@@ -1,123 +1,97 @@
-import { useState } from 'react';
-import { Button } from '@/components/ui/button';
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
-import { Input } from '@/components/ui/input';
-import { Label } from '@/components/ui/label';
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
-import { Alert, AlertDescription } from '@/components/ui/alert';
-import { Loader2 } from 'lucide-react';
+import { useState, useRef, useEffect } from "react";
+import { QrCode, Loader2, CheckCircle2, ExternalLink } from "lucide-react";
+import { api } from "../../lib/api";
+import styles from "./AccountLogin.module.css";
 
 interface LoginBeginResponse {
-  qr_data_url?: string;
+  login_session_id: string;
+  qr_code_base64?: string;
   login_page_url?: string;
-  session_id: string;
+  status?: string;
 }
 
 interface LoginPollResponse {
-  status: 'pending' | 'success' | 'expired' | 'canceled';
+  status: string;
   wxid?: string;
   nick_name?: string;
 }
 
-export function AccountLogin() {
-  const [accountAlias, setAccountAlias] = useState('');
-  const [loginType, setLoginType] = useState<'mac' | 'ipad'>('mac');
-  const [loginFlow, setLoginFlow] = useState<'auto' | 'manual'>('auto');
+export function AccountLogin({ onLoggedIn }: { onLoggedIn?: () => void }) {
+  const [accountAlias, setAccountAlias] = useState("");
+  const [loginType, setLoginType] = useState<"mac" | "ipad">("mac");
+  const [loginFlow, setLoginFlow] = useState<"auto" | "manual">("auto");
   const [qrDataUrl, setQrDataUrl] = useState<string | null>(null);
   const [loginPageUrl, setLoginPageUrl] = useState<string | null>(null);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [polling, setPolling] = useState(false);
+  const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [success, setSuccess] = useState<{ wxid: string; nickName: string } | null>(null);
+  const [success, setSuccess] = useState<{ wxid?: string; nickName?: string } | null>(null);
+  const pollTimer = useRef<number | null>(null);
 
-  const handleBeginLogin = async () => {
+  useEffect(() => {
+    return () => {
+      if (pollTimer.current) window.clearTimeout(pollTimer.current);
+    };
+  }, []);
+
+  const beginLogin = async () => {
     setError(null);
     setSuccess(null);
     setQrDataUrl(null);
     setLoginPageUrl(null);
     setSessionId(null);
-
+    setBusy(true);
     try {
-      const res = await fetch('/api/accounts/login/begin', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          accountAlias: accountAlias.trim() || undefined,
-          loginType,
-          loginFlow,
-        }),
+      const data = await api.post<LoginBeginResponse>("/api/accounts/login/begin", {
+        accountAlias: accountAlias.trim() || undefined,
+        loginType,
+        loginFlow,
       });
-
-      if (!res.ok) {
-        const err = await res.json();
-        throw new Error(err.message || `HTTP ${res.status}`);
-      }
-
-      const data: LoginBeginResponse = await res.json();
-      setQrDataUrl(data.qr_data_url || null);
+      setQrDataUrl(data.qr_code_base64 || null);
       setLoginPageUrl(data.login_page_url || null);
-      setSessionId(data.session_id);
-
-      // 自动开始轮询
-      if (data.session_id) {
-        startPolling(data.session_id);
-      }
-    } catch (err: any) {
-      setError(err.message || 'Failed to begin login');
+      setSessionId(data.login_session_id);
+      if (data.login_session_id) startPolling(data.login_session_id);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "发起登录失败");
+    } finally {
+      setBusy(false);
     }
   };
 
-  const startPolling = async (sid: string) => {
+  const startPolling = (sid: string) => {
     setPolling(true);
-
     const poll = async () => {
       try {
-        const params = new URLSearchParams({ session_id: sid });
-        if (accountAlias.trim()) {
-          params.append('account_alias', accountAlias.trim());
-        }
-
-        const res = await fetch(`/api/accounts/login/poll?${params}`);
-        if (!res.ok) {
-          const err = await res.json();
-          throw new Error(err.message || `HTTP ${res.status}`);
-        }
-
-        const data: LoginPollResponse = await res.json();
-
-        if (data.status === 'success') {
-          setSuccess({ wxid: data.wxid!, nickName: data.nick_name! });
+        const params = new URLSearchParams({ loginSessionId: sid });
+        if (accountAlias.trim()) params.append("accountAlias", accountAlias.trim());
+        const data = await api.get<LoginPollResponse>(`/api/accounts/login/poll?${params}`);
+        if (data.status === "success") {
+          setSuccess({ wxid: data.wxid, nickName: data.nick_name });
           setPolling(false);
           setQrDataUrl(null);
-          // 登录成功后自动同步账号
-          await syncAccounts();
-        } else if (data.status === 'pending') {
-          // 继续轮询
-          setTimeout(() => poll(), 2500);
+          try {
+            await api.post("/api/accounts/sync");
+          } catch {
+            /* 同步失败不阻断登录成功提示，用户可手动点同步 */
+          }
+          onLoggedIn?.();
+        } else if (data.status === "pending") {
+          pollTimer.current = window.setTimeout(poll, 2500);
         } else {
-          // expired / canceled
-          setError(`Login ${data.status}`);
+          setError(`登录${data.status === "expired" ? "已过期" : "未完成"}（${data.status}）`);
           setPolling(false);
         }
-      } catch (err: any) {
-        setError(err.message || 'Polling failed');
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "轮询失败");
         setPolling(false);
       }
     };
-
     poll();
   };
 
-  const syncAccounts = async () => {
-    try {
-      const res = await fetch('/api/accounts/sync', { method: 'POST' });
-      if (!res.ok) throw new Error('Sync failed');
-    } catch (err) {
-      console.error('Auto sync failed:', err);
-    }
-  };
-
-  const handleReset = () => {
+  const reset = () => {
+    if (pollTimer.current) window.clearTimeout(pollTimer.current);
     setQrDataUrl(null);
     setLoginPageUrl(null);
     setSessionId(null);
@@ -127,129 +101,110 @@ export function AccountLogin() {
   };
 
   return (
-    <Card className="w-full max-w-2xl mx-auto">
-      <CardHeader>
-        <CardTitle>微信账号登录</CardTitle>
-        <CardDescription>
-          通过扫码登录微信账号到 MCP Server。登录成功后账号会自动同步到系统。
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="space-y-4">
-        {!sessionId && (
-          <>
-            <div className="space-y-2">
-              <Label htmlFor="accountAlias">
-                账号别名 (Account Alias)
-                <span className="text-muted-foreground text-xs ml-2">
-                  Workspace Key 必填；Account Key 可留空
-                </span>
-              </Label>
-              <Input
-                id="accountAlias"
-                placeholder="例如: kefu-a"
-                value={accountAlias}
-                onChange={(e) => setAccountAlias(e.target.value)}
-              />
-            </div>
+    <div className={styles.card}>
+      <div className={styles.head}>
+        <span className={styles.headIcon}><QrCode size={18} /></span>
+        <div className={styles.headTxt}>
+          <strong>微信账号登录</strong>
+          <span>扫码登录微信账号到 MCP Server，成功后自动同步到系统。</span>
+        </div>
+      </div>
 
-            <div className="grid grid-cols-2 gap-4">
-              <div className="space-y-2">
-                <Label htmlFor="loginType">登录平台</Label>
-                <Select value={loginType} onValueChange={(v: any) => setLoginType(v)}>
-                  <SelectTrigger id="loginType">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="mac">Mac</SelectItem>
-                    <SelectItem value="ipad">iPad</SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
+      {!sessionId && !success && (
+        <div className={styles.form}>
+          <label className={styles.field}>
+            <span className={styles.label}>
+              账号别名 account_alias
+              <em className={styles.hint}>Workspace Key 必填（如 t-1）；Account Key 可留空</em>
+            </span>
+            <input
+              className={styles.input}
+              type="text"
+              value={accountAlias}
+              placeholder="例如 t-1"
+              onChange={(e) => setAccountAlias(e.target.value)}
+            />
+          </label>
 
-              <div className="space-y-2">
-                <Label htmlFor="loginFlow">登录流程</Label>
-                <Select value={loginFlow} onValueChange={(v: any) => setLoginFlow(v)}>
-                  <SelectTrigger id="loginFlow">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="auto">Auto (推荐)</SelectItem>
-                    <SelectItem value="manual">Manual</SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
-            </div>
-
-            <Button onClick={handleBeginLogin} className="w-full">
-              开始登录
-            </Button>
-          </>
-        )}
-
-        {sessionId && !success && (
-          <div className="space-y-4">
-            {loginPageUrl && (
-              <Alert>
-                <AlertDescription>
-                  推荐使用 MCP Server 提供的登录页面（支持自动刷新二维码和二次验证）：
-                  <a
-                    href={loginPageUrl}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="text-blue-600 hover:underline ml-2"
-                  >
-                    打开登录页面
-                  </a>
-                </AlertDescription>
-              </Alert>
-            )}
-
-            {qrDataUrl && (
-              <div className="flex flex-col items-center space-y-2">
-                <img src={qrDataUrl} alt="Login QR Code" className="w-64 h-64 border rounded" />
-                <p className="text-sm text-muted-foreground">请使用微信扫描二维码登录</p>
-              </div>
-            )}
-
-            {polling && (
-              <div className="flex items-center justify-center space-x-2 text-muted-foreground">
-                <Loader2 className="h-4 w-4 animate-spin" />
-                <span>等待扫码确认...</span>
-              </div>
-            )}
-
-            <Button variant="outline" onClick={handleReset} className="w-full">
-              取消
-            </Button>
+          <div className={styles.row}>
+            <label className={styles.field}>
+              <span className={styles.label}>登录平台</span>
+              <select
+                className={styles.input}
+                value={loginType}
+                onChange={(e) => setLoginType(e.target.value as "mac" | "ipad")}
+              >
+                <option value="mac">Mac</option>
+                <option value="ipad">iPad</option>
+              </select>
+            </label>
+            <label className={styles.field}>
+              <span className={styles.label}>登录流程</span>
+              <select
+                className={styles.input}
+                value={loginFlow}
+                onChange={(e) => setLoginFlow(e.target.value as "auto" | "manual")}
+              >
+                <option value="auto">Auto（推荐）</option>
+                <option value="manual">Manual</option>
+              </select>
+            </label>
           </div>
-        )}
 
-        {success && (
-          <Alert className="bg-green-50 border-green-200">
-            <AlertDescription className="space-y-2">
-              <p className="font-semibold text-green-800">✓ 登录成功</p>
-              <p className="text-sm">
-                <strong>微信 ID:</strong> {success.wxid}
-              </p>
-              <p className="text-sm">
-                <strong>昵称:</strong> {success.nickName}
-              </p>
-              <p className="text-xs text-muted-foreground mt-2">
-                账号已自动同步到系统，可在账号列表查看。
-              </p>
-              <Button onClick={handleReset} variant="outline" size="sm" className="mt-2">
-                登录另一个账号
-              </Button>
-            </AlertDescription>
-          </Alert>
-        )}
+          <button type="button" className={styles.primaryBtn} onClick={beginLogin} disabled={busy}>
+            {busy ? "发起中…" : "开始登录"}
+          </button>
+        </div>
+      )}
 
-        {error && (
-          <Alert variant="destructive">
-            <AlertDescription>{error}</AlertDescription>
-          </Alert>
-        )}
-      </CardContent>
-    </Card>
+      {sessionId && !success && (
+        <div className={styles.qrArea}>
+          {loginPageUrl && (
+            <a className={styles.pageLink} href={loginPageUrl} target="_blank" rel="noopener noreferrer">
+              <ExternalLink size={14} />
+              打开 MCP 登录页面（支持二维码刷新与二次验证）
+            </a>
+          )}
+          {qrDataUrl && (
+            <div className={styles.qrBox}>
+              <img src={qrDataUrl} alt="登录二维码" className={styles.qrImg} />
+              <p className={styles.qrTip}>请使用微信扫描二维码登录</p>
+            </div>
+          )}
+          {polling && (
+            <div className={styles.polling}>
+              <Loader2 size={16} className={styles.spin} />
+              <span>等待扫码确认…</span>
+            </div>
+          )}
+          <button type="button" className={styles.ghostBtn} onClick={reset}>取消</button>
+        </div>
+      )}
+
+      {success && (
+        <div className={styles.successBox}>
+          <div className={styles.successHead}>
+            <CheckCircle2 size={18} />
+            <strong>登录成功</strong>
+          </div>
+          {success.wxid && (
+            <div className={styles.metaRow}>
+              <span className={styles.metaLabel}>微信 ID</span>
+              <span className={styles.metaValue}>{success.wxid}</span>
+            </div>
+          )}
+          {success.nickName && (
+            <div className={styles.metaRow}>
+              <span className={styles.metaLabel}>昵称</span>
+              <span className={styles.metaValue}>{success.nickName}</span>
+            </div>
+          )}
+          <p className={styles.successTip}>账号已自动同步，可在账号列表查看。</p>
+          <button type="button" className={styles.ghostBtn} onClick={reset}>登录另一个账号</button>
+        </div>
+      )}
+
+      {error && <div className={styles.err}>{error}</div>}
+    </div>
   );
 }

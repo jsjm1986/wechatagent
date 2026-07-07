@@ -1,0 +1,88 @@
+/* 微信账号扫码登录卡片。实色白卡 + tokens.css 变量；蓝仅用于主操作。 */
+
+.card {
+  max-width: 520px;
+  border-radius: var(--r-lg);
+  border: 1px solid var(--hairline);
+  background: var(--surface-card);
+  padding: 20px;
+  display: grid;
+  gap: 16px;
+}
+
+.head { display: flex; align-items: center; gap: 12px; }
+.headIcon {
+  width: 34px; height: 34px; border-radius: 10px; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+  color: var(--color-scheduled); background: var(--fill-scheduled, rgba(10,132,255,.12));
+}
+.headTxt { display: grid; gap: 3px; min-width: 0; }
+.headTxt strong { font-size: 14px; color: var(--ink-1); font-weight: 600; letter-spacing: -.2px; }
+.headTxt span { font-size: 12px; color: var(--ink-3); }
+
+.form { display: grid; gap: 14px; }
+.row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.field { display: grid; gap: 6px; }
+.label { font-size: 12px; color: var(--ink-2); font-weight: 500; letter-spacing: -.1px; }
+.hint { display: block; margin-top: 3px; font-style: normal; font-size: 11px; color: var(--ink-4); font-weight: 400; }
+.input {
+  width: 100%; box-sizing: border-box;
+  border-radius: var(--r-md); padding: 9px 12px;
+  background: var(--surface-card); border: 1px solid var(--hairline);
+  font: inherit; font-size: 13px; color: var(--ink-1); letter-spacing: -.1px;
+  outline: 0; transition: border-color .16s, box-shadow .16s;
+}
+.input:focus { border-color: rgba(10,132,255,.4); box-shadow: 0 0 0 3px rgba(10,132,255,.1); }
+
+.primaryBtn {
+  border: 0; border-radius: var(--r-md); padding: 10px 16px;
+  background: var(--color-scheduled); color: #fff;
+  font: inherit; font-size: 13px; font-weight: 600; cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+  transition: opacity .16s;
+}
+.primaryBtn:disabled { opacity: .55; cursor: default; }
+
+.ghostBtn {
+  border: 1px solid var(--hairline); border-radius: var(--r-md); padding: 9px 16px;
+  background: var(--surface-card); color: var(--ink-1);
+  font: inherit; font-size: 13px; font-weight: 500; cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+}
+.ghostBtn:disabled { opacity: .55; cursor: default; }
+
+.qrArea { display: grid; gap: 14px; justify-items: center; }
+.pageLink {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 12px; color: var(--color-scheduled); text-decoration: none;
+}
+.pageLink:hover { text-decoration: underline; }
+.qrBox { display: grid; gap: 8px; justify-items: center; }
+.qrImg { width: 220px; height: 220px; border: 1px solid var(--hairline); border-radius: var(--r-md); }
+.qrTip { font-size: 12px; color: var(--ink-3); margin: 0; }
+
+.polling {
+  display: inline-flex; align-items: center; gap: 8px;
+  font-size: 13px; color: var(--ink-2);
+}
+.spin { animation: spin 1s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.successBox {
+  display: grid; gap: 10px;
+  border-radius: var(--r-md); padding: 16px;
+  background: var(--fill-running, rgba(48,209,88,.1)); border: 1px solid rgba(48,209,88,.3);
+}
+.successHead { display: flex; align-items: center; gap: 8px; color: var(--color-running); }
+.successHead strong { font-size: 14px; }
+.successTip { font-size: 12px; color: var(--ink-3); margin: 0; }
+
+.metaRow { display: flex; align-items: center; gap: 10px; font-size: 13px; }
+.metaLabel { color: var(--ink-3); min-width: 60px; }
+.metaValue { color: var(--ink-1); font-family: monospace; font-size: 12px; }
+
+.err {
+  font-size: 12px; color: var(--color-blocked);
+  background: var(--fill-blocked, rgba(255,69,58,.1)); border: 1px solid rgba(255,69,58,.3);
+  border-radius: var(--r-md); padding: 8px 12px;
+}
