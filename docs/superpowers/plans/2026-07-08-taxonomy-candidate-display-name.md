@@ -287,57 +287,75 @@ Co-Authored-By: Claude <noreply@anthropic.com>"
 
 **Files:**
 - Modify: `src/agent/decision_taxonomy.rs`
-  - `validate_and_normalize_decision`（`:84-95`）：`classify_decision_tags` 返回后按 kind 取名，把 `Vec<(String,String)>` 升级为 `Vec<(String,String,Option<String>)>`
+  - 新增纯函数 `attach_display_names`（把 `Vec<(kind,raw)>` + decision 映射为 `Vec<(kind,raw,Option<name>)>`）——生产与测试共用，避免重复映射逻辑
+  - `validate_and_normalize_decision`（`:84-95`）：`classify_decision_tags` 返回后调 `attach_display_names`
   - `spawn_candidate_upserts`（`:99-123`）：入参与 upsert 第 7 参改带名
-- Test: `src/agent/decision_taxonomy.rs`（`#[cfg(test)] mod tests` 内 append 一个「取名映射」纯逻辑单测）
+- Test: `src/agent/decision_taxonomy.rs`（`#[cfg(test)] mod tests` 内 append `attach_display_names` 单测）
 
 **Interfaces:**
-- Consumes: `super::super::agent::gateway::pick_dimension_display_name`（Task 2，`pub(crate)`）；`AgentDecision.dimension_display_names`（Task 1）。
+- Consumes: `crate::agent::gateway::pick_dimension_display_name`（Task 2，`pub(crate)`）；`AgentDecision.dimension_display_names`（Task 1）。
+- Produces: `fn attach_display_names(candidates: Vec<(String,String)>, decision: &AgentDecision) -> Vec<(String,String,Option<String>)>`（模块内 `fn`，`#[cfg(test)]` 可见）。
 
-- [ ] **Step 1: 写失败测试（生产入口取名——用可注入 cache 变体验证 candidates 带名）**
+- [ ] **Step 1: 写失败测试（`attach_display_names` 取名——生产与测试共用同一函数，不重复逻辑）**
 
-现有 `classify_with_cache_for_tests` 只透传 `classify_decision_tags`（不带名，保持不动）。新增一个「带名收集」的测试辅助 + 断言：在 `decision_taxonomy.rs` 的 `#[cfg(test)] mod tests` 内 append：
+在 `decision_taxonomy.rs` 的 `#[cfg(test)] mod tests` 内 append（现有 `classify_with_cache_for_tests` 保持不动）：
 
 ```rust
     #[test]
-    fn candidates_pick_up_display_name_from_decision() {
-        // decision 带 dimensionDisplayNames 时，收集到的候选应带上对应中文名；
-        // 缺名的维度回落 None。这段逻辑是生产入口 validate_and_normalize_decision
-        // 在 classify_decision_tags 之后做的取名映射（纯逻辑，用 pick_* + 手工映射验证）。
-        use crate::agent::gateway::pick_dimension_display_name;
+    fn attach_display_names_picks_name_and_falls_back() {
+        // 生产入口 validate_and_normalize_decision 用同一个 attach_display_names：
+        // decision.dimensionDisplayNames 有名 → 候选带名；无名 → None（回落英文）。
         use mongodb::bson::doc;
-        let cache = mk_cache(vec![]); // 空字典 → 两维都 CandidateNew
         let mut d = AgentDecision::default();
-        d.customer_stage = Some("焦虑观望期".to_string());
-        d.intent_level = Some("试探型".to_string());
-        d.dimension_display_names = doc! { "customer_stage": "焦虑观望期" }; // 只给 stage 配名
-        let (_risks, cands) = classify_with_cache_for_tests(&mut d, "acct-x", &cache);
-        // 模拟生产入口的取名映射：
-        let named: Vec<(String, String, Option<String>)> = cands
-            .into_iter()
-            .map(|(kind, raw)| {
-                let name = pick_dimension_display_name(&d.dimension_display_names, &kind)
-                    .map(str::to_string);
-                (kind, raw, name)
-            })
-            .collect();
-        let stage = named.iter().find(|(k, _, _)| k == "customer_stage").expect("stage 候选");
-        assert_eq!(stage.2.as_deref(), Some("焦虑观望期"));
-        let intent = named.iter().find(|(k, _, _)| k == "intent_level").expect("intent 候选");
-        assert_eq!(intent.2, None, "未配名的维度回落 None");
+        d.dimension_display_names = doc! { "customer_stage": "焦虑观望" }; // 只给 stage 配名
+        let cands = vec![
+            ("customer_stage".to_string(), "anxious_watch".to_string()),
+            ("intent_level".to_string(), "probing".to_string()),
+        ];
+        let named = attach_display_names(cands, &d);
+        let stage = named.iter().find(|(k, _, _)| k == "customer_stage").expect("stage");
+        assert_eq!(stage.2.as_deref(), Some("焦虑观望"));
+        let intent = named.iter().find(|(k, _, _)| k == "intent_level").expect("intent");
+        assert_eq!(intent.2, None, "未配名维度回落 None");
     }
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `touch src/lib.rs && cargo test --lib candidates_pick_up_display_name 2>&1 | tail -15`
-Expected: 编译失败——`pick_dimension_display_name` 未 `pub(crate)` 可见 / 或（若 Task 2 已合）测试引用路径未就绪。若 Task 2 已完成则应因断言逻辑就绪而直接指向缺少生产接线——本步核心是先让测试红。
+Run: `touch src/lib.rs && cargo test --lib attach_display_names 2>&1 | tail -15`
+Expected: 编译失败——`attach_display_names` 未定义（`cannot find function`）。
 
-> 注：本 Task 依赖 Task 1（字段）+ Task 2（纯函数 `pub(crate)`）。按顺序执行。
+> 注：本 Task 依赖 Task 1（字段）+ Task 2（纯函数 `pick_dimension_display_name` `pub(crate)`）。按顺序执行。
 
-- [ ] **Step 3: 改 `spawn_candidate_upserts` 带名**
+- [ ] **Step 3: 实现 `attach_display_names` 纯函数**
 
-把 `decision_taxonomy.rs:99-123` 整个函数替换为：
+在 `decision_taxonomy.rs` 的 `spawn_candidate_upserts`（`:99`）**之前**插入：
+
+```rust
+/// 把 `(kind, raw)` 候选列表按 `decision.dimension_display_names` 附上 LLM 产的
+/// 中文建议名 → `(kind, raw, Option<name>)`。与 gateway 主循环同源（复用同一取名
+/// 纯函数 `pick_dimension_display_name`）；缺名 → None → 候选回落英文裸值。
+fn attach_display_names(
+    candidates: Vec<(String, String)>,
+    decision: &AgentDecision,
+) -> Vec<(String, String, Option<String>)> {
+    candidates
+        .into_iter()
+        .map(|(kind, raw)| {
+            let name = crate::agent::gateway::pick_dimension_display_name(
+                &decision.dimension_display_names,
+                &kind,
+            )
+            .map(str::to_string);
+            (kind, raw, name)
+        })
+        .collect()
+}
+```
+
+- [ ] **Step 4: 改 `spawn_candidate_upserts` 带名 + 生产入口接线**
+
+把 `decision_taxonomy.rs:99-123` 的 `spawn_candidate_upserts` 整个函数替换为：
 
 ```rust
 /// 把 `candidates`（含中文建议名）列表 fire-and-forget 写盘。抽到独立函数便于未来
@@ -370,9 +388,7 @@ fn spawn_candidate_upserts(
 }
 ```
 
-- [ ] **Step 4: 改 `validate_and_normalize_decision` 取名映射**
-
-把 `decision_taxonomy.rs:84-95` 的函数体改为（在 `classify_decision_tags` 之后、`spawn_candidate_upserts` 之前插入取名映射）：
+再把 `validate_and_normalize_decision`（`:84-95`）函数体改为（在 `classify_decision_tags` 之后调 `attach_display_names`）：
 
 ```rust
 pub(crate) fn validate_and_normalize_decision(
@@ -388,27 +404,17 @@ pub(crate) fn validate_and_normalize_decision(
     // 中文名，随候选一起落库。二者写同一幂等键 (scope,kind,raw)，upsert 对已存在候选
     // 不更新 display_name（先写者赢）——此处带名，避免本 fire-and-forget 路径的 None
     // 抢先把 gateway 的中文名挡在门外。取的是同一个 decision，名字一致、幂等无害。
-    let named: Vec<(String, String, Option<String>)> = candidates
-        .into_iter()
-        .map(|(kind, raw)| {
-            let name = crate::agent::gateway::pick_dimension_display_name(
-                &decision.dimension_display_names,
-                &kind,
-            )
-            .map(str::to_string);
-            (kind, raw, name)
-        })
-        .collect();
+    let named = attach_display_names(candidates, decision);
     spawn_candidate_upserts(db, scope_account_id, named);
     risks
 }
 ```
 
-> 借用说明：`classify_decision_tags` 借 `&mut decision` 在该语句结束后即释放；随后 `pick_dimension_display_name(&decision.dimension_display_names, ...)` 取共享借用，二者不重叠，借用检查通过。
+> 借用说明：`classify_decision_tags` 借 `&mut decision` 在该语句结束后即释放；随后 `attach_display_names(candidates, decision)` 取共享借用，二者不重叠，借用检查通过。
 
 - [ ] **Step 5: 跑测试 + 编译 + 基线**
 
-Run: `cargo test --lib candidates_pick_up_display_name 2>&1 | tail -15`
+Run: `cargo test --lib attach_display_names 2>&1 | tail -15`
 Expected: PASS。
 
 Run: `RUSTFLAGS="-D warnings" cargo check --lib 2>&1 | tail -5`
@@ -527,6 +533,6 @@ Expected: 0 violations。新增代码/prompt 无禁用词（「中文名 / 显�
 ## 自查（Self-Review）
 
 - **Spec 覆盖**：spec §3.1（types 字段+Default+Raw+carry-through）→ Task 1；§3.3（prompt 不 bump）→ Task 4；§3.4（gateway 纯函数+取名）→ Task 2；§3.5（decision_taxonomy 同源必改）→ Task 3；§五（测试）→ 各 Task Step 1 + Task 5；§六（红线）→ Global Constraints + Task 5 Step 3；§七（真模型局限）→ Task 5 Step 5。无遗漏。
-- **类型一致**：`pick_dimension_display_name(&Document, &str) -> Option<&str>`（Task 2 定义，Task 3 复用，Task 5 核对）全程一致；`spawn_candidate_upserts` 入参 `Vec<(String,String,Option<String>)>`（Task 3 定义与调用一致）；`dimension_display_names: Document`（AgentDecision）/ `Option<Document>`（Raw）（Task 1 定义，Task 2/3 消费）一致。
+- **类型一致**：`pick_dimension_display_name(&Document, &str) -> Option<&str>`（Task 2 定义，Task 3 经 `attach_display_names` 复用，Task 5 核对）全程一致；`attach_display_names(Vec<(String,String)>, &AgentDecision) -> Vec<(String,String,Option<String>)>` + `spawn_candidate_upserts` 入参 `Vec<(String,String,Option<String>)>`（Task 3 定义与调用一致，生产/测试共用不重复逻辑）；`dimension_display_names: Document`（AgentDecision）/ `Option<Document>`（Raw）（Task 1 定义，Task 2/3 消费）一致。
 - **无占位符**：每个代码 step 均给完整可编译代码 + 精确行号 + 预期输出。
 - **依赖顺序**：Task 1 → 2 → 3（Task 3 依赖 1 的字段 + 2 的 `pub(crate)` 纯函数）；Task 4 独立（可任意序，但建议 1-3 后做便于 Step 4 端到端核对）；Task 5 最后。
