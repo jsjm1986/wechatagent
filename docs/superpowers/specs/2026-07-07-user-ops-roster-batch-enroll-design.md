@@ -26,11 +26,11 @@
 
 用户运营频道当前是 smart / traditional 双模式（`frontend/src/features/user-ops/index.tsx`），smart 模式 = `ContactsView` + `CockpitPanel`。本设计在其中**新增「通讯录」视图**，与现有的联系人列表、驾驶舱并列。理由：批量托管本质是「运营准备」动作，属于用户运营的一环，不该割裂成独立频道；复用频道内已有的 account 选择、store、labels 基础设施。
 
-**数据来源**：全量好友走 MCP 的好友缓存接口（含头像字段）。拉回的好友列表与本地 `contacts` 集合**按 `wxid` 左连接**，标注每个人的 `agentStatus`（`managed` / `normal` / 未入库）。
+**数据来源**：全量好友走 MCP 的好友列表接口（含头像字段）。拉回的好友列表与本地 `contacts` 集合**按 `wxid` 左连接**，标注每个人的 `agentStatus`（`managed` / `normal` / 未入库）。
 
 **纯浏览不写库**：打开通讯录视图只做「MCP 拉全量 + 本地 contacts 左连接标注」，不落任何库。只有当运营人员勾选并点「加入 Agent 运营」时才写库。这样反复打开通讯录不会污染 contacts 集合。
 
-**关键实现前提（须在 writing-plans 阶段用 `tools/list` 亲验）**：MCP server 拉全量好友的确切工具名与出参 schema（头像字段的真实 key）。设计正文按「`contacts_fetch_cache` 返回含 `bigHeadImg`/`smallHeadImg`，`im_sync` 为备选」的假设推进，但**该工具名与字段名在本仓无书面依据，仅凭 MCP 指南页记忆**，实现前必须打一次真实 `tools/list` 与样例调用核对，对齐后再写代码。
+**关键实现前提（已部分核实，仍须在实现前用 live `tools/list` 补全）**：2026-07-07 拉取 MCP 指南页（`http://117.72.54.28:3001/mcp-guide.html`）确认好友类工具真实名为 **`contact_list`**（主）与 **`im_sync`**（备选，全量同步），**不是**早前假设的 `contacts_fetch_cache`（该名在指南工具清单中不存在）。但指南页只列工具名，**未列出参 schema**，因此头像字段的真实 key（`bigHeadImg`/`smallHeadImg`/`headImgUrl` 之一）当日无法确认——探测时 MCP 网关返回 502（已知外部宕机）。实现计划第一步必须在服务恢复后打一次 `contact_list`（或 `im_sync`）真实调用，落定：①出参数组路径 ②头像字段 key ③是否分页/单次上限 ④Workspace Key 是否需 `account_alias`（账号类工具需，见 `src/mcp.rs:377-380`）。字段 key 定了再写解析代码。
 
 ---
 
