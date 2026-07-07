@@ -109,6 +109,8 @@ pub async fn sync_accounts(
                 .or_else(|| item.get("nickName"))
                 .and_then(|v| v.as_str())
                 .map(ToString::to_string),
+            // Task 3 会回填真实头像（sync_accounts 时从 MCP 拉取），此处先 None。
+            avatar_url: None,
             mcp_base_url: Some(state.config.mcp_base_url.clone()),
             mcp_api_key: Some(state.config.mcp_api_key.clone()),
             online: item

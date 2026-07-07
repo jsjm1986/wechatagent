@@ -264,6 +264,7 @@ mod tests {
             app_id: None,
             wxid: None,
             nick_name: None,
+            avatar_url: None,
             mcp_base_url: None,
             mcp_api_key: None,
             online,

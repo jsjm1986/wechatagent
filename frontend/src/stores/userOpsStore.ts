@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import type {
   Contact,
+  RosterEntry,
   Message,
   DecisionReview,
   OperationPlaybook,
@@ -107,6 +108,13 @@ interface UserOpsActions {
   loadPlaybooks: (accountId: string) => Promise<void>;
   loadContacts: (accountId: string) => Promise<void>;
   importContacts: () => Promise<void>;
+  loadRoster: (accountId: string) => Promise<RosterEntry[]>;
+  batchEnable: (payload: {
+    accountId: string;
+    candidates: { wxid: string; nickname?: string | null; remark?: string | null; avatarUrl?: string | null }[];
+    sharedNote: string;
+    playbookId?: string;
+  }) => Promise<{ enabled: number; queued: number }>;
   loadDomains: () => Promise<void>;
 
   // 15个业务回调
@@ -470,6 +478,22 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
     } finally {
       useUiStore.getState().setBusy(false);
     }
+  },
+
+  // 通讯录：拉指定账号的全量好友（MCP）+ 本地 contacts 左连接标注 agentStatus。纯浏览，不写库。
+  loadRoster: async (accountId) => {
+    const data = await api.get<{ items: RosterEntry[] }>(
+      `/api/contacts/roster?accountId=${encodeURIComponent(accountId)}`
+    );
+    return data.items;
+  },
+
+  // 批量托管：把勾选好友一次性置 managed + 共享运营备注，后端异步入队 initial_profile 生成画像。
+  batchEnable: async (payload) => {
+    return await api.post<{ enabled: number; queued: number }>(
+      "/api/contacts/batch-enable",
+      payload
+    );
   },
 
   // 加载 Domain 配置

@@ -6,7 +6,7 @@ use axum::{
 };
 use futures::TryStreamExt;
 use mongodb::{
-    bson::{doc, to_bson, DateTime, Document, Regex},
+    bson::{doc, oid::ObjectId, to_bson, DateTime, Document, Regex},
     options::FindOptions,
 };
 use serde::Deserialize;
@@ -18,7 +18,7 @@ use crate::{
     error::{AppError, AppResult},
     mcp::{self},
     models::{
-        ApiContact, ContactQuery, CustomAgentInstructionsRequest, EnableAgentRequest,
+        ApiContact, Contact, ContactQuery, CustomAgentInstructionsRequest, EnableAgentRequest,
         ImportContactsRequest, ProfileNoteRequest, SearchImportRequest,
     },
 };
@@ -358,6 +358,328 @@ pub(super) async fn list_entitlements(
     Ok(Json(json!({ "items": items, "total": total })))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct RosterQuery {
+    pub account_id: String,
+}
+
+pub(super) async fn roster_endpoint(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
+    Query(query): Query<RosterQuery>,
+) -> AppResult<Json<Value>> {
+    // account 必须属于当前 workspace（fail-closed）。
+    validate_account(&state, &admin.current_workspace, &query.account_id).await?;
+
+    let friends = mcp::fetch_roster_for_account(&state, &query.account_id).await?;
+
+    // 本地已入库联系人：wxid -> agent_status。
+    let mut cursor = state
+        .db
+        .contacts()
+        .find(
+            doc! { "workspace_id": &admin.current_workspace, "account_id": &query.account_id },
+            None,
+        )
+        .await?;
+    let mut status_by_wxid: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    while let Some(c) = cursor.try_next().await? {
+        let status = match c.agent_status {
+            crate::models::AgentStatus::Managed => "managed",
+            _ => "normal",
+        };
+        status_by_wxid.insert(c.wxid, status.to_string());
+    }
+
+    let items: Vec<Value> = friends
+        .into_iter()
+        .map(|f| {
+            let agent_status = status_by_wxid
+                .get(&f.wxid)
+                .cloned()
+                .unwrap_or_else(|| "not_imported".to_string());
+            json!({
+                "wxid": f.wxid,
+                "nickname": f.nickname,
+                "remark": f.remark,
+                "avatarUrl": f.avatar_url,
+                "agentStatus": agent_status,
+            })
+        })
+        .collect();
+    let total = items.len();
+    Ok(Json(json!({ "items": items, "total": total })))
+}
+
+/// 把 AI 生成的初始运营画像落库到指定联系人（切 managed + 画像 + 备注 + playbook）。
+///
+/// 同步 `enable_agent` 与异步 `handle_initial_profile_task` 两条路径共用此函数，
+/// 避免画像落库逻辑（stage/intent 校验、老客户字段保留、operation_state 初始态）
+/// 在两处复制后漂移。
+pub(super) async fn apply_generated_profile_to_contact(
+    state: &AppState,
+    workspace_id: &str,
+    contact: &Contact,
+    note: &str,
+    playbook_id: Option<ObjectId>,
+    playbook_version: i32,
+    generated: &agent::GeneratedOperationProfile,
+) -> AppResult<()> {
+    let object_id = contact
+        .id
+        .ok_or_else(|| AppError::BadRequest("contact missing _id".to_string()))?;
+    let commitments_bson = commitments_with_optional_text(
+        &contact.commitments,
+        generated.last_commitment.as_deref(),
+    );
+    // #72：曾运营过的老客户重新启用时，保留已积累的 stage / operation_state /
+    // commitments，不回退到 new_contact；只切 managed + 更新本次显式输入
+    // （备注 / playbook / 画像）。全新客户才走完整初始化。
+    let mut set_doc = doc! {
+        "agent_status": "managed",
+        "human_profile_note": note,
+        "agent_profile": to_bson(&generated.agent_profile)?,
+        "playbook_id": playbook_id,
+        "playbook_version": playbook_version,
+        "profile_attributes": generated.profile_attributes.clone(),
+        "profile_updated_at": DateTime::now(),
+        "updated_at": DateTime::now(),
+    };
+    let mut unset_doc = Document::new();
+    if !is_previously_operated(contact) {
+        // H13：初始 operation_state 从 active 状态机的 initial 态取（替代写死 "new_contact"）。
+        let domain_config =
+            agent::load_user_operation_domain_config(state, workspace_id).await?;
+        let initial_state = agent::initial_operation_state_key(domain_config.as_ref());
+        // M4：AI 生成的初始画像 stage/intent 经 dimension_registry 校验后再落库
+        // （对齐 management.rs 建档路径 + AI 主决策 validate_and_normalize_decision）。
+        // AI 产出 → WriteIntent::MachineWrite：越界值 drop（不阻断建档），不像 admin 那样 reject。
+        let (gen_stage, gen_intent) = validate_generated_stage_intent(
+            state,
+            &contact.account_id,
+            generated.customer_stage.as_deref(),
+            generated.intent_level.as_deref(),
+        )
+        .await?;
+        insert_domain_stage_fields(&mut set_doc, gen_stage.as_deref(), gen_intent.as_deref(), true);
+        set_doc.insert("commitments", commitments_bson);
+        set_doc.insert("follow_up_policy", generated.follow_up_policy.clone());
+        set_doc.insert("operation_state", initial_state);
+        set_doc.insert(
+            "operation_state_reason",
+            "初次纳入 Agent 运营，等待后续互动确认阶段",
+        );
+        set_doc.insert("operation_state_confidence", 6);
+        set_doc.insert("operation_state_updated_at", DateTime::now());
+        unset_doc.insert("last_commitment", "");
+    }
+    let mut update_doc = doc! { "$set": set_doc };
+    if !unset_doc.is_empty() {
+        update_doc.insert("$unset", unset_doc);
+    }
+    state
+        .db
+        .contacts()
+        .update_one(doc! { "_id": object_id }, update_doc, None)
+        .await?;
+    Ok(())
+}
+
+/// 异步初始画像任务处理器（`AgentTask.kind == "initial_profile"`）。
+///
+/// 批量托管（`batch_enable_endpoint`）不同步跑 LLM，而是给每个联系人入队本任务，
+/// 由 worker 异步调 `build_initial_operation_profile` 生成画像并经共享的
+/// [`apply_generated_profile_to_contact`] 落库。`task.content` 存本批共享运营备注。
+pub async fn handle_initial_profile_task(
+    state: &AppState,
+    task: &crate::models::AgentTask,
+) -> AppResult<()> {
+    // 按 wxid+account 定位联系人（worker 上下文没有 _id）。
+    let contact = state
+        .db
+        .contacts()
+        .find_one(
+            doc! {
+                "workspace_id": &task.workspace_id,
+                "account_id": &task.account_id,
+                "wxid": &task.contact_wxid,
+            },
+            None,
+        )
+        .await?;
+    let Some(contact) = contact else {
+        // 联系人已被删/清理：视为完成，不报错重试。
+        return Ok(());
+    };
+    // 批量后又被手动取消托管的，跳过画像回填。
+    if !matches!(contact.agent_status, crate::models::AgentStatus::Managed) {
+        return Ok(());
+    }
+    let playbook = resolve_playbook_for_contact(
+        state,
+        &task.workspace_id,
+        &task.account_id,
+        contact.playbook_id.map(|o| o.to_hex()).as_deref(),
+    )
+    .await?;
+    let generated = agent::build_initial_operation_profile(
+        state,
+        &task.workspace_id,
+        &task.content,
+        Some(&playbook),
+    )
+    .await?;
+    apply_generated_profile_to_contact(
+        state,
+        &task.workspace_id,
+        &contact,
+        &task.content,
+        playbook.id,
+        playbook.version,
+        &generated,
+    )
+    .await
+}
+
+pub async fn batch_enable_endpoint(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
+    Json(payload): Json<crate::models::BatchEnableRequest>,
+) -> AppResult<Json<Value>> {
+    if payload.shared_note.trim().is_empty() {
+        return Err(AppError::BadRequest("sharedNote is required".to_string()));
+    }
+    if payload.candidates.is_empty() {
+        return Err(AppError::BadRequest("candidates is empty".to_string()));
+    }
+    // account 必须在 wechat_accounts 注册(否则 webhook 入站会被 resolve_account_context 拒收)。
+    if state
+        .db
+        .accounts()
+        .find_one(
+            doc! { "workspace_id": &admin.current_workspace, "account_id": &payload.account_id },
+            None,
+        )
+        .await?
+        .is_none()
+    {
+        return Err(AppError::BadRequest(format!(
+            "account_id={} 在 wechat_accounts 中未注册，无法批量启用 Agent 运营",
+            payload.account_id
+        )));
+    }
+    // 可选统一 playbook：校验存在(用 enable 的解析器,None 则账号默认)。
+    let playbook = resolve_playbook_for_contact(
+        &state,
+        &admin.current_workspace,
+        &payload.account_id,
+        payload.playbook_id.as_deref(),
+    )
+    .await?;
+
+    let mut enabled = 0i32;
+    let mut queued = 0i32;
+    for cand in &payload.candidates {
+        // 幂等:已 managed 的不重复入队(但仍刷新 note/avatar)。
+        let existing = state
+            .db
+            .contacts()
+            .find_one(
+                doc! {
+                    "workspace_id": &admin.current_workspace,
+                    "account_id": &payload.account_id,
+                    "wxid": &cand.wxid,
+                },
+                None,
+            )
+            .await?;
+        let already_managed = existing
+            .as_ref()
+            .map(|c| matches!(c.agent_status, crate::models::AgentStatus::Managed))
+            .unwrap_or(false);
+
+        // upsert 联系人:置 managed + sharedNote + playbook。
+        // nickname/remark/avatar_url 只在候选真的带值时才写——MCP 好友列表常缺 remark，
+        // 若无条件 $set None 会把已入库联系人已有的备注/头像覆盖成 null（重入运营即丢数据）。
+        let mut set_doc = doc! {
+            "workspace_id": &admin.current_workspace,
+            "account_id": &payload.account_id,
+            "wxid": &cand.wxid,
+            "agent_status": "managed",
+            "human_profile_note": &payload.shared_note,
+            "playbook_id": playbook.id,
+            "playbook_version": playbook.version,
+            "updated_at": DateTime::now(),
+        };
+        if let Some(nickname) = &cand.nickname {
+            set_doc.insert("nickname", nickname);
+        }
+        if let Some(remark) = &cand.remark {
+            set_doc.insert("remark", remark);
+        }
+        if let Some(avatar_url) = &cand.avatar_url {
+            set_doc.insert("avatar_url", avatar_url);
+        }
+        state
+            .db
+            .contacts()
+            .update_one(
+                doc! {
+                    "workspace_id": &admin.current_workspace,
+                    "account_id": &payload.account_id,
+                    "wxid": &cand.wxid,
+                },
+                doc! {
+                    "$set": set_doc,
+                    "$setOnInsert": { "created_at": DateTime::now() },
+                },
+                mongodb::options::UpdateOptions::builder()
+                    .upsert(true)
+                    .build(),
+            )
+            .await?;
+        enabled += 1;
+
+        if !already_managed {
+            // 入队异步初始画像任务。
+            state
+                .db
+                .tasks()
+                .insert_one(
+                    crate::models::AgentTask {
+                        id: None,
+                        workspace_id: admin.current_workspace.clone(),
+                        account_id: payload.account_id.clone(),
+                        contact_wxid: cand.wxid.clone(),
+                        kind: "initial_profile".to_string(),
+                        run_at: DateTime::now(),
+                        expires_at: None,
+                        content: payload.shared_note.clone(),
+                        status: "pending".to_string(),
+                        source_decision_id: None,
+                        review_required: false,
+                        attempt_count: 0,
+                        max_attempts: 3,
+                        next_retry_at: None,
+                        gateway_status: None,
+                        cancel_reason: None,
+                        error: None,
+                        claimed_at: None,
+                        claim_recovery_count: 0,
+                        created_at: DateTime::now(),
+                        updated_at: DateTime::now(),
+                    },
+                    None,
+                )
+                .await?;
+            queued += 1;
+        }
+    }
+    Ok(Json(json!({ "enabled": enabled, "queued": queued })))
+}
+
 pub(super) async fn enable_agent(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
@@ -369,7 +691,6 @@ pub(super) async fn enable_agent(
             "humanProfileNote is required".to_string(),
         ));
     }
-    let object_id = parse_object_id(&id)?;
     let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
     // P1：先校验 contact.account_id 在 wechat_accounts 注册过。否则即使写 managed
     // 进去，webhook 入站时 resolve_account_context 也会因为 appId 匹配不到这个
@@ -400,65 +721,16 @@ pub(super) async fn enable_agent(
         Some(&playbook),
     )
     .await?;
-    let commitments_bson = commitments_with_optional_text(
-        &contact.commitments,
-        generated.last_commitment.as_deref(),
-    );
-    // #72：曾运营过的老客户重新启用时，保留已积累的 stage / operation_state /
-    // commitments，不回退到 new_contact；只切 managed + 更新本次 admin 显式输入
-    // （备注 / playbook / 画像）。全新客户才走完整初始化。
-    let mut set_doc = doc! {
-        "agent_status": "managed",
-        "human_profile_note": payload.human_profile_note,
-        "agent_profile": to_bson(&generated.agent_profile)?,
-        "playbook_id": playbook.id,
-        "playbook_version": playbook.version,
-        "profile_attributes": generated.profile_attributes,
-        "profile_updated_at": DateTime::now(),
-        "updated_at": DateTime::now(),
-    };
-    let mut unset_doc = Document::new();
-    if !is_previously_operated(&contact) {
-        // H13：初始 operation_state 从 active 状态机的 initial 态取（替代写死 "new_contact"）。
-        let domain_config =
-            agent::load_user_operation_domain_config(&state, &admin.current_workspace).await?;
-        let initial_state = agent::initial_operation_state_key(domain_config.as_ref());
-        // M4：AI 生成的初始画像 stage/intent 经 dimension_registry 校验后再落库
-        // （对齐 management.rs 建档路径 + AI 主决策 validate_and_normalize_decision）。
-        // AI 产出 → WriteIntent::MachineWrite：越界值 drop（不阻断建档），不像 admin 那样 reject。
-        let (gen_stage, gen_intent) = validate_generated_stage_intent(
-            &state,
-            &contact.account_id,
-            generated.customer_stage.as_deref(),
-            generated.intent_level.as_deref(),
-        )
-        .await?;
-        insert_domain_stage_fields(
-            &mut set_doc,
-            gen_stage.as_deref(),
-            gen_intent.as_deref(),
-            true,
-        );
-        set_doc.insert("commitments", commitments_bson);
-        set_doc.insert("follow_up_policy", generated.follow_up_policy);
-        set_doc.insert("operation_state", initial_state);
-        set_doc.insert(
-            "operation_state_reason",
-            "初次纳入 Agent 运营，等待后续互动确认阶段",
-        );
-        set_doc.insert("operation_state_confidence", 6);
-        set_doc.insert("operation_state_updated_at", DateTime::now());
-        unset_doc.insert("last_commitment", "");
-    }
-    let mut update_doc = doc! { "$set": set_doc };
-    if !unset_doc.is_empty() {
-        update_doc.insert("$unset", unset_doc);
-    }
-    state
-        .db
-        .contacts()
-        .update_one(doc! { "_id": object_id }, update_doc, None)
-        .await?;
+    apply_generated_profile_to_contact(
+        &state,
+        &admin.current_workspace,
+        &contact,
+        &payload.human_profile_note,
+        playbook.id,
+        playbook.version,
+        &generated,
+    )
+    .await?;
     let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
     Ok(Json(json!({ "item": ApiContact::from(contact) })))
 }

@@ -41,6 +41,7 @@ fn minimal_contact(wxid: &str) -> Contact {
         nickname: None,
         remark: None,
         alias: None,
+        avatar_url: None,
         agent_status: AgentStatus::Managed,
         human_profile_note: None,
         custom_agent_instructions: None,
