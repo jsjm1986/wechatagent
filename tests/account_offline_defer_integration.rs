@@ -96,6 +96,7 @@ fn make_account(online: bool) -> WechatAccount {
         mcp_base_url: None,
         mcp_api_key: None,
         online,
+        status: None,
         last_sync_at: now,
         capacity: 0,
         persona_tag: None,

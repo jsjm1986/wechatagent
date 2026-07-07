@@ -54,7 +54,8 @@ pub async fn list_accounts(
             "nickName": account.nick_name,
             "mcpBaseUrl": account.mcp_base_url,
             "mcpKeyConfigured": account.mcp_api_key.as_ref().map(|key| !key.is_empty()).unwrap_or(false) || !state.config.mcp_api_key.is_empty(),
-            "online": account.online
+            "online": account.online,
+            "status": account.status
         }));
     }
     Ok(Json(json!({ "items": items })))
@@ -114,6 +115,10 @@ pub async fn sync_accounts(
                 .get("online")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
+            status: item
+                .get("status")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string),
             last_sync_at: DateTime::now(),
             capacity: 0,
             persona_tag: None,
@@ -138,6 +143,7 @@ pub async fn sync_accounts(
                         "nick_name": &account.nick_name,
                         "mcp_base_url": &account.mcp_base_url,
                         "online": account.online,
+                        "status": &account.status,
                         "last_sync_at": account.last_sync_at,
                         "updated_at": account.updated_at,
                         // 确保所有 WechatAccount 必填字段都在 $set 或 $setOnInsert 中，
