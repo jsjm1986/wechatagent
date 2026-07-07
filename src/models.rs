@@ -3200,6 +3200,28 @@ pub struct EnableAgentRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct BatchEnableCandidate {
+    pub wxid: String,
+    #[serde(default)]
+    pub nickname: Option<String>,
+    #[serde(default)]
+    pub remark: Option<String>,
+    #[serde(default)]
+    pub avatar_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchEnableRequest {
+    pub account_id: String,
+    pub candidates: Vec<BatchEnableCandidate>,
+    pub shared_note: String,
+    #[serde(default)]
+    pub playbook_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProfileNoteRequest {
     pub human_profile_note: String,
 }
