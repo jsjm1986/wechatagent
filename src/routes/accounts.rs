@@ -270,16 +270,15 @@ pub async fn login_begin(
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoginPollQuery {
-    session_id: String,
+    login_session_id: String,
     account_alias: Option<String>,
 }
 
-/// GET /api/accounts/login/poll?session_id=xxx&account_alias=yyy - 轮询登录状态
+/// GET /api/accounts/login/poll?loginSessionId=xxx&accountAlias=yyy - 轮询登录状态
 ///
-/// 调用 MCP `login_poll` 工具，返回：
+/// 调用 MCP `login_poll` 工具（参数 `login_session_id` 来自 `login_begin` 返回值），返回：
 /// - `status`: `pending` / `success` / `expired` / `canceled`
-/// - `wxid`: 登录成功后的微信 ID（仅 status=success 时有值）
-/// - `nick_name`: 登录成功后的微信昵称（仅 status=success 时有值）
+/// - 登录成功后的微信身份字段（`wxid` / `nick_name` 等，以 server 回包为准）
 ///
 /// 前端应每 2-3 秒轮询一次，直到 status 不是 `pending`。
 /// 登录成功后建议立即调用 `POST /api/accounts/sync` 同步账号信息。
@@ -289,7 +288,7 @@ pub async fn login_poll(
     axum::extract::Query(query): axum::extract::Query<LoginPollQuery>,
 ) -> AppResult<Json<Value>> {
     let arguments = json!({
-        "session_id": query.session_id,
+        "login_session_id": query.login_session_id,
     });
 
     let result = if let Some(alias) = query.account_alias {

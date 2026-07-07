@@ -3,6 +3,7 @@
 export type AgentStatus = "normal" | "managed";
 export type Channel =
   | "command"
+  | "accountManagement"
   | "overview"
   | "userOps"
   | "groupOps"

@@ -1,0 +1,83 @@
+/* 账号管理页。实色白卡 + tokens.css 变量；蓝仅用于主操作。 */
+
+.page { display: grid; gap: 20px; }
+
+.header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.headerText { display: grid; gap: 4px; }
+.title { font-size: 20px; font-weight: 600; color: var(--ink-1); letter-spacing: -.3px; margin: 0; }
+.subtitle { font-size: 13px; color: var(--ink-3); margin: 0; }
+.headerActions { display: flex; gap: 10px; flex-shrink: 0; }
+
+.primaryBtn {
+  border: 0; border-radius: var(--r-md); padding: 9px 16px;
+  background: var(--color-scheduled); color: #fff;
+  font: inherit; font-size: 13px; font-weight: 600; cursor: pointer;
+  display: inline-flex; align-items: center; gap: 7px;
+  transition: opacity .16s;
+}
+.primaryBtn:disabled { opacity: .55; cursor: default; }
+
+.ghostBtn {
+  border: 1px solid var(--hairline); border-radius: var(--r-md); padding: 8px 16px;
+  background: var(--surface-card); color: var(--ink-1);
+  font: inherit; font-size: 13px; font-weight: 500; cursor: pointer;
+  display: inline-flex; align-items: center; gap: 7px;
+}
+.ghostBtn:disabled { opacity: .55; cursor: default; }
+
+.backBtn {
+  border: 0; background: none; color: var(--ink-3);
+  font: inherit; font-size: 13px; cursor: pointer;
+  display: inline-flex; align-items: center; gap: 6px; padding: 0;
+  justify-self: start;
+}
+.backBtn:hover { color: var(--ink-1); }
+
+.spin { animation: spin 1s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+.statCard {
+  border: 1px solid var(--hairline); border-radius: var(--r-md);
+  background: var(--surface-card); padding: 16px; display: grid; gap: 6px;
+}
+.statLabel { font-size: 12px; color: var(--ink-3); }
+.statValue { font-size: 26px; font-weight: 600; color: var(--ink-1); letter-spacing: -.5px; }
+
+.loading { padding: 40px; text-align: center; color: var(--ink-3); font-size: 13px; }
+
+.empty {
+  border: 1px dashed var(--hairline); border-radius: var(--r-lg);
+  padding: 32px; text-align: center; display: grid; gap: 10px; justify-items: center;
+}
+.empty strong { font-size: 15px; color: var(--ink-1); }
+.empty p { font-size: 13px; color: var(--ink-3); margin: 0; max-width: 420px; }
+.emptyActions { display: flex; gap: 10px; margin-top: 6px; }
+
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 14px; }
+.accountCard {
+  border: 1px solid var(--hairline); border-radius: var(--r-md);
+  background: var(--surface-card); padding: 16px; display: grid; gap: 12px;
+}
+.accountHead { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+.accountName { display: grid; gap: 2px; min-width: 0; }
+.accountName strong { font-size: 14px; color: var(--ink-1); font-weight: 600; letter-spacing: -.2px; }
+.accountNick { font-size: 12px; color: var(--ink-3); }
+
+.online, .offline {
+  flex-shrink: 0; font-size: 11px; font-weight: 600; padding: 3px 9px; border-radius: 20px;
+  display: inline-flex; align-items: center; gap: 5px; letter-spacing: -.1px;
+}
+.online { color: var(--color-running); background: var(--fill-running); border: 1px solid rgba(48,209,88,.3); }
+.offline { color: var(--ink-3); background: var(--fill-inactive, rgba(120,120,128,.1)); border: 1px solid var(--hairline); }
+
+.accountMeta { display: grid; gap: 7px; }
+.metaRow { display: flex; align-items: center; gap: 10px; font-size: 12px; }
+.metaLabel { color: var(--ink-3); min-width: 62px; }
+.metaValue { color: var(--ink-1); font-family: monospace; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.err {
+  font-size: 12px; color: var(--color-blocked);
+  background: var(--fill-blocked, rgba(255,69,58,.1)); border: 1px solid rgba(255,69,58,.3);
+  border-radius: var(--r-md); padding: 8px 12px;
+}
