@@ -543,6 +543,135 @@ pub async fn handle_initial_profile_task(
     .await
 }
 
+pub async fn batch_enable_endpoint(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
+    Json(payload): Json<crate::models::BatchEnableRequest>,
+) -> AppResult<Json<Value>> {
+    if payload.shared_note.trim().is_empty() {
+        return Err(AppError::BadRequest("sharedNote is required".to_string()));
+    }
+    if payload.candidates.is_empty() {
+        return Err(AppError::BadRequest("candidates is empty".to_string()));
+    }
+    // account 必须在 wechat_accounts 注册(否则 webhook 入站会被 resolve_account_context 拒收)。
+    if state
+        .db
+        .accounts()
+        .find_one(
+            doc! { "workspace_id": &admin.current_workspace, "account_id": &payload.account_id },
+            None,
+        )
+        .await?
+        .is_none()
+    {
+        return Err(AppError::BadRequest(format!(
+            "account_id={} 在 wechat_accounts 中未注册，无法批量启用 Agent 运营",
+            payload.account_id
+        )));
+    }
+    // 可选统一 playbook：校验存在(用 enable 的解析器,None 则账号默认)。
+    let playbook = resolve_playbook_for_contact(
+        &state,
+        &admin.current_workspace,
+        &payload.account_id,
+        payload.playbook_id.as_deref(),
+    )
+    .await?;
+
+    let mut enabled = 0i32;
+    let mut queued = 0i32;
+    for cand in &payload.candidates {
+        // 幂等:已 managed 的不重复入队(但仍刷新 note/avatar)。
+        let existing = state
+            .db
+            .contacts()
+            .find_one(
+                doc! {
+                    "workspace_id": &admin.current_workspace,
+                    "account_id": &payload.account_id,
+                    "wxid": &cand.wxid,
+                },
+                None,
+            )
+            .await?;
+        let already_managed = existing
+            .as_ref()
+            .map(|c| matches!(c.agent_status, crate::models::AgentStatus::Managed))
+            .unwrap_or(false);
+
+        // upsert 联系人:置 managed + sharedNote + avatar + playbook。
+        let set_doc = doc! {
+            "workspace_id": &admin.current_workspace,
+            "account_id": &payload.account_id,
+            "wxid": &cand.wxid,
+            "nickname": &cand.nickname,
+            "remark": &cand.remark,
+            "avatar_url": &cand.avatar_url,
+            "agent_status": "managed",
+            "human_profile_note": &payload.shared_note,
+            "playbook_id": playbook.id,
+            "playbook_version": playbook.version,
+            "updated_at": DateTime::now(),
+        };
+        state
+            .db
+            .contacts()
+            .update_one(
+                doc! {
+                    "workspace_id": &admin.current_workspace,
+                    "account_id": &payload.account_id,
+                    "wxid": &cand.wxid,
+                },
+                doc! {
+                    "$set": set_doc,
+                    "$setOnInsert": { "created_at": DateTime::now() },
+                },
+                mongodb::options::UpdateOptions::builder()
+                    .upsert(true)
+                    .build(),
+            )
+            .await?;
+        enabled += 1;
+
+        if !already_managed {
+            // 入队异步初始画像任务。
+            state
+                .db
+                .tasks()
+                .insert_one(
+                    crate::models::AgentTask {
+                        id: None,
+                        workspace_id: admin.current_workspace.clone(),
+                        account_id: payload.account_id.clone(),
+                        contact_wxid: cand.wxid.clone(),
+                        kind: "initial_profile".to_string(),
+                        run_at: DateTime::now(),
+                        expires_at: None,
+                        content: payload.shared_note.clone(),
+                        status: "pending".to_string(),
+                        source_decision_id: None,
+                        review_required: false,
+                        attempt_count: 0,
+                        max_attempts: 3,
+                        next_retry_at: None,
+                        gateway_status: None,
+                        cancel_reason: None,
+                        error: None,
+                        claimed_at: None,
+                        claim_recovery_count: 0,
+                        created_at: DateTime::now(),
+                        updated_at: DateTime::now(),
+                    },
+                    None,
+                )
+                .await?;
+            queued += 1;
+        }
+    }
+    Ok(Json(json!({ "enabled": enabled, "queued": queued })))
+}
+
 pub(super) async fn enable_agent(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,

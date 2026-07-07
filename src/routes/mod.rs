@@ -170,7 +170,8 @@ use admin_suspected_deals::{
 use assets::{create_content_asset, list_content_assets};
 use ask_human_inbox::{ask_human_inbox, ask_human_summary};
 use contacts::{
-    analyze_contact_profile, add_deal_event, clear_referral, disable_agent, enable_agent,
+    analyze_contact_profile, add_deal_event, batch_enable_endpoint, clear_referral, disable_agent,
+    enable_agent,
     get_contact, get_contact_memory_card, get_operating_memory, get_operation_health,
     import_contacts_endpoint, list_contact_memory_candidates, list_contacts, list_entitlements,
     list_outcome_events, roster_endpoint, run_contact_memory_consolidation,
@@ -347,6 +348,7 @@ pub fn api_router(state: AppState) -> Router<AppState> {
         .route("/contacts/import", post(import_contacts_endpoint))
         .route("/contacts/search-import", post(search_import_contacts))
         .route("/contacts/roster", get(roster_endpoint))
+        .route("/contacts/batch-enable", post(batch_enable_endpoint))
         .route("/contacts/:id", get(get_contact))
         .route("/contacts/:id/enable-agent", post(enable_agent))
         .route("/contacts/:id/disable-agent", post(disable_agent))
