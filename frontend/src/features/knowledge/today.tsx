@@ -604,6 +604,54 @@ export function DigestCanvas() {
   const [regen, setRegen] = useState(false);
   const [error, setError] = useState<Error | null>(null);
   const [dismissing, setDismissing] = useState<Set<string>>(new Set());
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [dispatchingBatch, setDispatchingBatch] = useState(false);
+
+  function toggleSelect(cardId: string) {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(cardId)) next.delete(cardId);
+      else next.add(cardId);
+      return next;
+    });
+  }
+
+  async function dispatchSelected() {
+    if (selected.size === 0) return;
+    const steps = visibleCards
+      .filter((c) => selected.has(c.cardId) && c.suggestedAction !== "freeform")
+      .map((c, idx) => ({
+        stepId: `step_${idx + 1}`,
+        cardId: c.cardId,
+        action: c.suggestedAction,
+        summary: c.summary,
+        reportDate: report?.reportDate,
+      }));
+    if (steps.length === 0) {
+      setError(new Error("选中的卡片都不可派工（仅查看类卡片无执行动作）"));
+      return;
+    }
+    setDispatchingBatch(true);
+    setError(null);
+    try {
+      const sessionId = crypto.randomUUID();
+      const r = await fetch("/api/knowledge/chat/tasks", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionId, plannedSteps: steps, cardIds: steps.map((s) => s.cardId) }),
+      });
+      if (!r.ok) throw await parseApiError(r);
+      const data = (await r.json()) as { taskId?: string };
+      setSelected(new Set());
+      if (data.taskId) {
+        window.dispatchEvent(new CustomEvent("wikiTrackTask", { detail: { taskId: data.taskId } }));
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e : new Error(String(e)));
+    } finally {
+      setDispatchingBatch(false);
+    }
+  }
 
   async function load() {
     setPending(true);
@@ -688,6 +736,9 @@ export function DigestCanvas() {
           <button type="button" className="primary" onClick={() => void regenerate()} disabled={regen}>
             <Sparkles size={14} /> {regen ? "重算中…" : "强制重算"}
           </button>
+          <button type="button" className="primary" onClick={() => void dispatchSelected()} disabled={dispatchingBatch || selected.size === 0}>
+            {dispatchingBatch ? "派工中…" : `批量派工（${selected.size}）`}
+          </button>
         </div>
       </div>
       {error ? <LlmErrorBanner error={error} onRetry={() => void load()} retrying={pending} /> : null}
@@ -702,6 +753,13 @@ export function DigestCanvas() {
         {visibleCards.map((card) => (
           <article className={`wikiDigestCard sev-${card.severity}`} key={card.cardId}>
             <div className="wikiDigestCardHead">
+              <input
+                type="checkbox"
+                checked={selected.has(card.cardId)}
+                onChange={() => toggleSelect(card.cardId)}
+                disabled={card.suggestedAction === "freeform"}
+                aria-label={`选择卡片 ${card.title}`}
+              />
               <span className={severityBadgeClass(card.severity)}>{severityLabel(card.severity)}</span>
               <span className="wikiDigestKind">{digestCardKindLabel(card.kind)}</span>
             </div>
