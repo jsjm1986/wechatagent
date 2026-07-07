@@ -24,7 +24,7 @@
 
 **后端（修改）**
 - `src/models.rs` — `Contact`（:138）加 `avatar_url`；`WechatAccount`（:58）加 `avatar_url`；`ApiContact`（:3276）加 `avatar_url` + `From` 映射（:3318）。
-- `src/mcp.rs` — 新增 `fetch_roster_for_account`（调 `contact_list`，解析 items + 头像 key fallback）。
+- `src/mcp.rs` — 新增 `fetch_roster_for_account`（调 `contacts_fetch_cache`，解析 items + 头像 key fallback）。
 - `src/routes/contacts.rs` — 新增 `roster_endpoint`、`batch_enable_endpoint`、`handle_initial_profile_task`（`pub`，供 tasks.rs 调）；抽出 `apply_generated_profile_to_contact`（`pub(super)`）并让 `enable_agent` 复用。
 - `src/routes/mod.rs` — 挂载两个新路由；导出新 handler。
 - `src/tasks.rs` — worker 分发加 `kind == "initial_profile"` 分支。
@@ -272,8 +272,10 @@ pub async fn fetch_roster_for_account(
     state: &AppState,
     account_id: &str,
 ) -> AppResult<Vec<RosterFriend>> {
-    // contact_list 是主工具；account_alias 由 logged_call_for_account 自动注入。
-    let result = logged_call_for_account(state, account_id, "contact_list", serde_json::json!({})).await?;
+    // contacts_fetch_cache 是全量好友工具（线上 tools/list 亲验；contact_list 不存在）。
+    let result =
+        logged_call_for_account(state, account_id, "contacts_fetch_cache", serde_json::json!({}))
+            .await?;
     Ok(parse_roster_items(&result))
 }
 ```
@@ -288,7 +290,7 @@ Expected: 3 tests PASS。
 ```bash
 git add src/mcp.rs
 git commit -m "$(cat <<'EOF'
-feat(mcp): contact_list 全量好友拉取 + 头像字段 fallback 解析
+feat(mcp): contacts_fetch_cache 全量好友拉取 + 头像字段 fallback 解析
 
 Co-Authored-By: Claude <noreply@anthropic.com>
 EOF
@@ -1010,16 +1012,16 @@ Expected: exit 0（新增行无红线词）。
 Run: `cd frontend && npx tsc --noEmit && npx vitest run && npm run build`
 Expected: 全绿，`frontend/dist` 产出。
 
-- [ ] **Step 4: MCP 真实字段核对（部署后，服务恢复时）**
+- [x] **Step 4: MCP 真实字段核对（部署后，线上 tools/list 已亲验）**
 
-服务恢复后，对目标账号打一次真实 `contact_list`（经 `POST /api/contacts/roster?accountId=`），核对：①返回 items 非空 ②头像 URL 真实可渲染 ③头像字段真实 key 是否已在 `parse_roster_items` fallback 列表中——若 server 用的是列表外的新 key，补进去并加注释。这是唯一需线上环境闭环的验证点（spec §7）。
+2026-07-07 线上 `tools/list` 亲验：工具名 `contact_list` 被证伪（`Forbidden tool`），改用 `contacts_fetch_cache`（已修 `src/mcp.rs`）。⚠️ 头像 / 数组真实 key **仍开放**：线上测试账号缓存为空（`structuredContent:{}`），无 populated 样本。已加内容识别兜底（`contact_like_array`）扛未知数组 key。**残留 TODO**：待某账号缓存非空时，再打一次 `contacts_fetch_cache` 核对 ①真实数组 key ②头像真实 key，若在 fallback 列表外则补入（spec §7）。
 
 ---
 
 ## Self-Review
 
 **Spec coverage：**
-- §1 通讯录第三视图 → Task 8。全量 `contact_list` + 左连接标注 → Task 2 + Task 3。纯浏览不写库 → Task 3（roster 只读）。✓
+- §1 通讯录第三视图 → Task 8。全量 `contacts_fetch_cache` + 左连接标注 → Task 2 + Task 3。纯浏览不写库 → Task 3（roster 只读）。✓
 - §2a avatar_url 全链路 → Task 1。✓
 - §2b GET /contacts/roster → Task 3。✓
 - §2c POST /contacts/batch-enable（upsert+managed+sharedNote+account校验+异步入队+幂等+老客户保留） → Task 6（老客户保留经 Task 4 的 `is_previously_operated` 分支）。✓

@@ -30,7 +30,7 @@
 
 **纯浏览不写库**：打开通讯录视图只做「MCP 拉全量 + 本地 contacts 左连接标注」，不落任何库。只有当运营人员勾选并点「加入 Agent 运营」时才写库。这样反复打开通讯录不会污染 contacts 集合。
 
-**关键实现前提（已部分核实，仍须在实现前用 live `tools/list` 补全）**：2026-07-07 拉取 MCP 指南页（`http://117.72.54.28:3001/mcp-guide.html`）确认好友类工具真实名为 **`contact_list`**（主）与 **`im_sync`**（备选，全量同步），**不是**早前假设的 `contacts_fetch_cache`（该名在指南工具清单中不存在）。但指南页只列工具名，**未列出参 schema**，因此头像字段的真实 key（`bigHeadImg`/`smallHeadImg`/`headImgUrl` 之一）当日无法确认——探测时 MCP 网关返回 502（已知外部宕机）。实现计划第一步必须在服务恢复后打一次 `contact_list`（或 `im_sync`）真实调用，落定：①出参数组路径 ②头像字段 key ③是否分页/单次上限 ④Workspace Key 是否需 `account_alias`（账号类工具需，见 `src/mcp.rs:377-380`）。字段 key 定了再写解析代码。
+**关键实现前提（2026-07-07 线上 `tools/list` 已亲验闭环）**：早前拉取的 MCP 指南页（`http://117.72.54.28:3001/mcp-guide.html`）曾载好友类工具名为 `contact_list`（主）与 `im_sync`（备选）——**此断言经线上 `tools/list` 证伪**：gewe-multi-tenant server（136 工具）**无 `contact_list`**（调用返 `-32000 Forbidden tool: contact_list`），`im_sync` 描述为 "Sync **enterprise** WeChat contacts"（企业微信，错域）。全量个人好友的唯一正确工具是 **`contacts_fetch_cache`**（描述 "Fetch the full remote contacts cache from GeWe"，入参 schema 为空 `{}`）。头像字段真实 key 仍**未能落定**——线上测试账号（alias `t-1`，`online:true`）的联系人缓存当前为空（`structuredContent:{}`），无 populated 样本可观察；故 `parse_roster_items` 保留 `bigHeadImg`/`smallHeadImg`/`headImgUrl`/`avatarUrl`/`headimgurl` 多 key fallback，并新增「按内容识别联系人数组」兜底（数组 key 也未核实）。⚠️ **仍开放**：待某账号缓存非空时，须再打一次 `contacts_fetch_cache` 核对 ①真实数组 key ②头像真实 key，若在 fallback 列表外则补入。另注：`call_tool_with_key`（`src/mcp.rs:202-205`）只回 `result.structuredContent`（已剥 JSON-RPC 外壳与 `content[0].text`），故解析器生效的是**顶层**数组候选。
 
 ---
 
