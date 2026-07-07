@@ -6,7 +6,7 @@ use axum::{
 };
 use futures::TryStreamExt;
 use mongodb::{
-    bson::{doc, to_bson, DateTime, Document, Regex},
+    bson::{doc, oid::ObjectId, to_bson, DateTime, Document, Regex},
     options::FindOptions,
 };
 use serde::Deserialize;
@@ -18,7 +18,7 @@ use crate::{
     error::{AppError, AppResult},
     mcp::{self},
     models::{
-        ApiContact, ContactQuery, CustomAgentInstructionsRequest, EnableAgentRequest,
+        ApiContact, Contact, ContactQuery, CustomAgentInstructionsRequest, EnableAgentRequest,
         ImportContactsRequest, ProfileNoteRequest, SearchImportRequest,
     },
 };
@@ -413,6 +413,80 @@ pub(super) async fn roster_endpoint(
     Ok(Json(json!({ "items": items, "total": total })))
 }
 
+/// 把 AI 生成的初始运营画像落库到指定联系人（切 managed + 画像 + 备注 + playbook）。
+///
+/// 同步 `enable_agent` 与异步 `handle_initial_profile_task` 两条路径共用此函数，
+/// 避免画像落库逻辑（stage/intent 校验、老客户字段保留、operation_state 初始态）
+/// 在两处复制后漂移。
+pub(super) async fn apply_generated_profile_to_contact(
+    state: &AppState,
+    workspace_id: &str,
+    contact: &Contact,
+    note: &str,
+    playbook_id: Option<ObjectId>,
+    playbook_version: i32,
+    generated: &agent::GeneratedOperationProfile,
+) -> AppResult<()> {
+    let object_id = contact
+        .id
+        .ok_or_else(|| AppError::BadRequest("contact missing _id".to_string()))?;
+    let commitments_bson = commitments_with_optional_text(
+        &contact.commitments,
+        generated.last_commitment.as_deref(),
+    );
+    // #72：曾运营过的老客户重新启用时，保留已积累的 stage / operation_state /
+    // commitments，不回退到 new_contact；只切 managed + 更新本次显式输入
+    // （备注 / playbook / 画像）。全新客户才走完整初始化。
+    let mut set_doc = doc! {
+        "agent_status": "managed",
+        "human_profile_note": note,
+        "agent_profile": to_bson(&generated.agent_profile)?,
+        "playbook_id": playbook_id,
+        "playbook_version": playbook_version,
+        "profile_attributes": generated.profile_attributes.clone(),
+        "profile_updated_at": DateTime::now(),
+        "updated_at": DateTime::now(),
+    };
+    let mut unset_doc = Document::new();
+    if !is_previously_operated(contact) {
+        // H13：初始 operation_state 从 active 状态机的 initial 态取（替代写死 "new_contact"）。
+        let domain_config =
+            agent::load_user_operation_domain_config(state, workspace_id).await?;
+        let initial_state = agent::initial_operation_state_key(domain_config.as_ref());
+        // M4：AI 生成的初始画像 stage/intent 经 dimension_registry 校验后再落库
+        // （对齐 management.rs 建档路径 + AI 主决策 validate_and_normalize_decision）。
+        // AI 产出 → WriteIntent::MachineWrite：越界值 drop（不阻断建档），不像 admin 那样 reject。
+        let (gen_stage, gen_intent) = validate_generated_stage_intent(
+            state,
+            &contact.account_id,
+            generated.customer_stage.as_deref(),
+            generated.intent_level.as_deref(),
+        )
+        .await?;
+        insert_domain_stage_fields(&mut set_doc, gen_stage.as_deref(), gen_intent.as_deref(), true);
+        set_doc.insert("commitments", commitments_bson);
+        set_doc.insert("follow_up_policy", generated.follow_up_policy.clone());
+        set_doc.insert("operation_state", initial_state);
+        set_doc.insert(
+            "operation_state_reason",
+            "初次纳入 Agent 运营，等待后续互动确认阶段",
+        );
+        set_doc.insert("operation_state_confidence", 6);
+        set_doc.insert("operation_state_updated_at", DateTime::now());
+        unset_doc.insert("last_commitment", "");
+    }
+    let mut update_doc = doc! { "$set": set_doc };
+    if !unset_doc.is_empty() {
+        update_doc.insert("$unset", unset_doc);
+    }
+    state
+        .db
+        .contacts()
+        .update_one(doc! { "_id": object_id }, update_doc, None)
+        .await?;
+    Ok(())
+}
+
 pub(super) async fn enable_agent(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
@@ -424,7 +498,6 @@ pub(super) async fn enable_agent(
             "humanProfileNote is required".to_string(),
         ));
     }
-    let object_id = parse_object_id(&id)?;
     let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
     // P1：先校验 contact.account_id 在 wechat_accounts 注册过。否则即使写 managed
     // 进去，webhook 入站时 resolve_account_context 也会因为 appId 匹配不到这个
@@ -455,65 +528,16 @@ pub(super) async fn enable_agent(
         Some(&playbook),
     )
     .await?;
-    let commitments_bson = commitments_with_optional_text(
-        &contact.commitments,
-        generated.last_commitment.as_deref(),
-    );
-    // #72：曾运营过的老客户重新启用时，保留已积累的 stage / operation_state /
-    // commitments，不回退到 new_contact；只切 managed + 更新本次 admin 显式输入
-    // （备注 / playbook / 画像）。全新客户才走完整初始化。
-    let mut set_doc = doc! {
-        "agent_status": "managed",
-        "human_profile_note": payload.human_profile_note,
-        "agent_profile": to_bson(&generated.agent_profile)?,
-        "playbook_id": playbook.id,
-        "playbook_version": playbook.version,
-        "profile_attributes": generated.profile_attributes,
-        "profile_updated_at": DateTime::now(),
-        "updated_at": DateTime::now(),
-    };
-    let mut unset_doc = Document::new();
-    if !is_previously_operated(&contact) {
-        // H13：初始 operation_state 从 active 状态机的 initial 态取（替代写死 "new_contact"）。
-        let domain_config =
-            agent::load_user_operation_domain_config(&state, &admin.current_workspace).await?;
-        let initial_state = agent::initial_operation_state_key(domain_config.as_ref());
-        // M4：AI 生成的初始画像 stage/intent 经 dimension_registry 校验后再落库
-        // （对齐 management.rs 建档路径 + AI 主决策 validate_and_normalize_decision）。
-        // AI 产出 → WriteIntent::MachineWrite：越界值 drop（不阻断建档），不像 admin 那样 reject。
-        let (gen_stage, gen_intent) = validate_generated_stage_intent(
-            &state,
-            &contact.account_id,
-            generated.customer_stage.as_deref(),
-            generated.intent_level.as_deref(),
-        )
-        .await?;
-        insert_domain_stage_fields(
-            &mut set_doc,
-            gen_stage.as_deref(),
-            gen_intent.as_deref(),
-            true,
-        );
-        set_doc.insert("commitments", commitments_bson);
-        set_doc.insert("follow_up_policy", generated.follow_up_policy);
-        set_doc.insert("operation_state", initial_state);
-        set_doc.insert(
-            "operation_state_reason",
-            "初次纳入 Agent 运营，等待后续互动确认阶段",
-        );
-        set_doc.insert("operation_state_confidence", 6);
-        set_doc.insert("operation_state_updated_at", DateTime::now());
-        unset_doc.insert("last_commitment", "");
-    }
-    let mut update_doc = doc! { "$set": set_doc };
-    if !unset_doc.is_empty() {
-        update_doc.insert("$unset", unset_doc);
-    }
-    state
-        .db
-        .contacts()
-        .update_one(doc! { "_id": object_id }, update_doc, None)
-        .await?;
+    apply_generated_profile_to_contact(
+        &state,
+        &admin.current_workspace,
+        &contact,
+        &payload.human_profile_note,
+        playbook.id,
+        playbook.version,
+        &generated,
+    )
+    .await?;
     let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
     Ok(Json(json!({ "item": ApiContact::from(contact) })))
 }
