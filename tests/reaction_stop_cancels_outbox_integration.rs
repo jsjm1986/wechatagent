@@ -39,6 +39,7 @@ fn make_contact(wxid: &str) -> Contact {
         nickname: Some("停止意图测试客户".to_string()),
         remark: None,
         alias: None,
+        avatar_url: None,
         agent_status: wechatagent::models::AgentStatus::Managed,
         human_profile_note: None,
         custom_agent_instructions: None,
