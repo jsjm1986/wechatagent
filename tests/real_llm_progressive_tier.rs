@@ -300,6 +300,7 @@ fn managed_contact(wxid: &str) -> Contact {
         nickname: Some("真实三档 smoke 客户".to_string()),
         remark: None,
         alias: None,
+        avatar_url: None,
         agent_status: AgentStatus::Managed,
         human_profile_note: None,
         agent_profile: None,

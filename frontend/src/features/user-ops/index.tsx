@@ -9,6 +9,7 @@ import {
   TraditionalOpsTabs
 } from "./legacy";
 import { CockpitPanel } from "./cockpit/CockpitPanel";
+import { RosterView } from "./RosterView";
 import OperationsFeature from "../operations";
 import { useUserOpsStore } from "../../stores/userOpsStore";
 import { useStrategyStore } from "../../stores/strategyStore";
@@ -334,6 +335,8 @@ function UserOpsFeatureInner() {
           />
         </section>
       )}
+
+      {userOpsMode === "roster" && <RosterView />}
 
       {userOpsMode === "traditional" && (
         <>

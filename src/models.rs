@@ -65,6 +65,8 @@ pub struct WechatAccount {
     pub app_id: Option<String>,
     pub wxid: Option<String>,
     pub nick_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar_url: Option<String>,
     pub mcp_base_url: Option<String>,
     pub mcp_api_key: Option<String>,
     pub online: bool,
@@ -144,6 +146,8 @@ pub struct Contact {
     pub nickname: Option<String>,
     pub remark: Option<String>,
     pub alias: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar_url: Option<String>,
     pub agent_status: AgentStatus,
     pub human_profile_note: Option<String>,
     /// per-contact 运营人员特别指令（最高优先级 Operator Instruction 层）。
@@ -3196,6 +3200,28 @@ pub struct EnableAgentRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct BatchEnableCandidate {
+    pub wxid: String,
+    #[serde(default)]
+    pub nickname: Option<String>,
+    #[serde(default)]
+    pub remark: Option<String>,
+    #[serde(default)]
+    pub avatar_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchEnableRequest {
+    pub account_id: String,
+    pub candidates: Vec<BatchEnableCandidate>,
+    pub shared_note: String,
+    #[serde(default)]
+    pub playbook_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProfileNoteRequest {
     pub human_profile_note: String,
 }
@@ -3281,6 +3307,7 @@ pub struct ApiContact {
     pub nickname: Option<String>,
     pub remark: Option<String>,
     pub alias: Option<String>,
+    pub avatar_url: Option<String>,
     pub agent_status: AgentStatus,
     pub human_profile_note: Option<String>,
     pub custom_agent_instructions: Option<String>,
@@ -3325,6 +3352,7 @@ impl From<Contact> for ApiContact {
             nickname: contact.nickname,
             remark: contact.remark,
             alias: contact.alias,
+            avatar_url: contact.avatar_url,
             agent_status: contact.agent_status,
             human_profile_note: contact.human_profile_note,
             custom_agent_instructions: contact.custom_agent_instructions,
@@ -6772,5 +6800,29 @@ mod conversation_message_relay_tests {
         let msg: ConversationMessage =
             mongodb::bson::from_document(doc).expect("deserialize");
         assert!(!msg.is_synthetic_relay);
+    }
+}
+
+#[cfg(test)]
+mod avatar_field_tests {
+    use super::Contact;
+    use mongodb::bson::{doc, DateTime};
+
+    #[test]
+    fn contact_deserializes_without_avatar_url_field() {
+        // 旧文档没有 avatar_url，必须 serde(default) 反序列化为 None（向后兼容红线）。
+        // 用 bson::doc! 直接构造（对齐 ConversationMessage 的向后兼容测试写法）：
+        // created_at / updated_at 是必需的非 Option 字段（无 #[serde(default)]），
+        // 必须提供且是真正的 bson DateTime，故不能走 serde_json::json!。
+        let doc = doc! {
+            "workspace_id": "w",
+            "account_id": "a",
+            "wxid": "wxid_1",
+            "agent_status": "normal",
+            "created_at": DateTime::now(),
+            "updated_at": DateTime::now(),
+        };
+        let contact: Contact = mongodb::bson::from_document(doc).unwrap();
+        assert_eq!(contact.avatar_url, None);
     }
 }

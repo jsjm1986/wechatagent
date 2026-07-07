@@ -231,6 +231,8 @@ async fn tick(state: &AppState) -> anyhow::Result<()> {
             agent::handle_memory_consolidation_task(state, task).await
         } else if task.kind == "outcome_aggregation" {
             handle_outcome_aggregation_task(state, task).await
+        } else if task.kind == "initial_profile" {
+            crate::routes::contacts::handle_initial_profile_task(state, &task).await
         } else {
             agent::handle_follow_up_task(state, task).await
         };

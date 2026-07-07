@@ -40,6 +40,7 @@ fn make_account_with_key(workspace_id: &str, account_id: &str, key: &str) -> Wec
         app_id: Some("wx_app".to_string()),
         wxid: Some("wxid_demo".to_string()),
         nick_name: Some("演示账号".to_string()),
+        avatar_url: None,
         mcp_base_url: Some("http://mcp.example".to_string()),
         mcp_api_key: Some(key.to_string()),
         online: true,

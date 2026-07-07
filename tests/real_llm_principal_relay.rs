@@ -346,6 +346,7 @@ fn sales_contact(wxid: &str) -> Contact {
         nickname: Some("等领导裁决的客户".to_string()),
         remark: None,
         alias: None,
+        avatar_url: None,
         agent_status: AgentStatus::Managed,
         human_profile_note: None,
         custom_agent_instructions: None,
