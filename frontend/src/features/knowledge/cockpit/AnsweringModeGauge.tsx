@@ -36,7 +36,7 @@ export function AnsweringModeGauge({ mode, needsReviewChunks, summary, labels }:
       <div className={styles.amRow}>
         <span className={styles.amDot} />
         <span className={styles.amVal}>{label}</span>
-        <span className={styles.amCode}>answeringMode · {mode} · {level}/3 档</span>
+        <span className={styles.amCode}>{level}/3 档</span>
       </div>
       <div className={styles.amMeter}>
         <div className={styles.amFill} style={{ width: `${fillPct}%` }} />

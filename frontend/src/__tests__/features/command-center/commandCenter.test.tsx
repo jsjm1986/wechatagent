@@ -49,7 +49,7 @@ describe("CommandCenterFeature", () => {
 
   it("renders Management Agent title", () => {
     render(<CommandCenterFeature />);
-    expect(screen.getByText("Management Agent")).toBeInTheDocument();
+    expect(screen.getByText("管理助手")).toBeInTheDocument();
   });
 
   it("renders operation scope section", () => {
@@ -66,7 +66,7 @@ describe("CommandCenterFeature", () => {
   it("displays pending tasks count", () => {
     render(<CommandCenterFeature />);
     expect(screen.getByText("待执行任务")).toBeInTheDocument();
-    expect(screen.getByText("3 pending")).toBeInTheDocument();
+    expect(screen.getByText("3 个待执行")).toBeInTheDocument();
   });
 
   it("displays execution plan section", () => {
@@ -102,7 +102,8 @@ describe("CommandCenterFeature", () => {
       },
     });
     render(<CommandCenterFeature />);
-    expect(screen.getByText(/待核实/)).toBeInTheDocument();
+    // executed_unverified 现在标题与明细行都映射为「⚠️ 待核实」（明细不再泄漏原始状态码）
+    expect(screen.getAllByText(/待核实/).length).toBeGreaterThan(0);
   });
 
   it("does not render confirm button for already succeeded commands", () => {

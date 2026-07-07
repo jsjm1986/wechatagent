@@ -39,6 +39,18 @@ function tierLabel(tier?: string): string {
   }
 }
 
+// 素材类型 → 中文标签（与上传表单下拉同源：image/file/video）；未知回退「文件」。
+function mediaTypeLabel(mediaType?: string): string {
+  switch (mediaType) {
+    case "image":
+      return "图片";
+    case "video":
+      return "视频";
+    default:
+      return "文件";
+  }
+}
+
 const ACCEPT =
   "image/*,application/pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,video/mp4";
 
@@ -606,7 +618,7 @@ function MediaAssetRow({
             </span>
           </div>
           <p className={styles.metaLine}>
-            {asset.fileName || "未命名文件"} · {asset.mediaType || "file"} · {formatSize(asset.fileSize)}
+            {asset.fileName || "未命名文件"} · {mediaTypeLabel(asset.mediaType)} · {formatSize(asset.fileSize)}
           </p>
           {asset.sendTriggerHint && (
             <p className={styles.metaLine}>时机：{asset.sendTriggerHint}</p>

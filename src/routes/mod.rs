@@ -1159,6 +1159,12 @@ mod tests {
             // repair.rs：AI 自主修复 chunk 首轮核心业务逻辑，与 axum handler / auth 解耦，
             // 被 propose_chunk_repair handler 与 knowledge_task worker 复用、不直接绑 HTTP。
             "propose_chunk_repair_inner",
+            // knowledge/import.rs：标签抽取核心业务逻辑，被 extract_operation_knowledge_tags
+            // handler 与 knowledge_task worker（retag action）复用、不直接绑 HTTP。
+            "extract_knowledge_tags_inner",
+            // knowledge/chat.rs：chunk 更新落库内核（强制 draft+needs_review），被 chat_apply
+            // 与 knowledge_task worker（retag action）复用、不直接绑 HTTP。
+            "apply_update_chunk",
         ];
 
         let mut handlers: Vec<&str> = Vec::new();

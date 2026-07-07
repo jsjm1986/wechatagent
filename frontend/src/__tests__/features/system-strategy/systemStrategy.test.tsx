@@ -97,7 +97,7 @@ describe("SystemStrategy Feature", () => {
   it("一体化迁移：暂无数据时灰度面板渲染空态，重置 Prompt Pack 按钮可见", async () => {
     render(<SystemStrategyFeature />);
 
-    expect(screen.getByText("重置系统 Prompt Pack v2")).toBeInTheDocument();
+    expect(screen.getByText("重置系统提示词包 v2")).toBeInTheDocument();
     // api.get mock 返回空 items（异步 reload 后）→ 各灰度面板空态文案
     await waitFor(() => {
       expect(screen.getByText("暂无状态策略")).toBeInTheDocument();

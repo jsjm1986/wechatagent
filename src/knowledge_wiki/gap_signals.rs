@@ -1018,7 +1018,7 @@ pub async fn refresh_usage_stats_and_confidence(
             min_samples,
         );
 
-        let mut set: Document = doc! {
+        let set: Document = doc! {
             "usage_stats": {
                 "hit_count_30d": h as i64,
                 "blocked_count_30d": b as i64,
@@ -1028,10 +1028,9 @@ pub async fn refresh_usage_stats_and_confidence(
             "dynamic_confidence": dyn_conf,
             "updated_at": now,
         };
-        // 显式去掉 None 字段以保持 doc 干净（mongo 写 null 也合法，这里二选一）
-        if last_used_at.is_none() {
-            set.insert("usage_stats.last_used_at", Bson::Null);
-        }
+        // last_used_at 已在上面的 usage_stats 对象里写好（None → Bson::Null）；
+        // 不能再往同一 $set 里插子路径 usage_stats.last_used_at——MongoDB 禁止同一
+        // $set 中父路径(usage_stats)与子路径(usage_stats.last_used_at)并存(code 40)。
         db.operation_knowledge_chunks()
             .update_one(
                 doc! { "_id": oid },

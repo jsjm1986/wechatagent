@@ -244,7 +244,7 @@ function CatalogTab() {
         {products.length === 0 ? (
           <EmptyState
             title="暂无产品"
-            hint="在右侧录入结构化产品（product_id / 价格 / SKU），agent 报价以此为准。无产品行业可留空。"
+            hint="在右侧录入产品（产品编号 / 价格 / SKU），AI 报价以此为准。无产品行业可留空。"
           />
         ) : (
           <div className={styles.list}>
@@ -285,7 +285,7 @@ function CatalogTab() {
         </div>
         <div className={styles.form}>
           <label className={styles.field}>
-            <span className={styles.fieldLabel}>product_id（业务主键，工作区内唯一）</span>
+            <span className={styles.fieldLabel}>产品编号（自定，同一账号内不可重复）</span>
             <input
               className={styles.input}
               value={draft.productId}

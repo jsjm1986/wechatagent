@@ -81,12 +81,12 @@ function commandCallDetail(call: CommandToolCall): string {
     return [
       `实际发送：${sentContent}`,
       gatewayStatus ? `网关：${gatewayStatusLabel(String(gatewayStatus))}` : "",
-      reviewApproved !== undefined ? `Review：${reviewApproved ? "通过" : "未通过"}` : "",
-      messageId ? `messageId：${String(messageId)}` : "",
+      reviewApproved !== undefined ? `复核：${reviewApproved ? "通过" : "未通过"}` : "",
+      messageId ? `消息编号：${String(messageId)}` : "",
       gatewayReason ? `原因：${String(gatewayReason)}` : ""
     ].filter(Boolean).join(" · ");
   }
-  return call.status;
+  return callStatusLabel(call.status);
 }
 
 // 活动推送结果跳转守卫：仅当 dispatch_campaign 真实执行成功且带 campaignId 才给跳转 id，
@@ -98,8 +98,18 @@ export function dispatchCampaignId(call: CommandToolCall): string | null {
   return typeof id === "string" ? id : null;
 }
 
+// 命令运行整体状态(src/routes/management.rs final_status 闭集:running/pending_confirmation/
+// failed/dry_run/succeeded);未知值回落原值。
+const COMMAND_STATUS_LABELS: Record<string, string> = {
+  running: "执行中",
+  pending_confirmation: "待确认",
+  failed: "已失败",
+  dry_run: "演练（未真实执行）",
+  succeeded: "已完成",
+};
+
 function resultTitle(result: CommandResult): string {
-  return result.status === "dry_run" ? "DRY-RUN 演练" : result.status;
+  return COMMAND_STATUS_LABELS[result.status] ?? result.status;
 }
 
 export default function CommandCenterFeature() {
@@ -157,10 +167,10 @@ export default function CommandCenterFeature() {
               value={currentAccount?.alias || currentAccount?.displayName || currentAccount?.accountId || "-"}
               tone={accountTone}
             />
-            <StatusLine label="运营好友" value={`${managedCount} managed`} tone="ai" />
-            <StatusLine label="待执行任务" value={`${pendingTasks} pending`} tone={pendingTasks ? "warn" : "neutral"} />
-            <StatusLine label="内容资产" value={`${assets.length} assets`} tone="neutral" />
-            <StatusLine label="Agent Soul" value={`${souls.length} versions`} tone="neutral" />
+            <StatusLine label="运营好友" value={`${managedCount} 位运营中`} tone="ai" />
+            <StatusLine label="待执行任务" value={`${pendingTasks} 个待执行`} tone={pendingTasks ? "warn" : "neutral"} />
+            <StatusLine label="内容资产" value={`${assets.length} 个素材`} tone="neutral" />
+            <StatusLine label="AI 人格" value={`${souls.length} 个版本`} tone="neutral" />
           </div>
           <div className={styles.boundaryBox}>
             <strong>执行边界</strong>
@@ -176,7 +186,7 @@ export default function CommandCenterFeature() {
           <div className={styles.commandHeader}>
             <span className={styles.commandHeaderIcon}><BrainCircuit size={20} /></span>
             <div className={styles.commandHeaderTxt}>
-              <strong>Management Agent<span className={styles.liveDot} /></strong>
+              <strong>管理助手<span className={styles.liveDot} /></strong>
               <span>用自然语言管理好友、群、朋友圈和任务。</span>
             </div>
           </div>
@@ -209,7 +219,7 @@ export default function CommandCenterFeature() {
                 checked={commandDryRun}
                 onChange={(event) => setCommandDryRun(event.target.checked)}
               />
-              <span>Dry-run（不写业务库）</span>
+              <span>演练模式（只预演，不写业务库）</span>
             </label>
             <span className={`${styles.modeBadge} ${commandDryRun ? styles.dryRun : styles.live}`}>
               {commandDryRun ? "演练模式" : "真实执行"}

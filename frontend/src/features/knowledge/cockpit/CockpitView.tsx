@@ -14,7 +14,7 @@ interface CockpitViewProps {
 export function CockpitView({ onOpenReview, onOpenAutoVerify }: CockpitViewProps) {
   const [completeness, setCompleteness] = useState<CompletenessView | null>(null);
   const [integrity, setIntegrity] = useState<IntegrityReportView | null>(null);
-  const [gapPendingCount, setGapPendingCount] = useState(0);
+  const [gapPendingCount, setGapPendingCount] = useState<number | null>(0);
   const [loadFailed, setLoadFailed] = useState(false);
 
   const load = useCallback(() => {
@@ -36,10 +36,14 @@ export function CockpitView({ onOpenReview, onOpenAutoVerify }: CockpitViewProps
       if (!alive) return;
       setCompleteness(comp);
       setIntegrity(integ);
-      const signals = gaps && Array.isArray((gaps as { signals?: unknown[] }).signals)
-        ? (gaps as { signals: unknown[] }).signals
-        : [];
-      setGapPendingCount(signals.length);
+      // gaps 请求失败(null)与"真的没有缺口"(空 signals 数组)要区分：
+      // 失败置 null → 卡片显"—"，避免把加载失败伪装成"零待办"误导运营。
+      const gapCount = gaps
+        ? (Array.isArray((gaps as { signals?: unknown[] }).signals)
+            ? (gaps as { signals: unknown[] }).signals.length
+            : 0)
+        : null;
+      setGapPendingCount(gapCount);
       if (!comp) setLoadFailed(true);
     });
     return () => {
@@ -85,20 +89,20 @@ export function CockpitView({ onOpenReview, onOpenAutoVerify }: CockpitViewProps
         <div className={styles.todoGrid}>
           <MetricCard
             label="待审草稿"
-            value={integrity?.needsReview ?? 0}
-            detail="审过前 AI 不会用"
+            value={integrity ? integrity.needsReview : "—"}
+            detail={integrity ? "审过前 AI 不会用" : "数据加载失败，请重试"}
             onClick={() => onOpenReview()}
           />
           <MetricCard
-            label="D2 降级"
-            value={integrity?.anchorsMissing ?? 0}
-            detail="active 但缺原文锚点"
+            label="缺原文出处"
+            value={integrity ? integrity.anchorsMissing : "—"}
+            detail={integrity ? "已启用但没填原文出处，AI 用前需补齐" : "数据加载失败，请重试"}
             onClick={() => onOpenReview()}
           />
           <MetricCard
             label="知识缺口"
-            value={gapPendingCount}
-            detail="待处理的缺口信号"
+            value={gapPendingCount ?? "—"}
+            detail={gapPendingCount === null ? "数据加载失败，请重试" : "待处理的缺口信号"}
             onClick={() => onOpenReview()}
           />
         </div>

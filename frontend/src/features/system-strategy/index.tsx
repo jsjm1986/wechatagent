@@ -10,6 +10,7 @@ import { LessonPromoteCard } from "../../components/review/LessonPromoteCard";
 import { ConfirmProvider } from "../../components/ui/ConfirmDialog";
 import { usePromptSaveConfirm, usePromptPublishConfirm } from "../../components/prompt/usePromptSaveConfirm";
 import { ToastProvider } from "../../components/ui/Toast";
+import { VERSION_STATUS_LABELS, seededByLabel, promptLayerLabel } from "../../lib/reviewLabels";
 import styles from "./SystemStrategy.module.css";
 
 // 系统策略频道：全局总控 Prompt（人格/任务）+ 状态机灰度 + 双层标签字典 + 跨用户教训。
@@ -92,27 +93,19 @@ function agentKindLabel(kind: string) {
   return labels[kind] || kind;
 }
 
-// prompt 模板 layer(与新建下拉选项同源;后端 prompts.rs 5 值)。
-function promptLayerLabel(layer: string): string {
-  const labels: Record<string, string> = {
-    system_contract: "系统契约",
-    policy: "运营规则",
-    task_template: "任务模板",
-    review: "复盘审查",
-    methodology_generator: "方法论生成",
-  };
-  return labels[layer] || layer;
+// prompt/soul 版本状态。映射收敛到共享字典 VERSION_STATUS_LABELS(单一真相源);未知值回落原值。
+function versionStatusLabel(status: string): string {
+  return VERSION_STATUS_LABELS[status] || status;
 }
 
-// prompt/soul 版本状态(prompt_templates.rs draft→active;未知值回落原值)。
-function versionStatusLabel(status: string): string {
-  const labels: Record<string, string> = {
-    draft: "草稿",
-    active: "生效中",
-    published: "已发布",
-    archived: "已归档",
-  };
-  return labels[status] || status;
+// 数字分身关系类型(canonical:customer/peer/friend,同 m024 字典/seed profile);未知回落原值。
+const RELATIONSHIP_TYPE_LABELS: Record<string, string> = {
+  customer: "客户",
+  peer: "同行",
+  friend: "朋友",
+};
+function relationshipTypeLabel(rt: string): string {
+  return RELATIONSHIP_TYPE_LABELS[rt] || rt;
 }
 
 // lessons 教训评审状态(lessons_learned.rs;未知值回落原值)。
@@ -200,7 +193,7 @@ function ActiveVersionsBar({
       <div className={styles.activeVersionsMeta}>
         <span className={isCurrent ? styles.activeVersionsBadgeCurrent : styles.activeVersionsBadgeShadow}>
           v{version}
-          {isCurrent ? " · current" : " · shadow"}
+          {isCurrent ? " · 当前生效" : " · 影子版本"}
         </span>
         {previousVersion !== null && (
           <span className={styles.activeVersionsChain} title="previous_version 回滚链">
@@ -209,7 +202,7 @@ function ActiveVersionsBar({
         )}
         {seededBy && (
           <span className={styles.activeVersionsSeeded} title="写入来源">
-            {seededBy}
+            {seededByLabel(seededBy)}
           </span>
         )}
         {meta.updatedAt && (
@@ -611,7 +604,7 @@ function StatePolicyAdmin({ busy }: { busy: boolean }) {
                 <span className={styles.versionedListScope}>{item.domain}</span>
                 <h3>{item.stateKey}</h3>
               </div>
-              <span className={item.status === "active" ? styles.badgeOk : styles.badgeDegraded}>{item.status}</span>
+              <span className={item.status === "active" ? styles.badgeOk : styles.badgeDegraded}>{versionStatusLabel(item.status)}</span>
             </div>
             <ActiveVersionsBar
               meta={item}
@@ -623,15 +616,15 @@ function StatePolicyAdmin({ busy }: { busy: boolean }) {
             />
             <div className={styles.versionedListBody}>
               <div className={styles.versionedListChunk}>
-                <span>allowed</span>
+                <span>允许动作</span>
                 <p>{item.allowed.join("，") || "—"}</p>
               </div>
               <div className={styles.versionedListChunk}>
-                <span>forbidden</span>
+                <span>禁止动作</span>
                 <p>{item.forbidden.join("，") || "—"}</p>
               </div>
               <div className={styles.versionedListChunk}>
-                <span>recommendedPace</span>
+                <span>建议节奏</span>
                 <p>{item.recommendedPace || "—"}</p>
               </div>
             </div>
@@ -859,7 +852,7 @@ function TaxonomiesAdmin({ busy }: { busy: boolean }) {
               checked={createDraft.isReactivationTarget}
               onChange={(e) => setCreateDraft({ ...createDraft, isReactivationTarget: e.target.checked })}
             />
-            可作再激活目标 is_reactivation_target
+            可作再激活目标
           </label>
           <label className={styles.inlineCheckbox}>
             <input
@@ -867,7 +860,7 @@ function TaxonomiesAdmin({ busy }: { busy: boolean }) {
               checked={createDraft.isTerminal}
               onChange={(e) => setCreateDraft({ ...createDraft, isTerminal: e.target.checked })}
             />
-            终态 is_terminal
+            终态
           </label>
           <div className={styles.buttonRow}>
             <button type="button" className={styles.btnPrimary} onClick={() => void submitCreate()} disabled={acting}>保存</button>
@@ -887,7 +880,7 @@ function TaxonomiesAdmin({ busy }: { busy: boolean }) {
                 <h3>{item.value.label || item.value.id}</h3>
               </div>
               <span className={item.value.status === "active" ? styles.badgeOk : styles.badgeDegraded}>
-                {item.value.status}
+                {versionStatusLabel(item.value.status)}
               </span>
             </div>
             <ActiveVersionsBar
@@ -904,12 +897,12 @@ function TaxonomiesAdmin({ busy }: { busy: boolean }) {
                 <p>{item.value.id}</p>
               </div>
               <div className={styles.versionedListChunk}>
-                <span>aliases</span>
+                <span>别名</span>
                 <p>{(item.value.aliases ?? []).join("，") || "—"}</p>
               </div>
               {item.value.description && (
                 <div className={styles.versionedListChunk}>
-                  <span>description</span>
+                  <span>描述</span>
                   <p>{item.value.description}</p>
                 </div>
               )}
@@ -949,7 +942,7 @@ function TaxonomiesAdmin({ busy }: { busy: boolean }) {
                     checked={editDraft.isReactivationTarget}
                     onChange={(e) => setEditDraft({ ...editDraft, isReactivationTarget: e.target.checked })}
                   />
-                  可作再激活目标 is_reactivation_target
+                  可作再激活目标
                 </label>
                 <label className={styles.inlineCheckbox}>
                   <input
@@ -957,7 +950,7 @@ function TaxonomiesAdmin({ busy }: { busy: boolean }) {
                     checked={editDraft.isTerminal}
                     onChange={(e) => setEditDraft({ ...editDraft, isTerminal: e.target.checked })}
                   />
-                  终态 is_terminal
+                  终态
                 </label>
                 <div className={styles.buttonRow}>
                   <button type="button" className={styles.btnPrimary} onClick={() => void submitEdit(item.id)} disabled={acting}>保存编辑</button>
@@ -1176,14 +1169,14 @@ function TaxonomyCandidatesAdmin({ busy }: { busy: boolean }) {
             </div>
             <div className={styles.versionedListBody}>
               <div className={styles.versionedListChunk}>
-                <span>confidence / 出现次数</span>
+                <span>置信度 / 出现次数</span>
                 <p>
                   {item.confidence} · {item.occurrences} 次
                 </p>
               </div>
               {item.evidence && (
                 <div className={styles.versionedListChunk}>
-                  <span>evidence</span>
+                  <span>判断依据</span>
                   <p>{item.evidence}</p>
                 </div>
               )}
@@ -1535,7 +1528,7 @@ function ProfileEditor({
       <details className={styles.advanced}>
         <summary>方法论生成器引导语（可选）</summary>
         <label className={styles.field}>
-          <span>methodologyGeneratorPreamble</span>
+          <span>方法论生成器引导语</span>
           <textarea
             className={styles.textarea}
             value={draft.methodology_generator_preamble ?? ""}
@@ -1618,7 +1611,7 @@ function ProfileEditor({
           只换人格口吻与方法论叙述，<strong>不放宽边界保护红线</strong>（边界硬规则始终由系统 prompt 守护）。
         </p>
         <label className={styles.field}>
-          <span>人格本体覆盖 soulOverride</span>
+          <span>人格本体覆盖</span>
           <textarea
             className={styles.textarea}
             value={draft.soul_override ?? ""}
@@ -1628,7 +1621,7 @@ function ProfileEditor({
           />
         </label>
         <label className={styles.field}>
-          <span>方法论本体覆盖 methodologyOverride</span>
+          <span>方法论本体覆盖</span>
           <textarea
             className={styles.textarea}
             value={draft.methodology_override ?? ""}
@@ -1638,7 +1631,7 @@ function ProfileEditor({
           />
         </label>
         <label className={styles.field}>
-          <span>对话模式判定规则覆盖 conversationModePolicy</span>
+          <span>对话模式判定规则覆盖</span>
           <textarea
             className={styles.textarea}
             value={draft.conversation_mode_policy ?? ""}
@@ -1650,7 +1643,7 @@ function ProfileEditor({
       </details>
 
       <details className={styles.advanced}>
-        <summary>自学习极性（H11）</summary>
+        <summary>自学习极性</summary>
         <p className={styles.panelHint}>
           正/负极 outcome 词集驱动召回排序 + 反向训练 + 卡死请示。留空回落内置销售极性。沉默/未分类一律删失（绝不臆测为负），本字段只声明正/负集。
         </p>
@@ -1691,7 +1684,7 @@ function ProfileEditor({
       </details>
 
       <details className={styles.advanced}>
-        <summary>completeness 审计维度</summary>
+        <summary>完整度审计维度</summary>
         <div className={styles.profileDimensionsSection}>
           {(draft.coverage_dimensions ?? []).map((cov, i) => (
             <div key={i} className={styles.profileDimensionRow}>
@@ -1772,13 +1765,13 @@ function ProfileEditor({
               })
             }
           >
-            + 添加 completeness 维度
+            + 添加完整度维度
           </button>
         </div>
       </details>
 
       <details className={styles.advanced}>
-        <summary>经营公式（H15）</summary>
+        <summary>经营公式</summary>
         <p className={styles.panelHint}>reviewer 自检 + /evaluations 度量锚点，不进硬闸。留空回落销售四公式。</p>
         <div className={styles.profileDimensionsSection}>
           {(draft.business_formulas ?? []).map((f, i) => (
@@ -1844,7 +1837,7 @@ function ProfileEditor({
       </details>
 
       <details className={styles.advanced}>
-        <summary>知识切片用途角色（H16）</summary>
+        <summary>知识条目用途角色</summary>
         <p className={styles.panelHint}>替代写死的销售四态分桶。留空回落内置销售四态。</p>
         <div className={styles.profileDimensionsSection}>
           {(draft.chunk_roles ?? []).map((role, i) => (
@@ -1923,7 +1916,7 @@ function ProfileEditor({
       </details>
 
       <details className={styles.advanced}>
-        <summary>记忆维度（H17）</summary>
+        <summary>记忆维度</summary>
         <p className={styles.panelHint}>memoryCard.extra 容器里的业务数组槽位。留空回落销售八槽。</p>
         <div className={styles.profileDimensionsSection}>
           {(draft.memory_dimensions ?? []).map((m, i) => (
@@ -2003,7 +1996,7 @@ function ProfileEditor({
       </details>
 
       <details className={styles.advanced}>
-        <summary>运营范式（H8/H19 三驱动力 + 作息门控）</summary>
+        <summary>运营范式（三驱动力 + 作息门控）</summary>
         <p className={styles.panelHint}>关掉某驱动力 → 对应 planner 扫描短路（陪伴型常关 funnel）。</p>
         <div className={styles.formGrid}>
           <label className={styles.inlineCheckbox}>
@@ -2021,7 +2014,7 @@ function ProfileEditor({
                 })
               }
             />
-            漏斗推进 funnel（停滞催进）
+            漏斗推进（停滞催进）
           </label>
           <label className={styles.inlineCheckbox}>
             <input
@@ -2038,7 +2031,7 @@ function ProfileEditor({
                 })
               }
             />
-            沉默唤醒 silence
+            沉默唤醒
           </label>
           <label className={styles.inlineCheckbox}>
             <input
@@ -2055,7 +2048,7 @@ function ProfileEditor({
                 })
               }
             />
-            承诺到期 commitment
+            承诺到期
           </label>
         </div>
       </details>
@@ -2072,11 +2065,11 @@ function ProfileEditor({
               checked={draft.transaction_facts_enabled ?? false}
               onChange={(e) => update({ transaction_facts_enabled: e.target.checked })}
             />
-            交易型域（注入产品目录 + 持有事实）transaction_facts_enabled
+            交易型域（注入产品目录 + 持有事实）
           </label>
         </div>
         <label className={styles.field}>
-          <span>评审重点 review_focus</span>
+          <span>评审重点</span>
           <input
             className={styles.input}
             type="text"
@@ -2092,7 +2085,7 @@ function ProfileEditor({
           />
         </label>
         <label className={styles.field}>
-          <span>平衡原则 balance_principle</span>
+          <span>平衡原则</span>
           <input
             className={styles.input}
             type="text"
@@ -2108,7 +2101,7 @@ function ProfileEditor({
           />
         </label>
         <label className={styles.field}>
-          <span>模式-闸说明覆盖 mode_gate_policy_override</span>
+          <span>模式-闸说明覆盖</span>
           <textarea
             className={styles.textarea}
             value={draft.mode_gate_policy_override ?? ""}
@@ -2116,7 +2109,7 @@ function ProfileEditor({
           />
         </label>
         <label className={styles.field}>
-          <span>去抖窗口（毫秒）debounce_window_ms_override</span>
+          <span>去抖窗口（毫秒）</span>
           <input
             className={styles.input}
             type="number"
@@ -2133,7 +2126,7 @@ function ProfileEditor({
       <details className={styles.advanced}>
         <summary>按关系类型分配运营范式（数字分身 per_relationship）</summary>
         <p className={styles.panelHint}>
-          为不同关系类型(customer/peer/friend)各配一套范式。未配的关系类型回落 profile 级 operation_mode。
+          为不同关系类型（客户 / 同行 / 朋友）各配一套范式。未配置的关系类型回落到画像级默认运营模式。
         </p>
         {(["customer", "peer", "friend"] as const).map((rt) => {
           const map = draft.per_relationship_operation_mode ?? {};
@@ -2162,7 +2155,7 @@ function ProfileEditor({
                     )
                   }
                 />
-                为 {rt} 单独配置范式
+                为「{relationshipTypeLabel(rt)}」单独配置范式
               </label>
               {enabled && mode && (
                 <>
@@ -2184,7 +2177,7 @@ function ProfileEditor({
                         setMode({ ...mode, silence: { ...(mode.silence ?? { enabled: true }), enabled: e.target.checked } })
                       }
                     />
-                    沉默唤醒 silence
+                    沉默唤醒
                   </label>
                   <label className={styles.inlineCheckbox}>
                     <input
@@ -2194,7 +2187,7 @@ function ProfileEditor({
                         setMode({ ...mode, commitment: { ...(mode.commitment ?? { enabled: true }), enabled: e.target.checked } })
                       }
                     />
-                    承诺到期 commitment
+                    承诺到期
                   </label>
                 </>
               )}
@@ -2207,7 +2200,7 @@ function ProfileEditor({
         <summary>领域标志位（高敏域可选）</summary>
         <div className={styles.formGrid}>
           <label className={styles.field}>
-            <span>停滞计时驱动维度 stagnationDimension</span>
+            <span>停滞计时驱动维度</span>
             <input
               className={styles.input}
               value={draft.stagnation_dimension ?? ""}
@@ -2221,7 +2214,7 @@ function ProfileEditor({
               checked={draft.grounding_gate_bypass_without_claim ?? false}
               onChange={(e) => update({ grounding_gate_bypass_without_claim: e.target.checked })}
             />
-            无产品声明时旁路 grounding 软闸（纯情感/关系域）
+            无产品声明时跳过知识接地校验（纯情感/关系域）
           </label>
           <label className={styles.inlineCheckbox}>
             <input
@@ -2341,7 +2334,7 @@ function DomainProfilePanel({ busy }: { busy: boolean }) {
         <div className={styles.profileGenerateSection}>
           <p className={styles.panelHint}>
             描述你的业务（行业/产品/客户/经营目标/对话风格），AI 将生成一份候选行业配置。
-            候选需要你审核确认后 publish + activate 才会生效。
+            候选需要你审核确认后「发布并激活」才会生效。
           </p>
           <label className={styles.field}>
             <span>Profile ID（英文唯一标识，生成后不可改）</span>
@@ -2374,7 +2367,7 @@ function DomainProfilePanel({ busy }: { busy: boolean }) {
           {generateError && <div className={styles.inlineError}>{generateError}</div>}
           {generateResult && (
             <div className={styles.profileGenerateSuccess}>
-              ✅ 候选配置已生成！可在「已有配置」列表中找到 v1 草稿，逐项审核后 publish + activate。
+              ✅ 候选配置已生成！可在「已有配置」列表中找到 v1 草稿，逐项审核后发布并激活。
               <br />
               如本次为新行业，AI 同时生成了取值字典候选（客户阶段 / 意向等级等维度的中文标签），需在本频道「新词候选审核」面板逐条采纳后，运营看板才会把这些维度显示为中文，否则将灰显英文原值。
             </div>
@@ -2433,7 +2426,7 @@ function DomainProfilePanel({ busy }: { busy: boolean }) {
                   <div className={styles.profileListMeta}>
                     <ProfileStatusBadge profile={profile} />
                     {profile.seeded_by && (
-                      <span className={styles.activeVersionsSeeded}>{profile.seeded_by}</span>
+                      <span className={styles.activeVersionsSeeded}>{seededByLabel(profile.seeded_by)}</span>
                     )}
                     {profile.updated_at && (
                       <span className={styles.activeVersionsTimestamp}>{profile.updated_at}</span>
@@ -2527,7 +2520,7 @@ function LessonsLearnedAdmin({ busy }: { busy: boolean }) {
 
   function patternLabel(kind: string): string {
     if (kind === "success") return "成功模式";
-    if (kind === "reviewer_misjudge_negative") return "Reviewer 误判（用户负反应）";
+    if (kind === "reviewer_misjudge_negative") return "复核误判（用户负反应）";
     if (kind === "blocked_by_safety_guard") return "安全门拦截";
     return kind || "未识别";
   }
@@ -2582,14 +2575,14 @@ function LessonsLearnedAdmin({ busy }: { busy: boolean }) {
                     onClick={() => openPromote(item.lessonId)}
                     disabled={busy || loading || promoting !== null}
                   >
-                    晋升为 peer_case
+                    晋升为同行案例
                   </button>
                 )}
               </div>
             </div>
             <div className={styles.versionedListBody}>
               <div className={styles.versionedListChunk}>
-                <span>sample run ids ({item.sampleRunIds.length})</span>
+                <span>样本运行 ID（{item.sampleRunIds.length}）</span>
                 <p>
                   {item.sampleRunIds.length === 0
                     ? "—"
@@ -2601,16 +2594,16 @@ function LessonsLearnedAdmin({ busy }: { busy: boolean }) {
                 </p>
               </div>
               <div className={styles.versionedListChunk}>
-                <span>updated</span>
+                <span>更新时间</span>
                 <p>{item.updatedAt || "—"}</p>
               </div>
               <div className={styles.versionedListChunk}>
-                <span>created</span>
+                <span>创建时间</span>
                 <p>{item.createdAt || "—"}</p>
               </div>
               {item.promotedChunkId && (
                 <div className={styles.versionedListChunk}>
-                  <span>promoted chunk</span>
+                  <span>已晋升切片</span>
                   <p>
                     <code>{item.promotedChunkId}</code>
                   </p>
@@ -2729,7 +2722,7 @@ function SystemStrategyInner() {
             onClick={() => void resetSystemPromptPack()}
             disabled={busy}
           >
-            重置系统 Prompt Pack v2
+            重置系统提示词包 v2
           </button>
         </div>
       </section>

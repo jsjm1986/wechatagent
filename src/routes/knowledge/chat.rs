@@ -1708,7 +1708,7 @@ pub async fn apply_create_chunk(
     }))
 }
 
-async fn apply_update_chunk(
+pub(crate) async fn apply_update_chunk(
     state: &AppState,
     workspace_id: &str,
     _account_id: &str,
@@ -1862,6 +1862,23 @@ pub(in crate::routes) struct ChatTaskCreateRequest {
     pub planned_steps: Vec<Value>,
 }
 
+/// 从 digest 卡片 target_refs 取第一个 kind=="chunk" 的非空 id。
+/// 用于派工落库时把 cardId 解析成 step.targetChunkId（fix_chunk/retag 需要）。
+pub(in crate::routes) fn extract_chunk_ref(
+    target_refs: &[mongodb::bson::Document],
+) -> Option<String> {
+    for r in target_refs {
+        if r.get_str("kind").ok() == Some("chunk") {
+            if let Ok(id) = r.get_str("id") {
+                if !id.is_empty() {
+                    return Some(id.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 pub(in crate::routes) async fn chat_task_create(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
@@ -1899,6 +1916,31 @@ pub(in crate::routes) async fn chat_task_create(
         "analyze_logs",
         "dismiss",
     ];
+    // 先加载今日日报，用其 cards 的 target_refs 构建 cardId → chunk id 解析表。
+    // 卡片驱动/对话驱动两条路的 step.cardId 都引用今日日报卡片。
+    let report_date = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let report = state
+        .db
+        .knowledge_daily_reports()
+        .find_one(
+            doc! {
+                "workspace_id": &admin.current_workspace,
+                "account_id": &account_id,
+                "report_date": &report_date,
+            },
+            None,
+        )
+        .await?;
+    let mut card_chunk_map: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    if let Some(r) = report.as_ref() {
+        for c in &r.cards {
+            if let Some(cid) = extract_chunk_ref(&c.target_refs) {
+                card_chunk_map.insert(c.card_id.to_hex(), cid);
+            }
+        }
+    }
+
     let mut steps_doc: Vec<Document> = Vec::with_capacity(body.planned_steps.len());
     for (idx, step) in body.planned_steps.iter().enumerate() {
         let mut d = bson_from_json(step)
@@ -1915,25 +1957,21 @@ pub(in crate::routes) async fn chat_task_create(
                 ALLOWED_TASK_ACTIONS
             )));
         }
+        // 派工落库时解析 targetChunkId：若 step 已带（对话驱动 LLM 可能直接给）则尊重，
+        // 否则按 cardId 从今日日报卡片 target_refs 解析。fix_chunk/retag 需要它。
+        if d.get_str("targetChunkId").is_err() {
+            if let Ok(card_id) = d.get_str("cardId") {
+                if let Some(chunk_id) = card_chunk_map.get(card_id) {
+                    d.insert("targetChunkId", chunk_id.clone());
+                }
+            }
+        }
         steps_doc.push(d);
     }
 
     // cards 快照：从今日日报里反查（best-effort，缺失也允许落 task）。
-    let report_date = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let report = state
-        .db
-        .knowledge_daily_reports()
-        .find_one(
-            doc! {
-                "workspace_id": &admin.current_workspace,
-                "account_id": &account_id,
-                "report_date": &report_date,
-            },
-            None,
-        )
-        .await?;
     let mut card_snapshots: Vec<crate::models::KnowledgeDigestCard> = vec![];
-    if let Some(r) = report {
+    if let Some(r) = report.as_ref() {
         for cid_hex in &body.card_ids {
             if let Ok(oid) = ObjectId::parse_str(cid_hex) {
                 if let Some(c) = r.cards.iter().find(|c| c.card_id == oid) {
@@ -2285,5 +2323,36 @@ mod tests {
         assert_eq!(clamp_task_list_limit(Some(-5)), 1, "负数 clamp 到 1");
         assert_eq!(clamp_task_list_limit(Some(10)), 10, "区间内原值");
         assert_eq!(clamp_task_list_limit(Some(9999)), 200, "上界 clamp 到 200");
+    }
+}
+
+#[cfg(test)]
+mod dispatch_resolution_tests {
+    use super::extract_chunk_ref;
+    use mongodb::bson::doc;
+
+    #[test]
+    fn extract_chunk_ref_returns_first_chunk_id() {
+        let refs = vec![
+            doc! { "kind": "pack", "id": "p1" },
+            doc! { "kind": "chunk", "id": "c1" },
+            doc! { "kind": "chunk", "id": "c2" },
+        ];
+        assert_eq!(extract_chunk_ref(&refs), Some("c1".to_string()));
+    }
+
+    #[test]
+    fn extract_chunk_ref_none_when_no_chunk_ref() {
+        let refs = vec![doc! { "kind": "pack", "id": "p1" }];
+        assert_eq!(extract_chunk_ref(&refs), None);
+    }
+
+    #[test]
+    fn extract_chunk_ref_skips_empty_id() {
+        let refs = vec![
+            doc! { "kind": "chunk", "id": "" },
+            doc! { "kind": "chunk", "id": "c9" },
+        ];
+        assert_eq!(extract_chunk_ref(&refs), Some("c9".to_string()));
     }
 }
