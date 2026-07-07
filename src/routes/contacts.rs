@@ -600,20 +600,28 @@ pub async fn batch_enable_endpoint(
             .map(|c| matches!(c.agent_status, crate::models::AgentStatus::Managed))
             .unwrap_or(false);
 
-        // upsert 联系人:置 managed + sharedNote + avatar + playbook。
-        let set_doc = doc! {
+        // upsert 联系人:置 managed + sharedNote + playbook。
+        // nickname/remark/avatar_url 只在候选真的带值时才写——MCP 好友列表常缺 remark，
+        // 若无条件 $set None 会把已入库联系人已有的备注/头像覆盖成 null（重入运营即丢数据）。
+        let mut set_doc = doc! {
             "workspace_id": &admin.current_workspace,
             "account_id": &payload.account_id,
             "wxid": &cand.wxid,
-            "nickname": &cand.nickname,
-            "remark": &cand.remark,
-            "avatar_url": &cand.avatar_url,
             "agent_status": "managed",
             "human_profile_note": &payload.shared_note,
             "playbook_id": playbook.id,
             "playbook_version": playbook.version,
             "updated_at": DateTime::now(),
         };
+        if let Some(nickname) = &cand.nickname {
+            set_doc.insert("nickname", nickname);
+        }
+        if let Some(remark) = &cand.remark {
+            set_doc.insert("remark", remark);
+        }
+        if let Some(avatar_url) = &cand.avatar_url {
+            set_doc.insert("avatar_url", avatar_url);
+        }
         state
             .db
             .contacts()
