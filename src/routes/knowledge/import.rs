@@ -184,24 +184,19 @@ pub struct ExtractKnowledgeTagsRequest {
     body: String,
 }
 
-/// `POST /api/operation-knowledge/extract-tags` —— 给单条 chunk 抽取
-/// productTags / businessTopics 两字段。复用与 import-preview
-/// 同样的 LLM prompt 风格，作为 backfill / 单条重抽入口。
-///
-/// 输入：`{ accountId?, title?, body }`
-/// 输出：`{ productTags: [], businessTopics: [] }`
-pub async fn extract_operation_knowledge_tags(
-    State(state): State<AppState>,
-    Json(payload): Json<ExtractKnowledgeTagsRequest>,
-) -> AppResult<Json<Value>> {
-    if payload.body.trim().is_empty() {
-        return Err(AppError::BadRequest("body is required".to_string()));
-    }
-    let title = payload
-        .title
-        .clone()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "未命名知识切片".to_string());
+/// LLM 抽取单条 chunk 的 productTags / businessTopics。路由 handler 与
+/// knowledge_task worker（retag action）共用。返回 (productTags, businessTopics)。
+pub(crate) async fn extract_knowledge_tags_inner(
+    state: &AppState,
+    account_id: Option<&str>,
+    title: &str,
+    body: &str,
+) -> AppResult<(Vec<String>, Vec<String>)> {
+    let title = if title.trim().is_empty() {
+        "未命名知识切片"
+    } else {
+        title.trim()
+    };
     let system = "你是企业微信运营知识库的标签抽取 Agent。给定一个知识切片（标题 + 正文），抽取它的 productTags / businessTopics。只输出严格 JSON。";
     let user = format!(
         r#"请基于下面的知识切片抽取两个字段：
@@ -222,11 +217,11 @@ pub async fn extract_operation_knowledge_tags(
 - businessTopics 概括这条知识"讲的是哪个业务主题"，方法论/话术类内容同样有主题（如价格异议处理、客户沟通），**至少抽 1 个**，不要因为没有产品就整体留空。
 - 主题用贴合正文的自然语言短语，不跑题、不空泛。
 - 只输出 JSON，不要解释。"#,
-        title, payload.body
+        title, body
     );
     let value = agent::generate_agent_json(
-        &state,
-        payload.account_id.as_deref(),
+        state,
+        account_id,
         None,
         None,
         "knowledge.tags.extract",
@@ -240,9 +235,31 @@ pub async fn extract_operation_knowledge_tags(
     let business_topics = json_string_list(&value, "businessTopics")
         .or_else(|| json_string_list(&value, "business_topics"))
         .unwrap_or_default();
+    Ok((
+        normalize_knowledge_tags(product_tags, 5, false),
+        normalize_knowledge_tags(business_topics, 3, false),
+    ))
+}
+
+/// `POST /api/operation-knowledge/extract-tags` —— 给单条 chunk 抽取
+/// productTags / businessTopics 两字段。
+pub async fn extract_operation_knowledge_tags(
+    State(state): State<AppState>,
+    Json(payload): Json<ExtractKnowledgeTagsRequest>,
+) -> AppResult<Json<Value>> {
+    if payload.body.trim().is_empty() {
+        return Err(AppError::BadRequest("body is required".to_string()));
+    }
+    let (product_tags, business_topics) = extract_knowledge_tags_inner(
+        &state,
+        payload.account_id.as_deref(),
+        payload.title.as_deref().unwrap_or(""),
+        &payload.body,
+    )
+    .await?;
     Ok(Json(json!({
-        "productTags": normalize_knowledge_tags(product_tags, 5, false),
-        "businessTopics": normalize_knowledge_tags(business_topics, 3, false),
+        "productTags": product_tags,
+        "businessTopics": business_topics,
     })))
 }
 

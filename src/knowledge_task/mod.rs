@@ -514,36 +514,238 @@ pub async fn execute_step(
             }
         }
         "add_chunk" => {
-            // 同上：实际 add 走 chat_apply（强制 draft + needs_review）。
-            Ok(StepOutcome {
-                chunk_id: None,
-                message: "已起草新 chunk，请运营在 chunk 编辑器审核".to_string(),
-                details: None,
-            })
+            let summary = step.get_str("summary").unwrap_or("").trim().to_string();
+            if summary.is_empty() {
+                return Ok(StepOutcome {
+                    chunk_id: None,
+                    message: "缺 summary 上下文，未起草新条目".to_string(),
+                    details: None,
+                });
+            }
+            let system = crate::prompts::load_prompt(
+                &state.db,
+                workspace_id,
+                "knowledge.chat.draft_chunk",
+            )
+            .await
+            .unwrap_or_else(|_| {
+                "你是知识库对话 Agent，起草新切片草稿。只输出 JSON: {patch, missingFields, followupQuestions, naturalReply}.".to_string()
+            });
+            let user = format!(
+                r#"请基于下面的运营待办摘要起草一条新知识切片草稿。
+
+待办摘要：
+{summary}
+
+起草要求：
+- patch 必须含非空的 title、summary、body 三者。
+- body（正文）承载可验证事实，绝不能留空。
+- 信息不足以填某字段时，把字段名写进 missingFields，不要编造内容。
+
+只输出 JSON 起草一条新切片草稿。"#
+            );
+            let run_id = format!("knowledge-task-add-{}", step.get_str("stepId").unwrap_or(""));
+            match crate::agent::generate_agent_json(
+                state, Some(_account_id), None, Some(&run_id),
+                "knowledge.chat.draft_chunk", &system, &user,
+            )
+            .await
+            {
+                Ok(value) => {
+                    let patch = value
+                        .get("patch")
+                        .and_then(|p| mongodb::bson::to_document(p).ok())
+                        .unwrap_or_default();
+                    if patch.is_empty() {
+                        return Ok(StepOutcome {
+                            chunk_id: None,
+                            message: "AI 未产出可落库的草稿字段".to_string(),
+                            details: None,
+                        });
+                    }
+                    // apply_create_chunk 强制 status=draft + integrity_status=needs_review。
+                    // account_id 传 None → 落 workspace 共享域（与 chat 新建一致）。
+                    // operator_statement=summary 作为溯源陈述驱动 sourceQuote 锚定。
+                    match crate::routes::knowledge::apply_create_chunk(
+                        state, workspace_id, None, "knowledge-task", &patch, None, &summary,
+                    )
+                    .await
+                    {
+                        Ok(res) => {
+                            let new_id = res
+                                .get("createdChunkId")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string());
+                            Ok(StepOutcome {
+                                chunk_id: new_id.clone(),
+                                message: format!(
+                                    "已起草新知识切片草稿{}，请运营在编辑器审核",
+                                    new_id.map(|i| format!("：{i}")).unwrap_or_default()
+                                ),
+                                details: None,
+                            })
+                        }
+                        Err(err) => Ok(StepOutcome {
+                            chunk_id: None,
+                            message: format!("起草落库失败（{err}，fail-soft）"),
+                            details: None,
+                        }),
+                    }
+                }
+                Err(err) => Ok(StepOutcome {
+                    chunk_id: None,
+                    message: format!("起草生成失败（{err}，fail-soft）"),
+                    details: None,
+                }),
+            }
         }
-        "retag" => Ok(StepOutcome {
-            chunk_id: step
-                .get_str("targetChunkId")
-                .ok()
-                .map(|s| s.to_string()),
-            message: "已标记需要重抽标签".to_string(),
-            details: None,
-        }),
+        "retag" => {
+            let Some(cid) = step.get_str("targetChunkId").ok().map(|s| s.to_string()) else {
+                return Ok(StepOutcome {
+                    chunk_id: None,
+                    message: "缺 targetChunkId，未重抽标签".to_string(),
+                    details: None,
+                });
+            };
+            let Ok(object_id) = ObjectId::parse_str(&cid) else {
+                return Ok(StepOutcome {
+                    chunk_id: Some(cid.clone()),
+                    message: format!("targetChunkId={cid} 非法，未重抽标签"),
+                    details: None,
+                });
+            };
+            let chunk = state
+                .db
+                .operation_knowledge_chunks()
+                .find_one(doc! { "_id": object_id, "workspace_id": workspace_id }, None)
+                .await?;
+            let Some(chunk) = chunk else {
+                return Ok(StepOutcome {
+                    chunk_id: Some(cid.clone()),
+                    message: format!("chunk {cid} 不存在，未重抽标签"),
+                    details: None,
+                });
+            };
+            let body = chunk.body.clone().unwrap_or_default();
+            match crate::routes::knowledge::extract_knowledge_tags_inner(
+                state,
+                Some(_account_id),
+                &chunk.title,
+                &body,
+            )
+            .await
+            {
+                Ok((product_tags, business_topics)) => {
+                    let patch = doc! {
+                        "productTags": product_tags.clone(),
+                        "businessTopics": business_topics.clone(),
+                    };
+                    // apply_update_chunk 强制 status=draft + integrity_status=needs_review。
+                    // operator_statement 传空（retag 不改 sourceQuote，不触发重锚定）。
+                    crate::routes::knowledge::apply_update_chunk(
+                        state, workspace_id, _account_id, &cid, &patch, "",
+                    )
+                    .await?;
+                    Ok(StepOutcome {
+                        chunk_id: Some(cid.clone()),
+                        message: format!(
+                            "已为 chunk {cid} 重抽标签（产品 {} / 主题 {}），落为待确认草稿",
+                            product_tags.len(),
+                            business_topics.len()
+                        ),
+                        details: None,
+                    })
+                }
+                Err(err) => Ok(StepOutcome {
+                    chunk_id: Some(cid.clone()),
+                    message: format!("chunk {cid} 重抽标签失败（{err}，fail-soft）"),
+                    details: None,
+                }),
+            }
+        }
         "review_evolution" => Ok(StepOutcome {
             chunk_id: None,
-            message: "已记录：请去 EvolutionCenterTab 评估候选".to_string(),
+            message: "本项需人工评估：请到「自优化中心」查看并裁决候选提案，AI 不自动放量".to_string(),
             details: None,
         }),
-        "analyze_logs" => Ok(StepOutcome {
-            chunk_id: None,
-            message: "已生成 24h block/hold 日志摘要（详见 turn 详情）".to_string(),
-            details: None,
-        }),
-        "dismiss" => Ok(StepOutcome {
-            chunk_id: None,
-            message: "已忽略本卡片".to_string(),
-            details: None,
-        }),
+        "analyze_logs" => {
+            let cutoff = mongodb::bson::DateTime::from_millis(
+                mongodb::bson::DateTime::now().timestamp_millis() - 24 * 3600 * 1000,
+            );
+            let filter = doc! {
+                "workspace_id": workspace_id,
+                "account_id": _account_id,
+                "created_at": { "$gte": cutoff },
+                "status": { "$in": ["blocked", "blocked_by_safety_guard", "warning", "warn"] },
+            };
+            let mut cursor = state
+                .db
+                .events()
+                .find(
+                    filter,
+                    mongodb::options::FindOptions::builder()
+                        .sort(doc! { "created_at": -1 })
+                        .limit(200)
+                        .build(),
+                )
+                .await?;
+            let mut by_kind: std::collections::HashMap<String, i32> =
+                std::collections::HashMap::new();
+            let mut total = 0i32;
+            while let Some(ev) = futures::TryStreamExt::try_next(&mut cursor).await? {
+                total += 1;
+                *by_kind.entry(ev.kind.clone()).or_insert(0) += 1;
+            }
+            let mut lines: Vec<(String, i32)> = by_kind.into_iter().collect();
+            lines.sort_by(|a, b| b.1.cmp(&a.1));
+            let top: Vec<Document> = lines
+                .iter()
+                .take(10)
+                .map(|(k, n)| doc! { "kind": k, "count": *n })
+                .collect();
+            Ok(StepOutcome {
+                chunk_id: None,
+                message: format!("已汇总近 24h 拦截/暂缓事件 {} 条（详见 turn 详情）", total),
+                details: Some(doc! { "analyzeLogsTotal": total, "byKind": top }),
+            })
+        }
+        "dismiss" => {
+            let card_id_hex = step.get_str("cardId").unwrap_or("").to_string();
+            if let Ok(card_oid) = ObjectId::parse_str(&card_id_hex) {
+                let report_date = step
+                    .get_str("reportDate")
+                    .ok()
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
+                let mut filter = doc! {
+                    "workspace_id": workspace_id,
+                    "cards.cardId": card_oid,
+                };
+                if !report_date.is_empty() {
+                    filter.insert("report_date", &report_date);
+                }
+                let _ = state
+                    .db
+                    .knowledge_daily_reports()
+                    .update_one(
+                        filter,
+                        doc! { "$addToSet": { "dismissed_card_ids": card_oid } },
+                        None,
+                    )
+                    .await;
+                Ok(StepOutcome {
+                    chunk_id: None,
+                    message: format!("已忽略卡片 {card_id_hex}"),
+                    details: None,
+                })
+            } else {
+                Ok(StepOutcome {
+                    chunk_id: None,
+                    message: "缺有效 cardId，未忽略卡片".to_string(),
+                    details: None,
+                })
+            }
+        }
         other => Err(anyhow::anyhow!("unsupported action: {other}")),
     }
 }
