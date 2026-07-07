@@ -122,6 +122,14 @@ pub struct AgentDecision {
     /// 不输出 `domainSignals`，故本容器由 normalize 从 typed 镜像得来——行为不变。
     #[serde(default)]
     pub domain_signals: Document,
+    /// 维度值 → 中文显示名。LLM 仅在为某维度填了「字典外自造新值」时，在此为该
+    /// 维度配一个简洁中文名（如 `{"customer_stage": "焦虑观望"}`）。字典已有的标准
+    /// 值不必填（已有 canonical label）。gateway / decision_taxonomy 产 taxonomy
+    /// 候选时按 kind 查此表取中文名作 `suggested_display_name`（收件箱命名卡预填）。
+    /// 绝大多数轮次不出现（无自造值即无名字）——故 `#[serde(default)]` 是输出容错，
+    /// 非兼容 shim；改必填会使 LLM 漏填的轮次 decision 反序列化失败、决策链路崩。
+    #[serde(default)]
+    pub dimension_display_names: Document,
     pub last_commitment: Option<String>,
     /// PR-D：结构化承诺（带可选 dueAt）。promote 时从 RawAgentDecision.commitment 透传。
     pub commitment: Option<CommitmentDecision>,
@@ -320,6 +328,7 @@ impl Default for AgentDecision {
             customer_stage: None,
             intent_level: None,
             domain_signals: Document::new(),
+            dimension_display_names: Document::new(),
             last_commitment: None,
             commitment: None,
             follow_up_policy: None,
@@ -458,6 +467,10 @@ pub struct RawAgentDecision {
     /// `normalize_domain_signals` 从 typed 镜像，行为与改造前逐字等价。
     #[serde(default)]
     pub domain_signals: Option<Document>,
+    /// 维度值→中文名映射（promote 后经 carry_through 透传到
+    /// `AgentDecision.dimension_display_names`）。LLM 缺省 → None → 容器空。
+    #[serde(default)]
+    pub dimension_display_names: Option<Document>,
     pub last_commitment: Option<String>,
     /// PR-D：结构化承诺（带可选 dueAt）。缺失时回落 last_commitment。
     pub commitment: Option<CommitmentDecision>,
@@ -1003,6 +1016,13 @@ fn carry_through_fields(raw: RawAgentDecision, decision: &mut AgentDecision) {
         // 不输出该键 → None → 不触；典型行业由 normalize_domain_signals 再镜像 typed。
         if !v.is_empty() {
             decision.domain_signals = v;
+        }
+    }
+    if let Some(v) = raw.dimension_display_names {
+        // 维度中文名 carry-through（同 namecard/assets 老坑：不透传则 promote 后
+        // 永远空、LLM 产的中文名被静默丢弃，收件箱又回落英文）。仅非空覆盖。
+        if !v.is_empty() {
+            decision.dimension_display_names = v;
         }
     }
     if raw.last_commitment.is_some() {
@@ -2219,6 +2239,47 @@ mod namecard_directive_tests {
         let (decision, _risks) = raw.validate_and_promote(&runtime);
         let card = decision.namecard_to_send.expect("namecard must carry through");
         assert_eq!(card.card_id, "c1");
+    }
+}
+
+#[cfg(test)]
+mod dimension_display_names_tests {
+    //! dimensionDisplayNames carry-through 回归：LLM 输出的维度中文名映射
+    //! 必须经 RawAgentDecision → validate_and_promote 透传到 AgentDecision，
+    //! 不能被静默丢弃（防丢字段硬伤，同 namecard/assets 老坑）。
+    use super::validate_and_promote_tests::{make_valid_low_routine_raw, runtime_default};
+    use super::*;
+    use mongodb::bson::doc;
+
+    #[test]
+    fn decision_without_display_names_defaults_empty() {
+        // 旧/常规 LLM 输出（无 dimensionDisplayNames）仍能反序列化，字段默认空 doc。
+        let json = r#"{"replyText":"你好","shouldReply":true}"#;
+        let d: AgentDecision = serde_json::from_str(json).expect("must deserialize");
+        assert!(d.dimension_display_names.is_empty());
+    }
+
+    #[test]
+    fn raw_decision_carries_display_names_through_promote() {
+        let mut raw = make_valid_low_routine_raw();
+        raw.dimension_display_names = Some(doc! { "customer_stage": "焦虑观望" });
+        let runtime = runtime_default(true);
+        let (decision, _risks) = raw.validate_and_promote(&runtime);
+        assert_eq!(
+            decision.dimension_display_names.get_str("customer_stage").ok(),
+            Some("焦虑观望"),
+            "dimensionDisplayNames 必须 carry-through，实际 {:?}",
+            decision.dimension_display_names
+        );
+    }
+
+    #[test]
+    fn raw_decision_none_display_names_stays_empty_after_promote() {
+        // Raw 未给该字段 → promote 后保持空 doc（不 panic、不误填）。
+        let raw = make_valid_low_routine_raw();
+        let runtime = runtime_default(true);
+        let (decision, _risks) = raw.validate_and_promote(&runtime);
+        assert!(decision.dimension_display_names.is_empty());
     }
 }
 
