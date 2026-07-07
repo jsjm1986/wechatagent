@@ -487,6 +487,62 @@ pub(super) async fn apply_generated_profile_to_contact(
     Ok(())
 }
 
+/// 异步初始画像任务处理器（`AgentTask.kind == "initial_profile"`）。
+///
+/// 批量托管（`batch_enable_endpoint`）不同步跑 LLM，而是给每个联系人入队本任务，
+/// 由 worker 异步调 `build_initial_operation_profile` 生成画像并经共享的
+/// [`apply_generated_profile_to_contact`] 落库。`task.content` 存本批共享运营备注。
+pub async fn handle_initial_profile_task(
+    state: &AppState,
+    task: &crate::models::AgentTask,
+) -> AppResult<()> {
+    // 按 wxid+account 定位联系人（worker 上下文没有 _id）。
+    let contact = state
+        .db
+        .contacts()
+        .find_one(
+            doc! {
+                "workspace_id": &task.workspace_id,
+                "account_id": &task.account_id,
+                "wxid": &task.contact_wxid,
+            },
+            None,
+        )
+        .await?;
+    let Some(contact) = contact else {
+        // 联系人已被删/清理：视为完成，不报错重试。
+        return Ok(());
+    };
+    // 批量后又被手动取消托管的，跳过画像回填。
+    if !matches!(contact.agent_status, crate::models::AgentStatus::Managed) {
+        return Ok(());
+    }
+    let playbook = resolve_playbook_for_contact(
+        state,
+        &task.workspace_id,
+        &task.account_id,
+        contact.playbook_id.map(|o| o.to_hex()).as_deref(),
+    )
+    .await?;
+    let generated = agent::build_initial_operation_profile(
+        state,
+        &task.workspace_id,
+        &task.content,
+        Some(&playbook),
+    )
+    .await?;
+    apply_generated_profile_to_contact(
+        state,
+        &task.workspace_id,
+        &contact,
+        &task.content,
+        playbook.id,
+        playbook.version,
+        &generated,
+    )
+    .await
+}
+
 pub(super) async fn enable_agent(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
