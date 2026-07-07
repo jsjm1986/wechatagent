@@ -189,3 +189,127 @@ pub async fn update_account_mcp_key(
     }
     Ok(Json(json!({ "ok": true })))
 }
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoginBeginRequest {
+    account_alias: Option<String>,
+    #[serde(default)]
+    login_type: LoginType,
+    #[serde(default)]
+    login_flow: LoginFlow,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum LoginType {
+    Mac,
+    Ipad,
+}
+
+impl Default for LoginType {
+    fn default() -> Self {
+        Self::Mac
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum LoginFlow {
+    Auto,
+    Manual,
+}
+
+impl Default for LoginFlow {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+/// POST /api/accounts/login/begin - 发起微信账号登录，获取二维码
+///
+/// 调用 MCP `login_begin` 工具，返回：
+/// - `qr_data_url`: 二维码图片的 data URL（base64）
+/// - `login_page_url`: MCP server 提供的登录页面 URL（推荐优先使用）
+/// - `session_id`: 轮询会话 ID（传给 `login_poll`）
+pub async fn login_begin(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
+    Json(payload): Json<LoginBeginRequest>,
+) -> AppResult<Json<Value>> {
+    // Workspace Key 必须传 account_alias；Account Key 可省略
+    let arguments = json!({
+        "login_type": format!("{:?}", payload.login_type).to_lowercase(),
+        "login_flow": format!("{:?}", payload.login_flow).to_lowercase(),
+    });
+
+    let result = if let Some(alias) = payload.account_alias {
+        // 通过 alias 找到对应账号的 credentials
+        let account = state
+            .db
+            .accounts()
+            .find_one(
+                doc! {
+                    "workspace_id": &admin.current_workspace,
+                    "alias": &alias
+                },
+                None,
+            )
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("account alias {} not found", alias)))?;
+
+        mcp::logged_call_for_account(&state, &account.account_id, "login_begin", arguments).await?
+    } else {
+        // Account Key 模式：使用默认 credentials
+        mcp::logged_call(&state, "login_begin", arguments).await?
+    };
+
+    Ok(Json(result))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoginPollQuery {
+    session_id: String,
+    account_alias: Option<String>,
+}
+
+/// GET /api/accounts/login/poll?session_id=xxx&account_alias=yyy - 轮询登录状态
+///
+/// 调用 MCP `login_poll` 工具，返回：
+/// - `status`: `pending` / `success` / `expired` / `canceled`
+/// - `wxid`: 登录成功后的微信 ID（仅 status=success 时有值）
+/// - `nick_name`: 登录成功后的微信昵称（仅 status=success 时有值）
+///
+/// 前端应每 2-3 秒轮询一次，直到 status 不是 `pending`。
+/// 登录成功后建议立即调用 `POST /api/accounts/sync` 同步账号信息。
+pub async fn login_poll(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
+    axum::extract::Query(query): axum::extract::Query<LoginPollQuery>,
+) -> AppResult<Json<Value>> {
+    let arguments = json!({
+        "session_id": query.session_id,
+    });
+
+    let result = if let Some(alias) = query.account_alias {
+        let account = state
+            .db
+            .accounts()
+            .find_one(
+                doc! {
+                    "workspace_id": &admin.current_workspace,
+                    "alias": &alias
+                },
+                None,
+            )
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("account alias {} not found", alias)))?;
+
+        mcp::logged_call_for_account(&state, &account.account_id, "login_poll", arguments).await?
+    } else {
+        mcp::logged_call(&state, "login_poll", arguments).await?
+    };
+
+    Ok(Json(result))
+}
