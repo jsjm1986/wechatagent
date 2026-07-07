@@ -87,32 +87,36 @@ describe("KnowledgeFeature — 一体化频道（全量重塑视觉壳）", () =
     const user = userEvent.setup();
     // ChatWorkbench 派工要求已有 sessionId（后端 sessionId 非空校验）；预置进 localStorage。
     window.localStorage.setItem("knowledgeChat.sessionId", "S1");
+    const jsonResp = (body: unknown) =>
+      ({
+        ok: true,
+        status: 200,
+        async json() {
+          return body;
+        },
+        async text() {
+          return JSON.stringify(body);
+        },
+      } as unknown as Response);
     const fetchMock = vi.fn(async (url: unknown, init?: { method?: string; body?: string }) => {
       const u = String(url);
-      if (u.includes("/knowledge/chat/tasks")) {
-        const body =
-          init?.method === "POST"
-            ? { taskId: "T1", sessionId: "S1", status: "pending", totalSteps: 1 }
-            : {
-                taskId: "T1",
-                sessionId: "S1",
-                status: "pending",
-                totalSteps: 1,
-                completedSteps: [],
-                cards: [],
-              };
-        return {
-          ok: true,
-          status: 200,
-          async json() {
-            return body;
-          },
-          async text() {
-            return JSON.stringify(body);
-          },
-        } as unknown as Response;
+      const method = init?.method ?? "GET";
+      // 发送对话 → AI 返回 plannedSteps（触发待确认派工区）。
+      if (u.includes("/operation-knowledge/chat") && method === "POST" && !u.includes("/apply")) {
+        return jsonResp({
+          sessionId: "S1",
+          turnIndex: 1,
+          intent: "draft",
+          naturalReply: "已为你拆分步骤",
+          plannedSteps: [{ action: "create_chunk", summary: "分析最近 24h 拦截日志" }],
+        });
       }
-      const benign = {
+      // 派工提交。
+      if (u.includes("/knowledge/chat/tasks") && method === "POST") {
+        return jsonResp({ taskId: "T1", sessionId: "S1", status: "pending", totalSteps: 1 });
+      }
+      // loadHistory + 其它子视图取数返回空集合。
+      return jsonResp({
         items: [],
         chunks: [],
         signals: [],
@@ -120,17 +124,7 @@ describe("KnowledgeFeature — 一体化频道（全量重塑视觉壳）", () =
         metrics: {},
         cards: [],
         dismissedCardIds: [],
-      };
-      return {
-        ok: true,
-        status: 200,
-        async json() {
-          return benign;
-        },
-        async text() {
-          return JSON.stringify(benign);
-        },
-      } as unknown as Response;
+      });
     });
     globalThis.fetch = fetchMock as typeof fetch;
 
@@ -138,9 +132,13 @@ describe("KnowledgeFeature — 一体化频道（全量重塑视觉壳）", () =
       render(<KnowledgeFeature />);
       // 切到「AI 协作」pane 暴露 ChatWorkbench。
       await user.click(screen.getByText("AI 协作").closest("button") as HTMLButtonElement);
-      const stepsInput = await screen.findByPlaceholderText(/每行一个步骤/);
-      await user.type(stepsInput, "分析最近 24h 拦截日志");
-      await user.click(screen.getByText("派工").closest("button") as HTMLButtonElement);
+      // 在对话输入框描述需求 → 发送 → AI 回包携带 plannedSteps。
+      const chatInput = await screen.findByPlaceholderText(/向 AI 描述/);
+      await user.type(chatInput, "分析最近 24h 拦截日志");
+      await user.click(screen.getByText("发送").closest("button") as HTMLButtonElement);
+      // 待确认派工区渲染后点「确认派工」。
+      const dispatchBtn = await screen.findByText("确认派工");
+      await user.click(dispatchBtn.closest("button") as HTMLButtonElement);
 
       const call = fetchMock.mock.calls.find(
         (c) => String(c[0]).includes("/knowledge/chat/tasks") && (c[1] as { method?: string })?.method === "POST"
