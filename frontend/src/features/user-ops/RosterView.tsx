@@ -35,10 +35,13 @@ export function RosterView() {
       if (!accountId) return;
       setLoading(true);
       setError(null);
+      // 切账号/刷新时连同本批草稿一起清空——否则账号 A 的运营备注/剧本会残留到账号 B。
+      setSelectedWxids(new Set());
+      setSharedNote("");
+      setPlaybookId("");
       try {
         const items = await loadRoster(accountId);
         setRoster(items);
-        setSelectedWxids(new Set());
       } catch (e) {
         setError(e instanceof Error ? e.message : "加载好友列表失败");
       } finally {
@@ -91,6 +94,7 @@ export function RosterView() {
       });
       toast.success(`已加入 ${res.enabled} 人，画像后台生成中`);
       setSharedNote("");
+      setPlaybookId("");
       await refresh(effectiveAccountId);
     } catch (e) {
       setError(e instanceof Error ? e.message : "批量加入运营失败");
