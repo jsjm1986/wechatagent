@@ -524,6 +524,13 @@ export function ContactsView({
             onClick={() => onOpenContact(contact)}
           >
             <span className={contact.agentStatus === "managed" ? "dot managed" : "dot"} />
+            {contact.avatarUrl ? (
+              <img className="contactAvatar" src={contact.avatarUrl} alt="" />
+            ) : (
+              <span className="contactAvatarFallback">
+                {(contact.remark || contact.nickname || contact.wxid).trim().charAt(0).toUpperCase()}
+              </span>
+            )}
             <div>
               <strong>{contact.remark || contact.nickname || contact.wxid}</strong>
               <small>{contact.alias || contact.wxid}</small>

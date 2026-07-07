@@ -1615,6 +1615,25 @@ textarea::placeholder {
   box-shadow: 0 0 0 4px rgba(4, 116, 129, 0.12);
 }
 
+.contactAvatar,
+.contactAvatarFallback {
+  flex-shrink: 0;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  object-fit: cover;
+}
+
+.contactAvatarFallback {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--surface-soft);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
 .statusPill {
   display: inline-flex;
   align-items: center;
