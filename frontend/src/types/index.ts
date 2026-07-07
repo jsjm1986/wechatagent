@@ -24,7 +24,7 @@ export type Channel =
   | "campaign";
 export type ContactTab = "all" | "managed" | "normal";
 export type TraditionalOpsTab = "playbooks" | "prompts" | "settings" | "audit";
-export type UserOpsMode = "smart" | "traditional";
+export type UserOpsMode = "smart" | "traditional" | "roster";
 export type OpsTab = "tasks" | "events" | "reviews" | "llm" | "runs";
 
 export type Account = {
