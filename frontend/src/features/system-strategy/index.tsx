@@ -982,13 +982,6 @@ interface TaxonomyCandidate {
   suggestedDisplayName: string | null;
 }
 
-interface ApproveDraft {
-  id: string;
-  label: string;
-  aliases: string;
-  description: string;
-}
-
 const CANDIDATE_STATUS_FILTERS = ["pending", "approved", "rejected", "all"] as const;
 type CandidateStatusFilter = (typeof CANDIDATE_STATUS_FILTERS)[number];
 
