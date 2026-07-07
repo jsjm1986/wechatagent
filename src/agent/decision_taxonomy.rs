@@ -90,16 +90,42 @@ pub(crate) fn validate_and_normalize_decision(
     let cache = global_taxonomy_cache();
     let (risks, candidates) =
         classify_decision_tags(decision, dimension_kinds, scope_account_id, &cache);
-    spawn_candidate_upserts(db, scope_account_id, candidates);
+    // 与 gateway 主循环同源：按 kind 从 decision.dimension_display_names 取 LLM 产的
+    // 中文名，随候选一起落库。二者写同一幂等键 (scope,kind,raw)，upsert 对已存在候选
+    // 不更新 display_name（先写者赢）——此处带名，避免本 fire-and-forget 路径的 None
+    // 抢先把 gateway 的中文名挡在门外。取的是同一个 decision，名字一致、幂等无害。
+    let named = attach_display_names(candidates, decision);
+    spawn_candidate_upserts(db, scope_account_id, named);
     risks
 }
 
-/// 把 `candidates` 列表 fire-and-forget 写盘。抽到独立函数便于未来加入熔断 /
-/// 限流策略（例如同一 contact 一轮内 candidate 暴量时降级）。
+/// 把 `(kind, raw)` 候选列表按 `decision.dimension_display_names` 附上 LLM 产的
+/// 中文建议名 → `(kind, raw, Option<name>)`。与 gateway 主循环同源（复用同一取名
+/// 纯函数 `pick_dimension_display_name`）；缺名 → None → 候选回落英文裸值。
+fn attach_display_names(
+    candidates: Vec<(String, String)>,
+    decision: &AgentDecision,
+) -> Vec<(String, String, Option<String>)> {
+    candidates
+        .into_iter()
+        .map(|(kind, raw)| {
+            let name = crate::agent::gateway::pick_dimension_display_name(
+                &decision.dimension_display_names,
+                &kind,
+            )
+            .map(str::to_string);
+            (kind, raw, name)
+        })
+        .collect()
+}
+
+/// 把 `candidates`（含中文建议名）列表 fire-and-forget 写盘。抽到独立函数便于未来
+/// 加入熔断 / 限流策略。第三元 `Option<String>` = LLM 为自造新值产的中文名，作
+/// `upsert_candidate` 的 `suggested_display_name`（收件箱命名卡预填）；None 回落英文。
 fn spawn_candidate_upserts(
     db: &Database,
     scope_account_id: &str,
-    candidates: Vec<(String, String)>,
+    candidates: Vec<(String, String, Option<String>)>,
 ) {
     if candidates.is_empty() {
         return;
@@ -107,9 +133,9 @@ fn spawn_candidate_upserts(
     let db = db.clone();
     let scope = scope_account_id.to_string();
     tokio::spawn(async move {
-        for (kind, raw) in candidates {
+        for (kind, raw, display_name) in candidates {
             if let Err(err) =
-                upsert_candidate(&db, &scope, &kind, &raw, None, 0, None).await
+                upsert_candidate(&db, &scope, &kind, &raw, None, 0, display_name.as_deref()).await
             {
                 tracing::warn!(
                     kind = %kind,
@@ -379,5 +405,23 @@ mod tests {
             cands,
             vec![("emotional_state".to_string(), "焦虑不安".to_string())]
         );
+    }
+
+    #[test]
+    fn attach_display_names_picks_name_and_falls_back() {
+        // 生产入口 validate_and_normalize_decision 用同一个 attach_display_names：
+        // decision.dimensionDisplayNames 有名 → 候选带名；无名 → None（回落英文）。
+        use mongodb::bson::doc;
+        let mut d = AgentDecision::default();
+        d.dimension_display_names = doc! { "customer_stage": "焦虑观望" }; // 只给 stage 配名
+        let cands = vec![
+            ("customer_stage".to_string(), "anxious_watch".to_string()),
+            ("intent_level".to_string(), "probing".to_string()),
+        ];
+        let named = attach_display_names(cands, &d);
+        let stage = named.iter().find(|(k, _, _)| k == "customer_stage").expect("stage");
+        assert_eq!(stage.2.as_deref(), Some("焦虑观望"));
+        let intent = named.iter().find(|(k, _, _)| k == "intent_level").expect("intent");
+        assert_eq!(intent.2, None, "未配名维度回落 None");
     }
 }
