@@ -155,7 +155,57 @@ async fn collect_knowledge_review(
         .collect())
 }
 
-/// 标签候选 pending → inline。隔离键是 scope（account_id 或 "global"），无 workspace_id；
+/// 单条标签候选 → InboxItem（具名以便单测）。归类 rich：审核 = 给 AI 新造取值
+/// 命名并纳入字典，需命名表单，不是简单二元通过/拒绝。富字段 evidence/confidence/
+/// occurrences 与 relationship_suggestion 对称接出；rich_params 带全前端渲染所需数据。
+fn taxonomy_candidate_to_inbox_item(
+    c: &crate::models::TaxonomyCandidate,
+    now_ms: i64,
+) -> InboxItem {
+    let id = c.id.map(|o| o.to_hex()).unwrap_or_default();
+    let mut params = doc! {
+        "candidateId": id.clone(),
+        "scope": c.scope.clone(),
+        "kind": c.kind.clone(),
+        "rawValue": c.raw_value.clone(),
+        "confidence": c.confidence,
+        "occurrences": c.occurrences,
+    };
+    if let Some(ev) = &c.evidence {
+        params.insert("evidence", ev.clone());
+    }
+    if let Some(name) = &c.suggested_display_name {
+        params.insert("suggestedDisplayName", name.clone());
+    }
+    InboxItem {
+        source: "taxonomy_candidate".into(),
+        id,
+        // 人话标题：以 AI 新识别的取值为主语，不暴露裸维度键（维度中文名前端补）。
+        title: format!("AI 新识别标签：{}", c.raw_value),
+        // 折叠预览：优先 evidence，无则通用框定。
+        summary: c
+            .evidence
+            .clone()
+            .unwrap_or_else(|| "AI 在对话中识别到一个尚未收录的取值，请确认是否纳入标签字典".into()),
+        severity: "low".into(),
+        created_at: Some(c.last_seen_at),
+        age_hours: age_hours_of(Some(c.last_seen_at), now_ms),
+        action_kind: "rich".into(),
+        rich_component: Some("taxonomyCandidateReview".into()),
+        rich_params: Some(params),
+        category: None,
+        question_for_principal: None,
+        contact_wxid: None,
+        principal_wxid: None,
+        evidence: c.evidence.clone(),
+        confidence: Some(c.confidence),
+        occurrences: Some(c.occurrences),
+        kind: None,
+        signal_severity: None,
+    }
+}
+
+/// 标签候选 pending → rich。隔离键是 scope（account_id 或 "global"），无 workspace_id；
 /// 仅暴露 scope="global" 的共享候选，避免泄漏账户私有候选（IDOR 安全）。
 async fn collect_taxonomy_candidates(
     state: &AppState,
@@ -174,30 +224,7 @@ async fn collect_taxonomy_candidates(
     let rows: Vec<crate::models::TaxonomyCandidate> = cursor.try_collect().await?;
     Ok(rows
         .into_iter()
-        .map(|c| {
-            let id = c.id.map(|o| o.to_hex()).unwrap_or_default();
-            InboxItem {
-                source: "taxonomy_candidate".into(),
-                id,
-                title: format!("标签候选：{}", c.kind),
-                summary: c.raw_value.clone(),
-                severity: "low".into(),
-                created_at: Some(c.last_seen_at),
-                age_hours: age_hours_of(Some(c.last_seen_at), now_ms),
-                action_kind: "inline".into(),
-                rich_component: None,
-                rich_params: None,
-                category: None,
-                question_for_principal: None,
-                contact_wxid: None,
-                principal_wxid: None,
-                evidence: None,
-                confidence: None,
-                occurrences: None,
-                kind: None,
-                signal_severity: None,
-            }
-        })
+        .map(|c| taxonomy_candidate_to_inbox_item(&c, now_ms))
         .collect())
 }
 
@@ -654,5 +681,80 @@ mod tests {
         assert_eq!(v["kind"], "orphan");
         assert_eq!(v["signalSeverity"], "warning");
         assert_eq!(v["severity"], "medium");
+    }
+
+    fn test_candidate_fixture() -> crate::models::TaxonomyCandidate {
+        let now = DateTime::now();
+        crate::models::TaxonomyCandidate {
+            id: None,
+            scope: "global".into(),
+            kind: "emotional_state".into(),
+            raw_value: "anxious".into(),
+            evidence: Some("客户连续两条消息表达担心".into()),
+            confidence: 7,
+            first_seen_at: now,
+            last_seen_at: now,
+            occurrences: 3,
+            status: "pending".into(),
+            reviewed_at: None,
+            reviewed_by: None,
+            suggested_display_name: Some("焦虑".into()),
+        }
+    }
+
+    #[test]
+    fn taxonomy_candidate_projected_as_rich() {
+        let c = test_candidate_fixture();
+        // id=None 时 hex 落空串；本测聚焦 rich 分类与富字段，用 None 固定路径。
+        let item = taxonomy_candidate_to_inbox_item(&c, 0);
+        assert_eq!(item.action_kind, "rich");
+        assert_eq!(item.rich_component.as_deref(), Some("taxonomyCandidateReview"));
+        // title 不再以裸维度键作主语（回归防护：不得再出现 "标签候选：emotional_state"）。
+        assert!(!item.title.contains("emotional_state"), "title 不应暴露裸维度键: {}", item.title);
+        // 顶层富字段与 relationship_suggestion 对称接出。
+        assert_eq!(item.evidence.as_deref(), Some("客户连续两条消息表达担心"));
+        assert_eq!(item.confidence, Some(7));
+        assert_eq!(item.occurrences, Some(3));
+    }
+
+    #[test]
+    fn taxonomy_candidate_rich_params_carry_all_fields() {
+        let c = test_candidate_fixture();
+        let item = taxonomy_candidate_to_inbox_item(&c, 0);
+        let params = item.rich_params.expect("rich_params 应存在");
+        assert_eq!(params.get_str("scope").unwrap(), "global");
+        assert_eq!(params.get_str("kind").unwrap(), "emotional_state");
+        assert_eq!(params.get_str("rawValue").unwrap(), "anxious");
+        assert_eq!(params.get_str("evidence").unwrap(), "客户连续两条消息表达担心");
+        assert_eq!(params.get_i32("confidence").unwrap(), 7);
+        assert_eq!(params.get_i32("occurrences").unwrap(), 3);
+        assert_eq!(params.get_str("suggestedDisplayName").unwrap(), "焦虑");
+    }
+
+    #[test]
+    fn taxonomy_candidate_optional_fields_omitted_when_absent() {
+        let mut c = test_candidate_fixture();
+        c.evidence = None;
+        c.suggested_display_name = None;
+        let item = taxonomy_candidate_to_inbox_item(&c, 0);
+        let params = item.rich_params.expect("rich_params 应存在");
+        // evidence / suggestedDisplayName 缺省时不写键（不产生 null）。
+        assert!(params.get("evidence").is_none());
+        assert!(params.get("suggestedDisplayName").is_none());
+        assert_eq!(item.evidence, None);
+        // confidence / occurrences 是非 Option i32，恒写入。
+        assert!(params.get("confidence").is_some());
+        assert!(params.get("occurrences").is_some());
+    }
+
+    #[test]
+    fn taxonomy_candidate_serializes_camel_case() {
+        let c = test_candidate_fixture();
+        let item = taxonomy_candidate_to_inbox_item(&c, 0);
+        let v = serde_json::to_value(&item).unwrap();
+        assert_eq!(v["actionKind"], "rich");
+        assert_eq!(v["richComponent"], "taxonomyCandidateReview");
+        assert_eq!(v["confidence"], 7);
+        assert_eq!(v["occurrences"], 3);
     }
 }
