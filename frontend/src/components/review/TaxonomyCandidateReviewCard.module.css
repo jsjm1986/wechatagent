@@ -1,0 +1,11 @@
+.card { display: flex; flex-direction: column; gap: 10px; }
+.intro { font-size: 13px; color: #444; line-height: 1.6; }
+.rawValue { font-weight: 600; color: #1a1a1a; }
+.evidence { font-size: 12px; color: #666; display: flex; flex-direction: column; gap: 2px; }
+.form { display: flex; flex-direction: column; gap: 8px; margin-top: 4px; }
+.field { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: #555; }
+.input, .textarea { border: 1px solid #d0d0d0; border-radius: 6px; padding: 6px 8px; font-size: 13px; }
+.textarea { min-height: 60px; resize: vertical; }
+.buttons { display: flex; gap: 8px; }
+.error { color: #c0392b; font-size: 12px; }
+.info { color: #1e7e34; font-size: 12px; }
