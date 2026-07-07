@@ -115,6 +115,18 @@ describe("KnowledgeFeature — 一体化频道（全量重塑视觉壳）", () =
       if (u.includes("/knowledge/chat/tasks") && method === "POST") {
         return jsonResp({ taskId: "T1", sessionId: "S1", status: "pending", totalSteps: 1 });
       }
+      // 派工成功广播 wikiTrackTask → TaskRail loadTask(taskId) GET 任务详情。
+      // 必须回完整 ChatTaskView 形态（completedSteps/cards 非空数组），否则渲染 length 崩。
+      if (u.includes("/knowledge/chat/tasks/") && method === "GET") {
+        return jsonResp({
+          taskId: "T1",
+          sessionId: "S1",
+          status: "pending",
+          totalSteps: 1,
+          completedSteps: [],
+          cards: [],
+        });
+      }
       // loadHistory + 其它子视图取数返回空集合。
       return jsonResp({
         items: [],
