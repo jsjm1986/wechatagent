@@ -427,10 +427,32 @@ fn first_str(obj: &serde_json::Map<String, serde_json::Value>, keys: &[&str]) ->
     None
 }
 
+/// 从对象里挑第一个「元素像联系人」的数组值（元素带 wxid/userName/username 键）。
+/// contacts_fetch_cache 的数组 key 未线上核实（测试账号缓存为空），故命名候选之外
+/// 再兜一层「按内容识别数组」——避免 server 用列表外的新 key 时整表解析成空。
+fn contact_like_array(obj: &serde_json::Map<String, serde_json::Value>) -> Option<Vec<serde_json::Value>> {
+    for value in obj.values() {
+        if let Some(arr) = value.as_array() {
+            let looks_like_contacts = arr.first().and_then(|first| first.as_object()).is_some_and(|o| {
+                ["wxid", "userName", "UserName", "username"].iter().any(|k| o.contains_key(*k))
+            });
+            if looks_like_contacts {
+                return Some(arr.clone());
+            }
+        }
+    }
+    None
+}
+
 fn parse_roster_items(result: &serde_json::Value) -> Vec<RosterFriend> {
-    // 数组路径多候选：结构化内容优先，其次顶层，最后 content[0].text 内嵌 JSON。
-    // 取第一个真正 **是数组** 的候选——不能先选中"存在的键"再 as_array，否则某高优先
-    // 候选键存在但非数组（server 回 {} 或标量）会短路掉后面真正的数组候选，导致空列表。
+    // 数组路径多候选。取第一个真正 **是数组** 的候选——不能先选中"存在的键"再
+    // as_array，否则某高优先候选键存在但非数组（server 回 {} 或标量）会短路掉后面
+    // 真正的数组候选，导致空列表。
+    //
+    // 关键事实（2026-07-07 线上亲验）：call_tool_with_key 只回 result.structuredContent
+    // （mcp.rs:202-205 已剥掉 JSON-RPC 外壳与 content[0].text），所以生产态本函数收到的
+    // 就是 structuredContent 本体——真正生效的是**顶层** /contacts 等候选。
+    // /structuredContent/* 与 /content/0/text 仅作防御（万一某调用方传入完整外壳）。
     let first_array = |v: &serde_json::Value, keys: &[&str]| -> Option<Vec<serde_json::Value>> {
         for k in keys {
             if let Some(arr) = v.pointer(k).and_then(|x| x.as_array()) {
@@ -439,23 +461,28 @@ fn parse_roster_items(result: &serde_json::Value) -> Vec<RosterFriend> {
         }
         None
     };
-    let arr = first_array(
-        result,
-        &[
-            "/structuredContent/contacts",
-            "/structuredContent/friends",
-            "/structuredContent/list",
-            "/contacts",
-            "/friends",
-        ],
-    )
-    .or_else(|| {
-        // content[0].text 内嵌 JSON 字符串形态。
-        let text = result.pointer("/content/0/text")?.as_str()?;
-        let inner: serde_json::Value = serde_json::from_str(text).ok()?;
-        first_array(&inner, &["/contacts", "/friends"])
-    })
-    .unwrap_or_default();
+    let named = [
+        // 生产态：structuredContent 本体的顶层数组。
+        "/contacts",
+        "/friends",
+        "/list",
+        "/items",
+        "/data",
+        // 防御：完整外壳形态（未剥壳的调用方）。
+        "/structuredContent/contacts",
+        "/structuredContent/friends",
+        "/structuredContent/list",
+    ];
+    let arr = first_array(result, &named)
+        .or_else(|| {
+            // content[0].text 内嵌 JSON 字符串形态（防御）。
+            let text = result.pointer("/content/0/text")?.as_str()?;
+            let inner: serde_json::Value = serde_json::from_str(text).ok()?;
+            first_array(&inner, &named).or_else(|| inner.as_object().and_then(contact_like_array))
+        })
+        // 末位兜底：命名候选全落空时，按内容识别顶层任一「联系人数组」。
+        .or_else(|| result.as_object().and_then(contact_like_array))
+        .unwrap_or_default();
 
     arr.iter()
         .filter_map(|item| {
@@ -478,8 +505,14 @@ pub async fn fetch_roster_for_account(
     state: &AppState,
     account_id: &str,
 ) -> AppResult<Vec<RosterFriend>> {
-    // contact_list 是主工具；account_alias 由 logged_call_for_account 自动注入。
-    let result = logged_call_for_account(state, account_id, "contact_list", serde_json::json!({})).await?;
+    // contacts_fetch_cache 是全量好友工具（gewe "Fetch the full remote contacts cache
+    // from GeWe"，无参）；account_alias 由 logged_call_for_account 自动注入。
+    // 注：早前指南页误载工具名为 contact_list，2026-07-07 线上 tools/list 亲验证伪
+    // ——gewe-multi-tenant server 无 contact_list（返 "Forbidden tool"），im_sync 是
+    // 企业微信同步（错域），全量个人好友唯一工具即 contacts_fetch_cache。
+    let result =
+        logged_call_for_account(state, account_id, "contacts_fetch_cache", serde_json::json!({}))
+            .await?;
     Ok(parse_roster_items(&result))
 }
 
@@ -613,6 +646,31 @@ mod roster_parse_tests {
     fn returns_empty_on_unknown_shape() {
         let v = serde_json::json!({ "unexpected": true });
         assert_eq!(parse_roster_items(&v).len(), 0);
+    }
+
+    #[test]
+    fn parses_unwrapped_structured_content_top_level_contacts() {
+        // 生产态真实形态：call_tool_with_key 已剥壳，本函数收到的就是 structuredContent
+        // 本体——数组在**顶层** contacts，而非 /structuredContent/contacts。
+        let v = serde_json::json!({ "contacts": [
+            { "userName": "wxid_p", "nickName": "生产好友", "bigHeadImg": "http://img/p" }
+        ]});
+        let out = parse_roster_items(&v);
+        assert_eq!(out.len(), 1, "顶层 contacts（剥壳后）应解析");
+        assert_eq!(out[0].wxid, "wxid_p");
+        assert_eq!(out[0].avatar_url.as_deref(), Some("http://img/p"));
+    }
+
+    #[test]
+    fn falls_back_to_content_like_array_under_unknown_key() {
+        // contacts_fetch_cache 的数组 key 未线上核实；若 server 用列表外的新 key
+        // （如 friendList），命名候选全落空时应按内容识别到该数组，而非解析成空。
+        let v = serde_json::json!({ "friendList": [
+            { "wxid": "wx_unknown_key", "nickName": "新键好友" }
+        ]});
+        let out = parse_roster_items(&v);
+        assert_eq!(out.len(), 1, "未知数组 key 应被内容识别兜底命中");
+        assert_eq!(out[0].wxid, "wx_unknown_key");
     }
 
     #[test]
