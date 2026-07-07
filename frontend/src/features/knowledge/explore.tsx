@@ -3,7 +3,7 @@ import { ChevronDown, ChevronRight, Clock3, RefreshCw, Sparkles } from "lucide-r
 import { parseApiError } from "../../lib/api";
 import { numberOr, stringOr, type TreeChunkItem } from "./shared";
 import { EmptyState } from "../../components/ui/EmptyState";
-import { wikiTypeLabel, statusLabel, integrityStatusLabel } from "./labels";
+import { wikiTypeLabel, statusLabel, integrityStatusLabel, relatedKindLabel } from "./labels";
 
 interface AskSourceQuote {
   chunkId: string;
@@ -261,10 +261,10 @@ export function AskView() {
             ) : null}
             <span>引用：{result.citedChunkIds.length}</span>
           </div>
-          <div className="wikiAskAnswer">{result.answer || "（agent 未给出文本回答）"}</div>
+          <div className="wikiAskAnswer">{result.answer || "（AI 未给出文字回答）"}</div>
           {result.citedChunkIds.length > 0 ? (
             <div className="wikiCitedList">
-              <div className="wikiCitedTitle">引用 chunks</div>
+              <div className="wikiCitedTitle">引用的知识片段</div>
               {result.citedChunkIds.map((cid) => {
                 const q = quoteByChunk.get(cid);
                 const open = openCited.has(cid);
@@ -278,16 +278,16 @@ export function AskView() {
                       {open ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
                       <code className="wikiCitedId">{cid}</code>
                       {q ? (
-                        <span className="wikiCitedHint">含 source_quote</span>
+                        <span className="wikiCitedHint">含原文引用</span>
                       ) : (
-                        <span className="wikiCitedHint muted">无 source_quote</span>
+                        <span className="wikiCitedHint muted">无原文引用</span>
                       )}
                     </button>
                     {open && q ? (
                       <blockquote className="wikiCitedQuote">{q.quote}</blockquote>
                     ) : null}
                     {open && !q ? (
-                      <p className="wikiHint">该引用未配 source_quote；请在 Review 视图补齐。</p>
+                      <p className="wikiHint">该引用未配原文引用；请在评审视图补齐。</p>
                     ) : null}
                   </div>
                 );
@@ -447,7 +447,7 @@ export function KnowledgeTreeView() {
           {loading ? "加载中…" : "刷新"}
         </button>
         <span className="wikiHint">
-          只读视图。verify / reject 请去"待评审"，编辑请去"编辑历史"。
+          只读视图。确认 / 退回请去"待评审"，查看改动请去"修订历史"。
         </span>
       </div>
       {error ? <div className="wikiAlert error">{error}</div> : null}
@@ -573,11 +573,11 @@ function ChunkDetail(props: {
           <span className="wikiArchiveCitationSource">{chunk.id}</span>
         </blockquote>
       ) : (
-        <div className="wikiHint">无 source_quote — 该 chunk 不可被 verify。</div>
+        <div className="wikiHint">无原文引用 — 该知识片段不可核验。</div>
       )}
       {anchors.length > 0 ? (
         <section className="wikiSourceAnchorsSection">
-          <div className="wikiSectionTitle">source_anchors（{anchors.length}）</div>
+          <div className="wikiSectionTitle">原文定位（{anchors.length}）</div>
           <div className="wikiSourceAnchorList">
             {anchors.map((a, i) => {
               const sl = numberOr(a["startLine"]);
@@ -609,7 +609,7 @@ function ChunkDetail(props: {
       ) : null}
       {related.length > 0 ? (
         <section>
-          <div className="wikiSectionTitle">related_chunks（{related.length}）</div>
+          <div className="wikiSectionTitle">关联知识（{related.length}）</div>
           <div className="wikiRelatedList">
             {related.map((r, i) => {
               const target = indexById.get(r.chunk_id);
@@ -623,7 +623,7 @@ function ChunkDetail(props: {
                   onClick={() => onJump(r.chunk_id)}
                   title={dead ? "目标 chunk 不在活跃集合（已 archived 或不存在）" : r.note ?? ""}
                 >
-                  <span className="wikiRelatedKind">{r.kind}</span>
+                  <span className="wikiRelatedKind">{relatedKindLabel(r.kind)}</span>
                   <span className="wikiRelatedTitle">{target ? target.title : r.chunk_id}</span>
                 </button>
               );

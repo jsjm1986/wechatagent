@@ -12,6 +12,7 @@ import {
   memoryFactList,
   stringField
 } from "../../legacy";
+import { useProfileStore, labelFor } from "../../../../stores/profileStore";
 import styles from "../cockpit.module.css";
 
 const FACT_SECTIONS = [
@@ -36,8 +37,11 @@ export function MemoryDetailView({
   memoryCard?: Record<string, unknown>;
   onBack: () => void;
 }) {
+  const taxonomies = useProfileStore((s) => s.taxonomies);
   const profile = memoryCard?.coreProfile as Record<string, unknown> | undefined;
   const relation = memoryCard?.relationshipState as Record<string, unknown> | undefined;
+  const stageRaw = stringField(relation || {}, "stage");
+  const stageLabel = stageRaw ? labelFor(taxonomies, "customer_stage", stageRaw).text : "";
 
   const factItems = FACT_SECTIONS
     .map((section) => ({ ...section, facts: memoryFactList(memoryCard, section.key) }))
@@ -72,7 +76,7 @@ export function MemoryDetailView({
                   stringField(profile || {}, "identity"),
                   stringField(profile || {}, "businessContext"),
                   stringField(profile || {}, "communicationStyle"),
-                  stringField(relation || {}, "stage")
+                  stageLabel
                 ]
                   .filter(Boolean)
                   .join(" / ") || "待确认"}

@@ -25,9 +25,9 @@ describe("ChunkRepairPanel", () => {
     render(<ChunkRepairPanel chunkId="c1" originalChunk={{ summary: "原" }} onApplied={vi.fn()} />);
     fireEvent.click(screen.getByText(/AI 修复建议/));
     await waitFor(() => screen.getByText(/AI改的summary/));
-    // patch 两字段各一复选框
-    expect(screen.getByText("summary")).toBeInTheDocument();
-    expect(screen.getByText("sourceQuote")).toBeInTheDocument();
+    // patch 两字段各一复选框（字段名经 chunkFieldLabel 中文化）
+    expect(screen.getByText("摘要")).toBeInTheDocument();
+    expect(screen.getByText("原话出处")).toBeInTheDocument();
     expect(screen.getAllByRole("checkbox").length).toBe(2);
     // confidenceHint 展示
     expect(screen.getByText(/65/)).toBeInTheDocument();

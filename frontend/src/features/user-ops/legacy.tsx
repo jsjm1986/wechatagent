@@ -46,6 +46,7 @@ import type {
   SendHistoryItem
 } from "../../types";
 import { api } from "../../lib/api";
+import { GATEWAY_STATUS_LABELS, NEXT_BEST_ACTION_TYPE_LABELS, VERSION_STATUS_LABELS, labelOf, seededByLabel, promptLayerLabel } from "../../lib/reviewLabels";
 import { useProfileStore, labelFor } from "../../stores/profileStore";
 import { useUserOpsStore } from "../../stores/userOpsStore";
 import TagTrustPanel from "./TagTrustPanel";
@@ -149,8 +150,8 @@ const USER_RUNTIME_PARAMETER_FIELDS: Array<{
   { key: "hallucinationBlockAt", label: "幻觉风险拦截线", detail: "幻觉风险达到该分值则禁止发送", kind: "number", defaultValue: 6 },
   { key: "knowledgeGroundingBlockBelow", label: "知识落地拦截线", detail: "低于该分值则禁止发送涉及产品/价格/政策的内容", kind: "number", defaultValue: 7 },
   { key: "humanLikeRewriteBelow", label: "真人感重写线", detail: "低于该分值时要求重写", kind: "number", defaultValue: 6 },
-  { key: "emotionalValueRewriteBelow", label: "情绪价值重写线", detail: "低于该分值时要求重写", kind: "number", defaultValue: 5 },
-  { key: "operationStateConfidenceFullReviewBelow", label: "状态置信 Review 线", detail: "低于该分值强制完整 Review", kind: "number", defaultValue: 4 },
+  { key: "emotionalValueRewriteBelow", label: "情绪价值重写线", detail: "低于该分值时要求重写", kind: "number", defaultValue: 6 },
+  { key: "operationStateConfidenceFullReviewBelow", label: "状态置信复盘线", detail: "低于该分值强制完整复盘", kind: "number", defaultValue: 4 },
   { key: "runTokenBudget", label: "单次 Token 预算", detail: "单次用户运营运行的最大 token", kind: "number", defaultValue: 30000 },
   { key: "runMaxLlmCalls", label: "单次模型调用上限", detail: "单次用户运营最多 LLM 调用次数", kind: "number", defaultValue: 6 },
   { key: "simulationTokenBudget", label: "模拟评测预算", detail: "单次模拟/评测可用 token", kind: "number", defaultValue: 60000 },
@@ -198,6 +199,7 @@ export function ChangePreview({ changes, readableChanges }: { changes: Record<st
 
 
 export function MemoryCardSummary({ memoryCard }: { memoryCard?: Record<string, unknown> }) {
+  const taxonomies = useProfileStore((s) => s.taxonomies);
   const factSections = [
     { key: "coreFacts", label: "核心事实" },
     { key: "recentFacts", label: "近期事实" },
@@ -231,7 +233,10 @@ export function MemoryCardSummary({ memoryCard }: { memoryCard?: Record<string, 
             stringField(profile || {}, "identity"),
             stringField(profile || {}, "businessContext"),
             stringField(profile || {}, "communicationStyle"),
-            stringField(relation || {}, "stage")
+            (() => {
+              const s = stringField(relation || {}, "stage");
+              return s ? labelFor(taxonomies, "customer_stage", s).text : "";
+            })()
           ].filter(Boolean).join(" / ") || "待确认"}</p>
         </div>
       )}
@@ -308,10 +313,10 @@ export function MemoryFactRow({ fact }: { fact: MemoryFactView }) {
       </p>
       <div className="memoryFactMeta">
         {typeof fact.confidence === "number" && (
-          <span className="memoryFactChip" title="confidence 0-10">置信 {fact.confidence}</span>
+          <span className="memoryFactChip" title="置信度 0-10">置信 {fact.confidence}</span>
         )}
         {typeof fact.importance === "number" && (
-          <span className="memoryFactChip" title="importance 0-10">重要 {fact.importance}</span>
+          <span className="memoryFactChip" title="重要度 0-10">重要 {fact.importance}</span>
         )}
         {fact.mayExpire && <span className="memoryFactChip memoryFactBadge">易失效</span>}
         {fact.evidence && (
@@ -358,7 +363,7 @@ export function SimulationResult({ turns }: { turns: SimulationTurn[] }) {
               </div>
             </div>
             <div className="simMetrics">
-              <span>网关：{gatewayAllowed ? "通过" : String(turn.gatewayResult?.reason || "拦截")}</span>
+              <span>网关：{gatewayAllowed ? "通过" : (turn.gatewayResult?.reason ? labelOf(GATEWAY_STATUS_LABELS, String(turn.gatewayResult.reason)) : "拦截")}</span>
               <span>幻觉风险：{reviewScores.hallucinationScore ?? "-"}</span>
               <span>知识匹配：{reviewScores.knowledgeGroundingScore ?? "-"}</span>
               <span>真人感：{reviewScores.humanLike ?? "-"}</span>
@@ -542,9 +547,11 @@ function ActiveVersionsBar({
 
   async function runAction(action: "publish" | "rollout" | "rollback") {
     if (!meta || !meta.id) return;
+    const actionLabel =
+      action === "publish" ? "发布" : action === "rollout" ? "切到当前" : "回滚";
     const confirmText =
       action === "publish"
-        ? `确认发布 ${resourceLabel} 新版本（version=${version + 1}）？`
+        ? `确认发布 ${resourceLabel} 新版本（v${version + 1}）？`
         : action === "rollout"
         ? `确认把 ${resourceLabel} v${version} 设为当前生效版本？`
         : `确认回滚 ${resourceLabel} 到上一版本（v${previousVersion ?? "?"}）？`;
@@ -554,7 +561,7 @@ function ActiveVersionsBar({
       await api.post(`${endpointPrefix}/${meta.id}/${action}`, {});
       if (onAfterAction) await onAfterAction();
     } catch (error) {
-      window.alert(`${resourceLabel} ${action} 失败：${(error as Error).message}`);
+      window.alert(`${resourceLabel} ${actionLabel}失败：${(error as Error).message}`);
     } finally {
       setActionBusy(false);
     }
@@ -567,20 +574,20 @@ function ActiveVersionsBar({
       <div className="activeVersionsMeta">
         <span className={`activeVersionsBadge ${isCurrent ? "current" : "shadow"}`}>
           v{version}
-          {isCurrent ? " · current" : " · shadow"}
+          {isCurrent ? " · 当前生效" : " · 影子版本"}
         </span>
         {previousVersion !== null && (
-          <span className="activeVersionsChain" title="previous_version 回滚链">
+          <span className="activeVersionsChain" title="上一版本回滚链">
             ← v{previousVersion}
           </span>
         )}
         {seededBy && (
           <span className={`activeVersionsSeeded seeded-${seededBy}`} title="写入来源">
-            {seededBy}
+            {seededByLabel(seededBy)}
           </span>
         )}
         {meta.updatedAt && (
-          <span className="activeVersionsTimestamp" title="updated_at">
+          <span className="activeVersionsTimestamp" title="更新时间">
             {meta.updatedAt}
           </span>
         )}
@@ -592,7 +599,7 @@ function ActiveVersionsBar({
             className="secondary"
             onClick={() => void runAction("publish")}
             disabled={disabled}
-            title="基于当前 row 发布新版本（version+1，previous_version 自动写入）"
+            title="基于当前内容发布新版本，版本号+1，自动记录上一版本"
           >
             发布新版本
           </button>
@@ -603,7 +610,7 @@ function ActiveVersionsBar({
             className="secondary"
             onClick={() => void runAction("rollout")}
             disabled={disabled}
-            title="把这一版本切到当前生效（其他版本 soft demote）"
+            title="把这一版本切到当前生效（其他版本自动降为影子版本）"
           >
             切到当前
           </button>
@@ -682,7 +689,7 @@ export function DomainConfigEditor({
         <ActiveVersionsBar
           meta={config}
           endpointPrefix="/api/admin/operation-domains"
-          resourceLabel={`Domain ${config.domain}`}
+          resourceLabel={config.domain === "user_operations" ? "用户运营域" : `业务域 ${config.domain}`}
           busy={busy}
           canPublish
           onAfterAction={onAfterVersionAction}
@@ -890,7 +897,7 @@ export function UserPlaybookPanel({
         </form>
         <section className="methodologyPanel">
           <div>
-            <span>Formula</span>
+            <span>运营公式</span>
             <h3>长期用户运营公式</h3>
           </div>
           <div className="formulaGrid">
@@ -916,7 +923,7 @@ export function UserPlaybookPanel({
               onClick={() => onEditPlaybook(playbook)}
             >
               <strong>{playbook.name}</strong>
-              <span>v{playbook.version} / {playbook.createdBy}{playbook.isDefault ? " / 默认" : ""}</span>
+              <span>v{playbook.version} / {playbookCreatedByLabel(playbook.createdBy)}{playbook.isDefault ? " / 默认" : ""}</span>
               <p>{playbook.description || playbook.methodPrompt}</p>
             </button>
           ))}
@@ -985,7 +992,7 @@ export function UserPlaybookPanel({
         {editingPlaybookId && (
           <section className="optimizeBox">
             <div>
-              <span>AI Optimize</span>
+              <span>AI 优化</span>
               <h3>优化当前方法</h3>
             </div>
             <textarea value={optimizePlaybookText} onChange={(event) => onOptimizePlaybookText(event.target.value)} />
@@ -1103,7 +1110,7 @@ export function DomainPromptPanel({
                 {soul.name}
                 {soul.status === "draft" && <span className="statusBadge statusBadgeDraft">草稿</span>}
               </strong>
-              <span>{agentKindLabel(soul.agentKind)} / v{soul.version} / {soul.status}</span>
+              <span>{agentKindLabel(soul.agentKind)} / v{soul.version} / {VERSION_STATUS_LABELS[soul.status] ?? soul.status}</span>
               <p>{soul.content}</p>
             </button>
           ))}
@@ -1156,7 +1163,7 @@ export function DomainPromptPanel({
                 {template.title}
                 {template.status === "draft" && <span className="statusBadge statusBadgeDraft">草稿</span>}
               </strong>
-              <span>{agentKindLabel(template.agentKind)} / {template.layer} / v{template.version} / {template.status}</span>
+              <span>{agentKindLabel(template.agentKind)} / {promptLayerLabel(template.layer)} / v{template.version} / {VERSION_STATUS_LABELS[template.status] ?? template.status}</span>
               <p>{template.description || template.content}</p>
             </button>
           ))}
@@ -1193,7 +1200,7 @@ export function DomainPromptPanel({
             <input value={promptDraft.description} onChange={(event) => updatePromptDraft({ description: event.target.value })} />
           </label>
           <label>
-            <span>Prompt 内容</span>
+            <span>提示词内容</span>
             <textarea value={promptDraft.content} onChange={(event) => updatePromptDraft({ content: event.target.value })} />
           </label>
           <details className="advancedFields">
@@ -1481,6 +1488,16 @@ export function contextPackList(source: Record<string, unknown> | undefined, key
 }
 
 
+// 运营公式写入来源（playbooks.rs / prompts.rs：system*/manual/agent/agent_optimized）→ 中文；未知回落原值。
+export function playbookCreatedByLabel(createdBy?: string | null) {
+  if (!createdBy) return "";
+  if (createdBy.startsWith("system")) return "系统内置";
+  if (createdBy === "manual") return "管理员新建";
+  if (createdBy === "agent") return "AI 生成";
+  if (createdBy === "agent_optimized") return "AI 优化";
+  return createdBy;
+}
+
 export function memoryStatusLabel(status: string) {
   if (status === "pending") return "待整理";
   if (status === "consolidated") return "已入库";
@@ -1488,9 +1505,42 @@ export function memoryStatusLabel(status: string) {
   return status || "未知";
 }
 
+// 记忆候选类型闭集（prompts.rs:1317 candidate type + domain_profile 派生桶）→ 中文；未知回落原值。
+const MEMORY_CANDIDATE_TYPE_LABELS: Record<string, string> = {
+  fact: "事实",
+  preference: "偏好",
+  doNotDo: "禁忌",
+  commitment: "承诺",
+  objection: "异议",
+  openLoop: "待办",
+  conflict: "冲突",
+};
+export function memoryCandidateTypeLabel(type: string) {
+  if (!type) return "";
+  return MEMORY_CANDIDATE_TYPE_LABELS[type] ?? type;
+}
+
+// 记忆候选写入来源闭集（memory.rs：tag_observation/memory_card/contact_seed/
+// memory_consolidator_agent + run_mode fast_chat/memory_candidate/knowledge_grounded/high_risk/live）→ 中文；未知回落原值。
+const MEMORY_CANDIDATE_SOURCE_LABELS: Record<string, string> = {
+  tag_observation: "标签观测",
+  memory_card: "记忆卡",
+  contact_seed: "初始录入",
+  memory_consolidator_agent: "记忆整理",
+  fast_chat: "快速对话",
+  memory_candidate: "记忆候选",
+  knowledge_grounded: "知识接地",
+  high_risk: "高风险",
+  live: "实时对话",
+};
+export function memoryCandidateSourceLabel(source?: string | null) {
+  if (!source) return "AI";
+  return MEMORY_CANDIDATE_SOURCE_LABELS[source] ?? source;
+}
+
 
 export function memoryCandidateText(candidate: Record<string, unknown>) {
-  const type = stringField(candidate, "type");
+  const type = memoryCandidateTypeLabel(stringField(candidate, "type"));
   const content = stringField(candidate, "content");
   const evidence = stringField(candidate, "evidence");
   return [type, content, evidence ? `依据：${evidence}` : ""].filter(Boolean).join(" · ");
@@ -1519,8 +1569,9 @@ export function simulationStatusLabel(status: string) {
 export function nextBestActionLabel(action?: Record<string, unknown>) {
   if (!action) return "-";
   const type = typeof action.type === "string" ? action.type : "-";
+  const typeLabel = NEXT_BEST_ACTION_TYPE_LABELS[type] ?? type;
   const score = typeof action.score === "number" ? ` / ${action.score}` : "";
-  return `${type}${score}`;
+  return `${typeLabel}${score}`;
 }
 
 
@@ -1630,7 +1681,7 @@ export function PlannerViewSection({ contact }: { contact: Contact | null }) {
   }
   return (
     <section className="cockpitSection" data-testid="planner-view-section">
-      <div className="sectionCaption">Planner 视角</div>
+      <div className="sectionCaption">主动跟进视角</div>
       {hasMode && (
         <div data-testid="planner-mode-row" style={{ fontSize: 13, color: "#444", marginBottom: 8 }}>
           上轮对话模式 <strong>{labelFor(taxonomies, "conversation_mode", lastMode!).text}</strong>

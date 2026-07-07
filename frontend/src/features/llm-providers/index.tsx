@@ -242,7 +242,7 @@ export default function LlmProvidersFeature() {
   // #574：指派 / 取消本 workspace 专职视觉模型。要求 supportsVision=true。
   async function setVisionItem(item: LlmProviderItem, activeFlag: boolean) {
     if (activeFlag && !item.supportsVision) {
-      window.alert("该供应商未勾选「支持图片」，请先在编辑里开启 supportsVision 再指派为视觉模型");
+      window.alert("该供应商未勾选「支持图片输入」，请先在编辑里勾选后再指派为视觉模型");
       return;
     }
     setBusy(true);
@@ -654,10 +654,10 @@ export default function LlmProvidersFeature() {
                 onChange={(e) => setDraft({ ...draft, supportsVision: e.target.checked })}
                 disabled={busy}
               />
-              <span>支持图片输入（multimodal vision）</span>
+              <span>支持图片输入（多模态视觉）</span>
             </label>
             <small className={`${styles.fieldHint} ${styles.spanFull}`}>
-              勾选后该模型可识别图片。若文字主模型不支持图片，可单独配置一条支持图片的模型，保存后在卡片上「设为视觉模型」——图片导入会自动路由到该视觉模型；否则图片导入返回 visionNotSupported。
+              勾选后该模型可识别图片。若文字主模型不支持图片，可单独配置一条支持图片的模型，保存后在卡片上「设为视觉模型」——图片导入会自动路由到该视觉模型；否则图片导入会因缺少可用视觉模型而失败。
             </small>
           </div>
 

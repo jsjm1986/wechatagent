@@ -43,7 +43,7 @@ export default function CampaignBoard() {
         <EmptyState
           icon={<Megaphone size={28} />}
           title="暂无活动结果"
-          hint="在 AI 总控 dispatch 活动后，点「查看推送结果」进入这里查看真实触达分布。"
+          hint="在 AI 总控下发活动推送后，点「查看推送结果」进入这里查看真实触达分布。"
         />
       </div>
     );
@@ -91,7 +91,7 @@ export default function CampaignBoard() {
       <section className={styles.panel}>
         <div className={styles.head}>
           <div className={styles.headL}>
-            <span className={styles.eyebrow}>Per-Contact</span>
+            <span className={styles.eyebrow}>逐人明细</span>
             <span className={styles.title}>推送明细</span>
           </div>
           <button

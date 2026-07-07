@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { fieldKindLabel } from "./labels";
 
 export interface DomainSchemaFieldDraft {
   name: string;
@@ -114,7 +115,7 @@ export function DomainSchemaEditor({
             <select className="wikiInput" value={f.kind} onChange={(e) => updateField(i, { kind: e.target.value })}>
               {KIND_OPTIONS.map((k) => (
                 <option key={k} value={k}>
-                  {k}
+                  {fieldKindLabel(k)}
                 </option>
               ))}
             </select>

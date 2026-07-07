@@ -1,4 +1,5 @@
 import type { BayesianSignal } from "../../types";
+import { useProfileStore, labelFor } from "../../stores/profileStore";
 import styles from "./BayesianTrendChart.module.css";
 
 /**
@@ -40,7 +41,11 @@ function toPoints(history: BayesianSignal["history"]): string {
 }
 
 export default function BayesianTrendChart({ signals }: { signals: BayesianSignal[] }) {
+  const taxonomies = useProfileStore((s) => s.taxonomies);
+  const dimensions = useProfileStore((s) => s.dimensions);
   const locked = signals.filter((s) => s.locked);
+  // dimension 是维度 kind（如 customer_stage）→ 显示名；currentValue 是该维度取值 → 中文标签。
+  const dimName = (kind: string) => dimensions.find((d) => d.kind === kind)?.displayName || kind;
 
   if (locked.length === 0) {
     return (
@@ -96,9 +101,9 @@ export default function BayesianTrendChart({ signals }: { signals: BayesianSigna
               style={{ background: PALETTE[idx % PALETTE.length] }}
               aria-hidden="true"
             />
-            <span className={styles.legendName}>{s.dimension}</span>
+            <span className={styles.legendName}>{dimName(s.dimension)}</span>
             <span className={styles.legendValue}>
-              {s.currentValue} · 置信度 {Math.round(s.currentConfidence * 100)}%
+              {labelFor(taxonomies, s.dimension, s.currentValue).text} · 置信度 {Math.round(s.currentConfidence * 100)}%
             </span>
           </li>
         ))}

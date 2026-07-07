@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { api } from "../../lib/api";
+import { VERSION_STATUS_LABELS, labelOf } from "../../lib/reviewLabels";
 import styles from "./EvaluationScenariosPanel.module.css";
 
 // 评测场景配置入口：管理员自助维护 formula-adherence 评测所依赖的 active evaluation_scenarios，
@@ -86,9 +87,8 @@ export function EvaluationScenariosPanel() {
   return (
     <div className={styles.panel}>
       <p className={styles.desc}>
-        管理 formula-adherence 评测所依赖的 <code>evaluation_scenarios</code>。只有 <code>active</code>{" "}
-        的场景会被「公式遵守度」评测跑到。每个场景包含输入消息序列与 ground truth；这里维护基础字段，
-        更细的 <code>contactSeed</code> / <code>groundTruth</code> 仍可由后端补全。
+        管理「公式遵守度」评测所依赖的评测场景。只有<strong>启用中</strong>的场景会被评测跑到。
+        每个场景包含输入消息序列与标准答案；这里维护基础字段，更细的初始联系人 / 标准答案仍可由后端补全。
       </p>
 
       <form
@@ -142,7 +142,7 @@ export function EvaluationScenariosPanel() {
       {err && <div className={styles.error}>{err}</div>}
 
       {items.length === 0 && !loading ? (
-        <p className={styles.hint}>还没有评测场景。新建一个 active 场景后，公式遵守度评测才有基准可跑。</p>
+        <p className={styles.hint}>还没有评测场景。新建一个启用中的场景后，公式遵守度评测才有基准可跑。</p>
       ) : (
         <table className={styles.table}>
           <thead>
@@ -161,7 +161,7 @@ export function EvaluationScenariosPanel() {
                   <br />
                   <small>{s.scenarioId}</small>
                 </td>
-                <td>{s.status || "—"}</td>
+                <td>{labelOf(VERSION_STATUS_LABELS, s.status)}</td>
                 <td>{s.inboundMessages?.length ?? 0}</td>
                 <td>
                   <button

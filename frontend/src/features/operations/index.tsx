@@ -5,7 +5,7 @@ import { StatusBadge, type StatusTone } from "../../components/ui/StatusBadge";
 import { useOperationsStore } from "../../stores/operationsStore";
 import { useAccountStore } from "../../stores/accountStore";
 import { api } from "../../lib/api";
-import { FINAL_REVIEW_STATUS_LABELS, GATEWAY_STATUS_LABELS, HOLD_CATEGORY_LABELS, labelOf } from "../../lib/reviewLabels";
+import { FINAL_REVIEW_STATUS_LABELS, GATEWAY_STATUS_LABELS, HOLD_CATEGORY_LABELS, NEXT_BEST_ACTION_TYPE_LABELS, REVIEW_SCORE_LABELS, EVENT_KIND_LABELS, EVENT_STATUS_LABELS, labelOf } from "../../lib/reviewLabels";
 import type { DecisionReview, AgentRunItem } from "../../types";
 import styles from "./Operations.module.css";
 
@@ -40,20 +40,19 @@ function taskStatusTone(status?: string): StatusTone {
   return "inactive";
 }
 
-const SCORE_LABELS: Record<string, string> = {
-  humanLike: "拟人度",
-  emotionalValue: "情绪价值",
-  hallucinationScore: "幻觉风险",
-  knowledgeGroundingScore: "知识接地",
-  pressureRisk: "压迫风险",
-  boundaryPrivacySafety: "隐私边界",
+// LLM 调用日志状态(models.rs:3005 闭集:success/cache_hit/failed/json_error);未知回落原值。
+const LLM_CALL_STATUS_LABELS: Record<string, string> = {
+  success: "成功",
+  cache_hit: "缓存命中",
+  failed: "失败",
+  json_error: "返回解析失败",
 };
 
 export function formatScores(scores: Record<string, number>) {
   const entries = Object.entries(scores ?? {}).filter(([, v]) => v !== undefined && v !== null);
   return (
     entries
-      .map(([key, v]) => `${SCORE_LABELS[key] ?? key}:${v}`)
+      .map(([key, v]) => `${REVIEW_SCORE_LABELS[key] ?? key}:${v}`)
       .join(" / ") || "-"
   );
 }
@@ -61,8 +60,9 @@ export function formatScores(scores: Record<string, number>) {
 function nextBestActionLabel(action?: Record<string, unknown>) {
   if (!action) return "-";
   const type = typeof action.type === "string" ? action.type : "-";
+  const typeLabel = NEXT_BEST_ACTION_TYPE_LABELS[type] ?? type;
   const score = typeof action.score === "number" ? ` / ${action.score}` : "";
-  return `${type}${score}`;
+  return `${typeLabel}${score}`;
 }
 
 function reviewTone(review: DecisionReview): StatusTone {
@@ -84,9 +84,9 @@ function runStatusTone(status?: string): StatusTone {
 // 不是 gatewayResult（SendGatewayResult 无 tier 字段），也不是 events.detail（/api/events 不下发 detail）。
 // missingTier 即本轮需要升到的档位（none → Lean 足够；relational / full → 需升档）。
 const TIER_LABELS: Record<string, string> = {
-  none: "Lean（精简档已足够）",
-  relational: "Relational（需关系档）",
-  full: "Full（需完整知识档）",
+  none: "精简档已足够",
+  relational: "需关系档",
+  full: "需完整知识档",
 };
 const SUFFICIENCY_LABELS: Record<string, string> = {
   enough: "信息充分",
@@ -158,11 +158,11 @@ function renderStageValue(value: unknown): string {
 }
 
 const RUN_STAGE_KEYS: { key: keyof AgentRunItem; label: string }[] = [
-  { key: "planner", label: "Planner" },
-  { key: "context", label: "Context" },
+  { key: "planner", label: "规划" },
+  { key: "context", label: "上下文" },
   { key: "knowledgeRoute", label: "知识路由" },
   { key: "decision", label: "决策" },
-  { key: "review", label: "Review" },
+  { key: "review", label: "复核" },
   { key: "gatewayResult", label: "送达网关" },
 ];
 
@@ -204,7 +204,7 @@ export default function OperationsFeature() {
   const tabs: { id: typeof opsTab; label: string }[] = [
     { id: "tasks", label: "跟进任务" },
     { id: "events", label: "运营事件" },
-    { id: "reviews", label: "Review 记录" },
+    { id: "reviews", label: "复核记录" },
     { id: "runs", label: "运行日志" },
     { id: "llm", label: "LLM 成本" }
   ];
@@ -218,7 +218,7 @@ export default function OperationsFeature() {
         <div className={styles.head}>
           <div className={styles.headL}>
             <span className={styles.eyebrow}>Operations</span>
-            <span className={styles.title}>任务、事件与 Review</span>
+            <span className={styles.title}>任务、事件与复核</span>
           </div>
           <span className={styles.clock}><Clock3 size={17} /></span>
         </div>
@@ -298,7 +298,7 @@ export default function OperationsFeature() {
                     <span className={styles.tDot} />
                     <div className={styles.tCard}>
                       <div className={styles.tHead}>
-                        <strong>{event.kind}</strong>
+                        <strong>{labelOf(EVENT_KIND_LABELS, event.kind)}</strong>
                         <span>{formatTime(event.createdAt)}</span>
                       </div>
                       {event.summary && <p>{event.summary}</p>}
@@ -310,7 +310,7 @@ export default function OperationsFeature() {
                       )}
                       {event.status && (
                         <div className={styles.tChips}>
-                          <span>{event.status}</span>
+                          <span>{labelOf(EVENT_STATUS_LABELS, event.status)}</span>
                         </div>
                       )}
                     </div>
@@ -324,7 +324,7 @@ export default function OperationsFeature() {
           (loading ? (
             <EmptyState title="加载中…" hint="正在拉取运营数据。" />
           ) : decisionReviews.length === 0 ? (
-            <EmptyState title="暂无 Review 记录" hint="独立复盘 Agent 的结论与评分会在这里留痕。" />
+            <EmptyState title="暂无复核记录" hint="独立复盘 Agent 的结论与评分会在这里留痕。" />
           ) : (
             <table className={styles.table}>
               <thead>
@@ -356,13 +356,13 @@ export default function OperationsFeature() {
           (loading ? (
             <EmptyState title="加载中…" hint="正在拉取运营数据。" />
           ) : agentRuns.length === 0 ? (
-            <EmptyState title="暂无运行日志" hint="Agent 每轮决策的 run envelope（含档位遥测）会在这里留痕。" />
+            <EmptyState title="暂无运行日志" hint="AI 每轮决策的运行记录（含档位遥测）会在这里留痕。" />
           ) : (
             <table className={styles.table}>
               <thead>
                 <tr>
                   <th>状态</th>
-                  <th>Run ID</th>
+                  <th>运行 ID</th>
                   <th>触发</th>
                   <th>档位遥测</th>
                   <th>时间</th>
@@ -416,7 +416,7 @@ export default function OperationsFeature() {
               <table className={styles.table}>
                 <thead>
                   <tr>
-                    <th>Prompt Key</th>
+                    <th>提示词</th>
                     <th>状态</th>
                     <th>耗时</th>
                     <th>命中</th>
@@ -428,10 +428,10 @@ export default function OperationsFeature() {
                   {usageItems.map((item) => (
                     <tr key={item.id}>
                       <td>{item.promptKey}</td>
-                      <td className={styles.cellMuted}>{item.status}</td>
+                      <td className={styles.cellMuted}>{LLM_CALL_STATUS_LABELS[item.status] ?? item.status}</td>
                       <td className={styles.cellNum}>{item.latencyMs}ms</td>
-                      <td className={styles.cellNum}>hit {item.promptCacheHitTokens}</td>
-                      <td className={styles.cellNum}>miss {item.promptCacheMissTokens}</td>
+                      <td className={styles.cellNum}>{item.promptCacheHitTokens}</td>
+                      <td className={styles.cellNum}>{item.promptCacheMissTokens}</td>
                       <td className={styles.cellMuted}>{formatTime(item.createdAt)}</td>
                     </tr>
                   ))}

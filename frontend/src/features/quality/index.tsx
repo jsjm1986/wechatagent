@@ -6,6 +6,7 @@ import { useAccountStore } from "../../stores/accountStore";
 import { ConfirmProvider, useConfirm } from "../../components/ui/ConfirmDialog";
 import { promptDiffBody } from "../../components/prompt/usePromptSaveConfirm";
 import { EvaluationScenariosPanel } from "./EvaluationScenariosPanel";
+import { VERSION_STATUS_LABELS, labelOf } from "../../lib/reviewLabels";
 import styles from "./Quality.module.css";
 
 // 运营成效中心频道：长期指标 / 知识自动校验 / 公式遵守度评测 / 产品声明兜底标记词。
@@ -112,13 +113,13 @@ export function OutcomeMetricsTab({ accountId }: { accountId?: string }) {
           {loading ? "加载中" : "刷新"}
         </button>
         <small className={styles.toolbarHint}>
-          指标说明：null（"—"）= 该窗口内无样本；不要把它当 0 解读。
+          指标说明：显示"—"表示该窗口内无样本；不要把它当 0 解读。
         </small>
       </div>
       {err && <div className={styles.error}>{err}</div>}
       {!accountId && <p className={styles.hint}>请先在顶部选择一个微信账号。</p>}
       {accountId && items.length === 0 && !loading && (
-        <p className={styles.hint}>该账号在选定 horizon 内还没有 outcome aggregation 任务跑过。后台 worker 会在每天 tick 时自动生成。</p>
+        <p className={styles.hint}>该账号在选定周期内还没有效果汇总任务跑过。系统每天会自动生成。</p>
       )}
       {items.length > 0 && (
         <table className={styles.table}>
@@ -128,8 +129,8 @@ export function OutcomeMetricsTab({ accountId }: { accountId?: string }) {
               <th>回复率</th>
               <th>对话深度</th>
               <th>AI暂缓澄清率</th>
-              <th>Agent 拦截率</th>
-              <th>当日 run 数</th>
+              <th>AI 拦截率</th>
+              <th>当日运行数</th>
               <th>当日 token</th>
             </tr>
           </thead>
@@ -183,10 +184,9 @@ export function AutoVerifyTab({ accountId }: { accountId?: string }) {
   return (
     <div className={styles.tabPanel}>
       <p className={styles.desc}>
-        对 <strong>needs_review</strong> 状态的知识切片做 LLM 自动校验。verified 必须满足：
-        切片自带 <code>source_quote</code> 非空 + <code>source_anchors</code> 可定位 +
-        模型 <code>integrityStatus="verified"</code> + 置信分 ≥ 阈值。否则降级为 needs_review/rejected。
-        随机 <code>sampleRate</code> 比例的 verified 切片改成 needs_human_audit 走运营抽查。
+        对<strong>待确认</strong>状态的知识条目做 AI 预审分诊：满足「自带原文引用 + 原文出处可定位 +
+        模型自评通过 + 置信分 ≥ 阈值」的条目会被挑出、转为<strong>待人工抽查</strong>，其余降级为待确认或退回。
+        为守住「AI 永不自动放行」红线，预审<strong>绝不</strong>把任何知识直接标记为已确认，最终是否采纳一律由运营核验。
       </p>
       <div className={styles.toolbar}>
         <label className={styles.label}>
@@ -235,10 +235,9 @@ export function AutoVerifyTab({ accountId }: { accountId?: string }) {
             {result.degraded && <span className={styles.badgeDegraded}>预算超额降级</span>}
           </h3>
           <ul>
-            <li>verified：{result.verified}</li>
-            <li>needs_review：{result.needsReview}</li>
-            <li>rejected：{result.rejected}</li>
-            <li>needs_human_audit：{result.needsHumanAudit}</li>
+            <li>待人工抽查：{result.needsHumanAudit}</li>
+            <li>仍待确认：{result.needsReview}</li>
+            <li>已退回：{result.rejected}</li>
           </ul>
           {result.budget && <pre>{JSON.stringify(result.budget, null, 2)}</pre>}
         </div>
@@ -481,7 +480,7 @@ function ProductClaimMarkersTabInner() {
             if (ok) await doPublish(true);
             return;
           }
-          setStatusMsg("已发布，Rust 端缓存已失效；下一次 review 即生效。");
+          setStatusMsg("已保存。注：该兜底守卫当前未启用，改动暂不影响评审行为。");
           await load();
         } catch (e) {
           const message = e instanceof Error ? e.message : String(e);
@@ -528,16 +527,16 @@ function ProductClaimMarkersTabInner() {
   return (
     <div className={styles.tabPanel}>
       <p className={styles.desc}>
-        Rust 端字符串级 fact-risk 兜底守卫使用的标记词与白名单短语。这是 Review Agent
-        判断"看似中性的话术里夹带绝对承诺"的最后一道防线。修改后会立即让进程内
-        30s TTL 缓存失效，下一次 review 加载新规则。
+        产品事实风险兜底的标记词与白名单短语（预留配置，当前未启用）。当前线上对产品声明的把关由
+        「已验证知识背书」机制负责——AI 只能基于已核验的知识条目做产品 / 价格 / 政策声明，否则拦截。
+        本配置为将来重新启用字符串级兜底守卫时预留，编辑后不会改变当前评审行为。
       </p>
       {err && <div className={styles.error}>{err}</div>}
       {statusMsg && <div className={styles.success}>{statusMsg}</div>}
       {template && (
         <>
           <small className={styles.metaLine}>
-            模板版本 v{template.version} · status={template.status}
+            模板版本 v{template.version} · 状态：{labelOf(VERSION_STATUS_LABELS, template.status)}
           </small>
           <textarea
             className={styles.textarea}

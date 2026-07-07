@@ -114,6 +114,20 @@ export interface ThresholdAuditRow {
   [k: string]: unknown;
 }
 
+// 阈值审计动作 → 中文（后端 action 闭集：released / rolled_back / auto_released，models.rs:4563）。
+function auditActionLabel(action?: string | null): string {
+  switch (action) {
+    case "released":
+      return "已发布";
+    case "rolled_back":
+      return "已回滚";
+    case "auto_released":
+      return "自动发布";
+    default:
+      return action ?? "—";
+  }
+}
+
 /// 7 天聚合（client 端从 experiments[] 推算 — 不打额外请求；后端尚未提供专用聚合 endpoint）。
 export function aggregateLast7Days(items: ExperimentItem[]): {
   experiments: number;
@@ -409,7 +423,7 @@ export function EvolutionCenterTab({ enabled = true }: { enabled?: boolean }) {
                     key={row.id ?? `${row.decidedAt ?? "row"}-${idx}`}
                     data-testid={`threshold-audit-row-${row.id ?? idx}`}
                   >
-                    <td>{row.action ?? "—"}</td>
+                    <td>{auditActionLabel(row.action)}</td>
                     <td>{row.gateKey ?? "—"}</td>
                     <td>
                       {formatNumber(row.previousValue ?? null)} → {formatNumber(row.newValue ?? null)}
@@ -477,7 +491,7 @@ function ProposalList({
   onSelect: (id: string) => void;
 }) {
   if (proposals.length === 0) {
-    return <p className={styles.proposalEmpty} data-testid="proposal-list-empty">最近 N 个 experiment 还没有候选。</p>;
+    return <p className={styles.proposalEmpty} data-testid="proposal-list-empty">最近 N 个实验还没有候选。</p>;
   }
   return (
     <table className={styles.proposalList} data-testid="proposal-list">
@@ -487,7 +501,7 @@ function ProposalList({
           <th>类型</th>
           <th>主题</th>
           <th>显著性</th>
-          <th>Replays</th>
+          <th>回放</th>
           <th>创建时间</th>
         </tr>
       </thead>
@@ -503,7 +517,7 @@ function ProposalList({
             <td>
               <StatusBadge status={p.status} />
             </td>
-            <td>{p.kind === "threshold" ? "阈值" : "Prompt"}</td>
+            <td>{p.kind === "threshold" ? "阈值" : "提示词"}</td>
             <td>
               {p.kind === "threshold"
                 ? `${p.gateKey ?? "—"}: ${formatNumber(p.currentValue)} → ${formatNumber(p.proposedValue)}`

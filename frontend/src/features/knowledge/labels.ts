@@ -249,3 +249,144 @@ export function fieldKindLabel(v?: string | null): string {
   if (!v) return "—";
   return FIELD_KIND_LABELS[v] ?? v;
 }
+
+/// chunk 关系类型(models.rs:1488 六值闭集 superseded_by/references/requires/
+/// contradicts/clarifies/refines;权威中文与关系新建下拉 shared.tsx 同源);未知回落原值。
+export const RELATED_KIND_LABELS: Record<string, string> = {
+  supports: "支持",
+  contradicts: "矛盾",
+  superseded_by: "被取代",
+  references: "引用",
+  requires: "依赖",
+  clarifies: "澄清",
+  refines: "细化",
+};
+export function relatedKindLabel(v?: string | null): string {
+  if (!v) return "—";
+  return RELATED_KIND_LABELS[v] ?? v;
+}
+
+/// AI 协作工坊单轮意图(chat.rs:1332 闭集);未知回落原值。
+export const CHAT_INTENT_LABELS: Record<string, string> = {
+  create_chunk: "起草知识",
+  update_chunk: "修订知识",
+  clarify_chunk: "澄清核对",
+  digest_action: "摘要派工",
+  update_operator_memory: "更新运营记忆",
+  freeform: "自由对话",
+};
+export function chatIntentLabel(v?: string | null): string {
+  if (!v) return "—";
+  return CHAT_INTENT_LABELS[v] ?? v;
+}
+
+/// 运营记忆类型(memory.rs:2067 闭集 preference/rejection/context;
+/// 中文与后端 chat.rs:959 同源);未知回落原值。
+export const OPERATOR_MEMORY_KIND_LABELS: Record<string, string> = {
+  preference: "偏好",
+  rejection: "红线",
+  context: "背景",
+};
+export function operatorMemoryKindLabel(v?: string | null): string {
+  if (!v) return "—";
+  return OPERATOR_MEMORY_KIND_LABELS[v] ?? v;
+}
+
+/// chunk 字段名 → 大白话中文名(AI 修复面板/字段锁展示用)。键形态可能 camelCase
+/// 或 snake_case(来自 LLM 工具产物),两种都归一;措辞与 ReviewChat 的
+/// PATCH_FIELD_LABELS/LOCKED_FIELD_LABELS 同源。未知字段回落原名,不吞。
+export const CHUNK_FIELD_LABELS: Record<string, string> = {
+  title: "标题",
+  summary: "摘要",
+  body: "正文",
+  tags: "标签",
+  priority: "优先级",
+  sourceQuote: "原话出处",
+  source_quote: "原话出处",
+  sourceAnchors: "来源锚点",
+  source_anchors: "来源锚点",
+  knowledgeType: "知识类型",
+  knowledge_type: "知识类型",
+  chunkType: "知识类型",
+  chunk_type: "知识类型",
+};
+export function chunkFieldLabel(v?: string | null): string {
+  if (!v) return "—";
+  return CHUNK_FIELD_LABELS[v] ?? v;
+}
+
+// ── 诊断仪表专用字典（PhaseRollup / WorkerHealth）──────────────────────────
+// 全部取值经后端聚合写入点逐点亲验枚举；均带原值兜底，闭集外新值回落原样不崩。
+
+/// run 终态(agent_run_logs.lifecycle,run_envelope.rs 7 值闭集)
+export const RUN_LIFECYCLE_LABELS: Record<string, string> = {
+  started: "已启动",
+  running: "运行中",
+  completed: "已完成",
+  failed_before_decision: "决策前失败",
+  failed_after_decision: "决策后失败",
+  aborted_by_budget: "预算耗尽中止",
+  aborted_by_external_signal: "外部信号中止",
+};
+export function runLifecycleLabel(v?: string | null): string {
+  if (!v) return "—";
+  return RUN_LIFECYCLE_LABELS[v] ?? v;
+}
+
+/// 单轮改写原因(agent_run_logs.revision_reason,gateway/gates 写入点枚举;
+/// revision_llm_error:<err> 为动态前缀,按前缀归一)
+export const REVISION_REASON_LABELS: Record<string, string> = {
+  revision_applied_approved: "改写后二审通过",
+  revisionDirection_empty: "改写方向为空跳过",
+  budget_exceeded_before_revision: "改写前预算超额跳过",
+  revision_post_review_failed: "改写后二审未过",
+  revision_llm_timeout_30s: "改写模型 30 秒超时",
+};
+export function revisionReasonLabel(v?: string | null): string {
+  if (!v) return "—";
+  if (v.startsWith("revision_llm_error")) return "改写模型报错";
+  return REVISION_REASON_LABELS[v] ?? v;
+}
+
+/// 审核员误判信号(agent_decision_reviews.reviewer_misjudge_signal,单值闭集)
+export const REVIEWER_MISJUDGE_KIND_LABELS: Record<string, string> = {
+  approved_but_user_negative: "放行后客户负反馈",
+};
+export function reviewerMisjudgeKindLabel(v?: string | null): string {
+  if (!v) return "—";
+  return REVIEWER_MISJUDGE_KIND_LABELS[v] ?? v;
+}
+
+/// 知识缺口信号状态(knowledge_gap_signals.status,observability.rs 5 值闭集)
+export const GAP_SIGNAL_STATUS_LABELS: Record<string, string> = {
+  pending: "待处理",
+  auto_resolved: "规则自动消解",
+  llm_resolved: "模型判定消解",
+  applied: "已处理",
+  dismissed: "已忽略",
+};
+export function gapSignalStatusLabel(v?: string | null): string {
+  if (!v) return "—";
+  return GAP_SIGNAL_STATUS_LABELS[v] ?? v;
+}
+
+/// 经验沉淀模式(lessons_learned.pattern_kind,3 值闭集)
+export const LESSON_PATTERN_LABELS: Record<string, string> = {
+  success: "成功案例",
+  reviewer_misjudge_negative: "审核员误判负反馈",
+  blocked_by_safety_guard: "安全门拦截",
+};
+export function lessonPatternLabel(v?: string | null): string {
+  if (!v) return "—";
+  return LESSON_PATTERN_LABELS[v] ?? v;
+}
+
+/// 知识对话任务失败错误类型(knowledge 任务/日报 error_kind,自由字符串,已知值兜底)
+export const CHAT_ERROR_KIND_LABELS: Record<string, string> = {
+  budget_exceeded: "预算耗尽",
+  internal: "内部错误",
+};
+export function chatErrorKindLabel(v?: string | null): string {
+  if (!v) return "—";
+  return CHAT_ERROR_KIND_LABELS[v] ?? v;
+}

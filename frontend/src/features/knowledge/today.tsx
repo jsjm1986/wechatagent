@@ -22,7 +22,7 @@ import { ChunkPicker } from "../../components/ui/ChunkRef";
 import { useConfirm } from "../../components/ui/ConfirmDialog";
 import { useToast } from "../../components/ui/Toast";
 import { EmptyState } from "../../components/ui/EmptyState";
-import { severityLabel, priorityLabel, originLabel, draftKindLabel, taskStatusLabel, reportStatusLabel, digestCardKindLabel, digestSuggestedActionLabel } from "./labels";
+import { severityLabel, priorityLabel, originLabel, draftKindLabel, taskStatusLabel, reportStatusLabel, digestCardKindLabel, digestSuggestedActionLabel, chatIntentLabel } from "./labels";
 
 interface ChatTurnView {
   role: "user" | "assistant";
@@ -48,6 +48,7 @@ interface ChatTurnResponse {
   naturalReply: string;
   draftKind?: string | null;
   draftPreview?: Record<string, unknown> | null;
+  plannedSteps?: Array<{ stepId?: string; cardId?: string; action: string; summary?: string }> | null;
   missingFields?: string[];
   followupQuestions?: string[];
   canApply?: boolean;
@@ -64,9 +65,10 @@ export function ChatWorkbench({ initialAttachChunkId }: { initialAttachChunkId?:
   });
   const [draft, setDraft] = useState("");
   const [attachChunkId, setAttachChunkId] = useState<string>("");
-  const [stepsText, setStepsText] = useState("");
   const [dispatching, setDispatching] = useState(false);
-  const [stepAction, setStepAction] = useState<string>("analyze_logs");
+  const [pendingSteps, setPendingSteps] = useState<
+    Array<{ stepId?: string; cardId?: string; action: string; summary?: string }>
+  >([]);
 
   // B2：从待办收件箱「找 AI 协作」跳转过来时预填 chunkId。
   useEffect(() => {
@@ -172,6 +174,9 @@ export function ChatWorkbench({ initialAttachChunkId }: { initialAttachChunkId?:
         setSessionId(resp.sessionId);
         persistSession(resp.sessionId);
       }
+      if (Array.isArray(resp.plannedSteps) && resp.plannedSteps.length > 0) {
+        setPendingSteps(resp.plannedSteps);
+      }
       setDraft("");
       await loadHistory(resp.sessionId);
     } catch (e) {
@@ -244,26 +249,8 @@ export function ChatWorkbench({ initialAttachChunkId }: { initialAttachChunkId?:
   );
 
   // E14：把当前会话的 plannedSteps 派工为长任务（后端串行 worker 执行）。
-  // 每行一个步骤描述 → 一个 step；统一附带选定的 action（后端 ALLOWED_TASK_ACTIONS
-  // 闭集校验，缺 action 会 400）。成功后用返回 taskId 触发 TaskRail 自动跟踪。
-  async function dispatchTask() {
-    if (!sessionId) {
-      setError("请先与 AI 协作开启会话，再派工长任务");
-      return;
-    }
-    const steps = stepsText
-      .split("\n")
-      .map((s) => s.trim())
-      .filter(Boolean)
-      .map((description, idx) => ({
-        stepId: `step_${idx + 1}`,
-        action: stepAction,
-        description,
-      }));
-    if (steps.length === 0) {
-      setError("请至少填写一个步骤（每行一个）");
-      return;
-    }
+  async function confirmDispatch() {
+    if (!sessionId || pendingSteps.length === 0) return;
     setDispatching(true);
     setError(null);
     setInfo(null);
@@ -271,20 +258,14 @@ export function ChatWorkbench({ initialAttachChunkId }: { initialAttachChunkId?:
       const r = await fetch("/api/knowledge/chat/tasks", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          sessionId,
-          plannedSteps: steps,
-          cardIds: [],
-        }),
+        body: JSON.stringify({ sessionId, plannedSteps: pendingSteps, cardIds: [] }),
       });
       if (!r.ok) throw await parseApiError(r);
-      const data = (await r.json()) as { taskId?: string; totalSteps?: number };
-      setStepsText("");
+      const data = (await r.json()) as { taskId?: string };
+      setPendingSteps([]);
       setInfo(`已派工长任务${data.taskId ? `：${data.taskId}` : ""}，可在右侧「派工跟踪」查看进度`);
       if (data.taskId) {
-        window.dispatchEvent(
-          new CustomEvent("wikiTrackTask", { detail: { taskId: data.taskId } })
-        );
+        window.dispatchEvent(new CustomEvent("wikiTrackTask", { detail: { taskId: data.taskId } }));
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -300,7 +281,7 @@ export function ChatWorkbench({ initialAttachChunkId }: { initialAttachChunkId?:
           <h2>AI 协作工坊</h2>
         </div>
         <div className="wikiArchiveHeaderActions">
-          <span className="wikiArchiveTag">session</span>
+          <span className="wikiArchiveTag">会话</span>
           <span className="wikiChatSessionId">{sessionId || "未开始"}</span>
           <button type="button" onClick={newSession}>
             <Plus size={14} /> 新会话
@@ -327,7 +308,7 @@ export function ChatWorkbench({ initialAttachChunkId }: { initialAttachChunkId?:
             <div className="wikiChatTurnHead">
               <span className="wikiArchiveTag">{t.role === "user" ? "运营" : "AI"}</span>
               <span className="wikiArchiveTimelineTime">#{t.turnIndex}</span>
-              {t.intent ? <span className="wikiArchiveTag">{t.intent}</span> : null}
+              {t.intent ? <span className="wikiArchiveTag">{chatIntentLabel(t.intent)}</span> : null}
               {t.draftKind ? <span className="wikiArchiveTag">{draftKindLabel(t.draftKind)}</span> : null}
             </div>
             <div className="wikiChatTurnBody">
@@ -404,45 +385,27 @@ export function ChatWorkbench({ initialAttachChunkId }: { initialAttachChunkId?:
             <Trash2 size={14} /> 丢弃草稿
           </button>
         </div>
-        <div className="wikiChatDispatch">
-          <div className="wikiChatDispatchHead">
-            <span className="wikiArchiveTag">派工长任务</span>
-            <span className="wikiArchiveTimelineTime">每行一个步骤，交由 AI worker 串行执行</span>
+        {pendingSteps.length > 0 ? (
+          <div className="wikiChatDispatch">
+            <div className="wikiChatDispatchHead">
+              <span className="wikiArchiveTag">待确认派工</span>
+              <span className="wikiArchiveTimelineTime">AI 拆出 {pendingSteps.length} 步，确认后交后台执行</span>
+            </div>
+            <ul className="wikiChatFollowups">
+              {pendingSteps.map((s, i) => (
+                <li key={s.stepId ?? i}>{s.action} · {s.summary ?? ""}</li>
+              ))}
+            </ul>
+            <div className="wikiChatFooterRow">
+              <button type="button" className="primary" onClick={() => void confirmDispatch()} disabled={dispatching || !sessionId}>
+                {dispatching ? "派工中…" : "确认派工"}
+              </button>
+              <button type="button" onClick={() => setPendingSteps([])} disabled={dispatching}>
+                取消
+              </button>
+            </div>
           </div>
-          <textarea
-            className="wikiChatInput"
-            value={stepsText}
-            onChange={(e) => setStepsText(e.target.value)}
-            placeholder="每行一个步骤，例如：分析最近 24h 拦截日志"
-            disabled={dispatching || !sessionId}
-            rows={2}
-          />
-          <div className="wikiChatFooterRow">
-            <select
-              className="wikiInput"
-              value={stepAction}
-              onChange={(e) => setStepAction(e.target.value)}
-              disabled={dispatching || !sessionId}
-              aria-label="步骤动作"
-            >
-              <option value="analyze_logs">分析日志</option>
-              <option value="review_evolution">评估候选</option>
-              <option value="retag">重抽标签</option>
-              <option value="fix_chunk">修订条目</option>
-              <option value="add_chunk">新增条目</option>
-              <option value="dismiss">忽略</option>
-            </select>
-            <button
-              type="button"
-              className="primary"
-              onClick={() => void dispatchTask()}
-              disabled={dispatching || !sessionId}
-              title={sessionId ? "把以上步骤派发为长任务" : "请先开启会话"}
-            >
-              <SendHorizonal size={14} /> {dispatching ? "派工中…" : "派工"}
-            </button>
-          </div>
-        </div>
+        ) : null}
       </footer>
     </div>
   );
@@ -641,6 +604,54 @@ export function DigestCanvas() {
   const [regen, setRegen] = useState(false);
   const [error, setError] = useState<Error | null>(null);
   const [dismissing, setDismissing] = useState<Set<string>>(new Set());
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [dispatchingBatch, setDispatchingBatch] = useState(false);
+
+  function toggleSelect(cardId: string) {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(cardId)) next.delete(cardId);
+      else next.add(cardId);
+      return next;
+    });
+  }
+
+  async function dispatchSelected() {
+    if (selected.size === 0) return;
+    const steps = visibleCards
+      .filter((c) => selected.has(c.cardId) && c.suggestedAction !== "freeform")
+      .map((c, idx) => ({
+        stepId: `step_${idx + 1}`,
+        cardId: c.cardId,
+        action: c.suggestedAction,
+        summary: c.summary,
+        reportDate: report?.reportDate,
+      }));
+    if (steps.length === 0) {
+      setError(new Error("选中的卡片都不可派工（仅查看类卡片无执行动作）"));
+      return;
+    }
+    setDispatchingBatch(true);
+    setError(null);
+    try {
+      const sessionId = crypto.randomUUID();
+      const r = await fetch("/api/knowledge/chat/tasks", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionId, plannedSteps: steps, cardIds: steps.map((s) => s.cardId) }),
+      });
+      if (!r.ok) throw await parseApiError(r);
+      const data = (await r.json()) as { taskId?: string };
+      setSelected(new Set());
+      if (data.taskId) {
+        window.dispatchEvent(new CustomEvent("wikiTrackTask", { detail: { taskId: data.taskId } }));
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e : new Error(String(e)));
+    } finally {
+      setDispatchingBatch(false);
+    }
+  }
 
   async function load() {
     setPending(true);
@@ -713,7 +724,7 @@ export function DigestCanvas() {
     <div className="wikiDigestCanvas">
       <div className="wikiDigestHead">
         <div>
-          <h3>今日 Digest</h3>
+          <h3>今日摘要</h3>
           <span className="wikiDigestMeta">
             {report?.reportDate ?? "—"} · {reportStatusLabel(report?.status)} · 生成于 {report?.generatedAt ?? "—"}
           </span>
@@ -724,6 +735,9 @@ export function DigestCanvas() {
           </button>
           <button type="button" className="primary" onClick={() => void regenerate()} disabled={regen}>
             <Sparkles size={14} /> {regen ? "重算中…" : "强制重算"}
+          </button>
+          <button type="button" className="primary" onClick={() => void dispatchSelected()} disabled={dispatchingBatch || selected.size === 0}>
+            {dispatchingBatch ? "派工中…" : `批量派工（${selected.size}）`}
           </button>
         </div>
       </div>
@@ -739,6 +753,13 @@ export function DigestCanvas() {
         {visibleCards.map((card) => (
           <article className={`wikiDigestCard sev-${card.severity}`} key={card.cardId}>
             <div className="wikiDigestCardHead">
+              <input
+                type="checkbox"
+                checked={selected.has(card.cardId)}
+                onChange={() => toggleSelect(card.cardId)}
+                disabled={card.suggestedAction === "freeform"}
+                aria-label={`选择卡片 ${card.title}`}
+              />
               <span className={severityBadgeClass(card.severity)}>{severityLabel(card.severity)}</span>
               <span className="wikiDigestKind">{digestCardKindLabel(card.kind)}</span>
             </div>
@@ -986,11 +1007,11 @@ export function TaskRail() {
             <div className="wikiTaskLive">
               <div className="wikiTaskLiveHead">
                 <Loader2 size={12} className="wikiTaskSpin" />
-                实时 turn
+                实时进度
               </div>
               <ol className="wikiTaskLiveList">
                 {liveTurns.slice(-12).map((t, i) => (
-                  <li key={`${t}-${i}`}>turn #{t}</li>
+                  <li key={`${t}-${i}`}>第 {t} 步</li>
                 ))}
               </ol>
             </div>
