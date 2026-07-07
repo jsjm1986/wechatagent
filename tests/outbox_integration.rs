@@ -132,6 +132,25 @@ async fn start_mcp_mock_failure() -> MockServer {
     server
 }
 
+/// 统计 wiremock 收到的真实"发送"调用数（JSON-RPC method==tools/call）。
+/// MCP Streamable-HTTP 每个新会话首次调用前先发一次 `initialize` 握手，那是会话
+/// 建立、不是发送；用原始 received_requests().len() 当发送数会把握手误算进去。
+fn count_tool_calls(requests: &[wiremock::Request]) -> usize {
+    requests
+        .iter()
+        .filter(|r| {
+            serde_json::from_slice::<serde_json::Value>(&r.body)
+                .ok()
+                .and_then(|v| {
+                    v.get("method")
+                        .and_then(|m| m.as_str())
+                        .map(|s| s == "tools/call")
+                })
+                .unwrap_or(false)
+        })
+        .count()
+}
+
 fn enqueue_request(run_id: &str, source_event_id: &str, contact_wxid: &str) -> EnqueueRequest {
     EnqueueRequest {
         workspace_id: "default".to_string(),
@@ -525,7 +544,7 @@ async fn idempotency_key_yields_at_most_one_mcp_send() {
         .received_requests()
         .await
         .expect("wiremock recorded requests");
-    let mcp_calls = recv.len();
+    let mcp_calls = count_tool_calls(&recv);
     assert_eq!(
         mcp_calls, 2,
         "exactly 2 MCP sends for 2 unique idempotency_keys (1 created + 1 created), 6 dupes elided",
@@ -880,7 +899,7 @@ async fn account_pacing_gate_allows_after_interval() {
         .received_requests()
         .await
         .expect("wiremock recorded requests");
-    assert_eq!(recv.len(), 1, "间隔已过，第二条应正常发往 MCP");
+    assert_eq!(count_tool_calls(&recv), 1, "间隔已过，第二条应正常发往 MCP");
 }
 
 /// 账号闸：不同账号互不影响（账号 A 刚发不拦账号 B）。
