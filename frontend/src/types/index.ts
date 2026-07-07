@@ -90,6 +90,7 @@ export type Contact = {
   nickname?: string;
   remark?: string;
   alias?: string;
+  avatarUrl?: string | null;
   agentStatus: AgentStatus;
   humanProfileNote?: string;
   customAgentInstructions?: string | null;
@@ -127,6 +128,15 @@ export type Contact = {
   /** 兼容字段：max(lastInboundAt, lastOutboundAt)。 */
   lastMessageAt?: string;
   updatedAt: string;
+};
+
+/** 通讯录条目：MCP 全量好友 + 本地 contacts 左连接标注（GET /api/contacts/roster）。纯浏览，不写库。 */
+export type RosterEntry = {
+  wxid: string;
+  nickname?: string | null;
+  remark?: string | null;
+  avatarUrl?: string | null;
+  agentStatus: "managed" | "normal" | "not_imported";
 };
 
 /** M3 / Task 80：与后端 `ApiCommitment` 对齐的承诺条目结构。 */
