@@ -163,16 +163,32 @@ const USER_RUNTIME_PARAMETER_FIELDS: Array<{
   { key: "quietHoursTzOffsetHours", label: "作息时区偏移", detail: "运营方所在时区相对 UTC 的小时偏移，中国填 8。不依赖服务器时区，跨机房部署也稳定", kind: "number", defaultValue: 8 }
 ];
 
+const MODE_COPY: Record<UserOpsMode, { title: string; desc: string }> = {
+  smart: {
+    title: "智能模式",
+    desc: "用自然语言指挥 Agent，查看当前运营判断、风险和修改预览；确认前不会改动数据。"
+  },
+  traditional: {
+    title: "传统模式",
+    desc: "用传统后台方式手动维护方法、提示词、运行策略和审计复盘。"
+  },
+  roster: {
+    title: "通讯录",
+    desc: "拉取该账号的全部微信好友，勾选后批量进入 Agent 运营。"
+  }
+};
+
 export function UserOpsModeHeader({ mode, onMode }: { mode: UserOpsMode; onMode: (mode: UserOpsMode) => void }) {
   return (
     <section className="userModeHeader">
       <div>
         <span>用户运营驾驶舱</span>
-        <h2>{mode === "smart" ? "智能模式" : "传统模式"}</h2>
-        <p>{mode === "smart" ? "用自然语言指挥 Agent，查看当前运营判断、风险和修改预览；确认前不会改动数据。" : "用传统后台方式手动维护方法、提示词、运行策略和审计复盘。"}</p>
+        <h2>{MODE_COPY[mode].title}</h2>
+        <p>{MODE_COPY[mode].desc}</p>
       </div>
       <div className="modeSwitch" role="tablist" aria-label="用户运营模式">
         <button className={mode === "smart" ? "active" : ""} onClick={() => onMode("smart")}>智能模式</button>
+        <button className={mode === "roster" ? "active" : ""} onClick={() => onMode("roster")}>通讯录</button>
         <button className={mode === "traditional" ? "active" : ""} onClick={() => onMode("traditional")}>传统模式</button>
       </div>
     </section>
