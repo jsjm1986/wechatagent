@@ -108,6 +108,7 @@ fn make_managed_contact(workspace_id: &str, wxid: &str) -> Contact {
         nickname: Some("AQG 测试客户".to_string()),
         remark: None,
         alias: None,
+        avatar_url: None,
         agent_status: AgentStatus::Managed,
         human_profile_note: None,
         agent_profile: None,
