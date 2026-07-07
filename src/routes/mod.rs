@@ -1167,6 +1167,9 @@ mod tests {
             // knowledge/chat.rs：chunk 更新落库内核（强制 draft+needs_review），被 chat_apply
             // 与 knowledge_task worker（retag action）复用、不直接绑 HTTP。
             "apply_update_chunk",
+            // contacts.rs：批量托管异步初始画像任务处理器，被 tasks.rs worker
+            // （task.kind=="initial_profile"）调用、不直接绑 HTTP。
+            "handle_initial_profile_task",
         ];
 
         let mut handlers: Vec<&str> = Vec::new();
