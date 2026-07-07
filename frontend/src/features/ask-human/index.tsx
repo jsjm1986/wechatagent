@@ -11,6 +11,7 @@ import { ChunkReviewCard } from "../../components/review/ChunkReviewCard";
 import { ProfilePublishCard } from "../../components/review/ProfilePublishCard";
 import { ProposalReleaseCard } from "../../components/review/ProposalReleaseCard";
 import { LessonPromoteCard } from "../../components/review/LessonPromoteCard";
+import { TaxonomyCandidateReviewCard } from "../../components/review/TaxonomyCandidateReviewCard";
 import "./AskHuman.css";
 
 // summary 端点下发 camelCase key，inbox ?source= 过滤认 snake_case source id（两者由后端 ask_human_inbox.rs 定义）。
@@ -50,6 +51,24 @@ function renderRich(item: InboxItem, onDone: () => void) {
       return <ProposalReleaseCard proposalId={String(p.proposalId)} onDone={onDone} />;
     case "lessonsPromote":
       return <LessonPromoteCard lessonId={String(p.lessonId)} onDone={onDone} />;
+    case "taxonomyCandidateReview": {
+      const c = item.richParams ?? {};
+      return (
+        <TaxonomyCandidateReviewCard
+          candidate={{
+            id: String(c.candidateId ?? item.id),
+            scope: String(c.scope ?? ""),
+            kind: String(c.kind ?? ""),
+            rawValue: String(c.rawValue ?? ""),
+            evidence: c.evidence != null ? String(c.evidence) : undefined,
+            confidence: c.confidence != null ? Number(c.confidence) : undefined,
+            occurrences: c.occurrences != null ? Number(c.occurrences) : undefined,
+            suggestedDisplayName: c.suggestedDisplayName != null ? String(c.suggestedDisplayName) : undefined,
+          }}
+          onDone={onDone}
+        />
+      );
+    }
     default:
       return <div className="askHumanUnknownRich">未知 rich 组件：{item.richComponent}</div>;
   }
@@ -60,17 +79,6 @@ function renderInline(item: InboxItem, ctx: RowCtx) {
   switch (item.source) {
     case "principal_escalation":
       return <EscalationInline item={item} ctx={ctx} />;
-    case "taxonomy_candidate":
-      return (
-        <SimpleApproveReject
-          item={item}
-          ctx={ctx}
-          endpoints={{
-            approve: (id) => `/api/admin/taxonomy-candidates/${encodeURIComponent(id)}/approve`,
-            reject: (id) => `/api/admin/taxonomy-candidates/${encodeURIComponent(id)}/reject`,
-          }}
-        />
-      );
     case "relationship_suggestion":
       return (
         <SimpleApproveReject
