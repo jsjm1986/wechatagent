@@ -1700,6 +1700,8 @@ async fn run_user_operation_gateway_inner(
             }
         }
         for (kind, raw) in &outcome.candidate_writes {
+            let display_name =
+                pick_dimension_display_name(&final_decision.dimension_display_names, kind);
             if let Err(error) = taxonomy_upsert_candidate(
                 &state.db,
                 &contact.account_id,
@@ -1707,7 +1709,7 @@ async fn run_user_operation_gateway_inner(
                 raw,
                 Some("user-ops decision path"),
                 50,
-                None,
+                display_name,
             )
             .await
             {
@@ -5164,6 +5166,16 @@ pub(crate) struct TaxonomyGuardOutcome {
     pub candidate_writes: Vec<(String, String)>,
 }
 
+/// 从维度中文名映射（`AgentDecision.dimension_display_names`）里按 `kind` 取中文名。
+/// 缺键 / 非字符串 / 空串 / 纯空格 → `None`（候选回落英文裸值）。纯函数，便于单测。
+pub(crate) fn pick_dimension_display_name<'a>(names: &'a Document, kind: &str) -> Option<&'a str> {
+    names
+        .get_str(kind)
+        .ok()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
 pub(crate) fn compute_taxonomy_guard_outcome(
     decision: &AgentDecision,
     dimension_kinds: &[String],
@@ -5926,6 +5938,28 @@ mod tests {
             )],
             "只有 intent_level 一个维度该进候选"
         );
+    }
+
+    #[test]
+    fn pick_display_name_hits_trims_and_misses() {
+        let names = doc! {
+            "customer_stage": "焦虑观望",
+            "intent_level": "  高意向  ",
+            "blank": "   ",
+            "nonstr": 42_i32,
+        };
+        // 命中 → 取出
+        assert_eq!(pick_dimension_display_name(&names, "customer_stage"), Some("焦虑观望"));
+        // 命中但含首尾空格 → trim
+        assert_eq!(pick_dimension_display_name(&names, "intent_level"), Some("高意向"));
+        // 纯空格 → None
+        assert_eq!(pick_dimension_display_name(&names, "blank"), None);
+        // 非字符串值 → None（get_str 失败）
+        assert_eq!(pick_dimension_display_name(&names, "nonstr"), None);
+        // 缺键 → None
+        assert_eq!(pick_dimension_display_name(&names, "absent"), None);
+        // 空 doc → None
+        assert_eq!(pick_dimension_display_name(&Document::new(), "customer_stage"), None);
     }
 
     #[test]
