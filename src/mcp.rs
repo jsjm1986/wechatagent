@@ -408,6 +408,73 @@ async fn credentials_for_account(state: &AppState, account_id: &str) -> AppResul
     })
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RosterFriend {
+    pub wxid: String,
+    pub nickname: Option<String>,
+    pub remark: Option<String>,
+    pub avatar_url: Option<String>,
+}
+
+fn first_str(obj: &serde_json::Map<String, serde_json::Value>, keys: &[&str]) -> Option<String> {
+    for k in keys {
+        if let Some(s) = obj.get(*k).and_then(|v| v.as_str()) {
+            if !s.is_empty() {
+                return Some(s.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn parse_roster_items(result: &serde_json::Value) -> Vec<RosterFriend> {
+    // 数组路径多候选：结构化内容优先，其次顶层，最后 content[0].text 内嵌 JSON。
+    let arr = result
+        .pointer("/structuredContent/contacts")
+        .or_else(|| result.pointer("/structuredContent/friends"))
+        .or_else(|| result.pointer("/structuredContent/list"))
+        .or_else(|| result.get("contacts"))
+        .or_else(|| result.get("friends"))
+        .and_then(|v| v.as_array())
+        .cloned()
+        .or_else(|| {
+            // content[0].text 内嵌 JSON 字符串形态。
+            let text = result.pointer("/content/0/text")?.as_str()?;
+            let inner: serde_json::Value = serde_json::from_str(text).ok()?;
+            inner
+                .pointer("/contacts")
+                .or_else(|| inner.get("friends"))
+                .and_then(|v| v.as_array())
+                .cloned()
+        })
+        .unwrap_or_default();
+
+    arr.iter()
+        .filter_map(|item| {
+            let obj = item.as_object()?;
+            let wxid = first_str(obj, &["wxid", "userName", "UserName", "username"])?;
+            Some(RosterFriend {
+                wxid,
+                nickname: first_str(obj, &["nickName", "nickname", "NickName"]),
+                remark: first_str(obj, &["remark", "Remark", "conRemark"]),
+                avatar_url: first_str(
+                    obj,
+                    &["bigHeadImg", "smallHeadImg", "headImgUrl", "avatarUrl", "headimgurl"],
+                ),
+            })
+        })
+        .collect()
+}
+
+pub async fn fetch_roster_for_account(
+    state: &AppState,
+    account_id: &str,
+) -> AppResult<Vec<RosterFriend>> {
+    // contact_list 是主工具；account_alias 由 logged_call_for_account 自动注入。
+    let result = logged_call_for_account(state, account_id, "contact_list", serde_json::json!({})).await?;
+    Ok(parse_roster_items(&result))
+}
+
 #[cfg(test)]
 mod sse_parse_tests {
     use super::{parse_mcp_response_body, McpClient};
@@ -502,6 +569,42 @@ mod tests {
         let req = doc! { "recipient": "wxid_x", "mediaId": "mid_123" };
         let out = redact_request_for_log(&req);
         assert_eq!(out, req, "无 base64 key 时脱敏应与原 doc 相等");
+    }
+}
+
+#[cfg(test)]
+mod roster_parse_tests {
+    use super::parse_roster_items;
+
+    #[test]
+    fn parses_structured_contacts_with_big_head_img() {
+        let v = serde_json::json!({
+            "structuredContent": { "contacts": [
+                { "wxid": "wxid_a", "nickName": "小明", "remark": "客户A", "bigHeadImg": "http://img/a" },
+                { "userName": "wxid_b", "nickname": "小红", "smallHeadImg": "http://img/b" }
+            ]}
+        });
+        let out = parse_roster_items(&v);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].wxid, "wxid_a");
+        assert_eq!(out[0].nickname.as_deref(), Some("小明"));
+        assert_eq!(out[0].remark.as_deref(), Some("客户A"));
+        assert_eq!(out[0].avatar_url.as_deref(), Some("http://img/a"));
+        // 第二条用 userName 作 wxid、smallHeadImg 作头像。
+        assert_eq!(out[1].wxid, "wxid_b");
+        assert_eq!(out[1].avatar_url.as_deref(), Some("http://img/b"));
+    }
+
+    #[test]
+    fn skips_entries_without_wxid() {
+        let v = serde_json::json!({ "contacts": [ { "nickName": "无id" } ] });
+        assert_eq!(parse_roster_items(&v).len(), 0);
+    }
+
+    #[test]
+    fn returns_empty_on_unknown_shape() {
+        let v = serde_json::json!({ "unexpected": true });
+        assert_eq!(parse_roster_items(&v).len(), 0);
     }
 }
 
