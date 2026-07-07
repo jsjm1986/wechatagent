@@ -358,6 +358,61 @@ pub(super) async fn list_entitlements(
     Ok(Json(json!({ "items": items, "total": total })))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct RosterQuery {
+    pub account_id: String,
+}
+
+pub(super) async fn roster_endpoint(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
+    Query(query): Query<RosterQuery>,
+) -> AppResult<Json<Value>> {
+    // account 必须属于当前 workspace（fail-closed）。
+    validate_account(&state, &admin.current_workspace, &query.account_id).await?;
+
+    let friends = mcp::fetch_roster_for_account(&state, &query.account_id).await?;
+
+    // 本地已入库联系人：wxid -> agent_status。
+    let mut cursor = state
+        .db
+        .contacts()
+        .find(
+            doc! { "workspace_id": &admin.current_workspace, "account_id": &query.account_id },
+            None,
+        )
+        .await?;
+    let mut status_by_wxid: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    while let Some(c) = cursor.try_next().await? {
+        let status = match c.agent_status {
+            crate::models::AgentStatus::Managed => "managed",
+            _ => "normal",
+        };
+        status_by_wxid.insert(c.wxid, status.to_string());
+    }
+
+    let items: Vec<Value> = friends
+        .into_iter()
+        .map(|f| {
+            let agent_status = status_by_wxid
+                .get(&f.wxid)
+                .cloned()
+                .unwrap_or_else(|| "not_imported".to_string());
+            json!({
+                "wxid": f.wxid,
+                "nickname": f.nickname,
+                "remark": f.remark,
+                "avatarUrl": f.avatar_url,
+                "agentStatus": agent_status,
+            })
+        })
+        .collect();
+    let total = items.len();
+    Ok(Json(json!({ "items": items, "total": total })))
+}
+
 pub(super) async fn enable_agent(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
