@@ -416,6 +416,31 @@ pub struct RosterFriend {
     pub avatar_url: Option<String>,
 }
 
+/// roster 拉取结果：友列表 + 是否仍在同步（cache 空 {} 未就绪）。
+pub struct RosterFetchOutcome {
+    pub friends: Vec<RosterFriend>,
+    pub syncing: bool,
+}
+
+/// 判定 contacts_fetch_cache 返回是否为「空 cache（异步未就绪）」——区别于
+/// 「真 0 好友」（result.friends 是空数组）。空对象 {} / Null → 空 cache（可重试）；
+/// 任何含非空数组候选的形态 → 已就绪。空数组 → 已就绪（真 0 好友，不重试）。
+fn roster_result_is_empty_cache(result: &serde_json::Value) -> bool {
+    match result {
+        serde_json::Value::Null => true,
+        serde_json::Value::Object(map) if map.is_empty() => true,
+        // result.friends / result.contacts 等存在且是数组（哪怕空）→ 已就绪。
+        _ => {
+            // 若解析能拿到任何数组候选（含空数组），视为已就绪；完全无数组候选 → 空 cache。
+            let has_any_array = ["/result/friends", "/result/contacts", "/result/list",
+                "/contacts", "/friends", "/list", "/items", "/data"]
+                .iter()
+                .any(|k| result.pointer(k).and_then(|v| v.as_array()).is_some());
+            !has_any_array
+        }
+    }
+}
+
 fn first_str(obj: &serde_json::Map<String, serde_json::Value>, keys: &[&str]) -> Option<String> {
     for k in keys {
         if let Some(s) = obj.get(*k).and_then(|v| v.as_str()) {
@@ -526,16 +551,39 @@ fn parse_roster_items(result: &serde_json::Value) -> Vec<RosterFriend> {
 pub async fn fetch_roster_for_account(
     state: &AppState,
     account_id: &str,
-) -> AppResult<Vec<RosterFriend>> {
+) -> AppResult<RosterFetchOutcome> {
     // contacts_fetch_cache 是全量好友工具（gewe "Fetch the full remote contacts cache
     // from GeWe"，无参）；account_alias 由 logged_call_for_account 自动注入。
-    // 注：早前指南页误载工具名为 contact_list，2026-07-07 线上 tools/list 亲验证伪
-    // ——gewe-multi-tenant server 无 contact_list（返 "Forbidden tool"），im_sync 是
-    // 企业微信同步（错域），全量个人好友唯一工具即 contacts_fetch_cache。
-    let result =
-        logged_call_for_account(state, account_id, "contacts_fetch_cache", serde_json::json!({}))
-            .await?;
-    Ok(parse_roster_items(&result))
+    // GeWe 缓存异步就绪：未就绪时返回 {}（空），就绪返回 {result:{friends:[wxid]}}。
+    // 空 {} 时同一请求内短重试（间隔 2s、最多 3 次），仍空则返回 syncing=true 让
+    // 前端提示「同步中」并自动重拉。重试复用同一 MCP session，间隔足够避免自撞 429。
+    const MAX_RETRIES: usize = 3;
+    const RETRY_INTERVAL_SECS: u64 = 2;
+    let mut last_result = serde_json::Value::Null;
+    for attempt in 0..MAX_RETRIES {
+        last_result = logged_call_for_account(
+            state,
+            account_id,
+            "contacts_fetch_cache",
+            serde_json::json!({}),
+        )
+        .await?;
+        if !roster_result_is_empty_cache(&last_result) {
+            return Ok(RosterFetchOutcome {
+                friends: parse_roster_items(&last_result),
+                syncing: false,
+            });
+        }
+        // 空 cache：还有重试机会则等待后重试（最后一次不等）。
+        if attempt + 1 < MAX_RETRIES {
+            tokio::time::sleep(std::time::Duration::from_secs(RETRY_INTERVAL_SECS)).await;
+        }
+    }
+    // 重试用尽仍空 → syncing。friends 用最后一次解析（正常为空）。
+    Ok(RosterFetchOutcome {
+        friends: parse_roster_items(&last_result),
+        syncing: true,
+    })
 }
 
 #[cfg(test)]
@@ -759,6 +807,37 @@ mod roster_parse_tests {
         assert_eq!(out[0].wxid, "wxid_str");
         assert_eq!(out[1].wxid, "wxid_obj");
         assert_eq!(out[1].nickname.as_deref(), Some("对象好友"));
+    }
+}
+
+#[cfg(test)]
+mod roster_empty_cache_tests {
+    use super::roster_result_is_empty_cache;
+
+    #[test]
+    fn empty_object_is_empty_cache() {
+        // contacts_fetch_cache 未就绪返回 {} → 判定为空 cache（syncing）。
+        assert!(roster_result_is_empty_cache(&serde_json::json!({})));
+    }
+
+    #[test]
+    fn null_is_empty_cache() {
+        // call_tool_with_key 无 structuredContent 时返回 Null → 也视为空 cache。
+        assert!(roster_result_is_empty_cache(&serde_json::Value::Null));
+    }
+
+    #[test]
+    fn populated_result_is_not_empty_cache() {
+        // 有 friends 数据 → 不是空 cache（已就绪）。
+        let v = serde_json::json!({ "result": { "friends": ["wxid_a"] } });
+        assert!(!roster_result_is_empty_cache(&v));
+    }
+
+    #[test]
+    fn empty_friends_array_is_not_empty_cache() {
+        // result.friends 是空数组（真 0 好友，已就绪）→ 不是空 cache，不该无限重试。
+        let v = serde_json::json!({ "result": { "friends": [] } });
+        assert!(!roster_result_is_empty_cache(&v));
     }
 }
 
