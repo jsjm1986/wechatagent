@@ -26,6 +26,11 @@ vi.mock("../../../lib/api", () => ({
   },
 }));
 
+// tab 化后：非默认 tab 的面板要先切 tab 才渲染。默认 tab = 总控与 Prompt。
+function selectTab(name: "总控与 Prompt" | "标签与状态" | "行业配置" | "经验教训") {
+  fireEvent.click(screen.getByRole("button", { name }));
+}
+
 describe("SystemStrategy Feature", () => {
   beforeEach(() => {
     // Mock loadStrategyData to avoid API calls
@@ -85,25 +90,32 @@ describe("SystemStrategy Feature", () => {
   });
 
   // 一体化迁移后追加：四块面板 + 三类灰度面板 + 重置按钮在新视觉壳下真实渲染。
-  it("一体化迁移：总控/Prompt/状态机/字典/教训四类面板小标题均渲染", () => {
+  it("一体化迁移：总控/Prompt/状态机/字典/教训面板小标题在各自 tab 渲染", () => {
     render(<SystemStrategyFeature />);
-
+    // control tab（默认）
     expect(screen.getByText("系统总控 Prompt")).toBeInTheDocument();
+    // taxonomy tab
+    selectTab("标签与状态");
     expect(screen.getByText("状态机动作策略灰度")).toBeInTheDocument();
     expect(screen.getByText("双层标签字典灰度")).toBeInTheDocument();
+    // lessons tab
+    selectTab("经验教训");
     expect(screen.getByText("跨用户教训归纳（14d 滑窗）")).toBeInTheDocument();
   });
 
-  it("一体化迁移：暂无数据时灰度面板渲染空态，重置 Prompt Pack 按钮可见", async () => {
+  it("一体化迁移：各 tab 空态渲染，重置 Prompt Pack 按钮在总控 tab 可见", async () => {
     render(<SystemStrategyFeature />);
-
+    // control tab
     expect(screen.getByText("重置系统提示词包 v2")).toBeInTheDocument();
-    // api.get mock 返回空 items（异步 reload 后）→ 各灰度面板空态文案
+    // taxonomy tab 空态
+    selectTab("标签与状态");
     await waitFor(() => {
       expect(screen.getByText("暂无状态策略")).toBeInTheDocument();
     });
     expect(screen.getByText("暂无字典条目")).toBeInTheDocument();
-    expect(screen.getByText("暂无教训聚合（窗口内无命中样本）")).toBeInTheDocument();
+    // lessons tab 空态（tab 化后面板切入即挂载，reload 异步 settle 后现空态）
+    selectTab("经验教训");
+    expect(await screen.findByText("暂无教训聚合（窗口内无命中样本）")).toBeInTheDocument();
   });
 });
 
@@ -122,8 +134,8 @@ describe("TaxonomiesAdmin 新增条目", () => {
     vi.spyOn(api, "get").mockResolvedValue({ items: [] } as never);
 
     render(<SystemStrategyFeature />);
+    selectTab("标签与状态");
 
-    // 与现有用例同款：SystemStrategyFeature 一次渲染全部面板，无需切 tab。
     fireEvent.click(await screen.findByText("新增条目"));
     fireEvent.change(screen.getByPlaceholderText(/canonical id/i), { target: { value: "need_discovery" } });
     fireEvent.change(screen.getByPlaceholderText(/显示名/i), { target: { value: "需求挖掘" } });
@@ -172,6 +184,7 @@ describe("TaxonomiesAdmin 编辑与废弃恢复", () => {
     seedTaxonomyGet(activeItem);
     const patch = vi.spyOn(api, "patch").mockResolvedValue({ item: activeItem } as never);
     render(<SystemStrategyFeature />);
+    selectTab("标签与状态");
     fireEvent.click(await screen.findByText("编辑"));
     fireEvent.change(screen.getByDisplayValue("需求挖掘"), { target: { value: "需求探索阶段" } });
     fireEvent.click(screen.getByText("保存编辑"));
@@ -185,6 +198,7 @@ describe("TaxonomiesAdmin 编辑与废弃恢复", () => {
     seedTaxonomyGet(activeItem);
     const del = vi.spyOn(api, "delete").mockResolvedValue({ ok: true } as never);
     render(<SystemStrategyFeature />);
+    selectTab("标签与状态");
     fireEvent.click(await screen.findByText("废弃"));
     await waitFor(() => expect(del).toHaveBeenCalledWith("/api/admin/taxonomies/id_active"));
   });
@@ -193,6 +207,7 @@ describe("TaxonomiesAdmin 编辑与废弃恢复", () => {
     seedTaxonomyGet(deprecatedItem);
     const patch = vi.spyOn(api, "patch").mockResolvedValue({ item: deprecatedItem } as never);
     render(<SystemStrategyFeature />);
+    selectTab("标签与状态");
     // deprecated 条目需勾「显示已废弃」才可见（现有 includeDeprecated checkbox）
     fireEvent.click(screen.getByText("显示已废弃"));
     fireEvent.click(await screen.findByText("恢复"));
@@ -206,6 +221,7 @@ describe("TaxonomiesAdmin 编辑与废弃恢复", () => {
     };
     seedTaxonomyGet(historyItem);
     render(<SystemStrategyFeature />);
+    selectTab("标签与状态");
     // 条目本身渲染（标题可见），但写操作按钮对历史版本行隐藏。
     expect(await screen.findByText("需求挖掘(旧版)")).toBeInTheDocument();
     expect(screen.queryByText("编辑")).toBeNull();
@@ -233,6 +249,7 @@ describe("TaxonomiesAdmin 边界", () => {
       data: { message: "(scope=global, kind=customer_stage, value.id=need_discovery) 已存在" },
     } as never);
     const { container } = render(<SystemStrategyFeature />);
+    selectTab("标签与状态");
     fireEvent.click(await screen.findByText("新增条目"));
     fireEvent.change(screen.getByPlaceholderText(/canonical id/i), { target: { value: "need_discovery" } });
     fireEvent.change(screen.getByPlaceholderText(/显示名/i), { target: { value: "需求挖掘" } });
@@ -252,6 +269,7 @@ describe("TaxonomiesAdmin 边界", () => {
     vi.spyOn(api, "get").mockResolvedValue({ items: [] } as never);
     const postRaw = vi.spyOn(api, "postRaw");
     render(<SystemStrategyFeature />);
+    selectTab("标签与状态");
     fireEvent.click(await screen.findByText("新增条目"));
     fireEvent.change(screen.getByPlaceholderText(/显示名/i), { target: { value: "需求挖掘" } });
     fireEvent.click(screen.getByText("保存"));
@@ -262,6 +280,7 @@ describe("TaxonomiesAdmin 边界", () => {
   it("kind=customer_stage 显示状态机软提示，改成 intent_level 后不显示", async () => {
     vi.spyOn(api, "get").mockResolvedValue({ items: [] } as never);
     render(<SystemStrategyFeature />);
+    selectTab("标签与状态");
     fireEvent.click(await screen.findByText("新增条目"));
     // 默认 kind=customer_stage → 软提示可见
     expect(screen.getByText(/状态机灰度.*同步配置/)).toBeInTheDocument();
@@ -305,6 +324,7 @@ describe("DomainProfile 维度配置 participates_in_decision", () => {
     seedProfileDraftWithDimension(setProfileDraft);
 
     render(<SystemStrategyFeature />);
+    selectTab("行业配置");
 
     // 维度行的「进决策」复选框初始为 checked（participates_in_decision=true）
     const checkbox = await screen.findByRole("checkbox", { name: "进决策" });
@@ -355,6 +375,7 @@ describe("DomainProfile completeness 维度 anchor_hint+initial_signal", () => {
     seedProfileDraftWithCoverage(setProfileDraft);
 
     render(<SystemStrategyFeature />);
+    selectTab("行业配置");
 
     // anchor_hint 输入框写入文本 → 写回该行 anchor_hint，保留 key/display_name/required
     const anchorInput = await screen.findByPlaceholderText(/anchor_hint/i);
