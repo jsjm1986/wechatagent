@@ -142,6 +142,30 @@ function Empty({ text }: { text: string }) {
   );
 }
 
+// 面板列表分页：条目全平铺会让「标签与状态」tab 无限长（线上候选 176 条 = 116 屏）。
+// 每页 20 条，safePage 在渲染期夹取——切 filter / reload 后条目变少时页码自动落回有效页，
+// 无需在每个 setState 处手动 setPage(0)。复用 CampaignBoard.tsx 的既有分页范式。
+const PANEL_PAGE_SIZE = 20;
+
+function usePagedList<T>(items: T[]): { pageRows: T[]; pageCount: number; safePage: number; setPage: (p: number) => void } {
+  const [page, setPage] = useState(0);
+  const pageCount = Math.max(1, Math.ceil(items.length / PANEL_PAGE_SIZE));
+  const safePage = Math.min(page, pageCount - 1);
+  const pageRows = items.slice(safePage * PANEL_PAGE_SIZE, safePage * PANEL_PAGE_SIZE + PANEL_PAGE_SIZE);
+  return { pageRows, pageCount, safePage, setPage };
+}
+
+function Pager({ pageCount, safePage, setPage }: { pageCount: number; safePage: number; setPage: (p: number) => void }) {
+  if (pageCount <= 1) return null;
+  return (
+    <div className={styles.pager}>
+      <button type="button" className={styles.pagerBtn} disabled={safePage === 0} onClick={() => setPage(safePage - 1)}>上一页</button>
+      <span className={styles.pagerInfo}>{safePage + 1} / {pageCount}</span>
+      <button type="button" className={styles.pagerBtn} disabled={safePage >= pageCount - 1} onClick={() => setPage(safePage + 1)}>下一页</button>
+    </div>
+  );
+}
+
 // 资源无关的版本动作条：发布新版本 / 切到当前 / 回滚到上一版本。
 function ActiveVersionsBar({
   meta,
@@ -558,6 +582,7 @@ function StatePolicyAdmin({ busy }: { busy: boolean }) {
   const [error, setError] = useState<string | null>(null);
   // 默认只显当前生效版本，避免历史版本一次性平铺撑长页面；需要时手动勾「显示历史版本」。
   const [includeAll, setIncludeAll] = useState(false);
+  const { pageRows, pageCount, safePage, setPage } = usePagedList(items);
 
   async function reload() {
     setLoading(true);
@@ -599,7 +624,7 @@ function StatePolicyAdmin({ busy }: { busy: boolean }) {
       {error && <div className={styles.inlineError}>{error}</div>}
       {!loading && items.length === 0 && <Empty text="暂无状态策略" />}
       <div className={styles.versionedList}>
-        {items.map((item) => (
+        {pageRows.map((item) => (
           <div key={item.id} className={styles.versionedListItem}>
             <div className={styles.versionedListHead}>
               <div>
@@ -633,6 +658,7 @@ function StatePolicyAdmin({ busy }: { busy: boolean }) {
           </div>
         ))}
       </div>
+      <Pager pageCount={pageCount} safePage={safePage} setPage={setPage} />
     </section>
   );
 }
@@ -660,6 +686,7 @@ function TaxonomiesAdmin({ busy }: { busy: boolean }) {
   const [info, setInfo] = useState<string | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editDraft, setEditDraft] = useState<EditDraft>({ label: "", aliases: "", description: "", isReactivationTarget: false, isTerminal: false });
+  const { pageRows, pageCount, safePage, setPage } = usePagedList(items);
 
   async function reload() {
     setLoading(true);
@@ -873,7 +900,7 @@ function TaxonomiesAdmin({ busy }: { busy: boolean }) {
       )}
       {!loading && items.length === 0 && <Empty text="暂无字典条目" />}
       <div className={styles.versionedList}>
-        {items.map((item) => (
+        {pageRows.map((item) => (
           <div key={item.id} className={styles.versionedListItem}>
             <div className={styles.versionedListHead}>
               <div>
@@ -964,6 +991,7 @@ function TaxonomiesAdmin({ busy }: { busy: boolean }) {
           </div>
         ))}
       </div>
+      <Pager pageCount={pageCount} safePage={safePage} setPage={setPage} />
     </section>
   );
 }
@@ -1005,6 +1033,7 @@ function TaxonomyCandidatesAdmin({ busy }: { busy: boolean }) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [statusFilter, setStatusFilter] = useState<CandidateStatusFilter>("pending");
+  const { pageRows, pageCount, safePage, setPage } = usePagedList(items);
 
   async function reload() {
     setLoading(true);
@@ -1055,7 +1084,7 @@ function TaxonomyCandidatesAdmin({ busy }: { busy: boolean }) {
       {error && <div className={styles.inlineError}>{error}</div>}
       {!loading && items.length === 0 && <Empty text="暂无候选" />}
       <div className={styles.versionedList}>
-        {items.map((item) => (
+        {pageRows.map((item) => (
           <div key={item.id} className={styles.versionedListItem}>
             <div className={styles.versionedListHead}>
               <div>
@@ -1105,6 +1134,7 @@ function TaxonomyCandidatesAdmin({ busy }: { busy: boolean }) {
           </div>
         ))}
       </div>
+      <Pager pageCount={pageCount} safePage={safePage} setPage={setPage} />
     </section>
   );
 }

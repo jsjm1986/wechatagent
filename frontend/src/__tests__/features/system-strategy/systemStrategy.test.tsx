@@ -405,3 +405,73 @@ describe("DomainProfile completeness 维度 anchor_hint+initial_signal", () => {
     expect(lastArg.coverage_dimensions[0].key).toBe("need");
   });
 });
+
+// 候选审核面板分页（消除 176 条全平铺致页面无限长；每页 20 条，复用 CampaignBoard 分页模式）。
+describe("TaxonomyCandidatesAdmin 分页", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    useUiStore.setState({ busy: false, error: "", setBusy: vi.fn(), setError: vi.fn() });
+  });
+
+  function makeCandidates(n: number) {
+    return Array.from({ length: n }, (_, i) => ({
+      id: `cand${i}`,
+      scope: "global",
+      kind: "churn_reason",
+      rawValue: `候选词${i}`,
+      evidence: null,
+      confidence: 0.5,
+      occurrences: 1,
+      status: "pending",
+      firstSeenAt: null,
+      lastSeenAt: null,
+      reviewedAt: null,
+      reviewedBy: null,
+      suggestedDisplayName: null,
+    }));
+  }
+
+  it("候选 25 条时首页只渲染 20 条并显示翻页控件，点下一页显示其余 5 条", async () => {
+    // 候选面板挂载即 GET /api/admin/taxonomy-candidates?status=pending
+    vi.spyOn(api, "get").mockImplementation((url: string) =>
+      Promise.resolve(
+        (url.includes("/api/admin/taxonomy-candidates") ? { items: makeCandidates(25) } : { items: [] }) as never,
+      ),
+    );
+
+    render(<SystemStrategyFeature />);
+    selectTab("标签与状态");
+
+    // 首页：候选词0/候选词19 可见，候选词20 不可见（被分页切掉）。
+    // 用 heading 精确匹配（rawValue 落在 <h3>），避免「候选词2」子串匹配「候选词20/21…」。
+    await waitFor(() => expect(screen.getByRole("heading", { name: "候选词0" })).toBeInTheDocument());
+    expect(screen.getByRole("heading", { name: "候选词19" })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "候选词20" })).toBeNull();
+    // 页码 1 / 2
+    expect(screen.getByText("1 / 2")).toBeInTheDocument();
+
+    // 点「下一页」→ 第 21..25 条可见，第 1 条移出
+    fireEvent.click(screen.getByText("下一页"));
+    await waitFor(() => expect(screen.getByRole("heading", { name: "候选词20" })).toBeInTheDocument());
+    expect(screen.getByRole("heading", { name: "候选词24" })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "候选词0" })).toBeNull();
+    expect(screen.getByText("2 / 2")).toBeInTheDocument();
+  });
+
+  it("候选 ≤20 条时不显示翻页控件", async () => {
+    vi.spyOn(api, "get").mockImplementation((url: string) =>
+      Promise.resolve(
+        (url.includes("/api/admin/taxonomy-candidates") ? { items: makeCandidates(20) } : { items: [] }) as never,
+      ),
+    );
+
+    render(<SystemStrategyFeature />);
+    selectTab("标签与状态");
+
+    await waitFor(() => expect(screen.getByRole("heading", { name: "候选词0" })).toBeInTheDocument());
+    expect(screen.getByRole("heading", { name: "候选词19" })).toBeInTheDocument();
+    // 正好 20 条 = 1 页，无翻页控件
+    expect(screen.queryByText("下一页")).toBeNull();
+    expect(screen.queryByText("上一页")).toBeNull();
+  });
+});

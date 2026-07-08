@@ -250,3 +250,14 @@
   border-radius: var(--r-md); border: 1px dashed var(--hairline);
 }
 .profileEditorPlaceholder p { max-width: 240px; line-height: 1.6; }
+
+/* 面板分页控件（复刻 Campaign.module.css .pager 系列，同 token；三面板列表尾部翻页，消除条目全平铺致页面无限长）。 */
+.pager { display: flex; align-items: center; justify-content: center; gap: 14px; margin-top: 14px; }
+.pagerBtn {
+  font: inherit; font-size: 12px; font-weight: 600; padding: 6px 14px;
+  border-radius: var(--r-sm); cursor: pointer;
+  color: var(--ink-2); background: var(--surface-card); border: 1px solid var(--hairline);
+}
+.pagerBtn:hover:not(:disabled) { border-color: rgba(10, 132, 255, .3); }
+.pagerBtn:disabled { color: var(--ink-3); cursor: not-allowed; opacity: .6; }
+.pagerInfo { font-size: 12px; color: var(--ink-3); font-variant-numeric: tabular-nums; }
