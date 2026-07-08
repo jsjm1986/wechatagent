@@ -31,6 +31,15 @@ function selectTab(name: "总控与 Prompt" | "标签与状态" | "行业配置"
   fireEvent.click(screen.getByRole("button", { name }));
 }
 
+// 「新增条目」按钮 disabled={busy||loading}：TaxonomiesAdmin 挂载即 reload() 置 loading=true，
+// findByText 只等文字出现、不等 loading 落地，CI 慢机上点击会落在 disabled 窗口内→表单不展开。
+// 必须等按钮 enabled 再点，否则 showCreate 不翻转、canonical id 输入框永不渲染（真实竞态，非 mock 污染）。
+async function openCreateForm() {
+  const btn = await screen.findByText("新增条目");
+  await waitFor(() => expect(btn).not.toBeDisabled());
+  fireEvent.click(btn);
+}
+
 describe("SystemStrategy Feature", () => {
   beforeEach(() => {
     // Mock loadStrategyData to avoid API calls
@@ -136,7 +145,7 @@ describe("TaxonomiesAdmin 新增条目", () => {
     render(<SystemStrategyFeature />);
     selectTab("标签与状态");
 
-    fireEvent.click(await screen.findByText("新增条目"));
+    await openCreateForm();
     fireEvent.change(screen.getByPlaceholderText(/canonical id/i), { target: { value: "need_discovery" } });
     fireEvent.change(screen.getByPlaceholderText(/显示名/i), { target: { value: "需求挖掘" } });
     fireEvent.change(screen.getByPlaceholderText(/别名/i), { target: { value: "挖需求，需求探索, 探需" } });
@@ -250,7 +259,7 @@ describe("TaxonomiesAdmin 边界", () => {
     } as never);
     const { container } = render(<SystemStrategyFeature />);
     selectTab("标签与状态");
-    fireEvent.click(await screen.findByText("新增条目"));
+    await openCreateForm();
     fireEvent.change(screen.getByPlaceholderText(/canonical id/i), { target: { value: "need_discovery" } });
     fireEvent.change(screen.getByPlaceholderText(/显示名/i), { target: { value: "需求挖掘" } });
     fireEvent.click(screen.getByText("保存"));
@@ -270,7 +279,7 @@ describe("TaxonomiesAdmin 边界", () => {
     const postRaw = vi.spyOn(api, "postRaw");
     render(<SystemStrategyFeature />);
     selectTab("标签与状态");
-    fireEvent.click(await screen.findByText("新增条目"));
+    await openCreateForm();
     fireEvent.change(screen.getByPlaceholderText(/显示名/i), { target: { value: "需求挖掘" } });
     fireEvent.click(screen.getByText("保存"));
     expect(await screen.findByText(/均不能为空/)).toBeInTheDocument();
@@ -281,7 +290,7 @@ describe("TaxonomiesAdmin 边界", () => {
     vi.spyOn(api, "get").mockResolvedValue({ items: [] } as never);
     render(<SystemStrategyFeature />);
     selectTab("标签与状态");
-    fireEvent.click(await screen.findByText("新增条目"));
+    await openCreateForm();
     // 默认 kind=customer_stage → 软提示可见
     expect(screen.getByText(/状态机灰度.*同步配置/)).toBeInTheDocument();
     fireEvent.change(screen.getByPlaceholderText("customer_stage"), { target: { value: "intent_level" } });

@@ -29,6 +29,14 @@ function selectTab(name: "总控与 Prompt" | "标签与状态" | "行业配置"
   fireEvent.click(screen.getByRole("button", { name }));
 }
 
+// 「新增条目」disabled={busy||loading}：挂载 reload() 置 loading，findByText 不等 loading 落地，
+// CI 慢机点击落在 disabled 窗口→表单不展开。等按钮 enabled 再点（与 systemStrategy.test.tsx 同源竞态）。
+async function openCreateForm() {
+  const btn = await screen.findByText("新增条目");
+  await waitFor(() => expect(btn).not.toBeDisabled());
+  fireEvent.click(btn);
+}
+
 describe("TaxonomiesAdmin 终态 / 再激活 flag 配置（D6）", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -47,7 +55,7 @@ describe("TaxonomiesAdmin 终态 / 再激活 flag 配置（D6）", () => {
     render(<SystemStrategyFeature />);
     selectTab("标签与状态");
 
-    fireEvent.click(await screen.findByText("新增条目"));
+    await openCreateForm();
     fireEvent.change(screen.getByPlaceholderText(/canonical id/i), { target: { value: "customer_success" } });
     fireEvent.change(screen.getByPlaceholderText(/显示名/i), { target: { value: "成交维护" } });
     // 勾两个复选（按 label 文案中的 flag 名定位）。
@@ -68,7 +76,7 @@ describe("TaxonomiesAdmin 终态 / 再激活 flag 配置（D6）", () => {
     render(<SystemStrategyFeature />);
     selectTab("标签与状态");
 
-    fireEvent.click(await screen.findByText("新增条目"));
+    await openCreateForm();
     fireEvent.change(screen.getByPlaceholderText(/canonical id/i), { target: { value: "first_contact" } });
     fireEvent.change(screen.getByPlaceholderText(/显示名/i), { target: { value: "初次接触" } });
     fireEvent.click(screen.getByText("保存"));
