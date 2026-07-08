@@ -584,13 +584,26 @@ pub async fn fetch_roster_for_account(
     const RETRY_INTERVAL_SECS: u64 = 2;
     let mut last_result = serde_json::Value::Null;
     for attempt in 0..MAX_RETRIES {
-        last_result = logged_call_for_account(
+        match logged_call_for_account(
             state,
             account_id,
             "contacts_fetch_cache",
             serde_json::json!({}),
         )
-        .await?;
+        .await
+        {
+            Ok(v) => {
+                last_result = v;
+            }
+            // 上游限流(429/503):柔化为「同步中」而非硬错误。当作本次空 cache——
+            // 还有重试机会则退避重试(退避后 MCP SSE 名额常已释放),用尽仍限流则
+            // 返回 syncing:true 让前端提示「同步中」并自动重拉,退避后自愈。
+            Err(AppError::UpstreamBusy(_)) => {
+                last_result = serde_json::Value::Null;
+            }
+            // 真实错误(401/500/配置错等)照常上抛 → 前端红条,不掩盖真问题。
+            Err(other) => return Err(other),
+        }
         // 解析器是「是否就绪」的唯一真相源：解析出好友即就绪返回。
         let outcome = roster_outcome_from_result(&last_result);
         if !outcome.syncing {
@@ -913,6 +926,15 @@ mod roster_outcome_tests {
         let out = roster_outcome_from_result(&v);
         assert_eq!(out.friends.len(), 1);
         assert!(!out.syncing);
+    }
+
+    #[test]
+    fn null_result_is_syncing() {
+        // fetch_roster_for_account 遇 UpstreamBusy(限流)会把 last_result 置 Null,
+        // 应判为空 cache→syncing:true(而非当作真 0 好友或报错)。
+        let out = roster_outcome_from_result(&serde_json::Value::Null);
+        assert!(out.friends.is_empty());
+        assert!(out.syncing, "Null(限流柔化)必须 syncing=true");
     }
 }
 
