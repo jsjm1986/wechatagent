@@ -664,7 +664,10 @@ pub(crate) fn format_reaction_hint(recent: &[Document]) -> String {
 /// snake_case → camelCase（最小实现）：用于把 trajectory 维度 kind（snake）映射到
 /// reaction_analysis 的 camelCase 字段名（LLM JSON 约定）。`objection_type` → `objectionType`。
 /// 已是单段（无下划线）时原样返回。
-fn snake_to_camel(s: &str) -> String {
+///
+/// 也被 `gateway::pick_dimension_display_name` 复用：LLM 产的 `dimensionDisplayNames`
+/// 内层键常镜像兄弟字段写成 camelCase，需按 snake kind 转 camel 回退取名。
+pub(crate) fn snake_to_camel(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut upper_next = false;
     for ch in s.chars() {
