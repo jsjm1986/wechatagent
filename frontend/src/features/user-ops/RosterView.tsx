@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { RefreshCw, Check, Users } from "lucide-react";
 import { useAccountStore } from "../../stores/accountStore";
 import { useUserOpsStore } from "../../stores/userOpsStore";
@@ -29,10 +29,16 @@ export function RosterView() {
   const [sharedNote, setSharedNote] = useState("");
   const [playbookId, setPlaybookId] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  // 请求序号守卫：快速切账号时并发多个 loadRoster，只有最新一次的响应才允许落地，
+  // 丢弃过时响应——否则先发的（账号 A）若晚于后发的（账号 B）返回，会用 A 的好友覆盖
+  // B 的列表，而选中账号已是 B，导致列表与账号错配、勾选提交用 B 的 accountId 配 A 的 wxid。
+  const reqSeqRef = useRef(0);
 
   const refresh = useCallback(
     async (accountId: string) => {
       if (!accountId) return;
+      const seq = ++reqSeqRef.current;
+      const isStale = () => seq !== reqSeqRef.current;
       setLoading(true);
       setError(null);
       // 切账号/刷新时连同本批草稿一起清空——否则账号 A 的运营备注/剧本会残留到账号 B。
@@ -41,11 +47,14 @@ export function RosterView() {
       setPlaybookId("");
       try {
         const items = await loadRoster(accountId);
+        if (isStale()) return; // 已有更新的请求发出，丢弃本次过时结果。
         setRoster(items);
       } catch (e) {
+        if (isStale()) return;
         setError(e instanceof Error ? e.message : "加载好友列表失败");
       } finally {
-        setLoading(false);
+        // 仅最新请求负责收起 loading——过时请求提前收起会让进行中的最新请求看起来已完成。
+        if (!isStale()) setLoading(false);
       }
     },
     [loadRoster]

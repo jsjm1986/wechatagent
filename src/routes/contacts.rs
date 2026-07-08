@@ -579,6 +579,18 @@ pub async fn batch_enable_endpoint(
     )
     .await?;
 
+    // 全新联系人的初始 operation_state 在此**同步**写入（不等异步画像回填）。
+    // 竞态修复：batch upsert 只切 managed 时，若客户在 initial_profile 任务跑之前来消息，
+    // gateway 的 apply_agent_updates 会无条件把 last_agent_run_at 推到 now
+    // （agent/gateway.rs），随后 worker 回填时 is_previously_operated(shared.rs) 因该字段
+    // 非空返回 true → 跳过 apply_generated_profile_to_contact 的初始化分支，联系人永远拿不到
+    // 状态机 initial 态（operation_state 空 → 停滞计时器/状态机初始态缺位）。故把「纳入运营即
+    // 拥有干净初始态」这个动作从异步回填提到同步 upsert——与 initial_profile 回填幂等（回填走
+    // 全新分支时会再写同一 initial 态，取值一致）。域配置循环外查一次，避免每 candidate 查库。
+    let domain_config =
+        agent::load_user_operation_domain_config(&state, &admin.current_workspace).await?;
+    let initial_state = agent::initial_operation_state_key(domain_config.as_ref());
+
     let mut enabled = 0i32;
     let mut queued = 0i32;
     for cand in &payload.candidates {
@@ -621,6 +633,19 @@ pub async fn batch_enable_endpoint(
         }
         if let Some(avatar_url) = &cand.avatar_url {
             set_doc.insert("avatar_url", avatar_url);
+        }
+        // 全新联系人（未入库，或已入库但从未被 Agent 运营过）同步落状态机 initial 态。
+        // 老客户（is_previously_operated）不碰 operation_state——保留其已积累的运营历史，
+        // 与 apply_generated_profile_to_contact 的老客户保留语义一致（#72）。
+        let is_new_contact = existing.as_ref().map(|c| !is_previously_operated(c)).unwrap_or(true);
+        if is_new_contact {
+            set_doc.insert("operation_state", &initial_state);
+            set_doc.insert(
+                "operation_state_reason",
+                "初次纳入 Agent 运营，等待后续互动确认阶段",
+            );
+            set_doc.insert("operation_state_confidence", 6);
+            set_doc.insert("operation_state_updated_at", DateTime::now());
         }
         state
             .db
