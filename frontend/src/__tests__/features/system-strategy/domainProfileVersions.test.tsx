@@ -43,6 +43,11 @@ const activeProfile = {
   updated_at: "2026-06-26T00:00:00Z",
 };
 
+// tab 化后：DomainProfilePanel 在「行业配置」tab，需先切 tab 才渲染。
+function selectTab(name: "总控与 Prompt" | "标签与状态" | "行业配置" | "经验教训") {
+  fireEvent.click(screen.getByRole("button", { name }));
+}
+
 describe("D4 domain-profiles 版本回滚 UI", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -57,6 +62,7 @@ describe("D4 domain-profiles 版本回滚 UI", () => {
 
   it("DomainProfilePanel renders ActiveVersionsBar with domain-profiles endpoint", async () => {
     render(<SystemStrategyFeature />);
+    selectTab("行业配置");
     // ActiveVersionsBar 在生效 profile（current+有 previous）下渲染回滚 + 发布按钮。
     expect(await screen.findByText("回滚到 v1")).toBeInTheDocument();
     expect(screen.getByText("发布新版本")).toBeInTheDocument();
@@ -66,6 +72,7 @@ describe("D4 domain-profiles 版本回滚 UI", () => {
     const post = vi.spyOn(api, "post").mockResolvedValue({} as never);
     const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
     render(<SystemStrategyFeature />);
+    selectTab("行业配置");
     fireEvent.click(await screen.findByText("回滚到 v1"));
     await waitFor(() =>
       expect(post).toHaveBeenCalledWith(

@@ -24,6 +24,11 @@ vi.mock("../../../lib/api", () => ({
 // Task 7 / D6：字典两 flag（is_terminal / is_reactivation_target）配置入口。
 // 验证 create 表单勾选两复选后，submit body 的 value 对象带 camelCase 键且为 true——
 // 这是"改字典即通用"在 UI 能真正写入终态 / 再激活语义的回归锁。
+// tab 化后：TaxonomiesAdmin 在「标签与状态」tab，需先切 tab 才渲染。
+function selectTab(name: "总控与 Prompt" | "标签与状态" | "行业配置" | "经验教训") {
+  fireEvent.click(screen.getByRole("button", { name }));
+}
+
 describe("TaxonomiesAdmin 终态 / 再激活 flag 配置（D6）", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -40,6 +45,7 @@ describe("TaxonomiesAdmin 终态 / 再激活 flag 配置（D6）", () => {
     vi.spyOn(api, "get").mockResolvedValue({ items: [] } as never);
 
     render(<SystemStrategyFeature />);
+    selectTab("标签与状态");
 
     fireEvent.click(await screen.findByText("新增条目"));
     fireEvent.change(screen.getByPlaceholderText(/canonical id/i), { target: { value: "customer_success" } });
@@ -60,6 +66,7 @@ describe("TaxonomiesAdmin 终态 / 再激活 flag 配置（D6）", () => {
     vi.spyOn(api, "get").mockResolvedValue({ items: [] } as never);
 
     render(<SystemStrategyFeature />);
+    selectTab("标签与状态");
 
     fireEvent.click(await screen.findByText("新增条目"));
     fireEvent.change(screen.getByPlaceholderText(/canonical id/i), { target: { value: "first_contact" } });
