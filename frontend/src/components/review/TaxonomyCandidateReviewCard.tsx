@@ -47,7 +47,7 @@ export function TaxonomyCandidateReviewCard({
 
   async function submitApprove() {
     if (!id.trim() || !label.trim()) {
-      setError("canonical id 与显示名不能为空。");
+      setError("标签标识与显示名不能为空。");
       return;
     }
     setActing(true);
@@ -119,7 +119,7 @@ export function TaxonomyCandidateReviewCard({
       {mode === "approve" && (
         <div className={styles.form}>
           <label className={styles.field}>
-            <span>canonical id（建议英文 slug，如 price_objection）</span>
+            <span>标签标识（英文，如 price_objection）</span>
             <input className={styles.input} value={id} onChange={(e) => setId(e.target.value)} />
           </label>
           <label className={styles.field}>
@@ -127,7 +127,7 @@ export function TaxonomyCandidateReviewCard({
             <input className={styles.input} value={label} onChange={(e) => setLabel(e.target.value)} />
           </label>
           <label className={styles.field}>
-            <span>别名（逗号分隔，可空；rawValue 会自动并入）</span>
+            <span>别名（逗号分隔，可空；原始取值会自动并入）</span>
             <input className={styles.input} value={aliases} onChange={(e) => setAliases(e.target.value)} />
           </label>
           <label className={styles.field}>
