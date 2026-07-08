@@ -36,8 +36,18 @@ describe("TaxonomyCandidateReviewCard", () => {
     expect(screen.getByText(/判断依据：客户连续两条消息表达担心/)).toBeTruthy();
     const label = screen.getByLabelText(/显示名/) as HTMLInputElement;
     expect(label.value).toBe("焦虑");
-    const idInput = screen.getByLabelText(/canonical id/i) as HTMLInputElement;
+    const idInput = screen.getByLabelText(/标签标识/) as HTMLInputElement;
     expect(idInput.value).toBe("anxious");
+  });
+
+  it("正文用中文维度名（情绪状态），不裸露 emotional_state；不出现 slug/rawValue/canonical 黑话", () => {
+    render(<TaxonomyCandidateReviewCard candidate={candidate} onDone={() => {}} />);
+    // kind=emotional_state → 经 TAXONOMY_KIND_LABELS 显示「情绪状态」
+    expect(screen.getByText(/情绪状态/)).toBeTruthy();
+    // 面向运营的技术黑话不应出现在可见文案里
+    expect(screen.queryByText(/slug/i)).toBeNull();
+    expect(screen.queryByText(/canonical/i)).toBeNull();
+    expect(screen.queryByText(/rawValue/)).toBeNull();
   });
 
   it("采纳发 canonicalValue body 并在成功后回调 onDone", async () => {
