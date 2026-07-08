@@ -372,7 +372,8 @@ pub(super) async fn roster_endpoint(
     // account 必须属于当前 workspace（fail-closed）。
     validate_account(&state, &admin.current_workspace, &query.account_id).await?;
 
-    let friends = mcp::fetch_roster_for_account(&state, &query.account_id).await?;
+    let outcome = mcp::fetch_roster_for_account(&state, &query.account_id).await?;
+    let friends = outcome.friends;
 
     // 本地已入库联系人：wxid -> agent_status。
     let mut cursor = state
@@ -410,7 +411,7 @@ pub(super) async fn roster_endpoint(
         })
         .collect();
     let total = items.len();
-    Ok(Json(json!({ "items": items, "total": total })))
+    Ok(Json(json!({ "items": items, "total": total, "syncing": outcome.syncing })))
 }
 
 /// 把 AI 生成的初始运营画像落库到指定联系人（切 managed + 画像 + 备注 + playbook）。
