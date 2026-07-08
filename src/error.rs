@@ -29,6 +29,10 @@ pub enum AppError {
     BsonSer(#[from] mongodb::bson::ser::Error),
     #[error("{0}")]
     External(String),
+    /// 上游 MCP server 返回 429/503(SSE 连接数满 / 瞬时不可用)。语义是「稍后重试」，
+    /// 调用方(如 roster)可捕获并柔化为「同步中」而非硬错误。
+    #[error("upstream busy: {0}")]
+    UpstreamBusy(String),
     /// MP-5 / Task 15：单 run LLM 预算超额。调用方应捕获并走降级路径
     /// （如使用 `local_decision_review`、跳过 rewrite、跳过二次 router 等），
     /// 不应原样返回给 webhook 调用者。
@@ -106,6 +110,11 @@ impl IntoResponse for AppError {
                 })),
             )
                 .into_response(),
+            AppError::UpstreamBusy(_) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": "upstream_busy" })),
+            )
+                .into_response(),
             AppError::Db(_)
             | AppError::Http(_)
             | AppError::Json(_)
@@ -129,5 +138,30 @@ impl IntoResponse for AppError {
                     .into_response()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::to_bytes;
+
+    #[tokio::test]
+    async fn upstream_busy_maps_to_503_upstream_busy() {
+        let resp = AppError::UpstreamBusy("MCP HTTP 429: xxx".into()).into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v, json!({ "error": "upstream_busy" }));
+    }
+
+    #[tokio::test]
+    async fn external_still_maps_to_internal_error_502() {
+        // 回归守卫:非限流的 External 仍走 internal_error/502,不被新分支误伤。
+        let resp = AppError::External("boom".into()).into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v, json!({ "error": "internal_error" }));
     }
 }
