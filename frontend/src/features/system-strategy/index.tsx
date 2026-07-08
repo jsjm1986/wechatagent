@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import type { FormEvent } from "react";
-import { Settings2, Inbox } from "lucide-react";
+import { Settings2, Inbox, SlidersHorizontal, Tags, Building2, GraduationCap } from "lucide-react";
 import { api } from "../../lib/api";
 import { useUiStore } from "../../stores/uiStore";
 import { useStrategyStore } from "../../stores/strategyStore";
@@ -2503,6 +2503,15 @@ function SystemStrategyInner() {
   // publish 同款三态二次确认：needs_human_confirm / reject 弹逐字核对框 → 带 force 重提。
   const runPublishPrompt = usePromptPublishConfirm();
 
+  type StrategyTab = "control" | "taxonomy" | "profile" | "lessons";
+  const STRATEGY_TABS: { key: StrategyTab; label: string; Icon: typeof Settings2 }[] = [
+    { key: "control", label: "总控与 Prompt", Icon: SlidersHorizontal },
+    { key: "taxonomy", label: "标签与状态", Icon: Tags },
+    { key: "profile", label: "行业配置", Icon: Building2 },
+    { key: "lessons", label: "经验教训", Icon: GraduationCap },
+  ];
+  const [tab, setTab] = useState<StrategyTab>("control");
+
   useEffect(() => {
     void loadStrategyData();
   }, [loadStrategyData]);
@@ -2526,6 +2535,22 @@ function SystemStrategyInner() {
 
   return (
     <div className={styles.page}>
+      <div className={styles.profileTabBar} style={{ marginBottom: 4 }}>
+        {STRATEGY_TABS.map((t) => (
+          <button
+            key={t.key}
+            type="button"
+            className={`${styles.profileTab} ${tab === t.key ? styles.profileTabActive : ""}`}
+            onClick={() => setTab(t.key)}
+          >
+            <t.Icon size={15} style={{ marginRight: 6, verticalAlign: "-2px" }} />
+            {t.label}
+          </button>
+        ))}
+      </div>
+
+      {tab === "control" && (
+        <>
       <section className={styles.panel}>
         <div className={styles.panelHead}>
           <div className={styles.panelHeadL}>
@@ -2586,12 +2611,19 @@ function SystemStrategyInner() {
         onSaveSoul={handleSaveSoul}
         onSoulDraft={setSoulDraft}
       />
+        </>
+      )}
 
-      <StatePolicyAdmin busy={busy} />
-      <TaxonomiesAdmin busy={busy} />
-      <TaxonomyCandidatesAdmin busy={busy} />
-      <LessonsLearnedAdmin busy={busy} />
-      <DomainProfilePanel busy={busy} />
+      {tab === "taxonomy" && (
+        <>
+          <StatePolicyAdmin busy={busy} />
+          <TaxonomiesAdmin busy={busy} />
+          <TaxonomyCandidatesAdmin busy={busy} />
+        </>
+      )}
+
+      {tab === "profile" && <DomainProfilePanel busy={busy} />}
+      {tab === "lessons" && <LessonsLearnedAdmin busy={busy} />}
     </div>
   );
 }
