@@ -556,7 +556,8 @@ function StatePolicyAdmin({ busy }: { busy: boolean }) {
   const [items, setItems] = useState<OperationStatePolicyEntry[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [includeAll, setIncludeAll] = useState(true);
+  // 默认只显当前生效版本，避免历史版本一次性平铺撑长页面；需要时手动勾「显示历史版本」。
+  const [includeAll, setIncludeAll] = useState(false);
 
   async function reload() {
     setLoading(true);
@@ -641,7 +642,8 @@ function TaxonomiesAdmin({ busy }: { busy: boolean }) {
   const [items, setItems] = useState<TaxonomyEntry[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [includeAll, setIncludeAll] = useState(true);
+  // 默认只显当前生效版本，避免历史版本一次性平铺撑长页面；需要时手动勾「显示历史版本」。
+  const [includeAll, setIncludeAll] = useState(false);
   const [includeDeprecated, setIncludeDeprecated] = useState(false);
   const [showCreate, setShowCreate] = useState(false);
   const [createDraft, setCreateDraft] = useState<TaxonomyDraft>({
