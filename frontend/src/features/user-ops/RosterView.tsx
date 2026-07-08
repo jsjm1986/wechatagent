@@ -22,6 +22,7 @@ export function RosterView() {
   const toast = useToast();
 
   const [roster, setRoster] = useState<RosterEntry[]>([]);
+  const [syncing, setSyncing] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [filter, setFilter] = useState("");
@@ -46,9 +47,10 @@ export function RosterView() {
       setSharedNote("");
       setPlaybookId("");
       try {
-        const items = await loadRoster(accountId);
+        const { items, syncing: isSyncing } = await loadRoster(accountId);
         if (isStale()) return; // 已有更新的请求发出，丢弃本次过时结果。
         setRoster(items);
+        setSyncing(isSyncing);
       } catch (e) {
         if (isStale()) return;
         setError(e instanceof Error ? e.message : "加载好友列表失败");
@@ -63,6 +65,15 @@ export function RosterView() {
   useEffect(() => {
     void refresh(effectiveAccountId);
   }, [effectiveAccountId, refresh]);
+
+  // cache 同步中时每 8s 自动重拉，直到就绪（syncing 变 false）或账号切换。
+  useEffect(() => {
+    if (!syncing || !effectiveAccountId) return;
+    const timer = setInterval(() => {
+      void refresh(effectiveAccountId);
+    }, 8000);
+    return () => clearInterval(timer);
+  }, [syncing, effectiveAccountId, refresh]);
 
   const filtered = useMemo(() => {
     const q = filter.trim().toLowerCase();
@@ -170,8 +181,17 @@ export function RosterView() {
       ) : filtered.length === 0 ? (
         <div className={styles.empty}>
           <Users size={22} />
-          <strong>暂无好友</strong>
-          <p>该账号还没有拉取到好友，或过滤条件无匹配。点「刷新」重新从 MCP 拉取。</p>
+          {syncing ? (
+            <>
+              <strong>正在从微信同步好友…</strong>
+              <p>GeWe 正在准备该账号的好友列表，稍候会自动刷新。也可点「刷新」重试。</p>
+            </>
+          ) : (
+            <>
+              <strong>暂无好友</strong>
+              <p>该账号还没有拉取到好友，或过滤条件无匹配。点「刷新」重新从 MCP 拉取。</p>
+            </>
+          )}
         </div>
       ) : (
         <div className={styles.grid}>

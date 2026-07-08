@@ -177,4 +177,28 @@ describe("RosterView — 通讯录批量托管视图（Task 8）", () => {
     });
     expect(screen.queryByText("A的好友")).not.toBeInTheDocument();
   });
+
+  it("cache 同步中(syncing:true,空列表)显示同步中提示而非「暂无好友」", async () => {
+    // 后端 cache 未就绪：items 空 + syncing:true。
+    getMock.mockResolvedValue({ items: [], syncing: true });
+    render(
+      <ToastProvider>
+        <RosterView />
+      </ToastProvider>
+    );
+    // 显示「同步中」文案，不显示「暂无好友」。
+    expect(await screen.findByText(/正在从微信同步好友/)).toBeInTheDocument();
+    expect(screen.queryByText("暂无好友")).not.toBeInTheDocument();
+  });
+
+  it("syncing:false 且空列表才显示「暂无好友」", async () => {
+    getMock.mockResolvedValue({ items: [], syncing: false });
+    render(
+      <ToastProvider>
+        <RosterView />
+      </ToastProvider>
+    );
+    expect(await screen.findByText("暂无好友")).toBeInTheDocument();
+    expect(screen.queryByText(/正在从微信同步好友/)).not.toBeInTheDocument();
+  });
 });
