@@ -142,10 +142,10 @@ impl McpClient {
                 continue;
             }
             if !status.is_success() {
-                return Err(AppError::External(format!(
-                    "MCP HTTP {status}: {}",
-                    truncate_for_error(&body)
-                )));
+                return Err(classify_mcp_http_error(
+                    status.as_u16(),
+                    format!("MCP HTTP {status}: {}", truncate_for_error(&body)),
+                ));
             }
             return parse_mcp_response_body(&body);
         }
@@ -229,6 +229,16 @@ impl McpClient {
             )));
         }
         Ok(body.get("result").cloned().unwrap_or(Value::Null))
+    }
+}
+
+/// 分类 MCP server 的非 2xx HTTP 响应:429/503(SSE 连接数满/瞬时不可用)→UpstreamBusy
+/// (调用方可柔化为「同步中」);其余(401/500 等)→External(→internal_error,不掩盖真错误)。
+fn classify_mcp_http_error(code: u16, detail: String) -> AppError {
+    if code == 429 || code == 503 {
+        AppError::UpstreamBusy(detail)
+    } else {
+        AppError::External(detail)
     }
 }
 
@@ -903,6 +913,45 @@ mod roster_outcome_tests {
         let out = roster_outcome_from_result(&v);
         assert_eq!(out.friends.len(), 1);
         assert!(!out.syncing);
+    }
+}
+
+#[cfg(test)]
+mod mcp_http_classify_tests {
+    use super::classify_mcp_http_error;
+    use crate::error::AppError;
+
+    #[test]
+    fn http_429_is_upstream_busy() {
+        assert!(matches!(
+            classify_mcp_http_error(429, "MCP HTTP 429: too many".into()),
+            AppError::UpstreamBusy(_)
+        ));
+    }
+
+    #[test]
+    fn http_503_is_upstream_busy() {
+        assert!(matches!(
+            classify_mcp_http_error(503, "MCP HTTP 503".into()),
+            AppError::UpstreamBusy(_)
+        ));
+    }
+
+    #[test]
+    fn http_500_is_external() {
+        // 非限流错误仍是 External(→internal_error),不被柔化,不掩盖真问题。
+        assert!(matches!(
+            classify_mcp_http_error(500, "MCP HTTP 500".into()),
+            AppError::External(_)
+        ));
+    }
+
+    #[test]
+    fn http_401_is_external() {
+        assert!(matches!(
+            classify_mcp_http_error(401, "MCP HTTP 401".into()),
+            AppError::External(_)
+        ));
     }
 }
 
