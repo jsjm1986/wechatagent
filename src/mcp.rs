@@ -427,14 +427,17 @@ fn first_str(obj: &serde_json::Map<String, serde_json::Value>, keys: &[&str]) ->
     None
 }
 
-/// 从对象里挑第一个「元素像联系人」的数组值（元素带 wxid/userName/username 键）。
-/// contacts_fetch_cache 的数组 key 未线上核实（测试账号缓存为空），故命名候选之外
-/// 再兜一层「按内容识别数组」——避免 server 用列表外的新 key 时整表解析成空。
+/// 从对象里挑第一个「元素像联系人」的数组值：元素带 wxid/userName/username 键，
+/// 或元素是纯字符串（contacts_fetch_cache 的 wxid 字符串数组）。
+/// 命名候选之外再兜一层「按内容识别数组」——避免 server 用列表外的新 key 时整表解析成空。
 fn contact_like_array(obj: &serde_json::Map<String, serde_json::Value>) -> Option<Vec<serde_json::Value>> {
     for value in obj.values() {
         if let Some(arr) = value.as_array() {
-            let looks_like_contacts = arr.first().and_then(|first| first.as_object()).is_some_and(|o| {
-                ["wxid", "userName", "UserName", "username"].iter().any(|k| o.contains_key(*k))
+            let looks_like_contacts = arr.first().is_some_and(|first| {
+                first.as_str().is_some()
+                    || first.as_object().is_some_and(|o| {
+                        ["wxid", "userName", "UserName", "username"].iter().any(|k| o.contains_key(*k))
+                    })
             });
             if looks_like_contacts {
                 return Some(arr.clone());
@@ -449,10 +452,11 @@ fn parse_roster_items(result: &serde_json::Value) -> Vec<RosterFriend> {
     // as_array，否则某高优先候选键存在但非数组（server 回 {} 或标量）会短路掉后面
     // 真正的数组候选，导致空列表。
     //
-    // 关键事实（2026-07-07 线上亲验）：call_tool_with_key 只回 result.structuredContent
-    // （mcp.rs:202-205 已剥掉 JSON-RPC 外壳与 content[0].text），所以生产态本函数收到的
-    // 就是 structuredContent 本体——真正生效的是**顶层** /contacts 等候选。
-    // /structuredContent/* 与 /content/0/text 仅作防御（万一某调用方传入完整外壳）。
+    // 关键事实（2026-07-08 线上亲验）：contacts_fetch_cache 就绪返回
+    // structuredContent = {result:{friends:[wxid字符串]}}，故真正生效的是嵌套
+    // /result/friends。call_tool_with_key 已剥掉 JSON-RPC 外壳与 content[0].text，
+    // 生产态本函数收到的就是 structuredContent 本体。顶层 /contacts 等 + /content
+    // 兜底仅作防御（万一 server 换形态或某调用方传入完整外壳）。
     let first_array = |v: &serde_json::Value, keys: &[&str]| -> Option<Vec<serde_json::Value>> {
         for k in keys {
             if let Some(arr) = v.pointer(k).and_then(|x| x.as_array()) {
@@ -462,13 +466,18 @@ fn parse_roster_items(result: &serde_json::Value) -> Vec<RosterFriend> {
         None
     };
     let named = [
-        // 生产态：structuredContent 本体的顶层数组。
+        // 生产态：contacts_fetch_cache 的嵌套 result.friends。
+        "/result/friends",
+        "/result/contacts",
+        "/result/list",
+        // 顶层数组（其它工具/形态）。
         "/contacts",
         "/friends",
         "/list",
         "/items",
         "/data",
         // 防御：完整外壳形态（未剥壳的调用方）。
+        "/structuredContent/result/friends",
         "/structuredContent/contacts",
         "/structuredContent/friends",
         "/structuredContent/list",
@@ -486,6 +495,19 @@ fn parse_roster_items(result: &serde_json::Value) -> Vec<RosterFriend> {
 
     arr.iter()
         .filter_map(|item| {
+            // 纯字符串元素：直接当 wxid（contacts_fetch_cache 的生产形态）。
+            if let Some(s) = item.as_str() {
+                if s.is_empty() {
+                    return None;
+                }
+                return Some(RosterFriend {
+                    wxid: s.to_string(),
+                    nickname: None,
+                    remark: None,
+                    avatar_url: None,
+                });
+            }
+            // 对象元素：从命名键提取（防御其它形态）。
             let obj = item.as_object()?;
             let wxid = first_str(obj, &["wxid", "userName", "UserName", "username"])?;
             Some(RosterFriend {
@@ -684,6 +706,59 @@ mod roster_parse_tests {
         let out = parse_roster_items(&v);
         assert_eq!(out.len(), 1, "应回落到顶层 contacts 数组，而非被非数组的高优先键短路成空");
         assert_eq!(out[0].wxid, "wx_top");
+    }
+
+    #[test]
+    fn parses_nested_result_friends_string_array() {
+        // 生产真实形态（2026-07-08 线上亲验）：structuredContent.result.friends
+        // 是纯 wxid 字符串数组。
+        let v = serde_json::json!({
+            "result": { "friends": ["medianote", "wxid_2o93p4cc9n4x22", "wxid_ax8y68dxucvm22"] }
+        });
+        let out = parse_roster_items(&v);
+        assert_eq!(out.len(), 3, "纯字符串数组应逐条解析为 wxid-only");
+        assert_eq!(out[0].wxid, "medianote");
+        assert_eq!(out[1].wxid, "wxid_2o93p4cc9n4x22");
+        assert_eq!(out[0].nickname, None, "字符串元素无昵称");
+        assert_eq!(out[0].avatar_url, None, "字符串元素无头像");
+    }
+
+    #[test]
+    fn parses_nested_result_friends_object_array() {
+        // 防御：万一 GeWe 换成 result.friends 里带对象详情，也要能解析。
+        let v = serde_json::json!({
+            "result": { "friends": [
+                { "wxid": "wxid_a", "nickName": "小明", "bigHeadImg": "http://img/a" }
+            ]}
+        });
+        let out = parse_roster_items(&v);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].wxid, "wxid_a");
+        assert_eq!(out[0].nickname.as_deref(), Some("小明"));
+        assert_eq!(out[0].avatar_url.as_deref(), Some("http://img/a"));
+    }
+
+    #[test]
+    fn empty_object_yields_empty_roster() {
+        // 空 cache 返回 {} → 空列表（不 panic、不误命中）。
+        let v = serde_json::json!({});
+        assert_eq!(parse_roster_items(&v).len(), 0);
+    }
+
+    #[test]
+    fn mixed_string_and_object_array_all_parsed() {
+        // 混合数组：字符串 + 对象都应解析（不因首元素类型短路）。
+        let v = serde_json::json!({
+            "result": { "friends": [
+                "wxid_str",
+                { "userName": "wxid_obj", "nickName": "对象好友" }
+            ]}
+        });
+        let out = parse_roster_items(&v);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].wxid, "wxid_str");
+        assert_eq!(out[1].wxid, "wxid_obj");
+        assert_eq!(out[1].nickname.as_deref(), Some("对象好友"));
     }
 }
 
