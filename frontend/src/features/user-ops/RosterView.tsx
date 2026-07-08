@@ -176,7 +176,7 @@ export function RosterView() {
         />
       </label>
 
-      {loading ? (
+      {loading && !syncing ? (
         <div className={styles.loading}>加载中…</div>
       ) : filtered.length === 0 ? (
         <div className={styles.empty}>

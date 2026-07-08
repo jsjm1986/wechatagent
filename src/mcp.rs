@@ -417,6 +417,7 @@ pub struct RosterFriend {
 }
 
 /// roster 拉取结果：友列表 + 是否仍在同步（cache 空 {} 未就绪）。
+#[derive(Debug)]
 pub struct RosterFetchOutcome {
     pub friends: Vec<RosterFriend>,
     pub syncing: bool,
@@ -548,6 +549,18 @@ fn parse_roster_items(result: &serde_json::Value) -> Vec<RosterFriend> {
         .collect()
 }
 
+/// 从单次 contacts_fetch_cache 返回体推导 roster 结果 + 是否仍在同步。
+/// 不变式：**解析出任何好友一定 syncing=false（就绪）**。仅当解析为空且返回体判为空
+/// cache（{}/Null/无命名数组候选）才 syncing=true。这样即便 parse_roster_items 识别的
+/// 形态多于 roster_result_is_empty_cache 的命名路径集（/structuredContent/*、/content/0/text
+/// 内嵌 JSON、contact_like_array 内容兜底），也绝不会「列表有人却仍报同步中」——
+/// 否则前端会无限 8s 重拉且每次清空运营勾选（RosterView refresh 重置草稿）。
+fn roster_outcome_from_result(result: &serde_json::Value) -> RosterFetchOutcome {
+    let friends = parse_roster_items(result);
+    let syncing = friends.is_empty() && roster_result_is_empty_cache(result);
+    RosterFetchOutcome { friends, syncing }
+}
+
 pub async fn fetch_roster_for_account(
     state: &AppState,
     account_id: &str,
@@ -568,22 +581,18 @@ pub async fn fetch_roster_for_account(
             serde_json::json!({}),
         )
         .await?;
-        if !roster_result_is_empty_cache(&last_result) {
-            return Ok(RosterFetchOutcome {
-                friends: parse_roster_items(&last_result),
-                syncing: false,
-            });
+        // 解析器是「是否就绪」的唯一真相源：解析出好友即就绪返回。
+        let outcome = roster_outcome_from_result(&last_result);
+        if !outcome.syncing {
+            return Ok(outcome);
         }
         // 空 cache：还有重试机会则等待后重试（最后一次不等）。
         if attempt + 1 < MAX_RETRIES {
             tokio::time::sleep(std::time::Duration::from_secs(RETRY_INTERVAL_SECS)).await;
         }
     }
-    // 重试用尽仍空 → syncing。friends 用最后一次解析（正常为空）。
-    Ok(RosterFetchOutcome {
-        friends: parse_roster_items(&last_result),
-        syncing: true,
-    })
+    // 重试用尽仍空 → syncing:true（friends 为空）。
+    Ok(roster_outcome_from_result(&last_result))
 }
 
 #[cfg(test)]
@@ -838,6 +847,62 @@ mod roster_empty_cache_tests {
         // result.friends 是空数组（真 0 好友，已就绪）→ 不是空 cache，不该无限重试。
         let v = serde_json::json!({ "result": { "friends": [] } });
         assert!(!roster_result_is_empty_cache(&v));
+    }
+}
+
+#[cfg(test)]
+mod roster_outcome_tests {
+    use super::roster_outcome_from_result;
+
+    #[test]
+    fn production_string_array_is_ready() {
+        // 线上亲验形态：result.friends 纯 wxid 字符串数组 → 就绪、非同步中。
+        let v = serde_json::json!({ "result": { "friends": ["wxid_a", "wxid_b"] } });
+        let out = roster_outcome_from_result(&v);
+        assert_eq!(out.friends.len(), 2);
+        assert!(!out.syncing);
+    }
+
+    #[test]
+    fn empty_object_is_syncing() {
+        // 空 cache {} → 同步中、空列表。
+        let out = roster_outcome_from_result(&serde_json::json!({}));
+        assert!(out.friends.is_empty());
+        assert!(out.syncing);
+    }
+
+    #[test]
+    fn real_zero_friends_is_ready_not_syncing() {
+        // result.friends 空数组 = 真 0 好友，已就绪，不该同步中（否则无限重拉）。
+        let v = serde_json::json!({ "result": { "friends": [] } });
+        let out = roster_outcome_from_result(&v);
+        assert!(out.friends.is_empty());
+        assert!(!out.syncing, "真 0 好友必须 syncing=false");
+    }
+
+    #[test]
+    fn parseable_but_not_in_empty_cache_pathset_is_ready() {
+        // 回归守卫：此形态 parse_roster_items 能解析（/structuredContent/contacts），
+        // 但 roster_result_is_empty_cache 的 8 条命名路径**不含**它 → 旧逻辑会误判空
+        // cache 而返回 syncing:true+非空列表。新不变式：解析出好友即 syncing=false。
+        let v = serde_json::json!({
+            "structuredContent": { "contacts": [
+                { "userName": "wxid_p", "nickName": "生产好友" }
+            ]}
+        });
+        let out = roster_outcome_from_result(&v);
+        assert_eq!(out.friends.len(), 1, "解析器识别的形态必须算就绪");
+        assert!(!out.syncing, "列表有人时绝不能报同步中");
+    }
+
+    #[test]
+    fn content_fallback_array_is_ready() {
+        // 回归守卫：未知 key 经 contact_like_array 内容兜底解析出好友，
+        // empty-cache 命名路径同样不含 → 必须 syncing=false。
+        let v = serde_json::json!({ "friendList": [ { "wxid": "wx_unknown" } ] });
+        let out = roster_outcome_from_result(&v);
+        assert_eq!(out.friends.len(), 1);
+        assert!(!out.syncing);
     }
 }
 

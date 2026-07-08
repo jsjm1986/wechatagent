@@ -201,4 +201,31 @@ describe("RosterView — 通讯录批量托管视图（Task 8）", () => {
     expect(await screen.findByText("暂无好友")).toBeInTheDocument();
     expect(screen.queryByText(/正在从微信同步好友/)).not.toBeInTheDocument();
   });
+
+  it("syncing 期间每 8s 自动重拉，且不闪现「加载中…」", async () => {
+    vi.useFakeTimers();
+    try {
+      getMock.mockResolvedValue({ items: [], syncing: true });
+      render(
+        <ToastProvider>
+          <RosterView />
+        </ToastProvider>
+      );
+      // 首次加载落地（syncing:true）。vi.waitFor 会在假定时器下推进定时器并冲洗 microtask，
+      // 直到同步中提示渲染出来。
+      await vi.waitFor(() => {
+        expect(screen.getByText(/正在从微信同步好友/)).toBeInTheDocument();
+      });
+      expect(screen.queryByText("加载中…")).not.toBeInTheDocument();
+      const callsAfterFirst = getMock.mock.calls.length;
+      // 推进 8s，自动重拉应再次调用 loadRoster。
+      await vi.advanceTimersByTimeAsync(8000);
+      expect(getMock.mock.calls.length).toBeGreaterThan(callsAfterFirst);
+      // 后台重拉期间仍不闪「加载中…」，同步中提示保持。
+      expect(screen.queryByText("加载中…")).not.toBeInTheDocument();
+      expect(screen.getByText(/正在从微信同步好友/)).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
