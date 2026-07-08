@@ -3,7 +3,7 @@
 //       (2) 勾选 2 条 not_imported + 填共享运营备注 + 点「加入 Agent 运营」→ POST /contacts/batch-enable，
 //           body 含 accountId / candidates(len 2) / sharedNote（camelCase wire 键）。
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, act } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { RosterView } from "../../../features/user-ops/RosterView";
 import { ToastProvider } from "../../../components/ui/Toast";
@@ -37,6 +37,15 @@ function seedAccount() {
     ],
     selectedAccountId: "acc1",
   });
+}
+
+// 手动控制 resolve 时序的 promise，用于制造"旧账号请求晚于新账号请求返回"的竞态。
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((res) => {
+    resolve = res;
+  });
+  return { promise, resolve };
 }
 
 describe("RosterView — 通讯录批量托管视图（Task 8）", () => {
@@ -101,5 +110,71 @@ describe("RosterView — 通讯录批量托管视图（Task 8）", () => {
       expect(body.candidates.map((c) => c.wxid).sort()).toEqual(["wx_new1", "wx_new2"]);
       expect(body.sharedNote).toBe("地产意向客户，热情专业");
     });
+  });
+
+  // 竞态回归：快速切账号 A→B，若账号 A 的 roster 响应晚于账号 B 返回，
+  // 过时的 A 结果不得覆盖已选中账号 B 的列表（请求序号守卫）。
+  it("切账号竞态：过时账号的迟到响应不覆盖当前账号列表", async () => {
+    // 两个账号可选（RosterView 仅在 accounts.length > 1 时渲染账号下拉）。
+    useAccountStore.setState({
+      accounts: [
+        { accountId: "accA", alias: "账号A", displayName: "账号A", online: true } as never,
+        { accountId: "accB", alias: "账号B", displayName: "账号B", online: true } as never,
+      ],
+      selectedAccountId: "accA",
+    });
+
+    const ROSTER_A = [
+      { wxid: "wx_a_only", nickname: "A的好友", remark: null, avatarUrl: null, agentStatus: "not_imported" },
+    ];
+    const ROSTER_B = [
+      { wxid: "wx_b_only", nickname: "B的好友", remark: null, avatarUrl: null, agentStatus: "not_imported" },
+    ];
+
+    const defA = deferred<{ items: typeof ROSTER_A }>();
+    const defB = deferred<{ items: typeof ROSTER_B }>();
+    // 按 url 里的 accountId 路由到各自的 deferred：A 先发起、B 后发起，
+    // 但下面刻意让 B 先 resolve、A 后 resolve（迟到）。
+    getMock.mockImplementation((url: string) => {
+      if (url.includes("accountId=accA")) return defA.promise;
+      if (url.includes("accountId=accB")) return defB.promise;
+      return Promise.resolve({ items: [] });
+    });
+
+    render(
+      <ToastProvider>
+        <RosterView />
+      </ToastProvider>
+    );
+
+    // 挂载即对账号 A 发起 roster 请求（seq=1，pending）。
+    await waitFor(() => {
+      expect(getMock.mock.calls.some((c) => String(c[0]).includes("accountId=accA"))).toBe(true);
+    });
+
+    // 切到账号 B（seq=2，pending）——effectiveAccountId 变 → useEffect 重跑 refresh。
+    act(() => {
+      useAccountStore.getState().selectAccount("accB");
+    });
+    await waitFor(() => {
+      expect(getMock.mock.calls.some((c) => String(c[0]).includes("accountId=accB"))).toBe(true);
+    });
+
+    // 账号 B 先返回（最新请求）→ 列表落 B。
+    await act(async () => {
+      defB.resolve({ items: ROSTER_B });
+    });
+    expect(await screen.findByText("B的好友")).toBeInTheDocument();
+
+    // 账号 A 迟到返回（过时请求）→ 守卫应丢弃，列表仍是 B、不得出现 A 的好友。
+    await act(async () => {
+      defA.resolve({ items: ROSTER_A });
+    });
+
+    // 给过时响应一个落地的机会：仍应看到 B、看不到 A。
+    await waitFor(() => {
+      expect(screen.getByText("B的好友")).toBeInTheDocument();
+    });
+    expect(screen.queryByText("A的好友")).not.toBeInTheDocument();
   });
 });
