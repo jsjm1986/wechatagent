@@ -5168,12 +5168,19 @@ pub(crate) struct TaxonomyGuardOutcome {
 
 /// 从维度中文名映射（`AgentDecision.dimension_display_names`）里按 `kind` 取中文名。
 /// 缺键 / 非字符串 / 空串 / 纯空格 → `None`（候选回落英文裸值）。纯函数，便于单测。
+///
+/// `kind` 恒为 snake（`customer_stage`），但生产实测 LLM 约一半的 run 把内层键写成
+/// camelCase（`customerStage`，镜像兄弟字段 customerStage/intentLevel）。故 snake 精确
+/// 取未命中时，按 `snake_to_camel(kind)` 回退再取一次——与 reaction.rs 容双形键同源做法。
 pub(crate) fn pick_dimension_display_name<'a>(names: &'a Document, kind: &str) -> Option<&'a str> {
-    names
-        .get_str(kind)
-        .ok()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
+    let pick = |key: &str| {
+        names
+            .get_str(key)
+            .ok()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    };
+    pick(kind).or_else(|| pick(&crate::agent::reaction::snake_to_camel(kind)))
 }
 
 pub(crate) fn compute_taxonomy_guard_outcome(
@@ -5960,6 +5967,33 @@ mod tests {
         assert_eq!(pick_dimension_display_name(&names, "absent"), None);
         // 空 doc → None
         assert_eq!(pick_dimension_display_name(&Document::new(), "customer_stage"), None);
+    }
+
+    #[test]
+    fn pick_display_name_falls_back_to_camel_case_key() {
+        // 生产实测：LLM 约一半的 run 把 dimensionDisplayNames 的内层键写成 camelCase
+        // （镜像兄弟字段 customerStage/intentLevel），而 kind 恒为 snake（customer_stage）。
+        // 只按 snake 精确取会漏掉这些名 → 候选丢中文建议名。故 snake 未命中回退 camelCase。
+        let names = doc! {
+            "customerStage": "成交在即",
+            "intentLevel": "  高度意向  ",
+        };
+        assert_eq!(pick_dimension_display_name(&names, "customer_stage"), Some("成交在即"));
+        // camelCase 命中同样 trim
+        assert_eq!(pick_dimension_display_name(&names, "intent_level"), Some("高度意向"));
+        // 单段 kind（无下划线）snake==camel，仍命中
+        let single = doc! { "objection": "价格顾虑" };
+        assert_eq!(pick_dimension_display_name(&single, "objection"), Some("价格顾虑"));
+    }
+
+    #[test]
+    fn pick_display_name_prefers_snake_over_camel_when_both_present() {
+        // snake 是 prompt 契约里教的键，优先；仅当 snake 缺失才回退 camel。
+        let names = doc! {
+            "customer_stage": "焦虑观望",
+            "customerStage": "别的值",
+        };
+        assert_eq!(pick_dimension_display_name(&names, "customer_stage"), Some("焦虑观望"));
     }
 
     #[test]
