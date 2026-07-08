@@ -7,11 +7,11 @@ import { useStrategyStore } from "../../stores/strategyStore";
 import type { AgentSoul, PromptTemplate, PromptTemplateDraft, DomainProfile, DomainProfileDraft } from "../../types";
 import { ProfilePublishCard } from "../../components/review/ProfilePublishCard";
 import { LessonPromoteCard } from "../../components/review/LessonPromoteCard";
-import { TaxonomyCandidateReviewCard } from "../../components/review/TaxonomyCandidateReviewCard";
+import { TaxonomyCandidateReviewCard, TAXONOMY_KIND_LABELS } from "../../components/review/TaxonomyCandidateReviewCard";
 import { ConfirmProvider } from "../../components/ui/ConfirmDialog";
 import { usePromptSaveConfirm, usePromptPublishConfirm } from "../../components/prompt/usePromptSaveConfirm";
 import { ToastProvider } from "../../components/ui/Toast";
-import { VERSION_STATUS_LABELS, seededByLabel, promptLayerLabel } from "../../lib/reviewLabels";
+import { VERSION_STATUS_LABELS, seededByLabel, promptLayerLabel, labelOf } from "../../lib/reviewLabels";
 import styles from "./SystemStrategy.module.css";
 
 // 系统策略频道：全局总控 Prompt（人格/任务）+ 状态机灰度 + 双层标签字典 + 跨用户教训。
@@ -876,7 +876,7 @@ function TaxonomiesAdmin({ busy }: { busy: boolean }) {
             <div className={styles.versionedListHead}>
               <div>
                 <span className={styles.versionedListScope}>
-                  {item.scope} · {item.kind}
+                  {item.scope} · {labelOf(TAXONOMY_KIND_LABELS, item.kind)}
                 </span>
                 <h3>{item.value.label || item.value.id}</h3>
               </div>
@@ -1048,7 +1048,7 @@ function TaxonomyCandidatesAdmin({ busy }: { busy: boolean }) {
         </div>
       </div>
       <p className={styles.panelHint}>
-        AI 在对话中遇到字典外的新词会落为候选；采纳后并入 system_taxonomies 字典，驳回则不进字典。
+        AI 在对话中遇到字典外的新词会落为候选；采纳后并入标签字典，今后 AI 可稳定使用；驳回则不进字典。
       </p>
       {error && <div className={styles.inlineError}>{error}</div>}
       {!loading && items.length === 0 && <Empty text="暂无候选" />}
@@ -1058,7 +1058,7 @@ function TaxonomyCandidatesAdmin({ busy }: { busy: boolean }) {
             <div className={styles.versionedListHead}>
               <div>
                 <span className={styles.versionedListScope}>
-                  {item.scope} · {item.kind}
+                  账号 {item.scope} · {labelOf(TAXONOMY_KIND_LABELS, item.kind)}
                 </span>
                 <h3>{item.rawValue}</h3>
               </div>
