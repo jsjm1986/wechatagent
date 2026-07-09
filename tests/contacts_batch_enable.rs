@@ -65,6 +65,7 @@ fn req(account_id: &str, wxids: &[&str], shared_note: &str) -> wechatagent::mode
                 "wxid": w,
                 "nickname": format!("好友{w}"),
                 "avatarUrl": format!("http://img/{w}"),
+                "sex": 1,
             })
         })
         .collect();
@@ -153,6 +154,7 @@ async fn batch_enables_and_queues_initial_profile_tasks() {
         .expect("contact exists");
     assert_eq!(c.human_profile_note.as_deref(), Some("统一运营备注：热情专业"));
     assert_eq!(c.avatar_url.as_deref(), Some("http://img/wx_b1"));
+    assert_eq!(c.sex, Some(1), "候选带的 sex 应落库到 Contact.sex");
     // 竞态修复：全新客户在 batch upsert 阶段即同步拿到状态机 initial 态（不等异步画像回填），
     // 这样即使客户在 initial_profile 任务前来消息、gateway 把 last_agent_run_at 推成非空、
     // 回填被 is_previously_operated 跳过，initial 态也不丢。DEFAULT 销售 profile initial=new_contact。
@@ -244,6 +246,7 @@ async fn batch_preserves_previously_operated_state_but_seeds_new() {
         remark: None,
         alias: None,
         avatar_url: None,
+        sex: None,
         agent_status: AgentStatus::Normal,
         human_profile_note: None,
         custom_agent_instructions: None,
