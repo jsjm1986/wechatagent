@@ -8,6 +8,7 @@ import userEvent from "@testing-library/user-event";
 import { RosterView } from "../../../features/user-ops/RosterView";
 import { ToastProvider } from "../../../components/ui/Toast";
 import { useAccountStore } from "../../../stores/accountStore";
+import { useUserOpsStore } from "../../../stores/userOpsStore";
 
 const getMock = vi.fn();
 const postMock = vi.fn();
@@ -54,6 +55,8 @@ describe("RosterView — 通讯录批量托管视图（Task 8）", () => {
     getMock.mockResolvedValue({ items: ROSTER });
     postMock.mockResolvedValue({ enabled: 2, queued: 2 });
     seedAccount();
+    // rosterCache 是 store 单例、跨用例常驻——每例清空，避免上一例的缓存命中污染本例 mock。
+    useUserOpsStore.setState({ rosterCache: {} });
   });
 
   it("渲染全量好友，managed 行不可勾选", async () => {
@@ -240,6 +243,22 @@ describe("RosterView — 通讯录批量托管视图（Task 8）", () => {
     // 翻到下一页：好友60 出现。
     await user.click(screen.getByRole("button", { name: /下一页/ }));
     expect(await screen.findByText("好友60")).toBeInTheDocument();
+  });
+
+  it("二次 loadRoster 命中缓存不重复请求，force 才重拉", async () => {
+    const { useUserOpsStore } = await import("../../../stores/userOpsStore");
+    getMock.mockResolvedValue({ items: ROSTER, syncing: false });
+    // 首次拉：打 API。
+    await useUserOpsStore.getState().loadRoster("accCache");
+    const after1 = getMock.mock.calls.length;
+    expect(after1).toBeGreaterThan(0);
+    // 二次非 force：走缓存，不再打 API。
+    const r2 = await useUserOpsStore.getState().loadRoster("accCache");
+    expect(getMock.mock.calls.length).toBe(after1);
+    expect(r2.items.length).toBe(ROSTER.length);
+    // force：强制重拉。
+    await useUserOpsStore.getState().loadRoster("accCache", { force: true });
+    expect(getMock.mock.calls.length).toBe(after1 + 1);
   });
 
   it("syncing 期间每 8s 自动重拉，且不闪现「加载中…」", async () => {
