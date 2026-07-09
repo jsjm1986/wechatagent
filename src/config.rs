@@ -326,6 +326,9 @@ pub struct AppConfig {
     /// webhook 是否校验 HMAC-SHA256(body, MCP_API_KEY) 签名（X-MCP-Signature 头）。
     /// 生产必须 true；staging/local 测试可以临时关掉。默认 true。
     pub webhook_verify_signature: bool,
+    /// 方案 B：`x-webhook-timestamp`（毫秒）与当前时间允许的最大偏差（秒），
+    /// 超窗拒绝以防重放。默认 300（±5 分钟），与 gewe-agent 入站侧 skew 校验对称。
+    pub webhook_timestamp_skew_seconds: i64,
     // ── P1-7：JWT RS256（公网 Bearer token 鉴权） ──
     //
     // session cookie 同 origin 路径，已经覆盖 admin SPA。公网 / 第三方调用走 JWT：
@@ -692,6 +695,7 @@ impl AppConfig {
                 .ok()
                 .filter(|s| !s.trim().is_empty()),
             webhook_verify_signature: parse_bool(&env_or("WEBHOOK_VERIFY_SIGNATURE", "true")),
+            webhook_timestamp_skew_seconds: env_or("WEBHOOK_TIMESTAMP_SKEW_SECONDS", "300").parse()?,
             jwt_enabled: parse_bool(&env_or("JWT_ENABLED", "false")),
             jwt_ttl_minutes: env_or("JWT_TTL_MINUTES", "60").parse()?,
             jwt_private_key_pem: env::var("JWT_PRIVATE_KEY_PEM")

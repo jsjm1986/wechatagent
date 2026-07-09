@@ -369,6 +369,7 @@ fn test_config(mongodb_uri: String, mongodb_database: String) -> AppConfig {
         bootstrap_admin_username: None,
         bootstrap_admin_password: None,
         webhook_verify_signature: false,
+        webhook_timestamp_skew_seconds: 300,
         jwt_enabled: false,
         jwt_ttl_minutes: 60,
         jwt_private_key_pem: None,

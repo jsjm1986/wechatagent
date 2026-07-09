@@ -267,6 +267,7 @@ mod tests {
             avatar_url: None,
             mcp_base_url: None,
             mcp_api_key: None,
+            webhook_secret: None,
             online,
             status: None,
             last_sync_at: BsonDate::now(),

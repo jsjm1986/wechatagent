@@ -69,6 +69,11 @@ pub struct WechatAccount {
     pub avatar_url: Option<String>,
     pub mcp_base_url: Option<String>,
     pub mcp_api_key: Option<String>,
+    /// 方案 B：本账号对应 gewe-agent slot 的明文回调签名密钥
+    /// （`messageWebhookSecret`）。用于校验 gewe-agent 转发的
+    /// `x-webhook-signature`。`None` = 未配置；验签开关打开时视为拒绝（fail-closed）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_secret: Option<String>,
     pub online: bool,
     /// MCP server 侧账号激活状态（`active` / `inactive` 等，来自 account_list 的
     /// `status` 字段）。区别于 `online`（当前是否在线）：status 是账号在 MCP 侧的
@@ -110,6 +115,10 @@ impl std::fmt::Debug for WechatAccount {
             .field(
                 "mcp_api_key",
                 &self.mcp_api_key.as_deref().map(crate::secret::mask_secret),
+            )
+            .field(
+                "webhook_secret",
+                &self.webhook_secret.as_deref().map(crate::secret::mask_secret),
             )
             .field("online", &self.online)
             .field("status", &self.status)
@@ -6824,5 +6833,41 @@ mod avatar_field_tests {
         };
         let contact: Contact = mongodb::bson::from_document(doc).unwrap();
         assert_eq!(contact.avatar_url, None);
+    }
+}
+
+#[cfg(test)]
+mod wechat_account_debug_tests {
+    use super::*;
+
+    fn sample() -> WechatAccount {
+        WechatAccount {
+            id: None,
+            workspace_id: "ws".into(),
+            account_id: "acc".into(),
+            alias: "a".into(),
+            display_name: "d".into(),
+            app_id: None,
+            wxid: None,
+            nick_name: None,
+            avatar_url: None,
+            mcp_base_url: None,
+            mcp_api_key: None,
+            webhook_secret: Some("super-secret-value".into()),
+            online: false,
+            status: None,
+            last_sync_at: DateTime::now(),
+            capacity: 0,
+            persona_tag: None,
+            off_hours: Vec::new(),
+            created_at: DateTime::now(),
+            updated_at: DateTime::now(),
+        }
+    }
+
+    #[test]
+    fn debug_masks_webhook_secret() {
+        let dbg = format!("{:?}", sample());
+        assert!(!dbg.contains("super-secret-value"), "raw webhook_secret leaked into Debug: {dbg}");
     }
 }

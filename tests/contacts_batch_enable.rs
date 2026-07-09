@@ -42,6 +42,7 @@ async fn seed_account(app: &TestApp, ws: &str, account_id: &str) {
                 avatar_url: None,
                 mcp_base_url: None,
                 mcp_api_key: None,
+                webhook_secret: None,
                 online: true,
                 status: None,
                 last_sync_at: now,
