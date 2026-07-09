@@ -414,6 +414,7 @@ pub struct RosterFriend {
     pub nickname: Option<String>,
     pub remark: Option<String>,
     pub avatar_url: Option<String>,
+    pub sex: Option<i32>,
 }
 
 /// roster 拉取结果：友列表 + 是否仍在同步（cache 空 {} 未就绪）。
@@ -531,6 +532,7 @@ fn parse_roster_items(result: &serde_json::Value) -> Vec<RosterFriend> {
                     nickname: None,
                     remark: None,
                     avatar_url: None,
+                    sex: None,
                 });
             }
             // 对象元素：从命名键提取（防御其它形态）。
@@ -542,8 +544,9 @@ fn parse_roster_items(result: &serde_json::Value) -> Vec<RosterFriend> {
                 remark: first_str(obj, &["remark", "Remark", "conRemark"]),
                 avatar_url: first_str(
                     obj,
-                    &["bigHeadImg", "smallHeadImg", "headImgUrl", "avatarUrl", "headimgurl"],
+                    &["bigHeadImgUrl", "smallHeadImgUrl", "bigHeadImg", "smallHeadImg", "headImgUrl", "avatarUrl", "headimgurl"],
                 ),
+                sex: obj.get("sex").and_then(|v| v.as_i64()).map(|n| n as i32),
             })
         })
         .collect()
@@ -816,6 +819,29 @@ mod roster_parse_tests {
         assert_eq!(out[0].wxid, "wxid_str");
         assert_eq!(out[1].wxid, "wxid_obj");
         assert_eq!(out[1].nickname.as_deref(), Some("对象好友"));
+    }
+
+    #[test]
+    fn parses_contacts_fetch_full_envelope_with_rich_fields() {
+        // contacts_fetch_full 真实形态（2026-07-09 117 亲验）：顶层 items 数组，
+        // 单条带 userName(=wxid)/nickName/bigHeadImgUrl/sex。
+        let v = serde_json::json!({
+            "status": "ready",
+            "count": 2,
+            "refreshing": true,
+            "items": [
+                { "userName": "wxid_full1", "nickName": "富化好友", "remark": "客户", "bigHeadImgUrl": "http://img/big", "sex": 1 },
+                { "userName": "wxid_full2", "nickName": "无头像", "smallHeadImgUrl": "http://img/small", "sex": 2 }
+            ]
+        });
+        let out = parse_roster_items(&v);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].wxid, "wxid_full1");
+        assert_eq!(out[0].nickname.as_deref(), Some("富化好友"));
+        assert_eq!(out[0].avatar_url.as_deref(), Some("http://img/big"), "bigHeadImgUrl 必须命中");
+        assert_eq!(out[0].sex, Some(1));
+        assert_eq!(out[1].avatar_url.as_deref(), Some("http://img/small"), "smallHeadImgUrl 回退命中");
+        assert_eq!(out[1].sex, Some(2));
     }
 }
 
