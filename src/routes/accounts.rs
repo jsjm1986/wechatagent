@@ -113,6 +113,7 @@ pub async fn sync_accounts(
             avatar_url: None,
             mcp_base_url: Some(state.config.mcp_base_url.clone()),
             mcp_api_key: Some(state.config.mcp_api_key.clone()),
+            webhook_secret: None,
             online: item
                 .get("online")
                 .and_then(|v| v.as_bool())

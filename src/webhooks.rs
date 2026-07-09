@@ -289,37 +289,16 @@ pub async fn wechat_webhook(
     headers: HeaderMap,
     body: Bytes,
 ) -> AppResult<Json<Value>> {
-    // P0-E：HMAC 签名校验。MCP（GeWe）侧约定按 `MCP_API_KEY` 作 HMAC-SHA256
-    // 签 raw body，hex 写到 header `X-MCP-Signature`。env `WEBHOOK_VERIFY_SIGNATURE`
-    // 可临时关停（默认开），仅用于灰度切换 + 联调，不应该在生产长期 false。
-    if state.config.webhook_verify_signature {
-        let provided = headers
-            .get("x-mcp-signature")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        if !verify_hmac_sha256(state.config.mcp_api_key.as_bytes(), &body, provided) {
-            tracing::warn!(
-                "webhook rejected: bad signature (provided_len={}, body_len={})",
-                provided.len(),
-                body.len()
-            );
-            return Err(AppError::BadRequest("invalid signature".into()));
-        }
-    }
-
+    // 方案 B 验签在下方「解析 appId、查到账号密钥之后」进行（fail-closed 全路径验签），
+    // 见 resolve_account_context 之后的 webhook_verify_signature 块。此处仅解析 body。
     let payload: Value = serde_json::from_slice(&body)
         .map_err(|e| AppError::BadRequest(format!("invalid json body: {}", e)))?;
 
-    // P2：先处理 GeWe 控制事件（在解析 appId / 进限流之前）。控制事件不喂 Agent，
-    // 立刻 200 返回，避免占用 per-account 限流配额，也保证 MCP 那边 5s timeout
-    // 内一定收到 ack。
-    //
-    // 三类 short-circuit：
-    // (a) `testMsg` 探活：GeWe 控制台「测试回调」按钮使用，直接 ack。
-    // (b) `TypeName=Offline/Online`：账号在线状态事件，落库 `online` 建状态源后 ack
-    //     （供 outbox dispatcher 发送前 gate，掉线 defer 不盲发）。
-    // (c) MCP envelope `_mcp.event` 非 wechat.message.created 的事件（如未来扩展），
-    //     谨慎放行：除显式消息事件外一律 ack ignored。
+    // GeWe 控制事件不喂 Agent，立刻 200 返回，保证 MCP 那边 5s timeout 内收到 ack。
+    // 方案 B（fail-closed）下按「是否产生副作用」分两处放置：
+    // (a) `testMsg` 探活无副作用 → 留在验签门之前直接 ack（GeWe 控制台「测试回调」按钮用）。
+    // (b) `TypeName=Offline/Online` 落库 `online`（供 outbox dispatcher 发送前 gate，掉线
+    //     defer 不盲发）有副作用 → 下沉到验签门之后（见 resolve_account_context 之后）。
     if let Some(test_msg) = find_string(&payload, &["testMsg", "TestMsg"]) {
         return Ok(Json(serde_json::json!({
             "ok": true,
@@ -327,17 +306,60 @@ pub async fn wechat_webhook(
             "echo": test_msg
         })));
     }
-    // (b) `TypeName=Offline`：账号离线事件。落库 `online=false` 建状态源（供 outbox
-    //     dispatcher 发送前 gate 判断，掉线时 defer 不盲发），然后直接 ack。此前直接
-    //     丢弃 → online 字段长期陈旧、掉线期间盲发。上线事件（Online）对称落 true。
+
+    // P2：MCP（GeWe-agent）转发的 payload 是 GeWe 原始 body 直接透传 + 顶层加
+     // 一个 `_mcp` envelope（tenantId/accountId/sourceMsgId 等）。GeWe 字段一般是
+     // 大写驼峰（`Appid` / `Wxid` / `FromUserName` / `Content` / `MsgId` / `NewMsgId`
+     // / `TypeName` / `ToUserName`），少量小写驼峰（`appId` / `fromWxid`），所以
+     // find_string 的 keys 必须同时覆盖两种风格。`_mcp.appId` 也算一份兜底。
+    let app_id = find_string(
+        &payload,
+        &["appId", "app_id", "appid", "Appid", "AppId", "APPID"],
+    );
+    let (workspace_id, account_id, webhook_secret) =
+        match resolve_account_context(&state, app_id.as_deref()).await {
+            Ok(triple) => triple,
+            Err(AppError::BadRequest(msg)) => {
+                // P1：未知 appId 不再静默回退到 default account_id；写一条 admin-visible
+                // 事件后明确 400，让运维侧能看到「webhook 入站但无对应 account」。
+                let _ = emit_unknown_app_id_event(&state, app_id.as_deref()).await;
+                return Err(AppError::BadRequest(msg));
+            }
+            Err(other) => return Err(other),
+        };
+
+    // 方案 B 验签门（fail-closed）：签名开关打开时，任何副作用之前必须验签通过。
+    // 校验 gewe-agent 每账号 x-webhook-signature + x-webhook-timestamp 时效。
+    if state.config.webhook_verify_signature {
+        let now_ms = DateTime::now().timestamp_millis();
+        if let Err(reason) = verify_webhook_signature(
+            webhook_secret.as_deref(),
+            headers
+                .get("x-webhook-timestamp")
+                .and_then(|v| v.to_str().ok()),
+            headers
+                .get("x-webhook-signature")
+                .and_then(|v| v.to_str().ok()),
+            &body,
+            now_ms,
+            state.config.webhook_timestamp_skew_seconds,
+        ) {
+            tracing::warn!(
+                ?reason,
+                account_id = %account_id,
+                body_len = body.len(),
+                "webhook rejected: signature verification failed"
+            );
+            return Err(AppError::BadRequest("invalid signature".into()));
+        }
+    }
+
+    // (b) `TypeName=Offline/Online`：账号在线状态事件，落库 `online` 建状态源（供 outbox
+    //     dispatcher 发送前 gate，掉线 defer 不盲发）。写 online 有副作用，必须在验签门之后。
     if let Some(type_name) = find_string(&payload, &["TypeName", "typeName"]) {
         let lower = type_name.to_ascii_lowercase();
         if lower == "offline" || lower == "online" {
             let online = lower == "online";
-            let app_id = find_string(
-                &payload,
-                &["appId", "app_id", "appid", "Appid", "AppId", "APPID"],
-            );
             if let Some(app_id) = app_id.as_deref() {
                 // fail-soft：状态落库失败不应让 MCP 侧收不到 ack（会触发重推）。
                 let res = state
@@ -360,27 +382,6 @@ pub async fn wechat_webhook(
             })));
         }
     }
-
-    // P2：MCP（GeWe-agent）转发的 payload 是 GeWe 原始 body 直接透传 + 顶层加
-     // 一个 `_mcp` envelope（tenantId/accountId/sourceMsgId 等）。GeWe 字段一般是
-     // 大写驼峰（`Appid` / `Wxid` / `FromUserName` / `Content` / `MsgId` / `NewMsgId`
-     // / `TypeName` / `ToUserName`），少量小写驼峰（`appId` / `fromWxid`），所以
-     // find_string 的 keys 必须同时覆盖两种风格。`_mcp.appId` 也算一份兜底。
-    let app_id = find_string(
-        &payload,
-        &["appId", "app_id", "appid", "Appid", "AppId", "APPID"],
-    );
-    let (workspace_id, account_id) =
-        match resolve_account_context(&state, app_id.as_deref()).await {
-            Ok(pair) => pair,
-            Err(AppError::BadRequest(msg)) => {
-                // P1：未知 appId 不再静默回退到 default account_id；写一条 admin-visible
-                // 事件后明确 400，让运维侧能看到「webhook 入站但无对应 account」。
-                let _ = emit_unknown_app_id_event(&state, app_id.as_deref()).await;
-                return Err(AppError::BadRequest(msg));
-            }
-            Err(other) => return Err(other),
-        };
 
     // LP-14 / Task 20：per-account_id 限流；超额返回 429。
     let limiter = limiter_for(
@@ -972,7 +973,7 @@ fn extract_inbound_media_ref(payload: &Value, msg_type: &str) -> Option<String> 
 async fn resolve_account_context(
     state: &AppState,
     app_id: Option<&str>,
-) -> AppResult<(String, String)> {
+) -> AppResult<(String, String, Option<String>)> {
     if let Some(app_id) = app_id {
         if let Some(account) = state
             .db
@@ -980,7 +981,8 @@ async fn resolve_account_context(
             .find_one(doc! { "app_id": app_id }, None)
             .await?
         {
-            return Ok((account.workspace_id, account.account_id));
+            // 第三元 = 该账号 webhook_secret，供方案 B 验签门使用。
+            return Ok((account.workspace_id, account.account_id, account.webhook_secret));
         }
         // P1：appId 提供了但 wechat_accounts 没匹配 —— 之前会静默回退到
         // default_account_id，导致 inbound 落到错的 account 下，managed contact
@@ -992,6 +994,7 @@ async fn resolve_account_context(
     Ok((
         state.config.default_workspace_id.clone(),
         state.config.default_account_id.clone(),
+        None,
     ))
 }
 
@@ -1155,28 +1158,6 @@ async fn maybe_emit_rate_limit_event(state: &AppState, account_id: &str) -> AppR
         Err(error) if is_duplicate_key_error(&error) => Ok(()),
         Err(error) => Err(error.into()),
     }
-}
-
-/// P0-E：HMAC-SHA256(body, MCP_API_KEY) 常时间比对。
-///
-/// `provided_hex` 是 header `X-MCP-Signature` 的 hex 字符串（大小写不敏感）。
-/// 任一为空 / hex 解码失败 / 长度不匹配 → 直接 false（不泄露具体原因）。
-/// 用 [`hmac::Mac::verify_slice`] 做常时间比对，避免 timing attack。
-fn verify_hmac_sha256(key: &[u8], body: &[u8], provided_hex: &str) -> bool {
-    if provided_hex.is_empty() || key.is_empty() {
-        return false;
-    }
-    let expected_bytes = match hex::decode(provided_hex.trim()) {
-        Ok(b) => b,
-        Err(_) => return false,
-    };
-    type HmacSha256 = Hmac<Sha256>;
-    let mut mac = match HmacSha256::new_from_slice(key) {
-        Ok(m) => m,
-        Err(_) => return false,
-    };
-    mac.update(body);
-    mac.verify_slice(&expected_bytes).is_ok()
 }
 
 #[cfg(test)]
@@ -1355,64 +1336,6 @@ mod inbound_msg_type_tests {
         assert_eq!(gewe_data_string(&payload, "Content"), None);
         assert_eq!(find_string(&payload, &["fromWxid"]).as_deref(), Some("wx_flat"));
         assert_eq!(find_string(&payload, &["content"]).as_deref(), Some("hello flat"));
-    }
-}
-
-#[cfg(test)]
-mod hmac_tests {
-    use super::*;
-
-    fn sign(key: &[u8], body: &[u8]) -> String {
-        type HmacSha256 = Hmac<Sha256>;
-        let mut mac = HmacSha256::new_from_slice(key).unwrap();
-        mac.update(body);
-        hex::encode(mac.finalize().into_bytes())
-    }
-
-    #[test]
-    fn verify_accepts_correct_signature() {
-        let key = b"secret_key";
-        let body = b"{\"appId\":\"a\"}";
-        let sig = sign(key, body);
-        assert!(verify_hmac_sha256(key, body, &sig));
-    }
-
-    #[test]
-    fn verify_accepts_uppercase_hex() {
-        let key = b"secret_key";
-        let body = b"x";
-        let sig = sign(key, body).to_uppercase();
-        assert!(verify_hmac_sha256(key, body, &sig));
-    }
-
-    #[test]
-    fn verify_rejects_wrong_signature() {
-        let key = b"secret_key";
-        let body = b"x";
-        let bad = "0".repeat(64);
-        assert!(!verify_hmac_sha256(key, body, &bad));
-    }
-
-    #[test]
-    fn verify_rejects_tampered_body() {
-        let key = b"secret_key";
-        let sig = sign(key, b"original");
-        assert!(!verify_hmac_sha256(key, b"tampered", &sig));
-    }
-
-    #[test]
-    fn verify_rejects_empty_signature() {
-        assert!(!verify_hmac_sha256(b"k", b"x", ""));
-    }
-
-    #[test]
-    fn verify_rejects_non_hex() {
-        assert!(!verify_hmac_sha256(b"k", b"x", "not-a-hex-string!"));
-    }
-
-    #[test]
-    fn verify_rejects_empty_key() {
-        assert!(!verify_hmac_sha256(b"", b"x", &"00".repeat(32)));
     }
 }
 
@@ -1701,5 +1624,197 @@ mod rate_limit_dedupe_tests {
         let a = rate_limit_event_dedupe_key("acct_a", 19_876);
         let b = rate_limit_event_dedupe_key("acct_b", 19_876);
         assert_ne!(a, b);
+    }
+}
+
+/// 方案 B：校验 gewe-agent 每账号签名 + 时间戳时效（纯函数，便于单测）。
+///
+/// gewe-agent 侧签名内容 = `"<timestamp_header.trim()>." + raw_body`，
+/// HMAC-SHA256(每 slot 明文 messageWebhookSecret)，hex 写到
+/// `x-webhook-signature: sha256=<hex>`，配套 `x-webhook-timestamp`（毫秒）。
+/// 全部通过返回 Ok；否则返回具体拒绝原因（handler 统一转 400 + 脱敏 warn 日志）。
+/// `secret=None`/空 → SecretNotConfigured（验签开关打开时的 fail-closed 语义）。
+#[derive(Debug, PartialEq, Eq)]
+enum WebhookSigError {
+    SecretNotConfigured,
+    MissingSignature,
+    MissingTimestamp,
+    BadTimestamp,
+    TimestampOutOfWindow,
+    BadSignatureFormat,
+    Mismatch,
+}
+
+fn verify_webhook_signature(
+    secret: Option<&str>,
+    timestamp_header: Option<&str>,
+    signature_header: Option<&str>,
+    body: &[u8],
+    now_ms: i64,
+    skew_seconds: i64,
+) -> Result<(), WebhookSigError> {
+    let secret = secret
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or(WebhookSigError::SecretNotConfigured)?;
+    let sig = signature_header
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or(WebhookSigError::MissingSignature)?;
+    let ts_str = timestamp_header
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or(WebhookSigError::MissingTimestamp)?;
+    let ts_ms: i64 = ts_str.parse().map_err(|_| WebhookSigError::BadTimestamp)?;
+    if (now_ms - ts_ms).abs() > skew_seconds.saturating_mul(1000) {
+        return Err(WebhookSigError::TimestampOutOfWindow);
+    }
+    let hex_part = sig.strip_prefix("sha256=").unwrap_or(sig);
+    let expected = hex::decode(hex_part).map_err(|_| WebhookSigError::BadSignatureFormat)?;
+    type HmacSha256 = Hmac<Sha256>;
+    let mut mac =
+        HmacSha256::new_from_slice(secret.as_bytes()).map_err(|_| WebhookSigError::SecretNotConfigured)?;
+    // 与 gewe-agent 一致：先喂 "<ts>." 再喂 raw body。
+    mac.update(ts_str.as_bytes());
+    mac.update(b".");
+    mac.update(body);
+    mac.verify_slice(&expected).map_err(|_| WebhookSigError::Mismatch)
+}
+
+#[cfg(test)]
+mod webhook_sig_tests {
+    use super::*;
+
+    // 与 gewe-agent webhook-signing.ts 逐字节对齐的金标：
+    // HMAC-SHA256(secret="test-secret", "<ts>." + body) hex。
+    const SECRET: &str = "test-secret";
+    const TS: &str = "1720500000000";
+    const BODY: &[u8] = b"{\"foo\":\"bar\"}";
+    // python: hmac.new(b"test-secret", b"1720500000000." + BODY, sha256).hexdigest()
+    const GOLDEN_HEX: &str = "1936755de0397e2cc912ab1652aaeccb278cae4bb489f16f0dbe3173a8057cbe";
+    const NOW_MS: i64 = 1_720_500_000_000; // 与 TS 相等 → 偏差 0
+    const SKEW: i64 = 300;
+
+    fn header() -> String {
+        format!("sha256={GOLDEN_HEX}")
+    }
+
+    #[test]
+    fn accepts_correct_signature_within_window() {
+        assert_eq!(
+            verify_webhook_signature(Some(SECRET), Some(TS), Some(&header()), BODY, NOW_MS, SKEW),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn accepts_signature_without_sha256_prefix() {
+        assert_eq!(
+            verify_webhook_signature(Some(SECRET), Some(TS), Some(GOLDEN_HEX), BODY, NOW_MS, SKEW),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn accepts_uppercase_hex() {
+        let h = format!("sha256={}", GOLDEN_HEX.to_uppercase());
+        assert_eq!(
+            verify_webhook_signature(Some(SECRET), Some(TS), Some(&h), BODY, NOW_MS, SKEW),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn rejects_tampered_body() {
+        assert_eq!(
+            verify_webhook_signature(Some(SECRET), Some(TS), Some(&header()), b"{\"foo\":\"BAR\"}", NOW_MS, SKEW),
+            Err(WebhookSigError::Mismatch)
+        );
+    }
+
+    #[test]
+    fn rejects_wrong_secret() {
+        assert_eq!(
+            verify_webhook_signature(Some("other-secret"), Some(TS), Some(&header()), BODY, NOW_MS, SKEW),
+            Err(WebhookSigError::Mismatch)
+        );
+    }
+
+    #[test]
+    fn rejects_timestamp_out_of_window_future() {
+        // now 比 ts 早 301s（ts 在未来 301s）→ 超窗
+        let now = NOW_MS - 301_000;
+        assert_eq!(
+            verify_webhook_signature(Some(SECRET), Some(TS), Some(&header()), BODY, now, SKEW),
+            Err(WebhookSigError::TimestampOutOfWindow)
+        );
+    }
+
+    #[test]
+    fn rejects_timestamp_out_of_window_past() {
+        // now 比 ts 晚 301s → 超窗
+        let now = NOW_MS + 301_000;
+        assert_eq!(
+            verify_webhook_signature(Some(SECRET), Some(TS), Some(&header()), BODY, now, SKEW),
+            Err(WebhookSigError::TimestampOutOfWindow)
+        );
+    }
+
+    #[test]
+    fn accepts_timestamp_at_window_edge() {
+        // 恰好 300s → 不超窗（用 <= 边界语义）
+        let now = NOW_MS + 300_000;
+        assert_eq!(
+            verify_webhook_signature(Some(SECRET), Some(TS), Some(&header()), BODY, now, SKEW),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn rejects_missing_signature() {
+        assert_eq!(
+            verify_webhook_signature(Some(SECRET), Some(TS), None, BODY, NOW_MS, SKEW),
+            Err(WebhookSigError::MissingSignature)
+        );
+        assert_eq!(
+            verify_webhook_signature(Some(SECRET), Some(TS), Some("  "), BODY, NOW_MS, SKEW),
+            Err(WebhookSigError::MissingSignature)
+        );
+    }
+
+    #[test]
+    fn rejects_missing_timestamp() {
+        assert_eq!(
+            verify_webhook_signature(Some(SECRET), None, Some(&header()), BODY, NOW_MS, SKEW),
+            Err(WebhookSigError::MissingTimestamp)
+        );
+    }
+
+    #[test]
+    fn rejects_bad_timestamp() {
+        assert_eq!(
+            verify_webhook_signature(Some(SECRET), Some("not-a-number"), Some(&header()), BODY, NOW_MS, SKEW),
+            Err(WebhookSigError::BadTimestamp)
+        );
+    }
+
+    #[test]
+    fn rejects_bad_signature_format() {
+        assert_eq!(
+            verify_webhook_signature(Some(SECRET), Some(TS), Some("sha256=not-hex!!"), BODY, NOW_MS, SKEW),
+            Err(WebhookSigError::BadSignatureFormat)
+        );
+    }
+
+    #[test]
+    fn rejects_secret_not_configured() {
+        assert_eq!(
+            verify_webhook_signature(None, Some(TS), Some(&header()), BODY, NOW_MS, SKEW),
+            Err(WebhookSigError::SecretNotConfigured)
+        );
+        assert_eq!(
+            verify_webhook_signature(Some("  "), Some(TS), Some(&header()), BODY, NOW_MS, SKEW),
+            Err(WebhookSigError::SecretNotConfigured)
+        );
     }
 }
