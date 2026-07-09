@@ -579,11 +579,10 @@ pub async fn fetch_roster_for_account(
     state: &AppState,
     account_id: &str,
 ) -> AppResult<RosterFetchOutcome> {
-    // contacts_fetch_cache 是全量好友工具（gewe "Fetch the full remote contacts cache
-    // from GeWe"，无参）；account_alias 由 logged_call_for_account 自动注入。
-    // GeWe 缓存异步就绪：未就绪时返回 {}（空），就绪返回 {result:{friends:[wxid]}}。
-    // 空 {} 时同一请求内短重试（间隔 2s、最多 3 次），仍空则返回 syncing=true 让
-    // 前端提示「同步中」并自动重拉。重试复用同一 MCP session，间隔足够避免自撞 429。
+    // contacts_fetch_full 是全量好友工具（返回昵称/头像/性别等富化字段，无参）；
+    // account_alias 由 logged_call_for_account 自动注入。就绪信号是返回体 status=="ready"
+    // （亲验：ready 时带全量 items，refreshing:true 是后台刷新标志、非未就绪）。未就绪时
+    // 同一请求内短重试（间隔 2s、最多 3 次），仍未就绪则 syncing=true 让前端提示「同步中」。
     const MAX_RETRIES: usize = 3;
     const RETRY_INTERVAL_SECS: u64 = 2;
     let mut last_result = serde_json::Value::Null;
@@ -591,7 +590,7 @@ pub async fn fetch_roster_for_account(
         last_result = logged_call_for_account(
             state,
             account_id,
-            "contacts_fetch_cache",
+            "contacts_fetch_full",
             serde_json::json!({}),
         )
         .await?;
@@ -600,12 +599,12 @@ pub async fn fetch_roster_for_account(
         if !outcome.syncing {
             return Ok(outcome);
         }
-        // 空 cache：还有重试机会则等待后重试（最后一次不等）。
+        // 未就绪：还有重试机会则等待后重试（最后一次不等）。
         if attempt + 1 < MAX_RETRIES {
             tokio::time::sleep(std::time::Duration::from_secs(RETRY_INTERVAL_SECS)).await;
         }
     }
-    // 重试用尽仍空 → syncing:true（friends 为空）。
+    // 重试用尽仍未就绪 → syncing:true（friends 为空）。
     Ok(roster_outcome_from_result(&last_result))
 }
 
