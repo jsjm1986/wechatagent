@@ -876,6 +876,17 @@ fn gewe_data_string(payload: &Value, field: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// 从 GeWe AddMsg 的 `Data.MsgType.low` 取微信消息类型数字码(`{low:N}` 包裹)。
+/// 返回数字的字符串形式(交 classify_inbound_msg_type 归一)。取不到返回 None。
+fn gewe_data_msg_type_code(payload: &Value) -> Option<String> {
+    payload
+        .get("Data")
+        .and_then(|d| d.get("MsgType"))
+        .and_then(|m| m.get("low"))
+        .and_then(|n| n.as_i64())
+        .map(|n| n.to_string())
+}
+
 /// F1 评审 I1：从入站 payload 解析归一化的消息类型。候选键**仅限“消息类型”语义
 /// 专用键**——GeWe 大写驼峰 `MsgType`（微信数字码真实字段）+ 手工/自测 payload 的
 /// 小写别名 `msgType`/`msg_type`。**刻意不收泛化裸键 `type`/`Type`**：`find_string`
@@ -887,7 +898,8 @@ fn gewe_data_string(payload: &Value, field: &str) -> Option<String> {
 /// payload 无任何类型字段时默认 `"text"`（runbook W1-W3 等纯文本自测 payload 不带
 /// 类型字段，行为不变）；有则交给 `classify_inbound_msg_type` 归一（未知码 → `"unknown"`）。
 fn parse_inbound_msg_type(payload: &Value) -> &'static str {
-    let raw_msg_type = find_string(payload, &["msgType", "msg_type", "MsgType"]);
+    let raw_msg_type = gewe_data_msg_type_code(payload)
+        .or_else(|| find_string(payload, &["msgType", "msg_type", "MsgType"]));
     match raw_msg_type.as_deref() {
         Some(raw_type) => classify_inbound_msg_type(raw_type),
         None => "text",
@@ -1268,6 +1280,24 @@ mod inbound_msg_type_tests {
             "content": "我想了解一下你们的产品",
         });
         assert_eq!(parse_inbound_msg_type(&payload), "text");
+    }
+
+    #[test]
+    fn gewe_addmsg_extracts_msg_type_from_data_low() {
+        // MsgType.low=3 → image。
+        let payload = json!({
+            "TypeName": "AddMsg",
+            "Data": {
+                "FromUserName": { "string": "wxid_x" },
+                "Content": { "string": "x" },
+                "MsgType": { "low": 3 }
+            }
+        });
+        assert_eq!(gewe_data_msg_type_code(&payload).as_deref(), Some("3"));
+        assert_eq!(parse_inbound_msg_type(&payload), "image");
+        // MsgType.low=1 → text(真实文本入站)。
+        let text_payload = json!({ "Data": { "MsgType": { "low": 1 } } });
+        assert_eq!(parse_inbound_msg_type(&text_payload), "text");
     }
 
     fn real_gewe_addmsg() -> serde_json::Value {
