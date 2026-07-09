@@ -74,11 +74,10 @@ pub(crate) async fn generate_holding_reply(
 ) -> String {
     let fallback = scene_fallback_text(scene).to_string();
     // 独立小预算：仅够一次短文案生成，与主 run 隔离。
-    // TODO(Task 4)：3000i64 字面量待替换为 state.config.holding_reply_token_budget。
     let run_id = format!("holding-{}", uuid::Uuid::new_v4());
     let side_budget = Arc::new(RunBudget::new(
         run_id.clone(),
-        3000i64,
+        state.config.holding_reply_token_budget,
         1, // 至多一次 LLM 调用
         0, // 不用工具
     ));
