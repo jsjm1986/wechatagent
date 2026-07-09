@@ -38,7 +38,11 @@ export function RosterView() {
   const playbooks = useUserOpsStore((s) => s.playbooks);
   const toast = useToast();
 
-  const [roster, setRoster] = useState<RosterEntry[]>([]);
+  const rosterCache = useUserOpsStore((s) => s.rosterCache);
+  const cached = rosterCache[effectiveAccountId];
+  const roster = cached?.items ?? [];
+  // syncing 是瞬态、不入缓存（store 仅缓存就绪结果，syncing:true 从不落缓存以允许自动重拉覆盖），
+  // 故不能从 rosterCache 派生——保留本地 state，由 refresh 的返回值驱动。roster 仍从缓存派生以跨挂载存活。
   const [syncing, setSyncing] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -53,7 +57,7 @@ export function RosterView() {
   const reqSeqRef = useRef(0);
 
   const refresh = useCallback(
-    async (accountId: string) => {
+    async (accountId: string, opts?: { force?: boolean }) => {
       if (!accountId) return;
       const seq = ++reqSeqRef.current;
       const isStale = () => seq !== reqSeqRef.current;
@@ -64,9 +68,9 @@ export function RosterView() {
       setSharedNote("");
       setPlaybookId("");
       try {
-        const { items, syncing: isSyncing } = await loadRoster(accountId);
+        const { syncing: isSyncing } = await loadRoster(accountId, opts);
         if (isStale()) return; // 已有更新的请求发出，丢弃本次过时结果。
-        setRoster(items);
+        // roster 现从 store 缓存派生（跨挂载存活）；syncing 瞬态不入缓存，仍在此驱动自动重拉 effect。
         setSyncing(isSyncing);
       } catch (e) {
         if (isStale()) return;
@@ -87,7 +91,7 @@ export function RosterView() {
   useEffect(() => {
     if (!syncing || !effectiveAccountId) return;
     const timer = setInterval(() => {
-      void refresh(effectiveAccountId);
+      void refresh(effectiveAccountId, { force: true });
     }, 8000);
     return () => clearInterval(timer);
   }, [syncing, effectiveAccountId, refresh]);
@@ -100,7 +104,11 @@ export function RosterView() {
     );
   }, [roster, filter]);
 
-  const { pageRows, pageCount, safePage, setPage } = usePagedList(filtered);
+  const humanRows = useMemo(() => filtered.filter((r) => !r.isNonHuman), [filtered]);
+  const nonHumanRows = useMemo(() => filtered.filter((r) => r.isNonHuman), [filtered]);
+  const [showNonHuman, setShowNonHuman] = useState(false);
+
+  const { pageRows, pageCount, safePage, setPage } = usePagedList(humanRows);
 
   const toggle = (entry: RosterEntry) => {
     if (entry.agentStatus === "managed") return; // 已托管不可重复勾选
@@ -135,7 +143,7 @@ export function RosterView() {
       toast.success(`已加入 ${res.enabled} 人，画像后台生成中`);
       setSharedNote("");
       setPlaybookId("");
-      await refresh(effectiveAccountId);
+      await refresh(effectiveAccountId, { force: true });
     } catch (e) {
       setError(e instanceof Error ? e.message : "批量加入运营失败");
     } finally {
@@ -177,7 +185,7 @@ export function RosterView() {
           <button
             type="button"
             className={styles.ghostBtn}
-            onClick={() => void refresh(effectiveAccountId)}
+            onClick={() => void refresh(effectiveAccountId, { force: true })}
             disabled={loading || !effectiveAccountId}
           >
             <RefreshCw size={14} className={loading ? styles.spin : ""} />
@@ -198,7 +206,7 @@ export function RosterView() {
 
       {loading && !syncing ? (
         <div className={styles.loading}>加载中…</div>
-      ) : filtered.length === 0 ? (
+      ) : humanRows.length === 0 && nonHumanRows.length === 0 ? (
         <div className={styles.empty}>
           <Users size={22} />
           {syncing ? (
@@ -253,6 +261,44 @@ export function RosterView() {
             </div>
           )}
         </>
+      )}
+
+      {nonHumanRows.length > 0 && (
+        <div className={styles.nonHumanSection}>
+          <button type="button" className={styles.nonHumanToggle} onClick={() => setShowNonHuman((v) => !v)}>
+            含 {nonHumanRows.length} 个系统账号（{showNonHuman ? "收起" : "展开"}）
+          </button>
+          {showNonHuman && (
+            <div className={styles.grid}>
+              {nonHumanRows.map((entry) => {
+                const checked = selectedWxids.has(entry.wxid);
+                const managed = entry.agentStatus === "managed";
+                return (
+                  <button
+                    key={entry.wxid}
+                    type="button"
+                    className={`${styles.card} ${checked ? styles.cardChecked : ""} ${managed ? styles.cardManaged : ""}`}
+                    onClick={() => toggle(entry)}
+                    disabled={managed}
+                  >
+                    <div className={styles.checkbox}>{checked && <Check size={13} />}</div>
+                    {entry.avatarUrl ? (
+                      <img className={styles.avatar} src={entry.avatarUrl} alt="" loading="lazy" />
+                    ) : (
+                      <span className={styles.avatarFallback}>{initial(entry)}</span>
+                    )}
+                    <div className={styles.cardBody}>
+                      <strong className={styles.name}>{entry.remark || entry.nickname || entry.wxid}</strong>
+                      <small className={styles.sub}>{entry.wxid}</small>
+                      <small className={styles.sysTag}>系统账号</small>
+                    </div>
+                    {statusBadge(entry.agentStatus)}
+                  </button>
+                );
+              })}
+            </div>
+          )}
+        </div>
       )}
 
       {selectedWxids.size > 0 && (
