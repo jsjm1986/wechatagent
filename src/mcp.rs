@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 
 use crate::{
     error::{AppError, AppResult},
-    models::McpCallLog,
+    models::{McpCallLog, RosterSnapshot},
     routes::AppState,
 };
 
@@ -664,6 +664,88 @@ pub async fn fetch_roster_for_account(
     }
     // 重试用尽仍未就绪 → syncing:true（friends 为空）。
     Ok(roster_outcome_from_result(&last_result))
+}
+
+/// 读某账号的 roster 快照（无则 None）。
+pub async fn read_roster_snapshot(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+) -> AppResult<Option<RosterSnapshot>> {
+    let snap = state
+        .db
+        .roster_snapshots()
+        .find_one(
+            doc! { "workspace_id": workspace_id, "account_id": account_id },
+            None,
+        )
+        .await?;
+    Ok(snap)
+}
+
+/// 覆盖写某账号的 roster 快照（replace_one upsert，每账号恒一条）。
+pub async fn write_roster_snapshot(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+    friends: &[RosterFriend],
+) -> AppResult<()> {
+    let snap = RosterSnapshot {
+        id: None,
+        workspace_id: workspace_id.to_string(),
+        account_id: account_id.to_string(),
+        friends: friends.to_vec(),
+        total: friends.len() as i64,
+        fetched_at: DateTime::now(),
+    };
+    let options = mongodb::options::ReplaceOptions::builder()
+        .upsert(true)
+        .build();
+    state
+        .db
+        .roster_snapshots()
+        .replace_one(
+            doc! { "workspace_id": workspace_id, "account_id": account_id },
+            &snap,
+            options,
+        )
+        .await?;
+    Ok(())
+}
+
+/// 后台静默自刷某账号的 roster 快照：fire-and-forget，不阻塞请求。最多
+/// `ROSTER_REFRESH_MAX_RETRIES` 次调 `fetch_roster_for_account`，**任何错误
+/// （含 AppError::Http 解码失败）都退避重试**（区别于同步路径 Err(other) 直接上抛）。
+/// 拿到就绪结果即覆盖写快照；用尽仍未就绪仅 warn（下次进频道再触发）。best-effort，
+/// 不加锁/去重，重复 spawn 覆盖写同一条无害。
+pub fn spawn_roster_refresh(state: AppState, workspace_id: String, account_id: String) {
+    tokio::spawn(async move {
+        for attempt in 0..ROSTER_REFRESH_MAX_RETRIES {
+            match fetch_roster_for_account(&state, &account_id).await {
+                Ok(outcome) if !outcome.syncing => {
+                    if let Err(err) =
+                        write_roster_snapshot(&state, &workspace_id, &account_id, &outcome.friends)
+                            .await
+                    {
+                        tracing::warn!(?err, account_id = %account_id, "roster 快照写入失败");
+                    }
+                    return;
+                }
+                // 就绪但仍 syncing（空 cache）或出错：退避后重试。
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::warn!(?err, account_id = %account_id, attempt, "roster 后台刷新单次失败,退避重试");
+                }
+            }
+            if attempt + 1 < ROSTER_REFRESH_MAX_RETRIES {
+                tokio::time::sleep(std::time::Duration::from_secs(
+                    roster_refresh_backoff_secs(attempt),
+                ))
+                .await;
+            }
+        }
+        tracing::warn!(account_id = %account_id, "roster 后台刷新用尽重试仍未就绪,放弃(下次进频道再触发)");
+    });
 }
 
 #[cfg(test)]
