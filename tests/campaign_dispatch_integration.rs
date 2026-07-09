@@ -36,6 +36,7 @@ fn make_contact(ws: &str, acc: &str, wxid: &str) -> Contact {
         remark: None,
         alias: None,
         avatar_url: None,
+        sex: None,
         agent_status: AgentStatus::Managed,
         human_profile_note: None,
         custom_agent_instructions: None,

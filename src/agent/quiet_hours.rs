@@ -282,6 +282,7 @@ mod tests {
             alias: None,
             avatar_url: None,
             agent_status: crate::models::AgentStatus::Managed,
+            sex: None,
             human_profile_note: None,
             agent_profile: None,
             memory_summary: None,
