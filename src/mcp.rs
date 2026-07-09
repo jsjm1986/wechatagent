@@ -604,6 +604,22 @@ fn roster_outcome_from_result(result: &serde_json::Value) -> RosterFetchOutcome 
     RosterFetchOutcome { friends, syncing }
 }
 
+/// 快照过期阈值：龄 > 24h 触发后台自刷（进频道仍先秒回旧快照）。
+const ROSTER_SNAPSHOT_STALE_HOURS: i64 = 24;
+/// 后台自刷/首次重试的最大尝试次数（连 http 解码失败也计入）。
+const ROSTER_REFRESH_MAX_RETRIES: usize = 5;
+
+/// 快照是否过期（龄 > ROSTER_SNAPSHOT_STALE_HOURS）。
+fn snapshot_is_stale(fetched_at: DateTime, now: DateTime) -> bool {
+    now.timestamp_millis() - fetched_at.timestamp_millis()
+        > ROSTER_SNAPSHOT_STALE_HOURS * 3600_000
+}
+
+/// 后台重试退避秒数：3 * 2^attempt（3/6/12/24/48…）。
+fn roster_refresh_backoff_secs(attempt: usize) -> u64 {
+    3u64 * 2u64.pow(attempt as u32)
+}
+
 pub async fn fetch_roster_for_account(
     state: &AppState,
     account_id: &str,
@@ -1103,6 +1119,31 @@ mod is_non_human_tests {
     fn public_account_not_misjudged() {
         // 公众号(福州晚报 wxid_8874178741811)无可靠字段识别 → 不误判为非真人。
         assert!(!is_non_human_account("wxid_8874178741811", Some("friend")));
+    }
+}
+
+#[cfg(test)]
+mod roster_snapshot_policy_tests {
+    use super::{roster_refresh_backoff_secs, snapshot_is_stale};
+    use mongodb::bson::DateTime;
+
+    #[test]
+    fn stale_after_24h() {
+        let base = 1_700_000_000_000i64; // ms
+        let now = DateTime::from_millis(base);
+        // 23h 前 → 未过期。
+        assert!(!snapshot_is_stale(DateTime::from_millis(base - 23 * 3600_000), now));
+        // 25h 前 → 过期。
+        assert!(snapshot_is_stale(DateTime::from_millis(base - 25 * 3600_000), now));
+    }
+
+    #[test]
+    fn backoff_is_exponential_3_to_48() {
+        assert_eq!(roster_refresh_backoff_secs(0), 3);
+        assert_eq!(roster_refresh_backoff_secs(1), 6);
+        assert_eq!(roster_refresh_backoff_secs(2), 12);
+        assert_eq!(roster_refresh_backoff_secs(3), 24);
+        assert_eq!(roster_refresh_backoff_secs(4), 48);
     }
 }
 
