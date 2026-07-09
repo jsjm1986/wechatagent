@@ -73,6 +73,10 @@ interface UserOpsState {
   operationDomains: OperationDomainConfig[];
   domainDrafts: Record<string, OperationDomainDraft>;
 
+  // 通讯录 roster 缓存（按 accountId 键控）：首次拉后缓存，进频道复用不重打 API；
+  // 仅就绪结果落缓存（syncing 中不缓存，允许自动重拉覆盖）。force 才重拉。
+  rosterCache: Record<string, { items: RosterEntry[]; syncing: boolean; fetchedAt: number }>;
+
   // 忙碌状态
   guideBusy: boolean;
   simulationBusy: boolean;
@@ -108,7 +112,7 @@ interface UserOpsActions {
   loadPlaybooks: (accountId: string) => Promise<void>;
   loadContacts: (accountId: string) => Promise<void>;
   importContacts: () => Promise<void>;
-  loadRoster: (accountId: string) => Promise<{ items: RosterEntry[]; syncing: boolean }>;
+  loadRoster: (accountId: string, opts?: { force?: boolean }) => Promise<{ items: RosterEntry[]; syncing: boolean }>;
   batchEnable: (payload: {
     accountId: string;
     candidates: { wxid: string; nickname?: string | null; remark?: string | null; avatarUrl?: string | null; sex?: number | null }[];
@@ -331,6 +335,8 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
   operationDomains: [],
   domainDrafts: {},
 
+  rosterCache: {},
+
   guideBusy: false,
   simulationBusy: false,
 
@@ -481,11 +487,22 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
   },
 
   // 通讯录：拉指定账号的全量好友（MCP）+ 本地 contacts 左连接标注 agentStatus。纯浏览，不写库。
-  loadRoster: async (accountId) => {
+  loadRoster: async (accountId, opts) => {
+    const cached = get().rosterCache[accountId];
+    if (!opts?.force && cached) {
+      return { items: cached.items, syncing: cached.syncing };
+    }
     const data = await api.get<{ items: RosterEntry[]; syncing?: boolean }>(
       `/api/contacts/roster?accountId=${encodeURIComponent(accountId)}`
     );
-    return { items: data.items, syncing: data.syncing ?? false };
+    const result = { items: data.items, syncing: data.syncing ?? false };
+    // 仅就绪结果落缓存；同步中(syncing)不缓存，避免卡在同步中态、允许自动重拉覆盖。
+    if (!result.syncing) {
+      set((s) => ({
+        rosterCache: { ...s.rosterCache, [accountId]: { ...result, fetchedAt: Date.now() } },
+      }));
+    }
+    return result;
   },
 
   // 批量托管：把勾选好友一次性置 managed + 共享运营备注，后端异步入队 initial_profile 生成画像。

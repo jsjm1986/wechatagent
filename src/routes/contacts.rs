@@ -407,6 +407,7 @@ pub(super) async fn roster_endpoint(
                 "remark": f.remark,
                 "avatarUrl": f.avatar_url,
                 "sex": f.sex,
+                "isNonHuman": f.is_non_human,
                 "agentStatus": agent_status,
             })
         })

@@ -116,3 +116,12 @@
   font-size: 13px;
   color: var(--ink-3);
 }
+
+.nonHumanSection { margin-top: 16px; }
+.nonHumanToggle {
+  width: 100%; padding: 10px; border: 1px dashed var(--line, #e5e5ea);
+  border-radius: var(--r-md, 8px); background: transparent;
+  color: var(--ink-3); font-size: 13px; cursor: pointer;
+}
+.nonHumanToggle:hover { background: var(--fill-2, #f5f5f7); }
+.sysTag { font-size: 11px; color: var(--ink-4, #b0b0b5); }

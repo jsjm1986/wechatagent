@@ -137,6 +137,7 @@ export type RosterEntry = {
   remark?: string | null;
   avatarUrl?: string | null;
   sex?: number | null;
+  isNonHuman?: boolean;
   agentStatus: "managed" | "normal" | "not_imported";
 };
 
