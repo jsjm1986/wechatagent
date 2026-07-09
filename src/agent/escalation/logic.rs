@@ -107,8 +107,6 @@ pub(crate) enum HoldingReplyScene {
     /// 闸门拦截后的客户回应保障占位（held/blocked/budget/revision_failed 等）。
     GateHold,
     /// 请示领导链尾失联，持续安抚。
-    // 生产构造点在 Task 6（C 类 scan_escalation_timeouts 链尾接入）落地，届时移除本 allow。
-    #[allow(dead_code)]
     ChainTail,
     /// relay 转述时领导授权已过期，中性收尾。
     ExpiredAuthorization,

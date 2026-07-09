@@ -194,13 +194,23 @@ pub(crate) async fn handle_principal_decision_relay(
             .await?;
         if let Some(contact) = contact {
             crate::agent::gateway::clear_awaiting_principal_state(state, &contact).await?;
+            // 授权已过期：substance 传 None（过期即不可用作事实源，AI 只发中性收尾、绝不复述过期数字，
+            // 语义同 relay_substance_if_usable 过期返 None）。保留裸 MCP 直发不变，仅换文案来源。
+            let holding_text = generate_holding_reply(
+                state,
+                &contact.account_id,
+                &contact.wxid,
+                HoldingReplyScene::ExpiredAuthorization,
+                None,
+            )
+            .await;
             let _ = mcp::logged_call_for_account(
                 state,
                 &contact.account_id,
                 "message_send_text",
                 serde_json::json!({
                     "recipient": &contact.wxid,
-                    "content": expired_authorization_neutral_reply()
+                    "content": holding_text
                 }),
             )
             .await;
@@ -383,13 +393,23 @@ pub async fn scan_escalation_timeouts(state: &AppState) -> AppResult<()> {
                         .last_holding_reply_ms
                         .map_or(true, |last| now_ms - last >= min_interval_ms);
                     if should_send {
+                        // 链尾纯安抚：还在核实、不涉及具体授权数字，substance 传 None。
+                        // 保留裸 MCP 直发（C 类不走 outbox）与 last_holding_reply_ms 去重不变，仅换文案来源。
+                        let holding_text = generate_holding_reply(
+                            state,
+                            &entry.account_id,
+                            &entry.contact_wxid,
+                            HoldingReplyScene::ChainTail,
+                            None,
+                        )
+                        .await;
                         let _ = mcp::logged_call_for_account(
                             state,
                             &entry.account_id,
                             "message_send_text",
                             serde_json::json!({
                                 "recipient": &entry.contact_wxid,
-                                "content": chain_tail_holding_reply()
+                                "content": holding_text
                             }),
                         )
                         .await;
