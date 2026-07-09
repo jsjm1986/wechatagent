@@ -425,6 +425,7 @@ pub struct RosterFriend {
     pub remark: Option<String>,
     pub avatar_url: Option<String>,
     pub sex: Option<i32>,
+    pub is_non_human: bool,
 }
 
 /// roster 拉取结果：友列表 + 是否仍在同步（cache 空 {} 未就绪）。
@@ -482,6 +483,19 @@ fn contact_like_array(obj: &serde_json::Map<String, serde_json::Value>) -> Optio
         }
     }
     None
+}
+
+/// 微信官方保留系统账号 wxid（业界通用白名单）——这些不是真人好友，
+/// 通讯录里标记为非真人（前端默认折叠）。公众号无可靠字段识别，不在此列。
+const WECHAT_SYSTEM_ACCOUNTS: &[&str] = &[
+    "fmessage", "qqmail", "weixin", "mphelper", "medianote",
+    "qmessage", "floatbottle", "tmessage", "qqsync", "newsapp",
+    "filehelper", "weibo", "brandsessionholder",
+];
+
+/// 判定是否非真人账号：type=="system" 或 wxid 命中微信保留白名单。
+fn is_non_human_account(user_name: &str, item_type: Option<&str>) -> bool {
+    item_type == Some("system") || WECHAT_SYSTEM_ACCOUNTS.contains(&user_name)
 }
 
 fn parse_roster_items(result: &serde_json::Value) -> Vec<RosterFriend> {
@@ -543,20 +557,25 @@ fn parse_roster_items(result: &serde_json::Value) -> Vec<RosterFriend> {
                     remark: None,
                     avatar_url: None,
                     sex: None,
+                    is_non_human: is_non_human_account(s, None),
                 });
             }
             // 对象元素：从命名键提取（防御其它形态）。
             let obj = item.as_object()?;
             let wxid = first_str(obj, &["wxid", "userName", "UserName", "username"])?;
             Some(RosterFriend {
-                wxid,
+                wxid: wxid.clone(),
                 nickname: first_str(obj, &["nickName", "nickname", "NickName"]),
                 remark: first_str(obj, &["remark", "Remark", "conRemark"]),
                 avatar_url: first_str(
                     obj,
                     &["bigHeadImgUrl", "smallHeadImgUrl", "bigHeadImg", "smallHeadImg", "headImgUrl", "avatarUrl", "headimgurl"],
                 ),
-                sex: obj.get("sex").and_then(|v| v.as_i64()).map(|n| n as i32),
+                sex: obj
+                    .get("sex")
+                    .and_then(|v| v.as_i64().or_else(|| v.get("low").and_then(|l| l.as_i64())))
+                    .map(|n| n as i32),
+                is_non_human: is_non_human_account(&wxid, obj.get("type").and_then(|v| v.as_str())),
             })
         })
         .collect()
@@ -876,6 +895,23 @@ mod roster_parse_tests {
         assert_eq!(out[1].avatar_url.as_deref(), Some("http://img/small"), "smallHeadImgUrl 回退命中");
         assert_eq!(out[1].sex, Some(2));
     }
+
+    #[test]
+    fn parses_sex_int64_object_form() {
+        // MCP contacts_fetch_full 真实形态：sex 是 int64 序列化对象 {high,low}，真值在 .low。
+        let v = serde_json::json!({
+            "status": "ready",
+            "items": [
+                { "userName": "wx_m", "nickName": "男", "sex": { "high": 0, "low": 1, "unsigned": false } },
+                { "userName": "wx_f", "nickName": "女", "sex": { "high": 0, "low": 2, "unsigned": false } },
+                { "userName": "wx_bare", "nickName": "裸整数", "sex": 1 }
+            ]
+        });
+        let out = parse_roster_items(&v);
+        assert_eq!(out[0].sex, Some(1), "对象 {{low:1}} → 男");
+        assert_eq!(out[1].sex, Some(2), "对象 {{low:2}} → 女");
+        assert_eq!(out[2].sex, Some(1), "裸整数 1 仍兼容");
+    }
 }
 
 #[cfg(test)]
@@ -1037,6 +1073,36 @@ mod mcp_http_classify_tests {
             classify_mcp_http_error(401, "MCP HTTP 401".into()),
             AppError::External(_)
         ));
+    }
+}
+
+#[cfg(test)]
+mod is_non_human_tests {
+    use super::is_non_human_account;
+
+    #[test]
+    fn system_type_is_non_human() {
+        assert!(is_non_human_account("weixin", Some("system")));
+    }
+
+    #[test]
+    fn whitelisted_wxid_is_non_human() {
+        assert!(is_non_human_account("fmessage", Some("friend")));
+        assert!(is_non_human_account("qqmail", None));
+        assert!(is_non_human_account("mphelper", Some("friend")));
+    }
+
+    #[test]
+    fn real_person_is_not_non_human() {
+        // 真人：新号 wxid_ / 老号自定义短 id —— 都不是非真人。
+        assert!(!is_non_human_account("wxid_42jvcxc49rbf12", Some("friend")));
+        assert!(!is_non_human_account("songboyu1993", Some("friend")));
+    }
+
+    #[test]
+    fn public_account_not_misjudged() {
+        // 公众号(福州晚报 wxid_8874178741811)无可靠字段识别 → 不误判为非真人。
+        assert!(!is_non_human_account("wxid_8874178741811", Some("friend")));
     }
 }
 
