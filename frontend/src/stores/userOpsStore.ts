@@ -111,7 +111,7 @@ interface UserOpsActions {
   loadRoster: (accountId: string) => Promise<{ items: RosterEntry[]; syncing: boolean }>;
   batchEnable: (payload: {
     accountId: string;
-    candidates: { wxid: string; nickname?: string | null; remark?: string | null; avatarUrl?: string | null }[];
+    candidates: { wxid: string; nickname?: string | null; remark?: string | null; avatarUrl?: string | null; sex?: number | null }[];
     sharedNote: string;
     playbookId?: string;
   }) => Promise<{ enabled: number; queued: number }>;

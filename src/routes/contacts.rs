@@ -406,6 +406,7 @@ pub(super) async fn roster_endpoint(
                 "nickname": f.nickname,
                 "remark": f.remark,
                 "avatarUrl": f.avatar_url,
+                "sex": f.sex,
                 "agentStatus": agent_status,
             })
         })
@@ -634,6 +635,9 @@ pub async fn batch_enable_endpoint(
         }
         if let Some(avatar_url) = &cand.avatar_url {
             set_doc.insert("avatar_url", avatar_url);
+        }
+        if let Some(sex) = cand.sex {
+            set_doc.insert("sex", sex);
         }
         // 全新联系人（未入库，或已入库但从未被 Agent 运营过）同步落状态机 initial 态。
         // 老客户（is_previously_operated）不碰 operation_state——保留其已积累的运营历史，
