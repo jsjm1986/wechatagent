@@ -1703,3 +1703,197 @@ mod rate_limit_dedupe_tests {
         assert_ne!(a, b);
     }
 }
+
+/// 方案 B：校验 gewe-agent 每账号签名 + 时间戳时效（纯函数，便于单测）。
+///
+/// gewe-agent 侧签名内容 = `"<timestamp_header.trim()>." + raw_body`，
+/// HMAC-SHA256(每 slot 明文 messageWebhookSecret)，hex 写到
+/// `x-webhook-signature: sha256=<hex>`，配套 `x-webhook-timestamp`（毫秒）。
+/// 全部通过返回 Ok；否则返回具体拒绝原因（handler 统一转 400 + 脱敏 warn 日志）。
+/// `secret=None`/空 → SecretNotConfigured（验签开关打开时的 fail-closed 语义）。
+#[derive(Debug, PartialEq, Eq)]
+#[allow(dead_code)] // Task 4 接入 handler 后即为 live
+enum WebhookSigError {
+    SecretNotConfigured,
+    MissingSignature,
+    MissingTimestamp,
+    BadTimestamp,
+    TimestampOutOfWindow,
+    BadSignatureFormat,
+    Mismatch,
+}
+
+#[allow(dead_code)] // Task 4 接入 handler 后即为 live
+fn verify_webhook_signature(
+    secret: Option<&str>,
+    timestamp_header: Option<&str>,
+    signature_header: Option<&str>,
+    body: &[u8],
+    now_ms: i64,
+    skew_seconds: i64,
+) -> Result<(), WebhookSigError> {
+    let secret = secret
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or(WebhookSigError::SecretNotConfigured)?;
+    let sig = signature_header
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or(WebhookSigError::MissingSignature)?;
+    let ts_str = timestamp_header
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or(WebhookSigError::MissingTimestamp)?;
+    let ts_ms: i64 = ts_str.parse().map_err(|_| WebhookSigError::BadTimestamp)?;
+    if (now_ms - ts_ms).abs() > skew_seconds.saturating_mul(1000) {
+        return Err(WebhookSigError::TimestampOutOfWindow);
+    }
+    let hex_part = sig.strip_prefix("sha256=").unwrap_or(sig);
+    let expected = hex::decode(hex_part).map_err(|_| WebhookSigError::BadSignatureFormat)?;
+    type HmacSha256 = Hmac<Sha256>;
+    let mut mac =
+        HmacSha256::new_from_slice(secret.as_bytes()).map_err(|_| WebhookSigError::SecretNotConfigured)?;
+    // 与 gewe-agent 一致：先喂 "<ts>." 再喂 raw body。
+    mac.update(ts_str.as_bytes());
+    mac.update(b".");
+    mac.update(body);
+    mac.verify_slice(&expected).map_err(|_| WebhookSigError::Mismatch)
+}
+
+#[cfg(test)]
+mod webhook_sig_tests {
+    use super::*;
+
+    // 与 gewe-agent webhook-signing.ts 逐字节对齐的金标：
+    // HMAC-SHA256(secret="test-secret", "<ts>." + body) hex。
+    const SECRET: &str = "test-secret";
+    const TS: &str = "1720500000000";
+    const BODY: &[u8] = b"{\"foo\":\"bar\"}";
+    // python: hmac.new(b"test-secret", b"1720500000000." + BODY, sha256).hexdigest()
+    const GOLDEN_HEX: &str = "1936755de0397e2cc912ab1652aaeccb278cae4bb489f16f0dbe3173a8057cbe";
+    const NOW_MS: i64 = 1_720_500_000_000; // 与 TS 相等 → 偏差 0
+    const SKEW: i64 = 300;
+
+    fn header() -> String {
+        format!("sha256={GOLDEN_HEX}")
+    }
+
+    #[test]
+    fn accepts_correct_signature_within_window() {
+        assert_eq!(
+            verify_webhook_signature(Some(SECRET), Some(TS), Some(&header()), BODY, NOW_MS, SKEW),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn accepts_signature_without_sha256_prefix() {
+        assert_eq!(
+            verify_webhook_signature(Some(SECRET), Some(TS), Some(GOLDEN_HEX), BODY, NOW_MS, SKEW),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn accepts_uppercase_hex() {
+        let h = format!("sha256={}", GOLDEN_HEX.to_uppercase());
+        assert_eq!(
+            verify_webhook_signature(Some(SECRET), Some(TS), Some(&h), BODY, NOW_MS, SKEW),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn rejects_tampered_body() {
+        assert_eq!(
+            verify_webhook_signature(Some(SECRET), Some(TS), Some(&header()), b"{\"foo\":\"BAR\"}", NOW_MS, SKEW),
+            Err(WebhookSigError::Mismatch)
+        );
+    }
+
+    #[test]
+    fn rejects_wrong_secret() {
+        assert_eq!(
+            verify_webhook_signature(Some("other-secret"), Some(TS), Some(&header()), BODY, NOW_MS, SKEW),
+            Err(WebhookSigError::Mismatch)
+        );
+    }
+
+    #[test]
+    fn rejects_timestamp_out_of_window_future() {
+        // now 比 ts 早 301s（ts 在未来 301s）→ 超窗
+        let now = NOW_MS - 301_000;
+        assert_eq!(
+            verify_webhook_signature(Some(SECRET), Some(TS), Some(&header()), BODY, now, SKEW),
+            Err(WebhookSigError::TimestampOutOfWindow)
+        );
+    }
+
+    #[test]
+    fn rejects_timestamp_out_of_window_past() {
+        // now 比 ts 晚 301s → 超窗
+        let now = NOW_MS + 301_000;
+        assert_eq!(
+            verify_webhook_signature(Some(SECRET), Some(TS), Some(&header()), BODY, now, SKEW),
+            Err(WebhookSigError::TimestampOutOfWindow)
+        );
+    }
+
+    #[test]
+    fn accepts_timestamp_at_window_edge() {
+        // 恰好 300s → 不超窗（用 <= 边界语义）
+        let now = NOW_MS + 300_000;
+        assert_eq!(
+            verify_webhook_signature(Some(SECRET), Some(TS), Some(&header()), BODY, now, SKEW),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn rejects_missing_signature() {
+        assert_eq!(
+            verify_webhook_signature(Some(SECRET), Some(TS), None, BODY, NOW_MS, SKEW),
+            Err(WebhookSigError::MissingSignature)
+        );
+        assert_eq!(
+            verify_webhook_signature(Some(SECRET), Some(TS), Some("  "), BODY, NOW_MS, SKEW),
+            Err(WebhookSigError::MissingSignature)
+        );
+    }
+
+    #[test]
+    fn rejects_missing_timestamp() {
+        assert_eq!(
+            verify_webhook_signature(Some(SECRET), None, Some(&header()), BODY, NOW_MS, SKEW),
+            Err(WebhookSigError::MissingTimestamp)
+        );
+    }
+
+    #[test]
+    fn rejects_bad_timestamp() {
+        assert_eq!(
+            verify_webhook_signature(Some(SECRET), Some("not-a-number"), Some(&header()), BODY, NOW_MS, SKEW),
+            Err(WebhookSigError::BadTimestamp)
+        );
+    }
+
+    #[test]
+    fn rejects_bad_signature_format() {
+        assert_eq!(
+            verify_webhook_signature(Some(SECRET), Some(TS), Some("sha256=not-hex!!"), BODY, NOW_MS, SKEW),
+            Err(WebhookSigError::BadSignatureFormat)
+        );
+    }
+
+    #[test]
+    fn rejects_secret_not_configured() {
+        assert_eq!(
+            verify_webhook_signature(None, Some(TS), Some(&header()), BODY, NOW_MS, SKEW),
+            Err(WebhookSigError::SecretNotConfigured)
+        );
+        assert_eq!(
+            verify_webhook_signature(Some("  "), Some(TS), Some(&header()), BODY, NOW_MS, SKEW),
+            Err(WebhookSigError::SecretNotConfigured)
+        );
+    }
+}
