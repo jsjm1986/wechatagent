@@ -397,39 +397,45 @@ pub async fn wechat_webhook(
         });
     }
 
-    let from_wxid = find_string(
-        &payload,
-        &[
-            // 小写驼峰（手工 / 自测 / 部分推送）
-            "fromWxid",
-            "from_wxid",
-            "fromUserName",
-            "from_user_name",
-            "fromusername",
-            "from",
-            // GeWe 大写驼峰（MCP 透传的真实推送主字段）
-            "FromUserName",
-            "FromWxid",
-            "Wxid",
-        ],
-    )
-    .ok_or_else(|| AppError::BadRequest("webhook missing sender wxid".to_string()))?;
-    let content = find_string(
-        &payload,
-        &[
-            // 小写驼峰
-            "content",
-            "text",
-            "msgContent",
-            "msg_content",
-            "message",
-            "messageContent",
-            // GeWe 大写驼峰
-            "Content",
-            "PushContent",
-        ],
-    )
-    .unwrap_or_default();
+    let from_wxid = gewe_data_string(&payload, "FromUserName")
+        .or_else(|| {
+            find_string(
+                &payload,
+                &[
+                    // 小写驼峰（手工 / 自测 / 部分推送）
+                    "fromWxid",
+                    "from_wxid",
+                    "fromUserName",
+                    "from_user_name",
+                    "fromusername",
+                    "from",
+                    // GeWe 大写驼峰（MCP 透传的真实推送主字段）
+                    "FromUserName",
+                    "FromWxid",
+                    "Wxid",
+                ],
+            )
+        })
+        .ok_or_else(|| AppError::BadRequest("webhook missing sender wxid".to_string()))?;
+    let content = gewe_data_string(&payload, "Content")
+        .or_else(|| {
+            find_string(
+                &payload,
+                &[
+                    // 小写驼峰
+                    "content",
+                    "text",
+                    "msgContent",
+                    "msg_content",
+                    "message",
+                    "messageContent",
+                    // GeWe 大写驼峰
+                    "Content",
+                    "PushContent",
+                ],
+            )
+        })
+        .unwrap_or_default();
     // 领导回复分流：from_wxid 是本 workspace 的 principal_decider → 走请示通道，不进客户链路。
     // 必须在落库 / contact-managed 处理之前分流——领导可能同时也是某 contact，
     // consumed=true 时短路返回，避免领导自己的消息被当成客户入站处理。
@@ -856,6 +862,31 @@ fn value_to_string(value: &Value) -> Option<String> {
     }
 }
 
+/// 从 GeWe AddMsg 的 `Data.<field>.string` 取字符串。真实推送里发件人/内容都是
+/// `{string:...}` 包裹且嵌在 `Data` 下——通用 find_string 会被顶层同名/近义键
+/// (`Wxid` / `PushContent`)遮蔽,故对 GeWe 形态显式走此路径,优先于 find_string。
+/// 取不到返回 None(交调用方回落 find_string)。命中空串返回 Some("")——刻意直接
+/// 用空内容,不回落到带发件人名前缀的 PushContent 通知串。
+fn gewe_data_string(payload: &Value, field: &str) -> Option<String> {
+    payload
+        .get("Data")
+        .and_then(|d| d.get(field))
+        .and_then(|f| f.get("string"))
+        .and_then(|s| s.as_str())
+        .map(|s| s.to_string())
+}
+
+/// 从 GeWe AddMsg 的 `Data.MsgType.low` 取微信消息类型数字码(`{low:N}` 包裹)。
+/// 返回数字的字符串形式(交 classify_inbound_msg_type 归一)。取不到返回 None。
+fn gewe_data_msg_type_code(payload: &Value) -> Option<String> {
+    payload
+        .get("Data")
+        .and_then(|d| d.get("MsgType"))
+        .and_then(|m| m.get("low"))
+        .and_then(|n| n.as_i64())
+        .map(|n| n.to_string())
+}
+
 /// F1 评审 I1：从入站 payload 解析归一化的消息类型。候选键**仅限“消息类型”语义
 /// 专用键**——GeWe 大写驼峰 `MsgType`（微信数字码真实字段）+ 手工/自测 payload 的
 /// 小写别名 `msgType`/`msg_type`。**刻意不收泛化裸键 `type`/`Type`**：`find_string`
@@ -867,7 +898,8 @@ fn value_to_string(value: &Value) -> Option<String> {
 /// payload 无任何类型字段时默认 `"text"`（runbook W1-W3 等纯文本自测 payload 不带
 /// 类型字段，行为不变）；有则交给 `classify_inbound_msg_type` 归一（未知码 → `"unknown"`）。
 fn parse_inbound_msg_type(payload: &Value) -> &'static str {
-    let raw_msg_type = find_string(payload, &["msgType", "msg_type", "MsgType"]);
+    let raw_msg_type = gewe_data_msg_type_code(payload)
+        .or_else(|| find_string(payload, &["msgType", "msg_type", "MsgType"]));
     match raw_msg_type.as_deref() {
         Some(raw_type) => classify_inbound_msg_type(raw_type),
         None => "text",
@@ -1248,6 +1280,81 @@ mod inbound_msg_type_tests {
             "content": "我想了解一下你们的产品",
         });
         assert_eq!(parse_inbound_msg_type(&payload), "text");
+    }
+
+    #[test]
+    fn gewe_addmsg_extracts_msg_type_from_data_low() {
+        // MsgType.low=3 → image。
+        let payload = json!({
+            "TypeName": "AddMsg",
+            "Data": {
+                "FromUserName": { "string": "wxid_x" },
+                "Content": { "string": "x" },
+                "MsgType": { "low": 3 }
+            }
+        });
+        assert_eq!(gewe_data_msg_type_code(&payload).as_deref(), Some("3"));
+        assert_eq!(parse_inbound_msg_type(&payload), "image");
+        // MsgType.low=1 → text(真实文本入站)。
+        let text_payload = json!({ "Data": { "MsgType": { "low": 1 } } });
+        assert_eq!(parse_inbound_msg_type(&text_payload), "text");
+    }
+
+    fn real_gewe_addmsg() -> serde_json::Value {
+        // 2026-07-09 线上 117 亲验的真实 GeWe AddMsg 形态(经 gewe-agent 转发):
+        // 顶层大写驼峰 + Data 嵌套 + {string}/{low} 包裹 + _mcp envelope。
+        json!({
+            "Wxid": "wxid_3yeirsb75afd22",
+            "TypeName": "AddMsg",
+            "Appid": "wx_WSHYpbq5Fdp_yGcOEl9Pn",
+            "Data": {
+                "FromUserName": { "string": "wxid_ydzaomn4scsb12" },
+                "ToUserName": { "string": "wxid_3yeirsb75afd22" },
+                "Content": { "string": "你好" },
+                "MsgType": { "low": 1 },
+                "PushContent": "吴界 : 你好",
+                "NewMsgId": { "high": 1976706754, "low": 1032436816 }
+            },
+            "_mcp": { "event": "wechat.message.created", "sourceMsgId": "8489890863244754000" }
+        })
+    }
+
+    #[test]
+    fn gewe_addmsg_extracts_real_sender_not_account_self() {
+        let payload = real_gewe_addmsg();
+        // 修复:显式走 Data.FromUserName.string 拿真实发件人(吴界)。
+        assert_eq!(
+            gewe_data_string(&payload, "FromUserName").as_deref(),
+            Some("wxid_ydzaomn4scsb12")
+        );
+        // 回归留证:通用 find_string 会被顶层 Wxid 遮蔽 → 归错成账号自己。
+        // 这正是本次修复的 bug,保留断言防止有人把提取改回纯 find_string。
+        assert_eq!(
+            find_string(&payload, &["fromWxid", "FromUserName", "FromWxid", "Wxid"]).as_deref(),
+            Some("wxid_3yeirsb75afd22")
+        );
+    }
+
+    #[test]
+    fn gewe_addmsg_extracts_clean_content_not_pushcontent() {
+        let payload = real_gewe_addmsg();
+        // 修复:Data.Content.string 拿干净正文。
+        assert_eq!(gewe_data_string(&payload, "Content").as_deref(), Some("你好"));
+        // 回归留证:find_string 会先命中 Data.PushContent 通知串(带发件人名前缀)。
+        assert_eq!(
+            find_string(&payload, &["content", "Content", "PushContent"]).as_deref(),
+            Some("吴界 : 你好")
+        );
+    }
+
+    #[test]
+    fn flat_payload_still_parses_via_fallback() {
+        // 扁平自测/biz-test payload 无 Data → helper 返 None → 走 find_string 回落,行为不变。
+        let payload = json!({ "fromWxid": "wx_flat", "content": "hello flat" });
+        assert_eq!(gewe_data_string(&payload, "FromUserName"), None);
+        assert_eq!(gewe_data_string(&payload, "Content"), None);
+        assert_eq!(find_string(&payload, &["fromWxid"]).as_deref(), Some("wx_flat"));
+        assert_eq!(find_string(&payload, &["content"]).as_deref(), Some("hello flat"));
     }
 }
 
