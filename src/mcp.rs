@@ -610,7 +610,7 @@ const ROSTER_SNAPSHOT_STALE_HOURS: i64 = 24;
 const ROSTER_REFRESH_MAX_RETRIES: usize = 5;
 
 /// 快照是否过期（龄 > ROSTER_SNAPSHOT_STALE_HOURS）。
-fn snapshot_is_stale(fetched_at: DateTime, now: DateTime) -> bool {
+pub(crate) fn snapshot_is_stale(fetched_at: DateTime, now: DateTime) -> bool {
     now.timestamp_millis() - fetched_at.timestamp_millis()
         > ROSTER_SNAPSHOT_STALE_HOURS * 3600_000
 }
