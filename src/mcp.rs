@@ -1,6 +1,6 @@
 use mongodb::bson::{doc, to_document, DateTime};
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::{
@@ -418,7 +418,7 @@ async fn credentials_for_account(state: &AppState, account_id: &str) -> AppResul
     })
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RosterFriend {
     pub wxid: String,
     pub nickname: Option<String>,
