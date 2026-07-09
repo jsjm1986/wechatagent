@@ -157,6 +157,8 @@ pub struct Contact {
     pub alias: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub avatar_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sex: Option<i32>,
     pub agent_status: AgentStatus,
     pub human_profile_note: Option<String>,
     /// per-contact 运营人员特别指令（最高优先级 Operator Instruction 层）。
@@ -3217,6 +3219,8 @@ pub struct BatchEnableCandidate {
     pub remark: Option<String>,
     #[serde(default)]
     pub avatar_url: Option<String>,
+    #[serde(default)]
+    pub sex: Option<i32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3317,6 +3321,7 @@ pub struct ApiContact {
     pub remark: Option<String>,
     pub alias: Option<String>,
     pub avatar_url: Option<String>,
+    pub sex: Option<i32>,
     pub agent_status: AgentStatus,
     pub human_profile_note: Option<String>,
     pub custom_agent_instructions: Option<String>,
@@ -3362,6 +3367,7 @@ impl From<Contact> for ApiContact {
             remark: contact.remark,
             alias: contact.alias,
             avatar_url: contact.avatar_url,
+            sex: contact.sex,
             agent_status: contact.agent_status,
             human_profile_note: contact.human_profile_note,
             custom_agent_instructions: contact.custom_agent_instructions,

@@ -424,6 +424,7 @@ pub struct RosterFriend {
     pub nickname: Option<String>,
     pub remark: Option<String>,
     pub avatar_url: Option<String>,
+    pub sex: Option<i32>,
 }
 
 /// roster 拉取结果：友列表 + 是否仍在同步（cache 空 {} 未就绪）。
@@ -541,6 +542,7 @@ fn parse_roster_items(result: &serde_json::Value) -> Vec<RosterFriend> {
                     nickname: None,
                     remark: None,
                     avatar_url: None,
+                    sex: None,
                 });
             }
             // 对象元素：从命名键提取（防御其它形态）。
@@ -552,8 +554,9 @@ fn parse_roster_items(result: &serde_json::Value) -> Vec<RosterFriend> {
                 remark: first_str(obj, &["remark", "Remark", "conRemark"]),
                 avatar_url: first_str(
                     obj,
-                    &["bigHeadImg", "smallHeadImg", "headImgUrl", "avatarUrl", "headimgurl"],
+                    &["bigHeadImgUrl", "smallHeadImgUrl", "bigHeadImg", "smallHeadImg", "headImgUrl", "avatarUrl", "headimgurl"],
                 ),
+                sex: obj.get("sex").and_then(|v| v.as_i64()).map(|n| n as i32),
             })
         })
         .collect()
@@ -567,7 +570,18 @@ fn parse_roster_items(result: &serde_json::Value) -> Vec<RosterFriend> {
 /// 否则前端会无限 8s 重拉且每次清空运营勾选（RosterView refresh 重置草稿）。
 fn roster_outcome_from_result(result: &serde_json::Value) -> RosterFetchOutcome {
     let friends = parse_roster_items(result);
-    let syncing = friends.is_empty() && roster_result_is_empty_cache(result);
+    if !friends.is_empty() {
+        // 铁律：解析出任何好友一定就绪（否则前端无限重拉且清空运营勾选）。
+        return RosterFetchOutcome { friends, syncing: false };
+    }
+    // 空列表：区分「真 0 好友（就绪）」vs「未就绪（同步中）」。
+    // contacts_fetch_full 有权威 status：ready → 就绪；其它 → 同步中。refreshing:true 带全量
+    // 数据也算就绪，故不参与判据。旧 contacts_fetch_cache 形态无 status → 回落空 cache 判据。
+    let syncing = match result.pointer("/status").and_then(|v| v.as_str()) {
+        Some("ready") => false,
+        Some(_) => true,
+        None => roster_result_is_empty_cache(result),
+    };
     RosterFetchOutcome { friends, syncing }
 }
 
@@ -575,11 +589,10 @@ pub async fn fetch_roster_for_account(
     state: &AppState,
     account_id: &str,
 ) -> AppResult<RosterFetchOutcome> {
-    // contacts_fetch_cache 是全量好友工具（gewe "Fetch the full remote contacts cache
-    // from GeWe"，无参）；account_alias 由 logged_call_for_account 自动注入。
-    // GeWe 缓存异步就绪：未就绪时返回 {}（空），就绪返回 {result:{friends:[wxid]}}。
-    // 空 {} 时同一请求内短重试（间隔 2s、最多 3 次），仍空则返回 syncing=true 让
-    // 前端提示「同步中」并自动重拉。重试复用同一 MCP session，间隔足够避免自撞 429。
+    // contacts_fetch_full 是全量好友工具（返回昵称/头像/性别等富化字段，无参）；
+    // account_alias 由 logged_call_for_account 自动注入。就绪信号是返回体 status=="ready"
+    // （亲验：ready 时带全量 items，refreshing:true 是后台刷新标志、非未就绪）。未就绪时
+    // 同一请求内短重试（间隔 2s、最多 3 次），仍未就绪则 syncing=true 让前端提示「同步中」。
     const MAX_RETRIES: usize = 3;
     const RETRY_INTERVAL_SECS: u64 = 2;
     let mut last_result = serde_json::Value::Null;
@@ -587,7 +600,7 @@ pub async fn fetch_roster_for_account(
         match logged_call_for_account(
             state,
             account_id,
-            "contacts_fetch_cache",
+            "contacts_fetch_full",
             serde_json::json!({}),
         )
         .await
@@ -609,12 +622,12 @@ pub async fn fetch_roster_for_account(
         if !outcome.syncing {
             return Ok(outcome);
         }
-        // 空 cache：还有重试机会则等待后重试（最后一次不等）。
+        // 未就绪：还有重试机会则等待后重试（最后一次不等）。
         if attempt + 1 < MAX_RETRIES {
             tokio::time::sleep(std::time::Duration::from_secs(RETRY_INTERVAL_SECS)).await;
         }
     }
-    // 重试用尽仍空 → syncing:true（friends 为空）。
+    // 重试用尽仍未就绪 → syncing:true（friends 为空）。
     Ok(roster_outcome_from_result(&last_result))
 }
 
@@ -840,6 +853,29 @@ mod roster_parse_tests {
         assert_eq!(out[1].wxid, "wxid_obj");
         assert_eq!(out[1].nickname.as_deref(), Some("对象好友"));
     }
+
+    #[test]
+    fn parses_contacts_fetch_full_envelope_with_rich_fields() {
+        // contacts_fetch_full 真实形态（2026-07-09 117 亲验）：顶层 items 数组，
+        // 单条带 userName(=wxid)/nickName/bigHeadImgUrl/sex。
+        let v = serde_json::json!({
+            "status": "ready",
+            "count": 2,
+            "refreshing": true,
+            "items": [
+                { "userName": "wxid_full1", "nickName": "富化好友", "remark": "客户", "bigHeadImgUrl": "http://img/big", "sex": 1 },
+                { "userName": "wxid_full2", "nickName": "无头像", "smallHeadImgUrl": "http://img/small", "sex": 2 }
+            ]
+        });
+        let out = parse_roster_items(&v);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].wxid, "wxid_full1");
+        assert_eq!(out[0].nickname.as_deref(), Some("富化好友"));
+        assert_eq!(out[0].avatar_url.as_deref(), Some("http://img/big"), "bigHeadImgUrl 必须命中");
+        assert_eq!(out[0].sex, Some(1));
+        assert_eq!(out[1].avatar_url.as_deref(), Some("http://img/small"), "smallHeadImgUrl 回退命中");
+        assert_eq!(out[1].sex, Some(2));
+    }
 }
 
 #[cfg(test)]
@@ -926,6 +962,33 @@ mod roster_outcome_tests {
         let out = roster_outcome_from_result(&v);
         assert_eq!(out.friends.len(), 1);
         assert!(!out.syncing);
+    }
+
+    #[test]
+    fn full_ready_with_items_is_ready() {
+        // contacts_fetch_full：status=ready + items 非空 → 就绪。
+        let v = serde_json::json!({ "status": "ready", "items": [ { "userName": "wxid_a", "sex": 1 } ] });
+        let out = roster_outcome_from_result(&v);
+        assert_eq!(out.friends.len(), 1);
+        assert!(!out.syncing);
+    }
+
+    #[test]
+    fn full_ready_zero_items_is_ready_not_syncing() {
+        // status=ready + 空 items = 真 0 好友，就绪不重试。
+        let v = serde_json::json!({ "status": "ready", "items": [] });
+        let out = roster_outcome_from_result(&v);
+        assert!(out.friends.is_empty());
+        assert!(!out.syncing, "ready 且 0 好友必须 syncing=false");
+    }
+
+    #[test]
+    fn full_pending_empty_is_syncing() {
+        // status!=ready + 空 items → 未就绪，同步中（refreshing 是干扰项，不参与判据）。
+        let v = serde_json::json!({ "status": "pending", "items": [], "refreshing": true });
+        let out = roster_outcome_from_result(&v);
+        assert!(out.friends.is_empty());
+        assert!(out.syncing, "非 ready 空列表必须 syncing=true");
     }
 
     #[test]

@@ -38,6 +38,7 @@ fn template(wxid: &str) -> Contact {
         remark: None,
         alias: None,
         avatar_url: None,
+        sex: None,
         agent_status: AgentStatus::Managed,
         human_profile_note: None,
         agent_profile: None,

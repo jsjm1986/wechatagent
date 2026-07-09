@@ -41,6 +41,7 @@ fn make_contact(wxid: &str) -> Contact {
         remark: None,
         alias: None,
         avatar_url: None,
+        sex: None,
         agent_status: wechatagent::models::AgentStatus::Managed,
         human_profile_note: None,
         agent_profile: None,

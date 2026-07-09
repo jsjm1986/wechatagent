@@ -104,3 +104,15 @@
   background: var(--fill-blocked, rgba(255,69,58,.1)); border: 1px solid rgba(255,69,58,.3);
   border-radius: var(--r-md); padding: 8px 12px;
 }
+
+.pager {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  margin-top: 16px;
+}
+.pagerInfo {
+  font-size: 13px;
+  color: var(--ink-3);
+}

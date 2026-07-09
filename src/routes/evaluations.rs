@@ -506,6 +506,7 @@ fn scenario_contact_from_seed(
         remark: seed.get_str("remark").ok().map(ToString::to_string),
         alias: None,
         avatar_url: None,
+        sex: None,
         agent_status: crate::models::AgentStatus::Managed,
         human_profile_note: seed
             .get_str("humanProfileNote")

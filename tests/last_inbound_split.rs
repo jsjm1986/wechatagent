@@ -23,6 +23,7 @@ fn make_contact(wxid: &str) -> Contact {
         remark: None,
         alias: None,
         avatar_url: None,
+        sex: None,
         agent_status: Default::default(),
         human_profile_note: None,
         agent_profile: None,
