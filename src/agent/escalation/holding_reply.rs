@@ -36,7 +36,6 @@ pub(crate) fn holding_reply_text_is_safe(
 /// 注意：本字符串**刻意不含任何禁词字面量**（否则会被 CI 的全自治定位文本 lint
 /// 扫 src/agent/ 新增行时自噬），改用「你是唯一对接人」这类正面表述框定；
 /// 运行期禁词判断完全交给 holding_reply_text_is_safe → passes_forbidden_words 兜底。
-#[allow(dead_code)] // 生产调用点在 Task 5/6（A/C 类接入）落地，届时移除本 allow。
 fn holding_reply_system_prompt(scene: HoldingReplyScene) -> &'static str {
     match scene {
         HoldingReplyScene::GateHold =>
@@ -64,7 +63,6 @@ fn holding_reply_system_prompt(scene: HoldingReplyScene) -> &'static str {
 /// 独立预算旁路：用新 RunBudget scope 包住 LLM 调用，主 run 预算耗尽也能生成一次。
 /// 任一失败/超时/耗尽/禁词命中/数字越界 → 回落 scene 对应硬编码文案。
 /// **保证返回非空、经守卫的文案**（客户永不被晾死）。
-#[allow(dead_code)] // 生产调用点在 Task 5/6（A/C 类接入）落地，届时移除本 allow。
 pub(crate) async fn generate_holding_reply(
     state: &AppState,
     account_id: &str,

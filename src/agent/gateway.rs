@@ -932,6 +932,14 @@ async fn ensure_customer_acknowledged(
             return;
         }
     }
+    let holding_text = escalation::generate_holding_reply(
+        state,
+        &contact.account_id,
+        &contact.wxid,
+        escalation::HoldingReplyScene::GateHold,
+        None,
+    )
+    .await;
     let req = build_ack_enqueue_request(
         &contact.workspace_id,
         &contact.account_id,
@@ -939,6 +947,7 @@ async fn ensure_customer_acknowledged(
         run_id,
         source_event_id,
         trigger_kind,
+        holding_text,
     );
     match outbox_enqueue(state, req).await {
         Ok(outcome) => {
@@ -3398,9 +3407,11 @@ pub(crate) fn should_send_ack_placeholder(trigger_kind: &str, status: &str) -> b
 
 /// 构造"客户回应保障占位"的 outbox 入参。
 ///
-/// 复用 `fallback_holding_reply()` 确定性文案，走 outbox（享受 dispatcher 在线门控 +
-/// 幂等键，与正常发送路径一致）。幂等键派生：`{source_event_id}#ack-placeholder` 后缀，
-/// 保证同 run 重复挂载只入一条、且与真回复 / 分段（`#seg{idx}`）key 天然不碰撞。
+/// `content` 由调用方（`ensure_customer_acknowledged`）经 `generate_holding_reply`
+/// 生成场景化安抚文案后传入（AI 生成失败已内部回落硬编码兜底，故此处必为非空安全文案），
+/// 走 outbox（享受 dispatcher 在线门控 + 幂等键，与正常发送路径一致）。幂等键派生：
+/// `{source_event_id}#ack-placeholder` 后缀，保证同 run 重复挂载只入一条、且与真回复 /
+/// 分段（`#seg{idx}`）key 天然不碰撞。
 ///
 /// 取 contact 的三个字符串字段而非 `&Contact`：本函数只需这三个值，原语入参使其成为
 /// 零依赖纯函数（单测无需构造 40 字段的 Contact）。
@@ -3411,6 +3422,7 @@ pub(crate) fn build_ack_enqueue_request(
     run_id: &str,
     source_event_id: &str,
     trigger_kind: &str,
+    content: String,
 ) -> EnqueueRequest {
     EnqueueRequest {
         workspace_id: workspace_id.to_string(),
@@ -3420,7 +3432,7 @@ pub(crate) fn build_ack_enqueue_request(
         decision_id: None,
         source_event_id: format!("{source_event_id}#ack-placeholder"),
         source_kind: trigger_kind.to_string(),
-        content: escalation::fallback_holding_reply().to_string(),
+        content,
         media_asset_id: None,
         referral_card_id: None,
         max_attempts: 3,
@@ -5290,12 +5302,20 @@ mod tests {
 
     #[test]
     fn build_ack_enqueue_request_shape() {
-        let req = build_ack_enqueue_request("ws1", "acc1", "cust_wxid", "run_abc", "evt123", "inbound");
+        let req = build_ack_enqueue_request(
+            "ws1",
+            "acc1",
+            "cust_wxid",
+            "run_abc",
+            "evt123",
+            "inbound",
+            "生成的过渡文案".to_string(),
+        );
 
         // 幂等键派生：源事件 id 加 `#ack-placeholder` 后缀，与真回复 / 分段 key 天然不碰撞
         assert_eq!(req.source_event_id, "evt123#ack-placeholder");
-        // 占位文案 = 确定性兜底（agent-first，不靠 LLM）
-        assert_eq!(req.content, escalation::fallback_holding_reply());
+        // content 原样取自传入文案（由 generate_holding_reply 生成，此处纯函数只做搬运）
+        assert_eq!(req.content, "生成的过渡文案");
         // 占位是纯文本，不带媒体 / 名片
         assert!(req.media_asset_id.is_none());
         assert!(req.referral_card_id.is_none());
@@ -5311,7 +5331,7 @@ mod tests {
 
     #[test]
     fn build_ack_enqueue_request_empty_source_event_id_still_suffixed() {
-        let req = build_ack_enqueue_request("ws", "acc", "wx", "run1", "", "inbound");
+        let req = build_ack_enqueue_request("ws", "acc", "wx", "run1", "", "inbound", "占位".to_string());
         // 空 source_event_id 仍带后缀（非空），走 outbox 非 synthetic 路径
         assert_eq!(req.source_event_id, "#ack-placeholder");
     }

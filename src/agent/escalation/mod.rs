@@ -10,9 +10,6 @@ mod ledger;
 mod logic;
 mod policy;
 
-// 生产调用点在 Task 5/6（A/C 类接入）落地；本任务先落生成器与 re-export，
-// 届时消费方接入后 allow 自然失效（不再触发 unused_imports）。
-#[allow(unused_imports)]
 pub(crate) use holding_reply::generate_holding_reply;
 pub(crate) use ledger::*;
 pub(crate) use logic::*;
