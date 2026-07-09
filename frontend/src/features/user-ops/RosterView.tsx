@@ -105,6 +105,7 @@ export function RosterView() {
           nickname: r.nickname,
           remark: r.remark,
           avatarUrl: r.avatarUrl,
+          sex: r.sex,
         }));
       const res = await batchEnable({
         accountId: effectiveAccountId,

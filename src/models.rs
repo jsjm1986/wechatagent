@@ -3210,6 +3210,8 @@ pub struct BatchEnableCandidate {
     pub remark: Option<String>,
     #[serde(default)]
     pub avatar_url: Option<String>,
+    #[serde(default)]
+    pub sex: Option<i32>,
 }
 
 #[derive(Debug, Deserialize)]
