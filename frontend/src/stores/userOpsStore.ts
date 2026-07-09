@@ -492,9 +492,10 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
     if (!opts?.force && cached) {
       return { items: cached.items, syncing: cached.syncing };
     }
-    const data = await api.get<{ items: RosterEntry[]; syncing?: boolean }>(
-      `/api/contacts/roster?accountId=${encodeURIComponent(accountId)}`
-    );
+    const url = `/api/contacts/roster?accountId=${encodeURIComponent(accountId)}${
+      opts?.force ? "&force=true" : ""
+    }`;
+    const data = await api.get<{ items: RosterEntry[]; syncing?: boolean }>(url);
     const result = { items: data.items, syncing: data.syncing ?? false };
     // 仅就绪结果落缓存；同步中(syncing)不缓存，避免卡在同步中态、允许自动重拉覆盖。
     if (!result.syncing) {
