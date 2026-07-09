@@ -556,7 +556,10 @@ fn parse_roster_items(result: &serde_json::Value) -> Vec<RosterFriend> {
                     obj,
                     &["bigHeadImgUrl", "smallHeadImgUrl", "bigHeadImg", "smallHeadImg", "headImgUrl", "avatarUrl", "headimgurl"],
                 ),
-                sex: obj.get("sex").and_then(|v| v.as_i64()).map(|n| n as i32),
+                sex: obj
+                    .get("sex")
+                    .and_then(|v| v.as_i64().or_else(|| v.get("low").and_then(|l| l.as_i64())))
+                    .map(|n| n as i32),
             })
         })
         .collect()
@@ -875,6 +878,23 @@ mod roster_parse_tests {
         assert_eq!(out[0].sex, Some(1));
         assert_eq!(out[1].avatar_url.as_deref(), Some("http://img/small"), "smallHeadImgUrl 回退命中");
         assert_eq!(out[1].sex, Some(2));
+    }
+
+    #[test]
+    fn parses_sex_int64_object_form() {
+        // MCP contacts_fetch_full 真实形态：sex 是 int64 序列化对象 {high,low}，真值在 .low。
+        let v = serde_json::json!({
+            "status": "ready",
+            "items": [
+                { "userName": "wx_m", "nickName": "男", "sex": { "high": 0, "low": 1, "unsigned": false } },
+                { "userName": "wx_f", "nickName": "女", "sex": { "high": 0, "low": 2, "unsigned": false } },
+                { "userName": "wx_bare", "nickName": "裸整数", "sex": 1 }
+            ]
+        });
+        let out = parse_roster_items(&v);
+        assert_eq!(out[0].sex, Some(1), "对象 {{low:1}} → 男");
+        assert_eq!(out[1].sex, Some(2), "对象 {{low:2}} → 女");
+        assert_eq!(out[2].sex, Some(1), "裸整数 1 仍兼容");
     }
 }
 
