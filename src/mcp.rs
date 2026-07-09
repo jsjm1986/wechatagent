@@ -142,10 +142,10 @@ impl McpClient {
                 continue;
             }
             if !status.is_success() {
-                return Err(AppError::External(format!(
-                    "MCP HTTP {status}: {}",
-                    truncate_for_error(&body)
-                )));
+                return Err(classify_mcp_http_error(
+                    status.as_u16(),
+                    format!("MCP HTTP {status}: {}", truncate_for_error(&body)),
+                ));
             }
             return parse_mcp_response_body(&body);
         }
@@ -229,6 +229,16 @@ impl McpClient {
             )));
         }
         Ok(body.get("result").cloned().unwrap_or(Value::Null))
+    }
+}
+
+/// 分类 MCP server 的非 2xx HTTP 响应:429/503(SSE 连接数满/瞬时不可用)→UpstreamBusy
+/// (调用方可柔化为「同步中」);其余(401/500 等)→External(→internal_error,不掩盖真错误)。
+fn classify_mcp_http_error(code: u16, detail: String) -> AppError {
+    if code == 429 || code == 503 {
+        AppError::UpstreamBusy(detail)
+    } else {
+        AppError::External(detail)
     }
 }
 
@@ -587,13 +597,26 @@ pub async fn fetch_roster_for_account(
     const RETRY_INTERVAL_SECS: u64 = 2;
     let mut last_result = serde_json::Value::Null;
     for attempt in 0..MAX_RETRIES {
-        last_result = logged_call_for_account(
+        match logged_call_for_account(
             state,
             account_id,
             "contacts_fetch_full",
             serde_json::json!({}),
         )
-        .await?;
+        .await
+        {
+            Ok(v) => {
+                last_result = v;
+            }
+            // 上游限流(429/503):柔化为「同步中」而非硬错误。当作本次空 cache——
+            // 还有重试机会则退避重试(退避后 MCP SSE 名额常已释放),用尽仍限流则
+            // 返回 syncing:true 让前端提示「同步中」并自动重拉,退避后自愈。
+            Err(AppError::UpstreamBusy(_)) => {
+                last_result = serde_json::Value::Null;
+            }
+            // 真实错误(401/500/配置错等)照常上抛 → 前端红条,不掩盖真问题。
+            Err(other) => return Err(other),
+        }
         // 解析器是「是否就绪」的唯一真相源：解析出好友即就绪返回。
         let outcome = roster_outcome_from_result(&last_result);
         if !outcome.syncing {
@@ -966,6 +989,54 @@ mod roster_outcome_tests {
         let out = roster_outcome_from_result(&v);
         assert!(out.friends.is_empty());
         assert!(out.syncing, "非 ready 空列表必须 syncing=true");
+    }
+
+    #[test]
+    fn null_result_is_syncing() {
+        // fetch_roster_for_account 遇 UpstreamBusy(限流)会把 last_result 置 Null,
+        // 应判为空 cache→syncing:true(而非当作真 0 好友或报错)。
+        let out = roster_outcome_from_result(&serde_json::Value::Null);
+        assert!(out.friends.is_empty());
+        assert!(out.syncing, "Null(限流柔化)必须 syncing=true");
+    }
+}
+
+#[cfg(test)]
+mod mcp_http_classify_tests {
+    use super::classify_mcp_http_error;
+    use crate::error::AppError;
+
+    #[test]
+    fn http_429_is_upstream_busy() {
+        assert!(matches!(
+            classify_mcp_http_error(429, "MCP HTTP 429: too many".into()),
+            AppError::UpstreamBusy(_)
+        ));
+    }
+
+    #[test]
+    fn http_503_is_upstream_busy() {
+        assert!(matches!(
+            classify_mcp_http_error(503, "MCP HTTP 503".into()),
+            AppError::UpstreamBusy(_)
+        ));
+    }
+
+    #[test]
+    fn http_500_is_external() {
+        // 非限流错误仍是 External(→internal_error),不被柔化,不掩盖真问题。
+        assert!(matches!(
+            classify_mcp_http_error(500, "MCP HTTP 500".into()),
+            AppError::External(_)
+        ));
+    }
+
+    #[test]
+    fn http_401_is_external() {
+        assert!(matches!(
+            classify_mcp_http_error(401, "MCP HTTP 401".into()),
+            AppError::External(_)
+        ));
     }
 }
 
