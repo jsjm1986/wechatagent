@@ -6,6 +6,23 @@ import { useToast } from "../../components/ui/Toast";
 import type { RosterEntry } from "../../types";
 import styles from "./RosterView.module.css";
 
+// 本地 6 行泛型分页 hook（卡片网格每页 60）——避免改动正在工作的 system-strategy 文件。
+const ROSTER_PAGE_SIZE = 60;
+function usePagedList<T>(items: T[]) {
+  const [page, setPage] = useState(0);
+  const pageCount = Math.max(1, Math.ceil(items.length / ROSTER_PAGE_SIZE));
+  const safePage = Math.min(page, pageCount - 1);
+  const pageRows = items.slice(safePage * ROSTER_PAGE_SIZE, safePage * ROSTER_PAGE_SIZE + ROSTER_PAGE_SIZE);
+  return { pageRows, pageCount, safePage, setPage };
+}
+
+const sexLabel = (sex?: number | null): string | null => {
+  if (sex === 1) return "男";
+  if (sex === 2) return "女";
+  if (sex === 0) return "未知";
+  return null; // 缺失（旧形态/无数据）不展示
+};
+
 // 通讯录视图：拉指定账号的全量微信好友（含头像），勾选后批量进入 Agent 运营。
 // 纯浏览不写库；仅点「加入 Agent 运营」时提交 batch-enable。
 export function RosterView() {
@@ -82,6 +99,8 @@ export function RosterView() {
       [r.remark, r.nickname, r.wxid].some((v) => v?.toLowerCase().includes(q))
     );
   }, [roster, filter]);
+
+  const { pageRows, pageCount, safePage, setPage } = usePagedList(filtered);
 
   const toggle = (entry: RosterEntry) => {
     if (entry.agentStatus === "managed") return; // 已托管不可重复勾选
@@ -195,35 +214,45 @@ export function RosterView() {
           )}
         </div>
       ) : (
-        <div className={styles.grid}>
-          {filtered.map((entry) => {
-            const checked = selectedWxids.has(entry.wxid);
-            const managed = entry.agentStatus === "managed";
-            return (
-              <button
-                key={entry.wxid}
-                type="button"
-                className={`${styles.card} ${checked ? styles.cardChecked : ""} ${managed ? styles.cardManaged : ""}`}
-                onClick={() => toggle(entry)}
-                disabled={managed}
-              >
-                <div className={styles.checkbox}>{checked && <Check size={13} />}</div>
-                {entry.avatarUrl ? (
-                  <img className={styles.avatar} src={entry.avatarUrl} alt="" />
-                ) : (
-                  <span className={styles.avatarFallback}>{initial(entry)}</span>
-                )}
-                <div className={styles.cardBody}>
-                  <strong className={styles.name}>
-                    {entry.remark || entry.nickname || entry.wxid}
-                  </strong>
-                  <small className={styles.sub}>{entry.wxid}</small>
-                </div>
-                {statusBadge(entry.agentStatus)}
-              </button>
-            );
-          })}
-        </div>
+        <>
+          <div className={styles.grid}>
+            {pageRows.map((entry) => {
+              const checked = selectedWxids.has(entry.wxid);
+              const managed = entry.agentStatus === "managed";
+              return (
+                <button
+                  key={entry.wxid}
+                  type="button"
+                  className={`${styles.card} ${checked ? styles.cardChecked : ""} ${managed ? styles.cardManaged : ""}`}
+                  onClick={() => toggle(entry)}
+                  disabled={managed}
+                >
+                  <div className={styles.checkbox}>{checked && <Check size={13} />}</div>
+                  {entry.avatarUrl ? (
+                    <img className={styles.avatar} src={entry.avatarUrl} alt="" loading="lazy" />
+                  ) : (
+                    <span className={styles.avatarFallback}>{initial(entry)}</span>
+                  )}
+                  <div className={styles.cardBody}>
+                    <strong className={styles.name}>
+                      {entry.remark || entry.nickname || entry.wxid}
+                    </strong>
+                    <small className={styles.sub}>{entry.wxid}</small>
+                    {sexLabel(entry.sex) && <small className={styles.sub}>{sexLabel(entry.sex)}</small>}
+                  </div>
+                  {statusBadge(entry.agentStatus)}
+                </button>
+              );
+            })}
+          </div>
+          {pageCount > 1 && (
+            <div className={styles.pager}>
+              <button type="button" className={styles.ghostBtn} disabled={safePage === 0} onClick={() => setPage(safePage - 1)}>上一页</button>
+              <span className={styles.pagerInfo}>{safePage + 1} / {pageCount}</span>
+              <button type="button" className={styles.ghostBtn} disabled={safePage >= pageCount - 1} onClick={() => setPage(safePage + 1)}>下一页</button>
+            </div>
+          )}
+        </>
       )}
 
       {selectedWxids.size > 0 && (

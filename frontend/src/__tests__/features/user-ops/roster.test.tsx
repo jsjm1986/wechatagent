@@ -202,6 +202,46 @@ describe("RosterView — 通讯录批量托管视图（Task 8）", () => {
     expect(screen.queryByText(/正在从微信同步好友/)).not.toBeInTheDocument();
   });
 
+  it("展示性别文字（男/女），并透传 sex 到 batch-enable", async () => {
+    // 好友名首字刻意避开「男/女/未知」，否则无头像时 avatarFallback 取首字母会与性别文字撞车。
+    getMock.mockResolvedValue({
+      items: [
+        { wxid: "wx_m", nickname: "张三", remark: null, avatarUrl: null, sex: 1, agentStatus: "not_imported" },
+        { wxid: "wx_f", nickname: "李四", remark: null, avatarUrl: null, sex: 2, agentStatus: "not_imported" },
+      ],
+      syncing: false,
+    });
+    const user = userEvent.setup();
+    render(<ToastProvider><RosterView /></ToastProvider>);
+    expect(await screen.findByText("张三")).toBeInTheDocument();
+    expect(screen.getByText("男")).toBeInTheDocument();
+    expect(screen.getByText("女")).toBeInTheDocument();
+
+    await user.click(screen.getByText("张三").closest("button") as HTMLButtonElement);
+    await user.type(screen.getByPlaceholderText(/本批运营备注/), "测试备注");
+    await user.click(screen.getByText("加入 Agent 运营").closest("button") as HTMLButtonElement);
+    await waitFor(() => {
+      const call = postMock.mock.calls.find((c) => String(c[0]).includes("/contacts/batch-enable"));
+      const body = call![1] as { candidates: { wxid: string; sex?: number | null }[] };
+      expect(body.candidates[0].sex).toBe(1);
+    });
+  });
+
+  it("超过一页时分页，切页显示下一批", async () => {
+    const many = Array.from({ length: 75 }, (_, i) => ({
+      wxid: `wx_${i}`, nickname: `好友${i}`, remark: null, avatarUrl: null, sex: 0, agentStatus: "not_imported",
+    }));
+    getMock.mockResolvedValue({ items: many, syncing: false });
+    const user = userEvent.setup();
+    render(<ToastProvider><RosterView /></ToastProvider>);
+    // 首页 60 条：好友0 在，好友60 不在。
+    expect(await screen.findByText("好友0")).toBeInTheDocument();
+    expect(screen.queryByText("好友60")).not.toBeInTheDocument();
+    // 翻到下一页：好友60 出现。
+    await user.click(screen.getByRole("button", { name: /下一页/ }));
+    expect(await screen.findByText("好友60")).toBeInTheDocument();
+  });
+
   it("syncing 期间每 8s 自动重拉，且不闪现「加载中…」", async () => {
     vi.useFakeTimers();
     try {
