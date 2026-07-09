@@ -163,6 +163,7 @@ mod tests {
             bootstrap_admin_username: None,
             bootstrap_admin_password: None,
             webhook_verify_signature: false,
+            webhook_timestamp_skew_seconds: 300,
             ingest_worker_enabled: false,
             ingest_worker_interval_seconds: 3600,
             jwt_enabled: false,
