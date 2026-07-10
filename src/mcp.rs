@@ -36,6 +36,11 @@ pub struct McpClient {
     /// `None` = server 无状态（initialize 未回 session 头，如无状态 mock）→ 后续请求不带 session 头。
     /// MCP 规范里 `mcp-session-id` 是可选的，两类 server 都要兼容。
     sessions: std::sync::Arc<dashmap::DashMap<String, Option<String>>>,
+    /// roster 后台刷新的 per-account in-flight 去重标记(键=account_id)。
+    /// spawn_roster_refresh 抢锁:键已存在→放弃本次spawn(全局同一账号同时只有一个
+    /// 后台拉取任务),消除"前端8s force轮询叠加spawn→并发打爆MCP SSE并发上限→大body
+    /// 读取TimedOut→相互中断"的自我限流循环。与sessions同款Arc<DashMap>:Clone下共享。
+    roster_refreshing: std::sync::Arc<dashmap::DashMap<String, ()>>,
 }
 
 impl McpClient {
@@ -47,6 +52,7 @@ impl McpClient {
                 .timeout(std::time::Duration::from_secs(MCP_CLIENT_TIMEOUT_SECONDS))
                 .build()?,
             sessions: std::sync::Arc::new(dashmap::DashMap::new()),
+            roster_refreshing: std::sync::Arc::new(dashmap::DashMap::new()),
         })
     }
 
@@ -718,8 +724,37 @@ pub async fn write_roster_snapshot(
 /// （含 AppError::Http 解码失败）都退避重试**（区别于同步路径 Err(other) 直接上抛）。
 /// 拿到就绪结果即覆盖写快照；用尽仍未就绪仅 warn（下次进频道再触发）。best-effort，
 /// 不加锁/去重，重复 spawn 覆盖写同一条无害。
+/// roster 后台刷新的 RAII 去重锁 guard:drop时移除in-flight键,保证任务正常结束/
+/// 提前return/**panic**(tokio::spawn内panic不传播,但Drop仍执行)时锁都释放,
+/// 避免键泄漏后该账号永远无法再刷新。
+pub(crate) struct RosterRefreshGuard {
+    pub(crate) map: std::sync::Arc<dashmap::DashMap<String, ()>>,
+    pub(crate) key: String,
+}
+
+impl Drop for RosterRefreshGuard {
+    fn drop(&mut self) {
+        self.map.remove(&self.key);
+    }
+}
+
 pub fn spawn_roster_refresh(state: AppState, workspace_id: String, account_id: String) {
     tokio::spawn(async move {
+        // single-flight抢锁:键已存在→已有同账号后台任务在拉,直接放弃(去重)。
+        // insert返回旧值:Some(_)=已占用→放弃;None=抢到→继续。原子,无TOCTOU。
+        if state
+            .mcp
+            .roster_refreshing
+            .insert(account_id.clone(), ())
+            .is_some()
+        {
+            return;
+        }
+        // RAII:本作用域结束(含return/panic)自动remove键释放锁。
+        let _guard = RosterRefreshGuard {
+            map: state.mcp.roster_refreshing.clone(),
+            key: account_id.clone(),
+        };
         for attempt in 0..ROSTER_REFRESH_MAX_RETRIES {
             match fetch_roster_for_account(&state, &account_id).await {
                 Ok(outcome) if !outcome.syncing => {
@@ -1226,6 +1261,57 @@ mod roster_snapshot_policy_tests {
         assert_eq!(roster_refresh_backoff_secs(2), 12);
         assert_eq!(roster_refresh_backoff_secs(3), 24);
         assert_eq!(roster_refresh_backoff_secs(4), 48);
+    }
+}
+
+#[cfg(test)]
+mod roster_refresh_lock_tests {
+    use super::RosterRefreshGuard;
+    use std::sync::Arc;
+
+    #[test]
+    fn second_insert_same_key_is_rejected() {
+        let map: Arc<dashmap::DashMap<String, ()>> = Arc::new(dashmap::DashMap::new());
+        assert!(map.insert("acc1".to_string(), ()).is_none());
+        assert!(map.insert("acc1".to_string(), ()).is_some());
+    }
+
+    #[test]
+    fn guard_drop_releases_key() {
+        let map: Arc<dashmap::DashMap<String, ()>> = Arc::new(dashmap::DashMap::new());
+        {
+            map.insert("acc1".to_string(), ());
+            let _guard = RosterRefreshGuard { map: map.clone(), key: "acc1".to_string() };
+            assert_eq!(map.len(), 1);
+        }
+        assert_eq!(map.len(), 0, "guard drop 后键应被移除");
+        assert!(map.insert("acc1".to_string(), ()).is_none());
+    }
+
+    #[test]
+    fn guard_releases_on_panic() {
+        let map: Arc<dashmap::DashMap<String, ()>> = Arc::new(dashmap::DashMap::new());
+        let map_for_closure = map.clone();
+        // Arc<DashMap> 非 UnwindSafe(内含 RwLock),但此处仅在 unwind 后读 map.len()
+        // 验证 guard Drop 已释放键,无跨 unwind 的逻辑不变量风险 → AssertUnwindSafe 安全。
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            map_for_closure.insert("acc1".to_string(), ());
+            let _guard = RosterRefreshGuard {
+                map: map_for_closure.clone(),
+                key: "acc1".to_string(),
+            };
+            panic!("模拟后台任务体 panic");
+        }));
+        assert!(result.is_err(), "闭包应 panic");
+        assert_eq!(map.len(), 0, "panic unwind 后 guard Drop 仍应移除键");
+    }
+
+    #[test]
+    fn distinct_accounts_are_independent() {
+        let map: Arc<dashmap::DashMap<String, ()>> = Arc::new(dashmap::DashMap::new());
+        assert!(map.insert("acc1".to_string(), ()).is_none());
+        assert!(map.insert("acc2".to_string(), ()).is_none(), "不同账号各自独立键,互不阻塞");
+        assert_eq!(map.len(), 2);
     }
 }
 
