@@ -3367,6 +3367,10 @@ pub struct ApiContact {
     pub last_inbound_at: Option<String>,
     pub last_outbound_at: Option<String>,
     pub last_agent_run_at: Option<String>,
+    /// 最近一条入站消息原文截断（待启用档展示，帮运营判断是否开 Agent）。
+    /// 非 LLM 摘要——normal 联系人不调 LLM，仅取 conversation_messages 最近 inbound content。
+    /// From<Contact> 无 DB 访问故填 None，由 list_contacts 单独查询填充。
+    pub last_inbound_preview: Option<String>,
     pub updated_at: String,
 }
 
@@ -3427,6 +3431,8 @@ impl From<Contact> for ApiContact {
             last_inbound_at: contact.last_inbound_at.and_then(dt_to_string),
             last_outbound_at: contact.last_outbound_at.and_then(dt_to_string),
             last_agent_run_at: contact.last_agent_run_at.and_then(dt_to_string),
+            // From<Contact> 无 DB 访问，真实预览由 list_contacts 查询后单独填充。
+            last_inbound_preview: None,
             updated_at: dt_to_string(contact.updated_at).unwrap_or_default(),
         }
     }

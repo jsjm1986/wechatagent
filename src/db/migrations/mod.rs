@@ -63,6 +63,11 @@ mod m025_backfill_ask_human_policy;
 mod m026_seed_sales_with_relationships;
 mod m027_contact_trust_fields;
 mod m028_seed_conversation_mode;
+/// `pub`：集成测试 `tests/m029_cleanup_contact_identity.rs` 需在 `TestApp::start()`
+/// 跑完迁移后手动插入受污染 contacts + roster 快照，再**直接调用** `m029::run_step`
+/// 验证清理语义（删非真人 normal / roster 回填 / 清 Demi / managed 保留 / 幂等）。
+/// 跨 crate 调用要求 `pub`（同 m018 先例）。
+pub mod m029_cleanup_contact_identity;
 
 type MigrationFuture<'a> = Pin<Box<dyn Future<Output = AppResult<()>> + Send + 'a>>;
 pub type MigrationFn = for<'a> fn(&'a Database) -> MigrationFuture<'a>;
@@ -186,6 +191,10 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration {
         id: "2026_06_Y2_001_seed_conversation_mode",
         run: |db| Box::pin(m028_seed_conversation_mode::run_step(db)),
+    },
+    Migration {
+        id: "2026_07_029_cleanup_contact_identity",
+        run: |db| Box::pin(m029_cleanup_contact_identity::run_step(db)),
     },
 ];
 

@@ -48,7 +48,9 @@ import type {
 import { api } from "../../lib/api";
 import { GATEWAY_STATUS_LABELS, NEXT_BEST_ACTION_TYPE_LABELS, VERSION_STATUS_LABELS, labelOf, seededByLabel, promptLayerLabel } from "../../lib/reviewLabels";
 import { useProfileStore, labelFor } from "../../stores/profileStore";
+import type { TaxonomyMap } from "../../stores/profileStore";
 import { useUserOpsStore } from "../../stores/userOpsStore";
+import { overdueHours, formatRelativeTime } from "./poolHelpers";
 import TagTrustPanel from "./TagTrustPanel";
 import PersonalityPanel from "./PersonalityPanel";
 
@@ -437,6 +439,45 @@ export function TraditionalOpsTabs({
 }
 
 
+/** 批量启用候选（对齐 userOpsStore.batchEnable payload.candidates 形状）。 */
+export type BatchEnableCandidate = {
+  wxid: string;
+  nickname?: string | null;
+  remark?: string | null;
+  avatarUrl?: string | null;
+  sex?: number | null;
+};
+
+// contact → batch 候选映射（Contact 无 sex 字段，回落 null）。
+function toBatchCandidate(contact: Contact): BatchEnableCandidate {
+  return {
+    wxid: contact.wxid,
+    nickname: contact.nickname ?? null,
+    remark: contact.remark ?? null,
+    avatarUrl: contact.avatarUrl ?? null,
+    sex: null
+  };
+}
+
+// 单个联系人的中文标签集（运营录入 manualTags + AI 确信 confirmedTags.value），
+// 每个经 labelFor 转中文（无字典回落原值）。用 Set 去重同名标签。
+function contactTagLabels(contact: Contact, taxonomies: TaxonomyMap): string[] {
+  const raw = [
+    ...(contact.manualTags ?? []),
+    ...((contact.confirmedTags ?? []).map((t) => t.value))
+  ];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const value of raw) {
+    if (!value) continue;
+    const text = labelFor(taxonomies, "tag", value).text;
+    if (seen.has(text)) continue;
+    seen.add(text);
+    out.push(text);
+  }
+  return out;
+}
+
 export function ContactsView({
   contactTab,
   contacts,
@@ -448,7 +489,8 @@ export function ContactsView({
   onContactTab,
   onLoadAll,
   onOpenContact,
-  onQuery
+  onQuery,
+  onBatchEnable
 }: {
   contactTab: ContactTab;
   contacts: Contact[];
@@ -461,26 +503,75 @@ export function ContactsView({
   onLoadAll: () => void;
   onOpenContact: (contact: Contact) => void;
   onQuery: (value: string) => void;
+  // 批量/单人启用回调（index.tsx 注入：调 batchEnable + toast + 刷新列表/计数）。
+  // 可选——纯展示渲染（如单元测试）不传时降级为只读列表。
+  onBatchEnable?: (candidates: BatchEnableCandidate[]) => Promise<void>;
 }) {
+  const taxonomies = useProfileStore((s) => s.taxonomies);
+  const [selectedWxids, setSelectedWxids] = useState<Set<string>>(new Set());
+  const [batching, setBatching] = useState(false);
+  const nowMs = Date.now();
+
+  // 待启用档才开放勾选（Agent 已在运营、全部档混档不勾选）。
+  const selectable = contactTab === "normal" && !!onBatchEnable;
+
+  const tierSubtitle =
+    contactTab === "normal"
+      ? "待你评估是否开 AI 自动回复"
+      : contactTab === "managed"
+        ? "AI 正在自动运营 · 显示当前运营阶段"
+        : "全部主动来过消息的私聊真人";
+
+  const toggleSelect = (wxid: string) => {
+    setSelectedWxids((prev) => {
+      const next = new Set(prev);
+      if (next.has(wxid)) next.delete(wxid);
+      else next.add(wxid);
+      return next;
+    });
+  };
+
+  const runEnable = async (candidates: BatchEnableCandidate[]) => {
+    if (!onBatchEnable || candidates.length === 0 || batching) return;
+    setBatching(true);
+    try {
+      await onBatchEnable(candidates);
+      setSelectedWxids(new Set());
+    } finally {
+      setBatching(false);
+    }
+  };
+
+  const runBatch = () => {
+    const candidates = contacts
+      .filter((c) => selectedWxids.has(c.wxid))
+      .map(toBatchCandidate);
+    void runEnable(candidates);
+  };
+
   return (
     <section className="panel">
       <div className="panelHead">
-        <div>
-          <span>好友池</span>
-          <h2>用户运营池</h2>
+        <div className="poolHeadText">
+          <span>运营池</span>
+          <h2>运营池</h2>
+          <p className="poolLede">主动来找过你的人 → 挑价值高的交给 AI 自动运营</p>
+          <p className="poolHint">区别于通讯录（全部好友）：这里只收主动来消息的私聊真人</p>
         </div>
         <div className="segmented">
-          <button className={contactTab === "all" ? "active" : ""} onClick={() => onContactTab("all")}>
-            已互动 {totalCount}
+          <button className={contactTab === "normal" ? "active" : ""} onClick={() => onContactTab("normal")}>
+            待启用 {normalCount}
           </button>
           <button className={contactTab === "managed" ? "active" : ""} onClick={() => onContactTab("managed")}>
             Agent {managedCount}
           </button>
-          <button className={contactTab === "normal" ? "active" : ""} onClick={() => onContactTab("normal")}>
-            待启用 {normalCount}
+          <button className={contactTab === "all" ? "active" : ""} onClick={() => onContactTab("all")}>
+            全部 {totalCount}
           </button>
         </div>
       </div>
+
+      <p className="poolTierSub">{tierSubtitle}</p>
 
       <div className="toolbar">
         <label className="filter">
@@ -489,33 +580,112 @@ export function ContactsView({
             value={query}
             onChange={(event) => onQuery(event.target.value)}
             onBlur={onLoadAll}
-            placeholder="过滤已互动"
+            placeholder="过滤联系人"
           />
         </label>
       </div>
 
-      <div className="contactList">
-        {contacts.map((contact) => (
-          <button
-            key={contact.id}
-            className={selected?.id === contact.id ? "contact selected" : "contact"}
-            onClick={() => onOpenContact(contact)}
-          >
-            <span className={contact.agentStatus === "managed" ? "dot managed" : "dot"} />
-            {contact.avatarUrl ? (
-              <img className="contactAvatar" src={contact.avatarUrl} alt="" />
-            ) : (
-              <span className="contactAvatarFallback">
-                {(contact.remark || contact.nickname || contact.wxid).trim().charAt(0).toUpperCase()}
-              </span>
-            )}
-            <div>
-              <strong>{contact.remark || contact.nickname || contact.wxid}</strong>
-              <small>{contact.alias || contact.wxid}</small>
-            </div>
-            <em>{contact.agentStatus === "managed" ? "Agent" : "普通"}</em>
+      {selectable && selectedWxids.size > 0 && (
+        <div className="poolBatchBar">
+          <button type="button" className="enableBtn primary" onClick={runBatch} disabled={batching}>
+            批量启用 Agent（{selectedWxids.size}）
           </button>
-        ))}
+          <button
+            type="button"
+            className="poolBatchClear"
+            onClick={() => setSelectedWxids(new Set())}
+            disabled={batching}
+          >
+            取消选择
+          </button>
+        </div>
+      )}
+
+      <div className="contactList">
+        {contacts.length === 0 ? (
+          <div className="contactEmpty">
+            <Inbox size={22} />
+            <strong>还没有人主动来找你</strong>
+            <p>去通讯录主动开启 Agent 运营。</p>
+          </div>
+        ) : (
+          contacts.map((contact) => {
+            const isManaged = contact.agentStatus === "managed";
+            const name = contact.remark || contact.nickname || contact.wxid;
+            const relTime = formatRelativeTime(contact.lastInboundAt, nowMs);
+            const overdue = isManaged ? null : overdueHours(contact, nowMs);
+            const stageResult =
+              isManaged && contact.operationState
+                ? labelFor(taxonomies, "customer_stage", contact.operationState)
+                : null;
+            const tagLabels = contactTagLabels(contact, taxonomies);
+            const checked = selectedWxids.has(contact.wxid);
+
+            return (
+              <div
+                key={contact.id}
+                role="button"
+                tabIndex={0}
+                className={selected?.id === contact.id ? "contact selected" : "contact"}
+                onClick={() => onOpenContact(contact)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    onOpenContact(contact);
+                  }
+                }}
+              >
+                {selectable && (
+                  <input
+                    type="checkbox"
+                    className="contactCheck"
+                    aria-label={`选择 ${name}`}
+                    checked={checked}
+                    onClick={(event) => event.stopPropagation()}
+                    onChange={() => toggleSelect(contact.wxid)}
+                  />
+                )}
+                <span className={isManaged ? "dot managed" : "dot"} />
+                {contact.avatarUrl ? (
+                  <img className="contactAvatar" src={contact.avatarUrl} alt="" />
+                ) : (
+                  <span className="contactAvatarFallback">{name.trim().charAt(0).toUpperCase()}</span>
+                )}
+                <div className="contactMain">
+                  <strong className="contactName">
+                    {name}
+                    {stageResult && <span className="stageBadge">{stageResult.text}</span>}
+                  </strong>
+                  {!isManaged && contact.lastInboundPreview && (
+                    <small className="contactPreview">{contact.lastInboundPreview}</small>
+                  )}
+                  <span className="contactMeta">
+                    {relTime && <span className="contactTime">{relTime}</span>}
+                    {overdue != null && <span className="overdueTag">{overdue} 小时未跟进</span>}
+                    {tagLabels.map((tag) => (
+                      <span key={tag} className="tagChip">
+                        {tag}
+                      </span>
+                    ))}
+                  </span>
+                </div>
+                {selectable && (
+                  <button
+                    type="button"
+                    className="enableBtn"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      void runEnable([toBatchCandidate(contact)]);
+                    }}
+                    disabled={batching}
+                  >
+                    启用 Agent
+                  </button>
+                )}
+              </div>
+            );
+          })
+        )}
       </div>
     </section>
   );
