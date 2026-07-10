@@ -555,7 +555,7 @@ export function ContactsView({
         <div className="poolHeadText">
           <span>运营池</span>
           <h2>运营池</h2>
-          <p className="poolLede">主动来找过你的人 → 挑价值高的交 AI 接管</p>
+          <p className="poolLede">主动来找过你的人 → 挑价值高的交给 AI 自动运营</p>
           <p className="poolHint">区别于通讯录（全部好友）：这里只收主动来消息的私聊真人</p>
         </div>
         <div className="segmented">
@@ -580,7 +580,7 @@ export function ContactsView({
             value={query}
             onChange={(event) => onQuery(event.target.value)}
             onBlur={onLoadAll}
-            placeholder="过滤已互动"
+            placeholder="过滤联系人"
           />
         </label>
       </div>
