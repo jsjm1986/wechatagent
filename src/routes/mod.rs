@@ -285,6 +285,14 @@ use simulations::{run_user_operation_evaluation, simulate_user_operation_dialogu
 use souls::{create_agent_soul, list_agent_souls, publish_agent_soul, update_agent_soul};
 use tasks::{cancel_agent_task, list_agent_runs, list_llm_usage, list_tasks, review_task_now};
 
+/// F-013：operation-knowledge completeness 的进程内 TTL 缓存。
+/// key = (workspace_id, account_id)；value = (计算完成的 Unix 毫秒, 结果 JSON)。
+/// 进程内 DashMap（与 [`chunk_locks::ChunkLockMap`] 同范式），重启清空、
+/// 多副本各自算；对"读多写少"的概览页足够。TTL 见
+/// `AppConfig::completeness_cache_ttl_seconds`。
+pub type CompletenessCache =
+    std::sync::Arc<dashmap::DashMap<(String, String), (i64, serde_json::Value)>>;
+
 #[derive(Clone)]
 pub struct AppState {
     pub db: Database,
@@ -328,6 +336,8 @@ pub struct AppState {
     /// Phase G P1-7：RS256 JWT keypair。`jwt_enabled=false` → None；
     /// `true` 时 main.rs 启动期 `JwtKeys::from_config` 解码 PEM 失败直接 panic。
     pub jwt_keys: Option<Arc<crate::auth::jwt::JwtKeys>>,
+    /// F-013：operation-knowledge completeness 的进程内 TTL 缓存。
+    pub completeness_cache: CompletenessCache,
 }
 
 pub fn api_router(state: AppState) -> Router<AppState> {
