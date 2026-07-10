@@ -362,6 +362,8 @@ pub(super) async fn list_entitlements(
 #[serde(rename_all = "camelCase")]
 pub(super) struct RosterQuery {
     pub account_id: String,
+    #[serde(default)]
+    pub force: bool,
 }
 
 pub(super) async fn roster_endpoint(
@@ -371,18 +373,62 @@ pub(super) async fn roster_endpoint(
 ) -> AppResult<Json<Value>> {
     // account 必须属于当前 workspace（fail-closed）。
     validate_account(&state, &admin.current_workspace, &query.account_id).await?;
+    let ws = &admin.current_workspace;
+    let acc = &query.account_id;
 
-    let outcome = mcp::fetch_roster_for_account(&state, &query.account_id).await?;
-    let friends = outcome.friends;
+    // 决定本次返回的 friends + syncing（快照优先 / force 强拉 / 失败兜底旧快照）。
+    let (friends, syncing): (Vec<mcp::RosterFriend>, bool) = if query.force {
+        // 强制刷新：同步拉；就绪则覆盖写快照并用新数据；失败则回退旧快照（有则用，syncing:false）。
+        match mcp::fetch_roster_for_account(&state, acc).await {
+            Ok(outcome) if !outcome.syncing => {
+                // 写快照失败不阻断已就绪数据的返回(缓存优化,与后台 spawn_roster_refresh 的
+                // best-effort warn 对齐)——MCP 已成功拿到全量,绝不因缓存写失败让页面空白。
+                if let Err(err) = mcp::write_roster_snapshot(&state, ws, acc, &outcome.friends).await
+                {
+                    tracing::warn!(?err, account_id = %acc, "roster 快照写入失败(force),仍返回已就绪数据");
+                }
+                (outcome.friends, false)
+            }
+            _ => match mcp::read_roster_snapshot(&state, ws, acc).await? {
+                Some(snap) => (snap.friends, false),
+                None => {
+                    mcp::spawn_roster_refresh(state.clone(), ws.clone(), acc.clone());
+                    (Vec::new(), true)
+                }
+            },
+        }
+    } else {
+        // 非 force：快照优先。有快照秒回；stale 则后台自刷。无快照走同步拉一次。
+        match mcp::read_roster_snapshot(&state, ws, acc).await? {
+            Some(snap) => {
+                if mcp::snapshot_is_stale(snap.fetched_at, mongodb::bson::DateTime::now()) {
+                    mcp::spawn_roster_refresh(state.clone(), ws.clone(), acc.clone());
+                }
+                (snap.friends, false)
+            }
+            None => match mcp::fetch_roster_for_account(&state, acc).await {
+                Ok(outcome) if !outcome.syncing => {
+                    // 写快照失败不阻断已就绪数据的返回(与 force 分支 / 后台任务对齐)。
+                    if let Err(err) =
+                        mcp::write_roster_snapshot(&state, ws, acc, &outcome.friends).await
+                    {
+                        tracing::warn!(?err, account_id = %acc, "roster 快照写入失败(首拉),仍返回已就绪数据");
+                    }
+                    (outcome.friends, false)
+                }
+                _ => {
+                    mcp::spawn_roster_refresh(state.clone(), ws.clone(), acc.clone());
+                    (Vec::new(), true)
+                }
+            },
+        }
+    };
 
-    // 本地已入库联系人：wxid -> agent_status。
+    // 本地已入库联系人：wxid -> agent_status。拿到 friends（快照或实时）后统一拼装。
     let mut cursor = state
         .db
         .contacts()
-        .find(
-            doc! { "workspace_id": &admin.current_workspace, "account_id": &query.account_id },
-            None,
-        )
+        .find(doc! { "workspace_id": ws, "account_id": acc }, None)
         .await?;
     let mut status_by_wxid: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
@@ -413,7 +459,7 @@ pub(super) async fn roster_endpoint(
         })
         .collect();
     let total = items.len();
-    Ok(Json(json!({ "items": items, "total": total, "syncing": outcome.syncing })))
+    Ok(Json(json!({ "items": items, "total": total, "syncing": syncing })))
 }
 
 /// 把 AI 生成的初始运营画像落库到指定联系人（切 managed + 画像 + 备注 + playbook）。

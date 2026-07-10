@@ -391,4 +391,9 @@ impl Database {
     pub fn campaign_sends(&self) -> Collection<CampaignSend> {
         self.db.collection("campaign_sends")
     }
+
+    /// 通讯录全量快照（每 workspace+account 一条，覆盖写）。进频道读此快照秒回。
+    pub fn roster_snapshots(&self) -> Collection<crate::models::RosterSnapshot> {
+        self.db.collection("roster_snapshots")
+    }
 }
