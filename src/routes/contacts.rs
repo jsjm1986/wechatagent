@@ -378,24 +378,13 @@ pub(super) async fn roster_endpoint(
 
     // 决定本次返回的 friends + syncing（快照优先 / force 强拉 / 失败兜底旧快照）。
     let (friends, syncing): (Vec<mcp::RosterFriend>, bool) = if query.force {
-        // 强制刷新：同步拉；就绪则覆盖写快照并用新数据；失败则回退旧快照（有则用，syncing:false）。
-        match mcp::fetch_roster_for_account(&state, acc).await {
-            Ok(outcome) if !outcome.syncing => {
-                // 写快照失败不阻断已就绪数据的返回(缓存优化,与后台 spawn_roster_refresh 的
-                // best-effort warn 对齐)——MCP 已成功拿到全量,绝不因缓存写失败让页面空白。
-                if let Err(err) = mcp::write_roster_snapshot(&state, ws, acc, &outcome.friends).await
-                {
-                    tracing::warn!(?err, account_id = %acc, "roster 快照写入失败(force),仍返回已就绪数据");
-                }
-                (outcome.friends, false)
-            }
-            _ => match mcp::read_roster_snapshot(&state, ws, acc).await? {
-                Some(snap) => (snap.friends, false),
-                None => {
-                    mcp::spawn_roster_refresh(state.clone(), ws.clone(), acc.clone());
-                    (Vec::new(), true)
-                }
-            },
+        // 强制刷新(仅用户手动点「刷新」触发,前端自动轮询不带force):
+        // 不再同步阻塞拉全量(异步工具首返pending、大body易TimedOut、占连接名额)。
+        // 触发后台单飞刷新;有旧快照先返回旧快照(后台写好下次秒回),无则syncing:true。
+        mcp::spawn_roster_refresh(state.clone(), ws.clone(), acc.clone());
+        match mcp::read_roster_snapshot(&state, ws, acc).await? {
+            Some(snap) => (snap.friends, false),
+            None => (Vec::new(), true),
         }
     } else {
         // 非 force：快照优先。有快照秒回；stale 则后台自刷。无快照走同步拉一次。
@@ -406,21 +395,13 @@ pub(super) async fn roster_endpoint(
                 }
                 (snap.friends, false)
             }
-            None => match mcp::fetch_roster_for_account(&state, acc).await {
-                Ok(outcome) if !outcome.syncing => {
-                    // 写快照失败不阻断已就绪数据的返回(与 force 分支 / 后台任务对齐)。
-                    if let Err(err) =
-                        mcp::write_roster_snapshot(&state, ws, acc, &outcome.friends).await
-                    {
-                        tracing::warn!(?err, account_id = %acc, "roster 快照写入失败(首拉),仍返回已就绪数据");
-                    }
-                    (outcome.friends, false)
-                }
-                _ => {
-                    mcp::spawn_roster_refresh(state.clone(), ws.clone(), acc.clone());
-                    (Vec::new(), true)
-                }
-            },
+            None => {
+                // 首次无快照:不再同步阻塞 fetch_roster_for_account(6s窗口常拿pending、
+                // 占连接名额)。立即返回syncing:true,后台单飞拉取,前端进只读轮询,
+                // 后台写好快照后下一轮普通读秒出。
+                mcp::spawn_roster_refresh(state.clone(), ws.clone(), acc.clone());
+                (Vec::new(), true)
+            }
         }
     };
 
