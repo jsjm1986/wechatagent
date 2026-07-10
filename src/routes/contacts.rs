@@ -135,7 +135,9 @@ pub(super) async fn list_contacts(
         .find(
             filter,
             FindOptions::builder()
-                .sort(doc! { "updated_at": -1 })
+                // 最近主动来消息的人排最前（热线索优先）；last_inbound_at 为空的
+                // 老记录用 updated_at 兜底。Mongo 多键 sort 按顺序生效。
+                .sort(doc! { "last_inbound_at": -1, "updated_at": -1 })
                 .limit(query.limit.unwrap_or(100).clamp(1, 500))
                 .skip(query.skip)
                 .build(),
@@ -143,6 +145,11 @@ pub(super) async fn list_contacts(
         .await?;
     let mut items = Vec::new();
     while let Some(contact) = cursor.try_next().await? {
+        // 双保险：即使 migration 已清，读时再过滤一次非真人（公众号 gh_/群
+        // @chatroom），防历史残留或新 bug 漏写。复用 webhook 建档同源判据。
+        if !crate::webhooks::is_operatable_person(&contact.wxid) {
+            continue;
+        }
         items.push(ApiContact::from(contact));
     }
     Ok(Json(json!({ "items": items })))
