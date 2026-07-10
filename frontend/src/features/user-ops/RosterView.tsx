@@ -87,12 +87,13 @@ export function RosterView() {
     void refresh(effectiveAccountId);
   }, [effectiveAccountId, refresh]);
 
-  // cache 同步中时每 8s 自动重拉，直到就绪（syncing 变 false）或账号切换。
+  // cache 同步中时每 10s 自动重拉（只读快照，不带 force→不触发新的后台拉取）；
+  // 后台单飞任务写好快照后，普通读自然读到、syncing 变 false、轮询自停。
   useEffect(() => {
     if (!syncing || !effectiveAccountId) return;
     const timer = setInterval(() => {
-      void refresh(effectiveAccountId, { force: true });
-    }, 8000);
+      void refresh(effectiveAccountId);
+    }, 10000);
     return () => clearInterval(timer);
   }, [syncing, effectiveAccountId, refresh]);
 

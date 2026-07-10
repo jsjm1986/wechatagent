@@ -293,7 +293,7 @@ describe("RosterView — 通讯录批量托管视图（Task 8）", () => {
     expect(forceUrl).toContain("force=true");
   });
 
-  it("syncing 期间每 8s 自动重拉，且不闪现「加载中…」", async () => {
+  it("syncing 期间每 10s 自动重拉，且不闪现「加载中…」", async () => {
     vi.useFakeTimers();
     try {
       getMock.mockResolvedValue({ items: [], syncing: true });
@@ -309,8 +309,8 @@ describe("RosterView — 通讯录批量托管视图（Task 8）", () => {
       });
       expect(screen.queryByText("加载中…")).not.toBeInTheDocument();
       const callsAfterFirst = getMock.mock.calls.length;
-      // 推进 8s，自动重拉应再次调用 loadRoster。
-      await vi.advanceTimersByTimeAsync(8000);
+      // 推进 10s，自动重拉应再次调用 loadRoster。
+      await vi.advanceTimersByTimeAsync(10000);
       expect(getMock.mock.calls.length).toBeGreaterThan(callsAfterFirst);
       // 后台重拉期间仍不闪「加载中…」，同步中提示保持。
       expect(screen.queryByText("加载中…")).not.toBeInTheDocument();
