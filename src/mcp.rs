@@ -1,11 +1,11 @@
 use mongodb::bson::{doc, to_document, DateTime};
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::{
     error::{AppError, AppResult},
-    models::McpCallLog,
+    models::{McpCallLog, RosterSnapshot},
     routes::AppState,
 };
 
@@ -418,7 +418,7 @@ async fn credentials_for_account(state: &AppState, account_id: &str) -> AppResul
     })
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RosterFriend {
     pub wxid: String,
     pub nickname: Option<String>,
@@ -604,6 +604,22 @@ fn roster_outcome_from_result(result: &serde_json::Value) -> RosterFetchOutcome 
     RosterFetchOutcome { friends, syncing }
 }
 
+/// 快照过期阈值：龄 > 24h 触发后台自刷（进频道仍先秒回旧快照）。
+const ROSTER_SNAPSHOT_STALE_HOURS: i64 = 24;
+/// 后台自刷/首次重试的最大尝试次数（连 http 解码失败也计入）。
+const ROSTER_REFRESH_MAX_RETRIES: usize = 5;
+
+/// 快照是否过期（龄 > ROSTER_SNAPSHOT_STALE_HOURS）。
+pub(crate) fn snapshot_is_stale(fetched_at: DateTime, now: DateTime) -> bool {
+    now.timestamp_millis() - fetched_at.timestamp_millis()
+        > ROSTER_SNAPSHOT_STALE_HOURS * 3600_000
+}
+
+/// 后台重试退避秒数：3 * 2^attempt（3/6/12/24/48…）。
+fn roster_refresh_backoff_secs(attempt: usize) -> u64 {
+    3u64 * 2u64.pow(attempt as u32)
+}
+
 pub async fn fetch_roster_for_account(
     state: &AppState,
     account_id: &str,
@@ -648,6 +664,88 @@ pub async fn fetch_roster_for_account(
     }
     // 重试用尽仍未就绪 → syncing:true（friends 为空）。
     Ok(roster_outcome_from_result(&last_result))
+}
+
+/// 读某账号的 roster 快照（无则 None）。
+pub async fn read_roster_snapshot(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+) -> AppResult<Option<RosterSnapshot>> {
+    let snap = state
+        .db
+        .roster_snapshots()
+        .find_one(
+            doc! { "workspace_id": workspace_id, "account_id": account_id },
+            None,
+        )
+        .await?;
+    Ok(snap)
+}
+
+/// 覆盖写某账号的 roster 快照（replace_one upsert，每账号恒一条）。
+pub async fn write_roster_snapshot(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+    friends: &[RosterFriend],
+) -> AppResult<()> {
+    let snap = RosterSnapshot {
+        id: None,
+        workspace_id: workspace_id.to_string(),
+        account_id: account_id.to_string(),
+        friends: friends.to_vec(),
+        total: friends.len() as i64,
+        fetched_at: DateTime::now(),
+    };
+    let options = mongodb::options::ReplaceOptions::builder()
+        .upsert(true)
+        .build();
+    state
+        .db
+        .roster_snapshots()
+        .replace_one(
+            doc! { "workspace_id": workspace_id, "account_id": account_id },
+            &snap,
+            options,
+        )
+        .await?;
+    Ok(())
+}
+
+/// 后台静默自刷某账号的 roster 快照：fire-and-forget，不阻塞请求。最多
+/// `ROSTER_REFRESH_MAX_RETRIES` 次调 `fetch_roster_for_account`，**任何错误
+/// （含 AppError::Http 解码失败）都退避重试**（区别于同步路径 Err(other) 直接上抛）。
+/// 拿到就绪结果即覆盖写快照；用尽仍未就绪仅 warn（下次进频道再触发）。best-effort，
+/// 不加锁/去重，重复 spawn 覆盖写同一条无害。
+pub fn spawn_roster_refresh(state: AppState, workspace_id: String, account_id: String) {
+    tokio::spawn(async move {
+        for attempt in 0..ROSTER_REFRESH_MAX_RETRIES {
+            match fetch_roster_for_account(&state, &account_id).await {
+                Ok(outcome) if !outcome.syncing => {
+                    if let Err(err) =
+                        write_roster_snapshot(&state, &workspace_id, &account_id, &outcome.friends)
+                            .await
+                    {
+                        tracing::warn!(?err, account_id = %account_id, "roster 快照写入失败");
+                    }
+                    return;
+                }
+                // 就绪但仍 syncing（空 cache）或出错：退避后重试。
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::warn!(?err, account_id = %account_id, attempt, "roster 后台刷新单次失败,退避重试");
+                }
+            }
+            if attempt + 1 < ROSTER_REFRESH_MAX_RETRIES {
+                tokio::time::sleep(std::time::Duration::from_secs(
+                    roster_refresh_backoff_secs(attempt),
+                ))
+                .await;
+            }
+        }
+        tracing::warn!(account_id = %account_id, "roster 后台刷新用尽重试仍未就绪,放弃(下次进频道再触发)");
+    });
 }
 
 #[cfg(test)]
@@ -1103,6 +1201,31 @@ mod is_non_human_tests {
     fn public_account_not_misjudged() {
         // 公众号(福州晚报 wxid_8874178741811)无可靠字段识别 → 不误判为非真人。
         assert!(!is_non_human_account("wxid_8874178741811", Some("friend")));
+    }
+}
+
+#[cfg(test)]
+mod roster_snapshot_policy_tests {
+    use super::{roster_refresh_backoff_secs, snapshot_is_stale};
+    use mongodb::bson::DateTime;
+
+    #[test]
+    fn stale_after_24h() {
+        let base = 1_700_000_000_000i64; // ms
+        let now = DateTime::from_millis(base);
+        // 23h 前 → 未过期。
+        assert!(!snapshot_is_stale(DateTime::from_millis(base - 23 * 3600_000), now));
+        // 25h 前 → 过期。
+        assert!(snapshot_is_stale(DateTime::from_millis(base - 25 * 3600_000), now));
+    }
+
+    #[test]
+    fn backoff_is_exponential_3_to_48() {
+        assert_eq!(roster_refresh_backoff_secs(0), 3);
+        assert_eq!(roster_refresh_backoff_secs(1), 6);
+        assert_eq!(roster_refresh_backoff_secs(2), 12);
+        assert_eq!(roster_refresh_backoff_secs(3), 24);
+        assert_eq!(roster_refresh_backoff_secs(4), 48);
     }
 }
 

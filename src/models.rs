@@ -959,6 +959,20 @@ pub struct McpCallLog {
     pub created_at: DateTime,
 }
 
+/// 通讯录全量快照：每 (workspace_id, account_id) 恒一条（覆盖写）。进频道读此快照
+/// 秒回，避免每次重打 MCP contacts_fetch_full（4832 条大 body、传输慢且偶发
+/// `error decoding response body`）。快照龄 > 24h 由 roster_endpoint 触发后台自刷。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RosterSnapshot {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub workspace_id: String,
+    pub account_id: String,
+    pub friends: Vec<crate::mcp::RosterFriend>,
+    pub total: i64,
+    pub fetched_at: DateTime,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContentAsset {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
@@ -6875,5 +6889,56 @@ mod wechat_account_debug_tests {
     fn debug_masks_webhook_secret() {
         let dbg = format!("{:?}", sample());
         assert!(!dbg.contains("super-secret-value"), "raw webhook_secret leaked into Debug: {dbg}");
+    }
+}
+
+#[cfg(test)]
+mod roster_snapshot_tests {
+    use super::RosterSnapshot;
+    use crate::mcp::RosterFriend;
+    use mongodb::bson::{self, DateTime};
+
+    #[test]
+    fn roster_snapshot_bson_round_trip_preserves_fields() {
+        // 快照写盘再读回：昵称 / 备注 / 头像 / sex / is_non_human / total / fetched_at 一致
+        // （验 RosterFriend 的 Deserialize，含 #158/#160 加的 sex + is_non_human 两字段）。
+        let snap = RosterSnapshot {
+            id: None,
+            workspace_id: "ws1".into(),
+            account_id: "acc1".into(),
+            friends: vec![
+                RosterFriend {
+                    wxid: "wxid_a".into(),
+                    nickname: Some("小明".into()),
+                    remark: Some("客户A".into()),
+                    avatar_url: Some("http://img/a".into()),
+                    sex: Some(1),
+                    is_non_human: false,
+                },
+                RosterFriend {
+                    wxid: "fmessage".into(),
+                    nickname: None,
+                    remark: None,
+                    avatar_url: None,
+                    sex: None,
+                    is_non_human: true,
+                },
+            ],
+            total: 2,
+            fetched_at: DateTime::from_millis(1_700_000_000_000),
+        };
+        let doc = bson::to_document(&snap).expect("序列化");
+        let back: RosterSnapshot = bson::from_document(doc).expect("反序列化");
+        assert_eq!(back.friends.len(), 2);
+        assert_eq!(back.friends[0].nickname.as_deref(), Some("小明"));
+        assert_eq!(back.friends[0].avatar_url.as_deref(), Some("http://img/a"));
+        assert_eq!(back.friends[0].sex, Some(1));
+        assert!(!back.friends[0].is_non_human);
+        assert_eq!(back.friends[1].wxid, "fmessage");
+        assert_eq!(back.friends[1].nickname, None);
+        assert_eq!(back.friends[1].sex, None);
+        assert!(back.friends[1].is_non_human);
+        assert_eq!(back.total, 2);
+        assert_eq!(back.fetched_at.timestamp_millis(), 1_700_000_000_000);
     }
 }

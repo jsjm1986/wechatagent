@@ -280,6 +280,19 @@ describe("RosterView — 通讯录批量托管视图（Task 8）", () => {
     expect(getMock.mock.calls.length).toBe(after1 + 1);
   });
 
+  it("force 刷新时 URL 带 &force=true，非 force 不带", async () => {
+    getMock.mockResolvedValue({ items: ROSTER, syncing: false });
+    // 非 force：URL 不含 force。
+    await useUserOpsStore.getState().loadRoster("accForce");
+    const firstUrl = String(getMock.mock.calls.at(-1)?.[0] ?? "");
+    expect(firstUrl).toContain("accountId=accForce");
+    expect(firstUrl).not.toContain("force=true");
+    // force：URL 含 &force=true。
+    await useUserOpsStore.getState().loadRoster("accForce", { force: true });
+    const forceUrl = String(getMock.mock.calls.at(-1)?.[0] ?? "");
+    expect(forceUrl).toContain("force=true");
+  });
+
   it("syncing 期间每 8s 自动重拉，且不闪现「加载中…」", async () => {
     vi.useFakeTimers();
     try {

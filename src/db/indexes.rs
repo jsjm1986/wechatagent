@@ -651,6 +651,16 @@ pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
     // objective-purchase-facts G2：商品库索引。
     ensure_products_indexes(db).await?;
     ensure_campaigns_indexes(db).await?;
+    // 通讯录快照：每 workspace+account 一条，覆盖写，故 (workspace_id, account_id) 唯一。
+    db.roster_snapshots()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "workspace_id": 1, "account_id": 1 })
+                .options(IndexOptions::builder().unique(true).build())
+                .build(),
+            None,
+        )
+        .await?;
     Ok(())
 }
 
