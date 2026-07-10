@@ -94,11 +94,14 @@ const SUFFICIENCY_LABELS: Record<string, string> = {
   need_clarification: "需澄清",
 };
 
-// 跟进任务状态(agent_tasks.status;未知值回落原值)。
+// 跟进任务状态(agent_tasks.status 闭集见 models.rs:868-877;未知值回落原值)。
 const TASK_STATUS_LABELS: Record<string, string> = {
   pending: "待执行",
   scheduled: "已排程",
   running: "执行中",
+  retry: "待重试",
+  outbox_enqueued: "已入发件箱",
+  sent: "已发送",
   done: "已完成",
   completed: "已完成",
   failed: "已失败",
