@@ -120,10 +120,10 @@ export default function ReferralCardsFeature() {
               />
             </label>
             <label className={styles.field}>
-              <span className={styles.fieldLabel}>目标阶段（逗号分隔，可留空）</span>
+              <span className={styles.fieldLabel}>目标阶段（逗号分隔，可留空；取值需在运营域配置阶段字典）</span>
               <input
                 className={styles.input}
-                placeholder="例如：意向,待成交"
+                placeholder="多个阶段用逗号分隔"
                 value={cardDraft.targetStages}
                 onChange={(event) => setCardDraft({ ...cardDraft, targetStages: event.target.value })}
               />
