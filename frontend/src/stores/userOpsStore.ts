@@ -42,7 +42,6 @@ interface UserOpsState {
   escalationPendingCount: number;
 
   // 表单/草稿
-  importQuery: string;
   searchQuery: string;
   profileNote: string;
   customAgentInstructions: string;
@@ -97,7 +96,6 @@ interface UserOpsActions {
   setGuideInstruction: (instruction: string) => void;
   setSimulationInput: (input: string) => void;
   setSelectedPlaybookId: (id: string) => void;
-  setImportQuery: (value: string) => void;
   setSearchQuery: (value: string) => void;
   setPlaybookDraft: (draft: PlaybookDraft) => void;
   setGeneratePlaybookText: (text: string) => void;
@@ -115,7 +113,6 @@ interface UserOpsActions {
   loadPlaybooks: (accountId: string) => Promise<void>;
   loadContacts: (accountId: string) => Promise<void>;
   loadContactCounts: (accountId: string) => Promise<void>;
-  importContacts: () => Promise<void>;
   loadRoster: (accountId: string, opts?: { force?: boolean }) => Promise<{ items: RosterEntry[]; syncing: boolean }>;
   batchEnable: (payload: {
     accountId: string;
@@ -322,7 +319,6 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
   referredSpecialistAt: undefined,
   referredCardId: undefined,
   profileEditDraft: {},
-  importQuery: "",
   searchQuery: "",
   guideInstruction: "",
   guidePreview: null,
@@ -357,7 +353,6 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
   setGuideInstruction: (instruction) => set({ guideInstruction: instruction }),
   setSimulationInput: (input) => set({ simulationInput: input }),
   setSelectedPlaybookId: (id) => set({ selectedPlaybookId: id }),
-  setImportQuery: (value) => set({ importQuery: value }),
   setSearchQuery: (value) => set({ searchQuery: value }),
   setPlaybookDraft: (draft) => set({ playbookDraft: draft }),
   setGeneratePlaybookText: (text) => set({ generatePlaybookText: text }),
@@ -472,37 +467,6 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
       set({ contactCounts: { all: data.all, managed: data.managed, normal: data.normal } });
     } catch {
       // 保留旧值，静默降级。
-    }
-  },
-
-  // 搜索并导入好友：先 /search 拿只读候选，再 /import 真正写库，最后刷新列表。
-  // 拆两步避免“搜索即改库”的误解（沿用后端 search/import 双路由语义）。
-  importContacts: async () => {
-    const currentAccountId = useAccountStore.getState().currentAccountId();
-    const { importQuery, searchQuery } = get();
-    if (!importQuery.trim() || !currentAccountId) return;
-
-    useUiStore.getState().setBusy(true);
-    useUiStore.getState().setError("");
-
-    try {
-      const search = await api.post<{ items: unknown[] }>("/api/contacts/search", {
-        query: importQuery,
-        accountId: currentAccountId
-      });
-      const candidates = search.items || [];
-      if (candidates.length) {
-        await api.post<{ items: Contact[] }>("/api/contacts/import", {
-          accountId: currentAccountId,
-          candidates
-        });
-      }
-      set({ importQuery: "" });
-      await refreshContacts(currentAccountId, searchQuery);
-    } catch (error) {
-      useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
-    } finally {
-      useUiStore.getState().setBusy(false);
     }
   },
 

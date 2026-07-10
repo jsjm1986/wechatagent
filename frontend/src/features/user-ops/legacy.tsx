@@ -438,7 +438,6 @@ export function TraditionalOpsTabs({
 
 
 export function ContactsView({
-  busy,
   contactTab,
   contacts,
   managedCount,
@@ -451,7 +450,6 @@ export function ContactsView({
   onOpenContact,
   onQuery
 }: {
-  busy: boolean;
   contactTab: ContactTab;
   contacts: Contact[];
   managedCount: number;
