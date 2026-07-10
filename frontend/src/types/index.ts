@@ -127,6 +127,8 @@ export type Contact = {
   lastOutboundAt?: string;
   /** 兼容字段：max(lastInboundAt, lastOutboundAt)。 */
   lastMessageAt?: string;
+  /** 最近一条入站消息原文截断（待启用档展示，后端 list_contacts 填充）。 */
+  lastInboundPreview?: string | null;
   updatedAt: string;
 };
 

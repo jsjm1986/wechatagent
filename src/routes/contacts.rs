@@ -7,7 +7,7 @@ use axum::{
 use futures::TryStreamExt;
 use mongodb::{
     bson::{doc, oid::ObjectId, to_bson, DateTime, Document, Regex},
-    options::FindOptions,
+    options::{FindOneOptions, FindOptions},
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -99,6 +99,20 @@ pub(super) struct DealEventRequest {
     event_kind: Option<String>,
 }
 
+/// 待启用档预览取原文的最大字符数（按字符非字节，避免中文截半）。
+const INBOUND_PREVIEW_MAX_CHARS: usize = 30;
+
+/// 按字符（非字节）截断，避免中文截半。超长加省略号。
+/// 这是纯原文截断，绝非 LLM 智能摘要——未托管联系人不调 LLM（产品红线）。
+pub(crate) fn truncate_preview(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_string();
+    }
+    let head: String = trimmed.chars().take(max_chars).collect();
+    format!("{head}…")
+}
+
 pub(super) async fn list_contacts(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
@@ -135,15 +149,70 @@ pub(super) async fn list_contacts(
         .find(
             filter,
             FindOptions::builder()
-                .sort(doc! { "updated_at": -1 })
+                // 最近主动来消息的人排最前（热线索优先）；last_inbound_at 为空的
+                // 老记录用 updated_at 兜底。Mongo 多键 sort 按顺序生效。
+                .sort(doc! { "last_inbound_at": -1, "updated_at": -1 })
                 .limit(query.limit.unwrap_or(100).clamp(1, 500))
                 .skip(query.skip)
                 .build(),
         )
         .await?;
+    // 读时兜底富化（spec 改动3.1）：webhook 只在首次建档时按 roster 富化昵称/头像，
+    // 若某真人在其 roster 快照（>24h 异步刷新）尚未收录时来消息，建档时拿不到昵称头像
+    // 且再无自愈点。此处读一次快照（整表一条 doc，非 per-contact），对 nickname/avatar
+    // 为空的联系人补齐——下次快照刷新后列表即显示正确身份。快照缺失/读失败不阻断（返回空 map）。
+    let roster_identity: std::collections::HashMap<String, (Option<String>, Option<String>)> =
+        match crate::mcp::read_roster_snapshot(&state, &admin.current_workspace, &account_id).await {
+            Ok(Some(snap)) => snap
+                .friends
+                .into_iter()
+                .map(|f| (f.wxid, (f.nickname, f.avatar_url)))
+                .collect(),
+            _ => std::collections::HashMap::new(),
+        };
     let mut items = Vec::new();
     while let Some(contact) = cursor.try_next().await? {
-        items.push(ApiContact::from(contact));
+        // 双保险：即使 migration 已清，读时再过滤一次非真人（公众号 gh_/群
+        // @chatroom），防历史残留或新 bug 漏写。复用 webhook 建档同源判据。
+        if !crate::webhooks::is_operatable_person(&contact.wxid) {
+            continue;
+        }
+        let wxid = contact.wxid.clone();
+        let mut api = ApiContact::from(contact);
+        // 读时兜底富化：仅补空字段，不覆盖已有 nickname/avatar（与建档 $set 语义一致）。
+        if api.nickname.is_none() || api.avatar_url.is_none() {
+            if let Some((roster_nick, roster_avatar)) = roster_identity.get(&wxid) {
+                if api.nickname.is_none() {
+                    api.nickname = roster_nick.clone();
+                }
+                if api.avatar_url.is_none() {
+                    api.avatar_url = roster_avatar.clone();
+                }
+            }
+        }
+        // 最近一条入站消息原文截断（待启用档展示，帮运营判断是否开 Agent）。
+        // direction 存储值为小写 "inbound"（MessageDirection serde rename_all="lowercase"）。
+        // 纯原文截断，非 LLM 摘要——normal 联系人不调 LLM。
+        if let Ok(Some(msg)) = state
+            .db
+            .messages()
+            .find_one(
+                doc! {
+                    "workspace_id": &admin.current_workspace,
+                    "account_id": &account_id,
+                    "contact_wxid": &wxid,
+                    "direction": "inbound",
+                },
+                FindOneOptions::builder()
+                    .sort(doc! { "created_at": -1 })
+                    .build(),
+            )
+            .await
+        {
+            api.last_inbound_preview =
+                Some(truncate_preview(&msg.content, INBOUND_PREVIEW_MAX_CHARS));
+        }
+        items.push(api);
     }
     Ok(Json(json!({ "items": items })))
 }
@@ -1510,6 +1579,16 @@ pub(super) async fn get_operation_health(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncate_preview_keeps_short_and_cuts_long() {
+        assert_eq!(truncate_preview("你好", 30), "你好");
+        assert_eq!(truncate_preview("  空白裁剪  ", 30), "空白裁剪");
+        let long = "一二三四五六七八九十".repeat(5); // 50 chars
+        let out = truncate_preview(&long, 30);
+        assert_eq!(out.chars().count(), 31); // 30 + 省略号
+        assert!(out.ends_with('…'));
+    }
 
     #[test]
     fn contact_count_filters_isolate_workspace_and_account() {

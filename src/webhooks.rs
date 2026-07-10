@@ -536,7 +536,11 @@ pub async fn wechat_webhook(
     }
 
     let Some(contact) = contact else {
-        return Err(AppError::External("failed to create contact".to_string()));
+        // 非私聊真人（gh_ 公众号 / @chatroom 群）：消息已落库（见上方 messages().insert_one），
+        // 但不建运营池联系人、不触发 Agent 流水线（这类 wxid 本就不可能 managed）。
+        return Ok(Json(
+            serde_json::json!({ "ok": true, "skipped": "not_operatable_contact" }),
+        ));
     };
 
     let now = DateTime::now();
@@ -1027,14 +1031,30 @@ async fn emit_unknown_app_id_event(state: &AppState, app_id: Option<&str>) -> Ap
     Ok(())
 }
 
+/// 真人判据（黑名单）：gh_ 公众号、@chatroom 群消息不是能运营的私聊真人。
+/// roster 全量好友里 gh_=0/群=0（117 亲验），故这两类天然不在好友名册。
+/// webhook 建档与 m029 存量清理共用此判据，杜绝两处漂移。
+pub(crate) fn is_operatable_person(wxid: &str) -> bool {
+    !(wxid.starts_with("gh_") || wxid.contains("@chatroom"))
+}
+
 async fn upsert_webhook_contact(
     state: &AppState,
     workspace_id: &str,
     account_id: &str,
     wxid: &str,
-    payload: &Value,
+    _payload: &Value,
 ) -> AppResult<Option<Contact>> {
-    let nickname = find_string(payload, &["nickName", "nickname", "fromNickName"]);
+    // 非私聊真人（公众号/群）不进运营池——消息仍在调用点落库，只是不建 contact。
+    if !is_operatable_person(wxid) {
+        return Ok(None);
+    }
+    // 昵称/头像不再从 payload 取：真实 GeWe payload 发件人只有 wxid，
+    // find_string 会递归命中 _mcp.nickName（账号自己昵称 "Demi"）。改从 roster 富化。
+    let (roster_nickname, roster_avatar) =
+        roster_identity_for(state, workspace_id, account_id, wxid)
+            .await
+            .unwrap_or((None, None));
     // P1：兜底 —— 如果同 (workspace_id, wxid) 已有 managed 记录在另一个
     // account_id 下，本次 inbound 与 managed contact 出现 account_id 错配，
     // 写一条 admin-visible 事件提醒（不创建影子副本会更激进，留给后续 PR）。
@@ -1080,6 +1100,14 @@ async fn upsert_webhook_contact(
                 .await;
         }
     }
+    // 只在 roster 命中时写 nickname/avatar_url——否则无条件 $set None 会覆盖已有值。
+    let mut set_doc = doc! { "updated_at": DateTime::now() };
+    if let Some(nick) = &roster_nickname {
+        set_doc.insert("nickname", nick);
+    }
+    if let Some(av) = &roster_avatar {
+        set_doc.insert("avatar_url", av);
+    }
     state
         .db
         .contacts()
@@ -1090,10 +1118,7 @@ async fn upsert_webhook_contact(
                 "wxid": wxid
             },
             doc! {
-                "$set": {
-                    "nickname": &nickname,
-                    "updated_at": DateTime::now()
-                },
+                "$set": set_doc,
                 "$setOnInsert": {
                     "workspace_id": workspace_id,
                     "account_id": account_id,
@@ -1157,6 +1182,70 @@ async fn maybe_emit_rate_limit_event(state: &AppState, account_id: &str) -> AppR
         Ok(_) => Ok(()),
         Err(error) if is_duplicate_key_error(&error) => Ok(()),
         Err(error) => Err(error.into()),
+    }
+}
+
+/// 从 roster friends 里按 wxid 找身份 `(nickname, avatar_url)`。找不到返 None。
+/// 纯函数：不触网、不访库，便于单测。
+pub(crate) fn pick_identity_from_friends(
+    friends: &[crate::mcp::RosterFriend],
+    wxid: &str,
+) -> Option<(Option<String>, Option<String>)> {
+    friends
+        .iter()
+        .find(|f| f.wxid == wxid)
+        .map(|f| (f.nickname.clone(), f.avatar_url.clone()))
+}
+
+/// 查 roster 快照拿某 wxid 的 `(nickname, avatar_url)`。快照缺失/读失败/无该 wxid → None。
+/// best-effort：读失败只返 None（吞错），绝不 panic、绝不阻断建档。
+async fn roster_identity_for(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+    wxid: &str,
+) -> Option<(Option<String>, Option<String>)> {
+    let snap = crate::mcp::read_roster_snapshot(state, workspace_id, account_id)
+        .await
+        .ok()
+        .flatten()?;
+    pick_identity_from_friends(&snap.friends, wxid)
+}
+
+#[cfg(test)]
+mod roster_identity_tests {
+    use super::*;
+    use crate::mcp::RosterFriend;
+
+    #[test]
+    fn pick_identity_from_friends_finds_match() {
+        let friends = vec![
+            RosterFriend {
+                wxid: "wxid_a".into(),
+                nickname: Some("小明".into()),
+                remark: None,
+                avatar_url: Some("http://img/a".into()),
+                sex: Some(0),
+                is_non_human: false,
+            },
+            RosterFriend {
+                wxid: "wxid_b".into(),
+                nickname: None,
+                remark: None,
+                avatar_url: None,
+                sex: Some(0),
+                is_non_human: false,
+            },
+        ];
+        assert_eq!(
+            pick_identity_from_friends(&friends, "wxid_a"),
+            Some((Some("小明".to_string()), Some("http://img/a".to_string())))
+        );
+        assert_eq!(
+            pick_identity_from_friends(&friends, "wxid_b"),
+            Some((None, None))
+        );
+        assert_eq!(pick_identity_from_friends(&friends, "wxid_missing"), None);
     }
 }
 
@@ -1336,6 +1425,21 @@ mod inbound_msg_type_tests {
         assert_eq!(gewe_data_string(&payload, "Content"), None);
         assert_eq!(find_string(&payload, &["fromWxid"]).as_deref(), Some("wx_flat"));
         assert_eq!(find_string(&payload, &["content"]).as_deref(), Some("hello flat"));
+    }
+
+    #[test]
+    fn is_operatable_person_rejects_official_and_group() {
+        assert!(!is_operatable_person("gh_416c280c4978"));
+        assert!(!is_operatable_person("7842243308@chatroom"));
+        assert!(!is_operatable_person("971559326@chatroom"));
+    }
+
+    #[test]
+    fn is_operatable_person_accepts_real_wxid() {
+        assert!(is_operatable_person("wxid_ydzaomn4scsb12"));
+        assert!(is_operatable_person("wxid_3yeirsb75afd22"));
+        // 边界：gh 出现在中间不算公众号（只认前缀）。
+        assert!(is_operatable_person("wxid_gh_not_prefix"));
     }
 }
 
