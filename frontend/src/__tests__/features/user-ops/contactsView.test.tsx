@@ -18,13 +18,13 @@ describe("ContactsView 运营池", () => {
     onQuery: vi.fn()
   };
 
-  it("三 tab 文案为 已互动 / Agent / 待启用，计数来自 props", () => {
+  it("三 tab 文案为 待启用 / Agent / 全部，计数来自 props", () => {
     render(<ContactsView {...baseProps} />);
-    expect(screen.getByText("已互动 63")).toBeInTheDocument();
-    expect(screen.getByText("Agent 2")).toBeInTheDocument();
     expect(screen.getByText("待启用 61")).toBeInTheDocument();
+    expect(screen.getByText("Agent 2")).toBeInTheDocument();
+    expect(screen.getByText("全部 63")).toBeInTheDocument();
     // 旧文案不得残留。
-    expect(screen.queryByText(/^全部 /)).toBeNull();
+    expect(screen.queryByText(/^已互动 /)).toBeNull();
     expect(screen.queryByText(/^普通 /)).toBeNull();
   });
 

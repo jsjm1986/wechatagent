@@ -121,6 +121,7 @@ function UserOpsFeatureInner() {
     loadPlaybooks,
     loadContacts,
     loadContactCounts,
+    batchEnable,
     loadDomains,
     // 15个业务回调
     enableAgent,
@@ -275,6 +276,21 @@ function UserOpsFeatureInner() {
             onLoadAll={reloadFiltered}
             onOpenContact={openContact}
             onQuery={setSearchQuery}
+            onBatchEnable={async (candidates) => {
+              if (!effectiveAccountId || candidates.length === 0) return;
+              try {
+                const res = await batchEnable({
+                  accountId: effectiveAccountId,
+                  candidates,
+                  sharedNote: "从运营池批量启用"
+                });
+                toast.success(`已启用 ${res.enabled} 人，画像后台生成中`);
+                void loadContacts(effectiveAccountId);
+                void loadContactCounts(effectiveAccountId);
+              } catch (e) {
+                toast.error(e instanceof Error ? e.message : "批量启用失败");
+              }
+            }}
           />
           <CockpitPanel
             busy={busy}
