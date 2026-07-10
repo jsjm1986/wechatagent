@@ -733,6 +733,58 @@ impl Drop for RosterRefreshGuard {
     }
 }
 
+/// chat_search 命中判据(纯函数便于单测)：items 里存在一条 **content 精确等于**
+/// `content`(非子串) 且 `createdAt >= since_millis`。用于 timeout 兜底核对"这条是否
+/// 已真的提交给微信"。精确等于防历史相似内容误命中；since 排除本 entry 创建前的历史同内容。
+pub(crate) fn chat_search_hit(items: &serde_json::Value, content: &str, since_millis: i64) -> bool {
+    let arr = match items.as_array() {
+        Some(a) => a,
+        None => return false,
+    };
+    arr.iter().any(|item| {
+        let c = item.get("content").and_then(|v| v.as_str());
+        if c != Some(content) {
+            return false;
+        }
+        // createdAt 是 ISO-8601 字符串；解析成 bson DateTime 再比 millis。解析失败保守视为不命中。
+        match item.get("createdAt").and_then(|v| v.as_str()) {
+            Some(ts) => match DateTime::parse_rfc3339_str(ts) {
+                Ok(dt) => dt.timestamp_millis() >= since_millis,
+                Err(_) => false,
+            },
+            None => false,
+        }
+    })
+}
+
+/// 查 MCP chat_search 确认某条 outbound 文本是否已提交给微信(server 侧真实已发记录，
+/// 同步落库、失败不写)。命中判据见 [`chat_search_hit`]。调用失败向上抛(由调用方回落本地日志)。
+pub async fn chat_search_outbound(
+    state: &AppState,
+    account_id: &str,
+    peer: &str,
+    content: &str,
+    since: DateTime,
+) -> AppResult<bool> {
+    let since_iso = since.try_to_rfc3339_string().unwrap_or_default();
+    let resp = logged_call_for_account(
+        state,
+        account_id,
+        "chat_search",
+        serde_json::json!({
+            "direction": "outbound",
+            "peer": peer,
+            "content_contains": content,
+            "since": since_iso,
+            "limit": 20,
+        }),
+    )
+    .await?;
+    // 返回体形如 { items:[...], count }。call_tool_with_key 已剥壳到 structuredContent 本体。
+    let items = resp.get("items").cloned().unwrap_or(serde_json::Value::Null);
+    Ok(chat_search_hit(&items, content, since.timestamp_millis()))
+}
+
 /// 后台静默自刷某账号的 roster 快照：fire-and-forget，不阻塞请求。最多
 /// `ROSTER_REFRESH_MAX_RETRIES` 次调 `fetch_roster_for_account`，**任何错误
 /// （含 AppError::Http 解码失败）都退避重试**（区别于同步路径 Err(other) 直接上抛）。
@@ -1313,6 +1365,60 @@ mod roster_refresh_lock_tests {
         assert!(map.insert("acc1".to_string(), ()).is_none());
         assert!(map.insert("acc2".to_string(), ()).is_none(), "不同账号各自独立键,互不阻塞");
         assert_eq!(map.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod chat_search_hit_tests {
+    use super::chat_search_hit;
+    use serde_json::json;
+
+    // since = 1_700_000_000_000 ms (2023-11-14T...)。item.createdAt 用 ISO-8601。
+    const SINCE: i64 = 1_700_000_000_000;
+    // SINCE 之后 1 分钟。
+    const AFTER: &str = "2023-11-14T22:14:20.000Z"; // = 1_700_000_060_000ms 附近，> SINCE
+    // SINCE 之前。
+    const BEFORE: &str = "2023-11-14T00:00:00.000Z"; // < SINCE
+
+    #[test]
+    fn exact_content_after_since_hits() {
+        let items = json!([
+            { "content": "你好呀，在吗", "createdAt": AFTER }
+        ]);
+        assert!(chat_search_hit(&items, "你好呀，在吗", SINCE));
+    }
+
+    #[test]
+    fn substring_not_exact_does_not_hit() {
+        // "你好" 是历史消息 "你好呀" 的子串——精确等于判据下不得命中。
+        let items = json!([
+            { "content": "你好呀", "createdAt": AFTER }
+        ]);
+        assert!(!chat_search_hit(&items, "你好", SINCE));
+    }
+
+    #[test]
+    fn before_since_does_not_hit() {
+        // content 精确等于但发生在 entry 创建之前(历史同内容) → 不命中。
+        let items = json!([
+            { "content": "确认一下", "createdAt": BEFORE }
+        ]);
+        assert!(!chat_search_hit(&items, "确认一下", SINCE));
+    }
+
+    #[test]
+    fn empty_items_does_not_hit() {
+        assert!(!chat_search_hit(&json!([]), "任意", SINCE));
+        assert!(!chat_search_hit(&json!(null), "任意", SINCE));
+    }
+
+    #[test]
+    fn one_of_many_matches_hits() {
+        let items = json!([
+            { "content": "别的消息", "createdAt": AFTER },
+            { "content": "目标内容", "createdAt": AFTER }
+        ]);
+        assert!(chat_search_hit(&items, "目标内容", SINCE));
     }
 }
 
