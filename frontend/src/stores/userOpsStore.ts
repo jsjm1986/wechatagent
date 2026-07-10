@@ -77,6 +77,9 @@ interface UserOpsState {
   // 仅就绪结果落缓存（syncing 中不缓存，允许自动重拉覆盖）。force 才重拉。
   rosterCache: Record<string, { items: RosterEntry[]; syncing: boolean; fetchedAt: number }>;
 
+  // 运营池三 tab 的后端真实计数（不受 list_contacts 的 limit 截断影响）。
+  contactCounts: { all: number; managed: number; normal: number };
+
   // 忙碌状态
   guideBusy: boolean;
   simulationBusy: boolean;
@@ -111,6 +114,7 @@ interface UserOpsActions {
   loadEscalationCount: () => Promise<void>;
   loadPlaybooks: (accountId: string) => Promise<void>;
   loadContacts: (accountId: string) => Promise<void>;
+  loadContactCounts: (accountId: string) => Promise<void>;
   importContacts: () => Promise<void>;
   loadRoster: (accountId: string, opts?: { force?: boolean }) => Promise<{ items: RosterEntry[]; syncing: boolean }>;
   batchEnable: (payload: {
@@ -288,6 +292,7 @@ async function refreshContacts(currentAccountId: string | null, q?: string) {
 
   try {
     const params = [`accountId=${encodeURIComponent(currentAccountId)}`];
+    params.push("limit=500");
     const trimmed = q?.trim();
     if (trimmed) params.push(`q=${encodeURIComponent(trimmed)}`);
     const contactData = await api.get<{ items: Contact[] }>(`/api/contacts?${params.join("&")}`);
@@ -336,6 +341,7 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
   domainDrafts: {},
 
   rosterCache: {},
+  contactCounts: { all: 0, managed: 0, normal: 0 },
 
   guideBusy: false,
   simulationBusy: false,
@@ -453,6 +459,20 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
   // 复用模块内 refreshContacts，透传当前 searchQuery 作为 q 过滤。
   loadContacts: async (accountId) => {
     await refreshContacts(accountId || null, get().searchQuery);
+  },
+
+  // 拉运营池三 tab 的后端真实计数。失败回落保留旧值（不弹错、不清零），
+  // 避免网络抖动把计数瞬间清 0 误导运营。
+  loadContactCounts: async (accountId) => {
+    if (!accountId) return;
+    try {
+      const data = await api.get<{ all: number; managed: number; normal: number }>(
+        `/api/contacts/counts?accountId=${encodeURIComponent(accountId)}`
+      );
+      set({ contactCounts: { all: data.all, managed: data.managed, normal: data.normal } });
+    } catch {
+      // 保留旧值，静默降级。
+    }
   },
 
   // 搜索并导入好友：先 /search 拿只读候选，再 /import 真正写库，最后刷新列表。
