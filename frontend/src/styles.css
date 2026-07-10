@@ -1618,8 +1618,8 @@ textarea::placeholder {
 .contactAvatar,
 .contactAvatarFallback {
   flex-shrink: 0;
-  width: 28px;
-  height: 28px;
+  width: 40px;
+  height: 40px;
   border-radius: 50%;
   object-fit: cover;
 }
@@ -1630,8 +1630,192 @@ textarea::placeholder {
   justify-content: center;
   background: var(--surface-soft);
   color: var(--muted);
+  font-size: 15px;
+  font-weight: 600;
+}
+
+/* 运营池漏斗工作台：顶部定位文案 */
+.poolHeadText {
+  display: grid;
+  gap: 2px;
+}
+
+.poolLede {
+  margin: 4px 0 0;
+  color: var(--ink-soft);
   font-size: 12px;
   font-weight: 600;
+}
+
+.poolHint {
+  margin: 2px 0 0;
+  color: #64748b;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.poolTierSub {
+  margin: -6px 0 12px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* 批量启用工具条 */
+.poolBatchBar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.poolBatchClear {
+  min-height: 30px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface-soft);
+  color: var(--muted);
+  padding: 5px 11px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.poolBatchClear:hover {
+  border-color: var(--line-strong);
+  background: #fff;
+  color: var(--ink);
+}
+
+/* 行内多段内容容器 */
+.contactMain {
+  min-width: 0;
+  flex: 1;
+  display: grid;
+  gap: 3px;
+}
+
+.contactName {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+}
+
+.contactPreview {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 450;
+}
+
+.contactMeta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 1px;
+}
+
+.contactTime {
+  color: var(--muted-soft);
+  font-size: 11px;
+}
+
+/* 运营阶段徽章（青色，仅标 AI 运营状态） */
+.stageBadge {
+  flex-shrink: 0;
+  border-radius: 999px;
+  background: rgba(15, 118, 110, 0.09);
+  color: #0f766e;
+  padding: 2px 8px;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+/* 标签 chip（中性小 chip） */
+.tagChip {
+  border-radius: 999px;
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  color: var(--muted);
+  padding: 1px 8px;
+  font-size: 11px;
+  font-weight: 500;
+}
+
+/* 超时未跟进（暖色，非 danger 红） */
+.overdueTag {
+  border-radius: 999px;
+  background: rgba(180, 83, 9, 0.08);
+  color: #b45309;
+  padding: 1px 8px;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+/* 启用 Agent 按钮（AI 蓝描边小按钮） */
+.enableBtn {
+  flex-shrink: 0;
+  min-height: 30px;
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+  background: #fff;
+  color: var(--accent-ink);
+  padding: 5px 11px;
+  font-size: 12px;
+  font-weight: 640;
+}
+
+.enableBtn:hover {
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+  box-shadow: none;
+}
+
+.enableBtn.primary {
+  background: var(--accent);
+  color: #fff;
+}
+
+.enableBtn.primary:hover {
+  background: var(--accent-ink);
+}
+
+.enableBtn:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+/* 行内勾选框 */
+.contactCheck {
+  flex-shrink: 0;
+  width: 16px;
+  height: 16px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+/* 运营池空态引导 */
+.contactEmpty {
+  display: grid;
+  justify-items: center;
+  gap: 6px;
+  padding: 40px 16px;
+  color: var(--muted);
+  text-align: center;
+}
+
+.contactEmpty strong {
+  color: var(--ink-soft);
+  font-size: 13px;
+}
+
+.contactEmpty p {
+  margin: 0;
+  color: var(--muted-soft);
+  font-size: 12px;
 }
 
 .statusPill {
