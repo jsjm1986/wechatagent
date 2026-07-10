@@ -31,6 +31,6 @@ describe("ContactsView 运营池", () => {
   it("导入框已移除，只保留过滤框", () => {
     render(<ContactsView {...baseProps} />);
     expect(screen.queryByPlaceholderText("搜索并导入好友，例如 AI应用开发")).toBeNull();
-    expect(screen.getByPlaceholderText("过滤已互动")).toBeInTheDocument();
+    expect(screen.getByPlaceholderText("过滤联系人")).toBeInTheDocument();
   });
 });
