@@ -116,6 +116,10 @@ pub struct CreateCampaignRequest {
     pub intent_text: String,
     #[serde(default)]
     pub segment_filter: SegmentFilter,
+    /// 目标账号；缺省回落 default_account_id（与 list_contacts / list_tasks 同模式，
+    /// workspace_id + account_id 组合过滤即隔离，不额外校验账号归属）。
+    #[serde(default)]
+    pub account_id: Option<String>,
 }
 
 /// 自建活动 follow_up 任务（不调 planner 私有 emit_planner_follow_up；
@@ -204,10 +208,14 @@ pub async fn create_campaign(
     }
     let now = DateTime::now();
     assert_campaign_status_valid("draft");
+    let account_id = body
+        .account_id
+        .filter(|a| !a.trim().is_empty())
+        .unwrap_or_else(|| state.config.default_account_id.clone());
     let campaign = Campaign {
         id: None,
         workspace_id: admin.current_workspace.clone(),
-        account_id: state.config.default_account_id.clone(),
+        account_id,
         title: body.title.trim().to_string(),
         intent_text: body.intent_text.trim().to_string(),
         segment_filter: body.segment_filter,

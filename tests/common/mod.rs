@@ -238,6 +238,7 @@ impl TestApp {
             )
             .0,
             jwt_keys: None,
+            completeness_cache: std::sync::Arc::new(dashmap::DashMap::new()),
         };
         // M4 W4 Task 5.3：seed 完成后 fetch_add 一次，与 main.rs 行为一致。
         state
@@ -282,6 +283,7 @@ fn test_config(mongodb_uri: String, mongodb_database: String) -> AppConfig {
         progressive_tier_enabled: true,
         message_debounce_window_ms: 4000,
         task_worker_interval_seconds: 30,
+        completeness_cache_ttl_seconds: 300,
         llm_timeout_seconds: 5,
         llm_max_retries: 1,
         llm_retry_base_ms: 100,
@@ -469,6 +471,7 @@ pub fn rebuild_app_state_with_mcp_url(app: &TestApp, mcp_url: String) -> AppStat
         chunk_locks: app.state.chunk_locks.clone(),
         chunk_event_bus: app.state.chunk_event_bus.clone(),
         jwt_keys: app.state.jwt_keys.clone(),
+        completeness_cache: app.state.completeness_cache.clone(),
     }
 }
 
@@ -536,5 +539,6 @@ pub fn rebuild_app_state_with_real_llm(
         chunk_locks: app.state.chunk_locks.clone(),
         chunk_event_bus: app.state.chunk_event_bus.clone(),
         jwt_keys: app.state.jwt_keys.clone(),
+        completeness_cache: app.state.completeness_cache.clone(),
     }
 }
