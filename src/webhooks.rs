@@ -536,7 +536,11 @@ pub async fn wechat_webhook(
     }
 
     let Some(contact) = contact else {
-        return Err(AppError::External("failed to create contact".to_string()));
+        // 非私聊真人（gh_ 公众号 / @chatroom 群）：消息已落库（见上方 messages().insert_one），
+        // 但不建运营池联系人、不触发 Agent 流水线（这类 wxid 本就不可能 managed）。
+        return Ok(Json(
+            serde_json::json!({ "ok": true, "skipped": "not_operatable_contact" }),
+        ));
     };
 
     let now = DateTime::now();
@@ -1039,9 +1043,18 @@ async fn upsert_webhook_contact(
     workspace_id: &str,
     account_id: &str,
     wxid: &str,
-    payload: &Value,
+    _payload: &Value,
 ) -> AppResult<Option<Contact>> {
-    let nickname = find_string(payload, &["nickName", "nickname", "fromNickName"]);
+    // 非私聊真人（公众号/群）不进运营池——消息仍在调用点落库，只是不建 contact。
+    if !is_operatable_person(wxid) {
+        return Ok(None);
+    }
+    // 昵称/头像不再从 payload 取：真实 GeWe payload 发件人只有 wxid，
+    // find_string 会递归命中 _mcp.nickName（账号自己昵称 "Demi"）。改从 roster 富化。
+    let (roster_nickname, roster_avatar) =
+        roster_identity_for(state, workspace_id, account_id, wxid)
+            .await
+            .unwrap_or((None, None));
     // P1：兜底 —— 如果同 (workspace_id, wxid) 已有 managed 记录在另一个
     // account_id 下，本次 inbound 与 managed contact 出现 account_id 错配，
     // 写一条 admin-visible 事件提醒（不创建影子副本会更激进，留给后续 PR）。
@@ -1087,6 +1100,14 @@ async fn upsert_webhook_contact(
                 .await;
         }
     }
+    // 只在 roster 命中时写 nickname/avatar_url——否则无条件 $set None 会覆盖已有值。
+    let mut set_doc = doc! { "updated_at": DateTime::now() };
+    if let Some(nick) = &roster_nickname {
+        set_doc.insert("nickname", nick);
+    }
+    if let Some(av) = &roster_avatar {
+        set_doc.insert("avatar_url", av);
+    }
     state
         .db
         .contacts()
@@ -1097,10 +1118,7 @@ async fn upsert_webhook_contact(
                 "wxid": wxid
             },
             doc! {
-                "$set": {
-                    "nickname": &nickname,
-                    "updated_at": DateTime::now()
-                },
+                "$set": set_doc,
                 "$setOnInsert": {
                     "workspace_id": workspace_id,
                     "account_id": account_id,
@@ -1181,7 +1199,6 @@ pub(crate) fn pick_identity_from_friends(
 
 /// 查 roster 快照拿某 wxid 的 `(nickname, avatar_url)`。快照缺失/读失败/无该 wxid → None。
 /// best-effort：读失败只返 None（吞错），绝不 panic、绝不阻断建档。
-#[allow(dead_code)]
 async fn roster_identity_for(
     state: &AppState,
     workspace_id: &str,
