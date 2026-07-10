@@ -1167,6 +1167,71 @@ async fn maybe_emit_rate_limit_event(state: &AppState, account_id: &str) -> AppR
     }
 }
 
+/// 从 roster friends 里按 wxid 找身份 `(nickname, avatar_url)`。找不到返 None。
+/// 纯函数：不触网、不访库，便于单测。
+pub(crate) fn pick_identity_from_friends(
+    friends: &[crate::mcp::RosterFriend],
+    wxid: &str,
+) -> Option<(Option<String>, Option<String>)> {
+    friends
+        .iter()
+        .find(|f| f.wxid == wxid)
+        .map(|f| (f.nickname.clone(), f.avatar_url.clone()))
+}
+
+/// 查 roster 快照拿某 wxid 的 `(nickname, avatar_url)`。快照缺失/读失败/无该 wxid → None。
+/// best-effort：读失败只返 None（吞错），绝不 panic、绝不阻断建档。
+#[allow(dead_code)]
+async fn roster_identity_for(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+    wxid: &str,
+) -> Option<(Option<String>, Option<String>)> {
+    let snap = crate::mcp::read_roster_snapshot(state, workspace_id, account_id)
+        .await
+        .ok()
+        .flatten()?;
+    pick_identity_from_friends(&snap.friends, wxid)
+}
+
+#[cfg(test)]
+mod roster_identity_tests {
+    use super::*;
+    use crate::mcp::RosterFriend;
+
+    #[test]
+    fn pick_identity_from_friends_finds_match() {
+        let friends = vec![
+            RosterFriend {
+                wxid: "wxid_a".into(),
+                nickname: Some("小明".into()),
+                remark: None,
+                avatar_url: Some("http://img/a".into()),
+                sex: Some(0),
+                is_non_human: false,
+            },
+            RosterFriend {
+                wxid: "wxid_b".into(),
+                nickname: None,
+                remark: None,
+                avatar_url: None,
+                sex: Some(0),
+                is_non_human: false,
+            },
+        ];
+        assert_eq!(
+            pick_identity_from_friends(&friends, "wxid_a"),
+            Some((Some("小明".to_string()), Some("http://img/a".to_string())))
+        );
+        assert_eq!(
+            pick_identity_from_friends(&friends, "wxid_b"),
+            Some((None, None))
+        );
+        assert_eq!(pick_identity_from_friends(&friends, "wxid_missing"), None);
+    }
+}
+
 #[cfg(test)]
 mod inbound_msg_type_tests {
     use super::*;
