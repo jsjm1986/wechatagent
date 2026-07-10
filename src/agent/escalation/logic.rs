@@ -77,8 +77,9 @@ pub(crate) fn render_principal_card(
     )
 }
 
-/// 安抚占位的确定性兜底文案。统一占位模型下，占位是 decision Agent 本轮 reply_text 经
-/// outbox 正常发出；本函数仅作回落参考（LLM 未给合适占位 / 降级场景），不由网关直接发送。
+/// 安抚占位的确定性兜底文案（GateHold 场景）。过渡回复现由 `generate_holding_reply`
+/// 经独立预算调 LLM 场景化生成；本文案是其**降级兜底终点**——AI 生成失败 / 超时 /
+/// 独立预算耗尽 / 禁词命中时经 `scene_fallback_text` 回落到此，保证客户永不被晾死。
 /// 红线：绝不提转接类措辞，只说"帮你确认一下"这类 AI 自然话术。
 /// `pub`（而非 `pub(crate)`）：供 tests/principal_decision_channel.rs 的 §14.9b
 /// 红线纯函数测试在 crate 外断言该兜底文案不含任何转接类措辞。
