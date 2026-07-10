@@ -1027,6 +1027,13 @@ async fn emit_unknown_app_id_event(state: &AppState, app_id: Option<&str>) -> Ap
     Ok(())
 }
 
+/// 真人判据（黑名单）：gh_ 公众号、@chatroom 群消息不是能运营的私聊真人。
+/// roster 全量好友里 gh_=0/群=0（117 亲验），故这两类天然不在好友名册。
+/// webhook 建档与 m029 存量清理共用此判据，杜绝两处漂移。
+pub(crate) fn is_operatable_person(wxid: &str) -> bool {
+    !(wxid.starts_with("gh_") || wxid.contains("@chatroom"))
+}
+
 async fn upsert_webhook_contact(
     state: &AppState,
     workspace_id: &str,
@@ -1336,6 +1343,21 @@ mod inbound_msg_type_tests {
         assert_eq!(gewe_data_string(&payload, "Content"), None);
         assert_eq!(find_string(&payload, &["fromWxid"]).as_deref(), Some("wx_flat"));
         assert_eq!(find_string(&payload, &["content"]).as_deref(), Some("hello flat"));
+    }
+
+    #[test]
+    fn is_operatable_person_rejects_official_and_group() {
+        assert!(!is_operatable_person("gh_416c280c4978"));
+        assert!(!is_operatable_person("7842243308@chatroom"));
+        assert!(!is_operatable_person("971559326@chatroom"));
+    }
+
+    #[test]
+    fn is_operatable_person_accepts_real_wxid() {
+        assert!(is_operatable_person("wxid_ydzaomn4scsb12"));
+        assert!(is_operatable_person("wxid_3yeirsb75afd22"));
+        // 边界：gh 出现在中间不算公众号（只认前缀）。
+        assert!(is_operatable_person("wxid_gh_not_prefix"));
     }
 }
 
