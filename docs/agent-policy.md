@@ -107,7 +107,9 @@ RunBudget 超限                        终止本 run，落 fallback (enforce_ru
 
 `HumanLikeScore` / `EmotionalValue` / `PressureRisk` 在 Phase B 补回为 review 评分阈值通道的软闸（详见 `src/agent/review.rs::route_dual_gate`）：低于 / 高于阈值时触发一次 `single-shot revision`，二次仍未通过写 `blocked_review`，不进入 `enforce_decision_guards` 三硬闸。
 
-当前实现使用统一发送网关。任何自动发送，包括私聊自动回复和 follow-up 定时任务，都必须重新加载上下文，检查 managed、冷却期、最小间隔、每日触达上限和任务是否过期，再进入独立 Review Agent。候选回复先生成，再评审；评审未通过时改写一次；二次仍未通过则写入 `blocked_review`，不调用微信发送工具。
+当前实现使用统一发送网关。任何自动发送，包括私聊自动回复和 follow-up 定时任务，都必须重新加载上下文，检查 managed、冷却期、最小间隔和任务是否过期，再进入独立 Review Agent。候选回复先生成，再评审；评审未通过时改写一次；二次仍未通过则写入 `blocked_review`，不调用微信发送工具。
+
+**每日触达上限（`max_daily_touches`）仅约束 AI 主动触达（follow-up 定时任务）**；客户主动发消息的被动回复（Inbound）属"客户期待内的被动应答"，不受此上限限制（与 quiet_hours 门同为 FollowUp-only 语义）。被动回复的防刷屏由最小回复间隔（`min_reply_interval`）与账号级软上限承担。
 
 用户运营状态由 `user_operations` 状态机约束。Agent 每次决策必须输出 `operationState` 和 `nextBestAction`，并写入决策复盘，供后续审计和优化。
 
