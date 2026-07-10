@@ -3,6 +3,7 @@ import type { FormEvent } from "react";
 import { PackageSearch, BadgeCheck, CreditCard, HelpCircle, ClipboardCheck } from "lucide-react";
 import { EmptyState } from "../../components/ui/EmptyState";
 import { api } from "../../lib/api";
+import { useAccountStore } from "../../stores/accountStore";
 import type { Contact } from "../../types";
 import styles from "./ProductsDeals.module.css";
 
@@ -356,17 +357,22 @@ function ContactPicker({
 }) {
   const [contacts, setContacts] = useState<Contact[]>([]);
   const [q, setQ] = useState("");
+  const currentAccountId = useAccountStore((s) => s.currentAccountId);
 
   useEffect(() => {
     void (async () => {
       try {
-        const res = await api.get<{ items: Contact[] }>("/api/contacts?limit=100");
+        const accountId = currentAccountId();
+        const url = accountId
+          ? `/api/contacts?limit=100&accountId=${encodeURIComponent(accountId)}`
+          : "/api/contacts?limit=100";
+        const res = await api.get<{ items: Contact[] }>(url);
         setContacts(res.items);
       } catch {
         setContacts([]);
       }
     })();
-  }, []);
+  }, [currentAccountId]);
 
   const filtered = q.trim()
     ? contacts.filter(
