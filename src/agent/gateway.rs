@@ -932,6 +932,14 @@ async fn ensure_customer_acknowledged(
             return;
         }
     }
+    let holding_text = escalation::generate_holding_reply(
+        state,
+        &contact.account_id,
+        &contact.wxid,
+        escalation::HoldingReplyScene::GateHold,
+        None,
+    )
+    .await;
     let req = build_ack_enqueue_request(
         &contact.workspace_id,
         &contact.account_id,
@@ -939,6 +947,7 @@ async fn ensure_customer_acknowledged(
         run_id,
         source_event_id,
         trigger_kind,
+        holding_text,
     );
     match outbox_enqueue(state, req).await {
         Ok(outcome) => {
@@ -3126,7 +3135,12 @@ pub(crate) async fn precheck_send_gateway(
                 return Ok(blocked("rate_limited", "短时间内已触达，跳过本次自动发送"));
             }
         }
-        if daily_touch_count(state, contact).await? >= runtime.max_daily_touches {
+        // daily_limit 仅约束 AI 主动触达（FollowUp）：被动回复（Inbound）豁免，
+        // 客户主动发消息的应答永不因每日触达上限被拦（与 quiet_hours 门 :3154 同范式）。
+        // 防刷屏仍靠 min_reply_interval（上）+ 账号级软上限。
+        if daily_limit_applies_to(trigger)
+            && daily_touch_count(state, contact).await? >= runtime.max_daily_touches
+        {
             return Ok(blocked("daily_limit", "已达到每日触达上限"));
         }
         // 过期判定**先于**作息门控：已过期的 FollowUp 是「死任务」，必须直接作废
@@ -3393,9 +3407,11 @@ pub(crate) fn should_send_ack_placeholder(trigger_kind: &str, status: &str) -> b
 
 /// 构造"客户回应保障占位"的 outbox 入参。
 ///
-/// 复用 `fallback_holding_reply()` 确定性文案，走 outbox（享受 dispatcher 在线门控 +
-/// 幂等键，与正常发送路径一致）。幂等键派生：`{source_event_id}#ack-placeholder` 后缀，
-/// 保证同 run 重复挂载只入一条、且与真回复 / 分段（`#seg{idx}`）key 天然不碰撞。
+/// `content` 由调用方（`ensure_customer_acknowledged`）经 `generate_holding_reply`
+/// 生成场景化安抚文案后传入（AI 生成失败已内部回落硬编码兜底，故此处必为非空安全文案），
+/// 走 outbox（享受 dispatcher 在线门控 + 幂等键，与正常发送路径一致）。幂等键派生：
+/// `{source_event_id}#ack-placeholder` 后缀，保证同 run 重复挂载只入一条、且与真回复 /
+/// 分段（`#seg{idx}`）key 天然不碰撞。
 ///
 /// 取 contact 的三个字符串字段而非 `&Contact`：本函数只需这三个值，原语入参使其成为
 /// 零依赖纯函数（单测无需构造 40 字段的 Contact）。
@@ -3406,6 +3422,7 @@ pub(crate) fn build_ack_enqueue_request(
     run_id: &str,
     source_event_id: &str,
     trigger_kind: &str,
+    content: String,
 ) -> EnqueueRequest {
     EnqueueRequest {
         workspace_id: workspace_id.to_string(),
@@ -3415,7 +3432,7 @@ pub(crate) fn build_ack_enqueue_request(
         decision_id: None,
         source_event_id: format!("{source_event_id}#ack-placeholder"),
         source_kind: trigger_kind.to_string(),
-        content: escalation::fallback_holding_reply().to_string(),
+        content,
         media_asset_id: None,
         referral_card_id: None,
         max_attempts: 3,
@@ -3431,6 +3448,13 @@ pub(crate) fn blocked(status: &str, reason: &str) -> SendGatewayResult {
         run_mode: "live".to_string(),
         message_id: None,
     }
+}
+
+/// daily_limit（每日触达上限）仅约束 AI **主动触达**（FollowUp）。
+/// 客户主动发消息 → AI 被动回复（Inbound）属"客户期待内的被动应答"，永不受此上限限制
+/// （语义同 quiet_hours 门 gateway.rs:3154 / relay 豁免 logic.rs:172-173）。
+pub(crate) fn daily_limit_applies_to(trigger: &AgentTrigger<'_>) -> bool {
+    matches!(trigger, AgentTrigger::FollowUp(_))
 }
 
 async fn daily_touch_count(state: &AppState, contact: &Contact) -> AppResult<i64> {
@@ -5231,7 +5255,7 @@ mod tests {
             "blocked_by_budget",
             "blocked_by_safety_guard",
             "blocked_unverified_product_claim",
-            "daily_limit",       // 每日触达上限：客户主动问也须 ack（全兜底）
+            "daily_limit",       // 仅 FollowUp 会命中；此用例验证 should_send_ack_placeholder 对该状态串的黑名单判定，与门是否触发无关
             "policy_cooldown",   // 运营策略冷却：仍 ack
         ] {
             assert!(
@@ -5278,12 +5302,20 @@ mod tests {
 
     #[test]
     fn build_ack_enqueue_request_shape() {
-        let req = build_ack_enqueue_request("ws1", "acc1", "cust_wxid", "run_abc", "evt123", "inbound");
+        let req = build_ack_enqueue_request(
+            "ws1",
+            "acc1",
+            "cust_wxid",
+            "run_abc",
+            "evt123",
+            "inbound",
+            "生成的过渡文案".to_string(),
+        );
 
         // 幂等键派生：源事件 id 加 `#ack-placeholder` 后缀，与真回复 / 分段 key 天然不碰撞
         assert_eq!(req.source_event_id, "evt123#ack-placeholder");
-        // 占位文案 = 确定性兜底（agent-first，不靠 LLM）
-        assert_eq!(req.content, escalation::fallback_holding_reply());
+        // content 原样取自传入文案（由 generate_holding_reply 生成，此处纯函数只做搬运）
+        assert_eq!(req.content, "生成的过渡文案");
         // 占位是纯文本，不带媒体 / 名片
         assert!(req.media_asset_id.is_none());
         assert!(req.referral_card_id.is_none());
@@ -5299,9 +5331,59 @@ mod tests {
 
     #[test]
     fn build_ack_enqueue_request_empty_source_event_id_still_suffixed() {
-        let req = build_ack_enqueue_request("ws", "acc", "wx", "run1", "", "inbound");
+        let req = build_ack_enqueue_request("ws", "acc", "wx", "run1", "", "inbound", "占位".to_string());
         // 空 source_event_id 仍带后缀（非空），走 outbox 非 synthetic 路径
         assert_eq!(req.source_event_id, "#ack-placeholder");
+    }
+
+    // daily_limit（每日触达上限）语义收窄：仅约束 AI 主动触达（FollowUp），
+    // 被动回复（Inbound）豁免。此处锁定纯判定函数 daily_limit_applies_to 的分支。
+    #[test]
+    fn daily_limit_applies_only_to_follow_up() {
+        use crate::agent::types::AgentTrigger;
+        let now = DateTime::now();
+        let task = crate::models::AgentTask {
+            id: None,
+            workspace_id: "ws".to_string(),
+            account_id: "acc".to_string(),
+            contact_wxid: "wx".to_string(),
+            kind: "follow_up".to_string(),
+            run_at: now,
+            expires_at: None,
+            content: "demo".to_string(),
+            status: "pending".to_string(),
+            source_decision_id: None,
+            review_required: false,
+            attempt_count: 0,
+            max_attempts: 3,
+            next_retry_at: None,
+            gateway_status: None,
+            cancel_reason: None,
+            error: None,
+            claimed_at: None,
+            claim_recovery_count: 0,
+            created_at: now,
+            updated_at: now,
+        };
+        let msg = ConversationMessage {
+            id: None,
+            workspace_id: "ws".into(),
+            account_id: "acc".into(),
+            contact_wxid: "wx".into(),
+            message_id: Some("m1".into()),
+            dedupe_key: None,
+            direction: MessageDirection::Inbound,
+            content: "客户主动发来的消息".into(),
+            msg_type: None,
+            media_ref: None,
+            raw: None,
+            is_synthetic_relay: false,
+            created_at: now,
+        };
+        // 主动触达：受 daily_limit
+        assert!(daily_limit_applies_to(&AgentTrigger::FollowUp(&task)));
+        // 被动回复：豁免 daily_limit
+        assert!(!daily_limit_applies_to(&AgentTrigger::Inbound(&msg)));
     }
 
     // H10：频控豁免开关 = is_principal_relay_trigger(trigger)。伪造哨兵的客户消息

@@ -77,8 +77,9 @@ pub(crate) fn render_principal_card(
     )
 }
 
-/// 安抚占位的确定性兜底文案。统一占位模型下，占位是 decision Agent 本轮 reply_text 经
-/// outbox 正常发出；本函数仅作回落参考（LLM 未给合适占位 / 降级场景），不由网关直接发送。
+/// 安抚占位的确定性兜底文案（GateHold 场景）。过渡回复现由 `generate_holding_reply`
+/// 经独立预算调 LLM 场景化生成；本文案是其**降级兜底终点**——AI 生成失败 / 超时 /
+/// 独立预算耗尽 / 禁词命中时经 `scene_fallback_text` 回落到此，保证客户永不被晾死。
 /// 红线：绝不提转接类措辞，只说"帮你确认一下"这类 AI 自然话术。
 /// `pub`（而非 `pub(crate)`）：供 tests/principal_decision_channel.rs 的 §14.9b
 /// 红线纯函数测试在 crate 外断言该兜底文案不含任何转接类措辞。
@@ -98,6 +99,27 @@ pub(crate) fn chain_tail_holding_reply() -> &'static str {
 /// 用于早退分支：客户不被晾死、awaiting 标记同步清除。
 pub(crate) fn expired_authorization_neutral_reply() -> &'static str {
     "关于您之前问的那件事，我这边再帮您核实下最新情况，有确切消息第一时间同步您～"
+}
+
+/// 过渡/占位回复的场景分类。决定 AI 生成失败时回落到哪条硬编码兜底文案，
+/// 以及生成 prompt 的语境框定。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HoldingReplyScene {
+    /// 闸门拦截后的客户回应保障占位（held/blocked/budget/revision_failed 等）。
+    GateHold,
+    /// 请示领导链尾失联，持续安抚。
+    ChainTail,
+    /// relay 转述时领导授权已过期，中性收尾。
+    ExpiredAuthorization,
+}
+
+/// 场景 → 确定性硬编码兜底文案。AI 生成失败/禁词命中/预算耗尽时的最终回落。
+pub(crate) fn scene_fallback_text(scene: HoldingReplyScene) -> &'static str {
+    match scene {
+        HoldingReplyScene::GateHold => fallback_holding_reply(),
+        HoldingReplyScene::ChainTail => chain_tail_holding_reply(),
+        HoldingReplyScene::ExpiredAuthorization => expired_authorization_neutral_reply(),
+    }
 }
 
 /// 该条已 resolved 的授权当前是否仍可用于转述。
@@ -1069,5 +1091,17 @@ mod tests {
         // 非 11000（即便 message 巧合含索引名）→ 不命中。
         let msg = format!("some other write error mentioning {}", PENDING_DEDUPE_INDEX_NAME);
         assert!(!dedupe_conflict_matches_pending_index(121, &msg));
+    }
+
+    // ---- HoldingReplyScene 场景 → 硬编码兜底文案映射 ----
+
+    #[test]
+    fn scene_fallback_text_maps_each_scene_to_its_hardcoded_copy() {
+        assert_eq!(scene_fallback_text(HoldingReplyScene::GateHold), fallback_holding_reply());
+        assert_eq!(scene_fallback_text(HoldingReplyScene::ChainTail), chain_tail_holding_reply());
+        assert_eq!(
+            scene_fallback_text(HoldingReplyScene::ExpiredAuthorization),
+            expired_authorization_neutral_reply()
+        );
     }
 }

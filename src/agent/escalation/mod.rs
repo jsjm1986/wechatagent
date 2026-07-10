@@ -4,11 +4,13 @@
 //! 请示，拿到裁决后用 AI 口吻向客户转述。客户永远只跟 Agent 对话——真人是
 //! 幕后决策源，绝不直接面对客户。这不是真人下场：AI 向内部决策源请示，转述仍由 AI 完成。
 
+mod holding_reply;
 mod labels;
 mod ledger;
 mod logic;
 mod policy;
 
+pub(crate) use holding_reply::generate_holding_reply;
 pub(crate) use ledger::*;
 pub(crate) use logic::*;
 pub(crate) use policy::*;
@@ -192,13 +194,23 @@ pub(crate) async fn handle_principal_decision_relay(
             .await?;
         if let Some(contact) = contact {
             crate::agent::gateway::clear_awaiting_principal_state(state, &contact).await?;
+            // 授权已过期：substance 传 None（过期即不可用作事实源，AI 只发中性收尾、绝不复述过期数字，
+            // 语义同 relay_substance_if_usable 过期返 None）。保留裸 MCP 直发不变，仅换文案来源。
+            let holding_text = generate_holding_reply(
+                state,
+                &contact.account_id,
+                &contact.wxid,
+                HoldingReplyScene::ExpiredAuthorization,
+                None,
+            )
+            .await;
             let _ = mcp::logged_call_for_account(
                 state,
                 &contact.account_id,
                 "message_send_text",
                 serde_json::json!({
                     "recipient": &contact.wxid,
-                    "content": expired_authorization_neutral_reply()
+                    "content": holding_text
                 }),
             )
             .await;
@@ -381,13 +393,23 @@ pub async fn scan_escalation_timeouts(state: &AppState) -> AppResult<()> {
                         .last_holding_reply_ms
                         .map_or(true, |last| now_ms - last >= min_interval_ms);
                     if should_send {
+                        // 链尾纯安抚：还在核实、不涉及具体授权数字，substance 传 None。
+                        // 保留裸 MCP 直发（C 类不走 outbox）与 last_holding_reply_ms 去重不变，仅换文案来源。
+                        let holding_text = generate_holding_reply(
+                            state,
+                            &entry.account_id,
+                            &entry.contact_wxid,
+                            HoldingReplyScene::ChainTail,
+                            None,
+                        )
+                        .await;
                         let _ = mcp::logged_call_for_account(
                             state,
                             &entry.account_id,
                             "message_send_text",
                             serde_json::json!({
                                 "recipient": &entry.contact_wxid,
-                                "content": chain_tail_holding_reply()
+                                "content": holding_text
                             }),
                         )
                         .await;
