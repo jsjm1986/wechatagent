@@ -381,7 +381,12 @@ pub(super) async fn roster_endpoint(
         // 强制刷新：同步拉；就绪则覆盖写快照并用新数据；失败则回退旧快照（有则用，syncing:false）。
         match mcp::fetch_roster_for_account(&state, acc).await {
             Ok(outcome) if !outcome.syncing => {
-                mcp::write_roster_snapshot(&state, ws, acc, &outcome.friends).await?;
+                // 写快照失败不阻断已就绪数据的返回(缓存优化,与后台 spawn_roster_refresh 的
+                // best-effort warn 对齐)——MCP 已成功拿到全量,绝不因缓存写失败让页面空白。
+                if let Err(err) = mcp::write_roster_snapshot(&state, ws, acc, &outcome.friends).await
+                {
+                    tracing::warn!(?err, account_id = %acc, "roster 快照写入失败(force),仍返回已就绪数据");
+                }
                 (outcome.friends, false)
             }
             _ => match mcp::read_roster_snapshot(&state, ws, acc).await? {
@@ -403,7 +408,12 @@ pub(super) async fn roster_endpoint(
             }
             None => match mcp::fetch_roster_for_account(&state, acc).await {
                 Ok(outcome) if !outcome.syncing => {
-                    mcp::write_roster_snapshot(&state, ws, acc, &outcome.friends).await?;
+                    // 写快照失败不阻断已就绪数据的返回(与 force 分支 / 后台任务对齐)。
+                    if let Err(err) =
+                        mcp::write_roster_snapshot(&state, ws, acc, &outcome.friends).await
+                    {
+                        tracing::warn!(?err, account_id = %acc, "roster 快照写入失败(首拉),仍返回已就绪数据");
+                    }
                     (outcome.friends, false)
                 }
                 _ => {
