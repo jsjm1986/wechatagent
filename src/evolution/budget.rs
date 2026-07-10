@@ -79,6 +79,7 @@ mod tests {
             agent_reply_max_segments: 4,
             message_debounce_window_ms: 4000,
             task_worker_interval_seconds: 30,
+            completeness_cache_ttl_seconds: 300,
             llm_timeout_seconds: 5,
             llm_max_retries: 1,
             llm_retry_base_ms: 100,

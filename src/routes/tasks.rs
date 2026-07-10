@@ -45,13 +45,16 @@ pub(super) async fn list_tasks(
     let account_id = query
         .account_id
         .unwrap_or_else(|| state.config.default_account_id.clone());
+    // F-003：只展示客户触达类任务（运营视角）；隐藏纯内部后台作业
+    // （outcome_aggregation 统计 / memory_consolidation 记忆整理 / initial_profile 画像生成）。
     let mut cursor = state
         .db
         .tasks()
         .find(
             doc! {
                 "workspace_id": &admin.current_workspace,
-                "account_id": &account_id
+                "account_id": &account_id,
+                "kind": { "$in": ["follow_up", "deferred_inbound_reply", "principal_decision_relay"] }
             },
             FindOptions::builder()
                 .sort(doc! { "run_at": -1 })

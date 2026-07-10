@@ -110,9 +110,26 @@ pub(in crate::routes) async fn get_operation_knowledge_completeness(
     let account_id = query
         .account_id
         .unwrap_or_else(|| state.config.default_account_id.clone());
+    let workspace_id = admin.current_workspace.clone();
+    let key = (workspace_id.clone(), account_id.clone());
+    let now_ms = mongodb::bson::DateTime::now().timestamp_millis();
+    let ttl_ms = state.config.completeness_cache_ttl_seconds * 1000;
+    // F-013：命中未过期的进程内缓存直接秒回，避免每次 GET 都跑一次阻塞 LLM 审计。
+    // DashMap 的 Ref 是借用，先在闭包内 clone 出结果再 drop，避免跨 await 持锁。
+    let hit = state.completeness_cache.get(&key).and_then(|entry| {
+        let (computed_at, value) = entry.value();
+        if now_ms - computed_at < ttl_ms {
+            Some(value.clone())
+        } else {
+            None
+        }
+    });
+    if let Some(item) = hit {
+        return Ok(Json(json!({ "item": item })));
+    }
     let item =
-        build_operation_knowledge_completeness(&state, &admin.current_workspace, &account_id)
-            .await?;
+        build_operation_knowledge_completeness(&state, &workspace_id, &account_id).await?;
+    state.completeness_cache.insert(key, (now_ms, item.clone()));
     Ok(Json(json!({ "item": item })))
 }
 
@@ -124,9 +141,14 @@ pub(in crate::routes) async fn refresh_operation_knowledge_completeness(
     let account_id = query
         .account_id
         .unwrap_or_else(|| state.config.default_account_id.clone());
+    let workspace_id = admin.current_workspace.clone();
+    // F-013：refresh 强制重算（忽略 TTL），算完写回缓存刷新后续 GET。
     let item =
-        build_operation_knowledge_completeness(&state, &admin.current_workspace, &account_id)
-            .await?;
+        build_operation_knowledge_completeness(&state, &workspace_id, &account_id).await?;
+    let now_ms = mongodb::bson::DateTime::now().timestamp_millis();
+    state
+        .completeness_cache
+        .insert((workspace_id, account_id), (now_ms, item.clone()));
     Ok(Json(json!({ "item": item })))
 }
 

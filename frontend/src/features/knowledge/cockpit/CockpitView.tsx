@@ -64,24 +64,28 @@ export function CockpitView({ onOpenReview, onOpenAutoVerify }: CockpitViewProps
     );
   }
 
-  if (!completeness) {
-    return <div className={styles.loading}>正在加载知识库状态…</div>;
-  }
-
   return (
     <div className={styles.cockpit}>
       <section className={styles.gaugeWrap}>
-        <AnsweringModeGauge
-          mode={completeness.answeringMode}
-          needsReviewChunks={completeness.needsReviewChunks}
-          summary={completeness.summary}
-          labels={completeness.answeringModeLabels}
-        />
+        {completeness ? (
+          <AnsweringModeGauge
+            mode={completeness.answeringMode}
+            needsReviewChunks={completeness.needsReviewChunks}
+            summary={completeness.summary}
+            labels={completeness.answeringModeLabels}
+          />
+        ) : (
+          <div className={styles.loading}>正在计算知识完整度…</div>
+        )}
       </section>
 
       <section className={styles.block}>
         <span className={styles.sectionLabel}>知识覆盖</span>
-        <CoverageVerdict view={completeness} onDrillDown={onOpenReview} />
+        {completeness ? (
+          <CoverageVerdict view={completeness} onDrillDown={onOpenReview} />
+        ) : (
+          <div className={styles.loading}>正在计算知识完整度…</div>
+        )}
       </section>
 
       <section className={styles.block}>
@@ -112,7 +116,7 @@ export function CockpitView({ onOpenReview, onOpenAutoVerify }: CockpitViewProps
         </button>
       </section>
 
-      {completeness.gaps.length > 0 && (
+      {completeness && completeness.gaps.length > 0 && (
         <section className={styles.block}>
           <span className={styles.sectionLabel}>缺口明细</span>
           <ul className={styles.gapList}>

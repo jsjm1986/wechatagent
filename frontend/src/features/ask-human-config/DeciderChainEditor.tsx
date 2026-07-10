@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { api } from "../../lib/api";
+import { useAccountStore } from "../../stores/accountStore";
 import type { Contact, DeciderRef } from "../../types";
 import styles from "./AskHumanConfig.module.css";
 
@@ -18,12 +19,16 @@ export function DeciderChainEditor({
   const [contacts, setContacts] = useState<Contact[]>([]);
   const [q, setQ] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const accountId = useAccountStore((s) => s.currentAccountId());
 
   useEffect(() => {
     if (!picking) return;
     void (async () => {
       try {
-        const res = await api.get<{ items: Contact[] }>("/api/contacts?limit=100");
+        const url = accountId
+          ? `/api/contacts?limit=100&accountId=${encodeURIComponent(accountId)}`
+          : "/api/contacts?limit=100";
+        const res = await api.get<{ items: Contact[] }>(url);
         setContacts(res.items);
         setError(null);
       } catch (e) {
@@ -31,7 +36,7 @@ export function DeciderChainEditor({
         setContacts([]);
       }
     })();
-  }, [picking]);
+  }, [picking, accountId]);
 
   const inChain = new Set(chain.map((d) => d.wxid));
   const candidates = contacts
