@@ -2923,6 +2923,19 @@ async fn run_user_operation_gateway_inner(
     Ok(())
 }
 
+/// 判定单条 send 返回信封是否表示"提交成功"。优先读 MCP 统一成功信封的显式
+/// `ok===true`；无 ok 字段(旧信封)则回落"存在非空 newMsgId"。用于可观测判定。
+pub(crate) fn send_receipt_is_ok(response: &serde_json::Value) -> bool {
+    if let Some(ok) = response.get("ok").and_then(|v| v.as_bool()) {
+        return ok;
+    }
+    response
+        .get("newMsgId")
+        .and_then(|v| v.as_str())
+        .map(|s| !s.is_empty())
+        .unwrap_or(false)
+}
+
 /// Only callable from outbox_dispatcher (W4 / Task 5.4) and the legacy in-line
 /// gateway send paths during the W4 transition. Once 5.5 lands the gateway
 /// will route exclusively through outbox enqueue and the in-line callers will
@@ -2947,6 +2960,14 @@ pub(crate) async fn send_outbound_message(
         .get("newMsgId")
         .and_then(|value| value.as_str())
         .map(ToString::to_string);
+    // 新信封成功标志观测(不改变 .await? 的成功语义)：await 成功但信封无 ok/newMsgId
+    // 属异常(如空返回体)，warn 供排查，不拦截。
+    if !send_receipt_is_ok(&response) {
+        tracing::warn!(
+            account_id = %contact.account_id,
+            "send_outbound_message: MCP 返回无成功标志(ok/newMsgId 缺失),疑似异常信封"
+        );
+    }
     let mut raw = to_document(&response).unwrap_or_default();
     if let Some(extra_raw) = extra_raw {
         raw.insert("wechatagent", Bson::Document(extra_raw));
@@ -5239,6 +5260,39 @@ pub(crate) fn compute_taxonomy_guard_outcome(
         }
     }
     outcome
+}
+
+#[cfg(test)]
+mod send_receipt_tests {
+    use super::send_receipt_is_ok;
+    use serde_json::json;
+
+    #[test]
+    fn ok_true_is_success() {
+        assert!(send_receipt_is_ok(&json!({ "ok": true, "newMsgId": "123" })));
+    }
+
+    #[test]
+    fn ok_false_is_not_success() {
+        assert!(!send_receipt_is_ok(&json!({ "ok": false })));
+    }
+
+    #[test]
+    fn legacy_envelope_without_ok_but_with_newmsgid_is_success() {
+        // 旧信封无 ok 字段，但有非空 newMsgId → 兼容判成功。
+        assert!(send_receipt_is_ok(&json!({ "newMsgId": "8974400044288526000" })));
+    }
+
+    #[test]
+    fn neither_ok_nor_newmsgid_is_not_success() {
+        assert!(!send_receipt_is_ok(&json!({ "target": {} })));
+        assert!(!send_receipt_is_ok(&json!(null)));
+    }
+
+    #[test]
+    fn empty_newmsgid_is_not_success() {
+        assert!(!send_receipt_is_ok(&json!({ "newMsgId": "" })));
+    }
 }
 
 #[cfg(test)]
