@@ -262,7 +262,15 @@ export function ConfigureView(props: CockpitPanelProps) {
                   <Sparkles size={16} />
                   AI 重新分析
                 </button>
-                <button className="secondary" onClick={onDisableAgent} disabled={busy}>
+                <button
+                  className="secondary"
+                  onClick={() => {
+                    if (window.confirm(`确认停止对「${selected.remark || selected.nickname || selected.wxid}」的 Agent 运营？停止后将不再自动回复。`)) {
+                      onDisableAgent();
+                    }
+                  }}
+                  disabled={busy}
+                >
                   停止运营
                 </button>
               </>

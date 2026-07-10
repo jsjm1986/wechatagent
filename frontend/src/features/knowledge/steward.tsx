@@ -703,8 +703,8 @@ export function ImportWizard() {
         body: JSON.stringify(payload)
       });
       if (!r.ok) throw await parseApiError(r);
-      const data = (await r.json()) as { createdChunkIds?: string[]; created_chunk_ids?: string[] };
-      const ids = data.createdChunkIds ?? data.created_chunk_ids ?? [];
+      const data = (await r.json()) as { chunkIds?: string[] };
+      const ids = data.chunkIds ?? [];
       setCreated(ids);
       setStep(3);
       if (ids[0]) {
