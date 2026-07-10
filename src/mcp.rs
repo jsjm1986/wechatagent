@@ -719,13 +719,8 @@ pub async fn write_roster_snapshot(
     Ok(())
 }
 
-/// 后台静默自刷某账号的 roster 快照：fire-and-forget，不阻塞请求。最多
-/// `ROSTER_REFRESH_MAX_RETRIES` 次调 `fetch_roster_for_account`，**任何错误
-/// （含 AppError::Http 解码失败）都退避重试**（区别于同步路径 Err(other) 直接上抛）。
-/// 拿到就绪结果即覆盖写快照；用尽仍未就绪仅 warn（下次进频道再触发）。best-effort，
-/// 不加锁/去重，重复 spawn 覆盖写同一条无害。
-/// roster 后台刷新的 RAII 去重锁 guard:drop时移除in-flight键,保证任务正常结束/
-/// 提前return/**panic**(tokio::spawn内panic不传播,但Drop仍执行)时锁都释放,
+/// roster 后台刷新的 RAII 去重锁 guard：drop 时移除 in-flight 键，保证任务正常结束 /
+/// 提前 return / **panic**（tokio::spawn 内 panic 不传播，但 Drop 仍执行）时锁都释放，
 /// 避免键泄漏后该账号永远无法再刷新。
 pub(crate) struct RosterRefreshGuard {
     pub(crate) map: std::sync::Arc<dashmap::DashMap<String, ()>>,
@@ -738,6 +733,12 @@ impl Drop for RosterRefreshGuard {
     }
 }
 
+/// 后台静默自刷某账号的 roster 快照：fire-and-forget，不阻塞请求。最多
+/// `ROSTER_REFRESH_MAX_RETRIES` 次调 `fetch_roster_for_account`，**任何错误
+/// （含 AppError::Http 解码失败）都退避重试**（区别于同步路径 Err(other) 直接上抛）。
+/// 拿到就绪结果即覆盖写快照；用尽仍未就绪仅 warn（下次进频道再触发）。
+/// single-flight 去重（`roster_refreshing` 抢锁）：全局同一账号同时只有一个后台
+/// 任务在拉，前端多次轮询 / 多标签页 / force 连点都不叠加 spawn（防并发打爆 MCP SSE）。
 pub fn spawn_roster_refresh(state: AppState, workspace_id: String, account_id: String) {
     tokio::spawn(async move {
         // single-flight抢锁:键已存在→已有同账号后台任务在拉,直接放弃(去重)。
