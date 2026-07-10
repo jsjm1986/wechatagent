@@ -301,8 +301,8 @@ function UserOpsFeatureInner() {
             simulationTurns={simulationTurns}
             onAnalyzeProfile={analyzeProfile}
             onApplyGuidePreview={onApplyGuide}
-            onDisableAgent={disableAgent}
-            onEnableAgent={enableAgent}
+            onDisableAgent={async () => { await disableAgent(); void loadContactCounts(effectiveAccountId); }}
+            onEnableAgent={async () => { await enableAgent(); void loadContactCounts(effectiveAccountId); }}
             onGuideInstruction={setGuideInstruction}
             onPreviewGuide={previewGuideInstruction}
             onProfileNote={setProfileNote}
