@@ -175,6 +175,7 @@ pub(super) async fn list_contacts(
             .find_one(
                 doc! {
                     "workspace_id": &admin.current_workspace,
+                    "account_id": &account_id,
                     "contact_wxid": &wxid,
                     "direction": "inbound",
                 },
