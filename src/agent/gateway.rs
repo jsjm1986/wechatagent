@@ -5278,6 +5278,12 @@ mod send_receipt_tests {
     }
 
     #[test]
+    fn ok_false_short_circuits_even_with_newmsgid() {
+        // ok 字段存在时优先短路：ok:false 即判失败，忽略 newMsgId（不回落）。
+        assert!(!send_receipt_is_ok(&json!({ "ok": false, "newMsgId": "123" })));
+    }
+
+    #[test]
     fn legacy_envelope_without_ok_but_with_newmsgid_is_success() {
         // 旧信封无 ok 字段，但有非空 newMsgId → 兼容判成功。
         assert!(send_receipt_is_ok(&json!({ "newMsgId": "8974400044288526000" })));

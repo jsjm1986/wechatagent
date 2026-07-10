@@ -780,8 +780,14 @@ pub async fn chat_search_outbound(
         }),
     )
     .await?;
-    // 返回体形如 { items:[...], count }。call_tool_with_key 已剥壳到 structuredContent 本体。
-    let items = resp.get("items").cloned().unwrap_or(serde_json::Value::Null);
+    // 返回体形如 { items:[...], count }。call_tool_with_key 已剥壳到 structuredContent 本体，
+    // 故 items 在顶层。防御：万一某调用方/形态未剥壳，回落 /structuredContent/items——
+    // 否则取不到 items 会静默判 false（no-op 退回"timeout 即重发"），而非报错。
+    let items = resp
+        .get("items")
+        .cloned()
+        .or_else(|| resp.pointer("/structuredContent/items").cloned())
+        .unwrap_or(serde_json::Value::Null);
     Ok(chat_search_hit(&items, content, since.timestamp_millis()))
 }
 
