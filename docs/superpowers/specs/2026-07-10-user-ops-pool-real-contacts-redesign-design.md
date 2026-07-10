@@ -2,7 +2,9 @@
 
 **日期**：2026-07-10
 **状态**：设计讨论中，待用户复审
-**范围**：webhook 建档过滤/富化 + 存量数据一次性治理 + list_contacts 读时富化 + 前端 ContactsView 漏斗工作台。跨后端+migration+前端三层，但都围绕同一目标：把运营池变成「主动来找过你的私聊真人」的可理解漏斗。
+**范围**：webhook 建档过滤/富化 + 存量数据一次性治理 + list_contacts 读时富化/排序 + 前端 ContactsView 漏斗工作台（含标签展示、超时未跟进提醒、批量启用）。跨后端+migration+前端三层，都围绕同一目标：把运营池变成「主动来找过你的私聊真人」的**干净、可理解、好用**的运营工作台。
+
+**范围边界（用户拍板 B 档：修复 1-2 + 零成本增强 3-6）**：本轮做数据现成、不需新建数据系统的能力。**明确不做**（放第二轮单独 brainstorm，因需新建数据系统）：真·未读状态（Contact 无「已读」概念，需新建 read_at + 写路径）、来源追踪（Contact 无 source/referrer 字段，建档也没记来源）、顶部聚合概览数字（需新聚合端点）。这三项已亲验数据模型不支持，不在本轮。
 
 ## 背景与问题（117 生产亲验）
 
@@ -68,13 +70,14 @@
 - **绝不带 `APP_ENV=production` 守卫**（m011/m012 那种守卫会在非 prod 删数据；本 migration 是数据清洗，必须无条件对所有环境的存量生效）。
 - migration 幂等：重复运行结果一致（删已删的无操作、回填同值、清已清的无操作）。
 
-### 改动 3：展示层后端 —— 读时富化 + API 摘要字段
+### 改动 3：展示层后端 —— 读时富化 + 排序 + API 摘要字段
 
 `src/routes/contacts.rs`：
 
 1. **list_contacts 读时兜底富化**（contacts.rs:102-160）：对 nickname 为空 / avatar_url 为空的 contact，按 wxid 左连 roster snapshot 补上（自愈——建档时 roster 未覆盖的新好友，下次列表就显示对了）。同时**读时过滤 gh_/@chatroom**（双保险，防历史残留/migration 遗漏）。
 2. **ApiContact 新增最近入站消息摘要字段**（`src/models.rs:3327` ApiContact）：新增 `last_inbound_preview: Option<String>`（最近一条 inbound 的 content 截断，如前 N 字）。
    - **实现方式留 writing-plans 定**：候选 A = list_contacts 为每个 contact 查最近一条 inbound（N+1，66 条可接受）；候选 B = 建档/收消息时把最近消息片段冗余到 contact 上（避免 N+1，但加写路径字段）。设计不锁定，实现时按性能/复杂度权衡。
+3. **能力 3 · 按最近来消息排序**：`list_contacts` 现在 sort `updated_at: -1`（contacts.rs:138）。改为 `last_inbound_at: -1`（次级 `updated_at: -1` 兜底 last_inbound_at 为空的老记录）——最近主动来消息的人排最前，符合「热线索优先」。`last_inbound_at` 现成字段，仅改 sort doc。
 
 ### 改动 4：前端漏斗工作台 —— ContactsView
 
@@ -83,9 +86,12 @@
 1. **顶部**（复用现有 `panelHead` 结构，不新建嵌套 panel）：标题「运营池」+ 定位副标题「主动来找过你的人 → 挑价值高的交 AI 接管」+ 一行小字「区别于通讯录（全部好友）：这里只收主动来消息的人」（muted 灰）。
 2. **三档 tab**（复用 `segmented`）：待启用 / Agent / 全部，下方一句人话副标题「待你评估是否开 AI 自动回复」。
 3. **分档差异化行**：
-   - **待启用（normal）**：头像（roster 富化，回落首字母）+ 昵称/备注 + 最近来消息时间（`last_inbound_at` 相对时间「3 小时前」）+ 最近消息摘要（`last_inbound_preview` 原文截断）。
-   - **Agent（managed）**：头像 + 昵称/备注 + 运营阶段徽章（`operation_state` 经字典转中文）+ 最近互动时间。
+   - **待启用（normal）**：头像（roster 富化，回落首字母，放大到 40px）+ 昵称/备注 + 最近来消息时间（`last_inbound_at` 相对时间「3 小时前」）+ 最近消息摘要（`last_inbound_preview` 原文截断）+ 标签（能力 4）+ 超时提醒（能力 5）+ 行尾「启用 Agent」按钮。
+   - **Agent（managed）**：头像 + 昵称/备注 + 运营阶段徽章（`operation_state` 经字典转中文）+ 标签（能力 4）+ 最近互动时间。
 4. **空态引导**：池空时显示「还没有人主动来找你，去通讯录主动开启 Agent 运营」。
+5. **能力 4 · 每行标签**：渲染 `manual_tags` + `confirmed_tags`（ApiContact 现成字段，models.rs:3346-3351）为小标签 chip。无标签不显示。标签文案经现有字典（避免裸 canonical id，延续前端裸枚举治理惯例）。
+6. **能力 5 · 超时未跟进提醒**（纯前端派生，不需已读系统）：当 `last_inbound_at > last_outbound_at`（客户来了消息、之后没有出站回复）且距今超过阈值（如 24h）→ 行上显示「N 小时未跟进」醒目标记（暖色，非 danger 红）。纯前端从现成时间字段算，不落库。
+7. **能力 6 · 批量选择 + 批量启用 Agent**：**复用 RosterView 已有多选范式**（`frontend/src/features/user-ops/RosterView.tsx:50` `selectedWxids: Set<string>` + :138 调 `batchEnable`）。待启用档每行加勾选框，选中后顶部出现「批量启用 Agent（N）」按钮，调现有 `userOpsStore.batchEnable`（userOpsStore.ts:494 → POST /api/contacts/batch-enable，端点已存在）。启用后刷新列表 + count。**仅待启用档提供**（Agent 档已托管无需再启用）。
 
 **取值优先级**（沿用现有 legacy.tsx:509,513）：`remark || nickname || wxid`。
 
@@ -97,7 +103,8 @@
 - **webhook 建档测试**：gh_/群 payload → 不建 contact（但消息落库）；真人 payload + roster 命中 → 建档带正确 nickname/avatar；真人 payload + roster 未命中 → 建档仅 wxid。
 
 ### 前端
-- ContactsView 契约测试（`frontend/src/__tests__/features/user-ops/`）：三档人话文案渲染；待启用行显示时间+摘要、Agent 行显示阶段徽章；空态引导文案；导入框已移除（延续 PR#166）。
+- ContactsView 契约测试（`frontend/src/__tests__/features/user-ops/`）：三档人话文案渲染；待启用行显示时间+摘要+启用按钮、Agent 行显示阶段徽章；标签 chip 渲染（能力 4）；超时未跟进标记按时间派生（能力 5：`last_inbound_at > last_outbound_at` 且超阈值→显示，否则不显示）；批量选择+批量启用按钮出现逻辑（能力 6）；空态引导文案；导入框已移除（延续 PR#166）。
+- **排序纯函数单测（能力 3，若排序有前端参与）**：若排序在后端 sort 完成则由后端测覆盖；前端不重排。
 
 ### 验证门（CLAUDE.md 基线，硬性）
 1. `cargo test --lib` ≥ 350 passed / 0 failed。
@@ -106,14 +113,20 @@
 4. `cd frontend && npx vitest run`（前端契约门）。
 5. `scripts/check-no-human-takeover.{sh,ps1}`（新增前端文案不得含禁用词——「待启用/Agent/运营池」均安全）。
 
-## 不做的事（YAGNI）
+## 不做的事（YAGNI + 放第二轮）
 
+**本轮 YAGNI**：
 - 不给 normal 联系人调 LLM 生成智能摘要（保持「未托管不调 LLM」现有语义；摘要=原文截断）。
 - 不给 normal 落 operation_state（未运营的人无状态机初态，语义正确）。
 - 不改 webhook 入站消息落库逻辑（gh_/群消息仍照常记 conversation_messages，只是不建 contact）。
-- 不改 principal 请示通道 / quiet-hours / gateway 决策链路 / batch-enable 托管路径。
-- 不改通讯录 RosterView（已正确）。
+- 不改 principal 请示通道 / quiet-hours / gateway 决策链路 / batch-enable 后端端点（仅前端复用）。
+- 不改通讯录 RosterView（已正确，仅复用其多选范式）。
 - 不加分页（运营池规模小）。
+
+**明确放第二轮（需新建数据系统，本轮亲验数据模型不支持）**：
+- **真·未读状态（红点）**：Contact 无「已读/未读」概念，需新建 `read_at` 字段 + 前端标记已读的写路径。本轮的「超时未跟进」（能力 5）是纯时间派生的替代，不等于未读。
+- **来源追踪**：Contact 无 source/referrer 字段，webhook 建档也没记来源，历史无法回溯。需新增字段 + 建档写入。
+- **顶部聚合概览数字**（今日新增/待跟进 N 个）：需新增聚合 count 端点。
 
 ## 关联
 
