@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { api } from "../../lib/api";
+import { useAccountStore } from "../../stores/accountStore";
 import { useCampaignStore } from "../../stores/campaignStore";
 import { useUiStore } from "../../stores/uiStore";
 import { ProductMultiSelect } from "./ProductMultiSelect";
@@ -12,6 +13,7 @@ export default function CampaignCreate() {
   const setView = useCampaignStore((s) => s.setView);
   const openReport = useCampaignStore((s) => s.openReport);
   const setError = useUiStore((s) => s.setError);
+  const currentAccountId = useAccountStore((s) => s.currentAccountId);
 
   const [title, setTitle] = useState("");
   const [intentText, setIntentText] = useState("");
@@ -42,6 +44,7 @@ export default function CampaignCreate() {
       if (!id) {
         const created = await api.post<{ id: string }>("/api/campaigns", {
           title: title.trim(), intentText: intentText.trim(), segmentFilter: segmentFilter(),
+          accountId: currentAccountId() || undefined,
         });
         id = created.id;
         setDraftCampaignId(id);
