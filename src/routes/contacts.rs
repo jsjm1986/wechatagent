@@ -157,6 +157,19 @@ pub(super) async fn list_contacts(
                 .build(),
         )
         .await?;
+    // 读时兜底富化（spec 改动3.1）：webhook 只在首次建档时按 roster 富化昵称/头像，
+    // 若某真人在其 roster 快照（>24h 异步刷新）尚未收录时来消息，建档时拿不到昵称头像
+    // 且再无自愈点。此处读一次快照（整表一条 doc，非 per-contact），对 nickname/avatar
+    // 为空的联系人补齐——下次快照刷新后列表即显示正确身份。快照缺失/读失败不阻断（返回空 map）。
+    let roster_identity: std::collections::HashMap<String, (Option<String>, Option<String>)> =
+        match crate::mcp::read_roster_snapshot(&state, &admin.current_workspace, &account_id).await {
+            Ok(Some(snap)) => snap
+                .friends
+                .into_iter()
+                .map(|f| (f.wxid, (f.nickname, f.avatar_url)))
+                .collect(),
+            _ => std::collections::HashMap::new(),
+        };
     let mut items = Vec::new();
     while let Some(contact) = cursor.try_next().await? {
         // 双保险：即使 migration 已清，读时再过滤一次非真人（公众号 gh_/群
@@ -166,6 +179,17 @@ pub(super) async fn list_contacts(
         }
         let wxid = contact.wxid.clone();
         let mut api = ApiContact::from(contact);
+        // 读时兜底富化：仅补空字段，不覆盖已有 nickname/avatar（与建档 $set 语义一致）。
+        if api.nickname.is_none() || api.avatar_url.is_none() {
+            if let Some((roster_nick, roster_avatar)) = roster_identity.get(&wxid) {
+                if api.nickname.is_none() {
+                    api.nickname = roster_nick.clone();
+                }
+                if api.avatar_url.is_none() {
+                    api.avatar_url = roster_avatar.clone();
+                }
+            }
+        }
         // 最近一条入站消息原文截断（待启用档展示，帮运营判断是否开 Agent）。
         // direction 存储值为小写 "inbound"（MessageDirection serde rename_all="lowercase"）。
         // 纯原文截断，非 LLM 摘要——normal 联系人不调 LLM。
