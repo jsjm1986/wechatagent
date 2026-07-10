@@ -1,5 +1,4 @@
 import { useEffect } from "react";
-import type { FormEvent } from "react";
 import {
   ContactsView,
   UserOpsModeHeader,
@@ -83,7 +82,6 @@ function UserOpsFeatureInner() {
     relationshipType,
     referredSpecialistAt,
     profileEditDraft,
-    importQuery,
     searchQuery,
     guideInstruction,
     guidePreview,
@@ -97,6 +95,7 @@ function UserOpsFeatureInner() {
     editingPlaybookId,
     guideBusy,
     simulationBusy,
+    contactCounts,
     // Domain 配置相关
     operationDomains,
     domainDrafts,
@@ -111,7 +110,6 @@ function UserOpsFeatureInner() {
     setGuideInstruction,
     setSimulationInput,
     setSelectedPlaybookId,
-    setImportQuery,
     setSearchQuery,
     setPlaybookDraft,
     setGeneratePlaybookText,
@@ -122,8 +120,8 @@ function UserOpsFeatureInner() {
     loadMessages,
     loadPlaybooks,
     loadContacts,
+    loadContactCounts,
     loadDomains,
-    importContacts,
     // 15个业务回调
     enableAgent,
     disableAgent,
@@ -206,12 +204,11 @@ function UserOpsFeatureInner() {
     }
   };
 
-  // 计算衍生状态
-  const managedCount = useMemo(
-    () => contacts.filter((contact) => contact.agentStatus === "managed").length,
-    [contacts]
-  );
-  const normalCount = contacts.length - managedCount;
+  // 计算衍生状态——计数改用后端真实 count（contactCounts），不再对已加载数组 .filter，
+  // 避免 list_contacts 的 limit 截断导致计数偏小。managedCount 另有 TraditionalOpsTabs
+  // 消费（下方传入），保留该派生名，仅切数据源。
+  const managedCount = contactCounts.managed;
+  const normalCount = contactCounts.normal;
 
   const filteredContacts = useMemo(() => {
     if (contactTab === "managed") return contacts.filter((contact) => contact.agentStatus === "managed");
@@ -223,12 +220,7 @@ function UserOpsFeatureInner() {
   // 这里不再用占位 tasks 反推；徽标后续可订阅 operationsStore.pending 派生。
   const pendingTasks = 0;
 
-  // 导入好友：表单提交 → store.importContacts（search→import 两步写库后刷新列表）。
-  const onImportContacts = (event: FormEvent) => {
-    event.preventDefault();
-    void importContacts();
-  };
-  // 过滤已导入好友：onBlur 时按当前 searchQuery 重拉列表（后端 q= 子串过滤）。
+  // 过滤已互动好友：onBlur 时按当前 searchQuery 重拉列表（后端 q= 子串过滤）。
   const reloadFiltered = () => {
     if (effectiveAccountId) void loadContacts(effectiveAccountId);
   };
@@ -244,9 +236,10 @@ function UserOpsFeatureInner() {
     if (effectiveAccountId) {
       setSelected(null); // 切账号清掉上个账号选中的联系人，避免串号
       void loadContacts(effectiveAccountId);
+      void loadContactCounts(effectiveAccountId);
       void loadPlaybooks(effectiveAccountId);
     }
-  }, [effectiveAccountId, loadContacts, loadPlaybooks, setSelected]);
+  }, [effectiveAccountId, loadContacts, loadContactCounts, loadPlaybooks, setSelected]);
 
   // 切到 traditional 模式时加载 souls/promptTemplates（prompts tab 复用 strategyStore）和 domains
   useEffect(() => {
@@ -271,18 +264,14 @@ function UserOpsFeatureInner() {
       {userOpsMode === "smart" && (
         <section className="userCockpitGrid">
           <ContactsView
-            busy={busy}
             contactTab={contactTab}
             contacts={filteredContacts}
-            importQuery={importQuery}
             query={searchQuery}
-            totalCount={contacts.length}
+            totalCount={contactCounts.all}
             managedCount={managedCount}
             normalCount={normalCount}
             selected={selected}
             onContactTab={setContactTab}
-            onImport={onImportContacts}
-            onImportQuery={setImportQuery}
             onLoadAll={reloadFiltered}
             onOpenContact={openContact}
             onQuery={setSearchQuery}
@@ -312,8 +301,8 @@ function UserOpsFeatureInner() {
             simulationTurns={simulationTurns}
             onAnalyzeProfile={analyzeProfile}
             onApplyGuidePreview={onApplyGuide}
-            onDisableAgent={disableAgent}
-            onEnableAgent={enableAgent}
+            onDisableAgent={async () => { await disableAgent(); void loadContactCounts(effectiveAccountId); }}
+            onEnableAgent={async () => { await enableAgent(); void loadContactCounts(effectiveAccountId); }}
             onGuideInstruction={setGuideInstruction}
             onPreviewGuide={previewGuideInstruction}
             onProfileNote={setProfileNote}

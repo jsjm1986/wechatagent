@@ -42,7 +42,6 @@ interface UserOpsState {
   escalationPendingCount: number;
 
   // 表单/草稿
-  importQuery: string;
   searchQuery: string;
   profileNote: string;
   customAgentInstructions: string;
@@ -77,6 +76,9 @@ interface UserOpsState {
   // 仅就绪结果落缓存（syncing 中不缓存，允许自动重拉覆盖）。force 才重拉。
   rosterCache: Record<string, { items: RosterEntry[]; syncing: boolean; fetchedAt: number }>;
 
+  // 运营池三 tab 的后端真实计数（不受 list_contacts 的 limit 截断影响）。
+  contactCounts: { all: number; managed: number; normal: number };
+
   // 忙碌状态
   guideBusy: boolean;
   simulationBusy: boolean;
@@ -94,7 +96,6 @@ interface UserOpsActions {
   setGuideInstruction: (instruction: string) => void;
   setSimulationInput: (input: string) => void;
   setSelectedPlaybookId: (id: string) => void;
-  setImportQuery: (value: string) => void;
   setSearchQuery: (value: string) => void;
   setPlaybookDraft: (draft: PlaybookDraft) => void;
   setGeneratePlaybookText: (text: string) => void;
@@ -111,7 +112,7 @@ interface UserOpsActions {
   loadEscalationCount: () => Promise<void>;
   loadPlaybooks: (accountId: string) => Promise<void>;
   loadContacts: (accountId: string) => Promise<void>;
-  importContacts: () => Promise<void>;
+  loadContactCounts: (accountId: string) => Promise<void>;
   loadRoster: (accountId: string, opts?: { force?: boolean }) => Promise<{ items: RosterEntry[]; syncing: boolean }>;
   batchEnable: (payload: {
     accountId: string;
@@ -288,6 +289,7 @@ async function refreshContacts(currentAccountId: string | null, q?: string) {
 
   try {
     const params = [`accountId=${encodeURIComponent(currentAccountId)}`];
+    params.push("limit=500");
     const trimmed = q?.trim();
     if (trimmed) params.push(`q=${encodeURIComponent(trimmed)}`);
     const contactData = await api.get<{ items: Contact[] }>(`/api/contacts?${params.join("&")}`);
@@ -317,7 +319,6 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
   referredSpecialistAt: undefined,
   referredCardId: undefined,
   profileEditDraft: {},
-  importQuery: "",
   searchQuery: "",
   guideInstruction: "",
   guidePreview: null,
@@ -336,6 +337,7 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
   domainDrafts: {},
 
   rosterCache: {},
+  contactCounts: { all: 0, managed: 0, normal: 0 },
 
   guideBusy: false,
   simulationBusy: false,
@@ -351,7 +353,6 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
   setGuideInstruction: (instruction) => set({ guideInstruction: instruction }),
   setSimulationInput: (input) => set({ simulationInput: input }),
   setSelectedPlaybookId: (id) => set({ selectedPlaybookId: id }),
-  setImportQuery: (value) => set({ importQuery: value }),
   setSearchQuery: (value) => set({ searchQuery: value }),
   setPlaybookDraft: (draft) => set({ playbookDraft: draft }),
   setGeneratePlaybookText: (text) => set({ generatePlaybookText: text }),
@@ -455,34 +456,17 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
     await refreshContacts(accountId || null, get().searchQuery);
   },
 
-  // 搜索并导入好友：先 /search 拿只读候选，再 /import 真正写库，最后刷新列表。
-  // 拆两步避免“搜索即改库”的误解（沿用后端 search/import 双路由语义）。
-  importContacts: async () => {
-    const currentAccountId = useAccountStore.getState().currentAccountId();
-    const { importQuery, searchQuery } = get();
-    if (!importQuery.trim() || !currentAccountId) return;
-
-    useUiStore.getState().setBusy(true);
-    useUiStore.getState().setError("");
-
+  // 拉运营池三 tab 的后端真实计数。失败回落保留旧值（不弹错、不清零），
+  // 避免网络抖动把计数瞬间清 0 误导运营。
+  loadContactCounts: async (accountId) => {
+    if (!accountId) return;
     try {
-      const search = await api.post<{ items: unknown[] }>("/api/contacts/search", {
-        query: importQuery,
-        accountId: currentAccountId
-      });
-      const candidates = search.items || [];
-      if (candidates.length) {
-        await api.post<{ items: Contact[] }>("/api/contacts/import", {
-          accountId: currentAccountId,
-          candidates
-        });
-      }
-      set({ importQuery: "" });
-      await refreshContacts(currentAccountId, searchQuery);
-    } catch (error) {
-      useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
-    } finally {
-      useUiStore.getState().setBusy(false);
+      const data = await api.get<{ all: number; managed: number; normal: number }>(
+        `/api/contacts/counts?accountId=${encodeURIComponent(accountId)}`
+      );
+      set({ contactCounts: { all: data.all, managed: data.managed, normal: data.normal } });
+    } catch {
+      // 保留旧值，静默降级。
     }
   },
 
