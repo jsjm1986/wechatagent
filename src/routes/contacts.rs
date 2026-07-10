@@ -7,7 +7,7 @@ use axum::{
 use futures::TryStreamExt;
 use mongodb::{
     bson::{doc, oid::ObjectId, to_bson, DateTime, Document, Regex},
-    options::FindOptions,
+    options::{FindOneOptions, FindOptions},
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -99,6 +99,20 @@ pub(super) struct DealEventRequest {
     event_kind: Option<String>,
 }
 
+/// 待启用档预览取原文的最大字符数（按字符非字节，避免中文截半）。
+const INBOUND_PREVIEW_MAX_CHARS: usize = 30;
+
+/// 按字符（非字节）截断，避免中文截半。超长加省略号。
+/// 这是纯原文截断，绝非 LLM 智能摘要——未托管联系人不调 LLM（产品红线）。
+pub(crate) fn truncate_preview(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_string();
+    }
+    let head: String = trimmed.chars().take(max_chars).collect();
+    format!("{head}…")
+}
+
 pub(super) async fn list_contacts(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
@@ -150,7 +164,30 @@ pub(super) async fn list_contacts(
         if !crate::webhooks::is_operatable_person(&contact.wxid) {
             continue;
         }
-        items.push(ApiContact::from(contact));
+        let wxid = contact.wxid.clone();
+        let mut api = ApiContact::from(contact);
+        // 最近一条入站消息原文截断（待启用档展示，帮运营判断是否开 Agent）。
+        // direction 存储值为小写 "inbound"（MessageDirection serde rename_all="lowercase"）。
+        // 纯原文截断，非 LLM 摘要——normal 联系人不调 LLM。
+        if let Ok(Some(msg)) = state
+            .db
+            .messages()
+            .find_one(
+                doc! {
+                    "workspace_id": &admin.current_workspace,
+                    "contact_wxid": &wxid,
+                    "direction": "inbound",
+                },
+                FindOneOptions::builder()
+                    .sort(doc! { "created_at": -1 })
+                    .build(),
+            )
+            .await
+        {
+            api.last_inbound_preview =
+                Some(truncate_preview(&msg.content, INBOUND_PREVIEW_MAX_CHARS));
+        }
+        items.push(api);
     }
     Ok(Json(json!({ "items": items })))
 }
@@ -1517,6 +1554,16 @@ pub(super) async fn get_operation_health(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncate_preview_keeps_short_and_cuts_long() {
+        assert_eq!(truncate_preview("你好", 30), "你好");
+        assert_eq!(truncate_preview("  空白裁剪  ", 30), "空白裁剪");
+        let long = "一二三四五六七八九十".repeat(5); // 50 chars
+        let out = truncate_preview(&long, 30);
+        assert_eq!(out.chars().count(), 31); // 30 + 省略号
+        assert!(out.ends_with('…'));
+    }
 
     #[test]
     fn contact_count_filters_isolate_workspace_and_account() {
