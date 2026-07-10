@@ -72,6 +72,8 @@ async fn cleans_up_stale_contact_identity() {
                 "wxid": "gh_official_1",
                 "nickname": "Demi",
                 "agent_status": "normal",
+                "created_at": mongodb::bson::DateTime::now(),
+                "updated_at": mongodb::bson::DateTime::now(),
             },
             None,
         )
@@ -87,6 +89,8 @@ async fn cleans_up_stale_contact_identity() {
                 "wxid": "12345@chatroom",
                 "nickname": "Demi",
                 "agent_status": "normal",
+                "created_at": mongodb::bson::DateTime::now(),
+                "updated_at": mongodb::bson::DateTime::now(),
             },
             None,
         )
@@ -102,6 +106,8 @@ async fn cleans_up_stale_contact_identity() {
                 "wxid": "wxid_real",
                 "nickname": "Demi",
                 "agent_status": "normal",
+                "created_at": mongodb::bson::DateTime::now(),
+                "updated_at": mongodb::bson::DateTime::now(),
             },
             None,
         )
@@ -117,6 +123,8 @@ async fn cleans_up_stale_contact_identity() {
                 "wxid": "wxid_demi",
                 "nickname": "Demi",
                 "agent_status": "normal",
+                "created_at": mongodb::bson::DateTime::now(),
+                "updated_at": mongodb::bson::DateTime::now(),
             },
             None,
         )
@@ -133,6 +141,8 @@ async fn cleans_up_stale_contact_identity() {
                 "nickname": "Demi",
                 "agent_status": "managed",
                 "operation_state": "need_discovery",
+                "created_at": mongodb::bson::DateTime::now(),
+                "updated_at": mongodb::bson::DateTime::now(),
             },
             None,
         )
