@@ -5,6 +5,7 @@ use axum::Router;
 use mongodb::bson::DateTime;
 use tokio::net::TcpListener;
 use tower_http::{
+    compression::CompressionLayer,
     cors::{Any, CorsLayer},
     services::{ServeDir, ServeFile},
     trace::TraceLayer,
@@ -319,7 +320,11 @@ async fn async_main() -> anyhow::Result<()> {
                 .allow_origin(Any)
                 .allow_methods(Any)
                 .allow_headers(Any),
-        );
+        )
+        // gzip 压缩所有响应（对带 Accept-Encoding: gzip 的客户端生效）。roster 端点
+        // 4832 好友 ~1.5MB JSON 高度可压（头像 URL / 字段名重复），实测压到 ~1/6；
+        // 静态前端 JS/CSS 也一并受益。挂最外层：响应流出时最后一步压缩。
+        .layer(CompressionLayer::new());
 
     let addr: SocketAddr = format!("{}:{}", config.app_host, config.app_port).parse()?;
     let listener = TcpListener::bind(addr).await?;
