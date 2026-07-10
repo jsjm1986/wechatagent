@@ -264,7 +264,6 @@ function UserOpsFeatureInner() {
       {userOpsMode === "smart" && (
         <section className="userCockpitGrid">
           <ContactsView
-            busy={busy}
             contactTab={contactTab}
             contacts={filteredContacts}
             query={searchQuery}
