@@ -51,6 +51,10 @@ use super::run_envelope::SOURCE_KIND_MANUAL_SEND;
 /// 另一次并发发送。60s × 2 次（媒体上传 + 发送）= 120s 下界，取 150s 留裕度。
 const MCP_SEND_TIMEOUT_SECONDS: u64 = 150;
 
+/// timeout 兜底里调 chat_search 核对的独立短超时——核对本身绝不能卡死 dispatcher。
+/// 超时/出错即回落本地 mcp_call_logs 核对。
+const CHAT_SEARCH_VERIFY_TIMEOUT_SECONDS: u64 = 15;
+
 /// 单条 send 内最坏情况下顺序发起的 MCP HTTP 调用次数。媒体发送 =
 /// `media_upload_base64`（media_id 缓存未命中时）+ `message_send_*`，共 2 次；
 /// 文本 / 名片各 1 次。dispatcher 外层 timeout 必须 > 本值 × 每次 reqwest 上界
@@ -845,14 +849,33 @@ pub async fn process_entry(state: &AppState, entry: &OutboxEntry) -> AppResult<(
                 )
                 .await
             } else {
-                mcp_already_succeeded(
-                    state,
-                    &entry.account_id,
-                    &entry.contact_wxid,
-                    &entry.content,
-                    entry.created_at,
+                // 先查 MCP chat_search(server 真实已发记录，同步落库、失败不写)——不受本地
+                // timeout 取消 mcp_call_logs 写入的影响。带独立短超时；超时/出错回落本地日志核对。
+                match tokio::time::timeout(
+                    Duration::from_secs(CHAT_SEARCH_VERIFY_TIMEOUT_SECONDS),
+                    crate::mcp::chat_search_outbound(
+                        state,
+                        &entry.account_id,
+                        &entry.contact_wxid,
+                        &entry.content,
+                        entry.created_at,
+                    ),
                 )
                 .await
+                {
+                    Ok(Ok(hit)) => Ok(hit),
+                    // chat_search 出错 / 超时 → 回落本地 mcp_call_logs 核对(不倒退)。
+                    Ok(Err(_)) | Err(_) => {
+                        mcp_already_succeeded(
+                            state,
+                            &entry.account_id,
+                            &entry.contact_wxid,
+                            &entry.content,
+                            entry.created_at,
+                        )
+                        .await
+                    }
+                }
             };
             if let Ok(true) = already
             {
@@ -867,7 +890,7 @@ pub async fn process_entry(state: &AppState, entry: &OutboxEntry) -> AppResult<(
                                 "status": OutboxStatus::Sent.as_str(),
                                 "sent_at": now,
                                 "updated_at": now,
-                                "last_error": "send timeout (150s) but MCP already succeeded — confirmed via mcp_call_logs",
+                                "last_error": "send timeout (150s) but MCP already succeeded — confirmed via chat_search/mcp_call_logs",
                             },
                             "$unset": {
                                 "worker_id": "",
