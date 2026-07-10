@@ -148,6 +148,38 @@ pub(super) async fn list_contacts(
     Ok(Json(json!({ "items": items })))
 }
 
+/// 计数端点的 filter 构造（抽纯函数便于单测口径正确性）。
+/// base 与 `list_contacts`（本文件上方）的 workspace+account filter 同源；
+/// managed 在其上加 `agent_status="managed"`。AgentStatus 仅 Normal/Managed
+/// 两态（models.rs），故调用方 `normal = all - managed` 精确无第三态遗漏。
+fn contact_count_filters(workspace_id: &str, account_id: &str) -> (Document, Document) {
+    let base = doc! { "workspace_id": workspace_id, "account_id": account_id };
+    let mut managed = base.clone();
+    managed.insert("agent_status", "managed");
+    (base, managed)
+}
+
+/// `GET /api/contacts/counts?accountId=xxx`
+///
+/// 返回运营池三个 tab 的**后端真实计数** `{ all, managed, normal }`，
+/// 不受 `list_contacts` 的 limit 截断影响。口径与 `list_contacts` 的
+/// workspace+account filter 同源。IDOR：workspace 来自 AuthenticatedAdmin，
+/// 不接受请求体 workspace。
+pub(super) async fn count_contacts(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
+    Query(query): Query<ContactQuery>,
+) -> AppResult<Json<Value>> {
+    let account_id = query
+        .account_id
+        .unwrap_or_else(|| state.config.default_account_id.clone());
+    let (base, managed_filter) = contact_count_filters(&admin.current_workspace, &account_id);
+    let all = state.db.contacts().count_documents(base, None).await?;
+    let managed = state.db.contacts().count_documents(managed_filter, None).await?;
+    let normal = all.saturating_sub(managed);
+    Ok(Json(json!({ "all": all, "managed": managed, "normal": normal })))
+}
+
 /// 波 A3：只搜索不写库的纯查询接口。
 ///
 /// MCP 调 `contacts_search` 返回原始候选列表，前端可在用户确认后再调
@@ -1478,6 +1510,19 @@ pub(super) async fn get_operation_health(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contact_count_filters_isolate_workspace_and_account() {
+        let (base, managed) = contact_count_filters("ws1", "acct1");
+        // base：仅 workspace + account 隔离（与 list_contacts 同源）。
+        assert_eq!(base.get_str("workspace_id").unwrap(), "ws1");
+        assert_eq!(base.get_str("account_id").unwrap(), "acct1");
+        assert!(base.get("agent_status").is_none(), "base 不得含 agent_status");
+        // managed：在 base 基础上加 agent_status=managed。
+        assert_eq!(managed.get_str("workspace_id").unwrap(), "ws1");
+        assert_eq!(managed.get_str("account_id").unwrap(), "acct1");
+        assert_eq!(managed.get_str("agent_status").unwrap(), "managed");
+    }
 
     #[test]
     fn admin_dim_apply_maps_reject_to_bad_request() {

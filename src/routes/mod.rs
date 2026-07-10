@@ -173,7 +173,8 @@ use contacts::{
     analyze_contact_profile, add_deal_event, batch_enable_endpoint, clear_referral, disable_agent,
     enable_agent,
     get_contact, get_contact_memory_card, get_operating_memory, get_operation_health,
-    import_contacts_endpoint, list_contact_memory_candidates, list_contacts, list_entitlements,
+    count_contacts, import_contacts_endpoint, list_contact_memory_candidates, list_contacts,
+    list_entitlements,
     list_outcome_events, roster_endpoint, run_contact_memory_consolidation,
     search_contacts_endpoint, search_import_contacts, update_operating_memory,
     update_operation_profile, update_profile_note, update_assist_override,
@@ -344,6 +345,7 @@ pub fn api_router(state: AppState) -> Router<AppState> {
         .route("/accounts/login/poll", get(login_poll))
         .route("/accounts/:id/mcp-key", put(update_account_mcp_key))
         .route("/contacts", get(list_contacts))
+        .route("/contacts/counts", get(count_contacts))
         .route("/contacts/search", post(search_contacts_endpoint))
         .route("/contacts/import", post(import_contacts_endpoint))
         .route("/contacts/search-import", post(search_import_contacts))
