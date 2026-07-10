@@ -19,13 +19,12 @@ export function DeciderChainEditor({
   const [contacts, setContacts] = useState<Contact[]>([]);
   const [q, setQ] = useState("");
   const [error, setError] = useState<string | null>(null);
-  const currentAccountId = useAccountStore((s) => s.currentAccountId);
+  const accountId = useAccountStore((s) => s.currentAccountId());
 
   useEffect(() => {
     if (!picking) return;
     void (async () => {
       try {
-        const accountId = currentAccountId();
         const url = accountId
           ? `/api/contacts?limit=100&accountId=${encodeURIComponent(accountId)}`
           : "/api/contacts?limit=100";
@@ -37,7 +36,7 @@ export function DeciderChainEditor({
         setContacts([]);
       }
     })();
-  }, [picking, currentAccountId]);
+  }, [picking, accountId]);
 
   const inChain = new Set(chain.map((d) => d.wxid));
   const candidates = contacts

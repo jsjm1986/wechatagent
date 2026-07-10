@@ -357,12 +357,11 @@ function ContactPicker({
 }) {
   const [contacts, setContacts] = useState<Contact[]>([]);
   const [q, setQ] = useState("");
-  const currentAccountId = useAccountStore((s) => s.currentAccountId);
+  const accountId = useAccountStore((s) => s.currentAccountId());
 
   useEffect(() => {
     void (async () => {
       try {
-        const accountId = currentAccountId();
         const url = accountId
           ? `/api/contacts?limit=100&accountId=${encodeURIComponent(accountId)}`
           : "/api/contacts?limit=100";
@@ -372,7 +371,7 @@ function ContactPicker({
         setContacts([]);
       }
     })();
-  }, [currentAccountId]);
+  }, [accountId]);
 
   const filtered = q.trim()
     ? contacts.filter(
