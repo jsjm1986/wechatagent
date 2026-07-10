@@ -33,4 +33,81 @@ describe("ContactsView 运营池", () => {
     expect(screen.queryByPlaceholderText("搜索并导入好友，例如 AI应用开发")).toBeNull();
     expect(screen.getByPlaceholderText("过滤联系人")).toBeInTheDocument();
   });
+
+  // 漏斗工作台契约（Task 8 行为锁定）：定位说明 / 待启用档差异化 / Agent 档差异化。
+  describe("漏斗工作台", () => {
+    it("顶部有定位说明 + 区别通讯录小字", () => {
+      render(<ContactsView {...baseProps} />);
+      // legacy.tsx:558-559 —— 运营池定位 + 与通讯录的区别。
+      expect(screen.getByText(/主动来找过你的人/)).toBeInTheDocument();
+      expect(screen.getByText(/区别于通讯录/)).toBeInTheDocument();
+    });
+
+    it("待启用档行显示消息摘要 + 启用按钮（传了 onBatchEnable）", () => {
+      const contacts = [
+        {
+          id: "1",
+          wxid: "wxid_a",
+          nickname: "小明",
+          agentStatus: "normal",
+          lastInboundPreview: "想问下课程怎么收费",
+          tags: [],
+          operationPolicy: {},
+          profileAttributes: {},
+          updatedAt: "2026-07-11T00:00:00Z"
+        }
+      ] as any;
+      render(
+        <ContactsView
+          {...baseProps}
+          contactTab="normal"
+          contacts={contacts}
+          onBatchEnable={vi.fn().mockResolvedValue(undefined)}
+        />
+      );
+      // 消息摘要仅待启用档渲染（legacy.tsx:659-661）。
+      expect(screen.getByText(/想问下课程怎么收费/)).toBeInTheDocument();
+      // 单人启用按钮仅 selectable（normal + onBatchEnable）时渲染（legacy.tsx:672-683）。
+      expect(screen.getByText("启用 Agent")).toBeInTheDocument();
+    });
+
+    it("不传 onBatchEnable 时降级为只读列表：无启用按钮", () => {
+      const contacts = [
+        {
+          id: "1",
+          wxid: "wxid_a",
+          nickname: "小明",
+          agentStatus: "normal",
+          lastInboundPreview: "想问下课程怎么收费",
+          tags: [],
+          operationPolicy: {},
+          profileAttributes: {},
+          updatedAt: "2026-07-11T00:00:00Z"
+        }
+      ] as any;
+      render(<ContactsView {...baseProps} contactTab="normal" contacts={contacts} />);
+      // 摘要照常渲染，但无勾选/启用按钮（selectable=false）。
+      expect(screen.getByText(/想问下课程怎么收费/)).toBeInTheDocument();
+      expect(screen.queryByText("启用 Agent")).toBeNull();
+    });
+
+    it("Agent 档行显示运营阶段徽章", () => {
+      const contacts = [
+        {
+          id: "2",
+          wxid: "wxid_b",
+          nickname: "张总",
+          agentStatus: "managed",
+          operationState: "new_contact",
+          tags: [],
+          operationPolicy: {},
+          profileAttributes: {},
+          updatedAt: "2026-07-11T00:00:00Z"
+        }
+      ] as any;
+      render(<ContactsView {...baseProps} contactTab="managed" contacts={contacts} />);
+      // 阶段值经 labelFor 转中文；无字典（taxonomies 默认 {}）回落原值 new_contact（legacy.tsx:617-620,657）。
+      expect(screen.getByText(/new_contact|初次接触|新联系人/)).toBeInTheDocument();
+    });
+  });
 });
