@@ -908,7 +908,7 @@ pub async fn process_entry(state: &AppState, entry: &OutboxEntry) -> AppResult<(
                     Some(&entry.contact_wxid),
                     "outbox_sent_post_hoc",
                     "warn",
-                    "outbox entry confirmed sent post-hoc via mcp_call_logs after timeout",
+                    "outbox entry confirmed sent post-hoc via chat_search/mcp_call_logs after timeout",
                     Some(doc! {
                         "outbox_id": entry_id,
                         "run_id": &entry.run_id,
