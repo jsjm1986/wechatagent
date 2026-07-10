@@ -125,6 +125,7 @@ describe("UserOpsFeature", () => {
     // Domain 配置相关
     operationDomains: [],
     domainDrafts: {},
+    contactCounts: { all: 1, managed: 1, normal: 0 },
     // Actions
     setUserOpsMode: vi.fn(),
     setTraditionalOpsTab: vi.fn(),
@@ -141,6 +142,7 @@ describe("UserOpsFeature", () => {
     loadMessages: vi.fn().mockResolvedValue(undefined),
     loadPlaybooks: vi.fn().mockResolvedValue(undefined),
     loadContacts: vi.fn().mockResolvedValue(undefined),
+    loadContactCounts: vi.fn().mockResolvedValue(undefined),
     loadDomains: vi.fn().mockResolvedValue(undefined),
     enableAgent: vi.fn().mockResolvedValue(undefined),
     disableAgent: vi.fn().mockResolvedValue(undefined),
