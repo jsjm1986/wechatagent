@@ -438,34 +438,26 @@ export function TraditionalOpsTabs({
 
 
 export function ContactsView({
-  busy,
   contactTab,
   contacts,
-  importQuery,
   managedCount,
   normalCount,
   query,
   selected,
   totalCount,
   onContactTab,
-  onImport,
-  onImportQuery,
   onLoadAll,
   onOpenContact,
   onQuery
 }: {
-  busy: boolean;
   contactTab: ContactTab;
   contacts: Contact[];
-  importQuery: string;
   managedCount: number;
   normalCount: number;
   query: string;
   selected: Contact | null;
   totalCount: number;
   onContactTab: (tab: ContactTab) => void;
-  onImport: (event: FormEvent) => void;
-  onImportQuery: (value: string) => void;
   onLoadAll: () => void;
   onOpenContact: (contact: Contact) => void;
   onQuery: (value: string) => void;
@@ -479,39 +471,25 @@ export function ContactsView({
         </div>
         <div className="segmented">
           <button className={contactTab === "all" ? "active" : ""} onClick={() => onContactTab("all")}>
-            全部 {totalCount}
+            已互动 {totalCount}
           </button>
           <button className={contactTab === "managed" ? "active" : ""} onClick={() => onContactTab("managed")}>
             Agent {managedCount}
           </button>
           <button className={contactTab === "normal" ? "active" : ""} onClick={() => onContactTab("normal")}>
-            普通 {normalCount}
+            待启用 {normalCount}
           </button>
         </div>
       </div>
 
       <div className="toolbar">
-        <form className="searchRow" onSubmit={onImport}>
-          <label>
-            <Search size={15} />
-            <input
-              value={importQuery}
-              onChange={(event) => onImportQuery(event.target.value)}
-              placeholder="搜索并导入好友，例如 AI应用开发"
-            />
-          </label>
-          <button type="submit" disabled={busy || !importQuery.trim()}>
-            导入
-          </button>
-        </form>
-
         <label className="filter">
           <Search size={15} />
           <input
             value={query}
             onChange={(event) => onQuery(event.target.value)}
             onBlur={onLoadAll}
-            placeholder="过滤已导入好友"
+            placeholder="过滤已互动"
           />
         </label>
       </div>
