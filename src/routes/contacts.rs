@@ -146,6 +146,8 @@ pub(super) async fn list_contacts(
         .unwrap_or_else(|| state.config.default_account_id.clone());
     filter.insert("workspace_id", &admin.current_workspace);
     filter.insert("account_id", &account_id);
+    // 手动移除的联系人不出现在列表（doc-only 标记，$ne:true 兼容旧文档）。
+    filter.insert("hidden_from_pool", doc! { "$ne": true });
     if let Some(status) = query.status {
         if !status.is_empty() {
             filter.insert("agent_status", status);
@@ -246,7 +248,13 @@ pub(super) async fn list_contacts(
 /// managed 在其上加 `agent_status="managed"`。AgentStatus 仅 Normal/Managed
 /// 两态（models.rs），故调用方 `normal = all - managed` 精确无第三态遗漏。
 fn contact_count_filters(workspace_id: &str, account_id: &str) -> (Document, Document) {
-    let base = doc! { "workspace_id": workspace_id, "account_id": account_id };
+    let base = doc! {
+        "workspace_id": workspace_id,
+        "account_id": account_id,
+        // 手动「从池移除」的联系人（hidden_from_pool=true）不计入——与 list_contacts 同源口径。
+        // $ne:true 兼容缺字段旧文档（doc-only 字段，非 Contact struct 成员）。
+        "hidden_from_pool": { "$ne": true },
+    };
     let mut managed = base.clone();
     managed.insert("agent_status", "managed");
     (base, managed)
@@ -938,6 +946,34 @@ pub(super) async fn disable_agent(
             None,
         )
         .await?;
+    let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
+    Ok(Json(json!({ "item": ApiContact::from(contact) })))
+}
+
+/// `POST /api/contacts/:id/hide-from-pool`
+///
+/// 手动把联系人从运营池移除（媒体号等无法自动判定的非目标）。**不删记录**
+/// ——删了下次对方发消息 webhook 又会重新建档。改标 doc-only `hidden_from_pool=true`，
+/// list_contacts / count_contacts 读时过滤（$ne:true）。单向移除，无恢复端点（YAGNI）。
+/// workspace 隔离：filter 带 current_workspace，杜绝跨租户改写（IDOR）。
+pub(super) async fn hide_from_pool(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
+    Path(id): Path<String>,
+) -> AppResult<Json<Value>> {
+    let object_id = parse_object_id(&id)?;
+    let result = state
+        .db
+        .contacts()
+        .update_one(
+            doc! { "_id": object_id, "workspace_id": &admin.current_workspace },
+            doc! { "$set": { "hidden_from_pool": true, "updated_at": DateTime::now() } },
+            None,
+        )
+        .await?;
+    if result.matched_count == 0 {
+        return Err(AppError::NotFound("contact not found".to_string()));
+    }
     let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
     Ok(Json(json!({ "item": ApiContact::from(contact) })))
 }
@@ -1650,10 +1686,13 @@ mod tests {
         assert_eq!(base.get_str("workspace_id").unwrap(), "ws1");
         assert_eq!(base.get_str("account_id").unwrap(), "acct1");
         assert!(base.get("agent_status").is_none(), "base 不得含 agent_status");
+        // 隐藏的联系人不计入任何 tab 计数（与 list_contacts 口径一致）。
+        assert!(base.get_document("hidden_from_pool").is_ok());
         // managed：在 base 基础上加 agent_status=managed。
         assert_eq!(managed.get_str("workspace_id").unwrap(), "ws1");
         assert_eq!(managed.get_str("account_id").unwrap(), "acct1");
         assert_eq!(managed.get_str("agent_status").unwrap(), "managed");
+        assert!(managed.get_document("hidden_from_pool").is_ok());
     }
 
     #[test]
