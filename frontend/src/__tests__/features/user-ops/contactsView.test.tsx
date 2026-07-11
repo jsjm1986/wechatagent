@@ -91,6 +91,44 @@ describe("ContactsView 运营池", () => {
       expect(screen.queryByText("启用 Agent")).toBeNull();
     });
 
+    it("传 onHideFromPool 时行尾有「从池移除」按钮，点击弹确认后调回调", () => {
+      const contacts = [
+        {
+          id: "c1", wxid: "wxid_media", nickname: "福州晚报", agentStatus: "normal",
+          lastInboundPreview: "[链接]", tags: [], operationPolicy: {}, profileAttributes: {},
+          updatedAt: "2026-07-11T00:00:00Z"
+        }
+      ] as any;
+      const onHideFromPool = vi.fn();
+      const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+      render(
+        <ContactsView
+          {...baseProps}
+          contactTab="normal"
+          contacts={contacts}
+          onBatchEnable={vi.fn().mockResolvedValue(undefined)}
+          onHideFromPool={onHideFromPool}
+        />
+      );
+      screen.getByText("从池移除").click();
+      expect(confirmSpy).toHaveBeenCalled();
+      expect(onHideFromPool).toHaveBeenCalledWith(contacts[0]);
+      confirmSpy.mockRestore();
+    });
+
+    it("预览为标签时行内渲染标签而非 XML", () => {
+      const contacts = [
+        {
+          id: "c2", wxid: "wxid_x", nickname: "某公众号内容", agentStatus: "normal",
+          lastInboundPreview: "[链接]", tags: [], operationPolicy: {}, profileAttributes: {},
+          updatedAt: "2026-07-11T00:00:00Z"
+        }
+      ] as any;
+      render(<ContactsView {...baseProps} contactTab="normal" contacts={contacts} onBatchEnable={vi.fn()} />);
+      expect(screen.getByText("[链接]")).toBeInTheDocument();
+      expect(screen.queryByText(/<msg>|<appmsg|<sysmsg/)).toBeNull();
+    });
+
     it("Agent 档行显示运营阶段徽章", () => {
       const contacts = [
         {
