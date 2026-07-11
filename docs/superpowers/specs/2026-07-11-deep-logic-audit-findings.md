@@ -204,7 +204,25 @@
 
 ## 环节④ 决策 + 渐进式知识路由（decision.rs / knowledge_router.rs）
 
-_（待审）_
+审查文件：`src/agent/decision.rs` + `src/agent/knowledge_router.rs` + `src/agent/types.rs`（RawAgentDecision 契约）。主控亲验 D-01（types.rs:405 `rename_all=camelCase` + decision.rs:150-153 双形兜底不对称）。
+
+### ✅ 亲验通过总览（历史已修现码仍正确 + 红线成立）
+- **PR#107 tool_calling 静默 no_reply**：prompt 恒 final + 守卫测试 + gateway 兜底闸三重，首发/rewrite/revision 三站点全覆盖。现码仍正确。✅
+- **双层标签红线**：taxonomy 候选 fire-and-forget 异步 upsert，硬门 `is_protocol_violation_tag` 不含 candidate 标签 → 不阻断 run。✅
+- **知识路由拿不到知识→拦截非幻觉**：verified-only 语料 + fallback 同池排序 + `blocked_unverified_product_claim` 终局硬门。✅
+- **PR#143 升档预算**：两升档分支升档前授 escalated ceiling、非升档不授、used_knowledge_ids 只在升 Full 记，接线正确。现码仍正确。✅
+
+### [D-01] reply 主路径顶层 customerStage/intentLevel 只认 camelCase，无 snake 双形容错（与初始画像路径不对称）
+- 入口频道: userOps
+- 链路环节: ④ 决策（RawAgentDecision 顶层 serde 键）
+- 类型: 一致性 / 错误处理（静默降级）
+- 严重度: Low（主控认同 subagent 初判：LLM 主流漂 camelCase、rename_all 即照其设计；漂 snake 是少数；丢失只是标签没打上=画像不精准，非丢回复/绕红线）
+- 现象/风险: `RawAgentDecision` 有 `#[serde(rename_all="camelCase")]`（`types.rs:405` 主控亲验），顶层 `customer_stage`/`intent_level`（:461-462）序列化只认 camelCase 键 `customerStage`/`intentLevel`。LLM 若顶层输出 snake_case，serde 静默 miss → None（字段 `default` 不报错、不报 risk）。对比初始画像路径 `decision.rs:150-153` 有手动双形兜底 `optional_string("customerStage").or_else(|| ...("customer_stage"))` ——**两路径不对称**：画像容双形，reply 主路径只容 camel。历史 PR#151 修的是 Document 内层键双形，未覆盖此顶层 serde 键。
+- 根因（亲验）: `types.rs:405` rename_all=camelCase + :461-462 无 `#[serde(alias="customer_stage")]`；`decision.rs:150-153` 对照有双形兜底。
+- 复现设想: 构造 LLM 响应顶层用 snake `customer_stage` → 解析后该字段 None，标签丢失。是否生产实际触发依赖 LLM 顶层键漂移率（未知，subagent 诚实标"需 117 日志统计"）。可 117 日志统计辅证，非直接真跑复现。
+- 验证状态: PLAUSIBLE（主控亲验代码路径 + 不对称确凿）
+- 修复建议: 给 :461-462 加 `#[serde(alias = "customer_stage")]` / `alias="intent_level"`（serde alias 让 camel 主名 + snake 别名双认），与初始画像路径的双形容错对齐。低成本加固。
+- 状态: Open
 
 ## 环节⑤ 独立 review + 阈值闸 + revision（review/gates.rs）
 
