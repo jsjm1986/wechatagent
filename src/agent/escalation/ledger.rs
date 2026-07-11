@@ -208,8 +208,12 @@ pub(crate) async fn emit_knowledge_gap_proposal(
 }
 
 
-/// 反查：在**入站消息自身所属 workspace** 内，from_wxid 是否是某 domain 的 principal_decider。
-/// 返回 Some(domain) 表示该 wxid 是本 workspace 的领导。
+/// 反查：在**入站消息自身所属 workspace** 内，from_wxid 是否是某 domain 的决策人。
+/// KD-04：判断 from_wxid 是否为本 workspace 任一 current_version 域配置的决策人
+/// （解析后的 decider_chain 成员，含旧 principal_decider 回落）。返回 Some(domain) 表示
+/// 是决策人（domain 供调用方观测，webhooks 仅用 is_some 分流）；None 表示非决策人。
+/// 从只查旧标量 principal_decider 改为复用 resolve_ask_human_policy——修复推荐配置
+/// （只配 decider_chain）下领导回复不被识别的缺陷。
 /// 🔒 关键：必须用入站消息自己的 workspace_id 约束查询——否则 A workspace 的领导 wxid
 /// 若恰好也是 B workspace 某业务号的好友，B 收到他消息时会被误路由进 A 的请示流（跨域串扰）。
 pub(crate) async fn lookup_principal_config(
@@ -217,19 +221,24 @@ pub(crate) async fn lookup_principal_config(
     workspace_id: &str,
     from_wxid: &str,
 ) -> AppResult<Option<String>> {
-    let cfg = state
+    use futures::TryStreamExt;
+    let mut cursor = state
         .db
         .operation_domain_configs()
-        .find_one(
+        .find(
             doc! {
                 "workspace_id": workspace_id,
-                "principal_decider": from_wxid,
                 "current_version": true,
             },
             None,
         )
         .await?;
-    Ok(cfg.map(|c| c.domain))
+    while let Some(cfg) = cursor.try_next().await? {
+        if crate::agent::escalation::policy::is_decider_for_config(&cfg, from_wxid) {
+            return Ok(Some(cfg.domain));
+        }
+    }
+    Ok(None)
 }
 
 /// 创建 principal_decision_relay task（立即可执行）。
