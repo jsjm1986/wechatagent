@@ -294,3 +294,10 @@
   padding: 32px 26px; font-size: 13px; color: var(--ink-2); line-height: 1.7;
   border-radius: var(--r-md); border: 1px dashed var(--hairline); background: var(--surface-page);
 }
+
+/* F-008：总开关关闭但有历史实验时的提示条（暖色 = 暂停态，区别于运维硬锁的中性 disabled）。 */
+.dormantNotice {
+  padding: 10px 14px; margin-bottom: 12px; font-size: 12.5px; line-height: 1.6;
+  color: var(--ink-2); border-radius: var(--r-sm);
+  border: 1px solid rgba(255, 159, 10, .28); background: rgba(255, 159, 10, .08);
+}
