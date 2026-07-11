@@ -51,6 +51,16 @@ pub(crate) fn resolve_ask_human_policy(config: &OperationDomainConfig) -> Resolv
     }
 }
 
+/// KD-04：from_wxid 是否是该 config 解析后 decider_chain 的成员。
+/// 复用 resolve_ask_human_policy（已内含旧 principal_decider 回落），故新旧配置都覆盖，
+/// 且覆盖链中全部决策人（含改派后的 next 决策人）。纯函数、无 IO。
+pub(crate) fn is_decider_for_config(config: &OperationDomainConfig, from_wxid: &str) -> bool {
+    resolve_ask_human_policy(config)
+        .decider_chain
+        .iter()
+        .any(|d| d.wxid == from_wxid)
+}
+
 /// 静默时段判定：now 落在 [start,end) 内（按 tz_offset 折算小时）。支持跨午夜（start>end）。
 pub(crate) fn in_quiet_hours(qh: &AskHumanQuietHours, now_ms: i64) -> bool {
     let shifted = now_ms + (qh.tz_offset_hours as i64) * 3600 * 1000;
@@ -135,6 +145,80 @@ mod tests {
             ask_human_policy: None,
             assist_mode_enabled: None,
         }
+    }
+
+    // ── KD-04 修复：is_decider_for_config 纯谓词 ──
+    #[test]
+    fn kd04_decider_chain_member_recognized() {
+        // KD-04 复现+修复：只配 decider_chain（推荐配置）、principal_decider=None。
+        // 旧逻辑只认 principal_decider → 领导 wxid 不被识别；新谓词应识别。
+        let mut cfg = base_config();
+        cfg.ask_human_policy = Some(AskHumanPolicy {
+            decider_chain: vec![DeciderRef { wxid: "leader1".into(), display_name: None }],
+            escalate_safety_guard: true,
+            escalate_unverified_product: true,
+            escalate_ai_policy_hold: false,
+            escalate_stuck: true,
+            dedupe_window_hours: None,
+            daily_push_cap: None,
+            quiet_hours: None,
+            timeout_hours: None,
+        });
+        assert!(is_decider_for_config(&cfg, "leader1"), "decider_chain 成员必须被识别为决策人");
+        assert!(cfg.principal_decider.is_none(), "本用例前提：principal_decider=None（推荐配置）");
+    }
+
+    #[test]
+    fn kd04_non_first_decider_recognized() {
+        // 覆盖改派 next：链中非首位决策人回复也须被识别。
+        let mut cfg = base_config();
+        cfg.ask_human_policy = Some(AskHumanPolicy {
+            decider_chain: vec![
+                DeciderRef { wxid: "leader1".into(), display_name: None },
+                DeciderRef { wxid: "leader2".into(), display_name: None },
+            ],
+            escalate_safety_guard: true,
+            escalate_unverified_product: true,
+            escalate_ai_policy_hold: false,
+            escalate_stuck: true,
+            dedupe_window_hours: None,
+            daily_push_cap: None,
+            quiet_hours: None,
+            timeout_hours: None,
+        });
+        assert!(is_decider_for_config(&cfg, "leader2"), "链中非首位（改派 next）也须被识别");
+    }
+
+    #[test]
+    fn kd04_legacy_principal_decider_still_recognized() {
+        // 旧配置兼容：只设 principal_decider、ask_human_policy=None → resolve 回落 → 识别。
+        let mut cfg = base_config();
+        cfg.principal_decider = Some("oldboss".into());
+        assert!(is_decider_for_config(&cfg, "oldboss"), "旧 principal_decider 经 resolve 回落仍须识别");
+    }
+
+    #[test]
+    fn kd04_non_decider_returns_false() {
+        let mut cfg = base_config();
+        cfg.ask_human_policy = Some(AskHumanPolicy {
+            decider_chain: vec![DeciderRef { wxid: "leader1".into(), display_name: None }],
+            escalate_safety_guard: true,
+            escalate_unverified_product: true,
+            escalate_ai_policy_hold: false,
+            escalate_stuck: true,
+            dedupe_window_hours: None,
+            daily_push_cap: None,
+            quiet_hours: None,
+            timeout_hours: None,
+        });
+        assert!(!is_decider_for_config(&cfg, "stranger"), "非决策人不得被识别");
+    }
+
+    #[test]
+    fn kd04_empty_chain_returns_false() {
+        // 未启用请示通道（decider_chain 空 + principal_decider None）→ 任何 wxid 都不是决策人。
+        let cfg = base_config();
+        assert!(!is_decider_for_config(&cfg, "anyone"), "未启用请示通道时任何 wxid 都非决策人");
     }
 
     #[test]
