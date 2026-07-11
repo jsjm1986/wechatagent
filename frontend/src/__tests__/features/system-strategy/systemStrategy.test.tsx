@@ -474,4 +474,118 @@ describe("TaxonomyCandidatesAdmin 分页", () => {
     expect(screen.queryByText("下一页")).toBeNull();
     expect(screen.queryByText("上一页")).toBeNull();
   });
+
+  it("选择 kind 下拉后重新请求候选列表并带上 kind= 参数", async () => {
+    const getSpy = vi.spyOn(api, "get").mockImplementation((url: string) =>
+      Promise.resolve(
+        (url.includes("/api/admin/taxonomy-candidates") ? { items: makeCandidates(3) } : { items: [] }) as never,
+      ),
+    );
+
+    render(<SystemStrategyFeature />);
+    selectTab("标签与状态");
+
+    // 初次挂载：只带 status=pending，不带 kind=
+    await waitFor(() => expect(screen.getByRole("heading", { name: "候选词0" })).toBeInTheDocument());
+    expect(
+      getSpy.mock.calls.some(
+        ([u]) => typeof u === "string" && u.includes("/api/admin/taxonomy-candidates") && !u.includes("kind="),
+      ),
+    ).toBe(true);
+
+    // 选 kind = objection_type（异议类型）
+    const kindSelect = screen.getByTestId("candidate-kind-filter") as HTMLSelectElement;
+    fireEvent.change(kindSelect, { target: { value: "objection_type" } });
+
+    // 重新请求带上 kind=objection_type
+    await waitFor(() =>
+      expect(
+        getSpy.mock.calls.some(
+          ([u]) => typeof u === "string" && u.includes("/api/admin/taxonomy-candidates") && u.includes("kind=objection_type"),
+        ),
+      ).toBe(true),
+    );
+  });
+
+  it("批量驳回：勾选 2 条 pending + 填原因 + 确认 → 发 2 次 reject 请求", async () => {
+    vi.spyOn(api, "get").mockImplementation((url: string) =>
+      Promise.resolve(
+        (url.includes("/api/admin/taxonomy-candidates") ? { items: makeCandidates(3) } : { items: [] }) as never,
+      ),
+    );
+    const postSpy = vi.spyOn(api, "post").mockResolvedValue({} as never);
+
+    render(<SystemStrategyFeature />);
+    selectTab("标签与状态");
+    await waitFor(() => expect(screen.getByRole("heading", { name: "候选词0" })).toBeInTheDocument());
+
+    // 勾选 cand0、cand1
+    fireEvent.click(screen.getByTestId("candidate-check-cand0"));
+    fireEvent.click(screen.getByTestId("candidate-check-cand1"));
+
+    // 填驳回原因
+    fireEvent.change(screen.getByTestId("bulk-reject-reason"), { target: { value: "无业务相关性" } });
+
+    // 点批量驳回 → 弹确认窗
+    fireEvent.click(screen.getByTestId("bulk-reject-btn"));
+
+    // 确认弹窗（useConfirm 渲染 confirmText="确认驳回"）
+    fireEvent.click(await screen.findByText("确认驳回"));
+
+    // 发出 2 次 reject POST，带 reason
+    await waitFor(() => expect(postSpy).toHaveBeenCalledTimes(2));
+    expect(postSpy).toHaveBeenCalledWith(
+      "/api/admin/taxonomy-candidates/cand0/reject",
+      { reason: "无业务相关性" },
+    );
+    expect(postSpy).toHaveBeenCalledWith(
+      "/api/admin/taxonomy-candidates/cand1/reject",
+      { reason: "无业务相关性" },
+    );
+  });
+
+  it("批量驳回按钮：未勾选或未填原因时 disabled", async () => {
+    vi.spyOn(api, "get").mockImplementation((url: string) =>
+      Promise.resolve(
+        (url.includes("/api/admin/taxonomy-candidates") ? { items: makeCandidates(3) } : { items: [] }) as never,
+      ),
+    );
+    render(<SystemStrategyFeature />);
+    selectTab("标签与状态");
+    await waitFor(() => expect(screen.getByRole("heading", { name: "候选词0" })).toBeInTheDocument());
+
+    // 未勾选 → disabled
+    expect(screen.getByTestId("bulk-reject-btn")).toBeDisabled();
+
+    // 勾一条但没填原因 → 仍 disabled
+    fireEvent.click(screen.getByTestId("candidate-check-cand0"));
+    expect(screen.getByTestId("bulk-reject-btn")).toBeDisabled();
+
+    // 填原因 → enabled
+    fireEvent.change(screen.getByTestId("bulk-reject-reason"), { target: { value: "重复" } });
+    expect(screen.getByTestId("bulk-reject-btn")).not.toBeDisabled();
+  });
+
+  it("非 pending 视图（已采纳）不渲染复选框与批量驳回入口", async () => {
+    vi.spyOn(api, "get").mockImplementation((url: string) => {
+      if (url.includes("/api/admin/taxonomy-candidates")) {
+        // 返回 1 条 approved 候选（无论 status filter，简化 mock）
+        const items = makeCandidates(1).map((c) => ({ ...c, status: "approved" }));
+        return Promise.resolve({ items } as never);
+      }
+      return Promise.resolve({ items: [] } as never);
+    });
+
+    render(<SystemStrategyFeature />);
+    selectTab("标签与状态");
+    await waitFor(() => expect(screen.getByRole("heading", { name: "候选词0" })).toBeInTheDocument());
+
+    // 切到「已采纳」status filter
+    fireEvent.click(screen.getByRole("button", { name: "已采纳" }));
+
+    await waitFor(() => {
+      expect(screen.queryByTestId("bulk-reject-bar")).toBeNull();
+    });
+    expect(screen.queryByTestId("candidate-check-cand0")).toBeNull();
+  });
 });
