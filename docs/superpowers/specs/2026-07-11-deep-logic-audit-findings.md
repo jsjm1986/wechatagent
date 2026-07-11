@@ -1057,3 +1057,45 @@
 - 根因（亲验）：final_status_from_5gate 假设"final 完全由 5 闸决定"，但源 run 真实终态可能是非-5gate 因素。
 - 验证状态：**PLAUSIBLE**（口径不对称 CONFIRMED；需 cohort 含"非-5gate block 但带 scores 且 5 闸重判 approved"的 run 且占比足以翻越 0.05 门，频率需生产终态分布量化）。
 - 修复建议：evaluate_threshold 计 original/new send_success 对齐口径——original 也用 final_status_from_5gate 基于源 scores+current 阈值重推（两侧同口径仅差被改 gate），或重判前剔除非-5gate 决定终态的 run 不计入 send_delta。KE-01/KE-02 均只在 auto_release 开启时影响放量（默认关）。
+
+## referral 名片引荐（红线受控例外 + 三闸让位）
+
+审查范围：`agent/referral.rs`（assist_mode_active:17 / validate_card_sendable:26 / send_outbound_namecard:99）+ `agent/decision.rs`（assist_on:395 / referral_block:399 / build_referral_cards_filter:1405）+ `agent/gateway.rs`（名片入队门:2818 / 准入:2837 / 不走 escalation:2813）+ `agent/review/mod.rs`（reviewer 让位:259/348）+ `routes/referral_cards.rs`（create:51 / review:122 / toggle:185 / delete:212）+ `agent/review/gates.rs`（产品硬闸:658）。主控派 opus subagent 复审 + 逐条亲验。
+
+### ✅ 亲验通过总览（辅助模式红线受控例外成立·默认关）
+
+1. **✅ 辅助模式默认关 + 三处 assist_on 判定一致**：assist_mode_active（referral.rs:17-23）force_on/force_off override > account_enabled.unwrap_or(false)=默认关，脏值 override 视无覆盖。三处（decision.rs:398 prompt 注入 / gateway.rs:2824 入队 / review/mod.rs:353 reviewer 让位）调**同一纯函数**、同输入、同优先级。**关时全跳**：gateway 二次门 `if assist_on`（:2828）整段包住入队，即便 LLM 幻觉 namecard_to_send 也不入队。主控亲验。
+2. **✅ 让位段不架空产品硬闸**：blocked_unverified_product_claim 是 gates.rs:658-684 **确定性结构化闸**，判据=claim_requires_product_knowledge && verified_chunks 空 && !priced_from_catalog，**不读 factRisk/reviewer 自评分**（gates.rs:642 注释"对 reviewer 自评分不信任的兜底"）。即便让位段令 reviewer 降 factRisk，产品声明硬闸独立照拦。让位措辞（referral.rs:14）明确只针对"引荐这一动作"、明说引荐不是产品声明（不计入 hallucination/产品准确度），未泛化到普通产品声明。主控亲验。
+3. **✅ 引荐≠转人工（物理隔离）**：gateway.rs:2811-2818 名片独立入队**不走** escalation 分支（不会被标 held_by_ai_policy）；台前顾问存 referral_cards 集合、幕后 principal_decider 存 operation_domain_configs.decider_chain——**物理隔离不同集合**（D9 解耦）。措辞守卫"我仍在场辅助"就位。
+4. **✅ 名片门含 relay 泄漏 fail-closed + should_reply + reply 非空**：media_send_allowed(outbox_eligible,...)（:2818）——outbox_eligible 含 relay 泄漏 fail-closed，杜绝 should_reply=false/reply 空发孤立名片、relay 泄漏时仍发名片。
+5. **✅ 准入闭合**：gateway.rs:2837 + referral.rs:111 双重 find_one（workspace scope）+ validate_card_sendable（enabled&&approved）；幻觉/不存在/未审/跨 workspace/停用 → 全落 referral_card_rejected 事件。
+6. **✅ CRUD 红线**：create 强制 enabled=false+review_status=draft（referral_cards.rs:80，AI 不自我核验，无路径创建即 approved）；approve 不自动 enable（validate 要 enabled&&approved 双门）；review/toggle/delete 均 AuthenticatedAdmin + workspace scope。
+
+### [KE-03] 名片发送准入门只按 workspace_id 不按 account_id，与候选加载器（账号级）不对称，同租户内可跨账号推名片
+
+- 链路环节：referral（发送准入）
+- 类型：防御纵深不对称（同租户业务错配）
+- 严重度：**Low**
+- 现象：候选加载 build_referral_cards_filter（decision.rs:1405-1419）是**账号级**过滤（workspace_id + `$or:[account_id null, ==account_id]` + enabled + approved），注入给 LLM 的是本账号候选。但 gateway 二次准入（:2837）和 send_outbound_namecard（referral.rs:111）的 find_one **只带 workspace_id 不带 account_id**。同 workspace 内绑定账号 A 的顾问名片若 card_id 被选中，会经账号 B 的会话推出去——同租户业务错配。
+- 根因（亲验）：准入门对齐了素材侧 workspace IDOR 防御，但未镜像候选加载器的 account 维度。
+- 验证状态：**Low / PLAUSIBLE**（口径不对称 CONFIRMED，主控亲验候选账号级 vs 准入 workspace-only；正常 LLM 只看本账号候选，触发需 LLM 幻觉合法他账号 ObjectId，概率极低）。
+- 修复建议：gateway 与 send_outbound_namecard 的 find_one 追加 `$or:[account_id null, ==contact.account_id]` 与 build_referral_cards_filter 同口径，命中失败照走 referral_card_rejected。
+
+### [KE-04] 名片防重推是纯 prompt 建议无硬去重门（有意软设计，登记）
+
+- 链路环节：referral（防重推）
+- 类型：软约束无硬兜底（有意设计）
+- 严重度：**Low**
+- 现象：对"已引荐过同一顾问"的防重推，全链路只有 render_referral_lines 往 prompt 注入一句建议（referral.rs:76-79）。gateway 入队块（:2818-2907）不读 REFERRED_CARD_ID_ATTR、无硬门；outbox 幂等键含 run_id（outbox.rs:412），每个新 run 键不同 → 同卡跨 run 可再入队真发。
+- 根因（亲验）：去重设计成 LLM 遵从 prompt 的软约束，无确定性兜底。outbox_dispatcher.rs:672 注释"重复推名片危害小…放行重发"——**有意软设计**。
+- 验证状态：**Low / PLAUSIBLE**（危害受限=客户多收一张名片，且文档化取舍）。
+- 修复建议：若要硬防，gateway 入队前读 REFERRED_CARD_ID_ATTR 同卡已引荐则跳过+落 referral_card_duplicate_skipped（须保留"新需求可重推"例外）；或维持现状 + 设计文档标注"去重 advisory-only"。
+
+### [KE-05] toggle 停用 / delete 删除名片无审计事件，delete 为硬删无留痕
+
+- 链路环节：referral（名片库 CRUD 审计）
+- 类型：审计留痕缺失
+- 严重度：**Low**
+- 现象：review_referral_card 写 referral_card.reviewed 审计（referral_cards.rs:167），但 toggle_referral_card（停用）和 delete_referral_card（delete_one 硬删）**都不写审计事件**。停用/删除已审批顾问名片直接改变 AI 可引荐范围（红线敏感），却无留痕；硬删误删不可恢复。三 handler 均有 AuthenticatedAdmin + workspace scope（越权已防）故 Low。
+- 验证状态：**Low / PLAUSIBLE**（审计缺失 CONFIRMED）。
+- 修复建议：toggle/delete 补 referral_card.toggled/deleted 审计（同 review 模式 fail-soft）；delete 可改软删（enabled=false + deleted_at）保留可追溯。
