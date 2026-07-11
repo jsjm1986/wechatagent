@@ -352,3 +352,37 @@
 
 ### 主控驳回的候选（证伪留痕）
 - **[驳回] F-⑧-02 task 先置 outbox_enqueued 再 enqueue，中间 `?` 失败留孤儿任务丢消息**：subagent 自标"未能确认（未核 tasks.rs worker）"。**主控亲验 tasks.rs:254-307**：gateway 返 Err → worker `Err` 分支 `update_one(doc!{"_id":task_id}, $set status=retry/failed)`（:261/:292）filter **仅 `_id` 无 status 条件、无条件覆盖** outbox_enqueued → task 会被打回 retry 重跑（enqueue 幂等重跑安全），**不卡孤儿、不静默丢**。与环节③ Task3 已排除的假 finding 同条。驳回，不入账。
+
+---
+
+## 批 A 总评（自动回复命脉链 · 审查收口）
+
+**审查方式**：8 环节逐行读码（webhook→去抖→gateway 闸→决策→review→outbox→MCP→回写），每环节派 opus subagent 只读审 + **主控逐条亲验 file:line**（多条 subagent 结论经亲验后调级/去重/驳回）。审查阶段只入账不改 src。
+
+### finding 计数（去重后，全部主控亲验）
+- **Critical 0 / High 0**
+- **Medium 4**：
+  - **B-02**（环节②）reaction 分析 DB 失败经 `?` 上抛、吞掉本轮聚合回复（(e) 网关包在 (d) 的 else 里）
+  - **C-01**（环节③）operation_state 非法迁移 rejected 审计事件 `:4503 .await?` 阻断未入队回复（违 fail-soft 红线，孪生 :3988 用 `let _` 为铁证）
+  - **H-01**（环节⑧）apply_agent_updates 另 3 处审计事件（:4411/:4480/:4551）同样 `?`——C-01 同族，构成"同函数 5 处审计事件系统性误用 `?`"
+  - **F-01**（环节⑥）outbox reclaim 崩溃恢复分支文本 post-hoc 只查本地 mcp_call_logs、漏查权威 chat_search（timeout 分支有）→ 崩溃后可能重发文本（PR#164 漏同步此分支）
+- **Low 9**：A-01/A-02（wxid 双重身份场景族）、B-01（抢占尾窗 TOCTOU 双回复）、B-03（决策期 managed 翻转不复核）、D-01（reply 顶层 serde 键 camel-only 不对称）、E-01（reviewer 填 0 绕软闸）、F-02/F-03/F-04（outbox 边缘）、H-02（run_envelope R0 死代码）
+- **主控驳回 2**：F-⑧-02（=Task3 排除的假 finding，worker 无条件重试兜底）；outbox_enqueued 静默丢（同上，环节③已排除）
+- **整环干净 2**：环节⑤ review 阈值闸（默认值/比较符对偶/revision 单次/状态闭集全过）、环节⑦ MCP 发送（三层失败识别/isError/超时/key 安全 0 finding）
+
+### 跨环节根因家族（修复统筹）
+1. **审计/旁路事件误用 `?` 连坐吞回复家族**（B-02 + C-01 + H-01，共 6 处 `?`）：本轮**最重、最系统性**的发现，也正是上一轮广度走查扫不到的"错误处理层"。共性 = 发送/回复所必需路径把"旁路观测写（reaction 分析 / operation_state 审计 / 画像 churn 审计）"用 `?` 硬抛，DB 抖动即吞本轮回复；且多处代码注释自认应 fail-soft，实现却 `?`（C-01 有孪生 `let _` 铁证）。**修复统筹**：一个"审计/旁路写 fail-soft 对齐"专项，把 apply_agent_updates 内 5 处审计事件（:4411/4480/4503/4525/4551）+ reaction 步骤 (d)(e) 解耦一并处理。这类改动小、风险低、价值高（消除"DB 一抖就静默丢客户回复"），建议优先。
+2. **outbox 崩溃恢复非对称家族**（F-01 + F-04）：reclaim 分支比 timeout 分支少一层权威核对、且不耗 attempt。修复=抽共用 post-hoc 核对函数（先 chat_search 再本地）+ reclaim_count 上限。
+
+### 修复优先级建议（供用户定）
+- **P1**：家族①（B-02/C-01/H-01）——改动小、根治"DB 抖动吞回复"，且可写确定性 lib 单测复现（mock write_event/reaction DB 失败，验证回复仍发）。
+- **P2**：F-01（reclaim 漏查 chat_search）——重发是发送链路最不该的后果，但触发窗窄；修复=抽共用核对函数。
+- **P3**：Low 类批量（D-01 serde alias、B-01/B-03 时序加固、A-01/A-02 wxid 双重身份产品裁决、E-01/F-02/F-04/H-02）——多为加固/产品裁决，择机。
+
+### Task 9（117 真跑复现）定调
+用户裁定**不在生产注故障/kill 进程复现**——批 A findings 触发前提多为"Mongo 瞬时故障 / 进程崩溃 / 精确时序 / 干预 LLM 输出"，生产无法安全构造。全部标 **PLAUSIBLE**（主控已亲验代码路径与铁证，确信度高，仅未在生产触发实证）。可复现的 finding（尤其家族① 的 mock 失败注入）**留到修复阶段写成确定性 lib 单测/小型集成测试随修复 PR 上 CI**——这比在生产 kill 进程更严谨可控。
+
+### 审查质量说明（防假绿）
+- 每条 finding 的 file:line 均主控当场 Read 亲验；subagent 凭猜/未确认的结论要么驳回（F-⑧-02）、要么降为 PLAUSIBLE。
+- 2 条整环 0 finding 是真读透后的正面结论（阈值闸/MCP），非漏审。
+- 未真跑，故无 CONFIRMED；这是诚实的确信度标注，非假绿。
