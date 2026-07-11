@@ -113,6 +113,7 @@ interface UserOpsActions {
   loadPlaybooks: (accountId: string) => Promise<void>;
   loadContacts: (accountId: string) => Promise<void>;
   loadContactCounts: (accountId: string) => Promise<void>;
+  hideFromPool: (accountId: string, contactId: string) => Promise<void>;
   loadRoster: (accountId: string, opts?: { force?: boolean }) => Promise<{ items: RosterEntry[]; syncing: boolean }>;
   batchEnable: (payload: {
     accountId: string;
@@ -496,6 +497,14 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
       "/api/contacts/batch-enable",
       payload
     );
+  },
+
+  // 手动把联系人从运营池移除（媒体号等无法自动判定的非目标）。调后端标记
+  // hidden_from_pool（不删记录），成功后刷新列表 + 计数。
+  hideFromPool: async (accountId, contactId) => {
+    await api.post(`/api/contacts/${encodeURIComponent(contactId)}/hide-from-pool`);
+    await refreshContacts(accountId || null, get().searchQuery);
+    await get().loadContactCounts(accountId);
   },
 
   // 加载 Domain 配置

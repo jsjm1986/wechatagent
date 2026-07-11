@@ -173,6 +173,7 @@ use contacts::{
     analyze_contact_profile, add_deal_event, batch_enable_endpoint, clear_referral, disable_agent,
     enable_agent,
     get_contact, get_contact_memory_card, get_operating_memory, get_operation_health,
+    hide_from_pool,
     count_contacts, import_contacts_endpoint, list_contact_memory_candidates, list_contacts,
     list_entitlements,
     list_outcome_events, roster_endpoint, run_contact_memory_consolidation,
@@ -364,6 +365,7 @@ pub fn api_router(state: AppState) -> Router<AppState> {
         .route("/contacts/:id", get(get_contact))
         .route("/contacts/:id/enable-agent", post(enable_agent))
         .route("/contacts/:id/disable-agent", post(disable_agent))
+        .route("/contacts/:id/hide-from-pool", post(hide_from_pool))
         .route("/contacts/:id/profile-note", put(update_profile_note))
         .route(
             "/contacts/:id/assist-override",

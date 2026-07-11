@@ -122,6 +122,7 @@ function UserOpsFeatureInner() {
     loadContacts,
     loadContactCounts,
     batchEnable,
+    hideFromPool,
     loadDomains,
     // 15个业务回调
     enableAgent,
@@ -289,6 +290,15 @@ function UserOpsFeatureInner() {
                 void loadContactCounts(effectiveAccountId);
               } catch (e) {
                 toast.error(e instanceof Error ? e.message : "批量启用失败");
+              }
+            }}
+            onHideFromPool={async (contact) => {
+              if (!effectiveAccountId) return;
+              try {
+                await hideFromPool(effectiveAccountId, contact.id);
+                toast.success("已从运营池移除");
+              } catch (e) {
+                toast.error(e instanceof Error ? e.message : "移除失败");
               }
             }}
           />

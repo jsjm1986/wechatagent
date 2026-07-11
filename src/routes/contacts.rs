@@ -113,6 +113,28 @@ pub(crate) fn truncate_preview(text: &str, max_chars: usize) -> String {
     format!("{head}…")
 }
 
+/// 按入站消息类型出运营池预览。text/None（含旧库无类型消息）走原文截断；
+/// 其它类型出固定中文标签，**绝不读 content**——appmsg/sysmsg 的 content 本身就是
+/// XML 串（`<msg><appmsg.../<sysmsg type=...>`），截断后是 XML 垃圾。
+/// 纯静态映射，非 LLM 摘要——normal 联系人不调 LLM（产品红线）。
+/// 类型字符串来源：webhooks::classify_inbound_msg_type。
+pub(crate) fn preview_label_for_type(msg_type: Option<&str>, content: &str) -> String {
+    match msg_type {
+        None | Some("text") => truncate_preview(content, INBOUND_PREVIEW_MAX_CHARS),
+        Some("image") => "[图片]".to_string(),
+        Some("voice") => "[语音]".to_string(),
+        Some("video") => "[视频]".to_string(),
+        Some("namecard") => "[名片]".to_string(),
+        Some("emoji") => "[表情]".to_string(),
+        Some("location") => "[位置]".to_string(),
+        Some("appmsg") => "[链接]".to_string(),
+        Some("voip") => "[通话]".to_string(),
+        Some("statussync") => String::new(),
+        Some("system") => "[系统消息]".to_string(),
+        Some(_) => "[消息]".to_string(),
+    }
+}
+
 pub(super) async fn list_contacts(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
@@ -124,6 +146,8 @@ pub(super) async fn list_contacts(
         .unwrap_or_else(|| state.config.default_account_id.clone());
     filter.insert("workspace_id", &admin.current_workspace);
     filter.insert("account_id", &account_id);
+    // 手动移除的联系人不出现在列表（doc-only 标记，$ne:true 兼容旧文档）。
+    filter.insert("hidden_from_pool", doc! { "$ne": true });
     if let Some(status) = query.status {
         if !status.is_empty() {
             filter.insert("agent_status", status);
@@ -209,8 +233,10 @@ pub(super) async fn list_contacts(
             )
             .await
         {
-            api.last_inbound_preview =
-                Some(truncate_preview(&msg.content, INBOUND_PREVIEW_MAX_CHARS));
+            api.last_inbound_preview = Some(preview_label_for_type(
+                msg.msg_type.as_deref(),
+                &msg.content,
+            ));
         }
         items.push(api);
     }
@@ -222,7 +248,13 @@ pub(super) async fn list_contacts(
 /// managed 在其上加 `agent_status="managed"`。AgentStatus 仅 Normal/Managed
 /// 两态（models.rs），故调用方 `normal = all - managed` 精确无第三态遗漏。
 fn contact_count_filters(workspace_id: &str, account_id: &str) -> (Document, Document) {
-    let base = doc! { "workspace_id": workspace_id, "account_id": account_id };
+    let base = doc! {
+        "workspace_id": workspace_id,
+        "account_id": account_id,
+        // 手动「从池移除」的联系人（hidden_from_pool=true）不计入——与 list_contacts 同源口径。
+        // $ne:true 兼容缺字段旧文档（doc-only 字段，非 Contact struct 成员）。
+        "hidden_from_pool": { "$ne": true },
+    };
     let mut managed = base.clone();
     managed.insert("agent_status", "managed");
     (base, managed)
@@ -918,6 +950,34 @@ pub(super) async fn disable_agent(
     Ok(Json(json!({ "item": ApiContact::from(contact) })))
 }
 
+/// `POST /api/contacts/:id/hide-from-pool`
+///
+/// 手动把联系人从运营池移除（媒体号等无法自动判定的非目标）。**不删记录**
+/// ——删了下次对方发消息 webhook 又会重新建档。改标 doc-only `hidden_from_pool=true`，
+/// list_contacts / count_contacts 读时过滤（$ne:true）。单向移除，无恢复端点（YAGNI）。
+/// workspace 隔离：filter 带 current_workspace，杜绝跨租户改写（IDOR）。
+pub(super) async fn hide_from_pool(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
+    Path(id): Path<String>,
+) -> AppResult<Json<Value>> {
+    let object_id = parse_object_id(&id)?;
+    let result = state
+        .db
+        .contacts()
+        .update_one(
+            doc! { "_id": object_id, "workspace_id": &admin.current_workspace },
+            doc! { "$set": { "hidden_from_pool": true, "updated_at": DateTime::now() } },
+            None,
+        )
+        .await?;
+    if result.matched_count == 0 {
+        return Err(AppError::NotFound("contact not found".to_string()));
+    }
+    let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
+    Ok(Json(json!({ "item": ApiContact::from(contact) })))
+}
+
 pub(super) async fn update_profile_note(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
@@ -1591,16 +1651,48 @@ mod tests {
     }
 
     #[test]
+    fn preview_label_text_truncates_content() {
+        // text / None 走原文截断（现有语义）
+        assert_eq!(preview_label_for_type(Some("text"), "你好呀"), "你好呀");
+        assert_eq!(preview_label_for_type(None, "旧消息无类型"), "旧消息无类型");
+        let long: String = "字".repeat(40);
+        let out = preview_label_for_type(Some("text"), &long);
+        assert!(out.ends_with('…'));
+        assert_eq!(out.chars().count(), INBOUND_PREVIEW_MAX_CHARS + 1); // 30 + 省略号
+    }
+
+    #[test]
+    fn preview_label_non_text_uses_static_label_not_content() {
+        // 非 text 类型绝不读 content（content 可能是 XML 垃圾）
+        let xml = "<msg><appmsg appid=\"\" sdk...";
+        assert_eq!(preview_label_for_type(Some("appmsg"), xml), "[链接]");
+        assert_eq!(preview_label_for_type(Some("system"), "<sysmsg type=\"functionmsg\">"), "[系统消息]");
+        assert_eq!(preview_label_for_type(Some("image"), "irrelevant"), "[图片]");
+        assert_eq!(preview_label_for_type(Some("voice"), ""), "[语音]");
+        assert_eq!(preview_label_for_type(Some("video"), ""), "[视频]");
+        assert_eq!(preview_label_for_type(Some("namecard"), ""), "[名片]");
+        assert_eq!(preview_label_for_type(Some("emoji"), ""), "[表情]");
+        assert_eq!(preview_label_for_type(Some("location"), ""), "[位置]");
+        assert_eq!(preview_label_for_type(Some("voip"), ""), "[通话]");
+        assert_eq!(preview_label_for_type(Some("statussync"), ""), ""); // 状态同步无展示意义
+        assert_eq!(preview_label_for_type(Some("unknown"), ""), "[消息]");
+        assert_eq!(preview_label_for_type(Some("某新类型"), ""), "[消息]"); // 兜底
+    }
+
+    #[test]
     fn contact_count_filters_isolate_workspace_and_account() {
         let (base, managed) = contact_count_filters("ws1", "acct1");
         // base：仅 workspace + account 隔离（与 list_contacts 同源）。
         assert_eq!(base.get_str("workspace_id").unwrap(), "ws1");
         assert_eq!(base.get_str("account_id").unwrap(), "acct1");
         assert!(base.get("agent_status").is_none(), "base 不得含 agent_status");
+        // 隐藏的联系人不计入任何 tab 计数（与 list_contacts 口径一致）。
+        assert!(base.get_document("hidden_from_pool").is_ok());
         // managed：在 base 基础上加 agent_status=managed。
         assert_eq!(managed.get_str("workspace_id").unwrap(), "ws1");
         assert_eq!(managed.get_str("account_id").unwrap(), "acct1");
         assert_eq!(managed.get_str("agent_status").unwrap(), "managed");
+        assert!(managed.get_document("hidden_from_pool").is_ok());
     }
 
     #[test]

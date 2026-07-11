@@ -499,9 +499,17 @@ const WECHAT_SYSTEM_ACCOUNTS: &[&str] = &[
     "filehelper", "weibo", "brandsessionholder",
 ];
 
+/// 判定 wxid 是否微信官方保留系统账号（业界通用白名单）。这些不是能运营的真人
+/// 私聊——建档判据（webhooks::is_operatable_person）与 roster 非真人标记共用此判据，
+/// 杜绝两份清单漂移。注意：公众号（gh_ 前缀）、媒体号（wxid_* 好友，如福州晚报）
+/// 无可靠字段识别，**不在此列**——公众号靠 gh_ 前缀单独拦，媒体号只能人工移除。
+pub(crate) fn is_system_account(wxid: &str) -> bool {
+    WECHAT_SYSTEM_ACCOUNTS.contains(&wxid)
+}
+
 /// 判定是否非真人账号：type=="system" 或 wxid 命中微信保留白名单。
 fn is_non_human_account(user_name: &str, item_type: Option<&str>) -> bool {
-    item_type == Some("system") || WECHAT_SYSTEM_ACCOUNTS.contains(&user_name)
+    item_type == Some("system") || is_system_account(user_name)
 }
 
 fn parse_roster_items(result: &serde_json::Value) -> Vec<RosterFriend> {
@@ -1295,6 +1303,22 @@ mod is_non_human_tests {
     fn public_account_not_misjudged() {
         // 公众号(福州晚报 wxid_8874178741811)无可靠字段识别 → 不误判为非真人。
         assert!(!is_non_human_account("wxid_8874178741811", Some("friend")));
+    }
+}
+
+#[cfg(test)]
+mod system_account_tests {
+    use super::is_system_account;
+
+    #[test]
+    fn is_system_account_matches_wechat_reserved() {
+        assert!(is_system_account("weixin")); // 微信团队
+        assert!(is_system_account("fmessage")); // 朋友推荐消息
+        assert!(is_system_account("newsapp"));
+        assert!(is_system_account("filehelper"));
+        // 真人 wxid_* 不命中
+        assert!(!is_system_account("wxid_ydzaomn4scsb12"));
+        assert!(!is_system_account("wxid_8874178741811")); // 福州晚报=媒体号,wxid_*,不靠此拦
     }
 }
 
