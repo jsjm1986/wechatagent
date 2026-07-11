@@ -251,7 +251,48 @@
 
 ## 环节⑥ outbox 幂等 / claim / second-pass safety gate / retry
 
-_（待审）_
+审查文件：`src/agent/outbox.rs` + `src/agent/outbox_dispatcher.rs`（辅证 gateway/reaction/media_send/mcp/indexes）。主控亲验 F-01 铁证（reclaim :689 直接 mcp_already_succeeded vs timeout :851-878 先 chat_search 再回落，两分支不对称）。**验证重心环节。**
+
+### ✅ 亲验通过总览（含历史三处已修基线仍在位）
+- **历史已修基线全部现码仍正确**：①FIFO sort `atomic_claim_pending` `.sort({created_at:1,_id:1})`（`outbox_dispatcher.rs:165`，PR#136）②`MCP_CLIENT_TIMEOUT=60 < SEND_TIMEOUT=150 < LEASE=180`（守护测试 `send_timeout_covers_worst_case...`:1159，PR#164）③second-pass 每次 MCP 前真重查（`process_entry`:600→609 现查非缓存）。✅
+- **幂等键维度充分**：文本 `{source_event_id}:{contact}:{content_hash}`（:215）+ 多段 `#seg{idx}`（:2565）；媒体/名片 synthetic 键含 asset_id/card_id（:411）避空 content 撞键；manual_send 摘 run_id + day_bucket。unique 索引存在（indexes.rs:772），DuplicateKey→IdempotentSkip。✅
+- **先入 outbox 再 MCP 无先发后记窗口**：MCP 只从 dispatcher process_entry 发起，gateway 侧全是 enqueue 后返回，S5.2 已删直连。✅
+- **claim 原子无双 claim**：find_one_and_update 单文档原子 + filter `status=pending`，第二 worker 跳下一条；worker_id=hostname:pid:uuid。✅
+- **cancel 彻底**：`cancel_for_contact_on_user_reaction`（outbox.rs:545）把同 contact pending/in_flight 全置 canceled + unset worker_id/locked_until。✅
+- **retry backoff 有界**：`2^attempt×5s` clamp[0,10] + jitter±20%；状态机 pending→in_flight→(sent|failed_terminal|canceled) 无卡死；掉线/pacing defer 刻意不耗 attempt。✅
+
+### [F-01] 崩溃恢复(reclaim)分支文本 post-hoc 只查本地 mcp_call_logs 不查权威 chat_search → 崩溃后可能重发文本（补 PR#164 未覆盖分支）
+- 入口频道: userOps / command（凡走 outbox 的文本发送）
+- 链路环节: ⑥ outbox 崩溃恢复
+- 类型: 幂等 / 竞态（防重发缺口）
+- 严重度: Medium（主控认同：后果=重发给真实客户顶下限；触发需"MCP已送达+mcp_logs未落+此刻崩溃+lease过期"多条件叠加+单worker崩溃罕见压上限）
+- 现象/风险: reclaim 分支（`outbox_dispatcher.rs:689` 主控亲验）文本条目**直接** `mcp_already_succeeded`（只查本地 `mcp_call_logs`）。对比 timeout 分支（`:851-878` 主控亲验）文本**先查 MCP `chat_search_outbound`**（server 真实已发记录，同步落库、不受本地取消影响），失败才回落本地日志。`mcp_call_logs` 写入 best-effort（`mcp.rs:358` `let _`）且在 MCP 响应**之后**。worker 在"MCP 已送达微信、mcp_logs 未落库"窗口崩溃 → lease 过期被 reclaim → 下一 worker `mcp_already_succeeded` 本地查不到 → 判"没发过" → 重发同一句给客户。崩溃恰是本地日志最不可靠时刻，此分支却唯独不查权威 chat_search。**reclaim 分支注释(:670)"与 timeout 分支同一核对函数"是过期/错误的**——PR#164 给 timeout 加 chat_search 时漏同步给 reclaim。
+- 根因（亲验）: `outbox_dispatcher.rs:689`（reclaim 文本走本地）vs `:851-878`（timeout 文本先 chat_search）不对称；`mcp.rs:358` 日志 best-effort 且在响应后。
+- 复现设想: 可 117 复现——managed 联系人触发回复入队 → dispatcher claim 后在 MCP 成功返回与 mcp_logs 写入之间 kill 进程（或删该 mcp_call_log 行模拟丢日志）→ 等 lease 过期(>180s) → 观察下一 tick 是否重发同内容。谨慎，勿碰真人吴界；须串行不与套件并发。
+- 验证状态: PLAUSIBLE（主控亲验两分支不对称确凿；触发窗口宽度需 117 时序实验估计）
+- 修复建议: reclaim 文本分支比照 timeout 先 `chat_search_outbound` 权威核对、失败再回落 `mcp_already_succeeded`；把 timeout 分支核对逻辑抽共用函数两处复用，消除非对称。
+- 状态: Open
+
+### [F-02] enqueue 与 dispatcher 的 max_attempts 默认值分歧（3 vs 5，死代码分支）
+- 链路环节: ⑥ retry 状态机 / 类型: 一致性 / 严重度: Low
+- 现象/根因（亲验）: `outbox.rs:244-248` enqueue 兜底 `<=0→3`（落库恒≥1）；`outbox_dispatcher.rs:322-326` schedule_retry_or_terminal 用 `<=0→5`。`<=0` 分支对 enqueue 产出 entry 是死代码（永不触发），仅手工/历史脏文档走到。当前无生产影响。
+- 验证状态: PLAUSIBLE（非活跃 bug）
+- 修复建议: dispatcher 侧默认改 3 对齐或删该分支。
+- 状态: Open
+
+### [F-03] 成功 update 忽略 modified_count，cancel 竞态下审计不一致（不致重发）
+- 链路环节: ⑥ cancel×send 竞态 / 类型: 一致性 / 严重度: Low
+- 现象/根因（亲验）: send 成功置 sent 的 update_one filter 含 `status=in_flight`（`outbox_dispatcher.rs:784-802`）不查 modified_count。发送在途时用户 stop→cancel 改 canceled，则 sent-update 匹配 0 行静默无效。消息已 MCP 发出（不可撤），DB 停 canceled → 审计"已取消却已送达"不一致。**不重发**（canceled 终态，reclaim 只碰 in_flight）。属固有取消延迟。
+- 验证状态: PLAUSIBLE（非双发风险，仅审计观感）
+- 修复建议: 可选——命中 0 行补 warn 事件提升审计可解释性。
+- 状态: Open
+
+### [F-04] reclaim 不消耗 attempt → 反复崩溃理论无界重发不入 failed_terminal
+- 链路环节: ⑥ 崩溃恢复 / 类型: 错误处理 / 严重度: Low
+- 现象/根因（亲验）: `reclaim_expired_leases`(:98-128) 仅置 pending+reclaimed_in_flight，attempt 不变；被 reclaim 条目若判未发出走全新实发（非 schedule_retry_or_terminal），不累加 attempt、不受 max_attempts 约束。若 worker 每次同位置崩溃→无限 reclaim→重试永不进 failed_terminal。生产单 worker 崩溃罕见，影响小。
+- 验证状态: PLAUSIBLE（纯边缘）
+- 修复建议: 可选——加独立 `reclaim_count` 上限，超限转 failed_terminal 交 admin。
+- 状态: Open
 
 ## 环节⑦ MCP 发送（message_send_text / result.isError / 超时）
 
