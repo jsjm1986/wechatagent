@@ -935,3 +935,78 @@
 ### 备案（观察项，非 live bug）
 - **resolve_escalation filter 缺 workspace_id**（ledger.rs:161，仅 {short_code, status=pending}）：因 short_code 全局唯一 + 两调用方上游均已 workspace 预筛，当前不可跨域越权；缺纵深防御，未来新增未预筛调用方即成 IDOR。列观察项。
 - **多实例并发双推**：scan_escalation_timeouts 单进程 worker（tasks.rs:167）驱动，当前单实例无害；横向扩展时两实例可能对同一 pending 同时推卡+改派（reassign_escalation 不 CAS principal_wxid）。就绪债，同多租户隔离债性质。
+
+## provider 热切换 + prompt pack 生效闸
+
+审查范围：`routes/llm_providers.rs`（activate_provider:305 / swap_registry:552 / test_provider:439 / base_url trim:178/229 / mask_api_key:43）+ `routes/prompt_templates.rs`（publish:240 / update:155 / reset_system_prompt_pack:385）+ `prompt_guard.rs`（三闸）+ `llm.rs`（with_format:268 / 请求拼接:453）。主控派 opus subagent 复审 + 逐条亲验。
+
+### ✅ 亲验通过总览（密钥安全 + 三闸不可绕 + 生效闸内容 diff + reset 语义全成立）
+
+1. **✅ api_key 无明文 echo/日志泄漏（红线，若泄漏为 High）**：LlmProviderView（llm_providers.rs:53-68）只出 api_key_masked 无明文字段（主控亲验字段列表）；全 llm.rs + llm_providers.rs **零** api_key 进 tracing/println/format 宏（主控 grep 空）；create 拒 mask 占位/update 传 mask 沿用旧值/test 传 mask 回退 DB 真值三处一致。**CONFIRMED 干净**。
+2. **✅ prompt pack 三闸不可绕**：字面双闸 validate_prompt_edit（禁词+锚完整性）在 create/update/publish 三处都过，且 publish 双闸在 force 判断**之外**（force 只跳 LLM 第三闸）；全仓仅 publish（gated）+ evolution/release 会写 status=active，无绕闸直置 active 路径。
+3. **✅ 生效闸是内容 diff 非版本号**：review_prompt_edit 传 old_content vs new_content 行级取增量；启动重种 ensure_prompt_pack_v2 按 normalize_prompt_content 内容比对，与版本常量解耦（符合"改 prompt 不必 bump 版本"）。
+4. **✅ publish 保护 evolution 行**：delete_many filter 带 `seeded_by:{$ne:"evolution_release"}`（prompt_templates.rs:338），不误删 rollback 链历史行。
+5. **✅ reset-system-pack 是显式销毁性 reseed**：reset_prompt_pack_v2 对 4 集合 delete_many+重种，仅 route handler 调（非每启动幂等，启动走 ensure_prompt_pack_v2 不 clobber 运营编辑）；bump prompt_pack_version 失效 LRU cache 正确。
+6. **✅ base_url trailing-slash 不发散**：LlmClient::with_format（llm.rs:268）内部 trim_end_matches('/')——test/activate 走同一 client 构造器，尾斜杠被统一吸收，**不因 test 不 trim 而与 activate 发散**（主控亲验，推翻初步"test 不 trim 致发散"担忧）。
+7. **✅ activate 读 DB 已 trim 值传 swap**：activate_provider（:334 读 target DB 文档）→ swap_registry，用的是写库已 trim 的值，与运行时一致。
+8. **✅ classify_review_verdict 收紧 fail-open**：仅 violation==false 才 Pass，模糊响应降级 NeedsHumanConfirm 不放水。
+
+### [KD-09] base_url 缺 /v1 无任何前置校验/补全，仅错误后文案提示（生产 405 坑无硬防）
+
+- 入口频道：llmProviders 频道 create/update provider
+- 链路环节：provider 配置
+- 类型：配置校验缺失（405 坑无前置防）
+- 严重度：**Low**
+- 现象：create/update 只 trim_end_matches('/')（:178/229），全代码无任何地方校验/补全 /v1。OpenAI 形态请求 `{base_url}/chat/completions`（llm.rs:453），管理员填 `https://api.deepseek.com`（漏 /v1）→ 打到 `.../chat/completions` → 404/405（历史踩过的坑）。仅错误后 classify_llm_error_for_user（llm.rs:982）文案提示补 /v1，无前置校验。
+- 缓解（降 severity，亲验）：test_provider 与 activate 走同一 LlmClient 拼接，test 能在保存前复现 404 让管理员发现。
+- 验证状态：**PLAUSIBLE**（无前置校验 CONFIRMED；触发需管理员漏填 /v1）。
+- 修复建议：可选——create/update 对 openai 形态软校验 base_url 是否以 /v1（或已知兼容后缀）结尾，不匹配给 warning 而非 hard block（各家路径不一不宜强制）。
+
+### [KD-10] provider 热切换 swap_registry 失败时 DB 已置新 active、运行时仍旧 client，返回 Err 掩盖"DB 已改"（瞬时不一致，自愈）
+
+- 链路环节：provider 热切换
+- 类型：DB↔运行时非事务
+- 严重度：**Low**
+- 现象：activate_provider 先 update_many 清旧 active（:325）→ update_one 置新（:334）→ swap_registry（:341）。若 swap_registry 返 Err（LlmFormat::parse 失败或 client 构造失败），DB 已提交 isActive=true 但运行时仍旧 client，函数返 Err，管理员以为激活失败实际 DB 已翻。
+- 缓解（降 severity，亲验）：①format 在 create/update 已过 LlmFormat::parse，DB 合法值极难触发 parse 失败；②reqwest builder 几乎不失败；③**最终一致**——重启时 ensure_default_llm_provider（main.rs）按 isActive=true 从 DB 重建 registry 用上新 provider。自愈瞬时窗口。
+- 验证状态：**PLAUSIBLE**（非事务窗口 CONFIRMED；触发需 swap 构造失败这一极罕见路径）。
+- 修复建议：swap 失败时回滚刚写的 active 标记（或先 swap 成功再写 DB），让"返回 Err"与"DB 未改"一致。
+
+### 备案（观察项，非 bug）
+- **manual publish 后无 current_version=true 行**：publish 只置 status=active（prompt_templates.rs:377）不设 current_version=true 且 delete_many 删了旧 current_version 行。不影响运行时（load_prompt 按 status=active + version:-1 选，不依赖 current_version），但下次 publish 的 old_content 基线查询（:280 用 current_version:true）查空→全文当增量送 LLM 第三闸。代码注释已声明"查不到则空串"，属设计取舍（manual publish 是单版本清理，rollback 只 evolution 链支持）。
+
+---
+
+# 批 D 总评（请示配置链 · 审查收口）
+
+**审查方式**：4 链（请示裁决→决策人链→provider 热切换→prompt pack），3 task，每链派 opus subagent 只读复审 + **主控逐条亲验 file:line**（含推翻 subagent 初判：base_url trailing-slash 经亲验 with_format 内部 trim 不发散）。审查阶段只入账不改 src。
+
+### finding 计数（去重后，全部主控亲验）
+- **Critical 0 / High 1**：
+  - **KD-04**（决策人链）用 decider_chain（推荐配置）时领导微信回复永不被识别为裁决——lookup_principal_config 只查旧标量 principal_decider（ledger.rs:226）+ put_ask_human_policy 不写 principal_decider（domains.rs:233），领导裁决掉进普通客户链路甚至被 AI 当客户自动回复。**非 DB-fault/时序触发、推荐配置下确定性发生、核心交互失效**——批 D 唯一 High、跨批唯一确定性核心交互破坏。
+- **Medium 4**：KD-01（relay 数字护栏中文数字盲区，绕过编造+误杀）、KD-03（relay 误杀后清 awaiting 不重排致裁决永久丢失）、KD-05（改派骚扰门用 created_at 口径漂移）、KD-06（改链后旧 pending 挂链外决策人被永久当链尾晾住）
+- **Low 4**：KD-02（客户永不知道有领导红线无字符级词表守卫，仅 prompt）、KD-07（改派缺 next==客户守卫）、KD-08（推卡成功 reassign 失败重复卡，已知权衡）、KD-09（base_url /v1 无前置校验）、KD-10（provider swap 失败 DB↔运行时瞬时不一致，自愈）
+  - 注：KD-02/KD-07 定 Low-Medium 边界，归 Low 计。
+- **整块干净 1**：provider 热切换 + prompt pack（密钥安全/三闸不可绕/生效闸内容 diff/reset 语义全 CONFIRMED，仅 2 Low）
+
+### 跨链根因家族（修复统筹）
+1. **relay 数字护栏家族**（KD-01 + KD-03，请示裁决）：extract_number_tokens 只认 ASCII 数字→中文数字盲区（绕过+误杀），且误杀后清 awaiting 不重排致裁决黑洞。修复统筹：中文数字归一 + 误杀不清 awaiting/重排兜底文案。
+2. **新旧字段迁移不对称家族**（KD-04 独立但最严重）：decider_chain 是推荐新字段，但领导回复分流仍靠旧 principal_decider 标量，写路径不同步。修复=lookup_principal_config 认 decider_chain。**与批 B KB-01（Lean 档 used_knowledge_ids 未清）、KB-05（serde 默认 vs Mongo 查询）同属"新旧路径/口径不对称"元家族**。
+3. **红线代码兜底缺失/覆盖不全**（KD-02）：无人工接管红线有字符级 lint，但平级的"客户永不知道有领导"红线无。修复=对齐加词表。
+
+### 修复优先级建议（供用户定）
+- **P0/P1**：**KD-04**（领导微信回复识别，改 lookup_principal_config 认 decider_chain）——推荐配置下核心交互确定性失效，改动小（一个函数改查询），**批 D 最高优先，建议置顶**。
+- **P1**：KD-01+KD-03（relay 数字护栏中文数字 + 误杀补偿）——涉红线转述正确性，改动中等，可写确定性测试。
+- **P2**：KD-05/KD-06（骚扰门口径 + 孤儿 pending）+ KD-02（领导泄漏词表兜底）。
+- **P3**：Low 批量（KD-07/08/09/10 + 备案观察项）。
+
+### 与批 A/B/C 关联
+- 四批最系统性家族分处四层：批 A 错误处理层（审计事件 `?` 吞回复）、批 B 数据写入审计层（编辑绕统一入口+字段锁未兑现）、批 C 多步非事务写健壮性层（触达三步非原子留孤儿）、批 D **新旧字段迁移不对称层**（KD-04 领导回复分流靠旧字段 + KD-01 数字护栏 + KD-02 红线兜底缺失）。
+- **KD-04 是四批唯一 High**——前三批全是 0 High（防护不完整/衔接有洞/审计断/非原子窗口，触发需 DB-fault/时序/误配），KD-04 是**推荐配置下确定性发生的核心交互破坏**，够 High 线。
+- 四批红线核心防线**均亲验成立**：relay 触发不可伪造/客户侧零泄漏/密钥不泄漏/三闸不可绕——findings 全是"防护不完整/衔接有洞/迁移不对称/覆盖盲区"，**非红线被突破**。
+
+### 审查质量说明（防假绿）
+- 每条 finding 的 file:line 均主控当场 Read/Grep 亲验；3 次 subagent 复审结论经主控亲验后坐实/校准/**推翻**入账（KD-04 补验 put_ask_human_policy 不写 principal_decider + 种子 None、KD-06 补验 position 未命中退化链尾、**base_url trailing-slash 经亲验 with_format 内部 trim 推翻 subagent 初判发散担忧、降为 /v1 校验缺失 Low**）。
+- **严重度校准（反过拟合）**：subagent 曾把 KD-01 定 High、KD-04 定 High——KD-01 按"relay 主防线是 prompt、数字护栏是代码 backstop"校准为 Med（backstop 盲区非主防线突破）；KD-04 **确认 High**（非 backstop、是核心交互在推荐配置下确定性失效，与前三批 DB-fault 触发类本质不同）。校准依据是触发确定性 + 是否主防线，非机械压级。
+- 1 整块 0 finding（provider+prompt pack，仅 2 Low）是真读透后正面结论。
+- 未真跑（同前定调），KD-04/KD-05/KD-06/KD-07/KD-08 代码路径 CONFIRMED，其余 PLAUSIBLE。复现留修复阶段写确定性测试随修复 PR 上 CI。
