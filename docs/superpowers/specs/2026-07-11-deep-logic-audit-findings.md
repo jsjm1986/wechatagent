@@ -310,4 +310,45 @@
 
 ## 环节⑧ 回写（events / outcome metrics / decision review / run log / operation_state 派生）
 
-_（待审）_
+审查文件：`src/agent/gateway.rs` 回写段 + `run_envelope.rs` + outcome_metrics/tasks/outcomes_autonomy。**主控去重/证伪**：F-⑧-01 与 C-01 部分重叠（去重后保留新增 3 处）、F-⑧-02 与 Task3 已排除的假 finding 同条（主控亲验 tasks.rs:254-307 后驳回）。
+
+### 关键架构澄清（修正 brief 假设）
+**gateway 不做同步发送**——物理 MCP 发送推迟到 outbox dispatcher 异步（gateway 只 `outbox_enqueue`:2586，`message_send_text` 由 dispatcher:768 后台发）。故 gateway 所有回写（events/decision_review/run_log/operation_state/metrics）都在 enqueue **之前**：gateway 回写用 `?` 抛错时消息**尚未入队**，后果是"本轮不回复"（**非重发**）。C-01 关于"送达后回写致重发"在 gateway 侧不成立——真正送达后回写全在 dispatcher，已亲验受 lease-reclaim + post-hoc 保护（见✅）。
+
+### ✅ 亲验通过总览（9 点）
+- **dispatcher 送达后 sent 回写受保护**：MCP 成功后置 sent 用 `?`（outbox_dispatcher.rs:802），失败则停 in_flight→lease 过期 reclaim→下轮 post-hoc 核对命中标 sent 不重发。✅（唯 reclaim 文本分支非对称见 F-01）
+- **update_run_log_outbox_status fail-soft**（outbox_dispatcher.rs:233-255 `let res;if Err{warn}`）✅
+- **enqueue 后回写 outbox_status=pending fail-soft**（gateway.rs:2596 `let _`）✅
+- **多段部分入队失败正确**：单段失败不中断续尝试其余，循环后写 partial_failure 事件再返 Err；每段 `#seg{idx}` 独立幂等 key 重跑 skip 已入队段。✅
+- **run log token usage 完整**（从 RunBudget 快照取 token_budget/tokens_used/llm_calls_used/degraded_reasons，gateway.rs:4897）✅
+- **promptVersions 未断链**：落 decision_reviews.prompt_versions（gateway.rs:4725，8 key）与 run_log 同 run_id 关联可 join。✅
+- **operation_state 派生落库口径与决策侧一致**（synced_state 优先 canonical customer_stage 缺失回落 decision.operation_state，applied_operation_state 据实际写入判迁移事件，与环节③同源无漂移）✅
+- **outcome_metrics 写/读 workspace_id 口径一致**（写 tasks.rs:681 / 读 outcome_metrics.rs:38 均带 ws+account；单租户一致，多租户就绪债）✅
+- **planner 聚合读侧口径一致**（outcomes_autonomy.rs:145 match ws+account+kind 白名单，与写侧一致，$ifNull 归 0 无断层）✅
+
+### [H-01] apply_agent_updates 内另有 3 处审计事件误用 `?`（C-01 同族扩展，enqueue 前→丢回复）
+- 入口频道: userOps / command
+- 链路环节: ⑧ 画像/状态回写侧（apply_agent_updates 内）
+- 类型: 错误处理 / 文档-代码漂移（C-01 同族）
+- 严重度: Medium（同 C-01 家族：审计事件误 `?`、enqueue 前 DB 抖动吞本轮回复；单租户单 worker 低发压上限）
+- 现象/风险: `apply_agent_updates`（gateway.rs:2356 调用，**早于** enqueue:2586）内注释多处声称"回复已异步发出，写失败绝不阻断"（:4168/4232/4285/4345），据此对纯观测旁路正确用了 fail-soft（bayesian warn:4266 / relationship `let _`:4333 / suspected_deal `let _`:4383）。**但同函数另有 5 处审计事件用 `?`**：其中 :4503 operation_state_transition_rejected、:4525 operation_state_transitioned **已在环节③ C-01 入账**；本条新增 **3 处**——`:4411 g1_correction`、`:4480 profile_churn_observed`、`:4551 follow_up_run_at_degraded`（主控亲验三处均 `.await?`）。注释"reply 已下发"前提为假（此刻尚未 enqueue），DB 抖动使这些纯审计写 return Err→本轮回复永不入队→丢回复。
+- 根因（亲验）: gateway.rs:4411/4480/4551 `.await?`；apply_agent_updates 调用点 :2356 早于 enqueue :2586。与 C-01 同一代码气味，构成"同函数 5 处审计事件系统性误用 `?`"family。
+- 复现设想: 令 events 集合在这些事件写时刻注入 Mongo 瞬时错误，观察本轮 inbound 无回复、无 outbox 条目。生产安全构造困难，标 PLAUSIBLE。
+- 验证状态: PLAUSIBLE（主控亲验 3 处 `?` + ordering 属实）
+- 修复建议: 与 C-01 合并修复——apply_agent_updates 内**全部纯审计事件**（含 C-01 的 :4503/:4525 + 本条 :4411/:4480/:4551）统一降级 fail-soft（`let _`/`if Err{warn}`），与同函数 bayesian/relationship/suspected_deal 口径一致。C-01 + H-01 应作为一个"审计事件 fail-soft 对齐"修复项一并处理。
+- 状态: Open
+
+### [H-02] run_envelope.rs R0「LLM 前先写信封」三函数是生产死代码，pre-LLM 追溯不变量未生效
+- 入口频道: —（可观测性）
+- 链路环节: ⑧ run log 生命周期
+- 类型: 文档-代码漂移 / 就绪债
+- 严重度: Low
+- 现象/风险: `run_envelope.rs` 头声称 R0.1「LLM 调用前 insert lifecycle=started 信封，确保超时/panic/JSON 失败也有可追溯条目」，提供 `write_run_envelope_started`/`update_run_envelope_terminal`/`install_panic_hook_for_envelope`。但全仓 Grep 这三符号**除定义+doc 外无生产调用点**（main.rs 无引用）。gateway 仍走单次 insert 的 `write_agent_run_log_with_finalize`（gateway.rs:4908）。即决策前 panic/超时的 run **不留** started 信封，R0 追溯在生产未生效。
+- 根因（亲验）: 模块 doc 自述"W1 task 2.5 会把 gateway 入口改为先调 write_run_envelope_started"为将来时（run_envelope.rs:23-27/705），接线从未落地。Grep 仅内部定义 + models.rs:2730 一处 doc 引用。
+- 复现设想: 读码确认无调用点，无需真跑。
+- 验证状态: PLAUSIBLE（主控可复核 Grep 无调用点）
+- 修复建议: 要么按原设计接上 started 信封+终态 update+panic hook，要么文档标注 R0 为"未接线/推迟"避免误以为已有 pre-LLM 追溯。当前单次 insert 对"决策已产出"的 run 追溯完整，缺口仅"决策前 panic/超时"极端 run。
+- 状态: Open
+
+### 主控驳回的候选（证伪留痕）
+- **[驳回] F-⑧-02 task 先置 outbox_enqueued 再 enqueue，中间 `?` 失败留孤儿任务丢消息**：subagent 自标"未能确认（未核 tasks.rs worker）"。**主控亲验 tasks.rs:254-307**：gateway 返 Err → worker `Err` 分支 `update_one(doc!{"_id":task_id}, $set status=retry/failed)`（:261/:292）filter **仅 `_id` 无 status 条件、无条件覆盖** outbox_enqueued → task 会被打回 retry 重跑（enqueue 幂等重跑安全），**不卡孤儿、不静默丢**。与环节③ Task3 已排除的假 finding 同条。驳回，不入账。
