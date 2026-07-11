@@ -66,7 +66,6 @@ export function DeciderChainEditor({
         <div key={d.wxid} className={styles.chainRow}>
           <span className={styles.chainName} title={d.wxid}>
             {d.displayName ?? d.wxid}
-            <span className={styles.chainWxid}>{d.wxid}</span>
           </span>
           <div className={styles.chainActions}>
             <button type="button" aria-label="上移" disabled={idx === 0} onClick={() => move(idx, -1)}>↑</button>
@@ -95,7 +94,16 @@ export function DeciderChainEditor({
                     <span className={styles.chainWxid}>{c.wxid}</span>
                   </button>
                 ))}
-                {candidates.length === 0 && <div className={styles.chainEmpty}>无可选联系人</div>}
+                {candidates.length === 0 &&
+                  (contacts.length === 0 ? (
+                    <div className={styles.chainEmpty}>
+                      当前账号还没有联系人。请先到「账号管理」同步该账号的通讯录，再来配置决策人。
+                    </div>
+                  ) : (
+                    <div className={styles.chainEmpty}>
+                      {q.trim() ? "没有匹配的联系人，换个关键词试试。" : "该账号联系人都已在决策链中。"}
+                    </div>
+                  ))}
               </>
             )}
           </div>

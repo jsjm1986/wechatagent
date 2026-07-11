@@ -244,7 +244,16 @@ export default function ContentAssetsFeature() {
                 <select
                   className={styles.select}
                   value={assetDraft.kind}
-                  onChange={(event) => setAssetDraft({ ...assetDraft, kind: event.target.value })}
+                  onChange={(event) => {
+                    const kind = event.target.value;
+                    // 切到禁用表达时注入档字段被隐藏（后端恒注入、无视 minInjectTier），
+                    // 同步把 draft 值归位默认档，避免残留上次所选档位落库（死字段、不整洁）。
+                    setAssetDraft(
+                      kind === "forbidden_expression"
+                        ? { ...assetDraft, kind, minInjectTier: "full" }
+                        : { ...assetDraft, kind }
+                    );
+                  }}
                 >
                   {KIND_OPTIONS.map((opt) => (
                     <option key={opt.value} value={opt.value}>{opt.label}</option>

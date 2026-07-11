@@ -1,6 +1,7 @@
+#!/usr/bin/env python3
 """清理旧格式知识数据。默认 dry-run：只打印将要删除的 _id，不写入。
 
-执行实删：CLEAN_KNOWLEDGE_APPLY=1 python scripts/diag/clean_knowledge_legacy.py
+执行实删：CLEAN_KNOWLEDGE_APPLY=1 python3 scripts/diag/clean_knowledge_legacy.py
 
 删除范围（用户选 C 档）：
   1. 旧格式 documents（缺 catalog_summary 或 routing_map）+ 它们下属的 packs/chunks

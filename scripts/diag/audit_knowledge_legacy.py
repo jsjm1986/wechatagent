@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """只读审计：扫 operation_knowledge_documents / items / chunks，找出与"全新通用
 知识 schema"不兼容的旧数据。
 
