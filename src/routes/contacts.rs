@@ -251,13 +251,20 @@ pub(super) async fn list_contacts(
 /// managed 在其上加 `agent_status="managed"`。AgentStatus 仅 Normal/Managed
 /// 两态（models.rs），故调用方 `normal = all - managed` 精确无第三态遗漏。
 fn contact_count_filters(workspace_id: &str, account_id: &str) -> (Document, Document) {
-    let base = doc! {
+    let mut base = doc! {
         "workspace_id": workspace_id,
         "account_id": account_id,
         // 手动「从池移除」的联系人（hidden_from_pool=true）不计入——与 list_contacts 同源口径。
         // $ne:true 兼容缺字段旧文档（doc-only 字段，非 Contact struct 成员）。
         "hidden_from_pool": { "$ne": true },
     };
+    // 非真人排除（公众号 gh_/群 @chatroom/微信系统号）——与 list_contacts 读时
+    // is_operatable_person 过滤 DB 侧等价，否则 count 会把系统号算进去而列表不显示，
+    // 导致顶部数字比列表偏大。$nor 为独立顶层键，与上面三键 AND 共存不冲突。
+    // 白名单单一数据源 mcp::WECHAT_SYSTEM_ACCOUNTS，杜绝两份清单漂移。
+    for (k, v) in mcp::non_human_exclusion_filter() {
+        base.insert(k, v);
+    }
     let mut managed = base.clone();
     managed.insert("agent_status", "managed");
     (base, managed)
@@ -1746,6 +1753,25 @@ mod tests {
         assert_eq!(managed.get_str("account_id").unwrap(), "acct1");
         assert_eq!(managed.get_str("agent_status").unwrap(), "managed");
         assert!(managed.get_document("hidden_from_pool").is_ok());
+    }
+
+    #[test]
+    fn contact_count_filters_exclude_non_human() {
+        // 口径漂移回归：count 必须与 list_contacts 的 is_operatable_person 过滤等价，
+        // 排除公众号(gh_)/群(@chatroom)/微信系统号，否则顶部数字比列表偏大。
+        let (base, managed) = contact_count_filters("ws1", "acct1");
+        // base 与 managed 都必须含非真人排除的 $nor 顶层键。
+        let base_nor = base.get_array("$nor").expect("base 应含 $nor 非真人排除");
+        assert_eq!(base_nor.len(), 3, "$nor 三条件：gh_/@chatroom/系统号白名单");
+        assert!(managed.get_array("$nor").is_ok(), "managed 应继承 $nor");
+        // 序列化后应含 gh_/@chatroom/系统号 关键片段，证明排除口径落地。
+        let s = base.to_string();
+        assert!(s.contains("gh_"), "排除条件应含 gh_ 公众号前缀");
+        assert!(s.contains("@chatroom"), "排除条件应含 @chatroom 群");
+        assert!(s.contains("weixin"), "排除条件应含系统号白名单(weixin)");
+        // 与既有隔离键共存不冲突。
+        assert_eq!(base.get_str("workspace_id").unwrap(), "ws1");
+        assert!(base.get_document("hidden_from_pool").is_ok());
     }
 
     #[test]
