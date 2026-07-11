@@ -228,6 +228,7 @@ export default function LlmProvidersFeature() {
   }
 
   async function activateItem(item: LlmProviderItem) {
+    if (!window.confirm(`确认激活供应商「${item.name || item.providerId}」？将立即对所有生产对话生效。`)) return;
     setBusy(true);
     try {
       await api.post(`/api/admin/llm-providers/${encodeURIComponent(item.providerId)}/activate`);
