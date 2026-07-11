@@ -1099,3 +1099,85 @@
 - 现象：review_referral_card 写 referral_card.reviewed 审计（referral_cards.rs:167），但 toggle_referral_card（停用）和 delete_referral_card（delete_one 硬删）**都不写审计事件**。停用/删除已审批顾问名片直接改变 AI 可引荐范围（红线敏感），却无留痕；硬删误删不可恢复。三 handler 均有 AuthenticatedAdmin + workspace scope（越权已防）故 Low。
 - 验证状态：**Low / PLAUSIBLE**（审计缺失 CONFIRMED）。
 - 修复建议：toggle/delete 补 referral_card.toggled/deleted 审计（同 review 模式 fail-soft）；delete 可改软删（enabled=false + deleted_at）保留可追溯。
+
+## account + overview / operations（合并 · 低风险配置+只读统计）
+
+审查范围：`routes/accounts.rs`（list:32 / sync:64 / update_mcp_key:171 / login:244）+ `routes/operation_view.rs`（active_view:27）+ `routes/send_ledger.rs`（overview:115 / stats:73）+ outcome_metrics/behavior_signal_metrics。主控派 opus subagent 复审 + 逐条亲验。
+
+### ✅ 亲验通过总览（本块整体干净，红线关注点全达标）
+
+1. **✅ 鉴权/workspace 隔离全绿**：list/sync/update_mcp_key/login 全 AuthenticatedAdmin + current_workspace scope；update_account_mcp_key `_id+workspace_id` 双过滤（跨 ws 改不到别人 key）；login alias 查账号带 ws scope。
+2. **✅ mcp_api_key 明文不泄漏**：list_accounts 只下发 mcpKeyConfigured 布尔（accounts.rs:56，主控亲验）；全 accounts.rs 响应无明文；key 只进 Authorization Bearer 头，logged_call 落库走 redact_request_for_log；无 tracing 打印 key。
+3. **✅ mcp_api_key 不被 sync 抹掉**：$setOnInsert（accounts.rs:158）保护既有手配 key。
+4. **✅ 无破坏性删除面**：mod.rs 无 /accounts DELETE 路由、无 delete_account handler。
+5. **✅ 统计口径健全**：response_rate 除零守卫返 0.0；agg_count i32/i64 兼容防静默清零；overview 率以 evaluated 为分母；只读端点无写副作用；outcome_metrics 投影不下发 workspaceId。
+6. **✅ online 陈旧风险已缓解**：online 不止 sync——webhook Offline/Online 事件实时落库（webhooks.rs:361）；outbox dispatcher 发送前 gate fail-soft（掉线 defer 不盲发），陈旧 online 不致误发。
+
+### [KE-06] sync_accounts 用 $set 覆盖手配 mcp_base_url，与 mcp_api_key 的 $setOnInsert 保护不对称
+
+- 链路环节：account（sync upsert）
+- 类型：保护策略不对称（就绪债）
+- 严重度：**Low**（就绪债）
+- 现象：update_account_mcp_key 允许管理员为单账号写自定义 mcp_base_url；但 sync_accounts upsert 时把 mcp_base_url 放进 $set（accounts.rs:147，值恒为 config.mcp_base_url），下次 sync 会静默把手配 base_url 重置回全局默认。而 mcp_api_key 被刻意保护在 $setOnInsert（:158，注释"避免 sync 抹掉手配 key"）——二者非对称。
+- 根因（亲验）：同一 upsert 里 mcp_api_key 有 $setOnInsert 保护、mcp_base_url 没有。
+- 验证状态：**Low / CONFIRMED**（$set vs $setOnInsert 不对称，主控亲验 accounts.rs:147/158；单 default account+单 MCP 部署下 base_url 通常与 config 一致，触发面窄）。
+- 修复建议：把 mcp_base_url 从 $set 移到 $setOnInsert（与 mcp_api_key 对齐），或 sync 时不写 base_url。
+
+---
+
+# 全五批终评（核心业务逻辑全链路深度审查 · 收官）
+
+**审查方式**：5 批 · 21 条业务链/环/块，每链派 opus subagent 只读复审 + **主控逐条 file:line 亲验**（含调级/去重/驳回/**推翻** subagent 结论）。审查阶段只入账不改 src。逐行读码（PLAUSIBLE），117 真跑留修复阶段写确定性测试（不在生产注故障/kill 进程）。
+
+## 累计 finding 计数（去重后，全部主控亲验；数字由 ledger 头逐条统计核对，非记忆）
+- **批 A（自动回复命脉链）**：18 条 = 0C / 0H / 4M（B-02/C-01/H-01/F-01）/ 14L（A-01~06 双身份族+边缘、B-01/03、D-01、E-01、F-02/03/04、H-02）
+- **批 B（知识链）**：12 条 = 0C / 0H / 5M（KB-01/08/09/10/11）/ 7L
+- **批 C（成交活动链）**：7 条 = 0C / 0H / 3M（KC-01/02/05）/ 4L
+- **批 D（请示配置链）**：10 条 = 0C / **1H（KD-04）** / 4M（KD-01/03/05/06）/ 5L
+- **批 E（其余频道）**：6 条 = 0C / 0H / 2M（KE-01/02）/ 4L（KE-03/04/05/06）
+- **累计：53 findings = 0 Critical / 1 High / 24 Medium / 28 Low**（另 3 整环/块 0 finding：批 A 阈值闸+MCP、批 C 成交登记+成效聚合、批 D provider+prompt pack；及大量 ✅ 亲验通过红线点）。
+
+> 注：唯一 High = **KD-04**（用 decider_chain 推荐配置时领导微信回复永不被识别为裁决）——四批 0 High 的例外，因它是**推荐配置下确定性发生的核心交互破坏**，非其余 findings 的"DB-fault/时序/误配/opt-in"触发。
+
+## 跨批元家族（最有价值的结构性洞察）
+本轮深度审查最系统性的发现，是一个贯穿五批的**元家族**：
+
+> **「设计声称的不变量/闭环/口径，实现层有旁路/缺口/非原子窗口/新旧不对称」**
+
+分处五层，每层一个代表：
+1. **错误处理层**（批 A 家族①）：审计/旁路事件误用 `?` 连坐吞回复（B-02/C-01/H-01，6 处 `?`）——注释自认应 fail-soft、实现却 fail-closed。
+2. **数据写入审计层**（批 B 家族①）：知识编辑绕过"统一 apply_chunk_revision 入口"（KB-09/10/11），且 per-chunk locked_fields 后端从不强制——设计声称统一，实现有旁路。
+3. **多步非事务写健壮性层**（批 C 家族①）：dispatch_campaign 三步非原子（KC-01/02/03）——占去重位→建 task→回填，中间失败留孤儿。
+4. **新旧字段迁移不对称层**（批 D 家族②）：领导回复分流靠旧 principal_decider、推荐配置用 decider_chain（KD-04）；relay 数字护栏只认 ASCII（KD-01）；批 B KB-01/KB-05 同属此元家族。
+5. **保护策略不对称/口径分裂层**（批 E + 批 C）：mcp_base_url vs mcp_api_key 保护不对称（KE-06）；serde 默认 vs Mongo 查询口径分裂（KC-05）；名片准入 workspace vs 候选账号级不对称（KE-03）。
+
+**这正是上一轮"全量系统测试"（前端点页面 + 抽验，偏广度）扫不到的"看不见的层"**——逐行读码 + 主控亲验才能穿透到。
+
+## 红线总结论（五批一致）
+**所有核心红线防线均亲验成立，无一被突破**：
+- 批 A：自动回复命脉（gateway 闸/阈值闸/outbox 幂等/状态机 fail-soft）。
+- 批 B：AI 永不自动 verify（auto_verify 强制降级所有类型）+ 产品声明须 verified 背书（grounding 三处协同 + 硬闸）+ AI 提议不落主集合。
+- 批 C：AI 永不自证成交（自治 agent 无 deal-write 工具、只写 suspected_deal_signals、运营 approve 才落 staff_confirmed）。
+- 批 D：relay 触发不可伪造（is_synthetic_relay skip_ser/deser）+ 客户侧零泄漏 + 密钥不泄漏 + prompt 三闸不可绕。
+- 批 E：AI 提议+人工发布（auto_release 双闸默认双关、prompt 只人工 release）+ 名片引荐受控例外（默认关、引荐≠转人工、物理隔离幕后领导）。
+
+**53 条 findings 全是"防护不完整/衔接有洞/审计断/非原子窗口/迁移不对称/口径分裂"，非红线被突破。**
+
+## 修复路线图（供用户定优先级）
+- **P0**：**KD-04**（领导微信回复识别，改 lookup_principal_config 认 decider_chain）——推荐配置下核心交互确定性失效，改动小（一个函数改查询），**置顶**。
+- **P1**（改动小/中、价值高、可写确定性 lib 单测）：
+  - 批 A 家族①（审计事件 fail-soft 对齐，6 处 `?`）
+  - KB-08（收件箱纳入 needs_human_audit）+ KB-01（grounding 硬闸 else clear()）
+  - 批 C 家族①（触达可重入+孤儿自愈）
+  - KD-01/03（relay 数字护栏中文数字 + 误杀补偿）
+- **P2**（需先裁定设计定位或改动中等）：
+  - 批 B 家族①（知识编辑统一接回 apply_chunk_revision + locked_fields 后端强制，需裁定字段锁定位）
+  - KC-05（粗筛 serde/Mongo 口径对齐）+ KD-05/06（骚扰门口径/孤儿 pending）+ KD-02（领导泄漏词表兜底）
+  - KE-01/02（auto_release 方向一致性 + 重判口径，仅 auto_release 开启时影响）
+- **P3**：Low 批量（产品裁决 / 就绪债 / latent / 死代码 / 规模保护 / 命名对齐 / 审计留痕 / 保护不对称）。
+
+## 审查质量说明（防假绿·收官）
+- 每条 finding 的 file:line 均主控当场 Read/Grep 亲验；跨 5 批 ~15 次 subagent 复审，结论经主控亲验后**调级/去重/驳回/推翻**入账（如批 D base_url trailing-slash 经亲验 with_format 内部 trim 推翻 subagent 发散初判、批 A 驳回 F-⑧-02 假 finding）。
+- **严重度跨批一致性校准（反过拟合核心）**：subagent 多次把 DB-fault/opt-in 触发类定 High，主控按统一基准校准为 Med（触发需 DB-fault/时序/非默认配置=Med；只有"推荐配置下确定性发生的核心交互/红线破坏"够 High——全五批仅 KD-04 达此线）。校准依据是触发确定性 + 是否主防线，非机械压级。
+- 3 整环/块 0 finding + 大量 ✅ 亲验通过红线点是真读透后的正面结论，非漏审。
+- 未真跑故无 CONFIRMED 运行时复现；代码路径 CONFIRMED 的 finding 已如实标注，其余 PLAUSIBLE。复现留修复阶段写确定性 lib 单测/小型集成测试随修复 PR 上 CI（比生产 kill 进程更严谨可控）。
