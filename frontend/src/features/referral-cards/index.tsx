@@ -1,9 +1,11 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import type { FormEvent } from "react";
 import { Contact, UserRoundPlus } from "lucide-react";
 import { EmptyState } from "../../components/ui/EmptyState";
+import { FriendPickerModal, type FriendPickerItem } from "../../components/ui/FriendPickerModal";
 import { useAccountStore } from "../../stores/accountStore";
 import { useUiStore } from "../../stores/uiStore";
+import { useUserOpsStore } from "../../stores/userOpsStore";
 import { useReferralCardStore } from "../../stores/referralCardStore";
 import type { ReferralCard } from "../../types";
 import styles from "./ReferralCards.module.css";
@@ -23,9 +25,39 @@ export default function ReferralCardsFeature() {
     deleteCard
   } = useReferralCardStore();
 
+  const loadRoster = useUserOpsStore((s) => s.loadRoster);
+  const rosterCache = useUserOpsStore((s) => s.rosterCache);
+  const [pickerOpen, setPickerOpen] = useState(false);
+
   useEffect(() => {
     void loadCards();
   }, [loadCards]);
+
+  useEffect(() => {
+    if (currentAccountId) void loadRoster(currentAccountId);
+  }, [currentAccountId, loadRoster]);
+
+  const rosterItems: FriendPickerItem[] = (rosterCache[currentAccountId]?.items ?? []).map((r) => ({
+    wxid: r.wxid,
+    nickname: r.nickname,
+    remark: r.remark,
+    avatarUrl: r.avatarUrl,
+    sex: r.sex,
+  }));
+
+  const pickFriend = (item: FriendPickerItem) => {
+    setCardDraft({
+      ...cardDraft,
+      targetWxid: item.wxid,
+      displayName: cardDraft.displayName.trim()
+        ? cardDraft.displayName
+        : (item.remark || item.nickname || ""),
+    });
+    setPickerOpen(false);
+  };
+
+  const pickedFriend = rosterItems.find((r) => r.wxid === cardDraft.targetWxid);
+  const pickedName = cardDraft.displayName.trim() || pickedFriend?.remark || pickedFriend?.nickname || "";
 
   const handleCreate = async (event: FormEvent) => {
     event.preventDefault();
@@ -103,12 +135,24 @@ export default function ReferralCardsFeature() {
             </label>
             <label className={styles.field}>
               <span className={styles.fieldLabel}>顾问微信号</span>
-              <input
-                className={styles.input}
-                placeholder="用于发送名片的微信 wxid"
-                value={cardDraft.targetWxid}
-                onChange={(event) => setCardDraft({ ...cardDraft, targetWxid: event.target.value })}
-              />
+              {cardDraft.targetWxid ? (
+                <div className={styles.pickedRow}>
+                  {pickedFriend?.avatarUrl ? (
+                    <img className={styles.pickedAvatar} src={pickedFriend.avatarUrl} alt="" loading="lazy" />
+                  ) : (
+                    <span className={styles.pickedAvatarFallback}>{(pickedName || cardDraft.targetWxid).trim().charAt(0).toUpperCase()}</span>
+                  )}
+                  <span className={styles.pickedInfo}>
+                    {pickedName && <span className={styles.pickedName}>{pickedName}</span>}
+                    <span className={styles.pickedWxid}>{cardDraft.targetWxid}</span>
+                  </span>
+                  <button type="button" className={styles.repickBtn} onClick={() => setPickerOpen(true)}>重选</button>
+                </div>
+              ) : (
+                <button type="button" className={styles.pickBtn} onClick={() => setPickerOpen(true)}>
+                  从好友选择
+                </button>
+              )}
             </label>
             <label className={styles.field}>
               <span className={styles.fieldLabel}>引荐时机（自然语言）</span>
@@ -147,6 +191,16 @@ export default function ReferralCardsFeature() {
           </div>
         </form>
       </div>
+
+      <FriendPickerModal
+        open={pickerOpen}
+        items={rosterItems}
+        onSelect={pickFriend}
+        onClose={() => setPickerOpen(false)}
+        title="选择专属顾问"
+        allowManualWxid
+        onManualWxid={(wxid) => { setCardDraft({ ...cardDraft, targetWxid: wxid }); setPickerOpen(false); }}
+      />
     </div>
   );
 }
