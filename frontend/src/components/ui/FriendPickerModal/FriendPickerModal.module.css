@@ -1,0 +1,47 @@
+.head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+.title { font-size: 15px; font-weight: 600; color: var(--ink-1); }
+.closeBtn {
+  border: 0; background: transparent; color: var(--ink-3);
+  font-size: 18px; line-height: 1; cursor: pointer; padding: 4px;
+}
+.search { width: 100%; margin-bottom: 12px; }
+.searchInput {
+  width: 100%; box-sizing: border-box;
+  border: 1px solid var(--hairline); border-radius: 8px;
+  padding: 8px 12px; font-size: 13px;
+}
+.grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 8px; max-height: 420px; overflow-y: auto;
+}
+.card {
+  display: flex; align-items: center; gap: 10px;
+  border: 1px solid var(--hairline); border-radius: 10px;
+  padding: 8px 10px; background: var(--surface-card);
+  cursor: pointer; text-align: left; width: 100%;
+}
+.card:hover { background: var(--surface-page); }
+.avatar { width: 36px; height: 36px; border-radius: 8px; object-fit: cover; flex: none; }
+.avatarFallback {
+  width: 36px; height: 36px; border-radius: 8px; flex: none;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--surface-page); color: var(--ink-3); font-weight: 600;
+}
+.cardBody { display: flex; flex-direction: column; min-width: 0; }
+.name { font-size: 13px; color: var(--ink-1); font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sub { font-size: 11px; color: var(--ink-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.badge { margin-left: auto; font-size: 11px; color: var(--ink-3); flex: none; }
+.state { padding: 32px 12px; text-align: center; color: var(--ink-3); font-size: 13px; }
+.pager { display: flex; align-items: center; justify-content: center; gap: 12px; margin-top: 12px; }
+.pagerBtn { border: 1px solid var(--hairline); background: transparent; border-radius: 6px; padding: 4px 10px; font-size: 12px; cursor: pointer; }
+.pagerBtn:disabled { opacity: 0.5; cursor: default; }
+.manual { margin-top: 12px; border-top: 1px solid var(--hairline); padding-top: 10px; }
+.manualToggle { border: 0; background: transparent; color: var(--ink-3); font-size: 12px; cursor: pointer; padding: 0; }
+.manualRow { display: flex; gap: 8px; margin-top: 8px; }
+.manualInput { flex: 1; border: 1px solid var(--hairline); border-radius: 8px; padding: 6px 10px; font-size: 13px; }
+.manualBtn { border: 1px solid var(--hairline); background: var(--surface-page); border-radius: 8px; padding: 6px 12px; font-size: 12px; cursor: pointer; }
