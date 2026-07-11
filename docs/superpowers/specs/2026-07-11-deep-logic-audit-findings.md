@@ -707,3 +707,55 @@
 - 后果：单请求耗时随受众线性增长 → HTTP/反代超时（超时后客户端重试叠加 KC-02 卡死）；contacts 全量驻内存；task worker 洪峰。
 - 验证状态：**PLAUSIBLE**（无上限保护 CONFIRMED；实际超时/内存崩溃点需压测）。
 - 修复建议：受众硬上限 + 超限拒绝或分批；insert_many 批量建 task；或 dispatch 只落"待扇出"标记由后台 worker 分批推进（同时解决 KC-02 恢复）。
+
+## 圈人环 audience 筛选（两阶段：Mongo 粗筛 + 内存精筛）
+
+审查范围：`routes/campaigns.rs`（build_segment_coarse_filter:31 / contact_matches_segment:61 / resolve_segment_contacts:178 / preview_campaign:236）+ `agent/entitlements.rs`（project_entitlements 净持有）。主控派 opus subagent 复审 + 逐条亲验。
+
+### ✅ 亲验通过总览
+
+1. **✅ 净持有退款抵消正确**：project_entitlements 按 product_id 聚合、reversal 反号累减、净件数≤0 剔除（entitlements.rs:86-125）；full/partial/over-reversal 三测覆盖。
+2. **✅ 售后窗 + value_tier 与 gateway G6 同源**：in_aftercare 语义（Some(true)期内/Some(false)过期/None 无规则）与精筛一致；value_tier 用同函数同 config 阈值（campaigns.rs:162 ↔ gateway.rs:4070），无漂移。
+3. **✅ conversation_inferred 不进筛选**：verification_drives_entitlement 闭集只认 staff_confirmed/payment_verified（entitlements.rs:51），精筛与 LTV 均排除 AI 疑似成交，红线守住。
+4. **✅ workspace/account 隔离**：粗筛固定 workspace_id+account_id+managed（:37-39）；account_id 缺省回落 default_account_id 是更严收窄，不串别账号 contact。
+5. **✅ 退款场景粗筛/精筛正确方向**：买后全额退款——粗筛靠原 deal 事件仍命中（宽），精筛净持有=0 排除（严），superset→narrow 方向正确（此为既定设计，非 KC-05 的反向问题）。
+6. **✅ customer_stage 写读路径一致**：粗筛读 domain_attributes.customer_stage（:44）↔ gateway 状态机门后写同字段（gateway.rs:4040-4054），主控亲验字段路径一致（不因字段名漂移恒筛不到）。
+
+### [KC-05] 粗筛对 verification/eventKind 做 Mongo 精确匹配，漏掉缺字段的旧成交事件 → product 定向活动静默漏老客户（serde 默认与 Mongo 查询口径分裂）
+
+- 入口频道：campaign 频道圈人（带 product_ids 的活动）
+- 链路环节：圈人（粗筛）
+- 类型：serde 默认 vs Mongo 查询口径分裂 / 假阴漏人
+- 严重度：**Medium**
+- 现象：带 product_ids 的活动，2026-06-15 §4.5 字段上线前登记的老成交客户会被粗筛漏掉，永进不了精筛 → 本该命中的老客户收不到活动推送。
+- 根因链（主控亲验）：
+  - 粗筛 `$elemMatch`（campaigns.rs:50-54）对 `verification:{$in:[...]}` + `eventKind:"deal"` 做 **Mongo 存储层精确匹配**。
+  - `verification`（models.rs:451 `#[serde(default="default_outcome_verification"]`→staff_confirmed）+ `event_kind`（:464 default→deal）**只在 Rust 反序列化时补默认，Mongo 查询时不补**。models.rs:448-450 注释明说"缺字段即视为已核实；`#[serde(default)]` 只作用于反序列化"。
+  - 旧文档 BSON 里根本没这两个字段（无迁移回填——主控亲验 migrations 仅 m011/m012/m014 是 production guard 文案，非回填）。
+  - 精筛侧 project_entitlements 读的是**已反序列化的 Contact**（缺字段已补 staff_confirmed/deal）→ 精筛认为该客户持有 → 但粗筛已把它挡在外面。
+- 后果：既定"粗筛 superset ⊇ 精筛"被**反转**——粗筛比精筛更严，旧成交事件 $elemMatch 匹配失败被排除，精筛没机会捞回。触发=①活动用 product_ids（空则不加 $elemMatch 无此问题）②库存在缺字段旧 outcome_events。
+- 验证状态：**Medium / PLAUSIBLE**（代码层口径分裂 CONFIRMED：serde default 不作用于 Mongo 查询 + 无回填迁移，主控亲验 models.rs:451/464 + migrations；生产实际影响面依赖 117 库是否真有缺字段旧成交，本地无法验，117 活跃系统概率非低）。
+- 修复建议：粗筛把"缺失=默认值"显式写进查询——`verification: {$or:[{$in:[...]},{$exists:false}]}` + `eventKind` 同理（或 `{$ne:"reversal"}` 与精筛 event_kind!=reversal 同口径）；或一次性迁移回填旧文档补齐两字段（更彻底，消除 serde 默认与 Mongo 查询的长期口径分裂）。
+
+### [KC-06] preview targetCount / dispatch dispatchedCount / report targetCount 三义相近命名各异，可能误导运营
+
+- 入口频道：campaign 频道 preview→dispatch→报表
+- 链路环节：圈人/触达/成效
+- 类型：可观测性/UX（语义不对齐）
+- 严重度：**Low**
+- 现象：preview 存 targetCount（命中总人数，:277）；dispatch 只写 dispatchedCount（本次新入队数，去重后，:379），**不更新 targetCount**；report 的 summary.targetCount（:472）又=campaign_sends 台账总行数。三个相近命名三种含义。首次 dispatch 若受众漂移缩小，dispatchedCount<残留 targetCount，运营会误读"有人没发出去"，实为受众变少。
+- 根因（亲验）：受众重算是既定设计，但三处计数语义未对齐、dispatch 不回刷 targetCount。
+- 验证状态：**CONFIRMED**（可观测性缺口，非发送正确性 bug）。
+- 修复建议：dispatch 时把本次 hits.len() 回刷 campaign（如 lastDispatchTargetCount），或前端/文档明确区分"预览命中数/本次实发数/累计台账数"三义。
+
+### [KC-07] resolve_segment_contacts 全量载入受众无 limit/分页（preview 与 dispatch 共用）——规模就绪债
+
+- 链路环节：圈人
+- 类型：规模（无上限）
+- 严重度：**Low**（就绪债）
+- 现象：resolve_segment_contacts（campaigns.rs:185-196）用 cursor 把粗筛命中的**全部** contact 逐条载入内存跑精筛，无 limit/分页；preview 与 dispatch 共用。product_ids 为空时粗筛退化为 {workspace,account,managed} 会扫本账号全部 managed 联系人。大受众下 preview 就可能超时/占内存。
+- 验证状态：**PLAUSIBLE**（无上限 CONFIRMED；当前联系人量有限时无害）。与 KC-04 同源（触达侧也无上限），修复可合并。
+- 修复建议：游标分批或规模上限；与 KC-04 一并做"受众规模保护"专项。
+
+### 未能确认的点（供修复阶段核）
+- **customer_stage 前端传值口径**：粗筛 domain_attributes.customer_stage 做精确字符串匹配、无归一/大小写容错（campaigns.rs:44）。后端写的是 taxonomy 校验后 canonical id。若前端 filter.customer_stage 传的也是 canonical id 则一致；若传显示名/大小写不符则**恒筛不到人且静默无报错**。前端传值口径未读 frontend 未确认——建议修复阶段核前端 filter 下发值，或后端加一次 canonical 归一兜底。
