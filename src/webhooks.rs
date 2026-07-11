@@ -1031,11 +1031,13 @@ async fn emit_unknown_app_id_event(state: &AppState, app_id: Option<&str>) -> Ap
     Ok(())
 }
 
-/// 真人判据（黑名单）：gh_ 公众号、@chatroom 群消息不是能运营的私聊真人。
-/// roster 全量好友里 gh_=0/群=0（117 亲验），故这两类天然不在好友名册。
-/// webhook 建档与 m029 存量清理共用此判据，杜绝两处漂移。
+/// 判定 wxid 是否能进运营池的私聊真人：排除公众号（gh_ 前缀）、群（@chatroom）、
+/// 微信官方系统保留号（weixin/fmessage/... 复用 mcp::is_system_account 同源判据）。
+/// 建档 upsert（:1049）+ m029 存量清理共用此判据，杜绝两处漂移。
 pub(crate) fn is_operatable_person(wxid: &str) -> bool {
-    !(wxid.starts_with("gh_") || wxid.contains("@chatroom"))
+    !(wxid.starts_with("gh_")
+        || wxid.contains("@chatroom")
+        || crate::mcp::is_system_account(wxid))
 }
 
 async fn upsert_webhook_contact(
@@ -1440,6 +1442,15 @@ mod inbound_msg_type_tests {
         assert!(is_operatable_person("wxid_3yeirsb75afd22"));
         // 边界：gh 出现在中间不算公众号（只认前缀）。
         assert!(is_operatable_person("wxid_gh_not_prefix"));
+    }
+
+    #[test]
+    fn is_operatable_person_rejects_system_accounts() {
+        assert!(!is_operatable_person("weixin")); // 微信团队
+        assert!(!is_operatable_person("fmessage")); // 朋友推荐消息
+        assert!(!is_operatable_person("newsapp"));
+        // 真人 + 媒体号 wxid_* 仍放行（媒体号靠手动移除，非此拦）
+        assert!(is_operatable_person("wxid_8874178741811")); // 福州晚报
     }
 }
 
