@@ -1010,3 +1010,50 @@
 - **严重度校准（反过拟合）**：subagent 曾把 KD-01 定 High、KD-04 定 High——KD-01 按"relay 主防线是 prompt、数字护栏是代码 backstop"校准为 Med（backstop 盲区非主防线突破）；KD-04 **确认 High**（非 backstop、是核心交互在推荐配置下确定性失效，与前三批 DB-fault 触发类本质不同）。校准依据是触发确定性 + 是否主防线，非机械压级。
 - 1 整块 0 finding（provider+prompt pack，仅 2 Low）是真读透后正面结论。
 - 未真跑（同前定调），KD-04/KD-05/KD-06/KD-07/KD-08 代码路径 CONFIRMED，其余 PLAUSIBLE。复现留修复阶段写确定性测试随修复 PR 上 CI。
+
+---
+
+# 批 E（其余频道：evolution / account / overview / operations / referral）
+
+- 审查计划：[`2026-07-11-deep-logic-audit-batch-e.md`](../plans/2026-07-11-deep-logic-audit-batch-e.md)
+- 五块：evolution 自优化（AI 提议+人工发布红线）/ account CRUD / overview 首屏 / operations 视图 / referral 名片引荐（辅助模式受控例外）。
+- **红线**：AI 提议、人工发布，AI 绝不自动放量 prompt 到生产（evolution）；名片引荐仍是 AI 发起+辅助、对话始终 AI 在说、台前顾问≠幕后领导（referral 受控例外）。
+- finding 编号 `KE-NN`。全部主控当场 Read/Grep 亲验；未真跑标 PLAUSIBLE。收官全五批。
+
+## evolution 自优化（最高优先 · auto_release 是唯一 AI 自动写生产路径）
+
+审查范围：`evolution/auto_release.rs`（gate_open:39 / eligible:48 / decide_auto_release:207 / decide_negative_reaction_block:226）+ `evolution/release.rs`（release_threshold:36 / release_prompt:198）+ `evolution/significance.rs` + `evolution/replay.rs` + `evolution/post_release.rs` + `routes/evolution.rs`（release_evolution_proposal:142）+ `config.rs`。主控派 opus subagent 复审 + 逐条亲验。
+
+### ✅ 亲验通过总览（"AI 提议+人工发布"红线成立，双闸默认双关）
+
+1. **✅ auto_release 双闸默认双关（红线核心）**：auto_release_gate_open（auto_release.rs:39-41）= env `EVOLUTION_AUTO_RELEASE_ENABLED` AND per-workspace `threshold_auto_release_enabled`，缺失/读失败均回落关（:60 `.ok().flatten()` + `unwrap_or(false)`）。**config.rs:637-640 硬编码默认 "false"** + .env.example:170 false + 子闸 default false——**双锁，两闸都须显式开**。主控亲验。
+2. **✅ prompt 绝不自动放量**：auto_release query 硬编码 `proposal_kind="threshold"`（auto_release.rs:77）；release_prompt 唯一 caller 是 routes/evolution.rs:169（release_evolution_proposal 内，AuthenticatedAdmin + confirmation=="RELEASE" 精确串校验）——**prompt 只人工 release，无任何自动路径**。主控亲验。
+3. **✅ release_prompt 红线三闸不 fail-open**：事务内 compose_appended_content + validate_prompt_edit（字面禁词+锚）+ review_prompt_edit（LLM 语义），LLM 不可用→NeedsHumanConfirm 中止（release.rs:278）不 fail-open。
+4. **✅ 无样本保守拒放**：decide_auto_release(None,...)→false（:209）；compute_window_gate_hit_rates total=0 返空 map→gate 缺失保守 SKIP。覆盖所有无样本路径。
+5. **✅ significance 方向/样本门正确**：send_delta=new-original≥0.05（方向=改进）；gate_increase≤0.10；completed<min_replays 先拒；fail_rate>max 拒；NaN 一律 reject；#152 安全回归门零容忍拦 blocked→sent 翻转。failed replay 正确排除出 completed。
+6. **✅ release_threshold 事务原子**：override insert + proposal status=released + audit 三写全 _with_session 一次 commit；threshold_overrides 写入 gate_key 与 runtime.rs:399 RESOLVED_GATE_KEYS 读取口径一致（写了能读到）。
+7. **✅ post_release 只观测不自动回滚**：process_one_review 仅写 post_release_reviews + agent_event，无 release/rollback 调用；rollback_threshold/rollback_prompt 唯一 caller 是 routes/evolution.rs:212/215（admin 端点+confirmation 串校验）。Req 9.7 成立。
+8. **✅ 负反应门同窗同源**：decide_negative_reaction_block 复用 post_release::compute_negative_reaction_rate 同 window_start 同极性源，超阈强制 SKIP 退 admin 不回滚。
+
+### [KE-01] decide_auto_release 缺"方向一致性"校验，实现与 doc 声称不符，命中率跨 band 翻转时可反向放量 threshold
+
+- 入口频道：evolution 自优化（auto_release，仅运维显式开启时）
+- 链路环节：evolution（自动放量决策）
+- 类型：doc-实现漂移 / 放量方向错误
+- 严重度：**Medium**（放量方向错误后果重，但触发需 auto_release **双闸显式开启**（默认双关、且是"受控例外"opt-in 面）AND 命中率跨 band 翻转到相反外侧——非默认配置 + 时序依赖，按跨批校准=Med，不同于 KD-04 的"推荐配置确定性发生"）
+- 现象：模块 doc（auto_release.rs:11-13）声称放行条件是"命中率仍在 band 之外**（方向与候选方向一致，意味着信号没有自然回正）**"。但 decide_auto_release（:207-211）实现只判落 band 外**任意一侧**：`rate < target_lower || rate > target_upper`，**不接收候选方向**（proposed_value vs current_value），调用点（:121-165）拿到整条 proposal 却从未用来判方向。
+- 失败场景（亲验推演）：gate=fact_risk_block band=[0.05,0.15]，候选生成时 hit_rate=0.30>upper→升阈值候选（拦截更少→命中率降）；经 replay+significance 通过→eligible。auto_release tick 用**不同时间窗**重看命中率，若此时 observed 已翻转到 0.02<lower → decide_auto_release(0.02,0.05,0.15)→0.02<0.05→true→**放行升阈值候选**，但命中率此刻已过低、继续升阈只把命中率推更低——朝错误方向放量，与"信号没自然回正才放行"设计相悖。
+- 根因（亲验）：设计意图（方向必须一致）没落进实现；decide_auto_release 签名只有 (observed,lower,upper) 天然无法表达方向。
+- 验证状态：**CONFIRMED**（实现 :210 无方向参数 + doc :11-13 声称方向一致 + 调用点有 proposal 未用，主控三处亲验；触发窗口窄+默认关故 Med）。
+- 修复建议：给 decide_auto_release 传候选方向（proposed_value-current_value 符号），仅当 observed 偏离方向与候选修正方向一致才放行——升阈候选只在 observed>upper 放行、降阈候选只在 observed<lower 放行，相反侧一律 SKIP 退 admin。
+
+### [KE-02] threshold 重判 send_success 口径不对称：original 用真实终态、new 用纯 5gate 重判，非-5gate block 类 run 抬高 send_delta 可虚假过门
+
+- 入口频道：evolution 自优化（threshold 显著性评估）
+- 链路环节：evolution（replay→significance）
+- 类型：重判口径不对称 / 显著性虚高
+- 严重度：**Medium**（PLAUSIBLE）
+- 现象：threshold 重判里 original_final_review_status 用源 run **真实**终态（replay.rs:296），而 new_final_review_status = final_status_from_5gate（:406-425，只产 5 闸决定的 5 种状态）。若 cohort 含非-5gate 因素 block 的 run（如 blocked_by_budget / blocked_by_required_field / ai_waiting_for_more_context，post_release.rs:40 UPGRADED_STATUSES 可见的合法终态）且带 review.scores：original 侧按真实终态计为发送失败、new 侧 5 闸重判不命中算 approved=成功 → 凭空制造一次"send_success 提升"，与被改阈值无关，累积到 send_delta 可能把不达标候选虚假抬过 min_send_success_delta(0.05) 门→误放行伪改进。
+- 根因（亲验）：final_status_from_5gate 假设"final 完全由 5 闸决定"，但源 run 真实终态可能是非-5gate 因素。
+- 验证状态：**PLAUSIBLE**（口径不对称 CONFIRMED；需 cohort 含"非-5gate block 但带 scores 且 5 闸重判 approved"的 run 且占比足以翻越 0.05 门，频率需生产终态分布量化）。
+- 修复建议：evaluate_threshold 计 original/new send_success 对齐口径——original 也用 final_status_from_5gate 基于源 scores+current 阈值重推（两侧同口径仅差被改 gate），或重判前剔除非-5gate 决定终态的 run 不计入 send_delta。KE-01/KE-02 均只在 auto_release 开启时影响放量（默认关）。
