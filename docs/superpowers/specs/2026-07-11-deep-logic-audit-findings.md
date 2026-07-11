@@ -806,3 +806,60 @@
 - **严重度校准（反过拟合）**：subagent 曾把 KC-01/KC-02 定 High，主控按跨批一致性校准为 Medium——后果虽重（客户永久漏推）但触发=循环中途 Mongo 瞬时写错误，与批 A/B 的 DB-fault 触发类 finding（B-02/C-01/F-01 均 Med）同级，不因单批 subagent 定 High 破坏跨批校准。
 - 1 条整环 0 finding（成交登记+成效聚合）是真读透后的正面结论，非漏审。
 - 未真跑（同批 A/B 定调），KC-06 CONFIRMED（静态确凿），其余 PLAUSIBLE。复现留修复阶段写确定性测试随修复 PR 上 CI。
+
+---
+
+# 批 D（请示配置链：askHuman / askHumanConfig / llmProviders / systemStrategy）
+
+- 审查计划：[`2026-07-11-deep-logic-audit-batch-d.md`](../plans/2026-07-11-deep-logic-audit-batch-d.md)
+- 四链：请示裁决（AI 识别→写单→领导裁决→AI relay 转述）→ 决策人链 → provider 热切换 → prompt pack。
+- **红线**：客户永远只跟 AI 对话、**永不知道背后有"领导"存在**；relay 是 AI 转述幕后领导结论、非人工接管（决策请示通道设计 2026-06-05）。
+- finding 编号 `KD-NN`。全部主控当场 Read/Grep 亲验；未真跑标 PLAUSIBLE。
+
+## 请示裁决链 + relay 出站守卫（最高优先 · 红线"客户永不知道有领导"）
+
+审查范围：`agent/escalation/logic.rs` + `agent/gateway.rs`（relay 守卫:2480 / relay_principal_decision_to_customer:755）+ `agent/escalation/mod.rs`（interpret/handle/escalate）+ `holding_reply.rs` + `prompt_isolation.rs`。主控派 opus subagent 复审 + 逐条亲验。
+
+### ✅ 亲验通过总览（红线核心防线成立）
+
+1. **✅ relay 触发不可伪造（红线根基）**：is_principal_relay_trigger（logic.rs:196）只认 `AgentTrigger::Inbound(m) if m.is_synthetic_relay`；is_synthetic_relay 字段 **skip_serializing + skip_deserializing**（models.rs:786，测试 :6790-6818 锁死）——客户消息从 DB/webhook 恒反序列化成 false，**不可伪造**。仅 synthetic_principal_relay（models.rs:822）在 gateway.rs:755 relay 路径置 true。主控亲验。
+2. **✅ 哨兵剥离防伪造转述模式**：inbound_prompt_content（prompt_isolation.rs:54）仅对 is_synthetic_relay=true 保留哨兵触发转述模式，客户伪造哨兵一律剥（:58），history 无条件剥——LLM 不会对客户输入进入转述模式。
+3. **✅ escalate 客户侧零泄漏**：escalate_held_decision（mod.rs:43）只 message_send_text 给 principal_wxid + 写 awaiting 标记，对 contact.wxid 不发任何消息；principal_wxid==contact.wxid 时拒发（:75）。客户安抚与请示领导完全解耦。
+4. **✅ interpret 侧红线**：interpret_principal_reply 解析失败/越界回落 deferred 空 substance（mod.rs:271）；handle 对 deferred 保持 pending、不起 relay（mod.rs:328）；sanitize_verdict 5 值闭集越界回落 deferred（logic.rs:411）。解析失败不误发。
+5. **✅ relay 出站守卫 fail-closed 在入 outbox 前**：gateway.rs:2480-2519 relay run 拟发文本命中泄漏载荷/授权外数字即 outbox_eligible=false + 记 blocked_by_safety_guard，非 relay run 不受影响。数字白名单授权源取合成消息完整 content（含 substance+constraints 全部数字）。gateway.rs:2483 FollowUp 分支授权源="" 是**死分支**（relay 恒 Inbound 触发，主控亲验）。
+
+### [KD-01] relay 授权外数字护栏只认 ASCII 数字，中文数字（九折/八折）完全盲区：既可绕过编造折扣、又误杀正确转述
+
+- 入口频道：askHuman relay 转述（客户等待领导裁决后的转述）
+- 链路环节：请示裁决（relay 出站数字护栏）
+- 类型：红线代码backstop 覆盖盲区（双向：绕过 + 误杀）
+- 严重度：**Medium**（relay 主防线是 prompt「AI 口吻重组」，此为**代码 backstop** 的覆盖盲区，非主防线突破；但 backstop 号称兜底却对最常见中文数字零覆盖）
+- 现象：extract_number_tokens（logic.rs:220）只用 `ch.is_ascii_digit()` 提取阿拉伯数字。
+  - **绕过**：领导授权 substance="9折"（阿拉伯），LLM 转述成"打八折"（中文）→ extract_number_tokens("打八折")=∅ → relay_introduces_unauthorized_number 恒 false → 放行编造折扣。
+  - **误杀**：授权"九折"（中文）、转述"9折"（阿拉伯）→ "9"∉空授权集 → 判授权外 → fail-closed 拦掉正确转述。
+- 根因（亲验）：数字 token 提取只覆盖 ASCII，中文数字/大写金额（八折/叁仟）既不进白名单也不进被检文本，白名单与被检文本不在同一数字空间。
+- 验证状态：**CONFIRMED**（extract_number_tokens :224 仅 is_ascii_digit + relay_introduces_unauthorized_number :260-264 集合差比对，主控亲验；中文数字盲区确定）。
+- 修复建议：extract_number_tokens 增中文数字→阿拉伯归一（一~十/百/千 + 折/成量词），白名单与被检文本同空间比较；无法归一时该场景保守 fail-closed。
+
+### [KD-02] "客户永不知道有领导"红线无字符级词表守卫，relay 出站 + holding_reply 对"领导/老板/请示"语义泄漏零代码兜底（仅靠 prompt）
+
+- 链路环节：请示裁决（relay 出站 + 过渡回复）
+- 类型：红线代码兜底缺失（诚实标注：prompt-only）
+- 严重度：**Medium**（LLM 转述本质靠 prompt 非必然 bug，但需如实标注最敏感泄漏向量无代码兜底 + 函数 doc 造成"已有代码守卫"错觉）
+- 现象：
+  - relay_output_leaks_internal_payload（logic.rs:211）只检测 4 个固定载荷标记（`__PRINCIPAL_RELAY__`/verdict=/substance=/constraints=）。转述若说"跟**领导**申请下来了""**老板**批准"——不含这 4 token → 放行。
+  - gateway relay 分支（:2485）只调此守卫 + 数字护栏，**从不调 passes_forbidden_words**；即便调，evolution::lint FORBIDDEN_LITERALS_LOWER（lint.rs:13-27）只含"人工接管/接管/人工"家族，**不含领导/上级/老板/请示**（主控亲验）。
+  - holding_reply_text_is_safe（holding_reply.rs:11）注释称"全自治定位禁词守卫"，但委托的 passes_forbidden_words 同样不含领导类词——"稍等我问下领导"可发出。
+- 根因（亲验）：本项目对"无人工接管"红线有字符级 lint（check-no-human-takeover + evolution::lint），但对**平级的"客户永不知道有领导"红线无任何字符级词表**。relay 出站守卫是"载荷标记检测器"非"语义泄漏检测器"，函数 doc（:203-210）自称"出站方向代码守卫……与 sanitize_verdict 对称"易造成"已有代码兜底"错觉。
+- 验证状态：**CONFIRMED**（结构事实：代码层无领导类词确定性兜底，主控亲验 lint.rs:13-27 词表 + gateway.rs:2485 只调 2 守卫；实际泄漏频率属 LLM 行为层未验，标结构 CONFIRMED）。
+- 修复建议：新增"幕后决策源泄漏"词表（领导/上级/老板/请示了/上面批/汇报了）对 relay reply_text + holding_reply 施加（命中 fail-closed）。接受词表必漏 fuzz 变体、主防线仍是 prompt，但至少堵直白泄漏，与"无人工接管"红线的字符级 lint 对齐。
+
+### [KD-03] relay 数字护栏误杀后清 awaiting + 不重排 relay task → 领导裁决永久丢失（fail-closed 把"这轮"放大成"永远"）
+
+- 链路环节：请示裁决（relay task 生命周期）
+- 类型：误杀后无补偿 / 裁决黑洞
+- 严重度：**Medium**
+- 现象：relay_introduces_unauthorized_number 误杀（KD-01 的误杀向量，或转述含"第2个问题""24小时"等非授权语义普通数字）→ outbox_eligible=false（gateway.rs:2491）→ relay 不入队。而 relay_principal_decision_to_customer 在 gateway 返回后**无条件** clear_awaiting_principal_state（gateway.rs:776），relay task 随即完成、**不重排**。领导已裁决（如 approved 9折）因转述夹了个"24小时"被误拦 → 客户**永远收不到这条裁决**（下轮客户来消息走普通对话、无 substance），awaiting 也清了。
+- 根因（亲验）：extract_number_tokens 抓一切数字串无"数量事实 vs 序数/时间/无关数字"语义区分（函数注释自称"只看客观数量"实际抓一切）；误杀后清 awaiting + 无重试 = 裁决永久丢失。
+- 验证状态：**PLAUSIBLE**（"裁决永久不达 + awaiting 清除"CONFIRMED：gateway.rs:776 无条件清 + relay task 不重排，主控亲验；误杀后客户是纯静默还是被 ensure_customer_acknowledged 补安抚未读该路径，标 PLAUSIBLE）。
+- 修复建议：数字提取加语义降噪（跳过时间/序数上下文），或误拦时不清 awaiting、重排一次 relay 用中性收尾兜底文案（新增"裁决不可安全转述"场景），避免裁决黑洞。KD-01/KD-03 同源（数字护栏），修复可合并。
