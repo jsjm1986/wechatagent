@@ -443,3 +443,62 @@
 - 根因（亲验）：写入侧 verify.rs:112 恒写小写 `"verified"`，当前不可能产生 `"Verified"`。若真出现，召回侧精确匹配失败→切片根本不进语料→不注入、不进 finalize 的 knowledge_chunks，`is_verified` 的宽松判定永远碰不到它——既不误放也不误堵。
 - 验证状态：**PLAUSIBLE**（无害 latent，当前不可触发）。
 - 修复建议：可选——把 is_verified 改成精确匹配 `== "verified"`，或召回侧统一大小写不敏感，消除口径漂移。不改也安全。
+
+## 链4 修复链（次高优先 · AI 只提议不落库主集合红线）
+
+审查范围：`routes/knowledge/repair.rs`（propose_chunk_repair_inner:218 / propose_pack_repair:576 / record_repair_apply:629）+ `knowledge_task/mod.rs`（worker execute_step 各 Phase）+ `knowledge_wiki/gap_signals.rs`（缺口信号生成/消解）+ `knowledge_wiki/structural_proposals.rs`。主控派 opus subagent 复审 + 逐条亲验。
+
+### ✅ 亲验通过总览（"AI 提议永不落主集合 verified"红线成立）
+
+逐路径亲验，链4 **无任何一条**直接把 chunk 写 verified 或绕人审改动已生效切片正文：
+
+1. **✅ propose_chunk_repair_inner**（repair.rs:218-377）：只 find_one 读 chunk/document → LLM → 写 `knowledge_usage_logs`（blocked_reason=`..._pending_operator_apply`）+ `knowledge_repair_proposed` 事件 → 返回 JSON。**全程无 operation_knowledge_chunks().update/insert**（repair.rs 三处 chunk 访问 :226/:422/:654 全是 find_one 读）。
+2. **✅ propose_pack_repair**（repair.rs:576-586）：死桩返 400（operation_knowledge_items 已删）——见 KB-05。
+3. **✅ record_repair_apply**（repair.rs:615-724）：纯审计端点，注释 :628「不写主业务集合」与代码一致（patch 已由前端 PUT 落库=KB-02 路径）。
+4. **✅ worker execute_step 各 Phase**：`fix_chunk`(:458) 调 propose_chunk_repair_inner 拿草稿塞 turn details 供人审、不 apply；`add_chunk`(:516) 走 apply_create_chunk（硬置 draft+needs_review）；`review_evolution`(:666) 有意占位（"需人工评估，AI 不自动放量"文案，不动集合）；`analyze_logs`/`dismiss` 只读 events / 写日报 dismissed_card_ids。
+5. **✅ gap_signals 只写信号旁路集合**：persist_signals/persist_recall_signal/sweep_stale_signals 只写 `knowledge_gap_signals`；唯一碰主 chunk 的 refresh_usage_stats_and_confidence(:1034)/record_chunk_hit(:1186) 只写 usage_stats/dynamic_confidence/updated_at 统计字段，**从不碰 status/integrity_status/body**（模块头 :8-9 自述不变量成立）。
+6. **✅ structural_proposals 只产 pending_review**：propose_structural_change 只 insert `status="pending_review"` 到旁路集合，序列化层物理无 apply/commit 字段——见 KB-06（无消费方=就绪债）。
+
+### [KB-04] worker `retag` 步骤经 apply_update_chunk 把 verified 切片静默降级为 draft/needs_review（人工派工路径，反向红线 UX 意外）
+
+- 入口频道：content/知识对话收件箱「派工」→ retag step
+- 链路环节：④修复（worker execute_step）
+- 类型：AI 自动改动已生效切片状态（反向：un-verify）/ UX 语义意外
+- 严重度：**Low-Medium**
+- 现象：worker 的 `retag` step（只想重抽 productTags/businessTopics，不动事实正文）复用 `apply_update_chunk`，而后者对**任何** patch 无条件写 `status="draft"` + `integrity_status="needs_review"`（chat.rs:1776-1777，retag 调用点 knowledge_task/mod.rs:643-648 注释亦自认）。若目标 chunk 当前 verified，一次重抽标签会把它踢回草稿态、退出可召回 verified 集合。
+- 根因（亲验）：apply_update_chunk 的"永不 verify"降级本为运营改正文设计（改正文理应重审）；retag 借道它，把"仅改标签元字段"也拖入降级。
+- 触发链（亲验，决定严重度）：**非 AI 自主**——retag step 由 admin 在收件箱审阅 AI 建议的 plannedSteps 后显式「派工」（`POST /api/knowledge/chat/tasks` = `chat_task_create` chat.rs:1882 `AuthenticatedAdmin` 门），落 `knowledge_chat_tasks{status=pending}`，再由 worker `tick_once`(mod.rs:165) 串行异步执行。故 AI 从不自主 un-verify，是人工派工触发；**不违反** CLAUDE.md「AI 永不自动 verify」红线（该红线管"不自动转 verified"，此处是反向 un-verify 且有人工闸）。
+- 验证状态：**PLAUSIBLE**（代码副作用 CONFIRMED：retag→apply_update_chunk→强制降级三处亲验坐实；实际影响=admin 对 verified 切片派 retag 时，本意"补标签"却导致该切片退出生效池且需重新人审）。
+- 修复建议：需用户产品裁决"重抽标签是否应触发重审"——倾向：retag 不走强制降级的 apply_update_chunk，或给 apply_update_chunk 加「仅元字段变更（标签）不降级 integrity」开关；至少 retag 判定 target 已 verified 时仅写候选标签、不动 integrity_status。
+
+### [KB-05] propose_pack_repair 死桩返 400 但路由仍注册，前端调用即失败（就绪债/死代码误导）
+
+- 入口频道：content 频道 pack 级修复（POST /api/operation-knowledge/packs/:id/repair）
+- 链路环节：④修复
+- 类型：死代码/路由误导
+- 严重度：**Low**
+- 现象：propose_pack_repair（repair.rs:576-586）已下线（operation_knowledge_items 集合已删），恒返 400 "pack repair temporarily disabled"，但路由仍在 mod.rs:682 注册。前端若调用 pack 修复即得 400。
+- 根因（亲验）：注释 :580-581「等 wiki Phase 重新规划包级别 repair」——有意下线但路由未摘。
+- 验证状态：**PLAUSIBLE**（死桩 CONFIRMED；是否有前端真调此路由未核，故严重度取决于前端是否暴露入口）。
+- 修复建议：要么摘掉路由注册（mod.rs:682）避免误导，要么前端隐藏 pack 修复入口；属就绪债，择机。
+
+### [KB-06] structural_proposals 只产 pending_review 无任何 apply/人审消费方，提案永久躺集合（就绪债）
+
+- 链路环节：④修复（结构化 split/merge 提议）
+- 类型：就绪债（功能半实装）
+- 严重度：**Low**
+- 现象：propose_structural_change 只 insert `status="pending_review"` 到 `structural_proposals` 集合，全仓 grep 无任何 apply worker / 人审 UI 消费方——提案产出后无落库/人审出口，纯躺集合。
+- 根因（亲验）：模块注释 structural_proposals.rs:1-14 自述"下一轮 out-of-scope"；序列化层物理无 apply/commit/delete 字段（测试 :173-190 锁死）——这是红线**正确**的一面（AI 绝不自动 apply split/merge），但也意味功能未闭环。
+- 验证状态：**PLAUSIBLE**（无消费方 CONFIRMED）。
+- 修复建议：要么补人审 apply UI 闭环、要么文档明确标注该功能未接线；不作为 bug，登记就绪债。
+
+### [KB-07] gap_signals 在线 recall 信号 dedup 用无序 find_one 单条 + 内存过滤，同 kind 多主题信号可能漏合并（逻辑不严谨）
+
+- 入口频道：召回热路径（每次 recall_miss 拦截写信号）
+- 链路环节：④修复（gap 信号去重）
+- 类型：业务逻辑正确性（去重不严谨）
+- 严重度：**Low**
+- 现象：`persist_recall_signal`（gap_signals.rs:602-610）先 `find_one({workspace_id, status:pending, kind})`（**无 sort、无 dedup_key 过滤**），再对返回的**单条**用 `.filter(dedup_key==key)`。若同一 kind（如 recall_miss）下已有多条不同主题的 pending 信号，find_one 返回"任意一条"很可能不匹配 → filter 掉 → insert 新建，导致**同主题信号漏合并**（无法累积 search_queries 变体、产生重复条目稀释信号）。
+- 根因（亲验）：对比离线 `persist_signals`（:499-503）把**全部** pending 载入 map 按 key 精确比对（正确）；在线路径为省一次全量查询走 find_one，牺牲了正确性。
+- 验证状态：**PLAUSIBLE**（逻辑不严谨 CONFIRMED：find_one 无序 + 内存过滤坐实；实际漏合并频率依赖 Mongo 返回顺序，需运行时估）。有 signal_id 唯一索引（indexes.rs:1386）兜底，不写坏数据，仅噪音。
+- 修复建议：在线 dedup 改为可精确命中的查询键（持久化 dedup_key/normalized_title 字段并加索引直接 find_one 命中），与离线 persist_signals 精确比对对齐。
