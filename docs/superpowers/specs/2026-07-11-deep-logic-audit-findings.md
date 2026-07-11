@@ -296,7 +296,17 @@
 
 ## 环节⑦ MCP 发送（message_send_text / result.isError / 超时）
 
-_（待审）_
+审查文件：`src/mcp.rs`（call_tool_with_key:160 / isError:195）。**0 finding —— 本环节亲验干净。** 主控亲验 isError 检查（:195-207）现码仍正确。
+
+### ✅ 亲验通过总览（0 finding）
+- **三层失败识别齐全**（主控亲验 mcp.rs:188-207）：HTTP 状态 + JSON-RPC 顶层 `error`（:188）+ `result.isError`（:195-207）。isError=true→返 `AppError::External`（带 content detail），early-return 在 structuredContent 提取（:208）之前；`unwrap_or(false)` 保证 server 不发 isError 时不误触发（no-op 兼容）。历史 finding③（PR 5779c33，联系人拒收类"HTTP200 但失败"）现码仍在且逻辑正确。✅
+- **超时层级**：`MCP_CLIENT_TIMEOUT=60`（reqwest client 上）配合外层 `SEND_TIMEOUT=150`，不变式 `60×2≤150<lease180` 有编译进 dispatcher 的守卫测试锁死。✅
+- **API key 安全**：只作 Bearer header，redact_request_for_log 不打印 key。✅
+- **5xx/网络错误**：转 upstream_error 不 panic；response.json() 用 `?` 不 unwrap。✅
+- **structuredContent 提取**：isError 分支加入后既有提取路径不变（no-op 兼容）。✅
+
+### 备案（非缺陷）
+- `MCP_CLIENT_TIMEOUT_SECONDS`/`MCP_SEND_TIMEOUT_SECONDS`/`MAX_SEQUENTIAL_MCP_CALLS_PER_SEND` 是编译期常量而非 env 可调项（memory/brief 称"默认值"略有语义出入），但值正确且有守卫测试，不构成问题。
 
 ## 环节⑧ 回写（events / outcome metrics / decision review / run log / operation_state 派生）
 
