@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import type { FormEvent } from "react";
 import { PackageSearch, BadgeCheck, CreditCard, HelpCircle, ClipboardCheck } from "lucide-react";
 import { EmptyState } from "../../components/ui/EmptyState";
+import { FriendPickerModal, type FriendPickerItem } from "../../components/ui/FriendPickerModal";
 import { api } from "../../lib/api";
 import { useAccountStore } from "../../stores/accountStore";
 import type { Contact } from "../../types";
@@ -348,7 +349,7 @@ function CatalogTab() {
   );
 }
 
-function ContactPicker({
+export function ContactPicker({
   selected,
   onSelect,
 }: {
@@ -356,7 +357,7 @@ function ContactPicker({
   onSelect: (c: Contact | null) => void;
 }) {
   const [contacts, setContacts] = useState<Contact[]>([]);
-  const [q, setQ] = useState("");
+  const [open, setOpen] = useState(false);
   const accountId = useAccountStore((s) => s.currentAccountId());
 
   useEffect(() => {
@@ -373,42 +374,37 @@ function ContactPicker({
     })();
   }, [accountId]);
 
-  const filtered = q.trim()
-    ? contacts.filter(
-        (c) =>
-          (c.nickname ?? "").includes(q) ||
-          (c.remark ?? "").includes(q) ||
-          c.wxid.includes(q)
-      )
-    : contacts;
+  const items: FriendPickerItem[] = contacts.map((c) => ({
+    wxid: c.wxid,
+    nickname: c.nickname,
+    remark: c.remark,
+    avatarUrl: c.avatarUrl,
+  }));
+
+  const pick = (item: FriendPickerItem) => {
+    const c = contacts.find((x) => x.wxid === item.wxid) ?? null;
+    onSelect(c);
+    setOpen(false);
+  };
 
   return (
     <section className={styles.pickerPanel}>
-      <input
+      <button
+        type="button"
         className={styles.input}
-        placeholder="搜索好友（昵称/备注/wxid）"
-        value={q}
-        onChange={(e) => setQ(e.target.value)}
+        onClick={() => setOpen(true)}
+        style={{ textAlign: "left", cursor: "pointer" }}
+      >
+        {selected ? selected.nickname || selected.remark || selected.wxid : "选择好友…"}
+      </button>
+      <FriendPickerModal
+        open={open}
+        items={items}
+        onSelect={pick}
+        onClose={() => setOpen(false)}
+        title="选择好友"
+        allowManualWxid={false}
       />
-      <div className={styles.pickerList}>
-        {filtered.map((c) => (
-          <button
-            key={c.id}
-            className={selected?.id === c.id ? styles.pickerItemActive : styles.pickerItem}
-            onClick={() => onSelect(c)}
-          >
-            {c.nickname || c.remark || c.wxid}
-          </button>
-        ))}
-        {filtered.length === 0 &&
-          (contacts.length === 0 ? (
-            <div className={styles.pickerEmpty}>
-              当前账号还没有联系人。请先到「账号管理」同步该账号的通讯录。
-            </div>
-          ) : (
-            <div className={styles.pickerEmpty}>没有匹配的好友，换个关键词试试。</div>
-          ))}
-      </div>
     </section>
   );
 }
