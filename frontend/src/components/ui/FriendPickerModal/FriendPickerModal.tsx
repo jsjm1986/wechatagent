@@ -23,6 +23,7 @@ export function FriendPickerModal({
   onSelect,
   onClose,
   title = "选择好友",
+  emptyText = "暂无好友",
   loading = false,
   error = null,
   allowManualWxid = false,
@@ -33,6 +34,7 @@ export function FriendPickerModal({
   onSelect: (item: FriendPickerItem) => void;
   onClose: () => void;
   title?: string;
+  emptyText?: string;
   loading?: boolean;
   error?: string | null;
   allowManualWxid?: boolean;
@@ -78,7 +80,7 @@ export function FriendPickerModal({
       ) : error ? (
         <div className={styles.state} role="alert">加载失败：{error}</div>
       ) : filtered.length === 0 ? (
-        <div className={styles.state}>{items.length === 0 ? "暂无好友" : "没有匹配的好友，换个关键词试试"}</div>
+        <div className={styles.state}>{items.length === 0 ? emptyText : "没有匹配的好友，换个关键词试试"}</div>
       ) : (
         <>
           <div className={styles.grid}>

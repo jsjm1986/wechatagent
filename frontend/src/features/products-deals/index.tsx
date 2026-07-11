@@ -403,6 +403,7 @@ export function ContactPicker({
         onSelect={pick}
         onClose={() => setOpen(false)}
         title="选择好友"
+        emptyText="当前账号还没有联系人。请先到「账号管理」同步该账号的通讯录。"
         allowManualWxid={false}
       />
     </section>

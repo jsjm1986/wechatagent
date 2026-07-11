@@ -57,6 +57,11 @@ describe("FriendPickerModal", () => {
     expect(screen.getByText(/暂无好友|没有匹配/)).toBeInTheDocument();
   });
 
+  it("emptyText 自定义空态文案", () => {
+    render(<FriendPickerModal {...baseProps} items={[]} emptyText="请先到账号管理同步通讯录" />);
+    expect(screen.getByText("请先到账号管理同步通讯录")).toBeInTheDocument();
+  });
+
   it("allowManualWxid=true 时有手动输入入口,提交调 onManualWxid", () => {
     const onManualWxid = vi.fn();
     render(<FriendPickerModal {...baseProps} allowManualWxid onManualWxid={onManualWxid} />);
