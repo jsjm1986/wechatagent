@@ -638,3 +638,72 @@
 - 每条 finding 的 file:line 均主控当场 Read/Grep 亲验；subagent 4 次复审共产出的候选，经主控亲验后全部坐实入账（KB-01 补验 selected_chunks tier-independent、KB-04 补验人工派工触发链、KB-08 补验前端仅计数无视图、KB-11 补验全仓无 existing.locked_fields 强制点）。
 - 5 条链 red-line 正面结论（grounding 三处协同 / auto-verify 强制降级 / AI 提议不落库 / AI 永不自证成交 / 录入恒 draft）是真读透后的结论，非漏审。
 - 未真跑（同批 A 定调），故无 CONFIRMED 运行时复现；KB-09/KB-10/KB-11 是代码路径 CONFIRMED（静态确凿），其余 PLAUSIBLE。复现留修复阶段写确定性 lib 单测随修复 PR 上 CI。
+
+---
+
+# 批 C（成交活动链：campaign / productsDeals / sendAnalytics）
+
+- 审查计划：[`2026-07-11-deep-logic-audit-batch-c.md`](../plans/2026-07-11-deep-logic-audit-batch-c.md)
+- 业务流四环：圈人（audience 筛选）→ 触达（批量扇出 follow_up）→ 成交登记（deal 录入）→ 成效聚合（analytics）。
+- 与批 B 链6 不重复：add_outcome_event_inner / approve_suspected_deal / entitlements 闭集已在批 B 亲验红线成立，批 C 审**上游入口衔接 + 触达/圈人 + 成效聚合口径**。
+- finding 编号 `KC-NN`。全部主控当场 Read/Grep 亲验；未真跑标 PLAUSIBLE（同批 A/B 定调）。
+
+## 触达环 dispatch_campaign（最高优先 · 多步非事务写健壮性）
+
+审查范围：`routes/campaigns.rs`（dispatch_campaign:289 / build_campaign_follow_up_task:127 / is_duplicate_key:170 / classify_send_outcome:395 / campaign_sends_report:492）+ `management.rs`（dispatch_campaign 工具入口）。主控派 opus subagent 复审 + 逐条亲验。
+
+### ✅ 亲验通过总览
+
+1. **✅ 触达不直连 MCP、复用统一发送网关**：build_campaign_follow_up_task(:127) 造 `kind="follow_up"` + `review_required=true` + `run_at=now` 标准 task，交 task worker → gateway → outbox → MCP。活动消息受同一批安全闸（cooldown/日上限/managed 门）约束，不绕过（主控亲验 task 形态）。
+2. **✅ 活动级去重靠唯一索引**：campaign_sends (campaignId, contactWxid) unique index（indexes.rs:748），DuplicateKey→跳过。
+3. **✅ dispatchedCount 语义正确**：只在 send 插入成功+task 建成+回填完成后 +1（:367），去重跳过（:369）/错误（:370）都不计。
+4. **✅ classify_send_outcome 无虚报 sent**：outbox_status=="sent" 最高优先（:410），无任何 run_status 分支误落 sent，未识别 status 诚实归 unknown。
+5. **✅ MCP 工具入口强制确认**：dispatch_campaign 经 management tool 恒 tool_always_requires_confirmation（高风险须确认）+ AuthenticatedAdmin + workspace 隔离。
+
+### [KC-01] 孤儿 send 永久漏推：先占去重位再建 task，中间失败留下"有 send 无 task"，重发被去重索引挡死
+
+- 入口频道：campaign 频道触达（POST /campaigns/:id/dispatch）
+- 链路环节：触达
+- 类型：多步非事务写 / 静默永久漏消息
+- 严重度：**Medium**（后果严重=客户永久漏推，但触发=循环中途 Mongo 瞬时写错误，与批 A/B DB-fault 触发类 finding 同级；无运行时复现故 PLAUSIBLE）
+- 现象：dispatch 循环里 `campaign_sends().insert_one` 成功（:341，占了 (campaignId,contactWxid) 去重位）后，`tasks().insert_one(&task).await?`（:351）的 `?` 若失败 → 整个 handler return Err。留下 `status="enqueued"` + `task_id=None` 的 campaign_send，但**无对应 task**。
+- 根因（亲验）：先占去重位、后建 task，两步非原子；中间失败无补偿（无 delete send 回滚、无 worker 兜底建 task——主控 grep tasks.rs/knowledge_task/agent 零命中，确认无对账）。
+- 后果（亲验）：重新 dispatch 时该 contact insert 撞 DuplicateKey（:369）被静默跳过 → task 永远建不出来 → 客户永久收不到活动消息。report 侧 `s.task_id=None`（:522 filter_map 丢弃）→ classify_send_outcome 走 run_log=None → 永远归 `("pending","not_yet_run")`，运营看到"待跑"假象，永不暴露为失败。
+- 验证状态：**PLAUSIBLE**（孤儿位一旦形成、重入必跳过、永久漏推的逻辑链 CONFIRMED；触发需循环中途非 DuplicateKey 写错误，概率需运行时估）。
+- 修复建议：调换顺序（先建 task 再插 send 带 taskId，让 task 成可重放源）；或 report 识别 `enqueued && task_id=None && 超时` 孤儿单列一桶；或提供孤儿 send 补建 task 入口。
+
+### [KC-02] 部分失败中断整批、campaign 永久卡 dispatching 无恢复；且 dispatch 无 status 前置门可重复推送
+
+- 入口频道：campaign 频道触达
+- 链路环节：触达
+- 类型：批量写无 checkpoint / 状态机悬空
+- 严重度：**Medium**
+- 现象：循环中任一 contact 非 DuplicateKey 错误 → `Err(e)=>return Err`（:370）立即中断 → 循环后的 completed update（:373-382）不执行 → campaign 永久停 `status="dispatching"`。前面已建 send+task、后面完全没建。**无任何 worker 扫 dispatching 态恢复**（主控亲验）。
+- 附加（亲验）：dispatch 前无 status 前置校验（:304-316 只查存在+圈人，不校验当前 status）→ `completed` 活动可被反复 dispatch（每次重新圈人、对新命中的人建 task）。
+- 根因（亲验）：批量写无 checkpoint/无幂等重入设计；status 机乐观直推（dispatching→completed），中断态无回收。重入虽可自愈"没建的继续建"，但被 KC-01 孤儿位反噬（中断在"send 已插 task 未建"窗口时，重入误当已推跳过）。
+- 验证状态：**PLAUSIBLE**（中断卡 dispatching + 无恢复 + 无 status 门 CONFIRMED；触发需循环中途写错误）。
+- 修复建议：dispatching 态可重入 + 孤儿位可自愈（配合 KC-01）；或失败落 status=canceled 而非悬空；补 status 前置门（仅 previewed/confirmed 可 dispatch，防重复推送）。
+
+### [KC-03] taskId 回填失败 → task 会发但成效报表显示 pending（成效统计虚低）
+
+- 入口频道：campaign 频道触达
+- 链路环节：触达 / 成效
+- 类型：多步非事务写 / 报表失真
+- 严重度：**Low-Medium**
+- 现象：task 已 insert 成功（:351），但回填 taskId 的 update_one（:365）`?` 失败 → return Err 中断整批（同 KC-02 卡 dispatching），且该 send.task_id 停 None，但 task 实际存在、worker 会正常跑真发消息。
+- 根因（亲验）：task_id 是 report join 唯一关联键（:520-523 filter_map），回填与建 task 非原子。
+- 后果（亲验）：report join `s.task_id=None` → run_doc=None → 归 pending/not_yet_run。**消息真发了，但活动报表显示"待跑"**，成效统计虚低。比 KC-01 轻（消息没丢）。
+- 验证状态：**PLAUSIBLE**。
+- 修复建议：建 task 时带上预生成 send 关联，或反向让 task 存 campaignId、report 从 task 侧 join，消除回填这步。
+
+### [KC-04] 触达规模无上限：大受众单 HTTP 请求内串行建数千 task（超时/内存/task 洪峰）
+
+- 入口频道：campaign 频道触达（也经 management tool 被 Agent 触发）
+- 链路环节：圈人+触达
+- 类型：规模/性能（无上限保护）
+- 严重度：**Low-Medium**
+- 现象：resolve_segment_contacts 的 cursor 无 limit（campaigns.rs:185），全量 collect 进 Vec（:191）；dispatch 循环对每个 hit 顺序 await 三次 DB 写。几千上万 contact 时单 HTTP 请求内串行几千~上万次往返。
+- 根因（亲验）：无分页、无批量写（insert_many）、无受众上限。对比 list_campaigns 不分页是因"活动数量本身有限"，但受众规模无此天然上界。
+- 后果：单请求耗时随受众线性增长 → HTTP/反代超时（超时后客户端重试叠加 KC-02 卡死）；contacts 全量驻内存；task worker 洪峰。
+- 验证状态：**PLAUSIBLE**（无上限保护 CONFIRMED；实际超时/内存崩溃点需压测）。
+- 修复建议：受众硬上限 + 超限拒绝或分批；insert_many 批量建 task；或 dispatch 只落"待扇出"标记由后台 worker 分批推进（同时解决 KC-02 恢复）。
