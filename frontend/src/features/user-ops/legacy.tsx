@@ -551,7 +551,7 @@ export function ContactsView({
 
   return (
     <section className="panel">
-      <div className="panelHead">
+      <div className="panelHead poolHead">
         <div className="poolHeadText">
           <span>运营池</span>
           <h2>运营池</h2>
