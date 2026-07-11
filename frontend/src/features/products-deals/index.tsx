@@ -400,6 +400,14 @@ function ContactPicker({
             {c.nickname || c.remark || c.wxid}
           </button>
         ))}
+        {filtered.length === 0 &&
+          (contacts.length === 0 ? (
+            <div className={styles.pickerEmpty}>
+              当前账号还没有联系人。请先到「账号管理」同步该账号的通讯录。
+            </div>
+          ) : (
+            <div className={styles.pickerEmpty}>没有匹配的好友，换个关键词试试。</div>
+          ))}
       </div>
     </section>
   );
@@ -800,6 +808,10 @@ function SuspectedDealsTab() {
   const [busyId, setBusyId] = useState<string | null>(null);
   // 每条信号独立的成交金额 / 币种录入（通过时一并提交，均可选）。
   const [drafts, setDrafts] = useState<Record<string, { amount: string; currency: string }>>({});
+  // 驳回原因内嵌录入（替代原生 window.prompt，与设计系统一致）：
+  // rejectingId 标记当前展开原因输入框的条目，rejectReasons 存各条草稿。
+  const [rejectingId, setRejectingId] = useState<string | null>(null);
+  const [rejectReasons, setRejectReasons] = useState<Record<string, string>>({});
 
   const load = useCallback(async () => {
     try {
@@ -843,19 +855,24 @@ function SuspectedDealsTab() {
   };
 
   const handleReject = async (item: SuspectedDeal) => {
-    const reason = window.prompt("请填写驳回原因（如：误判，实际只是咨询）");
-    if (reason == null) return;
-    if (!reason.trim()) {
+    const reason = (rejectReasons[item.id] ?? "").trim();
+    if (!reason) {
       setError("驳回原因不能为空。");
       return;
     }
     setBusyId(item.id);
     try {
       await api.post(`/api/admin/suspected-deals/${encodeURIComponent(item.id)}/reject`, {
-        reason: reason.trim(),
+        reason,
       });
       setInfo("已驳回该疑似成交线索。");
       setError(null);
+      setRejectingId(null);
+      setRejectReasons((prev) => {
+        const next = { ...prev };
+        delete next[item.id];
+        return next;
+      });
       await load();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -929,22 +946,56 @@ function SuspectedDealsTab() {
                       />
                     </label>
                   </div>
-                  <div className={styles.rowActions}>
-                    <button
-                      className={styles.submit}
-                      disabled={busyId === item.id}
-                      onClick={() => void handleApprove(item)}
-                    >
-                      确认成交
-                    </button>
-                    <button
-                      className={styles.linkBtn}
-                      disabled={busyId === item.id}
-                      onClick={() => void handleReject(item)}
-                    >
-                      驳回
-                    </button>
-                  </div>
+                  {rejectingId === item.id ? (
+                    <div className={styles.form}>
+                      <label className={styles.field}>
+                        <span className={styles.fieldLabel}>驳回原因</span>
+                        <textarea
+                          className={styles.input}
+                          rows={2}
+                          autoFocus
+                          placeholder="如：误判，实际只是咨询"
+                          value={rejectReasons[item.id] ?? ""}
+                          onChange={(e) =>
+                            setRejectReasons({ ...rejectReasons, [item.id]: e.target.value })
+                          }
+                        />
+                      </label>
+                      <div className={styles.rowActions}>
+                        <button
+                          className={styles.submit}
+                          disabled={busyId === item.id || !(rejectReasons[item.id] ?? "").trim()}
+                          onClick={() => void handleReject(item)}
+                        >
+                          确认驳回
+                        </button>
+                        <button
+                          className={styles.linkBtn}
+                          disabled={busyId === item.id}
+                          onClick={() => setRejectingId(null)}
+                        >
+                          取消
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className={styles.rowActions}>
+                      <button
+                        className={styles.submit}
+                        disabled={busyId === item.id}
+                        onClick={() => void handleApprove(item)}
+                      >
+                        确认成交
+                      </button>
+                      <button
+                        className={styles.linkBtn}
+                        disabled={busyId === item.id}
+                        onClick={() => setRejectingId(item.id)}
+                      >
+                        驳回
+                      </button>
+                    </div>
+                  )}
                 </div>
               );
             })}
