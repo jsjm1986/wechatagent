@@ -360,10 +360,10 @@ export default function ContentAssetsFeature() {
                 </select>
               </label>
               <label className={styles.field}>
-                <span className={styles.fieldLabel}>目标阶段（逗号分隔）</span>
+                <span className={styles.fieldLabel}>目标阶段（逗号分隔；取值需在运营域配置阶段字典）</span>
                 <input
                   className={styles.input}
-                  placeholder="例如：意向,未成交"
+                  placeholder="多个阶段用逗号分隔"
                   value={stages}
                   onChange={(event) => setStages(event.target.value)}
                 />
@@ -684,10 +684,10 @@ function MediaAssetRow({
                 />
               </label>
               <label className={styles.field}>
-                <span className={styles.fieldLabel}>目标阶段（逗号分隔）</span>
+                <span className={styles.fieldLabel}>目标阶段（逗号分隔；取值需在运营域配置阶段字典）</span>
                 <input
                   className={styles.input}
-                  placeholder="例如：意向,未成交"
+                  placeholder="多个阶段用逗号分隔"
                   value={editStages}
                   onChange={(event) => setEditStages(event.target.value)}
                 />

@@ -1748,12 +1748,9 @@ pub fn classify_recall_outcome(result: &AnswerResult) -> Option<GapSignalCandida
             severity: "high".into(),
             affected_chunk_ids: affected,
             search_queries: Vec::new(),
-            description: format!(
-                "本次召回 cited=0（truncated={}，opened_bodies={}）。疑似目标知识缺失、\
-                 粒度过粗或放置错位，待运营质检定位补/拆/重分类。",
-                result.truncated,
-                result.rounds_used,
-            ),
+            description: "本次没检索到可引用的知识。疑似目标知识缺失、粒度过粗或放置\
+                 错位，待运营质检定位后补录、拆分或重新归类。"
+                .to_string(),
         });
     }
 
@@ -1773,12 +1770,9 @@ pub fn classify_recall_outcome(result: &AnswerResult) -> Option<GapSignalCandida
             severity: "medium".into(),
             affected_chunk_ids: affected,
             search_queries: Vec::new(),
-            description: format!(
-                "本次 open 正文 {} 个但仅 cite {} 个。原子可能过粗或放错文档，\
-                 待运营质检判断该 split / reclassify。",
-                opened.len(),
-                cited_count,
-            ),
+            description: "本次翻阅了多条知识正文，可真正引用的却很少。知识条目可能\
+                 粒度过粗或放错文档，待运营质检判断是否拆分或重新归类。"
+                .to_string(),
         });
     }
 

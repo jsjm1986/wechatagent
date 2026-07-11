@@ -443,9 +443,9 @@ impl GapSignalCandidate {
             "high",
             Vec::new(),
             Some(
-                "产品宣称被 blocked_unverified_product_claim 拦截：本 run 引用的知识\
-                 切片里没有任何 verified chunk 背书该产品声明。待运营据 search_queries \
-                 里的客户问句对话式补录 / verify 相关知识，使该缺口可被闭环修复。",
+                "产品说法未经核实被拦截：本次回复引用的知识里，没有任何已核实的知识\
+                 背书该产品说法。待运营根据下方客户问句对话式补录、核实相关知识，\
+                 使该缺口可被闭环修复。",
             ),
         );
         if !customer_query.trim().is_empty() {

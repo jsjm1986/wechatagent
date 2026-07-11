@@ -321,14 +321,16 @@ pub(crate) fn dimension_values_with_labels(
 /// 按写入通道处置（机器 drop / admin reject）。`check_value` 对两种情况都返回
 /// `CandidateNew`，无法区分，故由调用方（`dimension_registry::lookup_dict`）配合本函数判别。
 ///
-/// 调用方负责保证 cache 已加载。读 [scope, "global"] 两层，任一有非空 entries 即 true。
+/// 调用方负责保证 cache 已加载。读 [scope, "global"] 两层，任一层存在 status=="active"
+/// 的条目即 true。纯 deprecated 残留（active=0）视同「未配置」→ false（F-009 fail-soft：
+/// 字典只剩 deprecated 时不 Reject，KindUnconfigured→Accept 回退信任原值）。
 pub(crate) fn kind_has_entries(kind: &str, scope_account_id: &str, cache: &TaxonomyCache) -> bool {
     let inner = cache.inner.lock();
     [scope_account_id, "global"].iter().any(|s| {
         inner
             .entries
             .get(&(s.to_string(), kind.to_string()))
-            .is_some_and(|e| !e.is_empty())
+            .is_some_and(|e| e.iter().any(|c| c.status == "active"))
     })
 }
 
@@ -973,6 +975,42 @@ mod tests {
         // 完全空缓存。
         let empty = make_cache_with_entries(vec![]);
         assert!(!kind_has_entries("customer_stage", "acct-1", &empty));
+    }
+
+    /// `kind_has_entries`：该 kind 只剩 deprecated 残留（active=0）→ false（F-009）。
+    /// 纯 deprecated 视同「未配置」→ KindUnconfigured→Accept fail-soft 放行，
+    /// 避免字典只剩废弃条目时运营填任何目标阶段被 Reject。
+    #[test]
+    fn kind_has_entries_false_when_only_deprecated() {
+        let cache = make_cache_with_entries(vec![make_entry(
+            "global",
+            "customer_stage",
+            "legacy_stage",
+            "旧阶段",
+            &[],
+            "deprecated",
+        )]);
+        assert!(!kind_has_entries("customer_stage", "acct-1", &cache));
+        // active + deprecated 混存时仍 true（有 active 即算已配置）。
+        let mixed = make_cache_with_entries(vec![
+            make_entry(
+                "global",
+                "customer_stage",
+                "legacy_stage",
+                "旧阶段",
+                &[],
+                "deprecated",
+            ),
+            make_entry(
+                "global",
+                "customer_stage",
+                "first_contact",
+                "初次接触",
+                &[],
+                "active",
+            ),
+        ]);
+        assert!(kind_has_entries("customer_stage", "acct-1", &mixed));
     }
 
     /// `dimension_values_with_labels_returns_id_label_pairs`

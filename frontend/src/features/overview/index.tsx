@@ -1,4 +1,6 @@
+import { useEffect } from "react";
 import { RefreshCw, ArrowRight } from "lucide-react";
+import { api } from "../../lib/api";
 import { Avatar } from "../../components/ui/Avatar";
 import { StatusBadge, type StatusTone } from "../../components/ui/StatusBadge";
 import { EmptyState } from "../../components/ui/EmptyState";
@@ -28,12 +30,32 @@ function contactStateLabel(contact: Contact): { tone: StatusTone; label: string 
 
 export default function OverviewFeature() {
   const contacts = useContactStore((s) => s.contacts);
+  const setContacts = useContactStore((s) => s.setContacts);
   const managedCount = useContactStore((s) => s.managedCount());
   const taxonomies = useProfileStore((s) => s.taxonomies);
   const normalCount = useContactStore((s) => s.normalCount());
   const onlineCount = useAccountStore((s) => s.onlineCount());
   const accountCount = useAccountStore((s) => s.accounts.length);
+  const currentAccountId = useAccountStore((s) => s.currentAccountId());
   const setChannel = useNavigationStore((s) => s.setChannel);
+
+  // F-015：工作台首屏自行拉取联系人填充 contactStore（此前仅用户运营页填充，
+  // 首次直接进工作台时统计卡/联系人池恒显 0）。仅当 store 为空时拉一次，避免
+  // 与用户运营页已加载的数据重复请求；带 accountId 防回落 default_account_id 查空。
+  useEffect(() => {
+    if (!currentAccountId) return;
+    if (useContactStore.getState().contacts.length > 0) return;
+    void (async () => {
+      try {
+        const data = await api.get<{ items: Contact[] }>(
+          `/api/contacts?accountId=${encodeURIComponent(currentAccountId)}`
+        );
+        setContacts(data.items);
+      } catch {
+        // 工作台概览非关键路径，拉取失败静默（用户进用户运营页会重试）
+      }
+    })();
+  }, [currentAccountId, setContacts]);
 
   const managed = contacts.filter((c) => c.agentStatus === "managed");
   const deliveryRate = contacts.length > 0 ? Math.round((managedCount / contacts.length) * 100) : 0;
