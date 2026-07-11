@@ -502,3 +502,33 @@
 - 根因（亲验）：对比离线 `persist_signals`（:499-503）把**全部** pending 载入 map 按 key 精确比对（正确）；在线路径为省一次全量查询走 find_one，牺牲了正确性。
 - 验证状态：**PLAUSIBLE**（逻辑不严谨 CONFIRMED：find_one 无序 + 内存过滤坐实；实际漏合并频率依赖 Mongo 返回顺序，需运行时估）。有 signal_id 唯一索引（indexes.rs:1386）兜底，不写坏数据，仅噪音。
 - 修复建议：在线 dedup 改为可精确命中的查询键（持久化 dedup_key/normalized_title 字段并加索引直接 find_one 命中），与离线 persist_signals 精确比对对齐。
+
+## 链2 审核链（第三优先 · auto-verify 红线最大对抗面）
+
+审查范围：`routes/knowledge/verify.rs`（auto_verify_inner:253 / decide_auto_verify_status:527 / enforce_verified_needs_human_audit:554 / clamp_sample_rate:38 / 人工 verify:66 / reject:126）+ `wiki_edit.rs` batch_verify_chunks:934 + `knowledge_wiki/chunk_revisions.rs` apply_chunk_revision。主控派 opus subagent 复审 + 逐条亲验。
+
+### ✅ 亲验通过总览（"AI 永不自动 verify"红线极稳固，无绕过）
+
+1. **✅ auto_verify 写库必经强制降级**：verify.rs:391 算 decide_auto_verify_status → :401 **无条件**套 enforce_verified_needs_human_audit → :418/:426 apply_chunk_revision 用的就是这个 final_status。verified→needs_human_audit 写库前已定死，无旁路；:404 `"verified"=>verified+=1` 是**死分支**（红线正确，非 bug）。
+2. **✅ product_fact 无特权也无边界漏洞**：decide_auto_verify_status / enforce_verified_needs_human_audit 完全不读 chunk_type，所有类型一视同仁强制降级（含单测 all_types_verified_forced_to_human_audit）。
+3. **✅ LLM 输出 integrityStatus 不透传**：model_status 只作 decide_auto_verify_status 入参（须 =="verified" 且证据+置信齐），LLM 自称 verified 也必降级；未知/脏值回落 needs_review（:544）。
+4. **✅ apply_chunk_revision Verify op 不自写 verified**：integrity_status 由调用方 patch 决定；AI source 强制 draft+needs_review，仅 Human source 才允许 verified。
+5. **✅ 人工 /verify + batch_verify 鉴权+隔离+D2 闸齐全**：均 `AuthenticatedAdmin` + require_session；先 find_one 带 `workspace_id=current_workspace`（跨 ws 返 NotFound）+ apply_chunk_revision 二次 workspace 守门（chunk_revisions.rs:159-165）；均先过 D2 闸 chunk_verify_gate_reason（无 quote/anchor 不得 verify）。
+6. **✅ batch_verify 部分失败正确**：wiki_edit.rs:947-1008 逐条 try，parse/not_found/db/gate/apply 失败各自 push skipped，不静默吞、不整批标成功；空/超100 提前 400。
+7. **✅ needs_human_audit 绝不被误召回 verified**：所有召回/背书过滤精确 `=="verified"`（guards.rs:314 / knowledge_router.rs:71 / knowledge_agent 各 tool / knowledge_tools.rs），needs_human_audit 既不满足召回也不吃 +0.5 加分。
+8. **✅ clamp_sample_rate 硬下限**：`.clamp(0.05,1.0)`，传 0 也钳 0.05（单测锁死）。
+9. **✅ 幂等**：重复 verify 已 verified 切片 → apply_chunk_revision before/after hash 相同跳过 replace_one，仅多一条 revision 审计，无副作用。
+
+### [KB-08] auto_verify 降级出的 needs_human_audit 切片不进任何审核收件箱，人审漏斗黑洞（分诊反使待审切片从收件箱消失）
+
+- 入口频道：content 频道 auto_verify 批处理 → 人审收件箱（quality/知识对话收件箱）
+- 链路环节：②审核（人审漏斗衔接）
+- 类型：业务流缺陷（状态机新增态无消费方）
+- 严重度：**Medium**
+- 现象：auto_verify 对过闸切片强制写 `integrity_status="needs_human_audit"`（verify.rs:401/:426），设计意图是"预审分诊，过闸的挑出来等运营重点看"。但**没有任何审核入口查询这个状态**：
+  - 统一收件箱 `collect_knowledge_review` 硬编码 `integrity_status:"needs_review"`（ask_human_inbox.rs:124），不认 needs_human_audit。
+  - AI digest 收件箱三分支（digest_inbox.rs:431/465/481）：分支1要 needs_review 不匹配；分支2/3要缺 quote/缺 anchor，而 needs_human_audit 必由「verified 判定」降级来（decide_auto_verify_status:534 要求 quote+anchor 都真），故必然同时有 quote+anchor，两分支也不匹配。
+  - 全仓 needs_human_audit 只出现在 verify.rs 写入端 + 前端**仅作计数展示**（AutoVerifyPanel.tsx:170 / quality/index.tsx:238「待人工抽查」数字），**无任何过滤视图列出这些切片供审**。
+- 根因（亲验）：auto_verify 输入过滤是 `integrity_status ∈ {needs_review, null}`（verify.rs:270）——它把原本以 needs_review 显示在收件箱的切片，改写成 needs_human_audit 后**从收件箱移除**。分诊动作反而让待审切片从人审界面消失，只剩一个计数。
+- 验证状态：**PLAUSIBLE**（写端 CONFIRMED verify.rs:270 输入含 needs_review + :426 写 needs_human_audit；读端 CONFIRMED ask_human_inbox.rs:124 只查 needs_review + 前端 grep 仅计数无过滤视图；主控亲验后端+前端两侧坐实）。红线字面未破（切片没被自动 verified、也不会被误召回背书——精确 `=="verified"` 已核），但人审漏斗有洞：needs_human_audit 切片无限期停留、无入口晋升 verified（仅能靠 chunk 全量列表浏览看到，故 Medium 非 High）。
+- 修复建议：让审核收件箱查询 `integrity_status ∈ {needs_review, needs_human_audit}`（ask_human_inbox.rs:124 + digest_inbox.rs:431 同步），并给 needs_human_audit 一个"AI 预审通过待人复核"标签/优先级；或前端加 needs_human_audit 专用过滤视图。**这是本批迄今最有业务价值的 finding**——正是上一轮广度走查扫不到的"状态机新增态与消费方脱节"。
