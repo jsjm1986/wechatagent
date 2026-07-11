@@ -226,7 +226,28 @@
 
 ## 环节⑤ 独立 review + 阈值闸 + revision（review/gates.rs）
 
-_（待审）_
+审查文件：`src/agent/review/gates.rs`（review_passed:20 / classify_dual_gate:115 / finalize_review_for_send / decide_revision）+ 默认值 `models.rs:3767-3781` + revision 控制流 `gateway.rs:1800` + 状态闭集 `run_envelope.rs`。主控亲验默认值(models.rs:3767-3781=6/7/7/6/6)+比较符对偶(gates.rs:20-45)。**验证重心环节 —— 结论：命脉核心闸设计扎实、干净。**
+
+### ✅ 亲验通过总览（这道命脉防线整体健康）
+- **阈值默认值 = CLAUDE.md 声明一字不差**（主控亲验 `models.rs:3767-3781`）：hallucination_block_at=6 / pressure_risk_block_at=7 / knowledge_grounding_block_below=7 / human_like_rewrite_below=6 / emotional_value_rewrite_below=6。runtime 可配 + admin 覆盖走 `clamp(1,10)` 护栏（runtime.rs:242）防误配禁用硬闸。✅
+- **五闸比较符精确对偶**（主控亲验 `gates.rs:20-45` review_passed 放行侧 ↔ `:115-207` classify_dual_gate 拦截侧）：FactRisk `<`放行/`>=`拦(临界6拦)、ProductAccuracy `>=`放行/`<`拦(临界7放)、HumanLike/EmotionalValue `>=`放行/`<`改写(临界6放)、PressureRisk `>=7`拦。无符号反置。✅
+- **硬闸优先软闸**：classify 先判 hard，非空即 return（:142），软闸绝不绕过硬闸（测试 :1644）。✅
+- **revision 单次硬保证**：`gateway.rs:1800` 是单个 `match`（非 loop），Proceed 只调一次；revision 后经 finalize+review_passed 双重复检，无循环回边；二次不达标→revision_failed 兜 Held。✅
+- **状态闭集 fail-closed**：`run_envelope.rs` 闭集完备，写库前 `assert_*_status_valid`（:556-566）不在闭集→返 AppError::External 不静默 coerce；人工接管禁词 `FORBIDDEN_HUMAN_HANDOFF_VALUES` 优先硬阻断；gates.rs 产出字面量全在闭集内。✅
+- **R5.4 verified-knowledge 产品声明硬门独立于 grounding 软闸**（:658-691），reviewer 自评高分也拦。✅
+
+### [E-01] pressure_risk / boundary_privacy_safety 的「0 值豁免」双义可被 reviewer 填 0 绕过软闸（观测项）
+- 入口频道: userOps / command（同一 gateway）
+- 链路环节: ⑤ review 软闸
+- 类型: 设计权衡（已知 tradeoff）
+- 严重度: Low（主控认同 subagent：观测项非 bug）
+- 现象/风险: `gates.rs:38-39`（pressure_risk）与 `:43-44`（boundary_privacy_safety）采「值=0 即豁免、不参与拦截」。0 同时承担"reviewer 未评分哨兵"（R11 老数据反序列化默认）与"合法最低分"两义。若 reviewer LLM 某轮把 pressure_risk 输出为 0（而非真实低分），该软闸静默失效、不触发 revision。
+- 根因（亲验）: `gates.rs:37-39` 注释明确 0 是"reviewer 未给分/老数据反序列化默认，不参与拦截"，属 R11 向后兼容显式取舍。
+- 为何 Low/观测非 bug: reviewer 是本系统自有 LLM（非对抗输入）；两个 0 豁免的都是**软闸→改写**非硬 block，误放行代价有限；硬闸（hallucination `>=` / grounding `<`）+ 两个无 0 豁免软闸（humanLike/emotionalValue）全程生效，质量兜底不空。
+- 复现设想: 可 117 复现——构造 reviewer 对高压迫话术回评 `pressureRisk=0` 观察是否跳过 revision。但需干预 LLM 输出，非自然高频路径。
+- 验证状态: PLAUSIBLE（主控亲验 :38-39 逻辑 + 注释意图）
+- 修复建议: 是否引入 `Option<i32>`/-1 哨兵区分"未评分"与"评 0 分"，涉 R11 反序列化基线，留用户裁决，勿擅改。
+- 状态: Open
 
 ## 环节⑥ outbox 幂等 / claim / second-pass safety gate / retry
 
