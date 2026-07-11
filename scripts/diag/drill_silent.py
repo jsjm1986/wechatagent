@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Drill into the two suspects."""
 from pymongo import MongoClient
 from datetime import datetime, timezone, timedelta

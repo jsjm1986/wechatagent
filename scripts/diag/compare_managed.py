@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Diagnostic: compare all managed contacts and their gateway-relevant state."""
 from pymongo import MongoClient
 from datetime import datetime, timezone, timedelta

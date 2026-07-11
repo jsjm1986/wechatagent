@@ -58,10 +58,16 @@ describe("ProductsDealsFeature — F23 疑似成交待核实", () => {
 
   it("suspected deal reject posts reason", async () => {
     const postSpy = vi.spyOn(api, "post").mockResolvedValue({} as never);
-    vi.spyOn(window, "prompt").mockReturnValue("误判，实际只是咨询");
     const user = await openReviewTab();
 
+    // 新交互（F-017）：点「驳回」展开内嵌原因输入框（替代原生 window.prompt），
+    // 填原因后点「确认驳回」才提交。
     await user.click(screen.getByRole("button", { name: "驳回" }));
+    await user.type(
+      screen.getByPlaceholderText("如：误判，实际只是咨询"),
+      "误判，实际只是咨询",
+    );
+    await user.click(screen.getByRole("button", { name: "确认驳回" }));
 
     await waitFor(() => expect(postSpy).toHaveBeenCalled());
     expect(postSpy).toHaveBeenCalledWith(
