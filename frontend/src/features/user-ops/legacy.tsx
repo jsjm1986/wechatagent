@@ -490,7 +490,8 @@ export function ContactsView({
   onLoadAll,
   onOpenContact,
   onQuery,
-  onBatchEnable
+  onBatchEnable,
+  onHideFromPool
 }: {
   contactTab: ContactTab;
   contacts: Contact[];
@@ -506,6 +507,7 @@ export function ContactsView({
   // 批量/单人启用回调（index.tsx 注入：调 batchEnable + toast + 刷新列表/计数）。
   // 可选——纯展示渲染（如单元测试）不传时降级为只读列表。
   onBatchEnable?: (candidates: BatchEnableCandidate[]) => Promise<void>;
+  onHideFromPool?: (contact: Contact) => void;
 }) {
   const taxonomies = useProfileStore((s) => s.taxonomies);
   const [selectedWxids, setSelectedWxids] = useState<Set<string>>(new Set());
@@ -551,7 +553,7 @@ export function ContactsView({
 
   return (
     <section className="panel">
-      <div className="panelHead">
+      <div className="panelHead poolHead">
         <div className="poolHeadText">
           <span>运营池</span>
           <h2>运营池</h2>
@@ -680,6 +682,21 @@ export function ContactsView({
                     disabled={batching}
                   >
                     启用 Agent
+                  </button>
+                )}
+                {onHideFromPool && (
+                  <button
+                    type="button"
+                    className="poolHideBtn"
+                    title="从运营池移除（不影响好友关系）"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      if (window.confirm(`把「${name}」从运营池移除？（不删好友，仅不再出现在池中）`)) {
+                        onHideFromPool(contact);
+                      }
+                    }}
+                  >
+                    从池移除
                   </button>
                 )}
               </div>

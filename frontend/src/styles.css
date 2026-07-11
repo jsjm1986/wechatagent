@@ -1545,6 +1545,21 @@ textarea::placeholder {
   border-top: 1px solid var(--line);
 }
 
+.poolHideBtn {
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--muted);
+  font-size: 11px;
+  padding: 3px 8px;
+  border-radius: 6px;
+  white-space: nowrap;
+}
+
+.poolHideBtn:hover {
+  color: var(--ink);
+  background: var(--surface-soft);
+}
+
 .contact {
   justify-content: flex-start;
   gap: 10px;
@@ -1638,6 +1653,25 @@ textarea::placeholder {
 .poolHeadText {
   display: grid;
   gap: 2px;
+}
+
+/* 运营池头部：标题块 + 三档 tab 纵向堆叠。全局 .panelHead 是 space-between 横行，
+   在智能模式 ~360px 窄左栏里会把 .segmented 挤成竖排畸形椭圆，故运营池单独纵向。 */
+.panelHead.poolHead {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 10px;
+}
+
+.panelHead.poolHead .segmented {
+  display: flex;
+  width: 100%;
+}
+
+.panelHead.poolHead .segmented button {
+  flex: 1;
+  text-align: center;
+  white-space: nowrap;
 }
 
 .poolLede {
