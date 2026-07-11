@@ -863,3 +863,75 @@
 - 根因（亲验）：extract_number_tokens 抓一切数字串无"数量事实 vs 序数/时间/无关数字"语义区分（函数注释自称"只看客观数量"实际抓一切）；误杀后清 awaiting + 无重试 = 裁决永久丢失。
 - 验证状态：**PLAUSIBLE**（"裁决永久不达 + awaiting 清除"CONFIRMED：gateway.rs:776 无条件清 + relay task 不重排，主控亲验；误杀后客户是纯静默还是被 ensure_customer_acknowledged 补安抚未读该路径，标 PLAUSIBLE）。
 - 修复建议：数字提取加语义降噪（跳过时间/序数上下文），或误拦时不清 awaiting、重排一次 relay 用中性收尾兜底文案（新增"裁决不可安全转述"场景），避免裁决黑洞。KD-01/KD-03 同源（数字护栏），修复可合并。
+
+## 决策人链 + 超时改派 + 骚扰门
+
+审查范围：`agent/escalation/policy.rs`（resolve_ask_human_policy:21 / next_decider_on_timeout:95 / push_allowed:68 / in_quiet_hours:55）+ `agent/escalation/mod.rs`（scan_escalation_timeouts:358）+ `agent/escalation/ledger.rs`（reassign:289 / lookup_principal_config:215 / count_pushes_today:338）+ `routes/principal_escalations.rs` + `routes/domains.rs`（put_ask_human_policy:206）+ `webhooks.rs`（领导回复分流:443）。主控派 opus subagent 复审 + 逐条亲验。
+
+### ✅ 亲验通过总览
+
+1. **✅ push_allowed 三条件组合**：cap/dedupe/quiet 任一不满足即 false（policy.rs:68-91），全 None→true 字节等价全放行。
+2. **✅ in_quiet_hours 跨午夜正确**：start<=end 用 [start,end)；start>end 用 h>=start||h<end；tz_offset 折算 + 负数安全（policy.rs:55-64，单测覆盖）。
+3. **✅ next_decider_on_timeout 常规边界**：timeout=None→None（无限等待）；age<timeout→None；链尾越界→None（policy.rs:100-105，仅"决策人不在链中"退化链尾属 KD-06）。
+4. **✅ resolve_ask_human_policy 回落字节等价**：ask_human_policy 存在逐字段拷贝；None 时旧行为等价（policy.rs:21-52，单测覆盖）。
+5. **✅ workspace 隔离**：lookup_principal_config（ledger.rs:224）/ reassign_escalation（:299）/ count_pushes_today/latest_push_ms/list_* 全带 workspace_id；两 admin 端点 AuthenticatedAdmin + current_workspace 约束；resolve 对非本 ws 条目返回泛化 alreadyResolved 避存在性泄漏；reassign 校验 to_wxid ∈ decider_chain。
+6. **✅ 骚扰门"无自我命中"时序不变量**：gate 检查时台账仍挂原 principal，查 next 的 count/latest 不含本条（mod.rs:432-437）。
+7. **✅ 短码唯一 + resolve/reassign 幂等**：唯一索引 + 碰撞换种子重试 5 次；find_one_and_update filter 带 status=pending，并发只一方成功。
+
+### [KD-04] 用 decider_chain（推荐配置）时领导的微信回复永不被识别为裁决，掉进普通客户入站链路（甚至被 AI 当客户自动回复）
+
+- 入口频道：askHumanConfig 配置 decider_chain 后，领导微信回复裁决
+- 链路环节：决策人链（领导回复分流）
+- 类型：新旧字段迁移不对称 / 核心交互静默失效
+- 严重度：**High**（非 DB-fault/时序触发——**推荐配置下确定性发生**，核心交互"领导微信回复裁决"整体失效；admin REST resolve 仍可用故非全断，但 WeChat-reply 模式是设计主交互）
+- 现象：领导用微信回复裁决时，webhooks.rs:443 靠 lookup_principal_config 分流。该函数（ledger.rs:224-227）查询条件是 `principal_decider: from_wxid`——**只认旧标量字段 principal_decider，完全不看 ask_human_policy.decider_chain**。
+- 根因链（主控亲验）：
+  - 唯一策略写路径 put_ask_human_policy（domains.rs:233）只 `$set ask_human_policy`，**从不写 principal_decider**。
+  - 默认种子 prompts.rs principal_decider: None；m025 迁移是**正向** backfill（principal_decider→decider_chain，仅对旧有 principal_decider 的 config 生效，一次性）。
+  - 用推荐的 decider_chain 配置后 principal_decider 恒 None → lookup_principal_config 恒返 None → handle_principal_reply 永不被调用 → 领导微信裁决消息掉进普通客户入站链路（领导若恰是 managed contact，甚至被 AI 当客户自动回复）。
+- 验证状态：**CONFIRMED / High**（lookup_principal_config 只查 principal_decider（ledger.rs:226）+ put_ask_human_policy 不写 principal_decider（domains.rs:233）+ 种子 None，三处主控亲验；decider_chain 反查领导身份全仓无实现）。
+- 修复建议：lookup_principal_config 改为解析 resolve_ask_human_policy(cfg) 后判断 from_wxid ∈ decider_chain（兼容旧 principal_decider），覆盖链中全部决策人（含改派后 next 决策人回复）。**批 D 最高优先修复项**。
+
+### [KD-05] 改派目标的骚扰门统计口径漂移：用 created_at 近似推送时刻，改派不改 created_at → 低估 next 的打扰
+
+- 链路环节：决策人链（超时改派骚扰门）
+- 类型：骚扰门统计口径漂移
+- 严重度：**Medium**
+- 现象：count_pushes_today（ledger.rs:351 `created_at>=since`）与 latest_push_ms（:373 `sort created_at:-1`）都以台账 created_at 近似"推送时刻"；reassign_escalation（:304）改派只 `$set principal_wxid+updated_at`，**不改 created_at**。改派后该行 principal_wxid=next 但 created_at 仍是原始创建时刻 → 对 next 算骚扰门时：latest_push_ms(next) 返回陈旧时刻低估最近打扰、可能 dedupe 窗内再推；改派跨天时今天推给 next 的卡不计入 next 当日 cap。
+- 根因（亲验）：改派复用 created_at 作推送时刻，未记真实"最近推送时刻"。
+- 验证状态：**CONFIRMED**（口径亲验；实际触发需改派 + 同决策人多议题并发）。
+- 修复建议：台账增真实"最近推送时刻"字段（改派/首推刷新），骚扰门统计改用它而非 created_at。
+
+### [KD-06] 配置变更后旧 pending 挂"已不在链中"的决策人被永久当链尾晾住（孤儿 pending）
+
+- 链路环节：决策人链（超时改派边界）
+- 类型：配置漂移致孤儿 pending
+- 严重度：**Medium**
+- 现象：next_decider_on_timeout（policy.rs:104）用 `position(|d| d.wxid==current_wxid)?`——当前 principal_wxid 不在链中时 position 返 None → 函数返 None。scan（mod.rs:378）next=None 且 timed_out=true 被当**链尾**：只发客户安抚、台账保持 pending，**永不改派**。decider_chain 被 admin 改过（删/换人）后旧 pending 的 principal_wxid 可能已不在新链 → 永远卡在原（失效）决策人名下，既不改派新链、又（叠加 KD-04）无法微信回复推进，只能 admin REST 手动兜底。
+- 根因（亲验）：position 未命中即静默退化为链尾语义。
+- 验证状态：**CONFIRMED**（代码路径亲验；触发需运行中改链）。
+- 修复建议：next_decider_on_timeout 在 position 未命中时回落链首（或明确"重新入链"策略），而非静默退化链尾。
+
+### [KD-07] 超时改派缺"next==客户 wxid"防护（首推有、改派无），误配下会把请示卡推给客户
+
+- 链路环节：决策人链（改派推卡）
+- 类型：守卫不一致
+- 严重度：**Low-Medium**
+- 现象：首推 escalate_held_decision:75 有 `principal_wxid==contact.wxid→拒绝`；但超时改派 scan_escalation_timeouts:430 取 next.wxid 后直接推卡（:450），**无"next 是否等于客户 wxid"校验**。reassign_principal_escalation 只保证 to_wxid∈链内、不保证链内成员非客户 → admin 误把客户 wxid 配进 decider_chain[1..] 时改派会把含客户标签/卡点的请示卡直接推给该客户，泄漏内部请示内容。
+- 根因（亲验）：两条推卡入口对"决策人==客户"守卫不一致。
+- 验证状态：**CONFIRMED**（守卫缺失亲验；触发需误配）。
+- 修复建议：改派推卡前复用同一 `next_wxid==entry.contact_wxid` 守卫；或 put_ask_human_policy 校验链成员不得等于任何在管客户。
+
+### [KD-08] 推卡成功但 reassign 落库失败 → next 收到重复请示卡（已知设计权衡）
+
+- 链路环节：决策人链（改派时序）
+- 类型：多步非事务写（已知权衡）
+- 严重度：**Low**
+- 现象：scan 先推卡（mod.rs:450）成功才 reassign（:463）。reassign 落库失败 → 下一 tick principal_wxid 仍原值、age 仍超时 → 重算同一 next → 再推同 short_code 卡。DB 层无重复台账，但 next 微信收到两条相同请示卡。
+- 根因（亲验）：push-then-reassign 时序落库失败无补偿、靠下 tick 重推兜底。代码注释（:459-461）已承认"幂等、可接受"。
+- 验证状态：**CONFIRMED**（行为与注释一致，单实例影响有限）。
+- 修复建议：可选——reassign 落库失败补一条"已推待改派"标记避免重推；或接受为已知权衡。
+
+### 备案（观察项，非 live bug）
+- **resolve_escalation filter 缺 workspace_id**（ledger.rs:161，仅 {short_code, status=pending}）：因 short_code 全局唯一 + 两调用方上游均已 workspace 预筛，当前不可跨域越权；缺纵深防御，未来新增未预筛调用方即成 IDOR。列观察项。
+- **多实例并发双推**：scan_escalation_timeouts 单进程 worker（tasks.rs:167）驱动，当前单实例无害；横向扩展时两实例可能对同一 pending 同时推卡+改派（reassign_escalation 不 CAS principal_wxid）。就绪债，同多租户隔离债性质。
