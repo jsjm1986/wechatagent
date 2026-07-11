@@ -579,3 +579,62 @@
 - 根因（亲验）：全仓 grep locked_fields 非测试消费点——只有 model 定义、preserve_unmodeled_chunk_fields 载体回填（mod.rs:546）、前端序列化（mod.rs:307）、wiki_edit 拒收入参（:39）、domain_schemas 黑名单——**无任何 guard 读 existing.locked_fields 去强制**。运营把 title/body 加进 locked_fields 后，apply_chunk_revision 的 patch 改 title/body 照样通过（DEFAULT 集不含它们），crud PUT replace_one 更直接覆盖。字段锁当前只在前端编辑表单禁用输入（设计文档 knowledge-trust-cockpit-frontend-design.md:71），后端无兜底。
 - 验证状态：**CONFIRMED**（主控亲验 chunk_revisions.rs:234 传常量 + 全仓无 existing.locked_fields 强制点坐实）。
 - 修复建议：需用户裁决 locked_fields 是"后端强制"还是"纯前端提示"——若前者（按设计描述应是），apply_chunk_revision 里把 existing.locked_fields 与 DEFAULT_LOCKED_FIELDS 合并后再 apply_field_patch + enforce_locked_fields；PUT 路径同理回填 existing 锁定字段值。KB-09/KB-10/KB-11 构成"统一编辑入口未真统一 + 字段锁未兑现"同一根因家族。
+
+## 链6 质量链（outcome 度量 / reviewer 统计 / 成交追认）
+
+审查范围：`routes/outcome_metrics.rs` + `routes/outcomes_autonomy.rs`（get_autonomy_outcomes:219 / list_autonomy_revisions:443）+ `knowledge_wiki/reviewer_stats.rs` + `agent/entitlements.rs`（staff_confirmed 闭集）+ 写侧 `routes/shared.rs`（add_outcome_event）/ `admin_suspected_deals.rs`。主控派 opus subagent 复审 + 逐条亲验。
+
+### ✅ 亲验通过总览（"AI 永不自证成交"红线干净，无 CONFIRMED bug）
+
+1. **✅ AI 永不自证成交（核心红线）**：`verification_drives_entitlement`（entitlements.rs:51-53）闭集 `{staff_confirmed, payment_verified}`，conversation_inferred 物理排除；三消费点（project_entitlements/confirmed_deal_timestamps/compute_customer_value_cents）全复用该闭集。
+2. **✅ 写侧闭集严密**：outcome_events 唯一写入点 add_outcome_event_inner（shared.rs）强制走 `validate_deal_verification`（shared.rs:1410-1419）——**主控亲验**：None/空/staff_confirmed→staff_confirmed，payment_verified→payment_verified，**其它一律 BadRequest 拒绝**（含 conversation_inferred，错误文案明说"疑似线索须经核实"）。AI 疑似成交无法经任何路径写 outcome_events。
+3. **✅ 成交追认必须人工触发**：conversation_inferred→staff_confirmed 唯一升级点 approve_suspected_deal（admin_suspected_deals.rs:119）**主控亲验** `Extension<AuthenticatedAdmin>` 门 + verification 硬编码 `"staff_confirmed"`（:203）；无 worker/AI 调用。AI 侧只 upsert suspected_deal_signals（status=pending 独立集合，gateway.rs:4346），从不碰 outcome_events，全程 fail-soft。
+4. **✅ misjudge_rate 分子⊆分母**：reviewer_misjudge_signal="approved_but_user_negative" 仅在 reviewer_approved==true 时产出（reaction.rs:173 `&&` 守卫），误判分子恒⊆approved 分母，misjudge_rate≤1 不虚高。
+5. **✅ ratio 除零保护**：reviewer_stats.rs:36-45 分母 0 返 0.0；outcomes_autonomy.rs:122 分母 0 返 null；held 类比率分子⊆分母恒≤1。
+6. **✅ 度量口径**：outcome_metrics 与 outcomes_autonomy 均 (workspace_id, account_id) 双维过滤；outcomes_autonomy final_review_status 白名单剔 legacy 脏值。
+
+### [KB-12] reviewer_stats 只按 workspace 聚合、缺 account_id 维度，与 outcome_metrics/outcomes_autonomy 双维口径不一致（就绪债）
+
+- 链路环节：⑥质量（reviewer 度量聚合）
+- 类型：口径不一致（多租户就绪债）
+- 严重度：**Low**（就绪债）
+- 现象：`aggregate_reviewer_stats_for_workspace`（reviewer_stats.rs:49-91）三条 count_documents 过滤只含 `workspace_id + created_at`，聚合行 stat_id=`"{workspace_id}::reviewer"`（一 workspace 一行）；而 outcome_metrics.rs:38 与 outcomes_autonomy.rs:101 都按 `(workspace_id, account_id)` 双维。
+- 根因（亲验）：reviewer 度量刻意做成 workspace 级（reviewer 的 prompt/model 是 workspace 级），但 AgentDecisionReview 写侧其实带 account_id（models.rs:2635），数据支持按账号切却没切。
+- 验证状态：**PLAUSIBLE**（就绪债）。单 workspace 挂多账号时 reviewer pass_rate/misjudge_rate 会混算；多租户默认关、常见"一 workspace 一账号"部署无实际串数据，且 reviewer 准确率作为 workspace 级属性语义基本成立。故记就绪债非 bug。
+- 修复建议：若未来一 workspace 多账号成常态，stat_id 与过滤加 account_id 维度对齐另两端点；否则维持现状 + 文档写明"reviewer 度量是 workspace 级"。
+
+---
+
+# 批 B 总评（知识链 · 审查收口）
+
+**审查方式**：7 条业务链按优先级组织（链3 grounding 最高 > 链4 修复 > 链2 审核 > 链1/5/7 > 链6），5 个 task 逐链读码 + 每链派 opus subagent 只读复审 + **主控逐条亲验 file:line**（subagent 结论经亲验后入账，无一凭猜采信）。审查阶段只入账不改 src。
+
+### finding 计数（去重后，全部主控亲验）
+- **Critical 0 / High 0**
+- **Medium 5**：
+  - **KB-01**（链3）Lean/Relational 档 LLM 自报 used_knowledge_ids 未清空，可架空 blocked_unverified_product_claim 硬闸（types.rs:973 透传 + gateway.rs:1457 只 Full 档覆盖不清空 + selected_chunks:1155 verified 全量语料，三处坐实；exploit 需 LLM 猜中真实 ObjectId 故 PLAUSIBLE）
+  - **KB-08**（链2）auto_verify 降级出的 needs_human_audit 切片不进任何审核收件箱（verify.rs:270 输入含 needs_review→:426 写 needs_human_audit 从收件箱移除；ask_human_inbox.rs:124 只查 needs_review；前端仅计数无过滤视图）——**本批最有业务价值**，红线字面未破但人审漏斗有洞
+  - **KB-09**（链5）apply_update_chunk 直改主集合内容+状态不写 revision 审计，数组 $set 整体替换非 union 可丢运营 tag（chat.rs:1779）
+  - **KB-10**（链5）crud PUT replace_one 整条替换不写 revision 审计（crud.rs:269；workspace 隔离健全）
+  - **KB-11**（链5）per-chunk locked_fields 后端从不强制，enforce_locked_fields 只传 DEFAULT 常量 8 字段，existing.locked_fields 仅前端禁用无 guard 读（chunk_revisions.rs:234）
+- **Low 4**：KB-02（admin PUT 锚点→verified 绕 /verify，人类路径非 AI 红线）、KB-03（is_verified 大小写口径 latent）、KB-05（propose_pack_repair 死桩路由仍注册）、KB-06（structural_proposals 无 apply 消费方就绪债）、KB-07（gap_signals 在线 dedup 无序 find_one 漏合并）、KB-12（reviewer_stats 缺 account 维度就绪债）、KB-04（worker retag 降级 verified，人工派工触发反向 UX 意外）
+  - 注：KB-02/KB-04 定 Low-Medium 边界，修复优先级归 P3。
+
+### 跨链根因家族（修复统筹）
+1. **知识编辑审计/统一入口家族**（KB-09 + KB-10 + KB-11，链5）：**本批最系统性发现**。apply_chunk_revision 本应是唯一编辑落库入口（留不可变审计 + 数组 union + 锁字段守门），但两条内容编辑路径（会话应用草稿 apply_update_chunk / admin PUT replace_one）**绕过它直改主集合**，且 per-chunk locked_fields 后端从不强制。共性="设计声称统一，实现有旁路"。修复统筹：一个"知识编辑统一接回 apply_chunk_revision + locked_fields 后端强制"专项，把 apply_update_chunk 与 crud PUT 都改走 revision（获审计+union+锁字段），并把 existing.locked_fields 并入 enforce_locked_fields。改动中等、价值高（补审计链 + 兑现字段锁）。
+2. **人审漏斗衔接家族**（KB-08，链2 独立但高价值）：auto_verify 引入第三态 needs_human_audit 却无收件箱消费方。修复=收件箱查询纳入 needs_human_audit。
+3. **grounding 硬闸防架空补全**（KB-01，链3 独立）：一行 clear() 补上自报通道。
+
+### 修复优先级建议（供用户定）
+- **P1**：KB-08（人审漏斗黑洞，收件箱查询加 needs_human_audit，改动小价值高）+ KB-01（grounding 硬闸 else 分支 clear()，一行根治）。
+- **P2**：家族①（KB-09/10/11，知识编辑统一接回 apply_chunk_revision + locked_fields 后端强制）——改动中等，补审计链 + 兑现字段锁；需先与用户确认 locked_fields 设计定位（后端强制 vs 前端提示）。
+- **P3**：Low 批量（KB-02 产品裁决、KB-04 retag 语义裁决、KB-03/KB-05/KB-06/KB-07/KB-12 就绪债/latent/死代码），择机。
+
+### 与批 A 的关联
+- 批 A 最系统性家族=①"审计/旁路事件误用 `?` 吞回复"（错误处理层）；批 B 最系统性家族=①"知识编辑绕过统一 revision 入口 + 字段锁未兑现"（数据写入审计层）。两批共性=**"设计声称的不变量，实现层有旁路/缺口"**——上一轮广度走查（前端点页面 + 抽验）扫不到的"看不见的层"，正是本轮逐行读码 + 主控亲验的价值所在。
+- 批 A 红线（自动回复命脉）与批 B 红线（AI 永不自动 verify / 产品声明须 verified 背书 / AI 永不自证成交）**核心防线均亲验成立**——findings 是"防护不完整/衔接有洞/审计链断"，非"红线被突破"。
+
+### 审查质量说明（防假绿）
+- 每条 finding 的 file:line 均主控当场 Read/Grep 亲验；subagent 4 次复审共产出的候选，经主控亲验后全部坐实入账（KB-01 补验 selected_chunks tier-independent、KB-04 补验人工派工触发链、KB-08 补验前端仅计数无视图、KB-11 补验全仓无 existing.locked_fields 强制点）。
+- 5 条链 red-line 正面结论（grounding 三处协同 / auto-verify 强制降级 / AI 提议不落库 / AI 永不自证成交 / 录入恒 draft）是真读透后的结论，非漏审。
+- 未真跑（同批 A 定调），故无 CONFIRMED 运行时复现；KB-09/KB-10/KB-11 是代码路径 CONFIRMED（静态确凿），其余 PLAUSIBLE。复现留修复阶段写确定性 lib 单测随修复 PR 上 CI。
