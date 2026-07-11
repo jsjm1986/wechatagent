@@ -759,3 +759,50 @@
 
 ### 未能确认的点（供修复阶段核）
 - **customer_stage 前端传值口径**：粗筛 domain_attributes.customer_stage 做精确字符串匹配、无归一/大小写容错（campaigns.rs:44）。后端写的是 taxonomy 校验后 canonical id。若前端 filter.customer_stage 传的也是 canonical id 则一致；若传显示名/大小写不符则**恒筛不到人且静默无报错**。前端传值口径未读 frontend 未确认——建议修复阶段核前端 filter 下发值，或后端加一次 canonical 归一兜底。
+
+## 成交登记环 + 成效聚合环（合并 · 上游入口衔接 + 聚合口径）
+
+审查范围：成交登记 `routes/contacts.rs`(add_deal_event:1407) + `management.rs`(write_deal_events:1917) + `routes/products.rs`；成效聚合 `routes/send_ledger.rs`(overview:115/stats:73) + `agent/send_ledger.rs`(response_rate:151/agg_count)。批 B 链6 已审落库核心（add_outcome_event_inner/approve_suspected_deal/entitlements 闭集），此处审上游入口 + 聚合口径。主控亲验。
+
+### ✅ 亲验通过总览（0 finding · AI 永不自证成交红线在活动链上游同样成立）
+
+1. **✅ AI 永不自证成交（活动链上游核验，最关键）**：`write_deal_events`（management.rs:1917）转调 add_deal_event(contacts.rs:1407)，payload.verification 直传 add_outcome_event_inner——**但这是 management-agent（管理台人类 admin 的控制台助手）工具**，路由挂 `/management-agent/*` 全 AuthenticatedAdmin（mod.rs:831-849），`management_admin(workspace_id)` 包的是**已鉴权 admin 的权限**（=admin 亲自填成交表单，本就是人工确认）。**客户端自治回复 agent（gateway/decision/knowledge_agent）无任何 deal-write 工具**——主控亲验 src/agent/ 下 write_deal_events/add_deal_event/add_outcome_event 仅 2 处注释引用，gateway.rs:4343 明说自治 agent 只写 suspected_deal_signals 待核实队列、"运营 approve 才调 add_outcome_event_inner 落正式成交"。故 AI 无法自证 staff_confirmed，红线在活动链上游同样成立。
+2. **✅ verification 闭集在写侧兜底**：DealEventRequest.verification 注释（contacts.rs:88-91）声明只接受 staff_confirmed/payment_verified、conversation_inferred 传入即 400；实际拦在 add_outcome_event_inner→validate_deal_verification（shared.rs:1410，批 B 已亲验）。即便管理台 admin 手滑传 conversation_inferred 也被拒。
+3. **✅ write_deal_events 风险分级 = Low 可逆写**（management.rs:1137，tool_effect），非只读、非 Irreversible；由管理台 admin 驱动，语义等价 admin 直登。
+4. **✅ 成效聚合 workspace 隔离 + 率计算正确**：send_ledger_overview（:120）/stats（build_stats_match:25）/contact_send_history 均固定 workspace_id 过滤（含单测 stats_match_pins_workspace）；`response_rate(total, responded)`（agent/send_ledger.rs:151）分母=evaluated（**已评估**数，非总发送数——避免未评估的 sent 拉低率）、零守卫 total==0→0.0、分子分母正确（responded/total）。
+5. **✅ agg_count 防静默清零**：send_ledger.rs:17 i64 优先、回落 i32、负值 clamp 0——防 Mongo $sum 类型漂移读成 0。
+
+---
+
+# 批 C 总评（成交活动链 · 审查收口）
+
+**审查方式**：4 业务环（圈人→触达→成交登记→成效聚合），3 task 组织，每环派 opus subagent 只读复审 + **主控逐条亲验 file:line**。审查阶段只入账不改 src。
+
+### finding 计数（去重后，全部主控亲验）
+- **Critical 0 / High 0**
+- **Medium 3**：
+  - **KC-01**（触达）孤儿 send 永久漏推（campaign_sends 占去重位后 tasks insert `?` 失败→有 send 无 task，重发撞 DuplicateKey 跳过永建不出，report 归 pending 假象，无 worker 对账）
+  - **KC-02**（触达）部分失败中断整批、campaign 永久卡 dispatching 无恢复 + dispatch 无 status 前置门可重复推送
+  - **KC-05**（圈人）粗筛对 verification/eventKind 做 Mongo 精确匹配，漏掉缺字段的旧成交事件（serde 默认不作用于 Mongo 查询 + 无回填迁移）→ product 定向活动静默漏老客户
+- **Low 4**：KC-03（taskId 回填失败→task 真发但 report 显 pending 成效虚低）、KC-04（触达规模无上限）、KC-06（targetCount/dispatchedCount 三义命名误导）、KC-07（圈人受众无 limit 就绪债）
+- **整环干净 1**：成交登记+成效聚合环（0 finding——AI 永不自证成交在活动链上游同样成立、聚合口径正确）
+
+### 跨环根因家族（修复统筹）
+1. **触达多步非事务写家族**（KC-01 + KC-02 + KC-03，触达环）：**本批最系统性发现**。dispatch_campaign 的"占去重位→建 task→回填 taskId"三步非原子 + 无 checkpoint + 无 worker 对账，任一步失败留下孤儿 send / 卡 dispatching / report 失真。修复统筹：一个"活动触达可重入 + 孤儿自愈"专项——调换 send/task 写序（task 为可重放源）、dispatching 态可恢复、report 识别孤儿单列桶、补 status 前置门。
+2. **serde 默认 vs Mongo 查询口径分裂**（KC-05，圈人独立）：粗筛 $elemMatch 精确匹配未处理"缺字段=默认值"。修复=查询显式 `$or {$exists:false}` 或迁移回填。
+3. **规模无上限家族**（KC-04 + KC-07）：触达与圈人共用 resolve_segment_contacts 无 limit。修复合并做受众规模保护。
+
+### 修复优先级建议（供用户定）
+- **P1**：家族①（KC-01/02/03，触达多步非事务写）——孤儿漏推是营销触达最不该的后果（客户永久收不到、运营看不到失败），改动中等（调写序 + 可重入 + report 孤儿桶），可写确定性测试复现。
+- **P2**：KC-05（粗筛口径分裂，product 定向漏老客户）——需先确认 117 库是否有缺字段旧成交定影响面；修复=查询 `$or {$exists:false}` 与 serde 默认对齐（低风险）。
+- **P3**：Low 批量（KC-04/KC-07 规模保护、KC-06 命名对齐）+ 未确认项（customer_stage 前端口径核）。
+
+### 与批 A/B 关联
+- 三批最系统性家族各不同层：批 A=错误处理层（审计事件 `?` 吞回复）、批 B=数据写入审计层（知识编辑绕统一入口 + 字段锁未兑现）、批 C=多步非事务写健壮性层（触达三步非原子留孤儿）。**共性="设计声称的不变量/闭环，实现层有旁路/缺口/非原子窗口"**——正是上一轮广度走查（前端点页面 + 抽验）扫不到的"看不见的层"。
+- 三批红线核心防线**均亲验成立**：批 A 自动回复命脉、批 B AI 永不自动 verify/产品声明须 verified 背书、批 C AI 永不自证成交（客户端自治 agent 无 deal-write 工具，只写 suspected_deal_signals，运营 approve 才落 staff_confirmed）。findings 全是"防护不完整/衔接有洞/审计链断/非原子窗口"，**非红线被突破**。
+
+### 审查质量说明（防假绿）
+- 每条 finding 的 file:line 均主控当场 Read/Grep 亲验；3 次 subagent 复审结论经主控亲验后坐实/校准入账（KC-01 补验无 worker 对账 + report 归桶、KC-05 补验 models.rs serde 默认 + 无回填迁移、成交登记环补验自治 agent 无 deal-write 工具）。
+- **严重度校准（反过拟合）**：subagent 曾把 KC-01/KC-02 定 High，主控按跨批一致性校准为 Medium——后果虽重（客户永久漏推）但触发=循环中途 Mongo 瞬时写错误，与批 A/B 的 DB-fault 触发类 finding（B-02/C-01/F-01 均 Med）同级，不因单批 subagent 定 High 破坏跨批校准。
+- 1 条整环 0 finding（成交登记+成效聚合）是真读透后的正面结论，非漏审。
+- 未真跑（同批 A/B 定调），KC-06 CONFIRMED（静态确凿），其余 PLAUSIBLE。复现留修复阶段写确定性测试随修复 PR 上 CI。
