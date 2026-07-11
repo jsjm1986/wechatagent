@@ -146,3 +146,23 @@
 }
 .submit:hover { background: #0a78ec; box-shadow: 0 10px 24px -12px rgba(10, 132, 255, .8), inset 0 1px 1px rgba(255, 255, 255, .35); }
 .submit:disabled { opacity: .5; cursor: not-allowed; box-shadow: inset 0 1px 1px rgba(255, 255, 255, .35); }
+
+/* 顾问微信号：从好友选择按钮 + 已选展示 + 重选 */
+.pickBtn {
+  font: inherit; font-size: 13px; color: var(--ink-2); cursor: pointer; text-align: left;
+  border: 1px dashed var(--hairline); background: var(--fill-inactive);
+  border-radius: var(--r-sm); padding: 10px 12px; height: 40px;
+  display: inline-flex; align-items: center;
+  transition: border-color .18s, background .18s, color .18s;
+}
+.pickBtn:hover { color: var(--ink-1); border-color: rgba(94, 92, 230, .3); background: rgba(94, 92, 230, .03); }
+.pickedRow { display: flex; align-items: center; gap: 10px; min-height: 40px; }
+.pickedWxid { font-size: 13px; color: var(--ink-1); font-family: monospace; letter-spacing: -.1px; }
+.repickBtn {
+  font: inherit; font-size: 12px; font-weight: 600; color: var(--ink-3); cursor: pointer;
+  border: 1px solid var(--hairline); background: var(--surface-card);
+  border-radius: var(--r-sm); padding: 4px 12px;
+  box-shadow: inset 0 1px 1px rgba(255, 255, 255, .9);
+  transition: border-color .18s, background .18s, color .18s;
+}
+.repickBtn:hover { color: var(--ink-1); border-color: rgba(94, 92, 230, .3); background: rgba(94, 92, 230, .03); }
