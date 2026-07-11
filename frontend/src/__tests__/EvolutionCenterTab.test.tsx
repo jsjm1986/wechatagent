@@ -499,17 +499,32 @@ describe("EvolutionCenterTab", () => {
     });
   });
 
-  it("env 允许但 flag 关时显示可点总开关、不加载实验数据", async () => {
+  it("env 允许但 flag 关时仍加载历史实验并显示暂停提示条（F-008）", async () => {
     fetchMock.mockResolvedValueOnce(mockRuntimeFlag({ envEvolutionEnabled: true, enabled: false, rolloutPercent: 0 }));
+    // F-008：flag 关时 load() 不再早返回，仍拉 experiments —— 关闭态只停产新实验，
+    // 历史实验须可见，否则管理员误判"演化从未运行"。返回 1 条历史让提示条命中。
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        items: [makeExperimentItem([makeProposal({ id: "e".repeat(24), status: "released" })])],
+      }),
+    });
     render(<EvolutionCenterTab enabled={true} />);
     await waitFor(() => {
       expect(screen.getByTestId("runtime-flag-panel")).toBeInTheDocument();
     });
-    // flag 关 → load() 早返回，不应发起 experiments 请求（唯一 fetch 是挂载期 runtime-flag GET）。
-    const experimentsCall = fetchMock.mock.calls.find(([url]) =>
-      String(url).includes("/api/evolution/experiments"),
-    );
-    expect(experimentsCall).toBeUndefined();
+    // flag 关 → 仍应发起 experiments 请求（F-008：不再早返回）。
+    await waitFor(() => {
+      const experimentsCall = fetchMock.mock.calls.find(([url]) =>
+        String(url).includes("/api/evolution/experiments"),
+      );
+      expect(experimentsCall).toBeTruthy();
+    });
+    // 有历史实验时显示"已关闭 / 仍保留 N 条历史"暂停提示条。
+    await waitFor(() => {
+      expect(screen.getByTestId("evolution-dormant-notice")).toBeInTheDocument();
+    });
+    expect(screen.getByTestId("evolution-dormant-notice").textContent).toContain("已关闭");
     // 总开关 checkbox 可点（未 disabled）。
     const toggle = screen.getByText("演化中心总开关").closest("label")?.querySelector("input");
     expect(toggle).not.toBeNull();

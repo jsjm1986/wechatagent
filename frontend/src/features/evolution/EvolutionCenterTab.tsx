@@ -263,7 +263,11 @@ export function EvolutionCenterTab({ enabled = true }: { enabled?: boolean }) {
   }
 
   async function load() {
-    if (!enabled || envAllowed === false || !flagEnabled) return;
+    // F-008：仅在 env 明确允许（envAllowed===true）时拉。envAllowed 尚为 null（loadFlag
+    // 未回）或运维硬锁（false）都不拉。workspace 总开关关闭（!flagEnabled）时仍拉
+    // experiments —— 关闭态只是不再产生新实验，历史实验应可见，否则管理员误判"演化从未
+    // 运行"。是否已关由下方提示条与开关状态表达。
+    if (!enabled || envAllowed !== true) return;
     setLoading(true);
     setError("");
     try {
@@ -325,6 +329,12 @@ export function EvolutionCenterTab({ enabled = true }: { enabled?: boolean }) {
 
   return (
     <section className={styles.center} data-testid="evolution-center">
+      {!flagEnabled && items.length > 0 && (
+        <div className={styles.dormantNotice} data-testid="evolution-dormant-notice" role="status">
+          演化中心当前已关闭，后台仍保留 {items.length} 条历史实验记录。关闭期间不再产生新实验；
+          需要继续演化请打开下方总开关。
+        </div>
+      )}
       <header className={styles.aggregate}>
         <AggregateCard label="近 7 天实验" value={aggregate.experiments} testid="agg-experiments" />
         <AggregateCard label="候选总数" value={aggregate.proposals} testid="agg-proposals" />
