@@ -532,3 +532,50 @@
 - 根因（亲验）：auto_verify 输入过滤是 `integrity_status ∈ {needs_review, null}`（verify.rs:270）——它把原本以 needs_review 显示在收件箱的切片，改写成 needs_human_audit 后**从收件箱移除**。分诊动作反而让待审切片从人审界面消失，只剩一个计数。
 - 验证状态：**PLAUSIBLE**（写端 CONFIRMED verify.rs:270 输入含 needs_review + :426 写 needs_human_audit；读端 CONFIRMED ask_human_inbox.rs:124 只查 needs_review + 前端 grep 仅计数无过滤视图；主控亲验后端+前端两侧坐实）。红线字面未破（切片没被自动 verified、也不会被误召回背书——精确 `=="verified"` 已核），但人审漏斗有洞：needs_human_audit 切片无限期停留、无入口晋升 verified（仅能靠 chunk 全量列表浏览看到，故 Medium 非 High）。
 - 修复建议：让审核收件箱查询 `integrity_status ∈ {needs_review, needs_human_audit}`（ask_human_inbox.rs:124 + digest_inbox.rs:431 同步），并给 needs_human_audit 一个"AI 预审通过待人复核"标签/优先级；或前端加 needs_human_audit 专用过滤视图。**这是本批迄今最有业务价值的 finding**——正是上一轮广度走查扫不到的"状态机新增态与消费方脱节"。
+
+## 链1 录入 + 链5 修订 + 链7 catalog（合并 · 结构较稳）
+
+审查范围：链1 `routes/knowledge/import.rs` + `media_assets.rs` + `knowledge_wiki/ingest_worker.rs`；链5 `routes/knowledge/chat.rs`(apply_update_chunk) + `crud.rs` + `knowledge_wiki/chunk_revisions.rs`(apply_chunk_revision) + `page_merge.rs`；链7 `routes/knowledge/catalog.rs`。主控派 opus subagent 复审链5 + 逐条亲验。
+
+### ✅ 亲验通过总览
+
+1. **✅ 链1 录入恒 draft+needs_review**：import 全入口（apply :315-316 / 流式 :362-365 / pdf :824-825 / image :872-880）在 apply_chunk_integrity 之后**无条件压回** draft+needs_review（红线注释在位）；ingest_worker 模块头 :9 自述同红线。**唯一非 /verify 直 verified 旁路是 KB-02**（crud PUT admin 路径，已账）。
+2. **✅ 链7 catalog completeness 缓存 key 维度充分**：缓存 key = `(workspace_id, account_id)`（catalog.rs:114/132/150）——含双维度，account A **不会**看到 account B 的 completeness。Explore 提示的"跨账号串味"风险**证伪**。F-013 TTL 缓存本身挡慢查询已确认。
+3. **✅ apply_chunk_revision 双写次序正确**：先 chunk_revisions.insert_one（:271）后 chunks.replace_one（:277）；before/after hash 用 compute_chunk_hash 剔 volatile 字段；workspace 隔离 find(:158)/replace(:278) 两侧一致；AI source 强制 draft+needs_review；末次 enforce_locked_fields（:234）。
+4. **✅ page_merge 三层函数逻辑正确**：apply_field_patch 前置 reject 锁定字段（:190）、union_array_fields existing∪incoming 保序去重（:94）、is_body_truncated 70% 阈值 existing=0 短路、enforce_locked_fields 强制覆盖回 existing（:140）。
+5. **✅ crud delete 无越权**：document delete / 级联 delete_many / chunk delete_one 三处 filter 均带 workspace_id，隔离健全无 IDOR。
+6. **✅ crud PUT 未建模字段回填**：preserve_unmodeled_chunk_fields（mod.rs:532-551）正确回填 provenance/wiki_type/locked_fields/created_at（有守卫测试 chunk_put_preserves_unmodeled_fields）。
+
+### [KB-09] apply_update_chunk（AI 会话应用草稿）直改主集合内容+状态，不写 chunk_revisions 审计，且数组字段整体替换非并集（旁路 apply_chunk_revision）
+
+- 入口频道：知识对话「应用草稿」→ update_chunk 分支（chat.rs:465）
+- 链路环节：⑤修订
+- 类型：审计链断 + 旁路统一编辑入口
+- 严重度：**Medium**
+- 现象：`apply_update_chunk`（chat.rs:1711-1790）把 title/summary/routing_card/applicable_scenes/source_quote 等内容字段 + status=draft/integrity=needs_review 直接 `$set` update_one 写库（:1779-1790），**全函数无任何 chunk_revisions 写入**（对比 auto_verify 已明确接回 apply_chunk_revision）。
+- 根因（亲验）：该路径独立实现 $set patch，未接回 apply_chunk_revision。
+- 后果：(1) 无 before/after hash、无 revision 行 → 审计链断（无法回滚/追溯）；(2) applicable_scenes/product_tags/business_topics 是 `$set` **整体替换**而非 union_array_fields 并集 → 运营既有 tag 可能被 AI 补丁悄悄丢弃（apply_chunk_revision 会 union，这里不会）；(3) 不读 locked_fields（见 KB-11）。**注：status 被强制 draft+needs_review，未破"AI 永不自动 verify"红线**；workspace 隔离在位。
+- 验证状态：**CONFIRMED**（主控亲验 chat.rs:1779-1790 update_one + 全函数无 revision 调用坐实）。
+- 修复建议：apply_update_chunk 落库改构造 `RevisionRequest{op:Patch}` 调 apply_chunk_revision，天然获审计行+截断守卫+数组 union+锁字段守门。
+
+### [KB-10] crud.rs admin PUT 用 replace_one 整条替换主集合，不写 chunk_revisions 审计
+
+- 入口频道：knowledgeWiki 频道 chunk 编辑（PUT /api/knowledge/chunks/:id）
+- 链路环节：⑤修订
+- 类型：审计链断
+- 严重度：**Medium**
+- 现象：`update_operation_knowledge_chunk`（crud.rs:212-279）用 replace_one 整条替换 chunk（:269-277），**无 chunk_revisions 写入**。整条 replace 覆盖 title/summary/body 等内容却不留 revision 审计。
+- 根因（亲验）：admin 直编端点独立实现，未接回 apply_chunk_revision。
+- 后果：审计链断（违"所有主集合内容编辑留不可变审计"）。**workspace 隔离健全**（filter 带 workspace_id find :256 + replace :271 一致，无 IDOR）；preserve_unmodeled_chunk_fields 正确回填元字段。唯一缺口=审计行缺失 + locked_fields 不强制（KB-11）。此路径也是 KB-02（锚点→verified）的同一 replace_one。
+- 验证状态：**CONFIRMED**（主控亲验 crud.rs:266-277 replace_one + 全函数无 revision 坐实）。
+- 修复建议：PUT 落库改走 apply_chunk_revision（op=Patch, source=Human），或至少 replace_one 前后补写一条 chunk_revisions 记 before/after hash。
+
+### [KB-11] 运营 per-chunk locked_fields 后端从不强制，仅前端禁用 + 静态 DEFAULT 8 字段受保护（字段锁形同虚设于后端）
+
+- 链路环节：⑤修订（字段锁保护）
+- 类型：设计红线未兑现（后端无强制）
+- 严重度：**Medium**（是否算缺陷取决于 locked_fields 设计定位）
+- 现象：设计要求 apply_chunk_revision "尊重 chunk 的 locked_fields（运营锁定字段不被覆盖）"。实际 `enforce_locked_fields(&merged, &existing, DEFAULT_LOCKED_FIELDS)`（chunk_revisions.rs:234）传的是**编译期常量** DEFAULT_LOCKED_FIELDS（page_merge.rs:35-44，仅 8 个身份/时间戳字段 chunk_id/wiki_type/chunk_type/created_at/source_anchor/verified_at/verified_by/approved_at）；对 `existing.locked_fields`（运营在单条 chunk 上标注的字段锁，models.rs:1538）**无任何读取/强制点**。
+- 根因（亲验）：全仓 grep locked_fields 非测试消费点——只有 model 定义、preserve_unmodeled_chunk_fields 载体回填（mod.rs:546）、前端序列化（mod.rs:307）、wiki_edit 拒收入参（:39）、domain_schemas 黑名单——**无任何 guard 读 existing.locked_fields 去强制**。运营把 title/body 加进 locked_fields 后，apply_chunk_revision 的 patch 改 title/body 照样通过（DEFAULT 集不含它们），crud PUT replace_one 更直接覆盖。字段锁当前只在前端编辑表单禁用输入（设计文档 knowledge-trust-cockpit-frontend-design.md:71），后端无兜底。
+- 验证状态：**CONFIRMED**（主控亲验 chunk_revisions.rs:234 传常量 + 全仓无 existing.locked_fields 强制点坐实）。
+- 修复建议：需用户裁决 locked_fields 是"后端强制"还是"纯前端提示"——若前者（按设计描述应是），apply_chunk_revision 里把 existing.locked_fields 与 DEFAULT_LOCKED_FIELDS 合并后再 apply_field_patch + enforce_locked_fields；PUT 路径同理回填 existing 锁定字段值。KB-09/KB-10/KB-11 构成"统一编辑入口未真统一 + 字段锁未兑现"同一根因家族。
