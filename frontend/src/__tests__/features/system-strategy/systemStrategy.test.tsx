@@ -565,4 +565,27 @@ describe("TaxonomyCandidatesAdmin 分页", () => {
     fireEvent.change(screen.getByTestId("bulk-reject-reason"), { target: { value: "重复" } });
     expect(screen.getByTestId("bulk-reject-btn")).not.toBeDisabled();
   });
+
+  it("非 pending 视图（已采纳）不渲染复选框与批量驳回入口", async () => {
+    vi.spyOn(api, "get").mockImplementation((url: string) => {
+      if (url.includes("/api/admin/taxonomy-candidates")) {
+        // 返回 1 条 approved 候选（无论 status filter，简化 mock）
+        const items = makeCandidates(1).map((c) => ({ ...c, status: "approved" }));
+        return Promise.resolve({ items } as never);
+      }
+      return Promise.resolve({ items: [] } as never);
+    });
+
+    render(<SystemStrategyFeature />);
+    selectTab("标签与状态");
+    await waitFor(() => expect(screen.getByRole("heading", { name: "候选词0" })).toBeInTheDocument());
+
+    // 切到「已采纳」status filter
+    fireEvent.click(screen.getByRole("button", { name: "已采纳" }));
+
+    await waitFor(() => {
+      expect(screen.queryByTestId("bulk-reject-bar")).toBeNull();
+    });
+    expect(screen.queryByTestId("candidate-check-cand0")).toBeNull();
+  });
 });
