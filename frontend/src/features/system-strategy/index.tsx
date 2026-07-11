@@ -8,7 +8,7 @@ import type { AgentSoul, PromptTemplate, PromptTemplateDraft, DomainProfile, Dom
 import { ProfilePublishCard } from "../../components/review/ProfilePublishCard";
 import { LessonPromoteCard } from "../../components/review/LessonPromoteCard";
 import { TaxonomyCandidateReviewCard, TAXONOMY_KIND_LABELS } from "../../components/review/TaxonomyCandidateReviewCard";
-import { ConfirmProvider } from "../../components/ui/ConfirmDialog";
+import { ConfirmProvider, useConfirm } from "../../components/ui/ConfirmDialog";
 import { usePromptSaveConfirm, usePromptPublishConfirm } from "../../components/prompt/usePromptSaveConfirm";
 import { ToastProvider } from "../../components/ui/Toast";
 import { VERSION_STATUS_LABELS, seededByLabel, promptLayerLabel, labelOf } from "../../lib/reviewLabels";
@@ -1035,6 +1035,11 @@ function TaxonomyCandidatesAdmin({ busy }: { busy: boolean }) {
   const [statusFilter, setStatusFilter] = useState<CandidateStatusFilter>("pending");
   const [kindFilter, setKindFilter] = useState<string>("");
   const { pageRows, pageCount, safePage, setPage } = usePagedList(items);
+  const confirm = useConfirm();
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [bulkReason, setBulkReason] = useState("");
+  const [bulkBusy, setBulkBusy] = useState(false);
+  const [bulkResult, setBulkResult] = useState("");
 
   async function reload() {
     setLoading(true);
@@ -1052,9 +1057,50 @@ function TaxonomyCandidatesAdmin({ busy }: { busy: boolean }) {
   }
 
   useEffect(() => {
+    setSelectedIds(new Set());
+    setBulkResult("");
     void reload();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [statusFilter, kindFilter]);
+
+  function toggleSelect(id: string) {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  async function runBulkReject() {
+    const reason = bulkReason.trim();
+    if (selectedIds.size === 0 || !reason) return;
+    const ids = Array.from(selectedIds);
+    const ok = await confirm({
+      title: "批量驳回候选",
+      body: `将驳回选中的 ${ids.length} 条候选，操作不可撤销。`,
+      confirmText: "确认驳回",
+      tone: "danger",
+    });
+    if (!ok) return;
+    setBulkBusy(true);
+    setBulkResult("");
+    let done = 0;
+    let failed = 0;
+    for (const id of ids) {
+      try {
+        await api.post(`/api/admin/taxonomy-candidates/${id}/reject`, { reason });
+        done += 1;
+      } catch {
+        failed += 1;
+      }
+    }
+    setBulkBusy(false);
+    setBulkResult(failed === 0 ? `已驳回 ${done} 条候选。` : `已驳回 ${done} 条，${failed} 条失败。`);
+    setBulkReason("");
+    setSelectedIds(new Set());
+    void reload();
+  }
 
   return (
     <section className={styles.panel}>
@@ -1095,17 +1141,50 @@ function TaxonomyCandidatesAdmin({ busy }: { busy: boolean }) {
       <p className={styles.panelHint}>
         AI 在对话中遇到字典外的新词会落为候选；采纳后并入标签字典，今后 AI 可稳定使用；驳回则不进字典。
       </p>
+      {statusFilter === "pending" && (
+        <div className={styles.bulkBar} data-testid="bulk-reject-bar">
+          <span className={styles.panelHint}>已选 {selectedIds.size} 条</span>
+          <input
+            className={styles.input}
+            data-testid="bulk-reject-reason"
+            placeholder="批量驳回原因（如：无业务相关性 / 与现有条目重复）"
+            value={bulkReason}
+            onChange={(e) => setBulkReason(e.target.value)}
+            disabled={bulkBusy}
+          />
+          <button
+            type="button"
+            className={styles.btnGhost}
+            data-testid="bulk-reject-btn"
+            onClick={() => void runBulkReject()}
+            disabled={bulkBusy || selectedIds.size === 0 || !bulkReason.trim()}
+          >
+            {bulkBusy ? "驳回中" : "批量驳回"}
+          </button>
+          {bulkResult && <span className={styles.panelHint}>{bulkResult}</span>}
+        </div>
+      )}
       {error && <div className={styles.inlineError}>{error}</div>}
       {!loading && items.length === 0 && <Empty text="暂无候选" />}
       <div className={styles.versionedList}>
         {pageRows.map((item) => (
           <div key={item.id} className={styles.versionedListItem}>
             <div className={styles.versionedListHead}>
-              <div>
-                <span className={styles.versionedListScope}>
-                  账号 {item.scope} · {labelOf(TAXONOMY_KIND_LABELS, item.kind)}
-                </span>
-                <h3>{item.rawValue}</h3>
+              <div style={{ display: "flex", alignItems: "flex-start", gap: 10 }}>
+                {statusFilter === "pending" && (
+                  <input
+                    type="checkbox"
+                    data-testid={`candidate-check-${item.id}`}
+                    checked={selectedIds.has(item.id)}
+                    onChange={() => toggleSelect(item.id)}
+                  />
+                )}
+                <div>
+                  <span className={styles.versionedListScope}>
+                    账号 {item.scope} · {labelOf(TAXONOMY_KIND_LABELS, item.kind)}
+                  </span>
+                  <h3>{item.rawValue}</h3>
+                </div>
               </div>
               <span className={candidateStatusBadgeClass(item.status)}>{CANDIDATE_STATUS_LABEL[item.status as CandidateStatusFilter] ?? item.status}</span>
             </div>
@@ -1148,7 +1227,14 @@ function TaxonomyCandidatesAdmin({ busy }: { busy: boolean }) {
           </div>
         ))}
       </div>
-      <Pager pageCount={pageCount} safePage={safePage} setPage={setPage} />
+      <Pager
+        pageCount={pageCount}
+        safePage={safePage}
+        setPage={(p) => {
+          setSelectedIds(new Set());
+          setPage(p);
+        }}
+      />
     </section>
   );
 }

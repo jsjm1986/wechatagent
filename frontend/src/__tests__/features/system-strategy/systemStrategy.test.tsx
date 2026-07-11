@@ -506,4 +506,63 @@ describe("TaxonomyCandidatesAdmin 分页", () => {
       ).toBe(true),
     );
   });
+
+  it("批量驳回：勾选 2 条 pending + 填原因 + 确认 → 发 2 次 reject 请求", async () => {
+    vi.spyOn(api, "get").mockImplementation((url: string) =>
+      Promise.resolve(
+        (url.includes("/api/admin/taxonomy-candidates") ? { items: makeCandidates(3) } : { items: [] }) as never,
+      ),
+    );
+    const postSpy = vi.spyOn(api, "post").mockResolvedValue({} as never);
+
+    render(<SystemStrategyFeature />);
+    selectTab("标签与状态");
+    await waitFor(() => expect(screen.getByRole("heading", { name: "候选词0" })).toBeInTheDocument());
+
+    // 勾选 cand0、cand1
+    fireEvent.click(screen.getByTestId("candidate-check-cand0"));
+    fireEvent.click(screen.getByTestId("candidate-check-cand1"));
+
+    // 填驳回原因
+    fireEvent.change(screen.getByTestId("bulk-reject-reason"), { target: { value: "无业务相关性" } });
+
+    // 点批量驳回 → 弹确认窗
+    fireEvent.click(screen.getByTestId("bulk-reject-btn"));
+
+    // 确认弹窗（useConfirm 渲染 confirmText="确认驳回"）
+    fireEvent.click(await screen.findByText("确认驳回"));
+
+    // 发出 2 次 reject POST，带 reason
+    await waitFor(() => expect(postSpy).toHaveBeenCalledTimes(2));
+    expect(postSpy).toHaveBeenCalledWith(
+      "/api/admin/taxonomy-candidates/cand0/reject",
+      { reason: "无业务相关性" },
+    );
+    expect(postSpy).toHaveBeenCalledWith(
+      "/api/admin/taxonomy-candidates/cand1/reject",
+      { reason: "无业务相关性" },
+    );
+  });
+
+  it("批量驳回按钮：未勾选或未填原因时 disabled", async () => {
+    vi.spyOn(api, "get").mockImplementation((url: string) =>
+      Promise.resolve(
+        (url.includes("/api/admin/taxonomy-candidates") ? { items: makeCandidates(3) } : { items: [] }) as never,
+      ),
+    );
+    render(<SystemStrategyFeature />);
+    selectTab("标签与状态");
+    await waitFor(() => expect(screen.getByRole("heading", { name: "候选词0" })).toBeInTheDocument());
+
+    // 未勾选 → disabled
+    expect(screen.getByTestId("bulk-reject-btn")).toBeDisabled();
+
+    // 勾一条但没填原因 → 仍 disabled
+    fireEvent.click(screen.getByTestId("candidate-check-cand0"));
+    expect(screen.getByTestId("bulk-reject-btn")).toBeDisabled();
+
+    // 填原因 → enabled
+    fireEvent.change(screen.getByTestId("bulk-reject-reason"), { target: { value: "重复" } });
+    expect(screen.getByTestId("bulk-reject-btn")).not.toBeDisabled();
+  });
 });
