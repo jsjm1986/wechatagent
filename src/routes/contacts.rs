@@ -113,6 +113,28 @@ pub(crate) fn truncate_preview(text: &str, max_chars: usize) -> String {
     format!("{head}…")
 }
 
+/// 按入站消息类型出运营池预览。text/None（含旧库无类型消息）走原文截断；
+/// 其它类型出固定中文标签，**绝不读 content**——appmsg/sysmsg 的 content 本身就是
+/// XML 串（`<msg><appmsg.../<sysmsg type=...>`），截断后是 XML 垃圾。
+/// 纯静态映射，非 LLM 摘要——normal 联系人不调 LLM（产品红线）。
+/// 类型字符串来源：webhooks::classify_inbound_msg_type。
+pub(crate) fn preview_label_for_type(msg_type: Option<&str>, content: &str) -> String {
+    match msg_type {
+        None | Some("text") => truncate_preview(content, INBOUND_PREVIEW_MAX_CHARS),
+        Some("image") => "[图片]".to_string(),
+        Some("voice") => "[语音]".to_string(),
+        Some("video") => "[视频]".to_string(),
+        Some("namecard") => "[名片]".to_string(),
+        Some("emoji") => "[表情]".to_string(),
+        Some("location") => "[位置]".to_string(),
+        Some("appmsg") => "[链接]".to_string(),
+        Some("voip") => "[通话]".to_string(),
+        Some("statussync") => String::new(),
+        Some("system") => "[系统消息]".to_string(),
+        Some(_) => "[消息]".to_string(),
+    }
+}
+
 pub(super) async fn list_contacts(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
@@ -209,8 +231,10 @@ pub(super) async fn list_contacts(
             )
             .await
         {
-            api.last_inbound_preview =
-                Some(truncate_preview(&msg.content, INBOUND_PREVIEW_MAX_CHARS));
+            api.last_inbound_preview = Some(preview_label_for_type(
+                msg.msg_type.as_deref(),
+                &msg.content,
+            ));
         }
         items.push(api);
     }
@@ -1588,6 +1612,35 @@ mod tests {
         let out = truncate_preview(&long, 30);
         assert_eq!(out.chars().count(), 31); // 30 + 省略号
         assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn preview_label_text_truncates_content() {
+        // text / None 走原文截断（现有语义）
+        assert_eq!(preview_label_for_type(Some("text"), "你好呀"), "你好呀");
+        assert_eq!(preview_label_for_type(None, "旧消息无类型"), "旧消息无类型");
+        let long: String = "字".repeat(40);
+        let out = preview_label_for_type(Some("text"), &long);
+        assert!(out.ends_with('…'));
+        assert_eq!(out.chars().count(), INBOUND_PREVIEW_MAX_CHARS + 1); // 30 + 省略号
+    }
+
+    #[test]
+    fn preview_label_non_text_uses_static_label_not_content() {
+        // 非 text 类型绝不读 content（content 可能是 XML 垃圾）
+        let xml = "<msg><appmsg appid=\"\" sdk...";
+        assert_eq!(preview_label_for_type(Some("appmsg"), xml), "[链接]");
+        assert_eq!(preview_label_for_type(Some("system"), "<sysmsg type=\"functionmsg\">"), "[系统消息]");
+        assert_eq!(preview_label_for_type(Some("image"), "irrelevant"), "[图片]");
+        assert_eq!(preview_label_for_type(Some("voice"), ""), "[语音]");
+        assert_eq!(preview_label_for_type(Some("video"), ""), "[视频]");
+        assert_eq!(preview_label_for_type(Some("namecard"), ""), "[名片]");
+        assert_eq!(preview_label_for_type(Some("emoji"), ""), "[表情]");
+        assert_eq!(preview_label_for_type(Some("location"), ""), "[位置]");
+        assert_eq!(preview_label_for_type(Some("voip"), ""), "[通话]");
+        assert_eq!(preview_label_for_type(Some("statussync"), ""), ""); // 状态同步无展示意义
+        assert_eq!(preview_label_for_type(Some("unknown"), ""), "[消息]");
+        assert_eq!(preview_label_for_type(Some("某新类型"), ""), "[消息]"); // 兜底
     }
 
     #[test]
