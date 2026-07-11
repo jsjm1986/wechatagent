@@ -43,14 +43,17 @@ pub struct OperationProfileRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct OperatingMemoryRequest {
+    // F-019：4 组各为 Option —— 缺组（None）时 PUT 不动该组，仅更新请求显式带上的组。
+    // 前端 saveOperatingMemory 恒全量提交 4 组（userOpsStore.ts），行为不变；API 直调
+    // 只传一组时不再把其余三组 $set 成空 Document 而清空（merge 而非整体覆盖）。
     #[serde(default)]
-    user_understanding: Document,
+    user_understanding: Option<Document>,
     #[serde(default)]
-    relationship_state: Document,
+    relationship_state: Option<Document>,
     #[serde(default)]
-    product_fit: Document,
+    product_fit: Option<Document>,
     #[serde(default)]
-    next_action: Document,
+    next_action: Option<Document>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1523,6 +1526,8 @@ pub(super) async fn update_operating_memory(
 ) -> AppResult<Json<Value>> {
     let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
     ensure_operating_memory(&state, &contact).await?;
+    // F-019：只 $set 请求显式带上的组（None 的组保持不动），避免缺组被清空。
+    let set_doc = build_operating_memory_set_doc(payload, DateTime::now());
     state
         .db
         .operating_memories()
@@ -1532,20 +1537,32 @@ pub(super) async fn update_operating_memory(
                 "account_id": &contact.account_id,
                 "contact_wxid": &contact.wxid
             },
-            doc! {
-                "$set": {
-                    "user_understanding": payload.user_understanding,
-                    "relationship_state": payload.relationship_state,
-                    "product_fit": payload.product_fit,
-                    "next_action": payload.next_action,
-                    "updated_at": DateTime::now()
-                }
-            },
+            doc! { "$set": set_doc },
             None,
         )
         .await?;
     let memory = ensure_operating_memory(&state, &contact).await?;
     Ok(Json(json!({ "item": operating_memory_json(memory) })))
+}
+
+/// F-019：从 PUT 请求体构建 operating_memory 的 `$set` 文档 —— 只含请求显式
+/// 带上的组（`Some`），缺组（`None`）不进 `$set` 故保持库中原值不被清空。
+/// `updated_at` 恒写。抽为纯函数以便单测锁住「缺组不覆盖」语义。
+fn build_operating_memory_set_doc(payload: OperatingMemoryRequest, now: DateTime) -> Document {
+    let mut set_doc = doc! { "updated_at": now };
+    if let Some(v) = payload.user_understanding {
+        set_doc.insert("user_understanding", v);
+    }
+    if let Some(v) = payload.relationship_state {
+        set_doc.insert("relationship_state", v);
+    }
+    if let Some(v) = payload.product_fit {
+        set_doc.insert("product_fit", v);
+    }
+    if let Some(v) = payload.next_action {
+        set_doc.insert("next_action", v);
+    }
+    set_doc
 }
 
 pub(super) async fn get_contact_memory_card(
@@ -1677,6 +1694,42 @@ mod tests {
         assert_eq!(preview_label_for_type(Some("statussync"), ""), ""); // 状态同步无展示意义
         assert_eq!(preview_label_for_type(Some("unknown"), ""), "[消息]");
         assert_eq!(preview_label_for_type(Some("某新类型"), ""), "[消息]"); // 兜底
+    }
+
+    #[test]
+    fn operating_memory_set_doc_full_submit_sets_all_groups() {
+        // 前端全量提交 4 组（都 Some）→ 4 组全进 $set + updated_at。
+        let payload = OperatingMemoryRequest {
+            user_understanding: Some(doc! { "a": 1 }),
+            relationship_state: Some(doc! { "b": 2 }),
+            product_fit: Some(doc! { "c": 3 }),
+            next_action: Some(doc! { "d": 4 }),
+        };
+        let set_doc = build_operating_memory_set_doc(payload, DateTime::now());
+        assert!(set_doc.get("user_understanding").is_some());
+        assert!(set_doc.get("relationship_state").is_some());
+        assert!(set_doc.get("product_fit").is_some());
+        assert!(set_doc.get("next_action").is_some());
+        assert!(set_doc.get("updated_at").is_some());
+    }
+
+    #[test]
+    fn operating_memory_set_doc_partial_submit_leaves_others_untouched() {
+        // F-019：API 直调只传 relationship_state（其余 None）→ $set 只含该组 +
+        // updated_at，缺组不进 $set 故库中原值不被清空（回归缺陷根因）。
+        let payload = OperatingMemoryRequest {
+            user_understanding: None,
+            relationship_state: Some(doc! { "stage": "warming" }),
+            product_fit: None,
+            next_action: None,
+        };
+        let set_doc = build_operating_memory_set_doc(payload, DateTime::now());
+        assert!(set_doc.get("relationship_state").is_some());
+        assert!(set_doc.get("updated_at").is_some());
+        // 缺失的三组绝不出现在 $set 中（否则会覆盖清空）。
+        assert!(set_doc.get("user_understanding").is_none());
+        assert!(set_doc.get("product_fit").is_none());
+        assert!(set_doc.get("next_action").is_none());
     }
 
     #[test]
