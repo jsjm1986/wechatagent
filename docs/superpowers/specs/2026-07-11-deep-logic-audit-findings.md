@@ -180,7 +180,27 @@
 
 ## 环节③ gateway 巨型闸函数（managed / cooldown / min-interval / 日上限 / 过期闸）
 
-_（待审）_
+审查文件：`src/agent/gateway.rs`——`run_user_operation_gateway`:616 → `run_user_operation_gateway_inner`:999（~1294 行、无单测）+ `precheck_send_gateway`:3121 + C2 派生块 :4144-4526。subagent 逐行走查 + 1 opus 复核，主控亲验 C-01 铁证（:4503 `.await?` vs :3988 `let _` 对称孪生不对称）。**本环节是验证重心，findings 少但每条读透。**
+
+### ✅ 亲验通过总览（三大验证点）
+- **闸序 + 临界值全对**（`precheck_send_gateway` :3127-3236）：顺序 = not_managed → (relay 豁免以下) cooldown → operation_policy → rate_limited/min-interval → daily_limit → expired → quiet_hours → context_changed。逐一核比较符临界：cooldown `until>now`（到点放行）、min-interval `elapsed<interval`（`<` 非 `<=`，刚到点即可发）、daily `>=max`（达上限即拦，仅约束 FollowUp，Inbound 豁免 :3477）、**expired 刻意排在 quiet_hours 之前**（:3167 注释：确保过期死任务作废而非被重排次日发）。not_managed 对 relay 不豁免（退运营不转述）正确。✅ 无该拦没拦/该放没放。
+- **operation_state 派生一致 + fail-soft**（:4144-4182）：唯一写点，`synced_state`=归一后 customer_stage，缺失回落 decision.operation_state（与 CLAUDE.md 逐字一致）；非法转移只记 rejected、不写、保留旧值（:4177-4180）；rejected/transitioned 事件 if/else 互斥。✅（唯 C-01 的 `?` 缺陷）
+- **RunBudget 降级四处全兜住**：知识路由（:1132 mark_degraded+empty_route 不 Err）、review（:1466 local_decision_review 兜底）、rewrite（:1527 跳过）、revision（:1748 Skip→Held）。全仓 grep 确认 `AppError::BudgetExceeded` 主链路**从不构造**（budget.rs 返 BudgetError 非 AppError），不泄 5xx 给 webhook。降级三分支无漏兜致 no_reply。✅
+
+### [C-01] operation_state 非法迁移的 rejected 审计事件用 `?` 阻断未入队回复（违 fail-soft 红线）
+- 入口频道: webhook Inbound（主要受害）/ follow-up（有 worker 重试兜底）
+- 链路环节: ③ gateway（apply_agent_updates 内 C2 派生块）
+- 类型: 错误处理 / 红线（fail-soft 语义）
+- 严重度: Medium（主控裁定：subagent 初判 Low-Med；升 Med 因双重铁证违红线 + Inbound 真丢一轮回复；触发前提 DB 瞬时故障压住上限）
+- 现象/风险: CLAUDE.md + 代码自身注释（:4486「reply 已照常下发」、:4166 fail-soft）要求非法 state 迁移只跳过写 + 发审计事件、**绝不阻断已发/将发回复**。但 :4489-4503 rejected 事件写用 `.await?`（`gateway.rs:4503` 主控亲验），`write_event_for_account` 的 Mongo insert 失败即 return Err，沿 apply_agent_updates(:2356 `?`)→inner→gateway 冒泡。此时回复**尚未入 outbox**（enqueue 在 :2543 更后）→ 本轮回复丢。webhook Inbound Err 只写 agent_error、**不重发**（webhooks.rs:205-219）→ 该轮回复彻底丢；follow-up 被 worker Err 重试（tasks.rs:254-307）影响较小。
+- 根因（亲验 file:line）: `gateway.rs:4503` rejected 事件 `.await?`。**铁证对比**：同函数孪生事件 `:3988 stage_transition_rejected` 用 `let _ = ...await`（fail-soft），且 `:3987` 注释明写「审计写失败不阻断主流程，与 dimension_dropped 同风格」、`:3966` 注释明写「与 operation_state_transition_rejected **对称**……校验/审计失败均不阻断」——它声称对称的孪生反而用了 `?`。:3942 `dimension_dropped` 亦 `let _`。
+- 复现设想: rejected 分支命中（LLM 给非法 state 跳转）+ 该次 `write_event_for_account` Mongo insert 恰好失败。难在 117 稳定复现（依赖 DB 瞬时故障注入），标 PLAUSIBLE，非"可 117 复现"候选。
+- 验证状态: PLAUSIBLE（主控亲验代码路径 + 对称铁证成立；唯"DB insert 会失败"触发前提无法正常环境构造，保守不标 CONFIRMED）
+- 修复建议: :4503 改 `let _ = ...await;`（或 `.ok()`），与同函数 `stage_transition_rejected`/`dimension_dropped` fail-soft 纪律对齐。**连带评估**：:4525 `operation_state_transitioned`（成功迁移审计，同 `?`）同属"回复已定纯观测事件"，审计写失败同样会连带丢回复，是否一并改需产品裁决（不带拒绝迁移红线注释）。
+- 状态: Open
+
+### 主控确认排除的假 finding（留痕防漏报/误报）
+- **[排除] follow-up 提前标 `outbox_enqueued` 致 DB 故障窗口静默丢消息**：inner :2337 确在 enqueue(:2543) 前置 task `outbox_enqueued`，中间一串 `?` 若 Err 会在 enqueue 前 return。但 `tasks.rs:254-307` worker Err 分支用 `doc!{"_id":task_id}`（无 status CAS）**无条件**重写 task 为 retry/failed，覆盖提前写的 outbox_enqueued → 会重试非静默丢。不成立。（连带观察：该 Err 分支无 status CAS 是隐性耦合就绪债，当前恰好兜住，非当前 bug。）
 
 ## 环节④ 决策 + 渐进式知识路由（decision.rs / knowledge_router.rs）
 
