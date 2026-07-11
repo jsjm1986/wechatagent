@@ -46,5 +46,9 @@ describe("ReferralCards 顾问选择器", () => {
       expect(useReferralCardStore.getState().cardDraft.targetWxid).toBe("wxid_adv");
       expect(useReferralCardStore.getState().cardDraft.displayName).toBe("王顾问");
     });
+    // 已选态显示 头像位/名字 + wxid + 重选(名字在 picked-row 的 name span,input 的 value 不算文本节点故只命中一处)
+    expect(screen.getByText("王顾问")).toBeInTheDocument();
+    expect(screen.getByText("wxid_adv")).toBeInTheDocument();
+    expect(screen.getByText(/重选/)).toBeInTheDocument();
   });
 });

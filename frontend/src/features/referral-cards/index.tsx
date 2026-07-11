@@ -56,6 +56,9 @@ export default function ReferralCardsFeature() {
     setPickerOpen(false);
   };
 
+  const pickedFriend = rosterItems.find((r) => r.wxid === cardDraft.targetWxid);
+  const pickedName = cardDraft.displayName.trim() || pickedFriend?.remark || pickedFriend?.nickname || "";
+
   const handleCreate = async (event: FormEvent) => {
     event.preventDefault();
     await createCard(currentAccountId);
@@ -134,7 +137,15 @@ export default function ReferralCardsFeature() {
               <span className={styles.fieldLabel}>顾问微信号</span>
               {cardDraft.targetWxid ? (
                 <div className={styles.pickedRow}>
-                  <span className={styles.pickedWxid}>{cardDraft.targetWxid}</span>
+                  {pickedFriend?.avatarUrl ? (
+                    <img className={styles.pickedAvatar} src={pickedFriend.avatarUrl} alt="" loading="lazy" />
+                  ) : (
+                    <span className={styles.pickedAvatarFallback}>{(pickedName || cardDraft.targetWxid).trim().charAt(0).toUpperCase()}</span>
+                  )}
+                  <span className={styles.pickedInfo}>
+                    {pickedName && <span className={styles.pickedName}>{pickedName}</span>}
+                    <span className={styles.pickedWxid}>{cardDraft.targetWxid}</span>
+                  </span>
                   <button type="button" className={styles.repickBtn} onClick={() => setPickerOpen(true)}>重选</button>
                 </div>
               ) : (
