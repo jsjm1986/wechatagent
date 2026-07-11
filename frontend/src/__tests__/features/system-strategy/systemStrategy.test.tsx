@@ -474,4 +474,36 @@ describe("TaxonomyCandidatesAdmin 分页", () => {
     expect(screen.queryByText("下一页")).toBeNull();
     expect(screen.queryByText("上一页")).toBeNull();
   });
+
+  it("选择 kind 下拉后重新请求候选列表并带上 kind= 参数", async () => {
+    const getSpy = vi.spyOn(api, "get").mockImplementation((url: string) =>
+      Promise.resolve(
+        (url.includes("/api/admin/taxonomy-candidates") ? { items: makeCandidates(3) } : { items: [] }) as never,
+      ),
+    );
+
+    render(<SystemStrategyFeature />);
+    selectTab("标签与状态");
+
+    // 初次挂载：只带 status=pending，不带 kind=
+    await waitFor(() => expect(screen.getByRole("heading", { name: "候选词0" })).toBeInTheDocument());
+    expect(
+      getSpy.mock.calls.some(
+        ([u]) => typeof u === "string" && u.includes("/api/admin/taxonomy-candidates") && !u.includes("kind="),
+      ),
+    ).toBe(true);
+
+    // 选 kind = objection_type（异议类型）
+    const kindSelect = screen.getByTestId("candidate-kind-filter") as HTMLSelectElement;
+    fireEvent.change(kindSelect, { target: { value: "objection_type" } });
+
+    // 重新请求带上 kind=objection_type
+    await waitFor(() =>
+      expect(
+        getSpy.mock.calls.some(
+          ([u]) => typeof u === "string" && u.includes("/api/admin/taxonomy-candidates") && u.includes("kind=objection_type"),
+        ),
+      ).toBe(true),
+    );
+  });
 });

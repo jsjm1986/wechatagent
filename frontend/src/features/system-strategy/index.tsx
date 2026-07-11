@@ -1033,15 +1033,16 @@ function TaxonomyCandidatesAdmin({ busy }: { busy: boolean }) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [statusFilter, setStatusFilter] = useState<CandidateStatusFilter>("pending");
+  const [kindFilter, setKindFilter] = useState<string>("");
   const { pageRows, pageCount, safePage, setPage } = usePagedList(items);
 
   async function reload() {
     setLoading(true);
     setError(null);
     try {
-      const data = await api.get<{ items: TaxonomyCandidate[] }>(
-        `/api/admin/taxonomy-candidates?status=${encodeURIComponent(statusFilter)}`
-      );
+      let url = `/api/admin/taxonomy-candidates?status=${encodeURIComponent(statusFilter)}`;
+      if (kindFilter) url += `&kind=${encodeURIComponent(kindFilter)}`;
+      const data = await api.get<{ items: TaxonomyCandidate[] }>(url);
       setItems(data.items ?? []);
     } catch (e) {
       setError((e as Error).message);
@@ -1053,7 +1054,7 @@ function TaxonomyCandidatesAdmin({ busy }: { busy: boolean }) {
   useEffect(() => {
     void reload();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [statusFilter]);
+  }, [statusFilter, kindFilter]);
 
   return (
     <section className={styles.panel}>
@@ -1073,6 +1074,19 @@ function TaxonomyCandidatesAdmin({ busy }: { busy: boolean }) {
               {CANDIDATE_STATUS_LABEL[s]}
             </button>
           ))}
+          <select
+            data-testid="candidate-kind-filter"
+            className={styles.profileTab}
+            value={kindFilter}
+            onChange={(e) => setKindFilter(e.target.value)}
+          >
+            <option value="">全部类型</option>
+            {Object.entries(TAXONOMY_KIND_LABELS).map(([k, label]) => (
+              <option key={k} value={k}>
+                {label}
+              </option>
+            ))}
+          </select>
           <button type="button" className={styles.btnGhost} onClick={() => void reload()} disabled={busy || loading}>
             刷新
           </button>
