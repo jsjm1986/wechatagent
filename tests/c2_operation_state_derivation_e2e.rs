@@ -700,3 +700,96 @@ async fn strong_stage_evidence_writes_domain_attrs_not_observation() {
         "强证据 stage 不应落 tag_observation 暂定层"
     );
 }
+
+/// 批A家族① C-01/H-01：apply_agent_updates 内**纯审计事件**写失败时，本轮回复仍须入队
+/// （fail-soft）。用 MongoDB collection validator 让 `agent.operation_state_transition_rejected`
+/// 的插入确定性失败，走非法迁移路径触发该审计写，断言 `agent_send_outbox` 仍有本轮回复一行。
+///
+/// - 修复前：gateway.rs `operation_state_transition_rejected` 写用 `.await?`，validator 拒写
+///   → Err 冒泡出 `apply_agent_updates`（enqueue 之前）→ 回复不入队 → outbox 空 → 本测试失败。
+/// - 修复后：该写降级 `let _ = ...await`，吞错继续 → 回复照常 enqueue → outbox 有一行 → 通过。
+///
+/// validator 仅拒该一个 kind，其余审计事件（stage_transition_rejected/profile_churn 等）与
+/// `agent_send_outbox` 集合均不受影响。`#[ignore]`，需 Docker，由 CI integration job 跑。
+#[tokio::test]
+#[ignore]
+async fn audit_write_failure_does_not_drop_reply_failsoft() {
+    let app = common::TestApp::start().await;
+
+    // 装 validator：拒绝 kind == agent.operation_state_transition_rejected 的插入。
+    // create_collection 若集合已存在会报错，用 let _ 忽略；随后 collMod 装校验器。
+    let _ = app
+        .state
+        .db
+        .raw()
+        .create_collection("agent_events", None)
+        .await;
+    app.state
+        .db
+        .raw()
+        .run_command(
+            doc! {
+                "collMod": "agent_events",
+                "validator": { "kind": { "$ne": "agent.operation_state_transition_rejected" } },
+                "validationAction": "error",
+            },
+            None,
+        )
+        .await
+        .expect("install agent_events validator");
+
+    let contact = make_managed_contact("user_audit_failsoft", "new_contact");
+    app.state
+        .db
+        .contacts()
+        .insert_one(&contact, None)
+        .await
+        .expect("insert managed contact");
+    let inbound = make_inbound(&contact, "msg_audit_failsoft_001", "你好，先简单了解一下。");
+    app.state
+        .db
+        .messages()
+        .insert_one(&inbound, None)
+        .await
+        .expect("insert inbound");
+
+    // 非法迁移（new_contact → customer_success）→ 触发 operation_state_transition_rejected
+    // 审计写（被 validator 拒）。2 次 LLM：Reply + Review。
+    app.llm
+        .push_response(reply_decision_json("customer_success", "need_discovery"));
+    app.llm.push_response(review_pass_json());
+
+    // 不 .expect handle 的返回：本不变量是"回复入队"，与顶层 Result 是否上抛无关，
+    // 用 let _ 使断言对修复前/后两种上抛行为都稳健。
+    let _ = handle_managed_message(&app.state, contact.clone(), &inbound).await;
+
+    // 核心断言：审计写失败时回复仍入队 outbox（证明未被吞）。
+    let log = app
+        .state
+        .db
+        .agent_run_logs()
+        .find_one(
+            doc! {
+                "workspace_id": &contact.workspace_id,
+                "account_id": &contact.account_id,
+                "contact_wxid": &contact.wxid,
+            },
+            None,
+        )
+        .await
+        .expect("query agent_run_logs")
+        .expect("agent_run_logs row exists");
+    let outbox = app
+        .state
+        .db
+        .collection_agent_send_outbox()
+        .find_one(doc! { "run_id": &log.run_id }, None)
+        .await
+        .expect("query outbox by run_id")
+        .expect("审计写失败时回复仍须入队 outbox 一行（fail-soft 未吞回复）");
+    assert_eq!(
+        outbox.contact_wxid, contact.wxid,
+        "outbox.contact_wxid 不一致：{:?}",
+        outbox
+    );
+}
