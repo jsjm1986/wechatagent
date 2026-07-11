@@ -4392,7 +4392,8 @@ async fn apply_agent_updates(
     // 这里只留可观测痕迹，不阻塞、不回滚。llm_original 为空表示 LLM 漏报 G1（补客观锚），
     // 非空表示 LLM 推断与客观态冲突被覆盖。
     if let Some((llm_original, corrected)) = &g1_correction {
-        write_event_for_account(
+        // fail-soft：纯审计写失败不阻断主流程（回复稍后异步入队），与 dimension_dropped 同风格。
+        let _ = write_event_for_account(
             state,
             &contact.account_id,
             Some(&contact.wxid),
@@ -4408,7 +4409,7 @@ async fn apply_agent_updates(
                 "objective_value": corrected,
             }),
         )
-        .await?;
+        .await;
     }
 
     // 画像写侧抖动观测（第一轮：体检量化，不改写库逻辑）。
@@ -4451,7 +4452,8 @@ async fn apply_agent_updates(
             .as_ref()
             .map(|(o, n)| format!("{o} → {n}"))
             .unwrap_or_default();
-        write_event_for_account(
+        // fail-soft：纯审计写失败不阻断主流程（回复稍后异步入队），与 dimension_dropped 同风格。
+        let _ = write_event_for_account(
             state,
             &contact.account_id,
             Some(&contact.wxid),
@@ -4477,7 +4479,7 @@ async fn apply_agent_updates(
                 "summary_len_after": churn.summary_len_after as i64,
             }),
         )
-        .await?;
+        .await;
     }
 
     // P2-4：operation_state 发生迁移时写一条 stage event，便于 staleness /
@@ -4487,7 +4489,8 @@ async fn apply_agent_updates(
     // 避免对一次被拒迁移既报"已迁移"又报"被拒"。domain_config=None 时不会进 rejected
     // 分支（fail-open），detect_state_transition 行为与改造前逐字一致。
     if let Some((prior, attempted, reason)) = &rejected_state_transition {
-        write_event_for_account(
+        // fail-soft：纯审计写失败不阻断主流程（回复稍后异步入队），与 dimension_dropped 同风格。
+        let _ = write_event_for_account(
             state,
             &contact.account_id,
             Some(&contact.wxid),
@@ -4500,12 +4503,13 @@ async fn apply_agent_updates(
                 "reason": reason,
             }),
         )
-        .await?;
+        .await;
     } else if let Some((prior, next)) = detect_state_transition(
         contact.operation_state.as_deref(),
         applied_operation_state.as_deref(),
     ) {
-        write_event_for_account(
+        // fail-soft：纯审计写失败不阻断主流程（回复稍后异步入队），与 dimension_dropped 同风格。
+        let _ = write_event_for_account(
             state,
             &contact.account_id,
             Some(&contact.wxid),
@@ -4522,7 +4526,7 @@ async fn apply_agent_updates(
                 "confidence": decision.operation_state_confidence.unwrap_or(0),
             }),
         )
-        .await?;
+        .await;
     }
 
     if let Some(follow_up) = &decision.follow_up {
@@ -4536,7 +4540,8 @@ async fn apply_agent_updates(
                     0,
                 );
                 if degraded {
-                    write_event_for_account(
+                    // fail-soft：纯审计写失败不阻断主流程（回复稍后异步入队），与 dimension_dropped 同风格。
+                    let _ = write_event_for_account(
                         state,
                         &contact.account_id,
                         Some(&contact.wxid),
@@ -4548,7 +4553,7 @@ async fn apply_agent_updates(
                         ),
                         Some(doc! { "raw_run_at": &follow_up.run_at }),
                     )
-                    .await?;
+                    .await;
                 }
                 let expires_at = DateTime::from_millis(
                     run_at.timestamp_millis()

@@ -185,6 +185,7 @@ pub async fn run_debounce_pipeline(
             };
 
             // (d) 一次反应分析（每串只在最新入站上跑一次 → 串行化，修反应写竞态）。
+            // 旁路分析：失败只 warn，绝不阻断本轮回复。
             if let Err(error) = agent::record_user_reaction(&state, &contact, &inbound).await {
                 let _ = agent::write_event_for_account(
                     &state,
@@ -196,31 +197,33 @@ pub async fn run_debounce_pipeline(
                     app_id.clone().map(|v| doc! { "app_id": v }),
                 )
                 .await;
-            } else {
-                // (e) 一次聚合网关，带协作式抢占 guard：运行期间 generation 变了即放弃。
-                let guard_state = st.clone();
-                let guard: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || {
-                    barge_in_triggered(gen_at_start, guard_state.generation.load(Ordering::Acquire))
-                });
-                if let Err(error) = agent::handle_managed_message_aggregated(
+            }
+
+            // (e) 一次聚合网关（无条件执行——与 (d) 解耦：reaction 是对上一轮结果的旁路分析，
+            // 与生成本轮回复无因果依赖，其失败绝不该吞本轮应答）。带协作式抢占 guard：
+            // 运行期间 generation 变了即放弃。
+            let guard_state = st.clone();
+            let guard: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || {
+                barge_in_triggered(gen_at_start, guard_state.generation.load(Ordering::Acquire))
+            });
+            if let Err(error) = agent::handle_managed_message_aggregated(
+                &state,
+                contact,
+                &inbound,
+                Some(guard),
+            )
+            .await
+            {
+                let _ = agent::write_event_for_account(
                     &state,
-                    contact,
-                    &inbound,
-                    Some(guard),
+                    &account_id,
+                    Some(&from_wxid),
+                    "agent_error",
+                    "failed",
+                    &error.to_string(),
+                    app_id.clone().map(|v| doc! { "app_id": v }),
                 )
-                .await
-                {
-                    let _ = agent::write_event_for_account(
-                        &state,
-                        &account_id,
-                        Some(&from_wxid),
-                        "agent_error",
-                        "failed",
-                        &error.to_string(),
-                        app_id.clone().map(|v| doc! { "app_id": v }),
-                    )
-                    .await;
-                }
+                .await;
             }
 
             // (f) 运行期间有新入站 → 重算（deadline 已被 register_inbound 刷新过）。
