@@ -1561,8 +1561,12 @@ textarea::placeholder {
 }
 
 .contact {
+  display: flex;
+  align-items: center;
   justify-content: flex-start;
+  flex-wrap: wrap;
   gap: 10px;
+  row-gap: 8px;
   width: 100%;
   min-height: var(--row-h);
   border: 0;
@@ -1588,6 +1592,22 @@ textarea::placeholder {
 .contact div {
   min-width: 0;
   flex: 1;
+}
+
+/* 主内容块：给一个宽度下限，窄栏(待启用 6 子元素)时逼动作组换行到第二行，
+   而非把名字/预览/标签挤成竖排单字。 */
+.contact .contactMain {
+  flex: 1 1 150px;
+  min-width: 150px;
+}
+
+/* 动作按钮组：按内容宽收缩(不吃 flex:1 catch-all)，靠右；放不下时整组换行。 */
+.contact .contactActions {
+  display: flex;
+  align-items: center;
+  flex: 0 0 auto;
+  gap: 8px;
+  margin-left: auto;
 }
 
 .contact strong,
@@ -1734,6 +1754,23 @@ textarea::placeholder {
   font-size: 13px;
 }
 
+/* 名字文本可截断，让阶段徽章(flex-shrink:0)在长名下仍完整显示。
+   .contact strong(0,1,1)会盖过 .contactName(0,1,0)的 display:flex，
+   故用 .contact .contactName(0,2,0)确保真正 flex 布局生效。 */
+.contact .contactName {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.contact .contactNameText {
+  min-width: 0;
+  flex: 0 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .contactPreview {
   display: block;
   overflow: hidden;
@@ -1753,6 +1790,8 @@ textarea::placeholder {
 }
 
 .contactTime {
+  flex-shrink: 0;
+  white-space: nowrap;
   color: var(--muted-soft);
   font-size: 11px;
 }
@@ -1770,6 +1809,8 @@ textarea::placeholder {
 
 /* 标签 chip（中性小 chip） */
 .tagChip {
+  flex-shrink: 0;
+  white-space: nowrap;
   border-radius: 999px;
   background: var(--surface-soft);
   border: 1px solid var(--line);
@@ -1781,6 +1822,8 @@ textarea::placeholder {
 
 /* 超时未跟进（暖色，非 danger 红） */
 .overdueTag {
+  flex-shrink: 0;
+  white-space: nowrap;
   border-radius: 999px;
   background: rgba(180, 83, 9, 0.08);
   color: #b45309;

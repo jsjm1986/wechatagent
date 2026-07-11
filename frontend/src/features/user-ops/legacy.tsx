@@ -655,7 +655,7 @@ export function ContactsView({
                 )}
                 <div className="contactMain">
                   <strong className="contactName">
-                    {name}
+                    <span className="contactNameText">{name}</span>
                     {stageResult && <span className="stageBadge">{stageResult.text}</span>}
                   </strong>
                   {!isManaged && contact.lastInboundPreview && (
@@ -671,33 +671,37 @@ export function ContactsView({
                     ))}
                   </span>
                 </div>
-                {selectable && (
-                  <button
-                    type="button"
-                    className="enableBtn"
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      void runEnable([toBatchCandidate(contact)]);
-                    }}
-                    disabled={batching}
-                  >
-                    启用 Agent
-                  </button>
-                )}
-                {onHideFromPool && (
-                  <button
-                    type="button"
-                    className="poolHideBtn"
-                    title="从运营池移除（不影响好友关系）"
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      if (window.confirm(`把「${name}」从运营池移除？（不删好友，仅不再出现在池中）`)) {
-                        onHideFromPool(contact);
-                      }
-                    }}
-                  >
-                    从池移除
-                  </button>
+                {(selectable || onHideFromPool) && (
+                  <div className="contactActions">
+                    {selectable && (
+                      <button
+                        type="button"
+                        className="enableBtn"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          void runEnable([toBatchCandidate(contact)]);
+                        }}
+                        disabled={batching}
+                      >
+                        启用 Agent
+                      </button>
+                    )}
+                    {onHideFromPool && (
+                      <button
+                        type="button"
+                        className="poolHideBtn"
+                        title="从运营池移除（不影响好友关系）"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          if (window.confirm(`把「${name}」从运营池移除？（不删好友，仅不再出现在池中）`)) {
+                            onHideFromPool(contact);
+                          }
+                        }}
+                      >
+                        从池移除
+                      </button>
+                    )}
+                  </div>
                 )}
               </div>
             );
