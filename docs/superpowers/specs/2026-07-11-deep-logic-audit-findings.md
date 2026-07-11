@@ -131,7 +131,52 @@
 
 ## 环节② 去抖 pipeline（register_inbound / deadline / generation 抢占 / barge_in / 窗口聚合）
 
-_（待审）_
+审查文件：`src/webhooks.rs`（去抖调度 :54-284）+ `src/agent/gateway.rs`（抢占 guard 落点）+ `src/agent/reaction.rs`（步骤 d）。主控已亲验 B-02 结构（webhooks.rs:188 else 包裹 (e)）+ reaction.rs:110 `?` 上抛，因果链坐实。
+
+### ✅ 亲验通过总览
+- **deadline 顺延 + 静默才决策**：`register_inbound` 每条入站刷 `deadline_ms.store`（`webhooks.rs:110/121`），runner 内层 loop 每轮重读 `deadline_ms.load`，`now>=dl` 才 break（:150-158）——窗口内又来消息就继续睡。`next_deadline_ms` 饱和加防溢出（:92-94，单测 :1473）。✅
+- **generation 抢占无双 runner 竞态**：spawn-vs-bump 原子决策在 `PENDING.entry(key)` DashMap shard 写锁内（:111-124），N 并发恰一个 `spawned_now=true`（单测 `concurrent_register_same_key_spawns_exactly_once` :1636）；退休 `remove_if` 谓词在 shard 锁内复核 generation（:233-237），晚到 bump 与 remove_if 串行化——两种交错各有单测（`retire_blocked_when_late_inbound_bumped_generation` :1570 / `retire_then_new_inbound_respawns` :1606）。任意交错不会同时有两个活 runner、不丢边界消息。✅ 机制严密。
+- **reload 早退三分支全覆盖**：`Ok(Some)`→继续 / `Ok(None)`→`PENDING.remove`+return（:167-170）/ `Err`→写事件+remove+return（:171-184），每轮 loop 起点 fresh DB 读（:165）挡住窗口期转 unmanaged/删除。✅
+- **load_recent_messages 边界**：按 `{created_at:-1}` 取最近 N 条（`gateway.rs:5010-5036`，N=recent_limit*6 clamp[24,80]），非时间窗过滤；inbound 在 spawn 前已落库（webhooks.rs:512 早于 :639），睡眠结束后连发消息全在库一次性聚合。"窗口边缘"不构成 bug。✅（仅单次突发>N 条时最旧被挤出上下文，属上下文上限非去抖 bug）
+
+### [B-01] 抢占 guard 的入队尾窗 TOCTOU：末次检查后到达的新入站拦不住，致"过时回复照发+重算再回"双回复（补 F-021 深层）
+- 入口频道: userOps
+- 链路环节: ② 去抖 pipeline（抢占 guard）
+- 类型: 竞态
+- 严重度: Low
+- 现象/风险: 协作式抢占最后一道 `should_abort_send()` 在 outbox 入队之前（`gateway.rs:2531-2542`）。新入站若落在该 guard 返 false 之后、多段 enqueue 循环（:2543-2642，多次 DB 往返）进行中，本轮过时回复会全部 enqueue→dispatcher 照发；同时 runner (f) 步（`webhooks.rs:227`）检测 generation 变化→continue 重算→再 enqueue 一批。两批 segment 不同幂等 key，不互相去重，客户收两次回复。
+- 根因: `gateway.rs:2531-2542` 是入队前最后 guard；`:2543-2642` 多段入队循环内无 guard 复查。唯一撤销通道 `outbox::cancel_for_contact_on_user_reaction`（`outbox.rs:545`）仅下一轮 reaction 判 `outcome_signals_stop` 才取消，普通追问不触发。
+- 复现设想: 精确时序——过 :2542 guard 后、多段 enqueue 期间灌新入站（窗口约 10-100ms）。观察 outbox 两批 segment（source_event_id 不同）。可 117 复现但时序窗极窄、需注入延迟，生产自然触发概率低。
+- 验证状态: PLAUSIBLE（读码）
+- 修复建议: 协作式抢占固有尾窗；彻底消除需"入队后按 generation 撤销 pending outbox"补偿（重算前先 cancel 上一 gen 的 pending，用 gen/run_id 标记 outbox 归属）。属产品取舍，Open 待裁决；生产影响小。
+- 状态: Open
+
+### [B-02] reaction 分析脚手架的瞬时 DB 错误经 `?` 上抛，吞掉本轮聚合回复（补 F-021 深层）
+- 入口频道: userOps
+- 链路环节: ② 去抖 pipeline（步骤 d record_user_reaction → 步骤 e gateway）
+- 类型: 错误处理
+- 严重度: Med
+- 现象/风险: runner 步骤 (e) 网关聚合回复被包在步骤 (d) `record_user_reaction` 的 **`else` 分支**里（`webhooks.rs:188-224` 主控亲验）——reaction 返 `Err` 时只写 `agent_error` 事件，(e) 网关**根本不执行**，本条客户消息本轮不回复。reaction 的 LLM 失败虽被 `unwrap_or_else` 兜底（`reaction.rs:162`），但其 **DB 脚手架多处 `?` 会真上抛**：claim `find_one_and_update`（`reaction.rs:110` 主控亲验 `.await?`）、`load_..domain_config`（:36）、stuck 重置 `update_many`（:83）、写回（:196）。任一瞬时 Mongo 错误→整轮回复被侧路分析失败连累吞掉。因 MCP 5s 不重试、webhook 不重推，本条入站要等**下一条消息到来**触发 respawn 才被 `load_recent_messages` 补回；客户不再发则永久静默。
+- 根因: `webhooks.rs:199-224` 把步骤 (e) 放进步骤 (d) 的 `else`，使"侧路反应分析成功"成为"生成本轮回复"的前置；`reaction.rs` DB 操作用 `?` 传播而非 best-effort。
+- 复现设想: 对 `decision_reviews` claim/update 注入瞬时错误（前置：该 contact 有 `status=sent` 且 `outcome_status∈{null,pending}` 的 decision_review 才进 claim→LLM 路径；无则 :113 提前 `Ok(())` 不触发）。生产安全构造困难，不建议真跑。
+- 验证状态: PLAUSIBLE（读码，主控亲验因果链坐实）
+- 修复建议: 把步骤 (d)(e) 解耦——reaction 失败只 warn，仍继续跑 (e)（reaction 是旁路分析不该阻断本轮应答）；或把 `reaction.rs` DB 脚手架降级 best-effort（与其 LLM 侧 `unwrap_or_else` 同纪律）。属错误处理加固。建议 Open。
+- 状态: Open
+
+### [B-03] managed 门只在 pipeline 起点复核一次，决策运行期（~10-15s）的 managed→unmanaged 翻转不复核，照发在途回复（补 F-021 深层）
+- 入口频道: userOps
+- 链路环节: ② 去抖 pipeline（reload → gateway）
+- 类型: 逻辑正确性
+- 严重度: Low
+- 现象/风险: `reload_managed_contact` 只在 loop 起点执行一次（`webhooks.rs:165`），gateway `precheck_send_gateway` 用这份快照判 `contact.agent_status`（`gateway.rs:3127`），全程不再重查。抢占 guard 只感知新入站（generation），不感知 agent_status 翻转。管理员在 reload 后、发送前的决策窗口（~10-15s）把 contact 改 normal（想立即止住 AI），本轮回复仍会 enqueue 并发出。
+- 根因: `webhooks.rs:165` 单次 reload；`gateway.rs:2308/2531` guard 仅基于 generation；`precheck` 读入参 contact 非 fresh DB。
+- 复现设想: contact managed，客户发消息触发 runner；决策期间（借慢 LLM 拉长窗口）管理员改 normal。观察回复仍发。可 117 复现（谨慎，勿碰真人吴界）。
+- 验证状态: PLAUSIBLE（读码）
+- 修复建议: outbox 入队前兜底 guard（:2531 附近）追加一次 `agent_status==Managed` fresh 复核（或让抢占 guard 一并检测状态翻转）。多一次 DB 读换"止发即时生效"。属加固项，生产窗口小。建议 Open。
+- 状态: Open
+
+### 已知非本轮 bug 的架构约束（不重复入 finding）
+- reload 查询缺 `workspace_id`（`webhooks.rs:279` 只 `{account_id,wxid}`，入口是三键），单副本单 workspace 无害（account 绑定唯一 workspace）；理论多 workspace 撞 account+wxid 才取错。极低风险 nit，与多租户就绪债同族。
 
 ## 环节③ gateway 巨型闸函数（managed / cooldown / min-interval / 日上限 / 过期闸）
 
