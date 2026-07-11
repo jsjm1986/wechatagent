@@ -386,3 +386,60 @@
 - 每条 finding 的 file:line 均主控当场 Read 亲验；subagent 凭猜/未确认的结论要么驳回（F-⑧-02）、要么降为 PLAUSIBLE。
 - 2 条整环 0 finding 是真读透后的正面结论（阈值闸/MCP），非漏审。
 - 未真跑，故无 CONFIRMED；这是诚实的确信度标注，非假绿。
+
+---
+
+# 批 B（知识链：knowledgeWiki / content / quality 三频道）
+
+- 审查计划：[`2026-07-11-deep-logic-audit-batch-b.md`](../plans/2026-07-11-deep-logic-audit-batch-b.md)
+- 视角：**业务链/命脉红线视角**（结构正确性由 2026-06-30 wiki 全覆盖审查 + PR#74 已覆盖，本批不重复结构面）。
+- 7 条业务链：①录入 ②审核 ③grounding 召回 ④修复 ⑤修订 ⑥质量 ⑦catalog。优先级：链3 grounding（最高）> 链4 修复 > 链2 审核 > 链1/5/7 > 链6。
+- finding 编号：`KB-NN`。全部主控当场 Read 亲验；未真跑标 PLAUSIBLE（同批 A 定调，复现留修复阶段写确定性测试）。
+
+## 链3 grounding 召回链（最高优先 · 产品声明红线命脉）
+
+审查范围：`routes/knowledge/chat.rs`（chat_turn/chat_apply/run_chat_with_tools/apply_create_chunk）+ `agent/knowledge_router.rs`（生产召回 load_operation_knowledge）+ `agent/knowledge_tools.rs` / `knowledge_agent.rs`（tool-calling 暴露面）+ `agent/review/gates.rs`（blocked_unverified_product_claim 硬闸）+ `agent/sufficiency.rs`（used_knowledge_ids 记录闸）。主控派 opus subagent 复审 + 逐条亲验。
+
+### ✅ 亲验通过总览（grounding 红线三处协同健康）
+
+1. **✅ 所有喂 LLM 的召回入口只暴露 verified**：生产客户召回 `knowledge_router.rs:71`（exact `"verified"`）、知识对话快照 `chat.rs:1076`、tool-calling `list_catalog`(:1063)/`open_chunk`(:1206)/`open_document`(:1235)/`follow_relations`(:1333)、`resolve_superseded` 只 redirect 到 verified(:1163-1171)——逐个亲验无一漏过滤。
+2. **✅ redaction 兜底**：`knowledge_tools.rs` exec_search/exec_open_slice 对非 verified 切片 snippet 置空 / body 换 `<redacted_unverified_chunk>`，即使调用方误传非 verified 集合也不泄漏正文。
+3. **✅ 过期知识两侧都排除**：硬闸 `guards.rs:309 is_verified` 排除 `valid_to < now`（含单测 :798）；召回侧过期 verified 降格但因 finalize `compute_verified_chunks(now)` 仍排除，不背书产品声明。
+4. **✅ 对话产出落库恒 draft+needs_review**：`apply_create_chunk:1680-1681`（强制 draft+needs_review 在 insert 前）、`apply_update_chunk:1776-1777`、chat_apply 分发(:422-472) 全链无任何路径能让对话直出 verified；溯源经共用 `resolve_quote_anchors`（D2 双路径修复）锚定。
+5. **✅ 硬闸主路径依赖真读**：`gates.rs:658-690` 仅当 reviewer 自报 requiresProductKnowledge=true 触发，取 `used_knowledge_ids ∩ selected_chunks(verified)` 非空 OR priced_from_catalog，否则强制 block；`selected_chunks`(gateway.rs:1155) 是 verified-only 语料。rewrite(:1592)/revision(:1865) 两处无条件记 used_knowledge_ids，但均在 `PromptTier::Full` 重跑决策（include_business=true 真读切片），非架空。
+
+### [KB-01] Lean/Relational 档 LLM 自报 used_knowledge_ids 未清空，可架空 blocked_unverified_product_claim 硬闸（防架空守卫不完整于其自述意图）
+
+- 入口频道：webhook 自动回复主链路（run_user_operation_gateway_inner，非知识频道，但根因在知识 grounding 闸）
+- 链路环节：③grounding 召回 → 硬闸
+- 类型：红线硬闸可被架空（防御不完整）
+- 严重度：**Medium**
+- 现象：非 Full 档决策（Lean-Enough / Clarify(Lean) / Escalate(Relational)，三者 include_business=false，decision.rs:318 不注入任何切片正文）若 LLM 自己在输出里吐出一个真实存在于 verified 语料的 24 位 ObjectId hex，该 id 会被记进 `decision.used_knowledge_ids` 并令 grounding 硬闸 `used ∩ verified` 非空 → 放行本应 `blocked_unverified_product_claim` 的产品声明。
+- 根因（亲验）：
+  - `types.rs:973-975 carry_through_fields` **无条件**把 `raw.used_knowledge_ids`（LLM 原始输出）透传进 `decision.used_knowledge_ids`。
+  - `gateway.rs:1457-1459` 的 `should_record_used_knowledge_ids(forced_full, escalated_to_full)` 只在 Full 档为真时**覆盖写**路由命中 id；非 Full 档走 else、**不清空**上一步透传的 LLM 自报值。
+  - `sufficiency.rs:88-91` 注释明确声明的不变量是"没读切片的决策不得记 id，否则架空硬闸"——该不变量对"路由通道"守住了，对"LLM 自报通道"没守。
+  - 硬闸侧 `selected_chunks`(gateway.rs:1155) 是 tier-independent 的 verified 全量语料，故非 Full 档的 `used ∩ selected` 完全可能非空。
+- 验证状态：**PLAUSIBLE**（代码缺口 CONFIRMED：自报值确实不被清空，主控亲验 types.rs:973 + gateway.rs:1457 + selected_chunks:1155 三处坐实；实际可利用性依赖 LLM 恰好吐出真实 verified ObjectId——而 Lean 档 prompt 不注入切片 ID，id 不可猜，真实命中率低）。
+- 修复建议：在 `gateway.rs:1457` 的 else 分支（非 Full 档）显式 `decision.used_knowledge_ids.clear()`，与 sufficiency.rs:88-91 注释意图对齐；一行改动、风险低、根治"自报通道架空硬闸"。可写确定性 lib 单测（构造 Lean 决策 + 自报一个语料内 verified id，断言硬闸仍 block）。
+
+### [KB-02] admin PUT 经 apply_chunk_integrity 锚点命中即自动置 verified，绕过 /verify 人审端点（人类 admin 路径，非 AI 红线）
+
+- 入口频道：knowledgeWiki 频道 chunk 编辑（PUT /api/knowledge/chunks/:id）
+- 链路环节：②审核（旁路）
+- 类型：verified 状态非 /verify 旁路
+- 严重度：**Low-Medium**（产品裁决项）
+- 现象：admin 更新一个带父文档的 chunk 时，若提交的 sourceQuote 能在父文档 raw_content 命中锚点，`apply_chunk_integrity`(mod.rs:918-921) 直接置 `integrity_status="verified"`；后续 `coerce_integrity_against_d2_gate`(mod.rs:1057) **只在缺 quote/anchor 时降级**，锚点命中则保持 verified。即：改个 summary + 附一段能命中的 quote，会把 needs_review 切片作为副作用提升到 verified，绕过专用 `/verify` 人审端点。
+- 根因（亲验）：crud.rs:241-245 有父文档即调 apply_chunk_integrity（锚点→verified），coerce 只降级不拦锚点命中。**与 import 路径不对称**：import.rs:316/365/880 在 apply_chunk_integrity 之后**无条件压回** needs_review（显式红线注释），唯独 crud.rs 更新路径没有这层覆写。
+- 验证状态：**PLAUSIBLE**（代码路径 CONFIRMED 可达 verified 而未走 /verify）。**边界澄清**：这是 `AuthenticatedAdmin` 鉴权端点=人类 admin 动作，**不属** CLAUDE.md「AI 永不自动 verify」红线的严格破坏（对话/AI 路径 apply_create_chunk/apply_update_chunk/import 全部硬置 needs_review，红线未破）。
+- 修复建议：需用户产品裁决——(a) 若"admin 锚点命中即信任"是有意设计则保留、仅补审计；(b) 若要求所有 verified 必走 /verify，则 crud.rs 更新路径比照 import 在 apply_chunk_integrity 后压回 needs_review。倾向 (b) 收口口径一致。
+
+### [KB-03] verified 判定口径大小写不一致（硬闸大小写不敏感 vs 召回精确匹配）——latent，当前不可触发
+
+- 链路环节：③grounding（口径一致性）
+- 类型：口径漂移（latent）
+- 严重度：**Low**（信息性）
+- 现象：硬闸 `guards.rs:314 is_verified` 用 `eq_ignore_ascii_case("verified")`（大小写不敏感），而**所有召回过滤**（knowledge_router.rs:71 / knowledge_agent.rs 各 tool / chat.rs:1076 / catalog）均 `== "verified"` 精确匹配。
+- 根因（亲验）：写入侧 verify.rs:112 恒写小写 `"verified"`，当前不可能产生 `"Verified"`。若真出现，召回侧精确匹配失败→切片根本不进语料→不注入、不进 finalize 的 knowledge_chunks，`is_verified` 的宽松判定永远碰不到它——既不误放也不误堵。
+- 验证状态：**PLAUSIBLE**（无害 latent，当前不可触发）。
+- 修复建议：可选——把 is_verified 改成精确匹配 `== "verified"`，或召回侧统一大小写不敏感，消除口径漂移。不改也安全。
