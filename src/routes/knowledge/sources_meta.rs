@@ -883,6 +883,28 @@ pub struct IngestSourceUpdateRequest {
     pub status: Option<String>,
 }
 
+/// 把存储结构体 `IngestSource`（snake_case bson）投影成前端 `IngestSourceItem`
+/// 期望的 camelCase JSON。仿 `operation_knowledge_chunk_json`（mod.rs:283）——
+/// 存储层不加 rename_all（会破坏 worker 查询/索引/存量文档），只在 API 边界映射。
+fn ingest_source_json(src: &crate::models::IngestSource) -> Value {
+    json!({
+        "sourceId": src.source_id,
+        "workspaceId": src.workspace_id,
+        "kind": src.kind,
+        "url": src.url,
+        "scheduleMinutes": src.schedule_minutes,
+        "label": src.label,
+        "lastFetchedAt": src.last_fetched_at.and_then(crate::models::dt_to_string),
+        "lastEtag": src.last_etag,
+        "lastError": src.last_error,
+        "status": src.status,
+        "failureStreak": src.failure_streak,
+        "ingestCount": src.ingest_count,
+        "createdAt": crate::models::dt_to_string(src.created_at),
+        "updatedAt": crate::models::dt_to_string(src.updated_at)
+    })
+}
+
 pub async fn list_ingest_sources(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
@@ -896,7 +918,7 @@ pub async fn list_ingest_sources(
         .map_err(AppError::from)?;
     let mut items: Vec<Value> = Vec::new();
     while let Some(src) = cursor.try_next().await.map_err(AppError::from)? {
-        items.push(serde_json::to_value(src).map_err(|e| AppError::External(e.to_string()))?);
+        items.push(ingest_source_json(&src));
     }
     Ok(Json(json!({ "workspaceId": workspace_id, "items": items })))
 }
@@ -1021,4 +1043,80 @@ pub async fn delete_ingest_source(
         return Err(AppError::NotFound("ingest source not found".to_string()));
     }
     Ok(Json(json!({ "sourceId": source_id, "deleted": true })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::IngestSource;
+    use mongodb::bson::{oid::ObjectId, DateTime};
+
+    fn sample_source() -> IngestSource {
+        IngestSource {
+            id: Some(ObjectId::parse_str("64a1f2c3e4b5a6978899d001").unwrap()),
+            source_id: "ing_abc123".to_string(),
+            workspace_id: "ws-1".to_string(),
+            kind: "rss".to_string(),
+            url: "https://example.com/feed".to_string(),
+            schedule_minutes: 60,
+            label: Some("行业资讯源".to_string()),
+            last_fetched_at: Some(DateTime::from_millis(1_700_000_000_000)),
+            last_etag: Some("\"etag-xyz\"".to_string()),
+            last_error: None,
+            status: "active".to_string(),
+            failure_streak: 2,
+            ingest_count: 7,
+            created_at: DateTime::from_millis(1_699_000_000_000),
+            updated_at: DateTime::from_millis(1_700_000_100_000),
+        }
+    }
+
+    #[test]
+    fn ingest_source_json_emits_camel_case() {
+        let v = ingest_source_json(&sample_source());
+
+        // 前端读的 camelCase 键必须存在且值正确
+        assert_eq!(v.get("sourceId").and_then(|x| x.as_str()), Some("ing_abc123"));
+        assert_eq!(v.get("workspaceId").and_then(|x| x.as_str()), Some("ws-1"));
+        assert_eq!(v.get("kind").and_then(|x| x.as_str()), Some("rss"));
+        assert_eq!(v.get("url").and_then(|x| x.as_str()), Some("https://example.com/feed"));
+        assert_eq!(v.get("scheduleMinutes").and_then(|x| x.as_i64()), Some(60));
+        assert_eq!(v.get("label").and_then(|x| x.as_str()), Some("行业资讯源"));
+        assert_eq!(v.get("lastEtag").and_then(|x| x.as_str()), Some("\"etag-xyz\""));
+        assert_eq!(v.get("status").and_then(|x| x.as_str()), Some("active"));
+        assert_eq!(v.get("failureStreak").and_then(|x| x.as_i64()), Some(2));
+        assert_eq!(v.get("ingestCount").and_then(|x| x.as_i64()), Some(7));
+        assert!(v.get("lastFetchedAt").and_then(|x| x.as_str()).is_some(), "lastFetchedAt 应为 RFC3339 串");
+        assert!(v.get("createdAt").and_then(|x| x.as_str()).is_some(), "createdAt 应为 RFC3339 串");
+        assert!(v.get("updatedAt").and_then(|x| x.as_str()).is_some(), "updatedAt 应为 RFC3339 串");
+        // lastError=None → null
+        assert!(v.get("lastError").map(|x| x.is_null()).unwrap_or(false), "lastError 应为 null");
+
+        // 绝不能再泄漏 snake_case 键（这些是 bug 的根源）
+        assert!(v.get("source_id").is_none(), "不得含 snake_case source_id");
+        assert!(v.get("schedule_minutes").is_none(), "不得含 snake_case schedule_minutes");
+        assert!(v.get("last_fetched_at").is_none(), "不得含 snake_case last_fetched_at");
+        assert!(v.get("failure_streak").is_none(), "不得含 snake_case failure_streak");
+        assert!(v.get("ingest_count").is_none(), "不得含 snake_case ingest_count");
+        assert!(v.get("created_at").is_none(), "不得含 snake_case created_at");
+        // 前端接口无 id 字段，投影不输出 id
+        assert!(v.get("id").is_none(), "投影不应输出 id（前端 IngestSourceItem 无此字段）");
+    }
+
+    #[test]
+    fn ingest_source_json_null_datetime() {
+        let mut src = sample_source();
+        src.last_fetched_at = None;
+        let v = ingest_source_json(&src);
+        assert!(v.get("lastFetchedAt").map(|x| x.is_null()).unwrap_or(false),
+            "last_fetched_at=None → lastFetchedAt 应为 null");
+    }
+
+    #[test]
+    fn ingest_source_json_matches_contract_fixture() {
+        // 摄取源列表端点响应形状：前端 IngestSourceItem 按此键集读源列表、
+        // 删除/重新激活按 sourceId 定位。构造全量 source 固化契约。
+        let projected = ingest_source_json(&sample_source());
+        crate::routes::contract_snapshot::assert_contract_fixture("ingest_source", projected);
+    }
 }

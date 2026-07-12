@@ -4,11 +4,13 @@ import usageFixture from "../../contracts/knowledge_usage_log.fixture.json";
 import revisionFixture from "../../contracts/revision_applied.fixture.json";
 import detailFixture from "../../contracts/operation_knowledge_chunk_detail.fixture.json";
 import importJobProgressFixture from "../../contracts/import_job_progress.fixture.json";
+import ingestSourceFixture from "../../contracts/ingest_source.fixture.json";
 import { CANONICAL_KEYS as DOCUMENT_KEYS } from "../../contracts/operationKnowledgeDocument.contract";
 import { CANONICAL_KEYS as USAGE_KEYS } from "../../contracts/knowledgeUsageLog.contract";
 import { CANONICAL_KEYS as REVISION_KEYS } from "../../contracts/revisionApplied.contract";
 import { CANONICAL_KEYS as DETAIL_KEYS } from "../../contracts/operationKnowledgeChunkDetail.contract";
 import { CANONICAL_KEYS as IMPORT_JOB_KEYS } from "../../contracts/importJobProgress.contract";
+import { CANONICAL_KEYS as INGEST_SOURCE_KEYS } from "../../contracts/ingestSource.contract";
 
 // 后端投影写出的 fixture(线上真相源)与前端 CANONICAL_KEYS 声明双向键集对账。
 // 任一侧漂移即测红:missingInFrontend=后端发了前端没声明;deadInFrontend=前端声明了后端没发。
@@ -39,4 +41,6 @@ describe("契约: 知识域投影键集对账", () => {
     assertKeysMatch("detail", detailFixture, DETAIL_KEYS));
   it("import_job_progress 异步导入进度投影(get/list 端点)", () =>
     assertKeysMatch("importJob", importJobProgressFixture, IMPORT_JOB_KEYS));
+  it("ingest_source 摄取源列表投影(list 端点)", () =>
+    assertKeysMatch("ingestSource", ingestSourceFixture, INGEST_SOURCE_KEYS));
 });

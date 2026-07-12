@@ -1,0 +1,16 @@
+{
+  "createdAt": "2023-11-03T08:26:40Z",
+  "failureStreak": 2,
+  "ingestCount": 7,
+  "kind": "rss",
+  "label": "行业资讯源",
+  "lastError": null,
+  "lastEtag": "\"etag-xyz\"",
+  "lastFetchedAt": "2023-11-14T22:13:20Z",
+  "scheduleMinutes": 60,
+  "sourceId": "ing_abc123",
+  "status": "active",
+  "updatedAt": "2023-11-14T22:15:00Z",
+  "url": "https://example.com/feed",
+  "workspaceId": "ws-1"
+}
