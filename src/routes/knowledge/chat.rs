@@ -1773,21 +1773,24 @@ pub(crate) async fn apply_update_chunk(
         }
     }
 
-    update_doc.insert("integrity_status", "needs_review");
-    update_doc.insert("status", "draft");
-    update_doc.insert("updated_at", DateTime::now());
-    state
-        .db
-        .operation_knowledge_chunks()
-        .update_one(
-            doc! {
-                "_id": oid,
-                "workspace_id": workspace_id,
-            },
-            doc! { "$set": update_doc.clone() },
-            None,
-        )
-        .await?;
+    // KB-09：落库改走统一入口 apply_chunk_revision（op=Patch, source=Ai）——获 chunk_revisions
+    // 审计行 + 数组字段 union（既有 tag 不被整体替换丢弃）+ locked_fields 守门（KB-11）；
+    // source=Ai 自动强制 status=draft + integrity_status=needs_review（"AI 永不自动 verify"红线不破）。
+    // update_doc 已含 patch 前重算的 source_anchors（复数,不撞 DEFAULT 锁的 source_anchor 单数）。
+    let applied = crate::knowledge_wiki::chunk_revisions::apply_chunk_revision(
+        &state.db,
+        workspace_id,
+        oid,
+        crate::knowledge_wiki::chunk_revisions::RevisionRequest {
+            op: crate::knowledge_wiki::chunk_revisions::RevisionOp::Patch,
+            source: crate::knowledge_wiki::chunk_revisions::ProvenanceSource::Ai,
+            patch: update_doc,
+            reason: Some("知识对话应用草稿".to_string()),
+            actor: Some("knowledge_chat".to_string()),
+        },
+    )
+    .await?;
+    let _ = applied; // source=Ai 恒 draft+needs_review，响应回填固定形状（语义正确）
     Ok(json!({
         "updatedChunkId": chunk_id,
         "fieldsTouched": fields_touched,
