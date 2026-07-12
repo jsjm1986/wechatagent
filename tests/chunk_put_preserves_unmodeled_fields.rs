@@ -125,6 +125,102 @@ async fn put_preserves_provenance_wiki_type_locked_fields_and_created_at() {
     assert_eq!(after.created_at, created, "created_at 保持原值(不被篡改成更新时间)");
 }
 
+/// KB-10 + KB-11 红线:admin PUT 走 replace_one 整条替换时——
+/// (KB-10) 补写一条 chunk_revisions 审计行(op=patch/source=human),补齐 admin 直接编辑修订链;
+/// (KB-11) 运营 per-chunk `locked_fields` 后端强制:PUT 试图改锁定字段(title)被静默丢弃、
+///          未锁字段(summary)正常更新。
+///
+/// 之前 admin PUT 既不留审计行(修订链缺口),又能绕过 per-chunk 锁定字段(前端隐藏≠后端强制)。
+/// 修复(crud.rs:281-326)复用 `effective_locked_fields` + `enforce_locked_fields` 同一份纯函数
+/// (与 apply_chunk_revision 单一真相源),replace 后补写 ChunkRevision。
+/// 一旦 enforce_locked_fields 调用被移除,锁定的 title 会被改掉,本测试立刻红。
+#[tokio::test]
+#[ignore]
+async fn put_enforces_locked_fields_and_writes_audit_revision() {
+    let app = TestApp::start().await;
+    let ws = app.state.config.default_workspace_id.clone();
+
+    let id = ObjectId::new();
+    let created = BsonDt::from_millis(1_000_000);
+
+    // seed:一条只锁 title 的 chunk(per-chunk locked_fields=["title"])。
+    let seeded = OperationKnowledgeChunk {
+        id: Some(id),
+        workspace_id: ws.clone(),
+        domain: "user_operations".to_string(),
+        title: "锁定标题".to_string(),
+        summary: Some("原摘要".to_string()),
+        status: "active".to_string(),
+        chunk_type: "product_fact".to_string(),
+        locked_fields: Some(vec!["title".to_string()]),
+        created_at: created,
+        updated_at: created,
+        ..Default::default()
+    };
+    app.state
+        .db
+        .operation_knowledge_chunks()
+        .insert_one(&seeded, None)
+        .await
+        .expect("seed chunk");
+
+    // PUT 同时改锁定的 title 与未锁的 summary(camelCase 请求体)。
+    let body: OperationKnowledgeChunkRequest = serde_json::from_value(serde_json::json!({
+        "title": "试图改",
+        "summary": "新摘要"
+    }))
+    .expect("deserialize OperationKnowledgeChunkRequest");
+
+    let _ = update_operation_knowledge_chunk(
+        State(app.state.clone()),
+        admin(&ws),
+        Path(id.to_hex()),
+        Json(body),
+    )
+    .await
+    .expect("update handler ok");
+
+    // reload 落库结果。
+    let after = app
+        .state
+        .db
+        .operation_knowledge_chunks()
+        .find_one(doc! { "_id": id, "workspace_id": &ws }, None)
+        .await
+        .expect("find")
+        .expect("chunk exists");
+
+    // (KB-11) 锁定字段 title 被静默丢弃,保持原值。
+    assert_eq!(
+        after.title, "锁定标题",
+        "PUT 不得改动 per-chunk 锁定字段 title(后端强制),实得 {:?}",
+        after.title
+    );
+    // 未锁字段 summary 正常更新。
+    assert_eq!(
+        after.summary.as_deref(),
+        Some("新摘要"),
+        "未锁字段 summary 应正常更新,实得 {:?}",
+        after.summary
+    );
+
+    // (KB-10) admin PUT 补写一条 chunk_revisions 审计行(op=patch/source=human)。
+    let revision_count = app
+        .state
+        .db
+        .chunk_revisions()
+        .count_documents(
+            doc! { "chunk_id": id.to_hex(), "op": "patch", "source": "human" },
+            None,
+        )
+        .await
+        .expect("count chunk_revisions");
+    assert!(
+        revision_count >= 1,
+        "admin PUT 必须补写 chunk_revisions 审计行(op=patch/source=human),实得 {revision_count}"
+    );
+}
+
 /// PUT 一个不存在的 chunk → NotFound（create 有独立 POST 端点，PUT 不该 upsert）。
 #[tokio::test]
 #[ignore]

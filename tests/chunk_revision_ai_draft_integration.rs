@@ -110,3 +110,108 @@ async fn apply_chunk_revision_ai_source_forces_draft_needs_review() {
         stored.integrity_status
     );
 }
+
+/// KB-09 红线:source=Ai 的 patch 对数组字段(product_tags)做 **existing ∪ patch**,
+/// 既有 tag 不因 LLM"只列出这一项"而丢失;同时审计行落库 + status 打回 draft。
+///
+/// 此前 `apply_chunk_revision` 的数组 union 只有 `wiki_chunk_revision_pbt` 纯函数覆盖,
+/// 没测真实落库的 union 既有源。KB-09 修复(chunk_revisions.rs:193-198)把数组既有源
+/// 从被 patch clobber 过的 `after_patch` 改回**原始 existing_bson**,union 才不会退化成
+/// `patch∪patch`(既有 tag 丢失)。本测试 seed 一条 `product_tags=["A"]` 的既有 chunk,
+/// 用 source=Ai 的 patch 送 `product_tags=["B"]`,断言落库后是 union `{A,B}` 非替换 `[B]`。
+/// 一旦 KB-09 修复被回退(数组既有源退回 after_patch),union 只剩 `[B]`,本测试立刻红。
+#[tokio::test]
+#[ignore]
+async fn apply_chunk_revision_ai_patch_unions_product_tags_and_forces_draft() {
+    let app = TestApp::start().await;
+    let ws = app.state.config.default_workspace_id.clone();
+
+    // seed:既有 chunk 带 product_tags=["A"],status=active(AI patch 应把它打回 draft)。
+    // body 给足长度;本 patch 只改 product_tags(非 body/summary/answer),不触发 70% 截断闸。
+    let chunk_oid = ObjectId::new();
+    let seeded = OperationKnowledgeChunk {
+        id: Some(chunk_oid),
+        workspace_id: ws.clone(),
+        domain: "user_operations".to_string(),
+        title: "产品价格政策".to_string(),
+        summary: Some("原始摘要:标准套餐与企业套餐价格概述。".to_string()),
+        body: Some(
+            "标准套餐月费 99 元,包含基础功能与 5 个坐席;企业套餐按坐席数阶梯计价,\
+             含高级分析与专属客户成功经理。以上为产品价格政策正文,内容较长以确保稳定。"
+                .to_string(),
+        ),
+        status: "active".to_string(),
+        integrity_status: Some("verified".to_string()),
+        product_tags: vec!["A".to_string()],
+        priority: 0,
+        created_at: BsonDt::now(),
+        updated_at: BsonDt::now(),
+        ..Default::default()
+    };
+    app.state
+        .db
+        .operation_knowledge_chunks()
+        .insert_one(&seeded, None)
+        .await
+        .expect("insert seeded chunk");
+
+    // 真调 apply_chunk_revision:source=Ai + op=Patch,patch 只送 product_tags=["B"]。
+    // product_tags 在 DEFAULT_UNION_ARRAY_KEYS(page_merge.rs:58)→ 应 union 而非替换。
+    apply_chunk_revision(
+        &app.state.db,
+        &ws,
+        chunk_oid,
+        RevisionRequest {
+            op: RevisionOp::Patch,
+            source: ProvenanceSource::Ai,
+            patch: doc! { "product_tags": ["B"] },
+            reason: Some("test: ai patch unions product_tags".to_string()),
+            actor: None,
+        },
+    )
+    .await
+    .expect("apply_chunk_revision 应成功");
+
+    // (1) 审计行落库:chunk_revisions 至少 1 行(chunk_id 存的是 hex 字符串)。
+    let revision_count = app
+        .state
+        .db
+        .chunk_revisions()
+        .count_documents(doc! { "chunk_id": chunk_oid.to_hex() }, None)
+        .await
+        .expect("count chunk_revisions");
+    assert!(
+        revision_count >= 1,
+        "apply_chunk_revision 必须写审计行(chunk_revisions),实得 {revision_count}"
+    );
+
+    // reload 落库结果。
+    let stored = app
+        .state
+        .db
+        .operation_knowledge_chunks()
+        .find_one(doc! { "_id": chunk_oid, "workspace_id": &ws }, None)
+        .await
+        .expect("查 chunk")
+        .expect("chunk 应存在");
+
+    // (2) product_tags 是 union {A,B} 非替换 [B](KB-09 治既有 tag 丢失)。
+    // 用集合含判定,非顺序敏感(union_array_fields 用 BTreeSet 去重)。
+    assert!(
+        stored.product_tags.contains(&"A".to_string()),
+        "既有 tag 'A' 必须保留(union 而非替换),实得 {:?}",
+        stored.product_tags
+    );
+    assert!(
+        stored.product_tags.contains(&"B".to_string()),
+        "patch 新增 tag 'B' 必须写入,实得 {:?}",
+        stored.product_tags
+    );
+
+    // (3) source=Ai 把 status 强制打回 draft(AI 永不自动 verify)。
+    assert_eq!(
+        stored.status, "draft",
+        "source=Ai 写入必须把 status 强制打回 draft,实得 {:?}",
+        stored.status
+    );
+}
