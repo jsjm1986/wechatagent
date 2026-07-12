@@ -68,6 +68,7 @@ mod m028_seed_conversation_mode;
 /// 验证清理语义（删非真人 normal / roster 回填 / 清 Demi / managed 保留 / 幂等）。
 /// 跨 crate 调用要求 `pub`（同 m018 先例）。
 pub mod m029_cleanup_contact_identity;
+mod m030_backfill_outcome_event_defaults;
 
 type MigrationFuture<'a> = Pin<Box<dyn Future<Output = AppResult<()>> + Send + 'a>>;
 pub type MigrationFn = for<'a> fn(&'a Database) -> MigrationFuture<'a>;
@@ -195,6 +196,10 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration {
         id: "2026_07_029_cleanup_contact_identity",
         run: |db| Box::pin(m029_cleanup_contact_identity::run_step(db)),
+    },
+    Migration {
+        id: "2026_07_030_backfill_outcome_event_defaults",
+        run: |db| Box::pin(m030_backfill_outcome_event_defaults::run_step(db)),
     },
 ];
 
