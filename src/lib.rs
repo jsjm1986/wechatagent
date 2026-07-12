@@ -16,6 +16,7 @@ pub mod config;
 pub mod db;
 pub mod error;
 pub mod evolution;
+pub mod import_worker;
 pub mod knowledge_digest;
 pub mod knowledge_task;
 pub mod knowledge_wiki;

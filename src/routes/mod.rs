@@ -113,7 +113,7 @@ pub mod ext_knowledge {
     pub use super::knowledge::{
         auto_verify_operation_knowledge_chunks, decide_auto_verify_status,
         extract_operation_knowledge_tags, import_operation_knowledge_preview,
-        propose_chunk_repair, reject_operation_knowledge_chunk,
+        propose_chunk_repair, reject_operation_knowledge_chunk, run_import_extraction,
         verify_operation_knowledge_chunk, ExtractKnowledgeTagsRequest,
         KnowledgeAutoVerifyRequest, KnowledgeVerifyRequest, OperationKnowledgeImportRequest,
     };
@@ -232,9 +232,10 @@ use knowledge::{
     get_operation_knowledge_chunk, get_operation_knowledge_chunk_source,
     get_operation_knowledge_completeness,
     get_operation_knowledge_document, get_operation_knowledge_integrity_report,
-    extract_operation_knowledge_tags, import_operation_knowledge_apply,
+    extract_operation_knowledge_tags, get_import_preview_job, import_operation_knowledge_apply,
     import_operation_knowledge_apply_image, import_operation_knowledge_apply_pdf,
     import_operation_knowledge_preview, knowledge_aggregate_metadata, knowledge_inbox,
+    list_import_preview_jobs,
     list_chunk_referrers,
     list_ingest_sources,
     list_knowledge_gap_signals,
@@ -651,6 +652,14 @@ pub fn api_router(state: AppState) -> Router<AppState> {
         .route(
             "/operation-knowledge/import-preview",
             post(import_operation_knowledge_preview),
+        )
+        .route(
+            "/operation-knowledge/import-preview-job/:id",
+            get(get_import_preview_job),
+        )
+        .route(
+            "/operation-knowledge/import-preview-jobs",
+            get(list_import_preview_jobs),
         )
         .route(
             "/operation-knowledge/import-apply",
@@ -1149,6 +1158,13 @@ mod tests {
             "vision_generate_json",
             // knowledge.rs：PDF multipart handler 委托的字节级 helper（集成测试直调）。
             "import_pdf_bytes",
+            // knowledge/import.rs：长文档分块抽取的共享内核（split→并发→合并→D2 锚定），
+            // 被同步 preview handler、run_import_extraction_for_job 及 real-LLM 集成测试
+            // （经 ext_knowledge 导出直调验真模型抽取）复用，不直接绑 HTTP。
+            "run_import_extraction",
+            // knowledge/import.rs：import_worker 复用的抽取入口，从 job 字段重建请求后
+            // 委托 run_import_extraction，不直接绑 HTTP（异步导入 job 走 worker 认领）。
+            "run_import_extraction_for_job",
             // knowledge.rs：完整度审计内核 helper，被 get/refresh completeness 两个 handler
             // 复用、不直接绑 HTTP；real_llm_knowledge.rs K11 通过 `pub use` 直调真模型审计。
             "build_operation_knowledge_completeness",

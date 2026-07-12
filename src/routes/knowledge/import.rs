@@ -1,10 +1,11 @@
 //! 运营知识库导入/摄取：preview/apply + PDF/图像多模态 + RSS/HTML 分块落库 + 标签抽取。
 
 use axum::{Extension, Json};
-use axum::extract::State;
+use axum::extract::{Path, Query, State};
 use futures::TryStreamExt;
+use futures::stream::{self, StreamExt};
 use mongodb::{
-    bson::{doc, DateTime, Document},
+    bson::{doc, oid::ObjectId, DateTime, Document},
     options::FindOptions,
 };
 use serde::Deserialize;
@@ -13,6 +14,7 @@ use serde_json::{json, Value};
 use crate::auth::AuthenticatedAdmin;
 use crate::error::{AppError, AppResult};
 use crate::agent;
+use crate::models::{assert_import_job_status_valid, ImportJob};
 use crate::knowledge_wiki::chunk_revisions::{
     apply_chunk_revision, ProvenanceSource, RevisionOp, RevisionRequest,
 };
@@ -124,56 +126,422 @@ const LONG_IMPORT_PROMPT_TEMPLATE: &str = r#"请把下面文本拆分为渐进�
 导入文本：
 {CONTENT}"#;
 
+/// 单次调用上限（按 char 计，适配中文）：内容 ≤ 此值走单段路径，与分块前字节等价（零回归）。
+const IMPORT_SINGLE_CALL_MAX_CHARS: usize = 3000;
+/// 贪心打包目标：连续标题块累加到此值就断开成一段。
+const IMPORT_SEGMENT_TARGET_CHARS: usize = 3000;
+/// 单块硬上限：超此值的原子块（如一个巨型小节 / 无标题长文）按段落再切。
+const IMPORT_SEGMENT_HARD_MAX_CHARS: usize = 5000;
+/// 每段抽取并发度：匹配生产端点真实 ~2 线程，避免 tool_use 争用。
+const IMPORT_EXTRACT_CONCURRENCY: usize = 2;
+
+/// 把长文档确定性切分为多段，每段随后独立调 LLM 抽取（输出小、不截断）。
+///
+/// 策略（标题优先 + 字符回退）：
+/// 1. 总 char ≤ SINGLE_MAX → 单段返回（零回归路径）。
+/// 2. 否则按 markdown 标题行（`#` 开头，对齐 `build_section_index`）切成原子块。
+/// 3. 贪心打包相邻块到 TARGET；单块超 HARD_MAX → 先 flush 累积段，再按段落窗口切该块。
+/// 4. 无标题的纯长文 → 步骤 2 得单块 → 走步骤 3 的段落窗口兜底。
+/// 5. 结果为空 → 兜底整篇单段。
+pub(super) fn split_import_content(content: &str) -> Vec<String> {
+    if content.chars().count() <= IMPORT_SINGLE_CALL_MAX_CHARS {
+        return vec![content.to_string()];
+    }
+    // 按标题行切原子块：标题行开启一个新块，标题前的前言归入第一个块。
+    let mut atoms: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for line in content.split_inclusive('\n') {
+        if line.trim_start().starts_with('#') && !current.is_empty() {
+            atoms.push(std::mem::take(&mut current));
+        }
+        current.push_str(line);
+    }
+    if !current.is_empty() {
+        atoms.push(current);
+    }
+
+    let mut segments: Vec<String> = Vec::new();
+    let mut acc = String::new();
+    for atom in atoms {
+        if atom.chars().count() > IMPORT_SEGMENT_HARD_MAX_CHARS {
+            // 先 flush 已累积段，再把这个超大块按段落窗口切开。
+            if !acc.trim().is_empty() {
+                segments.push(std::mem::take(&mut acc));
+            } else {
+                acc.clear();
+            }
+            segments.extend(split_oversized_by_paragraph(&atom));
+            continue;
+        }
+        if !acc.is_empty() && acc.chars().count() + atom.chars().count() > IMPORT_SEGMENT_TARGET_CHARS {
+            segments.push(std::mem::take(&mut acc));
+        }
+        acc.push_str(&atom);
+    }
+    if !acc.trim().is_empty() {
+        segments.push(acc);
+    }
+    segments.retain(|s| !s.trim().is_empty());
+    if segments.is_empty() {
+        return vec![content.to_string()];
+    }
+    segments
+}
+
+/// 把超过 HARD_MAX 的单块按段落边界（`\n\n`）打包成 ≤ TARGET 的窗口，
+/// 绝不在句子中间断开。单个段落本身就超 HARD_MAX 时整段独立成窗口（不再硬切字符，
+/// 保持语义完整——极端超长段落交给 LLM，仍比整篇小得多）。
+fn split_oversized_by_paragraph(block: &str) -> Vec<String> {
+    let mut windows: Vec<String> = Vec::new();
+    let mut acc = String::new();
+    for para in block.split_inclusive("\n\n") {
+        if !acc.is_empty() && acc.chars().count() + para.chars().count() > IMPORT_SEGMENT_TARGET_CHARS {
+            windows.push(std::mem::take(&mut acc));
+        }
+        acc.push_str(para);
+    }
+    if !acc.trim().is_empty() {
+        windows.push(acc);
+    }
+    windows.retain(|s| !s.trim().is_empty());
+    if windows.is_empty() {
+        return vec![block.to_string()];
+    }
+    windows
+}
+
+/// 合并多段 LLM 抽取出的 document 原始值（标量取首个非空；数组字段取并集去重）。
+/// rawContent / lineIndex / sectionIndex 不在此处理——由
+/// `normalize_operation_knowledge_preview_document` 从完整 `payload.content` 重算。
+fn merge_preview_documents(docs: &[Value]) -> Option<Value> {
+    if docs.is_empty() {
+        return None;
+    }
+    let first_str = |key: &str| -> Option<String> {
+        docs.iter()
+            .find_map(|d| json_string(d, key).filter(|s| !s.trim().is_empty()))
+    };
+    let union_list = |camel: &str, snake: &str| -> Vec<String> {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut out = Vec::new();
+        for d in docs {
+            let list = json_string_list(d, camel)
+                .or_else(|| json_string_list(d, snake))
+                .unwrap_or_default();
+            for item in list {
+                if seen.insert(item.clone()) {
+                    out.push(item);
+                }
+            }
+        }
+        out
+    };
+    // summary / catalogSummary 拼接各段非空值（各段视角不同，拼接比取首个信息更全）。
+    let join_nonempty = |camel: &str, snake: &str| -> String {
+        docs.iter()
+            .filter_map(|d| {
+                json_string(d, camel)
+                    .or_else(|| json_string(d, snake))
+                    .filter(|s| !s.trim().is_empty())
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    Some(json!({
+        "domain": first_str("domain"),
+        "sourceType": first_str("sourceType").or_else(|| first_str("source_type")),
+        "sourceName": first_str("sourceName").or_else(|| first_str("source_name")),
+        "title": first_str("title"),
+        "summary": join_nonempty("summary", "summary"),
+        "catalogSummary": join_nonempty("catalogSummary", "catalog_summary"),
+        "routingMap": union_list("routingMap", "routing_map"),
+        "riskNotes": union_list("riskNotes", "risk_notes"),
+        "productTags": union_list("productTags", "product_tags"),
+        "businessTopics": union_list("businessTopics", "business_topics"),
+        "status": first_str("status"),
+    }))
+}
+
 pub async fn import_operation_knowledge_preview(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Json(payload): Json<OperationKnowledgeImportRequest>,
 ) -> AppResult<Json<Value>> {
     if payload.content.trim().is_empty() {
         return Err(AppError::BadRequest("content is required".to_string()));
     }
+    // 小文档（≤ SINGLE_MAX，单段）→ 原样同步秒回，与今天字节等价（零回归）。
+    if payload.content.chars().count() <= IMPORT_SINGLE_CALL_MAX_CHARS {
+        let result = run_import_extraction(&state, &payload, None).await?;
+        return Ok(Json(result));
+    }
+    // 大文档 → 建 import_jobs（pending），返回 jobId 交由 import_worker 异步跑，前端轮询。
+    let segments_total = count_import_segments(&payload.content) as i32;
+    let now = DateTime::now();
+    assert_import_job_status_valid("pending");
+    let job = ImportJob {
+        id: None,
+        workspace_id: admin.current_workspace.clone(),
+        account_id: payload.account_id.clone(),
+        source_name: payload
+            .source_name
+            .clone()
+            .unwrap_or_else(|| "导入文本".to_string()),
+        content: payload.content.clone(),
+        segments_total,
+        progress_done: 0,
+        progress_succeeded: 0,
+        progress_failed: 0,
+        status: "pending".to_string(),
+        result: None,
+        error: None,
+        claimed_at: None,
+        claim_recovery_count: 0,
+        expires_at: None,
+        created_at: now,
+        updated_at: now,
+    };
+    let inserted = state.db.import_jobs().insert_one(&job, None).await?;
+    let job_id = inserted
+        .inserted_id
+        .as_object_id()
+        .map(|oid| oid.to_hex())
+        .unwrap_or_default();
+    Ok(Json(json!({
+        "jobId": job_id,
+        "async": true,
+        "segmentsTotal": segments_total,
+    })))
+}
+
+/// GET `/operation-knowledge/import-preview-job/:id`：前端每 ~2s 轮询导入 job 进度。
+/// IDOR 收口：只返回属当前 workspace 的 job（仿现有 admin handler workspace 隔离）。
+pub async fn get_import_preview_job(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
+    Path(id): Path<String>,
+) -> AppResult<Json<Value>> {
+    let job_id = ObjectId::parse_str(&id)
+        .map_err(|_| AppError::BadRequest("invalid job id".to_string()))?;
+    let job = state
+        .db
+        .import_jobs()
+        .find_one(
+            doc! { "_id": job_id, "workspace_id": &admin.current_workspace },
+            None,
+        )
+        .await?
+        .ok_or_else(|| AppError::NotFound("import job not found".to_string()))?;
+    Ok(Json(import_job_progress_json(&job)))
+}
+
+/// GET `/operation-knowledge/import-preview-jobs?status=running`：本 workspace 进行中
+/// job 列表（跨会话/跨设备发现用，不依赖 localStorage）。默认返回 running。
+pub async fn list_import_preview_jobs(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
+    Query(query): Query<ImportJobListQuery>,
+) -> AppResult<Json<Value>> {
+    let status = query.status.unwrap_or_else(|| "running".to_string());
+    assert_import_job_status_valid(&status);
+    let filter = doc! { "workspace_id": &admin.current_workspace, "status": &status };
+    // 列表按最新在前。
+    let opts = FindOptions::builder()
+        .sort(doc! { "created_at": -1 })
+        .limit(50)
+        .build();
+    let mut cursor = state.db.import_jobs().find(filter, opts).await?;
+    let mut jobs = Vec::new();
+    while let Some(job) = cursor.try_next().await? {
+        jobs.push(import_job_progress_json(&job));
+    }
+    Ok(Json(json!({ "jobs": jobs })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ImportJobListQuery {
+    status: Option<String>,
+}
+
+/// 把 job 投影成前端轮询用的 camelCase 进度 json。完成时带 `result`（同步 preview
+/// 响应体），失败时带 `error`。
+fn import_job_progress_json(job: &ImportJob) -> Value {
+    json!({
+        "jobId": job.id.map(|oid| oid.to_hex()).unwrap_or_default(),
+        "status": job.status,
+        "progress": {
+            "done": job.progress_done,
+            "total": job.segments_total,
+            "succeeded": job.progress_succeeded,
+            "failed": job.progress_failed,
+        },
+        "result": job.result,
+        "error": job.error,
+    })
+}
+
+/// 长文档分块抽取的共享逻辑：split → 并发抽取（buffered）→ 合并 document/items/chunks
+/// → D2 锚定（对完整原文）。同步 preview handler 与异步 import worker 都复用它，
+/// 分块/合并/锚定逻辑与原内联版本字节等价。
+///
+/// `pub`（经 `routes::ext_knowledge` 导出）：real-LLM 集成测试直调它验真模型抽取，
+/// 绕过 handler 的大/小文档 job 分流（测试只关心抽取结果，不涉及异步 job）。
+pub async fn run_import_extraction(
+    state: &AppState,
+    payload: &OperationKnowledgeImportRequest,
+    progress: Option<&(dyn Fn(usize, usize, usize) + Send + Sync)>,
+) -> AppResult<Value> {
     let system = "你是企业微信运营知识库导入 Agent。你把长文本拆成 Agent 可渐进查询的文档目录、知识包、知识切片和证据块。只输出严格 JSON。";
     let source_name = payload
         .source_name
         .clone()
         .unwrap_or_else(|| "导入文本".to_string());
-    let user = LONG_IMPORT_PROMPT_TEMPLATE
-        .replace("{SOURCE_NAME}", &source_name)
-        .replace("{CONTENT}", &payload.content);
-    let value = agent::generate_agent_json(
-        &state,
-        payload.account_id.as_deref(),
-        None,
-        None,
-        "knowledge.import.preview",
-        system,
-        &user,
-    )
-    .await?;
-    let document = value
-        .get("document")
-        .cloned()
+
+    // 后端自动分块：长文档切成多段，每段独立调 LLM（输出小、不截断），并发抽取后合并。
+    // 小文档（≤ SINGLE_MAX）切分返回单段 → 与分块前字节等价，零回归。
+    let segments = split_import_content(&payload.content);
+    let total_segments = segments.len();
+    // 段完成计数：`buffered` 下并发段完成顺序不定，用原子计数给进度回调喂
+    // 单调的 done/succeeded/failed 快照（worker 侧回写 job 进度，同步路径传 None）。
+    let done_counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let succeeded_counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let failed_counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let extractions: Vec<(usize, AppResult<Value>)> = stream::iter(segments.into_iter().enumerate())
+        .map(|(idx, segment)| {
+            let state = &state;
+            let system = system;
+            let source_name = source_name.clone();
+            let account_id = payload.account_id.clone();
+            let done_counter = done_counter.clone();
+            let succeeded_counter = succeeded_counter.clone();
+            let failed_counter = failed_counter.clone();
+            async move {
+                let user = LONG_IMPORT_PROMPT_TEMPLATE
+                    .replace("{SOURCE_NAME}", &source_name)
+                    .replace("{CONTENT}", &segment);
+                let result = agent::generate_agent_json(
+                    state,
+                    account_id.as_deref(),
+                    None,
+                    None,
+                    "knowledge.import.preview",
+                    system,
+                    &user,
+                )
+                .await;
+                use std::sync::atomic::Ordering::SeqCst;
+                if result.is_ok() {
+                    succeeded_counter.fetch_add(1, SeqCst);
+                } else {
+                    failed_counter.fetch_add(1, SeqCst);
+                }
+                let done = done_counter.fetch_add(1, SeqCst) + 1;
+                if let Some(cb) = progress {
+                    cb(
+                        done,
+                        succeeded_counter.load(SeqCst),
+                        failed_counter.load(SeqCst),
+                    );
+                }
+                (idx, result)
+            }
+        })
+        .buffered(IMPORT_EXTRACT_CONCURRENCY)
+        .collect()
+        .await;
+
+    // 保序收集成功段；单段失败记 warning 跳过，全失败才报错。
+    let mut ordered = extractions;
+    ordered.sort_by_key(|(idx, _)| *idx);
+    let mut values: Vec<Value> = Vec::new();
+    let mut succeeded = 0usize;
+    let mut failed = 0usize;
+    for (idx, result) in ordered {
+        match result {
+            Ok(value) => {
+                succeeded += 1;
+                values.push(value);
+            }
+            Err(err) => {
+                failed += 1;
+                tracing::warn!(
+                    segment_index = idx,
+                    total_segments,
+                    error = %err,
+                    "import preview: segment extraction failed (skipped)"
+                );
+            }
+        }
+    }
+    if values.is_empty() {
+        return Err(AppError::External(format!(
+            "import preview: 全部 {total_segments} 段抽取均失败"
+        )));
+    }
+
+    // 合并 document（确定性，不额外调 LLM）。
+    let doc_values: Vec<Value> = values
+        .iter()
+        .filter_map(|v| v.get("document").cloned())
+        .collect();
+    let document = merge_preview_documents(&doc_values)
         .map(|item| normalize_operation_knowledge_preview_document(item, &payload))
         .unwrap_or_else(|| default_operation_knowledge_preview_document(&payload));
-    let items = value
-        .get("items")
-        .and_then(|item| item.as_array())
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
+
+    // 合并 items / chunks（各段按序拼接）。
+    let items = values
+        .iter()
+        .filter_map(|v| v.get("items").and_then(|i| i.as_array()).cloned())
+        .flatten()
         .map(|item| normalize_operation_knowledge_preview_item(item, &payload))
         .collect::<Vec<_>>();
-    let mut chunks = value
-        .get("chunks")
-        .and_then(|item| item.as_array())
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
+    let mut chunks = values
+        .iter()
+        .filter_map(|v| v.get("chunks").and_then(|c| c.as_array()).cloned())
+        .flatten()
         .map(|item| normalize_operation_knowledge_preview_chunk(item, &payload))
         .collect::<Vec<_>>();
+
+    // D2 锚定：仍对完整原文跑一次，每 chunk 的 sourceQuote 在全文锚定（红线不动）。
     let integrity_report = integrity_report_for_preview(&payload.content, &mut chunks);
-    Ok(Json(
-        json!({ "document": document, "items": items, "chunks": chunks, "integrityReport": integrity_report }),
-    ))
+    Ok(json!({
+        "document": document,
+        "items": items,
+        "chunks": chunks,
+        "integrityReport": integrity_report,
+        "importReport": {
+            "totalSegments": total_segments,
+            "succeeded": succeeded,
+            "failed": failed,
+        },
+    }))
+}
+
+/// `import_worker` 复用的抽取入口：从 job 的原始字段重建请求并调
+/// [`run_import_extraction`]，把段完成进度经回调透出（worker 回写 job 进度）。
+/// 走同一 `run_import_extraction`，与同步 preview handler 字节等价。
+///
+/// 独立 wrapper 是因为 `OperationKnowledgeImportRequest` 字段是 `pub(super)`，
+/// crate-root 的 worker 无法直接构造；由本模块内构造后委托。
+pub(crate) async fn run_import_extraction_for_job(
+    state: &AppState,
+    account_id: Option<String>,
+    source_name: Option<String>,
+    content: String,
+    progress: Option<&(dyn Fn(usize, usize, usize) + Send + Sync)>,
+) -> AppResult<Value> {
+    let payload = OperationKnowledgeImportRequest {
+        account_id,
+        source_name,
+        content,
+    };
+    run_import_extraction(state, &payload, progress).await
+}
+
+/// `import_worker` 建 job 前预算段数（`segments_total`）。与
+/// [`run_import_extraction`] 内的 `split_import_content` 同源，保证一致。
+pub(crate) fn count_import_segments(content: &str) -> usize {
+    split_import_content(content).len()
 }
 
 #[derive(Debug, Deserialize)]
@@ -968,6 +1336,147 @@ mod tests {
         // 占位符仍在，运行时 .replace() 依赖
         assert!(LONG_IMPORT_PROMPT_TEMPLATE.contains("{SOURCE_NAME}"));
         assert!(LONG_IMPORT_PROMPT_TEMPLATE.contains("{CONTENT}"));
+    }
+
+    #[test]
+    fn import_job_progress_json_matches_contract_fixture() {
+        // 异步导入 job 进度端点（get/list）的响应形状：前端轮询按此键集读进度。
+        // 构造 completed 态带 result（顶层键集最全）固化契约。
+        let job = ImportJob {
+            id: Some(ObjectId::parse_str("64a1f2c3e4b5a6978899b002").unwrap()),
+            workspace_id: "ws-1".to_string(),
+            account_id: Some("acc-1".to_string()),
+            source_name: "产品手册".to_string(),
+            content: "原文全文".to_string(),
+            segments_total: 5,
+            progress_done: 5,
+            progress_succeeded: 5,
+            progress_failed: 0,
+            status: "completed".to_string(),
+            result: Some(json!({ "document": {}, "items": [], "chunks": [] })),
+            error: None,
+            claimed_at: None,
+            claim_recovery_count: 0,
+            expires_at: Some(DateTime::from_millis(1_700_086_500_000)),
+            created_at: DateTime::from_millis(1_700_000_000_000),
+            updated_at: DateTime::from_millis(1_700_000_100_000),
+        };
+        let projected = import_job_progress_json(&job);
+        crate::routes::contract_snapshot::assert_contract_fixture("import_job_progress", projected);
+    }
+
+    // ── split_import_content：后端自动分块（零回归 + 各回退分支） ──────────
+
+    #[test]
+    fn split_small_doc_returns_single_segment_verbatim() {
+        // ≤ SINGLE_MAX：单段返回，内容逐字不变（零回归路径）。
+        let content = "# 标题\n\n一段很短的内容。";
+        let segs = split_import_content(content);
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0], content);
+    }
+
+    #[test]
+    fn split_at_exactly_single_max_stays_single() {
+        // 恰好 = SINGLE_MAX 时仍走单段（边界：<= 判定）。
+        let content = "甲".repeat(IMPORT_SINGLE_CALL_MAX_CHARS);
+        let segs = split_import_content(&content);
+        assert_eq!(segs.len(), 1);
+    }
+
+    #[test]
+    fn split_large_doc_by_headings_packs_segments() {
+        // 超 SINGLE_MAX 的多标题文档 → 按标题切原子块后贪心打包成多段。
+        let mut content = String::new();
+        for i in 0..20 {
+            content.push_str(&format!("## 小节 {i}\n"));
+            content.push_str(&"内容".repeat(200));
+            content.push('\n');
+        }
+        let segs = split_import_content(&content);
+        assert!(segs.len() >= 2, "多标题长文应切成多段, got {}", segs.len());
+        // 每段都不超 HARD_MAX（除非单个原子块本身超限，本用例每块 ~400 char 不会）。
+        for s in &segs {
+            assert!(
+                s.chars().count() <= IMPORT_SEGMENT_HARD_MAX_CHARS,
+                "段长 {} 超 HARD_MAX",
+                s.chars().count()
+            );
+        }
+        // 无损：所有段拼回等于原文。
+        assert_eq!(segs.concat(), content);
+    }
+
+    #[test]
+    fn split_oversized_section_falls_back_to_paragraphs() {
+        // 单个标题小节就超 HARD_MAX → 按段落窗口再切。
+        let mut section = String::from("## 巨型小节\n");
+        for _ in 0..10 {
+            section.push_str(&"这是一个段落。".repeat(120));
+            section.push_str("\n\n");
+        }
+        assert!(section.chars().count() > IMPORT_SEGMENT_HARD_MAX_CHARS);
+        let segs = split_import_content(&section);
+        assert!(segs.len() >= 2, "超大单小节应按段落切成多段");
+        assert_eq!(segs.concat(), section);
+    }
+
+    #[test]
+    fn split_headingless_long_text_falls_back_to_paragraphs() {
+        // 无任何标题的纯长文 → 单原子块超 HARD_MAX → 段落窗口兜底。
+        let mut content = String::new();
+        for _ in 0..12 {
+            content.push_str(&"没有标题的一段流水文本。".repeat(100));
+            content.push_str("\n\n");
+        }
+        assert!(content.chars().count() > IMPORT_SEGMENT_HARD_MAX_CHARS);
+        let segs = split_import_content(&content);
+        assert!(segs.len() >= 2, "无标题长文应按段落切成多段");
+        assert_eq!(segs.concat(), content);
+    }
+
+    #[test]
+    fn split_empty_and_whitespace_have_single_segment() {
+        // 空 / 纯空白：走单段（≤ SINGLE_MAX），不 panic。
+        assert_eq!(split_import_content("").len(), 1);
+        assert_eq!(split_import_content("   \n  ").len(), 1);
+    }
+
+    #[test]
+    fn merge_preview_documents_unions_arrays_and_joins_summaries() {
+        let docs = vec![
+            json!({
+                "title": "文档A",
+                "summary": "摘要一",
+                "routingMap": ["目录1", "目录2"],
+                "productTags": ["套餐A"],
+            }),
+            json!({
+                "title": "文档B",
+                "summary": "摘要二",
+                "routingMap": ["目录2", "目录3"],
+                "productTags": ["套餐B"],
+            }),
+        ];
+        let merged = merge_preview_documents(&docs).unwrap();
+        // 标量取首个非空。
+        assert_eq!(merged.get("title").unwrap().as_str().unwrap(), "文档A");
+        // summary 拼接各段非空值。
+        assert_eq!(
+            merged.get("summary").unwrap().as_str().unwrap(),
+            "摘要一\n摘要二"
+        );
+        // routingMap 并集去重（目录2 只出现一次）。
+        let rm = merged.get("routingMap").unwrap().as_array().unwrap();
+        assert_eq!(rm.len(), 3);
+        // productTags 并集。
+        let pt = merged.get("productTags").unwrap().as_array().unwrap();
+        assert_eq!(pt.len(), 2);
+    }
+
+    #[test]
+    fn merge_preview_documents_empty_returns_none() {
+        assert!(merge_preview_documents(&[]).is_none());
     }
 }
 
