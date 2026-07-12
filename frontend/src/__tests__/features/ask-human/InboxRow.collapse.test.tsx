@@ -15,4 +15,19 @@ describe("InboxRow 折叠壳", () => {
     fireEvent.click(screen.getByText("#EQERR").closest("button")!);
     expect(screen.getByText("展开详情内容")).toBeInTheDocument();
   });
+
+  it("传 tag 时渲染 pill,不传时不渲染", () => {
+    const { rerender } = render(
+      <InboxRow badge={{ label: "知识核验", tone: "brand" }} title="切片A" preview="" tag={{ label: "AI预审通过·待复核", tone: "held" }}>
+        <div>body</div>
+      </InboxRow>,
+    );
+    expect(screen.getByText("AI预审通过·待复核")).toBeInTheDocument();
+    rerender(
+      <InboxRow badge={{ label: "知识核验", tone: "brand" }} title="切片B" preview="">
+        <div>body</div>
+      </InboxRow>,
+    );
+    expect(screen.queryByText("AI预审通过·待复核")).toBeNull();
+  });
 });

@@ -232,6 +232,19 @@
 .inboxBadge--running { background: var(--fill-running); }
 .inboxBadge--neutral { background: var(--fill-inactive); }
 
+.inboxTag {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 8px;
+  margin-left: 6px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 500;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.inboxTag--held { background: var(--fill-held); color: var(--ink-1); }
+
 /* 请示裁决卡内部 */
 .escalationInlineTitle { font-size: 14px; font-weight: 650; color: var(--ink-1); }
 .escalationInlineSummary { font-size: 13px; color: var(--ink-2); margin: 6px 0 10px; line-height: 1.5; }
