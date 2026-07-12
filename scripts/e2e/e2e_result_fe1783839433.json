@@ -1,0 +1,16 @@
+{
+  "sourceName": "星零感E2E-fe1783839433",
+  "preview": {
+    "chunks": 131,
+    "items": 21,
+    "importReport": {
+      "totalSegments": 5,
+      "succeeded": 5,
+      "failed": 0
+    }
+  },
+  "apply": {
+    "status": null,
+    "chunkIds": []
+  }
+}

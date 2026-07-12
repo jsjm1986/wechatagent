@@ -21,7 +21,7 @@ use crate::models::{
     ChunkRevision, Contact,
     ContentAsset, ConversationMessage, DomainProfile, DomainSchema, EvaluationScenario, Experiment, IngestSource,
     KnowledgeChatTask, KnowledgeChatTurn, KnowledgeDailyReport, KnowledgeGapSignal,
-    KnowledgeOperatorMemory, KnowledgeUsageLog, LlmCallLog, LlmProviderConfig,
+    ImportJob, KnowledgeOperatorMemory, KnowledgeUsageLog, LlmCallLog, LlmProviderConfig,
     ManagementAgentMessage, ManagementAgentSession, McpCallLog, MemoryCandidate, MigrationRecord,
     OperatingMemory, OperationDomainConfig, OperationKnowledgeChunk, OperationKnowledgeDocument,
     OperationPlaybook, OutboxEntry, PostReleaseReview, Product, PromptTemplate,
@@ -81,6 +81,12 @@ impl Database {
 
     pub fn tasks(&self) -> Collection<AgentTask> {
         self.db.collection("agent_tasks")
+    }
+
+    /// 异步知识导入 job（`import_jobs` 集合）。长文档 preview 落 job，`import_worker`
+    /// 认领并跑分块抽取，前端轮询进度。索引见 `db/indexes.rs`。
+    pub fn import_jobs(&self) -> Collection<ImportJob> {
+        self.db.collection("import_jobs")
     }
 
     pub fn events(&self) -> Collection<AgentEvent> {

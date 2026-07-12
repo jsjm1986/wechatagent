@@ -130,6 +130,42 @@ pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
             None,
         )
         .await?;
+    // 异步导入 job：前端按 workspace 跨会话发现进行中 job。
+    db.import_jobs()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "workspace_id": 1, "status": 1 })
+                .build(),
+            None,
+        )
+        .await?;
+    // import_worker 认领 pending + 孤儿 running（claimed_at 过期）重认领。
+    db.import_jobs()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "status": 1, "claimed_at": 1 })
+                .build(),
+            None,
+        )
+        .await?;
+    // 终态 job 24h 清扫（设计要求，防 result 无界堆积）。expireAfterSeconds=0：
+    // Mongo 在 `expires_at < now()` 时删。worker 落 completed/failed 时置
+    // `expires_at = now + 24h`；pending/running 不设该字段 → TTL 忽略缺失字段，
+    // 进行中 job 绝不被误删（与 knowledge_operator_memory 的 expires_at TTL 同构）。
+    db.import_jobs()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "expires_at": 1 })
+                .options(
+                    IndexOptions::builder()
+                        .name("import_jobs_expires_ttl".to_string())
+                        .expire_after(std::time::Duration::from_secs(0))
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
     db.events()
         .create_index(
             IndexModel::builder()

@@ -84,6 +84,8 @@ mod tests {
             llm_max_retries: 1,
             llm_retry_base_ms: 100,
             task_claim_timeout_seconds: 5,
+            import_worker_interval_seconds: 30,
+            import_job_claim_timeout_seconds: 5,
             reaction_analysis_claim_timeout_seconds: 5,
             webhook_rate_limit_window_seconds: 60,
             webhook_rate_limit_capacity: 1000,

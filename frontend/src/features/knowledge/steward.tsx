@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo, Fragment, type FormEvent } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo, Fragment, type FormEvent } from "react";
 import {
   Archive,
   CheckCircle2,
@@ -606,6 +606,29 @@ interface ImportPreviewResult {
   chunks?: ImportPreviewChunk[];
 }
 
+interface ImportJobProgress {
+  done: number;
+  total: number;
+  succeeded: number;
+  failed: number;
+}
+
+// 大文档异步导入 job 的轮询状态。小文档同步路径不产生 job。
+interface ImportJobStatus {
+  jobId: string;
+  status: "pending" | "running" | "completed" | "failed";
+  progress?: ImportJobProgress | null;
+  result?: ImportPreviewResult | null;
+  error?: string | null;
+}
+
+// POST /import-preview 大文档时的响应（小文档直接返回 ImportPreviewResult）。
+interface ImportPreviewAsyncResponse {
+  jobId?: string;
+  async?: boolean;
+  segmentsTotal?: number;
+}
+
 export function ImportWizard() {
   const confirm = useConfirm();
   const [step, setStep] = useState<1 | 2 | 3>(1);
@@ -619,6 +642,31 @@ export function ImportWizard() {
   const [created, setCreated] = useState<string[]>([]);
   // G-后续/4：AI 重抽 tags 按钮单条 loading 标记。
   const [retagging, setRetagging] = useState<number | null>(null);
+  // 大文档异步导入：轮询 job 进度（小文档走同步路径，jobProgress 恒 null）。
+  const [jobProgress, setJobProgress] = useState<ImportJobStatus | null>(null);
+  const pollRef = useRef<number | null>(null);
+
+  // 跨会话恢复 + 卸载清理：进向导时按 workspace 查进行中 job（不依赖 localStorage），
+  // 有则恢复到轮询态继续显示进度；组件卸载时清 interval 防泄漏。
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const r = await fetch("/api/operation-knowledge/import-preview-jobs?status=running");
+        if (!r.ok) return;
+        const data = (await r.json()) as { jobs?: ImportJobStatus[] };
+        const running = (data.jobs ?? [])[0];
+        if (!cancelled && running?.jobId) startPolling(running.jobId);
+      } catch {
+        /* 无进行中 job 或网络问题，忽略 */
+      }
+    })();
+    return () => {
+      cancelled = true;
+      stopPolling();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // 文件直接落库前的知情确认（PDF/图片无逐条预览，B3）
   const confirmImport = (title: string, body: string) =>
@@ -658,6 +706,57 @@ export function ImportWizard() {
     }
   }
 
+  // 用抽取结果填 preview 并进 step2（同步秒回与异步 job 完成共用）。
+  function acceptPreviewResult(data: ImportPreviewResult) {
+    setPreview(data);
+    const all = new Set<number>();
+    (data.chunks ?? []).forEach((_, i) => all.add(i));
+    setSelected(all);
+    setEdits({});
+    setStep(2);
+  }
+
+  function stopPolling() {
+    if (pollRef.current !== null) {
+      window.clearInterval(pollRef.current);
+      pollRef.current = null;
+    }
+  }
+
+  // 每 2s 轮询 job 进度：running 更新进度文案，completed 用 result 填 preview，
+  // failed 显错。三态均清 interval。
+  function startPolling(jobId: string) {
+    stopPolling();
+    setPending(true);
+    setJobProgress({ jobId, status: "pending", progress: null });
+    const poll = async () => {
+      try {
+        const r = await fetch(`/api/operation-knowledge/import-preview-job/${jobId}`);
+        if (!r.ok) throw await parseApiError(r);
+        const data = (await r.json()) as ImportJobStatus;
+        setJobProgress(data);
+        if (data.status === "completed") {
+          stopPolling();
+          setPending(false);
+          setJobProgress(null);
+          if (data.result) acceptPreviewResult(data.result);
+        } else if (data.status === "failed") {
+          stopPolling();
+          setPending(false);
+          setJobProgress(null);
+          setError(`导入失败：${data.error ?? "未知错误"}`);
+        }
+      } catch (e) {
+        stopPolling();
+        setPending(false);
+        setJobProgress(null);
+        setError(String(e));
+      }
+    };
+    void poll();
+    pollRef.current = window.setInterval(() => void poll(), 2000);
+  }
+
   async function runPreview() {
     if (!content.trim()) return;
     setPending(true);
@@ -669,16 +768,16 @@ export function ImportWizard() {
         body: JSON.stringify({ content, sourceName: sourceName.trim() || null })
       });
       if (!r.ok) throw await parseApiError(r);
-      const data = (await r.json()) as ImportPreviewResult;
-      setPreview(data);
-      const all = new Set<number>();
-      (data.chunks ?? []).forEach((_, i) => all.add(i));
-      setSelected(all);
-      setEdits({});
-      setStep(2);
+      const data = (await r.json()) as ImportPreviewResult & ImportPreviewAsyncResponse;
+      // 大文档 → 后端返回 jobId，进轮询态；小文档 → 响应即 preview，直接进 step2。
+      if (data.jobId) {
+        startPolling(data.jobId);
+      } else {
+        acceptPreviewResult(data);
+        setPending(false);
+      }
     } catch (e) {
       setError(String(e));
-    } finally {
       setPending(false);
     }
   }
@@ -772,6 +871,13 @@ export function ImportWizard() {
               AI 会把内容拆成多条知识，全部保存为待确认草稿，需你逐条确认后 AI 才会使用。
             </span>
           </div>
+          {jobProgress ? (
+            <div style={{ marginTop: 10, padding: "8px 12px", border: "1px solid var(--border)", borderRadius: 6, fontSize: 12, color: "var(--muted)" }}>
+              {jobProgress.progress && jobProgress.progress.total > 0
+                ? `长文档导入进行中，已完成 ${jobProgress.progress.done}/${jobProgress.progress.total} 段，可留在本页等待或稍后回来继续查看。`
+                : "长文档导入排队中，正在准备…"}
+            </div>
+          ) : null}
           <div style={{ marginTop: 14, padding: "10px 12px", border: "1px dashed var(--border)", borderRadius: 6 }}>
             <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 6 }}>
               上传文件后由 AI 自动识别为草稿知识，结果同样需在「待评审」里确认后才会被 AI 使用。

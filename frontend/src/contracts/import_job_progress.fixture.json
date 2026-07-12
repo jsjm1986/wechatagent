@@ -1,0 +1,16 @@
+{
+  "error": null,
+  "jobId": "64a1f2c3e4b5a6978899b002",
+  "progress": {
+    "done": 5,
+    "failed": 0,
+    "succeeded": 5,
+    "total": 5
+  },
+  "result": {
+    "chunks": [],
+    "document": {},
+    "items": []
+  },
+  "status": "completed"
+}

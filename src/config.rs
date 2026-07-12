@@ -44,6 +44,11 @@ pub struct AppConfig {
     /// HP-1 / Task 9：Worker 进程崩溃后，状态卡在 `running` 的任务的回收阈值。
     /// `claimed_at` 早于 `now - 该秒数` 即视为 stale，由下一次 tick 重置回 `retry`。
     pub task_claim_timeout_seconds: u64,
+    /// 异步知识导入 worker 的轮询周期秒数（默认 2，求启动延迟低）。
+    pub import_worker_interval_seconds: u64,
+    /// 异步导入 job 的孤儿回收阈值秒数（默认 600 / 10 分钟，覆盖长文档墙钟 + 余量）。
+    /// `running` 且 `claimed_at` 早于 `now - 该秒数` 视为进程崩溃遗留，重认领重跑。
+    pub import_job_claim_timeout_seconds: u64,
     /// HP-3 / Task 10：reaction analysis claim 锁的超时阈值。
     /// `outcome_status="analyzing"` 但 `reaction_claimed_at` 早于 `now - 该秒数`
     /// 的 review 会被视为分析进程崩溃，允许下次 webhook 重新 claim。
@@ -443,6 +448,9 @@ impl AppConfig {
             llm_max_retries: env_or("LLM_MAX_RETRIES", "5").parse()?,
             llm_retry_base_ms: env_or("LLM_RETRY_BASE_MS", "1500").parse()?,
             task_claim_timeout_seconds: env_or("TASK_CLAIM_TIMEOUT_SECONDS", "300").parse()?,
+            import_worker_interval_seconds: env_or("IMPORT_WORKER_INTERVAL_SECONDS", "2").parse()?,
+            import_job_claim_timeout_seconds: env_or("IMPORT_JOB_CLAIM_TIMEOUT_SECONDS", "600")
+                .parse()?,
             reaction_analysis_claim_timeout_seconds: env_or(
                 "REACTION_ANALYSIS_CLAIM_TIMEOUT_SECONDS",
                 "60",
