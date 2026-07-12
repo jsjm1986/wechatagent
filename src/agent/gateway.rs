@@ -2470,41 +2470,24 @@ async fn run_user_operation_gateway_inner(
     let mut outbox_eligible = final_decision.should_reply
         && !final_decision.reply_text.trim().is_empty()
         && (final_status == "approved" || final_status == "revision_applied_approved");
-    // relay 出站红线守卫（代码级兜底）：relay 转述要求 AI 口吻重组、绝不透传内部
-    // 载荷（__PRINCIPAL_RELAY__/verdict=/substance=/constraints=）；同时绝不编造领导
-    // 授权之外的数量事实（授权"9折"不得转成"8折"或加"95%成功率"）。此前仅靠 prompt
-    // 约束；这里在入 outbox 前对 relay run 的拟发文本做最后两道纯函数检查，命中即
-    // fail-closed：不入队该文本（宁可客户这轮收不到，也绝不把内部载荷/编造数字发给
-    // 客户），记 event + warn 供运维定位。非 relay run 不受影响。数字白名单的授权源
-    // 取合成 relay 消息的完整载荷（含 substance + constraints 里领导授权的全部数字）。
+    // relay 出站红线守卫（代码级兜底）：relay 转述绝不透传内部载荷
+    // （__PRINCIPAL_RELAY__/verdict=/substance=/constraints=）。命中即 fail-closed：
+    // 不入队该文本（宁可客户这轮收不到，也绝不把内部载荷标记发给客户），记 event + warn
+    // 供运维定位。非 relay run 不受影响。
+    //
+    // 注：转述是否忠于领导授权（不编造授权外折扣/数字）由生成侧 prompt（substance 是
+    // 唯一事实源）+ 独立 Review Agent（已同时看到授权 substance 与拟发转述）做语义级把关，
+    // 不再用字符级数字白名单 backstop——后者威胁模型错误（既漏中文数字、又误杀无害的
+    // 时间/序数/等价折扣数字，其 fail-closed 曾致 KD-03 裁决黑洞），已删除（KD-01/03）。
     if outbox_eligible && escalation::is_principal_relay_trigger(&trigger) {
-        let authorized_payload = match &trigger {
-            AgentTrigger::Inbound(m) => m.content.as_str(),
-            AgentTrigger::FollowUp(_) => "",
-        };
         let leaks_payload =
             escalation::relay_output_leaks_internal_payload(&final_decision.reply_text);
-        let unauthorized_number = escalation::relay_introduces_unauthorized_number(
-            &final_decision.reply_text,
-            authorized_payload,
-        );
-        if leaks_payload || unauthorized_number {
+        if leaks_payload {
             outbox_eligible = false;
-            let (warn_reason, event_reason) = if leaks_payload {
-                (
-                    "relay 转述拟发文本疑似泄漏内部载荷，已拦截不发（fail-closed）",
-                    "relay 转述输出含内部载荷标记，安全门拦截不发送",
-                )
-            } else {
-                (
-                    "relay 转述拟发文本含授权外数字事实，已拦截不发（fail-closed）",
-                    "relay 转述输出含授权外数字事实，安全门拦截不发送",
-                )
-            };
             tracing::warn!(
                 %run_id,
                 contact_wxid = %contact.wxid,
-                "{warn_reason}"
+                "relay 转述拟发文本疑似泄漏内部载荷，已拦截不发（fail-closed）"
             );
             write_event_for_account(
                 state,
@@ -2512,7 +2495,7 @@ async fn run_user_operation_gateway_inner(
                 Some(&contact.wxid),
                 "blocked_review",
                 "blocked_by_safety_guard",
-                event_reason,
+                "relay 转述输出含内部载荷标记，安全门拦截不发送",
                 None,
             )
             .await?;
