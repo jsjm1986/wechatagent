@@ -111,11 +111,13 @@ export function InboxRow({
   badge,
   title,
   preview,
+  tag,
   children,
 }: {
   badge: { label: string; tone: string };
   title: string;
   preview: string;
+  tag?: { label: string; tone: string };
   children: React.ReactNode;
 }) {
   const [open, setOpen] = useState(false);
@@ -124,6 +126,7 @@ export function InboxRow({
       <button type="button" className="inboxRowHead" onClick={() => setOpen((v) => !v)} aria-expanded={open}>
         <span className={`inboxBadge inboxBadge--${badge.tone}`}>{badge.label}</span>
         <span className="inboxRowTitle">{title}</span>
+        {tag && <span className={`inboxTag inboxTag--${tag.tone}`}>{tag.label}</span>}
         {!open && <span className="inboxRowPreview">{preview}</span>}
         <span className="inboxRowChevron">{open ? "▾" : "▸"}</span>
       </button>
@@ -221,6 +224,11 @@ function AskHumanView() {
                   badge={{ label: meta?.label ?? item.source, tone: SOURCE_TONE[item.source] ?? "neutral" }}
                   title={item.title}
                   preview={item.summary ?? ""}
+                  tag={
+                    item.source === "knowledge_review" && item.integrityStatus === "needs_human_audit"
+                      ? { label: "AI预审通过·待复核", tone: "held" }
+                      : undefined
+                  }
                 >
                   {item.actionKind === "rich"
                     ? renderRich(item, () => refreshAll())

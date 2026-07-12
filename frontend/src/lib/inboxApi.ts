@@ -20,6 +20,7 @@ export interface InboxItem {
   occurrences?: number;
   kind?: string;
   signalSeverity?: string;
+  integrityStatus?: string;
 }
 export interface SourceError {
   source: string;
