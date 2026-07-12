@@ -286,6 +286,13 @@ pub async fn preview_campaign(
     })))
 }
 
+/// KC-02：仅这些 status 允许 dispatch。dispatching = 允许重入恢复（配合补偿回滚，
+/// 已完成的 send 撞去重跳过、失败/剩余 contact 重建）；completed = 拒绝（防重复推送）；
+/// 未知态 = 拒绝（fail-safe）。
+pub(super) fn dispatch_allowed_from_status(status: &str) -> bool {
+    matches!(status, "draft" | "previewed" | "dispatching")
+}
+
 pub async fn dispatch_campaign(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
@@ -302,6 +309,14 @@ pub async fn dispatch_campaign(
         )
         .await?
         .ok_or_else(|| AppError::NotFound("campaign not found".to_string()))?;
+    // KC-02：置 dispatching 前先校验当前 status——completed/未知态拒绝重推，
+    // draft/previewed/dispatching 放行（dispatching 支持后续补偿回滚的重入恢复）。
+    if !dispatch_allowed_from_status(&campaign.status) {
+        return Err(AppError::BadRequest(format!(
+            "当前活动状态 {} 不可派发（仅 draft/previewed/dispatching 可派发；completed 需另建活动）",
+            campaign.status
+        )));
+    }
     // 重新跑圈人（防预览后数据漂移）。
     let hits = resolve_segment_contacts(
         &state,
@@ -340,6 +355,7 @@ pub async fn dispatch_campaign(
         };
         match state.db.campaign_sends().insert_one(&send, None).await {
             Ok(send_res) => {
+                let send_id = send_res.inserted_id.as_object_id();
                 let task = build_campaign_follow_up_task(
                     &campaign.workspace_id,
                     &campaign.account_id,
@@ -348,21 +364,44 @@ pub async fn dispatch_campaign(
                     now,
                 );
                 assert_agent_task_status_valid(&task.status);
-                let task_res = state.db.tasks().insert_one(&task, None).await?;
-                // 回填 taskId。
-                if let (Some(send_id), Some(task_id)) = (
-                    send_res.inserted_id.as_object_id(),
-                    task_res.inserted_id.as_object_id(),
-                ) {
-                    state
+                // KC-01：建 task 失败 → 补偿删掉刚占位的 send,避免留下 task_id=None 的孤儿 send
+                // (重入撞去重跳过→客户永久漏推)。补偿删除 best-effort(let _)。
+                let task_res = match state.db.tasks().insert_one(&task, None).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        if let Some(sid) = send_id {
+                            let _ = state
+                                .db
+                                .campaign_sends()
+                                .delete_one(doc! { "_id": sid }, None)
+                                .await;
+                        }
+                        return Err(e.into());
+                    }
+                };
+                // KC-03：回填 taskId 失败 → 补偿删 task + send,保持 all-or-nothing
+                // (否则 task 会真发但 report 显 pending 成效虚低)。
+                if let (Some(sid), Some(tid)) =
+                    (send_id, task_res.inserted_id.as_object_id())
+                {
+                    if let Err(e) = state
                         .db
                         .campaign_sends()
                         .update_one(
-                            doc! { "_id": send_id },
-                            doc! { "$set": { "taskId": task_id } },
+                            doc! { "_id": sid },
+                            doc! { "$set": { "taskId": tid } },
                             None,
                         )
-                        .await?;
+                        .await
+                    {
+                        let _ = state.db.tasks().delete_one(doc! { "_id": tid }, None).await;
+                        let _ = state
+                            .db
+                            .campaign_sends()
+                            .delete_one(doc! { "_id": sid }, None)
+                            .await;
+                        return Err(e.into());
+                    }
                 }
                 dispatched += 1;
             }
@@ -661,6 +700,17 @@ pub async fn list_campaigns(
 mod tests {
     use super::*;
     use crate::models::{OutcomeEvent, OutcomeProductRef};
+
+    #[test]
+    fn dispatch_allowed_only_from_draft_previewed_dispatching() {
+        // KC-02：completed 活动不可再派发（防重复推送）；dispatching 允许重入恢复；未知态 fail-safe 拒。
+        assert!(dispatch_allowed_from_status("draft"));
+        assert!(dispatch_allowed_from_status("previewed"));
+        assert!(dispatch_allowed_from_status("dispatching"), "dispatching 须允许重入恢复");
+        assert!(!dispatch_allowed_from_status("completed"), "completed 不可重推");
+        assert!(!dispatch_allowed_from_status("canceled"));
+        assert!(!dispatch_allowed_from_status("赫赫"), "未知态 fail-safe 拒");
+    }
 
     fn ev(verification: &str, pid: &str, qty: u32, kind: &str, amount: i64) -> OutcomeEvent {
         OutcomeEvent {
