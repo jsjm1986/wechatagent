@@ -47,8 +47,10 @@ proptest! {
         existing in arb_label_vec(8),
         incoming in arb_label_vec(8),
     ) {
+        let existing_doc = doc_with_tags(&existing);
         let merged = union_array_fields(
-            &doc_with_tags(&existing),
+            &existing_doc,
+            &existing_doc,
             &doc_with_tags(&incoming),
             &["tags"],
         );
@@ -72,12 +74,14 @@ proptest! {
         existing in arb_label_vec(8),
         incoming in arb_label_vec(8),
     ) {
+        let existing_doc = doc_with_tags(&existing);
         let once = union_array_fields(
-            &doc_with_tags(&existing),
+            &existing_doc,
+            &existing_doc,
             &doc_with_tags(&incoming),
             &["tags"],
         );
-        let twice = union_array_fields(&once, &doc_with_tags(&incoming), &["tags"]);
+        let twice = union_array_fields(&once, &once, &doc_with_tags(&incoming), &["tags"]);
         prop_assert_eq!(once.get_array("tags").unwrap(), twice.get_array("tags").unwrap());
     }
 }
@@ -90,8 +94,10 @@ proptest! {
         existing in arb_label_vec(8),
         incoming in arb_label_vec(8),
     ) {
+        let existing_doc = doc_with_tags(&existing);
         let merged = union_array_fields(
-            &doc_with_tags(&existing),
+            &existing_doc,
+            &existing_doc,
             &doc_with_tags(&incoming),
             &["tags"],
         );

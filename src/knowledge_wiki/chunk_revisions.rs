@@ -25,9 +25,9 @@ use serde::{Deserialize, Serialize};
 use crate::db::Database;
 use crate::error::{AppError, AppResult};
 use crate::knowledge_wiki::page_merge::{
-    apply_field_patch, compute_chunk_hash, enforce_locked_fields, is_body_truncated,
-    union_array_fields, RevisionError, BODY_TRUNCATION_THRESHOLD, DEFAULT_LOCKED_FIELDS,
-    DEFAULT_UNION_ARRAY_KEYS,
+    apply_field_patch, compute_chunk_hash, effective_locked_fields, enforce_locked_fields,
+    is_body_truncated, union_array_fields, RevisionError, BODY_TRUNCATION_THRESHOLD,
+    DEFAULT_LOCKED_FIELDS, DEFAULT_UNION_ARRAY_KEYS,
 };
 use crate::models::{CatalogRebuildJob, ChunkRevision};
 
@@ -186,8 +186,16 @@ pub async fn apply_chunk_revision(
         },
     )?;
 
-    // 2) 数组字段 union（永远 existing ∪ patch）
-    let merged = union_array_fields(&after_patch, &req.patch, DEFAULT_UNION_ARRAY_KEYS);
+    // 2) 数组字段 union（永远 原始existing ∪ patch）
+    // KB-09 修复：数组既有源用**原始 existing_bson**（非 after_patch——后者的数组字段
+    // 已被 apply_field_patch 用 patch 整体覆盖，若拿它当既有源则 union 退化成 patch∪patch、
+    // 既有 tag 丢失）；标量底用 after_patch（保标量 patch 结果）。
+    let merged = union_array_fields(
+        &after_patch,
+        &existing_bson,
+        &req.patch,
+        DEFAULT_UNION_ARRAY_KEYS,
+    );
 
     // 3) body / summary / answer 70% 长度阈值
     let touched_text_field = req.patch.contains_key("body")
@@ -231,7 +239,16 @@ pub async fn apply_chunk_revision(
     merged.insert("provenance", Bson::Document(provenance));
 
     // 6) 末次防线：锁定字段强制覆盖回 existing
-    let mut merged = enforce_locked_fields(&merged, &existing_bson, DEFAULT_LOCKED_FIELDS);
+    // KB-11：运营 per-chunk locked_fields 后端强制。existing.locked_fields 只并入
+    // enforce_locked_fields（末次静默覆盖，锁定字段改动被丢弃、其余字段正常写），
+    // **不并入 :173 apply_field_patch 的硬拒集**——否则 patch 碰锁定字段会整条 Err，
+    // 连坐毙掉同一 patch 里的合法字段。DEFAULT_LOCKED_FIELDS 两处维持不变。
+    // 生效锁字段集由共用纯函数 effective_locked_fields 构造（DEFAULT ∪ existing.locked_fields），
+    // 与 admin PUT (update_operation_knowledge_chunk) 共用同一真相源，杜绝 dual-path 漂移。
+    let effective_locked_owned = effective_locked_fields(&existing_bson);
+    let effective_enforce_locked: Vec<&str> =
+        effective_locked_owned.iter().map(|s| s.as_str()).collect();
+    let mut merged = enforce_locked_fields(&merged, &existing_bson, &effective_enforce_locked);
 
     // 6.5) universal-domain-adaptation D1-b：active DomainSchema 校验 / 重写
     // domain_attributes。仅当本 workspace 有 active schema 时生效；无 active schema
