@@ -502,11 +502,8 @@ pub(super) fn operation_knowledge_chunk_from_request(
             payload.status
         },
         priority: payload.priority,
-        wiki_type: payload.wiki_type.filter(|s| !s.trim().is_empty()),
-        chunk_type: payload
-            .chunk_type
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(crate::models::default_chunk_type),
+        wiki_type: crate::models::coerce_wiki_type(payload.wiki_type),
+        chunk_type: crate::models::coerce_chunk_type(payload.chunk_type),
         created_at: now,
         updated_at: now,
         ..Default::default()
@@ -661,6 +658,11 @@ pub(super) fn normalize_operation_knowledge_preview_chunk(
         "notApplicableScenes": json_string_list(&value, "notApplicableScenes").or_else(|| json_string_list(&value, "not_applicable_scenes")).unwrap_or_default(),
         "productTags": json_string_list(&value, "productTags").or_else(|| json_string_list(&value, "product_tags")).unwrap_or_default(),
         "businessTopics": json_string_list(&value, "businessTopics").or_else(|| json_string_list(&value, "business_topics")).unwrap_or_default(),
+        // C1 修复：抽取 prompt 要求 LLM 判定 wikiType(9类)/chunkType(4类)，此前归一化漏透传
+        // 致分类被丢弃、落库全 product_fact。原样透传 LLM 判定（含 null），越界/兜底由落库端
+        // coerce_wiki_type/coerce_chunk_type 统一裁决，避免默认值两处漂移。
+        "wikiType": json_string(&value, "wikiType").or_else(|| json_string(&value, "wiki_type")),
+        "chunkType": json_string(&value, "chunkType").or_else(|| json_string(&value, "chunk_type")),
         "sourceQuote": json_string(&value, "sourceQuote").or_else(|| json_string(&value, "source_quote")).unwrap_or_default(),
         "sourceAnchors": [],
         "integrityStatus": "needs_review",
@@ -1607,6 +1609,35 @@ mod tests {
     fn json_string_list_missing_key_returns_none() {
         let v = json!({});
         assert!(json_string_list(&v, "anything").is_none());
+    }
+
+    /// C1 回归：抽取 prompt 让 LLM 判定 wikiType/chunkType，归一化必须透传这两键
+    /// （此前漏掉 → 分类被丢弃、落库全 product_fact）。camelCase 与 snake_case 两形都要命中。
+    #[test]
+    fn preview_chunk_normalize_carries_wiki_and_chunk_type() {
+        let payload = OperationKnowledgeImportRequest {
+            account_id: None,
+            source_name: Some("t".to_string()),
+            content: "正文".to_string(),
+        };
+        // LLM 输出 camelCase（prompt 契约形态）。
+        let camel = normalize_operation_knowledge_preview_chunk(
+            json!({ "title": "话术模板", "wikiType": "methodology", "chunkType": "style_template" }),
+            &payload,
+        );
+        assert_eq!(camel.get("wikiType").and_then(|v| v.as_str()), Some("methodology"));
+        assert_eq!(camel.get("chunkType").and_then(|v| v.as_str()), Some("style_template"));
+        // LLM 漂 snake_case 也要兼容（项目已知键漂移）。
+        let snake = normalize_operation_knowledge_preview_chunk(
+            json!({ "title": "反例", "wiki_type": "finding", "chunk_type": "negative_example" }),
+            &payload,
+        );
+        assert_eq!(snake.get("wikiType").and_then(|v| v.as_str()), Some("finding"));
+        assert_eq!(snake.get("chunkType").and_then(|v| v.as_str()), Some("negative_example"));
+        // LLM 没给分类时透传 null（默认值交落库端 coerce，不在归一化兜底）。
+        let missing = normalize_operation_knowledge_preview_chunk(json!({ "title": "无分类" }), &payload);
+        assert!(missing.get("wikiType").map(|v| v.is_null()).unwrap_or(false));
+        assert!(missing.get("chunkType").map(|v| v.is_null()).unwrap_or(false));
     }
 
     #[test]

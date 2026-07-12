@@ -999,6 +999,39 @@ mod import_job_status_tests {
     }
 }
 
+#[cfg(test)]
+mod chunk_classification_tests {
+    use super::{coerce_chunk_type, coerce_wiki_type, ALLOWED_CHUNK_TYPE, ALLOWED_WIKI_TYPE};
+
+    #[test]
+    fn coerce_wiki_type_passes_legal_normalizes_illegal() {
+        // 9 类合法值全透传。
+        for t in ALLOWED_WIKI_TYPE {
+            assert_eq!(coerce_wiki_type(Some(t.to_string())).as_deref(), Some(*t));
+        }
+        // 越界（LLM 幻觉）→ None，不丢整条 chunk。
+        assert_eq!(coerce_wiki_type(Some("产品介绍".to_string())), None);
+        // 空/仅空白 → None。
+        assert_eq!(coerce_wiki_type(Some("  ".to_string())), None);
+        assert_eq!(coerce_wiki_type(None), None);
+        // 前后空白被 trim 后仍命中闭集。
+        assert_eq!(coerce_wiki_type(Some("  methodology ".to_string())).as_deref(), Some("methodology"));
+    }
+
+    #[test]
+    fn coerce_chunk_type_passes_legal_defaults_illegal() {
+        // 4 类合法值全透传。
+        for t in ALLOWED_CHUNK_TYPE {
+            assert_eq!(coerce_chunk_type(Some(t.to_string())), *t);
+        }
+        // 越界 → product_fact（最保守，走 verified-only）。
+        assert_eq!(coerce_chunk_type(Some("faq".to_string())), "product_fact");
+        // 空/None → product_fact（R11 兼容默认）。
+        assert_eq!(coerce_chunk_type(Some("".to_string())), "product_fact");
+        assert_eq!(coerce_chunk_type(None), "product_fact");
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentEvent {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
@@ -1637,6 +1670,60 @@ pub struct OperationKnowledgeChunk {
 /// 旧文档反序列化时缺该字段 → 视为 `product_fact`（最保守、走 verified-only 路径）。
 pub(crate) fn default_chunk_type() -> String {
     "product_fact".to_string()
+}
+
+/// `wiki_type` 9 类知识形态闭集（描述"它是什么知识"）。导入 LLM 判定后透传落库，
+/// 越界值经 [`coerce_wiki_type`] 归一。与 [`ALLOWED_CHUNK_TYPE`] 正交。
+pub const ALLOWED_WIKI_TYPE: &[&str] = &[
+    "source",
+    "entity",
+    "concept",
+    "comparison",
+    "synthesis",
+    "methodology",
+    "finding",
+    "query",
+    "thesis",
+];
+
+/// `chunk_type` 4 类运营用途闭集（描述"运营时怎么用它"）。与 [`ALLOWED_WIKI_TYPE`] 正交。
+pub const ALLOWED_CHUNK_TYPE: &[&str] =
+    &["product_fact", "style_template", "peer_case", "negative_example"];
+
+/// 落库前归一 `wiki_type`：合法值透传；空/闭集外（含 LLM 幻觉分类，如 `"产品介绍"`）→ `None`。
+/// 归一而非拒绝：LLM 幻觉是预期输入，不该让整条 chunk 写入失败丢掉正确 body；
+/// 落 `None` 后由 `wiki_type_priority` 兜底为 `entity`（`knowledge_agent.rs`）。越界时留痕。
+pub fn coerce_wiki_type(raw: Option<String>) -> Option<String> {
+    let value = raw.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())?;
+    if ALLOWED_WIKI_TYPE.contains(&value.as_str()) {
+        Some(value)
+    } else {
+        tracing::warn!(
+            target: "knowledge_classification",
+            "wiki_type='{value}' 不在 ALLOWED_WIKI_TYPE 闭集，归一为 None"
+        );
+        None
+    }
+}
+
+/// 落库前归一 `chunk_type`：合法值透传；空/闭集外 → `product_fact`（最保守、走 verified-only）。
+/// 归一而非拒绝，理由同 [`coerce_wiki_type`]。越界时留痕。
+pub fn coerce_chunk_type(raw: Option<String>) -> String {
+    let value = raw
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    match value {
+        Some(v) if ALLOWED_CHUNK_TYPE.contains(&v.as_str()) => v,
+        Some(v) => {
+            tracing::warn!(
+                target: "knowledge_classification",
+                "chunk_type='{v}' 不在 ALLOWED_CHUNK_TYPE 闭集，归一为 {}",
+                default_chunk_type()
+            );
+            default_chunk_type()
+        }
+        None => default_chunk_type(),
+    }
 }
 
 impl Default for OperationKnowledgeChunk {
