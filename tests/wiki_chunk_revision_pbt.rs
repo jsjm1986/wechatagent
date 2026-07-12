@@ -75,8 +75,10 @@ proptest! {
         existing in arb_label_vec(8),
         incoming in arb_label_vec(8),
     ) {
+        let existing_doc = doc! { "tags": vec_to_bson(&existing) };
         let merged = union_array_fields(
-            &doc! { "tags": vec_to_bson(&existing) },
+            &existing_doc,
+            &existing_doc,
             &doc! { "tags": vec_to_bson(&incoming) },
             &["tags"],
         );
