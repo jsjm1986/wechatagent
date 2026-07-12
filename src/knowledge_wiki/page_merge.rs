@@ -397,4 +397,17 @@ mod tests {
         let b = doc! { "title": "T", "updated_at": later, "dynamic_confidence": 0.9 };
         assert_eq!(compute_chunk_hash(&a), compute_chunk_hash(&b));
     }
+
+    #[test]
+    fn enforce_locked_honors_runtime_locked_fields() {
+        // KB-11：运营在 chunk 上锁定 "title"（内容字段，非 DEFAULT 集）→ merged 改了 title
+        // → enforce_locked_fields 传入 DEFAULT ∪ ["title"] 时，title 被覆盖回 existing 值，
+        //   未锁字段 summary 正常保留（静默覆盖，不毙整条）。
+        let existing = doc! { "title": "旧标题", "summary": "旧摘要" };
+        let merged = doc! { "title": "AI改的新标题", "summary": "AI改的新摘要" };
+        let locked: Vec<&str> = vec!["title"]; // 模拟 DEFAULT ∪ existing.locked_fields 里的运营锁
+        let out = enforce_locked_fields(&merged, &existing, &locked);
+        assert_eq!(out.get_str("title").unwrap(), "旧标题", "锁定字段 title 须覆盖回 existing");
+        assert_eq!(out.get_str("summary").unwrap(), "AI改的新摘要", "未锁字段 summary 正常保留");
+    }
 }

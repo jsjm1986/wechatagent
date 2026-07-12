@@ -231,7 +231,22 @@ pub async fn apply_chunk_revision(
     merged.insert("provenance", Bson::Document(provenance));
 
     // 6) 末次防线：锁定字段强制覆盖回 existing
-    let mut merged = enforce_locked_fields(&merged, &existing_bson, DEFAULT_LOCKED_FIELDS);
+    // KB-11：运营 per-chunk locked_fields 后端强制。existing.locked_fields 只并入
+    // enforce_locked_fields（末次静默覆盖，锁定字段改动被丢弃、其余字段正常写），
+    // **不并入 :173 apply_field_patch 的硬拒集**——否则 patch 碰锁定字段会整条 Err，
+    // 连坐毙掉同一 patch 里的合法字段。DEFAULT_LOCKED_FIELDS 两处维持不变。
+    let mut effective_enforce_locked: Vec<&str> = DEFAULT_LOCKED_FIELDS.to_vec();
+    let runtime_locked: Vec<String> = existing_bson
+        .get_array("locked_fields")
+        .ok()
+        .map(|a| {
+            a.iter()
+                .filter_map(|b| b.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    effective_enforce_locked.extend(runtime_locked.iter().map(|s| s.as_str()));
+    let mut merged = enforce_locked_fields(&merged, &existing_bson, &effective_enforce_locked);
 
     // 6.5) universal-domain-adaptation D1-b：active DomainSchema 校验 / 重写
     // domain_attributes。仅当本 workspace 有 active schema 时生效；无 active schema
