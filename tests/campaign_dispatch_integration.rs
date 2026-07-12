@@ -139,10 +139,14 @@ async fn dispatch_cross_workspace_not_found() {
 }
 
 /// 设计意图:命中 N 人 → 建 N 条 follow_up task(走 gateway 的证据);
-/// 二次 dispatch 同集 → campaign_sends 唯一索引去重 → dispatchedCount=0。
+/// 首次 dispatch 成功后 campaign 置 completed → 二次 dispatch 被 KC-02 status 前置门
+/// 以 BadRequest 拒(completed 不可再派发,防已完成活动对后来新命中者继续扩张受众),
+/// 且门在圈人前拦截→不新增任何 task。
+/// (KC-02 前旧契约是"completed 可反复 dispatch 靠 unique 索引幂等去重返0",
+///  该旧行为语义错误,已被 status 门有意取代,见 findings KC-02。)
 #[tokio::test]
 #[ignore]
-async fn dispatch_builds_tasks_and_dedups_on_repeat() {
+async fn dispatch_builds_tasks_then_rejects_repeat_after_completed() {
     let app = TestApp::start().await;
     let ws = app.state.config.default_workspace_id.clone();
     let acc = app.state.config.default_account_id.clone();
@@ -182,22 +186,22 @@ async fn dispatch_builds_tasks_and_dedups_on_repeat() {
         "命中 2 人应建 2 条 follow_up task(走 gateway 证据)"
     );
 
-    // 二次 dispatch 同集 → 唯一索引去重 → dispatchedCount=0、不再新增 task
-    let resp2 = dispatch_campaign(
+    // 首次成功后 campaign 已置 completed → 二次 dispatch 被 KC-02 status 门以 BadRequest 拒。
+    // (KC-02 前旧契约靠 unique 索引幂等返 dispatchedCount=0,现由门直接拒绝取代。)
+    let result2 = dispatch_campaign(
         State(app.state.clone()),
         Extension(test_admin(&ws)),
         Path(cid.to_hex()),
     )
-    .await
-    .expect("二次 dispatch 应成功(去重不报错)");
-    assert_eq!(
-        resp2.0["dispatchedCount"].as_i64(),
-        Some(0),
-        "二次 dispatch 同集应全去重,dispatchedCount=0,实际 {}",
-        resp2.0["dispatchedCount"]
+    .await;
+    assert!(
+        matches!(result2, Err(wechatagent::error::AppError::BadRequest(_))),
+        "首次成功后 campaign=completed,二次 dispatch 应被 status 门以 BadRequest 拒,实际 {:?}",
+        result2.map(|r| r.0.clone())
     );
+    // 门在圈人前拦截 → 二次不新增任何 task(比旧的 unique 去重更早、更强的防重推)。
     let tasks_after_2 = app.state.db.tasks().count_documents(doc! {}, None).await.expect("count after 2");
-    assert_eq!(tasks_after_2, tasks_after_1, "二次 dispatch 去重后不应新增 task");
+    assert_eq!(tasks_after_2, tasks_after_1, "二次 dispatch 被门拒后不应新增 task");
 }
 
 /// KC-01/03 补偿回滚：dispatch 循环中 agent_tasks insert 被 validator 拒 → task insert 失败
