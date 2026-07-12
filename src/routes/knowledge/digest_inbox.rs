@@ -303,6 +303,28 @@ fn inbox_pending_review_priority(chunk_type: &str) -> &'static str {
     }
 }
 
+/// KB-08：pending_review 卡片的 title/origin。needs_human_audit = auto_verify 预审通过待人复核,
+/// 与 needs_review(未审/反例) 区分。返回 (title, origin)。
+fn pending_review_card_labels(
+    integrity_status: &str,
+    base_title: &str,
+    is_negative_example: bool,
+) -> (String, String) {
+    if integrity_status == "needs_human_audit" {
+        return (
+            format!("AI预审通过待复核：{base_title}"),
+            "human_audit_pending".to_string(),
+        );
+    }
+    if is_negative_example {
+        return (
+            format!("待审反例：{base_title}"),
+            "negative_example_review".to_string(),
+        );
+    }
+    (format!("待审切片：{base_title}"), "pending_review".to_string())
+}
+
 pub(in crate::routes) async fn knowledge_inbox(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
@@ -428,17 +450,17 @@ pub(in crate::routes) async fn knowledge_inbox(
         // 因为这是 reviewer 误判反馈链路（reaction → enqueue_negative_example_chunk）的
         // admin 必须二次确认入口；其它类型 (peer_case / product_fact / style_template)
         // 维持 mid + pending_review。
-        if integrity == "needs_review" && updated_ms >= cutoff_ms {
+        if ["needs_review", "needs_human_audit"].contains(&integrity.as_str())
+            && updated_ms >= cutoff_ms
+        {
             let is_negative_example = c.chunk_type == "negative_example";
+            let (card_title, card_origin) =
+                pending_review_card_labels(&integrity, &title, is_negative_example);
             items.push(InboxCardView {
                 id: format!("chunk:{}:review", chunk_id_hex),
                 priority: inbox_pending_review_priority(&c.chunk_type).into(),
                 kind: "repair_chunk".into(),
-                title: if is_negative_example {
-                    format!("待审反例：{}", title)
-                } else {
-                    format!("待审切片：{}", title)
-                },
+                title: card_title,
                 context_summary: c
                     .summary
                     .clone()
@@ -452,11 +474,7 @@ pub(in crate::routes) async fn knowledge_inbox(
                 target_chunk_id: Some(chunk_id_hex.clone()),
                 target_pack_id: None,
                 suggested_actions: vec!["open_chat".into(), "open_repair".into(), "dismiss".into()],
-                origin: if is_negative_example {
-                    "negative_example_review".into()
-                } else {
-                    "pending_review".into()
-                },
+                origin: card_origin.into(),
                 created_at: crate::models::dt_to_string(c.updated_at).unwrap_or_default(),
             });
         }
@@ -541,6 +559,22 @@ mod tests {
     fn inbox_pending_review_priority_lifts_negative_example() {
         // negative_example 是 reviewer 误判反馈链路 admin 二次确认入口，必须高优。
         assert_eq!(inbox_pending_review_priority("negative_example"), "high");
+    }
+
+    #[test]
+    fn pending_review_card_labels_distinguishes_human_audit() {
+        // needs_human_audit → "AI预审通过待复核" + origin human_audit_pending
+        let (title, origin) = pending_review_card_labels("needs_human_audit", "价格政策", false);
+        assert!(title.contains("预审") && title.contains("价格政策"), "title={title}");
+        assert_eq!(origin, "human_audit_pending");
+        // needs_review 反例 → 保持原"待审反例"/negative_example_review
+        let (t2, o2) = pending_review_card_labels("needs_review", "反面话术", true);
+        assert!(t2.contains("待审反例") && t2.contains("反面话术"), "t2={t2}");
+        assert_eq!(o2, "negative_example_review");
+        // needs_review 普通 → 保持原"待审切片"/pending_review
+        let (t3, o3) = pending_review_card_labels("needs_review", "常规切片", false);
+        assert!(t3.contains("待审切片") && t3.contains("常规切片"), "t3={t3}");
+        assert_eq!(o3, "pending_review");
     }
 
     #[test]

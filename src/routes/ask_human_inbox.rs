@@ -50,6 +50,10 @@ pub struct InboxItem {
     pub kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signal_severity: Option<String>,
+    // KB-08：知识切片核验状态(needs_review / needs_human_audit),供前端区分"待审"vs"AI预审通过·待复核"。
+    // 仅 knowledge_review 来源填充,其余来源恒 None。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub integrity_status: Option<String>,
 }
 
 fn age_hours_of(created: Option<DateTime>, now_ms: i64) -> f64 {
@@ -93,6 +97,7 @@ fn escalation_to_inbox_item(
         occurrences: None,
         kind: None,
         signal_severity: None,
+        integrity_status: None,
     }
 }
 
@@ -110,6 +115,13 @@ async fn collect_escalations(
         .collect())
 }
 
+/// KB-08：审核收件箱认可的知识切片 integrity_status 集合。
+/// needs_review = AI 起草待审；needs_human_audit = auto_verify 预审通过、待人复核。
+/// 二者都须进人审收件箱(否则 needs_human_audit 切片成黑洞)。列表查询与 summary 计数共用本函数,防漂移。
+pub(crate) fn knowledge_review_statuses() -> [&'static str; 2] {
+    ["needs_review", "needs_human_audit"]
+}
+
 /// 知识切片 needs_review → InboxItem（rich：在统一频道内挂知识核验组件）。
 async fn collect_knowledge_review(
     state: &AppState,
@@ -121,7 +133,7 @@ async fn collect_knowledge_review(
         .db
         .operation_knowledge_chunks()
         .find(
-            doc! { "workspace_id": ws, "integrity_status": "needs_review" },
+            doc! { "workspace_id": ws, "integrity_status": { "$in": knowledge_review_statuses().to_vec() } },
             mongodb::options::FindOptions::builder().limit(100).build(),
         )
         .await?;
@@ -150,6 +162,7 @@ async fn collect_knowledge_review(
                 occurrences: None,
                 kind: None,
                 signal_severity: None,
+                integrity_status: c.integrity_status.clone(),
             }
         })
         .collect())
@@ -202,6 +215,7 @@ fn taxonomy_candidate_to_inbox_item(
         occurrences: Some(c.occurrences),
         kind: None,
         signal_severity: None,
+        integrity_status: None,
     }
 }
 
@@ -268,6 +282,7 @@ async fn collect_relationship_suggestions(
                 occurrences: Some(r.occurrences),
                 kind: None,
                 signal_severity: None,
+                integrity_status: None,
             }
         })
         .collect())
@@ -297,6 +312,7 @@ fn gap_to_inbox_item(g: &crate::models::KnowledgeGapSignal, now_ms: i64) -> Inbo
         occurrences: None,
         kind: non_empty(&g.kind),
         signal_severity: non_empty(&g.severity),
+        integrity_status: None,
     }
 }
 
@@ -362,6 +378,7 @@ async fn collect_profile_drafts(
                 occurrences: None,
                 kind: None,
                 signal_severity: None,
+                integrity_status: None,
             }
         })
         .collect())
@@ -407,6 +424,7 @@ async fn collect_evolution_proposals(
                 occurrences: None,
                 kind: None,
                 signal_severity: None,
+                integrity_status: None,
             }
         })
         .collect())
@@ -456,6 +474,7 @@ async fn collect_lessons_learned(
                 occurrences: None,
                 kind: None,
                 signal_severity: None,
+                integrity_status: None,
             }
         })
         .collect())
@@ -517,7 +536,7 @@ pub async fn ask_human_summary(
     let knowledge = state
         .db
         .operation_knowledge_chunks()
-        .count_documents(doc! { "workspace_id": ws, "integrity_status": "needs_review" }, None)
+        .count_documents(doc! { "workspace_id": ws, "integrity_status": { "$in": knowledge_review_statuses().to_vec() } }, None)
         .await
         .unwrap_or(0);
     let taxonomy_candidate = state
@@ -756,5 +775,14 @@ mod tests {
         assert_eq!(v["richComponent"], "taxonomyCandidateReview");
         assert_eq!(v["confidence"], 7);
         assert_eq!(v["occurrences"], 3);
+    }
+
+    #[test]
+    fn knowledge_review_statuses_includes_needs_human_audit() {
+        // KB-08 病根锚死：审核收件箱必须同时认 needs_human_audit,
+        // 否则 auto_verify 分诊出的切片从收件箱消失(黑洞)。防回退成只查 needs_review。
+        let s = knowledge_review_statuses();
+        assert!(s.contains(&"needs_review"), "必须含 needs_review");
+        assert!(s.contains(&"needs_human_audit"), "必须含 needs_human_audit(KB-08 黑洞根因)");
     }
 }

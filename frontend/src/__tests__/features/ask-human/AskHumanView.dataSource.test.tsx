@@ -22,7 +22,13 @@ const fi = fetchInbox as unknown as ReturnType<typeof vi.fn>;
 const fs = fetchSummary as unknown as ReturnType<typeof vi.fn>;
 
 // 用未知 source → renderInline 走 default 分支 = 纯 <div>{title}</div>，不触发子组件网络。
-function item(id: string, severity: string, ageHours = 0, source = "src_default"): InboxItem {
+function item(
+  id: string,
+  severity: string,
+  ageHours = 0,
+  source = "src_default",
+  extra: Partial<InboxItem> = {},
+): InboxItem {
   return {
     source,
     id,
@@ -32,6 +38,7 @@ function item(id: string, severity: string, ageHours = 0, source = "src_default"
     createdAt: null,
     ageHours,
     actionKind: "inline",
+    ...extra,
   };
 }
 
@@ -123,5 +130,28 @@ describe("AskHumanView 单数据源", () => {
     expect(screen.queryByText("t-all")).toBeNull();
     // 验证 fetchInbox 确实带上了该 source。
     expect(fi).toHaveBeenCalledWith("knowledge_review");
+  });
+
+  // 接线验证：renderItem 是内联闭包，只能经整棵视图渲染来验证 tag 是否被真实接线（而非只测 InboxRow 本身）。
+  it("接线：knowledge_review + needs_human_audit 的 item 显 held 徽章;其它 integrityStatus 不显", async () => {
+    fi.mockResolvedValue({
+      items: [
+        item("audit", "high", 2, "knowledge_review", { integrityStatus: "needs_human_audit" }),
+        item("plain", "medium", 1, "knowledge_review", { integrityStatus: "verified" }),
+      ],
+      errors: [],
+    });
+    fs.mockResolvedValue({ knowledgeReview: 2 });
+
+    render(<AskHumanFeature />);
+    await screen.findByText("t-audit");
+
+    // needs_human_audit 的那条经真实 renderItem 接线后出现 held 徽章。
+    const badges = screen.getAllByText("AI预审通过·待复核");
+    expect(badges).toHaveLength(1);
+    // 徽章确用 held 色类（复用 --fill-held，不新造色）。
+    expect(badges[0].className).toContain("inboxTag--held");
+    // verified 的那条不显徽章（tag=undefined）。
+    expect(screen.getByText("t-plain")).toBeTruthy();
   });
 });
