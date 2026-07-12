@@ -267,5 +267,11 @@ async fn dispatch_completed_campaign_rejected() {
         Path(cid.to_hex()),
     )
     .await;
-    assert!(result.is_err(), "completed 活动不可再 dispatch(防重推)");
+    // 精确断言 status 门的 BadRequest（非圈人/NotFound 等其它早退）——门在圈人前(:314)，
+    // 已 seed contact 对齐 ws，故唯一可达 Err 即 status 门；类型断言抵御未来 handler 早退分支变动。
+    assert!(
+        matches!(result, Err(wechatagent::error::AppError::BadRequest(_))),
+        "completed 活动应被 status 门以 BadRequest 拒(防重推)，实际 {:?}",
+        result.err()
+    );
 }
