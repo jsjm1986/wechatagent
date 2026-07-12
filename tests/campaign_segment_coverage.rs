@@ -169,7 +169,9 @@ async fn m030_does_not_create_deal_events_key_on_outcome_events_only_doc() {
     let ws = app.state.config.default_workspace_id.clone();
     let raw = app.state.db.raw();
 
-    // 只有 outcome_events(snake)、无 legacy deal_events。
+    // 只有 outcome_events(snake)、无 legacy deal_events。含 Contact 反序列化必需的
+    // created_at/updated_at(非 Option 非 default),否则类型化读回会因缺这俩字段失败、
+    // 掩盖本测真正要验的 C1(deal_events 双键 duplicate_field)。
     raw.collection::<Document>("contacts")
         .insert_one(
             doc! {
@@ -177,6 +179,8 @@ async fn m030_does_not_create_deal_events_key_on_outcome_events_only_doc() {
                 "account_id": "acc",
                 "wxid": "outcome_only",
                 "agent_status": "managed",
+                "created_at": mongodb::bson::DateTime::from_millis(0),
+                "updated_at": mongodb::bson::DateTime::from_millis(0),
                 "outcome_events": [ {
                     "markedAt": mongodb::bson::DateTime::from_millis(0),
                     "source": "manual",
