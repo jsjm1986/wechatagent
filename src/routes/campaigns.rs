@@ -43,14 +43,26 @@ pub(super) fn build_segment_coarse_filter(
     if let Some(stage) = &filter.customer_stage {
         d.insert("domain_attributes.customer_stage", stage);
     }
-    // 产品反查：$elemMatch 同一成交事件内匹配「指定产品 + 高可信 + 正向」。
+    // 产品反查：$elemMatch 同一成交事件内匹配「指定产品 + 高可信 + 非退款」。
+    // KC-05：verification/eventKind 的 serde 默认(staff_confirmed/deal)只在反序列化补、
+    // Mongo 查询不补，缺这两字段的老成交(§4.5 上线前登记)会被精确匹配漏掉→product 定向
+    // 静默漏老客户。故把"缺字段=默认值"显式写进查询：
+    // - verification：白名单命中 或 字段缺失(老文档=staff_confirmed)。$elemMatch 内多键是
+    //   隐式 AND，字段级"或缺失"须用 $and 包裹(顶层 $or 不能做字段级)。
+    // - eventKind：$ne:"reversal" 一箭双雕——缺字段(missing ≠ reversal)与显式"deal"都命中，
+    //   只排退款；同时与精筛口径对齐(精筛不按 kind 排除、只对 reversal 抵消件数)。
     if !filter.product_ids.is_empty() {
         d.insert(
             "outcome_events",
             doc! { "$elemMatch": {
                 "productRef.productId": { "$in": &filter.product_ids },
-                "verification": { "$in": ["staff_confirmed", "payment_verified"] },
-                "eventKind": "deal",
+                "$and": [
+                    { "$or": [
+                        { "verification": { "$in": ["staff_confirmed", "payment_verified"] } },
+                        { "verification": { "$exists": false } },
+                    ]},
+                    { "eventKind": { "$ne": "reversal" } },
+                ],
             }},
         );
     }
@@ -814,16 +826,22 @@ mod tests {
     fn coarse_filter_with_products_uses_elemmatch_real_keys() {
         let f = SegmentFilter { product_ids: vec!["vip".into()], ..Default::default() };
         let d = build_segment_coarse_filter("ws", "acc", &f);
-        // 真实混合大小写路径
         let em = d.get_document("outcome_events").unwrap();
         let elem = em.get_document("$elemMatch").unwrap();
-        // productRef.productId（camelCase 内嵌）
-        assert!(elem.get_document("productRef").is_ok()
-            || elem.contains_key("productRef.productId"));
-        // verification 高可信 $in
-        assert!(elem.contains_key("verification"));
-        // eventKind 正向
-        assert_eq!(elem.get_str("eventKind").ok(), Some("deal"));
+        // productRef.productId（camelCase 内嵌）仍在
+        assert!(elem.contains_key("productRef.productId"));
+        // KC-05：verification / eventKind 从精确匹配改成"缺字段=默认值"显式表达，
+        // 用 $elemMatch 内的 $and 数组承载（字段级"或缺失"不能用顶层 $or）。
+        let and = elem.get_array("$and").unwrap();
+        assert_eq!(and.len(), 2, "$and 恰两个子条件：verification 或缺失 + eventKind != reversal");
+        // 子条件 1：verification $in 白名单 OR $exists:false
+        let ver = and[0].as_document().unwrap();
+        let ver_or = ver.get_array("$or").unwrap();
+        assert_eq!(ver_or.len(), 2, "verification: $in 白名单 或 $exists:false");
+        // 子条件 2：eventKind $ne reversal（缺字段天然命中，与精筛口径对齐）
+        let kind = and[1].as_document().unwrap();
+        let kind_ne = kind.get_document("eventKind").unwrap();
+        assert_eq!(kind_ne.get_str("$ne").unwrap(), "reversal");
         // 始终带租户隔离
         assert_eq!(d.get_str("workspace_id").unwrap(), "ws");
         assert_eq!(d.get_str("account_id").unwrap(), "acc");
