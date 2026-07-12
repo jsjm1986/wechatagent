@@ -10,6 +10,10 @@ use serde_json::{json, Value};
 
 use crate::auth::AuthenticatedAdmin;
 use crate::error::{AppError, AppResult};
+use crate::knowledge_wiki::page_merge::{
+    compute_chunk_hash, effective_locked_fields, enforce_locked_fields,
+};
+use crate::models::{ChunkRevision, OperationKnowledgeChunk};
 
 use super::super::shared::*;
 use super::super::AppState;
@@ -263,6 +267,26 @@ pub async fn update_operation_knowledge_chunk(
     let next =
         operation_knowledge_chunk_from_request(&state, &admin.current_workspace, payload, Some(object_id))?;
     let next = preserve_unmodeled_chunk_fields(next, &existing);
+
+    // KB-10：admin PUT 走 replace_one 整条替换，需在替换前把运营锁定字段从 existing
+    // 强制覆盖回 next——否则 PUT 能绕过 per-chunk 锁定字段（`locked_fields` + DEFAULT 集）。
+    // 复用与 apply_chunk_revision 同一份 effective_locked_fields + enforce_locked_fields
+    // 纯函数（单一真相源，不造新 dual-path）。next/existing 是 typed struct，enforce_*
+    // 收 &Document，故 to_document 转换后喂它们、再 from_document 转回 typed 供 replace_one。
+    let existing_doc = mongodb::bson::to_document(&existing).map_err(|e| {
+        AppError::External(format!("serialize existing chunk to bson failed: {e}"))
+    })?;
+    let next_doc = mongodb::bson::to_document(&next)
+        .map_err(|e| AppError::External(format!("serialize next chunk to bson failed: {e}")))?;
+    let effective_locked_owned = effective_locked_fields(&existing_doc);
+    let effective_locked: Vec<&str> =
+        effective_locked_owned.iter().map(|s| s.as_str()).collect();
+    let enforced_doc = enforce_locked_fields(&next_doc, &existing_doc, &effective_locked);
+    let before_hash = compute_chunk_hash(&existing_doc);
+    let after_hash = compute_chunk_hash(&enforced_doc);
+    let enforced: OperationKnowledgeChunk = mongodb::bson::from_document(enforced_doc)
+        .map_err(|e| AppError::External(format!("deserialize enforced chunk failed: {e}")))?;
+
     state
         .db
         .operation_knowledge_chunks()
@@ -271,10 +295,36 @@ pub async fn update_operation_knowledge_chunk(
                 "_id": object_id,
                 "workspace_id": &admin.current_workspace
             },
-            next,
+            enforced,
             None,
         )
         .await?;
+
+    // KB-10：replace 成功后补写一条 chunk_revisions 审计行，补齐 admin 直接编辑的修订链。
+    // patch 留空 doc!{}（整条替换、非增量，语义诚实）；before/after hash 标识本次编辑改了什么。
+    // fail-soft：审计写失败仅记 warn，不回滚 replace、不返 Err——replace 已成功数据正确，
+    // 审计缺一行是可观测运维问题。
+    let revision = ChunkRevision {
+        id: None,
+        chunk_id: object_id.to_hex(),
+        revision_id: format!("rev_{}_{}", object_id.to_hex(), uuid::Uuid::new_v4().simple()),
+        op: "patch".to_string(),
+        patch: doc! {},
+        before_hash,
+        after_hash,
+        source: "human".to_string(),
+        reason: Some("admin 直接编辑".to_string()),
+        created_at: mongodb::bson::DateTime::now(),
+        created_by: Some(admin.user_id.clone()),
+    };
+    if let Err(err) = state.db.chunk_revisions().insert_one(revision, None).await {
+        tracing::warn!(
+            chunk_id = %object_id.to_hex(),
+            error = %err,
+            "admin PUT chunk_revisions 审计行写入失败 (non-fatal)"
+        );
+    }
+
     Ok(Json(json!({ "ok": true })))
 }
 

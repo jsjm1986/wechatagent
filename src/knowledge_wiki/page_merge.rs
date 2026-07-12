@@ -130,6 +130,31 @@ fn bson_string_array(b: Option<&Bson>) -> Option<Vec<String>> {
     }
 }
 
+/// 生效锁定字段集 = `DEFAULT_LOCKED_FIELDS` ∪ existing 文档上运营配置的
+/// `locked_fields` 数组（owned 合并、去重）。
+///
+/// **单一真相源**：`enforce_locked_fields` 末次防线需要的 owned 锁字段集，
+/// `apply_chunk_revision`（LLM/rule 写入路径）与 admin PUT（`update_operation_knowledge_chunk`）
+/// 两条写入路径都调本函数构造，杜绝各自内联一份导致的 dual-path 漂移。
+///
+/// 注意：本函数只并入 `enforce_locked_fields` 用的**末次静默覆盖集**——
+/// 运营 per-chunk 锁定字段被改动时静默覆盖回 existing、其余字段正常写；
+/// 不并入 `apply_field_patch` 的硬拒集（那会连坐毙掉同一 patch 里的合法字段）。
+pub fn effective_locked_fields(existing: &Document) -> Vec<String> {
+    let mut out: Vec<String> = DEFAULT_LOCKED_FIELDS.iter().map(|s| s.to_string()).collect();
+    let mut seen: BTreeSet<String> = out.iter().cloned().collect();
+    if let Ok(arr) = existing.get_array("locked_fields") {
+        for b in arr {
+            if let Some(s) = b.as_str() {
+                if seen.insert(s.to_string()) {
+                    out.push(s.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
 // ── 2. 锁定字段强制覆盖 ────────────────────────────────────────────────
 
 /// 把 `merged` 中位于 `locked` 列表的字段强制覆盖回 `existing` 的值。
@@ -396,6 +421,20 @@ mod tests {
         let a = doc! { "title": "T", "updated_at": now, "dynamic_confidence": 0.5 };
         let b = doc! { "title": "T", "updated_at": later, "dynamic_confidence": 0.9 };
         assert_eq!(compute_chunk_hash(&a), compute_chunk_hash(&b));
+    }
+
+    #[test]
+    fn effective_locked_unions_default_with_runtime_and_dedups() {
+        // 无运营锁 → 恰是 DEFAULT。
+        let bare = doc! { "title": "T" };
+        assert_eq!(effective_locked_fields(&bare).len(), DEFAULT_LOCKED_FIELDS.len());
+        // 运营锁定 "title"（非 DEFAULT）+ 重复一个 DEFAULT 项 "chunk_id"（应去重）。
+        let with_lock = doc! { "locked_fields": ["title", "chunk_id"] };
+        let eff = effective_locked_fields(&with_lock);
+        assert!(eff.contains(&"title".to_string()), "运营锁定字段须并入");
+        assert!(eff.contains(&"chunk_id".to_string()), "DEFAULT 字段须保留");
+        // "chunk_id" 已在 DEFAULT，不应重复计数：len == DEFAULT + 1（仅新增 title）。
+        assert_eq!(eff.len(), DEFAULT_LOCKED_FIELDS.len() + 1, "重复项须去重");
     }
 
     #[test]

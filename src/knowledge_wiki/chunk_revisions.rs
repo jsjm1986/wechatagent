@@ -25,9 +25,9 @@ use serde::{Deserialize, Serialize};
 use crate::db::Database;
 use crate::error::{AppError, AppResult};
 use crate::knowledge_wiki::page_merge::{
-    apply_field_patch, compute_chunk_hash, enforce_locked_fields, is_body_truncated,
-    union_array_fields, RevisionError, BODY_TRUNCATION_THRESHOLD, DEFAULT_LOCKED_FIELDS,
-    DEFAULT_UNION_ARRAY_KEYS,
+    apply_field_patch, compute_chunk_hash, effective_locked_fields, enforce_locked_fields,
+    is_body_truncated, union_array_fields, RevisionError, BODY_TRUNCATION_THRESHOLD,
+    DEFAULT_LOCKED_FIELDS, DEFAULT_UNION_ARRAY_KEYS,
 };
 use crate::models::{CatalogRebuildJob, ChunkRevision};
 
@@ -235,17 +235,11 @@ pub async fn apply_chunk_revision(
     // enforce_locked_fields（末次静默覆盖，锁定字段改动被丢弃、其余字段正常写），
     // **不并入 :173 apply_field_patch 的硬拒集**——否则 patch 碰锁定字段会整条 Err，
     // 连坐毙掉同一 patch 里的合法字段。DEFAULT_LOCKED_FIELDS 两处维持不变。
-    let mut effective_enforce_locked: Vec<&str> = DEFAULT_LOCKED_FIELDS.to_vec();
-    let runtime_locked: Vec<String> = existing_bson
-        .get_array("locked_fields")
-        .ok()
-        .map(|a| {
-            a.iter()
-                .filter_map(|b| b.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
-    effective_enforce_locked.extend(runtime_locked.iter().map(|s| s.as_str()));
+    // 生效锁字段集由共用纯函数 effective_locked_fields 构造（DEFAULT ∪ existing.locked_fields），
+    // 与 admin PUT (update_operation_knowledge_chunk) 共用同一真相源，杜绝 dual-path 漂移。
+    let effective_locked_owned = effective_locked_fields(&existing_bson);
+    let effective_enforce_locked: Vec<&str> =
+        effective_locked_owned.iter().map(|s| s.as_str()).collect();
     let mut merged = enforce_locked_fields(&merged, &existing_bson, &effective_enforce_locked);
 
     // 6.5) universal-domain-adaptation D1-b：active DomainSchema 校验 / 重写
