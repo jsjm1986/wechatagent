@@ -186,8 +186,16 @@ pub async fn apply_chunk_revision(
         },
     )?;
 
-    // 2) 数组字段 union（永远 existing ∪ patch）
-    let merged = union_array_fields(&after_patch, &req.patch, DEFAULT_UNION_ARRAY_KEYS);
+    // 2) 数组字段 union（永远 原始existing ∪ patch）
+    // KB-09 修复：数组既有源用**原始 existing_bson**（非 after_patch——后者的数组字段
+    // 已被 apply_field_patch 用 patch 整体覆盖，若拿它当既有源则 union 退化成 patch∪patch、
+    // 既有 tag 丢失）；标量底用 after_patch（保标量 patch 结果）。
+    let merged = union_array_fields(
+        &after_patch,
+        &existing_bson,
+        &req.patch,
+        DEFAULT_UNION_ARRAY_KEYS,
+    );
 
     // 3) body / summary / answer 70% 长度阈值
     let touched_text_field = req.patch.contains_key("body")

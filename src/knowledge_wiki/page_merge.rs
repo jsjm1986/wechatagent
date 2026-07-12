@@ -83,18 +83,30 @@ pub enum RevisionError {
 
 /// 对 `keys` 中列出的字段做应用层 union（去重 + 保序：existing 先，incoming 后）。
 ///
+/// 三方入参（KB-09 修复：数组既有源与标量底解耦）：
+/// - `base`：结果底 Document，提供**标量字段**的值（浅拷贝为结果基底）。
+/// - `existing_arr_source`：数组字段既有值的来源。**必须是原始既有 chunk**，
+///   而非已被 `apply_field_patch` 用 patch 覆盖过的 doc——否则数组既有元素已被
+///   patch clobber，union 退化成 `patch ∪ patch`，既有 tag 丢失（KB-09 原缺陷）。
+/// - `incoming`：patch，提供数组字段的新增元素。
+///
 /// 行为契约（PBT 覆盖）：
 /// 1. **幂等**：`union(union(a, b), b) == union(a, b)`；
-/// 2. **包含性**：`existing[k]` 与 `incoming[k]` 中所有字符串元素都在结果里；
+/// 2. **包含性**：`existing_arr_source[k]` 与 `incoming[k]` 中所有字符串元素都在结果里；
 /// 3. **保序**：existing 中已有元素相对顺序保持，incoming 新元素按出现顺序追加；
 /// 4. **跳过非数组**：`keys[i]` 在两侧都非数组 / 不存在 → 不动；
 /// 5. **类型不匹配**：跳过非字符串元素（不同 BSON 类型不混并）。
 ///
-/// 输入是借用，输出是新 `Document`（基于 `existing` 浅拷贝 + 覆盖目标字段）。
-pub fn union_array_fields(existing: &Document, incoming: &Document, keys: &[&str]) -> Document {
-    let mut merged = existing.clone();
+/// 输入是借用，输出是新 `Document`（基于 `base` 浅拷贝 + 覆盖目标数组字段）。
+pub fn union_array_fields(
+    base: &Document,
+    existing_arr_source: &Document,
+    incoming: &Document,
+    keys: &[&str],
+) -> Document {
+    let mut merged = base.clone();
     for &key in keys {
-        let existing_arr = bson_string_array(existing.get(key));
+        let existing_arr = bson_string_array(existing_arr_source.get(key));
         let incoming_arr = bson_string_array(incoming.get(key));
         if existing_arr.is_none() && incoming_arr.is_none() {
             continue;
@@ -319,7 +331,7 @@ mod tests {
     fn union_appends_new_and_preserves_existing_order() {
         let existing = doc! { "tags": ["a", "b", "c"] };
         let incoming = doc! { "tags": ["b", "d"] };
-        let merged = union_array_fields(&existing, &incoming, &["tags"]);
+        let merged = union_array_fields(&existing, &existing, &incoming, &["tags"]);
         assert_eq!(
             merged.get_array("tags").unwrap(),
             &vec![
@@ -335,7 +347,7 @@ mod tests {
     fn union_is_idempotent_when_incoming_is_subset() {
         let existing = doc! { "tags": ["a", "b"] };
         let incoming = doc! { "tags": ["a"] };
-        let merged = union_array_fields(&existing, &incoming, &["tags"]);
+        let merged = union_array_fields(&existing, &existing, &incoming, &["tags"]);
         assert_eq!(
             merged.get_array("tags").unwrap(),
             &vec![Bson::String("a".into()), Bson::String("b".into())]
@@ -346,13 +358,31 @@ mod tests {
     fn union_skips_non_array_and_missing_keys() {
         let existing = doc! { "tags": ["x"], "title": "hello" };
         let incoming = doc! { "title": "world" };
-        let merged = union_array_fields(&existing, &incoming, &["tags", "title"]);
-        // tags 不变、title 沿用 existing（union 不处理标量字段）
+        let merged = union_array_fields(&existing, &existing, &incoming, &["tags", "title"]);
+        // tags 不变、title 沿用 base（union 不处理标量字段）
         assert_eq!(merged.get_str("title").unwrap(), "hello");
         assert_eq!(
             merged.get_array("tags").unwrap(),
             &vec![Bson::String("x".into())]
         );
+    }
+
+    #[test]
+    fn union_arr_source_decoupled_from_base_preserves_existing_tags() {
+        // KB-09 回归哨兵：模拟生产 apply_chunk_revision 场景——base 的数组字段已被
+        // apply_field_patch 用 patch 整体覆盖成 ["B"]（既有 "A" 在 base 里已丢），
+        // 但 existing_arr_source 是**原始既有**（含 "A"）。union 须从 existing_arr_source
+        // 取数组既有 → 结果含 A 含 B（既有 tag 不丢）。若退回"数组源=base"旧缺陷，
+        // 结果会是 ["B"]、A 丢失，本测立刻红。
+        let base = doc! { "product_tags": ["B"], "title": "标量patch后的值" };
+        let existing = doc! { "product_tags": ["A"], "title": "原始标量" };
+        let patch = doc! { "product_tags": ["B"] };
+        let merged = union_array_fields(&base, &existing, &patch, &["product_tags"]);
+        let tags = merged.get_array("product_tags").unwrap();
+        assert!(tags.contains(&Bson::String("A".into())), "既有 tag A 不得丢失（KB-09）");
+        assert!(tags.contains(&Bson::String("B".into())), "patch 新增 tag B 须在");
+        // 标量字段沿用 base（保标量 patch 结果）。
+        assert_eq!(merged.get_str("title").unwrap(), "标量patch后的值");
     }
 
     #[test]
