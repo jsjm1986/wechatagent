@@ -13,6 +13,9 @@
 //! "过早回填致误黑"特定危害)，均与本迁移性质不同。误加守卫会致 117 生产静默 SKIP、
 //! 防线 B 名存实亡。
 //!
+//! **存储键**：Contact **无** `#[serde(rename_all)]`(models.rs:148)→ 顶层字段存 snake_case
+//! `outcome_events`(见 db/indexes.rs:38-40 索引键 + 防线A campaigns.rs 亦用 snake_case)。
+//! 内层 OutcomeEvent 带 `rename_all="camelCase"` → `event_kind`→`eventKind`、`verification` 不变。
 //! **兼容 legacy alias**：Contact.outcome_events serde alias="deal_events"(models.rs:248)，
 //! 故极老文档数组键可能是 `deal_events`；两个键各回填一次。
 //!
@@ -45,16 +48,16 @@ pub(super) fn backfill_array(field: &str) -> Document {
 pub(super) fn backfill_filter() -> Document {
     doc! {
         "$or": [
-            { "outcomeEvents": { "$exists": true } },
+            { "outcome_events": { "$exists": true } },
             { "deal_events": { "$exists": true } },
         ]
     }
 }
 
 /// 迁移主体。`pub` 暴露给 `tests/` 集成测试(同 m018/m029 先例)。
-/// 对 outcomeEvents 与 legacy deal_events 各跑一次 update_many pipeline。
+/// 对 outcome_events 与 legacy deal_events 各跑一次 update_many pipeline。
 pub async fn run_step(db: &Database) -> AppResult<()> {
-    for field in ["outcomeEvents", "deal_events"] {
+    for field in ["outcome_events", "deal_events"] {
         let result = db
             .contacts()
             .update_many(backfill_filter(), vec![backfill_array(field)], None)
@@ -76,9 +79,9 @@ mod tests {
 
     #[test]
     fn backfill_array_maps_with_defaults_as_base_and_element_on_top() {
-        let stage = backfill_array("outcomeEvents");
+        let stage = backfill_array("outcome_events");
         let set = stage.get_document("$set").unwrap();
-        let field = set.get_document("outcomeEvents").unwrap();
+        let field = set.get_document("outcome_events").unwrap();
         let map = field.get_document("$map").unwrap();
         // $map 遍历该字段(用 $ifNull 兜空)
         assert!(map.contains_key("input"));
@@ -102,7 +105,7 @@ mod tests {
             .filter_map(|b| b.as_document())
             .flat_map(|d| d.keys().cloned().collect::<Vec<_>>())
             .collect();
-        assert!(keys.contains(&"outcomeEvents".to_string()), "须命中 camelCase outcomeEvents");
+        assert!(keys.contains(&"outcome_events".to_string()), "须命中 snake_case outcome_events(Contact 无 rename_all)");
         assert!(keys.contains(&"deal_events".to_string()), "须命中 legacy alias deal_events");
     }
 }

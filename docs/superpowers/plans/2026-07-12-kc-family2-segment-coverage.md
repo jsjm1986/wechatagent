@@ -4,7 +4,7 @@
 
 **Goal:** 带 product_ids 的 campaign 圈人不再静默漏掉缺 verification/event_kind 字段的老成交客户（恢复"粗筛 ⊇ 精筛"）。
 
-**Architecture:** 两条独立防线。防线 A：粗筛 `$elemMatch` 查询把 verification/eventKind 精确匹配改成"缺字段=默认值"显式表达（即时生效、不依赖生产迁移）。防线 B：新增 m030 迁移用 `$map`+`$mergeObjects` 回填库中 outcomeEvents/deal_events 数组元素缺失的两字段默认值（治本清历史，非破坏幂等，不加 APP_ENV 守卫）。
+**Architecture:** 两条独立防线。防线 A：粗筛 `$elemMatch` 查询把 verification/eventKind 精确匹配改成"缺字段=默认值"显式表达（即时生效、不依赖生产迁移）。防线 B：新增 m030 迁移用 `$map`+`$mergeObjects` 回填库中 outcome_events/deal_events 数组元素缺失的两字段默认值（治本清历史，非破坏幂等，不加 APP_ENV 守卫）。
 
 **Tech Stack:** Rust 2021 / Axum / mongodb bson / testcontainers（集成测）。
 
@@ -16,7 +16,7 @@
 - 不动精筛 `contact_matches_segment`/`project_entitlements`（口径正确，是被对齐的基准）。不删 outcome_events 顶层老字段/不改 serde 默认定义。不含 KC-06/KC-07。
 - m030 **不加** `APP_ENV=production` 守卫（语义保持型回填，同 m018/m022/m025；写的就是 serde 读时默认值，误加守卫会致 117 生产静默 SKIP）。
 - baseline：`cargo test --lib` ≥ 350 passed / 0 failed，不回退。集成测 `#[ignore]`（CI Docker 跑），本地只 `cargo test --lib`。
-- 存储键（亲验）：Contact `#[serde(rename_all="camelCase")]`（models.rs:148）→ `outcome_events`→`outcomeEvents`，alias `deal_events`（models.rs:248）；OutcomeEvent 亦 camelCase → `event_kind`→`eventKind`，`verification` 不变。粗筛现有查询用的正是 `verification`/`eventKind`/`productRef.productId`。
+- 存储键（亲验）：Contact **无** `#[serde(rename_all)]`（models.rs:148）→ 顶层字段存 snake_case `outcome_events`（见 db/indexes.rs:38-40 索引键 + 防线A campaigns.rs 亦用 snake_case），alias `deal_events`（models.rs:248）；内层 OutcomeEvent **带** `rename_all="camelCase"` → `event_kind`→`eventKind`，`verification` 不变。粗筛现有查询用的正是 `outcome_events`（顶层 snake）+ `verification`/`eventKind`/`productRef.productId`（内层 camel）。
 - 子任务派 subagent 一律省略 model 参数（继承主会话 opus）。绝不动任何 sibling worktree 的 target/。
 
 ---
@@ -205,16 +205,16 @@ pub(super) fn backfill_array(field: &str) -> Document {
 pub(super) fn backfill_filter() -> Document {
     doc! {
         "$or": [
-            { "outcomeEvents": { "$exists": true } },
+            { "outcome_events": { "$exists": true } },
             { "deal_events": { "$exists": true } },
         ]
     }
 }
 
 /// 迁移主体。`pub` 暴露给 `tests/` 集成测试(同 m018/m029 先例)。
-/// 对 outcomeEvents 与 legacy deal_events 各跑一次 update_many pipeline。
+/// 对 outcome_events 与 legacy deal_events 各跑一次 update_many pipeline。
 pub async fn run_step(db: &Database) -> AppResult<()> {
-    for field in ["outcomeEvents", "deal_events"] {
+    for field in ["outcome_events", "deal_events"] {
         let result = db
             .contacts()
             .update_many(backfill_filter(), vec![backfill_array(field)], None)
@@ -236,9 +236,9 @@ mod tests {
 
     #[test]
     fn backfill_array_maps_with_defaults_as_base_and_element_on_top() {
-        let stage = backfill_array("outcomeEvents");
+        let stage = backfill_array("outcome_events");
         let set = stage.get_document("$set").unwrap();
-        let field = set.get_document("outcomeEvents").unwrap();
+        let field = set.get_document("outcome_events").unwrap();
         let map = field.get_document("$map").unwrap();
         // $map 遍历该字段(用 $ifNull 兜空)
         assert!(map.contains_key("input"));
@@ -262,7 +262,7 @@ mod tests {
             .filter_map(|b| b.as_document())
             .flat_map(|d| d.keys().cloned().collect::<Vec<_>>())
             .collect();
-        assert!(keys.contains(&"outcomeEvents".to_string()), "须命中 camelCase outcomeEvents");
+        assert!(keys.contains(&"outcome_events".to_string()), "须命中 camelCase outcome_events");
         assert!(keys.contains(&"deal_events".to_string()), "须命中 legacy alias deal_events");
     }
 }
@@ -333,7 +333,7 @@ use wechatagent::db::migrations::m030_backfill_outcome_event_defaults;
 
 use crate::common::TestApp;
 
-/// 直接插一条 outcomeEvents 缺 verification/eventKind 的"老成交"contact（raw Document
+/// 直接插一条 outcome_events 缺 verification/eventKind 的"老成交"contact（raw Document
 /// 绕过 serde 默认，模拟 §4.5 上线前的 BSON 形态），跑 m030 后两键补齐为默认值。
 #[tokio::test]
 #[ignore]
@@ -342,7 +342,7 @@ async fn m030_backfills_missing_verification_and_event_kind() {
     let ws = app.state.config.default_workspace_id.clone();
     let raw = app.state.db.raw();
 
-    // raw insert：outcomeEvents 元素只有 productRef，无 verification/eventKind。
+    // raw insert：outcome_events 元素只有 productRef，无 verification/eventKind。
     raw.collection::<Document>("contacts")
         .insert_one(
             doc! {
@@ -350,7 +350,7 @@ async fn m030_backfills_missing_verification_and_event_kind() {
                 "account_id": "acc",
                 "wxid": "old_buyer",
                 "agent_status": "managed",
-                "outcomeEvents": [ {
+                "outcome_events": [ {
                     "markedAt": mongodb::bson::DateTime::from_millis(0),
                     "source": "manual",
                     "productRef": { "productId": "vip", "name": "P", "quantity": 1 },
@@ -371,7 +371,7 @@ async fn m030_backfills_missing_verification_and_event_kind() {
         .await
         .expect("find")
         .expect("contact exists");
-    let ev = after.get_array("outcomeEvents").unwrap()[0].as_document().unwrap();
+    let ev = after.get_array("outcome_events").unwrap()[0].as_document().unwrap();
     assert_eq!(ev.get_str("verification").unwrap(), "staff_confirmed", "缺 verification 补默认");
     assert_eq!(ev.get_str("eventKind").unwrap(), "deal", "缺 eventKind 补默认");
     // productRef 原值不被破坏
@@ -396,7 +396,7 @@ async fn m030_does_not_overwrite_existing_values() {
                 "account_id": "acc",
                 "wxid": "explicit_buyer",
                 "agent_status": "managed",
-                "outcomeEvents": [ {
+                "outcome_events": [ {
                     "markedAt": mongodb::bson::DateTime::from_millis(0),
                     "source": "manual",
                     "verification": "conversation_inferred",
@@ -423,7 +423,7 @@ async fn m030_does_not_overwrite_existing_values() {
         .await
         .expect("find")
         .expect("exists");
-    let ev = after.get_array("outcomeEvents").unwrap()[0].as_document().unwrap();
+    let ev = after.get_array("outcome_events").unwrap()[0].as_document().unwrap();
     assert_eq!(ev.get_str("verification").unwrap(), "conversation_inferred", "已有值不被覆盖");
     assert_eq!(ev.get_str("eventKind").unwrap(), "reversal", "已有 reversal 不被改成 deal");
 }
@@ -445,7 +445,7 @@ async fn coarse_query_includes_legacy_event_missing_fields() {
                 "account_id": "acc",
                 "wxid": "legacy_vip",
                 "agent_status": "managed",
-                "outcomeEvents": [ {
+                "outcome_events": [ {
                     "markedAt": mongodb::bson::DateTime::from_millis(0),
                     "source": "manual",
                     "productRef": { "productId": "vip", "name": "P", "quantity": 1 },
@@ -461,7 +461,7 @@ async fn coarse_query_includes_legacy_event_missing_fields() {
         "workspace_id": &ws,
         "account_id": "acc",
         "agent_status": "managed",
-        "outcomeEvents": { "$elemMatch": {
+        "outcome_events": { "$elemMatch": {
             "productRef.productId": { "$in": ["vip"] },
             "$and": [
                 { "$or": [
@@ -510,7 +510,7 @@ git commit -m "test: KC-05 端到端(m030回填语义+幂等+缺字段老成交�
 - 既有单测旧断言更新（:826 eventKind:"deal"）→ Task 1 Step 1 ✓
 - 迁移注册 + id 顺序 → Task 2 Step 2/3/4 ✓
 - 集成测端到端复现 → Task 3 ✓
-- 存储键 camelCase/alias → 全任务已用 `outcomeEvents`/`eventKind`/`deal_events` ✓
+- 存储键 camelCase/alias → 全任务已用 `outcome_events`/`eventKind`/`deal_events` ✓
 
 **2. Placeholder scan：** 无 TBD/TODO；每个 code step 都有完整可编译代码。
 

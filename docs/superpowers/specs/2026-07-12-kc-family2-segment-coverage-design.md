@@ -57,7 +57,7 @@ campaign 圈人分两阶段：**粗筛**（Mongo 查询，`build_segment_coarse_
 
 ### 防线 B —— 迁移回填（治本 + 清历史）
 
-新增 `m030_backfill_outcome_event_defaults`，把库中所有 `outcomeEvents`（含 legacy alias `deal_events`，models.rs:248）数组元素中缺 `verification`/`eventKind` 的补上 serde 默认值。彻底消除长期口径分裂——以后任何新查询点都不用记得带 `$exists` 兜底。
+新增 `m030_backfill_outcome_event_defaults`，把库中所有 `outcome_events`（含 legacy alias `deal_events`，models.rs:248）数组元素中缺 `verification`/`eventKind` 的补上 serde 默认值。彻底消除长期口径分裂——以后任何新查询点都不用记得带 `$exists` 兜底。
 
 **关键设计决策：不加 `APP_ENV=production` 守卫。** 亲验：只有破坏性 drop（m011/m012/m014）+ m016（多租户前置回填，有特定"过早回填致误黑"危害）带该守卫；三个语义保持型回填 m018/m022/m025 **零守卫、生产照跑**。本回填写的就是 serde 读时本已假设的默认值（`staff_confirmed`/`deal`），非破坏、幂等，属 m018 那一类。若误加守卫，会在 117 生产（`APP_ENV` 疑似 production）静默 SKIP，使防线 B 名存实亡——这正是要避开的坑。
 
@@ -83,7 +83,7 @@ fn backfill_array(field: &str) -> Document {
 
 ```rust
 doc! { "$or": [
-    { "outcomeEvents": { "$exists": true } },
+    { "outcome_events": { "$exists": true } },
     { "deal_events":   { "$exists": true } },
 ]}
 ```
@@ -92,8 +92,8 @@ doc! { "$or": [
 
 ## 存储键约定（亲验）
 
-- `Contact` struct `#[serde(rename_all = "camelCase")]`（models.rs:148）→ `outcome_events` 存储键 = `outcomeEvents`；`#[serde(alias = "deal_events")]`（:248）→ 极老文档可能用 `deal_events`。
-- `OutcomeEvent` 也是 camelCase → `event_kind` → `eventKind`；`verification` 无变化。粗筛现有查询（campaigns.rs:51-53）用的正是 `verification`/`eventKind`/`productRef.productId`，与 camelCase 存储一致。
+- `Contact` struct **无** `#[serde(rename_all)]`（models.rs:148；:138 的 camelCase 属上方 `HourRange`，勿混淆）→ 顶层 `outcome_events` 存储键 = snake_case `outcome_events`（铁证：db/indexes.rs:38-40 索引键 `outcome_events.productRef.productId` + 防线A campaigns.rs 亦用 snake_case）；`#[serde(alias = "deal_events")]`（:248）→ 极老文档可能用 `deal_events`。
+- `OutcomeEvent` **带** `rename_all = "camelCase"` → `event_kind` → `eventKind`；`verification` 无变化。粗筛现有查询（campaigns.rs:51-53）用的正是顶层 snake `outcome_events` + 内层 camel `verification`/`eventKind`/`productRef.productId`。
 
 ## 回归风险
 
@@ -115,9 +115,9 @@ doc! { "$or": [
 - **单测（lib，本地可跑）**：
   - `build_segment_coarse_filter` 新构造断言：`$elemMatch` 含 `$and`→`[$or(verification $in / $exists:false), eventKind $ne reversal]` 结构；空 `product_ids` 仍不加 outcome_events 条件（既有断言保留）。
   - 迁移 `backfill_array` 纯函数：缺键补 staff_confirmed/deal；已有 `conversation_inferred`/`reversal` 不被覆盖；幂等（二次结果等价）。
-  - 迁移 filter：`$or` 命中 outcomeEvents / deal_events 任一存在。
+  - 迁移 filter：`$or` 命中 outcome_events / deal_events 任一存在。
 - **集成测（`#[ignore]` CI Docker）**：
-  - seed 一条 `outcomeEvents` 缺 `verification`/`eventKind` 的老成交 contact（managed、买过 product X）→ 直接调 `m030::run_step` → 断言两键补齐为 staff_confirmed/deal。
+  - seed 一条 `outcome_events` 缺 `verification`/`eventKind` 的老成交 contact（managed、买过 product X）→ 直接调 `m030::run_step` → 断言两键补齐为 staff_confirmed/deal。
   - 再走 `resolve_segment_contacts`（或 `build_segment_coarse_filter` + 查询）断言该老客户被纳入粗筛（端到端复现 KC-05 假阴修复：回退防线 A 或防线 B 任一即变红）。
 
 ## 非目标（YAGNI）
