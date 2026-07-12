@@ -68,7 +68,10 @@ mod m028_seed_conversation_mode;
 /// 验证清理语义（删非真人 normal / roster 回填 / 清 Demi / managed 保留 / 幂等）。
 /// 跨 crate 调用要求 `pub`（同 m018 先例）。
 pub mod m029_cleanup_contact_identity;
-mod m030_backfill_outcome_event_defaults;
+/// `pub`：集成测试 `tests/campaign_segment_coverage.rs` 需在 `TestApp::start()` 跑完
+/// 迁移后手动插入缺 verification/eventKind 的老成交 contacts，再**直接调用**
+/// `m030::run_step` 验回填语义（同 m018/m029 先例：为集成测暴露而用 `pub mod`）。
+pub mod m030_backfill_outcome_event_defaults;
 
 type MigrationFuture<'a> = Pin<Box<dyn Future<Output = AppResult<()>> + Send + 'a>>;
 pub type MigrationFn = for<'a> fn(&'a Database) -> MigrationFuture<'a>;
