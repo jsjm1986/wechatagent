@@ -61,7 +61,11 @@ async fn put_preserves_provenance_wiki_type_locked_fields_and_created_at() {
             edited_at: created,
             edited_by: Some("operator".to_string()),
         }),
-        locked_fields: Some(vec!["title".to_string(), "body".to_string()]),
+        // 只锁 body、不锁 title：本测试的意图是「请求体无法表达的字段在 replace_one 后存活」
+        // （provenance / wiki_type / locked_fields 数组本身 / created_at ...），而非验证锁字段强制。
+        // KB-11 落地后 PUT 会强制 per-chunk 锁定字段，若这里仍锁 title 则 PUT 的 title 会被静默回滚、
+        // 与下方「title 被更新」断言冲突（锁字段强制的正例由 put_enforces_locked_fields_and_writes_audit_revision 覆盖）。
+        locked_fields: Some(vec!["body".to_string()]),
         dynamic_confidence: Some(0.66),
         integrity_score: Some(0.88),
         created_at: created,
@@ -117,7 +121,7 @@ async fn put_preserves_provenance_wiki_type_locked_fields_and_created_at() {
     );
     assert_eq!(
         after.locked_fields.as_deref(),
-        Some(&["title".to_string(), "body".to_string()][..]),
+        Some(&["body".to_string()][..]),
         "locked_fields 保持原值(编辑保护清单)"
     );
     assert_eq!(after.dynamic_confidence, Some(0.66), "dynamic_confidence 保持原值");
