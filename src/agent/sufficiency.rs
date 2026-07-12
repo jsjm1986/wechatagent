@@ -93,6 +93,21 @@ pub(crate) fn should_record_used_knowledge_ids(forced_full: bool, escalated_to_f
     forced_full || escalated_to_full
 }
 
+/// KB-01：本决策最终应记录的 used_knowledge_ids。
+/// Full 档(读了切片)记路由命中 id;非 Full 档(没读切片)一律清空——含 LLM 经
+/// carry_through 透传的自报值,不给 grounding 硬闸 `compute_verified_chunks` 留架空口。
+pub(crate) fn resolve_used_knowledge_ids(
+    forced_full: bool,
+    escalated_to_full: bool,
+    route_ids: Vec<String>,
+) -> Vec<String> {
+    if should_record_used_knowledge_ids(forced_full, escalated_to_full) {
+        route_ids
+    } else {
+        Vec::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,5 +270,49 @@ mod tests {
         assert!(should_record_used_knowledge_ids(false, true));
         // 两者同真(理论不同时发生,防御)→ 记。
         assert!(should_record_used_knowledge_ids(true, true));
+    }
+
+    // ── KB-01：非 Full 档清空 used_knowledge_ids，堵 LLM 自报架空硬闸 ──
+    #[test]
+    fn kb01_lean_tier_clears_self_reported_ids() {
+        // 非 Full 档(false,false)：即便传入(经 carry_through 透传的)自报 id，也一律清空。
+        let ids = resolve_used_knowledge_ids(false, false, vec!["a".into(), "b".into()]);
+        assert!(ids.is_empty(), "非 Full 档必须清空 used_knowledge_ids(含 LLM 自报)");
+    }
+
+    #[test]
+    fn kb01_full_tier_keeps_route_ids() {
+        // Full 档(forced 或 escalated)：读了切片，保留路由命中 id，不误伤合法背书。
+        assert_eq!(
+            resolve_used_knowledge_ids(true, false, vec!["id1".into()]),
+            vec!["id1".to_string()]
+        );
+        assert_eq!(
+            resolve_used_knowledge_ids(false, true, vec!["id1".into()]),
+            vec!["id1".to_string()]
+        );
+    }
+
+    #[test]
+    fn kb01_lean_self_reported_verified_id_cannot_forge_grounding_gate() {
+        // 端到端不变量：非 Full 档 + 自报一个真实 verified 语料 id →
+        // resolve 清空 → compute_verified_chunks 取 used∩verified 为空 → 硬闸不被架空。
+        use crate::models::OperationKnowledgeChunk;
+        use mongodb::bson::{oid::ObjectId, DateTime};
+        let oid = ObjectId::new();
+        let mut chunk = OperationKnowledgeChunk::default();
+        chunk.id = Some(oid);
+        chunk.integrity_status = Some("verified".into());
+        chunk.valid_to = None;
+        let self_reported = vec![oid.to_hex()];
+        let resolved = resolve_used_knowledge_ids(false, false, self_reported);
+        assert!(resolved.is_empty(), "非 Full 档清空自报 id");
+        let chunks = [chunk];
+        let verified =
+            crate::agent::guards::compute_verified_chunks(&resolved, &chunks, DateTime::now());
+        assert!(
+            verified.is_empty(),
+            "非 Full 档不得有 verified 背书——否则架空 blocked_unverified_product_claim"
+        );
     }
 }
