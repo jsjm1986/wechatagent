@@ -286,6 +286,13 @@ pub async fn preview_campaign(
     })))
 }
 
+/// KC-02：仅这些 status 允许 dispatch。dispatching = 允许重入恢复（配合补偿回滚，
+/// 已完成的 send 撞去重跳过、失败/剩余 contact 重建）；completed = 拒绝（防重复推送）；
+/// 未知态 = 拒绝（fail-safe）。
+pub(super) fn dispatch_allowed_from_status(status: &str) -> bool {
+    matches!(status, "draft" | "previewed" | "dispatching")
+}
+
 pub async fn dispatch_campaign(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
@@ -302,6 +309,14 @@ pub async fn dispatch_campaign(
         )
         .await?
         .ok_or_else(|| AppError::NotFound("campaign not found".to_string()))?;
+    // KC-02：置 dispatching 前先校验当前 status——completed/未知态拒绝重推，
+    // draft/previewed/dispatching 放行（dispatching 支持后续补偿回滚的重入恢复）。
+    if !dispatch_allowed_from_status(&campaign.status) {
+        return Err(AppError::BadRequest(format!(
+            "当前活动状态 {} 不可派发（仅 draft/previewed/dispatching 可派发；completed 需另建活动）",
+            campaign.status
+        )));
+    }
     // 重新跑圈人（防预览后数据漂移）。
     let hits = resolve_segment_contacts(
         &state,
@@ -661,6 +676,17 @@ pub async fn list_campaigns(
 mod tests {
     use super::*;
     use crate::models::{OutcomeEvent, OutcomeProductRef};
+
+    #[test]
+    fn dispatch_allowed_only_from_draft_previewed_dispatching() {
+        // KC-02：completed 活动不可再派发（防重复推送）；dispatching 允许重入恢复；未知态 fail-safe 拒。
+        assert!(dispatch_allowed_from_status("draft"));
+        assert!(dispatch_allowed_from_status("previewed"));
+        assert!(dispatch_allowed_from_status("dispatching"), "dispatching 须允许重入恢复");
+        assert!(!dispatch_allowed_from_status("completed"), "completed 不可重推");
+        assert!(!dispatch_allowed_from_status("canceled"));
+        assert!(!dispatch_allowed_from_status("赫赫"), "未知态 fail-safe 拒");
+    }
 
     fn ev(verification: &str, pid: &str, qty: u32, kind: &str, amount: i64) -> OutcomeEvent {
         OutcomeEvent {
