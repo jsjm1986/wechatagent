@@ -18,7 +18,7 @@ import { ReviewChat, type ReviewChatChunk } from "./cockpit/ReviewChat";
 import { useConfirm } from "../../components/ui/ConfirmDialog";
 import { ChunkPicker } from "../../components/ui/ChunkRef";
 import { EmptyState } from "../../components/ui/EmptyState";
-import { sourceTypeLabel, statusLabel, integrityStatusLabel, wikiTypeLabel, sourceKindLabel, ingestStatusLabel, riskLevelLabel, revisionOpLabel, revisionSourceLabel, runLifecycleLabel, revisionReasonLabel, reviewerMisjudgeKindLabel, gapSignalStatusLabel, lessonPatternLabel, chatErrorKindLabel, taskStatusLabel } from "./labels";
+import { sourceTypeLabel, statusLabel, integrityStatusLabel, wikiTypeLabel, chunkTypeLabel, sourceKindLabel, ingestStatusLabel, riskLevelLabel, revisionOpLabel, revisionSourceLabel, runLifecycleLabel, revisionReasonLabel, reviewerMisjudgeKindLabel, gapSignalStatusLabel, lessonPatternLabel, chatErrorKindLabel, taskStatusLabel } from "./labels";
 import { GAP_SIGNAL_KIND_LABELS, GAP_SIGNAL_SEVERITY_LABELS, labelOf } from "../../lib/reviewLabels";
 import { DocumentRepairPanel } from "./DocumentRepairPanel";
 
@@ -595,6 +595,7 @@ interface ImportPreviewChunk {
   body?: string | null;
   summary?: string | null;
   wikiType?: string | null;
+  chunkType?: string | null;
   businessTopics?: string[] | null;
   productTags?: string[] | null;
   routingCard?: string | null;
@@ -1009,6 +1010,7 @@ export function ImportWizard() {
                   <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                     <input type="checkbox" checked={isOn} onChange={() => toggle(i)} />
                     <span className="wikiArchiveTag">{wikiTypeLabel(merged.wikiType ?? undefined)}</span>
+                    {chunkTypeLabel(merged.chunkType) ? <span className="wikiArchiveTag">{chunkTypeLabel(merged.chunkType)}</span> : null}
                     <input
                       type="text"
                       value={merged.title ?? ""}
