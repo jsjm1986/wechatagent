@@ -355,6 +355,7 @@ pub async fn dispatch_campaign(
         };
         match state.db.campaign_sends().insert_one(&send, None).await {
             Ok(send_res) => {
+                let send_id = send_res.inserted_id.as_object_id();
                 let task = build_campaign_follow_up_task(
                     &campaign.workspace_id,
                     &campaign.account_id,
@@ -363,21 +364,44 @@ pub async fn dispatch_campaign(
                     now,
                 );
                 assert_agent_task_status_valid(&task.status);
-                let task_res = state.db.tasks().insert_one(&task, None).await?;
-                // 回填 taskId。
-                if let (Some(send_id), Some(task_id)) = (
-                    send_res.inserted_id.as_object_id(),
-                    task_res.inserted_id.as_object_id(),
-                ) {
-                    state
+                // KC-01：建 task 失败 → 补偿删掉刚占位的 send,避免留下 task_id=None 的孤儿 send
+                // (重入撞去重跳过→客户永久漏推)。补偿删除 best-effort(let _)。
+                let task_res = match state.db.tasks().insert_one(&task, None).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        if let Some(sid) = send_id {
+                            let _ = state
+                                .db
+                                .campaign_sends()
+                                .delete_one(doc! { "_id": sid }, None)
+                                .await;
+                        }
+                        return Err(e.into());
+                    }
+                };
+                // KC-03：回填 taskId 失败 → 补偿删 task + send,保持 all-or-nothing
+                // (否则 task 会真发但 report 显 pending 成效虚低)。
+                if let (Some(sid), Some(tid)) =
+                    (send_id, task_res.inserted_id.as_object_id())
+                {
+                    if let Err(e) = state
                         .db
                         .campaign_sends()
                         .update_one(
-                            doc! { "_id": send_id },
-                            doc! { "$set": { "taskId": task_id } },
+                            doc! { "_id": sid },
+                            doc! { "$set": { "taskId": tid } },
                             None,
                         )
-                        .await?;
+                        .await
+                    {
+                        let _ = state.db.tasks().delete_one(doc! { "_id": tid }, None).await;
+                        let _ = state
+                            .db
+                            .campaign_sends()
+                            .delete_one(doc! { "_id": sid }, None)
+                            .await;
+                        return Err(e.into());
+                    }
                 }
                 dispatched += 1;
             }
