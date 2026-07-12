@@ -44,23 +44,25 @@ pub(super) fn backfill_array(field: &str) -> Document {
     }}}
 }
 
-/// 命中过滤器:两个数组字段任一存在即需回填(纯函数,便于单测)。
-pub(super) fn backfill_filter() -> Document {
-    doc! {
-        "$or": [
-            { "outcome_events": { "$exists": true } },
-            { "deal_events": { "$exists": true } },
-        ]
-    }
+/// 命中过滤器:**只**命中确实持有该数组字段的文档(纯函数,便于单测)。
+///
+/// 必须逐字段 `{field:$exists}`,**不能**共享一个 `$or:[两键任一存在]`——否则对
+/// `deal_events` 那轮,凡是有 `outcome_events` 的文档也会被命中,而 `backfill_array` 的
+/// `$ifNull($field,[])` 会给它们**凭空新增 `deal_events:[]`**。Contact.outcome_events 带
+/// `#[serde(alias="deal_events")]`(models.rs:248),两键同现 → serde `duplicate_field` 反序列化
+/// 报错,`Collection<Contact>` 类型化读取(webhook reload/圈人/outbox 热路径)全崩。故按字段隔离。
+pub(super) fn backfill_filter(field: &str) -> Document {
+    doc! { field: { "$exists": true } }
 }
 
 /// 迁移主体。`pub` 暴露给 `tests/` 集成测试(同 m018/m029 先例)。
-/// 对 outcome_events 与 legacy deal_events 各跑一次 update_many pipeline。
+/// 对 outcome_events 与 legacy deal_events 各跑一次 update_many pipeline;过滤器逐字段隔离,
+/// 只改真正持有该键的文档,绝不给缺该键的文档造键(见 backfill_filter doc)。
 pub async fn run_step(db: &Database) -> AppResult<()> {
     for field in ["outcome_events", "deal_events"] {
         let result = db
             .contacts()
-            .update_many(backfill_filter(), vec![backfill_array(field)], None)
+            .update_many(backfill_filter(field), vec![backfill_array(field)], None)
             .await?;
         tracing::info!(
             migration_id = "2026_07_030_backfill_outcome_event_defaults",
@@ -96,16 +98,18 @@ mod tests {
     }
 
     #[test]
-    fn backfill_filter_matches_either_array_key() {
-        let filter = backfill_filter();
-        let or = filter.get_array("$or").unwrap();
-        assert_eq!(or.len(), 2);
-        let keys: Vec<String> = or
-            .iter()
-            .filter_map(|b| b.as_document())
-            .flat_map(|d| d.keys().cloned().collect::<Vec<_>>())
-            .collect();
-        assert!(keys.contains(&"outcome_events".to_string()), "须命中 snake_case outcome_events(Contact 无 rename_all)");
-        assert!(keys.contains(&"deal_events".to_string()), "须命中 legacy alias deal_events");
+    fn backfill_filter_is_per_field_and_never_shares_or() {
+        // 逐字段隔离:只 {field:$exists},不能共享 $or——否则 deal_events 那轮会命中只有
+        // outcome_events 的文档、$ifNull 造 deal_events:[]、撞 serde alias 致类型化读崩(C1)。
+        for field in ["outcome_events", "deal_events"] {
+            let filter = backfill_filter(field);
+            // 恰一个顶层键 = 该字段,且 value 是 {$exists:true}
+            let keys: Vec<&String> = filter.keys().collect();
+            assert_eq!(keys.len(), 1, "过滤器必须只含单字段,严禁 $or 跨字段");
+            assert_eq!(keys[0], field);
+            assert!(filter.get_document(field).unwrap().get_bool("$exists").unwrap());
+            // 绝不含 $or(共享过滤器是 C1 根因)
+            assert!(filter.get("$or").is_none(), "backfill_filter 不得含 $or");
+        }
     }
 }

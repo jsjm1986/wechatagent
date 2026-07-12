@@ -155,3 +155,66 @@ async fn coarse_query_includes_legacy_event_missing_fields() {
         .expect("count");
     assert_eq!(count, 1, "缺 verification/eventKind 的老成交老客户须被粗筛纳入(KC-05 修复)");
 }
+
+/// C1 回归哨兵：只有 outcome_events(无 deal_events)的文档,跑 m030 后**不得**被凭空
+/// 追加 deal_events:[]。因 Contact.outcome_events 带 #[serde(alias="deal_events")]
+/// (models.rs:248),两键同现会触发 serde duplicate_field、类型化 Collection<Contact>
+/// 读取崩溃。故用**类型化** contacts() 读回(而非 raw Document)——若 m030 造了 deal_events,
+/// 这里反序列化直接 panic;并显式断言 raw 文档里 deal_events 键不存在。
+/// 若 backfill_filter 退回共享 $or(C1 缺陷),本测立刻红。
+#[tokio::test]
+#[ignore]
+async fn m030_does_not_create_deal_events_key_on_outcome_events_only_doc() {
+    let app = TestApp::start().await;
+    let ws = app.state.config.default_workspace_id.clone();
+    let raw = app.state.db.raw();
+
+    // 只有 outcome_events(snake)、无 legacy deal_events。
+    raw.collection::<Document>("contacts")
+        .insert_one(
+            doc! {
+                "workspace_id": &ws,
+                "account_id": "acc",
+                "wxid": "outcome_only",
+                "agent_status": "managed",
+                "outcome_events": [ {
+                    "markedAt": mongodb::bson::DateTime::from_millis(0),
+                    "source": "manual",
+                    "productRef": { "productId": "vip", "name": "P", "quantity": 1 },
+                } ],
+            },
+            None,
+        )
+        .await
+        .expect("seed outcome-only");
+
+    m030_backfill_outcome_event_defaults::run_step(&app.state.db)
+        .await
+        .expect("run m030");
+
+    // (a) raw 层:deal_events 键必须不存在(m030 不得对缺该键的文档造键)。
+    let raw_after = raw
+        .collection::<Document>("contacts")
+        .find_one(doc! { "wxid": "outcome_only", "workspace_id": &ws }, None)
+        .await
+        .expect("find raw")
+        .expect("exists");
+    assert!(
+        raw_after.get("deal_events").is_none(),
+        "m030 绝不能给只有 outcome_events 的文档凭空追加 deal_events(C1);实得 {:?}",
+        raw_after.get("deal_events")
+    );
+
+    // (b) 类型化层:contacts() 反序列化必须成功(两键同现会 duplicate_field 崩)。
+    let typed = app
+        .state
+        .db
+        .contacts()
+        .find_one(doc! { "wxid": "outcome_only", "workspace_id": &ws }, None)
+        .await
+        .expect("类型化 Contact 读取不得因 deal_events/outcome_events 双键 duplicate_field 崩")
+        .expect("contact exists");
+    assert_eq!(typed.outcome_events.len(), 1, "回填后成交事件仍在");
+    assert_eq!(typed.outcome_events[0].verification, "staff_confirmed", "缺 verification 补默认");
+    assert_eq!(typed.outcome_events[0].event_kind, "deal", "缺 event_kind 补默认");
+}
