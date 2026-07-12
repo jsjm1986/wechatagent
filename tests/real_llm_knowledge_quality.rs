@@ -56,8 +56,8 @@ use wechatagent::llm::{LlmClient, LlmFormat, LlmJsonResult, LlmProvider};
 use wechatagent::models::{LlmProviderConfig, OperationKnowledgeChunk, RelatedRef};
 use wechatagent::routes::ext_knowledge::{
     build_operation_knowledge_completeness, chat_turn, extract_operation_knowledge_tags,
-    import_operation_knowledge_apply_image, import_operation_knowledge_preview,
-    propose_chunk_repair, ChatTurnRequest, ExtractKnowledgeTagsRequest, ImportApplyImageRequest,
+    import_operation_knowledge_apply_image, propose_chunk_repair, run_import_extraction,
+    ChatTurnRequest, ExtractKnowledgeTagsRequest, ImportApplyImageRequest,
     OperationKnowledgeImportRequest,
 };
 
@@ -1943,11 +1943,12 @@ async fn q2_article_extraction_quality() {
         }))
         .expect("构造 OperationKnowledgeImportRequest");
 
-        let resp = unwrap_or_skip_transient!(
-            import_operation_knowledge_preview(State(state.clone()), Json(req)).await,
+        // 直调抽取纯函数（经 ext_knowledge 导出）：绕过 handler 大/小文档 job 分流，
+        // Q2 只验真模型抽取质量，不涉及异步 job。
+        let body = unwrap_or_skip_transient!(
+            run_import_extraction(&state, &req, None).await,
             "Q2 真实文章抽取"
         );
-        let body = resp.0;
         let chunks = body["chunks"].as_array().cloned().unwrap_or_default();
         let items = body["items"].as_array().cloned().unwrap_or_default();
 

@@ -56,8 +56,8 @@ use wechatagent::models::{LlmProviderConfig, OperationKnowledgeChunk, RelatedRef
 use wechatagent::routes::ext_knowledge::{
     auto_verify_operation_knowledge_chunks, build_operation_knowledge_completeness, chat_turn,
     decide_auto_verify_status, extract_operation_knowledge_tags,
-    import_operation_knowledge_apply_image, import_operation_knowledge_preview,
-    propose_chunk_repair, ChatTurnRequest, ExtractKnowledgeTagsRequest, ImportApplyImageRequest,
+    import_operation_knowledge_apply_image, propose_chunk_repair, run_import_extraction,
+    ChatTurnRequest, ExtractKnowledgeTagsRequest, ImportApplyImageRequest,
     KnowledgeAutoVerifyRequest, OperationKnowledgeImportRequest,
 };
 
@@ -733,11 +733,12 @@ async fn k5_real_article_extraction_keeps_needs_review() {
     }))
     .expect("构造 OperationKnowledgeImportRequest");
 
-    let resp = unwrap_or_skip_transient!(
-        import_operation_knowledge_preview(State(state.clone()), Json(req)).await,
+    // 直调抽取纯函数（经 ext_knowledge 导出）：绕过 handler 大/小文档 job 分流，
+    // K5 只验真模型抽取结果，不涉及异步 job（大文档走 handler 会返 jobId 而非 body）。
+    let body = unwrap_or_skip_transient!(
+        run_import_extraction(&state, &req, None).await,
         "真实文章抽取（不崩、JSON 能解析+normalize）"
     );
-    let body = resp.0;
 
     let chunks = body["chunks"].as_array().cloned().unwrap_or_default();
     let items = body["items"].as_array().cloned().unwrap_or_default();

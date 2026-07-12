@@ -919,6 +919,86 @@ mod agent_task_status_tests {
     }
 }
 
+/// 异步知识导入 job（`import_jobs` 集合）。长文档 preview 不再让前端同步死等：
+/// 大文档提交后建 job，专用 `import_worker` 认领并跑分块抽取，前端轮询进度。
+/// 小文档仍走同步路径，不落 job。`result` 完成时嵌入同步 preview 的响应体
+/// （`{document, items, chunks, integrityReport, importReport}`）。
+///
+/// 字段用 snake_case（无 `rename_all`，与 `AgentTask` 一致），使 `db/indexes.rs`
+/// 的 `{workspace_id,status}` / `{status,claimed_at}` 索引键与 BSON 字段名对齐。
+/// worker/endpoint 写库统一用 snake_case `doc!` key，读回反序列化本 struct。
+/// 前端读进度走 GET 端点手工构建的 camelCase json，不直接序列化本 struct。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportJob {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub workspace_id: String,
+    pub account_id: Option<String>,
+    pub source_name: String,
+    pub content: String,
+    pub segments_total: i32,
+    #[serde(default)]
+    pub progress_done: i32,
+    #[serde(default)]
+    pub progress_succeeded: i32,
+    #[serde(default)]
+    pub progress_failed: i32,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimed_at: Option<DateTime>,
+    #[serde(default)]
+    pub claim_recovery_count: i32,
+    /// TTL 清扫锚点：worker 落终态（completed/failed）时置 `now + 24h`；
+    /// pending/running 保持 `None`。`import_jobs` 的 `expires_at` TTL 索引
+    /// （expireAfterSeconds=0）只删设了此字段的终态 job，进行中 job 不误删
+    /// （Mongo TTL 忽略缺失字段）。防 `result`（可能较大）无界堆积。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime>,
+    pub created_at: DateTime,
+    pub updated_at: DateTime,
+}
+
+/// `ImportJob.status` 的封闭枚举（`import_jobs` 集合）。所有写入路径在
+/// `$set: { status: ... }` 之前必须经过 [`assert_import_job_status_valid`] 校验，
+/// 对齐 gateway/finalReview status 闭集红线（R9.10.e），避免脏值写进 DB。
+pub const ALLOWED_IMPORT_JOB_STATUS: &[&str] = &["pending", "running", "completed", "failed"];
+
+/// 任意 `import_jobs.status` 写入站点的闭集断言。命中闭集外值时 panic（debug）
+/// 或 `tracing::error!` + 拒绝写入（release）。
+#[track_caller]
+pub fn assert_import_job_status_valid(status: &str) {
+    if !ALLOWED_IMPORT_JOB_STATUS.contains(&status) {
+        let msg = format!(
+            "import_jobs.status='{status}' 不在 ALLOWED_IMPORT_JOB_STATUS 闭集 {ALLOWED_IMPORT_JOB_STATUS:?}"
+        );
+        debug_assert!(false, "{msg}");
+        tracing::error!(target: "agent_protocol_violation", "{msg}");
+    }
+}
+
+#[cfg(test)]
+mod import_job_status_tests {
+    use super::{assert_import_job_status_valid, ALLOWED_IMPORT_JOB_STATUS};
+
+    #[test]
+    fn closed_set_covers_lifecycle() {
+        for s in ["pending", "running", "completed", "failed"] {
+            assert!(ALLOWED_IMPORT_JOB_STATUS.contains(&s), "{s} 缺失");
+            assert_import_job_status_valid(s);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "ALLOWED_IMPORT_JOB_STATUS")]
+    fn unknown_status_panics_in_debug() {
+        assert_import_job_status_valid("queued");
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentEvent {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
