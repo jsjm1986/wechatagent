@@ -83,6 +83,7 @@ async fn seed_pending_escalation(
         resolved_at: None,
         resolved_via: None,
         last_holding_reply_ms: None,
+        last_pushed_at_ms: None,
     };
     state
         .db

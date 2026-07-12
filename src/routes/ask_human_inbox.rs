@@ -618,6 +618,7 @@ mod tests {
             is_generalizable: false,
             knowledge_proposal_emitted: false,
             last_holding_reply_ms: None,
+            last_pushed_at_ms: None,
             created_at: now,
             updated_at: now,
             resolved_at: None,
