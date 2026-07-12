@@ -1449,14 +1449,14 @@ async fn run_user_operation_gateway_inner(
     apply_confidence_override(&mut planner, &decision, &runtime);
     normalize_decision_runtime(&mut decision, &planner);
     decision.context_pack_version = Some(next_memory_card_version(&memory));
-    // ⑤口径修正:Lean/Relational 都不注入业务知识(include_business=matches!(tier,Full),decision.rs:297)。
-    // 若没读切片的决策记了路由命中 id,会架空 grounding 硬闸(取 used∩verified 非空即放行——
-    // 没读过任何切片却记了路由 id=误当"Agent 读过")。仅当本决策确实经 **Full** 知识档
-    // (forced_full=强升Full,或 escalated_to_full=升档到Full)时才记路由 id;
-    // 纯 Lean-Enough / Clarify(Lean) / 升到 Relational(同样 include_business=false)都不记。
-    if crate::agent::sufficiency::should_record_used_knowledge_ids(forced_full, escalated_to_full) {
-        decision.used_knowledge_ids = route_used_knowledge_ids(&knowledge_route);
-    }
+    // ⑤口径修正(KB-01):Full 档记路由命中 id;非 Full 档(Lean/Clarify/Relational 不读切片)
+    // 一律清空 used_knowledge_ids——含 LLM 经 carry_through 透传的自报 id,否则自报一个真实
+    // verified ObjectId 即可令 grounding 硬闸 used∩verified 非空、架空 blocked_unverified_product_claim。
+    decision.used_knowledge_ids = crate::agent::sufficiency::resolve_used_knowledge_ids(
+        forced_full,
+        escalated_to_full,
+        route_used_knowledge_ids(&knowledge_route),
+    );
     let _ = &mut promote_risks;
     // MP-5 / Task 15：进入 review 前预算超额则降级到 local。
     // agent-autonomy-loop W2 / Task 3.1：`local_decision_review` 改为接受
