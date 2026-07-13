@@ -476,18 +476,13 @@ pub(crate) async fn decide_reply_with_promote(
     } else {
         String::new()
     };
-    let runtime_text = if include_business {
-        serde_json::to_string(&runtime.as_document()).unwrap_or_default()
-    } else {
-        String::new()
-    };
     let knowledge_text = if include_business {
         format_operation_knowledge_for_prompt_with_roles(knowledge_chunks, &active_profile.chunk_roles)
     } else {
         String::new()
     };
     let knowledge_route_text = if include_business {
-        serde_json::to_string(knowledge_route).unwrap_or_default()
+        format_knowledge_route_for_prompt(knowledge_route)
     } else {
         String::new()
     };
@@ -524,10 +519,10 @@ pub(crate) async fn decide_reply_with_promote(
     };
     // §3 恒注入铁律（渐进式三档 2026-06-23）：doNotDo 禁止项 + commitments 已承诺
     // 属安全/身份类槽位，任何档都不能丢——降档若丢失"已承诺/禁止项"，AI 可能违背
-    // 承诺或踩禁止项，是不可恢复的安全事故。Relational/Full 档下完整 memory_card_text
-    // 已含这两项（context_pack 含 doNotDo/commitments 字段），无需重复注入；仅 Lean
-    // 档 memory_card_text 被跳过，必须单独补一份精简安全子片。整段（含标题/换行）只在
-    // Lean 档非空，Relational/Full 档空串 → Full 逐字等价历史 prompt（零字节差异）。
+    // 承诺或踩禁止项，是不可恢复的安全事故。Relational/Full 档下槽6 memory_text 的
+    // memoryCard 字段已含这两项（context_pack 含 doNotDo/commitments 字段），无需重复
+    // 注入；仅 Lean 档该字段被跳过，必须单独补一份精简安全子片。整段（含标题/换行）只在
+    // Lean 档非空，Relational/Full 档空串 → 该安全子片在 Relational/Full 档不额外加字节。
     let safety_donts_commitments_text = render_safety_donts_commitments(tier, context_pack);
     // 关系组：完整长期运营记忆 + 记忆卡片。Lean 跳过，空串占位。
     let memory_text = if include_relational {
@@ -539,11 +534,6 @@ pub(crate) async fn decide_reply_with_promote(
             "nextAction": memory.next_action.clone()
         })
         .unwrap_or_default()
-    } else {
-        String::new()
-    };
-    let memory_card_text = if include_relational {
-        serde_json::to_string(context_pack).unwrap_or_default()
     } else {
         String::new()
     };
@@ -850,13 +840,7 @@ pub(crate) async fn decide_reply_with_promote(
 运营状态机:
 {}
 
-硬运行参数:
-{}
-
 长期运营记忆:
-{}
-
-长期记忆卡片:
 {}
 
 最近 5 条已弃用记忆（不要再引用，仅供识别变化）:
@@ -922,9 +906,7 @@ pub(crate) async fn decide_reply_with_promote(
         playbook_text,
         domain_text,
         state_machine_text,
-        runtime_text,
         memory_text,
-        memory_card_text,
         serde_json::to_string(&deprecated_facts_recent).unwrap_or_default(),
         safety_donts_commitments_text,
         knowledge_text,
@@ -1256,6 +1238,25 @@ pub(crate) fn format_playbook_for_prompt(playbook: &OperationPlaybook) -> String
     )
 }
 
+/// 批次1③:知识路由注入槽的裁剪渲染。原槽直接 `serde_json::to_string(route)` 会把
+/// `toolTrace` / `evidenceExcerpts` / `selectedChunkRankings` 三个纯调试/落库元数据
+/// 一并喂给 LLM(`selectedChunkRankings` 注释明说只采集落库、不参与加权),回复文本
+/// 生成不消费。这里序列化后精确 remove 这 3 个 camelCase key,保留其余 10 个对 LLM
+/// 有语义的字段,且 key 大小写完全沿用 `KnowledgeRouteResult` 的 `rename_all` 派生
+/// (不手写 json! 以免字段漂移/大小写拼错、偷改 LLM 看到的字段名)。
+pub(crate) fn format_knowledge_route_for_prompt(route: &KnowledgeRouteResult) -> String {
+    let mut value = match serde_json::to_value(route) {
+        Ok(v) => v,
+        Err(_) => return String::new(),
+    };
+    if let Some(map) = value.as_object_mut() {
+        map.remove("toolTrace");
+        map.remove("evidenceExcerpts");
+        map.remove("selectedChunkRankings");
+    }
+    serde_json::to_string(&value).unwrap_or_default()
+}
+
 /// 把运营录入层（manual_tags）+ AI 确信层（confirmed_tags）标签渲染成 prompt 文本，
 /// 标注来源让 LLM 自行掂量分量。两层皆空 → 空串（调用点据此决定是否注入该段）。
 pub(crate) fn render_tags_for_prompt(
@@ -1295,8 +1296,8 @@ fn assemble_system_prompt(
 /// 或踩禁止项，是不可恢复的安全事故。
 ///
 /// 抽成纯函数让 lib 单测能锁住这条安全不变量：Lean 档（不注入完整 memory_card）必须
-/// 单独补一份含 doNotDo/commitments 的安全子片；Relational/Full 档完整 `memory_card_text`
-/// 已含这两项 → 此处返回空串避免重复，且保证 Full 档与改造前 prompt 逐字等价（零字节差异）。
+/// 单独补一份含 doNotDo/commitments 的安全子片；Relational/Full 档下槽6 memory_text 的
+/// `memoryCard` 字段已含这两项 → 此处返回空串避免重复（该安全子片在 Relational/Full 档不额外加字节）。
 /// 这段逻辑此前内联在 `decide_reply_with_promote` 里、依赖 AppState/DB，无法单测；抽出后
 /// 恒注入铁律成为可确定性断言的纯函数边界。
 pub(crate) fn render_safety_donts_commitments(
@@ -1735,7 +1736,7 @@ mod persona_override_tests {
     //! 「回落原出厂本体」。DEFAULT_PROFILE 两 override 均 None 必须返回 None（回落），
     //! 保证销售域字节不变。
 
-    use super::{assemble_system_prompt, non_empty_override, render_business_context_fragment, render_safety_donts_commitments};
+    use super::{assemble_system_prompt, format_knowledge_route_for_prompt, non_empty_override, render_business_context_fragment, render_safety_donts_commitments};
     use mongodb::bson::doc;
 
     #[test]
@@ -1826,6 +1827,54 @@ mod persona_override_tests {
         );
     }
 
+    /// 批次1③:知识路由注入槽只喂 LLM 有语义的字段,剔除 3 个纯调试/落库元数据
+    /// (toolTrace / evidenceExcerpts / selectedChunkRankings)——它们回复文本生成不消费
+    /// (selectedChunkRankings 注释明说"只采集落库、不参与加权")。
+    #[test]
+    fn format_knowledge_route_drops_debug_metadata() {
+        use crate::agent::types::{KnowledgeRouteResult, SelectedChunkRanking};
+        let route = KnowledgeRouteResult {
+            needed_categories: vec!["product".to_string()],
+            selected_knowledge_ids: vec!["k1".to_string()],
+            selected_chunk_ids: vec!["c1".to_string()],
+            knowledge_coverage: "full".to_string(),
+            reason: "命中产品事实切片".to_string(),
+            requires_evidence: true,
+            missing_knowledge: vec!["定价细则".to_string()],
+            tool_trace: vec![mongodb::bson::doc! { "tool": "search" }],
+            evidence_excerpts: vec!["某条摘录".to_string()],
+            selected_chunk_rankings: vec![SelectedChunkRanking {
+                chunk_id: "c1".to_string(),
+                rank: 0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let out = format_knowledge_route_for_prompt(&route);
+        assert!(out.contains("neededCategories"), "保留 neededCategories");
+        assert!(out.contains("selectedKnowledgeIds"), "保留 selectedKnowledgeIds");
+        assert!(out.contains("knowledgeCoverage"), "保留 knowledgeCoverage");
+        assert!(out.contains("missingKnowledge"), "保留 missingKnowledge");
+        assert!(out.contains("命中产品事实切片"), "保留 reason 内容");
+        assert!(!out.contains("toolTrace"), "剔除 toolTrace");
+        assert!(!out.contains("evidenceExcerpts"), "剔除 evidenceExcerpts");
+        assert!(!out.contains("selectedChunkRankings"), "剔除 selectedChunkRankings");
+        assert!(!out.contains("某条摘录"), "剔除 evidenceExcerpts 内容");
+    }
+
+    /// 空路由(全默认)不 panic、产合法 JSON、仍不含调试字段 key。
+    #[test]
+    fn format_knowledge_route_empty_is_valid_json_without_debug_keys() {
+        use crate::agent::types::KnowledgeRouteResult;
+        let out = format_knowledge_route_for_prompt(&KnowledgeRouteResult::default());
+        let parsed: serde_json::Value =
+            serde_json::from_str(&out).expect("产出必须是合法 JSON");
+        assert!(parsed.is_object(), "产出应为 JSON 对象");
+        assert!(!out.contains("toolTrace"));
+        assert!(!out.contains("evidenceExcerpts"));
+        assert!(!out.contains("selectedChunkRankings"));
+    }
+
     /// §3 恒注入铁律（核心安全不变量）：Lean 档不注入完整 memory_card，但 doNotDo /
     /// commitments 是绝不可丢的安全槽位 → 必须单独补一份安全子片，且必须真的含这两项内容。
     /// 丢失即不可恢复的安全事故（AI 违背承诺/踩禁止项），故锁死测试。
@@ -1844,9 +1893,9 @@ mod persona_override_tests {
         assert!(out.contains("周五前发报价单"), "commitments 实际内容必须随档注入");
     }
 
-    /// §3 铁律的另一面：Relational / Full 档完整 memory_card_text 已含 doNotDo /
-    /// commitments，此处返回空串避免重复——这保证 Full 档与改造前 prompt **逐字等价**
-    /// （零字节差异）。若这里非空，Full 档会多出一段、破坏等价护栏。
+    /// §3 铁律的另一面：Relational / Full 档下槽6 memory_text 的 `memoryCard` 字段已含
+    /// doNotDo / commitments，此处返回空串避免重复——该安全子片在 Relational / Full 档
+    /// 不额外给 prompt 加字节。若这里非空，会多出一段、破坏"不重复注入"护栏。
     #[test]
     fn relational_and_full_tiers_emit_empty_to_keep_byte_equivalence() {
         let pack = doc! {
