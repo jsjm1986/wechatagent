@@ -1034,6 +1034,60 @@ pub(crate) fn derive_revision_failure(reason: &str) -> (String, GatewayStatusFin
     (reason.to_string(), status)
 }
 
+/// 改写失败/超时的优雅降级：回退发送「改写前那份已 Approved 的原稿」。
+///
+/// 前提（已亲验）：能进改写通道的原稿在 finalize 阶段一定已判 Approved——硬闸
+/// 失败（hallucination / knowledge_grounding）走 approved=false → Held，
+/// `decide_revision` 返回 NotEligible，根本进不了改写。因此改写只由软闸 / style /
+/// 双审分歧触发，原稿本就安全可发；改写只是锦上添花。改写因下游 LLM 超时/错误没做成，
+/// 应回退发原稿而非毙掉补兜底。
+///
+/// 本函数只设置 review/finalize 状态；原稿恢复与 should_reply=true 由 gateway 调用方
+/// 负责（final_decision 是 gateway 局部变量）。返回 failure_reason 供调用方写 revision_reason。
+pub(crate) fn apply_revision_fallback(
+    review: &mut DecisionReviewResult,
+    finalize_status: &mut GatewayStatusFinal,
+    failure_reason: &str,
+) -> String {
+    review.approved = true;
+    review.revision_applied = false;
+    review.final_review_status = "revision_applied_approved".to_string();
+    *finalize_status = GatewayStatusFinal::Approved;
+    failure_reason.to_string()
+}
+
+#[cfg(test)]
+mod revision_fallback_tests {
+    use super::{apply_revision_fallback, GatewayStatusFinal, HOLD_CATEGORY_HELD_BY_AI_POLICY};
+    use crate::agent::types::DecisionReviewResult;
+
+    #[test]
+    fn fallback_sets_approved_draft_state() {
+        let mut review = DecisionReviewResult::default();
+        review.approved = false;
+        review.revision_applied = false;
+        review.final_review_status = String::new();
+        let mut status = GatewayStatusFinal::Held(HOLD_CATEGORY_HELD_BY_AI_POLICY.to_string());
+
+        let reason = apply_revision_fallback(&mut review, &mut status, "revision_llm_timeout_30s");
+
+        assert!(review.approved, "回退后原稿应视为已批准");
+        assert!(!review.revision_applied, "改写未真正应用");
+        assert_eq!(review.final_review_status, "revision_applied_approved");
+        assert!(matches!(status, GatewayStatusFinal::Approved), "finalize 应回到 Approved 走发送");
+        assert_eq!(reason, "revision_llm_timeout_30s", "失败原因应原样返回供审计");
+    }
+
+    #[test]
+    fn fallback_preserves_arbitrary_reason() {
+        let mut review = DecisionReviewResult::default();
+        let mut status = GatewayStatusFinal::Held(HOLD_CATEGORY_HELD_BY_AI_POLICY.to_string());
+        let reason = apply_revision_fallback(&mut review, &mut status, "revision_post_review_failed");
+        assert_eq!(reason, "revision_post_review_failed");
+        assert_eq!(review.final_review_status, "revision_applied_approved");
+    }
+}
+
 #[cfg(test)]
 mod review_passed_dual_gate_tests {
     //! Phase B / B1：`review_passed` 在 hallucination / grounding 两闸之外，
