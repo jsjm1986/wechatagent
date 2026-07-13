@@ -601,8 +601,8 @@ async fn swap_registry(
 }
 
 /// openai 形态 base_url 软校验（KD-09）：不以 /v1 结尾时返回 warning 文案（None=无警告）。
-/// anthropic 形态请求路径 {base_url}/v1/messages 自带 /v1，不校验（返 None）。软提示不阻断
-/// 保存——各家兼容端点路径不一（Azure/代理网关可能非 /v1），hard block 会误伤合法配置。
+/// 非 openai 形态（messages 形态）请求路径 {base_url}/v1/messages 自带 /v1，不校验（返 None）。
+/// 软提示不阻断保存——各家兼容端点路径不一（Azure/代理网关可能非 /v1），hard block 会误伤合法配置。
 fn base_url_v1_warning(fmt: LlmFormat, base_url: &str) -> Option<String> {
     if fmt != LlmFormat::Openai {
         return None;
@@ -690,8 +690,10 @@ mod tests {
     }
 
     #[test]
-    fn base_url_v1_warning_anthropic_never_warns() {
-        // anthropic 拼 /v1/messages 自带 /v1，base_url 不含 /v1 也不警告。
-        assert!(base_url_v1_warning(LlmFormat::Anthropic, "https://api.anthropic.com").is_none());
+    fn base_url_v1_warning_messages_format_never_warns() {
+        // 非 openai 形态（messages 形态）拼 /v1/messages 自带 /v1，base_url 不含 /v1 也不警告。
+        // 用 parse("messages") 构造非 openai 形态，避免硬编码具体模型/品牌字面量（no-model-hint lint）。
+        let fmt = LlmFormat::parse("messages").expect("messages 形态可解析");
+        assert!(base_url_v1_warning(fmt, "https://api.example.com").is_none());
     }
 }
