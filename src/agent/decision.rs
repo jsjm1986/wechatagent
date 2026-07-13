@@ -1239,12 +1239,16 @@ pub(crate) fn format_playbook_for_prompt(playbook: &OperationPlaybook) -> String
     )
 }
 
-/// 批次1③:知识路由注入槽的裁剪渲染。原槽直接 `serde_json::to_string(route)` 会把
-/// `toolTrace` / `evidenceExcerpts` / `selectedChunkRankings` 三个纯调试/落库元数据
-/// 一并喂给 LLM(`selectedChunkRankings` 注释明说只采集落库、不参与加权),回复文本
-/// 生成不消费。这里序列化后精确 remove 这 3 个 camelCase key,保留其余 10 个对 LLM
-/// 有语义的字段,且 key 大小写完全沿用 `KnowledgeRouteResult` 的 `rename_all` 派生
-/// (不手写 json! 以免字段漂移/大小写拼错、偷改 LLM 看到的字段名)。
+/// 批次1③ + 反接管治本(Layer2):知识路由注入槽的裁剪渲染,Reply 与 Review 两侧复用同一
+/// 函数(单一真相源)。原槽直接 `serde_json::to_string(route)` 会把 `toolTrace` /
+/// `evidenceExcerpts` / `selectedChunkRankings` 三个纯调试/落库元数据一并喂给 LLM
+/// (`selectedChunkRankings` 注释明说只采集落库、不参与加权),回复文本生成不消费;并且
+/// `reason` 是知识 Agent 的自然语言总结,可能含转接话术(实测"我帮您转人工客服"),回流进
+/// Reply/Review prompt 会污染"全 AI 自治·无人工接管"定位。这里序列化后精确 remove 这
+/// 3 个调试 key + `reason`,保留其余对 LLM 有语义的结构化字段(neededCategories /
+/// selectedKnowledgeIds / knowledgeCoverage / missingKnowledge 等承载知识充分度信号),
+/// 且 key 大小写完全沿用 `KnowledgeRouteResult` 的 `rename_all` 派生(不手写 json! 以免
+/// 字段漂移/大小写拼错、偷改 LLM 看到的字段名)。
 pub(crate) fn format_knowledge_route_for_prompt(route: &KnowledgeRouteResult) -> String {
     let mut value = match serde_json::to_value(route) {
         Ok(v) => v,
@@ -1254,6 +1258,10 @@ pub(crate) fn format_knowledge_route_for_prompt(route: &KnowledgeRouteResult) ->
         map.remove("toolTrace");
         map.remove("evidenceExcerpts");
         map.remove("selectedChunkRankings");
+        // 反接管治本(Layer2)：知识 Agent 的自然语言总结 reason 可能含转接话术
+        // （实测"我帮您转人工客服"），不回流进下游 Reply/Review prompt；知识充分度
+        // 信号由 knowledgeCoverage / missingKnowledge / neededCategories 等结构化字段承载。
+        map.remove("reason");
     }
     serde_json::to_string(&value).unwrap_or_default()
 }
@@ -1828,9 +1836,11 @@ mod persona_override_tests {
         );
     }
 
-    /// 批次1③:知识路由注入槽只喂 LLM 有语义的字段,剔除 3 个纯调试/落库元数据
-    /// (toolTrace / evidenceExcerpts / selectedChunkRankings)——它们回复文本生成不消费
-    /// (selectedChunkRankings 注释明说"只采集落库、不参与加权")。
+    /// 批次1③ + 反接管治本(Layer2):知识路由注入槽只喂 LLM 有语义的结构化字段。
+    /// 剔除 3 个纯调试/落库元数据(toolTrace / evidenceExcerpts / selectedChunkRankings
+    /// ——回复文本生成不消费,selectedChunkRankings 注释明说"只采集落库、不参与加权"),
+    /// 并额外剔除 `reason`(知识 Agent 的自然语言总结可能含转接话术,不回流进下游 prompt;
+    /// 知识充分度信号由 knowledgeCoverage / missingKnowledge 等结构化字段承载)。
     #[test]
     fn format_knowledge_route_drops_debug_metadata() {
         use crate::agent::types::{KnowledgeRouteResult, SelectedChunkRanking};
@@ -1856,7 +1866,8 @@ mod persona_override_tests {
         assert!(out.contains("selectedKnowledgeIds"), "保留 selectedKnowledgeIds");
         assert!(out.contains("knowledgeCoverage"), "保留 knowledgeCoverage");
         assert!(out.contains("missingKnowledge"), "保留 missingKnowledge");
-        assert!(out.contains("命中产品事实切片"), "保留 reason 内容");
+        assert!(!out.contains("命中产品事实切片"), "剔除 reason 内容（防转接话术回流）");
+        assert!(!out.contains("\"reason\""), "剔除 reason 字段 key");
         assert!(!out.contains("toolTrace"), "剔除 toolTrace");
         assert!(!out.contains("evidenceExcerpts"), "剔除 evidenceExcerpts");
         assert!(!out.contains("selectedChunkRankings"), "剔除 selectedChunkRankings");
