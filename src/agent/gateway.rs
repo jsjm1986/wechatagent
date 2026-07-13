@@ -2826,7 +2826,7 @@ async fn run_user_operation_gateway_inner(
                     Err(_) => None,
                 };
                 match card {
-                    Some(c) if super::referral::validate_card_sendable(&c) => {
+                    Some(c) if super::referral::validate_card_sendable(&c, &contact.account_id) => {
                         let namecard_source_event_id = match &trigger {
                             AgentTrigger::Inbound(msg) => {
                                 msg.message_id.clone().unwrap_or_default()
