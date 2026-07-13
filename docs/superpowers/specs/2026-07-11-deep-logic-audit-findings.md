@@ -85,7 +85,7 @@
 - 复现设想: 灌两条不含任何 *MsgId / _mcp.sourceMsgId 且 body 逐字节相同的 payload。第二条返 `duplicate:true`。**生产近乎无影响**——真实 GeWe AddMsg 恒带 `NewMsgId`（见 :1388 真实样例 + `real_gewe_addmsg` 测试），effective_message_id 必有值，走 `message:{id}` 而非 payload-hash 分支。风险仅限自测/手工无 ID payload。
 - 验证状态: PLAUSIBLE（读码）
 - 修复建议: 生产无影响，可 WontFix；若要严谨，payload-hash 分支可掺入接收时刻毫秒/随机 nonce 降低误杀（但会削弱重放防护，需权衡）。建议标注为"已知边界，生产不触发"。
-- 状态: Open
+- 状态: WontFix（已知边界，doc 标注 —— 生产 GeWe 恒带 NewMsgId 走 message-id 分支，payload-hash 仅自测触发；家族⑧ #待补）
 
 ### [A-04] 验签通过后 300s skew 内的重放窗口（已被 dedupe/幂等大幅缓解）
 - 入口频道: command
@@ -97,7 +97,7 @@
 - 复现设想: 截获一条带合法 `x-webhook-signature` + `x-webhook-timestamp` 的 AddMsg，300s 内重发。**实际影响很小**：AddMsg 重放命中 message-id dedupe → `duplicate:true` 幂等短路（:512-515）；Offline/Online 重放只是重复 `$set online`（幂等）；领导回复重放经 `resolve_escalation` 幂等（`escalation/mod.rs:344-345`）与 `NoPending`。故重放不产生重复发送/重复副作用。
 - 验证状态: PLAUSIBLE（读码）
 - 修复建议: 当前缓解已足够，无需加 nonce（会引入状态存储成本）。仅记录为"已知、已缓解"的入口特性。建议 WontFix。
-- 状态: Open
+- 状态: WontFix（已知边界，doc 标注 —— dedupe/幂等已缓解重放无重复副作用，加 nonce 收益不抵成本；家族⑧ #待补）
 
 ### [A-05] 缺失 appId（None）在关闭验签时回退 default account，多账号下可能张冠李戴
 - 入口频道: command

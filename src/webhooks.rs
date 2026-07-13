@@ -483,6 +483,10 @@ pub async fn wechat_webhook(
         .and_then(|env| env.get("sourceMsgId"))
         .and_then(value_to_string);
     let effective_message_id = message_id.clone().or(envelope_msg_id);
+    // A-03（已知边界，不修）：无任何 msgId（顶层 MsgId/NewMsgId + _mcp.sourceMsgId 全缺）时
+    // dedupe_key 回落 payload-hash，同内容连发的第二条 hash 相同 → 命中 unique 索引被当 duplicate
+    // 丢弃。生产 GeWe AddMsg 恒带 NewMsgId → effective_message_id 必有值走 message:{id} 分支，
+    // 此路径仅自测 / 无 ID payload 触发。掺接收时刻/nonce 会削弱重放去重，收益不抵，故不修。
     let dedupe_key = effective_message_id
         .as_ref()
         .map(|id| format!("message:{id}"))
@@ -552,7 +556,10 @@ pub async fn wechat_webhook(
     // （reply_latency / reactivation）。采集是 best-effort 旁路，绝不阻断应答。
     let prev_last_inbound_ms = contact.last_inbound_at.map(|d| d.timestamp_millis());
     let prev_last_outbound_ms = contact.last_outbound_at.map(|d| d.timestamp_millis());
-    state
+    // A-06：last_inbound_at/last_message_at/updated_at 是统计/信号旁路字段，落库失败不应连累
+    // 本轮应答（inbound 已在上方 insert 成功、去重已保证）。降 best-effort：失败仅 warn，与紧邻的
+    // collect_inbound_behavior_signals（下方）旁路纪律对齐。
+    if let Err(e) = state
         .db
         .contacts()
         .update_one(
@@ -566,7 +573,10 @@ pub async fn wechat_webhook(
             },
             None,
         )
-        .await?;
+        .await
+    {
+        tracing::warn!(contact_wxid = %from_wxid, error = ?e, "更新 last_inbound_at 失败（统计旁路，不影响应答）");
+    }
 
     // S1：落 T1 行为信号（观察层，不解释、不评分）。每条带 dedupe_key，重复
     // webhook / 重放只落一次。任何一段失败仅 warn，不影响后续 Agent 应答。
@@ -997,6 +1007,19 @@ async fn resolve_account_context(
         return Err(AppError::BadRequest(format!(
             "webhook appId {app_id} not registered in wechat_accounts"
         )));
+    }
+    // A-05：无 appId 时的账号归属防线。验签门（handler 的 webhook_verify_signature 块）在本函数
+    // 之后执行——verify=true 时无 appId → 返回 secret=None → verify_webhook_signature 必
+    // SecretNotConfigured → 400，default 回退到不了副作用点，无需在此付 count 代价。仅当未开验签
+    // （default 回退是唯一防线）时才校验：多账号无 appId 无法判断消息归属 → 400（防落到 default
+    // account 张冠李戴）；单账号（≤1）无歧义 → 回落 default，不打断上游确实不带 appId 的单账号部署。
+    if !state.config.webhook_verify_signature {
+        let account_count = state.db.accounts().count_documents(doc! {}, None).await?;
+        if account_count > 1 {
+            return Err(AppError::BadRequest(
+                "webhook 缺 appId 且存在多个账号，无法判断消息归属".into(),
+            ));
+        }
     }
     Ok((
         state.config.default_workspace_id.clone(),
@@ -1763,6 +1786,10 @@ enum WebhookSigError {
     Mismatch,
 }
 
+/// A-04（已知边界，不修）：仅校验 secret 存在 + 时间戳 ±skew 窗口 + HMAC-SHA256，无 nonce /
+/// 一次性签名记录。攻击者截获一条合法签名请求可在 skew（默认 300s）内原样重放。但重放无重复副作用：
+/// AddMsg 重放命中 message-id dedupe 幂等短路、Offline/Online 重放幂等 $set、领导回复经
+/// resolve_escalation 幂等 → 不产生重复发送。加 nonce 需状态存储，收益不抵成本，故不修。
 fn verify_webhook_signature(
     secret: Option<&str>,
     timestamp_header: Option<&str>,
