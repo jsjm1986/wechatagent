@@ -103,22 +103,31 @@ pub(crate) fn push_allowed(
 /// 超时转备选：当前决策人在链中、已等待 age_hours 超过 timeout_hours，返回链中下一位。
 /// timeout_hours=None（无限等待）/ 未超时 → None；current 不在链（admin 改链孤儿）→ 回落链首；
 /// current 在链中且已是链尾 → None（合法继续等链尾决策人）。
+/// KD-07：从起点起跳过被误配成本请示客户 wxid（contact_wxid）的链成员，返回第一个合法下一位，
+/// 防止把含内部请示内容的卡直推给客户；无合法下一位 → None（scan 走链尾安抚）。
 pub(crate) fn next_decider_on_timeout<'a>(
     policy: &'a ResolvedAskHumanPolicy,
     current_wxid: &str,
+    contact_wxid: &str,
     age_hours: f64,
 ) -> Option<&'a DeciderRef> {
     let timeout = policy.timeout_hours?;
     if age_hours < timeout {
         return None;
     }
-    // KD-06：current 不在链中（admin 改 decider_chain 删/换人后的孤儿 pending）时，
-    // 旧 `position(...)?` 返 None → scan 误当链尾永不改派。改为回落链首让孤儿重新入链；
-    // current 在链中时保持原语义（下一位；真链尾 get(idx+1)=None → 合法继续等，行为不变）。
-    match policy.decider_chain.iter().position(|d| d.wxid == current_wxid) {
-        Some(idx) => policy.decider_chain.get(idx + 1),
-        None => policy.decider_chain.first(),
-    }
+    // 起点：current 在链中→下一位（idx+1）；current 不在链（KD-06：admin 改 decider_chain 删/换人
+    // 后的孤儿 pending）→ 回落链首（起点 0）让孤儿重新入链。
+    let start = match policy.decider_chain.iter().position(|d| d.wxid == current_wxid) {
+        Some(idx) => idx + 1,
+        None => 0,
+    };
+    // KD-07：从起点起跳过被误配成本请示客户 wxid 的成员，返回第一个合法下一位决策人，防止把
+    // 含内部请示内容的卡直推给客户。无合法下一位（真链尾越界=空切片 / 剩余全是客户 / 空链）→
+    // None → scan 走既有链尾安抚（客户收安抚话术、不收内部请示卡）。真链尾 idx+1 越界时
+    // decider_chain[start..] 为空切片，find 返 None，KD-06 行为保持。
+    policy.decider_chain[start..]
+        .iter()
+        .find(|d| d.wxid != contact_wxid)
 }
 
 #[cfg(test)]
@@ -318,11 +327,11 @@ mod tests {
             DeciderRef { wxid: "b".into(), display_name: None },
         ];
         // 当前 a，已等 25h > 24h → 转 b
-        assert_eq!(next_decider_on_timeout(&p, "a", 25.0).map(|d| d.wxid.as_str()), Some("b"));
+        assert_eq!(next_decider_on_timeout(&p, "a", "customer_x", 25.0).map(|d| d.wxid.as_str()), Some("b"));
         // 未超时 → None
-        assert_eq!(next_decider_on_timeout(&p, "a", 10.0), None);
+        assert_eq!(next_decider_on_timeout(&p, "a", "customer_x", 10.0), None);
         // 已是链尾 b → None（继续等）
-        assert_eq!(next_decider_on_timeout(&p, "b", 99.0), None);
+        assert_eq!(next_decider_on_timeout(&p, "b", "customer_x", 99.0), None);
     }
 
     #[test]
@@ -333,7 +342,7 @@ mod tests {
             DeciderRef { wxid: "b".into(), display_name: None },
         ];
         // timeout_hours=None → 无限等待，永不转
-        assert_eq!(next_decider_on_timeout(&p, "a", 9999.0), None);
+        assert_eq!(next_decider_on_timeout(&p, "a", "customer_x", 9999.0), None);
     }
 
     #[test]
@@ -348,7 +357,7 @@ mod tests {
         ];
         // 当前 principal "ghost" 不在链中、已超时 → 回落链首 a。
         assert_eq!(
-            next_decider_on_timeout(&p, "ghost", 99.0).map(|d| d.wxid.as_str()),
+            next_decider_on_timeout(&p, "ghost", "customer_x", 99.0).map(|d| d.wxid.as_str()),
             Some("a"),
             "改链孤儿（current 不在链）超时后须回落链首重新入链，而非静默退化链尾"
         );
@@ -364,7 +373,7 @@ mod tests {
             DeciderRef { wxid: "b".into(), display_name: None },
         ];
         assert_eq!(
-            next_decider_on_timeout(&p, "b", 99.0),
+            next_decider_on_timeout(&p, "b", "customer_x", 99.0),
             None,
             "真链尾必须仍返 None（合法继续等），不得被孤儿回落逻辑误伤"
         );
@@ -376,7 +385,42 @@ mod tests {
         let mut p = resolved_with(None, None);
         p.timeout_hours = Some(24.0);
         p.decider_chain = vec![];
-        assert_eq!(next_decider_on_timeout(&p, "ghost", 99.0), None);
+        assert_eq!(next_decider_on_timeout(&p, "ghost", "customer_x", 99.0), None);
+    }
+
+    #[test]
+    fn next_decider_skips_member_equal_to_contact() {
+        // KD-07：decider_chain[1..] 误配成客户 wxid，链首超时改派须跳过该成员、改派给下一个合法
+        // 决策人，而非把内部请示卡推给客户。
+        let mut p = resolved_with(None, None);
+        p.timeout_hours = Some(24.0);
+        p.decider_chain = vec![
+            DeciderRef { wxid: "leader_a".into(), display_name: None },
+            DeciderRef { wxid: "customer_x".into(), display_name: None }, // 误配=客户
+            DeciderRef { wxid: "leader_c".into(), display_name: None },
+        ];
+        // 当前 leader_a 超时，下一位是被误配的 customer_x → 必须跳过，改派给 leader_c。
+        assert_eq!(
+            next_decider_on_timeout(&p, "leader_a", "customer_x", 99.0).map(|d| d.wxid.as_str()),
+            Some("leader_c"),
+            "改派须跳过误配成客户 wxid 的链成员，防内部请示卡直推客户"
+        );
+    }
+
+    #[test]
+    fn next_decider_none_when_only_remaining_is_contact() {
+        // KD-07：跳过客户成员后链中无其它合法下一位 → None → scan 走链尾安抚（客户不收内部卡）。
+        let mut p = resolved_with(None, None);
+        p.timeout_hours = Some(24.0);
+        p.decider_chain = vec![
+            DeciderRef { wxid: "leader_a".into(), display_name: None },
+            DeciderRef { wxid: "customer_x".into(), display_name: None },
+        ];
+        assert_eq!(
+            next_decider_on_timeout(&p, "leader_a", "customer_x", 99.0),
+            None,
+            "跳过客户成员后无合法下一位须返 None（走链尾安抚），不得回退到推客户"
+        );
     }
 
     #[test]
