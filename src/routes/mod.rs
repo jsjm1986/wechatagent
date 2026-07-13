@@ -246,7 +246,7 @@ use knowledge::{
     list_operator_memory,
     merge_operation_knowledge_chunk,
     open_operation_knowledge_slices, patch_operation_knowledge_chunk,
-    propose_chunk_repair, propose_pack_repair,
+    propose_chunk_repair,
     record_repair_apply, refresh_operation_knowledge_completeness,
     reject_operation_knowledge_chunk, relate_operation_knowledge_chunk,
     restore_operation_knowledge_chunk, rollback_operation_knowledge_chunk,
@@ -685,10 +685,6 @@ pub fn api_router(state: AppState) -> Router<AppState> {
         .route(
             "/operation-knowledge/logs/analyze",
             get(analyze_operation_knowledge_logs),
-        )
-        .route(
-            "/operation-knowledge/items/:id/repair",
-            post(propose_pack_repair),
         )
         .route(
             "/operation-knowledge/repair/applied",
