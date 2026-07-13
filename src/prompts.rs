@@ -1246,12 +1246,6 @@ fn prompt_specs() -> Vec<PromptSpec> {
     "pressureRisk": 1,
     "factRisk": 0
   },
-  "intentAnalysis": {
-    "userIntent": "用户此刻真实意图",
-    "emotionalState": "用户情绪",
-    "relationshipMoment": "陪伴/解释/推进/等待/修复",
-    "shouldAdvance": false
-  },
   "profileUpdate": {
     "summary": "更新后的一句话客户画像",
     "interests": ["兴趣"],
@@ -1327,12 +1321,9 @@ fn prompt_specs() -> Vec<PromptSpec> {
     }
   ],
   "memoryWriteScore": 0,
-  "productFitScore": 0,
   "matchedKnowledgeIds": [],
   "safeClaimsUsed": [],
-  "forbiddenClaimRisk": 0,
   "objectionsDetected": [],
-  "recommendedResourceIds": [],
   "usedKnowledgeIds": [],
   "memoryUpdate": "需要写入长期记忆的摘要",
   "followUp": {
@@ -2595,6 +2586,27 @@ mod reply_task_single_shot_tests {
             task.content.contains("\"decisionPhase\": \"final\""),
             "user.reply.task 应保留 final 形态契约"
         );
+    }
+
+    /// 批次1 瘦身护栏:4 个死字段(全库无任何 guard/阈值/发送逻辑消费,仅 types.rs
+    /// carry_through 透传 None)已从 reply.task 契约删除 → LM 不再输出、不再占 token。
+    /// struct 字段保留(Option 透传无害),故这里只断模板 schema 不含这些 wire key。
+    #[test]
+    fn reply_task_prompt_drops_dead_fields() {
+        let specs = prompt_specs();
+        let task = specs
+            .iter()
+            .find(|s| s.key == "user.reply.task")
+            .expect("user.reply.task prompt spec 存在");
+        for dead in ["intentAnalysis", "productFitScore", "forbiddenClaimRisk", "recommendedResourceIds"] {
+            assert!(
+                !task.content.contains(dead),
+                "reply.task 模板不应再声明死字段 {dead}(无消费点,白占 token)"
+            );
+        }
+        for keep in ["memoryWriteScore", "matchedKnowledgeIds", "safeClaimsUsed", "objectionsDetected", "usedKnowledgeIds"] {
+            assert!(task.content.contains(keep), "存活字段 {keep} 被误删");
+        }
     }
 }
 
