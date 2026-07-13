@@ -161,6 +161,10 @@ pub struct AppConfig {
     /// preview/dispatch，防单请求全量 contacts 驻内存 + dispatch 串行千次 DB 写超时
     /// （KC-04/07）。默认 500，与 account_daily_send_soft_cap 同量级（单活动受众与账号
     /// 日发能力匹配）。env `CAMPAIGN_MAX_AUDIENCE`。
+    ///
+    /// 注意：这是硬上限、非"软阈值可关闭"——设 0 意为"任一候选即拒"（全拒），
+    /// **不是**"不限"（与 ACCOUNT_SEND_*_INTERVAL_MS 的"0=关闭"约定相反）。要放宽
+    /// 上限请调大此值，不要设 0。
     pub campaign_max_audience: i64,
 
     // ── 自学习采集管道（第一阶段）：行为信号 + 沉默删失 + 止血 ──
