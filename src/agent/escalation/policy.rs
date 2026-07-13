@@ -101,7 +101,8 @@ pub(crate) fn push_allowed(
 }
 
 /// 超时转备选：当前决策人在链中、已等待 age_hours 超过 timeout_hours，返回链中下一位。
-/// timeout_hours=None（无限等待）/ 未超时 / 已是链尾 → None。
+/// timeout_hours=None（无限等待）/ 未超时 → None；current 不在链（admin 改链孤儿）→ 回落链首；
+/// current 在链中且已是链尾 → None（合法继续等链尾决策人）。
 pub(crate) fn next_decider_on_timeout<'a>(
     policy: &'a ResolvedAskHumanPolicy,
     current_wxid: &str,
@@ -111,8 +112,13 @@ pub(crate) fn next_decider_on_timeout<'a>(
     if age_hours < timeout {
         return None;
     }
-    let idx = policy.decider_chain.iter().position(|d| d.wxid == current_wxid)?;
-    policy.decider_chain.get(idx + 1)
+    // KD-06：current 不在链中（admin 改 decider_chain 删/换人后的孤儿 pending）时，
+    // 旧 `position(...)?` 返 None → scan 误当链尾永不改派。改为回落链首让孤儿重新入链；
+    // current 在链中时保持原语义（下一位；真链尾 get(idx+1)=None → 合法继续等，行为不变）。
+    match policy.decider_chain.iter().position(|d| d.wxid == current_wxid) {
+        Some(idx) => policy.decider_chain.get(idx + 1),
+        None => policy.decider_chain.first(),
+    }
 }
 
 #[cfg(test)]
@@ -328,6 +334,49 @@ mod tests {
         ];
         // timeout_hours=None → 无限等待，永不转
         assert_eq!(next_decider_on_timeout(&p, "a", 9999.0), None);
+    }
+
+    #[test]
+    fn next_decider_orphan_current_falls_back_to_chain_head() {
+        // KD-06：admin 改链后当前 principal 已不在链中（孤儿）。旧实现 position(...)? → None
+        // → scan 当链尾晾住、永不改派。修复后应回落链首，让孤儿重新入链。
+        let mut p = resolved_with(None, None);
+        p.timeout_hours = Some(24.0);
+        p.decider_chain = vec![
+            DeciderRef { wxid: "a".into(), display_name: None },
+            DeciderRef { wxid: "b".into(), display_name: None },
+        ];
+        // 当前 principal "ghost" 不在链中、已超时 → 回落链首 a。
+        assert_eq!(
+            next_decider_on_timeout(&p, "ghost", 99.0).map(|d| d.wxid.as_str()),
+            Some("a"),
+            "改链孤儿（current 不在链）超时后须回落链首重新入链，而非静默退化链尾"
+        );
+    }
+
+    #[test]
+    fn next_decider_real_chain_tail_still_none() {
+        // KD-06 不得误伤：真链尾（current 是链中最后一位）超时仍返 None（继续等链尾决策人）。
+        let mut p = resolved_with(None, None);
+        p.timeout_hours = Some(24.0);
+        p.decider_chain = vec![
+            DeciderRef { wxid: "a".into(), display_name: None },
+            DeciderRef { wxid: "b".into(), display_name: None },
+        ];
+        assert_eq!(
+            next_decider_on_timeout(&p, "b", 99.0),
+            None,
+            "真链尾必须仍返 None（合法继续等），不得被孤儿回落逻辑误伤"
+        );
+    }
+
+    #[test]
+    fn next_decider_orphan_empty_chain_is_none() {
+        // 空链 + current 不在链 → first()=None（无人可推，scan 走安抚）。
+        let mut p = resolved_with(None, None);
+        p.timeout_hours = Some(24.0);
+        p.decider_chain = vec![];
+        assert_eq!(next_decider_on_timeout(&p, "ghost", 99.0), None);
     }
 
     #[test]
