@@ -12,7 +12,7 @@ use axum::extract::{Extension, Path, State};
 use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
 
 use wechatagent::auth::AuthenticatedAdmin;
-use wechatagent::models::{AgentStatus, Campaign, Contact, SegmentFilter};
+use wechatagent::models::{AgentStatus, Campaign, CampaignSend, Contact, SegmentFilter};
 use wechatagent::routes::campaigns::dispatch_campaign;
 use wechatagent::routes::campaigns::preview_campaign;
 
@@ -372,4 +372,88 @@ async fn dispatch_backfills_last_dispatch_target_count() {
         "命中 2 人应回刷 lastDispatchTargetCount=2"
     );
     assert_eq!(reloaded.dispatched_count, 2, "首次全新命中 dispatchedCount=2");
+}
+
+/// KC-06 哨兵加强：**去重时 lastDispatchTargetCount 与 dispatchedCount 分叉**——
+/// 锁死 `lastDispatchTargetCount = hits.len()`（本次粗筛命中总数）语义，而非
+/// `= dispatched`（去重后新入队数）。上面的 `dispatch_backfills_last_dispatch_target_count`
+/// 只覆盖"无去重"（两值巧合都 = 2），无法区分正确实现与写成 `= dispatched` 的错误实现。
+///
+/// 场景 = 重入恢复（campaign 状态 dispatching，KC-02 放行）：wx_p 上一轮已建 send 台账
+/// （预置一条既存 campaign_send 占住去重位），wx_q 尚未推。本轮 dispatch：
+/// - wx_p：insert campaign_send 撞 (campaignId, contactWxid) 唯一索引 DuplicateKey → 跳过，
+///   dispatched 不自增（campaigns.rs:439）。
+/// - wx_q：全新 → dispatched += 1（campaigns.rs:437）。
+/// 于是 `dispatchedCount == 1`（去重后新入队）**但** `lastDispatchTargetCount == 2`
+/// （粗筛仍命中 2 人，campaigns.rs:452 写 `hits.len()`）——二者分叉。若有人把回刷改写成
+/// `lastDispatchTargetCount = dispatched`，本测试立刻绿变红（真哨兵）。
+#[tokio::test]
+#[ignore]
+async fn dispatch_last_dispatch_target_count_diverges_on_dedup() {
+    let app = TestApp::start().await;
+    let ws = app.state.config.default_workspace_id.clone();
+    let acc = app.state.config.default_account_id.clone();
+    // 重入恢复：dispatching 态放行（KC-02 dispatch_allowed_from_status，campaigns.rs:323）。
+    let mut campaign = make_campaign(&ws, &acc);
+    campaign.status = "dispatching".to_string();
+    let cid = campaign.id.unwrap();
+    app.state.db.campaigns().insert_one(&campaign, None).await.expect("seed campaign");
+    // 命中 2 人（空 filter：粗筛=精筛，workspace+account 内全部 managed contact）。
+    app.state.db.contacts().insert_one(make_contact(&ws, &acc, "wx_p"), None).await.expect("seed wx_p");
+    app.state.db.contacts().insert_one(make_contact(&ws, &acc, "wx_q"), None).await.expect("seed wx_q");
+
+    // 预置一条既存 campaign_send（campaignId=本活动, contactWxid=wx_p）占住去重位——
+    // 模拟 wx_p 上一轮已推过。CampaignSend serde rename_all=camelCase（models.rs:622），
+    // campaign_id→campaignId / contact_wxid→contactWxid，与唯一索引键
+    // (campaignId, contactWxid)（indexes.rs:784）一致，故本轮对 wx_p 的 insert 必撞 DuplicateKey。
+    let existing_send = CampaignSend {
+        id: None,
+        workspace_id: ws.clone(),
+        account_id: acc.clone(),
+        campaign_id: cid,
+        contact_wxid: "wx_p".to_string(),
+        task_id: None,
+        status: "enqueued".to_string(),
+        created_at: DateTime::now(),
+    };
+    app.state
+        .db
+        .campaign_sends()
+        .insert_one(&existing_send, None)
+        .await
+        .expect("seed 既存 campaign_send（占 wx_p 去重位）");
+
+    let resp = dispatch_campaign(
+        State(app.state.clone()),
+        Extension(test_admin(&ws)),
+        Path(cid.to_hex()),
+    )
+    .await
+    .expect("dispatch 应成功");
+    // 响应层：wx_q 新入队、wx_p 撞去重跳过 → dispatchedCount=1。
+    assert_eq!(
+        resp.0["dispatchedCount"].as_i64(),
+        Some(1),
+        "wx_p 撞去重跳过、仅 wx_q 新入队 → dispatchedCount=1,实际 {}",
+        resp.0["dispatchedCount"]
+    );
+
+    // 类型化读回 Campaign，断言两字段分叉（2 ≠ 1）——锁死 hits.len() 语义。
+    let reloaded = app
+        .state
+        .db
+        .campaigns()
+        .find_one(doc! { "_id": cid }, None)
+        .await
+        .expect("query campaign")
+        .expect("campaign exists");
+    assert_eq!(
+        reloaded.dispatched_count, 1,
+        "去重后新入队数 dispatchedCount=1（wx_p 跳过）"
+    );
+    assert_eq!(
+        reloaded.last_dispatch_target_count,
+        Some(2),
+        "粗筛命中总数 lastDispatchTargetCount=2（含被去重的 wx_p）——若写成 =dispatched(1) 即绿变红"
+    );
 }
