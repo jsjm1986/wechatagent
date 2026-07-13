@@ -458,7 +458,9 @@ pub struct RawAgentDecision {
     /// AgentDecision.bayesian_observations）。纯观测，永不驱动决策。
     #[serde(default)]
     pub bayesian_observations: Option<Vec<BayesianObservationRaw>>,
+    #[serde(alias = "customer_stage")]
     pub customer_stage: Option<String>,
+    #[serde(alias = "intent_level")]
     pub intent_level: Option<String>,
     /// universal-domain-adaptation G1：对维度名零假设的开放画像信号容器。非销售
     /// 行业（陪伴/同行等）的「参与决策」维度（如 `purchase_lifecycle` /
@@ -2043,6 +2045,28 @@ mod validate_and_promote_tests {
     fn raw_decision_without_escalation_still_parses() {
         let raw: RawAgentDecision = serde_json::from_str(r#"{}"#).expect("parse empty");
         assert!(raw.escalation_request.is_none());
+    }
+
+    /// D-01：LLM 若顶层输出 snake_case customer_stage / intent_level（而非 schema
+    /// 要求的 camelCase），须经 #[serde(alias)] 正确吸收为 Some，不再静默 miss→None
+    /// 致标签丢失。与初始画像路径 decision.rs 的 camel→snake 双形兜底对齐。
+    /// 回退（去掉 alias）即变红——rename_all=camelCase 下顶层 snake_case 恒 miss。
+    #[test]
+    fn raw_decision_accepts_snake_case_stage_and_intent() {
+        // 顶层用 snake_case（LLM 偶发形态）。
+        let snake = r#"{"customer_stage":"decision","intent_level":"high"}"#;
+        let raw: RawAgentDecision = serde_json::from_str(snake).expect("parse snake");
+        assert_eq!(raw.customer_stage.as_deref(), Some("decision"),
+            "顶层 snake_case customer_stage 须经 alias 吸收");
+        assert_eq!(raw.intent_level.as_deref(), Some("high"),
+            "顶层 snake_case intent_level 须经 alias 吸收");
+
+        // camelCase 主名仍照常工作（rename_all 主形态不受 alias 影响）。
+        let camel = r#"{"customerStage":"evaluation","intentLevel":"medium"}"#;
+        let raw2: RawAgentDecision = serde_json::from_str(camel).expect("parse camel");
+        assert_eq!(raw2.customer_stage.as_deref(), Some("evaluation"),
+            "camelCase 主名仍须正常解析");
+        assert_eq!(raw2.intent_level.as_deref(), Some("medium"));
     }
 
     // ─────────────────────────────────────────────────────────────────────

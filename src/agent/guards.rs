@@ -304,14 +304,20 @@ pub fn enforce_state_action_policy(
 // 不在本次恢复范围）。
 // ─────────────────────────────────────────────────────────────────────────
 
-/// R5.1：chunk 是否 `integrity_status == "verified"`（trim + 大小写不敏感）且未过期
+/// R5.1：chunk 是否 `integrity_status`（trim 后）精确等于小写 "verified" 且未过期
 /// （valid_to 为 None=永久有效，或 valid_to >= now）。过期知识不得背书产品声明。
+///
+/// KB-03：大小写口径与写入侧（`verify.rs` 恒写小写 "verified"）+ 所有召回过滤
+/// （knowledge_router / knowledge_agent / gap_signals / catalog / knowledge_tools 均
+/// `== "verified"` 精确匹配）统一。此前用 `eq_ignore_ascii_case` 大小写不敏感，与
+/// 召回侧精确匹配口径漂移（latent：写入恒小写故当前不可触发）；收窄为精确匹配消除
+/// 该漂移，对现有数据行为完全等价。（保留 `str::trim` 兜底前后空白，不在本次收窄范围。）
 pub(crate) fn is_verified(chunk: &OperationKnowledgeChunk, now: mongodb::bson::DateTime) -> bool {
     let status_ok = chunk
         .integrity_status
         .as_deref()
         .map(str::trim)
-        .map(|s| s.eq_ignore_ascii_case("verified"))
+        .map(|s| s == "verified")
         .unwrap_or(false);
     let not_expired = chunk.valid_to.map_or(true, |vt| vt >= now);
     status_ok && not_expired
@@ -811,6 +817,24 @@ mod is_verified_tests {
         c.integrity_status = Some("draft".into());
         c.valid_to = None;
         let now = DateTime::now();
+        assert!(!is_verified(&c, now));
+    }
+
+    /// KB-03：integrity_status 口径收窄为精确（trim 后）小写匹配，与写入侧（verify.rs
+    /// 恒写小写 "verified"）+ 所有召回过滤（knowledge_router / knowledge_agent /
+    /// catalog / gap_signals 均 `== "verified"` 精确匹配）对齐。大写变体不再被硬闸
+    /// 宽松接受——回退到 eq_ignore_ascii_case 即变红（真回归哨兵，非 tautology）。
+    /// 对现有数据完全等价（写入恒小写，大写变体当前不可触发）。
+    #[test]
+    fn is_verified_false_for_uppercase_variants() {
+        let now = DateTime::now();
+        let mut c = make_test_chunk();
+        c.valid_to = None;
+
+        c.integrity_status = Some("Verified".into());
+        assert!(!is_verified(&c, now), "大写变体须精确不匹配(口径对齐召回侧)");
+
+        c.integrity_status = Some("VERIFIED".into());
         assert!(!is_verified(&c, now));
     }
 }
