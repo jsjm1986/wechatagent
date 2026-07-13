@@ -187,20 +187,36 @@ fn is_duplicate_key(err: &mongodb::error::Error) -> bool {
 }
 
 /// 跑两阶段圈人，返回命中的 contacts。粗筛 Mongo + 内存精筛复用 G4。
+///
+/// KC-04/07：受众规模硬上限（粗筛扫描量）。cursor `.limit(max_audience+1)` 在 Mongo
+/// 层截断扫描量（防全量 contacts 驻内存）；循环内 `coarse_count > max_audience` 报错
+/// （防 limit 静默截断受众——运营会误以为圈到的就是全部）。上限加在粗筛层而非精筛后，
+/// 治的正是"全量驻内存 + dispatch 串行千次 DB 写超时"的根因。preview/dispatch 共用。
 async fn resolve_segment_contacts(
     state: &AppState,
     workspace_id: &str,
     account_id: &str,
     filter: &SegmentFilter,
+    max_audience: i64,
 ) -> AppResult<Vec<Contact>> {
     let coarse = build_segment_coarse_filter(workspace_id, account_id, filter);
-    let mut cursor = state.db.contacts().find(coarse, None).await?;
+    let opts = mongodb::options::FindOptions::builder()
+        .limit(max_audience + 1)
+        .build();
+    let mut cursor = state.db.contacts().find(coarse, opts).await?;
     let active_products: Vec<Product> =
         entitlements::load_active_products(&state.db, workspace_id).await;
     let now = DateTime::now();
     let (mid, high) = value_tier_thresholds(&state.config);
+    let mut coarse_count = 0i64;
     let mut hits = Vec::new();
     while let Some(c) = cursor.try_next().await? {
+        coarse_count += 1;
+        if coarse_count > max_audience {
+            return Err(AppError::BadRequest(format!(
+                "受众粗筛候选超过 {max_audience} 人，请细化圈选条件（产品/阶段/价值分层）后重试"
+            )));
+        }
         if contact_matches_segment(&c, &active_products, filter, now, mid, high) {
             hits.push(c);
         }
@@ -234,6 +250,7 @@ pub async fn create_campaign(
         status: "draft".to_string(),
         target_count: None,
         dispatched_count: 0,
+        last_dispatch_target_count: None,
         created_by: admin.username.clone(),
         created_at: now,
         updated_at: now,
@@ -266,6 +283,7 @@ pub async fn preview_campaign(
         &campaign.workspace_id,
         &campaign.account_id,
         &campaign.segment_filter,
+        state.config.campaign_max_audience,
     )
     .await?;
     let target = hits.len() as i64;
@@ -335,6 +353,7 @@ pub async fn dispatch_campaign(
         &campaign.workspace_id,
         &campaign.account_id,
         &campaign.segment_filter,
+        state.config.campaign_max_audience,
     )
     .await?;
     if hits.is_empty() {
@@ -427,7 +446,12 @@ pub async fn dispatch_campaign(
         .campaigns()
         .update_one(
             doc! { "_id": oid, "workspaceId": &admin.current_workspace },
-            doc! { "$set": { "status": "completed", "dispatchedCount": dispatched, "updatedAt": DateTime::now() } },
+            doc! { "$set": {
+                "status": "completed",
+                "dispatchedCount": dispatched,
+                "lastDispatchTargetCount": hits.len() as i64,
+                "updatedAt": DateTime::now(),
+            } },
             None,
         )
         .await?;
@@ -666,6 +690,8 @@ struct CampaignListItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     target_count: Option<i64>,
     dispatched_count: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_dispatch_target_count: Option<i64>,
     created_by: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     created_at: Option<String>,
@@ -679,6 +705,7 @@ impl From<&Campaign> for CampaignListItem {
             status: c.status.clone(),
             target_count: c.target_count,
             dispatched_count: c.dispatched_count,
+            last_dispatch_target_count: c.last_dispatch_target_count,
             created_by: c.created_by.clone(),
             created_at: crate::models::dt_to_string(c.created_at),
         }
@@ -816,6 +843,7 @@ mod tests {
             status: "draft".to_string(),
             target_count: None,
             dispatched_count: 0,
+            last_dispatch_target_count: None,
             created_by: "admin".to_string(),
             created_at: now,
             updated_at: now,
@@ -1103,6 +1131,7 @@ mod tests {
             status: "completed".to_string(),
             target_count: Some(500),
             dispatched_count: 470,
+            last_dispatch_target_count: None,
             created_by: "admin".to_string(),
             created_at: now,
             updated_at: now,

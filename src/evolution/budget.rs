@@ -119,6 +119,7 @@ mod tests {
             holding_reply_min_interval_hours: 6.0,
             holding_reply_token_budget: 3000,
             account_daily_send_soft_cap: 500,
+            campaign_max_audience: 500,
             silence_signal_worker_enabled: false,
             silence_threshold_seconds: 86400,
             silence_signal_interval_seconds: 0,

@@ -157,6 +157,15 @@ pub struct AppConfig {
     /// （`agent.account_daily_send_soft_cap_exceeded`）告警防封号。**仅告警，
     /// 不拦截、不排队、不改变发送行为**——观测先行。默认 500（保守高值）。
     pub account_daily_send_soft_cap: i64,
+    /// 单个 campaign 活动的受众规模硬上限（粗筛扫描量）。粗筛命中候选超过此值即拒绝
+    /// preview/dispatch，防单请求全量 contacts 驻内存 + dispatch 串行千次 DB 写超时
+    /// （KC-04/07）。默认 500，与 account_daily_send_soft_cap 同量级（单活动受众与账号
+    /// 日发能力匹配）。env `CAMPAIGN_MAX_AUDIENCE`。
+    ///
+    /// 注意：这是硬上限、非"软阈值可关闭"——设 0 意为"任一候选即拒"（全拒），
+    /// **不是**"不限"（与 ACCOUNT_SEND_*_INTERVAL_MS 的"0=关闭"约定相反）。要放宽
+    /// 上限请调大此值，不要设 0。
+    pub campaign_max_audience: i64,
 
     // ── 自学习采集管道（第一阶段）：行为信号 + 沉默删失 + 止血 ──
     //
@@ -578,6 +587,7 @@ impl AppConfig {
                 .parse()?,
             holding_reply_token_budget: env_or("HOLDING_REPLY_TOKEN_BUDGET", "3000").parse()?,
             account_daily_send_soft_cap: env_or("ACCOUNT_DAILY_SEND_SOFT_CAP", "500").parse()?,
+            campaign_max_audience: env_or("CAMPAIGN_MAX_AUDIENCE", "500").parse()?,
             // ── 自学习采集管道（第一阶段） ──
             silence_signal_worker_enabled: parse_bool(&env_or(
                 "SILENCE_SIGNAL_WORKER_ENABLED",
