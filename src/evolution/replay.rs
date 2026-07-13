@@ -293,7 +293,12 @@ fn evaluate_threshold(proposal: &Proposal, original: &AgentRunLog) -> ReplayOutc
     ReplayOutcome {
         completed: true,
         failure_reason: None,
-        original_final_review_status: Some(original.final_review_status.clone()),
+        // KE-02：original 终态用 5闸重推(基于已在上方算好的 original_5gate_hit)，
+        // 与 prompt 路径 prompt_sample_to_outcome 及 new 侧同口径。旧代码用源 run 真实
+        // 终态 original.final_review_status，若终态是非-5gate 因素(blocked_by_budget/
+        // ai_waiting_for_more_context 等)会让 original 侧算"发送失败"、new 侧 5闸算"成功"，
+        // 凭空 +send_delta 虚假翻越 min_send_success_delta 门。两侧同口径后唯一变量是被改 gate。
+        original_final_review_status: Some(final_status_from_5gate(&original_5gate_hit).to_string()),
         original_5gate_hit,
         original_self_critique_addressed: None,
         new_final_review_status: Some(new_final.to_string()),
@@ -697,6 +702,35 @@ mod tests {
             outcome.new_5gate_hit.get_bool("fact_risk_block").unwrap(),
             false
         );
+    }
+
+    /// KE-02：源 run 真实终态是**非-5gate**因素（如 blocked_by_budget）但 review.scores
+    /// 5 闸全过。修复后 original_final_review_status 必须用 5闸重推值（approved），
+    /// 不再是源真实终态——否则 original 侧算"发送失败"、new 侧 5闸算"成功"，凭空 +send_delta。
+    /// 回退到 `original.final_review_status.clone()` 即变红。
+    #[test]
+    fn evaluate_threshold_original_uses_5gate_not_real_terminal() {
+        let scores = doc! {
+            "factRisk": 1_i32,       // 远低于阈值 → 不 block
+            "pressureRisk": 1_i32,
+            "humanLike": 8_i32,
+            "emotionalValue": 7_i32,
+            "productAccuracy": 9_i32,
+        };
+        // 源 run 真实终态 = 非-5gate 因素（预算耗尽），但 scores 5 闸全过。
+        let run = mk_run_log(scores, "blocked_by_budget");
+        // 放松 fact_risk_block 6→7（升阈候选）；两侧 fact_risk 都不命中（scores 极低）。
+        let proposal = mk_threshold_proposal("fact_risk_block", 6.0, 7.0);
+        let outcome = evaluate_threshold(&proposal, &run);
+        assert!(outcome.completed);
+        // KE-02 核心：original 终态 = 5闸重推(approved)，不再是源真实终态 blocked_by_budget。
+        assert_eq!(
+            outcome.original_final_review_status.as_deref(),
+            Some("approved"),
+            "original 须用 5闸重推(与 new 侧同口径),不得用源真实非-5gate 终态"
+        );
+        // new 侧同样 approved（升阈后仍不命中）→ send_delta 对该 run 贡献 0，不再凭空 +。
+        assert_eq!(outcome.new_final_review_status.as_deref(), Some("approved"));
     }
 
     /// 反方向：放松 fact_risk_block 6 → 5，原 factRisk=5 不命中、新命中

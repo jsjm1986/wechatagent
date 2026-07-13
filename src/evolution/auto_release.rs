@@ -151,7 +151,13 @@ pub async fn auto_release_eligible_thresholds(state: &AppState) -> Result<usize,
             }
         };
         let observed = hit_rates.get(gate_key).copied();
-        let decision = decide_auto_release(observed, lower, upper);
+        let decision = decide_auto_release(
+            observed,
+            lower,
+            upper,
+            proposal.current_value,
+            proposal.proposed_value,
+        );
 
         // 2.5-main-4：放行判定为 true 时，再过负反应强制门——命中则强制改判 SKIP，
         // 拒绝自动放行、退回 admin 显式判断（非回滚，不触碰 Req 9.7）。门关时 forced_skip
@@ -201,13 +207,37 @@ pub async fn auto_release_eligible_thresholds(state: &AppState) -> Result<usize,
     Ok(released)
 }
 
-/// 纯函数版本：观察到的窗口命中率落在区间外 → 释放（true），落在区间内 → 跳过
-/// 留给 admin（false）。`observed=None`（窗口内无样本）也保守返回 false ——
-/// 没有信号不能盲目释放。
-pub fn decide_auto_release(observed: Option<f64>, target_lower: f64, target_upper: f64) -> bool {
-    match observed {
-        None => false,
-        Some(rate) => rate < target_lower || rate > target_upper,
+/// 纯函数版本：命中率仍在 band 外**且偏离方向与候选修正方向一致**时释放（true）。
+///
+/// KE-01：旧实现只判 `rate<lower || rate>upper`（band 外任意一侧），不看候选方向，
+/// 与模块 doc「方向与候选方向一致才放行」相悖。命中率跨 band 翻转到相反外侧时会
+/// 反向放量（升阈候选在命中率已过低时仍放行、继续把命中率推更低）。
+///
+/// 方向由 `proposed_value - current_value` 符号表达：
+/// - **升阈候选**（proposed>current，阈值调高→命中率将下降）：仅 `rate>upper`（仍过高）放行；
+/// - **降阈候选**（proposed<current，阈值调低→命中率将上升）：仅 `rate<lower`（仍过低）放行；
+/// - proposed==current（无方向）/ current 或 proposed 缺失 / `observed=None`：保守 SKIP。
+///
+/// 这是旧逻辑的**安全收窄**：只减少误放行、绝不新增放行。
+pub fn decide_auto_release(
+    observed: Option<f64>,
+    target_lower: f64,
+    target_upper: f64,
+    current_value: Option<f64>,
+    proposed_value: Option<f64>,
+) -> bool {
+    let Some(rate) = observed else {
+        return false; // 无信号不盲动
+    };
+    let (Some(cur), Some(prop)) = (current_value, proposed_value) else {
+        return false; // 缺方向不盲动
+    };
+    if prop > cur {
+        rate > target_upper // 升阈候选：仅命中率仍过高才放行
+    } else if prop < cur {
+        rate < target_lower // 降阈候选：仅命中率仍过低才放行
+    } else {
+        false // 无方向变化
     }
 }
 
@@ -380,28 +410,59 @@ mod tests {
 
     #[test]
     fn decide_auto_release_inside_band_skips() {
-        // 命中率回到正常区间 → 留给 admin 决定，不自动 release。
-        assert!(!decide_auto_release(Some(0.10), 0.05, 0.15));
-        assert!(!decide_auto_release(Some(0.05), 0.05, 0.15));
-        assert!(!decide_auto_release(Some(0.15), 0.05, 0.15));
-    }
-
-    #[test]
-    fn decide_auto_release_below_lower_releases() {
-        // 命中率仍低于下限——意味阈值仍过严，候选仍需 release。
-        assert!(decide_auto_release(Some(0.01), 0.05, 0.15));
-    }
-
-    #[test]
-    fn decide_auto_release_above_upper_releases() {
-        // 命中率仍高于上限——意味阈值仍过松，候选仍需 release。
-        assert!(decide_auto_release(Some(0.50), 0.05, 0.15));
+        // 命中率回到正常区间 → 留给 admin，不自动 release（无论方向）。
+        // 升阈候选(6→7)：band 内一律 SKIP。
+        assert!(!decide_auto_release(Some(0.10), 0.05, 0.15, Some(6.0), Some(7.0)));
+        assert!(!decide_auto_release(Some(0.05), 0.05, 0.15, Some(6.0), Some(7.0)));
+        assert!(!decide_auto_release(Some(0.15), 0.05, 0.15, Some(6.0), Some(7.0)));
     }
 
     #[test]
     fn decide_auto_release_no_signal_skips() {
-        // 窗口内无样本：保守拒释放，避免凭空生效阈值变更。
-        assert!(!decide_auto_release(None, 0.05, 0.15));
+        // 窗口内无样本：保守拒释放（方向齐备也不放行）。
+        assert!(!decide_auto_release(None, 0.05, 0.15, Some(6.0), Some(7.0)));
+    }
+
+    // ── KE-01 方向门：升阈候选(proposed>current)仅命中率仍过高(>upper)才放行 ──
+
+    #[test]
+    fn decide_auto_release_raise_threshold_releases_only_when_still_above_upper() {
+        // 升阈候选(6→7)：命中率仍 > upper（仍过高、需继续降）→ RELEASE。
+        assert!(decide_auto_release(Some(0.50), 0.05, 0.15, Some(6.0), Some(7.0)));
+    }
+
+    #[test]
+    fn decide_auto_release_raise_threshold_skips_when_flipped_below_lower() {
+        // KE-01 核心修复：升阈候选(6→7)，但命中率已翻转到 < lower（已过低）→ SKIP。
+        // 旧逻辑 rate<lower 也放行 = 反向放量把命中率推更低；本测锁死修复（回退即红）。
+        assert!(!decide_auto_release(Some(0.02), 0.05, 0.15, Some(6.0), Some(7.0)));
+    }
+
+    // ── KE-01 方向门：降阈候选(proposed<current)仅命中率仍过低(<lower)才放行 ──
+
+    #[test]
+    fn decide_auto_release_lower_threshold_releases_only_when_still_below_lower() {
+        // 降阈候选(6→5)：命中率仍 < lower（仍过低、需继续升）→ RELEASE。
+        assert!(decide_auto_release(Some(0.02), 0.05, 0.15, Some(6.0), Some(5.0)));
+    }
+
+    #[test]
+    fn decide_auto_release_lower_threshold_skips_when_flipped_above_upper() {
+        // 降阈候选(6→5)，但命中率已翻转到 > upper（已过高）→ SKIP（反向放量防护）。
+        assert!(!decide_auto_release(Some(0.50), 0.05, 0.15, Some(6.0), Some(5.0)));
+    }
+
+    #[test]
+    fn decide_auto_release_no_direction_skips() {
+        // proposed==current（无方向变化）→ SKIP。
+        assert!(!decide_auto_release(Some(0.50), 0.05, 0.15, Some(6.0), Some(6.0)));
+    }
+
+    #[test]
+    fn decide_auto_release_missing_value_skips() {
+        // current/proposed 任一缺失（无法定方向）→ 保守 SKIP。
+        assert!(!decide_auto_release(Some(0.50), 0.05, 0.15, None, Some(7.0)));
+        assert!(!decide_auto_release(Some(0.50), 0.05, 0.15, Some(6.0), None));
     }
 
     #[test]
