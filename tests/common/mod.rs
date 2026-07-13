@@ -323,6 +323,7 @@ fn test_config(mongodb_uri: String, mongodb_database: String) -> AppConfig {
         holding_reply_min_interval_hours: 6.0,
         holding_reply_token_budget: 3000,
         account_daily_send_soft_cap: 500,
+        campaign_max_audience: 500,
         // ── 自学习采集管道（第一阶段）：测试默认全部 disabled / 极小值 ──
         silence_signal_worker_enabled: false,
         silence_threshold_seconds: 86400,
