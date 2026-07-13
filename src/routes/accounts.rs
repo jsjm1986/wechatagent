@@ -144,7 +144,6 @@ pub async fn sync_accounts(
                         "app_id": &account.app_id,
                         "wxid": &account.wxid,
                         "nick_name": &account.nick_name,
-                        "mcp_base_url": &account.mcp_base_url,
                         "online": account.online,
                         "status": &account.status,
                         "last_sync_at": account.last_sync_at,
@@ -155,6 +154,10 @@ pub async fn sync_accounts(
                         "account_id": &account.account_id,
                     },
                     "$setOnInsert": {
+                        // KE-06：mcp_base_url + mcp_api_key 都仅插入时写 config 默认，后续 sync
+                        // 不覆盖管理员经 update_account_mcp_key 手配的值（对称保护，防 sync
+                        // 抹掉手配 base_url）。
+                        "mcp_base_url": &account.mcp_base_url,
                         "mcp_api_key": &account.mcp_api_key,
                         "created_at": account.created_at,
                         "capacity": 0,

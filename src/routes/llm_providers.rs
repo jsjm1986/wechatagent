@@ -151,7 +151,7 @@ pub(super) async fn create_provider(
     Json(body): Json<UpsertRequest>,
 ) -> AppResult<Json<Value>> {
     let workspace_id = resolve_authorized_workspace(&state, &admin, body.workspace_id.clone()).await?;
-    LlmFormat::parse(&body.format)?;
+    let fmt = LlmFormat::parse(&body.format)?;
     if body.provider_id.trim().is_empty() {
         return Err(AppError::BadRequest("providerId 不能为空".to_string()));
     }
@@ -197,7 +197,17 @@ pub(super) async fn create_provider(
                 "创建失败（可能 providerId 重复）: {err}"
             ))
         })?;
-    Ok(Json(json!({ "item": LlmProviderView::from(&cfg) })))
+    // KD-09：openai 形态 base_url 缺 /v1 时软提示（不阻断保存）。cfg.base_url 已 trim :178，
+    // fmt 复用上方 :154 已解析的合法值，不重复 parse。
+    let warning = base_url_v1_warning(fmt, &cfg.base_url);
+    if let Some(w) = &warning {
+        tracing::warn!("provider {} base_url 软校验: {w}", cfg.provider_id);
+    }
+    let mut resp = json!({ "item": LlmProviderView::from(&cfg) });
+    if let Some(w) = warning {
+        resp["warning"] = json!(w);
+    }
+    Ok(Json(resp))
 }
 
 pub(super) async fn update_provider(
@@ -267,7 +277,17 @@ pub(super) async fn update_provider(
             swap_registry(reg, &refreshed).await?;
         }
     }
-    Ok(Json(json!({ "item": LlmProviderView::from(&refreshed) })))
+    // KD-09：用 refreshed.format/base_url（实际存库值）软校验；refreshed.format 由上方 :210
+    // 已验的 body.format 写入，同样合法，parse 不会失败。
+    let warning = base_url_v1_warning(LlmFormat::parse(&refreshed.format)?, &refreshed.base_url);
+    if let Some(w) = &warning {
+        tracing::warn!("provider {} base_url 软校验: {w}", refreshed.provider_id);
+    }
+    let mut resp = json!({ "item": LlmProviderView::from(&refreshed) });
+    if let Some(w) = warning {
+        resp["warning"] = json!(w);
+    }
+    Ok(Json(resp))
 }
 
 pub(super) async fn delete_provider(
@@ -318,6 +338,12 @@ pub async fn activate_provider(
         )
         .await?
         .ok_or_else(|| AppError::NotFound(format!("provider {provider_id} not found")))?;
+    // KD-10：先 swap（成功才写 DB active），让"返 Err ⟺ DB 未改"一致。swap_registry 是纯
+    // client 构造 + 原子替换、无 DB 副作用，提前无害；swap 失败即返 Err、DB 未被触碰
+    // （原序 update 在前 → swap 失败会留下"DB 已翻但运行时仍旧 client"的假失败）。
+    if let Some(reg) = &state.llm_registry {
+        swap_registry(reg, &target).await?;
+    }
     let now = DateTime::now();
     state
         .db
@@ -337,9 +363,6 @@ pub async fn activate_provider(
             None,
         )
         .await?;
-    if let Some(reg) = &state.llm_registry {
-        swap_registry(reg, &target).await?;
-    }
     Ok(Json(
         json!({ "ok": true, "item": LlmProviderView::from(&target) }),
     ))
@@ -577,6 +600,23 @@ async fn swap_registry(
     Ok(())
 }
 
+/// openai 形态 base_url 软校验（KD-09）：不以 /v1 结尾时返回 warning 文案（None=无警告）。
+/// 非 openai 形态（messages 形态）请求路径 {base_url}/v1/messages 自带 /v1，不校验（返 None）。
+/// 软提示不阻断保存——各家兼容端点路径不一（Azure/代理网关可能非 /v1），hard block 会误伤合法配置。
+fn base_url_v1_warning(fmt: LlmFormat, base_url: &str) -> Option<String> {
+    if fmt != LlmFormat::Openai {
+        return None;
+    }
+    let trimmed = base_url.trim_end_matches('/');
+    if trimmed.ends_with("/v1") {
+        return None;
+    }
+    Some(format!(
+        "baseUrl \"{trimmed}\" 不以 /v1 结尾：OpenAI 形态请求路径为 {{baseUrl}}/chat/completions，\
+         多数服务商需 baseUrl 含 /v1（如 https://api.deepseek.com/v1）。若你的服务商路径确不含 /v1 可忽略此提示。"
+    ))
+}
+
 #[allow(dead_code)]
 fn _ensure_llm_provider_object_safe(_g: &dyn LlmProvider) {}
 
@@ -633,5 +673,27 @@ mod tests {
             payload.to_string()
         };
         assert_eq!(resolved, payload);
+    }
+
+    #[test]
+    fn base_url_v1_warning_openai_missing_v1_warns() {
+        let w = base_url_v1_warning(LlmFormat::Openai, "https://api.deepseek.com");
+        assert!(w.is_some(), "openai 缺 /v1 应 warning");
+        assert!(w.unwrap().contains("/v1"));
+    }
+
+    #[test]
+    fn base_url_v1_warning_openai_with_v1_ok() {
+        assert!(base_url_v1_warning(LlmFormat::Openai, "https://api.deepseek.com/v1").is_none());
+        // 尾斜杠 trim 后仍含 /v1
+        assert!(base_url_v1_warning(LlmFormat::Openai, "https://api.deepseek.com/v1/").is_none());
+    }
+
+    #[test]
+    fn base_url_v1_warning_messages_format_never_warns() {
+        // 非 openai 形态（messages 形态）拼 /v1/messages 自带 /v1，base_url 不含 /v1 也不警告。
+        // 用 parse("messages") 构造非 openai 形态，避免硬编码具体模型/品牌字面量（no-model-hint lint）。
+        let fmt = LlmFormat::parse("messages").expect("messages 形态可解析");
+        assert!(base_url_v1_warning(fmt, "https://api.example.com").is_none());
     }
 }
