@@ -603,6 +603,10 @@ pub async fn persist_recall_signal(
     // 原 find_one({workspace,status,kind} 无序)+对单条 filter 在同 kind 多主题时只随机看
     // 一条 → 常不匹配 → 漏合并、产重复条。改为全量 find 后按 dedup_key 精确匹配（与离线
     // persist_signals 同查找口径）。在线单候选只需命中一条，用 .find() 而非建 HashMap。
+    // 边界：本函数专司在线 recall_miss / recall_low_yield 信号，两者 dedup_key 均走
+    // signal_dedup_key 默认分支 `{kind}::{title}`（kind 已编进 key），故全量 find 去掉 kind
+    // 过滤后仍只精确命中同 kind 的那条。切勿用 broken_link / missing_chunk（affected≥2）调本
+    // 函数：那两类 dedup_key 是不带 kind 的 `link::from::to`，去 kind 过滤会跨 kind 误合并。
     let pending: Vec<KnowledgeGapSignal> = db
         .knowledge_gap_signals()
         .find(
