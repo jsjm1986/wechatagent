@@ -28,8 +28,9 @@ pub use gates::{
     PendingFinalizeEvent,
 };
 pub(crate) use gates::{
-    apply_dual_reviewer_disagreement, build_reviewer_decision_view, decide_revision,
-    derive_revision_failure, detect_dual_reviewer_disagreement, route_dual_gate, RevisionDecision,
+    apply_dual_reviewer_disagreement, apply_revision_fallback, build_reviewer_decision_view,
+    decide_revision, derive_revision_failure, detect_dual_reviewer_disagreement, route_dual_gate,
+    RevisionDecision,
 };
 // 风格指纹：gateway 出站后写 last_outbound_style、reviewer 比对风格漂移。
 pub(crate) use style::{extract_outbound_style_fingerprint, style_diverged};

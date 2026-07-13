@@ -57,9 +57,9 @@ use super::memory::{
 };
 use super::multimodal;
 use super::review::{
-    decide_revision, derive_revision_failure, effective_review_mode, finalize_review_for_send,
-    local_decision_review, review_decision, review_passed, should_run_review, FinalizeOutcome,
-    GatewayStatusFinal, PendingFinalizeEvent, RevisionDecision,
+    apply_revision_fallback, decide_revision, derive_revision_failure, effective_review_mode,
+    finalize_review_for_send, local_decision_review, review_decision, review_passed,
+    should_run_review, FinalizeOutcome, GatewayStatusFinal, PendingFinalizeEvent, RevisionDecision,
 };
 use super::run_envelope::{
     assert_final_review_status_valid, assert_gateway_status_valid, assert_lifecycle_valid,
@@ -1830,6 +1830,10 @@ async fn run_user_operation_gateway_inner(
         }
         RevisionDecision::Proceed => {
             let revision_direction = review.revision_direction.trim().to_string();
+            // 改写失败/超时回退用：此刻 final_decision 仍是改写前那份已 Approved 的原稿。
+            // decide_revision 只在首轮 finalize=Approved 时才返回 Proceed（gates.rs:981），
+            // 故此快照必然是已过全部硬闸的安全原稿；改写没做成时回退发它而非毙掉补兜底。
+            let pre_revision_decision = final_decision.clone();
             // R2.3 / R2.10：触发 1 次 revision，把 revisionDirection 透传
             // 给 Reply Agent，30s 超时控制。
             pre_revision_summary = Some(format!(
@@ -1958,44 +1962,39 @@ async fn run_user_operation_gateway_inner(
                         )
                         .await?;
                     } else {
-                        // R2.4：第二轮仍 fail → revision_failed
-                        revision_applied = true;
-                        review.revision_applied = true;
-                        review.approved = false;
-                        review.final_review_status = "revision_failed".to_string();
-                        final_decision.should_reply = false;
-                        let (reason_str, fallback_status) =
-                            derive_revision_failure("revision_post_review_failed");
-                        revision_reason = reason_str;
-                        finalize_status = match second_finalize_status {
-                            GatewayStatusFinal::Approved => fallback_status,
-                            other => other,
-                        };
+                        // 改写稿第二轮 review 未过 → 回退发改写前已 Approved 的原稿（降级放行）。
+                        // 原稿在首轮 finalize 已过 apply_state_action_gate，无需再检。
+                        final_decision = pre_revision_decision.clone();
+                        final_decision.should_reply = true;
+                        revision_applied = false;
+                        revision_reason = apply_revision_fallback(
+                            &mut review,
+                            &mut finalize_status,
+                            "revision_post_review_failed",
+                        );
                         post_revision_summary = Some(format!(
-                            "approved=false reply_text_len={} risks={:?}",
-                            final_decision.reply_text.chars().count(),
-                            review.risks
+                            "fallback_to_pre_revision reply_text_len={} reason=revision_post_review_failed",
+                            final_decision.reply_text.chars().count()
                         ));
                     }
                 }
                 Ok(Err(err)) => {
-                    // R2.11：LLM 不可解析 / 业务错误 → revision_failed
-                    review.approved = false;
-                    review.revision_applied = false;
-                    review.final_review_status = "revision_failed".to_string();
-                    final_decision.should_reply = false;
+                    // 改写 LLM 调用失败 → 回退发原稿（原稿此分支未被覆盖，仍安全；统一走快照恢复最省心）。
+                    final_decision = pre_revision_decision.clone();
+                    final_decision.should_reply = true;
                     revision_applied = false;
-                    let (reason_str, status) =
-                        derive_revision_failure(&format!("revision_llm_error:{}", err));
-                    revision_reason = reason_str;
-                    finalize_status = status;
+                    revision_reason = apply_revision_fallback(
+                        &mut review,
+                        &mut finalize_status,
+                        &format!("revision_llm_error:{}", err),
+                    );
                     write_event_for_account(
                         state,
                         &contact.account_id,
                         Some(&contact.wxid),
                         "revision_llm_failure",
-                        "blocked",
-                        "Reply Agent revision 调用失败：JSON 解析或下游错误",
+                        "info",
+                        "Reply Agent revision 调用失败：回退发送改写前已批准原稿",
                         Some(doc! {
                             "run_id": &run_id,
                             "error": err.to_string(),
@@ -2004,23 +2003,22 @@ async fn run_user_operation_gateway_inner(
                     .await?;
                 }
                 Err(_) => {
-                    // R2.11：30s 超时 → revision_failed
-                    review.approved = false;
-                    review.revision_applied = false;
-                    review.final_review_status = "revision_failed".to_string();
-                    final_decision.should_reply = false;
+                    // 改写 30s 超时 → 回退发改写前已 Approved 的原稿（慢端点下最常见路径）。
+                    final_decision = pre_revision_decision.clone();
+                    final_decision.should_reply = true;
                     revision_applied = false;
-                    let (reason_str, status) =
-                        derive_revision_failure("revision_llm_timeout_30s");
-                    revision_reason = reason_str;
-                    finalize_status = status;
+                    revision_reason = apply_revision_fallback(
+                        &mut review,
+                        &mut finalize_status,
+                        "revision_llm_timeout_30s",
+                    );
                     write_event_for_account(
                         state,
                         &contact.account_id,
                         Some(&contact.wxid),
                         "revision_llm_failure",
-                        "blocked",
-                        "Reply Agent revision 调用超时（30s）",
+                        "info",
+                        "Reply Agent revision 调用超时（30s）：回退发送改写前已批准原稿",
                         Some(doc! {
                             "run_id": &run_id,
                             "latency_ms": 30000_i64,
