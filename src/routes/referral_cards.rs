@@ -205,6 +205,38 @@ pub(super) async fn toggle_referral_card(
     if result.matched_count == 0 {
         return Err(AppError::BadRequest("card not found".to_string()));
     }
+    // KE-05：审计启停动作（改变 AI 可引荐范围）。回查拿 account_id/display_name。
+    // fail-soft：写失败只 warn，不影响启停结果。
+    if let Ok(Some(card)) = state
+        .db
+        .referral_cards()
+        .find_one(
+            doc! { "_id": oid, "workspace_id": &admin.current_workspace },
+            None,
+        )
+        .await
+    {
+        let account_id = card.account_id.clone().unwrap_or_default();
+        let enabled_label = if payload.enabled { "启用" } else { "停用" };
+        let details = doc! {
+            "card_id": oid.to_hex(),
+            "enabled": payload.enabled,
+            "toggled_by": admin.username.clone(),
+        };
+        if let Err(e) = crate::agent::write_event_for_account(
+            &state,
+            &account_id,
+            None,
+            "referral_card.toggled",
+            if payload.enabled { "enabled" } else { "disabled" },
+            &format!("管理员{}名片：{}", enabled_label, card.display_name),
+            Some(details),
+        )
+        .await
+        {
+            tracing::warn!("referral_card.toggled 审计写入失败（不影响启停）: {e}");
+        }
+    }
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -216,6 +248,18 @@ pub(super) async fn delete_referral_card(
 ) -> AppResult<Json<Value>> {
     let oid = ObjectId::parse_str(&id)
         .map_err(|_| AppError::BadRequest("invalid card id".to_string()))?;
+    // KE-05：先查后删——delete_one 之后 card 已不存在，拿不到 account_id/display_name
+    // 写审计，故先回查快照留待删成功后使用。
+    let snapshot = state
+        .db
+        .referral_cards()
+        .find_one(
+            doc! { "_id": oid, "workspace_id": &admin.current_workspace },
+            None,
+        )
+        .await
+        .ok()
+        .flatten();
     let result = state
         .db
         .referral_cards()
@@ -226,6 +270,29 @@ pub(super) async fn delete_referral_card(
         .await?;
     if result.deleted_count == 0 {
         return Err(AppError::BadRequest("card not found".to_string()));
+    }
+    // KE-05：审计删除动作（改变 AI 可引荐范围）。用删除前快照。
+    // fail-soft：写失败只 warn，不影响删除结果。
+    if let Some(card) = snapshot {
+        let account_id = card.account_id.clone().unwrap_or_default();
+        let details = doc! {
+            "card_id": oid.to_hex(),
+            "target_wxid": card.target_wxid.clone(),
+            "deleted_by": admin.username.clone(),
+        };
+        if let Err(e) = crate::agent::write_event_for_account(
+            &state,
+            &account_id,
+            None,
+            "referral_card.deleted",
+            "deleted",
+            &format!("管理员删除名片：{}", card.display_name),
+            Some(details),
+        )
+        .await
+        {
+            tracing::warn!("referral_card.deleted 审计写入失败（不影响删除）: {e}");
+        }
     }
     Ok(Json(json!({ "ok": true })))
 }
