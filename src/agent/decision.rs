@@ -482,7 +482,7 @@ pub(crate) async fn decide_reply_with_promote(
         String::new()
     };
     let knowledge_route_text = if include_business {
-        serde_json::to_string(knowledge_route).unwrap_or_default()
+        format_knowledge_route_for_prompt(knowledge_route)
     } else {
         String::new()
     };
@@ -1238,6 +1238,25 @@ pub(crate) fn format_playbook_for_prompt(playbook: &OperationPlaybook) -> String
     )
 }
 
+/// 批次1③:知识路由注入槽的裁剪渲染。原槽直接 `serde_json::to_string(route)` 会把
+/// `toolTrace` / `evidenceExcerpts` / `selectedChunkRankings` 三个纯调试/落库元数据
+/// 一并喂给 LLM(`selectedChunkRankings` 注释明说只采集落库、不参与加权),回复文本
+/// 生成不消费。这里序列化后精确 remove 这 3 个 camelCase key,保留其余 10 个对 LLM
+/// 有语义的字段,且 key 大小写完全沿用 `KnowledgeRouteResult` 的 `rename_all` 派生
+/// (不手写 json! 以免字段漂移/大小写拼错、偷改 LLM 看到的字段名)。
+pub(crate) fn format_knowledge_route_for_prompt(route: &KnowledgeRouteResult) -> String {
+    let mut value = match serde_json::to_value(route) {
+        Ok(v) => v,
+        Err(_) => return String::new(),
+    };
+    if let Some(map) = value.as_object_mut() {
+        map.remove("toolTrace");
+        map.remove("evidenceExcerpts");
+        map.remove("selectedChunkRankings");
+    }
+    serde_json::to_string(&value).unwrap_or_default()
+}
+
 /// 把运营录入层（manual_tags）+ AI 确信层（confirmed_tags）标签渲染成 prompt 文本，
 /// 标注来源让 LLM 自行掂量分量。两层皆空 → 空串（调用点据此决定是否注入该段）。
 pub(crate) fn render_tags_for_prompt(
@@ -1717,7 +1736,7 @@ mod persona_override_tests {
     //! 「回落原出厂本体」。DEFAULT_PROFILE 两 override 均 None 必须返回 None（回落），
     //! 保证销售域字节不变。
 
-    use super::{assemble_system_prompt, non_empty_override, render_business_context_fragment, render_safety_donts_commitments};
+    use super::{assemble_system_prompt, format_knowledge_route_for_prompt, non_empty_override, render_business_context_fragment, render_safety_donts_commitments};
     use mongodb::bson::doc;
 
     #[test]
@@ -1806,6 +1825,54 @@ mod persona_override_tests {
             render_business_context_fragment(Some("  含空白  "), "# H"),
             "\n\n# H\n含空白"
         );
+    }
+
+    /// 批次1③:知识路由注入槽只喂 LLM 有语义的字段,剔除 3 个纯调试/落库元数据
+    /// (toolTrace / evidenceExcerpts / selectedChunkRankings)——它们回复文本生成不消费
+    /// (selectedChunkRankings 注释明说"只采集落库、不参与加权")。
+    #[test]
+    fn format_knowledge_route_drops_debug_metadata() {
+        use crate::agent::types::{KnowledgeRouteResult, SelectedChunkRanking};
+        let route = KnowledgeRouteResult {
+            needed_categories: vec!["product".to_string()],
+            selected_knowledge_ids: vec!["k1".to_string()],
+            selected_chunk_ids: vec!["c1".to_string()],
+            knowledge_coverage: "full".to_string(),
+            reason: "命中产品事实切片".to_string(),
+            requires_evidence: true,
+            missing_knowledge: vec!["定价细则".to_string()],
+            tool_trace: vec![mongodb::bson::doc! { "tool": "search" }],
+            evidence_excerpts: vec!["某条摘录".to_string()],
+            selected_chunk_rankings: vec![SelectedChunkRanking {
+                chunk_id: "c1".to_string(),
+                rank: 0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let out = format_knowledge_route_for_prompt(&route);
+        assert!(out.contains("neededCategories"), "保留 neededCategories");
+        assert!(out.contains("selectedKnowledgeIds"), "保留 selectedKnowledgeIds");
+        assert!(out.contains("knowledgeCoverage"), "保留 knowledgeCoverage");
+        assert!(out.contains("missingKnowledge"), "保留 missingKnowledge");
+        assert!(out.contains("命中产品事实切片"), "保留 reason 内容");
+        assert!(!out.contains("toolTrace"), "剔除 toolTrace");
+        assert!(!out.contains("evidenceExcerpts"), "剔除 evidenceExcerpts");
+        assert!(!out.contains("selectedChunkRankings"), "剔除 selectedChunkRankings");
+        assert!(!out.contains("某条摘录"), "剔除 evidenceExcerpts 内容");
+    }
+
+    /// 空路由(全默认)不 panic、产合法 JSON、仍不含调试字段 key。
+    #[test]
+    fn format_knowledge_route_empty_is_valid_json_without_debug_keys() {
+        use crate::agent::types::KnowledgeRouteResult;
+        let out = format_knowledge_route_for_prompt(&KnowledgeRouteResult::default());
+        let parsed: serde_json::Value =
+            serde_json::from_str(&out).expect("产出必须是合法 JSON");
+        assert!(parsed.is_object(), "产出应为 JSON 对象");
+        assert!(!out.contains("toolTrace"));
+        assert!(!out.contains("evidenceExcerpts"));
+        assert!(!out.contains("selectedChunkRankings"));
     }
 
     /// §3 恒注入铁律（核心安全不变量）：Lean 档不注入完整 memory_card，但 doNotDo /
