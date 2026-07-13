@@ -573,18 +573,6 @@ pub(in crate::routes) async fn answer_chunk_repair(
     })))
 }
 
-pub(in crate::routes) async fn propose_pack_repair(
-    State(_state): State<AppState>,
-    Path(_id): Path<String>,
-) -> AppResult<Json<Value>> {
-    // operation_knowledge_items 已删除；pack-level 修复路径暂时下线，
-    // 等 wiki Phase 重新规划包级别 repair。
-    Err(AppError::BadRequest(
-        "operation_knowledge_items has been removed; pack repair temporarily disabled"
-            .to_string(),
-    ))
-}
-
 /// 把 `patch.extras`（如果有）按 JSON 形态分类，仅用于审计 detail 中的
 /// `extrasKind` 字段，便于后续按 kind 过滤。
 fn classify_extras_kind(extras: Option<&Value>) -> &'static str {
