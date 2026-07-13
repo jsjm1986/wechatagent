@@ -599,15 +599,28 @@ pub async fn persist_recall_signal(
     candidate: GapSignalCandidate,
 ) -> Result<(), AppError> {
     let key = candidate.dedup_key();
-    let existing = db
+    // KB-07：全量载入本 workspace 同 kind 的 pending 信号，按 dedup_key 精确命中该合并的那条。
+    // 病根是原 find_one({workspace,status,kind} 无序) 只返**单条**任意行 → 同 kind 多主题时命中
+    // 的那条常与当前候选 dedup_key 不符 → 漏合并、产重复条。改为全量 find（取代单条 find_one）后
+    // 按 dedup_key 精确匹配（与离线 persist_signals 同查找口径）；在线单候选只需命中一条，用 .find()
+    // 而非建 HashMap。filter 保留 kind 谓词：只载入同 kind 的行，在结构上把匹配范围隔离在同 kind
+    // 内——即便将来有人用 broken_link / missing_chunk（其 dedup_key=`link::from::to` 不含 kind）调
+    // 本函数，也不可能跨 kind 误合并。对当前 recall_miss / recall_low_yield（dedup_key 走
+    // signal_dedup_key 默认分支 `{kind}::{title}`，kind 已编进 key）结果完全一致。
+    let pending: Vec<KnowledgeGapSignal> = db
         .knowledge_gap_signals()
-        .find_one(
+        .find(
             doc! { "workspace_id": workspace_id, "status": "pending", "kind": &candidate.kind },
             None,
         )
         .await
         .map_err(AppError::from)?
-        .filter(|s| signal_dedup_key(&s.kind, &s.title, &s.affected_chunk_ids) == key);
+        .try_collect()
+        .await
+        .map_err(AppError::from)?;
+    let existing = pending
+        .into_iter()
+        .find(|s| signal_dedup_key(&s.kind, &s.title, &s.affected_chunk_ids) == key);
 
     if let Some(existing) = existing {
         let mut merged: HashSet<String> = existing.affected_chunk_ids.iter().cloned().collect();

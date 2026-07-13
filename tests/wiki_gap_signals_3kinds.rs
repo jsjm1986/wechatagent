@@ -305,3 +305,117 @@ async fn contradiction_emitted_when_same_title_diff_first_paragraph_then_resolve
         Some("rule:contradiction_resolved")
     );
 }
+
+/// KB-07 真回归哨兵：同 kind(recall_miss) 下多条不同主题的 pending 信号并存时，
+/// `persist_recall_signal` 必须精确合并进 dedup_key 匹配的那一条，绝不因原
+/// find_one({workspace,status,kind} 无序) 只看到"任意一条"而漏合并、误新建重复条。
+///
+/// 构造要点（据 gap_signals.rs 亲验）：
+///   - recall_miss 的 dedup_key = `recall_miss::{normalize_title(title)}`
+///     （affected 为空，走默认分支 gap_signals.rs:471-474）；
+///   - title = `产品宣称缺 verified 知识背书：{customer_query.chars().take(40)}`
+///     （gap_signals.rs:436-439）→ 两 query 的**前 40 字符**相同即命中同一 dedup_key；
+///   - `recall_miss_from_product_block` 把**整串** customer_query push 进 search_queries
+///     （gap_signals.rs:451-453）→ 前 40 字符相同但整串不同 = 命中同 dedup_key + 带来新
+///     search_query 变体，正是合并分支该累积的场景。
+///   - 因此 query_b / query_b2 取 >40 字符、前 40 字符完全一致、仅在第 40 字符之后追加
+///     后缀 → dedup_key 命中 B、search_query 是新的。
+///
+/// **为何 seed 三条、且让 B 居中**（哨兵必红的关键）：`knowledge_gap_signals` 上有
+/// 两条都能覆盖 `{workspace,status,kind}` 等值谓词的索引——
+/// `gap_signals_status_kind_idx {workspace:1,status:1,kind:1}`（indexes.rs:1399，本
+/// 用例三条行的这三键全等 → 同键内按自然/插入序 → 无序 find_one 先返回**最早**的 A）
+/// 与 `gap_signals_kind_status_created_idx {...,created_at:-1}`（indexes.rs:1442 → 先
+/// 返回**最新**的 C）。若只 seed A、B 两条，B 恰是最新，planner 一旦选中 created_at:-1
+/// 索引，回退的无序 find_one 会**恰好**返回 B → 误合并成功 → 哨兵在坏代码下也绿（失效）。
+/// 让 B 居中（A 最早、C 最新）→ 两种索引序下无序 find_one 都返回非 B（A 或 C）→ dedup_key
+/// 落空 → 走新建分支 → count 变 4 → 红。修复后（全量 find + 精确 find）恒命中 B → 仍 3 条 → 绿。
+#[tokio::test]
+#[ignore]
+async fn recall_signal_merges_correct_topic_among_multiple_pending() {
+    let app = TestApp::start().await;
+
+    // 三个不同主题，前 40 字符两两不同 → 三个不同 dedup_key。B 取 >40 字符（其变体的后缀须
+    // 落在 take(40) 之外才不改 title 截断）。seed 顺序 A→B→C 使 B 居中（非最早非最新）。
+    let query_a = "A产品的整机质保期到底是多少个月这一条我一直没在知识库里查到过对应的条款".to_string();
+    let query_b =
+        "B旗舰套餐每个月赠送的移动数据流量上限到底是多少这个数字我得给客户一个准确的答复不能含糊".to_string();
+    let query_c = "C尊享会员的专属线下沙龙活动每个季度到底安排几场这块我手头没有任何可以引用的资料".to_string();
+
+    for (q, label) in [(&query_a, "seed A"), (&query_b, "seed B"), (&query_c, "seed C")] {
+        gap_signals::persist_recall_signal(
+            &app.state.db,
+            WS,
+            gap_signals::GapSignalCandidate::recall_miss_from_product_block(q.clone()),
+        )
+        .await
+        .expect(label);
+    }
+
+    let pending = list_pending(&app, "recall_miss").await;
+    assert_eq!(pending.len(), 3, "三个不同主题应建 3 条 pending, got {pending:?}");
+
+    // 前提亲验：query_b 与其变体的前 40 字符必须一致（否则 dedup_key 不会命中 B）。
+    let prefix40 = |s: &str| s.chars().take(40).collect::<String>();
+    // query_b2：前 40 字符与 query_b 完全相同、整串不同（在第 40 字符之后追加后缀）。
+    let query_b2 = format!("{query_b} 另外也顺带确认下超出上限之后怎么计费");
+    assert_eq!(
+        prefix40(&query_b),
+        prefix40(&query_b2),
+        "变体前 40 字符必须与 B 一致才会命中同 dedup_key（构造前提）"
+    );
+    assert_ne!(
+        query_b, query_b2,
+        "变体整串必须不同才能产生新的 search_query"
+    );
+    // 且 query_b 本身须 >40 字符，否则 take(40) 会把后缀也纳入 title → 变体不再同 dedup_key。
+    assert!(
+        query_b.chars().count() > 40,
+        "锚点 query_b 须 >40 字符（当前 {}）",
+        query_b.chars().count()
+    );
+
+    // ── 再来一次匹配主题 B、但带新 query 变体的信号 ──
+    gap_signals::persist_recall_signal(
+        &app.state.db,
+        WS,
+        gap_signals::GapSignalCandidate::recall_miss_from_product_block(query_b2.clone()),
+    )
+    .await
+    .expect("merge into B");
+
+    // ── 断言：精确合并进 B、绝不误新建第 4 条；B 的 search_queries 累积两个变体 ──
+    let pending2 = list_pending(&app, "recall_miss").await;
+    assert_eq!(
+        pending2.len(),
+        3,
+        "精确合并须仍 3 条；回退 find_one 无序会命中 A 或 C（非 B）、漏合并 → 误新建变 4 条, got {pending2:?}"
+    );
+    // signal_dedup_key 是 pub(crate)，tests crate 不可见 → 用 search_queries 包含 query_b 定位 B。
+    let b = pending2
+        .iter()
+        .find(|s| s.search_queries.iter().any(|q| q == &query_b))
+        .expect("B 仍在 pending（按 search_queries 含 query_b 定位）");
+    assert!(
+        b.search_queries.iter().any(|q| q == &query_b2),
+        "B 应累积 query_b2 变体, got {:?}",
+        b.search_queries
+    );
+    assert!(
+        b.search_queries.len() >= 2,
+        "B 应至少累积 query_b 与 query_b2 两个变体, got {:?}",
+        b.search_queries
+    );
+    // A / C 不应被污染：各自 search_queries 只含自己的 query，不含 B 的任何变体。
+    for (own, label) in [(&query_a, "A"), (&query_c, "C")] {
+        let sig = pending2
+            .iter()
+            .find(|s| s.search_queries.iter().any(|q| q == own))
+            .unwrap_or_else(|| panic!("{label} 仍在 pending"));
+        assert!(
+            !sig.search_queries.iter().any(|q| q == &query_b || q == &query_b2),
+            "{label} 不应被 B 的变体污染, got {:?}",
+            sig.search_queries
+        );
+    }
+}

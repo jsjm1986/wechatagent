@@ -1,3 +1,7 @@
+//! ⚠️ **生产未接线（就绪债 KB-06）**：本模块只产 `status=pending_review` 提案，
+//! 全仓无任何 apply worker / 人审 UI 消费方（提案产出后纯躺集合）。这是红线
+//! **正确**的一面（AI 绝不自动 apply split/merge），但功能未闭环——接线属下一轮。
+//!
 //! 结构化写 **意图提案**（方法论点 6：写分 LEAF vs STRUCTURAL）。
 //!
 //! leaf 写（加事实/补引用/编辑正文）走既有 `chunk_revisions` 的 draft+needs_review
