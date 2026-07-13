@@ -14,6 +14,7 @@ use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
 use wechatagent::auth::AuthenticatedAdmin;
 use wechatagent::models::{AgentStatus, Campaign, Contact, SegmentFilter};
 use wechatagent::routes::campaigns::dispatch_campaign;
+use wechatagent::routes::campaigns::preview_campaign;
 
 use crate::common::TestApp;
 
@@ -278,4 +279,57 @@ async fn dispatch_completed_campaign_rejected() {
         "completed 活动应被 status 门以 BadRequest 拒(防重推)，实际 {:?}",
         result.err()
     );
+}
+
+/// KC-04/07：受众粗筛候选超过 campaign_max_audience → preview 返 BadRequest（不静默截断受众）。
+#[tokio::test]
+#[ignore]
+async fn preview_rejects_when_coarse_audience_exceeds_max() {
+    let mut app = TestApp::start().await;
+    app.state.config.campaign_max_audience = 3; // 小上限便于确定性触发
+    let ws = app.state.config.default_workspace_id.clone();
+    let acc = app.state.config.default_account_id.clone();
+    let campaign = make_campaign(&ws, &acc);
+    let cid = campaign.id.unwrap();
+    app.state.db.campaigns().insert_one(&campaign, None).await.expect("seed campaign");
+    // seed 4 个 managed contact（> 上限 3）→ 粗筛候选超限
+    for wx in ["wx_1", "wx_2", "wx_3", "wx_4"] {
+        app.state.db.contacts().insert_one(make_contact(&ws, &acc, wx), None).await.expect("seed contact");
+    }
+    let result = preview_campaign(
+        State(app.state.clone()),
+        Extension(test_admin(&ws)),
+        Path(cid.to_hex()),
+    )
+    .await;
+    assert!(
+        matches!(result, Err(wechatagent::error::AppError::BadRequest(_))),
+        "粗筛候选超过上限须 BadRequest（回退守卫即绿变红），实际 {:?}",
+        result.map(|r| r.0.clone())
+    );
+}
+
+/// KC-04/07：粗筛候选正好等于上限 → preview 成功、targetCount == 上限（探测法边界）。
+#[tokio::test]
+#[ignore]
+async fn preview_succeeds_at_exactly_max() {
+    let mut app = TestApp::start().await;
+    app.state.config.campaign_max_audience = 3;
+    let ws = app.state.config.default_workspace_id.clone();
+    let acc = app.state.config.default_account_id.clone();
+    let campaign = make_campaign(&ws, &acc);
+    let cid = campaign.id.unwrap();
+    app.state.db.campaigns().insert_one(&campaign, None).await.expect("seed campaign");
+    // seed 正好 3 个 → 不超限（空 filter：粗筛=精筛，全部命中）
+    for wx in ["wx_1", "wx_2", "wx_3"] {
+        app.state.db.contacts().insert_one(make_contact(&ws, &acc, wx), None).await.expect("seed contact");
+    }
+    let resp = preview_campaign(
+        State(app.state.clone()),
+        Extension(test_admin(&ws)),
+        Path(cid.to_hex()),
+    )
+    .await
+    .expect("正好等于上限应成功");
+    assert_eq!(resp.0["targetCount"].as_i64(), Some(3), "targetCount 应为 3");
 }
