@@ -500,6 +500,7 @@ mod tests {
             is_generalizable: false,
             knowledge_proposal_emitted: false,
             last_holding_reply_ms: None,
+            last_pushed_at_ms: None,
             created_at: mongodb::bson::DateTime::now(),
             updated_at: mongodb::bson::DateTime::now(),
             resolved_at: None,

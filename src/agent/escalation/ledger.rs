@@ -53,6 +53,7 @@ pub(crate) async fn insert_pending_escalation(
             is_generalizable,
             knowledge_proposal_emitted: false,
             last_holding_reply_ms: None,
+            last_pushed_at_ms: Some(now.timestamp_millis()),
             created_at: now,
             updated_at: now,
             resolved_at: None,
@@ -310,7 +311,12 @@ pub(crate) async fn reassign_escalation(
                 "short_code": short_code,
                 "status": PRINCIPAL_ESCALATION_STATUS_PENDING,
             },
-            doc! { "$set": { "principal_wxid": to_wxid, "updated_at": DateTime::now() } },
+            doc! { "$set": {
+                "principal_wxid": to_wxid,
+                "updated_at": DateTime::now(),
+                // KD-05：改派=给 next 的新推送时刻，与 updated_at 同步刷新，骚扰门据此正确计对 next 的打扰。
+                "last_pushed_at_ms": DateTime::now().timestamp_millis(),
+            } },
             mongodb::options::FindOneAndUpdateOptions::builder()
                 .return_document(mongodb::options::ReturnDocument::After)
                 .build(),
@@ -343,7 +349,7 @@ pub(crate) async fn touch_last_holding_reply_ms(
 }
 
 /// 统计某决策人当日（since_ms 起）已被推送的请示卡数（骚扰门 daily_push_cap 用）。
-/// 以 pending 台账 created_at 作为推送时刻近似（每条 pending = 一次推卡）。
+/// 以 last_pushed_at_ms（首推+改派刷新）为推送时刻（每条 pending = 一次推卡）。
 pub(crate) async fn count_pushes_today(
     state: &AppState,
     workspace_id: &str,
@@ -357,7 +363,8 @@ pub(crate) async fn count_pushes_today(
             doc! {
                 "workspace_id": workspace_id,
                 "principal_wxid": principal_wxid,
-                "created_at": { "$gte": DateTime::from_millis(since_ms) },
+                // KD-05：用真实最近推送时刻，而非 created_at（改派后 created_at 不刷新会漏计）。
+                "last_pushed_at_ms": { "$gte": since_ms },
             },
             None,
         )
@@ -366,7 +373,7 @@ pub(crate) async fn count_pushes_today(
 }
 
 /// 查某决策人最近一次被推卡的时刻（毫秒）——骚扰门 dedupe_window_hours 用。
-/// 以台账 created_at 作推送时刻近似（与 count_pushes_today 同口径，:310）。
+/// 以 last_pushed_at_ms（首推+改派刷新）作推送时刻（与 count_pushes_today 同口径）。
 /// 无任何台账 → None（首次推卡，dedupe 不拦）。
 pub(crate) async fn latest_push_ms(
     state: &AppState,
@@ -379,9 +386,11 @@ pub(crate) async fn latest_push_ms(
         .find_one(
             doc! { "workspace_id": workspace_id, "principal_wxid": principal_wxid },
             mongodb::options::FindOneOptions::builder()
-                .sort(doc! { "created_at": -1 })
+                // KD-05：按真实最近推送时刻排序取最近一次推卡时刻（改派刷新后才准）。
+                .sort(doc! { "last_pushed_at_ms": -1 })
                 .build(),
         )
         .await?;
-    Ok(latest.map(|e| e.created_at.timestamp_millis()))
+    // last_pushed_at_ms 已是 epoch ms；旧行缺字段→None（m031 backfill 前），用 created_at 兜底保口径。
+    Ok(latest.and_then(|e| e.last_pushed_at_ms.or_else(|| Some(e.created_at.timestamp_millis()))))
 }

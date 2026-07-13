@@ -412,6 +412,7 @@ fn pending_escalation(short_code: &str, contact_wxid: &str, principal_wxid: &str
         resolved_at: None,
         resolved_via: None,
         last_holding_reply_ms: None,
+        last_pushed_at_ms: None,
     }
 }
 

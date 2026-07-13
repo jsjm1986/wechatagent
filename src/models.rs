@@ -3733,6 +3733,12 @@ pub struct AgentPrincipalEscalation {
     /// holding_reply_min_interval_hours 最多发一条，防 worker tick 刷屏。`#[serde(default)]` 兼容旧文档。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_holding_reply_ms: Option<i64>,
+    /// KD-05：本条台账最近一次被推卡给【当前 principal】的时刻（epoch ms）。骚扰门
+    /// count_pushes_today / latest_push_ms 用它而非 created_at——改派换 principal 时
+    /// created_at 不刷新会低估对 next 的打扰。首推创建时=created_at；每次 reassign 刷新为
+    /// 改派时刻。`#[serde(default)]` 兼容旧文档（缺字段→None，由 m031 backfill 补成 created_at）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_pushed_at_ms: Option<i64>,
     pub created_at: DateTime,
     pub updated_at: DateTime,
     #[serde(default, skip_serializing_if = "Option::is_none")]

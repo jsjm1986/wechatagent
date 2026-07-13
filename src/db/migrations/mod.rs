@@ -72,6 +72,10 @@ pub mod m029_cleanup_contact_identity;
 /// 迁移后手动插入缺 verification/eventKind 的老成交 contacts，再**直接调用**
 /// `m030::run_step` 验回填语义（同 m018/m029 先例：为集成测暴露而用 `pub mod`）。
 pub mod m030_backfill_outcome_event_defaults;
+/// `pub`：集成测试需在 `TestApp::start()` 跑完迁移后手动插入缺 last_pushed_at_ms 的旧
+/// escalation 行，再**直接调用** `m031::run_step` 验回填语义（同 m018/m029/m030 先例：
+/// 为集成测暴露而用 `pub mod`）。
+pub mod m031_backfill_escalation_last_pushed_at;
 
 type MigrationFuture<'a> = Pin<Box<dyn Future<Output = AppResult<()>> + Send + 'a>>;
 pub type MigrationFn = for<'a> fn(&'a Database) -> MigrationFuture<'a>;
@@ -203,6 +207,10 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration {
         id: "2026_07_030_backfill_outcome_event_defaults",
         run: |db| Box::pin(m030_backfill_outcome_event_defaults::run_step(db)),
+    },
+    Migration {
+        id: "2026_07_031_backfill_escalation_last_pushed_at",
+        run: |db| Box::pin(m031_backfill_escalation_last_pushed_at::run_step(db)),
     },
 ];
 
