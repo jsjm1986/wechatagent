@@ -85,7 +85,7 @@
 - 复现设想: 灌两条不含任何 *MsgId / _mcp.sourceMsgId 且 body 逐字节相同的 payload。第二条返 `duplicate:true`。**生产近乎无影响**——真实 GeWe AddMsg 恒带 `NewMsgId`（见 :1388 真实样例 + `real_gewe_addmsg` 测试），effective_message_id 必有值，走 `message:{id}` 而非 payload-hash 分支。风险仅限自测/手工无 ID payload。
 - 验证状态: PLAUSIBLE（读码）
 - 修复建议: 生产无影响，可 WontFix；若要严谨，payload-hash 分支可掺入接收时刻毫秒/随机 nonce 降低误杀（但会削弱重放防护，需权衡）。建议标注为"已知边界，生产不触发"。
-- 状态: Open
+- 状态: WontFix（已知边界，doc 标注 —— 生产 GeWe 恒带 NewMsgId 走 message-id 分支，payload-hash 仅自测触发；家族⑧ #待补）
 
 ### [A-04] 验签通过后 300s skew 内的重放窗口（已被 dedupe/幂等大幅缓解）
 - 入口频道: command
@@ -97,7 +97,7 @@
 - 复现设想: 截获一条带合法 `x-webhook-signature` + `x-webhook-timestamp` 的 AddMsg，300s 内重发。**实际影响很小**：AddMsg 重放命中 message-id dedupe → `duplicate:true` 幂等短路（:512-515）；Offline/Online 重放只是重复 `$set online`（幂等）；领导回复重放经 `resolve_escalation` 幂等（`escalation/mod.rs:344-345`）与 `NoPending`。故重放不产生重复发送/重复副作用。
 - 验证状态: PLAUSIBLE（读码）
 - 修复建议: 当前缓解已足够，无需加 nonce（会引入状态存储成本）。仅记录为"已知、已缓解"的入口特性。建议 WontFix。
-- 状态: Open
+- 状态: WontFix（已知边界，doc 标注 —— dedupe/幂等已缓解重放无重复副作用，加 nonce 收益不抵成本；家族⑧ #待补）
 
 ### [A-05] 缺失 appId（None）在关闭验签时回退 default account，多账号下可能张冠李戴
 - 入口频道: command
@@ -109,7 +109,7 @@
 - 复现设想: `WEBHOOK_VERIFY_SIGNATURE=false` 下灌一条无 appId 的 payload。观察落到 default_account_id。**生产默认 verify=true（`config.rs:704`）**，None appId → secret=None → 400，天然挡住。风险仅存于显式关闭验签的部署。
 - 验证状态: PLAUSIBLE（读码）
 - 修复建议: 生产默认配置已 fail-closed。可考虑：无 appId 时无条件 400（不回退 default），彻底消除该路径。属加固项，非现网 bug。
-- 状态: Open
+- 状态: Fixed（家族⑧ #待补 —— resolve_account_context 无 appId 分支收敛：仅 verify=false 且多账号时 400，单账号仍回落 default 不打断单账号部署）
 
 ### [A-06] `last_inbound_at` 更新或 inbound 写入的瞬时 DB 错误使本条消息在下一条到来前不被回复
 - 入口频道: userOps
@@ -121,7 +121,7 @@
 - 复现设想: 注入 Mongo 瞬时错误于 contacts.update_one。难在生产安全构造，不建议真跑。
 - 验证状态: PLAUSIBLE（读码）
 - 修复建议: 可考虑把 `last_inbound_at` 时间戳更新降级为 best-effort（失败只 warn，不拦 spawn），与 `collect_inbound_behavior_signals`（:570 已是 best-effort）对齐——时间戳落库失败不应连累应答。属小加固。
-- 状态: Open
+- 状态: Fixed（家族⑧ #待补 —— last_inbound_at/last_message_at/updated_at 统计 update 降 best-effort，失败仅 warn；inbound insert_one 的 fail-close 保持不动）
 
 ### 已知非本轮 bug 的架构约束（记录留痕，不入 finding）
 
