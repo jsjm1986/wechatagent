@@ -365,7 +365,9 @@ pub(crate) async fn review_decision(
         "nextAction": memory.next_action.clone()
     })
     .unwrap_or_default();
-    let knowledge_route_text = serde_json::to_string(knowledge_route).unwrap_or_default();
+    // 全 AI 自治治本(Layer2)：复用 reply 侧同一净化函数,剔除 reason(防知识 Agent 越权承接
+    // 措辞经 reviewer 上下文回流)+ 3 个调试字段,两处口径单一真相源(替代裸 to_string)。
+    let knowledge_route_text = super::decision::format_knowledge_route_for_prompt(knowledge_route);
     // Phase B / B2：reviewer 视图剥离 reply-agent 自我推理。直接 `to_string(decision)`
     // 会把 9 个 self-reasoning 字段（why_should_reply / self_critique /
     // knowledge_need_reason / memory_update_reason / risk_self_check /
