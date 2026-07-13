@@ -375,7 +375,7 @@ pub async fn scan_escalation_timeouts(state: &AppState) -> AppResult<()> {
         for entry in pending {
             let age_hours =
                 (now_ms - entry.updated_at.timestamp_millis()) as f64 / (3600.0 * 1000.0);
-            let Some(next) = next_decider_on_timeout(&policy, &entry.principal_wxid, age_hours)
+            let Some(next) = next_decider_on_timeout(&policy, &entry.principal_wxid, &entry.contact_wxid, age_hours)
             else {
                 // next_decider_on_timeout 返回 None 有两种情形：①尚未超时 ②已超时但到链尾。
                 // 仅情形②需安抚客户。policy.timeout_hours 在 :365 已确保 Some，可直接比对区分。
