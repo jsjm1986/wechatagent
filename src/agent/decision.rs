@@ -519,10 +519,10 @@ pub(crate) async fn decide_reply_with_promote(
     };
     // §3 恒注入铁律（渐进式三档 2026-06-23）：doNotDo 禁止项 + commitments 已承诺
     // 属安全/身份类槽位，任何档都不能丢——降档若丢失"已承诺/禁止项"，AI 可能违背
-    // 承诺或踩禁止项，是不可恢复的安全事故。Relational/Full 档下完整 memory_card_text
-    // 已含这两项（context_pack 含 doNotDo/commitments 字段），无需重复注入；仅 Lean
-    // 档 memory_card_text 被跳过，必须单独补一份精简安全子片。整段（含标题/换行）只在
-    // Lean 档非空，Relational/Full 档空串 → Full 逐字等价历史 prompt（零字节差异）。
+    // 承诺或踩禁止项，是不可恢复的安全事故。Relational/Full 档下槽6 memory_text 的
+    // memoryCard 字段已含这两项（context_pack 含 doNotDo/commitments 字段），无需重复
+    // 注入；仅 Lean 档该字段被跳过，必须单独补一份精简安全子片。整段（含标题/换行）只在
+    // Lean 档非空，Relational/Full 档空串 → 该安全子片在 Relational/Full 档不额外加字节。
     let safety_donts_commitments_text = render_safety_donts_commitments(tier, context_pack);
     // 关系组：完整长期运营记忆 + 记忆卡片。Lean 跳过，空串占位。
     let memory_text = if include_relational {
@@ -1277,8 +1277,8 @@ fn assemble_system_prompt(
 /// 或踩禁止项，是不可恢复的安全事故。
 ///
 /// 抽成纯函数让 lib 单测能锁住这条安全不变量：Lean 档（不注入完整 memory_card）必须
-/// 单独补一份含 doNotDo/commitments 的安全子片；Relational/Full 档完整 `memory_card_text`
-/// 已含这两项 → 此处返回空串避免重复，且保证 Full 档与改造前 prompt 逐字等价（零字节差异）。
+/// 单独补一份含 doNotDo/commitments 的安全子片；Relational/Full 档下槽6 memory_text 的
+/// `memoryCard` 字段已含这两项 → 此处返回空串避免重复（该安全子片在 Relational/Full 档不额外加字节）。
 /// 这段逻辑此前内联在 `decide_reply_with_promote` 里、依赖 AppState/DB，无法单测；抽出后
 /// 恒注入铁律成为可确定性断言的纯函数边界。
 pub(crate) fn render_safety_donts_commitments(
@@ -1826,9 +1826,9 @@ mod persona_override_tests {
         assert!(out.contains("周五前发报价单"), "commitments 实际内容必须随档注入");
     }
 
-    /// §3 铁律的另一面：Relational / Full 档完整 memory_card_text 已含 doNotDo /
-    /// commitments，此处返回空串避免重复——这保证 Full 档与改造前 prompt **逐字等价**
-    /// （零字节差异）。若这里非空，Full 档会多出一段、破坏等价护栏。
+    /// §3 铁律的另一面：Relational / Full 档下槽6 memory_text 的 `memoryCard` 字段已含
+    /// doNotDo / commitments，此处返回空串避免重复——该安全子片在 Relational / Full 档
+    /// 不额外给 prompt 加字节。若这里非空，会多出一段、破坏"不重复注入"护栏。
     #[test]
     fn relational_and_full_tiers_emit_empty_to_keep_byte_equivalence() {
         let pack = doc! {
