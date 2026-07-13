@@ -305,6 +305,17 @@ pub async fn cancel_entry(
     Ok(())
 }
 
+/// F-02：max_attempts 兜底口径——与 enqueue 侧（`outbox.rs:244` `<=0→3`）对齐。
+/// enqueue 恒产出 ≥1，故 `<=0` 分支对正常入队 entry 是死代码；仅历史脏文档 /
+/// 手工写入的 `<=0` 走到，两处同口径才有确定一致行为。
+fn effective_max_attempts(raw: i32) -> i32 {
+    if raw <= 0 {
+        3
+    } else {
+        raw
+    }
+}
+
 /// 重试或终止：根据 attempt + max_attempts 判断走 pending(+next_retry_at) 还是
 /// failed_terminal。
 //
@@ -319,11 +330,7 @@ pub async fn schedule_retry_or_terminal(
     let collection = state.db.collection_agent_send_outbox();
     let now = DateTime::now();
     let next_attempt = entry.attempt.saturating_add(1);
-    let max_attempts = if entry.max_attempts <= 0 {
-        5
-    } else {
-        entry.max_attempts
-    };
+    let max_attempts = effective_max_attempts(entry.max_attempts);
 
     if next_attempt < max_attempts {
         let jitter01 = fastrand::f64();
@@ -1249,5 +1256,17 @@ mod tests {
             !entry.reclaimed_in_flight,
             "缺字段的旧文档必须默认 reclaimed_in_flight=false"
         );
+    }
+
+    /// F-02：dispatcher 侧 max_attempts 兜底须与 enqueue 侧（outbox.rs:244 `<=0→3`）
+    /// 同口径。历史脏文档 / 手工写入的 max_attempts<=0 时，两处兜底一致才有确定行为。
+    /// 该分支对 enqueue 正常产出的 entry 是死代码（enqueue 恒产出 ≥1），此测锁定口径对齐。
+    /// 驱动生产纯函数 effective_max_attempts——改回 `<=0→5` 即变红（真回归哨兵，非 tautology）。
+    #[test]
+    fn effective_max_attempts_fallback_aligns_with_enqueue() {
+        assert_eq!(effective_max_attempts(0), 3, "max_attempts=0 兜底须为 3(对齐 enqueue outbox.rs:244)");
+        assert_eq!(effective_max_attempts(-1), 3, "max_attempts<0 兜底须为 3");
+        assert_eq!(effective_max_attempts(1), 1, "max_attempts>0 原样透传");
+        assert_eq!(effective_max_attempts(5), 5, "max_attempts>0 原样透传");
     }
 }
