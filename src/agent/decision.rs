@@ -403,6 +403,7 @@ pub(crate) async fn decide_reply_with_promote(
         let candidates = super::referral::filter_referral_candidates(
             &cards,
             current_customer_stage.as_deref(),
+            &contact.account_id,
         );
         // 「已引荐」上下文：从已加载名片中按 referred_card_id 反查 display_name，
         // 给 Reply Agent 防重推依据（找不到对应名片则不展示历史）。

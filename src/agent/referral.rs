@@ -22,18 +22,31 @@ pub(crate) fn assist_mode_active(account_enabled: Option<bool>, override_attr: O
     }
 }
 
-/// 发送前准入：仅 enabled 且 approved 的名片可被 AI 选/发。
-pub(crate) fn validate_card_sendable(card: &ReferralCard) -> bool {
-    card.enabled && card.review_status == "approved"
+/// 发送前准入：仅 enabled + approved + account 归属匹配的名片可被 AI 选/发。
+///
+/// KE-03：account 归属校验与 enabled/approved 同层（三条发送路径——候选加载
+/// `filter_referral_candidates`、gateway 二次准入、`send_outbound_namecard`——
+/// 全部经过本纯函数做二次校验，故 account 归属加在此处一处生效、口径单一）。
+/// `account_id` = 本 contact 的账号。global scope 卡（`card.account_id=None`）
+/// 任何账号可用；绑定某账号的卡仅该账号可用——与候选加载 DB filter
+/// `build_referral_cards_filter` 的 `$or:[{account_id:null},{account_id:==account_id}]`
+/// 口径完全一致，杜绝「同 workspace 内绑定账号 A 的名片经账号 B 会话推出」。
+pub(crate) fn validate_card_sendable(card: &ReferralCard, account_id: &str) -> bool {
+    let account_ok = match card.account_id.as_deref() {
+        None => true,                       // global scope 卡：任何账号可用
+        Some(bound) => bound == account_id, // 绑定卡：仅本账号
+    };
+    card.enabled && card.review_status == "approved" && account_ok
 }
 
 pub(crate) fn filter_referral_candidates<'a>(
     cards: &'a [ReferralCard],
     customer_stage: Option<&str>,
+    account_id: &str,
 ) -> Vec<&'a ReferralCard> {
     cards
         .iter()
-        .filter(|c| validate_card_sendable(c))
+        .filter(|c| validate_card_sendable(c, account_id))
         .filter(|c| {
             c.target_stages.is_empty()
                 || customer_stage
@@ -114,10 +127,10 @@ pub(crate) async fn send_outbound_namecard(
         .await?
         .ok_or_else(|| AppError::NotFound("referral card not found".into()))?;
 
-    // 发送前准入二次校验（防 AI 幻觉/已撤下名片一路漏到发送）。
-    if !validate_card_sendable(&card) {
+    // 发送前准入二次校验（防 AI 幻觉/已撤下名片一路漏到发送 + KE-03 account 归属）。
+    if !validate_card_sendable(&card, &contact.account_id) {
         return Err(AppError::External(
-            "referral card not sendable (draft/disabled)".into(),
+            "referral card not sendable (draft/disabled/account mismatch)".into(),
         ));
     }
 
@@ -256,9 +269,30 @@ mod tests {
 
     #[test]
     fn validate_excludes_draft_and_disabled() {
-        assert!(validate_card_sendable(&card(true, "approved", vec![])));
-        assert!(!validate_card_sendable(&card(false, "approved", vec![])));
-        assert!(!validate_card_sendable(&card(true, "draft", vec![])));
+        assert!(validate_card_sendable(&card(true, "approved", vec![]), "acct"));
+        assert!(!validate_card_sendable(&card(false, "approved", vec![]), "acct"));
+        assert!(!validate_card_sendable(&card(true, "draft", vec![]), "acct"));
+    }
+
+    #[test]
+    fn validate_card_account_scope() {
+        // global 卡（account_id=None）→ 任何 account 可用（行为不变，与候选 DB filter $or:[null,...] 一致）。
+        assert!(validate_card_sendable(&card(true, "approved", vec![]), "acct_A"));
+        assert!(validate_card_sendable(&card(true, "approved", vec![]), "acct_B"));
+
+        // 绑定 acct_A 的卡：只有 acct_A 可用，acct_B 拒（KE-03 核心：跨账号不可推）。
+        let mut bound = card(true, "approved", vec![]);
+        bound.account_id = Some("acct_A".to_string());
+        assert!(validate_card_sendable(&bound, "acct_A"), "本账号卡须放行");
+        assert!(
+            !validate_card_sendable(&bound, "acct_B"),
+            "绑定 acct_A 的卡不得经 acct_B 会话推出(KE-03 跨账号防护,回退即红)"
+        );
+
+        // account 门与 enabled/approved 门叠加：绑定卡即使 account 匹配,draft/disabled 仍拒。
+        let mut bound_draft = card(false, "draft", vec![]);
+        bound_draft.account_id = Some("acct_A".to_string());
+        assert!(!validate_card_sendable(&bound_draft, "acct_A"));
     }
 
     #[test]
@@ -269,7 +303,7 @@ mod tests {
             card(true, "approved", vec![]),          // 空 = 总命中
             card(false, "approved", vec!["意向"]),  // 排除：disabled
         ];
-        let kept = filter_referral_candidates(&all, Some("意向"));
+        let kept = filter_referral_candidates(&all, Some("意向"), "acct");
         assert_eq!(kept.len(), 2);
     }
 
