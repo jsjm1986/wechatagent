@@ -588,6 +588,11 @@ pub struct Campaign {
     pub target_count: Option<i64>,
     #[serde(default)]
     pub dispatched_count: i64,
+    /// KC-06：最近一次 dispatch 的粗筛命中人数（回刷）。与 dispatched_count（本次去重后
+    /// 新入队数）区分——两者差 = 去重跳过数，消除"targetCount 三义"误导。旧文档缺此字段
+    /// serde 补 None（无破坏，Campaign 无 deny_unknown_fields）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_dispatch_target_count: Option<i64>,
     pub created_by: String,
     pub created_at: DateTime,
     pub updated_at: DateTime,

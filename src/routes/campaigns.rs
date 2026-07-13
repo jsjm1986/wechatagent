@@ -250,6 +250,7 @@ pub async fn create_campaign(
         status: "draft".to_string(),
         target_count: None,
         dispatched_count: 0,
+        last_dispatch_target_count: None,
         created_by: admin.username.clone(),
         created_at: now,
         updated_at: now,
@@ -445,7 +446,12 @@ pub async fn dispatch_campaign(
         .campaigns()
         .update_one(
             doc! { "_id": oid, "workspaceId": &admin.current_workspace },
-            doc! { "$set": { "status": "completed", "dispatchedCount": dispatched, "updatedAt": DateTime::now() } },
+            doc! { "$set": {
+                "status": "completed",
+                "dispatchedCount": dispatched,
+                "lastDispatchTargetCount": hits.len() as i64,
+                "updatedAt": DateTime::now(),
+            } },
             None,
         )
         .await?;
@@ -684,6 +690,8 @@ struct CampaignListItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     target_count: Option<i64>,
     dispatched_count: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_dispatch_target_count: Option<i64>,
     created_by: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     created_at: Option<String>,
@@ -697,6 +705,7 @@ impl From<&Campaign> for CampaignListItem {
             status: c.status.clone(),
             target_count: c.target_count,
             dispatched_count: c.dispatched_count,
+            last_dispatch_target_count: c.last_dispatch_target_count,
             created_by: c.created_by.clone(),
             created_at: crate::models::dt_to_string(c.created_at),
         }
@@ -834,6 +843,7 @@ mod tests {
             status: "draft".to_string(),
             target_count: None,
             dispatched_count: 0,
+            last_dispatch_target_count: None,
             created_by: "admin".to_string(),
             created_at: now,
             updated_at: now,
@@ -1121,6 +1131,7 @@ mod tests {
             status: "completed".to_string(),
             target_count: Some(500),
             dispatched_count: 470,
+            last_dispatch_target_count: None,
             created_by: "admin".to_string(),
             created_at: now,
             updated_at: now,

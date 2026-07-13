@@ -91,6 +91,7 @@ fn make_campaign(ws: &str, acc: &str) -> Campaign {
         status: "draft".to_string(),
         target_count: None,
         dispatched_count: 0,
+        last_dispatch_target_count: None,
         created_by: "camp_admin".to_string(),
         created_at: now,
         updated_at: now,
@@ -332,4 +333,43 @@ async fn preview_succeeds_at_exactly_max() {
     .await
     .expect("正好等于上限应成功");
     assert_eq!(resp.0["targetCount"].as_i64(), Some(3), "targetCount 应为 3");
+}
+
+/// KC-06：dispatch 成功后回刷 lastDispatchTargetCount == 本次命中人数，与 dispatchedCount
+/// （去重后新入队数）区分，消 targetCount 三义误导。
+#[tokio::test]
+#[ignore]
+async fn dispatch_backfills_last_dispatch_target_count() {
+    let app = TestApp::start().await;
+    let ws = app.state.config.default_workspace_id.clone();
+    let acc = app.state.config.default_account_id.clone();
+    let campaign = make_campaign(&ws, &acc);
+    let cid = campaign.id.unwrap();
+    app.state.db.campaigns().insert_one(&campaign, None).await.expect("seed campaign");
+    app.state.db.contacts().insert_one(make_contact(&ws, &acc, "wx_x"), None).await.expect("seed wx_x");
+    app.state.db.contacts().insert_one(make_contact(&ws, &acc, "wx_y"), None).await.expect("seed wx_y");
+
+    let _ = dispatch_campaign(
+        State(app.state.clone()),
+        Extension(test_admin(&ws)),
+        Path(cid.to_hex()),
+    )
+    .await
+    .expect("dispatch 应成功");
+
+    // 类型化读回 Campaign，断言回刷字段。
+    let reloaded = app
+        .state
+        .db
+        .campaigns()
+        .find_one(doc! { "_id": cid }, None)
+        .await
+        .expect("query campaign")
+        .expect("campaign exists");
+    assert_eq!(
+        reloaded.last_dispatch_target_count,
+        Some(2),
+        "命中 2 人应回刷 lastDispatchTargetCount=2"
+    );
+    assert_eq!(reloaded.dispatched_count, 2, "首次全新命中 dispatchedCount=2");
 }
