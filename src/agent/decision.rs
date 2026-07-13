@@ -476,11 +476,6 @@ pub(crate) async fn decide_reply_with_promote(
     } else {
         String::new()
     };
-    let runtime_text = if include_business {
-        serde_json::to_string(&runtime.as_document()).unwrap_or_default()
-    } else {
-        String::new()
-    };
     let knowledge_text = if include_business {
         format_operation_knowledge_for_prompt_with_roles(knowledge_chunks, &active_profile.chunk_roles)
     } else {
@@ -539,11 +534,6 @@ pub(crate) async fn decide_reply_with_promote(
             "nextAction": memory.next_action.clone()
         })
         .unwrap_or_default()
-    } else {
-        String::new()
-    };
-    let memory_card_text = if include_relational {
-        serde_json::to_string(context_pack).unwrap_or_default()
     } else {
         String::new()
     };
@@ -850,13 +840,7 @@ pub(crate) async fn decide_reply_with_promote(
 运营状态机:
 {}
 
-硬运行参数:
-{}
-
 长期运营记忆:
-{}
-
-长期记忆卡片:
 {}
 
 最近 5 条已弃用记忆（不要再引用，仅供识别变化）:
@@ -922,9 +906,7 @@ pub(crate) async fn decide_reply_with_promote(
         playbook_text,
         domain_text,
         state_machine_text,
-        runtime_text,
         memory_text,
-        memory_card_text,
         serde_json::to_string(&deprecated_facts_recent).unwrap_or_default(),
         safety_donts_commitments_text,
         knowledge_text,
