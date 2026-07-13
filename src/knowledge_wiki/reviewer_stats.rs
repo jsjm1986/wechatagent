@@ -46,6 +46,12 @@ impl ReviewerStatsReport {
 
 /// 单 workspace 单轮聚合。N 天窗口由 caller 透传，默认 14d。
 /// 纯 mongo count + 一次 upsert，不发 LLM 调用，廉价；每轮都跑。
+///
+/// ⚠️ **workspace 级聚合（刻意，就绪债 KB-12）**：本函数按 workspace_id 聚合、
+/// stat_id=`{workspace_id}::reviewer`（一 workspace 一行），**不带 account_id 维度**
+/// ——与 outcome_metrics / outcomes_autonomy 的 (workspace_id, account_id) 双维不同。
+/// reviewer 的 prompt/model 是 workspace 级属性，故度量刻意做 workspace 级。若未来
+/// 一 workspace 多账号成常态需按账号切,再加 account 维度对齐另两端点。
 pub async fn aggregate_reviewer_stats_for_workspace(
     state: &AppState,
     workspace_id: &str,
