@@ -1,30 +1,41 @@
 //! Run Envelope 模块（agent-autonomy-loop W1 / Task 2.4）。
 //!
-//! 本模块负责 [`AgentRunLog`] 的 R0 Run Envelope 生命周期：
+//! 本模块提供 [`AgentRunLog`] 的 R0 Run Envelope 生命周期原语。
+//!
+//! ⚠️ **接线状态（2026-07-13 核实）：R0 生命周期三函数在生产未接线。**
+//! 下述 `write_run_envelope_started` / `update_run_envelope_terminal` /
+//! `install_panic_hook_for_envelope` 均已实现并有集成测覆盖
+//! （`tests/run_envelope_integration.rs`，4 条不变量，`#[ignore]` / CI 跑），
+//! 但**没有任何生产调用点**：gateway 仍走单次 `insert_one` 的
+//! `write_agent_run_log_with_finalize`（`src/agent/gateway.rs`），并未先写
+//! `lifecycle="started"` 信封。因此「决策产出前 panic / 超时」的 run 目前
+//! **不留** started 信封，R0.1 的 pre-LLM 可追溯不变量在生产**尚未生效**。
+//! 对「决策已产出」的 run，单次 insert 的追溯是完整的；缺口仅限决策前的
+//! 极端 run。三函数保留备将来接线（见下方各自 doc 的接入设想），本模块的
+//! 其余常量 / 纯函数（`FINAL_REVIEW_STATUS_VALUES` / `SOURCE_KIND_*` /
+//! `derive_lifecycle_from_status` 等）已被 gateway / cohort / replay /
+//! observability 正常使用，不受此接线状态影响。
 //!
 //! * [`write_run_envelope_started`]：在任何 LLM 调用之前 `insert_one` 一条
 //!   `lifecycle="started"` 的信封记录，确保即使 Reply Agent 超时 / panic /
-//!   JSON 解析失败也有可追溯条目（requirements.md R0.1 / R0.5）。
+//!   JSON 解析失败也有可追溯条目（requirements.md R0.1 / R0.5）。**未接线。**
 //! * [`update_run_envelope_terminal`]：用 `update_one({run_id}, $set)` 落终态字段；
 //!   `matched_count == 0` 时走单次 `insert_one` 兜底 + 写
-//!   `agent_events kind="run_envelope_recovered_via_insert"`（R0.2）。
+//!   `agent_events kind="run_envelope_recovered_via_insert"`（R0.2）。**未接线。**
 //! * [`install_panic_hook_for_envelope`]：注册全局 `std::panic::set_hook`，把
 //!   panic message + location 通过 `tracing::error!` 输出。**实际的 lifecycle
-//!   推进**仍然在 W1 task 2.5 的 `catch_unwind` 包装层完成（panic hook 不能直接
-//!   调 async update_one；强行 spawn 会有 panic-in-panic 风险）。
+//!   推进**需在 `catch_unwind` 包装层完成（panic hook 不能直接调 async
+//!   update_one；强行 spawn 会有 panic-in-panic 风险）。**未接线。**
 //!
-//! 使用顺序（W1 task 2.5 接入）：
+//! 将来接线设想（尚未落地）：
 //! ```text
 //! write_run_envelope_started(&db, &run_id, ..).await?;
 //! let result = std::panic::catch_unwind(|| run_pipeline()).unwrap_or_else(|_| failed_terminal());
 //! update_run_envelope_terminal(&db, &run_id, build_terminal_fields(&result)).await?;
 //! ```
-//!
-//! 与现有 `write_agent_run_log`（`src/agent/gateway.rs`）的关系：
-//! 现阶段（W1 task 2.4）`write_agent_run_log` 仍走 `insert_one` 直接落最终
-//! 字段；W1 task 2.5 会把 gateway 入口改为先调 [`write_run_envelope_started`]、
-//! 主流程结束（含错误路径）调 [`update_run_envelope_terminal`]，从此告别
-//! 多次 insert 引发的 DuplicateKey 风险。
+//! 接线后 gateway 入口先调 [`write_run_envelope_started`]、主流程结束（含错误
+//! 路径）调 [`update_run_envelope_terminal`]，即可告别多次 insert 引发的
+//! DuplicateKey 风险。
 
 use std::sync::{Arc, Once};
 
