@@ -81,7 +81,7 @@ inbound `insert_one`（:515-521）fail-close 不动；contact `find_one`/`upsert
     ))
 ```
 
-`emit_unknown_app_id_event`（:1010-1013）"无 appId"事件文案保持——单账号回落时仍记录"缺 appId 按 default 处理"；多账号 400 时 handler（:325-329 BadRequest 分支）已 emit 该事件后再 400。
+`emit_unknown_app_id_event`（:1031-1058）仅在 `resolve_account_context` 返 `BadRequest` 时被 handler（:325-329 BadRequest 分支）调用。改前无 appId 恒返 Ok → 该函数的 `None` 分支是死路径；A-05 新增的多账号 400 激活它——故 `None` 分支文案须反映"多账号无法判归属、已拒收"（不能沿用旧的"已按 default account 处理"，那与 rejected 状态矛盾）。单账号无 appId 返 Ok、不进 BadRequest 臂、不写此事件。
 
 ### A-03 / A-04 —— doc 标注（不改逻辑）
 

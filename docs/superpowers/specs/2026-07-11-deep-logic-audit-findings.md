@@ -109,7 +109,7 @@
 - 复现设想: `WEBHOOK_VERIFY_SIGNATURE=false` 下灌一条无 appId 的 payload。观察落到 default_account_id。**生产默认 verify=true（`config.rs:704`）**，None appId → secret=None → 400，天然挡住。风险仅存于显式关闭验签的部署。
 - 验证状态: PLAUSIBLE（读码）
 - 修复建议: 生产默认配置已 fail-closed。可考虑：无 appId 时无条件 400（不回退 default），彻底消除该路径。属加固项，非现网 bug。
-- 状态: Open
+- 状态: Fixed（家族⑧ #待补 —— resolve_account_context 无 appId 分支收敛：仅 verify=false 且多账号时 400，单账号仍回落 default 不打断单账号部署）
 
 ### [A-06] `last_inbound_at` 更新或 inbound 写入的瞬时 DB 错误使本条消息在下一条到来前不被回复
 - 入口频道: userOps
@@ -121,7 +121,7 @@
 - 复现设想: 注入 Mongo 瞬时错误于 contacts.update_one。难在生产安全构造，不建议真跑。
 - 验证状态: PLAUSIBLE（读码）
 - 修复建议: 可考虑把 `last_inbound_at` 时间戳更新降级为 best-effort（失败只 warn，不拦 spawn），与 `collect_inbound_behavior_signals`（:570 已是 best-effort）对齐——时间戳落库失败不应连累应答。属小加固。
-- 状态: Open
+- 状态: Fixed（家族⑧ #待补 —— last_inbound_at/last_message_at/updated_at 统计 update 降 best-effort，失败仅 warn；inbound insert_one 的 fail-close 保持不动）
 
 ### 已知非本轮 bug 的架构约束（记录留痕，不入 finding）
 

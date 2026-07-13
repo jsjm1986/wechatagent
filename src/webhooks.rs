@@ -1033,7 +1033,9 @@ async fn resolve_account_context(
 async fn emit_unknown_app_id_event(state: &AppState, app_id: Option<&str>) -> AppResult<()> {
     let summary = match app_id {
         Some(id) => format!("webhook 入站 appId={id} 在 wechat_accounts 中未注册，已拒收"),
-        None => "webhook 入站缺失 appId 字段，已按 default account 处理".to_string(),
+        // A-05：此事件仅在 resolve_account_context 返 BadRequest 时写。无 appId 走到 BadRequest
+        // 只有一种情形——未开验签 + 多账号（单账号无 appId 会回落 default 返 Ok、不进本事件）。
+        None => "webhook 入站缺失 appId 字段且存在多个账号，无法判断归属，已拒收".to_string(),
     };
     let _ = state
         .db
