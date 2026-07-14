@@ -48,12 +48,24 @@
 
 ---
 
-## 环节汇总（收尾时填）
+## 环节汇总
 
-- 总 findings 数：（待填）
-- 严重度分布：H / M / L（待填）
-- 越权类元家族归纳：（待填）
-- 后续 P0-P3 修复路线建议：（待填）
+- **总 findings 数：17**（簇S 3 / 簇1 3 / 簇2 4 / 簇3 3 / 簇4 2 / 簇5 2）
+- **严重度分布：0 High / 2 Medium / 15 Low**
+  - **Medium（2）**：[1-01] enable_agent account 存在性校验漏 workspace（跨租户存在性读，无 PII 无写）；[4-01] taxonomy 一族 7 handler 零 workspace/scope 隔离（可跨租户改共享枚举字典，非 PII）。**两条均单租户默认不可达 = 多租户就绪债**。
+  - **Low（15）**：S-01/S-02/S-03（根因层纵深+sentinel fail-open+撤权滞后）、1-02/1-03（客户写 filter 纵深）、2-01/2-02/2-03/2-04（配置写 filter 纵深 + tool_catalog 无归属）、3-01（4 端点 account_id 未 validate_account 自限）/3-02（ask-human taxonomy 池）/3-03（chunk 软锁）、4-02（观测二级 filter 纵深）、5-01（chunk_revisions 聚合无 workspace）/5-02（chat SSE 无 workspace 校验）。
+- **核心正向结论（主控逐条亲验）**：①认证链干净（middleware.rs:36-90 双路径+TTL+白名单三条）②#153 IDOR 收口仍守住 ③**任务最担心的「指标 list/聚合端点跨 workspace 泄漏」零命中**（behavior_signal_metrics/outcome_metrics/events/outcomes_autonomy/observability/evolution 所有 `$match` 全含 workspace_id）④凭证泄漏面干净（llm_providers api_key 恒 mask、accounts 只回 mcpKeyConfigured 布尔）⑤knowledge 写端点全经 apply_chunk_revision 双端复合锁。**无推荐配置（单租户默认）下确定性可达的跨 workspace/account 越权读写或认证绕过。**
+- **越权类元家族归纳**：
+  1. **写 filter 不复述 workspace_id 的纵深缺口（S-01 族，最普遍）**：S-01/1-02/1-03/2-01/2-02/2-03/4-02 全同型——按 _id 写/重读的 filter 只 `{_id}`，靠上游 workspace-locked find_one 兜底。当前全不可利用（读门兜住），是回归护栏缺失。find_contact_by_id/domain_schemas.rs 是「写 filter 独立复述 workspace_id」的模范姿势。
+  2. **taxonomy 一族无 workspace 字段的策略型债（3-02+4-01 同根因）**：TaxonomyEntry/TaxonomyCandidate 模型层无 workspace_id、隔离靠 scope=global|account_id，两处注释亲证有意接受（无 RBAC 定义「谁可改全局字典」）。跨簇重复=同一根因，已在 4-01 归并留痕。
+  3. **account_id 输入未校验归属但被 workspace 兜住（3-01+2-04+1-01 相关）**：脏 account_id 因 workspace_id 恒会话注入而自限，唯 1-01 因「存在性判定」独立触及跨租户（故 Medium），其余仅死作用域/工具名清单（Low）。
+  4. **sentinel/撤权滞后（S-02/S-03）**：空 user_id 跳 ACL + session/JWT 有效期内撤权不即时——多租户动态授权才有意义。
+- **后续 P0-P3 修复路线建议**：
+  - **无 High → 本批不抢占第一批遗留 5 个 Medium 的优先级**（第一批 A-01/A-02/A-03/C-01/C-02 仍是下一波修复首选）。
+  - **P2（多租户启用前必修）**：1-01（account 存在性校验补 workspace_id，一行改动）+ 4-01/3-02（taxonomy 隔离，需产品裁决是否引 RBAC + 模型补 workspace_id，大改）。
+  - **P3（纵深护栏批量补齐，一个 PR 收口）**：元家族 1 的全部 Low（S-01/1-02/1-03/2-01/2-02/2-03/4-02 写 filter 复述 workspace_id）+ 5-01/5-02（knowledge 多租户聚合/SSE 补 workspace）+ 2-04（tool_catalog validate_account）+ 3-01（4 端点 validate_account）+ 3-03（chunk 软锁 workspace 校验）。
+  - **就绪债留痕不修**：S-02/S-03（sentinel/撤权，多租户动态授权模型确立时再议）。
+- **与既有 memory 一致性**：全部隔离缺陷符合 project_multitenant_isolation_debt「多租户默认关、单租户无害、启用才需加固」口径；taxonomy 债与第一批 D-08 同型（显式文档化接受取舍），但因**可写**跨租户改字典故标 Medium 待裁决而非 WontFix。
 
 ---
 
