@@ -88,7 +88,7 @@ mod reviews;
 mod shared;
 mod simulations;
 mod souls;
-mod tasks;
+pub mod tasks;
 
 pub use outcomes_autonomy::{
     get_autonomy_outcomes, list_autonomy_revisions, AutonomyMetricsQuery, AutonomyRevisionsQuery,

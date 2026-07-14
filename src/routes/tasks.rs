@@ -165,7 +165,7 @@ pub(super) async fn list_llm_usage(
     })))
 }
 
-pub(super) async fn review_task_now(
+pub async fn review_task_now(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Extension(admin): Extension<AuthenticatedAdmin>,
@@ -180,15 +180,41 @@ pub(super) async fn review_task_now(
         )
         .await?
         .ok_or_else(|| AppError::NotFound("task not found".to_string()))?;
-    state
+    // W-Batch3 [S-01]/[S-02]：原子 CAS claim，与 worker tick 的 claim（tasks.rs
+    // `{_id, status:&task.status}`）对称。缺 CAS 时 admin「立即复核」会与串行 worker
+    // 已 claim 的同一任务并发跑第二份 handler（S-01 双跑/双发）；缺 `claimed_at` 时
+    // handler 失败停 running 落入 reclaim 双分支盲区（分支A `claimed_at < stale` 不匹配
+    // 缺失字段、分支B `$exists:false` 不匹配 null-present）本进程永不回收（S-02）。
+    //
+    // filter 只认可复核态（pending/retry/failed）——排除 running（worker/他人正跑）与
+    // 终态 sent/completed/cancelled（绝不重跑已发送/已了结的任务）。claim 成功后写
+    // `claimed_at` 让 handler 失败后能被 `reclaim_stale_running_tasks` 分支A 兜回。
+    let claim_now = DateTime::now();
+    crate::models::assert_agent_task_status_valid("running");
+    let claim = state
         .db
         .tasks()
         .update_one(
-            doc! { "_id": object_id, "workspace_id": &admin.current_workspace },
-            doc! { "$set": { "status": "running", "updated_at": DateTime::now() } },
+            doc! {
+                "_id": object_id,
+                "workspace_id": &admin.current_workspace,
+                "status": { "$in": ["pending", "retry", "failed"] },
+            },
+            doc! {
+                "$set": {
+                    "status": "running",
+                    "updated_at": claim_now,
+                    "claimed_at": claim_now,
+                }
+            },
             None,
         )
         .await?;
+    if claim.modified_count == 0 {
+        return Err(AppError::Conflict(
+            "任务正在运行或已完成，无法立即复核".to_string(),
+        ));
+    }
     if task.kind == "memory_consolidation" {
         agent::handle_memory_consolidation_task(&state, task).await?;
     } else {
