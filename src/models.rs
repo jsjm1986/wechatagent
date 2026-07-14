@@ -3805,7 +3805,7 @@ mod typed {
         #[serde(default = "defaults::run_token_budget")]
         pub run_token_budget: i64,
         /// B-1 修复：progressive-tier 升档(Lean→Full)的 run 的 token gating 上限。
-        /// 升档触发两程 reply.task,base run_token_budget(30000)容不下,此值放宽升档路径。
+        /// 升档触发两程 reply.task,base run_token_budget(150000)容不下,此值放宽升档路径。
         #[serde(default = "defaults::run_token_budget_escalated")]
         pub run_token_budget_escalated: i64,
         #[serde(default = "defaults::run_max_llm_calls")]
@@ -3961,16 +3961,16 @@ mod typed {
             4
         }
         pub fn run_token_budget() -> i64 {
-            30000
+            150000
         }
         pub fn run_token_budget_escalated() -> i64 {
-            100000
+            500000
         }
         pub fn run_max_llm_calls() -> i32 {
             6
         }
         pub fn simulation_token_budget() -> i64 {
-            60000
+            300000
         }
         pub fn reaction_token_budget() -> i64 {
             8000
@@ -5066,7 +5066,7 @@ mod typed_tests {
         assert_eq!(p.hallucination_block_at, 6);
         // C1：pressure_risk_block_at 缺字段默认 7（DEFAULT 逐字等价旧写死值）。
         assert_eq!(p.pressure_risk_block_at, 7);
-        assert_eq!(p.run_token_budget, 30000);
+        assert_eq!(p.run_token_budget, 150000);
         assert_eq!(p.run_max_llm_calls, 6);
     }
 
@@ -5116,8 +5116,8 @@ mod typed_tests {
     fn runtime_parameters_typed_escalated_budget_default() {
         let p: RuntimeParametersTyped =
             mongodb::bson::from_document(doc! {}).expect("default deserialize");
-        assert_eq!(p.run_token_budget_escalated, 100000);
-        assert_eq!(typed::defaults::run_token_budget_escalated(), 100000);
+        assert_eq!(p.run_token_budget_escalated, 500000);
+        assert_eq!(typed::defaults::run_token_budget_escalated(), 500000);
     }
 
     #[test]
