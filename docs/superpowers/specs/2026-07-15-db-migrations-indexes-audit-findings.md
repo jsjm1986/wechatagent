@@ -100,7 +100,21 @@
 
 ## B 组 findings（数据变形迁移）
 
-（主控亲验后填入）
+> 逐条主控亲验 m001/m002/m005/m008/m016/m018/m022/m025/m027/m029/m030/m031，**无 finding**——幂等 filter 逐条真挡二次执行、回填口径正确、$set 只补缺失不误覆盖运营值。下列为正向 HOLDS。
+
+**B 组正向 HOLDS（主控逐条亲验 file:line）：**
+- **m001 backfill last_inbound_at**（`m001:20-35`）：filter `last_message_at 存在非null AND last_inbound_at 缺失/null`，pipeline `$set last_inbound_at=$last_message_at` 靠 filter 兜住，二次执行 filter 不命中 → 幂等。
+- **m002 activeFacts 拆分**（`m002:12-42`）：aggregation `$slice[.,6]`(coreFacts) + `$slice[.,6,10000]`(recentFacts) + `$unset activeFacts`；filter `activeFacts:{$exists:true}` 二次不命中；coreFacts 保留 legacy `Vec<String>` 兼容（CLAUDE.md R11）→ 幂等。
+- **m005 fact 结构化**（`m005:26-92`）：复用 helpers `upgrade_fact_array`（按元素含 `id` 字段判定，已结构化跳过）；fresh UUIDv4 + `$inc memory_card_version`；`!core_changed && !recent_changed → continue` 门控空写 → 幂等。
+- **m008 commitments reshape**（`m008:16-49`）：`last_commitment:Option<String>` → `commitments:[{id,text,createdAt}]` + `$unset`；filter `commitments:{$exists:false}` 二次不命中；`$cond` 处理 missing/null/空串 → 幂等。
+- **m016 workspace_id 回填**（`m016:95-143`）：`$exists:false → $set default_ws`，snake/camel 双表；**三单测审计基准兜底**（SNAKE/CAMEL 表 ⊆ 已核实全集、两表不相交、MUST_NOT_BACKFILL 排除 admin_users/chunk_revisions），防拼错/归错类；APP_ENV=production 守卫（warn+Ok noop）→ 幂等 + 有守卫。
+- **m018 顶层残留→domain_attributes**（`m018:31-80`）：`$mergeObjects([顶层字段..., $ifNull($domain_attributes,{})])` 现有 domain 值在末位覆盖（新覆旧），只回填不 $unset（可逆）；三纯函数单测覆盖；二次 domain 已有 key 结果不变 → 幂等 + 不误覆盖。
+- **m022 dormant/churned allowFromAny**（`m022:16-56`）：只对 key∈{dormant,churned} 且 `allowFromAny` 缺失/false 时 `$set true`，`changed` 门控空写 → 幂等 + 只补不覆盖。
+- **m025/m027 契约字段回填**（`m025:14-22`/`m027:14-32`）：`ask_human_policy`→"default"、`trust_level`→"normal"、`authorized_topics`→[]，均 `$exists:false` 命中 → 幂等，无守卫（语义保持型回填，正确）。
+- **m029 运营池身份清理**（`m029:22-105`，唯一含删除的数据变形）：删 `agent_status:normal 且 !is_operatable_person(wxid)`（删条件双重限定 normal），**managed 一律保留**；roster 回填 nickname/avatar_url；Demi 误名清 None。**有意无 APP_ENV 守卫**（注释:9-10 明示修 webhook 建档 bug 的存量清理需全环境生效，只删「本不该进池的非真人 normal 行」非业务数据）；不删 conversation_messages；幂等 → 合理。
+- **m030 老成交 outcome 默认**（`m030:19-53`）：`deal_verification`→"unverified"、`outcome_event_kind`→"deal_closed"，仅对 `lifecycle_stage=deal_won 或 deal_closed_at 存在` 的成交 contact + `$exists:false` → 幂等。
+- **m031 escalation last_pushed_at_ms**（`m031:30-42`）：`$toLong($created_at)` 回填（旧口径字节等价），纯函数+单测，语义保持型无守卫（注释:8-9 明示误加守卫会致生产静默 SKIP）→ 幂等。
+- **helpers 三纯函数**（`helpers.rs:14-141`）：`merge_allowed_from_defaults`/`merge_state_flag_defaults` 只补缺失不覆盖 + `changed` 门控空写；`upgrade_fact_array` 按 `id` 字段判定幂等；4 单测覆盖「不覆盖运营值」「已完整时不空写」「false 默认不落库」→ 全 HOLDS。
 
 ## C 组 findings（seed/drop 迁移）
 
