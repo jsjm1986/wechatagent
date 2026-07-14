@@ -77,7 +77,66 @@
 
 ## 簇 S findings（演化根因层）
 
-（主控亲验后填入）
+> 4 findings（0 High / 1 Medium / 3 Low）。主控逐条 Read/Grep 亲验：S-01 门语义分叉 CONFIRMED（`runtime_flag.rs:90 Ok(None)=>false` vs `cohort.rs:65,103-108 None=全量收`，`evolution_runtime_flags` 无启动 seed → 唯一写点 `routes/evolution.rs:616` admin PUT + m016 是 backfill 非 seed）；S-02/S-03/S-04 均 Low 就绪债。subagent 本簇未夸大（唯一 Medium 定级恰当，未误标 High）。
+
+### [S-01] runtime_flag=None 被 cohort 当「全量收」，与文档声称的「全员排除」相反 → 默认部署演化跑全流量而非灰度桶
+- 入口: `run_one_tick` → `select_cohorts_filtered`（`src/evolution/mod.rs:106-117` + `src/evolution/cohort.rs:61-108`）
+- 所属簇: S
+- 类型: 一致性(门语义分叉)|fail-safe 反向
+- 严重度: **Medium**（主控裁定：默认部署 EVOLUTION_ENABLED=true + runtime_flag 文档未 seed 下**确定性可达**——演化器对全量 completed run 选 cohort 产 proposal，非设计意图的灰度桶/None→全排除。但产出一律推 `awaiting_admin`，auto_release 双闸默认全关，**不会自动改生产 prompt/threshold**。故不构成「绕过 admin 自动放量」的 High；实际后果=灰度 fail-safe 网默认失效 + 演化拿全流量样本 + LLM 预算按全量消耗，有 admin 兜底 → Medium）
+- 现象/风险: 运维依 `mod.rs:101-105`/`runtime_flag.rs:29-31` 注释以为「不配 mongo flag=演化不选样本」，实际对全部客户对话产 proposal；mongo 抖动读失败同样落 None→全量收，`mod.rs:105` 注释「避免 mongo 抖动让灰度门误开」未兑现。
+- 失效链: `load_runtime_flag` 文档不存在/读失败 → `Ok(None)`/warn→None（`mod.rs:106-112`）→ `select_cohorts_filtered(..., None)` → `cohort.rs:103 if let Some(flag)` 为 None 时跳过整个桶过滤，全量入 `threshold_pool`（`cohort.rs:104-109`）。
+- 根因（亲验 file:line）:
+  - `src/evolution/cohort.rs:64-65` 文档「`None` 等价于"不过滤、全量收"，保持 W1 行为」。
+  - `src/evolution/cohort.rs:103-108` `if let Some(flag) = runtime_flag { ... continue; }`——None 时不进过滤分支。
+  - `src/evolution/mod.rs:101-105` 注释矛盾：「`enabled=false` 或文档不存在 → 全员排除」。
+  - 对照 `src/evolution/runtime_flag.rs:88-90` `is_evolution_enabled_for` 里 `Ok(None) => false`（正确排除）——两函数 None 语义分叉。
+  - `evolution_runtime_flags` 无启动 seed：唯一写点 `routes/evolution.rs:616` admin PUT upsert；m016（`m016_backfill_workspace_id_on_legacy_rows.rs:65,192`）是给已有行 backfill workspace_id 的迁移，集合空时无操作，非 seed。
+- 复现设想: 全新部署，不调 `PUT /api/evolution/runtime-flag`；窗口内积累 ≥30 条 completed run；一次 tick 后 `experiments.cohort_threshold_run_ids` 含全部客户 run（未按桶过滤），`proposals` 出现 awaiting_admin 候选。
+- 验证状态: **CONFIRMED**（代码路径 + 无 seed 双证默认可达；无自动放量后果亦亲验）
+- 修复建议: 二选一——(a) 把 `select_cohorts_filtered` 的 `None` 语义改「全员排除」（与 `is_evolution_enabled_for` 及 mod.rs 注释对齐），未配 flag 的 workspace 跑空 tick（推荐，与 kill-switch 语义一致、保守）；或 (b) 保留 W1「全量收」则修正 `mod.rs:101-105`/`runtime_flag.rs:29-31` 注释，并评估默认全量选样本对 LLM 预算与样本隐私面的影响。
+- 状态: Open
+
+### [S-02] config.rs:212 注释声称 evolution_enabled 安装态默认 false，与真实默认 true 矛盾（stale 注释误导运维）
+- 入口: `AppConfig`（`src/config.rs:210-217`）
+- 所属簇: S
+- 类型: 就绪债(文档/代码漂移)
+- 严重度: **Low**（主控裁定：纯注释与代码常量矛盾，无运行时后果；但误导运维对「默认是否跑演化」的判断，与 S-01 叠加放大误解）
+- 现象/风险: `config.rs:212` 写「`evolution_enabled=false` 是安装态默认」，实际 `EVOLUTION_ENABLED_DEFAULT="true"`（`config.rs:7`）+ 测试锁死 true（`config.rs:781-783`）；且同段 `config.rs:215` 字段 doc 又说「默认 true（允许）」——同段内自相矛盾。
+- 失效链: —（纯文档）
+- 根因（亲验 file:line）: `src/config.rs:7 ="true"`；`src/config.rs:212` 注释 `=false 是安装态默认`；`src/config.rs:215-216` 字段 doc `默认 true（允许）`；`src/config.rs:781-783 assert_eq!(EVOLUTION_ENABLED_DEFAULT,"true")`。取 :7/:782/:215 为真，:212 为 stale。
+- 复现设想: N/A（静态矛盾）
+- 验证状态: CONFIRMED
+- 修复建议: 删/改 `config.rs:212` 那句，与 `config.rs:215-216` 字段 doc 统一为「默认 true=允许 UI 开演化中心；false=运维硬锁定」。
+- 状态: Open
+
+### [S-03] 隔离 lint 用路径字符串子串匹配，grouped import 形态可绕过（当前无违规）
+- 入口: `scripts/check-evolution-isolation.sh`（`FORBIDDEN_PATTERNS`，`:33-42`）
+- 所属簇: S
+- 类型: 就绪债(lint 健壮性)|隔离红线
+- 严重度: **Low**（主控裁定：lint 靠 `grep -E 'crate::agent::gateway'` 等连续字符串子串；`use crate::agent::{gateway, outbox}` 形态不含该连续子串可规避。但 Grep 亲验当前 evolution 目录无任何 grouped import，实际未被绕过 → 无现存后果，纯防御纵深债）
+- 现象/风险: 未来若有人以 grouped import 引入 gateway/outbox/mcp，CI lint 可能漏报，破隔离红线不被拦。
+- 失效链: 仅「有人主动用 grouped import 写破红线代码」时；正常单符号 import 全被覆盖。
+- 根因（亲验 file:line）: `scripts/check-evolution-isolation.sh:33-42` 模式为完整路径字符串，`:49-50 grep -n -E` 逐行匹配。Grep `use crate::agent::\{` on `src/evolution` → 无匹配。
+- 复现设想: 某 evolution 文件写 `use crate::agent::{gateway, budget};` → `crate::agent::gateway` 模式因中间 `{` 不命中 → 漏报。
+- 验证状态: PLAUSIBLE（规避理论成立；当前无触发实例）
+- 修复建议: lint 补 grouped import 形态（如 `crate::agent::\{[^}]*gateway`），或改用 cargo 层依赖检查（cargo-deny/模块可见性）。低优先，可与其它 lint 加固合并。
+- 状态: Open
+
+### [S-04] tick 硬编码 default_workspace_id/default_account_id — 多租户下仅演化 default 租户
+- 入口: `run_one_tick`（`src/evolution/mod.rs:88-89`）
+- 所属簇: S
+- 类型: 就绪债(多租户)
+- 严重度: **Low**（主控裁定：单进程默认单 workspace 下无害——正是唯一被演化的租户。多租户启用后其它 workspace 不被演化=功能缺失非正确性/安全问题。多租户就绪债，按校准铁律不夸 High/Medium）
+- 现象/风险: 多租户下非 default workspace/account 的 run 永不进演化 cohort，不产 proposal；auto_release 同样只扫 default（`auto_release.rs:52,65`）。
+- 失效链: 多租户部署 → 非 default 租户演化能力静默缺失。
+- 根因（亲验 file:line）: `src/evolution/mod.rs:88-89 default_workspace_id/default_account_id`；`src/evolution/auto_release.rs:52,65` 只取 default。
+- 复现设想: 配 2 workspace，非 default 的积累 run，观察其永无 experiments/proposals。
+- 验证状态: PLAUSIBLE
+- 修复建议: 多租户化时改遍历活跃 workspace（各跑独立 tick）；当前单租户不动，标记水平扩展/多租户就绪债。
+- 状态: Open
+
+**演化安全基准（喂簇1-3）**：①EVOLUTION_ENABLED 真实默认 **true**（config.rs:7），worker 默认跑起来且默认产 proposal 推 awaiting_admin——拦「自动改生产」的是 auto_release 双闸（默认全关）+ admin 二次确认，非 EVOLUTION_ENABLED。②tick 单次失败不传播（mod.rs:66-70）、EvolutionBudget 耗尽正确 silent skip（mod.rs:148-156/189-194，budget.rs:44-52 saturating+max(0)）、分桶确定性/单调性/边界全 HOLDS（runtime_flag.rs:51-68）。③隔离红线 HOLDS：CI lint 已接线（ci.yml:137-139），全目录无 gateway/outbox/mcp/发送链引用，只用只读/纯计算符号，当前无 grouped import 规避。④R9.7 禁自动回滚 HOLDS：唯一自动放量点是 threshold auto_release（双闸默认关+方向门 auto_release.rs:222-242），prompt 永远 admin 确认，无任何自动回滚。⑤簇1-3 重点核查：critic/replay 每次 LLM 调用是否 check_or_fail+record_call（预算旁路面）+ replay 是否真短路 gateway/outbox/mcp（隔离红线延伸面）+ significance 显著性判定与 min delta 门。
 
 ## 簇 1 findings（候选生成）
 
