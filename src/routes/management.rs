@@ -1370,6 +1370,31 @@ pub(super) async fn execute_management_tool(
             let note = string_arg(&planned.arguments, "humanProfileNote")
                 .or_else(|_| string_arg(&planned.arguments, "note"))?;
             let contact = resolve_contact_arg(state, workspace_id, account_id, &planned.arguments).await?;
+            // 账号不能运营自己。
+            let self_wxid = state
+                .db
+                .accounts()
+                .find_one(
+                    doc! { "workspace_id": workspace_id, "account_id": account_id },
+                    None,
+                )
+                .await?
+                .and_then(|a| a.wxid);
+            if crate::webhooks::is_self_account(&contact.wxid, self_wxid.as_deref()) {
+                let _ = agent::write_event_for_account(
+                    state,
+                    account_id,
+                    Some(&contact.wxid),
+                    "contact.enable_rejected_self",
+                    "rejected",
+                    "目标命中账号自身 wxid，拒绝纳入 AI 运营",
+                    Some(doc! { "actor": "management_tool", "source": "enable_contact_agent" }),
+                )
+                .await;
+                return Err(AppError::BadRequest(
+                    "不能对账号自身 wxid 启用 Agent 运营".to_string(),
+                ));
+            }
             let playbook_id = planned.arguments.get("playbookId").and_then(Value::as_str);
             let playbook = resolve_playbook_for_contact(state, workspace_id, account_id, playbook_id).await?;
             let generated =
@@ -1453,6 +1478,16 @@ pub(super) async fn execute_management_tool(
                 .contacts()
                 .update_one(doc! { "_id": contact.id }, update_doc, None)
                 .await?;
+            let _ = agent::write_event_for_account(
+                state,
+                account_id,
+                Some(&contact.wxid),
+                "contact.enabled_for_ops",
+                "ok",
+                "经管理工具纳入 AI 运营",
+                Some(doc! { "actor": "management_tool", "source": "enable_contact_agent" }),
+            )
+            .await;
             let updated = find_contact_by_id(state, workspace_id, &contact.id.unwrap().to_hex()).await?;
             Ok(json!({ "item": ApiContact::from(updated) }))
         }
@@ -1467,6 +1502,16 @@ pub(super) async fn execute_management_tool(
                     None,
                 )
                 .await?;
+            let _ = agent::write_event_for_account(
+                state,
+                account_id,
+                Some(&contact.wxid),
+                "contact.removed_from_ops",
+                "ok",
+                "经管理工具移出 AI 运营",
+                Some(doc! { "actor": "management_tool", "source": "disable_contact_agent" }),
+            )
+            .await;
             Ok(json!({ "ok": true }))
         }
         "wechatagent.create_follow_up_task" => {
