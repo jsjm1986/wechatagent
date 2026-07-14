@@ -46,13 +46,13 @@
 
 ## 环节汇总（收尾时填）
 
-- 总 findings 数：（TaskE 填）
-- 严重度分布：（H/M/L，TaskE 填）
-- 元家族归纳：（TaskE 填）
-- 后续 P0-P3 路线：（TaskE 填）
-- 交叉去重留痕：（TaskE 填）
-- 正向 HOLDS（主控亲验）：（TaskE 填）
-- 生产实证需求：（APP_ENV 守卫家族需查 117 migrations 集合 + APP_ENV，TaskE 填）
+- **总 findings 数：3**（A 组 1 + B 组 0 + C 组 1 + D 组 1）。
+- **严重度分布：0 High / 1 Medium / 2 Low**。唯一 Medium=[C-01] m011 清空存活集合（生产实证需求）；两 Low=[A-01] 非事务序（幂等兜底）、[D-01] gap_signals 无业务 unique（交叉第四批 [1-01]）。
+- **元家族归纳**：本批（持久层收官）主线元家族=**「破坏性/幂等/唯一性不变量的实现层对『部署配置/入账时序/集合命名』的隐性依赖」**——即前五批「声称不变量实现层有旁路/层间不对称」在持久层的收官形态。具体三支：①[C-01] 破坏性 drop 的安全性押在运行时 env 判定（AP_ENV）+ 迁移入账时序双条件，且清理迁移与存活集合**同名**（`operation_knowledge_chunks`）——env 未设 + 未入账窗口内会误删生产知识；②[A-01] step/标记非事务，安全性押在「每条 step 幂等」的契约（已逐条兑现，故无害）；③[D-01] 业务去重押在应用层 find-then-insert 而非 unique 索引（与 outbox idempotency_key/messages dedupe_key 的强幂等姿势不对称，同第四批 [1-01]）。
+- **后续 P0-P3 路线**：本批无 High。①[C-01] 优先级最高（生产数据丢失潜在面）——但**修复入口是运维动作而非代码**：生产 117 显式设 `APP_ENV=production`（一次性消解 m011/m012/m014 三迁移同类风险），叠加长期把破坏性 drop 从「运行时 env 判定」改为「一次性运维脚本+显式确认」+ legacy 集合物理改名。②[D-01] 与第四批 [1-01] 一并收口（加 `(workspace_id,chunk_id,kind,status)` partial unique）。③[A-01] 无需修（幂等契约已兑现）。整体优先级低于前六批遗留的 Batch3 High[1-01]（initial_profile 终态）仍是全局 P0。
+- **交叉去重留痕**：[D-01] ≡ 第四批 [[project-knowledge-wiki-audit]] [1-01]（同一 gap_signals 去重缺陷，第四批从写入侧标、本批从 indexes.rs 侧核实未补，不重复计入 P0-P3 只交叉标注）；[C-01] 家族含 m012（删 taxonomy seed，可 m006 重 seed 恢复）/m014（unset 已下线字段）——破坏性弱于 m011，同守卫同生产实证，归并为一条不单列。
+- **正向 HOLDS（主控亲验）**：迁移框架幂等契约 + id 唯一/时序单测 + helpers 只补不覆盖；全部 12 条数据变形迁移逐条幂等 filter 兜住二次执行 + 回填口径正确 + 不误覆盖运营值；seed 家族 8 迁移 `$setOnInsert` upsert 幂等 + 与 prompts.rs 同源 + draft 示例不激活零扰动；drop 家族 APP_ENV 守卫形态正确（warn+Ok 防 boot-brick）；indexes.rs 幂等键 unique 全覆盖（outbox idempotency_key / messages 双唯一 / tasks outcome_aggregation partial unique 替代 TOCTOU / events dedupe_key）+ TTL 不误删进行中 + ops versioned 灰度切换二次启动安全 + `$in` 禁用防 Error 67 + 执行序（先 migrations 后 indexes）安全。
+- **生产实证需求**：[C-01]/[C 组] 严重度确定性取决于生产 117 实况——需查：①`migrations` 集合是否已含 `2026_05_V3_002_drop_legacy_sales_collections`（m011）/`2026_05_V3_003`（m012）/`2026_05_W4_002`（m014）入账记录（已入账则永不重跑，历史安全）；②启动环境是否设 `APP_ENV=production`（设则守卫 noop）。二者任一成立即当前安全；均不成立才是活雷。见 [[prod-app-env-guard-migrations-risk]]。
 
 ---
 
