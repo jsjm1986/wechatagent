@@ -56,13 +56,31 @@ function extractSubstance(chunk) {
   return "";
 }
 
-// 去掉 body 里以「卡点：」开头的那一行。
+// 去掉 body 里「卡点：」段：从以「卡点：」开头的行起，删到下一个已知字段
+// （「领导裁决：」/「约束：」）或结尾之前的所有行。对多行 reason（LLM 生成的
+// 多行质检点评）健壮，不只删首行。
 function stripBlockerLine(body) {
   if (!body) return body;
-  return body
-    .split("\n")
-    .filter((line) => !line.startsWith("卡点："))
-    .join("\n");
+  const lines = body.split("\n");
+  const out = [];
+  let inBlocker = false;
+  for (const line of lines) {
+    if (line.startsWith("卡点：")) {
+      inBlocker = true;
+      continue;
+    }
+    if (inBlocker) {
+      // 遇到下一个已知字段行 → 卡点段结束，恢复保留。
+      if (line.startsWith("领导裁决：") || line.startsWith("约束：")) {
+        inBlocker = false;
+        out.push(line);
+      }
+      // 否则仍在卡点段（多行 reason 续行）→ 丢弃。
+      continue;
+    }
+    out.push(line);
+  }
+  return out.join("\n");
 }
 
 const B_PREFIX = "领导授权沉淀：";
