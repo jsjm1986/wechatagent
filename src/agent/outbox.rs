@@ -492,6 +492,7 @@ pub(crate) fn outbox_status_is_user_cancelable(status: &str) -> bool {
 /// 时间字段统一用 epoch ms（i64）。
 ///
 /// 检查顺序：
+/// 0. `!is_managed` → `not_managed_at_send`（B-03：发送前 fresh 复核，决策期翻 normal 拦截）；
 /// 1. `cooldown_until > now` → `contact_cooldown_active`；
 /// 2. `last_inbound > decision_created_at && outcome 命中 stop` → `user_stop_requested_after_decision`；
 /// 3. `now - entry_created > stale_threshold_ms` → `outbox_stale_30min`。
