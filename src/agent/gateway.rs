@@ -1248,7 +1248,7 @@ async fn run_user_operation_gateway_inner(
                 .await
                 .ok();
                 // B-1:升 Full 前放宽本 run 的 token gating 上限,让「Lean 探测 + Full 程
-                // + review + 一次 rewrite」不撑爆 base run_token_budget(30000)而被
+                // + review + 一次 rewrite」不撑爆 base run_token_budget(150000)而被
                 // blocked_by_budget 拦回复。tokens_used 仍如实累计,只放宽判定上限。
                 if let Some(b) = current_run_budget() {
                     b.grant_escalated_ceiling(runtime.run_token_budget_escalated);
