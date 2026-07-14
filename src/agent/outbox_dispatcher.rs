@@ -95,7 +95,8 @@ fn worker_id() -> String {
 /// **崩溃恢复**：把所有 `status="in_flight" AND locked_until < now` 的 entry
 /// 改回 pending；同时清空 worker_id / locked_until，并置 `reclaimed_in_flight=true`。
 /// 该标记告诉 `process_entry`：上一个 worker 在写 `sent` 前消失，**可能已把消息
-/// 送达 MCP/微信**，重发前须先跑 `mcp_already_succeeded` post-hoc 核对。返回回收条数。
+/// 送达 MCP/微信**，重发前须先跑 `verify_already_sent` post-hoc 核对（文本先查权威
+/// chat_search、失败回落本地 mcp_call_logs）。返回回收条数。
 //
 // NOTE: 暴露为 `pub` 仅供 `tests/outbox_integration.rs`（W4 / Task 5.8 / R13.10）
 // 直接驱动，不应在生产代码中绕过 `tick` 单独调用。
@@ -613,6 +614,61 @@ async fn mcp_already_succeeded(
     Ok(count > 0)
 }
 
+/// post-hoc 防重发核对：判断这条 outbox entry 的内容是否**其实已经发出去过**
+/// （MCP 已送达微信但本地状态未落 sent）。命中（`Ok(true)`）即调用方应标 sent 不重发。
+///
+/// 供 `process_entry` 的两个窗口复用——崩溃恢复（reclaim）与发送 timeout——
+/// 消除历史上两分支 text 路的不对称（F-01）：
+/// - `referral_card` 条目：名片无 media_id、tool 不同，text/media 版核对都不适用；
+///   reclaim/timeout 是边缘场景且重复推名片危害小（客户最多多收一张名片），
+///   故保守取 `Ok(false)`（视为未发过、放行重发）。
+/// - `media_asset` 条目：content 为空、tool 为 message_send_*，text 版核对查不到
+///   → 改用 media_id 定位该素材的成功发送记录。
+/// - 纯文本条目：**先查权威 `chat_search_outbound`**（MCP server 真实已发记录，
+///   同步落库、不受本地 timeout 取消 mcp_call_logs 写入的影响），带
+///   `CHAT_SEARCH_VERIFY_TIMEOUT_SECONDS` 独立短超时；chat_search 出错 / 超时才
+///   回落本地 `mcp_already_succeeded`（不因权威通道抖动而倒退成"必重发"）。
+async fn verify_already_sent(state: &AppState, entry: &OutboxEntry) -> AppResult<bool> {
+    if entry.referral_card_id.is_some() {
+        Ok(false)
+    } else if let Some(asset_id) = entry.media_asset_id.as_deref() {
+        super::media_send::media_already_succeeded(
+            state,
+            &entry.account_id,
+            &entry.contact_wxid,
+            asset_id,
+            entry.created_at,
+        )
+        .await
+    } else {
+        match tokio::time::timeout(
+            Duration::from_secs(CHAT_SEARCH_VERIFY_TIMEOUT_SECONDS),
+            crate::mcp::chat_search_outbound(
+                state,
+                &entry.account_id,
+                &entry.contact_wxid,
+                &entry.content,
+                entry.created_at,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(hit)) => Ok(hit),
+            // chat_search 出错 / 超时 → 回落本地 mcp_call_logs 核对（不倒退成"必重发"）。
+            Ok(Err(_)) | Err(_) => {
+                mcp_already_succeeded(
+                    state,
+                    &entry.account_id,
+                    &entry.contact_wxid,
+                    &entry.content,
+                    entry.created_at,
+                )
+                .await
+            }
+        }
+    }
+}
+
 /// P1-6：发送前 contact 状态门——纯函数，便于单测。
 ///
 /// 入队后到 dispatcher 抢占之间 contact 可能被运营改成 `normal`（撤管）或
@@ -706,35 +762,11 @@ pub async fn process_entry(state: &AppState, entry: &OutboxEntry) -> AppResult<(
     let now = DateTime::now();
 
     // 崩溃恢复幂等门：本条曾被 reclaim（上一个 worker 抢占后在写 sent 前消失），
-    // 它可能已把消息送达 MCP/微信。重发前先 post-hoc 核对 mcp_call_logs；命中即
-    // 标 sent 不重发，避免客户收到重复消息（与 timeout 分支同一核对函数）。
+    // 它可能已把消息送达 MCP/微信。重发前先跑 `verify_already_sent` post-hoc 核对
+    // （文本先查权威 chat_search、回落本地 mcp_call_logs）；命中即标 sent 不重发。
+    // 与 timeout 分支复用同一 `verify_already_sent`。
     if entry.reclaimed_in_flight {
-        let already = if entry.referral_card_id.is_some() {
-            // 名片无 media_id、tool 不同，text/media 版 post-hoc 核对都不适用。
-            // reclaimed 是边缘场景且重复推名片危害小（客户最多多收一张名片），
-            // 故跳过核对、放行重发（保守取 false = 视为未发过）。
-            Ok(false)
-        } else if let Some(asset_id) = entry.media_asset_id.as_deref() {
-            // 硬伤④：媒体条目 content 为空、tool 为 message_send_*，text 版核对查不到
-            // → 误判没发过 → 重发文件。改用 media_id 定位该素材的成功发送记录。
-            super::media_send::media_already_succeeded(
-                state,
-                &entry.account_id,
-                &entry.contact_wxid,
-                asset_id,
-                entry.created_at,
-            )
-            .await
-        } else {
-            mcp_already_succeeded(
-                state,
-                &entry.account_id,
-                &entry.contact_wxid,
-                &entry.content,
-                entry.created_at,
-            )
-            .await
-        };
+        let already = verify_already_sent(state, entry).await;
         if let Ok(true) = already
         {
             collection
@@ -874,49 +906,7 @@ pub async fn process_entry(state: &AppState, entry: &OutboxEntry) -> AppResult<(
             // 微信协议（response 慢于 30s 的极端情况），此时 mcp_call_logs 已写入
             // tool_name + recipient + 定位字段（text=content / media=mediaId）且
             // error=null。命中即视为已送达，不再重发，避免给客户重复消息/重复文件。
-            let already = if entry.referral_card_id.is_some() {
-                // 名片无 media_id、tool 不同，text/media 版 post-hoc 核对都不适用。
-                // timeout 是边缘场景且重复推名片危害小（客户最多多收一张名片），
-                // 故跳过核对、放行重发（保守取 false = 视为未发过）。
-                Ok(false)
-            } else if let Some(asset_id) = entry.media_asset_id.as_deref() {
-                super::media_send::media_already_succeeded(
-                    state,
-                    &entry.account_id,
-                    &entry.contact_wxid,
-                    asset_id,
-                    entry.created_at,
-                )
-                .await
-            } else {
-                // 先查 MCP chat_search(server 真实已发记录，同步落库、失败不写)——不受本地
-                // timeout 取消 mcp_call_logs 写入的影响。带独立短超时；超时/出错回落本地日志核对。
-                match tokio::time::timeout(
-                    Duration::from_secs(CHAT_SEARCH_VERIFY_TIMEOUT_SECONDS),
-                    crate::mcp::chat_search_outbound(
-                        state,
-                        &entry.account_id,
-                        &entry.contact_wxid,
-                        &entry.content,
-                        entry.created_at,
-                    ),
-                )
-                .await
-                {
-                    Ok(Ok(hit)) => Ok(hit),
-                    // chat_search 出错 / 超时 → 回落本地 mcp_call_logs 核对(不倒退)。
-                    Ok(Err(_)) | Err(_) => {
-                        mcp_already_succeeded(
-                            state,
-                            &entry.account_id,
-                            &entry.contact_wxid,
-                            &entry.content,
-                            entry.created_at,
-                        )
-                        .await
-                    }
-                }
-            };
+            let already = verify_already_sent(state, entry).await;
             if let Ok(true) = already
             {
                 collection
