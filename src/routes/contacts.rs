@@ -660,11 +660,50 @@ pub(super) async fn apply_generated_profile_to_contact(
     Ok(())
 }
 
+/// 写 `initial_profile` 任务的成功终态（`status="sent"` + 区分性 `gateway_status`）。
+///
+/// 与其余三个 task kind 的成功路径同构（`outcome_aggregation`→`aggregated` /
+/// `memory_consolidation`→`consolidated` / `no_candidates`）：worker tick 的 `Ok(())`
+/// 分支只写事件、不代写终态，依赖 handler 自落终态。`initial_profile` 曾是四 kind 中
+/// 唯一漏写终态的（W-Batch3 [1-01]）——任务成功后停在 `running`，被
+/// `reclaim_stale_running_tasks` 判 stale 反复重置 `retry`（每次重跑 3×LLM + 覆写画像），
+/// 累计 `claim_recovery_count ≥ 3` 后被误判 `failed`。补写终态后闭合该失效链。
+async fn mark_initial_profile_task_sent(
+    state: &AppState,
+    task: &crate::models::AgentTask,
+    gateway_status: &str,
+) -> AppResult<()> {
+    let Some(task_id) = task.id else {
+        // 理论上不可达：handler 收到的 task 恒来自 worker 对 DB 已 claim 的行，必有 _id。
+        return Ok(());
+    };
+    crate::models::assert_agent_task_status_valid("sent");
+    state
+        .db
+        .tasks()
+        .update_one(
+            doc! { "_id": task_id },
+            doc! {
+                "$set": {
+                    "status": "sent",
+                    "gateway_status": gateway_status,
+                    "updated_at": DateTime::now(),
+                }
+            },
+            None,
+        )
+        .await?;
+    Ok(())
+}
+
 /// 异步初始画像任务处理器（`AgentTask.kind == "initial_profile"`）。
 ///
 /// 批量托管（`batch_enable_endpoint`）不同步跑 LLM，而是给每个联系人入队本任务，
 /// 由 worker 异步调 `build_initial_operation_profile` 生成画像并经共享的
 /// [`apply_generated_profile_to_contact`] 落库。`task.content` 存本批共享运营备注。
+///
+/// 每个返回点都写任务终态（`sent`），否则任务停在 `running` 被反复 reclaim
+/// （见 [`mark_initial_profile_task_sent`]）。
 pub async fn handle_initial_profile_task(
     state: &AppState,
     task: &crate::models::AgentTask,
@@ -684,11 +723,11 @@ pub async fn handle_initial_profile_task(
         .await?;
     let Some(contact) = contact else {
         // 联系人已被删/清理：视为完成，不报错重试。
-        return Ok(());
+        return mark_initial_profile_task_sent(state, task, "contact_gone").await;
     };
     // 批量后又被手动取消托管的，跳过画像回填。
     if !matches!(contact.agent_status, crate::models::AgentStatus::Managed) {
-        return Ok(());
+        return mark_initial_profile_task_sent(state, task, "unmanaged").await;
     }
     let playbook = resolve_playbook_for_contact(
         state,
@@ -713,7 +752,8 @@ pub async fn handle_initial_profile_task(
         playbook.version,
         &generated,
     )
-    .await
+    .await?;
+    mark_initial_profile_task_sent(state, task, "profiled").await
 }
 
 pub async fn batch_enable_endpoint(
