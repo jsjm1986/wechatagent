@@ -274,6 +274,7 @@ pub(crate) async fn interpret_principal_reply(
                 substance: String::new(),
                 constraints: vec![],
                 authorization_window_hours: None,
+                exemption_type: crate::models::EXEMPTION_TYPE_NONE.to_string(),
             });
         }
     };

@@ -3664,6 +3664,11 @@ pub const ALLOWED_PRINCIPAL_VERDICT: &[&str] = &[
     PRINCIPAL_VERDICT_DELEGATED_BACK,
 ];
 
+/// 领导授权豁免类型闭集。
+pub const EXEMPTION_TYPE_NONE: &str = "none";
+pub const EXEMPTION_TYPE_CUSTOMER_ONLY: &str = "customer_only";
+pub const EXEMPTION_TYPE_KNOWLEDGE: &str = "knowledge";
+
 /// 决策 Agent 在 decision 阶段 emit 的请示意图（内嵌进 AgentDecision）。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -3706,6 +3711,14 @@ pub struct PrincipalDecision {
     /// 由 interpret LLM 自判填充；Task 19 据此算 authorization_expires_at。
     #[serde(default)]
     pub authorization_window_hours: Option<f64>,
+    /// 领导授权豁免类型（none/customer_only/knowledge）。snake_case 持久化台账；
+    /// 缺省 none 兼容旧文档。
+    #[serde(default = "default_exemption_type")]
+    pub exemption_type: String,
+}
+
+fn default_exemption_type() -> String {
+    EXEMPTION_TYPE_NONE.to_string()
 }
 
 /// 请示台账行（MongoDB collection `agent_principal_escalations`）。
@@ -6318,6 +6331,22 @@ mod principal_escalation_model_tests {
         let req: EscalationRequest =
             serde_json::from_str("{}").expect("empty object should deserialize");
         assert!(!req.needed);
+    }
+
+    #[test]
+    fn principal_decision_exemption_type_defaults_none() {
+        let json = serde_json::json!({"verdict":"approved","substance":"x"});
+        let d: PrincipalDecision = serde_json::from_value(json).expect("deser");
+        assert_eq!(d.exemption_type, "none");
+    }
+
+    #[test]
+    fn principal_decision_exemption_type_roundtrip() {
+        let json = serde_json::json!({
+            "verdict":"approved","substance":"x","exemption_type":"knowledge"
+        });
+        let d: PrincipalDecision = serde_json::from_value(json).expect("deser");
+        assert_eq!(d.exemption_type, "knowledge");
     }
 }
 
