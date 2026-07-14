@@ -261,4 +261,56 @@ outbox_dispatcher（上轮主链路已审 + F-01）/ strategic_planner（第一�
 
 ## 簇3 信号/画像 worker findings
 
-（主控亲验后填入）
+> 主控亲验结论：**「behavior_signals 只写不进决策」红线 CONFIRMED HOLDS**。全仓 `.behavior_signals()` 生产侧只有 `insert_one` + 建索引 + m016 backfill，**零读取点**；决策链（agent/gateway/review/knowledge_router/cold_contact/tasks）对该集合零引用。唯一读取面 `behavior_signal_metrics` 仅经 admin-only REST 回三态计数做观测，不回原始信号、不入决策（同 bayesian/personality「永不驱动」铁律）。幂等底座 `uniq_behavior_signals_workspace_dedupe_key`（indexes.rs:213）含 workspace_id 亲验属实。4 条 finding 全 Low，无聚合结构故清单第 5 问「聚合口径竞态」本阶段不存在。
+
+### [3-01] behavior_signals 无 TTL/retention → append-only 无界增长
+- 入口频道: —
+- 所属簇: 3
+- 类型: 无界增长 / 就绪债
+- 严重度: Low（主控亲验裁定：入站采集 webhooks.rs:583 无 flag 门控恒开，每 inbound ≥2 条信号；索引清单 indexes.rs:206-223 无 TTL——长跑就绪债，无立即后果，对照 import_jobs:161 有 TTL、knowledge 诊断日志 TTL=35d，behavior_signals 独缺）
+- 现象/风险: behavior_signals 每 inbound 恒 append ≥2 条，无 TTL 长跑集合无界膨胀。
+- 越权链: —
+- 根因（亲验 file:line）: indexes.rs:206-223 behavior_signals 索引清单仅 `uniq_..._workspace_dedupe_key` + 查询索引，无 `expireAfterSeconds`；webhooks.rs:583 采集无 flag 门控。
+- 复现设想: 长跑生产观察 behavior_signals 集合体积单调增长无回收。
+- 验证状态: CONFIRMED（无 TTL 亲验；无界增长为长跑推演）
+- 修复建议: 给 behavior_signals 加 TTL 索引（仿 knowledge 诊断日志 TTL=35d），或按 retention 策略定期归档。属长跑运维就绪债。
+- 状态: Open
+
+### [3-02] `silence_signal_daily_cap` 名实不符（实为 per-tick cap）
+- 入口频道: —
+- 所属簇: 3（与簇2 [2-05] 同一发现，交叉留痕）
+- 类型: 就绪债（命名语义）
+- 严重度: Low（主控亲验裁定：CONFIRMED 字段名含 daily 实为 per-tick——silence_signal_worker.rs:74 emitted 每 tick 归零；纯命名误导，dedupe 幂等使其无数据后果）
+- 现象/风险: `silence_signal_daily_cap` 顾名"每日上限"，实际每 tick 内存计数归零，是"每 tick 上限"。
+- 越权链: —
+- 根因（亲验 file:line）: silence_signal_worker.rs:74 emitted 计数为 tick 局部变量每 tick 重置，非跨 tick 累积的日上限。
+- 复现设想: 阅读语义即知；无数据后果（dedupe 幂等兜住）。
+- 验证状态: CONFIRMED（per-tick 归零亲验）
+- 修复建议: 改名为 `silence_signal_per_tick_cap`，或改成真正的跨 tick 日上限（按需）。纯命名订正。
+- 状态: Open
+
+### [3-03] msgId 全缺时 dedupe 回落接收毫秒 → 同毫秒双入站碰撞丢一条信号
+- 入口频道: —
+- 所属簇: 3
+- 类型: 幂等 / 边缘
+- 严重度: Low（主控亲验裁定：CONFIRMED 已文档化 A-03 边界；生产 GeWe 恒带 NewMsgId 不可达——msgId 全缺是极端退化）
+- 现象/风险: dedupe_key 在 msgId 全缺时回落接收毫秒时间戳，同毫秒无 id 双入站会碰撞、被 `uniq_..._dedupe_key` 去重吞掉一条信号。
+- 越权链: —
+- 根因（亲验 file:line）: behavior_signals dedupe_key 生成在 msgId 缺失时用接收毫秒兜底，同毫秒无 id 双入站产同 key。
+- 复现设想: 构造两条无 NewMsgId 且同毫秒到达的 inbound，观察第二条信号被去重丢弃。
+- 验证状态: CONFIRMED（回落逻辑亲验；生产 GeWe 恒带 NewMsgId 使其不可达）
+- 修复建议: msgId 全缺时 dedupe_key 追加随机后缀或序号，避免同毫秒碰撞。生产不可达，标边缘就绪债。
+- 状态: Open
+
+### [3-04] observed_at 用 server 接收时刻而非事件发生时刻
+- 入口频道: —
+- 所属簇: 3
+- 类型: 就绪债（语义精度）
+- 严重度: Low（主控亲验裁定：PLAUSIBLE 与 struct 声称的 event_time 语义存偏差，仅影响未来 ML 切片精度，当前无消费者——behavior_signals 零读取点故 observed_at 当前不被任何决策/分析消费）
+- 现象/风险: 信号 observed_at 记 server 接收时刻，非消息真实事件发生时刻，两者在网络延迟/补发下有偏差。
+- 越权链: —
+- 根因（亲验 file:line）: behavior_signals 写入点用 server 接收 DateTime::now() 填 observed_at，未取消息自带事件时间。
+- 复现设想: 延迟到达的消息，其 observed_at 晚于真实发生时刻。
+- 验证状态: PLAUSIBLE（语义偏差亲验；当前无消费者故无实际后果）
+- 修复建议: observed_at 优先取消息 payload 自带事件时间戳，缺失才回落接收时刻。未来 ML 切片前再处理即可。
+- 状态: Open
