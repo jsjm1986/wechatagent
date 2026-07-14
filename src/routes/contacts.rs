@@ -1023,6 +1023,16 @@ pub(super) async fn disable_agent(
         )
         .await?;
     let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
+    let _ = agent::write_event_for_account(
+        &state,
+        &contact.account_id,
+        Some(&contact.wxid),
+        "contact.removed_from_ops",
+        "ok",
+        "管理员停止该联系人的 AI 运营",
+        Some(doc! { "actor": &admin.username, "source": "disable_agent" }),
+    )
+    .await;
     Ok(Json(json!({ "item": ApiContact::from(contact) })))
 }
 
@@ -1030,6 +1040,8 @@ pub(super) async fn disable_agent(
 ///
 /// 手动把联系人从运营池移除（媒体号等无法自动判定的非目标）。**不删记录**
 /// ——删了下次对方发消息 webhook 又会重新建档。改标 doc-only `hidden_from_pool=true`，
+/// 并联动 `agent_status=normal` 停止 AI 运营（移出池 = 不再运营，单一真相源：
+/// 回复门只看 agent_status，不看 hidden_from_pool）。
 /// list_contacts / count_contacts 读时过滤（$ne:true）。单向移除，无恢复端点（YAGNI）。
 /// workspace 隔离：filter 带 current_workspace，杜绝跨租户改写（IDOR）。
 pub(super) async fn hide_from_pool(
@@ -1043,7 +1055,11 @@ pub(super) async fn hide_from_pool(
         .contacts()
         .update_one(
             doc! { "_id": object_id, "workspace_id": &admin.current_workspace },
-            doc! { "$set": { "hidden_from_pool": true, "updated_at": DateTime::now() } },
+            doc! { "$set": {
+                "hidden_from_pool": true,
+                "agent_status": "normal",
+                "updated_at": DateTime::now()
+            } },
             None,
         )
         .await?;
@@ -1051,6 +1067,16 @@ pub(super) async fn hide_from_pool(
         return Err(AppError::NotFound("contact not found".to_string()));
     }
     let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
+    let _ = agent::write_event_for_account(
+        &state,
+        &contact.account_id,
+        Some(&contact.wxid),
+        "contact.removed_from_ops",
+        "ok",
+        "管理员从运营池移除并停止 AI 运营",
+        Some(doc! { "actor": &admin.username, "source": "hide_from_pool" }),
+    )
+    .await;
     Ok(Json(json!({ "item": ApiContact::from(contact) })))
 }
 
