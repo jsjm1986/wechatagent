@@ -146,4 +146,29 @@
 
 ## D 组 findings（indexes.rs 唯一性/覆盖）
 
-（主控亲验后填入）
+> 主控逐段亲验 `indexes.rs`(1765) + `db/mod.rs`(405) 关键面：unique/partial unique/sparse unique/TTL、outbox 幂等键、ops versioned 灰度索引切换、ensure_indexes 编排。1 条 Low（交叉第四批 [1-01]），其余全 HOLDS。
+
+### [D-01] knowledge_gap_signals 仍无 (workspace_id,chunk_id,kind,status) 业务去重 unique 索引（交叉第四批 [1-01]，本批仅核实未补）
+- 入口: `ensure_all` → knowledge_gap_signals 索引段（`src/db/indexes.rs:1396-1445`）
+- 所属组: D
+- 类型: 唯一索引缺失|就绪债
+- 严重度: **Low**（主控裁定：与第四批 [1-01] 同一缺陷，本批仅从 indexes.rs 侧核实"未补"。gap_signals 三索引 = `(status,kind)`/`(created_at)`/`signal_id unique` + `(kind,status,created)`，唯一索引仅 `signal_id`（新 UUID 主键，非业务键）。业务去重仍靠 gap_signals.rs:610 应用层 find-then-insert。feedback_worker 单实例串行 run_one_round → 并发窗口单进程默认不可达，无索引兜底=确定性去重缺失但无并发触发源 → Low，同第四批定级）
+- 现象/风险: `gap_signals_signal_id_unique`（indexes.rs:1422-1428）锁的是 `signal_id`（每次新生成的 UUID），不是业务去重键。若未来 feedback_worker 多副本/并发，find-then-insert（find pending → 应用层 dedup_key 匹配 → insert）在无 unique 索引兜底下会重复插入同一 (workspace,chunk,kind) 信号。
+- 失效链: 多副本 feedback_worker 并发 run_one_round → 两副本同时 find 到无 pending → 都 insert → 重复信号（单进程单副本默认不可达）。
+- 根因（亲验 file:line）:
+  - `src/db/indexes.rs:1396-1445` knowledge_gap_signals 四索引：`gap_signals_status_kind_idx`(:1402)/`gap_signals_created_at_idx`(:1415)/`gap_signals_signal_id_unique`(:1422-1428，唯一但锁 signal_id UUID)/`gap_signals_kind_status_created_idx`(:1439)——无 (workspace_id,chunk_id,kind,status) partial unique。
+  - 对照第四批已亲验 gap_signals.rs:610 find-then-insert 应用层去重。
+- 复现设想: 多副本部署 feedback_worker（当前单进程不可达）；或手工并发触发两次 structural lint。
+- 验证状态: PLAUSIBLE（索引确实缺失；并发触发源单进程默认不可达）
+- 修复建议: 加 `(workspace_id,chunk_id,kind,status)` partial unique 索引（partial filter `status:"pending"`，避免历史 resolved 信号阻挡新 pending），与 outbox idempotency_key / silence dedupe_key 的强幂等姿势对齐。低优先（单副本默认无触发源），与第四批 [1-01] 一并收口。
+- 状态: Open
+
+**D 组正向 HOLDS（主控亲验）**：
+- **outbox 幂等键 unique HOLDS**：`idempotency_key` unique（indexes.rs:808-817）= 强幂等门，DuplicateKey→IdempotentSkip；配 `(account_id,status,next_retry_at)` 扫描 + `(status,locked_until)` 崩溃恢复 lease + `(account_id,status,sent_at:-1)` pacing guard（避免内存 SORT）。
+- **messages 双唯一 HOLDS**：`(workspace_id,account_id,message_id)` sparse unique（:62-70）+ `(workspace_id,account_id,dedupe_key)` partial unique（:71-84，仅 dedupe_key 为 string 时约束）——去重锚点齐备。
+- **tasks outcome_aggregation partial unique HOLDS**：`(kind,account_id,content)` partial unique（filter `kind:"outcome_aggregation"`，:112-132）——注释明示替代 TOCTOU find-then-insert 原子去重，且 partial filter 限定 kind 不误伤其他 kind 同 content 合法重复。
+- **events dedupe_key partial unique HOLDS**：`(workspace_id,dedupe_key)` partial unique（:184-194，仅携带 dedupe_key 的事件约束，不携带的正常重复写）。
+- **import_jobs TTL 不误删进行中 HOLDS**：`expires_at` TTL expireAfterSeconds=0（:155-168），worker 落终态才置 expires_at，pending/running 不设该字段 → TTL 忽略缺失字段绝不误删进行中 job（与 knowledge_operator_memory TTL 同构）。
+- **ops versioned 灰度索引切换二次启动安全 HOLDS**：drop 旧 unique（`workspace_id_1_domain_1` 等）用 best-effort `let _ =`（:886-889/920-923/968-971，失败不阻塞），新 4-tuple unique（version 维度）+ current_version partial 索引；MongoDB 对已存在索引静默 noop。注释:339-343 明示为何 ops 三表 unique 统一由 ensure_ops_versioned_indexes 管——避免旧 unique 在多版本驻留下 E11000 致 ensure_indexes 返 Err boot-brick（H8）。
+- **执行序 HOLDS**：main.rs 先 `migrations::run` 后 `ensure_indexes`（CLAUDE.md 明示 + db/mod.rs connect 不建索引）；unique 索引建前若已有重复数据会 E11000 → 但 seed 迁移 upsert 幂等不产重复，backfill 只补缺失不产重复 → 建 unique 安全。
+- **$in 禁用防 Error 67 HOLDS**：注释:204/452 明示 partial_filter_expression 绝不用 `$in`（会触发 Error 67 让 ensure_indexes panic），改用 `$type`/精确值。
