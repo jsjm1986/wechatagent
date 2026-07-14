@@ -185,7 +185,87 @@
 
 ## 簇 2 findings（摄取源头）
 
-（主控亲验后填入）
+> 审查对象：`ingest_worker.rs`(489) + `block_parser.rs`(476) + `catalog_rebuild.rs`(357)，消费入口对照 `routes/knowledge/import.rs` `ingest_chunked_text`。主控逐条亲验：ingest 去重链路、`content_hash:None`、worker 门控默认值、catalog job claim CAS + stale 回收。**校准结论：1 Medium + 6 Low**（subagent 自评 1H/2M/4L；[2-01] High→Medium：`INGEST_WORKER_ENABLED` 默认关、需显式开启才可达 + 后果受限；[2-02]/[2-03] Medium→Low：同门后/有实时聚合兜底）。
+
+### [2-01] ingest 落库入口零内容去重，幂等完全押 HTTP 条件 GET(ETag)单点——不返 ETag 的源每轮全量重复落库、无界增长
+- 入口 worker: `ingest_worker.rs` → `import.rs::ingest_chunked_text`
+- 所属簇: 2
+- 类型: 幂等
+- 严重度: **Medium**（主控裁定：subagent 标 High，但 `INGEST_WORKER_ENABLED` **默认 false**（`config.rs:706` default "false" + `.env.example:244` + `main.rs:304` 门控 spawn，因触及 deploy topology 默认关），生产 117 单机默认部署下 ingest worker **根本不 spawn**→**默认不可达**。需管理员显式开启才触发；开启后确定性无界增长，但后果受限：新落 chunk 恒 `draft+needs_review` 不进 verified 召回池、不误发客户，仅灌爆 needs_review 审核队列 + document 集合膨胀。"功能门后确定性可达 + 后果受限"=Medium，非"默认部署确定性可达的丢任务/损坏"=High。）
+- 现象/风险: 自动 ingest 去重只在 HTTP 层 ETag/If-None-Match；源不返 ETag（只带 Last-Modified 或无）→ 每过 `schedule_minutes` 同篇内容重抓→重分块→全量 `insert_one`，落库层零 content-hash/URL 去重。
+- 失效链: `process_source` due 判定纯时间窗（`ingest_worker.rs:236-238` `now - last_fetched >= schedule`，无内容指纹）→ 条件 GET（`:104-105` `If-None-Match`，仅 `:109` 304→NotModified 才 skip）→ 200/无 ETag → `ingest_chunked_text` 每 block 无条件 `insert_one`（`import.rs:1154` `content_hash:None`，无查重）→ 同源每 `schedule_minutes` 落完整副本、无界增长。
+- 根因（亲验 file:line）: `ingest_worker.rs:236-238`(due 纯时间窗) + `:104-109`(条件 GET 仅 304 skip) + `import.rs:1154`(content_hash:None) + `:1148`(无条件 insert_one)；全仓 content_hash 去重只在发送侧 `outbox.rs:179`，知识摄取侧零去重。
+- 复现设想: 配返回 200 但无 ETag 头的源，schedule=60min，开启 ingest worker → 24h 后同篇文章 24 份 draft chunk。
+- 验证状态: CONFIRMED（默认门控关，触发需显式启用）
+- 修复建议: `ingest_chunked_text` 落库前按 `(source_id, content_hash)` 或 `(url, block_hash)` 查重跳过；`content_hash` 填真实指纹而非 None；或 ingest 层按 body sha256 与上轮比对未变则 skip。
+- 状态: Open
+
+### [2-02] `mark_success_with_etag` 返回值被 `let _ =` 吞错——写回失败下轮重复落库
+- 入口 worker: `ingest_worker.rs`
+- 所属簇: 2
+- 类型: 幂等/吞错
+- 严重度: **Low**（主控裁定：subagent 标 Medium，降 Low——同在 ingest 默认关门后（[2-01] 前提），且需叠加 `mark_success_with_etag` 的 update_one 瞬时失败才触发；与 [2-01] 同源，非常态。）
+- 现象/风险: 落库成功后 `mark_success_with_etag` 写 `last_etag`/`last_fetched_at`，返回值被 `ingest_worker.rs:66` `let _ =` 吞掉；写库失败→etag 不落→下轮无 If-None-Match→200 全量重抓（叠加 2-01）。
+- 根因（亲验 file:line）: `ingest_worker.rs:66` `let _ = mark_success_with_etag(...)`；`:302-320` 内 update_one 可失败。
+- 验证状态: CONFIRMED
+- 修复建议: 至少 warn；理想上写回失败应影响下轮判定或与落库同事务。
+- 状态: Open
+
+### [2-03] `catalog_rebuild` job claim 成 processing 后进程崩溃→无 stale 回收，job 永久 processing
+- 入口 worker: `catalog_rebuild.rs`
+- 所属簇: 2
+- 类型: 崩溃恢复
+- 严重度: **Low**（主控裁定：subagent 标 Medium，降 Low——catalog worker 默认开（interval=3，`.env.example:194`）故 claim-崩溃窗口可达，但 `build_operation_knowledge_catalog` 实时聚合兜底（persisted 仅缓存优化）→ catalog 功能不失效仅退化 O(N)；且需进程恰在 processing 窗口崩溃（低频）；后果仅单 document 缓存陈旧，非丢任务/损坏/误发。）
+- 现象/风险: `claim_one_job` 原子 CAS `{status:queued}→processing`（亲验成立），但 `rebuild_one_document` 执行中崩溃→job 停 processing，无 reclaim/超时重置（`attempts` 只 `$inc` 不用于回收判定）→该 document catalog 摘要永不重建。
+- 根因（亲验 file:line）: `catalog_rebuild.rs` claim CAS（`find_one_and_update {status:queued}→processing` + sort queued_at）无配套 stale-processing 回收；全文件无 reclaim。
+- 复现设想: catalog job 领取后 kill 进程→重启后该 job 永 processing。
+- 验证状态: CONFIRMED
+- 修复建议: 加 processing 超时回收（类 `tasks.rs::reclaim_stale_running_tasks`），或 job 用 claimed_at + stale 窗口。
+- 状态: Open
+
+### [2-04] `block_parser` frontmatter 解析对畸形 YAML 静默降级——可能吞结构化元数据进正文
+- 入口 worker: `block_parser.rs`
+- 所属簇: 2
+- 类型: 输入校验
+- 严重度: Low
+- 现象/风险: 遇畸形 frontmatter/分块标记静默 fallback 到整块 body，可能把结构化元数据吞进正文。不碰红线，属解析鲁棒性。
+- 根因（亲验 file:line）: `block_parser.rs` 解析路径 fallback 优先无严格校验。
+- 验证状态: PLAUSIBLE
+- 修复建议: 畸形 frontmatter 至少产 warning 或 gap_signal。
+- 状态: Open
+
+### [2-05] `ingest_chunked_text` 无 workspace 配额/速率限制——单源可灌满 workspace
+- 入口 worker: `ingest_worker.rs` → `import.rs`
+- 所属簇: 2
+- 类型: 就绪债
+- 严重度: Low
+- 现象/风险: 无 per-workspace chunk 上限/ingest 配额，配合 2-01 单源即可无界灌满；多租户下失控源影响整库。
+- 根因（亲验 file:line）: `import.rs::ingest_chunked_text` 无配额检查。
+- 验证状态: PLAUSIBLE
+- 修复建议: 加 per-workspace chunk 上限/ingest 速率配额。
+- 状态: Open
+
+### [2-06] ingest 落库 document 创建与 chunk 插入非原子——中途失败留半截 document
+- 入口 worker: `ingest_worker.rs` → `import.rs`
+- 所属簇: 2
+- 类型: 非原子写
+- 严重度: Low
+- 现象/风险: 先建 document 再逐块插 chunk，中途失败留 document + 部分 chunk（同 S-01 双写族）。非致命（下轮重跑/人工清理），留不一致态。
+- 根因（亲验 file:line）: `import.rs` document/chunk 分步插入无事务。
+- 验证状态: PLAUSIBLE
+- 修复建议: 记录 ingest 批次 id，失败可回滚/标记。
+- 状态: Open
+
+### [2-07] 正向 HOLDS 汇总（红线/claim CAS/not-due 不写库）——设计正确标注
+- 类型: 设计正确(标注)
+- 严重度: Low（标注）
+- 内容（逐条亲验成立）:
+  1. **AI 永不自动 verify HOLDS**：block 路径（`import.rs:1242/1248`）+ fallback-blob（`:1192-1193`）无条件写 `status=draft`+`integrity_status=needs_review`，无绕过。
+  2. **catalog job claim CAS HOLDS**：`find_one_and_update({status:queued}→processing)` 原子 + job_id 全局唯一索引，无 TOCTOU 双 claim。
+  3. **not-due 不写任何 DB HOLDS**：`SourceOutcome::Skipped` 分支绝不刷 last_fetched_at（`ingest_worker.rs:58`），防节流基准无限前推（该行为在 mod.rs 注释明列为正确设计）。
+  4. worker 单实例无并发 tick；block_parser 无 panic/数组越界。
+- 验证状态: CONFIRMED
+- 状态: Open（标注）
 
 ## 簇 3 findings（反馈闭环）
 
