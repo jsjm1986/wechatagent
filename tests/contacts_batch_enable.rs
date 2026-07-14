@@ -11,8 +11,8 @@ use mongodb::bson::{doc, Document, DateTime, oid::ObjectId};
 
 use wechatagent::auth::AuthenticatedAdmin;
 use wechatagent::error::AppError;
-use wechatagent::models::{AgentStatus, Contact, WechatAccount};
-use wechatagent::routes::contacts::batch_enable_endpoint;
+use wechatagent::models::{AgentStatus, AgentTask, Contact, WechatAccount};
+use wechatagent::routes::contacts::{batch_enable_endpoint, handle_initial_profile_task};
 
 use crate::common::TestApp;
 
@@ -334,4 +334,161 @@ async fn batch_preserves_previously_operated_state_but_seeds_new() {
         Some("new_contact"),
         "全新客户应同步落 initial 态"
     );
+}
+
+/// 构造一个最小 Contact（指定 wxid + 托管状态），其余字段取默认空值。
+fn make_contact(ws: &str, acc: &str, wxid: &str, status: AgentStatus) -> Contact {
+    let now = DateTime::now();
+    Contact {
+        id: None,
+        workspace_id: ws.to_string(),
+        account_id: acc.to_string(),
+        wxid: wxid.to_string(),
+        nickname: None,
+        remark: None,
+        alias: None,
+        avatar_url: None,
+        sex: None,
+        agent_status: status,
+        human_profile_note: None,
+        custom_agent_instructions: None,
+        operation_mode_override: None,
+        agent_profile: None,
+        memory_summary: None,
+        playbook_id: None,
+        playbook_version: None,
+        manual_tags: Vec::new(),
+        manual_tags_updated_at: None,
+        manual_tags_by: None,
+        confirmed_tags: Vec::new(),
+        bayesian_signals: Vec::new(),
+        personality_profile: None,
+        tags_version: 0,
+        domain_attributes: None,
+        domain_attributes_updated_at: None,
+        commitments: Vec::new(),
+        follow_up_policy: None,
+        operation_state: None,
+        operation_state_reason: None,
+        operation_state_confidence: None,
+        operation_state_updated_at: None,
+        cooldown_until: None,
+        operation_policy: Document::new(),
+        profile_attributes: Document::new(),
+        profile_updated_at: None,
+        last_message_at: None,
+        last_inbound_at: None,
+        last_outbound_at: None,
+        last_agent_run_at: None,
+        last_outbound_style: None,
+        intent_trajectory: Vec::new(),
+        outcome_events: Vec::new(),
+        locale: None,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+/// 构造一条 `initial_profile` 任务，模拟 worker 已 claim（status=running + claimed_at）。
+fn make_running_initial_profile_task(ws: &str, acc: &str, wxid: &str) -> AgentTask {
+    let now = DateTime::now();
+    AgentTask {
+        id: Some(ObjectId::new()),
+        workspace_id: ws.to_string(),
+        account_id: acc.to_string(),
+        contact_wxid: wxid.to_string(),
+        kind: "initial_profile".to_string(),
+        run_at: now,
+        expires_at: None,
+        content: "统一运营备注".to_string(),
+        status: "running".to_string(),
+        source_decision_id: None,
+        review_required: false,
+        attempt_count: 1,
+        max_attempts: 3,
+        next_retry_at: None,
+        gateway_status: None,
+        cancel_reason: None,
+        error: None,
+        claimed_at: Some(now),
+        claim_recovery_count: 0,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+/// W-Batch3 [1-01] 终态回归：联系人被手动取消托管（Normal）时，handler 早退也必须
+/// 写终态 sent（gateway_status=unmanaged），绝不停在 running——否则被 reclaim 反复重跑。
+#[tokio::test]
+#[ignore]
+async fn initial_profile_task_marks_sent_when_unmanaged() {
+    let app = TestApp::start().await;
+    let ws = app.state.config.default_workspace_id.clone();
+    let acc = app.state.config.default_account_id.clone();
+
+    app.state
+        .db
+        .contacts()
+        .insert_one(make_contact(&ws, &acc, "wx_unmanaged", AgentStatus::Normal), None)
+        .await
+        .expect("seed unmanaged contact");
+
+    let task = make_running_initial_profile_task(&ws, &acc, "wx_unmanaged");
+    let task_id = task.id.unwrap();
+    app.state
+        .db
+        .tasks()
+        .insert_one(&task, None)
+        .await
+        .expect("insert running task");
+
+    handle_initial_profile_task(&app.state, &task)
+        .await
+        .expect("handler 应成功返回（非 managed 跳过画像但写终态）");
+
+    let stored = app
+        .state
+        .db
+        .tasks()
+        .find_one(doc! { "_id": task_id }, None)
+        .await
+        .expect("query task")
+        .expect("task exists");
+    assert_eq!(stored.status, "sent", "非 managed 早退也必须写终态 sent，不得停 running");
+    assert_eq!(stored.gateway_status.as_deref(), Some("unmanaged"));
+}
+
+/// W-Batch3 [1-01] 终态回归：联系人已被删除（找不到）时，handler 早退也必须写终态
+/// sent（gateway_status=contact_gone），绝不停在 running。
+#[tokio::test]
+#[ignore]
+async fn initial_profile_task_marks_sent_when_contact_gone() {
+    let app = TestApp::start().await;
+    let ws = app.state.config.default_workspace_id.clone();
+    let acc = app.state.config.default_account_id.clone();
+
+    // 不插入任何 contact —— 模拟联系人已被删/清理。
+    let task = make_running_initial_profile_task(&ws, &acc, "wx_gone");
+    let task_id = task.id.unwrap();
+    app.state
+        .db
+        .tasks()
+        .insert_one(&task, None)
+        .await
+        .expect("insert running task");
+
+    handle_initial_profile_task(&app.state, &task)
+        .await
+        .expect("handler 应成功返回（联系人不存在但写终态）");
+
+    let stored = app
+        .state
+        .db
+        .tasks()
+        .find_one(doc! { "_id": task_id }, None)
+        .await
+        .expect("query task")
+        .expect("task exists");
+    assert_eq!(stored.status, "sent", "联系人不存在早退也必须写终态 sent，不得停 running");
+    assert_eq!(stored.gateway_status.as_deref(), Some("contact_gone"));
 }
