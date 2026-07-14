@@ -2510,6 +2510,13 @@ async fn run_user_operation_gateway_inner(
     let media_pending = (final_status == "approved" || final_status == "revision_applied_approved")
         && (!final_decision.assets_to_send.is_empty() || final_decision.namecard_to_send.is_some());
     if should_run_send(outbox_eligible, media_pending) {
+        // B-01（已知产品取舍，暂不修）：此兜底 guard 到下方多段 enqueue 循环之间仍有极窄
+        // 尾窗（每段一次 outbox_enqueue DB 往返，约 10-100ms）——新入站若恰落在此窗口内，
+        // 本轮过时回复会全部 enqueue，同时 runner 检测 generation 变化重算再 enqueue 一批，
+        // 两批 segment 幂等 key 不同不互相去重 → 客户可能收两次回复。彻底消除需"入队后按
+        // run_id/generation 撤销上一 gen 的 pending outbox"补偿（EnqueueRequest 已带 run_id），
+        // 但该方案触碰 outbox 幂等核心 + runner 重算交互（并发正确性改动，风险最高），且此窗口
+        // 极窄、生产自然触发概率低，故列为已知产品取舍待专项，不在本轮低危加固批消除。详见台账 B-01。
         if let Some(guard) = &should_abort_send {
             if guard() {
                 tracing::info!(
