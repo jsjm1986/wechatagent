@@ -274,4 +274,30 @@
 
 ## 簇5 knowledge 端点层 findings
 
-（主控亲验后填入）
+> 主控亲验结论：**knowledge 所有写端点都锁 workspace——无跨 workspace 改写/验证他人知识 chunk 的真 High**。verify/reject/auto_verify/batch_verify 全经 apply_chunk_revision(current_workspace,...) 双端复合锁（chunk_revisions.rs:158-160 find + :295-297 replace 均 `{_id, workspace_id}`，主控已亲验）；repair 只写 event 绝不改 chunk（红线）；wiki_edit patch/archive/rollback/split/merge/relate 写全走 apply_chunk_revision；crud 文档/切片 CRUD 每 find/replace/delete 复合锁 + delete 级联独立复述 workspace_id；import preview/apply/apply-pdf/apply-image 落库 workspace 恒 admin.current_workspace 不信 body；ask_knowledge/ask_knowledge_stream 显式忽略 body workspaceId 用 session 值(sources_meta.rs:531-534/631-634 带反跨租户注释)。2 条 Low 均多租户就绪债，单租户默认不可达。
+
+### [5-01] knowledge_aggregate_metadata 的 chunk_revisions 聚合无 workspace 隔离
+- 入口频道: admin（知识库元数据看板 GET /operation-knowledge/metadata）
+- 所属簇: 5
+- 类型: 敏感泄漏（聚合元数据）
+- 严重度: Low（主控亲验裁定：chunk_revisions 集合本身无 workspace_id 字段 models.rs:1820-1839 亲验，聚合天然跨全库；泄漏物仅编辑者名+按天操作计数无 chunk 正文；单租户默认全库=同一 workspace 不可达；代码注释已显式声明该限制为本波范围外=有意识接受残留）
+- 现象/风险: knowledge_aggregate_metadata 第二段 pipeline(topEditors/recentActivity7d)直接对 chunk_revisions 全集合 aggregate 无 `$match:{workspace_id}`；第一段(wikiTypeCounts/verifiedRatio)对 chunks 有 `$match:{workspace_id:ws}`(sources_meta.rs:174)——两段口径不一致。
+- 越权链: 多租户下 workspace A admin 调 GET /operation-knowledge/metadata → topEditors 返全库(含 B)的 created_by 编辑者名与次数、recentActivity7d 返全库近 7 天按天计数，泄漏他租户运营人员身份与活跃度画像（无 chunk 正文）。
+- 根因（亲验 file:line）: sources_meta.rs:249-282 revisions_pipe 的 topEditors/recentActivity `$match` 无 workspace_id（注释:33-35 自陈「chunk_revisions 没有 workspace_id 字段…多租户场景需后续 $lookup 关联 chunks…超出本波范围」）；对比 sources_meta.rs:174 第一段有 `$match:{workspace_id:ws}`；ChunkRevision 无 workspace_id 字段亲验 models.rs:1820-1839。
+- 复现设想: 多租户下 A 的 session cookie 调 GET /api/operation-knowledge/metadata 观察 topEditors[].author 出现非本 workspace 运营用户名。
+- 验证状态: CONFIRMED（file:line + chunk_revisions 无 workspace 字段亲验；仅「单租户不可达」为环境假设）
+- 修复建议: chunk_revisions pipeline 前置 `$lookup` 关联 operation_knowledge_chunks(chunk_id↔chunks._id hex)取回 workspace_id 后 `$match`（零 schema 变更）；或给 chunk_revisions 补冗余 workspace_id 字段(写侧 apply_chunk_revision 已知 workspace 可顺带落库)再 `$match`。属多租户就绪债。
+- 状态: Open
+
+### [5-02] chat_session_stream SSE 无 workspace 归属校验
+- 入口频道: admin（知识库 chat 进度流 GET /knowledge/chat/sessions/:sid/stream）
+- 所属簇: 5
+- 类型: 敏感泄漏（极小）
+- 严重度: Low（主控亲验裁定：本簇唯一不取 Extension<AuthenticatedAdmin> 的端点，但仅流式推送不透明单调计数 u64(turn_index/CLOSE_SENTINEL)无 chunk/turn 正文；拿正文仍须 chat_history(GET 已锁 `{workspace_id,session_id}` chat.rs:342-348 跨租户返空)；session_id 是 v4 UUID 不可猜；仍属基准偏离故记 Low）
+- 现象/风险: chat_session_stream 签名只 State+Path(session_id)无 AuthenticatedAdmin，直接 chat_progress_bus.subscribe(&session_id)订阅未校验 session 归属调用者 workspace。
+- 越权链: 已认证 admin(任意 workspace)若得知/猜中他 workspace 的 session_id，可 GET .../stream 收到该 session turn 计数递增与关闭信号，推断「该 session 有活动+频次」；无正文泄漏(正文经 chat_history 二次拉取被 workspace 拦)。
+- 根因（亲验 file:line）: chat.rs:2201-2209 handler 无 Extension<AuthenticatedAdmin> 参数、:2209 直接按 session_id subscribe 未核 workspace、:2226 推送 v.to_string()为 u64 计数；ChatProgressBus 以裸 session_id 为 key(knowledge_task/mod.rs:43)无 workspace 维度；对比同文件 chat_history/apply/discard 都取 Extension(admin)锁 workspace_id。
+- 复现设想: 多租户下 A cookie 调 GET /api/knowledge/chat/sessions/<B的sessionId>/stream 观察收到 event:turn 计数（需先知 B 的 UUID sessionId，旁路门槛高）。
+- 验证状态: CONFIRMED（handler 无 admin 参数亲验 chat.rs:2201-2203；progress bus keying 亲验；仅泄漏计数结论亲验：payload=u64 正文路径独立锁 workspace）
+- 修复建议: handler 加 Extension(admin)，subscribe 前先 knowledge_chat_turns.find_one(`{session_id, workspace_id:admin.current_workspace}`)确认 session 属本 workspace(存在任一 turn 即可)否则 404——与 chat_history 同款前置校验，改动局部不碰 progress bus keying。属多租户就绪债。
+- 状态: Open
