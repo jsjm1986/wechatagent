@@ -192,7 +192,72 @@ outbox_dispatcher（上轮主链路已审 + F-01）/ strategic_planner（第一�
 
 ## 簇2 主动触达调度 worker findings
 
-（主控亲验后填入）
+> 主控亲验结论：**核心不变量 `cold_reactivation_idempotent` HOLDS**（`decide_cold_emit` cold_contact_worker.rs:394-424 确定性返回 AlreadyPending，重复 tick 恒被 `has_pending_follow_up` 挡回）；silence 幂等落在 `(workspace_id, dedupe_key)` partial unique 索引真底座（indexes.rs:213 亲验含 workspace_id）；三 worker 默认全关停（cold/silence enabled=false，account_scheduler 仅 cold 内调用）。**无 High、无 Medium**。5 条 Low 均属"元家族命中但有下游 backstop / 默认关停 / 多副本才放大"的就绪债。
+
+### [2-01] cold worker 与 planner 共享 follow_up 池、去重 find-then-insert 且 agent_tasks 对 follow_up 无唯一索引（TOCTOU 双 emit 窗口）
+- 入口频道: cold_contact_worker（默认关）
+- 所属簇: 2
+- 类型: 幂等 / 就绪债（元家族命中）
+- 严重度: Low（主控亲验裁定：亲验 `agent_tasks` 对 follow_up **无任何唯一索引**（grep uniq/unique 零命中，唯一索引只覆盖 outcome_aggregation indexes.rs:117-121），去重是 `has_pending_follow_up` find-then-insert；两 worker 并发 tick 存 TOCTOU 双 emit 窗口。判 Low 而非 High：①需 cold+planner 同时启用（默认均 false）②单进程下多余任务被 task worker 串行 + min_reply_interval 门 gateway.rs:3227-3232 拦住不双发 ③升级为对客双发需多副本 task worker=水平扩展就绪债）
+- 现象/风险: cold worker 与 strategic_planner 都往 follow_up 池插任务，靠内存 has_pending_follow_up 判定去重，无 DB 唯一约束兜底。
+- 失效链: 两 worker 并发同一 tick 对同一 contact 各自 has_pending_follow_up 读到无 pending → 各插一条 follow_up → 双任务；下游 task worker 串行 + min_reply_interval 拦住不双发（单进程）；多副本 task worker 才对客双发。
+- 根因（亲验 file:line）: agent_tasks 无 follow_up 唯一索引（indexes.rs 唯一索引仅 uniq_outcome_aggregation_kind_account_content:117-126）；cold_contact_worker.rs decide_cold_emit find-then-insert。
+- 复现设想: 同时启用 cold+planner 多副本 task worker，观察同 contact 双 follow_up 落库并双发。
+- 验证状态: PLAUSIBLE（无唯一索引亲验；双 emit 需双 worker 启用 + 多副本，单进程默认不可达）
+- 修复建议: 给 follow_up 类任务加 `(workspace_id, account_id, contact_wxid, kind, dedupe)` partial unique 索引作幂等底座（同 outcome_aggregation 范式），把去重从内存判定升级为 DB 约束。属水平扩展就绪债。
+- 状态: Open
+
+### [2-02] cold emit 插 task 与写审计事件跨集合非原子（崩溃窗内 daily cap 漏计）
+- 入口频道: cold_contact_worker（默认关）
+- 所属簇: 2
+- 类型: 非原子写 / 就绪债
+- 严重度: Low（主控亲验裁定：per-contact 幂等仍由 has_pending_follow_up 兜住，仅 daily cap 计数在崩溃窗内漏计；默认关停）
+- 现象/风险: cold emit 先插 follow_up task 再写 account_scheduler/cap 审计事件，两步非原子，中间崩溃则任务已插但 cap 未计。
+- 越权链: —
+- 根因（亲验 file:line）: cold_contact_worker.rs emit 路径 insert task 与 write_event 分两次 await，无事务边界。
+- 复现设想: emit 插 task 后、写 cap 事件前进程崩溃，重启后该 contact 有 pending task 但 daily cap 少计一次。
+- 验证状态: PLAUSIBLE
+- 修复建议: cap 计数改为从 pending task 派生（幂等），或把 cap 写进 task 文档同一次 insert。属就绪债。
+- 状态: Open
+
+### [2-03] cold worker 丢弃 assign_account 返回值却仍写 account_scheduler_assignment 事件（capacity 计数污染）
+- 入口频道: cold_contact_worker（默认关）
+- 所属簇: 2
+- 类型: 输入校验 / 就绪债
+- 严重度: Low（主控亲验裁定：多账号才放大；单账号默认部署 account_id 恒 default 无影响；审计误导非数据损坏）
+- 现象/风险: cold worker 调 assign_account 拿到 scheduler 选中的 account 后丢弃返回值，仍用旧 account_id 写 account_scheduler_assignment 事件，capacity 计数记的是被丢弃的选择。
+- 越权链: —
+- 根因（亲验 file:line）: cold_contact_worker.rs 调 assign_account 后未采用其返回 account_id，写事件用原 account_id。
+- 复现设想: 多账号 workspace，观察 account_scheduler_assignment 事件的 account_id 与 scheduler 实际选中不符，capacity 计数偏。
+- 验证状态: PLAUSIBLE
+- 修复建议: 采用 assign_account 返回的 account_id 写审计事件，或移除该冗余事件。属多账号就绪债。
+- 状态: Open
+
+### [2-04] assign_account capacity 判定 count-then-pick 非原子（并发可越 capacity 软上限）
+- 入口频道: account_scheduler（cold 内调用，默认关）
+- 所属簇: 2
+- 类型: 时间窗竞态 / 就绪债
+- 严重度: Low（主控亲验裁定：capacity 是软上限；单进程 cold worker 串行调用不可达；多副本才放大）
+- 现象/风险: assign_account 先 count 各 account 当前负载再 pick 最空的，count 与后续 assign 非原子，并发调用可让多个请求都选中同一"最空" account 越过 capacity。
+- 越权链: —
+- 根因（亲验 file:line）: account_scheduler.rs assign_account count-then-pick 无锁/无原子占位。
+- 复现设想: 多副本并发 assign_account，观察某 account 负载越过 capacity 软上限。
+- 验证状态: PLAUSIBLE（单进程串行不可达）
+- 修复建议: 多副本化前无需动；若走多副本，用 find_one_and_update 原子占位 + capacity 前置过滤。属水平扩展就绪债。
+- 状态: Open
+
+### [2-05] silence_signal_daily_cap 命名为 daily 实为 per-tick 上限（命名语义误导）
+- 入口频道: silence_signal_worker（默认关）
+- 所属簇: 2
+- 类型: 就绪债（命名）
+- 严重度: Low（主控亲验裁定：CONFIRMED 纯命名语义误导，dedupe 幂等使其无数据后果）
+- 现象/风险: `silence_signal_daily_cap` 字段名含 daily，实为每 tick 内存计数（silence_signal_worker.rs:74 emitted 每 tick 归零），即 per-tick cap 非日上限。
+- 越权链: —
+- 根因（亲验 file:line）: silence_signal_worker.rs:74 emitted 计数每 tick 重置，cap 判定基于该 per-tick 计数。
+- 复现设想: 一天多 tick，每 tick 各发满 cap，实际日发送量 = cap × tick 数远超"daily"字面。
+- 验证状态: CONFIRMED（per-tick 归零亲验）
+- 修复建议: 重命名为 `silence_signal_per_tick_cap`，或改为跨 tick 累计的真日上限。属命名就绪债（与 [3-02] 同一发现，簇3 从信号侧记录）。
+- 状态: Open
 
 ## 簇3 信号/画像 worker findings
 
