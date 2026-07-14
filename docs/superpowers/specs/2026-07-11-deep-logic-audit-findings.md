@@ -161,7 +161,7 @@
 - 复现设想: 对 `decision_reviews` claim/update 注入瞬时错误（前置：该 contact 有 `status=sent` 且 `outcome_status∈{null,pending}` 的 decision_review 才进 claim→LLM 路径；无则 :113 提前 `Ok(())` 不触发）。生产安全构造困难，不建议真跑。
 - 验证状态: PLAUSIBLE（读码，主控亲验因果链坐实）
 - 修复建议: 把步骤 (d)(e) 解耦——reaction 失败只 warn，仍继续跑 (e)（reaction 是旁路分析不该阻断本轮应答）；或把 `reaction.rs` DB 脚手架降级 best-effort（与其 LLM 侧 `unwrap_or_else` 同纪律）。属错误处理加固。建议 Open。
-- 状态: Open
+- 状态: Fixed（#180 —— 已采方案一解耦：`webhooks.rs:189-200` 步骤(d) `record_user_reaction` 的 `if let Err` 块内无 return/continue，`:209` 步骤(e) 聚合网关在同层无条件执行；reaction 失败只 warn，不再吞本轮回复。主控本会话 file:line 亲验）
 
 ### [B-03] managed 门只在 pipeline 起点复核一次，决策运行期（~10-15s）的 managed→unmanaged 翻转不复核，照发在途回复（补 F-021 深层）
 - 入口频道: userOps
@@ -197,7 +197,7 @@
 - 复现设想: rejected 分支命中（LLM 给非法 state 跳转）+ 该次 `write_event_for_account` Mongo insert 恰好失败。难在 117 稳定复现（依赖 DB 瞬时故障注入），标 PLAUSIBLE，非"可 117 复现"候选。
 - 验证状态: PLAUSIBLE（主控亲验代码路径 + 对称铁证成立；唯"DB insert 会失败"触发前提无法正常环境构造，保守不标 CONFIRMED）
 - 修复建议: :4503 改 `let _ = ...await;`（或 `.ok()`），与同函数 `stage_transition_rejected`/`dimension_dropped` fail-soft 纪律对齐。**连带评估**：:4525 `operation_state_transitioned`（成功迁移审计，同 `?`）同属"回复已定纯观测事件"，审计写失败同样会连带丢回复，是否一并改需产品裁决（不带拒绝迁移红线注释）。
-- 状态: Open
+- 状态: Fixed（#180 —— `gateway.rs:4481` operation_state_transition_rejected + `:4500` operation_state_transitioned 两审计写已改 `let _ = …await` fail-soft，连带评估的成功迁移审计一并对齐。主控本会话 file:line 亲验）
 
 ### 主控确认排除的假 finding（留痕防漏报/误报）
 - **[排除] follow-up 提前标 `outbox_enqueued` 致 DB 故障窗口静默丢消息**：inner :2337 确在 enqueue(:2543) 前置 task `outbox_enqueued`，中间一串 `?` 若 Err 会在 enqueue 前 return。但 `tasks.rs:254-307` worker Err 分支用 `doc!{"_id":task_id}`（无 status CAS）**无条件**重写 task 为 retry/failed，覆盖提前写的 outbox_enqueued → 会重试非静默丢。不成立。（连带观察：该 Err 分支无 status CAS 是隐性耦合就绪债，当前恰好兜住，非当前 bug。）
@@ -222,7 +222,7 @@
 - 复现设想: 构造 LLM 响应顶层用 snake `customer_stage` → 解析后该字段 None，标签丢失。是否生产实际触发依赖 LLM 顶层键漂移率（未知，subagent 诚实标"需 117 日志统计"）。可 117 日志统计辅证，非直接真跑复现。
 - 验证状态: PLAUSIBLE（主控亲验代码路径 + 不对称确凿）
 - 修复建议: 给 :461-462 加 `#[serde(alias = "customer_stage")]` / `alias="intent_level"`（serde alias 让 camel 主名 + snake 别名双认），与初始画像路径的双形容错对齐。低成本加固。
-- 状态: Open
+- 状态: Fixed（#194 —— `types.rs:461-464` customer_stage/intent_level 已加 `#[serde(alias=…)]` 双形容错；`:2054` 回归测试 raw_decision_accepts_snake_case_stage_and_intent 点名 D-01。主控本会话 file:line 亲验）
 
 ## 环节⑤ 独立 review + 阈值闸 + revision（review/gates.rs）
 
@@ -261,7 +261,7 @@
 - **cancel 彻底**：`cancel_for_contact_on_user_reaction`（outbox.rs:545）把同 contact pending/in_flight 全置 canceled + unset worker_id/locked_until。✅
 - **retry backoff 有界**：`2^attempt×5s` clamp[0,10] + jitter±20%；状态机 pending→in_flight→(sent|failed_terminal|canceled) 无卡死；掉线/pacing defer 刻意不耗 attempt。✅
 
-### [F-01] 崩溃恢复(reclaim)分支文本 post-hoc 只查本地 mcp_call_logs 不查权威 chat_search → 崩溃后可能重发文本（补 PR#164 未覆盖分支）
+### [F-01] 崩溃恢复(reclaim)分支文本 post-hoc 只查本地 mcp_call_logs 不查权威 chat_search → 崩溃后可能重发文本（补 PR#164 未覆盖分支）✅已修
 - 入口频道: userOps / command（凡走 outbox 的文本发送）
 - 链路环节: ⑥ outbox 崩溃恢复
 - 类型: 幂等 / 竞态（防重发缺口）
@@ -271,14 +271,14 @@
 - 复现设想: 可 117 复现——managed 联系人触发回复入队 → dispatcher claim 后在 MCP 成功返回与 mcp_logs 写入之间 kill 进程（或删该 mcp_call_log 行模拟丢日志）→ 等 lease 过期(>180s) → 观察下一 tick 是否重发同内容。谨慎，勿碰真人吴界；须串行不与套件并发。
 - 验证状态: PLAUSIBLE（主控亲验两分支不对称确凿；触发窗口宽度需 117 时序实验估计）
 - 修复建议: reclaim 文本分支比照 timeout 先 `chat_search_outbound` 权威核对、失败再回落 `mcp_already_succeeded`；把 timeout 分支核对逻辑抽共用函数两处复用，消除非对称。
-- 状态: Open
+- 状态: Fixed（本 PR —— 抽 `verify_already_sent` 三分支共用函数(referral→Ok(false)/media→media_already_succeeded/text→chat_search 带超时→回落 mcp_already_succeeded)，reclaim 块与 timeout 块各改一行调用；reclaim 文本路从"只查本地"升为"先查权威 chat_search"，两分支不对称消除。`outbox_dispatcher.rs::verify_already_sent` + 两调用点复用 + 集成哨兵测 reclaim_text_verifies_via_chat_search_before_local）
 
 ### [F-02] enqueue 与 dispatcher 的 max_attempts 默认值分歧（3 vs 5，死代码分支）
 - 链路环节: ⑥ retry 状态机 / 类型: 一致性 / 严重度: Low
 - 现象/根因（亲验）: `outbox.rs:244-248` enqueue 兜底 `<=0→3`（落库恒≥1）；`outbox_dispatcher.rs:322-326` schedule_retry_or_terminal 用 `<=0→5`。`<=0` 分支对 enqueue 产出 entry 是死代码（永不触发），仅手工/历史脏文档走到。当前无生产影响。
 - 验证状态: PLAUSIBLE（非活跃 bug）
 - 修复建议: dispatcher 侧默认改 3 对齐或删该分支。
-- 状态: Open
+- 状态: Fixed（#193 —— `outbox_dispatcher.rs:341` 抽 `effective_max_attempts`，`<=0→3` 与 enqueue 侧 `outbox.rs:244` 口径对齐。主控本会话 file:line 亲验）
 
 ### [F-03] 成功 update 忽略 modified_count，cancel 竞态下审计不一致（不致重发）
 - 链路环节: ⑥ cancel×send 竞态 / 类型: 一致性 / 严重度: Low
@@ -336,7 +336,7 @@
 - 复现设想: 令 events 集合在这些事件写时刻注入 Mongo 瞬时错误，观察本轮 inbound 无回复、无 outbox 条目。生产安全构造困难，标 PLAUSIBLE。
 - 验证状态: PLAUSIBLE（主控亲验 3 处 `?` + ordering 属实）
 - 修复建议: 与 C-01 合并修复——apply_agent_updates 内**全部纯审计事件**（含 C-01 的 :4503/:4525 + 本条 :4411/:4480/:4551）统一降级 fail-soft（`let _`/`if Err{warn}`），与同函数 bayesian/relationship/suspected_deal 口径一致。C-01 + H-01 应作为一个"审计事件 fail-soft 对齐"修复项一并处理。
-- 状态: Open
+- 状态: Fixed（#180 —— 与 C-01 同批对齐：`gateway.rs:4382`(g1_correction 守卫下的 agent.purchase_lifecycle_corrected_by_objective) / `:4444` profile_churn_observed / `:4532` follow_up_run_at_degraded 三审计写已改 `let _ = …await` fail-soft。主控本会话 file:line 亲验）
 
 ### [H-02] run_envelope.rs R0「LLM 前先写信封」三函数是生产死代码，pre-LLM 追溯不变量未生效
 - 入口频道: —（可观测性）
@@ -348,7 +348,7 @@
 - 复现设想: 读码确认无调用点，无需真跑。
 - 验证状态: PLAUSIBLE（主控可复核 Grep 无调用点）
 - 修复建议: 要么按原设计接上 started 信封+终态 update+panic hook，要么文档标注 R0 为"未接线/推迟"避免误以为已有 pre-LLM 追溯。当前单次 insert 对"决策已产出"的 run 追溯完整，缺口仅"决策前 panic/超时"极端 run。
-- 状态: Open
+- 状态: WontFix（#193 doc 标注推迟 —— 采修复建议第二选项：`run_envelope.rs:5-38` 模块头 doc 已明确标注 R0 三生命周期函数"未接线/推迟"。代码层仍死代码（三函数 `:373/:555/:724` 仅定义、零生产调用，main.rs 无 panic hook 安装，gateway 仍走 write_agent_run_log_with_finalize），接线留将来专项。主控本会话 file:line 亲验）
 
 ### 主控驳回的候选（证伪留痕）
 - **[驳回] F-⑧-02 task 先置 outbox_enqueued 再 enqueue，中间 `?` 失败留孤儿任务丢消息**：subagent 自标"未能确认（未核 tasks.rs worker）"。**主控亲验 tasks.rs:254-307**：gateway 返 Err → worker `Err` 分支 `update_one(doc!{"_id":task_id}, $set status=retry/failed)`（:261/:292）filter **仅 `_id` 无 status 条件、无条件覆盖** outbox_enqueued → task 会被打回 retry 重跑（enqueue 幂等重跑安全），**不卡孤儿、不静默丢**。与环节③ Task3 已排除的假 finding 同条。驳回，不入账。
