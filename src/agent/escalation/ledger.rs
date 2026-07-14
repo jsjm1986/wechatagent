@@ -250,6 +250,37 @@ fn self_anchor_for_substance(substance: &str) -> Option<Document> {
     })
 }
 
+/// 从领导裁决 substance 提炼一个确定性的知识标题兜底：
+/// 取首句（截到第一个句末标点 `。！？!?` 或换行之前），再按 chars 限长 40。
+/// 空 substance → 固定安全标题（配合 sediment 空 substance 已提前跳过，实际仅有 substance 时被用到）。
+/// LLM 提炼失败时回退到本函数，保证 title 永远可读、沉淀永不失败。
+// 目前仅被单测消费；Task 3（derive_sediment_title 的 LLM 兜底）/ Task 4
+// （sediment 落 title）接线后即成为生产调用点，暂 allow(dead_code) 保持 build 无警告。
+#[allow(dead_code)]
+pub(crate) fn derive_sediment_title_fallback(substance: &str) -> String {
+    let trimmed = substance.trim();
+    if trimmed.is_empty() {
+        return "领导授权沉淀".to_string();
+    }
+    // 首句：截到第一个句末标点 / 换行之前。
+    let first = trimmed
+        .split(|c| matches!(c, '。' | '！' | '？' | '!' | '?' | '\n'))
+        .next()
+        .unwrap_or(trimmed)
+        .trim();
+    let first = if first.is_empty() { trimmed } else { first };
+    // 按 chars 限长 40（多字节安全），超长截断加省略号。
+    let mut chars: Vec<char> = first.chars().collect();
+    if chars.len() > 40 {
+        chars.truncate(40);
+        let mut out: String = chars.into_iter().collect();
+        out.push('…');
+        out
+    } else {
+        chars.into_iter().collect()
+    }
+}
+
 /// B 类沉淀：把领导（真人）经决策请示通道授权的 substance 落为 verified 知识 chunk，
 /// 供全体客户复用。
 ///
@@ -592,5 +623,38 @@ mod tests {
         let anchor = self_anchor_for_substance("第一行\n第二行\n第三行").expect("非空");
         assert_eq!(anchor.get_i32("startLine").unwrap(), 1);
         assert_eq!(anchor.get_i32("endLine").unwrap(), 3, "两个换行 → endLine=3");
+    }
+
+    #[test]
+    fn fallback_takes_first_sentence() {
+        // 句号截断：只取首句
+        let t = derive_sediment_title_fallback("同意给他八折。本周内付款有效。");
+        assert_eq!(t, "同意给他八折");
+    }
+
+    #[test]
+    fn fallback_no_terminator_takes_whole_when_short() {
+        let t = derive_sediment_title_fallback("同意八折");
+        assert_eq!(t, "同意八折");
+    }
+
+    #[test]
+    fn fallback_truncates_long_by_chars_not_bytes() {
+        // 41 个中文字符（多字节）应截到 40 + 省略号，且不 panic（按 chars 截断）
+        let s = "一".repeat(41);
+        let t = derive_sediment_title_fallback(&s);
+        assert_eq!(t.chars().count(), 41); // 40 + '…'
+        assert!(t.ends_with('…'));
+    }
+
+    #[test]
+    fn fallback_empty_returns_safe_title() {
+        assert_eq!(derive_sediment_title_fallback("   "), "领导授权沉淀");
+    }
+
+    #[test]
+    fn fallback_newline_is_sentence_terminator() {
+        let t = derive_sediment_title_fallback("同意八折\n补充说明若干");
+        assert_eq!(t, "同意八折");
     }
 }
