@@ -728,7 +728,8 @@ pub async fn batch_enable_endpoint(
         return Err(AppError::BadRequest("candidates is empty".to_string()));
     }
     // account 必须在 wechat_accounts 注册(否则 webhook 入站会被 resolve_account_context 拒收)。
-    if state
+    // 保留 account 对象取 wxid：候选命中账号自身 wxid 时要拦（账号不能运营自己）。
+    let account = state
         .db
         .accounts()
         .find_one(
@@ -736,13 +737,13 @@ pub async fn batch_enable_endpoint(
             None,
         )
         .await?
-        .is_none()
-    {
-        return Err(AppError::BadRequest(format!(
-            "account_id={} 在 wechat_accounts 中未注册，无法批量启用 Agent 运营",
-            payload.account_id
-        )));
-    }
+        .ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "account_id={} 在 wechat_accounts 中未注册，无法批量启用 Agent 运营",
+                payload.account_id
+            ))
+        })?;
+    let account_self_wxid = account.wxid.clone();
     // 可选统一 playbook：校验存在(用 enable 的解析器,None 则账号默认)。
     let playbook = resolve_playbook_for_contact(
         &state,
@@ -766,7 +767,23 @@ pub async fn batch_enable_endpoint(
 
     let mut enabled = 0i32;
     let mut queued = 0i32;
+    let mut rejected_self = 0i32;
     for cand in &payload.candidates {
+        // 账号不能运营自己：候选命中账号自身 wxid → 跳过并留审计。
+        if crate::webhooks::is_self_account(&cand.wxid, account_self_wxid.as_deref()) {
+            rejected_self += 1;
+            let _ = agent::write_event_for_account(
+                &state,
+                &payload.account_id,
+                Some(&cand.wxid),
+                "contact.enable_rejected_self",
+                "rejected",
+                "候选命中账号自身 wxid，已跳过纳入 AI 运营",
+                Some(doc! { "actor": &admin.username, "source": "batch_enable" }),
+            )
+            .await;
+            continue;
+        }
         // 幂等:已 managed 的不重复入队(但仍刷新 note/avatar)。
         let existing = state
             .db
@@ -877,8 +894,28 @@ pub async fn batch_enable_endpoint(
                 .await?;
             queued += 1;
         }
+
+        // 仅对本轮真正新纳入的写加入审计，避免幂等重入刷屏。
+        if !already_managed {
+            let _ = agent::write_event_for_account(
+                &state,
+                &payload.account_id,
+                Some(&cand.wxid),
+                "contact.enabled_for_ops",
+                "ok",
+                "管理员批量纳入 AI 运营",
+                Some(doc! {
+                    "actor": &admin.username,
+                    "source": "batch_enable",
+                    "note": &payload.shared_note,
+                }),
+            )
+            .await;
+        }
     }
-    Ok(Json(json!({ "enabled": enabled, "queued": queued })))
+    Ok(Json(
+        json!({ "enabled": enabled, "queued": queued, "rejectedSelf": rejected_self }),
+    ))
 }
 
 pub(super) async fn enable_agent(
@@ -896,17 +933,32 @@ pub(super) async fn enable_agent(
     // P1：先校验 contact.account_id 在 wechat_accounts 注册过。否则即使写 managed
     // 进去，webhook 入站时 resolve_account_context 也会因为 appId 匹配不到这个
     // account 直接 400 拒收，AI 永远不会回复。
-    if state
+    let account = state
         .db
         .accounts()
         .find_one(doc! { "account_id": &contact.account_id }, None)
         .await?
-        .is_none()
-    {
-        return Err(AppError::BadRequest(format!(
-            "contact.account_id={} 在 wechat_accounts 中未注册，无法启用 Agent 运营",
-            contact.account_id
-        )));
+        .ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "contact.account_id={} 在 wechat_accounts 中未注册，无法启用 Agent 运营",
+                contact.account_id
+            ))
+        })?;
+    // 账号不能运营自己。
+    if crate::webhooks::is_self_account(&contact.wxid, account.wxid.as_deref()) {
+        let _ = agent::write_event_for_account(
+            &state,
+            &contact.account_id,
+            Some(&contact.wxid),
+            "contact.enable_rejected_self",
+            "rejected",
+            "目标命中账号自身 wxid，拒绝纳入 AI 运营",
+            Some(doc! { "actor": &admin.username, "source": "enable_agent" }),
+        )
+        .await;
+        return Err(AppError::BadRequest(
+            "不能对账号自身 wxid 启用 Agent 运营".to_string(),
+        ));
     }
     let playbook = resolve_playbook_for_contact(
         &state,
@@ -932,6 +984,20 @@ pub(super) async fn enable_agent(
         &generated,
     )
     .await?;
+    let _ = agent::write_event_for_account(
+        &state,
+        &contact.account_id,
+        Some(&contact.wxid),
+        "contact.enabled_for_ops",
+        "ok",
+        "管理员纳入 AI 运营",
+        Some(doc! {
+            "actor": &admin.username,
+            "source": "enable_agent",
+            "note": &payload.human_profile_note,
+        }),
+    )
+    .await;
     let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
     Ok(Json(json!({ "item": ApiContact::from(contact) })))
 }
