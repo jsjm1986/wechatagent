@@ -1080,6 +1080,47 @@ pub(super) async fn hide_from_pool(
     Ok(Json(json!({ "item": ApiContact::from(contact) })))
 }
 
+/// `POST /api/contacts/:id/revoke-principal-exemption`
+///
+/// 撤销该 contact 的 A 类领导授权产品豁免（`$unset` `domain_attributes` 子 key）+ 审计。
+/// 豁免记录 long-term 常驻，误授权无自动过期，故须有此显式撤销入口收回。
+/// workspace 隔离：filter 带 current_workspace，杜绝跨租户改写（IDOR）。
+pub(super) async fn revoke_principal_exemption(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
+    Path(id): Path<String>,
+) -> AppResult<Json<Value>> {
+    let object_id = parse_object_id(&id)?;
+    let unset_key = format!(
+        "domain_attributes.{}",
+        crate::models::PRINCIPAL_PRODUCT_EXEMPTION_ATTR
+    );
+    let result = state
+        .db
+        .contacts()
+        .update_one(
+            doc! { "_id": object_id, "workspace_id": &admin.current_workspace },
+            doc! { "$unset": { unset_key: "" }, "$set": { "updated_at": DateTime::now() } },
+            None,
+        )
+        .await?;
+    if result.matched_count == 0 {
+        return Err(AppError::NotFound("contact not found".to_string()));
+    }
+    let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
+    let _ = agent::write_event_for_account(
+        &state,
+        &contact.account_id,
+        Some(&contact.wxid),
+        "contact.principal_exemption_revoked",
+        "ok",
+        "管理员撤销该联系人的领导授权产品豁免",
+        Some(doc! { "actor": &admin.username, "source": "revoke_principal_exemption" }),
+    )
+    .await;
+    Ok(Json(json!({ "item": ApiContact::from(contact) })))
+}
+
 pub(super) async fn update_profile_note(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
