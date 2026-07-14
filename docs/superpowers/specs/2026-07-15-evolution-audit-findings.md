@@ -140,11 +140,57 @@
 
 ## 簇 1 findings（候选生成）
 
-（主控亲验后填入）
+> **审查方式**：subagent 三次派发均遇 API mid-response 失败（未落盘报告），主控亲自逐行读 `threshold.rs`(467) + `prompt_critic.rs`(606) + 追证生产侧 `agent/review/gates.rs`(fact_risk/pressure_risk 闸机制) + `replay.rs`/`significance.rs`(闭环口径) 完成审查。file:line 均主控 Read/Grep 亲验。
+
+### [1-01] pressure_risk_block ↔ block status 映射在生产语义上失配（但演化闭环内自洽 → 无后果）
+- 入口: `classify_gate_hit`（`src/evolution/threshold.rs:64-73`）+ `SAFETY_GATE_BLOCK_STATUS`（`src/evolution/significance.rs:52-56`）
+- 所属簇: 1
+- 类型: 统计正确性（映射与生产语义不符）
+- 严重度: **Low**（主控裁定：映射与生产真相不符，但演化 shadow 闭环**自造合成 status 且用同一口径判定**，不读生产真实 status 做安全回归判决 → 闭环内零后果；仅属"注释/映射与生产语义漂移"的可读性债）
+- 现象/风险: `threshold.rs:68` 与 `significance.rs:54` 都把 `pressure_risk_block` 映射到 `blocked_by_safety_guard`，`fact_risk_block` 映射到 `held_by_ai_policy`。但生产真相（亲验 `agent/review/gates.rs`）：**fact_risk（hallucination_score≥阈值）是硬闸 → HardGateFailure → `held_by_ai_policy`**（gates.rs:875）；**pressure_risk 是软闸 → SoftGateFailure → 触发 revision，从不直接产 block status**（classify_dual_gate soft path）；`blocked_by_safety_guard` 实际来自产品声明 fail-closed（gates.rs:450 R5.3.a）+ relay 泄漏拦截（gateway.rs:2581），**与 pressure_risk 无因果**。故 pressure_risk_block 被映射到一个它在生产里永不产生的 status。
+- 失效链: **不成立（闭环内自洽）**——shadow replay 不读生产真实 `final_review_status`，而是用 `final_status_from_5gate`（`replay.rs:411-430`）把 5 闸命中向量**重推合成 status**：pressure_risk_block 命中→写合成 `blocked_by_safety_guard`（:420-421），与 `significance.rs:54` 的 `safety_block_status_for` 同口径；`grade_safety_regression`（significance.rs:98-119）在合成 original/new status 间比对，两侧口径一致 → 安全回归判定正确。合成世界与生产 status 命名"恰好"用同一份错映射，故闭环内自洽、判决无误。
+- 根因（亲验 file:line）:
+  - `src/evolution/threshold.rs:67-68` `held_by_ai_policy=>fact_risk_block` / `blocked_by_safety_guard=>pressure_risk_block`（含 :391-395 单测锁死此映射）。
+  - `src/evolution/significance.rs:52-56` `SAFETY_GATE_BLOCK_STATUS` 同一份映射。
+  - `src/evolution/replay.rs:411-430` `final_status_from_5gate` 合成 status 用同口径（:418-424）。
+  - 对照生产：`src/agent/review/gates.rs:120-124`（hallucination_score≥fact_risk_block_at→hard_risks）、:160-173（pressure_risk≥阈值→soft_risks→revision direction，非 block）、:875（HardGateFailure→held_by_ai_policy）、:450（R5.3.a claim fail-closed→blocked_by_safety_guard）、`gateway.rs:2581`（relay 泄漏→blocked_by_safety_guard）。
+- 复现设想: N/A（闭环自洽，无可触发的错误判决路径）。
+- 验证状态: **CONFIRMED**（映射与生产语义失配已亲验；闭环内自洽消除后果亦亲验——shadow 用合成 status 而非生产真实 status）
+- 修复建议: 与 [2-01] 一并收口——统一一份权威 `(gate_key ↔ 生产真实 status)` 映射常量（供三处引用），并在 shadow 侧显式声明"合成 status 命名仅内部对照、不等于生产语义"。当前无功能后果，属可读性/防未来误用债，低优先。
+- 状态: Open
+
+**簇1 正向 HOLDS（主控亲验）**：
+- **prompt_critic 预算记账完整**：`budget.exhausted()` 预检（`prompt_critic.rs:95`）+ `check_or_fail()`（:126）+ 成功记 `total_tokens`/失败记 0token+1call（:137/:167）；直调 `state.llm.generate_json_with_usage`（:130-133）**故意绕开** `agent::generate_agent_json`（:7 注释——避免读 task-local RunBudget），用独立 EvolutionBudget → 隔离红线 HOLDS，无发送链引用。
+- **threshold 纯统计 + 方向正确**：`decide_candidate`（threshold.rs:351-379）方向语义正确（hit_rate<lower→阈值过高→-step；>upper→+step）；hard clamp（:376）、cooldown（:260-289）、per-tick quota（MAX=4，:218）齐备；候选一律 `pending_eval`（:222）不直接生效；current_value 基于当前生效 override（#155，:151-154）非硬编码。
+- **classify_gate_hit + revision_applied 补判**：human_like/emotional_value rewrite 类经 `run.revision_applied` 补判（threshold.rs:107-116），不漏 rewrite 信号。
 
 ## 簇 2 findings（shadow评估）
 
-（主控亲验后填入）
+> **审查方式**：subagent 做完实质工作（113k tokens/26 工具）但中途返回自问语、SendMessage 续派空返（未落盘）；主控亲自读 `replay.rs`(909) + `significance.rs`(996) + `post_release.rs`(489 交叉) 关键路径完成审查。file:line 均主控亲验。
+
+### [2-01] post_release 面板 5 闸命中率 delta 用「对调的」status 映射查生产真实终态 → fact_risk/pressure_risk 命中率贴错标签
+- 入口: `compute_window_metrics`（`src/evolution/post_release.rs:270-335`）经 `FIVE_GATE_KEYS`（`post_release.rs:54-60`）
+- 所属簇: 2
+- 类型: 统计正确性（观测口径贴错标签）
+- 严重度: **Medium**（主控裁定：与 [1-01]/簇内合成世界不同，post_release **读生产真实 `final_review_status` 计数**填面板 delta，映射对调 → 面板上 fact_risk_block / pressure_risk_block 命中率 delta 是**贴错标签的数字**，admin 可能据此误读演化前后的闸命中变化。但 post_release 全程**纯观测**——delta 只写 `agent_events` details 供 admin 察觉，`post_release.rs:167/220` 明示**不参与任何 promote/rollback 判决**，不反哺自动放量/回滚。既非客户面、也不驱动任何自动决策 → 有界的观测面误导，Medium）
+- 现象/风险: `post_release.rs:55-56` 的 `FIVE_GATE_KEYS` 把 `fact_risk_block` 映射到 `blocked_by_safety_guard`、`pressure_risk_block` 映射到 `held_by_ai_policy`——**与 threshold.rs:67-68 / significance.rs:53-54 恰好对调**（三文件三向不一致）。`compute_window_metrics:309-322` 用这份映射的 `status` 去 `count_documents` 查窗口内生产真实 `final_review_status`，把计数塞进 `five_gate_hit_rate[gate_key]`。生产真相（[1-01] 已亲验）：`held_by_ai_policy` 来自 fact_risk 硬闸、`blocked_by_safety_guard` 来自产品声明 fail-closed/relay——两个 label 都不对应它们在 post_release 里被赋予的 gate_key。故面板显示的「fact_risk_block 命中率 delta」实为 blocked_by_safety_guard 计数，「pressure_risk_block 命中率 delta」实为 held_by_ai_policy 计数。
+- 失效链: 放量某 threshold → +24h 后 `run_due_reviews`→`process_one_review`→`compute_window_metrics` 用对调 status 查前/后窗口生产终态 → `actual_5gate_hit_delta` 面板数字 fact/pressure 两 gate 互换标签 → admin 读 EvolutionCenterTab 时对这两闸的命中率变化判断反向。不影响任何自动判决（纯观测）。
+- 根因（亲验 file:line）:
+  - `src/evolution/post_release.rs:54-60` `FIVE_GATE_KEYS`：`("fact_risk_block","blocked_by_safety_guard")` / `("pressure_risk_block","held_by_ai_policy")`——与 threshold/significance 对调。
+  - `src/evolution/post_release.rs:309-322` `for (gate_key, status) in FIVE_GATE_KEYS { count_documents(final_review_status==*status) → five_gate_hit_rate[gate_key] }`——**用了 status 查生产真实终态**（区别于 process_one_review:174 那处 `_status` 丢弃）。
+  - `src/evolution/post_release.rs:167/220` 明示 delta 纯观测不参与 promote/rollback。
+  - 对照生产语义见 [1-01] 根因（gates.rs:875/450 + gateway.rs:2581）。
+- 复现设想: auto_release 或 admin 放量一个 threshold；+24h 后 tick 触发 post_release；查该 review 的 `evolution_post_release_review` 事件 details.actual_5gate_hit_delta，fact_risk_block 的数字实际反映 blocked_by_safety_guard 的命中率变化。
+- 验证状态: **CONFIRMED**（映射对调 + compute_window_metrics 用生产真实 status 计数双证；纯观测不反哺决策亦亲验）
+- 修复建议: 与 [1-01] 合并——三文件（threshold/significance/post_release）统一引用一份**经生产语义核实**的权威 `(gate_key ↔ final_review_status)` 映射；post_release 侧尤其需修正（它是唯一读生产真实 status 的路径，对调直接反映到 admin 面板）。注意 pressure_risk 生产走软闸 revision 不产 block status，其"命中率"本身在生产侧无对应终态——该 gate 的 post_release delta 是否有意义需产品重新定义（可能应改用 revision_count/revision_applied 口径）。
+- 状态: Open
+
+**簇2 正向 HOLDS（主控亲验）**：
+- **replay shadow 隔离 HOLDS**：模块头（`replay.rs:3-19`）明示不调 `run_user_operation_gateway`/`handle_managed_message`/`outbox` enqueue/`mcp::*`/不写 conversation_messages；prompt 候选走 `agent::prompt_shadow::shadow_replay_prompt_one`（:226，纯演练 decide_reply+review_decision）；有静态扫描单测禁 `outbox/mcp::` 引用兜底（:874）。
+- **KE-02 两侧同口径消除虚假 send_delta**：`original_final_review_status` 用 5 闸重推（`replay.rs:296-301`）而非源 run 真实终态——避免非-5gate 因素（blocked_by_budget 等）让 original 算"失败"、new 算"成功"凭空 +send_delta 虚假翻越 min_send_success_delta 门（回归测试 :707/:721/:726）。
+- **significance 安全回归门自洽**：`grade_safety_regression`（significance.rs:98-119）默认 `max_safety_regression_rate=0.0` 零容忍（:76-77）——任一条风险消息从 blocked 翻 sent 即否决放松提案；与 replay 合成 status 同口径（见 [1-01]）。
+- **budget 预检**：replay `eval_all` 预算触顶时未启动的 replay 写 `failed`+`failure_reason="evolution_budget_exceeded"`（:122-128），不炸 tick（mod.rs:189-194 拦 BudgetExceeded）。
+- **evaluate_single_gate 双键兼容**：read_gate_score 兼容 factRisk/hallucinationScore 两套历史键名（:357-362），缺分→0.0 保守。
 
 ## 簇 3 findings（放量闭环）
 
