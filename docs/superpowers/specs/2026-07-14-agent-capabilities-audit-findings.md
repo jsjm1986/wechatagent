@@ -101,4 +101,64 @@
 
 ## 簇D 节流准入 findings
 
-（主控亲验后填入）
+> 主控亲验结论：**影子隔离性（发送侧红线）HOLDS**——simulate_user_dialogue 绝不触发真实 MCP 发送/outbox/outbound 写（有回归门 tests/simulation_no_sideeffect_integration.rs）。负向结论（亲验干净、不入 finding）：D-3 pacing 边界正确（`<` 恰好到点放行 + fail-soft 有意取舍）、D-4 quiet_hours 时区/跨午夜/边界/醒来时刻全对且单测锁死、D-6 entitlements.rs 全程 fail-safe/fail-closed 主文件内零 fail-open。
+
+### [D-01] 影子模拟真写 `operating_memories`（create+seed）——孤儿写入，非发送侧泄漏
+- 入口频道: userOps（影子演练 POST /simulations/dialogue）
+- 所属簇: D
+- 类型: 逻辑正确性（副作用越界）
+- 严重度: Low（主控亲验裁定：写的是 operating_memories 非发送侧集合；seed 仅派生自 contact 自身档案、**不含模拟对话内容**；与真实首触达同函数近似幂等；不构成客户副作用、不违反"发送侧零副作用"红线）
+- 现象/风险: 对从未真实运营的 contact 跑影子演练会在生产库静默落一条 operating_memories 文档并可能 seed memory card，与"影子=只读演练"心智模型 + 路由自身 `apply_memory=false` 门矛盾。
+- 根因（亲验 file:line）: `simulation.rs:86` 影子内联无条件 `load_or_create_operating_memory`（亲验）；`memory.rs:943-946` create 分支真 insert_one；`memory.rs:832-852` 已存在无信号时 seed 走 OCC update_one 真写；对照 `routes/simulations.rs:41-44` 影子显式拒 apply_memory=true，说明设计期望不落 memory，但 load_or_create 的 create/seed 侧写绕过该意图。
+- 复现设想: 对无 operating_memories 行的 managed contact 调影子 dialogue，跑完查该集合多一行（memory_card 由 contact 档案 seed）。
+- 验证状态: CONFIRMED（写路径+调用点亲验；"不含对话内容"亦亲验——seed 在消息循环前、用未经模拟的 contact）
+- 修复建议: 若要影子严格只读，simulate_user_dialogue_inner 改用"只读加载、缺失则构造内存态默认 memory 不落库"分支（新增 load_operating_memory_readonly 或给 load_or_create 传 persist=false）。属产品意图裁决项，非红线，可暂缓。
+- 状态: Open
+
+### [D-02] 影子模拟真写 `llm_call_logs`（每次 LLM 调用一行）——by-design 观测，非泄漏
+- 入口频道: userOps（影子演练）
+- 所属簇: D
+- 类型: 逻辑正确性（副作用越界·设计内）
+- 严重度: Low（主控亲验裁定：影子复用真实 decide/review LLM，记录 token/延迟/状态属正当观测；日志带影子 run_id 不污染发送侧/客户态；属设计内行为）
+- 现象/风险: 影子演练在 llm_call_logs 累积行、消耗真实 token 预算（simulation_token_budget 独立计费默认 300000），对成本/配额有真实影响但无功能副作用。
+- 根因（亲验 file:line）: `mod.rs:215` generate_agent_json（唯一 LLM JSON 入口，影子 decide/review/knowledge 全经它）→ `mod.rs:239-306` cache_hit/success/failure 三分支均 llm_call_logs 写。
+- 复现设想: 跑影子 dialogue 后查 llm_call_logs 有对应 run_id 的行。
+- 验证状态: CONFIRMED
+- 修复建议: 无需修（by-design）。若追求"影子零写入"可给 generate_agent_json 传 shadow 标记跳过日志，但牺牲 LLM 成本可观测性，不建议。
+- 状态: WontFix（by-design 观测，主控亲验确认非缺陷，留痕）
+
+### [D-05] quiet_hours 仅单时段+小时粒度（无多时段/分钟精度）——设计范围说明
+- 入口频道: —
+- 所属簇: D
+- 类型: 就绪债（表达力）
+- 严重度: Low（主控亲验裁定：非逻辑缺陷，是既定产品设计=运营方作息一个连续睡眠窗）
+- 现象/风险: 无法配"午间 12-14 + 夜间 22-08"多窗，也无法配 22:30 半点边界（in_quiet_hours 入参 u32 小时）。若某行业需多窗/分钟级作息当前引擎不支持。
+- 根因（亲验 file:line）: `quiet_hours.rs:29` in_quiet_hours(now_hour:u32,start:u32,end:u32) 单区间小时入参；`runtime.rs:70-72` quiet_hours_start/end:u32 单对。
+- 复现设想: 现状属实，无需运行时复现。
+- 验证状态: CONFIRMED（现状属实）
+- 修复建议: 无需修（超出当前产品范围）。未来若需多窗把 (start,end) 升级 Vec<(u32,u32)> 或引入分钟粒度，in_quiet_hours 改 any-match。
+- 状态: WontFix（既定产品范围，留痕）
+
+### [D-07] `load_active_products` best-effort 吞错 → 静默 fail-closed 降级 + 无法区分"无产品"与"DB 错误"
+- 入口频道: userOps / command（产品报价决策）
+- 所属簇: D
+- 类型: 错误处理（可用性降级·观测缺口）
+- 严重度: Low（主控亲验裁定：方向正确 fail-closed 不误放行，但错误被完全吞掉致"合法报价被误 block"且无从诊断——观测缺口非安全漏洞）
+- 现象/风险: products 集合瞬时错误时 load_active_products 返空 Vec，与"确实没配产品"不可区分。后果：①决策 prompt 产品目录/持有投影段变空；②priced_from_active_catalog 恒 false→若该 run 又无 verified chunk，`review/gates.rs:665` 触发 blocked_unverified_product_claim 误 block 本可正确报价的回复。
+- 根因（亲验 file:line）: `entitlements.rs:243-246` `match cursor { Ok(c)=>try_collect().unwrap_or_default(), Err(_)=>Vec::new() }`——Err 直接丢无日志/事件；调用点 gateway/campaigns.rs:208/contacts.rs:480 均无法感知是错误还是空表。
+- 复现设想: products 查询临时失败（索引重建/连接抖动）时，引用真实 active 产品的报价决策被 blocked_unverified_product_claim 拦下，日志只见"无 verified 背书"看不到根因是 DB 错。
+- 验证状态: CONFIRMED（吞错代码亲验；误 block 链路经 gates.rs:665 亲验）
+- 修复建议: Err 分支至少 tracing::warn! + 可选 best-effort 事件让"DB 错误导致的空产品"可诊断；或让 gateway 在 products 加载失败时对 priced_from_catalog 采取与"确认无产品"不同处置。属稳健性增强，非红线。
+- 状态: Open
+
+### [D-08] `claim_analysis` 缺失 → 产品声明硬门被跳过 = fail-open（**已文档化的既定接受取舍，非新缺陷**）
+- 入口频道: userOps（产品声明回复）
+- 所属簇: D（相邻 review/gates.rs，entitlements 消费侧）
+- 类型: 红线（准入门 fail-open）—— **主控裁定=已知取舍**
+- 严重度: Low（**主控亲验校准：subagent 初判 Medium，降级为 Low/已知取舍**——`gates.rs:654-657` 注释逐字写明"2026-05-25 知识库清理删除 chunk.safe_claims/ProductClaimMarkers，R5.3 claim_analysis 缺失 fail-closed 推断不在本次恢复范围；claim_analysis 缺失时按'非产品声明'放行"，是**显式文档化的既定接受取舍**，非本轮新发现的缺陷。memory 亦记载"auto-verify/fail-closed 推断删除是产品意图裁决非 bug"。有两道兜底：reviewer 软闸 + knowledge_router verified-only 语料。**不重开已裁决事项**。）
+- 现象/风险: Review Agent 未产出 claim_analysis（LLM 漏填/响应降级）时 claim_requires_product_knowledge 返 false→blocked_unverified_product_claim 硬门被跳过→产品声明无 verified chunk 也无目录背书的回复被放行。
+- 根因（亲验 file:line）: `gates.rs:658` 仅当 claim_requires_product_knowledge 为真才进 block 块；`gates.rs:654-657` 注释明确记录这是 2026-05-25 显式接受的取舍（亲验逐字属实）；硬门本体 `gates.rs:665` `if verified_chunks.is_empty() && !priced_from_catalog { block }`。
+- 复现设想: 构造 review 缺失 claim_analysis + decision 含产品声明但 used_knowledge_ids 无 verified chunk + quoted id 不在 active 目录→预期放行（本应 block）。
+- 验证状态: PLAUSIBLE（fail-open 路径代码层确凿可达；但"是否算 bug"取决于是否接受 2026-05-25 设计取舍——注释 + memory 均指向有意接受）
+- 修复建议: 若未来产品决定收紧回 fail-closed：claim_analysis 缺失时保守推断"可能是产品声明"并要求背书（恢复被删的 R5.3 语义）。**这是产品意图裁决项，改前须与用户确认**（会提高误 block 率）。当前保持接受取舍。
+- 状态: WontFix（2026-05-25 显式接受的既定取舍，主控亲验确认非新缺陷，留痕待未来产品裁决）
