@@ -110,6 +110,89 @@ impl wiremock::Respond for UniqueMsgIdResponder {
     }
 }
 
+/// 按 tool 名分派：`chat_search` 返回**命中** items（供 reclaim 权威核对判 true），
+/// 其它 tool（含 `message_send_text`）返回唯一 newMsgId 成功 envelope。
+///
+/// items 形状严格对齐 `src/mcp.rs::chat_search_hit`（亲验 :772-791）：每条须含
+/// `content`（**精确等于** entry.content，非子串）+ `createdAt`（ISO-8601 rfc3339
+/// 字符串，其 millis ≥ since=entry.created_at）。`chat_search_outbound`（:819-824）从
+/// `call_tool_with_key` 剥壳后的 structuredContent 顶层取 `items`，故 envelope 放在
+/// result.structuredContent.items。createdAt 用 respond 时刻（发生在 entry 入队之后，
+/// 故必 ≥ since）。
+struct ChatSearchHitResponder {
+    counter: std::sync::atomic::AtomicU64,
+    hit_content: String,
+}
+
+impl wiremock::Respond for ChatSearchHitResponder {
+    fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+        let tool = serde_json::from_slice::<serde_json::Value>(&request.body)
+            .ok()
+            .and_then(|v| {
+                v.pointer("/params/name")
+                    .and_then(|n| n.as_str())
+                    .map(String::from)
+            })
+            .unwrap_or_default();
+        if tool == "chat_search" {
+            let created_at = DateTime::now()
+                .try_to_rfc3339_string()
+                .unwrap_or_else(|_| "2099-01-01T00:00:00Z".to_string());
+            let body = json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": { "structuredContent": {
+                    "items": [ { "content": self.hit_content, "createdAt": created_at } ],
+                    "count": 1
+                }}
+            });
+            return ResponseTemplate::new(200).set_body_json(body);
+        }
+        let seq = self
+            .counter
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": { "structuredContent": { "newMsgId": format!("mock_msg_id_{seq}"), "content": [] }}
+        });
+        ResponseTemplate::new(200).set_body_json(body)
+    }
+}
+
+/// 按 tool 名分派：`chat_search` 返回 HTTP 500（模拟权威通道不可达 →
+/// `verify_already_sent` 走 `Ok(Err(_))` 分支回落本地 mcp_call_logs 核对），其它 tool
+/// 返回唯一 newMsgId 成功 envelope。供 `reclaim_gate_precedes_pacing_gate` 复用其
+/// step(e) 预置的本地"已发过"证据（chat_search 命中子路径由专门哨兵测覆盖）。
+struct ChatSearchErrDispatchResponder {
+    counter: std::sync::atomic::AtomicU64,
+}
+
+impl wiremock::Respond for ChatSearchErrDispatchResponder {
+    fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+        let tool = serde_json::from_slice::<serde_json::Value>(&request.body)
+            .ok()
+            .and_then(|v| {
+                v.pointer("/params/name")
+                    .and_then(|n| n.as_str())
+                    .map(String::from)
+            })
+            .unwrap_or_default();
+        if tool == "chat_search" {
+            return ResponseTemplate::new(500).set_body_string("simulated chat_search outage");
+        }
+        let seq = self
+            .counter
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": { "structuredContent": { "newMsgId": format!("mock_msg_id_{seq}"), "content": [] }}
+        });
+        ResponseTemplate::new(200).set_body_json(body)
+    }
+}
+
 /// 启 wiremock，POST /mcp 返回 MCP `tools/call` 成功 envelope（每请求唯一 newMsgId）。
 async fn start_mcp_mock_success() -> MockServer {
     let server = MockServer::start().await;
@@ -1216,7 +1299,19 @@ async fn account_pacing_gate_end_to_end_via_gateway() {
 #[ignore]
 async fn reclaim_gate_precedes_pacing_gate() {
     let app = common::TestApp::start().await;
-    let mcp_server = start_mcp_mock_success().await;
+    // F-01：reclaim text 路先查权威 chat_search。本测验的是"reclaim 门先于 pacing 闸"，
+    // 复用 step(e) 预置的**本地** mcp_call_logs 证据，故让 chat_search 返回 500 →
+    // verify_already_sent 走 Ok(Err(_)) 分支回落本地核对命中（chat_search 命中子路径由
+    // reclaim_text_verifies_via_chat_search_before_local 专门覆盖）。其它 tool 仍返回唯一
+    // newMsgId，若误真发可被计数。
+    let mcp_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .respond_with(ChatSearchErrDispatchResponder {
+            counter: std::sync::atomic::AtomicU64::new(0),
+        })
+        .mount(&mcp_server)
+        .await;
     let mut state = common::rebuild_app_state_with_mcp_url(&app, mcp_server.uri());
     // 开 pacing 闸（固定 2s，min=max 消除随机性）：默认 0/0 是关的，必须显式覆盖。
     // 这样若 2B 门不先命中、执行落到 pacing，就会被拦成 pending，暴露顺序错误。
@@ -1353,18 +1448,157 @@ async fn reclaim_gate_precedes_pacing_gate() {
     assert!(entry.worker_id.is_none(), "标 sent 时 worker_id 应清空");
     assert!(entry.locked_until.is_none(), "标 sent 时 locked_until 应清空");
 
-    // (h) 2B 门标 sent 不重发 → MCP 未收到任何真实发送调用（seed 历史与 seed
-    // mcp_call_logs 都是直接写库，未经 wiremock）。这坐实了走的是"已发过"分支
-    // 而非真实发送。
+    // (h) 2B 门标 sent 不重发 → MCP 未收到任何真实 message_send_text 发送调用。
+    // F-01 修复后 reclaim text 路会先发一次 chat_search 的 tools/call（本 mock 返回 500 →
+    // verify_already_sent 回落本地 mcp_already_succeeded，step(e) 已 seed 命中 → 仍标 sent）。
+    // 故不再断言"零请求"（chat_search 与 initialize 握手会到达 wiremock），而是断言
+    // "零 message_send_text 真实重发"——这正是 2B 门要守护的不变量。
     let recv = mcp_server
         .received_requests()
         .await
         .expect("wiremock recorded requests");
+    let send_calls = recv
+        .iter()
+        .filter(|r| {
+            serde_json::from_slice::<serde_json::Value>(&r.body)
+                .ok()
+                .and_then(|v| {
+                    v.pointer("/params/name")
+                        .and_then(|n| n.as_str())
+                        .map(|s| s == "message_send_text")
+                })
+                .unwrap_or(false)
+        })
+        .count();
     assert_eq!(
-        recv.len(),
-        0,
-        "2B post-hoc 确认已发过，不应再向 MCP 发送；recv={}",
-        recv.len()
+        send_calls, 0,
+        "2B post-hoc 确认已发过，不应再真实重发 message_send_text；send_calls={send_calls}"
+    );
+}
+
+/// F-01 守门：reclaim text 路必须**先查权威 chat_search**——本地 mcp_call_logs 查不到时，
+/// 只要 chat_search 命中就标 sent 不重发。若回退到"reclaim 直接查本地"（Task 1 修复前的
+/// 行为）→ 本地查不到 → 真实重发 message_send_text → send_calls≥1 → 本测变红。
+///
+/// 构造：reclaim 分支 text entry（reclaimed_in_flight=true）+ chat_search 命中 +
+/// **故意不 seed 本地 mcp_call_logs** → 断言 status=Sent 且零 message_send_text 重发
+/// 且收到过 ≥1 次 chat_search 调用。enqueue/置位/claim 步骤照
+/// `reclaim_gate_precedes_pacing_gate` 的 (b)(c)(d) 段复用。
+#[tokio::test]
+#[ignore]
+async fn reclaim_text_verifies_via_chat_search_before_local() {
+    let app = common::TestApp::start().await;
+    let contact = make_contact("user_reclaim_chat_search");
+    app.state
+        .db
+        .contacts()
+        .insert_one(&contact, None)
+        .await
+        .expect("insert contact");
+
+    // (b) enqueue 目标 pending 条目（text 版：无 media_asset_id / referral_card_id）。
+    let outcome = enqueue(
+        &app.state,
+        enqueue_request("run_reclaim_search", "evt_reclaim_search", &contact.wxid),
+    )
+    .await
+    .expect("enqueue ok");
+    let outbox_id = match outcome {
+        EnqueueOutcome::Created { outbox_id, .. } => outbox_id,
+        other => panic!("expected Created, got {other:?}"),
+    };
+
+    // (c) 置 reclaimed_in_flight=true，模拟崩溃恢复放回 pending（reclaim 门只对这条跑 post-hoc）。
+    let collection = app.state.db.collection_agent_send_outbox();
+    collection
+        .update_one(
+            doc! { "_id": outbox_id },
+            doc! { "$set": { "reclaimed_in_flight": true } },
+            None,
+        )
+        .await
+        .expect("set reclaimed_in_flight=true");
+
+    // (d) claim（status pending → in_flight，reclaimed_in_flight 原样保留）。
+    let claimed = atomic_claim_pending(&app.state, "worker_reclaim_search", 60)
+        .await
+        .expect("claim ok")
+        .expect("claimed entry");
+    assert_eq!(claimed.id, Some(outbox_id));
+    assert!(
+        claimed.reclaimed_in_flight,
+        "claim 应保留 reclaimed_in_flight=true（走 reclaim post-hoc 门的前提）"
+    );
+
+    // chat_search 命中（hit_content=claimed.content，精确对齐避免字面漂移）；其它 tool
+    // 返回唯一 newMsgId。**故意不 seed mcp_call_logs**——若 reclaim 直接查本地必查不到。
+    let mcp_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .respond_with(ChatSearchHitResponder {
+            counter: std::sync::atomic::AtomicU64::new(0),
+            hit_content: claimed.content.clone(),
+        })
+        .mount(&mcp_server)
+        .await;
+    let state = common::rebuild_app_state_with_mcp_url(&app, mcp_server.uri());
+
+    // (f) 驱动真实 process_entry。
+    process_entry(&state, &claimed)
+        .await
+        .expect("process entry ok");
+
+    // (g) chat_search 命中即标 sent（不重发）。
+    let entry = collection
+        .find_one(doc! { "_id": outbox_id }, None)
+        .await
+        .expect("query")
+        .expect("entry exists");
+    assert_eq!(
+        entry.status,
+        OutboxStatus::Sent.as_str(),
+        "chat_search 命中即应标 sent（本地无 mcp_call_logs 也不重发），status={:?}",
+        entry.status
+    );
+
+    let recv = mcp_server
+        .received_requests()
+        .await
+        .expect("wiremock recorded requests");
+    let send_calls = recv
+        .iter()
+        .filter(|r| {
+            serde_json::from_slice::<serde_json::Value>(&r.body)
+                .ok()
+                .and_then(|v| {
+                    v.pointer("/params/name")
+                        .and_then(|n| n.as_str())
+                        .map(|s| s == "message_send_text")
+                })
+                .unwrap_or(false)
+        })
+        .count();
+    assert_eq!(
+        send_calls, 0,
+        "chat_search 命中不应真实重发 message_send_text；send_calls={send_calls}"
+    );
+    // 反向坐实走了 chat_search（而非直接查本地/直接重发）：收到过 ≥1 次 chat_search tools/call。
+    let search_calls = recv
+        .iter()
+        .filter(|r| {
+            serde_json::from_slice::<serde_json::Value>(&r.body)
+                .ok()
+                .and_then(|v| {
+                    v.pointer("/params/name")
+                        .and_then(|n| n.as_str())
+                        .map(|s| s == "chat_search")
+                })
+                .unwrap_or(false)
+        })
+        .count();
+    assert!(
+        search_calls >= 1,
+        "reclaim text 路必须先查权威 chat_search；search_calls={search_calls}"
     );
 }
 
