@@ -45,14 +45,16 @@
 - `routes::evolution` HTTP 授权面（第二批 auth/routes 已审）——本批仅审 worker 侧逻辑。
 - `prompt_critic` 调 `generate_agent_json` 的 LLM 入口本身（主链路已审）——仅审 evolution 侧调用契约 + budget 记账。
 
-## 环节汇总（收尾时填）
+## 环节汇总
 
-- 总 findings 数：（TaskE 填）
-- 严重度分布：（H/M/L，TaskE 填）
-- 元家族归纳：（TaskE 填）
-- 后续 P0-P3 路线：（若有 High 优先级高于前四批遗留 Medium，TaskE 填）
-- 交叉去重留痕：（TaskE 填）
-- 正向 HOLDS（主控亲验）：（TaskE 填）
+- **总 findings 数：11**（簇S 4 + 簇1 1 + 簇2 1 + 簇3 3；另簇1/2 各因映射同源交叉，见下）。
+- **严重度分布：0 High / 2 Medium / 9 Low**。2 Medium=[S-01]（默认 runtime_flag=None 被 cohort 当全量收，灰度 fail-safe 网默认失效但 admin 兜底）、[2-01]（post_release 面板 5 闸命中率 delta 用对调 status 映射查生产真实终态→贴错标签，纯观测不反哺决策）。**本批无 High**——最可能出 High 的簇3（放量闭环/自动放量红线）逐条亲验后 3 条全 Low，R9.7「禁自动回滚」HOLDS。
+- **元家族归纳**：本批主线元家族=**「自优化闭环声称的安全不变量在实现层的语义分叉/口径漂移」**，前四批「声称不变量实现层有旁路/层间不对称」在自优化闭环侧的延伸，具体两支：
+  1. **门语义分叉 / fail-safe 反向（[S-01]，最尖锐）**：同一 runtime_flag=None 输入，`is_evolution_enabled_for`（正确排除）与 `select_cohorts_filtered`（当全量收）两函数分叉，加之 `evolution_runtime_flags` 无启动 seed，默认部署灰度 fail-safe 网失效。这是「同一安全语义在两个门函数实现不一致」的典型，与第四批 [3-02]「状态机字面量自相矛盾」同族。
+  2. **gate↔status 映射三文件三向不一致（[1-01]/[2-01]）**：threshold.rs:67-68 / significance.rs:53-54 一份、post_release.rs:55-56 **恰好对调**，且**都与生产真相不符**（生产：fact_risk 硬闸→held_by_ai_policy、pressure_risk 软闸→revision 不产 block status、blocked_by_safety_guard 来自产品声明 fail-closed/relay）。关键分野：shadow 闭环（threshold/significance/replay）**自造合成 status 且同口径判定**→闭环内自洽零后果（[1-01] Low）；post_release **读生产真实 status 计数填面板**→对调直接贴错标签（[2-01] Medium）。元教训=**同一份领域映射散在多文件各写一份、无单一权威常量，必然漂移**（与第四批「聚合 filter 字段与真实写点不对齐」同族——都是"引用生产语义却未回溯真实写点亲验"）。
+- **后续 P0-P3 路线**：本批**无 High**，2 Medium 优先级**低于**前三批遗留（Batch3 High [1-01] initial_profile 无终态写仍是全局 P0；Batch1/2/4 共 12 Medium 在前）。本批 Medium 修复取向：[S-01] 把 `select_cohorts_filtered` 的 None 语义改「全员排除」与 `is_evolution_enabled_for`+mod.rs 注释对齐（推荐 (a)，与 kill-switch 语义一致）；[1-01]+[2-01] 合并收口——三文件统一引用一份**经生产语义核实**的权威 `(gate_key ↔ final_review_status)` 映射常量，post_release 侧尤须修正（唯一读生产真实 status 的路径），并重新定义 pressure_risk 在生产走软闸 revision、无对应 block 终态时其"命中率"口径（可能应改 revision_count/revision_applied）。
+- **交叉去重留痕**：[1-01]（簇1）与 [2-01]（簇2）**同源**（同一份 gate↔status 映射漂移），但分列两条因**后果层级不同**——[1-01] 在合成闭环内自洽无后果（Low），[2-01] 在 post_release 读生产真实 status 贴错面板标签（Medium）；[3-02]（簇3 post_release 非原子写）与 [3-03]（簇3 auto_release write_release_event 冒泡）**同族**（审计 event best-effort 写失败触发误导性 will-retry 语义），修复取向一致（审计 event 改 best-effort 不冒泡 / 先写 event 再置终态）。[S-04]（tick 硬编码 default workspace）与前四批多租户就绪债（[[project-multitenant-isolation-debt]]）同族。
+- **正向 HOLDS（主控亲验，逐条 file:line）**：①**R9.7 禁自动回滚 HOLDS**——rollback 仅 release.rs:428/555 定义，evolution/ 内零调用，唯一调用点 routes/evolution.rs:210/211（AuthenticatedAdmin）。②**auto_release 双闸默认全关**——env 总闸 config.rs:655-658 默认 false AND 子闸 auto_release.rs:39-64 缺失→None→关（fail-safe 方向正确，未踩 [S-01] 反向坑）。③**prompt 绝不自动放量**——auto_release query 硬编码 proposal_kind="threshold"。④**release 三写同事务原子**——override+proposal+audit 同 transaction（release.rs:87-147）。⑤**红线三闸不 fail-open**——release_prompt NeedsHumanConfirm→RedlineGateRejected 中止（release.rs:281-284）。⑥**隔离红线守住**——CI lint 已接线（ci.yml:137-139），全目录无 gateway/outbox/mcp/发送链引用，只用只读/纯计算符号，当前无 grouped import 规避。⑦**prompt_critic/replay 预算记账完整+shadow 隔离**——check_or_fail+record_call 齐备，直调 llm client 绕开 RunBudget，静态扫描单测兜底禁 outbox/mcp 引用。⑧**tick 失败隔离+budget silent skip**——单 tick 失败不传播（mod.rs:66-70），BudgetExceeded 拦下不炸 tick（mod.rs:148-156/189-194）。⑨**significance 安全回归门零容忍**——max_safety_regression_rate 默认 0.0，任一风险消息 blocked→sent 即否决放松提案。
 
 ---
 
