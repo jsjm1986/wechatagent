@@ -1502,6 +1502,16 @@ pub(super) async fn execute_management_tool(
                     None,
                 )
                 .await?;
+            let _ = agent::write_event_for_account(
+                state,
+                account_id,
+                Some(&contact.wxid),
+                "contact.removed_from_ops",
+                "ok",
+                "经管理工具移出 AI 运营",
+                Some(doc! { "actor": "management_tool", "source": "disable_contact_agent" }),
+            )
+            .await;
             Ok(json!({ "ok": true }))
         }
         "wechatagent.create_follow_up_task" => {
