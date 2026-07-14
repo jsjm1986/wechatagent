@@ -244,7 +244,33 @@
 
 ## 簇4 admin/指标/观测域 findings
 
-（主控亲验后填入）
+> 主控亲验结论：**#153 收口仍守住 + 任务最担心的「指标 list/聚合端点跨 workspace 泄漏」零命中**。逐一亲验 behavior_signal_metrics/outcome_metrics/events/outcomes_autonomy/observability/evolution 所有 list/聚合/count 的 `$match` 全含 `workspace_id: admin.current_workspace`；admin_relationship_suggestions/admin_suspected_deals(CAS-first+staff_confirmed 财务红线)/admin_outbox(Jul-14 改)/admin_state_policies/evaluations/guides 是教科书级正例。**唯一实质缺口=taxonomy 一族（4-01）**，模型层无 workspace_id、隔离靠 scope，两处注释亲证是有意接受的策略型债。主控亲验 admin_taxonomies.rs:89/:126 handler 签名确实不接 Extension<AuthenticatedAdmin>、filter 无 workspace_id（:93-107 仅 optional scope/kind），admin_taxonomy_candidates.rs:303-318 注释确认「REST handler 保持原样不加 scope 校验维持现状不回归」，与工具侧 approve_taxonomy_candidate_inner(:319 加 taxonomy_scope_allows 校验)有意不对称。
+
+### [4-01] taxonomy 一族 7 个 handler 零 workspace/scope 隔离（可跨租户改共享字典）
+- 入口频道: admin（分类字典 CRUD + 候选审批）
+- 所属簇: 4
+- 类型: 授权（水平越权：跨租户读 + 写共享字典）
+- 严重度: Medium（主控亲验裁定：**可写**跨租户改字典高于纯读泄漏故不降 Low；但模型层 TaxonomyEntry/TaxonomyCandidate 无 workspace_id、隔离边界=scope 是**有意设计**两处注释亲证、数据是 customer_stage/intent_level/objection_type 枚举字典非客户 PII、系统无 RBAC「谁可改全局字典」定义、单租户默认不可达 → 不夸 High；与第一批 D-08 同型「显式文档化接受取舍」，但可写故不标 WontFix 而留 Medium 待多租户裁决）
+- 现象/风险: 7 个 handler 完全不接 Extension(admin)，filter 无 workspace_id 也无强制 scope：list_taxonomies(admin_taxonomies.rs:89 不传 scope 列全库)/create_taxonomy(:126)/patch_taxonomy(:195 update_one 裸 `{_id}` :242)/delete_taxonomy(:255,:264)/list_taxonomy_candidates(admin_taxonomy_candidates.rs:84)/approve(:123 裸 _id find_one :139 + 写 system_taxonomies :197)/reject(:240 裸 _id :253)。
+- 越权链: 多租户下 ws-A admin 可列/改/删/审 ws-B 账号 scope 的字典项及候选（含跨租户写共享字典项）。数据是枚举字典非客户 PII；所有路由仍在 require_session 后需认证 admin。单租户默认全库=同一 workspace 不可达。
+- 根因（亲验 file:line）: TaxonomyEntry(models.rs:3041 无 workspace_id 仅 scope:"global"|account_id) + TaxonomyCandidate(models.rs:3105 无 workspace_id) 模型层无 workspace 字段；admin_taxonomy_candidates.rs:303-318 注释「REST handler 无 Extension 无 account 来源保持原样不加 scope 校验维持现状不回归」+ admin_ops_versions.rs:921-931 audit_taxonomy_change docstring「Stage4 孤儿 #4…本系统无 RBAC…"谁有权改全局字典"红线/文档均无定义故不加拦截门」双证有意接受；工具侧 approve_taxonomy_candidate_inner(admin_taxonomy_candidates.rs:319)显式**新增** taxonomy_scope_allows(:307/:342)校验，两入口有意不对称。
+- 复现设想: 多租户下 ws-A admin 调 GET/POST/PATCH/DELETE /admin/taxonomies 操作 ws-B 账号 scope 字典项。
+- 验证状态: PLAUSIBLE（handler 不接 Extension + filter 无 workspace_id + 模型无 workspace_id 全亲验；跨租户可达性仅多租户成立单租户不可达）
+- 修复建议: 属 memory project_multitenant_isolation_debt「多租户默认关、单租户无害、启用才需加固」就绪债；是否加 scope/workspace 门取决于是否启用多租户 + 引入 RBAC，属产品裁决。若修：给 taxonomy 模型补 workspace_id（写侧已知 workspace 可落库）或 REST handler 接 Extension 后按 scope=global|current_workspace-account 施加 taxonomy_scope_allows 式校验（与工具侧对齐）。**与 [3-02] 同根因（taxonomy 无 workspace 字段），统一裁决**。
+- 状态: Open
+
+### [4-02] 若干二级写/重读在已授权 _id 上不复述 workspace_id（读门兜住）
+- 入口频道: —
+- 所属簇: 4
+- 类型: 就绪债（防御纵深）
+- 严重度: Low（主控亲验裁定：每处前置都先经一次 workspace 收窄的 find_one 才到达，不可越权；同 S-01 元家族）
+- 现象/风险: lessons_learned.rs:243-255 update_one(`{lesson_id}`)/guides.rs:214,246-250(update status + 重读 contact)/evolution.rs:123-127,233-244,252-260(experiment/proposals/shadow_replays by *_id) 写/重读 filter 漏 workspace_id。
+- 越权链: 当前不可达——lesson_id="{workspace_id}::{pattern_kind}"自带 workspace 前缀(knowledge_wiki/lessons_learned.rs:125)+ :157 find_one 已带 workspace 门；guides preview/contact 前置经 `{_id, workspace_id[, account_id]}` 门取回；evolution experiment_id/proposal_id 均来自前置 `{_id, workspace_id}` 门取回的 proposal。
+- 根因（亲验 file:line）: lessons_learned.rs:243-255/guides.rs:214,246-250/evolution.rs:123-127,233-244,252-260 二级 filter 未复述 workspace_id，靠前置 workspace-locked find_one。
+- 复现设想: 无当前触发路径（除非跨 ws *_id 碰撞，非现实威胁）。
+- 验证状态: 已亲验不可利用（防御纵深缺口）
+- 修复建议: 二级 filter 补 workspace_id 做纵深，无紧迫性。同 S-01/1-02/1-03 可一并补齐。
+- 状态: Open
 
 ## 簇5 knowledge 端点层 findings
 
