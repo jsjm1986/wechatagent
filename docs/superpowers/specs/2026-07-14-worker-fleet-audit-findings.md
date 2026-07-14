@@ -130,7 +130,65 @@ outbox_dispatcher（上轮主链路已审 + F-01）/ strategic_planner（第一�
 
 ## 簇1 派生任务执行 worker findings
 
-（主控亲验后填入）
+> 主控亲验结论：**worker claim/心跳/回收/import 终态全 CAS 骨架 HOLDS（7 判据逐条过）；本簇报出第三批唯一 High [1-01]**——`initial_profile` 是四个 task kind 里唯一"成功后不写 tasks 终态"的，元家族"新增 kind 与既有 kind 收尾契约不对称"实例。亲验四点全坐实：①tick Ok 分支只写 `follow_up_processed` 事件不写终态(tasks.rs:242-253) ②handle_initial_profile_task 全函数只碰 contacts、三早退全 `Ok(())`、主路径终于 apply_generated_profile_to_contact，**从不写 tasks 集合**(contacts.rs handle_initial_profile_task) ③对比另三 kind 均写终态：outcome_aggregation→sent(tasks.rs:232)、memory_consolidation→consolidate_contact_memory_inner 三处终态(memory.rs:1239 no_candidates→sent / :1599 occ_conflict→retry / :1724 consolidated→sent)、follow_up→gateway outbox_enqueued(gateway.rs:401/418)或 cancel/reschedule(:1099/1101) ④agent_tasks 对 follow_up/initial_profile 无唯一索引兜底(grep uniq 零命中，只 outcome_aggregation 有)。
+
+### [1-01] `initial_profile` 任务成功后无终态写入 → 停 running 被 reclaim 反复重跑 + 画像覆写 + 误判 failed
+- 入口频道: 后台 task worker（initial_profile kind）
+- 所属簇: 1
+- 类型: 崩溃恢复 / 状态机契约不对称（元家族命中）
+- 严重度: **High**（主控亲验裁定：单进程默认部署下**每条 initial_profile 任务确定性命中**——非并发/非多副本条件。裁定张力已核：subagent 诚实标注"若严格按客户可见后果判据可降 Medium"（画像首跑已落库非丢失、无客户可见消息重复）；但按第三批校准口径 High=确定性可达的丢任务/卡死——此处功能生命周期确定性破坏+每条必中+3×LLM 浪费+**旧初始画像覆写窗口内累积的画像更新（数据正确性损害）**+recovery_count≥3 误判 failed（丢任务语义），维持 High）
+- 现象/风险: initial_profile 任务成功生成并落库画像后，tasks 集合状态永远停在 `running`，被 reclaim_stale_running_tasks 判定 stale 反复重置 retry 重跑，直到 claim_recovery_count≥3 被强制误判 `failed`。
+- 失效链:
+  1. contacts 批量托管产出 initial_profile 任务，worker CAS claim 成 running+claimed_at(tasks.rs:192-209)。
+  2. handle_initial_profile_task 成功：build_initial_operation_profile + apply_generated_profile_to_contact 写 contacts，返回 `Ok(())`——**从不写 tasks 终态**。
+  3. tick Ok 分支(tasks.rs:242-253)只写 `follow_up_processed` 事件，也不写 task 终态 → 任务留在 running。
+  4. 下一 tick reclaim(tasks.rs:34-53) 按 claimed_at<stale_before 判 stale → CAS 重置 retry。
+  5. 反复重跑：每次 3×LLM(build profile) + apply 覆写 contacts 画像。若窗口内客户来消息推进了画像，重跑用新生成的**初始**画像覆盖累积更新。
+  6. claim_recovery_count≥3 → 强制 `failed`(tasks.rs:67-115)，功能被误判失败终结。
+- 根因（亲验 file:line）: tasks.rs:234-235 分派 initial_profile→handle_initial_profile_task(&task)；该 handler(contacts.rs) 全函数只 find_one contacts + build profile + apply_generated_profile_to_contact，三早退分支 `Ok(())`，无任何 tasks().update_one 终态写；tick Ok 分支 tasks.rs:242-253 不代写终态（契约=各 kind 自写）；对比 memory.rs:1239/1599/1724 + tasks.rs:232 + gateway.rs:401/1099 三 kind 都写。
+- 复现设想: 单进程；托管一个 contact 产出 initial_profile 任务；观察成功落库画像后 task 停 running，task_claim_timeout 后被 reclaim 重置 retry 重跑，累计 3 次后 status=failed。
+- 验证状态: CONFIRMED（四点断言逐条 Read 亲验；单进程确定性命中）
+- 修复建议: handle_initial_profile_task 成功落库后写 CAS 终态 `update_one({_id, status:"running"}, {$set:{status:"sent", gateway_status:"profiled"}})`（对齐 outcome_aggregation 范式）；两个早退分支（contact 不存在 / 非 managed）也各写终态（sent/skipped），使成功与合法早退都脱离 running。这是唯一 High，优先级高于第一批 5 Medium + 第二批 2 Medium。
+- 状态: Open
+
+### [1-02] outcome_aggregation 去重唯一索引缺 workspace_id（与 S-03 同根因）
+- 入口频道: —
+- 所属簇: 1（与簇S S-03 同一索引缺陷，收尾交叉去重归并）
+- 类型: 幂等 / 就绪债
+- 严重度: Low（主控亲验裁定：单租户默认 account_id 全局唯一永不触发；多租户两 workspace 复用同一 account_id 时第二条聚合任务被 dup-key 误去重致指标缺失）
+- 现象/风险: 见 S-03。unique index keys=`{kind, account_id, content}` 不含 workspace_id。
+- 越权链: —
+- 根因（亲验 file:line）: indexes.rs:117-121 keys 仅 kind/account_id/content；插入体 tasks.rs 带 workspace_id 但索引未纳入。
+- 复现设想: 见 S-03。
+- 验证状态: PLAUSIBLE（索引缺列亲验；撞名取决于是否允许 account_id 跨 workspace 复用）
+- 修复建议: 改 unique index 为 `{workspace_id, kind, account_id, content}` + 清历史重复 migration。与 S-03 同条修复。
+- 状态: Open
+
+### [1-03] tasks.rs 终态/重试/取消写用无状态前置的 `{_id}` filter（与 import_worker 全 CAS 不对称）
+- 入口频道: —
+- 所属簇: 1（与簇S S-04 同族，均"收尾写无状态前置"）
+- 类型: 非原子写 / 就绪债
+- 严重度: Low（主控亲验裁定：单进程串行 worker 独占任务安全；仅多副本部署下迟到收尾写会盖掉另一副本重 claim 的 running）
+- 现象/风险: tasks.rs:262/296 重试写 retry、终态写 failed 用 `update_one({_id: task_id})` 无 `status:running` 前置；对比 import_worker.rs 全 `{_id, status}` CAS。
+- 越权链: —
+- 根因（亲验 file:line）: tasks.rs:262 `doc!{"_id":task_id}`、:296 `doc!{"_id":task_id}`，对照 claim :198 的 `{_id, status:&task.status}`。
+- 复现设想: 仅多副本；heartbeat 失效+timeout+另副本重 claim+本副本迟到收尾写叠加。
+- 验证状态: PLAUSIBLE（filter 无前置亲验；单进程无并发 tick 故单机不可达）
+- 修复建议: 多副本化前无需动；多副本时收尾 update_one 加 `status:running` 前置。同 S-04。
+- 状态: Open
+
+### [1-04] heartbeat 持续续约掩盖"假死未 crash"handler + 串行 loop 单任务卡死阻塞全部
+- 入口频道: —
+- 所属簇: 1
+- 类型: 观测 / 就绪债
+- 严重度: Low（主控亲验裁定：上游 IO 均有 timeout 故当前有界；heartbeat 续约设计本意防长任务误回收，副作用是无法区分"真长任务"与"卡死未 panic"，且串行 tick 单任务卡死会阻塞后续任务本 tick）
+- 现象/风险: heartbeat 每 timeout/2 bump claimed_at，若 handler 逻辑假死（未 panic 也未返回，如无限等待）则任务永远续约不被 reclaim；且串行 loop 内单任务卡死阻塞本 tick 剩余任务。
+- 越权链: —
+- 根因（亲验 file:line）: tasks.rs:225-239 spawn_claim_heartbeat + 串行 while-cursor await。
+- 复现设想: handler 内出现无 timeout 的等待（当前不存在——LLM/DB/MCP 均有 timeout）。
+- 验证状态: PLAUSIBLE（当前上游 timeout 使其有界，属观测项非缺陷）
+- 修复建议: 低优先。可加 handler 级总时限 / 单任务处理超时告警，仅观测增强。
+- 状态: Open
 
 ## 簇2 主动触达调度 worker findings
 
