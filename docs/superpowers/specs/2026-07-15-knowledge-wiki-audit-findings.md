@@ -43,12 +43,26 @@
 
 ## 环节汇总（收尾时填）
 
-- 总 findings 数：（TaskE 填）
-- 严重度分布：（H/M/L，TaskE 填）
-- 元家族归纳：（TaskE 填）
-- 后续 P0-P3 路线：（若有 High 优先级高于前三批遗留 Medium，TaskE 填）
-- 交叉去重留痕：（TaskE 填）
-- 正向 HOLDS（主控亲验）：（TaskE 填）
+- **总 findings 数：32**（簇S 8 + 簇1 9 + 簇2 7 + 簇3 8）
+- **严重度分布：0 High / 5 Medium / 27 Low**（subagent 自评合计 3 High/10 Medium；主控亲验后 3 个 High 全降 Medium、多个 Medium 降 Low——见下"主控校准降级"）。
+- **5 Medium**：
+  - **[3-01]** `lessons_learned` success/failure 两支 filter 引用幽灵字段 `review.reaction_analysis.user_polarity`（三重落空：查错集合 agent_run_logs 非 decision_reviews / DecisionReviewResult 无 reaction_analysis 子文档 / 字段名从不存在真实是 outcomeStatus）→ 恒命中 0，学习闭环 inert。
+  - **[3-02]** `lessons_learned` blocked 支 filter `lifecycle="completed" AND final_review_status="blocked_by_safety_guard"` 互斥（`derive_lifecycle_from_status` 保证 blocked_by_safety_guard 恒派生 failed_after_decision）→ 恒 0。与 [3-01] 联合使 lessons_learned 三类模式全 inert。
+  - **[2-01]** ingest 落库入口 `content_hash:None` + 无条件 insert，幂等完全押 HTTP 条件 GET(ETag) 单点 → 不返 ETag 的源每轮全量重复落库、无界增长（**需 `INGEST_WORKER_ENABLED` 显式开启，默认关**）。
+  - **[1-01]** `knowledge_gap_signals` 无 (workspace,chunk,kind) 业务去重唯一索引，structural lint 走 find-then-insert 应用层查重 → 并发/多副本双插同信号（单进程串行 worker 默认不触发）。
+  - **[S-08]** `apply_chunk_revision` 读-改-写非原子（find_one → replace_one 无乐观锁 CAS），软锁不阻写 → 两个并发 patch 同一 chunk lost update（admin 协作场景，有 chunk_revisions 历史可 rollback）。
+- **元家族归纳**：本批主线元家族 = **「设计声称的闭环/去重不变量，实现层 filter 字段与真实写点数据形状/状态机派生规则不对齐，或缺唯一索引兜底，导致恒空/可重复」**。三个维度：①**幽灵字段/自相矛盾 filter**（[3-01]/[3-02]，凭设计意图写 filter 未亲验写侧真实字段/状态机派生规则，致聚合恒空）②**幂等靠应用层 find-then-insert 而非唯一索引/内容指纹兜底**（[1-01] 信号无去重唯一索引、[2-01] ingest 落库无 content_hash 去重——外部协议/串行假设一旦不成立即失效，与主动侧 outbox sha256 幂等键、silence partial unique 的强幂等姿势层间不对称，延续 Batch3 元家族到 knowledge 侧）③**读改写/双写非原子窗口**（[S-08] chunk patch 无乐观锁、[S-01] revisions→chunks 双写非事务、[1-02] usage refresh 与编辑并发——但 [1-02] 亲验 $set 限定字段无 body 覆盖降 Low）。
+- **后续 P0-P3 路线**（本批 0 High，优先级**低于**前三批遗留：Batch3 [1-01] High initial_profile 终态仍是最高 P0）：
+  - **P1（Medium）**：[3-01]+[3-02] 一并修（lessons_learned filter 改到正确集合 decision_reviews + 真实字段 outcomeStatus + blocked 支去掉 lifecycle=completed 约束），使学习闭环真正可命中——这是"整模块 inert"，修复价值最高的 Medium。
+  - **P2（Medium）**：[2-01]（ingest 落库加 content_hash 去重，即便 worker 默认关也应治本，防开启即灌爆）+ [1-01]（gap_signals 加 partial unique 索引）+ [S-08]（chunk patch replace_one filter 加 before_hash 乐观锁 CAS）。
+  - **P3（Low 批量）**：27 Low 就绪债/边界/标注批量收口（TTL/阈值可配/contradiction normalize/orphan age 下限等）。
+- **交叉去重留痕**：
+  - **[S-01]（双写非原子）与 [S-08]（读改写 lost update）** 同属"非原子写窗口"元家族但根因不同（S-01=跨集合双写无事务、S-08=同集合读改写无乐观锁），各自独立保留。
+  - **[3-01] 与 [3-02]** 同致 lessons_learned inert 但根因正交（字段路径落空 vs 状态机字面量互斥），独立保留，P1 一并修。
+  - **[1-01]（信号无唯一索引）与 [2-01]（ingest 无内容去重）** 同属"幂等靠应用层非索引/指纹兜底"元家族，跨簇呼应但审查对象不同（信号生成 vs 摄取落库），各自保留、元家族段归纳。
+  - **[S-04] related_chunks 不 union** 与 [1-08] broken_link sweep 语义一致标注（都涉 related_chunks 生命周期），S-04 已明确"设计正确"，不重复计为缺陷。
+- **正向 HOLDS（主控亲验）**：①**"AI 永不自动 verify" 红线跨全摄取入口 HOLDS**——chunk_revisions AI-source 强制 draft+needs_review（:223-225）、ingest block/fallback 路径无条件压 draft+needs_review（import.rs:1192/1242/1248）、结构化写只产 pending_review（structural_proposals 序列化层锁死无 apply/commit/delete 字段）②**信号/统计"只观测不进决策" 红线 HOLDS**——Grep `src/agent/` 全目录零读取 knowledge_gap_signals/structural_proposals/lessons_learned/reviewer_stats/deal_attribution_stats，消费端全在 routes/ admin 面板③**page_merge 纯函数正确**——union 幂等/保序、锁定字段双层防护（patch 硬拒 + enforce 末次覆盖）、70% 截断阈值、canonical hash 字段序无关（15 单测覆盖 KB-09/KB-11 回归哨兵）④**catalog job claim CAS HOLDS**——find_one_and_update `{status:queued}→processing` 原子 + signal_id/job_id 唯一索引无 TOCTOU⑤**normalize_ref_key 无 substring 误伤**（openai≠ai）⑥**三张滚动统计幂等姿势正确**（$set 快照覆盖非 $inc + 唯一 stat_id/lesson_id upsert）⑦**S-02 AI restore 绕 needs_review 不可达**（唯一 source=Ai 调用点 chat.rs:1786 恒 op=Patch，所有 restore/archive 硬编码 source=Human）⑧**not-due 不写任何 DB HOLDS**（Skipped 分支不刷 last_fetched_at，防节流基准前推）。
+- **主控校准降级留痕**（防夸大红线）：subagent 自评 3 High（[3-01]/[2-01] + 簇S subagent 无 High，实为簇3+簇2 各 1 + 另一说法合计），主控亲验后**全部降 Medium**——判据：三者均 **observation-only/功能门后确定性可达但无客户面可见后果、无数据污染、不反哺决策、有兜底**，较 Batch3 唯一 High [1-01]（initial_profile 丢任务 + 3×LLM 浪费 + 画像旧值覆写=资源浪费+数据正确性损害+功能生命周期确定性破坏）轻一档。[3-01]=学习闭环 inert 但经 admin review 才晋升 chunk 无正确性损害；[2-01]=INGEST_WORKER_ENABLED 默认关需显式开启 + draft 不进 verified 池不误发；[S-08]=admin 协作低频 + chunk_revisions 历史可 rollback。多个 Medium 亦降 Low：[2-02]/[2-03]（同门后/实时聚合兜底）、[1-02]（$set 限定字段无 body 覆盖）、[3-03]（单租户 default_workspace 恒在列表不可达）。
 
 ---
 
