@@ -3021,6 +3021,12 @@ pub struct OutboxEntry {
     /// 标 sent 不重发——避免给客户发重复消息。`#[serde(default)]` 兼容旧文档。
     #[serde(default)]
     pub reclaimed_in_flight: bool,
+    /// F-04：被 `reclaim_expired_leases` 回收的累计次数（每次 lease 过期 reclaim +1）。
+    /// worker 反复在同位置崩溃 → 无限 reclaim 永不进终态，超 OUTBOX_MAX_RECLAIMS 转
+    /// failed_terminal 止损。reclaim ≠ 发送 attempt，故独立计数不复用 max_attempts。
+    /// `#[serde(default)]` 兼容旧文档（=0）。
+    #[serde(default)]
+    pub reclaim_count: i32,
     pub created_at: DateTime,
     pub updated_at: DateTime,
     pub sent_at: Option<DateTime>,
@@ -5634,6 +5640,7 @@ mod typed_tests {
             worker_id: None,
             locked_until: None,
             reclaimed_in_flight: false,
+            reclaim_count: 0,
             created_at: now,
             updated_at: now,
             sent_at: None,

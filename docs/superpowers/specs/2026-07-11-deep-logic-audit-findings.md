@@ -149,7 +149,7 @@
 - 复现设想: 精确时序——过 :2542 guard 后、多段 enqueue 期间灌新入站（窗口约 10-100ms）。观察 outbox 两批 segment（source_event_id 不同）。可 117 复现但时序窗极窄、需注入延迟，生产自然触发概率低。
 - 验证状态: PLAUSIBLE（读码）
 - 修复建议: 协作式抢占固有尾窗；彻底消除需"入队后按 generation 撤销 pending outbox"补偿（重算前先 cancel 上一 gen 的 pending，用 gen/run_id 标记 outbox 归属）。属产品取舍，Open 待裁决；生产影响小。
-- 状态: Open
+- 状态: 已知产品取舍待专项（家族⑨ 标注不修 —— 协作式抢占固有尾窗，彻底消除需 gen 撤销补偿触碰 outbox 幂等核心风险最高；#待补）
 
 ### [B-02] reaction 分析脚手架的瞬时 DB 错误经 `?` 上抛，吞掉本轮聚合回复（补 F-021 深层）
 - 入口频道: userOps
@@ -173,7 +173,7 @@
 - 复现设想: contact managed，客户发消息触发 runner；决策期间（借慢 LLM 拉长窗口）管理员改 normal。观察回复仍发。可 117 复现（谨慎，勿碰真人吴界）。
 - 验证状态: PLAUSIBLE（读码）
 - 修复建议: outbox 入队前兜底 guard（:2531 附近）追加一次 `agent_status==Managed` fresh 复核（或让抢占 guard 一并检测状态翻转）。多一次 DB 读换"止发即时生效"。属加固项，生产窗口小。建议 Open。
-- 状态: Open
+- 状态: Fixed（家族⑨ #待补 —— second_safety_gate 发送前 fresh 复核 managed，非 managed 拦截 not_managed_at_send）
 
 ### 已知非本轮 bug 的架构约束（不重复入 finding）
 - reload 查询缺 `workspace_id`（`webhooks.rs:279` 只 `{account_id,wxid}`，入口是三键），单副本单 workspace 无害（account 绑定唯一 workspace）；理论多 workspace 撞 account+wxid 才取错。极低风险 nit，与多租户就绪债同族。
@@ -292,7 +292,7 @@
 - 现象/根因（亲验）: `reclaim_expired_leases`(:98-128) 仅置 pending+reclaimed_in_flight，attempt 不变；被 reclaim 条目若判未发出走全新实发（非 schedule_retry_or_terminal），不累加 attempt、不受 max_attempts 约束。若 worker 每次同位置崩溃→无限 reclaim→重试永不进 failed_terminal。生产单 worker 崩溃罕见，影响小。
 - 验证状态: PLAUSIBLE（纯边缘）
 - 修复建议: 可选——加独立 `reclaim_count` 上限，超限转 failed_terminal 交 admin。
-- 状态: Open
+- 状态: Fixed（家族⑨ #待补 —— reclaim 累加 reclaim_count，>5 转 failed_terminal 止损）
 
 ## 环节⑦ MCP 发送（message_send_text / result.isError / 超时）
 
