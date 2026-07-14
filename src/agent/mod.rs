@@ -532,10 +532,10 @@ mod tests {
             emotional_value_rewrite_below: 6,
             product_accuracy_block_below: 7,
             operation_state_confidence_full_review_below: 4,
-            run_token_budget: 30000,
-            run_token_budget_escalated: 100000,
+            run_token_budget: 150000,
+            run_token_budget_escalated: 500000,
             run_max_llm_calls: 6,
-            simulation_token_budget: 60000,
+            simulation_token_budget: 300000,
             reaction_token_budget: 8000,
             reaction_max_llm_calls: 2,
             // agent-autonomy-loop W0 / Task 1.3：测试默认值与
