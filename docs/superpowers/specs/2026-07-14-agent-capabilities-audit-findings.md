@@ -42,12 +42,20 @@
 
 ---
 
-## 环节汇总（收尾时填）
+## 环节汇总
 
-- 总 findings 数：（待填）
-- 严重度分布：H / M / L（待填）
-- 元家族归纳：（待填）
-- 后续 P0-P3 修复路线建议：（待填）
+- **总 findings 数：20**（簇A 7 + 簇B 3 + 簇C 5 + 簇D 5）
+- **严重度分布：0 High / 5 Medium / 15 Low**
+  - Medium（5）：A-01 core_facts 缺证据门 / A-02 confirmed_tags 截断 replace 丢标签(偏 High) / A-03 consolidation 跨集合写非原子重放 / C-01 stagnation 读写不对称 / C-02 初始画像半接线残留销售 schema
+  - Low（15）：A-04/A-05/A-06/A-07、B-01(Low-Med)/B-02/B-03、C-03/C-04/C-05、D-01/D-07 + 3 条 WontFix 性质（D-02 by-design 观测 / D-05 既定产品范围 / D-08 已文档化接受取舍）
+- **无 High、无红线破坏**：核心红线（bayesian/personality 只写不进决策、影子发送侧零副作用、entitlements fail-closed）逐条亲验全部 HOLDS。
+- **元家族归纳（本批主线）**：**证据门/合并保护的层间不对称** —— 记忆/标签子系统里"某一层有 fail-closed 证据门或保留合并、对称的另一层却没有"。A-01（core_facts 无证据门 vs tags/personality 有）与 A-02（confirmed_tags 无保留合并 vs core_facts 有）是同一元家族的一对镜像；C-01（读侧动态 vs 写侧写死）、C-02（reply 路径接线 vs 初始画像半接线）是"新旧/读写路径不对称"的延续（与上轮 53findings 元家族同型）。其余为死代码/文档漂移/TOCTOU/边缘就绪债。
+- **后续 P0-P3 修复路线建议**：
+  - **P0**：无（0 High）。
+  - **P1（Medium，优先）**：A-02（最值得修，有现成未消费的 discardedTags 通道可直接实现"显式弃用才移除"）+ A-01（证据门对齐）宜同族处理（都是记忆层证据/保留不对称）；C-01（stagnation 写侧补维度时间戳）+ C-03（配套订正陈旧注释）同族；C-02（初始画像补维度指引）；A-03（consolidation 原子性/fail-soft 对齐）。
+  - **P2/P3（Low）**：A-04(validate 接线或改文档)/A-05(部分唯一索引)/A-06/A-07、B-01(收敛双写单点)/B-02(删死代码)/B-03、C-04(移除过期 allow)/C-05(注释)、D-01(影子只读)/D-07(吞错补 warn)。
+  - **WontFix 留痕**：D-02/D-05/D-08（主控亲验确认非缺陷或已裁决接受取舍）。
+- **交叉去重**：无跨簇重复 finding。A-02（confirmed_tags 记忆丢失）与 B-01（taxonomy 候选双写）虽都涉标签，但前者是 memory consolidation 的 confirmed_tags replace、后者是 taxonomy_candidates 的 upsert 双计，属不同集合不同写路径，非重复。
 
 ---
 
