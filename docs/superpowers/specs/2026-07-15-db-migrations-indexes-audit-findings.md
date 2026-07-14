@@ -77,7 +77,26 @@
 
 ## A 组 findings（迁移框架根因层）
 
-（主控亲验后填入）
+> 主控逐行读 `mod.rs`(277 全) + `helpers.rs`(257 全) + APP_ENV 守卫家族（m011/m012/m014/m016）。框架设计稳健，**1 条 Low（非事务序，幂等兜底）**，其余正向 HOLDS。
+
+### [A-01] run_with 先跑 step 后 insert MigrationRecord 非事务 → step 成功但标记写失败会重跑
+- 入口: `run_with`（`src/db/migrations/mod.rs:223-246`）
+- 所属组: A
+- 类型: 非事务序|幂等
+- 严重度: **Low**（主控裁定：非事务窗口客观存在，但框架从设计上要求每条 step 幂等（`mod.rs:4` 明示「即使标记丢失，重跑也不破坏数据」），已逐条亲验各 step 幂等 filter 兜住重跑；故重跑不损坏数据 → 观测/边缘，非确定性可致错）
+- 现象/风险: `mod.rs:237 (migration.run)(db).await?` 跑完 step 后，`mod.rs:242 collection.insert_one(record)` 才写 MigrationRecord。两步非事务：step 成功但进程在 insert 标记前崩溃/insert 失败 → 该迁移下次启动重跑。
+- 失效链: step 成功 → insert 标记前崩溃 → 重启 → `find_one({_id})` 仍不存在 → 重跑同一 step。若 step 非幂等则损坏；但全部 step 经亲验幂等（`$exists:false` / `commitments 不存在` / upsert / delete_many 二次 matched=0）→ 重跑无害。
+- 根因（亲验 file:line）: `mod.rs:225-244` 循环体：`find_one`（:226）→ `is_some()` skip（:229）→ `(migration.run)(db).await?`（:237）→ `insert_one(record)`（:242）。step 与标记写非同一 transaction。
+- 复现设想: 迁移 step 成功后、insert 标记前 kill 进程；重启观察该 step 重跑（幂等 step 无副作用）。
+- 验证状态: PLAUSIBLE（非事务窗口确凿；幂等兜底使后果为零，故 Low）
+- 修复建议: 框架无需改——幂等是 step 的契约（`mod.rs:4` 已明示且逐条满足）。若未来引入非幂等 step，需在 step 内自带 CAS/标记，或把 step+标记包进 transaction。当前无缺陷。
+- 状态: Open
+
+**A 组正向 HOLDS（主控亲验）**：
+- **APP_ENV 守卫形态正确（防 boot-brick）**：m011（`m011:19-25`）/m012（`m012:19-25`）/m014（`m014:15-21`）/m016（`m016:96-102`）四个破坏性/回填迁移的 `APP_ENV=production` 守卫全是 **warn+`return Ok(())`** noop 形态——注释明示（`m011:8-10`/`m012:8-9`）为何不用 `Err`：返 Err 会在 `mod.rs:237 .await?` 处于 insert 标记（:242）前中断，迁移永不入账，每次启动重试重错（boot-brick 无干净恢复路径）。设计正确。
+- **id 唯一 + 时序单测兜底**：`mod.rs:252-276` 两单测锁死 MIGRATIONS id 唯一（dedup 前后长度相等）+ 严格时序递增（windows(2) 断言 `[0].id < [1].id`）——防重复 id 致某迁移被跳 / 乱序执行。
+- **helpers 3 纯函数「只补缺失不覆盖」**：`merge_allowed_from_defaults`（:14-49）/`merge_state_flag_defaults`（:57-83）/`upgrade_fact_array`（:88-128）均 `!contains_key` 才写 + `changed` 门控空写（false 默认不落库），不覆盖运营人员已写值；6 单测覆盖「不覆盖已写值 / 已完整时不空写 / false 默认不落库」（:149-256）。
+- **run 执行序**：`run`（:218-220）→`run_with(MIGRATIONS)`，main.rs 保证 migrations 先于 ensure_indexes（CLAUDE.md 架构约束），迁移间严格 id 顺序串行（:225 for 循环）。
 
 ## B 组 findings（数据变形迁移）
 
