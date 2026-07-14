@@ -201,7 +201,46 @@
 
 ## 簇3 媒体/运营动作域 findings
 
-（主控亲验后填入）
+> 主控亲验结论：**运营动作触发面（圈人群发/推名片/影子模拟/换素材）在真正的租户边界 workspace_id 上锁得干净——无跨 workspace 触发他人租户运营动作的真 High IDOR**。所有 send/action-trigger 写端点目标（contacts/campaign/card/asset）恒被 workspace_id 过滤。simulations.rs 是范式标杆（validate_account+find_contact_by_id+归属双核+shadow 不真发）。**主控关键校准：subagent 标 3-01 为 Medium，亲验 create_campaign(campaigns.rs:227-263)后降为 Low**——workspace_id 恒由会话注入(:245)、圈人 resolve_segment_contacts 恒同传 campaign.workspace_id(:283/:353)、脏 account_id 只能圈 0 人(dispatch :359-361 命中0直接 BadRequest)或落本 workspace 死作用域标签，无越权后果（校准口径「输入校验无越权后果=Low」），且 :131-134 注释明写「不额外校验账号归属」是显式设计。
+
+### [3-01] 4 个 action-capable 端点收 account_id 但不过 validate_account（自限不跨租户）
+- 入口频道: admin（圈人活动创建/素材上传/名片创建/内容资产创建）
+- 所属簇: 3
+- 类型: 输入校验（偏离基准 #3：涉 account 未 validate_account）
+- 严重度: Low（主控亲验降级裁定：subagent 初判 Medium，但 workspace_id 恒会话注入是真租户边界，脏 account_id 自限——圈人 0 命中即 BadRequest 不发送/素材落本 workspace 死作用域标签，**无跨租户读写、无动作触发**；校准口径「输入校验无越权后果=Low」；且 create_campaign 注释:131-134 显式声明「不额外校验账号归属」为设计选择）
+- 现象/风险: create_campaign(campaigns.rs:239-242)/upload_media_asset(media_assets.rs:105-108,140)/create_referral_card(referral_cards.rs:63,74)/create_content_asset(assets.rs:137) 接收 body/multipart account_id 但不调 validate_account(current_workspace, account_id)。
+- 越权链: 无跨租户越权——workspace_id 会话注入为真边界，account_id 仅作 scope 标签，脏值自限本 workspace（圈 0 人/死作用域）。
+- 根因（亲验 file:line）: campaigns.rs:239-242 account_id 回落 default 或取 body 不校验归属，:245 workspace_id=admin.current_workspace（真锁），:283/:353 resolve_segment_contacts 恒同传 campaign.workspace_id，:359-361 命中 0 人 BadRequest；referral_cards.rs:63/:73 + media_assets.rs:140/:160 account_id 仅当 scope 标签、读写 filter 恒 `{_id, workspace_id}`（referral :98/:139/:197/:257；media :214/:286/:341/:460/:507/:538）亲验。
+- 复现设想: 传外域 account_id 建 campaign → dispatch 圈本 workspace managed 联系人 0 命中 → BadRequest 不发送（无跨租户效果）。
+- 验证状态: CONFIRMED（代码偏离 + 自限性亲验：脏 account_id 不可跨租户）
+- 修复建议: 4 端点补 validate_account(current_workspace, account_id) 做输入健壮性（廉价保险，非安全阻断）；或显式在注释确认 account_id 纯 scope 标签设计。低优先。
+- 状态: Open
+
+### [3-02] ask-human 收件箱 taxonomy 全局候选池无 workspace 过滤（同 4-01 根因）
+- 入口频道: admin（ask-human 审核收件箱）
+- 所属簇: 3
+- 类型: 敏感泄漏（跨租户 evidence 可见性）
+- 严重度: Low（主控亲验裁定：TaxonomyCandidate 模型无 workspace_id、隔离靠 scope，account 私有候选 scope=account_id 正确未暴露仅暴露 global；多租户下 global 候选 evidence 跨租户可见为就绪债；单租户默认不可达；与 [4-01] 同根因 taxonomy 一族无 workspace 字段）
+- 现象/风险: collect_taxonomy_candidates(ask_human_inbox.rs:233-234)/ask_human_summary(:545) 查 `{scope:"global", status:"pending"}` 无 workspace_id 过滤。
+- 越权链: 多租户下租户 A 一次 AI run 生成的 global 候选（evidence 含 A 客户对话片段）出现在租户 B 审核收件箱；任一租户 approve 即全体命名共享字典项。单租户无害。
+- 根因（亲验 file:line）: ask_human_inbox.rs:233-234/:545 查 scope=global 无 workspace_id；TaxonomyCandidate(models.rs:3105-3128)无 workspace_id 字段亲验，隔离键仅 scope。
+- 复现设想: 多租户下租户 B admin 打开 ask-human 收件箱观察含租户 A 客户对话片段的 global 候选。
+- 验证状态: PLAUSIBLE（模型无 workspace_id 亲验；跨租户 evidence 泄漏为多租户推演）
+- 修复建议: 见 [4-01] 统一——taxonomy 一族是否加 workspace/scope 门属多租户+RBAC 产品裁决。本条与 4-01 归并到簇4 taxonomy 元家族留痕。
+- 状态: Open
+
+### [3-03] chunk 协作软锁未做 workspace 归属校验（软锁不 gate 写入）
+- 入口频道: admin（协作编辑软锁 WebSocket）
+- 所属簇: 3
+- 类型: 授权（协作软锁）
+- 严重度: Low（主控亲验裁定：锁表 DashMap 仅以 chunk_id 为键、只比 owner_user_id 不校验 chunk 归属 workspace；但 grep 确认**除 chunk_locks.rs 自身外无任何 chunk 编辑 handler 在写前检查此锁**——软锁纯 UI 协作提示不 gate apply_chunk_revision，绕过零数据完整性影响、无越权写；最坏多租户+已知外域 ObjectId=编辑骚扰+小幅锁元数据泄漏；单租户不可达）
+- 现象/风险: chunk_locks.rs:91 锁表 `DashMap<chunk_id, ChunkEditLock>` 只 chunk_id 为键；acquire(:103-163)/release(:168-198) 只比 owner_user_id，不校验 chunk_id 归属 current_workspace。
+- 越权链: 多租户+已知外域 chunk ObjectId → 跨租户占锁（对方看到 locked_by_other）+ 409/403 响应回吐锁的 workspace_id/owner_username 小幅元数据；软锁不 gate 写入故无越权写；WS 事件流(:234)按 workspace 过滤受害租户收不到骚扰事件。
+- 根因（亲验 file:line）: chunk_locks.rs:91 锁键仅 chunk_id；:103-198 acquire/release 只比 owner_user_id 无 workspace 校验；:89-90 注释辩称 chunk_id 全局唯一 ObjectId 故键安全。
+- 复现设想: 多租户下用已知外域 chunk ObjectId 调 acquire 观察占锁 + 响应体锁元数据。
+- 验证状态: PLAUSIBLE（锁键/所有权亲验；软锁不 gate 已 grep 确认）
+- 修复建议: acquire 前校验 chunk_id 归属 current_workspace（find_one `{_id, workspace_id}` 存在性）再占锁；或维持现状（软锁本就不承担安全边界）。低优先。
+- 状态: Open
 
 ## 簇4 admin/指标/观测域 findings
 
