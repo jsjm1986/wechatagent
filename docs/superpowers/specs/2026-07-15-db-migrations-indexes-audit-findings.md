@@ -118,7 +118,31 @@
 
 ## C 组 findings（seed/drop 迁移）
 
-（主控亲验后填入）
+> seed 家族（m006/m013/m020/m021/m023/m024/m026/m028）全部 `$setOnInsert` upsert 幂等 + 不覆盖运营编辑，主控逐个亲验 file:line；drop 家族（m011/m012/m014）AP_ENV=production→warn+Ok noop 守卫形态正确。核心 finding=[C-01] m011 清空的 `operation_knowledge_chunks` 是**当前 wiki 知识存活集合**，其破坏性完全押在 APP_ENV 守卫 + 迁移已入账双条件上。
+
+### [C-01] m011 `delete_many({})` 全量清空 `operation_knowledge_chunks`（当前 wiki 知识存活集合），破坏性只靠 APP_ENV 守卫 + 已入账兜住
+- 入口: `m011_drop_legacy_sales_collections::run_step`（`src/db/migrations/m011_drop_legacy_sales_collections.rs:19-43`）
+- 所属组: C
+- 类型: 数据丢失|APP_ENV守卫
+- 严重度: **Medium**（主控裁定：m011 对 `operation_knowledge_chunks`/`_documents`/`_items` 三集合无条件 `delete_many({})` 全量清空——而 `operation_knowledge_chunks` 是**当前活跃使用**的 wiki 知识存活集合（`db/mod.rs:149-150` typed accessor + CLAUDE.md 硬规则「产品声明须 verified 知识在 operation_knowledge_chunks」）。若某次启动时 m011 尚未入账 且 `APP_ENV != "production"`，会**清空全部已验证知识库**——生产数据丢失。但严重度非 High：①m011 id `2026_05_V3_002` 若已在生产 migrations 集合入账则**永不重跑**（`mod.rs:229 existing.is_some()→skip`），历史安全；②APP_ENV=production 守卫在设的前提下 noop。故确定性可达需「m011 未入账 + APP_ENV 未设 production」双条件叠加 → 生产实证需求，不凭空判 High）
+- 现象/风险: m011 注释（:1-3）称「开发期数据无价值」，但集合名 `operation_knowledge_chunks` 与当前 wiki 子系统存活集合**同名同用**（非 legacy）。`delete_many({})` 是全量删（filter `{}`）。守卫仅 `APP_ENV=="production"`（`:20`）；`unwrap_or_default()` 使未设 env→空串→非 production→执行删除。
+- 失效链: 全新/迁移记录丢失的生产实例，启动时 APP_ENV 未设为 "production" → m011 `find_one` 不存在 → run_step 执行 → `operation_knowledge_chunks.delete_many({})` 清空全部 verified 知识 chunk → wiki 召回/产品声明 grounding 全部落空（blocked_unverified_product_claim）。
+- 根因（亲验 file:line）:
+  - `m011_drop_legacy_sales_collections.rs:20`：`std::env::var("APP_ENV").unwrap_or_default() == "production"` 守卫（未设→空串→不跳过）。
+  - `m011_drop_legacy_sales_collections.rs:28-34`：`for name in ["operation_knowledge_items","operation_knowledge_documents","operation_knowledge_chunks"] { coll.delete_many(doc!{}, None) }` 全量删三集合。
+  - `src/db/mod.rs:149-150`：`operation_knowledge_chunks` typed accessor 当前活跃。
+  - `src/db/migrations/mod.rs:229`：已入账迁移 skip（历史入账即安全）。
+- 复现设想: 生产 migrations 集合无 `2026_05_V3_002_drop_legacy_sales_collections` 记录（新实例/记录丢失）+ 启动环境未设 `APP_ENV=production` → 启动跑 m011 → 查 operation_knowledge_chunks 计数归零。
+- 验证状态: PLAUSIBLE（代码路径确凿；是否确定性可达取决于生产 117 的 migrations 集合是否已入账 m011 + APP_ENV 是否设 production → **生产实证需求**，见 [[prod-app-env-guard-migrations-risk]]）
+- 修复建议: ①最稳=生产 117 显式设 `APP_ENV=production`（一次性运维动作，同时消解 m012/m014 同类风险）；②m011 的集合名若确指 legacy，应与当前 wiki 存活集合物理区分（改名或加 `legacy_` 前缀），避免「同名集合被 legacy 清理迁移误删」；③长期：破坏性 drop 迁移不应依赖运行时 env 判定，改为一次性运维脚本 + 显式确认。
+- 状态: Open
+
+**C 组正向 HOLDS（主控亲验）**：
+- **seed 家族全幂等**：m006（taxonomy_seed）/m020（purchase_lifecycle）/m021（churn_reason）/m023（value_tier）/m024（relationship_type）/m026（sales_with_relationships）/m028（conversation_mode）全部 `$setOnInsert` + `upsert(true)`（各文件亲验 `$setOnInsert`+`UpdateOptions::builder().upsert(true)`），仅 insert 时写默认值，不覆盖运营人员后续 API 编辑；m006 额外靠 `(scope,kind,value.id)` 唯一索引双层兜底（m006:9-14）。
+- **m013 state policies 无漂移**：`derive_state_policy_lists`（m013:23-39）抽成纯函数作**唯一真相**，与 `routes::admin_ops_versions::publish_state_machine_version` 共用（H13），杜绝 m013 与 publish 路径漂移；find_one 存在即 skip 保留运营调整；单测锁死 DEFAULT 字节等价（:119-139）。
+- **seed 与 prompts.rs 同源**：m006 数据源明示与 prompts.rs 现有 prompt 文案对齐（m006:16-19）；示例 profile（m020/m026）一律 draft 态不激活（零扰动，无 active profile 时回落 DEFAULT）。
+- **drop 家族守卫形态正确**：m011/m012/m014 三破坏性迁移均 `APP_ENV=="production"`→`warn!+Ok(())` noop（非返 Err），注释明示为何用 warn+Ok（返 Err 会在 `mod.rs:237` insert 标记前中断 → 迁移永不入账 → 每次启动重错 boot-brick）——守卫形态本身正确，问题在 [C-01] 的「未设 env + 未入账」窗口 + 集合同名。
+- **m012/m014 破坏性弱于 m011**：m012 删 taxonomy seed（可由 m006 重 seed 恢复）、m014 `$unset trigger_keywords`（字段已下线无用）——数据丢失后果远轻于 m011 清空 verified 知识；同守卫，同 [C-01] 生产实证，合并为交叉去重项不单列。
 
 ## D 组 findings（indexes.rs 唯一性/覆盖）
 
