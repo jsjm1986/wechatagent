@@ -728,7 +728,8 @@ pub async fn batch_enable_endpoint(
         return Err(AppError::BadRequest("candidates is empty".to_string()));
     }
     // account 必须在 wechat_accounts 注册(否则 webhook 入站会被 resolve_account_context 拒收)。
-    if state
+    // 保留 account 对象取 wxid：候选命中账号自身 wxid 时要拦（账号不能运营自己）。
+    let account = state
         .db
         .accounts()
         .find_one(
@@ -736,13 +737,13 @@ pub async fn batch_enable_endpoint(
             None,
         )
         .await?
-        .is_none()
-    {
-        return Err(AppError::BadRequest(format!(
-            "account_id={} 在 wechat_accounts 中未注册，无法批量启用 Agent 运营",
-            payload.account_id
-        )));
-    }
+        .ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "account_id={} 在 wechat_accounts 中未注册，无法批量启用 Agent 运营",
+                payload.account_id
+            ))
+        })?;
+    let account_self_wxid = account.wxid.clone();
     // 可选统一 playbook：校验存在(用 enable 的解析器,None 则账号默认)。
     let playbook = resolve_playbook_for_contact(
         &state,
@@ -766,7 +767,23 @@ pub async fn batch_enable_endpoint(
 
     let mut enabled = 0i32;
     let mut queued = 0i32;
+    let mut rejected_self = 0i32;
     for cand in &payload.candidates {
+        // 账号不能运营自己：候选命中账号自身 wxid → 跳过并留审计。
+        if crate::webhooks::is_self_account(&cand.wxid, account_self_wxid.as_deref()) {
+            rejected_self += 1;
+            let _ = agent::write_event_for_account(
+                &state,
+                &payload.account_id,
+                Some(&cand.wxid),
+                "contact.enable_rejected_self",
+                "rejected",
+                "候选命中账号自身 wxid，已跳过纳入 AI 运营",
+                Some(doc! { "actor": &admin.username, "source": "batch_enable" }),
+            )
+            .await;
+            continue;
+        }
         // 幂等:已 managed 的不重复入队(但仍刷新 note/avatar)。
         let existing = state
             .db
@@ -877,8 +894,28 @@ pub async fn batch_enable_endpoint(
                 .await?;
             queued += 1;
         }
+
+        // 仅对本轮真正新纳入的写加入审计，避免幂等重入刷屏。
+        if !already_managed {
+            let _ = agent::write_event_for_account(
+                &state,
+                &payload.account_id,
+                Some(&cand.wxid),
+                "contact.enabled_for_ops",
+                "ok",
+                "管理员批量纳入 AI 运营",
+                Some(doc! {
+                    "actor": &admin.username,
+                    "source": "batch_enable",
+                    "note": &payload.shared_note,
+                }),
+            )
+            .await;
+        }
     }
-    Ok(Json(json!({ "enabled": enabled, "queued": queued })))
+    Ok(Json(
+        json!({ "enabled": enabled, "queued": queued, "rejectedSelf": rejected_self }),
+    ))
 }
 
 pub(super) async fn enable_agent(
@@ -896,17 +933,32 @@ pub(super) async fn enable_agent(
     // P1：先校验 contact.account_id 在 wechat_accounts 注册过。否则即使写 managed
     // 进去，webhook 入站时 resolve_account_context 也会因为 appId 匹配不到这个
     // account 直接 400 拒收，AI 永远不会回复。
-    if state
+    let account = state
         .db
         .accounts()
         .find_one(doc! { "account_id": &contact.account_id }, None)
         .await?
-        .is_none()
-    {
-        return Err(AppError::BadRequest(format!(
-            "contact.account_id={} 在 wechat_accounts 中未注册，无法启用 Agent 运营",
-            contact.account_id
-        )));
+        .ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "contact.account_id={} 在 wechat_accounts 中未注册，无法启用 Agent 运营",
+                contact.account_id
+            ))
+        })?;
+    // 账号不能运营自己。
+    if crate::webhooks::is_self_account(&contact.wxid, account.wxid.as_deref()) {
+        let _ = agent::write_event_for_account(
+            &state,
+            &contact.account_id,
+            Some(&contact.wxid),
+            "contact.enable_rejected_self",
+            "rejected",
+            "目标命中账号自身 wxid，拒绝纳入 AI 运营",
+            Some(doc! { "actor": &admin.username, "source": "enable_agent" }),
+        )
+        .await;
+        return Err(AppError::BadRequest(
+            "不能对账号自身 wxid 启用 Agent 运营".to_string(),
+        ));
     }
     let playbook = resolve_playbook_for_contact(
         &state,
@@ -932,6 +984,20 @@ pub(super) async fn enable_agent(
         &generated,
     )
     .await?;
+    let _ = agent::write_event_for_account(
+        &state,
+        &contact.account_id,
+        Some(&contact.wxid),
+        "contact.enabled_for_ops",
+        "ok",
+        "管理员纳入 AI 运营",
+        Some(doc! {
+            "actor": &admin.username,
+            "source": "enable_agent",
+            "note": &payload.human_profile_note,
+        }),
+    )
+    .await;
     let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
     Ok(Json(json!({ "item": ApiContact::from(contact) })))
 }
@@ -957,6 +1023,16 @@ pub(super) async fn disable_agent(
         )
         .await?;
     let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
+    let _ = agent::write_event_for_account(
+        &state,
+        &contact.account_id,
+        Some(&contact.wxid),
+        "contact.removed_from_ops",
+        "ok",
+        "管理员停止该联系人的 AI 运营",
+        Some(doc! { "actor": &admin.username, "source": "disable_agent" }),
+    )
+    .await;
     Ok(Json(json!({ "item": ApiContact::from(contact) })))
 }
 
@@ -964,6 +1040,8 @@ pub(super) async fn disable_agent(
 ///
 /// 手动把联系人从运营池移除（媒体号等无法自动判定的非目标）。**不删记录**
 /// ——删了下次对方发消息 webhook 又会重新建档。改标 doc-only `hidden_from_pool=true`，
+/// 并联动 `agent_status=normal` 停止 AI 运营（移出池 = 不再运营，单一真相源：
+/// 回复门只看 agent_status，不看 hidden_from_pool）。
 /// list_contacts / count_contacts 读时过滤（$ne:true）。单向移除，无恢复端点（YAGNI）。
 /// workspace 隔离：filter 带 current_workspace，杜绝跨租户改写（IDOR）。
 pub(super) async fn hide_from_pool(
@@ -977,7 +1055,11 @@ pub(super) async fn hide_from_pool(
         .contacts()
         .update_one(
             doc! { "_id": object_id, "workspace_id": &admin.current_workspace },
-            doc! { "$set": { "hidden_from_pool": true, "updated_at": DateTime::now() } },
+            doc! { "$set": {
+                "hidden_from_pool": true,
+                "agent_status": "normal",
+                "updated_at": DateTime::now()
+            } },
             None,
         )
         .await?;
@@ -985,6 +1067,16 @@ pub(super) async fn hide_from_pool(
         return Err(AppError::NotFound("contact not found".to_string()));
     }
     let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
+    let _ = agent::write_event_for_account(
+        &state,
+        &contact.account_id,
+        Some(&contact.wxid),
+        "contact.removed_from_ops",
+        "ok",
+        "管理员从运营池移除并停止 AI 运营",
+        Some(doc! { "actor": &admin.username, "source": "hide_from_pool" }),
+    )
+    .await;
     Ok(Json(json!({ "item": ApiContact::from(contact) })))
 }
 
@@ -1762,12 +1854,17 @@ mod tests {
         let (base, managed) = contact_count_filters("ws1", "acct1");
         // base 与 managed 都必须含非真人排除的 $nor 顶层键。
         let base_nor = base.get_array("$nor").expect("base 应含 $nor 非真人排除");
-        assert_eq!(base_nor.len(), 3, "$nor 三条件：gh_/@chatroom/系统号白名单");
+        assert_eq!(
+            base_nor.len(),
+            4,
+            "$nor 四条件：gh_/@chatroom/@openim/系统号白名单"
+        );
         assert!(managed.get_array("$nor").is_ok(), "managed 应继承 $nor");
-        // 序列化后应含 gh_/@chatroom/系统号 关键片段，证明排除口径落地。
+        // 序列化后应含 gh_/@chatroom/@openim/系统号 关键片段，证明排除口径落地。
         let s = base.to_string();
         assert!(s.contains("gh_"), "排除条件应含 gh_ 公众号前缀");
         assert!(s.contains("@chatroom"), "排除条件应含 @chatroom 群");
+        assert!(s.contains("@openim"), "排除条件应含 @openim 企业微信号");
         assert!(s.contains("weixin"), "排除条件应含系统号白名单(weixin)");
         // 与既有隔离键共存不冲突。
         assert_eq!(base.get_str("workspace_id").unwrap(), "ws1");
