@@ -181,7 +181,117 @@
 
 ## 簇 1 findings（信号生成消解）
 
-（主控亲验后填入）
+> 审查对象：`gap_signals.rs`(2170) + `structural_proposals.rs`(208)。主控逐条亲验：`knowledge_gap_signals` 索引定义（`gap_signals_signal_id_unique` 是 UUID `signal_id` 唯一，非业务去重键）、find-then-insert 去重模式（:610 全量 find pending → :621 应用层 `dedup_key` 匹配 → :663-682 insert）、refresh 写回姿势（`update_one({_id},{$set})` 只限定 `usage_stats`/`dynamic_confidence`/`updated_at`，非整文档 replace）、信号只观测不进决策红线。**校准结论：1 Medium + 8 Low**（subagent 自评 0H/3M/6L；[1-02] Medium→Low：写回是 `$set` 限定字段、与 chunk 编辑 body 不重叠、无 lost update；[1-01] 保 Medium；[1-03] 保 Low）。
+
+### [1-01] `knowledge_gap_signals` 无业务去重唯一索引，信号生成走 find-then-insert——并发/交错窗口可重复插同一 (workspace,kind,dedup_key) 信号
+- 入口 worker: `feedback_worker` → `run_structural_lint` / `persist_signals`
+- 所属簇: 1
+- 类型: 幂等/去重旁路
+- 严重度: Medium（主控裁定：无业务去重唯一索引=确定性去重缺失，靠应用层 find-then-insert；单进程默认 `feedback_worker` 单实例串行 `run_one_round` 顺序 await，并发窗口默认不存在→当前不可达，但多副本/未来 admin 手动触发 lint 端点即真实双插。属"幂等靠应用层查重而非唯一索引兜底"的确定性缺失，故 Medium 非 Low）
+- 现象/风险: 八类 structural 信号 + recall_trace 在线信号均走"全量 find 同 kind pending → 应用层按 `dedup_key` 精确匹配 → 命中则 `$set` 合并 affected_chunk_ids/search_queries、未命中则 insert 新信号"。`knowledge_gap_signals` 无 `(workspace_id, kind, dedup_key/title)` 唯一索引兜底。
+- 失效链: 两轮 lint 并发（或 lint 与在线 `persist_signal` 交错）→ 两次 find 都返空（同一候选尚未落库）→ 双 insert_one 成功 → 同一 (chunk,kind) 两条 pending。默认单实例串行下不发生。
+- 根因（亲验 file:line）: `gap_signals.rs:610-620` 全量 find pending（`{workspace_id,status:"pending",kind}`）；`:621-623` 应用层 `signal_dedup_key` 匹配；`:663-682` 未命中 insert_one。`db/indexes.rs:1396-1445` `knowledge_gap_signals` 仅 4 个索引（`gap_signals_status_kind_idx`/`created_at_idx`/`signal_id_unique`/`kind_status_created_idx`）——`signal_id_unique` 键是每条新生成的 `sig_<uuid>`（:665），**非** (workspace,kind,dedup_key) 业务去重键。
+- 复现设想: 并发跑两轮 feedback_worker（多副本或手动触发 lint 撞车）→ 同一 orphan chunk 两条 pending 信号。
+- 验证状态: CONFIRMED（无业务唯一索引 + find-then-insert 双向亲验）
+- 修复建议: 加 `(workspace_id, kind, dedup_key)` partial unique 索引（partial: status=pending），或改 find-then-insert 为原子 upsert。
+- 状态: Open
+
+### [1-02] `refresh_usage_stats_and_confidence` read-modify-write 非原子——但写回是 $set 限定字段，无 lost update
+- 入口 worker: `feedback_worker` → `refresh_usage_stats_and_confidence`
+- 所属簇: 1
+- 类型: 时间窗竞态/非原子写
+- 严重度: Low（主控裁定：subagent 标 Medium 并自注"若 $set 限定则降 Low"。亲验写回是 `update_one({_id},{$set:&set})`、set 只含 `usage_stats`/`dynamic_confidence`/`updated_at`——与 `apply_chunk_revision` 编辑的 body/tags 字段不重叠，并发不产生 lost update。read-modify-write 窗口只影响 confidence 自身瞬时值（下轮全窗口重算即自愈），无跨字段覆盖后果，故 Low）
+- 现象/风险: 对每个 active chunk 读 usage_stats → 算 30d hit/blocked → 重算 dynamic_confidence → 写回，read-modify-write 非原子。
+- 失效链: refresh 读 chunk v1 → 并发 `apply_chunk_revision` 改 body(v1→v2) → refresh 写回。因写回 `$set` 只限定 usage/confidence 字段，v2 的 body 不被覆盖；confidence 自身若被并发 refresh 覆盖，下轮全窗口重算自愈。
+- 根因（亲验 file:line）: `gap_signals.rs:1035-1055` 写回 `update_one(doc!{"_id":oid}, doc!{"$set":&set})`，`set` 只含 `usage_stats`(子对象)/`dynamic_confidence`/`updated_at`。
+- 复现设想: feedback_worker refresh 时并发 admin 编辑同一 chunk——body 不受影响，仅 confidence 瞬时值可能被下轮重算覆盖（自愈）。
+- 验证状态: CONFIRMED（写回 $set 限定字段亲验，无 lost update）
+- 修复建议: 无需修（当前姿势正确）；仅标注 read-modify-write 窗口的 confidence 瞬时值靠下轮重算收敛。
+- 状态: Open
+
+### [1-03] `knowledge_gap_signals` 无 TTL、resolved 不物理删——无界累积（就绪债）
+- 入口 worker: `feedback_worker` → `sweep_stale_signals`
+- 所属簇: 1
+- 类型: 无界增长/就绪债
+- 严重度: Low（主控裁定：resolved/auto_resolved 只标 status 不物理删 + 无 TTL 索引，长期累积；单进程单/少 workspace 生产无立即后果，属就绪债）
+- 现象/风险: 信号 resolved 后只标 `status=resolved/auto_resolved`，不物理删除；集合无 TTL 索引。长期 pending+resolved 无界累积。
+- 根因（亲验 file:line）: `gap_signals.rs` sweep 只 update status；`db/indexes.rs:1396-1445` `knowledge_gap_signals` 四索引均无 TTL（`expireAfterSeconds`）。
+- 复现设想: 长期运行，resolved 信号越积越多。
+- 验证状态: CONFIRMED
+- 修复建议: resolved 信号加 TTL（如 30d 后删）或定期归档。
+- 状态: Open
+
+### [1-04] contradiction 信号 body 首段 sha256 纯字节比对——格式化差异（空格/标点/大小写）产生假阳性
+- 入口 worker: `feedback_worker` → `run_structural_lint`（contradiction 类）
+- 所属簇: 1
+- 类型: 逻辑边界
+- 严重度: Low
+- 现象/风险: contradiction 检测对同 `normalize_title` 的多 chunk 比对 body 首段 sha256，纯字节比对；格式化差异（多空格/标点/大小写）即算不同 → 假阳性 contradiction 信号（仅多产一条待运营处理的信号，无红线/正确性后果）。
+- 根因（亲验 file:line）: `gap_signals.rs` contradiction 检测 `sha256(body 首段)`。
+- 验证状态: PLAUSIBLE
+- 修复建议: 比对前 normalize（去空格/标点/小写）。
+- 状态: Open
+
+### [1-05] low_confidence 阈值 `LOW_CONFIDENCE_THRESHOLD=0.3` 硬编码——不可 per-workspace 配
+- 入口 worker: `feedback_worker` → `run_structural_lint`
+- 所属簇: 1
+- 类型: 就绪债
+- 严重度: Low
+- 现象/风险: 阈值硬编码常量，不可按 workspace 配置。
+- 根因（亲验 file:line）: `gap_signals.rs:47` `const LOW_CONFIDENCE_THRESHOLD: f64 = 0.3;`
+- 验证状态: CONFIRMED
+- 修复建议: 提为 workspace 可配。
+- 状态: Open
+
+### [1-06] orphan 判定「30d 无命中」——新导入 chunk 冷启动期可能被误判
+- 入口 worker: `feedback_worker` → `run_structural_lint`（orphan 类）
+- 所属簇: 1
+- 类型: 逻辑边界
+- 严重度: Low
+- 现象/风险: orphan 判定"既无入链也无 30d 命中"。新导入 chunk 冷启动期（<30d 无命中正常）可能被误判 orphan（仅多产信号，运营可忽略）。
+- 根因（亲验 file:line）: `gap_signals.rs` orphan 检测 30d 窗口。
+- 验证状态: PLAUSIBLE
+- 修复建议: orphan 判定加 chunk age 下限（如 `created_at > 30d` 才判）。
+- 状态: Open
+
+### [1-07] suggestion 信号 `blocked_count_30d > 3` 阈值硬编码
+- 入口 worker: `feedback_worker` → `run_structural_lint`（suggestion 类）
+- 所属簇: 1
+- 类型: 就绪债
+- 严重度: Low
+- 现象/风险: suggestion 类触发阈值硬编码，不可配。
+- 根因（亲验 file:line）: `gap_signals.rs` suggestion 检测。
+- 验证状态: CONFIRMED
+- 修复建议: 提为可配。
+- 状态: Open
+
+### [1-08] sweep stage1 broken_link auto_resolve——target 恢复即消解，不校验语义一致（chunk_id 复用场景）
+- 入口 worker: `feedback_worker` → `sweep_stale_signals`
+- 所属簇: 1
+- 类型: 逻辑边界
+- 严重度: Low
+- 现象/风险: broken_link 信号 sweep 时若 target chunk 恢复存在即 auto_resolved，不校验恢复的 chunk 是否真是原引用目标（chunk_id 复用/重建的边缘场景）。
+- 根因（亲验 file:line）: `gap_signals.rs` `sweep_stale_signals` broken_link 分支。
+- 验证状态: PLAUSIBLE
+- 修复建议: auto_resolve 前校验 target chunk 语义一致。
+- 状态: Open
+
+### [1-09] structural_proposals 只产 pending_review 无 apply 消费方（就绪债 KB-06，红线正确的一面）
+- 入口 worker: —（`gap_signals` 触发 `propose_structural_change`）
+- 所属簇: 1
+- 类型: 就绪债（红线正确的一面）
+- 严重度: Low
+- 现象/风险: structural_proposals 只产 `pending_review` 提案，全仓无 apply worker/人审 UI 消费。功能未闭环（模块头注释 KB-06 自认）。这是红线**正确**的一面（AI 绝不自动 apply split/merge），非缺陷。
+- 根因（亲验 file:line）: `structural_proposals.rs:1-18` 模块头注释 KB-06 + 无消费方；序列化层无 apply/commit/delete 字段（:63-110 `StructuralProposal` + `STATUS_PENDING_REVIEW` 唯一构造口）。
+- 验证状态: CONFIRMED
+- 修复建议: 接线 apply worker + 人审 UI（下一轮）。
+- 状态: Open（红线正确的一面，非缺陷）
+
+## 簇 1 正向 HOLDS（主控亲验）
+- **信号只观测不进决策红线 HOLDS**：Grep `src/agent/` 无对 `knowledge_gap_signals`/`structural_proposals` 的读取；消费端仅 `routes/`（admin 面板/timeline）。
+- **structural_proposals 序列化层锁死**：无 apply/commit/delete 字段，`status` 恒 `pending_review`（唯一构造口 `StructuralProposal::new`）。
+- **normalize_ref_key 无 substring 误伤**：`openai ≠ ai`（簇S 同款 normalize）。
+- **stage2 LLM sweep 是预留桩**：未串入热路径，不产生实际 LLM 调用（模块头 doc:28-31）。
 
 ## 簇 2 findings（摄取源头）
 
