@@ -102,7 +102,46 @@
 
 ## 簇1 客户数据域 findings
 
-（主控亲验后填入）
+> 主控亲验结论：**handler 总体守住 workspace 锁定基准**——list/read/单条取用一律经 find_contact_by_id 复合锁或显式 `workspace_id: &admin.current_workspace` filter，涉 account 端点先过 validate_account；**无推荐配置(单租户默认)下确定性可达的跨 workspace/account 越权，无 High**。亲验 enable_agent(contacts.rs:932)contact 取用已锁 workspace，但 :939 account 存在性校验漏 workspace（1-01）。
+
+### [1-01] `enable_agent` account 存在性校验漏 workspace 作用域（跨租户读）
+- 入口频道: admin（启用 Agent 运营）
+- 所属簇: 1
+- 类型: IDOR（跨租户存在性读）
+- 严重度: Medium（主控亲验裁定：CONFIRMED 代码偏离——contact 已锁 workspace 但 account 校验只按 account_id 无 workspace_id；多租户+共享 default account_id 时确定性可达命中他 workspace 同名 account 判"存在"通过；封顶 Medium 因**仅存在性判定、无 PII 泄漏、无跨 ws 写**；单租户默认不可达）
+- 现象/风险: enable_agent 校验 contact.account_id 是否在 wechat_accounts 注册时，find_one 只按 account_id 不含 workspace_id。
+- 越权链: 多租户环境，admin A 对本 workspace contact 启用 Agent，若其 account_id 与他 workspace 的 account 同名（如共享 default account_id），会命中他 workspace 记录判"已注册"通过——跨租户存在性读（不读内容、不写、不泄 PII）。
+- 根因（亲验 file:line）: contacts.rs:932 find_contact_by_id 已锁 workspace（正确），但 :936-940 `accounts().find_one(doc!{"account_id": &contact.account_id}, None)` 漏 workspace_id；复合唯一键 indexes.rs:14-15 亲验 + 共享 default account_id 使多租户可达。
+- 复现设想: 多租户 + 两 workspace 共享 default account_id，admin A 启用本 workspace contact 观察 account 存在性校验命中他 workspace 记录。
+- 验证状态: CONFIRMED（代码偏离 + 多租户可达性亲验；单租户不可达）
+- 修复建议: account 存在性校验 filter 加 workspace_id：`find_one(doc!{"account_id": &contact.account_id, "workspace_id": &admin.current_workspace})`。属多租户就绪债。
+- 状态: Open
+
+### [1-02] `apply_generated_profile_to_contact` 写 filter 未复述 workspace_id（读门兜住）
+- 入口频道: —
+- 所属簇: 1
+- 类型: 就绪债（防御纵深）
+- 严重度: Low（主控亲验裁定：当前上游已 workspace 锁定不可利用；写 filter 未复述 workspace_id 是回归护栏缺失，同 S-01）
+- 现象/风险: apply_generated_profile_to_contact 写 filter 未独立复述 workspace_id。
+- 越权链: 当前不可达（上游 workspace 锁定）；未来回归风险。
+- 根因（亲验 file:line）: contacts.rs apply_generated_profile_to_contact 写 update filter 未复述 workspace_id，靠上游读锁定。
+- 复现设想: 无当前触发路径。
+- 验证状态: CONFIRMED（当前不可利用）/ PLAUSIBLE（未来回归风险）
+- 修复建议: 写 filter 复述 workspace_id。
+- 状态: Open
+
+### [1-03] `analyze_contact_profile` 写 filter 未复述 workspace_id（读门兜住）
+- 入口频道: —
+- 所属簇: 1
+- 类型: 就绪债（防御纵深）
+- 严重度: Low（主控亲验裁定：同 1-02，当前上游锁定不可利用）
+- 现象/风险: analyze_contact_profile 写 filter 未独立复述 workspace_id。
+- 越权链: 当前不可达；未来回归风险。
+- 根因（亲验 file:line）: contacts.rs analyze_contact_profile 写 update filter 未复述 workspace_id。
+- 复现设想: 无当前触发路径。
+- 验证状态: CONFIRMED（当前不可利用）/ PLAUSIBLE（未来回归风险）
+- 修复建议: 写 filter 复述 workspace_id。附记 subagent out-of-cluster 观察：guides.rs 调用的 shared.rs guide-apply 写 helper 同属 _id-only 写 filter 模式（与 S-01 同族），可随本条一并补齐。
+- 状态: Open
 
 ## 簇2 配置/凭证域 findings
 
