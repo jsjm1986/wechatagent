@@ -106,7 +106,59 @@
 
 ## 簇2 配置/凭证域 findings
 
-（主控亲验后填入）
+> 主控亲验结论：**授权隔离扎实、无真越权、凭证泄漏面干净**。亲验 llm_providers.rs:79 api_key 恒 mask_api_key 不回明文、accounts.rs:56 只回 mcpKeyConfigured 布尔从不回 mcp key 明文、management.rs:1891 provider_activate 把 body workspaceId 强制覆盖为可信 workspace_id。4 条 finding 全是"读门已兜住、写 filter 未复述 workspace_id"的防御纵深偏离（同 S-01 元家族），无跨 workspace 泄漏。domain_schemas.rs 是模范（每写 filter 独立复述 workspace_id）。
+
+### [2-01] playbooks.rs 三处写 update_one 仅按 `_id` 未复述 workspace_id（读门兜住）
+- 入口频道: —
+- 所属簇: 2
+- 类型: 就绪债（防御纵深）
+- 严重度: Low（主控亲验裁定：update:175/set_default:223/optimize:401 前置 find_one 已归属校验不可越权；写 filter 只 `{_id}` 是纵深缺口同 S-01）
+- 现象/风险: playbooks 三处写操作 filter 仅 `{_id}`。
+- 越权链: 当前不可达（前置 find_one 锁定）；未来调用点若传未锁定 _id → 越 workspace 改他人 playbook。
+- 根因（亲验 file:line）: playbooks.rs:175/223/401 update_one filter 未复述 workspace_id，靠前置 find_one。
+- 复现设想: 无当前触发路径。
+- 验证状态: PLAUSIBLE
+- 修复建议: 写 filter 独立复述 workspace_id。
+- 状态: Open
+
+### [2-02] prompt_templates.rs publish 终态 update_one 仅按 `_id`（读门兜住）
+- 入口频道: —
+- 所属簇: 2
+- 类型: 就绪债（防御纵深）
+- 严重度: Low（主控亲验裁定：读门兜住，同 2-01）
+- 现象/风险: prompt_templates publish 写 filter 仅 `{_id}`。
+- 越权链: 当前不可达。
+- 根因（亲验 file:line）: prompt_templates.rs:376 update_one filter 未复述 workspace_id。
+- 复现设想: 无当前触发路径。
+- 验证状态: PLAUSIBLE
+- 修复建议: 写 filter 复述 workspace_id。
+- 状态: Open
+
+### [2-03] domain_profiles.rs publish/rollout/rollback/activate 的 promote/demote 仅按 `_id`（读门兜住）
+- 入口频道: —
+- 所属簇: 2
+- 类型: 就绪债（防御纵深）
+- 严重度: Low（主控亲验裁定：前置 find_one({_id,workspace_id}) 校验，scope 用已校验记录自身 workspace_id，不可越权）
+- 现象/风险: domain_profiles 状态流转的 promote/demote 写 filter 仅 `{_id}`。
+- 越权链: 当前不可达（前置 find_one 锁定 + scope 用已校验记录 workspace_id）。
+- 根因（亲验 file:line）: domain_profiles.rs promote/demote update filter 未复述 workspace_id，靠前置 find_one({_id,workspace_id})。
+- 复现设想: 无当前触发路径。
+- 验证状态: PLAUSIBLE
+- 修复建议: 写 filter 复述 workspace_id。
+- 状态: Open
+
+### [2-04] get_tool_catalog 无归属校验即按 query.accountId 调 MCP
+- 入口频道: admin（工具目录查询）
+- 所属簇: 2
+- 类型: 就绪债
+- 严重度: Low（主控亲验裁定：仍须登录，只回工具名清单无凭证/无 PII；query.accountId 未校验归属当前 workspace 但仅拉工具列表）
+- 现象/风险: management.rs:606 get_tool_catalog 按 query.accountId 调 MCP 拉工具清单，未校验该 account 归属当前 workspace。
+- 越权链: 已登录 admin 可用他 workspace 的 accountId 拉该账号 MCP 工具名清单（无凭证/无客户数据，信息价值极低）。
+- 根因（亲验 file:line）: management.rs:606 未 validate_account 即用 query.accountId 调 MCP。
+- 复现设想: 已登录传他 workspace 的 accountId 观察返回工具清单。
+- 验证状态: PLAUSIBLE（信息泄漏面极小）
+- 修复建议: 调 MCP 前 validate_account(current_workspace, account_id) 校验归属。
+- 状态: Open
 
 ## 簇3 媒体/运营动作域 findings
 
