@@ -24,8 +24,8 @@ mod style;
 // 这些是 review 对外契约的一部分（gateway / simulation 直接调用），按原
 // review.rs 顶层可见性 re-export。
 pub use gates::{
-    finalize_review_for_send, review_passed, FinalizeOutcome, GatewayStatusFinal,
-    PendingFinalizeEvent,
+    contact_has_principal_product_exemption, finalize_review_for_send, review_passed,
+    FinalizeOutcome, GatewayStatusFinal, PendingFinalizeEvent,
 };
 pub(crate) use gates::{
     apply_dual_reviewer_disagreement, apply_revision_fallback, build_reviewer_decision_view,

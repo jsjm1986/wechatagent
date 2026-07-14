@@ -3643,6 +3643,11 @@ pub const ALLOWED_ESCALATION_CATEGORY: &[&str] = &[
 /// 不是 hold category——触发请示的 run 本身是 Approved，占位已正常发出。
 pub const AWAITING_PRINCIPAL_DECISION_ATTR: &str = "awaiting_principal_decision";
 
+/// A 类领导授权豁免记录挂在 Contact.domain_attributes 的这个 key（doc-only 子文档）。
+/// 领导针对该客户授权后写入 `{ granted: true, ... }`；R5.4 产品门据此并联放行该客户的
+/// 产品说法。写入在 relay 接线阶段完成，本常量只定义挂载点。
+pub const PRINCIPAL_PRODUCT_EXEMPTION_ATTR: &str = "principal_product_exemption";
+
 /// 「已引荐」态：发送名片成功后写入 Contact.domain_attributes 的时间戳键。
 pub const REFERRED_SPECIALIST_AT_ATTR: &str = "referred_specialist_at";
 /// 已引荐推了哪张名片（card_id hex）。

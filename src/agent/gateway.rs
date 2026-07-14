@@ -57,9 +57,10 @@ use super::memory::{
 };
 use super::multimodal;
 use super::review::{
-    apply_revision_fallback, decide_revision, derive_revision_failure, effective_review_mode,
-    finalize_review_for_send, local_decision_review, review_decision, review_passed,
-    should_run_review, FinalizeOutcome, GatewayStatusFinal, PendingFinalizeEvent, RevisionDecision,
+    apply_revision_fallback, contact_has_principal_product_exemption, decide_revision,
+    derive_revision_failure, effective_review_mode, finalize_review_for_send, local_decision_review,
+    review_decision, review_passed, should_run_review, FinalizeOutcome, GatewayStatusFinal,
+    PendingFinalizeEvent, RevisionDecision,
 };
 use super::run_envelope::{
     assert_final_review_status_valid, assert_gateway_status_valid, assert_lifecycle_valid,
@@ -290,6 +291,8 @@ pub async fn send_contact_message_gateway(
     } else {
         false
     };
+    // R5.4 第三条并联背书：该客户是否有生效的 A 类领导授权产品豁免。
+    let principal_product_exempted = contact_has_principal_product_exemption(&contact);
     let outcome = finalize_review_for_send(
         review,
         &mut decision,
@@ -301,6 +304,7 @@ pub async fn send_contact_message_gateway(
         synthetic_inbound.content.as_str(),
         &active_profile.commitment_markers,
         priced_from_catalog,
+        principal_product_exempted,
     );
     let FinalizeOutcome {
         review: finalized_review,
@@ -1634,6 +1638,8 @@ async fn run_user_operation_gateway_inner(
     } else {
         false
     };
+    // R5.4 第三条并联背书：该客户是否有生效的 A 类领导授权产品豁免。
+    let principal_product_exempted = contact_has_principal_product_exemption(&contact);
     let outcome = finalize_review_for_send(
         review,
         &mut final_decision,
@@ -1644,6 +1650,7 @@ async fn run_user_operation_gateway_inner(
         inbound.content.as_str(),
         &active_profile.commitment_markers,
         priced_from_catalog,
+        principal_product_exempted,
     );
     let FinalizeOutcome {
         review: finalized_review,
@@ -1910,6 +1917,9 @@ async fn run_user_operation_gateway_inner(
                     } else {
                         false
                     };
+                    // R5.4 第三条并联背书：contact 未变，豁免记录同 contact，重算取同值。
+                    let second_principal_product_exempted =
+                        contact_has_principal_product_exemption(&contact);
                     let second_outcome = finalize_review_for_send(
                         second_review,
                         &mut final_decision,
@@ -1920,6 +1930,7 @@ async fn run_user_operation_gateway_inner(
                         inbound.content.as_str(),
                         &active_profile.commitment_markers,
                         second_priced_from_catalog,
+                        second_principal_product_exempted,
                     );
                     let FinalizeOutcome {
                         review: second_finalized_review,
