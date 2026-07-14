@@ -181,12 +181,20 @@ pub(crate) async fn emit_knowledge_gap_proposal(
     escalation: &AgentPrincipalEscalation,
     decision: &PrincipalDecision,
 ) -> AppResult<()> {
-    let title = format!("真人决策沉淀（待审核）：{}", escalation.reason);
+    // title 从 substance 提炼（不再用 escalation.reason——同 sediment，reason 是卡点原因/
+    // reviewer 质检点评，当知识标题会扭曲召回）；draft 提案加「待审核：」前缀以区分未复核。
+    let raw_title = derive_sediment_title(
+        state,
+        &escalation.account_id,
+        &escalation.contact_wxid,
+        &decision.substance,
+    )
+    .await;
+    let title = format!("待审核：{raw_title}");
     let body = format!(
-        "源自客户「{}」请示 #{}。\n卡点：{}\n领导裁决：{}\n约束：{}",
+        "源自客户「{}」请示 #{}。\n领导裁决：{}\n约束：{}",
         escalation.contact_wxid,
         escalation.short_code,
-        escalation.reason,
         decision.substance,
         if decision.constraints.is_empty() {
             "无".to_string()
