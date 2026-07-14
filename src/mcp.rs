@@ -508,13 +508,14 @@ pub(crate) fn is_system_account(wxid: &str) -> bool {
 }
 
 /// 运营池「仅真人」过滤片段（DB 侧）：排除公众号（gh_ 前缀）、群（@chatroom）、
-/// 微信保留系统号。与读时 Rust 层判据 `webhooks::is_operatable_person`
-/// （`!(gh_前缀 || @chatroom || is_system_account)`）DB 侧等价，供 count 端点复用，
+/// 企业微信/开放 IM 号（@openim）、微信保留系统号。与读时 Rust 层判据
+/// `webhooks::is_operatable_person`
+/// （`!(gh_前缀 || @chatroom || @openim || is_system_account)`）DB 侧等价，供 count 端点复用，
 /// 白名单单一数据源 `WECHAT_SYSTEM_ACCOUNTS`，杜绝两份清单漂移。
 ///
-/// 返回 `{"$nor": [gh_前缀, @chatroom, in 白名单]}`——`$nor` 语义为「以下条件全不满足」，
-/// 即 `NOT(A OR B OR C)`，与 `is_operatable_person` 的 `!(A||B||C)` 完全等价：
-/// 真人 wxid（如 `wxid_xxx`）三条都不命中故保留，公众号/群/系统号任一命中即排除。
+/// 返回 `{"$nor": [gh_前缀, @chatroom, @openim, in 白名单]}`——`$nor` 语义为「以下条件全不满足」，
+/// 即 `NOT(A OR B OR C OR D)`，与 `is_operatable_person` 的 `!(A||B||C||D)` 完全等价：
+/// 真人 wxid（如 `wxid_xxx`）四条都不命中故保留，公众号/群/企业号/系统号任一命中即排除。
 pub(crate) fn non_human_exclusion_filter() -> mongodb::bson::Document {
     let whitelist: Vec<&str> = WECHAT_SYSTEM_ACCOUNTS.to_vec();
     doc! {
@@ -523,6 +524,8 @@ pub(crate) fn non_human_exclusion_filter() -> mongodb::bson::Document {
             doc! { "wxid": { "$regex": "^gh_" } },
             // 群会话（@chatroom 为子串，@ 在正则里是普通字符）。
             doc! { "wxid": { "$regex": "@chatroom" } },
+            // 企业微信/开放 IM 号（@openim 子串）。
+            doc! { "wxid": { "$regex": "@openim" } },
             // 微信官方保留系统号（单一数据源白名单）。
             doc! { "wxid": { "$in": whitelist } },
         ]
@@ -970,10 +973,10 @@ mod tests {
 
     #[test]
     fn non_human_exclusion_filter_structure_and_whitelist() {
-        // 结构断言：顶层 $nor 三条件，白名单来自单一数据源 WECHAT_SYSTEM_ACCOUNTS。
+        // 结构断言：顶层 $nor 四条件，白名单来自单一数据源 WECHAT_SYSTEM_ACCOUNTS。
         let f = super::non_human_exclusion_filter();
         let nor = f.get_array("$nor").expect("应含 $nor 顶层键");
-        assert_eq!(nor.len(), 3, "$nor 应含 gh_/@chatroom/白名单 三条件");
+        assert_eq!(nor.len(), 4, "$nor 应含 gh_/@chatroom/@openim/白名单 四条件");
         // gh_ 前缀条件（^gh_ 锚定开头）。
         let gh = nor[0].as_document().unwrap();
         assert_eq!(
@@ -986,8 +989,14 @@ mod tests {
             room.get_document("wxid").unwrap().get_str("$regex").unwrap(),
             "@chatroom"
         );
+        // @openim 企业微信/开放 IM 号子串条件。
+        let openim = nor[2].as_document().unwrap();
+        assert_eq!(
+            openim.get_document("wxid").unwrap().get_str("$regex").unwrap(),
+            "@openim"
+        );
         // 系统号白名单 $in，须与 WECHAT_SYSTEM_ACCOUNTS 同源（含 weixin/newsapp）。
-        let sys = nor[2].as_document().unwrap();
+        let sys = nor[3].as_document().unwrap();
         let list = sys.get_document("wxid").unwrap().get_array("$in").unwrap();
         assert_eq!(
             list.len(),
@@ -1363,7 +1372,7 @@ mod is_non_human_tests {
 
 #[cfg(test)]
 mod system_account_tests {
-    use super::is_system_account;
+    use super::{is_system_account, non_human_exclusion_filter};
 
     #[test]
     fn is_system_account_matches_wechat_reserved() {
@@ -1374,6 +1383,20 @@ mod system_account_tests {
         // 真人 wxid_* 不命中
         assert!(!is_system_account("wxid_ydzaomn4scsb12"));
         assert!(!is_system_account("wxid_8874178741811")); // 福州晚报=媒体号,wxid_*,不靠此拦
+    }
+
+    #[test]
+    fn non_human_exclusion_filter_excludes_openim() {
+        let f = non_human_exclusion_filter();
+        let nor = f.get_array("$nor").expect("$nor present");
+        let has_openim = nor.iter().any(|c| {
+            c.as_document()
+                .and_then(|d| d.get_document("wxid").ok())
+                .and_then(|w| w.get_str("$regex").ok())
+                .map(|r| r.contains("@openim"))
+                .unwrap_or(false)
+        });
+        assert!(has_openim, "DB 侧过滤器必须含 @openim，与 is_operatable_person 同源");
     }
 }
 

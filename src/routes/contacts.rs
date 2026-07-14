@@ -1762,12 +1762,17 @@ mod tests {
         let (base, managed) = contact_count_filters("ws1", "acct1");
         // base 与 managed 都必须含非真人排除的 $nor 顶层键。
         let base_nor = base.get_array("$nor").expect("base 应含 $nor 非真人排除");
-        assert_eq!(base_nor.len(), 3, "$nor 三条件：gh_/@chatroom/系统号白名单");
+        assert_eq!(
+            base_nor.len(),
+            4,
+            "$nor 四条件：gh_/@chatroom/@openim/系统号白名单"
+        );
         assert!(managed.get_array("$nor").is_ok(), "managed 应继承 $nor");
-        // 序列化后应含 gh_/@chatroom/系统号 关键片段，证明排除口径落地。
+        // 序列化后应含 gh_/@chatroom/@openim/系统号 关键片段，证明排除口径落地。
         let s = base.to_string();
         assert!(s.contains("gh_"), "排除条件应含 gh_ 公众号前缀");
         assert!(s.contains("@chatroom"), "排除条件应含 @chatroom 群");
+        assert!(s.contains("@openim"), "排除条件应含 @openim 企业微信号");
         assert!(s.contains("weixin"), "排除条件应含系统号白名单(weixin)");
         // 与既有隔离键共存不冲突。
         assert_eq!(base.get_str("workspace_id").unwrap(), "ws1");

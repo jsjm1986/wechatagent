@@ -1065,7 +1065,15 @@ async fn emit_unknown_app_id_event(state: &AppState, app_id: Option<&str>) -> Ap
 pub(crate) fn is_operatable_person(wxid: &str) -> bool {
     !(wxid.starts_with("gh_")
         || wxid.contains("@chatroom")
+        || wxid.contains("@openim")
         || crate::mcp::is_system_account(wxid))
+}
+
+/// 账号不能运营自己：判断某 wxid 是否等于当前账号自身 wxid。
+/// 与真人判据 `is_operatable_person` 解耦——这是「不能自己运营自己」的逻辑铁律，
+/// 不是「是否真人」的判断。`account_self_wxid` 为 None（账号未同步 wxid）时返回 false（无从判定，不拦）。
+pub(crate) fn is_self_account(wxid: &str, account_self_wxid: Option<&str>) -> bool {
+    matches!(account_self_wxid, Some(self_wxid) if self_wxid == wxid)
 }
 
 async fn upsert_webhook_contact(
@@ -1462,6 +1470,8 @@ mod inbound_msg_type_tests {
         assert!(!is_operatable_person("gh_416c280c4978"));
         assert!(!is_operatable_person("7842243308@chatroom"));
         assert!(!is_operatable_person("971559326@chatroom"));
+        // 企业微信/开放 IM 号非私聊真人。
+        assert!(!is_operatable_person("25984984932102183@openim"));
     }
 
     #[test]
@@ -1479,6 +1489,22 @@ mod inbound_msg_type_tests {
         assert!(!is_operatable_person("newsapp"));
         // 真人 + 媒体号 wxid_* 仍放行（媒体号靠手动移除，非此拦）
         assert!(is_operatable_person("wxid_8874178741811")); // 福州晚报
+    }
+
+    #[test]
+    fn is_self_account_detects_account_own_wxid() {
+        // 账号自身 wxid == 目标 wxid → 拦。
+        assert!(is_self_account(
+            "wxid_3yeirsb75afd22",
+            Some("wxid_3yeirsb75afd22")
+        ));
+        // 不同 wxid → 不拦。
+        assert!(!is_self_account(
+            "wxid_ydzaomn4scsb12",
+            Some("wxid_3yeirsb75afd22")
+        ));
+        // 账号未同步 wxid（None）→ 无从判定，不拦。
+        assert!(!is_self_account("wxid_ydzaomn4scsb12", None));
     }
 }
 
