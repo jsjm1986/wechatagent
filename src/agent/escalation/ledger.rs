@@ -281,6 +281,63 @@ pub(crate) fn derive_sediment_title_fallback(substance: &str) -> String {
     }
 }
 
+/// 从领导裁决 substance 提炼知识标题：优先 LLM 提炼，任何失败/空结果回退确定性兜底。
+/// 绝不因提炼失败让沉淀失败——title 永远可读、非空。
+// 目前尚无生产调用点（Task 4 接线 sediment 落 title 时才启用），暂 allow(dead_code)
+// 保持 build 无警告。
+#[allow(dead_code)]
+pub(crate) async fn derive_sediment_title(
+    state: &AppState,
+    account_id: &str,
+    contact_wxid: &str,
+    substance: &str,
+) -> String {
+    let trimmed = substance.trim();
+    if trimmed.is_empty() {
+        return derive_sediment_title_fallback(substance);
+    }
+    let system = match crate::prompts::load_prompt(
+        &state.db,
+        &state.config.default_workspace_id,
+        "escalation.sediment.title",
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(_) => return derive_sediment_title_fallback(substance),
+    };
+    let user = format!("决策实质：{}", trimmed);
+    let value = match crate::agent::generate_agent_json(
+        state,
+        Some(account_id),
+        Some(contact_wxid),
+        None,
+        "escalation.sediment.title",
+        &system,
+        &user,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(_) => return derive_sediment_title_fallback(substance),
+    };
+    let title = value
+        .get("title")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .unwrap_or("");
+    if title.is_empty() {
+        return derive_sediment_title_fallback(substance);
+    }
+    // LLM 也可能给超长 title——用兜底同款 chars 限长逻辑收口（40 chars）。
+    let capped: String = title.chars().take(40).collect();
+    if title.chars().count() > 40 {
+        format!("{capped}…")
+    } else {
+        capped
+    }
+}
+
 /// B 类沉淀：把领导（真人）经决策请示通道授权的 substance 落为 verified 知识 chunk，
 /// 供全体客户复用。
 ///
@@ -311,12 +368,14 @@ pub(crate) async fn sediment_principal_authorized_knowledge(
 
     // 步骤①：建 chunk。参照 emit_knowledge_gap_proposal 的 chunk doc 范式，补齐 D2 门
     // 必需的 domain / chunk_type / source_quote / source_anchors。
-    let title = format!("领导授权沉淀：{}", entry.reason);
+    // title 从 substance 提炼（不再用 entry.reason——reason 是给领导看的卡点原因/reviewer
+    // 质检点评，当知识标题会扭曲召回打分并污染 decision prompt）；LLM 失败回退确定性兜底。
+    let title =
+        derive_sediment_title(state, &entry.account_id, &entry.contact_wxid, substance).await;
     let body = format!(
-        "源自客户「{}」请示 #{}。\n卡点：{}\n领导裁决：{}\n约束：{}",
+        "源自客户「{}」请示 #{}。\n领导裁决：{}\n约束：{}",
         entry.contact_wxid,
         entry.short_code,
-        entry.reason,
         substance,
         if decision.constraints.is_empty() {
             "无".to_string()
