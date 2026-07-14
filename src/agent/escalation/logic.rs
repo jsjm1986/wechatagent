@@ -417,6 +417,7 @@ pub(crate) fn sanitize_verdict(decision: PrincipalDecision) -> PrincipalDecision
             substance: decision.substance,
             constraints: decision.constraints,
             authorization_window_hours: decision.authorization_window_hours,
+            exemption_type: decision.exemption_type,
         }
     }
 }
@@ -583,6 +584,7 @@ mod tests {
             substance: "可以 8 折".into(),
             constraints: vec!["本周付款".into()],
             authorization_window_hours: None,
+            exemption_type: crate::models::EXEMPTION_TYPE_NONE.to_string(),
         };
         let now = mongodb::bson::DateTime::from_millis(2_000);
         let past = mongodb::bson::DateTime::from_millis(1_000);
@@ -626,6 +628,7 @@ mod tests {
             substance: "ok".into(),
             constraints: vec![],
             authorization_window_hours: None,
+            exemption_type: crate::models::EXEMPTION_TYPE_NONE.to_string(),
         };
         assert_eq!(sanitize_verdict(d).verdict, "approved");
     }
@@ -637,11 +640,14 @@ mod tests {
             substance: "x".into(),
             constraints: vec![],
             authorization_window_hours: Some(24.0),
+            exemption_type: crate::models::EXEMPTION_TYPE_CUSTOMER_ONLY.to_string(),
         };
         let out = sanitize_verdict(d);
         assert_eq!(out.verdict, "deferred");
         assert_eq!(out.substance, "x");
         assert_eq!(out.authorization_window_hours, Some(24.0));
+        // 越界回落必须透传 exemption_type，不能丢失领导授权范围。
+        assert_eq!(out.exemption_type, "customer_only");
     }
 
     #[test]

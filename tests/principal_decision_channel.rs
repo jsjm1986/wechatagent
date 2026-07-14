@@ -204,6 +204,7 @@ async fn t_pending_resolve_roundtrip() {
         substance: "可以给 8 折".to_string(),
         constraints: vec!["本周内付款".to_string()],
         authorization_window_hours: Some(48.0),
+        exemption_type: wechatagent::models::EXEMPTION_TYPE_NONE.to_string(),
     };
     let decision_bson = mongodb::bson::to_bson(&decision).expect("serialize decision");
     let now = DateTime::now();
@@ -774,6 +775,7 @@ async fn insert_resolved_expired_escalation(
         substance: "可以给 8 折".to_string(),
         constraints: vec!["本周内付款".to_string()],
         authorization_window_hours: Some(1.0),
+        exemption_type: wechatagent::models::EXEMPTION_TYPE_NONE.to_string(),
     });
     entry.authorization_expires_at = Some(one_hour_ago);
     entry.resolved_at = Some(one_hour_ago);
