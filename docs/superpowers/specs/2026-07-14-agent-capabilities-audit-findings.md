@@ -53,7 +53,91 @@
 
 ## 簇A 记忆固化 findings
 
-（主控亲验后填入）
+> 主控亲验结论：历史 lead"memory_summary 无界 append"**已修**（merge_memory_summary_dedup_capped 去重+12行/1200字节双封顶）；memoryCard 走 replace+OCC乐观锁+cap（core≤6/recent≤10/deprecated≤20）基本健壮。本簇真正的结构性缺口是**两个记忆层的证据门/合并保护不对称**（元家族）：core_facts 事实层缺 tags/personality 那样的 fail-closed 证据锚定（A-01），confirmed_tags 反过来缺 core_facts 那样的"未显式弃用即保留"合并保护、在截断窗口上整体 replace 丢历史标签（A-02，最值得修）。
+
+### [A-01] memoryCard 事实层 core_facts 缺证据锚定门，与 tags/personality 的 fail-closed 门不对称
+- 入口频道: userOps（每轮 reply prompt 注入）
+- 所属簇: A
+- 类型: 一致性（置信门缺失·元家族不对称）
+- 严重度: Medium（主控亲验裁定：core_facts 被注入每一轮 reply prompt 是权威长期记忆，其建立仅凭 LLM 自评分无对话证据锚定；不构成确定性红线破坏（需 LLM 过度采信一句话），但门的结构性缺失是确定的）
+- 现象/风险: 客户一句未经佐证的话（玩笑/试探"我预算 500 万"）若被 Reply Agent 判高 importance，即可无阻碍沉淀为长期 core_fact 污染后续所有回复——历史 lead"不因一句话盲目更新记忆"在事实层仍成立。
+- 根因（亲验 file:line）: 候选入池仅凭 LLM 自评——`memory.rs:1897-1913` validated_memory_candidate 只要求 importance>0 && confidence>0（均 LLM 自报）；`memory.rs:1887-1895` decide_candidate_status write_score>=6||max_importance>=8→pending 无证据门；consolidator 转 core_facts 落库路径（memory.rs:1469-1547）**无任何 resolve_evidence 调用**。对比 confirmed_tags（parse_reconfirmed_tags memory.rs:1086-1090 亲验）与 personality（parse_facet memory.rs:1123-1129）都强制 resolve_evidence、证据空即 fail-closed。事实层独缺此门。
+- 复现设想: 单条 inbound 高 importance 候选→无 evidenceTurns 校验入 pending→consolidation→core_fact 落库→之后每轮 reply prompt 注入。
+- 验证状态: PLAUSIBLE（门缺失与不对称代码确证；"坏事实落库"最终发生依赖 LLM 采信度未跑真实 LLM）
+- 修复建议: 给 memory_candidates→core_facts 通道加与 tags/personality 同源的证据锚定（candidate 带 evidenceTurns，consolidation 对当前窗口 resolve_evidence，无锚高分候选降级/不进 core_facts），或对"单轮弱证据产生"的候选设 importance 天花板。
+- 状态: Open
+
+### [A-02] confirmed_tags 在截断窗口上整体 replace，证据滚出窗口的持久标签被静默清除
+- 入口频道: userOps（consolidation 整理）
+- 所属簇: A
+- 类型: 逻辑正确性（记忆丢失·元家族不对称）
+- 严重度: Medium（偏 High）（主控亲验裁定：推荐配置 60 条/6000 字窗口下，任何历史 >60 条消息的联系人其早期 confirmed_tag 一旦支撑证据滚出窗口就可能在下次 consolidation 被清除——即便无任何对话推翻它；是否真丢取决于 LLM 是否重挂窗口内某条消息，故非 100% 确定，定 Medium）
+- 现象/风险: 长期确信标签（100 条消息前确立的"预算充足"）在一次例行整理后凭空消失，或被 LLM 强行锚到近期不相关消息（锚点漂移/污染）。与 core_facts"previous 未 discarded 即保留"保护形成鲜明不对称。
+- 根因（亲验 file:line）: replace 语义——`memory.rs:1552-1553` 注释"replace 语义：整体覆盖 confirmed_tags，不与旧值合并"（亲验）+ :1612-1624 `$set confirmed_tags`；fail-closed 丢无窗口内证据的标签——`parse_reconfirmed_tags memory.rs:1086-1090` evidences.is_empty()→None（亲验）；窗口被截断——memory.rs:1288-1292 take_window_by_budget(recent_asc,6000,60)。旧标签虽注入 prompt(memory.rs:1295 current_tags)，但 LLM 要保住必须重列且给窗口内可解析 evidenceTurn，证据在窗外时只能丢弃或伪造近窗锚点。
+- 复现设想: contact 有 200 条消息，早期确立 tag"价格敏感"（证据在第 3 条），后续不再提及；下次 consolidation 窗口只含最近 60 条→LLM 无法给有效 evidenceTurn→标签被 replace 掉。
+- 验证状态: PLAUSIBLE（replace+fail-closed+截断窗口三者组合代码确证会丢无近窗证据标签；最终丢/漂移取决于 LLM 输出未跑真实 LLM）
+- 修复建议: 给 confirmed_tags 加与 core_facts 同款"previous 未被显式 discardedTags 推翻则保留"合并（LLM 已输出 discardedTags 通道，memory.rs prompt:1443/1455 有该字段但**当前未被消费**——可据此实现"仅显式推翻才移除，否则保留旧确信标签"），把 replace 改为"合并+显式弃用"。
+- 状态: Open
+
+### [A-03] consolidation 跨集合写非原子：memory_card 写成功后中途失败会重放候选记忆
+- 入口频道: userOps（consolidation task）
+- 所属簇: A
+- 类型: 竞态 / 错误处理 / 一致性
+- 严重度: Medium（主控亲验裁定：需在两次写之间发生失败（网络/进程）非常驻发生；但一旦发生候选会被重新并入已推进的卡，且路径本身把这类失败当可 retry 放大重放概率）
+- 现象/风险: memory_card 已升 v2（operating_memories OCC 写）但随后写 contacts.confirmed_tags 失败→整函数返 Err→候选未被标 consolidated→task retry→重新加载 v2 卡+同批仍 pending 候选→再次并入卡（v3）。同批候选内容被并入两次。
+- 根因（亲验 file:line）: 写顺序与 ? 传播——memory_card OCC 写(memory.rs:1560-1580 成功后 v→next_version 已落库)；随后 confirmed_tags 写用 ?(memory.rs:1621 to_bson? + :1612-1624 .await?)；personality 写 fail-soft(memory.rs:1657-1688 仅 warn)；候选标 consolidated 在最末尾且用 ?(memory.rs:1690-1700 update_many...await?)。memory_card 写与候选标记之间任一 ? 失败→"卡已推进但候选仍 pending"撕裂态，task 走 tasks.rs:254-260 retry。
+- 复现设想: mock contacts.update_one 在 memory_card OCC 写成功后抛错→候选仍 pending、memory_card_version 已+1；触发 retry 后候选二次并入。
+- 验证状态: PLAUSIBLE（需故障注入；写顺序与 ? 传播已确证）
+- 修复建议: 把候选标 consolidated 与 memory_card 写归入同一原子边界（先标候选再写卡，或同一事务/幂等键），或把 memory_card 写之后所有 contacts 写改 fail-soft（warn，与 personality 一致）避免"卡已进但被判失败重放"。
+- 状态: Open
+
+### [A-04] `MemoryFact::validate()` 在固化写路径从未被调用（文档-代码漂移，bounds 未强制）
+- 入口频道: —
+- 所属簇: A
+- 类型: 文档-代码漂移 / 就绪债
+- 严重度: Low（主控亲验裁定：core_fact 的 confidence/importance 未被决策逻辑消费（grep 确认 memory.rs 内仅 personality 读 confidence，事实层不读）；超长 text 部分被非原子门>80 字间接拦；故未确认决策路径实害，主要是文档失真+潜在脏数据）
+- 现象/风险: consolidator 产出的 MemoryFact 若 confidence/importance 越界、text>500 字、evidence>1000 字、deprecation_reason>200 字，均不被校验也不被丢弃，原样落库。
+- 根因（亲验 file:line）: 文档断言会校验——models.rs:4151-4153"MemoryFact::validate 提供运行时长度/范围检查；apply_consolidator_deprecations 与 W2 校验链调用前会执行，违规 fact 将被 drop+warning"；实际——`.validate()` 在 **src/agent 零命中**（主控 grep 亲验确认），apply_consolidator_deprecations(memory.rs:631-750)全程无 validate 调用，validate 仅出现在 models.rs 单测。部分兜底 fact_is_non_atomic(memory.rs:499-512)>80 字触发重试但越界 confidence/importance 无检查。
+- 复现设想: consolidator 返回 confidence:99,text:<600字> 的 fact→落库后 confidence=99 原样存在。
+- 验证状态: CONFIRMED（.validate() 在 src/agent 零调用，文档断言可证伪）
+- 修复建议: 在 apply_consolidator_deprecations 或 compact 落库前对每条 MemoryFact 调 validate()，违规按文档承诺 drop+warning；或修正 models.rs 文档去掉不实断言。
+- 状态: Open
+
+### [A-05] `schedule_memory_consolidation_task` find-then-insert TOCTOU，可产生重复整理任务
+- 入口频道: userOps
+- 所属簇: A
+- 类型: 竞态 / 就绪债
+- 严重度: Low（主控亲验裁定：OCC 保护 memory_card 不被双写污染；重复任务多为空耗一次 LLM 调用后自愈——候选已被赢家标记→输家 no_candidates）
+- 现象/风险: 同一 contact 两次 reply run 近乎同时调度整理，二者都 find_one 到无 pending 任务→都 insert→生成两条 memory_consolidation 任务。
+- 根因（亲验 file:line）: memory.rs:1920-1966 先查后插无唯一索引兜底（find_one pending 任务→is_some 则 return→否则 insert_one，无 (workspace,account,contact,kind,status) 唯一索引）；db/indexes.rs 无对应 unique index。两任务跑起后 memory_card OCC(memory.rs:1560/1581)保证只一 winner 落库，输家 retry。
+- 复现设想: 并发两次 webhook run 对同一 contact 命中 consolidation_needed→两条任务。
+- 验证状态: PLAUSIBLE（TOCTOU 窗口与缺唯一索引已确证；实际重复概率取决于并发时序）
+- 修复建议: 给 tasks 加 (workspace_id,account_id,contact_wxid,kind) 在 status∈active 上的部分唯一索引，或 insert 用 upsert 幂等。
+- 状态: Open
+
+### [A-06] 同轮既新增又弃用的 fact 会整条消失（deprecated 集合查不到原件）
+- 入口频道: —
+- 所属簇: A
+- 类型: 逻辑正确性（边缘）
+- 严重度: Low（主控亲验裁定：需 LLM 在同一轮把某 id 同时放进 active coreFacts 和 deprecatedFacts，属畸形输出边缘）
+- 现象/风险: 该 fact 既不在 active 也不在 deprecated，凭空丢失（无 deprecated 审计痕迹）。
+- 根因（亲验 file:line）: apply_consolidator_deprecations 原件仅在 previous 里查(memory.rs:690-702)，新增于本轮 previous 无此 id→warning deprecated_fact_id_not_found+continue 不写 deprecated；而同 id 命中 active 时又从 active 移除(memory.rs:712-723)→active 移除+deprecated 未写=整条消失。
+- 复现设想: consolidator 输出 coreFacts 含 {id:"new1"} 且 deprecatedFacts 也含 {id:"new1"}。
+- 验证状态: PLAUSIBLE（读码推断；依赖畸形 LLM 输出）
+- 修复建议: original 查不到时回落到 incoming card active 集合取原件，或对该情形记更明确 warning 并保留 active。
+- 状态: Open
+
+### [A-07] `extra` 越界键与 `recentEpisodeSummary` 长度无 cap（replace 语义故非累积）
+- 入口频道: —
+- 所属簇: A
+- 类型: 就绪债 / 边缘
+- 严重度: Low（主控亲验裁定：consolidator 是 replace 故不累积；未知键被所有消费方忽略；recentEpisodeSummary 每轮由单次 LLM 输出决定非 append）
+- 现象/风险: LLM 若产出 dimension 表以外的 extra 数组键，或超长 recentEpisodeSummary，本轮不被截断，膨胀单张卡文档体积。
+- 根因（亲验 file:line）: compact_memory_card_with_dimensions(memory.rs:473-478)只 cap 已知键(coreFacts 6/recentFacts 10/deprecatedFacts 6 + dimensions 各自 cap)；recentEpisodeSummary(string 非 array)无长度封顶；未在 dimensions 且非上述三键的 array 不被 cap。DEFAULT 8 维(domain_profile.rs:86-112)覆盖 prompt 已知槽，仅越界键漏网。
+- 复现设想: LLM 吐 extra 越界数组键或超长 recentEpisodeSummary。
+- 验证状态: PLAUSIBLE（cap 覆盖范围已确证；实际膨胀依赖 LLM 是否吐越界键）
+- 修复建议: 对 recentEpisodeSummary 加字符封顶；或对 extra 内所有 array 键统一兜底 cap（未知键给保守默认上限）。
+- 状态: Open
 
 ## 簇B 标签体系 findings
 
