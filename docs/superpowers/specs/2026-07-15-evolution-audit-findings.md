@@ -148,4 +148,55 @@
 
 ## 簇 3 findings（放量闭环）
 
-（主控亲验后填入）
+> 本簇（release/auto_release/post_release）是最可能出 High 的簇（自动放量红线所在）。主控逐条亲验后**无 High/无 Medium，3 条全 Low**，R9.7「禁自动回滚」HOLDS。
+
+### [3-01] release_threshold/release_prompt 的 eligible 校验在事务外、update 无 status CAS 守卫 → 并发双重放量
+- 入口: `release_threshold`（`release.rs:40-155`）、`release_prompt`（`release.rs:229-372`）
+- 所属簇: 3
+- 类型: 幂等
+- 严重度: **Low**（主控裁定：并发窗口存在但效果良性 + unique 索引双重兜底，非确定性可致错；需 admin 双击/多 tab 并发才触发，有兜底）
+- 现象/风险: proposal `status="eligible_for_release"` 校验（`release.rs:55-60`，事务前 find_one 读）与放量 update（`release.rs:106-124`，filter 仅 `{_id: proposal_id}` 无 status CAS）之间无原子守卫。两并发 release 可都通过校验、都执行放量。
+- 失效链: admin 双击「放量」或多 tab 并发 → 两请求都读到 eligible → 都写 override + 都推 proposal 状态。threshold 情形：两次写同 override value（`$set` 同值幂等良性）；prompt 情形：`prompt_templates` `(workspace_id,prompt_key,version)` unique 索引第二次 insert 撞 E11000 → 事务 abort → 仅一次成功。
+- 根因（亲验 file:line）:
+  - `release.rs:55-60`：`if proposal.status != "eligible_for_release"` 校验在 `start_transaction`（`release.rs:82-85`）**之前**。
+  - `release.rs:106-124`：override insert + proposal 状态推进（`update_one_with_session` filter 仅 `{_id: proposal_id}`，无 `status` 前置条件）。
+  - `release.rs:87-104`：override 用 insert_one（`threshold_overrides`）；proposal `$set` 同值重放幂等。
+  - prompt 对照：`release.rs:330-345` insert `prompt_templates` 撞 unique 索引兜底。
+- 复现设想: admin UI 双击放量，两请求几乎同时到达；threshold 两次写同 override（无害），prompt 第二次 E11000 事务回滚。
+- 验证状态: PLAUSIBLE（并发窗口存在；无 CAS 但效果良性 + unique 索引双重兜底）
+- 修复建议: update filter 加 `status: "eligible_for_release"` 作 CAS 守卫，`matched_count==0` 中止返 409；或事务内重读 proposal 状态。属防御纵深，非当前可致错。
+- 状态: Open
+
+### [3-02] post_release review 先置 completed=true 再写 agent_event，事件写失败则审计永久丢失且 will-retry 不可达
+- 入口: `process_one_review`（`post_release.rs:158-238`）
+- 所属簇: 3
+- 类型: 一致性(非原子写)
+- 严重度: **Low**（主控裁定：纯观测子系统，delta 已落 review 文档本身，丢失的仅是冗余审计 agent_event，无功能/正确性损害）
+- 现象/风险: `run_due_reviews` 扫 `completed:false` 到期 review（`post_release.rs:82-93`），`process_one_review` 先置 review `completed=true`+写 delta 到 review 文档（:190-205）再写 `evolution_post_release_delta` agent_event（:210-233）。若事件写失败，审计 event 永久丢失，且 review 已 completed → 下 tick 不再命中，"will retry" 不可达。
+- 失效链: mongo 瞬时抖动致 event insert 失败 → delta 审计 event 丢失（但 delta 已在 review 文档留档 :190-205）→ 面板/审计事件流缺一条，无功能损害。
+- 根因（亲验 file:line）: `post_release.rs:190-205`（先置 completed+写 delta 字段）→ `:210-233`（后写 agent_event，Err 仅 warn）→ `:82-93`（下 tick 只扫 `completed:false`）。
+- 复现设想: mongo 在 :190 update 成功、:210 event insert 失败的瞬时窗口。
+- 验证状态: PLAUSIBLE
+- 修复建议: 先写 event 再置 completed；或 delta 已在 review 文档留档，审计 event 视为纯冗余观测可接受丢失。属观测保真度。
+- 状态: Open
+
+### [3-03] 放量 commit 后 write_release_event 冒泡 Err，auto_release 误记 will-retry（实则 status 已 released 不会重试）
+- 入口: `auto_release_eligible_thresholds`（`auto_release.rs:249-320` 循环体）
+- 所属簇: 3
+- 类型: 一致性
+- 严重度: **Low**（主控裁定：阈值已成功 live，仅审计 event 写失败致日志误导性 retry 语义，幂等安全无二次放量）
+- 现象/风险: `release_threshold` 事务 commit 成功（阈值已 live，`release.rs:147` commit 在 `:149` write_release_event 之前）后，`write_release_event` 若 Err 冒泡，auto_release 循环体 catch 记 "will retry next tick"，但 proposal 已 released，下 tick query 只选 `eligible_for_release` 不再命中 → 不会真重试。仅日志误导。
+- 失效链: 阈值已放量 live → 仅 release_event 审计写失败 → 日志说 will retry 实则不重试 → 无二次放量（幂等安全），仅日志/审计保真度问题。
+- 根因（亲验 file:line）: `release.rs:147`（事务 commit）先于 `release.rs:149-` write_release_event；auto_release 循环体 catch Err→warn "will retry"；下 tick query 硬编码 `status:"eligible_for_release"`（`auto_release.rs:78`）released 的不再选。
+- 复现设想: auto_release 放量 threshold 成功、write_release_event 遇 mongo 抖动 Err。
+- 验证状态: PLAUSIBLE
+- 修复建议: write_release_event 改 best-effort（Err 仅 warn 不冒泡），与 [3-02] 同理——审计 event 写失败不应触发误导性 retry 语义。属日志保真度。
+- 状态: Open
+
+**簇3 正向 HOLDS（主控亲验）**：
+- **R9.7 禁自动回滚 HOLDS**：`rollback_threshold`/`rollback_prompt` 仅在 `release.rs:428/555` **定义**，evolution/ 内**零调用**；唯一调用点 `routes/evolution.rs:210/211`（AuthenticatedAdmin + workspace scope）。tick/auto_release/post_release 内零 rollback 符号。
+- **auto_release 双闸默认全关**：env 总闸 `evolution_auto_release_enabled` 默认 "false"（`config.rs:655-658`）AND per-workspace 子闸 `threshold_auto_release_enabled`（读失败/缺失→`.ok().flatten()`→None→`unwrap_or(false)`→关，`auto_release.rs:39-64`，fail-safe 方向正确、**未踩 [S-01] 反向坑**）。
+- **prompt 绝不自动放量**：auto_release query 硬编码 `proposal_kind="threshold"`（`auto_release.rs:77-78`），prompt 永远 admin 二次确认。
+- **release 三写同事务原子**：override insert + proposal 推进 + audit 行同一 transaction（`release.rs:87-147`），commit 前完成（#155 P1 修过 commit 后 best-effort 审计漏写）。
+- **红线三闸不 fail-open**：release_prompt NeedsHumanConfirm→RedlineGateRejected 中止（`release.rs:281-284`）；rollback_prompt 目标版本缺失早返中止事务（`release.rs:658-662`）。
+- **隔离红线守住**：三文件无 gateway/outbox/mcp 符号（post_release 唯一 agent 引用是只读 domain_profile 加载 :384，非发送链）。
