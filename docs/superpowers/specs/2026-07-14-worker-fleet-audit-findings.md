@@ -50,12 +50,21 @@ outbox_dispatcher（上轮主链路已审 + F-01）/ strategic_planner（第一�
 
 ---
 
-## 环节汇总（收尾时填）
+## 环节汇总
 
-- 总 findings 数：（待填）
-- 严重度分布：H / M / L（待填）
-- 一致性类元家族归纳：（待填）
-- 后续 P0-P3 修复路线建议：（待填）
+- **总 findings 数：18**（簇S 5 / 簇1 4 / 簇2 5 / 簇3 4）
+- **严重度分布：1 High / 2 Medium / 15 Low**
+  - **High（1）**：[1-01] initial_profile 任务成功后无终态写入（唯一 kind 不写 tasks 终态，单进程默认每条确定性命中：停 running→reclaim 反复重置 retry→重跑 3×LLM+3×画像覆写→recovery≥3 误判 failed）。
+  - **Medium（2）**：[S-01] review_task_now 绕开 claim CAS 与串行 worker 真并发跑同一任务（双发被 outbox 幂等键兜住，仅两次 LLM 文本不同才击穿）；[S-02] review_task_now 置 running 不写 claimed_at → 崩溃/失败后落入 reclaim 双分支盲区、本进程内永不回收（重启才兜回）。
+  - **Low（15）**：S-03/S-04/S-05 + 1-02/1-03/1-04 + 2-01~2-05 + 3-01/3-03/3-04（[3-02] 与 [2-05] 同一发现，去重后计簇2）。
+- **一致性类元家族归纳**：本批主线元家族 = **「统一 claim/终态纪律的层间不对称」**——worker 主路径守原子 CAS + claimed_at 同写 + kind 终态契约，但旁路/新增 kind 各有漏项：①[1-01] 新增 kind（initial_profile）漏掉「handler 负责写 task 终态」的隐式契约（其余 3 kind 都写）；②[S-01/S-02] admin 侧门 review_task_now 绕开 claim CAS 与 claimed_at；③[S-04/1-03] 收尾/重试写用 plain `_id` 非 CAS（单进程串行安全，多副本不对称）。次要元家族 = **「幂等底座唯一索引缺列/缺失」**：[S-03/1-02] outcome_aggregation 唯一索引缺 workspace_id、[2-01] follow_up 池根本无唯一索引（find-then-insert TOCTOU）。第三类 = **命名名实不符**（[2-05/3-02] silence_signal_daily_cap 实为 per-tick）+ **无界增长**（[3-01] behavior_signals 无 TTL）。
+- **交叉去重留痕**：[S-03]≡[1-02]（outcome_aggregation 唯一索引缺 workspace_id，同根因，簇S 与簇1 各从生命周期/资源域视角各报一次，修复一处即可）；[S-04]≡[1-03]（终态写非 CAS，同族）；[2-05]≡[3-02]（silence_signal_daily_cap 名实不符，同一发现，簇2 计数为准）。
+- **正向 HOLDS（逐条主控亲验）**：worker claim 原子 CAS + claimed_at 同写、心跳续约自停、recovery≥3 终态封顶 CAS、outcome_aggregation dup-key 幂等、supervisor 11 worker「正常返回不重启」判定安全、cold_reactivation_idempotent 不变量、silence 幂等落 `(workspace_id, dedupe_key)` partial unique 索引、**behavior_signals「只写不进决策」红线（全仓零生产读取点，决策链零引用）**、import_worker 全 `find_one_and_update` 原子 CAS + preview-only 重跑无副作用。
+- **后续 P0-P3 修复路线建议**：
+  - **P0（High，优先级高于第一批 5 Medium + 第二批 2 Medium）**：[1-01] initial_profile handler 成功落库后写 CAS 终态 `{_id, status:"running"}→sent`（对齐 outcome_aggregation 范式），早退分支各写终态。独立走 brainstorming→SDD→PR。
+  - **P1（Medium）**：[S-01]+[S-02] review_task_now 走 worker 同款 claim CAS（`{_id, workspace_id, status:{$in:[pending,retry]}}→running+claimed_at` + modified_count 检查）或直接复用 worker claim 语义。两条同源，一个 PR 收口。
+  - **P2（Low 一致性纵深）**：[S-03/1-02] 唯一索引补 workspace_id（配 migration 清历史）、[2-01] follow_up 池加唯一索引或接受软去重现状（需产品裁定是否值得）。多租户/多副本就绪债，可批量收口或随多租户启用时再修。
+  - **P3（Low 观测/命名/健壮性）**：[3-01] behavior_signals 补 TTL、[2-05/3-02] 重命名或补文档、[S-05] config 校验 timeout 下界、[1-04]/[2-02]/[2-03]/[2-04]/[3-03]/[3-04] 观测项。低优先，随手改。
 
 ---
 
