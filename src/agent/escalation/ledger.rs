@@ -3,13 +3,16 @@
 
 use super::logic::{is_duplicate_key_error, is_pending_dedupe_conflict, short_code_from_seed};
 use crate::error::{AppError, AppResult};
+use crate::knowledge_wiki::chunk_revisions::{
+    apply_chunk_revision, ProvenanceSource, RevisionOp, RevisionRequest,
+};
 use crate::models::{
     AgentPrincipalEscalation, AgentTask, OperationKnowledgeChunk, PrincipalDecision,
     ALLOWED_ESCALATION_CATEGORY, PRINCIPAL_ESCALATION_STATUS_PENDING,
     PRINCIPAL_ESCALATION_STATUS_RESOLVED,
 };
 use crate::routes::AppState;
-use mongodb::bson::{doc, DateTime};
+use mongodb::bson::{doc, DateTime, Document};
 
 /// 插入一条 pending 台账。短码碰撞（短码唯一索引报错）时换种子重试至多 5 次。
 ///
@@ -208,6 +211,134 @@ pub(crate) async fn emit_knowledge_gap_proposal(
     Ok(())
 }
 
+/// FNV-1a 64bit 文本 hash——与知识子系统 `stable_text_hash`
+/// (routes/knowledge/mod.rs:710，`pub(super)` 跨模块不可见) 保持同一算法。
+/// escalation 模块无法调用它，故复制一份纯逻辑，保证自锚定的 quoteHash 与
+/// 既有锚点口径完全一致（同输入同 hash）。
+fn stable_text_hash(value: &str) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in value.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// 无父文档的 substance 自锚定：quote 即 substance 整段，锚点覆盖整段（start=行首）。
+/// 复制 `source_anchor_for_quote`(routes/knowledge/mod.rs:756，`pub(super)` 跨模块不可见)
+/// 在 `raw_content == source_quote` 场景下的等价纯逻辑：领导授权的 substance 无外部父文档
+/// 可溯源，以 substance 自身为锚源（合法出处 = 领导裁决原话），使其满足 D2 门
+/// （source_quote 非空 + source_anchors 非空）。substance trim 后为空 → 返回 None。
+fn self_anchor_for_substance(substance: &str) -> Option<Document> {
+    let quote = substance.trim();
+    if quote.is_empty() {
+        return None;
+    }
+    let start = 0usize;
+    let end = quote.len();
+    // start=行首=第 1 行；end_line=quote 内换行数 + 1（与 source_anchor_for_quote 同口径：
+    // 后者 end_line = raw_content[..end] 的换行数 + 1，本场景 raw_content == quote）。
+    let start_line = 1i32;
+    let end_line = (quote.bytes().filter(|b| *b == b'\n').count() + 1) as i32;
+    Some(doc! {
+        "startOffset": start as i32,
+        "endOffset": end as i32,
+        "startLine": start_line,
+        "endLine": end_line,
+        "sourceQuote": quote,
+        "quoteHash": stable_text_hash(quote),
+    })
+}
+
+/// B 类沉淀：把领导（真人）经决策请示通道授权的 substance 落为 verified 知识 chunk，
+/// 供全体客户复用。
+///
+/// **红线定性**：验证者是领导（真人）本人，不是 AI 自评——只是把知识库复核前移到领导
+/// 裁决当下。source=`PrincipalAuthorized` 归人类权威家族（视同 Human），不落入
+/// `apply_chunk_revision` 对 source=Ai 的 draft 强制降级，故可直接带 verified；
+/// "AI 永不自动验证"本质未破。
+///
+/// **两步法**（`apply_chunk_revision` 只能改既有 chunk、不建 chunk，find_one 找不到会 NotFound）：
+/// - 步骤①：insert 一条 chunk（status=active + integrity_status=needs_review；domain
+///   必填 `user_operations` 否则 knowledge_router 召不回；chunk_type=product_fact；
+///   source_quote=substance + 自锚定，满足 D2 门）；
+/// - 步骤②：`apply_chunk_revision(op=Verify, source=PrincipalAuthorized)` 把
+///   integrity_status 改 verified（verify 语义只动 integrity_status/confidence，不动 status）。
+///
+/// patch 绝不带锁定字段（verified_at / verified_by / source_anchor）——照搬
+/// verify.rs:104-115 的非锁定字段集。substance trim 后为空 → 无从沉淀，直接 Ok 跳过。
+pub(crate) async fn sediment_principal_authorized_knowledge(
+    state: &AppState,
+    entry: &AgentPrincipalEscalation,
+    decision: &PrincipalDecision,
+) -> AppResult<()> {
+    let substance = decision.substance.trim();
+    // 空 substance 自锚定为空 → 过不了 D2 门，也无实质可沉淀，跳过（幂等、非错误）。
+    let Some(anchor) = self_anchor_for_substance(substance) else {
+        return Ok(());
+    };
+
+    // 步骤①：建 chunk。参照 emit_knowledge_gap_proposal 的 chunk doc 范式，补齐 D2 门
+    // 必需的 domain / chunk_type / source_quote / source_anchors。
+    let title = format!("领导授权沉淀：{}", entry.reason);
+    let body = format!(
+        "源自客户「{}」请示 #{}。\n卡点：{}\n领导裁决：{}\n约束：{}",
+        entry.contact_wxid,
+        entry.short_code,
+        entry.reason,
+        substance,
+        if decision.constraints.is_empty() {
+            "无".to_string()
+        } else {
+            decision.constraints.join("；")
+        }
+    );
+    let chunk = OperationKnowledgeChunk {
+        workspace_id: entry.workspace_id.clone(),
+        account_id: None, // workspace 共享域（与既有 chat 补库 / 知识提案共享域一致）
+        domain: "user_operations".to_string(), // 必填：knowledge_router 按此召回
+        chunk_type: "product_fact".to_string(), // 领导授权的产品说法
+        status: "active".to_string(),
+        integrity_status: Some("needs_review".to_string()),
+        title,
+        body: Some(body),
+        source_quote: Some(substance.to_string()),
+        source_anchors: vec![anchor],
+        confidence_score: Some(0),
+        ..OperationKnowledgeChunk::default()
+    };
+    let inserted = state
+        .db
+        .operation_knowledge_chunks()
+        .insert_one(&chunk, None)
+        .await?;
+    let Some(object_id) = inserted.inserted_id.as_object_id() else {
+        return Err(AppError::External(
+            "沉淀领导授权知识：insert 未返回 ObjectId".into(),
+        ));
+    };
+
+    // 步骤②：verify。patch 只带非锁定字段（integrity_status / confidence_score）；
+    // source=PrincipalAuthorized 标注验证者是领导（真人）；actor=principal_wxid 供审计追溯
+    // 是哪位领导授权。绝不带锁定字段 verified_at / verified_by / source_anchor。
+    apply_chunk_revision(
+        &state.db,
+        &entry.workspace_id,
+        object_id,
+        RevisionRequest {
+            op: RevisionOp::Verify,
+            source: ProvenanceSource::PrincipalAuthorized,
+            patch: doc! {
+                "integrity_status": "verified",
+                "confidence_score": 100,
+            },
+            reason: Some(format!("领导授权沉淀（请示 #{}）", entry.short_code)),
+            actor: Some(entry.principal_wxid.clone()),
+        },
+    )
+    .await?;
+    Ok(())
+}
 
 /// 反查：在**入站消息自身所属 workspace** 内，from_wxid 是否是某 domain 的决策人。
 /// KD-04：判断 from_wxid 是否为本 workspace 任一 current_version 域配置的决策人
@@ -393,4 +524,73 @@ pub(crate) async fn latest_push_ms(
         .await?;
     // last_pushed_at_ms 已是 epoch ms；旧行缺字段→None（m031 backfill 前），用 created_at 兜底保口径。
     Ok(latest.and_then(|e| e.last_pushed_at_ms.or_else(|| Some(e.created_at.timestamp_millis()))))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // stable_text_hash / self_anchor_for_substance 是复制自知识子系统的纯逻辑
+    // （原 fn 是 pub(super)，escalation 模块跨模块不可见）。这里锁死"与原口径一致"
+    // 及"满足 D2 门"两条不变量，防复制版本后续被误改偏离。
+    // 完整两步法（insert + apply_chunk_revision）依赖 DB，本地磁盘纪律不跑 testcontainer，
+    // 交 Task 5 联调 + 生产验证。
+
+    #[test]
+    fn stable_text_hash_matches_knowledge_subsystem_algorithm() {
+        // 与 routes/knowledge/mod.rs:710 的 FNV-1a 64bit 同算法：确定性 + 16 位 hex。
+        let h1 = stable_text_hash("foo");
+        let h2 = stable_text_hash("foo");
+        assert_eq!(h1, h2, "同输入必须同 hash");
+        assert_eq!(h1.len(), 16, "16 位 hex");
+        assert_ne!(h1, stable_text_hash("bar"), "不同输入不同 hash");
+    }
+
+    #[test]
+    fn self_anchor_empty_substance_returns_none() {
+        // 空/纯空白 substance 无从自锚 → None（调用方据此跳过沉淀，过不了 D2 门）。
+        assert!(self_anchor_for_substance("").is_none());
+        assert!(self_anchor_for_substance("   \n  ").is_none());
+    }
+
+    #[test]
+    fn self_anchor_covers_full_substance_and_satisfies_d2() {
+        let substance = "同意给这位客户 8 折优惠";
+        let anchor = self_anchor_for_substance(substance).expect("非空 substance 必产锚点");
+        // D2 门要求 source_anchors 非空且能定位来源：quote 即 substance 整段，start=行首。
+        assert_eq!(anchor.get_i32("startOffset").unwrap(), 0, "锚点 start=行首");
+        assert_eq!(
+            anchor.get_i32("endOffset").unwrap() as usize,
+            substance.len(),
+            "锚点覆盖整段 substance"
+        );
+        assert_eq!(anchor.get_str("sourceQuote").unwrap(), substance);
+        assert_eq!(anchor.get_i32("startLine").unwrap(), 1);
+        assert_eq!(anchor.get_i32("endLine").unwrap(), 1, "单行 substance endLine=1");
+        assert_eq!(
+            anchor.get_str("quoteHash").unwrap(),
+            stable_text_hash(substance),
+            "quoteHash 与 stable_text_hash 口径一致"
+        );
+    }
+
+    #[test]
+    fn self_anchor_trims_before_anchoring() {
+        // 前后空白被 trim：quote 为 trim 后文本，offset 从 0 起（自锚源即 quote 自身）。
+        let anchor = self_anchor_for_substance("  报价 5000 元  ").expect("非空");
+        assert_eq!(anchor.get_str("sourceQuote").unwrap(), "报价 5000 元");
+        assert_eq!(anchor.get_i32("startOffset").unwrap(), 0);
+        assert_eq!(
+            anchor.get_i32("endOffset").unwrap() as usize,
+            "报价 5000 元".len()
+        );
+    }
+
+    #[test]
+    fn self_anchor_multiline_end_line_counts_newlines() {
+        // 多行 substance：endLine = 换行数 + 1（与 source_anchor_for_quote 同口径）。
+        let anchor = self_anchor_for_substance("第一行\n第二行\n第三行").expect("非空");
+        assert_eq!(anchor.get_i32("startLine").unwrap(), 1);
+        assert_eq!(anchor.get_i32("endLine").unwrap(), 3, "两个换行 → endLine=3");
+    }
 }

@@ -76,6 +76,10 @@ pub enum ProvenanceSource {
     Rule,
     /// import_apply 流式块导入。
     Imported,
+    /// 领导（真人）经决策请示通道授权的知识——验证者是领导本人，视同 Human
+    /// 人类权威家族（绝非 AI 自动验证：源头是真人裁决，只是把知识库复核前移到
+    /// 裁决当下）。不落入下方 `source=Ai` 的 draft 强制降级分支，故可直接带 verified。
+    PrincipalAuthorized,
 }
 
 impl ProvenanceSource {
@@ -85,6 +89,7 @@ impl ProvenanceSource {
             ProvenanceSource::Human => "human",
             ProvenanceSource::Rule => "rule",
             ProvenanceSource::Imported => "imported",
+            ProvenanceSource::PrincipalAuthorized => "principal_authorized",
         }
     }
 }
@@ -97,8 +102,9 @@ impl FromStr for ProvenanceSource {
             "human" => Ok(ProvenanceSource::Human),
             "rule" => Ok(ProvenanceSource::Rule),
             "imported" => Ok(ProvenanceSource::Imported),
+            "principal_authorized" => Ok(ProvenanceSource::PrincipalAuthorized),
             other => Err(AppError::BadRequest(format!(
-                "invalid revision source '{other}'; expected one of ai|human|rule|imported"
+                "invalid revision source '{other}'; expected one of ai|human|rule|imported|principal_authorized"
             ))),
         }
     }
@@ -489,5 +495,19 @@ mod tests {
             "imported"
         );
         assert!(ProvenanceSource::from_str("evil").is_err());
+    }
+
+    #[test]
+    fn provenance_principal_authorized_roundtrip() {
+        assert_eq!(
+            ProvenanceSource::PrincipalAuthorized.as_str(),
+            "principal_authorized"
+        );
+        assert_eq!(
+            "principal_authorized"
+                .parse::<ProvenanceSource>()
+                .unwrap(),
+            ProvenanceSource::PrincipalAuthorized
+        );
     }
 }
