@@ -97,7 +97,67 @@
 
 ## 簇C 通用化底座 findings
 
-（主控亲验后填入）
+> 主控亲验结论：**引擎层通用化远比预期健康，无写死销售死字段**——domain_signals/dimension_registry/domain_profile 里的销售字面量全是 default_* seed（有 *_matches_hardcoded_verbatim / *_default_is_byte_identical 字节等价护栏），非残留硬编码；历史"C3 apply_active_profile 仅 3 标量"已被设计化解（models.rs:1970-1995 文档化三类接线约定）。真正缺口只有 2 Medium 且都 fail-soft/自愈：F1 stagnation 写侧半接线 + F2 初始画像残留销售 schema。印证喂入线索"引擎/契约/知识三层已闭环"，未发现前端 labelFor 之外的后端残留硬编码销售假设。
+
+### [C-01] `stagnation_dimension` 配置读写不对称：读侧全动态、写侧写死 customer_stage_updated_at
+- 入口频道: userOps（planner 停滞催进）
+- 所属簇: C
+- 类型: 一致性（读写不对称·元家族典型）
+- 严重度: Medium（主控亲验裁定：CONFIRMED 读写不对称确凿；但读侧 fail-soft 回落掩盖缺口、funnel.enabled=false 兜底不炸，故非确定性崩溃而是"配了非 customer_stage 停滞维度的行业催进时机语义错误"）
+- 现象/风险: DomainProfile.stagnation_dimension 声称让任意行业指定"哪个维度驱动 planner 停滞计时"。读侧已完全动态化，但写侧从不写非 customer_stage 维度的时间戳→配非 customer_stage 停滞维度的行业计时实际永远跟踪 customer_stage 时间戳。
+- 根因（亲验 file:line）: 读侧动态——`planner/mod.rs:1022-1023` DB filter `format!("domain_attributes.{dim}_updated_at")`（亲验）+ 内存判定按同 key。写侧写死——`domain_signals.rs:148-149` `if stage_changed && signals.get_str("customer_stage").is_ok() { set_doc.insert("domain_attributes.customer_stage_updated_at", ...) }`（亲验）；gateway.rs:4043-4048 stage_changed 也只按 customer_stage 新旧比对。读侧 planner/mod.rs:1029-1032 第二支 $or（`<dim>_updated_at $exists:false` AND customer_stage_updated_at<before）回落恰好掩盖写侧缺口。
+- 复现设想: profile 设 stagnation_dimension="relationship_closeness"+funnel.enabled=true，期望"关系亲密度 N 天未变→催进"；实际 relationship_closeness_updated_at 永不被写→计时恒回落 customer_stage_updated_at→催进时机语义错误（且若该域根本不写 customer_stage，stage_stagnation_candidate_filter 的 customer_stage:{$exists} 会整体排除这些 contact，仅靠 funnel.enabled=false 兜底）。
+- 验证状态: CONFIRMED
+- 修复建议: insert_domain_signal_values 增参 stagnation_dimension，stage_changed 时写 `domain_attributes.{stagnation_dimension}_updated_at`（DEFAULT=customer_stage 时字节等价）；或 gateway 写点按 active profile 的 stagnation_dimension 补写对应时间戳。
+- 状态: Open
+
+### [C-02] 初始画像生成路径通用化只做了一半 + 残留销售 schema
+- 入口频道: userOps（admin 建档时的初始画像 seed）
+- 所属簇: C
+- 类型: 一致性（半接线·新旧路径不对称）
+- 严重度: Medium（主控亲验裁定：CONFIRMED 半接线确凿；但初始画像是一次性 seed，live reply 每轮重新派生维度→首条入站消息即自愈，故非确定性失效；非销售域首屏画像被销售字段主动框住是真实瑕疵）
+- 现象/风险: build_initial_operation_profile 注释自称已修复"唯一漏接 active DomainProfile 的 prompt 构造点"，但只接了 prompt_fragment，未接 live reply 路径已有的 render_decision_dimensions_guidance/render_memory_candidate_types_guidance 等；抽取仅读 customerStage/intentLevel。非销售域声明的 profile_dimensions（relationship_closeness/emotion_state）在建档时既不被告知 LLM 也不被采集。
+- 根因（亲验 file:line）: `decision.rs:69-77` 初始画像只接 active_profile.prompt_fragment 作 business_context（亲验），无 render_decision_dimensions_guidance append；对照 live reply 路径 decision.rs:679-686 明确 append 了该 guidance。默认 prompt user.initial_profile.task（prompts.rs:1075-1102）schema 写死销售字段 painPoints/budget/decisionRole/customerStage/intentLevel。
+- 复现设想: 情感陪伴域 workspace（profile_dimensions 含 emotion_state 而非 customer_stage）建档，首屏画像 prompt 仍问 budget/decisionRole，不采集 emotion_state；首条真实 inbound 后 live reply 才自愈。
+- 验证状态: CONFIRMED（半接线亲验；自愈缓解亦亲验）
+- 修复建议: 在 build_initial_operation_profile 的 user prompt 组装处比照 reply 路径追加 render_decision_dimensions_guidance + render_memory_candidate_types_guidance；或将 user.initial_profile.task 的销售 schema 段纳入 profile 驱动的注入点。
+- 状态: Open
+
+### [C-03] `planner/mod.rs:819-821` 注释陈旧：称 DB dotted-key 动态化"待后续 milestone"实际已实现
+- 入口频道: —
+- 所属簇: C
+- 类型: 文档-代码漂移
+- 严重度: Low（主控亲验裁定：CONFIRMED 注释与实现矛盾，易误导并掩盖 F1 真缺口在写侧）
+- 现象/风险: planner/mod.rs:819-821 注释称 stagnation_dimension"当前仅承载该值供内存判定；MongoDB 端 filter 的 dotted-key 动态化随后续 milestone 跟进"，但 stage_stagnation_candidate_filter(:1022-1033) 已实现 DB 端动态拼 `<dim>_updated_at`。
+- 根因（亲验 file:line）: planner/mod.rs:1022-1033 已动态化（C-01 亲验时确认），注释未更新。
+- 复现设想: 无（读码发现）。
+- 验证状态: CONFIRMED
+- 修复建议: 更新注释为"DB filter 已动态化，真正缺口在写侧只写 customer_stage_updated_at（见 C-01）"。
+- 状态: Open
+
+### [C-04] `domain_profile.rs:12` 模块级 `#![allow(dead_code)]` 承诺"Phase 1 后移除"却仍在
+- 入口频道: —
+- 所属簇: C
+- 类型: 就绪债
+- 严重度: Low（主控亲验裁定：CONFIRMED；subagent 逐一亲验全部 ~30 个 DomainProfile 字段均有真实消费方无死字段，故当前未掩盖实际死代码，但该 allow 关闭全模块死代码检测、未兑现自身注释承诺）
+- 现象/风险: domain_profile.rs:10-12 注释明写"Phase 1 接线后移除本 allow，由编译器确保每个导出项都被真实消费"，但 `#![allow(dead_code)]` 仍在，关闭整模块死代码检测。
+- 根因（亲验 file:line）: domain_profile.rs:10-12 注释 + allow 并存。
+- 复现设想: 无。
+- 验证状态: CONFIRMED
+- 修复建议: 移除模块级 allow 恢复编译器保护（subagent 已验全字段有消费方，移除应不触发新 warning）。
+- 状态: Open
+
+### [C-05] `DimensionChannel` 四变体仅 AdminDirect 驱动逻辑，其余三个纯描述性
+- 入口频道: —
+- 所属簇: C
+- 类型: 文档-代码漂移（易误导）
+- 严重度: Low（主控亲验裁定：CONFIRMED；注释已把 channel 定位为"结构属性"元数据，但维护者可能误以为 channel 决定写入路由）
+- 现象/风险: dimension_registry.rs:14-24 定义四通道但逻辑仅 AdminDirect 被 match(:133)，LlmSignals/GatewayDerived/ReactionDerived 从不驱动路由——真实"机器 vs admin"区分由正交的 WriteIntent 承担。
+- 根因（亲验 file:line）: dimension_registry.rs:133 `matches!(spec.channel, DimensionChannel::AdminDirect)` 是唯一 channel 判定点。
+- 复现设想: 无。
+- 验证状态: CONFIRMED
+- 修复建议: 注释显式说明"仅 AdminDirect 载逻辑、余者为文档性元数据，写入路由由 WriteIntent 承担"。
+- 状态: Open
 
 ## 簇D 节流准入 findings
 
