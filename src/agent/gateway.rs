@@ -758,11 +758,74 @@ pub(crate) async fn trigger_principal_escalation(
 /// relay：把领导裁决用 AI 口吻转述给客户，走现有网关。转述完清等待态、按需发知识提案。
 pub(crate) async fn relay_principal_decision_to_customer(
     state: &AppState,
-    contact: Contact,
+    mut contact: Contact,
     entry: &crate::models::AgentPrincipalEscalation,
     decision: &crate::models::PrincipalDecision,
     task_id: Option<ObjectId>,
 ) -> AppResult<()> {
+    // 领导裁决是否构成授权（approved / conditional 才授权；rejected 等不授权）。
+    // A 类豁免写入（relay 前）与 B 类知识沉淀（relay 后）共用此判定。
+    let verdict_authorizes = matches!(
+        decision.verdict.as_str(),
+        crate::models::PRINCIPAL_VERDICT_APPROVED | crate::models::PRINCIPAL_VERDICT_CONDITIONAL
+    );
+
+    // A 类领导授权豁免落地：授权 + 指定豁免类型（customer_only / knowledge）时，在 relay
+    // **之前**写该客户 domain_attributes 豁免记录。customer_only 与 knowledge 都先写，保证
+    // 本轮 relay 即通过 R5.4 产品门、不空等 B 类异步沉淀（B 是 A 的超集）。
+    if verdict_authorizes
+        && matches!(
+            decision.exemption_type.as_str(),
+            crate::models::EXEMPTION_TYPE_CUSTOMER_ONLY | crate::models::EXEMPTION_TYPE_KNOWLEDGE
+        )
+    {
+        let exemption_doc = doc! {
+            "granted": true,
+            "granted_by": &entry.principal_wxid,
+            "substance": &decision.substance,
+            "escalation_short_code": &entry.short_code,
+            "granted_at_ms": mongodb::bson::DateTime::now().timestamp_millis(),
+        };
+        let set_key = format!(
+            "domain_attributes.{}",
+            crate::models::PRINCIPAL_PRODUCT_EXEMPTION_ATTR
+        );
+        // 落库：$set 点号子键，不整体覆盖 domain_attributes（与既有 stage / value_tier 写法一致，
+        // 不会被 relay 内部各自的点号写入互相 clobber）。这一步须成功——失败则本轮放行落空，
+        // 故用 `?`（与紧随其后的 clear_awaiting_principal_state 同级）。
+        state
+            .db
+            .contacts()
+            .update_one(
+                doc! { "workspace_id": &contact.workspace_id, "account_id": &contact.account_id, "wxid": &contact.wxid },
+                doc! { "$set": {
+                    set_key: exemption_doc.clone(),
+                    "domain_attributes_updated_at": mongodb::bson::DateTime::now(),
+                } },
+                None,
+            )
+            .await?;
+        // 同步内存副本：本轮 relay 走 run_user_operation_gateway(contact.clone())，gateway_inner
+        // 不重载 contact，R5.4 产品门（gates.rs contact_has_principal_product_exemption）读的就是
+        // 这份内存值。不同步则 DB 已写、当轮仍读不到 → 产品门当轮照拦、要等下轮才生效，违背
+        // “relay 前写、当轮即通过”的设计目标。
+        contact
+            .domain_attributes
+            .get_or_insert_with(Document::new)
+            .insert(crate::models::PRINCIPAL_PRODUCT_EXEMPTION_ATTR, exemption_doc);
+        // fail-soft 审计（写事件失败不阻断放行）。
+        let _ = write_event_for_account(
+            state,
+            &contact.account_id,
+            Some(&contact.wxid),
+            "contact.principal_exemption_granted",
+            "ok",
+            "领导授权该客户产品豁免",
+            None,
+        )
+        .await;
+    }
+
     let synthetic = crate::models::ConversationMessage::synthetic_principal_relay(
         &contact,
         &decision.verdict,
@@ -778,21 +841,33 @@ pub(crate) async fn relay_principal_decision_to_customer(
     )
     .await?;
     clear_awaiting_principal_state(state, &contact).await?;
-    let verdict_yields_knowledge = matches!(
-        decision.verdict.as_str(),
-        crate::models::PRINCIPAL_VERDICT_APPROVED | crate::models::PRINCIPAL_VERDICT_CONDITIONAL
-    );
-    if entry.is_generalizable && verdict_yields_knowledge && !entry.knowledge_proposal_emitted {
-        escalation::emit_knowledge_gap_proposal(state, entry, decision).await?;
-        state
-            .db
-            .agent_principal_escalations()
-            .update_one(
-                doc! { "short_code": &entry.short_code },
-                doc! { "$set": { "knowledge_proposal_emitted": true } },
-                None,
-            )
-            .await?;
+    // B 类知识沉淀 / 旧 draft 提案二选一（互斥），都受 !knowledge_proposal_emitted 防重复：
+    // - exemption_type == knowledge：领导授权把该说法沉淀成全体可复用的 verified 知识（B 类，
+    //   是 A 类豁免的超集：先即时放行该客户，再沉淀给全体）；由 exemption_type 驱动，绕过
+    //   is_generalizable 门（授权即沉淀），走 sediment_principal_authorized_knowledge。
+    // - 其余可泛化裁决（exemption_type=none/customer_only 且 is_generalizable）：保持既有 draft
+    //   知识缺口提案行为不动（YAGNI，最小改动，只把 knowledge 类改走 verified 沉淀）。
+    if verdict_authorizes && !entry.knowledge_proposal_emitted {
+        let did_emit = if decision.exemption_type == crate::models::EXEMPTION_TYPE_KNOWLEDGE {
+            escalation::sediment_principal_authorized_knowledge(state, entry, decision).await?;
+            true
+        } else if entry.is_generalizable {
+            escalation::emit_knowledge_gap_proposal(state, entry, decision).await?;
+            true
+        } else {
+            false
+        };
+        if did_emit {
+            state
+                .db
+                .agent_principal_escalations()
+                .update_one(
+                    doc! { "short_code": &entry.short_code },
+                    doc! { "$set": { "knowledge_proposal_emitted": true } },
+                    None,
+                )
+                .await?;
+        }
     }
     Ok(())
 }
