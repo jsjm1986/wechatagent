@@ -78,6 +78,10 @@ const PER_TICK_PROCESS_CAP: usize = 16;
 /// 空转 reclaim，又足够短让恢复后及时补发。
 const ACCOUNT_OFFLINE_DEFER_SECONDS: i64 = 60;
 
+/// F-04：单条 entry 允许被 reclaim 的上限。超过则转 failed_terminal——worker 反复在
+/// 同位置崩溃（无限 reclaim 永不进终态）时止损交 admin。reclaim ≠ 发送 attempt。
+const OUTBOX_MAX_RECLAIMS: i32 = 5;
+
 /// 单 worker 的唯一 id：`hostname:pid:uuid`，便于审计哪台机器哪进程占了哪条。
 fn worker_id() -> String {
     let host = std::env::var("COMPUTERNAME")
@@ -113,7 +117,8 @@ pub async fn reclaim_expired_leases(state: &AppState) -> AppResult<u64> {
                 "$unset": {
                     "worker_id": "",
                     "locked_until": "",
-                }
+                },
+                "$inc": { "reclaim_count": 1 },
             },
             None,
         )
@@ -122,6 +127,30 @@ pub async fn reclaim_expired_leases(state: &AppState) -> AppResult<u64> {
         tracing::info!(
             modified_count = result.modified_count,
             "outbox dispatcher reclaimed expired leases"
+        );
+    }
+    // F-04：reclaim_count 超上限的 entry 转 failed_terminal。单 update 无法按 $inc 后的
+    // 新值分流，故单独一遍 update_many（幂等：已 failed_terminal 不再匹配 status:Pending）。
+    let terminated = collection
+        .update_many(
+            doc! {
+                "status": OutboxStatus::Pending.as_str(),
+                "reclaim_count": { "$gt": OUTBOX_MAX_RECLAIMS },
+            },
+            doc! {
+                "$set": {
+                    "status": OutboxStatus::FailedTerminal.as_str(),
+                    "updated_at": now,
+                    "last_error": "reclaim 超限（worker 反复崩溃，止损转终态）",
+                }
+            },
+            None,
+        )
+        .await?;
+    if terminated.modified_count > 0 {
+        tracing::warn!(
+            terminated = terminated.modified_count,
+            "outbox reclaim 超限转 failed_terminal"
         );
     }
     Ok(result.modified_count)
@@ -214,6 +243,9 @@ pub async fn second_safety_gate(
         String::new()
     };
 
+    let is_managed = contact
+        .as_ref()
+        .map_or(false, |c| c.agent_status == AgentStatus::Managed);
     let decision_created_ms = entry.created_at.timestamp_millis();
     Ok(check_second_safety_gate_pure(
         now.timestamp_millis(),
@@ -223,6 +255,7 @@ pub async fn second_safety_gate(
         &outcome,
         decision_created_ms,
         STALE_THRESHOLD_MILLIS,
+        is_managed,
     ))
 }
 

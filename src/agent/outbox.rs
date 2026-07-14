@@ -270,6 +270,7 @@ pub async fn enqueue(state: &AppState, req: EnqueueRequest) -> Result<EnqueueOut
         worker_id: None,
         locked_until: None,
         reclaimed_in_flight: false,
+        reclaim_count: 0,
         created_at: now,
         updated_at: now,
         sent_at: None,
@@ -502,7 +503,14 @@ pub(crate) fn check_second_safety_gate_pure(
     outcome: &str,
     decision_created_ms: i64,
     stale_threshold_ms: i64,
+    is_managed: bool,
 ) -> Option<String> {
+    // B-03：发送前 fresh 复核 managed。决策运行期（~10-15s）admin 把 contact 改 normal 想
+    // 立即止住 AI，precheck 的入参快照复核不到；dispatcher 发送前 fresh 查 contact 是最接近
+    // 实际发送的复核点，非 managed（含 contact 被删 → is_managed=false）→ 拦截，不发在途回复。
+    if !is_managed {
+        return Some("not_managed_at_send".to_string());
+    }
     if let Some(cooldown) = cooldown_until_ms {
         if cooldown > now_ms {
             return Some("contact_cooldown_active".to_string());
@@ -996,6 +1004,7 @@ mod tests {
             outcome,
             i64::MAX,
             30 * 60 * 1000,
+            true,
         );
         assert_eq!(reason.as_deref(), Some("contact_cooldown_active"));
     }
@@ -1015,6 +1024,7 @@ mod tests {
             outcome,
             entry_created,
             30 * 60 * 1000,
+            true,
         );
         assert_eq!(reason.as_deref(), Some("user_stop_requested_after_decision"));
     }
@@ -1031,6 +1041,7 @@ mod tests {
             "user_replied_unclassified",
             i64::MAX,
             30 * 60 * 1000,
+            true,
         );
         assert_eq!(reason.as_deref(), Some("outbox_stale_30min"));
     }
@@ -1047,6 +1058,7 @@ mod tests {
             "user_replied_unclassified",
             i64::MAX,
             30 * 60 * 1000,
+            true,
         );
         assert!(reason.is_none(), "正常情况应放行，实际：{:?}", reason);
     }
@@ -1135,6 +1147,7 @@ mod tests {
             "",
             entry_created_ms,
             STALE_MS,
+            true,
         );
         assert_eq!(res.as_deref(), Some("contact_cooldown_active"));
     }
@@ -1152,6 +1165,7 @@ mod tests {
             "",
             now_ms - 1_000,
             STALE_MS,
+            true,
         );
         assert!(res.is_none());
     }
@@ -1172,6 +1186,7 @@ mod tests {
             "user_replied_stop_requested",
             decision_created_ms,
             STALE_MS,
+            true,
         );
         assert_eq!(res.as_deref(), Some("user_stop_requested_after_decision"));
     }
@@ -1192,6 +1207,7 @@ mod tests {
             "user_replied_stop_requested",
             decision_created_ms,
             STALE_MS,
+            true,
         );
         assert!(res.is_none());
     }
@@ -1211,6 +1227,7 @@ mod tests {
             "",
             entry_created_ms,
             stale_ms,
+            true,
         );
         assert_eq!(res.as_deref(), Some("outbox_stale_30min"));
     }
@@ -1228,8 +1245,25 @@ mod tests {
             "",
             now_ms - 1_000,
             STALE_MS,
+            true,
         );
         assert!(res.is_none());
+    }
+
+    #[test]
+    fn second_gate_blocks_when_not_managed() {
+        // B-03：发送前非 managed（决策期 admin 改 normal / contact 被删）→ 拦截。
+        let now = 1_000_000_000_000i64;
+        let r = check_second_safety_gate_pure(now, now, None, None, "", now, 30 * 60 * 1000, false);
+        assert_eq!(r, Some("not_managed_at_send".to_string()), "非 managed 必须拦截");
+    }
+
+    #[test]
+    fn second_gate_managed_normal_passes() {
+        // is_managed=true + 无 cooldown/stop/陈旧 → None（不误伤正常发送）。
+        let now = 1_000_000_000_000i64;
+        let r = check_second_safety_gate_pure(now, now, None, None, "", now, 30 * 60 * 1000, true);
+        assert_eq!(r, None, "managed 且其它闸未命中应放行");
     }
 }
 
