@@ -516,6 +516,21 @@ pub struct FinalizeOutcome {
     pub pending_events: Vec<PendingFinalizeEvent>,
 }
 
+/// 该 contact 是否有生效的 A 类领导授权产品豁免。
+///
+/// 判据：`Contact.domain_attributes.<PRINCIPAL_PRODUCT_EXEMPTION_ATTR>` 存在，且其子文档
+/// `granted == true`。领导针对该客户授权后由 relay 接线写入该子文档；R5.4 产品门据此
+/// 并联放行该客户的产品说法。`domain_attributes` 为 `Option<Document>`，缺容器 / 缺 key /
+/// 缺 granted 一律返回 false（fail-closed：无授权即按原门拦截）。
+pub fn contact_has_principal_product_exemption(contact: &crate::models::Contact) -> bool {
+    contact
+        .domain_attributes
+        .as_ref()
+        .and_then(|d| d.get_document(crate::models::PRINCIPAL_PRODUCT_EXEMPTION_ATTR).ok())
+        .and_then(|d| d.get_bool("granted").ok())
+        .unwrap_or(false)
+}
+
 /// agent-autonomy-loop W2 / Task 3.2（R3.5 / R3.7 / R5.3 / R5.4 / R5.7 / R2.6 / R8）：
 /// 最终安全汇总层。
 ///
@@ -540,6 +555,11 @@ pub struct FinalizeOutcome {
 ///   的协议违规标签（如 `missing_required_field:* / invalid_enum_value:* /
 ///   invalid_type:* / decision_phase_invalid:* /
 ///   insufficient_detail_in_critical_turn:*`）。
+/// * `priced_from_catalog`：本轮 decision 报价 product_id 是否命中本 workspace active
+///   产品目录（G2 结构化背书，由 gateway 算好传入）；R5.4 与 verified_chunks 取或。
+/// * `principal_product_exempted`：该客户是否有生效的 A 类领导授权产品豁免（由 gateway
+///   经 [`contact_has_principal_product_exemption`] 从 contact 读出传入）；R5.4 第三条
+///   并联背书，与前两者取或，任一成立即放行产品声明门。
 pub fn finalize_review_for_send(
     review: DecisionReviewResult,
     decision: &mut AgentDecision,
@@ -550,6 +570,7 @@ pub fn finalize_review_for_send(
     _inbound_text: &str,
     commitment_markers: &crate::models::CommitmentMarkers,
     priced_from_catalog: bool,
+    principal_product_exempted: bool,
 ) -> FinalizeOutcome {
     let mut review = review;
     let mut pending_events: Vec<PendingFinalizeEvent> = Vec::new();
@@ -651,6 +672,11 @@ pub fn finalize_review_for_send(
     // 取**或**：两者皆空才 block。零扰动：无产品行业产品表空 → priced_from_catalog 恒假
     // → 行为与改造前字节等价（纯情感回复 requiresProductKnowledge 本就为假，不进此块）。
     //
+    // 第三条并联背书（A 类领导授权豁免，`principal_product_exempted`）：领导针对该客户
+    // 显式授权后，该客户的产品说法视为已获授权背书——与 verified_chunks / priced_from_catalog
+    // 三者取**或**，任一成立即放行。零扰动：无授权记录时 gateway 传入恒假（生产暂无写入方，
+    // 写入在 relay 接线阶段完成），行为与改造前字节等价。
+    //
     // 注：2026-05-25 知识库清理删除了 chunk.safe_claims / ProductClaimMarkers，
     // 故 R5.7 safe_claims 反向门 / R5.3 claim_analysis 缺失 fail-closed 推断不在
     // 本次恢复范围；claim_analysis 缺失时按"非产品声明"放行（reviewer 软闸 +
@@ -662,7 +688,7 @@ pub fn finalize_review_for_send(
             knowledge_chunks,
             now,
         );
-        if verified_chunks.is_empty() && !priced_from_catalog {
+        if verified_chunks.is_empty() && !priced_from_catalog && !principal_product_exempted {
             review.approved = false;
             review.scores.hallucination_score = review.scores.hallucination_score.max(6);
             extend_risks_unique(
@@ -1395,9 +1421,9 @@ mod dual_gate_classification_tests {
         AgentDecision, DecisionReviewResult, ReviewScores, HOLD_CATEGORY_HELD_BY_AI_POLICY,
     };
     use super::{
-        classify_dual_gate, decide_revision, finalize_review_for_send, reply_objective_features,
-        review_passed, route_dual_gate, DualGateClassification, FinalizeOutcome,
-        GatewayStatusFinal, RevisionDecision,
+        classify_dual_gate, contact_has_principal_product_exemption, decide_revision,
+        finalize_review_for_send, reply_objective_features, review_passed, route_dual_gate,
+        DualGateClassification, FinalizeOutcome, GatewayStatusFinal, RevisionDecision,
     };
     use crate::models::{AgentStatus, Contact};
     use mongodb::bson::{DateTime, Document};
@@ -1780,6 +1806,7 @@ mod dual_gate_classification_tests {
             "用户最新消息",
             &crate::models::CommitmentMarkers::default(),
             false,
+            false,
         );
         let FinalizeOutcome {
             review: finalized,
@@ -1814,6 +1841,7 @@ mod dual_gate_classification_tests {
             Vec::new(),
             "用户最新消息",
             &crate::models::CommitmentMarkers::default(),
+            false,
             false,
         );
         let FinalizeOutcome {
@@ -1857,6 +1885,7 @@ mod dual_gate_classification_tests {
             Vec::new(),
             "收到，谢谢",
             &crate::models::CommitmentMarkers::default(),
+            false,
             false,
         );
         assert_eq!(
@@ -1902,6 +1931,7 @@ mod dual_gate_classification_tests {
             "用户最新消息",
             &crate::models::CommitmentMarkers::default(),
             false,
+            false,
         );
         match outcome.status {
             GatewayStatusFinal::Held(category) => {
@@ -1936,6 +1966,7 @@ mod dual_gate_classification_tests {
             "用户最新消息",
             &crate::models::CommitmentMarkers::default(),
             false,
+            false,
         );
         let FinalizeOutcome {
             review: finalized,
@@ -1968,6 +1999,7 @@ mod dual_gate_classification_tests {
             Vec::new(),
             "用户最新消息",
             &crate::models::CommitmentMarkers::default(),
+            false,
             false,
         );
         let FinalizeOutcome {
@@ -2049,6 +2081,7 @@ mod dual_gate_classification_tests {
             "我们的产品一定能帮您",
             &crate::models::CommitmentMarkers::default(),
             false,
+            false,
         );
         assert_eq!(
             outcome.status,
@@ -2088,11 +2121,72 @@ mod dual_gate_classification_tests {
             "这款年度会员是 199 元",
             &crate::models::CommitmentMarkers::default(),
             true, // priced_from_catalog：报价 product_id 命中 active 产品目录
+            false, // principal_product_exempted：无领导授权豁免
         );
         assert_eq!(
             outcome.status,
             GatewayStatusFinal::Approved,
             "目录报价背书应放行，不被 blocked_unverified_product_claim 错杀"
+        );
+        assert!(outcome.review.approved);
+    }
+
+    #[test]
+    fn principal_exemption_helper_detects_granted() {
+        // helper 三态：无 domain_attributes / 有 key 且 granted=true / 缺 granted。
+        // domain_attributes 是 Option<Document>（models.rs:203），finalize_contact 置 None。
+        let mut c = finalize_contact();
+        assert!(
+            !contact_has_principal_product_exemption(&c),
+            "无 domain_attributes 容器时应返回 false（fail-closed）"
+        );
+        c.domain_attributes = Some(mongodb::bson::doc! {
+            crate::models::PRINCIPAL_PRODUCT_EXEMPTION_ATTR: {
+                "granted": true,
+                "substance": "这款年度会员是 199 元",
+            },
+        });
+        assert!(
+            contact_has_principal_product_exemption(&c),
+            "granted=true 时应识别为有生效豁免"
+        );
+        // granted=false 时不放行。
+        c.domain_attributes = Some(mongodb::bson::doc! {
+            crate::models::PRINCIPAL_PRODUCT_EXEMPTION_ATTR: { "granted": false },
+        });
+        assert!(
+            !contact_has_principal_product_exemption(&c),
+            "granted=false 时不应识别为有效豁免"
+        );
+    }
+
+    #[test]
+    fn finalize_allows_product_claim_when_principal_exempted() {
+        // R5.4 第三条并联背书：无 verified chunk、无目录报价（priced=false），
+        // 但该客户有生效的领导授权豁免（principal_product_exempted=true）→ 不 block。
+        // 复用 priced 测试同 setup，仅把末两参改成 priced=false, exempted=true。
+        let runtime = UserRuntimeParameters::default();
+        let mut review = full_pass_review();
+        review.claim_analysis = mongodb::bson::doc! { "requiresProductKnowledge": true };
+        let mut decision = shouldreply_decision();
+        // 没引用任何 verified chunk（used_knowledge_ids 空 / 无 verified）
+        let contact = finalize_contact();
+        let outcome = finalize_review_for_send(
+            review,
+            &mut decision,
+            &runtime,
+            &contact,
+            &[],
+            Vec::new(),
+            "这款年度会员是 199 元",
+            &crate::models::CommitmentMarkers::default(),
+            false, // priced_from_catalog：无目录报价背书
+            true,  // principal_product_exempted：领导已针对该客户授权
+        );
+        assert_eq!(
+            outcome.status,
+            GatewayStatusFinal::Approved,
+            "领导授权豁免应放行，不被 blocked_unverified_product_claim 错杀"
         );
         assert!(outcome.review.approved);
     }
@@ -2117,6 +2211,7 @@ mod dual_gate_classification_tests {
             "用户最新消息",
             &crate::models::CommitmentMarkers::default(),
             false,
+            false,
         );
         assert_eq!(outcome.status, GatewayStatusFinal::Approved);
         assert!(outcome.review.approved);
@@ -2139,6 +2234,7 @@ mod dual_gate_classification_tests {
             Vec::new(),
             "今天天气不错",
             &crate::models::CommitmentMarkers::default(),
+            false,
             false,
         );
         assert_eq!(outcome.status, GatewayStatusFinal::Approved);
@@ -2167,6 +2263,7 @@ mod dual_gate_classification_tests {
             Vec::new(),
             "你们能解决我的问题吗",
             &crate::models::CommitmentMarkers::default(),
+            false,
             false,
         );
         // 零拦截：判定不变。
@@ -2200,6 +2297,7 @@ mod dual_gate_classification_tests {
             "你们能解决我的问题吗",
             &crate::models::CommitmentMarkers::default(),
             false,
+            false,
         );
         // R5.4 硬闸生效。
         assert_eq!(
@@ -2232,6 +2330,7 @@ mod dual_gate_classification_tests {
             "你们能解决我的问题吗",
             &crate::models::CommitmentMarkers::default(),
             false,
+            false,
         );
         assert_eq!(outcome.status, GatewayStatusFinal::Approved);
         assert!(!outcome
@@ -2260,6 +2359,7 @@ mod dual_gate_classification_tests {
             Vec::new(),
             "你们能保证回款吗",
             &crate::models::CommitmentMarkers::default(),
+            false,
             false,
         );
         // 新行为：仅观测，回复放行
@@ -2294,6 +2394,7 @@ mod dual_gate_classification_tests {
             Vec::new(),
             "你会上心吗",
             &crate::models::CommitmentMarkers::default(),
+            false,
             false,
         );
         assert_eq!(outcome.status, GatewayStatusFinal::Approved);
@@ -2330,6 +2431,7 @@ mod dual_gate_classification_tests {
             "成功率怎么样",
             &crate::models::CommitmentMarkers::default(),
             false,
+            false,
         );
         assert_eq!(outcome.status, GatewayStatusFinal::Approved);
         assert!(decision.should_reply);
@@ -2363,6 +2465,7 @@ mod dual_gate_classification_tests {
             promote_risks,
             "用户最新消息",
             &crate::models::CommitmentMarkers::default(),
+            false,
             false,
         );
         let FinalizeOutcome {
@@ -2411,6 +2514,7 @@ mod dual_gate_classification_tests {
             "用户最新消息",
             &crate::models::CommitmentMarkers::default(),
             false,
+            false,
         );
         let FinalizeOutcome {
             review: finalized,
@@ -2444,6 +2548,7 @@ mod dual_gate_classification_tests {
             "用户最新消息",
             &crate::models::CommitmentMarkers::default(),
             false,
+            false,
         );
         assert_eq!(
             outcome.status,
@@ -2473,6 +2578,7 @@ mod dual_gate_classification_tests {
             promote_risks,
             "用户最新消息",
             &crate::models::CommitmentMarkers::default(),
+            false,
             false,
         );
         assert_eq!(
@@ -2520,6 +2626,7 @@ mod dual_gate_classification_tests {
             "我们的产品一定能帮您解决",
             &crate::models::CommitmentMarkers::default(),
             false,
+            false,
         );
         assert_eq!(
             outcome.status,
@@ -2547,6 +2654,7 @@ mod dual_gate_classification_tests {
             Vec::new(),
             "用户最新消息",
             &crate::models::CommitmentMarkers::default(),
+            false,
             false,
         );
         // finalize 单看：软闸失败仍落 Approved（指望 revision 循环）。

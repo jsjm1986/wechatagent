@@ -58,6 +58,10 @@ pub async fn list_principal_escalations(
     Ok(Json(json!({ "items": json_items })))
 }
 
+fn default_resolve_exemption_type() -> String {
+    crate::models::EXEMPTION_TYPE_NONE.to_string()
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResolveBody {
@@ -68,6 +72,9 @@ pub struct ResolveBody {
     pub constraints: Vec<String>,
     #[serde(default)]
     pub authorization_window_hours: Option<f64>,
+    /// 领导授权豁免类型（none/customer_only/knowledge）；admin 后台裁决由请求体决定，缺省 none。
+    #[serde(default = "default_resolve_exemption_type")]
+    pub exemption_type: String,
 }
 
 /// POST /api/admin/principal-escalations/:short_code/resolve
@@ -89,6 +96,7 @@ pub async fn resolve_principal_escalation(
         substance: body.substance,
         constraints: body.constraints,
         authorization_window_hours: body.authorization_window_hours,
+        exemption_type: body.exemption_type,
     });
     // deferred：领导/admin 暂缓 → 保持 pending 继续等待（与 wechat 路径 mod.rs 一致），不 resolve、不 relay。
     if decision.verdict == crate::models::PRINCIPAL_VERDICT_DEFERRED {

@@ -2221,13 +2221,20 @@ memoryKind 闭集：
   "verdict": "approved|rejected|conditional|deferred|delegated_back",
   "substance": "决策实质，一句话（你之后会用自己的口吻转述给客户，所以写清楚能给客户什么）",
   "constraints": ["附带条件，如 本周内付款；没有则空数组"],
-  "authorization_window_hours": null
+  "authorization_window_hours": null,
+  "exemption_type": "none"
 }
 
 authorization_window_hours（授权有效时长，小时）——领导说了算：
 - 领导明确给了时限才填数字：如"这个价就今天有效"→约 24；"这周内都行"→按本周剩余天数估算小时数；"24 小时内"→24。
 - 领导没提任何时限 → 填 null（表示这条授权不设过期窗、长期有效）。
-- 不要自己默认一个时长——没说就是 null。"#,
+- 不要自己默认一个时长——没说就是 null。
+
+exemption_type（领导本次授权的适用范围）取其一：
+- "none"：不授权豁免（默认，仅本次转述，不放宽任何后续限制）。
+- "customer_only"：仅对当前这位客户授权，可对该客户长期使用（领导表达"就这个客户能说""对他可以"等）。
+- "knowledge"：授权沉淀为通用口径，今后对所有客户都可复用（领导表达"以后都这么说""这是标准说法"等）。
+- 判断不出时输出 "none"。"#,
         },
     ]
 }
