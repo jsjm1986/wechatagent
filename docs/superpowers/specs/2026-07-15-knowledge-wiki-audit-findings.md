@@ -189,4 +189,79 @@
 
 ## 簇 3 findings（反馈闭环）
 
-（主控亲验后填入）
+> 审查对象：`feedback_worker.rs`(189) + `lessons_learned.rs`(173) + `reviewer_stats.rs`(186)。主控逐条亲验：`lessons_learned` filter 字段回溯真实写点、`derive_lifecycle_from_status` 派生规则、三表幂等姿势、观测-only 红线。**校准结论：2 Medium + 6 Low**（subagent 自评 1H/2M/4L+1标注，[3-01] High→Medium：observation-only 学习闭环恒空、[3-06] 已证不反哺决策、无客户面/正确性/资源损害，较 Batch3 High[1-01] 轻一档；[3-03] Medium→Low：单租户默认 workspace 恒在列表不可达，仅多租户+活跃无chunk边缘触发的面板缺行=就绪债）。
+
+### [3-01] `lessons_learned` success/failure 两支 filter 引用幽灵字段路径 `review.reaction_analysis.user_polarity`——三重落空致恒命中 0 条
+- 入口 worker: feedback_worker → `aggregate_lessons_for_workspace`
+- 所属簇: 3
+- 类型: 死过滤（filter 字段全链路从未被写入）
+- 严重度: **Medium**（主控裁定：CONFIRMED 且单进程确定性可达——`lessons_learned` success/failure 两类模式 100% 不产出，admin 面板 + peer_case 候选池永久空白。但降 subagent 自评 High 一档：这是 **observation-only 学习闭环**（lessons→admin review→才晋升 peer_case chunk），[3-06] 已亲验其**不反哺 agent 决策链**，恒空无客户可见后果、无数据污染、无资源浪费。对比 Batch3 High[1-01]（丢任务+3×LLM 重复消耗+画像旧值覆写=确定性正确性/资源损害）明显轻一档，故 Medium。）
+- 现象/风险: success（正反应）+ failure（reviewer 误判负反应）两支各在 `agent_run_logs` 上按 `review.reaction_analysis.user_polarity ∈ {positive,constructive}` / `=negative` 过滤，该字段路径三重不成立 → count 恒 0。
+- 失效链（三重落空，逐环主控亲验）:
+  1. **集合选错**：filter 查 `agent_run_logs`（lessons_learned.rs:99 `.collection::<Document>("agent_run_logs")`），而 `reaction_analysis` 只写进**另一集合** `decision_reviews`（reaction.rs:190-194 `.decision_reviews().update_one`，主控亲验 `$set` 含 `"reaction_analysis": reaction_analysis`）。
+  2. **子结构缺失**：`agent_run_logs.review` = `DecisionReviewResult` 序列化（models.rs:1186 起，主控亲验全字段），**无 `reaction_analysis` 子文档**。
+  3. **字段名从不存在**：`user_polarity`/`userPolarity` 全仓**零写点**（主控 grep 写侧空结果）——reaction 子文档真实极性键是 `outcome_status`（reaction.rs:180 `"outcome_status": outcome`）。
+- 根因（亲验 file:line）: lessons_learned.rs:44 + :61（幽灵字段 filter）；reaction.rs:190-194（reaction_analysis 写 decision_reviews 非 run_logs）；models.rs:1186（DecisionReviewResult 无该子文档）。
+- 复现设想: 任意 workspace 跑满 14d 真实对话（含 approved+正反应），feedback_worker 一轮后 `db.lessons_learned.find({pattern_kind:{$in:["success","reviewer_misjudge_negative"]}})` 恒空；日志 `lessons_learned aggregate done` 因 count 全 0 永不打印（lessons_learned.rs:101 门槛 `>0`）。
+- 验证状态: CONFIRMED
+- 修复建议: filter 改到正确集合+真实字段：聚合源改 `decision_reviews`，极性用真实存在的 `reaction_analysis.outcomeStatus`（或 `reviewer_misjudge_signal`/`outcome_status`）；移除全链路不存在的 `user_polarity` 键。单测须覆盖"filter 对真实文档形状能命中"，非仅测 id 拼接。
+- 状态: Open
+
+### [3-02] `lessons_learned` blocked 模式 filter 自相矛盾：`lifecycle="completed"` 与 `final_review_status="blocked_by_safety_guard"` 由同一派生函数保证互斥——恒命中 0 条
+- 入口 worker: feedback_worker → `aggregate_lessons_for_workspace`
+- 所属簇: 3
+- 类型: 死过滤（字面量与状态机派生规则冲突）
+- 严重度: **Medium**（主控裁定：CONFIRMED、单进程确定性可达；与 [3-01] 同族，两条联合使 `lessons_learned` 整模块 inert。单独看是三类模式的第 3 类失效、observation-only、无客户面后果，故 Medium 不夸 High。）
+- 现象/风险: blocked 模式要求 run 同时 `lifecycle="completed"` 且 `final_review_status="blocked_by_safety_guard"`，但任何 `blocked_by_safety_guard` 派生的 lifecycle 恒为 `failed_after_decision`，交集为空。
+- 失效链: blocked filter（lessons_learned.rs:73-74）`lifecycle="completed"` + `final_review_status="blocked_by_safety_guard"`；`derive_lifecycle_from_status`（run_envelope.rs:257 `completed` 分支只含 `sent|no_reply|approved|allowed|outbox_enqueued`，:267 `_ => LIFECYCLE_FAILED_AFTER_DECISION`）——主控亲验文档亦明写（run_envelope.rs:246-248 `blocked_by_safety_guard → failed_after_decision`）。两条件恒无交集。
+- 根因（亲验 file:line）: lessons_learned.rs:73-74；run_envelope.rs:257/267（派生规则保证互斥）。
+- 复现设想: 造被安全门拦截的 run，feedback_worker 一轮后 `db.lessons_learned.find({pattern_kind:"blocked_by_safety_guard"})` 空。
+- 验证状态: CONFIRMED
+- 修复建议: blocked 模式去掉 `lifecycle="completed"` 约束（或改 `failed_after_decision`），仅以 `final_review_status="blocked_by_safety_guard"` + 窗口定位；与 [3-01] 一并修使三类模式全可命中。
+- 状态: Open
+
+### [3-03] `list_workspaces` 以「有 chunk 的 workspace」驱动——有对话流量但无知识 chunk 的 workspace 的 reviewer_stats/lessons/deal_attribution 永不聚合
+- 入口 worker: feedback_worker → `run_one_round` / `list_workspaces`
+- 所属簇: 3
+- 类型: 就绪债（工作集来源与聚合对象错配）
+- 严重度: **Low**（主控裁定：降 subagent 自评 Medium——单租户默认部署 `default_workspace_id` 恒在列表中（有 chunk 或 :183-185 空则 fallback），缺口**单租户不可达**；仅多租户 + "活跃有 decision_reviews 但零 chunk 的 workspace" 边缘触发，且后果是 observation-only admin 面板对该 ws 静默缺行，无数据污染/客户面损害。属多租户就绪债。）
+- 现象/风险: `run_one_round` 遍历的 workspace 来自 `operation_knowledge_chunks.distinct("workspace_id")`，而 reviewer_stats（源 `decision_reviews`）/lessons（源 `agent_run_logs`）的聚合对象与 chunk 存在与否无因果——有流量无 chunk 的 ws 不进列表 → 统计永不刷新。
+- 失效链: feedback_worker.rs:41 `list_workspaces`；:176-178 `.operation_knowledge_chunks().distinct(...)`；:183-185 仅整体为空才 fallback default，非空不并入无 chunk 的活跃 ws；reviewer_stats.rs:62 聚合源 `decision_reviews()` 与 chunk 无关。
+- 根因（亲验 file:line）: feedback_worker.rs:176-178 + :183-188。
+- 复现设想: 多租户下新 workspace A 无 chunk 但有 decision_reviews，同时 ws B 有 chunk → 列表=[B]，`db.reviewer_stats.find({workspace_id:"A"})` 恒空。
+- 验证状态: CONFIRMED（缺口存在，单租户默认不可达）
+- 修复建议: 工作集由「全部业务活跃面」并集驱动（并入 decision_reviews/run_logs 的 distinct workspace_id 或权威 workspace 目录）。注意 [3-06/关联 3-08] >100 分页边界。多租户就绪债。
+- 状态: Open
+
+### [3-04] `reviewer_stats` 误判分子未在查询层显式 scope `approved:true`+窗口——依赖 reaction.rs 单一写点隐式不变量
+- 入口 worker: feedback_worker → `aggregate_reviewer_stats_for_workspace`
+- 所属簇: 3
+- 类型: 就绪债（隐式不变量非显式约束）
+- 严重度: **Low**（当前不变量成立、numerator ⊆ denominator、misjudge_rate ≤ 1；仅"查询未自我防御、依赖上游写点唯一性"的健壮性债，无当前正确性后果。）
+- 现象/风险: `approved_but_user_negative` 计数（reviewer_stats.rs:88-97）只按 `reviewer_misjudge_signal="approved_but_user_negative"`+窗口，不显式要求 `approved:true`/`outcome_status` 非空，靠"该信号仅在 approved==true 时写"的隐式不变量保证分子 ⊆ 分母。
+- 失效链/不变量（当前成立）: 信号唯一写点 reaction.rs:173-177（`compute_reviewer_misjudge_signal_with_polarity` 以 `approved &&` 守卫）+ :185-186 仅 Some 才 insert；与 `outcome_status` 同一 `$set`；gateway.rs 初始写 None 不产假分子。
+- 根因（亲验 file:line）: reviewer_stats.rs:88-97；reaction.rs:173-177。
+- 验证状态: CONFIRMED（缺口为隐式耦合，不变量当前 HOLDS）
+- 修复建议: 分子 filter 增补 `"approved": true` + `"outcome_status": {$exists:true,$ne:null}` + 窗口，使查询自洽。低优先。
+- 状态: Open
+
+### [3-05] 三张滚动统计（reviewer_stats/deal_attribution_stats/lessons_learned）幂等姿势正确——设计正确标注
+- 所属簇: 3 ｜ 类型: 设计正确(标注) ｜ 严重度: **Low**（标注，无缺陷）
+- 结论: 三者均 `$set` 覆盖瞬时值（非 `$inc` 累加）+ stat_id/lesson_id 定位 + upsert，重复跑同窗口结果一致无累加漂移，为 0 也写稳定锚点。reviewer_stats.rs:107-132（唯一索引 indexes.rs:1659-1673）；deal_attribution feedback_worker.rs:148-165（indexes.rs:1680-1692）；lessons_learned.rs:125-149（因 [3-01/02] count 恒 0 实际不落文档，幂等姿势本身正确）。
+- 验证状态: CONFIRMED ｜ 状态: Open（仅标注）
+
+### [3-06] reviewer/lessons/deal_attribution 均纯观测 upsert 不反哺 agent 决策链——red line HOLDS（设计正确标注）
+- 所属簇: 3 ｜ 类型: 设计正确(标注) ｜ 严重度: **Low**（标注）
+- 结论: 三张统计表消费端全在 `src/routes/`（admin 面板/observability），`src/agent/**` 无一读取（主控亲验 grep）——符合"统计只观测不进决策"红线（同 tag_trust "只写不进决策"）。reviewer_stats 仅 observability.rs:258；lessons_learned 仅 routes/lessons_learned.rs+ask_human_inbox.rs+observability.rs 读，晋升 chunk 需 admin review；deal_attribution 仅 observability.rs:280。
+- 验证状态: CONFIRMED ｜ 状态: Open（仅标注）
+
+### [3-07] feedback_worker best-effort 逐步吞错无跨步累积漂移——设计正确标注（含 deal_attribution 依赖 refresh 报告边缘）
+- 所属簇: 3 ｜ 类型: 设计正确(标注)+吞错累积(边缘) ｜ 严重度: **Low**
+- 结论: 5 步（refresh/lint/sweep/lessons/reviewer）各自独立从 DB 读当前态，无 in-memory 中间态跨步传递（feedback_worker.rs:43/69/83/99/118 各 `match...Err=>warn` 继续）；唯一跨步耦合 deal_attribution 依赖 refresh 报告（:61），refresh 失败该轮不写（停上轮值，稳定锚点），无系统性偏差。某步反复失败仅表现该指标停更，不污染其它 ws/指标。
+- 验证状态: CONFIRMED ｜ 状态: Open（标注；仅在 [3-01/02/03] 修复后配套"指标长期停 0/缺行"告警属加法）
+
+### [3-08] `list_workspaces` 全量 distinct 拉内存，>100 workspace 无界——就绪债标注
+- 所属簇: 3 ｜ 类型: 就绪债 ｜ 严重度: **Low**（注释已声明 <100 假设；单/少 workspace 生产无害；大规模多租户才成问题）
+- 现象: feedback_worker.rs:172-182 一次性 `distinct`+`collect` 到 `Vec<String>`，无分页/上限。
+- 根因（亲验 file:line）: feedback_worker.rs:173-182。
+- 验证状态: CONFIRMED ｜ 修复建议: 规模上量改游标分批或权威 workspace 目录，与 [3-03] 工作集来源一并考虑。 ｜ 状态: Open
