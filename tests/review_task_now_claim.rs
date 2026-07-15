@@ -14,11 +14,11 @@
 mod common;
 
 use axum::extract::{Extension, Path, State};
-use mongodb::bson::{doc, oid::ObjectId, DateTime};
+use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
 
 use wechatagent::auth::AuthenticatedAdmin;
 use wechatagent::error::AppError;
-use wechatagent::models::AgentTask;
+use wechatagent::models::{AgentStatus, AgentTask, Contact};
 use wechatagent::routes::tasks::review_task_now;
 
 use crate::common::TestApp;
@@ -55,6 +55,60 @@ fn task_with_status(ws: &str, acc: &str, wxid: &str, status: &str) -> AgentTask 
         error: None,
         claimed_at: None,
         claim_recovery_count: 0,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+/// 构造一条最小 Contact（memory_consolidation 无候选早退只需 contact 存在，
+/// 不读 agent_status）。
+fn make_contact(ws: &str, acc: &str, wxid: &str) -> Contact {
+    let now = DateTime::now();
+    Contact {
+        id: None,
+        workspace_id: ws.to_string(),
+        account_id: acc.to_string(),
+        wxid: wxid.to_string(),
+        nickname: None,
+        remark: None,
+        alias: None,
+        avatar_url: None,
+        sex: None,
+        agent_status: AgentStatus::Managed,
+        human_profile_note: None,
+        custom_agent_instructions: None,
+        operation_mode_override: None,
+        agent_profile: None,
+        memory_summary: None,
+        playbook_id: None,
+        playbook_version: None,
+        manual_tags: Vec::new(),
+        manual_tags_updated_at: None,
+        manual_tags_by: None,
+        confirmed_tags: Vec::new(),
+        bayesian_signals: Vec::new(),
+        personality_profile: None,
+        tags_version: 0,
+        domain_attributes: None,
+        domain_attributes_updated_at: None,
+        commitments: Vec::new(),
+        follow_up_policy: None,
+        operation_state: None,
+        operation_state_reason: None,
+        operation_state_confidence: None,
+        operation_state_updated_at: None,
+        cooldown_until: None,
+        operation_policy: Document::new(),
+        profile_attributes: Document::new(),
+        profile_updated_at: None,
+        last_message_at: None,
+        last_inbound_at: None,
+        last_outbound_at: None,
+        last_agent_run_at: None,
+        last_outbound_style: None,
+        intent_trajectory: Vec::new(),
+        outcome_events: Vec::new(),
+        locale: None,
         created_at: now,
         updated_at: now,
     }
@@ -143,6 +197,16 @@ async fn review_task_now_claims_pending_and_writes_claimed_at() {
     let ws = app.state.config.default_workspace_id.clone();
     let acc = app.state.config.default_account_id.clone();
 
+    // handler（memory_consolidation）先按 wxid 查 contact，查不到直接返 NotFound；
+    // 故须插一条真实 contact，且**不**插 memory_candidate → 走 consolidate_contact_memory
+    // 无候选早退（memory.rs:1231 写 status=sent/gateway_status=no_candidates），不触达 LLM。
+    app.state
+        .db
+        .contacts()
+        .insert_one(&make_contact(&ws, &acc, "wx_pending"), None)
+        .await
+        .expect("insert contact");
+
     let task = task_with_status(&ws, &acc, "wx_pending", "pending");
     let task_id = task.id.unwrap();
     app.state
@@ -152,7 +216,7 @@ async fn review_task_now_claims_pending_and_writes_claimed_at() {
         .await
         .expect("insert pending task");
 
-    review_task_now(
+    let _resp = review_task_now(
         State(app.state.clone()),
         Path(task_id.to_hex()),
         Extension(test_admin(&ws)),
