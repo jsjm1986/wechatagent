@@ -739,6 +739,7 @@ pub async fn handle_initial_profile_task(
     let generated = agent::build_initial_operation_profile(
         state,
         &task.workspace_id,
+        &task.account_id,
         &task.content,
         Some(&playbook),
     )
@@ -1010,6 +1011,7 @@ pub(super) async fn enable_agent(
     let generated = agent::build_initial_operation_profile(
         &state,
         &admin.current_workspace,
+        &contact.account_id,
         &payload.human_profile_note,
         Some(&playbook),
     )
@@ -1173,6 +1175,7 @@ pub(super) async fn update_profile_note(
     let generated = agent::build_initial_operation_profile(
         &state,
         &admin.current_workspace,
+        &contact.account_id,
         &payload.human_profile_note,
         playbook.as_ref(),
     )
@@ -1631,7 +1634,7 @@ pub(super) async fn analyze_contact_profile(
         )
     });
     let generated =
-        agent::build_initial_operation_profile(&state, &admin.current_workspace, &note, playbook.as_ref())
+        agent::build_initial_operation_profile(&state, &admin.current_workspace, &contact.account_id, &note, playbook.as_ref())
             .await?;
     let commitments_bson = commitments_with_optional_text(
         &contact.commitments,
