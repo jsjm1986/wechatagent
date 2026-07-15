@@ -48,6 +48,7 @@ impl PromptOverride {
 pub async fn build_initial_operation_profile(
     state: &AppState,
     workspace_id: &str,
+    account_id: &str,
     note: &str,
     playbook: Option<&OperationPlaybook>,
 ) -> AppResult<GeneratedOperationProfile> {
@@ -87,6 +88,23 @@ pub async fn build_initial_operation_profile(
         "user.initial_profile.task",
     )
     .await?;
+    // C-02：比照 live reply 路径，让初始画像建档时也告知 LLM 本行业记忆槽位 + 参与决策的
+    // typed 维度，否则非销售域（情感陪伴/同行/朋友）首屏画像被 user.initial_profile.task 的
+    // 销售 schema 单方框住、本行业维度既不告知也不采集（须等首条 inbound 后 live reply 自愈）。
+    // DEFAULT 销售域两函数均返空串 → prompt 字节等价（反过拟合护栏）。
+    let taxonomy_cache = crate::agent::taxonomy::global_taxonomy_cache();
+    taxonomy_cache.find_or_load(&state.db).await;
+    let task_template = format!(
+        "{task_template}{}{}",
+        super::domain_profile::render_memory_candidate_types_guidance(
+            &active_profile.memory_dimensions,
+        ),
+        super::domain_profile::render_decision_dimensions_guidance(
+            &active_profile.profile_dimensions,
+            account_id,
+            taxonomy_cache.as_ref(),
+        )
+    );
     let user = format!(
         r#"{}
 

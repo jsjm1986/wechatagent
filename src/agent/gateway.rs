@@ -4125,12 +4125,25 @@ async fn apply_agent_updates(
             };
         // 状态机校验后重算 stage_changed：customer_stage 可能因非法跳转被过滤副本移除，须读
         // 过滤后的 signals 再算（移除后 new_stage=None → stage_changed=false，不刷 stage 时间戳）。
-        let new_stage = signals_for_attrs.get_str("customer_stage").ok();
-        let stage_changed = new_stage.is_some() && prev_stage != new_stage;
+        // C-01：按 active profile 的 stagnation_dimension 计算「该维度是否变化」，而非写死
+        // customer_stage。读侧 planner 按 {dim}_updated_at 计时（该维度多久没变），写侧须在
+        // 该维度自身变化时刷其时间戳。DEFAULT dim=customer_stage → 与原 stage_changed 等价。
+        let stagnation_dim = active_profile
+            .stagnation_dimension
+            .as_deref()
+            .unwrap_or("customer_stage");
+        let prev_dim = contact
+            .domain_attributes
+            .as_ref()
+            .and_then(|d| d.get_str(stagnation_dim).ok());
+        let new_dim = signals_for_attrs.get_str(stagnation_dim).ok();
+        let stagnation_changed =
+            crate::agent::domain_signals::dimension_value_changed(prev_dim, new_dim);
         let wrote = crate::agent::domain_signals::insert_domain_signal_values(
             &mut set_doc,
             &signals_for_attrs,
-            stage_changed,
+            stagnation_changed,
+            Some(stagnation_dim),
         );
         if wrote {
             set_doc.insert("domain_attributes_updated_at", DateTime::now());

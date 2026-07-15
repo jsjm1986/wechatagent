@@ -128,7 +128,8 @@ pub(crate) fn set_dimension(decision: &mut AgentDecision, kind: &str, value: Str
 pub(crate) fn insert_domain_signal_values(
     set_doc: &mut Document,
     signals: &Document,
-    stage_changed: bool,
+    stagnation_changed: bool,
+    stagnation_dimension: Option<&str>,
 ) -> bool {
     let mut wrote_any = false;
     for (key, value) in signals {
@@ -141,14 +142,23 @@ pub(crate) fn insert_domain_signal_values(
             wrote_any = true;
         }
     }
-    // 纵深守卫：仅当 signals 里**确实有** customer_stage 键时，stage_changed 才生效刷
-    // 时间戳。否则若调用方传 (stage_changed=true, signals 无 customer_stage)，会写"stage
-    // 刚变更"时间戳但 stage 根本没写——错误重置下游 stagnation 计时。根因在内核，故守卫
-    // 加在此处而非各调用方。
-    if stage_changed && signals.get_str("customer_stage").is_ok() {
-        set_doc.insert("domain_attributes.customer_stage_updated_at", DateTime::now());
+    // C-01：停滞计时维度可配。读侧 planner 按 `{dim}_updated_at` 计时（该维度多久没变），
+    // 写侧此前写死 customer_stage。改为按传入的 stagnation_dimension（DEFAULT=customer_stage）。
+    // 纵深守卫：仅当 signals 里**确实有**该维度键（本轮确有值）且 stagnation_changed（=该
+    // 维度本轮变化）才刷时间戳。否则若传 (changed=true, signals 无该维度)，会写"刚变更"
+    // 时间戳但维度没写——错误重置下游 stagnation 计时。根因在内核，故守卫加在此处而非各调用方。
+    // DEFAULT dim=customer_stage → 与改造前字节等价。
+    let dim = stagnation_dimension.unwrap_or("customer_stage");
+    if stagnation_changed && signals.get_str(dim).is_ok() {
+        set_doc.insert(format!("domain_attributes.{dim}_updated_at"), DateTime::now());
     }
     wrote_any
+}
+
+/// C-01：某维度值本轮是否变化（供 gateway 决定是否刷 stagnation 计时戳）。新值缺失
+/// （本轮未产出该维度）不算变化——不刷时间戳，保持旧计时。纯函数便于单测。
+pub(crate) fn dimension_value_changed(prev: Option<&str>, new: Option<&str>) -> bool {
+    new.is_some() && prev != new
 }
 
 /// universal-domain-adaptation G1 写侧白名单：剔除 `signals` 容器里**未在 active
@@ -200,7 +210,7 @@ mod tests {
     fn kernel_writes_sales_dims_like_legacy() {
         let mut set_doc = Document::new();
         let signals = doc! { "customer_stage": "solution_fit", "intent_level": "high" };
-        let wrote = insert_domain_signal_values(&mut set_doc, &signals, true);
+        let wrote = insert_domain_signal_values(&mut set_doc, &signals, true, None);
 
         assert!(wrote, "写入了维度值应返回 true");
         assert_eq!(
@@ -219,7 +229,7 @@ mod tests {
     fn kernel_skips_stage_ts_when_unchanged() {
         let mut set_doc = Document::new();
         let signals = doc! { "customer_stage": "need_discovery" };
-        let wrote = insert_domain_signal_values(&mut set_doc, &signals, false);
+        let wrote = insert_domain_signal_values(&mut set_doc, &signals, false, None);
 
         assert!(wrote);
         assert_eq!(
@@ -236,7 +246,7 @@ mod tests {
         // customer_stage_updated_at——否则会在 stage 实际未写入时错误重置 stagnation 计时。
         let mut set_doc = Document::new();
         let signals = doc! { "intent_level": "high" };
-        let wrote = insert_domain_signal_values(&mut set_doc, &signals, true);
+        let wrote = insert_domain_signal_values(&mut set_doc, &signals, true, None);
 
         assert!(wrote, "intent_level 写入了，应返回 true");
         assert_eq!(set_doc.get_str("domain_attributes.intent_level").ok(), Some("high"));
@@ -251,7 +261,7 @@ mod tests {
         // 对照：signals 含 customer_stage + stage_changed=true → 刷时间戳。
         let mut set_doc = Document::new();
         let signals = doc! { "customer_stage": "solution_fit" };
-        insert_domain_signal_values(&mut set_doc, &signals, true);
+        insert_domain_signal_values(&mut set_doc, &signals, true, None);
         assert!(set_doc.contains_key("domain_attributes.customer_stage_updated_at"));
     }
 
@@ -259,7 +269,7 @@ mod tests {
     fn kernel_skips_stage_ts_when_empty_signals_even_if_changed() {
         // 空容器 + stage_changed=true：守卫确保不刷时间戳（也不写任何维度）。
         let mut set_doc = Document::new();
-        let wrote = insert_domain_signal_values(&mut set_doc, &Document::new(), true);
+        let wrote = insert_domain_signal_values(&mut set_doc, &Document::new(), true, None);
         assert!(!wrote);
         assert!(
             !set_doc.contains_key("domain_attributes.customer_stage_updated_at"),
@@ -270,7 +280,7 @@ mod tests {
     #[test]
     fn kernel_empty_signals_writes_nothing_and_returns_false() {
         let mut set_doc = Document::new();
-        let wrote = insert_domain_signal_values(&mut set_doc, &Document::new(), false);
+        let wrote = insert_domain_signal_values(&mut set_doc, &Document::new(), false, None);
 
         assert!(!wrote, "空容器不应写任何维度");
         assert!(set_doc.is_empty(), "set_doc 应保持为空：{set_doc:?}");
@@ -280,7 +290,7 @@ mod tests {
     fn kernel_trims_and_skips_blank_values() {
         let mut set_doc = Document::new();
         let signals = doc! { "customer_stage": "  solution_fit  ", "intent_level": "   " };
-        let wrote = insert_domain_signal_values(&mut set_doc, &signals, false);
+        let wrote = insert_domain_signal_values(&mut set_doc, &signals, false, None);
 
         assert!(wrote);
         // 前后空白被 trim
@@ -297,7 +307,7 @@ mod tests {
         // 通用化目标：陪伴域维度（非 customer_stage/intent_level）也能透传落库。
         let mut set_doc = Document::new();
         let signals = doc! { "relationship_closeness": "intimate" };
-        let wrote = insert_domain_signal_values(&mut set_doc, &signals, false);
+        let wrote = insert_domain_signal_values(&mut set_doc, &signals, false, None);
 
         assert!(wrote);
         assert_eq!(
@@ -310,7 +320,7 @@ mod tests {
     fn kernel_ignores_non_string_values() {
         let mut set_doc = Document::new();
         let signals = doc! { "customer_stage": "first_contact", "some_count": 7_i32 };
-        let wrote = insert_domain_signal_values(&mut set_doc, &signals, false);
+        let wrote = insert_domain_signal_values(&mut set_doc, &signals, false, None);
 
         assert!(wrote);
         assert_eq!(
@@ -319,6 +329,47 @@ mod tests {
         );
         // 非字符串维度被跳过（容器只承载字符串型画像维度取值）
         assert!(!set_doc.contains_key("domain_attributes.some_count"));
+    }
+
+    // ── C-01：stagnation 计时维度可配 ──
+
+    #[test]
+    fn insert_writes_custom_stagnation_dim_timestamp() {
+        let mut set_doc = Document::new();
+        let signals = doc! { "relationship_closeness": "亲密" };
+        // stagnation_dimension=relationship_closeness + 该维度本轮有值 + changed → 写它的 _updated_at
+        insert_domain_signal_values(&mut set_doc, &signals, true, Some("relationship_closeness"));
+        assert!(set_doc.contains_key("domain_attributes.relationship_closeness_updated_at"));
+        assert!(!set_doc.contains_key("domain_attributes.customer_stage_updated_at"));
+    }
+
+    #[test]
+    fn insert_default_dim_is_customer_stage_byte_equivalent() {
+        // DEFAULT 等价守护：None 与 Some("customer_stage") 都写 customer_stage_updated_at。
+        for dim in [None, Some("customer_stage")] {
+            let mut set_doc = Document::new();
+            let signals = doc! { "customer_stage": "solution_fit" };
+            insert_domain_signal_values(&mut set_doc, &signals, true, dim);
+            assert!(set_doc.contains_key("domain_attributes.customer_stage_updated_at"));
+        }
+    }
+
+    #[test]
+    fn insert_no_timestamp_when_stagnation_dim_absent_from_signals() {
+        // 纵深守卫：stagnation 维度本轮不在 signals 里 → 不刷时间戳（避免错误重置计时）。
+        let mut set_doc = Document::new();
+        let signals = doc! { "customer_stage": "solution_fit" }; // 无 relationship_closeness
+        insert_domain_signal_values(&mut set_doc, &signals, true, Some("relationship_closeness"));
+        assert!(!set_doc.contains_key("domain_attributes.relationship_closeness_updated_at"));
+    }
+
+    #[test]
+    fn dimension_value_changed_semantics() {
+        assert!(dimension_value_changed(Some("a"), Some("b")));
+        assert!(dimension_value_changed(None, Some("b")));
+        assert!(!dimension_value_changed(Some("a"), Some("a")));
+        assert!(!dimension_value_changed(Some("a"), None)); // 新值缺失不算变化（不刷）
+        assert!(!dimension_value_changed(None, None));
     }
 
     // ── 双向同步 ──
