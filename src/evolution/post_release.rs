@@ -51,9 +51,15 @@ const UPGRADED_STATUSES: &[&str] = &[
 
 /// 5gate block-rate delta 关注的 gate_key（与 release_threshold 支持的 gate_key
 /// 同集；planner_block_rate_threshold 不属于 5gate，所以不进 block-rate 桶）。
+// [2-01] 修正：fact_risk/pressure_risk 此前与 threshold/significance 两权威源对调
+// （面板命中率贴错标签，纯观测不反哺 promote/rollback）。安全闸映射以
+// significance::SAFETY_GATE_BLOCK_STATUS 为权威：fact_risk 硬闸生产落 held_by_ai_policy；
+// blocked_by_safety_guard 来自产品声明 fail-closed/relay，与 fact/pressure 无关。
+// pressure_risk 是软闸（走 revision，生产不产 block 终态），命中率改走 revision_failed
+// 口径，与 human_like/emotional 两 rewrite 闸一致。一致性由 five_gate_mapping_tests 钉死。
 const FIVE_GATE_KEYS: &[(&str, &str)] = &[
-    ("fact_risk_block", "blocked_by_safety_guard"),
-    ("pressure_risk_block", "held_by_ai_policy"),
+    ("fact_risk_block", "held_by_ai_policy"),
+    ("pressure_risk_block", "revision_failed"),
     ("human_like_score_rewrite", "revision_failed"),
     ("emotional_value_rewrite", "revision_failed"),
     ("product_accuracy_score_block", "blocked_unverified_product_claim"),
@@ -446,6 +452,42 @@ mod tests {
         assert!(keys.contains(&"emotional_value_rewrite"));
         assert!(keys.contains(&"product_accuracy_score_block"));
         assert_eq!(keys.len(), 5);
+    }
+
+    // [2-01]：真安全闸（fact_risk / product_accuracy）的映射必须与 significance 权威源
+    // 一致（防三文件再漂）。pressure_risk_block 是**有意偏离**——它在生产是软闸（走
+    // revision 不产 block 终态），命中率走 revision_failed 口径而非 significance 里
+    // 「若它是硬闸会落的」blocked_by_safety_guard；该偏离由 pressure_risk_uses_revision_failed
+    // _soft_gate_semantics 单独钉死，故此处排除，不要求它与 significance 一致。
+    #[test]
+    fn safety_gate_mapping_matches_significance_authority() {
+        for (gate_key, status) in FIVE_GATE_KEYS {
+            if *gate_key == "pressure_risk_block" {
+                continue; // 有意偏离：软闸走 revision_failed 口径，见下方专项测试。
+            }
+            if let Some(authoritative) =
+                crate::evolution::significance::safety_block_status_for(Some(gate_key))
+            {
+                assert_eq!(
+                    *status, authoritative,
+                    "post_release gate '{gate_key}' 映射 '{status}' 与 significance 权威 '{authoritative}' 不一致"
+                );
+            }
+        }
+    }
+
+    // fact_risk 硬闸生产落 held_by_ai_policy（非 blocked_by_safety_guard）。
+    #[test]
+    fn fact_risk_maps_to_held_by_ai_policy() {
+        let m: std::collections::HashMap<_, _> = FIVE_GATE_KEYS.iter().cloned().collect();
+        assert_eq!(m.get("fact_risk_block"), Some(&"held_by_ai_policy"));
+    }
+
+    // pressure_risk 是软闸（走 revision 不产 block 终态）→ 命中率走 revision_failed 口径。
+    #[test]
+    fn pressure_risk_uses_revision_failed_soft_gate_semantics() {
+        let m: std::collections::HashMap<_, _> = FIVE_GATE_KEYS.iter().cloned().collect();
+        assert_eq!(m.get("pressure_risk_block"), Some(&"revision_failed"));
     }
 
     #[test]
