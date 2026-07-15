@@ -84,14 +84,16 @@ C-01/C-02 互不牵连，同 PR 因同主题（domain profile 接线）。
 
 **缺陷**：DomainProfile.stagnation_dimension 让行业指定"哪个维度驱动 planner 停滞计时"。读侧已全动态（planner/mod.rs:1022-1023 `format!("domain_attributes.{dim}_updated_at")`），写侧写死（domain_signals.rs:148-149 只写 `customer_stage_updated_at`）。配非 customer_stage 停滞维度的行业，计时永远跟踪 customer_stage。
 
+**深度校准（实现前二次亲验修正设计初稿）**：读侧 planner（planner/mod.rs:1023）按 `{dim}_updated_at` 计时，语义是「**该维度自身**多久没变」。但写侧的触发信号 `stage_changed`（gateway.rs:4128-4129 `new_stage != prev_stage`）**只反映 customer_stage 的变化**。故仅把写死的 key 名换成 `{dim}_updated_at`（浅修）是**假修**——dim≠customer_stage 时，时间戳会在 customer_stage 变化时刷新（而非 dim 变化时），语义仍错。**最小正确修复必须检测 stagnation 维度自身的值变化**。可行性已亲验：`prev = contact.domain_attributes.get(dim)`（gateway.rs:4029-4030 同款读法）、`new = signals_for_attrs.get_str(dim)` 均现成可得。
+
 **修复（只动 AI 路径，wrapper 传 None）**：
-1. 内核 `insert_domain_signal_values`（domain_signals.rs:128）签名加 `stagnation_dimension: Option<&str>`；`stage_changed` 时写 `domain_attributes.{stagnation_dimension.unwrap_or("customer_stage")}_updated_at`。
-2. AI 决策路径 gateway.rs:4128-4133：`active_profile` 已在 :3923 载入，传 `Some(active_profile.stagnation_dimension.as_str())`。
-3. admin 直写 wrapper `insert_domain_stage_fields`（shared.rs:106）：传 `None`（保持现状，admin 路径不载 active_profile，避免波及其 8 个调用点）。
+1. 内核 `insert_domain_signal_values`（domain_signals.rs:128）签名加 `stagnation_dimension: Option<&str>`；把 :148-149 的守卫+写入改为按传入维度：`dim = stagnation_dimension.unwrap_or("customer_stage")`，`stage_changed && signals.get_str(dim).is_ok()` 时写 `domain_attributes.{dim}_updated_at`。（守卫从写死 customer_stage 改为按 dim，保持「该维度本轮确有值才刷时间戳」的纵深守卫语义。）
+2. AI 决策路径 gateway.rs:4128-4133：取 `dim = active_profile.stagnation_dimension`（active_profile 已在 :3923 载入）；`stage_changed` 改为 `stagnation_changed = new_dim != prev_dim`，其中 `prev_dim = contact.domain_attributes.get_str(dim).ok()`、`new_dim = signals_for_attrs.get_str(dim).ok()`；传 `Some(dim)` + `stagnation_changed` 给内核。DEFAULT（dim=customer_stage）时 `stagnation_changed == stage_changed`、写 `customer_stage_updated_at`，与现状字节等价。
+3. admin 直写 wrapper `insert_domain_stage_fields`（shared.rs:106）：传 `None`（保持现状按 customer_stage，admin 路径不载 active_profile，避免波及其 8 个调用点；admin 手动改维度不是 stagnation 计时的主驱动路径）。
 
-**等价性**：DEFAULT `stagnation_dimension="customer_stage"`（domain_profile.rs:791 亲验）→ `Some("customer_stage")` 与 `None` 都写 `customer_stage_updated_at`，销售域字节等价。非默认行业的 AI 路径才写对应维度时间戳。
+**等价性**：DEFAULT `stagnation_dimension="customer_stage"`（domain_profile.rs:791/845 亲验）→ 内核 `Some("customer_stage")` 与 wrapper `None` 都写 `customer_stage_updated_at`；gateway 的 `stagnation_changed` 在 dim=customer_stage 时等于原 `stage_changed`。销售域字节等价。非默认行业的 AI 路径才按该维度自身变化写对应时间戳。
 
-**测试**：`insert_domain_signal_values` 纯函数单测（lib）——传 `Some("relationship_closeness")` 写 `relationship_closeness_updated_at`、传 `None`/`Some("customer_stage")` 写 `customer_stage_updated_at`。
+**测试**：`insert_domain_signal_values` 纯函数单测（lib）——传 `(Some("relationship_closeness"), stage_changed=true, signals含relationship_closeness)` 写 `relationship_closeness_updated_at`、不含该键时不写；传 `None`/`Some("customer_stage")` + 含 customer_stage 写 `customer_stage_updated_at`（DEFAULT 等价守护）。gateway 的 stagnation_changed 计算逻辑因依赖 contact/signals 上下文，抽为纯函数 `dimension_value_changed(prev: Option<&str>, new: Option<&str>) -> bool` 单测或靠 code review。
 
 ### C-02：初始画像接 dimension/memory guidance
 
