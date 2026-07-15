@@ -103,7 +103,10 @@ pub(super) fn insert_domain_stage_fields(
     if let Some(intent) = intent_level {
         signals.insert("intent_level", intent);
     }
-    crate::agent::domain_signals::insert_domain_signal_values(set_doc, &signals, stage_changed);
+    // C-01：admin 直写路径不驱动 stagnation 计时的主逻辑（不载 active_profile），传 None
+    // 保持 customer_stage 语义（字节等价于改造前）。AI 决策路径（gateway）才按 active
+    // profile 的 stagnation_dimension 动态化。
+    crate::agent::domain_signals::insert_domain_signal_values(set_doc, &signals, stage_changed, None);
     set_doc.insert("domain_attributes_updated_at", DateTime::now());
 }
 
