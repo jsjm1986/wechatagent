@@ -1898,6 +1898,10 @@ fn chunk_haystack(c: &OperationKnowledgeChunk) -> String {
         s.push(' ');
         s.push_str(t);
     }
+    for t in &c.product_tags {
+        s.push(' ');
+        s.push_str(t);
+    }
     if let Some(x) = &c.wiki_type {
         s.push(' ');
         s.push_str(x);
@@ -2182,6 +2186,27 @@ mod tests {
         let mut c = rk_chunk("A", "x", "entity", 0.5, 0);
         c.superseded_by = Some("   ".to_string());
         assert!(rank_key("", &c, now).live);
+    }
+
+    #[test]
+    fn chunk_haystack_includes_product_tags() {
+        // product_tags 里的词（如品牌别名）即使不在 title/body，也应进 haystack 并参与打分。
+        // 场景：body 不含 "星零感"，只有 product_tags 里有——修复前召不回，修复后能命中。
+        let now = DateTime::now();
+        let mut with_tag = rk_chunk("去眼袋方案", "微孔技术介绍", "product_fact", 0.5, 0);
+        with_tag.product_tags = vec!["星零感".to_string()];
+        let without_tag = rk_chunk("去眼袋方案", "微孔技术介绍", "product_fact", 0.5, 0);
+
+        assert!(
+            chunk_haystack(&with_tag).contains("星零感"),
+            "product_tags 的词必须进 haystack"
+        );
+        let k_with = rank_key("星零感", &with_tag, now);
+        let k_without = rank_key("星零感", &without_tag, now);
+        assert!(
+            k_with.effective_relevance_micros > k_without.effective_relevance_micros,
+            "命中 product_tags 词的 chunk 相关度应高于同结构但无该 tag 的 chunk"
+        );
     }
 
     /// classify_recall_outcome 单测用：构造一条 AnswerResult，trace 里塞

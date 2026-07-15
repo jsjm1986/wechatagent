@@ -605,6 +605,7 @@ interface ImportPreviewResult {
   document?: { title?: string; summary?: string; catalogSummary?: string } | null;
   items?: unknown[];
   chunks?: ImportPreviewChunk[];
+  importReport?: { totalSegments: number; succeeded: number; failed: number };
 }
 
 interface ImportJobProgress {
@@ -989,6 +990,11 @@ export function ImportWizard() {
       ) : null}
       {step === 2 && preview ? (
         <div style={{ marginTop: 12 }}>
+          {preview.importReport && preview.importReport.failed > 0 ? (
+            <div className="wikiAlert error" style={{ marginBottom: 10 }}>
+              ⚠ 共 {preview.importReport.totalSegments} 段，其中 {preview.importReport.failed} 段抽取失败，下方仅为成功段内容，可能不完整。
+            </div>
+          ) : null}
           {preview.document ? (
             <dl className="wikiArchiveMeta">
               <dt>文档标题</dt><dd>{preview.document.title}</dd>
