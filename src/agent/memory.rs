@@ -1100,6 +1100,48 @@ pub(crate) fn parse_reconfirmed_tags(
         .unwrap_or_default()
 }
 
+/// A-02：解析 LLM 输出的 `discardedTags:[{value,reason}]`，取被显式推翻的标签 value 集合。
+/// 与 `parse_reconfirmed_tags` 平行，但不需要 window/证据锚（弃用是显式动作，不必再佐证）。
+pub(crate) fn parse_discarded_tags(value: &serde_json::Value) -> std::collections::HashSet<String> {
+    value
+        .get("discardedTags")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| {
+                    let v = item.get("value")?.as_str()?.trim().to_string();
+                    if v.is_empty() {
+                        None
+                    } else {
+                        Some(v)
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A-02：把「本轮重判保留的标签」与「旧确信标签中未被显式弃用的」合并。
+/// 对称 core_facts 的「未显式弃用即自动保留」保护（prompts.rs 内 memoryCard 整理指引）：
+/// 旧确信标签除非被 LLM 列入 discardedTags 显式推翻，否则保留——修掉「支撑证据滚出
+/// 截断窗口即静默丢持久标签」。reconfirmed 为本轮权威，同名以其为准（不重复）。
+pub(crate) fn merge_confirmed_tags(
+    old: &[ConfirmedTag],
+    reconfirmed: Vec<ConfirmedTag>,
+    discarded: &std::collections::HashSet<String>,
+) -> Vec<ConfirmedTag> {
+    let reconfirmed_values: std::collections::HashSet<String> =
+        reconfirmed.iter().map(|t| t.value.clone()).collect();
+    let mut merged = reconfirmed;
+    for tag in old {
+        // 旧标签：未被本轮重判覆盖（同名以 reconfirmed 为准）且未被显式弃用 → 保留。
+        if !reconfirmed_values.contains(&tag.value) && !discarded.contains(&tag.value) {
+            merged.push(tag.clone());
+        }
+    }
+    merged
+}
+
 /// 子计划 4 Task 3：从压缩归并 LLM 的同一份 `value`（搭车，不额外起 LLM 调用）里
 /// 解析大五 OCEAN 人格画像。OCEAN 是固定五维封闭量表（开放性/尽责性/外向性/宜人性/
 /// 神经质），不允许 LLM 自创维度。
@@ -1551,6 +1593,11 @@ async fn consolidate_contact_memory_inner(
     // 映射成 msg_id 锚——序号对齐由共享窗口保证。证据锚不上的标签 fail-closed 丢弃。
     // replace 语义：整体覆盖 confirmed_tags，不与旧值合并。
     let reconfirmed = parse_reconfirmed_tags(&value, &window);
+    // A-02：消费 discardedTags——旧确信标签除非被 LLM 显式弃用否则保留，对称 core_facts
+    // 「未显式弃用即保留」，修掉支撑证据滚出截断窗口即静默丢持久标签（memory.rs 元家族
+    // 不对称）。manual_tags（运营权威层）不在此列，绝不受影响。
+    let discarded = parse_discarded_tags(&value);
+    let reconfirmed = merge_confirmed_tags(&contact.confirmed_tags, reconfirmed, &discarded);
     // P1-5：OCC 写入。consolidator 路径与 load_or_create 的 seeding 路径
     // 共享同一份 OperatingMemory，并发 tick（如 webhook 入站 reload + 后台
     // memory_consolidation 任务并发）都会 read-modify-write memory_card_version。
@@ -1609,19 +1656,43 @@ async fn consolidate_contact_memory_inner(
     // 故不能搭 operating_memories 的 $set，否则落到无人读的孤儿键；放在 OCC winner
     // 分支内即继承「赢家才写」语义。$set 只含 confirmed_tags 一个键：绝不碰 manual_tags
     // （运营录入的权威层）、bayesian_signals / personality_profile（旁路），保持三线隔离。
-    state
-        .db
-        .contacts()
-        .update_one(
-            doc! {
-                "workspace_id": &contact.workspace_id,
-                "account_id": &contact.account_id,
-                "wxid": &contact.wxid,
-            },
-            doc! { "$set": { "confirmed_tags": to_bson(&reconfirmed)? } },
-            None,
-        )
-        .await?;
+    // A-03：confirmed_tags 是 memory_card 之后的 best-effort 搭车写。memory_card OCC
+    // 已是权威落库（上面 modified_count==1 才到这），若此处硬 `?` 失败会让整函数返 Err→
+    // 候选不被标 consolidated→task retry→候选二次并入已推进的卡（重放）。故改 fail-soft
+    // warn（对齐下方 personality 写），失败不触发整轮重放。
+    match to_bson(&reconfirmed) {
+        Ok(tags_bson) => {
+            if let Err(err) = state
+                .db
+                .contacts()
+                .update_one(
+                    doc! {
+                        "workspace_id": &contact.workspace_id,
+                        "account_id": &contact.account_id,
+                        "wxid": &contact.wxid,
+                    },
+                    doc! { "$set": { "confirmed_tags": tags_bson } },
+                    None,
+                )
+                .await
+            {
+                tracing::warn!(
+                    workspace_id = %contact.workspace_id,
+                    contact_wxid = %contact.wxid,
+                    error = %err,
+                    "confirmed_tags write-back failed (fail-soft; memory_card already persisted)"
+                );
+            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                workspace_id = %contact.workspace_id,
+                contact_wxid = %contact.wxid,
+                error = %err,
+                "confirmed_tags to_bson failed (fail-soft)"
+            );
+        }
+    }
     // 子计划 4 Task 3：大五 OCEAN 人格画像写回（搭车——从同一份归并 `value` 解析，
     // 不额外起 LLM 调用）。**永不驱动旁路**：只写 personality_profile，绝不进逐轮决策。
     // **解耦铁律**：$set 只含 personality_profile 一个键，绝不碰 manual_tags（运营权威层）/
@@ -1894,11 +1965,30 @@ pub(crate) fn decide_candidate_status(write_score: i32, max_importance: i32) -> 
     }
 }
 
+/// A-01：弱证据候选的 importance 天花板。core_facts 建立仅凭 LLM 自评（候选 evidence
+/// 是自由文本、无 evidenceTurns，无法像 tags/personality 那样 resolve_evidence 锚定对话）。
+/// 折中：evidence 文本过弱（trim 后字符数 < 阈值）时，即使 LLM 自报高 importance 也 clamp
+/// 到 < `IMPORTANCE_RESCUE_THRESHOLD`(8)，使其无法凭「max_importance>=8」走 pending 救援
+/// 通道（`decide_candidate_status`），仍可走 write_score>=6 常规通道。只降不升。纯函数便于单测。
+const WEAK_EVIDENCE_MIN_LEN: usize = 4;
+const IMPORTANCE_CAP_WHEN_WEAK: i32 = 7; // < IMPORTANCE_RESCUE_THRESHOLD(8)
+
+pub(crate) fn evidence_capped_importance(evidence: &str, importance: i32) -> i32 {
+    if evidence.trim().chars().count() < WEAK_EVIDENCE_MIN_LEN {
+        importance.min(IMPORTANCE_CAP_WHEN_WEAK)
+    } else {
+        importance
+    }
+}
+
 fn validated_memory_candidate(candidate: Document) -> Option<Document> {
     let candidate_type = doc_string(&candidate, "type")?;
     let content = doc_string(&candidate, "content")?;
     let evidence = doc_string(&candidate, "evidence")?;
     let importance = doc_i32(Some(&candidate), "importance", 0).clamp(0, 10);
+    // A-01：弱证据候选设 importance 天花板，堵住「空/极短 evidence + 高自报 importance」
+    // 凭救援阈值涌入 pending 的噪声通道。
+    let importance = evidence_capped_importance(&evidence, importance);
     let confidence = doc_i32(Some(&candidate), "confidence", 0).clamp(0, 10);
     if importance == 0 || confidence == 0 {
         return None;
@@ -3287,5 +3377,109 @@ mod parse_personality_tests {
         let snaps = super::append_snapshot_capped(Vec::new(), snap(1.0));
         assert_eq!(snaps.len(), 1);
         assert_eq!(snaps[0].scores[0], 1.0);
+    }
+}
+
+#[cfg(test)]
+mod audit_medium_a01_a02_tests {
+    use super::{evidence_capped_importance, merge_confirmed_tags, parse_discarded_tags};
+    use crate::models::ConfirmedTag;
+    use mongodb::bson::DateTime;
+    use std::collections::HashSet;
+
+    fn mk(v: &str) -> ConfirmedTag {
+        ConfirmedTag {
+            value: v.to_string(),
+            evidences: vec![],
+            confirmed_at: DateTime::now(),
+            confirmed_by: "test".to_string(),
+        }
+    }
+
+    // ---- A-02: merge_confirmed_tags ----
+
+    #[test]
+    fn merge_confirmed_tags_keeps_old_unless_discarded() {
+        let old = vec![mk("价格敏感"), mk("预算充足"), mk("已婚")];
+        // 本轮只重判出「价格敏感」，LLM 显式弃用「已婚」。
+        let reconfirmed = vec![mk("价格敏感")];
+        let discarded: HashSet<String> = ["已婚".to_string()].into_iter().collect();
+
+        let merged = merge_confirmed_tags(&old, reconfirmed, &discarded);
+        let vals: HashSet<String> = merged.iter().map(|t| t.value.clone()).collect();
+        // 价格敏感=reconfirmed 保留；预算充足=旧且未弃用→保留；已婚=显式弃用→移除。
+        assert!(vals.contains("价格敏感"));
+        assert!(vals.contains("预算充足"));
+        assert!(!vals.contains("已婚"));
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn merge_confirmed_tags_reconfirmed_wins_on_duplicate() {
+        let mut old = vec![mk("价格敏感")];
+        old[0].confirmed_by = "old".to_string();
+        let mut reconfirmed = vec![mk("价格敏感")];
+        reconfirmed[0].confirmed_by = "consolidation".to_string();
+        let merged = merge_confirmed_tags(&old, reconfirmed, &HashSet::new());
+        // 同名以 reconfirmed 为准（不重复），confirmed_by 取新值。
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].confirmed_by, "consolidation");
+    }
+
+    #[test]
+    fn merge_confirmed_tags_empty_discarded_supersets_reconfirmed() {
+        // DEFAULT 等价性守护：旧全部保留 + reconfirmed，无静默丢失。
+        let old = vec![mk("a"), mk("b")];
+        let reconfirmed = vec![mk("c")];
+        let merged = merge_confirmed_tags(&old, reconfirmed, &HashSet::new());
+        let vals: HashSet<String> = merged.iter().map(|t| t.value.clone()).collect();
+        assert_eq!(
+            vals,
+            ["a", "b", "c"].iter().map(|s| s.to_string()).collect()
+        );
+    }
+
+    #[test]
+    fn parse_discarded_tags_extracts_values() {
+        let v = serde_json::json!({ "discardedTags": [
+            {"value":"已婚","reason":"客户改口"},
+            {"value":"","reason":"空"},
+            {"value":"预算低","reason":"推翻"}
+        ] });
+        let d = parse_discarded_tags(&v);
+        assert!(d.contains("已婚"));
+        assert!(d.contains("预算低"));
+        assert!(!d.contains("")); // 空 value 不进集合
+        assert_eq!(d.len(), 2);
+    }
+
+    #[test]
+    fn parse_discarded_tags_missing_field_is_empty() {
+        let v = serde_json::json!({ "reconfirmedTags": [] });
+        assert!(parse_discarded_tags(&v).is_empty());
+    }
+
+    // ---- A-01: evidence_capped_importance ----
+
+    #[test]
+    fn evidence_capped_importance_caps_weak_evidence() {
+        // 弱证据（空/极短）+ 高自报 importance → clamp 到 < 8。
+        assert!(evidence_capped_importance("", 10) < 8);
+        assert!(evidence_capped_importance("   ", 9) < 8);
+        assert!(evidence_capped_importance("嗯", 10) < 8);
+    }
+
+    #[test]
+    fn evidence_capped_importance_keeps_substantial() {
+        // 充实证据 → importance 原样不动。
+        let ev = "客户明确说预算有500万，要买三套";
+        assert_eq!(evidence_capped_importance(ev, 10), 10);
+        assert_eq!(evidence_capped_importance(ev, 5), 5);
+    }
+
+    #[test]
+    fn evidence_capped_importance_does_not_raise() {
+        // 只降不升：弱证据低 importance 保持原值。
+        assert_eq!(evidence_capped_importance("", 3), 3);
     }
 }
