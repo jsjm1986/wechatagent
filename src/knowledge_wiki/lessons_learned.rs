@@ -1,6 +1,6 @@
 //! Phase D / D5：跨用户 lessons_learned 聚合。
 //!
-//! 设计目标：把每条 `agent_run_logs` 的胜/败模式压缩成"可被下一轮决策检索"的
+//! 设计目标：把真实用户反应与安全拦截模式压缩成"可被下一轮决策检索"的
 //! 知识颗粒。与 `feedback_worker` 已有的"按 reviewer 维度聚合统计"互补：
 //! - reviewer_stats：度量层（reviewer 通过率、误判信号）；
 //! - **lessons_learned**：模式层（"在 X 条件下用 Y 措辞 → 用户 Z 反应"）。
@@ -9,8 +9,8 @@
 //! 上游候选池。本模块只负责发现 + 存储 lessons；是否最终晋升为 chunk 由
 //! admin review 决定（不绕开 review queue）。
 //!
-//! 输入：近 N 天 agent_run_logs.final_review_status ∈ {approved-类, blocked-类}
-//! + reaction.user_polarity 信号；
+//! 输入：近 N 天 `agent_decision_reviews.outcome_status` 真实用户反应
+//! + `agent_run_logs.final_review_status` 安全拦截终态；
 //! 输出：去重后的 `lessons_learned` 文档，字段含 pattern_kind / sample /
 //! source_run_ids / count。
 
@@ -18,6 +18,39 @@ use futures::TryStreamExt;
 use mongodb::bson::{doc, DateTime, Document};
 
 use crate::routes::AppState;
+
+const REVIEW_SOURCE_COLLECTION: &str = "agent_decision_reviews";
+const RUN_SOURCE_COLLECTION: &str = "agent_run_logs";
+
+fn build_success_filter(
+    workspace_id: &str,
+    since: DateTime,
+    positive_outcomes: &[String],
+) -> Document {
+    doc! {
+        "workspace_id": workspace_id,
+        "approved": true,
+        "outcome_status": { "$in": positive_outcomes },
+        "created_at": { "$gte": since },
+    }
+}
+
+fn build_failure_filter(workspace_id: &str, since: DateTime) -> Document {
+    doc! {
+        "workspace_id": workspace_id,
+        "approved": true,
+        "reviewer_misjudge_signal": "approved_but_user_negative",
+        "created_at": { "$gte": since },
+    }
+}
+
+fn build_blocked_filter(workspace_id: &str, since: DateTime) -> Document {
+    doc! {
+        "workspace_id": workspace_id,
+        "final_review_status": "blocked_by_safety_guard",
+        "created_at": { "$gte": since },
+    }
+}
 
 /// 单 workspace 单轮聚合。N 天窗口由 caller 透传，默认 14d。
 pub async fn aggregate_lessons_for_workspace(
@@ -29,37 +62,28 @@ pub async fn aggregate_lessons_for_workspace(
     let since = DateTime::from_millis(now_ms - window_days.max(1) * 24 * 60 * 60 * 1000);
 
     let mut report = LessonsAggregateReport::default();
+    let profile =
+        crate::agent::domain_profile::load_active_domain_profile(&state.db, workspace_id).await;
+    let (positive_outcomes, _) =
+        super::gap_signals::resolve_effective_polarity(&profile.outcome_polarity);
 
-    // 1) success 模式：approved + 用户后续正反应（reaction.user_polarity ∈
-    //    {"positive","constructive"}）。
+    // 1) success 模式：reviewer approved + 用户后续真实反应命中本行业正极。
     report.success_lessons = upsert_pattern(
         state,
         workspace_id,
         "success",
-        doc! {
-            "workspace_id": workspace_id,
-            "lifecycle": "completed",
-            "final_review_status": "approved",
-            "created_at": { "$gte": since },
-            "review.reaction_analysis.user_polarity": {
-                "$in": ["positive", "constructive"],
-            },
-        },
+        REVIEW_SOURCE_COLLECTION,
+        build_success_filter(workspace_id, since, &positive_outcomes),
     )
     .await?;
 
-    // 2) failure 模式：approved 但用户负反应（reviewer 通过却挨骂）。
+    // 2) failure 模式：reviewer approved 但用户真实反应命中本行业负极。
     report.failure_lessons = upsert_pattern(
         state,
         workspace_id,
         "reviewer_misjudge_negative",
-        doc! {
-            "workspace_id": workspace_id,
-            "lifecycle": "completed",
-            "final_review_status": "approved",
-            "created_at": { "$gte": since },
-            "review.reaction_analysis.user_polarity": "negative",
-        },
+        REVIEW_SOURCE_COLLECTION,
+        build_failure_filter(workspace_id, since),
     )
     .await?;
 
@@ -68,12 +92,8 @@ pub async fn aggregate_lessons_for_workspace(
         state,
         workspace_id,
         "blocked_by_safety_guard",
-        doc! {
-            "workspace_id": workspace_id,
-            "lifecycle": "completed",
-            "final_review_status": "blocked_by_safety_guard",
-            "created_at": { "$gte": since },
-        },
+        RUN_SOURCE_COLLECTION,
+        build_blocked_filter(workspace_id, since),
     )
     .await?;
 
@@ -91,12 +111,13 @@ async fn upsert_pattern(
     state: &AppState,
     workspace_id: &str,
     pattern_kind: &str,
+    source_collection: &str,
     filter: Document,
 ) -> anyhow::Result<usize> {
     let count = state
         .db
         .raw()
-        .collection::<Document>("agent_run_logs")
+        .collection::<Document>(source_collection)
         .count_documents(filter.clone(), None)
         .await?;
     if count == 0 {
@@ -111,7 +132,7 @@ async fn upsert_pattern(
     let mut cursor = state
         .db
         .raw()
-        .collection::<Document>("agent_run_logs")
+        .collection::<Document>(source_collection)
         .find(filter, opts)
         .await?;
     let mut sample_run_ids: Vec<String> = Vec::new();
@@ -145,7 +166,9 @@ async fn upsert_pattern(
         .update_one(
             doc! { "lesson_id": &lesson_id },
             update,
-            mongodb::options::UpdateOptions::builder().upsert(true).build(),
+            mongodb::options::UpdateOptions::builder()
+                .upsert(true)
+                .build(),
         )
         .await?;
     Ok(count as usize)
@@ -169,5 +192,52 @@ mod tests {
         let id = format!("{}::{}", "ws_a", "success");
         assert!(id.starts_with("ws_a::"));
         assert!(id.ends_with("::success"));
+    }
+
+    #[test]
+    fn success_pattern_uses_real_review_outcome_and_domain_positive_set() {
+        let since = DateTime::from_millis(123);
+        let positives = vec!["relationship_deepened".to_string()];
+        assert_eq!(
+            build_success_filter("ws_a", since, &positives),
+            doc! {
+                "workspace_id": "ws_a",
+                "approved": true,
+                "outcome_status": { "$in": positives },
+                "created_at": { "$gte": since },
+            }
+        );
+        assert_eq!(REVIEW_SOURCE_COLLECTION, "agent_decision_reviews");
+    }
+
+    #[test]
+    fn failure_pattern_uses_persisted_reviewer_misjudge_signal() {
+        let since = DateTime::from_millis(456);
+        assert_eq!(
+            build_failure_filter("ws_b", since),
+            doc! {
+                "workspace_id": "ws_b",
+                "approved": true,
+                "reviewer_misjudge_signal": "approved_but_user_negative",
+                "created_at": { "$gte": since },
+            }
+        );
+        assert_eq!(REVIEW_SOURCE_COLLECTION, "agent_decision_reviews");
+    }
+
+    #[test]
+    fn blocked_pattern_does_not_require_mutually_exclusive_completed_lifecycle() {
+        let since = DateTime::from_millis(789);
+        let filter = build_blocked_filter("ws_c", since);
+        assert_eq!(
+            filter,
+            doc! {
+                "workspace_id": "ws_c",
+                "final_review_status": "blocked_by_safety_guard",
+                "created_at": { "$gte": since },
+            }
+        );
+        assert!(!filter.contains_key("lifecycle"));
+        assert_eq!(RUN_SOURCE_COLLECTION, "agent_run_logs");
     }
 }
