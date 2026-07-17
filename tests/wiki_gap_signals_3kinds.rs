@@ -431,8 +431,15 @@ async fn recall_signal_merges_correct_topic_among_multiple_pending() {
 async fn recall_signal_merges_into_legacy_row_without_persisted_dedup_key() {
     let app = TestApp::start().await;
     let original_query =
-        "历史套餐每年包含的服务额度和超额计费规则是什么需要一份可以核验的准确说明".to_string();
+        "历史套餐每年包含的服务额度和超额计费规则是什么需要一份可以核验的准确说明并注明适用范围".to_string();
     let variant_query = format!("{original_query} 另外请补充超额后的计费单位");
+    // title cap 是 40 字符：两变体必须在前 40 字内完全相同，才会 derive 出同一 dedup_key。
+    // original_query 本身须 ≥40 字，否则 variant 追加的内容会挤进 title cap 导致 key 分叉。
+    assert!(
+        original_query.chars().count() >= 40,
+        "original_query 须 ≥40 字填满 title cap, got {}",
+        original_query.chars().count()
+    );
     assert_eq!(
         original_query.chars().take(40).collect::<String>(),
         variant_query.chars().take(40).collect::<String>(),
