@@ -1181,6 +1181,7 @@ pub fn decision_dimension_kinds(profile: &DomainProfile) -> Vec<String> {
 /// 且 kind 不在销售 typed 集合里的维度。`description` 非空时一并注入语义提示。
 pub fn render_decision_dimensions_guidance(
     dimensions: &[ProfileDimension],
+    workspace_id: &str,
     scope_account_id: &str,
     cache: &crate::agent::taxonomy::TaxonomyCache,
 ) -> String {
@@ -1211,6 +1212,7 @@ pub fn render_decision_dimensions_guidance(
         // 优先命中字典 canonical id；无字典时明示「暂无受控取值」，让 AI 据语义判断
         // （新取值会被写入侧收集为候选待运营确认，不阻塞决策）。
         let values = crate::agent::taxonomy::dimension_values_with_labels(
+            workspace_id,
             &d.kind,
             scope_account_id,
             cache,
@@ -2345,10 +2347,13 @@ mod tests {
         let p = default_domain_profile("ws-1");
         let cache = taxonomy_cache_for_tests(vec![]);
         assert_eq!(
-            render_decision_dimensions_guidance(&p.profile_dimensions, "ws-1", &cache),
+            render_decision_dimensions_guidance(&p.profile_dimensions, "ws-1", "acct-1", &cache),
             ""
         );
-        assert_eq!(render_decision_dimensions_guidance(&[], "ws-1", &cache), "");
+        assert_eq!(
+            render_decision_dimensions_guidance(&[], "ws-1", "acct-1", &cache),
+            ""
+        );
     }
 
     #[test]
@@ -2377,7 +2382,7 @@ mod tests {
             },
         ];
         let cache = taxonomy_cache_for_tests(vec![]);
-        let out = render_decision_dimensions_guidance(&dims, "ws-1", &cache);
+        let out = render_decision_dimensions_guidance(&dims, "ws-1", "acct-1", &cache);
         assert!(out.contains("domainSignals"), "应告知 LLM 走 domainSignals 容器");
         assert!(out.contains("purchase_lifecycle"), "非销售参与决策维度进指引");
         assert!(out.contains("购买生命周期"), "带 display_name");
@@ -2402,6 +2407,7 @@ mod tests {
         fn entry(kind: &str, id: &str, label: &str) -> TaxonomyEntry {
             TaxonomyEntry {
                 id: None,
+                workspace_id: "default".to_string(),
                 scope: "global".to_string(),
                 kind: kind.to_string(),
                 value: TaxonomyValue {
@@ -2432,7 +2438,7 @@ mod tests {
             participates_in_decision: true,
             description: "客户当前情绪".to_string(),
         }];
-        let out = render_decision_dimensions_guidance(&dims, "acct1", &cache);
+        let out = render_decision_dimensions_guidance(&dims, "default", "acct1", &cache);
         assert!(out.contains("anxious（焦虑）"), "应注入字典取值: {out}");
         assert!(out.contains("calm（平静）"), "应注入字典取值: {out}");
     }
@@ -2448,7 +2454,7 @@ mod tests {
             participates_in_decision: true,
             description: String::new(),
         }];
-        let out = render_decision_dimensions_guidance(&dims, "acct1", &cache);
+        let out = render_decision_dimensions_guidance(&dims, "default", "acct1", &cache);
         assert!(out.contains("暂无受控取值"), "无字典应提示: {out}");
     }
 }

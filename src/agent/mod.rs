@@ -176,7 +176,7 @@ pub use types::{DecisionReviewResult, RawAgentDecision, ReviewScores};
 pub use taxonomy::{taxonomy_cache_for_tests, TaxonomyCache};
 
 // Phase A / A3：启动期预热入口；main.rs 在 ensure_indexes 后调用。
-pub use taxonomy::init_global_taxonomy_cache;
+pub use taxonomy::{ensure_workspace_taxonomies, init_global_taxonomy_cache};
 
 // universal-domain-adaptation 1G-c：active DomainProfile 进程级缓存预热入口；
 // main.rs 在 taxonomy 预热之后调用。

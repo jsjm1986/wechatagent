@@ -14,3 +14,9 @@ __pycache__/
 /.claude/
 /scripts/e2e/node_modules
 *.bundle
+# 临时探针脚本 / 本地产物(非项目源码)
+/scripts/_*.js
+/scripts/_*.py
+/scripts/e2e/
+/kb_backup_local/
+website.zip

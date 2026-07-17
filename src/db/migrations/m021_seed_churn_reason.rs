@@ -80,6 +80,7 @@ pub(super) fn churn_reason_seed_entries(now: DateTime) -> Vec<TaxonomyEntry> {
         .iter()
         .map(|(id, display, desc, aliases)| TaxonomyEntry {
             id: None,
+            workspace_id: crate::models::default_taxonomy_workspace_id(),
             scope: "global".to_string(),
             kind: CHURN_REASON_KIND.to_string(),
             value: TaxonomyValue {
@@ -108,6 +109,7 @@ async fn seed_churn_reason_taxonomy(db: &Database, now: DateTime) -> AppResult<(
     let mut skipped = 0_u64;
     for entry in churn_reason_seed_entries(now) {
         let filter = doc! {
+            "workspace_id": &entry.workspace_id,
             "scope": &entry.scope,
             "kind": &entry.kind,
             "value.id": &entry.value.id,

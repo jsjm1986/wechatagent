@@ -217,6 +217,27 @@ async fn start_mcp_mock_failure() -> MockServer {
     server
 }
 
+/// HTTP/JSON-RPC 均成功，但业务信封显式 `ok=false` 且没有 `newMsgId`。
+/// 该形态用于验证 dispatcher 是否把“收到响应”误当成“消息已送达”。
+async fn start_mcp_mock_negative_receipt() -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "structuredContent": {
+                    "ok": false,
+                    "content": []
+                }
+            }
+        })))
+        .mount(&server)
+        .await;
+    server
+}
+
 /// 统计 wiremock 收到的真实"发送"调用数（JSON-RPC method==tools/call）。
 /// MCP Streamable-HTTP 每个新会话首次调用前先发一次 `initialize` 握手，那是会话
 /// 建立、不是发送；用原始 received_requests().len() 当发送数会把握手误算进去。
@@ -250,6 +271,17 @@ fn enqueue_request(run_id: &str, source_event_id: &str, contact_wxid: &str) -> E
         referral_card_id: None,
         max_attempts: 3,
     }
+}
+
+fn enqueue_request_with_content(
+    run_id: &str,
+    source_event_id: &str,
+    contact_wxid: &str,
+    content: &str,
+) -> EnqueueRequest {
+    let mut request = enqueue_request(run_id, source_event_id, contact_wxid);
+    request.content = content.to_string();
+    request
 }
 
 // ── Case 1: 入队 → claim → MCP 成功 → sent ──────────────────────────────
@@ -293,6 +325,221 @@ async fn happy_path_enqueue_claim_send_sent() {
     assert!(entry.sent_at.is_some(), "sent_at must be populated");
     assert!(entry.worker_id.is_none(), "worker_id cleared on sent");
     assert!(entry.locked_until.is_none(), "locked_until cleared on sent");
+}
+
+/// HTTP/JSON-RPC 成功但业务回执 `ok=false` 时，必须按发送失败重试，不能记 sent。
+#[tokio::test]
+#[ignore]
+async fn negative_mcp_receipt_is_retried_without_outbound_record() {
+    let app = common::TestApp::start().await;
+    let mcp_server = start_mcp_mock_negative_receipt().await;
+    let state = common::rebuild_app_state_with_mcp_url(&app, mcp_server.uri());
+
+    let contact = make_contact("audit_negative_receipt");
+    state
+        .db
+        .contacts()
+        .insert_one(&contact, None)
+        .await
+        .expect("insert contact");
+
+    let outbox_id = match enqueue(
+        &state,
+        enqueue_request(
+            "audit_run_negative_receipt",
+            "audit_evt_negative",
+            &contact.wxid,
+        ),
+    )
+    .await
+    .expect("enqueue")
+    {
+        EnqueueOutcome::Created { outbox_id, .. } => outbox_id,
+        other => panic!("expected Created, got {other:?}"),
+    };
+    let claimed = atomic_claim_pending(&state, "audit-negative-receipt", 60)
+        .await
+        .expect("claim")
+        .expect("entry claimed");
+    process_entry(&state, &claimed)
+        .await
+        .expect("process entry");
+
+    let stored = state
+        .db
+        .collection_agent_send_outbox()
+        .find_one(doc! { "_id": outbox_id }, None)
+        .await
+        .expect("query outbox")
+        .expect("outbox exists");
+    let outbound_count = state
+        .db
+        .messages()
+        .count_documents(
+            doc! {
+                "contact_wxid": &contact.wxid,
+                "direction": "outbound",
+                "content": &claimed.content,
+            },
+            None,
+        )
+        .await
+        .expect("count outbound records");
+
+    assert_eq!(
+        stored.status,
+        OutboxStatus::Pending.as_str(),
+        "否定业务回执必须进入重试"
+    );
+    assert_eq!(stored.attempt, 1);
+    assert!(stored.sent_at.is_none());
+    assert_eq!(
+        outbound_count, 0,
+        "未获成功凭据不得写 outbound conversation record"
+    );
+}
+
+/// 对同一 run 制造一条 sent + 一条 canceled，并返回 run log 最终 outbox_status。
+/// `cancel_first=true` 时 sent 最后发生；false 时 canceled 最后发生。
+async fn mixed_run_status_after_ordered_transitions(
+    state: &wechatagent::routes::AppState,
+    contact: &Contact,
+    run_id: &str,
+    cancel_first: bool,
+) -> String {
+    state
+        .db
+        .raw()
+        .collection::<Document>("agent_run_logs")
+        .insert_one(
+            doc! {
+                "run_id": run_id,
+                "workspace_id": &contact.workspace_id,
+                "account_id": &contact.account_id,
+                "contact_wxid": &contact.wxid,
+                "outbox_status": null,
+                "created_at": DateTime::now(),
+            },
+            None,
+        )
+        .await
+        .expect("seed run log");
+
+    let cancel_one = async {
+        let cancel_id = match enqueue(
+            state,
+            enqueue_request_with_content(
+                run_id,
+                &format!("{run_id}-cancel"),
+                &contact.wxid,
+                "本条用于取消状态复现",
+            ),
+        )
+        .await
+        .expect("enqueue cancel entry")
+        {
+            EnqueueOutcome::Created { outbox_id, .. } => outbox_id,
+            other => panic!("expected Created, got {other:?}"),
+        };
+        let claimed = atomic_claim_pending(state, &format!("{run_id}-cancel-worker"), 60)
+            .await
+            .expect("claim cancel entry")
+            .expect("cancel entry claimed");
+        assert_eq!(claimed.id, Some(cancel_id));
+        cancel_entry(state, cancel_id, &claimed, "audit_mixed_run_cancel")
+            .await
+            .expect("cancel entry");
+    };
+
+    let send_one = async {
+        let send_id = match enqueue(
+            state,
+            enqueue_request_with_content(
+                run_id,
+                &format!("{run_id}-send"),
+                &contact.wxid,
+                "本条用于送达状态复现",
+            ),
+        )
+        .await
+        .expect("enqueue send entry")
+        {
+            EnqueueOutcome::Created { outbox_id, .. } => outbox_id,
+            other => panic!("expected Created, got {other:?}"),
+        };
+        let claimed = atomic_claim_pending(state, &format!("{run_id}-send-worker"), 60)
+            .await
+            .expect("claim send entry")
+            .expect("send entry claimed");
+        assert_eq!(claimed.id, Some(send_id));
+        process_entry(state, &claimed).await.expect("send entry");
+    };
+
+    if cancel_first {
+        cancel_one.await;
+        send_one.await;
+    } else {
+        send_one.await;
+        cancel_one.await;
+    }
+
+    let sent_count = state
+        .db
+        .collection_agent_send_outbox()
+        .count_documents(doc! { "run_id": run_id, "status": "sent" }, None)
+        .await
+        .expect("count sent entries");
+    let canceled_count = state
+        .db
+        .collection_agent_send_outbox()
+        .count_documents(doc! { "run_id": run_id, "status": "canceled" }, None)
+        .await
+        .expect("count canceled entries");
+    assert_eq!((sent_count, canceled_count), (1, 1));
+
+    state
+        .db
+        .raw()
+        .collection::<Document>("agent_run_logs")
+        .find_one(doc! { "run_id": run_id }, None)
+        .await
+        .expect("query run log")
+        .expect("run log exists")
+        .get_str("outbox_status")
+        .expect("outbox_status string")
+        .to_string()
+}
+
+/// 相同的 run 级事实集合（1 sent + 1 canceled）必须与处理顺序无关。
+#[tokio::test]
+#[ignore]
+async fn mixed_run_status_is_order_independent() {
+    let app = common::TestApp::start().await;
+    let mcp_server = start_mcp_mock_success().await;
+    let state = common::rebuild_app_state_with_mcp_url(&app, mcp_server.uri());
+
+    let contact = make_contact("audit_mixed_run_status");
+    state
+        .db
+        .contacts()
+        .insert_one(&contact, None)
+        .await
+        .expect("insert contact");
+
+    let sent_last =
+        mixed_run_status_after_ordered_transitions(&state, &contact, "audit_mixed_sent_last", true)
+            .await;
+    let canceled_last = mixed_run_status_after_ordered_transitions(
+        &state,
+        &contact,
+        "audit_mixed_canceled_last",
+        false,
+    )
+    .await;
+
+    assert_eq!(sent_last, "partially_sent");
+    assert_eq!(canceled_last, "partially_sent");
+    assert_eq!(sent_last, canceled_last);
 }
 
 // ── Case 2: MCP 失败 3 次 → failed_terminal ─────────────────────────────
@@ -528,9 +775,7 @@ async fn crash_recovery_worker_b_reclaims_after_lease_expires() {
         .await
         .expect("backdate locked_until");
 
-    let reclaimed = reclaim_expired_leases(&state)
-        .await
-        .expect("reclaim ok");
+    let reclaimed = reclaim_expired_leases(&state).await.expect("reclaim ok");
     assert_eq!(reclaimed, 1, "exactly one entry must be reclaimed");
 
     let after_reclaim = collection
@@ -579,10 +824,7 @@ async fn idempotency_key_yields_at_most_one_mcp_send() {
     let mut skipped = 0usize;
     let mut first_outbox_id: Option<ObjectId> = None;
     for _ in 0..7 {
-        match enqueue(&state, req.clone())
-            .await
-            .expect("enqueue ok")
-        {
+        match enqueue(&state, req.clone()).await.expect("enqueue ok") {
             EnqueueOutcome::Created { outbox_id, .. } => {
                 created += 1;
                 first_outbox_id = Some(outbox_id);
@@ -614,9 +856,7 @@ async fn idempotency_key_yields_at_most_one_mcp_send() {
             .await
             .expect("claim ok")
             .expect("must claim entry");
-        process_entry(&state, &claimed)
-            .await
-            .expect("process ok");
+        process_entry(&state, &claimed).await.expect("process ok");
     }
     let entry_a =
         common::wait_for_outbox_processed(&state, outbox_id, Duration::from_secs(5)).await;
@@ -787,7 +1027,10 @@ async fn under_soft_cap_emits_no_warning_event() {
         )
         .await
         .expect("count events");
-    assert_eq!(warns, 0, "未达软上限不应记 warning 事件，实际 count={warns}");
+    assert_eq!(
+        warns, 0,
+        "未达软上限不应记 warning 事件，实际 count={warns}"
+    );
 }
 
 // ── Case 9-12: 账号级最小发送间隔闸（防"连珠炮"机器化特征）─────────────────
@@ -887,20 +1130,23 @@ async fn account_pacing_gate_reschedules_back_to_back_send() {
         next_retry.timestamp_millis() > DateTime::now().timestamp_millis(),
         "next_retry_at 应在未来"
     );
-    assert!(entry.worker_id.is_none(), "worker_id 应被清空（放回 pending）");
+    assert!(
+        entry.worker_id.is_none(),
+        "worker_id 应被清空（放回 pending）"
+    );
     assert!(entry.locked_until.is_none(), "locked_until 应被清空");
 
     // 写了 pacing deferred 事件。
     let deferred = state
         .db
         .events()
-        .count_documents(
-            doc! { "kind": "agent.send_deferred_account_pacing" },
-            None,
-        )
+        .count_documents(doc! { "kind": "agent.send_deferred_account_pacing" }, None)
         .await
         .expect("count events");
-    assert!(deferred >= 1, "应写 pacing deferred 事件，实际 count={deferred}");
+    assert!(
+        deferred >= 1,
+        "应写 pacing deferred 事件，实际 count={deferred}"
+    );
 
     // MCP 未收到第二条的发送调用（被闸拦在发送之前）。
     let recv = mcp_server
@@ -1230,7 +1476,11 @@ async fn account_pacing_gate_end_to_end_via_gateway() {
         .await
         .expect("claim ok")
         .expect("claimed entry");
-    assert_eq!(claimed.id, Some(outbox_id), "claim 到的应是 gateway 入队那条");
+    assert_eq!(
+        claimed.id,
+        Some(outbox_id),
+        "claim 到的应是 gateway 入队那条"
+    );
     process_entry(&state, &claimed)
         .await
         .expect("process entry ok");
@@ -1253,7 +1503,10 @@ async fn account_pacing_gate_end_to_end_via_gateway() {
         next_retry.timestamp_millis() > DateTime::now().timestamp_millis(),
         "next_retry_at 应在未来"
     );
-    assert!(entry.worker_id.is_none(), "worker_id 应被清空（放回 pending）");
+    assert!(
+        entry.worker_id.is_none(),
+        "worker_id 应被清空（放回 pending）"
+    );
     assert!(entry.locked_until.is_none(), "locked_until 应被清空");
 
     // 写了账号闸 deferred 事件。
@@ -1446,7 +1699,10 @@ async fn reclaim_gate_precedes_pacing_gate() {
         "应走 reclaim 2B post-hoc 分支（last_error 带专属 marker），实际 last_error={last_error:?}"
     );
     assert!(entry.worker_id.is_none(), "标 sent 时 worker_id 应清空");
-    assert!(entry.locked_until.is_none(), "标 sent 时 locked_until 应清空");
+    assert!(
+        entry.locked_until.is_none(),
+        "标 sent 时 locked_until 应清空"
+    );
 
     // (h) 2B 门标 sent 不重发 → MCP 未收到任何真实 message_send_text 发送调用。
     // F-01 修复后 reclaim text 路会先发一次 chat_search 的 tools/call（本 mock 返回 500 →

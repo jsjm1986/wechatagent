@@ -235,7 +235,9 @@ async fn t_pending_resolve_roundtrip() {
 
     assert_eq!(found.status, PRINCIPAL_ESCALATION_STATUS_RESOLVED);
     assert!(found.resolved_at.is_some());
-    let stored = found.decision.expect("decision must be stored after resolve");
+    let stored = found
+        .decision
+        .expect("decision must be stored after resolve");
     assert_eq!(stored.verdict, PRINCIPAL_VERDICT_CONDITIONAL);
     assert_eq!(stored.substance, "可以给 8 折");
     assert_eq!(stored.constraints, vec!["本周内付款".to_string()]);
@@ -448,8 +450,14 @@ async fn t_timeout_reassign_pushes_and_touches_updated_at() {
         &app,
         &AskHumanPolicy {
             decider_chain: vec![
-                DeciderRef { wxid: "boss".into(), display_name: None },
-                DeciderRef { wxid: "backup".into(), display_name: None },
+                DeciderRef {
+                    wxid: "boss".into(),
+                    display_name: None,
+                },
+                DeciderRef {
+                    wxid: "backup".into(),
+                    display_name: None,
+                },
             ],
             escalate_safety_guard: true,
             escalate_unverified_product: true,
@@ -496,8 +504,14 @@ async fn t_timeout_reassign_push_failure_does_not_reassign() {
         &app,
         &AskHumanPolicy {
             decider_chain: vec![
-                DeciderRef { wxid: "boss".into(), display_name: None },
-                DeciderRef { wxid: "backup".into(), display_name: None },
+                DeciderRef {
+                    wxid: "boss".into(),
+                    display_name: None,
+                },
+                DeciderRef {
+                    wxid: "backup".into(),
+                    display_name: None,
+                },
             ],
             escalate_safety_guard: true,
             escalate_unverified_product: true,
@@ -552,8 +566,14 @@ async fn t_timeout_reassign_blocked_by_quiet_hours_skips_push() {
         &app,
         &AskHumanPolicy {
             decider_chain: vec![
-                DeciderRef { wxid: "boss".into(), display_name: None },
-                DeciderRef { wxid: "backup".into(), display_name: None },
+                DeciderRef {
+                    wxid: "boss".into(),
+                    display_name: None,
+                },
+                DeciderRef {
+                    wxid: "backup".into(),
+                    display_name: None,
+                },
             ],
             escalate_safety_guard: true,
             escalate_unverified_product: true,
@@ -606,8 +626,14 @@ async fn t_timeout_reassign_cap_one_not_self_blocked() {
         &app,
         &AskHumanPolicy {
             decider_chain: vec![
-                DeciderRef { wxid: "boss".into(), display_name: None },
-                DeciderRef { wxid: "backup".into(), display_name: None },
+                DeciderRef {
+                    wxid: "boss".into(),
+                    display_name: None,
+                },
+                DeciderRef {
+                    wxid: "backup".into(),
+                    display_name: None,
+                },
             ],
             escalate_safety_guard: true,
             escalate_unverified_product: true,
@@ -653,8 +679,14 @@ async fn t_timeout_reassign_push_failure_retries_same_next_on_next_tick() {
         &app,
         &AskHumanPolicy {
             decider_chain: vec![
-                DeciderRef { wxid: "boss".into(), display_name: None },
-                DeciderRef { wxid: "backup".into(), display_name: None },
+                DeciderRef {
+                    wxid: "boss".into(),
+                    display_name: None,
+                },
+                DeciderRef {
+                    wxid: "backup".into(),
+                    display_name: None,
+                },
             ],
             escalate_safety_guard: true,
             escalate_unverified_product: true,
@@ -719,7 +751,10 @@ async fn t_timeout_chain_tail_sends_holding_reply_once_within_interval() {
     set_ask_human_policy(
         &app,
         &AskHumanPolicy {
-            decider_chain: vec![DeciderRef { wxid: "boss".into(), display_name: None }],
+            decider_chain: vec![DeciderRef {
+                wxid: "boss".into(),
+                display_name: None,
+            }],
             escalate_safety_guard: true,
             escalate_unverified_product: true,
             escalate_ai_policy_hold: false,
@@ -741,10 +776,7 @@ async fn t_timeout_chain_tail_sends_holding_reply_once_within_interval() {
         .expect("scan 1");
     let after1 = find_escalation(&app, "T12").await;
     assert_eq!(after1.status, "pending", "链尾安抚后台账仍 pending");
-    assert!(
-        after1.last_holding_reply_ms.is_some(),
-        "应记录安抚发送时刻"
-    );
+    assert!(after1.last_holding_reply_ms.is_some(), "应记录安抚发送时刻");
 
     // 第二次 scan（紧接，min_interval=6h 未到）：不重复发。
     wechatagent::agent::escalation::scan_escalation_timeouts(&state)
@@ -793,7 +825,10 @@ async fn find_contact(app: &common::TestApp, wxid: &str) -> Contact {
     app.state
         .db
         .contacts()
-        .find_one(doc! { "wxid": wxid, "workspace_id": "default", "account_id": "default" }, None)
+        .find_one(
+            doc! { "wxid": wxid, "workspace_id": "default", "account_id": "default" },
+            None,
+        )
         .await
         .expect("query contact")
         .expect("contact must exist")
@@ -825,6 +860,63 @@ fn relay_task_for(short_code: &str, contact_wxid: &str) -> AgentTask {
         created_at: now,
         updated_at: now,
     }
+}
+
+fn relay_reply_decision_json(reply_text: &str) -> serde_json::Value {
+    serde_json::json!({
+        "decisionPhase": "final",
+        "userUnderstanding": "领导已给出明确裁决，需要向客户转述可执行结论。",
+        "relationshipRead": "客户正在等待裁决结果，应及时承接。",
+        "operationGoal": "用 AI 自己的口吻向客户说明裁决。",
+        "knowledgeNeedReason": "裁决载荷已经是本轮唯一事实源，无需查询知识库。",
+        "memoryUpdateReason": "本轮没有新的长期客户事实。",
+        "selfCritique": "转述必须克制，不得泄漏内部载荷字段。",
+        "whyShouldReply": "客户正在等待裁决结果。",
+        "whySkipReply": "",
+        "riskSelfCheck": "只转述既有裁决，不新增授权。",
+        "riskLevel": "medium",
+        "knowledgeNeed": "not_required",
+        "runMode": "fast_chat",
+        "autonomyMode": "auto",
+        "needsReview": true,
+        "consolidationNeeded": false,
+        "operationState": "need_discovery",
+        "shouldReply": true,
+        "replyText": reply_text,
+        "usedKnowledgeIds": [],
+        "conversationMode": "consultative",
+        "conversationModeReason": "当前是裁决转述场景。"
+    })
+}
+
+fn relay_review_pass_json() -> serde_json::Value {
+    serde_json::json!({
+        "approved": true,
+        "scores": {
+            "humanLike": 8,
+            "emotionalValue": 8,
+            "productAccuracy": 8,
+            "relationshipProgress": 7,
+            "conversionReadiness": 6,
+            "pressureRisk": 2,
+            "factRisk": 1
+        },
+        "claimAnalysis": {
+            "hasProductClaim": false,
+            "requiresProductKnowledge": false,
+            "knowledgeSupported": true,
+            "reason": "测试固定为已批准转述。"
+        },
+        "risks": [],
+        "rewriteInstruction": "",
+        "reviewSummary": "测试固定放行，由 relay 出站代码守卫做最终拦截。",
+        "needsRevision": false,
+        "revisionDirection": "",
+        "shouldHold": false,
+        "holdReason": "",
+        "holdCategory": "",
+        "selfCritiqueAddressed": true
+    })
 }
 
 /// §14.11（②授权过期闭环）：relay task 跑时领导授权已过期 → 不发过期承诺，但必须
@@ -890,6 +982,110 @@ async fn t_relay_expired_authorization_clears_awaiting_and_sends_neutral() {
         !all.contains("8 折") && !all.contains("8折"),
         "中性收尾绝不复述过期 substance 的具体承诺/数字，实际：{all}"
     );
+}
+
+/// relay 候选泄漏内部字段时，安全门必须在入队前拦截；客户仍处于 awaiting，
+/// 原任务明确取消，不能伪装成已入队或已送达。
+#[tokio::test]
+#[ignore]
+async fn blocked_relay_preserves_awaiting_and_cancels_task_without_outbox() {
+    let app = common::TestApp::start().await;
+    let wxid = "cust_audit_blocked_relay";
+    let short_code = "AUDR1";
+
+    let mut contact = minimal_contact(wxid);
+    let mut attrs = Document::new();
+    attrs.insert(AWAITING_PRINCIPAL_DECISION_ATTR, true);
+    contact.domain_attributes = Some(attrs);
+    app.state
+        .db
+        .contacts()
+        .insert_one(&contact, None)
+        .await
+        .expect("insert awaiting contact");
+
+    let mut escalation = minimal_pending_escalation(short_code, wxid);
+    escalation.status = PRINCIPAL_ESCALATION_STATUS_RESOLVED.to_string();
+    escalation.decision = Some(PrincipalDecision {
+        verdict: PRINCIPAL_VERDICT_CONDITIONAL.to_string(),
+        substance: "本周内可以按约定方案推进".to_string(),
+        constraints: vec!["本周内确认".to_string()],
+        authorization_window_hours: None,
+        exemption_type: wechatagent::models::EXEMPTION_TYPE_NONE.to_string(),
+    });
+    escalation.resolved_at = Some(DateTime::now());
+    app.state
+        .db
+        .agent_principal_escalations()
+        .insert_one(&escalation, None)
+        .await
+        .expect("insert resolved escalation");
+
+    let mut task = relay_task_for(short_code, wxid);
+    let task_id = ObjectId::new();
+    task.id = Some(task_id);
+    app.state
+        .db
+        .tasks()
+        .insert_one(&task, None)
+        .await
+        .expect("insert relay task");
+
+    app.llm.push_response(relay_reply_decision_json(
+        "给客户的错误转述：verdict=approved",
+    ));
+    app.llm.push_response(relay_review_pass_json());
+
+    wechatagent::agent::handle_follow_up_task(&app.state, task)
+        .await
+        .expect("blocked relay returns Ok");
+
+    let outbox_count = app
+        .state
+        .db
+        .collection_agent_send_outbox()
+        .count_documents(doc! { "contact_wxid": wxid }, None)
+        .await
+        .expect("count relay outbox");
+    assert_eq!(
+        outbox_count, 0,
+        "内部字段泄漏应被 relay 安全门拦截，实际不得创建 outbox"
+    );
+
+    let after = find_contact(&app, wxid).await;
+    let awaiting = after
+        .domain_attributes
+        .as_ref()
+        .and_then(|d| d.get_bool(AWAITING_PRINCIPAL_DECISION_ATTR).ok())
+        .unwrap_or(false);
+    assert!(awaiting, "零 outbox 时客户仍在等待有效裁决转述");
+
+    let stored_task = app
+        .state
+        .db
+        .tasks()
+        .find_one(doc! { "_id": task_id }, None)
+        .await
+        .expect("query relay task")
+        .expect("relay task exists");
+    assert_eq!(
+        stored_task.status, "cancelled",
+        "安全门拦截后任务必须进入明确终态"
+    );
+    assert_eq!(
+        stored_task.gateway_status.as_deref(),
+        Some("blocked_by_safety_guard")
+    );
+
+    let review = app
+        .state
+        .db
+        .decision_reviews()
+        .find_one(doc! { "contact_wxid": wxid }, None)
+        .await
+        .expect("query relay review")
+        .expect("relay review exists");
+    assert_eq!(review.status, "blocked_by_safety_guard");
 }
 
 // ───────────────────── §14 纯函数测试（不标 ignore，本地即跑） ─────────────────────

@@ -1448,6 +1448,7 @@ pub(super) async fn execute_management_tool(
                     Some(v) => apply_admin_dim_validation(
                         agent::dimension_registry::validate_dimension_value(
                             &state.db,
+                            workspace_id,
                             "customer_stage",
                             v,
                             &contact.account_id,
@@ -1461,6 +1462,7 @@ pub(super) async fn execute_management_tool(
                     Some(v) => apply_admin_dim_validation(
                         agent::dimension_registry::validate_dimension_value(
                             &state.db,
+                            workspace_id,
                             "intent_level",
                             v,
                             &contact.account_id,
@@ -1618,6 +1620,7 @@ pub(super) async fn execute_management_tool(
                 Some(v) => apply_admin_dim_validation(
                     agent::dimension_registry::validate_dimension_value(
                         &state.db,
+                        workspace_id,
                         "customer_stage",
                         v,
                         &contact.account_id,
@@ -1655,6 +1658,7 @@ pub(super) async fn execute_management_tool(
                 Some(v) => apply_admin_dim_validation(
                     agent::dimension_registry::validate_dimension_value(
                         &state.db,
+                        workspace_id,
                         "intent_level",
                         v,
                         &contact.account_id,
@@ -2346,7 +2350,7 @@ pub(super) async fn execute_management_tool(
             let payload = serde_json::from_value(planned.arguments.clone())
                 .map_err(|e| AppError::BadRequest(format!("参数解析失败: {e}")))?;
             crate::routes::admin_taxonomy_candidates::approve_taxonomy_candidate_inner(
-                state, account_id, &id, payload,
+                state, workspace_id, account_id, &id, payload,
             )
             .await
         }

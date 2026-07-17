@@ -22,9 +22,10 @@ use wechatagent::models::{TaxonomyEntry, TaxonomyValue};
 use crate::common::TestApp;
 
 /// 构造一条 active 的 global taxonomy 取值条目（两 flag 初值 false）。
-fn make_entry(kind: &str, id: &str) -> TaxonomyEntry {
+fn make_entry(workspace_id: &str, kind: &str, id: &str) -> TaxonomyEntry {
     TaxonomyEntry {
         id: None,
+        workspace_id: workspace_id.to_string(),
         scope: "global".to_string(),
         kind: kind.to_string(),
         value: TaxonomyValue {
@@ -52,7 +53,11 @@ async fn patch_camelcase_keys_persist_both_flags() {
     let coll = app.state.db.collection_system_taxonomies();
 
     // 种一条两 flag = false 的条目。
-    let entry = make_entry("customer_stage", "task7_flag_target");
+    let entry = make_entry(
+        &app.state.config.default_workspace_id,
+        "customer_stage",
+        "task7_flag_target",
+    );
     let inserted = coll
         .insert_one(&entry, None)
         .await

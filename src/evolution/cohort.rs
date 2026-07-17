@@ -62,7 +62,7 @@ pub async fn select_cohorts(
 ///
 /// `runtime_flag = Some(flag)` 时仅保留 `bucket_for_contact(flag, contact_wxid)` 命中
 /// 的 run（即 `enabled=true && hash(contact_id) % 100 < rollout_percent` 的 contact）；
-/// `None` 等价于"不过滤、全量收"，保持 W1 行为以兼容尚未配 mongo flag 的 workspace。
+/// `None`、`enabled=false` 或 `rollout_percent=0` 均返回空 cohort，不查询 run 日志。
 ///
 /// 同一 contact 在 rollout_percent 单调上升时永远在桶里——见 [`super::runtime_flag`]。
 pub async fn select_cohorts_filtered(
@@ -71,6 +71,12 @@ pub async fn select_cohorts_filtered(
     account_id: &str,
     runtime_flag: Option<&EvolutionRuntimeFlag>,
 ) -> Result<Cohorts, EvolutionError> {
+    if !runtime_flag
+        .is_some_and(|flag| flag.enabled && flag.rollout_percent_clamped() > 0)
+    {
+        return Ok(Cohorts::default());
+    }
+
     let window_hours = state.config.evolution_eval_window_hours.max(1) as i64;
     let cap_per_contact = state.config.evolution_cohort_per_contact_cap.max(1);
     let min_replays = state.config.evolution_min_replays;
@@ -100,11 +106,8 @@ pub async fn select_cohorts_filtered(
     while let Some(run) = cursor.try_next().await.map_err(EvolutionError::from)? {
         let Some(id) = run.id else { continue };
         let contact = run.contact_wxid.clone().unwrap_or_default();
-        if let Some(flag) = runtime_flag {
-            // 空 contact_wxid 视作"无法判定的桶"，灰度模式下排除以避免污染样本。
-            if contact.is_empty() || !bucket_for_contact(flag, &contact) {
-                continue;
-            }
+        if !contact_in_runtime_cohort(runtime_flag, &contact) {
+            continue;
         }
         threshold_pool.push((id, contact, run.final_review_status.clone()));
     }
@@ -134,6 +137,16 @@ pub async fn select_cohorts_filtered(
     })
 }
 
+fn contact_in_runtime_cohort(
+    runtime_flag: Option<&EvolutionRuntimeFlag>,
+    contact: &str,
+) -> bool {
+    match runtime_flag {
+        None => false,
+        Some(flag) => !contact.is_empty() && bucket_for_contact(flag, contact),
+    }
+}
+
 fn dedup_per_contact(
     pool: &[(ObjectId, String, String)],
     cap_per_contact: usize,
@@ -154,6 +167,18 @@ fn dedup_per_contact(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn runtime_flag(enabled: bool, rollout_percent: u32) -> EvolutionRuntimeFlag {
+        EvolutionRuntimeFlag {
+            id: None,
+            workspace_id: "ws_test".to_string(),
+            enabled,
+            rollout_percent,
+            updated_by: None,
+            updated_at: DateTime::now(),
+            threshold_auto_release_enabled: false,
+        }
+    }
 
     fn mk(idx: u32, contact: &str, status: &str) -> (ObjectId, String, String) {
         // ObjectId::new() 单调递增足以构造稳定测试 id；用 idx 仅作可读注释。
@@ -185,6 +210,23 @@ mod tests {
         ];
         let out = dedup_per_contact(&pool, 2);
         assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn missing_runtime_flag_excludes_contact_from_cohort() {
+        assert!(!contact_in_runtime_cohort(None, "contact_a"));
+    }
+
+    #[test]
+    fn runtime_flag_filter_respects_closed_and_full_rollout_states() {
+        let disabled = runtime_flag(false, 100);
+        let zero_percent = runtime_flag(true, 0);
+        let full_rollout = runtime_flag(true, 100);
+
+        assert!(!contact_in_runtime_cohort(Some(&disabled), "contact_a"));
+        assert!(!contact_in_runtime_cohort(Some(&zero_percent), "contact_a"));
+        assert!(contact_in_runtime_cohort(Some(&full_rollout), "contact_a"));
+        assert!(!contact_in_runtime_cohort(Some(&full_rollout), ""));
     }
 
     #[test]

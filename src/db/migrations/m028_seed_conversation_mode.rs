@@ -58,6 +58,7 @@ pub(super) fn conversation_mode_seed_entries(now: DateTime) -> Vec<TaxonomyEntry
         .iter()
         .map(|(id, display, desc, aliases)| TaxonomyEntry {
             id: None,
+            workspace_id: crate::models::default_taxonomy_workspace_id(),
             scope: "global".to_string(),
             kind: CONVERSATION_MODE_KIND.to_string(),
             value: TaxonomyValue {
@@ -85,6 +86,7 @@ async fn seed_conversation_mode_taxonomy(db: &Database, now: DateTime) -> AppRes
     let mut skipped = 0_u64;
     for entry in conversation_mode_seed_entries(now) {
         let filter = doc! {
+            "workspace_id": &entry.workspace_id,
             "scope": &entry.scope,
             "kind": &entry.kind,
             "value.id": &entry.value.id,

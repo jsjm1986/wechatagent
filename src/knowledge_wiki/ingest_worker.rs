@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use mongodb::bson::{doc, DateTime as BsonDateTime};
+use sha2::{Digest, Sha256};
 use tokio::time::sleep;
 
 use crate::models::IngestSource;
@@ -59,11 +60,19 @@ pub async fn run_one_round(state: &AppState) -> anyhow::Result<()> {
                 Ok(SourceOutcome::NotModified) => {
                     let _ = mark_success(state, &src, 0).await;
                 }
-                Ok(SourceOutcome::Ingested {
+                Ok(SourceOutcome::Fetched {
                     chunk_count,
                     etag,
+                    content_hash,
                 }) => {
-                    let _ = mark_success_with_etag(state, &src, chunk_count, etag).await;
+                    let _ = mark_success_with_checkpoint(
+                        state,
+                        &src,
+                        chunk_count,
+                        etag,
+                        &content_hash,
+                    )
+                    .await;
                 }
                 Err(err) => {
                     tracing::warn!(
@@ -86,9 +95,10 @@ enum SourceOutcome {
     /// 只有 NotModified 才走 mark_success 刷 last_fetched_at。
     Skipped,
     NotModified,
-    Ingested {
+    Fetched {
         chunk_count: usize,
         etag: Option<String>,
+        content_hash: String,
     },
 }
 
@@ -125,6 +135,14 @@ async fn process_source(
     if markdown.trim().is_empty() {
         anyhow::bail!("empty parsed body");
     }
+    let content_hash = content_sha256(&markdown);
+    if !should_ingest_content(src.last_content_hash.as_deref(), &content_hash) {
+        return Ok(SourceOutcome::Fetched {
+            chunk_count: 0,
+            etag,
+            content_hash,
+        });
+    }
     let source_name = src
         .label
         .clone()
@@ -138,9 +156,10 @@ async fn process_source(
     )
     .await
     .map_err(|e| anyhow::anyhow!("ingest_chunked_text failed: {e}"))?;
-    Ok(SourceOutcome::Ingested {
+    Ok(SourceOutcome::Fetched {
         chunk_count: outcome.chunk_ids.len(),
         etag,
+        content_hash,
     })
 }
 
@@ -152,6 +171,16 @@ fn is_due(src: &IngestSource) -> bool {
     let last_ms = last.timestamp_millis();
     let elapsed_min = (now_ms - last_ms) / 60_000;
     elapsed_min >= src.schedule_minutes.max(1)
+}
+
+fn content_sha256(content: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn should_ingest_content(last_content_hash: Option<&str>, content_hash: &str) -> bool {
+    last_content_hash != Some(content_hash)
 }
 
 fn render_rss_to_markdown(body: &[u8]) -> anyhow::Result<String> {
@@ -299,11 +328,12 @@ async fn mark_success(state: &AppState, src: &IngestSource, chunk_count: usize) 
     Ok(())
 }
 
-async fn mark_success_with_etag(
+async fn mark_success_with_checkpoint(
     state: &AppState,
     src: &IngestSource,
     chunk_count: usize,
     etag: Option<String>,
+    content_hash: &str,
 ) -> anyhow::Result<()> {
     let mut set_doc = doc! {
         "last_fetched_at": BsonDateTime::now(),
@@ -311,6 +341,7 @@ async fn mark_success_with_etag(
         "failure_streak": 0,
         "status": "active",
         "updated_at": BsonDateTime::now(),
+        "last_content_hash": content_hash,
     };
     if let Some(e) = etag {
         set_doc.insert("last_etag", e);
@@ -381,6 +412,7 @@ mod tests {
             schedule_minutes: schedule_min,
             last_fetched_at: last_fetched.map(BsonDateTime::from_millis),
             last_etag: None,
+            last_content_hash: None,
             status: "active".into(),
             failure_streak: 0,
             last_error: None,
@@ -417,6 +449,21 @@ mod tests {
         // 2 分钟前 → due
         let stale = sample_source(Some(just_now - 2 * 60_000), 0);
         assert!(is_due(&stale));
+    }
+
+    #[test]
+    fn unchanged_content_hash_is_not_ingested_again() {
+        let hash = content_sha256("same parsed content");
+        assert!(!should_ingest_content(Some(&hash), &hash));
+    }
+
+    #[test]
+    fn missing_or_changed_content_hash_is_ingested() {
+        let first = content_sha256("first parsed content");
+        let changed = content_sha256("changed parsed content");
+
+        assert!(should_ingest_content(None, &first));
+        assert!(should_ingest_content(Some(&first), &changed));
     }
 
     #[test]

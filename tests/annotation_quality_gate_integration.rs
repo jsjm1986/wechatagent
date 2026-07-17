@@ -188,9 +188,14 @@ async fn upload_alias_stage_normalizes_to_canonical() {
     // customer_stage 同空间，运行时 `s == cs` 才能命中、素材才发得出去）。
     let app = common::TestApp::start().await;
     let raw = vec!["需求挖掘".to_string()];
-    let normalized = wechatagent::agent::normalize_target_stages(&app.state.db, "", &raw)
-        .await
-        .expect("alias 应被接受并归一，而非报错");
+    let normalized = wechatagent::agent::normalize_target_stages(
+        &app.state.db,
+        &app.state.config.default_workspace_id,
+        "",
+        &raw,
+    )
+    .await
+    .expect("alias 应被接受并归一，而非报错");
     assert_eq!(
         normalized,
         vec!["need_discovery".to_string()],
@@ -205,7 +210,13 @@ async fn upload_out_of_dict_stage_rejected() {
     // 任何 alias 的阶段名 → AdminWrite 越界 → Err（upload 端点据此返回 400）。
     let app = common::TestApp::start().await;
     let raw = vec!["不存在的阶段名".to_string()];
-    let result = wechatagent::agent::normalize_target_stages(&app.state.db, "", &raw).await;
+    let result = wechatagent::agent::normalize_target_stages(
+        &app.state.db,
+        &app.state.config.default_workspace_id,
+        "",
+        &raw,
+    )
+    .await;
     assert!(
         result.is_err(),
         "字典已配置时越界 stage 必须 Err（端点 400），实际: {result:?}"

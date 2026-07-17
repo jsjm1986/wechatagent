@@ -34,6 +34,7 @@ use std::collections::{HashMap, HashSet};
 
 use futures::TryStreamExt;
 use mongodb::bson::{doc, DateTime, Document};
+use mongodb::options::UpdateOptions;
 use uuid::Uuid;
 
 use crate::db::Database;
@@ -474,6 +475,108 @@ pub(crate) fn signal_dedup_key(kind: &str, title: &str, affected: &[String]) -> 
     format!("{}::{}", kind, normalize_title(title))
 }
 
+fn persistent_signal_dedup_key(logical_key: &str) -> String {
+    sha256_hex(logical_key)
+}
+
+fn is_duplicate_key_error(err: &mongodb::error::Error) -> bool {
+    use mongodb::error::{ErrorKind, WriteFailure};
+    match &*err.kind {
+        ErrorKind::Write(WriteFailure::WriteError(write_error)) => {
+            write_error.code == 11000 || write_error.code == 11001
+        }
+        ErrorKind::BulkWrite(bulk) => bulk
+            .write_errors
+            .as_ref()
+            .is_some_and(|errors| errors.iter().any(|e| e.code == 11000 || e.code == 11001)),
+        _ => false,
+    }
+}
+
+fn pending_signal_merge_update(signal: &KnowledgeGapSignal) -> Result<Document, AppError> {
+    let mut on_insert = mongodb::bson::to_document(signal)?;
+    on_insert.remove("_id");
+    on_insert.remove("affected_chunk_ids");
+    on_insert.remove("search_queries");
+
+    let mut update = doc! { "$setOnInsert": on_insert };
+    let mut add_to_set = Document::new();
+    if !signal.affected_chunk_ids.is_empty() {
+        add_to_set.insert(
+            "affected_chunk_ids",
+            doc! { "$each": &signal.affected_chunk_ids },
+        );
+    }
+    if !signal.search_queries.is_empty() {
+        add_to_set.insert(
+            "search_queries",
+            doc! { "$each": &signal.search_queries },
+        );
+    }
+    if !add_to_set.is_empty() {
+        update.insert("$addToSet", add_to_set);
+    }
+    Ok(update)
+}
+
+async fn merge_existing_pending_signal(
+    db: &Database,
+    signal_id: &str,
+    signal: &KnowledgeGapSignal,
+) -> Result<bool, AppError> {
+    let update = pending_signal_merge_update(signal)?;
+    let result = db
+        .knowledge_gap_signals()
+        .update_one(
+            doc! { "signal_id": signal_id, "status": "pending" },
+            update,
+            None,
+        )
+        .await?;
+    Ok(result.matched_count > 0)
+}
+
+/// Atomically insert or merge a modern pending signal. The unique partial
+/// index closes the concurrent-upsert window; a duplicate-key loser retries
+/// the same merge without upsert.
+async fn upsert_pending_signal(
+    db: &Database,
+    signal: &KnowledgeGapSignal,
+) -> Result<bool, AppError> {
+    let dedup_key = signal
+        .dedup_key
+        .as_deref()
+        .ok_or_else(|| AppError::External("pending signal missing dedup_key".to_string()))?;
+    let filter = doc! {
+        "workspace_id": &signal.workspace_id,
+        "dedup_key": dedup_key,
+        "status": "pending",
+    };
+    let update = pending_signal_merge_update(signal)?;
+    match db
+        .knowledge_gap_signals()
+        .update_one(
+            filter.clone(),
+            update.clone(),
+            UpdateOptions::builder().upsert(true).build(),
+        )
+        .await
+    {
+        Ok(result) => Ok(result.upserted_id.is_some()),
+        Err(err) if is_duplicate_key_error(&err) => {
+            let retry = db
+                .knowledge_gap_signals()
+                .update_one(filter, update, None)
+                .await?;
+            if retry.matched_count == 0 {
+                return Err(AppError::Db(err));
+            }
+            Ok(false)
+        }
+        Err(err) => Err(AppError::Db(err)),
+    }
+}
+
 /// 把候选信号写库（去重 + stage 1 sweep + 落 pending）。
 ///
 /// 流程：
@@ -509,47 +612,39 @@ pub async fn persist_signals(
         let key = cand.dedup_key();
         seen_keys.insert(key.clone());
         if let Some(existing) = pending_by_key.get(&key) {
-            // 合并 affected_chunk_ids（如果有新增）
-            let mut merged_ids: HashSet<String> =
-                existing.affected_chunk_ids.iter().cloned().collect();
-            let before = merged_ids.len();
-            for id in &cand.affected_chunk_ids {
-                merged_ids.insert(id.clone());
-            }
-            if merged_ids.len() > before {
-                let new_vec: Vec<String> = merged_ids.into_iter().collect();
-                db.knowledge_gap_signals()
-                    .update_one(
-                        doc! { "signal_id": &existing.signal_id },
-                        doc! { "$set": { "affected_chunk_ids": &new_vec } },
-                        None,
-                    )
-                    .await
-                    .map_err(AppError::from)?;
-            }
-            report.existing_pending += 1;
-        } else {
-            let signal = KnowledgeGapSignal {
-                id: None,
-                signal_id: format!("sig_{}", Uuid::new_v4().simple()),
-                workspace_id: workspace_id.to_string(),
-                kind: cand.kind,
-                title: cand.title,
-                description: cand.description,
-                affected_chunk_ids: cand.affected_chunk_ids,
-                search_queries: Vec::new(),
-                severity: cand.severity,
-                source: "rule".into(),
-                status: "pending".into(),
-                resolution_note: None,
-                created_at: DateTime::now(),
-                resolved_at: None,
+            let merge = KnowledgeGapSignal {
+                affected_chunk_ids: cand.affected_chunk_ids.clone(),
+                dedup_key: existing.dedup_key.clone(),
+                ..existing.clone()
             };
-            db.knowledge_gap_signals()
-                .insert_one(&signal, None)
-                .await
-                .map_err(AppError::from)?;
+            // Always re-check status atomically. If sweep resolved the row after
+            // the initial read, fall through and create a new pending row.
+            if merge_existing_pending_signal(db, &existing.signal_id, &merge).await? {
+                report.existing_pending += 1;
+                continue;
+            }
+        }
+        let signal = KnowledgeGapSignal {
+            id: None,
+            signal_id: format!("sig_{}", Uuid::new_v4().simple()),
+            workspace_id: workspace_id.to_string(),
+            dedup_key: Some(persistent_signal_dedup_key(&key)),
+            kind: cand.kind,
+            title: cand.title,
+            description: cand.description,
+            affected_chunk_ids: cand.affected_chunk_ids,
+            search_queries: Vec::new(),
+            severity: cand.severity,
+            source: "rule".into(),
+            status: "pending".into(),
+            resolution_note: None,
+            created_at: DateTime::now(),
+            resolved_at: None,
+        };
+        if upsert_pending_signal(db, &signal).await? {
             report.new_signals += 1;
+        } else {
+            report.existing_pending += 1;
         }
     }
 
@@ -623,47 +718,24 @@ pub async fn persist_recall_signal(
         .find(|s| signal_dedup_key(&s.kind, &s.title, &s.affected_chunk_ids) == key);
 
     if let Some(existing) = existing {
-        let mut merged: HashSet<String> = existing.affected_chunk_ids.iter().cloned().collect();
-        let before = merged.len();
-        for id in &candidate.affected_chunk_ids {
-            merged.insert(id.clone());
+        let merge = KnowledgeGapSignal {
+            affected_chunk_ids: candidate.affected_chunk_ids.clone(),
+            search_queries: candidate.search_queries.clone(),
+            dedup_key: existing.dedup_key.clone(),
+            ..existing.clone()
+        };
+        // `$addToSet` is idempotent, so always re-check the pending state in
+        // MongoDB rather than trusting the earlier snapshot.
+        if merge_existing_pending_signal(db, &existing.signal_id, &merge).await? {
+            return Ok(());
         }
-        // search_queries 并集：同一缺失主题反复弃答时累积所有 query 变体（去重、丢空），
-        // 给人类更全的对话补全线索。原 affected_chunk_ids 并集逻辑保持不变。
-        let mut queries: Vec<String> = existing.search_queries.clone();
-        let q_before = queries.len();
-        for q in &candidate.search_queries {
-            if !q.trim().is_empty() && !queries.iter().any(|e| e == q) {
-                queries.push(q.clone());
-            }
-        }
-        let affected_grew = merged.len() > before;
-        let queries_grew = queries.len() > q_before;
-        if affected_grew || queries_grew {
-            let mut set = doc! {};
-            if affected_grew {
-                let new_vec: Vec<String> = merged.into_iter().collect();
-                set.insert("affected_chunk_ids", new_vec);
-            }
-            if queries_grew {
-                set.insert("search_queries", &queries);
-            }
-            db.knowledge_gap_signals()
-                .update_one(
-                    doc! { "signal_id": &existing.signal_id },
-                    doc! { "$set": set },
-                    None,
-                )
-                .await
-                .map_err(AppError::from)?;
-        }
-        return Ok(());
     }
 
     let signal = KnowledgeGapSignal {
         id: None,
         signal_id: format!("sig_{}", Uuid::new_v4().simple()),
         workspace_id: workspace_id.to_string(),
+        dedup_key: Some(persistent_signal_dedup_key(&key)),
         kind: candidate.kind,
         title: candidate.title,
         description: candidate.description,
@@ -676,10 +748,7 @@ pub async fn persist_recall_signal(
         created_at: DateTime::now(),
         resolved_at: None,
     };
-    db.knowledge_gap_signals()
-        .insert_one(&signal, None)
-        .await
-        .map_err(AppError::from)?;
+    upsert_pending_signal(db, &signal).await?;
     Ok(())
 }
 ///
@@ -1863,6 +1932,71 @@ mod tests {
             None::<&str>,
         );
         assert_eq!(a.dedup_key(), b.dedup_key());
+    }
+
+    #[test]
+    fn persistent_dedup_key_is_fixed_sha256_and_preserves_link_aliasing() {
+        let affected = vec!["from".to_string(), "to".to_string()];
+        let broken = signal_dedup_key("broken_link", "ignored", &affected);
+        let missing = signal_dedup_key("missing_chunk", "ignored", &affected);
+        let broken_persisted = persistent_signal_dedup_key(&broken);
+        let missing_persisted = persistent_signal_dedup_key(&missing);
+
+        assert_eq!(broken, missing, "link state aliases must share one logical key");
+        assert_eq!(broken_persisted, missing_persisted);
+        assert_eq!(broken_persisted.len(), 64);
+        assert!(broken_persisted
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert_ne!(broken_persisted, broken);
+    }
+
+    #[test]
+    fn pending_signal_merge_update_inserts_metadata_and_unions_arrays() {
+        let signal = KnowledgeGapSignal {
+            id: None,
+            signal_id: "sig_test".to_string(),
+            workspace_id: "ws_test".to_string(),
+            dedup_key: Some("a".repeat(64)),
+            kind: "recall_miss".to_string(),
+            title: "missing topic".to_string(),
+            description: "description".to_string(),
+            affected_chunk_ids: vec!["chunk_a".to_string(), "chunk_a".to_string()],
+            search_queries: vec!["query a".to_string(), "query a".to_string()],
+            severity: "high".to_string(),
+            source: "recall_trace".to_string(),
+            status: "pending".to_string(),
+            resolution_note: None,
+            created_at: DateTime::from_millis(1_700_000_000_000),
+            resolved_at: None,
+        };
+
+        let update = pending_signal_merge_update(&signal).unwrap();
+        let on_insert = update.get_document("$setOnInsert").unwrap();
+        assert_eq!(on_insert.get_str("signal_id").unwrap(), "sig_test");
+        assert_eq!(on_insert.get_str("status").unwrap(), "pending");
+        assert!(!on_insert.contains_key("affected_chunk_ids"));
+        assert!(!on_insert.contains_key("search_queries"));
+
+        let add_to_set = update.get_document("$addToSet").unwrap();
+        assert_eq!(
+            add_to_set
+                .get_document("affected_chunk_ids")
+                .unwrap()
+                .get_array("$each")
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            add_to_set
+                .get_document("search_queries")
+                .unwrap()
+                .get_array("$each")
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[test]

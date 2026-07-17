@@ -46,6 +46,7 @@ use crate::db::Database;
 pub(crate) fn classify_decision_tags(
     decision: &mut AgentDecision,
     dimension_kinds: &[String],
+    workspace_id: &str,
     scope_account_id: &str,
     cache: &TaxonomyCache,
 ) -> (Vec<String>, Vec<(String, String)>) {
@@ -56,7 +57,7 @@ pub(crate) fn classify_decision_tags(
             Some(v) if !v.trim().is_empty() => v.to_string(),
             _ => continue,
         };
-        match check_value(kind, &raw, scope_account_id, cache) {
+        match check_value(workspace_id, kind, &raw, scope_account_id, cache) {
             TaxonomyMatch::Active => {}
             TaxonomyMatch::AliasActive(canonical) => {
                 if canonical != raw {
@@ -85,17 +86,24 @@ pub(crate) fn validate_and_normalize_decision(
     db: &Database,
     decision: &mut AgentDecision,
     dimension_kinds: &[String],
+    workspace_id: &str,
     scope_account_id: &str,
 ) -> Vec<String> {
     let cache = global_taxonomy_cache();
     let (risks, candidates) =
-        classify_decision_tags(decision, dimension_kinds, scope_account_id, &cache);
+        classify_decision_tags(
+            decision,
+            dimension_kinds,
+            workspace_id,
+            scope_account_id,
+            &cache,
+        );
     // 与 gateway 主循环同源：按 kind 从 decision.dimension_display_names 取 LLM 产的
     // 中文名，随候选一起落库。二者写同一幂等键 (scope,kind,raw)，upsert 对已存在候选
     // 不更新 display_name（先写者赢）——此处带名，避免本 fire-and-forget 路径的 None
     // 抢先把 gateway 的中文名挡在门外。取的是同一个 decision，名字一致、幂等无害。
     let named = attach_display_names(candidates, decision);
-    spawn_candidate_upserts(db, scope_account_id, named);
+    spawn_candidate_upserts(db, workspace_id, scope_account_id, named);
     risks
 }
 
@@ -124,6 +132,7 @@ fn attach_display_names(
 /// `upsert_candidate` 的 `suggested_display_name`（收件箱命名卡预填）；None 回落英文。
 fn spawn_candidate_upserts(
     db: &Database,
+    workspace_id: &str,
     scope_account_id: &str,
     candidates: Vec<(String, String, Option<String>)>,
 ) {
@@ -131,11 +140,22 @@ fn spawn_candidate_upserts(
         return;
     }
     let db = db.clone();
+    let workspace = workspace_id.to_string();
     let scope = scope_account_id.to_string();
     tokio::spawn(async move {
         for (kind, raw, display_name) in candidates {
             if let Err(err) =
-                upsert_candidate(&db, &scope, &kind, &raw, None, 0, display_name.as_deref()).await
+                upsert_candidate(
+                    &db,
+                    &workspace,
+                    &scope,
+                    &kind,
+                    &raw,
+                    None,
+                    0,
+                    display_name.as_deref(),
+                )
+                .await
             {
                 tracing::warn!(
                     kind = %kind,
@@ -157,7 +177,7 @@ pub(crate) fn classify_with_cache_for_tests(
     cache: &std::sync::Arc<TaxonomyCache>,
 ) -> (Vec<String>, Vec<(String, String)>) {
     let dims = vec!["customer_stage".to_string(), "intent_level".to_string()];
-    classify_decision_tags(decision, &dims, scope_account_id, cache)
+    classify_decision_tags(decision, &dims, "default", scope_account_id, cache)
 }
 
 #[cfg(test)]
@@ -185,6 +205,7 @@ mod tests {
     ) -> TaxonomyEntry {
         TaxonomyEntry {
             id: Some(ObjectId::new()),
+            workspace_id: "default".to_string(),
             scope: scope.to_string(),
             kind: kind.to_string(),
             value: TaxonomyValue {
@@ -374,7 +395,8 @@ mod tests {
         d.domain_signals
             .insert("relationship_closeness".to_string(), "热恋".to_string());
         let dims = vec!["relationship_closeness".to_string()];
-        let (risks, cands) = classify_decision_tags(&mut d, &dims, "acct-x", &cache);
+        let (risks, cands) =
+            classify_decision_tags(&mut d, &dims, "default", "acct-x", &cache);
 
         assert_eq!(
             d.domain_signals.get_str("relationship_closeness").ok(),
@@ -398,7 +420,8 @@ mod tests {
         d.domain_signals
             .insert("emotional_state".to_string(), "焦虑不安".to_string());
         let dims = vec!["emotional_state".to_string()];
-        let (risks, cands) = classify_decision_tags(&mut d, &dims, "acct-x", &cache);
+        let (risks, cands) =
+            classify_decision_tags(&mut d, &dims, "default", "acct-x", &cache);
 
         assert_eq!(risks, vec!["taxonomy_candidate:emotional_state:焦虑不安"]);
         assert_eq!(

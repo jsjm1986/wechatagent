@@ -28,9 +28,17 @@ use wechatagent::models::{TaxonomyEntry, TaxonomyValue};
 use crate::common::TestApp;
 
 /// 构造一条 global taxonomy 取值条目。
-fn make_entry(kind: &str, id: &str, version: i32, current: bool, prev: Option<i32>) -> TaxonomyEntry {
+fn make_entry(
+    workspace_id: &str,
+    kind: &str,
+    id: &str,
+    version: i32,
+    current: bool,
+    prev: Option<i32>,
+) -> TaxonomyEntry {
     TaxonomyEntry {
         id: None,
+        workspace_id: workspace_id.to_string(),
         scope: "global".to_string(),
         kind: kind.to_string(),
         value: TaxonomyValue {
@@ -65,7 +73,14 @@ async fn publish_taxonomy_writes_audit_event_with_admin_identity() {
     let app = TestApp::start().await;
     let coll = app.state.db.collection_system_taxonomies();
 
-    let entry = make_entry("customer_stage", "orphan4_publish", 1, true, None);
+    let entry = make_entry(
+        &app.state.config.default_workspace_id,
+        "customer_stage",
+        "orphan4_publish",
+        1,
+        true,
+        None,
+    );
     let inserted = coll.insert_one(&entry, None).await.expect("insert");
     let oid = inserted.inserted_id.as_object_id().expect("oid");
 
@@ -110,7 +125,14 @@ async fn rollout_taxonomy_writes_audit_event() {
     let app = TestApp::start().await;
     let coll = app.state.db.collection_system_taxonomies();
 
-    let entry = make_entry("intent_level", "orphan4_rollout", 3, false, Some(2));
+    let entry = make_entry(
+        &app.state.config.default_workspace_id,
+        "intent_level",
+        "orphan4_rollout",
+        3,
+        false,
+        Some(2),
+    );
     let inserted = coll.insert_one(&entry, None).await.expect("insert");
     let oid = inserted.inserted_id.as_object_id().expect("oid");
 
@@ -147,9 +169,23 @@ async fn rollback_taxonomy_writes_audit_event_for_restored_version() {
     let coll = app.state.db.collection_system_taxonomies();
 
     // 种 v1（历史）+ v2（current，previous_version=1）
-    let v1 = make_entry("objection_type", "orphan4_rollback", 1, false, None);
+    let v1 = make_entry(
+        &app.state.config.default_workspace_id,
+        "objection_type",
+        "orphan4_rollback",
+        1,
+        false,
+        None,
+    );
     coll.insert_one(&v1, None).await.expect("insert v1");
-    let v2 = make_entry("objection_type", "orphan4_rollback", 2, true, Some(1));
+    let v2 = make_entry(
+        &app.state.config.default_workspace_id,
+        "objection_type",
+        "orphan4_rollback",
+        2,
+        true,
+        Some(1),
+    );
     let inserted = coll.insert_one(&v2, None).await.expect("insert v2");
     let v2_oid = inserted.inserted_id.as_object_id().expect("oid");
 

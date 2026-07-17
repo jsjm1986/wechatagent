@@ -15,7 +15,12 @@
 
 mod common;
 
+use std::collections::HashSet;
+use std::sync::Arc;
+
 use mongodb::bson::{doc, oid::ObjectId, DateTime as BsonDt};
+use tokio::sync::Barrier;
+use wechatagent::error::AppError;
 use wechatagent::knowledge_wiki::chunk_revisions::{
     apply_chunk_revision, ProvenanceSource, RevisionOp, RevisionRequest,
 };
@@ -213,5 +218,113 @@ async fn apply_chunk_revision_ai_patch_unions_product_tags_and_forces_draft() {
         stored.status, "draft",
         "source=Ai 写入必须把 status 强制打回 draft,实得 {:?}",
         stored.status
+    );
+}
+
+/// S-08 regression: concurrent full-document replacements must not silently
+/// overwrite a successful patch. Contenders that read a stale updated_at token
+/// return Conflict, and their provisional revision rows are removed.
+#[tokio::test]
+#[ignore]
+async fn concurrent_chunk_patches_conflict_without_lost_update_or_orphan_revision() {
+    const CONTENDERS: usize = 16;
+
+    let app = TestApp::start().await;
+    let ws = app.state.config.default_workspace_id.clone();
+    let chunk_oid = ObjectId::new();
+    let seeded = OperationKnowledgeChunk {
+        id: Some(chunk_oid),
+        workspace_id: ws.clone(),
+        domain: "user_operations".to_string(),
+        title: "concurrent patch target".to_string(),
+        summary: Some("baseline summary".to_string()),
+        body: Some(
+            "This body remains unchanged and is deliberately long enough that summary edits do not trigger the truncation guard."
+                .to_string(),
+        ),
+        status: "active".to_string(),
+        priority: 0,
+        created_at: BsonDt::now(),
+        updated_at: BsonDt::now(),
+        ..Default::default()
+    };
+    app.state
+        .db
+        .operation_knowledge_chunks()
+        .insert_one(&seeded, None)
+        .await
+        .expect("insert concurrent patch target");
+
+    let barrier = Arc::new(Barrier::new(CONTENDERS));
+    let mut handles = Vec::with_capacity(CONTENDERS);
+    for index in 0..CONTENDERS {
+        let db = app.state.db.clone();
+        let ws = ws.clone();
+        let barrier = barrier.clone();
+        handles.push(tokio::spawn(async move {
+            let summary = format!("contender-{index}");
+            barrier.wait().await;
+            let result = apply_chunk_revision(
+                &db,
+                &ws,
+                chunk_oid,
+                RevisionRequest {
+                    op: RevisionOp::Patch,
+                    source: ProvenanceSource::Human,
+                    patch: doc! { "summary": &summary },
+                    reason: Some("test: concurrent CAS".to_string()),
+                    actor: Some(format!("admin-{index}")),
+                },
+            )
+            .await;
+            (summary, result)
+        }));
+    }
+
+    let mut successful_summaries = HashSet::new();
+    let mut conflicts = 0usize;
+    for handle in handles {
+        let (summary, result) = handle.await.expect("contender task should not panic");
+        match result {
+            Ok(applied) => {
+                assert!(!applied.unchanged, "each unique summary must change the chunk");
+                successful_summaries.insert(summary);
+            }
+            Err(AppError::Conflict(code)) => {
+                assert_eq!(code, "chunk_revision_conflict");
+                conflicts += 1;
+            }
+            Err(other) => panic!("unexpected concurrent patch error: {other:?}"),
+        }
+    }
+
+    assert!(!successful_summaries.is_empty(), "at least one patch must succeed");
+    assert!(conflicts > 0, "simultaneous contenders must expose stale-write conflicts");
+
+    let stored = app
+        .state
+        .db
+        .operation_knowledge_chunks()
+        .find_one(doc! { "_id": chunk_oid, "workspace_id": &ws }, None)
+        .await
+        .expect("reload concurrent patch target")
+        .expect("concurrent patch target should exist");
+    let stored_summary = stored.summary.expect("winner summary should be stored");
+    assert!(
+        successful_summaries.contains(&stored_summary),
+        "final content must come from a successful writer, got {stored_summary:?}"
+    );
+
+    let revision_count = app
+        .state
+        .db
+        .chunk_revisions()
+        .count_documents(doc! { "chunk_id": chunk_oid.to_hex() }, None)
+        .await
+        .expect("count concurrent revisions");
+    assert_eq!(
+        revision_count,
+        successful_summaries.len() as u64,
+        "conflicted writes must not leave orphan revision rows"
     );
 }

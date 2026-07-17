@@ -746,6 +746,7 @@ pub(crate) async fn push_intent_trajectory_entry(
         let Some(raw) = raw else { continue };
         let verdict = crate::agent::dimension_registry::validate_dimension_value(
             &state.db,
+            &contact.workspace_id,
             &dim.kind,
             &raw,
             &contact.account_id,
