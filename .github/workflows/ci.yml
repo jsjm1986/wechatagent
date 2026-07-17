@@ -189,6 +189,10 @@ jobs:
       - name: cargo test --no-fail-fast -- --ignored (testcontainers MongoDB)
         env:
           RUSTFLAGS: ""
+          # 与生产 systemd(RUST_MIN_STACK=8388608)对齐。集成测试在 2MB 默认子线程栈
+          # 上跑,深 async 栈帧(如 gateway relay 路径)会栈溢出 SIGABRT(无 panic 文本);
+          # 生产早已设 8MB,CI 此前缺失是配置缺口。
+          RUST_MIN_STACK: "8388608"
         # --no-fail-fast：跑完所有 test 二进制再汇总，不在第一个失败的二进制处
         # abort（cargo 默认 fail-fast 会 exit 101 后跳过剩余 ~96 个测试，拿不到
         # 真实绿/红分布）。本 job continue-on-error，失败不阻塞合并。
