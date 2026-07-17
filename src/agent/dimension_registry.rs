@@ -159,17 +159,26 @@ fn match_to_dict(m: crate::agent::taxonomy::TaxonomyMatch) -> DictLookup {
 /// 该 kind 字典整个为空 → KindUnconfigured（未配置，回退信任）；有条目仅此值越界 → Miss。
 async fn lookup_dict(
     db: &crate::db::Database,
+    workspace_id: &str,
     kind: &str,
     trimmed: &str,
     scope_account_id: &str,
 ) -> DictLookup {
     use crate::agent::taxonomy::{check_value, global_taxonomy_cache, kind_has_entries};
     let cache = global_taxonomy_cache();
-    cache.find_or_load(db).await;
-    match match_to_dict(check_value(kind, trimmed, scope_account_id, &cache)) {
+    cache.find_or_load(db, workspace_id).await;
+    match match_to_dict(check_value(
+        workspace_id,
+        kind,
+        trimmed,
+        scope_account_id,
+        &cache,
+    )) {
         // check_value 对「字典空」与「值越界」都回 CandidateNew→Miss，这里用 kind_has_entries
         // 细分：该 kind 无任何条目 → KindUnconfigured（未配置）。同一 cache，无中途 reload。
-        DictLookup::Miss if !kind_has_entries(kind, scope_account_id, &cache) => {
+        DictLookup::Miss
+            if !kind_has_entries(workspace_id, kind, scope_account_id, &cache) =>
+        {
             DictLookup::KindUnconfigured
         }
         other => other,
@@ -179,6 +188,7 @@ async fn lookup_dict(
 /// DB 薄壳：查 registry + 字典，委托 classify_validation。未知 kind → 直通信任。
 pub(crate) async fn validate_dimension_value(
     db: &crate::db::Database,
+    workspace_id: &str,
     kind: &str,
     raw: &str,
     scope_account_id: &str,
@@ -194,7 +204,7 @@ pub(crate) async fn validate_dimension_value(
     }
     // 非 Taxonomy 源不查字典（Miss 占位，CodeEnum/FreeText 分支不看 dict）。
     let dict = if matches!(spec.value_source, ValueSource::Taxonomy) {
-        lookup_dict(db, kind, raw.trim(), scope_account_id).await
+        lookup_dict(db, workspace_id, kind, raw.trim(), scope_account_id).await
     } else {
         DictLookup::Miss
     };
@@ -226,6 +236,7 @@ pub(crate) fn fold_stage_validations(
 /// 聚合逻辑委托纯内核 fold_stage_validations（可单测）；本函数只做 DB 查询。
 pub async fn normalize_target_stages(
     db: &crate::db::Database,
+    workspace_id: &str,
     scope_account_id: &str,
     raw_stages: &[String],
 ) -> Result<Vec<String>, String> {
@@ -234,6 +245,7 @@ pub async fn normalize_target_stages(
         results.push(
             validate_dimension_value(
                 db,
+                workspace_id,
                 "customer_stage",
                 stage,
                 scope_account_id,

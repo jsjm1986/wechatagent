@@ -31,10 +31,29 @@ use std::sync::Arc;
 
 use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
 use serde_json::json;
-use wechatagent::agent::{handle_managed_message, handle_managed_message_aggregated};
+use wechatagent::agent::{
+    atomic_claim_pending, handle_managed_message, handle_managed_message_aggregated, process_entry,
+    record_user_reaction,
+};
 use wechatagent::models::{
     AgentStatus, Contact, ConversationMessage, MessageDirection, OperationKnowledgeChunk,
 };
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+async fn start_delivery_mock() -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": { "structuredContent": { "newMsgId": "full_flow_delivery", "content": [] } }
+        })))
+        .mount(&server)
+        .await;
+    server
+}
 
 // ── 公共 fixture builder ──────────────────────────────────────────────────
 
@@ -858,5 +877,255 @@ async fn full_flow_b3_barge_in_then_recompute_sends_once() {
     assert!(
         after_second.last_agent_run_at.is_some(),
         "重算落地后应推进 last_agent_run_at"
+    );
+}
+
+/// pending outbox 尚未真实送达时，review 不得进入 reaction 学习通道。
+#[tokio::test]
+#[ignore]
+async fn pending_delivery_is_not_learned_as_user_reaction() {
+    let app = common::TestApp::start().await;
+    let contact = make_managed_contact("ff_audit_pending_reaction");
+    app.state
+        .db
+        .contacts()
+        .insert_one(&contact, None)
+        .await
+        .expect("insert managed contact");
+
+    let first = make_inbound(
+        &contact,
+        "ff_audit_pending_reaction_1",
+        "我们准备推进试点，你先说说下一步。",
+    );
+    app.state
+        .db
+        .messages()
+        .insert_one(&first, None)
+        .await
+        .expect("insert first inbound");
+    app.llm.push_response(reply_agent_decision_json(
+        "可以，先把试点范围收敛到一个核心场景，我按这个方向继续梳理。",
+        "客户明确要推进试点，应承接下一步。",
+        "not_required",
+    ));
+    app.llm.push_response(review_agent_pass_json(
+        false,
+        "",
+        "回复承接需求且无越界承诺，可以放行。",
+    ));
+    handle_managed_message(&app.state, contact.clone(), &first)
+        .await
+        .expect("first gateway run");
+
+    let review = app
+        .state
+        .db
+        .decision_reviews()
+        .find_one(doc! { "contact_wxid": &contact.wxid }, None)
+        .await
+        .expect("query review")
+        .expect("review exists");
+    let review_id = review.id.expect("review id");
+    let outbox = app
+        .state
+        .db
+        .collection_agent_send_outbox()
+        .find_one(doc! { "decision_id": review_id }, None)
+        .await
+        .expect("query outbox")
+        .expect("outbox exists");
+    assert_eq!(outbox.status, "pending");
+    assert!(outbox.sent_at.is_none());
+    assert_eq!(
+        review.status, "outbox_enqueued",
+        "真实投递前 review 只能表示已入队"
+    );
+
+    let second = make_inbound(&contact, "ff_audit_pending_reaction_2", "好的，我再看看。");
+    app.state
+        .db
+        .messages()
+        .insert_one(&second, None)
+        .await
+        .expect("insert second inbound");
+    app.llm.push_response(json!({
+        "outcomeStatus": "user_replied_positive",
+        "confidence": 8,
+        "summary": "客户表示会继续查看"
+    }));
+    let calls_before = app.llm.calls();
+    record_user_reaction(&app.state, &contact, &second)
+        .await
+        .expect("record reaction");
+    assert_eq!(
+        app.llm.calls() - calls_before,
+        0,
+        "pending review 不得触发 reaction LLM"
+    );
+
+    let reacted = app
+        .state
+        .db
+        .decision_reviews()
+        .find_one(doc! { "_id": review_id }, None)
+        .await
+        .expect("reload review")
+        .expect("review exists");
+    // review 创建即置 outcome_status="pending"(gateway.rs:5199,待反应分析占位)。
+    // 未送达不得被 reaction 学成实际反应标签 = 该字段必须仍停在 "pending",
+    // 而非被改成 user_replied_* 等真实反应结果。
+    assert_eq!(
+        reacted.outcome_status.as_deref(),
+        Some("pending"),
+        "未送达回复不得被学成反应标签(应停在 pending 占位)"
+    );
+    let still_pending = app
+        .state
+        .db
+        .collection_agent_send_outbox()
+        .find_one(doc! { "_id": outbox.id.expect("outbox id") }, None)
+        .await
+        .expect("reload outbox")
+        .expect("outbox exists");
+    assert_eq!(still_pending.status, "pending");
+    assert!(still_pending.sent_at.is_none());
+}
+
+/// 承诺与 follow-up 只能在 dispatcher 确认真实送达后提交。
+#[tokio::test]
+#[ignore]
+async fn delivery_commits_promise_and_follow_up_only_after_sent() {
+    let app = common::TestApp::start().await;
+    let contact = make_managed_contact("ff_audit_pending_commitment");
+    app.state
+        .db
+        .contacts()
+        .insert_one(&contact, None)
+        .await
+        .expect("insert managed contact");
+    let inbound = make_inbound(
+        &contact,
+        "ff_audit_pending_commitment_1",
+        "试点资料你什么时候能整理好？",
+    );
+    app.state
+        .db
+        .messages()
+        .insert_one(&inbound, None)
+        .await
+        .expect("insert inbound");
+
+    let mut decision = reply_agent_decision_json(
+        "我明天把试点清单整理好，再和你确认范围。",
+        "客户询问明确交付时间，应给出下一步安排。",
+        "not_required",
+    );
+    decision["lastCommitment"] = json!("明天整理并发送试点清单");
+    decision["commitment"] = json!({
+        "text": "明天整理并发送试点清单",
+        "dueAt": "2099-01-01T09:00:00+08:00"
+    });
+    decision["followUp"] = json!({
+        "needed": true,
+        "runAt": "2099-01-02T09:00:00+08:00",
+        "content": "确认试点清单是否收到，并继续收敛试点范围"
+    });
+    app.llm.push_response(decision);
+    app.llm.push_response(review_agent_pass_json(
+        false,
+        "",
+        "回复给出后续动作，未涉及产品效果承诺，可以放行。",
+    ));
+    handle_managed_message(&app.state, contact.clone(), &inbound)
+        .await
+        .expect("gateway run");
+
+    let outbox = app
+        .state
+        .db
+        .collection_agent_send_outbox()
+        .find_one(doc! { "contact_wxid": &contact.wxid }, None)
+        .await
+        .expect("query outbox")
+        .expect("outbox exists");
+    assert_eq!(outbox.status, "pending");
+    assert!(outbox.sent_at.is_none());
+
+    let reloaded = app
+        .state
+        .db
+        .contacts()
+        .find_one(doc! { "wxid": &contact.wxid }, None)
+        .await
+        .expect("reload contact")
+        .expect("contact exists");
+    assert!(
+        reloaded.commitments.is_empty(),
+        "pending 阶段不得提交 commitment"
+    );
+    let pending_follow_up_count = app
+        .state
+        .db
+        .tasks()
+        .count_documents(
+            doc! {
+                "contact_wxid": &contact.wxid,
+                "kind": "follow_up",
+                "status": "pending",
+            },
+            None,
+        )
+        .await
+        .expect("count follow-up tasks");
+    assert_eq!(pending_follow_up_count, 0, "pending 阶段不得创建 follow-up");
+
+    let review_id = outbox.decision_id.expect("decision id");
+    let mcp = start_delivery_mock().await;
+    let state = common::rebuild_app_state_with_mcp_url(&app, mcp.uri());
+    let claimed = atomic_claim_pending(&state, "full-flow-delivery", 60)
+        .await
+        .expect("claim pending outbox")
+        .expect("outbox claimed");
+    process_entry(&state, &claimed)
+        .await
+        .expect("dispatch delivery");
+
+    let delivered_review = state
+        .db
+        .decision_reviews()
+        .find_one(doc! { "_id": review_id }, None)
+        .await
+        .expect("reload review")
+        .expect("review exists");
+    assert_eq!(delivered_review.status, "sent");
+    let delivered_contact = state
+        .db
+        .contacts()
+        .find_one(doc! { "wxid": &contact.wxid }, None)
+        .await
+        .expect("reload delivered contact")
+        .expect("contact exists");
+    assert!(delivered_contact
+        .commitments
+        .iter()
+        .any(|item| item.text() == "明天整理并发送试点清单"));
+    let delivered_follow_ups = state
+        .db
+        .tasks()
+        .count_documents(
+            doc! {
+                "contact_wxid": &contact.wxid,
+                "kind": "follow_up",
+                "status": "pending",
+                "source_decision_id": review_id,
+            },
+            None,
+        )
+        .await
+        .expect("count delivered follow-up tasks");
+    assert_eq!(
+        delivered_follow_ups, 1,
+        "送达后应创建且只创建一条 follow-up"
     );
 }

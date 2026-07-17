@@ -17,7 +17,10 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use mongodb::bson::{doc, DateTime};
+use mongodb::{
+    bson::{doc, DateTime},
+    options::UpdateOptions,
+};
 
 use crate::error::AppResult;
 use crate::models::MigrationRecord;
@@ -76,6 +79,64 @@ pub mod m030_backfill_outcome_event_defaults;
 /// escalation 行，再**直接调用** `m031::run_step` 验回填语义（同 m018/m029/m030 先例：
 /// 为集成测暴露而用 `pub mod`）。
 pub mod m031_backfill_escalation_last_pushed_at;
+pub mod m032_backfill_taxonomy_workspace;
+
+/// Seed the built-in taxonomy template into one workspace without overwriting
+/// any operator-owned row. This is used lazily when an existing/new workspace
+/// is first accessed; migrations only seed DEFAULT_WORKSPACE_ID and therefore
+/// cannot cover workspaces added after process startup.
+pub(crate) async fn ensure_builtin_taxonomies_for_workspace(
+    db: &Database,
+    workspace_id: &str,
+) -> AppResult<bool> {
+    let marker_id = format!("workspace_taxonomy_template_v1:{workspace_id}");
+    let markers = db.raw().collection::<mongodb::bson::Document>("migrations");
+    if markers.find_one(doc! { "_id": &marker_id }, None).await?.is_some() {
+        return Ok(false);
+    }
+
+    let now = DateTime::now();
+    let mut entries = m006_taxonomy_seed::default_taxonomy_seed_entries(now);
+    entries.extend(m020_seed_purchase_lifecycle::purchase_lifecycle_seed_entries(now));
+    entries.extend(m021_seed_churn_reason::churn_reason_seed_entries(now));
+    entries.extend(m023_seed_value_tier::value_tier_seed_entries(now));
+    entries.extend(m024_seed_relationship_type::relationship_type_seed_entries(now));
+    entries.extend(m028_seed_conversation_mode::conversation_mode_seed_entries(now));
+
+    let collection = db.collection_system_taxonomies();
+    let mut inserted = false;
+    for mut entry in entries {
+        entry.workspace_id = workspace_id.to_string();
+        entry.seeded_by = Some("workspace_template".to_string());
+        let filter = doc! {
+            "workspace_id": workspace_id,
+            "scope": &entry.scope,
+            "kind": &entry.kind,
+            "value.id": &entry.value.id,
+        };
+        let mut insert_doc = mongodb::bson::to_document(&entry)?;
+        insert_doc.remove("_id");
+        let result = collection
+            .update_one(
+                filter,
+                doc! { "$setOnInsert": insert_doc },
+                UpdateOptions::builder().upsert(true).build(),
+            )
+            .await?;
+        inserted |= result.upserted_id.is_some();
+    }
+    // Write the durable marker last. If the process stops while seeding, the
+    // next access safely retries the idempotent upserts. Once present, an
+    // operator can delete a template value without a later restart reviving it.
+    markers
+        .update_one(
+            doc! { "_id": &marker_id },
+            doc! { "$setOnInsert": { "applied_at": DateTime::now() } },
+            UpdateOptions::builder().upsert(true).build(),
+        )
+        .await?;
+    Ok(inserted)
+}
 
 type MigrationFuture<'a> = Pin<Box<dyn Future<Output = AppResult<()>> + Send + 'a>>;
 pub type MigrationFn = for<'a> fn(&'a Database) -> MigrationFuture<'a>;
@@ -211,6 +272,10 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration {
         id: "2026_07_031_backfill_escalation_last_pushed_at",
         run: |db| Box::pin(m031_backfill_escalation_last_pushed_at::run_step(db)),
+    },
+    Migration {
+        id: "2026_07_032_backfill_taxonomy_workspace",
+        run: |db| Box::pin(m032_backfill_taxonomy_workspace::run_step(db)),
     },
 ];
 

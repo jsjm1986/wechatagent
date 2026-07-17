@@ -10,6 +10,9 @@ use serde_json::{json, Value};
 
 use crate::auth::AuthenticatedAdmin;
 use crate::error::{AppError, AppResult};
+use crate::knowledge_wiki::chunk_revisions::{
+    chunk_replace_filter, monotonic_chunk_updated_at,
+};
 use crate::knowledge_wiki::page_merge::{
     compute_chunk_hash, effective_locked_fields, enforce_locked_fields,
 };
@@ -281,24 +284,28 @@ pub async fn update_operation_knowledge_chunk(
     let effective_locked_owned = effective_locked_fields(&existing_doc);
     let effective_locked: Vec<&str> =
         effective_locked_owned.iter().map(|s| s.as_str()).collect();
-    let enforced_doc = enforce_locked_fields(&next_doc, &existing_doc, &effective_locked);
+    let mut enforced_doc = enforce_locked_fields(&next_doc, &existing_doc, &effective_locked);
+    enforced_doc.insert(
+        "updated_at",
+        monotonic_chunk_updated_at(existing.updated_at, mongodb::bson::DateTime::now()),
+    );
     let before_hash = compute_chunk_hash(&existing_doc);
     let after_hash = compute_chunk_hash(&enforced_doc);
     let enforced: OperationKnowledgeChunk = mongodb::bson::from_document(enforced_doc)
         .map_err(|e| AppError::External(format!("deserialize enforced chunk failed: {e}")))?;
 
-    state
+    let replace_result = state
         .db
         .operation_knowledge_chunks()
         .replace_one(
-            doc! {
-                "_id": object_id,
-                "workspace_id": &admin.current_workspace
-            },
+            chunk_replace_filter(object_id, &admin.current_workspace, existing.updated_at),
             enforced,
             None,
         )
         .await?;
+    if replace_result.matched_count == 0 {
+        return Err(AppError::Conflict("chunk_revision_conflict".to_string()));
+    }
 
     // KB-10：replace 成功后补写一条 chunk_revisions 审计行，补齐 admin 直接编辑的修订链。
     // patch 留空 doc!{}（整条替换、非增量，语义诚实）；before/after hash 标识本次编辑改了什么。

@@ -199,7 +199,11 @@ pub async fn judge_trajectory(
                 .unwrap_or("")
                 .to_string();
             let ok = !scores.is_empty();
-            TrajectoryVerdict { scores, verdict, ok }
+            TrajectoryVerdict {
+                scores,
+                verdict,
+                ok,
+            }
         }
         Err(e) => TrajectoryVerdict {
             scores: std::collections::HashMap::new(),
@@ -241,7 +245,10 @@ mod tests {
         assert_eq!(fam.len(), 3);
         // 两两不同。
         assert_ne!(fam[0], fam[1], "agent vs roleplayer 应异族");
-        assert_ne!(fam[0], fam[2], "agent vs judge 应异族（同 host 不同 vendor）");
+        assert_ne!(
+            fam[0], fam[2],
+            "agent vs judge 应异族（同 host 不同 vendor）"
+        );
         assert_ne!(fam[1], fam[2], "roleplayer vs judge 应异族");
     }
 

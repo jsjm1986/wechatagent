@@ -31,6 +31,30 @@ use crate::knowledge_wiki::page_merge::{
 };
 use crate::models::{CatalogRebuildJob, ChunkRevision};
 
+pub(crate) fn chunk_replace_filter(
+    chunk_object_id: ObjectId,
+    workspace_id: &str,
+    expected_updated_at: DateTime,
+) -> Document {
+    doc! {
+        "_id": chunk_object_id,
+        "workspace_id": workspace_id,
+        "updated_at": expected_updated_at,
+    }
+}
+
+/// MongoDB DateTime has millisecond precision. Keep the CAS token strictly newer.
+pub(crate) fn monotonic_chunk_updated_at(
+    expected_updated_at: DateTime,
+    candidate: DateTime,
+) -> DateTime {
+    DateTime::from_millis(
+        candidate
+            .timestamp_millis()
+            .max(expected_updated_at.timestamp_millis().saturating_add(1)),
+    )
+}
+
 // ── 操作语义封闭枚举 ───────────────────────────────────────────────────
 
 /// `chunk_revisions.op` 合法值（design.md §9 / CLAUDE.md）。
@@ -234,8 +258,6 @@ pub async fn apply_chunk_revision(
         }
         _ => {}
     }
-    merged.insert("updated_at", DateTime::now());
-
     // 5) provenance 标注（每次写入都覆盖 edited_at / source / edited_by）
     let provenance = doc! {
         "source": req.source.as_str(),
@@ -273,6 +295,11 @@ pub async fn apply_chunk_revision(
         }
     }
 
+    merged.insert(
+        "updated_at",
+        monotonic_chunk_updated_at(existing_doc.updated_at, DateTime::now()),
+    );
+
     let after_hash = compute_chunk_hash(&merged);
     let unchanged = before_hash == after_hash;
 
@@ -297,15 +324,32 @@ pub async fn apply_chunk_revision(
         let merged_typed: crate::models::OperationKnowledgeChunk =
             mongodb::bson::from_document(merged.clone())
                 .map_err(|e| AppError::External(format!("deserialize merged chunk failed: {e}")))?;
-        coll.replace_one(
-            doc! {
-                "_id": chunk_object_id,
-                "workspace_id": workspace_id,
-            },
+        let replace_result = coll.replace_one(
+            chunk_replace_filter(chunk_object_id, workspace_id, existing_doc.updated_at),
             merged_typed,
             None,
         )
         .await?;
+        if replace_result.matched_count == 0 {
+            if let Err(err) = db
+                .chunk_revisions()
+                .delete_one(
+                    doc! {
+                        "revision_id": &revision_id,
+                        "chunk_id": &chunk_id_hex,
+                    },
+                    None,
+                )
+                .await
+            {
+                tracing::warn!(
+                    revision_id = %revision_id,
+                    error = %err,
+                    "delete conflicted chunk revision failed"
+                );
+            }
+            return Err(AppError::Conflict("chunk_revision_conflict".to_string()));
+        }
 
         // 8) enqueue catalog rebuild（best-effort）
         if let Some(doc_id) = existing_doc.document_id {
@@ -455,6 +499,43 @@ pub async fn cleanup_dangling_refs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunk_replace_filter_carries_expected_updated_at() {
+        let chunk_id = ObjectId::new();
+        let expected = DateTime::from_millis(1_700_000_000_123);
+        let filter = chunk_replace_filter(chunk_id, "ws_a", expected);
+
+        assert_eq!(filter.get_object_id("_id").unwrap(), chunk_id);
+        assert_eq!(filter.get_str("workspace_id").unwrap(), "ws_a");
+        assert_eq!(filter.get_datetime("updated_at").unwrap(), &expected);
+    }
+
+    #[test]
+    fn chunk_updated_at_is_strictly_monotonic_with_millisecond_precision() {
+        let expected = DateTime::from_millis(1_700_000_000_123);
+
+        assert_eq!(
+            monotonic_chunk_updated_at(expected, expected).timestamp_millis(),
+            expected.timestamp_millis() + 1
+        );
+        assert_eq!(
+            monotonic_chunk_updated_at(
+                expected,
+                DateTime::from_millis(expected.timestamp_millis() - 10),
+            )
+            .timestamp_millis(),
+            expected.timestamp_millis() + 1
+        );
+        assert_eq!(
+            monotonic_chunk_updated_at(
+                expected,
+                DateTime::from_millis(expected.timestamp_millis() + 10),
+            )
+            .timestamp_millis(),
+            expected.timestamp_millis() + 10
+        );
+    }
 
     #[test]
     fn normalize_strips_ext_path_and_punctuation() {

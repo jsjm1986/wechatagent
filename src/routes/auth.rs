@@ -69,6 +69,11 @@ pub(super) async fn login(
     )
     .await
     .map_err(map_auth_error)?;
+    let current_workspace = session
+        .current_workspace
+        .clone()
+        .unwrap_or_else(|| state.config.default_workspace_id.clone());
+    crate::agent::ensure_workspace_taxonomies(&state.db, &current_workspace).await?;
     let cookie = build_session_cookie(
         session.session_id.clone(),
         ttl_hours,
@@ -78,9 +83,7 @@ pub(super) async fn login(
     let body = LoginResponse {
         username: session.username.clone(),
         expires_at: session.expires_at.to_rfc3339(),
-        current_workspace: session
-            .current_workspace
-            .unwrap_or_else(|| state.config.default_workspace_id.clone()),
+        current_workspace,
     };
     Ok((jar, Json(body)))
 }
@@ -145,6 +148,7 @@ pub async fn switch_workspace(
     if !is_workspace_authorized(target, &user.workspaces, &state.config.default_workspace_id) {
         return Err(AppError::BadRequest("workspace_not_in_user_acl".into()));
     }
+    crate::agent::ensure_workspace_taxonomies(&state.db, target).await?;
     let session_id = jar
         .get(SESSION_COOKIE_NAME)
         .map(|c| c.value().to_string())

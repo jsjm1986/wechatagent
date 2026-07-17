@@ -115,6 +115,7 @@ fn sent_review(workspace: &str, account: &str, wxid: &str) -> AgentDecisionRevie
         reaction_analysis: Document::new(),
         reaction_claimed_at: None,
         reviewer_misjudge_signal: None,
+        expected_text_segments: 0,
         // 关键：claim filter 要求 status="sent"。
         status: "sent".to_string(),
         created_at: DateTime::now(),

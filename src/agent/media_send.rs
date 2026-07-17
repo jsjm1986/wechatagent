@@ -56,7 +56,11 @@ pub(crate) fn render_candidate_lines(candidates: &[&ContentAsset]) -> String {
     let mut out = String::from("可发送素材（按需选择，没有合适的就不发）：\n");
     for a in candidates {
         let id = a.id.map(|i| i.to_hex()).unwrap_or_default();
-        let stages = a.target_stages.as_ref().map(|v| v.join(",")).unwrap_or_default();
+        let stages = a
+            .target_stages
+            .as_ref()
+            .map(|v| v.join(","))
+            .unwrap_or_default();
         let pref = a.expression_pref.as_deref().unwrap_or("file_support");
         let hint = a.send_trigger_hint.as_deref().unwrap_or("");
         // tags 非空才渲染标签段（旧素材 tags 空则跳过，向后兼容）。
@@ -116,8 +120,11 @@ pub(crate) fn media_id_cache_valid(updated_at: DateTime, ttl_hours: i64, now: Da
 }
 
 /// 媒体发送工具集——崩溃恢复核对时用来圈定"这条记录是一次素材发送"。
-const MEDIA_SEND_TOOLS: [&str; 3] =
-    ["message_send_image", "message_send_file", "message_send_video"];
+const MEDIA_SEND_TOOLS: [&str; 3] = [
+    "message_send_image",
+    "message_send_file",
+    "message_send_video",
+];
 
 /// 确保 asset 在 MCP 侧有有效 media_id：缓存命中（media_id 存在且未过 TTL）直接用，
 /// 否则读盘 base64 → `media_upload_base64` → 回写 media_id + updated_at。
@@ -178,7 +185,9 @@ async fn ensure_media_uploaded(state: &AppState, asset: &ContentAsset) -> AppRes
             )
             .await
             .map_err(|e| {
-                AppError::External(format!("persist media_id failed (abort send to avoid dup): {e}"))
+                AppError::External(format!(
+                    "persist media_id failed (abort send to avoid dup): {e}"
+                ))
             })?;
     }
     Ok(media_id)
@@ -192,13 +201,16 @@ pub(crate) async fn send_outbound_media(
     contact: &crate::models::Contact,
     asset_id: &str,
 ) -> AppResult<Value> {
-    let oid = ObjectId::parse_str(asset_id)
-        .map_err(|_| AppError::External("bad asset_id".into()))?;
+    let oid =
+        ObjectId::parse_str(asset_id).map_err(|_| AppError::External("bad asset_id".into()))?;
     let asset = state
         .db
         .content_assets()
         // 纵深防御：按 _id + workspace_id 双条件查，杜绝跨租户 IDOR（asset_id 来自 outbox）。
-        .find_one(doc! { "_id": oid, "workspace_id": &contact.workspace_id }, None)
+        .find_one(
+            doc! { "_id": oid, "workspace_id": &contact.workspace_id },
+            None,
+        )
         .await?
         .ok_or_else(|| AppError::NotFound("asset not found".into()))?;
 
@@ -219,6 +231,12 @@ pub(crate) async fn send_outbound_media(
         json!({ "recipient": contact.wxid, "mediaId": media_id }),
     )
     .await?;
+
+    if !super::gateway::send_receipt_is_ok(&resp) {
+        return Err(AppError::External(
+            "media send returned a negative or unverifiable delivery receipt".into(),
+        ));
+    }
 
     // MCP 已成功 = 文件已送达客户，既成事实。此后落库失败**绝不**返 Err——
     // 否则 dispatcher 会 retry 重发，客户收到重复文件（与 send_outbound_message 对称）。
@@ -306,6 +324,13 @@ async fn mcp_media_already_succeeded(
                 "request.recipient": contact_wxid,
                 "request.mediaId": &media_id,
                 "error": null,
+                "$or": [
+                    { "response.ok": true },
+                    {
+                        "response.ok": { "$exists": false },
+                        "response.newMsgId": { "$type": "string", "$ne": "" },
+                    },
+                ],
                 "created_at": { "$gte": lower_bound },
             },
             None,
@@ -350,22 +375,39 @@ mod tests {
         assert!(!media_id_cache_valid(future, 24, now));
     }
 
-    fn asset(sendable: Option<bool>, review: Option<&str>, mt: Option<&str>, stages: Option<Vec<&str>>) -> ContentAsset {
+    fn asset(
+        sendable: Option<bool>,
+        review: Option<&str>,
+        mt: Option<&str>,
+        stages: Option<Vec<&str>>,
+    ) -> ContentAsset {
         ContentAsset {
-            id: None, workspace_id: "ws".into(), account_id: None,
-            kind: "media".into(), title: "报价单".into(), body: None, tags: vec![],
-            url: None, media_id: None, usage_scene: None,
+            id: None,
+            workspace_id: "ws".into(),
+            account_id: None,
+            kind: "media".into(),
+            title: "报价单".into(),
+            body: None,
+            tags: vec![],
+            url: None,
+            media_id: None,
+            usage_scene: None,
             media_type: mt.map(|s| s.to_string()),
-            file_path: Some("ws/ab/x.pdf".into()), file_name: Some("报价单.xlsx".into()),
-            file_size: Some(1), mime_type: Some("application/pdf".into()),
+            file_path: Some("ws/ab/x.pdf".into()),
+            file_name: Some("报价单.xlsx".into()),
+            file_size: Some(1),
+            mime_type: Some("application/pdf".into()),
             file_sha256: Some("ab".into()),
-            sendable, send_trigger_hint: Some("问价时发".into()),
+            sendable,
+            send_trigger_hint: Some("问价时发".into()),
             target_stages: stages.map(|v| v.into_iter().map(|s| s.to_string()).collect()),
             expression_pref: Some("file_primary".into()),
             requires_principal_approval: Some(false),
-            review_status: review.map(|s| s.to_string()), review_note: None,
+            review_status: review.map(|s| s.to_string()),
+            review_note: None,
             min_inject_tier: None,
-            created_at: DateTime::now(), updated_at: DateTime::now(),
+            created_at: DateTime::now(),
+            updated_at: DateTime::now(),
         }
     }
 
@@ -381,11 +423,11 @@ mod tests {
     #[test]
     fn filter_excludes_draft_and_non_sendable_and_no_media_type() {
         let all = vec![
-            asset(Some(true), Some("approved"), Some("file"), None),       // 保留
-            asset(Some(true), Some("draft"), Some("file"), None),          // 排除：未审
-            asset(Some(false), Some("approved"), Some("file"), None),      // 排除：不可发
-            asset(None, None, None, None),                                 // 排除：老朋友圈行
-            asset(Some(true), Some("approved"), None, None),               // 排除：无 media_type
+            asset(Some(true), Some("approved"), Some("file"), None), // 保留
+            asset(Some(true), Some("draft"), Some("file"), None),    // 排除：未审
+            asset(Some(false), Some("approved"), Some("file"), None), // 排除：不可发
+            asset(None, None, None, None),                           // 排除：老朋友圈行
+            asset(Some(true), Some("approved"), None, None),         // 排除：无 media_type
         ];
         let kept = filter_sendable_candidates(&all, None);
         assert_eq!(kept.len(), 1);
@@ -394,9 +436,19 @@ mod tests {
     #[test]
     fn filter_matches_stage_or_empty_stages() {
         let all = vec![
-            asset(Some(true), Some("approved"), Some("file"), Some(vec!["意向"])),    // 命中
-            asset(Some(true), Some("approved"), Some("file"), Some(vec!["已成交"])),  // 不命中
-            asset(Some(true), Some("approved"), Some("file"), None),                  // 空 stages 总命中
+            asset(
+                Some(true),
+                Some("approved"),
+                Some("file"),
+                Some(vec!["意向"]),
+            ), // 命中
+            asset(
+                Some(true),
+                Some("approved"),
+                Some("file"),
+                Some(vec!["已成交"]),
+            ), // 不命中
+            asset(Some(true), Some("approved"), Some("file"), None), // 空 stages 总命中
         ];
         let kept = filter_sendable_candidates(&all, Some("意向"));
         assert_eq!(kept.len(), 2);
@@ -404,7 +456,12 @@ mod tests {
 
     #[test]
     fn render_lines_includes_id_stage_pref_hint() {
-        let a = asset(Some(true), Some("approved"), Some("file"), Some(vec!["意向"]));
+        let a = asset(
+            Some(true),
+            Some("approved"),
+            Some("file"),
+            Some(vec!["意向"]),
+        );
         let line = render_candidate_lines(&[&a]);
         assert!(line.contains("file_primary") || line.contains("文件为主"));
         assert!(line.contains("问价时发"));
@@ -432,7 +489,12 @@ mod tests {
     #[test]
     fn overview_lists_title_and_hint_but_not_id_or_metadata() {
         // 轻量概览只露标题 + 发送时机，绝不露 assetId / 阶段 / 表达偏好（那是 Full 档完整清单的事）。
-        let mut a = asset(Some(true), Some("approved"), Some("file"), Some(vec!["意向"]));
+        let mut a = asset(
+            Some(true),
+            Some("approved"),
+            Some("file"),
+            Some(vec!["意向"]),
+        );
         a.title = "报价单".to_string();
         let out = render_candidate_overview(&[&a]);
         assert!(out.contains("报价单"), "概览应含标题");
@@ -464,8 +526,13 @@ mod tests {
         a.title = "报价单".to_string();
         let out = render_candidate_overview(&[&a]);
         // 升档引导：语义描述"契合就判 need_more_context + missingTier=full"，不列触发词。
-        assert!(out.contains("need_more_context"), "概览应含升档引导关键判定");
-        assert!(out.contains("missingTier") || out.contains("full"),
-                "升档引导应指明升 full 档");
+        assert!(
+            out.contains("need_more_context"),
+            "概览应含升档引导关键判定"
+        );
+        assert!(
+            out.contains("missingTier") || out.contains("full"),
+            "升档引导应指明升 full 档"
+        );
     }
 }

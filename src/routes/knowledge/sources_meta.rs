@@ -883,6 +883,20 @@ pub struct IngestSourceUpdateRequest {
     pub status: Option<String>,
 }
 
+fn ingest_source_url_update(current_url: &str, requested_url: String) -> AppResult<Document> {
+    if requested_url.trim().is_empty() {
+        return Err(AppError::BadRequest("url cannot be empty".to_string()));
+    }
+
+    let url_changed = requested_url != current_url;
+    let mut update = doc! { "url": requested_url };
+    if url_changed {
+        update.insert("last_etag", Bson::Null);
+        update.insert("last_content_hash", Bson::Null);
+    }
+    Ok(update)
+}
+
 /// 把存储结构体 `IngestSource`（snake_case bson）投影成前端 `IngestSourceItem`
 /// 期望的 camelCase JSON。仿 `operation_knowledge_chunk_json`（mod.rs:283）——
 /// 存储层不加 rename_all（会破坏 worker 查询/索引/存量文档），只在 API 边界映射。
@@ -953,6 +967,7 @@ pub async fn create_ingest_source(
         label: payload.label,
         last_fetched_at: None,
         last_etag: None,
+        last_content_hash: None,
         last_error: None,
         status: "active".to_string(),
         failure_streak: 0,
@@ -977,10 +992,20 @@ pub async fn update_ingest_source(
 ) -> AppResult<Json<Value>> {
     let mut set_doc = doc! { "updated_at": DateTime::now() };
     if let Some(url) = payload.url {
-        if url.trim().is_empty() {
-            return Err(AppError::BadRequest("url cannot be empty".to_string()));
-        }
-        set_doc.insert("url", url);
+        let current = state
+            .db
+            .ingest_sources()
+            .find_one(
+                doc! {
+                    "source_id": &source_id,
+                    "workspace_id": &admin.current_workspace,
+                },
+                None,
+            )
+            .await
+            .map_err(AppError::from)?
+            .ok_or_else(|| AppError::NotFound("ingest source not found".to_string()))?;
+        set_doc.extend(ingest_source_url_update(&current.url, url)?);
     }
     if let Some(m) = payload.schedule_minutes {
         if m < 1 {
@@ -1062,6 +1087,7 @@ mod tests {
             label: Some("行业资讯源".to_string()),
             last_fetched_at: Some(DateTime::from_millis(1_700_000_000_000)),
             last_etag: Some("\"etag-xyz\"".to_string()),
+            last_content_hash: Some("sha256-content".to_string()),
             last_error: None,
             status: "active".to_string(),
             failure_streak: 2,
@@ -1118,5 +1144,30 @@ mod tests {
         // 删除/重新激活按 sourceId 定位。构造全量 source 固化契约。
         let projected = ingest_source_json(&sample_source());
         crate::routes::contract_snapshot::assert_contract_fixture("ingest_source", projected);
+    }
+
+    #[test]
+    fn changed_source_url_clears_content_checkpoints() {
+        let update = ingest_source_url_update(
+            "https://example.com/old",
+            "https://example.com/new".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(update.get_str("url").unwrap(), "https://example.com/new");
+        assert_eq!(update.get("last_etag"), Some(&Bson::Null));
+        assert_eq!(update.get("last_content_hash"), Some(&Bson::Null));
+    }
+
+    #[test]
+    fn unchanged_source_url_preserves_content_checkpoints() {
+        let update = ingest_source_url_update(
+            "https://example.com/feed",
+            "https://example.com/feed".to_string(),
+        )
+        .unwrap();
+
+        assert!(!update.contains_key("last_etag"));
+        assert!(!update.contains_key("last_content_hash"));
     }
 }

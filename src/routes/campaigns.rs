@@ -489,6 +489,11 @@ pub(super) fn classify_send_outcome(
     if matches!(outbox_status, Some("failed_terminal") | Some("canceled")) {
         return ("canceled", outbox_status.map(str::to_string));
     }
+    // 同一 run 部分送达、部分终态失败：不能归成 sent，也不能回落 run_status
+    // 误报 pending/escalated。现有 API 无 partial 桶，归 canceled 并保留明确原因。
+    if outbox_status == Some("partially_sent") {
+        return ("canceled", Some("partially_sent".to_string()));
+    }
     // ⑤ 进了发送队列、还没发出/发送中。
     if matches!(outbox_status, Some("pending") | Some("in_flight")) {
         return ("pending", None);
@@ -496,7 +501,10 @@ pub(super) fn classify_send_outcome(
     // ⑥ 按 run_log.status 归桶（GATEWAY_STATUS_VALUES 闭集逐值明确）。
     match run_status {
         // a. 放行/已入队/作息重排：会继续，视作在途。
-        Some("allowed" | "outbox_enqueued" | "quiet_hours_deferred") => ("pending", None),
+        Some("allowed" | "outbox_enqueuing" | "outbox_enqueued" | "quiet_hours_deferred") => {
+            ("pending", None)
+        }
+        Some("skipped_duplicate") => ("skipped", None),
         // b. 频控/硬约束/改写失败——没发出且无后续。gateway_blocked = 二次 precheck
         //    在 LLM 决策后命中（罕见：频控/状态在决策窗口内翻转），顶层 status 是泛标签
         //    （真实原因在 gateway_result 子文档），语义上确定是一次"被拦下没发出"。
@@ -988,6 +996,13 @@ mod tests {
         assert_eq!(
             classify_send_outcome("enqueued", Some(&run_log("allowed", Some("canceled")))),
             ("canceled", Some("canceled".to_string()))
+        );
+        assert_eq!(
+            classify_send_outcome(
+                "enqueued",
+                Some(&run_log("outbox_enqueued", Some("partially_sent")))
+            ),
+            ("canceled", Some("partially_sent".to_string()))
         );
         // ⑤ 在途（outbox pending / in_flight）
         assert_eq!(

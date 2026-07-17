@@ -287,6 +287,7 @@ pub(super) async fn ensure_operating_memory(
                     .unwrap_or_default();
                 memory.memory_card = seeded_with_version;
                 memory.memory_card_updated_at = Some(updated_at);
+                memory.updated_at = updated_at;
                 state
                     .db
                     .operating_memories()
@@ -637,6 +638,31 @@ pub async fn apply_contact_changes(
     contact: &Contact,
     changes: &Document,
 ) -> AppResult<Vec<SkippedField>> {
+    let (set_doc, skipped) = prepare_contact_changes(state, contact, changes).await?;
+    if set_doc.is_empty() {
+        return Ok(skipped);
+    }
+    state
+        .db
+        .contacts()
+        .update_one(
+            doc! {
+                "_id": contact.id,
+                "workspace_id": &contact.workspace_id,
+                "account_id": &contact.account_id,
+            },
+            doc! { "$set": set_doc },
+            None,
+        )
+        .await?;
+    Ok(skipped)
+}
+
+pub(super) async fn prepare_contact_changes(
+    state: &AppState,
+    contact: &Contact,
+    changes: &Document,
+) -> AppResult<(Document, Vec<SkippedField>)> {
     let mut set_doc = Document::new();
     let mut skipped: Vec<SkippedField> = Vec::new();
     if let Some(value) = doc_get_string(changes, "humanProfileNote") {
@@ -651,6 +677,7 @@ pub async fn apply_contact_changes(
         use crate::agent::dimension_registry::DimValidation::{Accept, DropSilently, Reject};
         let validated_stage = match agent::dimension_registry::validate_dimension_value(
             &state.db,
+            &contact.workspace_id,
             "customer_stage",
             &value,
             &contact.account_id,
@@ -671,6 +698,7 @@ pub async fn apply_contact_changes(
         let intent = match doc_get_string(changes, "intentLevel") {
             Some(v) => match agent::dimension_registry::validate_dimension_value(
                 &state.db,
+                &contact.workspace_id,
                 "intent_level",
                 &v,
                 &contact.account_id,
@@ -705,6 +733,7 @@ pub async fn apply_contact_changes(
         use crate::agent::dimension_registry::DimValidation::{Accept, DropSilently, Reject};
         let validated = match agent::dimension_registry::validate_dimension_value(
             &state.db,
+            &contact.workspace_id,
             "intent_level",
             &value,
             &contact.account_id,
@@ -765,41 +794,33 @@ pub async fn apply_contact_changes(
     if let Some(value) = doc_get_document(changes, "operationPolicy") {
         set_doc.insert("operation_policy", value.clone());
     }
-    if set_doc.is_empty() {
-        return Ok(skipped);
+    if !set_doc.is_empty() {
+        set_doc.insert("updated_at", DateTime::now());
     }
-    set_doc.insert("updated_at", DateTime::now());
-    state
-        .db
-        .contacts()
-        .update_one(doc! { "_id": contact.id }, doc! { "$set": set_doc }, None)
-        .await?;
-    Ok(skipped)
+    Ok((set_doc, skipped))
 }
 
-pub(super) async fn apply_memory_changes(
-    state: &AppState,
-    contact: &Contact,
+pub(super) fn prepare_memory_changes(
+    memory: &OperatingMemory,
     changes: &Document,
-) -> AppResult<()> {
+) -> Document {
     let Some(memory_patch) = doc_get_document(changes, "memory") else {
-        return Ok(());
+        return Document::new();
     };
-    let memory = ensure_operating_memory(state, contact).await?;
     let mut set_doc = Document::new();
     for (json_key, db_key, existing) in [
         (
             "userUnderstanding",
             "user_understanding",
-            memory.user_understanding,
+            memory.user_understanding.clone(),
         ),
         (
             "relationshipState",
             "relationship_state",
-            memory.relationship_state,
+            memory.relationship_state.clone(),
         ),
-        ("productFit", "product_fit", memory.product_fit),
-        ("nextAction", "next_action", memory.next_action),
+        ("productFit", "product_fit", memory.product_fit.clone()),
+        ("nextAction", "next_action", memory.next_action.clone()),
     ] {
         if let Some(patch) = doc_get_document(&memory_patch, json_key) {
             let mut merged = existing;
@@ -807,37 +828,18 @@ pub(super) async fn apply_memory_changes(
             set_doc.insert(db_key, merged);
         }
     }
-    if set_doc.is_empty() {
-        return Ok(());
+    if !set_doc.is_empty() {
+        set_doc.insert("updated_at", DateTime::now());
     }
-    set_doc.insert("updated_at", DateTime::now());
-    state
-        .db
-        .operating_memories()
-        .update_one(
-            doc! {
-                "workspace_id": &contact.workspace_id,
-                "account_id": &contact.account_id,
-                "contact_wxid": &contact.wxid
-            },
-            doc! { "$set": set_doc },
-            None,
-        )
-        .await?;
-    Ok(())
+    set_doc
 }
 
-pub(super) async fn apply_playbook_changes(
-    state: &AppState,
+pub(super) fn prepare_playbook_changes(
     contact: &Contact,
     changes: &Document,
-) -> AppResult<()> {
-    let Some(playbook_patch) = doc_get_document(changes, "playbookPatch") else {
-        return Ok(());
-    };
-    let Some(playbook_id) = contact.playbook_id else {
-        return Ok(());
-    };
+) -> Option<(mongodb::bson::oid::ObjectId, Document)> {
+    let playbook_patch = doc_get_document(changes, "playbookPatch")?;
+    let playbook_id = contact.playbook_id?;
     let mut set_doc = Document::new();
     for (json_key, db_key) in [
         ("replyStyle", "reply_style"),
@@ -850,59 +852,52 @@ pub(super) async fn apply_playbook_changes(
         }
     }
     if set_doc.is_empty() {
-        return Ok(());
+        return None;
     }
     set_doc.insert("created_by", "guide_optimized");
     set_doc.insert("updated_at", DateTime::now());
-    state
-        .db
-        .operation_playbooks()
-        .update_one(
-            doc! { "_id": playbook_id, "account_id": &contact.account_id },
-            doc! { "$set": set_doc, "$inc": { "version": 1 } },
-            None,
-        )
-        .await?;
-    Ok(())
+    Some((playbook_id, set_doc))
 }
 
-pub(super) async fn apply_domain_changes(
+pub(super) async fn prepare_domain_changes(
     state: &AppState,
     workspace_id: &str,
     changes: &Document,
-) -> AppResult<()> {
+) -> AppResult<Option<(mongodb::bson::oid::ObjectId, Document, DateTime)>> {
     let Some(runtime_patch) = doc_get_document(changes, "domainRuntimeParameters") else {
-        return Ok(());
+        return Ok(None);
     };
     if runtime_patch.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     let Some(config) = state
         .db
         .operation_domain_configs()
         .find_one(
-            doc! {
-                "workspace_id": workspace_id,
-                "domain": "user_operations"
-            },
+            current_user_operations_domain_filter(workspace_id),
             None,
         )
         .await?
     else {
-        return Ok(());
+        return Err(AppError::Conflict(
+            "current user_operations domain config not found".to_string(),
+        ));
     };
+    let config_id = config.id.ok_or_else(|| {
+        AppError::External("current user_operations domain config has no _id".to_string())
+    })?;
+    let updated_at = config.updated_at;
     let mut runtime = config.runtime_parameters;
     merge_document(&mut runtime, runtime_patch);
-    state
-        .db
-        .operation_domain_configs()
-        .update_one(
-            doc! { "_id": config.id },
-            doc! { "$set": { "runtime_parameters": runtime, "updated_at": DateTime::now() } },
-            None,
-        )
-        .await?;
-    Ok(())
+    Ok(Some((config_id, runtime, updated_at)))
+}
+
+fn current_user_operations_domain_filter(workspace_id: &str) -> Document {
+    doc! {
+        "workspace_id": workspace_id,
+        "domain": "user_operations",
+        "current_version": true,
+    }
 }
 
 pub(super) fn build_guide_preview_prompt(
@@ -1622,12 +1617,25 @@ pub(super) async fn resolve_authorized_workspace(
 
 #[cfg(test)]
 mod tests {
+    use super::current_user_operations_domain_filter;
     use super::escape_regex_literal;
     use super::insert_domain_stage_fields;
     use super::{guide_preview_json, health_items_from_scores};
     use super::{validate_deal_verification, validate_event_kind};
     use crate::models::UserOperationGuidePreview;
     use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
+
+    #[test]
+    fn guide_domain_patch_targets_only_current_version() {
+        assert_eq!(
+            current_user_operations_domain_filter("ws-a"),
+            doc! {
+                "workspace_id": "ws-a",
+                "domain": "user_operations",
+                "current_version": true,
+            }
+        );
+    }
 
     /// 构造一条带指定 health_scores 的 guide preview（其余字段填最小合法值）。
     fn preview_with_scores(scores: Document) -> UserOperationGuidePreview {
@@ -2018,6 +2026,7 @@ mod tests {
             reaction_analysis: doc! { "sentiment": "positive" },
             reaction_claimed_at: Some(DateTime::from_millis(1_700_000_050_000)),
             reviewer_misjudge_signal: Some("none".to_string()),
+            expected_text_segments: 1,
             status: "approved".to_string(),
             created_at: DateTime::from_millis(1_700_000_000_000),
         };
@@ -2192,6 +2201,7 @@ mod tests {
             reaction_analysis: Document::new(),
             reaction_claimed_at: None,
             reviewer_misjudge_signal: None,
+            expected_text_segments: 0,
             status: "approved".to_string(),
             created_at: DateTime::from_millis(1_700_000_000_000),
         };

@@ -1099,25 +1099,40 @@ pub(super) enum ToolRisk {
 pub(super) struct ToolEffect {
     pub read_only: bool,
     pub risk: ToolRisk,
+    /// `false` means the tool reached the fail-closed fallback rather than an
+    /// explicitly reviewed policy entry.
+    pub explicitly_classified: bool,
 }
 
 pub(super) fn tool_effect(tool_name: &str) -> ToolEffect {
     use ToolRisk::*;
-    let risk = match tool_name {
-        // 只读查询
-        "account_list"
+    let (risk, explicitly_classified) = match tool_name {
+        // agent-policy.md explicitly classifies these raw MCP queries as read-only.
+        "auth_whoami"
+        | "account_list"
+        | "account_get_status"
         | "contacts_search"
+        | "contact_get_detail"
+        | "schedule_list"
         | "knowledge.search"
         | "knowledge.list_catalog"
+        | "knowledge.open_slice"
+        | "knowledge.open_document"
         | "wechatagent.search_contacts"
         | "wechatagent.query_runs"
         | "wechatagent.query_metrics"
         | "wechatagent.query_health"
         | "wechatagent.query_inbox"
         | "wechatagent.query_send_ledger"
-        | "wechatagent.preview_campaign" => Readonly,
+        | "wechatagent.preview_campaign" => (Readonly, true),
         // 低风险可逆写
-        "wechatagent.import_contacts"
+        // agent-policy.md allows these raw MCP actions to run automatically
+        // under the current phase-one policy. Keep that behavior explicit.
+        "message_send_text"
+        | "media_get"
+        | "schedule_create"
+        | "schedule_cancel"
+        | "wechatagent.import_contacts"
         | "wechatagent.enable_contact_agent"
         | "wechatagent.disable_contact_agent"
         | "wechatagent.create_follow_up_task"
@@ -1161,7 +1176,7 @@ pub(super) fn tool_effect(tool_name: &str) -> ToolEffect {
         | "wechatagent.cancel_outbox"
         | "wechatagent.approve_relationship_suggestion"
         | "wechatagent.approve_taxonomy_candidate"
-        | "wechatagent.import_knowledge_pdf" => Low,
+        | "wechatagent.import_knowledge_pdf" => (Low, true),
         // 高风险/宽影响（立即全量/改全局）
         "wechatagent.send_contact_message"
         | "wechatagent.publish_prompt_template"
@@ -1184,19 +1199,23 @@ pub(super) fn tool_effect(tool_name: &str) -> ToolEffect {
         | "wechatagent.activate_domain_profile"
         | "wechatagent.release_evolution_proposal"
         | "wechatagent.rollback_evolution_proposal"
+        | "wechatagent.dispatch_campaign"
         // 批 2：update_ask_human_policy 立即改全量在跑 agent 的请示行为（spec §4.1）→ Dangerous
-        | "wechatagent.update_ask_human_policy" => Dangerous,
+        | "wechatagent.update_ask_human_policy" => (Dangerous, true),
         // 不可逆（reset/delete/物理销毁）：档位高于 dangerous，第一期即便放权也保留确认
         "wechatagent.reset_domain"
         | "wechatagent.delete_knowledge_chunk"
-        | "wechatagent.reset_system_pack" => Irreversible,
-        // 只读前缀工具（knowledge.open*）
-        other if other.starts_with("knowledge.open") => Readonly,
-        // 未知（含 MCP 透传工具）：保守按 Low，read_only=false
-        _ => Low,
+        | "wechatagent.reset_system_pack" => (Irreversible, true),
+        // Any tool not reviewed above fails closed. It may still be shown in
+        // the dynamic catalog and executed after explicit confirmation.
+        _ => (Dangerous, false),
     };
     let read_only = matches!(risk, Readonly);
-    ToolEffect { read_only, risk }
+    ToolEffect {
+        read_only,
+        risk,
+        explicitly_classified,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1268,20 +1287,21 @@ pub(super) fn build_execution_summary(results: &[(String, ToolOutcome)]) -> Stri
 
 /// verify 类工具：把 chunk 推向 verified 的动作。它写 source=Human（verify.rs:101），
 /// 包成 AI 工具会"AI 调用被记成人确认"——故恒强制确认，不随第一期开关放行（spec §4.3）。
-/// batch_verify_chunks 同属 verify 类，一并恒确认。
+/// batch_verify_chunks 同属 verify 类，一并恒确认；未进入显式风险表的动态工具也
+/// fail closed，避免 `tools/list` 新增能力在第一阶段 dangerous 总闸关闭时自动执行。
 pub(super) fn tool_always_requires_confirmation(tool_name: &str) -> bool {
     matches!(
         tool_name,
         "wechatagent.verify_knowledge_chunk"
             | "wechatagent.batch_verify_chunks"
             | "wechatagent.dispatch_campaign"
-    )
+    ) || !tool_effect(tool_name).explicitly_classified
 }
 
 /// 第一期权限放大：dangerous_confirm_enabled 默认 false（见 spec §1.2），
 /// 此时即便有 dangerous 工具也不强制确认，先跑通功能。开关为后续收紧预留。
-/// 但 irreversible（reset/delete/销毁）+ verify 类（AI 永不自动 verify）无视开关
-/// 恒需确认——第一期即便放权也保留（spec §4.2/§4.3）。
+/// 但 irreversible（reset/delete/销毁）+ verify 类（AI 永不自动 verify）+
+/// 未显式分类工具无视开关恒需确认——第一期即便放权也保留（spec §4.2/§4.3）。
 pub(super) fn plan_requires_confirmation(
     tool_names: &[&str],
     dangerous_confirm_enabled: bool,
@@ -1428,6 +1448,7 @@ pub(super) async fn execute_management_tool(
                     Some(v) => apply_admin_dim_validation(
                         agent::dimension_registry::validate_dimension_value(
                             &state.db,
+                            workspace_id,
                             "customer_stage",
                             v,
                             &contact.account_id,
@@ -1441,6 +1462,7 @@ pub(super) async fn execute_management_tool(
                     Some(v) => apply_admin_dim_validation(
                         agent::dimension_registry::validate_dimension_value(
                             &state.db,
+                            workspace_id,
                             "intent_level",
                             v,
                             &contact.account_id,
@@ -1598,6 +1620,7 @@ pub(super) async fn execute_management_tool(
                 Some(v) => apply_admin_dim_validation(
                     agent::dimension_registry::validate_dimension_value(
                         &state.db,
+                        workspace_id,
                         "customer_stage",
                         v,
                         &contact.account_id,
@@ -1635,6 +1658,7 @@ pub(super) async fn execute_management_tool(
                 Some(v) => apply_admin_dim_validation(
                     agent::dimension_registry::validate_dimension_value(
                         &state.db,
+                        workspace_id,
                         "intent_level",
                         v,
                         &contact.account_id,
@@ -2326,7 +2350,7 @@ pub(super) async fn execute_management_tool(
             let payload = serde_json::from_value(planned.arguments.clone())
                 .map_err(|e| AppError::BadRequest(format!("参数解析失败: {e}")))?;
             crate::routes::admin_taxonomy_candidates::approve_taxonomy_candidate_inner(
-                state, account_id, &id, payload,
+                state, workspace_id, account_id, &id, payload,
             )
             .await
         }
@@ -2770,6 +2794,74 @@ mod tests {
     }
 
     #[test]
+    fn documented_raw_mcp_read_tools_are_classified_readonly() {
+        for tool in [
+            "auth_whoami",
+            "account_list",
+            "account_get_status",
+            "contacts_search",
+            "contact_get_detail",
+            "schedule_list",
+        ] {
+            assert!(tool_effect(tool).read_only, "{tool} should be readonly");
+            assert!(!plan_requires_confirmation(&[tool], false));
+        }
+    }
+
+    #[test]
+    fn documented_raw_mcp_medium_tools_keep_phase_one_policy() {
+        for tool in [
+            "message_send_text",
+            "media_get",
+            "schedule_create",
+            "schedule_cancel",
+        ] {
+            assert_eq!(tool_effect(tool).risk, ToolRisk::Low);
+            assert!(tool_effect(tool).explicitly_classified);
+            assert!(!plan_requires_confirmation(&[tool], false));
+        }
+    }
+
+    #[test]
+    fn raw_mcp_risk_policy_requires_confirmation_for_unclassified_tools() {
+        for tool in [
+            "friend_delete",
+            "account_logout",
+            "group_create",
+            "moment_post_text",
+            "personal_update_name",
+            "gewe_execute_raw",
+            "future_unclassified_mcp_write",
+            "knowledge.open_mutating",
+            "wechatagent.future_unclassified_product_tool",
+        ] {
+            assert_eq!(tool_effect(tool).risk, ToolRisk::Dangerous);
+            assert!(
+                plan_requires_confirmation(&[tool], false),
+                "{tool} should always require confirmation"
+            );
+        }
+    }
+
+    #[test]
+    fn every_advertised_product_tool_has_an_explicit_risk_classification() {
+        let tools = merge_product_tools(json!({ "tools": [] }));
+        let names = advertised_tool_names(&tools);
+        let product_names: Vec<&str> = names
+            .iter()
+            .map(String::as_str)
+            .filter(|name| name.starts_with("wechatagent."))
+            .collect();
+        assert!(!product_names.is_empty(), "product catalog should not be empty");
+        for name in product_names {
+            assert!(
+                tool_effect(name).explicitly_classified,
+                "advertised product tool {name} is missing a reviewed risk classification"
+            );
+        }
+    }
+
+    #[test]
     fn outcome_assertion_detects_business_failure() {
         use serde_json::json;
         // send: MCP RPC 返 Ok 但 success=false（账号离线）→ Failed
@@ -2882,7 +2974,9 @@ mod tests {
     #[test]
     fn dry_run_keeps_read_tools_live_and_blocks_write_tools() {
         assert!(!should_dry_run_tool("wechatagent.search_contacts", true));
-        assert!(!should_dry_run_tool("knowledge.open", true));
+        assert!(!should_dry_run_tool("knowledge.open_slice", true));
+        assert!(!should_dry_run_tool("knowledge.open_document", true));
+        assert!(should_dry_run_tool("knowledge.open_mutating", true));
         assert!(should_dry_run_tool("wechatagent.import_contacts", true));
         assert!(should_dry_run_tool(
             "wechatagent.send_contact_message",

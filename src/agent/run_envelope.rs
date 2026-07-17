@@ -131,7 +131,11 @@ pub const GATEWAY_STATUS_VALUES: &[&str] = &[
     // S5.2 (Phase 0)：管理 Agent send_contact_message_gateway 改走 outbox 后
     // decision_reviews / agent_run_logs 可能写入 "outbox_enqueued" 终态。
     // dispatcher 完成 MCP 发送后会补一条 "sent"。
+    "outbox_enqueuing",
     "outbox_enqueued",
+    "outbox_enqueue_failed",
+    "outbox_enqueue_partial_failure",
+    "skipped_duplicate",
     // P0-7 (Phase 0)：admin SPA 显式取消任务时写入。AI 自治语义上 admin 是
     // 维护操作员（不是把对话权交给真人继续聊天），cancel_reason 字段记录管理员触发上下文。
     "admin_cancelled",
@@ -254,7 +258,9 @@ pub fn derive_lifecycle_from_status(gateway_status: &str, error: Option<&str>) -
         return LIFECYCLE_ABORTED_BY_BUDGET;
     }
     match gateway_status {
-        "sent" | "no_reply" | "approved" | "allowed" | "outbox_enqueued" => LIFECYCLE_COMPLETED,
+        "outbox_enqueuing" => LIFECYCLE_RUNNING,
+        "sent" | "no_reply" | "approved" | "allowed" | "outbox_enqueued"
+        | "skipped_duplicate" => LIFECYCLE_COMPLETED,
         "not_managed" | "cooldown" | "rate_limited" | "daily_limit" | "expired"
         | "context_changed" | "policy_cooldown" | "policy_wait_user_reply"
         | "precheck_blocked" => LIFECYCLE_FAILED_BEFORE_DECISION,

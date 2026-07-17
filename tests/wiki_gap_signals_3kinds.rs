@@ -21,7 +21,10 @@
 
 mod common;
 
+use std::sync::Arc;
+
 use mongodb::bson::{doc, oid::ObjectId, DateTime as BsonDt};
+use tokio::sync::Barrier;
 use wechatagent::knowledge_wiki::gap_signals;
 use wechatagent::models::{KnowledgeGapSignal, OperationKnowledgeChunk, RelatedRef, UsageStats};
 
@@ -416,6 +419,129 @@ async fn recall_signal_merges_correct_topic_among_multiple_pending() {
             !sig.search_queries.iter().any(|q| q == &query_b || q == &query_b2),
             "{label} 不应被 B 的变体污染, got {:?}",
             sig.search_queries
+        );
+    }
+}
+
+/// Legacy rows created before `dedup_key` existed must still be matched by
+/// their derived business key. Enriching the same topic must merge into the
+/// legacy pending row instead of creating a second modern row.
+#[tokio::test]
+#[ignore]
+async fn recall_signal_merges_into_legacy_row_without_persisted_dedup_key() {
+    let app = TestApp::start().await;
+    let original_query =
+        "历史套餐每年包含的服务额度和超额计费规则是什么需要一份可以核验的准确说明并注明适用范围".to_string();
+    let variant_query = format!("{original_query} 另外请补充超额后的计费单位");
+    // title cap 是 40 字符：两变体必须在前 40 字内完全相同，才会 derive 出同一 dedup_key。
+    // original_query 本身须 ≥40 字，否则 variant 追加的内容会挤进 title cap 导致 key 分叉。
+    assert!(
+        original_query.chars().count() >= 40,
+        "original_query 须 ≥40 字填满 title cap, got {}",
+        original_query.chars().count()
+    );
+    assert_eq!(
+        original_query.chars().take(40).collect::<String>(),
+        variant_query.chars().take(40).collect::<String>(),
+        "fixture variants must derive the same logical key"
+    );
+
+    let candidate =
+        gap_signals::GapSignalCandidate::recall_miss_from_product_block(original_query.clone());
+    let legacy = doc! {
+        "signal_id": "legacy_gap_without_dedup_key",
+        "workspace_id": WS,
+        "kind": "recall_miss",
+        "title": candidate.title,
+        "description": candidate.description,
+        "affected_chunk_ids": candidate.affected_chunk_ids,
+        "search_queries": [original_query.clone()],
+        "severity": candidate.severity,
+        "source": "recall_trace",
+        "status": "pending",
+        "created_at": BsonDt::now(),
+    };
+    app.state
+        .db
+        .knowledge_gap_signals()
+        .clone_with_type::<mongodb::bson::Document>()
+        .insert_one(legacy, None)
+        .await
+        .expect("insert legacy gap row");
+
+    gap_signals::persist_recall_signal(
+        &app.state.db,
+        WS,
+        gap_signals::GapSignalCandidate::recall_miss_from_product_block(variant_query.clone()),
+    )
+    .await
+    .expect("merge into legacy row");
+
+    let pending = list_pending(&app, "recall_miss").await;
+    assert_eq!(pending.len(), 1, "legacy match must not create a duplicate row");
+    assert_eq!(pending[0].signal_id, "legacy_gap_without_dedup_key");
+    assert!(pending[0].dedup_key.is_none(), "legacy row remains readable without migration");
+    assert!(
+        pending[0].search_queries.iter().any(|q| q == &variant_query),
+        "new query variant must merge into the legacy row"
+    );
+}
+
+/// Concurrent writers for one business key must converge to one pending row.
+/// Each writer carries a distinct query variant, so the test also verifies
+/// that the atomic upsert merges arrays instead of dropping a loser's data.
+#[tokio::test]
+#[ignore]
+async fn concurrent_recall_signals_upsert_one_pending_and_merge_all_queries() {
+    const WRITERS: usize = 16;
+
+    let app = TestApp::start().await;
+    let prefix = "同一产品套餐的年度服务额度和超额计费规则究竟是什么请给出能够核验的准确资料并说明适用范围";
+    assert!(prefix.chars().count() >= 40, "prefix must fill the title cap");
+
+    let barrier = Arc::new(Barrier::new(WRITERS));
+    let mut handles = Vec::with_capacity(WRITERS);
+    let mut expected_queries = Vec::with_capacity(WRITERS);
+    for index in 0..WRITERS {
+        let db = app.state.db.clone();
+        let barrier = barrier.clone();
+        let query = format!("{prefix} writer-{index}");
+        expected_queries.push(query.clone());
+        handles.push(tokio::spawn(async move {
+            barrier.wait().await;
+            gap_signals::persist_recall_signal(
+                &db,
+                WS,
+                gap_signals::GapSignalCandidate::recall_miss_from_product_block(query),
+            )
+            .await
+        }));
+    }
+
+    for handle in handles {
+        handle
+            .await
+            .expect("concurrent writer should not panic")
+            .expect("concurrent signal upsert should succeed");
+    }
+
+    let pending = list_pending(&app, "recall_miss").await;
+    assert_eq!(
+        pending.len(),
+        1,
+        "one business dedup key must occupy exactly one pending row: {pending:?}"
+    );
+    let signal = &pending[0];
+    let persisted_key = signal
+        .dedup_key
+        .as_deref()
+        .expect("modern pending row must persist a dedup key");
+    assert_eq!(persisted_key.len(), 64);
+    for query in expected_queries {
+        assert!(
+            signal.search_queries.iter().any(|stored| stored == &query),
+            "concurrent query variant must be retained: {query:?}; stored={:?}",
+            signal.search_queries
         );
     }
 }

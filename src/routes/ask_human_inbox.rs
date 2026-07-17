@@ -219,11 +219,11 @@ fn taxonomy_candidate_to_inbox_item(
     }
 }
 
-/// 标签候选 pending → rich。隔离键是 scope（account_id 或 "global"），无 workspace_id；
-/// 仅暴露 scope="global" 的共享候选，避免泄漏账户私有候选（IDOR 安全）。
+/// 标签候选 pending → rich。只暴露当前 workspace 的 global 候选；account 私有
+/// scope 不进入共享审核收件箱。workspace + scope 双重过滤避免跨租户泄漏。
 async fn collect_taxonomy_candidates(
     state: &AppState,
-    _ws: &str,
+    ws: &str,
     now_ms: i64,
 ) -> AppResult<Vec<InboxItem>> {
     use futures::TryStreamExt;
@@ -231,7 +231,7 @@ async fn collect_taxonomy_candidates(
         .db
         .collection_taxonomy_candidates()
         .find(
-            doc! { "scope": "global", "status": "pending" },
+            pending_global_taxonomy_filter(ws),
             mongodb::options::FindOptions::builder().limit(100).build(),
         )
         .await?;
@@ -240,6 +240,14 @@ async fn collect_taxonomy_candidates(
         .into_iter()
         .map(|c| taxonomy_candidate_to_inbox_item(&c, now_ms))
         .collect())
+}
+
+fn pending_global_taxonomy_filter(workspace_id: &str) -> Document {
+    doc! {
+        "workspace_id": workspace_id,
+        "scope": "global",
+        "status": "pending",
+    }
 }
 
 /// 关系类型建议 pending → inline。无 created_at，用 last_seen_at。
@@ -542,7 +550,7 @@ pub async fn ask_human_summary(
     let taxonomy_candidate = state
         .db
         .collection_taxonomy_candidates()
-        .count_documents(doc! { "scope": "global", "status": "pending" }, None)
+        .count_documents(pending_global_taxonomy_filter(ws), None)
         .await
         .unwrap_or(0);
     let relationship_suggestion = state
@@ -599,6 +607,18 @@ mod tests {
     use super::*;
     use crate::models::AgentPrincipalEscalation;
     use mongodb::bson::DateTime;
+
+    #[test]
+    fn pending_global_taxonomy_filter_is_workspace_scoped() {
+        assert_eq!(
+            pending_global_taxonomy_filter("ws-a"),
+            doc! {
+                "workspace_id": "ws-a",
+                "scope": "global",
+                "status": "pending",
+            }
+        );
+    }
 
     fn test_escalation_fixture() -> AgentPrincipalEscalation {
         let now = DateTime::now();
@@ -668,6 +688,7 @@ mod tests {
             id: None,
             signal_id: "g1".into(),
             workspace_id: "ws1".into(),
+            dedup_key: None,
             kind: "orphan".into(),
             title: "孤立切片：定价政策".into(),
             description: "该切片无任何入向引用".into(),
@@ -707,6 +728,7 @@ mod tests {
         let now = DateTime::now();
         crate::models::TaxonomyCandidate {
             id: None,
+            workspace_id: "default".into(),
             scope: "global".into(),
             kind: "emotional_state".into(),
             raw_value: "anxious".into(),

@@ -140,6 +140,7 @@ pub(super) async fn upload_media_asset(
     let scope = account_id.as_deref().unwrap_or("");
     let target_stages = crate::agent::dimension_registry::normalize_target_stages(
         &state.db,
+        &admin.current_workspace,
         scope,
         &target_stages,
     )
@@ -317,8 +318,12 @@ pub async fn update_content_asset_meta(
     if let Some(stages) = payload.target_stages {
         // 复用簇 B 归一；scope 取被编辑 asset 自身 account_id，缺失走空串。
         let scope = asset.account_id.as_deref().unwrap_or("");
-        let normalized =
-            crate::agent::dimension_registry::normalize_target_stages(&state.db, scope, &stages)
+        let normalized = crate::agent::dimension_registry::normalize_target_stages(
+            &state.db,
+            &admin.current_workspace,
+            scope,
+            &stages,
+        )
                 .await
                 .map_err(|reason| {
                     AppError::BadRequest(format!("target_stages 校验未通过：{reason}"))

@@ -52,6 +52,7 @@ fn ingest_source(workspace_id: &str, source_id: &str, kind: &str, url: String) -
         // None → is_due() 恒 true，本轮立即拉取。
         last_fetched_at: None,
         last_etag: None,
+        last_content_hash: None,
         last_error: None,
         status: "active".to_string(),
         failure_streak: 0,
@@ -270,4 +271,94 @@ async fn run_one_round_still_ingests_due_source() {
         "due 源应被拉取,last_fetched_at 前移"
     );
     assert!(reloaded.ingest_count >= 1, "due 源应产 chunk 并累加 ingest_count");
+}
+
+/// 场景 5：源不提供 ETag 时，连续两次返回相同内容只导入一次。
+#[tokio::test]
+#[ignore]
+async fn run_one_round_dedupes_unchanged_content_without_etag() {
+    let app = TestApp::start().await;
+    let ws = app.state.config.default_workspace_id.clone();
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/feed-no-etag.xml"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(RSS_BODY))
+        .mount(&server)
+        .await;
+
+    let url = format!("{}/feed-no-etag.xml", server.uri());
+    let src = ingest_source(&ws, "ing_no_etag_dedupe", "rss", url);
+    insert_source(&app, &src).await;
+
+    run_one_round(&app.state).await.expect("first round ok");
+    let first_source = reload_source(&app, "ing_no_etag_dedupe").await;
+    assert!(first_source.last_etag.is_none(), "fixture must not return ETag");
+    assert!(
+        first_source.last_content_hash.is_some(),
+        "first successful ingest should persist the content checkpoint"
+    );
+
+    let first_documents = app
+        .state
+        .db
+        .operation_knowledge_documents()
+        .count_documents(
+            doc! { "workspace_id": &ws, "source_name": "smoke rss" },
+            None,
+        )
+        .await
+        .expect("count first documents");
+    let first_chunks = app
+        .state
+        .db
+        .operation_knowledge_chunks()
+        .count_documents(doc! { "workspace_id": &ws }, None)
+        .await
+        .expect("count first chunks");
+    assert_eq!(first_documents, 1, "first round should create one document");
+    assert!(first_chunks > 0, "first round should create chunks");
+
+    // Make the source due again without changing the fetched body.
+    let two_hours_ago = BsonDateTime::from_millis(
+        BsonDateTime::now().timestamp_millis() - 2 * 60 * 60 * 1000,
+    );
+    app.state
+        .db
+        .ingest_sources()
+        .update_one(
+            doc! { "source_id": "ing_no_etag_dedupe" },
+            doc! { "$set": { "last_fetched_at": two_hours_ago } },
+            None,
+        )
+        .await
+        .expect("make source due again");
+
+    run_one_round(&app.state).await.expect("second round ok");
+    let second_source = reload_source(&app, "ing_no_etag_dedupe").await;
+    let second_documents = app
+        .state
+        .db
+        .operation_knowledge_documents()
+        .count_documents(
+            doc! { "workspace_id": &ws, "source_name": "smoke rss" },
+            None,
+        )
+        .await
+        .expect("count second documents");
+    let second_chunks = app
+        .state
+        .db
+        .operation_knowledge_chunks()
+        .count_documents(doc! { "workspace_id": &ws }, None)
+        .await
+        .expect("count second chunks");
+
+    assert_eq!(second_documents, first_documents);
+    assert_eq!(second_chunks, first_chunks);
+    assert_eq!(second_source.ingest_count, first_source.ingest_count);
+    assert_eq!(
+        second_source.last_content_hash,
+        first_source.last_content_hash,
+    );
 }

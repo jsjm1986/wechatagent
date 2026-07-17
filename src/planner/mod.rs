@@ -665,7 +665,8 @@ async fn scan_commitments(state: &AppState) -> anyhow::Result<()> {
     // 排序配置 + 取行业默认范式（commitment enabled/窗口）。
     let profile =
         crate::agent::domain_profile::load_active_domain_profile(&state.db, &workspace_id).await;
-    let stage_config = build_planner_stage_config(state, &account_id, &profile).await;
+    let stage_config =
+        build_planner_stage_config(state, &workspace_id, &account_id, &profile).await;
 
     let filter = commitment_candidate_filter(&workspace_id, &account_id);
     let mut cursor = state.db.contacts().find(filter, None).await?;
@@ -902,6 +903,7 @@ impl PlannerStageConfig {
 /// 路径 warm_up；这里再 `find_or_load` 一次保证 TTL 自愈。
 pub(crate) async fn build_planner_stage_config(
     state: &AppState,
+    workspace_id: &str,
     account_id: &str,
     profile: &crate::models::DomainProfile,
 ) -> PlannerStageConfig {
@@ -913,7 +915,7 @@ pub(crate) async fn build_planner_stage_config(
         .unwrap_or_else(|| "customer_stage".to_string());
 
     let cache = global_taxonomy_cache();
-    cache.find_or_load(&state.db).await;
+    cache.find_or_load(&state.db, workspace_id).await;
 
     let mut config = PlannerStageConfig {
         stage_weights: std::collections::HashMap::new(),
@@ -923,7 +925,7 @@ pub(crate) async fn build_planner_stage_config(
         stagnation_dimension,
     };
     for (id, weight, is_terminal, is_reactivation_target) in
-        dimension_value_weights("customer_stage", account_id, &cache)
+        dimension_value_weights(workspace_id, "customer_stage", account_id, &cache)
     {
         if let Some(w) = weight {
             config.stage_weights.insert(id.clone(), w);
@@ -936,7 +938,7 @@ pub(crate) async fn build_planner_stage_config(
         }
     }
     for (id, weight, _is_terminal, _is_reactivation_target) in
-        dimension_value_weights("intent_level", account_id, &cache)
+        dimension_value_weights(workspace_id, "intent_level", account_id, &cache)
     {
         if let Some(w) = weight {
             config.intent_weights.insert(id, w);
@@ -1328,7 +1330,8 @@ async fn scan_stage_stagnation(state: &AppState) -> anyhow::Result<()> {
     // 排序配置 + 取行业默认范式（funnel enabled/停滞阈值）。
     let profile =
         crate::agent::domain_profile::load_active_domain_profile(&state.db, &workspace_id).await;
-    let stage_config = build_planner_stage_config(state, &account_id, &profile).await;
+    let stage_config =
+        build_planner_stage_config(state, &workspace_id, &account_id, &profile).await;
     let stage_updated_before =
         DateTime::from_millis(now_ms - global_threshold_days.saturating_mul(24 * 60 * 60 * 1000));
     let inbound_before =
@@ -1997,7 +2000,8 @@ async fn scan_reactivation(state: &AppState) -> anyhow::Result<()> {
     let global_cadence_days = state.config.strategic_planner_reactivation_cadence_days;
     let global_reactivation_cap = state.config.strategic_planner_reactivation_daily_cap;
 
-    let stage_config = build_planner_stage_config(state, &account_id, &profile).await;
+    let stage_config =
+        build_planner_stage_config(state, &workspace_id, &account_id, &profile).await;
     let filter = reactivation_candidate_filter(&workspace_id, &account_id, &stage_config);
     let mut cursor = state.db.contacts().find(filter, None).await?;
 

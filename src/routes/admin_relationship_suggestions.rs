@@ -149,6 +149,7 @@ pub(in crate::routes) async fn approve_relationship_suggestion_inner(
     // approve = 运营权威确认 = AdminWrite：suggested_value 越界恒 Reject 当场报错。
     let canonical = match validate_dimension_value(
         &state.db,
+        workspace_id,
         "relationship_type",
         &suggestion.suggested_value,
         &suggestion.account_id,

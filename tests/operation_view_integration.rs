@@ -80,9 +80,15 @@ fn make_active_profile(workspace_id: &str, dimensions: Vec<ProfileDimension>) ->
 }
 
 /// 构造一条 active 的 global taxonomy 取值条目。
-fn make_taxonomy_entry(kind: &str, id: &str, display_name: &str) -> TaxonomyEntry {
+fn make_taxonomy_entry(
+    workspace_id: &str,
+    kind: &str,
+    id: &str,
+    display_name: &str,
+) -> TaxonomyEntry {
     TaxonomyEntry {
         id: None,
+        workspace_id: workspace_id.to_string(),
         scope: "global".to_string(),
         kind: kind.to_string(),
         value: TaxonomyValue {
@@ -137,7 +143,7 @@ async fn active_view_returns_dimensions_and_taxonomy_labels() {
     // 种 system_taxonomies：customer_stage:first_contact→初次接触。
     db.collection_system_taxonomies()
         .insert_one(
-            &make_taxonomy_entry("customer_stage", "first_contact", "初次接触"),
+            &make_taxonomy_entry(&ws, "customer_stage", "first_contact", "初次接触"),
             None,
         )
         .await

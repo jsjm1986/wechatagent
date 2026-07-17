@@ -11,5 +11,6 @@
   "reviewedBy": "admin-1",
   "scope": "global",
   "status": "pending",
-  "suggestedDisplayName": "价格异议"
+  "suggestedDisplayName": "价格异议",
+  "workspaceId": "default"
 }

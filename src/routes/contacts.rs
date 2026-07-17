@@ -631,6 +631,7 @@ pub(super) async fn apply_generated_profile_to_contact(
         // AI 产出 → WriteIntent::MachineWrite：越界值 drop（不阻断建档），不像 admin 那样 reject。
         let (gen_stage, gen_intent) = validate_generated_stage_intent(
             state,
+            workspace_id,
             &contact.account_id,
             generated.customer_stage.as_deref(),
             generated.intent_level.as_deref(),
@@ -1203,6 +1204,7 @@ pub(super) async fn update_profile_note(
         let initial_state = agent::initial_operation_state_key(domain_config.as_ref());
         let (gen_stage, gen_intent) = validate_generated_stage_intent(
             &state,
+            &admin.current_workspace,
             &contact.account_id,
             generated.customer_stage.as_deref(),
             generated.intent_level.as_deref(),
@@ -1454,6 +1456,7 @@ fn stage_changed(prev_stage: Option<&str>, new_stage: Option<&str>) -> bool {
 /// 建档），alias 归一到 canonical，已登记/未配置值原样通过。
 async fn validate_generated_stage_intent(
     state: &AppState,
+    workspace_id: &str,
     account_id: &str,
     customer_stage: Option<&str>,
     intent_level: Option<&str>,
@@ -1461,13 +1464,29 @@ async fn validate_generated_stage_intent(
     use crate::agent::dimension_registry::{validate_dimension_value, WriteIntent};
     let gen_stage = match customer_stage {
         Some(v) => apply_admin_dim_validation(
-            validate_dimension_value(&state.db, "customer_stage", v, account_id, WriteIntent::MachineWrite).await,
+            validate_dimension_value(
+                &state.db,
+                workspace_id,
+                "customer_stage",
+                v,
+                account_id,
+                WriteIntent::MachineWrite,
+            )
+            .await,
         )?,
         None => None,
     };
     let gen_intent = match intent_level {
         Some(v) => apply_admin_dim_validation(
-            validate_dimension_value(&state.db, "intent_level", v, account_id, WriteIntent::MachineWrite).await,
+            validate_dimension_value(
+                &state.db,
+                workspace_id,
+                "intent_level",
+                v,
+                account_id,
+                WriteIntent::MachineWrite,
+            )
+            .await,
         )?,
         None => None,
     };
@@ -1489,6 +1508,7 @@ pub async fn update_operation_profile(
         Some(v) => apply_admin_dim_validation(
             crate::agent::dimension_registry::validate_dimension_value(
                 &state.db,
+                &admin.current_workspace,
                 "customer_stage",
                 &v,
                 &current.account_id,
@@ -1527,6 +1547,7 @@ pub async fn update_operation_profile(
         Some(v) => apply_admin_dim_validation(
             crate::agent::dimension_registry::validate_dimension_value(
                 &state.db,
+                &admin.current_workspace,
                 "intent_level",
                 &v,
                 &current.account_id,
@@ -1549,6 +1570,7 @@ pub async fn update_operation_profile(
         let validated = apply_admin_dim_validation(
             crate::agent::dimension_registry::validate_dimension_value(
                 &state.db,
+                &admin.current_workspace,
                 "relationship_type",
                 &v,
                 &current.account_id,
@@ -1656,6 +1678,7 @@ pub(super) async fn analyze_contact_profile(
         let initial_state = agent::initial_operation_state_key(domain_config.as_ref());
         let (gen_stage, gen_intent) = validate_generated_stage_intent(
             &state,
+            &admin.current_workspace,
             &contact.account_id,
             generated.customer_stage.as_deref(),
             generated.intent_level.as_deref(),

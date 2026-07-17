@@ -33,6 +33,7 @@ pub async fn run_step(db: &Database) -> AppResult<()> {
 
     for entry in default_taxonomy_seed_entries(now) {
         let filter = doc! {
+            "workspace_id": &entry.workspace_id,
             "scope": &entry.scope,
             "kind": &entry.kind,
             "value.id": &entry.value.id,
@@ -166,6 +167,7 @@ pub(super) fn default_taxonomy_seed_entries(now: DateTime) -> Vec<TaxonomyEntry>
     for (id, display, desc, aliases, weight, terminal, reactivation_target) in customer_stages {
         out.push(TaxonomyEntry {
             id: None,
+            workspace_id: crate::models::default_taxonomy_workspace_id(),
             scope: "global".to_string(),
             kind: "customer_stage".to_string(),
             value: TaxonomyValue {
@@ -214,6 +216,7 @@ pub(super) fn default_taxonomy_seed_entries(now: DateTime) -> Vec<TaxonomyEntry>
     for (id, display, desc, aliases, weight) in intent_levels {
         out.push(TaxonomyEntry {
             id: None,
+            workspace_id: crate::models::default_taxonomy_workspace_id(),
             scope: "global".to_string(),
             kind: "intent_level".to_string(),
             value: TaxonomyValue {
@@ -282,6 +285,7 @@ pub(super) fn default_taxonomy_seed_entries(now: DateTime) -> Vec<TaxonomyEntry>
     for (id, display, desc, aliases) in objection_types {
         out.push(TaxonomyEntry {
             id: None,
+            workspace_id: crate::models::default_taxonomy_workspace_id(),
             scope: "global".to_string(),
             kind: "objection_type".to_string(),
             value: TaxonomyValue {

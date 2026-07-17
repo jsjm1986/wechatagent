@@ -7,6 +7,54 @@ use mongodb::{bson::doc, options::IndexOptions, IndexModel};
 
 use super::Database;
 
+fn gap_signals_pending_dedup_index() -> IndexModel {
+    IndexModel::builder()
+        .keys(doc! { "workspace_id": 1, "dedup_key": 1 })
+        .options(
+            IndexOptions::builder()
+                .name("uniq_gap_signals_pending_ws_dedup".to_string())
+                .unique(true)
+                .partial_filter_expression(doc! {
+                    "status": "pending",
+                    "dedup_key": { "$type": "string" },
+                })
+                .build(),
+        )
+        .build()
+}
+
+fn outbox_delivery_finalize_pending_index() -> IndexModel {
+    IndexModel::builder()
+        .keys(doc! {
+            "status": 1,
+            "delivery_finalize_pending": 1,
+            "updated_at": 1,
+            "_id": 1,
+        })
+        .options(
+            IndexOptions::builder()
+                .name("outbox_delivery_finalize_pending_idx".to_string())
+                .partial_filter_expression(doc! {
+                    "status": "sent",
+                    "delivery_finalize_pending": true,
+                })
+                .build(),
+        )
+        .build()
+}
+
+fn agent_run_log_outbox_enqueuing_index() -> IndexModel {
+    IndexModel::builder()
+        .keys(doc! { "status": 1, "created_at": 1, "_id": 1 })
+        .options(
+            IndexOptions::builder()
+                .name("agent_run_log_outbox_enqueuing_idx".to_string())
+                .partial_filter_expression(doc! { "status": "outbox_enqueuing" })
+                .build(),
+        )
+        .build()
+}
+
 pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
     db.accounts()
         .create_index(
@@ -484,6 +532,9 @@ pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
             None,
         )
         .await?;
+    db.agent_run_logs()
+        .create_index(agent_run_log_outbox_enqueuing_index(), None)
+        .await?;
     // ── agent-autonomy-loop W0 (Task 1.2) / W6 (Task 7.1) ──
     //
     // R0.8 / R9.5 监控查询索引。BSON key 使用 snake_case，与 `AgentRunLog`
@@ -700,6 +751,66 @@ pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gap_signal_dedup_index_is_pending_partial_unique() {
+        let index = gap_signals_pending_dedup_index();
+        assert_eq!(
+            index.keys,
+            doc! { "workspace_id": 1, "dedup_key": 1 }
+        );
+
+        let options = index.options.expect("dedup index options");
+        assert_eq!(options.unique, Some(true));
+        assert_eq!(
+            options.partial_filter_expression,
+            Some(doc! {
+                "status": "pending",
+                "dedup_key": { "$type": "string" },
+            })
+        );
+    }
+
+    #[test]
+    fn outbox_delivery_finalize_index_matches_reconcile_scan() {
+        let index = outbox_delivery_finalize_pending_index();
+        assert_eq!(
+            index.keys,
+            doc! {
+                "status": 1,
+                "delivery_finalize_pending": 1,
+                "updated_at": 1,
+                "_id": 1,
+            }
+        );
+        let options = index.options.expect("delivery finalize index options");
+        assert_eq!(
+            options.partial_filter_expression,
+            Some(doc! {
+                "status": "sent",
+                "delivery_finalize_pending": true,
+            })
+        );
+    }
+
+    #[test]
+    fn agent_run_log_outbox_enqueuing_index_matches_reconcile_scan() {
+        let index = agent_run_log_outbox_enqueuing_index();
+        assert_eq!(
+            index.keys,
+            doc! { "status": 1, "created_at": 1, "_id": 1 }
+        );
+        let options = index.options.expect("stale enqueue index options");
+        assert_eq!(
+            options.partial_filter_expression,
+            Some(doc! { "status": "outbox_enqueuing" })
+        );
+    }
+}
+
 async fn ensure_llm_provider_indexes(db: &Database) -> anyhow::Result<()> {
     // 历史遗留：早期版本错误地用 snake_case 字段建过 unique 索引，
     // 但模型 BSON 层是 camelCase → 旧索引把所有真实文档当成
@@ -841,6 +952,9 @@ async fn ensure_agent_send_outbox_indexes(db: &Database) -> anyhow::Result<()> {
             None,
         )
         .await?;
+    db.collection_agent_send_outbox()
+        .create_index(outbox_delivery_finalize_pending_index(), None)
+        .await?;
     Ok(())
 }
 
@@ -851,10 +965,14 @@ async fn ensure_agent_send_outbox_indexes(db: &Database) -> anyhow::Result<()> {
 /// `(scope, kind, value.id, version)`，由 [`ensure_ops_versioned_indexes`] 创建；
 /// 这里只保留非唯一辅助索引（按 (scope, kind, status) 列字典），列表查询命中。
 async fn ensure_system_taxonomies_indexes(db: &Database) -> anyhow::Result<()> {
+    let _ = db
+        .collection_system_taxonomies()
+        .drop_index("sys_tax_scope_kind_status_idx", None)
+        .await;
     db.collection_system_taxonomies()
         .create_index(
             IndexModel::builder()
-                .keys(doc! { "scope": 1, "kind": 1, "value.status": 1 })
+                .keys(doc! { "workspace_id": 1, "scope": 1, "kind": 1, "value.status": 1 })
                 .options(
                     IndexOptions::builder()
                         .name("sys_tax_scope_kind_status_idx".to_string())
@@ -965,14 +1083,21 @@ async fn ensure_ops_versioned_indexes(db: &Database) -> anyhow::Result<()> {
     // 旧 (scope, kind, value.id) unique 索引由 ensure_system_taxonomies_indexes
     // 继续创建（兼容旧路径），这里只补 4-tuple 与 current_version 部分索引。
     // 多版本驻留时旧 unique 会冲突 —— 改为非唯一时机由 W5/W6 一并迁移。
-    let _ = db
-        .collection_system_taxonomies()
-        .drop_index("scope_1_kind_1_value.id_1", None)
-        .await;
+    for legacy_name in [
+        "scope_1_kind_1_value.id_1",
+        "sys_tax_scope_kind_value_version_unique",
+        "sys_tax_scope_kind_value_current_idx",
+    ] {
+        let _ = db
+            .collection_system_taxonomies()
+            .drop_index(legacy_name, None)
+            .await;
+    }
     db.collection_system_taxonomies()
         .create_index(
             IndexModel::builder()
                 .keys(doc! {
+                    "workspace_id": 1,
                     "scope": 1,
                     "kind": 1,
                     "value.id": 1,
@@ -980,7 +1105,7 @@ async fn ensure_ops_versioned_indexes(db: &Database) -> anyhow::Result<()> {
                 })
                 .options(
                     IndexOptions::builder()
-                        .name("sys_tax_scope_kind_value_version_unique".to_string())
+                        .name("sys_tax_ws_scope_kind_value_version_unique".to_string())
                         .unique(true)
                         .build(),
                 )
@@ -992,6 +1117,7 @@ async fn ensure_ops_versioned_indexes(db: &Database) -> anyhow::Result<()> {
         .create_index(
             IndexModel::builder()
                 .keys(doc! {
+                    "workspace_id": 1,
                     "scope": 1,
                     "kind": 1,
                     "value.id": 1,
@@ -999,7 +1125,7 @@ async fn ensure_ops_versioned_indexes(db: &Database) -> anyhow::Result<()> {
                 })
                 .options(
                     IndexOptions::builder()
-                        .name("sys_tax_scope_kind_value_current_idx".to_string())
+                        .name("sys_tax_ws_scope_kind_value_current_idx".to_string())
                         .partial_filter_expression(doc! { "current_version": true })
                         .build(),
                 )
@@ -1016,10 +1142,24 @@ async fn ensure_ops_versioned_indexes(db: &Database) -> anyhow::Result<()> {
 /// - `(scope, kind, raw_value)` 唯一：`upsert_candidate` 幂等键，重复值仅累加
 ///   `occurrences` / 更新 `last_seen_at`。
 async fn ensure_taxonomy_candidates_indexes(db: &Database) -> anyhow::Result<()> {
+    for legacy_name in [
+        "scope_1_kind_1_status_1",
+        "scope_1_kind_1_raw_value_1",
+    ] {
+        let _ = db
+            .collection_taxonomy_candidates()
+            .drop_index(legacy_name, None)
+            .await;
+    }
     db.collection_taxonomy_candidates()
         .create_index(
             IndexModel::builder()
-                .keys(doc! { "scope": 1, "kind": 1, "status": 1 })
+                .keys(doc! { "workspace_id": 1, "scope": 1, "kind": 1, "status": 1 })
+                .options(
+                    IndexOptions::builder()
+                        .name("tax_candidate_ws_scope_kind_status_idx".to_string())
+                        .build(),
+                )
                 .build(),
             None,
         )
@@ -1027,8 +1167,13 @@ async fn ensure_taxonomy_candidates_indexes(db: &Database) -> anyhow::Result<()>
     db.collection_taxonomy_candidates()
         .create_index(
             IndexModel::builder()
-                .keys(doc! { "scope": 1, "kind": 1, "raw_value": 1 })
-                .options(IndexOptions::builder().unique(true).build())
+                .keys(doc! { "workspace_id": 1, "scope": 1, "kind": 1, "raw_value": 1 })
+                .options(
+                    IndexOptions::builder()
+                        .name("tax_candidate_ws_scope_kind_raw_unique".to_string())
+                        .unique(true)
+                        .build(),
+                )
                 .build(),
             None,
         )
@@ -1432,6 +1577,9 @@ async fn ensure_evolution_indexes(db: &Database) -> anyhow::Result<()> {
                 .build(),
             None,
         )
+        .await?;
+    db.knowledge_gap_signals()
+        .create_index(gap_signals_pending_dedup_index(), None)
         .await?;
     // LintView dashboard：按 (kind, status) 分组的时间线视图。
     // 与 gap_signals_status_kind_idx 的差异是字段顺序与排序键 —— 前端
