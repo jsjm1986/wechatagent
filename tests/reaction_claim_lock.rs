@@ -39,6 +39,7 @@ fn pending_review(workspace: &str, account: &str, wxid: &str) -> AgentDecisionRe
         reaction_analysis: Document::new(),
         reaction_claimed_at: None,
         reviewer_misjudge_signal: None,
+        expected_text_segments: 0,
         status: "sent".to_string(),
         created_at: DateTime::now(),
     }

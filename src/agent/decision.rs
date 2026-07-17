@@ -93,7 +93,7 @@ pub async fn build_initial_operation_profile(
     // 销售 schema 单方框住、本行业维度既不告知也不采集（须等首条 inbound 后 live reply 自愈）。
     // DEFAULT 销售域两函数均返空串 → prompt 字节等价（反过拟合护栏）。
     let taxonomy_cache = crate::agent::taxonomy::global_taxonomy_cache();
-    taxonomy_cache.find_or_load(&state.db).await;
+    taxonomy_cache.find_or_load(&state.db, workspace_id).await;
     let task_template = format!(
         "{task_template}{}{}",
         super::domain_profile::render_memory_candidate_types_guidance(
@@ -101,6 +101,7 @@ pub async fn build_initial_operation_profile(
         ),
         super::domain_profile::render_decision_dimensions_guidance(
             &active_profile.profile_dimensions,
+            workspace_id,
             account_id,
             taxonomy_cache.as_ref(),
         )
@@ -693,11 +694,14 @@ pub(crate) async fn decide_reply_with_promote(
     // 换非销售行业（含本专题的 purchase_lifecycle）→ 注入维度语义 + domainSignals
     // 输出位置，让维度值能真正从 LLM 流到 AgentDecision.domain_signals。
     let taxonomy_cache = crate::agent::taxonomy::global_taxonomy_cache();
-    taxonomy_cache.find_or_load(&state.db).await;
+    taxonomy_cache
+        .find_or_load(&state.db, &contact.workspace_id)
+        .await;
     let task_template = format!(
         "{task_template}{}",
         super::domain_profile::render_decision_dimensions_guidance(
             &active_profile.profile_dimensions,
+            &contact.workspace_id,
             &contact.account_id,
             taxonomy_cache.as_ref(),
         )
@@ -1017,6 +1021,7 @@ pub(crate) async fn decide_reply_with_promote(
         &state.db,
         &mut decision,
         &dimension_kinds,
+        &contact.workspace_id,
         &contact.account_id,
     );
     promote_risks.extend(taxonomy_risks);

@@ -1848,6 +1848,10 @@ pub struct KnowledgeGapSignal {
     pub id: Option<ObjectId>,
     pub signal_id: String,
     pub workspace_id: String,
+    /// SHA-256 of the logical business dedup key. New pending rows use this
+    /// with a partial unique index; legacy rows may omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dedup_key: Option<String>,
     /// 8 类信号 kind 之一。
     pub kind: String,
     pub title: String,
@@ -1898,6 +1902,9 @@ pub struct IngestSource {
     /// HTTP `ETag` 缓存键；下一轮带 `If-None-Match` 上来。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_etag: Option<String>,
+    /// SHA-256 of the last successfully ingested parsed content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_content_hash: Option<String>,
     /// 上次错误（若有），用于前端排障。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
@@ -2846,6 +2853,10 @@ pub struct AgentDecisionReview {
     /// 供 feedback_worker 周期汇总 reviewer_stats，C2 分支据此挑选 negative_example 候选。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reviewer_misjudge_signal: Option<String>,
+    /// 入队时固化的文本分段总数。dispatcher 不得用当前运行配置重新切段，
+    /// 否则配置变更会让历史 decision 永久无法完成 finalization。
+    #[serde(default)]
+    pub expected_text_segments: i32,
     pub status: String,
     pub created_at: DateTime,
 }
@@ -3041,6 +3052,9 @@ pub struct OutboxEntry {
 pub struct TaxonomyEntry {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
     pub id: Option<ObjectId>,
+    /// 租户边界。旧文档由 m032 回填；serde default 仅用于滚动升级窗口兜底。
+    #[serde(default = "default_taxonomy_workspace_id")]
+    pub workspace_id: String,
     /// `"global"` 或 `account_id` 字符串。
     pub scope: String,
     /// 维度名（如 `"customer_stage"` / `"intent_level"` / `"objection_type"`）。
@@ -3105,6 +3119,9 @@ pub struct TaxonomyValue {
 pub struct TaxonomyCandidate {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
     pub id: Option<ObjectId>,
+    /// 租户边界。候选与正式字典必须落在同一 workspace。
+    #[serde(default = "default_taxonomy_workspace_id")]
+    pub workspace_id: String,
     pub scope: String,
     pub kind: String,
     pub raw_value: String,
@@ -3125,6 +3142,10 @@ pub struct TaxonomyCandidate {
     /// 存量候选文档向后兼容（缺省 None）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suggested_display_name: Option<String>,
+}
+
+pub(crate) fn default_taxonomy_workspace_id() -> String {
+    std::env::var("DEFAULT_WORKSPACE_ID").unwrap_or_else(|_| "default".to_string())
 }
 
 /// 数字分身建议链 T5：`relationship_type_suggestions` 集合结构。
@@ -5704,6 +5725,7 @@ mod typed_tests {
         let now = DateTime::now();
         let entry = TaxonomyEntry {
             id: None,
+            workspace_id: "default".to_string(),
             scope: "global".to_string(),
             kind: "customer_stage".to_string(),
             value: TaxonomyValue {
@@ -5757,6 +5779,7 @@ mod typed_tests {
         let now = DateTime::now();
         let candidate = TaxonomyCandidate {
             id: None,
+            workspace_id: "default".to_string(),
             scope: "default".to_string(),
             kind: "objection_type".to_string(),
             raw_value: "价格敏感_新词".to_string(),
@@ -6219,6 +6242,7 @@ mod typed_tests {
             id: None,
             signal_id: "gap_001".to_string(),
             workspace_id: "default".to_string(),
+            dedup_key: Some("dedup-hash".to_string()),
             kind: "broken_link".to_string(),
             title: "悬挂关系".to_string(),
             description: "chunk 引用已归档的目标".to_string(),

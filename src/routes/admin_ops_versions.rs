@@ -750,10 +750,14 @@ pub async fn publish_taxonomy_version(
     let object_id = parse_object_id(&id)?;
     let coll = state.db.collection_system_taxonomies();
     let source = coll
-        .find_one(doc! { "_id": object_id }, None)
+        .find_one(
+            doc! { "_id": object_id, "workspace_id": &admin.current_workspace },
+            None,
+        )
         .await?
         .ok_or_else(|| AppError::NotFound("taxonomy entry not found".to_string()))?;
     let scope = doc! {
+        "workspace_id": &admin.current_workspace,
         "scope": &source.scope,
         "kind": &source.kind,
         "value.id": &source.value.id,
@@ -766,6 +770,7 @@ pub async fn publish_taxonomy_version(
     let now = DateTime::now();
     let new_entry = TaxonomyEntry {
         id: None,
+        workspace_id: admin.current_workspace.clone(),
         scope: source.scope.clone(),
         kind: source.kind.clone(),
         value: source.value.clone(),
@@ -778,6 +783,7 @@ pub async fn publish_taxonomy_version(
     let inserted = coll.insert_one(&new_entry, None).await?;
     coll.update_many(
         doc! {
+            "workspace_id": &admin.current_workspace,
             "scope": &source.scope,
             "kind": &source.kind,
             "value.id": &source.value.id,
@@ -805,18 +811,22 @@ pub async fn rollout_taxonomy_version(
     let object_id = parse_object_id(&id)?;
     let coll = state.db.collection_system_taxonomies();
     let target = coll
-        .find_one(doc! { "_id": object_id }, None)
+        .find_one(
+            doc! { "_id": object_id, "workspace_id": &admin.current_workspace },
+            None,
+        )
         .await?
         .ok_or_else(|| AppError::NotFound("taxonomy entry not found".to_string()))?;
     let now = DateTime::now();
     coll.update_one(
-        doc! { "_id": object_id },
+        doc! { "_id": object_id, "workspace_id": &admin.current_workspace },
         doc! { "$set": { "current_version": true, "updated_at": now } },
         None,
     )
     .await?;
     coll.update_many(
         doc! {
+            "workspace_id": &admin.current_workspace,
             "scope": &target.scope,
             "kind": &target.kind,
             "value.id": &target.value.id,
@@ -839,7 +849,10 @@ pub async fn rollback_taxonomy_version(
     let object_id = parse_object_id(&id)?;
     let coll = state.db.collection_system_taxonomies();
     let target = coll
-        .find_one(doc! { "_id": object_id }, None)
+        .find_one(
+            doc! { "_id": object_id, "workspace_id": &admin.current_workspace },
+            None,
+        )
         .await?
         .ok_or_else(|| AppError::NotFound("taxonomy entry not found".to_string()))?;
     let prev_version = target.previous_version.ok_or_else(|| {
@@ -848,6 +861,7 @@ pub async fn rollback_taxonomy_version(
     let prev = coll
         .find_one(
             doc! {
+                "workspace_id": &admin.current_workspace,
                 "scope": &target.scope,
                 "kind": &target.kind,
                 "value.id": &target.value.id,
@@ -866,13 +880,14 @@ pub async fn rollback_taxonomy_version(
         .ok_or_else(|| AppError::BadRequest("previous version has no _id".to_string()))?;
     let now = DateTime::now();
     coll.update_one(
-        doc! { "_id": prev_id },
+        doc! { "_id": prev_id, "workspace_id": &admin.current_workspace },
         doc! { "$set": { "current_version": true, "updated_at": now } },
         None,
     )
     .await?;
     coll.update_many(
         doc! {
+            "workspace_id": &admin.current_workspace,
             "scope": &target.scope,
             "kind": &target.kind,
             "value.id": &target.value.id,

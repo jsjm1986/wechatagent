@@ -14,7 +14,10 @@ use serde_json::{json, Value};
 pub(crate) const REVIEWER_ASSIST_YIELD_NOTE: &str = "\n【受控例外·辅助模式】本账号已开启辅助模式。在辅助模式下，AI 主动为契合条件的客户增配一位「专属顾问」（决策里的 namecardToSend）是本账号的受控业务动作，定位是「我为你增配一位更专属的顾问、我仍在场辅助答疑」。评审时请注意两点：① 这一引荐动作不属于「对话中除『我』之外不得出现任何人类角色」红线所禁止的范畴，该红线在「引荐专属顾问」上让位，不要因此判 needs_revision；② 引荐专属顾问不是对产品能力/价格/效果的声明，不计入 hallucination/产品准确度评分（不要据此抬高 factRisk）。仅当客户真正契合（明确要签约/到店/深度对接）时才引荐，不为引荐而引荐。\n";
 
 /// 辅助模式是否对本客户生效。客户级 override > 账号级 enabled > 默认关。
-pub(crate) fn assist_mode_active(account_enabled: Option<bool>, override_attr: Option<&str>) -> bool {
+pub(crate) fn assist_mode_active(
+    account_enabled: Option<bool>,
+    override_attr: Option<&str>,
+) -> bool {
     match override_attr {
         Some("force_on") => true,
         Some("force_off") => false,
@@ -114,8 +117,7 @@ pub(crate) async fn send_outbound_namecard(
     contact: &crate::models::Contact,
     card_id: &str,
 ) -> AppResult<Value> {
-    let oid = ObjectId::parse_str(card_id)
-        .map_err(|_| AppError::External("bad card_id".into()))?;
+    let oid = ObjectId::parse_str(card_id).map_err(|_| AppError::External("bad card_id".into()))?;
     // 查询带 workspace_id scope（防跨租户读名片，与 send_outbound_media 的 IDOR 防御对齐）。
     let card = state
         .db
@@ -142,6 +144,12 @@ pub(crate) async fn send_outbound_namecard(
         json!({ "recipient": contact.wxid, "targetWxid": card.target_wxid }),
     )
     .await?;
+
+    if !super::gateway::send_receipt_is_ok(&resp) {
+        return Err(AppError::External(
+            "namecard send returned a negative or unverifiable delivery receipt".into(),
+        ));
+    }
 
     // MCP 已成功 = 名片已送达客户，既成事实。此后落库/置态失败**绝不**返 Err——
     // 否则 dispatcher 会 retry 重发，客户收到重复名片（与 send_outbound_media 对称）。
@@ -213,13 +221,19 @@ mod tests {
 
     fn card(enabled: bool, review: &str, stages: Vec<&str>) -> ReferralCard {
         ReferralCard {
-            id: None, workspace_id: "ws".into(), account_id: None,
-            target_wxid: "wxid_boss".into(), display_name: "老王".into(),
+            id: None,
+            workspace_id: "ws".into(),
+            account_id: None,
+            target_wxid: "wxid_boss".into(),
+            display_name: "老王".into(),
             send_trigger_hint: "要签约时引荐".into(),
             target_stages: stages.into_iter().map(|s| s.to_string()).collect(),
             tags: vec![],
-            enabled, review_status: review.into(), review_note: None,
-            created_at: DateTime::now(), updated_at: DateTime::now(),
+            enabled,
+            review_status: review.into(),
+            review_note: None,
+            created_at: DateTime::now(),
+            updated_at: DateTime::now(),
         }
     }
 
@@ -238,12 +252,19 @@ mod tests {
     #[test]
     fn render_referral_includes_tags() {
         let mut card = ReferralCard {
-            id: None, workspace_id: "ws".into(), account_id: None,
-            target_wxid: "wxid_boss".into(), display_name: "老王".into(),
-            send_trigger_hint: "签约时引荐".into(), target_stages: vec!["意向".into()],
+            id: None,
+            workspace_id: "ws".into(),
+            account_id: None,
+            target_wxid: "wxid_boss".into(),
+            display_name: "老王".into(),
+            send_trigger_hint: "签约时引荐".into(),
+            target_stages: vec!["意向".into()],
             tags: vec!["高客单".into()],
-            enabled: true, review_status: "approved".into(), review_note: None,
-            created_at: DateTime::now(), updated_at: DateTime::now(),
+            enabled: true,
+            review_status: "approved".into(),
+            review_note: None,
+            created_at: DateTime::now(),
+            updated_at: DateTime::now(),
         };
         let out = render_referral_lines(&[&card], None);
         assert!(out.contains("高客单"), "引荐候选应渲染 tags");
@@ -269,16 +290,31 @@ mod tests {
 
     #[test]
     fn validate_excludes_draft_and_disabled() {
-        assert!(validate_card_sendable(&card(true, "approved", vec![]), "acct"));
-        assert!(!validate_card_sendable(&card(false, "approved", vec![]), "acct"));
-        assert!(!validate_card_sendable(&card(true, "draft", vec![]), "acct"));
+        assert!(validate_card_sendable(
+            &card(true, "approved", vec![]),
+            "acct"
+        ));
+        assert!(!validate_card_sendable(
+            &card(false, "approved", vec![]),
+            "acct"
+        ));
+        assert!(!validate_card_sendable(
+            &card(true, "draft", vec![]),
+            "acct"
+        ));
     }
 
     #[test]
     fn validate_card_account_scope() {
         // global 卡（account_id=None）→ 任何 account 可用（行为不变，与候选 DB filter $or:[null,...] 一致）。
-        assert!(validate_card_sendable(&card(true, "approved", vec![]), "acct_A"));
-        assert!(validate_card_sendable(&card(true, "approved", vec![]), "acct_B"));
+        assert!(validate_card_sendable(
+            &card(true, "approved", vec![]),
+            "acct_A"
+        ));
+        assert!(validate_card_sendable(
+            &card(true, "approved", vec![]),
+            "acct_B"
+        ));
 
         // 绑定 acct_A 的卡：只有 acct_A 可用，acct_B 拒（KE-03 核心：跨账号不可推）。
         let mut bound = card(true, "approved", vec![]);
@@ -300,7 +336,7 @@ mod tests {
         let all = vec![
             card(true, "approved", vec!["意向"]),   // 命中
             card(true, "approved", vec!["已成交"]), // 不命中
-            card(true, "approved", vec![]),          // 空 = 总命中
+            card(true, "approved", vec![]),         // 空 = 总命中
             card(false, "approved", vec!["意向"]),  // 排除：disabled
         ];
         let kept = filter_referral_candidates(&all, Some("意向"), "acct");
@@ -313,7 +349,10 @@ mod tests {
         let line = render_referral_lines(&[&c], None);
         assert!(line.contains("要签约时引荐"));
         assert!(line.contains("老王"));
-        let already = AlreadyReferred { display_name: "老王".into(), card_id: "c1".into() };
+        let already = AlreadyReferred {
+            display_name: "老王".into(),
+            card_id: "c1".into(),
+        };
         let line2 = render_referral_lines(&[&c], Some(&already));
         assert!(line2.contains("已") && line2.contains("老王"));
     }
@@ -330,6 +369,9 @@ mod tests {
         assert!(d.contains_key("domain_attributes.referred_specialist_at"));
         assert!(d.contains_key("domain_attributes.referred_card_id"));
         assert!(d.contains_key("domain_attributes_updated_at"));
-        assert_eq!(d.get_str("domain_attributes.referred_card_id").ok(), Some("c1"));
+        assert_eq!(
+            d.get_str("domain_attributes.referred_card_id").ok(),
+            Some("c1")
+        );
     }
 }

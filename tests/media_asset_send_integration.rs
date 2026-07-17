@@ -270,7 +270,9 @@ async fn media_outbox_entry_is_idempotent_per_asset() {
         .await
         .expect("second enqueue ok");
     match second {
-        EnqueueOutcome::IdempotentSkip { idempotency_key } => {
+        EnqueueOutcome::IdempotentSkip {
+            idempotency_key, ..
+        } => {
             assert_eq!(
                 idempotency_key, first_key,
                 "同 asset 二次入队应命中同一幂等键"

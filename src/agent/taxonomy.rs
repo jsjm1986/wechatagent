@@ -13,8 +13,6 @@
 //! - [`check_value`]：纯函数，对照 `TaxonomyCache` 命中判定，返回 [`TaxonomyMatch`]。
 //! - [`upsert_candidate`]：幂等 upsert（按 `(scope, kind, raw_value)` 唯一），
 //!   `pending` → 累加 `occurrences`、`rejected` → 仅刷 `last_seen_at`、不存在 → insert pending。
-//! - [`approve`] / [`reject`]：后台审核入口；approve 时事务性把 candidate 写入
-//!   `system_taxonomies` 并把 candidate.status=approved。
 //! - [`TaxonomyCache`]：进程级 TTL 缓存，启动期 + API 写后失效。
 //!
 //! 与 `enforce_decision_guards` 接入：上层把 LLM 返回的 `domainSignals` 字典逐
@@ -25,15 +23,15 @@
 //! - `CandidateNew`：追加 `taxonomy_candidate:<kind>:<value>` risk + 异步 upsert
 //!   候选；不强制 `review.approved=false`。
 
-use mongodb::bson::{doc, oid::ObjectId, DateTime};
+use mongodb::bson::{doc, DateTime};
 use parking_lot::Mutex as PlMutex;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::db::Database;
-use crate::error::{AppError, AppResult};
-use crate::models::{TaxonomyCandidate, TaxonomyEntry, TaxonomyValue};
+use crate::error::AppResult;
+use crate::models::{TaxonomyCandidate, TaxonomyEntry};
 
 /// 缓存有效期：30s。后台 API 在 approve/reject/insert/update/delete 时
 /// 主动失效 [`TaxonomyCache`]，保证下一次 `check_value` 命中最新数据；
@@ -70,8 +68,8 @@ pub struct TaxonomyCache {
 }
 
 struct TaxonomyCacheInner {
-    /// `(scope, kind)` → entries（active + deprecated 都进缓存）。
-    entries: HashMap<(String, String), Vec<CachedEntry>>,
+    /// `(workspace_id, scope, kind)` → entries（active + deprecated 都进缓存）。
+    entries: HashMap<(String, String, String), Vec<CachedEntry>>,
     fetched_at: Option<Instant>,
 }
 
@@ -137,9 +135,13 @@ impl TaxonomyCache {
             .collection_system_taxonomies()
             .find(doc! { "current_version": true }, None)
             .await?;
-        let mut entries: HashMap<(String, String), Vec<CachedEntry>> = HashMap::new();
+        let mut entries: HashMap<(String, String, String), Vec<CachedEntry>> = HashMap::new();
         while let Some(entry) = cursor.try_next().await? {
-            let key = (entry.scope.clone(), entry.kind.clone());
+            let key = (
+                entry.workspace_id.clone(),
+                entry.scope.clone(),
+                entry.kind.clone(),
+            );
             entries
                 .entry(key)
                 .or_insert_with(Vec::new)
@@ -174,8 +176,15 @@ impl TaxonomyCache {
 
     /// 查找或自动加载（TTL 过期 → 异步加载）。
     /// 注意：本方法保持调用方 `&self`，内部异步加载完成后写回 inner。
-    pub(crate) async fn find_or_load(&self, db: &Database) {
-        if self.is_stale() {
+    pub(crate) async fn find_or_load(&self, db: &Database, workspace_id: &str) {
+        let seeded = match ensure_workspace_taxonomies(db, workspace_id).await {
+            Ok(seeded) => seeded,
+            Err(error) => {
+                tracing::warn!(?error, workspace_id, "workspace taxonomy initialization failed");
+                false
+            }
+        };
+        if seeded || self.is_stale() {
             if let Err(error) = self.reload_from_db(db).await {
                 tracing::warn!(?error, "TaxonomyCache.reload_from_db failed");
             }
@@ -209,6 +218,7 @@ impl TaxonomyCache {
 ///
 /// `scope` 优先按 `account_id` 查，未命中再按 `"global"` 查（两层 fallback）。
 pub(crate) fn check_value(
+    workspace_id: &str,
     kind: &str,
     raw_value: &str,
     scope_account_id: &str,
@@ -217,7 +227,11 @@ pub(crate) fn check_value(
     let inner = cache.inner.lock();
     // 优先看 account 私有字典；未命中再看 global。
     for scope in [scope_account_id, "global"] {
-        let key = (scope.to_string(), kind.to_string());
+        let key = (
+            workspace_id.to_string(),
+            scope.to_string(),
+            kind.to_string(),
+        );
         if let Some(entries) = inner.entries.get(&key) {
             // 1) canonical_id 命中（active 优先于 deprecated）。
             if let Some(entry) = entries
@@ -264,6 +278,7 @@ pub(crate) fn check_value(
 /// 调用方负责保证 cache 已加载。planner 每个 tick 调一次构造 `PlannerStageConfig`，
 /// 避免 N+1。空缓存（未配置 / 加载失败）返回空 Vec，planner 回落写死的 DEFAULT。
 pub(crate) fn dimension_value_weights(
+    workspace_id: &str,
     kind: &str,
     scope_account_id: &str,
     cache: &TaxonomyCache,
@@ -272,7 +287,11 @@ pub(crate) fn dimension_value_weights(
     let mut out: Vec<(String, Option<i32>, bool, bool)> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for scope in [scope_account_id, "global"] {
-        let key = (scope.to_string(), kind.to_string());
+        let key = (
+            workspace_id.to_string(),
+            scope.to_string(),
+            kind.to_string(),
+        );
         if let Some(entries) = inner.entries.get(&key) {
             for e in entries {
                 if seen.insert(e.canonical_id.clone()) {
@@ -293,6 +312,7 @@ pub(crate) fn dimension_value_weights(
 /// scope 回落：account 私有 scope 优先，再补 global；按 canonical_id 去重。
 /// 流 A prompt 取值指引 + 流 B 前端字典翻译共用。
 pub(crate) fn dimension_values_with_labels(
+    workspace_id: &str,
     kind: &str,
     scope_account_id: &str,
     cache: &TaxonomyCache,
@@ -301,7 +321,11 @@ pub(crate) fn dimension_values_with_labels(
     let mut out: Vec<(String, String)> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for scope in [scope_account_id, "global"] {
-        let key = (scope.to_string(), kind.to_string());
+        let key = (
+            workspace_id.to_string(),
+            scope.to_string(),
+            kind.to_string(),
+        );
         if let Some(entries) = inner.entries.get(&key) {
             for e in entries {
                 if e.status == "active" && seen.insert(e.canonical_id.clone()) {
@@ -324,12 +348,21 @@ pub(crate) fn dimension_values_with_labels(
 /// 调用方负责保证 cache 已加载。读 [scope, "global"] 两层，任一层存在 status=="active"
 /// 的条目即 true。纯 deprecated 残留（active=0）视同「未配置」→ false（F-009 fail-soft：
 /// 字典只剩 deprecated 时不 Reject，KindUnconfigured→Accept 回退信任原值）。
-pub(crate) fn kind_has_entries(kind: &str, scope_account_id: &str, cache: &TaxonomyCache) -> bool {
+pub(crate) fn kind_has_entries(
+    workspace_id: &str,
+    kind: &str,
+    scope_account_id: &str,
+    cache: &TaxonomyCache,
+) -> bool {
     let inner = cache.inner.lock();
     [scope_account_id, "global"].iter().any(|s| {
         inner
             .entries
-            .get(&(s.to_string(), kind.to_string()))
+            .get(&(
+                workspace_id.to_string(),
+                s.to_string(),
+                kind.to_string(),
+            ))
             .is_some_and(|e| e.iter().any(|c| c.status == "active"))
     })
 }
@@ -348,6 +381,7 @@ pub(crate) fn kind_has_entries(kind: &str, scope_account_id: &str, cache: &Taxon
 /// 并发竞争（两个 run 同时 upsert 同 raw_value）由 unique index + retry 保护。
 pub(crate) async fn upsert_candidate(
     db: &Database,
+    workspace_id: &str,
     scope_account_id: &str,
     kind: &str,
     raw_value: &str,
@@ -362,6 +396,7 @@ pub(crate) async fn upsert_candidate(
     let existing = collection
         .find_one(
             doc! {
+                "workspace_id": workspace_id,
                 "scope": scope_account_id,
                 "kind": kind,
                 "raw_value": raw_value,
@@ -417,6 +452,7 @@ pub(crate) async fn upsert_candidate(
 
     let candidate = TaxonomyCandidate {
         id: None,
+        workspace_id: workspace_id.to_string(),
         scope: scope_account_id.to_string(),
         kind: kind.to_string(),
         raw_value: raw_value.to_string(),
@@ -452,137 +488,6 @@ pub(crate) async fn upsert_candidate(
     }
 }
 
-/// 后台审核 — 通过候选。
-///
-/// 行为：
-/// 1. 把候选 `(scope, kind, raw_value)` 作为 `value.id` 写入 `system_taxonomies`
-///    （`status="active"`、`display_name = raw_value`、aliases 空）；
-/// 2. 把候选 `status` 改为 `"approved"`、`reviewed_at=now`、`reviewed_by=by`；
-/// 3. 让 [`TaxonomyCache`] 失效（调用方传入）。
-///
-/// 注意：本函数 SHALL 由后台 API 用单独的 transaction 包裹（task 4.8 实现），
-/// 这里只暴露最小事务无关的步骤。失败时若 system_taxonomies 已写入但 candidate
-/// 未更新，下次审核会发现 `status != "pending"` 而幂等跳过；若 candidate 更新
-/// 成功但 system_taxonomies 写入失败，下次相同 value 会被视为 CandidateNew 重新
-/// 走流程（少量重复但不破坏正确性）。
-#[allow(dead_code)]
-pub(crate) async fn approve(
-    db: &Database,
-    candidate_id: ObjectId,
-    by: &str,
-    cache: Option<&Arc<TaxonomyCache>>,
-) -> AppResult<TaxonomyEntry> {
-    let collection_candidates = db.collection_taxonomy_candidates();
-    let candidate = collection_candidates
-        .find_one(doc! { "_id": candidate_id }, None)
-        .await?
-        .ok_or_else(|| AppError::NotFound("候选 taxonomy 不存在".to_string()))?;
-    if candidate.status != "pending" {
-        return Err(AppError::BadRequest(format!(
-            "候选状态 = {}，仅 status=pending 可 approve",
-            candidate.status
-        )));
-    }
-
-    let now = DateTime::now();
-    let entry = TaxonomyEntry {
-        id: None,
-        scope: candidate.scope.clone(),
-        kind: candidate.kind.clone(),
-        value: TaxonomyValue {
-            id: candidate.raw_value.clone(),
-            // 流 C：优先用 AI 生成的中文 label（候选 suggested_display_name），缺省回落
-            // 英文 raw_value id（保持与 admin approve 路径口径一致）。
-            display_name: candidate
-                .suggested_display_name
-                .clone()
-                .unwrap_or_else(|| candidate.raw_value.clone()),
-            description: candidate.evidence.clone().unwrap_or_default(),
-            aliases: Vec::new(),
-            status: "active".to_string(),
-            priority_weight: None,
-            is_terminal: false,
-            is_reactivation_target: false,
-        },
-        updated_at: now,
-        version: 1,
-        current_version: true,
-        previous_version: None,
-        seeded_by: Some("manual".to_string()),
-    };
-
-    // 先写字典：(scope, kind, value.id) 唯一索引保证幂等；冲突视为已存在，跳过。
-    match db
-        .collection_system_taxonomies()
-        .insert_one(&entry, None)
-        .await
-    {
-        Ok(_) => {}
-        Err(error) => {
-            let msg = error.to_string();
-            if !(msg.contains("E11000") || msg.contains("duplicate key")) {
-                return Err(error.into());
-            }
-            tracing::info!(
-                scope = candidate.scope.as_str(),
-                kind = candidate.kind.as_str(),
-                value_id = candidate.raw_value.as_str(),
-                "approve_candidate found existing taxonomy entry, skipping insert"
-            );
-        }
-    }
-
-    collection_candidates
-        .update_one(
-            doc! { "_id": candidate_id },
-            doc! {
-                "$set": {
-                    "status": "approved",
-                    "reviewed_at": now,
-                    "reviewed_by": by,
-                }
-            },
-            None,
-        )
-        .await?;
-
-    if let Some(cache) = cache {
-        cache.invalidate();
-    }
-    Ok(entry)
-}
-
-/// 后台审核 — 拒绝候选。
-/// 仅把候选 `status` 改为 `"rejected"`，**不**写字典。
-#[allow(dead_code)]
-pub(crate) async fn reject(
-    db: &Database,
-    candidate_id: ObjectId,
-    by: &str,
-) -> AppResult<()> {
-    let now = DateTime::now();
-    let result = db
-        .collection_taxonomy_candidates()
-        .update_one(
-            doc! { "_id": candidate_id, "status": "pending" },
-            doc! {
-                "$set": {
-                    "status": "rejected",
-                    "reviewed_at": now,
-                    "reviewed_by": by,
-                }
-            },
-            None,
-        )
-        .await?;
-    if result.matched_count == 0 {
-        return Err(AppError::BadRequest(
-            "候选不存在或状态不是 pending".to_string(),
-        ));
-    }
-    Ok(())
-}
-
 // ─────────────────────────────────────────────────────────────────
 // 进程级共享 TaxonomyCache。
 //
@@ -593,6 +498,32 @@ pub(crate) async fn reject(
 
 static GLOBAL_TAXONOMY_CACHE: std::sync::LazyLock<Arc<TaxonomyCache>> =
     std::sync::LazyLock::new(|| Arc::new(TaxonomyCache::new()));
+
+static INITIALIZED_TAXONOMY_WORKSPACES: std::sync::LazyLock<dashmap::DashSet<String>> =
+    std::sync::LazyLock::new(dashmap::DashSet::new);
+
+/// Idempotently install the built-in taxonomy template for a workspace. The
+/// process-local guard avoids repeated upserts while the database name in the
+/// key keeps independent test databases isolated from each other.
+pub async fn ensure_workspace_taxonomies(
+    db: &Database,
+    workspace_id: &str,
+) -> AppResult<bool> {
+    let key = format!("{}:{workspace_id}", db.raw().name());
+    if INITIALIZED_TAXONOMY_WORKSPACES.contains(&key) {
+        return Ok(false);
+    }
+    let inserted = crate::db::migrations::ensure_builtin_taxonomies_for_workspace(
+        db,
+        workspace_id,
+    )
+    .await?;
+    INITIALIZED_TAXONOMY_WORKSPACES.insert(key);
+    if inserted {
+        GLOBAL_TAXONOMY_CACHE.invalidate();
+    }
+    Ok(inserted)
+}
 
 /// 进程级单例 cache 句柄；`enforce_decision_taxonomy_guards` 调用方在没有
 /// 注入自定义 cache 时使用本入口。
@@ -620,9 +551,13 @@ pub(crate) fn invalidate_global_taxonomy_cache() {
 /// 因此从 `cfg(test)` 升级为 `pub`。
 pub fn taxonomy_cache_for_tests(entries: Vec<TaxonomyEntry>) -> TaxonomyCache {
     let cache = TaxonomyCache::new();
-    let mut grouped: HashMap<(String, String), Vec<CachedEntry>> = HashMap::new();
+    let mut grouped: HashMap<(String, String, String), Vec<CachedEntry>> = HashMap::new();
     for entry in entries {
-        let key = (entry.scope.clone(), entry.kind.clone());
+        let key = (
+            entry.workspace_id.clone(),
+            entry.scope.clone(),
+            entry.kind.clone(),
+        );
         grouped.entry(key).or_insert_with(Vec::new).push(CachedEntry {
             canonical_id: entry.value.id,
             aliases: entry.value.aliases,
@@ -648,9 +583,13 @@ mod tests {
 
     fn make_cache_with_entries(entries: Vec<TaxonomyEntry>) -> TaxonomyCache {
         let cache = TaxonomyCache::new();
-        let mut grouped: HashMap<(String, String), Vec<CachedEntry>> = HashMap::new();
+        let mut grouped: HashMap<(String, String, String), Vec<CachedEntry>> = HashMap::new();
         for entry in entries {
-            let key = (entry.scope.clone(), entry.kind.clone());
+            let key = (
+                entry.workspace_id.clone(),
+                entry.scope.clone(),
+                entry.kind.clone(),
+            );
             grouped
                 .entry(key)
                 .or_insert_with(Vec::new)
@@ -682,6 +621,7 @@ mod tests {
     ) -> TaxonomyEntry {
         TaxonomyEntry {
             id: None,
+            workspace_id: "default".to_string(),
             scope: scope.to_string(),
             kind: kind.to_string(),
             value: TaxonomyValue {
@@ -712,7 +652,7 @@ mod tests {
             &["新客", "刚加好友"],
             "active",
         )]);
-        let m = check_value("customer_stage", "first_contact", "acct-1", &cache);
+        let m = check_value("default", "customer_stage", "first_contact", "acct-1", &cache);
         assert_eq!(m, TaxonomyMatch::Active);
     }
 
@@ -726,7 +666,7 @@ mod tests {
             &["新客", "刚加好友"],
             "active",
         )]);
-        let m = check_value("customer_stage", "新客", "acct-1", &cache);
+        let m = check_value("default", "customer_stage", "新客", "acct-1", &cache);
         assert_eq!(m, TaxonomyMatch::AliasActive("first_contact".to_string()));
     }
 
@@ -740,7 +680,7 @@ mod tests {
             &[],
             "deprecated",
         )]);
-        let m = check_value("intent_level", "lukewarm", "acct-1", &cache);
+        let m = check_value("default", "intent_level", "lukewarm", "acct-1", &cache);
         assert_eq!(m, TaxonomyMatch::Deprecated);
     }
 
@@ -755,6 +695,7 @@ mod tests {
             "active",
         )]);
         let m = check_value(
+            "default",
             "objection_type",
             "完全没听过的异议类型",
             "acct-1",
@@ -778,7 +719,7 @@ mod tests {
                 "active",
             ),
         ]);
-        let m = check_value("customer_stage", "first_contact", "acct-1", &cache);
+        let m = check_value("default", "customer_stage", "first_contact", "acct-1", &cache);
         // 命中 account scope 的 alias，返回 canonical_id = premium_first_contact
         assert_eq!(
             m,
@@ -801,8 +742,8 @@ mod tests {
                 "deprecated",
             ),
         ]);
-        let stage = check_value("customer_stage", "shared_value", "acct-1", &cache);
-        let intent = check_value("intent_level", "shared_value", "acct-1", &cache);
+        let stage = check_value("default", "customer_stage", "shared_value", "acct-1", &cache);
+        let intent = check_value("default", "intent_level", "shared_value", "acct-1", &cache);
         assert_eq!(stage, TaxonomyMatch::Active);
         assert_eq!(intent, TaxonomyMatch::Deprecated);
     }
@@ -820,15 +761,15 @@ mod tests {
         ]);
 
         // 三类未知值都应判为 CandidateNew（由调用方写入 taxonomy_candidates）。
-        let unknown_stage = check_value("customer_stage", "未知阶段_xx", "acct-1", &cache);
-        let unknown_intent = check_value("intent_level", "lukewarm_xx", "acct-1", &cache);
-        let unknown_objection = check_value("objection_type", "全新异议_xx", "acct-1", &cache);
+        let unknown_stage = check_value("default", "customer_stage", "未知阶段_xx", "acct-1", &cache);
+        let unknown_intent = check_value("default", "intent_level", "lukewarm_xx", "acct-1", &cache);
+        let unknown_objection = check_value("default", "objection_type", "全新异议_xx", "acct-1", &cache);
         assert_eq!(unknown_stage, TaxonomyMatch::CandidateNew);
         assert_eq!(unknown_intent, TaxonomyMatch::CandidateNew);
         assert_eq!(unknown_objection, TaxonomyMatch::CandidateNew);
 
         // 已知 active 值不进候选。
-        let known = check_value("customer_stage", "first_contact", "acct-1", &cache);
+        let known = check_value("default", "customer_stage", "first_contact", "acct-1", &cache);
         assert_eq!(known, TaxonomyMatch::Active);
     }
 
@@ -945,7 +886,7 @@ mod tests {
             &[],
             "active",
         )]);
-        assert!(kind_has_entries("customer_stage", "acct-1", &cache));
+        assert!(kind_has_entries("default", "customer_stage", "acct-1", &cache));
         // account 私有 scope 也算（命中任一层即 true）。
         let cache2 = make_cache_with_entries(vec![make_entry(
             "acct-1",
@@ -955,7 +896,7 @@ mod tests {
             &[],
             "active",
         )]);
-        assert!(kind_has_entries("customer_stage", "acct-1", &cache2));
+        assert!(kind_has_entries("default", "customer_stage", "acct-1", &cache2));
     }
 
     /// `kind_has_entries`：该 kind 字典整个为空（未配置，如 m012 删 seed 后）→ false。
@@ -971,10 +912,10 @@ mod tests {
             &[],
             "active",
         )]);
-        assert!(!kind_has_entries("customer_stage", "acct-1", &cache));
+        assert!(!kind_has_entries("default", "customer_stage", "acct-1", &cache));
         // 完全空缓存。
         let empty = make_cache_with_entries(vec![]);
-        assert!(!kind_has_entries("customer_stage", "acct-1", &empty));
+        assert!(!kind_has_entries("default", "customer_stage", "acct-1", &empty));
     }
 
     /// `kind_has_entries`：该 kind 只剩 deprecated 残留（active=0）→ false（F-009）。
@@ -990,7 +931,7 @@ mod tests {
             &[],
             "deprecated",
         )]);
-        assert!(!kind_has_entries("customer_stage", "acct-1", &cache));
+        assert!(!kind_has_entries("default", "customer_stage", "acct-1", &cache));
         // active + deprecated 混存时仍 true（有 active 即算已配置）。
         let mixed = make_cache_with_entries(vec![
             make_entry(
@@ -1010,7 +951,7 @@ mod tests {
                 "active",
             ),
         ]);
-        assert!(kind_has_entries("customer_stage", "acct-1", &mixed));
+        assert!(kind_has_entries("default", "customer_stage", "acct-1", &mixed));
     }
 
     /// `dimension_values_with_labels_returns_id_label_pairs`
@@ -1023,7 +964,7 @@ mod tests {
             make_entry("global", "customer_stage", "qualified", "已确认意向", &[], "active"),
             make_entry("global", "customer_stage", "old_dep", "废弃", &[], "deprecated"),
         ]);
-        let mut got = dimension_values_with_labels("customer_stage", "acct1", &cache);
+        let mut got = dimension_values_with_labels("default", "customer_stage", "acct1", &cache);
         got.sort();
         assert_eq!(
             got,
@@ -1032,5 +973,34 @@ mod tests {
                 ("qualified".to_string(), "已确认意向".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn cache_does_not_leak_entries_across_workspaces() {
+        let mut entry = make_entry(
+            "global",
+            "customer_stage",
+            "ws_a_only",
+            "A 租户专用",
+            &[],
+            "active",
+        );
+        entry.workspace_id = "ws-a".to_string();
+        let cache = make_cache_with_entries(vec![entry]);
+
+        assert_eq!(
+            check_value("ws-a", "customer_stage", "ws_a_only", "acct-1", &cache),
+            TaxonomyMatch::Active
+        );
+        assert_eq!(
+            check_value("ws-b", "customer_stage", "ws_a_only", "acct-1", &cache),
+            TaxonomyMatch::CandidateNew
+        );
+        assert!(!kind_has_entries(
+            "ws-b",
+            "customer_stage",
+            "acct-1",
+            &cache
+        ));
     }
 }

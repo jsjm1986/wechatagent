@@ -13,6 +13,7 @@ export const CANONICAL_KEYS = [
   "scope",
   "status",
   "suggestedDisplayName",
+  "workspaceId",
 ] as const;
 
 export type CanonicalKey = (typeof CANONICAL_KEYS)[number];

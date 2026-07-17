@@ -162,7 +162,9 @@ reason 必须引用待评回复里的具体片段 / 措辞，不许空泛地说\
     // completeness 锚点（coverage_dimensions 的 anchor_hint，供 helpfulness/factualRestraint 参考）。
     let coverage_hint = render_coverage_hint(profile);
     if !coverage_hint.is_empty() {
-        system.push_str(&format!("本行业信息完整度关注点（仅供参考）：{coverage_hint}\n"));
+        system.push_str(&format!(
+            "本行业信息完整度关注点（仅供参考）：{coverage_hint}\n"
+        ));
     }
 
     // ── 输出格式契约（与现有 judge 同口径：嵌套 {score,reason} + verdict）────────
@@ -317,7 +319,11 @@ pub async fn run_judge_graded(
     samples: usize,
     gate: JudgeGate,
 ) -> Option<JudgeOutcome> {
-    if std::env::var("REAL_LLM_JUDGE").map(|v| v == "1").unwrap_or(false) != true {
+    if std::env::var("REAL_LLM_JUDGE")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+        != true
+    {
         eprintln!("[裁判:{label}] 跳过（未设 REAL_LLM_JUDGE=1）");
         return None;
     }
@@ -336,9 +342,10 @@ pub async fn run_judge_graded(
     let k = samples.max(1);
     let user = build_judge_user(label, inbound, reply);
 
-    let results =
-        futures::future::join_all((0..k).map(|_| judge.generate_json_with_usage(&rubric.system, &user)))
-            .await;
+    let results = futures::future::join_all(
+        (0..k).map(|_| judge.generate_json_with_usage(&rubric.system, &user)),
+    )
+    .await;
 
     let mut per_dim: HashMap<String, Vec<i64>> = HashMap::new();
     let mut ok = 0usize;

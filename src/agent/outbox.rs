@@ -89,6 +89,9 @@ pub enum OutboxError {
     /// 入参非法（content 为空 / contact_wxid 为空 等）。
     #[error("outbox invalid input: {0}")]
     Invalid(String),
+    /// 唯一键已冲突但无法回读既有条目，说明幂等事实链损坏。
+    #[error("outbox invariant violation: {0}")]
+    Invariant(String),
 }
 
 impl From<OutboxError> for AppError {
@@ -96,6 +99,7 @@ impl From<OutboxError> for AppError {
         match value {
             OutboxError::Db(e) => AppError::Db(e),
             OutboxError::Invalid(msg) => AppError::BadRequest(msg),
+            OutboxError::Invariant(msg) => AppError::External(msg),
         }
     }
 }
@@ -116,6 +120,11 @@ pub enum EnqueueOutcome {
     IdempotentSkip {
         /// 触发 skip 的 idempotency_key。
         idempotency_key: String,
+        /// 已占用该幂等键的真实 outbox，供调用方区分“本 decision 重试”与“跨 run 去重”。
+        existing_outbox_id: ObjectId,
+        existing_run_id: String,
+        existing_decision_id: Option<ObjectId>,
+        existing_status: String,
     },
 }
 
@@ -305,6 +314,19 @@ pub async fn enqueue(state: &AppState, req: EnqueueRequest) -> Result<EnqueueOut
             })
         }
         Err(err) if is_duplicate_key_error(&err) => {
+            let existing = collection
+                .find_one(doc! { "idempotency_key": &idempotency_key }, None)
+                .await?
+                .ok_or_else(|| {
+                    OutboxError::Invariant(format!(
+                        "duplicate idempotency_key {idempotency_key} has no existing row"
+                    ))
+                })?;
+            let existing_outbox_id = existing.id.ok_or_else(|| {
+                OutboxError::Invariant(format!(
+                    "duplicate idempotency_key {idempotency_key} row has no _id"
+                ))
+            })?;
             let _ = write_outbox_event(
                 state,
                 &req.account_id,
@@ -319,7 +341,13 @@ pub async fn enqueue(state: &AppState, req: EnqueueRequest) -> Result<EnqueueOut
                 }),
             )
             .await;
-            Ok(EnqueueOutcome::IdempotentSkip { idempotency_key })
+            Ok(EnqueueOutcome::IdempotentSkip {
+                idempotency_key,
+                existing_outbox_id,
+                existing_run_id: existing.run_id,
+                existing_decision_id: existing.decision_id,
+                existing_status: existing.status,
+            })
         }
         Err(err) => Err(OutboxError::Db(err)),
     }

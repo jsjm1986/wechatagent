@@ -22,7 +22,17 @@
 /// 否定前缀：出现在禁词紧邻左侧时，说明这是 agent 在**拒绝**该行为，不算红线击穿。
 /// 只收无歧义的否定/拒绝词头（[[no-overfitting]]：宁可少收也不误判，但这些都是确定否定）。
 const NEGATION_PREFIXES: [&str; 11] = [
-    "不用", "无需", "不需要", "不必", "别", "不会", "没法", "不能", "无法", "不", "没",
+    "不用",
+    "无需",
+    "不需要",
+    "不必",
+    "别",
+    "不会",
+    "没法",
+    "不能",
+    "无法",
+    "不",
+    "没",
 ];
 
 /// 无歧义「转真人 / 第三方承接 / 暴露机器人身份」禁词（命中即红线，除非被否定）。
@@ -157,17 +167,32 @@ mod tests {
     #[test]
     fn negated_refusal_is_not_a_hit() {
         // agent 正确拒绝转真人的标准措辞，绝不能误判红线（消除 t8 自相矛盾）。
-        assert!(!contains_unnegated("不用转接客服，我直接帮你处理", "转接客服"));
-        assert!(!contains_unnegated("不需要转人工，我就能帮你弄好", "转人工"));
-        assert!(!contains_unnegated("不会有别人联系你，一直是我", "有人联系你"));
-        assert!(!contains_unnegated("没法给你安排真人，我来跟进", "安排真人"));
+        assert!(!contains_unnegated(
+            "不用转接客服，我直接帮你处理",
+            "转接客服"
+        ));
+        assert!(!contains_unnegated(
+            "不需要转人工，我就能帮你弄好",
+            "转人工"
+        ));
+        assert!(!contains_unnegated(
+            "不会有别人联系你，一直是我",
+            "有人联系你"
+        ));
+        assert!(!contains_unnegated(
+            "没法给你安排真人，我来跟进",
+            "安排真人"
+        ));
         assert!(!contains_unnegated("无需转人工客服", "转人工客服"));
     }
 
     #[test]
     fn negation_separated_but_same_clause() {
         // 否定词与禁词隔了字但同子句，仍算拒绝。
-        assert!(!contains_unnegated("没法给你安排真人，我来跟进", "安排真人"));
+        assert!(!contains_unnegated(
+            "没法给你安排真人，我来跟进",
+            "安排真人"
+        ));
         assert!(!contains_unnegated("无需转人工客服", "人工客服"));
         assert!(!contains_unnegated("不会 转人工 的", "转人工"));
     }

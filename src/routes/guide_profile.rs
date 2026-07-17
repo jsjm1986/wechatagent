@@ -462,6 +462,7 @@ pub async fn generate_domain_profile_candidate(
         for (id, label) in values {
             let _ = agent::taxonomy::upsert_candidate(
                 &state.db,
+                &admin.current_workspace,
                 "global",
                 kind,
                 id,

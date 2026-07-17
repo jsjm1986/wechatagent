@@ -16,5 +16,6 @@
     "label": "首次接触",
     "status": "active"
   },
-  "version": 1
+  "version": 1,
+  "workspaceId": "default"
 }

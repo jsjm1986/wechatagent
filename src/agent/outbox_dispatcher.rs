@@ -22,11 +22,14 @@
 
 use std::time::Duration;
 
+use futures::TryStreamExt;
 use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
-use mongodb::options::{FindOneAndUpdateOptions, ReturnDocument};
+use mongodb::options::{
+    FindOneAndUpdateOptions, FindOptions, ReturnDocument, UpdateOptions,
+};
 
 use crate::error::AppResult;
-use crate::models::{AgentStatus, OutboxEntry};
+use crate::models::{AgentStatus, AgentTask, OutboxEntry};
 use crate::routes::AppState;
 
 use super::outbox::{
@@ -260,20 +263,151 @@ pub async fn second_safety_gate(
     ))
 }
 
-/// **反向通知通道（W4 / Task 5.5 收尾）**：dispatcher 在状态推进时把
-/// `agent_run_logs.outbox_status` 更新为最新 outbox 状态，便于运营 / 审计
-/// 直接从 run log 看到本次 run 的发送链路最终走向（sent / canceled /
-/// failed_terminal / pending_retry）。run_id 缺失时无操作。
-async fn update_run_log_outbox_status(state: &AppState, run_id: &str, outbox_status: &str) {
+fn aggregate_run_outbox_status<'a>(
+    statuses: impl IntoIterator<Item = &'a str>,
+) -> Option<&'static str> {
+    let statuses: Vec<&str> = statuses.into_iter().collect();
+    if statuses.is_empty() {
+        return None;
+    }
+    if statuses
+        .iter()
+        .any(|status| *status == OutboxStatus::InFlight.as_str())
+    {
+        return Some(OutboxStatus::InFlight.as_str());
+    }
+    if statuses
+        .iter()
+        .any(|status| *status == OutboxStatus::Pending.as_str())
+    {
+        return Some(OutboxStatus::Pending.as_str());
+    }
+
+    let sent = statuses
+        .iter()
+        .filter(|status| **status == OutboxStatus::Sent.as_str())
+        .count();
+    if sent == statuses.len() {
+        return Some(OutboxStatus::Sent.as_str());
+    }
+    if sent > 0 {
+        return Some("partially_sent");
+    }
+    if statuses
+        .iter()
+        .any(|status| *status == OutboxStatus::FailedTerminal.as_str())
+    {
+        return Some(OutboxStatus::FailedTerminal.as_str());
+    }
+    Some(OutboxStatus::Canceled.as_str())
+}
+
+fn run_outbox_refresh_write_filter(
+    run_id: &str,
+    run_status: Option<&str>,
+    generation: i64,
+) -> Document {
+    let mut filter = doc! {
+        "run_id": run_id,
+        "outbox_refresh_generation": generation,
+    };
+    if let Some(status) = run_status {
+        filter.insert("status", status);
+    }
+    filter
+}
+
+/// 按同一 run 的完整 outbox 集合重算聚合状态。不能让单条 entry 的最后写入者
+/// 覆盖 run 级事实：`sent + canceled/failed_terminal` 稳定记为 `partially_sent`。
+pub(crate) async fn refresh_run_log_outbox_status(state: &AppState, run_id: &str) {
     if run_id.is_empty() {
         return;
     }
+    // 每次刷新先原子领取递增 generation。较早刷新即使在较晚刷新之后才完成查询，
+    // 最终 CAS 也会因 generation 不匹配而放弃，避免旧快照把 sent 倒退成 pending。
+    let snapshot = match state
+        .db
+        .agent_run_logs()
+        .clone_with_type::<Document>()
+        .find_one_and_update(
+            doc! { "run_id": run_id },
+            doc! { "$inc": { "outbox_refresh_generation": 1i64 } },
+            FindOneAndUpdateOptions::builder()
+                .return_document(ReturnDocument::After)
+                .build(),
+        )
+        .await
+    {
+        Ok(Some(log)) => log,
+        Ok(None) => return,
+        Err(err) => {
+            tracing::warn!(?err, run_id, "reserve run outbox aggregation generation failed");
+            return;
+        }
+    };
+    let run_status = snapshot.get_str("status").ok().map(str::to_string);
+    let generation = snapshot
+        .get_i64("outbox_refresh_generation")
+        .or_else(|_| {
+            snapshot
+                .get_i32("outbox_refresh_generation")
+                .map(i64::from)
+        })
+        .unwrap_or_default();
+    let mut cursor = match state
+        .db
+        .collection_agent_send_outbox()
+        .find(doc! { "run_id": run_id }, None)
+        .await
+    {
+        Ok(cursor) => cursor,
+        Err(err) => {
+            tracing::warn!(?err, run_id, "query outbox statuses for run failed");
+            return;
+        }
+    };
+    let mut statuses = Vec::new();
+    loop {
+        match cursor.try_next().await {
+            Ok(Some(entry)) => statuses.push(entry.status),
+            Ok(None) => break,
+            Err(err) => {
+                tracing::warn!(?err, run_id, "read outbox statuses for run failed");
+                return;
+            }
+        }
+    }
+    let outbox_status = match run_status.as_deref() {
+        Some("outbox_enqueuing") => OutboxStatus::Pending.as_str(),
+        Some("outbox_enqueue_partial_failure") => {
+            let Some(status) =
+                aggregate_run_outbox_status(statuses.iter().map(String::as_str))
+            else {
+                return;
+            };
+            if status == OutboxStatus::Sent.as_str() {
+                "partially_sent"
+            } else {
+                status
+            }
+        }
+        _ => {
+            let Some(status) =
+                aggregate_run_outbox_status(statuses.iter().map(String::as_str))
+            else {
+                return;
+            };
+            status
+        }
+    };
     let now = DateTime::now();
+    let write_filter =
+        run_outbox_refresh_write_filter(run_id, run_status.as_deref(), generation);
     let res = state
         .db
         .agent_run_logs()
         .update_one(
-            doc! { "run_id": run_id },
+            write_filter,
             doc! {
                 "$set": {
                     "outbox_status": outbox_status,
@@ -283,9 +417,757 @@ async fn update_run_log_outbox_status(state: &AppState, run_id: &str, outbox_sta
             None,
         )
         .await;
-    if let Err(err) = res {
-        tracing::warn!(?err, run_id, outbox_status, "update agent_run_logs.outbox_status failed");
+    match res {
+        Ok(result) if result.matched_count == 0 => {
+            tracing::debug!(run_id, generation, "stale outbox aggregation snapshot skipped");
+        }
+        Ok(_) => {}
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                run_id,
+                outbox_status,
+                "update agent_run_logs.outbox_status failed"
+            );
+        }
     }
+}
+
+const DELIVERY_FINALIZE_LEASE_SECONDS: i64 = 60;
+const DELIVERY_FINALIZE_RECONCILE_BATCH: i64 = 20;
+const OUTBOX_ENQUEUE_RECONCILE_GRACE_SECONDS: i64 = 60;
+const OUTBOX_ENQUEUE_RECONCILE_BATCH: i64 = 20;
+
+#[derive(Debug, PartialEq, Eq)]
+enum StaleEnqueueReconcileAction {
+    Enqueued,
+    PartialFailure,
+    Failed,
+}
+
+fn stale_enqueue_reconcile_action(
+    expected_text_segments: i32,
+    actual_text_segments: u64,
+) -> StaleEnqueueReconcileAction {
+    if actual_text_segments == 0 {
+        return StaleEnqueueReconcileAction::Failed;
+    }
+    // 升级前的 review 没有固化段数字段；已有文本条目是唯一可恢复事实。
+    if expected_text_segments <= 0 {
+        return StaleEnqueueReconcileAction::Enqueued;
+    }
+    if actual_text_segments >= expected_text_segments as u64 {
+        StaleEnqueueReconcileAction::Enqueued
+    } else {
+        StaleEnqueueReconcileAction::PartialFailure
+    }
+}
+
+fn stale_enqueue_effective_action(
+    review_status: &str,
+    expected_text_segments: i32,
+    actual_text_segments: u64,
+) -> Option<StaleEnqueueReconcileAction> {
+    match review_status {
+        "outbox_enqueuing" => Some(stale_enqueue_reconcile_action(
+            expected_text_segments,
+            actual_text_segments,
+        )),
+        "outbox_enqueued" | "delivery_finalizing" | "sent" => {
+            Some(StaleEnqueueReconcileAction::Enqueued)
+        }
+        "outbox_enqueue_partial_failure" => {
+            Some(StaleEnqueueReconcileAction::PartialFailure)
+        }
+        "outbox_enqueue_failed" => Some(StaleEnqueueReconcileAction::Failed),
+        _ => None,
+    }
+}
+
+fn stale_enqueue_run_update(action: &StaleEnqueueReconcileAction, now: DateTime) -> Document {
+    match action {
+        StaleEnqueueReconcileAction::Enqueued => doc! { "$set": {
+            "status": "outbox_enqueued",
+            "lifecycle": super::run_envelope::LIFECYCLE_COMPLETED,
+            "updated_at": now,
+        } },
+        StaleEnqueueReconcileAction::PartialFailure => doc! { "$set": {
+            "status": "outbox_enqueue_partial_failure",
+            "lifecycle": super::run_envelope::LIFECYCLE_FAILED_AFTER_DECISION,
+            "updated_at": now,
+        } },
+        StaleEnqueueReconcileAction::Failed => doc! { "$set": {
+            "status": "outbox_enqueue_failed",
+            "lifecycle": super::run_envelope::LIFECYCLE_FAILED_AFTER_DECISION,
+            "outbox_status": OutboxStatus::Canceled.as_str(),
+            "updated_at": now,
+        } },
+    }
+}
+
+fn stale_enqueue_review_status_compatible(
+    action: &StaleEnqueueReconcileAction,
+    status: &str,
+) -> bool {
+    match action {
+        StaleEnqueueReconcileAction::Enqueued => matches!(
+            status,
+            "outbox_enqueuing" | "outbox_enqueued" | "delivery_finalizing" | "sent"
+        ),
+        StaleEnqueueReconcileAction::PartialFailure => {
+            matches!(status, "outbox_enqueuing" | "outbox_enqueue_partial_failure")
+        }
+        StaleEnqueueReconcileAction::Failed => {
+            matches!(status, "outbox_enqueuing" | "outbox_enqueue_failed")
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum DeliveryFinalizeReconcileAction {
+    Finalize,
+    Wait,
+    Clear,
+}
+
+fn delivery_finalize_reconcile_action(
+    review_status: Option<&str>,
+) -> DeliveryFinalizeReconcileAction {
+    match review_status {
+        Some("outbox_enqueued" | "delivery_finalizing") => {
+            DeliveryFinalizeReconcileAction::Finalize
+        }
+        Some("outbox_enqueuing") => DeliveryFinalizeReconcileAction::Wait,
+        Some("sent") | Some(_) | None => DeliveryFinalizeReconcileAction::Clear,
+    }
+}
+
+async fn clear_delivery_finalize_markers(state: &AppState, decision_id: ObjectId) {
+    if let Err(err) = state
+        .db
+        .collection_agent_send_outbox()
+        .update_many(
+            doc! { "decision_id": decision_id, "delivery_finalize_pending": true },
+            doc! {
+                "$set": { "delivery_finalized_at": DateTime::now() },
+                "$unset": { "delivery_finalize_pending": "" },
+            },
+            None,
+        )
+        .await
+    {
+        tracing::warn!(?err, %decision_id, "clear delivery finalization markers failed");
+    }
+}
+
+/// 当一条纯文本 entry 已确认送达后，检查同一 decision 的全部文本分段是否均已送达。
+/// review 上的短 lease 保证同一时刻只有一个提交者；outbox 上的 pending marker 让
+/// dispatcher 能在进程崩溃后重跑。所有附属写入均幂等，review 仅在它们完成后置 sent。
+async fn finalize_delivered_text_decision(
+    state: &AppState,
+    entry: &OutboxEntry,
+    contact: &crate::models::Contact,
+) {
+    if entry.media_asset_id.is_some() || entry.referral_card_id.is_some() {
+        return;
+    }
+    let Some(decision_id) = entry.decision_id else {
+        return;
+    };
+
+    let run_log = match state
+        .db
+        .agent_run_logs()
+        .find_one(doc! { "run_id": &entry.run_id }, None)
+        .await
+    {
+        Ok(Some(log)) => log,
+        Ok(None) => return,
+        Err(err) => {
+            tracing::warn!(?err, run_id = %entry.run_id, "load run log for delivery finalize failed");
+            return;
+        }
+    };
+    let decision: super::types::AgentDecision =
+        match mongodb::bson::from_document(run_log.decision.clone()) {
+            Ok(decision) => decision,
+            Err(err) => {
+                tracing::warn!(?err, run_id = %entry.run_id, "decode delivered decision failed");
+                return;
+            }
+        };
+    let text_filter = doc! {
+        "decision_id": decision_id,
+        "media_asset_id": null,
+        "referral_card_id": null,
+    };
+    let text_total = match state
+        .db
+        .collection_agent_send_outbox()
+        .count_documents(text_filter.clone(), None)
+        .await
+    {
+        Ok(count) => count,
+        Err(err) => {
+            tracing::warn!(?err, %decision_id, "count decision text outbox failed");
+            return;
+        }
+    };
+    let review_snapshot = match state
+        .db
+        .decision_reviews()
+        .find_one(doc! { "_id": decision_id }, None)
+        .await
+    {
+        Ok(Some(review)) => review,
+        Ok(None) => return,
+        Err(err) => {
+            tracing::warn!(?err, %decision_id, "load decision review for delivery finalize failed");
+            return;
+        }
+    };
+    // 新记录在入队前固化期望段数，配置热更新不会改变本 decision 的完整性口径。
+    // 历史记录字段为 0；它们只有在 status=outbox_enqueued 后才会进入 finalizer，
+    // 此时已存在的文本条目数就是旧链路可恢复的最佳事实。
+    let expected_segments = if review_snapshot.expected_text_segments > 0 {
+        review_snapshot.expected_text_segments as u64
+    } else {
+        text_total
+    };
+    if expected_segments == 0 {
+        return;
+    }
+    if text_total < expected_segments {
+        return;
+    }
+    let mut unsent_filter = text_filter;
+    unsent_filter.insert("status", doc! { "$ne": OutboxStatus::Sent.as_str() });
+    match state
+        .db
+        .collection_agent_send_outbox()
+        .count_documents(unsent_filter, None)
+        .await
+    {
+        Ok(0) => {}
+        Ok(_) => return,
+        Err(err) => {
+            tracing::warn!(?err, %decision_id, "count unsent decision text outbox failed");
+            return;
+        }
+    }
+
+    let now = DateTime::now();
+    let lock_until =
+        DateTime::from_millis(now.timestamp_millis() + DELIVERY_FINALIZE_LEASE_SECONDS * 1000);
+    let worker = uuid::Uuid::new_v4().to_string();
+    let review = match state
+        .db
+        .decision_reviews()
+        .find_one_and_update(
+            doc! {
+                "_id": decision_id,
+                "$or": [
+                    { "status": "outbox_enqueued" },
+                    {
+                        "status": "delivery_finalizing",
+                        "$or": [
+                            { "delivery_finalize_locked_until": { "$lt": now } },
+                            { "delivery_finalize_locked_until": null },
+                            { "delivery_finalize_locked_until": { "$exists": false } },
+                        ],
+                    },
+                ],
+            },
+            doc! { "$set": {
+                "status": "delivery_finalizing",
+                "delivery_finalize_worker": &worker,
+                "delivery_finalize_locked_until": lock_until,
+            } },
+            FindOneAndUpdateOptions::builder()
+                .return_document(ReturnDocument::After)
+                .build(),
+        )
+        .await
+    {
+        Ok(Some(review)) => review,
+        Ok(None) => {
+            // 上一次 finalizer 可能已完成 review 写回、但在清 outbox marker 前崩溃。
+            // 此时副作用已完成，只需清 marker，不能把 sent review 回退到 finalizing。
+            if matches!(
+                state
+                    .db
+                    .decision_reviews()
+                    .find_one(doc! { "_id": decision_id, "status": "sent" }, None)
+                    .await,
+                Ok(Some(_))
+            ) {
+                clear_delivery_finalize_markers(state, decision_id).await;
+            }
+            return;
+        }
+        Err(err) => {
+            tracing::warn!(?err, %decision_id, "claim delivered decision finalize failed");
+            return;
+        }
+    };
+
+    // 发送已成事实。附属写入失败时保留 finalizing + outbox marker，由后续 tick 重试；
+    // 绝不把 outbox 改回 pending，因而不会触发重复发送。
+    let side_effect_result: AppResult<()> = async {
+        if let Some(value) = decision
+            .last_commitment
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let mut commitment = crate::models::CommitmentEntry::from_plain_text(value.to_string());
+            if let Some(structured) = &decision.commitment {
+                if structured.text.trim() == value {
+                    commitment.due_at = super::types::parse_rfc3339_to_bson(&structured.due_at);
+                }
+            }
+            state
+                .db
+                .contacts()
+                .update_one(
+                    doc! { "_id": contact.id, "commitments.text": { "$ne": value } },
+                    super::gateway::build_commitment_push_update(&commitment),
+                    None,
+                )
+                .await?;
+        }
+
+        if let Some(follow_up) = decision
+            .follow_up
+            .as_ref()
+            .filter(|follow_up| follow_up.needed && !follow_up.content.trim().is_empty())
+        {
+            let defaults = crate::models::RuntimeParametersTyped::default();
+            let max_pending = review
+                .runtime_parameters_snapshot
+                .get_i64("maxPendingFollowUps")
+                .unwrap_or(defaults.max_pending_follow_ups);
+            let expires_hours = review
+                .runtime_parameters_snapshot
+                .get_i64("followUpExpiresHours")
+                .unwrap_or(defaults.follow_up_expires_hours);
+            let pending_count = state
+                .db
+                .tasks()
+                .count_documents(
+                    doc! {
+                        "workspace_id": &entry.workspace_id,
+                        "account_id": &entry.account_id,
+                        "contact_wxid": &entry.contact_wxid,
+                        "kind": "follow_up",
+                        "status": "pending",
+                    },
+                    None,
+                )
+                .await?;
+            if pending_count < max_pending.max(0) as u64 {
+                let (run_at, degraded) = super::types::resolve_run_at_or_degrade(
+                    &follow_up.run_at,
+                    DateTime::now().timestamp_millis(),
+                    0,
+                );
+                let expires_at = DateTime::from_millis(
+                    run_at.timestamp_millis() + expires_hours.max(0) * 60 * 60 * 1000,
+                );
+                let now = DateTime::now();
+                let task = AgentTask {
+                    id: None,
+                    workspace_id: entry.workspace_id.clone(),
+                    account_id: entry.account_id.clone(),
+                    contact_wxid: entry.contact_wxid.clone(),
+                    kind: "follow_up".to_string(),
+                    run_at,
+                    expires_at: Some(expires_at),
+                    content: follow_up.content.clone(),
+                    status: "pending".to_string(),
+                    source_decision_id: Some(decision_id),
+                    review_required: true,
+                    attempt_count: 0,
+                    max_attempts: 3,
+                    next_retry_at: None,
+                    gateway_status: Some(if degraded {
+                        "run_at_degraded_after_delivery".to_string()
+                    } else {
+                        "scheduled_after_delivery".to_string()
+                    }),
+                    cancel_reason: None,
+                    error: None,
+                    claimed_at: None,
+                    claim_recovery_count: 0,
+                    created_at: now,
+                    updated_at: now,
+                };
+                let task_doc = mongodb::bson::to_document(&task)?;
+                state
+                    .db
+                    .tasks()
+                    .update_one(
+                        doc! { "_id": decision_id },
+                        doc! { "$setOnInsert": task_doc },
+                        UpdateOptions::builder().upsert(true).build(),
+                    )
+                    .await?;
+            }
+        }
+
+        let relay_task = state
+            .db
+            .tasks()
+            .find_one(
+                doc! {
+                    "source_decision_id": decision_id,
+                    "kind": "principal_decision_relay",
+                },
+                None,
+            )
+            .await?;
+        if relay_task.is_some() {
+            super::gateway::clear_awaiting_principal_state(state, contact).await?;
+        }
+
+        crate::models::assert_agent_task_status_valid("sent");
+        state
+            .db
+            .tasks()
+            .update_many(
+                doc! {
+                    "source_decision_id": decision_id,
+                    "status": { "$in": ["running", "outbox_enqueued"] },
+                },
+                doc! {
+                    "$set": {
+                        "status": "sent",
+                        "gateway_status": "sent",
+                        "updated_at": DateTime::now(),
+                    },
+                    "$unset": { "claimed_at": "" },
+                },
+                None,
+            )
+            .await?;
+        Ok(())
+    }
+    .await;
+
+    if let Err(err) = side_effect_result {
+        tracing::warn!(?err, %decision_id, "delivered decision side effects failed; will reconcile");
+        let _ = state
+            .db
+            .decision_reviews()
+            .update_one(
+                doc! {
+                    "_id": decision_id,
+                    "status": "delivery_finalizing",
+                    "delivery_finalize_worker": &worker,
+                },
+                doc! { "$unset": {
+                    "delivery_finalize_worker": "",
+                    "delivery_finalize_locked_until": "",
+                } },
+                None,
+            )
+            .await;
+        return;
+    }
+
+    match state
+        .db
+        .decision_reviews()
+        .update_one(
+            doc! {
+                "_id": decision_id,
+                "status": "delivery_finalizing",
+                "delivery_finalize_worker": &worker,
+            },
+            doc! {
+                "$set": { "status": "sent" },
+                "$unset": {
+                    "delivery_finalize_worker": "",
+                    "delivery_finalize_locked_until": "",
+                },
+            },
+            None,
+        )
+        .await
+    {
+        Ok(result) if result.matched_count == 1 => {
+            clear_delivery_finalize_markers(state, decision_id).await;
+        }
+        Ok(_) => {}
+        Err(err) => {
+            tracing::warn!(?err, %decision_id, "mark delivered decision sent failed; will reconcile");
+        }
+    }
+}
+
+/// 恢复“outbox 已 sent，但 review/承诺/follow-up 尚未完成”的窗口。
+async fn reconcile_delivered_decision_finalizations(state: &AppState) -> AppResult<()> {
+    let mut cursor = state
+        .db
+        .collection_agent_send_outbox()
+        .find(
+            doc! {
+                "status": OutboxStatus::Sent.as_str(),
+                "delivery_finalize_pending": true,
+                "decision_id": { "$ne": null },
+                "media_asset_id": null,
+                "referral_card_id": null,
+            },
+            FindOptions::builder()
+                .sort(doc! { "updated_at": 1, "_id": 1 })
+                .limit(DELIVERY_FINALIZE_RECONCILE_BATCH)
+                .build(),
+        )
+        .await?;
+    while let Some(entry) = cursor.try_next().await? {
+        let Some(decision_id) = entry.decision_id else {
+            continue;
+        };
+        let review = state
+            .db
+            .decision_reviews()
+            .find_one(doc! { "_id": decision_id }, None)
+            .await?;
+        match delivery_finalize_reconcile_action(review.as_ref().map(|item| item.status.as_str())) {
+            DeliveryFinalizeReconcileAction::Wait => continue,
+            DeliveryFinalizeReconcileAction::Clear => {
+                clear_delivery_finalize_markers(state, decision_id).await;
+                continue;
+            }
+            DeliveryFinalizeReconcileAction::Finalize => {}
+        }
+        let contact = state
+            .db
+            .contacts()
+            .find_one(
+                doc! {
+                    "workspace_id": &entry.workspace_id,
+                    "account_id": &entry.account_id,
+                    "wxid": &entry.contact_wxid,
+                },
+                None,
+            )
+            .await?;
+        if let Some(contact) = contact {
+            finalize_delivered_text_decision(state, &entry, &contact).await;
+        } else {
+            clear_delivery_finalize_markers(state, decision_id).await;
+        }
+    }
+    Ok(())
+}
+
+/// 恢复 gateway 在写入 `outbox_enqueuing` run log 后崩溃的窗口。
+///
+/// run log 是恢复标记并最后提交：review/task 先做幂等补偿，最后才以
+/// `status=outbox_enqueuing` CAS 推进 run。恢复过程任一步再次崩溃时，下一轮仍会
+/// 扫到该 run 并继续。若最后一条文本 outbox 仍在宽限期内则继续等待。
+async fn reconcile_stale_outbox_enqueues(state: &AppState) -> AppResult<()> {
+    let now = DateTime::now();
+    let cutoff = DateTime::from_millis(
+        now.timestamp_millis() - OUTBOX_ENQUEUE_RECONCILE_GRACE_SECONDS * 1000,
+    );
+    let mut runs = state
+        .db
+        .agent_run_logs()
+        .find(
+            doc! {
+                "status": "outbox_enqueuing",
+                "created_at": { "$lte": cutoff },
+            },
+            FindOptions::builder()
+                .sort(doc! { "created_at": 1, "_id": 1 })
+                .limit(OUTBOX_ENQUEUE_RECONCILE_BATCH)
+                .build(),
+        )
+        .await?;
+
+    while let Some(run_log) = runs.try_next().await? {
+        let run_id = run_log.run_id.as_str();
+        let Some(review) = state
+            .db
+            .decision_reviews()
+            .find_one(doc! { "run_id": run_id }, None)
+            .await?
+        else {
+            tracing::warn!(run_id, "stale outbox run lacks decision review");
+            state
+                .db
+                .agent_run_logs()
+                .update_one(
+                    doc! { "run_id": run_id, "status": "outbox_enqueuing" },
+                    stale_enqueue_run_update(&StaleEnqueueReconcileAction::Failed, now),
+                    None,
+                )
+                .await?;
+            continue;
+        };
+        let Some(decision_id) = review.id else {
+            tracing::warn!(run_id, "stale outbox review lacks _id");
+            continue;
+        };
+        let text_filter = doc! {
+            "decision_id": decision_id,
+            "media_asset_id": null,
+            "referral_card_id": null,
+        };
+        let actual_text_segments = state
+            .db
+            .collection_agent_send_outbox()
+            .count_documents(text_filter.clone(), None)
+            .await?;
+
+        if actual_text_segments > 0 {
+            let mut latest = state
+                .db
+                .collection_agent_send_outbox()
+                .find(
+                    text_filter,
+                    FindOptions::builder()
+                        .sort(doc! { "created_at": -1, "_id": -1 })
+                        .limit(1)
+                        .build(),
+                )
+                .await?;
+            if latest
+                .try_next()
+                .await?
+                .map(|entry| entry.created_at.timestamp_millis() > cutoff.timestamp_millis())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+        }
+
+        let Some(action) = stale_enqueue_effective_action(
+            &review.status,
+            review.expected_text_segments,
+            actual_text_segments,
+        ) else {
+            tracing::warn!(
+                %decision_id,
+                run_id,
+                review_status = %review.status,
+                "stale outbox run has incompatible review status"
+            );
+            continue;
+        };
+        let review_status = match action {
+            StaleEnqueueReconcileAction::Enqueued => "outbox_enqueued",
+            StaleEnqueueReconcileAction::PartialFailure => "outbox_enqueue_partial_failure",
+            StaleEnqueueReconcileAction::Failed => "outbox_enqueue_failed",
+        };
+        let review_ready = if review.status == "outbox_enqueuing" {
+            let result = state
+                .db
+                .decision_reviews()
+                .update_one(
+                    doc! { "_id": decision_id, "status": "outbox_enqueuing" },
+                    doc! { "$set": {
+                        "status": review_status,
+                        "enqueue_reconciled_at": now,
+                        "actual_text_segments": actual_text_segments as i64,
+                    } },
+                    None,
+                )
+                .await?;
+            if result.matched_count == 1 {
+                true
+            } else {
+                state
+                    .db
+                    .decision_reviews()
+                    .find_one(doc! { "_id": decision_id }, None)
+                    .await?
+                    .map(|current| {
+                        stale_enqueue_review_status_compatible(&action, &current.status)
+                    })
+                    .unwrap_or(false)
+            }
+        } else {
+            stale_enqueue_review_status_compatible(&action, &review.status)
+        };
+        if !review_ready {
+            tracing::warn!(
+                %decision_id,
+                run_id,
+                review_status = %review.status,
+                "stale outbox run has incompatible review status"
+            );
+            continue;
+        }
+
+        match action {
+            StaleEnqueueReconcileAction::Enqueued => {
+                crate::models::assert_agent_task_status_valid("outbox_enqueued");
+                state
+                    .db
+                    .tasks()
+                    .update_many(
+                        doc! {
+                            "source_decision_id": decision_id,
+                            "status": { "$in": ["pending", "retry", "running"] },
+                        },
+                        doc! { "$set": {
+                            "status": "outbox_enqueued",
+                            "gateway_status": "outbox_enqueued",
+                            "updated_at": now,
+                        } },
+                        None,
+                    )
+                    .await?;
+            }
+            StaleEnqueueReconcileAction::PartialFailure
+            | StaleEnqueueReconcileAction::Failed => {
+                crate::models::assert_agent_task_status_valid("cancelled");
+                state
+                    .db
+                    .tasks()
+                    .update_many(
+                        doc! {
+                            "source_decision_id": decision_id,
+                            "status": { "$in": ["pending", "retry", "running", "outbox_enqueued"] },
+                        },
+                        doc! { "$set": {
+                            "status": "cancelled",
+                            "gateway_status": review_status,
+                            "cancel_reason": "outbox enqueue interrupted and reconciled",
+                            "updated_at": now,
+                        } },
+                        None,
+                    )
+                    .await?;
+            }
+        }
+        // run 是恢复事务的提交标记，必须最后 CAS。此前任一步失败/崩溃都会保留
+        // status=outbox_enqueuing，下一轮可继续幂等补偿 review/task。
+        let committed = state
+            .db
+            .agent_run_logs()
+            .update_one(
+                doc! { "run_id": run_id, "status": "outbox_enqueuing" },
+                stale_enqueue_run_update(&action, now),
+                None,
+            )
+            .await?;
+        if committed.matched_count == 1 {
+            refresh_run_log_outbox_status(state, run_id).await;
+        }
+        tracing::warn!(
+            %decision_id,
+            run_id,
+            review_status,
+            expected_text_segments = review.expected_text_segments,
+            actual_text_segments,
+            "reconciled stale outbox enqueue"
+        );
+    }
+    Ok(())
 }
 
 /// 取消已抢占的 entry（仅限当前已是 `in_flight`，避免 race）。
@@ -335,7 +1217,7 @@ pub async fn cancel_entry(
         }),
     )
     .await;
-    update_run_log_outbox_status(state, &entry.run_id, "canceled").await;
+    refresh_run_log_outbox_status(state, &entry.run_id).await;
     Ok(())
 }
 
@@ -410,7 +1292,7 @@ pub async fn schedule_retry_or_terminal(
             }),
         )
         .await;
-        update_run_log_outbox_status(state, &entry.run_id, "pending").await;
+        refresh_run_log_outbox_status(state, &entry.run_id).await;
     } else {
         collection
             .update_one(
@@ -450,7 +1332,7 @@ pub async fn schedule_retry_or_terminal(
             }),
         )
         .await;
-        update_run_log_outbox_status(state, &entry.run_id, "failed_terminal").await;
+        refresh_run_log_outbox_status(state, &entry.run_id).await;
     }
     Ok(())
 }
@@ -506,7 +1388,7 @@ pub async fn defer_account_offline(
         }),
     )
     .await;
-    update_run_log_outbox_status(state, &entry.run_id, "pending").await;
+    refresh_run_log_outbox_status(state, &entry.run_id).await;
     Ok(())
 }
 
@@ -574,7 +1456,7 @@ async fn defer_account_pacing(
         }),
     )
     .await;
-    update_run_log_outbox_status(state, &entry.run_id, "pending").await;
+    refresh_run_log_outbox_status(state, &entry.run_id).await;
     Ok(())
 }
 
@@ -606,6 +1488,13 @@ async fn mcp_already_succeeded(
                 "request.recipient": contact_wxid,
                 "request.content": content,
                 "error": null,
+                "$or": [
+                    { "response.ok": true },
+                    {
+                        "response.ok": { "$exists": false },
+                        "response.newMsgId": { "$type": "string", "$ne": "" },
+                    },
+                ],
                 "created_at": { "$gte": lower_bound },
             },
             None,
@@ -767,8 +1656,7 @@ pub async fn process_entry(state: &AppState, entry: &OutboxEntry) -> AppResult<(
     // 与 timeout 分支复用同一 `verify_already_sent`。
     if entry.reclaimed_in_flight {
         let already = verify_already_sent(state, entry).await;
-        if let Ok(true) = already
-        {
+        if let Ok(true) = already {
             collection
                 .update_one(
                     doc! {
@@ -780,6 +1668,9 @@ pub async fn process_entry(state: &AppState, entry: &OutboxEntry) -> AppResult<(
                             "status": OutboxStatus::Sent.as_str(),
                             "sent_at": now,
                             "updated_at": now,
+                            "delivery_finalize_pending": entry.decision_id.is_some()
+                                && entry.media_asset_id.is_none()
+                                && entry.referral_card_id.is_none(),
                             "last_error": "reclaimed after crash but MCP already succeeded — confirmed via mcp_call_logs",
                         },
                         "$unset": {
@@ -807,7 +1698,8 @@ pub async fn process_entry(state: &AppState, entry: &OutboxEntry) -> AppResult<(
                 }),
             )
             .await;
-            update_run_log_outbox_status(state, &entry.run_id, "sent").await;
+            refresh_run_log_outbox_status(state, &entry.run_id).await;
+            finalize_delivered_text_decision(state, entry, &contact).await;
             // 主动发送台账：post-hoc 确认送达同样记一条（素材/名片才记）。
             super::send_ledger::record_send_for_entry(state, entry, &contact, now).await;
             return Ok(());
@@ -862,6 +1754,9 @@ pub async fn process_entry(state: &AppState, entry: &OutboxEntry) -> AppResult<(
                             "status": OutboxStatus::Sent.as_str(),
                             "sent_at": now,
                             "updated_at": now,
+                            "delivery_finalize_pending": entry.decision_id.is_some()
+                                && entry.media_asset_id.is_none()
+                                && entry.referral_card_id.is_none(),
                         },
                         "$unset": {
                             "worker_id": "",
@@ -887,19 +1782,15 @@ pub async fn process_entry(state: &AppState, entry: &OutboxEntry) -> AppResult<(
                 }),
             )
             .await;
-            update_run_log_outbox_status(state, &entry.run_id, "sent").await;
+            refresh_run_log_outbox_status(state, &entry.run_id).await;
+            finalize_delivered_text_decision(state, entry, &contact).await;
 
             // 主动发送台账：素材/名片条目记一条（纯文本不记）。fail-soft，不影响已成发送。
             super::send_ledger::record_send_for_entry(state, entry, &contact, now).await;
         }
         Ok(Err(err)) => {
-            schedule_retry_or_terminal(
-                state,
-                entry_id,
-                entry,
-                &format!("send failed: {err}"),
-            )
-            .await?;
+            schedule_retry_or_terminal(state, entry_id, entry, &format!("send failed: {err}"))
+                .await?;
         }
         Err(_) => {
             // post-hoc 核对：MCP 调用本身在 timeout 之前可能已经成功把消息送达
@@ -907,8 +1798,7 @@ pub async fn process_entry(state: &AppState, entry: &OutboxEntry) -> AppResult<(
             // tool_name + recipient + 定位字段（text=content / media=mediaId）且
             // error=null。命中即视为已送达，不再重发，避免给客户重复消息/重复文件。
             let already = verify_already_sent(state, entry).await;
-            if let Ok(true) = already
-            {
+            if let Ok(true) = already {
                 collection
                     .update_one(
                         doc! {
@@ -920,6 +1810,9 @@ pub async fn process_entry(state: &AppState, entry: &OutboxEntry) -> AppResult<(
                                 "status": OutboxStatus::Sent.as_str(),
                                 "sent_at": now,
                                 "updated_at": now,
+                                "delivery_finalize_pending": entry.decision_id.is_some()
+                                    && entry.media_asset_id.is_none()
+                                    && entry.referral_card_id.is_none(),
                                 "last_error": "send timeout (150s) but MCP already succeeded — confirmed via chat_search/mcp_call_logs",
                             },
                             "$unset": {
@@ -946,7 +1839,8 @@ pub async fn process_entry(state: &AppState, entry: &OutboxEntry) -> AppResult<(
                     }),
                 )
                 .await;
-                update_run_log_outbox_status(state, &entry.run_id, "sent").await;
+                refresh_run_log_outbox_status(state, &entry.run_id).await;
+                finalize_delivered_text_decision(state, entry, &contact).await;
                 // 主动发送台账：超时 post-hoc 确认送达同样记一条（素材/名片才记）。
                 super::send_ledger::record_send_for_entry(state, entry, &contact, now).await;
             } else {
@@ -1098,6 +1992,8 @@ pub async fn run_outbox_dispatcher(state: AppState) -> AppResult<()> {
 /// 单次 tick：reclaim → 循环 claim+process 直到无可抢占或达到 `PER_TICK_PROCESS_CAP`。
 async fn tick(state: &AppState, worker: &str, lease_seconds: i32) -> AppResult<()> {
     reclaim_expired_leases(state).await?;
+    reconcile_stale_outbox_enqueues(state).await?;
+    reconcile_delivered_decision_finalizations(state).await?;
     for _ in 0..PER_TICK_PROCESS_CAP {
         let claimed = atomic_claim_pending(state, worker, lease_seconds).await?;
         let entry = match claimed {
@@ -1114,6 +2010,138 @@ async fn tick(state: &AppState, worker: &str, lease_seconds: i32) -> AppResult<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_status_aggregation_is_order_independent() {
+        let forward = aggregate_run_outbox_status(["sent", "canceled"]);
+        let reverse = aggregate_run_outbox_status(["canceled", "sent"]);
+        assert_eq!(forward, Some("partially_sent"));
+        assert_eq!(reverse, forward);
+        assert_eq!(
+            aggregate_run_outbox_status(["sent", "failed_terminal"]),
+            Some("partially_sent")
+        );
+        assert_eq!(
+            aggregate_run_outbox_status(["sent", "pending"]),
+            Some("pending")
+        );
+        assert_eq!(
+            aggregate_run_outbox_status(["canceled", "failed_terminal"]),
+            Some("failed_terminal")
+        );
+    }
+
+    #[test]
+    fn run_outbox_refresh_filter_rejects_old_generation_and_status() {
+        assert_eq!(
+            run_outbox_refresh_write_filter("run-1", Some("outbox_enqueued"), 7),
+            doc! {
+                "run_id": "run-1",
+                "outbox_refresh_generation": 7i64,
+                "status": "outbox_enqueued",
+            }
+        );
+    }
+
+    #[test]
+    fn stale_enqueue_action_distinguishes_complete_partial_and_empty() {
+        assert_eq!(
+            stale_enqueue_reconcile_action(2, 2),
+            StaleEnqueueReconcileAction::Enqueued
+        );
+        assert_eq!(
+            stale_enqueue_reconcile_action(2, 1),
+            StaleEnqueueReconcileAction::PartialFailure
+        );
+        assert_eq!(
+            stale_enqueue_reconcile_action(2, 0),
+            StaleEnqueueReconcileAction::Failed
+        );
+        assert_eq!(
+            stale_enqueue_reconcile_action(0, 1),
+            StaleEnqueueReconcileAction::Enqueued
+        );
+    }
+
+    #[test]
+    fn stale_enqueue_reentry_preserves_committed_review_outcome() {
+        assert_eq!(
+            stale_enqueue_effective_action("outbox_enqueued", 2, 0),
+            Some(StaleEnqueueReconcileAction::Enqueued)
+        );
+        assert_eq!(
+            stale_enqueue_effective_action("delivery_finalizing", 2, 1),
+            Some(StaleEnqueueReconcileAction::Enqueued)
+        );
+        assert_eq!(
+            stale_enqueue_effective_action("sent", 2, 1),
+            Some(StaleEnqueueReconcileAction::Enqueued)
+        );
+        assert_eq!(
+            stale_enqueue_effective_action("outbox_enqueue_partial_failure", 2, 2),
+            Some(StaleEnqueueReconcileAction::PartialFailure)
+        );
+        assert_eq!(
+            stale_enqueue_effective_action("outbox_enqueue_failed", 2, 2),
+            Some(StaleEnqueueReconcileAction::Failed)
+        );
+        assert_eq!(
+            stale_enqueue_effective_action("skipped_duplicate", 2, 2),
+            None
+        );
+    }
+
+    #[test]
+    fn stale_enqueue_review_compatibility_rejects_cross_outcome_reentry() {
+        assert!(stale_enqueue_review_status_compatible(
+            &StaleEnqueueReconcileAction::Enqueued,
+            "sent"
+        ));
+        assert!(stale_enqueue_review_status_compatible(
+            &StaleEnqueueReconcileAction::PartialFailure,
+            "outbox_enqueue_partial_failure"
+        ));
+        assert!(stale_enqueue_review_status_compatible(
+            &StaleEnqueueReconcileAction::Failed,
+            "outbox_enqueue_failed"
+        ));
+        assert!(!stale_enqueue_review_status_compatible(
+            &StaleEnqueueReconcileAction::Enqueued,
+            "outbox_enqueue_failed"
+        ));
+        assert!(!stale_enqueue_review_status_compatible(
+            &StaleEnqueueReconcileAction::Failed,
+            "sent"
+        ));
+    }
+
+    #[test]
+    fn delivery_finalize_marker_action_handles_process_and_terminal_states() {
+        assert_eq!(
+            delivery_finalize_reconcile_action(Some("outbox_enqueued")),
+            DeliveryFinalizeReconcileAction::Finalize
+        );
+        assert_eq!(
+            delivery_finalize_reconcile_action(Some("delivery_finalizing")),
+            DeliveryFinalizeReconcileAction::Finalize
+        );
+        assert_eq!(
+            delivery_finalize_reconcile_action(Some("outbox_enqueuing")),
+            DeliveryFinalizeReconcileAction::Wait
+        );
+        assert_eq!(
+            delivery_finalize_reconcile_action(Some("sent")),
+            DeliveryFinalizeReconcileAction::Clear
+        );
+        assert_eq!(
+            delivery_finalize_reconcile_action(Some("outbox_enqueue_partial_failure")),
+            DeliveryFinalizeReconcileAction::Clear
+        );
+        assert_eq!(
+            delivery_finalize_reconcile_action(None),
+            DeliveryFinalizeReconcileAction::Clear
+        );
+    }
 
     /// `PER_ENTRY_EVENT_CAP` 与 R13.7 设计目标一致：≤ 20。
     #[test]
@@ -1287,7 +2315,11 @@ mod tests {
     /// 驱动生产纯函数 effective_max_attempts——改回 `<=0→5` 即变红（真回归哨兵，非 tautology）。
     #[test]
     fn effective_max_attempts_fallback_aligns_with_enqueue() {
-        assert_eq!(effective_max_attempts(0), 3, "max_attempts=0 兜底须为 3(对齐 enqueue outbox.rs:244)");
+        assert_eq!(
+            effective_max_attempts(0),
+            3,
+            "max_attempts=0 兜底须为 3(对齐 enqueue outbox.rs:244)"
+        );
         assert_eq!(effective_max_attempts(-1), 3, "max_attempts<0 兜底须为 3");
         assert_eq!(effective_max_attempts(1), 1, "max_attempts>0 原样透传");
         assert_eq!(effective_max_attempts(5), 5, "max_attempts>0 原样透传");

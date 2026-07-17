@@ -46,9 +46,9 @@ use super::guards::{
     planner_from_decision,
 };
 use super::knowledge_router::{
-    empty_knowledge_route, load_operation_knowledge,
-    maybe_emit_unverified_warning, route_operation_knowledge, route_used_knowledge_ids,
-    select_operation_knowledge_chunks, write_knowledge_usage_log,
+    empty_knowledge_route, load_operation_knowledge, maybe_emit_unverified_warning,
+    route_operation_knowledge, route_used_knowledge_ids, select_operation_knowledge_chunks,
+    write_knowledge_usage_log,
 };
 use super::memory::{
     effective_memory_card, effective_memory_card_for_contact, load_or_create_operating_memory,
@@ -56,11 +56,12 @@ use super::memory::{
     write_memory_candidates, write_stage_observation, write_tag_observations,
 };
 use super::multimodal;
+use super::outbox::{enqueue as outbox_enqueue, EnqueueOutcome, EnqueueRequest};
 use super::review::{
     apply_revision_fallback, contact_has_principal_product_exemption, decide_revision,
-    derive_revision_failure, effective_review_mode, finalize_review_for_send, local_decision_review,
-    review_decision, review_passed, should_run_review, FinalizeOutcome, GatewayStatusFinal,
-    PendingFinalizeEvent, RevisionDecision,
+    derive_revision_failure, effective_review_mode, finalize_review_for_send,
+    local_decision_review, review_decision, review_passed, should_run_review, FinalizeOutcome,
+    GatewayStatusFinal, PendingFinalizeEvent, RevisionDecision,
 };
 use super::run_envelope::{
     assert_final_review_status_valid, assert_gateway_status_valid, assert_lifecycle_valid,
@@ -68,23 +69,40 @@ use super::run_envelope::{
     SOURCE_KIND_MANUAL_SEND,
 };
 use super::runtime::UserRuntimeParameters;
-use super::types::{
-    doc_bool, doc_i64, doc_string, non_empty_option,
-    AgentDecision, AgentTrigger, ContactSendResult, DecisionReviewResult, KnowledgeRouteResult,
-    ManualContactSend, RunPlannerResult, SendGatewayResult,
-};
-use super::outbox::{enqueue as outbox_enqueue, EnqueueOutcome, EnqueueRequest};
 use super::taxonomy::{
-    check_value as taxonomy_check_value, global_taxonomy_cache, upsert_candidate as taxonomy_upsert_candidate,
-    TaxonomyMatch,
+    check_value as taxonomy_check_value, global_taxonomy_cache,
+    upsert_candidate as taxonomy_upsert_candidate, TaxonomyMatch,
+};
+use super::types::{
+    doc_bool, doc_i64, doc_string, non_empty_option, AgentDecision, AgentTrigger,
+    ContactSendResult, DecisionReviewResult, KnowledgeRouteResult, ManualContactSend,
+    RunPlannerResult, SendGatewayResult,
 };
 
 /// 弱启发：reply 是否含"时间相关承诺"特征。仅用于 ⑥ 观测覆盖率，不进任何门、
 /// 不改变发送判定。非红线护栏（"是否做了承诺"是语义判断，交 LLM + prompt）。
 /// 明确接受可能误报/漏报——这正是它只观测不拦的原因。
 fn reply_has_time_commitment_feature(reply: &str) -> bool {
-    const MARKERS: [&str; 8] = ["明天", "后天", "下周", "下个月", "稍后", "晚点", "回头", "马上"];
+    const MARKERS: [&str; 8] = [
+        "明天",
+        "后天",
+        "下周",
+        "下个月",
+        "稍后",
+        "晚点",
+        "回头",
+        "马上",
+    ];
     MARKERS.iter().any(|m| reply.contains(m))
+}
+
+fn existing_outbox_covers_decision(
+    existing_decision_id: Option<ObjectId>,
+    decision_id: ObjectId,
+    existing_status: &str,
+) -> bool {
+    existing_decision_id == Some(decision_id)
+        && matches!(existing_status, "pending" | "in_flight" | "sent")
 }
 
 /// CONC-2：构造 commitments 的原子追加 update。`$push`+`$slice:-8` 保证并发
@@ -92,7 +110,9 @@ fn reply_has_time_commitment_feature(reply: &str) -> bool {
 /// 条（丢最旧，与原 `drain(0..drop)` 语义一致）。去重仍在应用层快照判定（并发
 /// 下可能写重复——接受：planner pick_commitment_emit_target 单选 +
 /// commitment_recently_emitted 按 id 幂等，重复项最多占槽不重复 emit）。
-fn build_commitment_push_update(entry: &crate::models::CommitmentEntry) -> mongodb::bson::Document {
+pub(crate) fn build_commitment_push_update(
+    entry: &crate::models::CommitmentEntry,
+) -> mongodb::bson::Document {
     let entry_bson = mongodb::bson::to_bson(entry)
         .unwrap_or_else(|_| mongodb::bson::Bson::Document(mongodb::bson::Document::new()));
     doc! {
@@ -155,8 +175,14 @@ pub async fn handle_follow_up_task(state: &AppState, task: AgentTask) -> AppResu
         )
         .await?
         .ok_or_else(|| AppError::NotFound("follow-up contact not found".to_string()))?;
-    run_user_operation_gateway(state, contact, AgentTrigger::FollowUp(&task), Some(task_id), None)
-        .await
+    run_user_operation_gateway(
+        state,
+        contact,
+        AgentTrigger::FollowUp(&task),
+        Some(task_id),
+        None,
+    )
+    .await
 }
 
 pub async fn send_contact_message_gateway(
@@ -313,8 +339,8 @@ pub async fn send_contact_message_gateway(
     } = outcome;
     let review = finalized_review;
     persist_finalize_pending_events(state, &contact, &pending_events).await?;
-    let passed = matches!(finalize_status, GatewayStatusFinal::Approved)
-        && review_passed(&review, &runtime);
+    let passed =
+        matches!(finalize_status, GatewayStatusFinal::Approved) && review_passed(&review, &runtime);
     if !passed {
         let blocked_status = finalize_status.gateway_status_str();
         let blocked_result = SendGatewayResult {
@@ -398,8 +424,8 @@ pub async fn send_contact_message_gateway(
     // gateway_status="outbox_enqueued"，调用方据此感知"已交付到发送队列"。
     let pending_result = SendGatewayResult {
         allowed: true,
-        status: "outbox_enqueued".to_string(),
-        reason: "Review 通过，已入队 outbox 等待 dispatcher 发送".to_string(),
+        status: "outbox_enqueuing".to_string(),
+        reason: "Review 通过，正在建立 outbox 投递记录".to_string(),
         policy_blocks: Vec::new(),
         run_mode: "live".to_string(),
         message_id: None,
@@ -415,10 +441,36 @@ pub async fn send_contact_message_gateway(
         &runtime,
         &pending_result,
         &context_pack,
-        "outbox_enqueued",
+        "outbox_enqueuing",
         &knowledge_route,
         &run_id,
         &planner,
+    )
+    .await?;
+
+    write_agent_run_log_with_finalize(
+        state,
+        &contact,
+        &run_id,
+        SOURCE_KIND_MANUAL_SEND,
+        "outbox_enqueuing",
+        &planner,
+        context_pack.clone(),
+        &knowledge_route,
+        to_document(&decision).unwrap_or_default(),
+        to_document(&review).unwrap_or_default(),
+        to_document(&pending_result).unwrap_or_default(),
+        None,
+        FinalizeRunLogFields {
+            final_review_status: review.final_review_status.clone(),
+            autonomy_mode: decision.autonomy_mode.clone(),
+            conversation_mode: decision.conversation_mode.clone(),
+            conversation_mode_reason: decision.conversation_mode_reason.clone(),
+            self_critique: non_empty_option(&Some(decision.self_critique.clone())),
+            source_event_id: format!("manual:{run_id}"),
+            source_kind: SOURCE_KIND_MANUAL_SEND.to_string(),
+            ..FinalizeRunLogFields::default()
+        },
     )
     .await?;
 
@@ -438,7 +490,7 @@ pub async fn send_contact_message_gateway(
         referral_card_id: None,
         max_attempts: 3,
     };
-    match outbox_enqueue(state, enqueue_req).await {
+    let enqueue_outcome = match outbox_enqueue(state, enqueue_req).await {
         Ok(EnqueueOutcome::Created { outbox_id, .. }) => {
             tracing::info!(
                 %run_id,
@@ -446,19 +498,89 @@ pub async fn send_contact_message_gateway(
                 contact_wxid = %contact.wxid,
                 "management send enqueued to outbox"
             );
+            "outbox_enqueued"
         }
-        Ok(EnqueueOutcome::IdempotentSkip { idempotency_key }) => {
+        Ok(EnqueueOutcome::IdempotentSkip {
+            idempotency_key,
+            existing_outbox_id,
+            existing_run_id,
+            existing_decision_id,
+            existing_status,
+        }) => {
             tracing::info!(
                 %run_id,
                 %idempotency_key,
+                %existing_outbox_id,
+                %existing_run_id,
+                %existing_status,
                 contact_wxid = %contact.wxid,
                 "management send outbox idempotent skip"
             );
+            if existing_outbox_covers_decision(
+                existing_decision_id,
+                review_id,
+                &existing_status,
+            ) {
+                "outbox_enqueued"
+            } else {
+                "skipped_duplicate"
+            }
         }
         Err(err) => {
             tracing::error!(?err, %run_id, "management send outbox enqueue failed");
+            let now = DateTime::now();
+            state
+                .db
+                .decision_reviews()
+                .update_one(
+                    doc! { "_id": review_id, "status": "outbox_enqueuing" },
+                    doc! { "$set": { "status": "outbox_enqueue_failed" } },
+                    None,
+                )
+                .await?;
+            state
+                .db
+                .agent_run_logs()
+                .update_one(
+                    doc! { "run_id": &run_id, "status": "outbox_enqueuing" },
+                    doc! { "$set": {
+                        "status": "outbox_enqueue_failed",
+                        "lifecycle": crate::agent::run_envelope::LIFECYCLE_FAILED_AFTER_DECISION,
+                        "error_summary": err.to_string(),
+                        "updated_at": now,
+                    } },
+                    None,
+                )
+                .await?;
             return Err(err.into());
         }
+    };
+
+    let lifecycle = crate::agent::run_envelope::LIFECYCLE_COMPLETED;
+    state
+        .db
+        .decision_reviews()
+        .update_one(
+            doc! { "_id": review_id, "status": "outbox_enqueuing" },
+            doc! { "$set": { "status": enqueue_outcome } },
+            None,
+        )
+        .await?;
+    state
+        .db
+        .agent_run_logs()
+        .update_one(
+            doc! { "run_id": &run_id, "status": "outbox_enqueuing" },
+            doc! { "$set": {
+                "status": enqueue_outcome,
+                "lifecycle": lifecycle,
+                "updated_at": DateTime::now(),
+            } },
+            None,
+        )
+        .await?;
+    if enqueue_outcome == "outbox_enqueued" {
+        super::outbox_dispatcher::refresh_run_log_outbox_status(state, &run_id).await;
     }
 
     write_event_for_account(
@@ -466,8 +588,12 @@ pub async fn send_contact_message_gateway(
         &contact.account_id,
         Some(&contact.wxid),
         "management_send",
-        "enqueued",
-        "生产发送网关已入队 outbox，dispatcher 将异步发送",
+        enqueue_outcome,
+        if enqueue_outcome == "outbox_enqueued" {
+            "生产发送网关已入队 outbox，dispatcher 将异步发送"
+        } else {
+            "相同内容已由既有 outbox 覆盖，本次未重复入队"
+        },
         Some(doc! {
             "sentContent": &content,
             "decisionReviewId": review_id.to_hex(),
@@ -479,8 +605,12 @@ pub async fn send_contact_message_gateway(
         sent_content: content,
         message_id: None,
         review_approved: true,
-        gateway_status: "outbox_enqueued".to_string(),
-        gateway_reason: "已入队 outbox，dispatcher 将异步发送".to_string(),
+        gateway_status: enqueue_outcome.to_string(),
+        gateway_reason: if enqueue_outcome == "outbox_enqueued" {
+            "已入队 outbox，dispatcher 将异步发送".to_string()
+        } else {
+            "相同内容已存在，幂等门阻止重复发送".to_string()
+        },
         decision_review_id: Some(review_id.to_hex()),
     })
 }
@@ -570,28 +700,45 @@ async fn maybe_handle_non_text_transition(
         referral_card_id: None,
         max_attempts: 3,
     };
-    match outbox_enqueue(state, enqueue_req).await {
+    let enqueue_status = match outbox_enqueue(state, enqueue_req).await {
         Ok(EnqueueOutcome::Created { outbox_id, .. }) => {
             tracing::info!(%run_id, %outbox_id, contact_wxid = %contact.wxid, %msg_type,
                 "F2: 非文本入站过渡话术已入队 outbox");
+            "outbox_enqueued"
         }
-        Ok(EnqueueOutcome::IdempotentSkip { idempotency_key }) => {
+        Ok(EnqueueOutcome::IdempotentSkip {
+            idempotency_key,
+            existing_run_id,
+            existing_status,
+            ..
+        }) => {
             tracing::info!(%run_id, %idempotency_key, contact_wxid = %contact.wxid, %msg_type,
                 "F2: 非文本入站过渡话术 outbox 幂等 skip");
+            if existing_run_id == run_id
+                && matches!(existing_status.as_str(), "pending" | "in_flight" | "sent")
+            {
+                "outbox_enqueued"
+            } else {
+                "skipped_duplicate"
+            }
         }
         Err(err) => {
             tracing::error!(?err, %run_id, "F2: 非文本入站过渡话术 outbox 入队失败");
             return Err(err.into());
         }
-    }
+    };
 
     write_event_for_account(
         state,
         &contact.account_id,
         Some(&contact.wxid),
         "non_text_inbound_transition",
-        "enqueued",
-        "非文本入站消息：理解链路未接通，已发过渡话术请客户文字补充",
+        enqueue_status,
+        if enqueue_status == "outbox_enqueued" {
+            "非文本入站消息：理解链路未接通，已入队过渡话术请客户文字补充"
+        } else {
+            "非文本入站过渡话术已由既有 outbox 覆盖，本轮未重复入队"
+        },
         Some(doc! { "msgType": &msg_type, "runId": run_id }),
     )
     .await?;
@@ -601,13 +748,13 @@ async fn maybe_handle_non_text_transition(
         contact,
         run_id,
         trigger.kind(),
-        "outbox_enqueued",
+        enqueue_status,
         &RunPlannerResult::default(),
         doc! { "refreshed": false, "reason": "non_text_inbound_transition" },
         &KnowledgeRouteResult::default(),
         doc! { "msgType": &msg_type, "replyKind": "non_text_transition" },
         Document::new(),
-        doc! { "gatewayStatus": "outbox_enqueued", "msgType": &msg_type },
+        doc! { "gatewayStatus": enqueue_status, "msgType": &msg_type },
         None,
         source_event_id,
         source_kind,
@@ -812,7 +959,10 @@ pub(crate) async fn relay_principal_decision_to_customer(
         contact
             .domain_attributes
             .get_or_insert_with(Document::new)
-            .insert(crate::models::PRINCIPAL_PRODUCT_EXEMPTION_ATTR, exemption_doc);
+            .insert(
+                crate::models::PRINCIPAL_PRODUCT_EXEMPTION_ATTR,
+                exemption_doc,
+            );
         // fail-soft 审计（写事件失败不阻断放行）。
         let _ = write_event_for_account(
             state,
@@ -840,7 +990,8 @@ pub(crate) async fn relay_principal_decision_to_customer(
         None,
     )
     .await?;
-    clear_awaiting_principal_state(state, &contact).await?;
+    // awaiting 只能在 dispatcher 确认 relay 文本真实送达后清除。gateway 返回 Ok
+    // 仅表示决策链执行完毕；安全门拦截或 outbox 尚 pending 都不等于客户已收到裁决。
     // B 类知识沉淀 / 旧 draft 提案二选一（互斥），都受 !knowledge_proposal_emitted 防重复：
     // - exemption_type == knowledge：领导授权把该说法沉淀成全体可复用的 verified 知识（B 类，
     //   是 A 类豁免的超集：先即时放行该客户，再沉淀给全体）；由 exemption_type 驱动，绕过
@@ -954,7 +1105,11 @@ async fn apply_state_action_gate(
         review.final_review_status = "held_by_ai_policy".to_string();
         final_decision.should_reply = false;
         final_decision.autonomy_mode = "blocked".to_string();
-        if !review.risks.iter().any(|r| r == "state_action_policy_blocked") {
+        if !review
+            .risks
+            .iter()
+            .any(|r| r == "state_action_policy_blocked")
+        {
             review.risks.push("state_action_policy_blocked".to_string());
         }
         *finalize_status = GatewayStatusFinal::Held("held_by_ai_policy".to_string());
@@ -1095,7 +1250,12 @@ async fn run_user_operation_gateway_inner(
         if let Some(task_id) = task_id {
             // #69：静默时段命中 → 重排到醒来时刻（不取消，避免丢承诺/催进）；其余 block 维持取消。
             if precheck.status == "quiet_hours_deferred" {
-                let wake_at = crate::agent::quiet_hours::next_wake_at(runtime.quiet_hours_end, runtime.quiet_hours_tz_offset_hours, &contact.wxid, state.config.wake_jitter_max_seconds);
+                let wake_at = crate::agent::quiet_hours::next_wake_at(
+                    runtime.quiet_hours_end,
+                    runtime.quiet_hours_tz_offset_hours,
+                    &contact.wxid,
+                    state.config.wake_jitter_max_seconds,
+                );
                 reschedule_task(state, task_id, wake_at, &precheck.reason).await?;
             } else {
                 cancel_task(state, task_id, &precheck.status, &precheck.reason).await?;
@@ -1165,11 +1325,9 @@ async fn run_user_operation_gateway_inner(
     // 一次（30s TTL 进程缓存，命中即廉价），供 finalize 阶段的承诺词表
     // commitment_markers（H4）+ runtime grounding 闸开关（H14）消费。DEFAULT 销售域
     // 词表逐字复刻 guards const、bypass=false → 行为字节等价。
-    let active_profile = crate::agent::domain_profile::load_active_domain_profile(
-        &state.db,
-        &contact.workspace_id,
-    )
-    .await;
+    let active_profile =
+        crate::agent::domain_profile::load_active_domain_profile(&state.db, &contact.workspace_id)
+            .await;
     // universal-domain-adaptation 第 78 点：用单一入口 apply_active_profile 把 active
     // profile 的运行期价值开关（H14 grounding bypass + reviewer distrust + M2 五闸阈值
     // 覆盖）一次性派生进 runtime，替代此处散落的手工赋值。DEFAULT 销售 profile →
@@ -1443,8 +1601,8 @@ async fn run_user_operation_gateway_inner(
             // 纯澄清问句通常短且含问号；「硬答+澄清混合」通常更长、问号在大段断言之后或缺失。
             // 这些客观量供后续机器扫描量化硬答率，语义判断留给取证分析，不在此处用词表硬判。
             let reply_chars = decision_first.reply_text.chars().count() as i64;
-            let has_question_mark = decision_first.reply_text.contains('?')
-                || decision_first.reply_text.contains('？');
+            let has_question_mark =
+                decision_first.reply_text.contains('?') || decision_first.reply_text.contains('？');
             write_event_for_account(
                 state,
                 &contact.account_id,
@@ -1519,7 +1677,9 @@ async fn run_user_operation_gateway_inner(
     normalize_decision_state(&mut decision, domain_config.as_ref());
     normalize_decision_runtime(&mut decision, &initial_planner);
     let mut planner = planner_from_decision(&decision, "Reply Agent 单轮决策（知识路由前置）");
-    if !knowledge_route.selected_chunk_ids.is_empty() || !knowledge_route.selected_knowledge_ids.is_empty() {
+    if !knowledge_route.selected_chunk_ids.is_empty()
+        || !knowledge_route.selected_knowledge_ids.is_empty()
+    {
         planner.knowledge_required = true;
         if planner.review_mode.trim().is_empty() {
             planner.review_mode = "full".to_string();
@@ -1593,10 +1753,7 @@ async fn run_user_operation_gateway_inner(
     };
     let mut final_decision = decision;
 
-    if final_decision.should_reply
-        && !review_passed(&review, &runtime)
-        && !review.needs_revision
-    {
+    if final_decision.should_reply && !review_passed(&review, &runtime) && !review.needs_revision {
         // Phase B / B1：`needs_revision=true` 表示 [`route_dual_gate`] 已经
         // 把当前 review 标为软闸-only 失败，应走 finalize 之后的 single-shot
         // revision 通道（decide_revision Proceed），而不是这里的 rewrite 路径
@@ -1766,7 +1923,9 @@ async fn run_user_operation_gateway_inner(
         // TTL 自愈：启动 warm_up 后若长期无 admin 写操作触发 invalidate，
         // 30s 后 find_or_load 自动 reload，防 cache 永远 stale。任何 IO 故障被
         // find_or_load 内部 log 后吞掉。
-        cache.find_or_load(&state.db).await;
+        cache
+            .find_or_load(&state.db, &contact.workspace_id)
+            .await;
         // universal-domain-adaptation H7：校验维度集合改读 active DomainProfile。
         // DEFAULT 销售域返回 ["customer_stage","intent_level"] 逐字等价。
         // （复用本 run 顶部已加载的 active_profile，避免重复 load。）
@@ -1775,6 +1934,7 @@ async fn run_user_operation_gateway_inner(
         let outcome = compute_taxonomy_guard_outcome(
             &final_decision,
             &dimension_kinds,
+            &contact.workspace_id,
             &contact.account_id,
             &cache,
         );
@@ -1795,6 +1955,7 @@ async fn run_user_operation_gateway_inner(
                 pick_dimension_display_name(&final_decision.dimension_display_names, kind);
             if let Err(error) = taxonomy_upsert_candidate(
                 &state.db,
+                &contact.workspace_id,
                 &contact.account_id,
                 kind,
                 raw,
@@ -1839,10 +2000,7 @@ async fn run_user_operation_gateway_inner(
         && !review.should_hold
         && final_decision.should_reply
     {
-        let prev_style = contact
-            .last_outbound_style
-            .clone()
-            .unwrap_or_default();
+        let prev_style = contact.last_outbound_style.clone().unwrap_or_default();
         if !prev_style.trim().is_empty() {
             let new_style =
                 super::review::extract_outbound_style_fingerprint(&final_decision.reply_text);
@@ -1864,10 +2022,7 @@ async fn run_user_operation_gateway_inner(
                     Some(&contact.wxid),
                     "style_consistency_revision_trigger",
                     "info",
-                    &format!(
-                        "style_diverged: prev={} new={}",
-                        prev_style, new_style
-                    ),
+                    &format!("style_diverged: prev={} new={}", prev_style, new_style),
                     Some(doc! {
                         "run_id": &run_id,
                         "prev_style": &prev_style,
@@ -2016,17 +2171,15 @@ async fn run_user_operation_gateway_inner(
                     persist_finalize_pending_events(state, &contact, &second_pending_events)
                         .await?;
 
-                    let second_passed = matches!(
-                        second_finalize_status,
-                        GatewayStatusFinal::Approved
-                    ) && review_passed(&review, &runtime);
+                    let second_passed =
+                        matches!(second_finalize_status, GatewayStatusFinal::Approved)
+                            && review_passed(&review, &runtime);
 
                     if second_passed {
                         // R2.3：revision_applied_approved
                         revision_applied = true;
                         review.revision_applied = true;
-                        review.final_review_status =
-                            "revision_applied_approved".to_string();
+                        review.final_review_status = "revision_applied_approved".to_string();
                         revision_reason = "revision_applied_approved".to_string();
                         finalize_status = GatewayStatusFinal::Approved;
                         post_revision_summary = Some(format!(
@@ -2138,8 +2291,8 @@ async fn run_user_operation_gateway_inner(
             if task.kind == crate::agent::quiet_hours::DEFERRED_INBOUND_REPLY_KIND {
                 false
             } else {
-                let last_inbound_ms = inbound_marker_for_context_check(&contact)
-                    .map(|d| d.timestamp_millis());
+                let last_inbound_ms =
+                    inbound_marker_for_context_check(&contact).map(|d| d.timestamp_millis());
                 let task_created_ms = task.created_at.timestamp_millis();
                 check_context_changed_followup_pure(last_inbound_ms, task_created_ms)
             }
@@ -2155,26 +2308,26 @@ async fn run_user_operation_gateway_inner(
     // finalize 终态决定是否拦截发送：approved 路径继续走原有 send 逻辑；
     // 其它终态（held / blocked_*）一律 fail-closed（不发送、记录审计）。
     if !matches!(finalize_status, GatewayStatusFinal::Approved) {
-        let (blocked_status, cancel_reason) =
-            if let Some(reason) = context_changed_followup_reason {
-                // ISSUE-001 (R12)：context_changed 抢先覆盖 gateway_status；
-                // final_review_status 保持 finalize 计算值（10 项枚举内合法），
-                // 但通过 review.risks 追加 "follow_up_context_changed" 标签，
-                // 让审计 / observability 能看到这一 race 真实信号。
-                if !review
-                    .risks
-                    .iter()
-                    .any(|r| r == "follow_up_context_changed")
-                {
-                    review.risks.push("follow_up_context_changed".to_string());
-                }
-                ("context_changed".to_string(), reason)
-            } else {
-                (
-                    finalize_status.gateway_status_str(),
-                    "finalize_review_blocked",
-                )
-            };
+        let (blocked_status, cancel_reason) = if let Some(reason) = context_changed_followup_reason
+        {
+            // ISSUE-001 (R12)：context_changed 抢先覆盖 gateway_status；
+            // final_review_status 保持 finalize 计算值（10 项枚举内合法），
+            // 但通过 review.risks 追加 "follow_up_context_changed" 标签，
+            // 让审计 / observability 能看到这一 race 真实信号。
+            if !review
+                .risks
+                .iter()
+                .any(|r| r == "follow_up_context_changed")
+            {
+                review.risks.push("follow_up_context_changed".to_string());
+            }
+            ("context_changed".to_string(), reason)
+        } else {
+            (
+                finalize_status.gateway_status_str(),
+                "finalize_review_blocked",
+            )
+        };
         write_decision_review(
             state,
             &contact,
@@ -2260,7 +2413,10 @@ async fn run_user_operation_gateway_inner(
         // fail-soft：gap_signal 写失败只记 warn、不阻断 run（回复路径已决，与上方
         // escalate_held / `agent.dimension_dropped` 的 let _ 同纪律）。落点选在此 async
         // 上游而非 finalize_review_for_send 内——后者是纯同步 finalize 逻辑、不持有 db。
-        if matches!(finalize_status, GatewayStatusFinal::BlockedUnverifiedProductClaim) {
+        if matches!(
+            finalize_status,
+            GatewayStatusFinal::BlockedUnverifiedProductClaim
+        ) {
             let candidate =
                 crate::knowledge_wiki::gap_signals::GapSignalCandidate::recall_miss_from_product_block(
                     inbound.content.clone(),
@@ -2299,7 +2455,12 @@ async fn run_user_operation_gateway_inner(
             // 第二道在 LLM 决策之后命中（罕见：仅当静默边界恰好落在决策耗时内），
             // 重排即丢弃这次决策、醒来按完整上下文重跑，语义正确。
             if final_precheck.status == "quiet_hours_deferred" {
-                let wake_at = crate::agent::quiet_hours::next_wake_at(runtime.quiet_hours_end, runtime.quiet_hours_tz_offset_hours, &contact.wxid, state.config.wake_jitter_max_seconds);
+                let wake_at = crate::agent::quiet_hours::next_wake_at(
+                    runtime.quiet_hours_end,
+                    runtime.quiet_hours_tz_offset_hours,
+                    &contact.wxid,
+                    state.config.wake_jitter_max_seconds,
+                );
                 reschedule_task(state, task_id, wake_at, &final_precheck.reason).await?;
             } else {
                 cancel_task(
@@ -2412,24 +2573,6 @@ async fn run_user_operation_gateway_inner(
         }
     }
 
-    if text_send_eligible(final_decision.should_reply, &final_decision.reply_text) {
-        if let Some(task_id) = task_id {
-            // W4 / Task 5.5：发送改异步走 outbox，把 task 状态推进为
-            // `outbox_enqueued` 而不是 `sent`；真正 `sent` 由 dispatcher 在
-            // MCP 成功后更新（dispatcher 反向通道见 5.4）。
-            crate::models::assert_agent_task_status_valid("outbox_enqueued");
-            state
-                .db
-                .tasks()
-                .update_one(
-                    doc! { "_id": task_id },
-                    doc! { "$set": { "status": "outbox_enqueued", "gateway_status": "outbox_enqueued", "updated_at": DateTime::now() } },
-                    None,
-                )
-                .await?;
-        }
-    }
-
     // 子计划2 Task3/Task4：tag_observation 证据锚定 + customer_stage 强弱门控均需按
     // created_at 升序（最早在前，0-based）的对话窗口——与 prompt 呈现给 LLM 的顺序一致。
     // `recent_messages` 来自 load_recent_messages，按 {created_at:-1} 降序（最新在前），
@@ -2470,7 +2613,7 @@ async fn run_user_operation_gateway_inner(
         &final_precheck,
         &context_pack,
         if final_decision.should_reply {
-            "sent"
+            "outbox_enqueuing"
         } else {
             "no_reply"
         },
@@ -2479,6 +2622,23 @@ async fn run_user_operation_gateway_inner(
         &planner,
     )
     .await?;
+    // 先建立原始 task → decision_review 关联，再创建 outbox。dispatcher 可能在
+    // enqueue 返回后立即抢占并完成发送；提前写关联可确保其总能找到并推进原任务。
+    // 这里只写关联，不宣称已入队或已送达。
+    if let Some(task_id) = task_id {
+        state
+            .db
+            .tasks()
+            .update_one(
+                doc! { "_id": task_id },
+                doc! { "$set": {
+                    "source_decision_id": decision_review_id,
+                    "updated_at": DateTime::now(),
+                } },
+                None,
+            )
+            .await?;
+    }
     write_knowledge_usage_log(
         state,
         &contact,
@@ -2522,7 +2682,7 @@ async fn run_user_operation_gateway_inner(
         &contact,
         &run_id,
         trigger.kind(),
-        if final_decision.should_reply { "outbox_enqueued" } else { "no_reply" },
+        if final_decision.should_reply { "outbox_enqueuing" } else { "no_reply" },
         &planner,
         doc! { "refreshed": should_refresh_context, "version": context_pack.get_i32("version").unwrap_or_default() },
         &knowledge_route,
@@ -2554,6 +2714,7 @@ async fn run_user_operation_gateway_inner(
     let mut outbox_eligible = final_decision.should_reply
         && !final_decision.reply_text.trim().is_empty()
         && (final_status == "approved" || final_status == "revision_applied_approved");
+    let mut delivery_block_status: Option<&str> = None;
     // relay 出站红线守卫（代码级兜底）：relay 转述绝不透传内部载荷
     // （__PRINCIPAL_RELAY__/verdict=/substance=/constraints=）。命中即 fail-closed：
     // 不入队该文本（宁可客户这轮收不到，也绝不把内部载荷标记发给客户），记 event + warn
@@ -2568,6 +2729,7 @@ async fn run_user_operation_gateway_inner(
             escalation::relay_output_leaks_internal_payload(&final_decision.reply_text);
         if leaks_payload {
             outbox_eligible = false;
+            delivery_block_status = Some("blocked_by_safety_guard");
             tracing::warn!(
                 %run_id,
                 contact_wxid = %contact.wxid,
@@ -2610,16 +2772,48 @@ async fn run_user_operation_gateway_inner(
                     contact_wxid = %contact.wxid,
                     "outbox enqueue skipped: superseded by newer inbound"
                 );
+                state
+                    .db
+                    .decision_reviews()
+                    .update_one(
+                        doc! { "_id": decision_review_id, "status": "outbox_enqueuing" },
+                        doc! { "$set": { "status": "superseded_by_new_inbound" } },
+                        None,
+                    )
+                    .await?;
+                state
+                    .db
+                    .agent_run_logs()
+                    .update_one(
+                        doc! { "run_id": &run_id, "status": "outbox_enqueuing" },
+                        doc! { "$set": {
+                            "status": "superseded_by_new_inbound",
+                            "lifecycle": crate::agent::run_envelope::LIFECYCLE_ABORTED_BY_EXTERNAL_SIGNAL,
+                            "abort_reason": "superseded_by_new_inbound",
+                            "updated_at": DateTime::now(),
+                        } },
+                        None,
+                    )
+                    .await?;
+                if let Some(task_id) = task_id {
+                    cancel_task(
+                        state,
+                        task_id,
+                        "superseded_by_new_inbound",
+                        "入队前被更新的客户消息取代",
+                    )
+                    .await?;
+                }
                 return Ok(());
             }
         }
     }
+    let mut text_outbox_enqueued = false;
+    let mut cross_decision_duplicates: Vec<(usize, ObjectId, String)> = Vec::new();
     if outbox_eligible {
         let source_event_id = match &trigger {
             AgentTrigger::Inbound(msg) => msg.message_id.clone().unwrap_or_default(),
-            AgentTrigger::FollowUp(task) => {
-                task.id.map(|id| id.to_hex()).unwrap_or_default()
-            }
+            AgentTrigger::FollowUp(task) => task.id.map(|id| id.to_hex()).unwrap_or_default(),
         };
         // #68：把整条回复拆成多条短消息,逐条 enqueue。每条把 segment 序号拼进
         // source_event_id(`{src}#seg{idx}`),保证 N 条幂等 key 天然不碰撞——否则
@@ -2659,6 +2853,7 @@ async fn run_user_operation_gateway_inner(
             };
             match outbox_enqueue(state, enqueue_req).await {
                 Ok(EnqueueOutcome::Created { outbox_id, .. }) => {
+                    text_outbox_enqueued = true;
                     tracing::info!(
                         %run_id,
                         %outbox_id,
@@ -2667,22 +2862,29 @@ async fn run_user_operation_gateway_inner(
                         segment_total = total,
                         "outbox enqueued"
                     );
-                    let _ = state
-                        .db
-                        .agent_run_logs()
-                        .update_one(
-                            doc! { "run_id": &run_id },
-                            doc! { "$set": { "outbox_status": "pending" } },
-                            None,
-                        )
-                        .await;
                 }
-                Ok(EnqueueOutcome::IdempotentSkip { idempotency_key }) => {
+                Ok(EnqueueOutcome::IdempotentSkip {
+                    idempotency_key,
+                    existing_outbox_id,
+                    existing_decision_id,
+                    existing_status,
+                    ..
+                }) => {
+                    if existing_outbox_covers_decision(
+                        existing_decision_id,
+                        decision_review_id,
+                        &existing_status,
+                    ) {
+                        text_outbox_enqueued = true;
+                    } else {
+                        cross_decision_duplicates.push((idx, existing_outbox_id, existing_status));
+                    }
                     tracing::info!(
                         %run_id,
                         %idempotency_key,
                         contact_wxid = %contact.wxid,
                         segment_index = idx,
+                        %existing_outbox_id,
                         "outbox enqueue idempotent skip"
                     );
                 }
@@ -2692,9 +2894,77 @@ async fn run_user_operation_gateway_inner(
                 }
             }
         }
-        if !enqueue_errors.is_empty() {
+        if enqueue_errors.is_empty()
+            && !cross_decision_duplicates.is_empty()
+            && cross_decision_duplicates.len() == total
+            && !text_outbox_enqueued
+        {
+            let duplicate_outbox_ids: Vec<ObjectId> = cross_decision_duplicates
+                .iter()
+                .map(|(_, outbox_id, _)| *outbox_id)
+                .collect();
+            state
+                .db
+                .decision_reviews()
+                .update_one(
+                    doc! { "_id": decision_review_id, "status": "outbox_enqueuing" },
+                    doc! { "$set": {
+                        "status": "skipped_duplicate",
+                        "duplicate_outbox_ids": duplicate_outbox_ids.clone(),
+                    } },
+                    None,
+                )
+                .await?;
+            state
+                .db
+                .agent_run_logs()
+                .update_one(
+                    doc! { "run_id": &run_id, "status": "outbox_enqueuing" },
+                    doc! { "$set": {
+                        "status": "skipped_duplicate",
+                        "lifecycle": crate::agent::run_envelope::LIFECYCLE_COMPLETED,
+                        "updated_at": DateTime::now(),
+                    } },
+                    None,
+                )
+                .await?;
+            if let Some(task_id) = task_id {
+                cancel_task(
+                    state,
+                    task_id,
+                    "skipped_duplicate",
+                    "相同回复已由既有 outbox 覆盖，本轮不重复发送",
+                )
+                .await?;
+            }
+            write_event_for_account(
+                state,
+                &contact.account_id,
+                Some(&contact.wxid),
+                "outbox_skipped_duplicate",
+                "skipped_duplicate",
+                "全部文本分段均命中既有 outbox，本轮未重复入队",
+                Some(doc! {
+                    "run_id": &run_id,
+                    "duplicate_outbox_ids": duplicate_outbox_ids,
+                }),
+            )
+            .await
+            .ok();
+            return Ok(());
+        }
+        if !enqueue_errors.is_empty() || !cross_decision_duplicates.is_empty() {
+            let partial_outbox_status = if text_outbox_enqueued {
+                "pending"
+            } else {
+                "canceled"
+            };
             let failed_indices: Vec<i64> =
                 enqueue_errors.iter().map(|(idx, _)| *idx as i64).collect();
+            let duplicate_indices: Vec<i64> = cross_decision_duplicates
+                .iter()
+                .map(|(idx, _, _)| *idx as i64)
+                .collect();
             write_event_for_account(
                 state,
                 &contact.account_id,
@@ -2706,13 +2976,117 @@ async fn run_user_operation_gateway_inner(
                     "run_id": &run_id,
                     "segment_total": total as i64,
                     "failed_segment_indices": failed_indices,
+                    "duplicate_segment_indices": duplicate_indices,
                 }),
             )
             .await
             .ok();
-            // 返回首个失败错误供上层观测（已入队段不回滚，照常发出）。
-            return Err(enqueue_errors.into_iter().next().map(|(_, e)| e).unwrap());
+            state
+                .db
+                .decision_reviews()
+                .update_one(
+                    doc! { "_id": decision_review_id, "status": "outbox_enqueuing" },
+                    doc! { "$set": { "status": "outbox_enqueue_partial_failure" } },
+                    None,
+                )
+                .await?;
+            state
+                .db
+                .agent_run_logs()
+                .update_one(
+                    doc! { "run_id": &run_id },
+                    doc! { "$set": {
+                        "status": "outbox_enqueue_partial_failure",
+                        "lifecycle": crate::agent::run_envelope::LIFECYCLE_FAILED_AFTER_DECISION,
+                        "outbox_status": partial_outbox_status,
+                        "updated_at": DateTime::now(),
+                    } },
+                    None,
+                )
+                .await?;
+            if let Some(task_id) = task_id {
+                cancel_task(
+                    state,
+                    task_id,
+                    "outbox_enqueue_partial_failure",
+                    "多段回复部分入队失败",
+                )
+                .await?;
+            }
+            super::outbox_dispatcher::refresh_run_log_outbox_status(state, &run_id).await;
+            if let Some((_, err)) = enqueue_errors.into_iter().next() {
+                return Err(err);
+            }
+            return Ok(());
         }
+        if text_outbox_enqueued {
+            state
+                .db
+                .decision_reviews()
+                .update_one(
+                    doc! { "_id": decision_review_id, "status": "outbox_enqueuing" },
+                    doc! { "$set": { "status": "outbox_enqueued" } },
+                    None,
+                )
+                .await?;
+        }
+    }
+    if let Some(task_id) = task_id {
+        if text_send_eligible(final_decision.should_reply, &final_decision.reply_text) {
+            if text_outbox_enqueued {
+                crate::models::assert_agent_task_status_valid("outbox_enqueued");
+                state
+                    .db
+                    .tasks()
+                    .update_one(
+                        doc! {
+                            "_id": task_id,
+                            "status": { "$in": ["pending", "retry", "running", "outbox_enqueued"] },
+                        },
+                        doc! { "$set": {
+                            "status": "outbox_enqueued",
+                            "gateway_status": "outbox_enqueued",
+                            "updated_at": DateTime::now(),
+                        } },
+                        None,
+                    )
+                    .await?;
+            } else {
+                cancel_task(
+                    state,
+                    task_id,
+                    "blocked_by_safety_guard",
+                    "发送安全门拦截，未创建 outbox",
+                )
+                .await?;
+            }
+        }
+    }
+    if final_decision.should_reply && !text_outbox_enqueued {
+        let blocked_status = delivery_block_status.unwrap_or("blocked_by_safety_guard");
+        state
+            .db
+            .decision_reviews()
+            .update_one(
+                doc! { "_id": decision_review_id, "status": "outbox_enqueuing" },
+                doc! { "$set": { "status": blocked_status } },
+                None,
+            )
+            .await?;
+        state
+            .db
+            .agent_run_logs()
+            .update_one(
+                doc! { "run_id": &run_id },
+                doc! { "$set": {
+                    "status": blocked_status,
+                    "lifecycle": crate::agent::run_envelope::LIFECYCLE_FAILED_AFTER_DECISION,
+                    "outbox_status": "canceled",
+                    "updated_at": DateTime::now(),
+                } },
+                None,
+            )
+            .await?;
     }
     // media-asset Task 8：素材文件发送。文本回复已在上方先入 outbox（先文字后文件），
     // 这里把 final_decision.assets_to_send 逐个转成独立媒体 outbox 条目。
@@ -2753,7 +3127,10 @@ async fn run_user_operation_gateway_inner(
             let asset = match state
                 .db
                 .content_assets()
-                .find_one(doc! { "_id": oid, "workspace_id": &contact.workspace_id }, None)
+                .find_one(
+                    doc! { "_id": oid, "workspace_id": &contact.workspace_id },
+                    None,
+                )
                 .await
             {
                 Ok(a) => a,
@@ -2795,9 +3172,7 @@ async fn run_user_operation_gateway_inner(
             if asset.requires_principal_approval == Some(true) {
                 let escalation_req = crate::models::EscalationRequest {
                     needed: true,
-                    category: Some(
-                        crate::models::ESCALATION_CATEGORY_OUT_OF_SCOPE.to_string(),
-                    ),
+                    category: Some(crate::models::ESCALATION_CATEGORY_OUT_OF_SCOPE.to_string()),
                     reason: Some(format!(
                         "素材《{}》标记为需领导核准后才能发送给客户",
                         asset.title
@@ -2857,7 +3232,7 @@ async fn run_user_operation_gateway_inner(
                         "media outbox enqueued"
                     );
                 }
-                Ok(EnqueueOutcome::IdempotentSkip { idempotency_key }) => {
+                Ok(EnqueueOutcome::IdempotentSkip { idempotency_key, .. }) => {
                     tracing::info!(
                         %run_id,
                         %idempotency_key,
@@ -2943,7 +3318,7 @@ async fn run_user_operation_gateway_inner(
                             Ok(EnqueueOutcome::Created { outbox_id, .. }) => {
                                 tracing::info!(%run_id, %outbox_id, contact_wxid = %contact.wxid, card_id = %directive.card_id, "namecard outbox enqueued");
                             }
-                            Ok(EnqueueOutcome::IdempotentSkip { idempotency_key }) => {
+                            Ok(EnqueueOutcome::IdempotentSkip { idempotency_key, .. }) => {
                                 tracing::info!(%run_id, %idempotency_key, card_id = %directive.card_id, "namecard outbox enqueue idempotent skip");
                             }
                             Err(err) => {
@@ -2979,6 +3354,23 @@ async fn run_user_operation_gateway_inner(
             }
         }
     }
+    // 所有文本/素材/名片条目都完成 enqueue 后，先关闭过程态，再聚合完整集合。
+    // dispatcher 在此之前即使抢先送达首段，也只能把 run 聚合为 pending。
+    if text_outbox_enqueued {
+        state
+            .db
+            .agent_run_logs()
+            .update_one(
+                doc! { "run_id": &run_id, "status": "outbox_enqueuing" },
+                doc! { "$set": {
+                    "status": "outbox_enqueued",
+                    "lifecycle": crate::agent::run_envelope::LIFECYCLE_COMPLETED,
+                } },
+                None,
+            )
+            .await?;
+    }
+    super::outbox_dispatcher::refresh_run_log_outbox_status(state, &run_id).await;
     // 决策请示触发（统一占位模型）：占位 reply 已入 outbox 正常发给客户，
     // 这里只做不面向客户的副作用——推请示卡给领导 + 落台账 pending。
     // 失败不回滚已发占位、不让 run 失败：仅 warn 降级。
@@ -3034,13 +3426,10 @@ pub(crate) async fn send_outbound_message(
         .get("newMsgId")
         .and_then(|value| value.as_str())
         .map(ToString::to_string);
-    // 新信封成功标志观测(不改变 .await? 的成功语义)：await 成功但信封无 ok/newMsgId
-    // 属异常(如空返回体)，warn 供排查，不拦截。
     if !send_receipt_is_ok(&response) {
-        tracing::warn!(
-            account_id = %contact.account_id,
-            "send_outbound_message: MCP 返回无成功标志(ok/newMsgId 缺失),疑似异常信封"
-        );
+        return Err(AppError::External(
+            "message_send_text returned a negative or unverifiable delivery receipt".to_string(),
+        ));
     }
     let mut raw = to_document(&response).unwrap_or_default();
     if let Some(extra_raw) = extra_raw {
@@ -3122,8 +3511,7 @@ pub(crate) async fn send_outbound_message(
     // 不改 last_inbound_at（出站不应推进"用户最后一次说话"的时间）。
     // Phase D / D2：同步把本次出站文本的风格指纹写入 last_outbound_style，
     // 供下一轮 reviewer 做 style_diverged 判定。
-    let style_fingerprint =
-        super::review::extract_outbound_style_fingerprint(content);
+    let style_fingerprint = super::review::extract_outbound_style_fingerprint(content);
     let pipeline: Vec<Document> = vec![doc! {
         "$set": {
             "last_outbound_at": now,
@@ -3848,7 +4236,10 @@ pub(crate) fn merge_memory_summary_dedup_capped(
 pub(crate) fn stage_realtime_write_allowed(
     strength: crate::agent::tag_evidence::EvidenceStrength,
 ) -> bool {
-    matches!(strength, crate::agent::tag_evidence::EvidenceStrength::Strong)
+    matches!(
+        strength,
+        crate::agent::tag_evidence::EvidenceStrength::Strong
+    )
 }
 
 /// 贝叶斯评估旁路（子计划4 Task2）：把 LLM 输出的维度观察映射成
@@ -3920,11 +4311,9 @@ async fn apply_agent_updates(
     // 追加 transaction_facts_enabled 守门，避免"非交易域关了注入、却仍用持有事实改写
     // 客户阶段标签"的行为分裂（此前靠情感域默认不声明该维度间接挡住，非不变量；且
     // project_entitlements 还看 outcome_events，产品表空也可能投影非空，巧合不可依赖）。
-    let active_profile = crate::agent::domain_profile::load_active_domain_profile(
-        &state.db,
-        &contact.workspace_id,
-    )
-    .await;
+    let active_profile =
+        crate::agent::domain_profile::load_active_domain_profile(&state.db, &contact.workspace_id)
+            .await;
     let mut g1_correction: Option<(String, String)> = None;
     {
         let g1_participates = active_profile.transaction_facts_enabled
@@ -3933,11 +4322,9 @@ async fn apply_agent_updates(
                     && d.kind == crate::agent::entitlements::G1_DIMENSION_KIND
             });
         if g1_participates {
-            let active_products = crate::agent::entitlements::load_active_products(
-                &state.db,
-                &contact.workspace_id,
-            )
-            .await;
+            let active_products =
+                crate::agent::entitlements::load_active_products(&state.db, &contact.workspace_id)
+                    .await;
             let (entitlements, _total) = crate::agent::entitlements::project_entitlements(
                 &contact.outcome_events,
                 &active_products,
@@ -3992,6 +4379,7 @@ async fn apply_agent_updates(
             };
             let verdict = crate::agent::dimension_registry::validate_dimension_value(
                 &state.db,
+                &contact.workspace_id,
                 kind,
                 raw,
                 &contact.account_id,
@@ -4008,7 +4396,9 @@ async fn apply_agent_updates(
             }
         }
         for (kind, canonical) in &to_replace {
-            signals_decision.domain_signals.insert(kind.as_str(), canonical.as_str());
+            signals_decision
+                .domain_signals
+                .insert(kind.as_str(), canonical.as_str());
         }
         for (kind, raw) in &to_drop {
             signals_decision.domain_signals.remove(kind.as_str());
@@ -4049,14 +4439,15 @@ async fn apply_agent_updates(
             .get_str("customer_stage")
             .ok()
             .map(str::to_string);
-        let stage_rejection: Option<(Option<String>, String, String)> =
-            match proposed_stage.as_deref() {
-                Some(to_stage) if prev_stage != Some(to_stage) => {
-                    crate::agent::guards::check_state_transition(domain_config, prev_stage, to_stage)
-                        .map(|reason| (prev_stage.map(str::to_string), to_stage.to_string(), reason))
-                }
-                _ => None,
-            };
+        let stage_rejection: Option<(Option<String>, String, String)> = match proposed_stage
+            .as_deref()
+        {
+            Some(to_stage) if prev_stage != Some(to_stage) => {
+                crate::agent::guards::check_state_transition(domain_config, prev_stage, to_stage)
+                    .map(|reason| (prev_stage.map(str::to_string), to_stage.to_string(), reason))
+            }
+            _ => None,
+        };
         if let Some((from, to, reason)) = &stage_rejection {
             // fail-soft：审计写失败不阻断主流程（回复已异步发出），与 dimension_dropped 同风格。
             let _ = write_event_for_account(
@@ -4084,10 +4475,8 @@ async fn apply_agent_updates(
         // domain_attributes.customer_stage（保持旧值），改沉淀 tag_observation 暂定层等压缩
         // 重判。强弱由 Task1 纯函数客观判定（证据方向 + explicit 标志），不读 LLM 自称置信。
         // 先 resolve 升序窗口证据 + 判强弱，全程只读 signals/decision，无可变借用冲突。
-        let stage_evidences = crate::agent::tag_evidence::resolve_evidence(
-            window,
-            &decision.stage_evidence_turns,
-        );
+        let stage_evidences =
+            crate::agent::tag_evidence::resolve_evidence(window, &decision.stage_evidence_turns);
         let weak_stage_drop = proposed_stage.is_some()
             && !stage_realtime_write_allowed(crate::agent::tag_evidence::evidence_strength(
                 &stage_evidences,
@@ -4175,43 +4564,19 @@ async fn apply_agent_updates(
         .unwrap_or(false)
     {
         set_doc.insert(
-            format!("domain_attributes.{}", crate::models::AWAITING_PRINCIPAL_DECISION_ATTR),
+            format!(
+                "domain_attributes.{}",
+                crate::models::AWAITING_PRINCIPAL_DECISION_ATTR
+            ),
             true,
         );
         set_doc.insert("domain_attributes_updated_at", DateTime::now());
     }
-    if let Some(value) = non_empty_option(&decision.last_commitment) {
-        // M2：把 LLM 输出的字符串承诺升级为结构化 CommitmentEntry 追加到
-        // commitments 数组（cap 8），让 Planner::scan_commitments 在 due_at
-        // 到期/快到期时能 emit follow_up。PR-D：优先用结构化 decision.commitment
-        // （带 dueAt），解析成 CommitmentEntry.due_at；LLM 未给结构化 commitment 时
-        // 回落 last_commitment 字符串路径（due_at=None，由 planner created_at 兜底接住）。
-        // CONC-2：去重仍用快照判定（应用层），命中已存在则不追加。
-        let already_present = contact.commitments.iter().any(|c| c.text() == value.as_str());
-        if !already_present {
-            let mut entry = crate::models::CommitmentEntry::from_plain_text(value.clone());
-            if let Some(c) = &decision.commitment {
-                if c.text.trim() == value.as_str() {
-                    entry.due_at = crate::agent::types::parse_rfc3339_to_bson(&c.due_at);
-                }
-            }
-            // CONC-2：原子追加（$push+$slice:-8），不再走大 set_doc 的整体覆盖（$set），
-            // 避免并发 writer 各自从陈旧快照 append 互相覆盖丢累积项。
-            // 既成事实纪律：reply 已送出，此写失败只 warn 不阻断（不 `?` 透传，防重发）。
-            if let Err(e) = state
-                .db
-                .contacts()
-                .update_one(
-                    doc! { "_id": contact.id },
-                    build_commitment_push_update(&entry),
-                    None,
-                )
-                .await
-            {
-                tracing::warn!(error = %e, contact_wxid = %contact.wxid, "commitment $push 失败；reply 已送出，跳过");
-            }
-        }
-    } else if reply_has_time_commitment_feature(&decision.reply_text) {
+    // 承诺是“客户已经收到的外部事实”，必须由 dispatcher 在真实送达后提交。
+    // 此处仅保留缺字段观测，不写 commitments。
+    if non_empty_option(&decision.last_commitment).is_none()
+        && reply_has_time_commitment_feature(&decision.reply_text)
+    {
         // ⑥观测：reply 像做了时间承诺但 LLM 没填 commitment 字段 → 无 follow-up。
         // 仅观测 prompt 强化是否生效，不阻断、不改写、不进任何门。
         let _ = write_event_for_account(
@@ -4262,8 +4627,11 @@ async fn apply_agent_updates(
                 set_doc.insert("operation_state_updated_at", DateTime::now());
             }
             Some(reason) => {
-                rejected_state_transition =
-                    Some((contact.operation_state.clone().unwrap_or_default(), value, reason));
+                rejected_state_transition = Some((
+                    contact.operation_state.clone().unwrap_or_default(),
+                    value,
+                    reason,
+                ));
             }
         }
     }
@@ -4378,6 +4746,7 @@ async fn apply_agent_updates(
         // 会被 classify_validation 判 Reject（llm_signal_apply 兜底当 None），不写建议。
         let verdict = crate::agent::dimension_registry::validate_dimension_value(
             &state.db,
+            &contact.workspace_id,
             "relationship_type",
             &value,
             &contact.account_id,
@@ -4415,7 +4784,9 @@ async fn apply_agent_updates(
                 },
                 "$inc": { "occurrences": 1 },
             };
-            let opts = mongodb::options::UpdateOptions::builder().upsert(true).build();
+            let opts = mongodb::options::UpdateOptions::builder()
+                .upsert(true)
+                .build();
             // fail-soft：写建议失败（含已审记录与 unique 锚的 upsert 竞态 E11000）不阻断主流程。
             let _ = state
                 .db
@@ -4465,7 +4836,9 @@ async fn apply_agent_updates(
             },
             "$inc": { "occurrences": 1 },
         };
-        let opts = mongodb::options::UpdateOptions::builder().upsert(true).build();
+        let opts = mongodb::options::UpdateOptions::builder()
+            .upsert(true)
+            .build();
         // fail-soft：写信号失败（含已审记录与 unique 锚的 upsert 竞态 E11000）不阻断主流程。
         let _ = state
             .db
@@ -4488,7 +4861,11 @@ async fn apply_agent_updates(
             "observed",
             &format!(
                 "G1 购买生命周期纠偏：LLM[{}] → G4客观[{}]",
-                if llm_original.is_empty() { "缺失" } else { llm_original.as_str() },
+                if llm_original.is_empty() {
+                    "缺失"
+                } else {
+                    llm_original.as_str()
+                },
                 corrected
             ),
             Some(doc! {
@@ -4616,69 +4993,7 @@ async fn apply_agent_updates(
         .await;
     }
 
-    if let Some(follow_up) = &decision.follow_up {
-        if follow_up.needed && !follow_up.content.trim().is_empty() {
-            if pending_follow_up_count(state, contact).await? < runtime.max_pending_follow_ups {
-                // #66：run_at 解析失败时降级到 now（而非静默丢弃整条跟进），
-                // precheck 的 context_changed / expired 仍正常守门。降级时写审计事件。
-                let (run_at, degraded) = crate::agent::types::resolve_run_at_or_degrade(
-                    &follow_up.run_at,
-                    DateTime::now().timestamp_millis(),
-                    0,
-                );
-                if degraded {
-                    // fail-soft：纯审计写失败不阻断主流程（回复稍后异步入队），与 dimension_dropped 同风格。
-                    let _ = write_event_for_account(
-                        state,
-                        &contact.account_id,
-                        Some(&contact.wxid),
-                        "agent.follow_up_run_at_degraded",
-                        "warn",
-                        &format!(
-                            "follow_up.run_at 解析失败，降级到 now：raw={:?}",
-                            follow_up.run_at
-                        ),
-                        Some(doc! { "raw_run_at": &follow_up.run_at }),
-                    )
-                    .await;
-                }
-                let expires_at = DateTime::from_millis(
-                    run_at.timestamp_millis()
-                        + runtime.follow_up_expires_hours * 60 * 60 * 1000,
-                );
-                state
-                    .db
-                    .tasks()
-                    .insert_one(
-                        AgentTask {
-                            id: None,
-                            workspace_id: contact.workspace_id.clone(),
-                            account_id: contact.account_id.clone(),
-                            contact_wxid: contact.wxid.clone(),
-                            kind: "follow_up".to_string(),
-                            run_at,
-                            expires_at: Some(expires_at),
-                            content: follow_up.content.clone(),
-                            status: "pending".to_string(),
-                            source_decision_id: None,
-                            review_required: true,
-                            attempt_count: 0,
-                            max_attempts: 3,
-                            next_retry_at: None,
-                            gateway_status: None,
-                            cancel_reason: None,
-                            error: None,
-                            claimed_at: None,
-                            claim_recovery_count: 0,
-                            created_at: DateTime::now(),
-                            updated_at: DateTime::now(),
-                        },
-                        None,
-                    )
-                    .await?;
-            }
-        }
-    }
+    // follow_up 同样只在 dispatcher 确认本 decision 的全部文本段送达后创建。
     Ok(())
 }
 
@@ -4719,12 +5034,16 @@ async fn apply_operating_memory_update(
     if !memory_card_has_signal(&effective_memory_card(memory)) {
         // task 6.3：把 typed memoryCard 在写入边界一次性转为 Document 落库。
         // H13：无 operation_state 时回落状态机初始态。
-        let initial_state = super::decision::initial_operation_state_for_contact(state, contact).await?;
+        let initial_state =
+            super::decision::initial_operation_state_for_contact(state, contact).await?;
         let prev_version = memory.memory_card_version;
         let next_version = next_memory_card_version(memory);
-        let card_doc =
-            mongodb::bson::to_document(&effective_memory_card_for_contact(memory, contact, &initial_state))
-                .unwrap_or_default();
+        let card_doc = mongodb::bson::to_document(&effective_memory_card_for_contact(
+            memory,
+            contact,
+            &initial_state,
+        ))
+        .unwrap_or_default();
         let now = DateTime::now();
         let res = state
             .db
@@ -4881,6 +5200,16 @@ pub(crate) async fn write_decision_review(
                 reaction_analysis: Document::new(),
                 reaction_claimed_at: None,
                 reviewer_misjudge_signal: None,
+                expected_text_segments: if status == "outbox_enqueuing" {
+                    split_reply_into_segments(
+                        &decision.reply_text,
+                        state.config.agent_reply_max_segment_chars,
+                        state.config.agent_reply_max_segments,
+                    )
+                    .len() as i32
+                } else {
+                    0
+                },
                 status: status.to_string(),
                 created_at: DateTime::now(),
             },
@@ -4982,8 +5311,7 @@ async fn write_agent_run_log_with_finalize(
     // lifecycle（与 R0.3 / R0.10 状态机对齐），任何脏值 fail-closed 不写库。
     // 这取代了既有"裸 String::new() 占位"路径——envelope 在 W1 task 2.5 改造完成
     // 之前，本路径是 agent_run_logs 唯一终态写入点，必须保证 lifecycle 永远落非空闭集值。
-    let lifecycle =
-        derive_lifecycle_from_status(status, error.as_deref()).to_string();
+    let lifecycle = derive_lifecycle_from_status(status, error.as_deref()).to_string();
     assert_lifecycle_valid(&lifecycle)?;
 
     // MP-5 / Task 15：从 task_local 读 budget snapshot，落 agent_run_logs。
@@ -5163,31 +5491,14 @@ pub(crate) async fn load_pending_tasks(
     Ok(tasks)
 }
 
-async fn pending_follow_up_count(state: &AppState, contact: &Contact) -> AppResult<i64> {
-    state
-        .db
-        .tasks()
-        .count_documents(
-            doc! {
-                "workspace_id": &contact.workspace_id,
-                "account_id": &contact.account_id,
-                "contact_wxid": &contact.wxid,
-                "kind": "follow_up",
-                "status": "pending"
-            },
-            None,
-        )
-        .await
-        .map(|count| count as i64)
-        .map_err(AppError::from)
-}
-
 /// 把 LLM/机器通道维度的 [`DimValidation`] 处置结论映射为写入决策：
 /// `Accept(canonical)` → `Some(canonical)`（用归一值写入）；
 /// `DropSilently | Reject(_)` → `None`（不写该维度键，调用方据此移除 + 写审计）。
 /// Reject 在 LlmSignals 通道按 spec 不会出现（机器路径越界返 Drop），兜底也当 Drop——
 /// 绝不因一个维度越界让整条已发送回复链路报错（fail-soft 红线）。
-pub(crate) fn llm_signal_apply(v: crate::agent::dimension_registry::DimValidation) -> Option<String> {
+pub(crate) fn llm_signal_apply(
+    v: crate::agent::dimension_registry::DimValidation,
+) -> Option<String> {
     use crate::agent::dimension_registry::DimValidation::*;
     match v {
         Accept(s) => Some(s),
@@ -5323,6 +5634,7 @@ pub(crate) fn pick_dimension_display_name<'a>(names: &'a Document, kind: &str) -
 pub(crate) fn compute_taxonomy_guard_outcome(
     decision: &AgentDecision,
     dimension_kinds: &[String],
+    workspace_id: &str,
     scope_account_id: &str,
     cache: &super::taxonomy::TaxonomyCache,
 ) -> TaxonomyGuardOutcome {
@@ -5334,14 +5646,18 @@ pub(crate) fn compute_taxonomy_guard_outcome(
         else {
             continue;
         };
-        match taxonomy_check_value(kind, raw, scope_account_id, cache) {
+        match taxonomy_check_value(workspace_id, kind, raw, scope_account_id, cache) {
             TaxonomyMatch::Active => {}
             TaxonomyMatch::AliasActive(canonical) => {
                 outcome.rewrites.push((kind.clone(), canonical));
-                outcome.risks.push(format!("taxonomy_alias_rewritten:{kind}"));
+                outcome
+                    .risks
+                    .push(format!("taxonomy_alias_rewritten:{kind}"));
             }
             TaxonomyMatch::Deprecated => {
-                outcome.risks.push(format!("taxonomy_deprecated_value:{kind}"));
+                outcome
+                    .risks
+                    .push(format!("taxonomy_deprecated_value:{kind}"));
             }
             TaxonomyMatch::CandidateNew => {
                 outcome.risks.push(format!("taxonomy_candidate_new:{kind}"));
@@ -5361,7 +5677,9 @@ mod send_receipt_tests {
 
     #[test]
     fn ok_true_is_success() {
-        assert!(send_receipt_is_ok(&json!({ "ok": true, "newMsgId": "123" })));
+        assert!(send_receipt_is_ok(
+            &json!({ "ok": true, "newMsgId": "123" })
+        ));
     }
 
     #[test]
@@ -5372,13 +5690,17 @@ mod send_receipt_tests {
     #[test]
     fn ok_false_short_circuits_even_with_newmsgid() {
         // ok 字段存在时优先短路：ok:false 即判失败，忽略 newMsgId（不回落）。
-        assert!(!send_receipt_is_ok(&json!({ "ok": false, "newMsgId": "123" })));
+        assert!(!send_receipt_is_ok(
+            &json!({ "ok": false, "newMsgId": "123" })
+        ));
     }
 
     #[test]
     fn legacy_envelope_without_ok_but_with_newmsgid_is_success() {
         // 旧信封无 ok 字段，但有非空 newMsgId → 兼容判成功。
-        assert!(send_receipt_is_ok(&json!({ "newMsgId": "8974400044288526000" })));
+        assert!(send_receipt_is_ok(
+            &json!({ "newMsgId": "8974400044288526000" })
+        ));
     }
 
     #[test]
@@ -5397,6 +5719,41 @@ mod send_receipt_tests {
 mod tests {
     use super::*;
 
+    #[test]
+    fn existing_outbox_only_covers_same_decision_in_deliverable_states() {
+        let decision_id = ObjectId::new();
+        assert!(existing_outbox_covers_decision(
+            Some(decision_id),
+            decision_id,
+            "pending"
+        ));
+        assert!(existing_outbox_covers_decision(
+            Some(decision_id),
+            decision_id,
+            "in_flight"
+        ));
+        assert!(existing_outbox_covers_decision(
+            Some(decision_id),
+            decision_id,
+            "sent"
+        ));
+        assert!(!existing_outbox_covers_decision(
+            Some(decision_id),
+            decision_id,
+            "canceled"
+        ));
+        assert!(!existing_outbox_covers_decision(
+            Some(decision_id),
+            decision_id,
+            "failed_terminal"
+        ));
+        assert!(!existing_outbox_covers_decision(
+            Some(ObjectId::new()),
+            decision_id,
+            "sent"
+        ));
+    }
+
     // 客户回应保障守卫判定纯函数（黑名单语义）：
     // 只要 Inbound 且 status 不在豁免清单内就补占位（覆盖真正的晾死：held/blocked/precheck）。
     #[test]
@@ -5407,8 +5764,8 @@ mod tests {
             "blocked_by_budget",
             "blocked_by_safety_guard",
             "blocked_unverified_product_claim",
-            "daily_limit",       // 仅 FollowUp 会命中；此用例验证 should_send_ack_placeholder 对该状态串的黑名单判定，与门是否触发无关
-            "policy_cooldown",   // 运营策略冷却：仍 ack
+            "daily_limit", // 仅 FollowUp 会命中；此用例验证 should_send_ack_placeholder 对该状态串的黑名单判定，与门是否触发无关
+            "policy_cooldown", // 运营策略冷却：仍 ack
         ] {
             assert!(
                 should_send_ack_placeholder("inbound", status),
@@ -5427,7 +5784,7 @@ mod tests {
             "superseded_by_new_inbound",
             "not_managed",
             "context_changed",
-            "no_reply",          // A3 主动沉默：AI 判定该沉默更拟人，非晾死，不补占位
+            "no_reply", // A3 主动沉默：AI 判定该沉默更拟人，非晾死，不补占位
         ] {
             assert!(
                 !should_send_ack_placeholder("inbound", status),
@@ -5483,7 +5840,8 @@ mod tests {
 
     #[test]
     fn build_ack_enqueue_request_empty_source_event_id_still_suffixed() {
-        let req = build_ack_enqueue_request("ws", "acc", "wx", "run1", "", "inbound", "占位".to_string());
+        let req =
+            build_ack_enqueue_request("ws", "acc", "wx", "run1", "", "inbound", "占位".to_string());
         // 空 source_event_id 仍带后缀（非空），走 outbox 非 synthetic 路径
         assert_eq!(req.source_event_id, "#ack-placeholder");
     }
@@ -5634,7 +5992,10 @@ mod tests {
             }
         }
         // window[0]=客户(Inbound)，window[1]=我方(Outbound)。
-        let window = vec![msg(MessageDirection::Inbound), msg(MessageDirection::Outbound)];
+        let window = vec![
+            msg(MessageDirection::Inbound),
+            msg(MessageDirection::Outbound),
+        ];
         let mut decision = AgentDecision::default();
         decision.bayesian_observations = vec![
             // 锚定 Inbound → strong=1。
@@ -5655,10 +6016,16 @@ mod tests {
         let observed = build_observed_dimensions(&decision, &window);
         assert_eq!(observed.len(), 2);
         assert_eq!(observed[0].dimension, "价格敏感度");
-        assert_eq!(observed[0].strong_evidence_count, 1, "Inbound 证据应计入强证据");
+        assert_eq!(
+            observed[0].strong_evidence_count, 1,
+            "Inbound 证据应计入强证据"
+        );
         assert_eq!(observed[0].confidence, 0.9, "confidence 作为观察值原样带入");
         assert_eq!(observed[1].dimension, "决策果断度");
-        assert_eq!(observed[1].strong_evidence_count, 0, "Outbound 证据不计入强证据");
+        assert_eq!(
+            observed[1].strong_evidence_count, 0,
+            "Outbound 证据不计入强证据"
+        );
     }
 
     // D5-F1：单轮观测数代码侧截断到 MAX_BAYESIAN_SLOTS，防畸形/超量 LLM 输出无界写脏。
@@ -5741,7 +6108,12 @@ mod tests {
     fn extract_relationship_type_suggestion_picks_kind() {
         use crate::agent::types::AgentSignal;
         let signals = vec![
-            AgentSignal { kind: "other".into(), value: "x".into(), evidence: None, confidence: 5 },
+            AgentSignal {
+                kind: "other".into(),
+                value: "x".into(),
+                evidence: None,
+                confidence: 5,
+            },
             AgentSignal {
                 kind: "relationship_type".into(),
                 value: "peer".into(),
@@ -5750,7 +6122,10 @@ mod tests {
             },
         ];
         let got = extract_relationship_type_suggestion(&signals);
-        assert_eq!(got, Some(("peer".to_string(), Some("自称同行".to_string()), 8)));
+        assert_eq!(
+            got,
+            Some(("peer".to_string(), Some("自称同行".to_string()), 8))
+        );
     }
 
     #[test]
@@ -5769,7 +6144,12 @@ mod tests {
     fn extract_suspected_deal_signal_picks_kind() {
         use crate::agent::types::AgentSignal;
         let signals = vec![
-            AgentSignal { kind: "other".into(), value: "x".into(), evidence: None, confidence: 5 },
+            AgentSignal {
+                kind: "other".into(),
+                value: "x".into(),
+                evidence: None,
+                confidence: 5,
+            },
             AgentSignal {
                 kind: "suspected_deal".into(),
                 value: "疑似成交·待核实".into(),
@@ -5780,7 +6160,11 @@ mod tests {
         let got = extract_suspected_deal_signal(&signals);
         assert_eq!(
             got,
-            Some(("疑似成交·待核实".to_string(), Some("客户说要下单".to_string()), 75))
+            Some((
+                "疑似成交·待核实".to_string(),
+                Some("客户说要下单".to_string()),
+                75
+            ))
         );
     }
 
@@ -5947,15 +6331,24 @@ mod tests {
             crate::agent::quiet_hours::DEFERRED_INBOUND_REPLY_KIND,
             "作息时段累积消息",
         );
-        assert!(text.contains("回应客户"), "醒来任务应是被动应答措辞: {text}");
-        assert!(!text.contains("主动触达"), "醒来任务不应出现主动触达措辞: {text}");
+        assert!(
+            text.contains("回应客户"),
+            "醒来任务应是被动应答措辞: {text}"
+        );
+        assert!(
+            !text.contains("主动触达"),
+            "醒来任务不应出现主动触达措辞: {text}"
+        );
     }
 
     #[test]
     fn ordinary_follow_up_trigger_text_keeps_proactive_framing() {
         // 普通 follow_up 仍是"主动触达"判断，并带上任务内容。
         let text = follow_up_trigger_message_text("follow_up", "三天前承诺的报价");
-        assert!(text.contains("主动触达"), "普通跟进应保留主动触达措辞: {text}");
+        assert!(
+            text.contains("主动触达"),
+            "普通跟进应保留主动触达措辞: {text}"
+        );
         assert!(text.contains("三天前承诺的报价"), "应带上任务内容: {text}");
     }
 
@@ -5972,6 +6365,7 @@ mod tests {
     fn entry(scope: &str, kind: &str, id: &str, aliases: &[&str], status: &str) -> TaxonomyEntry {
         TaxonomyEntry {
             id: None,
+            workspace_id: "default".to_string(),
             scope: scope.to_string(),
             kind: kind.to_string(),
             value: TaxonomyValue {
@@ -6013,7 +6407,7 @@ mod tests {
             decision.intent_level = Some(i.to_string());
         }
         let dims = vec!["customer_stage".to_string(), "intent_level".to_string()];
-        compute_taxonomy_guard_outcome(&decision, &dims, scope, cache)
+        compute_taxonomy_guard_outcome(&decision, &dims, "default", scope, cache)
     }
 
     /// 取某维度的 rewrite canonical（替代旧的 customer_stage_rewrite/intent_level_rewrite 字段）。
@@ -6055,8 +6449,7 @@ mod tests {
             &[],
             "active",
         )]);
-        let out =
-            guard(Some("first_contact"), None, "acct-1", &cache);
+        let out = guard(Some("first_contact"), None, "acct-1", &cache);
         assert!(rewrite_of(&out, "customer_stage").is_none());
         assert!(out.risks.is_empty());
         assert!(out.candidate_writes.is_empty());
@@ -6125,12 +6518,7 @@ mod tests {
             &[],
             "active",
         )]);
-        let out = guard(
-            Some("完全没听过的阶段"),
-            None,
-            "acct-1",
-            &cache,
-        );
+        let out = guard(Some("完全没听过的阶段"), None, "acct-1", &cache);
         assert!(
             out.risks
                 .iter()
@@ -6157,26 +6545,15 @@ mod tests {
             &["新客"],
             "active",
         )]);
-        let out = guard(
-            Some("新客"),
-            Some("never_seen_intent"),
-            "acct-1",
-            &cache,
-        );
-        assert_eq!(
-            rewrite_of(&out, "customer_stage"),
-            Some("first_contact")
-        );
+        let out = guard(Some("新客"), Some("never_seen_intent"), "acct-1", &cache);
+        assert_eq!(rewrite_of(&out, "customer_stage"), Some("first_contact"));
         assert!(rewrite_of(&out, "intent_level").is_none());
         let risks: Vec<&str> = out.risks.iter().map(String::as_str).collect();
         assert!(risks.contains(&"taxonomy_alias_rewritten:customer_stage"));
         assert!(risks.contains(&"taxonomy_candidate_new:intent_level"));
         assert_eq!(
             out.candidate_writes,
-            vec![(
-                "intent_level".to_string(),
-                "never_seen_intent".to_string()
-            )],
+            vec![("intent_level".to_string(), "never_seen_intent".to_string())],
             "只有 intent_level 一个维度该进候选"
         );
     }
@@ -6190,9 +6567,15 @@ mod tests {
             "nonstr": 42_i32,
         };
         // 命中 → 取出
-        assert_eq!(pick_dimension_display_name(&names, "customer_stage"), Some("焦虑观望"));
+        assert_eq!(
+            pick_dimension_display_name(&names, "customer_stage"),
+            Some("焦虑观望")
+        );
         // 命中但含首尾空格 → trim
-        assert_eq!(pick_dimension_display_name(&names, "intent_level"), Some("高意向"));
+        assert_eq!(
+            pick_dimension_display_name(&names, "intent_level"),
+            Some("高意向")
+        );
         // 纯空格 → None
         assert_eq!(pick_dimension_display_name(&names, "blank"), None);
         // 非字符串值 → None（get_str 失败）
@@ -6200,7 +6583,10 @@ mod tests {
         // 缺键 → None
         assert_eq!(pick_dimension_display_name(&names, "absent"), None);
         // 空 doc → None
-        assert_eq!(pick_dimension_display_name(&Document::new(), "customer_stage"), None);
+        assert_eq!(
+            pick_dimension_display_name(&Document::new(), "customer_stage"),
+            None
+        );
     }
 
     #[test]
@@ -6212,12 +6598,21 @@ mod tests {
             "customerStage": "成交在即",
             "intentLevel": "  高度意向  ",
         };
-        assert_eq!(pick_dimension_display_name(&names, "customer_stage"), Some("成交在即"));
+        assert_eq!(
+            pick_dimension_display_name(&names, "customer_stage"),
+            Some("成交在即")
+        );
         // camelCase 命中同样 trim
-        assert_eq!(pick_dimension_display_name(&names, "intent_level"), Some("高度意向"));
+        assert_eq!(
+            pick_dimension_display_name(&names, "intent_level"),
+            Some("高度意向")
+        );
         // 单段 kind（无下划线）snake==camel，仍命中
         let single = doc! { "objection": "价格顾虑" };
-        assert_eq!(pick_dimension_display_name(&single, "objection"), Some("价格顾虑"));
+        assert_eq!(
+            pick_dimension_display_name(&single, "objection"),
+            Some("价格顾虑")
+        );
     }
 
     #[test]
@@ -6227,7 +6622,10 @@ mod tests {
             "customer_stage": "焦虑观望",
             "customerStage": "别的值",
         };
-        assert_eq!(pick_dimension_display_name(&names, "customer_stage"), Some("焦虑观望"));
+        assert_eq!(
+            pick_dimension_display_name(&names, "customer_stage"),
+            Some("焦虑观望")
+        );
     }
 
     #[test]
@@ -6245,8 +6643,7 @@ mod tests {
                 "active",
             ),
         ]);
-        let out =
-            guard(Some("首单 VIP"), None, "acct-1", &cache);
+        let out = guard(Some("首单 VIP"), None, "acct-1", &cache);
         assert_eq!(
             rewrite_of(&out, "customer_stage"),
             Some("premium_first_contact"),
@@ -6317,16 +6714,7 @@ mod tests {
     /// ② stage 翻转：old 决策 / new 关注 → flipped、notable。
     #[test]
     fn churn_detects_stage_flip() {
-        let r = compute_profile_churn(
-            &[],
-            &[],
-            Some("决策"),
-            Some("关注"),
-            None,
-            None,
-            None,
-            "",
-        );
+        let r = compute_profile_churn(&[], &[], Some("决策"), Some("关注"), None, None, None, "");
         assert_eq!(
             r.stage_flipped,
             Some(("决策".to_string(), "关注".to_string()))
@@ -6337,16 +6725,7 @@ mod tests {
     /// ③ old 空不算翻转：首次建立 stage 不是 flip，无抖动。
     #[test]
     fn churn_first_time_stage_is_not_flip() {
-        let r = compute_profile_churn(
-            &[],
-            &[],
-            None,
-            Some("决策"),
-            Some(""),
-            Some("高"),
-            None,
-            "",
-        );
+        let r = compute_profile_churn(&[], &[], None, Some("决策"), Some(""), Some("高"), None, "");
         assert_eq!(r.stage_flipped, None, "old 空 = 首次画像，不算翻转");
         assert_eq!(r.intent_flipped, None, "old 空串 = 未知，不算翻转");
         assert!(!r.notable);
@@ -6355,16 +6734,7 @@ mod tests {
     /// ④ summary append 长度增长，与写侧 `existing\nupdate` 一致（+1 换行）。
     #[test]
     fn churn_tracks_summary_growth() {
-        let r = compute_profile_churn(
-            &[],
-            &[],
-            None,
-            None,
-            None,
-            None,
-            Some("abc"),
-            "de",
-        );
+        let r = compute_profile_churn(&[], &[], None, None, None, None, Some("abc"), "de");
         assert_eq!(r.summary_len_before, 3);
         assert_eq!(r.summary_len_after, 3 + 1 + 2, "existing + 换行 + update");
     }
@@ -6395,7 +6765,10 @@ mod tests {
         assert_eq!(r.tags_added, 1);
         assert_eq!(r.stage_flipped, None);
         assert_eq!(r.intent_flipped, None);
-        assert!(!r.notable, "纯新增 + 无翻转 + 短 summary 不算抖动，不发事件");
+        assert!(
+            !r.notable,
+            "纯新增 + 无翻转 + 短 summary 不算抖动，不发事件"
+        );
     }
 
     /// ⑥ new 空 = 本轮未给标签，不计 added/removed（与"非空才写"对齐）。

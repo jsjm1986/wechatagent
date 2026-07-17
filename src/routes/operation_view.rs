@@ -74,7 +74,9 @@ pub async fn active_view(
 
     // 4) 预热进程级 taxonomy cache（冷 / 过期缓存会返回空，必须先 find_or_load）。
     let cache = crate::agent::taxonomy::global_taxonomy_cache();
-    cache.find_or_load(&state.db).await;
+    cache
+        .find_or_load(&state.db, &admin.current_workspace)
+        .await;
 
     // 5) 逐 kind 建取值字典 {kind: [{id, label}]}。scope 第二参传 current_workspace：
     //    dimension_values_with_labels 在 account 私有 scope 未命中时回落 global，
@@ -82,8 +84,9 @@ pub async fn active_view(
     let mut taxonomies = Map::new();
     for kind in &kinds {
         let pairs = crate::agent::taxonomy::dimension_values_with_labels(
-            kind,
             &admin.current_workspace,
+            kind,
+            "",
             cache.as_ref(),
         );
         let values: Vec<Value> = pairs

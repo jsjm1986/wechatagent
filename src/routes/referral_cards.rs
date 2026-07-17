@@ -63,6 +63,7 @@ pub(super) async fn create_referral_card(
     let scope = payload.account_id.as_deref().unwrap_or("");
     let target_stages = crate::agent::dimension_registry::normalize_target_stages(
         &state.db,
+        &admin.current_workspace,
         scope,
         &payload.target_stages,
     )

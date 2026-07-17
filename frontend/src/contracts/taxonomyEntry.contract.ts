@@ -10,6 +10,7 @@ export const CANONICAL_KEYS = [
   "updatedAt",
   "value",
   "version",
+  "workspaceId",
 ] as const;
 
 export type CanonicalKey = (typeof CANONICAL_KEYS)[number];

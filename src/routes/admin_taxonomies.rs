@@ -16,7 +16,7 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
+    Extension, Json,
 };
 use futures::TryStreamExt;
 use mongodb::bson::{doc, to_bson, DateTime, Document};
@@ -26,6 +26,7 @@ use serde_json::{json, Value};
 
 use crate::{
     agent::taxonomy::invalidate_global_taxonomy_cache,
+    auth::AuthenticatedAdmin,
     error::{AppError, AppResult},
     models::{TaxonomyEntry, TaxonomyValue},
 };
@@ -88,10 +89,12 @@ pub(super) struct PatchTaxonomyRequest {
 
 pub(super) async fn list_taxonomies(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Query(query): Query<ListTaxonomiesQuery>,
 ) -> AppResult<Json<Value>> {
-    let mut filter = Document::new();
+    let mut filter = doc! { "workspace_id": &admin.current_workspace };
     if let Some(scope) = query.scope.as_ref().filter(|s| !s.trim().is_empty()) {
+        authorize_taxonomy_scope(&state, &admin.current_workspace, scope.trim()).await?;
         filter.insert("scope", scope.trim());
     }
     if let Some(kind) = query.kind.as_ref().filter(|s| !s.trim().is_empty()) {
@@ -125,6 +128,7 @@ pub(super) async fn list_taxonomies(
 
 pub(super) async fn create_taxonomy(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Json(payload): Json<CreateTaxonomyRequest>,
 ) -> Result<Response, AppError> {
     if payload.scope.trim().is_empty()
@@ -136,10 +140,12 @@ pub(super) async fn create_taxonomy(
             "scope / kind / value.id / value.label 均不能为空".to_string(),
         ));
     }
+    authorize_taxonomy_scope(&state, &admin.current_workspace, payload.scope.trim()).await?;
 
     let now = DateTime::now();
     let entry = TaxonomyEntry {
         id: None,
+        workspace_id: admin.current_workspace.clone(),
         scope: payload.scope.trim().to_string(),
         kind: payload.kind.trim().to_string(),
         value: TaxonomyValue {
@@ -195,6 +201,7 @@ pub(super) async fn create_taxonomy(
 pub(super) async fn patch_taxonomy(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Json(payload): Json<PatchTaxonomyRequest>,
 ) -> AppResult<Json<Value>> {
     let object_id = parse_object_id(&id)?;
@@ -239,14 +246,29 @@ pub(super) async fn patch_taxonomy(
 
     let collection = state.db.collection_system_taxonomies();
     let result = collection
-        .update_one(doc! { "_id": object_id }, doc! { "$set": set_doc }, None)
+        .update_one(
+            doc! {
+                "_id": object_id,
+                "workspace_id": &admin.current_workspace,
+                "current_version": true,
+            },
+            doc! { "$set": set_doc },
+            None,
+        )
         .await?;
     if result.matched_count == 0 {
         return Err(AppError::NotFound("taxonomy entry not found".to_string()));
     }
     invalidate_global_taxonomy_cache();
     let entry = collection
-        .find_one(doc! { "_id": object_id }, None)
+        .find_one(
+            doc! {
+                "_id": object_id,
+                "workspace_id": &admin.current_workspace,
+                "current_version": true,
+            },
+            None,
+        )
         .await?
         .ok_or_else(|| AppError::NotFound("taxonomy entry not found".to_string()))?;
     Ok(Json(json!({ "item": taxonomy_entry_json(entry) })))
@@ -255,13 +277,18 @@ pub(super) async fn patch_taxonomy(
 pub(super) async fn delete_taxonomy(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
 ) -> AppResult<Json<Value>> {
     let object_id = parse_object_id(&id)?;
     let result = state
         .db
         .collection_system_taxonomies()
         .update_one(
-            doc! { "_id": object_id },
+            doc! {
+                "_id": object_id,
+                "workspace_id": &admin.current_workspace,
+                "current_version": true,
+            },
             doc! {
                 "$set": {
                     "value.status": "deprecated",
@@ -278,9 +305,21 @@ pub(super) async fn delete_taxonomy(
     Ok(Json(json!({ "ok": true })))
 }
 
+pub(super) async fn authorize_taxonomy_scope(
+    state: &AppState,
+    workspace_id: &str,
+    scope: &str,
+) -> AppResult<()> {
+    if scope == "global" {
+        return Ok(());
+    }
+    validate_account(state, workspace_id, scope).await
+}
+
 pub(super) fn taxonomy_entry_json(entry: TaxonomyEntry) -> Value {
     json!({
         "id": entry.id.map(|id| id.to_hex()).unwrap_or_default(),
+        "workspaceId": entry.workspace_id,
         "scope": entry.scope,
         "kind": entry.kind,
         "value": {
@@ -326,6 +365,7 @@ mod tests {
         let oid = ObjectId::new();
         let entry = TaxonomyEntry {
             id: Some(oid),
+            workspace_id: "default".to_string(),
             scope: "global".to_string(),
             kind: "customer_stage".to_string(),
             value: TaxonomyValue {
@@ -404,6 +444,7 @@ mod tests {
         use mongodb::bson::{oid::ObjectId, DateTime};
         let entry = TaxonomyEntry {
             id: Some(ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap()),
+            workspace_id: "default".to_string(),
             scope: "global".to_string(),
             kind: "customer_stage".to_string(),
             value: TaxonomyValue {

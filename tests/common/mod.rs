@@ -9,8 +9,8 @@
 
 #![allow(dead_code)]
 
-pub mod generalization;
 pub mod dynamic;
+pub mod generalization;
 pub mod identity_generator;
 pub mod judge;
 pub mod redline;
@@ -407,7 +407,10 @@ pub async fn wait_for_outbox_processed(
             .expect("query outbox entry");
         if let Some(entry) = entry {
             last_status = entry.status.clone();
-            if matches!(entry.status.as_str(), "sent" | "failed_terminal" | "canceled") {
+            if matches!(
+                entry.status.as_str(),
+                "sent" | "failed_terminal" | "canceled"
+            ) {
                 return entry;
             }
         }
@@ -439,7 +442,10 @@ pub async fn wait_for_outbox_processed_by_run_id(
             .expect("query outbox entry by run_id");
         if let Some(entry) = entry {
             last_status = entry.status.clone();
-            if matches!(entry.status.as_str(), "sent" | "failed_terminal" | "canceled") {
+            if matches!(
+                entry.status.as_str(),
+                "sent" | "failed_terminal" | "canceled"
+            ) {
                 return entry;
             }
         }
