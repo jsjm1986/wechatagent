@@ -927,10 +927,6 @@ async fn pending_delivery_is_not_learned_as_user_reaction() {
         .expect("query review")
         .expect("review exists");
     let review_id = review.id.expect("review id");
-    eprintln!(
-        "DIAG-A after handle_managed_message: review.status={:?} outcome_status={:?}",
-        review.status, review.outcome_status
-    );
     let outbox = app
         .state
         .db
@@ -958,26 +954,6 @@ async fn pending_delivery_is_not_learned_as_user_reaction() {
         "confidence": 8,
         "summary": "客户表示会继续查看"
     }));
-    let pre_claim = app
-        .state
-        .db
-        .decision_reviews()
-        .find_one(doc! { "_id": review_id }, None)
-        .await
-        .expect("reload pre-claim")
-        .expect("review exists");
-    eprintln!(
-        "DIAG-B before record_user_reaction: review.status={:?} outcome_status={:?}",
-        pre_claim.status, pre_claim.outcome_status
-    );
-    let sent_count = app
-        .state
-        .db
-        .decision_reviews()
-        .count_documents(doc! { "contact_wxid": &contact.wxid, "status": "sent" }, None)
-        .await
-        .expect("count sent");
-    eprintln!("DIAG-C sent-status reviews for this contact: {}", sent_count);
     let calls_before = app.llm.calls();
     record_user_reaction(&app.state, &contact, &second)
         .await
@@ -996,9 +972,13 @@ async fn pending_delivery_is_not_learned_as_user_reaction() {
         .await
         .expect("reload review")
         .expect("review exists");
-    assert!(
-        reacted.outcome_status.is_none(),
-        "未送达回复不得产生反应标签"
+    // review 创建即置 outcome_status="pending"(gateway.rs:5199,待反应分析占位)。
+    // 未送达不得被 reaction 学成实际反应标签 = 该字段必须仍停在 "pending",
+    // 而非被改成 user_replied_* 等真实反应结果。
+    assert_eq!(
+        reacted.outcome_status.as_deref(),
+        Some("pending"),
+        "未送达回复不得被学成反应标签(应停在 pending 占位)"
     );
     let still_pending = app
         .state
