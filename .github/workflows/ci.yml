@@ -381,16 +381,16 @@ jobs:
         if: ${{ env.REAL_LLM_API_KEY != '' }}
         env:
           RUSTFLAGS: ""
+          RUST_MIN_STACK: "8388608"
           # 文本主链路（T1/T2）走 claude-opus-4-8（rsxermu666.cn，Anthropic /v1/messages，非流式）。
           REAL_LLM_BASE_URL: https://rsxermu666.cn
           REAL_LLM_MODEL: claude-opus-4-8
           REAL_LLM_FORMAT: anthropic
-          # vision（T3）：claude 的 Anthropic 图片 block 未实现（generate_json_with_image Anthropic
-          # 分支返 Err），故 vision 走 gpt-5.4（rsxermu OpenAI /v1，多模态 image_url）。端点强制流式
-          # SSE 由 generate_json_once_openai_vision 的聚合兜底处理（0a）。偶发 5xx/524 走 skip 不 fail。
-          REAL_LLM_VISION_API_KEY: ${{ secrets.RSXERMU_KEY }}
-          REAL_LLM_VISION_BASE_URL: https://rsxermu666.cn/v1
-          REAL_LLM_VISION_MODEL: gpt-5.4
+          # vision（T3）：claude 的 Anthropic 图片 block 未实现，故使用 NVIDIA 专职视觉模型；
+          # 与文本主模型的 RSXERMU key/端点解耦，避免无 GPT vision 权限的 copilot key 返回 403。
+          REAL_LLM_VISION_API_KEY: ${{ secrets.NVIDIA_KEY }}
+          REAL_LLM_VISION_BASE_URL: https://integrate.api.nvidia.com/v1
+          REAL_LLM_VISION_MODEL: nvidia/nemotron-nano-12b-v2-vl
         run: cargo test --no-fail-fast --test real_llm_smoke -- --ignored --nocapture
 
       # ════════════════════════════════════════════════════════════════════════════
@@ -422,11 +422,11 @@ jobs:
           REAL_LLM_BASE_URL: https://rsxermu666.cn
           REAL_LLM_MODEL: claude-opus-4-8
           REAL_LLM_FORMAT: anthropic
-          # vision（K6）：claude Anthropic 图片 block 未实现，故走 gpt-5.4（rsxermu OpenAI /v1，多模态）。
-          # 端点强制流式 SSE 由 vision 路径聚合兜底（0a）。偶发 5xx/524 走 LlmUnavailable→skip。
-          REAL_LLM_VISION_API_KEY: ${{ secrets.RSXERMU_KEY }}
-          REAL_LLM_VISION_BASE_URL: https://rsxermu666.cn/v1
-          REAL_LLM_VISION_MODEL: gpt-5.4
+          # vision（K6）：使用 NVIDIA 专职视觉模型，避免把无 GPT vision 权限的 RSXERMU key
+          # 误接到 gpt-5.4；瞬时 5xx/超时仍按 LlmUnavailable 记录并由汇总门判定。
+          REAL_LLM_VISION_API_KEY: ${{ secrets.NVIDIA_KEY }}
+          REAL_LLM_VISION_BASE_URL: https://integrate.api.nvidia.com/v1
+          REAL_LLM_VISION_MODEL: nvidia/nemotron-nano-12b-v2-vl
         run: cargo test --no-fail-fast --test real_llm_knowledge -- --ignored --nocapture
 
       # R0.2：传出 skip ledger（含 unwrap_or_skip_transient! 写的 skip_ledger.jsonl），
@@ -875,14 +875,13 @@ jobs:
           REAL_LLM_JUDGE_MODEL: gpt-5.4
           REAL_LLM_JUDGE_FORMAT: openai
           REAL_LLM_JUDGE_LITE_MODEL: gpt-5.4
-          # vision 链路（Q3）：claude 的 Anthropic 图片 block 未实现，故 vision 抽取走 gpt-5.4
-          # （rsxermu OpenAI /v1，多模态 image_url；端点强制流式 SSE 由 vision 路径聚合兜底，0a）。
-          # 偶发 5xx/524 走 LlmUnavailable→skip 不 fail。
-          REAL_LLM_VISION_API_KEY: ${{ secrets.RSXERMU_KEY }}
-          REAL_LLM_VISION_BASE_URL: https://rsxermu666.cn/v1
-          REAL_LLM_VISION_MODEL: gpt-5.4
-          # Q3 vision **裁判团**（真看图判「图 vs 抽取文本」）：被测抽取走 gpt-5.4(openai)，vision 裁判
-          # 用可选 NVIDIA llama-3.2-90b-vision（meta 家族，与被测 gpt 跨家族）。独立 VISION_JUDGE_API_KEY
+          # vision 链路（Q3）：被测抽取使用 NVIDIA Nemotron VL；独立视觉裁判仍使用下方
+          # VISION_JUDGE_* 配置，两者不共享模型，避免自评同源。
+          REAL_LLM_VISION_API_KEY: ${{ secrets.NVIDIA_KEY }}
+          REAL_LLM_VISION_BASE_URL: https://integrate.api.nvidia.com/v1
+          REAL_LLM_VISION_MODEL: nvidia/nemotron-nano-12b-v2-vl
+          # Q3 vision **裁判团**（真看图判「图 vs 抽取文本」）：被测抽取走 Nemotron，vision 裁判
+          # 用可选 NVIDIA llama-3.2-90b-vision（Meta 家族，与被测模型不同）。独立 VISION_JUDGE_API_KEY
           # （无字面量回落）；缺此 key → vision_judge_panel 返回 None → Q3 skip 不 fail。
           VISION_JUDGE_API_KEY: ${{ secrets.VISION_JUDGE_API_KEY }}
           VISION_JUDGE_BASE_URL: https://integrate.api.nvidia.com/v1

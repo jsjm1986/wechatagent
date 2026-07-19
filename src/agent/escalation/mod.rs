@@ -300,13 +300,7 @@ pub(crate) async fn escalate_held_decision(
 }
 
 /// 处理 principal_decision_relay task：领导已裁决，把决策用 AI 口吻转述给客户。
-pub(crate) async fn handle_principal_decision_relay(
-    state: &AppState,
-    task: &AgentTask,
-) -> AppResult<()> {
-    handle_principal_decision_relay_with_claim(state, task, None).await
-}
-
+/// 生产任务入口必须携带当前 claim，以阻止 lease 重领后的旧 owner 继续提交。
 pub(crate) async fn handle_principal_decision_relay_with_claim(
     state: &AppState,
     task: &AgentTask,

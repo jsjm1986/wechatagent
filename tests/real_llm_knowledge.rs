@@ -1253,13 +1253,20 @@ async fn k10_real_chat_workstation_drafts_proposal_never_persists() {
         username: "k10_admin".into(),
         current_workspace: ws.clone(),
     });
-    // 明确的「新建切片」意图：让真模型走 create_chunk 分支起草 patch。
+    // 明确的「新建切片」意图，并一次性给齐 schema 所需的已核实运营事实。
+    // 这里验证的是可应用 proposal 与零自动落库，不把“缺业务原文时应追问”误当成功路径。
     let req: ChatTurnRequest = serde_json::from_value(json!({
         "sessionId": null,
         "accountId": null,
         "operatorId": "k10_operator",
-        "content": "帮我新建一条知识切片：我们的企业版支持私有化部署，数据不出客户内网。\
-                    知识类型是产品能力，请帮我起草标题、摘要和正文。",
+        "content": "帮我新建一条知识切片。以下内容均由运营核实，可直接作为事实原文：\
+                    ‘企业版支持私有化部署，业务数据仅存储在客户内网环境，不上传公共云。’\
+                    标题写‘企业版私有化部署’，知识类型是产品能力，业务上下文是企业客户部署咨询；\
+                    摘要和正文都应准确保留上述事实。适用场景是客户询问私有化部署或数据存储位置；\
+                    不适用场景是客户询问公有云价格。可安全表述‘支持私有化部署’和‘业务数据留在客户内网’；\
+                    禁止表述‘无需客户提供部署环境’。证据项和 sourceQuote 都原样使用引号中的事实原文；\
+                    产品标签是企业版、私有化，业务主题是部署、数据安全；routingCard 写客户咨询私有化部署时打开。\
+                    请填齐这些字段，missingFields 返回空数组，并起草可供运营确认的 proposal。",
         "attachments": [],
     }))
     .expect("构造 ChatTurnRequest");
