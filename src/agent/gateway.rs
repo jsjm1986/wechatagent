@@ -2672,7 +2672,7 @@ async fn run_user_operation_gateway_inner(
     )
     .await?;
     // SR-034：在创建任何 Outbox 前，把 decision 绑定到本次 task claim。生产路径
-    // 必须以不可复用 token CAS；若 lease 已被 reclaim/新 owner 接管，本 worker 到此
+    // 必须以不可复用 token CAS；若 lease 已被 reclaim/新 owner 取得所有权，本 worker 到此
     // 立即停止，绝不进入 Outbox。旧直接调用入口仅保留按 task_id 的兼容关联。
     if let Some(task_context) = task_context.as_ref() {
         let bound = if let Some(claim) = task_context.claim.as_ref() {
@@ -2709,7 +2709,7 @@ async fn run_user_operation_gateway_inner(
                 Some(&contact.wxid),
                 "task_claim_fenced",
                 "stale_task_claim",
-                "任务 lease 已被新 owner 接管，本轮在 Outbox 前终止",
+                "任务 lease 已由新 owner 取得所有权，本轮在 Outbox 前终止",
                 Some(doc! { "run_id": &run_id, "decision_id": decision_review_id }),
             )
             .await?;

@@ -1687,7 +1687,7 @@ async fn consolidate_contact_memory_inner(
         return reconcile_memory_consolidation_commit(state, claim.task_id).await;
     }
 
-    // 无 claim 的人工直调兼容路径不参与任务取消协议，保持原 OCC 写入语义。
+    // 无 claim 的直接调用兼容路径不参与任务取消协议，保持原 OCC 写入语义。
     if !consolidator_warnings.is_empty() {
         let _ = state
             .db

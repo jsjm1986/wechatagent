@@ -51,7 +51,7 @@ pub enum OutboxStatus {
     FailedTerminal,
     /// 用户拒绝 / cooldown / 30min 陈旧 / 后台手动取消。
     Canceled,
-    /// 已跨过远端发送边界，但本地没有可验证回执；禁止自动重发，等待人工核验。
+    /// 已跨过远端发送边界，但本地没有可验证回执；禁止自动重发，等待离线核验。
     DeliveryUnknown,
 }
 
