@@ -43,11 +43,7 @@ async fn insert_run_log(app: &common::TestApp, mut fields: Document) {
     fields
         .entry("created_at".to_string())
         .or_insert(DateTime::now().into());
-    let raw = app
-        .state
-        .db
-        .raw()
-        .collection::<Document>("agent_run_logs");
+    let raw = app.state.db.raw().collection::<Document>("agent_run_logs");
     raw.insert_one(fields, None).await.expect("insert run log");
 }
 
@@ -153,7 +149,11 @@ async fn outcomes_autonomy_revision_trigger_rate_two_of_five_is_0_4() {
 async fn outcomes_autonomy_ai_hold_breakdown_each_one_third_with_three_holds() {
     let app = common::TestApp::start().await;
 
-    for status in ["held_by_ai_policy", "blocked_by_safety_guard", "ai_waiting_for_more_context"] {
+    for status in [
+        "held_by_ai_policy",
+        "blocked_by_safety_guard",
+        "ai_waiting_for_more_context",
+    ] {
         insert_run_log(
             &app,
             doc! {
@@ -274,10 +274,7 @@ async fn outcomes_autonomy_unverified_claim_block_rate_counts_only_blocked_statu
         "1/4 unverified product claim block，实际 {:?}",
         body["metrics"]["unverifiedClaimBlockRate"]
     );
-    assert_eq!(
-        body["rawCounts"]["unverifiedClaimBlock"].as_u64(),
-        Some(1)
-    );
+    assert_eq!(body["rawCounts"]["unverifiedClaimBlock"].as_u64(), Some(1));
 }
 
 #[tokio::test]
@@ -330,17 +327,16 @@ async fn outcomes_autonomy_taxonomy_candidate_rate_matches_review_risk_prefix() 
     let body = call_metrics(&app).await;
     assert_eq!(body["totalRuns"].as_u64(), Some(3));
     let close = |v: &serde_json::Value, target: f64| -> bool {
-        v.as_f64().map(|x| (x - target).abs() < 1e-9).unwrap_or(false)
+        v.as_f64()
+            .map(|x| (x - target).abs() < 1e-9)
+            .unwrap_or(false)
     };
     assert!(
         close(&body["metrics"]["taxonomyCandidateRate"], 2.0 / 3.0),
         "2/3 taxonomy candidate, 实际 {:?}",
         body["metrics"]["taxonomyCandidateRate"]
     );
-    assert_eq!(
-        body["rawCounts"]["taxonomyCandidate"].as_u64(),
-        Some(2)
-    );
+    assert_eq!(body["rawCounts"]["taxonomyCandidate"].as_u64(), Some(2));
 }
 
 #[tokio::test]
@@ -348,8 +344,8 @@ async fn outcomes_autonomy_taxonomy_candidate_rate_matches_review_risk_prefix() 
 async fn outcomes_autonomy_outbox_link_breaks_down_by_status() {
     let app = common::TestApp::start().await;
 
-    // 4 条 outbox 记录：2 sent、1 canceled、1 failed_terminal。
-    // sendSuccessRate = 0.5、canceledRate = 0.25、failedTerminalRate = 0.25。
+    // 5 条 outbox 记录：2 sent、1 canceled、1 failed_terminal、1 delivery_unknown。
+    // 比率分别为 0.4 / 0.2 / 0.2 / 0.2。
     let workspace_id = app.state.config.default_workspace_id.clone();
     let account_id = app.state.config.default_account_id.clone();
     let outbox = app
@@ -379,6 +375,7 @@ async fn outcomes_autonomy_outbox_link_breaks_down_by_status() {
     push("sent");
     push("canceled");
     push("failed_terminal");
+    push("delivery_unknown");
     outbox
         .insert_many(docs, None)
         .await
@@ -386,13 +383,15 @@ async fn outcomes_autonomy_outbox_link_breaks_down_by_status() {
 
     let body = call_metrics(&app).await;
     let outbox = &body["outboxLink"];
-    assert_eq!(outbox["totalEnqueued"].as_u64(), Some(4));
+    assert_eq!(outbox["totalEnqueued"].as_u64(), Some(5));
     assert_eq!(outbox["sent"].as_u64(), Some(2));
     assert_eq!(outbox["canceled"].as_u64(), Some(1));
     assert_eq!(outbox["failedTerminal"].as_u64(), Some(1));
-    assert_eq!(outbox["sendSuccessRate"].as_f64(), Some(0.5));
-    assert_eq!(outbox["canceledRate"].as_f64(), Some(0.25));
-    assert_eq!(outbox["failedTerminalRate"].as_f64(), Some(0.25));
+    assert_eq!(outbox["deliveryUnknown"].as_u64(), Some(1));
+    assert_eq!(outbox["sendSuccessRate"].as_f64(), Some(0.4));
+    assert_eq!(outbox["canceledRate"].as_f64(), Some(0.2));
+    assert_eq!(outbox["failedTerminalRate"].as_f64(), Some(0.2));
+    assert_eq!(outbox["deliveryUnknownRate"].as_f64(), Some(0.2));
 }
 
 // ── M3 / Task 70：`planner` 子段聚合 ───────────────────────────────────────
@@ -413,11 +412,7 @@ async fn outcomes_autonomy_planner_section_aggregates_strategic_events() {
 
     let workspace_id = app.state.config.default_workspace_id.clone();
     let account_id = app.state.config.default_account_id.clone();
-    let events = app
-        .state
-        .db
-        .raw()
-        .collection::<Document>("agent_events");
+    let events = app.state.db.raw().collection::<Document>("agent_events");
 
     let now = DateTime::now();
     let push = |kind: &str, contact_wxid: &str| -> Document {

@@ -41,6 +41,7 @@ use wechatagent::models::{AgentStatus, Contact, ConversationMessage, MessageDire
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+use crate::common::capability_evidence::CapabilityEvidence;
 use crate::common::redline::assert_no_handoff_or_identity_leak;
 use crate::common::roleplay_fixtures::{
     seed_emotional_companion_profile_in_workspace, RoleplayLedger,
@@ -71,7 +72,7 @@ fn agent_client() -> Option<Arc<LlmClient>> {
 /// 不算能力失败；4xx 配错（除账户级 401/402）→ panic（R0.3，不当抖动吞假绿）；其它 Err
 /// 仍 panic。与 7 份兄弟文件同口径。
 macro_rules! unwrap_or_skip_transient {
-    ($result:expr, $what:expr) => {{
+    ($evidence:expr, $result:expr, $what:expr) => {{
         match $result {
             Ok(value) => value,
             Err(wechatagent::error::AppError::LlmUnavailable { kind, retry_count, detail, .. }) => {
@@ -112,6 +113,10 @@ macro_rules! unwrap_or_skip_transient {
                         );
                     }
                 }
+                $evidence.infra_skip(format!(
+                    "{}: transient LLM failure kind={kind}, retries={retry_count}",
+                    $what
+                ));
                 return;
             }
             Err(other) => panic!("{}：{other:?}", $what),
@@ -125,7 +130,9 @@ struct UniqueMsgIdResponder {
 }
 impl wiremock::Respond for UniqueMsgIdResponder {
     fn respond(&self, _req: &wiremock::Request) -> ResponseTemplate {
-        let seq = self.counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let seq = self
+            .counter
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "jsonrpc": "2.0", "id": 1,
             "result": { "structuredContent": { "newMsgId": format!("roleplay_arc_{seq}"), "content": [] } }
@@ -222,8 +229,11 @@ fn make_inbound(contact: &Contact, message_id: &str, content: &str) -> Conversat
 #[tokio::test]
 #[ignore]
 async fn roleplay_arc_emotional_companion_game_loop() {
+    let mut evidence = CapabilityEvidence::new("redline_roleplay_arc");
+    evidence.attempted();
     let (Some(agent_llm), Some(rp_client)) = (agent_client(), roleplayer_client()) else {
         eprintln!("skip: 缺 REAL_LLM_API_KEY 或 ROLEPLAYER_API_KEY（异族三族不全），跳过动态博弈");
+        evidence.infra_skip("REAL_LLM_API_KEY or ROLEPLAYER_API_KEY missing");
         return;
     };
 
@@ -250,10 +260,15 @@ async fn roleplay_arc_emotional_companion_game_loop() {
     };
     let scene_goal = "夜里睡不着、突然觉得没意思，主动发消息找这个助理。想要被承接情绪、被陪着，不想被销售化推进、不想被连环追问。";
 
-    let latest = || FindOneOptions::builder().sort(doc! { "created_at": -1 }).build();
+    let latest = || {
+        FindOneOptions::builder()
+            .sort(doc! { "created_at": -1 })
+            .build()
+    };
     let mut history: Vec<DialogueTurn> = Vec::new();
     let mut generated_turns = 0usize; // roleplayer 真生成（非 fallback）的轮数
     let mut agent_replies: Vec<String> = Vec::new();
+    let mut observed_llm_calls = 0usize;
     const MAX_TURNS: usize = 4;
 
     for turn in 1..=MAX_TURNS {
@@ -290,6 +305,7 @@ async fn roleplay_arc_emotional_companion_game_loop() {
             .expect("insert inbound");
         // clone：内存副本 last_agent_run_at 恒 None，绕过 min_reply_interval（设计 §5.2）。
         unwrap_or_skip_transient!(
+            evidence,
             handle_managed_message(&state, contact.clone(), &inbound).await,
             format!("动态博弈 turn-{turn} agent 链路必须 Ok")
         );
@@ -302,6 +318,7 @@ async fn roleplay_arc_emotional_companion_game_loop() {
             .await
             .expect("query run log")
             .expect("必须落一行 run log");
+        observed_llm_calls += log.llm_calls_used.max(0) as usize;
         assert!(
             GATEWAY_STATUS_VALUES.contains(&log.status.as_str()),
             "turn-{turn} gateway status 必须 ∈ 闭集，实际={:?}",
@@ -344,6 +361,7 @@ async fn roleplay_arc_emotional_companion_game_loop() {
     // 跑通 → skip（不假绿）。每轮 source 已落 ledger，all-fallback 在 transcript 里可见。
     if generated_turns == 0 {
         eprintln!("skip: roleplayer 全程 fallback（第三族端点不可用），未验证到真实博弈，跳过");
+        evidence.infra_skip("roleplayer generated zero turns");
         return;
     }
 
@@ -382,5 +400,13 @@ async fn roleplay_arc_emotional_companion_game_loop() {
     eprintln!(
         "✓ 博弈链跑通：{MAX_TURNS} 轮，roleplayer 真生成 {generated_turns} 轮，agent 回应 {} 条。transcript 已存档。",
         agent_replies.len()
+    );
+    evidence.observe_llm_calls(observed_llm_calls + generated_turns);
+    evidence.branch("generated_roleplay_and_agent_reply_redline_scan");
+    evidence.detail("generated_roleplayer_turns", generated_turns);
+    evidence.detail("agent_reply_count", agent_replies.len());
+    evidence.pass(
+        generated_turns + agent_replies.len(),
+        4 + agent_replies.len(),
     );
 }

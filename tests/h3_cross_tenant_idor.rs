@@ -54,9 +54,14 @@ fn make_provider(ws: &str, provider_id: &str, active: bool) -> LlmProviderConfig
 
 /// seed 一个 ACL=[ws_a] 的 admin，返回其真实 user_id。
 async fn seed_admin_with_acl(app: &TestApp, ws_a: &str) -> String {
-    bootstrap_admin_if_needed(&app.state.db, Some("h3_admin"), Some("pw-h3-123456"), Some(ws_a))
-        .await
-        .expect("bootstrap admin");
+    bootstrap_admin_if_needed(
+        &app.state.db,
+        Some("h3_admin"),
+        Some("pw-h3-123456"),
+        Some(ws_a),
+    )
+    .await
+    .expect("bootstrap admin");
     let user = authenticate(&app.state.db, "h3_admin", "pw-h3-123456")
         .await
         .expect("authenticate");
@@ -100,7 +105,10 @@ async fn activate_provider_blocks_cross_tenant_override() {
 
     // 副作用断言：ws_b 的 victim_provider 仍未激活。
     let still = coll
-        .find_one(doc! { "workspaceId": ws_b, "providerId": "victim_provider" }, None)
+        .find_one(
+            doc! { "workspaceId": ws_b, "providerId": "victim_provider" },
+            None,
+        )
         .await
         .expect("find victim")
         .expect("victim exists");
@@ -134,7 +142,10 @@ async fn activate_provider_allows_own_workspace() {
         query,
     )
     .await;
-    assert!(result.is_ok(), "本租户 provider 激活应成功，实际 {result:?}");
+    assert!(
+        result.is_ok(),
+        "本租户 provider 激活应成功，实际 {result:?}"
+    );
 
     let mine = coll
         .find_one(doc! { "workspaceId": ws_a, "providerId": "mine" }, None)

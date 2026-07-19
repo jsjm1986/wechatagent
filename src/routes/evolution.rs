@@ -33,7 +33,7 @@ use crate::{
         error::EvolutionError,
         release::{release_prompt, release_threshold, rollback_prompt, rollback_threshold},
     },
-    models::{Experiment, EvolutionRuntimeFlag, Proposal, ShadowReplay, ThresholdOverride},
+    models::{EvolutionRuntimeFlag, Experiment, Proposal, ShadowReplay, ThresholdOverride},
 };
 
 use super::shared::parse_object_id;
@@ -239,7 +239,9 @@ async fn load_proposal_summaries(
         .proposals()
         .find(
             doc! { "experiment_id": experiment_id },
-            FindOptions::builder().sort(doc! { "created_at": 1 }).build(),
+            FindOptions::builder()
+                .sort(doc! { "created_at": 1 })
+                .build(),
         )
         .await?;
     let mut out = Vec::new();
@@ -249,10 +251,7 @@ async fn load_proposal_summaries(
     Ok(out)
 }
 
-async fn aggregate_shadow_replays(
-    state: &AppState,
-    proposal_id: ObjectId,
-) -> AppResult<Value> {
+async fn aggregate_shadow_replays(state: &AppState, proposal_id: ObjectId) -> AppResult<Value> {
     let mut cursor = state
         .db
         .shadow_replays()
@@ -278,10 +277,7 @@ async fn aggregate_shadow_replays(
     }))
 }
 
-async fn load_current_state_for_diff(
-    state: &AppState,
-    proposal: &Proposal,
-) -> AppResult<Value> {
+async fn load_current_state_for_diff(state: &AppState, proposal: &Proposal) -> AppResult<Value> {
     match proposal.proposal_kind.as_str() {
         "threshold" => {
             let gate_key = match proposal.gate_key.as_deref() {
@@ -314,7 +310,10 @@ async fn load_current_state_for_diff(
                 .await?;
             let (current_value, source) = match latest_override.as_ref() {
                 Some(o) => (o.value, "threshold_overrides"),
-                None => (baseline_threshold_value(&state.config, gate_key), "appconfig_baseline"),
+                None => (
+                    baseline_threshold_value(&state.config, gate_key),
+                    "appconfig_baseline",
+                ),
             };
             Ok(json!({
                 "kind": "threshold",
@@ -617,7 +616,9 @@ pub(super) async fn put_evolution_runtime_flag(
         .update_one(
             doc! { "workspace_id": &workspace_id },
             doc! { "$set": set_fields },
-            mongodb::options::UpdateOptions::builder().upsert(true).build(),
+            mongodb::options::UpdateOptions::builder()
+                .upsert(true)
+                .build(),
         )
         .await?;
 
@@ -718,10 +719,21 @@ mod tests {
         cfg.strategic_planner_block_rate_threshold = 0.42;
         assert_eq!(baseline_threshold_value(&cfg, "fact_risk_block"), 6.0);
         assert_eq!(baseline_threshold_value(&cfg, "pressure_risk_block"), 7.0);
-        assert_eq!(baseline_threshold_value(&cfg, "human_like_score_rewrite"), 6.0);
-        assert_eq!(baseline_threshold_value(&cfg, "emotional_value_rewrite"), 5.0);
-        assert_eq!(baseline_threshold_value(&cfg, "product_accuracy_score_block"), 7.0);
-        assert!((baseline_threshold_value(&cfg, "planner_block_rate_threshold") - 0.42).abs() < 1e-9);
+        assert_eq!(
+            baseline_threshold_value(&cfg, "human_like_score_rewrite"),
+            6.0
+        );
+        assert_eq!(
+            baseline_threshold_value(&cfg, "emotional_value_rewrite"),
+            5.0
+        );
+        assert_eq!(
+            baseline_threshold_value(&cfg, "product_accuracy_score_block"),
+            7.0
+        );
+        assert!(
+            (baseline_threshold_value(&cfg, "planner_block_rate_threshold") - 0.42).abs() < 1e-9
+        );
         assert_eq!(baseline_threshold_value(&cfg, "unknown_gate"), 0.0);
     }
 

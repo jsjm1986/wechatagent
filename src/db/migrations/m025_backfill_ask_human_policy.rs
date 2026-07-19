@@ -37,7 +37,9 @@ pub(super) async fn run_step(db: &Database) -> AppResult<()> {
             "escalateAiPolicyHold": all_mode,
             "escalateStuck": true,
         };
-        let Some(id) = cfg.id else { continue; };
+        let Some(id) = cfg.id else {
+            continue;
+        };
         coll.update_one(
             doc! { "_id": id },
             doc! { "$set": { "ask_human_policy": policy, "updated_at": DateTime::now() } },

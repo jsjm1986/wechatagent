@@ -1,79 +1,61 @@
-//! Phase E / E3：knowledge_agent 离线评测集 harness。
+//! SR-126：Knowledge 离线召回门必须由生产 catalog 排序决定候选。
 //!
-//! 目的：在 testcontainers MongoDB + mock LLM 下批量跑一组固定 query，统计
-//! - 平均 rounds_used（应 ≤ 3）
-//! - cited 命中率（每条 query 都标注了"理想 chunk_id"，命中即 +1）
-//! - truncated / cancelled 比例
-//! - 全程 LLM 调用次数
-//!
-//! 评测集刻意做小（5 条），方便快速回归；后续加 query 只需在 [`SCENARIOS`]
-//! 末尾追加 [`EvalScenario`]。
-//!
-//! `#[ignore]` 守门：依赖 testcontainers MongoDB，CI 用 `cargo test -- --ignored`。
+//! 金标只用于执行后的 recall@1 评分，绝不注入 mock LLM。测试先把相关条目与
+//! 高静态分无关干扰项写入真实 Mongo，再调用生产 `list_catalog`；mock 只负责
+//! 打开生产排序的第一项并引用其证据。排序若退化，引用会合法但金标 recall 会下降。
 
 mod common;
 
-use mongodb::bson::{oid::ObjectId, DateTime as BsonDt};
+use std::collections::HashMap;
+
+use mongodb::bson::{doc, oid::ObjectId, DateTime as BsonDt};
 use serde_json::json;
-use wechatagent::agent::knowledge_agent::{answer, AnswerRequest, CatalogFilter};
+use wechatagent::agent::knowledge_agent::{answer, list_catalog, AnswerRequest, CatalogFilter};
 use wechatagent::models::OperationKnowledgeChunk;
 
 use crate::common::TestApp;
 
 const WS: &str = "ws_eval";
 
-/// 一条固定评测样本。
 struct EvalScenario {
-    /// 给运营的自然语言 query。
     query: &'static str,
-    /// 期待 agent 引用的 chunk title 集合（命中其一即视为 cited 命中）。
-    expected_titles: &'static [&'static str],
-    /// mock LLM 在本场景应输出的 action 序列（转 JSON 后入队）。
-    /// 空表示用默认"open 第一条 → answer"两步。
-    llm_steps: &'static [LlmStep],
-}
-
-#[derive(Clone, Copy)]
-enum LlmStep {
-    /// open 期待 chunk 中第 idx 条（按 expected_titles 顺序）。
-    OpenExpected(usize),
-    /// 直接 answer，cite 期待 chunk 中第 idx 条。
-    AnswerExpected(usize),
+    expected_title: &'static str,
 }
 
 const SCENARIOS: &[EvalScenario] = &[
     EvalScenario {
         query: "客户嫌价格贵怎么处理",
-        expected_titles: &["三步价格异议处理"],
-        llm_steps: &[LlmStep::OpenExpected(0), LlmStep::AnswerExpected(0)],
+        expected_title: "三步价格异议处理",
     },
     EvalScenario {
         query: "新客户首次跟进的开场白",
-        expected_titles: &["新客开场白模板"],
-        llm_steps: &[LlmStep::OpenExpected(0), LlmStep::AnswerExpected(0)],
+        expected_title: "新客开场白模板",
     },
     EvalScenario {
         query: "客户已读不回如何唤回",
-        expected_titles: &["已读不回唤回三阶段"],
-        llm_steps: &[LlmStep::OpenExpected(0), LlmStep::AnswerExpected(0)],
+        expected_title: "已读不回唤回三阶段",
     },
     EvalScenario {
         query: "复购客户如何升级套餐",
-        expected_titles: &["复购升级路径"],
-        llm_steps: &[LlmStep::OpenExpected(0), LlmStep::AnswerExpected(0)],
+        expected_title: "复购升级路径",
     },
     EvalScenario {
         query: "竞品对比怎么客观陈述",
-        expected_titles: &["竞品对比方法论"],
-        llm_steps: &[LlmStep::OpenExpected(0), LlmStep::AnswerExpected(0)],
+        expected_title: "竞品对比方法论",
     },
 ];
 
-/// 评测集结果聚合。
+const DISTRACTORS: &[&str] = &[
+    "仓库盘点与库存校准",
+    "员工入职设备领取流程",
+    "发票抬头修改规范",
+];
+
 #[derive(Debug, Default)]
 struct EvalReport {
     total: usize,
     cited_hits: usize,
+    top_rank_hits: usize,
     rounds_sum: i32,
     truncated: usize,
     cancelled: usize,
@@ -82,105 +64,112 @@ struct EvalReport {
 
 impl EvalReport {
     fn cited_hit_rate(&self) -> f64 {
-        if self.total == 0 {
-            0.0
-        } else {
-            self.cited_hits as f64 / self.total as f64
-        }
+        self.cited_hits as f64 / self.total.max(1) as f64
+    }
+
+    fn top_rank_hit_rate(&self) -> f64 {
+        self.top_rank_hits as f64 / self.total.max(1) as f64
     }
 
     fn avg_rounds(&self) -> f64 {
-        if self.total == 0 {
-            0.0
-        } else {
-            self.rounds_sum as f64 / self.total as f64
-        }
+        self.rounds_sum as f64 / self.total.max(1) as f64
     }
 }
 
-fn verified_chunk(title: &str) -> OperationKnowledgeChunk {
+fn verified_chunk(title: &str, query_terms: &str, confidence: f64) -> OperationKnowledgeChunk {
+    let source_quote = format!("证据：{title}；适用问题：{query_terms}");
     OperationKnowledgeChunk {
         id: Some(ObjectId::new()),
         workspace_id: WS.to_string(),
+        account_id: None,
         domain: "user_operations".to_string(),
         title: title.to_string(),
-        summary: Some(format!("摘要：{title}")),
-        body: Some(format!("正文：{title}")),
+        summary: Some(format!("{title} {query_terms}")),
+        body: Some(format!("{source_quote}。正文说明。")),
         wiki_type: Some("methodology".to_string()),
         status: "active".to_string(),
         integrity_status: Some("verified".to_string()),
-        dynamic_confidence: Some(0.9),
-        priority: 0,
+        source_quote: Some(source_quote.clone()),
+        source_anchors: vec![doc! { "sourceQuote": &source_quote }],
+        dynamic_confidence: Some(confidence),
+        priority: if confidence > 0.9 { 100 } else { 0 },
         created_at: BsonDt::now(),
         updated_at: BsonDt::now(),
         ..Default::default()
     }
 }
 
-/// E3 入口测试：跑完 SCENARIOS，断言聚合阈值。
-///
-/// 阈值：
-/// - cited 命中率 ≥ 80%
-/// - 平均 rounds_used ≤ 3
-/// - 0 truncated / 0 cancelled
-#[tokio::test]
-#[ignore]
-async fn knowledge_agent_eval_set_meets_thresholds() {
-    let app = TestApp::start().await;
-    // 评测集隔离：清表，再按场景顺序写入对应 chunk，把 chunk_id 记下来给 mock LLM。
-    app.state
-        .db
-        .operation_knowledge_chunks()
-        .delete_many(mongodb::bson::doc! { "workspaceId": WS }, None)
-        .await
-        .expect("clean ws_eval chunks");
-
+async fn exercise_eval(app: &TestApp) -> anyhow::Result<EvalReport> {
+    let chunks = app.state.db.operation_knowledge_chunks();
     let mut report = EvalReport::default();
-    let mut prev_calls: usize = 0;
+    let mut previous_calls = app.llm.calls();
 
     for scenario in SCENARIOS {
-        // 每条 scenario 单独建 chunk，避免互相污染 catalog 排序。
-        // 用 delete_many 把上一轮的 chunk 全清，保持 catalog 干净。
-        app.state
-            .db
-            .operation_knowledge_chunks()
-            .delete_many(mongodb::bson::doc! { "workspaceId": WS }, None)
-            .await
-            .expect("reset ws_eval chunks");
+        chunks
+            .delete_many(doc! { "workspace_id": WS }, None)
+            .await?;
+        let remaining = chunks
+            .count_documents(doc! { "workspace_id": WS }, None)
+            .await?;
+        anyhow::ensure!(remaining == 0, "scenario reset left {remaining} chunks");
 
-        let mut chunk_hexes: Vec<String> = Vec::new();
-        for title in scenario.expected_titles {
-            let chunk = verified_chunk(title);
-            chunk_hexes.push(chunk.id.expect("oid").to_hex());
-            app.state
-                .db
-                .operation_knowledge_chunks()
-                .insert_one(&chunk, None)
-                .await
-                .expect("insert chunk");
+        let relevant = verified_chunk(scenario.expected_title, scenario.query, 0.35);
+        let gold_id = relevant.id.expect("relevant oid").to_hex();
+        let mut evidence_by_id = HashMap::new();
+        evidence_by_id.insert(
+            gold_id.clone(),
+            relevant
+                .source_quote
+                .clone()
+                .expect("relevant source quote"),
+        );
+        chunks.insert_one(&relevant, None).await?;
+
+        for title in DISTRACTORS {
+            let distractor = verified_chunk(title, "内部行政流程，与客户咨询无关", 0.99);
+            let id = distractor.id.expect("distractor oid").to_hex();
+            evidence_by_id.insert(
+                id,
+                distractor
+                    .source_quote
+                    .clone()
+                    .expect("distractor source quote"),
+            );
+            chunks.insert_one(&distractor, None).await?;
         }
 
-        // 把本场景 LLM 步骤入队。
-        for step in scenario.llm_steps {
-            match step {
-                LlmStep::OpenExpected(idx) => {
-                    let id = &chunk_hexes[*idx];
-                    app.llm.push_response(json!({
-                        "action": "open_chunk",
-                        "ids": [id],
-                    }));
-                }
-                LlmStep::AnswerExpected(idx) => {
-                    let id = &chunk_hexes[*idx];
-                    app.llm.push_response(json!({
-                        "action": "answer",
-                        "answer": format!("基于 {} 给出方案。", id),
-                        "citedChunkIds": [id],
-                        "sourceQuotes": [],
-                    }));
-                }
-            }
-        }
+        let catalog = list_catalog(
+            &app.state,
+            WS,
+            None,
+            &CatalogFilter::default(),
+            Some(scenario.query),
+        )
+        .await?;
+        let selected_id = catalog
+            .first()
+            .map(|entry| entry.chunk_id.clone())
+            .ok_or_else(|| anyhow::anyhow!("production catalog returned no candidates"))?;
+        let selected_quote = evidence_by_id
+            .get(&selected_id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("catalog selected unknown chunk {selected_id}"))?;
+
+        // mock 不知道 gold_id，只照生产排序第一项执行 open + answer。
+        app.llm.push_response(json!({
+            "action": "open_chunk",
+            "ids": [selected_id.clone()],
+        }));
+        app.llm.push_response(json!({
+            "action": "answer",
+            "answer": "基于已打开的首候选给出方案。",
+            "citedChunkIds": [selected_id.clone()],
+            "sourceQuotes": [{
+                "chunkId": selected_id.clone(),
+                "quote": selected_quote,
+                "sourceAnchorIndex": 0,
+            }],
+        }));
 
         let result = answer(
             &app.state,
@@ -192,34 +181,34 @@ async fn knowledge_agent_eval_set_meets_thresholds() {
                 max_rounds: None,
             },
         )
-        .await
-        .expect("answer must succeed");
+        .await?;
 
         report.total += 1;
         report.rounds_sum += result.rounds_used;
-        if result.truncated {
-            report.truncated += 1;
-        }
-        if result.cancelled {
-            report.cancelled += 1;
-        }
+        report.truncated += usize::from(result.truncated);
+        report.cancelled += usize::from(result.cancelled);
         let calls_now = app.llm.calls();
-        report.llm_calls_sum += calls_now - prev_calls;
-        prev_calls = calls_now;
-
-        // cited 命中：返回的任一 cited_chunk_id 必须落在本场景准备的 chunk_hexes 集合里。
-        if result
-            .cited_chunk_ids
-            .iter()
-            .any(|c| chunk_hexes.contains(c))
-        {
-            report.cited_hits += 1;
-        }
+        report.llm_calls_sum += calls_now - previous_calls;
+        previous_calls = calls_now;
+        report.top_rank_hits += usize::from(selected_id == gold_id);
+        report.cited_hits += usize::from(result.cited_chunk_ids.iter().any(|id| id == &gold_id));
     }
 
+    Ok(report)
+}
+
+#[tokio::test]
+#[ignore]
+async fn knowledge_agent_eval_set_meets_thresholds() {
+    let app = TestApp::start().await;
+    let result = exercise_eval(&app).await;
+    app.cleanup().await;
+
+    let report = result.expect("exercise production-ranked knowledge eval");
     eprintln!(
-        "[eval] total={} hit_rate={:.2} avg_rounds={:.2} truncated={} cancelled={} llm_calls={}",
+        "[eval] total={} top_rank_hit={:.2} cited_hit={:.2} avg_rounds={:.2} truncated={} cancelled={} llm_calls={}",
         report.total,
+        report.top_rank_hit_rate(),
         report.cited_hit_rate(),
         report.avg_rounds(),
         report.truncated,
@@ -227,22 +216,19 @@ async fn knowledge_agent_eval_set_meets_thresholds() {
         report.llm_calls_sum,
     );
 
+    assert_eq!(report.total, SCENARIOS.len(), "all scenarios must execute");
+    assert!(
+        report.top_rank_hit_rate() >= 0.80,
+        "production catalog recall@1 below floor: {:.2}",
+        report.top_rank_hit_rate()
+    );
     assert!(
         report.cited_hit_rate() >= 0.80,
-        "cited 命中率不达标：{:.2} < 0.80",
+        "grounded cited recall below floor: {:.2}",
         report.cited_hit_rate()
     );
-    assert!(
-        report.avg_rounds() <= 3.0,
-        "平均 rounds 超阈值：{:.2} > 3.0",
-        report.avg_rounds()
-    );
-    assert_eq!(report.truncated, 0, "评测集中不应出现 truncated 结果");
-    assert_eq!(report.cancelled, 0, "评测集中不应出现 cancelled 结果");
-    // 每条场景应该 LLM 调用 = open + answer = 2，5 条 = 10 次。允许 +/- 0 容差。
-    assert_eq!(
-        report.llm_calls_sum,
-        SCENARIOS.len() * 2,
-        "LLM 调用次数与场景预期不符"
-    );
+    assert!(report.avg_rounds() <= 3.0);
+    assert_eq!(report.truncated, 0);
+    assert_eq!(report.cancelled, 0);
+    assert_eq!(report.llm_calls_sum, SCENARIOS.len() * 2);
 }

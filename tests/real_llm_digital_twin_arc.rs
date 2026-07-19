@@ -43,6 +43,7 @@ use wechatagent::models::{AgentStatus, Contact, ConversationMessage, MessageDire
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+use crate::common::capability_evidence::CapabilityEvidence;
 use crate::common::identity_generator::{generate_identity, GeneratedIdentity, IdentityCategory};
 use crate::common::redline::assert_no_handoff_or_identity_leak;
 use crate::common::roleplay_fixtures::{seed_active_domain_profile, RoleplayLedger};
@@ -70,7 +71,7 @@ fn agent_client() -> Option<Arc<LlmClient>> {
 
 /// 端点瞬时不可达 → skip（写 ledger，R0.2）；4xx 配错 → panic（R0.3）。与 7 份兄弟文件同口径。
 macro_rules! unwrap_or_skip_transient {
-    ($result:expr, $what:expr) => {{
+    ($evidence:expr, $result:expr, $what:expr) => {{
         match $result {
             Ok(value) => value,
             Err(wechatagent::error::AppError::LlmUnavailable { kind, retry_count, detail, .. }) => {
@@ -88,6 +89,10 @@ macro_rules! unwrap_or_skip_transient {
                     "skip: {} —— 真模型上游瞬时不可达（kind={kind}, retry_count={retry_count}），不算能力失败",
                     $what
                 );
+                $evidence.infra_skip(format!(
+                    "{}: transient LLM failure kind={kind} retry_count={retry_count}",
+                    $what
+                ));
                 {
                     use std::io::Write as _;
                     let dir = std::env::var("REAL_LLM_LEDGER")
@@ -122,7 +127,9 @@ struct UniqueMsgIdResponder {
 }
 impl wiremock::Respond for UniqueMsgIdResponder {
     fn respond(&self, _req: &wiremock::Request) -> ResponseTemplate {
-        let seq = self.counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let seq = self
+            .counter
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "jsonrpc": "2.0", "id": 1,
             "result": { "structuredContent": { "newMsgId": format!("dtwin_{seq}"), "content": [] } }
@@ -219,10 +226,13 @@ async fn run_twin_arc(
     rp_client: Arc<LlmClient>,
     seed: usize,
     expect_category: IdentityCategory,
+    evidence: &mut CapabilityEvidence,
 ) {
     // ① 真生成身份（端点抖动 → None → skip 不假绿）。
-    let Some(identity): Option<GeneratedIdentity> = generate_identity(&rp_client, seed).await else {
+    let Some(identity): Option<GeneratedIdentity> = generate_identity(&rp_client, seed).await
+    else {
         eprintln!("skip: generate_identity(seed={seed}) 返回 None（端点抖动 / 关键字段缺失），跳过本域 arc");
+        evidence.inconclusive("identity generator produced no complete identity");
         return;
     };
     assert_eq!(
@@ -265,7 +275,11 @@ async fn run_twin_arc(
         .expect("insert contact");
 
     let ledger = RoleplayLedger::for_fixture(&format!("digital_twin_{category_label}"));
-    let latest = || FindOneOptions::builder().sort(doc! { "created_at": -1 }).build();
+    let latest = || {
+        FindOneOptions::builder()
+            .sort(doc! { "created_at": -1 })
+            .build()
+    };
     let persona = identity.persona.clone();
     let scene_goal = identity.persona.need.clone();
 
@@ -273,6 +287,7 @@ async fn run_twin_arc(
     let mut generated_turns = 0usize;
     let mut agent_replies: Vec<String> = Vec::new();
     let mut sent_turns = 0usize;
+    let mut observed_llm_calls = 0usize;
     const MAX_TURNS: usize = 4;
 
     for turn in 1..=MAX_TURNS {
@@ -281,7 +296,8 @@ async fn run_twin_arc(
             (identity.opening_inbound.clone(), RoleplaySource::Generated)
         } else {
             let fallback = "嗯，你继续说。";
-            let rp = roleplay_user_turn(&rp_client, &persona, &scene_goal, &history, fallback).await;
+            let rp =
+                roleplay_user_turn(&rp_client, &persona, &scene_goal, &history, fallback).await;
             (rp.message.clone(), rp.source)
         };
         if source == RoleplaySource::Generated {
@@ -298,8 +314,14 @@ async fn run_twin_arc(
 
         let msg_id = format!("dtwin_{category_label}_inbound_{turn}");
         let inbound = make_inbound(&contact, &msg_id, &customer_line);
-        state.db.messages().insert_one(&inbound, None).await.expect("insert inbound");
+        state
+            .db
+            .messages()
+            .insert_one(&inbound, None)
+            .await
+            .expect("insert inbound");
         unwrap_or_skip_transient!(
+            evidence,
             handle_managed_message(&state, contact.clone(), &inbound).await,
             format!("[{category_label}] turn-{turn} agent 链路必须 Ok")
         );
@@ -312,6 +334,7 @@ async fn run_twin_arc(
             .await
             .expect("query run log")
             .expect("必须落一行 run log");
+        observed_llm_calls += log.llm_calls_used.max(0) as usize;
         assert!(
             GATEWAY_STATUS_VALUES.contains(&log.status.as_str()),
             "[{category_label}] turn-{turn} gateway status 必须 ∈ 闭集，实际={:?}",
@@ -361,8 +384,14 @@ async fn run_twin_arc(
     // 博弈链跑通校验：roleplayer 全程 fallback（仅首轮生成开场）→ 未验证到真实多轮博弈，skip。
     if generated_turns <= 1 {
         eprintln!("skip: [{category_label}] roleplayer 后续轮全 fallback（第三族端点抖），未验真实多轮博弈，跳过");
+        evidence.infra_skip("roleplayer produced no generated follow-up turn");
         return;
     }
+
+    assert!(
+        sent_turns > 0,
+        "[{category_label}] 数字分身红线需要至少一条非空 agent 回复供扫描"
+    );
 
     // arc 级硬断言：发出过回复 → contact 必留至少一项画像信号（数字分身也要记住对话方）。
     if sent_turns > 0 {
@@ -375,9 +404,17 @@ async fn run_twin_arc(
             .expect("contact exists");
         // 非交易域 profile（peer/formal 经 apply_category_semantics）不无条件写 value_tier，
         // 故 domain_attributes 任一键 / memory_summary / agent_profile 任一非空即算记住对话方。
-        let has_signal = final_contact.memory_summary.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false)
+        let has_signal = final_contact
+            .memory_summary
+            .as_deref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
             || final_contact.agent_profile.is_some()
-            || final_contact.domain_attributes.as_ref().map(|d| d.keys().count() > 0).unwrap_or(false);
+            || final_contact
+                .domain_attributes
+                .as_ref()
+                .map(|d| d.keys().count() > 0)
+                .unwrap_or(false);
         assert!(
             has_signal,
             "[{category_label}] arc 跑完（发出 {sent_turns} 轮回复）后 contact 无任何画像信号——数字分身对吐露信息的对话方零记录"
@@ -387,26 +424,52 @@ async fn run_twin_arc(
     eprintln!(
         "✓ [{category_label}] 数字分身全链跑通：{MAX_TURNS} 轮，roleplayer 真生成 {generated_turns} 轮，agent 发出 {sent_turns} 轮，红线/闭集/画像断言通过。"
     );
+    evidence.observe_llm_calls(observed_llm_calls);
+    evidence.branch("identity_generated_multiturn_reply_redline_profile");
+    evidence.detail("identity_category", category_label);
+    evidence.detail("generated_turns", generated_turns);
+    evidence.detail("agent_reply_count", sent_turns);
+    evidence.pass(2 + sent_turns, 4 + MAX_TURNS * 2 + sent_turns);
 }
 
 /// peer_social 域（同行交流搭子）全链 arc。seed=5 → PeerSocial（见 industry_candidates）。
 #[tokio::test]
 #[ignore]
 async fn digital_twin_peer_social_full_arc() {
+    let mut evidence = CapabilityEvidence::new("redline_digital_twin_peer");
+    evidence.attempted();
     let (Some(agent_llm), Some(rp_client)) = (agent_client(), roleplayer_client()) else {
         eprintln!("skip: 缺 REAL_LLM_API_KEY 或 ROLEPLAYER_API_KEY（异族不全），跳过数字分身 arc");
+        evidence.infra_skip("REAL_LLM_API_KEY or ROLEPLAYER_API_KEY missing");
         return;
     };
-    run_twin_arc(agent_llm, rp_client, 5, IdentityCategory::PeerSocial).await;
+    run_twin_arc(
+        agent_llm,
+        rp_client,
+        5,
+        IdentityCategory::PeerSocial,
+        &mut evidence,
+    )
+    .await;
 }
 
 /// formal_business 域（正式业务咨询）全链 arc。seed=7 → FormalBusiness。
 #[tokio::test]
 #[ignore]
 async fn digital_twin_formal_business_full_arc() {
+    let mut evidence = CapabilityEvidence::new("redline_digital_twin_formal");
+    evidence.attempted();
     let (Some(agent_llm), Some(rp_client)) = (agent_client(), roleplayer_client()) else {
         eprintln!("skip: 缺 REAL_LLM_API_KEY 或 ROLEPLAYER_API_KEY（异族不全），跳过数字分身 arc");
+        evidence.infra_skip("REAL_LLM_API_KEY or ROLEPLAYER_API_KEY missing");
         return;
     };
-    run_twin_arc(agent_llm, rp_client, 7, IdentityCategory::FormalBusiness).await;
+    run_twin_arc(
+        agent_llm,
+        rp_client,
+        7,
+        IdentityCategory::FormalBusiness,
+        &mut evidence,
+    )
+    .await;
 }

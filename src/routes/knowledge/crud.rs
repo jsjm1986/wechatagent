@@ -10,9 +10,7 @@ use serde_json::{json, Value};
 
 use crate::auth::AuthenticatedAdmin;
 use crate::error::{AppError, AppResult};
-use crate::knowledge_wiki::chunk_revisions::{
-    chunk_replace_filter, monotonic_chunk_updated_at,
-};
+use crate::knowledge_wiki::chunk_revisions::{chunk_replace_filter, monotonic_chunk_updated_at};
 use crate::knowledge_wiki::page_merge::{
     compute_chunk_hash, effective_locked_fields, enforce_locked_fields,
 };
@@ -80,7 +78,12 @@ pub(in crate::routes) async fn create_operation_knowledge_document(
         .db
         .operation_knowledge_documents()
         .insert_one(
-            operation_knowledge_document_from_request(&state, &admin.current_workspace, payload, None),
+            operation_knowledge_document_from_request(
+                &state,
+                &admin.current_workspace,
+                payload,
+                None,
+            ),
             None,
         )
         .await?;
@@ -128,7 +131,12 @@ pub(in crate::routes) async fn update_operation_knowledge_document(
                 "_id": object_id,
                 "workspace_id": &admin.current_workspace
             },
-            operation_knowledge_document_from_request(&state, &admin.current_workspace, payload, Some(object_id)),
+            operation_knowledge_document_from_request(
+                &state,
+                &admin.current_workspace,
+                payload,
+                Some(object_id),
+            ),
             None,
         )
         .await?;
@@ -207,7 +215,12 @@ pub(in crate::routes) async fn create_operation_knowledge_chunk(
         .db
         .operation_knowledge_chunks()
         .insert_one(
-            operation_knowledge_chunk_from_request(&state, &admin.current_workspace, payload, None)?,
+            operation_knowledge_chunk_from_request(
+                &state,
+                &admin.current_workspace,
+                payload,
+                None,
+            )?,
             None,
         )
         .await?;
@@ -267,8 +280,12 @@ pub async fn update_operation_knowledge_chunk(
         )
         .await?
         .ok_or_else(|| AppError::NotFound("operation knowledge chunk not found".to_string()))?;
-    let next =
-        operation_knowledge_chunk_from_request(&state, &admin.current_workspace, payload, Some(object_id))?;
+    let next = operation_knowledge_chunk_from_request(
+        &state,
+        &admin.current_workspace,
+        payload,
+        Some(object_id),
+    )?;
     let next = preserve_unmodeled_chunk_fields(next, &existing);
 
     // KB-10：admin PUT 走 replace_one 整条替换，需在替换前把运营锁定字段从 existing
@@ -276,14 +293,12 @@ pub async fn update_operation_knowledge_chunk(
     // 复用与 apply_chunk_revision 同一份 effective_locked_fields + enforce_locked_fields
     // 纯函数（单一真相源，不造新 dual-path）。next/existing 是 typed struct，enforce_*
     // 收 &Document，故 to_document 转换后喂它们、再 from_document 转回 typed 供 replace_one。
-    let existing_doc = mongodb::bson::to_document(&existing).map_err(|e| {
-        AppError::External(format!("serialize existing chunk to bson failed: {e}"))
-    })?;
+    let existing_doc = mongodb::bson::to_document(&existing)
+        .map_err(|e| AppError::External(format!("serialize existing chunk to bson failed: {e}")))?;
     let next_doc = mongodb::bson::to_document(&next)
         .map_err(|e| AppError::External(format!("serialize next chunk to bson failed: {e}")))?;
     let effective_locked_owned = effective_locked_fields(&existing_doc);
-    let effective_locked: Vec<&str> =
-        effective_locked_owned.iter().map(|s| s.as_str()).collect();
+    let effective_locked: Vec<&str> = effective_locked_owned.iter().map(|s| s.as_str()).collect();
     let mut enforced_doc = enforce_locked_fields(&next_doc, &existing_doc, &effective_locked);
     enforced_doc.insert(
         "updated_at",
@@ -314,7 +329,11 @@ pub async fn update_operation_knowledge_chunk(
     let revision = ChunkRevision {
         id: None,
         chunk_id: object_id.to_hex(),
-        revision_id: format!("rev_{}_{}", object_id.to_hex(), uuid::Uuid::new_v4().simple()),
+        revision_id: format!(
+            "rev_{}_{}",
+            object_id.to_hex(),
+            uuid::Uuid::new_v4().simple()
+        ),
         op: "patch".to_string(),
         patch: doc! {},
         before_hash,

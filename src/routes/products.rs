@@ -99,8 +99,7 @@ struct ProductView {
 
 impl From<&Product> for ProductView {
     fn from(p: &Product) -> Self {
-        let attributes =
-            mongodb::bson::Bson::Document(p.attributes.clone()).into_relaxed_extjson();
+        let attributes = mongodb::bson::Bson::Document(p.attributes.clone()).into_relaxed_extjson();
         Self {
             product_id: p.product_id.clone(),
             workspace_id: p.workspace_id.clone(),
@@ -236,7 +235,9 @@ pub(super) async fn update_product(
         )
         .await?;
     if res.matched_count == 0 {
-        return Err(AppError::NotFound(format!("product {product_id} not found")));
+        return Err(AppError::NotFound(format!(
+            "product {product_id} not found"
+        )));
     }
     let refreshed = load_product(&state, &admin.current_workspace, &product_id).await?;
     Ok(Json(json!({ "item": ProductView::from(&refreshed) })))
@@ -276,7 +277,9 @@ async fn set_product_status(
         )
         .await?;
     if res.matched_count == 0 {
-        return Err(AppError::NotFound(format!("product {product_id} not found")));
+        return Err(AppError::NotFound(format!(
+            "product {product_id} not found"
+        )));
     }
     let refreshed = load_product(state, workspace_id, product_id).await?;
     Ok(Json(json!({ "item": ProductView::from(&refreshed) })))
@@ -340,20 +343,38 @@ mod tests {
     #[test]
     fn validate_product_money_rejects_negative_and_bad_currency() {
         // 金额整数化：i64 无 NaN/Inf，只需查非负。
-        assert!(validate_product_money(Some(-1), None).is_err(), "负数金额拒绝");
+        assert!(
+            validate_product_money(Some(-1), None).is_err(),
+            "负数金额拒绝"
+        );
         assert!(validate_product_money(Some(0), None).is_ok(), "0 分合法");
-        assert!(validate_product_money(Some(19900), None).is_ok(), "正常金额合法");
+        assert!(
+            validate_product_money(Some(19900), None).is_ok(),
+            "正常金额合法"
+        );
         assert!(validate_product_money(None, None).is_ok(), "未设价合法");
         // currency ISO-4217 形态校验。
         assert!(validate_product_money(Some(19900), Some("CNY")).is_ok());
-        assert!(validate_product_money(Some(19900), Some("cny")).is_err(), "小写币种拒绝");
-        assert!(validate_product_money(Some(19900), Some("RMB币")).is_err(), "非法币种拒绝");
-        assert!(validate_product_money(Some(19900), Some("  ")).is_ok(), "空白币种按未设处理");
+        assert!(
+            validate_product_money(Some(19900), Some("cny")).is_err(),
+            "小写币种拒绝"
+        );
+        assert!(
+            validate_product_money(Some(19900), Some("RMB币")).is_err(),
+            "非法币种拒绝"
+        );
+        assert!(
+            validate_product_money(Some(19900), Some("  ")).is_ok(),
+            "空白币种按未设处理"
+        );
     }
 
     #[test]
     fn normalize_opt_trims_and_drops_empty() {
-        assert_eq!(normalize_opt(Some("  abc ".to_string())), Some("abc".to_string()));
+        assert_eq!(
+            normalize_opt(Some("  abc ".to_string())),
+            Some("abc".to_string())
+        );
         assert_eq!(normalize_opt(Some("   ".to_string())), None);
         assert_eq!(normalize_opt(None), None);
     }

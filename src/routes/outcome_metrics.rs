@@ -12,8 +12,7 @@ use mongodb::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::{
-    auth::AuthenticatedAdmin,error::AppResult, models::AgentOutcomeMetric};
+use crate::{auth::AuthenticatedAdmin, error::AppResult, models::AgentOutcomeMetric};
 
 use super::AppState;
 
@@ -111,6 +110,8 @@ mod contract_tests {
             agent_block_rate: Some(0.1),
             daily_run_count: 120,
             daily_run_token_total: 45000,
+            source_task_id: None,
+            source_task_claim_generation: 0,
             created_at: DateTime::from_millis(1_700_000_000_000),
         };
         let projected = outcome_metric_json(item);

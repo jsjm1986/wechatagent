@@ -167,10 +167,14 @@ pub async fn tick_once(state: &AppState, bus: &Arc<ChatProgressBus>) -> anyhow::
     let task = collection
         .find_one(
             doc! { "status": "pending" },
-            FindOneOptions::builder().sort(doc! { "created_at": 1 }).build(),
+            FindOneOptions::builder()
+                .sort(doc! { "created_at": 1 })
+                .build(),
         )
         .await?;
-    let Some(task) = task else { return Ok(()); };
+    let Some(task) = task else {
+        return Ok(());
+    };
     let session_id = task.session_id.clone();
     let lock = bus.lock_for(&session_id).await;
     let _guard = lock.lock().await;
@@ -214,10 +218,7 @@ pub async fn run_task(
         &workspace_id,
         &account_id,
         &session_id,
-        format!(
-            "AI 已开始处理 {} 条派工任务（taskId={}）",
-            total, task_id
-        ),
+        format!("AI 已开始处理 {} 条派工任务（taskId={}）", total, task_id),
         doc! { "taskId": task_id, "phase": "started", "total": total as i32 },
     )
     .await?;
@@ -225,13 +226,14 @@ pub async fn run_task(
     let mut completed_steps: Vec<Document> = Vec::with_capacity(total);
     let mut needs_review: Vec<String> = Vec::new();
     let mut failed_steps: Vec<String> = Vec::new();
+    let mut needs_manual_steps: Vec<String> = Vec::new();
+    let mut noop_steps: Vec<String> = Vec::new();
+    let mut committed_steps = 0usize;
     let mut cancelled = false;
 
     for (idx, step) in task.planned_steps.iter().enumerate() {
         // 每步前检查 task.status；若 cancelled，立即停下并写 progress。
-        let current = collection
-            .find_one(doc! { "_id": task_id }, None)
-            .await?;
+        let current = collection.find_one(doc! { "_id": task_id }, None).await?;
         if let Some(t) = current {
             if t.status == "cancelled" {
                 cancelled = true;
@@ -239,10 +241,7 @@ pub async fn run_task(
             }
         }
 
-        let step_id = step
-            .get_str("stepId")
-            .unwrap_or("")
-            .to_string();
+        let step_id = step.get_str("stepId").unwrap_or("").to_string();
         let action = step.get_str("action").unwrap_or("").to_string();
         let card_id = step.get_str("cardId").unwrap_or("").to_string();
         let summary_text = step.get_str("summary").unwrap_or("").to_string();
@@ -269,21 +268,47 @@ pub async fn run_task(
         let progress_msg;
         let mut step_details: Option<Document> = None;
         match outcome {
-            Ok(StepOutcome { chunk_id, message, details }) => {
+            Ok(StepOutcome {
+                verdict,
+                chunk_id,
+                message,
+                details,
+            }) => {
+                if verdict == StepVerdict::Committed {
+                    committed_steps += 1;
+                }
+                if verdict == StepVerdict::Committed {
+                    if let Some(cid) = chunk_id.as_deref() {
+                        needs_review.push(cid.to_string());
+                    }
+                }
                 if let Some(cid) = chunk_id.as_deref() {
                     entry.insert("chunkId", cid);
-                    needs_review.push(cid.to_string());
                 }
-                entry.insert("status", "ok");
+                entry.insert("status", verdict.as_str());
+                if verdict == StepVerdict::Failed && !message.trim().is_empty() {
+                    entry.insert("error", message.clone());
+                }
+                match verdict {
+                    StepVerdict::Committed => {}
+                    StepVerdict::Noop => noop_steps.push(step_id.clone()),
+                    StepVerdict::NeedsManual => needs_manual_steps.push(step_id.clone()),
+                    StepVerdict::Failed => failed_steps.push(step_id.clone()),
+                }
                 if let Some(d) = details.as_ref() {
                     entry.insert("repairDraft", d.clone());
                 }
                 progress_msg = format!(
-                    "第 {}/{} 步完成 · {} · {}",
+                    "第 {}/{} 步 {} · {} · {}",
                     idx + 1,
                     total,
+                    verdict.as_str(),
                     action,
-                    if message.is_empty() { summary_text.clone() } else { message }
+                    if message.is_empty() {
+                        summary_text.clone()
+                    } else {
+                        message
+                    }
                 );
                 step_details = details; // 供下方 write_progress_turn 的 turn details 使用
             }
@@ -372,9 +397,11 @@ pub async fn run_task(
         format!("AI 派工任务被运营取消（taskId={task_id}）")
     } else {
         format!(
-            "AI 派工任务已完成 · 共 {} 步 · 成功 {} · 失败 {} · 待运营审核 chunk {}",
+            "AI 派工任务已完成 · 共 {} 步 · committed {} · noop {} · needs_manual {} · failed {} · 待运营审核 chunk {}",
             total,
-            total.saturating_sub(failed_steps.len()),
+            committed_steps,
+            noop_steps.len(),
+            needs_manual_steps.len(),
             failed_steps.len(),
             dedup_review.len()
         )
@@ -392,6 +419,9 @@ pub async fn run_task(
             "status": final_status,
             "needsReviewChunkIds": dedup_review.iter().cloned().collect::<Vec<_>>(),
             "failedStepIds": failed_steps.iter().cloned().collect::<Vec<_>>(),
+            "needsManualStepIds": needs_manual_steps.iter().cloned().collect::<Vec<_>>(),
+            "noopStepIds": noop_steps.iter().cloned().collect::<Vec<_>>(),
+            "committedCount": committed_steps as i32,
             "completedSteps": completed_steps,
         },
     )
@@ -418,6 +448,9 @@ pub async fn run_task(
                     "status": final_status,
                     "totalSteps": total as i32,
                     "failedCount": failed_steps.len() as i32,
+                    "needsManualCount": needs_manual_steps.len() as i32,
+                    "noopCount": noop_steps.len() as i32,
+                    "committedCount": committed_steps as i32,
                     "needsReviewCount": dedup_review.len() as i32,
                 }),
                 created_at: DateTime::now(),
@@ -438,12 +471,39 @@ pub async fn run_task(
 }
 
 pub struct StepOutcome {
+    /// 业务结果，而不是 Rust 调用是否成功。Worker 必须按此字段汇总，不能把
+    /// `Ok(StepOutcome)` 一律记成成功。
+    pub verdict: StepVerdict,
     pub chunk_id: Option<String>,
     pub message: String,
     /// ③-b：fix_chunk 产的 AI 修复草稿（patch/missingFields/confidenceHint）。
     /// merge 进本 step 的 progress turn details，供运营在 chunk 编辑器审核。
     /// 其它 action 为 None。
     pub details: Option<Document>,
+}
+
+/// Knowledge task 单步的封闭业务结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepVerdict {
+    /// 已产生可审计产物或完成目标副作用。
+    Committed,
+    /// 输入合法，但当前状态无需再次变更。
+    Noop,
+    /// 自动路径未完成，且存在明确的运营后续动作。
+    NeedsManual,
+    /// 缺参、非法/不存在目标或持久化失败。
+    Failed,
+}
+
+impl StepVerdict {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Committed => "committed",
+            Self::Noop => "noop",
+            Self::NeedsManual => "needs_manual",
+            Self::Failed => "failed",
+        }
+    }
 }
 
 /// 执行单个 step；不同 action 走不同 fail-soft 路径，但都不写 verified、不发送 outbox。
@@ -463,6 +523,7 @@ pub async fn execute_step(
             let Some(cid) = chunk_id.clone() else {
                 // 无 targetChunkId：退回文案，不阻断（fail-soft）。
                 return Ok(StepOutcome {
+                    verdict: StepVerdict::Failed,
                     chunk_id: None,
                     message: "缺 targetChunkId，未生成修复草稿".to_string(),
                     details: None,
@@ -470,6 +531,7 @@ pub async fn execute_step(
             };
             let Ok(object_id) = ObjectId::parse_str(&cid) else {
                 return Ok(StepOutcome {
+                    verdict: StepVerdict::Failed,
                     chunk_id: Some(cid.clone()),
                     message: format!("targetChunkId={cid} 非法，未生成修复草稿"),
                     details: None,
@@ -478,7 +540,10 @@ pub async fn execute_step(
             let run_id = format!("knowledge-task-fix-{}", cid);
             // 已在外层 RUN_BUDGET.scope(STEP budget) 内；inner 不自建 scope。
             match crate::routes::knowledge::propose_chunk_repair_inner(
-                state, workspace_id, object_id, &run_id,
+                state,
+                workspace_id,
+                object_id,
+                &run_id,
             )
             .await
             {
@@ -496,6 +561,7 @@ pub async fn execute_step(
                         .map(|a| a.len())
                         .unwrap_or(0);
                     Ok(StepOutcome {
+                        verdict: StepVerdict::Committed,
                         chunk_id: Some(cid.clone()),
                         message: format!(
                             "已为 chunk {cid} 生成 AI 修复草稿（含 {missing_n} 个待补字段），请运营在 chunk 编辑器审核后 apply"
@@ -505,6 +571,7 @@ pub async fn execute_step(
                 }
                 // budget 超额 / LLM 失败：fail-soft，仍把 chunk 推入待审池。
                 Err(err) => Ok(StepOutcome {
+                    verdict: StepVerdict::NeedsManual,
                     chunk_id: Some(cid.clone()),
                     message: format!(
                         "chunk {cid} 修复草稿生成失败（{err}，fail-soft），请运营在编辑器手动处理"
@@ -517,6 +584,7 @@ pub async fn execute_step(
             let summary = step.get_str("summary").unwrap_or("").trim().to_string();
             if summary.is_empty() {
                 return Ok(StepOutcome {
+                    verdict: StepVerdict::Failed,
                     chunk_id: None,
                     message: "缺 summary 上下文，未起草新条目".to_string(),
                     details: None,
@@ -544,10 +612,18 @@ pub async fn execute_step(
 
 只输出 JSON 起草一条新切片草稿。"#
             );
-            let run_id = format!("knowledge-task-add-{}", step.get_str("stepId").unwrap_or(""));
+            let run_id = format!(
+                "knowledge-task-add-{}",
+                step.get_str("stepId").unwrap_or("")
+            );
             match crate::agent::generate_agent_json(
-                state, Some(_account_id), None, Some(&run_id),
-                "knowledge.chat.draft_chunk", &system, &user,
+                state,
+                Some(_account_id),
+                None,
+                Some(&run_id),
+                "knowledge.chat.draft_chunk",
+                &system,
+                &user,
             )
             .await
             {
@@ -558,6 +634,7 @@ pub async fn execute_step(
                         .unwrap_or_default();
                     if patch.is_empty() {
                         return Ok(StepOutcome {
+                            verdict: StepVerdict::Failed,
                             chunk_id: None,
                             message: "AI 未产出可落库的草稿字段".to_string(),
                             details: None,
@@ -567,7 +644,13 @@ pub async fn execute_step(
                     // account_id 传 None → 落 workspace 共享域（与 chat 新建一致）。
                     // operator_statement=summary 作为溯源陈述驱动 sourceQuote 锚定。
                     match crate::routes::knowledge::apply_create_chunk(
-                        state, workspace_id, None, "knowledge-task", &patch, None, &summary,
+                        state,
+                        workspace_id,
+                        None,
+                        "knowledge-task",
+                        &patch,
+                        None,
+                        &summary,
                     )
                     .await
                     {
@@ -575,17 +658,29 @@ pub async fn execute_step(
                             let new_id = res
                                 .get("createdChunkId")
                                 .and_then(|v| v.as_str())
+                                .filter(|s| !s.trim().is_empty())
                                 .map(|s| s.to_string());
+                            let (verdict, message) = if let Some(id) = new_id.as_deref() {
+                                (
+                                    StepVerdict::Committed,
+                                    format!("已起草新知识切片草稿：{id}，请运营在编辑器审核"),
+                                )
+                            } else {
+                                (
+                                    StepVerdict::Failed,
+                                    "起草落库返回成功但缺 createdChunkId，无法确认草稿产物"
+                                        .to_string(),
+                                )
+                            };
                             Ok(StepOutcome {
-                                chunk_id: new_id.clone(),
-                                message: format!(
-                                    "已起草新知识切片草稿{}，请运营在编辑器审核",
-                                    new_id.map(|i| format!("：{i}")).unwrap_or_default()
-                                ),
+                                verdict,
+                                chunk_id: new_id,
+                                message,
                                 details: None,
                             })
                         }
                         Err(err) => Ok(StepOutcome {
+                            verdict: StepVerdict::Failed,
                             chunk_id: None,
                             message: format!("起草落库失败（{err}，fail-soft）"),
                             details: None,
@@ -593,6 +688,7 @@ pub async fn execute_step(
                     }
                 }
                 Err(err) => Ok(StepOutcome {
+                    verdict: StepVerdict::Failed,
                     chunk_id: None,
                     message: format!("起草生成失败（{err}，fail-soft）"),
                     details: None,
@@ -602,6 +698,7 @@ pub async fn execute_step(
         "retag" => {
             let Some(cid) = step.get_str("targetChunkId").ok().map(|s| s.to_string()) else {
                 return Ok(StepOutcome {
+                    verdict: StepVerdict::Failed,
                     chunk_id: None,
                     message: "缺 targetChunkId，未重抽标签".to_string(),
                     details: None,
@@ -609,6 +706,7 @@ pub async fn execute_step(
             };
             let Ok(object_id) = ObjectId::parse_str(&cid) else {
                 return Ok(StepOutcome {
+                    verdict: StepVerdict::Failed,
                     chunk_id: Some(cid.clone()),
                     message: format!("targetChunkId={cid} 非法，未重抽标签"),
                     details: None,
@@ -617,10 +715,14 @@ pub async fn execute_step(
             let chunk = state
                 .db
                 .operation_knowledge_chunks()
-                .find_one(doc! { "_id": object_id, "workspace_id": workspace_id }, None)
+                .find_one(
+                    doc! { "_id": object_id, "workspace_id": workspace_id },
+                    None,
+                )
                 .await?;
             let Some(chunk) = chunk else {
                 return Ok(StepOutcome {
+                    verdict: StepVerdict::Failed,
                     chunk_id: Some(cid.clone()),
                     message: format!("chunk {cid} 不存在，未重抽标签"),
                     details: None,
@@ -643,10 +745,16 @@ pub async fn execute_step(
                     // apply_update_chunk 强制 status=draft + integrity_status=needs_review。
                     // operator_statement 传空（retag 不改 sourceQuote，不触发重锚定）。
                     crate::routes::knowledge::apply_update_chunk(
-                        state, workspace_id, _account_id, &cid, &patch, "",
+                        state,
+                        workspace_id,
+                        _account_id,
+                        &cid,
+                        &patch,
+                        "",
                     )
                     .await?;
                     Ok(StepOutcome {
+                        verdict: StepVerdict::Committed,
                         chunk_id: Some(cid.clone()),
                         message: format!(
                             "已为 chunk {cid} 重抽标签（产品 {} / 主题 {}），落为待确认草稿",
@@ -657,6 +765,7 @@ pub async fn execute_step(
                     })
                 }
                 Err(err) => Ok(StepOutcome {
+                    verdict: StepVerdict::NeedsManual,
                     chunk_id: Some(cid.clone()),
                     message: format!("chunk {cid} 重抽标签失败（{err}，fail-soft）"),
                     details: None,
@@ -664,8 +773,10 @@ pub async fn execute_step(
             }
         }
         "review_evolution" => Ok(StepOutcome {
+            verdict: StepVerdict::NeedsManual,
             chunk_id: None,
-            message: "本项需人工评估：请到「自优化中心」查看并裁决候选提案，AI 不自动放量".to_string(),
+            message: "本项需人工评估：请到「自优化中心」查看并裁决候选提案，AI 不自动放量"
+                .to_string(),
             details: None,
         }),
         "analyze_logs" => {
@@ -704,6 +815,11 @@ pub async fn execute_step(
                 .map(|(k, n)| doc! { "kind": k, "count": *n })
                 .collect();
             Ok(StepOutcome {
+                verdict: if total == 0 {
+                    StepVerdict::Noop
+                } else {
+                    StepVerdict::Committed
+                },
                 chunk_id: None,
                 message: format!("已汇总近 24h 拦截/暂缓事件 {} 条（详见 turn 详情）", total),
                 details: Some(doc! { "analyzeLogsTotal": total, "byKind": top }),
@@ -724,7 +840,7 @@ pub async fn execute_step(
                 if !report_date.is_empty() {
                     filter.insert("report_date", &report_date);
                 }
-                let _ = state
+                let update = state
                     .db
                     .knowledge_daily_reports()
                     .update_one(
@@ -732,14 +848,29 @@ pub async fn execute_step(
                         doc! { "$addToSet": { "dismissed_card_ids": card_oid } },
                         None,
                     )
-                    .await;
+                    .await?;
+                let (verdict, message) = if update.matched_count == 0 {
+                    (
+                        StepVerdict::Failed,
+                        format!("卡片 {card_id_hex} 不属于当前 workspace/report，未忽略"),
+                    )
+                } else if update.modified_count == 0 {
+                    (
+                        StepVerdict::Noop,
+                        format!("卡片 {card_id_hex} 已处于忽略状态"),
+                    )
+                } else {
+                    (StepVerdict::Committed, format!("已忽略卡片 {card_id_hex}"))
+                };
                 Ok(StepOutcome {
+                    verdict,
                     chunk_id: None,
-                    message: format!("已忽略卡片 {card_id_hex}"),
+                    message,
                     details: None,
                 })
             } else {
                 Ok(StepOutcome {
+                    verdict: StepVerdict::Failed,
                     chunk_id: None,
                     message: "缺有效 cardId，未忽略卡片".to_string(),
                     details: None,

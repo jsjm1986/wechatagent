@@ -69,7 +69,9 @@ async fn publish_preserves_evolution_history_rows() {
         State(app.state.clone()),
         Extension(test_admin(&ws)),
         Path(draft_id.clone()),
-        Some(Json(serde_json::from_value(json!({ "force": true })).unwrap())),
+        Some(Json(
+            serde_json::from_value(json!({ "force": true })).unwrap(),
+        )),
     )
     .await
     .expect("publish ok");
@@ -80,7 +82,10 @@ async fn publish_preserves_evolution_history_rows() {
         .state
         .db
         .prompt_templates()
-        .find_one(doc! { "workspace_id": &ws, "prompt_key": key, "version": 2 }, None)
+        .find_one(
+            doc! { "workspace_id": &ws, "prompt_key": key, "version": 2 },
+            None,
+        )
         .await
         .unwrap();
     assert!(
@@ -93,7 +98,10 @@ async fn publish_preserves_evolution_history_rows() {
         .state
         .db
         .prompt_templates()
-        .find_one(doc! { "workspace_id": &ws, "prompt_key": key, "version": 1 }, None)
+        .find_one(
+            doc! { "workspace_id": &ws, "prompt_key": key, "version": 1 },
+            None,
+        )
         .await
         .unwrap();
     assert!(sys_after.is_none(), "非 evolution 历史行应被 publish 清理");
@@ -103,11 +111,17 @@ async fn publish_preserves_evolution_history_rows() {
         .state
         .db
         .prompt_templates()
-        .find_one(doc! { "workspace_id": &ws, "prompt_key": key, "version": 3 }, None)
+        .find_one(
+            doc! { "workspace_id": &ws, "prompt_key": key, "version": 3 },
+            None,
+        )
         .await
         .unwrap()
         .expect("v3 row");
-    assert_eq!(draft_after.status, "active", "被 publish 的 draft 应转 active");
+    assert_eq!(
+        draft_after.status, "active",
+        "被 publish 的 draft 应转 active"
+    );
 
     // 断言 4：检测到 evolution 行时写了观测事件（边缘副作用可见）。
     let ev = app
@@ -120,5 +134,8 @@ async fn publish_preserves_evolution_history_rows() {
         )
         .await
         .unwrap();
-    assert!(ev.is_some(), "检测到 evolution 行时应写 prompt_publish_kept_evolution_rows 观测事件");
+    assert!(
+        ev.is_some(),
+        "检测到 evolution 行时应写 prompt_publish_kept_evolution_rows 观测事件"
+    );
 }

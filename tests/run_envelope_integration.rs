@@ -108,8 +108,7 @@ async fn same_run_id_second_insert_triggers_duplicate_key_error() {
     );
     let err_msg = format!("{:?}", result.unwrap_err());
     assert!(
-        err_msg.to_lowercase().contains("duplicate")
-            || err_msg.to_lowercase().contains("e11000"),
+        err_msg.to_lowercase().contains("duplicate") || err_msg.to_lowercase().contains("e11000"),
         "错误信息 SHALL 含 duplicate 关键字, err={}",
         err_msg
     );

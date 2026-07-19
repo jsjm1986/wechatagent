@@ -253,7 +253,10 @@ mod tests {
     #[test]
     fn dual_gate_rejects_forbidden_words() {
         // 禁用词闸：写回含禁用词被拒（fail-closed）
-        let bad = format!("{DEFAULT_MODE_GATE_POLICY}\n遇到难题就{}", forbidden_phrase());
+        let bad = format!(
+            "{DEFAULT_MODE_GATE_POLICY}\n遇到难题就{}",
+            forbidden_phrase()
+        );
         assert!(validate_prompt_edit("user.reply.policy", &bad).is_err());
     }
 
@@ -353,7 +356,10 @@ mod tests {
         assert!(composed.starts_with("正文\n\n"));
         assert!(composed.contains("追加片段"));
         // 不产生多余尾部空白行
-        assert_eq!(composed.trim_end(), composed.trim_end_matches('\n').trim_end());
+        assert_eq!(
+            composed.trim_end(),
+            composed.trim_end_matches('\n').trim_end()
+        );
     }
 
     // ── classify_review_verdict：第三闸 JSON→三态判定（收紧 fail-open 回归门）──

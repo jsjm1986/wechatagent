@@ -20,7 +20,12 @@ use wechatagent::routes::ext_knowledge::build_operation_knowledge_integrity_repo
 
 use crate::common::TestApp;
 
-fn chunk(workspace_id: &str, title: &str, status: &str, with_anchor: bool) -> OperationKnowledgeChunk {
+fn chunk(
+    workspace_id: &str,
+    title: &str,
+    status: &str,
+    with_anchor: bool,
+) -> OperationKnowledgeChunk {
     let source_anchors = if with_anchor {
         let mut anchor = Document::new();
         anchor.insert("documentId", "doc_test");

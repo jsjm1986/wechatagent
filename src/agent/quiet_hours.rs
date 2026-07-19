@@ -71,7 +71,12 @@ pub(crate) fn jitter_ms_for_seed(seed: &str, max_seconds: u32) -> i64 {
 /// `end`:00 + jitter"对应的 UTC 毫秒。严格在 `now` 之后（恰好命中 `end`:00 也取次日，
 /// 保证 wake 落在未来，与旧 `next_wake_instant` 的"严格大于"语义一致）。jitter 把同一
 /// workspace 多客户的整点唤醒散开（per-contact 确定性偏移，见 [`jitter_ms_for_seed`]）。
-pub(crate) fn next_wake_utc_ms(now_utc_ms: i64, end: u32, tz_offset_hours: i32, jitter_ms: i64) -> i64 {
+pub(crate) fn next_wake_utc_ms(
+    now_utc_ms: i64,
+    end: u32,
+    tz_offset_hours: i32,
+    jitter_ms: i64,
+) -> i64 {
     let off = (tz_offset_hours as i64) * 3_600_000;
     let local_ms = now_utc_ms + off;
     let day = local_ms.div_euclid(86_400_000); // 本地"第几天"

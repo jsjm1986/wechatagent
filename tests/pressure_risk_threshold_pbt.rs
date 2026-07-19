@@ -16,7 +16,9 @@
 //! 不接 mongo / mock LLM —— 纯 in-memory `review_passed` 调用。
 
 use proptest::prelude::*;
-use wechatagent::agent::{review_passed, DecisionReviewResult, ReviewScores, UserRuntimeParameters};
+use wechatagent::agent::{
+    review_passed, DecisionReviewResult, ReviewScores, UserRuntimeParameters,
+};
 
 fn full_pass_review(pressure_risk: i32) -> DecisionReviewResult {
     DecisionReviewResult {

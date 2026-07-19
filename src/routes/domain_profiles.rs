@@ -65,7 +65,8 @@ pub(super) async fn list_domain_profiles(
     Extension(admin): Extension<AuthenticatedAdmin>,
     Query(params): Query<ListQuery>,
 ) -> AppResult<Json<Value>> {
-    let workspace_id = resolve_authorized_workspace(&state, &admin, params.workspace_id.clone()).await?;
+    let workspace_id =
+        resolve_authorized_workspace(&state, &admin, params.workspace_id.clone()).await?;
     let mut filter = doc! { "workspace_id": &workspace_id };
     if !params.include_all_versions {
         filter.insert("current_version", true);
@@ -165,12 +166,12 @@ pub async fn create_domain_profile(
     Extension(admin): Extension<AuthenticatedAdmin>,
     Json(body): Json<UpsertRequest>,
 ) -> AppResult<Json<Value>> {
-    let workspace_id = resolve_authorized_workspace(&state, &admin, body.workspace_id.clone()).await?;
+    let workspace_id =
+        resolve_authorized_workspace(&state, &admin, body.workspace_id.clone()).await?;
     if body.profile_id.trim().is_empty() {
         return Err(AppError::BadRequest("profileId 不能为空".to_string()));
     }
-    let next_version =
-        next_version_for_profile(&state, &workspace_id, &body.profile_id).await?;
+    let next_version = next_version_for_profile(&state, &workspace_id, &body.profile_id).await?;
     let now = DateTime::now();
     // 用请求 body 反序列化成 DomainProfile,再强制覆盖后端管理字段。
     let mut doc = body.profile.clone();
@@ -188,7 +189,11 @@ pub async fn create_domain_profile(
     profile.seeded_by = profile.seeded_by.or_else(|| Some("manual".to_string()));
     profile.created_at = now;
     profile.updated_at = now;
-    let inserted = state.db.domain_profiles().insert_one(&profile, None).await?;
+    let inserted = state
+        .db
+        .domain_profiles()
+        .insert_one(&profile, None)
+        .await?;
     profile.id = inserted.inserted_id.as_object_id();
     Ok(Json(json!({ "item": profile_view(&profile) })))
 }
@@ -336,7 +341,7 @@ pub async fn publish_domain_profile(
         published.current_version = false;
         let inserted = coll.insert_one(&published, None).await?;
         let new_id = inserted.inserted_id.as_object_id();
-        invalidate_global_domain_profile_cache();
+        invalidate_global_domain_profile_cache(&state.db);
         return Ok(Json(json!({
             "ok": true,
             "pendingActivation": true,
@@ -368,7 +373,7 @@ pub async fn publish_domain_profile(
         realign_active_to_current(&coll, &source.workspace_id, &source.profile_id, nid, now)
             .await?;
     }
-    invalidate_global_domain_profile_cache();
+    invalidate_global_domain_profile_cache(&state.db);
     Ok(Json(json!({
         "ok": true,
         "id": new_id.map(|i| i.to_hex()).unwrap_or_default(),
@@ -411,9 +416,15 @@ pub async fn rollout_domain_profile(
     .await?;
     // 不变量对齐：current 已移到 object_id，若血缘原本生效则把 is_active 一并迁过来，
     // 避免 active 行非 current → 运行时静默回落 DEFAULT。
-    realign_active_to_current(&coll, &target.workspace_id, &target.profile_id, object_id, now)
-        .await?;
-    invalidate_global_domain_profile_cache();
+    realign_active_to_current(
+        &coll,
+        &target.workspace_id,
+        &target.profile_id,
+        object_id,
+        now,
+    )
+    .await?;
+    invalidate_global_domain_profile_cache(&state.db);
     Ok(Json(json!({ "ok": true, "version": target.version })))
 }
 
@@ -446,7 +457,9 @@ pub async fn rollback_domain_profile(
         )
         .await?
         .ok_or_else(|| {
-            AppError::BadRequest(format!("previous version {prev_version} not found for rollback"))
+            AppError::BadRequest(format!(
+                "previous version {prev_version} not found for rollback"
+            ))
         })?;
     let prev_id = prev
         .id
@@ -469,9 +482,15 @@ pub async fn rollback_domain_profile(
     )
     .await?;
     // 不变量对齐：current 已回退到 prev_id，若血缘原本生效则把 is_active 一并迁过来。
-    realign_active_to_current(&coll, &target.workspace_id, &target.profile_id, prev_id, now)
-        .await?;
-    invalidate_global_domain_profile_cache();
+    realign_active_to_current(
+        &coll,
+        &target.workspace_id,
+        &target.profile_id,
+        prev_id,
+        now,
+    )
+    .await?;
+    invalidate_global_domain_profile_cache(&state.db);
     Ok(Json(json!({ "ok": true, "rolledBackTo": prev_version })))
 }
 
@@ -572,11 +591,8 @@ pub async fn activate_domain_profile(
                         );
                     } else {
                         let initial_key =
-                            crate::agent::initial_operation_state_key_in_machine(Some(
-                                machine,
-                            ));
-                        let nin: Vec<Bson> =
-                            new_keys.iter().cloned().map(Bson::String).collect();
+                            crate::agent::initial_operation_state_key_in_machine(Some(machine));
+                        let nin: Vec<Bson> = new_keys.iter().cloned().map(Bson::String).collect();
                         match state
                             .db
                             .contacts()
@@ -638,7 +654,7 @@ pub async fn activate_domain_profile(
             }
         }
     }
-    invalidate_global_domain_profile_cache();
+    invalidate_global_domain_profile_cache(&state.db);
     Ok(Json(json!({ "ok": true, "activated": target.profile_id })))
 }
 
@@ -807,10 +823,7 @@ async fn next_version_for_profile(
     workspace_id: &str,
     profile_id: &str,
 ) -> AppResult<i32> {
-    let raw = state
-        .db
-        .domain_profiles()
-        .clone_with_type::<Document>();
+    let raw = state.db.domain_profiles().clone_with_type::<Document>();
     let mut cursor = raw
         .find(
             doc! { "workspace_id": workspace_id, "profile_id": profile_id },
@@ -878,7 +891,10 @@ mod tests {
         assert_eq!(current.len(), 1, "demote 后只一条 current_version");
         assert_eq!(current[0].0, 2);
         // demote 子步本身不动 is_active（is_active 的迁移由后续 realign 子步负责）。
-        assert!(rows[0].2, "demote 子步不改 is_active：版本1 此刻仍标 active");
+        assert!(
+            rows[0].2,
+            "demote 子步不改 is_active：版本1 此刻仍标 active"
+        );
         assert!(!rows[1].2, "demote 子步不激活版本2（realign 才迁移）");
     }
 
@@ -912,8 +928,16 @@ mod tests {
         let mut rows = vec![(1, true, true), (2, true, false)];
         publish_demote_current(&mut rows, 2);
         realign_active_to_current_sim(&mut rows, 2);
-        let current: Vec<_> = rows.iter().filter(|(_, c, _)| *c).map(|(v, _, _)| *v).collect();
-        let active: Vec<_> = rows.iter().filter(|(_, _, a)| *a).map(|(v, _, _)| *v).collect();
+        let current: Vec<_> = rows
+            .iter()
+            .filter(|(_, c, _)| *c)
+            .map(|(v, _, _)| *v)
+            .collect();
+        let active: Vec<_> = rows
+            .iter()
+            .filter(|(_, _, a)| *a)
+            .map(|(v, _, _)| *v)
+            .collect();
         assert_eq!(current, vec![2], "publish 后唯一 current=版本2");
         assert_eq!(active, vec![2], "realign 后 active 迁到版本2");
         // 充要条件成立:版本2 既 current 又 active → 立即可加载,无静默降级。
@@ -927,7 +951,10 @@ mod tests {
         let mut rows = vec![(1, true, false), (2, true, false)];
         publish_demote_current(&mut rows, 2);
         realign_active_to_current_sim(&mut rows, 2);
-        assert!(rows.iter().all(|(_, _, a)| !*a), "血缘从未 active → realign 不动 is_active");
+        assert!(
+            rows.iter().all(|(_, _, a)| !*a),
+            "血缘从未 active → realign 不动 is_active"
+        );
     }
 
     /// 红线钉死：AI 生成候选（`guide_profile::generate_domain_profile_candidate` 落库
@@ -951,7 +978,11 @@ mod tests {
         );
         // 必须显式 activate v2 才生效。
         activate_single(&mut rows, 2);
-        let active: Vec<_> = rows.iter().filter(|(_, _, a)| *a).map(|(v, _, _)| *v).collect();
+        let active: Vec<_> = rows
+            .iter()
+            .filter(|(_, _, a)| *a)
+            .map(|(v, _, _)| *v)
+            .collect();
         assert_eq!(active, vec![2], "人审 activate 后 v2 才生效");
         // 此刻 v2 既 current 又 active → 运行时可加载。
         assert_eq!(rows.iter().filter(|(_, c, a)| *c && *a).count(), 1);
@@ -967,7 +998,11 @@ mod tests {
             *cur = *v == 1;
         }
         realign_active_to_current_sim(&mut rows, 1);
-        let loadable: Vec<_> = rows.iter().filter(|(_, c, a)| *c && *a).map(|(v, _, _)| *v).collect();
+        let loadable: Vec<_> = rows
+            .iter()
+            .filter(|(_, c, a)| *c && *a)
+            .map(|(v, _, _)| *v)
+            .collect();
         assert_eq!(loadable, vec![1], "rollback 后版本1 既 current 又 active");
     }
 
@@ -992,9 +1027,23 @@ mod tests {
         // 只保留内容键。
         assert_eq!(set_doc.len(), 2, "只剩两个内容键");
         assert_eq!(set_doc.get_str("display_name").unwrap(), "情感陪伴");
-        assert_eq!(set_doc.get_bool("grounding_gate_bypass_without_claim").unwrap(), true);
+        assert_eq!(
+            set_doc
+                .get_bool("grounding_gate_bypass_without_claim")
+                .unwrap(),
+            true
+        );
         // 所有后端管理键被剥离。
-        for k in ["is_active", "version", "current_version", "seeded_by", "_id", "id", "workspace_id", "profile_id"] {
+        for k in [
+            "is_active",
+            "version",
+            "current_version",
+            "seeded_by",
+            "_id",
+            "id",
+            "workspace_id",
+            "profile_id",
+        ] {
             assert!(set_doc.get(k).is_none(), "后端管理键 {k} 必须被剥离");
         }
     }
@@ -1026,8 +1075,8 @@ mod tests {
             "description": "改简介",
             "conversation_mode_policy": "## 对话模式判定\n\n用户表达情绪 → empathetic_support。"
         });
-        let req: super::UpsertRequest =
-            serde_json::from_value(body).expect("缺 profileId 的 body 应能反序列化（update 路径不消费它）");
+        let req: super::UpsertRequest = serde_json::from_value(body)
+            .expect("缺 profileId 的 body 应能反序列化（update 路径不消费它）");
         // profile_id 走 default = 空串（update 路径不读它，用 existing.profile_id）。
         assert_eq!(req.profile_id, "");
         // workspaceId 缺省也走 default = None。
@@ -1104,11 +1153,17 @@ mod tests {
 
         let mut p = base.clone();
         p.methodology_override = Some("换方法论".to_string());
-        assert_eq!(risky_fields_changed(&base, &p), vec!["methodology_override"]);
+        assert_eq!(
+            risky_fields_changed(&base, &p),
+            vec!["methodology_override"]
+        );
 
         let mut p = base.clone();
         p.conversation_mode_policy = Some("## 对话模式判定\n换判定规则".to_string());
-        assert_eq!(risky_fields_changed(&base, &p), vec!["conversation_mode_policy"]);
+        assert_eq!(
+            risky_fields_changed(&base, &p),
+            vec!["conversation_mode_policy"]
+        );
 
         let mut p = base.clone();
         p.grounding_gate_bypass_without_claim = !base.grounding_gate_bypass_without_claim;
@@ -1191,7 +1246,10 @@ mod tests {
             .outcome_polarity
             .positive
             .push("emotional_disclosure".to_string());
-        assert_eq!(risky_fields_changed(&base, &edited), vec!["outcome_polarity"]);
+        assert_eq!(
+            risky_fields_changed(&base, &edited),
+            vec!["outcome_polarity"]
+        );
     }
 
     /// publish 危险分支：落「旁路稿」(current=false)，不动正在生效的旧版本。
@@ -1204,9 +1262,21 @@ mod tests {
         // 危险 publish：插入 v2 旁路稿 current=false、is_active=false；**不** demote v1。
         rows.push((2, false, false));
         // 危险分支既不 demote 也不 realign：rows 保持原样。
-        let current: Vec<_> = rows.iter().filter(|(_, c, _)| *c).map(|(v, _, _)| *v).collect();
-        let active: Vec<_> = rows.iter().filter(|(_, _, a)| *a).map(|(v, _, _)| *v).collect();
-        assert_eq!(current, vec![1], "旁路稿不占 current，v1 仍唯一 current（零窗口）");
+        let current: Vec<_> = rows
+            .iter()
+            .filter(|(_, c, _)| *c)
+            .map(|(v, _, _)| *v)
+            .collect();
+        let active: Vec<_> = rows
+            .iter()
+            .filter(|(_, _, a)| *a)
+            .map(|(v, _, _)| *v)
+            .collect();
+        assert_eq!(
+            current,
+            vec![1],
+            "旁路稿不占 current，v1 仍唯一 current（零窗口）"
+        );
         assert_eq!(active, vec![1], "v1 仍唯一 active，运行时不回落 DEFAULT");
         // 充要条件：v1 既 current 又 active，运行时继续加载旧版本。
         assert_eq!(rows.iter().filter(|(_, c, a)| *c && *a).count(), 1);
@@ -1229,7 +1299,11 @@ mod tests {
             .filter(|(_, c, a)| *c && *a)
             .map(|(v, _, _)| *v)
             .collect();
-        assert_eq!(loadable, vec![2], "确认后 v2 既 current 又 active，唯一可加载");
+        assert_eq!(
+            loadable,
+            vec![2],
+            "确认后 v2 既 current 又 active，唯一可加载"
+        );
         // 单 current 不变量保持。
         assert_eq!(rows.iter().filter(|(_, c, _)| *c).count(), 1);
     }

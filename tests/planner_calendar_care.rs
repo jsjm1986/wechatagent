@@ -106,7 +106,10 @@ fn memory_with_today_anniversary(wxid: &str) -> OperatingMemory {
         context_pack: Document::new(),
         context_pack_version: 0,
         context_pack_updated_at: None,
-        memory_card: MemoryCardTyped { extra, ..Default::default() },
+        memory_card: MemoryCardTyped {
+            extra,
+            ..Default::default()
+        },
         memory_card_version: 1,
         memory_card_updated_at: Some(now),
         created_at: now,
@@ -122,7 +125,7 @@ async fn seed_active_profile(db: &wechatagent::db::Database, mut profile: Domain
         .insert_one(&profile, None)
         .await
         .expect("insert active profile");
-    invalidate_global_domain_profile_cache();
+    invalidate_global_domain_profile_cache(db);
 }
 
 #[tokio::test]
@@ -132,7 +135,11 @@ async fn calendar_care_emits_for_emotional_profile_today_anniversary() {
     let app = common::TestApp::start().await;
 
     // 情感陪伴 profile：calendar 开 + anniversaries date_dimension。
-    seed_active_profile(&app.state.db, example_emotional_companion_profile(WORKSPACE)).await;
+    seed_active_profile(
+        &app.state.db,
+        example_emotional_companion_profile(WORKSPACE),
+    )
+    .await;
 
     let contact = contact_template("user_companion");
     app.state
@@ -163,14 +170,24 @@ async fn calendar_care_emits_for_emotional_profile_today_anniversary() {
             .await
             .expect("collect tasks")
     };
-    assert_eq!(tasks.len(), 1, "今日纪念日应 emit 一条 calendar_care follow_up");
+    assert_eq!(
+        tasks.len(),
+        1,
+        "今日纪念日应 emit 一条 calendar_care follow_up"
+    );
     assert!(
         tasks[0].content.starts_with("Planner: calendar_care"),
         "content 应以 Planner: calendar_care 起头，实际: {}",
         tasks[0].content
     );
-    assert!(tasks[0].content.contains("她生日"), "content 应含纪念日标签");
-    assert!(tasks[0].review_required, "calendar_care follow_up 必须保留 review_required");
+    assert!(
+        tasks[0].content.contains("她生日"),
+        "content 应含纪念日标签"
+    );
+    assert!(
+        tasks[0].review_required,
+        "calendar_care follow_up 必须保留 review_required"
+    );
 
     let emit_events = app
         .state
@@ -179,10 +196,15 @@ async fn calendar_care_emits_for_emotional_profile_today_anniversary() {
         .count_documents(doc! { "kind": "strategic_planner_calendar_care" }, None)
         .await
         .expect("count care events");
-    assert_eq!(emit_events, 1, "应写一条 strategic_planner_calendar_care 事件");
+    assert_eq!(
+        emit_events, 1,
+        "应写一条 strategic_planner_calendar_care 事件"
+    );
 
     // 幂等：再 tick，已有 pending follow_up → 不重复 emit。
-    planner::tick(&app.state).await.expect("second planner tick");
+    planner::tick(&app.state)
+        .await
+        .expect("second planner tick");
     let after = app
         .state
         .db
@@ -226,7 +248,10 @@ async fn calendar_care_no_emit_for_default_sales_profile() {
         .count_documents(doc! { "kind": "strategic_planner_calendar_care" }, None)
         .await
         .expect("count care events");
-    assert_eq!(care_events, 0, "DEFAULT 销售域不应触发 calendar_care（零扰动）");
+    assert_eq!(
+        care_events, 0,
+        "DEFAULT 销售域不应触发 calendar_care（零扰动）"
+    );
 
     // calendar tick 事件也不应写（无 date_dimension → 提前 return，连 tick 事件都不写）。
     let tick_events = app
@@ -236,5 +261,8 @@ async fn calendar_care_no_emit_for_default_sales_profile() {
         .count_documents(doc! { "kind": "strategic_planner_calendar_tick" }, None)
         .await
         .expect("count calendar tick events");
-    assert_eq!(tick_events, 0, "无 date_dimension 维度时 scan_calendar 应提前短路、不写 tick");
+    assert_eq!(
+        tick_events, 0,
+        "无 date_dimension 维度时 scan_calendar 应提前短路、不写 tick"
+    );
 }

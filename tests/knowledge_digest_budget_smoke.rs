@@ -25,7 +25,10 @@ fn digest_budget_exceeded_when_llm_calls_reach_cap() {
     budget.record_call(100);
     assert!(!budget.is_exceeded(), "2 < 3, 不应超额");
     budget.record_call(100);
-    assert!(budget.is_exceeded(), "llm_calls_used=3 >= max_llm_calls=3 必须触发");
+    assert!(
+        budget.is_exceeded(),
+        "llm_calls_used=3 >= max_llm_calls=3 必须触发"
+    );
 }
 
 #[test]

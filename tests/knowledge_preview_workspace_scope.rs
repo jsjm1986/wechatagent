@@ -59,10 +59,7 @@ async fn preview_without_contact_scopes_to_passed_workspace() {
     // 在非 default 的 ws_a 插一条 active+verified chunk(含可命中关键词)。
     // 记下其 id,断言时用 id 判隔离——不依赖 default 库恰好为空。
     let chunk = verified_chunk("ws_a", "保修政策", "测试产品保修两年");
-    let ws_a_chunk_id = chunk
-        .id
-        .expect("chunk has id")
-        .to_hex();
+    let ws_a_chunk_id = chunk.id.expect("chunk has id").to_hex();
     app.state
         .db
         .operation_knowledge_chunks()
@@ -101,10 +98,9 @@ async fn preview_without_contact_scopes_to_passed_workspace() {
     // 用 id 判“不包含”而非整体 count==0:即便 default 被 seed 了别的 verified chunk,
     // 只要 ws_a 的这条不可见即证明隔离成立,消除 default corpus 非空时的假红。
     let default_ws = app.state.config.default_workspace_id.clone();
-    let miss =
-        test_knowledge_route_for_contact(&app.state, None, &default_ws, "acc_a", "保修多久")
-            .await
-            .expect("route default");
+    let miss = test_knowledge_route_for_contact(&app.state, None, &default_ws, "acc_a", "保修多久")
+        .await
+        .expect("route default");
     let ids_def = selected_chunk_ids(&miss);
     assert!(
         !ids_def.contains(&ws_a_chunk_id),

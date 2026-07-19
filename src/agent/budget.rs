@@ -29,9 +29,7 @@ use parking_lot::Mutex as PlMutex;
 pub enum BudgetError {
     /// `tool_calls_used >= tool_call_budget`：任何后续 tool call SHALL
     /// 立即返回 `budget_exceeded` 而不实际执行（R4.3）。
-    #[error(
-        "tool_call budget exceeded: tool_calls_used={used} >= tool_call_budget={budget}"
-    )]
+    #[error("tool_call budget exceeded: tool_calls_used={used} >= tool_call_budget={budget}")]
     ToolCallsExceeded { used: i32, budget: i32 },
     /// `tokens_used + tokens_consumed > token_budget`：本次 tool call 想
     /// 累计的 snippet / body token 数会越过 token 硬上限（R4.3）。
@@ -307,7 +305,10 @@ mod tests {
         budget.grant_escalated_ceiling(100_000);
         budget.grant_escalated_ceiling(100_000);
         budget.record_call(90_000);
-        assert!(!budget.is_exceeded(), "90000 < 100000，重复授予同值无副作用");
+        assert!(
+            !budget.is_exceeded(),
+            "90000 < 100000，重复授予同值无副作用"
+        );
         budget.record_call(20_000);
         assert!(budget.is_exceeded(), "110000 >= 100000");
     }
@@ -329,7 +330,10 @@ mod tests {
         budget.record_call(60);
         assert!(!budget.is_exceeded());
         budget.record_call(50);
-        assert!(budget.is_exceeded(), "未授予时 110 >= 100 base，行为逐字不变");
+        assert!(
+            budget.is_exceeded(),
+            "未授予时 110 >= 100 base，行为逐字不变"
+        );
     }
 
     #[test]

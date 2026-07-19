@@ -115,8 +115,11 @@ pub async fn generate(
     }
 
     // 2. 加载 critic 自身的 system prompt + 当前 reply_agent 主模板原文供 critic 参考。
-    let critic_system = load_prompt(&state.db, &workspace_id, CRITIC_PROMPT_KEY).await
-        .map_err(|e| EvolutionError::Internal(format!("load_prompt(evolution_critic_v1) failed: {e}")))?;
+    let critic_system = load_prompt(&state.db, &workspace_id, CRITIC_PROMPT_KEY)
+        .await
+        .map_err(|e| {
+            EvolutionError::Internal(format!("load_prompt(evolution_critic_v1) failed: {e}"))
+        })?;
     let reply_agent_template = load_reply_agent_template_text(state, &workspace_id).await;
 
     // 3. 拼 user 输入：JSON 体，包含模板原文 + 失败桶。
@@ -541,12 +544,7 @@ mod tests {
             "遇到投诉时，建议切换到{}{}{}{}以稳住客户",
             '\u{4eba}', '\u{5de5}', '\u{63a5}', '\u{7ba1}',
         );
-        let diffs = vec![mk_diff(
-            "reply_agent_main",
-            "policy",
-            "ok",
-            &forbidden,
-        )];
+        let diffs = vec![mk_diff("reply_agent_main", "policy", "ok", &forbidden)];
         assert_eq!(validate_diffs(&diffs), Some("forbidden_literal"));
     }
 
@@ -559,7 +557,10 @@ mod tests {
             "改善 critic 自身",
             "更激进地建议改动",
         )];
-        assert_eq!(validate_diffs(&diffs), Some("self_referential_critic_prompt"));
+        assert_eq!(
+            validate_diffs(&diffs),
+            Some("self_referential_critic_prompt")
+        );
     }
 
     /// 全部合法 → None（不 drop）。
@@ -592,13 +593,7 @@ mod tests {
     /// drop proposal 的 schema 字段：kind=prompt，status=rejected_below_threshold。
     #[test]
     fn drop_proposal_uses_prompt_kind_and_rejected_status() {
-        let p = mk_drop_proposal(
-            "exp_x",
-            "ws",
-            "acct",
-            "forbidden_literal",
-            DateTime::now(),
-        );
+        let p = mk_drop_proposal("exp_x", "ws", "acct", "forbidden_literal", DateTime::now());
         assert_eq!(p.proposal_kind, "prompt");
         assert_eq!(p.status, "rejected_below_threshold");
         assert_eq!(p.failure_reason.as_deref(), Some("forbidden_literal"));

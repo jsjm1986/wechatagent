@@ -69,7 +69,10 @@ async fn import_job_bson_round_trips_with_snake_case_fields() {
         .state
         .db
         .import_jobs()
-        .find_one(doc! { "workspace_id": "default", "status": "pending" }, None)
+        .find_one(
+            doc! { "workspace_id": "default", "status": "pending" },
+            None,
+        )
         .await
         .expect("query ok");
     assert!(by_snake.is_some(), "snake_case 字段名应命中");
@@ -107,7 +110,10 @@ async fn stale_running_import_job_matches_reclaim_filter() {
         )
         .await
         .expect("query ok");
-    assert!(matched.is_some(), "stale running job 应被 reclaim filter 命中");
+    assert!(
+        matched.is_some(),
+        "stale running job 应被 reclaim filter 命中"
+    );
 }
 
 #[tokio::test]
@@ -141,7 +147,10 @@ async fn import_job_query_is_workspace_scoped_idor() {
         .find_one(doc! { "_id": job_id, "workspace_id": "ws_b" }, None)
         .await
         .expect("query ok");
-    assert!(cross_ws.is_none(), "跨 workspace 取 job 必须被拒（返 None）");
+    assert!(
+        cross_ws.is_none(),
+        "跨 workspace 取 job 必须被拒（返 None）"
+    );
 }
 
 /// 竞态回归：worker 收尾写终态用 `{_id, status:"running"}` CAS。若 job 已被
@@ -212,10 +221,14 @@ async fn terminal_job_sets_expires_at_pending_does_not() {
         .await
         .expect("query ok")
         .expect("job present");
-    assert!(pending.expires_at.is_none(), "pending job 不应有 expires_at");
+    assert!(
+        pending.expires_at.is_none(),
+        "pending job 不应有 expires_at"
+    );
 
     // 复刻 run_job 收尾终态写：置 status=completed + expires_at = now + 24h。
-    let expires_at = DateTime::from_millis(DateTime::now().timestamp_millis() + 24 * 60 * 60 * 1000);
+    let expires_at =
+        DateTime::from_millis(DateTime::now().timestamp_millis() + 24 * 60 * 60 * 1000);
     app.state
         .db
         .import_jobs()
@@ -236,5 +249,8 @@ async fn terminal_job_sets_expires_at_pending_does_not() {
         .expect("query ok")
         .expect("job present");
     assert_eq!(done.status, "completed");
-    assert!(done.expires_at.is_some(), "终态 job 必须置 expires_at 供 TTL 清扫");
+    assert!(
+        done.expires_at.is_some(),
+        "终态 job 必须置 expires_at 供 TTL 清扫"
+    );
 }

@@ -1,9 +1,9 @@
 //! 运营知识库导入/摄取：preview/apply + PDF/图像多模态 + RSS/HTML 分块落库 + 标签抽取。
 
-use axum::{Extension, Json};
 use axum::extract::{Path, Query, State};
-use futures::TryStreamExt;
+use axum::{Extension, Json};
 use futures::stream::{self, StreamExt};
+use futures::TryStreamExt;
 use mongodb::{
     bson::{doc, oid::ObjectId, DateTime, Document},
     options::FindOptions,
@@ -11,13 +11,13 @@ use mongodb::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::agent;
 use crate::auth::AuthenticatedAdmin;
 use crate::error::{AppError, AppResult};
-use crate::agent;
-use crate::models::{assert_import_job_status_valid, ImportJob};
 use crate::knowledge_wiki::chunk_revisions::{
     apply_chunk_revision, ProvenanceSource, RevisionOp, RevisionRequest,
 };
+use crate::models::{assert_import_job_status_valid, ImportJob};
 
 use super::super::AppState;
 use super::*;
@@ -173,7 +173,9 @@ pub(super) fn split_import_content(content: &str) -> Vec<String> {
             segments.extend(split_oversized_by_paragraph(&atom));
             continue;
         }
-        if !acc.is_empty() && acc.chars().count() + atom.chars().count() > IMPORT_SEGMENT_TARGET_CHARS {
+        if !acc.is_empty()
+            && acc.chars().count() + atom.chars().count() > IMPORT_SEGMENT_TARGET_CHARS
+        {
             segments.push(std::mem::take(&mut acc));
         }
         acc.push_str(&atom);
@@ -195,7 +197,9 @@ fn split_oversized_by_paragraph(block: &str) -> Vec<String> {
     let mut windows: Vec<String> = Vec::new();
     let mut acc = String::new();
     for para in block.split_inclusive("\n\n") {
-        if !acc.is_empty() && acc.chars().count() + para.chars().count() > IMPORT_SEGMENT_TARGET_CHARS {
+        if !acc.is_empty()
+            && acc.chars().count() + para.chars().count() > IMPORT_SEGMENT_TARGET_CHARS
+        {
             windows.push(std::mem::take(&mut acc));
         }
         acc.push_str(para);
@@ -321,8 +325,8 @@ pub async fn get_import_preview_job(
     Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
-    let job_id = ObjectId::parse_str(&id)
-        .map_err(|_| AppError::BadRequest("invalid job id".to_string()))?;
+    let job_id =
+        ObjectId::parse_str(&id).map_err(|_| AppError::BadRequest("invalid job id".to_string()))?;
     let job = state
         .db
         .import_jobs()
@@ -406,49 +410,50 @@ pub async fn run_import_extraction(
     let done_counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let succeeded_counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let failed_counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let extractions: Vec<(usize, AppResult<Value>)> = stream::iter(segments.into_iter().enumerate())
-        .map(|(idx, segment)| {
-            let state = &state;
-            let system = system;
-            let source_name = source_name.clone();
-            let account_id = payload.account_id.clone();
-            let done_counter = done_counter.clone();
-            let succeeded_counter = succeeded_counter.clone();
-            let failed_counter = failed_counter.clone();
-            async move {
-                let user = LONG_IMPORT_PROMPT_TEMPLATE
-                    .replace("{SOURCE_NAME}", &source_name)
-                    .replace("{CONTENT}", &segment);
-                let result = agent::generate_agent_json(
-                    state,
-                    account_id.as_deref(),
-                    None,
-                    None,
-                    "knowledge.import.preview",
-                    system,
-                    &user,
-                )
-                .await;
-                use std::sync::atomic::Ordering::SeqCst;
-                if result.is_ok() {
-                    succeeded_counter.fetch_add(1, SeqCst);
-                } else {
-                    failed_counter.fetch_add(1, SeqCst);
+    let extractions: Vec<(usize, AppResult<Value>)> =
+        stream::iter(segments.into_iter().enumerate())
+            .map(|(idx, segment)| {
+                let state = &state;
+                let system = system;
+                let source_name = source_name.clone();
+                let account_id = payload.account_id.clone();
+                let done_counter = done_counter.clone();
+                let succeeded_counter = succeeded_counter.clone();
+                let failed_counter = failed_counter.clone();
+                async move {
+                    let user = LONG_IMPORT_PROMPT_TEMPLATE
+                        .replace("{SOURCE_NAME}", &source_name)
+                        .replace("{CONTENT}", &segment);
+                    let result = agent::generate_agent_json(
+                        state,
+                        account_id.as_deref(),
+                        None,
+                        None,
+                        "knowledge.import.preview",
+                        system,
+                        &user,
+                    )
+                    .await;
+                    use std::sync::atomic::Ordering::SeqCst;
+                    if result.is_ok() {
+                        succeeded_counter.fetch_add(1, SeqCst);
+                    } else {
+                        failed_counter.fetch_add(1, SeqCst);
+                    }
+                    let done = done_counter.fetch_add(1, SeqCst) + 1;
+                    if let Some(cb) = progress {
+                        cb(
+                            done,
+                            succeeded_counter.load(SeqCst),
+                            failed_counter.load(SeqCst),
+                        );
+                    }
+                    (idx, result)
                 }
-                let done = done_counter.fetch_add(1, SeqCst) + 1;
-                if let Some(cb) = progress {
-                    cb(
-                        done,
-                        succeeded_counter.load(SeqCst),
-                        failed_counter.load(SeqCst),
-                    );
-                }
-                (idx, result)
-            }
-        })
-        .buffered(IMPORT_EXTRACT_CONCURRENCY)
-        .collect()
-        .await;
+            })
+            .buffered(IMPORT_EXTRACT_CONCURRENCY)
+            .collect()
+            .await;
 
     // 保序收集成功段；单段失败记 warning 跳过，全失败才报错。
     let mut ordered = extractions;
@@ -636,7 +641,14 @@ pub(in crate::routes) async fn import_operation_knowledge_apply(
     Extension(admin): Extension<AuthenticatedAdmin>,
     Json(payload): Json<OperationKnowledgeImportApplyRequest>,
 ) -> AppResult<Json<Value>> {
-    if payload.items.is_empty() && payload.chunked_text.as_deref().unwrap_or("").trim().is_empty() {
+    if payload.items.is_empty()
+        && payload
+            .chunked_text
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty()
+    {
         return Err(AppError::BadRequest(
             "items or chunkedText are required".to_string(),
         ));
@@ -657,7 +669,12 @@ pub(in crate::routes) async fn import_operation_knowledge_apply(
             .db
             .operation_knowledge_documents()
             .insert_one(
-                operation_knowledge_document_from_request(&state, &admin.current_workspace, document, None),
+                operation_knowledge_document_from_request(
+                    &state,
+                    &admin.current_workspace,
+                    document,
+                    None,
+                ),
                 None,
             )
             .await?;
@@ -687,7 +704,12 @@ pub(in crate::routes) async fn import_operation_knowledge_apply(
             .db
             .operation_knowledge_chunks()
             .insert_one(
-                operation_knowledge_chunk_from_request(&state, &admin.current_workspace, chunk, None)?,
+                operation_knowledge_chunk_from_request(
+                    &state,
+                    &admin.current_workspace,
+                    chunk,
+                    None,
+                )?,
                 None,
             )
             .await?;
@@ -697,9 +719,12 @@ pub(in crate::routes) async fn import_operation_knowledge_apply(
     }
     // ── knowledge-wiki Phase D：fence-aware chunked text 流式块导入 ───────
     let mut parse_warnings_json: Vec<Value> = Vec::new();
-    if let Some(text) = payload.chunked_text.as_deref().filter(|s| !s.trim().is_empty()) {
-        let (blocks, warnings) =
-            crate::knowledge_wiki::block_parser::parse_chunk_blocks(text);
+    if let Some(text) = payload
+        .chunked_text
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        let (blocks, warnings) = crate::knowledge_wiki::block_parser::parse_chunk_blocks(text);
         for w in &warnings.items {
             parse_warnings_json.push(parse_warning_to_json(w));
         }
@@ -707,7 +732,9 @@ pub(in crate::routes) async fn import_operation_knowledge_apply(
             // payload 中一律期待 camelCase 字段名（与既有 OperationKnowledgeChunkRequest 一致）；
             // 关键缺省值由下面的 enrich + validate 兜底。
             let mut chunk_req: OperationKnowledgeChunkRequest =
-                match serde_json::from_value::<OperationKnowledgeChunkRequest>(block.payload.clone()) {
+                match serde_json::from_value::<OperationKnowledgeChunkRequest>(
+                    block.payload.clone(),
+                ) {
                     Ok(c) => c,
                     Err(e) => {
                         parse_warnings_json.push(json!({
@@ -743,7 +770,12 @@ pub(in crate::routes) async fn import_operation_knowledge_apply(
                 .db
                 .operation_knowledge_chunks()
                 .insert_one(
-                    operation_knowledge_chunk_from_request(&state, &admin.current_workspace, chunk_req, None)?,
+                    operation_knowledge_chunk_from_request(
+                        &state,
+                        &admin.current_workspace,
+                        chunk_req,
+                        None,
+                    )?,
                     None,
                 )
                 .await?;
@@ -757,13 +789,8 @@ pub(in crate::routes) async fn import_operation_knowledge_apply(
                     reason: Some(format!("import_apply chunked block id={}", block.id)),
                     actor: payload.account_id.clone(),
                 };
-                if let Err(e) = apply_chunk_revision(
-                    &state.db,
-                    &admin.current_workspace,
-                    id,
-                    req,
-                )
-                .await
+                if let Err(e) =
+                    apply_chunk_revision(&state.db, &admin.current_workspace, id, req).await
                 {
                     tracing::warn!(
                         chunk_id = %id.to_hex(),
@@ -822,26 +849,22 @@ pub(in crate::routes) async fn import_operation_knowledge_apply_pdf(
                 file_bytes = Some(bytes.to_vec());
             }
             "sourceName" => {
-                source_name = Some(
-                    field
-                        .text()
-                        .await
-                        .map_err(|e| AppError::BadRequest(format!("sourceName 字段读取失败: {e}")))?,
-                );
+                source_name =
+                    Some(field.text().await.map_err(|e| {
+                        AppError::BadRequest(format!("sourceName 字段读取失败: {e}"))
+                    })?);
             }
             "accountId" => {
-                account_id = Some(
-                    field
-                        .text()
-                        .await
-                        .map_err(|e| AppError::BadRequest(format!("accountId 字段读取失败: {e}")))?,
-                );
+                account_id =
+                    Some(field.text().await.map_err(|e| {
+                        AppError::BadRequest(format!("accountId 字段读取失败: {e}"))
+                    })?);
             }
             _ => {}
         }
     }
-    let bytes = file_bytes
-        .ok_or_else(|| AppError::BadRequest("缺少 file 字段（PDF 字节）".to_string()))?;
+    let bytes =
+        file_bytes.ok_or_else(|| AppError::BadRequest("缺少 file 字段（PDF 字节）".to_string()))?;
     let outcome = import_pdf_bytes(
         &state,
         &admin.current_workspace,
@@ -922,10 +945,7 @@ pub(crate) async fn select_vision_provider(
     let active = state
         .db
         .llm_provider_configs()
-        .find_one(
-            doc! { "workspaceId": workspace_id, "isActive": true },
-            None,
-        )
+        .find_one(doc! { "workspaceId": workspace_id, "isActive": true }, None)
         .await?;
     if active.as_ref().map(|c| c.supports_vision).unwrap_or(false) {
         // active 文字模型即视觉模型：复用运行时 provider（含热切换 / registry 语义）。
@@ -949,7 +969,8 @@ pub(crate) async fn select_vision_provider(
     let vision_cfgs: Vec<_> = cursor.try_collect().await?;
     if vision_cfgs.is_empty() {
         return Err(AppError::External(
-            "visionNotSupported: 当前文字模型不支持图片，且未在模型设置中指派专职视觉模型".to_string(),
+            "visionNotSupported: 当前文字模型不支持图片，且未在模型设置中指派专职视觉模型"
+                .to_string(),
         ));
     }
     let mut candidates = Vec::with_capacity(vision_cfgs.len());
@@ -963,7 +984,9 @@ pub(crate) async fn select_vision_provider(
             vision_cfg
                 .timeout_seconds
                 .unwrap_or(state.config.llm_timeout_seconds),
-            vision_cfg.max_retries.unwrap_or(state.config.llm_max_retries),
+            vision_cfg
+                .max_retries
+                .unwrap_or(state.config.llm_max_retries),
             vision_cfg
                 .retry_base_ms
                 .unwrap_or(state.config.llm_retry_base_ms),
@@ -1066,9 +1089,7 @@ pub async fn import_operation_knowledge_apply_image(
 3. **保留原文 token 粒度**：body 照搬原文的关键表述、专有名词与具体数值（数字、比例、金额、期限、单位、阈值都要原样保留），不要概括、改写或压缩成一句话。\n\
 4. **只抽真实存在的文字**：绝不编造、补全、推断或脑补图中没有的内容；图里没写的就不写，看不清的标注为不确定而非猜测。\n\
 所有 chunk 默认 needs_review，不要写 verified。返回严格 JSON：{\"fence\": <字符串，全部 fence 文本>}。如果图片无文本可抽取，返回 {\"fence\": \"\"}。".to_string();
-    let user_prompt = format!(
-        "请按 fence 格式抽取下面这张图片中的知识 chunk。hint：{hint}"
-    );
+    let user_prompt = format!("请按 fence 格式抽取下面这张图片中的知识 chunk。hint：{hint}");
     // 3) 调视觉模型一次（抽到 vision_generate_json 复用容错/候选切换逻辑）：图片以真正的
     //    多模态 image_url content block 发送（generate_json_with_image），而不是把 base64 当
     //    文本塞进 prompt——后者会让纯文字模型"看不到"图片。VisionProvider 解析阶段已保证
@@ -1266,7 +1287,10 @@ pub async fn ingest_chunked_text(
                 op: RevisionOp::Create,
                 source: ProvenanceSource::Imported,
                 patch: Document::new(),
-                reason: Some(format!("ingest_chunked_text source={source_name} block={}", block.id)),
+                reason: Some(format!(
+                    "ingest_chunked_text source={source_name} block={}",
+                    block.id
+                )),
                 actor: account_id.map(|s| s.to_string()),
             };
             if let Err(e) = apply_chunk_revision(&state.db, workspace_id, id, req).await {
@@ -1303,7 +1327,12 @@ mod tests {
             "chunks 模板须含 chunkType"
         );
         // 已删死字段不得再出现在 prompt（防未来回退）
-        for dead in ["safeClaims", "forbiddenClaims", "evidenceItems", "routingCard"] {
+        for dead in [
+            "safeClaims",
+            "forbiddenClaims",
+            "evidenceItems",
+            "routingCard",
+        ] {
             assert!(
                 !LONG_IMPORT_PROMPT_TEMPLATE.contains(dead),
                 "已删字段 {dead} 不应再出现在抽取 prompt"
@@ -1479,4 +1508,3 @@ mod tests {
         assert!(merge_preview_documents(&[]).is_none());
     }
 }
-

@@ -89,15 +89,14 @@ pub(crate) fn validate_and_normalize_decision(
     workspace_id: &str,
     scope_account_id: &str,
 ) -> Vec<String> {
-    let cache = global_taxonomy_cache();
-    let (risks, candidates) =
-        classify_decision_tags(
-            decision,
-            dimension_kinds,
-            workspace_id,
-            scope_account_id,
-            &cache,
-        );
+    let cache = global_taxonomy_cache(db);
+    let (risks, candidates) = classify_decision_tags(
+        decision,
+        dimension_kinds,
+        workspace_id,
+        scope_account_id,
+        &cache,
+    );
     // 与 gateway 主循环同源：按 kind 从 decision.dimension_display_names 取 LLM 产的
     // 中文名，随候选一起落库。二者写同一幂等键 (scope,kind,raw)，upsert 对已存在候选
     // 不更新 display_name（先写者赢）——此处带名，避免本 fire-and-forget 路径的 None
@@ -144,18 +143,17 @@ fn spawn_candidate_upserts(
     let scope = scope_account_id.to_string();
     tokio::spawn(async move {
         for (kind, raw, display_name) in candidates {
-            if let Err(err) =
-                upsert_candidate(
-                    &db,
-                    &workspace,
-                    &scope,
-                    &kind,
-                    &raw,
-                    None,
-                    0,
-                    display_name.as_deref(),
-                )
-                .await
+            if let Err(err) = upsert_candidate(
+                &db,
+                &workspace,
+                &scope,
+                &kind,
+                &raw,
+                None,
+                0,
+                display_name.as_deref(),
+            )
+            .await
             {
                 tracing::warn!(
                     kind = %kind,
@@ -341,13 +339,7 @@ mod tests {
         // account 私有字典优先于 global，且 active 标签直接通过。
         let cache = mk_cache(vec![
             mk_entry("global", "customer_stage", "first_contact", "active", &[]),
-            mk_entry(
-                "acct-special",
-                "customer_stage",
-                "vip_lead",
-                "active",
-                &[],
-            ),
+            mk_entry("acct-special", "customer_stage", "vip_lead", "active", &[]),
         ]);
         let mut d = AgentDecision::default();
         d.customer_stage = Some("vip_lead".to_string());
@@ -369,10 +361,7 @@ mod tests {
         d.customer_stage = Some("first_contact".to_string());
         d.intent_level = Some("unicorn_tier".to_string());
         let (risks, cands) = classify_with_cache_for_tests(&mut d, "acct-x", &cache);
-        assert_eq!(
-            risks,
-            vec!["taxonomy_candidate:intent_level:unicorn_tier"]
-        );
+        assert_eq!(risks, vec!["taxonomy_candidate:intent_level:unicorn_tier"]);
         assert_eq!(
             cands,
             vec![("intent_level".to_string(), "unicorn_tier".to_string())]
@@ -395,8 +384,7 @@ mod tests {
         d.domain_signals
             .insert("relationship_closeness".to_string(), "热恋".to_string());
         let dims = vec!["relationship_closeness".to_string()];
-        let (risks, cands) =
-            classify_decision_tags(&mut d, &dims, "default", "acct-x", &cache);
+        let (risks, cands) = classify_decision_tags(&mut d, &dims, "default", "acct-x", &cache);
 
         assert_eq!(
             d.domain_signals.get_str("relationship_closeness").ok(),
@@ -420,8 +408,7 @@ mod tests {
         d.domain_signals
             .insert("emotional_state".to_string(), "焦虑不安".to_string());
         let dims = vec!["emotional_state".to_string()];
-        let (risks, cands) =
-            classify_decision_tags(&mut d, &dims, "default", "acct-x", &cache);
+        let (risks, cands) = classify_decision_tags(&mut d, &dims, "default", "acct-x", &cache);
 
         assert_eq!(risks, vec!["taxonomy_candidate:emotional_state:焦虑不安"]);
         assert_eq!(
@@ -442,9 +429,15 @@ mod tests {
             ("intent_level".to_string(), "probing".to_string()),
         ];
         let named = attach_display_names(cands, &d);
-        let stage = named.iter().find(|(k, _, _)| k == "customer_stage").expect("stage");
+        let stage = named
+            .iter()
+            .find(|(k, _, _)| k == "customer_stage")
+            .expect("stage");
         assert_eq!(stage.2.as_deref(), Some("焦虑观望"));
-        let intent = named.iter().find(|(k, _, _)| k == "intent_level").expect("intent");
+        let intent = named
+            .iter()
+            .find(|(k, _, _)| k == "intent_level")
+            .expect("intent");
         assert_eq!(intent.2, None, "未配名维度回落 None");
     }
 }

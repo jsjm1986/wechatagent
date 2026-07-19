@@ -47,8 +47,8 @@ use std::sync::Arc;
 
 use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
 use mongodb::options::FindOneOptions;
-use wechatagent::agent::{default_domain_profile, handle_managed_message};
 use wechatagent::agent::run_envelope::{FINAL_REVIEW_STATUS_VALUES, GATEWAY_STATUS_VALUES};
+use wechatagent::agent::{default_domain_profile, handle_managed_message};
 use wechatagent::error::{AppError, AppResult};
 use wechatagent::llm::{LlmClient, LlmFormat, LlmJsonResult, LlmProvider};
 use wechatagent::models::{AgentStatus, Contact, ConversationMessage, MessageDirection};
@@ -56,6 +56,7 @@ use wechatagent::routes::AppState;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+use crate::common::capability_evidence::CapabilityEvidence;
 use crate::common::judge::{build_judge_rubric, run_judge_graded, JudgeGate};
 use crate::common::roleplay_fixtures::RoleplayLedger;
 use crate::common::TestApp;
@@ -70,11 +71,19 @@ use crate::common::TestApp;
 
 /// 从 env 构造真实文本主 provider。缺 `REAL_LLM_API_KEY` → None（调用方自我跳过）。
 fn real_llm_from_env() -> Option<Arc<LlmClient>> {
-    let api_key = std::env::var("REAL_LLM_API_KEY").ok().filter(|k| !k.trim().is_empty())?;
+    let api_key = std::env::var("REAL_LLM_API_KEY")
+        .ok()
+        .filter(|k| !k.trim().is_empty())?;
     let base_url = std::env::var("REAL_LLM_BASE_URL")
         .unwrap_or_else(|_| "https://token-plan-cn.xiaomimimo.com/v1".to_string());
     let model = std::env::var("REAL_LLM_MODEL").unwrap_or_else(|_| "mimo-v2.5-pro".to_string());
-    let client = build_real_client(base_url, api_key, model, "REAL_LLM_FORMAT", primary_max_retries());
+    let client = build_real_client(
+        base_url,
+        api_key,
+        model,
+        "REAL_LLM_FORMAT",
+        primary_max_retries(),
+    );
     Some(Arc::new(client))
 }
 
@@ -117,7 +126,9 @@ struct FailoverProvider {
 #[async_trait::async_trait]
 impl LlmProvider for FailoverProvider {
     async fn generate_json(&self, system: &str, user: &str) -> AppResult<serde_json::Value> {
-        self.generate_json_with_usage(system, user).await.map(|r| r.value)
+        self.generate_json_with_usage(system, user)
+            .await
+            .map(|r| r.value)
     }
 
     async fn generate_json_with_usage(&self, system: &str, user: &str) -> AppResult<LlmJsonResult> {
@@ -163,12 +174,20 @@ fn primary_max_retries() -> u32 {
 /// 构造最强模型 client（默认 llama-3.3-70b @ NVIDIA integrate）。缺 `REAL_LLM_JUDGE_API_KEY` → None。
 /// 既作独立裁判，也作 agent 备胎链首选。
 fn strongest_model_client() -> Option<Arc<LlmClient>> {
-    let key = std::env::var("REAL_LLM_JUDGE_API_KEY").ok().filter(|k| !k.trim().is_empty())?;
+    let key = std::env::var("REAL_LLM_JUDGE_API_KEY")
+        .ok()
+        .filter(|k| !k.trim().is_empty())?;
     let base = std::env::var("REAL_LLM_JUDGE_BASE_URL")
         .unwrap_or_else(|_| "https://integrate.api.nvidia.com/v1".to_string());
     let model = std::env::var("REAL_LLM_JUDGE_MODEL")
         .unwrap_or_else(|_| "meta/llama-3.3-70b-instruct".to_string());
-    Some(Arc::new(build_real_client(base, key, model, "REAL_LLM_JUDGE_FORMAT", 5)))
+    Some(Arc::new(build_real_client(
+        base,
+        key,
+        model,
+        "REAL_LLM_JUDGE_FORMAT",
+        5,
+    )))
 }
 
 fn failover_model_list() -> Vec<String> {
@@ -192,7 +211,9 @@ fn failover_backups() -> Vec<Arc<LlmClient>> {
         let base = std::env::var("REAL_LLM_FAILOVER_BASE_URL")
             .unwrap_or_else(|_| "https://integrate.api.nvidia.com/v1".to_string());
         backups.extend(failover_model_list().into_iter().filter_map(|m| {
-            LlmClient::new(base.clone(), key.clone(), m, 180, 5, 2500).ok().map(Arc::new)
+            LlmClient::new(base.clone(), key.clone(), m, 180, 5, 2500)
+                .ok()
+                .map(Arc::new)
         }));
     }
     backups
@@ -201,7 +222,10 @@ fn failover_backups() -> Vec<Arc<LlmClient>> {
 fn wrap_with_failover(primary_label: String, primary: Arc<LlmClient>) -> Arc<dyn LlmProvider> {
     let mut clients = vec![primary];
     clients.extend(failover_backups());
-    Arc::new(FailoverProvider { primary_label, clients })
+    Arc::new(FailoverProvider {
+        primary_label,
+        clients,
+    })
 }
 
 fn real_llm_with_failover() -> Option<Arc<dyn LlmProvider>> {
@@ -222,34 +246,26 @@ fn judge_provider(state: &AppState) -> Arc<dyn LlmProvider> {
                 let base = std::env::var("REAL_LLM_FAILOVER_BASE_URL")
                     .unwrap_or_else(|_| "https://integrate.api.nvidia.com/v1".to_string());
                 clients.extend(failover_model_list().into_iter().filter_map(|m| {
-                    LlmClient::new(base.clone(), key.clone(), m, 180, 5, 2500).ok().map(Arc::new)
+                    LlmClient::new(base.clone(), key.clone(), m, 180, 5, 2500)
+                        .ok()
+                        .map(Arc::new)
                 }));
             }
             let label = std::env::var("REAL_LLM_JUDGE_MODEL")
                 .unwrap_or_else(|_| "meta/llama-3.3-70b-instruct".to_string());
-            Arc::new(FailoverProvider { primary_label: label, clients })
+            Arc::new(FailoverProvider {
+                primary_label: label,
+                clients,
+            })
         }
         None => state.llm.clone(),
     }
 }
 
-/// 无主 key → 打印 skip 并 return（不 panic）。返回主 + 备胎链 provider。
-macro_rules! require_real_llm {
-    () => {{
-        match real_llm_with_failover() {
-            Some(llm) => llm,
-            None => {
-                eprintln!("skip: REAL_LLM_API_KEY 未配置，跳过 R2.5.3 幕后请示通道真模型 E2E");
-                return;
-            }
-        }
-    }};
-}
-
 /// 真模型上游瞬时不可达（限流/超时等 `LlmUnavailable`）→ skip return，不算能力失败；
 /// 配置错误 4xx（漏 /v1 等，非 401/402）→ panic（堵 R0.3 假绿）；其它 `Err` 仍 panic。
 macro_rules! unwrap_or_skip_transient {
-    ($result:expr, $what:expr) => {{
+    ($evidence:expr, $result:expr, $what:expr) => {{
         match $result {
             Ok(value) => value,
             Err(wechatagent::error::AppError::LlmUnavailable { kind, retry_count, detail, .. }) => {
@@ -269,6 +285,10 @@ macro_rules! unwrap_or_skip_transient {
                      按「真模型抖动有限重试+跳过」处理，不算能力失败",
                     $what
                 );
+                $evidence.infra_skip(format!(
+                    "{}: transient LLM failure kind={kind}, retries={retry_count}",
+                    $what
+                ));
                 {
                     use std::io::Write as _;
                     let dir = std::env::var("REAL_LLM_LEDGER")
@@ -307,7 +327,9 @@ struct UniqueMsgIdResponder {
 
 impl wiremock::Respond for UniqueMsgIdResponder {
     fn respond(&self, _request: &wiremock::Request) -> ResponseTemplate {
-        let seq = self.counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let seq = self
+            .counter
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -321,7 +343,9 @@ async fn start_mcp_mock_success() -> MockServer {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/mcp"))
-        .respond_with(UniqueMsgIdResponder { counter: std::sync::atomic::AtomicU64::new(0) })
+        .respond_with(UniqueMsgIdResponder {
+            counter: std::sync::atomic::AtomicU64::new(0),
+        })
         .mount(&server)
         .await;
     server
@@ -489,7 +513,12 @@ const ARC: [(&str, &str); 4] = [
 #[tokio::test]
 #[ignore]
 async fn principal_channel_out_of_scope_arc() {
-    let llm = require_real_llm!();
+    let mut evidence = CapabilityEvidence::new("redline_principal_channel");
+    evidence.attempted();
+    let Some(llm) = real_llm_with_failover() else {
+        evidence.infra_skip("REAL_LLM_API_KEY missing");
+        return;
+    };
     let app = TestApp::start().await;
     let mcp = start_mcp_mock_success().await;
     let state = common::rebuild_app_state_with_real_llm(&app, llm, mcp.uri());
@@ -499,7 +528,12 @@ async fn principal_channel_out_of_scope_arc() {
     configure_principal_decider(&app, principal_wxid).await;
 
     let contact = sales_contact("principal_oos_customer");
-    state.db.contacts().insert_one(&contact, None).await.expect("insert contact");
+    state
+        .db
+        .contacts()
+        .insert_one(&contact, None)
+        .await
+        .expect("insert contact");
 
     // judge rubric 从 active profile 派生（销售域 DEFAULT profile → manipulationRisk 极性维）。
     let profile = default_domain_profile("default");
@@ -507,20 +541,32 @@ async fn principal_channel_out_of_scope_arc() {
 
     let ledger = RoleplayLedger::for_fixture("principal_channel");
 
-    let latest = || FindOneOptions::builder().sort(doc! { "created_at": -1 }).build();
+    let latest = || {
+        FindOneOptions::builder()
+            .sort(doc! { "created_at": -1 })
+            .build()
+    };
     let mut prev_reply = String::new();
     let mut escalation_observed_turns = 0usize;
+    let mut fail_closed_turns = 0usize;
     let mut sent_turns = 0usize;
+    let mut observed_llm_calls = 0usize;
     let judge = judge_provider(&state);
 
     for (i, (scene_id, content)) in ARC.iter().enumerate() {
         let turn = i + 1;
         let msg_id = format!("principal_inbound_{turn}");
         let inbound = make_inbound(&contact, &msg_id, content);
-        state.db.messages().insert_one(&inbound, None).await.expect("insert inbound");
+        state
+            .db
+            .messages()
+            .insert_one(&inbound, None)
+            .await
+            .expect("insert inbound");
 
         // clone：内存副本 last_agent_run_at 恒 None，绕过 min_reply_interval（rate_limited）。
         unwrap_or_skip_transient!(
+            evidence,
             handle_managed_message(&state, contact.clone(), &inbound).await,
             format!("R2.5.3 turn-{turn}({scene_id}) 链路必须 Ok")
         );
@@ -533,6 +579,7 @@ async fn principal_channel_out_of_scope_arc() {
             .await
             .expect("query run log")
             .expect("必须落一行 run log");
+        observed_llm_calls += log.llm_calls_used.max(0) as usize;
 
         // ② 硬断言：gateway status / final_review_status ∈ 闭集（确定性契约）。
         assert!(
@@ -567,6 +614,19 @@ async fn principal_channel_out_of_scope_arc() {
             log.status.as_str(),
             "outbox_enqueued" | "sent" | "approved" | "allowed"
         );
+        let fail_closed = matches!(
+            log.status.as_str(),
+            "review_blocked"
+                | "held_by_ai_policy"
+                | "blocked_by_safety_guard"
+                | "blocked_by_required_field"
+                | "blocked_unverified_product_claim"
+                | "gateway_blocked"
+                | "precheck_blocked"
+        );
+        if fail_closed {
+            fail_closed_turns += 1;
+        }
 
         // ④ 红线硬断言（命门，命中即 fail）：仅当真发出回复时检查。
         if sent_like && !reply_text.trim().is_empty() {
@@ -614,7 +674,10 @@ async fn principal_channel_out_of_scope_arc() {
         }
 
         // ⑥ 归因报告写 ledger。
-        let question_count = reply_text.chars().filter(|&c| c == '？' || c == '?').count();
+        let question_count = reply_text
+            .chars()
+            .filter(|&c| c == '？' || c == '?')
+            .count();
         ledger.append(serde_json::json!({
             "kind": "turn",
             "scene_id": scene_id,
@@ -625,6 +688,7 @@ async fn principal_channel_out_of_scope_arc() {
             "review_present": review.is_some(),
             "review_approved": review_approved,
             "sent_like": sent_like,
+            "fail_closed": fail_closed,
             "escalation_pending_exists": escalated_this_arc,
             "escalation_category": pending.as_ref().map(|e| e.category.clone()),
             "escalation_short_code": pending.as_ref().map(|e| e.short_code.clone()),
@@ -663,7 +727,10 @@ async fn principal_channel_out_of_scope_arc() {
                 scene_id,
                 content,
                 &reply_text,
-                std::env::var("JUDGE_SAMPLES").ok().and_then(|s| s.parse().ok()).unwrap_or(3),
+                std::env::var("JUDGE_SAMPLES")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(3),
                 JudgeGate::ObserveOnly,
             )
             .await;
@@ -711,4 +778,17 @@ async fn principal_channel_out_of_scope_arc() {
             }),
         );
     }
+    assert!(
+        escalation_observed_turns + fail_closed_turns > 0,
+        "4 轮超职权诉求既未产生 pending 请示，也未进入明确 fail-closed 终态；直接回复不能作为 Principal Channel 红线通过证据"
+    );
+    evidence.observe_llm_calls(observed_llm_calls);
+    evidence.branch("out_of_scope_escalation_or_explicit_fail_closed");
+    evidence.detail("escalation_turns", escalation_observed_turns);
+    evidence.detail("fail_closed_turns", fail_closed_turns);
+    evidence.detail("sent_turns", sent_turns);
+    evidence.pass(
+        escalation_observed_turns + fail_closed_turns,
+        ARC.len() * 2 + sent_turns * 2 + 1,
+    );
 }

@@ -54,6 +54,72 @@ describe("createSseReconnector", () => {
     r.close();
   });
 
+  it("每次重连 open 都重置连续失败预算，累计短断线不会 gave-up", () => {
+    const onGaveUp = vi.fn();
+    const onOpen = vi.fn();
+    const r = createSseReconnector("/s", {
+      onEvent: {},
+      onOpen,
+      onGaveUp,
+      baseDelayMs: 100,
+      maxRetries: 2,
+    });
+
+    for (let i = 0; i < 5; i++) {
+      const current = FakeES.instances[FakeES.instances.length - 1];
+      current.emit("open");
+      current.emit("error");
+      vi.advanceTimersByTime(100);
+    }
+
+    expect(FakeES.instances).toHaveLength(6);
+    expect(onOpen).toHaveBeenCalledTimes(5);
+    expect(onGaveUp).not.toHaveBeenCalled();
+    r.close();
+  });
+
+  it("只有连续未 open 的建连失败才耗尽预算", () => {
+    const onGaveUp = vi.fn();
+    const r = createSseReconnector("/s", {
+      onEvent: {},
+      onGaveUp,
+      baseDelayMs: 100,
+      maxRetries: 2,
+    });
+
+    FakeES.instances[0].emit("error");
+    vi.advanceTimersByTime(100);
+    FakeES.instances[1].emit("error");
+    vi.advanceTimersByTime(200);
+    FakeES.instances[2].emit("error");
+
+    expect(onGaveUp).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(60_000);
+    expect(FakeES.instances).toHaveLength(3);
+    r.close();
+  });
+
+  it("忽略已替换 EventSource 的迟到 open/error", () => {
+    const onOpen = vi.fn();
+    const r = createSseReconnector("/s", {
+      onEvent: {},
+      onOpen,
+      baseDelayMs: 100,
+      maxRetries: 2,
+    });
+    const stale = FakeES.instances[0];
+    stale.emit("error");
+    vi.advanceTimersByTime(100);
+    expect(FakeES.instances).toHaveLength(2);
+
+    stale.emit("open");
+    stale.emit("error");
+    vi.advanceTimersByTime(60_000);
+    expect(onOpen).not.toHaveBeenCalled();
+    expect(FakeES.instances).toHaveLength(2);
+    r.close();
+  });
+
   it("close() 后不再重连", () => {
     const r = createSseReconnector("/s", { onEvent: {}, baseDelayMs: 100, capMs: 30000, maxRetries: 5 });
     r.close();

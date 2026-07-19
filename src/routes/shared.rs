@@ -106,7 +106,12 @@ pub(super) fn insert_domain_stage_fields(
     // C-01：admin 直写路径不驱动 stagnation 计时的主逻辑（不载 active_profile），传 None
     // 保持 customer_stage 语义（字节等价于改造前）。AI 决策路径（gateway）才按 active
     // profile 的 stagnation_dimension 动态化。
-    crate::agent::domain_signals::insert_domain_signal_values(set_doc, &signals, stage_changed, None);
+    crate::agent::domain_signals::insert_domain_signal_values(
+        set_doc,
+        &signals,
+        stage_changed,
+        None,
+    );
     set_doc.insert("domain_attributes_updated_at", DateTime::now());
 }
 
@@ -283,8 +288,8 @@ pub(super) async fn ensure_operating_memory(
                 seeded_with_version
                     .extra
                     .insert("version", memory.memory_card_version);
-                let seeded_doc = mongodb::bson::to_document(&seeded_with_version)
-                    .unwrap_or_default();
+                let seeded_doc =
+                    mongodb::bson::to_document(&seeded_with_version).unwrap_or_default();
                 memory.memory_card = seeded_with_version;
                 memory.memory_card_updated_at = Some(updated_at);
                 memory.updated_at = updated_at;
@@ -374,7 +379,8 @@ pub(super) async fn ensure_operating_memory(
         created_at: DateTime::now(),
         updated_at: DateTime::now(),
     };
-    let mut seeded_typed = agent::effective_memory_card_for_contact(&memory, contact, &initial_state);
+    let mut seeded_typed =
+        agent::effective_memory_card_for_contact(&memory, contact, &initial_state);
     memory.memory_card_version = if agent::memory_card_has_signal(&seeded_typed) {
         1
     } else {
@@ -530,13 +536,48 @@ pub(super) async fn compute_quiet_hours_view(
 pub(super) fn health_items_from_scores(scores: &Document) -> Value {
     let score = |key: &str| scores.get_i32(key).unwrap_or(0);
     json!([
-        health_item("userUnderstanding", "用户理解完整度", score("userUnderstanding"), "身份、痛点、动机、偏好和禁忌是否清楚"),
-        health_item("relationshipQuality", "信任关系质量", score("relationshipQuality"), "当前互动是否适合推进，是否需要先建立信任"),
-        health_item("productFit", "产品匹配清晰度", score("productFit"), "是否知道用户需求与产品价值之间的真实匹配"),
-        health_item("rhythmRisk", "跟进节奏风险", score("rhythmRisk"), "是否存在过度打扰或冷却中的风险"),
-        health_item("knowledgeGrounding", "知识匹配度", score("knowledgeGrounding"), "回应是否被 verified 知识支撑"),
-        health_item("hallucinationRisk", "幻觉风险", score("hallucinationRisk"), "是否可能出现编造案例、承诺结果或产品事实不准确"),
-        health_item("pressureRisk", "销售压迫感风险", score("pressureRisk"), "表达是否可能显得催促、强推或过度营销")
+        health_item(
+            "userUnderstanding",
+            "用户理解完整度",
+            score("userUnderstanding"),
+            "身份、痛点、动机、偏好和禁忌是否清楚"
+        ),
+        health_item(
+            "relationshipQuality",
+            "信任关系质量",
+            score("relationshipQuality"),
+            "当前互动是否适合推进，是否需要先建立信任"
+        ),
+        health_item(
+            "productFit",
+            "产品匹配清晰度",
+            score("productFit"),
+            "是否知道用户需求与产品价值之间的真实匹配"
+        ),
+        health_item(
+            "rhythmRisk",
+            "跟进节奏风险",
+            score("rhythmRisk"),
+            "是否存在过度打扰或冷却中的风险"
+        ),
+        health_item(
+            "knowledgeGrounding",
+            "知识匹配度",
+            score("knowledgeGrounding"),
+            "回应是否被 verified 知识支撑"
+        ),
+        health_item(
+            "hallucinationRisk",
+            "幻觉风险",
+            score("hallucinationRisk"),
+            "是否可能出现编造案例、承诺结果或产品事实不准确"
+        ),
+        health_item(
+            "pressureRisk",
+            "销售压迫感风险",
+            score("pressureRisk"),
+            "表达是否可能显得催促、强推或过度营销"
+        )
     ])
 }
 
@@ -722,7 +763,12 @@ pub(super) async fn prepare_contact_changes(
             // M2:customer_stage 实际变化时同步刷新 customer_stage_updated_at(归一后再比较)。
             let prev = contact_domain_str(contact, "customer_stage");
             let stage_changed = prev.as_deref().map(|s| s != value.as_str()).unwrap_or(true);
-            insert_domain_stage_fields(&mut set_doc, Some(&value), intent.as_deref(), stage_changed);
+            insert_domain_stage_fields(
+                &mut set_doc,
+                Some(&value),
+                intent.as_deref(),
+                stage_changed,
+            );
         } else if intent.is_some() {
             // stage 越界/缺席但 intent 通过:仍写 intent(stage_changed=false,不刷 stage 计时)。
             insert_domain_stage_fields(&mut set_doc, None, intent.as_deref(), false);
@@ -800,10 +846,7 @@ pub(super) async fn prepare_contact_changes(
     Ok((set_doc, skipped))
 }
 
-pub(super) fn prepare_memory_changes(
-    memory: &OperatingMemory,
-    changes: &Document,
-) -> Document {
+pub(super) fn prepare_memory_changes(memory: &OperatingMemory, changes: &Document) -> Document {
     let Some(memory_patch) = doc_get_document(changes, "memory") else {
         return Document::new();
     };
@@ -873,10 +916,7 @@ pub(super) async fn prepare_domain_changes(
     let Some(config) = state
         .db
         .operation_domain_configs()
-        .find_one(
-            current_user_operations_domain_filter(workspace_id),
-            None,
-        )
+        .find_one(current_user_operations_domain_filter(workspace_id), None)
         .await?
     else {
         return Err(AppError::Conflict(
@@ -1026,8 +1066,12 @@ wxid：{}
         contact.remark.as_deref().unwrap_or(""),
         contact.human_profile_note.as_deref().unwrap_or(""),
         agent::render_tags_for_prompt(&contact.manual_tags, &contact.confirmed_tags),
-        contact_domain_str(contact, "customer_stage").as_deref().unwrap_or(""),
-        contact_domain_str(contact, "intent_level").as_deref().unwrap_or(""),
+        contact_domain_str(contact, "customer_stage")
+            .as_deref()
+            .unwrap_or(""),
+        contact_domain_str(contact, "intent_level")
+            .as_deref()
+            .unwrap_or(""),
         contact.follow_up_policy.as_deref().unwrap_or(""),
         contact.operation_state.as_deref().unwrap_or(""),
         contact.operation_state_reason.as_deref().unwrap_or(""),
@@ -1609,7 +1653,11 @@ pub(super) async fn resolve_authorized_workspace(
         })?
         .ok_or_else(|| AppError::Unauthorized("admin_user_not_found".into()))?;
 
-    if !is_workspace_authorized(&resolved, &user.workspaces, &state.config.default_workspace_id) {
+    if !is_workspace_authorized(
+        &resolved,
+        &user.workspaces,
+        &state.config.default_workspace_id,
+    ) {
         return Err(AppError::BadRequest("workspace_not_in_user_acl".into()));
     }
     Ok(resolved)
@@ -1712,8 +1760,14 @@ mod tests {
         );
 
         // scores 仍随响应返回；旧 `healthScores` 键保留以兼容现有读端。
-        assert!(body["health"]["scores"].is_object(), "health.scores 应保留 scores document");
-        assert!(body["healthScores"].is_object(), "healthScores 旧键应保留向后兼容");
+        assert!(
+            body["health"]["scores"].is_object(),
+            "health.scores 应保留 scores document"
+        );
+        assert!(
+            body["healthScores"].is_object(),
+            "healthScores 旧键应保留向后兼容"
+        );
     }
 
     /// DRY 抽出的 `health_items_from_scores` 与组装函数同口径：缺失键回落 0、
@@ -1827,10 +1881,7 @@ mod tests {
     // conversation_inferred 绝不经直登通道（与 §5.5 红线一致）。
     #[test]
     fn validate_deal_verification_rejects_conversation_inferred_via_direct_path() {
-        assert_eq!(
-            validate_deal_verification(None).unwrap(),
-            "staff_confirmed"
-        );
+        assert_eq!(validate_deal_verification(None).unwrap(), "staff_confirmed");
         assert_eq!(
             validate_deal_verification(Some("")).unwrap(),
             "staff_confirmed"
@@ -2012,9 +2063,7 @@ mod tests {
             review_summary: Some("通过".to_string()),
             playbook_id: Some(ObjectId::parse_str("64a1f2c3e4b5a697889a0002").unwrap()),
             playbook_version: Some(2),
-            used_knowledge_ids: vec![
-                ObjectId::parse_str("64a1f2c3e4b5a697889a0003").unwrap(),
-            ],
+            used_knowledge_ids: vec![ObjectId::parse_str("64a1f2c3e4b5a697889a0003").unwrap()],
             prompt_versions: doc! { "user.reply": "v2" },
             operation_state: Some("negotiation".to_string()),
             next_best_action: doc! { "action": "follow_up" },
@@ -2025,6 +2074,10 @@ mod tests {
             outcome_status: Some("replied".to_string()),
             reaction_analysis: doc! { "sentiment": "positive" },
             reaction_claimed_at: Some(DateTime::from_millis(1_700_000_050_000)),
+            reaction_claim_token: Some("reaction-claim-1".to_string()),
+            reaction_claim_generation: 1,
+            source_task_id: None,
+            source_task_claim_token: None,
             reviewer_misjudge_signal: Some("none".to_string()),
             expected_text_segments: 1,
             status: "approved".to_string(),
@@ -2126,7 +2179,9 @@ mod tests {
             bayesian_signals: vec![],
             personality_profile: None,
             tags_version: 0,
-            domain_attributes: Some(doc! { "customer_stage": "negotiation", "intent_level": "high" }),
+            domain_attributes: Some(
+                doc! { "customer_stage": "negotiation", "intent_level": "high" },
+            ),
             domain_attributes_updated_at: None,
             commitments: vec![],
             follow_up_policy: Some("每周一次".to_string()),
@@ -2200,6 +2255,10 @@ mod tests {
             outcome_status: None,
             reaction_analysis: Document::new(),
             reaction_claimed_at: None,
+            reaction_claim_token: None,
+            reaction_claim_generation: 0,
+            source_task_id: None,
+            source_task_claim_token: None,
             reviewer_misjudge_signal: None,
             expected_text_segments: 0,
             status: "approved".to_string(),
@@ -2316,7 +2375,10 @@ mod tests {
             &intent_values,
         );
         assert!(prompt.contains("合法值"), "应注入'合法值'引导段");
-        assert!(prompt.contains("need_discovery"), "应含状态机/字典 canonical key");
+        assert!(
+            prompt.contains("need_discovery"),
+            "应含状态机/字典 canonical key"
+        );
         assert!(prompt.contains("高意向"), "应含字典中文标签");
 
         // 空切片:输出"暂无受控取值"兜底,不 panic。

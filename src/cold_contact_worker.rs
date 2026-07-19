@@ -75,10 +75,11 @@ async fn scan_cold_outbound(state: &AppState) -> anyhow::Result<()> {
     let mut cursor = state.db.contacts().find(filter, None).await?;
 
     let daily_cap = state.config.cold_contact_daily_emit_cap;
-    let already_emitted_today =
-        count_today_cold_emit_workspace(state, &workspace_id, now).await?;
+    let already_emitted_today = count_today_cold_emit_workspace(state, &workspace_id, now).await?;
 
-    let peer_hooks = load_peer_case_hooks(state, &workspace_id).await.unwrap_or_default();
+    let peer_hooks = load_peer_case_hooks(state, &workspace_id)
+        .await
+        .unwrap_or_default();
 
     let mut scanned = 0i64;
     let mut emitted = 0i64;
@@ -95,8 +96,7 @@ async fn scan_cold_outbound(state: &AppState) -> anyhow::Result<()> {
         // 旧实现只在 tick 起始读一次 count，并在内存里 decrement 一个本地
         // counter，并发 tick 之间会让真实 emit 数翻倍。改为每轮 re-count，
         // 让 cap 与 cold_contact_emit 事件 collection 真实实时对齐。
-        let live_count =
-            count_today_cold_emit_workspace(state, &workspace_id, now).await?;
+        let live_count = count_today_cold_emit_workspace(state, &workspace_id, now).await?;
         if cap_reached(live_count, daily_cap) {
             break;
         }
@@ -117,9 +117,9 @@ async fn scan_cold_outbound(state: &AppState) -> anyhow::Result<()> {
             .map(|d| d.timestamp_millis().to_string())
             .unwrap_or_else(|| "never".to_string());
         let content = match hook.as_deref() {
-            Some(hook_text) => format!(
-                "Planner: cold_reactivation since {last_outbound_repr} | hook={hook_text}"
-            ),
+            Some(hook_text) => {
+                format!("Planner: cold_reactivation since {last_outbound_repr} | hook={hook_text}")
+            }
             None => format!("Planner: cold_reactivation since {last_outbound_repr}"),
         };
         emit_cold_follow_up(state, &contact, content, now).await?;

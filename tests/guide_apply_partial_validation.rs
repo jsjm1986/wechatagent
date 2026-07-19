@@ -68,7 +68,12 @@ fn seed_contact(ws: &str, acc: &str, wxid: &str) -> Contact {
 
 /// seed + 取回带 _id 的 contact(apply_contact_changes 需要 contact.id)。
 async fn insert_and_load(app: &TestApp, c: Contact, wxid: &str) -> Contact {
-    app.state.db.contacts().insert_one(c, None).await.expect("seed contact");
+    app.state
+        .db
+        .contacts()
+        .insert_one(c, None)
+        .await
+        .expect("seed contact");
     app.state
         .db
         .contacts()
@@ -119,8 +124,14 @@ async fn apply_skips_invalid_keeps_valid() {
     );
     // 两个越界字段都进 skipped。
     let fields: Vec<&str> = skipped.iter().map(|s| s.field.as_str()).collect();
-    assert!(fields.contains(&"operationState"), "operationState 应在 skipped: {fields:?}");
-    assert!(fields.contains(&"customerStage"), "customerStage 应在 skipped: {fields:?}");
+    assert!(
+        fields.contains(&"operationState"),
+        "operationState 应在 skipped: {fields:?}"
+    );
+    assert!(
+        fields.contains(&"customerStage"),
+        "customerStage 应在 skipped: {fields:?}"
+    );
     assert_eq!(skipped.len(), 2, "恰两个越界字段被跳过");
 }
 
@@ -222,10 +233,23 @@ async fn apply_legal_values_all_persist() {
         .await
         .expect("query")
         .expect("exists");
-    assert_eq!(after.operation_state.as_deref(), Some("cooldown"), "合法迁移落库");
-    let stage = after.domain_attributes.as_ref().and_then(|d| d.get_str("customer_stage").ok());
-    let intent = after.domain_attributes.as_ref().and_then(|d| d.get_str("intent_level").ok());
+    assert_eq!(
+        after.operation_state.as_deref(),
+        Some("cooldown"),
+        "合法迁移落库"
+    );
+    let stage = after
+        .domain_attributes
+        .as_ref()
+        .and_then(|d| d.get_str("customer_stage").ok());
+    let intent = after
+        .domain_attributes
+        .as_ref()
+        .and_then(|d| d.get_str("intent_level").ok());
     assert_eq!(stage, Some("need_discovery"), "合法 stage 落库");
     assert_eq!(intent, Some("high"), "合法 intent 落库");
-    assert!(skipped.is_empty(), "全合法 → skipped 空(证明不影响 happy path)");
+    assert!(
+        skipped.is_empty(),
+        "全合法 → skipped 空(证明不影响 happy path)"
+    );
 }

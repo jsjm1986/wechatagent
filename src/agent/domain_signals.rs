@@ -47,9 +47,7 @@ pub(crate) fn normalize_domain_signals(decision: &mut AgentDecision) {
             .map(ToString::to_string);
         if let Some(value) = typed {
             // typed 权威：写回容器（canonical）。
-            decision
-                .domain_signals
-                .insert(dim.to_string(), value);
+            decision.domain_signals.insert(dim.to_string(), value);
         } else if let Some(from_container) = decision
             .domain_signals
             .get_str(dim)
@@ -150,7 +148,10 @@ pub(crate) fn insert_domain_signal_values(
     // DEFAULT dim=customer_stage → 与改造前字节等价。
     let dim = stagnation_dimension.unwrap_or("customer_stage");
     if stagnation_changed && signals.get_str(dim).is_ok() {
-        set_doc.insert(format!("domain_attributes.{dim}_updated_at"), DateTime::now());
+        set_doc.insert(
+            format!("domain_attributes.{dim}_updated_at"),
+            DateTime::now(),
+        );
     }
     wrote_any
 }
@@ -249,7 +250,10 @@ mod tests {
         let wrote = insert_domain_signal_values(&mut set_doc, &signals, true, None);
 
         assert!(wrote, "intent_level 写入了，应返回 true");
-        assert_eq!(set_doc.get_str("domain_attributes.intent_level").ok(), Some("high"));
+        assert_eq!(
+            set_doc.get_str("domain_attributes.intent_level").ok(),
+            Some("high")
+        );
         assert!(
             !set_doc.contains_key("domain_attributes.customer_stage_updated_at"),
             "signals 无 customer_stage 时不应刷 stage 时间戳：{set_doc:?}"
@@ -311,7 +315,9 @@ mod tests {
 
         assert!(wrote);
         assert_eq!(
-            set_doc.get_str("domain_attributes.relationship_closeness").ok(),
+            set_doc
+                .get_str("domain_attributes.relationship_closeness")
+                .ok(),
             Some("intimate")
         );
     }
@@ -452,7 +458,10 @@ mod tests {
         normalize_domain_signals(&mut decision);
 
         assert_eq!(
-            decision.domain_signals.get_str("relationship_closeness").ok(),
+            decision
+                .domain_signals
+                .get_str("relationship_closeness")
+                .ok(),
             Some("intimate"),
             "非销售维度应保留"
         );
@@ -477,7 +486,10 @@ mod tests {
             "purchase_lifecycle".to_string(),
         ];
         retain_declared_dimensions(&mut signals, &allowed);
-        assert_eq!(signals.get_str("purchase_lifecycle").ok(), Some("purchased"));
+        assert_eq!(
+            signals.get_str("purchase_lifecycle").ok(),
+            Some("purchased")
+        );
         assert_eq!(signals.get_str("customer_stage").ok(), Some("solution_fit"));
         assert!(
             !signals.contains_key("llm_hallucinated_key"),
@@ -504,4 +516,3 @@ mod tests {
         assert!(signals.is_empty(), "无声明维度时容器应被清空");
     }
 }
-

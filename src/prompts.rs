@@ -12,7 +12,8 @@ use crate::{
     models::{AgentSoul, OperationDomainConfig, OperationPlaybook, PromptTemplate},
 };
 
-pub const PROMPT_PACK_VERSION: &str = "wechatagent_prompt_pack_v16_2026_06_28_memory_structured_fact_and_dimension_required";
+pub const PROMPT_PACK_VERSION: &str =
+    "wechatagent_prompt_pack_v16_2026_06_28_memory_structured_fact_and_dimension_required";
 
 /// universal-domain-adaptation A/T1：user.reply.policy prompt「## 模式与 5 闸的关系」
 /// 模式-闸说明段（逐字复刻 prompt pack v3 现文 :958-963：标题 + casual_relationship /
@@ -127,37 +128,10 @@ pub async fn ensure_prompt_pack_v2(
             reset_prompt_pack_v2(db, workspace_id, default_account_id).await?;
             Ok(true)
         }
-        Err(error) => {
-            // 查询异常（连接抖动、字段错乱等）时进入兜底：
-            // 重新种入默认模板，宁可短暂存在重复条目，也要保证模板始终可用。
-            // 同步写一条 agent_events 留痕，便于事后排查。
-            let summary =
-                format!("ensure_prompt_pack_v2 detect query failed, fallback to reseed: {error}");
-            let details = doc! {
-                "promptPackVersion": PROMPT_PACK_VERSION,
-                "error": error.to_string(),
-            };
-            let _ = db
-                .events()
-                .insert_one(
-                    crate::models::AgentEvent {
-                        id: None,
-                        workspace_id: workspace_id.to_string(),
-                        account_id: default_account_id.to_string(),
-                        contact_wxid: None,
-                        kind: "prompt_pack_reseed_fallback".to_string(),
-                        status: "warn".to_string(),
-                        summary,
-                        details: Some(details),
-                        created_at: DateTime::now(),
-                        dedupe_key: None,
-                    },
-                    None,
-                )
-                .await;
-            reset_prompt_pack_v2(db, workspace_id, default_account_id).await?;
-            Ok(true)
-        }
+        // A failed read is not evidence that the workspace is empty. Propagate the error and
+        // perform zero writes; otherwise a transient read failure can trigger a destructive
+        // four-collection reset after connectivity recovers.
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -2439,10 +2413,18 @@ mod ab_bucket_tests {
     fn refreshable_prompt_only_system_true() {
         assert!(is_refreshable_prompt_seeded_by(&Some("system".to_string())));
         // 其余脉络一律保留（不可刷新）
-        assert!(!is_refreshable_prompt_seeded_by(&Some("manual".to_string())));
-        assert!(!is_refreshable_prompt_seeded_by(&Some("evolution_release".to_string())));
-        assert!(!is_refreshable_prompt_seeded_by(&Some("system_evolution_v1".to_string())));
-        assert!(!is_refreshable_prompt_seeded_by(&Some("operator".to_string())));
+        assert!(!is_refreshable_prompt_seeded_by(&Some(
+            "manual".to_string()
+        )));
+        assert!(!is_refreshable_prompt_seeded_by(&Some(
+            "evolution_release".to_string()
+        )));
+        assert!(!is_refreshable_prompt_seeded_by(&Some(
+            "system_evolution_v1".to_string()
+        )));
+        assert!(!is_refreshable_prompt_seeded_by(&Some(
+            "operator".to_string()
+        )));
         // None 保守视为不可刷新（不照搬 domain_configs 的 None→可刷新）
         assert!(!is_refreshable_prompt_seeded_by(&None));
     }
@@ -2501,7 +2483,9 @@ mod locale_tests {
 #[cfg(test)]
 mod reviewer_orientation_anchor_tests {
     use super::*;
-    use crate::agent::domain_profile::{DEFAULT_REVIEWER_REVIEW_FOCUS, REVIEWER_REVIEW_FOCUS_LABEL};
+    use crate::agent::domain_profile::{
+        DEFAULT_REVIEWER_REVIEW_FOCUS, REVIEWER_REVIEW_FOCUS_LABEL,
+    };
 
     /// G31 锚漂移护栏：reviewer **system** prompt（`user.review.system`，运行时由
     /// `load_prompt` → `default_prompt_content` → `prompt_specs()` 供给）实际「评审重点：…」
@@ -2624,13 +2608,24 @@ mod reply_task_single_shot_tests {
             .iter()
             .find(|s| s.key == "user.reply.task")
             .expect("user.reply.task prompt spec 存在");
-        for dead in ["intentAnalysis", "productFitScore", "forbiddenClaimRisk", "recommendedResourceIds"] {
+        for dead in [
+            "intentAnalysis",
+            "productFitScore",
+            "forbiddenClaimRisk",
+            "recommendedResourceIds",
+        ] {
             assert!(
                 !task.content.contains(dead),
                 "reply.task 模板不应再声明死字段 {dead}(无消费点,白占 token)"
             );
         }
-        for keep in ["memoryWriteScore", "matchedKnowledgeIds", "safeClaimsUsed", "objectionsDetected", "usedKnowledgeIds"] {
+        for keep in [
+            "memoryWriteScore",
+            "matchedKnowledgeIds",
+            "safeClaimsUsed",
+            "objectionsDetected",
+            "usedKnowledgeIds",
+        ] {
             assert!(task.content.contains(keep), "存活字段 {keep} 被误删");
         }
     }
@@ -2790,4 +2785,3 @@ mod reply_schema_evidence_tests {
         );
     }
 }
-

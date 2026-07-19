@@ -9,9 +9,9 @@ use mongodb::bson::{doc, oid::ObjectId, Bson, DateTime, Document};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::agent;
 use crate::auth::AuthenticatedAdmin;
 use crate::error::{AppError, AppResult};
-use crate::agent;
 
 use super::super::shared::*;
 use super::super::AppState;
@@ -46,9 +46,7 @@ pub async fn chat_turn(
 ) -> AppResult<Json<Value>> {
     let trimmed = body.content.trim();
     if trimmed.is_empty() {
-        return Err(AppError::BadRequest(
-            "content cannot be empty".to_string(),
-        ));
+        return Err(AppError::BadRequest("content cannot be empty".to_string()));
     }
     let session_id = body
         .session_id
@@ -70,17 +68,15 @@ pub async fn chat_turn(
         .unwrap_or_else(|| "default".to_string());
 
     // 加载历史 turns（按 turn_index 升序）
-    let history = load_chat_history(&state, &admin.current_workspace, &account_id, &session_id).await?;
+    let history =
+        load_chat_history(&state, &admin.current_workspace, &account_id, &session_id).await?;
     // P1-7：原子预分配两个 turn_index——user turn + assistant turn，避免并发
     // 写者读到同一 last 制造重复索引。返回的是分配后的最大 seq；user 拿
     // `assistant_index - 1`、assistant 拿 `assistant_index`。
     let assistant_index =
         allocate_next_turn_indices(&state, &admin.current_workspace, &session_id, 2).await?;
     let next_index = assistant_index - 1;
-    let assistant_turns_so_far = history
-        .iter()
-        .filter(|t| t.role == "assistant")
-        .count() as i32;
+    let assistant_turns_so_far = history.iter().filter(|t| t.role == "assistant").count() as i32;
     if assistant_turns_so_far >= CHAT_MAX_TURNS_PER_SESSION {
         return Err(AppError::BadRequest(format!(
             "session {session_id} 已达 {CHAT_MAX_TURNS_PER_SESSION} 轮上限，请「应用为草稿」或开启新会话"
@@ -157,11 +153,11 @@ pub async fn chat_turn(
         .map(|arr| {
             arr.iter()
                 .filter_map(|x| {
-                    x.as_str()
-                        .map(|s| s.to_string())
-                        .or_else(|| {
-                            x.get("field").and_then(|f| f.as_str()).map(|s| s.to_string())
-                        })
+                    x.as_str().map(|s| s.to_string()).or_else(|| {
+                        x.get("field")
+                            .and_then(|f| f.as_str())
+                            .map(|s| s.to_string())
+                    })
                 })
                 .collect()
         })
@@ -193,12 +189,8 @@ pub async fn chat_turn(
     // knowledge-digest-workstation Phase 4 / P4.4：digest_action intent 命中时
     // LLM 出 plannedSteps + estimatedLlmCalls，转发给前端弹「派工确认」小卡。
     let planned_steps = result.get("plannedSteps").cloned();
-    let estimated_llm_calls = result
-        .get("estimatedLlmCalls")
-        .and_then(|v| v.as_i64());
-    let can_apply = patch.is_some()
-        && missing_fields.is_empty()
-        && draft_kind.is_some();
+    let estimated_llm_calls = result.get("estimatedLlmCalls").and_then(|v| v.as_i64());
+    let can_apply = patch.is_some() && missing_fields.is_empty() && draft_kind.is_some();
     let tokens_used = budget.snapshot().tokens_used;
 
     // 写 assistant turn
@@ -288,9 +280,7 @@ pub async fn chat_turn(
         &admin.current_workspace,
         &account_id,
         "knowledge_chat_turn",
-        format!(
-            "AI 对话补完 sessionId={session_id} 第 {assistant_index} 轮 intent={intent}"
-        ),
+        format!("AI 对话补完 sessionId={session_id} 第 {assistant_index} 轮 intent={intent}"),
         doc! {
             "kind": "chunk_chat_session",
             "sessionId": &session_id,
@@ -344,7 +334,9 @@ pub(in crate::routes) async fn chat_history(
                 "workspace_id": &admin.current_workspace,
                 "session_id": trimmed,
             },
-            FindOptions::builder().sort(doc! { "turn_index": 1 }).build(),
+            FindOptions::builder()
+                .sort(doc! { "turn_index": 1 })
+                .build(),
         )
         .await?;
     let mut items: Vec<Value> = vec![];
@@ -445,8 +437,16 @@ pub async fn chat_apply(
                     }
                 })
                 .filter(|a| !a.is_empty() && *a != state.config.default_account_id);
-            apply_create_chunk(&state, &admin.current_workspace, create_account_id.as_deref(), &trimmed, patch, target_pack_id.as_deref(), &operator_statement)
-                .await?
+            apply_create_chunk(
+                &state,
+                &admin.current_workspace,
+                create_account_id.as_deref(),
+                &trimmed,
+                patch,
+                target_pack_id.as_deref(),
+                &operator_statement,
+            )
+            .await?
         }
         "update_chunk" => {
             let chunk_id = target_chunk_id.clone().ok_or_else(|| {
@@ -462,7 +462,15 @@ pub async fn chat_apply(
                 .filter(|c| !c.is_empty())
                 .collect::<Vec<_>>()
                 .join("\n");
-            apply_update_chunk(&state, &admin.current_workspace, &account_id, &chunk_id, patch, &operator_statement).await?
+            apply_update_chunk(
+                &state,
+                &admin.current_workspace,
+                &account_id,
+                &chunk_id,
+                patch,
+                &operator_statement,
+            )
+            .await?
         }
         other => {
             return Err(AppError::BadRequest(format!(
@@ -600,7 +608,9 @@ async fn load_chat_history(
         .knowledge_chat_turns()
         .find(
             filter,
-            FindOptions::builder().sort(doc! { "turn_index": 1 }).build(),
+            FindOptions::builder()
+                .sort(doc! { "turn_index": 1 })
+                .build(),
         )
         .await?;
     let mut items = vec![];
@@ -750,7 +760,9 @@ fn synthesize_natural_reply_from_patch(out: &Value) -> Option<String> {
             arr.iter()
                 .filter_map(|x| {
                     x.as_str().map(|s| s.to_string()).or_else(|| {
-                        x.get("field").and_then(|f| f.as_str()).map(|s| s.to_string())
+                        x.get("field")
+                            .and_then(|f| f.as_str())
+                            .map(|s| s.to_string())
                     })
                 })
                 .map(|s| field_label(&s).to_string())
@@ -763,7 +775,10 @@ fn synthesize_natural_reply_from_patch(out: &Value) -> Option<String> {
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
     {
-        format!("我已经按您的要求起草好{}，拟定的标题是「{t}」。", filled.join("、"))
+        format!(
+            "我已经按您的要求起草好{}，拟定的标题是「{t}」。",
+            filled.join("、")
+        )
     } else {
         format!("我已经为您起草好了{}。", filled.join("、"))
     };
@@ -795,15 +810,10 @@ async fn run_chat_turn_pipeline(
     // knowledge-digest-workstation Phase 5：先取运营长期偏好记忆，作为
     // intent 分类与下游分支的 prompt header。与 contacts.memory_card 物理
     // 隔离（仅触达 knowledge_operator_memory collection）。
-    let operator_memory = agent::load_operator_memory(
-        &state.db,
-        workspace_id,
-        account_id,
-        operator_id,
-        5,
-    )
-    .await
-    .unwrap_or_default();
+    let operator_memory =
+        agent::load_operator_memory(&state.db, workspace_id, account_id, operator_id, 5)
+            .await
+            .unwrap_or_default();
     let operator_memory_header = render_operator_memory_for_prompt(&operator_memory);
 
     // 1. intent 分类
@@ -900,12 +910,19 @@ async fn run_chat_turn_pipeline(
             v["promptKey"] = json!("knowledge.chat.intent");
             v
         }
-        _ => clarify_for_chat(state, workspace_id, account_id, session_id, user_content, history)
-            .await
-            .map(|mut v| {
-                v["promptKey"] = json!("knowledge.chat.clarify");
-                v
-            })?,
+        _ => clarify_for_chat(
+            state,
+            workspace_id,
+            account_id,
+            session_id,
+            user_content,
+            history,
+        )
+        .await
+        .map(|mut v| {
+            v["promptKey"] = json!("knowledge.chat.clarify");
+            v
+        })?,
     };
 
     out["intent"] = json!(intent);
@@ -933,7 +950,14 @@ fn render_chat_history_for_prompt(history: &[KnowledgeChatTurn]) -> String {
         return "（暂无历史）".to_string();
     }
     let mut s = String::new();
-    for t in history.iter().rev().take(6).collect::<Vec<_>>().iter().rev() {
+    for t in history
+        .iter()
+        .rev()
+        .take(6)
+        .collect::<Vec<_>>()
+        .iter()
+        .rev()
+    {
         s.push_str(&format!(
             "- [{}] {}: {}\n",
             t.turn_index,
@@ -1083,10 +1107,7 @@ async fn run_chat_with_tools(
         .await?
         .try_collect()
         .await?;
-    let knowledge = KnowledgeRuntime {
-        documents,
-        chunks,
-    };
+    let knowledge = KnowledgeRuntime { documents, chunks };
     let runtime = UserRuntimeParameters::default();
 
     // 取当前 RUN_BUDGET（chat_turn handler 已经 scope 进来了）；
@@ -1135,9 +1156,7 @@ async fn run_chat_with_tools(
             } else {
                 format!("{user_owned}\n\n[system tool result]{tool_results_owned}")
             };
-            let run_id = format!(
-                "chat-{session_id_owned}-{run_key_owned}-loop-{loop_count}"
-            );
+            let run_id = format!("chat-{session_id_owned}-{run_key_owned}-loop-{loop_count}");
             let value = agent::generate_agent_json(
                 &state_arc,
                 Some(&account_id_owned),
@@ -1153,8 +1172,7 @@ async fn run_chat_with_tools(
                 *guard = Some(value.clone());
             }
             // 反序列化为 RawAgentDecision，再 promote 到 AgentDecision。
-            let raw: RawAgentDecision =
-                serde_json::from_value(value).map_err(AppError::from)?;
+            let raw: RawAgentDecision = serde_json::from_value(value).map_err(AppError::from)?;
             let (decision, promote_risks) = raw.validate_and_promote(&runtime_for_fn);
             Ok((decision, promote_risks))
         });
@@ -1267,7 +1285,10 @@ async fn update_operator_memory_for_chat(
         "context" => "背景",
         other => other,
     };
-    let summary = format!("已记下您的{kind_label}：{}", truncate_for_prompt(&content, 80));
+    let summary = format!(
+        "已记下您的{kind_label}：{}",
+        truncate_for_prompt(&content, 80)
+    );
     record_repair_event(
         state,
         workspace_id,
@@ -1951,9 +1972,9 @@ pub(in crate::routes) async fn chat_task_create(
         if d.get_str("stepId").is_err() {
             d.insert("stepId", format!("step_{}", idx + 1));
         }
-        let action = d.get_str("action").map_err(|_| {
-            AppError::BadRequest(format!("plannedSteps[{idx}].action 缺失"))
-        })?;
+        let action = d
+            .get_str("action")
+            .map_err(|_| AppError::BadRequest(format!("plannedSteps[{idx}].action 缺失")))?;
         if !ALLOWED_TASK_ACTIONS.contains(&action) {
             return Err(AppError::BadRequest(format!(
                 "plannedSteps[{idx}].action='{action}' 不在允许集合内：{:?}",
@@ -2008,7 +2029,8 @@ pub(in crate::routes) async fn chat_task_create(
 
     // 立刻写一条 task_progress turn 记录派工已落库。
     // P1-7：原子分配新 turn_index，避免与并发 chat_turn / worker 写入冲突。
-    let next_index = allocate_next_turn_indices(&state, &admin.current_workspace, session_id, 1).await?;
+    let next_index =
+        allocate_next_turn_indices(&state, &admin.current_workspace, session_id, 1).await?;
     let turn = KnowledgeChatTurn {
         id: None,
         workspace_id: admin.current_workspace.clone(),
@@ -2189,7 +2211,9 @@ pub(in crate::routes) async fn chat_task_cancel(
             }
         }
     }
-    Ok(Json(json!({ "ok": true, "taskId": id_hex, "status": "cancelled" })))
+    Ok(Json(
+        json!({ "ok": true, "taskId": id_hex, "status": "cancelled" }),
+    ))
 }
 
 /// `GET /api/knowledge/chat/sessions/:sid/stream`：SSE 推送最新 turn_index。
@@ -2204,8 +2228,8 @@ pub(in crate::routes) async fn chat_session_stream(
 ) -> axum::response::Sse<
     impl futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
 > {
-    use axum::response::sse::{Event, KeepAlive, Sse};
     use crate::knowledge_task::CLOSE_SENTINEL;
+    use axum::response::sse::{Event, KeepAlive, Sse};
     let rx = state.chat_progress_bus.subscribe(&session_id).await;
     // 用 futures::stream::unfold 把 watch::Receiver 转成 SSE Stream，
     // 避免引入 tokio-stream 新依赖。state 是 (Receiver, closed) 元组——一旦

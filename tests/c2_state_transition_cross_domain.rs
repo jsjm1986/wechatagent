@@ -101,7 +101,10 @@ fn cross_domain_illegal_transitions_rejected() {
     let cfg = medical_domain_config();
     // 跳步：初诊直接→已治疗（treated.allowedFrom 不含 initial_consult）。
     let reason = check_state_transition(Some(&cfg), Some("initial_consult"), "treated");
-    assert!(reason.is_some(), "初诊直接→已治疗应被拦（跳过方案确认/复诊）");
+    assert!(
+        reason.is_some(),
+        "初诊直接→已治疗应被拦（跳过方案确认/复诊）"
+    );
     assert!(
         reason.unwrap().contains("state_transition_invalid"),
         "拦截理由须含 state_transition_invalid"

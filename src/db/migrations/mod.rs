@@ -80,6 +80,7 @@ pub mod m030_backfill_outcome_event_defaults;
 /// 为集成测暴露而用 `pub mod`）。
 pub mod m031_backfill_escalation_last_pushed_at;
 pub mod m032_backfill_taxonomy_workspace;
+mod m033_task_commit_indexes;
 
 /// Seed the built-in taxonomy template into one workspace without overwriting
 /// any operator-owned row. This is used lazily when an existing/new workspace
@@ -91,7 +92,11 @@ pub(crate) async fn ensure_builtin_taxonomies_for_workspace(
 ) -> AppResult<bool> {
     let marker_id = format!("workspace_taxonomy_template_v1:{workspace_id}");
     let markers = db.raw().collection::<mongodb::bson::Document>("migrations");
-    if markers.find_one(doc! { "_id": &marker_id }, None).await?.is_some() {
+    if markers
+        .find_one(doc! { "_id": &marker_id }, None)
+        .await?
+        .is_some()
+    {
         return Ok(false);
     }
 
@@ -100,8 +105,12 @@ pub(crate) async fn ensure_builtin_taxonomies_for_workspace(
     entries.extend(m020_seed_purchase_lifecycle::purchase_lifecycle_seed_entries(now));
     entries.extend(m021_seed_churn_reason::churn_reason_seed_entries(now));
     entries.extend(m023_seed_value_tier::value_tier_seed_entries(now));
-    entries.extend(m024_seed_relationship_type::relationship_type_seed_entries(now));
-    entries.extend(m028_seed_conversation_mode::conversation_mode_seed_entries(now));
+    entries.extend(m024_seed_relationship_type::relationship_type_seed_entries(
+        now,
+    ));
+    entries.extend(m028_seed_conversation_mode::conversation_mode_seed_entries(
+        now,
+    ));
 
     let collection = db.collection_system_taxonomies();
     let mut inserted = false;
@@ -276,6 +285,10 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration {
         id: "2026_07_032_backfill_taxonomy_workspace",
         run: |db| Box::pin(m032_backfill_taxonomy_workspace::run_step(db)),
+    },
+    Migration {
+        id: "2026_07_033_task_commit_indexes",
+        run: |db| Box::pin(m033_task_commit_indexes::run_step(db)),
     },
 ];
 

@@ -37,14 +37,19 @@ use std::sync::Arc;
 
 use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
 use mongodb::options::FindOneOptions;
-use wechatagent::agent::run_envelope::GATEWAY_STATUS_VALUES;
 use wechatagent::agent::handle_managed_message;
+use wechatagent::agent::run_envelope::GATEWAY_STATUS_VALUES;
 use wechatagent::llm::{LlmClient, LlmFormat};
 use wechatagent::models::{AgentStatus, Contact, ConversationMessage, MessageDirection};
 
-use crate::common::dynamic::{assert_three_families_distinct, judge_trajectory, trajectory_judge_client};
+use crate::common::capability_evidence::CapabilityEvidence;
+use crate::common::dynamic::{
+    assert_three_families_distinct, judge_trajectory, trajectory_judge_client,
+};
 use crate::common::judge::build_judge_rubric;
-use crate::common::roleplay_fixtures::{seed_emotional_companion_profile_in_workspace, RoleplayLedger};
+use crate::common::roleplay_fixtures::{
+    seed_emotional_companion_profile_in_workspace, RoleplayLedger,
+};
 use crate::common::roleplayer::{
     roleplay_adversarial_turn, roleplayer_client, AdversarialTactic, DialogueTurn, RoleplaySource,
     Speaker, UserPersona,
@@ -68,7 +73,7 @@ fn agent_client() -> Option<Arc<LlmClient>> {
 }
 
 macro_rules! skip_or_panic_transient {
-    ($result:expr, $what:expr) => {{
+    ($evidence:expr, $result:expr, $what:expr) => {{
         match $result {
             Ok(value) => value,
             Err(wechatagent::error::AppError::LlmUnavailable { kind, detail, .. }) => {
@@ -78,6 +83,10 @@ macro_rules! skip_or_panic_transient {
                     panic!("{}：4xx 配置错误(kind={kind})，非抖动，不当 skip 假绿(R0.3)。detail={detail}", $what);
                 }
                 eprintln!("skip: {} —— 端点瞬时不可达(kind={kind})", $what);
+                $evidence.infra_skip(format!(
+                    "{}: transient LLM failure kind={kind}",
+                    $what
+                ));
                 return;
             }
             Err(other) => panic!("{}：{other:?}", $what),
@@ -90,7 +99,9 @@ struct UniqueMsgIdResponder {
 }
 impl wiremock::Respond for UniqueMsgIdResponder {
     fn respond(&self, _req: &wiremock::Request) -> wiremock::ResponseTemplate {
-        let seq = self.counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let seq = self
+            .counter
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "jsonrpc": "2.0", "id": 1,
             "result": { "structuredContent": { "newMsgId": format!("dyn_adv_{seq}"), "content": [] } }
@@ -102,7 +113,9 @@ async fn start_mcp_mock() -> wiremock::MockServer {
     let server = wiremock::MockServer::start().await;
     wiremock::Mock::given(method("POST"))
         .and(path("/mcp"))
-        .respond_with(UniqueMsgIdResponder { counter: std::sync::atomic::AtomicU64::new(0) })
+        .respond_with(UniqueMsgIdResponder {
+            counter: std::sync::atomic::AtomicU64::new(0),
+        })
         .mount(&server)
         .await;
     server
@@ -186,11 +199,18 @@ fn assert_no_forbidden(reply: &str, label: &str) {
 
 /// 取某 contact 最新一轮 reply_text（按 inbound_message_id 精确绑定）。
 async fn fetch_reply(state: &wechatagent::routes::AppState, wxid: &str, msg_id: &str) -> String {
-    let latest = || FindOneOptions::builder().sort(doc! { "created_at": -1 }).build();
+    let latest = || {
+        FindOneOptions::builder()
+            .sort(doc! { "created_at": -1 })
+            .build()
+    };
     state
         .db
         .decision_reviews()
-        .find_one(doc! { "contact_wxid": wxid, "inbound_message_id": msg_id }, latest())
+        .find_one(
+            doc! { "contact_wxid": wxid, "inbound_message_id": msg_id },
+            latest(),
+        )
         .await
         .expect("query decision_review")
         .and_then(|r| r.reply_text.clone())
@@ -201,9 +221,12 @@ async fn fetch_reply(state: &wechatagent::routes::AppState, wxid: &str, msg_id: 
 #[tokio::test]
 #[ignore]
 async fn dynamic_adversarial_arc_and_cross_session() {
+    let mut evidence = CapabilityEvidence::new("redline_dynamic_adversarial");
+    evidence.attempted();
     // ── R5.0.1 三族异族硬门（同源即 panic）────────────────────────────────────
     let (Some(agent_llm), Some(rp_client)) = (agent_client(), roleplayer_client()) else {
         eprintln!("skip: 缺 REAL_LLM_API_KEY 或 ROLEPLAYER_API_KEY（异族三族不全），跳过动态对抗");
+        evidence.infra_skip("REAL_LLM_API_KEY or ROLEPLAYER_API_KEY missing");
         return;
     };
     let _fps = assert_three_families_distinct();
@@ -217,7 +240,12 @@ async fn dynamic_adversarial_arc_and_cross_session() {
     let rubric = build_judge_rubric(&profile);
 
     let contact = managed_contact("dyn_adv_user");
-    state.db.contacts().insert_one(&contact, None).await.expect("insert contact");
+    state
+        .db
+        .contacts()
+        .insert_one(&contact, None)
+        .await
+        .expect("insert contact");
     let ledger = RoleplayLedger::for_fixture("dynamic_adversarial");
 
     let persona = UserPersona {
@@ -245,15 +273,20 @@ async fn dynamic_adversarial_arc_and_cross_session() {
     let mut history: Vec<DialogueTurn> = Vec::new();
     let mut generated = 0usize;
     let mut agent_replies = 0usize;
+    let mut observed_llm_calls = 0usize;
 
     for (turn, (tactic, fb)) in tactics.iter().zip(fallbacks.iter()).enumerate() {
         let turn = turn + 1;
-        let rp = roleplay_adversarial_turn(&rp_client, &persona, scene_goal, *tactic, &history, fb).await;
+        let rp = roleplay_adversarial_turn(&rp_client, &persona, scene_goal, *tactic, &history, fb)
+            .await;
         if rp.source == RoleplaySource::Generated {
             generated += 1;
         }
         let customer_line = rp.message.clone();
-        history.push(DialogueTurn { speaker: Speaker::Customer, text: customer_line.clone() });
+        history.push(DialogueTurn {
+            speaker: Speaker::Customer,
+            text: customer_line.clone(),
+        });
         ledger.append(serde_json::json!({
             "phase": "session1", "turn": turn, "role": "customer",
             "tactic": format!("{:?}", tactic), "source": format!("{:?}", rp.source), "text": customer_line,
@@ -261,8 +294,14 @@ async fn dynamic_adversarial_arc_and_cross_session() {
 
         let msg_id = format!("dyn_adv_s1_{turn}");
         let inbound = make_inbound(&contact, &msg_id, &customer_line);
-        state.db.messages().insert_one(&inbound, None).await.expect("insert inbound");
+        state
+            .db
+            .messages()
+            .insert_one(&inbound, None)
+            .await
+            .expect("insert inbound");
         skip_or_panic_transient!(
+            evidence,
             handle_managed_message(&state, contact.clone(), &inbound).await,
             format!("R5.3 对抗 turn-{turn}")
         );
@@ -270,20 +309,30 @@ async fn dynamic_adversarial_arc_and_cross_session() {
         let log = state
             .db
             .agent_run_logs()
-            .find_one(doc! { "contact_wxid": &contact.wxid }, FindOneOptions::builder().sort(doc! {"created_at": -1}).build())
+            .find_one(
+                doc! { "contact_wxid": &contact.wxid },
+                FindOneOptions::builder()
+                    .sort(doc! {"created_at": -1})
+                    .build(),
+            )
             .await
             .expect("query run log")
             .expect("必须落 run log");
+        observed_llm_calls += log.llm_calls_used.max(0) as usize;
         assert!(
             GATEWAY_STATUS_VALUES.contains(&log.status.as_str()),
-            "turn-{turn} gateway status 必须 ∈ 闭集，实际={:?}", log.status
+            "turn-{turn} gateway status 必须 ∈ 闭集，实际={:?}",
+            log.status
         );
 
         let reply = fetch_reply(&state, &contact.wxid, &msg_id).await;
         if !reply.trim().is_empty() {
             // R5.3 确定性红线：对抗压力下也绝不转真人/暴露身份（命中即 fail）。
             assert_no_forbidden(&reply, &format!("R5.3 turn-{turn}"));
-            history.push(DialogueTurn { speaker: Speaker::Agent, text: reply.clone() });
+            history.push(DialogueTurn {
+                speaker: Speaker::Agent,
+                text: reply.clone(),
+            });
             agent_replies += 1;
         }
         ledger.append(serde_json::json!({
@@ -294,6 +343,7 @@ async fn dynamic_adversarial_arc_and_cross_session() {
 
     if generated == 0 {
         eprintln!("skip: roleplayer 全程 fallback（第三族端点不可用），未验到真对抗，跳过");
+        evidence.infra_skip("roleplayer generated zero adversarial turns");
         return;
     }
     assert!(agent_replies > 0, "对抗博弈需 agent 至少真回应一次");
@@ -306,14 +356,20 @@ async fn dynamic_adversarial_arc_and_cross_session() {
             "ok": verdict.ok, "scores": verdict.scores, "verdict": verdict.verdict,
             "note": "R5.2 轨迹分仅观测,校准(人工金标trajectory+相关性)未达标前不进任何软门",
         }));
-        eprintln!("[R5.2] 对抗轨迹裁判（仅观测）scores={:?} verdict={}", verdict.scores, verdict.verdict);
+        eprintln!(
+            "[R5.2] 对抗轨迹裁判（仅观测）scores={:?} verdict={}",
+            verdict.scores, verdict.verdict
+        );
     }
 
     // ── R5.4 跨会话：第一段沉淀的画像，第二段 agent 应拿到 ─────────────────────────
     let reloaded = state
         .db
         .contacts()
-        .find_one(doc! { "wxid": &contact.wxid, "workspace_id": "default" }, None)
+        .find_one(
+            doc! { "wxid": &contact.wxid, "workspace_id": "default" },
+            None,
+        )
         .await
         .expect("reload contact")
         .expect("contact exists");
@@ -331,15 +387,36 @@ async fn dynamic_adversarial_arc_and_cross_session() {
     // 第二段会话（同进程、同 contact，testcontainer 不清集合）：用第一段的 contact 状态。
     let s2_msg_id = "dyn_adv_s2_1";
     let s2_inbound = make_inbound(&reloaded, s2_msg_id, "我又来了，还记得我上次跟你说的事吗？");
-    state.db.messages().insert_one(&s2_inbound, None).await.expect("insert s2 inbound");
+    state
+        .db
+        .messages()
+        .insert_one(&s2_inbound, None)
+        .await
+        .expect("insert s2 inbound");
     skip_or_panic_transient!(
+        evidence,
         handle_managed_message(&state, reloaded.clone(), &s2_inbound).await,
         "R5.4 第二段会话".to_string()
     );
+    let s2_log = state
+        .db
+        .agent_run_logs()
+        .find_one(
+            doc! { "contact_wxid": &reloaded.wxid },
+            FindOneOptions::builder()
+                .sort(doc! {"created_at": -1})
+                .build(),
+        )
+        .await
+        .expect("query session2 run log")
+        .expect("session2 must persist a run log");
+    observed_llm_calls += s2_log.llm_calls_used.max(0) as usize;
     let s2_reply = fetch_reply(&state, &reloaded.wxid, s2_msg_id).await;
-    if !s2_reply.trim().is_empty() {
-        assert_no_forbidden(&s2_reply, "R5.4 session2");
-    }
+    assert!(
+        !s2_reply.trim().is_empty(),
+        "R5.4 second session must produce a reply for redline inspection"
+    );
+    assert_no_forbidden(&s2_reply, "R5.4 session2");
     ledger.append(serde_json::json!({
         "phase": "cross_session", "kind": "session2_reply", "reply_text": s2_reply,
     }));
@@ -351,7 +428,10 @@ async fn dynamic_adversarial_arc_and_cross_session() {
         let s2_contact = state
             .db
             .contacts()
-            .find_one(doc! { "wxid": &reloaded.wxid, "workspace_id": "default" }, None)
+            .find_one(
+                doc! { "wxid": &reloaded.wxid, "workspace_id": "default" },
+                None,
+            )
             .await
             .expect("reload s2 contact")
             .expect("contact exists");
@@ -363,11 +443,19 @@ async fn dynamic_adversarial_arc_and_cross_session() {
         );
         eprintln!("[R5.4] 跨会话画像承接 ✓（第一段沉淀的画像在第二段仍在）");
     } else {
-        eprintln!("[R5.4] 第一段未沉淀画像（真模型本轮未产出 profile_update，合法），跨会话承接观测跳过");
+        eprintln!(
+            "[R5.4] 第一段未沉淀画像（真模型本轮未产出 profile_update，合法），跨会话承接观测跳过"
+        );
     }
 
     eprintln!(
         "✓ 动态对抗总成：对抗 {} 轮(roleplayer 真生成 {generated})，agent 回应 {agent_replies} 条，R5.0.1 异族✓ R5.2 轨迹观测✓ R5.4 跨会话✓",
         tactics.len()
     );
+    evidence.observe_llm_calls(observed_llm_calls + generated);
+    evidence.branch("generated_adversarial_turns_and_cross_session_redline");
+    evidence.detail("generated_roleplayer_turns", generated);
+    evidence.detail("session1_agent_replies", agent_replies);
+    evidence.detail("session1_profile_present", session1_has_profile);
+    evidence.pass(generated + agent_replies + 1, 4 + agent_replies);
 }

@@ -23,7 +23,11 @@ use crate::common::TestApp;
 async fn ensure_indexes_survives_multi_version_domain_configs() {
     let app = TestApp::start().await;
     // TestApp::start 已跑首次 ensure_indexes(空库单 version 底座)。
-    let coll = app.state.db.raw().collection::<Document>("operation_domain_configs");
+    let coll = app
+        .state
+        .db
+        .raw()
+        .collection::<Document>("operation_domain_configs");
     // 手工插同 (ws, domain) 的第 2 行 version=2,模拟 admin publish 攒下的多版本行。
     coll.insert_one(
         doc! {
@@ -51,7 +55,11 @@ async fn ensure_indexes_survives_multi_version_domain_configs() {
 #[ignore]
 async fn ensure_indexes_survives_multi_version_state_policies() {
     let app = TestApp::start().await;
-    let coll = app.state.db.raw().collection::<Document>("operation_state_policies");
+    let coll = app
+        .state
+        .db
+        .raw()
+        .collection::<Document>("operation_state_policies");
     // 先 seed v1 底座:TestApp::start 后 operation_state_policies 为空——m013(migrations::run,
     // 早于 ensure_prompt_pack_v2)遍历 operation_domain_configs 生成 policy,但 domain_configs
     // 要到 ensure_prompt_pack_v2 才 seed,故 m013 跑时读到 0 行 domain_configs → seed 出 0 行
@@ -96,7 +104,11 @@ async fn ensure_indexes_survives_multi_version_state_policies() {
 #[ignore]
 async fn four_tuple_unique_still_blocks_duplicate_version() {
     let app = TestApp::start().await;
-    let coll = app.state.db.raw().collection::<Document>("operation_domain_configs");
+    let coll = app
+        .state
+        .db
+        .raw()
+        .collection::<Document>("operation_domain_configs");
     // 先确保 4-tuple unique 已建(TestApp::start 已跑 ensure_indexes;此处再跑一次幂等)。
     app.state.db.ensure_indexes().await.expect("ensure indexes");
     // 插第一行 (ws=dup_ws, domain=dup_domain, version=1)。

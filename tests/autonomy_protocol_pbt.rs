@@ -253,8 +253,6 @@ proptest! {
     }
 }
 
-
-
 // ─────────────────────────────────────────────────────────────────
 // P2 single-shot revision 上限（task 4.15）
 // ─────────────────────────────────────────────────────────────────
@@ -343,7 +341,11 @@ fn run_revision_loop(
     // 首轮 finalize 未通过 → gateway 直接 fail-closed return（gateway.rs:937），
     // 永远不进入 revision 块。模型保留首轮 should_reply 与 status。
     if !initial.finalize_approved {
-        let status = if initial.should_hold { "hold" } else { "blocked" };
+        let status = if initial.should_hold {
+            "hold"
+        } else {
+            "blocked"
+        };
         return (reply_calls, false, status);
     }
 

@@ -322,7 +322,10 @@ fn pending_review_card_labels(
             "negative_example_review".to_string(),
         );
     }
-    (format!("待审切片：{base_title}"), "pending_review".to_string())
+    (
+        format!("待审切片：{base_title}"),
+        "pending_review".to_string(),
+    )
 }
 
 pub(in crate::routes) async fn knowledge_inbox(
@@ -425,9 +428,7 @@ pub(in crate::routes) async fn knowledge_inbox(
         .await?;
     let chunks: Vec<OperationKnowledgeChunk> = chunks_cursor.try_collect().await?;
 
-    let cutoff_ms = (chrono::Utc::now()
-        - chrono::Duration::days(7))
-    .timestamp_millis();
+    let cutoff_ms = (chrono::Utc::now() - chrono::Duration::days(7)).timestamp_millis();
 
     for c in &chunks {
         let chunk_id_hex = match &c.id {
@@ -461,16 +462,13 @@ pub(in crate::routes) async fn knowledge_inbox(
                 priority: inbox_pending_review_priority(&c.chunk_type).into(),
                 kind: "repair_chunk".into(),
                 title: card_title,
-                context_summary: c
-                    .summary
-                    .clone()
-                    .unwrap_or_else(|| {
-                        if is_negative_example {
-                            "AI 从 reviewer 误判信号入队，等运营 admin 二次确认。".into()
-                        } else {
-                            "AI 起草，等运营确认。".into()
-                        }
-                    }),
+                context_summary: c.summary.clone().unwrap_or_else(|| {
+                    if is_negative_example {
+                        "AI 从 reviewer 误判信号入队，等运营 admin 二次确认。".into()
+                    } else {
+                        "AI 起草，等运营确认。".into()
+                    }
+                }),
                 target_chunk_id: Some(chunk_id_hex.clone()),
                 target_pack_id: None,
                 suggested_actions: vec!["open_chat".into(), "open_repair".into(), "dismiss".into()],
@@ -565,15 +563,24 @@ mod tests {
     fn pending_review_card_labels_distinguishes_human_audit() {
         // needs_human_audit → "AI预审通过待复核" + origin human_audit_pending
         let (title, origin) = pending_review_card_labels("needs_human_audit", "价格政策", false);
-        assert!(title.contains("预审") && title.contains("价格政策"), "title={title}");
+        assert!(
+            title.contains("预审") && title.contains("价格政策"),
+            "title={title}"
+        );
         assert_eq!(origin, "human_audit_pending");
         // needs_review 反例 → 保持原"待审反例"/negative_example_review
         let (t2, o2) = pending_review_card_labels("needs_review", "反面话术", true);
-        assert!(t2.contains("待审反例") && t2.contains("反面话术"), "t2={t2}");
+        assert!(
+            t2.contains("待审反例") && t2.contains("反面话术"),
+            "t2={t2}"
+        );
         assert_eq!(o2, "negative_example_review");
         // needs_review 普通 → 保持原"待审切片"/pending_review
         let (t3, o3) = pending_review_card_labels("needs_review", "常规切片", false);
-        assert!(t3.contains("待审切片") && t3.contains("常规切片"), "t3={t3}");
+        assert!(
+            t3.contains("待审切片") && t3.contains("常规切片"),
+            "t3={t3}"
+        );
         assert_eq!(o3, "pending_review");
     }
 
@@ -591,12 +598,27 @@ mod tests {
     /// 这把封闭枚举绑定在测试上，新加 kind 必须显式更新。
     #[test]
     fn inbox_digest_kind_mapping_is_total_for_known_kinds() {
-        assert_eq!(digest_kind_to_inbox_kind("chunk_missing_field"), "fill_field");
-        assert_eq!(digest_kind_to_inbox_kind("chunk_low_hit_rate"), "repair_chunk");
-        assert_eq!(digest_kind_to_inbox_kind("chunk_caused_block"), "repair_chunk");
+        assert_eq!(
+            digest_kind_to_inbox_kind("chunk_missing_field"),
+            "fill_field"
+        );
+        assert_eq!(
+            digest_kind_to_inbox_kind("chunk_low_hit_rate"),
+            "repair_chunk"
+        );
+        assert_eq!(
+            digest_kind_to_inbox_kind("chunk_caused_block"),
+            "repair_chunk"
+        );
         assert_eq!(digest_kind_to_inbox_kind("pack_outdated"), "repair_chunk");
-        assert_eq!(digest_kind_to_inbox_kind("evolution_pending"), "repair_chunk");
-        assert_eq!(digest_kind_to_inbox_kind("evolution_released"), "repair_chunk");
+        assert_eq!(
+            digest_kind_to_inbox_kind("evolution_pending"),
+            "repair_chunk"
+        );
+        assert_eq!(
+            digest_kind_to_inbox_kind("evolution_released"),
+            "repair_chunk"
+        );
         assert_eq!(digest_kind_to_inbox_kind("freeform"), "repair_chunk");
         // 未知 kind 走 fallback。
         assert_eq!(digest_kind_to_inbox_kind("__unknown__"), "repair_chunk");
@@ -638,12 +660,8 @@ mod tests {
     /// 在没有 mongo 的情况下用纯 Vec 验证 inbox 排序行为。
     #[test]
     fn inbox_sort_places_high_priority_first() {
-        let mut items: Vec<(&str, &str)> = vec![
-            ("c", "low"),
-            ("a", "high"),
-            ("b", "mid"),
-            ("d", "high"),
-        ];
+        let mut items: Vec<(&str, &str)> =
+            vec![("c", "low"), ("a", "high"), ("b", "mid"), ("d", "high")];
         items.sort_by(|x, y| priority_rank(y.1).cmp(&priority_rank(x.1)));
         let priorities: Vec<&str> = items.iter().map(|(_, p)| *p).collect();
         assert_eq!(priorities, vec!["high", "high", "mid", "low"]);
@@ -681,7 +699,7 @@ mod tests {
     /// 这是前后端对齐 Critical 缺陷修复后的契约快照（防回退）。
     #[test]
     fn serialize_digest_report_cards_are_camel_case_with_hex_card_id() {
-        use crate::models::{KnowledgeDigestCard, KnowledgeDailyReport};
+        use crate::models::{KnowledgeDailyReport, KnowledgeDigestCard};
         use mongodb::bson::{doc, oid::ObjectId, DateTime};
 
         let card_id = ObjectId::new();

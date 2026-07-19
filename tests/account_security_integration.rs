@@ -14,10 +14,10 @@ mod common;
 use axum::extract::{Extension, State};
 use mongodb::bson::DateTime;
 
+use crate::common::TestApp;
 use wechatagent::auth::AuthenticatedAdmin;
 use wechatagent::models::WechatAccount;
 use wechatagent::routes::accounts::{list_accounts, update_account_mcp_key};
-use crate::common::TestApp;
 
 /// 构造测试 admin auth context(`current_workspace` 决定 handler 可见/可写范围)。
 fn test_admin(workspace_id: &str) -> AuthenticatedAdmin {

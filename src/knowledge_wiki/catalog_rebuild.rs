@@ -46,10 +46,7 @@ pub async fn catalog_rebuild_worker_loop(db: Database, interval_secs: u64) {
         return;
     }
     let interval = Duration::from_secs(interval_secs);
-    tracing::info!(
-        interval_secs,
-        "catalog_rebuild_worker started"
-    );
+    tracing::info!(interval_secs, "catalog_rebuild_worker started");
     loop {
         match drain_pending_jobs(&db).await {
             Ok(n) if n > 0 => {
@@ -95,7 +92,9 @@ async fn drain_pending_jobs(db: &Database) -> Result<usize, AppError> {
 }
 
 /// 原子领取一条 queued job：`findOneAndUpdate(status="queued") => status="processing"`。
-async fn claim_one_job(db: &Database) -> Result<Option<crate::models::CatalogRebuildJob>, AppError> {
+async fn claim_one_job(
+    db: &Database,
+) -> Result<Option<crate::models::CatalogRebuildJob>, AppError> {
     let now = DateTime::now();
     let filter = doc! { "status": "queued" };
     let update = doc! {
@@ -187,10 +186,9 @@ pub fn render_persisted_catalog(chunks: &[crate::models::OperationKnowledgeChunk
     }
     let mut buf = String::with_capacity(chunks.len() * 256);
     for c in chunks {
-        let id = c
-            .id
-            .map(|o| o.to_hex())
-            .unwrap_or_else(|| String::from("?"));
+        let id =
+            c.id.map(|o| o.to_hex())
+                .unwrap_or_else(|| String::from("?"));
         let wiki_type = c
             .wiki_type
             .as_deref()
@@ -206,11 +204,7 @@ pub fn render_persisted_catalog(chunks: &[crate::models::OperationKnowledgeChunk
             .dynamic_confidence
             .map(|v| format!("{:.2}", v))
             .unwrap_or_else(|| "—".to_string());
-        let hits = c
-            .usage_stats
-            .as_ref()
-            .map(|u| u.hit_count_30d)
-            .unwrap_or(0);
+        let hits = c.usage_stats.as_ref().map(|u| u.hit_count_30d).unwrap_or(0);
         let excerpt = c
             .summary
             .as_deref()

@@ -128,14 +128,9 @@ pub(super) async fn approve_taxonomy_candidate(
     Json(payload): Json<ApproveCandidateRequest>,
 ) -> Result<Response, AppError> {
     let object_id = parse_object_id(&id)?;
-    let outcome = approve_candidate_transaction(
-        &state,
-        &admin.current_workspace,
-        object_id,
-        None,
-        &payload,
-    )
-    .await?;
+    let outcome =
+        approve_candidate_transaction(&state, &admin.current_workspace, object_id, None, &payload)
+            .await?;
     if outcome.duplicate {
         return Ok((
             StatusCode::CONFLICT,
@@ -225,20 +220,13 @@ pub(in crate::routes) async fn approve_taxonomy_candidate_inner(
     payload: ApproveCandidateRequest,
 ) -> AppResult<Value> {
     let object_id = parse_object_id(id)?;
-    let outcome = approve_candidate_transaction(
-        state,
-        workspace_id,
-        object_id,
-        Some(account_id),
-        &payload,
-    )
-    .await?;
+    let outcome =
+        approve_candidate_transaction(state, workspace_id, object_id, Some(account_id), &payload)
+            .await?;
     if outcome.duplicate {
         return Err(AppError::Conflict(format!(
             "duplicate_taxonomy: (scope={}, kind={}, value.id={}) 已存在；候选已置为 approved",
-            outcome.candidate.scope,
-            outcome.candidate.kind,
-            payload.canonical_value.id
+            outcome.candidate.scope, outcome.candidate.kind, payload.canonical_value.id
         )));
     }
     Ok(json!({ "item": taxonomy_candidate_json(outcome.candidate) }))
@@ -445,7 +433,7 @@ async fn approve_candidate_transaction(
             Err(error) => return Err(error.into()),
         }
     }
-    invalidate_global_taxonomy_cache();
+    invalidate_global_taxonomy_cache(&state.db);
     Ok(ApproveOutcome {
         candidate,
         duplicate,

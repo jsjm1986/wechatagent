@@ -51,7 +51,10 @@ pub(crate) fn extract_short_code(reply: &str, pending_codes: &[String]) -> Optio
 }
 
 /// 业务决策 #4：根据该真人当前所有 pending 台账 + 回复文本，决定匹配哪一条。
-pub(crate) fn match_principal_reply(reply: &str, pending: &[AgentPrincipalEscalation]) -> ReplyMatch {
+pub(crate) fn match_principal_reply(
+    reply: &str,
+    pending: &[AgentPrincipalEscalation],
+) -> ReplyMatch {
     let codes: Vec<String> = pending.iter().map(|e| e.short_code.clone()).collect();
     if codes.is_empty() {
         return ReplyMatch::NoPending;
@@ -257,8 +260,9 @@ pub(crate) fn relay_introduces_unauthorized_number(
     reply_text: &str,
     authorized_substance: &str,
 ) -> bool {
-    let authorized: std::collections::HashSet<String> =
-        extract_number_tokens(authorized_substance).into_iter().collect();
+    let authorized: std::collections::HashSet<String> = extract_number_tokens(authorized_substance)
+        .into_iter()
+        .collect();
     extract_number_tokens(reply_text)
         .into_iter()
         .any(|tok| !authorized.contains(&tok))
@@ -310,10 +314,8 @@ pub(crate) fn build_decision_signals_text(
 
     // ② 多轮卡死：同一议题连续未推进 + 最近一轮负面反应（两条件 AND）。
     let turns = consecutive_unprogressed_turns(&contact.intent_trajectory);
-    let latest_negative = latest_reaction_is_negative_with_polarity(
-        &contact.intent_trajectory,
-        negative_outcomes,
-    );
+    let latest_negative =
+        latest_reaction_is_negative_with_polarity(&contact.intent_trajectory, negative_outcomes);
     if is_stuck_or_undelivered(turns, DEFAULT_STUCK_THRESHOLD, latest_negative) {
         lines.push(
             "- 该议题已连续多轮未推进且客户有负面反应：避免硬推同一话术，考虑换个角度，或如实告诉客户你需要向领导确认后再答复。".to_string(),
@@ -541,18 +543,29 @@ mod tests {
 
     #[test]
     fn match_no_pending_returns_no_pending() {
-        assert_eq!(match_principal_reply("以后都按 8 折", &[]), ReplyMatch::NoPending);
+        assert_eq!(
+            match_principal_reply("以后都按 8 折", &[]),
+            ReplyMatch::NoPending
+        );
     }
 
     #[test]
     fn extract_short_code_is_case_insensitive() {
         let codes = vec!["E1A2".to_string()];
-        assert_eq!(extract_short_code("回复 e1a2 同意", &codes), Some("E1A2".into()));
+        assert_eq!(
+            extract_short_code("回复 e1a2 同意", &codes),
+            Some("E1A2".into())
+        );
     }
 
     #[test]
     fn principal_card_puts_code_first_and_is_not_redacted() {
-        let card = render_principal_card("E1A2", "张三(老客户)", "超出标准 9 折权限", "是否同意 8 折？");
+        let card = render_principal_card(
+            "E1A2",
+            "张三(老客户)",
+            "超出标准 9 折权限",
+            "是否同意 8 折？",
+        );
         assert!(card.starts_with("【请示 #E1A2】"));
         assert!(card.contains("张三(老客户)")); // 对领导不脱敏
         assert!(card.contains("是否同意 8 折？"));
@@ -560,7 +573,10 @@ mod tests {
 
     #[test]
     fn authorization_none_expiry_is_usable() {
-        assert!(authorization_is_usable(None, mongodb::bson::DateTime::now()));
+        assert!(authorization_is_usable(
+            None,
+            mongodb::bson::DateTime::now()
+        ));
     }
 
     #[test]
@@ -598,13 +614,22 @@ mod tests {
 
     #[test]
     fn high_risk_mode_parses_all() {
-        assert_eq!(parse_high_risk_mode(Some("all")), HighRiskEscalationMode::All);
+        assert_eq!(
+            parse_high_risk_mode(Some("all")),
+            HighRiskEscalationMode::All
+        );
     }
 
     #[test]
     fn high_risk_mode_defaults_to_decision_only() {
-        assert_eq!(parse_high_risk_mode(None), HighRiskEscalationMode::DecisionOnly);
-        assert_eq!(parse_high_risk_mode(Some("garbage")), HighRiskEscalationMode::DecisionOnly);
+        assert_eq!(
+            parse_high_risk_mode(None),
+            HighRiskEscalationMode::DecisionOnly
+        );
+        assert_eq!(
+            parse_high_risk_mode(Some("garbage")),
+            HighRiskEscalationMode::DecisionOnly
+        );
         assert_eq!(
             parse_high_risk_mode(Some("decision_only")),
             HighRiskEscalationMode::DecisionOnly
@@ -729,7 +754,10 @@ mod tests {
             &[],
         );
         // Task 1：合成构造器置来源标记 true（这是 relay 身份的唯一合法来源）。
-        assert!(msg.is_synthetic_relay, "synthetic_principal_relay 必须置 is_synthetic_relay=true");
+        assert!(
+            msg.is_synthetic_relay,
+            "synthetic_principal_relay 必须置 is_synthetic_relay=true"
+        );
         assert!(is_principal_relay_trigger(&AgentTrigger::Inbound(&msg)));
     }
 
@@ -808,8 +836,12 @@ mod tests {
     #[test]
     fn relay_output_guard_catches_field_marker_leak() {
         // 即使没透传哨兵，但漏了任一内部字段标记也命中。
-        assert!(relay_output_leaks_internal_payload("verdict=approved 可以给你"));
-        assert!(relay_output_leaks_internal_payload("领导说 substance=8折优惠"));
+        assert!(relay_output_leaks_internal_payload(
+            "verdict=approved 可以给你"
+        ));
+        assert!(relay_output_leaks_internal_payload(
+            "领导说 substance=8折优惠"
+        ));
         assert!(relay_output_leaks_internal_payload("constraints=本周付款"));
     }
 
@@ -863,7 +895,12 @@ mod tests {
     #[test]
     fn signals_empty_when_no_signal_present() {
         let contact = make_contact("cust1");
-        assert!(build_decision_signals_text(&contact, None, crate::agent::reaction::DEFAULT_NEGATIVE_OUTCOMES).is_empty());
+        assert!(build_decision_signals_text(
+            &contact,
+            None,
+            crate::agent::reaction::DEFAULT_NEGATIVE_OUTCOMES
+        )
+        .is_empty());
     }
 
     #[test]
@@ -872,8 +909,15 @@ mod tests {
         let mut attrs = mongodb::bson::Document::new();
         attrs.insert(AWAITING_PRINCIPAL_DECISION_ATTR, true);
         contact.domain_attributes = Some(attrs);
-        let text = build_decision_signals_text(&contact, None, crate::agent::reaction::DEFAULT_NEGATIVE_OUTCOMES);
-        assert!(text.contains("正在等待裁决"), "应出等待领导信号，实际：{text}");
+        let text = build_decision_signals_text(
+            &contact,
+            None,
+            crate::agent::reaction::DEFAULT_NEGATIVE_OUTCOMES,
+        );
+        assert!(
+            text.contains("正在等待裁决"),
+            "应出等待领导信号，实际：{text}"
+        );
     }
 
     #[test]
@@ -885,8 +929,15 @@ mod tests {
             traj_entry("user_replied_objection"),
             traj_entry("user_replied_objection"),
         ];
-        let text = build_decision_signals_text(&contact, None, crate::agent::reaction::DEFAULT_NEGATIVE_OUTCOMES);
-        assert!(text.contains("连续多轮未推进"), "应出卡死信号，实际：{text}");
+        let text = build_decision_signals_text(
+            &contact,
+            None,
+            crate::agent::reaction::DEFAULT_NEGATIVE_OUTCOMES,
+        );
+        assert!(
+            text.contains("连续多轮未推进"),
+            "应出卡死信号，实际：{text}"
+        );
     }
 
     #[test]
@@ -897,7 +948,12 @@ mod tests {
             traj_entry("user_replied_objection"),
             traj_entry("user_replied_objection"),
         ];
-        assert!(!build_decision_signals_text(&contact, None, crate::agent::reaction::DEFAULT_NEGATIVE_OUTCOMES).contains("连续多轮未推进"));
+        assert!(!build_decision_signals_text(
+            &contact,
+            None,
+            crate::agent::reaction::DEFAULT_NEGATIVE_OUTCOMES
+        )
+        .contains("连续多轮未推进"));
     }
 
     #[test]
@@ -909,7 +965,12 @@ mod tests {
             traj_entry("user_replied_positive"),
             traj_entry("user_replied_positive"),
         ];
-        assert!(!build_decision_signals_text(&contact, None, crate::agent::reaction::DEFAULT_NEGATIVE_OUTCOMES).contains("连续多轮未推进"));
+        assert!(!build_decision_signals_text(
+            &contact,
+            None,
+            crate::agent::reaction::DEFAULT_NEGATIVE_OUTCOMES
+        )
+        .contains("连续多轮未推进"));
     }
 
     #[test]
@@ -924,13 +985,15 @@ mod tests {
         // 自定义负集不含 objection → 末轮非负 → 不触发卡死（即便连续 3 轮同 intent）。
         let custom_negative = ["user_went_cold"];
         assert!(
-            !build_decision_signals_text(&contact, None, &custom_negative).contains("连续多轮未推进"),
+            !build_decision_signals_text(&contact, None, &custom_negative)
+                .contains("连续多轮未推进"),
             "自定义负集下 objection 不应判负、不触发卡死"
         );
         // 自定义负集含 objection → 恢复触发，证明极性确实来自传入集。
         let custom_with_objection = ["user_replied_objection"];
         assert!(
-            build_decision_signals_text(&contact, None, &custom_with_objection).contains("连续多轮未推进"),
+            build_decision_signals_text(&contact, None, &custom_with_objection)
+                .contains("连续多轮未推进"),
             "自定义负集含 objection 时应触发卡死"
         );
     }
@@ -966,36 +1029,64 @@ mod tests {
         // 证明极性来自配置：自定义负极下情感域"转冷"判负,原销售 objection 不判负。
         let negative = ["user_went_cold"];
         let traj_cold = vec![traj_entry("a"), traj_entry("user_went_cold")];
-        assert!(latest_reaction_is_negative_with_polarity(&traj_cold, &negative));
+        assert!(latest_reaction_is_negative_with_polarity(
+            &traj_cold, &negative
+        ));
         let traj_obj = vec![traj_entry("user_replied_objection")];
-        assert!(!latest_reaction_is_negative_with_polarity(&traj_obj, &negative));
+        assert!(!latest_reaction_is_negative_with_polarity(
+            &traj_obj, &negative
+        ));
     }
 
     #[test]
     fn should_escalate_held_safety_guard_unconditional() {
         use crate::agent::types::HOLD_CATEGORY_BLOCKED_BY_SAFETY_GUARD;
-        assert!(should_escalate_held(HOLD_CATEGORY_BLOCKED_BY_SAFETY_GUARD, &policy_with(false)));
-        assert!(should_escalate_held(HOLD_CATEGORY_BLOCKED_BY_SAFETY_GUARD, &policy_with(true)));
+        assert!(should_escalate_held(
+            HOLD_CATEGORY_BLOCKED_BY_SAFETY_GUARD,
+            &policy_with(false)
+        ));
+        assert!(should_escalate_held(
+            HOLD_CATEGORY_BLOCKED_BY_SAFETY_GUARD,
+            &policy_with(true)
+        ));
     }
 
     #[test]
     fn should_escalate_held_unverified_product_unconditional() {
-        assert!(should_escalate_held("blocked_unverified_product_claim", &policy_with(false)));
-        assert!(should_escalate_held("blocked_unverified_product_claim", &policy_with(true)));
+        assert!(should_escalate_held(
+            "blocked_unverified_product_claim",
+            &policy_with(false)
+        ));
+        assert!(should_escalate_held(
+            "blocked_unverified_product_claim",
+            &policy_with(true)
+        ));
     }
 
     #[test]
     fn should_escalate_held_ai_policy_only_when_enabled() {
         use crate::agent::types::HOLD_CATEGORY_HELD_BY_AI_POLICY;
-        assert!(should_escalate_held(HOLD_CATEGORY_HELD_BY_AI_POLICY, &policy_with(true)));
-        assert!(!should_escalate_held(HOLD_CATEGORY_HELD_BY_AI_POLICY, &policy_with(false)));
+        assert!(should_escalate_held(
+            HOLD_CATEGORY_HELD_BY_AI_POLICY,
+            &policy_with(true)
+        ));
+        assert!(!should_escalate_held(
+            HOLD_CATEGORY_HELD_BY_AI_POLICY,
+            &policy_with(false)
+        ));
     }
 
     #[test]
     fn should_escalate_held_waiting_context_never() {
         use crate::agent::types::HOLD_CATEGORY_AI_WAITING_FOR_MORE_CONTEXT;
-        assert!(!should_escalate_held(HOLD_CATEGORY_AI_WAITING_FOR_MORE_CONTEXT, &policy_with(true)));
-        assert!(!should_escalate_held(HOLD_CATEGORY_AI_WAITING_FOR_MORE_CONTEXT, &policy_with(false)));
+        assert!(!should_escalate_held(
+            HOLD_CATEGORY_AI_WAITING_FOR_MORE_CONTEXT,
+            &policy_with(true)
+        ));
+        assert!(!should_escalate_held(
+            HOLD_CATEGORY_AI_WAITING_FOR_MORE_CONTEXT,
+            &policy_with(false)
+        ));
     }
 
     #[test]
@@ -1007,7 +1098,10 @@ mod tests {
             "context_changed",
         ] {
             assert!(!should_escalate_held(s, &policy_with(true)), "{s} 不应升级");
-            assert!(!should_escalate_held(s, &policy_with(false)), "{s} 不应升级");
+            assert!(
+                !should_escalate_held(s, &policy_with(false)),
+                "{s} 不应升级"
+            );
         }
     }
 
@@ -1017,35 +1111,50 @@ mod tests {
     fn relay_unauthorized_number_detects_fabricated_discount() {
         // 领导授权"9折"，转述说"8折" → 引入授权外数字 → 拦。
         let substance = "可以给客户9折优惠";
-        assert!(relay_introduces_unauthorized_number("我帮您申请到8折了", substance));
+        assert!(relay_introduces_unauthorized_number(
+            "我帮您申请到8折了",
+            substance
+        ));
     }
 
     #[test]
     fn relay_unauthorized_number_allows_authorized_number() {
         // 转述里的数字都在授权 substance 内 → 放行。
         let substance = "可以给客户9折，质保2年";
-        assert!(!relay_introduces_unauthorized_number("给您9折，质保2年", substance));
+        assert!(!relay_introduces_unauthorized_number(
+            "给您9折，质保2年",
+            substance
+        ));
     }
 
     #[test]
     fn relay_unauthorized_number_allows_no_numbers() {
         // 转述无任何数字 → 放行（纯定性转述）。
         let substance = "可以适当让利";
-        assert!(!relay_introduces_unauthorized_number("我帮您争取了一些优惠", substance));
+        assert!(!relay_introduces_unauthorized_number(
+            "我帮您争取了一些优惠",
+            substance
+        ));
     }
 
     #[test]
     fn relay_unauthorized_number_detects_added_percentage() {
         // 授权无百分比，转述编造"95%成功率" → 拦。
         let substance = "这个方案可行";
-        assert!(relay_introduces_unauthorized_number("成功率有95%", substance));
+        assert!(relay_introduces_unauthorized_number(
+            "成功率有95%",
+            substance
+        ));
     }
 
     #[test]
     fn relay_unauthorized_number_allows_substance_superset() {
         // 转述只用了授权数字的子集 → 放行。
         let substance = "9折，满3000减500，质保2年";
-        assert!(!relay_introduces_unauthorized_number("给您9折优惠", substance));
+        assert!(!relay_introduces_unauthorized_number(
+            "给您9折优惠",
+            substance
+        ));
     }
 
     #[test]
@@ -1061,9 +1170,15 @@ mod tests {
         // 覆盖 normalize_number_token 的 split_once('.') frac_part 分支：
         // 授权集 = {"9.5"}，"9折"归一化为 token "9" ∉ 集 → true。
         let substance = "可以给客户9.5折";
-        assert!(relay_introduces_unauthorized_number("我帮您申请到9折了", substance));
+        assert!(relay_introduces_unauthorized_number(
+            "我帮您申请到9折了",
+            substance
+        ));
         // 另一变体：转述编成不同小数"8.5折"（"8.5" ∉ {"9.5"}）→ 拦。
-        assert!(relay_introduces_unauthorized_number("帮您争取到8.5折", substance));
+        assert!(relay_introduces_unauthorized_number(
+            "帮您争取到8.5折",
+            substance
+        ));
     }
 
     #[test]
@@ -1071,7 +1186,10 @@ mod tests {
         // 小数变体：授权"9.5折"，转述用同一小数"9.5折" → 归一化后 token "9.5" 命中授权集 → 放行。
         // 验证小数 token 经 normalize_number_token 后能在授权集内正确匹配（frac_part 往返一致）。
         let substance = "可以给客户9.5折优惠";
-        assert!(!relay_introduces_unauthorized_number("给您9.5折，很划算", substance));
+        assert!(!relay_introduces_unauthorized_number(
+            "给您9.5折，很划算",
+            substance
+        ));
     }
 
     // ---- fix C：pending 去重唯一索引冲突判定（区分两类 11000）----
@@ -1096,7 +1214,10 @@ mod tests {
     #[test]
     fn dedupe_conflict_misses_non_11000() {
         // 非 11000（即便 message 巧合含索引名）→ 不命中。
-        let msg = format!("some other write error mentioning {}", PENDING_DEDUPE_INDEX_NAME);
+        let msg = format!(
+            "some other write error mentioning {}",
+            PENDING_DEDUPE_INDEX_NAME
+        );
         assert!(!dedupe_conflict_matches_pending_index(121, &msg));
     }
 
@@ -1104,8 +1225,14 @@ mod tests {
 
     #[test]
     fn scene_fallback_text_maps_each_scene_to_its_hardcoded_copy() {
-        assert_eq!(scene_fallback_text(HoldingReplyScene::GateHold), fallback_holding_reply());
-        assert_eq!(scene_fallback_text(HoldingReplyScene::ChainTail), chain_tail_holding_reply());
+        assert_eq!(
+            scene_fallback_text(HoldingReplyScene::GateHold),
+            fallback_holding_reply()
+        );
+        assert_eq!(
+            scene_fallback_text(HoldingReplyScene::ChainTail),
+            chain_tail_holding_reply()
+        );
         assert_eq!(
             scene_fallback_text(HoldingReplyScene::ExpiredAuthorization),
             expired_authorization_neutral_reply()

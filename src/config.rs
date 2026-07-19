@@ -2,9 +2,9 @@ use std::env;
 
 use crate::secret::mask_secret;
 
-/// EVOLUTION_ENABLED 默认串。语义：是否允许在 UI 开启演化中心（默认允许）；
-/// 设 "false" 为运维硬锁定（紧急熔断，无需 mongo 写权限）。
-pub(crate) const EVOLUTION_ENABLED_DEFAULT: &str = "true";
+/// EVOLUTION_ENABLED 默认串。默认关闭；只有运维显式设为 "true" 时，
+/// 才允许 UI/Mongo runtime flag 进一步开启演化中心。
+pub(crate) const EVOLUTION_ENABLED_DEFAULT: &str = "false";
 
 #[derive(Clone)]
 pub struct AppConfig {
@@ -136,7 +136,6 @@ pub struct AppConfig {
     pub strategic_planner_priority_enabled: bool,
 
     // ── Phase D / D3：cold contact reactivation ──
-
     /// Phase D / D3：是否启用冷联系人重激活扫描器（与静默扫描器互补：
     /// 关注 `last_outbound_at` 远早于 now 的 contact，由 peer_case 钩子文案推动）。
     /// 默认 false——首发关闭，通过 `COLD_CONTACT_WORKER_ENABLED=true` 显式开启。
@@ -171,7 +170,6 @@ pub struct AppConfig {
     //
     // 全部默认关停 / 保守值。本阶段只铺 append-only 采集底座，不调任何学习
     // 公式。沉默信号恒带 censored=true（删失，绝不当负例）。
-
     /// 是否启用沉默信号探测 worker（S6）。默认 false——首发关闭，需显式
     /// `SILENCE_SIGNAL_WORKER_ENABLED=true` 打开。只写信号，绝不发任何消息。
     pub silence_signal_worker_enabled: bool,
@@ -211,9 +209,8 @@ pub struct AppConfig {
     //
     // 默认全部保守值。`evolution_enabled=false` 是安装态默认；运维需显式
     // 通过 env 打开。所有阈值在 design.md §5 中有明确单位与范围说明。
-
-    /// M4：是否允许在 UI 开启演化中心（runtime flag 总开关的硬上限）。默认 true（允许）；
-    /// 设 false 为运维硬锁定——worker 不进 tick、UI 总开关锁定。
+    /// M4：是否允许在 UI 开启演化中心（runtime flag 总开关的硬上限）。默认 false；
+    /// 只有 env 显式设 true 后，Mongo runtime flag 才能进一步放行。
     pub evolution_enabled: bool,
     /// M4：演化器主循环间隔秒数。默认 21600（6 小时）——比 strategic planner 长一档。
     pub evolution_tick_seconds: u64,
@@ -265,7 +262,6 @@ pub struct AppConfig {
     //
     // 自动通道仅适用于 threshold（纯统计可观测）；prompt 候选仍要 admin 二次确认。
     // rollback 永远人工——Requirements 9.7 的硬约束。
-
     /// Phase C / C5：是否启用 threshold proposal 自动 release。默认 false。
     pub evolution_auto_release_enabled: bool,
     /// Phase C / C5：自动 release 决策回看窗口（小时）。默认 336（14 天）。
@@ -291,7 +287,6 @@ pub struct AppConfig {
     // ── Knowledge Digest Workstation ──
     //
     // 默认关停。设计见 `.kiro/specs/knowledge-digest-workstation/`。
-
     /// 是否启用知识库日报 worker。默认 false（安装态关停）。
     pub knowledge_digest_enabled: bool,
     /// 每天触发合成的小时（运营时区，0..=23）。默认 9。
@@ -331,7 +326,6 @@ pub struct AppConfig {
     // ── P0 鉴权 / Session ──
     //
     // admin SPA 同 origin 走 cookie session；公网部署阻断未登录访问。
-
     /// session cookie TTL（小时）。默认 168（7 天）。
     pub session_ttl_hours: i64,
     /// Set-Cookie 是否带 Secure 属性。生产环境（HTTPS）必须 true；
@@ -457,7 +451,8 @@ impl AppConfig {
             llm_max_retries: env_or("LLM_MAX_RETRIES", "5").parse()?,
             llm_retry_base_ms: env_or("LLM_RETRY_BASE_MS", "1500").parse()?,
             task_claim_timeout_seconds: env_or("TASK_CLAIM_TIMEOUT_SECONDS", "300").parse()?,
-            import_worker_interval_seconds: env_or("IMPORT_WORKER_INTERVAL_SECONDS", "2").parse()?,
+            import_worker_interval_seconds: env_or("IMPORT_WORKER_INTERVAL_SECONDS", "2")
+                .parse()?,
             import_job_claim_timeout_seconds: env_or("IMPORT_JOB_CLAIM_TIMEOUT_SECONDS", "600")
                 .parse()?,
             reaction_analysis_claim_timeout_seconds: env_or(
@@ -528,11 +523,8 @@ impl AppConfig {
                 "7",
             )
             .parse()?,
-            strategic_planner_renewal_daily_cap: env_or(
-                "STRATEGIC_PLANNER_RENEWAL_DAILY_CAP",
-                "3",
-            )
-            .parse()?,
+            strategic_planner_renewal_daily_cap: env_or("STRATEGIC_PLANNER_RENEWAL_DAILY_CAP", "3")
+                .parse()?,
             strategic_planner_reactivation_dormant_days: env_or(
                 "STRATEGIC_PLANNER_REACTIVATION_DORMANT_DAYS",
                 "30",
@@ -548,16 +540,10 @@ impl AppConfig {
                 "3",
             )
             .parse()?,
-            value_tier_mid_threshold_cents: env_or(
-                "VALUE_TIER_MID_THRESHOLD_CENTS",
-                "50000",
-            )
-            .parse()?,
-            value_tier_high_threshold_cents: env_or(
-                "VALUE_TIER_HIGH_THRESHOLD_CENTS",
-                "300000",
-            )
-            .parse()?,
+            value_tier_mid_threshold_cents: env_or("VALUE_TIER_MID_THRESHOLD_CENTS", "50000")
+                .parse()?,
+            value_tier_high_threshold_cents: env_or("VALUE_TIER_HIGH_THRESHOLD_CENTS", "300000")
+                .parse()?,
             strategic_planner_block_rate_window_hours: env_or(
                 "STRATEGIC_PLANNER_BLOCK_RATE_WINDOW_HOURS",
                 "24",
@@ -597,7 +583,8 @@ impl AppConfig {
             silence_signal_interval_seconds: env_or("SILENCE_SIGNAL_INTERVAL_SECONDS", "600")
                 .parse()?,
             silence_signal_daily_cap: env_or("SILENCE_SIGNAL_DAILY_CAP", "500").parse()?,
-            dynamic_confidence_min_samples: env_or("DYNAMIC_CONFIDENCE_MIN_SAMPLES", "5").parse()?,
+            dynamic_confidence_min_samples: env_or("DYNAMIC_CONFIDENCE_MIN_SAMPLES", "5")
+                .parse()?,
             dynamic_confidence_real_outcome_enabled: parse_bool(&env_or(
                 "DYNAMIC_CONFIDENCE_REAL_OUTCOME_ENABLED",
                 "true",
@@ -661,11 +648,8 @@ impl AppConfig {
                 "336",
             )
             .parse()?,
-            evolution_auto_release_per_tick_cap: env_or(
-                "EVOLUTION_AUTO_RELEASE_PER_TICK_CAP",
-                "1",
-            )
-            .parse()?,
+            evolution_auto_release_per_tick_cap: env_or("EVOLUTION_AUTO_RELEASE_PER_TICK_CAP", "1")
+                .parse()?,
             evolution_auto_release_negative_reaction_gate_enabled: parse_bool(&env_or(
                 "EVOLUTION_AUTO_RELEASE_NEGATIVE_REACTION_GATE_ENABLED",
                 "false",
@@ -678,16 +662,10 @@ impl AppConfig {
             // ── Knowledge Digest Workstation ──
             knowledge_digest_enabled: parse_bool(&env_or("KNOWLEDGE_DIGEST_ENABLED", "false")),
             knowledge_digest_run_hour: env_or("KNOWLEDGE_DIGEST_RUN_HOUR", "9").parse()?,
-            knowledge_digest_run_token_budget: env_or(
-                "KNOWLEDGE_DIGEST_RUN_TOKEN_BUDGET",
-                "24000",
-            )
-            .parse()?,
-            knowledge_digest_run_max_llm_calls: env_or(
-                "KNOWLEDGE_DIGEST_RUN_MAX_LLM_CALLS",
-                "8",
-            )
-            .parse()?,
+            knowledge_digest_run_token_budget: env_or("KNOWLEDGE_DIGEST_RUN_TOKEN_BUDGET", "24000")
+                .parse()?,
+            knowledge_digest_run_max_llm_calls: env_or("KNOWLEDGE_DIGEST_RUN_MAX_LLM_CALLS", "8")
+                .parse()?,
             knowledge_task_worker_interval_seconds: env_or(
                 "KNOWLEDGE_TASK_WORKER_INTERVAL_SECONDS",
                 "30",
@@ -720,7 +698,8 @@ impl AppConfig {
                 .ok()
                 .filter(|s| !s.trim().is_empty()),
             webhook_verify_signature: parse_bool(&env_or("WEBHOOK_VERIFY_SIGNATURE", "true")),
-            webhook_timestamp_skew_seconds: env_or("WEBHOOK_TIMESTAMP_SKEW_SECONDS", "300").parse()?,
+            webhook_timestamp_skew_seconds: env_or("WEBHOOK_TIMESTAMP_SKEW_SECONDS", "300")
+                .parse()?,
             jwt_enabled: parse_bool(&env_or("JWT_ENABLED", "false")),
             jwt_ttl_minutes: env_or("JWT_TTL_MINUTES", "60").parse()?,
             jwt_private_key_pem: env::var("JWT_PRIVATE_KEY_PEM")
@@ -775,11 +754,10 @@ mod tests {
         assert_eq!(ttl_hours, 24);
     }
 
-    /// EVOLUTION_ENABLED 默认＝允许（true）。锁定 EVOLUTION_ENABLED_DEFAULT 常量值，
-    /// 防止有人把默认改回 "false" 而不更新部署文档（语义：默认允许 UI 开启演化中心）。
+    /// EVOLUTION_ENABLED 安装态默认关闭。锁定常量，避免演化器在未显式授权时启动。
     #[test]
-    fn evolution_enabled_defaults_to_true() {
-        assert_eq!(EVOLUTION_ENABLED_DEFAULT, "true");
-        assert!(parse_bool(EVOLUTION_ENABLED_DEFAULT));
+    fn evolution_enabled_defaults_to_false() {
+        assert_eq!(EVOLUTION_ENABLED_DEFAULT, "false");
+        assert!(!parse_bool(EVOLUTION_ENABLED_DEFAULT));
     }
 }

@@ -28,7 +28,11 @@ use crate::common::TestApp;
 /// 插一条 threshold proposal（`status="eligible_for_release"`）到指定 workspace，
 /// 返回其 `_id`。用 raw insert 避免依赖 `Proposal` 全字段默认值，只放隔离测试
 /// 需要的字段（与 `workspace_isolation.rs` 的 raw-insert 风格一致）。
-async fn insert_threshold_proposal(app: &TestApp, workspace_id: &str, account_id: &str) -> ObjectId {
+async fn insert_threshold_proposal(
+    app: &TestApp,
+    workspace_id: &str,
+    account_id: &str,
+) -> ObjectId {
     let id = ObjectId::new();
     app.state
         .db
@@ -117,7 +121,10 @@ async fn cross_workspace_release_rollback_filter_blocks() {
         .count_documents(doc! { "_id": proposal_id, "workspace_id": "ws_a" }, None)
         .await
         .expect("own-tenant release/rollback filter count");
-    assert_eq!(own, 1, "ws_a 视角应能命中自己的 proposal 用于 release/rollback");
+    assert_eq!(
+        own, 1,
+        "ws_a 视角应能命中自己的 proposal 用于 release/rollback"
+    );
 }
 
 /// SEC-1：未知 workspace 读不到任何 proposal。

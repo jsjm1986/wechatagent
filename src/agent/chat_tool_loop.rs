@@ -306,17 +306,12 @@ fn build_tool_trace_entry(call: &ToolCallRequest, result: &Value, latency_ms: i6
     doc
 }
 
-fn append_tool_result_to_context(
-    accumulated: &mut String,
-    call: &ToolCallRequest,
-    result: &Value,
-) {
-    let arguments_json = match mongodb::bson::Bson::from(call.arguments.clone())
-        .into_relaxed_extjson()
-    {
-        Value::Object(map) => Value::Object(map),
-        other => other,
-    };
+fn append_tool_result_to_context(accumulated: &mut String, call: &ToolCallRequest, result: &Value) {
+    let arguments_json =
+        match mongodb::bson::Bson::from(call.arguments.clone()).into_relaxed_extjson() {
+            Value::Object(map) => Value::Object(map),
+            other => other,
+        };
     let segment = format!(
         "\n[system tool result]\ntool: {}\narguments: {}\nresult: {}\n",
         call.tool,
@@ -341,10 +336,7 @@ fn truncate_tool_results(accumulated: &str, risks: &mut Vec<String>) -> String {
     total[drop_count..].iter().collect()
 }
 
-fn strip_extra_tool_calls(
-    mut decision: AgentDecision,
-    risks: &mut Vec<String>,
-) -> AgentDecision {
+fn strip_extra_tool_calls(mut decision: AgentDecision, risks: &mut Vec<String>) -> AgentDecision {
     if !decision.tool_calls.is_empty() {
         risks.push("chat_final_phase_extra_tool_calls_dropped".to_string());
         decision.tool_calls.clear();
@@ -468,7 +460,11 @@ mod tests {
 
         // 真实断言：1) reply_fn 仅被调一次（final 一轮就退）；2) 留下 final decision；
         // 3) 没有 tool 派发（tool_trace 空 / 没消耗 tool_call 配额）。
-        assert_eq!(call_count.load(Ordering::SeqCst), 1, "final 路径应该只调用一次 reply_fn");
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "final 路径应该只调用一次 reply_fn"
+        );
         assert_eq!(outcome.decision.decision_phase, "final");
         assert_eq!(outcome.decision.reply_text, "OK");
         assert!(
@@ -477,7 +473,10 @@ mod tests {
             outcome.tool_trace
         );
         let snap = budget.snapshot();
-        assert_eq!(snap.tool_calls_used, 0, "final-only 路径不应消耗 tool_call 配额");
+        assert_eq!(
+            snap.tool_calls_used, 0,
+            "final-only 路径不应消耗 tool_call 配额"
+        );
     }
 
     /// 验证常量与设计金标一致：CHAT_TOOL_CALLS_PER_TURN_CAP=6,

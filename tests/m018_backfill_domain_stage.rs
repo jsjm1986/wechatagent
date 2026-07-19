@@ -28,11 +28,7 @@ async fn raw_contact(app: &common::TestApp, wxid: &str) -> Document {
 #[ignore]
 async fn backfills_top_level_into_domain_and_keeps_domain_winner() {
     let app = common::TestApp::start().await;
-    let contacts = app
-        .state
-        .db
-        .raw()
-        .collection::<Document>("contacts");
+    let contacts = app.state.db.raw().collection::<Document>("contacts");
 
     // 场景 A:只有顶层残留,domain_attributes 完全缺失 → 应把三字段搬入 domain。
     contacts
@@ -92,7 +88,10 @@ async fn backfills_top_level_into_domain_and_keeps_domain_winner() {
     // 场景 A:三字段进入 domain_attributes;顶层保留(可逆,不 $unset)。
     let a = raw_contact(&app, "legacy_only_top").await;
     let a_domain = a.get_document("domain_attributes").expect("A has domain");
-    assert_eq!(a_domain.get_str("customer_stage").ok(), Some("solution_fit"));
+    assert_eq!(
+        a_domain.get_str("customer_stage").ok(),
+        Some("solution_fit")
+    );
     assert_eq!(a_domain.get_str("intent_level").ok(), Some("high"));
     assert!(
         a_domain.contains_key("customer_stage_updated_at"),
@@ -116,13 +115,19 @@ async fn backfills_top_level_into_domain_and_keeps_domain_winner() {
     // 场景 C:无顶层字段不被 filter 命中,domain 原样不动。
     let c = raw_contact(&app, "clean_contact").await;
     let c_domain = c.get_document("domain_attributes").expect("C has domain");
-    assert_eq!(c_domain.get_str("customer_stage").ok(), Some("need_discovery"));
+    assert_eq!(
+        c_domain.get_str("customer_stage").ok(),
+        Some("need_discovery")
+    );
 
     // 二次执行幂等:domain 已有值,mergeObjects 结果不变。
     m018::run_step(&app.state.db).await.expect("rerun m018");
     let a2 = raw_contact(&app, "legacy_only_top").await;
     let a2_domain = a2.get_document("domain_attributes").expect("A2 has domain");
-    assert_eq!(a2_domain.get_str("customer_stage").ok(), Some("solution_fit"));
+    assert_eq!(
+        a2_domain.get_str("customer_stage").ok(),
+        Some("solution_fit")
+    );
     let b2 = raw_contact(&app, "domain_wins").await;
     let b2_domain = b2.get_document("domain_attributes").expect("B2 has domain");
     assert_eq!(

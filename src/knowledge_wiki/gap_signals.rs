@@ -111,7 +111,8 @@ pub async fn load_archived_chunk_ids(
         )
         .await
         .map_err(AppError::from)?;
-    let archived: Vec<OperationKnowledgeChunk> = cursor.try_collect().await.map_err(AppError::from)?;
+    let archived: Vec<OperationKnowledgeChunk> =
+        cursor.try_collect().await.map_err(AppError::from)?;
     Ok(archived
         .iter()
         .filter_map(|c| c.id.as_ref().map(|o| o.to_hex()))
@@ -508,10 +509,7 @@ fn pending_signal_merge_update(signal: &KnowledgeGapSignal) -> Result<Document, 
         );
     }
     if !signal.search_queries.is_empty() {
-        add_to_set.insert(
-            "search_queries",
-            doc! { "$each": &signal.search_queries },
-        );
+        add_to_set.insert("search_queries", doc! { "$each": &signal.search_queries });
     }
     if !add_to_set.is_empty() {
         update.insert("$addToSet", add_to_set);
@@ -597,7 +595,8 @@ pub async fn persist_signals(
         )
         .await
         .map_err(AppError::from)?;
-    let pending: Vec<KnowledgeGapSignal> = pending_cursor.try_collect().await.map_err(AppError::from)?;
+    let pending: Vec<KnowledgeGapSignal> =
+        pending_cursor.try_collect().await.map_err(AppError::from)?;
 
     let mut pending_by_key: HashMap<String, KnowledgeGapSignal> = HashMap::new();
     for s in pending {
@@ -873,14 +872,22 @@ pub(crate) fn attributed_log_indices(
 /// （`DEFAULT_POSITIVE_OUTCOMES` / `DEFAULT_NEGATIVE_OUTCOMES`），非空 → 用 profile 声明的。
 /// DEFAULT_PROFILE 的 seed 显式填回这两组常量，故 DEFAULT 下解析结果与回落字节相等
 /// → 回路① 召回排序逐字等价。换行业（声明非空极性）时按本行业极性判定。
-pub(crate) fn resolve_effective_polarity(polarity: &crate::models::OutcomePolarity) -> (Vec<String>, Vec<String>) {
+pub(crate) fn resolve_effective_polarity(
+    polarity: &crate::models::OutcomePolarity,
+) -> (Vec<String>, Vec<String>) {
     let positive = if polarity.positive.is_empty() {
-        DEFAULT_POSITIVE_OUTCOMES.iter().map(|s| s.to_string()).collect()
+        DEFAULT_POSITIVE_OUTCOMES
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
     } else {
         polarity.positive.clone()
     };
     let negative = if polarity.negative.is_empty() {
-        DEFAULT_NEGATIVE_OUTCOMES.iter().map(|s| s.to_string()).collect()
+        DEFAULT_NEGATIVE_OUTCOMES
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
     } else {
         polarity.negative.clone()
     };
@@ -927,7 +934,8 @@ pub async fn refresh_usage_stats_and_confidence(
     // 2.5-main-2：本 workspace 的有效极性（profile 非空极性 ?? 内置销售常量，逐极独立）。
     // DEFAULT_PROFILE seed 与回落同源 → 销售域字节等价。命中 1G-c 的 30s TTL 缓存。
     let (positive_outcomes, negative_outcomes) = if real_outcome_enabled {
-        let profile = crate::agent::domain_profile::load_active_domain_profile(db, workspace_id).await;
+        let profile =
+            crate::agent::domain_profile::load_active_domain_profile(db, workspace_id).await;
         resolve_effective_polarity(&profile.outcome_polarity)
     } else {
         // 回滚路径不查极性（走 review_approved），省一次 profile 解析。
@@ -1009,9 +1017,7 @@ pub async fn refresh_usage_stats_and_confidence(
         // 换血：真实用户反应三态；删失（Censored）整条 log 跳过 hit/block 统计，
         // 但仍参与 last_used 记账（chunk 确实被召回过）。回滚时退回 reviewer 自评。
         let base_label = if real_outcome_enabled {
-            let outcome = outcome_by_run
-                .get(&log.run_id)
-                .and_then(|o| o.as_deref());
+            let outcome = outcome_by_run.get(&log.run_id).and_then(|o| o.as_deref());
             Some(classify_outcome_label_with_polarity(
                 outcome,
                 &positive_outcomes,
@@ -1114,11 +1120,7 @@ pub async fn refresh_usage_stats_and_confidence(
         // 不能再往同一 $set 里插子路径 usage_stats.last_used_at——MongoDB 禁止同一
         // $set 中父路径(usage_stats)与子路径(usage_stats.last_used_at)并存(code 40)。
         db.operation_knowledge_chunks()
-            .update_one(
-                doc! { "_id": oid },
-                doc! { "$set": &set },
-                None,
-            )
+            .update_one(doc! { "_id": oid }, doc! { "$set": &set }, None)
             .await
             .map_err(AppError::from)?;
         report.updated += 1;
@@ -1303,7 +1305,10 @@ pub async fn sweep_stale_signals(
             if key.is_empty() {
                 continue;
             }
-            title_groups.entry(key).or_default().push(sha256_hex(first_paragraph(body)));
+            title_groups
+                .entry(key)
+                .or_default()
+                .push(sha256_hex(first_paragraph(body)));
         }
     }
 
@@ -1399,7 +1404,12 @@ pub async fn sweep_stale_signals(
                     .unwrap_or(false);
                 if dep_back {
                     Some("rule:dep_restored")
-                } else if sig.affected_chunk_ids.first().map(|src| !known_ids.contains(src)).unwrap_or(false) {
+                } else if sig
+                    .affected_chunk_ids
+                    .first()
+                    .map(|src| !known_ids.contains(src))
+                    .unwrap_or(false)
+                {
                     // 引用源 chunk 自己也 archived 了 → 信号无意义。
                     Some("rule:dep_unrelated")
                 } else {
@@ -1418,7 +1428,11 @@ pub async fn sweep_stale_signals(
                 } else {
                     false
                 };
-                if extended { Some("rule:valid_to_extended") } else { None }
+                if extended {
+                    Some("rule:valid_to_extended")
+                } else {
+                    None
+                }
             }
             "suggestion" => {
                 // chunk 被 verify → 信号失效。
@@ -1428,7 +1442,11 @@ pub async fn sweep_stale_signals(
                     .and_then(|id| integrity_by_id.get(id))
                     .map(|st| st == "verified")
                     .unwrap_or(false);
-                if verified { Some("rule:chunk_verified") } else { None }
+                if verified {
+                    Some("rule:chunk_verified")
+                } else {
+                    None
+                }
             }
             "contradiction" => {
                 // 同题只剩 1 条，或同题首段哈希已收敛到一致 → 视为冲突已解决。
@@ -1441,7 +1459,11 @@ pub async fn sweep_stale_signals(
                         unique.len() < 2
                     }
                 };
-                if resolved { Some("rule:contradiction_resolved") } else { None }
+                if resolved {
+                    Some("rule:contradiction_resolved")
+                } else {
+                    None
+                }
             }
             "orphan" => {
                 // chunk 拿到入链或 30d 命中，或自身已 archived → 信号失效。
@@ -1489,9 +1511,7 @@ pub async fn sweep_stale_signals(
                     if !known_ids.contains(target) {
                         Some("rule:chunk_archived")
                     } else if let Some((_, _, conf, hits)) = chunk_view.get(target) {
-                        let lifted = conf
-                            .map(|s| s >= LOW_CONFIDENCE_THRESHOLD)
-                            .unwrap_or(false);
+                        let lifted = conf.map(|s| s >= LOW_CONFIDENCE_THRESHOLD).unwrap_or(false);
                         if lifted {
                             Some("rule:confidence_lifted")
                         } else if *hits == 0 {
@@ -1629,7 +1649,11 @@ mod tests {
         assert!((v - 0.3).abs() < 1e-9, "got {v}");
     }
 
-    fn chunk(title: &str, wiki: Option<&str>, related: Vec<(&str, &str)>) -> OperationKnowledgeChunk {
+    fn chunk(
+        title: &str,
+        wiki: Option<&str>,
+        related: Vec<(&str, &str)>,
+    ) -> OperationKnowledgeChunk {
         OperationKnowledgeChunk {
             id: Some(ObjectId::new()),
             workspace_id: "w".into(),
@@ -1689,7 +1713,8 @@ mod tests {
             chunk("entity 页", Some("entity"), vec![]),
             chunk("方法论页", Some("methodology"), vec![]),
         ];
-        let cands = compute_structural_candidates(&cs, &HashSet::new(), &HashMap::new(), DateTime::now());
+        let cands =
+            compute_structural_candidates(&cs, &HashSet::new(), &HashMap::new(), DateTime::now());
         let kinds: Vec<&str> = cands.iter().map(|c| c.kind.as_str()).collect();
         assert!(kinds.contains(&"no_outlinks"));
         // entity 页只该出 orphan，不该出 no_outlinks
@@ -1701,14 +1726,19 @@ mod tests {
 
     #[test]
     fn broken_link_detected_when_target_missing() {
-        let mut cs = vec![chunk("源页", Some("entity"), vec![("missing_id", "references")])];
+        let mut cs = vec![chunk(
+            "源页",
+            Some("entity"),
+            vec![("missing_id", "references")],
+        )];
         cs[0].usage_stats = Some(crate::models::UsageStats {
             hit_count_30d: 5,
             blocked_count_30d: 0,
             last_used_at: None,
             last_blocked_reason: None,
         });
-        let cands = compute_structural_candidates(&cs, &HashSet::new(), &HashMap::new(), DateTime::now());
+        let cands =
+            compute_structural_candidates(&cs, &HashSet::new(), &HashMap::new(), DateTime::now());
         assert!(cands.iter().any(|c| c.kind == "broken_link"));
     }
 
@@ -1716,7 +1746,8 @@ mod tests {
     fn stale_when_valid_to_expired() {
         let mut c = chunk("过期页", Some("entity"), vec![]);
         c.valid_to = Some(DateTime::from_millis(0));
-        let cands = compute_structural_candidates(&[c], &HashSet::new(), &HashMap::new(), DateTime::now());
+        let cands =
+            compute_structural_candidates(&[c], &HashSet::new(), &HashMap::new(), DateTime::now());
         assert!(cands.iter().any(|s| s.kind == "stale"));
     }
 
@@ -1730,7 +1761,8 @@ mod tests {
             last_used_at: None,
             last_blocked_reason: None,
         });
-        let cands = compute_structural_candidates(&[c], &HashSet::new(), &HashMap::new(), DateTime::now());
+        let cands =
+            compute_structural_candidates(&[c], &HashSet::new(), &HashMap::new(), DateTime::now());
         assert!(cands.iter().any(|s| s.kind == "low_confidence"));
     }
 
@@ -1762,7 +1794,8 @@ mod tests {
             last_used_at: None,
             last_blocked_reason: None,
         });
-        let cands = compute_structural_candidates(&[c], &HashSet::new(), &HashMap::new(), DateTime::now());
+        let cands =
+            compute_structural_candidates(&[c], &HashSet::new(), &HashMap::new(), DateTime::now());
         assert!(cands.iter().any(|s| s.kind == "suggestion"));
 
         // 一旦 verified，suggestion 不应再出现
@@ -1774,7 +1807,8 @@ mod tests {
             last_used_at: None,
             last_blocked_reason: None,
         });
-        let cands2 = compute_structural_candidates(&[c2], &HashSet::new(), &HashMap::new(), DateTime::now());
+        let cands2 =
+            compute_structural_candidates(&[c2], &HashSet::new(), &HashMap::new(), DateTime::now());
         assert!(!cands2.iter().any(|s| s.kind == "suggestion"));
     }
 
@@ -1785,7 +1819,12 @@ mod tests {
         a.body = Some("策略一：阶梯价。\n\n详细说明……".to_string());
         let mut b = chunk("产品价格策略", Some("methodology"), vec![]);
         b.body = Some("策略二：固定价。\n\n详细说明……".to_string());
-        let cands = compute_structural_candidates(&[a, b], &HashSet::new(), &HashMap::new(), DateTime::now());
+        let cands = compute_structural_candidates(
+            &[a, b],
+            &HashSet::new(),
+            &HashMap::new(),
+            DateTime::now(),
+        );
         assert!(cands.iter().any(|s| s.kind == "contradiction"));
 
         // 同 normalize_title 多 chunk 但首段一致 → 不出 contradiction
@@ -1793,7 +1832,12 @@ mod tests {
         x.body = Some("策略一：阶梯价。\n\n详细说明……".to_string());
         let mut y = chunk("产品价格策略", Some("methodology"), vec![]);
         y.body = Some("策略一：阶梯价。\n\n另一段补充。".to_string());
-        let cands2 = compute_structural_candidates(&[x, y], &HashSet::new(), &HashMap::new(), DateTime::now());
+        let cands2 = compute_structural_candidates(
+            &[x, y],
+            &HashSet::new(),
+            &HashMap::new(),
+            DateTime::now(),
+        );
         assert!(!cands2.iter().any(|s| s.kind == "contradiction"));
     }
 
@@ -1804,14 +1848,20 @@ mod tests {
         assert!(!anchor_is_dangling(Some(""), Some("任意原文")));
         assert!(!anchor_is_dangling(Some("   "), Some("任意原文")));
         // 引用是原文子串 → 不悬空
-        assert!(!anchor_is_dangling(Some("阶梯价"), Some("我们采用阶梯价策略")));
+        assert!(!anchor_is_dangling(
+            Some("阶梯价"),
+            Some("我们采用阶梯价策略")
+        ));
         // 容忍空白差异：原文有换行/空格，引用无
         assert!(!anchor_is_dangling(
             Some("阶梯价策略"),
             Some("我们采用阶梯\n价 策略")
         ));
         // 引用不在原文 → 悬空
-        assert!(anchor_is_dangling(Some("固定价"), Some("我们采用阶梯价策略")));
+        assert!(anchor_is_dangling(
+            Some("固定价"),
+            Some("我们采用阶梯价策略")
+        ));
         // 有引用但无原文 → 悬空
         assert!(anchor_is_dangling(Some("固定价"), None));
     }
@@ -1824,12 +1874,8 @@ mod tests {
         c.source_quote = Some("某段不存在于原文的引用".to_string());
         let mut raw_by_doc = HashMap::new();
         raw_by_doc.insert(doc_id.to_hex(), "这是完全不同的文档原文内容".to_string());
-        let cands = compute_structural_candidates(
-            &[c],
-            &HashSet::new(),
-            &raw_by_doc,
-            DateTime::now(),
-        );
+        let cands =
+            compute_structural_candidates(&[c], &HashSet::new(), &raw_by_doc, DateTime::now());
         assert!(cands.iter().any(|s| s.kind == "dangling_anchor"));
     }
 
@@ -1842,12 +1888,8 @@ mod tests {
         hit.source_quote = Some("阶梯价".to_string());
         let mut raw_by_doc = HashMap::new();
         raw_by_doc.insert(doc_id.to_hex(), "我们采用阶梯价策略".to_string());
-        let cands = compute_structural_candidates(
-            &[hit],
-            &HashSet::new(),
-            &raw_by_doc,
-            DateTime::now(),
-        );
+        let cands =
+            compute_structural_candidates(&[hit], &HashSet::new(), &raw_by_doc, DateTime::now());
         assert!(!cands.iter().any(|s| s.kind == "dangling_anchor"));
 
         // 查无原文（raw_by_doc 缺该文档）→ 软语义跳过，不误报
@@ -1872,7 +1914,10 @@ mod tests {
         let p_dangling = dangling_anchor_penalty(Some("固定价"), "我们采用阶梯价策略");
         assert!((p_dangling - DANGLING_ANCHOR_PENALTY).abs() < 1e-9);
         // 命中：quote 是原文子串 → 不罚
-        assert_eq!(dangling_anchor_penalty(Some("阶梯价"), "我们采用阶梯价策略"), 0.0);
+        assert_eq!(
+            dangling_anchor_penalty(Some("阶梯价"), "我们采用阶梯价策略"),
+            0.0
+        );
         // 无引用 → 不罚
         assert_eq!(dangling_anchor_penalty(None, "任意原文"), 0.0);
 
@@ -1886,7 +1931,10 @@ mod tests {
             dangling_anchor_penalty(Some("固定价"), "我们采用阶梯价策略"),
             5,
         );
-        assert!(demoted < live, "dangling demoted={demoted} must be < live={live}");
+        assert!(
+            demoted < live,
+            "dangling demoted={demoted} must be < live={live}"
+        );
     }
 
     #[test]
@@ -1901,7 +1949,9 @@ mod tests {
     fn sha256_hex_is_64_chars_lowercase() {
         let h = sha256_hex("hello");
         assert_eq!(h.len(), 64);
-        assert!(h.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(h
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
         // 同输入哈希一致
         assert_eq!(sha256_hex("hello"), sha256_hex("hello"));
         // 不同输入哈希不同
@@ -1942,7 +1992,10 @@ mod tests {
         let broken_persisted = persistent_signal_dedup_key(&broken);
         let missing_persisted = persistent_signal_dedup_key(&missing);
 
-        assert_eq!(broken, missing, "link state aliases must share one logical key");
+        assert_eq!(
+            broken, missing,
+            "link state aliases must share one logical key"
+        );
         assert_eq!(broken_persisted, missing_persisted);
         assert_eq!(broken_persisted.len(), 64);
         assert!(broken_persisted
@@ -2051,7 +2104,10 @@ mod tests {
         // Iron Law ②：沉默 / 无反应 / pending / 空 / 含义不明 → 删失（不进任何分母）。
         assert_eq!(classify_outcome_label(None), OutcomeLabel::Censored);
         assert_eq!(classify_outcome_label(Some("")), OutcomeLabel::Censored);
-        assert_eq!(classify_outcome_label(Some("pending")), OutcomeLabel::Censored);
+        assert_eq!(
+            classify_outcome_label(Some("pending")),
+            OutcomeLabel::Censored
+        );
         assert_eq!(
             classify_outcome_label(Some("user_replied_unclassified")),
             OutcomeLabel::Censored
@@ -2067,10 +2123,7 @@ mod tests {
     fn censored_never_counts_as_block() {
         // 回归门：删失绝不能滑成负例（这正是镜厅/把沉默当负例的病根）。
         assert_ne!(classify_outcome_label(None), OutcomeLabel::Block);
-        assert_ne!(
-            classify_outcome_label(Some("pending")),
-            OutcomeLabel::Block
-        );
+        assert_ne!(classify_outcome_label(Some("pending")), OutcomeLabel::Block);
     }
 
     // ---- 2.5-pre-1：classify 极性参数化 等价性 + 召回回归基线 ----
@@ -2086,11 +2139,22 @@ mod tests {
         for s in DEFAULT_NEGATIVE_OUTCOMES {
             assert_eq!(classify_outcome_label(Some(s)), OutcomeLabel::Block, "{s}");
         }
-        for s in [None, Some(""), Some("pending"), Some("user_replied_unclassified"), Some("x")] {
+        for s in [
+            None,
+            Some(""),
+            Some("pending"),
+            Some("user_replied_unclassified"),
+            Some("x"),
+        ] {
             assert_eq!(classify_outcome_label(s), OutcomeLabel::Censored, "{s:?}");
         }
         // wrapper 与显式传默认极性的核心函数同结果。
-        for s in ["user_replied_buying_signal", "user_replied_objection", "pending", "x"] {
+        for s in [
+            "user_replied_buying_signal",
+            "user_replied_objection",
+            "pending",
+            "x",
+        ] {
             assert_eq!(
                 classify_outcome_label(Some(s)),
                 classify_outcome_label_with_polarity(
@@ -2108,7 +2172,11 @@ mod tests {
         let positive = ["user_emotion_opened_up"]; // 情感域：示弱/倾诉=正向
         let negative = ["user_went_cold"]; // 情感域：转冷=负向
         assert_eq!(
-            classify_outcome_label_with_polarity(Some("user_emotion_opened_up"), &positive, &negative),
+            classify_outcome_label_with_polarity(
+                Some("user_emotion_opened_up"),
+                &positive,
+                &negative
+            ),
             OutcomeLabel::Hit
         );
         assert_eq!(
@@ -2117,11 +2185,19 @@ mod tests {
         );
         // 原销售极性词在情感 profile 下不再被识别 → 删失(不臆测)。
         assert_eq!(
-            classify_outcome_label_with_polarity(Some("user_replied_buying_signal"), &positive, &negative),
+            classify_outcome_label_with_polarity(
+                Some("user_replied_buying_signal"),
+                &positive,
+                &negative
+            ),
             OutcomeLabel::Censored
         );
         assert_eq!(
-            classify_outcome_label_with_polarity(Some("user_replied_objection"), &positive, &negative),
+            classify_outcome_label_with_polarity(
+                Some("user_replied_objection"),
+                &positive,
+                &negative
+            ),
             OutcomeLabel::Censored
         );
     }
@@ -2184,7 +2260,10 @@ mod tests {
         assert_eq!((h_flip, b_flip), (3, 0));
         let conf_flip = compute_dynamic_confidence(base, h_flip, b_flip, 0.0, min_samples);
         // 极性翻转使 dyn_conf 严格升高（召回排序权重随之改变）。
-        assert!(conf_flip > conf_def, "翻转极性应抬高 dyn_conf: {conf_flip} vs {conf_def}");
+        assert!(
+            conf_flip > conf_def,
+            "翻转极性应抬高 dyn_conf: {conf_flip} vs {conf_def}"
+        );
     }
 
     // ---- 2.5-main-2：resolve_effective_polarity 逐极独立回落 ----
@@ -2196,11 +2275,17 @@ mod tests {
         let (pos, neg) = resolve_effective_polarity(&crate::models::OutcomePolarity::default());
         assert_eq!(
             pos,
-            DEFAULT_POSITIVE_OUTCOMES.iter().map(|s| s.to_string()).collect::<Vec<_>>()
+            DEFAULT_POSITIVE_OUTCOMES
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
         );
         assert_eq!(
             neg,
-            DEFAULT_NEGATIVE_OUTCOMES.iter().map(|s| s.to_string()).collect::<Vec<_>>()
+            DEFAULT_NEGATIVE_OUTCOMES
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
         );
     }
 
@@ -2226,7 +2311,10 @@ mod tests {
         assert_eq!(pos, vec!["user_emotion_opened_up"]);
         assert_eq!(
             neg,
-            DEFAULT_NEGATIVE_OUTCOMES.iter().map(|s| s.to_string()).collect::<Vec<_>>()
+            DEFAULT_NEGATIVE_OUTCOMES
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
         );
         // 只声明负极 → 对称。
         let only_neg = crate::models::OutcomePolarity {
@@ -2236,7 +2324,10 @@ mod tests {
         let (pos2, neg2) = resolve_effective_polarity(&only_neg);
         assert_eq!(
             pos2,
-            DEFAULT_POSITIVE_OUTCOMES.iter().map(|s| s.to_string()).collect::<Vec<_>>()
+            DEFAULT_POSITIVE_OUTCOMES
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
         );
         assert_eq!(neg2, vec!["user_went_cold"]);
     }

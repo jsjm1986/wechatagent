@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { BarChart3, Image, Contact } from "lucide-react";
 import { EmptyState } from "../../components/ui/EmptyState";
 import { useSendAnalyticsStore } from "../../stores/sendAnalyticsStore";
+import { useAccountStore } from "../../stores/accountStore";
 import type { SendStatRow } from "../../stores/sendAnalyticsStore";
 import styles from "./SendAnalytics.module.css";
 
@@ -11,15 +12,16 @@ const pct = (rate: number) => `${(rate * 100).toFixed(1)}%`;
 
 export default function SendAnalyticsFeature() {
   const { overview, mediaStats, namecardStats, loadOverview, loadStats } = useSendAnalyticsStore();
+  const accountId = useAccountStore((s) => s.currentAccountId());
   const [tab, setTab] = useState<StatTab>("media");
 
   useEffect(() => {
-    void loadOverview();
-  }, [loadOverview]);
+    void loadOverview(accountId);
+  }, [accountId, loadOverview]);
 
   useEffect(() => {
-    void loadStats(tab);
-  }, [tab, loadStats]);
+    void loadStats(tab, accountId);
+  }, [accountId, tab, loadStats]);
 
   const rows = tab === "media" ? mediaStats : namecardStats;
 

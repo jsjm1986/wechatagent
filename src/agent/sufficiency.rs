@@ -129,13 +129,19 @@ mod tests {
     #[test]
     fn test_need_more_context_escalates_to_relational() {
         let d = make_decision("need_more_context", "relational");
-        assert_eq!(decide_tier_escalation(&d), TierDecision::Escalate(PromptTier::Relational));
+        assert_eq!(
+            decide_tier_escalation(&d),
+            TierDecision::Escalate(PromptTier::Relational)
+        );
     }
 
     #[test]
     fn test_need_more_context_escalates_to_full() {
         let d = make_decision("need_more_context", "full");
-        assert_eq!(decide_tier_escalation(&d), TierDecision::Escalate(PromptTier::Full));
+        assert_eq!(
+            decide_tier_escalation(&d),
+            TierDecision::Escalate(PromptTier::Full)
+        );
     }
 
     #[test]
@@ -159,7 +165,10 @@ mod tests {
     #[test]
     fn test_need_more_context_invalid_tier_falls_back_to_full() {
         let d = make_decision("need_more_context", "garbage");
-        assert_eq!(decide_tier_escalation(&d), TierDecision::Escalate(PromptTier::Full));
+        assert_eq!(
+            decide_tier_escalation(&d),
+            TierDecision::Escalate(PromptTier::Full)
+        );
     }
 
     fn decision_with_need(sufficiency: &str, knowledge_need: &str) -> AgentDecision {
@@ -241,16 +250,31 @@ mod tests {
     #[test]
     fn force_full_requires_positive_enough_not_negation() {
         // _=>Enough 兜底的 unknown/空不是"自评够了"，不强升。
-        assert!(!should_force_full_on_missing(&decision_with_need("unknown", "required"), "missing"));
-        assert!(!should_force_full_on_missing(&decision_with_need("", "required"), "missing"));
-        assert!(!should_force_full_on_missing(&decision_with_need("need_more_context", "required"), "missing"));
+        assert!(!should_force_full_on_missing(
+            &decision_with_need("unknown", "required"),
+            "missing"
+        ));
+        assert!(!should_force_full_on_missing(
+            &decision_with_need("", "required"),
+            "missing"
+        ));
+        assert!(!should_force_full_on_missing(
+            &decision_with_need("need_more_context", "required"),
+            "missing"
+        ));
     }
 
     #[test]
     fn sufficiency_recognized_three_states_only() {
         assert!(is_sufficiency_recognized(&make_decision("enough", "")));
-        assert!(is_sufficiency_recognized(&make_decision("need_more_context", "")));
-        assert!(is_sufficiency_recognized(&make_decision("need_clarification", "")));
+        assert!(is_sufficiency_recognized(&make_decision(
+            "need_more_context",
+            ""
+        )));
+        assert!(is_sufficiency_recognized(&make_decision(
+            "need_clarification",
+            ""
+        )));
         assert!(!is_sufficiency_recognized(&make_decision("", "")));
         assert!(!is_sufficiency_recognized(&make_decision("garbage", "")));
     }
@@ -277,7 +301,10 @@ mod tests {
     fn kb01_lean_tier_clears_self_reported_ids() {
         // 非 Full 档(false,false)：即便传入(经 carry_through 透传的)自报 id，也一律清空。
         let ids = resolve_used_knowledge_ids(false, false, vec!["a".into(), "b".into()]);
-        assert!(ids.is_empty(), "非 Full 档必须清空 used_knowledge_ids(含 LLM 自报)");
+        assert!(
+            ids.is_empty(),
+            "非 Full 档必须清空 used_knowledge_ids(含 LLM 自报)"
+        );
     }
 
     #[test]

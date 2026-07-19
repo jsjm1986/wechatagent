@@ -58,7 +58,9 @@ async fn run_one_round(state: &AppState) -> anyhow::Result<()> {
                 }
                 // D（可观测）：把本轮成交追认命中数 upsert 到滚动统计 doc，供
                 // phase_rollup 读出展示。为 0 也写（稳定锚点）。失败只 warn 不阻断本轮。
-                if let Err(err) = upsert_deal_attribution_stats(state, &ws, report.deal_attributed_hits).await {
+                if let Err(err) =
+                    upsert_deal_attribution_stats(state, &ws, report.deal_attributed_hits).await
+                {
                     tracing::warn!(workspace_id = %ws, ?err, "upsert deal_attribution_stats failed");
                 }
             }
@@ -163,7 +165,9 @@ async fn upsert_deal_attribution_stats(
                     "created_at": now,
                 },
             },
-            mongodb::options::UpdateOptions::builder().upsert(true).build(),
+            mongodb::options::UpdateOptions::builder()
+                .upsert(true)
+                .build(),
         )
         .await?;
     Ok(())

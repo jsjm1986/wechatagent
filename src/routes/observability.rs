@@ -19,20 +19,18 @@
 //! - lessons_learned pattern × status 矩阵：已在 [`super::lessons_learned`]
 //!   面板单独出现，不在本接口重复。
 
-use axum::{extract::State, Json,
-    Extension
-};
+use axum::{extract::State, Extension, Json};
 use futures::TryStreamExt;
 use mongodb::bson::{doc, Document};
 use serde_json::{json, Value};
 
 use crate::{
-    auth::AuthenticatedAdmin,
     agent::run_envelope::{
         LIFECYCLE_ABORTED_BY_BUDGET, LIFECYCLE_ABORTED_BY_EXTERNAL_SIGNAL, LIFECYCLE_COMPLETED,
         LIFECYCLE_FAILED_AFTER_DECISION, LIFECYCLE_FAILED_BEFORE_DECISION, LIFECYCLE_RUNNING,
         LIFECYCLE_STARTED,
     },
+    auth::AuthenticatedAdmin,
     error::AppResult,
     models::{
         ALLOWED_PRINCIPAL_ESCALATION_STATUS, ALLOWED_TASK_STATUS,
@@ -76,10 +74,7 @@ pub(super) async fn phase_rollup(
     })))
 }
 
-async fn aggregate_lifecycle(
-    state: &AppState,
-    workspace: &str,
-) -> AppResult<Value> {
+async fn aggregate_lifecycle(state: &AppState, workspace: &str) -> AppResult<Value> {
     let since = mongodb::bson::DateTime::from_millis(now_ms() - WINDOW_MS);
     let coll = state.db.raw().collection::<Document>("agent_run_logs");
     let pipeline = vec![
@@ -180,10 +175,7 @@ async fn aggregate_hold_breakdown(state: &AppState, workspace: &str) -> AppResul
     Ok(Value::Array(items))
 }
 
-async fn aggregate_revision_reasons(
-    state: &AppState,
-    workspace: &str,
-) -> AppResult<Value> {
+async fn aggregate_revision_reasons(state: &AppState, workspace: &str) -> AppResult<Value> {
     let since = mongodb::bson::DateTime::from_millis(now_ms() - WINDOW_MS);
     let coll = state.db.raw().collection::<Document>("agent_run_logs");
     let pipeline = vec![
@@ -213,12 +205,12 @@ async fn aggregate_revision_reasons(
     Ok(Value::Array(items))
 }
 
-async fn aggregate_reviewer_misjudge(
-    state: &AppState,
-    workspace: &str,
-) -> AppResult<Value> {
+async fn aggregate_reviewer_misjudge(state: &AppState, workspace: &str) -> AppResult<Value> {
     let since = mongodb::bson::DateTime::from_millis(now_ms() - WINDOW_MS);
-    let coll = state.db.raw().collection::<Document>("agent_decision_reviews");
+    let coll = state
+        .db
+        .raw()
+        .collection::<Document>("agent_decision_reviews");
     let pipeline = vec![
         doc! { "$match": {
             "workspace_id": workspace,
@@ -250,10 +242,7 @@ async fn aggregate_reviewer_misjudge(
     Ok(Value::Array(items))
 }
 
-async fn read_reviewer_stats(
-    state: &AppState,
-    workspace: &str,
-) -> AppResult<Value> {
+async fn read_reviewer_stats(state: &AppState, workspace: &str) -> AppResult<Value> {
     let stat_id = format!("{workspace}::reviewer");
     let coll = state.db.raw().collection::<Document>("reviewer_stats");
     let Some(doc) = coll.find_one(doc! { "stat_id": &stat_id }, None).await? else {
@@ -287,11 +276,11 @@ async fn read_deal_attribution_stats(state: &AppState, workspace: &str) -> AppRe
     }))
 }
 
-async fn count_negative_example_pending(
-    state: &AppState,
-    workspace: &str,
-) -> AppResult<i64> {
-    let coll = state.db.raw().collection::<Document>("operation_knowledge_chunks");
+async fn count_negative_example_pending(state: &AppState, workspace: &str) -> AppResult<i64> {
+    let coll = state
+        .db
+        .raw()
+        .collection::<Document>("operation_knowledge_chunks");
     let n = coll
         .count_documents(
             doc! {
@@ -471,10 +460,7 @@ pub(super) async fn worker_health(
     })))
 }
 
-async fn aggregate_chat_tasks(
-    state: &AppState,
-    workspace: &str,
-) -> AppResult<Value> {
+async fn aggregate_chat_tasks(state: &AppState, workspace: &str) -> AppResult<Value> {
     let coll = state
         .db
         .raw()
@@ -543,10 +529,7 @@ async fn aggregate_chat_tasks(
     }))
 }
 
-async fn aggregate_gap_signals(
-    state: &AppState,
-    workspace: &str,
-) -> AppResult<Value> {
+async fn aggregate_gap_signals(state: &AppState, workspace: &str) -> AppResult<Value> {
     let coll = state
         .db
         .raw()
@@ -658,10 +641,7 @@ async fn aggregate_gap_signals(
 /// 调 `aggregate_lessons_for_workspace(_, _, 14)` 同窗口。
 const LESSONS_WINDOW_MS: i64 = 14 * 24 * 60 * 60 * 1000;
 
-async fn aggregate_lessons_learned(
-    state: &AppState,
-    workspace: &str,
-) -> AppResult<Value> {
+async fn aggregate_lessons_learned(state: &AppState, workspace: &str) -> AppResult<Value> {
     let since = mongodb::bson::DateTime::from_millis(now_ms() - LESSONS_WINDOW_MS);
     let coll = state.db.raw().collection::<Document>("lessons_learned");
     // [`crate::knowledge_wiki::lessons_learned`] 写出的文档结构：
@@ -743,7 +723,6 @@ async fn aggregate_lessons_learned(
         "blockedTotal": blocked_total,
     }))
 }
-
 
 #[cfg(test)]
 mod tests {

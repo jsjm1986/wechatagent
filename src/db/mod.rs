@@ -12,28 +12,42 @@
 mod indexes;
 pub mod migrations;
 
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Weak,
+};
+
 use mongodb::{options::ClientOptions, Client, Collection, Database as MongoDatabase};
 
 use crate::models::{
     AgentCommandRun, AgentDecisionReview, AgentEvent, AgentOutcomeMetric, AgentPrincipalEscalation,
-    AgentRunLog, AgentSendLedger, AgentSoul,
-    AgentTask, AgentToolCall, BehaviorSignal, BehaviorSignalMetric, Campaign, CampaignSend, CatalogRebuildJob,
-    ChunkRevision, Contact,
-    ContentAsset, ConversationMessage, DomainProfile, DomainSchema, EvaluationScenario, Experiment, IngestSource,
-    KnowledgeChatTask, KnowledgeChatTurn, KnowledgeDailyReport, KnowledgeGapSignal,
-    ImportJob, KnowledgeOperatorMemory, KnowledgeUsageLog, LlmCallLog, LlmProviderConfig,
+    AgentRunLog, AgentSendLedger, AgentSoul, AgentTask, AgentToolCall, BehaviorSignal,
+    BehaviorSignalMetric, Campaign, CampaignSend, CatalogRebuildJob, ChunkRevision, Contact,
+    ContentAsset, ConversationMessage, DomainProfile, DomainSchema, EvaluationScenario, Experiment,
+    ImportJob, IngestSource, KnowledgeChatTask, KnowledgeChatTurn, KnowledgeDailyReport,
+    KnowledgeGapSignal, KnowledgeOperatorMemory, KnowledgeUsageLog, LlmCallLog, LlmProviderConfig,
     ManagementAgentMessage, ManagementAgentSession, McpCallLog, MemoryCandidate, MigrationRecord,
     OperatingMemory, OperationDomainConfig, OperationKnowledgeChunk, OperationKnowledgeDocument,
-    OperationPlaybook, OutboxEntry, PostReleaseReview, Product, PromptTemplate,
-    Proposal, ReferralCard, RelationshipTypeSuggestion, ShadowReplay, SuspectedDealSignal, TaxonomyCandidate, TaxonomyEntry,
-    ThresholdOverride, ThresholdOverrideAudit, UserOperationGuidePreview, WechatAccount,
+    OperationPlaybook, OutboxEntry, PostReleaseReview, Product, PromptTemplate, Proposal,
+    ReferralCard, RelationshipTypeSuggestion, ShadowReplay, SuspectedDealSignal, TaxonomyCandidate,
+    TaxonomyEntry, ThresholdOverride, ThresholdOverrideAudit, UserOperationGuidePreview,
+    WechatAccount,
 };
 
 #[derive(Clone)]
 pub struct Database {
     db: MongoDatabase,
     client: Client,
+    /// Process-local identity shared by clones of this connection wrapper.
+    ///
+    /// Runtime caches use it to isolate independent Mongo databases/connections
+    /// that happen to contain the same workspace ids. It is intentionally not a
+    /// persisted database identifier and has no business semantics.
+    cache_identity: u64,
+    cache_lifetime: Arc<()>,
 }
+
+static NEXT_DATABASE_CACHE_IDENTITY: AtomicU64 = AtomicU64::new(1);
 
 impl Database {
     pub async fn connect(uri: &str, database: &str) -> anyhow::Result<Self> {
@@ -44,6 +58,8 @@ impl Database {
         Ok(Self {
             db,
             client,
+            cache_identity: NEXT_DATABASE_CACHE_IDENTITY.fetch_add(1, Ordering::Relaxed),
+            cache_lifetime: Arc::new(()),
         })
     }
 
@@ -69,6 +85,18 @@ impl Database {
     /// 写入未走 typed `Collection<T>` 的原始 BSON（避免重复构造 30+ 字段）。
     pub fn raw(&self) -> &MongoDatabase {
         &self.db
+    }
+
+    /// Stable process-local cache identity. `Database::clone()` preserves it;
+    /// a separate `connect` call receives a new identity even for the same URI.
+    pub(crate) fn cache_identity(&self) -> u64 {
+        self.cache_identity
+    }
+
+    /// Lifetime token for process-local cache registries. Registries retain a
+    /// strong cache only while at least one clone of this `Database` exists.
+    pub(crate) fn cache_lifetime(&self) -> Weak<()> {
+        Arc::downgrade(&self.cache_lifetime)
     }
 
     pub fn contacts(&self) -> Collection<Contact> {

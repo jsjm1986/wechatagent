@@ -476,7 +476,6 @@ pub(super) async fn find_operation_domain(
     .ok_or_else(|| AppError::NotFound("operation domain not found".to_string()))
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

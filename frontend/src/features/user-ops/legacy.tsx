@@ -50,6 +50,7 @@ import { GATEWAY_STATUS_LABELS, NEXT_BEST_ACTION_TYPE_LABELS, VERSION_STATUS_LAB
 import { useProfileStore, labelFor } from "../../stores/profileStore";
 import type { TaxonomyMap } from "../../stores/profileStore";
 import { useUserOpsStore } from "../../stores/userOpsStore";
+import { useAccountStore } from "../../stores/accountStore";
 import { overdueHours, formatRelativeTime } from "./poolHelpers";
 import TagTrustPanel from "./TagTrustPanel";
 import PersonalityPanel from "./PersonalityPanel";
@@ -1955,6 +1956,7 @@ export function PlannerViewSection({ contact }: { contact: Contact | null }) {
  *  选中客户 wxid 变化时随画像同生命周期重新拉取；客户端故障置空不崩页。 */
 
 export function SendHistorySection({ wxid }: { wxid: string }) {
+  const accountId = useAccountStore((s) => s.currentAccountId());
   const [items, setItems] = useState<SendHistoryItem[]>([]);
   const [loaded, setLoaded] = useState(false);
   // 区分「拉取失败」与「确实没发过」：失败时绝不渲染"还没发过"这句事实性断言，
@@ -1970,8 +1972,16 @@ export function SendHistorySection({ wxid }: { wxid: string }) {
       setLoaded(true);
       return;
     }
+    if (!accountId) {
+      setFailed(true);
+      setLoaded(true);
+      return;
+    }
+    const params = new URLSearchParams({ accountId });
     api
-      .get<{ items: SendHistoryItem[] }>(`/api/contacts/${wxid}/send-history`)
+      .get<{ items: SendHistoryItem[] }>(
+        `/api/contacts/${encodeURIComponent(wxid)}/send-history?${params}`
+      )
       .then((res) => {
         if (!alive) return;
         setItems(Array.isArray(res.items) ? res.items : []);
@@ -1985,7 +1995,7 @@ export function SendHistorySection({ wxid }: { wxid: string }) {
     return () => {
       alive = false;
     };
-  }, [wxid]);
+  }, [accountId, wxid]);
 
   if (loaded && failed) {
     return (

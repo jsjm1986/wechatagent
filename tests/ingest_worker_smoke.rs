@@ -185,7 +185,12 @@ async fn run_one_round_skips_not_due_source_without_touching_last_fetched_at() {
 
     // 不挂任何 wiremock:not-due 本就不该发请求;若代码错误地发了请求会因无 mock
     // 连接失败,但那条路径也不会走到(is_due=false 早退在发请求之前)。
-    let src = ingest_source(&ws, "ing_not_due", "rss", "http://127.0.0.1:1/never".to_string());
+    let src = ingest_source(
+        &ws,
+        "ing_not_due",
+        "rss",
+        "http://127.0.0.1:1/never".to_string(),
+    );
     insert_source(&app, &src).await;
 
     // 把 last_fetched_at 设成 10 分钟前(schedule_minutes=60 → 未到点 not-due),
@@ -212,7 +217,10 @@ async fn run_one_round_skips_not_due_source_without_touching_last_fetched_at() {
         Some(ten_min_ago_ms),
         "not-due 源的 last_fetched_at 不得被 run_one_round 刷新(旧 bug 会刷成 now)"
     );
-    assert_eq!(reloaded.ingest_count, 0, "not-due 源不应产 chunk / 累加 ingest_count");
+    assert_eq!(
+        reloaded.ingest_count, 0,
+        "not-due 源不应产 chunk / 累加 ingest_count"
+    );
     assert_eq!(reloaded.status, "active", "not-due 源状态不变");
 
     // 且没落任何 chunk。
@@ -267,10 +275,17 @@ async fn run_one_round_still_ingests_due_source() {
     let reloaded = reload_source(&app, "ing_due").await;
     // due 源被真实拉取:last_fetched_at 前移(> 120min 前的旧值)、产 chunk。
     assert!(
-        reloaded.last_fetched_at.map(|d| d.timestamp_millis()).unwrap_or(0) > two_hours_ago_ms,
+        reloaded
+            .last_fetched_at
+            .map(|d| d.timestamp_millis())
+            .unwrap_or(0)
+            > two_hours_ago_ms,
         "due 源应被拉取,last_fetched_at 前移"
     );
-    assert!(reloaded.ingest_count >= 1, "due 源应产 chunk 并累加 ingest_count");
+    assert!(
+        reloaded.ingest_count >= 1,
+        "due 源应产 chunk 并累加 ingest_count"
+    );
 }
 
 /// 场景 5：源不提供 ETag 时，连续两次返回相同内容只导入一次。
@@ -293,7 +308,10 @@ async fn run_one_round_dedupes_unchanged_content_without_etag() {
 
     run_one_round(&app.state).await.expect("first round ok");
     let first_source = reload_source(&app, "ing_no_etag_dedupe").await;
-    assert!(first_source.last_etag.is_none(), "fixture must not return ETag");
+    assert!(
+        first_source.last_etag.is_none(),
+        "fixture must not return ETag"
+    );
     assert!(
         first_source.last_content_hash.is_some(),
         "first successful ingest should persist the content checkpoint"
@@ -320,9 +338,8 @@ async fn run_one_round_dedupes_unchanged_content_without_etag() {
     assert!(first_chunks > 0, "first round should create chunks");
 
     // Make the source due again without changing the fetched body.
-    let two_hours_ago = BsonDateTime::from_millis(
-        BsonDateTime::now().timestamp_millis() - 2 * 60 * 60 * 1000,
-    );
+    let two_hours_ago =
+        BsonDateTime::from_millis(BsonDateTime::now().timestamp_millis() - 2 * 60 * 60 * 1000);
     app.state
         .db
         .ingest_sources()

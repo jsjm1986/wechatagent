@@ -1,6 +1,6 @@
 //! 销售素材本地文件存储：安全路径构造（防穿越）、sha256、读写。
-use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum MediaStorageError {
@@ -27,7 +27,8 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 /// 仅允许 [A-Za-z0-9_-] 的 segment（workspace_id / sha 都应满足；含 . / 或其它即拒）。
 fn is_safe_segment(s: &str) -> bool {
     !s.is_empty()
-        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 pub fn safe_relative_path(
@@ -53,11 +54,20 @@ const ALLOWED: &[(&str, &str)] = &[
     ("gif", "image/gif"),
     ("webp", "image/webp"),
     ("doc", "application/msword"),
-    ("docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+    (
+        "docx",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ),
     ("xls", "application/vnd.ms-excel"),
-    ("xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+    (
+        "xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ),
     ("ppt", "application/vnd.ms-powerpoint"),
-    ("pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation"),
+    (
+        "pptx",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ),
     ("mp4", "video/mp4"),
     ("mov", "video/quicktime"),
 ];
@@ -134,7 +144,10 @@ mod tests {
 
     #[test]
     fn sanitize_ext_whitelists_known_types() {
-        assert_eq!(sanitize_ext("a.pdf", "application/pdf").as_deref(), Some("pdf"));
+        assert_eq!(
+            sanitize_ext("a.pdf", "application/pdf").as_deref(),
+            Some("pdf")
+        );
         assert_eq!(sanitize_ext("a.PNG", "image/png").as_deref(), Some("png"));
         // 危险/未知扩展名拒绝
         assert_eq!(sanitize_ext("evil.exe", "application/octet-stream"), None);
@@ -150,7 +163,10 @@ mod tests {
 
     #[tokio::test]
     async fn delete_bytes_removes_file_and_is_idempotent() {
-        let dir = std::env::temp_dir().join(format!("mediadel_{}", sha256_hex(format!("{:?}", std::time::SystemTime::now()).as_bytes())));
+        let dir = std::env::temp_dir().join(format!(
+            "mediadel_{}",
+            sha256_hex(format!("{:?}", std::time::SystemTime::now()).as_bytes())
+        ));
         let rel = "ws/ab/abcd.pdf";
         store_bytes(&dir, rel, b"hi").await.unwrap();
         assert!(dir.join(rel).exists());

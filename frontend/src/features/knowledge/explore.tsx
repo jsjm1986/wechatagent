@@ -24,6 +24,13 @@ interface AskResult {
   tookMs: number;
 }
 
+interface AskFailedEvent {
+  code?: string;
+  message?: string;
+}
+
+const ASK_MAX_ROUNDS = 4;
+
 // AskView：把 /api/knowledge/ask 包装成"输入 → answer + cited 卡片 + tool_trace 时间线"。
 //
 // 设计要点：
@@ -48,6 +55,7 @@ export function AskView() {
   // 而 setResult 是异步 state —— 必须在每个 setResult 处同步置 ref，否则 error
   // handler 读到的是上一轮的旧 result（stale closure），导致新查询失败时错误横幅被误抑制。
   const resultRef = useRef<AskResult | null>(null);
+  const streamOutcomeRef = useRef<"idle" | "pending" | "answered" | "failed" | "cancelled">("idle");
 
   // 组件卸载/重新提交时关掉旧 EventSource，避免连接泄漏。
   useEffect(() => () => {
@@ -59,6 +67,7 @@ export function AskView() {
     setError(null);
     setResult(null);
     resultRef.current = null;
+    streamOutcomeRef.current = "idle";
     setLiveTrace([]);
     setStreamText("");
     setOpenCited(new Set());
@@ -102,6 +111,7 @@ export function AskView() {
   function submitStream(q: string) {
     setPending(true);
     resetForSubmit();
+    streamOutcomeRef.current = "pending";
     setShowTrace(true);
     const startedAt = Date.now();
     const params = new URLSearchParams({ query: q });
@@ -135,13 +145,32 @@ export function AskView() {
         const next: AskResult = { ...data, tookMs: data.tookMs ?? Date.now() - startedAt };
         setResult(next);
         resultRef.current = next;
+        streamOutcomeRef.current = "answered";
       } catch (err) {
+        streamOutcomeRef.current = "failed";
         setError(err instanceof Error ? err.message : "解析 answer 帧失败");
       }
     });
+    es.addEventListener("failed", (ev) => {
+      let message = "知识问答暂时失败，请稍后重试。";
+      try {
+        const data = JSON.parse((ev as MessageEvent).data) as AskFailedEvent;
+        if (typeof data.message === "string" && data.message.trim()) {
+          message = data.message;
+        }
+      } catch {
+        // 失败帧自身格式异常时仍展示稳定通用文案。
+      }
+      streamOutcomeRef.current = "failed";
+      setError(message);
+      es.close();
+      esRef.current = null;
+      setPending(false);
+    });
     es.addEventListener("error", () => {
-      // 浏览器在 close 后也会触发 error；只在还没拿到 answer 时报警，避免误报。
-      if (!resultRef.current) {
+      // 浏览器在主动 close 后也可能触发 error；只有仍处于 pending 才是连接异常。
+      if (streamOutcomeRef.current === "pending" && !resultRef.current) {
+        streamOutcomeRef.current = "failed";
         setError("流式连接错误（请关闭实时模式或重试）");
       }
       es.close();
@@ -149,6 +178,10 @@ export function AskView() {
       setPending(false);
     });
     es.addEventListener("close", () => {
+      if (streamOutcomeRef.current === "pending" && !resultRef.current) {
+        streamOutcomeRef.current = "failed";
+        setError("流式连接在返回结果前结束，请重试。");
+      }
       es.close();
       esRef.current = null;
       setPending(false);
@@ -159,6 +192,7 @@ export function AskView() {
   // agent 在下一个 cancel checkpoint 自行收尾并发出 cancelled answer 帧。
   // 此处前端不等 answer 帧，直接把 pending 置 false，UI 立即解锁。
   function cancelStream() {
+    streamOutcomeRef.current = "cancelled";
     esRef.current?.close();
     esRef.current = null;
     setPending(false);
@@ -255,7 +289,7 @@ export function AskView() {
             <span>
               <Clock3 size={12} /> {result.tookMs} ms
             </span>
-            <span>轮次：{result.roundsUsed}/3</span>
+            <span>轮次：{result.roundsUsed}/{ASK_MAX_ROUNDS}</span>
             {result.truncated ? (
               <span className="wikiBadge warn">已截断</span>
             ) : null}

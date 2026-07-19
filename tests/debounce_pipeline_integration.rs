@@ -165,9 +165,8 @@ fn push_gateway_rounds(app: &common::TestApp, rounds: usize) {
             "我们一般 2~4 周可上线，预算和场景深度相关，要不要先按你们的优先级排排序？",
             "客户主动询问实施周期与预算，回复能确认需求颗粒度并降低决策摩擦，是关键推进时机。",
         ));
-        app.llm.push_response(review_agent_pass_json(
-            "回复语气良好、不越界承诺，可放行。",
-        ));
+        app.llm
+            .push_response(review_agent_pass_json("回复语气良好、不越界承诺，可放行。"));
     }
 }
 
@@ -373,7 +372,12 @@ async fn runner_uses_latest_inbound_snapshot_for_decision() {
         review.inbound_message_id
     );
     // 聚合仍只跑一轮（无中途抢占）→ 只 2 次 LLM、outbox 1 行。
-    assert_eq!(app.llm.calls(), 2, "单轮聚合只应 2 次 LLM，实际 {}", app.llm.calls());
+    assert_eq!(
+        app.llm.calls(),
+        2,
+        "单轮聚合只应 2 次 LLM，实际 {}",
+        app.llm.calls()
+    );
     let run_logs = count_run_logs(&app, &contact).await;
     assert_eq!(run_logs, 1, "聚合应只产 1 次运行，实际 {run_logs} 行");
 }

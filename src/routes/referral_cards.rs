@@ -229,7 +229,11 @@ pub(super) async fn toggle_referral_card(
             &account_id,
             None,
             "referral_card.toggled",
-            if payload.enabled { "enabled" } else { "disabled" },
+            if payload.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            },
             &format!("管理员{}名片：{}", enabled_label, card.display_name),
             Some(details),
         )

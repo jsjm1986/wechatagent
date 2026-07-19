@@ -62,7 +62,10 @@ const FIVE_GATE_KEYS: &[(&str, &str)] = &[
     ("pressure_risk_block", "revision_failed"),
     ("human_like_score_rewrite", "revision_failed"),
     ("emotional_value_rewrite", "revision_failed"),
-    ("product_accuracy_score_block", "blocked_unverified_product_claim"),
+    (
+        "product_accuracy_score_block",
+        "blocked_unverified_product_claim",
+    ),
 ];
 
 /// 安插一条 `post_release_reviews` 文档。`released_at` 由 `release.rs` 在自己
@@ -126,7 +129,10 @@ pub async fn run_due_reviews(state: &AppState) -> Result<usize, EvolutionError> 
     use futures::TryStreamExt;
     while let Some(review) = cursor.try_next().await.map_err(EvolutionError::from)? {
         if let Err(e) = process_one_review(state, &review).await {
-            tracing::warn!(?e, "post_release_review processing failed; will retry next tick");
+            tracing::warn!(
+                ?e,
+                "post_release_review processing failed; will retry next tick"
+            );
             continue;
         }
         completed_count += 1;
@@ -161,8 +167,11 @@ async fn process_one_review(state: &AppState, review: &Document) -> Result<(), E
     let before_start = released_at_plus_hours(released_at, -REVIEW_WINDOW_HOURS);
     let after_end = released_at_plus_hours(released_at, REVIEW_WINDOW_HOURS);
 
-    let before = compute_window_metrics(state, &workspace_id, &account_id, before_start, released_at).await?;
-    let after = compute_window_metrics(state, &workspace_id, &account_id, released_at, after_end).await?;
+    let before =
+        compute_window_metrics(state, &workspace_id, &account_id, before_start, released_at)
+            .await?;
+    let after =
+        compute_window_metrics(state, &workspace_id, &account_id, released_at, after_end).await?;
 
     let delta_send_success = after
         .send_success_rate
@@ -440,7 +449,10 @@ mod tests {
         let minus24 = released_at_plus_hours(t, -24);
         let one_day_ms = 24 * 60 * 60 * 1000;
         assert_eq!(plus24.timestamp_millis() - t.timestamp_millis(), one_day_ms);
-        assert_eq!(t.timestamp_millis() - minus24.timestamp_millis(), one_day_ms);
+        assert_eq!(
+            t.timestamp_millis() - minus24.timestamp_millis(),
+            one_day_ms
+        );
     }
 
     #[test]
@@ -525,7 +537,10 @@ mod tests {
             OutcomeLabel::Block
         );
         // 沉默/pending/未知 = 删失（Iron Law ②），绝不当负例。
-        assert_eq!(classify_outcome_label(Some("pending")), OutcomeLabel::Censored);
+        assert_eq!(
+            classify_outcome_label(Some("pending")),
+            OutcomeLabel::Censored
+        );
         assert_eq!(classify_outcome_label(None), OutcomeLabel::Censored);
     }
 }

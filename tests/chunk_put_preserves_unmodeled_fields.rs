@@ -107,15 +107,25 @@ async fn put_preserves_provenance_wiki_type_locked_fields_and_created_at() {
     assert_eq!(after.title, "新标题", "title 被更新");
 
     // 「请求体无法表达」的字段保持原值（核心防回归：不再被 replace_one 清空）。
-    assert_eq!(after.wiki_type.as_deref(), Some("methodology"), "wiki_type 保持原值");
-    assert_eq!(after.chunk_type, "style_template", "chunk_type 保持原值(不被重置为 product_fact)");
+    assert_eq!(
+        after.wiki_type.as_deref(),
+        Some("methodology"),
+        "wiki_type 保持原值"
+    );
+    assert_eq!(
+        after.chunk_type, "style_template",
+        "chunk_type 保持原值(不被重置为 product_fact)"
+    );
     assert_eq!(
         after.provenance.as_ref().map(|p| p.source.as_str()),
         Some("imported"),
         "provenance 保持原值(知识来源追溯)"
     );
     assert_eq!(
-        after.provenance.as_ref().and_then(|p| p.source_doc_id.as_deref()),
+        after
+            .provenance
+            .as_ref()
+            .and_then(|p| p.source_doc_id.as_deref()),
         Some("doc-seed"),
         "provenance.source_doc_id 保持原值"
     );
@@ -124,9 +134,20 @@ async fn put_preserves_provenance_wiki_type_locked_fields_and_created_at() {
         Some(&["body".to_string()][..]),
         "locked_fields 保持原值(编辑保护清单)"
     );
-    assert_eq!(after.dynamic_confidence, Some(0.66), "dynamic_confidence 保持原值");
-    assert_eq!(after.integrity_score, Some(0.88), "integrity_score 保持原值");
-    assert_eq!(after.created_at, created, "created_at 保持原值(不被篡改成更新时间)");
+    assert_eq!(
+        after.dynamic_confidence,
+        Some(0.66),
+        "dynamic_confidence 保持原值"
+    );
+    assert_eq!(
+        after.integrity_score,
+        Some(0.88),
+        "integrity_score 保持原值"
+    );
+    assert_eq!(
+        after.created_at, created,
+        "created_at 保持原值(不被篡改成更新时间)"
+    );
 }
 
 /// KB-10 + KB-11 红线:admin PUT 走 replace_one 整条替换时——

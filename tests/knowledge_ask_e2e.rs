@@ -131,9 +131,7 @@ async fn ask_returns_no_relevant_when_corpus_empty() {
 
     // 不入队任何 LLM 响应；如果代码错误地调 LLM，pop_or_error 会立即报错。
 
-    let result = answer(&app.state, req("任何 query"))
-        .await
-        .expect("answer");
+    let result = answer(&app.state, req("任何 query")).await.expect("answer");
 
     assert_eq!(result.answer, "知识库无相关内容。");
     assert!(result.cited_chunk_ids.is_empty());
@@ -166,9 +164,7 @@ async fn ask_falls_back_to_truncated_when_llm_never_emits_answer() {
         }));
     }
 
-    let result = answer(&app.state, req("question"))
-        .await
-        .expect("answer");
+    let result = answer(&app.state, req("question")).await.expect("answer");
 
     assert!(result.truncated, "4 轮未 answer 必须 truncated=true");
     assert_eq!(
@@ -197,9 +193,7 @@ async fn ask_skips_unverified_chunks_in_catalog() {
     chunk.integrity_status = Some("needs_review".to_string());
     insert(&app, &[chunk]).await;
 
-    let result = answer(&app.state, req("query"))
-        .await
-        .expect("answer");
+    let result = answer(&app.state, req("query")).await.expect("answer");
 
     assert_eq!(
         result.answer, "知识库无相关内容。",
@@ -247,17 +241,19 @@ async fn follow_relations_marks_contradiction_targets() {
     let source_id = source.id.unwrap().to_hex();
     insert(&app, &[source, support, contra]).await;
 
-    let (_catalog, prefetched) =
-        follow_relations(&app.state, WS, &source_id, 1, &HashSet::new())
-            .await
-            .expect("follow_relations ok");
+    let (_catalog, prefetched) = follow_relations(&app.state, WS, &source_id, 1, &HashSet::new())
+        .await
+        .expect("follow_relations ok");
 
     // B 与 C 都被拉入（contradicts 跟随但标记，不是跳过）。
     let b = prefetched
         .iter()
         .find(|c| c.chunk_id == support_id)
         .expect("B 应被作为支撑拉入");
-    assert_eq!(b.relation_role, None, "references 目标不带 contradiction 标记");
+    assert_eq!(
+        b.relation_role, None,
+        "references 目标不带 contradiction 标记"
+    );
 
     let c = prefetched
         .iter()
@@ -314,10 +310,9 @@ async fn follow_relations_redirects_superseded_target() {
     let source_id = source.id.unwrap().to_hex();
     insert(&app, &[source, old_target, new_chunk]).await;
 
-    let (_catalog, prefetched) =
-        follow_relations(&app.state, WS, &source_id, 1, &HashSet::new())
-            .await
-            .expect("follow_relations ok");
+    let (_catalog, prefetched) = follow_relations(&app.state, WS, &source_id, 1, &HashSet::new())
+        .await
+        .expect("follow_relations ok");
 
     assert!(
         prefetched.iter().any(|c| c.chunk_id == new_id),
@@ -364,9 +359,7 @@ async fn answer_cites_redirected_current_version_end_to_end() {
         }],
     }));
 
-    let result = answer(&app.state, req("价格异议"))
-        .await
-        .expect("answer");
+    let result = answer(&app.state, req("价格异议")).await.expect("answer");
 
     // cite⊆opened 修复成立：cite 新版 id 不被丢，cited 非空且恰为新版。
     assert_eq!(

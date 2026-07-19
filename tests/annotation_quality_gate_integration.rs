@@ -163,7 +163,11 @@ fn review_request(status: &str, note: Option<&str>) -> ReviewRequest {
 
 /// 回查某 contact 的 `domain_attributes.assist_mode_override` 字段（缺口 2 断言用）。
 /// 返回 None 表示键不存在（default → $unset 后的预期）。
-async fn read_assist_override(state: &AppState, workspace_id: &str, oid: ObjectId) -> Option<String> {
+async fn read_assist_override(
+    state: &AppState,
+    workspace_id: &str,
+    oid: ObjectId,
+) -> Option<String> {
     let contact = state
         .db
         .contacts()
@@ -174,7 +178,10 @@ async fn read_assist_override(state: &AppState, workspace_id: &str, oid: ObjectI
     contact
         .domain_attributes
         .as_ref()
-        .and_then(|d| d.get_str(wechatagent::models::ASSIST_MODE_OVERRIDE_ATTR).ok())
+        .and_then(|d| {
+            d.get_str(wechatagent::models::ASSIST_MODE_OVERRIDE_ATTR)
+                .ok()
+        })
         .map(ToString::to_string)
 }
 
@@ -322,7 +329,10 @@ async fn assist_override_force_on_then_default_unsets() {
     )
     .await
     .expect("force_on 应成功");
-    assert_eq!(resp.0.get("mode").and_then(|v| v.as_str()), Some("force_on"));
+    assert_eq!(
+        resp.0.get("mode").and_then(|v| v.as_str()),
+        Some("force_on")
+    );
     assert_eq!(
         read_assist_override(&app.state, ws, contact_id).await,
         Some("force_on".to_string()),

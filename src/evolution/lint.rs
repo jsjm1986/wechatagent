@@ -47,13 +47,17 @@ mod tests {
     #[test]
     fn ascii_clean_text_passes() {
         assert!(passes_forbidden_words(""));
-        assert!(passes_forbidden_words("Reply Agent should ground claims in knowledge"));
+        assert!(passes_forbidden_words(
+            "Reply Agent should ground claims in knowledge"
+        ));
         assert!(passes_forbidden_words("AI 策略主动暂缓 / 安全门拦截"));
     }
 
     #[test]
     fn english_takeover_variants_blocked() {
-        assert!(!passes_forbidden_words("if user is angry, hand off to a human"));
+        assert!(!passes_forbidden_words(
+            "if user is angry, hand off to a human"
+        ));
         assert!(!passes_forbidden_words("trigger human-takeover branch"));
         assert!(!passes_forbidden_words("human_takeover required"));
         assert!(!passes_forbidden_words("requires hand-off to operator"));

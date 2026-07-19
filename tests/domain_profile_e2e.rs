@@ -39,18 +39,16 @@
 
 mod common;
 
+use axum::extract::{Extension, Json, Path, State};
 use futures::TryStreamExt;
-use std::sync::Arc;
 use mongodb::bson::{doc, oid::ObjectId, DateTime};
 use mongodb::options::FindOptions;
 use serde_json::Value;
-use axum::extract::{Extension, Json, Path, State};
+use std::sync::Arc;
 use wechatagent::auth::AuthenticatedAdmin;
 use wechatagent::db::Database;
 use wechatagent::llm::{LlmClient, LlmFormat};
-use wechatagent::models::{
-    CommitmentMarkers, DomainProfile, OperationMode, OutcomePolarity,
-};
+use wechatagent::models::{CommitmentMarkers, DomainProfile, OperationMode, OutcomePolarity};
 use wechatagent::routes::guide_profile::GenerateProfileRequest;
 
 /// 按 `REAL_LLM_FORMAT`（openai/anthropic，缺省 openai）解析 LlmFormat。端点切到
@@ -91,7 +89,10 @@ async fn db_create_profile(
         soul_override: None,
         methodology_override: None,
         conversation_mode_policy: None,
-        commitment_markers: CommitmentMarkers { product_effect: vec![], tone_only: vec![] },
+        commitment_markers: CommitmentMarkers {
+            product_effect: vec![],
+            tone_only: vec![],
+        },
         coverage_dimensions: vec![],
         stagnation_dimension: None,
         conversation_modes: vec![],
@@ -120,7 +121,11 @@ async fn db_create_profile(
         generated_state_machine: None,
         version: 1,
     };
-    let result = db.domain_profiles().insert_one(&profile, None).await.expect("insert");
+    let result = db
+        .domain_profiles()
+        .insert_one(&profile, None)
+        .await
+        .expect("insert");
     result.inserted_id.as_object_id().expect("ObjectId")
 }
 
@@ -156,7 +161,11 @@ async fn db_get_profile(db: &Database, id: ObjectId) -> DomainProfile {
 }
 
 /// 从 DB 里按 profile_id 找 current_version=true 的 profile。
-async fn db_find_current(db: &Database, workspace_id: &str, profile_id: &str) -> Option<DomainProfile> {
+async fn db_find_current(
+    db: &Database,
+    workspace_id: &str,
+    profile_id: &str,
+) -> Option<DomainProfile> {
     db.domain_profiles()
         .find_one(
             doc! { "workspace_id": workspace_id, "profile_id": profile_id, "current_version": true },
@@ -217,7 +226,10 @@ async fn e2e_create_lands_as_draft() {
 
     let p = db_get_profile(&db, id).await;
     assert_eq!(p.profile_id, "edu-k12-tuition");
-    assert_eq!(p.current_version, false, "create 应落草稿态 current_version=false");
+    assert_eq!(
+        p.current_version, false,
+        "create 应落草稿态 current_version=false"
+    );
     assert_eq!(p.is_active, false, "create 应落草稿态 is_active=false");
     assert_eq!(p.version, 1);
     assert_eq!(p.seeded_by.as_deref(), Some("manual"));
@@ -270,7 +282,10 @@ async fn e2e_update_only_edits_draft() {
         p.profile_dimensions.get(0).map(|d| d.kind.as_str()),
         Some("emotional_state")
     );
-    assert_eq!(p.current_version, false, "更新后仍是草稿 current_version=false");
+    assert_eq!(
+        p.current_version, false,
+        "更新后仍是草稿 current_version=false"
+    );
     assert_eq!(p.is_active, false);
 }
 
@@ -302,8 +317,14 @@ async fn e2e_draft_lineage_publish_then_activate_two_step() {
         .expect("publish");
 
     let published = db_get_profile(&db, id).await;
-    assert_eq!(published.current_version, true, "publish 后 current_version=true");
-    assert_eq!(published.is_active, false, "草稿血缘手动 publish 不动 is_active（须 activate）");
+    assert_eq!(
+        published.current_version, true,
+        "publish 后 current_version=true"
+    );
+    assert_eq!(
+        published.is_active, false,
+        "草稿血缘手动 publish 不动 is_active（须 activate）"
+    );
     assert_eq!(published.version, 1);
 
     // Step 2: activate —— is_active=true, current_version 保持 true
@@ -334,13 +355,21 @@ async fn e2e_only_one_active_per_workspace() {
 
     // 两个都 publish + activate
     db.domain_profiles()
-        .update_one(doc! { "_id": id_a }, doc! { "$set": { "current_version": true } }, None)
+        .update_one(
+            doc! { "_id": id_a },
+            doc! { "$set": { "current_version": true } },
+            None,
+        )
         .await
         .expect("publish a");
     db_activate_profile(&db, ws, id_a).await;
 
     db.domain_profiles()
-        .update_one(doc! { "_id": id_b }, doc! { "$set": { "current_version": true } }, None)
+        .update_one(
+            doc! { "_id": id_b },
+            doc! { "$set": { "current_version": true } },
+            None,
+        )
         .await
         .expect("publish b");
     db_activate_profile(&db, ws, id_b).await;
@@ -349,9 +378,13 @@ async fn e2e_only_one_active_per_workspace() {
     let count = db_active_count(&db, ws).await;
     assert_eq!(count, 1, "同 workspace 应只有一条 is_active=true");
 
-    let b = db_find_current(&db, ws, "profile-b").await.expect("profile-b should exist");
+    let b = db_find_current(&db, ws, "profile-b")
+        .await
+        .expect("profile-b should exist");
     assert_eq!(b.is_active, true);
-    let a = db_find_current(&db, ws, "profile-a").await.expect("profile-a should exist");
+    let a = db_find_current(&db, ws, "profile-a")
+        .await
+        .expect("profile-a should exist");
     assert_eq!(a.is_active, false, "profile-a 应被 soft demote");
 }
 
@@ -365,7 +398,11 @@ async fn e2e_delete_forbidden_on_active() {
     let id = db_create_profile(&db, ws, "profile-x", "X", "X", "manual").await;
 
     db.domain_profiles()
-        .update_one(doc! { "_id": id }, doc! { "$set": { "current_version": true } }, None)
+        .update_one(
+            doc! { "_id": id },
+            doc! { "$set": { "current_version": true } },
+            None,
+        )
         .await
         .expect("publish");
     db_activate_profile(&db, ws, id).await;
@@ -387,7 +424,9 @@ async fn e2e_generate_candidate_is_draft() {
     let base_url = std::env::var("REAL_LLM_BASE_URL").ok();
     let model = std::env::var("REAL_LLM_MODEL").ok();
     if api_key.is_none() || base_url.is_none() {
-        eprintln!("[SKIP] REAL_LLM_API_KEY or REAL_LLM_BASE_URL not set; skipping real-LLM generate test");
+        eprintln!(
+            "[SKIP] REAL_LLM_API_KEY or REAL_LLM_BASE_URL not set; skipping real-LLM generate test"
+        );
         return;
     }
 
@@ -497,7 +536,9 @@ async fn e2e_generate_second_industry_profile() {
     let base_url = std::env::var("REAL_LLM_BASE_URL").ok();
     let model = std::env::var("REAL_LLM_MODEL").ok();
     if api_key.is_none() || base_url.is_none() {
-        eprintln!("[SKIP] REAL_LLM_API_KEY or REAL_LLM_BASE_URL not set; skipping real-LLM generate test");
+        eprintln!(
+            "[SKIP] REAL_LLM_API_KEY or REAL_LLM_BASE_URL not set; skipping real-LLM generate test"
+        );
         return;
     }
 
@@ -579,17 +620,17 @@ async fn e2e_generate_second_industry_profile() {
 
     assert_eq!(p.current_version, false);
     assert_eq!(p.is_active, false);
-    assert!(!p.profile_dimensions.is_empty(), "AI 应生成 profile_dimensions");
+    assert!(
+        !p.profile_dimensions.is_empty(),
+        "AI 应生成 profile_dimensions"
+    );
     assert!(
         p.prompt_fragment.as_ref().is_some_and(|s| !s.is_empty()),
         "AI 应生成 prompt_fragment"
     );
     // 验证多 profile 并存（之前生成过 emotional-companion-care）
     let all = db_list_current(&app.state.db, &app.state.config.default_workspace_id).await;
-    assert!(
-        all.len() >= 1,
-        "列表应至少包含刚生成的 profile"
-    );
+    assert!(all.len() >= 1, "列表应至少包含刚生成的 profile");
 }
 
 // ── Part C：真 route handler 集成（TEST-2/TEST-6 缺口）─────────────────────
@@ -639,10 +680,16 @@ async fn e2e_publish_handler_realigns_active_on_live_lineage() {
         )
         .await
         .expect("count loadable");
-    assert_eq!(loadable, 1, "publish 后恰一行可被运行时加载（无回落 DEFAULT）");
+    assert_eq!(
+        loadable, 1,
+        "publish 后恰一行可被运行时加载（无回落 DEFAULT）"
+    );
 
     let v2_doc = db_get_profile(&db, v2).await;
-    assert!(v2_doc.is_active && v2_doc.current_version, "v2 既 active 又 current");
+    assert!(
+        v2_doc.is_active && v2_doc.current_version,
+        "v2 既 active 又 current"
+    );
     let v1_doc = db_get_profile(&db, v1).await;
     assert!(!v1_doc.current_version, "v1 不再是 current");
     assert!(!v1_doc.is_active, "realign 把 active 迁走，v1 不再 active");
@@ -658,7 +705,15 @@ async fn e2e_publish_handler_noop_on_never_active_lineage() {
     let ws = app.state.config.default_workspace_id.clone();
 
     // 纯草稿：current_version=true 但从未 activate（is_active=false）。
-    let v1 = db_create_profile(&db, &ws, "draft-only", "草稿", "纯草稿血缘", "generated_by_ai").await;
+    let v1 = db_create_profile(
+        &db,
+        &ws,
+        "draft-only",
+        "草稿",
+        "纯草稿血缘",
+        "generated_by_ai",
+    )
+    .await;
     db.domain_profiles()
         .update_one(
             doc! { "_id": v1 },
@@ -678,7 +733,10 @@ async fn e2e_publish_handler_noop_on_never_active_lineage() {
 
     // 红线：血缘从未 active → publish 后仍无任何 active 行。
     let active = db_active_count(&db, &ws).await;
-    assert_eq!(active, 0, "草稿血缘 publish 后仍 0 个 active（须人审 activate）");
+    assert_eq!(
+        active, 0,
+        "草稿血缘 publish 后仍 0 个 active（须人审 activate）"
+    );
 }
 
 /// TEST-2 缺口：rollback 真 handler 在已生效血缘上把 active 迁回上一版本。
@@ -706,7 +764,12 @@ async fn e2e_rollback_handler_realigns_active() {
     )
     .await
     .expect("publish v2");
-    let v2_hex = pub_resp.0.get("id").and_then(|v| v.as_str()).expect("v2 id").to_string();
+    let v2_hex = pub_resp
+        .0
+        .get("id")
+        .and_then(|v| v.as_str())
+        .expect("v2 id")
+        .to_string();
 
     // rollback v2 → 回到 v1（previous_version）。
     let _ = wechatagent::routes::domain_profiles::rollback_domain_profile(
@@ -719,7 +782,10 @@ async fn e2e_rollback_handler_realigns_active() {
 
     // 不变量：回退后 v1 既 current 又 active，恰一行可加载。
     let v1_doc = db_get_profile(&db, v1).await;
-    assert!(v1_doc.current_version && v1_doc.is_active, "rollback 后 v1 既 current 又 active");
+    assert!(
+        v1_doc.current_version && v1_doc.is_active,
+        "rollback 后 v1 既 current 又 active"
+    );
     let loadable = db
         .domain_profiles()
         .count_documents(
@@ -771,8 +837,15 @@ async fn e2e_update_handler_partial_set_preserves_untouched_fields() {
     assert_eq!(p.display_name, "新名", "display_name 被更新");
     // 未触碰字段保持原值（核心：不再整行清零）。
     assert_eq!(p.description, "原简介", "未带的 description 保持原值");
-    assert_eq!(p.prompt_fragment.as_deref(), Some("原始业务上下文"), "未带的 prompt_fragment 保持原值");
-    assert!(p.grounding_gate_bypass_without_claim, "未带的 grounding 开关保持原值");
+    assert_eq!(
+        p.prompt_fragment.as_deref(),
+        Some("原始业务上下文"),
+        "未带的 prompt_fragment 保持原值"
+    );
+    assert!(
+        p.grounding_gate_bypass_without_claim,
+        "未带的 grounding 开关保持原值"
+    );
 }
 
 /// TEST-6 缺口 + CORRECT-1：PUT update 带未知键 → 白名单过滤，未知键不落库（防文档污染）；
@@ -787,15 +860,14 @@ async fn e2e_update_handler_drops_unknown_and_managed_keys() {
     let id = db_create_profile(&db, &ws, "filter-target", "原名", "原简介", "manual").await;
 
     // body 含：合法内容键 + 未知键 + 试图篡改的托管键。
-    let body: wechatagent::routes::domain_profiles::UpsertRequest = serde_json::from_value(
-        serde_json::json!({
+    let body: wechatagent::routes::domain_profiles::UpsertRequest =
+        serde_json::from_value(serde_json::json!({
             "display_name": "新名",
             "totally_unknown_field": "should_not_persist",
             "is_active": true,
             "version": 99,
-        }),
-    )
-    .expect("deserialize");
+        }))
+        .expect("deserialize");
     let _ = wechatagent::routes::domain_profiles::update_domain_profile(
         State(app.state.clone()),
         Extension(test_admin(&ws)),
@@ -813,8 +885,15 @@ async fn e2e_update_handler_drops_unknown_and_managed_keys() {
         .await
         .expect("find")
         .expect("doc");
-    assert_eq!(raw.get_str("display_name").ok(), Some("新名"), "合法内容键更新");
-    assert!(raw.get("totally_unknown_field").is_none(), "未知键不落库（CORRECT-1 白名单过滤）");
+    assert_eq!(
+        raw.get_str("display_name").ok(),
+        Some("新名"),
+        "合法内容键更新"
+    );
+    assert!(
+        raw.get("totally_unknown_field").is_none(),
+        "未知键不落库（CORRECT-1 白名单过滤）"
+    );
     // 托管字段未被篡改（strip_backend_managed_keys 剥离）。
     let p = db_get_profile(&db, id).await;
     assert!(!p.is_active, "is_active 不可经 PUT 篡改");
@@ -877,7 +956,11 @@ async fn e2e_publish_risky_returns_pending_no_current_shift() {
     let risky: Vec<String> = body
         .get("riskyFields")
         .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
         .expect("riskyFields array");
     assert!(
         risky.contains(&"grounding_gate_bypass_without_claim".to_string())
@@ -894,7 +977,10 @@ async fn e2e_publish_risky_returns_pending_no_current_shift() {
 
     // 关键：旧 v1 仍唯一 current+active（零窗口期，运行时继续加载旧版本）。
     let v1_doc = db_get_profile(&db, v1).await;
-    assert!(v1_doc.current_version && v1_doc.is_active, "v1 仍 current+active");
+    assert!(
+        v1_doc.current_version && v1_doc.is_active,
+        "v1 仍 current+active"
+    );
     let loadable = db
         .domain_profiles()
         .count_documents(
@@ -903,7 +989,10 @@ async fn e2e_publish_risky_returns_pending_no_current_shift() {
         )
         .await
         .expect("count loadable");
-    assert_eq!(loadable, 1, "危险 publish 后仍恰一行可加载（旧版本，无窗口期回落）");
+    assert_eq!(
+        loadable, 1,
+        "危险 publish 后仍恰一行可加载（旧版本，无窗口期回落）"
+    );
 }
 
 /// 二次确认：对旁路稿调 rollout → 推 current+demote+realign，新版本生效、单活。
@@ -939,7 +1028,12 @@ async fn e2e_confirm_activation_promotes_risky_draft() {
     )
     .await
     .expect("publish risky");
-    let sideline_hex = pub_resp.0.get("id").and_then(|v| v.as_str()).expect("id").to_string();
+    let sideline_hex = pub_resp
+        .0
+        .get("id")
+        .and_then(|v| v.as_str())
+        .expect("id")
+        .to_string();
     let sideline_id = ObjectId::parse_str(&sideline_hex).expect("oid");
 
     // 运营二次确认 → rollout 旁路稿（confirm-path 复用 rollout）。
@@ -953,9 +1047,15 @@ async fn e2e_confirm_activation_promotes_risky_draft() {
 
     // 确认后旁路稿既 current 又 active，旧 v1 都让出。
     let sideline = db_get_profile(&db, sideline_id).await;
-    assert!(sideline.current_version && sideline.is_active, "确认后旁路稿 current+active");
+    assert!(
+        sideline.current_version && sideline.is_active,
+        "确认后旁路稿 current+active"
+    );
     let v1_doc = db_get_profile(&db, v1).await;
-    assert!(!v1_doc.current_version && !v1_doc.is_active, "v1 让出 current+active");
+    assert!(
+        !v1_doc.current_version && !v1_doc.is_active,
+        "v1 让出 current+active"
+    );
     let loadable = db
         .domain_profiles()
         .count_documents(
@@ -1008,10 +1108,14 @@ async fn e2e_publish_nonrisky_live_lineage_still_realigns() {
         body.get("pendingActivation").is_none(),
         "普通字段变更不触发分级（无 pendingActivation）"
     );
-    let new_id = ObjectId::parse_str(body.get("id").and_then(|v| v.as_str()).expect("id")).expect("oid");
+    let new_id =
+        ObjectId::parse_str(body.get("id").and_then(|v| v.as_str()).expect("id")).expect("oid");
     // 即时生效：realign 把 active 迁到新版本。
     let new_doc = db_get_profile(&db, new_id).await;
-    assert!(new_doc.current_version && new_doc.is_active, "普通变更即时生效（v2 current+active）");
+    assert!(
+        new_doc.current_version && new_doc.is_active,
+        "普通变更即时生效（v2 current+active）"
+    );
     let loadable = db
         .domain_profiles()
         .count_documents(
@@ -1033,7 +1137,15 @@ async fn e2e_publish_risky_on_draft_lineage_no_pending() {
     let ws = app.state.config.default_workspace_id.clone();
 
     // 纯草稿血缘：current_version=true 但从未 activate（is_active=false），且带危险字段。
-    let v1 = db_create_profile(&db, &ws, "risky-draft", "AI候选", "纯草稿", "generated_by_ai").await;
+    let v1 = db_create_profile(
+        &db,
+        &ws,
+        "risky-draft",
+        "AI候选",
+        "纯草稿",
+        "generated_by_ai",
+    )
+    .await;
     db.domain_profiles()
         .update_one(
             doc! { "_id": v1 },
@@ -1108,7 +1220,9 @@ async fn db_seed_base_domain_config(db: &Database, workspace_id: &str) {
         .replace_one(
             doc! { "workspace_id": workspace_id, "domain": "user_operations", "version": 1_i32 },
             &cfg,
-            mongodb::options::ReplaceOptions::builder().upsert(true).build(),
+            mongodb::options::ReplaceOptions::builder()
+                .upsert(true)
+                .build(),
         )
         .await
         .expect("seed base operation_domain_config");
@@ -1161,7 +1275,15 @@ async fn e2e_activate_publishes_generated_state_machine() {
             { "key": "x_deep", "name": "深入", "allowedFrom": ["x_intro"] },
         ]
     };
-    let pid = db_create_profile(&db, &ws, "edu-domain", "教育", "教育咨询", "generated_by_ai").await;
+    let pid = db_create_profile(
+        &db,
+        &ws,
+        "edu-domain",
+        "教育",
+        "教育咨询",
+        "generated_by_ai",
+    )
+    .await;
     db.domain_profiles()
         .update_one(
             doc! { "_id": pid },
@@ -1182,10 +1304,18 @@ async fn e2e_activate_publishes_generated_state_machine() {
 
     // 断言：多出一版 config，新 current 的 state_machine 含 "x_intro"，版本递增。
     let after_count = db_domain_config_count(&db, &ws).await;
-    assert_eq!(after_count, base_count + 1, "activate 应 publish 一版新 config");
+    assert_eq!(
+        after_count,
+        base_count + 1,
+        "activate 应 publish 一版新 config"
+    );
     let current = db_current_domain_config(&db, &ws).await;
     assert!(current.version > base_version, "新 current 版本号递增");
-    assert_eq!(current.previous_version, Some(base_version), "previous_version 指向底座版本");
+    assert_eq!(
+        current.previous_version,
+        Some(base_version),
+        "previous_version 指向底座版本"
+    );
     let keys: Vec<&str> = current
         .state_machine
         .get_array("states")
@@ -1194,8 +1324,14 @@ async fn e2e_activate_publishes_generated_state_machine() {
         .filter_map(|s| s.as_document())
         .filter_map(|d| d.get_str("key").ok())
         .collect();
-    assert!(keys.contains(&"x_intro"), "publish 的 state_machine 含生成的 x_intro: {keys:?}");
-    assert!(keys.contains(&"x_deep"), "publish 的 state_machine 含生成的 x_deep: {keys:?}");
+    assert!(
+        keys.contains(&"x_intro"),
+        "publish 的 state_machine 含生成的 x_intro: {keys:?}"
+    );
+    assert!(
+        keys.contains(&"x_deep"),
+        "publish 的 state_machine 含生成的 x_deep: {keys:?}"
+    );
     assert_eq!(
         current.seeded_by.as_deref(),
         Some("profile:edu-domain"),
@@ -1268,7 +1404,15 @@ async fn e2e_activate_derives_state_policies_for_forbids_proactive() {
             { "key": "grieving", "name": "哀伤期", "allowedFrom": ["x_intro"], "forbidsProactive": true },
         ]
     };
-    let pid = db_create_profile(&db, &ws, "grief-care", "哀伤陪伴", "情感陪伴", "generated_by_ai").await;
+    let pid = db_create_profile(
+        &db,
+        &ws,
+        "grief-care",
+        "哀伤陪伴",
+        "情感陪伴",
+        "generated_by_ai",
+    )
+    .await;
     db.domain_profiles()
         .update_one(
             doc! { "_id": pid },
@@ -1427,7 +1571,9 @@ async fn republish_toggled_forbids_proactive_refreshes_policy() {
         ]
     };
     activate_profile_with_machine(&app, &db, &ws, "grief", &machine_allow).await;
-    let p1 = db_state_policy(&db, &ws, "grieving").await.expect("grieving policy after v1");
+    let p1 = db_state_policy(&db, &ws, "grieving")
+        .await
+        .expect("grieving policy after v1");
     assert!(
         !p1.forbidden.iter().any(|a| a == "reply"),
         "forbidsProactive=false 时 forbidden 不应含 reply: {:?}",
@@ -1442,7 +1588,9 @@ async fn republish_toggled_forbids_proactive_refreshes_policy() {
         ]
     };
     activate_profile_with_machine(&app, &db, &ws, "grief", &machine_forbid).await;
-    let p2 = db_state_policy(&db, &ws, "grieving").await.expect("grieving policy after v2");
+    let p2 = db_state_policy(&db, &ws, "grieving")
+        .await
+        .expect("grieving policy after v2");
     assert!(
         p2.forbidden.iter().any(|a| a == "reply"),
         "forbidsProactive 切 true 后机器派生 policy forbidden 应含 reply（in-place 刷新）: {:?}",
@@ -1467,7 +1615,11 @@ async fn operator_edited_policy_preserved_on_republish() {
         workspace_id: ws.clone(),
         domain: "user_operations".to_string(),
         state_key: "grieving".to_string(),
-        allowed: vec!["reply".to_string(), "silent".to_string(), "follow_up".to_string()],
+        allowed: vec![
+            "reply".to_string(),
+            "silent".to_string(),
+            "follow_up".to_string(),
+        ],
         forbidden: vec![],
         recommended_pace: None,
         status: "active".to_string(),
@@ -1492,7 +1644,9 @@ async fn operator_edited_policy_preserved_on_republish() {
     activate_profile_with_machine(&app, &db, &ws, "grief", &machine).await;
 
     // 断言：运营手工行未被覆盖——forbidden 仍空、seeded_by 仍 admin_manual。
-    let after = db_state_policy(&db, &ws, "grieving").await.expect("grieving policy preserved");
+    let after = db_state_policy(&db, &ws, "grieving")
+        .await
+        .expect("grieving policy preserved");
     assert!(
         after.forbidden.is_empty(),
         "运营手工行 forbidden 应保持空（不被机器派生 clobber）: {:?}",
@@ -1601,14 +1755,8 @@ async fn republish_refreshes_only_current_policy_version() {
         "historical(version 1) 行不应被改动，forbidden 仍空: {:?}",
         hist_after.forbidden
     );
-    assert_eq!(
-        hist_after.version, 1,
-        "historical 行 version 不变"
-    );
-    assert!(
-        !hist_after.current_version,
-        "historical 行仍非 current"
-    );
+    assert_eq!(hist_after.version, 1, "historical 行 version 不变");
+    assert!(!hist_after.current_version, "historical 行仍非 current");
 }
 
 // ── H13 (T14)：activate 切状态机后迁移存量 contact 幻影态到新 initial ────────────────

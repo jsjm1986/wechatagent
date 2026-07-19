@@ -94,15 +94,19 @@ pub(crate) async fn shadow_replay_prompt_one(
         .await?
     {
         Some(log) => log,
-        None => return Ok(PromptShadowSample::failed(source_run_id, "source_run_not_found")),
+        None => {
+            return Ok(PromptShadowSample::failed(
+                source_run_id,
+                "source_run_not_found",
+            ))
+        }
     };
 
     // 2. 原始侧（G4 真实基线）：源 run review.scores + selfCritiqueAddressed。
     //    review 文档以 camelCase 落库（见 gateway `to_document(&review)`），故
     //    self_critique_addressed → `selfCritiqueAddressed`，scores → `scores`。
     let original_scores = original.review.get_document("scores").ok().cloned();
-    let original_self_critique_addressed =
-        original.review.get_bool("selfCritiqueAddressed").ok();
+    let original_self_critique_addressed = original.review.get_bool("selfCritiqueAddressed").ok();
 
     // 3. 候选片段必须齐全（target_prompt_key + diff_snippet）。
     let (target_prompt_key, append_snippet) = match (
@@ -125,7 +129,12 @@ pub(crate) async fn shadow_replay_prompt_one(
     // 4. contact 从源 run 反查（workspace + account + wxid 三键定位）。
     let contact_wxid = match original.contact_wxid.clone() {
         Some(wxid) => wxid,
-        None => return Ok(PromptShadowSample::failed(source_run_id, "contact_unavailable")),
+        None => {
+            return Ok(PromptShadowSample::failed(
+                source_run_id,
+                "contact_unavailable",
+            ))
+        }
     };
     let contact = match state
         .db
@@ -141,7 +150,12 @@ pub(crate) async fn shadow_replay_prompt_one(
         .await?
     {
         Some(c) => c,
-        None => return Ok(PromptShadowSample::failed(source_run_id, "contact_unavailable")),
+        None => {
+            return Ok(PromptShadowSample::failed(
+                source_run_id,
+                "contact_unavailable",
+            ))
+        }
     };
 
     // 5. inbound 用源 run 关联的真实消息，不合成。源 inbound id 落在 AgentRunLog

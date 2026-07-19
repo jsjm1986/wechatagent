@@ -15,6 +15,7 @@
 //!
 //! FORBIDDEN dependencies: gateway / outbox / mcp / tasks / webhooks。
 
+pub mod auto_release;
 pub mod budget;
 pub mod cohort;
 pub mod envelope;
@@ -26,7 +27,6 @@ pub mod release;
 pub mod replay;
 pub mod significance;
 pub mod threshold;
-pub mod auto_release;
 
 use std::time::Duration;
 
@@ -52,7 +52,9 @@ pub use self::runtime_flag::{
 /// 不影响下次（异常被捕获后写 `agent_events kind="evolution_tick_failed"`）。
 pub async fn run_evolutionary_worker(state: AppState) {
     if !state.config.evolution_enabled {
-        tracing::info!("evolution worker hard-locked (EVOLUTION_ENABLED=false); not entering tick loop");
+        tracing::info!(
+            "evolution worker hard-locked (EVOLUTION_ENABLED=false); not entering tick loop"
+        );
         return;
     }
     let tick_seconds = state.config.evolution_tick_seconds.max(60);
@@ -106,15 +108,17 @@ pub async fn run_one_tick(state: &AppState) -> Result<(), EvolutionError> {
     let runtime_flag = match self::runtime_flag::load_runtime_flag(state, &workspace_id).await {
         Ok(v) => v,
         Err(err) => {
-            tracing::warn!(?err, "evolution runtime_flag load failed; treating as disabled this tick");
+            tracing::warn!(
+                ?err,
+                "evolution runtime_flag load failed; treating as disabled this tick"
+            );
             None
         }
     };
 
     // 2. cohort（灰度过滤）
     let cohorts =
-        select_cohorts_filtered(state, &workspace_id, &account_id, runtime_flag.as_ref())
-            .await?;
+        select_cohorts_filtered(state, &workspace_id, &account_id, runtime_flag.as_ref()).await?;
     let threshold_count = cohorts.threshold.len();
     let prompt_count = cohorts.prompt.len();
 
@@ -142,18 +146,18 @@ pub async fn run_one_tick(state: &AppState) -> Result<(), EvolutionError> {
 
     // 4. prompt critic 候选（消 EvolutionBudget；BudgetExceeded 不向上传播）。
     let mut budget = EvolutionBudget::from_config(&state.config);
-    let prompt_proposals = match prompt_critic::generate(state, &exp_id, &cohorts, &mut budget).await
-    {
-        Ok(v) => v,
-        Err(EvolutionError::BudgetExceeded {
-            tokens_used,
-            calls_used,
-        }) => {
-            write_budget_exceeded_event(state, &exp_id, tokens_used, calls_used).await?;
-            Vec::new()
-        }
-        Err(e) => return Err(e),
-    };
+    let prompt_proposals =
+        match prompt_critic::generate(state, &exp_id, &cohorts, &mut budget).await {
+            Ok(v) => v,
+            Err(EvolutionError::BudgetExceeded {
+                tokens_used,
+                calls_used,
+            }) => {
+                write_budget_exceeded_event(state, &exp_id, tokens_used, calls_used).await?;
+                Vec::new()
+            }
+            Err(e) => return Err(e),
+        };
     insert_proposals(state, &prompt_proposals).await?;
 
     // 5. 写预算用量到 envelope。
@@ -223,10 +227,15 @@ pub async fn run_one_tick(state: &AppState) -> Result<(), EvolutionError> {
 
     // 8. M4 W4 Task 5.6：扫一次到期的 post_release_reviews（+24h 对比窗口）。
     //    单条失败不影响 tick；已 release 的 proposal 仍受 admin 控制是否回滚。
-    let post_release_completed = post_release::run_due_reviews(state).await.unwrap_or_else(|e| {
-        tracing::warn!(?e, "post_release run_due_reviews failed; will retry next tick");
-        0
-    });
+    let post_release_completed = post_release::run_due_reviews(state)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                ?e,
+                "post_release run_due_reviews failed; will retry next tick"
+            );
+            0
+        });
 
     // 9. Phase C / C5：threshold proposal 自动 release 闭环。
     //    `evolution_auto_release_enabled=false` 时立即 return 0；
@@ -235,7 +244,10 @@ pub async fn run_one_tick(state: &AppState) -> Result<(), EvolutionError> {
     let auto_released = auto_release::auto_release_eligible_thresholds(state)
         .await
         .unwrap_or_else(|e| {
-            tracing::warn!(?e, "auto_release_eligible_thresholds failed; will retry next tick");
+            tracing::warn!(
+                ?e,
+                "auto_release_eligible_thresholds failed; will retry next tick"
+            );
             0
         });
 

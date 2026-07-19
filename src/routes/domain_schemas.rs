@@ -148,8 +148,7 @@ impl From<&DomainSchema> for DomainSchemaView {
                 alias_of: f.alias_of.clone(),
             })
             .collect();
-        let alias_dict = mongodb::bson::Bson::Document(s.alias_dict.clone())
-            .into_relaxed_extjson();
+        let alias_dict = mongodb::bson::Bson::Document(s.alias_dict.clone()).into_relaxed_extjson();
         Self {
             schema_id: s.schema_id.clone(),
             workspace_id: s.workspace_id.clone(),
@@ -170,7 +169,8 @@ pub(super) async fn list_domain_schemas(
     Extension(admin): Extension<AuthenticatedAdmin>,
     Query(params): Query<ListQuery>,
 ) -> AppResult<Json<Value>> {
-    let workspace_id = resolve_authorized_workspace(&state, &admin, params.workspace_id.clone()).await?;
+    let workspace_id =
+        resolve_authorized_workspace(&state, &admin, params.workspace_id.clone()).await?;
     let mut filter = doc! { "workspace_id": &workspace_id };
     if params.active_only {
         filter.insert("is_active", true);
@@ -197,7 +197,8 @@ pub(super) async fn create_domain_schema(
     Extension(admin): Extension<AuthenticatedAdmin>,
     Json(body): Json<UpsertRequest>,
 ) -> AppResult<Json<Value>> {
-    let workspace_id = resolve_authorized_workspace(&state, &admin, body.workspace_id.clone()).await?;
+    let workspace_id =
+        resolve_authorized_workspace(&state, &admin, body.workspace_id.clone()).await?;
     if body.schema_id.trim().is_empty() {
         return Err(AppError::BadRequest("schemaId 不能为空".to_string()));
     }
@@ -236,7 +237,8 @@ pub(super) async fn update_domain_schema(
     Path(schema_id): Path<String>,
     Json(body): Json<UpsertRequest>,
 ) -> AppResult<Json<Value>> {
-    let workspace_id = resolve_authorized_workspace(&state, &admin, body.workspace_id.clone()).await?;
+    let workspace_id =
+        resolve_authorized_workspace(&state, &admin, body.workspace_id.clone()).await?;
     let existing = state
         .db
         .domain_schemas()
@@ -289,7 +291,8 @@ pub(super) async fn delete_domain_schema(
     Path(schema_id): Path<String>,
     Query(params): Query<ListQuery>,
 ) -> AppResult<Json<Value>> {
-    let workspace_id = resolve_authorized_workspace(&state, &admin, params.workspace_id.clone()).await?;
+    let workspace_id =
+        resolve_authorized_workspace(&state, &admin, params.workspace_id.clone()).await?;
     let existing = state
         .db
         .domain_schemas()
@@ -323,7 +326,8 @@ pub(super) async fn activate_domain_schema(
     Path(schema_id): Path<String>,
     Query(params): Query<ListQuery>,
 ) -> AppResult<Json<Value>> {
-    let workspace_id = resolve_authorized_workspace(&state, &admin, params.workspace_id.clone()).await?;
+    let workspace_id =
+        resolve_authorized_workspace(&state, &admin, params.workspace_id.clone()).await?;
     let target = state
         .db
         .domain_schemas()
@@ -380,11 +384,7 @@ pub(super) async fn activate_domain_schema(
     })))
 }
 
-async fn next_version_for(
-    state: &AppState,
-    workspace_id: &str,
-    schema_id: &str,
-) -> AppResult<i32> {
+async fn next_version_for(state: &AppState, workspace_id: &str, schema_id: &str) -> AppResult<i32> {
     let latest = state
         .db
         .domain_schemas()
@@ -415,18 +415,14 @@ fn validate_schema_payload(
     alias_dict_value: &Value,
 ) -> AppResult<(Vec<DomainField>, Document)> {
     if incoming_fields.len() > 64 {
-        return Err(AppError::BadRequest(
-            "fields 数量不得超过 64".to_string(),
-        ));
+        return Err(AppError::BadRequest("fields 数量不得超过 64".to_string()));
     }
     let mut seen_names = std::collections::HashSet::new();
     let mut fields = Vec::with_capacity(incoming_fields.len());
     for f in incoming_fields {
         let name = f.name.trim();
         if name.is_empty() {
-            return Err(AppError::BadRequest(
-                "field.name 不能为空".to_string(),
-            ));
+            return Err(AppError::BadRequest("field.name 不能为空".to_string()));
         }
         if BASE_FIELD_BLACKLIST.contains(&name) {
             return Err(AppError::BadRequest(format!(
@@ -527,10 +523,7 @@ pub async fn load_active_domain_schema(
 ///
 /// 返回 rewrite 后的 `Document`（调用方据此落库）。schema 未声明的额外字段原样保留
 /// （schema 是"必填/枚举/别名"约束层，不是白名单，行业自定义扩展字段不被剔除）。
-pub fn enforce_domain_attributes(
-    schema: &DomainSchema,
-    attrs: &Document,
-) -> AppResult<Document> {
+pub fn enforce_domain_attributes(schema: &DomainSchema, attrs: &Document) -> AppResult<Document> {
     use mongodb::bson::Bson;
 
     // 1. alias 透明 rewrite：别名 key → canonical key。
@@ -645,11 +638,9 @@ mod tests {
 
     #[test]
     fn validate_payload_rejects_alias_pointing_to_unknown_field() {
-        let err = validate_schema_payload(
-            &[enum_field()],
-            &json!({"客户阶段": "non_existent_field"}),
-        )
-        .unwrap_err();
+        let err =
+            validate_schema_payload(&[enum_field()], &json!({"客户阶段": "non_existent_field"}))
+                .unwrap_err();
         assert!(matches!(err, AppError::BadRequest(_)));
     }
 
@@ -671,8 +662,7 @@ mod tests {
 
     #[test]
     fn validate_payload_rejects_non_string_alias_value() {
-        let err =
-            validate_schema_payload(&[enum_field()], &json!({"客户阶段": 123})).unwrap_err();
+        let err = validate_schema_payload(&[enum_field()], &json!({"客户阶段": 123})).unwrap_err();
         assert!(matches!(err, AppError::BadRequest(_)));
     }
 

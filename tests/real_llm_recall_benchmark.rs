@@ -23,17 +23,26 @@ mod common;
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use axum::{
+    extract::{Path, State},
+    Extension, Json,
+};
 use futures::TryStreamExt;
 use mongodb::bson::{doc, oid::ObjectId, DateTime};
-use wechatagent::agent::knowledge_agent::{answer, AnswerRequest, AnswerResult, CatalogFilter, SourceQuoteCitation};
+use serde_json::json;
+use wechatagent::agent::knowledge_agent::{
+    answer, AnswerRequest, AnswerResult, CatalogFilter, SourceQuoteCitation,
+};
 use wechatagent::auth::AuthenticatedAdmin;
 use wechatagent::llm::{LlmClient, LlmFormat};
 use wechatagent::models::{KnowledgeGapSignal, OperationKnowledgeChunk, RelatedRef};
+use wechatagent::routes::ext_knowledge::{
+    chat_apply, chat_turn, verify_operation_knowledge_chunk, ChatApplyRequest, ChatTurnRequest,
+    KnowledgeVerifyRequest,
+};
 use wechatagent::routes::AppState;
-use wechatagent::routes::ext_knowledge::{chat_apply, chat_turn, verify_operation_knowledge_chunk, ChatApplyRequest, ChatTurnRequest, KnowledgeVerifyRequest};
-use axum::{extract::{State, Path}, Extension, Json};
-use serde_json::json;
 
+use crate::common::capability_evidence::CapabilityEvidence;
 use crate::common::TestApp;
 use wiremock::MockServer;
 
@@ -41,7 +50,9 @@ use wiremock::MockServer;
 
 /// 从 env 构造真实文本 provider。缺 `REAL_LLM_API_KEY` → None（调用方自我跳过）。
 fn real_llm_from_env() -> Option<Arc<LlmClient>> {
-    let api_key = std::env::var("REAL_LLM_API_KEY").ok().filter(|k| !k.trim().is_empty())?;
+    let api_key = std::env::var("REAL_LLM_API_KEY")
+        .ok()
+        .filter(|k| !k.trim().is_empty())?;
     let base_url = std::env::var("REAL_LLM_BASE_URL")
         .unwrap_or_else(|_| "https://api.supxh.xin/v1".to_string());
     let model = std::env::var("REAL_LLM_MODEL").unwrap_or_else(|_| "deepseek-v4-pro".to_string());
@@ -181,7 +192,11 @@ async fn seed_chunk(
         wiki_type: Some("methodology".to_string()),
         dynamic_confidence: Some(dynamic_confidence),
         chunk_type: "product_fact".to_string(),
-        related_chunks: if related.is_empty() { None } else { Some(related) },
+        related_chunks: if related.is_empty() {
+            None
+        } else {
+            Some(related)
+        },
         ..Default::default()
     };
     app.state
@@ -194,14 +209,19 @@ async fn seed_chunk(
 }
 
 /// 便捷：seed 一条 verified / active / 高置信的全局 chunk。
-async fn seed_verified(
-    app: &TestApp,
-    ws: &str,
-    title: &str,
-    summary: &str,
-    body: &str,
-) -> String {
-    seed_chunk(app, ws, title, summary, body, "verified", "active", 0.9, Vec::new()).await
+async fn seed_verified(app: &TestApp, ws: &str, title: &str, summary: &str, body: &str) -> String {
+    seed_chunk(
+        app,
+        ws,
+        title,
+        summary,
+        body,
+        "verified",
+        "active",
+        0.9,
+        Vec::new(),
+    )
+    .await
 }
 
 // ── Task2: 跨行业语料矩阵 + 客观对抗度量 ────────────────────────────────────
@@ -488,15 +508,11 @@ fn bigram_overlap(query: &str, body: &str) -> f64 {
         return 0.0;
     }
 
-    let query_bigrams: std::collections::HashSet<(char, char)> = query_chars
-        .windows(2)
-        .map(|w| (w[0], w[1]))
-        .collect();
+    let query_bigrams: std::collections::HashSet<(char, char)> =
+        query_chars.windows(2).map(|w| (w[0], w[1])).collect();
 
-    let body_bigrams: std::collections::HashSet<(char, char)> = body_chars
-        .windows(2)
-        .map(|w| (w[0], w[1]))
-        .collect();
+    let body_bigrams: std::collections::HashSet<(char, char)> =
+        body_chars.windows(2).map(|w| (w[0], w[1])).collect();
 
     let intersection_count = query_bigrams.intersection(&body_bigrams).count();
     intersection_count as f64 / query_bigrams.len() as f64
@@ -528,7 +544,8 @@ async fn seed_corpus_matrix(app: &TestApp, ws: &str, matrix: &[IndustryCorpus]) 
                 .expected_titles
                 .iter()
                 .map(|title| {
-                    title_to_id.get(title)
+                    title_to_id
+                        .get(title)
                         .unwrap_or_else(|| panic!("title not found in seeds: {}", title))
                         .clone()
                 })
@@ -536,14 +553,18 @@ async fn seed_corpus_matrix(app: &TestApp, ws: &str, matrix: &[IndustryCorpus]) 
 
             // 计算lexical_overlap（使用第一个expected chunk的body）
             let first_expected_title = query_case.expected_titles[0];
-            let first_expected_body = title_to_body.get(first_expected_title)
+            let first_expected_body = title_to_body
+                .get(first_expected_title)
                 .unwrap_or_else(|| panic!("body not found for title: {}", first_expected_title));
 
             let lexical_overlap = bigram_overlap(query_case.query, first_expected_body);
             let adversarial = lexical_overlap < 0.15;
 
-            let name = format!("{}/{}", corpus.industry,
-                &query_case.query.chars().take(10).collect::<String>());
+            let name = format!(
+                "{}/{}",
+                corpus.industry,
+                &query_case.query.chars().take(10).collect::<String>()
+            );
 
             recall_cases.push(RecallCase {
                 name,
@@ -574,12 +595,20 @@ fn bigram_overlap_properties() {
     // 部分重叠 → (0,1)
     let overlap3 = bigram_overlap("退货流程", "退换货政策流程说明");
     println!("overlap3 (退货流程 vs 退换货政策流程说明): {}", overlap3);
-    assert!(overlap3 > 0.0 && overlap3 < 1.0, "Expected partial overlap, got {}", overlap3);
+    assert!(
+        overlap3 > 0.0 && overlap3 < 1.0,
+        "Expected partial overlap, got {}",
+        overlap3
+    );
 
     // query 太短 → 0.0
     let overlap4 = bigram_overlap("退", "退换货");
     println!("overlap4 (退 vs 退换货): {}", overlap4);
-    assert_eq!(overlap4, 0.0, "Expected zero for short query, got {}", overlap4);
+    assert_eq!(
+        overlap4, 0.0,
+        "Expected zero for short query, got {}",
+        overlap4
+    );
 }
 
 // ── Task3: 触达/采纳两层召回提取 + recall@k ────────────────────────────────
@@ -712,7 +741,14 @@ async fn recall_benchmark_smoke() {
     let state = common::rebuild_app_state_with_real_llm(&app, llm, mcp.uri());
     let ws = "recall_smoke_ws";
 
-    let id = seed_verified(&app, ws, "退换货政策", "7天无理由退换", "本店支持 7 天无理由退换货，商品需保持完好。").await;
+    let id = seed_verified(
+        &app,
+        ws,
+        "退换货政策",
+        "7天无理由退换",
+        "本店支持 7 天无理由退换货，商品需保持完好。",
+    )
+    .await;
 
     // 跑一次 answer，验证管线打通
     let req = AnswerRequest {
@@ -749,7 +785,8 @@ async fn recall_benchmark_smoke() {
         reach_recall >= 1.0,
         "契约违约：smoke seeded query reach 召回 {:.3} < 1.0——\
          唯一 seeded chunk({}) 连自己都没被检索翻到，检索路径真 bug",
-        reach_recall, id
+        reach_recall,
+        id
     );
     eprintln!("[RECALL-SMOKE] 契约硬断言通过：seeded chunk reach 召回=1.0");
 }
@@ -776,14 +813,21 @@ async fn run_query_n_times(state: &AppState, ws: &str, query: &str, n: usize) ->
 
         match answer(state, req).await {
             Ok(result) => results.push(result),
-            Err(wechatagent::error::AppError::LlmUnavailable { kind, retry_count, .. }) => {
+            Err(wechatagent::error::AppError::LlmUnavailable {
+                kind, retry_count, ..
+            }) => {
                 eprintln!(
                     "skip: query={} round={}/{} —— 真模型上游瞬时不可达（kind={}, retry_count={}），跳过本次",
                     query, i+1, n, kind, retry_count
                 );
                 continue;
             }
-            Err(other) => panic!("run_query_n_times query={} round={}: {}", query, i+1, other),
+            Err(other) => panic!(
+                "run_query_n_times query={} round={}: {}",
+                query,
+                i + 1,
+                other
+            ),
         }
     }
 
@@ -794,6 +838,7 @@ async fn run_query_n_times(state: &AppState, ws: &str, query: &str, n: usize) ->
 #[tokio::test]
 #[ignore]
 async fn recall_benchmark_cross_industry() {
+    let mut evidence = CapabilityEvidence::new("recall_cross_industry");
     let llm = require_real_llm!();
     let app = TestApp::start().await;
     let mcp = dummy_mcp_server().await;
@@ -805,10 +850,11 @@ async fn recall_benchmark_cross_industry() {
     let cases = seed_corpus_matrix(&app, ws, &matrix).await;
 
     // 获取所有 seeded chunk ids（⊆seed 红线检查用）
-    let seeded_ids: HashSet<String> = app.state
+    let seeded_ids: HashSet<String> = app
+        .state
         .db
         .operation_knowledge_chunks()
-        .find(doc!{"workspace_id": ws}, None)
+        .find(doc! {"workspace_id": ws}, None)
         .await
         .expect("查询 seeded chunks")
         .try_collect::<Vec<OperationKnowledgeChunk>>()
@@ -841,6 +887,7 @@ async fn recall_benchmark_cross_industry() {
     let mut total_cases = 0;
     // 硬断言专用累加器（基于现有逐轮数据，不改测试主逻辑）：
     let mut ran_cases = 0; // 实际产出结果的 case 数（排除全轮瞬时跳过）——硬断言分母
+    let mut successful_rounds = 0usize;
     let mut per_case_reach_recall_range: Vec<f64> = Vec::new(); // 各 case 跨轮 reach 召回率极差(max-min)
 
     // 逐条 case 测试
@@ -848,6 +895,7 @@ async fn recall_benchmark_cross_industry() {
         total_cases += 1;
 
         let results = run_query_n_times(&state, ws, &case.query, n).await;
+        successful_rounds += results.len();
 
         if results.is_empty() {
             eprintln!("[RECALL] case={} 全轮失败，跳过", case.name);
@@ -869,7 +917,8 @@ async fn recall_benchmark_cross_industry() {
                 assert!(
                     seeded_ids.contains(id),
                     "RED-LINE 召回集越界: {} 不在 seed 集 (case={})",
-                    id, case.name
+                    id,
+                    case.name
                 );
             }
 
@@ -913,8 +962,12 @@ async fn recall_benchmark_cross_industry() {
             true // 单轮视为稳定
         };
 
-        if reach_stable { reach_stable_count += 1; }
-        if adopt_stable { adopt_stable_count += 1; }
+        if reach_stable {
+            reach_stable_count += 1;
+        }
+        if adopt_stable {
+            adopt_stable_count += 1;
+        }
 
         // 本 case 实际产出了结果（results 非空），计入硬断言分母
         ran_cases += 1;
@@ -953,7 +1006,11 @@ async fn recall_benchmark_cross_industry() {
 
     // Step 3 — 分组聚合汇总
     let calc_mean = |values: &[f64]| -> f64 {
-        if values.is_empty() { 0.0 } else { values.iter().sum::<f64>() / values.len() as f64 }
+        if values.is_empty() {
+            0.0
+        } else {
+            values.iter().sum::<f64>() / values.len() as f64
+        }
     };
 
     eprintln!("[RECALL] === 分组聚合汇总 ===");
@@ -961,7 +1018,9 @@ async fn recall_benchmark_cross_industry() {
     // overall 组
     eprintln!(
         "[RECALL] overall: reach_recall(mean)={:.3} adopt_recall(mean)={:.3} cases={}",
-        calc_mean(&overall_reach_recalls), calc_mean(&overall_adopt_recalls), overall_reach_recalls.len()
+        calc_mean(&overall_reach_recalls),
+        calc_mean(&overall_adopt_recalls),
+        overall_reach_recalls.len()
     );
 
     // lexical-easy 组
@@ -976,18 +1035,32 @@ async fn recall_benchmark_cross_industry() {
     if !adversarial_reach_recalls.is_empty() {
         eprintln!(
             "[RECALL] adversarial: reach_recall(mean)={:.3} adopt_recall(mean)={:.3} cases={}",
-            calc_mean(&adversarial_reach_recalls), calc_mean(&adversarial_adopt_recalls), adversarial_reach_recalls.len()
+            calc_mean(&adversarial_reach_recalls),
+            calc_mean(&adversarial_adopt_recalls),
+            adversarial_reach_recalls.len()
         );
     }
 
     // 跨轮稳定占比
-    let reach_stable_ratio = if total_cases > 0 { reach_stable_count as f64 / total_cases as f64 } else { 0.0 };
-    let adopt_stable_ratio = if total_cases > 0 { adopt_stable_count as f64 / total_cases as f64 } else { 0.0 };
+    let reach_stable_ratio = if total_cases > 0 {
+        reach_stable_count as f64 / total_cases as f64
+    } else {
+        0.0
+    };
+    let adopt_stable_ratio = if total_cases > 0 {
+        adopt_stable_count as f64 / total_cases as f64
+    } else {
+        0.0
+    };
 
     eprintln!(
         "[RECALL] 跨轮完全稳定占比: reach_stable={:.1}% ({}/{}) adopt_stable={:.1}% ({}/{})",
-        reach_stable_ratio * 100.0, reach_stable_count, total_cases,
-        adopt_stable_ratio * 100.0, adopt_stable_count, total_cases
+        reach_stable_ratio * 100.0,
+        reach_stable_count,
+        total_cases,
+        adopt_stable_ratio * 100.0,
+        adopt_stable_count,
+        total_cases
     );
 
     // ── 契约级硬断言（spec R4.1：消除「自称基准却零硬断言」假绿）──────────────────
@@ -996,13 +1069,18 @@ async fn recall_benchmark_cross_industry() {
     // 模型升级会让召回更好——锁死分数会在模型变强时误红。下限留足抖动余量，
     // 单调契约只断言「组间相对关系」这种结构性事实。⊆seed RED-LINE（loop 内）保持不动。
     //
-    // 前置：若所有 case 全轮瞬时不可达（ran_cases==0），无任何真模型样本可断言 →
-    // 不硬失败（这是端点抖动，已由 run_query_n_times 的 skip 处理），直接收尾。
-    if ran_cases == 0 {
-        eprintln!("[RECALL] 全部 case 均无成功轮次（端点瞬时不可达），跳过契约硬断言");
-        eprintln!("[RECALL] 召回基准测试完成");
-        return;
-    }
+    evidence.attempted();
+    evidence.observe_llm_calls(successful_rounds);
+    assert!(total_cases > 0, "recall corpus must contain cases");
+    assert!(
+        ran_cases * 5 >= total_cases * 4,
+        "召回基准成功 case 覆盖率不足 80%：{ran_cases}/{total_cases}"
+    );
+    assert!(
+        successful_rounds * 10 >= total_cases * n * 7,
+        "召回基准成功轮次覆盖率不足 70%：{successful_rounds}/{}",
+        total_cases * n
+    );
 
     let overall_reach_mean = calc_mean(&overall_reach_recalls);
     let lexical_easy_reach_mean = calc_mean(&lexical_easy_reach_recalls);
@@ -1040,7 +1118,8 @@ async fn recall_benchmark_cross_industry() {
             adversarial_reach_mean <= lexical_easy_reach_mean + 1e-9,
             "契约违约：adversarial 组 reach 召回均值 {:.3} 反超 lexical-easy 组 {:.3}——\
              词面强重叠反而召不回，lexical 检索路径异常",
-            adversarial_reach_mean, lexical_easy_reach_mean
+            adversarial_reach_mean,
+            lexical_easy_reach_mean
         );
     }
 
@@ -1053,7 +1132,9 @@ async fn recall_benchmark_cross_industry() {
         reach_stable_ratio_ran >= 0.8,
         "契约违约：reach 跨轮完全稳定占比 {:.3} ({}/{}) < 0.8 下限——\
          真模型召回过度抖动（已留 20% 非确定性余量）",
-        reach_stable_ratio_ran, reach_stable_count, ran_cases
+        reach_stable_ratio_ran,
+        reach_stable_count,
+        ran_cases
     );
 
     // 断言4 — 漂移率上限：任一 case 的跨轮 reach 召回率极差(max-min)应 ≤ 0.34。
@@ -1113,7 +1194,15 @@ async fn recall_benchmark_cross_industry() {
         reach_stable_ratio_ran,
         per_case_reach_recall_range.iter().cloned().fold(0.0_f64, f64::max),
     );
-    eprintln!("[RECALL] 召回基准测试完成 —— ⊆seed 红线 + recall@k 分组/单调/稳定/漂移 契约硬断言齐备");
+    eprintln!(
+        "[RECALL] 召回基准测试完成 —— ⊆seed 红线 + recall@k 分组/单调/稳定/漂移 契约硬断言齐备"
+    );
+    evidence.branch("thresholds_with_minimum_sample_coverage");
+    evidence.detail("total_cases", total_cases);
+    evidence.detail("ran_cases", ran_cases);
+    evidence.detail("planned_rounds", total_cases * n);
+    evidence.detail("successful_rounds", successful_rounds);
+    evidence.pass(ran_cases, 7);
 }
 
 // ── Task5: 真实 agent chat 改库全链路后召回保持 ────────────────────────────────
@@ -1123,8 +1212,14 @@ async fn recall_all(
     state: &AppState,
     ws: &str,
     cases: &[RecallCase],
-) -> std::collections::HashMap<String, (Vec<String>, Vec<String>)> {
+) -> (
+    std::collections::HashMap<String, (Vec<String>, Vec<String>)>,
+    usize,
+    usize,
+) {
     let mut results = std::collections::HashMap::new();
+    let mut successful_answers = 0usize;
+    let mut llm_calls = 0usize;
 
     for case in cases {
         let req = AnswerRequest {
@@ -1142,11 +1237,15 @@ async fn recall_all(
 
         match answer(state, req).await {
             Ok(result) => {
+                successful_answers += 1;
+                llm_calls += result.rounds_used.max(1) as usize;
                 let reach = reach_set(&result);
                 let adopt = adopt_set(&result);
                 results.insert(case.name.clone(), (reach, adopt));
             }
-            Err(wechatagent::error::AppError::LlmUnavailable { kind, retry_count, .. }) => {
+            Err(wechatagent::error::AppError::LlmUnavailable {
+                kind, retry_count, ..
+            }) => {
                 eprintln!(
                     "[RECALL-MAINT] skip case={} —— 真模型上游瞬时不可达（kind={}, retry_count={}），记录空集跳过",
                     case.name, kind, retry_count
@@ -1154,13 +1253,16 @@ async fn recall_all(
                 results.insert(case.name.clone(), (vec![], vec![]));
             }
             Err(other) => {
-                eprintln!("[RECALL-MAINT] fail case={} —— {}, 记录空集跳过", case.name, other);
+                eprintln!(
+                    "[RECALL-MAINT] fail case={} —— {}, 记录空集跳过",
+                    case.name, other
+                );
                 results.insert(case.name.clone(), (vec![], vec![]));
             }
         }
     }
 
-    results
+    (results, successful_answers, llm_calls)
 }
 
 /// Step 2 — chat_create_and_verify: 通过 chat 对话创建并审定知识切片。
@@ -1188,13 +1290,7 @@ async fn chat_create_and_verify(
     .expect("构造 ChatTurnRequest");
 
     // 调用 chat_turn —— 只产 pending 草稿预览，拿 sessionId
-    let resp = match chat_turn(
-        State(state.clone()),
-        Extension(admin.clone()),
-        Json(req),
-    )
-    .await
-    {
+    let resp = match chat_turn(State(state.clone()), Extension(admin.clone()), Json(req)).await {
         Ok(resp) => resp,
         Err(e) => {
             eprintln!("[RECALL-MAINT] chat_turn failed: {}, return None", e);
@@ -1254,7 +1350,8 @@ async fn chat_create_and_verify(
     // 调用 verify_operation_knowledge_chunk
     let verify_req: KnowledgeVerifyRequest = serde_json::from_value(json!({
         "verifiedClaims": null
-    })).expect("构造 KnowledgeVerifyRequest");
+    }))
+    .expect("构造 KnowledgeVerifyRequest");
 
     match verify_operation_knowledge_chunk(
         State(state.clone()),
@@ -1272,10 +1369,101 @@ async fn chat_create_and_verify(
     }
 }
 
+/// Run the real update branch against an explicitly attached chunk, apply the AI patch as a
+/// draft, then explicitly verify it. A positive return proves update_chunk, chat_apply and verify
+/// all committed against the same target and at least one field changed.
+async fn chat_update_and_verify(
+    state: &AppState,
+    admin: &AuthenticatedAdmin,
+    chunk_id: &str,
+    content: &str,
+) -> Option<usize> {
+    let req: ChatTurnRequest = serde_json::from_value(json!({
+        "sessionId": null,
+        "accountId": null,
+        "operatorId": "recall_maint_operator",
+        "content": content,
+        "attachments": [{ "chunkId": chunk_id, "itemId": null }],
+    }))
+    .expect("construct update ChatTurnRequest");
+
+    let body = match chat_turn(State(state.clone()), Extension(admin.clone()), Json(req)).await {
+        Ok(resp) => resp.0,
+        Err(err) => {
+            eprintln!("[RECALL-MAINT] update chat_turn failed: {err}");
+            return None;
+        }
+    };
+    if body.get("intent").and_then(|v| v.as_str()) != Some("update_chunk")
+        || body.get("canApply").and_then(|v| v.as_bool()) != Some(true)
+    {
+        eprintln!(
+            "[RECALL-MAINT] update branch not applicable: intent={:?} canApply={:?}",
+            body.get("intent"),
+            body.get("canApply")
+        );
+        return None;
+    }
+    let session_id = body.get("sessionId")?.as_str()?.trim().to_string();
+    if session_id.is_empty() {
+        return None;
+    }
+
+    let apply_req: ChatApplyRequest = serde_json::from_value(json!({ "accountId": null }))
+        .expect("construct update ChatApplyRequest");
+    let applied = match chat_apply(
+        State(state.clone()),
+        Extension(admin.clone()),
+        Path(session_id),
+        Json(apply_req),
+    )
+    .await
+    {
+        Ok(resp) => resp.0,
+        Err(err) => {
+            eprintln!("[RECALL-MAINT] update chat_apply failed: {err}");
+            return None;
+        }
+    };
+    let result = applied.get("result")?;
+    if result.get("updatedChunkId").and_then(|v| v.as_str()) != Some(chunk_id) {
+        eprintln!("[RECALL-MAINT] update applied to unexpected target: {result:?}");
+        return None;
+    }
+    let fields_touched = result
+        .get("fieldsTouched")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    if fields_touched == 0 {
+        eprintln!("[RECALL-MAINT] update patch touched zero recognized fields");
+        return None;
+    }
+
+    let verify_req: KnowledgeVerifyRequest = serde_json::from_value(json!({
+        "verifiedClaims": null
+    }))
+    .expect("construct update KnowledgeVerifyRequest");
+    match verify_operation_knowledge_chunk(
+        State(state.clone()),
+        Extension(admin.clone()),
+        Path(chunk_id.to_string()),
+        Json(verify_req),
+    )
+    .await
+    {
+        Ok(_) => Some(fields_touched),
+        Err(err) => {
+            eprintln!("[RECALL-MAINT] update verify failed: {err}");
+            None
+        }
+    }
+}
+
 /// Step 3 — 主测：真实 agent chat 改库全链路后召回保持
 #[tokio::test]
 #[ignore]
 async fn recall_benchmark_maintenance_stability() {
+    let mut evidence = CapabilityEvidence::new("recall_maintenance");
     let llm = require_real_llm!();
     let app = TestApp::start().await;
     let mcp = dummy_mcp_server().await;
@@ -1323,7 +1511,8 @@ async fn recall_benchmark_maintenance_stability() {
     };
 
     // baseline 召回
-    let r0 = recall_all(&state, ws, &cases).await;
+    evidence.attempted();
+    let (r0, ok0, calls0) = recall_all(&state, ws, &cases).await;
     let all_ids_r0 = get_all_chunk_ids().await;
 
     // 验证 baseline ⊆seed
@@ -1331,12 +1520,16 @@ async fn recall_benchmark_maintenance_stability() {
         check_subset_seed(reach, &all_ids_r0, &format!("baseline {}", case_name));
     }
 
-    eprintln!("[RECALL-MAINT] baseline完成，cases={}, seeded_ids={}", cases.len(), all_ids_r0.len());
+    eprintln!(
+        "[RECALL-MAINT] baseline完成，cases={}, seeded_ids={}",
+        cases.len(),
+        all_ids_r0.len()
+    );
 
     // 变更A·新增：补一条缺知识
     let create_content = "帮我新建一条知识切片：我们的高级版支持API集成对接，可以与客户现有CRM系统无缝连接。知识类型是产品能力，请起草标题、摘要和正文。";
 
-    let _created_chunk_id = match chat_create_and_verify(&state, ws, &admin, create_content).await {
+    let created_chunk_id = match chat_create_and_verify(&state, ws, &admin, create_content).await {
         Some(id) => {
             eprintln!("[RECALL-MAINT] 变更A新增成功，chunk_id={}", id);
             id
@@ -1349,7 +1542,7 @@ async fn recall_benchmark_maintenance_stability() {
 
     // 重新查 DB 取全集（包含新增的）
     let all_ids_r1 = get_all_chunk_ids().await;
-    let r1 = recall_all(&state, ws, &cases).await;
+    let (r1, ok1, calls1) = recall_all(&state, ws, &cases).await;
 
     // 验证 r1 ⊆seed
     for (case_name, (reach, _adopt)) in &r1 {
@@ -1360,7 +1553,9 @@ async fn recall_benchmark_maintenance_stability() {
     let mut drift_count = 0;
     let mut total_cases = 0;
     for case in &cases {
-        if let (Some((r0_reach, r0_adopt)), Some((r1_reach, r1_adopt))) = (r0.get(&case.name), r1.get(&case.name)) {
+        if let (Some((r0_reach, r0_adopt)), Some((r1_reach, r1_adopt))) =
+            (r0.get(&case.name), r1.get(&case.name))
+        {
             total_cases += 1;
             let mut r0_reach_sorted = r0_reach.clone();
             let mut r1_reach_sorted = r1_reach.clone();
@@ -1380,21 +1575,33 @@ async fn recall_benchmark_maintenance_stability() {
         }
     }
 
-    eprintln!("[RECALL-MAINT] 变更A·新增后 漂移率={:.1}% ({}/{})",
-        if total_cases > 0 { drift_count as f64 / total_cases as f64 * 100.0 } else { 0.0 },
-        drift_count, total_cases);
+    eprintln!(
+        "[RECALL-MAINT] 变更A·新增后 漂移率={:.1}% ({}/{})",
+        if total_cases > 0 {
+            drift_count as f64 / total_cases as f64 * 100.0
+        } else {
+            0.0
+        },
+        drift_count,
+        total_cases
+    );
 
     // 变更B·改写：chat_turn 发"更新/补充某切片同义表述"
-    let update_content = "帮我更新一条现有知识切片，为企业版产品增加更多同义表述：企业级解决方案、商业版本、专业版服务等表达方式。";
-
-    if let Some(_) = chat_create_and_verify(&state, ws, &admin, update_content).await {
-        eprintln!("[RECALL-MAINT] 变更B改写成功");
-    } else {
-        eprintln!("[RECALL-MAINT] 变更B改写失败");
-    }
+    let update_content = "请更新我附上的知识切片：保留原事实，并在摘要和产品标签中补充同义表达：企业级解决方案、商业版本、专业版服务。";
+    let fields_touched =
+        match chat_update_and_verify(&state, &admin, &created_chunk_id, update_content).await {
+            Some(count) => {
+                eprintln!("[RECALL-MAINT] 变更B真实改写成功，fields_touched={count}");
+                count
+            }
+            None => {
+                evidence.inconclusive("real update_chunk branch did not apply and verify");
+                return;
+            }
+        };
 
     let all_ids_r2 = get_all_chunk_ids().await;
-    let r2 = recall_all(&state, ws, &cases).await;
+    let (r2, ok2, calls2) = recall_all(&state, ws, &cases).await;
 
     // 验证 r2 ⊆seed
     for (case_name, (reach, _adopt)) in &r2 {
@@ -1405,7 +1612,9 @@ async fn recall_benchmark_maintenance_stability() {
     let mut drift_count_b = 0;
     let mut total_cases_b = 0;
     for case in &cases {
-        if let (Some((r1_reach, r1_adopt)), Some((r2_reach, r2_adopt))) = (r1.get(&case.name), r2.get(&case.name)) {
+        if let (Some((r1_reach, r1_adopt)), Some((r2_reach, r2_adopt))) =
+            (r1.get(&case.name), r2.get(&case.name))
+        {
             total_cases_b += 1;
             let mut r1_reach_sorted = r1_reach.clone();
             let mut r2_reach_sorted = r2_reach.clone();
@@ -1425,36 +1634,42 @@ async fn recall_benchmark_maintenance_stability() {
         }
     }
 
-    eprintln!("[RECALL-MAINT] 变更B·改写后 漂移率={:.1}% ({}/{})",
-        if total_cases_b > 0 { drift_count_b as f64 / total_cases_b as f64 * 100.0 } else { 0.0 },
-        drift_count_b, total_cases_b);
+    eprintln!(
+        "[RECALL-MAINT] 变更B·改写后 漂移率={:.1}% ({}/{})",
+        if total_cases_b > 0 {
+            drift_count_b as f64 / total_cases_b as f64 * 100.0
+        } else {
+            0.0
+        },
+        drift_count_b,
+        total_cases_b
+    );
 
     // 变更C·废弃：把某条 verified chunk update_one 置 integrity_status="needs_review"
-    if !all_ids_r2.is_empty() {
-        let first_chunk_id = all_ids_r2.iter().next().unwrap();
-        if let Ok(object_id) = ObjectId::parse_str(first_chunk_id) {
-            match app.state
-                .db
-                .operation_knowledge_chunks()
-                .update_one(
-                    doc! { "_id": object_id },
-                    doc! { "$set": { "integrity_status": "needs_review" } },
-                    None,
-                )
-                .await
-            {
-                Ok(_) => {
-                    eprintln!("[RECALL-MAINT] 变更C废弃成功，chunk_id={}", first_chunk_id);
-                }
-                Err(e) => {
-                    eprintln!("[RECALL-MAINT] 变更C废弃失败: {}", e);
-                }
-            }
-        }
-    }
+    let retired_chunk_id = all_ids_r0
+        .iter()
+        .next()
+        .expect("maintenance corpus must contain a seed")
+        .clone();
+    let retired_oid = ObjectId::parse_str(&retired_chunk_id).expect("seed id must be ObjectId");
+    let retired = app
+        .state
+        .db
+        .operation_knowledge_chunks()
+        .update_one(
+            doc! { "_id": retired_oid, "workspace_id": ws, "integrity_status": "verified" },
+            doc! { "$set": { "integrity_status": "needs_review" } },
+            None,
+        )
+        .await
+        .expect("retire verified seed chunk");
+    assert_eq!(
+        retired.modified_count, 1,
+        "maintenance retire must modify one seed"
+    );
 
     let all_ids_r3 = get_all_chunk_ids().await;
-    let r3 = recall_all(&state, ws, &cases).await;
+    let (r3, ok3, calls3) = recall_all(&state, ws, &cases).await;
 
     // 验证 r3 ⊆seed
     for (case_name, (reach, _adopt)) in &r3 {
@@ -1465,7 +1680,9 @@ async fn recall_benchmark_maintenance_stability() {
     let mut drift_count_c = 0;
     let mut total_cases_c = 0;
     for case in &cases {
-        if let (Some((r2_reach, r2_adopt)), Some((r3_reach, r3_adopt))) = (r2.get(&case.name), r3.get(&case.name)) {
+        if let (Some((r2_reach, r2_adopt)), Some((r3_reach, r3_adopt))) =
+            (r2.get(&case.name), r3.get(&case.name))
+        {
             total_cases_c += 1;
             let mut r2_reach_sorted = r2_reach.clone();
             let mut r3_reach_sorted = r3_reach.clone();
@@ -1485,9 +1702,16 @@ async fn recall_benchmark_maintenance_stability() {
         }
     }
 
-    eprintln!("[RECALL-MAINT] 变更C·废弃后 漂移率={:.1}% ({}/{})",
-        if total_cases_c > 0 { drift_count_c as f64 / total_cases_c as f64 * 100.0 } else { 0.0 },
-        drift_count_c, total_cases_c);
+    eprintln!(
+        "[RECALL-MAINT] 变更C·废弃后 漂移率={:.1}% ({}/{})",
+        if total_cases_c > 0 {
+            drift_count_c as f64 / total_cases_c as f64 * 100.0
+        } else {
+            0.0
+        },
+        drift_count_c,
+        total_cases_c
+    );
 
     // 契约硬断言（spec R4.1：maintenance 也要漂移率上限，把 SOFT-WARN 升级成硬断言）。
     // 上面三段 SOFT-WARN 的 drift_count* 把「端点瞬时不可达→recall_all 记空集」也算成漂移
@@ -1501,46 +1725,72 @@ async fn recall_benchmark_maintenance_stability() {
     // 【相对上限/单调契约，非绝对锁分，留足真模型抖动+变更引发的合理漂移余量】
     let mut safe_drift = 0usize;
     let mut safe_total = 0usize;
-    let count_safe_drift = |prev: &std::collections::HashMap<String, (Vec<String>, Vec<String>)>,
-                            cur: &std::collections::HashMap<String, (Vec<String>, Vec<String>)>,
-                            drift: &mut usize,
-                            total: &mut usize| {
-        for case in &cases {
-            if let (Some((p_reach, _)), Some((c_reach, _))) = (prev.get(&case.name), cur.get(&case.name)) {
-                // 任一侧 reach 为空 → 视为 transient 跳过该 case 对，不计入分母（防端点抖动假红）
-                if p_reach.is_empty() || c_reach.is_empty() {
-                    continue;
-                }
-                *total += 1;
-                let mut p_sorted = p_reach.clone();
-                let mut c_sorted = c_reach.clone();
-                p_sorted.sort();
-                c_sorted.sort();
-                if p_sorted != c_sorted {
-                    *drift += 1;
+    let count_safe_drift =
+        |prev: &std::collections::HashMap<String, (Vec<String>, Vec<String>)>,
+         cur: &std::collections::HashMap<String, (Vec<String>, Vec<String>)>,
+         drift: &mut usize,
+         total: &mut usize| {
+            for case in &cases {
+                if let (Some((p_reach, _)), Some((c_reach, _))) =
+                    (prev.get(&case.name), cur.get(&case.name))
+                {
+                    // 任一侧 reach 为空 → 视为 transient 跳过该 case 对，不计入分母（防端点抖动假红）
+                    if p_reach.is_empty() || c_reach.is_empty() {
+                        continue;
+                    }
+                    *total += 1;
+                    let mut p_sorted = p_reach.clone();
+                    let mut c_sorted = c_reach.clone();
+                    p_sorted.sort();
+                    c_sorted.sort();
+                    if p_sorted != c_sorted {
+                        *drift += 1;
+                    }
                 }
             }
-        }
-    };
+        };
     count_safe_drift(&r0, &r1, &mut safe_drift, &mut safe_total);
     count_safe_drift(&r1, &r2, &mut safe_drift, &mut safe_total);
     count_safe_drift(&r2, &r3, &mut safe_drift, &mut safe_total);
 
-    if safe_total == 0 {
-        eprintln!("[RECALL-MAINT] 三变更全程 reach 双侧均空（端点瞬时不可达），跳过漂移率上限硬断言");
-    } else {
-        let safe_drift_rate = safe_drift as f64 / safe_total as f64;
-        eprintln!(
-            "[RECALL-MAINT] flutter-safe 跨变更 reach 漂移率={:.1}% ({}/{})",
-            safe_drift_rate * 100.0, safe_drift, safe_total
-        );
-        assert!(
-            safe_drift_rate <= 0.5,
-            "契约违约：跨三变更 reach 漂移率 {:.3} ({}/{}) > 0.5 上限——\
-             过半 case 在知识库变更后召回结果翻转，检索对变更过度敏感（已剔除端点抖动空集，非绝对锁分）",
-            safe_drift_rate, safe_drift, safe_total
-        );
-    }
+    let successful_answers = ok0 + ok1 + ok2 + ok3;
+    let planned_answers = cases.len() * 4;
+    assert!(
+        successful_answers * 10 >= planned_answers * 7,
+        "maintenance successful answer coverage below 70%: {successful_answers}/{planned_answers}"
+    );
+    assert!(
+        safe_total >= cases.len(),
+        "maintenance has too few non-empty adjacent comparisons: {safe_total} < {}",
+        cases.len()
+    );
+    let safe_drift_rate = safe_drift as f64 / safe_total as f64;
+    eprintln!(
+        "[RECALL-MAINT] flutter-safe 跨变更 reach 漂移率={:.1}% ({}/{})",
+        safe_drift_rate * 100.0,
+        safe_drift,
+        safe_total
+    );
+    assert!(
+        safe_drift_rate <= 0.5,
+        "契约违约：跨三变更 reach 漂移率 {:.3} ({}/{}) > 0.5 上限",
+        safe_drift_rate,
+        safe_drift,
+        safe_total
+    );
+
+    // Only record calls directly observed from AnswerResult::rounds_used. The create/update
+    // artifacts below prove those LLM-backed branches ran; do not inflate the typed call count
+    // with an estimate for their internal tool loops.
+    evidence.observe_llm_calls(calls0 + calls1 + calls2 + calls3);
+    evidence.branch("create_update_verify_retire_with_recall_comparisons");
+    evidence.detail("created_chunk_id", created_chunk_id);
+    evidence.detail("updated_fields", fields_touched);
+    evidence.detail("retired_chunk_id", retired_chunk_id);
+    evidence.detail("successful_answers", successful_answers);
+    evidence.detail("planned_answers", planned_answers);
+    evidence.detail("safe_comparisons", safe_total);
+    evidence.pass(3, 7);
 
     eprintln!("[RECALL-MAINT] 真实chat改库全链路召回保持测试完成 —— 三变更后稳定性观测完毕 + 漂移率上限契约硬断言");
 }
@@ -1603,12 +1853,12 @@ async fn poll_recall_miss_signal(
     None
 }
 
-/// 单跑一次 answer，返回 (reach, adopt)；瞬时不可达 → None（调用方跳过）。
+/// 单跑一次 answer，返回 (reach, adopt, observed_llm_rounds)；瞬时不可达 → None。
 async fn answer_reach_adopt(
     state: &AppState,
     ws: &str,
     query: &str,
-) -> Option<(Vec<String>, Vec<String>)> {
+) -> Option<(Vec<String>, Vec<String>, usize)> {
     let req = AnswerRequest {
         workspace_id: ws.to_string(),
         account_id: None,
@@ -1622,8 +1872,13 @@ async fn answer_reach_adopt(
         max_rounds: None,
     };
     match answer(state, req).await {
-        Ok(result) => Some((reach_set(&result), adopt_set(&result))),
-        Err(wechatagent::error::AppError::LlmUnavailable { kind, retry_count, .. }) => {
+        Ok(result) => {
+            let observed_rounds = result.rounds_used.max(1) as usize;
+            Some((reach_set(&result), adopt_set(&result), observed_rounds))
+        }
+        Err(wechatagent::error::AppError::LlmUnavailable {
+            kind, retry_count, ..
+        }) => {
             eprintln!(
                 "[RECALL-CLOSED] skip —— 真模型上游瞬时不可达（kind={}, retry_count={}）",
                 kind, retry_count
@@ -1640,6 +1895,7 @@ async fn answer_reach_adopt(
 #[tokio::test]
 #[ignore]
 async fn recall_benchmark_gap_closed_loop_trajectory() {
+    let mut evidence = CapabilityEvidence::new("recall_gap_closed_loop");
     let llm = require_real_llm!();
     let app = TestApp::start().await;
     let mcp = dummy_mcp_server().await;
@@ -1661,9 +1917,13 @@ async fn recall_benchmark_gap_closed_loop_trajectory() {
     let gap_query = "你们支持哪些海外支付货币？跨境结算手续费是百分之几？";
 
     // ② answer 未覆盖主题 → 期望诚实弃答（cited 为空 → reach/adopt 不命中已有 chunk）。
-    let (reach0, adopt0) = match answer_reach_adopt(&state, ws, gap_query).await {
+    evidence.attempted();
+    let (reach0, adopt0, calls0) = match answer_reach_adopt(&state, ws, gap_query).await {
         Some(v) => v,
-        None => return, // 瞬时不可达，跳过
+        None => {
+            evidence.infra_skip("initial gap answer produced no model result");
+            return;
+        }
     };
     eprintln!(
         "[RECALL-CLOSED] ② 弃答阶段 reach0={:?} adopt0={:?}",
@@ -1678,6 +1938,7 @@ async fn recall_benchmark_gap_closed_loop_trajectory() {
              无法验证缺口闭合",
             adopt0
         );
+        evidence.inconclusive("initial query did not take the honest-abstention branch");
         return;
     }
 
@@ -1704,7 +1965,10 @@ async fn recall_benchmark_gap_closed_loop_trajectory() {
         ),
     };
     // 红线断言：信号确定性字段（与 K3 闭环红线一致）。
-    assert_eq!(signal.kind, "recall_miss", "gap 信号 kind 必须是 recall_miss");
+    assert_eq!(
+        signal.kind, "recall_miss",
+        "gap 信号 kind 必须是 recall_miss"
+    );
     assert_eq!(signal.status, "pending", "gap 信号 status 必须是 pending");
     assert!(
         signal.search_queries.iter().any(|q| q == gap_query),
@@ -1736,6 +2000,7 @@ async fn recall_benchmark_gap_closed_loop_trajectory() {
         }
         None => {
             eprintln!("[RECALL-CLOSED] 跳过：对话补库未命中 create 意图 / 未落库");
+            evidence.inconclusive("chat create/apply/verify did not produce a chunk");
             return;
         }
     };
@@ -1745,7 +2010,8 @@ async fn recall_benchmark_gap_closed_loop_trajectory() {
     // verify 语义是双维独立：integrity_status=verified（审计完整度）+ status=active（生命周期
     // draft→active）——二者正是召回侧过滤器（knowledge_agent.rs / knowledge_router.rs）同时要求
     // 的两个条件，故此处双断言＝在写侧确认补库产物确实进入"可被 ⑤ 阶段召回"的状态。
-    let created_oid = ObjectId::parse_str(&created_chunk_id).expect("created_chunk_id 合法 ObjectId");
+    let created_oid =
+        ObjectId::parse_str(&created_chunk_id).expect("created_chunk_id 合法 ObjectId");
     let created_chunk = app
         .state
         .db
@@ -1765,9 +2031,12 @@ async fn recall_benchmark_gap_closed_loop_trajectory() {
     );
 
     // ⑤ 再 answer **同一** query → 断言缺口闭合：这次召回命中新补的 chunk。
-    let (reach1, adopt1) = match answer_reach_adopt(&state, ws, gap_query).await {
+    let (reach1, adopt1, calls1) = match answer_reach_adopt(&state, ws, gap_query).await {
         Some(v) => v,
-        None => return, // 瞬时不可达，跳过
+        None => {
+            evidence.infra_skip("post-fill answer produced no model result");
+            return;
+        }
     };
     eprintln!(
         "[RECALL-CLOSED] ⑤ 补库后 reach1={:?} adopt1={:?}（target={}）",
@@ -1814,6 +2083,18 @@ async fn recall_benchmark_gap_closed_loop_trajectory() {
             ws
         );
     }
+
+    evidence.observe_llm_calls(calls0 + calls1);
+    evidence.branch("abstain_signal_chat_create_verify_recall_hit");
+    evidence.detail("signal_id", signal.signal_id.clone());
+    evidence.detail("created_chunk_id", created_chunk_id.clone());
+    evidence.detail("initial_reach_count", reach0.len());
+    evidence.detail("post_fill_reach_count", reach1.len());
+    evidence.detail(
+        "post_fill_adopted_target",
+        adopt1.contains(&created_chunk_id),
+    );
+    evidence.pass(3, 8);
 
     eprintln!("[RECALL-CLOSED] 闭合轨迹测试完成 —— gap→提问→对话补库→同 query 再命中 全程走通");
 }

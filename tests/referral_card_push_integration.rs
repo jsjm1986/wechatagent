@@ -181,7 +181,11 @@ async fn only_approved_enabled_card_is_loadable() {
         1,
         "disabled-but-approved card must NOT leak into loadable set, got {loadable_final:?}"
     );
-    assert_eq!(loadable_final[0].id, Some(card_id), "only 老王 remains loadable");
+    assert_eq!(
+        loadable_final[0].id,
+        Some(card_id),
+        "only 老王 remains loadable"
+    );
 }
 
 // ── Test 2: outbox 名片条目按 card_id 幂等 ─────────────────────────────────
@@ -197,7 +201,9 @@ async fn namecard_outbox_entry_idempotent_per_card() {
     // 名片走 synthetic_namecard 形态（compute_synthetic_key 含 card_id），content 为空也不挡。
     let req = namecard_enqueue_request("run_card_idem", "evt_card_1", contact_wxid, "card_aaa");
 
-    let first = enqueue(&state, req.clone()).await.expect("first enqueue ok");
+    let first = enqueue(&state, req.clone())
+        .await
+        .expect("first enqueue ok");
     let first_id = match first {
         EnqueueOutcome::Created { outbox_id, .. } => outbox_id,
         other => panic!("first enqueue expected Created, got {other:?}"),
@@ -212,12 +218,8 @@ async fn namecard_outbox_entry_idempotent_per_card() {
     }
 
     // 同 run 不同 referral_card_id → 应当独立入队（synthetic_namecard key 含 card_id）。
-    let other_card = namecard_enqueue_request(
-        "run_card_idem",
-        "evt_card_1",
-        contact_wxid,
-        "card_bbb",
-    );
+    let other_card =
+        namecard_enqueue_request("run_card_idem", "evt_card_1", contact_wxid, "card_bbb");
     let other = enqueue(&state, other_card)
         .await
         .expect("other-card enqueue ok");

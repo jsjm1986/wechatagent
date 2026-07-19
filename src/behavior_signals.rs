@@ -120,7 +120,11 @@ pub fn build_reply_length(
 
 /// 判定本条 inbound 是否构成 reactivation：上一条 inbound 距本条超过阈值。
 /// `last_inbound_ms` 缺失（首条 inbound）不算 reactivation——属"新建首次触达"。
-pub fn is_reactivation(last_inbound_ms: Option<i64>, inbound_at: DateTime, threshold_ms: i64) -> bool {
+pub fn is_reactivation(
+    last_inbound_ms: Option<i64>,
+    inbound_at: DateTime,
+    threshold_ms: i64,
+) -> bool {
     match last_inbound_ms {
         Some(prev_ms) => inbound_at.timestamp_millis() - prev_ms >= threshold_ms,
         None => false,
@@ -239,7 +243,11 @@ pub async fn record_signal_metric(
         .update_one(mongodb::bson::doc! { "_id": &id }, update, opts)
         .await
     {
-        tracing::warn!(?err, workspace_id, "record_signal_metric failed (non-fatal)");
+        tracing::warn!(
+            ?err,
+            workspace_id,
+            "record_signal_metric failed (non-fatal)"
+        );
     }
 }
 
@@ -303,14 +311,20 @@ mod tests {
         );
         let doc = mongodb::bson::to_document(&sig).expect("serialize BehaviorSignal");
         // 索引 / 查询依赖的字段名必须是 snake_case。
-        assert!(doc.contains_key("dedupe_key"), "幂等键必须落库为 dedupe_key");
+        assert!(
+            doc.contains_key("dedupe_key"),
+            "幂等键必须落库为 dedupe_key"
+        );
         assert!(doc.contains_key("workspace_id"), "必须落库为 workspace_id");
         assert!(doc.contains_key("contact_wxid"), "必须落库为 contact_wxid");
         assert!(doc.contains_key("signal_type"), "必须落库为 signal_type");
         assert!(doc.contains_key("observed_at"), "必须落库为 observed_at");
         assert!(doc.contains_key("latency_ms"), "必须落库为 latency_ms");
         // 绝不能出现任何 camelCase 变体。
-        assert!(!doc.contains_key("dedupeKey"), "camelCase dedupeKey 会让 partial 索引失效");
+        assert!(
+            !doc.contains_key("dedupeKey"),
+            "camelCase dedupeKey 会让 partial 索引失效"
+        );
         assert!(!doc.contains_key("contactWxid"));
         assert!(!doc.contains_key("signalType"));
     }
@@ -318,13 +332,7 @@ mod tests {
     #[test]
     fn latency_none_when_no_prior_outbound() {
         // 从未出站过 → 没有基准，latency_ms 必须 None（不臆造 0）。
-        let sig = build_reply_latency(
-            "ws",
-            "wxid_a",
-            "msg1",
-            DateTime::from_millis(10_000),
-            None,
-        );
+        let sig = build_reply_latency("ws", "wxid_a", "msg1", DateTime::from_millis(10_000), None);
         assert_eq!(sig.latency_ms, None);
         assert_eq!(sig.source, SOURCE_SYSTEM_OBSERVED);
         assert_eq!(sig.confidence, 1.0);
@@ -387,7 +395,11 @@ mod tests {
     #[test]
     fn reactivation_first_inbound_is_not_reactivation() {
         // 首条 inbound（无 last_inbound）属"新建首次触达"，不是 reactivation。
-        assert!(!is_reactivation(None, DateTime::from_millis(99_999_999), REACTIVATION_THRESHOLD_MS));
+        assert!(!is_reactivation(
+            None,
+            DateTime::from_millis(99_999_999),
+            REACTIVATION_THRESHOLD_MS
+        ));
     }
 
     #[test]
@@ -436,7 +448,10 @@ mod tests {
         let k2 = silence_dedupe_key("w", 12_345);
         assert_eq!(k1, k2);
         // 不同 outbound → 不同 key。
-        assert_ne!(silence_dedupe_key("w", 12_345), silence_dedupe_key("w", 12_346));
+        assert_ne!(
+            silence_dedupe_key("w", 12_345),
+            silence_dedupe_key("w", 12_346)
+        );
     }
 
     // ---- P2 双时间戳：observed_at(event_time) + ingest_time(write-time) ----
@@ -444,12 +459,22 @@ mod tests {
     #[test]
     fn builders_fill_ingest_time() {
         // 四个 builder 都必须填 ingest_time（落库时刻），否则数据工程无法识别采集延迟/回填。
-        let latency = build_reply_latency("ws", "w", "m", DateTime::from_millis(10_000), Some(3_000));
+        let latency =
+            build_reply_latency("ws", "w", "m", DateTime::from_millis(10_000), Some(3_000));
         let length = build_reply_length("ws", "w", "m", DateTime::from_millis(10_000), "hi");
         let react = build_reactivation("ws", "w", "m", DateTime::from_millis(10_000));
-        let silence = build_silence("ws", "w", DateTime::from_millis(1_000), DateTime::from_millis(90_000));
+        let silence = build_silence(
+            "ws",
+            "w",
+            DateTime::from_millis(1_000),
+            DateTime::from_millis(90_000),
+        );
         for sig in [latency, length, react, silence] {
-            assert!(sig.ingest_time.is_some(), "{} 必须填 ingest_time", sig.signal_type);
+            assert!(
+                sig.ingest_time.is_some(),
+                "{} 必须填 ingest_time",
+                sig.signal_type
+            );
         }
     }
 
@@ -459,7 +484,11 @@ mod tests {
         // 两者独立存在，event_time 不被 builder 篡改成 now()。
         let event_ms = 10_000;
         let sig = build_reply_latency("ws", "w", "m", DateTime::from_millis(event_ms), Some(3_000));
-        assert_eq!(sig.observed_at.timestamp_millis(), event_ms, "event_time 必须保留调用方传入值");
+        assert_eq!(
+            sig.observed_at.timestamp_millis(),
+            event_ms,
+            "event_time 必须保留调用方传入值"
+        );
         assert!(sig.ingest_time.is_some());
     }
 
@@ -477,8 +506,8 @@ mod tests {
             "dedupe_key": "reply_length:w:m",
             "char_len": 2_i64,
         };
-        let sig: BehaviorSignal =
-            mongodb::bson::from_document(doc).expect("legacy doc without ingest_time must deserialize");
+        let sig: BehaviorSignal = mongodb::bson::from_document(doc)
+            .expect("legacy doc without ingest_time must deserialize");
         assert_eq!(sig.ingest_time, None);
     }
 
@@ -488,10 +517,7 @@ mod tests {
     fn metric_inc_field_maps_three_states() {
         assert_eq!(metric_inc_field(&Ok(true)), "persisted");
         assert_eq!(metric_inc_field(&Ok(false)), "dedupe_skipped");
-        assert_eq!(
-            metric_inc_field(&Err(anyhow::anyhow!("boom"))),
-            "errors"
-        );
+        assert_eq!(metric_inc_field(&Err(anyhow::anyhow!("boom"))), "errors");
     }
 
     #[test]

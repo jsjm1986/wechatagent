@@ -131,11 +131,7 @@ impl IntoResponse for AppError {
                     _ => "internal_error",
                 };
                 tracing::error!(error_kind = kind, detail = %self, "request failed with 502");
-                (
-                    StatusCode::BAD_GATEWAY,
-                    Json(json!({ "error": kind })),
-                )
-                    .into_response()
+                (StatusCode::BAD_GATEWAY, Json(json!({ "error": kind }))).into_response()
             }
         }
     }

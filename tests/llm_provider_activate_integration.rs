@@ -136,8 +136,5 @@ async fn activate_missing_provider_not_found() {
         query,
     )
     .await;
-    assert!(
-        result.is_err(),
-        "activate 不存在的 provider 必须 NotFound"
-    );
+    assert!(result.is_err(), "activate 不存在的 provider 必须 NotFound");
 }

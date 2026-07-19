@@ -44,10 +44,7 @@ pub async fn worker_loop(state: AppState) {
         return;
     }
     let run_hour = state.config.knowledge_digest_run_hour.min(23);
-    tracing::info!(
-        run_hour,
-        "knowledge digest worker starting"
-    );
+    tracing::info!(run_hour, "knowledge digest worker starting");
     loop {
         let wait = duration_until_next_run(run_hour);
         tracing::debug!(?wait, "knowledge digest worker sleeping until next run");
@@ -184,15 +181,18 @@ async fn analyze_chunks_health(
         .await?;
     let mut out: Vec<ChunkHealthSignal> = Vec::new();
     while let Some(chunk) = cursor.try_next().await? {
-        let chunk_id = chunk
-            .id
-            .map(|oid| oid.to_hex())
-            .unwrap_or_default();
+        let chunk_id = chunk.id.map(|oid| oid.to_hex()).unwrap_or_default();
         if chunk_id.is_empty() {
             continue;
         }
         let mut missing_fields: Vec<String> = Vec::new();
-        if chunk.source_quote.as_deref().unwrap_or("").trim().is_empty() {
+        if chunk
+            .source_quote
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty()
+        {
             missing_fields.push("sourceQuote".to_string());
         }
         if chunk
@@ -283,10 +283,7 @@ async fn analyze_run_logs(
         "blocked_by_safety_guard",
     ];
     let mut filter = ws_filter(workspace_id, account_id);
-    filter.insert(
-        "final_review_status",
-        doc! { "$in": &block_states },
-    );
+    filter.insert("final_review_status", doc! { "$in": &block_states });
     filter.insert("created_at", doc! { "$gte": since_24h() });
     let mut cursor = state.db.agent_run_logs().find(filter, None).await?;
 
@@ -318,7 +315,10 @@ async fn analyze_run_logs(
             if bucket.run_ids.len() < 8 {
                 bucket.run_ids.push(log.run_id.clone());
             }
-            *bucket.block_reasons.entry(block_reason.clone()).or_insert(0) += 1;
+            *bucket
+                .block_reasons
+                .entry(block_reason.clone())
+                .or_insert(0) += 1;
         }
     }
     if buckets.is_empty() {
@@ -345,15 +345,25 @@ async fn analyze_run_logs(
             .unwrap_or_else(|| "unknown".to_string());
         let summary = if idx < 6 {
             // 前 6 大 chunk 走 LLM summarize；超出走 fallback。
-            match summarize_block_runs(state, run_id, &chunk_id, &bucket.run_ids, &top_block_reason).await {
+            match summarize_block_runs(state, run_id, &chunk_id, &bucket.run_ids, &top_block_reason)
+                .await
+            {
                 Ok(s) => s,
                 Err(err) => {
                     tracing::warn!(?err, chunk_id = %chunk_id, "summarize_logs failed; using fallback");
-                    format!("AI 观察：该切片在 {} 条 run 上被{}拦截", block_count, labels::block_reason_zh(&top_block_reason))
+                    format!(
+                        "AI 观察：该切片在 {} 条 run 上被{}拦截",
+                        block_count,
+                        labels::block_reason_zh(&top_block_reason)
+                    )
                 }
             }
         } else {
-            format!("AI 观察：该切片在 {} 条 run 上被{}拦截", block_count, labels::block_reason_zh(&top_block_reason))
+            format!(
+                "AI 观察：该切片在 {} 条 run 上被{}拦截",
+                block_count,
+                labels::block_reason_zh(&top_block_reason)
+            )
         };
         out.push(BlockSignal {
             chunk_id,
@@ -454,10 +464,7 @@ async fn analyze_evolution(
                 "AI 建议复核：演化提案 {} 已通过评测，等待运营确认发布",
                 p.proposal_kind
             ),
-            "rolled_back" => format!(
-                "AI 已回滚：演化提案 {} 在发布后指标退化",
-                p.proposal_kind
-            ),
+            "rolled_back" => format!("AI 已回滚：演化提案 {} 在发布后指标退化", p.proposal_kind),
             other => format!("AI 演化状态：{}", other),
         };
         out.push(EvolutionSignal {
@@ -582,7 +589,12 @@ async fn compose_cards(
 /// 全部成孤儿。改成由 `(report_date, kind, target_refs_signature, title)` 派生
 /// sha256 前 12 字节 → ObjectId，让"同一天 + 同 kind + 同目标 + 同标题"的卡片
 /// 在 regenerate 后保持稳定 cardId。新卡片（运营当日新增问题）天然得到不同 id。
-fn stable_card_id(report_date: &str, kind: &str, target_refs: &[Document], title: &str) -> ObjectId {
+fn stable_card_id(
+    report_date: &str,
+    kind: &str,
+    target_refs: &[Document],
+    title: &str,
+) -> ObjectId {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(report_date.as_bytes());
@@ -632,7 +644,9 @@ fn parse_cards_from_llm_array(raw_arr: Vec<Value>, report_date: &str) -> Vec<Kno
 
     let mut cards: Vec<KnowledgeDigestCard> = Vec::new();
     for item in raw_arr.into_iter() {
-        let Some(obj) = item.as_object() else { continue };
+        let Some(obj) = item.as_object() else {
+            continue;
+        };
         let kind = obj.get("kind").and_then(|v| v.as_str()).unwrap_or("");
         let severity = obj.get("severity").and_then(|v| v.as_str()).unwrap_or("");
         let action = obj
@@ -748,13 +762,16 @@ pub(crate) async fn generate_today_digest(
     let report_date = chrono::Local::now().format("%Y-%m-%d").to_string();
     let run_id = format!("digest_{}_{}", account_id, report_date);
 
-    let budget = Arc::new(RunBudget::new(
-        run_id.clone(),
-        24_000,
-        8,
-        i32::MAX,
-    ));
-    generate_today_digest_inner(state, workspace_id, account_id, &report_date, &run_id, budget).await
+    let budget = Arc::new(RunBudget::new(run_id.clone(), 24_000, 8, i32::MAX));
+    generate_today_digest_inner(
+        state,
+        workspace_id,
+        account_id,
+        &report_date,
+        &run_id,
+        budget,
+    )
+    .await
 }
 
 async fn generate_today_digest_inner(
@@ -767,7 +784,15 @@ async fn generate_today_digest_inner(
 ) -> AppResult<KnowledgeDailyReport> {
     RUN_BUDGET
         .scope(Arc::clone(&budget), async move {
-            do_generate(state, workspace_id, account_id, report_date, run_id, Arc::clone(&budget)).await
+            do_generate(
+                state,
+                workspace_id,
+                account_id,
+                report_date,
+                run_id,
+                Arc::clone(&budget),
+            )
+            .await
         })
         .await
 }
@@ -781,12 +806,27 @@ async fn do_generate(
     budget: Arc<RunBudget>,
 ) -> AppResult<KnowledgeDailyReport> {
     // 1. 4 路只读分析（任一失败 → status=failed + 写空 cards 报告）。
-    let result: AppResult<(Vec<ChunkHealthSignal>, UsageDigest, Vec<BlockSignal>, Vec<EvolutionSignal>, Vec<KnowledgeDigestCard>)> = async {
+    let result: AppResult<(
+        Vec<ChunkHealthSignal>,
+        UsageDigest,
+        Vec<BlockSignal>,
+        Vec<EvolutionSignal>,
+        Vec<KnowledgeDigestCard>,
+    )> = async {
         let chunk_health = analyze_chunks_health(state, workspace_id, account_id).await?;
         let usage = analyze_usage_logs(state, workspace_id, account_id).await?;
         let blocked = analyze_run_logs(state, workspace_id, account_id, run_id).await?;
         let evolution = analyze_evolution(state, workspace_id, account_id).await?;
-        let cards = compose_cards(state, run_id, report_date, &chunk_health, &usage, &blocked, &evolution).await?;
+        let cards = compose_cards(
+            state,
+            run_id,
+            report_date,
+            &chunk_health,
+            &usage,
+            &blocked,
+            &evolution,
+        )
+        .await?;
         Ok((chunk_health, usage, blocked, evolution, cards))
     }
     .await;
@@ -811,19 +851,29 @@ async fn do_generate(
         }
         Err(AppError::BudgetExceeded { reason, .. }) => {
             tracing::warn!(%reason, "knowledge digest compose hit budget; saving partial report");
-            ("partial".to_string(), Some("budget_exceeded".to_string()), Vec::new())
+            (
+                "partial".to_string(),
+                Some("budget_exceeded".to_string()),
+                Vec::new(),
+            )
         }
         Err(err) => {
-            tracing::warn!(?err, "knowledge digest compose failed; saving failed report");
-            ("failed".to_string(), Some("internal".to_string()), Vec::new())
+            tracing::warn!(
+                ?err,
+                "knowledge digest compose failed; saving failed report"
+            );
+            (
+                "failed".to_string(),
+                Some("internal".to_string()),
+                Vec::new(),
+            )
         }
     };
 
     // 2. upsert by `(workspace_id, account_id, report_date)`。
     let now = BsonDateTime::now();
-    let serialized_cards = mongodb::bson::to_bson(&cards).unwrap_or_else(|_| {
-        mongodb::bson::Bson::Array(Vec::new())
-    });
+    let serialized_cards =
+        mongodb::bson::to_bson(&cards).unwrap_or_else(|_| mongodb::bson::Bson::Array(Vec::new()));
 
     let update = doc! {
         "$set": {
@@ -861,7 +911,9 @@ async fn do_generate(
             opts,
         )
         .await?
-        .ok_or_else(|| AppError::External("upsert knowledge_daily_reports returned none".to_string()))?;
+        .ok_or_else(|| {
+            AppError::External("upsert knowledge_daily_reports returned none".to_string())
+        })?;
 
     // 3. 旁路审计：knowledge_usage_logs（route_result.kind="digest_compose"）+ AgentEvent。
     let card_count = cards.len() as i64;
@@ -892,7 +944,10 @@ async fn do_generate(
         .insert_one(&usage_log, None)
         .await
     {
-        tracing::warn!(?err, "knowledge_usage_logs insert failed (digest); ignoring");
+        tracing::warn!(
+            ?err,
+            "knowledge_usage_logs insert failed (digest); ignoring"
+        );
     }
 
     let event = crate::models::AgentEvent {
@@ -902,10 +957,7 @@ async fn do_generate(
         contact_wxid: None,
         kind: "knowledge_digest_generated".to_string(),
         status: status.clone(),
-        summary: format!(
-            "AI 知识库日报合成完成：{} 张卡片（{}）",
-            card_count, status
-        ),
+        summary: format!("AI 知识库日报合成完成：{} 张卡片（{}）", card_count, status),
         details: Some(doc! {
             "reportDate": report_date,
             "cardCount": card_count,
@@ -930,7 +982,11 @@ mod tests {
     #[test]
     fn duration_until_next_run_is_positive() {
         let d = duration_until_next_run(9);
-        assert!(d.as_secs() >= 60, "duration must be at least 60s, got {:?}", d);
+        assert!(
+            d.as_secs() >= 60,
+            "duration must be at least 60s, got {:?}",
+            d
+        );
         assert!(
             d.as_secs() <= 24 * 3600,
             "duration must be ≤ 24h, got {:?}",
@@ -1078,10 +1134,7 @@ mod tests {
         let cards = parse_cards_from_llm_array(raw, "2026-05-24");
         assert_eq!(cards.len(), 1);
         assert_eq!(cards[0].target_refs.len(), 1);
-        assert_eq!(
-            cards[0].target_refs[0].get_str("id").unwrap_or(""),
-            "abc"
-        );
+        assert_eq!(cards[0].target_refs[0].get_str("id").unwrap_or(""), "abc");
     }
 
     /// R5：dismiss 卡片必须在 regenerate 后仍然生效。同一 (report_date, kind,

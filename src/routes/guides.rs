@@ -109,7 +109,7 @@ pub(super) async fn preview_user_operation_guide(
         .iter()
         .filter_map(|d| d.get_str("key").ok().map(String::from))
         .collect();
-    let cache = agent::taxonomy::global_taxonomy_cache();
+    let cache = agent::taxonomy::global_taxonomy_cache(&state.db);
     cache
         .find_or_load(&state.db, &admin.current_workspace)
         .await; // 冷/过期缓存返回空,先 load(幂等自愈)
@@ -263,11 +263,7 @@ pub(super) async fn apply_user_operation_guide(
         let error_summary: String = error.to_string().chars().take(500).collect();
         if let Err(mark_error) = previews
             .update_one(
-                guide_owned_apply_filter(
-                    preview_id,
-                    &admin.current_workspace,
-                    &apply_token,
-                ),
+                guide_owned_apply_filter(preview_id, &admin.current_workspace, &apply_token),
                 doc! {
                     "$set": {
                         "status": "failed",
@@ -547,9 +543,7 @@ async fn apply_claimed_user_operation_guide(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        guide_claim_filter, guide_owned_apply_filter, GUIDE_APPLY_PROTOCOL_VERSION,
-    };
+    use super::{guide_claim_filter, guide_owned_apply_filter, GUIDE_APPLY_PROTOCOL_VERSION};
     use mongodb::bson::{doc, oid::ObjectId, DateTime};
 
     #[test]

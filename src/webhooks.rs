@@ -2,12 +2,7 @@ use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 
-use axum::{
-    body::Bytes,
-    extract::State,
-    http::HeaderMap,
-    Json,
-};
+use axum::{body::Bytes, extract::State, http::HeaderMap, Json};
 use dashmap::DashMap;
 use governor::{
     clock::{Clock, DefaultClock},
@@ -206,13 +201,9 @@ pub async fn run_debounce_pipeline(
             let guard: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || {
                 barge_in_triggered(gen_at_start, guard_state.generation.load(Ordering::Acquire))
             });
-            if let Err(error) = agent::handle_managed_message_aggregated(
-                &state,
-                contact,
-                &inbound,
-                Some(guard),
-            )
-            .await
+            if let Err(error) =
+                agent::handle_managed_message_aggregated(&state, contact, &inbound, Some(guard))
+                    .await
             {
                 let _ = agent::write_event_for_account(
                     &state,
@@ -278,14 +269,10 @@ async fn reload_managed_contact(
     let contact = state
         .db
         .contacts()
-        .find_one(
-            doc! { "account_id": account_id, "wxid": wxid },
-            None,
-        )
+        .find_one(doc! { "account_id": account_id, "wxid": wxid }, None)
         .await?;
     Ok(contact.filter(|c| c.agent_status == AgentStatus::Managed))
 }
-
 
 pub async fn wechat_webhook(
     State(state): State<AppState>,
@@ -311,10 +298,10 @@ pub async fn wechat_webhook(
     }
 
     // P2：MCP（GeWe-agent）转发的 payload 是 GeWe 原始 body 直接透传 + 顶层加
-     // 一个 `_mcp` envelope（tenantId/accountId/sourceMsgId 等）。GeWe 字段一般是
-     // 大写驼峰（`Appid` / `Wxid` / `FromUserName` / `Content` / `MsgId` / `NewMsgId`
-     // / `TypeName` / `ToUserName`），少量小写驼峰（`appId` / `fromWxid`），所以
-     // find_string 的 keys 必须同时覆盖两种风格。`_mcp.appId` 也算一份兜底。
+    // 一个 `_mcp` envelope（tenantId/accountId/sourceMsgId 等）。GeWe 字段一般是
+    // 大写驼峰（`Appid` / `Wxid` / `FromUserName` / `Content` / `MsgId` / `NewMsgId`
+    // / `TypeName` / `ToUserName`），少量小写驼峰（`appId` / `fromWxid`），所以
+    // find_string 的 keys 必须同时覆盖两种风格。`_mcp.appId` 也算一份兜底。
     let app_id = find_string(
         &payload,
         &["appId", "app_id", "appid", "Appid", "AppId", "APPID"],
@@ -443,7 +430,8 @@ pub async fn wechat_webhook(
     // 领导回复分流：from_wxid 是本 workspace 的 principal_decider → 走请示通道，不进客户链路。
     // 必须在落库 / contact-managed 处理之前分流——领导可能同时也是某 contact，
     // consumed=true 时短路返回，避免领导自己的消息被当成客户入站处理。
-    if (crate::agent::escalation::lookup_principal_config(&state, &workspace_id, &from_wxid).await?)
+    if (crate::agent::escalation::lookup_principal_config(&state, &workspace_id, &from_wxid)
+        .await?)
         .is_some()
     {
         let consumed = crate::agent::escalation::handle_principal_reply(
@@ -455,7 +443,9 @@ pub async fn wechat_webhook(
         )
         .await?;
         if consumed {
-            return Ok(Json(serde_json::json!({ "ok": true, "routed": "principal" })));
+            return Ok(Json(
+                serde_json::json!({ "ok": true, "routed": "principal" }),
+            ));
         }
     }
     let message_id = find_string(
@@ -475,9 +465,9 @@ pub async fn wechat_webhook(
         ],
     );
     // P2：dedupe key 优先用 GeWe sourceMsgId（MCP 那边按
-     // `${slot.id}:${appId}:${sourceMsgId}` 做转发去重，且 5s timeout 内不重试，
-     // 单次推送绝不能丢）。也兼顾 _mcp envelope 里冗余的 sourceMsgId / msgId
-     // 字段，万一 GeWe 顶层 MsgId 缺失仍能正确去重。
+    // `${slot.id}:${appId}:${sourceMsgId}` 做转发去重，且 5s timeout 内不重试，
+    // 单次推送绝不能丢）。也兼顾 _mcp envelope 里冗余的 sourceMsgId / msgId
+    // 字段，万一 GeWe 顶层 MsgId 缺失仍能正确去重。
     let envelope_msg_id = payload
         .get("_mcp")
         .and_then(|env| env.get("sourceMsgId"))
@@ -637,11 +627,12 @@ pub async fn wechat_webhook(
             deferred = true;
         } else {
             let key = contact_key(&workspace_id, &account_id, &from_wxid);
-            let active_profile = crate::agent::domain_profile::load_active_domain_profile(
-                &state.db, &workspace_id,
-            ).await;
+            let active_profile =
+                crate::agent::domain_profile::load_active_domain_profile(&state.db, &workspace_id)
+                    .await;
             let window_ms = crate::agent::domain_profile::resolve_debounce_window_ms(
-                &active_profile, state.config.message_debounce_window_ms,
+                &active_profile,
+                state.config.message_debounce_window_ms,
             );
             let (st, spawned_now) = register_inbound(key.clone(), inbound.clone(), window_ms);
             if spawned_now {
@@ -709,7 +700,12 @@ pub async fn ensure_wake_followup_task(
         return Ok(());
     }
     let now = DateTime::now();
-    let run_at = agent::quiet_hours::next_wake_at(wake_hour, tz_offset_hours, &contact.wxid, state.config.wake_jitter_max_seconds);
+    let run_at = agent::quiet_hours::next_wake_at(
+        wake_hour,
+        tz_offset_hours,
+        &contact.wxid,
+        state.config.wake_jitter_max_seconds,
+    );
     // expiry 给 24h 余量（覆盖最长跨午夜窗口 + 醒来后 worker tick 间隔），过期未跑则作废。
     let expires_at = DateTime::from_millis(run_at.timestamp_millis() + 24 * 60 * 60 * 1000);
     let task = AgentTask {
@@ -802,7 +798,11 @@ async fn collect_inbound_behavior_signals(
         ),
         bs::build_reply_length(workspace_id, wxid, &dedupe_suffix, inbound_at, content),
     ];
-    if bs::is_reactivation(prev_last_inbound_ms, inbound_at, bs::REACTIVATION_THRESHOLD_MS) {
+    if bs::is_reactivation(
+        prev_last_inbound_ms,
+        inbound_at,
+        bs::REACTIVATION_THRESHOLD_MS,
+    ) {
         signals.push(bs::build_reactivation(
             workspace_id,
             wxid,
@@ -999,7 +999,11 @@ async fn resolve_account_context(
             .await?
         {
             // 第三元 = 该账号 webhook_secret，供方案 B 验签门使用。
-            return Ok((account.workspace_id, account.account_id, account.webhook_secret));
+            return Ok((
+                account.workspace_id,
+                account.account_id,
+                account.webhook_secret,
+            ));
         }
         // P1：appId 提供了但 wechat_accounts 没匹配 —— 之前会静默回退到
         // default_account_id，导致 inbound 落到错的 account 下，managed contact
@@ -1358,8 +1362,14 @@ mod inbound_msg_type_tests {
     fn parse_inbound_msg_type_uses_dedicated_keys() {
         // a. 专用键正常生效（回归不破）：顶层 MsgType 数字码 + 小写别名
         assert_eq!(parse_inbound_msg_type(&json!({ "MsgType": "3" })), "image");
-        assert_eq!(parse_inbound_msg_type(&json!({ "msgType": "voice" })), "voice");
-        assert_eq!(parse_inbound_msg_type(&json!({ "msg_type": "43" })), "video");
+        assert_eq!(
+            parse_inbound_msg_type(&json!({ "msgType": "voice" })),
+            "voice"
+        );
+        assert_eq!(
+            parse_inbound_msg_type(&json!({ "msg_type": "43" })),
+            "video"
+        );
     }
 
     #[test]
@@ -1447,7 +1457,10 @@ mod inbound_msg_type_tests {
     fn gewe_addmsg_extracts_clean_content_not_pushcontent() {
         let payload = real_gewe_addmsg();
         // 修复:Data.Content.string 拿干净正文。
-        assert_eq!(gewe_data_string(&payload, "Content").as_deref(), Some("你好"));
+        assert_eq!(
+            gewe_data_string(&payload, "Content").as_deref(),
+            Some("你好")
+        );
         // 回归留证:find_string 会先命中 Data.PushContent 通知串(带发件人名前缀)。
         assert_eq!(
             find_string(&payload, &["content", "Content", "PushContent"]).as_deref(),
@@ -1461,8 +1474,14 @@ mod inbound_msg_type_tests {
         let payload = json!({ "fromWxid": "wx_flat", "content": "hello flat" });
         assert_eq!(gewe_data_string(&payload, "FromUserName"), None);
         assert_eq!(gewe_data_string(&payload, "Content"), None);
-        assert_eq!(find_string(&payload, &["fromWxid"]).as_deref(), Some("wx_flat"));
-        assert_eq!(find_string(&payload, &["content"]).as_deref(), Some("hello flat"));
+        assert_eq!(
+            find_string(&payload, &["fromWxid"]).as_deref(),
+            Some("wx_flat")
+        );
+        assert_eq!(
+            find_string(&payload, &["content"]).as_deref(),
+            Some("hello flat")
+        );
     }
 
     #[test]
@@ -1601,7 +1620,8 @@ mod debounce_tests {
         let key = "ws-test:acct-test:wx-retire-ok".to_string();
         PENDING.remove(&key);
 
-        let (st, spawned) = register_inbound(key.clone(), test_inbound("wx-retire-ok", "hi"), 4_000);
+        let (st, spawned) =
+            register_inbound(key.clone(), test_inbound("wx-retire-ok", "hi"), 4_000);
         assert!(spawned);
         let gen_at_start = st.generation.load(Ordering::Acquire);
         assert_eq!(gen_at_start, 1);
@@ -1640,7 +1660,10 @@ mod debounce_tests {
                 s.generation.load(Ordering::Acquire) == gen_at_start
             })
             .is_some();
-        assert!(!removed, "晚到入站 bump 后 SHALL NOT 退休（否则丢这条消息）");
+        assert!(
+            !removed,
+            "晚到入站 bump 后 SHALL NOT 退休（否则丢这条消息）"
+        );
         assert!(
             PENDING.contains_key(&key),
             "退休被阻时 runner 状态必须留存以供重算"
@@ -1648,7 +1671,11 @@ mod debounce_tests {
         // runner 据 barge_in_triggered 判定需重算。
         assert!(barge_in_triggered(
             gen_at_start,
-            PENDING.get(&key).unwrap().generation.load(Ordering::Acquire)
+            PENDING
+                .get(&key)
+                .unwrap()
+                .generation
+                .load(Ordering::Acquire)
         ));
 
         PENDING.remove(&key);
@@ -1661,18 +1688,14 @@ mod debounce_tests {
         let key = "ws-test:acct-test:wx-respawn".to_string();
         PENDING.remove(&key);
 
-        let (st1, spawned1) =
-            register_inbound(key.clone(), test_inbound("wx-respawn", "a"), 4_000);
+        let (st1, spawned1) = register_inbound(key.clone(), test_inbound("wx-respawn", "a"), 4_000);
         assert!(spawned1);
         let gen0 = st1.generation.load(Ordering::Acquire);
-        PENDING.remove_if(&key, |_, s| {
-            s.generation.load(Ordering::Acquire) == gen0
-        });
+        PENDING.remove_if(&key, |_, s| s.generation.load(Ordering::Acquire) == gen0);
         assert!(!PENDING.contains_key(&key));
 
         // 退休后的新入站：必须重新 spawn（runner 已退场）。
-        let (st2, spawned2) =
-            register_inbound(key.clone(), test_inbound("wx-respawn", "b"), 4_000);
+        let (st2, spawned2) = register_inbound(key.clone(), test_inbound("wx-respawn", "b"), 4_000);
         assert!(spawned2, "退休后新入站 SHALL 重新 spawn runner");
         assert_eq!(
             st2.generation.load(Ordering::Acquire),
@@ -1727,7 +1750,11 @@ mod debounce_tests {
             "N 线程并发注册同一 key 必须恰好 spawn 一次"
         );
         assert_eq!(
-            PENDING.get(&key).unwrap().generation.load(Ordering::Acquire),
+            PENDING
+                .get(&key)
+                .unwrap()
+                .generation
+                .load(Ordering::Acquire),
             N as u64,
             "每条入站各 bump 一次 generation，最终须等于线程数"
         );
@@ -1845,13 +1872,14 @@ fn verify_webhook_signature(
     let hex_part = sig.strip_prefix("sha256=").unwrap_or(sig);
     let expected = hex::decode(hex_part).map_err(|_| WebhookSigError::BadSignatureFormat)?;
     type HmacSha256 = Hmac<Sha256>;
-    let mut mac =
-        HmacSha256::new_from_slice(secret.as_bytes()).map_err(|_| WebhookSigError::SecretNotConfigured)?;
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
+        .map_err(|_| WebhookSigError::SecretNotConfigured)?;
     // 与 gewe-agent 一致：先喂 "<ts>." 再喂 raw body。
     mac.update(ts_str.as_bytes());
     mac.update(b".");
     mac.update(body);
-    mac.verify_slice(&expected).map_err(|_| WebhookSigError::Mismatch)
+    mac.verify_slice(&expected)
+        .map_err(|_| WebhookSigError::Mismatch)
 }
 
 #[cfg(test)]
@@ -1900,7 +1928,14 @@ mod webhook_sig_tests {
     #[test]
     fn rejects_tampered_body() {
         assert_eq!(
-            verify_webhook_signature(Some(SECRET), Some(TS), Some(&header()), b"{\"foo\":\"BAR\"}", NOW_MS, SKEW),
+            verify_webhook_signature(
+                Some(SECRET),
+                Some(TS),
+                Some(&header()),
+                b"{\"foo\":\"BAR\"}",
+                NOW_MS,
+                SKEW
+            ),
             Err(WebhookSigError::Mismatch)
         );
     }
@@ -1908,7 +1943,14 @@ mod webhook_sig_tests {
     #[test]
     fn rejects_wrong_secret() {
         assert_eq!(
-            verify_webhook_signature(Some("other-secret"), Some(TS), Some(&header()), BODY, NOW_MS, SKEW),
+            verify_webhook_signature(
+                Some("other-secret"),
+                Some(TS),
+                Some(&header()),
+                BODY,
+                NOW_MS,
+                SKEW
+            ),
             Err(WebhookSigError::Mismatch)
         );
     }
@@ -1966,7 +2008,14 @@ mod webhook_sig_tests {
     #[test]
     fn rejects_bad_timestamp() {
         assert_eq!(
-            verify_webhook_signature(Some(SECRET), Some("not-a-number"), Some(&header()), BODY, NOW_MS, SKEW),
+            verify_webhook_signature(
+                Some(SECRET),
+                Some("not-a-number"),
+                Some(&header()),
+                BODY,
+                NOW_MS,
+                SKEW
+            ),
             Err(WebhookSigError::BadTimestamp)
         );
     }
@@ -1974,7 +2023,14 @@ mod webhook_sig_tests {
     #[test]
     fn rejects_bad_signature_format() {
         assert_eq!(
-            verify_webhook_signature(Some(SECRET), Some(TS), Some("sha256=not-hex!!"), BODY, NOW_MS, SKEW),
+            verify_webhook_signature(
+                Some(SECRET),
+                Some(TS),
+                Some("sha256=not-hex!!"),
+                BODY,
+                NOW_MS,
+                SKEW
+            ),
             Err(WebhookSigError::BadSignatureFormat)
         );
     }

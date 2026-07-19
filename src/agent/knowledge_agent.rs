@@ -214,6 +214,9 @@ pub enum TraceEvent {
     /// 下发；前端按 token append 即可获得真实流式视觉。工具轮无 answer 字段不产生
     /// token。
     Token { delta: String },
+    /// 整条知识问答未能产出 Final 的失败终态。只携带稳定错误码和面向运营的
+    /// 通用文案；详细上游错误保留在服务端日志，避免经 SSE 暴露内部信息。
+    Failed { code: String, message: String },
     /// 终态：携带最终 `AnswerResult`（不再有 step）。
     Final { answer: AnswerResult },
 }
@@ -649,10 +652,7 @@ async fn answer_inner(
     tx: Option<&UnboundedSender<TraceEvent>>,
     cancel: Option<&Arc<AtomicBool>>,
 ) -> AppResult<AnswerResult> {
-    let max_rounds = req
-        .max_rounds
-        .unwrap_or(MAX_ROUNDS)
-        .clamp(1, MAX_ROUNDS);
+    let max_rounds = req.max_rounds.unwrap_or(MAX_ROUNDS).clamp(1, MAX_ROUNDS);
 
     let mut tool_trace: Vec<Document> = Vec::new();
     let mut opened: Vec<ChunkFull> = Vec::new();
@@ -918,14 +918,9 @@ async fn answer_inner(
             }
             AgentAction::FollowRelations { chunk_id, depth } => {
                 let depth = depth.unwrap_or(1).clamp(1, 2);
-                let (entries, prefetched) = follow_relations(
-                    state,
-                    &req.workspace_id,
-                    &chunk_id,
-                    depth,
-                    &opened_seen,
-                )
-                .await?;
+                let (entries, prefetched) =
+                    follow_relations(state, &req.workspace_id, &chunk_id, depth, &opened_seen)
+                        .await?;
                 let appended = entries.len() as i32;
                 merge_catalog(&mut catalog, entries);
                 // 关联目标的完整正文直接载入 opened（镜像 OpenChunk 分支），
@@ -971,7 +966,7 @@ async fn answer_inner(
                     continue;
                 }
                 let (cited, quotes) =
-                    filter_answer_against_opened(&opened_seen, cited_chunk_ids, source_quotes);
+                    filter_answer_against_opened_chunks(&opened, cited_chunk_ids, source_quotes);
                 push_trace(
                     &mut tool_trace,
                     tx,
@@ -1002,10 +997,10 @@ async fn answer_inner(
     // 兜底：未在循环内 answer。可能原因：跑完 max_rounds、budget 提前 break、
     // 多次 invalid_action 把轮数耗光、客户端取消。rounds_used 上报真实跑过的轮数
     //（最低 0），而不是 max_rounds，避免前端误读。
-    let cited_chunk_ids: Vec<String> = opened
-        .iter()
-        .map(|c| c.chunk_id.clone())
-        .collect();
+    // The loop did not produce an AI-selected answer/evidence pair. Opened chunks may inform the
+    // generic fallback text, but opening a chunk alone is not a citation. Do not manufacture
+    // evidence IDs here; a later consumer must never mistake exploration for grounded support.
+    let cited_chunk_ids: Vec<String> = Vec::new();
     push_trace(
         &mut tool_trace,
         tx,
@@ -1036,9 +1031,7 @@ async fn answer_inner(
 /// `cancel.is_some_and(|c| c.load(Relaxed))` 的简短形式。`Relaxed` 足够：
 /// 取消是单向 false→true，跨任务延迟一两轮可接受（软取消语义）。
 fn is_cancelled(cancel: Option<&Arc<AtomicBool>>) -> bool {
-    cancel
-        .map(|c| c.load(Ordering::Relaxed))
-        .unwrap_or(false)
+    cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false)
 }
 
 /// 列出 chunk 摘要（不含 body）。`query` 非空时按 [`rank_key`]（relevance ×
@@ -1137,12 +1130,11 @@ async fn resolve_superseded(
         let chunk = state
             .db
             .operation_knowledge_chunks()
-            .find_one(
-                doc! { "_id": current, "workspace_id": workspace_id },
-                None,
-            )
+            .find_one(doc! { "_id": current, "workspace_id": workspace_id }, None)
             .await?;
-        let Some(chunk) = chunk else { return Ok(current) };
+        let Some(chunk) = chunk else {
+            return Ok(current);
+        };
         // superseded_by 空白 / 缺失 → current 即现行版本。
         let next_hex = match chunk.superseded_by.as_deref().map(str::trim) {
             Some(s) if !s.is_empty() => s.to_string(),
@@ -1287,10 +1279,7 @@ pub async fn follow_relations(
             let chunk = state
                 .db
                 .operation_knowledge_chunks()
-                .find_one(
-                    doc! { "_id": oid, "workspace_id": workspace_id },
-                    None,
-                )
+                .find_one(doc! { "_id": oid, "workspace_id": workspace_id }, None)
                 .await?;
             let Some(chunk) = chunk else { continue };
             let related = chunk.related_chunks.unwrap_or_default();
@@ -1377,11 +1366,7 @@ fn chunk_to_catalog_entry(chunk: OperationKnowledgeChunk) -> CatalogEntry {
         .or_else(|| chunk.body.clone())
         .map(|s| truncate_chars(&s, CATALOG_SUMMARY_CHARS))
         .unwrap_or_default();
-    let related_count = chunk
-        .related_chunks
-        .as_ref()
-        .map(|v| v.len())
-        .unwrap_or(0) as i32;
+    let related_count = chunk.related_chunks.as_ref().map(|v| v.len()).unwrap_or(0) as i32;
     let verified = chunk
         .integrity_status
         .as_deref()
@@ -1527,6 +1512,98 @@ pub fn filter_answer_against_opened(
     (cited, quotes)
 }
 
+/// Production evidence-integrity filter for an AI-selected answer.
+///
+/// The AI still decides which knowledge is relevant and what to say. This function only proves
+/// that every accepted citation refers to a verified, opened, non-contradiction chunk and that
+/// every accepted quote is literal evidence from that cited chunk. The anchor index is required,
+/// must exist, and its own sourceQuote must identify the same evidence.
+pub fn filter_answer_against_opened_chunks(
+    opened: &[ChunkFull],
+    cited_chunk_ids: Vec<String>,
+    raw_quotes: Vec<RawSourceQuote>,
+) -> (Vec<String>, Vec<SourceQuoteCitation>) {
+    let eligible: std::collections::HashMap<&str, &ChunkFull> = eligible_opened_chunks(opened)
+        .map(|chunk| (chunk.chunk_id.as_str(), chunk))
+        .collect();
+
+    let mut requested_seen = HashSet::new();
+    let requested: Vec<String> = cited_chunk_ids
+        .into_iter()
+        .filter(|id| eligible.contains_key(id.as_str()) && requested_seen.insert(id.clone()))
+        .collect();
+    let requested_set: HashSet<&str> = requested.iter().map(String::as_str).collect();
+
+    let quotes: Vec<SourceQuoteCitation> = raw_quotes
+        .into_iter()
+        .filter_map(|raw| {
+            let chunk = eligible.get(raw.chunk_id.as_str())?;
+            if !requested_set.contains(raw.chunk_id.as_str())
+                || !quote_is_chunk_evidence(chunk, &raw)
+            {
+                return None;
+            }
+            Some(SourceQuoteCitation {
+                chunk_id: raw.chunk_id,
+                quote: raw.quote.trim().to_string(),
+                source_anchor_index: raw.source_anchor_index,
+            })
+        })
+        .collect();
+    let evidenced: HashSet<&str> = quotes.iter().map(|quote| quote.chunk_id.as_str()).collect();
+    let cited = requested
+        .into_iter()
+        .filter(|id| evidenced.contains(id.as_str()))
+        .collect();
+    (cited, quotes)
+}
+
+fn eligible_opened_chunks(opened: &[ChunkFull]) -> impl Iterator<Item = &ChunkFull> {
+    opened.iter().filter(|chunk| {
+        chunk.verified
+            && !chunk.chunk_id.trim().is_empty()
+            && chunk.relation_role.as_deref() != Some("contradiction")
+    })
+}
+
+fn quote_is_chunk_evidence(chunk: &ChunkFull, raw: &RawSourceQuote) -> bool {
+    let quote = normalize_evidence_text(&raw.quote);
+    if quote.is_empty() {
+        return false;
+    }
+    let appears_in_chunk = chunk
+        .source_quote
+        .as_deref()
+        .into_iter()
+        .chain(std::iter::once(chunk.body.as_str()))
+        .map(normalize_evidence_text)
+        .any(|text| text.contains(&quote));
+    if !appears_in_chunk {
+        return false;
+    }
+
+    // A quote without an anchor remains useful context for the AI but cannot become an accepted
+    // evidence citation. This keeps the read path aligned with the knowledge verification gate.
+    let Some(index) = raw.source_anchor_index else {
+        return false;
+    };
+    let Ok(index) = usize::try_from(index) else {
+        return false;
+    };
+    let Some(anchor) = chunk.source_anchors.get(index) else {
+        return false;
+    };
+    let Ok(anchor_quote) = anchor.get_str("sourceQuote") else {
+        return false;
+    };
+    let anchor_quote = normalize_evidence_text(anchor_quote);
+    !anchor_quote.is_empty() && (anchor_quote.contains(&quote) || quote.contains(&anchor_quote))
+}
+
+fn normalize_evidence_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn build_prompt(
     query: &str,
     opened: &[ChunkFull],
@@ -1555,13 +1632,9 @@ fn build_prompt(
             .collect::<Vec<_>>(),
     )
     .unwrap_or_default();
-    let catalog_json = serde_json::to_string_pretty(
-        &catalog
-            .iter()
-            .map(|c| json!(c))
-            .collect::<Vec<_>>(),
-    )
-    .unwrap_or_default();
+    let catalog_json =
+        serde_json::to_string_pretty(&catalog.iter().map(|c| json!(c)).collect::<Vec<_>>())
+            .unwrap_or_default();
     let last_round = round >= max_rounds;
     let force_answer_hint = if last_round {
         "\n这是最后一轮，必须输出 action=answer。"
@@ -1673,8 +1746,7 @@ pub fn rank_key(query: &str, chunk: &OperationKnowledgeChunk, now: DateTime) -> 
         .valid_to
         .map(|t| t.timestamp_millis() < now.timestamp_millis())
         .unwrap_or(false);
-    let trust_factor =
-        if superseded { 0.1 } else { 1.0 } * if expired { 0.5 } else { 1.0 };
+    let trust_factor = if superseded { 0.1 } else { 1.0 } * if expired { 0.5 } else { 1.0 };
     let effective = base * trust_factor;
     RankKey {
         effective_relevance_micros: (effective * 1_000_000.0) as i64,
@@ -1757,8 +1829,7 @@ pub fn classify_recall_outcome(result: &AnswerResult) -> Option<GapSignalCandida
 
     // 签名 2：recall_low_yield。
     if opened.len() >= LOW_YIELD_OPENED_MIN && cited_count <= LOW_YIELD_CITED_MAX {
-        let cited_set: HashSet<&str> =
-            result.cited_chunk_ids.iter().map(|s| s.as_str()).collect();
+        let cited_set: HashSet<&str> = result.cited_chunk_ids.iter().map(|s| s.as_str()).collect();
         // affected = open 了正文却没被 cite 的那批（诊断价值最高）；恒 ⊆ opened。
         let affected: Vec<String> = opened
             .iter()
@@ -1959,6 +2030,111 @@ pub(crate) mod test_helpers {
 mod tests {
     use super::*;
 
+    fn evidence_chunk(chunk_id: &str, relation_role: Option<&str>) -> ChunkFull {
+        ChunkFull {
+            chunk_id: chunk_id.to_string(),
+            wiki_type: "methodology".to_string(),
+            chunk_type: "product_fact".to_string(),
+            title: "Evidence".to_string(),
+            summary: "Evidence summary".to_string(),
+            body: "The supported fact is 42 units.".to_string(),
+            source_quote: Some("The supported fact is 42 units.".to_string()),
+            source_anchors: vec![doc! {
+                "sourceQuote": "The supported fact is 42 units.",
+                "startOffset": 0_i32,
+                "endOffset": 31_i32,
+            }],
+            related_chunks: Vec::new(),
+            verified: true,
+            business_topics: Vec::new(),
+            relation_role: relation_role.map(ToString::to_string),
+        }
+    }
+
+    fn raw_quote(chunk_id: &str, quote: &str, anchor: Option<i32>) -> RawSourceQuote {
+        RawSourceQuote {
+            chunk_id: chunk_id.to_string(),
+            quote: quote.to_string(),
+            source_anchor_index: anchor,
+        }
+    }
+
+    #[test]
+    fn strict_evidence_accepts_ai_selected_anchored_quote() {
+        let opened = vec![evidence_chunk("support", None)];
+        let (cited, quotes) = filter_answer_against_opened_chunks(
+            &opened,
+            vec!["support".to_string()],
+            vec![raw_quote("support", "supported fact is 42 units", Some(0))],
+        );
+
+        assert_eq!(cited, vec!["support"]);
+        assert_eq!(quotes.len(), 1);
+        assert_eq!(quotes[0].source_anchor_index, Some(0));
+    }
+
+    #[test]
+    fn strict_evidence_rejects_contradiction_even_when_quote_is_real() {
+        let opened = vec![evidence_chunk("contra", Some("contradiction"))];
+        let (cited, quotes) = filter_answer_against_opened_chunks(
+            &opened,
+            vec!["contra".to_string()],
+            vec![raw_quote("contra", "supported fact is 42 units", Some(0))],
+        );
+
+        assert!(cited.is_empty());
+        assert!(quotes.is_empty());
+    }
+
+    #[test]
+    fn strict_evidence_rejects_quote_for_id_not_selected_by_ai() {
+        let opened = vec![evidence_chunk("support", None)];
+        let (cited, quotes) = filter_answer_against_opened_chunks(
+            &opened,
+            Vec::new(),
+            vec![raw_quote("support", "supported fact is 42 units", Some(0))],
+        );
+
+        assert!(cited.is_empty());
+        assert!(quotes.is_empty());
+    }
+
+    #[test]
+    fn strict_evidence_rejects_fabricated_quote_and_its_bare_citation() {
+        let opened = vec![evidence_chunk("support", None)];
+        let (cited, quotes) = filter_answer_against_opened_chunks(
+            &opened,
+            vec!["support".to_string()],
+            vec![raw_quote("support", "fabricated evidence", Some(0))],
+        );
+
+        assert!(cited.is_empty());
+        assert!(quotes.is_empty());
+    }
+
+    #[test]
+    fn strict_evidence_rejects_missing_out_of_range_or_mismatched_anchor() {
+        let mut opened = vec![evidence_chunk("support", None)];
+        for anchor in [None, Some(-1), Some(1)] {
+            let (cited, quotes) = filter_answer_against_opened_chunks(
+                &opened,
+                vec!["support".to_string()],
+                vec![raw_quote("support", "supported fact is 42 units", anchor)],
+            );
+            assert!(cited.is_empty(), "anchor={anchor:?}");
+            assert!(quotes.is_empty(), "anchor={anchor:?}");
+        }
+
+        opened[0].source_anchors[0].insert("sourceQuote", "different evidence");
+        let (cited, quotes) = filter_answer_against_opened_chunks(
+            &opened,
+            vec!["support".to_string()],
+            vec![raw_quote("support", "supported fact is 42 units", Some(0))],
+        );
+        assert!(cited.is_empty());
+        assert!(quotes.is_empty());
+    }
+
     #[test]
     fn classify_relation_role_maps_all_six_kinds() {
         // D3(a)：六种合法 relation_kind 的语义分类锁定。
@@ -2137,7 +2313,10 @@ mod tests {
         let irrelevant = rk_chunk("产品定价表", "标准版每月99元", "thesis", 0.99, 100);
         let kr = rank_key("价格异议", &relevant, now);
         let ki = rank_key("价格异议", &irrelevant, now);
-        assert!(kr > ki, "high-relevance chunk must outrank high-confidence irrelevant one");
+        assert!(
+            kr > ki,
+            "high-relevance chunk must outrank high-confidence irrelevant one"
+        );
     }
 
     #[test]
@@ -2176,7 +2355,10 @@ mod tests {
         let ke = rank_key("", &entity, now);
         assert_eq!(kt.effective_relevance_micros, 0);
         assert_eq!(ke.effective_relevance_micros, 0);
-        assert!(kt > ke, "with empty query, thesis outranks entity by static priority");
+        assert!(
+            kt > ke,
+            "with empty query, thesis outranks entity by static priority"
+        );
     }
 
     #[test]
@@ -2385,11 +2567,7 @@ mod tests {
     #[test]
     fn streamer_handles_cjk_split_across_fragments() {
         // 多字节 char 被切在两段之间：不能丢字、不能 panic。
-        let frags = [
-            "{\"action\":\"answer\",\"answer\":\"你",
-            "好",
-            "世界\"}",
-        ];
+        let frags = ["{\"action\":\"answer\",\"answer\":\"你", "好", "世界\"}"];
         assert_eq!(drive_streamer(&frags), "你好世界");
     }
 

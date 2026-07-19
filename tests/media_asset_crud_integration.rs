@@ -104,10 +104,7 @@ fn toggle_request(sendable: bool) -> ToggleSendableRequest {
 /// 克隆 `AppState`，把 `media_storage_dir` 指向进程内唯一临时目录，返回 (state, root)。
 /// 复用 `TestApp` 已建好的 Mongo 容器 / LLM mock，仅覆盖文件落盘根目录，避免多测试撞文件。
 fn state_with_unique_media_dir(app: &common::TestApp) -> (AppState, std::path::PathBuf) {
-    let root = std::env::temp_dir().join(format!(
-        "aqgc_media_{}",
-        ObjectId::new().to_hex()
-    ));
+    let root = std::env::temp_dir().join(format!("aqgc_media_{}", ObjectId::new().to_hex()));
     let mut config = app.state.config.clone();
     config.media_storage_dir = root.to_string_lossy().to_string();
     let mut state = app.state.clone();
@@ -290,11 +287,7 @@ async fn toggle_cross_workspace_404() {
     let unchanged = find_asset(&app.state, "other_ws", foreign_id)
         .await
         .expect("foreign asset exists");
-    assert_eq!(
-        unchanged.sendable,
-        Some(true),
-        "跨 workspace 写必须不落地"
-    );
+    assert_eq!(unchanged.sendable, Some(true), "跨 workspace 写必须不落地");
 }
 
 // ── delete：无兄弟引用 → DB 记录删 + 物理文件删 ───────────────────────────────
@@ -310,8 +303,8 @@ async fn delete_removes_db_and_file_when_no_siblings() {
     // 真落一个物理文件。
     let bytes = b"unique-asset-bytes";
     let sha = wechatagent::media_storage::sha256_hex(bytes);
-    let rel = wechatagent::media_storage::safe_relative_path(ws, &sha, "pdf")
-        .expect("safe rel path");
+    let rel =
+        wechatagent::media_storage::safe_relative_path(ws, &sha, "pdf").expect("safe rel path");
     wechatagent::media_storage::store_bytes(&root, &rel, bytes)
         .await
         .expect("store bytes");
@@ -342,10 +335,7 @@ async fn delete_removes_db_and_file_when_no_siblings() {
         "delete 后 DB 记录应消失"
     );
     // 物理文件也没了（无兄弟引用 → 引用计数为 0 → 物理删）。
-    assert!(
-        !root.join(&rel).exists(),
-        "无兄弟引用时物理文件应被删除"
-    );
+    assert!(!root.join(&rel).exists(), "无兄弟引用时物理文件应被删除");
 
     // 清理临时目录。
     let _ = tokio::fs::remove_dir_all(&root).await;
@@ -367,8 +357,8 @@ async fn delete_keeps_file_when_sibling_references_it() {
     // 真落一个物理文件。
     let bytes = b"shared-asset-bytes";
     let sha = wechatagent::media_storage::sha256_hex(bytes);
-    let rel = wechatagent::media_storage::safe_relative_path(ws, &sha, "pdf")
-        .expect("safe rel path");
+    let rel =
+        wechatagent::media_storage::safe_relative_path(ws, &sha, "pdf").expect("safe rel path");
     wechatagent::media_storage::store_bytes(&root, &rel, bytes)
         .await
         .expect("store bytes");
@@ -393,13 +383,9 @@ async fn delete_keeps_file_when_sibling_references_it() {
         .expect("insert asset b");
 
     // 删 A。
-    let _ = delete_content_asset(
-        State(state.clone()),
-        Extension(admin),
-        Path(id_a.to_hex()),
-    )
-    .await
-    .expect("delete a 应成功");
+    let _ = delete_content_asset(State(state.clone()), Extension(admin), Path(id_a.to_hex()))
+        .await
+        .expect("delete a 应成功");
 
     // A 记录没了、B 还在。
     assert!(

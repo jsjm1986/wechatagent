@@ -73,10 +73,7 @@ fn non_empty(s: &str) -> Option<String> {
 
 /// 单条请示 → InboxItem（具名以便单测）。保留富字段
 /// category/question_for_principal/contact_wxid/principal_wxid，避免决策人盲裁。
-fn escalation_to_inbox_item(
-    e: &crate::models::AgentPrincipalEscalation,
-    now_ms: i64,
-) -> InboxItem {
+fn escalation_to_inbox_item(e: &crate::models::AgentPrincipalEscalation, now_ms: i64) -> InboxItem {
     InboxItem {
         source: "principal_escalation".into(),
         id: e.short_code.clone(),
@@ -102,11 +99,7 @@ fn escalation_to_inbox_item(
 }
 
 /// 请示通道 pending → InboxItem（inline）。
-async fn collect_escalations(
-    state: &AppState,
-    ws: &str,
-    now_ms: i64,
-) -> AppResult<Vec<InboxItem>> {
+async fn collect_escalations(state: &AppState, ws: &str, now_ms: i64) -> AppResult<Vec<InboxItem>> {
     let items =
         crate::agent::escalation::list_escalations_by_workspace(state, ws, "pending").await?;
     Ok(items
@@ -146,7 +139,13 @@ async fn collect_knowledge_review(
                 source: "knowledge_review".into(),
                 id: id.clone(),
                 title: c.title.clone(),
-                summary: c.body.clone().unwrap_or_default().chars().take(80).collect(),
+                summary: c
+                    .body
+                    .clone()
+                    .unwrap_or_default()
+                    .chars()
+                    .take(80)
+                    .collect(),
                 severity: "medium".into(),
                 created_at: None,
                 age_hours: 0.0,
@@ -196,10 +195,9 @@ fn taxonomy_candidate_to_inbox_item(
         // 人话标题：以 AI 新识别的取值为主语，不暴露裸维度键（维度中文名前端补）。
         title: format!("AI 新识别标签：{}", c.raw_value),
         // 折叠预览：优先 evidence，无则通用框定。
-        summary: c
-            .evidence
-            .clone()
-            .unwrap_or_else(|| "AI 在对话中识别到一个尚未收录的取值，请确认是否纳入标签字典".into()),
+        summary: c.evidence.clone().unwrap_or_else(|| {
+            "AI 在对话中识别到一个尚未收录的取值，请确认是否纳入标签字典".into()
+        }),
         severity: "low".into(),
         created_at: Some(c.last_seen_at),
         age_hours: age_hours_of(Some(c.last_seen_at), now_ms),
@@ -274,7 +272,10 @@ async fn collect_relationship_suggestions(
                 source: "relationship_suggestion".into(),
                 id,
                 title: format!("关系类型建议：{}", r.suggested_value),
-                summary: r.evidence.clone().unwrap_or_else(|| r.suggested_value.clone()),
+                summary: r
+                    .evidence
+                    .clone()
+                    .unwrap_or_else(|| r.suggested_value.clone()),
                 severity: "low".into(),
                 created_at: Some(r.last_seen_at),
                 age_hours: age_hours_of(Some(r.last_seen_at), now_ms),
@@ -325,11 +326,7 @@ fn gap_to_inbox_item(g: &crate::models::KnowledgeGapSignal, now_ms: i64) -> Inbo
 }
 
 /// 知识缺口信号 pending → inline。
-async fn collect_gap_signals(
-    state: &AppState,
-    ws: &str,
-    now_ms: i64,
-) -> AppResult<Vec<InboxItem>> {
+async fn collect_gap_signals(state: &AppState, ws: &str, now_ms: i64) -> AppResult<Vec<InboxItem>> {
     use futures::TryStreamExt;
     let cursor = state
         .db
@@ -517,14 +514,32 @@ pub async fn ask_human_inbox(
         };
     }
 
-    collect_source!("principal_escalation", collect_escalations(&state, ws, now_ms));
-    collect_source!("knowledge_review", collect_knowledge_review(&state, ws, now_ms));
-    collect_source!("taxonomy_candidate", collect_taxonomy_candidates(&state, ws, now_ms));
-    collect_source!("relationship_suggestion", collect_relationship_suggestions(&state, ws, now_ms));
+    collect_source!(
+        "principal_escalation",
+        collect_escalations(&state, ws, now_ms)
+    );
+    collect_source!(
+        "knowledge_review",
+        collect_knowledge_review(&state, ws, now_ms)
+    );
+    collect_source!(
+        "taxonomy_candidate",
+        collect_taxonomy_candidates(&state, ws, now_ms)
+    );
+    collect_source!(
+        "relationship_suggestion",
+        collect_relationship_suggestions(&state, ws, now_ms)
+    );
     collect_source!("gap_signal", collect_gap_signals(&state, ws, now_ms));
     collect_source!("profile_risky", collect_profile_drafts(&state, ws, now_ms));
-    collect_source!("evolution_proposal", collect_evolution_proposals(&state, ws, now_ms));
-    collect_source!("lessons_learned", collect_lessons_learned(&state, ws, now_ms));
+    collect_source!(
+        "evolution_proposal",
+        collect_evolution_proposals(&state, ws, now_ms)
+    );
+    collect_source!(
+        "lessons_learned",
+        collect_lessons_learned(&state, ws, now_ms)
+    );
 
     Ok(Json(json!({ "items": items, "errors": errors })))
 }
@@ -577,7 +592,10 @@ pub async fn ask_human_summary(
     let evolution_proposal = state
         .db
         .proposals()
-        .count_documents(doc! { "workspace_id": ws, "status": "eligible_for_release" }, None)
+        .count_documents(
+            doc! { "workspace_id": ws, "status": "eligible_for_release" },
+            None,
+        )
         .await
         .unwrap_or(0);
     let lessons_learned = state
@@ -750,9 +768,16 @@ mod tests {
         // id=None 时 hex 落空串；本测聚焦 rich 分类与富字段，用 None 固定路径。
         let item = taxonomy_candidate_to_inbox_item(&c, 0);
         assert_eq!(item.action_kind, "rich");
-        assert_eq!(item.rich_component.as_deref(), Some("taxonomyCandidateReview"));
+        assert_eq!(
+            item.rich_component.as_deref(),
+            Some("taxonomyCandidateReview")
+        );
         // title 不再以裸维度键作主语（回归防护：不得再出现 "标签候选：emotional_state"）。
-        assert!(!item.title.contains("emotional_state"), "title 不应暴露裸维度键: {}", item.title);
+        assert!(
+            !item.title.contains("emotional_state"),
+            "title 不应暴露裸维度键: {}",
+            item.title
+        );
         // 顶层富字段与 relationship_suggestion 对称接出。
         assert_eq!(item.evidence.as_deref(), Some("客户连续两条消息表达担心"));
         assert_eq!(item.confidence, Some(7));
@@ -767,7 +792,10 @@ mod tests {
         assert_eq!(params.get_str("scope").unwrap(), "global");
         assert_eq!(params.get_str("kind").unwrap(), "emotional_state");
         assert_eq!(params.get_str("rawValue").unwrap(), "anxious");
-        assert_eq!(params.get_str("evidence").unwrap(), "客户连续两条消息表达担心");
+        assert_eq!(
+            params.get_str("evidence").unwrap(),
+            "客户连续两条消息表达担心"
+        );
         assert_eq!(params.get_i32("confidence").unwrap(), 7);
         assert_eq!(params.get_i32("occurrences").unwrap(), 3);
         assert_eq!(params.get_str("suggestedDisplayName").unwrap(), "焦虑");
@@ -806,6 +834,9 @@ mod tests {
         // 否则 auto_verify 分诊出的切片从收件箱消失(黑洞)。防回退成只查 needs_review。
         let s = knowledge_review_statuses();
         assert!(s.contains(&"needs_review"), "必须含 needs_review");
-        assert!(s.contains(&"needs_human_audit"), "必须含 needs_human_audit(KB-08 黑洞根因)");
+        assert!(
+            s.contains(&"needs_human_audit"),
+            "必须含 needs_human_audit(KB-08 黑洞根因)"
+        );
     }
 }

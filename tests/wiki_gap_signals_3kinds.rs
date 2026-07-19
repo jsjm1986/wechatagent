@@ -340,12 +340,19 @@ async fn recall_signal_merges_correct_topic_among_multiple_pending() {
 
     // 三个不同主题，前 40 字符两两不同 → 三个不同 dedup_key。B 取 >40 字符（其变体的后缀须
     // 落在 take(40) 之外才不改 title 截断）。seed 顺序 A→B→C 使 B 居中（非最早非最新）。
-    let query_a = "A产品的整机质保期到底是多少个月这一条我一直没在知识库里查到过对应的条款".to_string();
+    let query_a =
+        "A产品的整机质保期到底是多少个月这一条我一直没在知识库里查到过对应的条款".to_string();
     let query_b =
-        "B旗舰套餐每个月赠送的移动数据流量上限到底是多少这个数字我得给客户一个准确的答复不能含糊".to_string();
-    let query_c = "C尊享会员的专属线下沙龙活动每个季度到底安排几场这块我手头没有任何可以引用的资料".to_string();
+        "B旗舰套餐每个月赠送的移动数据流量上限到底是多少这个数字我得给客户一个准确的答复不能含糊"
+            .to_string();
+    let query_c = "C尊享会员的专属线下沙龙活动每个季度到底安排几场这块我手头没有任何可以引用的资料"
+        .to_string();
 
-    for (q, label) in [(&query_a, "seed A"), (&query_b, "seed B"), (&query_c, "seed C")] {
+    for (q, label) in [
+        (&query_a, "seed A"),
+        (&query_b, "seed B"),
+        (&query_c, "seed C"),
+    ] {
         gap_signals::persist_recall_signal(
             &app.state.db,
             WS,
@@ -356,7 +363,11 @@ async fn recall_signal_merges_correct_topic_among_multiple_pending() {
     }
 
     let pending = list_pending(&app, "recall_miss").await;
-    assert_eq!(pending.len(), 3, "三个不同主题应建 3 条 pending, got {pending:?}");
+    assert_eq!(
+        pending.len(),
+        3,
+        "三个不同主题应建 3 条 pending, got {pending:?}"
+    );
 
     // 前提亲验：query_b 与其变体的前 40 字符必须一致（否则 dedup_key 不会命中 B）。
     let prefix40 = |s: &str| s.chars().take(40).collect::<String>();
@@ -416,7 +427,9 @@ async fn recall_signal_merges_correct_topic_among_multiple_pending() {
             .find(|s| s.search_queries.iter().any(|q| q == own))
             .unwrap_or_else(|| panic!("{label} 仍在 pending"));
         assert!(
-            !sig.search_queries.iter().any(|q| q == &query_b || q == &query_b2),
+            !sig.search_queries
+                .iter()
+                .any(|q| q == &query_b || q == &query_b2),
             "{label} 不应被 B 的变体污染, got {:?}",
             sig.search_queries
         );
@@ -431,7 +444,8 @@ async fn recall_signal_merges_correct_topic_among_multiple_pending() {
 async fn recall_signal_merges_into_legacy_row_without_persisted_dedup_key() {
     let app = TestApp::start().await;
     let original_query =
-        "历史套餐每年包含的服务额度和超额计费规则是什么需要一份可以核验的准确说明并注明适用范围".to_string();
+        "历史套餐每年包含的服务额度和超额计费规则是什么需要一份可以核验的准确说明并注明适用范围"
+            .to_string();
     let variant_query = format!("{original_query} 另外请补充超额后的计费单位");
     // title cap 是 40 字符：两变体必须在前 40 字内完全相同，才会 derive 出同一 dedup_key。
     // original_query 本身须 ≥40 字，否则 variant 追加的内容会挤进 title cap 导致 key 分叉。
@@ -478,11 +492,21 @@ async fn recall_signal_merges_into_legacy_row_without_persisted_dedup_key() {
     .expect("merge into legacy row");
 
     let pending = list_pending(&app, "recall_miss").await;
-    assert_eq!(pending.len(), 1, "legacy match must not create a duplicate row");
+    assert_eq!(
+        pending.len(),
+        1,
+        "legacy match must not create a duplicate row"
+    );
     assert_eq!(pending[0].signal_id, "legacy_gap_without_dedup_key");
-    assert!(pending[0].dedup_key.is_none(), "legacy row remains readable without migration");
     assert!(
-        pending[0].search_queries.iter().any(|q| q == &variant_query),
+        pending[0].dedup_key.is_none(),
+        "legacy row remains readable without migration"
+    );
+    assert!(
+        pending[0]
+            .search_queries
+            .iter()
+            .any(|q| q == &variant_query),
         "new query variant must merge into the legacy row"
     );
 }
@@ -496,8 +520,12 @@ async fn concurrent_recall_signals_upsert_one_pending_and_merge_all_queries() {
     const WRITERS: usize = 16;
 
     let app = TestApp::start().await;
-    let prefix = "同一产品套餐的年度服务额度和超额计费规则究竟是什么请给出能够核验的准确资料并说明适用范围";
-    assert!(prefix.chars().count() >= 40, "prefix must fill the title cap");
+    let prefix =
+        "同一产品套餐的年度服务额度和超额计费规则究竟是什么请给出能够核验的准确资料并说明适用范围";
+    assert!(
+        prefix.chars().count() >= 40,
+        "prefix must fill the title cap"
+    );
 
     let barrier = Arc::new(Barrier::new(WRITERS));
     let mut handles = Vec::with_capacity(WRITERS);

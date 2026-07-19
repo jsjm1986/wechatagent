@@ -128,7 +128,9 @@ pub async fn aggregate_reviewer_stats_for_workspace(
         .update_one(
             doc! { "stat_id": &stat_id },
             update,
-            mongodb::options::UpdateOptions::builder().upsert(true).build(),
+            mongodb::options::UpdateOptions::builder()
+                .upsert(true)
+                .build(),
         )
         .await?;
 

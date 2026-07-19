@@ -6,9 +6,9 @@
 //!   - 只看到 workspace_a 那条；
 //!   - 完全不会泄漏 workspace_b 的内容。
 //!
-//! 走 helper 而非 handler 路由是因为 handler 是 `pub(super)`，且核心隔离逻辑
-//! 已经下沉到 `load_operation_knowledge_chunks_for_query`：handler 只是
-//! 注入 `admin.current_workspace` 的 thin wrapper。
+//! 本文件多数用例只验证 collection/helper 的过滤形状、迁移与索引局部约束；没有
+//! 调用对应 Router/Handler 的用例不得外推为 IDOR 端点证据。真实 Cookie、middleware、
+//! Contact Router 与 Product Router 边界由 `sr176_real_route_isolation.rs` 覆盖。
 //!
 //! 默认 `#[ignore]`，需要 Docker（testcontainers MongoDB）。
 
@@ -206,14 +206,12 @@ async fn legacy_row_without_workspace_id_is_invisible_after_backfill() {
     );
 }
 
-/// 安全回归（IDOR）：`find_contact_by_id` 现强制 `{ _id, workspace_id }` 复合
-/// 过滤。本测试直插两条分属不同租户的 contact，再用与 handler 同形的过滤
-/// shape 验证：
+/// Contact collection 复合过滤形状回归（非 Handler 证据）。本测试直插两条分属
+/// 不同租户的 contact，再显式构造 `{ _id, workspace_id }` 查询，验证：
 ///   - 用 workspace_a 视角查 workspace_b 的 contact_id → 查不到（404 语义）；
 ///   - 用本租户视角查自己的 contact_id → 命中。
 ///
-/// 这覆盖了 P0 越权修复：旧实现只按 `_id` 查，admin A 可读 workspace B 的
-/// 联系人完整资料；修复后跨租户 `_id` 命中也被 workspace_id 过滤掉。
+/// 生产 Contact Router 的跨租户 404 与本租户 200 由 SR-176 真实路由红线覆盖。
 #[tokio::test]
 #[ignore]
 async fn contact_lookup_blocks_cross_tenant_by_id() {
@@ -258,10 +256,7 @@ async fn contact_lookup_blocks_cross_tenant_by_id() {
 
     // workspace_a 视角查 workspace_b 的 contact_id —— 复合过滤命中不到 → None
     let cross = coll
-        .find_one(
-            doc! { "_id": id_b, "workspace_id": "workspace_a" },
-            None,
-        )
+        .find_one(doc! { "_id": id_b, "workspace_id": "workspace_a" }, None)
         .await
         .expect("cross-tenant lookup");
     assert!(
@@ -271,10 +266,7 @@ async fn contact_lookup_blocks_cross_tenant_by_id() {
 
     // 本租户视角查自己的 contact_id —— 命中
     let own = coll
-        .find_one(
-            doc! { "_id": id_b, "workspace_id": "workspace_b" },
-            None,
-        )
+        .find_one(doc! { "_id": id_b, "workspace_id": "workspace_b" }, None)
         .await
         .expect("own-tenant lookup");
     assert!(
@@ -284,22 +276,18 @@ async fn contact_lookup_blocks_cross_tenant_by_id() {
 
     // 反向再确认 workspace_a 能读自己的
     let own_a = coll
-        .find_one(
-            doc! { "_id": id_a, "workspace_id": "workspace_a" },
-            None,
-        )
+        .find_one(doc! { "_id": id_a, "workspace_id": "workspace_a" }, None)
         .await
         .expect("own-tenant lookup a");
     assert!(own_a.is_some(), "workspace_a 视角应能读到自己的 contact");
 }
 
-/// 安全回归（IDOR sweep #153）：admin 写/控/发布路径现全部强制
-/// `{ _id, workspace_id }` 复合过滤。本测试针对一次性修复的 5 个集合
+/// 五个集合的复合过滤形状回归（非 Handler sweep 证据）。本测试针对 5 个集合
 /// （wechat_accounts / follow_up_tasks / agent_souls / command_runs /
 /// user_operation_guide_previews）各插一条 workspace_b 的 doc，再用
-/// workspace_a 视角按 handler 同形过滤验证跨租户命中为 0、本租户命中为 1。
+/// 用测试内显式过滤验证跨租户命中为 0、本租户命中为 1。
 ///
-/// 对应被修复的 handler：
+/// 这些集合被下列 Handler 使用，但本用例不调用它们：
 ///   - `accounts::update_account_mcp_key`（跨租户改 MCP key）
 ///   - `tasks::review_task_now` / `cancel_agent_task`（跨租户触发/取消任务）
 ///   - `souls::publish_agent_soul`（跨租户发布 + delete_many 销毁）
@@ -307,16 +295,11 @@ async fn contact_lookup_blocks_cross_tenant_by_id() {
 ///   - `guides::apply_user_operation_guide`（跨租户套用运营指令）
 #[tokio::test]
 #[ignore]
-async fn admin_mutation_handlers_block_cross_tenant_by_id() {
+async fn admin_mutation_collection_filters_are_workspace_scoped() {
     use mongodb::bson::{doc, oid::ObjectId, DateTime as BsonDt, Document};
 
     let app = TestApp::start().await;
-    let raw = |name: &str| {
-        app.state
-            .db
-            .raw()
-            .collection::<Document>(name)
-    };
+    let raw = |name: &str| app.state.db.raw().collection::<Document>(name);
 
     // 每个集合插一条 workspace_b 的最小 doc。
     let acc_id = ObjectId::new();
@@ -418,10 +401,7 @@ async fn admin_mutation_handlers_block_cross_tenant_by_id() {
     ];
     for (coll_name, id) in &cases {
         let cross = raw(coll_name)
-            .count_documents(
-                doc! { "_id": id, "workspace_id": "workspace_a" },
-                None,
-            )
+            .count_documents(doc! { "_id": id, "workspace_id": "workspace_a" }, None)
             .await
             .unwrap_or_else(|_| panic!("cross count {coll_name}"));
         assert_eq!(
@@ -429,35 +409,24 @@ async fn admin_mutation_handlers_block_cross_tenant_by_id() {
             "{coll_name}: workspace_a 不应通过 _id 命中 workspace_b 的 doc（IDOR）"
         );
         let own = raw(coll_name)
-            .count_documents(
-                doc! { "_id": id, "workspace_id": "workspace_b" },
-                None,
-            )
+            .count_documents(doc! { "_id": id, "workspace_id": "workspace_b" }, None)
             .await
             .unwrap_or_else(|_| panic!("own count {coll_name}"));
-        assert_eq!(
-            own, 1,
-            "{coll_name}: workspace_b 视角应能命中自己的 doc"
-        );
+        assert_eq!(own, 1, "{coll_name}: workspace_b 视角应能命中自己的 doc");
     }
 }
 
-/// 安全回归（IDOR sweep #153）：MCP 透传搜索接口现校验 account_id 归属当前
-/// workspace。本测试验证 `validate_account` 的过滤 shape——跨租户 account_id
-/// 命中不到（→ NotFound），本租户 account_id 命中。覆盖被修复的
+/// Account collection 过滤形状回归（非 MCP Handler 证据）。跨租户 account_id
+/// 命中不到、本租户 account_id 命中。下列生产端点使用同类校验，但本用例不调用
 /// `contacts::search_contacts_endpoint` / `import_contacts_endpoint` /
 /// `search_import_contacts`（旧三处把 payload.account_id 直接喂给 MCP）。
 #[tokio::test]
 #[ignore]
-async fn account_scoped_mcp_passthrough_blocks_cross_tenant() {
+async fn account_collection_filter_is_workspace_scoped() {
     use mongodb::bson::{doc, oid::ObjectId, DateTime as BsonDt, Document};
 
     let app = TestApp::start().await;
-    let raw = app
-        .state
-        .db
-        .raw()
-        .collection::<Document>("wechat_accounts");
+    let raw = app.state.db.raw().collection::<Document>("wechat_accounts");
     raw.insert_one(
         doc! {
             "_id": ObjectId::new(),
@@ -501,12 +470,11 @@ async fn account_scoped_mcp_passthrough_blocks_cross_tenant() {
     assert_eq!(own, 1, "workspace_b 视角应能用自己的 account_id");
 }
 
-/// 安全回归（IDOR sweep #156 终极审查）：第二批 admin 写/控/发布路径补齐
-/// `{ _id, workspace_id }` 复合过滤。本测试针对一次修复的 4 个集合各插一条
-/// workspace_b 的 doc，再用 workspace_a 视角按 handler 同形过滤验证跨租户命中
+/// 四个 admin 集合的复合过滤形状回归（非“终极 Handler 审查”）。本测试各插一条
+/// workspace_b 的 doc，再用测试内显式过滤验证跨租户命中
 /// 为 0、本租户命中为 1。
 ///
-/// 对应被修复的 handler：
+/// 这些集合被下列 Handler 使用，但本用例不调用它们：
 ///   - `admin_outbox::cancel_outbox`（跨租户取消 outbox 条目）
 ///   - `admin_state_policies::get_operation_state_policy`（跨租户读状态策略）
 ///   - `admin_ops_versions::{publish,rollout,rollback}_operation_domain_version`
@@ -519,7 +487,7 @@ async fn account_scoped_mcp_passthrough_blocks_cross_tenant() {
 /// `system_taxonomies` 是全局字典（无 workspace_id），按设计不分租户。
 #[tokio::test]
 #[ignore]
-async fn admin_ultimate_audit_handlers_block_cross_tenant_by_id() {
+async fn admin_collection_filters_are_workspace_scoped() {
     use mongodb::bson::{doc, oid::ObjectId, DateTime as BsonDt, Document};
 
     let app = TestApp::start().await;

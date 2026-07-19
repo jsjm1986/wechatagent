@@ -24,9 +24,7 @@ use std::time::Duration;
 
 use futures::TryStreamExt;
 use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
-use mongodb::options::{
-    FindOneAndUpdateOptions, FindOptions, ReturnDocument, UpdateOptions,
-};
+use mongodb::options::{FindOneAndUpdateOptions, FindOptions, ReturnDocument, UpdateOptions};
 
 use crate::error::AppResult;
 use crate::models::{AgentStatus, AgentTask, OutboxEntry};
@@ -106,6 +104,62 @@ fn worker_id() -> String {
 pub async fn reclaim_expired_leases(state: &AppState) -> AppResult<u64> {
     let collection = state.db.collection_agent_send_outbox();
     let now = DateTime::now();
+    // A cancellation that won before the irreversible send boundary can be completed safely.
+    let canceled = collection
+        .update_many(
+            doc! {
+                "status": OutboxStatus::InFlight.as_str(),
+                "locked_until": { "$lt": now },
+                "cancel_requested": true,
+                "$or": [
+                    { "send_started_at": { "$exists": false } },
+                    { "send_started_at": null },
+                ],
+            },
+            doc! {
+                "$set": {
+                    "status": OutboxStatus::Canceled.as_str(),
+                    "updated_at": now,
+                    "cancel_reason": "cancel request recovered before remote send",
+                },
+                "$unset": {
+                    "worker_id": "",
+                    "locked_until": "",
+                    "claim_token": "",
+                },
+            },
+            None,
+        )
+        .await?;
+    // A namecard has no authoritative post-hoc query. A cancellation that arrived after any
+    // payload crossed the remote boundary is also no longer safe to report as canceled or replay.
+    // Stop both cases in an explicit terminal instead of risking a duplicate delivery.
+    let unknown = collection
+        .update_many(
+            doc! {
+                "status": OutboxStatus::InFlight.as_str(),
+                "locked_until": { "$lt": now },
+                "send_started_at": { "$ne": null },
+                "$or": [
+                    { "referral_card_id": { "$ne": null } },
+                    { "cancel_requested": true },
+                ],
+            },
+            doc! {
+                "$set": {
+                    "status": OutboxStatus::DeliveryUnknown.as_str(),
+                    "updated_at": now,
+                    "last_error": "namecard worker lease expired after remote send boundary; delivery requires manual verification",
+                },
+                "$unset": {
+                    "worker_id": "",
+                    "locked_until": "",
+                    "claim_token": "",
+                },
+            },
+            None,
+        )
+        .await?;
     let result = collection
         .update_many(
             doc! {
@@ -121,6 +175,8 @@ pub async fn reclaim_expired_leases(state: &AppState) -> AppResult<u64> {
                 "$unset": {
                     "worker_id": "",
                     "locked_until": "",
+                    "claim_token": "",
+                    "send_started_at": "",
                 },
                 "$inc": { "reclaim_count": 1 },
             },
@@ -157,7 +213,7 @@ pub async fn reclaim_expired_leases(state: &AppState) -> AppResult<u64> {
             "outbox reclaim 超限转 failed_terminal"
         );
     }
-    Ok(result.modified_count)
+    Ok(result.modified_count + canceled.modified_count + unknown.modified_count)
 }
 
 /// **原子抢占**：从 `pending` + (next_retry_at 为 null 或 ≤ now) 中抢一条，
@@ -174,9 +230,14 @@ pub async fn atomic_claim_pending(
     let now = DateTime::now();
     let lease_ms = (lease_seconds.max(1) as i64) * 1000;
     let lease_until = DateTime::from_millis(now.timestamp_millis() + lease_ms);
+    let claim_token = uuid::Uuid::new_v4().to_string();
 
     let filter = doc! {
         "status": OutboxStatus::Pending.as_str(),
+        // Defensive invariant: a persisted cancellation intent must never be erased by a new
+        // claim. Normal pending rows have this field false/missing; a true value means an older
+        // transition lost a race and must be reconciled instead of sent.
+        "cancel_requested": { "$ne": true },
         "$or": [
             { "next_retry_at": { "$exists": false } },
             { "next_retry_at": null },
@@ -187,9 +248,16 @@ pub async fn atomic_claim_pending(
         "$set": {
             "status": OutboxStatus::InFlight.as_str(),
             "worker_id": worker,
+            "claim_token": &claim_token,
             "locked_until": lease_until,
             "updated_at": now,
-        }
+            "cancel_requested": false,
+        },
+        "$inc": { "claim_generation": 1i64 },
+        "$unset": {
+            "cancel_requested_at": "",
+            "send_started_at": "",
+        },
     };
     // finding ②：按 created_at 升序领取（FIFO），保证同一 run 的多段回复（文本
     // seg0/seg1…后接媒体，各段独立 enqueue、created_at 单调递增）按入队顺序发出，
@@ -202,6 +270,458 @@ pub async fn atomic_claim_pending(
     Ok(collection
         .find_one_and_update(filter, update, options)
         .await?)
+}
+
+fn active_claim_filter(entry_id: ObjectId, entry: &OutboxEntry) -> Option<Document> {
+    let worker_id = entry.worker_id.as_deref()?;
+    let claim_token = entry.claim_token.as_deref()?;
+    Some(doc! {
+        "_id": entry_id,
+        "status": OutboxStatus::InFlight.as_str(),
+        "worker_id": worker_id,
+        "claim_token": claim_token,
+    })
+}
+
+fn send_not_started_filter() -> Document {
+    doc! {
+        "$or": [
+            { "send_started_at": { "$exists": false } },
+            { "send_started_at": null },
+        ]
+    }
+}
+
+/// SR-034：Task 产生的 Outbox 在触达 MCP 前必须证明发送意图已由同一 task claim
+/// 提交。非 Task / 历史 Outbox 没有 source_task_* 元数据，保持原有放行语义。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TaskSendAuthorization {
+    /// `None` 表示非 Task / 历史 Outbox；`Some(token)` 表示新协议 marker 已提交。
+    Authorized(Option<String>),
+    /// Gateway 已绑定 decision，但尚未完成全部分段/素材入队并提交 task 终态。
+    Building,
+    /// task 已被 reclaim、取消、换 token，或 decision 绑定已被新 owner 替换。
+    Stale(String),
+}
+
+fn classify_task_send_authorization(
+    status: &str,
+    binding_token: &str,
+    task_claim_token: Option<&str>,
+    decision_matches: bool,
+    marker: Option<&str>,
+) -> TaskSendAuthorization {
+    if task_claim_token != Some(binding_token) || !decision_matches {
+        return TaskSendAuthorization::Stale(
+            "source task claim or decision binding was replaced".to_string(),
+        );
+    }
+    if marker.is_some_and(|marker| marker != binding_token) {
+        return TaskSendAuthorization::Stale(
+            "outbox authorization marker does not match task claim".to_string(),
+        );
+    }
+    match status {
+        "running" => TaskSendAuthorization::Building,
+        // `sent` is reached only after all text segments are delivered. Media/namecard entries
+        // belonging to the same decision may still be pending and remain authorized by the same
+        // immutable token + outbox_decision_id pair.
+        "outbox_enqueued" | "sent" => match marker {
+            Some(marker) => TaskSendAuthorization::Authorized(Some(marker.to_string())),
+            None => TaskSendAuthorization::Building,
+        },
+        other => TaskSendAuthorization::Stale(format!(
+            "source task is no longer send-authorized (status={other})"
+        )),
+    }
+}
+
+async fn task_send_authorization(
+    state: &AppState,
+    entry: &OutboxEntry,
+) -> AppResult<TaskSendAuthorization> {
+    let Some(decision_id) = entry.decision_id else {
+        return Ok(TaskSendAuthorization::Authorized(None));
+    };
+    let Some(review) = state
+        .db
+        .decision_reviews()
+        .find_one(doc! { "_id": decision_id }, None)
+        .await?
+    else {
+        // 历史/手工 Outbox 允许没有 review；Task Outbox 的 review 在 enqueue 前已落库。
+        return Ok(TaskSendAuthorization::Authorized(None));
+    };
+    let binding = match (
+        review.source_task_id,
+        review.source_task_claim_token.as_deref(),
+    ) {
+        (None, None) => return Ok(TaskSendAuthorization::Authorized(None)),
+        (Some(task_id), Some(token)) if !token.trim().is_empty() => (task_id, token.to_string()),
+        _ => {
+            return Ok(TaskSendAuthorization::Stale(
+                "task authorization metadata incomplete".to_string(),
+            ));
+        }
+    };
+    let task = state
+        .db
+        .tasks()
+        .clone_with_type::<Document>()
+        .find_one(doc! { "_id": binding.0 }, None)
+        .await?;
+    let Some(task) = task else {
+        return Ok(TaskSendAuthorization::Stale(
+            "source task no longer exists".to_string(),
+        ));
+    };
+    Ok(classify_task_send_authorization(
+        task.get_str("status").unwrap_or_default(),
+        &binding.1,
+        task.get_str("claim_token").ok(),
+        task.get_object_id("outbox_decision_id").ok() == Some(decision_id),
+        entry.task_send_authorization_token.as_deref(),
+    ))
+}
+
+/// Gateway 仍在构建同一 decision 时无损退回 pending。此路径不是发送失败，也不是
+/// worker 崩溃：不增加 attempt/reclaim_count，不置 reclaimed_in_flight。
+async fn defer_until_task_authorized(
+    state: &AppState,
+    entry_id: ObjectId,
+    entry: &OutboxEntry,
+) -> AppResult<()> {
+    let Some(mut filter) = active_claim_filter(entry_id, entry) else {
+        return Ok(());
+    };
+    filter.insert("cancel_requested", doc! { "$ne": true });
+    filter.extend(send_not_started_filter());
+    let now = DateTime::now();
+    let next_retry_at = DateTime::from_millis(now.timestamp_millis() + 1_000);
+    let result = state
+        .db
+        .collection_agent_send_outbox()
+        .update_one(
+            filter,
+            doc! {
+                "$set": {
+                    "status": OutboxStatus::Pending.as_str(),
+                    "next_retry_at": next_retry_at,
+                    "updated_at": now,
+                },
+                "$unset": {
+                    "worker_id": "",
+                    "locked_until": "",
+                    "claim_token": "",
+                    "send_started_at": "",
+                },
+            },
+            None,
+        )
+        .await?;
+    if result.matched_count == 0 {
+        let _ = complete_requested_cancel_before_send(state, entry_id, entry).await?;
+    } else {
+        refresh_run_log_outbox_status(state, &entry.run_id).await;
+    }
+    Ok(())
+}
+
+async fn enforce_task_send_authorization(
+    state: &AppState,
+    entry_id: ObjectId,
+    entry: &OutboxEntry,
+) -> AppResult<Option<Option<String>>> {
+    match task_send_authorization(state, entry).await? {
+        TaskSendAuthorization::Authorized(token) => Ok(Some(token)),
+        TaskSendAuthorization::Building => {
+            defer_until_task_authorized(state, entry_id, entry).await?;
+            Ok(None)
+        }
+        TaskSendAuthorization::Stale(reason) => {
+            cancel_entry(
+                state,
+                entry_id,
+                entry,
+                &format!("stale_task_claim: {reason}"),
+            )
+            .await?;
+            Ok(None)
+        }
+    }
+}
+
+/// Finish an in-flight cancellation only while the remote send boundary has not been crossed.
+/// Returns true only when this worker still owned the claim and committed the cancellation.
+async fn complete_requested_cancel_before_send(
+    state: &AppState,
+    entry_id: ObjectId,
+    entry: &OutboxEntry,
+) -> AppResult<bool> {
+    let Some(mut filter) = active_claim_filter(entry_id, entry) else {
+        return Ok(false);
+    };
+    filter.insert("cancel_requested", true);
+    filter.extend(send_not_started_filter());
+    let now = DateTime::now();
+    let result = state
+        .db
+        .collection_agent_send_outbox()
+        .update_one(
+            filter,
+            doc! {
+                "$set": {
+                    "status": OutboxStatus::Canceled.as_str(),
+                    "updated_at": now,
+                },
+                "$unset": {
+                    "worker_id": "",
+                    "locked_until": "",
+                    "claim_token": "",
+                },
+            },
+            None,
+        )
+        .await?;
+    if result.matched_count == 0 {
+        return Ok(false);
+    }
+    let reason = entry
+        .cancel_reason
+        .as_deref()
+        .unwrap_or("cancel requested before remote send");
+    let _ = write_event_with_cap(
+        state,
+        entry_id,
+        &entry.account_id,
+        Some(&entry.contact_wxid),
+        "outbox_canceled",
+        "warn",
+        reason,
+        Some(doc! {
+            "outbox_id": entry_id,
+            "run_id": &entry.run_id,
+            "cancel_reason": reason,
+            "claim_generation": entry.claim_generation,
+        }),
+    )
+    .await;
+    refresh_run_log_outbox_status(state, &entry.run_id).await;
+    Ok(true)
+}
+
+/// Last cancellable CAS. A successful update proves this claim is still current and no cancel
+/// request won before the irreversible MCP call boundary.
+fn remote_send_start_filter(
+    entry_id: ObjectId,
+    worker_id: &str,
+    outbox_claim_token: &str,
+    task_authorization_token: Option<&str>,
+) -> Document {
+    let mut filter = doc! {
+        "_id": entry_id,
+        "status": OutboxStatus::InFlight.as_str(),
+        "worker_id": worker_id,
+        "claim_token": outbox_claim_token,
+        "cancel_requested": { "$ne": true },
+    };
+    if let Some(token) = task_authorization_token {
+        filter.insert("task_send_authorization_token", token);
+    }
+    filter.extend(send_not_started_filter());
+    filter
+}
+
+async fn begin_remote_send(
+    state: &AppState,
+    entry_id: ObjectId,
+    entry: &OutboxEntry,
+    task_authorization_token: Option<&str>,
+) -> AppResult<bool> {
+    let (Some(worker_id), Some(outbox_claim_token)) =
+        (entry.worker_id.as_deref(), entry.claim_token.as_deref())
+    else {
+        return Ok(false);
+    };
+    // SR-034 最后不可逆边界只依赖当前 Outbox 单文档：该 marker 只能在持有
+    // 同一 Task claim token 的 owner 成功提交 task 授权后写入。
+    let filter = remote_send_start_filter(
+        entry_id,
+        worker_id,
+        outbox_claim_token,
+        task_authorization_token,
+    );
+    let now = DateTime::now();
+    let result = state
+        .db
+        .collection_agent_send_outbox()
+        .update_one(
+            filter,
+            doc! { "$set": {
+                "send_started_at": now,
+                "updated_at": now,
+            } },
+            None,
+        )
+        .await?;
+    if result.matched_count == 1 {
+        return Ok(true);
+    }
+    let _ = complete_requested_cancel_before_send(state, entry_id, entry).await?;
+    Ok(false)
+}
+
+async fn commit_sent_if_owned(
+    state: &AppState,
+    entry_id: ObjectId,
+    entry: &OutboxEntry,
+    note: Option<&str>,
+) -> AppResult<bool> {
+    let Some(filter) = active_claim_filter(entry_id, entry) else {
+        return Ok(false);
+    };
+    let now = DateTime::now();
+    let mut set = doc! {
+        "status": OutboxStatus::Sent.as_str(),
+        "sent_at": now,
+        "updated_at": now,
+        "delivery_finalize_pending": entry.decision_id.is_some()
+            && entry.media_asset_id.is_none()
+            && entry.referral_card_id.is_none(),
+    };
+    if let Some(note) = note {
+        set.insert("last_error", note);
+    }
+    let result = state
+        .db
+        .collection_agent_send_outbox()
+        .update_one(
+            filter,
+            doc! {
+                "$set": set,
+                "$unset": {
+                    "worker_id": "",
+                    "locked_until": "",
+                    "claim_token": "",
+                    "reclaimed_in_flight": "",
+                },
+            },
+            None,
+        )
+        .await?;
+    Ok(result.matched_count == 1)
+}
+
+async fn mark_delivery_unknown_if_owned(
+    state: &AppState,
+    entry_id: ObjectId,
+    entry: &OutboxEntry,
+    reason: &str,
+) -> AppResult<bool> {
+    let Some(filter) = active_claim_filter(entry_id, entry) else {
+        return Ok(false);
+    };
+    let now = DateTime::now();
+    let result = state
+        .db
+        .collection_agent_send_outbox()
+        .update_one(
+            filter,
+            doc! {
+                "$set": {
+                    "status": OutboxStatus::DeliveryUnknown.as_str(),
+                    "last_error": reason,
+                    "updated_at": now,
+                },
+                "$unset": {
+                    "worker_id": "",
+                    "locked_until": "",
+                    "claim_token": "",
+                    "reclaimed_in_flight": "",
+                },
+            },
+            None,
+        )
+        .await?;
+    if result.matched_count == 0 {
+        return Ok(false);
+    }
+    let _ = write_event_with_cap(
+        state,
+        entry_id,
+        &entry.account_id,
+        Some(&entry.contact_wxid),
+        "outbox_delivery_unknown",
+        "warning",
+        reason,
+        Some(doc! {
+            "outbox_id": entry_id,
+            "run_id": &entry.run_id,
+            "claim_generation": entry.claim_generation,
+        }),
+    )
+    .await;
+    refresh_run_log_outbox_status(state, &entry.run_id).await;
+    Ok(true)
+}
+
+/// A cancellation may arrive after the worker crossed the remote-call boundary but before an
+/// error/timeout is handled. Such an entry must never be returned to `pending`: the next claim
+/// would clear `cancel_requested` and could replay a delivery that actually succeeded remotely.
+async fn settle_late_cancel_as_delivery_unknown(
+    state: &AppState,
+    entry_id: ObjectId,
+    entry: &OutboxEntry,
+) -> AppResult<bool> {
+    let Some(mut filter) = active_claim_filter(entry_id, entry) else {
+        return Ok(false);
+    };
+    filter.insert("cancel_requested", true);
+    filter.insert("send_started_at", doc! { "$ne": null });
+    let now = DateTime::now();
+    let reason = "cancel requested after remote send boundary; delivery requires verification";
+    let result = state
+        .db
+        .collection_agent_send_outbox()
+        .update_one(
+            filter,
+            doc! {
+                "$set": {
+                    "status": OutboxStatus::DeliveryUnknown.as_str(),
+                    "last_error": reason,
+                    "updated_at": now,
+                },
+                "$unset": {
+                    "worker_id": "",
+                    "locked_until": "",
+                    "claim_token": "",
+                    "reclaimed_in_flight": "",
+                },
+            },
+            None,
+        )
+        .await?;
+    if result.matched_count == 0 {
+        return Ok(false);
+    }
+    let _ = write_event_with_cap(
+        state,
+        entry_id,
+        &entry.account_id,
+        Some(&entry.contact_wxid),
+        "outbox_delivery_unknown",
+        "warning",
+        reason,
+        Some(doc! {
+            "outbox_id": entry_id,
+            "run_id": &entry.run_id,
+            "claim_generation": entry.claim_generation,
+            "cancel_requested": true,
+        }),
+    )
+    .await;
+    refresh_run_log_outbox_status(state, &entry.run_id).await;
+    Ok(true)
 }
 
 /// **二次安全门**（R13.4）：发送前再次检查 contact cooldown / user stop /
@@ -299,6 +819,12 @@ fn aggregate_run_outbox_status<'a>(
     {
         return Some(OutboxStatus::FailedTerminal.as_str());
     }
+    if statuses
+        .iter()
+        .any(|status| *status == OutboxStatus::DeliveryUnknown.as_str())
+    {
+        return Some(OutboxStatus::DeliveryUnknown.as_str());
+    }
     Some(OutboxStatus::Canceled.as_str())
 }
 
@@ -341,18 +867,18 @@ pub(crate) async fn refresh_run_log_outbox_status(state: &AppState, run_id: &str
         Ok(Some(log)) => log,
         Ok(None) => return,
         Err(err) => {
-            tracing::warn!(?err, run_id, "reserve run outbox aggregation generation failed");
+            tracing::warn!(
+                ?err,
+                run_id,
+                "reserve run outbox aggregation generation failed"
+            );
             return;
         }
     };
     let run_status = snapshot.get_str("status").ok().map(str::to_string);
     let generation = snapshot
         .get_i64("outbox_refresh_generation")
-        .or_else(|_| {
-            snapshot
-                .get_i32("outbox_refresh_generation")
-                .map(i64::from)
-        })
+        .or_else(|_| snapshot.get_i32("outbox_refresh_generation").map(i64::from))
         .unwrap_or_default();
     let mut cursor = match state
         .db
@@ -380,8 +906,7 @@ pub(crate) async fn refresh_run_log_outbox_status(state: &AppState, run_id: &str
     let outbox_status = match run_status.as_deref() {
         Some("outbox_enqueuing") => OutboxStatus::Pending.as_str(),
         Some("outbox_enqueue_partial_failure") => {
-            let Some(status) =
-                aggregate_run_outbox_status(statuses.iter().map(String::as_str))
+            let Some(status) = aggregate_run_outbox_status(statuses.iter().map(String::as_str))
             else {
                 return;
             };
@@ -392,8 +917,7 @@ pub(crate) async fn refresh_run_log_outbox_status(state: &AppState, run_id: &str
             }
         }
         _ => {
-            let Some(status) =
-                aggregate_run_outbox_status(statuses.iter().map(String::as_str))
+            let Some(status) = aggregate_run_outbox_status(statuses.iter().map(String::as_str))
             else {
                 return;
             };
@@ -401,8 +925,7 @@ pub(crate) async fn refresh_run_log_outbox_status(state: &AppState, run_id: &str
         }
     };
     let now = DateTime::now();
-    let write_filter =
-        run_outbox_refresh_write_filter(run_id, run_status.as_deref(), generation);
+    let write_filter = run_outbox_refresh_write_filter(run_id, run_status.as_deref(), generation);
     let res = state
         .db
         .agent_run_logs()
@@ -419,7 +942,11 @@ pub(crate) async fn refresh_run_log_outbox_status(state: &AppState, run_id: &str
         .await;
     match res {
         Ok(result) if result.matched_count == 0 => {
-            tracing::debug!(run_id, generation, "stale outbox aggregation snapshot skipped");
+            tracing::debug!(
+                run_id,
+                generation,
+                "stale outbox aggregation snapshot skipped"
+            );
         }
         Ok(_) => {}
         Err(err) => {
@@ -476,9 +1003,7 @@ fn stale_enqueue_effective_action(
         "outbox_enqueued" | "delivery_finalizing" | "sent" => {
             Some(StaleEnqueueReconcileAction::Enqueued)
         }
-        "outbox_enqueue_partial_failure" => {
-            Some(StaleEnqueueReconcileAction::PartialFailure)
-        }
+        "outbox_enqueue_partial_failure" => Some(StaleEnqueueReconcileAction::PartialFailure),
         "outbox_enqueue_failed" => Some(StaleEnqueueReconcileAction::Failed),
         _ => None,
     }
@@ -515,7 +1040,10 @@ fn stale_enqueue_review_status_compatible(
             "outbox_enqueuing" | "outbox_enqueued" | "delivery_finalizing" | "sent"
         ),
         StaleEnqueueReconcileAction::PartialFailure => {
-            matches!(status, "outbox_enqueuing" | "outbox_enqueue_partial_failure")
+            matches!(
+                status,
+                "outbox_enqueuing" | "outbox_enqueue_partial_failure"
+            )
         }
         StaleEnqueueReconcileAction::Failed => {
             matches!(status, "outbox_enqueuing" | "outbox_enqueue_failed")
@@ -575,27 +1103,48 @@ async fn finalize_delivered_text_decision(
         return;
     };
 
-    let run_log = match state
+    let review_snapshot = match state
         .db
-        .agent_run_logs()
-        .find_one(doc! { "run_id": &entry.run_id }, None)
+        .decision_reviews()
+        .find_one(doc! { "_id": decision_id }, None)
         .await
     {
-        Ok(Some(log)) => log,
+        Ok(Some(review)) => review,
         Ok(None) => return,
         Err(err) => {
-            tracing::warn!(?err, run_id = %entry.run_id, "load run log for delivery finalize failed");
+            tracing::warn!(?err, %decision_id, "load decision review for delivery finalize failed");
             return;
         }
     };
-    let decision: super::types::AgentDecision =
+    let is_expired_relay_holding = review_snapshot
+        .send_gateway_result
+        .get_str("deliveryKind")
+        .ok()
+        == Some("expired_principal_authorization_holding");
+    let decision: Option<super::types::AgentDecision> = if is_expired_relay_holding {
+        None
+    } else {
+        let run_log = match state
+            .db
+            .agent_run_logs()
+            .find_one(doc! { "run_id": &entry.run_id }, None)
+            .await
+        {
+            Ok(Some(log)) => log,
+            Ok(None) => return,
+            Err(err) => {
+                tracing::warn!(?err, run_id = %entry.run_id, "load run log for delivery finalize failed");
+                return;
+            }
+        };
         match mongodb::bson::from_document(run_log.decision.clone()) {
-            Ok(decision) => decision,
+            Ok(decision) => Some(decision),
             Err(err) => {
                 tracing::warn!(?err, run_id = %entry.run_id, "decode delivered decision failed");
                 return;
             }
-        };
+        }
+    };
     let text_filter = doc! {
         "decision_id": decision_id,
         "media_asset_id": null,
@@ -610,19 +1159,6 @@ async fn finalize_delivered_text_decision(
         Ok(count) => count,
         Err(err) => {
             tracing::warn!(?err, %decision_id, "count decision text outbox failed");
-            return;
-        }
-    };
-    let review_snapshot = match state
-        .db
-        .decision_reviews()
-        .find_one(doc! { "_id": decision_id }, None)
-        .await
-    {
-        Ok(Some(review)) => review,
-        Ok(None) => return,
-        Err(err) => {
-            tracing::warn!(?err, %decision_id, "load decision review for delivery finalize failed");
             return;
         }
     };
@@ -714,142 +1250,189 @@ async fn finalize_delivered_text_decision(
     // 发送已成事实。附属写入失败时保留 finalizing + outbox marker，由后续 tick 重试；
     // 绝不把 outbox 改回 pending，因而不会触发重复发送。
     let side_effect_result: AppResult<()> = async {
-        if let Some(value) = decision
-            .last_commitment
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            let mut commitment = crate::models::CommitmentEntry::from_plain_text(value.to_string());
-            if let Some(structured) = &decision.commitment {
-                if structured.text.trim() == value {
-                    commitment.due_at = super::types::parse_rfc3339_to_bson(&structured.due_at);
+        if let Some(decision) = decision.as_ref() {
+            if let Some(value) = decision
+                .last_commitment
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                let mut commitment =
+                    crate::models::CommitmentEntry::from_plain_text(value.to_string());
+                if let Some(structured) = &decision.commitment {
+                    if structured.text.trim() == value {
+                        commitment.due_at = super::types::parse_rfc3339_to_bson(&structured.due_at);
+                    }
                 }
-            }
-            state
-                .db
-                .contacts()
-                .update_one(
-                    doc! { "_id": contact.id, "commitments.text": { "$ne": value } },
-                    super::gateway::build_commitment_push_update(&commitment),
-                    None,
-                )
-                .await?;
-        }
-
-        if let Some(follow_up) = decision
-            .follow_up
-            .as_ref()
-            .filter(|follow_up| follow_up.needed && !follow_up.content.trim().is_empty())
-        {
-            let defaults = crate::models::RuntimeParametersTyped::default();
-            let max_pending = review
-                .runtime_parameters_snapshot
-                .get_i64("maxPendingFollowUps")
-                .unwrap_or(defaults.max_pending_follow_ups);
-            let expires_hours = review
-                .runtime_parameters_snapshot
-                .get_i64("followUpExpiresHours")
-                .unwrap_or(defaults.follow_up_expires_hours);
-            let pending_count = state
-                .db
-                .tasks()
-                .count_documents(
-                    doc! {
-                        "workspace_id": &entry.workspace_id,
-                        "account_id": &entry.account_id,
-                        "contact_wxid": &entry.contact_wxid,
-                        "kind": "follow_up",
-                        "status": "pending",
-                    },
-                    None,
-                )
-                .await?;
-            if pending_count < max_pending.max(0) as u64 {
-                let (run_at, degraded) = super::types::resolve_run_at_or_degrade(
-                    &follow_up.run_at,
-                    DateTime::now().timestamp_millis(),
-                    0,
-                );
-                let expires_at = DateTime::from_millis(
-                    run_at.timestamp_millis() + expires_hours.max(0) * 60 * 60 * 1000,
-                );
-                let now = DateTime::now();
-                let task = AgentTask {
-                    id: None,
-                    workspace_id: entry.workspace_id.clone(),
-                    account_id: entry.account_id.clone(),
-                    contact_wxid: entry.contact_wxid.clone(),
-                    kind: "follow_up".to_string(),
-                    run_at,
-                    expires_at: Some(expires_at),
-                    content: follow_up.content.clone(),
-                    status: "pending".to_string(),
-                    source_decision_id: Some(decision_id),
-                    review_required: true,
-                    attempt_count: 0,
-                    max_attempts: 3,
-                    next_retry_at: None,
-                    gateway_status: Some(if degraded {
-                        "run_at_degraded_after_delivery".to_string()
-                    } else {
-                        "scheduled_after_delivery".to_string()
-                    }),
-                    cancel_reason: None,
-                    error: None,
-                    claimed_at: None,
-                    claim_recovery_count: 0,
-                    created_at: now,
-                    updated_at: now,
-                };
-                let task_doc = mongodb::bson::to_document(&task)?;
                 state
                     .db
-                    .tasks()
+                    .contacts()
                     .update_one(
-                        doc! { "_id": decision_id },
-                        doc! { "$setOnInsert": task_doc },
-                        UpdateOptions::builder().upsert(true).build(),
+                        doc! { "_id": contact.id, "commitments.text": { "$ne": value } },
+                        super::gateway::build_commitment_push_update(&commitment),
+                        None,
                     )
                     .await?;
             }
+
+            if let Some(follow_up) = decision
+                .follow_up
+                .as_ref()
+                .filter(|follow_up| follow_up.needed && !follow_up.content.trim().is_empty())
+            {
+                let defaults = crate::models::RuntimeParametersTyped::default();
+                let max_pending = review
+                    .runtime_parameters_snapshot
+                    .get_i64("maxPendingFollowUps")
+                    .unwrap_or(defaults.max_pending_follow_ups);
+                let expires_hours = review
+                    .runtime_parameters_snapshot
+                    .get_i64("followUpExpiresHours")
+                    .unwrap_or(defaults.follow_up_expires_hours);
+                let pending_count = state
+                    .db
+                    .tasks()
+                    .count_documents(
+                        doc! {
+                            "workspace_id": &entry.workspace_id,
+                            "account_id": &entry.account_id,
+                            "contact_wxid": &entry.contact_wxid,
+                            "kind": "follow_up",
+                            "status": "pending",
+                        },
+                        None,
+                    )
+                    .await?;
+                if pending_count < max_pending.max(0) as u64 {
+                    let (run_at, degraded) = super::types::resolve_run_at_or_degrade(
+                        &follow_up.run_at,
+                        DateTime::now().timestamp_millis(),
+                        0,
+                    );
+                    let expires_at = DateTime::from_millis(
+                        run_at.timestamp_millis() + expires_hours.max(0) * 60 * 60 * 1000,
+                    );
+                    let now = DateTime::now();
+                    let task = AgentTask {
+                        id: None,
+                        workspace_id: entry.workspace_id.clone(),
+                        account_id: entry.account_id.clone(),
+                        contact_wxid: entry.contact_wxid.clone(),
+                        kind: "follow_up".to_string(),
+                        run_at,
+                        expires_at: Some(expires_at),
+                        content: follow_up.content.clone(),
+                        status: "pending".to_string(),
+                        source_decision_id: Some(decision_id),
+                        review_required: true,
+                        attempt_count: 0,
+                        max_attempts: 3,
+                        next_retry_at: None,
+                        gateway_status: Some(if degraded {
+                            "run_at_degraded_after_delivery".to_string()
+                        } else {
+                            "scheduled_after_delivery".to_string()
+                        }),
+                        cancel_reason: None,
+                        error: None,
+                        claimed_at: None,
+                        claim_recovery_count: 0,
+                        created_at: now,
+                        updated_at: now,
+                    };
+                    let task_doc = mongodb::bson::to_document(&task)?;
+                    state
+                        .db
+                        .tasks()
+                        .update_one(
+                            doc! { "_id": decision_id },
+                            doc! { "$setOnInsert": task_doc },
+                            UpdateOptions::builder().upsert(true).build(),
+                        )
+                        .await?;
+                }
+            }
         }
 
-        let relay_task = state
-            .db
-            .tasks()
-            .find_one(
-                doc! {
-                    "source_decision_id": decision_id,
-                    "kind": "principal_decision_relay",
-                },
-                None,
-            )
-            .await?;
+        let relay_task = if let Some(source_task_id) = review.source_task_id {
+            state
+                .db
+                .tasks()
+                .find_one(
+                    doc! {
+                        "_id": source_task_id,
+                        "kind": "principal_decision_relay",
+                    },
+                    None,
+                )
+                .await?
+        } else {
+            // Compatibility for reviews created before source_task_id was persisted.
+            state
+                .db
+                .tasks()
+                .find_one(
+                    doc! {
+                        "source_decision_id": decision_id,
+                        "kind": "principal_decision_relay",
+                    },
+                    None,
+                )
+                .await?
+        };
         if relay_task.is_some() {
             super::gateway::clear_awaiting_principal_state(state, contact).await?;
         }
 
         crate::models::assert_agent_task_status_valid("sent");
-        state
-            .db
-            .tasks()
-            .update_many(
-                doc! {
-                    "source_decision_id": decision_id,
-                    "status": { "$in": ["running", "outbox_enqueued"] },
-                },
-                doc! {
-                    "$set": {
-                        "status": "sent",
-                        "gateway_status": "sent",
-                        "updated_at": DateTime::now(),
+        if let (Some(task_id), Some(task_token)) = (
+            review.source_task_id,
+            review.source_task_claim_token.as_deref(),
+        ) {
+            // New protocol: finalize only the task claim that produced this decision.
+            state
+                .db
+                .tasks()
+                .update_one(
+                    doc! {
+                        "_id": task_id,
+                        "status": "outbox_enqueued",
+                        "claim_token": task_token,
+                        "outbox_decision_id": decision_id,
                     },
-                    "$unset": { "claimed_at": "" },
-                },
-                None,
-            )
-            .await?;
+                    doc! {
+                        "$set": {
+                            "status": "sent",
+                            "gateway_status": "sent",
+                            "updated_at": DateTime::now(),
+                        },
+                        "$unset": { "claimed_at": "" },
+                    },
+                    None,
+                )
+                .await?;
+        } else {
+            // Compatibility for decisions created before source_task_* existed.
+            state
+                .db
+                .tasks()
+                .update_many(
+                    doc! {
+                        "source_decision_id": decision_id,
+                        "status": { "$in": ["running", "outbox_enqueued"] },
+                    },
+                    doc! {
+                        "$set": {
+                            "status": "sent",
+                            "gateway_status": "sent",
+                            "updated_at": DateTime::now(),
+                        },
+                        "$unset": { "claimed_at": "" },
+                    },
+                    None,
+                )
+                .await?;
+        }
         Ok(())
     }
     .await;
@@ -962,6 +1545,52 @@ async fn reconcile_delivered_decision_finalizations(state: &AppState) -> AppResu
     Ok(())
 }
 
+async fn reconcile_stale_task_claim(
+    state: &AppState,
+    review_id: ObjectId,
+    workspace_id: &str,
+    run_id: &str,
+    decision_id: ObjectId,
+    reason: &str,
+    now: DateTime,
+) -> AppResult<()> {
+    super::outbox::cancel_for_decision(state, workspace_id, decision_id, "stale_task_claim")
+        .await?;
+    state
+        .db
+        .decision_reviews()
+        .update_one(
+            doc! { "_id": review_id },
+            doc! { "$set": {
+                "status": "stale_task_claim",
+                "enqueue_reconciled_at": now,
+                "task_claim_fence_reason": reason,
+            } },
+            None,
+        )
+        .await?;
+    let committed = state
+        .db
+        .agent_run_logs()
+        .update_one(
+            doc! { "run_id": run_id, "status": "outbox_enqueuing" },
+            doc! { "$set": {
+                "status": "stale_task_claim",
+                "lifecycle": super::run_envelope::LIFECYCLE_ABORTED_BY_EXTERNAL_SIGNAL,
+                "abort_reason": "stale_task_claim",
+                "outbox_status": OutboxStatus::Canceled.as_str(),
+                "updated_at": now,
+            } },
+            None,
+        )
+        .await?;
+    if committed.matched_count == 1 {
+        refresh_run_log_outbox_status(state, run_id).await;
+    }
+    tracing::warn!(%decision_id, run_id, reason, "stale task claim enqueue canceled");
+    Ok(())
+}
+
 /// 恢复 gateway 在写入 `outbox_enqueuing` run log 后崩溃的窗口。
 ///
 /// run log 是恢复标记并最后提交：review/task 先做幂等补偿，最后才以
@@ -1057,6 +1686,143 @@ async fn reconcile_stale_outbox_enqueues(state: &AppState) -> AppResult<()> {
             );
             continue;
         };
+
+        // SR-034：新协议的恢复只能投影已经由 Task CAS 提交的授权，不能从“Outbox
+        // 数量看起来完整”反推出授权。running 表示原 owner 尚未提交（或已崩溃、等待
+        // lease reclaim），此时保持 run/review 原状；token/decision 失配则撤销旧意图。
+        let task_binding = match (
+            review.source_task_id,
+            review.source_task_claim_token.as_deref(),
+        ) {
+            (None, None) => None,
+            (Some(task_id), Some(token)) if !token.trim().is_empty() => {
+                Some((task_id, token.to_string()))
+            }
+            _ => {
+                reconcile_stale_task_claim(
+                    state,
+                    decision_id,
+                    &review.workspace_id,
+                    run_id,
+                    decision_id,
+                    "incomplete source_task binding",
+                    now,
+                )
+                .await?;
+                continue;
+            }
+        };
+        if let Some((task_id, task_token)) = task_binding.as_ref() {
+            let task = state
+                .db
+                .tasks()
+                .clone_with_type::<Document>()
+                .find_one(doc! { "_id": task_id }, None)
+                .await?;
+            let Some(task) = task else {
+                reconcile_stale_task_claim(
+                    state,
+                    decision_id,
+                    &review.workspace_id,
+                    run_id,
+                    decision_id,
+                    "source task missing",
+                    now,
+                )
+                .await?;
+                continue;
+            };
+            let token_matches = task.get_str("claim_token").ok() == Some(task_token.as_str());
+            let decision_matches =
+                task.get_object_id("outbox_decision_id").ok() == Some(decision_id);
+            if !token_matches || !decision_matches {
+                reconcile_stale_task_claim(
+                    state,
+                    decision_id,
+                    &review.workspace_id,
+                    run_id,
+                    decision_id,
+                    "source task token or decision binding was replaced",
+                    now,
+                )
+                .await?;
+                continue;
+            }
+            let task_status = task.get_str("status").unwrap_or_default();
+            match (&action, task_status) {
+                (StaleEnqueueReconcileAction::Enqueued, "running") => {
+                    // Never authorize on behalf of a worker. Reclaim/new owner will eventually
+                    // replace this token, after which the stale path above cancels these rows.
+                    continue;
+                }
+                (StaleEnqueueReconcileAction::Enqueued, "outbox_enqueued" | "sent") => {
+                    state
+                        .db
+                        .collection_agent_send_outbox()
+                        .update_many(
+                            doc! { "decision_id": decision_id },
+                            doc! { "$set": {
+                                "task_send_authorization_token": task_token,
+                                "updated_at": now,
+                            } },
+                            None,
+                        )
+                        .await?;
+                }
+                (
+                    StaleEnqueueReconcileAction::PartialFailure
+                    | StaleEnqueueReconcileAction::Failed,
+                    "running" | "outbox_enqueued" | "sent",
+                ) => {
+                    crate::models::assert_agent_task_status_valid("cancelled");
+                    state
+                        .db
+                        .tasks()
+                        .update_one(
+                            doc! {
+                                "_id": task_id,
+                                "status": { "$in": ["running", "outbox_enqueued"] },
+                                "claim_token": task_token,
+                                "outbox_decision_id": decision_id,
+                            },
+                            doc! {
+                                "$set": {
+                                    "status": "cancelled",
+                                    "gateway_status": match action {
+                                        StaleEnqueueReconcileAction::PartialFailure => "outbox_enqueue_partial_failure",
+                                        _ => "outbox_enqueue_failed",
+                                    },
+                                    "cancel_reason": "outbox enqueue interrupted and reconciled",
+                                    "updated_at": now,
+                                },
+                                "$unset": { "claimed_at": "", "claim_token": "" },
+                            },
+                            None,
+                        )
+                        .await?;
+                    super::outbox::cancel_for_decision(
+                        state,
+                        &review.workspace_id,
+                        decision_id,
+                        "outbox_enqueue_interrupted",
+                    )
+                    .await?;
+                }
+                _ => {
+                    reconcile_stale_task_claim(
+                        state,
+                        decision_id,
+                        &review.workspace_id,
+                        run_id,
+                        decision_id,
+                        &format!("source task status is not recoverable: {task_status}"),
+                        now,
+                    )
+                    .await?;
+                    continue;
+                }
+            }
+        }
         let review_status = match action {
             StaleEnqueueReconcileAction::Enqueued => "outbox_enqueued",
             StaleEnqueueReconcileAction::PartialFailure => "outbox_enqueue_partial_failure",
@@ -1084,9 +1850,7 @@ async fn reconcile_stale_outbox_enqueues(state: &AppState) -> AppResult<()> {
                     .decision_reviews()
                     .find_one(doc! { "_id": decision_id }, None)
                     .await?
-                    .map(|current| {
-                        stale_enqueue_review_status_compatible(&action, &current.status)
-                    })
+                    .map(|current| stale_enqueue_review_status_compatible(&action, &current.status))
                     .unwrap_or(false)
             }
         } else {
@@ -1102,30 +1866,33 @@ async fn reconcile_stale_outbox_enqueues(state: &AppState) -> AppResult<()> {
             continue;
         }
 
-        match action {
-            StaleEnqueueReconcileAction::Enqueued => {
-                crate::models::assert_agent_task_status_valid("outbox_enqueued");
-                state
-                    .db
-                    .tasks()
-                    .update_many(
-                        doc! {
-                            "source_decision_id": decision_id,
-                            "status": { "$in": ["pending", "retry", "running"] },
-                        },
-                        doc! { "$set": {
-                            "status": "outbox_enqueued",
-                            "gateway_status": "outbox_enqueued",
-                            "updated_at": now,
-                        } },
-                        None,
-                    )
-                    .await?;
-            }
-            StaleEnqueueReconcileAction::PartialFailure
-            | StaleEnqueueReconcileAction::Failed => {
-                crate::models::assert_agent_task_status_valid("cancelled");
-                state
+        // Legacy records did not persist source_task_*; retain their old best-effort repair.
+        // New-protocol tasks were already handled with exact id/token/decision filters above.
+        if task_binding.is_none() {
+            match action {
+                StaleEnqueueReconcileAction::Enqueued => {
+                    crate::models::assert_agent_task_status_valid("outbox_enqueued");
+                    state
+                        .db
+                        .tasks()
+                        .update_many(
+                            doc! {
+                                "source_decision_id": decision_id,
+                                "status": { "$in": ["pending", "retry", "running"] },
+                            },
+                            doc! { "$set": {
+                                "status": "outbox_enqueued",
+                                "gateway_status": "outbox_enqueued",
+                                "updated_at": now,
+                            } },
+                            None,
+                        )
+                        .await?;
+                }
+                StaleEnqueueReconcileAction::PartialFailure
+                | StaleEnqueueReconcileAction::Failed => {
+                    crate::models::assert_agent_task_status_valid("cancelled");
+                    state
                     .db
                     .tasks()
                     .update_many(
@@ -1142,6 +1909,7 @@ async fn reconcile_stale_outbox_enqueues(state: &AppState) -> AppResult<()> {
                         None,
                     )
                     .await?;
+                }
             }
         }
         // run 是恢复事务的提交标记，必须最后 CAS。此前任一步失败/崩溃都会保留
@@ -1182,12 +1950,15 @@ pub async fn cancel_entry(
 ) -> AppResult<()> {
     let collection = state.db.collection_agent_send_outbox();
     let now = DateTime::now();
-    collection
+    let Some(mut filter) = active_claim_filter(entry_id, entry) else {
+        return Ok(());
+    };
+    // Safety-gate cancellation is only truthful before the irreversible remote-call boundary.
+    // A stale caller must not overwrite an already-started delivery with `canceled`.
+    filter.extend(send_not_started_filter());
+    let result = collection
         .update_one(
-            doc! {
-                "_id": entry_id,
-                "status": OutboxStatus::InFlight.as_str(),
-            },
+            filter,
             doc! {
                 "$set": {
                     "status": OutboxStatus::Canceled.as_str(),
@@ -1197,11 +1968,15 @@ pub async fn cancel_entry(
                 "$unset": {
                     "worker_id": "",
                     "locked_until": "",
+                    "claim_token": "",
                 }
             },
             None,
         )
         .await?;
+    if result.matched_count == 0 {
+        return Ok(());
+    }
     let _ = write_event_with_cap(
         state,
         entry_id,
@@ -1243,21 +2018,27 @@ pub async fn schedule_retry_or_terminal(
     entry: &OutboxEntry,
     error_message: &str,
 ) -> AppResult<()> {
+    if settle_late_cancel_as_delivery_unknown(state, entry_id, entry).await? {
+        return Ok(());
+    }
     let collection = state.db.collection_agent_send_outbox();
     let now = DateTime::now();
     let next_attempt = entry.attempt.saturating_add(1);
     let max_attempts = effective_max_attempts(entry.max_attempts);
+    let Some(mut filter) = active_claim_filter(entry_id, entry) else {
+        return Ok(());
+    };
+    // Cancellation wins over retry/terminal settlement. Without this predicate a cancellation
+    // can land after the pre-check above and immediately be converted back to pending.
+    filter.insert("cancel_requested", doc! { "$ne": true });
 
     if next_attempt < max_attempts {
         let jitter01 = fastrand::f64();
         let backoff_seconds = backoff_with_jitter_seeded(next_attempt, jitter01);
         let next_retry = DateTime::from_millis(now.timestamp_millis() + backoff_seconds * 1000);
-        collection
+        let result = collection
             .update_one(
-                doc! {
-                    "_id": entry_id,
-                    "status": OutboxStatus::InFlight.as_str(),
-                },
+                filter,
                 doc! {
                     "$set": {
                         "status": OutboxStatus::Pending.as_str(),
@@ -1269,11 +2050,18 @@ pub async fn schedule_retry_or_terminal(
                     "$unset": {
                         "worker_id": "",
                         "locked_until": "",
+                        "claim_token": "",
+                        "send_started_at": "",
                     }
                 },
                 None,
             )
             .await?;
+        if result.matched_count == 0 {
+            let _ = complete_requested_cancel_before_send(state, entry_id, entry).await?;
+            let _ = settle_late_cancel_as_delivery_unknown(state, entry_id, entry).await?;
+            return Ok(());
+        }
         let _ = write_event_with_cap(
             state,
             entry_id,
@@ -1294,12 +2082,9 @@ pub async fn schedule_retry_or_terminal(
         .await;
         refresh_run_log_outbox_status(state, &entry.run_id).await;
     } else {
-        collection
+        let result = collection
             .update_one(
-                doc! {
-                    "_id": entry_id,
-                    "status": OutboxStatus::InFlight.as_str(),
-                },
+                filter,
                 doc! {
                     "$set": {
                         "status": OutboxStatus::FailedTerminal.as_str(),
@@ -1310,11 +2095,18 @@ pub async fn schedule_retry_or_terminal(
                     "$unset": {
                         "worker_id": "",
                         "locked_until": "",
+                        "claim_token": "",
+                        "send_started_at": "",
                     }
                 },
                 None,
             )
             .await?;
+        if result.matched_count == 0 {
+            let _ = complete_requested_cancel_before_send(state, entry_id, entry).await?;
+            let _ = settle_late_cancel_as_delivery_unknown(state, entry_id, entry).await?;
+            return Ok(());
+        }
         let _ = write_event_with_cap(
             state,
             entry_id,
@@ -1351,12 +2143,13 @@ pub async fn defer_account_offline(
     let now = DateTime::now();
     let next_retry =
         DateTime::from_millis(now.timestamp_millis() + ACCOUNT_OFFLINE_DEFER_SECONDS * 1000);
-    collection
+    let Some(mut filter) = active_claim_filter(entry_id, entry) else {
+        return Ok(());
+    };
+    filter.insert("cancel_requested", doc! { "$ne": true });
+    let result = collection
         .update_one(
-            doc! {
-                "_id": entry_id,
-                "status": OutboxStatus::InFlight.as_str(),
-            },
+            filter,
             doc! {
                 "$set": {
                     // attempt 刻意不变——掉线非发送失败，不耗重试额度、不走 terminal。
@@ -1367,11 +2160,17 @@ pub async fn defer_account_offline(
                 "$unset": {
                     "worker_id": "",
                     "locked_until": "",
+                    "claim_token": "",
+                    "send_started_at": "",
                 }
             },
             None,
         )
         .await?;
+    if result.matched_count == 0 {
+        let _ = complete_requested_cancel_before_send(state, entry_id, entry).await?;
+        return Ok(());
+    }
     let _ = write_event_with_cap(
         state,
         entry_id,
@@ -1420,12 +2219,13 @@ async fn defer_account_pacing(
     let collection = state.db.collection_agent_send_outbox();
     let now = DateTime::now();
     let next_retry = DateTime::from_millis(next_send_at_ms);
-    collection
+    let Some(mut filter) = active_claim_filter(entry_id, entry) else {
+        return Ok(());
+    };
+    filter.insert("cancel_requested", doc! { "$ne": true });
+    let result = collection
         .update_one(
-            doc! {
-                "_id": entry_id,
-                "status": OutboxStatus::InFlight.as_str(),
-            },
+            filter,
             doc! {
                 "$set": {
                     // attempt 刻意不变——间隔闸非发送失败，不耗重试额度、不走 terminal。
@@ -1436,11 +2236,17 @@ async fn defer_account_pacing(
                 "$unset": {
                     "worker_id": "",
                     "locked_until": "",
+                    "claim_token": "",
+                    "send_started_at": "",
                 }
             },
             None,
         )
         .await?;
+    if result.matched_count == 0 {
+        let _ = complete_requested_cancel_before_send(state, entry_id, entry).await?;
+        return Ok(());
+    }
     let _ = write_event_with_cap(
         state,
         entry_id,
@@ -1503,25 +2309,27 @@ async fn mcp_already_succeeded(
     Ok(count > 0)
 }
 
-/// post-hoc 防重发核对：判断这条 outbox entry 的内容是否**其实已经发出去过**
-/// （MCP 已送达微信但本地状态未落 sent）。命中（`Ok(true)`）即调用方应标 sent 不重发。
+/// post-hoc 防重发核对。缺少成功证据不等于确认未送达：只有权威查询明确未命中，
+/// 或发送前置条件能证明客户投递尚未发生，才返回 `NotDelivered`。
 ///
 /// 供 `process_entry` 的两个窗口复用——崩溃恢复（reclaim）与发送 timeout——
 /// 消除历史上两分支 text 路的不对称（F-01）：
-/// - `referral_card` 条目：名片无 media_id、tool 不同，text/media 版核对都不适用；
-///   reclaim/timeout 是边缘场景且重复推名片危害小（客户最多多收一张名片），
-///   故保守取 `Ok(false)`（视为未发过、放行重发）。
+/// - `referral_card` 条目：没有权威查询 API，恒为 `Inconclusive`；
 /// - `media_asset` 条目：content 为空、tool 为 message_send_*，text 版核对查不到
 ///   → 改用 media_id 定位该素材的成功发送记录。
 /// - 纯文本条目：**先查权威 `chat_search_outbound`**（MCP server 真实已发记录，
 ///   同步落库、不受本地 timeout 取消 mcp_call_logs 写入的影响），带
 ///   `CHAT_SEARCH_VERIFY_TIMEOUT_SECONDS` 独立短超时；chat_search 出错 / 超时才
 ///   回落本地 `mcp_already_succeeded`（不因权威通道抖动而倒退成"必重发"）。
-async fn verify_already_sent(state: &AppState, entry: &OutboxEntry) -> AppResult<bool> {
+async fn verify_delivery(
+    state: &AppState,
+    entry: &OutboxEntry,
+) -> AppResult<super::types::DeliveryVerification> {
+    use super::types::DeliveryVerification;
     if entry.referral_card_id.is_some() {
-        Ok(false)
+        Ok(DeliveryVerification::Inconclusive)
     } else if let Some(asset_id) = entry.media_asset_id.as_deref() {
-        super::media_send::media_already_succeeded(
+        super::media_send::media_delivery_verification(
             state,
             &entry.account_id,
             &entry.contact_wxid,
@@ -1542,20 +2350,105 @@ async fn verify_already_sent(state: &AppState, entry: &OutboxEntry) -> AppResult
         )
         .await
         {
-            Ok(Ok(hit)) => Ok(hit),
-            // chat_search 出错 / 超时 → 回落本地 mcp_call_logs 核对（不倒退成"必重发"）。
+            Ok(Ok(true)) => Ok(DeliveryVerification::Delivered),
+            // chat_search 是权威远端记录；明确空结果才可证明未送达。
+            Ok(Ok(false)) => Ok(DeliveryVerification::NotDelivered),
+            // 权威通道出错 / 超时 → 本地日志只能证明成功，不能以“无日志”证明失败。
             Ok(Err(_)) | Err(_) => {
-                mcp_already_succeeded(
+                let hit = mcp_already_succeeded(
                     state,
                     &entry.account_id,
                     &entry.contact_wxid,
                     &entry.content,
                     entry.created_at,
                 )
-                .await
+                .await?;
+                Ok(if hit {
+                    DeliveryVerification::Delivered
+                } else {
+                    DeliveryVerification::Inconclusive
+                })
             }
         }
     }
+}
+
+/// 将事后核验命中的既成送达事实收敛为 `sent`，并执行与正常成功相同的审计、
+/// decision finalize 和素材/名片台账副作用。返回 false 表示 claim 已不属于本 worker。
+async fn commit_verified_delivery(
+    state: &AppState,
+    entry_id: ObjectId,
+    entry: &OutboxEntry,
+    contact: &crate::models::Contact,
+    note: &str,
+    reason: &str,
+) -> AppResult<bool> {
+    if !commit_sent_if_owned(state, entry_id, entry, Some(note)).await? {
+        return Ok(false);
+    }
+    let delivered_at = DateTime::now();
+    let _ = write_event_with_cap(
+        state,
+        entry_id,
+        &entry.account_id,
+        Some(&entry.contact_wxid),
+        "outbox_sent_post_hoc",
+        "warn",
+        note,
+        Some(doc! {
+            "outbox_id": entry_id,
+            "run_id": &entry.run_id,
+            "attempt": entry.attempt + 1,
+            "reason": reason,
+        }),
+    )
+    .await;
+    refresh_run_log_outbox_status(state, &entry.run_id).await;
+    finalize_delivered_text_decision(state, entry, contact).await;
+    super::send_ledger::record_send_for_entry(state, entry, contact, delivered_at).await;
+    Ok(true)
+}
+
+async fn settle_ambiguous_send(
+    state: &AppState,
+    entry_id: ObjectId,
+    entry: &OutboxEntry,
+    contact: &crate::models::Contact,
+    failure_reason: &str,
+) -> AppResult<()> {
+    use super::types::DeliveryVerification;
+    match verify_delivery(state, entry).await {
+        Ok(DeliveryVerification::Delivered) => {
+            let note = format!(
+                "{failure_reason}; delivery confirmed post-hoc via authoritative/local evidence"
+            );
+            if !commit_verified_delivery(state, entry_id, entry, contact, &note, "ambiguous_send")
+                .await?
+            {
+                tracing::warn!(
+                    outbox_id = %entry_id,
+                    claim_generation = entry.claim_generation,
+                    "post-hoc delivery confirmed but worker no longer owns claim"
+                );
+            }
+        }
+        Ok(DeliveryVerification::NotDelivered) => {
+            schedule_retry_or_terminal(state, entry_id, entry, failure_reason).await?;
+        }
+        Ok(DeliveryVerification::Inconclusive) => {
+            let reason = format!(
+                "{failure_reason}; delivery verification inconclusive; automatic replay disabled"
+            );
+            let _ = mark_delivery_unknown_if_owned(state, entry_id, entry, &reason).await?;
+        }
+        Err(err) => {
+            let reason = format!(
+                "{failure_reason}; delivery verification failed: {err}; automatic replay disabled"
+            );
+            let _ = mark_delivery_unknown_if_owned(state, entry_id, entry, &reason).await?;
+        }
+    }
+    Ok(())
 }
 
 /// P1-6：发送前 contact 状态门——纯函数，便于单测。
@@ -1590,6 +2483,15 @@ pub async fn process_entry(state: &AppState, entry: &OutboxEntry) -> AppResult<(
             return Ok(());
         }
     };
+
+    // SR-034 第一检查点：正常 Gateway 可能刚写入首段、尚未提交 task 授权；此时无损
+    // defer。若 token/decision 已被新 owner 替换，则在任何业务查询和 MCP 前取消。
+    if enforce_task_send_authorization(state, entry_id, entry)
+        .await?
+        .is_none()
+    {
+        return Ok(());
+    }
 
     if let Some(reason) = second_safety_gate(state, entry).await? {
         cancel_entry(state, entry_id, entry, &reason).await?;
@@ -1647,62 +2549,50 @@ pub async fn process_entry(state: &AppState, entry: &OutboxEntry) -> AppResult<(
         return Ok(());
     }
 
-    let collection = state.db.collection_agent_send_outbox();
-    let now = DateTime::now();
-
-    // 崩溃恢复幂等门：本条曾被 reclaim（上一个 worker 抢占后在写 sent 前消失），
-    // 它可能已把消息送达 MCP/微信。重发前先跑 `verify_already_sent` post-hoc 核对
-    // （文本先查权威 chat_search、回落本地 mcp_call_logs）；命中即标 sent 不重发。
-    // 与 timeout 分支复用同一 `verify_already_sent`。
+    // 崩溃恢复幂等门：本条曾被 reclaim（上一个 worker 抢占后在写 sent 前消失）。
+    // 只有权威核验明确未送达才继续本次发送；已送达则收敛为 sent，无法确认则进入
+    // delivery_unknown，绝不把“没有本地成功日志”当作“确认未送达”。
     if entry.reclaimed_in_flight {
-        let already = verify_already_sent(state, entry).await;
-        if let Ok(true) = already {
-            collection
-                .update_one(
-                    doc! {
-                        "_id": entry_id,
-                        "status": OutboxStatus::InFlight.as_str(),
-                    },
-                    doc! {
-                        "$set": {
-                            "status": OutboxStatus::Sent.as_str(),
-                            "sent_at": now,
-                            "updated_at": now,
-                            "delivery_finalize_pending": entry.decision_id.is_some()
-                                && entry.media_asset_id.is_none()
-                                && entry.referral_card_id.is_none(),
-                            "last_error": "reclaimed after crash but MCP already succeeded — confirmed via mcp_call_logs",
-                        },
-                        "$unset": {
-                            "worker_id": "",
-                            "locked_until": "",
-                            "reclaimed_in_flight": "",
-                        }
-                    },
-                    None,
+        use super::types::DeliveryVerification;
+        match verify_delivery(state, entry).await {
+            Ok(DeliveryVerification::Delivered) => {
+                let note = "reclaimed after crash but delivery was confirmed post-hoc";
+                if !commit_verified_delivery(
+                    state,
+                    entry_id,
+                    entry,
+                    &contact,
+                    note,
+                    "crash_reclaim",
+                )
+                .await?
+                {
+                    tracing::warn!(
+                        outbox_id = %entry_id,
+                        claim_generation = entry.claim_generation,
+                        "reclaim verification confirmed delivery but worker no longer owns claim"
+                    );
+                }
+                return Ok(());
+            }
+            Ok(DeliveryVerification::NotDelivered) => {}
+            Ok(DeliveryVerification::Inconclusive) => {
+                let _ = mark_delivery_unknown_if_owned(
+                    state,
+                    entry_id,
+                    entry,
+                    "worker was reclaimed after the remote boundary and delivery cannot be verified; automatic replay disabled",
                 )
                 .await?;
-            let _ = write_event_with_cap(
-                state,
-                entry_id,
-                &entry.account_id,
-                Some(&entry.contact_wxid),
-                "outbox_sent_post_hoc",
-                "warn",
-                "outbox entry confirmed sent post-hoc via mcp_call_logs after crash reclaim",
-                Some(doc! {
-                    "outbox_id": entry_id,
-                    "run_id": &entry.run_id,
-                    "attempt": entry.attempt + 1,
-                    "reason": "crash_reclaim",
-                }),
-            )
-            .await;
-            refresh_run_log_outbox_status(state, &entry.run_id).await;
-            finalize_delivered_text_decision(state, entry, &contact).await;
-            // 主动发送台账：post-hoc 确认送达同样记一条（素材/名片才记）。
-            super::send_ledger::record_send_for_entry(state, entry, &contact, now).await;
-            return Ok(());
+                return Ok(());
+            }
+            Err(err) => {
+                let reason = format!(
+                    "worker was reclaimed and delivery verification failed: {err}; automatic replay disabled"
+                );
+                let _ = mark_delivery_unknown_if_owned(state, entry_id, entry, &reason).await?;
+                return Ok(());
+            }
         }
     }
 
@@ -1729,6 +2619,21 @@ pub async fn process_entry(state: &AppState, entry: &OutboxEntry) -> AppResult<(
         "attempt": entry.attempt + 1,
     });
 
+    // SR-034 第二检查点：覆盖第一检查后到远端边界前发生的 task 状态变化。已提交的
+    // outbox_enqueued 授权对 task worker/reclaimer 是稳定终态；失权/取消则在这里停下。
+    let Some(task_authorization_token) =
+        enforce_task_send_authorization(state, entry_id, entry).await?
+    else {
+        return Ok(());
+    };
+
+    // Last cancellable point. The CAS fails when an admin/user cancellation request won, the
+    // lease was reclaimed, or another owner replaced this claim. In every case this worker must
+    // stop before invoking MCP.
+    if !begin_remote_send(state, entry_id, entry, task_authorization_token.as_deref()).await? {
+        return Ok(());
+    }
+
     let send_fut = async {
         if let Some(card_id) = entry.referral_card_id.as_deref() {
             super::referral::send_outbound_namecard(state, &contact, card_id).await
@@ -1743,30 +2648,15 @@ pub async fn process_entry(state: &AppState, entry: &OutboxEntry) -> AppResult<(
 
     match send_result {
         Ok(Ok(_)) => {
-            collection
-                .update_one(
-                    doc! {
-                        "_id": entry_id,
-                        "status": OutboxStatus::InFlight.as_str(),
-                    },
-                    doc! {
-                        "$set": {
-                            "status": OutboxStatus::Sent.as_str(),
-                            "sent_at": now,
-                            "updated_at": now,
-                            "delivery_finalize_pending": entry.decision_id.is_some()
-                                && entry.media_asset_id.is_none()
-                                && entry.referral_card_id.is_none(),
-                        },
-                        "$unset": {
-                            "worker_id": "",
-                            "locked_until": "",
-                            "reclaimed_in_flight": "",
-                        }
-                    },
-                    None,
-                )
-                .await?;
+            if !commit_sent_if_owned(state, entry_id, entry, None).await? {
+                tracing::warn!(
+                    outbox_id = %entry_id,
+                    claim_generation = entry.claim_generation,
+                    "MCP reported delivery but this worker no longer owns the claim; suppressing duplicate side effects"
+                );
+                return Ok(());
+            }
+            let delivered_at = DateTime::now();
             let _ = write_event_with_cap(
                 state,
                 entry_id,
@@ -1786,66 +2676,23 @@ pub async fn process_entry(state: &AppState, entry: &OutboxEntry) -> AppResult<(
             finalize_delivered_text_decision(state, entry, &contact).await;
 
             // 主动发送台账：素材/名片条目记一条（纯文本不记）。fail-soft，不影响已成发送。
-            super::send_ledger::record_send_for_entry(state, entry, &contact, now).await;
+            super::send_ledger::record_send_for_entry(state, entry, &contact, delivered_at).await;
         }
-        Ok(Err(err)) => {
-            schedule_retry_or_terminal(state, entry_id, entry, &format!("send failed: {err}"))
-                .await?;
+        Ok(Err(super::types::OutboundSendError::SafeToRetry(reason))) => {
+            schedule_retry_or_terminal(state, entry_id, entry, &reason).await?;
+        }
+        Ok(Err(super::types::OutboundSendError::DeliveryUncertain(reason))) => {
+            settle_ambiguous_send(state, entry_id, entry, &contact, &reason).await?;
         }
         Err(_) => {
-            // post-hoc 核对：MCP 调用本身在 timeout 之前可能已经成功把消息送达
-            // 微信协议（response 慢于 30s 的极端情况），此时 mcp_call_logs 已写入
-            // tool_name + recipient + 定位字段（text=content / media=mediaId）且
-            // error=null。命中即视为已送达，不再重发，避免给客户重复消息/重复文件。
-            let already = verify_already_sent(state, entry).await;
-            if let Ok(true) = already {
-                collection
-                    .update_one(
-                        doc! {
-                            "_id": entry_id,
-                            "status": OutboxStatus::InFlight.as_str(),
-                        },
-                        doc! {
-                            "$set": {
-                                "status": OutboxStatus::Sent.as_str(),
-                                "sent_at": now,
-                                "updated_at": now,
-                                "delivery_finalize_pending": entry.decision_id.is_some()
-                                    && entry.media_asset_id.is_none()
-                                    && entry.referral_card_id.is_none(),
-                                "last_error": "send timeout (150s) but MCP already succeeded — confirmed via chat_search/mcp_call_logs",
-                            },
-                            "$unset": {
-                                "worker_id": "",
-                                "locked_until": "",
-                                "reclaimed_in_flight": "",
-                            }
-                        },
-                        None,
-                    )
-                    .await?;
-                let _ = write_event_with_cap(
-                    state,
-                    entry_id,
-                    &entry.account_id,
-                    Some(&entry.contact_wxid),
-                    "outbox_sent_post_hoc",
-                    "warn",
-                    "outbox entry confirmed sent post-hoc via chat_search/mcp_call_logs after timeout",
-                    Some(doc! {
-                        "outbox_id": entry_id,
-                        "run_id": &entry.run_id,
-                        "attempt": entry.attempt + 1,
-                    }),
-                )
-                .await;
-                refresh_run_log_outbox_status(state, &entry.run_id).await;
-                finalize_delivered_text_decision(state, entry, &contact).await;
-                // 主动发送台账：超时 post-hoc 确认送达同样记一条（素材/名片才记）。
-                super::send_ledger::record_send_for_entry(state, entry, &contact, now).await;
-            } else {
-                schedule_retry_or_terminal(state, entry_id, entry, "send timeout (150s)").await?;
-            }
+            settle_ambiguous_send(
+                state,
+                entry_id,
+                entry,
+                &contact,
+                "send timed out after the remote boundary",
+            )
+            .await?;
         }
     }
     Ok(())
@@ -2010,6 +2857,99 @@ async fn tick(state: &AppState, worker: &str, lease_seconds: i32) -> AppResult<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn task_send_authorization_requires_same_claim_decision_and_marker() {
+        assert_eq!(
+            classify_task_send_authorization(
+                "running",
+                "task-token",
+                Some("task-token"),
+                true,
+                Some("task-token")
+            ),
+            TaskSendAuthorization::Building,
+            "prepared marker alone must not authorize a still-running task"
+        );
+        assert_eq!(
+            classify_task_send_authorization(
+                "outbox_enqueued",
+                "task-token",
+                Some("task-token"),
+                true,
+                None
+            ),
+            TaskSendAuthorization::Building,
+            "committed task without its single-document marker must defer"
+        );
+        assert_eq!(
+            classify_task_send_authorization(
+                "outbox_enqueued",
+                "task-token",
+                Some("task-token"),
+                true,
+                Some("task-token")
+            ),
+            TaskSendAuthorization::Authorized(Some("task-token".to_string()))
+        );
+        for stale in [
+            classify_task_send_authorization(
+                "outbox_enqueued",
+                "task-token",
+                Some("new-owner-token"),
+                true,
+                Some("task-token"),
+            ),
+            classify_task_send_authorization(
+                "outbox_enqueued",
+                "task-token",
+                Some("task-token"),
+                false,
+                Some("task-token"),
+            ),
+            classify_task_send_authorization(
+                "outbox_enqueued",
+                "task-token",
+                Some("task-token"),
+                true,
+                Some("other-marker"),
+            ),
+            classify_task_send_authorization(
+                "cancelled",
+                "task-token",
+                Some("task-token"),
+                true,
+                Some("task-token"),
+            ),
+        ] {
+            assert!(matches!(stale, TaskSendAuthorization::Stale(_)));
+        }
+    }
+
+    #[test]
+    fn remote_send_boundary_filter_contains_every_fence() {
+        let entry_id = ObjectId::parse_str("64b64c000000000000000034").unwrap();
+        assert_eq!(
+            remote_send_start_filter(
+                entry_id,
+                "outbox-worker",
+                "outbox-claim",
+                Some("task-token")
+            ),
+            doc! {
+                "_id": entry_id,
+                "status": "in_flight",
+                "worker_id": "outbox-worker",
+                "claim_token": "outbox-claim",
+                "cancel_requested": { "$ne": true },
+                "task_send_authorization_token": "task-token",
+                "$or": [
+                    { "send_started_at": { "$exists": false } },
+                    { "send_started_at": null },
+                ],
+            }
+        );
+    }
 
     #[test]
     fn run_status_aggregation_is_order_independent() {

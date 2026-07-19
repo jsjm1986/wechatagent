@@ -1,16 +1,16 @@
 //! objective-purchase-facts G2：`products` 多租户隔离集成测试（spec §3.5）。
 //!
-//! 产品 CRUD handler 是 `pub(super)`，核心隔离逻辑就是"每个 Mongo filter 含
-//! `workspace_id = current_workspace`"。本测试在 `products` collection 直接写两条
-//! 不同租户的产品，断言：
+//! 本文件只验证 `products` collection 的 workspace 过滤形状与复合唯一索引；它不
+//! 调用 Product Router/Handler，因此不能单独证明生产端点不存在 IDOR。真实 Cookie、
+//! middleware、Router、跨租户写后不变与本租户正向路径由
+//! `sr176_real_route_isolation.rs` 覆盖。本文件直接写两条不同租户的产品，断言：
 //!   - workspace_a 视角只看到自己的产品；
 //!   - 跨 workspace 同名 product_id 合法且互不可见（复合 unique 是 workspace 内唯一）；
 //!   - 未知 workspace 读不到任何产品。
 //!
 //! 默认 `#[ignore]`，需 Docker（testcontainers MongoDB）。
 //!
-//! 与 `workspace_isolation.rs` 同形态——走 collection filter shape 而非 handler，
-//! 因为 handler 是 thin wrapper，隔离不变量全在"filter 必带 workspace_id"这一条。
+//! 这些断言是局部数据库约束，不得在审计中外推为 Handler 回归证据。
 
 mod common;
 

@@ -95,10 +95,7 @@ async fn apply_chunk_revision_ai_source_forces_draft_needs_review() {
         .state
         .db
         .operation_knowledge_chunks()
-        .find_one(
-            doc! { "_id": chunk_oid, "workspace_id": &ws },
-            None,
-        )
+        .find_one(doc! { "_id": chunk_oid, "workspace_id": &ws }, None)
         .await
         .expect("查 chunk")
         .expect("chunk 应存在");
@@ -287,7 +284,10 @@ async fn concurrent_chunk_patches_conflict_without_lost_update_or_orphan_revisio
         let (summary, result) = handle.await.expect("contender task should not panic");
         match result {
             Ok(applied) => {
-                assert!(!applied.unchanged, "each unique summary must change the chunk");
+                assert!(
+                    !applied.unchanged,
+                    "each unique summary must change the chunk"
+                );
                 successful_summaries.insert(summary);
             }
             Err(AppError::Conflict(code)) => {
@@ -298,8 +298,14 @@ async fn concurrent_chunk_patches_conflict_without_lost_update_or_orphan_revisio
         }
     }
 
-    assert!(!successful_summaries.is_empty(), "at least one patch must succeed");
-    assert!(conflicts > 0, "simultaneous contenders must expose stale-write conflicts");
+    assert!(
+        !successful_summaries.is_empty(),
+        "at least one patch must succeed"
+    );
+    assert!(
+        conflicts > 0,
+        "simultaneous contenders must expose stale-write conflicts"
+    );
 
     let stored = app
         .state

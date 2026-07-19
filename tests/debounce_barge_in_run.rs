@@ -273,9 +273,8 @@ async fn no_barge_in_completes_normally_and_enqueues_outbox() {
         "我们一般 2~4 周可上线，预算和场景深度相关，要不要先按你们的优先级排排序？",
         "客户主动询问实施周期与预算，回复能确认需求颗粒度并降低决策摩擦，是关键推进时机。",
     ));
-    app.llm.push_response(review_agent_pass_json(
-        "回复语气良好、不越界承诺，可放行。",
-    ));
+    app.llm
+        .push_response(review_agent_pass_json("回复语气良好、不越界承诺，可放行。"));
 
     // guard 恒 false：去抖窗口已结束、无更新入站，正常发送。
     let called = Arc::new(AtomicBool::new(false));

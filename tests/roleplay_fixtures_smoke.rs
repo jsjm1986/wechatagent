@@ -31,7 +31,10 @@ async fn p0_seed_active_profile_round_trips() {
     assert_eq!(profile.profile_id, "emotional_companion_minimal");
     assert!(profile.is_active);
     assert!(
-        profile.conversation_modes.iter().any(|m| m == "intimate_companion"),
+        profile
+            .conversation_modes
+            .iter()
+            .any(|m| m == "intimate_companion"),
         "conversation_modes 应含 intimate_companion，实际：{:?}",
         profile.conversation_modes
     );

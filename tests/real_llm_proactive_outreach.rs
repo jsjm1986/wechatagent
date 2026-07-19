@@ -38,6 +38,7 @@ use wechatagent::webhooks::ensure_wake_followup_task;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+use crate::common::capability_evidence::CapabilityEvidence;
 use crate::common::judge::{build_judge_rubric, run_judge_graded, JudgeGate};
 use crate::common::TestApp;
 
@@ -66,8 +67,7 @@ fn judge_client() -> Option<Arc<LlmClient>> {
         .filter(|k| !k.trim().is_empty())?;
     let base_url = std::env::var("REAL_LLM_JUDGE_BASE_URL")
         .unwrap_or_else(|_| "https://rsxermu666.cn/v1".to_string());
-    let model =
-        std::env::var("REAL_LLM_JUDGE_MODEL").unwrap_or_else(|_| "gpt-5.4".to_string());
+    let model = std::env::var("REAL_LLM_JUDGE_MODEL").unwrap_or_else(|_| "gpt-5.4".to_string());
     let fmt = match std::env::var("REAL_LLM_JUDGE_FORMAT").ok().as_deref() {
         Some("anthropic") | Some("messages") | Some("claude") => LlmFormat::Anthropic,
         _ => LlmFormat::Openai,
@@ -79,7 +79,7 @@ fn judge_client() -> Option<Arc<LlmClient>> {
 
 /// 端点抖动 → skip（R0.2 写 ledger）；4xx 配错 → panic（R0.3）；其它 Err → panic。
 macro_rules! unwrap_or_skip_transient {
-    ($result:expr, $what:expr) => {{
+    ($evidence:expr, $result:expr, $what:expr) => {{
         match $result {
             Ok(value) => value,
             Err(wechatagent::error::AppError::LlmUnavailable { kind, retry_count, detail, .. }) => {
@@ -97,6 +97,10 @@ macro_rules! unwrap_or_skip_transient {
                     "skip: {} —— 真模型上游瞬时不可达（kind={kind}, retry_count={retry_count}），按抖动跳过不算能力失败",
                     $what
                 );
+                $evidence.infra_skip(format!(
+                    "{}: transient LLM failure kind={kind}, retries={retry_count}",
+                    $what
+                ));
                 {
                     use std::io::Write as _;
                     let dir = std::env::var("REAL_LLM_LEDGER")
@@ -124,7 +128,9 @@ struct UniqueMsgIdResponder {
 }
 impl wiremock::Respond for UniqueMsgIdResponder {
     fn respond(&self, _req: &wiremock::Request) -> ResponseTemplate {
-        let seq = self.counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let seq = self
+            .counter
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "jsonrpc": "2.0", "id": 1,
             "result": { "structuredContent": { "newMsgId": format!("proactive_{seq}"), "content": [] } }
@@ -239,8 +245,12 @@ async fn assert_outreach_reply(
     wxid: &str,
     inbound_ctx: &str,
     label: &str,
-) {
-    let latest = || FindOneOptions::builder().sort(doc! { "created_at": -1 }).build();
+) -> (usize, usize) {
+    let latest = || {
+        FindOneOptions::builder()
+            .sort(doc! { "created_at": -1 })
+            .build()
+    };
     // gateway 必须落一行 run log，且 status ∈ 闭集。
     let log = app
         .state
@@ -267,28 +277,40 @@ async fn assert_outreach_reply(
         .and_then(|r| r.reply_text.clone())
         .unwrap_or_default();
 
-    // 主动触达不一定每次都发出（可能因冷启动/最小间隔被 gateway 拦——那是合法行为）。
-    // 仅当真产出 reply 时做内容红线断言；否则记录 gateway status 供观测。
-    if reply.trim().is_empty() {
-        eprintln!("[{label}] 本轮无 reply（gateway status={}，可能被频控/冷启动拦，合法）", log.status);
-        return;
-    }
+    assert!(
+        !reply.trim().is_empty(),
+        "{label} task was consumed but produced no reply artifact (gateway={})",
+        log.status
+    );
     assert_no_forbidden_markers(&reply, label);
 
     // judge 观测（ObserveOnly：触达质量只观测不 fail，业务红线已由禁词硬断言守）。
     if let Some(j) = judge {
         let rubric = build_judge_rubric(&wechatagent::agent::default_domain_profile("default"));
-        let _ = run_judge_graded(j.as_ref(), &rubric, label, inbound_ctx, &reply, 1, JudgeGate::ObserveOnly).await;
+        let _ = run_judge_graded(
+            j.as_ref(),
+            &rubric,
+            label,
+            inbound_ctx,
+            &reply,
+            1,
+            JudgeGate::ObserveOnly,
+        )
+        .await;
     }
     eprintln!("[{label}] ✓ 主动触达产出：{reply}");
+    (reply.chars().count(), log.llm_calls_used.max(0) as usize)
 }
 
 /// R2.5.2 Planner 主动触达真模型：静默 contact → planner emit follow_up → 真模型消费生成触达。
 #[tokio::test]
 #[ignore]
 async fn r2_5_2_planner_silent_followup_real_outreach() {
+    let mut evidence = CapabilityEvidence::new("redline_proactive_planner");
+    evidence.attempted();
     let Some(agent_llm) = agent_client() else {
         eprintln!("skip: 缺 REAL_LLM_API_KEY，跳过 Planner 主动触达真模型");
+        evidence.infra_skip("REAL_LLM_API_KEY missing");
         return;
     };
     let judge = judge_client();
@@ -301,22 +323,45 @@ async fn r2_5_2_planner_silent_followup_real_outreach() {
     let mut contact = managed_contact("proactive_silent_user");
     contact.last_inbound_at = Some(long_ago);
     contact.last_message_at = Some(long_ago);
-    state.db.contacts().insert_one(&contact, None).await.expect("insert contact");
+    state
+        .db
+        .contacts()
+        .insert_one(&contact, None)
+        .await
+        .expect("insert contact");
 
     // planner 排 follow_up task（排程层，不调 LLM——mock 已覆盖计数/幂等，这里只为拿到 task）。
-    wechatagent::planner::tick(&state).await.expect("planner tick");
+    wechatagent::planner::tick(&state)
+        .await
+        .expect("planner tick");
     let Some(task) = fetch_task(&app, &contact.wxid, "follow_up").await else {
-        eprintln!("skip: planner 未 emit follow_up（默认 config 可能未触发静默扫描），跳过真模型触达");
+        eprintln!(
+            "skip: planner 未 emit follow_up（默认 config 可能未触发静默扫描），跳过真模型触达"
+        );
+        evidence.inconclusive("planner emitted no follow_up task");
         return;
     };
 
     // 真模型消费 task → gateway 全链生成主动触达内容。
     unwrap_or_skip_transient!(
+        evidence,
         handle_follow_up_task(&state, task).await,
         "R2.5.2 Planner 主动触达 handle_follow_up_task".to_string()
     );
 
-    assert_outreach_reply(&app, &judge, &contact.wxid, "（沉默 200 小时后主动跟进）", "R2.5.2").await;
+    let (reply_chars, llm_calls) = assert_outreach_reply(
+        &app,
+        &judge,
+        &contact.wxid,
+        "（沉默 200 小时后主动跟进）",
+        "R2.5.2",
+    )
+    .await;
+    evidence.observe_llm_calls(llm_calls);
+    evidence.branch("planner_task_consumed_nonempty_reply_redline_scan");
+    evidence.detail("task_kind", "follow_up");
+    evidence.detail("reply_chars", reply_chars);
+    evidence.pass(2, 4);
 }
 
 /// R2.5.1 作息门控醒来回复真模型：排 deferred_inbound_reply → 真模型消费生成醒来回复。
@@ -327,8 +372,11 @@ async fn r2_5_2_planner_silent_followup_real_outreach() {
 #[tokio::test]
 #[ignore]
 async fn r2_5_1_quiet_hours_wake_reply_real() {
+    let mut evidence = CapabilityEvidence::new("redline_proactive_wake");
+    evidence.attempted();
     let Some(agent_llm) = agent_client() else {
         eprintln!("skip: 缺 REAL_LLM_API_KEY，跳过 quiet hours 醒来回复真模型");
+        evidence.infra_skip("REAL_LLM_API_KEY missing");
         return;
     };
     let judge = judge_client();
@@ -337,11 +385,19 @@ async fn r2_5_1_quiet_hours_wake_reply_real() {
     let state = common::rebuild_app_state_with_real_llm(&app, agent_llm, mcp.uri());
 
     let contact = managed_contact("proactive_wake_user");
-    state.db.contacts().insert_one(&contact, None).await.expect("insert contact");
+    state
+        .db
+        .contacts()
+        .insert_one(&contact, None)
+        .await
+        .expect("insert contact");
 
     // 客户在静默时段攒下的消息（醒来回复要基于它们）。
     use wechatagent::models::{ConversationMessage, MessageDirection};
-    for (i, text) in ["在吗？", "我想问下你们这个怎么收费", "急，等你回复"].iter().enumerate() {
+    for (i, text) in ["在吗？", "我想问下你们这个怎么收费", "急，等你回复"]
+        .iter()
+        .enumerate()
+    {
         let msg = ConversationMessage {
             id: None,
             workspace_id: "default".to_string(),
@@ -357,21 +413,42 @@ async fn r2_5_1_quiet_hours_wake_reply_real() {
             is_synthetic_relay: false,
             created_at: DateTime::now(),
         };
-        state.db.messages().insert_one(&msg, None).await.expect("insert inbound");
+        state
+            .db
+            .messages()
+            .insert_one(&msg, None)
+            .await
+            .expect("insert inbound");
     }
 
     // 排醒来任务（排程层 DB 契约 mock 已覆盖；这里只为拿到 deferred task）。
-    ensure_wake_followup_task(&state, &contact, 8, 8).await.expect("ensure wake task");
+    ensure_wake_followup_task(&state, &contact, 8, 8)
+        .await
+        .expect("ensure wake task");
     let Some(task) = fetch_task(&app, &contact.wxid, "deferred_inbound_reply").await else {
         eprintln!("skip: 未排出 deferred_inbound_reply 任务，跳过");
+        evidence.inconclusive("wake scheduler emitted no deferred_inbound_reply task");
         return;
     };
 
     // 真模型消费醒来 task → 基于累积消息生成 1 次回复。
     unwrap_or_skip_transient!(
+        evidence,
         handle_follow_up_task(&state, task).await,
         "R2.5.1 quiet hours 醒来回复 handle_follow_up_task".to_string()
     );
 
-    assert_outreach_reply(&app, &judge, &contact.wxid, "在吗？/怎么收费/急等回复", "R2.5.1").await;
+    let (reply_chars, llm_calls) = assert_outreach_reply(
+        &app,
+        &judge,
+        &contact.wxid,
+        "在吗？/怎么收费/急等回复",
+        "R2.5.1",
+    )
+    .await;
+    evidence.observe_llm_calls(llm_calls);
+    evidence.branch("wake_task_consumed_nonempty_reply_redline_scan");
+    evidence.detail("task_kind", "deferred_inbound_reply");
+    evidence.detail("reply_chars", reply_chars);
+    evidence.pass(2, 4);
 }

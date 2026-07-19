@@ -1,5 +1,5 @@
 //! 主动发送台账只读 API：单客户发送历史 / 素材·名片维度聚合 / 总览。
-//! 全部带 workspace_id scope（防跨租户 IDOR）。
+//! 全部带 `(workspace_id, account_id)` scope（防跨租户/跨业务号串账）。
 use axum::{
     extract::{Path, Query, State},
     Extension, Json,
@@ -9,7 +9,7 @@ use mongodb::bson::{doc, Document};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::AppState;
+use super::{shared::validate_account, AppState};
 use crate::{auth::AuthenticatedAdmin, error::AppResult};
 
 /// 读聚合 $sum 计数：兼容 mongo 返回 i32 或 i64（$sum:1 的运行时类型随版本/数据量变）。
@@ -21,9 +21,16 @@ fn agg_count(d: &Document, key: &str) -> u64 {
         .unwrap_or(0)
 }
 
-/// 聚合 $match：固定 workspace，可选 kind。
-pub(super) fn build_stats_match(workspace_id: &str, kind: Option<&str>) -> Document {
-    let mut m = doc! { "workspace_id": workspace_id };
+/// 聚合 `$match`：固定 workspace/account，可选 kind。
+pub(super) fn build_stats_match(
+    workspace_id: &str,
+    account_id: &str,
+    kind: Option<&str>,
+) -> Document {
+    let mut m = doc! {
+        "workspace_id": workspace_id,
+        "account_id": account_id,
+    };
     if let Some(k) = kind {
         m.insert("send_kind", k);
     }
@@ -33,7 +40,14 @@ pub(super) fn build_stats_match(workspace_id: &str, kind: Option<&str>) -> Docum
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct StatsQuery {
+    account_id: String,
     kind: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct LedgerScopeQuery {
+    account_id: String,
 }
 
 /// 单客户发送历史（按 sent_at 倒序）。
@@ -41,13 +55,19 @@ pub(super) async fn contact_send_history(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
     Path(wxid): Path<String>,
+    Query(query): Query<LedgerScopeQuery>,
 ) -> AppResult<Json<Value>> {
     use mongodb::options::FindOptions;
+    validate_account(&state, &admin.current_workspace, &query.account_id).await?;
     let mut cursor = state
         .db
         .agent_send_ledger()
         .find(
-            doc! { "workspace_id": &admin.current_workspace, "contact_wxid": &wxid },
+            doc! {
+                "workspace_id": &admin.current_workspace,
+                "account_id": &query.account_id,
+                "contact_wxid": &wxid,
+            },
             FindOptions::builder()
                 .sort(doc! { "sent_at": -1 })
                 .limit(100)
@@ -75,7 +95,8 @@ pub(super) async fn send_ledger_stats(
     Extension(admin): Extension<AuthenticatedAdmin>,
     Query(q): Query<StatsQuery>,
 ) -> AppResult<Json<Value>> {
-    let match_doc = build_stats_match(&admin.current_workspace, q.kind.as_deref());
+    validate_account(&state, &admin.current_workspace, &q.account_id).await?;
+    let match_doc = build_stats_match(&admin.current_workspace, &q.account_id, q.kind.as_deref());
     let pipeline = vec![
         doc! { "$match": match_doc },
         doc! { "$group": {
@@ -90,7 +111,11 @@ pub(super) async fn send_ledger_stats(
         doc! { "$sort": { "sentCount": -1 } },
         doc! { "$limit": 100 },
     ];
-    let mut cursor = state.db.agent_send_ledger().aggregate(pipeline, None).await?;
+    let mut cursor = state
+        .db
+        .agent_send_ledger()
+        .aggregate(pipeline, None)
+        .await?;
     let mut items = Vec::new();
     while let Some(d) = cursor.try_next().await? {
         let sent = agg_count(&d, "sentCount");
@@ -115,9 +140,14 @@ pub(super) async fn send_ledger_stats(
 pub(super) async fn send_ledger_overview(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
+    Query(query): Query<LedgerScopeQuery>,
 ) -> AppResult<Json<Value>> {
+    validate_account(&state, &admin.current_workspace, &query.account_id).await?;
     let pipeline = vec![
-        doc! { "$match": { "workspace_id": &admin.current_workspace } },
+        doc! { "$match": {
+            "workspace_id": &admin.current_workspace,
+            "account_id": &query.account_id,
+        } },
         doc! { "$group": {
             "_id": null,
             "total": { "$sum": 1 },
@@ -126,7 +156,11 @@ pub(super) async fn send_ledger_overview(
             "evaluatedCount": { "$sum": { "$cond": [ { "$ifNull": ["$outcome_evaluated_at", false] }, 1, 0 ] } },
         }},
     ];
-    let mut cursor = state.db.agent_send_ledger().aggregate(pipeline, None).await?;
+    let mut cursor = state
+        .db
+        .agent_send_ledger()
+        .aggregate(pipeline, None)
+        .await?;
     let (mut total, mut responded, mut advanced, mut evaluated) = (0u64, 0u64, 0u64, 0u64);
     if let Some(d) = cursor.try_next().await? {
         total = agg_count(&d, "total");
@@ -147,15 +181,17 @@ mod tests {
 
     #[test]
     fn stats_match_pins_workspace_and_kind() {
-        let m = build_stats_match("ws1", Some("media"));
+        let m = build_stats_match("ws1", "account-a", Some("media"));
         assert_eq!(m.get_str("workspace_id").ok(), Some("ws1"));
+        assert_eq!(m.get_str("account_id").ok(), Some("account-a"));
         assert_eq!(m.get_str("send_kind").ok(), Some("media"));
     }
 
     #[test]
     fn stats_match_without_kind_omits_kind() {
-        let m = build_stats_match("ws1", None);
+        let m = build_stats_match("ws1", "account-a", None);
         assert_eq!(m.get_str("workspace_id").ok(), Some("ws1"));
+        assert_eq!(m.get_str("account_id").ok(), Some("account-a"));
         assert!(!m.contains_key("send_kind"));
     }
 

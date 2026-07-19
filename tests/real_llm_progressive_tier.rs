@@ -45,9 +45,7 @@ use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
 use wechatagent::agent::handle_managed_message;
 use wechatagent::error::{AppError, AppResult};
 use wechatagent::llm::{LlmClient, LlmFormat, LlmJsonResult, LlmProvider};
-use wechatagent::models::{
-    AgentStatus, Contact, ConversationMessage, MessageDirection,
-};
+use wechatagent::models::{AgentStatus, Contact, ConversationMessage, MessageDirection};
 
 use crate::common::TestApp;
 use wiremock::matchers::{method, path};
@@ -60,11 +58,19 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// 从 env 构造真实文本主 provider。缺 `REAL_LLM_API_KEY` → None（调用方自我跳过）。
 fn real_llm_from_env() -> Option<Arc<LlmClient>> {
-    let api_key = std::env::var("REAL_LLM_API_KEY").ok().filter(|k| !k.trim().is_empty())?;
+    let api_key = std::env::var("REAL_LLM_API_KEY")
+        .ok()
+        .filter(|k| !k.trim().is_empty())?;
     let base_url = std::env::var("REAL_LLM_BASE_URL")
         .unwrap_or_else(|_| "https://token-plan-cn.xiaomimimo.com/v1".to_string());
     let model = std::env::var("REAL_LLM_MODEL").unwrap_or_else(|_| "mimo-v2.5-pro".to_string());
-    let client = build_real_client(base_url, api_key, model, "REAL_LLM_FORMAT", primary_max_retries());
+    let client = build_real_client(
+        base_url,
+        api_key,
+        model,
+        "REAL_LLM_FORMAT",
+        primary_max_retries(),
+    );
     Some(Arc::new(client))
 }
 
@@ -107,7 +113,9 @@ struct FailoverProvider {
 #[async_trait::async_trait]
 impl LlmProvider for FailoverProvider {
     async fn generate_json(&self, system: &str, user: &str) -> AppResult<serde_json::Value> {
-        self.generate_json_with_usage(system, user).await.map(|r| r.value)
+        self.generate_json_with_usage(system, user)
+            .await
+            .map(|r| r.value)
     }
 
     async fn generate_json_with_usage(&self, system: &str, user: &str) -> AppResult<LlmJsonResult> {
@@ -161,7 +169,13 @@ fn strongest_model_client() -> Option<Arc<LlmClient>> {
         .unwrap_or_else(|_| "https://integrate.api.nvidia.com/v1".to_string());
     let model = std::env::var("REAL_LLM_JUDGE_MODEL")
         .unwrap_or_else(|_| "meta/llama-3.3-70b-instruct".to_string());
-    Some(Arc::new(build_real_client(base, key, model, "REAL_LLM_JUDGE_FORMAT", 5)))
+    Some(Arc::new(build_real_client(
+        base,
+        key,
+        model,
+        "REAL_LLM_JUDGE_FORMAT",
+        5,
+    )))
 }
 
 /// 备胎 model 名列表（逗号分隔异族链）。
@@ -188,7 +202,9 @@ fn failover_backups() -> Vec<Arc<LlmClient>> {
         let base = std::env::var("REAL_LLM_FAILOVER_BASE_URL")
             .unwrap_or_else(|_| "https://integrate.api.nvidia.com/v1".to_string());
         backups.extend(failover_model_list().into_iter().filter_map(|m| {
-            LlmClient::new(base.clone(), key.clone(), m, 180, 5, 2500).ok().map(Arc::new)
+            LlmClient::new(base.clone(), key.clone(), m, 180, 5, 2500)
+                .ok()
+                .map(Arc::new)
         }));
     }
     backups
@@ -198,7 +214,10 @@ fn failover_backups() -> Vec<Arc<LlmClient>> {
 fn wrap_with_failover(primary_label: String, primary: Arc<LlmClient>) -> Arc<dyn LlmProvider> {
     let mut clients = vec![primary];
     clients.extend(failover_backups());
-    Arc::new(FailoverProvider { primary_label, clients })
+    Arc::new(FailoverProvider {
+        primary_label,
+        clients,
+    })
 }
 
 /// 主模型 + 备胎链 → `Arc<dyn LlmProvider>`。缺主 key → None。
@@ -261,7 +280,9 @@ struct UniqueMsgIdResponder {
 
 impl wiremock::Respond for UniqueMsgIdResponder {
     fn respond(&self, _request: &wiremock::Request) -> ResponseTemplate {
-        let seq = self.counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let seq = self
+            .counter
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -369,7 +390,9 @@ async fn find_ptier_event(
     kind: &str,
 ) -> Option<wechatagent::models::AgentEvent> {
     use mongodb::options::FindOneOptions;
-    let opts = FindOneOptions::builder().sort(doc! { "created_at": -1 }).build();
+    let opts = FindOneOptions::builder()
+        .sort(doc! { "created_at": -1 })
+        .build();
     state
         .db
         .events()
@@ -394,10 +417,20 @@ async fn p1_greeting_stays_lean_no_escalation() {
     let state = common::rebuild_app_state_with_real_llm(&app, llm, mcp_server.uri());
 
     let contact = managed_contact("real_ptier_user_greet");
-    state.db.contacts().insert_one(&contact, None).await.expect("insert contact");
+    state
+        .db
+        .contacts()
+        .insert_one(&contact, None)
+        .await
+        .expect("insert contact");
 
     let inbound = make_inbound(&contact, "real_ptier_msg_greet", "在吗");
-    state.db.messages().insert_one(&inbound, None).await.expect("insert inbound");
+    state
+        .db
+        .messages()
+        .insert_one(&inbound, None)
+        .await
+        .expect("insert inbound");
 
     unwrap_or_skip_transient!(
         handle_managed_message(&state, contact.clone(), &inbound).await,
@@ -440,14 +473,24 @@ async fn p2_product_inquiry_escalates_to_full() {
     let state = common::rebuild_app_state_with_real_llm(&app, llm, mcp_server.uri());
 
     let contact = managed_contact("real_ptier_user_product");
-    state.db.contacts().insert_one(&contact, None).await.expect("insert contact");
+    state
+        .db
+        .contacts()
+        .insert_one(&contact, None)
+        .await
+        .expect("insert contact");
 
     let inbound = make_inbound(
         &contact,
         "real_ptier_msg_product",
         "你们企业版具体多少钱？能详细讲讲都有哪些功能、怎么落地吗？",
     );
-    state.db.messages().insert_one(&inbound, None).await.expect("insert inbound");
+    state
+        .db
+        .messages()
+        .insert_one(&inbound, None)
+        .await
+        .expect("insert inbound");
 
     unwrap_or_skip_transient!(
         handle_managed_message(&state, contact.clone(), &inbound).await,
@@ -503,11 +546,21 @@ async fn p3_ambiguous_message_may_clarify() {
     let state = common::rebuild_app_state_with_real_llm(&app, llm, mcp_server.uri());
 
     let contact = managed_contact("real_ptier_user_ambiguous");
-    state.db.contacts().insert_one(&contact, None).await.expect("insert contact");
+    state
+        .db
+        .contacts()
+        .insert_one(&contact, None)
+        .await
+        .expect("insert contact");
 
     // 没有任何上下文指代的含糊消息。
     let inbound = make_inbound(&contact, "real_ptier_msg_ambiguous", "这个怎么样");
-    state.db.messages().insert_one(&inbound, None).await.expect("insert inbound");
+    state
+        .db
+        .messages()
+        .insert_one(&inbound, None)
+        .await
+        .expect("insert inbound");
 
     unwrap_or_skip_transient!(
         handle_managed_message(&state, contact.clone(), &inbound).await,
@@ -561,14 +614,24 @@ async fn p4_product_inquiry_missing_coverage_forces_full() {
     let state = common::rebuild_app_state_with_real_llm(&app, llm, mcp_server.uri());
 
     let contact = managed_contact("real_ptier_user_forcefull");
-    state.db.contacts().insert_one(&contact, None).await.expect("insert contact");
+    state
+        .db
+        .contacts()
+        .insert_one(&contact, None)
+        .await
+        .expect("insert contact");
 
     let inbound = make_inbound(
         &contact,
         "real_ptier_msg_forcefull",
         "你们这个产品到底能解决什么问题？给我说说就行。",
     );
-    state.db.messages().insert_one(&inbound, None).await.expect("insert inbound");
+    state
+        .db
+        .messages()
+        .insert_one(&inbound, None)
+        .await
+        .expect("insert inbound");
 
     unwrap_or_skip_transient!(
         handle_managed_message(&state, contact.clone(), &inbound).await,
@@ -597,7 +660,10 @@ async fn p4_product_inquiry_missing_coverage_forces_full() {
             );
             // 顺带观测是否走了升档（产品轮更常见路径）。
             if let Some(ev) = find_ptier_event(&state, &contact.wxid, "ptier_escalated").await {
-                eprintln!("[p4][观测] 本轮改走了 ptier_escalated：details={:?}", ev.details);
+                eprintln!(
+                    "[p4][观测] 本轮改走了 ptier_escalated：details={:?}",
+                    ev.details
+                );
             }
         }
     }

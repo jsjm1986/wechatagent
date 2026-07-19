@@ -279,10 +279,7 @@ pub(crate) async fn propose_chunk_repair_inner(
             })
         })
         .unwrap_or(Value::Null);
-    let pack_payload = pack
-        .as_ref()
-        .map(|_| Value::Null)
-        .unwrap_or(Value::Null);
+    let pack_payload = pack.as_ref().map(|_| Value::Null).unwrap_or(Value::Null);
 
     let id_str = chunk_object_id.to_hex();
 
@@ -448,7 +445,8 @@ pub(in crate::routes) async fn answer_chunk_repair(
     )
     .await
     .unwrap_or_else(|_| {
-        "你是 WechatAgent 知识库 AI 修复 Agent，正在合并操作员对追问的回答。只输出严格 JSON。".to_string()
+        "你是 WechatAgent 知识库 AI 修复 Agent，正在合并操作员对追问的回答。只输出严格 JSON。"
+            .to_string()
     });
 
     let answers_for_prompt: Vec<Value> = body
@@ -660,8 +658,7 @@ pub(in crate::routes) async fn record_repair_apply(
         }
         _ => None,
     };
-    let account_id =
-        resolved_account.unwrap_or_else(|| state.config.default_account_id.clone());
+    let account_id = resolved_account.unwrap_or_else(|| state.config.default_account_id.clone());
 
     let accepted_count = body.accepted_fields.len() as i32;
     let skipped_count = body.skipped_fields.len() as i32;
@@ -730,9 +727,18 @@ mod tests {
             "confidenceHint": 65
         });
         let parsed = parse_repair_response(&raw);
-        let interp = parsed.get("interpretation").and_then(|v| v.as_object()).unwrap();
-        assert_eq!(interp.get("domain").and_then(|v| v.as_str()), Some("B2B SaaS"));
-        let missing = parsed.get("missingFields").and_then(|v| v.as_array()).unwrap();
+        let interp = parsed
+            .get("interpretation")
+            .and_then(|v| v.as_object())
+            .unwrap();
+        assert_eq!(
+            interp.get("domain").and_then(|v| v.as_str()),
+            Some("B2B SaaS")
+        );
+        let missing = parsed
+            .get("missingFields")
+            .and_then(|v| v.as_array())
+            .unwrap();
         assert_eq!(missing.len(), 2);
         assert_eq!(
             missing[0].get("field").and_then(|v| v.as_str()),
@@ -740,9 +746,15 @@ mod tests {
             "字符串形态 missingFields 必须被规整为 {{field, reason}}"
         );
         assert_eq!(missing[0].get("reason"), Some(&Value::Null));
-        let followup = parsed.get("followupQuestions").and_then(|v| v.as_array()).unwrap();
+        let followup = parsed
+            .get("followupQuestions")
+            .and_then(|v| v.as_array())
+            .unwrap();
         assert_eq!(followup.len(), 1);
-        assert_eq!(parsed.get("confidenceHint").and_then(|v| v.as_i64()), Some(65));
+        assert_eq!(
+            parsed.get("confidenceHint").and_then(|v| v.as_i64()),
+            Some(65)
+        );
     }
 
     #[test]
@@ -757,7 +769,10 @@ mod tests {
             "confidenceHint": 30
         });
         let parsed = parse_repair_response(&raw);
-        let missing = parsed.get("missingFields").and_then(|v| v.as_array()).unwrap();
+        let missing = parsed
+            .get("missingFields")
+            .and_then(|v| v.as_array())
+            .unwrap();
         assert_eq!(missing.len(), 2);
         assert_eq!(
             missing[0].get("field").and_then(|v| v.as_str()),
@@ -785,7 +800,10 @@ mod tests {
             "confidenceHint": 0
         });
         let parsed = parse_repair_response(&raw);
-        let followup = parsed.get("followupQuestions").and_then(|v| v.as_array()).unwrap();
+        let followup = parsed
+            .get("followupQuestions")
+            .and_then(|v| v.as_array())
+            .unwrap();
         assert_eq!(followup.len(), 3, "followup 必须截断到最多 3 条");
     }
 
@@ -813,7 +831,10 @@ mod tests {
         let raw = json!({ "patch": "should be object", "missingFields": "should be array" });
         let parsed = parse_repair_response(&raw);
         assert!(parsed.get("patch").map(|v| v.is_object()).unwrap_or(false));
-        let missing = parsed.get("missingFields").and_then(|v| v.as_array()).unwrap();
+        let missing = parsed
+            .get("missingFields")
+            .and_then(|v| v.as_array())
+            .unwrap();
         assert_eq!(missing.len(), 0);
     }
 
@@ -856,7 +877,10 @@ mod tests {
         let en2: String = ['h', 'a', 'n', 'd', '-', 'o', 'f', 'f'].iter().collect();
         let forbidden = [cn1, cn2, cn3, cn4, en1, en2];
         for w in &forbidden {
-            assert!(!s.contains(w.as_str()), "summary should not contain '{w}': {s}");
+            assert!(
+                !s.contains(w.as_str()),
+                "summary should not contain '{w}': {s}"
+            );
         }
     }
 }

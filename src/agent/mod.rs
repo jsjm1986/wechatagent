@@ -30,10 +30,10 @@ pub(crate) mod consolidation_window;
 mod decision;
 mod decision_taxonomy;
 pub(crate) mod dimension_registry;
-pub(crate) mod entitlements;
 pub mod domain;
 pub(crate) mod domain_profile;
 pub(crate) mod domain_signals;
+pub(crate) mod entitlements;
 pub mod escalation;
 mod gateway;
 mod guards;
@@ -43,19 +43,19 @@ mod knowledge_tools;
 mod media_send;
 mod memory;
 pub(crate) mod multimodal;
-pub(crate) mod prompt_isolation;
-pub(crate) mod quiet_hours;
 pub(crate) mod outbox;
 pub(crate) mod outbox_dispatcher;
 pub(crate) mod pacing;
+pub(crate) mod prompt_isolation;
+pub(crate) mod prompt_shadow;
+pub(crate) mod quiet_hours;
 mod reaction;
 mod referral;
 mod review;
+pub mod run_envelope;
 pub(crate) mod runtime;
 pub(crate) mod send_ledger;
-pub mod run_envelope;
 mod simulation;
-pub(crate) mod prompt_shadow;
 pub mod sufficiency;
 pub(crate) mod tag_evidence;
 pub(crate) mod taxonomy;
@@ -76,20 +76,20 @@ pub use self::budget::RunBudget;
 pub(crate) use self::budget::{current_run_budget, RUN_BUDGET};
 
 // 入口函数 / 类型重新导出，保持与拆分前 `crate::agent::xxx` 完全一致。
-pub use decision::{build_initial_operation_profile, load_operation_playbook_for_contact};
 pub(crate) use decision::load_user_operation_domain_config_for_contact;
 pub(crate) use decision::render_tags_for_prompt;
+pub use decision::{build_initial_operation_profile, load_operation_playbook_for_contact};
 // H13：onboarding 写侧（routes/contacts、routes/management）取状态机初始态 key +
 // 按 workspace 加载 active domain_config（替代写死 "new_contact"）。
-pub(crate) use decision::load_user_operation_domain_config;
 pub(crate) use decision::initial_operation_state_for_contact;
+pub(crate) use decision::load_user_operation_domain_config;
+pub use gateway::{
+    handle_follow_up_task, handle_follow_up_task_with_claim, handle_managed_message,
+    handle_managed_message_aggregated, send_contact_message_gateway, write_event_for_account,
+};
 pub(crate) use guards::initial_operation_state_key;
 pub(crate) use guards::initial_operation_state_key_in_machine;
 pub(crate) use guards::operation_states;
-pub use gateway::{
-    handle_follow_up_task, handle_managed_message, handle_managed_message_aggregated,
-    send_contact_message_gateway, write_event_for_account,
-};
 pub use knowledge_router::test_knowledge_route_for_contact;
 // Agent-first 渐进式披露入口：`/api/knowledge/ask` 路由直接调用本 agent。
 pub use knowledge_agent::{
@@ -105,8 +105,10 @@ pub use knowledge_agent::{
 pub use knowledge_router::{
     format_operation_knowledge_for_prompt, format_operation_knowledge_for_prompt_with_roles,
 };
+pub(crate) use memory::reconcile_memory_consolidation_commit;
 pub use memory::{
-    consolidate_contact_memory, handle_memory_consolidation_task, load_or_create_operating_memory,
+    consolidate_contact_memory, handle_memory_consolidation_task,
+    handle_memory_consolidation_task_with_claim, load_or_create_operating_memory,
 };
 // §3.7：planner scan_calendar 只读取 contact memoryCard 的 extra 容器（纪念日槽），
 // 复用 memory 模块的纯解析入口（mod memory 私有，故在此 re-export 给 planner）。
@@ -122,9 +124,14 @@ pub use outbox_dispatcher::{
 };
 // outbox 公共 API（enqueue + 取消通道 + 类型）的对外重导出，集成测试需要。
 pub use outbox::{
-    cancel_for_contact_on_user_reaction, enqueue, EnqueueOutcome, EnqueueRequest, OutboxStatus,
+    cancel_for_contact_on_user_reaction, cancel_for_decision, enqueue, EnqueueOutcome,
+    EnqueueRequest, OutboxStatus,
 };
 pub use reaction::{cap_intent_trajectory, record_user_reaction};
+#[doc(hidden)]
+pub use send_ledger::{
+    recent_sends_for_contact, record_send as record_send_ledger, scan_send_ledger_outcomes,
+};
 pub use simulation::simulate_user_dialogue;
 pub use types::{
     AgentDecision, ContactSendResult, FollowUpDecision, GeneratedOperationProfile,
@@ -152,7 +159,10 @@ pub use memory::{compact_memory_card_with_dimensions, compact_memory_card_with_p
 // 这些函数原本是 `pub(crate)`（仅 crate 内部使用）。在 W3 阶段需要被
 // `tests/autonomy_protocol_pbt.rs` 这个独立 crate 的测试文件直接调用，因此重
 // 导出为 `pub`。语义不变，仅可见性变化。
-pub use review::{finalize_review_for_send, local_decision_review, FinalizeOutcome, GatewayStatusFinal, PendingFinalizeEvent};
+pub use review::{
+    finalize_review_for_send, local_decision_review, FinalizeOutcome, GatewayStatusFinal,
+    PendingFinalizeEvent,
+};
 // Phase B / B6：把 `review_passed` 暴露到 crate 边界，让 PBT 文件
 // (`tests/human_like_threshold_pbt.rs` / `tests/pressure_risk_threshold_pbt.rs`)
 // 直接断言"双闸阈值穿越是否拦截"——契约性测试的最小暴露面。
@@ -189,7 +199,6 @@ pub use domain_profile::{
     example_sales_with_relationships_profile, invalidate_global_domain_profile_cache,
     load_active_domain_profile,
 };
-
 
 // task 6.3：`compact_memory_card_typed` 已与 `compact_memory_card_with_previous`
 // 合并，仅作向后兼容别名保留；外部测试仍引用，需要 `#[allow(deprecated)]`

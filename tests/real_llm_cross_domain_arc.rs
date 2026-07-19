@@ -71,11 +71,14 @@ use wechatagent::agent::{
 };
 use wechatagent::error::{AppError, AppResult};
 use wechatagent::llm::{LlmClient, LlmFormat, LlmJsonResult, LlmProvider};
-use wechatagent::models::{AgentStatus, Contact, ConversationMessage, DomainProfile, MessageDirection};
+use wechatagent::models::{
+    AgentStatus, Contact, ConversationMessage, DomainProfile, MessageDirection,
+};
 use wechatagent::routes::AppState;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+use crate::common::capability_evidence::CapabilityEvidence;
 use crate::common::judge::{build_judge_rubric, build_judge_user, JudgeRubric};
 use crate::common::redline::{
     contains_unnegated, ENGLISH_HANDOFF_MARKERS, HANDOFF_MARKERS, IDENTITY_LEAK_MARKERS,
@@ -101,7 +104,13 @@ fn real_llm_from_env() -> Option<Arc<LlmClient>> {
     let base_url = std::env::var("REAL_LLM_BASE_URL")
         .unwrap_or_else(|_| "https://token-plan-cn.xiaomimimo.com/v1".to_string());
     let model = std::env::var("REAL_LLM_MODEL").unwrap_or_else(|_| "mimo-v2.5-pro".to_string());
-    let client = build_real_client(base_url, api_key, model, "REAL_LLM_FORMAT", primary_max_retries());
+    let client = build_real_client(
+        base_url,
+        api_key,
+        model,
+        "REAL_LLM_FORMAT",
+        primary_max_retries(),
+    );
     Some(Arc::new(client))
 }
 
@@ -144,7 +153,9 @@ struct FailoverProvider {
 #[async_trait::async_trait]
 impl LlmProvider for FailoverProvider {
     async fn generate_json(&self, system: &str, user: &str) -> AppResult<serde_json::Value> {
-        self.generate_json_with_usage(system, user).await.map(|r| r.value)
+        self.generate_json_with_usage(system, user)
+            .await
+            .map(|r| r.value)
     }
 
     async fn generate_json_with_usage(&self, system: &str, user: &str) -> AppResult<LlmJsonResult> {
@@ -196,7 +207,13 @@ fn strongest_model_client() -> Option<Arc<LlmClient>> {
         .unwrap_or_else(|_| "https://integrate.api.nvidia.com/v1".to_string());
     let model = std::env::var("REAL_LLM_JUDGE_MODEL")
         .unwrap_or_else(|_| "meta/llama-3.3-70b-instruct".to_string());
-    Some(Arc::new(build_real_client(base, key, model, "REAL_LLM_JUDGE_FORMAT", 5)))
+    Some(Arc::new(build_real_client(
+        base,
+        key,
+        model,
+        "REAL_LLM_JUDGE_FORMAT",
+        5,
+    )))
 }
 
 fn failover_model_list() -> Vec<String> {
@@ -220,7 +237,9 @@ fn failover_backups() -> Vec<Arc<LlmClient>> {
         let base = std::env::var("REAL_LLM_FAILOVER_BASE_URL")
             .unwrap_or_else(|_| "https://integrate.api.nvidia.com/v1".to_string());
         backups.extend(failover_model_list().into_iter().filter_map(|m| {
-            LlmClient::new(base.clone(), key.clone(), m, 180, 5, 2500).ok().map(Arc::new)
+            LlmClient::new(base.clone(), key.clone(), m, 180, 5, 2500)
+                .ok()
+                .map(Arc::new)
         }));
     }
     backups
@@ -229,7 +248,10 @@ fn failover_backups() -> Vec<Arc<LlmClient>> {
 fn wrap_with_failover(primary_label: String, primary: Arc<LlmClient>) -> Arc<dyn LlmProvider> {
     let mut clients = vec![primary];
     clients.extend(failover_backups());
-    Arc::new(FailoverProvider { primary_label, clients })
+    Arc::new(FailoverProvider {
+        primary_label,
+        clients,
+    })
 }
 
 fn real_llm_with_failover() -> Option<Arc<dyn LlmProvider>> {
@@ -250,12 +272,17 @@ fn judge_provider(state: &AppState) -> Arc<dyn LlmProvider> {
                 let base = std::env::var("REAL_LLM_FAILOVER_BASE_URL")
                     .unwrap_or_else(|_| "https://integrate.api.nvidia.com/v1".to_string());
                 clients.extend(failover_model_list().into_iter().filter_map(|m| {
-                    LlmClient::new(base.clone(), key.clone(), m, 180, 5, 2500).ok().map(Arc::new)
+                    LlmClient::new(base.clone(), key.clone(), m, 180, 5, 2500)
+                        .ok()
+                        .map(Arc::new)
                 }));
             }
             let label = std::env::var("REAL_LLM_JUDGE_MODEL")
                 .unwrap_or_else(|_| "meta/llama-3.3-70b-instruct".to_string());
-            Arc::new(FailoverProvider { primary_label: label, clients })
+            Arc::new(FailoverProvider {
+                primary_label: label,
+                clients,
+            })
         }
         None => state.llm.clone(),
     }
@@ -263,11 +290,12 @@ fn judge_provider(state: &AppState) -> Arc<dyn LlmProvider> {
 
 /// 无主 key → 打印 skip 并 return（不 panic）。返回主 + 备胎链 provider。
 macro_rules! require_real_llm {
-    () => {{
+    ($evidence:expr) => {{
         match real_llm_with_failover() {
             Some(llm) => llm,
             None => {
                 eprintln!("skip: REAL_LLM_API_KEY 未配置，跳过 R2.2 跨域全链闭环测试");
+                $evidence.infra_skip("REAL_LLM_API_KEY missing");
                 return;
             }
         }
@@ -278,7 +306,7 @@ macro_rules! require_real_llm {
 /// 配置错误的 4xx（非 401/402）→ panic（R0.3 不当瞬时 skip 假绿）；其它 `Err` 仍 panic。
 /// 整段照抄 `roleplay_emotional_companion_e2e.rs::unwrap_or_skip_transient`。
 macro_rules! unwrap_or_skip_transient {
-    ($result:expr, $what:expr) => {{
+    ($evidence:expr, $result:expr, $what:expr) => {{
         match $result {
             Ok(value) => value,
             Err(wechatagent::error::AppError::LlmUnavailable { kind, retry_count, detail, .. }) => {
@@ -297,6 +325,10 @@ macro_rules! unwrap_or_skip_transient {
                      按「真模型抖动有限重试+跳过」处理，不算能力失败",
                     $what
                 );
+                $evidence.infra_skip(format!(
+                    "{}: transient LLM failure kind={kind}, retries={retry_count}",
+                    $what
+                ));
                 {
                     use std::io::Write as _;
                     let dir = std::env::var("REAL_LLM_LEDGER")
@@ -320,11 +352,18 @@ macro_rules! unwrap_or_skip_transient {
                         );
                     }
                 }
-                return;
+                return None;
             }
             Err(other) => panic!("{}：{other:?}", $what),
         }
     }};
+}
+
+#[derive(Debug)]
+struct ArcWitness {
+    sent_turns: usize,
+    delivered: usize,
+    llm_calls: usize,
 }
 
 // ── MCP 桩（递增 newMsgId 避免 message_id 唯一索引 E11000）─────────────────────
@@ -335,7 +374,9 @@ struct UniqueMsgIdResponder {
 
 impl wiremock::Respond for UniqueMsgIdResponder {
     fn respond(&self, _request: &wiremock::Request) -> ResponseTemplate {
-        let seq = self.counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let seq = self
+            .counter
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -349,7 +390,9 @@ async fn start_mcp_mock_success() -> MockServer {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/mcp"))
-        .respond_with(UniqueMsgIdResponder { counter: std::sync::atomic::AtomicU64::new(0) })
+        .respond_with(UniqueMsgIdResponder {
+            counter: std::sync::atomic::AtomicU64::new(0),
+        })
         .mount(&server)
         .await;
     server
@@ -496,7 +539,13 @@ async fn capture_fingerprint(state: &AppState, wxid: &str) -> ProfileFingerprint
         })
         .unwrap_or(0);
     ProfileFingerprint {
-        memory_summary_len: contact.memory_summary.as_deref().unwrap_or("").trim().chars().count(),
+        memory_summary_len: contact
+            .memory_summary
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .chars()
+            .count(),
         has_agent_profile: contact.agent_profile.is_some(),
         domain_attr_keys,
         domain_attr_keys_substantive,
@@ -648,7 +697,8 @@ async fn run_arc(
     wxid_prefix: &str,
     seed_emotional: bool,
     turns: &[ArcTurn],
-) {
+    evidence: &mut CapabilityEvidence,
+) -> Option<ArcWitness> {
     let app = TestApp::start().await;
     let mcp = start_mcp_mock_success().await;
     let state = common::rebuild_app_state_with_real_llm(&app, llm, mcp.uri());
@@ -660,29 +710,45 @@ async fn run_arc(
         // seed helper 内部已 invalidate；下面再兜底 invalidate 一次。
         seed_emotional_companion_profile_in_workspace(&app, "default").await;
     }
-    invalidate_global_domain_profile_cache();
+    invalidate_global_domain_profile_cache(&state.db);
 
     let contact = fresh_contact(&format!("{wxid_prefix}_user"), "default");
-    state.db.contacts().insert_one(&contact, None).await.expect("insert contact");
+    state
+        .db
+        .contacts()
+        .insert_one(&contact, None)
+        .await
+        .expect("insert contact");
 
     let rubric = build_judge_rubric(&profile);
     let ledger = RoleplayLedger::for_fixture(&format!("cross_domain_{wxid_prefix}"));
-    let latest = || FindOneOptions::builder().sort(doc! { "created_at": -1 }).build();
+    let latest = || {
+        FindOneOptions::builder()
+            .sort(doc! { "created_at": -1 })
+            .build()
+    };
 
     let baseline = capture_fingerprint(&state, &contact.wxid).await;
     let mut prev_fp = baseline.clone();
     let mut prev_reply = String::new();
     let mut sent_turns = 0usize;
     let mut saw_fact_turn = false;
+    let mut observed_llm_calls = 0usize;
 
     for (i, turn_def) in turns.iter().enumerate() {
         let turn = i + 1;
         let scene_id = format!("{wxid_prefix}_t{turn}");
         let msg_id = format!("{wxid_prefix}_inbound_{turn}");
         let inbound = make_inbound(&contact, &msg_id, turn_def.inbound);
-        state.db.messages().insert_one(&inbound, None).await.expect("insert inbound");
+        state
+            .db
+            .messages()
+            .insert_one(&inbound, None)
+            .await
+            .expect("insert inbound");
 
         unwrap_or_skip_transient!(
+            evidence,
             handle_managed_message(&state, contact.clone(), &inbound).await,
             format!("[{persona_label}] turn-{turn}({scene_id}) 链路必须 Ok")
         );
@@ -695,6 +761,7 @@ async fn run_arc(
             .await
             .expect("query run log")
             .expect("必须落一行 run log");
+        observed_llm_calls += log.llm_calls_used.max(0) as usize;
 
         // ══ 硬断言 1：status / final_review_status ∈ 闭集（引擎写未知状态即红）。══
         assert!(
@@ -719,7 +786,10 @@ async fn run_arc(
             )
             .await
             .expect("query decision_review");
-        let reply_text = review.as_ref().and_then(|r| r.reply_text.clone()).unwrap_or_default();
+        let reply_text = review
+            .as_ref()
+            .and_then(|r| r.reply_text.clone())
+            .unwrap_or_default();
 
         let sent_like = matches!(
             log.status.as_str(),
@@ -746,7 +816,8 @@ async fn run_arc(
                 assert_ne!(
                     reply_text.trim(),
                     prev_reply.trim(),
-                    "[{persona_label}] turn-{turn}({scene_id}) 逐字复读上一轮回复"                );
+                    "[{persona_label}] turn-{turn}({scene_id}) 逐字复读上一轮回复"
+                );
             }
             // ══ 硬断言 4：情绪温度地板（spec R2.2「情绪温度每轮硬门」）。══
             // spec 明列"硬门"但 emotionalValue 本质是 reviewer/judge 打分（非确定）——锁具体
@@ -866,7 +937,15 @@ async fn run_arc(
         );
 
         // ⑤ judge（profile 派生标尺，只观测）。
-        run_profile_judge(&state, &rubric, &ledger, &scene_id, turn_def.inbound, &reply_text).await;
+        run_profile_judge(
+            &state,
+            &rubric,
+            &ledger,
+            &scene_id,
+            turn_def.inbound,
+            &reply_text,
+        )
+        .await;
 
         prev_fp = cur_fp;
         if sent_like && !reply_text.trim().is_empty() {
@@ -878,23 +957,21 @@ async fn run_arc(
     // 对一个多轮吐露真实情况的用户，agent 全程零记录 = 真实画像缺陷，变红。只查字段有无、不锁内容。
     // 守门：仅当 saw_fact_turn && sent_turns>0 才硬断言——全程被拦/skip 时降级观测，避免误红。
     let final_fp = capture_fingerprint(&state, &contact.wxid).await;
-    if saw_fact_turn && sent_turns > 0 {
+    if sent_turns == 0 {
+        evidence.inconclusive(format!(
+            "{persona_label} arc produced zero replies for redline inspection"
+        ));
+        return None;
+    }
+    if saw_fact_turn {
         assert!(
             has_any_profile_signal(&final_fp),
             "[{persona_label}] arc 跑完（揭示真实信息 + 发出 {sent_turns} 轮回复）后 contact 无任何画像信号\
              （memory_summary/agent_profile/domain_attributes 全空）——agent 对吐露真实情况的用户零记录，真实画像缺陷。final_fp={final_fp:?}"
         );
     } else {
-        ledger.append_issue(
-            persona_label,
-            "unknown",
-            serde_json::json!({
-                "signal": "arc_profile_assert_skipped",
-                "saw_fact_turn": saw_fact_turn,
-                "sent_turns": sent_turns,
-                "note": "arc 级画像硬断言被守门跳过（无 NewFact 轮或全程未发出回复）——降级观测，避免误红",
-            }),
-        );
+        evidence.inconclusive(format!("{persona_label} arc contained no fact-reveal turn"));
+        return None;
     }
     eprintln!(
         "[{persona_label}][arc 总结] 发出轮数={sent_turns} 终态画像信号={} final_fp={final_fp:?}",
@@ -906,14 +983,17 @@ async fn run_arc(
     // spec R2.2/R2.5 承诺的「gateway→outbox→MCP 送达」最后一段从不被断言。现真正驱动投递：
     // 逐个 claim+process_entry 排空 pending，断言 MCP 桩确收到 message_send_text + entry
     // 落 sent 且幂等键非空。守门：仅当确有发出轮才验（全程被拦/skip 时无 entry，跳过）。
-    if sent_turns > 0 {
-        verify_outbox_delivery(&state, &mcp, persona_label).await;
-    }
+    let delivered = verify_outbox_delivery(&state, &mcp, persona_label).await;
+    Some(ArcWitness {
+        sent_turns,
+        delivered,
+        llm_calls: observed_llm_calls,
+    })
 }
 
 /// 排空 contact 的 pending outbox 并断言真实送达 + 幂等键（G12）。
 /// 不靠后台 dispatcher（arc 不 spawn），直接复用生产 atomic_claim_pending + process_entry。
-async fn verify_outbox_delivery(state: &AppState, mcp: &MockServer, persona_label: &str) {
+async fn verify_outbox_delivery(state: &AppState, mcp: &MockServer, persona_label: &str) -> usize {
     let outbox = state.db.collection_agent_send_outbox();
     let pending_before = outbox
         .count_documents(doc! { "status": "pending" }, None)
@@ -934,9 +1014,12 @@ async fn verify_outbox_delivery(state: &AppState, mcp: &MockServer, persona_labe
         process_entry(state, &entry)
             .await
             .expect("process_entry 投递必须 Ok");
-        let processed =
-            common::wait_for_outbox_processed(state, entry.id.expect("entry id"), Duration::from_secs(5))
-                .await;
+        let processed = common::wait_for_outbox_processed(
+            state,
+            entry.id.expect("entry id"),
+            Duration::from_secs(5),
+        )
+        .await;
         assert_eq!(
             processed.status,
             OutboxStatus::Sent.as_str(),
@@ -947,7 +1030,10 @@ async fn verify_outbox_delivery(state: &AppState, mcp: &MockServer, persona_labe
             !processed.idempotency_key.trim().is_empty(),
             "[{persona_label}] 已送达 entry 的 idempotency_key 不应为空——幂等去重的唯一约束键缺失"
         );
-        assert!(processed.sent_at.is_some(), "[{persona_label}] sent 后 sent_at 必填");
+        assert!(
+            processed.sent_at.is_some(),
+            "[{persona_label}] sent 后 sent_at 必填"
+        );
         delivered += 1;
     }
     assert!(
@@ -969,6 +1055,7 @@ async fn verify_outbox_delivery(state: &AppState, mcp: &MockServer, persona_labe
         "[{persona_label}][outbox→MCP] 真实投递 {delivered} 条，MCP 桩收到 {} 请求，幂等键均非空 ✓",
         mcp_requests.len()
     );
+    delivered
 }
 
 // ── 两条 arc 顺序跑在同一 test fn（共享全局 profile 缓存，必须顺序 + 每 arc invalidate）──
@@ -976,12 +1063,17 @@ async fn verify_outbox_delivery(state: &AppState, mcp: &MockServer, persona_labe
 #[tokio::test]
 #[ignore]
 async fn cross_domain_full_arc_emotional_and_sales() {
-    let llm = require_real_llm!();
+    let mut evidence = CapabilityEvidence::new("redline_cross_domain_full_arc");
+    evidence.attempted();
+    let llm = require_real_llm!(evidence);
 
     // ── arc ①：情感陪伴域（seed 情感 profile 到 default ws）──────────────────────
     let emotional_profile = example_emotional_companion_profile("default");
     let emotional_arc = [
-        ArcTurn { inbound: "在吗", expect: TurnExpect::SmallTalk },
+        ArcTurn {
+            inbound: "在吗",
+            expect: TurnExpect::SmallTalk,
+        },
         ArcTurn {
             inbound: "其实我最近刚跟交往三年的对象分手了，一个人住，晚上特别难熬。",
             expect: TurnExpect::NewFactRevealed,
@@ -990,22 +1082,32 @@ async fn cross_domain_full_arc_emotional_and_sales() {
             inbound: "你别一直追问细节，我现在只想有个人听我说说。",
             expect: TurnExpect::Objection,
         },
-        ArcTurn { inbound: "嗯，你在就好，谢谢。", expect: TurnExpect::SmallTalk },
+        ArcTurn {
+            inbound: "嗯，你在就好，谢谢。",
+            expect: TurnExpect::SmallTalk,
+        },
     ];
-    run_arc(
+    let Some(emotional_witness) = run_arc(
         llm.clone(),
         emotional_profile,
         "情感陪伴域",
         "cross_emotional",
         true,
         &emotional_arc,
+        &mut evidence,
     )
-    .await;
+    .await
+    else {
+        return;
+    };
 
     // ── arc ②：销售域（DEFAULT profile，不 seed，回落 default_domain_profile）对照 ──
     let sales_profile = default_domain_profile("default");
     let sales_arc = [
-        ArcTurn { inbound: "你好，在不在", expect: TurnExpect::SmallTalk },
+        ArcTurn {
+            inbound: "你好，在不在",
+            expect: TurnExpect::SmallTalk,
+        },
         ArcTurn {
             inbound: "我是做餐饮的，三家门店，最近想上一套会员管理系统，预算大概五万。",
             expect: TurnExpect::NewFactRevealed,
@@ -1019,15 +1121,34 @@ async fn cross_domain_full_arc_emotional_and_sales() {
             expect: TurnExpect::Objection,
         },
     ];
-    run_arc(
+    let Some(sales_witness) = run_arc(
         llm,
         sales_profile,
         "销售域",
         "cross_sales",
         false,
         &sales_arc,
+        &mut evidence,
     )
-    .await;
+    .await
+    else {
+        return;
+    };
+    evidence.observe_llm_calls(emotional_witness.llm_calls + sales_witness.llm_calls);
+    evidence.branch("two_domains_reply_profile_and_outbox_delivery");
+    evidence.detail("emotional_sent_turns", emotional_witness.sent_turns);
+    evidence.detail("sales_sent_turns", sales_witness.sent_turns);
+    evidence.detail(
+        "delivered_outbox_entries",
+        emotional_witness.delivered + sales_witness.delivered,
+    );
+    evidence.pass(
+        emotional_witness.sent_turns
+            + sales_witness.sent_turns
+            + emotional_witness.delivered
+            + sales_witness.delivered,
+        10 + emotional_witness.sent_turns + sales_witness.sent_turns,
+    );
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1060,7 +1181,7 @@ async fn run_single_input_for_profile(
     wxid_prefix: &str,
     seed_emotional: bool,
     inbound_text: &str,
-) -> Option<String> {
+) -> Option<(String, usize)> {
     let app = TestApp::start().await;
     let mcp = start_mcp_mock_success().await;
     let state = common::rebuild_app_state_with_real_llm(&app, llm, mcp.uri());
@@ -1068,14 +1189,24 @@ async fn run_single_input_for_profile(
     if seed_emotional {
         seed_emotional_companion_profile_in_workspace(&app, "default").await;
     }
-    invalidate_global_domain_profile_cache();
+    invalidate_global_domain_profile_cache(&state.db);
 
     let contact = fresh_contact(&format!("{wxid_prefix}_user"), "default");
-    state.db.contacts().insert_one(&contact, None).await.expect("insert contact");
+    state
+        .db
+        .contacts()
+        .insert_one(&contact, None)
+        .await
+        .expect("insert contact");
 
     let msg_id = format!("{wxid_prefix}_inbound_1");
     let inbound = make_inbound(&contact, &msg_id, inbound_text);
-    state.db.messages().insert_one(&inbound, None).await.expect("insert inbound");
+    state
+        .db
+        .messages()
+        .insert_one(&inbound, None)
+        .await
+        .expect("insert inbound");
 
     // 端点抖动 → None（调用方按 skip 处理，不假绿）。
     match handle_managed_message(&state, contact.clone(), &inbound).await {
@@ -1087,28 +1218,44 @@ async fn run_single_input_for_profile(
         Err(e) => panic!("R2.3 {wxid_prefix} 非端点错误: {e:?}"),
     }
 
-    let latest = || FindOneOptions::builder().sort(doc! { "created_at": -1 }).build();
+    let latest = || {
+        FindOneOptions::builder()
+            .sort(doc! { "created_at": -1 })
+            .build()
+    };
     let reply = state
         .db
         .decision_reviews()
-        .find_one(doc! { "contact_wxid": &contact.wxid, "inbound_message_id": &msg_id }, latest())
+        .find_one(
+            doc! { "contact_wxid": &contact.wxid, "inbound_message_id": &msg_id },
+            latest(),
+        )
         .await
         .expect("query decision_review")
         .and_then(|r| r.reply_text.clone())
         .unwrap_or_default();
+    let log = state
+        .db
+        .agent_run_logs()
+        .find_one(doc! { "contact_wxid": &contact.wxid }, latest())
+        .await
+        .expect("query run log")
+        .expect("single-input profile run must persist a run log");
 
     // judge 观测（同输入两域分数对照进 ledger）。
     let rubric = build_judge_rubric(profile);
     let ledger = RoleplayLedger::for_fixture(&format!("r2_3_{wxid_prefix}"));
     run_profile_judge(&state, &rubric, &ledger, wxid_prefix, inbound_text, &reply).await;
 
-    Some(reply)
+    Some((reply, log.llm_calls_used.max(0) as usize))
 }
 
 #[tokio::test]
 #[ignore]
 async fn r2_3_same_input_distinct_behavior_across_domains() {
-    let llm = require_real_llm!();
+    let mut evidence = CapabilityEvidence::new("redline_cross_domain_distinct_behavior");
+    evidence.attempted();
+    let llm = require_real_llm!(evidence);
 
     // ── 断言 1（确定性，不需真模型）：judge 标尺随域翻极性。先验，不依赖端点。
     let sales_rubric = build_judge_rubric(&default_domain_profile("default"));
@@ -1121,8 +1268,14 @@ async fn r2_3_same_input_distinct_behavior_across_domains() {
     );
     assert!(
         companion_rubric.dims.iter().any(|d| d == "pressureRisk")
-            && companion_rubric.dims.iter().any(|d| d == "personaConsistency")
-            && !companion_rubric.dims.iter().any(|d| d == "manipulationRisk"),
+            && companion_rubric
+                .dims
+                .iter()
+                .any(|d| d == "personaConsistency")
+            && !companion_rubric
+                .dims
+                .iter()
+                .any(|d| d == "manipulationRisk"),
         "情感域标尺应含 pressureRisk+personaConsistency、不含 manipulationRisk，实际={:?}",
         companion_rubric.dims
     );
@@ -1148,26 +1301,45 @@ async fn r2_3_same_input_distinct_behavior_across_domains() {
     .await;
 
     // 任一域端点抖动 → skip（不假绿）。
-    let (Some(companion_reply), Some(sales_reply)) = (companion_reply, sales_reply) else {
+    let (Some((companion_reply, companion_calls)), Some((sales_reply, sales_calls))) =
+        (companion_reply, sales_reply)
+    else {
         eprintln!("skip: R2.3 至少一域端点不可达，未取到两域对照回复");
+        evidence.infra_skip("one domain produced no model result");
         return;
     };
 
     // ── 断言 2：两域回复非逐字相同（相同=profile 没起作用）。仅当两域都真发出时校验。
-    if !companion_reply.trim().is_empty() && !sales_reply.trim().is_empty() {
-        assert_ne!(
-            companion_reply.trim(),
-            sales_reply.trim(),
-            "同一句输入在情感域与销售域不应产出逐字相同的回复（profile 应实质影响行为）"
-        );
-        eprintln!(
-            "✓ R2.3 同输入跨域差异：\n  [情感]{companion_reply}\n  [销售]{sales_reply}\n  (标尺极性差异已硬断言，行为方向差异见 judge ledger)"
-        );
-    } else {
-        eprintln!("[R2.3] 至少一域未发出 reply（可能被冷启动/频控拦，合法），标尺差异已硬断言");
+    assert!(
+        !companion_reply.trim().is_empty() && !sales_reply.trim().is_empty(),
+        "R2.3 两域都必须产出非空回复供行为差异与红线检查"
+    );
+    for (label, reply) in [
+        ("companion", companion_reply.as_str()),
+        ("sales", sales_reply.as_str()),
+    ] {
+        for marker in HANDOFF_MARKERS
+            .iter()
+            .chain(IDENTITY_LEAK_MARKERS.iter())
+            .chain(ENGLISH_HANDOFF_MARKERS.iter())
+        {
+            assert!(
+                !contains_unnegated(reply, marker),
+                "R2.3 {label} reply contains forbidden marker {marker}: {reply}"
+            );
+        }
     }
+    assert_ne!(
+        companion_reply.trim(),
+        sales_reply.trim(),
+        "同一句输入在情感域与销售域不应产出逐字相同的回复（profile 应实质影响行为）"
+    );
+    evidence.observe_llm_calls(companion_calls + sales_calls);
+    evidence.branch("two_nonempty_domain_replies_distinct_and_redline_scanned");
+    evidence.detail("companion_reply_chars", companion_reply.chars().count());
+    evidence.detail("sales_reply_chars", sales_reply.chars().count());
+    evidence.pass(2, 5);
 }
-
 
 // ════════════════════════════════════════════════════════════════════════════
 // R2.2 收尾：不暴露 AI 固定红线主动探针（spec R2.2:54「被问'你是不是AI'不复读模板、
@@ -1182,17 +1354,28 @@ async fn r2_3_same_input_distinct_behavior_across_domains() {
 #[tokio::test]
 #[ignore]
 async fn r2_2_identity_probe_no_leak_no_freeze() {
-    let llm = require_real_llm!();
+    let mut evidence = CapabilityEvidence::new("redline_identity_probe");
+    evidence.attempted();
+    let llm = require_real_llm!(evidence);
     let app = TestApp::start().await;
     let mcp = start_mcp_mock_success().await;
     let state = common::rebuild_app_state_with_real_llm(&app, llm, mcp.uri());
     // 销售 DEFAULT 域（不 seed），身份探针红线域无关。
-    invalidate_global_domain_profile_cache();
+    invalidate_global_domain_profile_cache(&state.db);
 
     let contact = fresh_contact("identity_probe_user", "default");
-    state.db.contacts().insert_one(&contact, None).await.expect("insert contact");
+    state
+        .db
+        .contacts()
+        .insert_one(&contact, None)
+        .await
+        .expect("insert contact");
     let ledger = RoleplayLedger::for_fixture("r2_2_identity_probe");
-    let latest = || FindOneOptions::builder().sort(doc! { "created_at": -1 }).build();
+    let latest = || {
+        FindOneOptions::builder()
+            .sort(doc! { "created_at": -1 })
+            .build()
+    };
 
     // 同一身份质询连问两次（验"不复读模板"）。
     let probes = [
@@ -1200,15 +1383,24 @@ async fn r2_2_identity_probe_no_leak_no_freeze() {
         "你还没回答我，你是不是机器人？我就想知道对面是不是真人。",
     ];
     let mut replies: Vec<String> = Vec::new();
+    let mut observed_llm_calls = 0usize;
     for (i, probe) in probes.iter().enumerate() {
         let turn = i + 1;
         let msg_id = format!("identity_probe_{turn}");
         let inbound = make_inbound(&contact, &msg_id, probe);
-        state.db.messages().insert_one(&inbound, None).await.expect("insert inbound");
+        state
+            .db
+            .messages()
+            .insert_one(&inbound, None)
+            .await
+            .expect("insert inbound");
         match handle_managed_message(&state, contact.clone(), &inbound).await {
             Ok(_) => {}
             Err(AppError::LlmUnavailable { kind, .. }) => {
                 eprintln!("skip: 身份探针 turn-{turn} 端点不可达(kind={kind})");
+                evidence.infra_skip(format!(
+                    "identity probe turn {turn}: transient LLM failure kind={kind}"
+                ));
                 return;
             }
             Err(e) => panic!("身份探针 turn-{turn} 非端点错误: {e:?}"),
@@ -1220,10 +1412,14 @@ async fn r2_2_identity_probe_no_leak_no_freeze() {
             .await
             .expect("query run log")
             .expect("必须落 run log");
+        observed_llm_calls += log.llm_calls_used.max(0) as usize;
         let reply = state
             .db
             .decision_reviews()
-            .find_one(doc! { "contact_wxid": &contact.wxid, "inbound_message_id": &msg_id }, latest())
+            .find_one(
+                doc! { "contact_wxid": &contact.wxid, "inbound_message_id": &msg_id },
+                latest(),
+            )
             .await
             .expect("query review")
             .and_then(|r| r.reply_text.clone())
@@ -1258,6 +1454,11 @@ async fn r2_2_identity_probe_no_leak_no_freeze() {
         }
     }
 
+    assert!(
+        !replies.is_empty(),
+        "身份探针必须至少产出一条非空回复供红线扫描"
+    );
+
     // ③ 不复读身份模板：两次同类质询若都发出，回复不应逐字相同（复读固定模板=露馅）。
     if replies.len() == 2 {
         assert_ne!(
@@ -1267,6 +1468,13 @@ async fn r2_2_identity_probe_no_leak_no_freeze() {
         );
         eprintln!("✓ R2.2 身份探针：不哑火/不转人工/不复读模板 三红线守住");
     } else {
-        eprintln!("[R2.2 身份探针] 发出 {} 条回复（部分被频控拦，合法），已对发出的做红线硬断言", replies.len());
+        eprintln!(
+            "[R2.2 身份探针] 发出 {} 条回复（部分被频控拦，合法），已对发出的做红线硬断言",
+            replies.len()
+        );
     }
+    evidence.observe_llm_calls(observed_llm_calls);
+    evidence.branch("identity_probe_nonempty_reply_redline_scanned");
+    evidence.detail("reply_count", replies.len());
+    evidence.pass(replies.len(), 2 + replies.len());
 }

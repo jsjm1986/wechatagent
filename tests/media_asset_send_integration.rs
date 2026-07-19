@@ -18,9 +18,9 @@
 
 mod common;
 
+use futures::TryStreamExt;
 use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
 use mongodb::options::FindOptions;
-use futures::TryStreamExt;
 use wechatagent::agent::{enqueue, EnqueueOutcome, EnqueueRequest};
 use wechatagent::models::{AgentStatus, Contact, ContentAsset};
 
@@ -257,18 +257,26 @@ async fn media_outbox_entry_is_idempotent_per_asset() {
     let asset_b = ObjectId::new().to_hex();
 
     // 第一次入队同 (run, contact, asset_a) → Created。
-    let first = enqueue(state, media_enqueue_request("run_media", &contact.wxid, &asset_a))
-        .await
-        .expect("first enqueue ok");
+    let first = enqueue(
+        state,
+        media_enqueue_request("run_media", &contact.wxid, &asset_a),
+    )
+    .await
+    .expect("first enqueue ok");
     let first_key = match first {
-        EnqueueOutcome::Created { idempotency_key, .. } => idempotency_key,
+        EnqueueOutcome::Created {
+            idempotency_key, ..
+        } => idempotency_key,
         other => panic!("expected Created, got {other:?}"),
     };
 
     // 第二次入队同 (run, contact, asset_a) → IdempotentSkip（永不发两次）。
-    let second = enqueue(state, media_enqueue_request("run_media", &contact.wxid, &asset_a))
-        .await
-        .expect("second enqueue ok");
+    let second = enqueue(
+        state,
+        media_enqueue_request("run_media", &contact.wxid, &asset_a),
+    )
+    .await
+    .expect("second enqueue ok");
     match second {
         EnqueueOutcome::IdempotentSkip {
             idempotency_key, ..
@@ -282,11 +290,16 @@ async fn media_outbox_entry_is_idempotent_per_asset() {
     }
 
     // 同 run 不同 media_asset_id → 第二条也 Created（幂等键含 asset_id、不撞键）。
-    let other = enqueue(state, media_enqueue_request("run_media", &contact.wxid, &asset_b))
-        .await
-        .expect("other-asset enqueue ok");
+    let other = enqueue(
+        state,
+        media_enqueue_request("run_media", &contact.wxid, &asset_b),
+    )
+    .await
+    .expect("other-asset enqueue ok");
     let other_key = match other {
-        EnqueueOutcome::Created { idempotency_key, .. } => idempotency_key,
+        EnqueueOutcome::Created {
+            idempotency_key, ..
+        } => idempotency_key,
         other => panic!("expected Created for different asset, got {other:?}"),
     };
     assert_ne!(

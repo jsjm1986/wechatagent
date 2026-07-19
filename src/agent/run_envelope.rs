@@ -135,6 +135,9 @@ pub const GATEWAY_STATUS_VALUES: &[&str] = &[
     "outbox_enqueued",
     "outbox_enqueue_failed",
     "outbox_enqueue_partial_failure",
+    // SR-034：Task claim 在 decision 绑定或 Outbox 授权提交前后失权。
+    // 这是外部 lease/reclaim 信号导致的本轮中止，不是模型或发送失败。
+    "stale_task_claim",
     "skipped_duplicate",
     // P0-7 (Phase 0)：admin SPA 显式取消任务时写入。AI 自治语义上 admin 是
     // 维护操作员（不是把对话权交给真人继续聊天），cancel_reason 字段记录管理员触发上下文。
@@ -259,15 +262,22 @@ pub fn derive_lifecycle_from_status(gateway_status: &str, error: Option<&str>) -
     }
     match gateway_status {
         "outbox_enqueuing" => LIFECYCLE_RUNNING,
-        "sent" | "no_reply" | "approved" | "allowed" | "outbox_enqueued"
-        | "skipped_duplicate" => LIFECYCLE_COMPLETED,
-        "not_managed" | "cooldown" | "rate_limited" | "daily_limit" | "expired"
-        | "context_changed" | "policy_cooldown" | "policy_wait_user_reply"
+        "sent" | "no_reply" | "approved" | "allowed" | "outbox_enqueued" | "skipped_duplicate" => {
+            LIFECYCLE_COMPLETED
+        }
+        "not_managed"
+        | "cooldown"
+        | "rate_limited"
+        | "daily_limit"
+        | "expired"
+        | "context_changed"
+        | "policy_cooldown"
+        | "policy_wait_user_reply"
         | "precheck_blocked" => LIFECYCLE_FAILED_BEFORE_DECISION,
         // 并发去抖：被更新的入站取代 → 外部信号中止（终态已存在，吸收态）。
         // #69 作息门控：主动发送在静默时段被重排到醒来时刻——同属外部信号（时段）触发
         // 的"本次不送达、改时段重来"，任务仍 pending 等醒来，按吸收态记录而非失败。
-        "superseded_by_new_inbound" | "quiet_hours_deferred" => {
+        "superseded_by_new_inbound" | "quiet_hours_deferred" | "stale_task_claim" => {
             LIFECYCLE_ABORTED_BY_EXTERNAL_SIGNAL
         }
         _ => LIFECYCLE_FAILED_AFTER_DECISION,
@@ -917,7 +927,10 @@ mod tests {
         assert!(assert_gateway_status_valid("revision_failed").is_ok());
 
         let set = fields.to_set_document();
-        assert_eq!(set.get_str("final_review_status").unwrap(), "revision_failed");
+        assert_eq!(
+            set.get_str("final_review_status").unwrap(),
+            "revision_failed"
+        );
         assert!(set.get_bool("revision_applied").unwrap());
         assert_eq!(set.get_str("autonomy_mode").unwrap(), "blocked");
     }
@@ -978,25 +991,19 @@ mod tests {
             "handoff_to_human",
             "manual_takeover",
         ] {
-            let result = std::panic::catch_unwind(|| {
-                assert_final_review_status_valid(forbidden)
-            });
+            let result = std::panic::catch_unwind(|| assert_final_review_status_valid(forbidden));
             // debug_assert! 在 debug 构建里会 panic；release 模式下返回 Err。
             // 两条路径都满足"严格拒收"语义，这里都接受：
             match result {
                 Err(_) => { /* debug 构建：debug_assert! panic */ }
                 Ok(Err(crate::error::AppError::External(msg))) => {
                     assert!(
-                        msg.contains("forbidden")
-                            && msg.contains(forbidden),
+                        msg.contains("forbidden") && msg.contains(forbidden),
                         "拒收信息应当指明 forbidden 取值: {}",
                         msg
                     );
                 }
-                Ok(Ok(())) => panic!(
-                    "{} SHALL 被严格拒收，不应返回 Ok(())",
-                    forbidden
-                ),
+                Ok(Ok(())) => panic!("{} SHALL 被严格拒收，不应返回 Ok(())", forbidden),
                 Ok(Err(other)) => panic!(
                     "{} SHALL 返回 AppError::External, got {:?}",
                     forbidden, other
@@ -1004,16 +1011,12 @@ mod tests {
             }
 
             // gateway_status 同等拒收。
-            let gateway_result = std::panic::catch_unwind(|| {
-                assert_gateway_status_valid(forbidden)
-            });
+            let gateway_result =
+                std::panic::catch_unwind(|| assert_gateway_status_valid(forbidden));
             match gateway_result {
                 Err(_) => {}
                 Ok(Err(crate::error::AppError::External(_))) => {}
-                Ok(Ok(())) => panic!(
-                    "gateway_status={} SHALL 被严格拒收",
-                    forbidden
-                ),
+                Ok(Ok(())) => panic!("gateway_status={} SHALL 被严格拒收", forbidden),
                 Ok(Err(other)) => panic!(
                     "gateway_status={} SHALL 返回 AppError::External, got {:?}",
                     forbidden, other
@@ -1031,9 +1034,7 @@ mod tests {
             "approved_maybe",
             "blocked_by_unknown_reason",
         ] {
-            let result = std::panic::catch_unwind(|| {
-                assert_final_review_status_valid(unknown)
-            });
+            let result = std::panic::catch_unwind(|| assert_final_review_status_valid(unknown));
             match result {
                 Err(_) => {}
                 Ok(Err(crate::error::AppError::External(msg))) => {
@@ -1043,14 +1044,10 @@ mod tests {
                         msg
                     );
                 }
-                Ok(Ok(())) => panic!(
-                    "{} SHALL 被严格拒收，不应返回 Ok(())",
-                    unknown
-                ),
-                Ok(Err(other)) => panic!(
-                    "{} SHALL 返回 AppError::External, got {:?}",
-                    unknown, other
-                ),
+                Ok(Ok(())) => panic!("{} SHALL 被严格拒收，不应返回 Ok(())", unknown),
+                Ok(Err(other)) => {
+                    panic!("{} SHALL 返回 AppError::External, got {:?}", unknown, other)
+                }
             }
         }
     }
@@ -1359,9 +1356,7 @@ mod tests {
         assert_eq!(doc.get_str("final_review_status").unwrap(), "");
         // Vec<String> 默认 -> BSON 空数组
         assert_eq!(
-            doc.get_array("memory_consolidator_warnings")
-                .unwrap()
-                .len(),
+            doc.get_array("memory_consolidator_warnings").unwrap().len(),
             0
         );
     }
@@ -1411,23 +1406,37 @@ mod tests {
         };
 
         let doc = to_document(&original).expect("serialize");
-        let round_tripped: AgentRunLog =
-            mongodb::bson::from_document(doc).expect("deserialize");
+        let round_tripped: AgentRunLog = mongodb::bson::from_document(doc).expect("deserialize");
         assert_eq!(round_tripped.lifecycle, LIFECYCLE_COMPLETED);
         assert_eq!(round_tripped.source_event_id, "evt_99");
         assert_eq!(round_tripped.source_kind, SOURCE_KIND_FOLLOW_UP_TASK);
-        assert_eq!(round_tripped.error_summary.as_deref(), Some("llm_timeout: 30s"));
+        assert_eq!(
+            round_tripped.error_summary.as_deref(),
+            Some("llm_timeout: 30s")
+        );
         assert_eq!(
             round_tripped.abort_reason.as_deref(),
             Some("user_reaction_stop_requested")
         );
         assert!(round_tripped.revision_applied);
         assert_eq!(round_tripped.revision_reason, "review needsRevision=true");
-        assert_eq!(round_tripped.pre_revision_summary.as_deref(), Some("第一版回复"));
-        assert_eq!(round_tripped.post_revision_summary.as_deref(), Some("第二版改写"));
-        assert_eq!(round_tripped.self_critique.as_deref(), Some("上一版语气太硬"));
+        assert_eq!(
+            round_tripped.pre_revision_summary.as_deref(),
+            Some("第一版回复")
+        );
+        assert_eq!(
+            round_tripped.post_revision_summary.as_deref(),
+            Some("第二版改写")
+        );
+        assert_eq!(
+            round_tripped.self_critique.as_deref(),
+            Some("上一版语气太硬")
+        );
         assert_eq!(round_tripped.autonomy_mode, "assisted");
-        assert_eq!(round_tripped.final_review_status, "revision_applied_approved");
+        assert_eq!(
+            round_tripped.final_review_status,
+            "revision_applied_approved"
+        );
         assert_eq!(round_tripped.outbox_status.as_deref(), Some("sent"));
         assert_eq!(round_tripped.memory_consolidator_warnings.len(), 2);
     }
@@ -1885,11 +1894,8 @@ mod protocol_skeleton_tests {
     ];
 
     /// 历史脏值（R9.2 / R9.10.e 严格拒收 — 暗示人工接管）。
-    const FINAL_REVIEW_STATUS_FORBIDDEN: &[&str] = &[
-        "held_for_human",
-        "human_required",
-        "waiting_for_human",
-    ];
+    const FINAL_REVIEW_STATUS_FORBIDDEN: &[&str] =
+        &["held_for_human", "human_required", "waiting_for_human"];
 
     #[test]
     fn final_review_status_allowed_set_excludes_human_handoff_values() {

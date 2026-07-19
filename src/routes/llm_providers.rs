@@ -34,8 +34,8 @@ use crate::{
     secret::mask_secret,
 };
 
-use super::AppState;
 use super::shared::resolve_authorized_workspace;
+use super::AppState;
 
 /// api_key mask：复用 [`crate::secret::mask_secret`]（保留前 3 + 后 4，
 /// 中间 `****`）。本路由保留 `mask_api_key` 名称是为兼容已有调用站点；
@@ -150,7 +150,8 @@ pub(super) async fn create_provider(
     Extension(admin): Extension<AuthenticatedAdmin>,
     Json(body): Json<UpsertRequest>,
 ) -> AppResult<Json<Value>> {
-    let workspace_id = resolve_authorized_workspace(&state, &admin, body.workspace_id.clone()).await?;
+    let workspace_id =
+        resolve_authorized_workspace(&state, &admin, body.workspace_id.clone()).await?;
     let fmt = LlmFormat::parse(&body.format)?;
     if body.provider_id.trim().is_empty() {
         return Err(AppError::BadRequest("providerId 不能为空".to_string()));
@@ -192,11 +193,7 @@ pub(super) async fn create_provider(
         .llm_provider_configs()
         .insert_one(&cfg, None)
         .await
-        .map_err(|err| {
-            AppError::BadRequest(format!(
-                "创建失败（可能 providerId 重复）: {err}"
-            ))
-        })?;
+        .map_err(|err| AppError::BadRequest(format!("创建失败（可能 providerId 重复）: {err}")))?;
     // KD-09：openai 形态 base_url 缺 /v1 时软提示（不阻断保存）。cfg.base_url 已 trim :178，
     // fmt 复用上方 :154 已解析的合法值，不重复 parse。
     let warning = base_url_v1_warning(fmt, &cfg.base_url);
@@ -216,7 +213,8 @@ pub(super) async fn update_provider(
     Path(provider_id): Path<String>,
     Json(body): Json<UpsertRequest>,
 ) -> AppResult<Json<Value>> {
-    let workspace_id = resolve_authorized_workspace(&state, &admin, body.workspace_id.clone()).await?;
+    let workspace_id =
+        resolve_authorized_workspace(&state, &admin, body.workspace_id.clone()).await?;
     LlmFormat::parse(&body.format)?;
     let existing = state
         .db
@@ -296,7 +294,8 @@ pub(super) async fn delete_provider(
     Path(provider_id): Path<String>,
     Query(params): Query<ListQuery>,
 ) -> AppResult<Json<Value>> {
-    let workspace_id = resolve_authorized_workspace(&state, &admin, params.workspace_id.clone()).await?;
+    let workspace_id =
+        resolve_authorized_workspace(&state, &admin, params.workspace_id.clone()).await?;
     let existing = state
         .db
         .llm_provider_configs()
@@ -328,7 +327,8 @@ pub async fn activate_provider(
     Path(provider_id): Path<String>,
     Query(params): Query<ListQuery>,
 ) -> AppResult<Json<Value>> {
-    let workspace_id = resolve_authorized_workspace(&state, &admin, params.workspace_id.clone()).await?;
+    let workspace_id =
+        resolve_authorized_workspace(&state, &admin, params.workspace_id.clone()).await?;
     let target = state
         .db
         .llm_provider_configs()
@@ -395,7 +395,8 @@ pub(super) async fn set_vision_active(
     Path(provider_id): Path<String>,
     Json(body): Json<VisionActivateRequest>,
 ) -> AppResult<Json<Value>> {
-    let workspace_id = resolve_authorized_workspace(&state, &admin, body.workspace_id.clone()).await?;
+    let workspace_id =
+        resolve_authorized_workspace(&state, &admin, body.workspace_id.clone()).await?;
     let target = state
         .db
         .llm_provider_configs()
@@ -464,62 +465,60 @@ pub(super) async fn test_provider(
     Extension(admin): Extension<AuthenticatedAdmin>,
     Json(body): Json<TestRequest>,
 ) -> AppResult<Json<Value>> {
-    let workspace_id = resolve_authorized_workspace(&state, &admin, body.workspace_id.clone()).await?;
-    let (format, base_url, api_key, model, timeout) = if let Some(pid) = body
-        .provider_id
-        .as_ref()
-        .filter(|s| !s.trim().is_empty())
-    {
-        let cfg = state
-            .db
-            .llm_provider_configs()
-            .find_one(
-                doc! { "workspaceId": &workspace_id, "providerId": pid },
-                None,
-            )
-            .await?
-            .ok_or_else(|| AppError::NotFound(format!("provider {pid} not found")))?;
-        // 若客户端额外提供 inline 覆盖（编辑表单未保存即测试），按 inline 优先；
-        // 但若 apiKey 是 mask 形态则继续用 DB 中的真值。
-        let api_key = match body
-            .api_key
-            .as_ref()
-            .filter(|k| !k.trim().is_empty() && !is_masked_value(k))
-        {
-            Some(k) => k.clone(),
-            None => cfg.api_key.clone(),
+    let workspace_id =
+        resolve_authorized_workspace(&state, &admin, body.workspace_id.clone()).await?;
+    let (format, base_url, api_key, model, timeout) =
+        if let Some(pid) = body.provider_id.as_ref().filter(|s| !s.trim().is_empty()) {
+            let cfg = state
+                .db
+                .llm_provider_configs()
+                .find_one(
+                    doc! { "workspaceId": &workspace_id, "providerId": pid },
+                    None,
+                )
+                .await?
+                .ok_or_else(|| AppError::NotFound(format!("provider {pid} not found")))?;
+            // 若客户端额外提供 inline 覆盖（编辑表单未保存即测试），按 inline 优先；
+            // 但若 apiKey 是 mask 形态则继续用 DB 中的真值。
+            let api_key = match body
+                .api_key
+                .as_ref()
+                .filter(|k| !k.trim().is_empty() && !is_masked_value(k))
+            {
+                Some(k) => k.clone(),
+                None => cfg.api_key.clone(),
+            };
+            let format = body.format.clone().unwrap_or(cfg.format.clone());
+            let base_url = body.base_url.clone().unwrap_or(cfg.base_url.clone());
+            let model = body.model.clone().unwrap_or(cfg.model.clone());
+            let timeout = body
+                .timeout_seconds
+                .or(cfg.timeout_seconds)
+                .unwrap_or(state.config.llm_timeout_seconds);
+            (format, base_url, api_key, model, timeout)
+        } else {
+            let format = body
+                .format
+                .clone()
+                .ok_or_else(|| AppError::BadRequest("format 必填".to_string()))?;
+            let base_url = body
+                .base_url
+                .clone()
+                .ok_or_else(|| AppError::BadRequest("baseUrl 必填".to_string()))?;
+            let api_key = body
+                .api_key
+                .clone()
+                .filter(|k| !k.trim().is_empty() && !is_masked_value(k))
+                .ok_or_else(|| AppError::BadRequest("apiKey 必填且不能是 mask 占位".to_string()))?;
+            let model = body
+                .model
+                .clone()
+                .ok_or_else(|| AppError::BadRequest("model 必填".to_string()))?;
+            let timeout = body
+                .timeout_seconds
+                .unwrap_or(state.config.llm_timeout_seconds);
+            (format, base_url, api_key, model, timeout)
         };
-        let format = body.format.clone().unwrap_or(cfg.format.clone());
-        let base_url = body.base_url.clone().unwrap_or(cfg.base_url.clone());
-        let model = body.model.clone().unwrap_or(cfg.model.clone());
-        let timeout = body
-            .timeout_seconds
-            .or(cfg.timeout_seconds)
-            .unwrap_or(state.config.llm_timeout_seconds);
-        (format, base_url, api_key, model, timeout)
-    } else {
-        let format = body
-            .format
-            .clone()
-            .ok_or_else(|| AppError::BadRequest("format 必填".to_string()))?;
-        let base_url = body
-            .base_url
-            .clone()
-            .ok_or_else(|| AppError::BadRequest("baseUrl 必填".to_string()))?;
-        let api_key = body
-            .api_key
-            .clone()
-            .filter(|k| !k.trim().is_empty() && !is_masked_value(k))
-            .ok_or_else(|| AppError::BadRequest("apiKey 必填且不能是 mask 占位".to_string()))?;
-        let model = body
-            .model
-            .clone()
-            .ok_or_else(|| AppError::BadRequest("model 必填".to_string()))?;
-        let timeout = body
-            .timeout_seconds
-            .unwrap_or(state.config.llm_timeout_seconds);
-        (format, base_url, api_key, model, timeout)
-    };
     let fmt = LlmFormat::parse(&format)?;
     let client = LlmClient::with_format(
         base_url,

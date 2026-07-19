@@ -60,10 +60,16 @@ mod tests {
     fn msg(dir: MessageDirection) -> ConversationMessage {
         ConversationMessage {
             id: Some(ObjectId::new()),
-            workspace_id: "w".into(), account_id: "a".into(), contact_wxid: "c".into(),
-            message_id: None, dedupe_key: None,
-            direction: dir, content: "x".into(),
-            msg_type: None, media_ref: None, raw: None,
+            workspace_id: "w".into(),
+            account_id: "a".into(),
+            contact_wxid: "c".into(),
+            message_id: None,
+            dedupe_key: None,
+            direction: dir,
+            content: "x".into(),
+            msg_type: None,
+            media_ref: None,
+            raw: None,
             is_synthetic_relay: false,
             created_at: mongodb::bson::DateTime::from_millis(0),
         }
@@ -71,7 +77,10 @@ mod tests {
 
     #[test]
     fn resolve_evidence_maps_index_to_oid_and_drops_out_of_range() {
-        let w = vec![msg(MessageDirection::Inbound), msg(MessageDirection::Outbound)];
+        let w = vec![
+            msg(MessageDirection::Inbound),
+            msg(MessageDirection::Outbound),
+        ];
         let ev = resolve_evidence(&w, &[0, 5]); // 0 有效, 5 越界
         assert_eq!(ev.len(), 1);
         assert_eq!(ev[0].turn, 0);
@@ -82,20 +91,29 @@ mod tests {
     fn strength_strong_when_inbound_and_explicit() {
         let w = vec![msg(MessageDirection::Inbound)];
         let ev = resolve_evidence(&w, &[0]);
-        assert!(matches!(evidence_strength(&ev, &w, true), EvidenceStrength::Strong));
+        assert!(matches!(
+            evidence_strength(&ev, &w, true),
+            EvidenceStrength::Strong
+        ));
     }
 
     #[test]
     fn strength_weak_when_outbound_even_if_explicit() {
         let w = vec![msg(MessageDirection::Outbound)];
         let ev = resolve_evidence(&w, &[0]);
-        assert!(matches!(evidence_strength(&ev, &w, true), EvidenceStrength::Weak));
+        assert!(matches!(
+            evidence_strength(&ev, &w, true),
+            EvidenceStrength::Weak
+        ));
     }
 
     #[test]
     fn strength_weak_when_not_explicit() {
         let w = vec![msg(MessageDirection::Inbound)];
         let ev = resolve_evidence(&w, &[0]);
-        assert!(matches!(evidence_strength(&ev, &w, false), EvidenceStrength::Weak));
+        assert!(matches!(
+            evidence_strength(&ev, &w, false),
+            EvidenceStrength::Weak
+        ));
     }
 }

@@ -30,10 +30,10 @@ use wechatagent::agent::knowledge_agent::{
     classify_recall_outcome, filter_answer_against_opened, merge_catalog_pure, rank_key,
     split_prefetch, truncate_chars, wiki_type_priority, AnswerResult, CatalogEntry, RawSourceQuote,
 };
-use wechatagent::models::OperationKnowledgeChunk;
 use wechatagent::knowledge_wiki::structural_proposals::{
     StructuralKind, StructuralProposal, STATUS_PENDING_REVIEW,
 };
+use wechatagent::models::OperationKnowledgeChunk;
 
 // ── 字符串生成器 ─────────────────────────────────────────────────────
 
@@ -50,12 +50,13 @@ fn arb_chunk_id_vec(max: usize) -> impl Strategy<Value = Vec<String>> {
 }
 
 fn arb_raw_quote() -> impl Strategy<Value = RawSourceQuote> {
-    (arb_chunk_id(), "[ -~]{0,20}", proptest::option::of(0i32..8))
-        .prop_map(|(chunk_id, quote, source_anchor_index)| RawSourceQuote {
+    (arb_chunk_id(), "[ -~]{0,20}", proptest::option::of(0i32..8)).prop_map(
+        |(chunk_id, quote, source_anchor_index)| RawSourceQuote {
             chunk_id,
             quote,
             source_anchor_index,
-        })
+        },
+    )
 }
 
 fn arb_raw_quote_vec(max: usize) -> impl Strategy<Value = Vec<RawSourceQuote>> {
@@ -646,15 +647,57 @@ fn metric_relevant_chunks_rank_into_top_k() {
     let now = DateTime::now();
     let mut corpus = Vec::new();
     // 强相关，故意 static 最差（conf=0.01, priority=0）。
-    corpus.push(mk_rank_chunk("报价规则", "标准报价与折扣阶梯说明", "methodology", 0.01, 0, false, None));
-    corpus.push(mk_rank_chunk("折扣政策", "大客户折扣报价审批", "methodology", 0.02, 0, false, None));
-    corpus.push(mk_rank_chunk("报价折扣常见问答", "报价 折扣 如何组合", "finding", 0.01, 0, false, None));
+    corpus.push(mk_rank_chunk(
+        "报价规则",
+        "标准报价与折扣阶梯说明",
+        "methodology",
+        0.01,
+        0,
+        false,
+        None,
+    ));
+    corpus.push(mk_rank_chunk(
+        "折扣政策",
+        "大客户折扣报价审批",
+        "methodology",
+        0.02,
+        0,
+        false,
+        None,
+    ));
+    corpus.push(mk_rank_chunk(
+        "报价折扣常见问答",
+        "报价 折扣 如何组合",
+        "finding",
+        0.01,
+        0,
+        false,
+        None,
+    ));
     // 噪声，故意 static 最优（conf=0.99, priority=99）。
-    for t in ["售后流程", "物流时效", "退换货", "会员等级", "门店地址", "营业时间", "联系方式"] {
-        corpus.push(mk_rank_chunk(t, "与报价无关的运营资料", "entity", 0.99, 99, false, None));
+    for t in [
+        "售后流程",
+        "物流时效",
+        "退换货",
+        "会员等级",
+        "门店地址",
+        "营业时间",
+        "联系方式",
+    ] {
+        corpus.push(mk_rank_chunk(
+            t,
+            "与报价无关的运营资料",
+            "entity",
+            0.99,
+            99,
+            false,
+            None,
+        ));
     }
 
-    let relevant: HashSet<&str> = ["报价规则", "折扣政策", "报价折扣常见问答"].into_iter().collect();
+    let relevant: HashSet<&str> = ["报价规则", "折扣政策", "报价折扣常见问答"]
+        .into_iter()
+        .collect();
     let ranked = rank_sorted("报价 折扣", &corpus, now);
 
     // recall@3 必须满分：3 条强相关全部进 top-3，static 噪声压不住相关度。
@@ -663,7 +706,11 @@ fn metric_relevant_chunks_rank_into_top_k() {
         (r3 - 1.0).abs() < f64::EPSILON,
         "recall@3 应为 1.0（相关度主导排序），实得 {}；排序后 top5={:?}",
         r3,
-        ranked.iter().take(5).map(|c| c.title.as_str()).collect::<Vec<_>>(),
+        ranked
+            .iter()
+            .take(5)
+            .map(|c| c.title.as_str())
+            .collect::<Vec<_>>(),
     );
     // hit@1：排第一的必是 relevant。
     assert!(
@@ -682,24 +729,67 @@ fn metric_superseded_expired_do_not_poison_topk() {
     let past = DateTime::from_millis(now.timestamp_millis() - 7 * 86_400_000);
     let mut corpus = Vec::new();
     // 三版本同标题前缀内容，relevance 全等；只 trust/recency 不同。
-    corpus.push(mk_rank_chunk("报价规则-现行", "报价 折扣 阶梯", "methodology", 0.5, 10, false, None));
-    corpus.push(mk_rank_chunk("报价规则-旧版", "报价 折扣 阶梯", "methodology", 0.5, 10, true, None));
-    corpus.push(mk_rank_chunk("报价规则-过期", "报价 折扣 阶梯", "methodology", 0.5, 10, false, Some(past)));
+    corpus.push(mk_rank_chunk(
+        "报价规则-现行",
+        "报价 折扣 阶梯",
+        "methodology",
+        0.5,
+        10,
+        false,
+        None,
+    ));
+    corpus.push(mk_rank_chunk(
+        "报价规则-旧版",
+        "报价 折扣 阶梯",
+        "methodology",
+        0.5,
+        10,
+        true,
+        None,
+    ));
+    corpus.push(mk_rank_chunk(
+        "报价规则-过期",
+        "报价 折扣 阶梯",
+        "methodology",
+        0.5,
+        10,
+        false,
+        Some(past),
+    ));
     // 噪声。
     for t in ["售后流程", "物流时效", "退换货"] {
-        corpus.push(mk_rank_chunk(t, "与报价无关", "entity", 0.99, 99, false, None));
+        corpus.push(mk_rank_chunk(
+            t,
+            "与报价无关",
+            "entity",
+            0.99,
+            99,
+            false,
+            None,
+        ));
     }
 
     let ranked = rank_sorted("报价 折扣 阶梯", &corpus, now);
     assert_eq!(
-        ranked[0].title, "报价规则-现行",
+        ranked[0].title,
+        "报价规则-现行",
         "live 版必须排在 superseded/expired 同内容之前；实得 top3={:?}",
-        ranked.iter().take(3).map(|c| c.title.as_str()).collect::<Vec<_>>(),
+        ranked
+            .iter()
+            .take(3)
+            .map(|c| c.title.as_str())
+            .collect::<Vec<_>>(),
     );
     // live 版排名必须严格优于它的 superseded / expired 同内容版本。
     let pos = |title: &str| ranked.iter().position(|c| c.title == title).unwrap();
-    assert!(pos("报价规则-现行") < pos("报价规则-旧版"), "live 必先于 superseded");
-    assert!(pos("报价规则-现行") < pos("报价规则-过期"), "live 必先于 expired");
+    assert!(
+        pos("报价规则-现行") < pos("报价规则-旧版"),
+        "live 必先于 superseded"
+    );
+    assert!(
+        pos("报价规则-现行") < pos("报价规则-过期"),
+        "live 必先于 expired"
+    );
 }
 
 #[test]
@@ -713,6 +803,8 @@ fn metric_empty_query_degrades_to_static_order() {
         mk_rank_chunk("高分", "y", "entity", 0.9, 1, false, None),
     ];
     let ranked = rank_sorted("", &corpus, now);
-    assert_eq!(ranked[0].title, "高分", "空 query 应退化为高 confidence 优先");
+    assert_eq!(
+        ranked[0].title, "高分",
+        "空 query 应退化为高 confidence 优先"
+    );
 }
-

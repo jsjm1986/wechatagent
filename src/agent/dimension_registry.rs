@@ -59,13 +59,48 @@ use ValueSource::*;
 
 /// 维度元数据单一真相源。新增维度在此加一行。
 pub(crate) const DIMENSION_REGISTRY: &[DimensionSpec] = &[
-    DimensionSpec { kind: "customer_stage", channel: LlmSignals, typed: true, value_source: Taxonomy },
-    DimensionSpec { kind: "intent_level", channel: LlmSignals, typed: true, value_source: Taxonomy },
-    DimensionSpec { kind: "purchase_lifecycle", channel: LlmSignals, typed: false, value_source: Taxonomy },
-    DimensionSpec { kind: "churn_reason", channel: LlmSignals, typed: false, value_source: Taxonomy },
-    DimensionSpec { kind: "value_tier", channel: GatewayDerived, typed: false, value_source: CodeEnum },
-    DimensionSpec { kind: "relationship_type", channel: AdminDirect, typed: false, value_source: Taxonomy },
-    DimensionSpec { kind: "objection_type", channel: ReactionDerived, typed: false, value_source: Taxonomy },
+    DimensionSpec {
+        kind: "customer_stage",
+        channel: LlmSignals,
+        typed: true,
+        value_source: Taxonomy,
+    },
+    DimensionSpec {
+        kind: "intent_level",
+        channel: LlmSignals,
+        typed: true,
+        value_source: Taxonomy,
+    },
+    DimensionSpec {
+        kind: "purchase_lifecycle",
+        channel: LlmSignals,
+        typed: false,
+        value_source: Taxonomy,
+    },
+    DimensionSpec {
+        kind: "churn_reason",
+        channel: LlmSignals,
+        typed: false,
+        value_source: Taxonomy,
+    },
+    DimensionSpec {
+        kind: "value_tier",
+        channel: GatewayDerived,
+        typed: false,
+        value_source: CodeEnum,
+    },
+    DimensionSpec {
+        kind: "relationship_type",
+        channel: AdminDirect,
+        typed: false,
+        value_source: Taxonomy,
+    },
+    DimensionSpec {
+        kind: "objection_type",
+        channel: ReactionDerived,
+        typed: false,
+        value_source: Taxonomy,
+    },
 ];
 
 /// 查某维度的契约；未知维度返回 None。
@@ -75,7 +110,11 @@ pub(crate) fn spec_for(kind: &str) -> Option<&'static DimensionSpec> {
 
 /// 派生：所有 typed 维度的 kind（替代硬编码 KNOWN_TYPED_DIMS / SALES_TYPED_DIMENSION_KINDS）。
 pub(crate) fn typed_dimension_kinds() -> Vec<&'static str> {
-    DIMENSION_REGISTRY.iter().filter(|s| s.typed).map(|s| s.kind).collect()
+    DIMENSION_REGISTRY
+        .iter()
+        .filter(|s| s.typed)
+        .map(|s| s.kind)
+        .collect()
 }
 
 /// 维度取值校验结论。
@@ -165,7 +204,7 @@ async fn lookup_dict(
     scope_account_id: &str,
 ) -> DictLookup {
     use crate::agent::taxonomy::{check_value, global_taxonomy_cache, kind_has_entries};
-    let cache = global_taxonomy_cache();
+    let cache = global_taxonomy_cache(db);
     cache.find_or_load(db, workspace_id).await;
     match match_to_dict(check_value(
         workspace_id,
@@ -176,9 +215,7 @@ async fn lookup_dict(
     )) {
         // check_value 对「字典空」与「值越界」都回 CandidateNew→Miss，这里用 kind_has_entries
         // 细分：该 kind 无任何条目 → KindUnconfigured（未配置）。同一 cache，无中途 reload。
-        DictLookup::Miss
-            if !kind_has_entries(workspace_id, kind, scope_account_id, &cache) =>
-        {
+        DictLookup::Miss if !kind_has_entries(workspace_id, kind, scope_account_id, &cache) => {
             DictLookup::KindUnconfigured
         }
         other => other,
@@ -214,9 +251,7 @@ pub(crate) async fn validate_dimension_value(
 /// 纯内核（簇 B 缺口 6）：把每个 stage 的 DimValidation 聚合成归一结果。
 /// Accept → 收集 canonical；Reject → 短路返 Err（该项原因）；DropSilently（空串）→ 跳过。
 /// 无 IO，完全可单测。
-pub(crate) fn fold_stage_validations(
-    results: Vec<DimValidation>,
-) -> Result<Vec<String>, String> {
+pub(crate) fn fold_stage_validations(results: Vec<DimValidation>) -> Result<Vec<String>, String> {
     let mut out = Vec::with_capacity(results.len());
     for r in results {
         match r {
@@ -266,8 +301,13 @@ mod tests {
         let kinds: Vec<&str> = DIMENSION_REGISTRY.iter().map(|s| s.kind).collect();
         assert_eq!(kinds.len(), 7);
         for k in [
-            "customer_stage", "intent_level", "purchase_lifecycle",
-            "churn_reason", "value_tier", "relationship_type", "objection_type",
+            "customer_stage",
+            "intent_level",
+            "purchase_lifecycle",
+            "churn_reason",
+            "value_tier",
+            "relationship_type",
+            "objection_type",
         ] {
             assert!(kinds.contains(&k), "registry 缺维度 {k}");
         }
@@ -283,10 +323,22 @@ mod tests {
 
     #[test]
     fn spec_for_known_and_unknown() {
-        assert_eq!(spec_for("value_tier").unwrap().channel, DimensionChannel::GatewayDerived);
-        assert_eq!(spec_for("value_tier").unwrap().value_source, ValueSource::CodeEnum);
-        assert_eq!(spec_for("relationship_type").unwrap().channel, DimensionChannel::AdminDirect);
-        assert_eq!(spec_for("objection_type").unwrap().channel, DimensionChannel::ReactionDerived);
+        assert_eq!(
+            spec_for("value_tier").unwrap().channel,
+            DimensionChannel::GatewayDerived
+        );
+        assert_eq!(
+            spec_for("value_tier").unwrap().value_source,
+            ValueSource::CodeEnum
+        );
+        assert_eq!(
+            spec_for("relationship_type").unwrap().channel,
+            DimensionChannel::AdminDirect
+        );
+        assert_eq!(
+            spec_for("objection_type").unwrap().channel,
+            DimensionChannel::ReactionDerived
+        );
         assert!(spec_for("nonexistent").is_none());
     }
 
@@ -304,7 +356,12 @@ mod tests {
         // relationship_type=AdminDirect+Taxonomy：字典有条目但此值越界(Miss) → Reject。
         // 即便是机器路径写（MachineWrite），AdminDirect 通道仍恒 Reject。
         let spec = spec_for("relationship_type").unwrap();
-        let r = classify_validation(spec, DictLookup::Miss, "瞎编关系", WriteIntent::MachineWrite);
+        let r = classify_validation(
+            spec,
+            DictLookup::Miss,
+            "瞎编关系",
+            WriteIntent::MachineWrite,
+        );
         assert!(matches!(r, DimValidation::Reject(_)));
     }
 
@@ -386,7 +443,12 @@ mod tests {
         // Known 覆盖 Active(canonical) 与 Deprecated：两者都是字典登记过的合法值 → Accept 原值。
         // 红线：deprecated 是历史合法值，admin 通道也必须 Accept 不得 reject。
         let stage = spec_for("customer_stage").unwrap();
-        let r = classify_validation(stage, DictLookup::Known, "need_discovery", WriteIntent::AdminWrite);
+        let r = classify_validation(
+            stage,
+            DictLookup::Known,
+            "need_discovery",
+            WriteIntent::AdminWrite,
+        );
         assert!(matches!(r, DimValidation::Accept(ref c) if c == "need_discovery"));
         let rel = spec_for("relationship_type").unwrap();
         let r2 = classify_validation(rel, DictLookup::Known, "customer", WriteIntent::AdminWrite);
@@ -429,7 +491,13 @@ mod tests {
             DimValidation::Accept("need_discovery".into()),
             DimValidation::Accept("negotiation".into()),
         ]);
-        assert_eq!(r, Ok(vec!["need_discovery".to_string(), "negotiation".to_string()]));
+        assert_eq!(
+            r,
+            Ok(vec![
+                "need_discovery".to_string(),
+                "negotiation".to_string()
+            ])
+        );
     }
 
     #[test]

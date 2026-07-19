@@ -204,17 +204,27 @@ async fn account_level_402_not_misconfig_observe_swallows() {
     };
     // 账户级 402 不算端点配错 → ObserveOnly 照常吞，返 None 不 panic。
     let out = run_judge_graded(&judge, &r, "t", "in", "reply", 1, JudgeGate::ObserveOnly).await;
-    assert!(out.is_none(), "402 账户级应按 gate 处置，ObserveOnly 返 None");
+    assert!(
+        out.is_none(),
+        "402 账户级应按 gate 处置，ObserveOnly 返 None"
+    );
 }
 
 #[tokio::test]
 async fn scoring_judge_returns_medians() {
     set_judge_env();
     let r = build_judge_rubric(&default_domain_profile("ws"));
-    let out = run_judge_graded(&ScoringJudge, &r, "t", "in", "reply", 3, JudgeGate::QualityGate)
-        .await
-        .expect("成功打分应返 Some");
+    let out = run_judge_graded(
+        &ScoringJudge,
+        &r,
+        "t",
+        "in",
+        "reply",
+        3,
+        JudgeGate::QualityGate,
+    )
+    .await
+    .expect("成功打分应返 Some");
     assert_eq!(out.medians.get("humanLike"), Some(&8));
     assert!(out.attempted >= 1);
 }
-

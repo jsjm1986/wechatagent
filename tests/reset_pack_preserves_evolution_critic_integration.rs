@@ -18,7 +18,10 @@ use crate::common::TestApp;
 
 const CRITIC_KEY: &str = "evolution_critic_v1";
 
-async fn critic_current(app: &TestApp, workspace: &str) -> Option<wechatagent::models::PromptTemplate> {
+async fn critic_current(
+    app: &TestApp,
+    workspace: &str,
+) -> Option<wechatagent::models::PromptTemplate> {
     app.state
         .db
         .prompt_templates()
@@ -48,10 +51,7 @@ async fn reset_pack_preserves_evolution_critic_prompt() {
         .await
         .expect("seed evolution pack");
     let before = critic_current(&app, &workspace).await;
-    assert!(
-        before.is_some(),
-        "前置:reset 前 evolution_critic_v1 应存在"
-    );
+    assert!(before.is_some(), "前置:reset 前 evolution_critic_v1 应存在");
 
     // act:显式销毁性 reseed。
     prompts::reset_prompt_pack_v2(&app.state.db, &workspace, &account)
@@ -59,9 +59,9 @@ async fn reset_pack_preserves_evolution_critic_prompt() {
         .expect("reset_prompt_pack_v2");
 
     // assert:critic prompt 仍在（修复前会被 delete_many 删且不重种→None）。
-    let after = critic_current(&app, &workspace).await.expect(
-        "reset 后 evolution_critic_v1 必须仍存在(修复补种);缺失=M12 回归",
-    );
+    let after = critic_current(&app, &workspace)
+        .await
+        .expect("reset 后 evolution_critic_v1 必须仍存在(修复补种);缺失=M12 回归");
     assert_eq!(after.prompt_key, CRITIC_KEY);
     assert_eq!(after.status, "active", "critic prompt 应为 active");
     assert!(after.current_version, "critic prompt 应为 current_version");
@@ -70,8 +70,5 @@ async fn reset_pack_preserves_evolution_critic_prompt() {
     let loaded = prompts::load_prompt(&app.state.db, &workspace, CRITIC_KEY)
         .await
         .expect("reset 后 load_prompt(evolution_critic_v1) 不应 NotFound");
-    assert!(
-        !loaded.trim().is_empty(),
-        "critic prompt 内容不应为空"
-    );
+    assert!(!loaded.trim().is_empty(), "critic prompt 内容不应为空");
 }

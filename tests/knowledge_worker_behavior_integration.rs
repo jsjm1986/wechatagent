@@ -1,68 +1,168 @@
-//! 知识 worker execute_step 红线集成测试:占位桩的**行为契约**——
-//! 合法 action 返 Ok + chunk_id 透传 targetChunkId;unsupported action 返 Err。
-//! 全部 `#[ignore]`,需 Docker testcontainers(execute_step 取 &AppState,虽不读 DB)。
-//! CI:`cargo test --test knowledge_worker_behavior_integration -- --ignored`。
-//!
-//! ## 红线意义(P0):execute_step 是 Phase 4 派工编排占位桩——6 个 action 全部只返回
-//! StepOutcome,**绝不写 chunk verified / 不发 outbox**(mod.rs:430 契约 + `_state` 未使用)。
-//! 真实 fix/add 仍走运营在 chat 内的 chat_apply(强制 draft+needs_review)。本测试钉死
-//! "派工不直接落 verified" 的边界:一旦未来 execute_step 被改为真写 chunk 状态,
-//! 其签名/行为会变,本契约测试是回归哨兵。
+//! SR-126: knowledge worker evidence must assert business verdicts and side effects.
+
 #![cfg(test)]
 
 mod common;
 
-use mongodb::bson::doc;
+use std::sync::Arc;
 
-use wechatagent::knowledge_task::execute_step;
+use mongodb::bson::{doc, oid::ObjectId, DateTime};
+use serde_json::json;
+use wechatagent::knowledge_task::{execute_step, run_task, ChatProgressBus, StepVerdict};
+use wechatagent::models::KnowledgeChatTask;
 
 use crate::common::TestApp;
 
-/// fix_chunk / retag 透传 targetChunkId;返回 Ok(不报错、不写 verified)。
-#[tokio::test]
-#[ignore]
-async fn execute_step_fix_and_retag_passthrough_chunk_id() {
-    let app = TestApp::start().await;
-    let step = doc! { "targetChunkId": "chunk_abc" };
-
-    let fix = execute_step(&app.state, "ws", "acc", "fix_chunk", &step)
-        .await
-        .expect("fix_chunk 应 Ok");
-    assert_eq!(
-        fix.chunk_id.as_deref(),
-        Some("chunk_abc"),
-        "fix_chunk 应透传 targetChunkId"
-    );
-
-    let retag = execute_step(&app.state, "ws", "acc", "retag", &step)
-        .await
-        .expect("retag 应 Ok");
-    assert_eq!(
-        retag.chunk_id.as_deref(),
-        Some("chunk_abc"),
-        "retag 应透传 targetChunkId"
-    );
-}
-
-/// add_chunk / review_evolution / analyze_logs / dismiss 返 Ok 且 chunk_id=None(纯编排)。
-#[tokio::test]
-#[ignore]
-async fn execute_step_orchestration_actions_ok_no_chunk() {
-    let app = TestApp::start().await;
-    let empty = doc! {};
-    for action in ["add_chunk", "review_evolution", "analyze_logs", "dismiss"] {
-        let out = execute_step(&app.state, "ws", "acc", action, &empty)
-            .await
-            .unwrap_or_else(|e| panic!("{action} 应 Ok,实际 {e:?}"));
-        assert!(out.chunk_id.is_none(), "{action} 不应关联具体 chunk");
+async fn exercise_step_verdicts(app: &TestApp) -> anyhow::Result<()> {
+    for (action, step) in [
+        ("fix_chunk", doc! {}),
+        ("retag", doc! { "targetChunkId": "not-an-object-id" }),
+        ("add_chunk", doc! {}),
+        ("dismiss", doc! {}),
+    ] {
+        let out = execute_step(&app.state, "ws_worker", "acc", action, &step).await?;
+        anyhow::ensure!(
+            out.verdict == StepVerdict::Failed,
+            "{action}={:?}",
+            out.verdict
+        );
     }
+    let manual = execute_step(&app.state, "ws_worker", "acc", "review_evolution", &doc! {}).await?;
+    anyhow::ensure!(manual.verdict == StepVerdict::NeedsManual);
+    let noop = execute_step(&app.state, "ws_worker", "acc", "analyze_logs", &doc! {}).await?;
+    anyhow::ensure!(noop.verdict == StepVerdict::Noop);
+    anyhow::ensure!(
+        execute_step(&app.state, "ws_worker", "acc", "drop_table", &doc! {})
+            .await
+            .is_err()
+    );
+    Ok(())
 }
 
-/// 红线:未知 action 必须返 Err(不静默吞掉派工指令)。
 #[tokio::test]
 #[ignore]
-async fn execute_step_unsupported_action_errors() {
+async fn execute_step_reports_typed_business_verdicts() {
     let app = TestApp::start().await;
-    let result = execute_step(&app.state, "ws", "acc", "drop_table", &doc! {}).await;
-    assert!(result.is_err(), "未知 action 必须 Err");
+    let result = exercise_step_verdicts(&app).await;
+    app.cleanup().await;
+    result.expect("exercise typed worker verdicts");
+}
+
+async fn exercise_committed_add(app: &TestApp) -> anyhow::Result<()> {
+    app.llm.push_response(json!({
+        "patch": {
+            "title": "Worker draft",
+            "summary": "Worker-created auditable draft",
+            "body": "Worker-created auditable draft body",
+            "knowledgeType": "methodology"
+        },
+        "missingFields": [],
+        "followupQuestions": [],
+        "naturalReply": "Drafted"
+    }));
+    let out = execute_step(
+        &app.state,
+        "ws_worker",
+        "acc",
+        "add_chunk",
+        &doc! { "stepId": "add-1", "summary": "Worker-created auditable draft body" },
+    )
+    .await?;
+    anyhow::ensure!(out.verdict == StepVerdict::Committed);
+    let id = ObjectId::parse_str(out.chunk_id.as_deref().unwrap_or_default())?;
+    let row = app
+        .state
+        .db
+        .operation_knowledge_chunks()
+        .find_one(doc! { "_id": id, "workspace_id": "ws_worker" }, None)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("committed verdict without persisted chunk"))?;
+    anyhow::ensure!(row.status == "draft");
+    anyhow::ensure!(row.integrity_status.as_deref() == Some("needs_review"));
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore]
+async fn committed_add_has_real_draft_side_effect() {
+    let app = TestApp::start().await;
+    let result = exercise_committed_add(&app).await;
+    app.cleanup().await;
+    result.expect("committed add must persist a draft");
+}
+
+async fn exercise_task_summary(app: &TestApp) -> anyhow::Result<()> {
+    let id = ObjectId::new();
+    let task = KnowledgeChatTask {
+        id: Some(id),
+        workspace_id: "ws_worker".into(),
+        account_id: "acc".into(),
+        session_id: "sr126-worker-summary".into(),
+        operator_id: Some("operator".into()),
+        cards: vec![],
+        planned_steps: vec![
+            doc! { "stepId": "noop", "cardId": "c1", "action": "analyze_logs" },
+            doc! { "stepId": "manual", "cardId": "c2", "action": "review_evolution" },
+            doc! { "stepId": "failed", "cardId": "c3", "action": "dismiss" },
+        ],
+        completed_steps: vec![],
+        status: "pending".into(),
+        error_kind: None,
+        created_at: DateTime::now(),
+        started_at: None,
+        finished_at: None,
+    };
+    app.state
+        .db
+        .knowledge_chat_tasks()
+        .insert_one(&task, None)
+        .await?;
+    run_task(&app.state, &Arc::new(ChatProgressBus::new()), task).await?;
+    let saved = app
+        .state
+        .db
+        .knowledge_chat_tasks()
+        .find_one(doc! { "_id": id }, None)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("task disappeared"))?;
+    let statuses: Vec<&str> = saved
+        .completed_steps
+        .iter()
+        .filter_map(|step| step.get_str("status").ok())
+        .collect();
+    anyhow::ensure!(statuses == ["noop", "needs_manual", "failed"]);
+    let failed = saved
+        .completed_steps
+        .iter()
+        .find(|step| step.get_str("status").ok() == Some("failed"))
+        .ok_or_else(|| anyhow::anyhow!("failed step missing"))?;
+    anyhow::ensure!(!failed.get_str("error")?.trim().is_empty());
+    let summary = app
+        .state
+        .db
+        .knowledge_chat_turns()
+        .find_one(
+            doc! { "session_id": "sr126-worker-summary", "kind": "task_summary" },
+            None,
+        )
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("summary turn missing"))?;
+    let detail = summary
+        .attachments
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("summary detail missing"))?;
+    anyhow::ensure!(detail.get_array("noopStepIds")?.len() == 1);
+    anyhow::ensure!(detail.get_array("needsManualStepIds")?.len() == 1);
+    anyhow::ensure!(detail.get_array("failedStepIds")?.len() == 1);
+    anyhow::ensure!(detail.get_i32("committedCount")? == 0);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore]
+async fn run_task_persists_mixed_verdict_buckets() {
+    let app = TestApp::start().await;
+    let result = exercise_task_summary(&app).await;
+    app.cleanup().await;
+    result.expect("run_task must persist business verdict buckets");
 }

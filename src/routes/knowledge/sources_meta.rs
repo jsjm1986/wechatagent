@@ -249,32 +249,30 @@ pub async fn knowledge_aggregate_metadata(
     // 2) topEditors + recentActivity7d 在 chunk_revisions 上做。
     // chunk_revisions 没有 workspace_id 字段（绑定 chunk_id），单租户部署下无影响；
     // 多租户场景需要后续 $lookup 关联 chunks 集合，超出本波范围。
-    let revisions_pipe = vec![
-        doc! {
-            "$facet": {
-                "topEditors": [
-                    { "$match": { "created_by": { "$exists": true, "$ne": null } } },
-                    { "$group": {
-                        "_id": "$created_by",
-                        "count": { "$sum": 1 },
-                    } },
-                    { "$sort": { "count": -1 } },
-                    { "$limit": 10 },
-                ],
-                "recentActivity": [
-                    { "$match": { "created_at": { "$gte": cutoff } } },
-                    { "$group": {
-                        "_id": {
-                            "date": { "$dateToString": { "format": "%Y-%m-%d", "date": "$created_at" } },
-                            "op": { "$ifNull": ["$op", "unknown"] },
-                        },
-                        "count": { "$sum": 1 },
-                    } },
-                    { "$sort": { "_id.date": 1 } },
-                ],
-            }
-        },
-    ];
+    let revisions_pipe = vec![doc! {
+        "$facet": {
+            "topEditors": [
+                { "$match": { "created_by": { "$exists": true, "$ne": null } } },
+                { "$group": {
+                    "_id": "$created_by",
+                    "count": { "$sum": 1 },
+                } },
+                { "$sort": { "count": -1 } },
+                { "$limit": 10 },
+            ],
+            "recentActivity": [
+                { "$match": { "created_at": { "$gte": cutoff } } },
+                { "$group": {
+                    "_id": {
+                        "date": { "$dateToString": { "format": "%Y-%m-%d", "date": "$created_at" } },
+                        "op": { "$ifNull": ["$op", "unknown"] },
+                    },
+                    "count": { "$sum": 1 },
+                } },
+                { "$sort": { "_id.date": 1 } },
+            ],
+        }
+    }];
     let mut rcursor = state
         .db
         .chunk_revisions()
@@ -532,10 +530,7 @@ pub(in crate::routes) async fn ask_knowledge(
     // workspaceId（AuthenticatedAdmin 不携带可访问 workspace 列表，无法做 ACL 校验，
     // 信任 client 值会导致跨租户读取）。切换 workspace 走 POST /api/auth/workspace。
     let workspace_id = admin.current_workspace.clone();
-    let account_id = req
-        .account_id
-        .clone()
-        .filter(|s| !s.trim().is_empty());
+    let account_id = req.account_id.clone().filter(|s| !s.trim().is_empty());
     let agent_req = agent::knowledge_agent::AnswerRequest {
         workspace_id,
         account_id,
@@ -579,7 +574,8 @@ pub(in crate::routes) async fn ask_knowledge(
 // ── /api/knowledge/ask/stream: SSE 流式版 /api/knowledge/ask ──────────
 //
 // 浏览器 EventSource 仅支持 GET，所以参数走 query string；filter 用逗号分隔字符串。
-// 每个 tool_trace 步同步推 `event:trace`，跑完推 `event:answer`，最后 `event:close`。
+// 每个 tool_trace 步同步推 `event:trace`，业务失败推 `event:failed`，成功推
+// `event:answer`，最后统一推 `event:close`。
 // 与 chat_session_stream:5562 同模式（`futures::stream::unfold` 包 receiver、零新依赖）。
 
 #[derive(Debug, Deserialize)]
@@ -612,6 +608,7 @@ fn split_csv(raw: Option<&str>) -> Vec<String> {
 /// `GET /api/knowledge/ask/stream`：SSE 推送 [`agent::knowledge_agent::answer_streaming`]
 /// 的实时事件。事件类型：
 ///   - `trace` —— 每一步工具调用（与 `tool_trace` 一一对应，纯 JSON）
+///   - `failed` —— Agent 失败终态（稳定 code + 面向运营的通用 message）
 ///   - `answer` —— 终态 `AnswerResult`（同 `/api/knowledge/ask` JSON 形态）
 ///   - `close` —— 流结束信号；前端收到后应主动 `es.close()` 不再重连
 pub(in crate::routes) async fn ask_knowledge_stream(
@@ -632,10 +629,7 @@ pub(in crate::routes) async fn ask_knowledge_stream(
     // workspaceId（AuthenticatedAdmin 不携带可访问 workspace 列表，无法做 ACL 校验，
     // 信任 client 值会导致跨租户读取）。切换 workspace 走 POST /api/auth/workspace。
     let workspace_id = admin.current_workspace.clone();
-    let account_id = req
-        .account_id
-        .clone()
-        .filter(|s| !s.trim().is_empty());
+    let account_id = req.account_id.clone().filter(|s| !s.trim().is_empty());
     let agent_req = agent::knowledge_agent::AnswerRequest {
         workspace_id,
         account_id,
@@ -657,8 +651,8 @@ pub(in crate::routes) async fn ask_knowledge_stream(
     let cancel_for_agent = cancel.clone();
     let state_clone = state.clone();
     tokio::spawn(async move {
-        // answer_streaming 末尾会发 TraceEvent::Final；error 路径只能 drop tx，
-        // 所以这里把 Err 转成一条 error 事件再发出去再退出。
+        // answer_streaming 末尾会发 TraceEvent::Final；失败路径在关闭 channel 前补一条
+        // 稳定的 failed 终态。详细上游错误只进服务端日志，避免经 SSE 暴露内部信息。
         if let Err(err) = agent::knowledge_agent::answer_streaming(
             &state_clone,
             agent_req,
@@ -667,11 +661,10 @@ pub(in crate::routes) async fn ask_knowledge_stream(
         )
         .await
         {
-            let _ = tx.send(agent::knowledge_agent::TraceEvent::Step {
-                payload: json!({
-                    "tool": "error",
-                    "reason": format!("agent_error:{err}"),
-                }),
+            tracing::warn!(error = %err, "knowledge ask stream failed");
+            let _ = tx.send(agent::knowledge_agent::TraceEvent::Failed {
+                code: "knowledge_agent_failed".to_string(),
+                message: "知识问答暂时失败，请稍后重试。".to_string(),
             });
         }
         // tx 在此 drop（仅剩 spawn 任务持有；drop 后 rx.recv 会拿到 None）。
@@ -716,6 +709,13 @@ pub(in crate::routes) async fn ask_knowledge_stream(
                     st,
                 ))
             }
+            Some(agent::knowledge_agent::TraceEvent::Failed { code, message }) => {
+                let data = json!({ "code": code, "message": message }).to_string();
+                Some((
+                    Ok::<_, std::convert::Infallible>(Event::default().event("failed").data(data)),
+                    st,
+                ))
+            }
             Some(agent::knowledge_agent::TraceEvent::Final { answer }) => {
                 // 与 /api/knowledge/ask 的 JSON 形态对齐：tool_trace 走 relaxed extjson。
                 let tool_trace_json: Vec<Value> = answer
@@ -737,7 +737,10 @@ pub(in crate::routes) async fn ask_knowledge_stream(
                     "truncated": answer.truncated,
                     "cancelled": answer.cancelled,
                 });
-                Some((Ok(Event::default().event("answer").data(payload.to_string())), st))
+                Some((
+                    Ok(Event::default().event("answer").data(payload.to_string())),
+                    st,
+                ))
             }
             None => {
                 st.closed = true;
@@ -1102,31 +1105,70 @@ mod tests {
         let v = ingest_source_json(&sample_source());
 
         // 前端读的 camelCase 键必须存在且值正确
-        assert_eq!(v.get("sourceId").and_then(|x| x.as_str()), Some("ing_abc123"));
+        assert_eq!(
+            v.get("sourceId").and_then(|x| x.as_str()),
+            Some("ing_abc123")
+        );
         assert_eq!(v.get("workspaceId").and_then(|x| x.as_str()), Some("ws-1"));
         assert_eq!(v.get("kind").and_then(|x| x.as_str()), Some("rss"));
-        assert_eq!(v.get("url").and_then(|x| x.as_str()), Some("https://example.com/feed"));
+        assert_eq!(
+            v.get("url").and_then(|x| x.as_str()),
+            Some("https://example.com/feed")
+        );
         assert_eq!(v.get("scheduleMinutes").and_then(|x| x.as_i64()), Some(60));
         assert_eq!(v.get("label").and_then(|x| x.as_str()), Some("行业资讯源"));
-        assert_eq!(v.get("lastEtag").and_then(|x| x.as_str()), Some("\"etag-xyz\""));
+        assert_eq!(
+            v.get("lastEtag").and_then(|x| x.as_str()),
+            Some("\"etag-xyz\"")
+        );
         assert_eq!(v.get("status").and_then(|x| x.as_str()), Some("active"));
         assert_eq!(v.get("failureStreak").and_then(|x| x.as_i64()), Some(2));
         assert_eq!(v.get("ingestCount").and_then(|x| x.as_i64()), Some(7));
-        assert!(v.get("lastFetchedAt").and_then(|x| x.as_str()).is_some(), "lastFetchedAt 应为 RFC3339 串");
-        assert!(v.get("createdAt").and_then(|x| x.as_str()).is_some(), "createdAt 应为 RFC3339 串");
-        assert!(v.get("updatedAt").and_then(|x| x.as_str()).is_some(), "updatedAt 应为 RFC3339 串");
+        assert!(
+            v.get("lastFetchedAt").and_then(|x| x.as_str()).is_some(),
+            "lastFetchedAt 应为 RFC3339 串"
+        );
+        assert!(
+            v.get("createdAt").and_then(|x| x.as_str()).is_some(),
+            "createdAt 应为 RFC3339 串"
+        );
+        assert!(
+            v.get("updatedAt").and_then(|x| x.as_str()).is_some(),
+            "updatedAt 应为 RFC3339 串"
+        );
         // lastError=None → null
-        assert!(v.get("lastError").map(|x| x.is_null()).unwrap_or(false), "lastError 应为 null");
+        assert!(
+            v.get("lastError").map(|x| x.is_null()).unwrap_or(false),
+            "lastError 应为 null"
+        );
 
         // 绝不能再泄漏 snake_case 键（这些是 bug 的根源）
         assert!(v.get("source_id").is_none(), "不得含 snake_case source_id");
-        assert!(v.get("schedule_minutes").is_none(), "不得含 snake_case schedule_minutes");
-        assert!(v.get("last_fetched_at").is_none(), "不得含 snake_case last_fetched_at");
-        assert!(v.get("failure_streak").is_none(), "不得含 snake_case failure_streak");
-        assert!(v.get("ingest_count").is_none(), "不得含 snake_case ingest_count");
-        assert!(v.get("created_at").is_none(), "不得含 snake_case created_at");
+        assert!(
+            v.get("schedule_minutes").is_none(),
+            "不得含 snake_case schedule_minutes"
+        );
+        assert!(
+            v.get("last_fetched_at").is_none(),
+            "不得含 snake_case last_fetched_at"
+        );
+        assert!(
+            v.get("failure_streak").is_none(),
+            "不得含 snake_case failure_streak"
+        );
+        assert!(
+            v.get("ingest_count").is_none(),
+            "不得含 snake_case ingest_count"
+        );
+        assert!(
+            v.get("created_at").is_none(),
+            "不得含 snake_case created_at"
+        );
         // 前端接口无 id 字段，投影不输出 id
-        assert!(v.get("id").is_none(), "投影不应输出 id（前端 IngestSourceItem 无此字段）");
+        assert!(
+            v.get("id").is_none(),
+            "投影不应输出 id（前端 IngestSourceItem 无此字段）"
+        );
     }
 
     #[test]
@@ -1134,8 +1176,10 @@ mod tests {
         let mut src = sample_source();
         src.last_fetched_at = None;
         let v = ingest_source_json(&src);
-        assert!(v.get("lastFetchedAt").map(|x| x.is_null()).unwrap_or(false),
-            "last_fetched_at=None → lastFetchedAt 应为 null");
+        assert!(
+            v.get("lastFetchedAt").map(|x| x.is_null()).unwrap_or(false),
+            "last_fetched_at=None → lastFetchedAt 应为 null"
+        );
     }
 
     #[test]

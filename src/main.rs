@@ -11,6 +11,7 @@ use tower_http::{
     trace::TraceLayer,
 };
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use wechatagent::agent::run_outbox_dispatcher;
 use wechatagent::{
     config::AppConfig,
     db::{self, Database},
@@ -20,7 +21,6 @@ use wechatagent::{
     routes::{api_router, AppState},
     tasks, webhooks, APP_STARTED_AT,
 };
-use wechatagent::agent::run_outbox_dispatcher;
 
 fn main() -> anyhow::Result<()> {
     // Windows 上 main 线程默认栈较小，启动期深调用（migrations / prompt seed /
@@ -88,17 +88,22 @@ async fn async_main() -> anyhow::Result<()> {
     // LLM 配置：DB 优先，缺则用 .env 当种子。
     // 启动时若 `llm_provider_configs` 没有 active 记录，写一条来自 .env 的
     // openai 形态默认记录；之后每次启动都按当前 active 记录构造 LlmClient。
-    let active_provider =
-        ensure_default_llm_provider(&db, &config).await?;
+    let active_provider = ensure_default_llm_provider(&db, &config).await?;
     let active_format = LlmFormat::parse(&active_provider.format)?;
     let llm_client = LlmClient::with_format(
         active_provider.base_url.clone(),
         active_provider.api_key.clone(),
         active_provider.model.clone(),
         active_format,
-        active_provider.timeout_seconds.unwrap_or(config.llm_timeout_seconds),
-        active_provider.max_retries.unwrap_or(config.llm_max_retries),
-        active_provider.retry_base_ms.unwrap_or(config.llm_retry_base_ms),
+        active_provider
+            .timeout_seconds
+            .unwrap_or(config.llm_timeout_seconds),
+        active_provider
+            .max_retries
+            .unwrap_or(config.llm_max_retries),
+        active_provider
+            .retry_base_ms
+            .unwrap_or(config.llm_retry_base_ms),
     )?;
     let registry = Arc::new(LlmRegistry::new(
         llm_client,
@@ -115,21 +120,30 @@ async fn async_main() -> anyhow::Result<()> {
     // 注入 AppState.second_reviewer_llm；review_decision 看到 Some 即并行调用。
     // 缺件视为配置错误：拒绝启动，避免静默退化为单 reviewer。
     let second_reviewer_llm: Option<Arc<dyn LlmProvider>> = if config.reviewer_dual_enabled {
-        let base_url = config.reviewer_second_provider_base_url.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "REVIEWER_DUAL_ENABLED=true 但 REVIEWER_SECOND_PROVIDER_BASE_URL 未配置"
-            )
-        })?;
-        let api_key = config.reviewer_second_provider_api_key.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "REVIEWER_DUAL_ENABLED=true 但 REVIEWER_SECOND_PROVIDER_API_KEY 未配置"
-            )
-        })?;
-        let model = config.reviewer_second_provider_model.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "REVIEWER_DUAL_ENABLED=true 但 REVIEWER_SECOND_PROVIDER_MODEL 未配置"
-            )
-        })?;
+        let base_url = config
+            .reviewer_second_provider_base_url
+            .as_ref()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "REVIEWER_DUAL_ENABLED=true 但 REVIEWER_SECOND_PROVIDER_BASE_URL 未配置"
+                )
+            })?;
+        let api_key = config
+            .reviewer_second_provider_api_key
+            .as_ref()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "REVIEWER_DUAL_ENABLED=true 但 REVIEWER_SECOND_PROVIDER_API_KEY 未配置"
+                )
+            })?;
+        let model = config
+            .reviewer_second_provider_model
+            .as_ref()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "REVIEWER_DUAL_ENABLED=true 但 REVIEWER_SECOND_PROVIDER_MODEL 未配置"
+                )
+            })?;
         let format = LlmFormat::parse(&config.reviewer_second_provider_format)?;
         let client = LlmClient::with_format(
             base_url.clone(),
@@ -170,9 +184,7 @@ async fn async_main() -> anyhow::Result<()> {
         llm_registry: Some(registry.clone()),
         config: config.clone(),
         prompt_pack_version: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        chat_progress_bus: std::sync::Arc::new(
-            wechatagent::knowledge_task::ChatProgressBus::new(),
-        ),
+        chat_progress_bus: std::sync::Arc::new(wechatagent::knowledge_task::ChatProgressBus::new()),
         second_reviewer_llm,
         chunk_locks: std::sync::Arc::new(dashmap::DashMap::new()),
         chunk_event_bus: tokio::sync::broadcast::channel(
@@ -241,9 +253,8 @@ async fn async_main() -> anyhow::Result<()> {
     });
 
     // agent-self-evolution M4 W1：演化器 worker。
-    // 默认允许（`EVOLUTION_ENABLED=true`）；env=false 为运维硬锁定，run_evolutionary_worker
-    // 内部立即 return 不进 tick。实际开关由 UI 总开关（mongo runtime flag）控制。打开后
-    // 周期跑 cohort 选择 + 候选生成 + shadow eval。
+    // 默认关闭（`EVOLUTION_ENABLED=false`）；只有 env=true 后，UI 总开关（Mongo
+    // runtime flag）才有权进一步放行。打开后周期跑 cohort 选择 + 候选生成 + shadow eval。
     spawn_supervised(state.clone(), "evolutionary_worker", |s| async move {
         wechatagent::evolution::run_evolutionary_worker(s).await;
     });
@@ -437,10 +448,7 @@ async fn ensure_default_llm_provider(
     }
     if let Some(any) = db
         .llm_provider_configs()
-        .find_one(
-            doc! { "workspaceId": &config.default_workspace_id },
-            None,
-        )
+        .find_one(doc! { "workspaceId": &config.default_workspace_id }, None)
         .await?
     {
         db.llm_provider_configs()

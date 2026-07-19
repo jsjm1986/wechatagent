@@ -124,7 +124,8 @@ async fn digest_today_synth_uses_admin_workspace_not_default() {
         .count();
 
     assert_eq!(
-        in_tenant, 1,
+        in_tenant,
+        1,
         "合成的日报必须落在 tenant_ws={tenant_ws} 下(修复前 = 0,因写成了 default),实际落库={:?}",
         all_reports
             .iter()
@@ -132,7 +133,8 @@ async fn digest_today_synth_uses_admin_workspace_not_default() {
             .collect::<Vec<_>>()
     );
     assert_eq!(
-        in_default, 0,
+        in_default,
+        0,
         "绝不得跨租户串写到 default={default_ws}(修复前 = 1),实际落库={:?}",
         all_reports
             .iter()

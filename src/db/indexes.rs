@@ -55,6 +55,79 @@ fn agent_run_log_outbox_enqueuing_index() -> IndexModel {
         .build()
 }
 
+fn outcome_aggregation_task_dedupe_index() -> IndexModel {
+    IndexModel::builder()
+        .keys(doc! {
+            "workspace_id": 1,
+            "kind": 1,
+            "account_id": 1,
+            "content": 1,
+        })
+        .options(
+            IndexOptions::builder()
+                .unique(true)
+                .partial_filter_expression(doc! { "kind": "outcome_aggregation" })
+                .name("uniq_outcome_aggregation_ws_kind_account_content".to_string())
+                .build(),
+        )
+        .build()
+}
+
+fn memory_active_task_key_index() -> IndexModel {
+    IndexModel::builder()
+        .keys(doc! {
+            "workspace_id": 1,
+            "account_id": 1,
+            "contact_wxid": 1,
+            "active_task_key": 1,
+        })
+        .options(
+            IndexOptions::builder()
+                .unique(true)
+                .partial_filter_expression(doc! {
+                    "active_task_key": { "$type": "string" },
+                })
+                .name("uniq_memory_active_task_key".to_string())
+                .build(),
+        )
+        .build()
+}
+
+fn send_ledger_outbox_unique_index() -> IndexModel {
+    IndexModel::builder()
+        .keys(doc! { "outbox_id": 1 })
+        .options(
+            IndexOptions::builder()
+                .name("uniq_send_ledger_outbox_id".to_string())
+                .unique(true)
+                .partial_filter_expression(doc! { "outbox_id": { "$type": "objectId" } })
+                .build(),
+        )
+        .build()
+}
+
+fn send_ledger_contact_history_index() -> IndexModel {
+    IndexModel::builder()
+        .keys(doc! {
+            "workspace_id": 1,
+            "account_id": 1,
+            "contact_wxid": 1,
+            "sent_at": -1,
+        })
+        .build()
+}
+
+fn send_ledger_target_stats_index() -> IndexModel {
+    IndexModel::builder()
+        .keys(doc! {
+            "workspace_id": 1,
+            "account_id": 1,
+            "send_kind": 1,
+            "target_id": 1,
+        })
+        .build()
+}
+
 pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
     db.accounts()
         .create_index(
@@ -152,31 +225,20 @@ pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
             None,
         )
         .await?;
-    // P1-1：outcome_aggregation 任务幂等去重靠 (kind, account_id, content) 唯一约束。
+    // P1-1：outcome_aggregation 任务幂等去重靠
+    // (workspace_id, kind, account_id, content) 唯一约束。
     // tasks.rs::ensure_today_outcome_aggregation_tasks 之前用 find_one 后 insert_one
     // 存在 TOCTOU；改原子 insert + 11000 dup-key 视作"已存在"前必须有此索引。
     // partial filter 限定 kind 否则会误伤其他 kind 同 content 的合法重复（如
     // follow_up 同一 contact 不同回合的内容）。
     db.tasks()
-        .create_index(
-            IndexModel::builder()
-                .keys(doc! {
-                    "kind": 1,
-                    "account_id": 1,
-                    "content": 1
-                })
-                .options(
-                    IndexOptions::builder()
-                        .unique(true)
-                        .partial_filter_expression(
-                            doc! { "kind": "outcome_aggregation" },
-                        )
-                        .name("uniq_outcome_aggregation_kind_account_content".to_string())
-                        .build(),
-                )
-                .build(),
-            None,
-        )
+        .create_index(outcome_aggregation_task_dedupe_index(), None)
+        .await?;
+    // Memory consolidation uses a durable lease key rather than find-then-insert. Terminal
+    // transitions remove active_task_key atomically, so historical rows remain outside the
+    // partial unique index while every newly scheduled task is single-flight per contact.
+    db.tasks()
+        .create_index(memory_active_task_key_index(), None)
         .await?;
     // 异步导入 job：前端按 workspace 跨会话发现进行中 job。
     db.import_jobs()
@@ -329,21 +391,15 @@ pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
         .await?;
     // 主动发送台账：单客户发送历史（按时间倒序）。
     db.agent_send_ledger()
-        .create_index(
-            IndexModel::builder()
-                .keys(doc! { "workspace_id": 1, "contact_wxid": 1, "sent_at": -1 })
-                .build(),
-            None,
-        )
+        .create_index(send_ledger_contact_history_index(), None)
         .await?;
     // 主动发送台账：素材/名片维度聚合。
     db.agent_send_ledger()
-        .create_index(
-            IndexModel::builder()
-                .keys(doc! { "workspace_id": 1, "send_kind": 1, "target_id": 1 })
-                .build(),
-            None,
-        )
+        .create_index(send_ledger_target_stats_index(), None)
+        .await?;
+    // 每个已确认送达的 Outbox 事实最多产生一条台账。历史无 outbox_id 行不入约束。
+    db.agent_send_ledger()
+        .create_index(send_ledger_outbox_unique_index(), None)
         .await?;
     // 主动发送台账：回扫服务索引。匹配 scan 查询形状
     // （filter { outcome_evaluated_at: { $exists: false } } + sort { sent_at: 1 }，
@@ -509,9 +565,7 @@ pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
     // 会全表扫高写入量的 decision_reviews。非 unique：不假设一 run 一 review。
     db.decision_reviews()
         .create_index(
-            IndexModel::builder()
-                .keys(doc! { "run_id": 1 })
-                .build(),
+            IndexModel::builder().keys(doc! { "run_id": 1 }).build(),
             None,
         )
         .await?;
@@ -758,10 +812,7 @@ mod tests {
     #[test]
     fn gap_signal_dedup_index_is_pending_partial_unique() {
         let index = gap_signals_pending_dedup_index();
-        assert_eq!(
-            index.keys,
-            doc! { "workspace_id": 1, "dedup_key": 1 }
-        );
+        assert_eq!(index.keys, doc! { "workspace_id": 1, "dedup_key": 1 });
 
         let options = index.options.expect("dedup index options");
         assert_eq!(options.unique, Some(true));
@@ -799,14 +850,81 @@ mod tests {
     #[test]
     fn agent_run_log_outbox_enqueuing_index_matches_reconcile_scan() {
         let index = agent_run_log_outbox_enqueuing_index();
-        assert_eq!(
-            index.keys,
-            doc! { "status": 1, "created_at": 1, "_id": 1 }
-        );
+        assert_eq!(index.keys, doc! { "status": 1, "created_at": 1, "_id": 1 });
         let options = index.options.expect("stale enqueue index options");
         assert_eq!(
             options.partial_filter_expression,
             Some(doc! { "status": "outbox_enqueuing" })
+        );
+    }
+
+    #[test]
+    fn outcome_task_dedupe_index_is_workspace_scoped() {
+        let index = outcome_aggregation_task_dedupe_index();
+        assert_eq!(
+            index.keys,
+            doc! {
+                "workspace_id": 1,
+                "kind": 1,
+                "account_id": 1,
+                "content": 1,
+            }
+        );
+        let options = index.options.expect("outcome task index options");
+        assert_eq!(options.unique, Some(true));
+        assert_eq!(
+            options.partial_filter_expression,
+            Some(doc! { "kind": "outcome_aggregation" })
+        );
+    }
+
+    #[test]
+    fn memory_active_task_index_is_tenant_contact_scoped() {
+        let index = memory_active_task_key_index();
+        assert_eq!(
+            index.keys,
+            doc! {
+                "workspace_id": 1,
+                "account_id": 1,
+                "contact_wxid": 1,
+                "active_task_key": 1,
+            }
+        );
+        let options = index.options.expect("memory task index options");
+        assert_eq!(options.unique, Some(true));
+        assert_eq!(
+            options.partial_filter_expression,
+            Some(doc! { "active_task_key": { "$type": "string" } })
+        );
+    }
+
+    #[test]
+    fn send_ledger_indexes_are_account_scoped_and_outbox_unique() {
+        assert_eq!(
+            send_ledger_contact_history_index().keys,
+            doc! {
+                "workspace_id": 1,
+                "account_id": 1,
+                "contact_wxid": 1,
+                "sent_at": -1,
+            }
+        );
+        assert_eq!(
+            send_ledger_target_stats_index().keys,
+            doc! {
+                "workspace_id": 1,
+                "account_id": 1,
+                "send_kind": 1,
+                "target_id": 1,
+            }
+        );
+        let unique = send_ledger_outbox_unique_index();
+        assert_eq!(unique.keys, doc! { "outbox_id": 1 });
+        let options = unique.options.expect("send ledger unique options");
+        assert_eq!(options.unique, Some(true));
+        assert_eq!(
+            options.partial_filter_expression,
+            Some(doc! { "outbox_id": { "$type": "objectId" } })
         );
     }
 }
@@ -1142,10 +1260,7 @@ async fn ensure_ops_versioned_indexes(db: &Database) -> anyhow::Result<()> {
 /// - `(scope, kind, raw_value)` 唯一：`upsert_candidate` 幂等键，重复值仅累加
 ///   `occurrences` / 更新 `last_seen_at`。
 async fn ensure_taxonomy_candidates_indexes(db: &Database) -> anyhow::Result<()> {
-    for legacy_name in [
-        "scope_1_kind_1_status_1",
-        "scope_1_kind_1_raw_value_1",
-    ] {
+    for legacy_name in ["scope_1_kind_1_status_1", "scope_1_kind_1_raw_value_1"] {
         let _ = db
             .collection_taxonomy_candidates()
             .drop_index(legacy_name, None)

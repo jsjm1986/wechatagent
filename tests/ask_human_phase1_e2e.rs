@@ -143,7 +143,10 @@ async fn put_ask_human_policy_persists_and_reads_back() {
     // 捕获 PUT 前的版本号（证 PUT 后不变）。
     let before = current_user_ops_config(&app.state, &ws).await;
     let version_before = before.version;
-    assert!(before.current_version, "前置：底座 config current_version=true");
+    assert!(
+        before.current_version,
+        "前置：底座 config current_version=true"
+    );
 
     // 构造 AskHumanPolicy（camelCase wire 格式经 serde 反序列化）。
     let policy: wechatagent::models::AskHumanPolicy = serde_json::from_value(serde_json::json!({
@@ -174,10 +177,16 @@ async fn put_ask_human_policy_persists_and_reads_back() {
         .ask_human_policy
         .as_ref()
         .expect("ask_human_policy 应已落库");
-    assert_eq!(stored, &policy, "回读的 ask_human_policy 应与 PUT 的逐字段一致");
+    assert_eq!(
+        stored, &policy,
+        "回读的 ask_human_policy 应与 PUT 的逐字段一致"
+    );
 
     // 确认项 A：version 未 bump、current_version 仍 true（$set 贴生产 admin 编辑语义）。
-    assert_eq!(after.version, version_before, "PUT ask_human_policy 不应 bump version");
+    assert_eq!(
+        after.version, version_before,
+        "PUT ask_human_policy 不应 bump version"
+    );
     assert!(after.current_version, "PUT 后 current_version 仍为 true");
 }
 
@@ -219,7 +228,11 @@ async fn admin_resolve_enqueues_relay_and_marks_resolved() {
         .expect("query escalation")
         .expect("escalation exists");
     assert_eq!(updated.status, "resolved", "裁决后台账应转 resolved");
-    assert_eq!(updated.resolved_via.as_deref(), Some("admin"), "resolved_via=admin");
+    assert_eq!(
+        updated.resolved_via.as_deref(),
+        Some("admin"),
+        "resolved_via=admin"
+    );
 
     // relay task 入队（kind=principal_decision_relay，content=short_code）。
     let task_count = app
@@ -368,7 +381,10 @@ async fn inbox_aggregates_and_degrades() {
     .expect("inbox ok");
     let body: Value = resp.0;
 
-    let items = body.get("items").and_then(|v| v.as_array()).expect("items array");
+    let items = body
+        .get("items")
+        .and_then(|v| v.as_array())
+        .expect("items array");
     assert!(
         items.len() >= 2,
         "inbox 应至少聚合到请示 + 知识核验两条 item，实际={}",
@@ -387,7 +403,10 @@ async fn inbox_aggregates_and_degrades() {
         "应含 knowledge_review source: {sources:?}"
     );
 
-    let errors = body.get("errors").and_then(|v| v.as_array()).expect("errors array");
+    let errors = body
+        .get("errors")
+        .and_then(|v| v.as_array())
+        .expect("errors array");
     assert!(errors.is_empty(), "正常聚合 errors 应为空，实际={errors:?}");
 }
 
@@ -465,7 +484,10 @@ async fn resolve_foreign_workspace_escalation_is_noop() {
         still.status, "pending",
         "跨 workspace resolve 不应真正裁决，台账须仍 pending（IDOR 守卫）"
     );
-    assert!(still.resolved_via.is_none(), "未被裁决 → resolved_via 仍为空");
+    assert!(
+        still.resolved_via.is_none(),
+        "未被裁决 → resolved_via 仍为空"
+    );
 }
 
 // ── 测试 8（终审修 #1）：admin deferred 暂缓保持 pending，不 resolve 不 relay ──
@@ -514,7 +536,10 @@ async fn admin_deferred_keeps_escalation_pending() {
         still.status, "pending",
         "deferred 不应 resolve，台账须仍 pending（与 wechat 路径一致）"
     );
-    assert!(still.resolved_via.is_none(), "deferred 未裁决 → resolved_via 仍空");
+    assert!(
+        still.resolved_via.is_none(),
+        "deferred 未裁决 → resolved_via 仍空"
+    );
 
     // 零 relay task 入队（deferred 不转述）。
     let task_count = app
@@ -600,10 +625,7 @@ async fn timeout_reassign_gives_each_decider_full_window() {
         .await
         .expect("query")
         .expect("exists");
-    assert_eq!(
-        after_first.principal_wxid, "b",
-        "第一次超时扫描应 a→b"
-    );
+    assert_eq!(after_first.principal_wxid, "b", "第一次超时扫描应 a→b");
 
     // 第二次 scan：不再拨钟。b 的 updated_at 刚被 reassign 刷到 ~now → age≈0 < 24h → 不动。
     wechatagent::agent::escalation::scan_escalation_timeouts(&state)
@@ -639,19 +661,18 @@ async fn inbox_lessons_item_carries_lesson_id() {
         .db
         .raw()
         .collection::<mongodb::bson::Document>("lessons_learned");
-    coll
-        .insert_one(
-            doc! {
-                "workspace_id": &ws,
-                "lesson_id": &lesson_id,
-                "review_status": "pending_review",
-                "pattern_kind": "objection_handling",
-                "created_at": DateTime::now(),
-            },
-            None,
-        )
-        .await
-        .unwrap();
+    coll.insert_one(
+        doc! {
+            "workspace_id": &ws,
+            "lesson_id": &lesson_id,
+            "review_status": "pending_review",
+            "pattern_kind": "objection_handling",
+            "created_at": DateTime::now(),
+        },
+        None,
+    )
+    .await
+    .unwrap();
     // 调 inbox handler，过滤 lessons_learned 源
     let resp = wechatagent::routes::ask_human_inbox::ask_human_inbox(
         State(app.state.clone()),
@@ -688,7 +709,13 @@ async fn get_single_chunk_by_id_scoped_to_workspace() {
         body: Some("正文".into()),
         ..Default::default()
     };
-    let inserted = app.state.db.operation_knowledge_chunks().insert_one(&chunk, None).await.unwrap();
+    let inserted = app
+        .state
+        .db
+        .operation_knowledge_chunks()
+        .insert_one(&chunk, None)
+        .await
+        .unwrap();
     let hex = inserted.inserted_id.as_object_id().unwrap().to_hex();
     let resp = wechatagent::routes::knowledge::crud::get_operation_knowledge_chunk(
         axum::extract::State(app.state.clone()),
@@ -754,9 +781,18 @@ async fn operation_domain_json_includes_ask_human_policy() {
     .await
     .unwrap();
     let body: serde_json::Value = resp.0;
-    assert_eq!(body["item"]["askHumanPolicy"]["deciderChain"][0]["wxid"], serde_json::json!("wxid_boss"));
-    assert_eq!(body["item"]["askHumanPolicy"]["timeoutHours"], serde_json::json!(24.0));
-    assert_eq!(body["item"]["askHumanPolicy"]["dailyPushCap"], serde_json::json!(3));
+    assert_eq!(
+        body["item"]["askHumanPolicy"]["deciderChain"][0]["wxid"],
+        serde_json::json!("wxid_boss")
+    );
+    assert_eq!(
+        body["item"]["askHumanPolicy"]["timeoutHours"],
+        serde_json::json!(24.0)
+    );
+    assert_eq!(
+        body["item"]["askHumanPolicy"]["dailyPushCap"],
+        serde_json::json!(3)
+    );
 }
 
 // ── 测试 8：关系类型建议富投影（E10 审核反盲批）────────────────────────────────
@@ -805,14 +841,33 @@ async fn inbox_relationship_suggestion_carries_evidence() {
     .expect("inbox ok");
     let body: Value = resp.0;
 
-    let items = body.get("items").and_then(|v| v.as_array()).expect("items array");
+    let items = body
+        .get("items")
+        .and_then(|v| v.as_array())
+        .expect("items array");
     let item = items
         .iter()
         .find(|i| i.get("source").and_then(|s| s.as_str()) == Some("relationship_suggestion"))
         .expect("应含 relationship_suggestion item");
 
-    assert_eq!(item["evidence"], serde_json::json!("多次自称同行"), "应投影 evidence");
-    assert_eq!(item["confidence"], serde_json::json!(80), "应投影 confidence==80");
-    assert_eq!(item["occurrences"], serde_json::json!(3), "应投影 occurrences==3");
-    assert_eq!(item["contactWxid"], serde_json::json!("contact_e10"), "应投影 contact_id 入 contactWxid");
+    assert_eq!(
+        item["evidence"],
+        serde_json::json!("多次自称同行"),
+        "应投影 evidence"
+    );
+    assert_eq!(
+        item["confidence"],
+        serde_json::json!(80),
+        "应投影 confidence==80"
+    );
+    assert_eq!(
+        item["occurrences"],
+        serde_json::json!(3),
+        "应投影 occurrences==3"
+    );
+    assert_eq!(
+        item["contactWxid"],
+        serde_json::json!("contact_e10"),
+        "应投影 contact_id 入 contactWxid"
+    );
 }

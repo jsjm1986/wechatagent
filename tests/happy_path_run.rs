@@ -174,9 +174,7 @@ async fn consolidate_contact_memory_writes_core_fact_via_mock_llm() {
         .map(|f| f.as_text().to_string())
         .collect();
     assert!(
-        core_facts
-            .iter()
-            .any(|s| s == "客户在做企业 IM 选型"),
+        core_facts.iter().any(|s| s == "客户在做企业 IM 选型"),
         "coreFacts 应包含 LLM 输出的事实，实际：{:?}",
         core_facts
     );
@@ -272,7 +270,6 @@ async fn seed_verified_chunk(
         .expect("insert verified chunk");
     id.to_hex()
 }
-
 
 ///
 /// `reply_text` / `why_should_reply` 由调用方覆盖以表达 revision 前后版本；

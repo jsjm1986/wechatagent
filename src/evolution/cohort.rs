@@ -71,9 +71,7 @@ pub async fn select_cohorts_filtered(
     account_id: &str,
     runtime_flag: Option<&EvolutionRuntimeFlag>,
 ) -> Result<Cohorts, EvolutionError> {
-    if !runtime_flag
-        .is_some_and(|flag| flag.enabled && flag.rollout_percent_clamped() > 0)
-    {
+    if !runtime_flag.is_some_and(|flag| flag.enabled && flag.rollout_percent_clamped() > 0) {
         return Ok(Cohorts::default());
     }
 
@@ -137,20 +135,14 @@ pub async fn select_cohorts_filtered(
     })
 }
 
-fn contact_in_runtime_cohort(
-    runtime_flag: Option<&EvolutionRuntimeFlag>,
-    contact: &str,
-) -> bool {
+fn contact_in_runtime_cohort(runtime_flag: Option<&EvolutionRuntimeFlag>, contact: &str) -> bool {
     match runtime_flag {
         None => false,
         Some(flag) => !contact.is_empty() && bucket_for_contact(flag, contact),
     }
 }
 
-fn dedup_per_contact(
-    pool: &[(ObjectId, String, String)],
-    cap_per_contact: usize,
-) -> Vec<ObjectId> {
+fn dedup_per_contact(pool: &[(ObjectId, String, String)], cap_per_contact: usize) -> Vec<ObjectId> {
     let mut counter: HashMap<&str, usize> = HashMap::new();
     let mut out = Vec::with_capacity(pool.len());
     for (id, contact, _) in pool {
@@ -264,7 +256,11 @@ mod tests {
     fn failure_status_set_excludes_success_statuses() {
         // R14：approved / revision_applied_approved / legacy_mode_unchecked
         // 是成功类，SHALL NOT 进 prompt cohort（否则 Critic LLM 学不到失败信号）。
-        for s in ["approved", "revision_applied_approved", "legacy_mode_unchecked"] {
+        for s in [
+            "approved",
+            "revision_applied_approved",
+            "legacy_mode_unchecked",
+        ] {
             assert!(
                 !FAILURE_FINAL_REVIEW_STATUSES.contains(&s),
                 "成功类 \"{s}\" 不应该出现在 FAILURE 集合里"

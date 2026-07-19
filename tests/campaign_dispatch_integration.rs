@@ -107,7 +107,12 @@ async fn dispatch_zero_hits_rejected() {
     let acc = app.state.config.default_account_id.clone();
     let campaign = make_campaign(&ws, &acc);
     let cid = campaign.id.unwrap();
-    app.state.db.campaigns().insert_one(&campaign, None).await.expect("seed campaign");
+    app.state
+        .db
+        .campaigns()
+        .insert_one(&campaign, None)
+        .await
+        .expect("seed campaign");
     // 不 seed 任何 contact → 命中 0 人
 
     let result = dispatch_campaign(
@@ -128,7 +133,12 @@ async fn dispatch_cross_workspace_not_found() {
     let acc = app.state.config.default_account_id.clone();
     let campaign = make_campaign(&ws, &acc);
     let cid = campaign.id.unwrap();
-    app.state.db.campaigns().insert_one(&campaign, None).await.expect("seed campaign");
+    app.state
+        .db
+        .campaigns()
+        .insert_one(&campaign, None)
+        .await
+        .expect("seed campaign");
 
     // 用 other_workspace 视角 dispatch → filter {_id, workspaceId:other} 不匹配 → NotFound
     let result = dispatch_campaign(
@@ -154,10 +164,25 @@ async fn dispatch_builds_tasks_then_rejects_repeat_after_completed() {
     let acc = app.state.config.default_account_id.clone();
     let campaign = make_campaign(&ws, &acc);
     let cid = campaign.id.unwrap();
-    app.state.db.campaigns().insert_one(&campaign, None).await.expect("seed campaign");
+    app.state
+        .db
+        .campaigns()
+        .insert_one(&campaign, None)
+        .await
+        .expect("seed campaign");
     // seed 2 个 managed contact → 命中 2 人
-    app.state.db.contacts().insert_one(make_contact(&ws, &acc, "wx_a"), None).await.expect("seed wx_a");
-    app.state.db.contacts().insert_one(make_contact(&ws, &acc, "wx_b"), None).await.expect("seed wx_b");
+    app.state
+        .db
+        .contacts()
+        .insert_one(make_contact(&ws, &acc, "wx_a"), None)
+        .await
+        .expect("seed wx_a");
+    app.state
+        .db
+        .contacts()
+        .insert_one(make_contact(&ws, &acc, "wx_b"), None)
+        .await
+        .expect("seed wx_b");
 
     let tasks_before = app
         .state
@@ -181,7 +206,13 @@ async fn dispatch_builds_tasks_then_rejects_repeat_after_completed() {
         "命中 2 人首次 dispatch 应派 2 条,实际 {}",
         resp1.0["dispatchedCount"]
     );
-    let tasks_after_1 = app.state.db.tasks().count_documents(doc! {}, None).await.expect("count after 1");
+    let tasks_after_1 = app
+        .state
+        .db
+        .tasks()
+        .count_documents(doc! {}, None)
+        .await
+        .expect("count after 1");
     assert_eq!(
         tasks_after_1 - tasks_before,
         2,
@@ -202,8 +233,17 @@ async fn dispatch_builds_tasks_then_rejects_repeat_after_completed() {
         result2.map(|r| r.0.clone())
     );
     // 门在圈人前拦截 → 二次不新增任何 task(比旧的 unique 去重更早、更强的防重推)。
-    let tasks_after_2 = app.state.db.tasks().count_documents(doc! {}, None).await.expect("count after 2");
-    assert_eq!(tasks_after_2, tasks_after_1, "二次 dispatch 被门拒后不应新增 task");
+    let tasks_after_2 = app
+        .state
+        .db
+        .tasks()
+        .count_documents(doc! {}, None)
+        .await
+        .expect("count after 2");
+    assert_eq!(
+        tasks_after_2, tasks_after_1,
+        "二次 dispatch 被门拒后不应新增 task"
+    );
 }
 
 /// KC-01/03 补偿回滚：dispatch 循环中 agent_tasks insert 被 validator 拒 → task insert 失败
@@ -216,11 +256,26 @@ async fn dispatch_task_insert_failure_rolls_back_send() {
     let acc = app.state.config.default_account_id.clone();
     let campaign = make_campaign(&ws, &acc);
     let cid = campaign.id.unwrap();
-    app.state.db.campaigns().insert_one(&campaign, None).await.expect("seed campaign");
-    app.state.db.contacts().insert_one(make_contact(&ws, &acc, "wx_rollback"), None).await.expect("seed contact");
+    app.state
+        .db
+        .campaigns()
+        .insert_one(&campaign, None)
+        .await
+        .expect("seed campaign");
+    app.state
+        .db
+        .contacts()
+        .insert_one(make_contact(&ws, &acc, "wx_rollback"), None)
+        .await
+        .expect("seed contact");
 
     // 装 validator：让 agent_tasks 的 insert 确定性失败（拒绝所有 kind=follow_up 的插入）。
-    let _ = app.state.db.raw().create_collection("agent_tasks", None).await;
+    let _ = app
+        .state
+        .db
+        .raw()
+        .create_collection("agent_tasks", None)
+        .await;
     app.state
         .db
         .raw()
@@ -251,7 +306,10 @@ async fn dispatch_task_insert_failure_rolls_back_send() {
         .count_documents(doc! { "campaignId": cid }, None)
         .await
         .expect("count sends");
-    assert_eq!(orphan_sends, 0, "task insert 失败须补偿删除 send,不留孤儿(KC-01)");
+    assert_eq!(
+        orphan_sends, 0,
+        "task insert 失败须补偿删除 send,不留孤儿(KC-01)"
+    );
 }
 
 /// KC-02 status 门：completed 活动 dispatch → BadRequest（防重复推送）。
@@ -264,8 +322,18 @@ async fn dispatch_completed_campaign_rejected() {
     let mut campaign = make_campaign(&ws, &acc);
     campaign.status = "completed".to_string();
     let cid = campaign.id.unwrap();
-    app.state.db.campaigns().insert_one(&campaign, None).await.expect("seed campaign");
-    app.state.db.contacts().insert_one(make_contact(&ws, &acc, "wx_done"), None).await.expect("seed contact");
+    app.state
+        .db
+        .campaigns()
+        .insert_one(&campaign, None)
+        .await
+        .expect("seed campaign");
+    app.state
+        .db
+        .contacts()
+        .insert_one(make_contact(&ws, &acc, "wx_done"), None)
+        .await
+        .expect("seed contact");
 
     let result = dispatch_campaign(
         State(app.state.clone()),
@@ -292,10 +360,20 @@ async fn preview_rejects_when_coarse_audience_exceeds_max() {
     let acc = app.state.config.default_account_id.clone();
     let campaign = make_campaign(&ws, &acc);
     let cid = campaign.id.unwrap();
-    app.state.db.campaigns().insert_one(&campaign, None).await.expect("seed campaign");
+    app.state
+        .db
+        .campaigns()
+        .insert_one(&campaign, None)
+        .await
+        .expect("seed campaign");
     // seed 4 个 managed contact（> 上限 3）→ 粗筛候选超限
     for wx in ["wx_1", "wx_2", "wx_3", "wx_4"] {
-        app.state.db.contacts().insert_one(make_contact(&ws, &acc, wx), None).await.expect("seed contact");
+        app.state
+            .db
+            .contacts()
+            .insert_one(make_contact(&ws, &acc, wx), None)
+            .await
+            .expect("seed contact");
     }
     let result = preview_campaign(
         State(app.state.clone()),
@@ -320,10 +398,20 @@ async fn preview_succeeds_at_exactly_max() {
     let acc = app.state.config.default_account_id.clone();
     let campaign = make_campaign(&ws, &acc);
     let cid = campaign.id.unwrap();
-    app.state.db.campaigns().insert_one(&campaign, None).await.expect("seed campaign");
+    app.state
+        .db
+        .campaigns()
+        .insert_one(&campaign, None)
+        .await
+        .expect("seed campaign");
     // seed 正好 3 个 → 不超限（空 filter：粗筛=精筛，全部命中）
     for wx in ["wx_1", "wx_2", "wx_3"] {
-        app.state.db.contacts().insert_one(make_contact(&ws, &acc, wx), None).await.expect("seed contact");
+        app.state
+            .db
+            .contacts()
+            .insert_one(make_contact(&ws, &acc, wx), None)
+            .await
+            .expect("seed contact");
     }
     let resp = preview_campaign(
         State(app.state.clone()),
@@ -332,7 +420,11 @@ async fn preview_succeeds_at_exactly_max() {
     )
     .await
     .expect("正好等于上限应成功");
-    assert_eq!(resp.0["targetCount"].as_i64(), Some(3), "targetCount 应为 3");
+    assert_eq!(
+        resp.0["targetCount"].as_i64(),
+        Some(3),
+        "targetCount 应为 3"
+    );
 }
 
 /// KC-06：dispatch 成功后回刷 lastDispatchTargetCount == 本次命中人数，与 dispatchedCount
@@ -345,9 +437,24 @@ async fn dispatch_backfills_last_dispatch_target_count() {
     let acc = app.state.config.default_account_id.clone();
     let campaign = make_campaign(&ws, &acc);
     let cid = campaign.id.unwrap();
-    app.state.db.campaigns().insert_one(&campaign, None).await.expect("seed campaign");
-    app.state.db.contacts().insert_one(make_contact(&ws, &acc, "wx_x"), None).await.expect("seed wx_x");
-    app.state.db.contacts().insert_one(make_contact(&ws, &acc, "wx_y"), None).await.expect("seed wx_y");
+    app.state
+        .db
+        .campaigns()
+        .insert_one(&campaign, None)
+        .await
+        .expect("seed campaign");
+    app.state
+        .db
+        .contacts()
+        .insert_one(make_contact(&ws, &acc, "wx_x"), None)
+        .await
+        .expect("seed wx_x");
+    app.state
+        .db
+        .contacts()
+        .insert_one(make_contact(&ws, &acc, "wx_y"), None)
+        .await
+        .expect("seed wx_y");
 
     let _ = dispatch_campaign(
         State(app.state.clone()),
@@ -371,7 +478,10 @@ async fn dispatch_backfills_last_dispatch_target_count() {
         Some(2),
         "命中 2 人应回刷 lastDispatchTargetCount=2"
     );
-    assert_eq!(reloaded.dispatched_count, 2, "首次全新命中 dispatchedCount=2");
+    assert_eq!(
+        reloaded.dispatched_count, 2,
+        "首次全新命中 dispatchedCount=2"
+    );
 }
 
 /// KC-06 哨兵加强：**去重时 lastDispatchTargetCount 与 dispatchedCount 分叉**——
@@ -397,10 +507,25 @@ async fn dispatch_last_dispatch_target_count_diverges_on_dedup() {
     let mut campaign = make_campaign(&ws, &acc);
     campaign.status = "dispatching".to_string();
     let cid = campaign.id.unwrap();
-    app.state.db.campaigns().insert_one(&campaign, None).await.expect("seed campaign");
+    app.state
+        .db
+        .campaigns()
+        .insert_one(&campaign, None)
+        .await
+        .expect("seed campaign");
     // 命中 2 人（空 filter：粗筛=精筛，workspace+account 内全部 managed contact）。
-    app.state.db.contacts().insert_one(make_contact(&ws, &acc, "wx_p"), None).await.expect("seed wx_p");
-    app.state.db.contacts().insert_one(make_contact(&ws, &acc, "wx_q"), None).await.expect("seed wx_q");
+    app.state
+        .db
+        .contacts()
+        .insert_one(make_contact(&ws, &acc, "wx_p"), None)
+        .await
+        .expect("seed wx_p");
+    app.state
+        .db
+        .contacts()
+        .insert_one(make_contact(&ws, &acc, "wx_q"), None)
+        .await
+        .expect("seed wx_q");
 
     // 预置一条既存 campaign_send（campaignId=本活动, contactWxid=wx_p）占住去重位——
     // 模拟 wx_p 上一轮已推过。CampaignSend serde rename_all=camelCase（models.rs:622），

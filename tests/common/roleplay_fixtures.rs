@@ -44,7 +44,7 @@ pub const EMOTIONAL_COMPANION_WORKSPACE: &str = "test_emotional_companion";
 /// activate 端点语义），确保 `reload_from_db` 的 `find` 只命中一条——否则"后插入者
 /// 赢"会让结果不确定（设计 §5.1）。
 ///
-/// **缓存失效**：插入后立即 `invalidate_global_domain_profile_cache()`，使下一次
+/// **缓存失效**：插入后立即失效当前测试数据库的 DomainProfile cache，使下一次
 /// `load_active_domain_profile` 重读当前 DB（绕开 30s TTL）。
 pub async fn seed_active_domain_profile<F>(
     app: &TestApp,
@@ -85,7 +85,7 @@ where
         .expect("insert active domain profile");
 
     // 强制失效进程级缓存，下次 load 立即见最新（绕开 30s TTL）。
-    invalidate_global_domain_profile_cache();
+    invalidate_global_domain_profile_cache(&app.state.db);
     id
 }
 

@@ -60,10 +60,7 @@ async fn scan_silence(state: &AppState) -> anyhow::Result<()> {
     let workspace_id = state.config.default_workspace_id.clone();
     let now = DateTime::now();
     let now_ms = now.timestamp_millis();
-    let threshold_ms = state
-        .config
-        .silence_threshold_seconds
-        .saturating_mul(1000);
+    let threshold_ms = state.config.silence_threshold_seconds.saturating_mul(1000);
     let silent_before = DateTime::from_millis(now_ms - threshold_ms);
 
     let filter = silence_candidate_filter(&workspace_id, silent_before);

@@ -178,7 +178,7 @@ pub(super) async fn create_taxonomy(
         .await
     {
         Ok(result) => {
-            invalidate_global_taxonomy_cache();
+            invalidate_global_taxonomy_cache(&state.db);
             let mut entry_with_id = entry;
             entry_with_id.id = result.inserted_id.as_object_id();
             Ok(Json(json!({ "item": taxonomy_entry_json(entry_with_id) })).into_response())
@@ -259,7 +259,7 @@ pub(super) async fn patch_taxonomy(
     if result.matched_count == 0 {
         return Err(AppError::NotFound("taxonomy entry not found".to_string()));
     }
-    invalidate_global_taxonomy_cache();
+    invalidate_global_taxonomy_cache(&state.db);
     let entry = collection
         .find_one(
             doc! {
@@ -301,7 +301,7 @@ pub(super) async fn delete_taxonomy(
     if result.matched_count == 0 {
         return Err(AppError::NotFound("taxonomy entry not found".to_string()));
     }
-    invalidate_global_taxonomy_cache();
+    invalidate_global_taxonomy_cache(&state.db);
     Ok(Json(json!({ "ok": true })))
 }
 

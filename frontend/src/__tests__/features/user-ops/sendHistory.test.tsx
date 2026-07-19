@@ -8,6 +8,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen } from "@testing-library/react";
 import { SendHistorySection } from "../../../features/user-ops/legacy";
+import { useAccountStore } from "../../../stores/accountStore";
 
 const EMPTY_CLAIM = /还没有主动给该客户发送过素材或名片/;
 
@@ -34,12 +35,19 @@ function errResponse(status: number): Response {
 describe("SendHistorySection 加载失败不吞成空态", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
+    useAccountStore.setState({
+      accounts: [{ accountId: "account-a" } as never],
+      selectedAccountId: "account-a",
+    });
   });
 
   it("拉取成功但确实无记录 → 展示空态事实句", async () => {
     globalThis.fetch = vi.fn(() => Promise.resolve(okJson({ items: [] }))) as unknown as typeof fetch;
     render(<SendHistorySection wxid="wx_ok_empty" />);
     expect(await screen.findByText(EMPTY_CLAIM)).toBeInTheDocument();
+    expect(globalThis.fetch).toHaveBeenCalledWith(
+      expect.stringContaining("accountId=account-a")
+    );
   });
 
   it("拉取失败 → 不得展示'还没发过'事实句，且要给出失败提示", async () => {

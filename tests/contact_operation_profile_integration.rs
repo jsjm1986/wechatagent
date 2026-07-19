@@ -106,7 +106,11 @@ async fn front_end_style_request_preserves_profile_attributes() {
     let ws = app.state.config.default_workspace_id.clone();
     let acc = app.state.config.default_account_id.clone();
     let ai_attrs = doc! { "budget": "high", "decision_role": "owner" };
-    let id = seed(&app, managed_contact(&ws, &acc, "wx_m13_a", ai_attrs.clone())).await;
+    let id = seed(
+        &app,
+        managed_contact(&ws, &acc, "wx_m13_a", ai_attrs.clone()),
+    )
+    .await;
 
     update_operation_profile(
         State(app.state.clone()),
@@ -138,7 +142,11 @@ async fn non_empty_profile_attributes_is_written() {
     let app = TestApp::start().await;
     let ws = app.state.config.default_workspace_id.clone();
     let acc = app.state.config.default_account_id.clone();
-    let id = seed(&app, managed_contact(&ws, &acc, "wx_m13_b", Document::new())).await;
+    let id = seed(
+        &app,
+        managed_contact(&ws, &acc, "wx_m13_b", Document::new()),
+    )
+    .await;
 
     update_operation_profile(
         State(app.state.clone()),
@@ -172,7 +180,11 @@ async fn updating_follow_up_policy_preserves_profile_attributes() {
     let ws = app.state.config.default_workspace_id.clone();
     let acc = app.state.config.default_account_id.clone();
     let ai_attrs = doc! { "budget": "mid" };
-    let id = seed(&app, managed_contact(&ws, &acc, "wx_m13_c", ai_attrs.clone())).await;
+    let id = seed(
+        &app,
+        managed_contact(&ws, &acc, "wx_m13_c", ai_attrs.clone()),
+    )
+    .await;
 
     update_operation_profile(
         State(app.state.clone()),

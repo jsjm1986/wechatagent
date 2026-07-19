@@ -49,7 +49,7 @@ use axum::extract::{Path, State};
 use axum::{Extension, Json};
 use mongodb::bson::{doc, oid::ObjectId, DateTime};
 use serde_json::json;
-use wechatagent::agent::knowledge_agent::{answer, AnswerRequest, CatalogFilter};
+use wechatagent::agent::knowledge_agent::{answer, list_catalog, AnswerRequest, CatalogFilter};
 use wechatagent::auth::AuthenticatedAdmin;
 use wechatagent::llm::{LlmClient, LlmFormat};
 use wechatagent::models::{LlmProviderConfig, OperationKnowledgeChunk, RelatedRef};
@@ -61,6 +61,7 @@ use wechatagent::routes::ext_knowledge::{
     KnowledgeAutoVerifyRequest, OperationKnowledgeImportRequest,
 };
 
+use crate::common::capability_evidence::CapabilityEvidence;
 use crate::common::TestApp;
 use wiremock::MockServer;
 
@@ -72,7 +73,9 @@ use wiremock::MockServer;
 /// provider 沿革（2026-06-03）：MiMo 配额耗尽 + 端点下线 → 文本默认切
 /// deepseek-v4（api.supxh.xin，OpenAI 兼容 /v1，已验 json_object 可用）。
 fn real_llm_from_env() -> Option<Arc<LlmClient>> {
-    let api_key = std::env::var("REAL_LLM_API_KEY").ok().filter(|k| !k.trim().is_empty())?;
+    let api_key = std::env::var("REAL_LLM_API_KEY")
+        .ok()
+        .filter(|k| !k.trim().is_empty())?;
     let base_url = std::env::var("REAL_LLM_BASE_URL")
         .unwrap_or_else(|_| "https://api.supxh.xin/v1".to_string());
     let model = std::env::var("REAL_LLM_MODEL").unwrap_or_else(|_| "deepseek-v4-pro".to_string());
@@ -222,7 +225,11 @@ async fn seed_chunk(
         wiki_type: Some("methodology".to_string()),
         dynamic_confidence: Some(dynamic_confidence),
         chunk_type: "product_fact".to_string(),
-        related_chunks: if related.is_empty() { None } else { Some(related) },
+        related_chunks: if related.is_empty() {
+            None
+        } else {
+            Some(related)
+        },
         ..Default::default()
     };
     app.state
@@ -235,14 +242,19 @@ async fn seed_chunk(
 }
 
 /// 便捷：seed 一条 verified / active / 高置信的全局 chunk（summary≠body 时由调用方控制）。
-async fn seed_verified(
-    app: &TestApp,
-    ws: &str,
-    title: &str,
-    summary: &str,
-    body: &str,
-) -> String {
-    seed_chunk(app, ws, title, summary, body, "verified", "active", 0.9, Vec::new()).await
+async fn seed_verified(app: &TestApp, ws: &str, title: &str, summary: &str, body: &str) -> String {
+    seed_chunk(
+        app,
+        ws,
+        title,
+        summary,
+        body,
+        "verified",
+        "active",
+        0.9,
+        Vec::new(),
+    )
+    .await
 }
 
 /// 断言 tool_trace 里是否出现某个 tool 名的步骤。
@@ -254,12 +266,11 @@ fn trace_has_tool(result: &wechatagent::agent::knowledge_agent::AnswerResult, to
 }
 
 /// 断言 tool_trace 里某个 open_chunk 步骤的 `opened` 数组包含目标 id。
-fn trace_opened_id(
-    result: &wechatagent::agent::knowledge_agent::AnswerResult,
-    id: &str,
-) -> bool {
+fn trace_opened_id(result: &wechatagent::agent::knowledge_agent::AnswerResult, id: &str) -> bool {
     result.tool_trace.iter().any(|d| {
-        d.get_str("tool").map(|t| t == "open_chunk").unwrap_or(false)
+        d.get_str("tool")
+            .map(|t| t == "open_chunk")
+            .unwrap_or(false)
             && d.get_array("opened")
                 .map(|arr| arr.iter().any(|b| b.as_str() == Some(id)))
                 .unwrap_or(false)
@@ -343,7 +354,11 @@ async fn k1_real_open_chunk_reaches_body_detail() {
         result.answer.chars().take(120).collect::<String>(),
     );
 
-    assert!(result.rounds_used >= 1, "真模型必须至少跑 1 轮，实际 {}", result.rounds_used);
+    assert!(
+        result.rounds_used >= 1,
+        "真模型必须至少跑 1 轮，实际 {}",
+        result.rounds_used
+    );
     assert!(!result.answer.trim().is_empty(), "answer 不应为空");
     // 红线：cite 的每个 id 必须是本 workspace seed 出来的某条（不能凭空捏造）。
     // K1 只关心赔付 chunk 被 open；over-cite 无关 chunk 由 K3 专门盯。
@@ -371,6 +386,7 @@ async fn k1_real_open_chunk_reaches_body_detail() {
 #[tokio::test]
 #[ignore]
 async fn k2_real_follow_relations_reaches_excluded_chunk() {
+    let mut evidence = CapabilityEvidence::new("k2_relationship_traversal");
     let llm = require_real_llm!();
     let app = TestApp::start().await;
     let mcp = dummy_mcp_server().await;
@@ -381,9 +397,9 @@ async fn k2_real_follow_relations_reaches_excluded_chunk() {
     let id_b = seed_chunk(
         &app,
         &ws,
-        "私有化部署硬件前置条件",
-        "私有化部署的服务器与资源要求。",
-        "私有化部署需独立服务器，最低配置 8 核 16G 内存、200G SSD；需 Docker 20+ 与内网 DNS。",
+        "资源基线 Zeta",
+        "关联项目的编号化资源约束。",
+        "最低规格为 8 核 16G 内存、200G SSD；运行环境需 Docker 20+ 与内网 DNS。",
         "verified",
         "active",
         0.05, // 极低 → 排在所有填充 chunk 之后，跌出 top-30
@@ -396,8 +412,8 @@ async fn k2_real_follow_relations_reaches_excluded_chunk() {
         &app,
         &ws,
         "私有化部署方案",
-        "私有化部署整体方案；具体硬件/前置条件见关联条目。",
-        "私有化部署支持完全离线运行，数据不出内网。硬件与前置条件详见关联的前置条件条目。",
+        "私有化部署整体方案；完整要求见关联条目 Zeta。",
+        "私有化部署支持完全离线运行，数据不出内网。请继续展开关联条目 Zeta。",
         "verified",
         "active",
         0.99, // 最高 → 一定在 catalog 内
@@ -409,15 +425,15 @@ async fn k2_real_follow_relations_reaches_excluded_chunk() {
     )
     .await;
 
-    // 30 条填充 chunk（中等置信）占满 catalog 头部，确保 B 跌出 top-30。
+    // 29 条与 query 相关的填充 chunk + A 恰好占满 top-30，确保低相关 B 为第 31。
     let mut all_seed = vec![id_a.clone(), id_b.clone()];
-    for i in 0..30 {
+    for i in 0..29 {
         let id = seed_chunk(
             &app,
             &ws,
-            &format!("常见问题 {i}"),
-            &format!("常见问题 {i} 的简要说明。"),
-            &format!("这是与私有化部署硬件无关的常见问题 {i} 的正文内容。"),
+            &format!("私有化部署落地常见问题 {i}"),
+            &format!("私有化部署落地前置清单的常见说明 {i}。"),
+            &format!("这是私有化部署落地流程中的一般说明 {i}，不包含目标资源规格。"),
             "verified",
             "active",
             0.5, // 高于 B、低于 A → 占满 A 之后的 catalog 名额
@@ -427,14 +443,33 @@ async fn k2_real_follow_relations_reaches_excluded_chunk() {
         all_seed.push(id);
     }
 
+    let query = "私有化部署方案中关联前置条目的完整内容是什么？";
+    let initial_catalog = list_catalog(&state, &ws, None, &CatalogFilter::default(), Some(query))
+        .await
+        .expect("load production-ranked initial catalog");
+    let initial_ids: Vec<&str> = initial_catalog
+        .iter()
+        .map(|entry| entry.chunk_id.as_str())
+        .collect();
+    assert!(
+        initial_ids.contains(&id_a.as_str()),
+        "K2 fixture invalid: A must be visible in initial production catalog: {initial_ids:?}"
+    );
+    assert!(
+        !initial_ids.contains(&id_b.as_str()),
+        "K2 fixture invalid: B is directly visible in initial production catalog: {initial_ids:?}"
+    );
+
     let req = AnswerRequest {
         workspace_id: ws.clone(),
         account_id: None,
-        query: "私有化部署对服务器硬件有什么具体要求？最低配置是多少？".to_string(),
+        query: query.to_string(),
         filter: CatalogFilter::default(),
         max_rounds: None,
     };
+    evidence.attempted();
     let result = unwrap_or_skip_transient!(answer(&state, req).await, "真实知识 agent answer");
+    evidence.observe_llm_calls(result.rounds_used.max(1) as usize);
 
     let reached_b_via_follow = trace_has_tool(&result, "follow_relations");
     let reached_b_via_open = trace_opened_id(&result, &id_b);
@@ -455,7 +490,11 @@ async fn k2_real_follow_relations_reaches_excluded_chunk() {
         result.answer.chars().take(120).collect::<String>(),
     );
 
-    assert!(result.rounds_used >= 1, "真模型必须至少跑 1 轮，实际 {}", result.rounds_used);
+    assert!(
+        result.rounds_used >= 1,
+        "真模型必须至少跑 1 轮，实际 {}",
+        result.rounds_used
+    );
     // 红线：cite ⊆ 全部 seed（含 A/B/填充），绝不凭空。
     for c in &result.cited_chunk_ids {
         assert!(
@@ -474,25 +513,25 @@ async fn k2_real_follow_relations_reaches_excluded_chunk() {
     // **能力**（触达被挤出 catalog 的关系条目）而非**特定工具名**——否则就是为某一
     // 工具的措辞优化测试，而非验证生产真实可达性。
     assert!(
-        reached_b_via_follow || reached_b_via_open,
-        "真模型必须沿 A→B 关系图触达被挤出 catalog 的硬件条目 B（follow_relations 或 \
-         open_chunk(从 A 关系指针学到的 B id) 均可），但两条路径都未命中。\
-         tool_trace={:?}",
+        reached_b_via_follow,
+        "真模型必须显式执行 follow_relations(A) 触达初始 catalog 外的 B；\
+         仅直接 open B 不能作为本 case 的关系工具正向见证。tool_trace={:?}",
         result.tool_trace
     );
     // K2 召回修复验证（follow_relations 预取关联目标正文进 opened）：若真模型**仅**经
     // follow_relations 触达 B（没另外 open_chunk(B)），则修复保证 B 正文在该 follow 步
     // 即被预取进 opened（trace.openedBodies 含 B）——否则模型读不到 B 正文、cite⊆opened
     // 红线会把 B 滤掉，召回仍是残的。这条断言锁死「follow 当轮即载正文」这一修复行为。
-    if reached_b_via_follow && !reached_b_via_open {
-        assert!(
-            follow_loaded_b,
-            "真模型经 follow_relations 触达 B，但 trace.openedBodies 未含 B——\
-             follow_relations 预取正文（K2 召回修复）失效，B 正文没被载入 opened。\
-             tool_trace={:?}",
-            result.tool_trace
-        );
-    }
+    assert!(
+        follow_loaded_b,
+        "真模型经 follow_relations 触达 B，但 trace.openedBodies 未含 B——\
+         follow_relations 预取正文失效。tool_trace={:?}",
+        result.tool_trace
+    );
+    evidence.branch("follow_relations");
+    evidence.detail("initial_catalog_count", initial_ids.len());
+    evidence.detail("target_opened_directly", reached_b_via_open);
+    evidence.pass(1, 6);
 }
 
 // ── K3 · 无幻觉（catalog 非空但无相关 chunk）─────────────────────────────────
@@ -503,6 +542,7 @@ async fn k2_real_follow_relations_reaches_excluded_chunk() {
 #[tokio::test]
 #[ignore]
 async fn k3_real_no_hallucination_when_topic_absent() {
+    let mut evidence = CapabilityEvidence::new("k3_honest_abstention");
     let llm = require_real_llm!();
     let app = TestApp::start().await;
     let mcp = dummy_mcp_server().await;
@@ -528,14 +568,17 @@ async fn k3_real_no_hallucination_when_topic_absent() {
     let seed = [id1, id2];
 
     // 知识库完全没覆盖的主题：海外支付货币 / 跨境结算手续费。
+    let original_query = "你们支持哪些海外支付货币？跨境结算的手续费是多少个百分点？";
     let req = AnswerRequest {
         workspace_id: ws.clone(),
         account_id: None,
-        query: "你们支持哪些海外支付货币？跨境结算的手续费是多少个百分点？".to_string(),
+        query: original_query.to_string(),
         filter: CatalogFilter::default(),
         max_rounds: None,
     };
+    evidence.attempted();
     let result = unwrap_or_skip_transient!(answer(&state, req).await, "真实知识 agent answer");
+    evidence.observe_llm_calls(result.rounds_used.max(1) as usize);
 
     eprintln!(
         "[k3] rounds_used={} cited={:?} answer={:?}",
@@ -544,8 +587,15 @@ async fn k3_real_no_hallucination_when_topic_absent() {
         result.answer.chars().take(160).collect::<String>(),
     );
 
-    assert!(result.rounds_used >= 1, "真模型必须至少跑 1 轮，实际 {}", result.rounds_used);
-    assert!(!result.answer.trim().is_empty(), "answer 不应为空（至少应说明无相关信息）");
+    assert!(
+        result.rounds_used >= 1,
+        "真模型必须至少跑 1 轮，实际 {}",
+        result.rounds_used
+    );
+    assert!(
+        !result.answer.trim().is_empty(),
+        "answer 不应为空（至少应说明无相关信息）"
+    );
     // 红线：cite 的每个 id 必 ⊆ seed（真模型绝不捏造不存在的 chunk id）。
     for c in &result.cited_chunk_ids {
         assert!(
@@ -553,62 +603,52 @@ async fn k3_real_no_hallucination_when_topic_absent() {
             "真模型 cite 了不存在/无关捏造的 chunk id={c}，seed={seed:?}",
         );
     }
-    // 软诊断：无关主题理应零引用；非空时在 CI 日志标注，供迭代判断是否需收紧 prompt。
-    if !result.cited_chunk_ids.is_empty() {
-        eprintln!(
-            "[k3][warn] 真模型对无覆盖主题 over-cite 了 {} 条无关 chunk（理想应为 0）：{:?}",
-            result.cited_chunk_ids.len(),
-            result.cited_chunk_ids
-        );
-    }
+    assert!(
+        result.cited_chunk_ids.is_empty(),
+        "无覆盖主题必须诚实弃答，不得引用无关 seed：{:?}",
+        result.cited_chunk_ids
+    );
 
     // ── 闭环红线（确定性）：诚实弃答路径必产出携带原始 query 的 recall_miss gap 信号 ──
     // 仅当真模型走了诚实弃答路径（cited 为空）时强断；over-cite 时跳过该断言，避免模型
     // 方差导致 flaky。原始 query 的写入是确定性的（answer() 同步注入，不依赖 LLM 追问），
     // 故此断言零模型方差——这正是「确定性闭环」落在 K（而非 Q）的意义。gap 信号经
     // tokio::spawn fire-and-forget 持久化，有延迟，故 bounded-retry 轮询（~10×300ms）。
-    if result.cited_chunk_ids.is_empty() {
-        let original_query = "你们支持哪些海外支付货币？跨境结算的手续费是多少个百分点？";
-        let mut found: Option<wechatagent::models::KnowledgeGapSignal> = None;
-        for _ in 0..10 {
-            let mut cursor = state
-                .db
-                .knowledge_gap_signals()
-                .find(
-                    doc! { "workspace_id": &ws, "kind": "recall_miss", "status": "pending" },
-                    None,
-                )
-                .await
-                .expect("query knowledge_gap_signals");
-            use futures::StreamExt;
-            while let Some(next) = cursor.next().await {
-                let sig = next.expect("decode gap signal");
-                if sig.search_queries.iter().any(|q| q == original_query) {
-                    found = Some(sig);
-                    break;
-                }
-            }
-            if found.is_some() {
+    let mut found: Option<wechatagent::models::KnowledgeGapSignal> = None;
+    for _ in 0..10 {
+        let mut cursor = state
+            .db
+            .knowledge_gap_signals()
+            .find(
+                doc! { "workspace_id": &ws, "kind": "recall_miss", "status": "pending" },
+                None,
+            )
+            .await
+            .expect("query knowledge_gap_signals");
+        use futures::StreamExt;
+        while let Some(next) = cursor.next().await {
+            let sig = next.expect("decode gap signal");
+            if sig.search_queries.iter().any(|q| q == original_query) {
+                found = Some(sig);
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         }
-        let sig = found.expect(
-            "诚实弃答（cited 为空）后必须留下 kind=recall_miss / status=pending 的 gap 信号，\
-             且其 search_queries 包含原始 query（确定性闭环：人类可据此用对话补全知识库）",
-        );
-        assert_eq!(sig.kind, "recall_miss", "gap 信号 kind 必须是 recall_miss");
-        assert_eq!(sig.status, "pending", "新留 gap 信号必须是 pending（待人类补全）");
-        assert!(
-            sig.search_queries.iter().any(|q| q == original_query),
-            "gap 信号 search_queries 必须包含原始 query（确定性），实际={:?}",
-            sig.search_queries
-        );
-        eprintln!(
-            "[k3] 闭环 gap 信号 ✓ signal_id={} kind={} search_queries={:?}",
-            sig.signal_id, sig.kind, sig.search_queries
-        );
+        if found.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     }
+    let sig = found.expect("诚实弃答后必须留下 recall_miss/pending gap 信号且包含原始 query");
+    assert_eq!(sig.kind, "recall_miss", "gap 信号 kind 必须是 recall_miss");
+    assert_eq!(sig.status, "pending", "新留 gap 信号必须是 pending");
+    assert!(
+        sig.search_queries.iter().any(|q| q == original_query),
+        "gap 信号 search_queries 必须包含原始 query，实际={:?}",
+        sig.search_queries
+    );
+    evidence.branch("honest_abstention_recall_miss");
+    evidence.detail("signal_id", sig.signal_id.clone());
+    evidence.pass(1, 7);
 }
 
 // ── K4 · 未审定知识永不上桌（needs_review chunk 永不进 catalog / 永不被 cite）──
@@ -789,6 +829,7 @@ const K6_ARTICLE_IMAGE_BASE64: &str = include_str!("fixtures/k6_article_image.b6
 #[tokio::test]
 #[ignore]
 async fn k6_real_vision_article_extraction_keeps_needs_review() {
+    let mut evidence = CapabilityEvidence::new("k6_vision_artifact");
     let _llm = require_real_llm!();
     let app = TestApp::start().await;
     let ws = app.state.config.default_workspace_id.clone();
@@ -803,8 +844,8 @@ async fn k6_real_vision_article_extraction_keeps_needs_review() {
     let base_url = std::env::var("REAL_LLM_VISION_BASE_URL")
         .or_else(|_| std::env::var("REAL_LLM_BASE_URL"))
         .unwrap_or_else(|_| "https://integrate.api.nvidia.com/v1".to_string());
-    let vision_model =
-        std::env::var("REAL_LLM_VISION_MODEL").unwrap_or_else(|_| "nvidia/nemotron-nano-12b-v2-vl".to_string());
+    let vision_model = std::env::var("REAL_LLM_VISION_MODEL")
+        .unwrap_or_else(|_| "nvidia/nemotron-nano-12b-v2-vl".to_string());
     let vision_cfg = LlmProviderConfig {
         id: Some(ObjectId::new()),
         workspace_id: ws.clone(),
@@ -843,6 +884,7 @@ async fn k6_real_vision_article_extraction_keeps_needs_review() {
         hint: Some("企业版服务条款图片".to_string()),
     };
 
+    evidence.attempted();
     let resp = unwrap_or_skip_transient!(
         import_operation_knowledge_apply_image(State(app.state.clone()), admin, Json(req)).await,
         "真实 vision 抽取（不崩）"
@@ -856,6 +898,11 @@ async fn k6_real_vision_article_extraction_keeps_needs_review() {
         body.get("note"),
     );
 
+    assert!(
+        !chunk_ids.is_empty(),
+        "K6 vision 必须产出至少一条可复查 chunk"
+    );
+    evidence.observe_llm_calls(1);
     // 红线（硬断言）：任何落库 chunk 必 draft + needs_review。
     for id in &chunk_ids {
         let id_hex = id.as_str().expect("chunkId str");
@@ -870,13 +917,19 @@ async fn k6_real_vision_article_extraction_keeps_needs_review() {
             .await
             .expect("query chunk")
             .expect("chunk exists");
-        assert_eq!(chunk.status, "draft", "vision chunk 必须 draft（AI 永不自动 verify）");
+        assert_eq!(
+            chunk.status, "draft",
+            "vision chunk 必须 draft（AI 永不自动 verify）"
+        );
         assert_eq!(
             chunk.integrity_status.as_deref(),
             Some("needs_review"),
             "vision chunk 必须 needs_review（AI 永不自动 verify）"
         );
     }
+    evidence.branch("vision_chunks_persisted");
+    evidence.detail("chunk_count", chunk_ids.len());
+    evidence.pass(chunk_ids.len(), 1 + chunk_ids.len() * 2);
 }
 
 // ── K7 · 自动审定 provenance 闸门（auto_verify_operation_knowledge_chunks）──────
@@ -895,6 +948,7 @@ async fn k6_real_vision_article_extraction_keeps_needs_review() {
 #[tokio::test]
 #[ignore]
 async fn k7_real_auto_verify_provenance_gate_holds() {
+    let mut evidence = CapabilityEvidence::new("k7_auto_verify_commit");
     let llm = require_real_llm!();
     let app = TestApp::start().await;
     let mcp = dummy_mcp_server().await;
@@ -932,8 +986,8 @@ async fn k7_real_auto_verify_provenance_gate_holds() {
         title: "无出处的定价说明".to_string(),
         summary: Some("一条没有任何原文引用/锚点的定价说明。".to_string()),
         body: Some("基础版 99 元/月，专业版 299 元/月。".to_string()),
-        source_quote: None,            // 关键：无原文引用
-        source_anchors: Vec::new(),    // 关键：无锚点
+        source_quote: None,         // 关键：无原文引用
+        source_anchors: Vec::new(), // 关键：无锚点
         integrity_status: Some("needs_review".to_string()),
         confidence_score: Some(50),
         status: "active".to_string(),
@@ -965,6 +1019,7 @@ async fn k7_real_auto_verify_provenance_gate_holds() {
     }))
     .expect("构造 KnowledgeAutoVerifyRequest");
 
+    evidence.attempted();
     let resp = unwrap_or_skip_transient!(
         auto_verify_operation_knowledge_chunks(State(state.clone()), admin, Json(req)).await,
         "真实 auto_verify（不崩）"
@@ -983,7 +1038,10 @@ async fn k7_real_auto_verify_provenance_gate_holds() {
         .await
         .expect("query chunk")
         .expect("chunk exists");
-    eprintln!("[k7] chunk integrity_status after auto_verify = {:?}", after.integrity_status);
+    eprintln!(
+        "[k7] chunk integrity_status after auto_verify = {:?}",
+        after.integrity_status
+    );
     // 红线：缺 provenance 的 chunk 绝不能被自动 verified。
     assert_ne!(
         after.integrity_status.as_deref(),
@@ -997,34 +1055,31 @@ async fn k7_real_auto_verify_provenance_gate_holds() {
     // created_by=auto_verify 的不可变历史。此前 auto_verify 直接 update_one 绕过审计链，
     // 「谁在何时基于什么裁决」查不到。注：单条 LLM 调用 transient 失败时 handler `continue`
     // 不写 revision，故 gate 在 processed≥1。
-    let processed = resp.0.get("processed").and_then(|v| v.as_i64()).unwrap_or(0);
-    if processed >= 1 {
-        use futures::TryStreamExt;
-        let revs: Vec<wechatagent::models::ChunkRevision> = state
-            .db
-            .chunk_revisions()
-            .find(doc! { "chunk_id": id.to_hex() }, None)
-            .await
-            .expect("query chunk_revisions")
-            .try_collect()
-            .await
-            .expect("collect chunk_revisions");
-        assert!(
-            !revs.is_empty(),
-            "[k7] auto_verify processed={processed} 但未写任何 chunk_revisions——审计链断裂"
-        );
-        let rev = &revs[0];
-        assert_eq!(rev.op, "verify", "[k7] auto_verify revision op 必须为 verify");
-        assert_eq!(
-            rev.source, "rule",
-            "[k7] auto_verify revision source 必须为 rule（LLM 自评+规则闸门，非人工签字）"
-        );
-        assert_eq!(
-            rev.created_by.as_deref(),
-            Some("auto_verify"),
-            "[k7] auto_verify revision created_by 必须为 auto_verify"
-        );
-    }
+    let processed = resp
+        .0
+        .get("processed")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    assert_eq!(processed, 1, "K7 必须实际处理唯一 seed chunk");
+    evidence.observe_llm_calls(processed as usize);
+    use futures::TryStreamExt;
+    let revs: Vec<wechatagent::models::ChunkRevision> = state
+        .db
+        .chunk_revisions()
+        .find(doc! { "chunk_id": id.to_hex() }, None)
+        .await
+        .expect("query chunk_revisions")
+        .try_collect()
+        .await
+        .expect("collect chunk_revisions");
+    assert_eq!(revs.len(), 1, "K7 必须为唯一处理项写恰好一条 revision");
+    let rev = &revs[0];
+    assert_eq!(rev.op, "verify", "K7 revision op 必须为 verify");
+    assert_eq!(rev.source, "rule", "K7 revision source 必须为 rule");
+    assert_eq!(rev.created_by.as_deref(), Some("auto_verify"));
+    evidence.branch("processed_needs_review_with_revision");
+    evidence.detail("revision_id", rev.revision_id.clone());
+    evidence.pass(1, 8);
 }
 
 // ── K8 · AI 修复只产 patch、永不自动落库（propose_chunk_repair）────────────────
@@ -1178,6 +1233,7 @@ async fn k9_real_tag_extraction_returns_two_arrays() {
 #[tokio::test]
 #[ignore]
 async fn k10_real_chat_workstation_drafts_proposal_never_persists() {
+    let mut evidence = CapabilityEvidence::new("k10_chat_create_proposal");
     let llm = require_real_llm!();
     let app = TestApp::start().await;
     let mcp = dummy_mcp_server().await;
@@ -1208,6 +1264,7 @@ async fn k10_real_chat_workstation_drafts_proposal_never_persists() {
     }))
     .expect("构造 ChatTurnRequest");
 
+    evidence.attempted();
     let resp = unwrap_or_skip_transient!(
         chat_turn(State(state.clone()), admin, Json(req)).await,
         "真实知识对话工作台 chat_turn（不崩、JSON 能解析）"
@@ -1222,30 +1279,30 @@ async fn k10_real_chat_workstation_drafts_proposal_never_persists() {
         body.get("missingFields"),
     );
 
-    // 形状红线：intent ∈ 生产闭集；naturalReply 非空字符串。
-    const INTENTS: &[&str] = &[
-        "create_chunk",
-        "update_chunk",
-        "clarify_chunk",
-        "update_pack",
-        "digest_action",
-        "update_operator_memory",
-        "freeform",
-    ];
+    evidence.observe_llm_calls(2);
+    assert_eq!(intent, "create_chunk", "明确新建请求必须命中 create_chunk");
     assert!(
-        INTENTS.contains(&intent),
-        "intent 必须 ∈ 生产闭集 {INTENTS:?}，实际 {intent:?}"
-    );
-    assert!(
-        body.get("naturalReply").and_then(|v| v.as_str()).map(|s| !s.trim().is_empty()).unwrap_or(false),
+        body.get("naturalReply")
+            .and_then(|v| v.as_str())
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false),
         "naturalReply 必须是非空字符串，实际 {:?}",
         body.get("naturalReply")
     );
-    assert!(
-        body.get("canApply").map(|v| v.is_boolean()).unwrap_or(false),
-        "canApply 必须是 bool，实际 {:?}",
-        body.get("canApply")
-    );
+    assert_eq!(body.get("canApply").and_then(|v| v.as_bool()), Some(true));
+    let draft = body
+        .get("draftPreview")
+        .and_then(|value| value.as_object())
+        .expect("create_chunk 必须返回 object draftPreview");
+    for field in ["title", "summary", "body"] {
+        assert!(
+            draft
+                .get(field)
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| !value.trim().is_empty()),
+            "draftPreview.{field} 必须非空"
+        );
+    }
 
     // 核心红线：对话起草**绝不**自动落库任何 chunk —— collection 计数必须不变。
     let chunks_after = state
@@ -1274,6 +1331,9 @@ async fn k10_real_chat_workstation_drafts_proposal_never_persists() {
         verified_after, 0,
         "chat 对话起草落库了 verified chunk——AI 永不自动 verify 红线被击穿！"
     );
+    evidence.branch("create_chunk_proposal");
+    evidence.detail("draft_fields", draft.len());
+    evidence.pass(1, 9);
 }
 
 // ── K11 · LLM 知识完整度审计（build_operation_knowledge_completeness）──────────
@@ -1340,7 +1400,10 @@ async fn k11_real_completeness_audit_closed_mode_never_verifies() {
         build_operation_knowledge_completeness(&state, &ws, &account_id).await,
         "真实知识完整度审计（不崩、JSON 能解析）"
     );
-    let mode = audit.get("answeringMode").and_then(|v| v.as_str()).unwrap_or("");
+    let mode = audit
+        .get("answeringMode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     eprintln!(
         "[k11] answeringMode={mode} totalChunks={:?} verifiedChunks={:?} evidenceChunks={:?} gaps={:?}",
         audit.get("totalChunks"),
@@ -1445,7 +1508,10 @@ async fn r4_2_legal_domain_no_hallucination_when_topic_absent() {
     );
 
     assert!(result.rounds_used >= 1, "真模型必须至少跑 1 轮");
-    assert!(!result.answer.trim().is_empty(), "answer 不应为空（至少应说明无相关信息）");
+    assert!(
+        !result.answer.trim().is_empty(),
+        "answer 不应为空（至少应说明无相关信息）"
+    );
     // 红线（域无关）：cite ⊆ seed，绝不捏造法条 chunk id。
     for c in &result.cited_chunk_ids {
         assert!(
@@ -1485,7 +1551,10 @@ async fn r4_2_legal_domain_no_hallucination_when_topic_absent() {
         );
         assert_eq!(sig.kind, "recall_miss");
         assert_eq!(sig.status, "pending");
-        eprintln!("[r4.2a] 法律域闭环 gap 信号 ✓ search_queries={:?}", sig.search_queries);
+        eprintln!(
+            "[r4.2a] 法律域闭环 gap 信号 ✓ search_queries={:?}",
+            sig.search_queries
+        );
     }
 }
 

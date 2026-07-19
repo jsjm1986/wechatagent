@@ -106,10 +106,7 @@ async fn ensure_prompt_pack_seeds_all_spec_keys() {
     let workspace = app.state.config.default_workspace_id.clone();
 
     // 跑了一遍 prompt pack v2 后，spec 里的两个新 key 都应已落地。
-    for key in [
-        "user.review.product_claim_markers",
-        "knowledge.auto_verify",
-    ] {
+    for key in ["user.review.product_claim_markers", "knowledge.auto_verify"] {
         let template = app
             .state
             .db
@@ -187,7 +184,10 @@ async fn align_refreshes_drifted_system_row_and_archives_old() {
         .await
         .unwrap()
         .expect("current row exists");
-    assert_ne!(current.content, "STALE_DRIFTED_CONTENT", "脏内容应被 spec 对齐覆盖");
+    assert_ne!(
+        current.content, "STALE_DRIFTED_CONTENT",
+        "脏内容应被 spec 对齐覆盖"
+    );
 
     // 旧脏行应被归档（archived），而非物理删除。
     let archived = app
@@ -225,7 +225,12 @@ async fn align_skips_keys_with_evolution_release_chain() {
     // 版本，这里设 2 避让。align 的 evolution 守卫按 seeded_by 识别、不看 version。
     evo.version = 2;
     evo.content = "EVOLUTION_TUNED_CONTENT".to_string();
-    app.state.db.prompt_templates().insert_one(&evo, None).await.unwrap();
+    app.state
+        .db
+        .prompt_templates()
+        .insert_one(&evo, None)
+        .await
+        .unwrap();
 
     // 制造 Ok(None)（模拟版本 bump 前的旧库）：把所有行的 pack version 改旧。
     // evo 行也被改旧没关系——align 的 evolution 守卫按 seeded_by 识别，不看 version。
@@ -378,7 +383,8 @@ async fn delete_redundant_runs_on_nonempty_db_each_startup() {
     let account = app.state.config.default_account_id.clone();
 
     // 预置一条孤立的 archived 行（key 不在 spec 中，不参与对齐）。
-    let mut archived_row = make_user_template(&workspace, "user.custom.archived_orphan", "archived");
+    let mut archived_row =
+        make_user_template(&workspace, "user.custom.archived_orphan", "archived");
     archived_row.current_version = false;
     app.state
         .db
@@ -416,7 +422,10 @@ async fn delete_redundant_runs_on_nonempty_db_each_startup() {
         )
         .await
         .unwrap();
-    assert!(after.is_none(), "archived 孤立行应被 delete_redundant 在非空库路径清除");
+    assert!(
+        after.is_none(),
+        "archived 孤立行应被 delete_redundant 在非空库路径清除"
+    );
 }
 
 /// 终审 Minor #1 回归：ensure_prompt_pack_v2 返回"是否写入",供运行时调用点据此失效 LRU。
@@ -429,9 +438,10 @@ async fn ensure_returns_true_on_write_false_on_idempotent() {
     let account = app.state.config.default_account_id.clone();
 
     // 第一次重跑(spec 与 DB 一致)应幂等 → 返回 false(无写入)。
-    let wrote_idempotent = wechatagent::prompts::ensure_prompt_pack_v2(&app.state.db, &workspace, &account)
-        .await
-        .expect("rerun ensure");
+    let wrote_idempotent =
+        wechatagent::prompts::ensure_prompt_pack_v2(&app.state.db, &workspace, &account)
+            .await
+            .expect("rerun ensure");
     assert!(!wrote_idempotent, "spec 一致时应幂等无写入→false");
 
     // 制造漂移:把一个 system 行 content 改脏(不改版本号)。
@@ -449,8 +459,12 @@ async fn ensure_returns_true_on_write_false_on_idempotent() {
         .unwrap();
 
     // 再跑应检测到漂移→对齐写入→返回 true。
-    let wrote_after_drift = wechatagent::prompts::ensure_prompt_pack_v2(&app.state.db, &workspace, &account)
-        .await
-        .expect("rerun ensure");
-    assert!(wrote_after_drift, "spec 漂移时对齐写入→true(供调用点失效LRU)");
+    let wrote_after_drift =
+        wechatagent::prompts::ensure_prompt_pack_v2(&app.state.db, &workspace, &account)
+            .await
+            .expect("rerun ensure");
+    assert!(
+        wrote_after_drift,
+        "spec 漂移时对齐写入→true(供调用点失效LRU)"
+    );
 }

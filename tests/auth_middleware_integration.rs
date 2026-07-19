@@ -15,7 +15,7 @@ use wechatagent::auth::session::{
     authenticate, bootstrap_admin_if_needed, create_session, delete_session, lookup_session,
     AuthError,
 };
-use wechatagent::auth::{AdminUser, AuthenticatedAdmin};
+use wechatagent::auth::{AdminSession, AdminUser, AuthenticatedAdmin};
 use wechatagent::routes::auth::switch_workspace;
 
 use crate::common::TestApp;
@@ -58,7 +58,9 @@ async fn authenticate_does_not_leak_user_existence() {
     );
     // 正确凭据成功
     assert!(
-        authenticate(&app.state.db, "alice", "correct-horse").await.is_ok(),
+        authenticate(&app.state.db, "alice", "correct-horse")
+            .await
+            .is_ok(),
         "正确凭据应成功"
     );
 }
@@ -81,7 +83,9 @@ async fn create_session_workspace_fallback_chain() {
         workspaces: vec!["ws_list_first".into()],
         default_workspace: Some("ws_default".into()),
     };
-    let s1 = create_session(db, &u1, 24, "ws_fallback").await.expect("s1");
+    let s1 = create_session(db, &u1, 24, "ws_fallback")
+        .await
+        .expect("s1");
     assert_eq!(s1.current_workspace.as_deref(), Some("ws_default"));
 
     // ② 无 default、有 workspaces → 用 workspaces.first()
@@ -89,7 +93,9 @@ async fn create_session_workspace_fallback_chain() {
         default_workspace: None,
         ..u1.clone()
     };
-    let s2 = create_session(db, &u2, 24, "ws_fallback").await.expect("s2");
+    let s2 = create_session(db, &u2, 24, "ws_fallback")
+        .await
+        .expect("s2");
     assert_eq!(s2.current_workspace.as_deref(), Some("ws_list_first"));
 
     // ③ 都无 → 用 fallback
@@ -98,16 +104,18 @@ async fn create_session_workspace_fallback_chain() {
         workspaces: vec![],
         ..u1.clone()
     };
-    let s3 = create_session(db, &u3, 24, "ws_fallback").await.expect("s3");
+    let s3 = create_session(db, &u3, 24, "ws_fallback")
+        .await
+        .expect("s3");
     assert_eq!(s3.current_workspace.as_deref(), Some("ws_fallback"));
 }
 
-/// 红线:过期 session lookup 必须返回 SessionExpired(ttl<=0 → expires_at<=now)。登出幂等。
+/// 红线：真实过期 session lookup 必须返回 SessionExpired；活跃 session 登出保持幂等。
+/// 完整 Cookie middleware 的 401 由 `sr176_real_route_isolation` 走真实 Router 覆盖。
 #[tokio::test]
 #[ignore]
 async fn expired_session_rejected_and_logout_idempotent() {
     let app = TestApp::start().await;
-    let db = &app.state.db;
     let user = AdminUser {
         user_id: "u_exp".into(),
         username: "u_exp".into(),
@@ -117,18 +125,51 @@ async fn expired_session_rejected_and_logout_idempotent() {
         workspaces: vec!["ws".into()],
         default_workspace: Some("ws".into()),
     };
-    // ttl_hours.max(1):create_session 强制 ttl>=1h,无法直接造过期。改为 delete 后 lookup → SessionNotFound。
-    let s = create_session(db, &user, 1, "ws").await.expect("create");
-    assert!(lookup_session(db, &s.session_id).await.is_ok(), "新 session 应可查到");
+    let expired = AdminSession {
+        session_id: "auth-test-expired-session".into(),
+        admin_user_id: user.user_id.clone(),
+        username: user.username.clone(),
+        created_at: chrono::Utc::now() - chrono::Duration::hours(2),
+        expires_at: chrono::Utc::now() - chrono::Duration::hours(1),
+        current_workspace: Some("ws".into()),
+    };
+    app.state
+        .db
+        .raw()
+        .collection::<AdminSession>("admin_sessions")
+        .insert_one(&expired, None)
+        .await
+        .expect("insert expired session");
+    let expired_result = lookup_session(&app.state.db, &expired.session_id).await;
+    let expired_rejected = matches!(expired_result, Err(AuthError::SessionExpired));
+
+    let s = create_session(&app.state.db, &user, 1, "ws")
+        .await
+        .expect("create active session");
+    let active_lookup_ok = lookup_session(&app.state.db, &s.session_id).await.is_ok();
 
     // 登出幂等:删两次都不报错
-    delete_session(db, &s.session_id).await.expect("logout 1");
-    delete_session(db, &s.session_id).await.expect("logout 2(幂等)");
+    delete_session(&app.state.db, &s.session_id)
+        .await
+        .expect("logout 1");
+    delete_session(&app.state.db, &s.session_id)
+        .await
+        .expect("logout 2(幂等)");
 
     // 删除后 lookup → SessionNotFound
-    let after = lookup_session(db, &s.session_id).await;
+    let after = lookup_session(&app.state.db, &s.session_id).await;
+    let logout_removed = matches!(after, Err(AuthError::SessionNotFound));
+
+    // 外部 Mongo 模式下始终先清理随机库，再执行断言；失败证据也不遗留测试数据。
+    app.cleanup().await;
+
     assert!(
-        matches!(after, Err(AuthError::SessionNotFound)),
+        expired_rejected,
+        "expires_at<=now 必须返回 SessionExpired，实际 {expired_result:?}"
+    );
+    assert!(active_lookup_ok, "新 session 应可查到");
+    assert!(
+        logout_removed,
         "删除后 lookup 必须 SessionNotFound,实际 {after:?}"
     );
 }
@@ -140,9 +181,14 @@ async fn switch_workspace_rejects_outside_acl() {
     let app = TestApp::start().await;
     // seed user(workspaces=[default_workspace_id])。用唯一的 default ws,使 "ws_b" 必在 ACL 外。
     let own_ws = app.state.config.default_workspace_id.clone();
-    bootstrap_admin_if_needed(&app.state.db, Some("acl_user"), Some("pw-123456"), Some(&own_ws))
-        .await
-        .expect("bootstrap admin 失败");
+    bootstrap_admin_if_needed(
+        &app.state.db,
+        Some("acl_user"),
+        Some("pw-123456"),
+        Some(&own_ws),
+    )
+    .await
+    .expect("bootstrap admin 失败");
     // 用公开路径 authenticate 拿回真实 user_id(switch_workspace 按 user_id 查 ACL)。
     let user = authenticate(&app.state.db, "acl_user", "pw-123456")
         .await

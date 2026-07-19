@@ -815,6 +815,10 @@ interface ChatTaskListItem {
   finishedAt?: string | null;
 }
 
+const CHAT_TASK_TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
+const TASK_FALLBACK_POLL_INTERVAL_MS = 5_000;
+const TASK_FALLBACK_POLL_MAX_ATTEMPTS = 12;
+
 export function TaskRail() {
   const toast = useToast();
   const [sessionId, setSessionId] = useState("");
@@ -823,7 +827,12 @@ export function TaskRail() {
   const [error, setError] = useState<string | null>(null);
   const [liveTurns, setLiveTurns] = useState<number[]>([]);
   const [taskList, setTaskList] = useState<ChatTaskListItem[]>([]);
+  const [streamNotice, setStreamNotice] = useState("");
   const sseRef = useRef<SseHandle | null>(null);
+  const trackedTaskIdRef = useRef("");
+  const snapshotGenerationRef = useRef(0);
+  const fallbackPollTimerRef = useRef<number | null>(null);
+  const fallbackPollGenerationRef = useRef(0);
 
   async function loadTaskList() {
     try {
@@ -852,16 +861,120 @@ export function TaskRail() {
     sseRef.current = null;
   }
 
-  function attachStream(sid: string) {
+  function stopFallbackPolling() {
+    fallbackPollGenerationRef.current += 1;
+    if (fallbackPollTimerRef.current !== null) {
+      window.clearTimeout(fallbackPollTimerRef.current);
+      fallbackPollTimerRef.current = null;
+    }
+  }
+
+  function settleTerminalTask(data: ChatTaskView) {
+    if (!CHAT_TASK_TERMINAL_STATUSES.has(data.status)) return false;
     closeStream();
-    if (!sid || typeof window === "undefined" || typeof window.EventSource === "undefined") return;
+    stopFallbackPolling();
+    setStreamNotice("");
+    void loadTaskList();
+    return true;
+  }
+
+  async function fetchTaskSnapshot(taskId: string, showPending = false) {
+    const snapshotGeneration = ++snapshotGenerationRef.current;
+    if (showPending) setPending(true);
+    if (showPending) setError(null);
+    try {
+      const r = await fetch(`/api/knowledge/chat/tasks/${encodeURIComponent(taskId)}`);
+      if (!r.ok) throw await parseApiError(r);
+      const data = (await r.json()) as ChatTaskView;
+      if (
+        trackedTaskIdRef.current !== taskId ||
+        snapshotGeneration !== snapshotGenerationRef.current
+      ) return null;
+      setError(null);
+      setTask(data);
+      settleTerminalTask(data);
+      return data;
+    } catch (e) {
+      if (
+        trackedTaskIdRef.current === taskId &&
+        snapshotGeneration === snapshotGenerationRef.current
+      ) {
+        setError(e instanceof Error ? e.message : String(e));
+      }
+      return null;
+    } finally {
+      if (
+        showPending &&
+        trackedTaskIdRef.current === taskId &&
+        snapshotGeneration === snapshotGenerationRef.current
+      ) setPending(false);
+    }
+  }
+
+  function startFallbackPolling(taskId: string) {
+    stopFallbackPolling();
+    const generation = fallbackPollGenerationRef.current;
+    let attempts = 0;
+    setStreamNotice("实时连接已中断，正在通过任务接口核对最新状态…");
+
+    const poll = async () => {
+      if (
+        generation !== fallbackPollGenerationRef.current ||
+        trackedTaskIdRef.current !== taskId
+      ) return;
+      attempts += 1;
+      const data = await fetchTaskSnapshot(taskId);
+      if (
+        generation !== fallbackPollGenerationRef.current ||
+        trackedTaskIdRef.current !== taskId ||
+        (data && CHAT_TASK_TERMINAL_STATUSES.has(data.status))
+      ) return;
+      if (attempts >= TASK_FALLBACK_POLL_MAX_ATTEMPTS) {
+        fallbackPollTimerRef.current = null;
+        setStreamNotice("实时连接与自动核对均已停止，请点击“拉取”获取最新状态。");
+        return;
+      }
+      fallbackPollTimerRef.current = window.setTimeout(
+        () => void poll(),
+        TASK_FALLBACK_POLL_INTERVAL_MS,
+      );
+    };
+    void poll();
+  }
+
+  function attachStream(sid: string, taskId: string) {
+    closeStream();
+    if (!sid || typeof window === "undefined") return;
+    if (typeof window.EventSource === "undefined") {
+      startFallbackPolling(taskId);
+      return;
+    }
+    setStreamNotice("正在连接实时进度…");
     sseRef.current = createSseReconnector(
       `/api/knowledge/chat/sessions/${encodeURIComponent(sid)}/stream`,
-      { onEvent: { turn: (ev) => { const v = Number(ev.data); if (!Number.isNaN(v)) setLiveTurns((prev) => [...prev, v]); } }, terminalEvents: ["close"] },
+      {
+        onEvent: {
+          turn: (ev) => {
+            const v = Number(ev.data);
+            if (!Number.isNaN(v)) setLiveTurns((prev) => [...prev, v]);
+            void fetchTaskSnapshot(taskId);
+          },
+          close: () => { void fetchTaskSnapshot(taskId); },
+        },
+        terminalEvents: ["close"],
+        onOpen: () => { setStreamNotice(""); },
+        onReconnecting: (attempt) => {
+          setStreamNotice(`实时连接中断，正在第 ${attempt} 次重连…`);
+        },
+        onGaveUp: () => { startFallbackPolling(taskId); },
+      },
     );
   }
 
-  useEffect(() => () => closeStream(), []);
+  useEffect(() => () => {
+    closeStream();
+    stopFallbackPolling();
+  }, []);
 
   // E14：ChatWorkbench 派工成功后广播 wikiTrackTask，自动填入并跟踪新任务。
   useEffect(() => {
@@ -880,18 +993,17 @@ export function TaskRail() {
   }, []);
 
   async function loadTask(taskId: string) {
-    setPending(true);
-    setError(null);
-    try {
-      const r = await fetch(`/api/knowledge/chat/tasks/${encodeURIComponent(taskId)}`);
-      if (!r.ok) throw await parseApiError(r);
-      const data = (await r.json()) as ChatTaskView;
-      setTask(data);
-      attachStream(data.sessionId);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setPending(false);
+    const normalized = taskId.trim();
+    if (!normalized) return;
+    trackedTaskIdRef.current = normalized;
+    snapshotGenerationRef.current += 1;
+    closeStream();
+    stopFallbackPolling();
+    setStreamNotice("");
+    setLiveTurns([]);
+    const data = await fetchTaskSnapshot(normalized, true);
+    if (data && !CHAT_TASK_TERMINAL_STATUSES.has(data.status)) {
+      attachStream(data.sessionId, normalized);
     }
   }
 
@@ -979,6 +1091,11 @@ export function TaskRail() {
             <div className="wikiTaskMeta wikiTaskMeta--small">
               开始：{task.startedAt ?? "—"} · 结束：{task.finishedAt ?? "—"}
             </div>
+            {streamNotice ? (
+              <div className="wikiTaskMeta wikiTaskMeta--small" role="status">
+                {streamNotice}
+              </div>
+            ) : null}
             {task.errorKind ? (
               <div className="wikiAlert error">执行出错：{task.errorKind}</div>
             ) : null}

@@ -84,7 +84,11 @@ fn asset_query(value: serde_json::Value) -> ContentAssetQuery {
 }
 
 /// 直调 `list_content_assets` 并返回 items 中的 id（hex string）集合，便于断言含/不含。
-async fn list_ids(state: &AppState, admin: &AuthenticatedAdmin, query: serde_json::Value) -> Vec<String> {
+async fn list_ids(
+    state: &AppState,
+    admin: &AuthenticatedAdmin,
+    query: serde_json::Value,
+) -> Vec<String> {
     let resp = list_content_assets(
         State(state.clone()),
         Extension(admin.clone()),

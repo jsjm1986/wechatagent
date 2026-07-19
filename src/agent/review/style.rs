@@ -40,10 +40,7 @@ pub(crate) fn extract_outbound_style_fingerprint(content: &str) -> String {
     let tail = trimmed
         .chars()
         .rev()
-        .find(|c| {
-            !c.is_whitespace()
-                && !matches!(*c as u32, 0x1F300..=0x1FAFF | 0x2600..=0x27BF)
-        })
+        .find(|c| !c.is_whitespace() && !matches!(*c as u32, 0x1F300..=0x1FAFF | 0x2600..=0x27BF))
         .unwrap_or('.');
     let tail_class = match tail {
         '?' | '？' => 'q',
@@ -76,9 +73,7 @@ pub(crate) fn style_diverged(prev: &str, current: &str) -> bool {
     let prev_parts: Vec<&str> = prev.split('|').collect();
     let cur_parts: Vec<&str> = current.split('|').collect();
     let len = prev_parts.len().min(cur_parts.len());
-    let diff = (0..len)
-        .filter(|i| prev_parts[*i] != cur_parts[*i])
-        .count();
+    let diff = (0..len).filter(|i| prev_parts[*i] != cur_parts[*i]).count();
     diff >= 3
 }
 

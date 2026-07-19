@@ -8,6 +8,7 @@ use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
 
 /// 构造一条待写台账。转化字段一律留空（回扫填）。
 pub(crate) fn build_ledger_entry(
+    outbox_id: ObjectId,
     workspace_id: &str,
     account_id: &str,
     contact_wxid: &str,
@@ -20,6 +21,7 @@ pub(crate) fn build_ledger_entry(
 ) -> AgentSendLedger {
     AgentSendLedger {
         id: None,
+        outbox_id: Some(outbox_id),
         workspace_id: workspace_id.to_string(),
         account_id: account_id.to_string(),
         contact_wxid: contact_wxid.to_string(),
@@ -39,10 +41,43 @@ pub(crate) fn build_ledger_entry(
 
 /// fail-soft 写台账：失败只 log，绝不返 Err（既成事实纪律——发送已成，
 /// 台账缺一条不该影响发送结果，更不能让上游误判为失败而重发）。
-pub(crate) async fn record_send(state: &AppState, entry: &AgentSendLedger) {
-    if let Err(err) = state.db.agent_send_ledger().insert_one(entry, None).await {
+pub async fn record_send(state: &AppState, entry: &AgentSendLedger) {
+    let Some(outbox_id) = entry.outbox_id else {
         tracing::error!(
             workspace_id = %entry.workspace_id,
+            account_id = %entry.account_id,
+            "refusing to persist an unanchored send ledger row"
+        );
+        return;
+    };
+    let row = match mongodb::bson::to_document(entry) {
+        Ok(row) => row,
+        Err(err) => {
+            tracing::error!(error = %err, "serializing anchored send ledger row failed");
+            return;
+        }
+    };
+    let options = mongodb::options::UpdateOptions::builder()
+        .upsert(true)
+        .build();
+    if let Err(err) = state
+        .db
+        .agent_send_ledger()
+        .update_one(
+            doc! {
+                "workspace_id": &entry.workspace_id,
+                "account_id": &entry.account_id,
+                "outbox_id": outbox_id,
+            },
+            doc! { "$setOnInsert": row },
+            options,
+        )
+        .await
+    {
+        tracing::error!(
+            workspace_id = %entry.workspace_id,
+            account_id = %entry.account_id,
+            outbox_id = %outbox_id,
             contact_wxid = %entry.contact_wxid,
             send_kind = %entry.send_kind,
             target_id = %entry.target_id,
@@ -61,6 +96,14 @@ pub(crate) async fn record_send_for_entry(
     contact: &Contact,
     now: DateTime,
 ) {
+    let Some(outbox_id) = entry.id else {
+        tracing::error!(
+            workspace_id = %entry.workspace_id,
+            account_id = %entry.account_id,
+            "delivered outbox entry has no _id; send ledger write suppressed"
+        );
+        return;
+    };
     let send_kind_target = entry
         .referral_card_id
         .as_deref()
@@ -78,6 +121,7 @@ pub(crate) async fn record_send_for_entry(
         .and_then(|d| d.get_str("customer_stage").ok())
         .map(ToString::to_string);
     let ledger_row = build_ledger_entry(
+        outbox_id,
         &entry.workspace_id,
         &entry.account_id,
         &entry.contact_wxid,
@@ -173,7 +217,7 @@ pub(crate) fn ordered_stages_from_machine(state_machine: &Document) -> Vec<Strin
 
 /// 回扫一批 outcome_evaluated_at 缺失且已过响应窗口的台账条目，回填转化字段。
 /// 纯读 + 回写自己表，不调 LLM、不发消息（无副作用红线）。返回处理条数。
-pub(crate) async fn scan_send_ledger_outcomes(state: &AppState) -> AppResult<usize> {
+pub async fn scan_send_ledger_outcomes(state: &AppState) -> AppResult<usize> {
     use futures::TryStreamExt;
     use mongodb::options::FindOptions;
 
@@ -210,6 +254,7 @@ pub(crate) async fn scan_send_ledger_outcomes(state: &AppState) -> AppResult<usi
         // responded：查该 contact 在 (sent, sent+窗口] 内的入站消息时间戳。
         let inbound_filter = doc! {
             "workspace_id": &row.workspace_id,
+            "account_id": &row.account_id,
             "contact_wxid": &row.contact_wxid,
             "direction": "inbound",
             "created_at": {
@@ -233,7 +278,11 @@ pub(crate) async fn scan_send_ledger_outcomes(state: &AppState) -> AppResult<usi
             .db
             .contacts()
             .find_one(
-                doc! { "workspace_id": &row.workspace_id, "wxid": &row.contact_wxid },
+                doc! {
+                    "workspace_id": &row.workspace_id,
+                    "account_id": &row.account_id,
+                    "wxid": &row.contact_wxid,
+                },
                 None,
             )
             .await
@@ -287,9 +336,10 @@ async fn load_user_ops_stage_order(state: &AppState, workspace_id: &str) -> Vec<
 }
 
 /// 取该客户近期某类发送记录（按 sent_at 倒序）。best-effort：故障返空。
-pub(crate) async fn recent_sends_for_contact(
+pub async fn recent_sends_for_contact(
     state: &AppState,
     workspace_id: &str,
+    account_id: &str,
     contact_wxid: &str,
     send_kind: &str,
     limit: i64,
@@ -300,8 +350,16 @@ pub(crate) async fn recent_sends_for_contact(
         .db
         .agent_send_ledger()
         .find(
-            doc! { "workspace_id": workspace_id, "contact_wxid": contact_wxid, "send_kind": send_kind },
-            FindOptions::builder().sort(doc! { "sent_at": -1 }).limit(limit).build(),
+            doc! {
+                "workspace_id": workspace_id,
+                "account_id": account_id,
+                "contact_wxid": contact_wxid,
+                "send_kind": send_kind,
+            },
+            FindOptions::builder()
+                .sort(doc! { "sent_at": -1 })
+                .limit(limit)
+                .build(),
         )
         .await;
     match res {
@@ -352,15 +410,24 @@ mod tests {
         let sent = 1_000_000_000_000;
         // 负窗口钳到 0 → 结束时刻 = sent（无窗口）
         assert_eq!(response_window_end_ms(sent, -5), sent);
-    }    #[test]
+    }
+    #[test]
     fn stage_advanced_true_when_moves_forward() {
-        let order = vec!["new_contact".to_string(), "意向".to_string(), "待成交".to_string()];
+        let order = vec![
+            "new_contact".to_string(),
+            "意向".to_string(),
+            "待成交".to_string(),
+        ];
         assert!(stage_advanced(Some("意向"), Some("待成交"), &order));
     }
 
     #[test]
     fn stage_advanced_false_when_same_or_backward() {
-        let order = vec!["new_contact".to_string(), "意向".to_string(), "待成交".to_string()];
+        let order = vec![
+            "new_contact".to_string(),
+            "意向".to_string(),
+            "待成交".to_string(),
+        ];
         assert!(!stage_advanced(Some("意向"), Some("意向"), &order)); // 持平
         assert!(!stage_advanced(Some("待成交"), Some("意向"), &order)); // 回退
     }
@@ -412,7 +479,16 @@ mod tests {
     fn render_recent_media_lists_titles() {
         use mongodb::bson::DateTime;
         let row = build_ledger_entry(
-            "ws", "acct", "wx", "media", "a1", "报价单 2026", "run1", None, DateTime::now(),
+            ObjectId::new(),
+            "ws",
+            "acct",
+            "wx",
+            "media",
+            "a1",
+            "报价单 2026",
+            "run1",
+            None,
+            DateTime::now(),
         );
         let out = render_recent_media_lines(&[row]);
         assert!(out.contains("报价单 2026"));
@@ -424,8 +500,16 @@ mod tests {
     fn build_ledger_entry_sets_kind_and_leaves_outcome_none() {
         use mongodb::bson::DateTime;
         let row = build_ledger_entry(
-            "ws", "acct", "wx", "media", "asset1", "报价单", "run1",
-            Some("意向".to_string()), DateTime::now(),
+            ObjectId::new(),
+            "ws",
+            "acct",
+            "wx",
+            "media",
+            "asset1",
+            "报价单",
+            "run1",
+            Some("意向".to_string()),
+            DateTime::now(),
         );
         assert_eq!(row.send_kind, "media");
         assert_eq!(row.target_id, "asset1");

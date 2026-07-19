@@ -96,7 +96,7 @@ describe("DocumentsView — E6 文档元数据编辑（整替换回填全字段�
   });
 
   it("document edit PUTs full body including rawContent", async () => {
-    const getSpy = vi.spyOn(api, "get").mockResolvedValue(FULL_DETAIL as never);
+    const getSpy = vi.spyOn(api, "get").mockResolvedValue({ item: FULL_DETAIL } as never);
     const putSpy = vi.spyOn(api, "put").mockResolvedValue({} as never);
     const user = userEvent.setup();
     renderView();

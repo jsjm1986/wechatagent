@@ -65,14 +65,9 @@ pub async fn run_one_round(state: &AppState) -> anyhow::Result<()> {
                     etag,
                     content_hash,
                 }) => {
-                    let _ = mark_success_with_checkpoint(
-                        state,
-                        &src,
-                        chunk_count,
-                        etag,
-                        &content_hash,
-                    )
-                    .await;
+                    let _ =
+                        mark_success_with_checkpoint(state, &src, chunk_count, etag, &content_hash)
+                            .await;
                 }
                 Err(err) => {
                     tracing::warn!(
@@ -192,11 +187,7 @@ fn render_rss_to_markdown(body: &[u8]) -> anyhow::Result<String> {
             .as_ref()
             .map(|t| t.content.trim())
             .unwrap_or("(no title)");
-        let link = entry
-            .links
-            .first()
-            .map(|l| l.href.as_str())
-            .unwrap_or("");
+        let link = entry.links.first().map(|l| l.href.as_str()).unwrap_or("");
         let summary = entry
             .summary
             .as_ref()
@@ -231,12 +222,10 @@ fn render_rss_to_markdown(body: &[u8]) -> anyhow::Result<String> {
 }
 
 fn render_html_to_markdown(body: &[u8]) -> anyhow::Result<String> {
-    let html = std::str::from_utf8(body)
-        .map_err(|e| anyhow::anyhow!("html not utf8: {e}"))?;
+    let html = std::str::from_utf8(body).map_err(|e| anyhow::anyhow!("html not utf8: {e}"))?;
     let doc = scraper::Html::parse_document(html);
     let title_sel = scraper::Selector::parse("title").unwrap();
-    let body_sel =
-        scraper::Selector::parse("article, main, [role=main], .content, body").unwrap();
+    let body_sel = scraper::Selector::parse("article, main, [role=main], .content, body").unwrap();
     let title = doc
         .select(&title_sel)
         .next()
@@ -284,10 +273,7 @@ async fn list_workspaces(state: &AppState) -> anyhow::Result<Vec<String>> {
     Ok(workspaces)
 }
 
-async fn list_active_sources(
-    state: &AppState,
-    ws: &str,
-) -> anyhow::Result<Vec<IngestSource>> {
+async fn list_active_sources(state: &AppState, ws: &str) -> anyhow::Result<Vec<IngestSource>> {
     // active + failing 都纳入扫描：failing 源继续重试 → 成功则 mark_success 复位 active，
     // 持续不可达则 mark_failure 推进到 disabled。disabled 才真正停扫（需 admin 手动复活）。
     let mut cursor = state
@@ -306,7 +292,11 @@ async fn list_active_sources(
     Ok(out)
 }
 
-async fn mark_success(state: &AppState, src: &IngestSource, chunk_count: usize) -> anyhow::Result<()> {
+async fn mark_success(
+    state: &AppState,
+    src: &IngestSource,
+    chunk_count: usize,
+) -> anyhow::Result<()> {
     state
         .db
         .ingest_sources()
@@ -361,11 +351,7 @@ async fn mark_success_with_checkpoint(
     Ok(())
 }
 
-async fn mark_failure(
-    state: &AppState,
-    src: &IngestSource,
-    err: &str,
-) -> anyhow::Result<()> {
+async fn mark_failure(state: &AppState, src: &IngestSource, err: &str) -> anyhow::Result<()> {
     let new_streak = src.failure_streak + 1;
     let mut new_status = src.status.clone();
     if new_streak >= FAILURE_STREAK_TO_FAILING && new_status == "active" {
@@ -488,14 +474,29 @@ mod tests {
 </rss>"#;
         let md = render_rss_to_markdown(rss).expect("parse rss");
         // 新 fence 形态：每条目一个 `---CHUNK: rss-<idx>---` + JSON body + `---END CHUNK---`。
-        assert!(md.contains("---CHUNK: rss-0---"), "chunk fence missing: {md}");
-        assert!(md.contains("---END CHUNK---"), "END CHUNK terminator missing: {md}");
+        assert!(
+            md.contains("---CHUNK: rss-0---"),
+            "chunk fence missing: {md}"
+        );
+        assert!(
+            md.contains("---END CHUNK---"),
+            "END CHUNK terminator missing: {md}"
+        );
         assert!(md.contains("First post"));
         assert!(md.contains("Second post"));
         // 红线回归：渲染产物必须能被 block_parser 解析成离散 chunk（旧 `---END---` bug 会退化为 0 块）。
         let (blocks, warnings) = crate::knowledge_wiki::block_parser::parse_chunk_blocks(&md);
-        assert_eq!(blocks.len(), 2, "expected 2 discrete chunks, got {}: {md}", blocks.len());
-        assert!(warnings.items.is_empty(), "unexpected parse warnings: {:?}", warnings.items);
+        assert_eq!(
+            blocks.len(),
+            2,
+            "expected 2 discrete chunks, got {}: {md}",
+            blocks.len()
+        );
+        assert!(
+            warnings.items.is_empty(),
+            "unexpected parse warnings: {:?}",
+            warnings.items
+        );
     }
 
     #[test]
@@ -517,15 +518,30 @@ mod tests {
   </article>
 </body></html>"#;
         let md = render_html_to_markdown(html).expect("parse html");
-        assert!(md.contains("---CHUNK: html-page---"), "chunk fence missing: {md}");
-        assert!(md.contains("---END CHUNK---"), "END CHUNK terminator missing: {md}");
+        assert!(
+            md.contains("---CHUNK: html-page---"),
+            "chunk fence missing: {md}"
+        );
+        assert!(
+            md.contains("---END CHUNK---"),
+            "END CHUNK terminator missing: {md}"
+        );
         assert!(md.contains("Page Title"));
         assert!(md.contains("First paragraph body."));
         assert!(md.contains("Second paragraph body."));
         // 红线回归：单页归一为 1 个离散 chunk 且无 warning。
         let (blocks, warnings) = crate::knowledge_wiki::block_parser::parse_chunk_blocks(&md);
-        assert_eq!(blocks.len(), 1, "expected 1 chunk, got {}: {md}", blocks.len());
-        assert!(warnings.items.is_empty(), "unexpected parse warnings: {:?}", warnings.items);
+        assert_eq!(
+            blocks.len(),
+            1,
+            "expected 1 chunk, got {}: {md}",
+            blocks.len()
+        );
+        assert!(
+            warnings.items.is_empty(),
+            "unexpected parse warnings: {:?}",
+            warnings.items
+        );
     }
 
     #[test]

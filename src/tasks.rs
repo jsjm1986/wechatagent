@@ -2,12 +2,368 @@ use std::time::Duration;
 
 use futures::TryStreamExt;
 use mongodb::{
-    bson::{doc, DateTime, oid::ObjectId},
-    options::FindOptions,
+    bson::{doc, oid::ObjectId, DateTime, Document},
+    options::{FindOneAndUpdateOptions, FindOptions, ReturnDocument},
 };
 use tokio::time::sleep;
 
 use crate::{agent, error::AppResult, models::assert_agent_task_status_valid, routes::AppState};
+
+/// 一次 AgentTask claim 的不可转移所有权凭证。token 每次 claim 都重新生成；
+/// generation 只落库审计，正确性只依赖 `_id + status=running + claim_token` CAS。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskClaim {
+    pub task_id: ObjectId,
+    pub claim_token: String,
+    /// 每次 claim 原子递增。token 负责不可伪造所有权，generation 负责把晚到业务
+    /// 投影做成单调写，避免旧执行者覆盖新执行者已经提交的结果。
+    pub claim_generation: i64,
+}
+
+impl TaskClaim {
+    pub fn owned_running_filter(&self) -> Document {
+        doc! {
+            "_id": self.task_id,
+            "status": "running",
+            "claim_token": &self.claim_token,
+            "claim_generation": self.claim_generation,
+        }
+    }
+
+    pub fn committing_filter(&self) -> Document {
+        doc! {
+            "_id": self.task_id,
+            "status": "committing",
+            "claim_token": &self.claim_token,
+            "claim_generation": self.claim_generation,
+        }
+    }
+}
+
+/// Linearization point for non-send task side effects. Cancellation and this CAS compete on the
+/// same task document. Once `committing` wins, the prepared payload is durable and can be replayed
+/// idempotently after a crash; cancellation deliberately no longer accepts this state.
+pub async fn prepare_task_commit_if_owned(
+    state: &AppState,
+    claim: &TaskClaim,
+    commit_kind: &str,
+    payload: Document,
+) -> AppResult<bool> {
+    assert_agent_task_status_valid("committing");
+    let result = state
+        .db
+        .tasks()
+        .update_one(
+            claim.owned_running_filter(),
+            doc! {
+                "$set": {
+                    "status": "committing",
+                    "gateway_status": format!("{commit_kind}_committing"),
+                    "prepared_commit_kind": commit_kind,
+                    "prepared_commit": payload,
+                    "updated_at": DateTime::now(),
+                },
+                "$unset": { "claimed_at": "" },
+            },
+            None,
+        )
+        .await?;
+    Ok(result.matched_count == 1)
+}
+
+pub async fn finalize_task_commit_if_owned(
+    state: &AppState,
+    claim: &TaskClaim,
+    gateway_status: &str,
+) -> AppResult<bool> {
+    assert_agent_task_status_valid("sent");
+    let result = state
+        .db
+        .tasks()
+        .update_one(
+            claim.committing_filter(),
+            doc! {
+                "$set": {
+                    "status": "sent",
+                    "gateway_status": gateway_status,
+                    "updated_at": DateTime::now(),
+                },
+                "$unset": {
+                    "claim_token": "",
+                    "prepared_commit_kind": "",
+                    "prepared_commit": "",
+                },
+            },
+            None,
+        )
+        .await?;
+    Ok(result.matched_count == 1)
+}
+
+/// A prepared commit may discover that its optimistic business precondition was superseded
+/// before any target-side write occurred. Return that exact commit to `retry` so a later claim can
+/// recompute from fresh state; the committing token is still required for the transition.
+pub async fn requeue_task_commit_if_owned(
+    state: &AppState,
+    claim: &TaskClaim,
+    gateway_status: &str,
+) -> AppResult<bool> {
+    assert_agent_task_status_valid("retry");
+    let result = state
+        .db
+        .tasks()
+        .update_one(
+            claim.committing_filter(),
+            doc! {
+                "$set": {
+                    "status": "retry",
+                    "gateway_status": gateway_status,
+                    "next_retry_at": DateTime::now(),
+                    "updated_at": DateTime::now(),
+                },
+                "$unset": {
+                    "claim_token": "",
+                    "prepared_commit_kind": "",
+                    "prepared_commit": "",
+                },
+            },
+            None,
+        )
+        .await?;
+    Ok(result.matched_count == 1)
+}
+
+fn task_outbox_marker_prepare_filter(decision_id: ObjectId, claim_token: &str) -> Document {
+    doc! {
+        "decision_id": decision_id,
+        "$or": [
+            { "task_send_authorization_token": { "$exists": false } },
+            { "task_send_authorization_token": null },
+            { "task_send_authorization_token": claim_token },
+        ],
+    }
+}
+
+fn task_outbox_commit_filter(claim: &TaskClaim, decision_id: ObjectId) -> Document {
+    let mut filter = claim.owned_running_filter();
+    filter.insert("outbox_decision_id", decision_id);
+    filter
+}
+
+fn task_claim_send_terminal_filter(claim: &TaskClaim) -> Document {
+    doc! {
+        "_id": claim.task_id,
+        "status": { "$in": ["outbox_enqueued", "sent"] },
+        "claim_token": &claim.claim_token,
+        "claim_generation": claim.claim_generation,
+    }
+}
+
+/// 任务处理器的执行上下文。生产 worker/Admin 路径携带不可复用 claim；
+/// 旧的直接调用入口只携带 task_id，以保持测试和人工工具兼容。
+#[derive(Debug, Clone)]
+pub struct TaskRunContext {
+    pub task_id: ObjectId,
+    pub claim: Option<TaskClaim>,
+}
+
+impl TaskRunContext {
+    pub fn new(task_id: ObjectId, claim: Option<&TaskClaim>) -> Self {
+        Self {
+            task_id,
+            claim: claim.cloned(),
+        }
+    }
+
+    pub fn write_filter(&self) -> Document {
+        self.claim
+            .as_ref()
+            .map(TaskClaim::owned_running_filter)
+            .unwrap_or_else(|| doc! { "_id": self.task_id })
+    }
+}
+
+async fn claim_task_with_filter(
+    state: &AppState,
+    mut filter: Document,
+) -> AppResult<Option<(crate::models::AgentTask, TaskClaim)>> {
+    let claim_token = uuid::Uuid::new_v4().to_string();
+    if !filter.contains_key("status") {
+        filter.insert("status", doc! { "$in": ["pending", "retry", "failed"] });
+    }
+    let now = DateTime::now();
+    let claimed = state
+        .db
+        .tasks()
+        .clone_with_type::<Document>()
+        .find_one_and_update(
+            filter,
+            doc! {
+                "$set": {
+                    "status": "running",
+                    "updated_at": now,
+                    "claimed_at": now,
+                    "claim_token": &claim_token,
+                },
+                "$inc": {
+                    "attempt_count": 1,
+                    "claim_generation": 1i64,
+                },
+                "$unset": {
+                    "outbox_decision_id": "",
+                    "next_retry_at": "",
+                    "rerun_requested": "",
+                },
+            },
+            FindOneAndUpdateOptions::builder()
+                .return_document(ReturnDocument::After)
+                .build(),
+        )
+        .await?;
+    let Some(raw) = claimed else {
+        return Ok(None);
+    };
+    let task_id = raw.get_object_id("_id").map_err(|error| {
+        crate::error::AppError::External(format!("claimed task _id invalid: {error}"))
+    })?;
+    let claim_generation = raw
+        .get_i64("claim_generation")
+        .or_else(|_| raw.get_i32("claim_generation").map(i64::from))
+        .unwrap_or(1);
+    let task = mongodb::bson::from_document(raw).map_err(|error| {
+        crate::error::AppError::External(format!("claimed task decode failed: {error}"))
+    })?;
+    Ok(Some((
+        task,
+        TaskClaim {
+            task_id,
+            claim_token,
+            claim_generation,
+        },
+    )))
+}
+
+/// Admin“立即复核”和集成红线共用的原子 claim。生产 worker 也使用同一底层协议。
+pub async fn claim_task_by_id(
+    state: &AppState,
+    task_id: ObjectId,
+    workspace_id: Option<&str>,
+) -> AppResult<Option<(crate::models::AgentTask, TaskClaim)>> {
+    let mut filter = doc! { "_id": task_id };
+    if let Some(workspace_id) = workspace_id {
+        filter.insert("workspace_id", workspace_id);
+    }
+    claim_task_with_filter(state, filter).await
+}
+
+pub async fn task_claim_is_current(state: &AppState, claim: &TaskClaim) -> AppResult<bool> {
+    Ok(state
+        .db
+        .tasks()
+        .count_documents(claim.owned_running_filter(), None)
+        .await?
+        == 1)
+}
+
+/// 在创建任何 Outbox 前，把本次 decision 绑定到仍归当前 token 所有的 task。
+pub async fn bind_task_decision_if_owned(
+    state: &AppState,
+    claim: &TaskClaim,
+    decision_id: ObjectId,
+) -> AppResult<bool> {
+    let result = state
+        .db
+        .tasks()
+        .update_one(
+            claim.owned_running_filter(),
+            doc! { "$set": {
+                "outbox_decision_id": decision_id,
+                "updated_at": DateTime::now(),
+            } },
+            None,
+        )
+        .await?;
+    if result.matched_count == 0 {
+        return Ok(false);
+    }
+    state
+        .db
+        .decision_reviews()
+        .update_one(
+            doc! { "_id": decision_id },
+            doc! { "$set": {
+                "source_task_id": claim.task_id,
+                "source_task_claim_token": &claim.claim_token,
+            } },
+            None,
+        )
+        .await?;
+    Ok(true)
+}
+
+/// Outbox 全部写入后，以同一 token 提交客户发送意图。Dispatcher 只放行该终态。
+pub async fn authorize_task_outbox_if_owned(
+    state: &AppState,
+    claim: &TaskClaim,
+    decision_id: ObjectId,
+) -> AppResult<bool> {
+    assert_agent_task_status_valid("outbox_enqueued");
+
+    // Prepare the single-document send markers before committing the Task. A prepared marker is
+    // not authorization by itself: Dispatcher also requires this exact task/token/decision to be
+    // in outbox_enqueued|sent. Therefore a crash here can only defer, and a later reclaim makes
+    // the old marker stale. Doing the Task CAS first would leave a committed task with no marker
+    // if this projection failed, permanently stranding paths that have no ordinary run log.
+    let outbox = state.db.collection_agent_send_outbox();
+    let total = outbox
+        .count_documents(doc! { "decision_id": decision_id }, None)
+        .await?;
+    if total == 0 {
+        tracing::warn!(%decision_id, task_id = %claim.task_id, "refusing task authorization without outbox rows");
+        return Ok(false);
+    }
+    let prepared = outbox
+        .update_many(
+            task_outbox_marker_prepare_filter(decision_id, &claim.claim_token),
+            doc! { "$set": {
+                "task_send_authorization_token": &claim.claim_token,
+                "updated_at": DateTime::now(),
+            } },
+            None,
+        )
+        .await?;
+    if prepared.matched_count != total {
+        tracing::error!(
+            %decision_id,
+            task_id = %claim.task_id,
+            expected = total,
+            matched = prepared.matched_count,
+            "outbox authorization marker conflicts with another task claim"
+        );
+        return Ok(false);
+    }
+
+    let result = state
+        .db
+        .tasks()
+        .update_one(
+            task_outbox_commit_filter(claim, decision_id),
+            doc! {
+                "$set": {
+                    "status": "outbox_enqueued",
+                    "gateway_status": "outbox_enqueued",
+                    "updated_at": DateTime::now(),
+                },
+                "$unset": { "claimed_at": "" },
+            },
+            None,
+        )
+        .await?;
+    if result.matched_count == 0 {
+        return Ok(false);
+    }
+    Ok(true)
+}
 
 pub async fn run_task_worker(state: AppState) {
     loop {
@@ -19,6 +375,32 @@ pub async fn run_task_worker(state: AppState) {
         ))
         .await;
     }
+}
+
+/// 执行一条已经由调用方以 [`TaskClaim`] 原子认领的任务，并在执行期间续约 lease。
+/// worker 与 Admin“立即复核”共用此入口，避免后者绕过 token/heartbeat 协议。
+pub async fn execute_claimed_task(
+    state: &AppState,
+    task: crate::models::AgentTask,
+    claim: &TaskClaim,
+) -> AppResult<()> {
+    let heartbeat = spawn_claim_heartbeat(
+        state.clone(),
+        claim.clone(),
+        state.config.task_claim_timeout_seconds,
+    );
+    let result = if task.kind == "memory_consolidation" {
+        agent::handle_memory_consolidation_task_with_claim(state, task, Some(claim)).await
+    } else if task.kind == "outcome_aggregation" {
+        handle_outcome_aggregation_task(state, task, Some(claim)).await
+    } else if task.kind == "initial_profile" {
+        crate::routes::contacts::handle_initial_profile_task_with_claim(state, &task, Some(claim))
+            .await
+    } else {
+        agent::handle_follow_up_task_with_claim(state, task, Some(claim)).await
+    };
+    heartbeat.abort();
+    result
 }
 
 /// HP-1 / Task 9：在每次 tick 开头扫描 `status="running"` 但 `claimed_at`
@@ -52,11 +434,54 @@ async fn reclaim_stale_running_tasks(state: &AppState) -> anyhow::Result<usize> 
         ]
     };
 
-    let mut cursor = state.db.tasks().find(filter, None).await?;
+    // 读原始 BSON，保留不进入 AgentTask 业务 DTO 的 claim_token。若先反序列化成
+    // AgentTask 再二次读取 token，旧 lease 在两次读取之间可能已被新 owner 接管，
+    // 回收器会拿新 token 去误回收新 claim。
+    let mut cursor = state
+        .db
+        .tasks()
+        .clone_with_type::<Document>()
+        .find(filter, None)
+        .await?;
     let mut recovered = 0usize;
-    while let Some(task) = cursor.try_next().await? {
+    while let Some(raw_task) = cursor.try_next().await? {
+        let claim_token = raw_task.get_str("claim_token").ok().map(str::to_string);
+        let claim_generation = raw_task
+            .get_i64("claim_generation")
+            .or_else(|_| raw_task.get_i32("claim_generation").map(i64::from))
+            .ok();
+        let task: crate::models::AgentTask = mongodb::bson::from_document(raw_task)?;
         let Some(task_id) = task.id else { continue };
-        let claimed_at_ms = task.claimed_at.map(|d| d.timestamp_millis()).unwrap_or(0);
+        let mut owned_filter = doc! { "_id": task_id, "status": "running" };
+        match claim_token.as_deref() {
+            Some(token) => {
+                owned_filter.insert("claim_token", token);
+            }
+            None => {
+                // 兼容部署前遗留的 running 文档；只匹配仍无 token 的同一旧 owner。
+                owned_filter.insert("claim_token", doc! { "$exists": false });
+            }
+        }
+        let claimed_at = task.claimed_at;
+        match claimed_at {
+            Some(snapshot) => {
+                // 必须匹配扫描时看到的 lease 时间。若 owner 在 find→update 窗口内成功
+                // heartbeat，claimed_at 已变化，旧 scanner 的 CAS 必须失败。
+                owned_filter.insert("claimed_at", snapshot);
+            }
+            None => {
+                owned_filter.insert("claimed_at", doc! { "$exists": false });
+            }
+        }
+        if let Some(generation) = claim_generation {
+            owned_filter.insert("claim_generation", generation);
+        } else if claim_token.is_some() {
+            // 新协议的 token 必须与 generation 成对存在；畸形行宁可不回收，也不能用
+            // 猜测 generation 的 filter 误伤后来 owner。部署前无 token 的旧行仍走兼容分支。
+            tracing::error!(%task_id, "running task has claim_token but no claim_generation; refusing stale reclaim");
+            continue;
+        }
+        let claimed_at_ms = claimed_at.map(|d| d.timestamp_millis()).unwrap_or(0);
         let stuck_seconds = if claimed_at_ms > 0 {
             ((now_ms - claimed_at_ms) / 1000).max(0)
         } else {
@@ -66,11 +491,20 @@ async fn reclaim_stale_running_tasks(state: &AppState) -> anyhow::Result<usize> 
         // 累计回收次数 ≥ 3 → 直接 failed，防止死循环。
         if recovery_count >= 3 {
             assert_agent_task_status_valid("failed");
+            let mut terminal_unset = doc! {
+                "claimed_at": "",
+                "claim_token": "",
+                "outbox_decision_id": "",
+            };
+            if task.kind != "memory_consolidation" {
+                terminal_unset.insert("active_task_key", "");
+                terminal_unset.insert("rerun_requested", "");
+            }
             let res = state
                 .db
                 .tasks()
                 .update_one(
-                    doc! { "_id": task_id, "status": "running" },
+                    owned_filter.clone(),
                     doc! {
                         "$set": {
                             "status": "failed",
@@ -78,7 +512,8 @@ async fn reclaim_stale_running_tasks(state: &AppState) -> anyhow::Result<usize> 
                             "error": "task stuck in running state and exceeded recovery attempts",
                             "updated_at": DateTime::now()
                         },
-                        "$inc": { "claim_recovery_count": 1 }
+                        "$inc": { "claim_recovery_count": 1 },
+                        "$unset": terminal_unset
                     },
                     None,
                 )
@@ -119,7 +554,7 @@ async fn reclaim_stale_running_tasks(state: &AppState) -> anyhow::Result<usize> 
             .db
             .tasks()
             .update_one(
-                doc! { "_id": task_id, "status": "running" },
+                owned_filter,
                 doc! {
                     "$set": {
                         "status": "retry",
@@ -127,7 +562,12 @@ async fn reclaim_stale_running_tasks(state: &AppState) -> anyhow::Result<usize> 
                         "next_retry_at": DateTime::now(),
                         "updated_at": DateTime::now()
                     },
-                    "$inc": { "claim_recovery_count": 1 }
+                    "$inc": { "claim_recovery_count": 1 },
+                    "$unset": {
+                        "claimed_at": "",
+                        "claim_token": "",
+                        "outbox_decision_id": "",
+                    }
                 },
                 None,
             )
@@ -158,9 +598,80 @@ async fn reclaim_stale_running_tasks(state: &AppState) -> anyhow::Result<usize> 
     Ok(recovered)
 }
 
+async fn reconcile_committing_tasks(state: &AppState) -> anyhow::Result<()> {
+    let mut cursor = state
+        .db
+        .tasks()
+        .clone_with_type::<Document>()
+        .find(
+            doc! { "status": "committing" },
+            FindOptions::builder().limit(20).build(),
+        )
+        .await?;
+    while let Some(task) = cursor.try_next().await? {
+        let Some(task_id) = task.get_object_id("_id").ok() else {
+            continue;
+        };
+        let kind = task.get_str("prepared_commit_kind").unwrap_or_default();
+        let result = match kind {
+            "initial_profile" => {
+                crate::routes::contacts::reconcile_initial_profile_commit(state, task_id).await
+            }
+            "outcome_aggregation" => reconcile_outcome_aggregation_commit(state, task_id).await,
+            "memory_consolidation" => {
+                crate::agent::reconcile_memory_consolidation_commit(state, task_id).await
+            }
+            _ => {
+                tracing::error!(%task_id, kind, "unknown prepared task commit kind");
+                continue;
+            }
+        };
+        if let Err(error) = result {
+            tracing::warn!(%task_id, kind, %error, "task commit reconciliation failed");
+        }
+    }
+    Ok(())
+}
+
+async fn revive_failed_memory_tasks_with_rerun(state: &AppState) -> anyhow::Result<u64> {
+    assert_agent_task_status_valid("retry");
+    let result = state
+        .db
+        .tasks()
+        .update_many(
+            doc! {
+                "kind": "memory_consolidation",
+                "status": "failed",
+                "active_task_key": "memory_consolidation",
+                "rerun_requested": true,
+            },
+            doc! {
+                "$set": {
+                    "status": "retry",
+                    "gateway_status": "memory_candidates_arrived",
+                    "next_retry_at": DateTime::now(),
+                    "attempt_count": 0,
+                    "claim_recovery_count": 0,
+                    "updated_at": DateTime::now(),
+                },
+                "$unset": {
+                    "error": "",
+                    "rerun_requested": "",
+                },
+            },
+            None,
+        )
+        .await?;
+    Ok(result.modified_count)
+}
+
 async fn tick(state: &AppState) -> anyhow::Result<()> {
+    reconcile_committing_tasks(state).await?;
     // HP-1：先回收 stale running，再 claim 新任务。
     let _ = reclaim_stale_running_tasks(state).await?;
+    // A candidate may arrive while its single-flight memory task is crossing running -> failed.
+    // The scheduler leaves rerun_requested on that row; revive it before scanning runnable work.
+    let _ = revive_failed_memory_tasks_with_rerun(state).await?;
     // S-19 / Task 17：保证当日 outcome 聚合任务存在。
     let _ = ensure_today_outcome_aggregation_tasks(state).await;
     // Ask-Human Phase 1 / Task 10：超时未答的请示改派链上下一位真人并重推卡。
@@ -189,30 +700,16 @@ async fn tick(state: &AppState) -> anyhow::Result<()> {
         let Some(task_id) = task.id else {
             continue;
         };
-        let claim_now = DateTime::now();
         assert_agent_task_status_valid("running");
-        let claim = state
-            .db
-            .tasks()
-            .update_one(
-                doc! { "_id": task_id, "status": &task.status },
-                doc! {
-                    "$set": {
-                        "status": "running",
-                        "updated_at": claim_now,
-                        "claimed_at": claim_now
-                    },
-                    "$inc": { "attempt_count": 1 }
-                },
-                None,
-            )
-            .await?;
-        if claim.modified_count == 0 {
+        let Some((task, claim)) =
+            claim_task_with_filter(state, doc! { "_id": task_id, "status": &task.status }).await?
+        else {
             continue;
-        }
+        };
         let task_account_id = task.account_id.clone();
         let task_contact_wxid = task.contact_wxid.clone();
-        let attempt_count = task.attempt_count.saturating_add(1);
+        let task_kind = task.kind.clone();
+        let attempt_count = task.attempt_count;
         let max_attempts = if task.max_attempts <= 0 {
             3
         } else {
@@ -222,44 +719,41 @@ async fn tick(state: &AppState) -> anyhow::Result<()> {
         // 可能跑过 task_claim_timeout_seconds，被 reclaim_stale_running_tasks 误判
         // 抢回 retry，导致同一任务并发跑两份。每 timeout/2 秒 bump 一次 claimed_at
         // 让仍在进行中的 claimer 续约，关停信号靠 work future 完成时 drop 句柄触发。
-        let heartbeat = spawn_claim_heartbeat(
-            state.clone(),
-            task_id,
-            state.config.task_claim_timeout_seconds,
-        );
-        let result = if task.kind == "memory_consolidation" {
-            agent::handle_memory_consolidation_task(state, task).await
-        } else if task.kind == "outcome_aggregation" {
-            handle_outcome_aggregation_task(state, task).await
-        } else if task.kind == "initial_profile" {
-            crate::routes::contacts::handle_initial_profile_task(state, &task).await
-        } else {
-            agent::handle_follow_up_task(state, task).await
-        };
-        heartbeat.abort();
+        let result = execute_claimed_task(state, task, &claim).await;
 
         match result {
             Ok(()) => {
-                agent::write_event_for_account(
-                    state,
-                    &task_account_id,
-                    Some(&task_contact_wxid),
-                    "follow_up_processed",
-                    "success",
-                    "跟进任务已通过发送网关处理",
-                    None,
-                )
-                .await?;
+                // Some handlers deliberately return Ok after losing ownership or after choosing a
+                // non-send terminal state. Emit the send-success audit only when this exact claim
+                // reached the durable outbox authorization terminal.
+                let send_authorized = state
+                    .db
+                    .tasks()
+                    .count_documents(task_claim_send_terminal_filter(&claim), None)
+                    .await?
+                    == 1;
+                if send_authorized {
+                    agent::write_event_for_account(
+                        state,
+                        &task_account_id,
+                        Some(&task_contact_wxid),
+                        "follow_up_processed",
+                        "success",
+                        "跟进任务已通过发送网关处理",
+                        None,
+                    )
+                    .await?;
+                }
             }
             Err(error) => {
                 if attempt_count < max_attempts {
                     let delay_seconds = retry_delay_seconds(attempt_count);
                     assert_agent_task_status_valid("retry");
-                    state
+                    let updated = state
                         .db
                         .tasks()
                         .update_one(
-                            doc! { "_id": task_id },
+                            claim.owned_running_filter(),
                             doc! {
                                 "$set": {
                                     "status": "retry",
@@ -269,52 +763,72 @@ async fn tick(state: &AppState) -> anyhow::Result<()> {
                                         DateTime::now().timestamp_millis() + delay_seconds * 1000
                                     ),
                                     "updated_at": DateTime::now()
+                                },
+                                "$unset": {
+                                    "claimed_at": "",
+                                    "claim_token": "",
+                                    "outbox_decision_id": "",
                                 }
                             },
                             None,
                         )
                         .await?;
-                    agent::write_event_for_account(
-                        state,
-                        &task_account_id,
-                        Some(&task_contact_wxid),
-                        "follow_up_retry_scheduled",
-                        "retry",
-                        &format!(
-                            "跟进任务失败，已安排第 {attempt_count}/{max_attempts} 次重试：{error}"
-                        ),
-                        None,
-                    )
-                    .await?;
+                    // 失权 worker 的 CAS 为 0：不得伪造“已安排重试”事件。
+                    if updated.matched_count == 1 {
+                        agent::write_event_for_account(
+                            state,
+                            &task_account_id,
+                            Some(&task_contact_wxid),
+                            "follow_up_retry_scheduled",
+                            "retry",
+                            &format!(
+                                "跟进任务失败，已安排第 {attempt_count}/{max_attempts} 次重试：{error}"
+                            ),
+                            None,
+                        )
+                        .await?;
+                    }
                     continue;
                 }
                 assert_agent_task_status_valid("failed");
-                state
+                let mut terminal_unset = doc! {
+                    "claimed_at": "",
+                    "claim_token": "",
+                    "outbox_decision_id": "",
+                };
+                if task_kind != "memory_consolidation" {
+                    terminal_unset.insert("active_task_key", "");
+                    terminal_unset.insert("rerun_requested", "");
+                }
+                let updated = state
                     .db
                     .tasks()
                     .update_one(
-                        doc! { "_id": task_id },
+                        claim.owned_running_filter(),
                         doc! {
                             "$set": {
                                 "status": "failed",
                                 "gateway_status": "failed",
                                 "error": error.to_string(),
                                 "updated_at": DateTime::now()
-                            }
+                            },
+                            "$unset": terminal_unset
                         },
                         None,
                     )
                     .await?;
-                agent::write_event_for_account(
-                    state,
-                    &task_account_id,
-                    Some(&task_contact_wxid),
-                    "follow_up_failed",
-                    "failed",
-                    &error.to_string(),
-                    None,
-                )
-                .await?;
+                if updated.matched_count == 1 {
+                    agent::write_event_for_account(
+                        state,
+                        &task_account_id,
+                        Some(&task_contact_wxid),
+                        "follow_up_failed",
+                        "failed",
+                        &error.to_string(),
+                        None,
+                    )
+                    .await?;
+                }
             }
         }
     }
@@ -356,7 +870,7 @@ pub(crate) fn claim_heartbeat_interval_seconds(task_claim_timeout_seconds: u64) 
 /// 应该让其消失，让 reclaim_stale_running_tasks 兜底。
 fn spawn_claim_heartbeat(
     state: AppState,
-    task_id: ObjectId,
+    claim: TaskClaim,
     task_claim_timeout_seconds: u64,
 ) -> tokio::task::JoinHandle<()> {
     let interval = claim_heartbeat_interval_seconds(task_claim_timeout_seconds);
@@ -371,7 +885,7 @@ fn spawn_claim_heartbeat(
                 .db
                 .tasks()
                 .update_one(
-                    doc! { "_id": task_id, "status": "running" },
+                    claim.owned_running_filter(),
                     doc! { "$set": { "claimed_at": DateTime::now() } },
                     None,
                 )
@@ -384,7 +898,7 @@ fn spawn_claim_heartbeat(
                 Ok(_) => {}
                 Err(error) => {
                     tracing::warn!(
-                        task_id = %task_id.to_hex(),
+                        task_id = %claim.task_id.to_hex(),
                         error = %error,
                         "claim_heartbeat update failed; will retry next tick"
                     );
@@ -399,7 +913,7 @@ fn spawn_claim_heartbeat(
 ///
 /// P1-1：原 `find_one + insert_one` 是 TOCTOU；多副本/重叠 tick 都会通过
 /// 检查并双写。改为直接 `insert_one`，依赖 db/indexes.rs:90 的
-/// `uniq_outcome_aggregation_kind_account_content` partial unique index
+/// `uniq_outcome_aggregation_ws_kind_account_content` partial unique index
 /// 在 MongoDB 侧原子去重，11000 dup-key 视作"已经有人插过了"忽略即可。
 async fn ensure_today_outcome_aggregation_tasks(state: &AppState) -> anyhow::Result<()> {
     use mongodb::bson::DateTime as BsonDt;
@@ -485,6 +999,7 @@ fn today_date_string() -> String {
 async fn handle_outcome_aggregation_task(
     state: &AppState,
     task: crate::models::AgentTask,
+    task_claim: Option<&TaskClaim>,
 ) -> AppResult<()> {
     let Some(task_id) = task.id else {
         return Ok(());
@@ -693,31 +1208,153 @@ async fn handle_outcome_aggregation_task(
         agent_block_rate,
         daily_run_count,
         daily_run_token_total,
+        source_task_id: task_claim.map(|claim| claim.task_id),
+        source_task_claim_generation: task_claim.map(|claim| claim.claim_generation).unwrap_or(0),
         created_at: mongodb::bson::DateTime::now(),
     };
     let metric_doc = mongodb::bson::to_document(&metric)?;
-    state
+    if let Some(claim) = task_claim {
+        if !prepare_task_commit_if_owned(
+            state,
+            claim,
+            "outcome_aggregation",
+            doc! { "metric": metric_doc },
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        return reconcile_outcome_aggregation_commit(state, claim.task_id).await;
+    }
+
+    let metric_filter = outcome_metric_write_filter(&metric.id, task_claim);
+    if let Err(error) = state
         .db
         .outcome_metrics()
         .update_one(
-            doc! { "_id": &metric.id },
+            metric_filter,
             doc! { "$set": metric_doc },
             mongodb::options::UpdateOptions::builder()
                 .upsert(true)
                 .build(),
         )
-        .await?;
+        .await
+    {
+        // 若更高 generation 已写同一 _id，带条件的 upsert 会撞 duplicate key；这是
+        // 旧 owner 被 fencing 的正常结果，不得让它回写 task retry/failed。
+        if task_claim.is_some() && is_duplicate_key_error(&error) {
+            return Ok(());
+        }
+        return Err(error.into());
+    }
     assert_agent_task_status_valid("sent");
+    let task_filter = task_claim
+        .map(TaskClaim::owned_running_filter)
+        .unwrap_or_else(|| doc! { "_id": task_id });
     state
         .db
         .tasks()
         .update_one(
-            doc! { "_id": task_id },
-            doc! { "$set": { "status": "sent", "gateway_status": "aggregated", "updated_at": mongodb::bson::DateTime::now() } },
+            task_filter,
+            doc! {
+                "$set": {
+                    "status": "sent",
+                    "gateway_status": "aggregated",
+                    "updated_at": mongodb::bson::DateTime::now()
+                },
+                "$unset": { "claimed_at": "", "claim_token": "" }
+            },
             None,
         )
         .await?;
     Ok(())
+}
+
+async fn reconcile_outcome_aggregation_commit(
+    state: &AppState,
+    task_id: ObjectId,
+) -> AppResult<()> {
+    let Some(raw) = state
+        .db
+        .tasks()
+        .clone_with_type::<Document>()
+        .find_one(
+            doc! {
+                "_id": task_id,
+                "status": "committing",
+                "prepared_commit_kind": "outcome_aggregation",
+            },
+            None,
+        )
+        .await?
+    else {
+        return Ok(());
+    };
+    let claim_token = raw
+        .get_str("claim_token")
+        .map(str::to_string)
+        .map_err(|error| {
+            crate::error::AppError::External(format!("outcome commit token missing: {error}"))
+        })?;
+    let claim_generation = raw
+        .get_i64("claim_generation")
+        .or_else(|_| raw.get_i32("claim_generation").map(i64::from))
+        .map_err(|error| {
+            crate::error::AppError::External(format!("outcome commit generation missing: {error}"))
+        })?;
+    let claim = TaskClaim {
+        task_id,
+        claim_token,
+        claim_generation,
+    };
+    let metric = raw
+        .get_document("prepared_commit")
+        .and_then(|prepared| prepared.get_document("metric"))
+        .map_err(|error| {
+            crate::error::AppError::External(format!("outcome prepared metric missing: {error}"))
+        })?
+        .clone();
+    let metric_id = metric.get_str("_id").map_err(|error| {
+        crate::error::AppError::External(format!("outcome metric id missing: {error}"))
+    })?;
+    let result = state
+        .db
+        .outcome_metrics()
+        .update_one(
+            outcome_metric_write_filter(metric_id, Some(&claim)),
+            doc! { "$set": metric },
+            mongodb::options::UpdateOptions::builder()
+                .upsert(true)
+                .build(),
+        )
+        .await;
+    match result {
+        Ok(_) => {}
+        Err(error) if is_duplicate_key_error(&error) => {
+            // A higher generation from this task already owns the projection. The prepared
+            // commit is stale but complete from the task protocol's point of view.
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let _ = finalize_task_commit_if_owned(state, &claim, "aggregated").await?;
+    Ok(())
+}
+
+fn outcome_metric_write_filter(metric_id: &str, claim: Option<&TaskClaim>) -> Document {
+    let mut filter = doc! { "_id": metric_id };
+    if let Some(claim) = claim {
+        filter.insert(
+            "$or",
+            vec![
+                doc! { "source_task_id": { "$exists": false } },
+                doc! {
+                    "source_task_id": claim.task_id,
+                    "source_task_claim_generation": { "$lte": claim.claim_generation }
+                },
+            ],
+        );
+    }
+    filter
 }
 
 #[cfg(test)]
@@ -730,7 +1367,91 @@ mod tests {
     //! 防止后续重构误删字段而不被发现。
 
     use crate::models::AgentTask;
-    use mongodb::bson::DateTime;
+    use mongodb::bson::{doc, oid::ObjectId, DateTime};
+
+    use super::{
+        outcome_metric_write_filter, task_claim_send_terminal_filter, task_outbox_commit_filter,
+        task_outbox_marker_prepare_filter, TaskClaim,
+    };
+
+    #[test]
+    fn task_outbox_commit_filter_fences_owner_and_decision() {
+        let task_id = ObjectId::parse_str("64b64c000000000000000034").unwrap();
+        let decision_id = ObjectId::parse_str("64b64c000000000000000035").unwrap();
+        let claim = TaskClaim {
+            task_id,
+            claim_token: "claim-token".to_string(),
+            claim_generation: 7,
+        };
+        assert_eq!(
+            task_outbox_commit_filter(&claim, decision_id),
+            doc! {
+                "_id": task_id,
+                "status": "running",
+                "claim_token": "claim-token",
+                "claim_generation": 7i64,
+                "outbox_decision_id": decision_id,
+            }
+        );
+    }
+
+    #[test]
+    fn task_outbox_marker_prepare_filter_never_overwrites_another_owner() {
+        let decision_id = ObjectId::parse_str("64b64c000000000000000035").unwrap();
+        assert_eq!(
+            task_outbox_marker_prepare_filter(decision_id, "claim-token"),
+            doc! {
+                "decision_id": decision_id,
+                "$or": [
+                    { "task_send_authorization_token": { "$exists": false } },
+                    { "task_send_authorization_token": null },
+                    { "task_send_authorization_token": "claim-token" },
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn send_terminal_filter_requires_the_exact_claim() {
+        let task_id = ObjectId::parse_str("64b64c000000000000000034").unwrap();
+        let claim = TaskClaim {
+            task_id,
+            claim_token: "claim-token".to_string(),
+            claim_generation: 7,
+        };
+        assert_eq!(
+            task_claim_send_terminal_filter(&claim),
+            doc! {
+                "_id": task_id,
+                "status": { "$in": ["outbox_enqueued", "sent"] },
+                "claim_token": "claim-token",
+                "claim_generation": 7i64,
+            }
+        );
+    }
+
+    #[test]
+    fn outcome_projection_never_allows_a_different_task_owner() {
+        let task_id = ObjectId::parse_str("64b64c000000000000000034").unwrap();
+        let claim = TaskClaim {
+            task_id,
+            claim_token: "claim-token".to_string(),
+            claim_generation: 7,
+        };
+        assert_eq!(
+            outcome_metric_write_filter("metric-1", Some(&claim)),
+            doc! {
+                "_id": "metric-1",
+                "$or": [
+                    { "source_task_id": { "$exists": false } },
+                    {
+                        "source_task_id": task_id,
+                        "source_task_claim_generation": { "$lte": 7i64 }
+                    },
+                ],
+            }
+        );
+    }
 
     /// HP-1 / Task 7 schema 回归：
     /// `AgentTask` 必须支持 `claimed_at: Option<DateTime>` 与
@@ -814,10 +1535,7 @@ mod tests {
             let j = fastrand::f64();
             let v = retry_delay_seconds_seeded(3, j);
             // attempt=3 base=240，区间 [192, 288]。
-            assert!(
-                v >= 192 && v <= 288,
-                "v={v} jitter01={j} out of [192, 288]"
-            );
+            assert!(v >= 192 && v <= 288, "v={v} jitter01={j} out of [192, 288]");
         }
     }
 

@@ -127,8 +127,15 @@ pub(super) async fn execute_plan_tool_calls(
             .inserted_id
             .as_object_id()
             .ok_or_else(|| AppError::External("tool call id missing".to_string()))?;
-        let result =
-            execute_management_tool(state, workspace_id, account_id, planned, dry_run, advertised).await;
+        let result = execute_management_tool(
+            state,
+            workspace_id,
+            account_id,
+            planned,
+            dry_run,
+            advertised,
+        )
+        .await;
         let is_dry_run = should_dry_run_tool(&planned.tool_name, dry_run);
         match result {
             Ok(response) => {
@@ -336,7 +343,11 @@ pub(super) async fn post_management_message(
         .inserted_id
         .as_object_id()
         .ok_or_else(|| AppError::External("command run id missing".to_string()))?;
-    let tool_names: Vec<&str> = plan.tool_calls.iter().map(|c| c.tool_name.as_str()).collect();
+    let tool_names: Vec<&str> = plan
+        .tool_calls
+        .iter()
+        .map(|c| c.tool_name.as_str())
+        .collect();
     let requires_confirmation = plan.requires_confirmation
         || plan.risk_level.eq_ignore_ascii_case("dangerous")
         // §1.2 第一期 dangerous 开关仍关（传 false，不放大权限），但 §4.3 verify/§4.2 irreversible
@@ -663,7 +674,7 @@ pub(super) fn merge_product_tools(mut tools: Value) -> Value {
         }),
         json!({
             "name": "wechatagent.query_send_ledger",
-            "description": "查询发送台账统计（只读）。可选参数：kind。用于查看各类发送的聚合统计。"
+            "description": "查询发送台账统计（只读）。必填参数：accountId；可选参数：kind。用于查看指定业务号各类发送的聚合统计。"
         }),
         // ── 批 1：版本与灰度类（publish=出草稿低风险；rollout/rollback/activate/灰度=高风险）──
         json!({
@@ -1378,7 +1389,8 @@ pub(super) async fn execute_management_tool(
             for item in items {
                 if let Some(contact_value) = item.get("contact") {
                     if let Some(contact) =
-                        upsert_contact_from_value(state, workspace_id, account_id, contact_value).await?
+                        upsert_contact_from_value(state, workspace_id, account_id, contact_value)
+                            .await?
                     {
                         imported.push(ApiContact::from(contact));
                     }
@@ -1389,7 +1401,8 @@ pub(super) async fn execute_management_tool(
         "wechatagent.enable_contact_agent" => {
             let note = string_arg(&planned.arguments, "humanProfileNote")
                 .or_else(|_| string_arg(&planned.arguments, "note"))?;
-            let contact = resolve_contact_arg(state, workspace_id, account_id, &planned.arguments).await?;
+            let contact =
+                resolve_contact_arg(state, workspace_id, account_id, &planned.arguments).await?;
             // 账号不能运营自己。
             let self_wxid = state
                 .db
@@ -1416,9 +1429,16 @@ pub(super) async fn execute_management_tool(
                 ));
             }
             let playbook_id = planned.arguments.get("playbookId").and_then(Value::as_str);
-            let playbook = resolve_playbook_for_contact(state, workspace_id, account_id, playbook_id).await?;
-            let generated =
-                agent::build_initial_operation_profile(state, workspace_id, account_id, &note, Some(&playbook)).await?;
+            let playbook =
+                resolve_playbook_for_contact(state, workspace_id, account_id, playbook_id).await?;
+            let generated = agent::build_initial_operation_profile(
+                state,
+                workspace_id,
+                account_id,
+                &note,
+                Some(&playbook),
+            )
+            .await?;
             let commitments_bson = commitments_with_optional_text(
                 &contact.commitments,
                 generated.last_commitment.as_deref(),
@@ -1510,11 +1530,13 @@ pub(super) async fn execute_management_tool(
                 Some(doc! { "actor": "management_tool", "source": "enable_contact_agent" }),
             )
             .await;
-            let updated = find_contact_by_id(state, workspace_id, &contact.id.unwrap().to_hex()).await?;
+            let updated =
+                find_contact_by_id(state, workspace_id, &contact.id.unwrap().to_hex()).await?;
             Ok(json!({ "item": ApiContact::from(updated) }))
         }
         "wechatagent.disable_contact_agent" => {
-            let contact = resolve_contact_arg(state, workspace_id, account_id, &planned.arguments).await?;
+            let contact =
+                resolve_contact_arg(state, workspace_id, account_id, &planned.arguments).await?;
             state
                 .db
                 .contacts()
@@ -1537,7 +1559,8 @@ pub(super) async fn execute_management_tool(
             Ok(json!({ "ok": true }))
         }
         "wechatagent.create_follow_up_task" => {
-            let contact = resolve_contact_arg(state, workspace_id, account_id, &planned.arguments).await?;
+            let contact =
+                resolve_contact_arg(state, workspace_id, account_id, &planned.arguments).await?;
             let content = string_arg(&planned.arguments, "content")?;
             let run_at = string_arg(&planned.arguments, "runAt")
                 .ok()
@@ -1579,7 +1602,8 @@ pub(super) async fn execute_management_tool(
         }
         "wechatagent.send_contact_message" => {
             let content = string_arg(&planned.arguments, "content")?;
-            let contact = resolve_contact_arg(state, workspace_id, account_id, &planned.arguments).await?;
+            let contact =
+                resolve_contact_arg(state, workspace_id, account_id, &planned.arguments).await?;
             let response = agent::send_contact_message_gateway(
                 state,
                 contact,
@@ -1600,7 +1624,8 @@ pub(super) async fn execute_management_tool(
             Ok(json!(response))
         }
         "wechatagent.update_contact_profile" => {
-            let contact = resolve_contact_arg(state, workspace_id, account_id, &planned.arguments).await?;
+            let contact =
+                resolve_contact_arg(state, workspace_id, account_id, &planned.arguments).await?;
             // T8（子计划2 衔接）：旧裸 `tags` 字段已废弃（Contact 不再有该字段），这里
             // 写 "tags" 是孤儿键、反序列化即丢弃。management Agent 产出的是 AI 画像层标签，
             // 应进 confirmed_tags（带证据），由子计划2 落地，本任务不顺势改写 AI 标签语义。
@@ -2328,7 +2353,8 @@ pub(super) async fn execute_management_tool(
             let id = string_arg(&planned.arguments, "id")?;
             let reason = string_arg(&planned.arguments, "cancelReason")
                 .or_else(|_| string_arg(&planned.arguments, "cancel_reason"))?;
-            crate::routes::admin_outbox::cancel_outbox_inner(state, workspace_id, &id, &reason).await
+            crate::routes::admin_outbox::cancel_outbox_inner(state, workspace_id, &id, &reason)
+                .await
         }
         "wechatagent.approve_relationship_suggestion" => {
             let id = string_arg(&planned.arguments, "id")?;
@@ -2350,7 +2376,11 @@ pub(super) async fn execute_management_tool(
             let payload = serde_json::from_value(planned.arguments.clone())
                 .map_err(|e| AppError::BadRequest(format!("参数解析失败: {e}")))?;
             crate::routes::admin_taxonomy_candidates::approve_taxonomy_candidate_inner(
-                state, workspace_id, account_id, &id, payload,
+                state,
+                workspace_id,
+                account_id,
+                &id,
+                payload,
             )
             .await
         }
@@ -2388,15 +2418,20 @@ pub(super) async fn execute_management_tool(
                 State(state.clone()),
                 Extension(management_admin(workspace_id)),
                 Json(body),
-            ).await?;
-            let campaign_id = created.0.get("id").and_then(Value::as_str)
+            )
+            .await?;
+            let campaign_id = created
+                .0
+                .get("id")
+                .and_then(Value::as_str)
                 .ok_or_else(|| AppError::External("campaign id missing".to_string()))?
                 .to_string();
             let resp = crate::routes::campaigns::preview_campaign(
                 State(state.clone()),
                 Extension(management_admin(workspace_id)),
                 Path(campaign_id),
-            ).await?;
+            )
+            .await?;
             Ok(resp.0)
         }
         "wechatagent.dispatch_campaign" => {
@@ -2405,7 +2440,8 @@ pub(super) async fn execute_management_tool(
                 State(state.clone()),
                 Extension(management_admin(workspace_id)),
                 Path(campaign_id),
-            ).await?;
+            )
+            .await?;
             Ok(resp.0)
         }
         _ => {
@@ -2489,7 +2525,11 @@ pub(super) async fn resolve_contact_arg(
         .ok_or_else(|| AppError::NotFound("contact not found".to_string()))
 }
 
-pub(super) async fn management_context(state: &AppState, workspace_id: &str, account_id: &str) -> AppResult<String> {
+pub(super) async fn management_context(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+) -> AppResult<String> {
     let mut contacts = state
         .db
         .contacts()
@@ -2557,18 +2597,8 @@ pub(super) async fn build_management_plan(
 ) -> AppResult<ManagementPlan> {
     let system = format!(
         "{}\n\n{}",
-        prompts::load_prompt(
-            &state.db,
-            workspace_id,
-            "management.plan.system",
-        )
-        .await?,
-        prompts::load_prompt(
-            &state.db,
-            workspace_id,
-            "management.plan.policy",
-        )
-        .await?
+        prompts::load_prompt(&state.db, workspace_id, "management.plan.system",).await?,
+        prompts::load_prompt(&state.db, workspace_id, "management.plan.policy",).await?
     );
     let user = format!(
         "操作员指令:\n{}\n\n当前系统上下文:\n{}\n\nMCP 工具目录:\n{}",
@@ -2596,12 +2626,27 @@ mod tests {
 
     #[test]
     fn tool_effect_classifies_risk() {
-        assert_eq!(tool_effect("wechatagent.search_contacts").risk, ToolRisk::Readonly);
-        assert_eq!(tool_effect("wechatagent.create_follow_up_task").risk, ToolRisk::Low);
-        assert_eq!(tool_effect("wechatagent.send_contact_message").risk, ToolRisk::Dangerous);
+        assert_eq!(
+            tool_effect("wechatagent.search_contacts").risk,
+            ToolRisk::Readonly
+        );
+        assert_eq!(
+            tool_effect("wechatagent.create_follow_up_task").risk,
+            ToolRisk::Low
+        );
+        assert_eq!(
+            tool_effect("wechatagent.send_contact_message").risk,
+            ToolRisk::Dangerous
+        );
         // 批 1：publish_* 出草稿不放量 → Low（rollout/rollback 才 Dangerous）
-        assert_eq!(tool_effect("wechatagent.publish_domain_profile").risk, ToolRisk::Low);
-        assert_eq!(tool_effect("wechatagent.reset_domain").risk, ToolRisk::Irreversible);
+        assert_eq!(
+            tool_effect("wechatagent.publish_domain_profile").risk,
+            ToolRisk::Low
+        );
+        assert_eq!(
+            tool_effect("wechatagent.reset_domain").risk,
+            ToolRisk::Irreversible
+        );
         // 只读工具同时 read_only=true（与既有 dry-run 逻辑兼容）
         assert!(tool_effect("wechatagent.search_contacts").read_only);
     }
@@ -2609,12 +2654,19 @@ mod tests {
     #[test]
     fn campaign_tools_risk_and_confirmation() {
         // preview 只读（dry-run 下也执行返回圈人结果）
-        assert_eq!(tool_effect("wechatagent.preview_campaign").risk, ToolRisk::Readonly);
+        assert_eq!(
+            tool_effect("wechatagent.preview_campaign").risk,
+            ToolRisk::Readonly
+        );
         assert!(tool_effect("wechatagent.preview_campaign").read_only);
         // dispatch 恒确认门——关键：dangerous 开关默认 false 下仍须确认
-        assert!(tool_always_requires_confirmation("wechatagent.dispatch_campaign"));
-        assert!(plan_requires_confirmation(&["wechatagent.dispatch_campaign"], false),
-            "dispatch 必须无视第一期 dangerous 开关恒走确认门");
+        assert!(tool_always_requires_confirmation(
+            "wechatagent.dispatch_campaign"
+        ));
+        assert!(
+            plan_requires_confirmation(&["wechatagent.dispatch_campaign"], false),
+            "dispatch 必须无视第一期 dangerous 开关恒走确认门"
+        );
     }
 
     #[test]
@@ -2647,19 +2699,37 @@ mod tests {
     #[test]
     fn tool_effect_classifies_batch1_risk() {
         // query_* = Readonly
-        assert_eq!(tool_effect("wechatagent.query_runs").risk, ToolRisk::Readonly);
+        assert_eq!(
+            tool_effect("wechatagent.query_runs").risk,
+            ToolRisk::Readonly
+        );
         assert!(tool_effect("wechatagent.query_send_ledger").read_only);
         // publish_* = Low（出草稿不放量）
-        assert_eq!(tool_effect("wechatagent.publish_domain_profile").risk, ToolRisk::Low);
+        assert_eq!(
+            tool_effect("wechatagent.publish_domain_profile").risk,
+            ToolRisk::Low
+        );
         assert_eq!(
             tool_effect("wechatagent.publish_operation_domain_version").risk,
             ToolRisk::Low
         );
         // rollout/rollback/activate/provider/evolution = Dangerous
-        assert_eq!(tool_effect("wechatagent.rollout_domain_profile").risk, ToolRisk::Dangerous);
-        assert_eq!(tool_effect("wechatagent.rollback_taxonomy_version").risk, ToolRisk::Dangerous);
-        assert_eq!(tool_effect("wechatagent.activate_domain_profile").risk, ToolRisk::Dangerous);
-        assert_eq!(tool_effect("wechatagent.provider_activate").risk, ToolRisk::Dangerous);
+        assert_eq!(
+            tool_effect("wechatagent.rollout_domain_profile").risk,
+            ToolRisk::Dangerous
+        );
+        assert_eq!(
+            tool_effect("wechatagent.rollback_taxonomy_version").risk,
+            ToolRisk::Dangerous
+        );
+        assert_eq!(
+            tool_effect("wechatagent.activate_domain_profile").risk,
+            ToolRisk::Dangerous
+        );
+        assert_eq!(
+            tool_effect("wechatagent.provider_activate").risk,
+            ToolRisk::Dangerous
+        );
         assert_eq!(
             tool_effect("wechatagent.release_evolution_proposal").risk,
             ToolRisk::Dangerous
@@ -2686,11 +2756,20 @@ mod tests {
     #[test]
     fn tool_effect_classifies_batch2_risk() {
         // 运营态单对象写 = Low
-        assert_eq!(tool_effect("wechatagent.update_manual_tags").risk, ToolRisk::Low);
-        assert_eq!(tool_effect("wechatagent.update_assist_override").risk, ToolRisk::Low);
+        assert_eq!(
+            tool_effect("wechatagent.update_manual_tags").risk,
+            ToolRisk::Low
+        );
+        assert_eq!(
+            tool_effect("wechatagent.update_assist_override").risk,
+            ToolRisk::Low
+        );
         assert_eq!(tool_effect("wechatagent.cancel_task").risk, ToolRisk::Low);
         // 运行时调参：update_operation_domain = Low
-        assert_eq!(tool_effect("wechatagent.update_operation_domain").risk, ToolRisk::Low);
+        assert_eq!(
+            tool_effect("wechatagent.update_operation_domain").risk,
+            ToolRisk::Low
+        );
         // ask_human_policy 立即改全量在跑 agent 行为 → Dangerous（spec §4.1）
         assert_eq!(
             tool_effect("wechatagent.update_ask_human_policy").risk,
@@ -2721,11 +2800,20 @@ mod tests {
         // 策略编辑：soul/playbook 编辑 = Low（出草稿不放量）
         assert_eq!(tool_effect("wechatagent.edit_soul").risk, ToolRisk::Low);
         // 知识维护：patch 等可逆单对象写 = Low
-        assert_eq!(tool_effect("wechatagent.patch_knowledge_chunk").risk, ToolRisk::Low);
+        assert_eq!(
+            tool_effect("wechatagent.patch_knowledge_chunk").risk,
+            ToolRisk::Low
+        );
         // 改全局状态机 = Dangerous（spec §4.1）
-        assert_eq!(tool_effect("wechatagent.edit_state_machine").risk, ToolRisk::Dangerous);
+        assert_eq!(
+            tool_effect("wechatagent.edit_state_machine").risk,
+            ToolRisk::Dangerous
+        );
         // verify 类 = Dangerous（推 chunk 到 verified，写 source=Human）
-        assert_eq!(tool_effect("wechatagent.verify_knowledge_chunk").risk, ToolRisk::Dangerous);
+        assert_eq!(
+            tool_effect("wechatagent.verify_knowledge_chunk").risk,
+            ToolRisk::Dangerous
+        );
     }
 
     #[test]
@@ -2754,7 +2842,10 @@ mod tests {
             tool_effect("wechatagent.approve_taxonomy_candidate").risk,
             ToolRisk::Low
         );
-        assert_eq!(tool_effect("wechatagent.import_knowledge_pdf").risk, ToolRisk::Low);
+        assert_eq!(
+            tool_effect("wechatagent.import_knowledge_pdf").risk,
+            ToolRisk::Low
+        );
         // Low 工具非只读：dry-run 下应被拦截不实际执行
         assert!(!tool_effect("wechatagent.cancel_outbox").read_only);
     }
@@ -2774,23 +2865,43 @@ mod tests {
     fn batch_verify_always_requires_confirmation() {
         // batch_verify 与单条 verify 同属 verify 类，恒强制确认无视第一期 dangerous 开关
         // （spec §4.3：守"AI 永不自动 verify"，AI 调 verify 会落 source=Human）。
-        assert!(plan_requires_confirmation(&["wechatagent.batch_verify_chunks"], false));
-        assert!(tool_always_requires_confirmation("wechatagent.batch_verify_chunks"));
+        assert!(plan_requires_confirmation(
+            &["wechatagent.batch_verify_chunks"],
+            false
+        ));
+        assert!(tool_always_requires_confirmation(
+            "wechatagent.batch_verify_chunks"
+        ));
     }
 
     #[test]
     fn confirmation_gate_off_by_default_phase1() {
         // 第一期权限放大：dangerous_confirm_enabled=false 时即便有 dangerous 工具也不强制确认
-        assert!(!plan_requires_confirmation(&["wechatagent.send_contact_message"], false));
+        assert!(!plan_requires_confirmation(
+            &["wechatagent.send_contact_message"],
+            false
+        ));
         // 开关打开后 dangerous 触发确认（为后续阶段预留）
-        assert!(plan_requires_confirmation(&["wechatagent.send_contact_message"], true));
+        assert!(plan_requires_confirmation(
+            &["wechatagent.send_contact_message"],
+            true
+        ));
         // 全 readonly 永不需确认
-        assert!(!plan_requires_confirmation(&["wechatagent.search_contacts"], true));
+        assert!(!plan_requires_confirmation(
+            &["wechatagent.search_contacts"],
+            true
+        ));
         // irreversible 无视开关恒需确认（第一期即便放权也保留，spec §4.2）
-        assert!(plan_requires_confirmation(&["wechatagent.reset_domain"], false));
+        assert!(plan_requires_confirmation(
+            &["wechatagent.reset_domain"],
+            false
+        ));
         // verify 类无视开关恒需确认（spec §4.3：AI 调 verify 会落 source=Human，
         // 守"AI 永不自动 verify"——确认门不随第一期 dangerous 开关放行）
-        assert!(plan_requires_confirmation(&["wechatagent.verify_knowledge_chunk"], false));
+        assert!(plan_requires_confirmation(
+            &["wechatagent.verify_knowledge_chunk"],
+            false
+        ));
     }
 
     #[test]
@@ -2852,7 +2963,10 @@ mod tests {
             .map(String::as_str)
             .filter(|name| name.starts_with("wechatagent."))
             .collect();
-        assert!(!product_names.is_empty(), "product catalog should not be empty");
+        assert!(
+            !product_names.is_empty(),
+            "product catalog should not be empty"
+        );
         for name in product_names {
             assert!(
                 tool_effect(name).explicitly_classified,
@@ -2866,29 +2980,53 @@ mod tests {
         use serde_json::json;
         // send: MCP RPC 返 Ok 但 success=false（账号离线）→ Failed
         let r = json!({"success": false, "error": "account offline"});
-        assert!(matches!(assert_tool_outcome("wechatagent.send_contact_message", &r), ToolOutcome::Failed(_)));
+        assert!(matches!(
+            assert_tool_outcome("wechatagent.send_contact_message", &r),
+            ToolOutcome::Failed(_)
+        ));
         // send: success=true 且有 msgId → Succeeded
         let r = json!({"success": true, "msgId": "m123"});
-        assert!(matches!(assert_tool_outcome("wechatagent.send_contact_message", &r), ToolOutcome::Succeeded));
+        assert!(matches!(
+            assert_tool_outcome("wechatagent.send_contact_message", &r),
+            ToolOutcome::Succeeded
+        ));
         // update: matched=0 → Failed（未命中、实际没改）
         let r = json!({"matched": 0, "modified": 0});
-        assert!(matches!(assert_tool_outcome("wechatagent.update_contact_profile", &r), ToolOutcome::Failed(_)));
+        assert!(matches!(
+            assert_tool_outcome("wechatagent.update_contact_profile", &r),
+            ToolOutcome::Failed(_)
+        ));
         // update: modified>=1 → Succeeded
         let r = json!({"matched": 1, "modified": 1});
-        assert!(matches!(assert_tool_outcome("wechatagent.update_contact_profile", &r), ToolOutcome::Succeeded));
+        assert!(matches!(
+            assert_tool_outcome("wechatagent.update_contact_profile", &r),
+            ToolOutcome::Succeeded
+        ));
         // 无断言规则的工具 + response 无明显信号 → Unverified（诚实暴露）
         let r = json!({"weird": "shape"});
-        assert!(matches!(assert_tool_outcome("wechatagent.some_unknown_tool", &r), ToolOutcome::Unverified(_)));
+        assert!(matches!(
+            assert_tool_outcome("wechatagent.some_unknown_tool", &r),
+            ToolOutcome::Unverified(_)
+        ));
         // readonly 查询：有数据即 Succeeded
         let r = json!({"items": []});
-        assert!(matches!(assert_tool_outcome("wechatagent.query_runs", &r), ToolOutcome::Succeeded));
+        assert!(matches!(
+            assert_tool_outcome("wechatagent.query_runs", &r),
+            ToolOutcome::Succeeded
+        ));
     }
 
     #[test]
     fn execution_summary_reports_real_outcomes() {
         let results = vec![
-            ("wechatagent.update_contact_profile".to_string(), ToolOutcome::Succeeded),
-            ("wechatagent.send_contact_message".to_string(), ToolOutcome::Failed("账号离线".to_string())),
+            (
+                "wechatagent.update_contact_profile".to_string(),
+                ToolOutcome::Succeeded,
+            ),
+            (
+                "wechatagent.send_contact_message".to_string(),
+                ToolOutcome::Failed("账号离线".to_string()),
+            ),
         ];
         let s = build_execution_summary(&results);
         assert!(s.contains("update_contact_profile"));
@@ -2896,7 +3034,10 @@ mod tests {
         // 不假报全部成功
         assert!(!s.contains("全部成功"));
 
-        let unv = vec![("wechatagent.x".to_string(), ToolOutcome::Unverified("无法确认".to_string()))];
+        let unv = vec![(
+            "wechatagent.x".to_string(),
+            ToolOutcome::Unverified("无法确认".to_string()),
+        )];
         let s2 = build_execution_summary(&unv);
         assert!(s2.contains("待核实") || s2.contains("无法确认"));
     }
@@ -2907,7 +3048,9 @@ mod tests {
         // customer_stage 主通道是 LlmSignals（机器容错）：字典有条目但此值越界(Miss) →
         // classify_validation 判 DropSilently（不阻断、不报错），apply_admin_dim_validation
         // 再把 DropSilently 映成 None → 该键不写入（越界值不落库脏值，且不像 admin 那样 400）。
-        use crate::agent::dimension_registry::{classify_validation, spec_for, DictLookup, WriteIntent};
+        use crate::agent::dimension_registry::{
+            classify_validation, spec_for, DictLookup, WriteIntent,
+        };
         let stage = spec_for("customer_stage").unwrap();
         let v = classify_validation(stage, DictLookup::Miss, "臆造态", WriteIntent::MachineWrite);
         // 旁路修复前：值原样落库；修复后：MachineWrite 越界 → DropSilently → 不写。
@@ -2915,7 +3058,12 @@ mod tests {
 
         // intent_level 同为 LlmSignals 机器通道，越界同样 drop（不写）而非报错。
         let intent = spec_for("intent_level").unwrap();
-        let vi = classify_validation(intent, DictLookup::Miss, "瞎填意向", WriteIntent::MachineWrite);
+        let vi = classify_validation(
+            intent,
+            DictLookup::Miss,
+            "瞎填意向",
+            WriteIntent::MachineWrite,
+        );
         assert!(matches!(apply_admin_dim_validation(vi), Ok(None)));
 
         // 合法值（alias 归一后 Accept）仍写入 canonical，证明校验不误杀正常路径。
@@ -3082,7 +3230,13 @@ mod tests {
     #[test]
     fn tool_call_status_closed_set() {
         use crate::models::ALLOWED_TOOL_CALL_STATUS;
-        const EXPECTED: &[&str] = &["running", "dry_run", "succeeded", "failed", "executed_unverified"];
+        const EXPECTED: &[&str] = &[
+            "running",
+            "dry_run",
+            "succeeded",
+            "failed",
+            "executed_unverified",
+        ];
         for s in EXPECTED {
             assert!(ALLOWED_TOOL_CALL_STATUS.contains(s), "缺少状态 {s}");
         }
@@ -3091,7 +3245,13 @@ mod tests {
 
     #[test]
     fn assert_tool_call_status_accepts_all_valid() {
-        for s in ["running", "dry_run", "succeeded", "failed", "executed_unverified"] {
+        for s in [
+            "running",
+            "dry_run",
+            "succeeded",
+            "failed",
+            "executed_unverified",
+        ] {
             crate::models::assert_tool_call_status_valid(s); // 不 panic 即通过
         }
     }

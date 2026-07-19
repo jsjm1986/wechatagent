@@ -51,11 +51,8 @@ pub(super) async fn run_step(db: &Database) -> AppResult<()> {
         };
         let (new_core, core_changed) =
             upgrade_fact_array(card.get_array("coreFacts").ok(), now, &mut upgraded_facts);
-        let (new_recent, recent_changed) = upgrade_fact_array(
-            card.get_array("recentFacts").ok(),
-            now,
-            &mut upgraded_facts,
-        );
+        let (new_recent, recent_changed) =
+            upgrade_fact_array(card.get_array("recentFacts").ok(), now, &mut upgraded_facts);
         if !core_changed && !recent_changed {
             continue;
         }

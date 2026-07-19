@@ -148,7 +148,10 @@ async fn approve_suspected_deal_inner(
     // 读 signal 仅为拿 contact_id（落成交需要）；pending 校验以下方 CAS 的 matched_count
     // 为准（防 TOCTOU）。查询带 workspace 过滤：跨 workspace 的 _id 返回 NotFound。
     let signal = signals
-        .find_one(doc! { "_id": object_id, "workspace_id": workspace_id }, None)
+        .find_one(
+            doc! { "_id": object_id, "workspace_id": workspace_id },
+            None,
+        )
         .await?
         .ok_or_else(|| AppError::NotFound("suspected deal signal not found".to_string()))?;
 
@@ -211,7 +214,10 @@ async fn approve_suspected_deal_inner(
     .await?;
 
     let updated = signals
-        .find_one(doc! { "_id": object_id, "workspace_id": workspace_id }, None)
+        .find_one(
+            doc! { "_id": object_id, "workspace_id": workspace_id },
+            None,
+        )
         .await?
         .ok_or_else(|| AppError::NotFound("suspected deal signal not found".to_string()))?;
     Ok(json!({ "item": suspected_deal_json(updated) }))

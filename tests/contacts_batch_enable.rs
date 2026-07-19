@@ -7,7 +7,7 @@
 mod common;
 
 use axum::extract::{Extension, State};
-use mongodb::bson::{doc, Document, DateTime, oid::ObjectId};
+use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
 
 use wechatagent::auth::AuthenticatedAdmin;
 use wechatagent::error::AppError;
@@ -58,7 +58,11 @@ async fn seed_account(app: &TestApp, ws: &str, account_id: &str) {
         .expect("seed account");
 }
 
-fn req(account_id: &str, wxids: &[&str], shared_note: &str) -> wechatagent::models::BatchEnableRequest {
+fn req(
+    account_id: &str,
+    wxids: &[&str],
+    shared_note: &str,
+) -> wechatagent::models::BatchEnableRequest {
     let candidates: Vec<_> = wxids
         .iter()
         .map(|w| {
@@ -153,7 +157,10 @@ async fn batch_enables_and_queues_initial_profile_tasks() {
         .await
         .expect("query")
         .expect("contact exists");
-    assert_eq!(c.human_profile_note.as_deref(), Some("统一运营备注：热情专业"));
+    assert_eq!(
+        c.human_profile_note.as_deref(),
+        Some("统一运营备注：热情专业")
+    );
     assert_eq!(c.avatar_url.as_deref(), Some("http://img/wx_b1"));
     assert_eq!(c.sex, Some(1), "候选带的 sex 应落库到 Contact.sex");
     // 竞态修复：全新客户在 batch upsert 阶段即同步拿到状态机 initial 态（不等异步画像回填），
@@ -318,7 +325,11 @@ async fn batch_preserves_previously_operated_state_but_seeds_new() {
         Some("deal_won"),
         "老客户已积累的 operation_state 不得被批量托管覆盖"
     );
-    assert_eq!(vet.operation_state_confidence, Some(9), "老客户 confidence 不被覆盖");
+    assert_eq!(
+        vet.operation_state_confidence,
+        Some(9),
+        "老客户 confidence 不被覆盖"
+    );
 
     // 全新客户：同步拿到状态机 initial 态。
     let fresh = app
@@ -429,7 +440,10 @@ async fn initial_profile_task_marks_sent_when_unmanaged() {
     app.state
         .db
         .contacts()
-        .insert_one(make_contact(&ws, &acc, "wx_unmanaged", AgentStatus::Normal), None)
+        .insert_one(
+            make_contact(&ws, &acc, "wx_unmanaged", AgentStatus::Normal),
+            None,
+        )
         .await
         .expect("seed unmanaged contact");
 
@@ -454,7 +468,10 @@ async fn initial_profile_task_marks_sent_when_unmanaged() {
         .await
         .expect("query task")
         .expect("task exists");
-    assert_eq!(stored.status, "sent", "非 managed 早退也必须写终态 sent，不得停 running");
+    assert_eq!(
+        stored.status, "sent",
+        "非 managed 早退也必须写终态 sent，不得停 running"
+    );
     assert_eq!(stored.gateway_status.as_deref(), Some("unmanaged"));
 }
 
@@ -489,6 +506,9 @@ async fn initial_profile_task_marks_sent_when_contact_gone() {
         .await
         .expect("query task")
         .expect("task exists");
-    assert_eq!(stored.status, "sent", "联系人不存在早退也必须写终态 sent，不得停 running");
+    assert_eq!(
+        stored.status, "sent",
+        "联系人不存在早退也必须写终态 sent，不得停 running"
+    );
     assert_eq!(stored.gateway_status.as_deref(), Some("contact_gone"));
 }

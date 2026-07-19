@@ -25,32 +25,32 @@ use super::AppState;
 
 // ── 模块化解耦（2026-06-07）：子域逐个搬运，建好一个解开一对 ────────────
 // 见 docs/superpowers/plans/2026-06-07-knowledge-routes-split.md
-pub mod crud;
-mod verify;
-mod import;
 mod catalog;
+pub mod crud;
+mod import;
 mod repair;
+mod verify;
 // pub:knowledge_chat_apply_integration.rs 集成测试需从 tests/ 直调 apply_create_chunk。
 pub mod chat;
 mod digest_inbox;
-mod wiki_edit;
 mod sources_meta;
+mod wiki_edit;
 //
 pub(in crate::routes) use crud::*;
 // Task6：chunk PUT update handler 暴露给集成测试 crate（经 routes::ext_knowledge 再导出）。
-pub use crud::update_operation_knowledge_chunk;
-pub use verify::*;
-pub use import::*;
 pub use catalog::*;
-pub use repair::*;
 pub use chat::*;
+pub use crud::update_operation_knowledge_chunk;
 pub(in crate::routes) use digest_inbox::*;
+pub use import::*;
+pub use repair::*;
+pub use verify::*;
 // 跨租户 digest 缺陷回归钉:digest_today handler + query 暴露给集成测试 crate
 // （经 routes::ext_knowledge 再导出）。glob 再导出被 pub(in crate::routes) 收窄，
 // 故显式 pub use 提升这两项可见性（同 crud::update_operation_knowledge_chunk 惯例）。
 pub use digest_inbox::{digest_today, DigestTodayQuery};
-pub use wiki_edit::*;
 pub use sources_meta::*;
+pub use wiki_edit::*;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -320,8 +320,7 @@ pub(super) fn operation_knowledge_chunk_json(item: OperationKnowledgeChunk) -> V
 pub(super) fn knowledge_usage_json(item: KnowledgeUsageLog) -> Value {
     // tool_trace / route_result 都是 BSON Document — 走 extjson 桥接避免
     // `{"$numberInt":"…"}` 等 BSON 包装泄漏到前端。
-    let route_result_json =
-        mongodb::bson::Bson::Document(item.route_result).into_relaxed_extjson();
+    let route_result_json = mongodb::bson::Bson::Document(item.route_result).into_relaxed_extjson();
     let tool_trace_json: Vec<Value> = item
         .tool_trace
         .into_iter()
@@ -1033,7 +1032,6 @@ pub(super) fn default_active_status() -> String {
     "active".to_string()
 }
 
-
 /// D2 不变量纯函数：verify gate 在 sourceQuote / source_anchors 缺失时必须挡住任何升级路径。
 /// 返回 Some(reason) 表示拒绝，None 表示放行。AI 自主修复后的 "应用并立即运营确认" 也必须经过这个 gate。
 fn chunk_verify_gate_reason(has_source_quote: bool, has_source_anchor: bool) -> Option<String> {
@@ -1056,7 +1054,9 @@ fn chunk_verify_gate_reason(has_source_quote: bool, has_source_anchor: bool) -> 
 /// 调用方后门 D2 收口：create/PUT chunk 落库前，若调用方提交 `integrity_status="verified"`
 /// 但缺 sourceQuote 或 source_anchors（未过 D2 闸），降级为 needs_review 并留审计痕迹。
 /// 与 import 路径「锚点只作审核线索、最终 needs_review」语义一致；正路仍是走 /verify。
-pub(in crate::routes) fn coerce_integrity_against_d2_gate(payload: &mut OperationKnowledgeChunkRequest) {
+pub(in crate::routes) fn coerce_integrity_against_d2_gate(
+    payload: &mut OperationKnowledgeChunkRequest,
+) {
     if payload.integrity_status.as_deref() != Some("verified") {
         return;
     }
@@ -1155,7 +1155,6 @@ fn bson_from_json(value: &Value) -> Result<Document, String> {
     mongodb::bson::to_document(value).map_err(|e| e.to_string())
 }
 
-
 /// 把 `block_parser::ParseWarning` 序列化为 import_apply 返回体里的统一形态。
 fn parse_warning_to_json(w: &crate::knowledge_wiki::block_parser::ParseWarning) -> Value {
     use crate::knowledge_wiki::block_parser::ParseWarning::*;
@@ -1172,7 +1171,6 @@ fn parse_warning_to_json(w: &crate::knowledge_wiki::block_parser::ParseWarning) 
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1188,7 +1186,11 @@ mod tests {
         })];
         let report = integrity_report_for_preview(raw, &mut chunks);
         // 报告聚合：verified 恒 0。
-        assert_eq!(report["verified"], json!(0), "preview 聚合 verified 必须恒 0");
+        assert_eq!(
+            report["verified"],
+            json!(0),
+            "preview 聚合 verified 必须恒 0"
+        );
         // 单 chunk：anchor 命中 → 保留锚点+confidence 90 作审计线索，但状态压回 needs_review。
         assert_eq!(
             chunks[0]["integrityStatus"],
@@ -1201,7 +1203,9 @@ mod tests {
             "anchor 命中保留 confidence=90 审计线索"
         );
         assert!(
-            chunks[0]["sourceAnchors"].as_array().map_or(false, |a| !a.is_empty()),
+            chunks[0]["sourceAnchors"]
+                .as_array()
+                .map_or(false, |a| !a.is_empty()),
             "anchor 命中保留 sourceAnchors 审计线索"
         );
     }
@@ -1226,14 +1230,26 @@ mod tests {
     /// `user_operations`，避免落库后被路由查询漏掉。
     #[test]
     fn normalize_operation_domain_keeps_known_values() {
-        assert_eq!(normalize_operation_domain("user_operations"), "user_operations");
-        assert_eq!(normalize_operation_domain("group_operations"), "group_operations");
-        assert_eq!(normalize_operation_domain("moments_operations"), "moments_operations");
+        assert_eq!(
+            normalize_operation_domain("user_operations"),
+            "user_operations"
+        );
+        assert_eq!(
+            normalize_operation_domain("group_operations"),
+            "group_operations"
+        );
+        assert_eq!(
+            normalize_operation_domain("moments_operations"),
+            "moments_operations"
+        );
     }
 
     #[test]
     fn normalize_operation_domain_trims_whitespace() {
-        assert_eq!(normalize_operation_domain("  user_operations  "), "user_operations");
+        assert_eq!(
+            normalize_operation_domain("  user_operations  "),
+            "user_operations"
+        );
     }
 
     #[test]
@@ -1244,7 +1260,10 @@ mod tests {
         assert_eq!(normalize_operation_domain("私域运营"), "user_operations");
         assert_eq!(normalize_operation_domain("销售知识"), "user_operations");
         assert_eq!(normalize_operation_domain(""), "user_operations");
-        assert_eq!(normalize_operation_domain("USER_OPERATIONS"), "user_operations"); // 大小写敏感：不命中白名单 → 归一
+        assert_eq!(
+            normalize_operation_domain("USER_OPERATIONS"),
+            "user_operations"
+        ); // 大小写敏感：不命中白名单 → 归一
     }
 
     /// D2 不变量：verify gate 在 sourceQuote / source_anchors 任一缺失时必须挡住升级。
@@ -1298,11 +1317,22 @@ mod tests {
         let v = operation_knowledge_chunk_json(chunk);
         let prov = &v["provenance"];
         assert_eq!(prov["source"], json!("ai_repair"), "下发 source");
-        assert_eq!(prov["sourceDocId"], json!("doc1"), "下发 sourceDocId(camelCase)");
+        assert_eq!(
+            prov["sourceDocId"],
+            json!("doc1"),
+            "下发 sourceDocId(camelCase)"
+        );
         assert_eq!(prov["sourceQuote"], json!("原文片段"), "下发 sourceQuote");
-        assert_eq!(prov["llmModelAlias"], json!("provider-a"), "下发 llmModelAlias");
+        assert_eq!(
+            prov["llmModelAlias"],
+            json!("provider-a"),
+            "下发 llmModelAlias"
+        );
         assert_eq!(prov["editedBy"], json!("admin1"), "下发 editedBy");
-        assert!(prov["editedAt"].is_string(), "editedAt 走 dt_to_string 成字符串");
+        assert!(
+            prov["editedAt"].is_string(),
+            "editedAt 走 dt_to_string 成字符串"
+        );
     }
 
     /// provenance 为 None（旧数据 / 非修复来源）时下发 null，前端来源区不显、不崩。
@@ -1355,7 +1385,9 @@ mod tests {
             business_context: Some("企业版能力说明".to_string()),
             title: "7x24 自动应答".to_string(),
             summary: Some("企业版提供全天候自动应答".to_string()),
-            body: Some("WechatAgent 企业版提供 7x24 小时自动应答,支持私域多账号统一纳管。".to_string()),
+            body: Some(
+                "WechatAgent 企业版提供 7x24 小时自动应答,支持私域多账号统一纳管。".to_string(),
+            ),
             applicable_scenes: vec!["售前咨询".to_string()],
             not_applicable_scenes: vec!["售后投诉".to_string()],
             product_tags: vec!["企业版".to_string(), "自动应答".to_string()],
@@ -1465,10 +1497,7 @@ mod tests {
             created_at: DateTime::from_millis(1_700_000_000_000),
         };
         let projected = knowledge_usage_json(log);
-        crate::routes::contract_snapshot::assert_contract_fixture(
-            "knowledge_usage_log",
-            projected,
-        );
+        crate::routes::contract_snapshot::assert_contract_fixture("knowledge_usage_log", projected);
     }
 
     /// 根治 chunk PUT replace_one 清空 model 字段：请求体无法表达的 13 个字段 +
@@ -1525,12 +1554,23 @@ mod tests {
 
         // 请求体能表达的字段仍来自 next。
         assert_eq!(merged.title, "新标题", "title 来自请求体");
-        assert_eq!(merged.summary.as_deref(), Some("新摘要"), "summary 来自请求体");
+        assert_eq!(
+            merged.summary.as_deref(),
+            Some("新摘要"),
+            "summary 来自请求体"
+        );
         assert_eq!(merged.updated_at, updated, "updated_at 跟随 now,不回填");
 
         // 13 个请求体无法表达的字段 + created_at 全部回填原值。
-        assert_eq!(merged.wiki_type.as_deref(), Some("entity"), "wiki_type 回填");
-        assert_eq!(merged.chunk_type, "style_template", "chunk_type 回填(不被重置为 product_fact)");
+        assert_eq!(
+            merged.wiki_type.as_deref(),
+            Some("entity"),
+            "wiki_type 回填"
+        );
+        assert_eq!(
+            merged.chunk_type, "style_template",
+            "chunk_type 回填(不被重置为 product_fact)"
+        );
         assert_eq!(
             merged.provenance.as_ref().map(|p| p.source.as_str()),
             Some("imported"),
@@ -1542,11 +1582,31 @@ mod tests {
             "related_chunks 回填"
         );
         assert!(merged.usage_stats.is_some(), "usage_stats 回填");
-        assert_eq!(merged.dynamic_confidence, Some(0.73), "dynamic_confidence 回填");
-        assert_eq!(merged.valid_from, Some(DateTime::from_millis(2_000_000)), "valid_from 回填");
-        assert_eq!(merged.valid_to, Some(DateTime::from_millis(3_000_000)), "valid_to 回填");
-        assert_eq!(merged.superseded_by.as_deref(), Some("c-9"), "superseded_by 回填");
-        assert_eq!(merged.previous_version_id.as_deref(), Some("c-0"), "previous_version_id 回填");
+        assert_eq!(
+            merged.dynamic_confidence,
+            Some(0.73),
+            "dynamic_confidence 回填"
+        );
+        assert_eq!(
+            merged.valid_from,
+            Some(DateTime::from_millis(2_000_000)),
+            "valid_from 回填"
+        );
+        assert_eq!(
+            merged.valid_to,
+            Some(DateTime::from_millis(3_000_000)),
+            "valid_to 回填"
+        );
+        assert_eq!(
+            merged.superseded_by.as_deref(),
+            Some("c-9"),
+            "superseded_by 回填"
+        );
+        assert_eq!(
+            merged.previous_version_id.as_deref(),
+            Some("c-0"),
+            "previous_version_id 回填"
+        );
         assert_eq!(
             merged.locked_fields.as_deref(),
             Some(&["title".to_string(), "body".to_string()][..]),
@@ -1554,11 +1614,17 @@ mod tests {
         );
         assert_eq!(merged.integrity_score, Some(0.91), "integrity_score 回填");
         assert_eq!(
-            merged.domain_attributes.as_ref().and_then(|d| d.get_str("customer_stage").ok()),
+            merged
+                .domain_attributes
+                .as_ref()
+                .and_then(|d| d.get_str("customer_stage").ok()),
             Some("negotiation"),
             "domain_attributes 回填"
         );
-        assert_eq!(merged.created_at, created, "created_at 回填原值(不被篡改成更新时间)");
+        assert_eq!(
+            merged.created_at, created,
+            "created_at 回填原值(不被篡改成更新时间)"
+        );
     }
 
     // ── G-后续Ⅱ/1：纯逻辑 helper 单测扩展 ─────────────────────────────────
@@ -1602,7 +1668,10 @@ mod tests {
     fn json_string_list_string_falls_through_to_split_lines() {
         let v = json!({ "tags": "- foo\n* bar\n\n• baz" });
         let out = json_string_list(&v, "tags").unwrap();
-        assert_eq!(out, vec!["foo".to_string(), "bar".to_string(), "baz".to_string()]);
+        assert_eq!(
+            out,
+            vec!["foo".to_string(), "bar".to_string(), "baz".to_string()]
+        );
     }
 
     #[test]
@@ -1625,19 +1694,38 @@ mod tests {
             json!({ "title": "话术模板", "wikiType": "methodology", "chunkType": "style_template" }),
             &payload,
         );
-        assert_eq!(camel.get("wikiType").and_then(|v| v.as_str()), Some("methodology"));
-        assert_eq!(camel.get("chunkType").and_then(|v| v.as_str()), Some("style_template"));
+        assert_eq!(
+            camel.get("wikiType").and_then(|v| v.as_str()),
+            Some("methodology")
+        );
+        assert_eq!(
+            camel.get("chunkType").and_then(|v| v.as_str()),
+            Some("style_template")
+        );
         // LLM 漂 snake_case 也要兼容（项目已知键漂移）。
         let snake = normalize_operation_knowledge_preview_chunk(
             json!({ "title": "反例", "wiki_type": "finding", "chunk_type": "negative_example" }),
             &payload,
         );
-        assert_eq!(snake.get("wikiType").and_then(|v| v.as_str()), Some("finding"));
-        assert_eq!(snake.get("chunkType").and_then(|v| v.as_str()), Some("negative_example"));
+        assert_eq!(
+            snake.get("wikiType").and_then(|v| v.as_str()),
+            Some("finding")
+        );
+        assert_eq!(
+            snake.get("chunkType").and_then(|v| v.as_str()),
+            Some("negative_example")
+        );
         // LLM 没给分类时透传 null（默认值交落库端 coerce，不在归一化兜底）。
-        let missing = normalize_operation_knowledge_preview_chunk(json!({ "title": "无分类" }), &payload);
-        assert!(missing.get("wikiType").map(|v| v.is_null()).unwrap_or(false));
-        assert!(missing.get("chunkType").map(|v| v.is_null()).unwrap_or(false));
+        let missing =
+            normalize_operation_knowledge_preview_chunk(json!({ "title": "无分类" }), &payload);
+        assert!(missing
+            .get("wikiType")
+            .map(|v| v.is_null())
+            .unwrap_or(false));
+        assert!(missing
+            .get("chunkType")
+            .map(|v| v.is_null())
+            .unwrap_or(false));
     }
 
     #[test]
@@ -1687,7 +1775,10 @@ mod tests {
         assert_eq!(anchor.get_i32("startLine").unwrap(), 2);
         assert_eq!(anchor.get_i32("endLine").unwrap(), 2);
         assert_eq!(anchor.get_str("sourceQuote").unwrap(), "这是引文段落");
-        assert!(!anchor.contains_key("documentId"), "未传 document_id 不应写入");
+        assert!(
+            !anchor.contains_key("documentId"),
+            "未传 document_id 不应写入"
+        );
     }
 
     #[test]

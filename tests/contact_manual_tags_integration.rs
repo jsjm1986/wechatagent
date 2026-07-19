@@ -94,7 +94,11 @@ fn normalize_trims_dedups_preserves_order() {
         "   ".to_string(), // 纯空白→去掉
     ];
     let out = normalize_manual_tags(&raw);
-    assert_eq!(out, vec!["VIP".to_string(), "高意向".to_string()], "去空白+去空串+去重保序");
+    assert_eq!(
+        out,
+        vec!["VIP".to_string(), "高意向".to_string()],
+        "去空白+去空串+去重保序"
+    );
 }
 
 #[test]
@@ -103,7 +107,9 @@ fn validate_rejects_too_many_tags() {
         .map(|i| format!("tag{i}"))
         .collect();
     assert!(validate_manual_tags(&many).is_err(), "超条数上限必须 400");
-    let ok: Vec<String> = (0..MANUAL_TAGS_MAX_COUNT).map(|i| format!("tag{i}")).collect();
+    let ok: Vec<String> = (0..MANUAL_TAGS_MAX_COUNT)
+        .map(|i| format!("tag{i}"))
+        .collect();
     assert!(validate_manual_tags(&ok).is_ok(), "恰好上限应放行");
 }
 
@@ -186,8 +192,5 @@ async fn update_manual_tags_cross_workspace_not_found() {
         ),
     )
     .await;
-    assert!(
-        result.is_err(),
-        "跨 workspace 改 manual_tags 必须 NotFound"
-    );
+    assert!(result.is_err(), "跨 workspace 改 manual_tags 必须 NotFound");
 }

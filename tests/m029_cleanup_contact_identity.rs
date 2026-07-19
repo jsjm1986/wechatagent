@@ -37,7 +37,11 @@ async fn cleans_up_stale_contact_identity() {
         .db
         .raw()
         .collection::<Document>("conversation_messages");
-    let rosters = app.state.db.raw().collection::<Document>("roster_snapshots");
+    let rosters = app
+        .state
+        .db
+        .raw()
+        .collection::<Document>("roster_snapshots");
 
     // 一条 roster 快照：真人 wxid_real 有正确昵称/头像；wxid_demi 不在 roster（未命中）。
     rosters
@@ -185,9 +189,7 @@ async fn cleans_up_stale_contact_identity() {
     assert_eq!(msg_count, 1, "被删 contact 的历史消息必须保留");
 
     // (C) 真人 roster 命中 → nickname/avatar_url 回填正确，未删。
-    let c = raw_contact(&app, "wxid_real")
-        .await
-        .expect("C: 真人应保留");
+    let c = raw_contact(&app, "wxid_real").await.expect("C: 真人应保留");
     assert_eq!(
         c.get_str("nickname").ok(),
         Some("真实客户"),
@@ -200,9 +202,7 @@ async fn cleans_up_stale_contact_identity() {
     );
 
     // (D) roster 未命中 + Demi → nickname $unset（字段不存在）。
-    let d = raw_contact(&app, "wxid_demi")
-        .await
-        .expect("D: 真人应保留");
+    let d = raw_contact(&app, "wxid_demi").await.expect("D: 真人应保留");
     assert!(
         !d.contains_key("nickname"),
         "D: Demi 未命中应 $unset nickname"

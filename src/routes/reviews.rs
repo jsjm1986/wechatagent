@@ -198,8 +198,14 @@ mod tests {
         let v = autonomy_protocol_from_decision(&decision).expect("some");
         let obj = v.as_object().expect("object");
         assert_eq!(obj.len(), 9);
-        assert_eq!(obj.get("whyShouldReply").and_then(|x| x.as_str()), Some("用户主动询问，及时回应推进决策"));
-        assert_eq!(obj.get("userUnderstanding").and_then(|x| x.as_str()), Some(""));
+        assert_eq!(
+            obj.get("whyShouldReply").and_then(|x| x.as_str()),
+            Some("用户主动询问，及时回应推进决策")
+        );
+        assert_eq!(
+            obj.get("userUnderstanding").and_then(|x| x.as_str()),
+            Some("")
+        );
         assert_eq!(obj.get("riskSelfCheck").and_then(|x| x.as_str()), Some(""));
     }
 }

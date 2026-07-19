@@ -89,8 +89,10 @@ pub async fn generate(
 
     // 1. 把 cohort 内每条 run 拉出来，按 gate 累加命中数。
     let mut total_runs = 0_u64;
-    let mut hit_counts: HashMap<&'static str, u64> =
-        THRESHOLD_REASONABLE_BANDS.iter().map(|(k, _, _)| (*k, 0)).collect();
+    let mut hit_counts: HashMap<&'static str, u64> = THRESHOLD_REASONABLE_BANDS
+        .iter()
+        .map(|(k, _, _)| (*k, 0))
+        .collect();
     let mut cursor = state
         .db
         .agent_run_logs()
@@ -262,7 +264,10 @@ async fn load_gate_cooldowns(
     workspace_id: &str,
     account_id: &str,
 ) -> Result<std::collections::HashSet<String>, EvolutionError> {
-    let cooldown_hours = state.config.evolution_threshold_release_cooldown_hours.max(1) as i64;
+    let cooldown_hours = state
+        .config
+        .evolution_threshold_release_cooldown_hours
+        .max(1) as i64;
     let now_ms = DateTime::now().timestamp_millis();
     let since = DateTime::from_millis(now_ms.saturating_sub(cooldown_hours * 3600 * 1000));
     let mut cursor = state
@@ -388,7 +393,10 @@ mod tests {
             classify_gate_hit("blocked_unverified_product_claim"),
             Some("product_accuracy_score_block")
         );
-        assert_eq!(classify_gate_hit("held_by_ai_policy"), Some("fact_risk_block"));
+        assert_eq!(
+            classify_gate_hit("held_by_ai_policy"),
+            Some("fact_risk_block")
+        );
         assert_eq!(
             classify_gate_hit("blocked_by_safety_guard"),
             Some("pressure_risk_block")

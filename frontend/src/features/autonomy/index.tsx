@@ -65,9 +65,11 @@ export function AutonomyOutcomesTab({ accountId }: { accountId?: string }) {
       sent: number;
       canceled: number;
       failedTerminal: number;
+      deliveryUnknown: number;
       sendSuccessRate: number | null;
       canceledRate: number | null;
       failedTerminalRate: number | null;
+      deliveryUnknownRate: number | null;
     };
     /** M3 / Task 70：Planner 三段 tick / emit / capped / backoff 计数。 */
     planner?: PlannerSection;
@@ -208,9 +210,11 @@ export function AutonomyOutcomesTab({ accountId }: { accountId?: string }) {
                   <th>已送达</th>
                   <th>已取消</th>
                   <th>终态失败</th>
+                  <th>送达待核验</th>
                   <th>送达率</th>
                   <th>取消率</th>
                   <th>失败率</th>
+                  <th>待核验率</th>
                 </tr>
               </thead>
               <tbody>
@@ -219,9 +223,11 @@ export function AutonomyOutcomesTab({ accountId }: { accountId?: string }) {
                   <td>{ob?.sent ?? 0}</td>
                   <td>{ob?.canceled ?? 0}</td>
                   <td>{ob?.failedTerminal ?? 0}</td>
+                  <td>{ob?.deliveryUnknown ?? 0}</td>
                   <td>{formatRate(ob?.sendSuccessRate ?? null)}</td>
                   <td>{formatRate(ob?.canceledRate ?? null)}</td>
                   <td>{formatRate(ob?.failedTerminalRate ?? null)}</td>
+                  <td>{formatRate(ob?.deliveryUnknownRate ?? null)}</td>
                 </tr>
               </tbody>
             </table>

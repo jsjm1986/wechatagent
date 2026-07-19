@@ -259,7 +259,10 @@ fn review_pass_json() -> serde_json::Value {
 }
 
 /// 读出本 proposal 写下的唯一一条 shadow_replays 行。
-async fn fetch_replay(state: &AppState, proposal_id: ObjectId) -> wechatagent::models::ShadowReplay {
+async fn fetch_replay(
+    state: &AppState,
+    proposal_id: ObjectId,
+) -> wechatagent::models::ShadowReplay {
     state
         .db
         .shadow_replays()
@@ -304,7 +307,8 @@ async fn run_shadow_replay_prompt_completed_fills_both_sides() {
         .await
         .expect("insert source run log");
 
-    let proposal = make_prompt_proposal(TARGET_KEY, "补充：本行业语气更稳重，先确认优先级再给建议。");
+    let proposal =
+        make_prompt_proposal(TARGET_KEY, "补充：本行业语气更稳重，先确认优先级再给建议。");
     let proposal_id = proposal.id.expect("proposal id present");
 
     // shadow 内部：知识库为空 → 路由 0 次 LLM；decide_reply 1 次 + review_decision 1 次。
@@ -323,8 +327,15 @@ async fn run_shadow_replay_prompt_completed_fills_both_sides() {
     );
 
     let replay = fetch_replay(&app.state, proposal_id).await;
-    assert_eq!(replay.status, "completed", "shadow_replay 应 completed，实际 {:?}", replay);
-    assert!(replay.failure_reason.is_none(), "completed 不应带 failure_reason");
+    assert_eq!(
+        replay.status, "completed",
+        "shadow_replay 应 completed，实际 {:?}",
+        replay
+    );
+    assert!(
+        replay.failure_reason.is_none(),
+        "completed 不应带 failure_reason"
+    );
     assert!(
         !replay.original_5gate_hit.is_empty(),
         "G4：源 run review.scores 应推回非空的 original_5gate_hit，实际 {:?}",
@@ -343,7 +354,10 @@ async fn run_shadow_replay_prompt_completed_fills_both_sides() {
         replay.new_self_critique_addressed.is_some(),
         "新侧 selfCritiqueAddressed 应从 review 读出"
     );
-    assert_eq!(replay.source_run_id, source_run_id, "source_run_id 透传一致");
+    assert_eq!(
+        replay.source_run_id, source_run_id,
+        "source_run_id 透传一致"
+    );
 }
 
 /// source_message_unavailable：source_event_id 指向不存在的 message。
@@ -388,7 +402,11 @@ async fn run_shadow_replay_prompt_failed_when_message_missing() {
     );
 
     let replay = fetch_replay(&app.state, proposal_id).await;
-    assert_eq!(replay.status, "failed", "message 缺失应 failed，实际 {:?}", replay);
+    assert_eq!(
+        replay.status, "failed",
+        "message 缺失应 failed，实际 {:?}",
+        replay
+    );
     assert_eq!(
         replay.failure_reason.as_deref(),
         Some("source_message_unavailable"),
@@ -435,7 +453,11 @@ async fn run_shadow_replay_prompt_failed_when_contact_missing() {
         .expect("run_shadow_replay ok（failed 是业务结果而非 Err）");
 
     let replay = fetch_replay(&app.state, proposal_id).await;
-    assert_eq!(replay.status, "failed", "contact 缺失应 failed，实际 {:?}", replay);
+    assert_eq!(
+        replay.status, "failed",
+        "contact 缺失应 failed，实际 {:?}",
+        replay
+    );
     assert_eq!(
         replay.failure_reason.as_deref(),
         Some("contact_unavailable"),

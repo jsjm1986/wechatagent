@@ -18,23 +18,15 @@ use mongodb::bson::doc;
 use proptest::prelude::*;
 #[allow(deprecated)] // task 6.3：保留兼容别名调用以验证语义等价性。
 use wechatagent::agent::compact_memory_card_typed;
-use wechatagent::agent::compact_memory_card_with_previous;
 use wechatagent::agent::compact_memory_card_with_dimensions;
+use wechatagent::agent::compact_memory_card_with_previous;
 use wechatagent::models::{MemoryCardTyped, MemoryDimension, MemoryFactRepr};
 
 /// 用 `Vec<String>` 构造 typed 形态的 memoryCard（core / recent 各自）。
 fn typed_card_with_core_recent(core: &[String], recent: &[String]) -> MemoryCardTyped {
     MemoryCardTyped {
-        core_facts: core
-            .iter()
-            .cloned()
-            .map(MemoryFactRepr::Plain)
-            .collect(),
-        recent_facts: recent
-            .iter()
-            .cloned()
-            .map(MemoryFactRepr::Plain)
-            .collect(),
+        core_facts: core.iter().cloned().map(MemoryFactRepr::Plain).collect(),
+        recent_facts: recent.iter().cloned().map(MemoryFactRepr::Plain).collect(),
         ..Default::default()
     }
 }
@@ -170,8 +162,14 @@ fn previous_core_fact_persists_after_compact_when_under_cap() {
     let new = typed_card_with_core_recent(&["baz".to_string()], &[]);
     let result = compact_memory_card_with_previous(&new, Some(&prev), &[]);
     let cores = texts(&result.core_facts);
-    assert!(cores.contains(&"foo".to_string()), "foo 必须保留: {cores:?}");
-    assert!(cores.contains(&"bar".to_string()), "bar 必须保留: {cores:?}");
+    assert!(
+        cores.contains(&"foo".to_string()),
+        "foo 必须保留: {cores:?}"
+    );
+    assert!(
+        cores.contains(&"bar".to_string()),
+        "bar 必须保留: {cores:?}"
+    );
     assert!(
         cores.contains(&"baz".to_string()),
         "新 fact baz 必须存在: {cores:?}"
@@ -182,8 +180,7 @@ fn previous_core_fact_persists_after_compact_when_under_cap() {
 fn discarded_fact_is_dropped() {
     let prev = typed_card_with_core_recent(&["foo".to_string(), "bar".to_string()], &[]);
     let new = typed_card_with_core_recent(&[], &[]);
-    let result =
-        compact_memory_card_with_previous(&new, Some(&prev), &["foo".to_string()]);
+    let result = compact_memory_card_with_previous(&new, Some(&prev), &["foo".to_string()]);
     let cores = texts(&result.core_facts);
     assert!(
         !cores.contains(&"foo".to_string()),
@@ -371,14 +368,32 @@ fn emotional_companion_profile_memory_dimensions_end_to_end() {
 
     // ① cap 截断：三槽各按自己的 cap 截留（防无界增长）。
     let mut extra = mongodb::bson::Document::new();
-    extra.insert("emotionHistory", (0..30).map(|i| format!("e{i}")).collect::<Vec<_>>());
-    extra.insert("anniversaries", (0..30).map(|i| format!("a{i}")).collect::<Vec<_>>());
-    extra.insert("importantEvents", (0..30).map(|i| format!("v{i}")).collect::<Vec<_>>());
-    let card = MemoryCardTyped { extra, ..Default::default() };
+    extra.insert(
+        "emotionHistory",
+        (0..30).map(|i| format!("e{i}")).collect::<Vec<_>>(),
+    );
+    extra.insert(
+        "anniversaries",
+        (0..30).map(|i| format!("a{i}")).collect::<Vec<_>>(),
+    );
+    extra.insert(
+        "importantEvents",
+        (0..30).map(|i| format!("v{i}")).collect::<Vec<_>>(),
+    );
+    let card = MemoryCardTyped {
+        extra,
+        ..Default::default()
+    };
     let compacted = compact_memory_card_with_dimensions(&card, None, &[], &emotional_dims);
-    assert_eq!(compacted.extra.get_array("emotionHistory").unwrap().len(), 10);
+    assert_eq!(
+        compacted.extra.get_array("emotionHistory").unwrap().len(),
+        10
+    );
     assert_eq!(compacted.extra.get_array("anniversaries").unwrap().len(), 5);
-    assert_eq!(compacted.extra.get_array("importantEvents").unwrap().len(), 8);
+    assert_eq!(
+        compacted.extra.get_array("importantEvents").unwrap().len(),
+        8
+    );
 
     // ② candidate type 派生：candidate_type=true 的情绪史/重要事件进合法集，
     // 纪念日（false）不进；fact/conflict 固定派生；销售槽（preferences 等）不出现。
@@ -386,10 +401,15 @@ fn emotional_companion_profile_memory_dimensions_end_to_end() {
     assert!(guidance.contains("emotionHistory"));
     assert!(guidance.contains("importantEvents"));
     assert!(guidance.contains("fact") && guidance.contains("conflict"));
-    assert!(!guidance.contains("anniversaries"), "candidate_type=false 不进候选 type");
-    assert!(!guidance.contains("objection"), "销售槽不应出现在情感 profile 候选 type");
+    assert!(
+        !guidance.contains("anniversaries"),
+        "candidate_type=false 不进候选 type"
+    );
+    assert!(
+        !guidance.contains("objection"),
+        "销售槽不应出现在情感 profile 候选 type"
+    );
 }
-
 
 // ── agent-autonomy-loop W5 / Task 6.8 扩展 ─────────────────────────────
 
@@ -451,12 +471,15 @@ fn full_card_round_trip_preserves_extra_fields() {
     let doc = to_document(&card).expect("serialize");
     // 回归断言：序列化后顶层不应同时出现两份 coreProfile/relationshipState。
     assert_eq!(doc.iter().filter(|(k, _)| *k == "coreProfile").count(), 1);
-    assert_eq!(doc.iter().filter(|(k, _)| *k == "relationshipState").count(), 1);
+    assert_eq!(
+        doc.iter()
+            .filter(|(k, _)| *k == "relationshipState")
+            .count(),
+        1
+    );
     let back: MemoryCardTyped = from_document(doc).expect("deserialize");
     assert_eq!(
-        back.extra
-            .get_str("custom_field")
-            .ok(),
+        back.extra.get_str("custom_field").ok(),
         Some("未识别字段也应保留")
     );
     assert_eq!(

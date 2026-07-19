@@ -115,7 +115,8 @@ pub(super) async fn approve_relationship_suggestion(
     // 抽内部 fn 后 REST handler 只负责包 Response，业务逻辑全在 inner——
     // 与管理 Agent 工具分支共用同一份校验 + 写 contact + 改状态流程，行为等价。
     let value =
-        approve_relationship_suggestion_inner(&state, &admin.current_workspace, &id, payload).await?;
+        approve_relationship_suggestion_inner(&state, &admin.current_workspace, &id, payload)
+            .await?;
     Ok(Json(value).into_response())
 }
 
@@ -256,7 +257,9 @@ pub(super) async fn reject_relationship_suggestion(
         .find_one(doc! { "_id": object_id }, None)
         .await?
         .ok_or_else(|| AppError::NotFound("suggestion not found".to_string()))?;
-    Ok(Json(json!({ "item": relationship_suggestion_json(updated) })))
+    Ok(Json(
+        json!({ "item": relationship_suggestion_json(updated) }),
+    ))
 }
 
 pub(super) fn relationship_suggestion_json(item: RelationshipTypeSuggestion) -> Value {
@@ -375,9 +378,6 @@ mod tests {
             reviewed_by: Some("admin-1".to_string()),
         };
         let value = relationship_suggestion_json(item);
-        crate::routes::contract_snapshot::assert_contract_fixture(
-            "relationship_suggestion",
-            value,
-        );
+        crate::routes::contract_snapshot::assert_contract_fixture("relationship_suggestion", value);
     }
 }

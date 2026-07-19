@@ -313,16 +313,14 @@ pub(super) async fn run_formula_adherence_evaluation(
             }));
             continue;
         }
-        let contact = base_contact
-            .clone()
-            .unwrap_or_else(|| {
-                scenario_contact_from_seed(
-                    &admin.current_workspace,
-                    &payload.account_id,
-                    &scenario,
-                    &seed_initial_state,
-                )
-            });
+        let contact = base_contact.clone().unwrap_or_else(|| {
+            scenario_contact_from_seed(
+                &admin.current_workspace,
+                &payload.account_id,
+                &scenario,
+                &seed_initial_state,
+            )
+        });
         let turns = match agent::simulate_user_dialogue(&state, contact, messages).await {
             Ok(t) => t,
             Err(err) => {
@@ -337,9 +335,14 @@ pub(super) async fn run_formula_adherence_evaluation(
         // 用 evaluation 启动后的 agent_run_logs 时间戳过滤当前场景的子 run。
         // 简化处理：累加自评测开始至今的所有 run（多场景共享 account），
         // 不会重复计数因为我们每次循环之后才做一次累加。
-        let scenario_tokens = sum_scenario_tokens(&state, &admin.current_workspace, &payload.account_id, evaluation_started_at)
-            .await
-            .saturating_sub(total_tokens_used);
+        let scenario_tokens = sum_scenario_tokens(
+            &state,
+            &admin.current_workspace,
+            &payload.account_id,
+            evaluation_started_at,
+        )
+        .await
+        .saturating_sub(total_tokens_used);
         total_tokens_used = total_tokens_used.saturating_add(scenario_tokens);
 
         let last = turns.last();
@@ -460,7 +463,12 @@ pub(super) async fn run_formula_adherence_evaluation(
 }
 
 /// 波 C2：累加从 `since` 起到现在 evaluation 这个 account 上的所有 agent_run_logs.tokens_used。
-async fn sum_scenario_tokens(state: &AppState, workspace_id: &str, account_id: &str, since: DateTime) -> i64 {
+async fn sum_scenario_tokens(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+    since: DateTime,
+) -> i64 {
     let mut total = 0_i64;
     let Ok(mut cur) = state
         .db

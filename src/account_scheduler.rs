@@ -355,7 +355,10 @@ mod tests {
         assert!(is_in_off_hours(&ranges, hour_in_offset(utc_midnight_ms, 0)));
         // 正确用 +8 偏移：本地 08:00,不在任何 off 区间（修复后行为）。
         assert_eq!(hour_in_offset(utc_midnight_ms, 8), 8);
-        assert!(!is_in_off_hours(&ranges, hour_in_offset(utc_midnight_ms, 8)));
+        assert!(!is_in_off_hours(
+            &ranges,
+            hour_in_offset(utc_midnight_ms, 8)
+        ));
     }
 
     #[test]
@@ -377,7 +380,9 @@ mod tests {
         let mut acc1 = 0;
         let mut acc2 = 0;
         for i in 0..200 {
-            let pick = stable_pick(&pool, &format!("wxid_{}", i)).account_id.clone();
+            let pick = stable_pick(&pool, &format!("wxid_{}", i))
+                .account_id
+                .clone();
             if pick == "acc_1" {
                 acc1 += 1;
             } else {

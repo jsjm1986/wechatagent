@@ -210,7 +210,10 @@ async fn image_import_with_empty_vision_output_yields_no_chunk() {
     let body = resp.0;
 
     assert!(
-        body["chunkIds"].as_array().map(|a| a.is_empty()).unwrap_or(false),
+        body["chunkIds"]
+            .as_array()
+            .map(|a| a.is_empty())
+            .unwrap_or(false),
         "空 fence 不应产 chunk: {body:?}",
     );
     let count = app

@@ -9,9 +9,7 @@ use axum::Router;
 use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
 use reqwest::StatusCode;
 use tokio::net::TcpListener;
-use wechatagent::auth::session::{
-    authenticate, bootstrap_admin_if_needed, create_session,
-};
+use wechatagent::auth::session::{authenticate, bootstrap_admin_if_needed, create_session};
 use wechatagent::auth::SESSION_COOKIE_NAME;
 use wechatagent::models::{
     AgentStatus, Contact, TaxonomyCandidate, TaxonomyEntry, TaxonomyValue,
@@ -50,9 +48,7 @@ async fn start_api(app: &TestApp) -> (String, String, tokio::task::JoinHandle<()
         .nest("/api", api_router(app.state.clone()))
         .with_state(app.state.clone());
     let server = tokio::spawn(async move {
-        axum::serve(listener, router)
-            .await
-            .expect("serve test API");
+        axum::serve(listener, router).await.expect("serve test API");
     });
     (
         format!("http://{address}/api"),
@@ -395,7 +391,10 @@ async fn guide_apply_rolls_back_all_writes_and_retries_once() {
         .expect("load playbook after rollback")
         .expect("playbook exists");
     assert_eq!(failed_playbook.version, 1);
-    assert_ne!(failed_playbook.reply_style.as_deref(), Some("committed style"));
+    assert_ne!(
+        failed_playbook.reply_style.as_deref(),
+        Some("committed style")
+    );
     let failed_preview = app
         .state
         .db
@@ -406,7 +405,10 @@ async fn guide_apply_rolls_back_all_writes_and_retries_once() {
         .expect("load failed preview")
         .expect("preview exists");
     assert_eq!(failed_preview.get_str("status").ok(), Some("failed"));
-    assert_eq!(failed_preview.get_i32("apply_protocol_version").ok(), Some(2));
+    assert_eq!(
+        failed_preview.get_i32("apply_protocol_version").ok(),
+        Some(2)
+    );
 
     app.state
         .db

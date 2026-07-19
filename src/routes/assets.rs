@@ -155,7 +155,9 @@ pub(super) async fn create_content_asset(
         requires_principal_approval: None,
         review_status: None,
         review_note: None,
-        min_inject_tier: Some(normalize_min_inject_tier(payload.min_inject_tier.as_deref())),
+        min_inject_tier: Some(normalize_min_inject_tier(
+            payload.min_inject_tier.as_deref(),
+        )),
         created_at: DateTime::now(),
         updated_at: DateTime::now(),
     };

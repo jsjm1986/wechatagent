@@ -61,7 +61,10 @@ async fn chat_apply_create_forces_draft_needs_review() {
         .expect("查 chunk")
         .expect("chunk 应存在");
 
-    assert_eq!(chunk.status, "draft", "落库瞬间 status 必须 draft(AI 永不自动 verify)");
+    assert_eq!(
+        chunk.status, "draft",
+        "落库瞬间 status 必须 draft(AI 永不自动 verify)"
+    );
     assert_eq!(
         chunk.integrity_status.as_deref(),
         Some("needs_review"),

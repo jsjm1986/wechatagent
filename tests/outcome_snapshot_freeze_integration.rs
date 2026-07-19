@@ -113,7 +113,11 @@ fn active_product(ws: &str, product_id: &str, name: &str, price: i64) -> Product
 }
 
 /// seed 一条 pending 待核实信号，返回其 _id 的 hex。
-async fn seed_pending_signal(state: &wechatagent::routes::AppState, ws: &str, contact_id: &str) -> String {
+async fn seed_pending_signal(
+    state: &wechatagent::routes::AppState,
+    ws: &str,
+    contact_id: &str,
+) -> String {
     let now = DateTime::now();
     let signal = SuspectedDealSignal {
         id: None,
@@ -207,7 +211,11 @@ async fn outcome_product_ref_freezes_snapshot_and_survives_later_price_change() 
         .expect("给定 product_id 时 product_ref 必须为 Some（快照已冻结）");
     assert_eq!(product_ref.product_id, "annual-vip");
     assert_eq!(product_ref.name, "年度会员", "name 应冻结成交当时值");
-    assert_eq!(product_ref.unit_price, Some(19900), "unit_price 应冻结产品当时 price");
+    assert_eq!(
+        product_ref.unit_price,
+        Some(19900),
+        "unit_price 应冻结产品当时 price"
+    );
     assert_eq!(product_ref.sku.as_deref(), Some("VIP-Y"), "sku 应冻结");
     // approve 路径 quantity 恒 None → 默认冻结为 1（unwrap_or(1).max(1)）。
     assert_eq!(product_ref.quantity, 1, "quantity 无输入时冻结为默认 1");
@@ -252,5 +260,9 @@ async fn outcome_product_ref_freezes_snapshot_and_survives_later_price_change() 
         Some(19900),
         "红线：产品改价后历史成交快照 unit_price 不得漂移（19900 而非 99900）"
     );
-    assert_eq!(frozen.entitlement_days, Some(365), "红线：entitlement_days 快照不漂移");
+    assert_eq!(
+        frozen.entitlement_days,
+        Some(365),
+        "红线：entitlement_days 快照不漂移"
+    );
 }

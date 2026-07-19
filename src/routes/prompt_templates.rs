@@ -104,8 +104,11 @@ pub(super) async fn create_prompt_template(
     // #2 修复：create 与 update 对齐，过字面双闸（禁用词 + 锚完整性）。
     // create 是写入全新整篇内容，对整篇过双闸语义正确；不加 LLM 第三闸
     //（无 old 基线做 diff，且该 draft 最终须经 publish，publish 关口兜 LLM 闸）。
-    crate::routes::management_prompt_edit::validate_prompt_edit(&payload.prompt_key, &payload.content)
-        .map_err(AppError::BadRequest)?;
+    crate::routes::management_prompt_edit::validate_prompt_edit(
+        &payload.prompt_key,
+        &payload.content,
+    )
+    .map_err(AppError::BadRequest)?;
     let latest = state
         .db
         .prompt_templates()
@@ -161,8 +164,11 @@ pub(super) async fn update_prompt_template(
     validate_prompt_template_input(&payload)?;
     // 自然语言编辑硬门（fail-closed）：三层分级 + 字面双闸（禁用词 + 锚完整性）。
     // 单点拦截——无论走管理 agent 工具还是管理员直接 PUT，命中即拒、不落库。
-    crate::routes::management_prompt_edit::validate_prompt_edit(&payload.prompt_key, &payload.content)
-        .map_err(AppError::BadRequest)?;
+    crate::routes::management_prompt_edit::validate_prompt_edit(
+        &payload.prompt_key,
+        &payload.content,
+    )
+    .map_err(AppError::BadRequest)?;
     let object_id = parse_object_id(&id)?;
     // Task 6.6 第三闸：LLM 红线语义审查（审 diff 增量）。force=true 跳过（管理者已逐字核对）。
     let force = payload.force.unwrap_or(false);

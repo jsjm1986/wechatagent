@@ -200,7 +200,7 @@ pub(crate) async fn send_outbound_media(
     state: &AppState,
     contact: &crate::models::Contact,
     asset_id: &str,
-) -> AppResult<Value> {
+) -> Result<Value, super::types::OutboundSendError> {
     let oid =
         ObjectId::parse_str(asset_id).map_err(|_| AppError::External("bad asset_id".into()))?;
     let asset = state
@@ -216,24 +216,25 @@ pub(crate) async fn send_outbound_media(
 
     // 发送前准入二次校验（防 AI 幻觉出未审/不可发素材一路漏到发送）。
     if !validate_asset_sendable(&asset) {
-        return Err(AppError::External(
-            "asset not sendable (draft/disabled/bad type)".into(),
-        ));
+        return Err(
+            AppError::External("asset not sendable (draft/disabled/bad type)".into()).into(),
+        );
     }
     let tool = mcp_tool_for_media_type(asset.media_type.as_deref().unwrap_or(""))
         .ok_or_else(|| AppError::External("unsupported media_type".into()))?;
     let media_id = ensure_media_uploaded(state, &asset).await?;
 
-    let resp = crate::mcp::logged_call_for_account(
+    let resp = crate::mcp::logged_send_call_for_account(
         state,
         &contact.account_id,
         tool,
         json!({ "recipient": contact.wxid, "mediaId": media_id }),
     )
-    .await?;
+    .await
+    .map_err(super::types::OutboundSendError::from)?;
 
     if !super::gateway::send_receipt_is_ok(&resp) {
-        return Err(AppError::External(
+        return Err(super::types::OutboundSendError::SafeToRetry(
             "media send returned a negative or unverifiable delivery receipt".into(),
         ));
     }
@@ -280,35 +281,35 @@ pub(crate) async fn send_outbound_media(
     Ok(resp)
 }
 
-/// 媒体条目崩溃恢复核对（硬伤④）：`mcp_already_succeeded` 写死 text 工具 + 按
-/// content 匹配，对媒体条目（content 空、tool 为 message_send_*）会查不到 → 误判
-/// 没发过 → 重发文件骚扰客户。本函数按 **media_id** 定位该 asset 的成功发送记录。
+/// 媒体条目崩溃恢复核对（硬伤④）：按 **media_id** 定位该 asset 的成功发送记录。
 ///
 /// 可靠性依据：素材发送前必走 `ensure_media_uploaded`，它在 send 之前把 media_id
 /// 回写到 `content_assets`，且 MCP send 请求体携带 `request.mediaId`。故：
-/// - asset.media_id 为 None ⇒ 从未上传 ⇒ 不可能发出过 ⇒ 返回 false（放行发送）；
-/// - asset.media_id 为 Some ⇒ 查 `mcp_call_logs` 里 tool ∈ 媒体工具集 + 同 recipient
-///   + `request.mediaId` == 该 media_id + `error=null` + 时间窗内的成功记录。
-async fn mcp_media_already_succeeded(
+/// - asset.media_id 为 None ⇒ 从未完成上传回写 ⇒ 客户投递不可能发生；
+/// - asset.media_id 为 Some 且命中成功日志 ⇒ 已送达；
+/// - asset.media_id 为 Some 但本地日志未命中 ⇒ 本地日志不是权威远端查询，只能判
+///   `Inconclusive`，禁止把“缺证据”误作“确认未送达”而重发。
+async fn mcp_media_delivery_verification(
     state: &AppState,
     account_id: &str,
     contact_wxid: &str,
     asset_id: &str,
     entry_created_at: DateTime,
-) -> AppResult<bool> {
+) -> AppResult<super::types::DeliveryVerification> {
+    use super::types::DeliveryVerification;
     let oid = match ObjectId::parse_str(asset_id) {
         Ok(o) => o,
-        Err(_) => return Ok(false),
+        Err(_) => return Ok(DeliveryVerification::NotDelivered),
     };
     let asset = state
         .db
         .content_assets()
         .find_one(doc! { "_id": oid }, None)
         .await?;
-    // media_id 缺失 ⇒ 不可能发出过（send 必先 upload 回写 media_id）⇒ 安全放行。
+    // media_id 缺失 ⇒ send 的客户投递步骤尚不可能发生 ⇒ 安全放行。
     let media_id = match asset.and_then(|a| a.media_id) {
         Some(m) => m,
-        None => return Ok(false),
+        None => return Ok(DeliveryVerification::NotDelivered),
     };
     let lower_bound_millis = entry_created_at
         .timestamp_millis()
@@ -336,19 +337,23 @@ async fn mcp_media_already_succeeded(
             None,
         )
         .await?;
-    Ok(count > 0)
+    Ok(if count > 0 {
+        DeliveryVerification::Delivered
+    } else {
+        DeliveryVerification::Inconclusive
+    })
 }
 
-/// dispatcher 在媒体条目崩溃恢复 / timeout 分支调用：核对该素材是否已发出。
-/// 见 [`mcp_media_already_succeeded`] 的可靠性依据。
-pub(crate) async fn media_already_succeeded(
+/// dispatcher 在媒体条目崩溃恢复 / timeout / 歧义错误分支调用。
+pub(crate) async fn media_delivery_verification(
     state: &AppState,
     account_id: &str,
     contact_wxid: &str,
     asset_id: &str,
     entry_created_at: DateTime,
-) -> AppResult<bool> {
-    mcp_media_already_succeeded(state, account_id, contact_wxid, asset_id, entry_created_at).await
+) -> AppResult<super::types::DeliveryVerification> {
+    mcp_media_delivery_verification(state, account_id, contact_wxid, asset_id, entry_created_at)
+        .await
 }
 
 #[cfg(test)]

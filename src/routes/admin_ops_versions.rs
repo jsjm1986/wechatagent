@@ -99,8 +99,9 @@ async fn insert_new_current_domain_config(
         None,
     )
     .await?;
-    inserted_id
-        .ok_or_else(|| AppError::External("inserted operation domain config has no _id".to_string()))
+    inserted_id.ok_or_else(|| {
+        AppError::External("inserted operation domain config has no _id".to_string())
+    })
 }
 
 pub(super) async fn publish_operation_domain_version(
@@ -122,11 +123,8 @@ pub(super) async fn publish_operation_domain_version(
         "workspace_id": &source.workspace_id,
         "domain": &source.domain,
     };
-    let next_version = next_version_for_scope(
-        state.db.operation_domain_configs(),
-        scope.clone(),
-    )
-    .await?;
+    let next_version =
+        next_version_for_scope(state.db.operation_domain_configs(), scope.clone()).await?;
     let now = DateTime::now();
     let inserted_id = insert_new_current_domain_config(
         &coll,
@@ -315,7 +313,11 @@ pub(crate) async fn reconcile_state_policies_for_machine(
                     previous_version: None,
                     seeded_by: Some(policy_seeded_by.to_string()),
                 };
-                if let Err(err) = db.operation_state_policies().insert_one(&policy, None).await {
+                if let Err(err) = db
+                    .operation_state_policies()
+                    .insert_one(&policy, None)
+                    .await
+                {
                     tracing::warn!(
                         workspace_id,
                         domain,
@@ -607,11 +609,8 @@ pub(super) async fn publish_operation_state_policy_version(
         "domain": &source.domain,
         "state_key": &source.state_key,
     };
-    let next_version = next_version_for_scope(
-        state.db.operation_state_policies(),
-        scope.clone(),
-    )
-    .await?;
+    let next_version =
+        next_version_for_scope(state.db.operation_state_policies(), scope.clone()).await?;
     let now = DateTime::now();
     let new_entry = OperationStatePolicy {
         id: None,
@@ -762,11 +761,8 @@ pub async fn publish_taxonomy_version(
         "kind": &source.kind,
         "value.id": &source.value.id,
     };
-    let next_version = next_version_for_scope(
-        state.db.collection_system_taxonomies(),
-        scope.clone(),
-    )
-    .await?;
+    let next_version =
+        next_version_for_scope(state.db.collection_system_taxonomies(), scope.clone()).await?;
     let now = DateTime::now();
     let new_entry = TaxonomyEntry {
         id: None,
@@ -793,7 +789,7 @@ pub async fn publish_taxonomy_version(
         None,
     )
     .await?;
-    invalidate_global_taxonomy_cache();
+    invalidate_global_taxonomy_cache(&state.db);
     audit_taxonomy_change(&state, &admin, "publish", &new_entry).await;
     Ok(Json(json!({
         "ok": true,
@@ -836,7 +832,7 @@ pub async fn rollout_taxonomy_version(
         None,
     )
     .await?;
-    invalidate_global_taxonomy_cache();
+    invalidate_global_taxonomy_cache(&state.db);
     audit_taxonomy_change(&state, &admin, "rollout", &target).await;
     Ok(Json(json!({ "ok": true, "version": target.version })))
 }
@@ -897,7 +893,7 @@ pub async fn rollback_taxonomy_version(
         None,
     )
     .await?;
-    invalidate_global_taxonomy_cache();
+    invalidate_global_taxonomy_cache(&state.db);
     audit_taxonomy_change(&state, &admin, "rollback", &prev).await;
     Ok(Json(json!({ "ok": true, "rolledBackTo": prev_version })))
 }
@@ -906,10 +902,7 @@ pub async fn rollback_taxonomy_version(
 ///
 /// 通用化以避免三表三份重复实现。`T` 必须是携带 `version: i32` 的 BSON struct，
 /// 这里只读 `version` 字段；其他字段反序列化时由各自的 `serde(default)` 处理。
-async fn next_version_for_scope<T>(
-    coll: mongodb::Collection<T>,
-    scope: Document,
-) -> AppResult<i32>
+async fn next_version_for_scope<T>(coll: mongodb::Collection<T>, scope: Document) -> AppResult<i32>
 where
     T: serde::de::DeserializeOwned + Sync + Send + Unpin,
 {
@@ -1052,7 +1045,10 @@ mod tests {
     #[test]
     fn rollback_rejects_when_no_previous_version() {
         let target_prev: Option<i32> = None;
-        assert!(target_prev.is_none(), "无 previous_version 时 rollback 应被拒绝");
+        assert!(
+            target_prev.is_none(),
+            "无 previous_version 时 rollback 应被拒绝"
+        );
     }
 
     /// H13 (2)：`is_refreshable_policy_seeded_by` 区分机器派生行（可刷新）与手工行（保留）。
@@ -1060,13 +1056,18 @@ mod tests {
     fn refreshable_seeded_by_classifies_machine_vs_operator() {
         use super::is_refreshable_policy_seeded_by;
         // 机器派生 / 可安全刷新
-        assert!(is_refreshable_policy_seeded_by(&None), "None（无溯源）可刷新");
+        assert!(
+            is_refreshable_policy_seeded_by(&None),
+            "None（无溯源）可刷新"
+        );
         assert!(
             is_refreshable_policy_seeded_by(&Some("legacy_migration".to_string())),
             "m013 seed tag 可刷新"
         );
         assert!(
-            is_refreshable_policy_seeded_by(&Some("statemachine_publish:profile:edu-k12".to_string())),
+            is_refreshable_policy_seeded_by(&Some(
+                "statemachine_publish:profile:edu-k12".to_string()
+            )),
             "statemachine_publish:* 可刷新"
         );
         assert!(

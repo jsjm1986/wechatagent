@@ -27,7 +27,10 @@ pub struct SlotPromotionThreshold {
 
 impl Default for SlotPromotionThreshold {
     fn default() -> Self {
-        Self { min_hits: 3, min_strong_evidence: 2 }
+        Self {
+            min_hits: 3,
+            min_strong_evidence: 2,
+        }
     }
 }
 
@@ -41,7 +44,11 @@ pub struct ObservedDimension {
 }
 
 /// 占槽门：跨多轮命中 + 强证据累积双达标才占。一两句话（hit=1）永远不够。
-pub fn should_promote(hit_count: i32, strong_evidence_count: i32, th: &SlotPromotionThreshold) -> bool {
+pub fn should_promote(
+    hit_count: i32,
+    strong_evidence_count: i32,
+    th: &SlotPromotionThreshold,
+) -> bool {
     hit_count >= th.min_hits && strong_evidence_count >= th.min_strong_evidence
 }
 
@@ -135,41 +142,72 @@ mod tests {
 
     #[test]
     fn no_promote_below_threshold() {
-        let th = SlotPromotionThreshold { min_hits: 3, min_strong_evidence: 2 };
+        let th = SlotPromotionThreshold {
+            min_hits: 3,
+            min_strong_evidence: 2,
+        };
         assert!(!should_promote(2, 2, &th)); // hits 不够
         assert!(!should_promote(3, 1, &th)); // 强证据不够
-        assert!(should_promote(3, 2, &th));  // 双达标
+        assert!(should_promote(3, 2, &th)); // 双达标
     }
 
     #[test]
     fn single_mention_never_promotes() {
         // 用户红线：一两句话不能占槽。
-        let th = SlotPromotionThreshold { min_hits: 3, min_strong_evidence: 2 };
+        let th = SlotPromotionThreshold {
+            min_hits: 3,
+            min_strong_evidence: 2,
+        };
         assert!(!should_promote(1, 1, &th));
     }
 
     #[test]
     fn history_capped_at_100() {
-        let th = SlotPromotionThreshold { min_hits: 1, min_strong_evidence: 0 };
+        let th = SlotPromotionThreshold {
+            min_hits: 1,
+            min_strong_evidence: 0,
+        };
         let mut signals = vec![];
         for turn in 0..150 {
-            apply_bayesian_update(&mut signals, &[ObservedDimension {
-                dimension: "价格敏感度".into(), value: "高".into(), confidence: 0.6, strong_evidence_count: 1,
-            }], turn, &th);
+            apply_bayesian_update(
+                &mut signals,
+                &[ObservedDimension {
+                    dimension: "价格敏感度".into(),
+                    value: "高".into(),
+                    confidence: 0.6,
+                    strong_evidence_count: 1,
+                }],
+                turn,
+                &th,
+            );
         }
-        let sig = signals.iter().find(|s| s.dimension == "价格敏感度").unwrap();
+        let sig = signals
+            .iter()
+            .find(|s| s.dimension == "价格敏感度")
+            .unwrap();
         assert!(sig.locked);
         assert!(sig.history.len() <= 100);
     }
 
     #[test]
     fn never_exceeds_six_locked_slots() {
-        let th = SlotPromotionThreshold { min_hits: 1, min_strong_evidence: 0 };
+        let th = SlotPromotionThreshold {
+            min_hits: 1,
+            min_strong_evidence: 0,
+        };
         let mut signals = vec![];
         for d in 0..10 {
-            apply_bayesian_update(&mut signals, &[ObservedDimension {
-                dimension: format!("dim{d}"), value: "v".into(), confidence: 0.5, strong_evidence_count: 1,
-            }], 0, &th);
+            apply_bayesian_update(
+                &mut signals,
+                &[ObservedDimension {
+                    dimension: format!("dim{d}"),
+                    value: "v".into(),
+                    confidence: 0.5,
+                    strong_evidence_count: 1,
+                }],
+                0,
+                &th,
+            );
         }
         assert!(signals.iter().filter(|s| s.locked).count() <= MAX_BAYESIAN_SLOTS);
     }
@@ -177,24 +215,49 @@ mod tests {
     #[test]
     fn promotion_uses_code_side_strong_not_confidence() {
         // Option B：占槽强证据口径取自代码侧（Inbound 锚定数），不信 LLM 自报 confidence。
-        let th = SlotPromotionThreshold { min_hits: 3, min_strong_evidence: 2 };
+        let th = SlotPromotionThreshold {
+            min_hits: 3,
+            min_strong_evidence: 2,
+        };
 
         // 高置信(0.9)但代码侧强证据=0：跨 5 轮命中达 min_hits，仍不应占槽（strong=0 < 2）。
         let mut signals = vec![];
         for turn in 0..5 {
-            apply_bayesian_update(&mut signals, &[ObservedDimension {
-                dimension: "价格敏感度".into(), value: "高".into(), confidence: 0.9, strong_evidence_count: 0,
-            }], turn, &th);
+            apply_bayesian_update(
+                &mut signals,
+                &[ObservedDimension {
+                    dimension: "价格敏感度".into(),
+                    value: "高".into(),
+                    confidence: 0.9,
+                    strong_evidence_count: 0,
+                }],
+                turn,
+                &th,
+            );
         }
-        let sig = signals.iter().find(|s| s.dimension == "价格敏感度").unwrap();
-        assert!(!sig.locked, "高置信但代码侧强证据=0 不得占槽（confidence 不再驱动占槽）");
+        let sig = signals
+            .iter()
+            .find(|s| s.dimension == "价格敏感度")
+            .unwrap();
+        assert!(
+            !sig.locked,
+            "高置信但代码侧强证据=0 不得占槽（confidence 不再驱动占槽）"
+        );
 
         // 低置信(0.3)但代码侧强证据=1：跨 3 轮累积 hits=3 且 strong=3 >= 2 → 占槽。
         let mut signals2 = vec![];
         for turn in 0..3 {
-            apply_bayesian_update(&mut signals2, &[ObservedDimension {
-                dimension: "决策角色".into(), value: "拍板人".into(), confidence: 0.3, strong_evidence_count: 1,
-            }], turn, &th);
+            apply_bayesian_update(
+                &mut signals2,
+                &[ObservedDimension {
+                    dimension: "决策角色".into(),
+                    value: "拍板人".into(),
+                    confidence: 0.3,
+                    strong_evidence_count: 1,
+                }],
+                turn,
+                &th,
+            );
         }
         let sig2 = signals2.iter().find(|s| s.dimension == "决策角色").unwrap();
         assert!(sig2.locked, "代码侧强证据累积达标即占槽，与 LLM 低置信无关");

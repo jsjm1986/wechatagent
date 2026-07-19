@@ -45,9 +45,7 @@ use super::knowledge_agent::relevance_score;
 use super::runtime::UserRuntimeParameters;
 use super::types::{KnowledgeRuntime, ToolCallRequest};
 use crate::db::Database;
-use crate::models::{
-    KnowledgeUsageLog, OperationKnowledgeChunk, OperationKnowledgeDocument,
-};
+use crate::models::{KnowledgeUsageLog, OperationKnowledgeChunk, OperationKnowledgeDocument};
 
 /// 单次 dispatch 的硬超时（R4.8）。
 pub(crate) const TOOL_DISPATCH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -584,8 +582,7 @@ struct VerifyAnchorArgs {
 /// `verify_anchor` 模糊匹配回调签名：
 /// `(raw_content, document_id_hex, source_quote) -> Option<doc!{ ... }>`。
 /// 由 chat route 注入；为空时 verify_anchor 工具退化为 best-effort 子串匹配。
-pub(crate) type AnchorMatchFn =
-    fn(&str, Option<String>, &str) -> Option<mongodb::bson::Document>;
+pub(crate) type AnchorMatchFn = fn(&str, Option<String>, &str) -> Option<mongodb::bson::Document>;
 
 /// 异步派发 chat tool call。
 ///
@@ -608,7 +605,10 @@ pub(crate) async fn dispatch_chat_tool_call(
     anchor_match: Option<AnchorMatchFn>,
 ) -> Value {
     let tool = call.tool.trim();
-    if !ALLOWED_CHAT_TOOL_NAMES.iter().any(|allowed| *allowed == tool) {
+    if !ALLOWED_CHAT_TOOL_NAMES
+        .iter()
+        .any(|allowed| *allowed == tool)
+    {
         return tool_error("unknown_tool", &format!("tool name '{tool}' not allowed"));
     }
     if let Err(err) = budget.record_tool_call(0) {
@@ -628,18 +628,10 @@ pub(crate) async fn dispatch_chat_tool_call(
             TOOL_AUDIT_COMPLETENESS => {
                 exec_audit_completeness(&arguments, db, &workspace_id_owned).await
             }
-            TOOL_SEARCH_CHUNKS => {
-                exec_search_chunks(&arguments, db, &workspace_id_owned).await
-            }
-            TOOL_PROPOSE_REPAIR => {
-                exec_propose_repair(&arguments, db, &workspace_id_owned).await
-            }
-            TOOL_ANALYZE_LOGS => {
-                exec_analyze_logs(&arguments, db, &workspace_id_owned).await
-            }
-            TOOL_OPEN_DOCUMENT => {
-                exec_open_document(&arguments, db, &workspace_id_owned).await
-            }
+            TOOL_SEARCH_CHUNKS => exec_search_chunks(&arguments, db, &workspace_id_owned).await,
+            TOOL_PROPOSE_REPAIR => exec_propose_repair(&arguments, db, &workspace_id_owned).await,
+            TOOL_ANALYZE_LOGS => exec_analyze_logs(&arguments, db, &workspace_id_owned).await,
+            TOOL_OPEN_DOCUMENT => exec_open_document(&arguments, db, &workspace_id_owned).await,
             TOOL_VERIFY_ANCHOR => {
                 exec_verify_anchor(&arguments, db, &workspace_id_owned, anchor_match).await
             }
@@ -662,16 +654,17 @@ pub(crate) async fn dispatch_chat_tool_call(
 // 输出：{ chunk_id, integrity_status, missing_fields, has_source_quote,
 //        verified_claim_count, evidence_count, completeness_score (0..=1) }；
 // 错误：invalid_input / unknown_chunk_id / db_error。
-async fn exec_audit_completeness(
-    arguments: &Document,
-    db: &Database,
-    workspace_id: &str,
-) -> Value {
+async fn exec_audit_completeness(arguments: &Document, db: &Database, workspace_id: &str) -> Value {
     let args: AuditCompletenessArgs = match parse_arguments(arguments) {
         Ok(args) => args,
         Err(detail) => return tool_error("invalid_input", &detail),
     };
-    let chunk_id = match args.chunk_id.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+    let chunk_id = match args
+        .chunk_id
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
         Some(id) => id.to_string(),
         None => return tool_error("invalid_input", "chunk_id is required"),
     };
@@ -681,10 +674,7 @@ async fn exec_audit_completeness(
     };
     let chunk = match db
         .operation_knowledge_chunks()
-        .find_one(
-            doc! { "_id": oid, "workspace_id": workspace_id },
-            None,
-        )
+        .find_one(doc! { "_id": oid, "workspace_id": workspace_id }, None)
         .await
     {
         Ok(Some(c)) => c,
@@ -698,7 +688,13 @@ async fn exec_audit_completeness(
     if chunk.title.trim().is_empty() {
         missing.push("title");
     }
-    if chunk.summary.as_deref().map(str::trim).unwrap_or("").is_empty() {
+    if chunk
+        .summary
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .is_empty()
+    {
         missing.push("summary");
     }
     if chunk
@@ -738,11 +734,7 @@ async fn exec_audit_completeness(
 //                  redacted }], hit_count, query }
 // 与 user-ops `knowledge.search` 行为相似但走 db query；snippet 仍按 verified
 // 闸门 redact。
-async fn exec_search_chunks(
-    arguments: &Document,
-    db: &Database,
-    workspace_id: &str,
-) -> Value {
+async fn exec_search_chunks(arguments: &Document, db: &Database, workspace_id: &str) -> Value {
     let args: SearchChunksArgs = match parse_arguments(arguments) {
         Ok(args) => args,
         Err(detail) => return tool_error("invalid_input", &detail),
@@ -817,16 +809,17 @@ async fn exec_search_chunks(
 // 输入：{ chunk_id }
 // 输出：{ chunk_id, suggestions: [...] }，每条 suggestion 形如
 // { field, reason, hint }；不直接写库（与 AI 永不自动 verify 红线一致）。
-async fn exec_propose_repair(
-    arguments: &Document,
-    db: &Database,
-    workspace_id: &str,
-) -> Value {
+async fn exec_propose_repair(arguments: &Document, db: &Database, workspace_id: &str) -> Value {
     let args: ProposeRepairArgs = match parse_arguments(arguments) {
         Ok(args) => args,
         Err(detail) => return tool_error("invalid_input", &detail),
     };
-    let chunk_id = match args.chunk_id.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+    let chunk_id = match args
+        .chunk_id
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
         Some(id) => id.to_string(),
         None => return tool_error("invalid_input", "chunk_id is required"),
     };
@@ -836,10 +829,7 @@ async fn exec_propose_repair(
     };
     let chunk = match db
         .operation_knowledge_chunks()
-        .find_one(
-            doc! { "_id": oid, "workspace_id": workspace_id },
-            None,
-        )
+        .find_one(doc! { "_id": oid, "workspace_id": workspace_id }, None)
         .await
     {
         Ok(Some(c)) => c,
@@ -898,11 +888,7 @@ async fn exec_propose_repair(
 // 输出：{ window_hours, total_runs, blocked_or_held_runs, top_chunks, items }
 // items[i]: { run_id, blocked_reason, knowledge_ids, created_at }
 // 复用 KnowledgeUsageLog 的 blocked_reason 字段做 24h 块/hold 反查。
-async fn exec_analyze_logs(
-    arguments: &Document,
-    db: &Database,
-    workspace_id: &str,
-) -> Value {
+async fn exec_analyze_logs(arguments: &Document, db: &Database, workspace_id: &str) -> Value {
     let args: AnalyzeLogsArgs = match parse_arguments(arguments) {
         Ok(args) => args,
         Err(detail) => return tool_error("invalid_input", &detail),
@@ -1003,11 +989,7 @@ async fn exec_analyze_logs(
 // 输出：{ document_id, title, source_type, raw_content_excerpt, raw_content_truncated,
 //        raw_content_total_chars, summary }；
 // 错误：invalid_input / unknown_document_id / db_error。
-async fn exec_open_document(
-    arguments: &Document,
-    db: &Database,
-    workspace_id: &str,
-) -> Value {
+async fn exec_open_document(arguments: &Document, db: &Database, workspace_id: &str) -> Value {
     let args: OpenDocumentArgs = match parse_arguments(arguments) {
         Ok(args) => args,
         Err(detail) => return tool_error("invalid_input", &detail),
@@ -1023,21 +1005,12 @@ async fn exec_open_document(
     };
     let oid = match ObjectId::parse_str(&document_id) {
         Ok(o) => o,
-        Err(_) => {
-            return tool_error("invalid_input", "document_id is not a valid ObjectId")
-        }
+        Err(_) => return tool_error("invalid_input", "document_id is not a valid ObjectId"),
     };
-    let max_chars = args
-        .max_chars
-        .filter(|v| *v > 0)
-        .unwrap_or(4000)
-        .min(8000) as usize;
+    let max_chars = args.max_chars.filter(|v| *v > 0).unwrap_or(4000).min(8000) as usize;
     let doc_record: OperationKnowledgeDocument = match db
         .operation_knowledge_documents()
-        .find_one(
-            doc! { "_id": oid, "workspace_id": workspace_id },
-            None,
-        )
+        .find_one(doc! { "_id": oid, "workspace_id": workspace_id }, None)
         .await
     {
         Ok(Some(d)) => d,
@@ -1099,10 +1072,7 @@ async fn exec_verify_anchor(
     };
     let chunk: OperationKnowledgeChunk = match db
         .operation_knowledge_chunks()
-        .find_one(
-            doc! { "_id": oid, "workspace_id": workspace_id },
-            None,
-        )
+        .find_one(doc! { "_id": oid, "workspace_id": workspace_id }, None)
         .await
     {
         Ok(Some(c)) => c,
@@ -1171,7 +1141,11 @@ async fn exec_verify_anchor(
     }
     // 退回模糊：若调用方注入了 anchor_match，复用 verify gate 同算法。
     if let Some(matcher) = anchor_match {
-        if let Some(anchor) = matcher(&raw_content, Some(document_id_hex.clone()), candidate_trimmed) {
+        if let Some(anchor) = matcher(
+            &raw_content,
+            Some(document_id_hex.clone()),
+            candidate_trimmed,
+        ) {
             let value = mongodb::bson::Bson::Document(anchor).into_relaxed_extjson();
             return json!({
                 "chunk_id": chunk_id,
@@ -1195,7 +1169,9 @@ async fn exec_verify_anchor(
 
 // ── 内部辅助 ────────────────────────────────────────────────────────────
 
-fn parse_arguments<T: for<'de> Deserialize<'de> + Default>(arguments: &Document) -> Result<T, String> {
+fn parse_arguments<T: for<'de> Deserialize<'de> + Default>(
+    arguments: &Document,
+) -> Result<T, String> {
     if arguments.is_empty() {
         return Ok(T::default());
     }
@@ -1332,7 +1308,10 @@ mod tests {
         let knowledge = KnowledgeRuntime::default();
         let mut state = ToolDispatchState::new();
         let bad = exec_list_catalog(&doc! {"kind": "messages"}, &knowledge, &mut state);
-        assert_eq!(bad.get("error").and_then(|x| x.as_str()), Some("invalid_input"));
+        assert_eq!(
+            bad.get("error").and_then(|x| x.as_str()),
+            Some("invalid_input")
+        );
         assert!(state.list_catalog_calls_per_kind.is_empty());
     }
 
@@ -1362,7 +1341,10 @@ mod tests {
         let knowledge = KnowledgeRuntime::default();
         let runtime = make_runtime();
         let v = exec_search(&doc! {"query": "   "}, &knowledge, &runtime);
-        assert_eq!(v.get("error").and_then(|x| x.as_str()), Some("invalid_query"));
+        assert_eq!(
+            v.get("error").and_then(|x| x.as_str()),
+            Some("invalid_query")
+        );
     }
 
     #[test]
@@ -1455,11 +1437,7 @@ mod tests {
         let knowledge = KnowledgeRuntime::default();
         let mut runtime = make_runtime();
         runtime.knowledge_open_slice_max_k = 2;
-        let v = exec_open_slice(
-            &doc! {"chunk_ids": ["a", "b", "c"]},
-            &knowledge,
-            &runtime,
-        );
+        let v = exec_open_slice(&doc! {"chunk_ids": ["a", "b", "c"]}, &knowledge, &runtime);
         assert_eq!(v.get("error").and_then(|x| x.as_str()), Some("over_limit"));
     }
 
@@ -1479,7 +1457,11 @@ mod tests {
         // 用旧版 id 请求 → 返回的 slice 必须是现行版（chunk_id=新版、body=new body）。
         let v = exec_open_slice(&doc! {"chunk_ids": [old_hex]}, &knowledge, &runtime);
         let slice = &v["slices"].as_array().unwrap()[0];
-        assert_eq!(slice["chunk_id"].as_str(), Some(new_hex.as_str()), "应 redirect 到新版 id");
+        assert_eq!(
+            slice["chunk_id"].as_str(),
+            Some(new_hex.as_str()),
+            "应 redirect 到新版 id"
+        );
         assert_eq!(slice["body"].as_str(), Some("new body"), "应返回现行版正文");
     }
 
@@ -1497,7 +1479,11 @@ mod tests {
         let runtime = make_runtime();
         let v = exec_open_slice(&doc! {"chunk_ids": [old_hex.clone()]}, &knowledge, &runtime);
         let slice = &v["slices"].as_array().unwrap()[0];
-        assert_eq!(slice["chunk_id"].as_str(), Some(old_hex.as_str()), "新版缺失应回退旧版");
+        assert_eq!(
+            slice["chunk_id"].as_str(),
+            Some(old_hex.as_str()),
+            "新版缺失应回退旧版"
+        );
         assert_eq!(slice["body"].as_str(), Some("old body"));
     }
 
@@ -1535,14 +1521,16 @@ mod tests {
     #[test]
     fn audit_completeness_args_accept_camel_case() {
         let d = doc! { "chunkId": "c-1" };
-        let a: AuditCompletenessArgs = mongodb::bson::from_document(d).expect("camelCase 反序列化必须通过");
+        let a: AuditCompletenessArgs =
+            mongodb::bson::from_document(d).expect("camelCase 反序列化必须通过");
         assert_eq!(a.chunk_id.as_deref(), Some("c-1"));
     }
 
     #[test]
     fn search_chunks_args_accept_camel_case() {
         let d = doc! { "query": "宝妈", "topK": 8_i32, "onlyVerified": true };
-        let a: SearchChunksArgs = mongodb::bson::from_document(d).expect("camelCase 反序列化必须通过");
+        let a: SearchChunksArgs =
+            mongodb::bson::from_document(d).expect("camelCase 反序列化必须通过");
         assert_eq!(a.query.as_deref(), Some("宝妈"));
         assert_eq!(a.top_k, Some(8));
         assert_eq!(a.only_verified, Some(true));
@@ -1551,14 +1539,16 @@ mod tests {
     #[test]
     fn propose_repair_args_accept_camel_case() {
         let d = doc! { "chunkId": "c-9" };
-        let a: ProposeRepairArgs = mongodb::bson::from_document(d).expect("camelCase 反序列化必须通过");
+        let a: ProposeRepairArgs =
+            mongodb::bson::from_document(d).expect("camelCase 反序列化必须通过");
         assert_eq!(a.chunk_id.as_deref(), Some("c-9"));
     }
 
     #[test]
     fn analyze_logs_args_accept_camel_case() {
         let d = doc! { "accountId": "acc-1", "hours": 24_i64, "onlyBlockedOrHeld": true };
-        let a: AnalyzeLogsArgs = mongodb::bson::from_document(d).expect("camelCase 反序列化必须通过");
+        let a: AnalyzeLogsArgs =
+            mongodb::bson::from_document(d).expect("camelCase 反序列化必须通过");
         assert_eq!(a.account_id.as_deref(), Some("acc-1"));
         assert_eq!(a.hours, Some(24));
         assert_eq!(a.only_blocked_or_held, Some(true));
@@ -1567,7 +1557,8 @@ mod tests {
     #[test]
     fn open_document_args_accept_camel_case() {
         let d = doc! { "documentId": "doc-x", "maxChars": 4000_i32 };
-        let a: OpenDocumentArgs = mongodb::bson::from_document(d).expect("camelCase 反序列化必须通过");
+        let a: OpenDocumentArgs =
+            mongodb::bson::from_document(d).expect("camelCase 反序列化必须通过");
         assert_eq!(a.document_id.as_deref(), Some("doc-x"));
         assert_eq!(a.max_chars, Some(4000));
     }
@@ -1575,7 +1566,8 @@ mod tests {
     #[test]
     fn verify_anchor_args_accept_camel_case() {
         let d = doc! { "chunkId": "c-2", "sourceQuote": "原文片段≥10字" };
-        let a: VerifyAnchorArgs = mongodb::bson::from_document(d).expect("camelCase 反序列化必须通过");
+        let a: VerifyAnchorArgs =
+            mongodb::bson::from_document(d).expect("camelCase 反序列化必须通过");
         assert_eq!(a.chunk_id.as_deref(), Some("c-2"));
         assert_eq!(a.source_quote.as_deref(), Some("原文片段≥10字"));
     }
@@ -1586,7 +1578,10 @@ mod tests {
         // 防止后续有人把 #[serde(alias = "chunk_id")] 加进来又恢复为旧的双向 alias 路径。
         let d = doc! { "chunk_id": "c-1" };
         let a: AuditCompletenessArgs = mongodb::bson::from_document(d).unwrap_or_default();
-        assert!(a.chunk_id.is_none(), "snake_case 不应被识别（rename_all=camelCase 单向）");
+        assert!(
+            a.chunk_id.is_none(),
+            "snake_case 不应被识别（rename_all=camelCase 单向）"
+        );
     }
 
     // ── score_chunk_for_query 迁移到 relevance_score（TDD 红阶段）──
@@ -1619,7 +1614,7 @@ mod tests {
         let query = "beta";
 
         let chunk_title_hit = build_chunk(
-            "beta-feature",  // title 命中
+            "beta-feature", // title 命中
             Some("verified"),
             Some("unrelated body"),
             None,
@@ -1627,7 +1622,7 @@ mod tests {
         let chunk_body_hit = build_chunk(
             "unrelated title",
             Some("verified"),
-            Some("beta-feature in body"),  // body 命中
+            Some("beta-feature in body"), // body 命中
             None,
         );
 
@@ -1648,13 +1643,13 @@ mod tests {
 
         let chunk_verified = build_chunk(
             "feature-doc",
-            Some("verified"),  // verified
+            Some("verified"), // verified
             None,
             None,
         );
         let chunk_draft = build_chunk(
-            "feature-doc",  // 完全相同的 title
-            Some("draft"),  // draft
+            "feature-doc", // 完全相同的 title
+            Some("draft"), // draft
             None,
             None,
         );

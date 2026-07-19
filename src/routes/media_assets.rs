@@ -229,7 +229,10 @@ pub async fn review_media_asset(
     if let Ok(Some(asset)) = state
         .db
         .content_assets()
-        .find_one(doc! { "_id": oid, "workspace_id": &admin.current_workspace }, None)
+        .find_one(
+            doc! { "_id": oid, "workspace_id": &admin.current_workspace },
+            None,
+        )
         .await
     {
         let account_id = asset.account_id.clone().unwrap_or_default();
@@ -284,7 +287,10 @@ pub async fn update_content_asset_meta(
     let asset = state
         .db
         .content_assets()
-        .find_one(doc! { "_id": oid, "workspace_id": &admin.current_workspace }, None)
+        .find_one(
+            doc! { "_id": oid, "workspace_id": &admin.current_workspace },
+            None,
+        )
         .await?
         .ok_or_else(|| AppError::NotFound("asset not found".into()))?;
 
@@ -324,10 +330,8 @@ pub async fn update_content_asset_meta(
             scope,
             &stages,
         )
-                .await
-                .map_err(|reason| {
-                    AppError::BadRequest(format!("target_stages 校验未通过：{reason}"))
-                })?;
+        .await
+        .map_err(|reason| AppError::BadRequest(format!("target_stages 校验未通过：{reason}")))?;
         set.insert("target_stages", normalized);
     }
     if let Some(v) = payload.min_inject_tier {
@@ -533,14 +537,20 @@ pub async fn delete_content_asset(
     let asset = state
         .db
         .content_assets()
-        .find_one(doc! { "_id": oid, "workspace_id": &admin.current_workspace }, None)
+        .find_one(
+            doc! { "_id": oid, "workspace_id": &admin.current_workspace },
+            None,
+        )
         .await?
         .ok_or_else(|| AppError::NotFound("asset not found".into()))?;
 
     let res = state
         .db
         .content_assets()
-        .delete_one(doc! { "_id": oid, "workspace_id": &admin.current_workspace }, None)
+        .delete_one(
+            doc! { "_id": oid, "workspace_id": &admin.current_workspace },
+            None,
+        )
         .await?;
     if res.deleted_count == 0 {
         return Err(AppError::NotFound("asset not found".into()));
@@ -551,7 +561,10 @@ pub async fn delete_content_asset(
         let refs = state
             .db
             .content_assets()
-            .count_documents(doc! { "workspace_id": &admin.current_workspace, "file_path": &rel }, None)
+            .count_documents(
+                doc! { "workspace_id": &admin.current_workspace, "file_path": &rel },
+                None,
+            )
             .await
             .unwrap_or(1); // 查询失败 → 视为有引用,保守不删
         if media_storage::should_delete_physical_file(refs) {

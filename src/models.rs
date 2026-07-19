@@ -118,7 +118,10 @@ impl std::fmt::Debug for WechatAccount {
             )
             .field(
                 "webhook_secret",
-                &self.webhook_secret.as_deref().map(crate::secret::mask_secret),
+                &self
+                    .webhook_secret
+                    .as_deref()
+                    .map(crate::secret::mask_secret),
             )
             .field("online", &self.online)
             .field("status", &self.status)
@@ -403,7 +406,11 @@ impl From<PersonalityProfile> for ApiPersonalityProfile {
             agreeableness: p.agreeableness,
             neuroticism: p.neuroticism,
             updated_at: dt_to_string(p.updated_at),
-            snapshots: p.snapshots.into_iter().map(ApiPersonalitySnapshot::from).collect(),
+            snapshots: p
+                .snapshots
+                .into_iter()
+                .map(ApiPersonalitySnapshot::from)
+                .collect(),
         }
     }
 }
@@ -873,6 +880,7 @@ pub struct AgentTask {
 pub const ALLOWED_AGENT_TASK_STATUS: &[&str] = &[
     "pending",
     "running",
+    "committing",
     "retry",
     "failed",
     "cancelled",
@@ -1020,7 +1028,10 @@ mod chunk_classification_tests {
         assert_eq!(coerce_wiki_type(Some("  ".to_string())), None);
         assert_eq!(coerce_wiki_type(None), None);
         // 前后空白被 trim 后仍命中闭集。
-        assert_eq!(coerce_wiki_type(Some("  methodology ".to_string())).as_deref(), Some("methodology"));
+        assert_eq!(
+            coerce_wiki_type(Some("  methodology ".to_string())).as_deref(),
+            Some("methodology")
+        );
     }
 
     #[test]
@@ -1309,6 +1320,9 @@ pub struct ReferralCard {
 pub struct AgentSendLedger {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
     pub id: Option<ObjectId>,
+    /// 不可变送达事实锚点。新写入必须携带对应 Outbox `_id`；历史行缺失时仍可读取。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outbox_id: Option<ObjectId>,
     pub workspace_id: String,
     pub account_id: String,
     pub contact_wxid: String,
@@ -1692,14 +1706,20 @@ pub const ALLOWED_WIKI_TYPE: &[&str] = &[
 ];
 
 /// `chunk_type` 4 类运营用途闭集（描述"运营时怎么用它"）。与 [`ALLOWED_WIKI_TYPE`] 正交。
-pub const ALLOWED_CHUNK_TYPE: &[&str] =
-    &["product_fact", "style_template", "peer_case", "negative_example"];
+pub const ALLOWED_CHUNK_TYPE: &[&str] = &[
+    "product_fact",
+    "style_template",
+    "peer_case",
+    "negative_example",
+];
 
 /// 落库前归一 `wiki_type`：合法值透传；空/闭集外（含 LLM 幻觉分类，如 `"产品介绍"`）→ `None`。
 /// 归一而非拒绝：LLM 幻觉是预期输入，不该让整条 chunk 写入失败丢掉正确 body；
 /// 落 `None` 后由 `wiki_type_priority` 兜底为 `entity`（`knowledge_agent.rs`）。越界时留痕。
 pub fn coerce_wiki_type(raw: Option<String>) -> Option<String> {
-    let value = raw.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())?;
+    let value = raw
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())?;
     if ALLOWED_WIKI_TYPE.contains(&value.as_str()) {
         Some(value)
     } else {
@@ -1714,9 +1734,7 @@ pub fn coerce_wiki_type(raw: Option<String>) -> Option<String> {
 /// 落库前归一 `chunk_type`：合法值透传；空/闭集外 → `product_fact`（最保守、走 verified-only）。
 /// 归一而非拒绝，理由同 [`coerce_wiki_type`]。越界时留痕。
 pub fn coerce_chunk_type(raw: Option<String>) -> String {
-    let value = raw
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+    let value = raw.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     match value {
         Some(v) if ALLOWED_CHUNK_TYPE.contains(&v.as_str()) => v,
         Some(v) => {
@@ -2302,7 +2320,6 @@ pub struct AnsweringModeDescriptor {
     pub label: Option<String>,
 }
 
-
 /// + 各自阈值。三驱动力对应 planner 三扫描器（funnel→`scan_stage_stagnation`、
 /// silence→`scan_silent`、commitment→`scan_commitments`）。
 ///
@@ -2379,7 +2396,10 @@ pub struct FunnelMode {
 
 impl Default for FunnelMode {
     fn default() -> Self {
-        Self { enabled: true, stagnation_threshold_days: None }
+        Self {
+            enabled: true,
+            stagnation_threshold_days: None,
+        }
     }
 }
 
@@ -2395,7 +2415,10 @@ pub struct SilenceMode {
 
 impl Default for SilenceMode {
     fn default() -> Self {
-        Self { enabled: true, threshold_hours: None }
+        Self {
+            enabled: true,
+            threshold_hours: None,
+        }
     }
 }
 
@@ -2412,7 +2435,10 @@ pub struct CommitmentMode {
 
 impl Default for CommitmentMode {
     fn default() -> Self {
-        Self { enabled: true, imminent_window_hours: None }
+        Self {
+            enabled: true,
+            imminent_window_hours: None,
+        }
     }
 }
 
@@ -2431,7 +2457,9 @@ pub struct QuietHoursMode {
 
 impl Default for QuietHoursMode {
     fn default() -> Self {
-        Self { enabled_override: None }
+        Self {
+            enabled_override: None,
+        }
     }
 }
 
@@ -2457,7 +2485,11 @@ pub struct CalendarMode {
 
 impl Default for CalendarMode {
     fn default() -> Self {
-        Self { enabled: false, lookahead_days: None, daily_cap: None }
+        Self {
+            enabled: false,
+            lookahead_days: None,
+            daily_cap: None,
+        }
     }
 }
 
@@ -2485,7 +2517,12 @@ pub struct RenewalMode {
 
 impl Default for RenewalMode {
     fn default() -> Self {
-        Self { enabled: false, lookahead_days: None, grace_days: None, daily_cap: None }
+        Self {
+            enabled: false,
+            lookahead_days: None,
+            grace_days: None,
+            daily_cap: None,
+        }
     }
 }
 
@@ -2516,7 +2553,12 @@ pub struct ReactivationMode {
 
 impl Default for ReactivationMode {
     fn default() -> Self {
-        Self { enabled: false, dormant_days: None, cadence_days: None, daily_cap: None }
+        Self {
+            enabled: false,
+            dormant_days: None,
+            cadence_days: None,
+            daily_cap: None,
+        }
     }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2847,6 +2889,20 @@ pub struct AgentDecisionReview {
     pub reaction_analysis: Document,
     #[serde(default)]
     pub reaction_claimed_at: Option<DateTime>,
+    /// Reaction 分析每次 claim 生成的不可复用 fencing token。分析结果与其后的业务
+    /// 副作用只有在 `_id + outcome_status=analyzing + token` 仍匹配时才能提交。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reaction_claim_token: Option<String>,
+    /// Reaction claim 的单调审计代次；正确性由不可复用 token 保证。
+    #[serde(default)]
+    pub reaction_claim_generation: i64,
+    /// 该决策若由异步 AgentTask 产生，记录任务与当次不可复用 claim token。
+    /// Dispatcher 发送前据此核对任务已由同一 owner 授权为 `outbox_enqueued`；
+    /// 旧 worker 即使在失权窗口写出了 Outbox，也不能触达远端 MCP。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_task_id: Option<ObjectId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_task_claim_token: Option<String>,
     /// Phase C / C1: reviewer 误判信号（reviewer 判断与用户实际反应不一致时记录）。
     /// 取值：`approved_but_user_negative` / `blocked_but_user_positive` / None。
     /// 由 `record_user_reaction_inner` 在 reaction_analysis 写入后计算并 $set 同步落库，
@@ -2992,7 +3048,8 @@ pub struct AgentRunLog {
 /// 用于 Reply Agent → review → MCP 发送之间的可靠链路（持久化 / 幂等 / 重试 /
 /// 取消）。具体语义详见 design.md §3.2 与 requirements.md R13；本期 W0 仅用作
 /// `Database::collection_agent_send_outbox` 的类型绑定，最终字段约束（如
-/// `idempotency_key` 唯一索引、`status` 枚举值 `pending|in_flight|sent|failed_terminal|canceled`）
+/// `idempotency_key` 唯一索引、`status` 枚举值
+/// `pending|in_flight|sent|failed_terminal|canceled|delivery_unknown`）
 /// 在 W4 task 5.x 中落地。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutboxEntry {
@@ -3025,6 +3082,27 @@ pub struct OutboxEntry {
     pub next_retry_at: Option<DateTime>,
     pub worker_id: Option<String>,
     pub locked_until: Option<DateTime>,
+    /// 每次 atomic claim 生成的不可复用 fencing token。所有 worker 状态推进都必须
+    /// 同时匹配 `_id + status=in_flight + worker_id + claim_token`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_token: Option<String>,
+    /// claim/reclaim 的单调审计代次；正确性以 claim_token CAS 为准。
+    #[serde(default)]
+    pub claim_generation: i64,
+    /// in-flight 取消不能伪装成已取消：先记录请求，worker 在进入 MCP 前原子复查。
+    #[serde(default)]
+    pub cancel_requested: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancel_requested_at: Option<DateTime>,
+    /// worker 已跨过“最后可取消点”并准备调用远端 MCP。此后取消只能等待真实回执；
+    /// 崩溃且无法核验时进入 delivery_unknown，禁止自动重发。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_started_at: Option<DateTime>,
+    /// SR-034：Task claim 提交发送意图后写入的不可变授权标记。仅由持有同一
+    /// `claim_token` 且成功把 task CAS 到 `outbox_enqueued` 的 owner 写入；
+    /// dispatcher 的最后远端边界 CAS 必须匹配该 token。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_send_authorization_token: Option<String>,
     /// 崩溃恢复标记：`reclaim_expired_leases` 把一条 `in_flight`（lease 过期）
     /// 改回 `pending` 时置 true。说明上一个 worker 抢占后在写 `sent` 前消失
     /// （OOM / 部署 / panic），它**可能已把消息送达 MCP/微信**。dispatcher 重发
@@ -3333,8 +3411,13 @@ pub struct AgentToolCall {
 
 /// `AgentToolCall.status` 合法闭集（管理 agent 工具调用终态）。
 /// executed_unverified：已执行但业务结果无法核实（spec §3.3，诚实优于好看）。
-pub const ALLOWED_TOOL_CALL_STATUS: &[&str] =
-    &["running", "dry_run", "succeeded", "failed", "executed_unverified"];
+pub const ALLOWED_TOOL_CALL_STATUS: &[&str] = &[
+    "running",
+    "dry_run",
+    "succeeded",
+    "failed",
+    "executed_unverified",
+];
 
 /// `agent_tool_calls.status` 写入站点闭集断言。命中闭集外值 panic(debug) / tracing::error!(release)。
 #[track_caller]
@@ -3379,6 +3462,12 @@ pub struct AgentOutcomeMetric {
     pub daily_run_count: i64,
     #[serde(default)]
     pub daily_run_token_total: i64,
+    /// 产生本次投影的 AgentTask。旧文档缺失时为 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_task_id: Option<ObjectId>,
+    /// 目标文档上的单调 fencing generation：更旧的 task owner 不得覆盖更新结果。
+    #[serde(default)]
+    pub source_task_claim_generation: i64,
     pub created_at: DateTime,
 }
 
@@ -3616,7 +3705,11 @@ impl From<Contact> for ApiContact {
             domain_attributes_updated_at: contact
                 .domain_attributes_updated_at
                 .and_then(dt_to_string),
-            commitments: contact.commitments.iter().map(ApiCommitment::from).collect(),
+            commitments: contact
+                .commitments
+                .iter()
+                .map(ApiCommitment::from)
+                .collect(),
             follow_up_policy: contact.follow_up_policy,
             operation_state: contact.operation_state,
             operation_state_reason: contact.operation_state_reason,
@@ -4311,10 +4404,16 @@ mod typed {
                 }
             }
             if !(0..=10).contains(&self.confidence) {
-                errors.push(format!("memory_fact_confidence_out_of_range:{}", self.confidence));
+                errors.push(format!(
+                    "memory_fact_confidence_out_of_range:{}",
+                    self.confidence
+                ));
             }
             if !(0..=10).contains(&self.importance) {
-                errors.push(format!("memory_fact_importance_out_of_range:{}", self.importance));
+                errors.push(format!(
+                    "memory_fact_importance_out_of_range:{}",
+                    self.importance
+                ));
             }
             if let Some(reason) = &self.deprecation_reason {
                 let reason_len = reason.chars().count();
@@ -4657,7 +4756,11 @@ mod typed {
             };
             assert_eq!(
                 card.live_dimension_names(),
-                vec!["孩子年龄".to_string(), "预算".to_string(), "决策角色".to_string()]
+                vec![
+                    "孩子年龄".to_string(),
+                    "预算".to_string(),
+                    "决策角色".to_string()
+                ]
             );
         }
 
@@ -4992,7 +5095,8 @@ pub struct KnowledgeChatTask {
     /// `knowledge.digest.dispatch` LLM 拆出，后端校验后落库。
     #[serde(default)]
     pub planned_steps: Vec<Document>,
-    /// `[{cardId, action, chunkId?, error?}]`，worker 每完成一步追加。
+    /// `[{cardId, action, status, chunkId?, error?}]`，worker 每完成一步追加；
+    /// `status` 闭集为 `committed|noop|needs_manual|failed`，不得用 Rust `Ok` 冒充成功。
     #[serde(default)]
     pub completed_steps: Vec<Document>,
     /// `pending` / `running` / `completed` / `failed` / `cancelled`。封闭枚举，
@@ -5097,7 +5201,8 @@ mod typed_tests {
 
     #[test]
     fn intent_trajectory_entry_legacy_objection_round_trips() {
-        let legacy = mongodb::bson::doc! { "turnIndex": 3, "intent": "advance", "objectionType": "price" };
+        let legacy =
+            mongodb::bson::doc! { "turnIndex": 3, "intent": "advance", "objectionType": "price" };
         let e: IntentTrajectoryEntry = mongodb::bson::from_document(legacy).unwrap();
         assert_eq!(e.objection_type.as_deref(), Some("price"));
         assert!(e.dimensions.is_empty(), "老数据 dimensions 默认空");
@@ -5168,8 +5273,7 @@ mod typed_tests {
     #[test]
     fn runtime_parameters_typed_reads_escalated_budget() {
         let doc = doc! { "runTokenBudgetEscalated": 120000_i64 };
-        let p: RuntimeParametersTyped =
-            mongodb::bson::from_document(doc).expect("deserialize");
+        let p: RuntimeParametersTyped = mongodb::bson::from_document(doc).expect("deserialize");
         assert_eq!(p.run_token_budget_escalated, 120000);
     }
 
@@ -5481,7 +5585,11 @@ mod typed_tests {
             MemoryFactRepr::Plain(_) => panic!("Structured 应原样保留"),
         }
         // 二次调用应返回 0（幂等）。
-        assert_eq!(card.auto_upgrade_plain_facts(), 0, "幂等：第二次升级应当 0 条");
+        assert_eq!(
+            card.auto_upgrade_plain_facts(),
+            0,
+            "幂等：第二次升级应当 0 条"
+        );
     }
 
     #[test]
@@ -5534,6 +5642,8 @@ mod typed_tests {
             agent_block_rate: None,
             daily_run_count: 0,
             daily_run_token_total: 0,
+            source_task_id: None,
+            source_task_claim_generation: 0,
             created_at: DateTime::now(),
         };
         // BSON round-trip 保持 None。
@@ -5678,6 +5788,12 @@ mod typed_tests {
             next_retry_at: None,
             worker_id: None,
             locked_until: None,
+            claim_token: None,
+            claim_generation: 0,
+            cancel_requested: false,
+            cancel_requested_at: None,
+            send_started_at: None,
+            task_send_authorization_token: None,
             reclaimed_in_flight: false,
             reclaim_count: 0,
             created_at: now,
@@ -5842,7 +5958,10 @@ mod typed_tests {
         let doc = mongodb::bson::to_document(&signal).expect("serialize SuspectedDealSignal");
         assert_eq!(doc.get_str("workspace_id").unwrap(), "ws-1");
         assert_eq!(doc.get_str("account_id").unwrap(), "acc-1");
-        assert_eq!(doc.get_str("contact_id").unwrap(), "507f1f77bcf86cd799439011");
+        assert_eq!(
+            doc.get_str("contact_id").unwrap(),
+            "507f1f77bcf86cd799439011"
+        );
         assert_eq!(doc.get_str("value").unwrap(), "疑似成交·待核实");
         assert_eq!(doc.get_str("status").unwrap(), "pending");
         assert_eq!(doc.get_i32("confidence").unwrap(), 75);
@@ -5891,8 +6010,7 @@ mod typed_tests {
         assert_eq!(doc.get_str("experiment_id").unwrap(), "exp_2026_05_001");
         assert_eq!(doc.get_str("status").unwrap(), "collecting");
         assert_eq!(doc.get_i32("window_hours").unwrap(), 72);
-        let parsed: Experiment =
-            mongodb::bson::from_document(doc).expect("deserialize Experiment");
+        let parsed: Experiment = mongodb::bson::from_document(doc).expect("deserialize Experiment");
         assert_eq!(parsed.experiment_id, exp.experiment_id);
         assert_eq!(parsed.cohort_threshold_run_ids.len(), 1);
         assert!(parsed.cohort_prompt_run_ids.is_empty());
@@ -5939,8 +6057,7 @@ mod typed_tests {
         assert_eq!(doc.get_f64("current_value").unwrap(), 6.0);
         let cohort = doc.get_document("cohort_notes").unwrap();
         assert_eq!(cohort.get_f64("hit_rate_observed").unwrap(), 0.42);
-        let parsed: Proposal =
-            mongodb::bson::from_document(doc).expect("deserialize Proposal");
+        let parsed: Proposal = mongodb::bson::from_document(doc).expect("deserialize Proposal");
         assert_eq!(parsed.proposed_value, Some(7.0));
         assert!(parsed.proposed_template_key.is_none());
     }
@@ -5963,7 +6080,9 @@ mod typed_tests {
             proposed_section: Some("policy".to_string()),
             diff_summary: Some("强化 product fact-check 兜底语句".to_string()),
             diff_snippet: Some("…在引用产品参数前必须确认 knowledge chunk…".to_string()),
-            critic_reasoning: Some("过去 30 条失败 cohort 中 12 条触发 fact_risk_block".to_string()),
+            critic_reasoning: Some(
+                "过去 30 条失败 cohort 中 12 条触发 fact_risk_block".to_string(),
+            ),
             expected_improvement_on: vec!["blocked_unverified_product_claim".to_string()],
             risk_note: None,
             previous_prompt_version: Some("v3".to_string()),
@@ -5982,9 +6101,11 @@ mod typed_tests {
         let doc = mongodb::bson::to_document(&p).expect("serialize Proposal");
         assert_eq!(doc.get_str("proposal_kind").unwrap(), "prompt");
         assert_eq!(doc.get_str("proposed_section").unwrap(), "policy");
-        let parsed: Proposal =
-            mongodb::bson::from_document(doc).expect("deserialize Proposal");
-        assert_eq!(parsed.proposed_template_key.as_deref(), Some("reply_agent_main"));
+        let parsed: Proposal = mongodb::bson::from_document(doc).expect("deserialize Proposal");
+        assert_eq!(
+            parsed.proposed_template_key.as_deref(),
+            Some("reply_agent_main")
+        );
         assert_eq!(parsed.expected_improvement_on.len(), 1);
         assert_eq!(parsed.previous_prompt_version.as_deref(), Some("v3"));
     }
@@ -6086,8 +6207,10 @@ mod typed_tests {
     #[test]
     fn m4_migration_id_is_after_2026_05_009() {
         // `0` (0x30) < `M` (0x4D)：`2026_05_009...` < `2026_05_M4_001...`。
-        assert!("2026_05_009_contact_customer_stage_updated_at_backfill"
-            < "2026_05_M4_001_prompt_template_versioned");
+        assert!(
+            "2026_05_009_contact_customer_stage_updated_at_backfill"
+                < "2026_05_M4_001_prompt_template_versioned"
+        );
     }
 
     /// knowledge-wiki Phase A：旧 chunk 文档（无 wiki_type / domain_attributes /
@@ -6256,8 +6379,7 @@ mod typed_tests {
             resolved_at: None,
         };
         let doc = mongodb::bson::to_document(&sig).expect("serialize");
-        let parsed: KnowledgeGapSignal =
-            mongodb::bson::from_document(doc).expect("deserialize");
+        let parsed: KnowledgeGapSignal = mongodb::bson::from_document(doc).expect("deserialize");
         assert_eq!(parsed.kind, "broken_link");
         assert_eq!(parsed.affected_chunk_ids.len(), 2);
     }
@@ -6335,7 +6457,10 @@ mod principal_escalation_model_tests {
     fn awaiting_principal_decision_attr_key_is_stable() {
         // set（Task 18 apply_agent_updates）与 unset（Task 16 clear_awaiting_principal_state）
         // 必须用同一个 key，否则等待标记清不掉。锁死常量值防回归。
-        assert_eq!(AWAITING_PRINCIPAL_DECISION_ATTR, "awaiting_principal_decision");
+        assert_eq!(
+            AWAITING_PRINCIPAL_DECISION_ATTR,
+            "awaiting_principal_decision"
+        );
     }
 
     #[test]
@@ -6398,7 +6523,11 @@ mod objective_purchase_facts_model_tests {
         }"#;
         let ev: OutcomeEvent = serde_json::from_str(legacy).expect("legacy doc should deserialize");
         assert_eq!(ev.verification, "staff_confirmed");
-        assert_eq!(ev.amount, Some(19900), "金额是最小币种单位整数（分），19900=¥199.00");
+        assert_eq!(
+            ev.amount,
+            Some(19900),
+            "金额是最小币种单位整数（分），19900=¥199.00"
+        );
         assert!(ev.product_ref.is_none());
         // §4.5：旧文档无 event_kind → 缺省 deal（正向成交），退款逆转语义不影响存量。
         assert_eq!(ev.event_kind, "deal");
@@ -6584,7 +6713,9 @@ mod content_asset_compat_tests {
             file_path: Some("ws1/ab/abcd.xlsx".into()),
             file_name: Some("产品报价单.xlsx".into()),
             file_size: Some(20480),
-            mime_type: Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet".into()),
+            mime_type: Some(
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet".into(),
+            ),
             file_sha256: Some("abcd".into()),
             sendable: Some(true),
             send_trigger_hint: Some("客户问价格时发".into()),
@@ -6607,7 +6738,7 @@ mod content_asset_compat_tests {
 
 #[cfg(test)]
 mod referral_card_compat_tests {
-    use super::{ReferralCard, OperationDomainConfig};
+    use super::{OperationDomainConfig, ReferralCard};
     use mongodb::bson::{doc, DateTime};
 
     #[test]
@@ -6676,6 +6807,7 @@ mod send_ledger_compat_tests {
     fn ledger_roundtrips() {
         let row = AgentSendLedger {
             id: None,
+            outbox_id: Some(mongodb::bson::oid::ObjectId::new()),
             workspace_id: "ws1".into(),
             account_id: "acct1".into(),
             contact_wxid: "wxid_cust".into(),
@@ -6706,8 +6838,8 @@ mod send_ledger_compat_tests {
             "send_kind": "namecard", "target_id": "c1", "target_title": "张顾问",
             "run_id": "r1", "sent_at": DateTime::now(),
         };
-        let row: AgentSendLedger = mongodb::bson::from_document(legacy)
-            .expect("legacy ledger row must deserialize");
+        let row: AgentSendLedger =
+            mongodb::bson::from_document(legacy).expect("legacy ledger row must deserialize");
         assert_eq!(row.send_kind, "namecard");
         assert!(row.responded.is_none());
         assert!(row.outcome_evaluated_at.is_none());
@@ -6803,12 +6935,30 @@ mod tag_trust_tests {
         let c: Contact = bson::from_document(minimal_doc).expect("deserialize minimal contact");
 
         // 验证新字段取默认值
-        assert!(c.manual_tags.is_empty(), "manual_tags should default to empty Vec");
-        assert!(c.manual_tags_updated_at.is_none(), "manual_tags_updated_at should default to None");
-        assert!(c.manual_tags_by.is_none(), "manual_tags_by should default to None");
-        assert!(c.confirmed_tags.is_empty(), "confirmed_tags should default to empty Vec");
-        assert!(c.bayesian_signals.is_empty(), "bayesian_signals should default to empty Vec");
-        assert!(c.personality_profile.is_none(), "personality_profile should default to None");
+        assert!(
+            c.manual_tags.is_empty(),
+            "manual_tags should default to empty Vec"
+        );
+        assert!(
+            c.manual_tags_updated_at.is_none(),
+            "manual_tags_updated_at should default to None"
+        );
+        assert!(
+            c.manual_tags_by.is_none(),
+            "manual_tags_by should default to None"
+        );
+        assert!(
+            c.confirmed_tags.is_empty(),
+            "confirmed_tags should default to empty Vec"
+        );
+        assert!(
+            c.bayesian_signals.is_empty(),
+            "bayesian_signals should default to empty Vec"
+        );
+        assert!(
+            c.personality_profile.is_none(),
+            "personality_profile should default to None"
+        );
         assert_eq!(c.tags_version, 0, "tags_version should default to 0");
     }
 
@@ -6828,8 +6978,7 @@ mod tag_trust_tests {
             "created_at": DateTime::now(),
             "updated_at": DateTime::now(),
         };
-        let mut c: Contact =
-            bson::from_document(minimal_doc).expect("deserialize minimal contact");
+        let mut c: Contact = bson::from_document(minimal_doc).expect("deserialize minimal contact");
         c.manual_tags = vec!["VIP".to_string(), "价格敏感".to_string()];
         c.confirmed_tags = vec![ConfirmedTag {
             value: "价格敏感".to_string(),
@@ -6844,18 +6993,32 @@ mod tag_trust_tests {
         let api = ApiContact::from(c);
 
         // manual 的 "VIP" 与 confirmed 的 "价格敏感" 都应出现在合并 tags 中。
-        assert!(api.tags.contains(&"VIP".to_string()), "merged tags should include manual VIP");
+        assert!(
+            api.tags.contains(&"VIP".to_string()),
+            "merged tags should include manual VIP"
+        );
         assert!(
             api.tags.contains(&"价格敏感".to_string()),
             "merged tags should include confirmed value 价格敏感"
         );
         // manual 已含 "价格敏感"，confirmed 同值不应重复 → 合并后只 2 个。
-        assert_eq!(api.tags.len(), 2, "duplicate confirmed value must not be appended twice");
+        assert_eq!(
+            api.tags.len(),
+            2,
+            "duplicate confirmed value must not be appended twice"
+        );
         // manual 在前，保序。
-        assert_eq!(api.tags[0], "VIP", "manual tags should come first in merged order");
+        assert_eq!(
+            api.tags[0], "VIP",
+            "manual tags should come first in merged order"
+        );
 
         // confirmed_tags 单独投影：长度 1，value 正确。
-        assert_eq!(api.confirmed_tags.len(), 1, "confirmed_tags should project 1 entry");
+        assert_eq!(
+            api.confirmed_tags.len(),
+            1,
+            "confirmed_tags should project 1 entry"
+        );
         assert_eq!(api.confirmed_tags[0].value, "价格敏感");
     }
 
@@ -6876,8 +7039,7 @@ mod tag_trust_tests {
             "created_at": DateTime::now(),
             "updated_at": DateTime::now(),
         };
-        let mut c: Contact =
-            bson::from_document(minimal_doc).expect("deserialize minimal contact");
+        let mut c: Contact = bson::from_document(minimal_doc).expect("deserialize minimal contact");
         c.confirmed_tags = vec![ConfirmedTag {
             value: "价格敏感".to_string(),
             evidences: vec![],
@@ -6919,9 +7081,12 @@ mod tag_trust_tests {
             "created_at": DateTime::now(),
             "updated_at": DateTime::now(),
         };
-        let mut c: Contact =
-            bson::from_document(minimal_doc).expect("deserialize minimal contact");
-        let facet = PersonalityFacet { score: 0.5, confidence: 0.3, evidence_refs: vec![] };
+        let mut c: Contact = bson::from_document(minimal_doc).expect("deserialize minimal contact");
+        let facet = PersonalityFacet {
+            score: 0.5,
+            confidence: 0.3,
+            evidence_refs: vec![],
+        };
         c.personality_profile = Some(PersonalityProfile {
             openness: facet.clone(),
             conscientiousness: facet.clone(),
@@ -6955,7 +7120,14 @@ mod campaign_model_tests {
 
     #[test]
     fn campaign_status_closed_set_covers_lifecycle() {
-        for s in ["draft", "previewed", "confirmed", "dispatching", "completed", "canceled"] {
+        for s in [
+            "draft",
+            "previewed",
+            "confirmed",
+            "dispatching",
+            "completed",
+            "canceled",
+        ] {
             assert!(ALLOWED_CAMPAIGN_STATUS.contains(&s), "缺少状态 {s}");
         }
         assert_eq!(ALLOWED_CAMPAIGN_STATUS.len(), 6);
@@ -6964,7 +7136,14 @@ mod campaign_model_tests {
     #[test]
     fn assert_campaign_status_accepts_valid_rejects_unknown() {
         // 合法值不 panic
-        for s in ["draft", "previewed", "confirmed", "dispatching", "completed", "canceled"] {
+        for s in [
+            "draft",
+            "previewed",
+            "confirmed",
+            "dispatching",
+            "completed",
+            "canceled",
+        ] {
             assert_campaign_status_valid(s);
         }
         // 闭集外值在 debug 下 panic（用 catch_unwind 验证）
@@ -7054,8 +7233,7 @@ mod conversation_message_relay_tests {
             "is_synthetic_relay": true,
             "created_at": mongodb::bson::DateTime::now(),
         };
-        let msg: ConversationMessage =
-            mongodb::bson::from_document(doc).expect("deserialize");
+        let msg: ConversationMessage = mongodb::bson::from_document(doc).expect("deserialize");
         assert!(
             !msg.is_synthetic_relay,
             "反序列化必须忽略输入里的 is_synthetic_relay，恒取 default(false)——这是不可伪造的根基"
@@ -7075,8 +7253,7 @@ mod conversation_message_relay_tests {
             "raw": mongodb::bson::Bson::Null,
             "created_at": mongodb::bson::DateTime::now(),
         };
-        let msg: ConversationMessage =
-            mongodb::bson::from_document(doc).expect("deserialize");
+        let msg: ConversationMessage = mongodb::bson::from_document(doc).expect("deserialize");
         assert!(!msg.is_synthetic_relay);
     }
 }
@@ -7137,7 +7314,10 @@ mod wechat_account_debug_tests {
     #[test]
     fn debug_masks_webhook_secret() {
         let dbg = format!("{:?}", sample());
-        assert!(!dbg.contains("super-secret-value"), "raw webhook_secret leaked into Debug: {dbg}");
+        assert!(
+            !dbg.contains("super-secret-value"),
+            "raw webhook_secret leaked into Debug: {dbg}"
+        );
     }
 }
 

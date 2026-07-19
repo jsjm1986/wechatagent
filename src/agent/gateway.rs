@@ -59,9 +59,9 @@ use super::multimodal;
 use super::outbox::{enqueue as outbox_enqueue, EnqueueOutcome, EnqueueRequest};
 use super::review::{
     apply_revision_fallback, contact_has_principal_product_exemption, decide_revision,
-    derive_revision_failure, effective_review_mode, finalize_review_for_send,
-    local_decision_review, review_decision, review_passed, should_run_review, FinalizeOutcome,
-    GatewayStatusFinal, PendingFinalizeEvent, RevisionDecision,
+    derive_revision_failure, effective_review_mode, ensure_independent_claim_gate,
+    finalize_review_for_send, local_decision_review, review_decision, review_passed,
+    should_run_review, FinalizeOutcome, GatewayStatusFinal, PendingFinalizeEvent, RevisionDecision,
 };
 use super::run_envelope::{
     assert_final_review_status_valid, assert_gateway_status_valid, assert_lifecycle_valid,
@@ -102,7 +102,10 @@ fn existing_outbox_covers_decision(
     existing_status: &str,
 ) -> bool {
     existing_decision_id == Some(decision_id)
-        && matches!(existing_status, "pending" | "in_flight" | "sent")
+        && matches!(
+            existing_status,
+            "pending" | "in_flight" | "sent" | "delivery_unknown"
+        )
 }
 
 /// CONC-2：构造 commitments 的原子追加 update。`$push`+`$slice:-8` 保证并发
@@ -155,13 +158,25 @@ pub async fn handle_managed_message_aggregated(
 }
 
 pub async fn handle_follow_up_task(state: &AppState, task: AgentTask) -> AppResult<()> {
+    handle_follow_up_task_with_claim(state, task, None).await
+}
+
+pub async fn handle_follow_up_task_with_claim(
+    state: &AppState,
+    task: AgentTask,
+    task_claim: Option<&crate::tasks::TaskClaim>,
+) -> AppResult<()> {
     // principal_decision_relay：领导已裁决，走专门的 relay 转述路径，而非普通 follow-up。
     if task.kind == "principal_decision_relay" {
-        return crate::agent::escalation::handle_principal_decision_relay(state, &task).await;
+        return crate::agent::escalation::handle_principal_decision_relay_with_claim(
+            state, &task, task_claim,
+        )
+        .await;
     }
     let Some(task_id) = task.id else {
         return Ok(());
     };
+    let task_context = crate::tasks::TaskRunContext::new(task_id, task_claim);
     let contact = state
         .db
         .contacts()
@@ -179,7 +194,7 @@ pub async fn handle_follow_up_task(state: &AppState, task: AgentTask) -> AppResu
         state,
         contact,
         AgentTrigger::FollowUp(&task),
-        Some(task_id),
+        Some(task_context),
         None,
     )
     .await
@@ -281,7 +296,7 @@ pub async fn send_contact_message_gateway(
         },
         ..Default::default()
     };
-    let review = review_decision(
+    let mut review = review_decision(
         state,
         &contact,
         &synthetic_inbound,
@@ -298,25 +313,30 @@ pub async fn send_contact_message_gateway(
         None,
     )
     .await?;
+    let active_profile =
+        crate::agent::domain_profile::load_active_domain_profile(&state.db, &contact.workspace_id)
+            .await;
+    let active_products = if active_profile.transaction_facts_enabled {
+        super::entitlements::load_active_products(&state.db, &contact.workspace_id).await
+    } else {
+        Vec::new()
+    };
+    let priced_from_catalog = ensure_independent_claim_gate(
+        state,
+        &contact,
+        &synthetic_inbound,
+        &decision,
+        &mut review,
+        &active_products,
+        Some(&run_id),
+    )
+    .await;
     // M1：与客户主链路对齐——管理发送也走 finalize_review_for_send 汇总所有硬门
     // （R5.4 verified-knowledge / R3.5-R3.6 协议 / R3.7 预算 / R2.6 should_hold），
     // 不再仅凭 review_passed 的软闸折叠 bool 放行。放行条件带 `&& review_passed`
     // guard：finalize 对软闸失败会标 Approved+needs_revision 指望 revision 循环，而
     // 管理发送无 revision 通道，故必须用 review_passed 二次确认软闸达标（镜像主链路
     // 的 second_passed，gateway.rs 内 revision 分支）。
-    let active_profile =
-        crate::agent::domain_profile::load_active_domain_profile(&state.db, &contact.workspace_id)
-            .await;
-    let priced_from_catalog = if active_profile.transaction_facts_enabled {
-        let active_products =
-            super::entitlements::load_active_products(&state.db, &contact.workspace_id).await;
-        super::entitlements::priced_from_active_catalog(
-            &decision.quoted_product_ids,
-            &active_products,
-        )
-    } else {
-        false
-    };
     // R5.4 第三条并联背书：该客户是否有生效的 A 类领导授权产品豁免。
     let principal_product_exempted = contact_has_principal_product_exemption(&contact);
     let outcome = finalize_review_for_send(
@@ -516,11 +536,7 @@ pub async fn send_contact_message_gateway(
                 contact_wxid = %contact.wxid,
                 "management send outbox idempotent skip"
             );
-            if existing_outbox_covers_decision(
-                existing_decision_id,
-                review_id,
-                &existing_status,
-            ) {
+            if existing_outbox_covers_decision(existing_decision_id, review_id, &existing_status) {
                 "outbox_enqueued"
             } else {
                 "skipped_duplicate"
@@ -715,7 +731,10 @@ async fn maybe_handle_non_text_transition(
             tracing::info!(%run_id, %idempotency_key, contact_wxid = %contact.wxid, %msg_type,
                 "F2: 非文本入站过渡话术 outbox 幂等 skip");
             if existing_run_id == run_id
-                && matches!(existing_status.as_str(), "pending" | "in_flight" | "sent")
+                && matches!(
+                    existing_status.as_str(),
+                    "pending" | "in_flight" | "sent" | "delivery_unknown"
+                )
             {
                 "outbox_enqueued"
             } else {
@@ -768,7 +787,7 @@ pub(crate) async fn run_user_operation_gateway(
     state: &AppState,
     contact: Contact,
     trigger: AgentTrigger<'_>,
-    task_id: Option<ObjectId>,
+    task_context: Option<crate::tasks::TaskRunContext>,
     should_abort_send: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 ) -> AppResult<()> {
     let run_id = uuid::Uuid::new_v4().to_string();
@@ -800,7 +819,7 @@ pub(crate) async fn run_user_operation_gateway(
                 state,
                 contact,
                 trigger,
-                task_id,
+                task_context,
                 run_id,
                 inbound,
                 domain_config,
@@ -908,7 +927,7 @@ pub(crate) async fn relay_principal_decision_to_customer(
     mut contact: Contact,
     entry: &crate::models::AgentPrincipalEscalation,
     decision: &crate::models::PrincipalDecision,
-    task_id: Option<ObjectId>,
+    task_context: Option<crate::tasks::TaskRunContext>,
 ) -> AppResult<()> {
     // 领导裁决是否构成授权（approved / conditional 才授权；rejected 等不授权）。
     // A 类豁免写入（relay 前）与 B 类知识沉淀（relay 后）共用此判定。
@@ -986,7 +1005,7 @@ pub(crate) async fn relay_principal_decision_to_customer(
         state,
         contact.clone(),
         AgentTrigger::Inbound(&synthetic),
-        task_id,
+        task_context,
         None,
     )
     .await?;
@@ -1234,7 +1253,7 @@ async fn run_user_operation_gateway_inner(
     state: &AppState,
     contact: Contact,
     trigger: AgentTrigger<'_>,
-    task_id: Option<ObjectId>,
+    task_context: Option<crate::tasks::TaskRunContext>,
     run_id: String,
     inbound: ConversationMessage,
     domain_config: Option<OperationDomainConfig>,
@@ -1247,7 +1266,7 @@ async fn run_user_operation_gateway_inner(
     let envelope_source_kind = envelope_source_kind.to_string();
     let precheck = precheck_send_gateway(state, &contact, &trigger, &runtime).await?;
     if !precheck.allowed {
-        if let Some(task_id) = task_id {
+        if let Some(task_context) = task_context.as_ref() {
             // #69：静默时段命中 → 重排到醒来时刻（不取消，避免丢承诺/催进）；其余 block 维持取消。
             if precheck.status == "quiet_hours_deferred" {
                 let wake_at = crate::agent::quiet_hours::next_wake_at(
@@ -1256,9 +1275,9 @@ async fn run_user_operation_gateway_inner(
                     &contact.wxid,
                     state.config.wake_jitter_max_seconds,
                 );
-                reschedule_task(state, task_id, wake_at, &precheck.reason).await?;
+                reschedule_task(state, task_context, wake_at, &precheck.reason).await?;
             } else {
-                cancel_task(state, task_id, &precheck.status, &precheck.reason).await?;
+                cancel_task(state, task_context, &precheck.status, &precheck.reason).await?;
             }
         }
         write_event_for_account(
@@ -1860,18 +1879,23 @@ async fn run_user_operation_gateway_inner(
     // G4 #5 收口：报价背书是交易事实的一种消费，统一受 transaction_facts_enabled 闸。
     // 非交易域（情感陪伴）即便误配产品表 + LLM 幻觉 quoted_product_ids，也不放行报价
     // 豁免（方向更严格、安全）。DEFAULT 销售域 = true → 报价背书行为字节等价。
-    let priced_from_catalog = if active_profile.transaction_facts_enabled {
-        let active_products =
-            super::entitlements::load_active_products(&state.db, &contact.workspace_id).await;
-        super::entitlements::priced_from_active_catalog(
-            &final_decision.quoted_product_ids,
-            &active_products,
-        )
+    let active_products = if active_profile.transaction_facts_enabled {
+        super::entitlements::load_active_products(&state.db, &contact.workspace_id).await
     } else {
-        false
+        Vec::new()
     };
     // R5.4 第三条并联背书：该客户是否有生效的 A 类领导授权产品豁免。
     let principal_product_exempted = contact_has_principal_product_exemption(&contact);
+    let priced_from_catalog = ensure_independent_claim_gate(
+        state,
+        &contact,
+        &inbound,
+        &final_decision,
+        &mut review,
+        &active_products,
+        Some(&run_id),
+    )
+    .await;
     let outcome = finalize_review_for_send(
         review,
         &mut final_decision,
@@ -1919,13 +1943,11 @@ async fn run_user_operation_gateway_inner(
         // canonical id；deprecated → 仅 risks 追加；CandidateNew → upsert 候选
         // 队列供 admin review。任何 IO 故障静默跳过（best-effort），不阻塞 run。
         // 这是 CLAUDE.md 硬规则"unreviewed candidates must not block runs"的实现位。
-        let cache = global_taxonomy_cache();
+        let cache = global_taxonomy_cache(&state.db);
         // TTL 自愈：启动 warm_up 后若长期无 admin 写操作触发 invalidate，
         // 30s 后 find_or_load 自动 reload，防 cache 永远 stale。任何 IO 故障被
         // find_or_load 内部 log 后吞掉。
-        cache
-            .find_or_load(&state.db, &contact.workspace_id)
-            .await;
+        cache.find_or_load(&state.db, &contact.workspace_id).await;
         // universal-domain-adaptation H7：校验维度集合改读 active DomainProfile。
         // DEFAULT 销售域返回 ["customer_stage","intent_level"] 逐字等价。
         // （复用本 run 顶部已加载的 active_profile，避免重复 load。）
@@ -2069,8 +2091,11 @@ async fn run_user_operation_gateway_inner(
             let revision_direction = review.revision_direction.trim().to_string();
             // 改写失败/超时回退用：此刻 final_decision 仍是改写前那份已 Approved 的原稿。
             // decide_revision 只在首轮 finalize=Approved 时才返回 Proceed（gates.rs:981），
-            // 故此快照必然是已过全部硬闸的安全原稿；改写没做成时回退发它而非毙掉补兜底。
+            // 但 Approved 仍可能带 pressure / boundary-privacy / dual-reviewer 等安全类
+            // revision trigger；这些 trigger 的改写失败必须 fail closed。保留首轮 review
+            // 快照，让 fallback policy 只对白名单纯风格 trigger 恢复原稿。
             let pre_revision_decision = final_decision.clone();
+            let pre_revision_review = review.clone();
             // R2.3 / R2.10：触发 1 次 revision，把 revisionDirection 透传
             // 给 Reply Agent，30s 超时控制。
             pre_revision_summary = Some(format!(
@@ -2106,7 +2131,7 @@ async fn run_user_operation_gateway_inner(
                     revised_decision.used_knowledge_ids =
                         route_used_knowledge_ids(&knowledge_route);
 
-                    let second_review = review_decision(
+                    let mut second_review = review_decision(
                         state,
                         &contact,
                         &inbound,
@@ -2131,22 +2156,16 @@ async fn run_user_operation_gateway_inner(
                     if final_decision.namecard_to_send.is_none() {
                         final_decision.namecard_to_send = prior_namecard;
                     }
-
-                    // 改写后的 decision 可能换了 quoted_product_ids，重算 priced_from_catalog。
-                    // G4 #5 收口：同上受 transaction_facts_enabled 闸；闸关恒 false。
-                    let second_priced_from_catalog = if active_profile.transaction_facts_enabled {
-                        let active_products = super::entitlements::load_active_products(
-                            &state.db,
-                            &contact.workspace_id,
-                        )
-                        .await;
-                        super::entitlements::priced_from_active_catalog(
-                            &final_decision.quoted_product_ids,
-                            &active_products,
-                        )
-                    } else {
-                        false
-                    };
+                    let second_priced_from_catalog = ensure_independent_claim_gate(
+                        state,
+                        &contact,
+                        &inbound,
+                        &final_decision,
+                        &mut second_review,
+                        &active_products,
+                        Some(&run_id),
+                    )
+                    .await;
                     // R5.4 第三条并联背书：contact 未变，豁免记录同 contact，重算取同值。
                     let second_principal_product_exempted =
                         contact_has_principal_product_exemption(&contact);
@@ -2201,66 +2220,96 @@ async fn run_user_operation_gateway_inner(
                         )
                         .await?;
                     } else {
-                        // 改写稿第二轮 review 未过 → 回退发改写前已 Approved 的原稿（降级放行）。
-                        // 原稿在首轮 finalize 已过 apply_state_action_gate，无需再检。
-                        final_decision = pre_revision_decision.clone();
-                        final_decision.should_reply = true;
+                        // 第二轮未过：按首轮 trigger 分类。纯风格可恢复原稿；安全/边界/
+                        // 压力/双审分歧一律 hold，不允许把已知风险原稿重新标成可发送。
+                        review = pre_revision_review.clone();
                         revision_applied = false;
-                        revision_reason = apply_revision_fallback(
+                        let (reason, restored) = apply_revision_fallback(
                             &mut review,
+                            &runtime,
                             &mut finalize_status,
                             "revision_post_review_failed",
                         );
+                        revision_reason = reason;
+                        if restored {
+                            final_decision = pre_revision_decision.clone();
+                            final_decision.should_reply = true;
+                        } else {
+                            final_decision.should_reply = false;
+                        }
                         post_revision_summary = Some(format!(
-                            "fallback_to_pre_revision reply_text_len={} reason=revision_post_review_failed",
-                            final_decision.reply_text.chars().count()
+                            "revision_post_review_failed restored_pre_revision={} reply_text_len={}",
+                            restored,
+                            final_decision.reply_text.chars().count(),
                         ));
                     }
                 }
                 Ok(Err(err)) => {
-                    // 改写 LLM 调用失败 → 回退发原稿（原稿此分支未被覆盖，仍安全；统一走快照恢复最省心）。
-                    final_decision = pre_revision_decision.clone();
-                    final_decision.should_reply = true;
+                    review = pre_revision_review.clone();
                     revision_applied = false;
-                    revision_reason = apply_revision_fallback(
+                    let (reason, restored) = apply_revision_fallback(
                         &mut review,
+                        &runtime,
                         &mut finalize_status,
                         &format!("revision_llm_error:{}", err),
                     );
+                    revision_reason = reason;
+                    if restored {
+                        final_decision = pre_revision_decision.clone();
+                        final_decision.should_reply = true;
+                    } else {
+                        final_decision.should_reply = false;
+                    }
                     write_event_for_account(
                         state,
                         &contact.account_id,
                         Some(&contact.wxid),
                         "revision_llm_failure",
-                        "info",
-                        "Reply Agent revision 调用失败：回退发送改写前已批准原稿",
+                        if restored { "info" } else { "blocked" },
+                        if restored {
+                            "Reply Agent revision 调用失败：纯风格改写回退到原稿"
+                        } else {
+                            "Reply Agent revision 调用失败：安全类改写 fail closed"
+                        },
                         Some(doc! {
                             "run_id": &run_id,
                             "error": err.to_string(),
+                            "restored_pre_revision": restored,
                         }),
                     )
                     .await?;
                 }
                 Err(_) => {
-                    // 改写 30s 超时 → 回退发改写前已 Approved 的原稿（慢端点下最常见路径）。
-                    final_decision = pre_revision_decision.clone();
-                    final_decision.should_reply = true;
+                    review = pre_revision_review.clone();
                     revision_applied = false;
-                    revision_reason = apply_revision_fallback(
+                    let (reason, restored) = apply_revision_fallback(
                         &mut review,
+                        &runtime,
                         &mut finalize_status,
                         "revision_llm_timeout_30s",
                     );
+                    revision_reason = reason;
+                    if restored {
+                        final_decision = pre_revision_decision.clone();
+                        final_decision.should_reply = true;
+                    } else {
+                        final_decision.should_reply = false;
+                    }
                     write_event_for_account(
                         state,
                         &contact.account_id,
                         Some(&contact.wxid),
                         "revision_llm_failure",
-                        "info",
-                        "Reply Agent revision 调用超时（30s）：回退发送改写前已批准原稿",
+                        if restored { "info" } else { "blocked" },
+                        if restored {
+                            "Reply Agent revision 调用超时（30s）：纯风格改写回退到原稿"
+                        } else {
+                            "Reply Agent revision 调用超时（30s）：安全类改写 fail closed"
+                        },
                         Some(doc! {
                             "run_id": &run_id,
                             "latency_ms": 30000_i64,
+                            "restored_pre_revision": restored,
                         }),
                     )
                     .await?;
@@ -2345,8 +2394,8 @@ async fn run_user_operation_gateway_inner(
             &planner,
         )
         .await?;
-        if let Some(task_id) = task_id {
-            cancel_task(state, task_id, &blocked_status, cancel_reason).await?;
+        if let Some(task_context) = task_context.as_ref() {
+            cancel_task(state, task_context, &blocked_status, cancel_reason).await?;
         }
         write_event_for_account(
             state,
@@ -2450,7 +2499,7 @@ async fn run_user_operation_gateway_inner(
 
     let final_precheck = precheck_send_gateway(state, &contact, &trigger, &runtime).await?;
     if final_decision.should_reply && !final_precheck.allowed {
-        if let Some(task_id) = task_id {
+        if let Some(task_context) = task_context.as_ref() {
             // #69：与第一道 precheck 一致——静默时段命中重排到醒来，其余 block 取消。
             // 第二道在 LLM 决策之后命中（罕见：仅当静默边界恰好落在决策耗时内），
             // 重排即丢弃这次决策、醒来按完整上下文重跑，语义正确。
@@ -2461,11 +2510,11 @@ async fn run_user_operation_gateway_inner(
                     &contact.wxid,
                     state.config.wake_jitter_max_seconds,
                 );
-                reschedule_task(state, task_id, wake_at, &final_precheck.reason).await?;
+                reschedule_task(state, task_context, wake_at, &final_precheck.reason).await?;
             } else {
                 cancel_task(
                     state,
-                    task_id,
+                    task_context,
                     &final_precheck.status,
                     &final_precheck.reason,
                 )
@@ -2622,22 +2671,50 @@ async fn run_user_operation_gateway_inner(
         &planner,
     )
     .await?;
-    // 先建立原始 task → decision_review 关联，再创建 outbox。dispatcher 可能在
-    // enqueue 返回后立即抢占并完成发送；提前写关联可确保其总能找到并推进原任务。
-    // 这里只写关联，不宣称已入队或已送达。
-    if let Some(task_id) = task_id {
-        state
-            .db
-            .tasks()
-            .update_one(
-                doc! { "_id": task_id },
-                doc! { "$set": {
-                    "source_decision_id": decision_review_id,
-                    "updated_at": DateTime::now(),
-                } },
-                None,
+    // SR-034：在创建任何 Outbox 前，把 decision 绑定到本次 task claim。生产路径
+    // 必须以不可复用 token CAS；若 lease 已被 reclaim/新 owner 接管，本 worker 到此
+    // 立即停止，绝不进入 Outbox。旧直接调用入口仅保留按 task_id 的兼容关联。
+    if let Some(task_context) = task_context.as_ref() {
+        let bound = if let Some(claim) = task_context.claim.as_ref() {
+            crate::tasks::bind_task_decision_if_owned(state, claim, decision_review_id).await?
+        } else {
+            state
+                .db
+                .tasks()
+                .update_one(
+                    task_context.write_filter(),
+                    doc! { "$set": {
+                        "outbox_decision_id": decision_review_id,
+                        "updated_at": DateTime::now(),
+                    } },
+                    None,
+                )
+                .await?
+                .matched_count
+                == 1
+        };
+        if !bound {
+            state
+                .db
+                .decision_reviews()
+                .update_one(
+                    doc! { "_id": decision_review_id },
+                    doc! { "$set": { "status": "stale_task_claim" } },
+                    None,
+                )
+                .await?;
+            write_event_for_account(
+                state,
+                &contact.account_id,
+                Some(&contact.wxid),
+                "task_claim_fenced",
+                "stale_task_claim",
+                "任务 lease 已被新 owner 接管，本轮在 Outbox 前终止",
+                Some(doc! { "run_id": &run_id, "decision_id": decision_review_id }),
             )
             .await?;
+            return Ok(());
+        }
     }
     write_knowledge_usage_log(
         state,
@@ -2650,7 +2727,7 @@ async fn run_user_operation_gateway_inner(
     )
     .await?;
     if !text_send_eligible(final_decision.should_reply, &final_decision.reply_text) {
-        if let Some(task_id) = task_id {
+        if let Some(task_context) = task_context.as_ref() {
             // should_reply=false → 无需触达；should_reply=true 但 reply_text 为空 → 退化
             // 决策无内容可发（媒体/名片也因 outbox_eligible 要求非空文本而不会发）。两者都
             // 须落终态，否则 task 卡在 running 被 reclaim 反复重试、3 次后强制 failed。
@@ -2659,7 +2736,7 @@ async fn run_user_operation_gateway_inner(
             } else {
                 "Agent 判断无需触达"
             };
-            cancel_task(state, task_id, "no_reply", reason).await?;
+            cancel_task(state, task_context, "no_reply", reason).await?;
         }
     }
     let details = build_decision_event_details(&final_decision, playbook.as_ref(), &review);
@@ -2795,10 +2872,10 @@ async fn run_user_operation_gateway_inner(
                         None,
                     )
                     .await?;
-                if let Some(task_id) = task_id {
+                if let Some(task_context) = task_context.as_ref() {
                     cancel_task(
                         state,
-                        task_id,
+                        task_context,
                         "superseded_by_new_inbound",
                         "入队前被更新的客户消息取代",
                     )
@@ -2928,10 +3005,10 @@ async fn run_user_operation_gateway_inner(
                     None,
                 )
                 .await?;
-            if let Some(task_id) = task_id {
+            if let Some(task_context) = task_context.as_ref() {
                 cancel_task(
                     state,
-                    task_id,
+                    task_context,
                     "skipped_duplicate",
                     "相同回复已由既有 outbox 覆盖，本轮不重复发送",
                 )
@@ -3004,10 +3081,10 @@ async fn run_user_operation_gateway_inner(
                     None,
                 )
                 .await?;
-            if let Some(task_id) = task_id {
+            if let Some(task_context) = task_context.as_ref() {
                 cancel_task(
                     state,
-                    task_id,
+                    task_context,
                     "outbox_enqueue_partial_failure",
                     "多段回复部分入队失败",
                 )
@@ -3019,47 +3096,18 @@ async fn run_user_operation_gateway_inner(
             }
             return Ok(());
         }
-        if text_outbox_enqueued {
-            state
-                .db
-                .decision_reviews()
-                .update_one(
-                    doc! { "_id": decision_review_id, "status": "outbox_enqueuing" },
-                    doc! { "$set": { "status": "outbox_enqueued" } },
-                    None,
-                )
-                .await?;
-        }
     }
-    if let Some(task_id) = task_id {
-        if text_send_eligible(final_decision.should_reply, &final_decision.reply_text) {
-            if text_outbox_enqueued {
-                crate::models::assert_agent_task_status_valid("outbox_enqueued");
-                state
-                    .db
-                    .tasks()
-                    .update_one(
-                        doc! {
-                            "_id": task_id,
-                            "status": { "$in": ["pending", "retry", "running", "outbox_enqueued"] },
-                        },
-                        doc! { "$set": {
-                            "status": "outbox_enqueued",
-                            "gateway_status": "outbox_enqueued",
-                            "updated_at": DateTime::now(),
-                        } },
-                        None,
-                    )
-                    .await?;
-            } else {
-                cancel_task(
-                    state,
-                    task_id,
-                    "blocked_by_safety_guard",
-                    "发送安全门拦截，未创建 outbox",
-                )
-                .await?;
-            }
+    if let Some(task_context) = task_context.as_ref() {
+        if text_send_eligible(final_decision.should_reply, &final_decision.reply_text)
+            && !text_outbox_enqueued
+        {
+            cancel_task(
+                state,
+                task_context,
+                "blocked_by_safety_guard",
+                "发送安全门拦截，未创建 outbox",
+            )
+            .await?;
         }
     }
     if final_decision.should_reply && !text_outbox_enqueued {
@@ -3232,7 +3280,9 @@ async fn run_user_operation_gateway_inner(
                         "media outbox enqueued"
                     );
                 }
-                Ok(EnqueueOutcome::IdempotentSkip { idempotency_key, .. }) => {
+                Ok(EnqueueOutcome::IdempotentSkip {
+                    idempotency_key, ..
+                }) => {
                     tracing::info!(
                         %run_id,
                         %idempotency_key,
@@ -3318,7 +3368,9 @@ async fn run_user_operation_gateway_inner(
                             Ok(EnqueueOutcome::Created { outbox_id, .. }) => {
                                 tracing::info!(%run_id, %outbox_id, contact_wxid = %contact.wxid, card_id = %directive.card_id, "namecard outbox enqueued");
                             }
-                            Ok(EnqueueOutcome::IdempotentSkip { idempotency_key, .. }) => {
+                            Ok(EnqueueOutcome::IdempotentSkip {
+                                idempotency_key, ..
+                            }) => {
                                 tracing::info!(%run_id, %idempotency_key, card_id = %directive.card_id, "namecard outbox enqueue idempotent skip");
                             }
                             Err(err) => {
@@ -3354,9 +3406,81 @@ async fn run_user_operation_gateway_inner(
             }
         }
     }
-    // 所有文本/素材/名片条目都完成 enqueue 后，先关闭过程态，再聚合完整集合。
-    // dispatcher 在此之前即使抢先送达首段，也只能把 run 聚合为 pending。
+    // 所有文本/素材/名片条目都完成 enqueue 后才提交 task 授权。Dispatcher 在此之前
+    // 即使抢到首段，也只会识别为 Building 并无损 defer；同 token CAS 成功后才允许 MCP。
     if text_outbox_enqueued {
+        let task_authorized = if let Some(task_context) = task_context.as_ref() {
+            if let Some(claim) = task_context.claim.as_ref() {
+                crate::tasks::authorize_task_outbox_if_owned(state, claim, decision_review_id)
+                    .await?
+            } else {
+                crate::models::assert_agent_task_status_valid("outbox_enqueued");
+                state
+                    .db
+                    .tasks()
+                    .update_one(
+                        task_context.write_filter(),
+                        doc! { "$set": {
+                            "status": "outbox_enqueued",
+                            "gateway_status": "outbox_enqueued",
+                            "outbox_decision_id": decision_review_id,
+                            "updated_at": DateTime::now(),
+                        } },
+                        None,
+                    )
+                    .await?
+                    .matched_count
+                    == 1
+            }
+        } else {
+            true
+        };
+        if !task_authorized {
+            state
+                .db
+                .decision_reviews()
+                .update_one(
+                    doc! { "_id": decision_review_id, "status": "outbox_enqueuing" },
+                    doc! { "$set": { "status": "stale_task_claim" } },
+                    None,
+                )
+                .await?;
+            state
+                .db
+                .agent_run_logs()
+                .update_one(
+                    doc! { "run_id": &run_id, "status": "outbox_enqueuing" },
+                    doc! { "$set": {
+                        "status": "stale_task_claim",
+                        "lifecycle": crate::agent::run_envelope::LIFECYCLE_ABORTED_BY_EXTERNAL_SIGNAL,
+                        "abort_reason": "stale_task_claim",
+                        "updated_at": DateTime::now(),
+                    } },
+                    None,
+                )
+                .await?;
+            write_event_for_account(
+                state,
+                &contact.account_id,
+                Some(&contact.wxid),
+                "task_claim_fenced",
+                "stale_task_claim",
+                "Outbox 已构建但任务授权 CAS 失败，Dispatcher 将取消旧 owner 条目",
+                Some(doc! { "run_id": &run_id, "decision_id": decision_review_id }),
+            )
+            .await?;
+            super::outbox_dispatcher::refresh_run_log_outbox_status(state, &run_id).await;
+            return Ok(());
+        }
+        state
+            .db
+            .decision_reviews()
+            .update_one(
+                doc! { "_id": decision_review_id, "status": "outbox_enqueuing" },
+                doc! { "$set": { "status": "outbox_enqueued" } },
+                None,
+            )
+            .await?;
         state
             .db
             .agent_run_logs()
@@ -3411,8 +3535,8 @@ pub(crate) async fn send_outbound_message(
     contact: &Contact,
     content: &str,
     extra_raw: Option<Document>,
-) -> AppResult<serde_json::Value> {
-    let response = mcp::logged_call_for_account(
+) -> Result<serde_json::Value, super::types::OutboundSendError> {
+    let response = mcp::logged_send_call_for_account(
         state,
         &contact.account_id,
         "message_send_text",
@@ -3421,13 +3545,14 @@ pub(crate) async fn send_outbound_message(
             "content": content
         }),
     )
-    .await?;
+    .await
+    .map_err(super::types::OutboundSendError::from)?;
     let message_id = response
         .get("newMsgId")
         .and_then(|value| value.as_str())
         .map(ToString::to_string);
     if !send_receipt_is_ok(&response) {
-        return Err(AppError::External(
+        return Err(super::types::OutboundSendError::SafeToRetry(
             "message_send_text returned a negative or unverifiable delivery receipt".to_string(),
         ));
     }
@@ -3993,7 +4118,7 @@ fn utc_today_start_millis() -> i64 {
 
 async fn cancel_task(
     state: &AppState,
-    task_id: ObjectId,
+    task_context: &crate::tasks::TaskRunContext,
     status: &str,
     reason: &str,
 ) -> AppResult<()> {
@@ -4002,13 +4127,18 @@ async fn cancel_task(
         .db
         .tasks()
         .update_one(
-            doc! { "_id": task_id },
+            task_context.write_filter(),
             doc! {
                 "$set": {
                     "status": "cancelled",
                     "gateway_status": status,
                     "cancel_reason": reason,
                     "updated_at": DateTime::now()
+                },
+                "$unset": {
+                    "claimed_at": "",
+                    "claim_token": "",
+                    "outbox_decision_id": "",
                 }
             },
             None,
@@ -4026,7 +4156,7 @@ async fn cancel_task(
 /// `next_retry_at` 让 worker 在醒来时干净地重新认领。
 async fn reschedule_task(
     state: &AppState,
-    task_id: ObjectId,
+    task_context: &crate::tasks::TaskRunContext,
     run_at: DateTime,
     reason: &str,
 ) -> AppResult<()> {
@@ -4035,7 +4165,7 @@ async fn reschedule_task(
         .db
         .tasks()
         .update_one(
-            doc! { "_id": task_id },
+            task_context.write_filter(),
             doc! {
                 "$set": {
                     "status": "pending",
@@ -4045,7 +4175,12 @@ async fn reschedule_task(
                     "updated_at": DateTime::now()
                 },
                 "$inc": { "attempt_count": -1 },
-                "$unset": { "claimed_at": "", "next_retry_at": "" }
+                "$unset": {
+                    "claimed_at": "",
+                    "claim_token": "",
+                    "outbox_decision_id": "",
+                    "next_retry_at": ""
+                }
             },
             None,
         )
@@ -5199,6 +5334,10 @@ pub(crate) async fn write_decision_review(
                 outcome_status: Some("pending".to_string()),
                 reaction_analysis: Document::new(),
                 reaction_claimed_at: None,
+                reaction_claim_token: None,
+                reaction_claim_generation: 0,
+                source_task_id: None,
+                source_task_claim_token: None,
                 reviewer_misjudge_signal: None,
                 expected_text_segments: if status == "outbox_enqueuing" {
                     split_reply_into_segments(

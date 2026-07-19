@@ -108,13 +108,12 @@ pub async fn acquire_chunk_lock(
 ) -> impl IntoResponse {
     let now = Utc::now();
     let ttl = Duration::seconds(CHUNK_LOCK_TTL_SECONDS);
-    let actor_label = payload.actor_label.unwrap_or_else(|| admin.username.clone());
+    let actor_label = payload
+        .actor_label
+        .unwrap_or_else(|| admin.username.clone());
 
     // 先尝试拿到现有锁的快照判断 owner / 过期
-    let existing = state
-        .chunk_locks
-        .get(&chunk_id)
-        .map(|r| r.value().clone());
+    let existing = state.chunk_locks.get(&chunk_id).map(|r| r.value().clone());
 
     if let Some(lock) = existing {
         if !lock.is_expired(now) && lock.owner_user_id != admin.user_id {

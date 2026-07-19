@@ -20,17 +20,161 @@ pub(crate) use policy::*;
 pub use logic::fallback_holding_reply;
 
 use super::generate_agent_json;
+use super::outbox::{enqueue as outbox_enqueue, EnqueueOutcome, EnqueueRequest};
+use super::run_envelope::SOURCE_KIND_FOLLOW_UP_TASK;
 use super::types::{AgentDecision, DecisionReviewResult};
 use crate::error::{AppError, AppResult};
+use crate::mcp;
 use crate::models::{
-    AgentPrincipalEscalation, AgentTask, Contact, OperationDomainConfig, PrincipalDecision,
-    AWAITING_PRINCIPAL_DECISION_ATTR, ESCALATION_CATEGORY_HIGH_RISK_GATED,
+    AgentDecisionReview, AgentPrincipalEscalation, AgentTask, Contact, OperationDomainConfig,
+    PrincipalDecision, AWAITING_PRINCIPAL_DECISION_ATTR, ESCALATION_CATEGORY_HIGH_RISK_GATED,
     PRINCIPAL_VERDICT_DEFERRED,
 };
-use crate::mcp;
 use crate::prompts;
 use crate::routes::AppState;
 use mongodb::bson::{doc, DateTime};
+
+async fn enqueue_holding_reply(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+    contact_wxid: &str,
+    run_id: String,
+    source_event_id: String,
+    decision_id: Option<mongodb::bson::oid::ObjectId>,
+    content: String,
+) -> AppResult<EnqueueOutcome> {
+    Ok(outbox_enqueue(
+        state,
+        EnqueueRequest {
+            workspace_id: workspace_id.to_string(),
+            account_id: account_id.to_string(),
+            contact_wxid: contact_wxid.to_string(),
+            run_id,
+            decision_id,
+            source_event_id,
+            source_kind: SOURCE_KIND_FOLLOW_UP_TASK.to_string(),
+            content,
+            media_asset_id: None,
+            referral_card_id: None,
+            max_attempts: 3,
+        },
+    )
+    .await?)
+}
+
+/// Enqueue an expired-authorization holding reply under the same fenced task protocol as the
+/// normal gateway. The review is the durable task→decision binding consumed by the dispatcher.
+async fn enqueue_expired_relay_holding_reply(
+    state: &AppState,
+    task: &AgentTask,
+    claim: &crate::tasks::TaskClaim,
+    contact: &Contact,
+    short_code: &str,
+    content: String,
+) -> AppResult<bool> {
+    let review_id = mongodb::bson::oid::ObjectId::new();
+    let run_id = format!("holding-expired-{}", claim.task_id.to_hex());
+    state
+        .db
+        .decision_reviews()
+        .insert_one(
+            AgentDecisionReview {
+                id: Some(review_id),
+                workspace_id: contact.workspace_id.clone(),
+                account_id: contact.account_id.clone(),
+                contact_wxid: Some(contact.wxid.clone()),
+                run_id: Some(run_id.clone()),
+                inbound_message_id: None,
+                reply_text: Some(content.clone()),
+                approved: true,
+                scores: Default::default(),
+                formula_breakdown: Default::default(),
+                risks: Vec::new(),
+                rewrite_instruction: None,
+                review_summary: Some(
+                    "expired authorization neutral holding reply passed independent safety review"
+                        .to_string(),
+                ),
+                playbook_id: None,
+                playbook_version: None,
+                used_knowledge_ids: Vec::new(),
+                prompt_versions: Default::default(),
+                operation_state: None,
+                next_best_action: Default::default(),
+                context_pack_snapshot: Default::default(),
+                domain_config_snapshot: Default::default(),
+                runtime_parameters_snapshot: Default::default(),
+                send_gateway_result: doc! {
+                    "allowed": true,
+                    "status": "outbox_enqueuing",
+                    "deliveryKind": "expired_principal_authorization_holding",
+                },
+                outcome_status: Some("pending".to_string()),
+                reaction_analysis: Default::default(),
+                reaction_claimed_at: None,
+                reaction_claim_token: None,
+                reaction_claim_generation: 0,
+                source_task_id: None,
+                source_task_claim_token: None,
+                reviewer_misjudge_signal: None,
+                expected_text_segments: 1,
+                status: "outbox_enqueuing".to_string(),
+                created_at: DateTime::now(),
+            },
+            None,
+        )
+        .await?;
+
+    if !crate::tasks::bind_task_decision_if_owned(state, claim, review_id).await? {
+        state
+            .db
+            .decision_reviews()
+            .update_one(
+                doc! { "_id": review_id },
+                doc! { "$set": { "status": "stale_task_claim" } },
+                None,
+            )
+            .await?;
+        return Ok(false);
+    }
+
+    let _ = enqueue_holding_reply(
+        state,
+        &contact.workspace_id,
+        &contact.account_id,
+        &contact.wxid,
+        run_id,
+        format!("principal-expired:{short_code}:{}", claim.claim_token),
+        Some(review_id),
+        content,
+    )
+    .await?;
+
+    if !crate::tasks::authorize_task_outbox_if_owned(state, claim, review_id).await? {
+        state
+            .db
+            .decision_reviews()
+            .update_one(
+                doc! { "_id": review_id, "status": "outbox_enqueuing" },
+                doc! { "$set": { "status": "stale_task_claim" } },
+                None,
+            )
+            .await?;
+        return Ok(false);
+    }
+    state
+        .db
+        .decision_reviews()
+        .update_one(
+            doc! { "_id": review_id, "status": "outbox_enqueuing" },
+            doc! { "$set": { "status": "outbox_enqueued" } },
+            None,
+        )
+        .await?;
+    let _ = task;
+    Ok(true)
+}
 
 /// hold→升级请示：被风险闸门拦下的高风险件，按 workspace 升级模式请示领导。
 ///
@@ -80,8 +224,7 @@ pub(crate) async fn escalate_held_decision(
     // 骚扰门：daily_push_cap / quiet_hours（None 配置全放行，字节等价）。
     let now_ms = mongodb::bson::DateTime::now().timestamp_millis();
     let since_ms = now_ms - 24 * 3600 * 1000;
-    let today =
-        count_pushes_today(state, &contact.workspace_id, &principal_wxid, since_ms).await?;
+    let today = count_pushes_today(state, &contact.workspace_id, &principal_wxid, since_ms).await?;
     let last_push = latest_push_ms(state, &contact.workspace_id, &principal_wxid).await?;
     if !crate::agent::escalation::push_allowed(&policy, today, last_push, now_ms) {
         return Ok(()); // 骚扰门关：跳过推卡（pending 台账可由 admin 在收件箱处置）
@@ -161,6 +304,19 @@ pub(crate) async fn handle_principal_decision_relay(
     state: &AppState,
     task: &AgentTask,
 ) -> AppResult<()> {
+    handle_principal_decision_relay_with_claim(state, task, None).await
+}
+
+pub(crate) async fn handle_principal_decision_relay_with_claim(
+    state: &AppState,
+    task: &AgentTask,
+    task_claim: Option<&crate::tasks::TaskClaim>,
+) -> AppResult<()> {
+    if let Some(claim) = task_claim {
+        if !crate::tasks::task_claim_is_current(state, claim).await? {
+            return Ok(());
+        }
+    }
     let short_code = task.content.trim();
     let entry = state
         .db
@@ -193,9 +349,8 @@ pub(crate) async fn handle_principal_decision_relay(
             )
             .await?;
         if let Some(contact) = contact {
-            crate::agent::gateway::clear_awaiting_principal_state(state, &contact).await?;
-            // 授权已过期：substance 传 None（过期即不可用作事实源，AI 只发中性收尾、绝不复述过期数字，
-            // 语义同 relay_substance_if_usable 过期返 None）。保留裸 MCP 直发不变，仅换文案来源。
+            // Expired authorization is not a fact source. The neutral holding reply is reviewed
+            // independently and then handed to the durable outbox rather than sent by bare MCP.
             let holding_text = generate_holding_reply(
                 state,
                 &contact.account_id,
@@ -204,16 +359,36 @@ pub(crate) async fn handle_principal_decision_relay(
                 None,
             )
             .await;
-            let _ = mcp::logged_call_for_account(
-                state,
-                &contact.account_id,
-                "message_send_text",
-                serde_json::json!({
-                    "recipient": &contact.wxid,
-                    "content": holding_text
-                }),
-            )
-            .await;
+            if let Some(claim) = task_claim {
+                let _ = enqueue_expired_relay_holding_reply(
+                    state,
+                    task,
+                    claim,
+                    &contact,
+                    short_code,
+                    holding_text,
+                )
+                .await?;
+            } else {
+                // Compatibility for direct test/tool invocations that do not represent a claimed
+                // AgentTask. Production worker/admin paths always carry a claim.
+                let _ = enqueue_holding_reply(
+                    state,
+                    &contact.workspace_id,
+                    &contact.account_id,
+                    &contact.wxid,
+                    format!(
+                        "holding-expired-{}",
+                        task.id
+                            .map(|id| id.to_hex())
+                            .unwrap_or_else(|| short_code.to_string())
+                    ),
+                    format!("principal-expired:{short_code}"),
+                    None,
+                    holding_text,
+                )
+                .await?;
+            }
         }
         return Ok(());
     }
@@ -234,8 +409,23 @@ pub(crate) async fn handle_principal_decision_relay(
         return Ok(());
     };
 
-    crate::agent::gateway::relay_principal_decision_to_customer(state, contact, &entry, &decision, task.id)
-        .await
+    if let Some(claim) = task_claim {
+        if !crate::tasks::task_claim_is_current(state, claim).await? {
+            return Ok(());
+        }
+    }
+
+    let task_context = task
+        .id
+        .map(|task_id| crate::tasks::TaskRunContext::new(task_id, task_claim));
+    crate::agent::gateway::relay_principal_decision_to_customer(
+        state,
+        contact,
+        &entry,
+        &decision,
+        task_context,
+    )
+    .await
 }
 
 /// 用 LLM 把真人自然语言回复解读成结构化裁决。绝不原话转发给客户。
@@ -341,7 +531,8 @@ pub(crate) async fn handle_principal_reply(
                     None
                 }
             });
-            let resolved = resolve_escalation(state, &short_code, &decision, expires, "wechat").await?;
+            let resolved =
+                resolve_escalation(state, &short_code, &decision, expires, "wechat").await?;
             if resolved.is_none() {
                 return Ok(true); // 已被并发 resolve；幂等。
             }
@@ -376,13 +567,15 @@ pub async fn scan_escalation_timeouts(state: &AppState) -> AppResult<()> {
         for entry in pending {
             let age_hours =
                 (now_ms - entry.updated_at.timestamp_millis()) as f64 / (3600.0 * 1000.0);
-            let Some(next) = next_decider_on_timeout(&policy, &entry.principal_wxid, &entry.contact_wxid, age_hours)
-            else {
+            let Some(next) = next_decider_on_timeout(
+                &policy,
+                &entry.principal_wxid,
+                &entry.contact_wxid,
+                age_hours,
+            ) else {
                 // next_decider_on_timeout 返回 None 有两种情形：①尚未超时 ②已超时但到链尾。
                 // 仅情形②需安抚客户。policy.timeout_hours 在 :365 已确保 Some，可直接比对区分。
-                let timed_out = policy
-                    .timeout_hours
-                    .map_or(false, |t| age_hours >= t);
+                let timed_out = policy.timeout_hours.map_or(false, |t| age_hours >= t);
                 if timed_out {
                     // 链尾：无更多决策人可改派。客户不能被永久晾着——发 AI 自主延期安抚话术，
                     // 台账保持 pending 继续等领导。去重：每 holding_reply_min_interval_hours 最多一条。
@@ -394,8 +587,7 @@ pub async fn scan_escalation_timeouts(state: &AppState) -> AppResult<()> {
                         .last_holding_reply_ms
                         .map_or(true, |last| now_ms - last >= min_interval_ms);
                     if should_send {
-                        // 链尾纯安抚：还在核实、不涉及具体授权数字，substance 传 None。
-                        // 保留裸 MCP 直发（C 类不走 outbox）与 last_holding_reply_ms 去重不变，仅换文案来源。
+                        // Chain-tail holding reply: semantic review first, durable outbox second.
                         let holding_text = generate_holding_reply(
                             state,
                             &entry.account_id,
@@ -404,25 +596,35 @@ pub async fn scan_escalation_timeouts(state: &AppState) -> AppResult<()> {
                             None,
                         )
                         .await;
-                        let _ = mcp::logged_call_for_account(
-                            state,
-                            &entry.account_id,
-                            "message_send_text",
-                            serde_json::json!({
-                                "recipient": &entry.contact_wxid,
-                                "content": holding_text
-                            }),
-                        )
-                        .await;
-                        if let Err(e) = touch_last_holding_reply_ms(
+                        let window_ms = min_interval_ms.max(1);
+                        let window = now_ms.div_euclid(window_ms);
+                        let enqueue_result = enqueue_holding_reply(
                             state,
                             &cfg.workspace_id,
-                            &entry.short_code,
-                            now_ms,
+                            &entry.account_id,
+                            &entry.contact_wxid,
+                            format!("holding-chain-tail-{}-{window}", entry.short_code),
+                            format!("principal-chain-tail:{}:{window}", entry.short_code),
+                            None,
+                            holding_text,
                         )
-                        .await
-                        {
-                            tracing::warn!(short_code = %entry.short_code, error = ?e, "链尾安抚已发但更新 last_holding_reply_ms 失败");
+                        .await;
+                        match enqueue_result {
+                            Ok(_) => {
+                                if let Err(e) = touch_last_holding_reply_ms(
+                                    state,
+                                    &cfg.workspace_id,
+                                    &entry.short_code,
+                                    now_ms,
+                                )
+                                .await
+                                {
+                                    tracing::warn!(short_code = %entry.short_code, error = ?e, "链尾安抚已入队但更新 last_holding_reply_ms 失败");
+                                }
+                            }
+                            Err(error) => {
+                                tracing::warn!(short_code = %entry.short_code, ?error, "chain-tail holding reply enqueue failed; retry remains eligible");
+                            }
                         }
                     }
                 }

@@ -25,7 +25,12 @@ use wechatagent::models::OperationKnowledgeChunk;
 
 // ── 已知 chunk_type 4 类（与 knowledge_router.rs 内部 order[] 对齐） ──
 
-const KNOWN_TYPES: [&str; 4] = ["product_fact", "style_template", "peer_case", "negative_example"];
+const KNOWN_TYPES: [&str; 4] = [
+    "product_fact",
+    "style_template",
+    "peer_case",
+    "negative_example",
+];
 
 const HEADER_PRODUCT_FACT: &str = "【产品事实 product_fact】";
 const HEADER_STYLE_TEMPLATE: &str = "【语气模板 style_template】";
@@ -88,8 +93,7 @@ fn arb_known_type() -> impl Strategy<Value = String> {
 // 末尾加 `_END` sentinel，防止 substring 误匹配（如 `title_known_1` 是
 // `title_known_10` 的子串）。
 fn arb_chunk_with_known_type() -> impl Strategy<Value = (String, String)> {
-    (0u32..10_000, arb_known_type())
-        .prop_map(|(idx, t)| (format!("title_known_{idx}_END"), t))
+    (0u32..10_000, arb_known_type()).prop_map(|(idx, t)| (format!("title_known_{idx}_END"), t))
 }
 
 // 任意（含未知）chunk_type 字符串：纯 ASCII 小写、长度 0..16，覆盖空串。

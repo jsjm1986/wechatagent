@@ -77,8 +77,7 @@ fn knowledge_chat_task_bson_roundtrip() {
     };
     let bson = to_bson(&task).expect("serialize");
     let doc: Document = bson.as_document().expect("doc").clone();
-    let back: KnowledgeChatTask =
-        mongodb::bson::from_document(doc).expect("roundtrip deserialize");
+    let back: KnowledgeChatTask = mongodb::bson::from_document(doc).expect("roundtrip deserialize");
     assert_eq!(back.status, "pending");
     assert_eq!(back.planned_steps.len(), 1);
 }

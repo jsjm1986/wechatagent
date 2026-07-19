@@ -23,8 +23,8 @@ pub mod accounts;
 pub mod admin_ops_versions;
 mod admin_outbox;
 mod admin_relationship_suggestions;
-pub mod admin_suspected_deals;
 mod admin_state_policies;
+pub mod admin_suspected_deals;
 mod admin_taxonomies;
 mod admin_taxonomy_candidates;
 // pub（非 pub(crate)）：ask_human_phase1_e2e.rs 集成测试需从 tests/ crate 直调
@@ -44,9 +44,9 @@ pub mod chunk_locks;
 // crate 直调 update_assist_override handler 真函数（缺口 2 override + IDOR），仿
 // domain_profiles / ask_human_inbox 先例。生产路由注册仍走下方 use。
 pub mod contacts;
-mod conversations;
 #[cfg(test)]
 mod contract_snapshot;
+mod conversations;
 // pub（非 pub(crate)）：domain_profile_e2e.rs 集成测试需从 tests/ crate 直调
 // publish/update/rollout/rollback handler 真函数（覆盖 realign + $set 部分更新），仿
 // guide_profile 已有先例。生产路由注册仍走下方 use。
@@ -83,18 +83,16 @@ pub mod principal_escalations;
 mod products;
 pub mod prompt_templates;
 mod referral_cards;
-mod send_ledger;
 mod reviews;
+mod send_ledger;
 mod shared;
 mod simulations;
 mod souls;
 pub mod tasks;
 
+pub use knowledge::{ChunkBatchArchiveRequest, ChunkBatchVerifyRequest, ChunkReferrersQuery};
 pub use outcomes_autonomy::{
     get_autonomy_outcomes, list_autonomy_revisions, AutonomyMetricsQuery, AutonomyRevisionsQuery,
-};
-pub use knowledge::{
-    ChunkBatchArchiveRequest, ChunkBatchVerifyRequest, ChunkReferrersQuery,
 };
 // G3：批量动作 + 反向查询的处理函数。集成测试直接调用绕过 axum HTTP 层。
 pub mod ext_knowledge {
@@ -112,10 +110,10 @@ pub mod ext_knowledge {
     // `decide_auto_verify_status` 暴露用于直接对 provenance 闸门做单元级红线断言。
     pub use super::knowledge::{
         auto_verify_operation_knowledge_chunks, decide_auto_verify_status,
-        extract_operation_knowledge_tags, import_operation_knowledge_preview,
-        propose_chunk_repair, reject_operation_knowledge_chunk, run_import_extraction,
-        verify_operation_knowledge_chunk, ExtractKnowledgeTagsRequest,
-        KnowledgeAutoVerifyRequest, KnowledgeVerifyRequest, OperationKnowledgeImportRequest,
+        extract_operation_knowledge_tags, import_operation_knowledge_preview, propose_chunk_repair,
+        reject_operation_knowledge_chunk, run_import_extraction, verify_operation_knowledge_chunk,
+        ExtractKnowledgeTagsRequest, KnowledgeAutoVerifyRequest, KnowledgeVerifyRequest,
+        OperationKnowledgeImportRequest,
     };
     // real-LLM 知识库全能力 smoke（real_llm_knowledge.rs K10–K11）：
     // K10 = 对话工作台（chat_turn → run_chat_turn_pipeline，真模型意图分类 + 切片起草）；
@@ -154,43 +152,39 @@ use admin_ops_versions::{
     rollout_taxonomy_version,
 };
 use admin_outbox::{cancel_outbox, list_outbox};
-use admin_state_policies::{get_operation_state_policy, list_operation_state_policies};
-use admin_taxonomies::{
-    create_taxonomy, delete_taxonomy, list_taxonomies, patch_taxonomy,
-};
-use admin_taxonomy_candidates::{
-    approve_taxonomy_candidate, list_taxonomy_candidates, reject_taxonomy_candidate,
-};
 use admin_relationship_suggestions::{
     approve_relationship_suggestion, list_relationship_suggestions, reject_relationship_suggestion,
 };
-use admin_suspected_deals::{
-    approve_suspected_deal, list_suspected_deals, reject_suspected_deal,
+use admin_state_policies::{get_operation_state_policy, list_operation_state_policies};
+use admin_suspected_deals::{approve_suspected_deal, list_suspected_deals, reject_suspected_deal};
+use admin_taxonomies::{create_taxonomy, delete_taxonomy, list_taxonomies, patch_taxonomy};
+use admin_taxonomy_candidates::{
+    approve_taxonomy_candidate, list_taxonomy_candidates, reject_taxonomy_candidate,
 };
-use assets::{create_content_asset, list_content_assets};
 use ask_human_inbox::{ask_human_inbox, ask_human_summary};
+use assets::{create_content_asset, list_content_assets};
+use behavior_signal_metrics::list_behavior_signal_metrics;
+use campaigns::{
+    campaign_sends_report, create_campaign, dispatch_campaign, list_campaigns, preview_campaign,
+};
 use contacts::{
-    analyze_contact_profile, add_deal_event, batch_enable_endpoint, clear_referral, disable_agent,
-    enable_agent,
-    get_contact, get_contact_memory_card, get_operating_memory, get_operation_health,
-    hide_from_pool,
-    count_contacts, import_contacts_endpoint, list_contact_memory_candidates, list_contacts,
-    list_entitlements,
-    list_outcome_events, revoke_principal_exemption, roster_endpoint,
-    run_contact_memory_consolidation,
-    search_contacts_endpoint, search_import_contacts, update_operating_memory,
-    update_operation_profile, update_profile_note, update_assist_override,
-    update_custom_agent_instructions, update_manual_tags,
+    add_deal_event, analyze_contact_profile, batch_enable_endpoint, clear_referral, count_contacts,
+    disable_agent, enable_agent, get_contact, get_contact_memory_card, get_operating_memory,
+    get_operation_health, hide_from_pool, import_contacts_endpoint, list_contact_memory_candidates,
+    list_contacts, list_entitlements, list_outcome_events, revoke_principal_exemption,
+    roster_endpoint, run_contact_memory_consolidation, search_contacts_endpoint,
+    search_import_contacts, update_assist_override, update_custom_agent_instructions,
+    update_manual_tags, update_operating_memory, update_operation_profile, update_profile_note,
 };
 use conversations::list_messages;
-use domain_schemas::{
-    activate_domain_schema, create_domain_schema, delete_domain_schema, list_domain_schemas,
-    update_domain_schema,
-};
 use domain_profiles::{
     activate_domain_profile, active_domain_profile, create_domain_profile, delete_domain_profile,
     get_domain_profile, list_domain_profiles, publish_domain_profile, rollback_domain_profile,
     rollout_domain_profile, update_domain_profile,
+};
+use domain_schemas::{
+    activate_domain_schema, create_domain_schema, delete_domain_schema, list_domain_schemas,
+    update_domain_schema,
 };
 use domains::{
     get_operation_domain, get_operation_domain_state_machine, list_operation_domains,
@@ -207,82 +201,61 @@ use evolution::{
     list_threshold_override_audit, put_evolution_runtime_flag, release_evolution_proposal,
     rollback_evolution_proposal,
 };
-use guides::{apply_user_operation_guide, preview_user_operation_guide};
 use guide_profile::generate_domain_profile_candidate;
+use guides::{apply_user_operation_guide, preview_user_operation_guide};
 use health::health;
-use llm_providers::{
-    activate_provider, create_provider, delete_provider, list_providers, set_vision_active,
-    test_provider,
-    update_provider,
-};
 use knowledge::{
-    analyze_operation_knowledge_logs, answer_chunk_repair,
-    apply_knowledge_gap_signal,
-    archive_operation_knowledge_chunk, ask_knowledge, ask_knowledge_stream, knowledge_metrics,
-    auto_verify_operation_knowledge_chunks,
-    batch_archive_chunks, batch_verify_chunks,
-    chat_apply, chat_discard,
-    chat_history, chat_session_stream, chat_task_cancel, chat_task_create, chat_task_get,
-    chat_task_list,
-    chat_turn, create_ingest_source, create_operation_knowledge,
-    create_operation_knowledge_chunk, create_operation_knowledge_document,
-    delete_ingest_source, delete_operation_knowledge, delete_operation_knowledge_chunk,
+    analyze_operation_knowledge_logs, answer_chunk_repair, apply_knowledge_gap_signal,
+    archive_operation_knowledge_chunk, ask_knowledge, ask_knowledge_stream,
+    auto_verify_operation_knowledge_chunks, batch_archive_chunks, batch_verify_chunks, chat_apply,
+    chat_discard, chat_history, chat_session_stream, chat_task_cancel, chat_task_create,
+    chat_task_get, chat_task_list, chat_turn, create_ingest_source, create_operation_knowledge,
+    create_operation_knowledge_chunk, create_operation_knowledge_document, delete_ingest_source,
+    delete_operation_knowledge, delete_operation_knowledge_chunk,
     delete_operation_knowledge_document, digest_dismiss_card, digest_regenerate, digest_today,
-    dismiss_knowledge_gap_signal,
+    dismiss_knowledge_gap_signal, extract_operation_knowledge_tags, get_import_preview_job,
     get_operation_knowledge_catalog, get_operation_knowledge_catalog_persisted,
     get_operation_knowledge_chunk, get_operation_knowledge_chunk_source,
-    get_operation_knowledge_completeness,
-    get_operation_knowledge_document, get_operation_knowledge_integrity_report,
-    extract_operation_knowledge_tags, get_import_preview_job, import_operation_knowledge_apply,
+    get_operation_knowledge_completeness, get_operation_knowledge_document,
+    get_operation_knowledge_integrity_report, import_operation_knowledge_apply,
     import_operation_knowledge_apply_image, import_operation_knowledge_apply_pdf,
     import_operation_knowledge_preview, knowledge_aggregate_metadata, knowledge_inbox,
-    list_import_preview_jobs,
-    list_chunk_referrers,
-    list_ingest_sources,
-    list_knowledge_gap_signals,
-    list_knowledge_usage,
-    list_operation_knowledge, list_operation_knowledge_chunk_revisions,
-    list_operation_knowledge_chunks,
+    knowledge_metrics, list_chunk_referrers, list_import_preview_jobs, list_ingest_sources,
+    list_knowledge_gap_signals, list_knowledge_usage, list_operation_knowledge,
+    list_operation_knowledge_chunk_revisions, list_operation_knowledge_chunks,
     list_operation_knowledge_document_chunks, list_operation_knowledge_documents,
-    list_operator_memory,
-    merge_operation_knowledge_chunk,
-    open_operation_knowledge_slices, patch_operation_knowledge_chunk,
-    propose_chunk_repair,
-    record_repair_apply, refresh_operation_knowledge_completeness,
-    reject_operation_knowledge_chunk, relate_operation_knowledge_chunk,
-    restore_operation_knowledge_chunk, rollback_operation_knowledge_chunk,
-    search_operation_knowledge_tool, split_operation_knowledge_chunk,
-    sweep_knowledge_gap_signals,
-    test_operation_knowledge_match, unrelate_operation_knowledge_chunk,
-    update_operation_knowledge,
+    list_operator_memory, merge_operation_knowledge_chunk, open_operation_knowledge_slices,
+    patch_operation_knowledge_chunk, propose_chunk_repair, record_repair_apply,
+    refresh_operation_knowledge_completeness, reject_operation_knowledge_chunk,
+    relate_operation_knowledge_chunk, restore_operation_knowledge_chunk,
+    rollback_operation_knowledge_chunk, search_operation_knowledge_tool,
+    split_operation_knowledge_chunk, sweep_knowledge_gap_signals, test_operation_knowledge_match,
+    unrelate_operation_knowledge_chunk, update_ingest_source, update_operation_knowledge,
     update_operation_knowledge_chunk, update_operation_knowledge_document,
-    update_ingest_source,
     verify_operation_knowledge_chunk,
 };
-use management::{
-    confirm_management_command, create_management_session, get_management_command, get_tool_catalog,
-    post_management_message, reject_management_command,
-};
-use behavior_signal_metrics::list_behavior_signal_metrics;
 use lessons_learned::{list_lessons_learned, promote_lesson_to_peer_case};
+use llm_providers::{
+    activate_provider, create_provider, delete_provider, list_providers, set_vision_active,
+    test_provider, update_provider,
+};
+use management::{
+    confirm_management_command, create_management_session, get_management_command,
+    get_tool_catalog, post_management_message, reject_management_command,
+};
 use observability::{phase_rollup, worker_health};
 use outcome_metrics::list_agent_outcome_metrics;
 use playbooks::{
     create_operation_playbook, generate_operation_playbook, list_operation_playbooks,
     optimize_operation_playbook, set_default_operation_playbook, update_operation_playbook,
 };
+use principal_escalations::{
+    list_principal_escalations, reassign_principal_escalation, resolve_principal_escalation,
+};
+use products::{archive_product, create_product, list_products, restore_product, update_product};
 use prompt_templates::{
     create_prompt_template, list_prompt_templates, publish_prompt_template,
     reset_system_prompt_pack, update_prompt_template,
-};
-use products::{
-    archive_product, create_product, list_products, restore_product, update_product,
-};
-use campaigns::{
-    campaign_sends_report, create_campaign, dispatch_campaign, list_campaigns, preview_campaign,
-};
-use principal_escalations::{
-    list_principal_escalations, reassign_principal_escalation, resolve_principal_escalation,
 };
 use reviews::{get_decision_review, list_decision_reviews};
 use simulations::{run_user_operation_evaluation, simulate_user_operation_dialogue};
@@ -373,10 +346,7 @@ pub fn api_router(state: AppState) -> Router<AppState> {
             post(revoke_principal_exemption),
         )
         .route("/contacts/:id/profile-note", put(update_profile_note))
-        .route(
-            "/contacts/:id/assist-override",
-            put(update_assist_override),
-        )
+        .route("/contacts/:id/assist-override", put(update_assist_override))
         .route("/contacts/:id/clear-referral", post(clear_referral))
         .route(
             "/contacts/:id/custom-agent-instructions",
@@ -440,11 +410,9 @@ pub fn api_router(state: AppState) -> Router<AppState> {
             // 真实销售素材（PDF/海报/视频）常 >2MB：axum 全局默认 body limit 2MB 会先于
             // handler 内的 media_max_file_size_mb 校验生效，>2MB 直接 413。仅给本上传路由
             // 单独抬高 body limit 到配置上限，其它路由保留默认 2MB 保护。
-            post(media_assets::upload_media_asset).layer(
-                axum::extract::DefaultBodyLimit::max(
-                    state.config.media_max_file_size_mb as usize * 1024 * 1024,
-                ),
-            ),
+            post(media_assets::upload_media_asset).layer(axum::extract::DefaultBodyLimit::max(
+                state.config.media_max_file_size_mb as usize * 1024 * 1024,
+            )),
         )
         .route(
             "/content-assets/:id/review",
@@ -488,10 +456,7 @@ pub fn api_router(state: AppState) -> Router<AppState> {
             get(send_ledger::contact_send_history),
         )
         .route("/send-ledger/stats", get(send_ledger::send_ledger_stats))
-        .route(
-            "/operation/active-view",
-            get(operation_view::active_view),
-        )
+        .route("/operation/active-view", get(operation_view::active_view))
         .route(
             "/send-ledger/overview",
             get(send_ledger::send_ledger_overview),
@@ -584,8 +549,7 @@ pub fn api_router(state: AppState) -> Router<AppState> {
         // ── Phase G P1-4 · 软锁 + WebSocket 事件总线 ───────────────────────────
         .route(
             "/operation-knowledge/chunks/:id/lock",
-            post(chunk_locks::acquire_chunk_lock)
-                .delete(chunk_locks::release_chunk_lock),
+            post(chunk_locks::acquire_chunk_lock).delete(chunk_locks::release_chunk_lock),
         )
         .route("/ws/chunks", get(chunk_locks::chunk_event_websocket))
         // ── G3 · 反向查询 + 批量动作（admin 手工触发，非 AI 自动） ─────────────
@@ -626,10 +590,7 @@ pub fn api_router(state: AppState) -> Router<AppState> {
             "/operation-knowledge/auto-verify",
             post(auto_verify_operation_knowledge_chunks),
         )
-        .route(
-            "/knowledge/gap-signals",
-            get(list_knowledge_gap_signals),
-        )
+        .route("/knowledge/gap-signals", get(list_knowledge_gap_signals))
         .route(
             "/knowledge/gap-signals/:id/dismiss",
             post(dismiss_knowledge_gap_signal),
@@ -696,18 +657,12 @@ pub fn api_router(state: AppState) -> Router<AppState> {
             post(record_repair_apply),
         )
         .route("/operation-knowledge/chat", post(chat_turn))
-        .route(
-            "/operation-knowledge/inbox",
-            get(knowledge_inbox),
-        )
+        .route("/operation-knowledge/inbox", get(knowledge_inbox))
         .route(
             "/operation-knowledge/metadata",
             get(knowledge_aggregate_metadata),
         )
-        .route(
-            "/operation-knowledge/chat/:session_id",
-            get(chat_history),
-        )
+        .route("/operation-knowledge/chat/:session_id", get(chat_history))
         .route(
             "/operation-knowledge/chat/:session_id/apply",
             post(chat_apply),
@@ -726,14 +681,8 @@ pub fn api_router(state: AppState) -> Router<AppState> {
             "/knowledge/chat/tasks",
             get(chat_task_list).post(chat_task_create),
         )
-        .route(
-            "/knowledge/chat/tasks/:id",
-            get(chat_task_get),
-        )
-        .route(
-            "/knowledge/chat/tasks/:id/cancel",
-            post(chat_task_cancel),
-        )
+        .route("/knowledge/chat/tasks/:id", get(chat_task_get))
+        .route("/knowledge/chat/tasks/:id/cancel", post(chat_task_cancel))
         .route(
             "/knowledge/chat/sessions/:sid/stream",
             get(chat_session_stream),
@@ -758,10 +707,7 @@ pub fn api_router(state: AppState) -> Router<AppState> {
             get(list_behavior_signal_metrics),
         )
         .route("/outcomes/autonomy", get(get_autonomy_outcomes))
-        .route(
-            "/outcomes/autonomy/revisions",
-            get(list_autonomy_revisions),
-        )
+        .route("/outcomes/autonomy/revisions", get(list_autonomy_revisions))
         .route(
             "/evaluation-scenarios",
             get(list_evaluation_scenarios).post(create_evaluation_scenario),
@@ -866,10 +812,7 @@ pub fn api_router(state: AppState) -> Router<AppState> {
             "/admin/taxonomies/:id",
             patch(patch_taxonomy).delete(delete_taxonomy),
         )
-        .route(
-            "/admin/taxonomy-candidates",
-            get(list_taxonomy_candidates),
-        )
+        .route("/admin/taxonomy-candidates", get(list_taxonomy_candidates))
         .route(
             "/admin/taxonomy-candidates/:id/approve",
             post(approve_taxonomy_candidate),
@@ -931,7 +874,10 @@ pub fn api_router(state: AppState) -> Router<AppState> {
         )
         // ── Ask-Human Phase 1 / Task 7：决策请示通道 admin REST 端点 ──────────
         // 列表 / admin 直接裁决（复用 relay 下游）/ 改派决策人。
-        .route("/admin/principal-escalations", get(list_principal_escalations))
+        .route(
+            "/admin/principal-escalations",
+            get(list_principal_escalations),
+        )
         .route(
             "/admin/principal-escalations/:short_code/resolve",
             post(resolve_principal_escalation),
@@ -993,14 +939,8 @@ pub fn api_router(state: AppState) -> Router<AppState> {
             "/admin/llm-providers/:id",
             put(update_provider).delete(delete_provider),
         )
-        .route(
-            "/admin/llm-providers/:id/activate",
-            post(activate_provider),
-        )
-        .route(
-            "/admin/llm-providers/:id/vision",
-            post(set_vision_active),
-        )
+        .route("/admin/llm-providers/:id/activate", post(activate_provider))
+        .route("/admin/llm-providers/:id/vision", post(set_vision_active))
         .route("/admin/llm-providers/test", post(test_provider))
         // ── knowledge-wiki Phase G：行业可配 schema admin 路由 ─────────────────
         .route(

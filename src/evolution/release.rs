@@ -44,7 +44,9 @@ pub async fn release_threshold(
         .find_one(doc! { "_id": proposal_id }, None)
         .await
         .map_err(EvolutionError::from)?
-        .ok_or_else(|| EvolutionError::InvalidStatus(format!("proposal not found: {proposal_id}")))?;
+        .ok_or_else(|| {
+            EvolutionError::InvalidStatus(format!("proposal not found: {proposal_id}"))
+        })?;
 
     if proposal.proposal_kind != "threshold" {
         return Err(EvolutionError::InvalidStatus(format!(
@@ -172,7 +174,10 @@ pub async fn release_threshold(
     )
     .await
     {
-        tracing::warn!(?e, "schedule_post_release_review failed for threshold release; continuing");
+        tracing::warn!(
+            ?e,
+            "schedule_post_release_review failed for threshold release; continuing"
+        );
     }
 
     Ok(())
@@ -206,7 +211,9 @@ pub async fn release_prompt(
         .find_one(doc! { "_id": proposal_id }, None)
         .await
         .map_err(EvolutionError::from)?
-        .ok_or_else(|| EvolutionError::InvalidStatus(format!("proposal not found: {proposal_id}")))?;
+        .ok_or_else(|| {
+            EvolutionError::InvalidStatus(format!("proposal not found: {proposal_id}"))
+        })?;
 
     if proposal.proposal_kind != "prompt" {
         return Err(EvolutionError::InvalidStatus(format!(
@@ -255,7 +262,8 @@ pub async fn release_prompt(
 
     // ── 红线三闸（与管理员手动编辑路径同源,从 prompt_guard 复用）──
     // 末尾追加:原 prompt 正文逐字保留,critic 片段追加到末尾。
-    let new_content = crate::prompt_guard::compose_appended_content(&current.content, &append_snippet);
+    let new_content =
+        crate::prompt_guard::compose_appended_content(&current.content, &append_snippet);
     // 闸 1+2:禁词 + 锚点完整性（原文保留 → 锚点天然过;不过说明原 prompt 已缺锚,fail-closed 正确）
     crate::prompt_guard::validate_prompt_edit(&prompt_key, &new_content)
         .map_err(EvolutionError::RedlineGateRejected)?;
@@ -399,7 +407,10 @@ pub async fn release_prompt(
     )
     .await
     {
-        tracing::warn!(?e, "schedule_post_release_review failed for prompt release; continuing");
+        tracing::warn!(
+            ?e,
+            "schedule_post_release_review failed for prompt release; continuing"
+        );
     }
 
     Ok(())
@@ -436,7 +447,9 @@ pub async fn rollback_threshold(
         .find_one(doc! { "_id": proposal_id }, None)
         .await
         .map_err(EvolutionError::from)?
-        .ok_or_else(|| EvolutionError::InvalidStatus(format!("proposal not found: {proposal_id}")))?;
+        .ok_or_else(|| {
+            EvolutionError::InvalidStatus(format!("proposal not found: {proposal_id}"))
+        })?;
 
     if proposal.proposal_kind != "threshold" {
         return Err(EvolutionError::InvalidStatus(format!(
@@ -563,7 +576,9 @@ pub async fn rollback_prompt(
         .find_one(doc! { "_id": proposal_id }, None)
         .await
         .map_err(EvolutionError::from)?
-        .ok_or_else(|| EvolutionError::InvalidStatus(format!("proposal not found: {proposal_id}")))?;
+        .ok_or_else(|| {
+            EvolutionError::InvalidStatus(format!("proposal not found: {proposal_id}"))
+        })?;
 
     if proposal.proposal_kind != "prompt" {
         return Err(EvolutionError::InvalidStatus(format!(
@@ -796,8 +811,9 @@ mod tests {
     /// （`tests/evolution_threshold_e2e.rs` / `tests/evolution_prompt_e2e.rs`）。
     #[test]
     fn invalid_status_messages_carry_actionable_context() {
-        let e =
-            EvolutionError::InvalidStatus("proposal not eligible for release (status=pending_eval)".to_string());
+        let e = EvolutionError::InvalidStatus(
+            "proposal not eligible for release (status=pending_eval)".to_string(),
+        );
         let msg = format!("{e}");
         assert!(msg.contains("eligible"));
         assert!(msg.contains("pending_eval"));

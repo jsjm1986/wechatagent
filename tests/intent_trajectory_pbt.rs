@@ -30,7 +30,9 @@ fn mk_entry(turn: i32, intent: &str) -> IntentTrajectoryEntry {
 }
 
 fn build_existing(n: usize) -> Vec<IntentTrajectoryEntry> {
-    (0..n).map(|i| mk_entry(i as i32, &format!("intent_{i}"))).collect()
+    (0..n)
+        .map(|i| mk_entry(i as i32, &format!("intent_{i}")))
+        .collect()
 }
 
 // ── Property 1：length_capped_at_max_items ───────────────────────────────

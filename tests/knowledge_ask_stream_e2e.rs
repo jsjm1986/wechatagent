@@ -83,6 +83,7 @@ fn step_tool(ev: &TraceEvent) -> Option<String> {
             .and_then(|v| v.as_str())
             .map(str::to_string),
         TraceEvent::Token { .. } => None,
+        TraceEvent::Failed { .. } => None,
         TraceEvent::Final { .. } => None,
     }
 }
@@ -247,6 +248,7 @@ async fn stream_emits_truncated_when_llm_never_emits_answer() {
         .find_map(|ev| match ev {
             TraceEvent::Step { payload } => Some(payload),
             TraceEvent::Token { .. } => None,
+            TraceEvent::Failed { .. } => None,
             TraceEvent::Final { .. } => None,
         })
         .expect("应至少有一条 Step");
@@ -295,7 +297,10 @@ async fn stream_emits_cancelled_when_cancel_flag_set_before_loop() {
 
     assert!(result.cancelled, "cancel 翻 true 必须导致 cancelled=true");
     assert!(result.truncated, "cancel 也走兜底，必须 truncated=true");
-    assert_eq!(result.rounds_used, 0, "cancel 在第一轮顶部命中，未跑完任何轮");
+    assert_eq!(
+        result.rounds_used, 0,
+        "cancel 在第一轮顶部命中，未跑完任何轮"
+    );
     assert_eq!(app.llm.calls(), 0, "cancel 在 LLM 调用前命中，0 LLM 调用");
 
     // 事件序列：list_catalog → cancelled → answer(truncated, cancelled) → Final
@@ -307,6 +312,7 @@ async fn stream_emits_cancelled_when_cancel_flag_set_before_loop() {
                 .and_then(|v| v.as_str())
                 .map(str::to_string),
             TraceEvent::Token { .. } => None,
+            TraceEvent::Failed { .. } => None,
             TraceEvent::Final { .. } => None,
         })
         .collect();

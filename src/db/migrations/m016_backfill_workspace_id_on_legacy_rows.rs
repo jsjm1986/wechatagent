@@ -86,11 +86,7 @@ const SNAKE_CASE_COLLECTIONS: &[&str] = &[
 /// (见 tests::KNOWN_CAMEL_TENANT_COLLECTIONS 审计基准)。
 /// 注意:`admin_users` 不在此表——AdminUser 用 `workspaces:Vec<String>` 而非单值
 /// workspaceId(auth/mod.rs:28-39),不符合单值回填契约。
-const CAMEL_CASE_COLLECTIONS: &[&str] = &[
-    "llm_provider_configs",
-    "campaigns",
-    "campaign_sends",
-];
+const CAMEL_CASE_COLLECTIONS: &[&str] = &["llm_provider_configs", "campaigns", "campaign_sends"];
 
 pub(super) async fn run_step(db: &Database) -> AppResult<()> {
     if std::env::var("APP_ENV").unwrap_or_default() == "production" {
@@ -211,11 +207,8 @@ mod tests {
     /// 审计定稿:真实携带**单值 camelCase `workspaceId`** 字段的集合。
     /// 判据=对应 struct 头带 `#[serde(rename_all="camelCase")]`(spec §2):
     /// LlmProviderConfig(models.rs:4732)/ Campaign(552)/ CampaignSend(596)。
-    const KNOWN_CAMEL_TENANT_COLLECTIONS: &[&str] = &[
-        "llm_provider_configs",
-        "campaigns",
-        "campaign_sends",
-    ];
+    const KNOWN_CAMEL_TENANT_COLLECTIONS: &[&str] =
+        &["llm_provider_configs", "campaigns", "campaign_sends"];
 
     /// 无单值 workspace_id 字段、绝不该进任一回填表(防回退,spec §2.C):
     /// `admin_users` 用 `workspaces:Vec<String>`(auth/mod.rs:28-39);

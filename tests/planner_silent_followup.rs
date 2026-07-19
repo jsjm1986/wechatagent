@@ -119,7 +119,10 @@ async fn planner_emits_follow_up_for_silent_managed_contacts_only() {
         .count_documents(follow_up_filter.clone(), None)
         .await
         .expect("count follow-up tasks");
-    assert_eq!(task_count, 5, "应当为 5 个 managed+静默 contact 各 emit 一条 follow_up");
+    assert_eq!(
+        task_count, 5,
+        "应当为 5 个 managed+静默 contact 各 emit 一条 follow_up"
+    );
 
     use futures::TryStreamExt;
     let tasks: Vec<_> = app
@@ -143,7 +146,10 @@ async fn planner_emits_follow_up_for_silent_managed_contacts_only() {
             "只有 managed 静默联系人应被 emit, 实际: {}",
             task.contact_wxid
         );
-        assert!(task.review_required, "Planner emit 的 follow_up 必须保留 review_required");
+        assert!(
+            task.review_required,
+            "Planner emit 的 follow_up 必须保留 review_required"
+        );
     }
 
     let tick_events = app
@@ -153,7 +159,10 @@ async fn planner_emits_follow_up_for_silent_managed_contacts_only() {
         .count_documents(doc! { "kind": "strategic_planner_tick" }, None)
         .await
         .expect("count tick events");
-    assert_eq!(tick_events, 1, "每个 tick 应记录 1 条 strategic_planner_tick 事件");
+    assert_eq!(
+        tick_events, 1,
+        "每个 tick 应记录 1 条 strategic_planner_tick 事件"
+    );
 
     let emit_events = app
         .state
@@ -162,11 +171,16 @@ async fn planner_emits_follow_up_for_silent_managed_contacts_only() {
         .count_documents(doc! { "kind": "strategic_planner_emit" }, None)
         .await
         .expect("count emit events");
-    assert_eq!(emit_events, 5, "每个被 emit 的 follow_up 都应有 strategic_planner_emit 事件");
+    assert_eq!(
+        emit_events, 5,
+        "每个被 emit 的 follow_up 都应有 strategic_planner_emit 事件"
+    );
 
     // 再跑一次 tick：candidate 还是同样这 5 个，但已存在 pending follow_up，
     // 应被幂等跳过；任务总数仍为 5，emit 事件总数仍为 5，tick 事件 +1。
-    planner::tick(&app.state).await.expect("second planner tick");
+    planner::tick(&app.state)
+        .await
+        .expect("second planner tick");
 
     let task_count_after = app
         .state

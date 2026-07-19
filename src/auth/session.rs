@@ -133,10 +133,7 @@ pub async fn create_session(
 
 /// 拿 session_id 查 session；未找到 / 已过期都返错。不更新 expires_at（不滚动续期，
 /// 若需要可以在后续加 sliding window；当前 7 天 TTL 够用）。
-pub async fn lookup_session(
-    db: &Database,
-    session_id: &str,
-) -> Result<AdminSession, AuthError> {
+pub async fn lookup_session(db: &Database, session_id: &str) -> Result<AdminSession, AuthError> {
     let session = admin_sessions(db)
         .find_one(doc! { "session_id": session_id }, None)
         .await?
@@ -173,10 +170,7 @@ pub async fn update_session_workspace(
 }
 
 /// 按 user_id 查 admin user，用于切换 workspace 时校验权限。
-pub async fn get_admin_user(
-    db: &Database,
-    user_id: &str,
-) -> Result<Option<AdminUser>, AuthError> {
+pub async fn get_admin_user(db: &Database, user_id: &str) -> Result<Option<AdminUser>, AuthError> {
     let user = admin_users(db)
         .find_one(doc! { "user_id": user_id }, None)
         .await?;

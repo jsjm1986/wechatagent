@@ -374,7 +374,9 @@ impl LlmClient {
                 if is_openai_sse_body(&text) {
                     let (acc, _) = aggregate_openai_sse(&text);
                     if acc.trim().is_empty() {
-                        return Err(AppError::External("LLM SSE body 聚合后内容为空".to_string()));
+                        return Err(AppError::External(
+                            "LLM SSE body 聚合后内容为空".to_string(),
+                        ));
                     }
                     Ok(acc)
                 } else {
@@ -1134,7 +1136,11 @@ fn aggregate_openai_sse(text: &str) -> (String, Option<ChatUsage>) {
         if let Some(u) = parsed.usage {
             usage = Some(u);
         }
-        if let Some(c) = parsed.choices.first().and_then(|ch| ch.delta.content.as_ref()) {
+        if let Some(c) = parsed
+            .choices
+            .first()
+            .and_then(|ch| ch.delta.content.as_ref())
+        {
             acc.push_str(c);
         }
     }
@@ -1243,9 +1249,9 @@ fn extract_embedded_json(text: &str) -> Option<Value> {
         let Some(block) = balanced_block(text, start) else {
             continue;
         };
-        let parsed = serde_json::from_str::<Value>(block)
-            .ok()
-            .or_else(|| repair_loose_json(block).and_then(|r| serde_json::from_str::<Value>(&r).ok()));
+        let parsed = serde_json::from_str::<Value>(block).ok().or_else(|| {
+            repair_loose_json(block).and_then(|r| serde_json::from_str::<Value>(&r).ok())
+        });
         match parsed {
             // 对象：generate_json 期望形态，立即返回。
             Some(v @ Value::Object(_)) => return Some(v),
@@ -1343,17 +1349,37 @@ pub(crate) fn repair_loose_json(input: &str) -> Option<String> {
             continue;
         }
         match c {
-            '"' => { in_string = true; out.push(c); }
-            '{' => { depth_obj += 1; out.push(c); }
-            '}' => { depth_obj -= 1; out.push(c); }
-            '[' => { depth_arr += 1; out.push(c); }
-            ']' => { depth_arr -= 1; out.push(c); }
+            '"' => {
+                in_string = true;
+                out.push(c);
+            }
+            '{' => {
+                depth_obj += 1;
+                out.push(c);
+            }
+            '}' => {
+                depth_obj -= 1;
+                out.push(c);
+            }
+            '[' => {
+                depth_arr += 1;
+                out.push(c);
+            }
+            ']' => {
+                depth_arr -= 1;
+                out.push(c);
+            }
             ',' => {
                 // peek non-whitespace next char
                 let mut peek_iter = chars.clone();
                 let mut next_significant = None;
                 while let Some(&p) = peek_iter.peek() {
-                    if p.is_whitespace() { peek_iter.next(); } else { next_significant = Some(p); break; }
+                    if p.is_whitespace() {
+                        peek_iter.next();
+                    } else {
+                        next_significant = Some(p);
+                        break;
+                    }
                 }
                 match next_significant {
                     Some('}') | Some(']') => {
@@ -1478,7 +1504,9 @@ mod tests {
     fn detects_sse_body_vs_plain_json() {
         assert!(is_openai_sse_body("data: {\"choices\":[]}\n\ndata: [DONE]"));
         assert!(is_openai_sse_body("\n  data: {\"x\":1}"));
-        assert!(!is_openai_sse_body("{\"choices\":[{\"message\":{\"content\":\"hi\"}}]}"));
+        assert!(!is_openai_sse_body(
+            "{\"choices\":[{\"message\":{\"content\":\"hi\"}}]}"
+        ));
         assert!(!is_openai_sse_body(""));
     }
 
@@ -1516,7 +1544,8 @@ mod tests {
     #[test]
     fn sse_with_think_prefix_parses_to_json() {
         // 端到端：gpt 风格 SSE（带 <think> 前缀）聚合后能被 parse_json_content 解析。
-        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"<think>hmm</think>{\\\"ok\\\"\"}}]}\n\
+        let body =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"<think>hmm</think>{\\\"ok\\\"\"}}]}\n\
                     data: {\"choices\":[{\"delta\":{\"content\":\":true}\"}}]}\n\
                     data: [DONE]";
         let (acc, _) = aggregate_openai_sse(body);
@@ -1547,7 +1576,9 @@ mod tests {
         // 经 Cloudflare 的端点（rsxermu）源站慢/抖时回 520/522/524——属瞬时不可达应重试。
         // status 段是 reqwest 渲染的 "524 <unknown status code>"，故串里含 "LLM HTTP 524"。
         for code in ["520", "522", "524"] {
-            let err = AppError::External(format!("LLM HTTP {code} <unknown status code>: origin timeout"));
+            let err = AppError::External(format!(
+                "LLM HTTP {code} <unknown status code>: origin timeout"
+            ));
             assert!(
                 is_retryable_llm_error(&err),
                 "Cloudflare {code} 应可重试（端点抖动，非配置错）"
@@ -1827,14 +1858,21 @@ mod tests {
         let body = r#"{"content":[{"type":"text","text":"我将为您生成完整配置。"},{"type":"tool_use","name":"WebFetch","input":{"url":"https://x"}}],"stop_reason":"tool_use"}"#;
         let parsed: AnthropicMessageResponse = serde_json::from_str(body).unwrap();
         let diag = detect_tool_use_hijack(&parsed).expect("应识别 tool_use 劫持");
-        assert!(diag.contains("llm_tool_use_instead_of_json"), "诊断: {diag}");
-        assert!(diag.contains("我将为您生成"), "诊断须含 text 开场白前缀: {diag}");
+        assert!(
+            diag.contains("llm_tool_use_instead_of_json"),
+            "诊断: {diag}"
+        );
+        assert!(
+            diag.contains("我将为您生成"),
+            "诊断须含 text 开场白前缀: {diag}"
+        );
     }
 
     #[test]
     fn detect_tool_use_hijack_flags_stop_reason_only() {
         // 即便 content 里暂无 tool_use block，stop_reason=tool_use 也要拦。
-        let body = r#"{"content":[{"type":"text","text":"让我查一下。"}],"stop_reason":"tool_use"}"#;
+        let body =
+            r#"{"content":[{"type":"text","text":"让我查一下。"}],"stop_reason":"tool_use"}"#;
         let parsed: AnthropicMessageResponse = serde_json::from_str(body).unwrap();
         assert!(detect_tool_use_hijack(&parsed).is_some());
     }
@@ -1842,7 +1880,8 @@ mod tests {
     #[test]
     fn detect_tool_use_hijack_passes_normal_text_response() {
         // 正常一次性 JSON 输出（end_turn，纯 text）不得误判。
-        let body = r#"{"content":[{"type":"text","text":"{\"ok\":true}"}],"stop_reason":"end_turn"}"#;
+        let body =
+            r#"{"content":[{"type":"text","text":"{\"ok\":true}"}],"stop_reason":"end_turn"}"#;
         let parsed: AnthropicMessageResponse = serde_json::from_str(body).unwrap();
         assert!(detect_tool_use_hijack(&parsed).is_none());
     }
@@ -1850,17 +1889,12 @@ mod tests {
     #[test]
     fn temperature_defaults_to_02_and_setter_overrides() {
         // 生产构造默认 0.2（决策稳定）；with_temperature 链式覆盖（roleplayer 用 0.8）。
-        let c = LlmClient::new(
-            "http://x".into(),
-            "k".into(),
-            "m".into(),
-            10,
-            1,
-            100,
-        )
-        .unwrap();
+        let c = LlmClient::new("http://x".into(), "k".into(), "m".into(), 10, 1, 100).unwrap();
         assert!((c.temperature - 0.2).abs() < f64::EPSILON, "默认应 0.2");
         let hot = c.with_temperature(0.8);
-        assert!((hot.temperature - 0.8).abs() < f64::EPSILON, "setter 应覆盖到 0.8");
+        assert!(
+            (hot.temperature - 0.8).abs() < f64::EPSILON,
+            "setter 应覆盖到 0.8"
+        );
     }
 }

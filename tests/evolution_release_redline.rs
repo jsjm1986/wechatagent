@@ -171,7 +171,10 @@ async fn release_prompt_rejects_semantic_violation_snippet() {
     let (after_version, after_content) =
         current_version_snapshot(&app.state, &workspace, TARGET_KEY).await;
     assert_eq!(after_version, before_version, "语义闸拒绝不应写入新版本");
-    assert_eq!(after_content, before_content, "语义闸拒绝不应改动 current 内容");
+    assert_eq!(
+        after_content, before_content,
+        "语义闸拒绝不应改动 current 内容"
+    );
     assert_eq!(
         proposal_status(&app.state, proposal_id).await,
         "eligible_for_release",
@@ -206,12 +209,19 @@ async fn release_prompt_accepts_clean_append_snippet() {
     // 新 current 行：version+1，内容 = 原文开头 + 片段结尾（末尾追加语义）。
     let (after_version, after_content) =
         current_version_snapshot(&app.state, &workspace, TARGET_KEY).await;
-    assert_eq!(after_version, before_version + 1, "放行应写入 version+1 新版本");
+    assert_eq!(
+        after_version,
+        before_version + 1,
+        "放行应写入 version+1 新版本"
+    );
     assert!(
         after_content.starts_with(before_content.trim_end()),
         "新内容应以原 prompt 正文开头（红线逐字保留）"
     );
-    assert!(after_content.trim_end().ends_with(snippet), "新内容应以追加片段结尾");
+    assert!(
+        after_content.trim_end().ends_with(snippet),
+        "新内容应以追加片段结尾"
+    );
 
     // proposal 推进到 released + 记录被替换的旧版本号。
     let released = app
@@ -222,7 +232,10 @@ async fn release_prompt_accepts_clean_append_snippet() {
         .await
         .unwrap()
         .expect("proposal exists");
-    assert_eq!(released.status, "released", "放行后 proposal 应推进到 released");
+    assert_eq!(
+        released.status, "released",
+        "放行后 proposal 应推进到 released"
+    );
     assert_eq!(
         released.previous_prompt_version.as_deref(),
         Some(before_version.to_string().as_str()),

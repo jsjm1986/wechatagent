@@ -150,10 +150,7 @@ pub(super) async fn promote_lesson_to_peer_case(
     }
     let (title, body, summary_opt) = validate_promote_request(&payload)?;
 
-    let lessons_coll = state
-        .db
-        .raw()
-        .collection::<Document>("lessons_learned");
+    let lessons_coll = state.db.raw().collection::<Document>("lessons_learned");
     let lesson = lessons_coll
         .find_one(
             doc! {

@@ -17,6 +17,7 @@ use cookie::time::Duration as CookieDuration;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::auth::is_workspace_authorized;
 use crate::auth::{
     jwt::issue_jwt,
     session::{
@@ -25,7 +26,6 @@ use crate::auth::{
     },
     AuthenticatedAdmin, SESSION_COOKIE_NAME,
 };
-use crate::auth::is_workspace_authorized;
 use crate::error::{AppError, AppResult};
 
 use super::AppState;

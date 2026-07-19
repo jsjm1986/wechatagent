@@ -11,7 +11,8 @@
 //! 2. **空 source_event_id 兜底**：跟进任务等场景下 source_event_id 可能为空，
 //!    此时 SHALL 走 `synthetic:run_id:contact_wxid:content_hash` 前缀，并写一条
 //!    `outbox_synthetic_idempotency_key` warning 事件（R13.2 / R13.10）。
-//! 3. **状态枚举严格**：`pending / in_flight / sent / failed_terminal / canceled`，
+//! 3. **状态枚举严格**：`pending / in_flight / sent / failed_terminal / canceled /
+//!    delivery_unknown`，
 //!    SHALL NOT 使用 `failed`（旧值）—— 索引 + dispatcher state machine 全部按
 //!    新枚举对齐（design.md §3.2 R13.5 / R13.10 hard rule）。
 //!
@@ -22,6 +23,7 @@
 use futures::TryStreamExt;
 use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
 use mongodb::error::{ErrorKind, WriteFailure};
+use mongodb::options::{FindOneAndUpdateOptions, ReturnDocument};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -49,6 +51,8 @@ pub enum OutboxStatus {
     FailedTerminal,
     /// 用户拒绝 / cooldown / 30min 陈旧 / 后台手动取消。
     Canceled,
+    /// 已跨过远端发送边界，但本地没有可验证回执；禁止自动重发，等待人工核验。
+    DeliveryUnknown,
 }
 
 impl OutboxStatus {
@@ -61,6 +65,7 @@ impl OutboxStatus {
             OutboxStatus::Sent => "sent",
             OutboxStatus::FailedTerminal => "failed_terminal",
             OutboxStatus::Canceled => "canceled",
+            OutboxStatus::DeliveryUnknown => "delivery_unknown",
         }
     }
 
@@ -72,6 +77,7 @@ impl OutboxStatus {
             "sent" => Some(OutboxStatus::Sent),
             "failed_terminal" => Some(OutboxStatus::FailedTerminal),
             "canceled" => Some(OutboxStatus::Canceled),
+            "delivery_unknown" => Some(OutboxStatus::DeliveryUnknown),
             _ => None,
         }
     }
@@ -177,7 +183,9 @@ pub async fn enqueue(state: &AppState, req: EnqueueRequest) -> Result<EnqueueOut
     if req.contact_wxid.trim().is_empty() {
         return Err(OutboxError::Invalid("contact_wxid is empty".to_string()));
     }
-    if content_required_for(&req.media_asset_id, &req.referral_card_id) && req.content.trim().is_empty() {
+    if content_required_for(&req.media_asset_id, &req.referral_card_id)
+        && req.content.trim().is_empty()
+    {
         return Err(OutboxError::Invalid("content is empty".to_string()));
     }
     if req.run_id.trim().is_empty() {
@@ -278,6 +286,12 @@ pub async fn enqueue(state: &AppState, req: EnqueueRequest) -> Result<EnqueueOut
         next_retry_at: None,
         worker_id: None,
         locked_until: None,
+        claim_token: None,
+        claim_generation: 0,
+        cancel_requested: false,
+        cancel_requested_at: None,
+        send_started_at: None,
+        task_send_authorization_token: None,
         reclaimed_in_flight: false,
         reclaim_count: 0,
         created_at: now,
@@ -446,9 +460,7 @@ pub(crate) fn compute_synthetic_key(
         return format!("synthetic_media:{run_id}:{contact_wxid}:{aid}");
     }
     if source_kind == SOURCE_KIND_MANUAL_SEND {
-        format!(
-            "synthetic_manual:{account_id}:{contact_wxid}:{content_hash}:{day_bucket}"
-        )
+        format!("synthetic_manual:{account_id}:{contact_wxid}:{content_hash}:{day_bucket}")
     } else {
         format!("synthetic:{run_id}:{contact_wxid}:{content_hash}")
     }
@@ -558,27 +570,152 @@ pub(crate) fn check_second_safety_gate_pure(
 
 // ── 用户反应驱动的取消通道（W4 task 5.6 / R13.6）─────────────────────────
 
-/// 用户回了 stop / cooldown 信号时，把同一 contact 名下还在 `pending` /
-/// `in_flight` 的 outbox entry 全部置为 `canceled`，并清掉 worker 抢占字段，
-/// 让 dispatcher 不再继续推进这些条目（design.md §3.2 R13.6）。
+/// 按 decision 持久化撤销尚可停止的发送意图。
+///
+/// `pending` 直接进入 `canceled`；`in_flight` 只登记 `cancel_requested`，由
+/// dispatcher 在最后可取消点或真实远端回执后收敛。逐条使用基于数据库当前状态的
+/// update pipeline，避免 cursor 快照与 worker claim 之间的竞态。
+pub async fn cancel_for_decision(
+    state: &AppState,
+    workspace_id: &str,
+    decision_id: ObjectId,
+    reason: &str,
+) -> Result<usize, OutboxError> {
+    if workspace_id.trim().is_empty() {
+        return Err(OutboxError::Invalid("workspace_id is empty".to_string()));
+    }
+    if reason.trim().is_empty() {
+        return Err(OutboxError::Invalid("cancel reason is empty".to_string()));
+    }
+
+    let collection = state.db.collection_agent_send_outbox();
+    let mut cursor = collection
+        .find(
+            doc! {
+                "workspace_id": workspace_id,
+                "decision_id": decision_id,
+                "status": { "$in": [
+                    OutboxStatus::Pending.as_str(),
+                    OutboxStatus::InFlight.as_str(),
+                ] },
+            },
+            None,
+        )
+        .await?;
+    let mut accepted = 0usize;
+    while let Some(entry) = cursor.try_next().await? {
+        let Some(entry_id) = entry.id else { continue };
+        let now = DateTime::now();
+        let previous = collection
+            .find_one_and_update(
+                doc! {
+                    "_id": entry_id,
+                    "workspace_id": workspace_id,
+                    "decision_id": decision_id,
+                    "$or": [
+                        { "status": OutboxStatus::Pending.as_str() },
+                        {
+                            "status": OutboxStatus::InFlight.as_str(),
+                            "cancel_requested": { "$ne": true },
+                        },
+                    ],
+                },
+                vec![doc! { "$set": {
+                    "status": {
+                        "$cond": [
+                            { "$eq": ["$status", OutboxStatus::Pending.as_str()] },
+                            OutboxStatus::Canceled.as_str(),
+                            "$status",
+                        ]
+                    },
+                    "cancel_requested": {
+                        "$cond": [
+                            { "$eq": ["$status", OutboxStatus::InFlight.as_str()] },
+                            true,
+                            { "$ifNull": ["$cancel_requested", false] },
+                        ]
+                    },
+                    "cancel_requested_at": {
+                        "$cond": [
+                            { "$eq": ["$status", OutboxStatus::InFlight.as_str()] },
+                            now,
+                            "$$REMOVE",
+                        ]
+                    },
+                    "cancel_reason": reason,
+                    "updated_at": now,
+                    "worker_id": {
+                        "$cond": [
+                            { "$eq": ["$status", OutboxStatus::Pending.as_str()] },
+                            "$$REMOVE",
+                            "$worker_id",
+                        ]
+                    },
+                    "locked_until": {
+                        "$cond": [
+                            { "$eq": ["$status", OutboxStatus::Pending.as_str()] },
+                            "$$REMOVE",
+                            "$locked_until",
+                        ]
+                    },
+                    "claim_token": {
+                        "$cond": [
+                            { "$eq": ["$status", OutboxStatus::Pending.as_str()] },
+                            "$$REMOVE",
+                            "$claim_token",
+                        ]
+                    },
+                } }],
+                FindOneAndUpdateOptions::builder()
+                    .return_document(ReturnDocument::Before)
+                    .build(),
+            )
+            .await?;
+        let Some(previous) = previous else { continue };
+        let was_in_flight = previous.status == OutboxStatus::InFlight.as_str();
+        accepted += 1;
+        let _ = write_outbox_event(
+            state,
+            &previous.account_id,
+            Some(&previous.contact_wxid),
+            if was_in_flight {
+                "outbox_cancel_requested"
+            } else {
+                "outbox_canceled"
+            },
+            "warning",
+            if was_in_flight {
+                "in-flight outbox cancellation requested by task decision"
+            } else {
+                "pending outbox canceled by task decision"
+            },
+            Some(doc! {
+                "outbox_id": entry_id,
+                "run_id": &previous.run_id,
+                "decision_id": decision_id,
+                "previous_status": &previous.status,
+                "cancel_reason": reason,
+                "cancel_requested": was_in_flight,
+            }),
+        )
+        .await;
+    }
+    Ok(accepted)
+}
+
+/// 用户回了 stop / cooldown 信号时，对同一 contact 名下仍可停止的 outbox
+/// 持久化取消意图。`pending` 尚未进入 worker，立即置 `canceled`；`in_flight`
+/// 可能正处于不可撤回的远端调用，只置 `cancel_requested=true`，保留 claim token，
+/// 由 dispatcher 在最后可取消点或真实回执后收敛。
 ///
 /// 行为：
 /// * 过滤条件 = `(workspace_id, account_id, contact_wxid, status ∈ {pending,
 ///   in_flight})`。`workspace_id` 取 `state.config.default_workspace_id`，与
 ///   其它路径一致（W3 阶段单 workspace）。
-/// * 每命中一条做一次 `update_one`：
-///   - `$set { status: "canceled", cancel_reason: "user_reaction_stop_requested",
-///            updated_at: now }`
-///   - `$unset { worker_id: "", locked_until: "" }`
-/// * 每条成功 cancel 后写一条 `outbox_canceled` event（warning 级别），方便
-///   后续审计 / 看板观察用户拒绝触发的链路。
-/// * 返回真正被改动的条数。任何条目的写失败即视为整体错误透传，调用方按
+/// * pending 成功终止写 `outbox_canceled`；in-flight 成功登记请求写
+///   `outbox_cancel_requested`，绝不提前宣称已取消。
+/// * 返回真正被改动（终止或登记请求）的条数。任何条目的写失败即视为整体错误透传，调用方按
 ///   "best-effort" 处理（reaction 路径只 log，不影响反应记录）。
-///
-/// 这里 **不复用** dispatcher 的 atomic claim 路径：取消属于"业务侧管理"动作，
-/// 与 worker 抢占的 `in_flight → sent` 状态机互斥，因此不需要 `worker_id`
-/// 上下文，只需要满足 `status` 仍在可取消集合即可（已经 sent / canceled /
-/// failed_terminal 一律 noop）。
 pub async fn cancel_for_contact_on_user_reaction(
     state: &AppState,
     account_id: &str,
@@ -610,53 +747,115 @@ pub async fn cancel_for_contact_on_user_reaction(
         "status": { "$in": &cancelable_statuses },
     };
     let mut cursor = collection.find(filter, None).await?;
-    let mut canceled = 0usize;
+    let mut accepted = 0usize;
     while let Some(entry) = cursor.try_next().await? {
         let Some(entry_id) = entry.id else { continue };
         let now = DateTime::now();
-        let result = collection
-            .update_one(
+        // Use one update pipeline so the branch is evaluated from the database's current status,
+        // not from the cursor snapshot above. If a worker claims a pending row between find and
+        // update, this atomically records an in-flight cancellation instead of losing the stop.
+        let previous = collection
+            .find_one_and_update(
                 doc! {
                     "_id": entry_id,
-                    "status": { "$in": &cancelable_statuses },
+                    "workspace_id": &workspace_id,
+                    "account_id": account_id,
+                    "contact_wxid": contact_wxid,
+                    "$or": [
+                        { "status": OutboxStatus::Pending.as_str() },
+                        {
+                            "status": OutboxStatus::InFlight.as_str(),
+                            "cancel_requested": { "$ne": true },
+                        },
+                    ],
                 },
-                doc! {
-                    "$set": {
-                        "status": OutboxStatus::Canceled.as_str(),
-                        "cancel_reason": "user_reaction_stop_requested",
-                        "updated_at": now,
+                vec![doc! { "$set": {
+                    "status": {
+                        "$cond": [
+                            { "$eq": ["$status", OutboxStatus::Pending.as_str()] },
+                            OutboxStatus::Canceled.as_str(),
+                            "$status",
+                        ]
                     },
-                    "$unset": {
-                        "worker_id": "",
-                        "locked_until": "",
-                    }
-                },
-                None,
+                    "cancel_requested": {
+                        "$cond": [
+                            { "$eq": ["$status", OutboxStatus::InFlight.as_str()] },
+                            true,
+                            { "$ifNull": ["$cancel_requested", false] },
+                        ]
+                    },
+                    "cancel_requested_at": {
+                        "$cond": [
+                            { "$eq": ["$status", OutboxStatus::InFlight.as_str()] },
+                            now,
+                            "$$REMOVE",
+                        ]
+                    },
+                    "cancel_reason": "user_reaction_stop_requested",
+                    "updated_at": now,
+                    "worker_id": {
+                        "$cond": [
+                            { "$eq": ["$status", OutboxStatus::Pending.as_str()] },
+                            "$$REMOVE",
+                            "$worker_id",
+                        ]
+                    },
+                    "locked_until": {
+                        "$cond": [
+                            { "$eq": ["$status", OutboxStatus::Pending.as_str()] },
+                            "$$REMOVE",
+                            "$locked_until",
+                        ]
+                    },
+                    "claim_token": {
+                        "$cond": [
+                            { "$eq": ["$status", OutboxStatus::Pending.as_str()] },
+                            "$$REMOVE",
+                            "$claim_token",
+                        ]
+                    },
+                } }],
+                FindOneAndUpdateOptions::builder()
+                    .return_document(ReturnDocument::Before)
+                    .build(),
             )
             .await?;
-        if result.modified_count == 0 {
+        let Some(previous) = previous else {
             // 并发场景下别的路径已先一步推进掉了状态：跳过且不写事件，避免
             // 误导审计（"取消"事件却没真的取消）。
             continue;
-        }
-        canceled += 1;
+        };
+        let was_in_flight = previous.status == OutboxStatus::InFlight.as_str();
+        let (event_kind, event_summary) = if was_in_flight {
+            (
+                "outbox_cancel_requested",
+                "in-flight outbox cancellation requested because user reaction signaled stop",
+            )
+        } else {
+            (
+                "outbox_canceled",
+                "pending outbox canceled because user reaction signaled stop",
+            )
+        };
+        accepted += 1;
         let _ = write_outbox_event(
             state,
             account_id,
             Some(contact_wxid),
-            "outbox_canceled",
+            event_kind,
             "warning",
-            "outbox entry canceled because user reaction signaled stop",
+            event_summary,
             Some(doc! {
                 "outbox_id": entry_id,
-                "run_id": &entry.run_id,
-                "previous_status": entry.status.clone(),
+                "run_id": &previous.run_id,
+                "previous_status": previous.status.clone(),
                 "cancel_reason": "user_reaction_stop_requested",
+                "cancel_requested": was_in_flight,
             }),
         )
         .await;
     }
-    Ok(canceled)
+    Ok(accepted)
 }
 
 // ── 单元测试 ────────────────────────────────────────────────────────────
@@ -673,6 +872,7 @@ mod tests {
             OutboxStatus::Sent,
             OutboxStatus::FailedTerminal,
             OutboxStatus::Canceled,
+            OutboxStatus::DeliveryUnknown,
         ] {
             let s = status.as_str();
             assert_eq!(OutboxStatus::from_str(s), Some(status));
@@ -825,7 +1025,11 @@ mod tests {
     #[test]
     fn media_routes_synthetic_ignores_source_event_id() {
         // 媒体条目：非空 source_event_id 也走 synthetic（key 才会含 asset_id）。
-        assert!(media_routes_synthetic(&Some("aid".to_string()), &None, "evt_1"));
+        assert!(media_routes_synthetic(
+            &Some("aid".to_string()),
+            &None,
+            "evt_1"
+        ));
         assert!(media_routes_synthetic(&Some("aid".to_string()), &None, ""));
         // 纯文本条目：非空 source_event_id 走非 synthetic；空才 synthetic。
         assert!(!media_routes_synthetic(&None, &None, "evt_1"));
@@ -943,12 +1147,10 @@ mod tests {
         let content_hash = sha256_hex(b"hello there");
         let contact_wxid = "wxid_alice";
         let source_event_id = "evt_99";
-        let key_a = sha256_hex(
-            format!("{}:{}:{}", source_event_id, contact_wxid, content_hash).as_bytes(),
-        );
-        let key_b = sha256_hex(
-            format!("{}:{}:{}", source_event_id, contact_wxid, content_hash).as_bytes(),
-        );
+        let key_a =
+            sha256_hex(format!("{}:{}:{}", source_event_id, contact_wxid, content_hash).as_bytes());
+        let key_b =
+            sha256_hex(format!("{}:{}:{}", source_event_id, contact_wxid, content_hash).as_bytes());
         assert_eq!(
             key_a, key_b,
             "non-empty source_event_id 路径不依赖 run_id, 必须生成相同 idempotency_key"
@@ -1055,7 +1257,10 @@ mod tests {
             30 * 60 * 1000,
             true,
         );
-        assert_eq!(reason.as_deref(), Some("user_stop_requested_after_decision"));
+        assert_eq!(
+            reason.as_deref(),
+            Some("user_stop_requested_after_decision")
+        );
     }
 
     #[test]
@@ -1284,7 +1489,11 @@ mod tests {
         // B-03：发送前非 managed（决策期 admin 改 normal / contact 被删）→ 拦截。
         let now = 1_000_000_000_000i64;
         let r = check_second_safety_gate_pure(now, now, None, None, "", now, 30 * 60 * 1000, false);
-        assert_eq!(r, Some("not_managed_at_send".to_string()), "非 managed 必须拦截");
+        assert_eq!(
+            r,
+            Some("not_managed_at_send".to_string()),
+            "非 managed 必须拦截"
+        );
     }
 
     #[test]
@@ -1313,7 +1522,11 @@ mod referral_outbox_tests {
     #[test]
     fn namecard_routes_synthetic_regardless_of_source_event() {
         // 名片条目即使 source_event_id 非空也走 synthetic
-        assert!(media_routes_synthetic(&None, &Some("c1".to_string()), "evt123"));
+        assert!(media_routes_synthetic(
+            &None,
+            &Some("c1".to_string()),
+            "evt123"
+        ));
         // 纯文本 + 非空 source_event → 不走 synthetic
         assert!(!media_routes_synthetic(&None, &None, "evt123"));
     }
@@ -1321,8 +1534,26 @@ mod referral_outbox_tests {
     #[test]
     fn synthetic_key_differs_per_card() {
         // 同 run/contact、空 content、不同 card → key 必须不同（防撞键误去重）
-        let k1 = compute_synthetic_key("inbound_message", "acct", "wx", "run1", "H", 0, None, Some("c1"));
-        let k2 = compute_synthetic_key("inbound_message", "acct", "wx", "run1", "H", 0, None, Some("c2"));
+        let k1 = compute_synthetic_key(
+            "inbound_message",
+            "acct",
+            "wx",
+            "run1",
+            "H",
+            0,
+            None,
+            Some("c1"),
+        );
+        let k2 = compute_synthetic_key(
+            "inbound_message",
+            "acct",
+            "wx",
+            "run1",
+            "H",
+            0,
+            None,
+            Some("c2"),
+        );
         assert_ne!(k1, k2);
         // 名片 key 形态稳定可识别
         assert!(k1.contains("c1"));

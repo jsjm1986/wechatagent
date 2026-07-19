@@ -197,7 +197,8 @@ async fn run_job(state: &AppState, job: ImportJob) {
     // 终态同时置 `expires_at = now + 24h`：`import_jobs` 的 TTL 索引据此在 24h 后
     // 删除完成/失败 job，防 `result`（可能较大）无界堆积（设计文档要求）。pending/
     // running 不设 expires_at → TTL 忽略缺失字段，进行中 job 绝不被删。
-    let expires_at = DateTime::from_millis(DateTime::now().timestamp_millis() + 24 * 60 * 60 * 1000);
+    let expires_at =
+        DateTime::from_millis(DateTime::now().timestamp_millis() + 24 * 60 * 60 * 1000);
     match result {
         Ok(value) => match mongodb::bson::to_bson(&value) {
             Ok(result_bson) => {

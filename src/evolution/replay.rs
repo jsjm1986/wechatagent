@@ -40,10 +40,7 @@ use super::budget::EvolutionBudget;
 use super::error::EvolutionError;
 
 /// Block-class gates with `score >= threshold` 触发（分数越高越危险）。
-const BLOCK_DIRECTION_GTE: &[&str] = &[
-    "fact_risk_block",
-    "pressure_risk_block",
-];
+const BLOCK_DIRECTION_GTE: &[&str] = &["fact_risk_block", "pressure_risk_block"];
 
 /// Block / rewrite 类用 `score < threshold` 触发（分数越低越触发）。
 /// 注意 `product_accuracy_score_block` 走 < 方向：业务上"产品准确度过低 →
@@ -91,9 +88,7 @@ pub async fn eval_all(
         .await
         .map_err(EvolutionError::from)?
         .ok_or_else(|| {
-            EvolutionError::InvalidStatus(format!(
-                "experiment_id not found: {experiment_id}"
-            ))
+            EvolutionError::InvalidStatus(format!("experiment_id not found: {experiment_id}"))
         })?;
     let threshold_runs = envelope_doc.cohort_threshold_run_ids.clone();
     let prompt_runs = envelope_doc.cohort_prompt_run_ids.clone();
@@ -120,14 +115,9 @@ pub async fn eval_all(
             // 不启动 LLM——所以 W3 的 budget 主要在 W2 的 prompt_critic 阶段消耗。
             // 这里仍调 exhausted 占位以保持后续接入完整 LLM 时一处控制。
             if budget.exhausted() {
-                let _ = insert_replay_failed(
-                    state,
-                    &proposal,
-                    pid,
-                    src,
-                    "evolution_budget_exceeded",
-                )
-                .await;
+                let _ =
+                    insert_replay_failed(state, &proposal, pid, src, "evolution_budget_exceeded")
+                        .await;
                 continue;
             }
 
@@ -298,7 +288,9 @@ fn evaluate_threshold(proposal: &Proposal, original: &AgentRunLog) -> ReplayOutc
         // 终态 original.final_review_status，若终态是非-5gate 因素(blocked_by_budget/
         // ai_waiting_for_more_context 等)会让 original 侧算"发送失败"、new 侧 5闸算"成功"，
         // 凭空 +send_delta 虚假翻越 min_send_success_delta 门。两侧同口径后唯一变量是被改 gate。
-        original_final_review_status: Some(final_status_from_5gate(&original_5gate_hit).to_string()),
+        original_final_review_status: Some(
+            final_status_from_5gate(&original_5gate_hit).to_string(),
+        ),
         original_5gate_hit,
         original_self_critique_addressed: None,
         new_final_review_status: Some(new_final.to_string()),
@@ -411,7 +403,9 @@ fn scores_to_5gate_hit(scores: &Document) -> Document {
 fn final_status_from_5gate(hit: &Document) -> &'static str {
     let any_block_hit = hit.get_bool("fact_risk_block").unwrap_or(false)
         || hit.get_bool("pressure_risk_block").unwrap_or(false)
-        || hit.get_bool("product_accuracy_score_block").unwrap_or(false);
+        || hit
+            .get_bool("product_accuracy_score_block")
+            .unwrap_or(false);
     let any_rewrite_hit = hit.get_bool("human_like_score_rewrite").unwrap_or(false)
         || hit.get_bool("emotional_value_rewrite").unwrap_or(false);
     if any_block_hit {
@@ -544,7 +538,12 @@ async fn persist_replay(
         workspace_id: proposal.workspace_id.clone(),
         account_id: proposal.account_id.clone(),
         source_run_id,
-        status: if outcome.completed { "completed" } else { "failed" }.to_string(),
+        status: if outcome.completed {
+            "completed"
+        } else {
+            "failed"
+        }
+        .to_string(),
         failure_reason: outcome.failure_reason,
         original_final_review_status: outcome.original_final_review_status,
         original_5gate_hit: outcome.original_5gate_hit,
@@ -772,7 +771,8 @@ mod tests {
         let outcome = evaluate_threshold(&proposal, &run);
         assert!(outcome.completed);
         assert_eq!(
-            outcome.new_5gate_hit
+            outcome
+                .new_5gate_hit
                 .get_bool("emotional_value_rewrite")
                 .unwrap(),
             true

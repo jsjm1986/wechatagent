@@ -92,10 +92,8 @@ fn minimal_pdf(text: &str) -> Vec<u8> {
     }
     // trailer
     buf.extend_from_slice(
-        format!(
-            "trailer\n<< /Size {obj_count} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n"
-        )
-        .as_bytes(),
+        format!("trailer\n<< /Size {obj_count} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+            .as_bytes(),
     );
     buf
 }
@@ -136,7 +134,10 @@ async fn import_pdf_without_fence_falls_back_to_blob() {
         .await
         .expect("import_pdf_bytes ok");
 
-    assert!(outcome.fallback_blob, "无 fence 应触发 fallback blob: {outcome:?}");
+    assert!(
+        outcome.fallback_blob,
+        "无 fence 应触发 fallback blob: {outcome:?}"
+    );
     assert_eq!(
         outcome.chunk_ids.len(),
         1,

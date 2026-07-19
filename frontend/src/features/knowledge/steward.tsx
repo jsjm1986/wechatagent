@@ -70,6 +70,10 @@ interface DocumentDetail {
   version?: number | null;
 }
 
+interface DocumentDetailResponse {
+  item?: DocumentDetail | null;
+}
+
 // 编辑表单可改字段（少数元数据）；rawContent 等未编辑字段原样从 detail 回带。
 interface DocEditState {
   detail: DocumentDetail;
@@ -174,9 +178,13 @@ export function DocumentsView() {
     setEditLoadingId(d.id);
     setError(null);
     try {
-      const detail = await api.get<DocumentDetail>(
+      const response = await api.get<DocumentDetailResponse>(
         `/api/operation-knowledge/documents/${encodeURIComponent(d.id)}`,
       );
+      const detail = response.item;
+      if (!detail || detail.id !== d.id) {
+        throw new Error("文档详情响应与当前文档不匹配，请刷新后重试。");
+      }
       setEditState({
         detail,
         // productTags / businessTopics 仅在列表项里（GET 详情不返回这俩）。
@@ -1830,9 +1838,20 @@ export function ReviewView({ initialDimFilter }: { initialDimFilter?: string | n
 //   - body 默认收起；展开后用 <pre> 渲染原文（white-space pre-wrap）
 //
 // 全部只读：本视图不修改 chunk，verify / reject 走 ReviewView。
+interface CatalogPersistedDocument {
+  catalogSummaryPersisted?: string | null;
+}
+
 interface CatalogPersistedView {
-  total?: number;
-  items?: unknown[];
+  documents?: CatalogPersistedDocument[];
+}
+
+interface CatalogLiveView {
+  item?: {
+    documents?: unknown[];
+    items?: unknown[];
+    chunks?: unknown[];
+  } | null;
 }
 
 interface LogsAnalyzeView {
@@ -2078,7 +2097,7 @@ export function IngestSourcesView() {
 
 export function ObservabilityDashboard() {
   const [catalog, setCatalog] = useState<CatalogPersistedView | null>(null);
-  const [catalogLive, setCatalogLive] = useState<{ total?: number } | null>(null);
+  const [catalogLive, setCatalogLive] = useState<CatalogLiveView | null>(null);
   const [completeness, setCompleteness] = useState<CompletenessView | null>(null);
   const [integrity, setIntegrity] = useState<IntegrityReportView | null>(null);
   const [logs, setLogs] = useState<LogsAnalyzeView | null>(null);
@@ -2161,7 +2180,7 @@ export function ObservabilityDashboard() {
     try {
       const [a, b, c, d, e, f, g, h, i] = await Promise.allSettled([
         safe<CatalogPersistedView>("/api/operation-knowledge/catalog/persisted"),
-        safe<{ total?: number }>("/api/operation-knowledge/catalog"),
+        safe<CatalogLiveView>("/api/operation-knowledge/catalog"),
         safe<unknown>("/api/operation-knowledge/completeness"),
         safe<unknown>("/api/operation-knowledge/integrity-report"),
         safe<LogsAnalyzeView>("/api/operation-knowledge/logs/analyze"),
@@ -2171,7 +2190,7 @@ export function ObservabilityDashboard() {
         safe<typeof behaviorMetrics>("/api/behavior-signal-metrics?limit=14"),
       ]).then((rs) => rs.map((r) => (r.status === "fulfilled" ? r.value : null)));
       if (a) setCatalog(a as CatalogPersistedView);
-      if (b) setCatalogLive(b as { total?: number });
+      if (b) setCatalogLive(b as CatalogLiveView);
       if (c) setCompleteness(parseCompleteness(c));
       if (d) setIntegrity(parseIntegrityReport(d));
       if (e) setLogs(e as LogsAnalyzeView);
@@ -2212,8 +2231,12 @@ export function ObservabilityDashboard() {
     }
   }
 
-  const persistedTotal = catalog?.total ?? catalog?.items?.length ?? 0;
-  const liveTotal = catalogLive?.total ?? 0;
+  const persistedTotal = (catalog?.documents ?? []).filter(
+    (document) =>
+      typeof document.catalogSummaryPersisted === "string" &&
+      document.catalogSummaryPersisted.trim().length > 0,
+  ).length;
+  const liveTotal = catalogLive?.item?.documents?.length ?? 0;
   const drift = liveTotal - persistedTotal;
 
   return (

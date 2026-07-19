@@ -37,6 +37,10 @@ describe("契约: 配置/playbook 域投影键集对账", () => {
     assertKeysMatch("evaluationScenario", evaluationScenarioFixture, EVALUATION_SCENARIO_KEYS));
   it("suspected_deal 投影", () =>
     assertKeysMatch("suspectedDeal", suspectedDealFixture, SUSPECTED_DEAL_KEYS));
-  it("outbox_entry 投影", () =>
-    assertKeysMatch("outboxEntry", outboxEntryFixture, OUTBOX_ENTRY_KEYS));
+  it("outbox_entry 投影保留 typed payload 业务身份", () => {
+    assertKeysMatch("outboxEntry", outboxEntryFixture, OUTBOX_ENTRY_KEYS);
+    expect(outboxEntryFixture.payload).toEqual(
+      expect.objectContaining({ kind: "media", assetId: "asset-1" }),
+    );
+  });
 });

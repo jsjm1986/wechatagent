@@ -16,17 +16,16 @@ use crate::routes::AppState;
 
 use super::budget::{RunBudget, RUN_BUDGET};
 use super::decision::{
-    decide_reply, load_operation_playbook_for_contact, load_user_operation_domain_config_for_contact,
+    decide_reply, load_operation_playbook_for_contact,
+    load_user_operation_domain_config_for_contact,
 };
 use super::gateway::{
     load_context_messages, load_pending_tasks, precheck_send_gateway, simulation_gateway_document,
 };
-use super::guards::{
-    normalize_decision_runtime, normalize_decision_state, planner_from_decision,
-};
+use super::guards::{normalize_decision_runtime, normalize_decision_state, planner_from_decision};
 use super::knowledge_router::{
-    empty_knowledge_route, load_operation_knowledge,
-    route_operation_knowledge, route_used_knowledge_ids, select_operation_knowledge_chunks,
+    empty_knowledge_route, load_operation_knowledge, route_operation_knowledge,
+    route_used_knowledge_ids, select_operation_knowledge_chunks,
 };
 use super::memory::{
     effective_memory_card_for_contact, load_or_create_operating_memory, next_memory_card_version,

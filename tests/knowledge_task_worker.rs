@@ -10,8 +10,7 @@
 //!    BSON round-trip，attachments 里 phase / taskId / stepIndex / total 都保留。
 //! 3. `ChatProgressBus` 在并发场景下：`subscribe` 后 `bump` 必然让订阅者观察到
 //!    `changed()`；同 sessionId 锁始终是同一 Arc。
-//! 4. summary turn details 中 needsReviewChunkIds / failedStepIds / completedSteps
-//!    三个字段类型契约稳定（Vec<String> / Vec<String> / Vec<Document>）。
+//! 4. summary turn details 保留结构化业务 verdict 与各结果桶。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -72,8 +71,7 @@ fn knowledge_chat_task_status_closed_set_round_trip() {
         };
         let bson = to_bson(&task).expect("serialize task");
         let doc: Document = bson.as_document().expect("doc").clone();
-        let back: KnowledgeChatTask =
-            mongodb::bson::from_document(doc).expect("round-trip task");
+        let back: KnowledgeChatTask = mongodb::bson::from_document(doc).expect("round-trip task");
         assert_eq!(back.status, status);
         assert_eq!(back.planned_steps.len(), 1);
     }
@@ -134,15 +132,18 @@ fn task_summary_turn_carries_review_and_failed_lists() {
         "stepId": "step_1",
         "cardId": "card_a",
         "action": "fix_chunk",
-        "status": "ok",
+        "status": "committed",
         "chunkId": "chunk_1",
     }];
     let summary_attach = doc! {
         "taskId": task_id,
         "phase": "summary",
-        "status": "finished",
+        "status": "completed",
         "needsReviewChunkIds": needs_review.clone(),
         "failedStepIds": failed_steps.clone(),
+        "needsManualStepIds": vec!["step_2"],
+        "noopStepIds": vec!["step_4"],
+        "committedCount": 1_i32,
         "completedSteps": completed_steps.clone(),
     };
     let turn = KnowledgeChatTurn {
@@ -153,8 +154,7 @@ fn task_summary_turn_carries_review_and_failed_lists() {
         turn_index: 12,
         role: "system".to_string(),
         intent: Some("digest_action".to_string()),
-        content: "AI 派工任务已完成 · 共 3 步 · 成功 2 · 失败 1 · 待运营审核 chunk 2"
-            .to_string(),
+        content: "AI 派工任务已完成 · 共 3 步 · 成功 2 · 失败 1 · 待运营审核 chunk 2".to_string(),
         attachments: vec![summary_attach],
         patch: None,
         missing_fields: vec![],
@@ -172,7 +172,7 @@ fn task_summary_turn_carries_review_and_failed_lists() {
     assert_eq!(back.kind.as_deref(), Some("task_summary"));
     let attach = back.attachments.first().expect("summary attachment");
     let status = attach.get_str("status").expect("status");
-    assert!(["finished", "failed", "cancelled"].contains(&status));
+    assert!(["completed", "failed", "cancelled"].contains(&status));
     let review = attach
         .get_array("needsReviewChunkIds")
         .expect("needsReviewChunkIds is array");
@@ -185,6 +185,17 @@ fn task_summary_turn_carries_review_and_failed_lists() {
         .get_array("completedSteps")
         .expect("completedSteps is array");
     assert_eq!(completed.len(), 1);
+    assert_eq!(
+        completed[0]
+            .as_document()
+            .unwrap()
+            .get_str("status")
+            .unwrap(),
+        "committed"
+    );
+    assert_eq!(attach.get_i32("committedCount").unwrap(), 1);
+    assert_eq!(attach.get_array("needsManualStepIds").unwrap().len(), 1);
+    assert_eq!(attach.get_array("noopStepIds").unwrap().len(), 1);
 }
 
 #[tokio::test]

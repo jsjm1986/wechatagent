@@ -310,7 +310,10 @@ async fn terminal_signal_does_not_block_new_pending() {
         err.kind.as_ref(),
         ErrorKind::Write(WriteFailure::WriteError(we)) if we.code == 11000
     );
-    assert!(is_dup_key, "第二条 pending 应因 DuplicateKey(11000) 被拒,实际={err:?}");
+    assert!(
+        is_dup_key,
+        "第二条 pending 应因 DuplicateKey(11000) 被拒,实际={err:?}"
+    );
 
     // 断言 3：该 contact 下恰好 1 条 pending + 1 条 approved 并存。
     let pending_count = app

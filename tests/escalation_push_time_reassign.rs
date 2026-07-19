@@ -62,7 +62,11 @@ async fn reassign_refreshes_last_pushed_at_ms() {
         .await
         .expect("find")
         .expect("exists");
-    assert_eq!(row.get_i64("last_pushed_at_ms").unwrap(), reassign_ms, "改派须刷新 last_pushed_at_ms 为改派时刻");
+    assert_eq!(
+        row.get_i64("last_pushed_at_ms").unwrap(),
+        reassign_ms,
+        "改派须刷新 last_pushed_at_ms 为改派时刻"
+    );
     // created_at 保持不变（真实创建审计）。
     assert_eq!(
         row.get_datetime("created_at").unwrap().timestamp_millis(),
@@ -122,18 +126,24 @@ async fn m031_backfills_last_pushed_at_from_created_at() {
     let old_row = raw
         .collection::<Document>("agent_principal_escalations")
         .find_one(doc! { "short_code": "OLD1", "workspace_id": &ws }, None)
-        .await.expect("find").expect("exists");
+        .await
+        .expect("find")
+        .expect("exists");
     assert_eq!(
-        old_row.get_i64("last_pushed_at_ms").unwrap(), legacy_created,
+        old_row.get_i64("last_pushed_at_ms").unwrap(),
+        legacy_created,
         "老行 last_pushed_at_ms 回填成 created_at"
     );
 
     let new_row = raw
         .collection::<Document>("agent_principal_escalations")
         .find_one(doc! { "short_code": "NEW1", "workspace_id": &ws }, None)
-        .await.expect("find").expect("exists");
+        .await
+        .expect("find")
+        .expect("exists");
     assert_eq!(
-        new_row.get_i64("last_pushed_at_ms").unwrap(), has_field_pushed,
+        new_row.get_i64("last_pushed_at_ms").unwrap(),
+        has_field_pushed,
         "已有 last_pushed_at_ms 的行不被迁移覆盖（幂等）"
     );
 }

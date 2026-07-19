@@ -31,8 +31,7 @@ fn make_card(kind: &str, severity: &str, action: &str) -> KnowledgeDigestCard {
 fn card_with_metric_document_roundtrips_via_bson() {
     let card = make_card("chunk_caused_block", "warn", "fix_chunk");
     let doc = to_document(&card).expect("serialize card");
-    let back: KnowledgeDigestCard =
-        mongodb::bson::from_document(doc).expect("roundtrip card");
+    let back: KnowledgeDigestCard = mongodb::bson::from_document(doc).expect("roundtrip card");
     assert_eq!(back.kind, "chunk_caused_block");
     assert_eq!(back.severity, "warn");
     assert_eq!(back.suggested_action, "fix_chunk");
@@ -60,8 +59,7 @@ fn report_accepts_failed_status_with_empty_cards() {
     };
     let bson = mongodb::bson::to_bson(&report).expect("serialize");
     let doc: Document = bson.as_document().expect("doc").clone();
-    let back: KnowledgeDailyReport =
-        mongodb::bson::from_document(doc).expect("roundtrip");
+    let back: KnowledgeDailyReport = mongodb::bson::from_document(doc).expect("roundtrip");
     assert_eq!(back.status, "failed");
     assert_eq!(back.error_kind.as_deref(), Some("upstream_timeout"));
     assert!(back.cards.is_empty());
@@ -85,15 +83,11 @@ fn report_accepts_partial_status_with_budget_exceeded() {
     };
     let bson = mongodb::bson::to_bson(&report).expect("serialize");
     let doc: Document = bson.as_document().expect("doc").clone();
-    let back: KnowledgeDailyReport =
-        mongodb::bson::from_document(doc).expect("roundtrip");
+    let back: KnowledgeDailyReport = mongodb::bson::from_document(doc).expect("roundtrip");
     assert_eq!(back.status, "partial");
     assert_eq!(back.error_kind.as_deref(), Some("budget_exceeded"));
     assert_eq!(back.cards.len(), 1);
-    assert_eq!(
-        back.budget_snapshot.get_i64("tokens_used").unwrap(),
-        24_000
-    );
+    assert_eq!(back.budget_snapshot.get_i64("tokens_used").unwrap(), 24_000);
 }
 
 #[test]
@@ -105,8 +99,7 @@ fn card_target_refs_support_mixed_kinds() {
         doc! { "kind": "chunk", "id": "c_003" },
     ];
     let doc = to_document(&card).expect("serialize");
-    let back: KnowledgeDigestCard =
-        mongodb::bson::from_document(doc).expect("roundtrip");
+    let back: KnowledgeDigestCard = mongodb::bson::from_document(doc).expect("roundtrip");
     assert_eq!(back.target_refs.len(), 3);
     let kinds: Vec<&str> = back
         .target_refs

@@ -412,9 +412,7 @@ pub async fn dispatch_campaign(
                 };
                 // KC-03：回填 taskId 失败 → 补偿删 task + send,保持 all-or-nothing
                 // (否则 task 会真发但 report 显 pending 成效虚低)。
-                if let (Some(sid), Some(tid)) =
-                    (send_id, task_res.inserted_id.as_object_id())
-                {
+                if let (Some(sid), Some(tid)) = (send_id, task_res.inserted_id.as_object_id()) {
                     if let Err(e) = state
                         .db
                         .campaign_sends()
@@ -489,6 +487,11 @@ pub(super) fn classify_send_outcome(
     if matches!(outbox_status, Some("failed_terminal") | Some("canceled")) {
         return ("canceled", outbox_status.map(str::to_string));
     }
+    // The remote call may have crossed the irreversible boundary without a verifiable receipt.
+    // Keep the campaign bucket conservative while preserving the exact operational reason.
+    if outbox_status == Some("delivery_unknown") {
+        return ("unknown", Some("delivery_unknown".to_string()));
+    }
     // 同一 run 部分送达、部分终态失败：不能归成 sent，也不能回落 run_status
     // 误报 pending/escalated。现有 API 无 partial 桶，归 canceled 并保留明确原因。
     if outbox_status == Some("partially_sent") {
@@ -508,22 +511,39 @@ pub(super) fn classify_send_outcome(
         // b. 频控/硬约束/改写失败——没发出且无后续。gateway_blocked = 二次 precheck
         //    在 LLM 决策后命中（罕见：频控/状态在决策窗口内翻转），顶层 status 是泛标签
         //    （真实原因在 gateway_result 子文档），语义上确定是一次"被拦下没发出"。
-        Some(s @ ("daily_limit" | "cooldown" | "rate_limited"
-            | "policy_cooldown" | "policy_wait_user_reply" | "policy_consecutive_limit"
-            | "blocked_by_required_field" | "blocked_by_budget"
-            | "review_blocked" | "revision_failed" | "revision_skipped_invalid_direction"
-            | "revision_skipped_budget_exceeded" | "revision_llm_failure"
-            | "tool_loop_timeout" | "gateway_blocked")) => ("blocked", Some(s.to_string())),
+        Some(
+            s @ ("daily_limit"
+            | "cooldown"
+            | "rate_limited"
+            | "policy_cooldown"
+            | "policy_wait_user_reply"
+            | "policy_consecutive_limit"
+            | "blocked_by_required_field"
+            | "blocked_by_budget"
+            | "review_blocked"
+            | "revision_failed"
+            | "revision_skipped_invalid_direction"
+            | "revision_skipped_budget_exceeded"
+            | "revision_llm_failure"
+            | "tool_loop_timeout"
+            | "gateway_blocked"),
+        ) => ("blocked", Some(s.to_string())),
         // c. 已转交幕后领导请示，待裁决后 AI 会继续触达（非失败漏推）。
-        Some(s @ ("blocked_unverified_product_claim" | "blocked_by_safety_guard"
-            | "held_by_ai_policy" | "ai_waiting_for_more_context")) => {
-            ("escalated", Some(s.to_string()))
-        }
+        Some(
+            s @ ("blocked_unverified_product_claim"
+            | "blocked_by_safety_guard"
+            | "held_by_ai_policy"
+            | "ai_waiting_for_more_context"),
+        ) => ("escalated", Some(s.to_string())),
         // d. 取消（无后续）。
-        Some(s @ ("context_changed" | "expired" | "not_managed"
-            | "no_reply" | "admin_cancelled" | "superseded_by_new_inbound")) => {
-            ("canceled", Some(s.to_string()))
-        }
+        Some(
+            s @ ("context_changed"
+            | "expired"
+            | "not_managed"
+            | "no_reply"
+            | "admin_cancelled"
+            | "superseded_by_new_inbound"),
+        ) => ("canceled", Some(s.to_string())),
         // e. 灰度/口径态 / 不认识的值：诚实标 unknown，绝不强划进 sent。
         Some(other) => ("unknown", Some(other.to_string())),
         None => ("unknown", None),
@@ -539,7 +559,10 @@ pub(super) fn build_sends_summary(items: &[Value]) -> Value {
     let mut canceled: Map<String, Value> = Map::new();
     let mut escalated: Map<String, Value> = Map::new();
     for it in items {
-        let status = it.get("status").and_then(Value::as_str).unwrap_or("unknown");
+        let status = it
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
         let reason = it.get("reason").and_then(Value::as_str);
         match status {
             "sent" => sent += 1,
@@ -583,7 +606,10 @@ pub async fn campaign_sends_report(
     let campaign = state
         .db
         .campaigns()
-        .find_one(doc! { "_id": oid, "workspaceId": &admin.current_workspace }, None)
+        .find_one(
+            doc! { "_id": oid, "workspaceId": &admin.current_workspace },
+            None,
+        )
         .await?
         .ok_or_else(|| AppError::NotFound("campaign not found".to_string()))?;
 
@@ -604,7 +630,8 @@ pub async fn campaign_sends_report(
         .iter()
         .filter_map(|s| s.task_id.map(|t| t.to_hex()))
         .collect();
-    let mut latest_run: std::collections::HashMap<String, AgentRunLog> = std::collections::HashMap::new();
+    let mut latest_run: std::collections::HashMap<String, AgentRunLog> =
+        std::collections::HashMap::new();
     if !task_hexes.is_empty() {
         let logs: Vec<AgentRunLog> = state
             .db
@@ -753,8 +780,14 @@ mod tests {
         // KC-02：completed 活动不可再派发（防重复推送）；dispatching 允许重入恢复；未知态 fail-safe 拒。
         assert!(dispatch_allowed_from_status("draft"));
         assert!(dispatch_allowed_from_status("previewed"));
-        assert!(dispatch_allowed_from_status("dispatching"), "dispatching 须允许重入恢复");
-        assert!(!dispatch_allowed_from_status("completed"), "completed 不可重推");
+        assert!(
+            dispatch_allowed_from_status("dispatching"),
+            "dispatching 须允许重入恢复"
+        );
+        assert!(
+            !dispatch_allowed_from_status("completed"),
+            "completed 不可重推"
+        );
         assert!(!dispatch_allowed_from_status("canceled"));
         assert!(!dispatch_allowed_from_status("赫赫"), "未知态 fail-safe 拒");
     }
@@ -860,7 +893,10 @@ mod tests {
 
     #[test]
     fn coarse_filter_with_products_uses_elemmatch_real_keys() {
-        let f = SegmentFilter { product_ids: vec!["vip".into()], ..Default::default() };
+        let f = SegmentFilter {
+            product_ids: vec!["vip".into()],
+            ..Default::default()
+        };
         let d = build_segment_coarse_filter("ws", "acc", &f);
         let em = d.get_document("outcome_events").unwrap();
         let elem = em.get_document("$elemMatch").unwrap();
@@ -869,7 +905,11 @@ mod tests {
         // KC-05：verification / eventKind 从精确匹配改成"缺字段=默认值"显式表达，
         // 用 $elemMatch 内的 $and 数组承载（字段级"或缺失"不能用顶层 $or）。
         let and = elem.get_array("$and").unwrap();
-        assert_eq!(and.len(), 2, "$and 恰两个子条件：verification 或缺失 + eventKind != reversal");
+        assert_eq!(
+            and.len(),
+            2,
+            "$and 恰两个子条件：verification 或缺失 + eventKind != reversal"
+        );
         // 子条件 1：verification $in 白名单 OR $exists:false
         let ver = and[0].as_document().unwrap();
         let ver_or = ver.get_array("$or").unwrap();
@@ -900,9 +940,17 @@ mod tests {
             ev("staff_confirmed", "vip", 1, "deal", 19900),
             ev("staff_confirmed", "vip", 1, "reversal", 19900),
         ];
-        let f = SegmentFilter { product_ids: vec!["vip".into()], ..Default::default() };
+        let f = SegmentFilter {
+            product_ids: vec!["vip".into()],
+            ..Default::default()
+        };
         assert!(!contact_matches_segment(
-            &contact_with(events), &[], &f, DateTime::from_millis(1_000_000), 50000, 300000
+            &contact_with(events),
+            &[],
+            &f,
+            DateTime::from_millis(1_000_000),
+            50000,
+            300000
         ));
     }
 
@@ -910,9 +958,17 @@ mod tests {
     fn precise_filter_conversation_inferred_never_matches() {
         // conversation_inferred 不进 G4 投影 → 不算持有
         let events = vec![ev("conversation_inferred", "vip", 1, "deal", 19900)];
-        let f = SegmentFilter { product_ids: vec!["vip".into()], ..Default::default() };
+        let f = SegmentFilter {
+            product_ids: vec!["vip".into()],
+            ..Default::default()
+        };
         assert!(!contact_matches_segment(
-            &contact_with(events), &[], &f, DateTime::from_millis(1_000_000), 50000, 300000
+            &contact_with(events),
+            &[],
+            &f,
+            DateTime::from_millis(1_000_000),
+            50000,
+            300000
         ));
     }
 
@@ -926,12 +982,22 @@ mod tests {
             ..Default::default()
         };
         assert!(contact_matches_segment(
-            &contact_with(events.clone()), &[], &f, DateTime::from_millis(1_000_000), 50000, 300000
+            &contact_with(events.clone()),
+            &[],
+            &f,
+            DateTime::from_millis(1_000_000),
+            50000,
+            300000
         ));
         // 要求 high 但只值 1.99 元(19900分=low) → 不命中
         let cheap = vec![ev("staff_confirmed", "vip", 1, "deal", 19900)];
         assert!(!contact_matches_segment(
-            &contact_with(cheap), &[], &f, DateTime::from_millis(1_000_000), 50000, 300000
+            &contact_with(cheap),
+            &[],
+            &f,
+            DateTime::from_millis(1_000_000),
+            50000,
+            300000
         ));
     }
 
@@ -964,7 +1030,10 @@ mod tests {
     #[test]
     fn classify_covers_all_buckets_and_priority() {
         // ① 去重
-        assert_eq!(classify_send_outcome("skipped_duplicate", None), ("skipped", None));
+        assert_eq!(
+            classify_send_outcome("skipped_duplicate", None),
+            ("skipped", None)
+        );
         // ② 有 task 无 run log
         assert_eq!(
             classify_send_outcome("enqueued", None),
@@ -990,12 +1059,22 @@ mod tests {
         );
         // ④ outbox 终态失败
         assert_eq!(
-            classify_send_outcome("enqueued", Some(&run_log("allowed", Some("failed_terminal")))),
+            classify_send_outcome(
+                "enqueued",
+                Some(&run_log("allowed", Some("failed_terminal")))
+            ),
             ("canceled", Some("failed_terminal".to_string()))
         );
         assert_eq!(
             classify_send_outcome("enqueued", Some(&run_log("allowed", Some("canceled")))),
             ("canceled", Some("canceled".to_string()))
+        );
+        assert_eq!(
+            classify_send_outcome(
+                "enqueued",
+                Some(&run_log("allowed", Some("delivery_unknown")))
+            ),
+            ("unknown", Some("delivery_unknown".to_string()))
         );
         assert_eq!(
             classify_send_outcome(
@@ -1036,7 +1115,10 @@ mod tests {
             ("blocked", Some("policy_wait_user_reply".to_string()))
         );
         assert_eq!(
-            classify_send_outcome("enqueued", Some(&run_log("blocked_by_required_field", None))),
+            classify_send_outcome(
+                "enqueued",
+                Some(&run_log("blocked_by_required_field", None))
+            ),
             ("blocked", Some("blocked_by_required_field".to_string()))
         );
         assert_eq!(
@@ -1050,8 +1132,14 @@ mod tests {
         );
         // ⑥c 请示通道（escalated）：产品红线/安全门/AI策略/等上下文，原因保留
         assert_eq!(
-            classify_send_outcome("enqueued", Some(&run_log("blocked_unverified_product_claim", None))),
-            ("escalated", Some("blocked_unverified_product_claim".to_string()))
+            classify_send_outcome(
+                "enqueued",
+                Some(&run_log("blocked_unverified_product_claim", None))
+            ),
+            (
+                "escalated",
+                Some("blocked_unverified_product_claim".to_string())
+            )
         );
         assert_eq!(
             classify_send_outcome("enqueued", Some(&run_log("blocked_by_safety_guard", None))),
@@ -1062,7 +1150,10 @@ mod tests {
             ("escalated", Some("held_by_ai_policy".to_string()))
         );
         assert_eq!(
-            classify_send_outcome("enqueued", Some(&run_log("ai_waiting_for_more_context", None))),
+            classify_send_outcome(
+                "enqueued",
+                Some(&run_log("ai_waiting_for_more_context", None))
+            ),
             ("escalated", Some("ai_waiting_for_more_context".to_string()))
         );
         // ⑥d 取消（run status）
@@ -1161,7 +1252,12 @@ mod tests {
         assert_eq!(v.get("createdBy").unwrap(), "admin");
         // createdAt 是 RFC3339 字符串（非 {$date} 对象）
         assert!(v.get("createdAt").unwrap().is_string());
-        assert!(v.get("createdAt").unwrap().as_str().unwrap().contains("2023"));
+        assert!(v
+            .get("createdAt")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .contains("2023"));
         // 不泄漏内部字段
         assert!(v.get("workspaceId").is_none());
         assert!(v.get("workspace_id").is_none());

@@ -9,6 +9,7 @@
 
 #![allow(dead_code)]
 
+pub mod capability_evidence;
 pub mod dynamic;
 pub mod generalization;
 pub mod identity_generator;
@@ -120,7 +121,8 @@ impl LlmProvider for TestLlmGenerator {
 pub struct TestApp {
     pub state: AppState,
     pub llm: Arc<TestLlmGenerator>,
-    _container: ContainerAsync<Mongo>,
+    _container: Option<ContainerAsync<Mongo>>,
+    external_mongo: bool,
 }
 
 impl TestApp {
@@ -148,26 +150,36 @@ impl TestApp {
         // OnceCell 一旦填充即不可变。
         let _ = wechatagent::APP_STARTED_AT.set(mongodb::bson::DateTime::now());
 
-        let container = if repl_set {
-            Mongo::repl_set()
-                .start()
+        // CI/default remains Testcontainers. Environments with a trusted local mongod but no
+        // Docker may opt in explicitly; every TestApp still gets a random isolated database.
+        let external_uri = std::env::var("TEST_MONGODB_URI")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        let external_mongo = external_uri.is_some();
+        let (container, uri) = if let Some(uri) = external_uri {
+            (None, uri)
+        } else {
+            let container = if repl_set {
+                Mongo::repl_set()
+                    .start()
+                    .await
+                    .expect("启动 mongo replica set 容器失败")
+            } else {
+                Mongo::default().start().await.expect("启动 mongo 容器失败")
+            };
+            let host = container.get_host().await.expect("获取容器 host 失败");
+            let port = container
+                .get_host_port_ipv4(27017)
                 .await
-                .expect("启动 mongo replica set 容器失败")
-        } else {
-            Mongo::default().start().await.expect("启动 mongo 容器失败")
-        };
-        let host = container.get_host().await.expect("获取容器 host 失败");
-        let port = container
-            .get_host_port_ipv4(27017)
-            .await
-            .expect("获取容器端口失败");
-        // 单节点 replica set 必须带 directConnection=true：否则驱动会按 RS 拓扑做
-        // server discovery，连到 rs.initiate() 在容器内 advertise 的 hostname（宿主不可达）
-        // → 连接挂起 / 超时。directConnection 强制单服务器直连，事务仍可在 RS 成员上提交。
-        let uri = if repl_set {
-            format!("mongodb://{host}:{port}/?directConnection=true")
-        } else {
-            format!("mongodb://{host}:{port}")
+                .expect("获取容器端口失败");
+            // 单节点 replica set 必须带 directConnection=true：否则驱动会按 RS 拓扑做
+            // server discovery，连到容器内 advertise 的 hostname（宿主不可达）。
+            let uri = if repl_set {
+                format!("mongodb://{host}:{port}/?directConnection=true")
+            } else {
+                format!("mongodb://{host}:{port}")
+            };
+            (Some(container), uri)
         };
         let db_name = format!("wechatagent_test_{}", uuid::Uuid::new_v4().simple());
 
@@ -249,6 +261,20 @@ impl TestApp {
             state,
             llm,
             _container: container,
+            external_mongo,
+        }
+    }
+
+    /// Explicitly remove the random database when TEST_MONGODB_URI is used. Container-backed
+    /// databases are removed with their container and need no manual cleanup.
+    pub async fn cleanup(self) {
+        if self.external_mongo {
+            self.state
+                .db
+                .raw()
+                .drop(None)
+                .await
+                .expect("删除外部 Mongo 隔离测试库失败");
         }
     }
 }
@@ -387,7 +413,8 @@ fn test_config(mongodb_uri: String, mongodb_database: String) -> AppConfig {
     }
 }
 
-/// 轮询等待指定 outbox entry 进入终态（sent / failed_terminal / canceled）。
+/// 轮询等待指定 outbox entry 进入终态（sent / failed_terminal / canceled /
+/// delivery_unknown）。
 ///
 /// W4 / Task 5.8（R13.10 / requirements.md:549）：集成测试 helper —— dispatcher
 /// 异步推进状态机，调用方需要"决策入队 → worker 抢占 → 终态"完整链路结束。
@@ -409,7 +436,7 @@ pub async fn wait_for_outbox_processed(
             last_status = entry.status.clone();
             if matches!(
                 entry.status.as_str(),
-                "sent" | "failed_terminal" | "canceled"
+                "sent" | "failed_terminal" | "canceled" | "delivery_unknown"
             ) {
                 return entry;
             }
@@ -426,7 +453,8 @@ pub async fn wait_for_outbox_processed(
 ///
 /// W6 / Task 7.4（R0.7 / R13.10）：happy_path_run 集成测试在调用 `handle_managed_message`
 /// 之后并不掌握 `outbox._id`，只有 `run_id`，因此需要按 `run_id` 字段轮询。命中
-/// 终态 `sent / failed_terminal / canceled` 立即返回；超时 panic 报告最后状态。
+/// 终态 `sent / failed_terminal / canceled / delivery_unknown` 立即返回；超时 panic
+/// 报告最后状态。
 pub async fn wait_for_outbox_processed_by_run_id(
     state: &AppState,
     run_id: &str,
@@ -444,7 +472,7 @@ pub async fn wait_for_outbox_processed_by_run_id(
             last_status = entry.status.clone();
             if matches!(
                 entry.status.as_str(),
-                "sent" | "failed_terminal" | "canceled"
+                "sent" | "failed_terminal" | "canceled" | "delivery_unknown"
             ) {
                 return entry;
             }

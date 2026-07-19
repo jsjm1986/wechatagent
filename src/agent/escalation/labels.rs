@@ -30,15 +30,30 @@ mod tests {
 
     #[test]
     fn blocked_status_maps_known_values() {
-        assert_eq!(blocked_status_zh("blocked_unverified_product_claim"), "产品说法未经核实".to_string());
-        assert_eq!(blocked_status_zh("blocked_by_safety_guard"), "安全门拦截".to_string());
-        assert_eq!(blocked_status_zh("held_by_ai_policy"), "AI 策略主动暂缓".to_string());
-        assert_eq!(blocked_status_zh("ai_waiting_for_more_context"), "AI 等待更多上下文".to_string());
+        assert_eq!(
+            blocked_status_zh("blocked_unverified_product_claim"),
+            "产品说法未经核实".to_string()
+        );
+        assert_eq!(
+            blocked_status_zh("blocked_by_safety_guard"),
+            "安全门拦截".to_string()
+        );
+        assert_eq!(
+            blocked_status_zh("held_by_ai_policy"),
+            "AI 策略主动暂缓".to_string()
+        );
+        assert_eq!(
+            blocked_status_zh("ai_waiting_for_more_context"),
+            "AI 等待更多上下文".to_string()
+        );
     }
 
     #[test]
     fn blocked_status_unknown_falls_back_to_input() {
-        assert_eq!(blocked_status_zh("some_new_status"), "some_new_status".to_string());
+        assert_eq!(
+            blocked_status_zh("some_new_status"),
+            "some_new_status".to_string()
+        );
     }
 
     #[test]

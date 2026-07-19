@@ -84,15 +84,21 @@ async fn behavior_signal_dedupe_round_trip() {
     let sig = bs::build_reply_latency("default", "wxid_a", "msg1", inbound_at, Some(5_000));
 
     // 首次写入 → Ok(true)。
-    let first = bs::persist_signal(state, sig.clone()).await.expect("persist 1");
+    let first = bs::persist_signal(state, sig.clone())
+        .await
+        .expect("persist 1");
     assert!(first, "首次写入应成功");
     // 同 dedupe_key 再写 → 撞 partial unique 索引 → Ok(false)。
-    let second = bs::persist_signal(state, sig.clone()).await.expect("persist 2");
+    let second = bs::persist_signal(state, sig.clone())
+        .await
+        .expect("persist 2");
     assert!(!second, "同 dedupe_key 第二次写入应被幂等吞掉");
 
     // 不同 dedupe_key（reply_length 同 msg）→ 各落一条。
     let len_sig = bs::build_reply_length("default", "wxid_a", "msg1", inbound_at, "你好👋");
-    assert!(bs::persist_signal(state, len_sig).await.expect("persist len"));
+    assert!(bs::persist_signal(state, len_sig)
+        .await
+        .expect("persist len"));
 
     let count = state
         .db
@@ -177,7 +183,11 @@ async fn deal_event_push_round_trip() {
         .await
         .expect("reload")
         .expect("contact exists");
-    assert_eq!(reloaded.outcome_events.len(), 1, "旧 deal_events key 经 alias 读入 outcome_events");
+    assert_eq!(
+        reloaded.outcome_events.len(),
+        1,
+        "旧 deal_events key 经 alias 读入 outcome_events"
+    );
     assert_eq!(reloaded.outcome_events[0].source, "manual");
     assert_eq!(reloaded.outcome_events[0].amount, Some(19900));
     assert_eq!(reloaded.outcome_events[0].marked_by, "admin_smoke");
@@ -230,7 +240,10 @@ async fn silence_worker_single_round_idempotent() {
         .await
         .expect("find silence")
         .expect("silence exists");
-    assert!(stored.censored, "沉默信号必须 censored=true（删失，不是负例）");
+    assert!(
+        stored.censored,
+        "沉默信号必须 censored=true（删失，不是负例）"
+    );
     assert_eq!(stored.unanswered, Some(true));
 
     // 给 worker 一点时间确保没有遗留 spawn（本测试只调 tick，不 spawn loop）。

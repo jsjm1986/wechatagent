@@ -193,9 +193,8 @@ pub async fn apply_chunk_revision(
         )
         .await?
         .ok_or_else(|| AppError::NotFound("operation knowledge chunk not found".to_string()))?;
-    let existing_bson = mongodb::bson::to_document(&existing_doc).map_err(|e| {
-        AppError::External(format!("serialize existing chunk to bson failed: {e}"))
-    })?;
+    let existing_bson = mongodb::bson::to_document(&existing_doc)
+        .map_err(|e| AppError::External(format!("serialize existing chunk to bson failed: {e}")))?;
     let chunk_id_hex = chunk_object_id.to_hex();
     let before_hash = compute_chunk_hash(&existing_bson);
 
@@ -287,10 +286,8 @@ pub async fn apply_chunk_revision(
         crate::routes::domain_schemas::load_active_domain_schema(db, workspace_id).await?
     {
         if let Ok(attrs) = merged.get_document("domain_attributes") {
-            let enforced = crate::routes::domain_schemas::enforce_domain_attributes(
-                &schema,
-                &attrs.clone(),
-            )?;
+            let enforced =
+                crate::routes::domain_schemas::enforce_domain_attributes(&schema, &attrs.clone())?;
             merged.insert("domain_attributes", Bson::Document(enforced));
         }
     }
@@ -324,12 +321,13 @@ pub async fn apply_chunk_revision(
         let merged_typed: crate::models::OperationKnowledgeChunk =
             mongodb::bson::from_document(merged.clone())
                 .map_err(|e| AppError::External(format!("deserialize merged chunk failed: {e}")))?;
-        let replace_result = coll.replace_one(
-            chunk_replace_filter(chunk_object_id, workspace_id, existing_doc.updated_at),
-            merged_typed,
-            None,
-        )
-        .await?;
+        let replace_result = coll
+            .replace_one(
+                chunk_replace_filter(chunk_object_id, workspace_id, existing_doc.updated_at),
+                merged_typed,
+                None,
+            )
+            .await?;
         if replace_result.matched_count == 0 {
             if let Err(err) = db
                 .chunk_revisions()
@@ -585,9 +583,7 @@ mod tests {
             "principal_authorized"
         );
         assert_eq!(
-            "principal_authorized"
-                .parse::<ProvenanceSource>()
-                .unwrap(),
+            "principal_authorized".parse::<ProvenanceSource>().unwrap(),
             ProvenanceSource::PrincipalAuthorized
         );
     }

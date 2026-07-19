@@ -663,7 +663,10 @@ mod tests {
         assert!(blank.quiet_hours_enabled, "缺字段默认启用作息门控");
         assert_eq!(blank.quiet_hours_start, 22);
         assert_eq!(blank.quiet_hours_end, 8);
-        assert_eq!(blank.quiet_hours_tz_offset_hours, 8, "缺字段默认 +8 中国时区");
+        assert_eq!(
+            blank.quiet_hours_tz_offset_hours, 8,
+            "缺字段默认 +8 中国时区"
+        );
     }
 
     /// #69：as_document 把作息门控四字段写进 wire shape（camelCase）。
@@ -704,9 +707,15 @@ mod tests {
         assert!(!runtime.distrust_self_reported_low_risk);
         runtime.apply_active_profile(&profile);
         // H14：纯情感回复旁路 grounding 软分硬闸。
-        assert!(runtime.grounding_gate_bypass_without_claim, "情感陪伴应旁路 grounding 软闸");
+        assert!(
+            runtime.grounding_gate_bypass_without_claim,
+            "情感陪伴应旁路 grounding 软闸"
+        );
         // reviewer：高敏域强制走 LLM review。
-        assert!(runtime.distrust_self_reported_low_risk, "情感陪伴高敏域应不信任自报低风险");
+        assert!(
+            runtime.distrust_self_reported_low_risk,
+            "情感陪伴高敏域应不信任自报低风险"
+        );
     }
 
     /// 第 78 点：DEFAULT 销售 profile → apply_active_profile 零扰动（字节等价护栏）。
@@ -734,8 +743,7 @@ mod tests {
     /// 第 78 点：情感 profile 声明 threshold_overrides 时，apply 逐字段覆盖五闸阈值。
     #[test]
     fn apply_active_profile_applies_threshold_overrides() {
-        let mut profile =
-            crate::agent::domain_profile::example_emotional_companion_profile("ws-t");
+        let mut profile = crate::agent::domain_profile::example_emotional_companion_profile("ws-t");
         // 情感域放宽压力闸（主动关心不该被高 pressure 拦）、提高情绪价值改写线。
         profile.threshold_overrides = Some(crate::models::ProfileThresholds {
             fact_risk_block_at: None,
@@ -766,8 +774,14 @@ mod tests {
         let resolved = ResolvedThresholds::baseline(&runtime, 0.6);
         assert_eq!(resolved.fact_risk_block, runtime.fact_risk_block_at);
         assert_eq!(resolved.pressure_risk_block, runtime.pressure_risk_block_at);
-        assert_eq!(resolved.human_like_score_rewrite, runtime.human_like_rewrite_below);
-        assert_eq!(resolved.emotional_value_rewrite, runtime.emotional_value_rewrite_below);
+        assert_eq!(
+            resolved.human_like_score_rewrite,
+            runtime.human_like_rewrite_below
+        );
+        assert_eq!(
+            resolved.emotional_value_rewrite,
+            runtime.emotional_value_rewrite_below
+        );
         assert_eq!(
             resolved.product_accuracy_score_block,
             runtime.product_accuracy_block_below

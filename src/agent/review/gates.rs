@@ -17,10 +17,7 @@ use crate::agent::types::{
     HOLD_CATEGORY_BLOCKED_BY_SAFETY_GUARD, HOLD_CATEGORY_HELD_BY_AI_POLICY,
 };
 
-pub fn review_passed(
-    review: &DecisionReviewResult,
-    runtime: &UserRuntimeParameters,
-) -> bool {
+pub fn review_passed(review: &DecisionReviewResult, runtime: &UserRuntimeParameters) -> bool {
     review.approved
         && review.scores.hallucination_score < runtime.fact_risk_block_at
         && review.scores.human_like >= runtime.human_like_rewrite_below
@@ -281,7 +278,16 @@ fn reply_objective_features(reply_text: &str) -> String {
     let questions = text.matches(['?', '？']).count();
     let chars = text.chars().count();
     const EMPATHY_WORDS: [&str; 10] = [
-        "理解", "明白", "辛苦", "不容易", "感受", "确实", "懂", "体会", "替你", "为你",
+        "理解",
+        "明白",
+        "辛苦",
+        "不容易",
+        "感受",
+        "确实",
+        "懂",
+        "体会",
+        "替你",
+        "为你",
     ];
     let empathy: usize = EMPATHY_WORDS.iter().map(|w| text.matches(w).count()).sum();
     format!(
@@ -526,7 +532,10 @@ pub fn contact_has_principal_product_exemption(contact: &crate::models::Contact)
     contact
         .domain_attributes
         .as_ref()
-        .and_then(|d| d.get_document(crate::models::PRINCIPAL_PRODUCT_EXEMPTION_ATTR).ok())
+        .and_then(|d| {
+            d.get_document(crate::models::PRINCIPAL_PRODUCT_EXEMPTION_ATTR)
+                .ok()
+        })
         .and_then(|d| d.get_bool("granted").ok())
         .unwrap_or(false)
 }
@@ -639,7 +648,11 @@ pub fn finalize_review_for_send(
     }
 
     // R3.7：预算超额 + needs_review=true → blocked_by_budget
-    if review.risks.iter().any(|r| r == "budget_exceeded_no_review") {
+    if review
+        .risks
+        .iter()
+        .any(|r| r == "budget_exceeded_no_review")
+    {
         review.approved = false;
         decision.should_reply = false;
         decision.autonomy_mode = "blocked".to_string();
@@ -703,8 +716,7 @@ pub fn finalize_review_for_send(
             pending_events.push(PendingFinalizeEvent {
                 kind: "product_claim_blocked".to_string(),
                 status: "blocked".to_string(),
-                summary: "产品声明缺少 verified knowledge 支撑：本次决策被强制 blocked"
-                    .to_string(),
+                summary: "产品声明缺少 verified knowledge 支撑：本次决策被强制 blocked".to_string(),
                 details,
             });
             review.final_review_status = "blocked_unverified_product_claim".to_string();
@@ -729,7 +741,8 @@ pub fn finalize_review_for_send(
     // 与真阳性重复计数。有统计意义的漏判率证据后，再决定是否抬成硬闸（用户决策：
     // 先观测，避免重新引入 2026-05-25 刻意删除的脆弱 string-marker 判罚）。
     if !crate::agent::guards::claim_requires_product_knowledge(&review.claim_analysis) {
-        let class = crate::agent::guards::commitment_claim_class(&decision.reply_text, commitment_markers);
+        let class =
+            crate::agent::guards::commitment_claim_class(&decision.reply_text, commitment_markers);
         if class != crate::agent::guards::CommitmentClass::None {
             let now = mongodb::bson::DateTime::now();
             let verified = crate::agent::guards::compute_verified_chunks(
@@ -740,11 +753,9 @@ pub fn finalize_review_for_send(
             if verified.is_empty() {
                 match class {
                     crate::agent::guards::CommitmentClass::ProductEffect => {
-                        // 语气类：维持现状，仅观测不拦（避免误杀情感承诺）。
-                        // 注意：ProductEffect 原为兜底硬闸（H4 universal-domain-adaptation 分支引入），
-                        // 2026-06-14 回退为观测——成交弧中"保证"/"效果"类词汇高频出现，
-                        // 在知识稀缺场景下新闸导致全程哑火。先观测漏判率，有统计意义证据后
-                        // 由用户决策是否抬闸（对应注释"先观测后判罚"设计意图）。
+                        // ProductEffect is only a telemetry hint. Semantic claim decisions belong
+                        // to the AI reviewer; keyword matching must never become the business
+                        // judge. A separate typed AI claim gate supplies the fail-closed verdict.
                         let mut details = Document::new();
                         details.insert(
                             "reply_excerpt",
@@ -1060,31 +1071,62 @@ pub(crate) fn derive_revision_failure(reason: &str) -> (String, GatewayStatusFin
     (reason.to_string(), status)
 }
 
-/// 改写失败/超时的优雅降级：回退发送「改写前那份已 Approved 的原稿」。
+/// Decide fallback from the Reviewer's structured scores, not from reply keywords.
 ///
-/// 前提（已亲验）：能进改写通道的原稿在 finalize 阶段一定已判 Approved——硬闸
-/// 失败（hallucination / knowledge_grounding）走 approved=false → Held，
-/// `decide_revision` 返回 NotEligible，根本进不了改写。因此改写只由软闸 / style /
-/// 双审分歧触发，原稿本就安全可发；改写只是锦上添花。改写因下游 LLM 超时/错误没做成，
-/// 应回退发原稿而非毙掉补兜底。
-///
-/// 本函数只设置 review/finalize 状态；原稿恢复与 should_reply=true 由 gateway 调用方
-/// 负责（final_decision 是 gateway 局部变量）。返回 failure_reason 供调用方写 revision_reason。
+/// The AI owns semantic review. Code only enforces its typed safety result: hard-gate,
+/// pressure, boundary/privacy, or dual-reviewer disagreement can never fall back. A draft may
+/// be restored only when the structured classification is safe except for human-like or
+/// emotional-value style quality, or when the mechanical style-divergence detector was the
+/// sole trigger.
+pub(crate) fn revision_fallback_is_safe_style_only(
+    review: &DecisionReviewResult,
+    runtime: &UserRuntimeParameters,
+) -> bool {
+    if review
+        .risks
+        .iter()
+        .any(|risk| risk.starts_with("reviewer_dual_disagree:"))
+    {
+        return false;
+    }
+
+    match classify_dual_gate(review, runtime) {
+        DualGateClassification::HardGateFailure { .. } => false,
+        DualGateClassification::SoftGateFailure { risks, .. } => {
+            !risks.is_empty()
+                && risks.iter().all(|risk| {
+                    risk.starts_with("human_like_") || risk.starts_with("emotional_value_")
+                })
+        }
+        DualGateClassification::AllPass => review.risks.iter().any(|risk| risk == "style_diverged"),
+    }
+}
+
+/// Apply the revision failure policy and return whether the pre-revision draft may be restored.
+/// Unsafe or unknown revision triggers fail closed with `revision_failed`.
 pub(crate) fn apply_revision_fallback(
     review: &mut DecisionReviewResult,
+    runtime: &UserRuntimeParameters,
     finalize_status: &mut GatewayStatusFinal,
     failure_reason: &str,
-) -> String {
-    review.approved = true;
+) -> (String, bool) {
+    let allow_fallback = revision_fallback_is_safe_style_only(review, runtime);
+    review.approved = allow_fallback;
     review.revision_applied = false;
-    review.final_review_status = "revision_applied_approved".to_string();
-    *finalize_status = GatewayStatusFinal::Approved;
-    failure_reason.to_string()
+    if allow_fallback {
+        review.final_review_status = "revision_applied_approved".to_string();
+        *finalize_status = GatewayStatusFinal::Approved;
+    } else {
+        review.final_review_status = "revision_failed".to_string();
+        *finalize_status = GatewayStatusFinal::Held(HOLD_CATEGORY_HELD_BY_AI_POLICY.to_string());
+    }
+    (failure_reason.to_string(), allow_fallback)
 }
 
 #[cfg(test)]
 mod revision_fallback_tests {
     use super::{apply_revision_fallback, GatewayStatusFinal, HOLD_CATEGORY_HELD_BY_AI_POLICY};
+    use crate::agent::runtime::UserRuntimeParameters;
     use crate::agent::types::DecisionReviewResult;
 
     #[test]
@@ -1095,22 +1137,83 @@ mod revision_fallback_tests {
         review.final_review_status = String::new();
         let mut status = GatewayStatusFinal::Held(HOLD_CATEGORY_HELD_BY_AI_POLICY.to_string());
 
-        let reason = apply_revision_fallback(&mut review, &mut status, "revision_llm_timeout_30s");
+        review.risks.push("style_diverged".to_string());
+        review.scores.human_like = 10;
+        review.scores.emotional_value = 10;
+        review.scores.hallucination_score = 0;
+        review.scores.knowledge_grounding_score = 10;
+        review.scores.pressure_risk = 1;
+        review.scores.boundary_privacy_safety = 10;
+        let runtime = UserRuntimeParameters::default();
+        let (reason, restored) = apply_revision_fallback(
+            &mut review,
+            &runtime,
+            &mut status,
+            "revision_llm_timeout_30s",
+        );
 
+        assert!(
+            restored,
+            "pure style revision may restore the approved draft"
+        );
         assert!(review.approved, "回退后原稿应视为已批准");
         assert!(!review.revision_applied, "改写未真正应用");
         assert_eq!(review.final_review_status, "revision_applied_approved");
-        assert!(matches!(status, GatewayStatusFinal::Approved), "finalize 应回到 Approved 走发送");
-        assert_eq!(reason, "revision_llm_timeout_30s", "失败原因应原样返回供审计");
+        assert!(
+            matches!(status, GatewayStatusFinal::Approved),
+            "finalize 应回到 Approved 走发送"
+        );
+        assert_eq!(
+            reason, "revision_llm_timeout_30s",
+            "失败原因应原样返回供审计"
+        );
     }
 
     #[test]
-    fn fallback_preserves_arbitrary_reason() {
+    fn unsafe_revision_failure_is_held() {
         let mut review = DecisionReviewResult::default();
+        review.scores.human_like = 10;
+        review.scores.emotional_value = 10;
+        review.scores.knowledge_grounding_score = 10;
+        review.scores.pressure_risk = 1;
+        review.scores.boundary_privacy_safety = 2;
+        let runtime = UserRuntimeParameters::default();
         let mut status = GatewayStatusFinal::Held(HOLD_CATEGORY_HELD_BY_AI_POLICY.to_string());
-        let reason = apply_revision_fallback(&mut review, &mut status, "revision_post_review_failed");
+        let (reason, restored) = apply_revision_fallback(
+            &mut review,
+            &runtime,
+            &mut status,
+            "revision_post_review_failed",
+        );
+        assert!(!restored);
         assert_eq!(reason, "revision_post_review_failed");
-        assert_eq!(review.final_review_status, "revision_applied_approved");
+        assert!(!review.approved);
+        assert_eq!(review.final_review_status, "revision_failed");
+        assert!(matches!(status, GatewayStatusFinal::Held(_)));
+    }
+
+    #[test]
+    fn unknown_or_empty_revision_trigger_is_not_restorable() {
+        for risks in [
+            Vec::<String>::new(),
+            vec!["reviewer_dual_disagree:approved_mismatch".to_string()],
+        ] {
+            let mut review = DecisionReviewResult {
+                risks,
+                ..Default::default()
+            };
+            review.scores.human_like = 10;
+            review.scores.emotional_value = 10;
+            review.scores.knowledge_grounding_score = 10;
+            review.scores.pressure_risk = 1;
+            review.scores.boundary_privacy_safety = 10;
+            let runtime = UserRuntimeParameters::default();
+            let mut status = GatewayStatusFinal::Approved;
+            let (_, restored) =
+                apply_revision_fallback(&mut review, &runtime, &mut status, "failure");
+            assert!(!restored);
+            assert_eq!(review.final_review_status, "revision_failed");
+        }
     }
 }
 
@@ -1125,9 +1228,9 @@ mod review_passed_dual_gate_tests {
     //! * humanLike < 阈值（默认 6）→ 必须返回 false；
     //! * 全分通过且 approved=true → 返回 true。
 
+    use super::review_passed;
     use crate::agent::runtime::UserRuntimeParameters;
     use crate::agent::types::{DecisionReviewResult, ReviewScores};
-    use super::review_passed;
 
     fn full_pass_review() -> DecisionReviewResult {
         DecisionReviewResult {
@@ -1219,7 +1322,7 @@ mod review_passed_dual_gate_tests {
         runtime.product_accuracy_block_below = 7;
         let mut review = full_pass_review();
         review.scores.knowledge_grounding_score = 3; // 低于阈值 7
-        // claim_analysis 空 → claim_requires_product_knowledge=false（无产品声明）
+                                                     // claim_analysis 空 → claim_requires_product_knowledge=false（无产品声明）
         review.claim_analysis = mongodb::bson::doc! {};
         assert!(
             review_passed(&review, &runtime),
@@ -1304,8 +1407,8 @@ mod reviewer_decision_view_tests {
     //! * intent_analysis / next_best_action / operating_memory_update 三个
     //!   推理 Document 不进 reviewer 视图。
 
-    use crate::agent::types::AgentDecision;
     use super::build_reviewer_decision_view;
+    use crate::agent::types::AgentDecision;
     use mongodb::bson::doc;
 
     fn decision_with_reasoning_filled() -> AgentDecision {
@@ -1391,12 +1494,36 @@ mod reviewer_decision_view_tests {
     fn reviewer_view_preserves_reply_facts() {
         let view = build_reviewer_decision_view(&decision_with_reasoning_filled());
         // 候选回复事实面必须保留
-        assert!(view.contains("好的，明白您的顾虑"), "应保留 replyText: {}", view);
-        assert!(view.contains("\"shouldReply\":true"), "应保留 shouldReply: {}", view);
-        assert!(view.contains("\"customerStage\":\"evaluating\""), "应保留 customerStage: {}", view);
-        assert!(view.contains("\"operationState\":\"trust_building\""), "应保留 operationState: {}", view);
-        assert!(view.contains("\"k1\""), "应保留 knowledge id 引用: {}", view);
-        assert!(view.contains("price"), "应保留 objectionsDetected: {}", view);
+        assert!(
+            view.contains("好的，明白您的顾虑"),
+            "应保留 replyText: {}",
+            view
+        );
+        assert!(
+            view.contains("\"shouldReply\":true"),
+            "应保留 shouldReply: {}",
+            view
+        );
+        assert!(
+            view.contains("\"customerStage\":\"evaluating\""),
+            "应保留 customerStage: {}",
+            view
+        );
+        assert!(
+            view.contains("\"operationState\":\"trust_building\""),
+            "应保留 operationState: {}",
+            view
+        );
+        assert!(
+            view.contains("\"k1\""),
+            "应保留 knowledge id 引用: {}",
+            view
+        );
+        assert!(
+            view.contains("price"),
+            "应保留 objectionsDetected: {}",
+            view
+        );
     }
 
     #[test]
@@ -1416,14 +1543,14 @@ mod dual_gate_classification_tests {
     //! emotionalValue 任一软闸不达标时，flow 走的是 single-shot revision
     //! 而不是 hold。硬闸失败仍走 hold。
 
-    use crate::agent::runtime::UserRuntimeParameters;
-    use crate::agent::types::{
-        AgentDecision, DecisionReviewResult, ReviewScores, HOLD_CATEGORY_HELD_BY_AI_POLICY,
-    };
     use super::{
         classify_dual_gate, contact_has_principal_product_exemption, decide_revision,
         finalize_review_for_send, reply_objective_features, review_passed, route_dual_gate,
         DualGateClassification, FinalizeOutcome, GatewayStatusFinal, RevisionDecision,
+    };
+    use crate::agent::runtime::UserRuntimeParameters;
+    use crate::agent::types::{
+        AgentDecision, DecisionReviewResult, ReviewScores, HOLD_CATEGORY_HELD_BY_AI_POLICY,
     };
     use crate::models::{AgentStatus, Contact};
     use mongodb::bson::{DateTime, Document};
@@ -1532,9 +1659,7 @@ mod dual_gate_classification_tests {
         review.scores.knowledge_grounding_score = runtime.product_accuracy_block_below - 1;
         match classify_dual_gate(&review, &runtime) {
             DualGateClassification::HardGateFailure { risks } => {
-                assert!(risks
-                    .iter()
-                    .any(|r| r.starts_with("knowledge_grounding_")));
+                assert!(risks.iter().any(|r| r.starts_with("knowledge_grounding_")));
             }
             other => panic!("expected HardGateFailure, got {:?}", other),
         }
@@ -1697,7 +1822,7 @@ mod dual_gate_classification_tests {
         let runtime = UserRuntimeParameters::default();
         let mut review = full_pass_review();
         review.scores.boundary_privacy_safety = 0; // 未填,豁免
-        // 其它分都满分 → 应 AllPass
+                                                   // 其它分都满分 → 应 AllPass
         assert_eq!(
             classify_dual_gate(&review, &runtime),
             DualGateClassification::AllPass
@@ -2120,7 +2245,7 @@ mod dual_gate_classification_tests {
             Vec::new(),
             "这款年度会员是 199 元",
             &crate::models::CommitmentMarkers::default(),
-            true, // priced_from_catalog：报价 product_id 命中 active 产品目录
+            true,  // priced_from_catalog：报价 product_id 命中 active 产品目录
             false, // principal_product_exempted：无领导授权豁免
         );
         assert_eq!(
@@ -2343,7 +2468,7 @@ mod dual_gate_classification_tests {
 
     #[test]
     fn finalize_only_observes_on_product_effect_claim_when_reviewer_missed() {
-        // reviewer 漏判 + 回复含效果词「回款」+ 无 verified → 仅观测不拦（2026-06-14 回退硬闸为观测）。
+        // Keyword telemetry must not replace the AI semantic claim decision.
         let runtime = UserRuntimeParameters::default();
         let mut review = full_pass_review();
         review.claim_analysis = mongodb::bson::doc! { "requiresProductKnowledge": false };
@@ -2362,7 +2487,6 @@ mod dual_gate_classification_tests {
             false,
             false,
         );
-        // 新行为：仅观测，回复放行
         assert_eq!(outcome.status, GatewayStatusFinal::Approved);
         assert!(outcome.review.approved);
         assert!(decision.should_reply);
@@ -2370,10 +2494,6 @@ mod dual_gate_classification_tests {
             .pending_events
             .iter()
             .any(|e| e.kind == "grounding_probe_reviewer_missed" && e.status == "observe"));
-        assert!(!outcome
-            .pending_events
-            .iter()
-            .any(|e| e.kind == "product_claim_blocked_by_probe_fallback"));
     }
 
     #[test]
@@ -2479,7 +2599,10 @@ mod dual_gate_classification_tests {
             "insufficient_detail-only 必须矫正为 Approved（进 revision 通道），而非 blocked_by_required_field"
         );
         assert!(finalized.approved);
-        assert!(finalized.needs_revision, "应标记 needs_revision 触发 single-shot revision");
+        assert!(
+            finalized.needs_revision,
+            "应标记 needs_revision 触发 single-shot revision"
+        );
         assert!(
             !finalized.revision_direction.trim().is_empty(),
             "应写补全推理痕迹的 revision_direction"
@@ -2502,8 +2625,7 @@ mod dual_gate_classification_tests {
         route_dual_gate(&mut review, &runtime, "好的，我来想想看"); // 硬闸 → approved=false，不设 needs_revision
         let mut decision = shouldreply_decision();
         let contact = finalize_contact();
-        let promote_risks =
-            vec!["insufficient_detail_in_critical_turn:operation_goal".to_string()];
+        let promote_risks = vec!["insufficient_detail_in_critical_turn:operation_goal".to_string()];
         let outcome = finalize_review_for_send(
             review,
             &mut decision,
@@ -2685,12 +2807,12 @@ mod dual_reviewer_disagreement_tests {
     //! - apply 副作用：needs_revision=true、空 revision_direction 兜底、risk
     //!   marker 去重追加
 
-    use crate::agent::runtime::UserRuntimeParameters;
-    use crate::agent::types::{DecisionReviewResult, ReviewScores};
     use super::{
         apply_dual_reviewer_disagreement, detect_dual_reviewer_disagreement,
         DualReviewerDisagreement,
     };
+    use crate::agent::runtime::UserRuntimeParameters;
+    use crate::agent::types::{DecisionReviewResult, ReviewScores};
 
     fn full_pass_review() -> DecisionReviewResult {
         DecisionReviewResult {
@@ -2855,4 +2977,3 @@ mod dual_reviewer_disagreement_tests {
         assert_eq!(count, 1, "重复 apply 不应重复追加同一 risk_marker");
     }
 }
-

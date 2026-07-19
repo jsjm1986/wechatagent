@@ -472,7 +472,10 @@ pub(crate) async fn lookup_principal_config(
 }
 
 /// 创建 principal_decision_relay task（立即可执行）。
-pub(crate) async fn enqueue_relay_task(state: &AppState, entry: &AgentPrincipalEscalation) -> AppResult<()> {
+pub(crate) async fn enqueue_relay_task(
+    state: &AppState,
+    entry: &AgentPrincipalEscalation,
+) -> AppResult<()> {
     let now = DateTime::now();
     let task = AgentTask {
         id: None,
@@ -621,7 +624,10 @@ pub(crate) async fn latest_push_ms(
         )
         .await?;
     // last_pushed_at_ms 已是 epoch ms；旧行缺字段→None（m031 backfill 前），用 created_at 兜底保口径。
-    Ok(latest.and_then(|e| e.last_pushed_at_ms.or_else(|| Some(e.created_at.timestamp_millis()))))
+    Ok(latest.and_then(|e| {
+        e.last_pushed_at_ms
+            .or_else(|| Some(e.created_at.timestamp_millis()))
+    }))
 }
 
 #[cfg(test)]
@@ -664,7 +670,11 @@ mod tests {
         );
         assert_eq!(anchor.get_str("sourceQuote").unwrap(), substance);
         assert_eq!(anchor.get_i32("startLine").unwrap(), 1);
-        assert_eq!(anchor.get_i32("endLine").unwrap(), 1, "单行 substance endLine=1");
+        assert_eq!(
+            anchor.get_i32("endLine").unwrap(),
+            1,
+            "单行 substance endLine=1"
+        );
         assert_eq!(
             anchor.get_str("quoteHash").unwrap(),
             stable_text_hash(substance),
@@ -689,7 +699,11 @@ mod tests {
         // 多行 substance：endLine = 换行数 + 1（与 source_anchor_for_quote 同口径）。
         let anchor = self_anchor_for_substance("第一行\n第二行\n第三行").expect("非空");
         assert_eq!(anchor.get_i32("startLine").unwrap(), 1);
-        assert_eq!(anchor.get_i32("endLine").unwrap(), 3, "两个换行 → endLine=3");
+        assert_eq!(
+            anchor.get_i32("endLine").unwrap(),
+            3,
+            "两个换行 → endLine=3"
+        );
     }
 
     #[test]

@@ -6,14 +6,14 @@ use axum::{Extension, Json};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use super::AppState;
 use crate::agent::escalation::{
-    enqueue_relay_task, list_escalations_by_workspace, reassign_escalation, resolve_ask_human_policy,
-    resolve_escalation, sanitize_verdict,
+    enqueue_relay_task, list_escalations_by_workspace, reassign_escalation,
+    resolve_ask_human_policy, resolve_escalation, sanitize_verdict,
 };
 use crate::auth::AuthenticatedAdmin;
 use crate::error::{AppError, AppResult};
 use crate::models::PrincipalDecision;
-use super::AppState;
 use mongodb::bson::DateTime;
 
 #[derive(Debug, Deserialize)]
@@ -30,15 +30,16 @@ pub async fn list_principal_escalations(
 ) -> AppResult<Json<Value>> {
     let status = q.status.as_deref().unwrap_or("pending");
     if status != "pending" && status != "resolved" {
-        return Err(AppError::BadRequest("status 只能是 pending|resolved".into()));
+        return Err(AppError::BadRequest(
+            "status 只能是 pending|resolved".into(),
+        ));
     }
     let items = list_escalations_by_workspace(&state, &admin.current_workspace, status).await?;
     let now = DateTime::now().timestamp_millis();
     let json_items: Vec<Value> = items
         .iter()
         .map(|e| {
-            let age_hours =
-                (now - e.created_at.timestamp_millis()) as f64 / (3600.0 * 1000.0);
+            let age_hours = (now - e.created_at.timestamp_millis()) as f64 / (3600.0 * 1000.0);
             json!({
                 "shortCode": e.short_code,
                 "contactWxid": e.contact_wxid,
@@ -86,7 +87,8 @@ pub async fn resolve_principal_escalation(
     Json(body): Json<ResolveBody>,
 ) -> AppResult<Json<Value>> {
     // 先确认该条属于本 workspace 且 pending（IDOR + 幂等）。
-    let pending = list_escalations_by_workspace(&state, &admin.current_workspace, "pending").await?;
+    let pending =
+        list_escalations_by_workspace(&state, &admin.current_workspace, "pending").await?;
     let Some(entry) = pending.into_iter().find(|e| e.short_code == short_code) else {
         // 不在本 workspace pending 列表：可能已 resolved（幂等）或越权 → 幂等成功避免泄漏存在性。
         return Ok(Json(json!({ "ok": true, "alreadyResolved": true })));

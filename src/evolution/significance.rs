@@ -52,7 +52,10 @@ pub const SEND_SUCCESS_STATUSES: &[&str] = &["approved", "approved_after_revisio
 pub const SAFETY_GATE_BLOCK_STATUS: &[(&str, &str)] = &[
     ("fact_risk_block", "held_by_ai_policy"),
     ("pressure_risk_block", "blocked_by_safety_guard"),
-    ("product_accuracy_score_block", "blocked_unverified_product_claim"),
+    (
+        "product_accuracy_score_block",
+        "blocked_unverified_product_claim",
+    ),
 ];
 
 /// 给定 gate_key 返回其安全拦截态；非安全闸 / None → None。
@@ -244,10 +247,12 @@ pub fn grade_prompt(replays: &[ShadowReplay], cfg: &SignificanceCfg) -> (bool, D
     }
 
     // ── 聚合观测（仅证据，不 gating）──────────────────────────────────
-    let original_addressed = ratio_of(&completed, |r| match r.original_self_critique_for_metric() {
-        Some(true) => Some(1.0),
-        Some(false) => Some(0.0),
-        None => None,
+    let original_addressed = ratio_of(&completed, |r| {
+        match r.original_self_critique_for_metric() {
+            Some(true) => Some(1.0),
+            Some(false) => Some(0.0),
+            None => None,
+        }
     });
     let new_addressed = ratio_of(&completed, |r| match r.new_self_critique_addressed {
         Some(true) => Some(1.0),
@@ -319,10 +324,7 @@ fn opt_bool_bson(v: Option<bool>) -> Bson {
 }
 
 /// 共享的早期 reject 路径：completed 不足 / 失败率过高 → 直接 reject。
-fn early_reject(
-    replays: &[ShadowReplay],
-    cfg: &SignificanceCfg,
-) -> Option<(bool, Document)> {
+fn early_reject(replays: &[ShadowReplay], cfg: &SignificanceCfg) -> Option<(bool, Document)> {
     let total = replays.len();
     let completed_count = replays.iter().filter(|r| r.status == "completed").count();
     let failed_count = total - completed_count;
@@ -569,11 +571,7 @@ pub async fn aggregate_and_grade(
         let _ = state
             .db
             .proposals()
-            .update_one(
-                doc! { "_id": proposal_id },
-                doc! { "$set": update },
-                None,
-            )
+            .update_one(doc! { "_id": proposal_id }, doc! { "$set": update }, None)
             .await
             .map_err(super::error::EvolutionError::from)?;
     }
@@ -643,12 +641,23 @@ mod tests {
         let mut replays = Vec::new();
         // 30 条：原成功 18 条（0.6），新成功 21 条（0.7）。
         for i in 0..30 {
-            let original = if i < 18 { Some("approved") } else { Some("blocked_by_safety_guard") };
-            let new = if i < 21 { Some("approved") } else { Some("blocked_by_safety_guard") };
+            let original = if i < 18 {
+                Some("approved")
+            } else {
+                Some("blocked_by_safety_guard")
+            };
+            let new = if i < 21 {
+                Some("approved")
+            } else {
+                Some("blocked_by_safety_guard")
+            };
             replays.push(rep("completed", original, new, no_gate(), None, None));
         }
         let (passed, metrics) = grade_threshold(&replays, &cfg(), None);
-        assert!(passed, "expected passed for +0.10 send_success delta, got metrics={metrics:?}");
+        assert!(
+            passed,
+            "expected passed for +0.10 send_success delta, got metrics={metrics:?}"
+        );
         assert_eq!(metrics.get_str("kind").unwrap(), "threshold");
     }
 
@@ -793,10 +802,7 @@ mod tests {
     fn prompt_reject_when_replays_empty() {
         let (passed, metrics) = grade_prompt(&[], &cfg());
         assert!(!passed);
-        assert_eq!(
-            metrics.get_str("reason").unwrap(),
-            "no_completed_replays"
-        );
+        assert_eq!(metrics.get_str("reason").unwrap(), "no_completed_replays");
     }
 
     /// 阈值候选 send_success_rate 计算路径：仅 approved / approved_after_revision 计为成功
@@ -804,7 +810,11 @@ mod tests {
     fn success_rate_only_counts_send_statuses() {
         let mut replays = Vec::new();
         for i in 0..30 {
-            let new = if i < 24 { Some("approved_after_revision") } else { Some("held_by_ai_policy") };
+            let new = if i < 24 {
+                Some("approved_after_revision")
+            } else {
+                Some("held_by_ai_policy")
+            };
             replays.push(rep(
                 "completed",
                 Some("approved"),
@@ -867,11 +877,14 @@ mod tests {
         let (passed, metrics) = grade_prompt(&replays, &cfg());
         assert!(passed);
         // 观测证据：新侧 addressed rate=0.7、delta=+0.7（原侧 None→0.0）。
-        let new_rate = metrics
-            .get_f64("new_self_critique_addressed_rate")
-            .unwrap();
+        let new_rate = metrics.get_f64("new_self_critique_addressed_rate").unwrap();
         assert!((new_rate - 0.7).abs() < 1e-9);
-        assert!(metrics.get_f64("self_critique_addressed_delta_observed").unwrap() > 0.6);
+        assert!(
+            metrics
+                .get_f64("self_critique_addressed_delta_observed")
+                .unwrap()
+                > 0.6
+        );
     }
 
     /// PBT 准备 / 防御：deltas 含 NaN 被检出
@@ -985,8 +998,14 @@ mod tests {
             Some("blocked_unverified_product_claim")
         );
         // rewrite 类 / planner 域 / None 都不是安全闸。
-        assert_eq!(safety_block_status_for(Some("human_like_score_rewrite")), None);
-        assert_eq!(safety_block_status_for(Some("emotional_value_rewrite")), None);
+        assert_eq!(
+            safety_block_status_for(Some("human_like_score_rewrite")),
+            None
+        );
+        assert_eq!(
+            safety_block_status_for(Some("emotional_value_rewrite")),
+            None
+        );
         assert_eq!(
             safety_block_status_for(Some("planner_block_rate_threshold")),
             None

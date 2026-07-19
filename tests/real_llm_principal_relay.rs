@@ -66,6 +66,7 @@ use wechatagent::models::{
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+use crate::common::capability_evidence::CapabilityEvidence;
 use crate::common::redline::assert_no_handoff_or_identity_leak;
 use crate::common::TestApp;
 
@@ -78,11 +79,19 @@ use crate::common::TestApp;
 
 /// 从 env 构造真实文本主 provider。缺 `REAL_LLM_API_KEY` → None（调用方自我跳过）。
 fn real_llm_from_env() -> Option<Arc<LlmClient>> {
-    let api_key = std::env::var("REAL_LLM_API_KEY").ok().filter(|k| !k.trim().is_empty())?;
+    let api_key = std::env::var("REAL_LLM_API_KEY")
+        .ok()
+        .filter(|k| !k.trim().is_empty())?;
     let base_url = std::env::var("REAL_LLM_BASE_URL")
         .unwrap_or_else(|_| "https://token-plan-cn.xiaomimimo.com/v1".to_string());
     let model = std::env::var("REAL_LLM_MODEL").unwrap_or_else(|_| "mimo-v2.5-pro".to_string());
-    let client = build_real_client(base_url, api_key, model, "REAL_LLM_FORMAT", primary_max_retries());
+    let client = build_real_client(
+        base_url,
+        api_key,
+        model,
+        "REAL_LLM_FORMAT",
+        primary_max_retries(),
+    );
     Some(Arc::new(client))
 }
 
@@ -125,7 +134,9 @@ struct FailoverProvider {
 #[async_trait::async_trait]
 impl LlmProvider for FailoverProvider {
     async fn generate_json(&self, system: &str, user: &str) -> AppResult<serde_json::Value> {
-        self.generate_json_with_usage(system, user).await.map(|r| r.value)
+        self.generate_json_with_usage(system, user)
+            .await
+            .map(|r| r.value)
     }
 
     async fn generate_json_with_usage(&self, system: &str, user: &str) -> AppResult<LlmJsonResult> {
@@ -171,12 +182,20 @@ fn primary_max_retries() -> u32 {
 /// 构造最强模型 client（默认 llama-3.3-70b @ NVIDIA integrate）。缺 `REAL_LLM_JUDGE_API_KEY` → None。
 /// 本套件不打分，仅借它作 agent 备胎链首选。
 fn strongest_model_client() -> Option<Arc<LlmClient>> {
-    let key = std::env::var("REAL_LLM_JUDGE_API_KEY").ok().filter(|k| !k.trim().is_empty())?;
+    let key = std::env::var("REAL_LLM_JUDGE_API_KEY")
+        .ok()
+        .filter(|k| !k.trim().is_empty())?;
     let base = std::env::var("REAL_LLM_JUDGE_BASE_URL")
         .unwrap_or_else(|_| "https://integrate.api.nvidia.com/v1".to_string());
     let model = std::env::var("REAL_LLM_JUDGE_MODEL")
         .unwrap_or_else(|_| "meta/llama-3.3-70b-instruct".to_string());
-    Some(Arc::new(build_real_client(base, key, model, "REAL_LLM_JUDGE_FORMAT", 5)))
+    Some(Arc::new(build_real_client(
+        base,
+        key,
+        model,
+        "REAL_LLM_JUDGE_FORMAT",
+        5,
+    )))
 }
 
 fn failover_model_list() -> Vec<String> {
@@ -200,7 +219,9 @@ fn failover_backups() -> Vec<Arc<LlmClient>> {
         let base = std::env::var("REAL_LLM_FAILOVER_BASE_URL")
             .unwrap_or_else(|_| "https://integrate.api.nvidia.com/v1".to_string());
         backups.extend(failover_model_list().into_iter().filter_map(|m| {
-            LlmClient::new(base.clone(), key.clone(), m, 180, 5, 2500).ok().map(Arc::new)
+            LlmClient::new(base.clone(), key.clone(), m, 180, 5, 2500)
+                .ok()
+                .map(Arc::new)
         }));
     }
     backups
@@ -209,7 +230,10 @@ fn failover_backups() -> Vec<Arc<LlmClient>> {
 fn wrap_with_failover(primary_label: String, primary: Arc<LlmClient>) -> Arc<dyn LlmProvider> {
     let mut clients = vec![primary];
     clients.extend(failover_backups());
-    Arc::new(FailoverProvider { primary_label, clients })
+    Arc::new(FailoverProvider {
+        primary_label,
+        clients,
+    })
 }
 
 fn real_llm_with_failover() -> Option<Arc<dyn LlmProvider>> {
@@ -219,23 +243,10 @@ fn real_llm_with_failover() -> Option<Arc<dyn LlmProvider>> {
     Some(wrap_with_failover(primary_label, primary))
 }
 
-/// 无主 key → 打印 skip 并 return（不 panic）。返回主 + 备胎链 provider。
-macro_rules! require_real_llm {
-    () => {{
-        match real_llm_with_failover() {
-            Some(llm) => llm,
-            None => {
-                eprintln!("skip: REAL_LLM_API_KEY 未配置，跳过 G9/G10 幕后请示通道入站 relay 回路真模型 E2E");
-                return;
-            }
-        }
-    }};
-}
-
 /// 真模型上游瞬时不可达（限流/超时等 `LlmUnavailable`）→ skip return，不算能力失败；
 /// 配置错误 4xx（漏 /v1 等，非 401/402）→ panic（堵 R0.3 假绿）；其它 `Err` 仍 panic。
 macro_rules! unwrap_or_skip_transient {
-    ($result:expr, $what:expr) => {{
+    ($evidence:expr, $result:expr, $what:expr) => {{
         match $result {
             Ok(value) => value,
             Err(wechatagent::error::AppError::LlmUnavailable { kind, retry_count, detail, .. }) => {
@@ -255,6 +266,10 @@ macro_rules! unwrap_or_skip_transient {
                      按「真模型抖动有限重试+跳过」处理，不算能力失败",
                     $what
                 );
+                $evidence.infra_skip(format!(
+                    "{}: transient LLM failure kind={kind}, retries={retry_count}",
+                    $what
+                ));
                 {
                     use std::io::Write as _;
                     let dir = std::env::var("REAL_LLM_LEDGER")
@@ -293,7 +308,9 @@ struct UniqueMsgIdResponder {
 
 impl wiremock::Respond for UniqueMsgIdResponder {
     fn respond(&self, _request: &wiremock::Request) -> ResponseTemplate {
-        let seq = self.counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let seq = self
+            .counter
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -307,7 +324,9 @@ async fn start_mcp_mock_success() -> MockServer {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/mcp"))
-        .respond_with(UniqueMsgIdResponder { counter: std::sync::atomic::AtomicU64::new(0) })
+        .respond_with(UniqueMsgIdResponder {
+            counter: std::sync::atomic::AtomicU64::new(0),
+        })
         .mount(&server)
         .await;
     server
@@ -390,7 +409,11 @@ fn sales_contact(wxid: &str) -> Contact {
 
 /// 一条 pending 请示台账（镜像 `escalation::insert_pending_escalation` 写入的形状）。
 /// 模拟「客户超职权诉求已发起请示、正等领导回话」这一前置状态——本套件聚焦其后的入站 relay 回路。
-fn pending_escalation(short_code: &str, contact_wxid: &str, principal_wxid: &str) -> AgentPrincipalEscalation {
+fn pending_escalation(
+    short_code: &str,
+    contact_wxid: &str,
+    principal_wxid: &str,
+) -> AgentPrincipalEscalation {
     let now = DateTime::now();
     AgentPrincipalEscalation {
         id: None,
@@ -445,7 +468,12 @@ const PRINCIPAL_VERDICT_REPLY: &str = "这个客户可以给他打九折，但�
 #[tokio::test]
 #[ignore]
 async fn principal_inbound_relay_loop_happy_path() {
-    let llm = require_real_llm!();
+    let mut evidence = CapabilityEvidence::new("redline_principal_relay");
+    evidence.attempted();
+    let Some(llm) = real_llm_with_failover() else {
+        evidence.infra_skip("REAL_LLM_API_KEY missing");
+        return;
+    };
     let app = TestApp::start().await;
     let mcp = start_mcp_mock_success().await;
     let state = common::rebuild_app_state_with_real_llm(&app, llm, mcp.uri());
@@ -456,7 +484,12 @@ async fn principal_inbound_relay_loop_happy_path() {
 
     // 客户 + 一条 pending 请示台账（前置状态：已请示、正等领导回话）。
     let contact = sales_contact("principal_relay_customer");
-    state.db.contacts().insert_one(&contact, None).await.expect("insert contact");
+    state
+        .db
+        .contacts()
+        .insert_one(&contact, None)
+        .await
+        .expect("insert contact");
     // 该客户当前正等待领导决策（relay 完成后应被清掉）。
     let awaiting_key = format!(
         "domain_attributes.{}",
@@ -490,6 +523,7 @@ async fn principal_inbound_relay_loop_happy_path() {
     });
     let body = Bytes::from(serde_json::to_vec(&payload).expect("serialize webhook payload"));
     let resp = unwrap_or_skip_transient!(
+        evidence,
         wechatagent::webhooks::wechat_webhook(State(state.clone()), HeaderMap::new(), body).await,
         "G9/G10 webhook 入站领导裁决解析必须 Ok"
     );
@@ -548,11 +582,16 @@ async fn principal_inbound_relay_loop_happy_path() {
     // 走公开再导出的 handle_follow_up_task（task worker 真实调用点，据 kind 分流到 relay）。
     let relay_task: AgentTask = relay_task;
     unwrap_or_skip_transient!(
+        evidence,
         handle_follow_up_task(&state, relay_task).await,
         "G9/G10 relay 转述链路必须 Ok"
     );
 
-    let latest = || FindOneOptions::builder().sort(doc! { "created_at": -1 }).build();
+    let latest = || {
+        FindOneOptions::builder()
+            .sort(doc! { "created_at": -1 })
+            .build()
+    };
 
     // relay run 的 gateway 终态：闭集契约（确定性）。relay 合成 inbound 的 message_id=None，
     // 故按 contact_wxid 取最新一行（本套件该 contact 仅 relay run 产生 run log）。
@@ -615,7 +654,17 @@ async fn principal_inbound_relay_loop_happy_path() {
         .expect("contact must exist");
     let still_awaiting = after
         .domain_attributes
-        .map(|d| d.get_bool(wechatagent::models::AWAITING_PRINCIPAL_DECISION_ATTR).unwrap_or(false))
+        .map(|d| {
+            d.get_bool(wechatagent::models::AWAITING_PRINCIPAL_DECISION_ATTR)
+                .unwrap_or(false)
+        })
         .unwrap_or(false);
     eprintln!("[G9/G10][软观测] relay 后 awaiting 标记残留={still_awaiting}（应为 false）");
+    evidence.observe_llm_calls(log.llm_calls_used.max(0) as usize);
+    evidence.branch("principal_resolved_relay_task_nonempty_redline_scan");
+    evidence.detail("short_code", short_code);
+    evidence.detail("decision_verdict", decision.verdict);
+    evidence.detail("reply_chars", reply_text.chars().count());
+    evidence.detail("awaiting_marker_remaining", still_awaiting);
+    evidence.pass(3, 8 + FORBIDDEN_BACKSTAGE_MARKERS.len());
 }

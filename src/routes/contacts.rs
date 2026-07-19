@@ -189,7 +189,8 @@ pub(super) async fn list_contacts(
     // 且再无自愈点。此处读一次快照（整表一条 doc，非 per-contact），对 nickname/avatar
     // 为空的联系人补齐——下次快照刷新后列表即显示正确身份。快照缺失/读失败不阻断（返回空 map）。
     let roster_identity: std::collections::HashMap<String, (Option<String>, Option<String>)> =
-        match crate::mcp::read_roster_snapshot(&state, &admin.current_workspace, &account_id).await {
+        match crate::mcp::read_roster_snapshot(&state, &admin.current_workspace, &account_id).await
+        {
             Ok(Some(snap)) => snap
                 .friends
                 .into_iter()
@@ -286,9 +287,15 @@ pub(super) async fn count_contacts(
         .unwrap_or_else(|| state.config.default_account_id.clone());
     let (base, managed_filter) = contact_count_filters(&admin.current_workspace, &account_id);
     let all = state.db.contacts().count_documents(base, None).await?;
-    let managed = state.db.contacts().count_documents(managed_filter, None).await?;
+    let managed = state
+        .db
+        .contacts()
+        .count_documents(managed_filter, None)
+        .await?;
     let normal = all.saturating_sub(managed);
-    Ok(Json(json!({ "all": all, "managed": managed, "normal": normal })))
+    Ok(Json(
+        json!({ "all": all, "managed": managed, "normal": normal }),
+    ))
 }
 
 /// 波 A3：只搜索不写库的纯查询接口。
@@ -348,7 +355,12 @@ pub(super) async fn import_contacts_endpoint(
     validate_account(&state, &admin.current_workspace, &account_id).await?;
     let candidates: Vec<Value> = if !payload.candidates.is_empty() {
         payload.candidates.clone()
-    } else if let Some(query) = payload.query.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
+    } else if let Some(query) = payload
+        .query
+        .as_deref()
+        .map(str::trim)
+        .filter(|q| !q.is_empty())
+    {
         let result = mcp::logged_call_for_account(
             &state,
             &account_id,
@@ -412,9 +424,13 @@ pub(super) async fn search_import_contacts(
     let mut imported = Vec::new();
     for item in items {
         if let Some(contact_value) = item.get("contact") {
-            if let Some(contact) =
-                upsert_contact_from_value(&state, &admin.current_workspace, &account_id, contact_value)
-                    .await?
+            if let Some(contact) = upsert_contact_from_value(
+                &state,
+                &admin.current_workspace,
+                &account_id,
+                contact_value,
+            )
+            .await?
             {
                 imported.push(ApiContact::from(contact));
             }
@@ -583,7 +599,9 @@ pub(super) async fn roster_endpoint(
         })
         .collect();
     let total = items.len();
-    Ok(Json(json!({ "items": items, "total": total, "syncing": syncing })))
+    Ok(Json(
+        json!({ "items": items, "total": total, "syncing": syncing }),
+    ))
 }
 
 /// 把 AI 生成的初始运营画像落库到指定联系人（切 managed + 画像 + 备注 + playbook）。
@@ -599,19 +617,18 @@ pub(super) async fn apply_generated_profile_to_contact(
     playbook_id: Option<ObjectId>,
     playbook_version: i32,
     generated: &agent::GeneratedOperationProfile,
-) -> AppResult<()> {
+    enrollment_token: Option<&str>,
+    task_claim: Option<&crate::tasks::TaskClaim>,
+) -> AppResult<bool> {
     let object_id = contact
         .id
         .ok_or_else(|| AppError::BadRequest("contact missing _id".to_string()))?;
-    let commitments_bson = commitments_with_optional_text(
-        &contact.commitments,
-        generated.last_commitment.as_deref(),
-    );
+    let commitments_bson =
+        commitments_with_optional_text(&contact.commitments, generated.last_commitment.as_deref());
     // #72：曾运营过的老客户重新启用时，保留已积累的 stage / operation_state /
     // commitments，不回退到 new_contact；只切 managed + 更新本次显式输入
     // （备注 / playbook / 画像）。全新客户才走完整初始化。
     let mut set_doc = doc! {
-        "agent_status": "managed",
         "human_profile_note": note,
         "agent_profile": to_bson(&generated.agent_profile)?,
         "playbook_id": playbook_id,
@@ -620,11 +637,26 @@ pub(super) async fn apply_generated_profile_to_contact(
         "profile_updated_at": DateTime::now(),
         "updated_at": DateTime::now(),
     };
+    // Direct admin enable owns the state transition. The async initial-profile worker must never
+    // grant managed status: it may only enrich the exact enrollment generation that is still
+    // managed. This prevents a late worker from resurrecting a disabled/hidden contact.
+    if task_claim.is_none() {
+        set_doc.insert("agent_status", "managed");
+    }
+    if let Some(claim) = task_claim {
+        set_doc.insert("profile_source_task_id", claim.task_id);
+        set_doc.insert(
+            "profile_source_task_claim_generation",
+            claim.claim_generation,
+        );
+        if let Some(token) = enrollment_token {
+            set_doc.insert("profile_source_enrollment_token", token);
+        }
+    }
     let mut unset_doc = Document::new();
     if !is_previously_operated(contact) {
         // H13：初始 operation_state 从 active 状态机的 initial 态取（替代写死 "new_contact"）。
-        let domain_config =
-            agent::load_user_operation_domain_config(state, workspace_id).await?;
+        let domain_config = agent::load_user_operation_domain_config(state, workspace_id).await?;
         let initial_state = agent::initial_operation_state_key(domain_config.as_ref());
         // M4：AI 生成的初始画像 stage/intent 经 dimension_registry 校验后再落库
         // （对齐 management.rs 建档路径 + AI 主决策 validate_and_normalize_decision）。
@@ -637,7 +669,12 @@ pub(super) async fn apply_generated_profile_to_contact(
             generated.intent_level.as_deref(),
         )
         .await?;
-        insert_domain_stage_fields(&mut set_doc, gen_stage.as_deref(), gen_intent.as_deref(), true);
+        insert_domain_stage_fields(
+            &mut set_doc,
+            gen_stage.as_deref(),
+            gen_intent.as_deref(),
+            true,
+        );
         set_doc.insert("commitments", commitments_bson);
         set_doc.insert("follow_up_policy", generated.follow_up_policy.clone());
         set_doc.insert("operation_state", initial_state);
@@ -653,12 +690,54 @@ pub(super) async fn apply_generated_profile_to_contact(
     if !unset_doc.is_empty() {
         update_doc.insert("$unset", unset_doc);
     }
-    state
+    let filter = initial_profile_contact_commit_filter(
+        object_id,
+        workspace_id,
+        &contact.account_id,
+        enrollment_token,
+        task_claim,
+    );
+    let result = state
         .db
         .contacts()
-        .update_one(doc! { "_id": object_id }, update_doc, None)
+        .update_one(filter, update_doc, None)
         .await?;
-    Ok(())
+    Ok(result.matched_count == 1)
+}
+
+fn initial_profile_contact_commit_filter(
+    contact_id: ObjectId,
+    workspace_id: &str,
+    account_id: &str,
+    enrollment_token: Option<&str>,
+    task_claim: Option<&crate::tasks::TaskClaim>,
+) -> Document {
+    let mut filter = doc! {
+        "_id": contact_id,
+        "workspace_id": workspace_id,
+        "account_id": account_id,
+    };
+    if let Some(token) = enrollment_token {
+        if task_claim.is_some() {
+            filter.insert("agent_status", "managed");
+        }
+        filter.insert("enrollment_token", token);
+    }
+    if let Some(claim) = task_claim {
+        let token = enrollment_token.expect("claimed initial-profile commit requires token");
+        filter.insert(
+            "$or",
+            vec![
+                doc! { "profile_source_enrollment_token": { "$ne": token } },
+                doc! {
+                    "profile_source_enrollment_token": token,
+                    "profile_source_task_id": claim.task_id,
+                    "profile_source_task_claim_generation": { "$lte": claim.claim_generation },
+                },
+            ],
+        );
+    }
+    filter
 }
 
 /// 写 `initial_profile` 任务的成功终态（`status="sent"` + 区分性 `gateway_status`）。
@@ -672,6 +751,7 @@ pub(super) async fn apply_generated_profile_to_contact(
 async fn mark_initial_profile_task_sent(
     state: &AppState,
     task: &crate::models::AgentTask,
+    task_claim: Option<&crate::tasks::TaskClaim>,
     gateway_status: &str,
 ) -> AppResult<()> {
     let Some(task_id) = task.id else {
@@ -679,17 +759,21 @@ async fn mark_initial_profile_task_sent(
         return Ok(());
     };
     crate::models::assert_agent_task_status_valid("sent");
+    let filter = task_claim
+        .map(crate::tasks::TaskClaim::owned_running_filter)
+        .unwrap_or_else(|| doc! { "_id": task_id });
     state
         .db
         .tasks()
         .update_one(
-            doc! { "_id": task_id },
+            filter,
             doc! {
                 "$set": {
                     "status": "sent",
                     "gateway_status": gateway_status,
                     "updated_at": DateTime::now(),
-                }
+                },
+                "$unset": { "claimed_at": "", "claim_token": "" }
             },
             None,
         )
@@ -709,6 +793,28 @@ pub async fn handle_initial_profile_task(
     state: &AppState,
     task: &crate::models::AgentTask,
 ) -> AppResult<()> {
+    handle_initial_profile_task_with_claim(state, task, None).await
+}
+
+pub async fn handle_initial_profile_task_with_claim(
+    state: &AppState,
+    task: &crate::models::AgentTask,
+    task_claim: Option<&crate::tasks::TaskClaim>,
+) -> AppResult<()> {
+    let enrollment_token = if let Some(claim) = task_claim {
+        let raw = state
+            .db
+            .tasks()
+            .clone_with_type::<Document>()
+            .find_one(claim.owned_running_filter(), None)
+            .await?;
+        let Some(raw) = raw else {
+            return Ok(());
+        };
+        raw.get_str("enrollment_token").ok().map(str::to_string)
+    } else {
+        None
+    };
     // 按 wxid+account 定位联系人（worker 上下文没有 _id）。
     let contact = state
         .db
@@ -724,11 +830,15 @@ pub async fn handle_initial_profile_task(
         .await?;
     let Some(contact) = contact else {
         // 联系人已被删/清理：视为完成，不报错重试。
-        return mark_initial_profile_task_sent(state, task, "contact_gone").await;
+        return mark_initial_profile_task_sent(state, task, task_claim, "contact_gone").await;
     };
     // 批量后又被手动取消托管的，跳过画像回填。
     if !matches!(contact.agent_status, crate::models::AgentStatus::Managed) {
-        return mark_initial_profile_task_sent(state, task, "unmanaged").await;
+        return mark_initial_profile_task_sent(state, task, task_claim, "unmanaged").await;
+    }
+    if task_claim.is_some() && enrollment_token.is_none() {
+        return mark_initial_profile_task_sent(state, task, task_claim, "missing_enrollment_token")
+            .await;
     }
     let playbook = resolve_playbook_for_contact(
         state,
@@ -745,7 +855,29 @@ pub async fn handle_initial_profile_task(
         Some(&playbook),
     )
     .await?;
-    apply_generated_profile_to_contact(
+    if let Some(claim) = task_claim {
+        let contact_id = contact
+            .id
+            .ok_or_else(|| AppError::BadRequest("contact missing _id".to_string()))?;
+        let prepared = doc! {
+            "contact_id": contact_id,
+            "workspace_id": &task.workspace_id,
+            "account_id": &task.account_id,
+            "note": &task.content,
+            "playbook_id": playbook.id,
+            "playbook_version": playbook.version,
+            "generated": to_bson(&generated)?,
+            "enrollment_token": enrollment_token.as_deref(),
+        };
+        if !crate::tasks::prepare_task_commit_if_owned(state, claim, "initial_profile", prepared)
+            .await?
+        {
+            return Ok(());
+        }
+        return reconcile_initial_profile_commit(state, claim.task_id).await;
+    }
+
+    let committed = apply_generated_profile_to_contact(
         state,
         &task.workspace_id,
         &contact,
@@ -753,9 +885,125 @@ pub async fn handle_initial_profile_task(
         playbook.id,
         playbook.version,
         &generated,
+        enrollment_token.as_deref(),
+        None,
     )
     .await?;
-    mark_initial_profile_task_sent(state, task, "profiled").await
+    mark_initial_profile_task_sent(
+        state,
+        task,
+        None,
+        if committed {
+            "profiled"
+        } else {
+            "stale_enrollment"
+        },
+    )
+    .await
+}
+
+pub(crate) async fn reconcile_initial_profile_commit(
+    state: &AppState,
+    task_id: ObjectId,
+) -> AppResult<()> {
+    let Some(raw) = state
+        .db
+        .tasks()
+        .clone_with_type::<Document>()
+        .find_one(
+            doc! {
+                "_id": task_id,
+                "status": "committing",
+                "prepared_commit_kind": "initial_profile",
+            },
+            None,
+        )
+        .await?
+    else {
+        return Ok(());
+    };
+    let claim_token = raw
+        .get_str("claim_token")
+        .map(str::to_string)
+        .map_err(|error| {
+            AppError::External(format!("initial-profile commit token missing: {error}"))
+        })?;
+    let claim_generation = raw
+        .get_i64("claim_generation")
+        .or_else(|_| raw.get_i32("claim_generation").map(i64::from))
+        .map_err(|error| {
+            AppError::External(format!(
+                "initial-profile commit generation missing: {error}"
+            ))
+        })?;
+    let claim = crate::tasks::TaskClaim {
+        task_id,
+        claim_token,
+        claim_generation,
+    };
+    let prepared = raw.get_document("prepared_commit").map_err(|error| {
+        AppError::External(format!("initial-profile prepared payload missing: {error}"))
+    })?;
+    let contact_id = prepared.get_object_id("contact_id").map_err(|error| {
+        AppError::External(format!("initial-profile contact id invalid: {error}"))
+    })?;
+    let workspace_id = prepared.get_str("workspace_id").map_err(|error| {
+        AppError::External(format!("initial-profile workspace missing: {error}"))
+    })?;
+    let account_id = prepared
+        .get_str("account_id")
+        .map_err(|error| AppError::External(format!("initial-profile account missing: {error}")))?;
+    let enrollment_token = prepared.get_str("enrollment_token").map_err(|error| {
+        AppError::External(format!("initial-profile enrollment token missing: {error}"))
+    })?;
+    let note = prepared.get_str("note").unwrap_or_default();
+    let playbook_id = prepared.get_object_id("playbook_id").ok();
+    let playbook_version = prepared.get_i32("playbook_version").unwrap_or_default();
+    let generated: agent::GeneratedOperationProfile =
+        mongodb::bson::from_bson(prepared.get("generated").cloned().ok_or_else(|| {
+            AppError::External("initial-profile generated payload missing".to_string())
+        })?)
+        .map_err(|error| {
+            AppError::External(format!(
+                "initial-profile generated payload invalid: {error}"
+            ))
+        })?;
+
+    let committed = if let Some(contact) = state
+        .db
+        .contacts()
+        .find_one(
+            doc! {
+                "_id": contact_id,
+                "workspace_id": workspace_id,
+                "account_id": account_id,
+            },
+            None,
+        )
+        .await?
+    {
+        apply_generated_profile_to_contact(
+            state,
+            workspace_id,
+            &contact,
+            note,
+            playbook_id,
+            playbook_version,
+            &generated,
+            Some(enrollment_token),
+            Some(&claim),
+        )
+        .await?
+    } else {
+        false
+    };
+    let status = if committed {
+        "profiled"
+    } else {
+        "stale_enrollment"
+    };
+    let _ = crate::tasks::finalize_task_commit_if_owned(state, &claim, status).await?;
+    Ok(())
 }
 
 pub async fn batch_enable_endpoint(
@@ -843,6 +1091,7 @@ pub async fn batch_enable_endpoint(
             .as_ref()
             .map(|c| matches!(c.agent_status, crate::models::AgentStatus::Managed))
             .unwrap_or(false);
+        let enrollment_token = (!already_managed).then(|| uuid::Uuid::new_v4().to_string());
 
         // upsert 联系人:置 managed + sharedNote + playbook。
         // nickname/remark/avatar_url 只在候选真的带值时才写——MCP 好友列表常缺 remark，
@@ -857,6 +1106,9 @@ pub async fn batch_enable_endpoint(
             "playbook_version": playbook.version,
             "updated_at": DateTime::now(),
         };
+        if let Some(token) = enrollment_token.as_deref() {
+            set_doc.insert("enrollment_token", token);
+        }
         if let Some(nickname) = &cand.nickname {
             set_doc.insert("nickname", nickname);
         }
@@ -872,7 +1124,10 @@ pub async fn batch_enable_endpoint(
         // 全新联系人（未入库，或已入库但从未被 Agent 运营过）同步落状态机 initial 态。
         // 老客户（is_previously_operated）不碰 operation_state——保留其已积累的运营历史，
         // 与 apply_generated_profile_to_contact 的老客户保留语义一致（#72）。
-        let is_new_contact = existing.as_ref().map(|c| !is_previously_operated(c)).unwrap_or(true);
+        let is_new_contact = existing
+            .as_ref()
+            .map(|c| !is_previously_operated(c))
+            .unwrap_or(true);
         if is_new_contact {
             set_doc.insert("operation_state", &initial_state);
             set_doc.insert(
@@ -904,35 +1159,41 @@ pub async fn batch_enable_endpoint(
 
         if !already_managed {
             // 入队异步初始画像任务。
+            let task = crate::models::AgentTask {
+                id: None,
+                workspace_id: admin.current_workspace.clone(),
+                account_id: payload.account_id.clone(),
+                contact_wxid: cand.wxid.clone(),
+                kind: "initial_profile".to_string(),
+                run_at: DateTime::now(),
+                expires_at: None,
+                content: payload.shared_note.clone(),
+                status: "pending".to_string(),
+                source_decision_id: None,
+                review_required: false,
+                attempt_count: 0,
+                max_attempts: 3,
+                next_retry_at: None,
+                gateway_status: None,
+                cancel_reason: None,
+                error: None,
+                claimed_at: None,
+                claim_recovery_count: 0,
+                created_at: DateTime::now(),
+                updated_at: DateTime::now(),
+            };
+            let mut task_doc = mongodb::bson::to_document(&task)?;
+            task_doc.insert(
+                "enrollment_token",
+                enrollment_token
+                    .as_deref()
+                    .expect("new enrollment has token"),
+            );
             state
                 .db
                 .tasks()
-                .insert_one(
-                    crate::models::AgentTask {
-                        id: None,
-                        workspace_id: admin.current_workspace.clone(),
-                        account_id: payload.account_id.clone(),
-                        contact_wxid: cand.wxid.clone(),
-                        kind: "initial_profile".to_string(),
-                        run_at: DateTime::now(),
-                        expires_at: None,
-                        content: payload.shared_note.clone(),
-                        status: "pending".to_string(),
-                        source_decision_id: None,
-                        review_required: false,
-                        attempt_count: 0,
-                        max_attempts: 3,
-                        next_retry_at: None,
-                        gateway_status: None,
-                        cancel_reason: None,
-                        error: None,
-                        claimed_at: None,
-                        claim_recovery_count: 0,
-                        created_at: DateTime::now(),
-                        updated_at: DateTime::now(),
-                    },
-                    None,
-                )
+                .clone_with_type::<Document>()
+                .insert_one(task_doc, None)
                 .await?;
             queued += 1;
         }
@@ -1009,6 +1270,20 @@ pub(super) async fn enable_agent(
         payload.playbook_id.as_deref(),
     )
     .await?;
+    let enrollment_token = uuid::Uuid::new_v4().to_string();
+    state
+        .db
+        .contacts()
+        .clone_with_type::<Document>()
+        .update_one(
+            doc! { "_id": contact.id, "workspace_id": &admin.current_workspace },
+            doc! { "$set": {
+                "enrollment_token": &enrollment_token,
+                "updated_at": DateTime::now(),
+            } },
+            None,
+        )
+        .await?;
     let generated = agent::build_initial_operation_profile(
         &state,
         &admin.current_workspace,
@@ -1017,7 +1292,7 @@ pub(super) async fn enable_agent(
         Some(&playbook),
     )
     .await?;
-    apply_generated_profile_to_contact(
+    let committed = apply_generated_profile_to_contact(
         &state,
         &admin.current_workspace,
         &contact,
@@ -1025,8 +1300,15 @@ pub(super) async fn enable_agent(
         playbook.id,
         playbook.version,
         &generated,
+        Some(&enrollment_token),
+        None,
     )
     .await?;
+    if !committed {
+        return Err(AppError::Conflict(
+            "联系人运营状态在画像生成期间发生变化，已丢弃过期结果".to_string(),
+        ));
+    }
     let _ = agent::write_event_for_account(
         &state,
         &contact.account_id,
@@ -1051,6 +1333,7 @@ pub(super) async fn disable_agent(
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
     let object_id = parse_object_id(&id)?;
+    let enrollment_token = uuid::Uuid::new_v4().to_string();
     state
         .db
         .contacts()
@@ -1059,6 +1342,7 @@ pub(super) async fn disable_agent(
             doc! {
                 "$set": {
                     "agent_status": "normal",
+                    "enrollment_token": enrollment_token,
                     "updated_at": DateTime::now()
                 }
             },
@@ -1093,6 +1377,7 @@ pub(super) async fn hide_from_pool(
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
     let object_id = parse_object_id(&id)?;
+    let enrollment_token = uuid::Uuid::new_v4().to_string();
     let result = state
         .db
         .contacts()
@@ -1101,6 +1386,7 @@ pub(super) async fn hide_from_pool(
             doc! { "$set": {
                 "hidden_from_pool": true,
                 "agent_status": "normal",
+                "enrollment_token": enrollment_token,
                 "updated_at": DateTime::now()
             } },
             None,
@@ -1181,10 +1467,8 @@ pub(super) async fn update_profile_note(
         playbook.as_ref(),
     )
     .await?;
-    let commitments_bson = commitments_with_optional_text(
-        &contact.commitments,
-        generated.last_commitment.as_deref(),
-    );
+    let commitments_bson =
+        commitments_with_optional_text(&contact.commitments, generated.last_commitment.as_deref());
     // #72：曾运营过的老客户重新生成画像时保留 stage / operation_state / commitments，
     // 不回退 new_contact；全新客户才完整初始化。
     // 标签可信度改造：note 重生成只写 AI 层（agent_profile/profile_attributes），
@@ -1306,7 +1590,10 @@ pub async fn update_assist_override(
     let object_id = parse_object_id(&id)?;
     // workspace 隔离：跨 workspace / 不存在均 404（不泄漏存在性）。
     find_contact_by_id(&state, &admin.current_workspace, &id).await?;
-    let attr = format!("domain_attributes.{}", crate::models::ASSIST_MODE_OVERRIDE_ATTR);
+    let attr = format!(
+        "domain_attributes.{}",
+        crate::models::ASSIST_MODE_OVERRIDE_ATTR
+    );
     let now = DateTime::now();
     let update = if payload.mode == "default" {
         doc! { "$unset": { &attr: "" }, "$set": { "updated_at": now } }
@@ -1434,7 +1721,10 @@ pub fn validate_manual_tags(tags: &[String]) -> Result<(), AppError> {
             "manual_tags 条数上限 {MANUAL_TAGS_MAX_COUNT} 个"
         )));
     }
-    if let Some(t) = tags.iter().find(|t| t.chars().count() > MANUAL_TAG_MAX_CHARS) {
+    if let Some(t) = tags
+        .iter()
+        .find(|t| t.chars().count() > MANUAL_TAG_MAX_CHARS)
+    {
         return Err(AppError::BadRequest(format!(
             "单个 manual_tag 长度上限 {MANUAL_TAG_MAX_CHARS} 字符（超限：{t}）"
         )));
@@ -1655,13 +1945,16 @@ pub(super) async fn analyze_contact_profile(
                 .unwrap_or(contact.wxid.clone())
         )
     });
-    let generated =
-        agent::build_initial_operation_profile(&state, &admin.current_workspace, &contact.account_id, &note, playbook.as_ref())
-            .await?;
-    let commitments_bson = commitments_with_optional_text(
-        &contact.commitments,
-        generated.last_commitment.as_deref(),
-    );
+    let generated = agent::build_initial_operation_profile(
+        &state,
+        &admin.current_workspace,
+        &contact.account_id,
+        &note,
+        playbook.as_ref(),
+    )
+    .await?;
+    let commitments_bson =
+        commitments_with_optional_text(&contact.commitments, generated.last_commitment.as_deref());
     // #72：曾运营过的老客户 AI 重新分析时保留 stage / operation_state / commitments，
     // 不回退 new_contact；全新客户才完整初始化。
     let mut set_doc = doc! {
@@ -1864,6 +2157,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn initial_profile_generation_is_scoped_by_enrollment_and_task() {
+        let contact_id = ObjectId::parse_str("64b64c000000000000000031").unwrap();
+        let task_id = ObjectId::parse_str("64b64c000000000000000032").unwrap();
+        let claim = crate::tasks::TaskClaim {
+            task_id,
+            claim_token: "claim-token".to_string(),
+            claim_generation: 7,
+        };
+        assert_eq!(
+            initial_profile_contact_commit_filter(
+                contact_id,
+                "ws",
+                "acct",
+                Some("enrollment-1"),
+                Some(&claim),
+            ),
+            doc! {
+                "_id": contact_id,
+                "workspace_id": "ws",
+                "account_id": "acct",
+                "agent_status": "managed",
+                "enrollment_token": "enrollment-1",
+                "$or": [
+                    { "profile_source_enrollment_token": { "$ne": "enrollment-1" } },
+                    {
+                        "profile_source_enrollment_token": "enrollment-1",
+                        "profile_source_task_id": task_id,
+                        "profile_source_task_claim_generation": { "$lte": 7i64 },
+                    },
+                ],
+            }
+        );
+    }
+
+    #[test]
     fn truncate_preview_keeps_short_and_cuts_long() {
         assert_eq!(truncate_preview("你好", 30), "你好");
         assert_eq!(truncate_preview("  空白裁剪  ", 30), "空白裁剪");
@@ -1889,8 +2217,14 @@ mod tests {
         // 非 text 类型绝不读 content（content 可能是 XML 垃圾）
         let xml = "<msg><appmsg appid=\"\" sdk...";
         assert_eq!(preview_label_for_type(Some("appmsg"), xml), "[链接]");
-        assert_eq!(preview_label_for_type(Some("system"), "<sysmsg type=\"functionmsg\">"), "[系统消息]");
-        assert_eq!(preview_label_for_type(Some("image"), "irrelevant"), "[图片]");
+        assert_eq!(
+            preview_label_for_type(Some("system"), "<sysmsg type=\"functionmsg\">"),
+            "[系统消息]"
+        );
+        assert_eq!(
+            preview_label_for_type(Some("image"), "irrelevant"),
+            "[图片]"
+        );
         assert_eq!(preview_label_for_type(Some("voice"), ""), "[语音]");
         assert_eq!(preview_label_for_type(Some("video"), ""), "[视频]");
         assert_eq!(preview_label_for_type(Some("namecard"), ""), "[名片]");
@@ -1944,7 +2278,10 @@ mod tests {
         // base：仅 workspace + account 隔离（与 list_contacts 同源）。
         assert_eq!(base.get_str("workspace_id").unwrap(), "ws1");
         assert_eq!(base.get_str("account_id").unwrap(), "acct1");
-        assert!(base.get("agent_status").is_none(), "base 不得含 agent_status");
+        assert!(
+            base.get("agent_status").is_none(),
+            "base 不得含 agent_status"
+        );
         // 隐藏的联系人不计入任何 tab 计数（与 list_contacts 口径一致）。
         assert!(base.get_document("hidden_from_pool").is_ok());
         // managed：在 base 基础上加 agent_status=managed。
@@ -2046,16 +2383,22 @@ mod tests {
 
     #[test]
     fn validate_manual_tags_accepts_within_limits() {
-        let tags: Vec<String> = (0..MANUAL_TAGS_MAX_COUNT).map(|i| format!("标签{i}")).collect();
+        let tags: Vec<String> = (0..MANUAL_TAGS_MAX_COUNT)
+            .map(|i| format!("标签{i}"))
+            .collect();
         assert!(validate_manual_tags(&tags).is_ok(), "正好满额应通过");
-        assert!(validate_manual_tags(&["a".repeat(MANUAL_TAG_MAX_CHARS)]).is_ok(), "正好满长应通过");
+        assert!(
+            validate_manual_tags(&["a".repeat(MANUAL_TAG_MAX_CHARS)]).is_ok(),
+            "正好满长应通过"
+        );
         assert!(validate_manual_tags(&[]).is_ok());
     }
 
     #[test]
     fn validate_manual_tags_rejects_too_many() {
-        let tags: Vec<String> =
-            (0..MANUAL_TAGS_MAX_COUNT + 1).map(|i| format!("标签{i}")).collect();
+        let tags: Vec<String> = (0..MANUAL_TAGS_MAX_COUNT + 1)
+            .map(|i| format!("标签{i}"))
+            .collect();
         assert!(validate_manual_tags(&tags).is_err(), "超条数上限应拒绝");
     }
 

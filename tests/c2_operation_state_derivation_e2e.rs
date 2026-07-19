@@ -207,7 +207,11 @@ async fn normal_transition_uses_customer_stage_over_operation_state() {
         .insert_one(&contact, None)
         .await
         .expect("insert managed contact");
-    let inbound = make_inbound(&contact, "msg_c2_legal_001", "我大概了解了，可以再多聊聊你们怎么做的吗？");
+    let inbound = make_inbound(
+        &contact,
+        "msg_c2_legal_001",
+        "我大概了解了，可以再多聊聊你们怎么做的吗？",
+    );
     app.state
         .db
         .messages()
@@ -217,8 +221,10 @@ async fn normal_transition_uses_customer_stage_over_operation_state() {
 
     // 知识库为空 → route_operation_knowledge 早返回（0 次 LLM）。
     // LLM 调用序列：#1 Reply Agent 决策；#2 Review Agent（approved，无 revision）。
-    app.llm
-        .push_response(reply_decision_json("relationship_building", "need_discovery"));
+    app.llm.push_response(reply_decision_json(
+        "relationship_building",
+        "need_discovery",
+    ));
     app.llm.push_response(review_pass_json());
 
     let before = app.llm.calls();
@@ -245,11 +251,9 @@ async fn normal_transition_uses_customer_stage_over_operation_state() {
         // [诊断2] gateway 用 load_active_domain_profile 读 active profile 决定 declared_dims；
         // 若它返回的不是 DEFAULT（不声明 customer_stage participates），retain 会剔除
         // customer_stage。这里复刻同一读法，打印 profile_id + 声明维度，定位真因。
-        let active = wechatagent::agent::load_active_domain_profile(
-            &app.state.db,
-            &contact.workspace_id,
-        )
-        .await;
+        let active =
+            wechatagent::agent::load_active_domain_profile(&app.state.db, &contact.workspace_id)
+                .await;
         let declared: Vec<&str> = active
             .profile_dimensions
             .iter()
@@ -346,7 +350,11 @@ async fn illegal_transition_keeps_old_state_and_audits_failsoft() {
     handle_managed_message(&app.state, contact.clone(), &inbound)
         .await
         .expect("handle_managed_message ok（fail-soft：非法迁移不返回 Err）");
-    assert_eq!(app.llm.calls() - before, 2, "Reply ×1 + Review ×1 = 2 次 LLM 调用");
+    assert_eq!(
+        app.llm.calls() - before,
+        2,
+        "Reply ×1 + Review ×1 = 2 次 LLM 调用"
+    );
 
     // ① fail-soft 跳写：保留旧态 new_contact（既没被非法的 customer_success 覆盖，
     //    也没回落到 operationState=need_discovery——customer_stage present 时不回落）。
@@ -639,13 +647,27 @@ async fn weak_stage_evidence_drops_to_observation_not_domain_attrs() {
     // stage 状态机的 prev_stage 读 domain_attributes.customer_stage（非 operation_state）。
     // 预置为 new_contact，使 → relationship_building 合法迁移（否则 from=None→非 initial 态被拒）。
     contact.domain_attributes = Some(doc! { "customer_stage": "new_contact" });
-    app.state.db.contacts().insert_one(&contact, None).await.expect("insert contact");
+    app.state
+        .db
+        .contacts()
+        .insert_one(&contact, None)
+        .await
+        .expect("insert contact");
     // 窗口序位 0 = 这条 Inbound（升序最早）。stageEvidenceTurns=[0] 能 resolve 出非空证据，
     // 但 stageExplicitIntent=false → evidence_strength 判 Weak → 走 weak_stage_drop。
     let inbound = make_inbound(&contact, "msg_d7_weak_001", "嗯，我再想想看吧。");
-    app.state.db.messages().insert_one(&inbound, None).await.expect("insert inbound");
+    app.state
+        .db
+        .messages()
+        .insert_one(&inbound, None)
+        .await
+        .expect("insert inbound");
 
-    app.llm.push_response(reply_decision_with_stage_evidence("relationship_building", vec![0], false));
+    app.llm.push_response(reply_decision_with_stage_evidence(
+        "relationship_building",
+        vec![0],
+        false,
+    ));
     app.llm.push_response(review_pass_json());
 
     handle_managed_message(&app.state, contact.clone(), &inbound)
@@ -675,12 +697,30 @@ async fn strong_stage_evidence_writes_domain_attrs_not_observation() {
     let mut contact = make_managed_contact("user_d7_strong", "new_contact");
     // 同弱证据用例：预置 domain_attributes.customer_stage=new_contact 使 → relationship_building 合法。
     contact.domain_attributes = Some(doc! { "customer_stage": "new_contact" });
-    app.state.db.contacts().insert_one(&contact, None).await.expect("insert contact");
-    let inbound = make_inbound(&contact, "msg_d7_strong_001", "我明确想推进，咱们继续聊吧。");
-    app.state.db.messages().insert_one(&inbound, None).await.expect("insert inbound");
+    app.state
+        .db
+        .contacts()
+        .insert_one(&contact, None)
+        .await
+        .expect("insert contact");
+    let inbound = make_inbound(
+        &contact,
+        "msg_d7_strong_001",
+        "我明确想推进，咱们继续聊吧。",
+    );
+    app.state
+        .db
+        .messages()
+        .insert_one(&inbound, None)
+        .await
+        .expect("insert inbound");
 
     // Inbound 锚定 + explicit=true → Strong → 实时写状态机（relationship_building 合法 from new_contact）。
-    app.llm.push_response(reply_decision_with_stage_evidence("relationship_building", vec![0], true));
+    app.llm.push_response(reply_decision_with_stage_evidence(
+        "relationship_building",
+        vec![0],
+        true,
+    ));
     app.llm.push_response(review_pass_json());
 
     handle_managed_message(&app.state, contact.clone(), &inbound)

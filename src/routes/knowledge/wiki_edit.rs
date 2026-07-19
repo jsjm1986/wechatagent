@@ -104,13 +104,7 @@ pub(in crate::routes) async fn patch_operation_knowledge_chunk(
         reason: payload.reason,
         actor: payload.actor,
     };
-    let applied = apply_chunk_revision(
-        &state.db,
-        &admin.current_workspace,
-        object_id,
-        req,
-    )
-    .await?;
+    let applied = apply_chunk_revision(&state.db, &admin.current_workspace, object_id, req).await?;
     super::super::chunk_locks::broadcast_chunk_revised_in(
         &state,
         &admin.current_workspace,
@@ -137,20 +131,10 @@ pub(in crate::routes) async fn archive_operation_knowledge_chunk(
         reason: payload.reason,
         actor: payload.actor,
     };
-    let applied = apply_chunk_revision(
-        &state.db,
-        &admin.current_workspace,
-        object_id,
-        req,
-    )
-    .await?;
-    let cleaned = cleanup_dangling_refs(
-        &state.db,
-        &admin.current_workspace,
-        &applied.chunk_id,
-    )
-    .await
-    .unwrap_or(0);
+    let applied = apply_chunk_revision(&state.db, &admin.current_workspace, object_id, req).await?;
+    let cleaned = cleanup_dangling_refs(&state.db, &admin.current_workspace, &applied.chunk_id)
+        .await
+        .unwrap_or(0);
     super::super::chunk_locks::broadcast_chunk_revised_in(
         &state,
         &admin.current_workspace,
@@ -180,13 +164,7 @@ pub(in crate::routes) async fn restore_operation_knowledge_chunk(
         reason: payload.reason,
         actor: payload.actor,
     };
-    let applied = apply_chunk_revision(
-        &state.db,
-        &admin.current_workspace,
-        object_id,
-        req,
-    )
-    .await?;
+    let applied = apply_chunk_revision(&state.db, &admin.current_workspace, object_id, req).await?;
     super::super::chunk_locks::broadcast_chunk_revised_in(
         &state,
         &admin.current_workspace,
@@ -273,13 +251,7 @@ pub(in crate::routes) async fn rollback_operation_knowledge_chunk(
         )),
         actor: payload.actor,
     };
-    let applied = apply_chunk_revision(
-        &state.db,
-        &admin.current_workspace,
-        object_id,
-        req,
-    )
-    .await?;
+    let applied = apply_chunk_revision(&state.db, &admin.current_workspace, object_id, req).await?;
     super::super::chunk_locks::broadcast_chunk_revised_in(
         &state,
         &admin.current_workspace,
@@ -411,10 +383,12 @@ pub(in crate::routes) async fn split_operation_knowledge_chunk(
         op: RevisionOp::Split,
         source: ProvenanceSource::Human,
         patch: Document::new(),
-        reason: payload
-            .reason
-            .clone()
-            .or_else(|| Some(format!("split into {} new chunks", payload.new_chunks.len()))),
+        reason: payload.reason.clone().or_else(|| {
+            Some(format!(
+                "split into {} new chunks",
+                payload.new_chunks.len()
+            ))
+        }),
         actor: payload.actor.clone(),
     };
     // 用 archive 语义但 op 标 Split（apply_chunk_revision 内部把 status 设 archived）
@@ -470,8 +444,10 @@ pub(in crate::routes) async fn split_operation_knowledge_chunk(
             .db
             .operation_knowledge_chunks()
             .insert_one(
-                mongodb::bson::from_document::<crate::models::OperationKnowledgeChunk>(new_doc.clone())
-                    .map_err(|e| AppError::BadRequest(format!("split 新 chunk 字段不合法: {e}")))?,
+                mongodb::bson::from_document::<crate::models::OperationKnowledgeChunk>(
+                    new_doc.clone(),
+                )
+                .map_err(|e| AppError::BadRequest(format!("split 新 chunk 字段不合法: {e}")))?,
                 None,
             )
             .await?;
@@ -632,9 +608,7 @@ pub(in crate::routes) async fn merge_operation_knowledge_chunk(
                     mongodb::bson::from_document::<crate::models::OperationKnowledgeChunk>(
                         new_doc.clone(),
                     )
-                    .map_err(|e| {
-                        AppError::BadRequest(format!("merge 新 chunk 字段不合法: {e}"))
-                    })?,
+                    .map_err(|e| AppError::BadRequest(format!("merge 新 chunk 字段不合法: {e}")))?,
                     None,
                 )
                 .await?;
@@ -769,13 +743,7 @@ pub(in crate::routes) async fn relate_operation_knowledge_chunk(
         }),
         actor: payload.actor,
     };
-    let applied = apply_chunk_revision(
-        &state.db,
-        &admin.current_workspace,
-        object_id,
-        req,
-    )
-    .await?;
+    let applied = apply_chunk_revision(&state.db, &admin.current_workspace, object_id, req).await?;
     super::super::chunk_locks::broadcast_chunk_revised_in(
         &state,
         &admin.current_workspace,
@@ -833,13 +801,7 @@ pub(in crate::routes) async fn unrelate_operation_knowledge_chunk(
         reason: Some(format!("unrelate -> {target_id}")),
         actor: None,
     };
-    let applied = apply_chunk_revision(
-        &state.db,
-        &admin.current_workspace,
-        object_id,
-        req,
-    )
-    .await?;
+    let applied = apply_chunk_revision(&state.db, &admin.current_workspace, object_id, req).await?;
     super::super::chunk_locks::broadcast_chunk_revised_in(
         &state,
         &admin.current_workspace,
@@ -849,10 +811,7 @@ pub(in crate::routes) async fn unrelate_operation_knowledge_chunk(
     );
     let mut value = revision_applied_to_json(&applied);
     if let Some(o) = value.as_object_mut() {
-        o.insert(
-            "removed".to_string(),
-            json!(original_len - kept.len()),
-        );
+        o.insert("removed".to_string(), json!(original_len - kept.len()));
     }
     Ok(Json(value))
 }
@@ -890,10 +849,7 @@ pub async fn list_chunk_referrers(
     let mut items: Vec<Value> = Vec::new();
     while cur.advance().await? {
         let chunk = cur.deserialize_current()?;
-        let chunk_id = chunk
-            .id
-            .map(|o| o.to_hex())
-            .unwrap_or_default();
+        let chunk_id = chunk.id.map(|o| o.to_hex()).unwrap_or_default();
         let related = chunk.related_chunks.clone().unwrap_or_default();
         let matched: Vec<&_> = related
             .iter()
@@ -1053,14 +1009,7 @@ pub async fn batch_archive_chunks(
             reason: payload.reason.clone(),
             actor: payload.actor.clone(),
         };
-        match apply_chunk_revision(
-            &state.db,
-            &admin.current_workspace,
-            object_id,
-            req,
-        )
-        .await
-        {
+        match apply_chunk_revision(&state.db, &admin.current_workspace, object_id, req).await {
             Ok(_) => archived.push(id.clone()),
             Err(e) => skipped.push(json!({ "id": id, "reason": format!("{}", e) })),
         }
