@@ -156,6 +156,7 @@ fn review_pass_json() -> serde_json::Value {
             "relationshipProgress": 7,
             "conversionReadiness": 6,
             "pressureRisk": 2,
+            "boundaryPrivacySafety": 9,
             "factRisk": 1,
         },
         "claimAnalysis": {

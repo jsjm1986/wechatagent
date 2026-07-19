@@ -84,6 +84,7 @@ pub async fn describe_inbound_image(
         user_prompt,
         image_base64,
         mime,
+        "description",
     )
     .await?;
     let description = value

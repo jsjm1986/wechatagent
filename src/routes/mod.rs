@@ -1143,6 +1143,10 @@ mod tests {
             // contacts.rs：批量托管异步初始画像任务处理器，被 tasks.rs worker
             // （task.kind=="initial_profile"）调用、不直接绑 HTTP。
             "handle_initial_profile_task",
+            // contacts.rs：带 owner claim 的初始画像 worker 入口，由 tasks.rs 调用；
+            // prepared commit 对账入口由 tasks.rs::reconcile_prepared_task_commits 调用。
+            "handle_initial_profile_task_with_claim",
+            "reconcile_initial_profile_commit",
         ];
 
         let mut handlers: Vec<&str> = Vec::new();

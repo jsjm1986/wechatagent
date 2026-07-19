@@ -932,6 +932,20 @@ pub(crate) enum VisionProvider {
     Dedicated(Vec<(String, crate::llm::LlmClient)>),
 }
 
+fn require_non_empty_vision_text(value: Value, field: &str) -> AppResult<Value> {
+    if value
+        .get(field)
+        .and_then(Value::as_str)
+        .is_some_and(|text| !text.trim().is_empty())
+    {
+        Ok(value)
+    } else {
+        Err(AppError::External(format!(
+            "LLM vision response missing non-empty `{field}`"
+        )))
+    }
+}
+
 /// 解析本 workspace 的视觉模型 provider（供知识库导入与运营 Agent 入站图片理解
 /// 复用，避免两处各写一套选择逻辑）：
 /// a. active 文字主模型本身 supports_vision → 直接用运行时 `state.llm`；
@@ -1008,30 +1022,53 @@ pub(crate) async fn vision_generate_json(
     user_prompt: &str,
     image_base64: &str,
     mime: &str,
+    required_text_field: &str,
 ) -> AppResult<Value> {
     match provider {
-        VisionProvider::Runtime => state
-            .llm
-            .generate_json_with_image(system_prompt, user_prompt, image_base64, mime)
-            .await
-            .map_err(|e| match e {
-                // 瞬时不可达（429/限流/配额耗尽/网关超时）原样透传结构化变体，
-                // 让上游（测试 skip 宏、网关回退逻辑）按瞬时态处理而非当成内容失败。
-                AppError::LlmUnavailable { .. } => e,
-                other => AppError::External(format!("LLM vision 抽取失败: {other}")),
-            }),
+        VisionProvider::Runtime => {
+            let value = state
+                .llm
+                .generate_json_with_image(system_prompt, user_prompt, image_base64, mime)
+                .await
+                .map_err(|e| match e {
+                    // 瞬时不可达（429/限流/配额耗尽/网关超时）原样透传结构化变体，
+                    // 让上游（测试 skip 宏、网关回退逻辑）按瞬时态处理而非当成内容失败。
+                    AppError::LlmUnavailable { .. } => e,
+                    other => AppError::External(format!("LLM vision 抽取失败: {other}")),
+                })?;
+            require_non_empty_vision_text(value, required_text_field)
+        }
         VisionProvider::Dedicated(candidates) => {
-            let mut last_transient: Option<AppError> = None;
+            let mut last_failure: Option<AppError> = None;
             let mut result: Option<AppResult<Value>> = None;
             for (idx, (model, client)) in candidates.iter().enumerate() {
                 match client
                     .generate_json_with_image(system_prompt, user_prompt, image_base64, mime)
                     .await
                 {
-                    Ok(v) => {
-                        result = Some(Ok(v));
-                        break;
-                    }
+                    Ok(v) => match require_non_empty_vision_text(v, required_text_field) {
+                        Ok(v) => {
+                            result = Some(Ok(v));
+                            break;
+                        }
+                        Err(error) => {
+                            if idx + 1 < candidates.len() {
+                                tracing::warn!(
+                                    model = %model,
+                                    next = %candidates[idx + 1].0,
+                                    field = required_text_field,
+                                    "vision model returned empty required content; trying backup"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    model = %model,
+                                    field = required_text_field,
+                                    "vision model returned empty required content; no backup remains"
+                                );
+                            }
+                            last_failure = Some(error);
+                        }
+                    },
                     Err(e @ AppError::LlmUnavailable { .. }) => {
                         if idx + 1 < candidates.len() {
                             tracing::warn!(
@@ -1047,7 +1084,7 @@ pub(crate) async fn vision_generate_json(
                                 "视觉模型瞬时不可达，已无更多备用模型可切换"
                             );
                         }
-                        last_transient = Some(e);
+                        last_failure = Some(e);
                     }
                     Err(other) => {
                         result = Some(Err(AppError::External(format!(
@@ -1058,7 +1095,7 @@ pub(crate) async fn vision_generate_json(
                 }
             }
             result.unwrap_or_else(|| {
-                Err(last_transient.unwrap_or_else(|| {
+                Err(last_failure.unwrap_or_else(|| {
                     AppError::External("LLM vision 抽取失败: 无可用视觉模型候选".to_string())
                 }))
             })
@@ -1101,6 +1138,7 @@ pub async fn import_operation_knowledge_apply_image(
         &user_prompt,
         &req.image_base64,
         mime,
+        "fence",
     )
     .await?;
     let raw = value
@@ -1108,15 +1146,7 @@ pub async fn import_operation_knowledge_apply_image(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    if raw.trim().is_empty() {
-        return Ok(Json(json!({
-            "documentId": null,
-            "chunkIds": [],
-            "parseWarnings": [],
-            "fallbackBlob": false,
-            "note": "vision 返回空文本",
-        })));
-    }
+    debug_assert!(!raw.trim().is_empty());
     let outcome = ingest_chunked_text(
         &state,
         &admin.current_workspace,
@@ -1314,6 +1344,24 @@ pub async fn ingest_chunked_text(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vision_payload_requires_the_callers_non_empty_text_field() {
+        assert!(require_non_empty_vision_text(json!({"fence": "content"}), "fence").is_ok());
+        for value in [
+            json!({}),
+            json!({"fence": null}),
+            json!({"fence": 1}),
+            json!({"fence": "   "}),
+        ] {
+            assert!(require_non_empty_vision_text(value, "fence").is_err());
+        }
+        assert!(require_non_empty_vision_text(
+            json!({"description": "visible image"}),
+            "description"
+        )
+        .is_ok());
+    }
 
     #[test]
     fn long_import_prompt_carries_types_and_drops_dead_fields() {

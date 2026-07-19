@@ -38,6 +38,8 @@ fn verified_chunk(title: &str, body: &str) -> OperationKnowledgeChunk {
         title: title.to_string(),
         summary: Some(format!("摘要：{title}")),
         body: Some(body.to_string()),
+        source_quote: Some(body.to_string()),
+        source_anchors: vec![doc! { "sourceQuote": body }],
         wiki_type: Some("methodology".to_string()),
         status: "active".to_string(),
         integrity_status: Some("verified".to_string()),
@@ -96,7 +98,7 @@ async fn ask_returns_answer_with_cited_when_corpus_has_relevant_chunks() {
         "sourceQuotes": [{
             "chunkId": chunk_hex.clone(),
             "quote": "Step1 共情；Step2 说价值；Step3 给方案。",
-            "sourceAnchorIndex": null,
+            "sourceAnchorIndex": 0,
         }],
     }));
 
@@ -355,7 +357,7 @@ async fn answer_cites_redirected_current_version_end_to_end() {
         "sourceQuotes": [{
             "chunkId": new_id.clone(),
             "quote": "现行版正文：价格异议三步法",
-            "sourceAnchorIndex": null,
+            "sourceAnchorIndex": 0,
         }],
     }));
 

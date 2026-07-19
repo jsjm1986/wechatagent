@@ -2165,11 +2165,11 @@ async fn reclaim_gate_precedes_pacing_gate() {
         OutboxStatus::Pending.as_str(),
         "若 status=pending 说明 pacing 闸被误挪到 reclaim 门之前，已发过的消息被拦成僵尸条目"
     );
-    // last_error 是 reclaim 分支专属 marker(:685)——确认确实走的是 2B post-hoc，
+    // last_error 是 reclaim 分支专属 marker——确认确实走的是 2B post-hoc，
     // 而非碰巧走真实发送（后者 last_error 为 None、且会有 MCP 调用）。
     let last_error = entry.last_error.clone().unwrap_or_default();
     assert!(
-        last_error.contains("MCP already succeeded"),
+        last_error.contains("delivery was confirmed post-hoc"),
         "应走 reclaim 2B post-hoc 分支（last_error 带专属 marker），实际 last_error={last_error:?}"
     );
     assert!(entry.worker_id.is_none(), "标 sent 时 worker_id 应清空");
@@ -2373,6 +2373,7 @@ fn review_agent_pass_json(review_summary: &str) -> serde_json::Value {
             "relationshipProgress": 7,
             "conversionReadiness": 6,
             "pressureRisk": 2,
+            "boundaryPrivacySafety": 9,
             "factRisk": 1,
         },
         "claimAnalysis": {

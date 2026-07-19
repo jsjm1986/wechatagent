@@ -899,6 +899,7 @@ fn relay_review_pass_json() -> serde_json::Value {
             "relationshipProgress": 7,
             "conversionReadiness": 6,
             "pressureRisk": 2,
+            "boundaryPrivacySafety": 9,
             "factRisk": 1
         },
         "claimAnalysis": {
@@ -960,7 +961,16 @@ async fn t_relay_expired_authorization_clears_awaiting_and_sends_neutral() {
         .unwrap_or(false);
     assert!(!awaiting, "授权过期早退也必须清 awaiting 标记");
 
-    // 断言②：客户收到一条中性收尾话术（MCP 桩收到 message_send_text），且不复述过期 substance。
+    // 中性收尾先进入 durable outbox；测试显式驱动 dispatcher 后再检查 MCP。
+    let claimed = wechatagent::agent::atomic_claim_pending(&state, "expired-relay-test", 60)
+        .await
+        .expect("claim expired relay holding")
+        .expect("expired relay holding must be enqueued");
+    wechatagent::agent::process_entry(&state, &claimed)
+        .await
+        .expect("dispatch expired relay holding");
+
+    // 断言②：客户收到一条中性收尾话术，且不复述过期 substance。
     let recv = mcp
         .received_requests()
         .await

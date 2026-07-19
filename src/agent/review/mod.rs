@@ -710,9 +710,46 @@ fn parse_live_review(value: Value) -> AppResult<DecisionReviewResult> {
     serde_json::from_value(value).map_err(AppError::from)
 }
 
+/// Convert an unusable live Reviewer payload into a structured fail-closed result.
+///
+/// The wire parser remains strict: missing safety fields are never defaulted into a pass. A
+/// malformed model response is nevertheless a valid business terminal state, not a pipeline
+/// exception. Returning a safety hold lets the gateway persist an auditable blocked decision and
+/// keeps the candidate reply away from the outbox.
+fn hold_for_review_schema_failure(error: &AppError) -> DecisionReviewResult {
+    let error_summary = error.to_string().chars().take(160).collect::<String>();
+    DecisionReviewResult {
+        approved: false,
+        scores: ReviewScores {
+            human_like: 0,
+            emotional_value: 0,
+            hallucination_score: 10,
+            knowledge_grounding_score: 0,
+            pressure_risk: 10,
+            boundary_privacy_safety: 0,
+            ..Default::default()
+        },
+        claim_analysis: mongodb::bson::doc! {
+            "requiresProductKnowledge": true,
+            "reviewSchemaValid": false,
+            "reviewSchemaError": error_summary,
+        },
+        risks: vec!["review_schema_invalid".to_string()],
+        review_summary: "Live Reviewer response failed strict schema validation; send blocked"
+            .to_string(),
+        should_hold: true,
+        hold_reason: "Reviewer safety verdict was incomplete or malformed".to_string(),
+        hold_category: HOLD_CATEGORY_BLOCKED_BY_SAFETY_GUARD.to_string(),
+        final_review_status: "blocked_by_safety_guard".to_string(),
+        ..Default::default()
+    }
+}
+
 #[cfg(test)]
 mod strict_review_wire_tests {
-    use super::parse_live_review;
+    use super::{hold_for_review_schema_failure, parse_live_review};
+    use crate::agent::types::HOLD_CATEGORY_BLOCKED_BY_SAFETY_GUARD;
+    use crate::error::AppError;
     use serde_json::{json, Value};
 
     fn valid_review() -> Value {
@@ -781,6 +818,25 @@ mod strict_review_wire_tests {
         let mut invalid = valid_review();
         invalid["claimAnalysis"]["requiresProductKnowledge"] = json!("false");
         assert!(parse_live_review(invalid).is_err());
+    }
+
+    #[test]
+    fn malformed_live_review_becomes_auditable_safety_hold() {
+        let held = hold_for_review_schema_failure(&AppError::External(
+            "review_schema_invalid:approved".to_string(),
+        ));
+        assert!(!held.approved);
+        assert!(held.should_hold);
+        assert_eq!(held.hold_category, HOLD_CATEGORY_BLOCKED_BY_SAFETY_GUARD);
+        assert_eq!(held.final_review_status, "blocked_by_safety_guard");
+        assert!(held
+            .risks
+            .iter()
+            .any(|risk| risk == "review_schema_invalid"));
+        assert!(held
+            .claim_analysis
+            .get_bool("requiresProductKnowledge")
+            .unwrap());
     }
 }
 
@@ -1251,7 +1307,16 @@ Review 模式: {}
         let second_future = second_llm.generate_json(&system, &user);
         let (primary_res, second_res) = tokio::join!(primary_future, second_future);
         let primary_value = primary_res?;
-        let mut review = parse_live_review(primary_value)?;
+        let mut review = match parse_live_review(primary_value) {
+            Ok(review) => review,
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    "primary reviewer schema validation failed - blocking send"
+                );
+                return Ok(hold_for_review_schema_failure(&error));
+            }
+        };
         let _ = (decision, domain_config, knowledge_chunks, contact);
         // Phase B / B1：双闸路由替换原 `review.approved = review_passed(...)`。
         // 软闸失败时保持 approved=false（review_passed 行为）但同时写
@@ -1303,7 +1368,16 @@ Review 模式: {}
     } else {
         primary_future.await?
     };
-    let mut review = parse_live_review(value)?;
+    let mut review = match parse_live_review(value) {
+        Ok(review) => review,
+        Err(error) => {
+            tracing::warn!(
+                ?error,
+                "primary reviewer schema validation failed - blocking send"
+            );
+            return Ok(hold_for_review_schema_failure(&error));
+        }
+    };
     let _ = (decision, domain_config, knowledge_chunks, contact);
     route_dual_gate(&mut review, runtime, &decision.reply_text);
 

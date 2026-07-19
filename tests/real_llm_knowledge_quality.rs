@@ -2297,9 +2297,12 @@ async fn q3_vision_extraction_quality() {
     // 备用视觉模型（NVIDIA 托管 nemotron-nano-vl-8b，与主 nemotron-12b 同 nvidia 家族——backup 仅主挂时
     // 应急，关键是回退后被测 vs vision 裁判(meta llama-vision)仍跨家族）：supports_vision=true 但
     // is_vision_active=false，故生产候选链把它排在专职 nemotron-vl 之后——主模型瞬时
-    // 不可达（429/配额/网关超时）时自动切换到它。缺 BACKUP key 时不插入，链退化为单主模型，
-    // 不影响测试。模型名/端点是 tests 内字面量（check-no-model-hint 对 tests/ 豁免）。
-    if let Ok(backup_key) = std::env::var("REAL_LLM_VISION_BACKUP_API_KEY") {
+    // 不可达（429/配额/网关超时）或返回空 fence 时自动切换到它。专用 BACKUP key
+    // 未配置时复用主视觉 key（同一 NVIDIA 端点、不同模型），无需额外 secret 接线。
+    // 模型名/端点是 tests 内字面量（check-no-model-hint 对 tests/ 豁免）。
+    if let Ok(backup_key) = std::env::var("REAL_LLM_VISION_BACKUP_API_KEY")
+        .or_else(|_| std::env::var("REAL_LLM_VISION_API_KEY"))
+    {
         let backup_base = std::env::var("REAL_LLM_VISION_BACKUP_BASE_URL")
             .unwrap_or_else(|_| "https://integrate.api.nvidia.com/v1".to_string());
         let backup_model = std::env::var("REAL_LLM_VISION_BACKUP_MODEL")
@@ -2444,8 +2447,9 @@ async fn q4_chat_workstation_quality() {
         "sessionId": null,
         "accountId": null,
         "operatorId": "q4_operator",
-        "content": "帮我新建一条知识切片：企业版支持私有化部署，数据不出客户内网，\
-                    知识类型是产品能力，请起草标题、摘要和正文。",
+        "content": "帮我新建一条知识切片，知识类型是产品能力，请起草标题、摘要和正文。\
+                    以下是运营已确认、可直接作为 sourceQuote 的原文出处，请原样写入：\
+                    企业版支持私有化部署，数据不出客户内网。",
         "attachments": [],
     }))
     .expect("构造 ChatTurnRequest");
@@ -2474,7 +2478,7 @@ async fn q4_chat_workstation_quality() {
         .get("draftPreview")
         .and_then(|value| value.as_object())
         .expect("Q4 create_chunk 必须返回 object draftPreview");
-    for field in ["title", "summary", "body"] {
+    for field in ["title", "summary", "body", "sourceQuote"] {
         assert!(
             draft
                 .get(field)

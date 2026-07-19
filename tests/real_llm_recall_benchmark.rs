@@ -183,6 +183,11 @@ async fn seed_chunk(
         summary: Some(summary.to_string()),
         body: Some(body.to_string()),
         source_quote: Some(body.to_string()),
+        // Strict evidence adoption requires an indexed anchor whose sourceQuote matches the
+        // selected quote. Without this, the first uncached run can still count open_chunk as
+        // reach, but cached runs have no accepted citation and collapse both reach stability
+        // and adopt recall.
+        source_anchors: vec![doc! { "sourceQuote": body }],
         integrity_status: Some(integrity_status.to_string()),
         confidence_score: Some(88),
         status: status.to_string(),

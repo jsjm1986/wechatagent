@@ -343,6 +343,11 @@ pub(crate) async fn handle_principal_decision_relay_with_claim(
             )
             .await?;
         if let Some(contact) = contact {
+            // The authorization is no longer usable, so the customer must not remain stuck in
+            // the "awaiting principal decision" state while the neutral close-out is queued.
+            // Clear this before any best-effort generation/enqueue work: a downstream failure
+            // must not permanently suppress normal autonomous replies for this topic.
+            crate::agent::gateway::clear_awaiting_principal_state(state, &contact).await?;
             // Expired authorization is not a fact source. The neutral holding reply is reviewed
             // independently and then handed to the durable outbox rather than sent by bare MCP.
             let holding_text = generate_holding_reply(

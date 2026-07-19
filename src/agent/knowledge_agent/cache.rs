@@ -257,6 +257,28 @@ mod tests {
     }
 
     #[test]
+    fn put_then_get_preserves_verified_citation_payload() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        clear_for_test();
+        let key = mk_key("grounded answer");
+        let mut result = mk_result("supported answer");
+        result.cited_chunk_ids = vec!["chunk-1".to_string()];
+        result.source_quotes = vec![crate::agent::knowledge_agent::SourceQuoteCitation {
+            chunk_id: "chunk-1".to_string(),
+            quote: "anchored source text".to_string(),
+            source_anchor_index: Some(0),
+        }];
+
+        put(key.clone(), result);
+        let cached = get(&key).expect("grounded result must remain cacheable");
+
+        assert_eq!(cached.cited_chunk_ids, vec!["chunk-1"]);
+        assert_eq!(cached.source_quotes.len(), 1);
+        assert_eq!(cached.source_quotes[0].chunk_id, "chunk-1");
+        assert_eq!(cached.source_quotes[0].source_anchor_index, Some(0));
+    }
+
+    #[test]
     fn truncated_results_are_not_cached() {
         let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         clear_for_test();

@@ -57,6 +57,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-Dwarnings"
+  # Production and deep async integration paths use an 8 MiB Rust thread stack. Keep this at
+  # workflow scope so every current and future test harness gets the same runtime contract.
+  RUST_MIN_STACK: "8388608"
 
 jobs:
   # 路径分流:PR 上用 dorny/paths-filter 判定本次 diff 碰了 backend 还是 frontend。

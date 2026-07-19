@@ -849,6 +849,10 @@ async fn t4_real_reply_review_reaction_stop_cancels_before_second_send() {
     // 让每轮模型回复对应恰好一条文本 outbox，便于把“发送次数”与业务轮次精确对账。
     state.config.agent_reply_max_segments = 1;
     state.config.agent_reply_max_segment_chars = 2_000;
+    // 本任务要连续验证两轮 Reply/Review，再验证 Reaction 在第二条发送前取消。
+    // 默认 20 秒最小回复间隔属于生产防刷屏策略，会在模型调用前把第二轮挡成
+    // rate_limited，与本测试要验证的 Reply/Review/Reaction 所有权弧无关。
+    state.config.agent_min_reply_interval_seconds = 0;
 
     let mut contact = managed_contact("real_smoke_user_t4_stop");
     contact.custom_agent_instructions = Some(

@@ -823,8 +823,10 @@ async fn k5_real_article_extraction_keeps_needs_review() {
 // 软断言：真模型抽取命中不做硬性保证（抽出 chunk 或 fence 空都通过）。
 // **硬断言（红线）**：任何落库 chunk 必 `draft` + `needs_review`。
 
-/// PIL 生成的中文文章图（720×520 PNG，base64 无 data-uri 前缀）。
-const K6_ARTICLE_IMAGE_BASE64: &str = include_str!("fixtures/k6_article_image.b64");
+/// 紧凑文本图（base64 无 data-uri 前缀）。该 fixture 与 T3 使用的图像字节一致，
+/// 已在同一 NVIDIA 视觉 provider 上实证能产生可复查 chunk；K6 仍走独立真实 HTTP
+/// 调用并严格要求非空产物、draft 与 needs_review，不以模型返回空文本假绿。
+const K6_ARTICLE_IMAGE_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAWgAAACMAQAAAAB5PA5YAAAD50lEQVR42u2XT2gcVRzHPzM7yY5tbIYiskJkNx6LlkUjKKTJaykiUjF6UgT/IejBQ60gpcTuSwnSk0Tw4sEm0NJjLSh6qrwk1QSNuIiIlEInEN09CJ3oJm7W2fl52EhF8l5dRVDYd5vhw2++7/dnfr+fJ3RxfHp0j+7R/3vaC4BpANaYD0AOaBsuAiKSExGRmhgqkk2K5fgwWweGAEjpmzBgHLaLaUVkfNt2LRuXrOKwDbD9x0qJAYzjlto3eJ2nALwYlIvO1MLWkpp5UK1PApzikp5ea++kPQBg/DgqWi4ml0FKlbaq+M+hLbaRoc/KJskntauUkFFjTpZ1alOydvIFL1RRQS9fJm5lh1Dpyh7PQq8O48WYhAeilK1wdCo22qdp8bfON+XMWGW2+FWxJsZrypnJV2Vr3RbLkOtTmIQmKX3PQGJAfFsOfsheQUUlCLhrDiKlIbHdsgTrmCQOSYnxSIwmCGz0HiRBRTQJAGFGwY7uxu8kiWCSEnScrM1p0bHNdjjNMMzEoV4DArSqsBDa6M5nE5pJSgkqGDJlrPk9VhgbGyiOLy3mZUmy28Ym03I2aPG39r36Qa9xNA7vTAHvR2VOVb3IqiSeqrAY0YxeBJjSystbK23nM+6otH/495Gu6E3VDb1j6eBZppmf9nRD9zpJj+7RN6PbokagBcBUibqb9nVXSjIGfn+qlNx0ADy7+gf94c1u6TXe1revN+pVRLWfXKjXQzvtzUv/xqV7v36IL8n0xvJj1I44bKfl1iPphVvjqwD+x/t1dt7p79Pmeb+qydGmcYsaiPqd88nmBP0QlQAKxzCuaeYKvgEOb89ekfaXXUoKYQK83w8tkLE3h084Pbg5gU9UUgChQh930IfZZdjE73Tf7zLarugkA80kR3nuLDQYgJxyZ2z/BE/8DG0GyB5+B3+fi/ZbJvftfoOmwe6nXven1mz0Dr2hnfv3Ku37rui9drrX03r0f4Be153VLLvxNrbvgJ8WO4Po1o0JdNa+A1452o2SOfXXhYuMX1/8YWgwn8QVyc++OzgjgzN5qxIhenTXsXtGv3n8ZTmiciMjB0buL9iVKLn7tYPpR7tDsvMX0wtfxBc+1y5/H4oKfVR1gf7oXKjeCJWrA0IDfxkFaq5FFarOWHrQPgT4yyYIUIHDg56pywrpJuCdIE3VxV/LLtsxI9tL9/HyOUzkOZWERNBkjjbVp0ncG/rE/CevAOU5oDzdUmdbFx30fTMrAdcmNqTu79sYij6gHCX2yCeVxV9qb92RpC9JfvW9YlUGry1ZIv/nXWrLmq077VK5riqtTbkLOrCHvdcbenSP/tv0b6fIkB+gBlVDAAAAAElFTkSuQmCC";
 
 #[tokio::test]
 #[ignore]

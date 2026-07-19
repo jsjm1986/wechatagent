@@ -601,8 +601,9 @@ mod tests {
                 file_name: Some("quote.pdf".to_string()),
             },
         );
+        let media_payload = outbox_payload_json(&media, &targets);
         assert_eq!(
-            outbox_payload_json(&media, &targets),
+            media_payload,
             json!({
                 "kind": "media",
                 "assetId": "asset-1",
@@ -610,6 +611,7 @@ mod tests {
                 "fileName": "quote.pdf",
             })
         );
+        crate::routes::contract_snapshot::assert_contract_fixture("outbox_payload", media_payload);
 
         let mut card = sample_entry("pending");
         card.content.clear();

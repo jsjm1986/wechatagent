@@ -187,12 +187,11 @@ async fn review_task_now_rejects_terminal_task() {
     );
 }
 
-/// S-02：可复核态（pending）被成功原子 claim，且写入 claimed_at——让 handler 失败
-/// 停 running 后能被 reclaim_stale_running_tasks 分支A（claimed_at < stale）兜回。
-/// memory_consolidation 无候选时走 sent 早退，handler 成功、任务落终态 sent。
+/// S-02：可复核态（pending）被成功原子 claim。处理中写入 claimed_at，使 handler
+/// 失败停 running 后可被 reclaim；memory_consolidation 无候选成功落 sent 后必须清 lease。
 #[tokio::test]
 #[ignore]
-async fn review_task_now_claims_pending_and_writes_claimed_at() {
+async fn review_task_now_claims_pending_and_clears_lease_on_success() {
     let app = TestApp::start().await;
     let ws = app.state.config.default_workspace_id.clone();
     let acc = app.state.config.default_account_id.clone();
@@ -232,10 +231,14 @@ async fn review_task_now_claims_pending_and_writes_claimed_at() {
         .await
         .expect("query")
         .expect("task exists");
-    // handler（memory_consolidation 无候选）自写终态 sent；claimed_at 已在 claim 时写入。
+    // attempt_count 原子递增证明 claim 已发生；成功终态必须清理运行中 lease。
+    assert_eq!(
+        stored.attempt_count, 1,
+        "成功 claim 必须原子递增 attempt_count"
+    );
     assert!(
-        stored.claimed_at.is_some(),
-        "成功 claim 必须写 claimed_at（否则 handler 失败停 running 落入 reclaim 盲区）"
+        stored.claimed_at.is_none(),
+        "成功终态必须清 claimed_at，不能遗留看似仍被 worker 持有的 lease"
     );
     assert_eq!(
         stored.status, "sent",

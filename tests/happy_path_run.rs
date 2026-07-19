@@ -251,6 +251,7 @@ async fn seed_verified_chunk(
         summary: Some(body.to_string()),
         body: Some(body.to_string()),
         source_quote: Some(body.to_string()),
+        source_anchors: vec![doc! { "sourceQuote": body }],
         integrity_status: Some("verified".to_string()),
         confidence_score: Some(88),
         status: "active".to_string(),
@@ -322,6 +323,7 @@ fn review_agent_pass_json(
             "relationshipProgress": 7,
             "conversionReadiness": 6,
             "pressureRisk": 2,
+            "boundaryPrivacySafety": 9,
             "factRisk": 1,
         },
         "claimAnalysis": {
