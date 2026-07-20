@@ -1045,6 +1045,8 @@ async fn blocked_relay_preserves_awaiting_and_cancels_task_without_outbox() {
         "给客户的错误转述：verdict=approved",
     ));
     app.llm.push_response(relay_review_pass_json());
+    app.llm
+        .push_response(common::independent_claim_gate_pass_json());
 
     wechatagent::agent::handle_follow_up_task(&app.state, task)
         .await

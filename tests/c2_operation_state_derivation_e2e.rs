@@ -221,12 +221,14 @@ async fn normal_transition_uses_customer_stage_over_operation_state() {
         .expect("insert inbound");
 
     // 知识库为空 → route_operation_knowledge 早返回（0 次 LLM）。
-    // LLM 调用序列：#1 Reply Agent 决策；#2 Review Agent（approved，无 revision）。
+    // LLM 调用序列：#1 Reply Agent；#2 Review Agent；#3 独立 ClaimGate。
     app.llm.push_response(reply_decision_json(
         "relationship_building",
         "need_discovery",
     ));
     app.llm.push_response(review_pass_json());
+    app.llm
+        .push_response(common::independent_claim_gate_pass_json());
 
     let before = app.llm.calls();
     handle_managed_message(&app.state, contact.clone(), &inbound)
@@ -234,8 +236,8 @@ async fn normal_transition_uses_customer_stage_over_operation_state() {
         .expect("handle_managed_message ok");
     assert_eq!(
         app.llm.calls() - before,
-        2,
-        "空知识库 happy path：Reply ×1 + Review ×1 = 2 次 LLM 调用"
+        3,
+        "空知识库 happy path：Reply ×1 + Review ×1 + ClaimGate ×1 = 3 次 LLM 调用"
     );
 
     // [诊断] 打印落库后的 contact 关键字段，定位 customer_stage 是否进了 domain_attributes
@@ -342,10 +344,12 @@ async fn illegal_transition_keeps_old_state_and_audits_failsoft() {
         .await
         .expect("insert inbound");
 
-    // 同样 2 次 LLM 调用；customerStage 取一个从 new_contact 非法的终态 customer_success。
+    // 同样 3 次 LLM 调用；customerStage 取一个从 new_contact 非法的终态 customer_success。
     app.llm
         .push_response(reply_decision_json("customer_success", "need_discovery"));
     app.llm.push_response(review_pass_json());
+    app.llm
+        .push_response(common::independent_claim_gate_pass_json());
 
     let before = app.llm.calls();
     handle_managed_message(&app.state, contact.clone(), &inbound)
@@ -353,8 +357,8 @@ async fn illegal_transition_keeps_old_state_and_audits_failsoft() {
         .expect("handle_managed_message ok（fail-soft：非法迁移不返回 Err）");
     assert_eq!(
         app.llm.calls() - before,
-        2,
-        "Reply ×1 + Review ×1 = 2 次 LLM 调用"
+        3,
+        "Reply ×1 + Review ×1 + ClaimGate ×1 = 3 次 LLM 调用"
     );
 
     // ① fail-soft 跳写：保留旧态 new_contact（既没被非法的 customer_success 覆盖，
@@ -494,6 +498,8 @@ async fn illegal_stage_jump_keeps_old_stage_and_audits_failsoft() {
     app.llm
         .push_response(reply_decision_json("customer_success", "need_discovery"));
     app.llm.push_response(review_pass_json());
+    app.llm
+        .push_response(common::independent_claim_gate_pass_json());
 
     handle_managed_message(&app.state, contact.clone(), &inbound)
         .await
@@ -670,6 +676,8 @@ async fn weak_stage_evidence_drops_to_observation_not_domain_attrs() {
         false,
     ));
     app.llm.push_response(review_pass_json());
+    app.llm
+        .push_response(common::independent_claim_gate_pass_json());
 
     handle_managed_message(&app.state, contact.clone(), &inbound)
         .await
@@ -723,6 +731,8 @@ async fn strong_stage_evidence_writes_domain_attrs_not_observation() {
         true,
     ));
     app.llm.push_response(review_pass_json());
+    app.llm
+        .push_response(common::independent_claim_gate_pass_json());
 
     handle_managed_message(&app.state, contact.clone(), &inbound)
         .await
@@ -795,10 +805,12 @@ async fn audit_write_failure_does_not_drop_reply_failsoft() {
         .expect("insert inbound");
 
     // 非法迁移（new_contact → customer_success）→ 触发 operation_state_transition_rejected
-    // 审计写（被 validator 拒）。2 次 LLM：Reply + Review。
+    // 审计写（被 validator 拒）。3 次 LLM：Reply + Review + ClaimGate。
     app.llm
         .push_response(reply_decision_json("customer_success", "need_discovery"));
     app.llm.push_response(review_pass_json());
+    app.llm
+        .push_response(common::independent_claim_gate_pass_json());
 
     // 不 .expect handle 的返回：本不变量是"回复入队"，与顶层 Result 是否上抛无关，
     // 用 let _ 使断言对修复前/后两种上抛行为都稳健。

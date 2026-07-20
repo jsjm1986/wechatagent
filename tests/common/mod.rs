@@ -88,6 +88,37 @@ impl TestLlmGenerator {
     }
 }
 
+/// 独立语义 ClaimGate 的严格“无需事实证据”响应。
+///
+/// Gateway 在每轮 Review 后都会再调用一次 `user.review.claim_gate`。集成测试必须显式
+/// 排入完整 schema，避免旧的 Reply→Review 两段 fixture 被第三次调用错位消费。
+pub fn independent_claim_gate_pass_json() -> Value {
+    serde_json::json!({
+        "requiresEvidence": false,
+        "claimKinds": [],
+        "hasCatalogClaims": false,
+        "catalogCoverageComplete": true,
+        "hasNonCatalogEvidenceClaims": false,
+        "catalogClaims": [],
+        "reason": "The candidate contains no independently verifiable business claim."
+    })
+}
+
+/// Independent ClaimGate verdict for a capability statement that must be backed by verified
+/// operation knowledge. This fixture is used only where the test has seeded and cited a verified
+/// chunk; it must not be used to bypass evidence checks in generic gateway-flow tests.
+pub fn independent_claim_gate_verified_knowledge_json() -> Value {
+    serde_json::json!({
+        "requiresEvidence": true,
+        "claimKinds": ["product_capability"],
+        "hasCatalogClaims": false,
+        "catalogCoverageComplete": true,
+        "hasNonCatalogEvidenceClaims": true,
+        "catalogClaims": [],
+        "reason": "The candidate asserts a product capability backed by cited verified knowledge."
+    })
+}
+
 #[async_trait]
 impl LlmProvider for TestLlmGenerator {
     async fn generate_json(&self, _system: &str, _user: &str) -> AppResult<Value> {

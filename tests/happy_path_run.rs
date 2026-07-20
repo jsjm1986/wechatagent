@@ -368,21 +368,23 @@ async fn autonomy_full_loop_with_revision() {
         .expect("insert inbound message");
 
     // R2 single-shot revision 完整链路：
-    //   #1 Reply Agent → #2 Review Agent (needs_revision=true)
-    //   → #3 Reply Agent (revised) → #4 Review Agent (pass)
+    //   #1 Reply Agent → #2 Review Agent → #3 ClaimGate
+    //   → #4 Reply Agent (revised) → #5 Review Agent → #6 ClaimGate
     app.llm.push_response(reply_agent_decision_json(
-        "理解你们在做横向对比。我们一般 2~4 周可上线，预算区间和场景深度直接相关，要不要先按你们的优先级排排序？",
+        "理解你们在做横向对比。周期和预算先不急着下结论，我们先把最重要的场景排一下？",
         "客户主动询问实施周期与预算，回复能确认需求颗粒度并降低决策摩擦，是关键推进时机。",
         "not_required",
     ));
     app.llm.push_response(review_agent_pass_json(
         true,
-        "去掉对预算区间的模糊措辞，给出更具体的 2~4 周分阶段交付样例，并明确指出我们不会在此轮强推报价。",
+        "把回复再收敛一些，先承接横向对比，再确认最优先场景；不要给未经核实的周期或报价。",
         "首版语气良好，但预算与交付描述偏笼统，需要按 revisionDirection 修正后再放行。",
     ));
+    app.llm
+        .push_response(common::independent_claim_gate_pass_json());
     app.llm.push_response(reply_agent_decision_json(
-        "理解你们在做横向对比。常见落地节奏是：第 1~2 周梳理流程并接通试点账号，第 3~4 周扩到核心场景，预算我们这轮只做范围确认，等优先级清楚再给报价更稳。",
-        "客户主动询问节奏与预算，按修正方向给出更具体的 2~4 周分阶段交付样例并明确不强推报价，能直接降低对方的决策压力。",
+        "理解，你们在做横向对比。周期和预算先不急着下结论，我们先确定最优先的场景，再按范围往下拆，会更稳。",
+        "客户主动询问节奏与预算，按修正方向先确认优先场景且不输出未经核实的周期或报价，能降低对方的决策压力。",
         "not_required",
     ));
     app.llm.push_response(review_agent_pass_json(
@@ -390,6 +392,8 @@ async fn autonomy_full_loop_with_revision() {
         "",
         "二轮回复已按 revisionDirection 收敛信息密度，不再有笼统措辞，可以放行。",
     ));
+    app.llm
+        .push_response(common::independent_claim_gate_pass_json());
 
     let before_calls = app.llm.calls();
     handle_managed_message(&app.state, contact.clone(), &inbound)
@@ -398,8 +402,8 @@ async fn autonomy_full_loop_with_revision() {
     let after_calls = app.llm.calls();
     assert_eq!(
         after_calls - before_calls,
-        4,
-        "revision happy path: Reply Agent ×2 + Review Agent ×2 = 4 次 LLM 调用"
+        6,
+        "revision happy path: Reply ×2 + Review ×2 + ClaimGate ×2 = 6 次 LLM 调用"
     );
 
     // 断言 agent_run_logs 落入 revision_applied_approved 终态。
@@ -499,8 +503,10 @@ async fn autonomy_tool_loop_happy_path() {
     // LLM 调用序列（agent-first 架构）：
     //   #1 knowledge_agent round1 —— open_chunk 打开上面种入的 chunk；
     //   #2 knowledge_agent round2 —— answer，cite 该 chunk；
-    //   #3 Reply Agent —— 单轮决策（知识路由前置，已携带 agent 命中上下文）；
-    //   #4 Review Agent —— full review，approved 通过。
+    //   #3 Reply Agent Lean 探测 —— 自评需要 Full 业务上下文；
+    //   #4 Reply Agent Full —— 读取已选 verified chunk 后生成最终回复；
+    //   #5 Review Agent —— full review，approved 通过；
+    //   #6 独立 ClaimGate —— 识别能力声明需要证据，由 cited verified chunk 背书。
     app.llm.push_response(json!({
         "action": "open_chunk",
         "ids": [chunk_id.clone()],
@@ -515,6 +521,14 @@ async fn autonomy_tool_loop_happy_path() {
         }],
         "answer": "我们已形成企业 IM 场景的能力清单，覆盖账号纳管、自动应答、手动指令三类核心能力。",
     }));
+    let mut lean_probe = reply_agent_decision_json(
+        "我先核对一下具体能力清单，再给你准确答复。",
+        "客户在问具体产品能力，Lean 档没有业务知识，应先升 Full 读取已选知识。",
+        "required",
+    );
+    lean_probe["sufficiency"] = json!("need_more_context");
+    lean_probe["missingTier"] = json!("full");
+    app.llm.push_response(lean_probe);
     app.llm.push_response(reply_agent_decision_json(
         "我们已经形成了企业 IM 场景下的能力清单，按你们的接入侧重点会优先覆盖账号纳管、自动应答、手动指令三类，要不要我先发一份场景对照？",
         "客户明确询问能力覆盖范围，结合知识库切片给出三类核心能力对照，是把对话推进到具体方案的关键时机。",
@@ -525,6 +539,8 @@ async fn autonomy_tool_loop_happy_path() {
         "",
         "知识路由已扫过 list_catalog/open_chunk/answer，回复未越界做产品承诺，整体可放行。",
     ));
+    app.llm
+        .push_response(common::independent_claim_gate_verified_knowledge_json());
 
     let before_calls = app.llm.calls();
     handle_managed_message(&app.state, contact.clone(), &inbound)
@@ -533,8 +549,8 @@ async fn autonomy_tool_loop_happy_path() {
     let after_calls = app.llm.calls();
     assert_eq!(
         after_calls - before_calls,
-        4,
-        "tool-loop happy path: knowledge_agent ×2（open_chunk + answer）+ Reply ×1 + Review ×1 = 4 次 LLM 调用"
+        6,
+        "tool-loop happy path: knowledge_agent ×2 + Reply Lean/Full ×2 + Review ×1 + ClaimGate ×1 = 6 次 LLM 调用"
     );
 
     let log = app
