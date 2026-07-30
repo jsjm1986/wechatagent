@@ -228,7 +228,7 @@ async fn full_utc_day_bucket_does_not_block_the_next_day() {
             .expect("count midnight tasks"),
         2
     );
-    let mut buckets = app
+    let buckets = app
         .state
         .db
         .raw()
