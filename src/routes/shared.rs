@@ -1405,28 +1405,6 @@ pub(super) fn json_document_any(value: &Value, keys: &[&str]) -> Option<Document
     })
 }
 
-pub(super) fn json_string_vec_any(value: &Value, keys: &[&str]) -> Vec<String> {
-    keys.iter()
-        .find_map(|key| {
-            value.get(*key).and_then(|item| {
-                if let Some(items) = item.as_array() {
-                    Some(
-                        items
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .map(str::trim)
-                            .filter(|text| !text.is_empty())
-                            .map(ToString::to_string)
-                            .collect::<Vec<_>>(),
-                    )
-                } else {
-                    item.as_str().map(|text| vec![text.trim().to_string()])
-                }
-            })
-        })
-        .unwrap_or_default()
-}
-
 pub(super) fn json_string(value: &Value, key: &str) -> Option<String> {
     value
         .get(key)
