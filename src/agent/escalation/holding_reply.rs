@@ -72,6 +72,7 @@ Output strict JSON only:
 
 async fn review_holding_reply(
     state: &AppState,
+    workspace_id: &str,
     account_id: &str,
     contact_wxid: &str,
     run_id: &str,
@@ -85,6 +86,7 @@ async fn review_holding_reply(
     .ok()?;
     let value = crate::agent::generate_agent_json(
         state,
+        workspace_id,
         Some(account_id),
         Some(contact_wxid),
         Some(run_id),
@@ -130,6 +132,7 @@ fn holding_reply_system_prompt(scene: HoldingReplyScene) -> &'static str {
 /// **保证返回非空、经守卫的文案**（客户永不被晾死）。
 pub(crate) async fn generate_holding_reply(
     state: &AppState,
+    workspace_id: &str,
     account_id: &str,
     contact_wxid: &str,
     scene: HoldingReplyScene,
@@ -156,6 +159,7 @@ pub(crate) async fn generate_holding_reply(
         }
         let generated = match crate::agent::generate_agent_json(
             state,
+            workspace_id,
             Some(account_id),
             Some(contact_wxid),
             Some(run_id.as_str()),
@@ -177,9 +181,16 @@ pub(crate) async fn generate_holding_reply(
         if !holding_reply_text_is_safe(&generated, scene, authorized_substance) {
             return None;
         }
-        let verdict =
-            review_holding_reply(state, account_id, contact_wxid, &run_id, scene, &generated)
-                .await?;
+        let verdict = review_holding_reply(
+            state,
+            workspace_id,
+            account_id,
+            contact_wxid,
+            &run_id,
+            scene,
+            &generated,
+        )
+        .await?;
         holding_safety_verdict_allows(&verdict).then_some(generated)
     };
     let generated: Option<String> = RUN_BUDGET.scope(side_budget, gen).await;

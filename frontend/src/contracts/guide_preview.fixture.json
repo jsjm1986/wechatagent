@@ -1,5 +1,7 @@
 {
   "accountId": "acc-1",
+  "authoritativeChanges": [],
+  "candidateHash": "candidate-hash",
   "contactId": "64a1f2c3e4b5a697889b0002",
   "contactWxid": "wxid_abc",
   "createdAt": "2023-11-14T22:13:20Z",
@@ -78,9 +80,11 @@
   "impactScope": "current_contact",
   "instruction": "更关注客户情绪",
   "mode": "tune",
+  "playbookAffectedContacts": 0,
   "readableChanges": [
     "语气更温和"
   ],
+  "requiresStrongConfirmation": false,
   "riskWarnings": [
     "勿过度承诺"
   ],

@@ -73,6 +73,7 @@ async fn list_accounts_never_returns_mcp_key_plaintext() {
         .expect("list_accounts 应成功");
 
     let body = serde_json::to_string(&resp.0).expect("序列化响应失败");
+    app.cleanup().await;
     assert!(
         !body.contains("SECRET_KEY_123"),
         "响应体绝不能含 mcp_api_key 明文(红线): {body}"
@@ -122,14 +123,88 @@ async fn update_mcp_key_blocks_cross_workspace() {
         axum::extract::Path(id_hex),
         Extension(test_admin("other_workspace")),
         axum::Json(
-            serde_json::from_value(serde_json::json!({ "mcpApiKey": "NEW_KEY" }))
-                .expect("构造请求体失败"),
+            serde_json::from_value(serde_json::json!({
+                "expectedAccountId": "acct_a",
+                "mcpApiKey": "NEW_KEY"
+            }))
+            .expect("构造请求体失败"),
         ),
     )
     .await;
 
+    app.cleanup().await;
     assert!(
         result.is_err(),
         "跨 workspace update 必须 NotFound(handler 注入 current_workspace 而非测试自拼 filter)"
+    );
+}
+
+/// 同一 workspace 内，URL ObjectId 与正文冻结账号不一致也必须零写拒绝。
+#[tokio::test]
+#[ignore]
+async fn update_mcp_key_blocks_same_workspace_account_mismatch_without_writing() {
+    let app = TestApp::start().await;
+    let ws = app.state.config.default_workspace_id.clone();
+    let inserted = app
+        .state
+        .db
+        .accounts()
+        .insert_one(make_account_with_key(&ws, "acct_a", "OLD_KEY"), None)
+        .await
+        .expect("seed account");
+    let id = inserted.inserted_id.as_object_id().expect("account id");
+
+    let result = update_account_mcp_key(
+        State(app.state.clone()),
+        axum::extract::Path(id.to_hex()),
+        Extension(test_admin(&ws)),
+        axum::Json(
+            serde_json::from_value(serde_json::json!({
+                "expectedAccountId": "acct_b",
+                "mcpApiKey": "STOLEN_KEY"
+            }))
+            .expect("request"),
+        ),
+    )
+    .await;
+    let stored = app
+        .state
+        .db
+        .accounts()
+        .find_one(mongodb::bson::doc! { "_id": id }, None)
+        .await
+        .expect("read account")
+        .expect("account exists");
+    app.cleanup().await;
+
+    assert!(matches!(
+        result,
+        Err(wechatagent::error::AppError::Conflict(_))
+    ));
+    assert_eq!(stored.mcp_api_key.as_deref(), Some("OLD_KEY"));
+}
+
+/// Webhook routing treats app_id as a global identity. Two account rows must
+/// never be able to claim the same app_id, even across workspaces.
+#[tokio::test]
+#[ignore]
+async fn duplicate_app_id_is_rejected_by_database_constraint() {
+    let app = TestApp::start().await;
+    let first = make_account_with_key("ws_a", "acct_a", "KEY_A");
+    let mut second = make_account_with_key("ws_b", "acct_b", "KEY_B");
+    second.app_id = first.app_id.clone();
+
+    app.state
+        .db
+        .accounts()
+        .insert_one(first, None)
+        .await
+        .expect("first app_id owner should insert");
+    let duplicate = app.state.db.accounts().insert_one(second, None).await;
+
+    app.cleanup().await;
+    assert!(
+        duplicate.is_err(),
+        "duplicate app_id must be rejected instead of routing nondeterministically"
     );
 }

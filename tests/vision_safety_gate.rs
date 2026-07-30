@@ -140,7 +140,7 @@ async fn image_import_with_no_provider_at_all_is_rejected() {
 #[tokio::test]
 #[ignore]
 async fn image_import_with_vision_capable_primary_produces_review_chunks() {
-    let app = TestApp::start().await;
+    let app = TestApp::start_repl_set().await;
     let ws = app.state.config.default_workspace_id.clone();
 
     insert_provider(&app, &provider(&ws, "vision_primary", true, true, false)).await;

@@ -2097,7 +2097,7 @@ async fn q2_article_extraction_quality() {
         // 直调抽取纯函数（经 ext_knowledge 导出）：绕过 handler 大/小文档 job 分流，
         // Q2 只验真模型抽取质量，不涉及异步 job。
         let body = unwrap_or_skip_transient!(
-            run_import_extraction(&state, &req, None).await,
+            run_import_extraction(&state, "default", &req, None).await,
             "Q2 真实文章抽取"
         );
         let chunks = body["chunks"].as_array().cloned().unwrap_or_default();
@@ -2255,7 +2255,7 @@ const Q3_ARTICLE_IMAGE_BASE64: &str = include_str!("fixtures/k6_article_image.b6
 async fn q3_vision_extraction_quality() {
     let mut evidence = CapabilityEvidence::new("q3_vision_quality");
     let _llm = require_real_llm!();
-    let app = TestApp::start().await;
+    let app = TestApp::start_repl_set().await;
     let ws = app.state.config.default_workspace_id.clone();
 
     // vision 链路用**独立** env 三元组：被测文字/裁判端点（kimi @ NVIDIA integrate）
@@ -2752,7 +2752,16 @@ async fn q7_tag_extraction_quality() {
     .expect("构造 ExtractKnowledgeTagsRequest");
 
     let resp = unwrap_or_skip_transient!(
-        extract_operation_knowledge_tags(State(state.clone()), Json(req)).await,
+        extract_operation_knowledge_tags(
+            State(state.clone()),
+            Extension(AuthenticatedAdmin {
+                user_id: "real-llm-knowledge-quality".to_string(),
+                username: "real-llm-knowledge-quality".to_string(),
+                current_workspace: "default".to_string(),
+            }),
+            Json(req),
+        )
+        .await,
         "Q7 真实标签抽取"
     );
     let body = resp.0;

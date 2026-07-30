@@ -18,9 +18,15 @@
 //!   与 worker 跟进任务的两个外部入口；
 //! - `send_contact_message_gateway`：管理 Agent 主动发送的"生产发送网关"。
 
-use std::sync::Arc;
+use std::{
+    panic::AssertUnwindSafe,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 
-use futures::TryStreamExt;
+use futures::{FutureExt, TryStreamExt};
 use mongodb::bson::{doc, oid::ObjectId, to_document, Bson, DateTime, Document};
 use mongodb::options::FindOptions;
 use serde_json::json;
@@ -28,16 +34,17 @@ use serde_json::json;
 use crate::error::{AppError, AppResult};
 use crate::mcp;
 use crate::models::{
-    AgentDecisionReview, AgentEvent, AgentRunLog, AgentStatus, AgentTask, Contact,
-    ConversationMessage, MessageDirection, OperationDomainConfig, OperationPlaybook,
+    AgentDecisionReview, AgentEvent, AgentStatus, AgentTask, Contact, ConversationMessage,
+    MessageDirection, OperationDomainConfig, OperationPlaybook,
 };
 use crate::prompts;
 use crate::routes::AppState;
 
 use super::budget::{current_run_budget, RunBudget, RUN_BUDGET};
 use super::decision::{
-    decide_reply_with_promote, load_operation_playbook_for_contact,
-    load_operation_state_policy_for_contact, load_user_operation_domain_config_for_contact,
+    decide_reply_with_promote, initial_operation_state_for_contact,
+    load_operation_playbook_for_contact, load_operation_state_policy_for_contact,
+    load_user_operation_domain_config_for_contact,
 };
 use super::escalation;
 use super::guards::{
@@ -65,8 +72,9 @@ use super::review::{
 };
 use super::run_envelope::{
     assert_final_review_status_valid, assert_gateway_status_valid, assert_lifecycle_valid,
-    derive_lifecycle_from_status, SOURCE_KIND_FOLLOW_UP_TASK, SOURCE_KIND_INBOUND_MESSAGE,
-    SOURCE_KIND_MANUAL_SEND,
+    derive_lifecycle_from_status, fail_run_envelope_if_open, mark_run_envelope_running,
+    update_run_envelope_terminal, write_run_envelope_started, AgentRunLogTerminalFields,
+    SOURCE_KIND_FOLLOW_UP_TASK, SOURCE_KIND_INBOUND_MESSAGE, SOURCE_KIND_MANUAL_SEND,
 };
 use super::runtime::UserRuntimeParameters;
 use super::taxonomy::{
@@ -173,6 +181,9 @@ pub async fn handle_follow_up_task_with_claim(
         )
         .await;
     }
+    if task.kind == crate::webhooks::DURABLE_INBOUND_REPLY_KIND {
+        return handle_durable_inbound_reply_task(state, task, task_claim).await;
+    }
     let Some(task_id) = task.id else {
         return Ok(());
     };
@@ -200,6 +211,108 @@ pub async fn handle_follow_up_task_with_claim(
     .await
 }
 
+/// Execute a durable webhook handoff with inbound semantics while retaining the
+/// AgentTask claim as the send-authorization fence. The task snapshot stores
+/// the exact persisted conversation message id in `content`; a later inbound
+/// refreshes the same task row, clears the old claim token, and therefore makes
+/// both this cooperative guard and the final Outbox authorization reject the
+/// stale generation.
+async fn handle_durable_inbound_reply_task(
+    state: &AppState,
+    task: AgentTask,
+    task_claim: Option<&crate::tasks::TaskClaim>,
+) -> AppResult<()> {
+    let task_id = task
+        .id
+        .ok_or_else(|| AppError::External("durable inbound task missing _id".to_string()))?;
+    let claim = task_claim.ok_or_else(|| {
+        AppError::External("durable inbound task must execute under a task claim".to_string())
+    })?;
+    let message_id = ObjectId::parse_str(task.content.trim()).map_err(|error| {
+        AppError::External(format!("durable inbound task message id invalid: {error}"))
+    })?;
+    let inbound = state
+        .db
+        .messages()
+        .find_one(
+            doc! {
+                "_id": message_id,
+                "workspace_id": &task.workspace_id,
+                "account_id": &task.account_id,
+                "contact_wxid": &task.contact_wxid,
+                "direction": "inbound",
+            },
+            None,
+        )
+        .await?
+        .ok_or_else(|| AppError::NotFound("durable inbound message not found".to_string()))?;
+    let contact = state
+        .db
+        .contacts()
+        .find_one(
+            doc! {
+                "workspace_id": &task.workspace_id,
+                "account_id": &task.account_id,
+                "wxid": &task.contact_wxid,
+            },
+            None,
+        )
+        .await?
+        .ok_or_else(|| AppError::NotFound("durable inbound contact not found".to_string()))?;
+
+    let claim_lost = Arc::new(AtomicBool::new(false));
+    let monitor_state = state.clone();
+    let monitor_claim = claim.clone();
+    let monitor_flag = claim_lost.clone();
+    let monitor = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(100));
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            match crate::tasks::task_claim_is_current(&monitor_state, &monitor_claim).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    monitor_flag.store(true, Ordering::Release);
+                    return;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        task_id = %monitor_claim.task_id,
+                        %error,
+                        "durable inbound claim monitor query failed"
+                    );
+                }
+            }
+        }
+    });
+
+    // Reaction analysis remains a best-effort side channel, matching the
+    // previous in-process debounce runner. It must never suppress the reply.
+    if let Err(error) = super::reaction::record_user_reaction(state, &contact, &inbound).await {
+        tracing::warn!(
+            task_id = %task_id,
+            contact_wxid = %contact.wxid,
+            %error,
+            "durable inbound reaction analysis failed"
+        );
+    }
+
+    let guard_flag = claim_lost.clone();
+    let guard: Arc<dyn Fn() -> bool + Send + Sync> =
+        Arc::new(move || guard_flag.load(Ordering::Acquire));
+    let task_context = crate::tasks::TaskRunContext::new(task_id, Some(claim));
+    let result = run_user_operation_gateway(
+        state,
+        contact,
+        AgentTrigger::Inbound(&inbound),
+        Some(task_context),
+        Some(guard),
+    )
+    .await;
+    monitor.abort();
+    result
+}
+
 pub async fn send_contact_message_gateway(
     state: &AppState,
     contact: Contact,
@@ -208,7 +321,32 @@ pub async fn send_contact_message_gateway(
     if request.content.trim().is_empty() {
         return Err(AppError::BadRequest("content is required".to_string()));
     }
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let source_event_id = format!("manual:{run_id}");
+    write_run_envelope_started(
+        &state.db,
+        &run_id,
+        &contact.workspace_id,
+        &contact.account_id,
+        Some(&contact.wxid),
+        &source_event_id,
+        SOURCE_KIND_MANUAL_SEND,
+        SOURCE_KIND_MANUAL_SEND,
+    )
+    .await?;
+
+    let execution = send_contact_message_gateway_inner(state, contact, request, run_id.clone());
+    settle_gateway_execution(state, &run_id, execution).await
+}
+
+async fn send_contact_message_gateway_inner(
+    state: &AppState,
+    contact: Contact,
+    request: ManualContactSend,
+    run_id: String,
+) -> AppResult<ContactSendResult> {
     let content = request.content.trim().to_string();
+    let source_event_id = format!("manual:{run_id}");
     let domain_config =
         load_user_operation_domain_config_for_contact(state, &contact.workspace_id, &contact.wxid)
             .await?;
@@ -234,7 +372,6 @@ pub async fn send_contact_message_gateway(
         created_at: DateTime::now(),
     };
     let trigger = AgentTrigger::Inbound(&synthetic_inbound);
-    let run_id = uuid::Uuid::new_v4().to_string();
     let planner = RunPlannerResult {
         risk_level: "high".to_string(),
         context_needs_refresh: true,
@@ -249,12 +386,30 @@ pub async fn send_contact_message_gateway(
     if !precheck.allowed {
         write_event_for_account(
             state,
+            &contact.workspace_id,
             &contact.account_id,
             Some(&contact.wxid),
             "send_gateway_blocked",
             &precheck.status,
             &precheck.reason,
             Some(to_document(&precheck).unwrap_or_default()),
+        )
+        .await?;
+        write_agent_run_log(
+            state,
+            &contact,
+            &run_id,
+            SOURCE_KIND_MANUAL_SEND,
+            &precheck.status,
+            &planner,
+            doc! { "refreshed": false, "reason": "manual_precheck_blocked" },
+            &KnowledgeRouteResult::default(),
+            Document::new(),
+            Document::new(),
+            to_document(&precheck).unwrap_or_default(),
+            None,
+            &source_event_id,
+            SOURCE_KIND_MANUAL_SEND,
         )
         .await?;
         return Err(AppError::BadRequest(precheck.reason));
@@ -296,6 +451,12 @@ pub async fn send_contact_message_gateway(
         },
         ..Default::default()
     };
+    mark_run_envelope_running(
+        &state.db,
+        &run_id,
+        to_document(&decision).unwrap_or_default(),
+    )
+    .await?;
     let mut review = review_decision(
         state,
         &contact,
@@ -315,7 +476,7 @@ pub async fn send_contact_message_gateway(
     .await?;
     let active_profile =
         crate::agent::domain_profile::load_active_domain_profile(&state.db, &contact.workspace_id)
-            .await;
+            .await?;
     let active_products = if active_profile.transaction_facts_enabled {
         super::entitlements::load_active_products(&state.db, &contact.workspace_id).await
     } else {
@@ -354,11 +515,22 @@ pub async fn send_contact_message_gateway(
     );
     let FinalizeOutcome {
         review: finalized_review,
-        status: finalize_status,
+        status: mut finalize_status,
         pending_events,
     } = outcome;
-    let review = finalized_review;
+    let mut review = finalized_review;
     persist_finalize_pending_events(state, &contact, &pending_events).await?;
+    if matches!(finalize_status, GatewayStatusFinal::Approved) {
+        apply_state_action_gate(
+            state,
+            &contact,
+            &mut decision,
+            &mut review,
+            &mut finalize_status,
+            &run_id,
+        )
+        .await?;
+    }
     let passed =
         matches!(finalize_status, GatewayStatusFinal::Approved) && review_passed(&review, &runtime);
     if !passed {
@@ -390,12 +562,38 @@ pub async fn send_contact_message_gateway(
         .await?;
         write_event_for_account(
             state,
+            &contact.workspace_id,
             &contact.account_id,
             Some(&contact.wxid),
             "blocked_review",
             &blocked_status,
             "生产发送网关安全门未通过，已拦截私聊发送",
             Some(review_event_details(&review)),
+        )
+        .await?;
+        write_agent_run_log_with_finalize(
+            state,
+            &contact,
+            &run_id,
+            SOURCE_KIND_MANUAL_SEND,
+            &blocked_status,
+            &planner,
+            context_pack.clone(),
+            &knowledge_route,
+            to_document(&decision).unwrap_or_default(),
+            to_document(&review).unwrap_or_default(),
+            to_document(&blocked_result).unwrap_or_default(),
+            None,
+            FinalizeRunLogFields {
+                final_review_status: review.final_review_status.clone(),
+                autonomy_mode: decision.autonomy_mode.clone(),
+                conversation_mode: decision.conversation_mode.clone(),
+                conversation_mode_reason: decision.conversation_mode_reason.clone(),
+                self_critique: non_empty_option(&Some(decision.self_critique.clone())),
+                source_event_id: source_event_id.clone(),
+                source_kind: SOURCE_KIND_MANUAL_SEND.to_string(),
+                ..FinalizeRunLogFields::default()
+            },
         )
         .await?;
         return Ok(ContactSendResult {
@@ -425,6 +623,31 @@ pub async fn send_contact_message_gateway(
             &knowledge_route,
             &run_id,
             &planner,
+        )
+        .await?;
+        write_agent_run_log_with_finalize(
+            state,
+            &contact,
+            &run_id,
+            SOURCE_KIND_MANUAL_SEND,
+            "gateway_blocked",
+            &planner,
+            context_pack.clone(),
+            &knowledge_route,
+            to_document(&decision).unwrap_or_default(),
+            to_document(&review).unwrap_or_default(),
+            to_document(&final_precheck).unwrap_or_default(),
+            None,
+            FinalizeRunLogFields {
+                final_review_status: review.final_review_status.clone(),
+                autonomy_mode: decision.autonomy_mode.clone(),
+                conversation_mode: decision.conversation_mode.clone(),
+                conversation_mode_reason: decision.conversation_mode_reason.clone(),
+                self_critique: non_empty_option(&Some(decision.self_critique.clone())),
+                source_event_id: source_event_id.clone(),
+                source_kind: SOURCE_KIND_MANUAL_SEND.to_string(),
+                ..FinalizeRunLogFields::default()
+            },
         )
         .await?;
         return Ok(ContactSendResult {
@@ -487,7 +710,7 @@ pub async fn send_contact_message_gateway(
             conversation_mode: decision.conversation_mode.clone(),
             conversation_mode_reason: decision.conversation_mode_reason.clone(),
             self_critique: non_empty_option(&Some(decision.self_critique.clone())),
-            source_event_id: format!("manual:{run_id}"),
+            source_event_id: source_event_id.clone(),
             source_kind: SOURCE_KIND_MANUAL_SEND.to_string(),
             ..FinalizeRunLogFields::default()
         },
@@ -601,6 +824,7 @@ pub async fn send_contact_message_gateway(
 
     write_event_for_account(
         state,
+        &contact.workspace_id,
         &contact.account_id,
         Some(&contact.wxid),
         "management_send",
@@ -671,6 +895,7 @@ async fn maybe_handle_non_text_transition(
     state: &AppState,
     contact: &Contact,
     trigger: &AgentTrigger<'_>,
+    task_context: Option<&crate::tasks::TaskRunContext>,
     run_id: &str,
     source_event_id: &str,
     source_kind: &str,
@@ -703,12 +928,86 @@ async fn maybe_handle_non_text_transition(
     }
 
     let reply = multimodal::non_text_transition_reply(&msg_type);
+    // Durable inbound tasks must never create an unbound Outbox row. Persist a
+    // minimal review and bind it to the current claim before enqueueing; the
+    // dispatcher then applies the same task-token fence as the normal reply
+    // path. Non-task callers keep the historical decision-less behavior.
+    let decision_id = if let Some(task_context) = task_context {
+        let claim = task_context.claim.as_ref().ok_or_else(|| {
+            AppError::External(
+                "task-backed non-text transition requires an owned claim".to_string(),
+            )
+        })?;
+        let decision_id = state
+            .db
+            .decision_reviews()
+            .insert_one(
+                AgentDecisionReview {
+                    id: None,
+                    workspace_id: contact.workspace_id.clone(),
+                    account_id: contact.account_id.clone(),
+                    contact_wxid: Some(contact.wxid.clone()),
+                    run_id: Some(run_id.to_string()),
+                    inbound_message_id: inbound.message_id.clone(),
+                    reply_text: Some(reply.clone()),
+                    approved: true,
+                    scores: Document::new(),
+                    formula_breakdown: Document::new(),
+                    risks: Vec::new(),
+                    rewrite_instruction: None,
+                    review_summary: Some("非文本入站过渡话术（确定性系统回复）".to_string()),
+                    playbook_id: None,
+                    playbook_version: None,
+                    used_knowledge_ids: Vec::new(),
+                    prompt_versions: Document::new(),
+                    operation_state: contact.operation_state.clone(),
+                    next_best_action: Document::new(),
+                    context_pack_snapshot: doc! { "msgType": &msg_type },
+                    domain_config_snapshot: Document::new(),
+                    runtime_parameters_snapshot: Document::new(),
+                    send_gateway_result: doc! { "allowed": true, "status": "outbox_enqueuing" },
+                    outcome_status: Some("pending".to_string()),
+                    reaction_analysis: Document::new(),
+                    reaction_claimed_at: None,
+                    reaction_claim_token: None,
+                    reaction_claim_generation: 0,
+                    source_task_id: None,
+                    source_task_claim_token: None,
+                    reviewer_misjudge_signal: None,
+                    expected_text_segments: 1,
+                    status: "outbox_enqueuing".to_string(),
+                    created_at: DateTime::now(),
+                },
+                None,
+            )
+            .await?
+            .inserted_id
+            .as_object_id()
+            .ok_or_else(|| {
+                AppError::External("non-text transition review id missing".to_string())
+            })?;
+        if !crate::tasks::bind_task_decision_if_owned(state, claim, decision_id).await? {
+            state
+                .db
+                .decision_reviews()
+                .update_one(
+                    doc! { "_id": decision_id },
+                    doc! { "$set": { "status": "stale_task_claim" } },
+                    None,
+                )
+                .await?;
+            return Ok(true);
+        }
+        Some(decision_id)
+    } else {
+        None
+    };
     let enqueue_req = EnqueueRequest {
         workspace_id: contact.workspace_id.clone(),
         account_id: contact.account_id.clone(),
         contact_wxid: contact.wxid.clone(),
         run_id: run_id.to_string(),
-        decision_id: None,
+        decision_id,
         source_event_id: source_event_id.to_string(),
         source_kind: source_kind.to_string(),
         content: reply.clone(),
@@ -716,26 +1015,50 @@ async fn maybe_handle_non_text_transition(
         referral_card_id: None,
         max_attempts: 3,
     };
+    let mut enqueue_covers_decision = false;
     let enqueue_status = match outbox_enqueue(state, enqueue_req).await {
         Ok(EnqueueOutcome::Created { outbox_id, .. }) => {
+            enqueue_covers_decision = true;
             tracing::info!(%run_id, %outbox_id, contact_wxid = %contact.wxid, %msg_type,
                 "F2: 非文本入站过渡话术已入队 outbox");
             "outbox_enqueued"
         }
         Ok(EnqueueOutcome::IdempotentSkip {
             idempotency_key,
+            existing_outbox_id,
             existing_run_id,
+            existing_decision_id,
             existing_status,
             ..
         }) => {
             tracing::info!(%run_id, %idempotency_key, contact_wxid = %contact.wxid, %msg_type,
                 "F2: 非文本入站过渡话术 outbox 幂等 skip");
-            if existing_run_id == run_id
-                && matches!(
-                    existing_status.as_str(),
-                    "pending" | "in_flight" | "sent" | "delivery_unknown"
+            let adopted = if let (Some(new_decision_id), Some(old_decision_id), Some(claim)) = (
+                decision_id,
+                existing_decision_id,
+                task_context.and_then(|context| context.claim.as_ref()),
+            ) {
+                crate::tasks::adopt_recoverable_durable_outbox_if_owned(
+                    state,
+                    claim,
+                    new_decision_id,
+                    run_id,
+                    existing_outbox_id,
+                    old_decision_id,
                 )
+                .await?
+            } else {
+                false
+            };
+            if adopted
+                || (existing_run_id == run_id
+                    && (decision_id.is_none() || existing_decision_id == decision_id)
+                    && matches!(
+                        existing_status.as_str(),
+                        "pending" | "in_flight" | "sent" | "delivery_unknown"
+                    ))
             {
+                enqueue_covers_decision = true;
                 "outbox_enqueued"
             } else {
                 "skipped_duplicate"
@@ -747,8 +1070,32 @@ async fn maybe_handle_non_text_transition(
         }
     };
 
+    if let (Some(task_context), Some(decision_id)) = (task_context, decision_id) {
+        let claim = task_context.claim.as_ref().expect("claim checked above");
+        let authorized = enqueue_covers_decision
+            && crate::tasks::authorize_task_outbox_if_owned(state, claim, decision_id).await?;
+        let review_status = if authorized {
+            "outbox_enqueued"
+        } else {
+            "stale_task_claim"
+        };
+        state
+            .db
+            .decision_reviews()
+            .update_one(
+                doc! { "_id": decision_id, "status": "outbox_enqueuing" },
+                doc! { "$set": { "status": review_status } },
+                None,
+            )
+            .await?;
+        if !authorized {
+            return Ok(true);
+        }
+    }
+
     write_event_for_account(
         state,
+        &contact.workspace_id,
         &contact.account_id,
         Some(&contact.wxid),
         "non_text_inbound_transition",
@@ -791,43 +1138,98 @@ pub(crate) async fn run_user_operation_gateway(
     should_abort_send: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 ) -> AppResult<()> {
     let run_id = uuid::Uuid::new_v4().to_string();
-    let inbound = trigger_message(&contact, &trigger);
-    let domain_config =
-        load_user_operation_domain_config_for_contact(state, &contact.workspace_id, &contact.wxid)
-            .await?;
-    let mut runtime = UserRuntimeParameters::from_config(domain_config.as_ref(), state);
-    // M4 W4 Task 5.1：通过 resolve_thresholds 把 threshold_overrides 的最新生效值
-    // 写回 runtime，让 5 闸 block/rewrite 阈值即时反映 release，无需重启进程。
-    crate::agent::runtime::resolve_thresholds(state, &contact)
-        .await?
-        .apply_to_runtime(&mut runtime);
+    let (source_event_id, source_kind) = trigger_envelope_source(&trigger);
+    let trigger_kind = trigger.kind().to_string();
+    write_run_envelope_started(
+        &state.db,
+        &run_id,
+        &contact.workspace_id,
+        &contact.account_id,
+        Some(&contact.wxid),
+        &source_event_id,
+        source_kind,
+        &trigger_kind,
+    )
+    .await?;
 
-    // MP-5 / Task 15：为本次 run 构建 budget，并通过 task_local 注入。
-    // agent-autonomy-loop W3 / Task 4.1：从 runtime_parameters.knowledgeMaxToolCalls
-    // 注入 tool_call_budget（loader 已 clamp 到 [1, 16]，默认 6）。
-    let budget = Arc::new(RunBudget::new(
-        run_id.clone(),
-        runtime.run_token_budget,
-        runtime.run_max_llm_calls,
-        runtime.knowledge_max_tool_calls,
-    ));
-
-    RUN_BUDGET
-        .scope(
-            budget,
-            run_user_operation_gateway_inner(
-                state,
-                contact,
-                trigger,
-                task_context,
-                run_id,
-                inbound,
-                domain_config,
-                runtime,
-                should_abort_send,
-            ),
+    let execution = async {
+        let inbound = trigger_message(&contact, &trigger);
+        let domain_config = load_user_operation_domain_config_for_contact(
+            state,
+            &contact.workspace_id,
+            &contact.wxid,
         )
-        .await
+        .await?;
+        let mut runtime = UserRuntimeParameters::from_config(domain_config.as_ref(), state);
+        // M4 W4 Task 5.1：通过 resolve_thresholds 把 threshold_overrides 的最新生效值
+        // 写回 runtime，让 5 闸 block/rewrite 阈值即时反映 release，无需重启进程。
+        crate::agent::runtime::resolve_thresholds(state, &contact)
+            .await?
+            .apply_to_runtime(&mut runtime);
+
+        // MP-5 / Task 15：为本次 run 构建 budget，并通过 task_local 注入。
+        let budget = Arc::new(RunBudget::new(
+            run_id.clone(),
+            runtime.run_token_budget,
+            runtime.run_max_llm_calls,
+            runtime.knowledge_max_tool_calls,
+        ));
+        RUN_BUDGET
+            .scope(
+                budget,
+                run_user_operation_gateway_inner(
+                    state,
+                    contact,
+                    trigger,
+                    task_context,
+                    run_id.clone(),
+                    inbound,
+                    domain_config,
+                    runtime,
+                    should_abort_send,
+                ),
+            )
+            .await
+    };
+    settle_gateway_execution(state, &run_id, execution).await
+}
+
+async fn settle_gateway_execution<T, F>(
+    state: &AppState,
+    run_id: &str,
+    execution: F,
+) -> AppResult<T>
+where
+    F: std::future::Future<Output = AppResult<T>>,
+{
+    match AssertUnwindSafe(execution).catch_unwind().await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => {
+            let summary = format!("gateway_error: {error}");
+            if let Err(audit_error) = fail_run_envelope_if_open(&state.db, run_id, &summary).await {
+                tracing::error!(%run_id, error = %audit_error, "failed to close errored run envelope");
+            }
+            Err(error)
+        }
+        Err(payload) => {
+            let panic_message = panic_payload_message(payload.as_ref());
+            let summary = format!("unhandled_panic: {panic_message}");
+            if let Err(audit_error) = fail_run_envelope_if_open(&state.db, run_id, &summary).await {
+                tracing::error!(%run_id, error = %audit_error, "failed to close panicked run envelope");
+            }
+            std::panic::resume_unwind(payload)
+        }
+    }
+}
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
 }
 
 /// decision Agent emit 了 escalation_request 时，在 approved 发送路径末尾调用。
@@ -851,10 +1253,16 @@ pub(crate) async fn trigger_principal_escalation(
         return Ok(()); // 无 config = 请示通道未配置
     };
     let policy = escalation::resolve_ask_human_policy(&cfg);
-    let Some(decider) = policy.decider_chain.first() else {
+    let frozen_policy = escalation::freeze_ask_human_policy(&policy, &contact.account_id);
+    let Some(decider) = frozen_policy.decider_chain.first() else {
         return Ok(()); // 决策人链空 = 本 workspace 未启用请示通道
     };
     let principal_wxid = decider.wxid.clone();
+    let principal_account_id = decider
+        .account_id
+        .as_deref()
+        .ok_or_else(|| AppError::BadRequest("决策人缺少发送账号".into()))?
+        .to_string();
     if principal_wxid == contact.wxid {
         return Err(AppError::BadRequest(
             "决策人配置等于客户 wxid，拒绝触发请示".into(),
@@ -880,13 +1288,25 @@ pub(crate) async fn trigger_principal_escalation(
         return Ok(());
     }
     // 去重：同客户同类别已有 pending → 不重复推卡。
-    if escalation::has_pending_for_contact(state, &contact.workspace_id, &contact.wxid, &category)
-        .await?
+    if escalation::has_pending_for_contact(
+        state,
+        &contact.workspace_id,
+        &contact.account_id,
+        &contact.wxid,
+        &category,
+    )
+    .await?
     {
         return Ok(());
     }
     let reason = req.reason.clone().unwrap_or_default();
     let question = req.question_for_principal.clone().unwrap_or_default();
+    let customer_label = contact
+        .remark
+        .clone()
+        .or_else(|| contact.nickname.clone())
+        .or_else(|| contact.alias.clone())
+        .unwrap_or_else(|| contact.wxid.clone());
     let Some(entry) = escalation::insert_pending_escalation(
         state,
         &contact.workspace_id,
@@ -897,27 +1317,17 @@ pub(crate) async fn trigger_principal_escalation(
         &question,
         &principal_wxid,
         req.is_generalizable,
+        &cfg,
+        frozen_policy,
+        &principal_account_id,
+        &customer_label,
     )
     .await?
     else {
         // 并发已插入同客户同类别 pending（pending 去重索引兜住）→ 不重复推卡。
         return Ok(());
     };
-    let customer_label = contact
-        .remark
-        .clone()
-        .or_else(|| contact.nickname.clone())
-        .or_else(|| contact.alias.clone())
-        .unwrap_or_else(|| contact.wxid.clone());
-    let card =
-        escalation::render_principal_card(&entry.short_code, &customer_label, &reason, &question);
-    mcp::logged_call_for_account(
-        state,
-        &contact.account_id,
-        "message_send_text",
-        serde_json::json!({ "recipient": principal_wxid, "content": card }),
-    )
-    .await?;
+    escalation::materialize_principal_card_delivery(state, &entry).await?;
     Ok(())
 }
 
@@ -958,7 +1368,7 @@ pub(crate) async fn relay_principal_decision_to_customer(
         );
         // 落库：$set 点号子键，不整体覆盖 domain_attributes（与既有 stage / value_tier 写法一致，
         // 不会被 relay 内部各自的点号写入互相 clobber）。这一步须成功——失败则本轮放行落空，
-        // 故用 `?`（与紧随其后的 clear_awaiting_principal_state 同级）。
+        // 故用 `?`，确保授权写入失败时本轮转述不会被误认为已完成。
         state
             .db
             .contacts()
@@ -985,6 +1395,7 @@ pub(crate) async fn relay_principal_decision_to_customer(
         // fail-soft 审计（写事件失败不阻断放行）。
         let _ = write_event_for_account(
             state,
+            &contact.workspace_id,
             &contact.account_id,
             Some(&contact.wxid),
             "contact.principal_exemption_granted",
@@ -1011,17 +1422,12 @@ pub(crate) async fn relay_principal_decision_to_customer(
     .await?;
     // awaiting 只能在 dispatcher 确认 relay 文本真实送达后清除。gateway 返回 Ok
     // 仅表示决策链执行完毕；安全门拦截或 outbox 尚 pending 都不等于客户已收到裁决。
-    // B 类知识沉淀 / 旧 draft 提案二选一（互斥），都受 !knowledge_proposal_emitted 防重复：
-    // - exemption_type == knowledge：领导授权把该说法沉淀成全体可复用的 verified 知识（B 类，
-    //   是 A 类豁免的超集：先即时放行该客户，再沉淀给全体）；由 exemption_type 驱动，绕过
-    //   is_generalizable 门（授权即沉淀），走 sediment_principal_authorized_knowledge。
-    // - 其余可泛化裁决（exemption_type=none/customer_only 且 is_generalizable）：保持既有 draft
-    //   知识缺口提案行为不动（YAGNI，最小改动，只把 knowledge 类改走 verified 沉淀）。
+    // 领导裁决可授权本次客户转述，但不等同于知识库复核。任何可复用沉淀都只能进入
+    // draft + needs_review；即使 exemption_type=knowledge，也不得直接生成 verified 知识。
     if verdict_authorizes && !entry.knowledge_proposal_emitted {
-        let did_emit = if decision.exemption_type == crate::models::EXEMPTION_TYPE_KNOWLEDGE {
-            escalation::sediment_principal_authorized_knowledge(state, entry, decision).await?;
-            true
-        } else if entry.is_generalizable {
+        let did_emit = if decision.exemption_type == crate::models::EXEMPTION_TYPE_KNOWLEDGE
+            || entry.is_generalizable
+        {
             escalation::emit_knowledge_gap_proposal(state, entry, decision).await?;
             true
         } else {
@@ -1032,35 +1438,18 @@ pub(crate) async fn relay_principal_decision_to_customer(
                 .db
                 .agent_principal_escalations()
                 .update_one(
-                    doc! { "short_code": &entry.short_code },
+                    doc! {
+                        "_id": entry.id,
+                        "workspace_id": &entry.workspace_id,
+                        "account_id": &entry.account_id,
+                        "short_code": &entry.short_code,
+                    },
                     doc! { "$set": { "knowledge_proposal_emitted": true } },
                     None,
                 )
                 .await?;
         }
     }
-    Ok(())
-}
-
-/// 清掉客户 state 上的"等待领导决策"标记（key 用 AWAITING_PRINCIPAL_DECISION_ATTR 常量）。
-/// `pub(crate)`：escalation 模块授权过期早退分支也需清此标记，避免 awaiting 永久残留。
-pub(crate) async fn clear_awaiting_principal_state(
-    state: &AppState,
-    contact: &Contact,
-) -> AppResult<()> {
-    let unset_key = format!(
-        "domain_attributes.{}",
-        crate::models::AWAITING_PRINCIPAL_DECISION_ATTR
-    );
-    state
-        .db
-        .contacts()
-        .update_one(
-            doc! { "workspace_id": &contact.workspace_id, "account_id": &contact.account_id, "wxid": &contact.wxid },
-            doc! { "$unset": { unset_key: "" } },
-            None,
-        )
-        .await?;
     Ok(())
 }
 
@@ -1100,8 +1489,8 @@ pub(crate) fn should_run_send(outbox_eligible: bool, media_pending: bool) -> boo
 ///
 /// 初次 finalize 与 single-shot revision 后各调一次:revision 会整条替换
 /// `final_decision`,可能把 `operation_state` 迁到禁止 reply 的态,故必须对改写后的
-/// decision 复检,否则绕过。老库无 `operation_state_policies` 行 →
-/// `enforce_state_action_policy(None, _)` fallthrough(向前兼容),不会绕过 outbox。
+/// decision 复检,否则绕过。完全没有 current 状态机的老库仍兼容 fallthrough；一旦
+/// workspace 已有 current 状态机，缺失/非 active policy 由 loader fail closed。
 #[allow(clippy::too_many_arguments)]
 async fn apply_state_action_gate(
     state: &AppState,
@@ -1111,10 +1500,28 @@ async fn apply_state_action_gate(
     finalize_status: &mut GatewayStatusFinal,
     run_id: &str,
 ) -> AppResult<()> {
+    let operation_state = final_decision
+        .operation_state
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            contact
+                .operation_state
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        });
+    let operation_state = match operation_state {
+        Some(value) => value,
+        None => initial_operation_state_for_contact(state, contact).await?,
+    };
     let policy_opt = load_operation_state_policy_for_contact(
         state,
         &contact.workspace_id,
-        final_decision.operation_state.as_deref().unwrap_or(""),
+        &operation_state,
         &contact.wxid,
     )
     .await?;
@@ -1134,6 +1541,7 @@ async fn apply_state_action_gate(
         *finalize_status = GatewayStatusFinal::Held("held_by_ai_policy".to_string());
         write_event_for_account(
             state,
+            &contact.workspace_id,
             &contact.account_id,
             Some(&contact.wxid),
             "state_action_policy_blocked",
@@ -1142,10 +1550,7 @@ async fn apply_state_action_gate(
             Some(doc! {
                 "run_id": run_id,
                 "action": action,
-                "operation_state": final_decision
-                    .operation_state
-                    .clone()
-                    .unwrap_or_default(),
+                "operation_state": &operation_state,
                 "reason": reason.clone(),
             }),
         )
@@ -1170,9 +1575,24 @@ async fn ensure_customer_acknowledged(
     trigger_kind: &str,
     source_event_id: &str,
     status: &str,
+    task_context: Option<&crate::tasks::TaskRunContext>,
     should_abort_send: &Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 ) {
     if !should_send_ack_placeholder(trigger_kind, status) {
+        return;
+    }
+    // Task-backed sends require a decision binding and a live claim token.
+    // These call sites run only after the task has already been cancelled or
+    // rescheduled by the blocking gate, so a placeholder cannot be authorized
+    // safely. Fail closed instead of enqueueing decision_id=None and bypassing
+    // dispatcher fencing.
+    if task_context.is_some() {
+        tracing::info!(
+            %run_id,
+            contact_wxid = %contact.wxid,
+            %status,
+            "客户回应保障占位跳过：task 路径已失去可提交发送授权的 running claim"
+        );
         return;
     }
     if let Some(guard) = should_abort_send {
@@ -1187,6 +1607,7 @@ async fn ensure_customer_acknowledged(
     }
     let holding_text = escalation::generate_holding_reply(
         state,
+        &contact.workspace_id,
         &contact.account_id,
         &contact.wxid,
         escalation::HoldingReplyScene::GateHold,
@@ -1282,6 +1703,7 @@ async fn run_user_operation_gateway_inner(
         }
         write_event_for_account(
             state,
+            &contact.workspace_id,
             &contact.account_id,
             Some(&contact.wxid),
             "agent_skipped",
@@ -1314,6 +1736,7 @@ async fn run_user_operation_gateway_inner(
             trigger.kind(),
             &envelope_source_event_id,
             &precheck.status,
+            task_context.as_ref(),
             &should_abort_send,
         )
         .await;
@@ -1329,6 +1752,7 @@ async fn run_user_operation_gateway_inner(
         state,
         &contact,
         &trigger,
+        task_context.as_ref(),
         &run_id,
         &envelope_source_event_id,
         &envelope_source_kind,
@@ -1346,7 +1770,7 @@ async fn run_user_operation_gateway_inner(
     // 词表逐字复刻 guards const、bypass=false → 行为字节等价。
     let active_profile =
         crate::agent::domain_profile::load_active_domain_profile(&state.db, &contact.workspace_id)
-            .await;
+            .await?;
     // universal-domain-adaptation 第 78 点：用单一入口 apply_active_profile 把 active
     // profile 的运行期价值开关（H14 grounding bypass + reviewer distrust + M2 五闸阈值
     // 覆盖）一次性派生进 runtime，替代此处散落的手工赋值。DEFAULT 销售 profile →
@@ -1440,6 +1864,12 @@ async fn run_user_operation_gateway_inner(
         first_pass_tier,
     )
     .await?;
+    mark_run_envelope_running(
+        &state.db,
+        &run_id,
+        to_document(&decision_first).unwrap_or_default(),
+    )
+    .await?;
 
     // 充分性自评判定：决定直接进闸 / 升档第二程 / 澄清。
     let tier_decision = crate::agent::sufficiency::decide_tier_escalation(&decision_first);
@@ -1464,6 +1894,7 @@ async fn run_user_operation_gateway_inner(
     if !crate::agent::sufficiency::is_sufficiency_recognized(&decision_first) {
         write_event_for_account(
             state,
+            &contact.workspace_id,
             &contact.account_id,
             Some(&contact.wxid),
             "ptier_self_assessment_malformed",
@@ -1490,6 +1921,7 @@ async fn run_user_operation_gateway_inner(
                 forced_full = true;
                 write_event_for_account(
                     state,
+                    &contact.workspace_id,
                     &contact.account_id,
                     Some(&contact.wxid),
                     "ptier_forced_full",
@@ -1536,6 +1968,7 @@ async fn run_user_operation_gateway_inner(
                 ) {
                     write_event_for_account(
                         state,
+                        &contact.workspace_id,
                         &contact.account_id,
                         Some(&contact.wxid),
                         "ptier_coverage_optimism",
@@ -1555,6 +1988,7 @@ async fn run_user_operation_gateway_inner(
                 if decision_first.sufficiency == "enough" && !contact.intent_trajectory.is_empty() {
                     write_event_for_account(
                         state,
+                        &contact.workspace_id,
                         &contact.account_id,
                         Some(&contact.wxid),
                         "ptier_relational_optimism",
@@ -1576,6 +2010,7 @@ async fn run_user_operation_gateway_inner(
             // 成本翻倍，但只在 need_more_context 时发生，符合设计预期。
             write_event_for_account(
                 state,
+                &contact.workspace_id,
                 &contact.account_id,
                 Some(&contact.wxid),
                 "ptier_escalated",
@@ -1624,6 +2059,7 @@ async fn run_user_operation_gateway_inner(
                 decision_first.reply_text.contains('?') || decision_first.reply_text.contains('？');
             write_event_for_account(
                 state,
+                &contact.workspace_id,
                 &contact.account_id,
                 Some(&contact.wxid),
                 "ptier_clarify",
@@ -1651,6 +2087,7 @@ async fn run_user_operation_gateway_inner(
     };
     write_event_for_account(
         state,
+        &contact.workspace_id,
         &contact.account_id,
         Some(&contact.wxid),
         "ptier_run_tier",
@@ -1675,6 +2112,7 @@ async fn run_user_operation_gateway_inner(
     if decision.decision_phase == "tool_calling" {
         write_event_for_account(
             state,
+            &contact.workspace_id,
             &contact.account_id,
             Some(&contact.wxid),
             "decision_phase_tool_calling_in_single_shot",
@@ -1740,6 +2178,7 @@ async fn run_user_operation_gateway_inner(
         }
         write_event_for_account(
             state,
+            &contact.workspace_id,
             &contact.account_id,
             Some(&contact.wxid),
             "run_budget_exceeded",
@@ -1789,6 +2228,7 @@ async fn run_user_operation_gateway_inner(
             }
             write_event_for_account(
                 state,
+                &contact.workspace_id,
                 &contact.account_id,
                 Some(&contact.wxid),
                 "run_budget_exceeded",
@@ -1873,12 +2313,11 @@ async fn run_user_operation_gateway_inner(
     // 并产出待写 `agent_events`（由 [`persist_finalize_pending_events`] 持久化）。
     // 任何上游 `approved=true` SHALL NOT 绕过本调用（详见 design.md §4.5 / N3）。
     // 客观购买事实增强 G2（spec §5.4）：R5.4 priced_from_catalog 并联背书。
-    // 加载本 workspace active 产品（IDOR：只取本 workspace），判定本轮 decision 报价
-    // 引用的 product_id 是否命中 active 目录 → 与 verified_chunks 取或，避免 G2 准确
-    // 报价被 blocked_unverified_product_claim 错杀。零扰动：产品表空 → 恒假。
+    // 加载本 workspace active 产品（IDOR：只取本 workspace）；独立 ClaimGate 从最终
+    // 正文逐 clause 提取目录事实并给出精确 sourceQuote，服务端再逐字段及反向覆盖核验。
+    // Reply 自报 quoted_product_ids 不参与授权。产品表空 → 恒假。
     // G4 #5 收口：报价背书是交易事实的一种消费，统一受 transaction_facts_enabled 闸。
-    // 非交易域（情感陪伴）即便误配产品表 + LLM 幻觉 quoted_product_ids，也不放行报价
-    // 豁免（方向更严格、安全）。DEFAULT 销售域 = true → 报价背书行为字节等价。
+    // 非交易域（情感陪伴）即便误配产品表也不启用目录背书（方向更严格、安全）。
     let active_products = if active_profile.transaction_facts_enabled {
         super::entitlements::load_active_products(&state.db, &contact.workspace_id).await
     } else {
@@ -1945,9 +2384,9 @@ async fn run_user_operation_gateway_inner(
         // 这是 CLAUDE.md 硬规则"unreviewed candidates must not block runs"的实现位。
         let cache = global_taxonomy_cache(&state.db);
         // TTL 自愈：启动 warm_up 后若长期无 admin 写操作触发 invalidate，
-        // 30s 后 find_or_load 自动 reload，防 cache 永远 stale。任何 IO 故障被
-        // find_or_load 内部 log 后吞掉。
-        cache.find_or_load(&state.db, &contact.workspace_id).await;
+        // 30s 后 find_or_load 自动 reload。版本指针损坏或 DB 错误必须阻止本轮，
+        // 不能用旧/空字典继续写画像。
+        cache.find_or_load(&state.db, &contact.workspace_id).await?;
         // universal-domain-adaptation H7：校验维度集合改读 active DomainProfile。
         // DEFAULT 销售域返回 ["customer_stage","intent_level"] 逐字等价。
         // （复用本 run 顶部已加载的 active_profile，避免重复 load。）
@@ -2040,6 +2479,7 @@ async fn run_user_operation_gateway_inner(
                 }
                 write_event_for_account(
                     state,
+                    &contact.workspace_id,
                     &contact.account_id,
                     Some(&contact.wxid),
                     "style_consistency_revision_trigger",
@@ -2078,6 +2518,7 @@ async fn run_user_operation_gateway_inner(
             };
             write_event_for_account(
                 state,
+                &contact.workspace_id,
                 &contact.account_id,
                 Some(&contact.wxid),
                 event,
@@ -2262,6 +2703,7 @@ async fn run_user_operation_gateway_inner(
                     }
                     write_event_for_account(
                         state,
+                        &contact.workspace_id,
                         &contact.account_id,
                         Some(&contact.wxid),
                         "revision_llm_failure",
@@ -2297,6 +2739,7 @@ async fn run_user_operation_gateway_inner(
                     }
                     write_event_for_account(
                         state,
+                        &contact.workspace_id,
                         &contact.account_id,
                         Some(&contact.wxid),
                         "revision_llm_failure",
@@ -2399,6 +2842,7 @@ async fn run_user_operation_gateway_inner(
         }
         write_event_for_account(
             state,
+            &contact.workspace_id,
             &contact.account_id,
             Some(&contact.wxid),
             "blocked_review",
@@ -2491,6 +2935,7 @@ async fn run_user_operation_gateway_inner(
             trigger.kind(),
             &envelope_source_event_id,
             &blocked_status,
+            task_context.as_ref(),
             &should_abort_send,
         )
         .await;
@@ -2540,6 +2985,7 @@ async fn run_user_operation_gateway_inner(
         .await?;
         write_event_for_account(
             state,
+            &contact.workspace_id,
             &contact.account_id,
             Some(&contact.wxid),
             "gateway_blocked",
@@ -2583,6 +3029,7 @@ async fn run_user_operation_gateway_inner(
             trigger.kind(),
             &envelope_source_event_id,
             &final_precheck.status,
+            task_context.as_ref(),
             &should_abort_send,
         )
         .await;
@@ -2607,6 +3054,36 @@ async fn run_user_operation_gateway_inner(
                 &run_id,
                 trigger.kind(),
                 "superseded_by_new_inbound",
+                &planner,
+                doc! { "refreshed": should_refresh_context, "version": context_pack.get_i32("version").unwrap_or_default() },
+                &knowledge_route,
+                to_document(&final_decision).unwrap_or_default(),
+                to_document(&review).unwrap_or_default(),
+                to_document(&final_precheck).unwrap_or_default(),
+                None,
+                &envelope_source_event_id,
+                &envelope_source_kind,
+            )
+            .await?;
+            return Ok(());
+        }
+    }
+
+    // The 100ms monitor is an early-abort optimization, not the ownership
+    // authority. Re-read the exact task lease immediately before the first
+    // profile/memory mutation so a newer inbound cannot slip through the
+    // monitor scheduling window and let an obsolete generation write state.
+    if let Some(claim) = task_context
+        .as_ref()
+        .and_then(|context| context.claim.as_ref())
+    {
+        if !crate::tasks::task_claim_is_current(state, claim).await? {
+            write_agent_run_log(
+                state,
+                &contact,
+                &run_id,
+                trigger.kind(),
+                "stale_task_claim",
                 &planner,
                 doc! { "refreshed": should_refresh_context, "version": context_pack.get_i32("version").unwrap_or_default() },
                 &knowledge_route,
@@ -2705,6 +3182,7 @@ async fn run_user_operation_gateway_inner(
                 .await?;
             write_event_for_account(
                 state,
+                &contact.workspace_id,
                 &contact.account_id,
                 Some(&contact.wxid),
                 "task_claim_fenced",
@@ -2742,6 +3220,7 @@ async fn run_user_operation_gateway_inner(
     let details = build_decision_event_details(&final_decision, playbook.as_ref(), &review);
     write_event_for_account(
         state,
+        &contact.workspace_id,
         &contact.account_id,
         Some(&contact.wxid),
         "agent_reply",
@@ -2814,6 +3293,7 @@ async fn run_user_operation_gateway_inner(
             );
             write_event_for_account(
                 state,
+                &contact.workspace_id,
                 &contact.account_id,
                 Some(&contact.wxid),
                 "blocked_review",
@@ -2947,11 +3427,31 @@ async fn run_user_operation_gateway_inner(
                     existing_status,
                     ..
                 }) => {
-                    if existing_outbox_covers_decision(
+                    let adopted = if let (Some(old_decision_id), Some(claim)) = (
                         existing_decision_id,
-                        decision_review_id,
-                        &existing_status,
+                        task_context
+                            .as_ref()
+                            .and_then(|context| context.claim.as_ref()),
                     ) {
+                        crate::tasks::adopt_recoverable_durable_outbox_if_owned(
+                            state,
+                            claim,
+                            decision_review_id,
+                            &run_id,
+                            existing_outbox_id,
+                            old_decision_id,
+                        )
+                        .await?
+                    } else {
+                        false
+                    };
+                    if adopted
+                        || existing_outbox_covers_decision(
+                            existing_decision_id,
+                            decision_review_id,
+                            &existing_status,
+                        )
+                    {
                         text_outbox_enqueued = true;
                     } else {
                         cross_decision_duplicates.push((idx, existing_outbox_id, existing_status));
@@ -3016,6 +3516,7 @@ async fn run_user_operation_gateway_inner(
             }
             write_event_for_account(
                 state,
+                &contact.workspace_id,
                 &contact.account_id,
                 Some(&contact.wxid),
                 "outbox_skipped_duplicate",
@@ -3044,6 +3545,7 @@ async fn run_user_operation_gateway_inner(
                 .collect();
             write_event_for_account(
                 state,
+                &contact.workspace_id,
                 &contact.account_id,
                 Some(&contact.wxid),
                 "outbox_enqueue_partial_failure",
@@ -3156,6 +3658,7 @@ async fn run_user_operation_gateway_inner(
                 Err(_) => {
                     write_event_for_account(
                         state,
+                        &contact.workspace_id,
                         &contact.account_id,
                         Some(&contact.wxid),
                         "media_asset_id_invalid",
@@ -3186,6 +3689,7 @@ async fn run_user_operation_gateway_inner(
                     tracing::error!(?err, %run_id, asset_id = %directive.asset_id, "media asset 查询失败（降级跳过该素材，不阻断 run）");
                     write_event_for_account(
                         state,
+                        &contact.workspace_id,
                         &contact.account_id,
                         Some(&contact.wxid),
                         "media_asset_lookup_failed",
@@ -3203,6 +3707,7 @@ async fn run_user_operation_gateway_inner(
                 _ => {
                     write_event_for_account(
                         state,
+                        &contact.workspace_id,
                         &contact.account_id,
                         Some(&contact.wxid),
                         "media_asset_rejected",
@@ -3244,6 +3749,7 @@ async fn run_user_operation_gateway_inner(
                 }
                 write_event_for_account(
                     state,
+                    &contact.workspace_id,
                     &contact.account_id,
                     Some(&contact.wxid),
                     "media_asset_escalated",
@@ -3294,6 +3800,7 @@ async fn run_user_operation_gateway_inner(
                     tracing::error!(?err, %run_id, asset_id = %directive.asset_id, "media outbox enqueue failed");
                     write_event_for_account(
                         state,
+                        &contact.workspace_id,
                         &contact.account_id,
                         Some(&contact.wxid),
                         "media_outbox_enqueue_failed",
@@ -3377,6 +3884,7 @@ async fn run_user_operation_gateway_inner(
                                 tracing::error!(?err, %run_id, card_id = %directive.card_id, "namecard outbox enqueue failed");
                                 write_event_for_account(
                                     state,
+                                    &contact.workspace_id,
                                     &contact.account_id,
                                     Some(&contact.wxid),
                                     "namecard_outbox_enqueue_failed",
@@ -3392,6 +3900,7 @@ async fn run_user_operation_gateway_inner(
                     _ => {
                         write_event_for_account(
                             state,
+                            &contact.workspace_id,
                             &contact.account_id,
                             Some(&contact.wxid),
                             "referral_card_rejected",
@@ -3461,6 +3970,7 @@ async fn run_user_operation_gateway_inner(
                 .await?;
             write_event_for_account(
                 state,
+                &contact.workspace_id,
                 &contact.account_id,
                 Some(&contact.wxid),
                 "task_claim_fenced",
@@ -3513,17 +4023,33 @@ async fn run_user_operation_gateway_inner(
     Ok(())
 }
 
-/// 判定单条 send 返回信封是否表示"提交成功"。优先读 MCP 统一成功信封的显式
-/// `ok===true`；无 ok 字段(旧信封)则回落"存在非空 newMsgId"。用于可观测判定。
-pub(crate) fn send_receipt_is_ok(response: &serde_json::Value) -> bool {
-    if let Some(ok) = response.get("ok").and_then(|v| v.as_bool()) {
-        return ok;
-    }
-    response
+/// 客户发送回执的三态分类。
+///
+/// `ok:false` 且没有成功标识是远端明确拒绝，可安全重试；`ok:true` 或旧信封的非空
+/// `newMsgId` 是成功。互相冲突或其它形态（含 `ok` 类型错误、空对象、空 message id）
+/// 只说明 HTTP/MCP 调用返回，不能证明客户未收到，必须停止自动重放。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SendReceiptStatus {
+    Succeeded,
+    ExplicitlyFailed,
+    Inconclusive,
+}
+
+pub(crate) fn classify_send_receipt(response: &serde_json::Value) -> SendReceiptStatus {
+    let has_message_id = response
         .get("newMsgId")
-        .and_then(|v| v.as_str())
-        .map(|s| !s.is_empty())
-        .unwrap_or(false)
+        .and_then(|value| value.as_str())
+        .is_some_and(|message_id| !message_id.is_empty());
+    match response.get("ok") {
+        Some(serde_json::Value::Bool(true)) => SendReceiptStatus::Succeeded,
+        Some(serde_json::Value::Bool(false)) if !has_message_id => {
+            SendReceiptStatus::ExplicitlyFailed
+        }
+        Some(serde_json::Value::Bool(false)) => SendReceiptStatus::Inconclusive,
+        Some(_) => SendReceiptStatus::Inconclusive,
+        None if has_message_id => SendReceiptStatus::Succeeded,
+        None => SendReceiptStatus::Inconclusive,
+    }
 }
 
 /// Only callable from outbox_dispatcher (W4 / Task 5.4) and the legacy in-line
@@ -3538,6 +4064,7 @@ pub(crate) async fn send_outbound_message(
 ) -> Result<serde_json::Value, super::types::OutboundSendError> {
     let response = mcp::logged_send_call_for_account(
         state,
+        &contact.workspace_id,
         &contact.account_id,
         "message_send_text",
         json!({
@@ -3551,10 +4078,18 @@ pub(crate) async fn send_outbound_message(
         .get("newMsgId")
         .and_then(|value| value.as_str())
         .map(ToString::to_string);
-    if !send_receipt_is_ok(&response) {
-        return Err(super::types::OutboundSendError::SafeToRetry(
-            "message_send_text returned a negative or unverifiable delivery receipt".to_string(),
-        ));
+    match classify_send_receipt(&response) {
+        SendReceiptStatus::Succeeded => {}
+        SendReceiptStatus::ExplicitlyFailed => {
+            return Err(super::types::OutboundSendError::SafeToRetry(
+                "message_send_text returned an explicit negative delivery receipt".to_string(),
+            ));
+        }
+        SendReceiptStatus::Inconclusive => {
+            return Err(super::types::OutboundSendError::DeliveryUncertain(
+                "message_send_text returned an unverifiable delivery receipt".to_string(),
+            ));
+        }
     }
     let mut raw = to_document(&response).unwrap_or_default();
     if let Some(extra_raw) = extra_raw {
@@ -3564,12 +4099,18 @@ pub(crate) async fn send_outbound_message(
     // ④ 账号级发送软上限告警（仅告警，绝不拦截/排队/改变发送行为——观测先行防封号）。
     // 查该账号当日（UTC 日界起）`agent_send_outbox` 已 `sent` 的总量，达到软上限即
     // 记一条 warning 审计事件。fail-soft：查询/写事件失败都不影响"已发"语义。
-    if let Ok(sent) =
-        account_daily_sent_count(state, &contact.account_id, utc_today_start_millis()).await
+    if let Ok(sent) = account_daily_sent_count(
+        state,
+        &contact.workspace_id,
+        &contact.account_id,
+        utc_today_start_millis(),
+    )
+    .await
     {
         if sent >= state.config.account_daily_send_soft_cap {
             let _ = write_event_for_account(
                 state,
+                &contact.workspace_id,
                 &contact.account_id,
                 Some(&contact.wxid),
                 "agent.account_daily_send_soft_cap_exceeded",
@@ -3621,6 +4162,7 @@ pub(crate) async fn send_outbound_message(
         );
         write_event_for_account(
             state,
+            &contact.workspace_id,
             &contact.account_id,
             Some(&contact.wxid),
             "outbound_record_persist_failed",
@@ -3734,7 +4276,13 @@ pub(crate) async fn precheck_send_gateway(
                 return Ok(blocked("cooldown", "用户处于冷却期"));
             }
         }
-        if let Some(policy_block) = precheck_operation_policy(state, contact).await? {
+        if let Some(policy_block) = precheck_operation_policy(
+            state,
+            contact,
+            trigger_resets_consecutive_outbounds(trigger),
+        )
+        .await?
+        {
             return Ok(policy_block);
         }
         if let Some(last_run) = contact.last_agent_run_at {
@@ -3781,7 +4329,7 @@ pub(crate) async fn precheck_send_gateway(
                     &state.db,
                     &contact.workspace_id,
                 )
-                .await,
+                .await?,
                 runtime.quiet_hours_enabled,
             )
             && crate::agent::quiet_hours::is_quiet_now(
@@ -3825,6 +4373,7 @@ pub(crate) async fn precheck_send_gateway(
 async fn precheck_operation_policy(
     state: &AppState,
     contact: &Contact,
+    current_inbound_resets_consecutive: bool,
 ) -> AppResult<Option<SendGatewayResult>> {
     if contact.operation_policy.is_empty() {
         return Ok(None);
@@ -3839,7 +4388,16 @@ async fn precheck_operation_policy(
             )));
         }
     }
-    let consecutive_outbounds = consecutive_outbound_count(state, contact).await?;
+    // The current customer inbound may not exist in Mongo yet (shadow runs are
+    // intentionally never persisted). It nevertheless interrupts the prior
+    // outbound streak. Production webhook messages and shadow messages both
+    // carry a message_id; manual-send's synthetic Inbound deliberately does
+    // not, so it cannot bypass proactive-contact policy.
+    let consecutive_outbounds = if current_inbound_resets_consecutive {
+        0
+    } else {
+        consecutive_outbound_count(state, contact).await?
+    };
     if doc_bool(
         &contact.operation_policy,
         "requireUserReplyBeforeNextOutbound",
@@ -3864,6 +4422,10 @@ async fn precheck_operation_policy(
         }
     }
     Ok(None)
+}
+
+fn trigger_resets_consecutive_outbounds(trigger: &AgentTrigger<'_>) -> bool {
+    matches!(trigger, AgentTrigger::Inbound(message) if message.message_id.is_some() || message.dedupe_key.is_some())
 }
 
 async fn consecutive_outbound_count(state: &AppState, contact: &Contact) -> AppResult<i64> {
@@ -4090,6 +4652,7 @@ async fn daily_touch_count(state: &AppState, contact: &Contact) -> AppResult<i64
 /// 不同，这里**不按 contact 过滤**，是账号级总量（防封号观测）。
 async fn account_daily_sent_count(
     state: &AppState,
+    workspace_id: &str,
     account_id: &str,
     since_ms: i64,
 ) -> AppResult<i64> {
@@ -4098,6 +4661,7 @@ async fn account_daily_sent_count(
         .collection_agent_send_outbox()
         .count_documents(
             doc! {
+                "workspace_id": workspace_id,
                 "account_id": account_id,
                 "status": "sent",
                 "sent_at": { "$gte": DateTime::from_millis(since_ms) },
@@ -4448,7 +5012,7 @@ async fn apply_agent_updates(
     // project_entitlements 还看 outcome_events，产品表空也可能投影非空，巧合不可依赖）。
     let active_profile =
         crate::agent::domain_profile::load_active_domain_profile(&state.db, &contact.workspace_id)
-            .await;
+            .await?;
     let mut g1_correction: Option<(String, String)> = None;
     {
         let g1_participates = active_profile.transaction_facts_enabled
@@ -4540,6 +5104,7 @@ async fn apply_agent_updates(
             // fail-soft：审计写失败不阻断主流程（回复已异步发出）。
             let _ = write_event_for_account(
                 &state,
+                &contact.workspace_id,
                 &contact.account_id,
                 Some(&contact.wxid),
                 "agent.dimension_dropped",
@@ -4587,6 +5152,7 @@ async fn apply_agent_updates(
             // fail-soft：审计写失败不阻断主流程（回复已异步发出），与 dimension_dropped 同风格。
             let _ = write_event_for_account(
                 state,
+                &contact.workspace_id,
                 &contact.account_id,
                 Some(&contact.wxid),
                 "agent.stage_transition_rejected",
@@ -4689,24 +5255,9 @@ async fn apply_agent_updates(
         set_doc.insert("domain_attributes.value_tier", tier);
         set_doc.insert("domain_attributes_updated_at", DateTime::now());
     }
-    // 请示触发：把"等待领导决策"标记写进客户 domain_attributes（admin 可观测）。
-    // key 用 AWAITING_PRINCIPAL_DECISION_ATTR 常量，与 relay 完成时 clear_awaiting_principal_state 的 $unset 同一字符串。
-    // 注意：这只是可观测布尔标记——本轮 run 是 Approved，占位 reply 已正常发出，不进 Held、不设 hold category、不碰 review。
-    if decision
-        .escalation_request
-        .as_ref()
-        .map(|e| e.needed)
-        .unwrap_or(false)
-    {
-        set_doc.insert(
-            format!(
-                "domain_attributes.{}",
-                crate::models::AWAITING_PRINCIPAL_DECISION_ATTR
-            ),
-            true,
-        );
-        set_doc.insert("domain_attributes_updated_at", DateTime::now());
-    }
+    // `awaiting_principal_decision` is derived only after a durable escalation
+    // and its Outbox intent exist. Writing it from the LLM request here could
+    // leave a false waiting state when policy routing or enqueue later fails.
     // 承诺是“客户已经收到的外部事实”，必须由 dispatcher 在真实送达后提交。
     // 此处仅保留缺字段观测，不写 commitments。
     if non_empty_option(&decision.last_commitment).is_none()
@@ -4716,6 +5267,7 @@ async fn apply_agent_updates(
         // 仅观测 prompt 强化是否生效，不阻断、不改写、不进任何门。
         let _ = write_event_for_account(
             &state,
+            &contact.workspace_id,
             &contact.account_id,
             Some(&contact.wxid),
             "agent.commitment_field_missing",
@@ -4839,6 +5391,7 @@ async fn apply_agent_updates(
             &mut signals,
             &observed,
             current_turn,
+            run_id,
             &th,
         );
         match mongodb::bson::to_bson(&signals) {
@@ -4899,10 +5452,9 @@ async fn apply_agent_updates(
             if let Some(ev) = &evidence {
                 set_fields.insert("evidence", ev);
             }
-            // upsert 锚 (workspace_id, contact_id)（T5 unique 索引）。已审（approved/rejected）
-            // 的不复活——filter 加 status="pending" 约束：仅 pending 或不存在时刷新累加；
-            // 已审记录命中不到 → 不匹配 + $setOnInsert 又因 unique 锚冲突而不新建 → no-op，
-            // 保审核结论不被新一轮建议覆盖回 pending。
+            // upsert 锚是仅 `status=pending` 生效的 (workspace_id, contact_id) 部分唯一索引。
+            // 同一审核周期重复观察刷新/累加现有 pending；approved/rejected 历史不复活也不
+            // 占槽，因此闭环后的新证据会插入下一周期 pending，并继续等待人工审核。
             let filter = doc! {
                 "workspace_id": &contact.workspace_id,
                 "contact_id": &contact_id,
@@ -4990,6 +5542,7 @@ async fn apply_agent_updates(
         // fail-soft：纯审计写失败不阻断主流程（回复稍后异步入队），与 dimension_dropped 同风格。
         let _ = write_event_for_account(
             state,
+            &contact.workspace_id,
             &contact.account_id,
             Some(&contact.wxid),
             "agent.purchase_lifecycle_corrected_by_objective",
@@ -5054,6 +5607,7 @@ async fn apply_agent_updates(
         // fail-soft：纯审计写失败不阻断主流程（回复稍后异步入队），与 dimension_dropped 同风格。
         let _ = write_event_for_account(
             state,
+            &contact.workspace_id,
             &contact.account_id,
             Some(&contact.wxid),
             "agent.profile_churn_observed",
@@ -5091,6 +5645,7 @@ async fn apply_agent_updates(
         // fail-soft：纯审计写失败不阻断主流程（回复稍后异步入队），与 dimension_dropped 同风格。
         let _ = write_event_for_account(
             state,
+            &contact.workspace_id,
             &contact.account_id,
             Some(&contact.wxid),
             "agent.operation_state_transition_rejected",
@@ -5110,6 +5665,7 @@ async fn apply_agent_updates(
         // fail-soft：纯审计写失败不阻断主流程（回复稍后异步入队），与 dimension_dropped 同风格。
         let _ = write_event_for_account(
             state,
+            &contact.workspace_id,
             &contact.account_id,
             Some(&contact.wxid),
             "agent.operation_state_transitioned",
@@ -5268,9 +5824,9 @@ pub(crate) async fn write_decision_review(
     run_id: &str,
     planner: &RunPlannerResult,
 ) -> AppResult<ObjectId> {
-    let prompt_versions = prompts::prompt_versions(
+    let mut prompt_versions = prompts::prompt_versions(
         &state.db,
-        &state.config.default_workspace_id,
+        &contact.workspace_id,
         &[
             "user.reply.system",
             "user.reply.policy",
@@ -5285,6 +5841,13 @@ pub(crate) async fn write_decision_review(
         playbook,
     )
     .await?;
+    // run-local 记录覆盖上面的通用快照，保证 Shadow override 等路径的审计反映
+    // 模型真正看到的模板。
+    if let Some(budget) = current_run_budget() {
+        for (key, value) in budget.prompt_versions() {
+            prompt_versions.insert(key, value);
+        }
+    }
     let result = state
         .db
         .decision_reviews()
@@ -5455,64 +6018,55 @@ async fn write_agent_run_log_with_finalize(
 
     // MP-5 / Task 15：从 task_local 读 budget snapshot，落 agent_run_logs。
     let budget_snapshot = current_run_budget().map(|b| b.snapshot());
-    let (token_budget, tokens_used, llm_calls_used, degraded_reasons) = match &budget_snapshot {
-        Some(snap) => (
-            snap.token_budget,
-            snap.tokens_used,
-            snap.llm_calls_used,
-            snap.degraded_reasons.clone(),
-        ),
-        None => (0, 0, 0, Vec::new()),
-    };
-    state
-        .db
-        .agent_run_logs()
-        .insert_one(
-            AgentRunLog {
-                id: None,
-                workspace_id: contact.workspace_id.clone(),
-                account_id: contact.account_id.clone(),
-                contact_wxid: Some(contact.wxid.clone()),
-                run_id: run_id.to_string(),
-                trigger_kind: trigger_kind.to_string(),
-                status: status.to_string(),
-                planner: to_document(planner).unwrap_or_default(),
-                context,
-                knowledge_route: to_document(knowledge_route).unwrap_or_default(),
-                decision,
-                review,
-                gateway_result,
-                error,
-                token_budget,
-                tokens_used,
-                llm_calls_used,
-                degraded_reasons,
-                // S1.1 (Phase 0)：lifecycle 由 derive_lifecycle_from_status
-                // 推算并经 assert_lifecycle_valid 闭集校验；source_event_id /
-                // source_kind 由调用方按 trigger 显式传入（FinalizeRunLogFields）。
-                // 杜绝旧的裸 String::new() 占位路径。
-                lifecycle: lifecycle.clone(),
-                source_event_id: finalize_fields.source_event_id.clone(),
-                source_kind: finalize_fields.source_kind.clone(),
-                error_summary: None,
-                abort_reason: None,
-                revision_applied: finalize_fields.revision_applied,
-                revision_reason: finalize_fields.revision_reason,
-                pre_revision_summary: finalize_fields.pre_revision_summary,
-                post_revision_summary: finalize_fields.post_revision_summary,
-                self_critique: finalize_fields.self_critique,
-                autonomy_mode: finalize_fields.autonomy_mode,
-                conversation_mode: finalize_fields.conversation_mode,
-                conversation_mode_reason: finalize_fields.conversation_mode_reason,
-                final_review_status: finalize_fields.final_review_status,
-                outbox_status: None,
-                memory_consolidator_warnings: Vec::new(),
-                created_at: DateTime::now(),
-            },
-            None,
-        )
-        .await?;
-    Ok(())
+    let (token_budget, tokens_used, llm_calls_used, unknown_usage_calls, degraded_reasons) =
+        match &budget_snapshot {
+            Some(snap) => (
+                snap.token_budget,
+                snap.tokens_used,
+                snap.llm_calls_used,
+                snap.unknown_usage_calls,
+                snap.degraded_reasons.clone(),
+            ),
+            None => (0, 0, 0, 0, Vec::new()),
+        };
+    update_run_envelope_terminal(
+        &state.db,
+        run_id,
+        AgentRunLogTerminalFields {
+            workspace_id: Some(contact.workspace_id.clone()),
+            account_id: Some(contact.account_id.clone()),
+            contact_wxid: Some(contact.wxid.clone()),
+            trigger_kind: Some(trigger_kind.to_string()),
+            source_event_id: Some(finalize_fields.source_event_id),
+            source_kind: Some(finalize_fields.source_kind),
+            lifecycle: Some(lifecycle),
+            status: Some(status.to_string()),
+            planner: Some(to_document(planner).unwrap_or_default()),
+            context: Some(context),
+            knowledge_route: Some(to_document(knowledge_route).unwrap_or_default()),
+            decision: Some(decision),
+            review: Some(review),
+            gateway_result: Some(gateway_result),
+            error: error.clone(),
+            error_summary: error,
+            token_budget: Some(token_budget),
+            tokens_used: Some(tokens_used),
+            llm_calls_used: Some(llm_calls_used),
+            unknown_usage_calls: Some(unknown_usage_calls),
+            degraded_reasons: Some(degraded_reasons),
+            revision_applied: Some(finalize_fields.revision_applied),
+            revision_reason: Some(finalize_fields.revision_reason),
+            pre_revision_summary: finalize_fields.pre_revision_summary,
+            post_revision_summary: finalize_fields.post_revision_summary,
+            self_critique: finalize_fields.self_critique,
+            autonomy_mode: Some(finalize_fields.autonomy_mode),
+            conversation_mode: Some(finalize_fields.conversation_mode),
+            conversation_mode_reason: finalize_fields.conversation_mode_reason,
+            final_review_status: Some(finalize_fields.final_review_status),
+            ..AgentRunLogTerminalFields::default()
+        },
+    )
+    .await
 }
 
 /// agent-autonomy-loop W2 / Task 3.4：把 `finalize_review_for_send` 产出的待写
@@ -5530,6 +6084,7 @@ async fn persist_finalize_pending_events(
     for event in pending_events {
         write_event_for_account(
             state,
+            &contact.workspace_id,
             &contact.account_id,
             Some(&contact.wxid),
             &event.kind,
@@ -5674,6 +6229,7 @@ fn extract_suspected_deal_signal(
 
 pub async fn write_event_for_account(
     state: &AppState,
+    workspace_id: &str,
     account_id: &str,
     contact_wxid: Option<&str>,
     kind: &str,
@@ -5687,7 +6243,7 @@ pub async fn write_event_for_account(
         .insert_one(
             AgentEvent {
                 id: None,
-                workspace_id: state.config.default_workspace_id.clone(),
+                workspace_id: workspace_id.to_string(),
                 account_id: account_id.to_string(),
                 contact_wxid: contact_wxid.map(ToString::to_string),
                 kind: kind.to_string(),
@@ -5811,46 +6367,38 @@ pub(crate) fn compute_taxonomy_guard_outcome(
 
 #[cfg(test)]
 mod send_receipt_tests {
-    use super::send_receipt_is_ok;
+    use super::{classify_send_receipt, SendReceiptStatus};
     use serde_json::json;
 
     #[test]
-    fn ok_true_is_success() {
-        assert!(send_receipt_is_ok(
-            &json!({ "ok": true, "newMsgId": "123" })
-        ));
-    }
+    fn classifies_success_explicit_failure_and_inconclusive_receipts() {
+        for value in [
+            json!({ "ok": true }),
+            json!({ "ok": true, "newMsgId": "123" }),
+            json!({ "newMsgId": "8974400044288526000" }),
+        ] {
+            assert_eq!(classify_send_receipt(&value), SendReceiptStatus::Succeeded);
+        }
 
-    #[test]
-    fn ok_false_is_not_success() {
-        assert!(!send_receipt_is_ok(&json!({ "ok": false })));
-    }
+        for value in [json!({ "ok": false })] {
+            assert_eq!(
+                classify_send_receipt(&value),
+                SendReceiptStatus::ExplicitlyFailed
+            );
+        }
 
-    #[test]
-    fn ok_false_short_circuits_even_with_newmsgid() {
-        // ok 字段存在时优先短路：ok:false 即判失败，忽略 newMsgId（不回落）。
-        assert!(!send_receipt_is_ok(
-            &json!({ "ok": false, "newMsgId": "123" })
-        ));
-    }
-
-    #[test]
-    fn legacy_envelope_without_ok_but_with_newmsgid_is_success() {
-        // 旧信封无 ok 字段，但有非空 newMsgId → 兼容判成功。
-        assert!(send_receipt_is_ok(
-            &json!({ "newMsgId": "8974400044288526000" })
-        ));
-    }
-
-    #[test]
-    fn neither_ok_nor_newmsgid_is_not_success() {
-        assert!(!send_receipt_is_ok(&json!({ "target": {} })));
-        assert!(!send_receipt_is_ok(&json!(null)));
-    }
-
-    #[test]
-    fn empty_newmsgid_is_not_success() {
-        assert!(!send_receipt_is_ok(&json!({ "newMsgId": "" })));
+        for value in [
+            json!({ "target": {} }),
+            json!(null),
+            json!({ "newMsgId": "" }),
+            json!({ "ok": "true", "newMsgId": "123" }),
+            json!({ "ok": false, "newMsgId": "123" }),
+        ] {
+            assert_eq!(
+                classify_send_receipt(&value),
+                SendReceiptStatus::Inconclusive
+            );
+        }
     }
 }
 
@@ -6033,6 +6581,45 @@ mod tests {
         assert!(daily_limit_applies_to(&AgentTrigger::FollowUp(&task)));
         // 被动回复：豁免 daily_limit
         assert!(!daily_limit_applies_to(&AgentTrigger::Inbound(&msg)));
+    }
+
+    #[test]
+    fn only_real_or_shadow_customer_inbound_resets_outbound_streak() {
+        use crate::agent::types::AgentTrigger;
+
+        let mut inbound = ConversationMessage {
+            id: None,
+            workspace_id: "ws".into(),
+            account_id: "acc".into(),
+            contact_wxid: "wx".into(),
+            message_id: Some("webhook-message".into()),
+            dedupe_key: Some("webhook-dedupe".into()),
+            direction: MessageDirection::Inbound,
+            content: "customer reply".into(),
+            msg_type: None,
+            media_ref: None,
+            raw: None,
+            is_synthetic_relay: false,
+            created_at: DateTime::now(),
+        };
+        assert!(trigger_resets_consecutive_outbounds(
+            &AgentTrigger::Inbound(&inbound)
+        ));
+
+        inbound.message_id = Some("shadow-1".into());
+        inbound.dedupe_key = None;
+        inbound.raw = Some(doc! { "runMode": "shadow" });
+        assert!(trigger_resets_consecutive_outbounds(
+            &AgentTrigger::Inbound(&inbound)
+        ));
+
+        // Manual-send uses a synthetic Inbound only as an internal carrier.
+        // No persisted inbound identity means it must remain proactive.
+        inbound.message_id = None;
+        inbound.raw = Some(doc! { "source": "manual" });
+        assert!(!trigger_resets_consecutive_outbounds(
+            &AgentTrigger::Inbound(&inbound)
+        ));
     }
 
     // H10：频控豁免开关 = is_principal_relay_trigger(trigger)。伪造哨兵的客户消息

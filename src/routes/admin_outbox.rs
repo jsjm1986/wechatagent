@@ -54,7 +54,8 @@ pub(super) struct ListOutboxQuery {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct CancelOutboxRequest {
+pub struct CancelOutboxRequest {
+    expected_account_id: String,
     cancel_reason: String,
 }
 
@@ -119,7 +120,7 @@ pub(super) async fn list_outbox(
     })))
 }
 
-pub(super) async fn cancel_outbox(
+pub async fn cancel_outbox(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
@@ -131,6 +132,7 @@ pub(super) async fn cancel_outbox(
     let value = cancel_outbox_inner(
         &state,
         &admin.current_workspace,
+        &payload.expected_account_id,
         &id,
         &payload.cancel_reason,
     )
@@ -147,9 +149,16 @@ pub(super) async fn cancel_outbox(
 pub(in crate::routes) async fn cancel_outbox_inner(
     state: &AppState,
     workspace_id: &str,
+    expected_account_id: &str,
     id: &str,
     cancel_reason: &str,
 ) -> AppResult<Value> {
+    let expected_account_id = expected_account_id.trim();
+    if expected_account_id.is_empty() {
+        return Err(AppError::BadRequest(
+            "expectedAccountId is required".to_string(),
+        ));
+    }
     let cancel_reason = cancel_reason.trim().to_string();
     if cancel_reason.is_empty() {
         return Err(AppError::BadRequest("cancel_reason 不能为空".to_string()));
@@ -179,6 +188,7 @@ pub(in crate::routes) async fn cancel_outbox_inner(
             doc! {
                 "_id": object_id,
                 "workspace_id": workspace_id,
+                "account_id": expected_account_id,
                 "status": OutboxStatus::Pending.as_str(),
             },
             doc! {
@@ -211,6 +221,7 @@ pub(in crate::routes) async fn cancel_outbox_inner(
                 doc! {
                     "_id": object_id,
                     "workspace_id": workspace_id,
+                    "account_id": expected_account_id,
                     "status": OutboxStatus::InFlight.as_str(),
                 },
                 doc! { "$set": {
@@ -708,15 +719,26 @@ mod tests {
         assert!(value["lockedUntil"].is_null());
     }
 
-    /// W4 / Task 5.6：`CancelOutboxRequest` 需要 `cancelReason` 字段
+    /// W4 / Task 5.6：`CancelOutboxRequest` 需要账号身份与 `cancelReason` 字段
     /// （camelCase 自动来自 serde 配置）；空字段 / 缺失字段都应该被业务
     /// 校验拦截。这里直接验证 serde 反序列化最低要求。
     #[test]
-    fn cancel_request_requires_reason_field() {
-        let parsed: Result<CancelOutboxRequest, _> = serde_json::from_value(json!({}));
-        assert!(parsed.is_err(), "缺少 cancelReason 应被 serde 拒绝");
-        let ok: CancelOutboxRequest =
-            serde_json::from_value(json!({ "cancelReason": "operator_test" })).unwrap();
+    fn cancel_request_requires_account_and_reason_fields() {
+        let missing_reason: Result<CancelOutboxRequest, _> =
+            serde_json::from_value(json!({ "expectedAccountId": "acc-1" }));
+        assert!(missing_reason.is_err(), "缺少 cancelReason 应被 serde 拒绝");
+        let missing_account: Result<CancelOutboxRequest, _> =
+            serde_json::from_value(json!({ "cancelReason": "operator_test" }));
+        assert!(
+            missing_account.is_err(),
+            "缺少 expectedAccountId 应被 serde 拒绝"
+        );
+        let ok: CancelOutboxRequest = serde_json::from_value(json!({
+            "expectedAccountId": "acc-1",
+            "cancelReason": "operator_test"
+        }))
+        .unwrap();
+        assert_eq!(ok.expected_account_id, "acc-1");
         assert_eq!(ok.cancel_reason, "operator_test");
     }
 

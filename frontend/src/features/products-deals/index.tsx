@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import { PackageSearch, BadgeCheck, CreditCard, HelpCircle, ClipboardCheck } from "lucide-react";
 import { EmptyState } from "../../components/ui/EmptyState";
@@ -359,20 +359,38 @@ export function ContactPicker({
   const [contacts, setContacts] = useState<Contact[]>([]);
   const [open, setOpen] = useState(false);
   const accountId = useAccountStore((s) => s.currentAccountId());
+  const requestGeneration = useRef(0);
+  const scopeRef = useRef(accountId);
+
+  if (scopeRef.current !== accountId) {
+    scopeRef.current = accountId;
+    requestGeneration.current += 1;
+  }
+  const scopedSelected = selected?.accountId === accountId ? selected : null;
 
   useEffect(() => {
+    const generation = ++requestGeneration.current;
+    setContacts([]);
+    setOpen(false);
+    onSelect(null);
+    if (!accountId) return;
     void (async () => {
       try {
-        const url = accountId
-          ? `/api/contacts?limit=100&accountId=${encodeURIComponent(accountId)}`
-          : "/api/contacts?limit=100";
+        const url = `/api/contacts?limit=100&accountId=${encodeURIComponent(accountId)}`;
         const res = await api.get<{ items: Contact[] }>(url);
-        setContacts(res.items);
+        if (
+          requestGeneration.current !== generation ||
+          scopeRef.current !== accountId ||
+          useAccountStore.getState().currentAccountId() !== accountId
+        ) return;
+        setContacts(res.items.filter((contact) => contact.accountId === accountId));
       } catch {
-        setContacts([]);
+        if (requestGeneration.current === generation && scopeRef.current === accountId) {
+          setContacts([]);
+        }
       }
     })();
-  }, [accountId]);
+  }, [accountId, onSelect]);
 
   const items: FriendPickerItem[] = contacts.map((c) => ({
     wxid: c.wxid,
@@ -382,7 +400,9 @@ export function ContactPicker({
   }));
 
   const pick = (item: FriendPickerItem) => {
-    const c = contacts.find((x) => x.wxid === item.wxid) ?? null;
+    const c = contacts.find(
+      (x) => x.wxid === item.wxid && x.accountId === accountId
+    ) ?? null;
     onSelect(c);
     setOpen(false);
   };
@@ -395,7 +415,9 @@ export function ContactPicker({
         onClick={() => setOpen(true)}
         style={{ textAlign: "left", cursor: "pointer" }}
       >
-        {selected ? selected.nickname || selected.remark || selected.wxid : "选择好友…"}
+        {scopedSelected
+          ? scopedSelected.nickname || scopedSelected.remark || scopedSelected.wxid
+          : "选择好友…"}
       </button>
       <FriendPickerModal
         open={open}
@@ -432,7 +454,8 @@ const EMPTY_DEAL_DRAFT: DealDraft = {
   note: "",
 };
 
-function DealsTab() {
+export function DealsTab() {
+  const accountId = useAccountStore((s) => s.currentAccountId());
   const [selected, setSelected] = useState<Contact | null>(null);
   const [events, setEvents] = useState<OutcomeEvent[]>([]);
   const [products, setProducts] = useState<Product[]>([]);
@@ -441,29 +464,76 @@ function DealsTab() {
   const [error, setError] = useState<string | null>(null);
   const [formError, setFormError] = useState<string | null>(null);
   const [info, setInfo] = useState<string | null>(null);
+  const scopeRef = useRef({ accountId, generation: 0 });
+  const selectedRef = useRef<Contact | null>(null);
+  const eventRequestGeneration = useRef(0);
+
+  if (scopeRef.current.accountId !== accountId) {
+    scopeRef.current = {
+      accountId,
+      generation: scopeRef.current.generation + 1,
+    };
+    selectedRef.current = null;
+    eventRequestGeneration.current += 1;
+  }
+  const scopedSelected = selected?.accountId === accountId ? selected : null;
+
+  const handleSelect = useCallback((contact: Contact | null) => {
+    const currentAccountId = useAccountStore.getState().currentAccountId();
+    const scoped = contact?.accountId === currentAccountId ? contact : null;
+    selectedRef.current = scoped;
+    setSelected(scoped);
+  }, []);
 
   const loadEvents = useCallback(async (contact: Contact) => {
+    const generation = ++eventRequestGeneration.current;
+    const scopeGeneration = scopeRef.current.generation;
     try {
       const res = await api.get<{ items: OutcomeEvent[] }>(
         `/api/contacts/${contact.id}/outcome-events`
       );
+      if (
+        eventRequestGeneration.current !== generation ||
+        scopeRef.current.generation !== scopeGeneration ||
+        scopeRef.current.accountId !== contact.accountId ||
+        selectedRef.current?.id !== contact.id ||
+        useAccountStore.getState().currentAccountId() !== contact.accountId
+      ) return;
       setEvents(res.items);
       setError(null);
     } catch (e) {
+      if (
+        eventRequestGeneration.current !== generation ||
+        scopeRef.current.generation !== scopeGeneration ||
+        selectedRef.current?.id !== contact.id
+      ) return;
       setError(e instanceof Error ? e.message : String(e));
     }
   }, []);
 
   useEffect(() => {
-    if (!selected) {
+    selectedRef.current = null;
+    setSelected(null);
+    setEvents([]);
+    setDraft(EMPTY_DEAL_DRAFT);
+    setBusy(false);
+    setError(null);
+    setFormError(null);
+    setInfo(null);
+  }, [accountId]);
+
+  useEffect(() => {
+    if (!scopedSelected) {
+      eventRequestGeneration.current += 1;
       setEvents([]);
       return;
     }
     setDraft(EMPTY_DEAL_DRAFT);
     setFormError(null);
     setInfo(null);
-    void loadEvents(selected);
-  }, [selected, loadEvents]);
+    selectedRef.current = scopedSelected;
+    void loadEvents(scopedSelected);
+  }, [scopedSelected, loadEvents]);
 
   // 产品下拉选项：拉一次本工作区产品表（deal 只选 active，reversal 放宽全部 status）。
   useEffect(() => {
@@ -484,7 +554,15 @@ function DealsTab() {
 
   const handleSubmit = async (event: FormEvent) => {
     event.preventDefault();
-    if (!selected) return;
+    const contact = scopedSelected;
+    if (
+      !contact ||
+      !accountId ||
+      contact.accountId !== accountId ||
+      selectedRef.current?.id !== contact.id ||
+      useAccountStore.getState().currentAccountId() !== accountId
+    ) return;
+    const scope = { ...scopeRef.current };
     setFormError(null);
     setInfo(null);
     // 前端预校验：reversal 必须关联产品（呼应后端 400 规则）。
@@ -505,6 +583,7 @@ function DealsTab() {
     }
     // 只传非空字段；eventKind / verification 始终传。
     const body: Record<string, unknown> = {
+      expectedAccountId: accountId,
       eventKind: draft.eventKind,
       verification: draft.verification,
     };
@@ -523,22 +602,39 @@ function DealsTab() {
 
     setBusy(true);
     try {
-      await api.post(`/api/contacts/${selected.id}/deal-events`, body);
+      await api.post(`/api/contacts/${contact.id}/deal-events`, body);
+      if (
+        scopeRef.current.generation !== scope.generation ||
+        scopeRef.current.accountId !== scope.accountId ||
+        selectedRef.current?.id !== contact.id ||
+        useAccountStore.getState().currentAccountId() !== accountId
+      ) return;
       setDraft(EMPTY_DEAL_DRAFT);
       setInfo(draft.eventKind === "reversal" ? "已登记退款/撤单。" : "已登记成交。");
-      await loadEvents(selected);
+      await loadEvents(contact);
     } catch (e) {
+      if (
+        scopeRef.current.generation !== scope.generation ||
+        scopeRef.current.accountId !== scope.accountId ||
+        selectedRef.current?.id !== contact.id
+      ) return;
       setFormError(e instanceof Error ? e.message : String(e));
     } finally {
-      setBusy(false);
+      if (
+        scopeRef.current.generation === scope.generation &&
+        scopeRef.current.accountId === scope.accountId &&
+        selectedRef.current?.id === contact.id
+      ) {
+        setBusy(false);
+      }
     }
   };
 
   return (
     <div className={styles.workbench}>
-      <ContactPicker selected={selected} onSelect={setSelected} />
+      <ContactPicker selected={scopedSelected} onSelect={handleSelect} />
       <div className={styles.stack}>
-        {selected && (
+        {scopedSelected && (
           <form className={styles.panel} onSubmit={handleSubmit}>
             <div className={styles.head}>
               <div className={styles.headL}>
@@ -678,7 +774,7 @@ function DealsTab() {
             </div>
           </div>
           {error && <p className={styles.error}>{error}</p>}
-          {!selected ? (
+          {!scopedSelected ? (
             <EmptyState title="请选择好友" hint="从左侧选择一个好友查看其成交记录。" />
           ) : events.length === 0 ? (
             <EmptyState title="暂无成交记录" hint="该好友还没有登记成交事件。" />

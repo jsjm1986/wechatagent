@@ -1,31 +1,21 @@
 //! universal-domain-adaptation Phase 3（3A-3）：`domain_profiles` 行业总装配单的
-//! admin REST + 多版本灰度。
+//! admin REST + 不可变草稿、发布与显式激活。
 //!
 //! `DomainProfile` 携带与 ops 三表同构的 `(version, current_version, previous_version,
 //! seeded_by)` 四元字段（见 [`crate::models::DomainProfile`]），故 publish / rollout /
 //! rollback 行为照搬 [`crate::routes::admin_ops_versions`] 的 soft-demote 语义，scope =
 //! `(workspace_id, profile_id)`。
 //!
-//! **publish / activate 语义**（设计文档 §4.1 step 6-7，+ #1 不变量对齐修订）：
-//! - `publish`：在 scope 下写新 `version+1`、`current_version=true`、soft-demote 同
-//!   scope 其他 row 的 `current_version`；随后调 `realign_active_to_current`：
-//!   - 若该 `(workspace_id, profile_id)` 血缘**原本有 active 行**（已被人审 activate 过、
-//!     正在生效）→ 把 `is_active` 一并迁到新版本行 → 新版本**即时生效**（运营编辑已生效
-//!     配置后无需再 activate；与 ops 三表 publish 即生效一致）。
-//!   - 若血缘**从未 active**（纯草稿/AI 生成候选，`is_active=false`）→ realign **noop** →
-//!     新版本仍 `is_active=false`，**必须经人审 `activate` 才生效**（守住「AI 生成候选须
-//!     人审」红线）。
-//! - `activate`：把指定 row 的 `is_active=true`，并把同 workspace 其他 profile 的
-//!   `is_active=false`（每 workspace 至多一条 active）。运行时下一轮决策即用它。
+//! **publish / activate 语义**：
+//! - `publish`：把不可变 draft 原位标为 `release_status=published` 并切成该血缘唯一
+//!   `current_version=true`；只移动发布指针，绝不改任何行的 `is_active`。
+//! - `rollout` / `rollback`：只在已发布历史中移动 `current_version`，同样不改运行时。
+//! - `activate`：仅允许选中 published current；事务内把它设为 workspace 唯一
+//!   `is_active=true`。这一步才改变运行时，并在核心指针提交后执行可重试附属同步。
 //!
-//! > 注：未来若要对「危险开关变更」加二次确认（即便已生效血缘也强制走 publish→activate
-//! > 两步），在 publish 的 realign 调用前按字段 diff 分级即可——本文件头描述的是当前
-//! > 「已生效血缘 publish 即时生效」基线行为。
-//!
-//! 运行时缓存查询要求 `is_active=true AND current_version=true`（见
-//! [`crate::agent::domain_profile::DomainProfileCache`]），故任何改这两个标记的写入
-//! 路径都立即调 [`crate::agent::domain_profile::invalidate_global_domain_profile_cache`]，
-//! 让运行中 Agent 在下一次决策重新加载 active profile（否则最多 30s TTL 才可见）。
+//! 因此发布后允许「旧版本 active + 新版本 current」并存；运行时只按 workspace 的唯一
+//! `is_active=true` 读取，不要求 active 同时也是 current。此分离保证任何内容（包括普通字段）
+//! 都必须经过明确人工激活才生效。
 //!
 //! **红线**：引导层 AI 生成的 profile 必须人审才能 activate（继承「AI 永不自动 verify」）；
 //! 候选不阻塞运行时（无 active 时回落 DEFAULT_PROFILE，零配置启动不变）。
@@ -36,14 +26,15 @@ use axum::{
 };
 use futures::TryStreamExt;
 use mongodb::bson::{doc, oid::ObjectId, Bson, DateTime, Document};
-use mongodb::options::FindOptions;
-use mongodb::Collection;
+use mongodb::options::{FindOneOptions, FindOptions, TransactionOptions};
+use mongodb::ClientSession;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::{
     agent::domain_profile::invalidate_global_domain_profile_cache,
     auth::AuthenticatedAdmin,
+    db::Database,
     error::{AppError, AppResult},
     models::DomainProfile,
 };
@@ -51,11 +42,366 @@ use crate::{
 use super::shared::{parse_object_id, resolve_authorized_workspace};
 use super::AppState;
 
+const DOMAIN_PROFILE_RELEASE_CONFLICT: &str = "domain_profile_release_conflict";
+
+fn domain_profile_transaction_error(error: AppError) -> AppError {
+    match error {
+        AppError::Db(db_error) => {
+            tracing::warn!(error = %db_error, "domain profile transaction conflicted");
+            AppError::Conflict(DOMAIN_PROFILE_RELEASE_CONFLICT.to_string())
+        }
+        other => other,
+    }
+}
+
+async fn commit_domain_profile_transaction(session: &mut ClientSession) -> AppResult<()> {
+    loop {
+        match session.commit_transaction().await {
+            Ok(()) => return Ok(()),
+            Err(error) if error.contains_label("UnknownTransactionCommitResult") => continue,
+            Err(error) => {
+                tracing::warn!(error = %error, "domain profile transaction commit failed");
+                return Err(AppError::Conflict(
+                    DOMAIN_PROFILE_RELEASE_CONFLICT.to_string(),
+                ));
+            }
+        }
+    }
+}
+
+/// Validate every permanent property of an activation target before the
+/// transaction changes the workspace runtime pointer. Transient writes may
+/// still fail after activation and return `partial`, but malformed persisted
+/// content must fail with zero writes because retrying cannot repair it.
+fn validate_domain_profile_activation_target(target: &DomainProfile) -> AppResult<()> {
+    crate::models::validate_domain_profile_dimensions(target).map_err(AppError::BadRequest)?;
+    if let Some(machine) = target.generated_state_machine.as_ref() {
+        let states = machine.get_array("states").map_err(|_| {
+            AppError::BadRequest(
+                "generatedStateMachine.states must be a non-empty array".to_string(),
+            )
+        })?;
+        if states.is_empty() {
+            return Err(AppError::BadRequest(
+                "generatedStateMachine.states must be a non-empty array".to_string(),
+            ));
+        }
+        crate::routes::domains::validate_state_machine(machine)?;
+    }
+    Ok(())
+}
+
+/// Append one immutable draft and allocate the lineage version inside the same
+/// transaction. Concurrent editors may both prepare drafts, but at most one
+/// can claim a particular version; the loser receives a stable 409.
+pub(crate) async fn append_domain_profile_draft(
+    db: &Database,
+    mut draft: DomainProfile,
+) -> AppResult<DomainProfile> {
+    crate::models::validate_domain_profile_dimensions(&draft).map_err(AppError::BadRequest)?;
+    let collection = db.domain_profiles();
+    let mut session = db.client().start_session(None).await?;
+    session
+        .start_transaction(TransactionOptions::builder().build())
+        .await?;
+    let result: AppResult<DomainProfile> = async {
+        let latest = collection
+            .find_one_with_session(
+                doc! {
+                    "workspace_id": &draft.workspace_id,
+                    "profile_id": &draft.profile_id,
+                },
+                FindOneOptions::builder()
+                    .sort(doc! { "version": -1_i32 })
+                    .build(),
+                &mut session,
+            )
+            .await?;
+        draft.version = match latest {
+            Some(ref row) => row.version.checked_add(1).ok_or_else(|| {
+                AppError::BadRequest("domain profile version overflow".to_string())
+            })?,
+            None => 1,
+        };
+        let current = collection
+            .find_one_with_session(
+                doc! {
+                    "workspace_id": &draft.workspace_id,
+                    "profile_id": &draft.profile_id,
+                    "current_version": true,
+                },
+                None,
+                &mut session,
+            )
+            .await?;
+        if current
+            .as_ref()
+            .is_some_and(|row| row.release_status != "published")
+        {
+            return Err(AppError::Conflict(
+                "domain_profile_current_not_published".to_string(),
+            ));
+        }
+        draft.id = None;
+        draft.current_version = false;
+        draft.previous_version = current.map(|row| row.version);
+        draft.is_active = false;
+        draft.release_status = "draft".to_string();
+        let inserted = collection
+            .insert_one_with_session(&draft, None, &mut session)
+            .await?;
+        draft.id = inserted.inserted_id.as_object_id();
+        Ok(draft)
+    }
+    .await;
+    let draft = match result {
+        Ok(draft) => draft,
+        Err(error) => {
+            let _ = session.abort_transaction().await;
+            return Err(domain_profile_transaction_error(error));
+        }
+    };
+    commit_domain_profile_transaction(&mut session).await?;
+    Ok(draft)
+}
+
+/// Move the published current pointer for one lineage. `expected_status` is
+/// `draft` for first publication and `published` for rollout/rollback.
+/// Runtime activation is intentionally untouched.
+async fn switch_domain_profile_current(
+    db: &Database,
+    workspace_id: &str,
+    profile_id: &str,
+    target_id: ObjectId,
+    expected_status: &str,
+) -> AppResult<DomainProfile> {
+    let collection = db.domain_profiles();
+    let mut session = db.client().start_session(None).await?;
+    session
+        .start_transaction(TransactionOptions::builder().build())
+        .await?;
+    let result: AppResult<DomainProfile> = async {
+        let target = collection
+            .find_one_with_session(
+                doc! {
+                    "_id": target_id,
+                    "workspace_id": workspace_id,
+                    "profile_id": profile_id,
+                    "release_status": expected_status,
+                },
+                None,
+                &mut session,
+            )
+            .await?
+            .ok_or_else(|| AppError::Conflict("domain_profile_target_changed".to_string()))?;
+        crate::models::validate_domain_profile_dimensions(&target).map_err(AppError::BadRequest)?;
+        if expected_status == "draft" && (target.current_version || target.is_active) {
+            return Err(AppError::Conflict(
+                "domain_profile_draft_state_invalid".to_string(),
+            ));
+        }
+
+        let mut cursor = collection
+            .find_with_session(
+                doc! {
+                    "workspace_id": workspace_id,
+                    "profile_id": profile_id,
+                    "current_version": true,
+                },
+                FindOptions::builder().limit(2).build(),
+                &mut session,
+            )
+            .await?;
+        let current = cursor.next(&mut session).await.transpose()?;
+        if cursor.next(&mut session).await.transpose()?.is_some() {
+            return Err(AppError::Conflict(
+                "multiple_current_domain_profiles".to_string(),
+            ));
+        }
+        if current.as_ref().and_then(|row| row.id) == Some(target_id) {
+            return Ok(target);
+        }
+
+        let now = DateTime::now();
+        if let Some(current) = current {
+            let current_id = current.id.ok_or_else(|| {
+                AppError::External("current domain profile missing _id".to_string())
+            })?;
+            let demoted = collection
+                .update_one_with_session(
+                    doc! {
+                        "_id": current_id,
+                        "workspace_id": workspace_id,
+                        "profile_id": profile_id,
+                        "current_version": true,
+                    },
+                    doc! { "$set": { "current_version": false, "updated_at": now } },
+                    None,
+                    &mut session,
+                )
+                .await?;
+            if demoted.modified_count != 1 {
+                return Err(AppError::Conflict(
+                    "domain_profile_current_changed".to_string(),
+                ));
+            }
+        }
+
+        let promoted = collection
+            .update_one_with_session(
+                doc! {
+                    "_id": target_id,
+                    "workspace_id": workspace_id,
+                    "profile_id": profile_id,
+                    "release_status": expected_status,
+                    "current_version": false,
+                },
+                doc! {
+                    "$set": {
+                        "release_status": "published",
+                        "current_version": true,
+                        "updated_at": now,
+                    }
+                },
+                None,
+                &mut session,
+            )
+            .await?;
+        if promoted.modified_count != 1 {
+            return Err(AppError::Conflict(
+                "domain_profile_target_changed".to_string(),
+            ));
+        }
+        let mut target = target;
+        target.release_status = "published".to_string();
+        target.current_version = true;
+        target.updated_at = now;
+        Ok(target)
+    }
+    .await;
+    let target = match result {
+        Ok(target) => target,
+        Err(error) => {
+            let _ = session.abort_transaction().await;
+            return Err(domain_profile_transaction_error(error));
+        }
+    };
+    commit_domain_profile_transaction(&mut session).await?;
+    Ok(target)
+}
+
+/// Atomically move the workspace runtime pointer to a published current row.
+/// Repeating activation of the same target is a no-op so failed side effects
+/// can be retried safely.
+async fn switch_domain_profile_active(
+    db: &Database,
+    workspace_id: &str,
+    target_id: ObjectId,
+) -> AppResult<DomainProfile> {
+    let collection = db.domain_profiles();
+    let mut session = db.client().start_session(None).await?;
+    session
+        .start_transaction(TransactionOptions::builder().build())
+        .await?;
+    let result: AppResult<DomainProfile> = async {
+        let target = collection
+            .find_one_with_session(
+                doc! {
+                    "_id": target_id,
+                    "workspace_id": workspace_id,
+                    "release_status": "published",
+                    "current_version": true,
+                },
+                None,
+                &mut session,
+            )
+            .await?
+            .ok_or_else(|| AppError::Conflict("domain_profile_target_not_current".to_string()))?;
+        validate_domain_profile_activation_target(&target)?;
+
+        let mut cursor = collection
+            .find_with_session(
+                doc! { "workspace_id": workspace_id, "is_active": true },
+                FindOptions::builder().limit(2).build(),
+                &mut session,
+            )
+            .await?;
+        let active = cursor.next(&mut session).await.transpose()?;
+        if cursor.next(&mut session).await.transpose()?.is_some() {
+            return Err(AppError::Conflict(
+                "multiple_active_domain_profiles".to_string(),
+            ));
+        }
+        if active.as_ref().and_then(|row| row.id) == Some(target_id) {
+            return Ok(target);
+        }
+
+        let now = DateTime::now();
+        if let Some(active) = active {
+            let active_id = active.id.ok_or_else(|| {
+                AppError::External("active domain profile missing _id".to_string())
+            })?;
+            let demoted = collection
+                .update_one_with_session(
+                    doc! {
+                        "_id": active_id,
+                        "workspace_id": workspace_id,
+                        "is_active": true,
+                    },
+                    doc! { "$set": { "is_active": false, "updated_at": now } },
+                    None,
+                    &mut session,
+                )
+                .await?;
+            if demoted.modified_count != 1 {
+                return Err(AppError::Conflict(
+                    "domain_profile_active_changed".to_string(),
+                ));
+            }
+        }
+        let promoted = collection
+            .update_one_with_session(
+                doc! {
+                    "_id": target_id,
+                    "workspace_id": workspace_id,
+                    "release_status": "published",
+                    "current_version": true,
+                    "is_active": false,
+                },
+                doc! { "$set": { "is_active": true, "updated_at": now } },
+                None,
+                &mut session,
+            )
+            .await?;
+        if promoted.modified_count != 1 {
+            return Err(AppError::Conflict(
+                "domain_profile_target_changed".to_string(),
+            ));
+        }
+        let mut target = target;
+        target.is_active = true;
+        target.updated_at = now;
+        Ok(target)
+    }
+    .await;
+    let target = match result {
+        Ok(target) => target,
+        Err(error) => {
+            let _ = session.abort_transaction().await;
+            return Err(domain_profile_transaction_error(error));
+        }
+    };
+    commit_domain_profile_transaction(&mut session).await?;
+    Ok(target)
+}
+
 #[derive(Debug, Deserialize)]
 pub(super) struct ListQuery {
     #[serde(default, rename = "workspaceId")]
     workspace_id: Option<String>,
-    /// 默认只返回 `current_version=true`；`includeAllVersions=true` 时返回全部历史版本。
+    /// Compatibility flag. The default view already includes drafts, current
+    /// published rows, and the active runtime row so reviewable drafts cannot
+    /// disappear from the workflow.
     #[serde(default, rename = "includeAllVersions")]
     include_all_versions: bool,
 }
@@ -67,10 +413,8 @@ pub(super) async fn list_domain_profiles(
 ) -> AppResult<Json<Value>> {
     let workspace_id =
         resolve_authorized_workspace(&state, &admin, params.workspace_id.clone()).await?;
-    let mut filter = doc! { "workspace_id": &workspace_id };
-    if !params.include_all_versions {
-        filter.insert("current_version", true);
-    }
+    let filter = doc! { "workspace_id": &workspace_id };
+    let _ = params.include_all_versions;
     let mut cursor = state
         .db
         .domain_profiles()
@@ -120,27 +464,31 @@ pub(super) async fn get_domain_profile(
 
 /// 取当前 workspace 运行时生效的 active profile（只读）。
 ///
-/// 查询条件与 [`crate::agent::domain_profile::DomainProfileCache::reload_from_db`]
-/// 逐字一致（`is_active=true AND current_version=true` + 同 workspace），确保前端
-/// 显示的 profile 与 AI 实际加载的是同一行。无 active 时返 `{item: null}`（合法状态：
-/// 运行时此时回落 DEFAULT_PROFILE），不报 404。
+/// Query the same unique `is_active=true` runtime row used by the cache. A
+/// successful zero-row query is the only legal default-profile fallback;
+/// multiple rows fail closed even before the unique index is available.
 pub(super) async fn active_domain_profile(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
 ) -> AppResult<Json<Value>> {
-    let profile = state
+    let mut cursor = state
         .db
         .domain_profiles()
-        .find_one(
+        .find(
             doc! {
                 "workspace_id": &admin.current_workspace,
                 "is_active": true,
-                "current_version": true,
             },
-            None,
+            FindOptions::builder().limit(2).build(),
         )
         .await?;
-    Ok(Json(json!({ "item": profile.map(|p| profile_view(&p)) })))
+    let first = cursor.try_next().await?;
+    if cursor.try_next().await?.is_some() {
+        return Err(AppError::Conflict(
+            "multiple_active_domain_profiles".to_string(),
+        ));
+    }
+    Ok(Json(json!({ "item": first.map(|p| profile_view(&p)) })))
 }
 
 /// create / update 请求体 = 完整 DomainProfile（引导层 apply 落候选用）。`id` /
@@ -168,12 +516,12 @@ pub async fn create_domain_profile(
 ) -> AppResult<Json<Value>> {
     let workspace_id =
         resolve_authorized_workspace(&state, &admin, body.workspace_id.clone()).await?;
-    if body.profile_id.trim().is_empty() {
-        return Err(AppError::BadRequest("profileId 不能为空".to_string()));
+    if body.profile_id.is_empty() || body.profile_id.trim() != body.profile_id {
+        return Err(AppError::BadRequest(
+            "profileId must be non-empty and canonical".to_string(),
+        ));
     }
-    let next_version = next_version_for_profile(&state, &workspace_id, &body.profile_id).await?;
     let now = DateTime::now();
-    // 用请求 body 反序列化成 DomainProfile,再强制覆盖后端管理字段。
     let mut doc = body.profile.clone();
     doc.insert("profile_id", &body.profile_id);
     doc.insert("workspace_id", &workspace_id);
@@ -182,25 +530,20 @@ pub async fn create_domain_profile(
     profile.id = None;
     profile.profile_id = body.profile_id.clone();
     profile.workspace_id = workspace_id.clone();
-    profile.version = next_version;
-    profile.current_version = false; // 创建即草稿,需 publish 定稿 + activate 生效
+    profile.version = 0;
+    profile.current_version = false;
     profile.previous_version = None;
+    profile.release_status = "draft".to_string();
     profile.is_active = false;
     profile.seeded_by = profile.seeded_by.or_else(|| Some("manual".to_string()));
     profile.created_at = now;
     profile.updated_at = now;
-    let inserted = state
-        .db
-        .domain_profiles()
-        .insert_one(&profile, None)
-        .await?;
-    profile.id = inserted.inserted_id.as_object_id();
+    let profile = append_domain_profile_draft(&state.db, profile).await?;
     Ok(Json(json!({ "item": profile_view(&profile) })))
 }
 
-/// update：在指定 `_id`（必须是当前 current_version 草稿）上原地改字段。已 publish
-/// 定稿的版本不应原地改（应 create 新版本再 publish），故 update 只允许改
-/// `current_version=false` 的草稿行；改 active 行直接拒绝（须走 create→publish→activate）。
+/// Save edits by appending a new immutable draft derived from the selected
+/// version. Published and active rows are never modified in place.
 pub async fn update_domain_profile(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
@@ -216,47 +559,26 @@ pub async fn update_domain_profile(
         )
         .await?
         .ok_or_else(|| AppError::NotFound("domain profile not found".to_string()))?;
-    if existing.is_active {
-        return Err(AppError::BadRequest(
-            "已激活的 profile 不可原地修改;请 create 新版本再 publish/activate".to_string(),
-        ));
-    }
     let now = DateTime::now();
-    // 部分更新：只 `$set` 请求 body 实际带来的内容键,未出现的字段保持原值(避免
-    // `from_document` + `replace_one` 把缺失字段按 serde 默认清零 —— 草稿/AI 候选行
-    // is_active=false 不受上面那道拒绝保护,replace 会静默丢字段)。同时剥离后端管理键,
-    // 任何来自 body 的 id/版本灰度/active/审计字段都被忽略,不可经 PUT 篡改。
     let set_doc = strip_backend_managed_keys(&body.profile);
-    // 校验：把 body 内容键合并到现有文档上,整体反序列化一次,确保类型/取值合法
-    // （非法直接 400,不落库）；校验通过后只 `$set` body 键(合并后的不写回,防止把
-    // 未触碰字段的 BSON 形态漂移)。
     let mut merged = mongodb::bson::to_document(&existing)
         .map_err(|e| AppError::External(format!("序列化现有 profile 失败: {e}")))?;
     for (k, v) in set_doc.iter() {
         merged.insert(k.clone(), v.clone());
     }
-    let _validated: DomainProfile = mongodb::bson::from_document(merged)
+    let mut draft: DomainProfile = mongodb::bson::from_document(merged)
         .map_err(|e| AppError::BadRequest(format!("profile 字段不合法: {e}")))?;
-    // 白名单过滤（审查 CORRECT-1）：只 `$set` 既出现在 body、又是合法 DomainProfile
-    // 字段的键。DomainProfile 无 deny_unknown_fields，校验阶段 serde 会忽略未知键 → 不
-    // 拦截；若直接 $set 原始 set_doc，body 里任意未知键会被真实写进 Mongo 文档（读回
-    // 虽被 serde 忽略、功能无害，但属文档污染）。用 _validated 重新序列化得到的键集做
-    // 交集，挡掉未知键。
-    let known_keys: std::collections::HashSet<String> = mongodb::bson::to_document(&_validated)
-        .map(|d| d.keys().cloned().collect())
-        .unwrap_or_default();
-    let mut set_doc: Document = set_doc
-        .into_iter()
-        .filter(|(k, _)| known_keys.contains(k))
-        .collect();
-    set_doc.insert("updated_at", now);
-    coll.update_one(doc! { "_id": object_id }, doc! { "$set": set_doc }, None)
-        .await?;
-    let updated = coll
-        .find_one(doc! { "_id": object_id }, None)
-        .await?
-        .ok_or_else(|| AppError::NotFound("domain profile not found".to_string()))?;
-    Ok(Json(json!({ "item": profile_view(&updated) })))
+    draft.id = None;
+    draft.version = 0;
+    draft.current_version = false;
+    draft.previous_version = Some(existing.version);
+    draft.release_status = "draft".to_string();
+    draft.is_active = false;
+    draft.seeded_by = Some("manual".to_string());
+    draft.created_at = now;
+    draft.updated_at = now;
+    let draft = append_domain_profile_draft(&state.db, draft).await?;
+    Ok(Json(json!({ "item": profile_view(&draft) })))
 }
 
 /// delete：禁止删除 active profile（须先 activate 另一条或回落 DEFAULT）。
@@ -274,43 +596,57 @@ pub(super) async fn delete_domain_profile(
         )
         .await?
         .ok_or_else(|| AppError::NotFound("domain profile not found".to_string()))?;
-    if existing.is_active {
+    if existing.release_status != "draft" || existing.current_version || existing.is_active {
         return Err(AppError::BadRequest(
-            "不可删除已激活的 profile;请先激活另一条或停用".to_string(),
+            "only an unpublished domain profile draft may be deleted".to_string(),
         ));
     }
-    coll.delete_one(doc! { "_id": object_id }, None).await?;
+    let deleted = coll
+        .delete_one(
+            doc! {
+                "_id": object_id,
+                "workspace_id": &admin.current_workspace,
+                "release_status": "draft",
+                "current_version": false,
+                "is_active": false,
+            },
+            None,
+        )
+        .await?;
+    if deleted.deleted_count != 1 {
+        return Err(AppError::Conflict(
+            "domain_profile_draft_changed".to_string(),
+        ));
+    }
     Ok(Json(json!({ "ok": true })))
 }
 
-/// publish：在 scope=(workspace_id, profile_id) 下取 max(version)+1,写新文档。
-///
-/// **分级生效**（危险开关二次确认）：先取该血缘当前 active 版本作 diff 基准，比对
-/// [`risky_fields_changed`] 的 11 个危险字段——
-/// - **危险分支**（血缘已生效 **且** 危险字段有变更）：新版本落「旁路稿」
-///   `current_version=false`、`is_active=false`，**不 demote、不 realign、不动旧 active
-///   版本**——旧版继续 current+active 生效（零窗口期回落 DEFAULT）。返回 `pendingActivation:true`
-///   + `riskyFields`，前端二次确认后经 `rollout`（推 current+demote+realign）才真正生效。
-/// - **普通分支**（无危险变更，或血缘从未 active：纯草稿/AI 候选/DEFAULT）：与改造前
-///   逐字节等价——新版本 `current_version=true`、soft-demote 其他、`realign_active_to_current`
-///   据血缘决定是否继承生效态。
+/// Publish an immutable draft as the lineage's unique current artifact.
+/// Runtime activation is a separate explicit action: an old active version
+/// keeps serving until `activate` succeeds, even after this pointer moves.
 pub async fn publish_domain_profile(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
     let object_id = parse_object_id(&id)?;
-    let coll = state.db.domain_profiles();
-    let source = coll
+    let source = state
+        .db
+        .domain_profiles()
         .find_one(
             doc! { "_id": object_id, "workspace_id": &admin.current_workspace },
             None,
         )
         .await?
         .ok_or_else(|| AppError::NotFound("domain profile not found".to_string()))?;
-    // diff 基准 = 该血缘当前正在生效（is_active）的版本。无 active（纯草稿/AI 候选/
-    // DEFAULT 血缘）时为 None → 危险分支不触发，走与改造前等价的普通分支。
-    let active_base = coll
+    if source.release_status != "draft" || source.current_version || source.is_active {
+        return Err(AppError::BadRequest(
+            "only an unpublished domain profile draft may be published".to_string(),
+        ));
+    }
+    let active_base = state
+        .db
+        .domain_profiles()
         .find_one(
             doc! {
                 "workspace_id": &source.workspace_id,
@@ -324,65 +660,26 @@ pub async fn publish_domain_profile(
         .as_ref()
         .map(|base| risky_fields_changed(base, &source))
         .unwrap_or_default();
-    let next_version =
-        next_version_for_profile(&state, &source.workspace_id, &source.profile_id).await?;
-    let now = DateTime::now();
-    let mut published = source.clone();
-    published.id = None;
-    published.version = next_version;
-    published.previous_version = Some(source.version);
-    published.seeded_by = Some("manual".to_string());
-    published.is_active = false;
-    published.updated_at = now;
-
-    if active_base.is_some() && !risky_changed.is_empty() {
-        // 危险分支：落旁路稿（非 current），不动正在生效的旧版本。等运营二次确认后
-        // 经 rollout 才推 current+生效——给手滑改错风控/人格/自学习方向留缓冲。
-        published.current_version = false;
-        let inserted = coll.insert_one(&published, None).await?;
-        let new_id = inserted.inserted_id.as_object_id();
-        invalidate_global_domain_profile_cache(&state.db);
-        return Ok(Json(json!({
-            "ok": true,
-            "pendingActivation": true,
-            "riskyFields": risky_changed,
-            "id": new_id.map(|i| i.to_hex()).unwrap_or_default(),
-            "version": next_version,
-            "previousVersion": source.version,
-        })));
-    }
-
-    // 普通分支（无危险变更，或血缘从未 active）——与改造前逐字节等价。
-    published.current_version = true;
-    let inserted = coll.insert_one(&published, None).await?;
-    let new_id = inserted.inserted_id.as_object_id();
-    coll.update_many(
-        doc! {
-            "workspace_id": &source.workspace_id,
-            "profile_id": &source.profile_id,
-            "_id": { "$ne": new_id },
-        },
-        doc! { "$set": { "current_version": false, "updated_at": now } },
-        None,
+    let published = switch_domain_profile_current(
+        &state.db,
+        &source.workspace_id,
+        &source.profile_id,
+        object_id,
+        "draft",
     )
     .await?;
-    // 不变量对齐:若该 profile 血缘原本生效(有 active 行),把 is_active 迁到新 current 行,
-    // 避免 publish 后 active 行(旧版本)非 current → 运行时静默回落 DEFAULT。血缘从未生效
-    // 则不动(守住「AI 生成候选须人审 activate」红线)。
-    if let Some(nid) = new_id {
-        realign_active_to_current(&coll, &source.workspace_id, &source.profile_id, nid, now)
-            .await?;
-    }
-    invalidate_global_domain_profile_cache(&state.db);
     Ok(Json(json!({
         "ok": true,
-        "id": new_id.map(|i| i.to_hex()).unwrap_or_default(),
-        "version": next_version,
-        "previousVersion": source.version,
+        "status": "published",
+        "requiresActivation": true,
+        "riskyFields": risky_changed,
+        "id": object_id.to_hex(),
+        "version": published.version,
     })))
 }
 
-/// rollout：把指定 row promote 到 current_version=true,demote 同 scope 其他 row。
+/// Roll an already-published historical artifact forward to unique current.
+/// This never changes the runtime active pointer.
 pub async fn rollout_domain_profile(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
@@ -397,35 +694,26 @@ pub async fn rollout_domain_profile(
         )
         .await?
         .ok_or_else(|| AppError::NotFound("domain profile not found".to_string()))?;
-    let now = DateTime::now();
-    coll.update_one(
-        doc! { "_id": object_id },
-        doc! { "$set": { "current_version": true, "updated_at": now } },
-        None,
-    )
-    .await?;
-    coll.update_many(
-        doc! {
-            "workspace_id": &target.workspace_id,
-            "profile_id": &target.profile_id,
-            "_id": { "$ne": object_id },
-        },
-        doc! { "$set": { "current_version": false, "updated_at": now } },
-        None,
-    )
-    .await?;
-    // 不变量对齐：current 已移到 object_id，若血缘原本生效则把 is_active 一并迁过来，
-    // 避免 active 行非 current → 运行时静默回落 DEFAULT。
-    realign_active_to_current(
-        &coll,
+    if target.release_status != "published" {
+        return Err(AppError::BadRequest(
+            "only a published domain profile may be rolled out".to_string(),
+        ));
+    }
+    let target = switch_domain_profile_current(
+        &state.db,
         &target.workspace_id,
         &target.profile_id,
         object_id,
-        now,
+        "published",
     )
     .await?;
-    invalidate_global_domain_profile_cache(&state.db);
-    Ok(Json(json!({ "ok": true, "version": target.version })))
+    Ok(Json(json!({
+        "ok": true,
+        "status": "published",
+        "requiresActivation": true,
+        "id": object_id.to_hex(),
+        "version": target.version,
+    })))
 }
 
 /// rollback：以 target.previous_version 找回上一版本 promote 到 current,demote 当前。
@@ -438,11 +726,18 @@ pub async fn rollback_domain_profile(
     let coll = state.db.domain_profiles();
     let target = coll
         .find_one(
-            doc! { "_id": object_id, "workspace_id": &admin.current_workspace },
+            doc! {
+                "_id": object_id,
+                "workspace_id": &admin.current_workspace,
+                "release_status": "published",
+                "current_version": true,
+            },
             None,
         )
         .await?
-        .ok_or_else(|| AppError::NotFound("domain profile not found".to_string()))?;
+        .ok_or_else(|| {
+            AppError::Conflict("domain_profile_rollback_source_not_current".to_string())
+        })?;
     let prev_version = target.previous_version.ok_or_else(|| {
         AppError::BadRequest("target version has no previous_version recorded".to_string())
     })?;
@@ -452,6 +747,7 @@ pub async fn rollback_domain_profile(
                 "workspace_id": &target.workspace_id,
                 "profile_id": &target.profile_id,
                 "version": prev_version,
+                "release_status": "published",
             },
             None,
         )
@@ -464,136 +760,133 @@ pub async fn rollback_domain_profile(
     let prev_id = prev
         .id
         .ok_or_else(|| AppError::BadRequest("previous version has no _id".to_string()))?;
-    let now = DateTime::now();
-    coll.update_one(
-        doc! { "_id": prev_id },
-        doc! { "$set": { "current_version": true, "updated_at": now } },
-        None,
-    )
-    .await?;
-    coll.update_many(
-        doc! {
-            "workspace_id": &target.workspace_id,
-            "profile_id": &target.profile_id,
-            "_id": { "$ne": prev_id },
-        },
-        doc! { "$set": { "current_version": false, "updated_at": now } },
-        None,
-    )
-    .await?;
-    // 不变量对齐：current 已回退到 prev_id，若血缘原本生效则把 is_active 一并迁过来。
-    realign_active_to_current(
-        &coll,
+    switch_domain_profile_current(
+        &state.db,
         &target.workspace_id,
         &target.profile_id,
         prev_id,
-        now,
+        "published",
     )
     .await?;
-    invalidate_global_domain_profile_cache(&state.db);
-    Ok(Json(json!({ "ok": true, "rolledBackTo": prev_version })))
+    Ok(Json(json!({
+        "ok": true,
+        "status": "published",
+        "requiresActivation": true,
+        "id": prev_id.to_hex(),
+        "rolledBackTo": prev_version,
+    })))
 }
 
-/// activate：把指定 row is_active=true,同 workspace 其他 profile is_active=false
-/// （每 workspace 至多一条 active）。运行时缓存查 is_active+current_version,故只有
-/// 既 current 又 active 的 row 会被加载——activate 前应已 publish 定稿。
+/// Atomically activate the selected published current row. The core pointer
+/// switch commits first; state-machine publication and contact realignment are
+/// explicit retryable follow-up steps whose outcome is returned to the caller.
 pub async fn activate_domain_profile(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
     let object_id = parse_object_id(&id)?;
-    let coll = state.db.domain_profiles();
-    let target = coll
-        .find_one(
-            doc! { "_id": object_id, "workspace_id": &admin.current_workspace },
-            None,
-        )
-        .await?
-        .ok_or_else(|| AppError::NotFound("domain profile not found".to_string()))?;
-    if !target.current_version {
-        return Err(AppError::BadRequest(
-            "只能激活 current_version 定稿版本;请先 publish".to_string(),
-        ));
-    }
+    let target =
+        switch_domain_profile_active(&state.db, &admin.current_workspace, object_id).await?;
+    // The runtime pointer is already committed. Invalidate before any optional
+    // follow-up so the next decision observes the new profile even if a later
+    // step fails and the response becomes partial.
+    invalidate_global_domain_profile_cache(&state.db);
+
     let now = DateTime::now();
-    coll.update_one(
-        doc! { "_id": object_id },
-        doc! { "$set": { "is_active": true, "updated_at": now } },
-        None,
-    )
-    .await?;
-    coll.update_many(
-        doc! {
-            "workspace_id": &target.workspace_id,
-            "_id": { "$ne": object_id },
-        },
-        doc! { "$set": { "is_active": false, "updated_at": now } },
-        None,
-    )
-    .await?;
+    let mut state_machine_status = "skipped";
+    let mut state_policies_status = "skipped";
+    let mut state_policies_report = json!(null);
+    let mut contacts_status = "skipped";
+    let mut contacts_matched = 0_u64;
+    let mut contacts_modified = 0_u64;
+    let mut errors: Vec<Value> = Vec::new();
     // universal/H13：若该 profile 携带 AI 生成的状态机本体，activate 时把它 publish 成
     // `operation_domain_configs` 在 `(workspace, user_operations)` 下的新 current 版本——
     // 运行时引擎照旧按 `(workspace, domain, current_version=true)` 读表，零改动即拿到行业
     // 状态机。`None`（如 DEFAULT 销售域）→ 不动状态机表 → 运行时字节等价回落 DEFAULT。
     if let Some(machine) = target.generated_state_machine.as_ref() {
-        // 防御性二次校验：profile 草稿在生成后若被手改成非法状态机，这里跳过 publish 而
-        // 不阻塞 activate（profile 已激活；坏本体只意味着保留上一版状态机）。
-        match crate::routes::domains::validate_state_machine(machine) {
-            Ok(()) => {
-                if let Err(err) = super::admin_ops_versions::publish_state_machine_version(
-                    &state.db,
-                    &target.workspace_id,
-                    crate::agent::domain::USER_OPS_DOMAIN_ID,
-                    machine.clone(),
-                    format!("profile:{}", target.profile_id),
-                )
-                .await
-                {
+        match super::admin_ops_versions::publish_state_machine_version(
+            &state.db,
+            &target.workspace_id,
+            crate::agent::domain::USER_OPS_DOMAIN_ID,
+            machine.clone(),
+            format!("profile:{}", target.profile_id),
+        )
+        .await
+        {
+            Err(err) => {
+                state_machine_status = "failed";
+                errors.push(json!({
+                    "step": "stateMachine",
+                    "code": "state_machine_publish_failed",
+                    "message": err.to_string(),
+                }));
+                tracing::warn!(
+                    profile_id = %target.profile_id,
+                    workspace_id = %target.workspace_id,
+                    error = %err,
+                    "activate：状态机本体 publish 失败，profile 已激活，运行时保留原状态机（best-effort，不阻断激活）"
+                );
+            }
+            Ok(report) => {
+                state_machine_status = "completed";
+                state_policies_status = if report.policies.is_complete() {
+                    "completed"
+                } else {
+                    "partial"
+                };
+                if !report.policies.is_complete() {
+                    errors.push(json!({
+                        "step": "statePolicies",
+                        "code": "state_policy_reconcile_partial",
+                        "message": "one or more operation state policies were not reconciled",
+                    }));
+                }
+                state_policies_report = json!(report.policies);
+                // universal/H13 幻影态修复：状态机已成功切到新行业机器，但本 workspace 的
+                // **存量** contact 的 `operation_state` 仍是旧机器的 key（如 sales 的
+                // `"negotiating"`）。这些 key 在新机器里不存在 → 运行时 `check_state_transition`
+                // 找不到 `from` 态 → 该 contact 的状态机 fail-soft 静默冻结永不推进（幻影态）。
+                // 新建 contact 不受影响（从新机器 initial 起步）；只有切域前已存在的 contact 受困。
+                //
+                // 修复：把「`operation_state` 已设且不在新机器 key 集合里」的存量 contact
+                // 批量重置到新机器声明的 initial 态（T10 保证 publish 通过的机器必有 initial:true，
+                // 这里用 guards 同一抽取逻辑取 initial key，不引第二份事实源）。
+                // 精确 scope（红线：这是一次破坏性批量改客户数据）：
+                //   - 只本 workspace；
+                //   - 只 `operation_state` 已设且 `$nin` 新 key 集（真正非法态）；
+                //   - `None`/未设的 contact 被 `$exists:true,$ne:null` 排除 → 首次运行时再补 initial；
+                //   - 仍合法的态被 `$nin` 排除 → 不被误重置。
+                let new_keys: std::collections::HashSet<String> = machine
+                    .get_array("states")
+                    .map(|states| {
+                        states
+                            .iter()
+                            .filter_map(|item| item.as_document())
+                            .filter_map(|state| state.get_str("key").ok().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                // 防御：new_keys 为空时 `$nin:[]` 会匹配所有 contact → 误重置全量。T10 后
+                // 不应发生（机器必有 state），但仍硬守：空集时跳过迁移。
+                if new_keys.is_empty() {
+                    contacts_status = "failed";
+                    errors.push(json!({
+                        "step": "contacts",
+                        "code": "state_machine_has_no_states",
+                        "message": "generated state machine has no state keys",
+                    }));
                     tracing::warn!(
                         profile_id = %target.profile_id,
                         workspace_id = %target.workspace_id,
-                        error = %err,
-                        "activate：状态机本体 publish 失败，profile 已激活，运行时保留原状态机（best-effort，不阻断激活）"
+                        "activate：新状态机 key 集为空，跳过存量 contact 幻影态迁移（防止 $nin:[] 误重置全量）"
                     );
                 } else {
-                    // universal/H13 幻影态修复：状态机已成功切到新行业机器，但本 workspace 的
-                    // **存量** contact 的 `operation_state` 仍是旧机器的 key（如 sales 的
-                    // `"negotiating"`）。这些 key 在新机器里不存在 → 运行时 `check_state_transition`
-                    // 找不到 `from` 态 → 该 contact 的状态机 fail-soft 静默冻结永不推进（幻影态）。
-                    // 新建 contact 不受影响（从新机器 initial 起步）；只有切域前已存在的 contact 受困。
-                    //
-                    // 修复：把「`operation_state` 已设且不在新机器 key 集合里」的存量 contact
-                    // 批量重置到新机器声明的 initial 态（T10 保证 publish 通过的机器必有 initial:true，
-                    // 这里用 guards 同一抽取逻辑取 initial key，不引第二份事实源）。
-                    // 精确 scope（红线：这是一次破坏性批量改客户数据）：
-                    //   - 只本 workspace；
-                    //   - 只 `operation_state` 已设且 `$nin` 新 key 集（真正非法态）；
-                    //   - `None`/未设的 contact 被 `$exists:true,$ne:null` 排除 → 首次运行时再补 initial；
-                    //   - 仍合法的态被 `$nin` 排除 → 不被误重置。
-                    let new_keys: std::collections::HashSet<String> = machine
-                        .get_array("states")
-                        .map(|states| {
-                            states
-                                .iter()
-                                .filter_map(|item| item.as_document())
-                                .filter_map(|state| state.get_str("key").ok().map(str::to_string))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    // 防御：new_keys 为空时 `$nin:[]` 会匹配所有 contact → 误重置全量。T10 后
-                    // 不应发生（机器必有 state），但仍硬守：空集时跳过迁移。
-                    if new_keys.is_empty() {
-                        tracing::warn!(
-                            profile_id = %target.profile_id,
-                            workspace_id = %target.workspace_id,
-                            "activate：新状态机 key 集为空，跳过存量 contact 幻影态迁移（防止 $nin:[] 误重置全量）"
-                        );
-                    } else {
-                        let initial_key =
-                            crate::agent::initial_operation_state_key_in_machine(Some(machine));
-                        let nin: Vec<Bson> = new_keys.iter().cloned().map(Bson::String).collect();
-                        match state
+                    let initial_key =
+                        crate::agent::initial_operation_state_key_in_machine(Some(machine));
+                    let nin: Vec<Bson> = new_keys.iter().cloned().map(Bson::String).collect();
+                    match state
                             .db
                             .contacts()
                             .update_many(
@@ -623,6 +916,9 @@ pub async fn activate_domain_profile(
                             .await
                         {
                             Ok(result) => {
+                                contacts_status = "completed";
+                                contacts_matched = result.matched_count;
+                                contacts_modified = result.modified_count;
                                 tracing::info!(
                                     profile_id = %target.profile_id,
                                     workspace_id = %target.workspace_id,
@@ -633,6 +929,12 @@ pub async fn activate_domain_profile(
                                 );
                             }
                             Err(err) => {
+                                contacts_status = "failed";
+                                errors.push(json!({
+                                    "step": "contacts",
+                                    "code": "contact_state_migration_failed",
+                                    "message": err.to_string(),
+                                }));
                                 tracing::warn!(
                                     profile_id = %target.profile_id,
                                     workspace_id = %target.workspace_id,
@@ -641,86 +943,42 @@ pub async fn activate_domain_profile(
                                 );
                             }
                         }
-                    }
                 }
-            }
-            Err(err) => {
-                tracing::warn!(
-                    profile_id = %target.profile_id,
-                    workspace_id = %target.workspace_id,
-                    error = %err,
-                    "activate: generated_state_machine 校验失败，跳过 publish（保留上一版状态机）"
-                );
             }
         }
     }
-    invalidate_global_domain_profile_cache(&state.db);
-    Ok(Json(json!({ "ok": true, "activated": target.profile_id })))
-}
-
-/// 不变量对齐：把 `is_active` 迁到新的 current 行。
-///
-/// 运行时缓存加载充要条件是 `is_active=true AND current_version=true`（见文件头）。
-/// `publish`/`rollout`/`rollback` 都会把 `current_version` 移动到 **另一行**，若不同步
-/// 迁移 `is_active`，会出现「active 行非 current、current 行非 active」→ reload 查询零命中
-/// → 该 workspace 静默回落 DEFAULT_PROFILE（运营无感知配置失效）。
-///
-/// 本 helper 在移动 current_version **之后**调用：若该 `(workspace_id, profile_id)` 血缘
-/// 里原本存在 active 行（说明这个 profile 是当前生效的），就把 `is_active` 收敛到
-/// `new_current_id` 这一行、清掉血缘里其他行的 active，保证「active 行 == current 行」。
-/// 若血缘里本就没有 active 行（profile 从未 activate，纯草稿/定稿态），则不动 is_active
-/// （不凭空激活一个未经人审 activate 的版本——守住 AI 永不自动 verify 红线）。
-async fn realign_active_to_current(
-    coll: &Collection<DomainProfile>,
-    workspace_id: &str,
-    profile_id: &str,
-    new_current_id: ObjectId,
-    now: DateTime,
-) -> AppResult<()> {
-    let active_in_lineage = coll
-        .count_documents(
-            doc! {
-                "workspace_id": workspace_id,
-                "profile_id": profile_id,
-                "is_active": true,
+    let partial = !errors.is_empty();
+    Ok(Json(json!({
+        "ok": true,
+        "status": if partial { "partial" } else { "completed" },
+        "retryable": partial,
+        "activated": target.profile_id,
+        "id": object_id.to_hex(),
+        "version": target.version,
+        "steps": {
+            "profileActive": { "status": "completed" },
+            "stateMachine": { "status": state_machine_status },
+            "statePolicies": {
+                "status": state_policies_status,
+                "report": state_policies_report,
             },
-            None,
-        )
-        .await?;
-    if active_in_lineage == 0 {
-        // profile 从未生效过 → 不凭空激活，保持纯草稿/定稿态。
-        return Ok(());
-    }
-    // 血缘原本生效 → 把 active 收敛到新 current 行。
-    coll.update_one(
-        doc! { "_id": new_current_id },
-        doc! { "$set": { "is_active": true, "updated_at": now } },
-        None,
-    )
-    .await?;
-    coll.update_many(
-        doc! {
-            "workspace_id": workspace_id,
-            "profile_id": profile_id,
-            "_id": { "$ne": new_current_id },
+            "contacts": {
+                "status": contacts_status,
+                "matched": contacts_matched,
+                "modified": contacts_modified,
+            },
         },
-        doc! { "$set": { "is_active": false, "updated_at": now } },
-        None,
-    )
-    .await?;
-    Ok(())
+        "errors": errors,
+    })))
 }
 
 /// 「危险开关」字段集：直接左右 AI 能否瞎编产品 / 自学习方向 / 人格本体 / 风控阈值 /
-/// 交易事实注入 / 评审取向 / 模式-闸说明的 13 个字段。运营手动编辑**已生效**血缘并 publish
-/// 时，这些字段一旦相对当前 active 版本发生变化，就不即时生效（落旁路稿等二次确认），避免
-/// 手滑改错立即污染线上。
+/// 交易事实注入 / 评审取向 / 模式-闸说明的 13 个字段。publish 对所有字段都不改变运行时；
+/// 此列表用于响应中标出相对当前 active 的高风险差异，帮助管理员在显式 activate 前重点审阅。
 /// `reviewer_orientation`（评审重点取向 / 转化平衡 / few-shot 打分锚）与
 /// `mode_gate_policy_override`（模式与 5 闸说明散文）直接改写喂给 Review/Reply Agent 的
-/// 取向 prompt，G31 起一并纳入危险字段——改已生效取向不再即时生效，须二次确认。
-/// 黑名单外字段（display_name/description/profile_dimensions/coverage_dimensions/
-/// business_formulas/memory_dimensions/chunk_roles/prompt_fragment/stagnation_dimension/
-/// methodology_generator_preamble）视为普通字段，照旧即时生效。
+/// 取向 prompt，G31 起一并纳入风险提示。黑名单外字段仍不列入风险提示，但也必须经过
+/// 独立 activate 才进入运行时。
 const RISKY_FIELD_NAMES: [&str; 13] = [
     "soul_override",
     "methodology_override",
@@ -742,7 +1000,7 @@ const RISKY_FIELD_NAMES: [&str; 13] = [
 /// 不漏判）。`commitment_markers` / `operation_mode` / `outcome_polarity` /
 /// `threshold_overrides` / `reviewer_orientation` 依赖各自类型的 `PartialEq`（见 `models.rs`）。
 ///
-/// 纯函数、无 IO，供 `publish_domain_profile` 分级判定 + 单测共用。空 Vec = 无危险变更。
+/// 纯函数、无 IO，供 `publish_domain_profile` 生成审阅提示 + 单测共用。空 Vec = 无危险变更。
 pub fn risky_fields_changed(old: &DomainProfile, new: &DomainProfile) -> Vec<&'static str> {
     let mut changed = Vec::new();
     if old.soul_override != new.soul_override {
@@ -802,6 +1060,7 @@ fn strip_backend_managed_keys(body: &Document) -> Document {
         "version",
         "current_version",
         "previous_version",
+        "release_status",
         "is_active",
         "seeded_by",
         "created_at",
@@ -817,40 +1076,13 @@ fn strip_backend_managed_keys(body: &Document) -> Document {
     set_doc
 }
 
-/// 同 scope=(workspace_id, profile_id) 下取 max(version)+1。
-async fn next_version_for_profile(
-    state: &AppState,
-    workspace_id: &str,
-    profile_id: &str,
-) -> AppResult<i32> {
-    let raw = state.db.domain_profiles().clone_with_type::<Document>();
-    let mut cursor = raw
-        .find(
-            doc! { "workspace_id": workspace_id, "profile_id": profile_id },
-            FindOptions::builder()
-                .sort(doc! { "version": -1_i32 })
-                .limit(1_i64)
-                .projection(doc! { "version": 1_i32 })
-                .build(),
-        )
-        .await?;
-    let max = if let Some(d) = cursor.try_next().await? {
-        d.get_i32("version").unwrap_or(0)
-    } else {
-        0
-    };
-    Ok(max + 1)
-}
-
 #[cfg(test)]
 mod tests {
     //! publish/activate 两步语义的纯函数不变量(DB 端 update_many 行为的可单测抽离)。
     //! 完整 DB-backed 端到端流程由 CI 集成套件覆盖(本地磁盘纪律:重套件走 CI)。
 
-    /// publish 的 **demote 子步**：scope 内除新版本外全部 demote current_version；
-    /// is_active 不动。**完整 publish = 本子步 + realign 子步**（见 handler line296-299）：
-    /// realign 才负责把 is_active 迁到新版本（对已生效血缘）。单测把两子步分开锁，便于
-    /// 各自验证；勿把本子步当成完整 publish 语义（历史上这里的注释曾误导）。
+    /// publish / rollout / rollback 只移动 lineage 的 published-current 指针；
+    /// `is_active` 是独立的 workspace 运行时指针，只有 activate 可以修改。
     fn publish_demote_current(rows: &mut [(i32, bool, bool)], new_version: i32) {
         // 元组 = (version, current_version, is_active)
         for (v, cur, _active) in rows.iter_mut() {
@@ -865,37 +1097,15 @@ mod tests {
         }
     }
 
-    /// realign：current 移动后调用。若血缘原本有 active 行,把 is_active 收敛到新 current
-    /// 版本行、清掉其他;若血缘从未 active 则不动(不凭空激活未经人审 activate 的版本)。
-    /// 对应 `realign_active_to_current`(以 version 代 _id 作模型键)。
-    fn realign_active_to_current_sim(rows: &mut [(i32, bool, bool)], new_current_version: i32) {
-        let lineage_had_active = rows.iter().any(|(_, _, a)| *a);
-        if !lineage_had_active {
-            return;
-        }
-        for (v, _cur, active) in rows.iter_mut() {
-            *active = *v == new_current_version;
-        }
-    }
-
     #[test]
-    fn publish_demote_current_substep_leaves_is_active_untouched() {
-        // 仅测 publish 的 **demote 子步**（`publish_demote_current`）：它只把 current_version
-        // 收敛到新版本，不碰 is_active。**这不是完整 publish 语义**——真 `publish_domain_profile`
-        // 在 demote 之后还会调 `realign_active_to_current`（见 `realign_*_when_lineage_was_active`
-        // 测试 + handler line296-299），对「已生效血缘」会把 is_active 迁到新版本（即时生效）。
-        // 本测试只锁 demote 子步自身的不变量：demote 不应有副作用地改动 is_active。
-        let mut rows = vec![(1, true, true), (2, true, false)];
+    fn publish_moves_current_but_preserves_old_active() {
+        let mut rows = vec![(1, true, true), (2, false, false)];
         publish_demote_current(&mut rows, 2);
         let current: Vec<_> = rows.iter().filter(|(_, c, _)| *c).collect();
         assert_eq!(current.len(), 1, "demote 后只一条 current_version");
         assert_eq!(current[0].0, 2);
-        // demote 子步本身不动 is_active（is_active 的迁移由后续 realign 子步负责）。
-        assert!(
-            rows[0].2,
-            "demote 子步不改 is_active：版本1 此刻仍标 active"
-        );
-        assert!(!rows[1].2, "demote 子步不激活版本2（realign 才迁移）");
+        assert!(rows[0].2, "旧版本继续作为运行时 active");
+        assert!(!rows[1].2, "publish 不得隐式激活新版本");
     }
 
     #[test]
@@ -912,98 +1122,74 @@ mod tests {
 
     #[test]
     fn two_step_publish_then_activate_makes_version_loadable() {
-        // 缓存可见的充要条件 = current_version && is_active。两步后版本 2 同时满足。
-        let mut rows = vec![(1, true, true), (2, true, false)];
+        let mut rows = vec![(1, true, true), (2, false, false)];
         publish_demote_current(&mut rows, 2);
-        activate_single(&mut rows, 2);
-        let loadable: Vec<_> = rows.iter().filter(|(_, c, a)| *c && *a).collect();
-        assert_eq!(loadable.len(), 1, "只一条 current+active 可被运行时加载");
-        assert_eq!(loadable[0].0, 2);
-    }
-
-    #[test]
-    fn realign_migrates_active_to_new_current_when_lineage_was_active() {
-        // 血缘原本生效(版本1 current+active)。publish 版本2 demote current 后,
-        // realign 把 active 迁到版本2 → active 行恒等于 current 行,运行时不回落 DEFAULT。
-        let mut rows = vec![(1, true, true), (2, true, false)];
-        publish_demote_current(&mut rows, 2);
-        realign_active_to_current_sim(&mut rows, 2);
-        let current: Vec<_> = rows
-            .iter()
-            .filter(|(_, c, _)| *c)
-            .map(|(v, _, _)| *v)
-            .collect();
-        let active: Vec<_> = rows
-            .iter()
-            .filter(|(_, _, a)| *a)
-            .map(|(v, _, _)| *v)
-            .collect();
-        assert_eq!(current, vec![2], "publish 后唯一 current=版本2");
-        assert_eq!(active, vec![2], "realign 后 active 迁到版本2");
-        // 充要条件成立:版本2 既 current 又 active → 立即可加载,无静默降级。
-        assert_eq!(rows.iter().filter(|(_, c, a)| *c && *a).count(), 1);
-    }
-
-    #[test]
-    fn realign_noop_when_lineage_never_active() {
-        // 纯草稿/定稿血缘(从未 activate)。publish 新版本后 realign 不凭空激活任何行,
-        // 守住「AI 生成候选须人审 activate」红线。
-        let mut rows = vec![(1, true, false), (2, true, false)];
-        publish_demote_current(&mut rows, 2);
-        realign_active_to_current_sim(&mut rows, 2);
-        assert!(
-            rows.iter().all(|(_, _, a)| !*a),
-            "血缘从未 active → realign 不动 is_active"
+        assert_eq!(
+            rows.iter().find(|(_, _, active)| *active).map(|row| row.0),
+            Some(1),
+            "publish 后运行时仍使用旧 active"
         );
+        activate_single(&mut rows, 2);
+        let active: Vec<_> = rows.iter().filter(|(_, _, active)| *active).collect();
+        assert_eq!(active.len(), 1, "只一条 active 可被运行时加载");
+        assert_eq!(active[0].0, 2);
+        assert!(active[0].1, "激活目标仍是 published current");
     }
 
-    /// 红线钉死：AI 生成候选（`guide_profile::generate_domain_profile_candidate` 落库
-    /// 强制 `is_active=false`+`current_version=false`，见该文件 :248-249）的整个生命周期，
-    /// 在被人审 `activate` 之前**始终 is_active=false**——publish 定稿子步 + realign 子步
-    /// 都不会让它生效。这是「AI 永不自动 verify / AI 生成候选须人审」红线在版本机制层的
-    /// 护栏：blocked 场景下哪怕有人 publish 了 AI 草稿，realign 命中「血缘从未 active」→
-    /// noop → 仍须显式 activate。
     #[test]
     fn ai_candidate_stays_inactive_until_human_activate() {
-        // AI 生成候选落库态：单条草稿，既非 current 也非 active。
         let mut rows = vec![(1, false, false)];
-        // 有人对它 publish（定稿一个新版本 v2）：demote 子步把 current 收敛到 v2。
-        rows.push((2, true, false));
-        publish_demote_current(&mut rows, 2);
-        // realign 子步：血缘从未 active → noop。
-        realign_active_to_current_sim(&mut rows, 2);
+        publish_demote_current(&mut rows, 1);
         assert!(
             rows.iter().all(|(_, _, a)| !*a),
-            "AI 候选血缘从未 active → publish 后仍无任何 active 行（守住人审红线）"
+            "AI 候选 publish 后仍无 active 行"
         );
-        // 必须显式 activate v2 才生效。
-        activate_single(&mut rows, 2);
-        let active: Vec<_> = rows
-            .iter()
-            .filter(|(_, _, a)| *a)
-            .map(|(v, _, _)| *v)
-            .collect();
-        assert_eq!(active, vec![2], "人审 activate 后 v2 才生效");
-        // 此刻 v2 既 current 又 active → 运行时可加载。
-        assert_eq!(rows.iter().filter(|(_, c, a)| *c && *a).count(), 1);
+        activate_single(&mut rows, 1);
+        assert!(rows[0].1 && rows[0].2, "人审 activate 后才生效");
     }
 
     #[test]
-    fn rollback_realigns_active_back_to_previous_version() {
-        // 版本2 current+active(生效中),rollback 到版本1:current 回退到版本1,
-        // realign 把 active 也迁回版本1 → 回退后的版本立即生效,不静默降级。
+    fn rollback_moves_current_but_preserves_runtime_active() {
         let mut rows = vec![(1, false, false), (2, true, true)];
-        // rollback：prev(版本1) current=true,其余 demote。
-        for (v, cur, _) in rows.iter_mut() {
-            *cur = *v == 1;
-        }
-        realign_active_to_current_sim(&mut rows, 1);
-        let loadable: Vec<_> = rows
-            .iter()
-            .filter(|(_, c, a)| *c && *a)
-            .map(|(v, _, _)| *v)
-            .collect();
-        assert_eq!(loadable, vec![1], "rollback 后版本1 既 current 又 active");
+        publish_demote_current(&mut rows, 1);
+        assert!(rows[0].1 && !rows[0].2, "版本1成为发布 current，但未激活");
+        assert!(!rows[1].1 && rows[1].2, "版本2继续服务运行时");
+    }
+
+    #[test]
+    fn activation_target_rejects_permanently_invalid_generated_machine() {
+        use mongodb::bson::doc;
+
+        let mut profile = crate::agent::domain_profile::default_domain_profile("ws");
+        profile.generated_state_machine = None;
+        assert!(super::validate_domain_profile_activation_target(&profile).is_ok());
+
+        profile.generated_state_machine = Some(doc! {
+            "states": [{
+                "key": "ready",
+                "initial": true,
+                "allowedFrom": ["ready"],
+            }]
+        });
+        assert!(super::validate_domain_profile_activation_target(&profile).is_ok());
+
+        profile.generated_state_machine = Some(doc! { "states": [] });
+        assert!(matches!(
+            super::validate_domain_profile_activation_target(&profile),
+            Err(crate::error::AppError::BadRequest(_))
+        ));
+
+        profile.generated_state_machine = Some(doc! {
+            "states": [{
+                "key": "ready",
+                "initial": true,
+                "allowedFrom": ["missing"],
+            }]
+        });
+        assert!(matches!(
+            super::validate_domain_profile_activation_target(&profile),
+            Err(crate::error::AppError::BadRequest(_))
+        ));
     }
 
     #[test]
@@ -1088,7 +1274,7 @@ mod tests {
     }
 
     // ───────────────────────────────────────────────────────────────
-    // 分级二次确认：risky_fields_changed 纯函数 + 旁路稿/确认 sim。
+    // 激活前审阅提示：risky_fields_changed 纯函数。
     // 真 DomainProfile 夹具复用 lib 侧单一真相源（销售 DEFAULT vs 情感陪伴 example），
     // 直接验证真函数逻辑而非 sim 复刻。
     // ───────────────────────────────────────────────────────────────
@@ -1196,9 +1382,8 @@ mod tests {
 
     #[test]
     fn risky_fields_detects_reviewer_orientation_and_mode_gate() {
-        // G31：reviewer 取向 / 模式-闸说明覆盖是「已生效血缘即时生效则可绕过二次确认」的
-        // 漏网危险字段。改 reviewer_orientation（评审取向/转化平衡/few-shot 锚）或
-        // mode_gate_policy_override（模式-闸说明）必须落旁路稿二次确认，不可手滑即时污染线上。
+        // reviewer 取向 / 模式-闸说明会直接改写喂给 Review/Reply Agent 的取向 prompt，
+        // 因此必须出现在发布结果的 riskyFields 中，供激活前审阅。
         let base = default_domain_profile("ws");
 
         let mut changed_ro = base.clone();
@@ -1252,16 +1437,12 @@ mod tests {
         );
     }
 
-    /// publish 危险分支：落「旁路稿」(current=false)，不动正在生效的旧版本。
-    /// 旧 v1 保持唯一 current+active（零窗口期回落 DEFAULT）。
-    /// 对应 handler 危险分支：insert published(current=false)，不 demote / 不 realign。
+    /// riskyFields 只改变审阅提示，不改变统一的发布语义：新版本成为 published current，
+    /// 旧版本仍是 runtime active，直到显式 activate。
     #[test]
-    fn risky_publish_keeps_v1_current_active_via_sideline_draft() {
-        // 元组 = (version, current_version, is_active)。v1 当前 current+active 生效。
-        let mut rows = vec![(1, true, true)];
-        // 危险 publish：插入 v2 旁路稿 current=false、is_active=false；**不** demote v1。
-        rows.push((2, false, false));
-        // 危险分支既不 demote 也不 realign：rows 保持原样。
+    fn risky_publish_moves_current_but_keeps_runtime_active() {
+        let mut rows = vec![(1, true, true), (2, false, false)];
+        publish_demote_current(&mut rows, 2);
         let current: Vec<_> = rows
             .iter()
             .filter(|(_, c, _)| *c)
@@ -1272,39 +1453,17 @@ mod tests {
             .filter(|(_, _, a)| *a)
             .map(|(v, _, _)| *v)
             .collect();
-        assert_eq!(
-            current,
-            vec![1],
-            "旁路稿不占 current，v1 仍唯一 current（零窗口）"
-        );
-        assert_eq!(active, vec![1], "v1 仍唯一 active，运行时不回落 DEFAULT");
-        // 充要条件：v1 既 current 又 active，运行时继续加载旧版本。
-        assert_eq!(rows.iter().filter(|(_, c, a)| *c && *a).count(), 1);
+        assert_eq!(current, vec![2], "新发布版本成为唯一 current");
+        assert_eq!(active, vec![1], "旧版本继续作为唯一 runtime active");
     }
 
-    /// 二次确认经 rollout 把旁路稿推成 current+active（rollout = 推 current + demote +
-    /// realign）。对应 confirm-path 复用 `rollout_domain_profile`。
+    /// rollout 也只移动 published current；不得借版本操作绕过显式 activate。
     #[test]
-    fn confirm_via_rollout_migrates_current_and_active_to_sideline_draft() {
-        // v1 current+active 生效中，v2 是危险 publish 落的旁路稿。
+    fn rollout_preserves_runtime_active_until_activate() {
         let mut rows = vec![(1, true, true), (2, false, false)];
-        // rollout(v2)：推 v2 current=true，demote 其他 current。
-        for (v, cur, _) in rows.iter_mut() {
-            *cur = *v == 2;
-        }
-        // realign：血缘原本有 active（v1）→ 把 is_active 迁到新 current（v2）。
-        realign_active_to_current_sim(&mut rows, 2);
-        let loadable: Vec<_> = rows
-            .iter()
-            .filter(|(_, c, a)| *c && *a)
-            .map(|(v, _, _)| *v)
-            .collect();
-        assert_eq!(
-            loadable,
-            vec![2],
-            "确认后 v2 既 current 又 active，唯一可加载"
-        );
-        // 单 current 不变量保持。
-        assert_eq!(rows.iter().filter(|(_, c, _)| *c).count(), 1);
+        publish_demote_current(&mut rows, 2);
+        assert!(rows[0].2 && !rows[1].2, "rollout 不改变 active");
+        activate_single(&mut rows, 2);
+        assert!(!rows[0].2 && rows[1].2, "显式 activate 才切换运行时");
     }
 }

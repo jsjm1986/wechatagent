@@ -36,6 +36,7 @@ export function RosterView() {
   const loadRoster = useUserOpsStore((s) => s.loadRoster);
   const batchEnable = useUserOpsStore((s) => s.batchEnable);
   const playbooks = useUserOpsStore((s) => s.playbooks);
+  const publishedPlaybooks = playbooks.filter((playbook) => playbook.releaseStatus === "published");
   const toast = useToast();
 
   const rosterCache = useUserOpsStore((s) => s.rosterCache);
@@ -112,7 +113,7 @@ export function RosterView() {
   const { pageRows, pageCount, safePage, setPage } = usePagedList(humanRows);
 
   const toggle = (entry: RosterEntry) => {
-    if (entry.agentStatus === "managed") return; // 已托管不可重复勾选
+    if (entry.agentStatus === "managed" || entry.isNonHuman) return;
     setSelectedWxids((prev) => {
       const next = new Set(prev);
       if (next.has(entry.wxid)) next.delete(entry.wxid);
@@ -137,6 +138,7 @@ export function RosterView() {
         }));
       const res = await batchEnable({
         accountId: effectiveAccountId,
+        source: "roster",
         candidates,
         sharedNote: sharedNote.trim(),
         playbookId: playbookId || undefined,
@@ -272,17 +274,15 @@ export function RosterView() {
           {showNonHuman && (
             <div className={styles.grid}>
               {nonHumanRows.map((entry) => {
-                const checked = selectedWxids.has(entry.wxid);
-                const managed = entry.agentStatus === "managed";
                 return (
                   <button
                     key={entry.wxid}
                     type="button"
-                    className={`${styles.card} ${checked ? styles.cardChecked : ""} ${managed ? styles.cardManaged : ""}`}
-                    onClick={() => toggle(entry)}
-                    disabled={managed}
+                    className={`${styles.card} ${styles.cardManaged}`}
+                    disabled
+                    aria-label={`${entry.remark || entry.nickname || entry.wxid}（系统账号，不可运营）`}
                   >
-                    <div className={styles.checkbox}>{checked && <Check size={13} />}</div>
+                    <div className={styles.checkbox} />
                     {entry.avatarUrl ? (
                       <img className={styles.avatar} src={entry.avatarUrl} alt="" loading="lazy" />
                     ) : (
@@ -312,14 +312,14 @@ export function RosterView() {
             placeholder="本批运营备注（人类给 Agent 的运营意图，整批共享，如：地产意向客户，热情专业、以约看房为目标）"
             rows={2}
           />
-          {playbooks.length > 0 && (
+          {publishedPlaybooks.length > 0 && (
             <select
               className={styles.playbookSelect}
               value={playbookId}
               onChange={(e) => setPlaybookId(e.target.value)}
             >
               <option value="">账号默认运营方法</option>
-              {playbooks.map((p) => (
+              {publishedPlaybooks.map((p) => (
                 <option key={p.id} value={p.id}>
                   {p.name}
                 </option>

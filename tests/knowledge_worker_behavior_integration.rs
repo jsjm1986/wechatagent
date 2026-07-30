@@ -93,25 +93,52 @@ async fn committed_add_has_real_draft_side_effect() {
 
 async fn exercise_task_summary(app: &TestApp) -> anyhow::Result<()> {
     let id = ObjectId::new();
+    let now = DateTime::now();
     let task = KnowledgeChatTask {
         id: Some(id),
         workspace_id: "ws_worker".into(),
         account_id: "acc".into(),
         session_id: "sr126-worker-summary".into(),
+        owner_admin_id: Some("admin".into()),
         operator_id: Some("operator".into()),
         cards: vec![],
+        dispatch_binding: None,
         planned_steps: vec![
             doc! { "stepId": "noop", "cardId": "c1", "action": "analyze_logs" },
             doc! { "stepId": "manual", "cardId": "c2", "action": "review_evolution" },
             doc! { "stepId": "failed", "cardId": "c3", "action": "dismiss" },
         ],
         completed_steps: vec![],
+        step_intents: vec![],
         status: "pending".into(),
         error_kind: None,
-        created_at: DateTime::now(),
+        attempts: 0,
+        claim_generation: 0,
+        worker_id: None,
+        claim_token: None,
+        locked_until: None,
+        heartbeat_at: None,
+        created_at: now,
         started_at: None,
         finished_at: None,
     };
+    app.state
+        .db
+        .knowledge_chat_session_seqs()
+        .insert_one(
+            doc! {
+                "_id": "ws_worker|sr126-worker-summary",
+                "workspace_id": "ws_worker",
+                "account_id": "acc",
+                "session_id": "sr126-worker-summary",
+                "owner_admin_id": "admin",
+                "seq": 0_i64,
+                "created_at": now,
+                "updated_at": now,
+            },
+            None,
+        )
+        .await?;
     app.state
         .db
         .knowledge_chat_tasks()
@@ -125,6 +152,8 @@ async fn exercise_task_summary(app: &TestApp) -> anyhow::Result<()> {
         .find_one(doc! { "_id": id }, None)
         .await?
         .ok_or_else(|| anyhow::anyhow!("task disappeared"))?;
+    anyhow::ensure!(saved.status == "failed");
+    anyhow::ensure!(saved.error_kind.as_deref() == Some("knowledge_task_step_failed"));
     let statuses: Vec<&str> = saved
         .completed_steps
         .iter()

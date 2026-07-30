@@ -184,6 +184,9 @@ export function draftKindLabel(v?: string | null): string {
 
 /// 今日 Digest 报告状态
 export const REPORT_STATUS_LABELS: Record<string, string> = {
+  ok: "已生成",
+  partial: "部分生成",
+  running: "生成中",
   active: "已生成",
   generating: "生成中",
   failed: "生成失败",
@@ -273,6 +276,7 @@ export const CHAT_INTENT_LABELS: Record<string, string> = {
   clarify_chunk: "澄清核对",
   digest_action: "摘要派工",
   update_operator_memory: "更新运营记忆",
+  revoke_operator_memory: "撤销运营记忆",
   freeform: "自由对话",
 };
 export function chatIntentLabel(v?: string | null): string {

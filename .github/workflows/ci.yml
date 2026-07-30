@@ -41,6 +41,7 @@ on:
         default: 'ops'
         type: choice
         options:
+          - credential_probe
           - ops
           - nightly_full
           - smoke_t4
@@ -62,6 +63,63 @@ env:
   RUST_MIN_STACK: "8388608"
 
 jobs:
+  # HC-001：凭证轮换后的最小真测。只发一条合成 JSON 请求，不 checkout、不编译、
+  # 不打印或上传模型正文；用于确认 Actions Secret 与公开 provider 绑定同时生效。
+  credential-probe:
+    name: Rotated LLM credential probe (HC-001)
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.dispatch_target == 'credential_probe' }}
+    timeout-minutes: 5
+    env:
+      REAL_LLM_API_KEY: ${{ secrets.RSXERMU_KEY }}
+      REAL_LLM_BASE_URL: https://gateway.oeezzk.cn/v1
+      REAL_LLM_MODEL: gpt-5.6-auto
+      REAL_LLM_FORMAT: openai
+    steps:
+      - name: Require rotated credential
+        if: ${{ env.REAL_LLM_API_KEY == '' }}
+        run: |
+          echo "::error::RSXERMU_KEY is not configured"
+          exit 1
+      - name: Probe one synthetic JSON response
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.request
+
+          request = urllib.request.Request(
+              os.environ["REAL_LLM_BASE_URL"].rstrip("/") + "/chat/completions",
+              data=json.dumps({
+                  "model": os.environ["REAL_LLM_MODEL"],
+                  "temperature": 0,
+                  "max_tokens": 32,
+                  "messages": [
+                      {"role": "system", "content": "Return strict JSON only."},
+                      {"role": "user", "content": "Return exactly {\"ok\":true}."},
+                  ],
+              }).encode("utf-8"),
+              method="POST",
+              headers={
+                  "Authorization": "Bearer " + os.environ["REAL_LLM_API_KEY"],
+                  "Content-Type": "application/json",
+                  "User-Agent": "wechatagent-hc001-actions-probe",
+              },
+          )
+          with urllib.request.urlopen(request, timeout=45) as response:
+              payload = json.loads(response.read().decode("utf-8"))
+              if response.status != 200:
+                  raise SystemExit("provider probe did not return HTTP 200")
+          choices = payload.get("choices") or []
+          content = choices[0].get("message", {}).get("content", "") if choices else ""
+          content = content.strip().removeprefix("```json").removesuffix("```").strip()
+          parsed = json.loads(content)
+          if parsed.get("ok") is not True:
+              raise SystemExit("provider probe returned unexpected JSON")
+          print("HC001_CREDENTIAL_PROBE=ok")
+          PY
+
   # 路径分流:PR 上用 dorny/paths-filter 判定本次 diff 碰了 backend 还是 frontend。
   # baseline/integration 仅 backend 变更跑;frontend-contract 仅 frontend 变更跑。
   # 非 PR 事件(push/schedule/workflow_dispatch)无 PR diff 基线,filter 输出按"变更"处理,
@@ -147,10 +205,21 @@ jobs:
         shell: bash
         run: bash scripts/test-ci-lints.sh
 
+      - name: Reject tracked literal credentials (HC-001)
+        run: |
+          python3 scripts/check-secrets.py --self-test
+          python3 scripts/check-secrets.py
+
       # SR-004: keep critical business/security evidence blocking while the broad
       # Docker suite and variable model-quality suites remain diagnostic/nightly.
       - name: Check CI hard/soft gate policy (SR-004)
         run: python3 scripts/check-ci-gate-policy.py
+
+      - name: Check auditable Kiro task statuses (SR-179)
+        run: python3 scripts/check-task-status-manifest.py
+
+      - name: Check reproducible 47-domain audit status (SR-183)
+        run: python3 scripts/check-audit-status-manifest.py
 
   integration:
     name: Integration tests (Docker / testcontainers)
@@ -282,7 +351,7 @@ jobs:
       - name: Cache cargo registry / target
         uses: Swatinem/rust-cache@v2
 
-      - name: Run real Router and expired-session redlines
+      - name: Run real Router, auth-rate-limit, and expired-session redlines
         shell: bash
         env:
           RUSTFLAGS: ""
@@ -292,8 +361,11 @@ jobs:
           test "$router_count" -eq 1
           auth_count="$(cargo test --test auth_middleware_integration -- --list | grep -c '^expired_session_rejected_and_logout_idempotent: test$')"
           test "$auth_count" -eq 1
+          auth_rate_count="$(cargo test --test sr016_auth_rate_limit -- --list | grep -c '^login_and_token_share_limit_and_write_redacted_audit: test$')"
+          test "$auth_rate_count" -eq 1
           cargo test --test sr176_real_route_isolation sr176_real_router_enforces_read_write_and_expired_session_boundaries -- --ignored --exact --nocapture
           cargo test --test auth_middleware_integration expired_session_rejected_and_logout_idempotent -- --ignored --exact --nocapture
+          cargo test --test sr016_auth_rate_limit login_and_token_share_limit_and_write_redacted_audit -- --ignored --exact --nocapture
 
   frontend-contract:
     name: 前端契约对账 (tsc + vitest)
@@ -386,9 +458,9 @@ jobs:
           RUSTFLAGS: ""
           RUST_MIN_STACK: "8388608"
           # 文本主链路（T1/T2）走 claude-opus-4-8（rsxermu666.cn，Anthropic /v1/messages，非流式）。
-          REAL_LLM_BASE_URL: https://rsxermu666.cn
-          REAL_LLM_MODEL: claude-opus-4-8
-          REAL_LLM_FORMAT: anthropic
+          REAL_LLM_BASE_URL: https://gateway.oeezzk.cn/v1
+          REAL_LLM_MODEL: gpt-5.6-auto
+          REAL_LLM_FORMAT: openai
           # vision（T3）：claude 的 Anthropic 图片 block 未实现，故使用 NVIDIA 专职视觉模型；
           # 与文本主模型的 RSXERMU key/端点解耦，避免无 GPT vision 权限的 copilot key 返回 403。
           REAL_LLM_VISION_API_KEY: ${{ secrets.NVIDIA_KEY }}
@@ -404,9 +476,9 @@ jobs:
         if: ${{ env.REAL_LLM_API_KEY != '' }}
         env:
           RUSTFLAGS: ""
-          REAL_LLM_BASE_URL: https://rsxermu666.cn
-          REAL_LLM_MODEL: claude-opus-4-8
-          REAL_LLM_FORMAT: anthropic
+          REAL_LLM_BASE_URL: https://gateway.oeezzk.cn/v1
+          REAL_LLM_MODEL: gpt-5.6-auto
+          REAL_LLM_FORMAT: openai
         run: cargo test --test domain_profile_e2e -- --ignored --nocapture
 
       # 知识库全能力 smoke（real_llm_knowledge.rs K1–K9）：渐进式披露检索
@@ -422,9 +494,9 @@ jobs:
         env:
           RUSTFLAGS: ""
           # 文本知识链路（K1–K5/K7–K11）走 claude-opus-4-8（rsxermu，Anthropic /v1/messages）。
-          REAL_LLM_BASE_URL: https://rsxermu666.cn
-          REAL_LLM_MODEL: claude-opus-4-8
-          REAL_LLM_FORMAT: anthropic
+          REAL_LLM_BASE_URL: https://gateway.oeezzk.cn/v1
+          REAL_LLM_MODEL: gpt-5.6-auto
+          REAL_LLM_FORMAT: openai
           # vision（K6）：使用 NVIDIA 专职视觉模型，避免把无 GPT vision 权限的 RSXERMU key
           # 误接到 gpt-5.4；瞬时 5xx/超时仍按 LlmUnavailable 记录并由汇总门判定。
           REAL_LLM_VISION_API_KEY: ${{ secrets.NVIDIA_KEY }}
@@ -534,9 +606,9 @@ jobs:
         if: ${{ !cancelled() && env.REAL_LLM_API_KEY != '' }}
         env:
           RUSTFLAGS: ""
-          REAL_LLM_BASE_URL: https://rsxermu666.cn
-          REAL_LLM_MODEL: claude-opus-4-8
-          REAL_LLM_FORMAT: anthropic
+          REAL_LLM_BASE_URL: https://gateway.oeezzk.cn/v1
+          REAL_LLM_MODEL: gpt-5.6-auto
+          REAL_LLM_FORMAT: openai
           RECALL_STABILITY_RUNS: "3"
         run: cargo test --no-fail-fast --test real_llm_recall_benchmark ${{ matrix.t }} -- --ignored --nocapture
 
@@ -632,17 +704,17 @@ jobs:
         if: ${{ env.REAL_LLM_API_KEY != '' }}
         env:
           RUSTFLAGS: ""
-          REAL_LLM_BASE_URL: https://rsxermu666.cn
-          REAL_LLM_MODEL: claude-opus-4-8
-          REAL_LLM_FORMAT: anthropic
+          REAL_LLM_BASE_URL: https://gateway.oeezzk.cn/v1
+          REAL_LLM_MODEL: gpt-5.6-auto
+          REAL_LLM_FORMAT: openai
           REAL_LLM_JUDGE: "1"
           JUDGE_SAMPLES: "1"
           # 裁判用异族 gpt-5.4（rsxermu OpenAI /v1，端点强制流式 SSE 由 LlmClient 聚合兜底）——被测
           # claude 与裁判 gpt 天然跨家族，G-Eval/MT-Bench 方法论判分更可信。judge 走独立 JUDGE_*
           # 端点（claude 走 /v1/messages、gpt 走 /v1/chat/completions，端点串异故必须独立接线）。
           REAL_LLM_JUDGE_API_KEY: ${{ secrets.RSXERMU_KEY }}
-          REAL_LLM_JUDGE_BASE_URL: https://rsxermu666.cn/v1
-          REAL_LLM_JUDGE_MODEL: gpt-5.4
+          REAL_LLM_JUDGE_BASE_URL: https://gateway.oeezzk.cn/v1
+          REAL_LLM_JUDGE_MODEL: codex-auto-review
           REAL_LLM_JUDGE_FORMAT: openai
         run: cargo test --no-fail-fast --test real_llm_ops_smoke ${{ matrix.t }} -- --ignored --nocapture
 
@@ -702,14 +774,14 @@ jobs:
           # 手动单跑切 rsxermu666.cn 不限流端点（主 claude-opus-4-8 走 Anthropic 非
           # 流式；judge gpt-5.4 走 OpenAI，端点强制流式 SSE 由 LlmClient 聚合兜底），
           # 避免 NVIDIA 429 让多轮弧 turn-1 即 skip 出假绿。仅影响手动单跑入口。
-          REAL_LLM_BASE_URL: https://rsxermu666.cn
-          REAL_LLM_MODEL: claude-opus-4-8
-          REAL_LLM_FORMAT: anthropic
+          REAL_LLM_BASE_URL: https://gateway.oeezzk.cn/v1
+          REAL_LLM_MODEL: gpt-5.6-auto
+          REAL_LLM_FORMAT: openai
           REAL_LLM_JUDGE: "1"
           JUDGE_SAMPLES: "1"
           REAL_LLM_JUDGE_API_KEY: ${{ secrets.RSXERMU_KEY }}
-          REAL_LLM_JUDGE_BASE_URL: https://rsxermu666.cn/v1
-          REAL_LLM_JUDGE_MODEL: gpt-5.4
+          REAL_LLM_JUDGE_BASE_URL: https://gateway.oeezzk.cn/v1
+          REAL_LLM_JUDGE_MODEL: codex-auto-review
           REAL_LLM_JUDGE_FORMAT: openai
         run: cargo test --no-fail-fast --test real_llm_ops_smoke ${{ github.event.inputs.ops_test }} -- --ignored --nocapture
 
@@ -759,7 +831,7 @@ jobs:
         shell: bash
         run: |
           count="$(cargo test --test outbox_integration -- --list | grep -c '^delivery_redline_.*: test$')"
-          test "$count" -eq 4
+          test "$count" -eq 5
           cargo test --test outbox_integration delivery_redline_ -- --ignored --nocapture
           reaction_count="$(cargo test --test reaction_claim_lock -- --list | grep -c '^reaction_redline_.*: test$')"
           test "$reaction_count" -eq 2
@@ -770,9 +842,9 @@ jobs:
         env:
           RUSTFLAGS: ""
           RUST_MIN_STACK: "8388608"
-          REAL_LLM_BASE_URL: https://rsxermu666.cn
-          REAL_LLM_MODEL: claude-opus-4-8
-          REAL_LLM_FORMAT: anthropic
+          REAL_LLM_BASE_URL: https://gateway.oeezzk.cn/v1
+          REAL_LLM_MODEL: gpt-5.6-auto
+          REAL_LLM_FORMAT: openai
         run: cargo test --test real_llm_smoke t4_real_reply_review_reaction_stop_cancels_before_second_send -- --ignored --exact --nocapture
 
       - name: Upload T4 business transcript
@@ -868,16 +940,16 @@ jobs:
           # 被测内容生成 + 文本裁判全迁 rsxermu666.cn：被测 claude-opus-4-8（Anthropic /v1/messages）、
           # 文本裁判 gpt-5.4（OpenAI /v1，端点强制流式 SSE 由 LlmClient 聚合兜底）。被测/裁判跨家族
           # （anthropic/openai），跨家族分歧暴露 rubric 歧义。可选第三族 Qwen（NVIDIA）再加一层。
-          REAL_LLM_BASE_URL: https://rsxermu666.cn
-          REAL_LLM_MODEL: claude-opus-4-8
-          REAL_LLM_FORMAT: anthropic
+          REAL_LLM_BASE_URL: https://gateway.oeezzk.cn/v1
+          REAL_LLM_MODEL: gpt-5.6-auto
+          REAL_LLM_FORMAT: openai
           JUDGE_SAMPLES: "1"
           # 文本裁判端点（quality_judge_panel 读独立 REAL_LLM_JUDGE_* / 缺则回落主 base）。rsxermu 下
           # judge 仅 gpt-5.4 一款文本模型，双 checkpoint 塌成同模型；跨家族效度靠下方可选异族 Qwen 承担。
-          REAL_LLM_JUDGE_BASE_URL: https://rsxermu666.cn/v1
-          REAL_LLM_JUDGE_MODEL: gpt-5.4
+          REAL_LLM_JUDGE_BASE_URL: https://gateway.oeezzk.cn/v1
+          REAL_LLM_JUDGE_MODEL: codex-auto-review
           REAL_LLM_JUDGE_FORMAT: openai
-          REAL_LLM_JUDGE_LITE_MODEL: gpt-5.4
+          REAL_LLM_JUDGE_LITE_MODEL: codex-auto-review
           # vision 链路（Q3）：被测抽取使用 NVIDIA Nemotron VL；独立视觉裁判仍使用下方
           # VISION_JUDGE_* 配置，两者不共享模型，避免自评同源。
           REAL_LLM_VISION_API_KEY: ${{ secrets.NVIDIA_KEY }}
@@ -990,14 +1062,14 @@ jobs:
           # 端点串异故必须独立接线）。**不配 REAL_LLM_JUDGE_API_KEY**：judge1 的 key 经 judge_key 回落
           # 取主 RSXERMU_KEY；这样 strongest_model_client（读 JUDGE_API_KEY）返 None，agent failover 不被
           # 激活，被测纯度保住（被测恒 claude，不会抖动时切成 gpt）。
-          REAL_LLM_BASE_URL: https://rsxermu666.cn
-          REAL_LLM_MODEL: claude-opus-4-8
-          REAL_LLM_FORMAT: anthropic
-          REAL_LLM_JUDGE1_MODEL: gpt-5.4
-          REAL_LLM_JUDGE_BASE_URL: https://rsxermu666.cn/v1
-          REAL_LLM_JUDGE_MODEL: gpt-5.4
+          REAL_LLM_BASE_URL: https://gateway.oeezzk.cn/v1
+          REAL_LLM_MODEL: gpt-5.6-auto
+          REAL_LLM_FORMAT: openai
+          REAL_LLM_JUDGE1_MODEL: codex-auto-review
+          REAL_LLM_JUDGE_BASE_URL: https://gateway.oeezzk.cn/v1
+          REAL_LLM_JUDGE_MODEL: codex-auto-review
           REAL_LLM_JUDGE_FORMAT: openai
-          REAL_LLM_VISION_MODEL: gpt-5.4
+          REAL_LLM_VISION_MODEL: gpt-5.6-auto
           REAL_LLM_JUDGE: "1"
           JUDGE_SAMPLES: "1"
           REAL_LLM_LEDGER: target/real_llm_ledger
@@ -1109,14 +1181,14 @@ jobs:
         if: ${{ env.REAL_LLM_API_KEY != '' }}
         env:
           RUSTFLAGS: ""
-          REAL_LLM_BASE_URL: https://rsxermu666.cn
-          REAL_LLM_MODEL: claude-opus-4-8
-          REAL_LLM_FORMAT: anthropic
+          REAL_LLM_BASE_URL: https://gateway.oeezzk.cn/v1
+          REAL_LLM_MODEL: gpt-5.6-auto
+          REAL_LLM_FORMAT: openai
           REAL_LLM_JUDGE: "1"
           JUDGE_SAMPLES: "1"
           REAL_LLM_JUDGE_API_KEY: ${{ secrets.RSXERMU_KEY }}
-          REAL_LLM_JUDGE_BASE_URL: https://rsxermu666.cn/v1
-          REAL_LLM_JUDGE_MODEL: gpt-5.4
+          REAL_LLM_JUDGE_BASE_URL: https://gateway.oeezzk.cn/v1
+          REAL_LLM_JUDGE_MODEL: codex-auto-review
           REAL_LLM_JUDGE_FORMAT: openai
         run: cargo test --no-fail-fast --test roleplay_emotional_companion_e2e -- --ignored --nocapture
 
@@ -1173,14 +1245,14 @@ jobs:
         if: ${{ env.REAL_LLM_API_KEY != '' }}
         env:
           RUSTFLAGS: ""
-          REAL_LLM_BASE_URL: https://rsxermu666.cn
-          REAL_LLM_MODEL: claude-opus-4-8
-          REAL_LLM_FORMAT: anthropic
+          REAL_LLM_BASE_URL: https://gateway.oeezzk.cn/v1
+          REAL_LLM_MODEL: gpt-5.6-auto
+          REAL_LLM_FORMAT: openai
           REAL_LLM_JUDGE: "1"
           JUDGE_SAMPLES: "1"
           REAL_LLM_JUDGE_API_KEY: ${{ secrets.RSXERMU_KEY }}
-          REAL_LLM_JUDGE_BASE_URL: https://rsxermu666.cn/v1
-          REAL_LLM_JUDGE_MODEL: gpt-5.4
+          REAL_LLM_JUDGE_BASE_URL: https://gateway.oeezzk.cn/v1
+          REAL_LLM_JUDGE_MODEL: codex-auto-review
           REAL_LLM_JUDGE_FORMAT: openai
         run: cargo test --no-fail-fast --test roleplay_reviewer_pressure_calibration -- --ignored --nocapture
 
@@ -1245,9 +1317,9 @@ jobs:
         if: ${{ env.REAL_LLM_API_KEY != '' && env.ROLEPLAYER_API_KEY != '' }}
         env:
           RUSTFLAGS: ""
-          REAL_LLM_BASE_URL: https://rsxermu666.cn
-          REAL_LLM_MODEL: claude-opus-4-8
-          REAL_LLM_FORMAT: anthropic
+          REAL_LLM_BASE_URL: https://gateway.oeezzk.cn/v1
+          REAL_LLM_MODEL: gpt-5.6-auto
+          REAL_LLM_FORMAT: openai
           ROLEPLAYER_BASE_URL: https://integrate.api.nvidia.com/v1
           ROLEPLAYER_MODEL: meta/llama-3.3-70b-instruct
           ROLEPLAYER_FORMAT: openai
@@ -1344,12 +1416,12 @@ jobs:
         if: ${{ env.REAL_LLM_API_KEY != '' }}
         env:
           RUSTFLAGS: ""
-          REAL_LLM_BASE_URL: https://rsxermu666.cn
-          REAL_LLM_MODEL: claude-opus-4-8
-          REAL_LLM_FORMAT: anthropic
-          REAL_LLM_JUDGE1_MODEL: gpt-5.4
-          REAL_LLM_JUDGE_BASE_URL: https://rsxermu666.cn/v1
-          REAL_LLM_JUDGE_MODEL: gpt-5.4
+          REAL_LLM_BASE_URL: https://gateway.oeezzk.cn/v1
+          REAL_LLM_MODEL: gpt-5.6-auto
+          REAL_LLM_FORMAT: openai
+          REAL_LLM_JUDGE1_MODEL: codex-auto-review
+          REAL_LLM_JUDGE_BASE_URL: https://gateway.oeezzk.cn/v1
+          REAL_LLM_JUDGE_MODEL: codex-auto-review
           REAL_LLM_JUDGE_FORMAT: openai
           REAL_LLM_JUDGE: "1"
           JUDGE_SAMPLES: "1"

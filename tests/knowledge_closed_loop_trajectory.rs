@@ -101,7 +101,7 @@ async fn smoke_catalog_returns_seeded_chunk() {
 #[tokio::test]
 #[ignore]
 async fn chat_apply_verify_then_answer_is_auditable_closed_loop() {
-    let app = TestApp::start().await;
+    let app = TestApp::start_repl_set().await;
     let result = AssertUnwindSafe(async {
         reset_ws(&app).await;
         let admin = AuthenticatedAdmin {
@@ -400,7 +400,7 @@ async fn relation_graph_has_no_dangling_refs() {
 #[tokio::test]
 #[ignore]
 async fn unverified_draft_not_recallable_until_approved() {
-    let app = TestApp::start().await;
+    let app = TestApp::start_repl_set().await;
     reset_ws(&app).await;
 
     // 维护 agent 提案：落 needs_review（带 source_quote/source_anchors 以便后续 verify）。

@@ -2,40 +2,21 @@
 //!
 //! 本模块提供 [`AgentRunLog`] 的 R0 Run Envelope 生命周期原语。
 //!
-//! ⚠️ **接线状态（2026-07-13 核实）：R0 生命周期三函数在生产未接线。**
-//! 下述 `write_run_envelope_started` / `update_run_envelope_terminal` /
-//! `install_panic_hook_for_envelope` 均已实现并有集成测覆盖
-//! （`tests/run_envelope_integration.rs`，4 条不变量，`#[ignore]` / CI 跑），
-//! 但**没有任何生产调用点**：gateway 仍走单次 `insert_one` 的
-//! `write_agent_run_log_with_finalize`（`src/agent/gateway.rs`），并未先写
-//! `lifecycle="started"` 信封。因此「决策产出前 panic / 超时」的 run 目前
-//! **不留** started 信封，R0.1 的 pre-LLM 可追溯不变量在生产**尚未生效**。
-//! 对「决策已产出」的 run，单次 insert 的追溯是完整的；缺口仅限决策前的
-//! 极端 run。三函数保留备将来接线（见下方各自 doc 的接入设想），本模块的
-//! 其余常量 / 纯函数（`FINAL_REVIEW_STATUS_VALUES` / `SOURCE_KIND_*` /
-//! `derive_lifecycle_from_status` 等）已被 gateway / cohort / replay /
-//! observability 正常使用，不受此接线状态影响。
+//! 生产 Gateway 在生成 `run_id` 后、任何 LLM 调用前先写
+//! [`write_run_envelope_started`]，正常出口用 [`update_run_envelope_terminal`]
+//! 更新同一行；普通错误和 unwind panic 则通过 [`fail_run_envelope_if_open`]
+//! 只关闭仍处于 `started/running` 的信封，不覆盖已经完成的业务终态。
 //!
 //! * [`write_run_envelope_started`]：在任何 LLM 调用之前 `insert_one` 一条
 //!   `lifecycle="started"` 的信封记录，确保即使 Reply Agent 超时 / panic /
-//!   JSON 解析失败也有可追溯条目（requirements.md R0.1 / R0.5）。**未接线。**
+//!   JSON 解析失败也有可追溯条目（requirements.md R0.1 / R0.5）。
 //! * [`update_run_envelope_terminal`]：用 `update_one({run_id}, $set)` 落终态字段；
 //!   `matched_count == 0` 时走单次 `insert_one` 兜底 + 写
-//!   `agent_events kind="run_envelope_recovered_via_insert"`（R0.2）。**未接线。**
+//!   `agent_events kind="run_envelope_recovered_via_insert"`（R0.2）。
 //! * [`install_panic_hook_for_envelope`]：注册全局 `std::panic::set_hook`，把
 //!   panic message + location 通过 `tracing::error!` 输出。**实际的 lifecycle
 //!   推进**需在 `catch_unwind` 包装层完成（panic hook 不能直接调 async
-//!   update_one；强行 spawn 会有 panic-in-panic 风险）。**未接线。**
-//!
-//! 将来接线设想（尚未落地）：
-//! ```text
-//! write_run_envelope_started(&db, &run_id, ..).await?;
-//! let result = std::panic::catch_unwind(|| run_pipeline()).unwrap_or_else(|_| failed_terminal());
-//! update_run_envelope_terminal(&db, &run_id, build_terminal_fields(&result)).await?;
-//! ```
-//! 接线后 gateway 入口先调 [`write_run_envelope_started`]、主流程结束（含错误
-//! 路径）调 [`update_run_envelope_terminal`]，即可告别多次 insert 引发的
-//! DuplicateKey 风险。
+//!   update_one；强行 spawn 会有 panic-in-panic 风险）。
 
 use std::sync::{Arc, Once};
 
@@ -53,6 +34,9 @@ use crate::models::{AgentEvent, AgentRunLog};
 pub const SOURCE_KIND_INBOUND_MESSAGE: &str = "inbound_message";
 pub const SOURCE_KIND_FOLLOW_UP_TASK: &str = "follow_up_task";
 pub const SOURCE_KIND_MANUAL_SEND: &str = "manual_send";
+/// Durable internal cards sent to a configured principal. This source is not
+/// a customer reply and must not inherit customer conversation side effects.
+pub const SOURCE_KIND_PRINCIPAL_ESCALATION: &str = "principal_escalation";
 
 /// lifecycle 枚举（R0.3）。统一用 `&'static str` 暴露常量，避免散落字面量。
 pub const LIFECYCLE_STARTED: &str = "started";
@@ -150,6 +134,8 @@ pub const GATEWAY_STATUS_VALUES: &[&str] = &[
     // **重排**到醒来时刻（status 回 pending + run_at=wake）而非取消——避免丢承诺跟进。
     // 是 AI 自治内的"挑时段送达"过程态，不是失败、更不是把对话交给真人。
     "quiet_hours_deferred",
+    // Gateway 外层在内部错误或 panic 时使用；具体原因写入 error/error_summary。
+    "internal_error",
 ];
 
 /// 严禁取值（R2.7 业务语义保护 + R9.2）。任何 finalReviewStatus / gateway_status
@@ -414,6 +400,7 @@ pub async fn write_run_envelope_started(
         token_budget: 0,
         tokens_used: 0,
         llm_calls_used: 0,
+        unknown_usage_calls: 0,
         degraded_reasons: Vec::new(),
         lifecycle: LIFECYCLE_STARTED.to_string(),
         source_event_id: source_event_id.to_string(),
@@ -438,6 +425,30 @@ pub async fn write_run_envelope_started(
     Ok(())
 }
 
+/// 首份业务决策成功形成后，把信封从 `started` 原子推进到 `running`，并保存
+/// 当时的决策快照。CAS 只命中开放的 `started` 行，绝不把终态重新打开。
+///
+/// 返回 `true` 表示本调用完成了状态推进；返回 `false` 表示信封已不在
+/// `started`（例如重复调用或并发终结）。
+pub async fn mark_run_envelope_running(
+    db: &Database,
+    run_id: &str,
+    decision: Document,
+) -> AppResult<bool> {
+    let result = db
+        .agent_run_logs()
+        .update_one(
+            doc! { "run_id": run_id, "lifecycle": LIFECYCLE_STARTED },
+            doc! { "$set": {
+                "lifecycle": LIFECYCLE_RUNNING,
+                "decision": decision,
+            } },
+            None,
+        )
+        .await?;
+    Ok(result.modified_count > 0)
+}
+
 /// R0.2 / R0.4：终态字段集合。所有字段都是 `Option<T>` —— 调用方按需 set，
 /// `None` 字段在 `$set` Document 里**不出现**，这样可以多次 update 而不互相
 /// 覆盖（例如先落 lifecycle / final_review_status，再异步落 outbox_status）。
@@ -446,6 +457,13 @@ pub async fn write_run_envelope_started(
 /// `AgentRunLog` 字段命名一致）。
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct AgentRunLogTerminalFields {
+    /// 恢复路径所需身份字段；正常 update 也会再次写入相同值。
+    pub workspace_id: Option<String>,
+    pub account_id: Option<String>,
+    pub contact_wxid: Option<String>,
+    pub trigger_kind: Option<String>,
+    pub source_event_id: Option<String>,
+    pub source_kind: Option<String>,
     pub lifecycle: Option<String>,
     pub status: Option<String>,
     pub planner: Option<Document>,
@@ -460,6 +478,7 @@ pub struct AgentRunLogTerminalFields {
     pub token_budget: Option<i64>,
     pub tokens_used: Option<i64>,
     pub llm_calls_used: Option<i32>,
+    pub unknown_usage_calls: Option<i32>,
     pub degraded_reasons: Option<Vec<String>>,
     pub revision_applied: Option<bool>,
     pub revision_reason: Option<String>,
@@ -479,6 +498,24 @@ impl AgentRunLogTerminalFields {
     /// 这是公开方法，便于 W1 task 2.6 单元测试直接断言 set 文档形态。
     pub fn to_set_document(&self) -> Document {
         let mut set = Document::new();
+        if let Some(value) = &self.workspace_id {
+            set.insert("workspace_id", value);
+        }
+        if let Some(value) = &self.account_id {
+            set.insert("account_id", value);
+        }
+        if let Some(value) = &self.contact_wxid {
+            set.insert("contact_wxid", value);
+        }
+        if let Some(value) = &self.trigger_kind {
+            set.insert("trigger_kind", value);
+        }
+        if let Some(value) = &self.source_event_id {
+            set.insert("source_event_id", value);
+        }
+        if let Some(value) = &self.source_kind {
+            set.insert("source_kind", value);
+        }
         if let Some(value) = &self.lifecycle {
             set.insert("lifecycle", value);
         }
@@ -521,6 +558,9 @@ impl AgentRunLogTerminalFields {
         if let Some(value) = self.llm_calls_used {
             set.insert("llm_calls_used", value);
         }
+        if let Some(value) = self.unknown_usage_calls {
+            set.insert("unknown_usage_calls", value);
+        }
         if let Some(value) = &self.degraded_reasons {
             set.insert("degraded_reasons", value.clone());
         }
@@ -559,6 +599,43 @@ impl AgentRunLogTerminalFields {
         }
         set
     }
+}
+
+/// 把尚未终结的 Gateway 信封关闭为内部失败。两次 CAS 区分失败发生在决策前
+/// (`started`) 还是已经进入决策/投递阶段 (`running`)；终态行不会被覆盖。
+/// 返回 `true` 表示本调用实际关闭了一个开放信封。
+pub async fn fail_run_envelope_if_open(
+    db: &Database,
+    run_id: &str,
+    summary: &str,
+) -> AppResult<bool> {
+    let summary: String = summary.chars().take(1024).collect();
+    for (from, to) in [
+        (LIFECYCLE_STARTED, LIFECYCLE_FAILED_BEFORE_DECISION),
+        (LIFECYCLE_RUNNING, LIFECYCLE_FAILED_AFTER_DECISION),
+    ] {
+        let result = db
+            .agent_run_logs()
+            .update_one(
+                doc! { "run_id": run_id, "lifecycle": from },
+                doc! { "$set": {
+                    "status": "internal_error",
+                    "gateway_result": {
+                        "gatewayStatus": "internal_error",
+                        "reason": &summary,
+                    },
+                    "error": &summary,
+                    "error_summary": &summary,
+                    "lifecycle": to,
+                } },
+                None,
+            )
+            .await?;
+        if result.modified_count > 0 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// R0.2：把终态字段写入 `agent_run_logs.{run_id}`；matched_count == 0 时走
@@ -638,9 +715,9 @@ pub async fn update_run_envelope_terminal(
         id: None,
         // workspace_id 在恢复路径下未知；保持空字符串占位，由后续治理工具
         // 按 run_id JOIN agent_run_logs 找到正确的 workspace。
-        workspace_id: String::new(),
-        account_id: String::new(),
-        contact_wxid: None,
+        workspace_id: fields.workspace_id.clone().unwrap_or_default(),
+        account_id: fields.account_id.clone().unwrap_or_default(),
+        contact_wxid: fields.contact_wxid.clone(),
         kind: EVENT_RUN_ENVELOPE_RECOVERED_VIA_INSERT.to_string(),
         status: "warning".to_string(),
         summary: format!("agent_run_envelope_missing for run_id={run_id}"),
@@ -664,12 +741,15 @@ async fn insert_envelope_recovery(
 ) -> AppResult<()> {
     let envelope = AgentRunLog {
         id: None,
-        workspace_id: String::new(),
-        account_id: String::new(),
-        contact_wxid: None,
+        workspace_id: fields.workspace_id.clone().unwrap_or_default(),
+        account_id: fields.account_id.clone().unwrap_or_default(),
+        contact_wxid: fields.contact_wxid.clone(),
         run_id: run_id.to_string(),
         // trigger_kind 在恢复路径下未知；用占位字符串，避免和 normal write 冲突。
-        trigger_kind: "envelope_recovered".to_string(),
+        trigger_kind: fields
+            .trigger_kind
+            .clone()
+            .unwrap_or_else(|| "envelope_recovered".to_string()),
         status: fields
             .status
             .clone()
@@ -684,10 +764,11 @@ async fn insert_envelope_recovery(
         token_budget: fields.token_budget.unwrap_or(0),
         tokens_used: fields.tokens_used.unwrap_or(0),
         llm_calls_used: fields.llm_calls_used.unwrap_or(0),
+        unknown_usage_calls: fields.unknown_usage_calls.unwrap_or(0),
         degraded_reasons: fields.degraded_reasons.clone().unwrap_or_default(),
         lifecycle: fields.lifecycle.clone().unwrap_or_default(),
-        source_event_id: String::new(),
-        source_kind: String::new(),
+        source_event_id: fields.source_event_id.clone().unwrap_or_default(),
+        source_kind: fields.source_kind.clone().unwrap_or_default(),
         error_summary: fields.error_summary.clone(),
         abort_reason: fields.abort_reason.clone(),
         revision_applied: fields.revision_applied.unwrap_or(false),
@@ -783,6 +864,7 @@ mod tests {
             revision_applied: Some(false),
             tokens_used: Some(1234),
             llm_calls_used: Some(2),
+            unknown_usage_calls: Some(1),
             ..Default::default()
         }
     }
@@ -798,6 +880,7 @@ mod tests {
         assert_eq!(set.get_bool("revision_applied").unwrap(), false);
         assert_eq!(set.get_i64("tokens_used").unwrap(), 1234);
         assert_eq!(set.get_i32("llm_calls_used").unwrap(), 2);
+        assert_eq!(set.get_i32("unknown_usage_calls").unwrap(), 1);
         // None 字段不应出现在 $set 里
         assert!(!set.contains_key("error"));
         assert!(!set.contains_key("error_summary"));
@@ -1324,6 +1407,7 @@ mod tests {
             token_budget: 0,
             tokens_used: 0,
             llm_calls_used: 0,
+            unknown_usage_calls: 0,
             degraded_reasons: Vec::new(),
             lifecycle: LIFECYCLE_STARTED.to_string(),
             source_event_id: "evt_42".to_string(),
@@ -1382,6 +1466,7 @@ mod tests {
             token_budget: 30000,
             tokens_used: 12345,
             llm_calls_used: 3,
+            unknown_usage_calls: 1,
             degraded_reasons: vec!["review_skipped_budget_exceeded".to_string()],
             lifecycle: LIFECYCLE_COMPLETED.to_string(),
             source_event_id: "evt_99".to_string(),

@@ -482,6 +482,8 @@ impl ShadowReplayExt for ShadowReplay {
 pub async fn aggregate_and_grade(
     state: &crate::routes::AppState,
     experiment_id: &str,
+    workspace_id: &str,
+    account_id: &str,
 ) -> Result<(usize, usize), super::error::EvolutionError> {
     use futures::TryStreamExt;
     use mongodb::bson::DateTime;
@@ -492,7 +494,14 @@ pub async fn aggregate_and_grade(
     let mut proposals: Vec<crate::models::Proposal> = state
         .db
         .proposals()
-        .find(doc! { "experiment_id": experiment_id }, None)
+        .find(
+            doc! {
+                "experiment_id": experiment_id,
+                "workspace_id": workspace_id,
+                "account_id": account_id,
+            },
+            None,
+        )
         .await
         .map_err(super::error::EvolutionError::from)?
         .try_collect()
@@ -515,7 +524,14 @@ pub async fn aggregate_and_grade(
         let replays: Vec<ShadowReplay> = state
             .db
             .shadow_replays()
-            .find(doc! { "proposal_id": proposal_id }, None)
+            .find(
+                doc! {
+                    "proposal_id": proposal_id,
+                    "workspace_id": workspace_id,
+                    "account_id": account_id,
+                },
+                None,
+            )
             .await
             .map_err(super::error::EvolutionError::from)?
             .try_collect()
@@ -571,7 +587,15 @@ pub async fn aggregate_and_grade(
         let _ = state
             .db
             .proposals()
-            .update_one(doc! { "_id": proposal_id }, doc! { "$set": update }, None)
+            .update_one(
+                doc! {
+                    "_id": proposal_id,
+                    "workspace_id": workspace_id,
+                    "account_id": account_id,
+                },
+                doc! { "$set": update },
+                None,
+            )
             .await
             .map_err(super::error::EvolutionError::from)?;
     }

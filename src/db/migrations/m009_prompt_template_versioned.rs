@@ -35,27 +35,27 @@ pub(super) async fn run_step(db: &Database) -> AppResult<()> {
         .aggregate(
             vec![
                 doc! {
-                    "$match": {
-                        "current_version": false,
-                        "status": { "$ne": "archived" },
+                    "$match": { "status": { "$ne": "archived" } }
+                },
+                doc! {
+                    "$addFields": {
+                        "_migration_active_priority": {
+                            "$cond": [{ "$eq": ["$status", "active"] }, 1, 0]
+                        }
                     }
                 },
                 doc! {
                     "$sort": {
                         "workspace_id": 1,
                         "prompt_key": 1,
+                        "_migration_active_priority": -1,
                         "version": -1,
                     }
                 },
                 doc! {
                     "$group": {
                         "_id": { "workspace_id": "$workspace_id", "prompt_key": "$prompt_key" },
-                        "active_id": {
-                            "$first": {
-                                "$cond": [{ "$eq": ["$status", "active"] }, "$_id", Bson::Null]
-                            }
-                        },
-                        "fallback_id": { "$first": "$_id" },
+                        "target_id": { "$first": "$_id" },
                     }
                 },
             ],
@@ -64,13 +64,17 @@ pub(super) async fn run_step(db: &Database) -> AppResult<()> {
         .await?;
     let mut promoted: u64 = 0;
     while let Some(group) = cursor.try_next().await? {
-        let target_id = group
-            .get("active_id")
-            .and_then(|b| b.as_object_id())
-            .or_else(|| group.get("fallback_id").and_then(|b| b.as_object_id()));
-        let Some(target) = target_id else {
+        let scope = group.get_document("_id").ok();
+        let workspace_id = scope.and_then(|value| value.get_str("workspace_id").ok());
+        let prompt_key = scope.and_then(|value| value.get_str("prompt_key").ok());
+        let target_id = group.get("target_id").and_then(|b| b.as_object_id());
+        let (Some(workspace_id), Some(prompt_key), Some(target)) =
+            (workspace_id, prompt_key, target_id)
+        else {
             continue;
         };
+        // Promote first so interruption cannot leave the scope with zero
+        // current rows. The following demotion makes retries converge to one.
         let result = coll
             .update_one(
                 doc! { "_id": target },
@@ -79,6 +83,16 @@ pub(super) async fn run_step(db: &Database) -> AppResult<()> {
             )
             .await?;
         promoted += result.modified_count;
+        coll.update_many(
+            doc! {
+                "workspace_id": workspace_id,
+                "prompt_key": prompt_key,
+                "_id": { "$ne": target },
+            },
+            doc! { "$set": { "current_version": false } },
+            None,
+        )
+        .await?;
     }
 
     tracing::info!(

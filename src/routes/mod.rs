@@ -21,7 +21,8 @@ use crate::{
 // list_accounts / sync_accounts / update_account_mcp_key handler 真函数，仿 admin_suspected_deals 先例。
 pub mod accounts;
 pub mod admin_ops_versions;
-mod admin_outbox;
+// pub:outbox_scope_integration.rs 直调真实取消 handler，验证账号错配零写。
+pub mod admin_outbox;
 mod admin_relationship_suggestions;
 mod admin_state_policies;
 pub mod admin_suspected_deals;
@@ -76,7 +77,8 @@ mod observability;
 pub mod operation_view;
 mod outcome_metrics;
 mod outcomes_autonomy;
-mod playbooks;
+// pub:playbook_scope_integration.rs 直调真实写 handler，验证账号/版本 CAS 与零写。
+pub mod playbooks;
 // pub（非默认私有）：ask_human_phase1_e2e.rs 集成测试需从 tests/ crate 直调
 // resolve / reassign / list handler 真函数及其请求体结构，仿 domain_profiles 先例。
 pub mod principal_escalations;
@@ -166,6 +168,7 @@ use assets::{create_content_asset, list_content_assets};
 use behavior_signal_metrics::list_behavior_signal_metrics;
 use campaigns::{
     campaign_sends_report, create_campaign, dispatch_campaign, list_campaigns, preview_campaign,
+    update_campaign_draft,
 };
 use contacts::{
     add_deal_event, analyze_contact_profile, batch_enable_endpoint, clear_referral, count_contacts,
@@ -224,15 +227,16 @@ use knowledge::{
     list_knowledge_gap_signals, list_knowledge_usage, list_operation_knowledge,
     list_operation_knowledge_chunk_revisions, list_operation_knowledge_chunks,
     list_operation_knowledge_document_chunks, list_operation_knowledge_documents,
-    list_operator_memory, merge_operation_knowledge_chunk, open_operation_knowledge_slices,
-    patch_operation_knowledge_chunk, propose_chunk_repair, record_repair_apply,
+    list_operation_knowledge_review_queue, list_operator_memory, merge_operation_knowledge_chunk,
+    open_operation_knowledge_slices, patch_operation_knowledge_chunk,
+    patch_operation_knowledge_document, propose_chunk_repair, record_repair_apply,
     refresh_operation_knowledge_completeness, reject_operation_knowledge_chunk,
     relate_operation_knowledge_chunk, restore_operation_knowledge_chunk,
-    rollback_operation_knowledge_chunk, search_operation_knowledge_tool,
-    split_operation_knowledge_chunk, sweep_knowledge_gap_signals, test_operation_knowledge_match,
-    unrelate_operation_knowledge_chunk, update_ingest_source, update_operation_knowledge,
-    update_operation_knowledge_chunk, update_operation_knowledge_document,
-    verify_operation_knowledge_chunk,
+    revoke_operator_memory as revoke_operator_memory_http, rollback_operation_knowledge_chunk,
+    search_operation_knowledge_tool, split_operation_knowledge_chunk, sweep_knowledge_gap_signals,
+    test_operation_knowledge_match, unrelate_operation_knowledge_chunk, update_ingest_source,
+    update_operation_knowledge, update_operation_knowledge_chunk,
+    update_operation_knowledge_document, verify_operation_knowledge_chunk,
 };
 use lessons_learned::{list_lessons_learned, promote_lesson_to_peer_case};
 use llm_providers::{
@@ -275,10 +279,9 @@ pub struct AppState {
     pub db: Database,
     pub mcp: McpClient,
     pub llm: Arc<dyn LlmProvider>,
-    /// 当前激活 provider 的热替换 wrapper。生产路径 `main.rs` 让 `llm` 与
-    /// 这里指向同一个 [`LlmRegistry`] 实例；前端「启用 provider」走
-    /// `routes/llm_providers` 时取这个字段进行原子 swap，写一次新 client
-    /// 后整个进程的 LLM 调用就切换到新配置。测试可填 `None`，使用 mock。
+    /// Workspace-scoped active-provider registry. Production LLM entry points
+    /// resolve an immutable snapshot by request workspace; provider changes only
+    /// replace that workspace slot. Tests may set this to `None` and use `llm`.
     pub llm_registry: Option<Arc<LlmRegistry>>,
     pub config: AppConfig,
     /// agent-self-evolution M4 W4 Task 5.3：prompt 包版本号。
@@ -303,8 +306,8 @@ pub struct AppState {
     /// （与 `LlmRegistry` 的运行时热替换不同——双 reviewer 故意不热切以保持
     /// epistemic 对照稳定）。
     pub second_reviewer_llm: Option<Arc<dyn LlmProvider>>,
-    /// Phase G P1-4：知识 chunk 软锁表。进程内 DashMap，重启清空。
-    /// key=chunk_id；value 含 owner / 过期时间，TTL 见 [`chunk_locks::CHUNK_LOCK_TTL_SECONDS`]。
+    /// Phase G P1-4：知识 chunk advisory presence 表。进程内 DashMap，重启清空。
+    /// key=(workspace_id, chunk_id)；只作协作提示，不授予写权或阻止 mutation。
     pub chunk_locks: chunk_locks::ChunkLockMap,
     /// Phase G P1-4：知识 chunk 事件总线。WebSocket handler 订阅；
     /// patch/archive/restore/... handler 写入 `Revised` 事件。
@@ -313,6 +316,9 @@ pub struct AppState {
     /// Phase G P1-7：RS256 JWT keypair。`jwt_enabled=false` → None；
     /// `true` 时 main.rs 启动期 `JwtKeys::from_config` 解码 PEM 失败直接 panic。
     pub jwt_keys: Option<Arc<crate::auth::jwt::JwtKeys>>,
+    /// Shared login/token limiter. Kept in AppState so both public endpoints
+    /// consume one atomic client+target attempt budget.
+    pub auth_rate_limiter: Arc<crate::auth::rate_limit::AuthRateLimiter>,
     /// F-013：operation-knowledge completeness 的进程内 TTL 缓存。
     pub completeness_cache: CompletenessCache,
 }
@@ -473,6 +479,7 @@ pub fn api_router(state: AppState) -> Router<AppState> {
             "/operation-knowledge/documents/:id",
             get(get_operation_knowledge_document)
                 .put(update_operation_knowledge_document)
+                .patch(patch_operation_knowledge_document)
                 .delete(delete_operation_knowledge_document),
         )
         .route(
@@ -482,6 +489,10 @@ pub fn api_router(state: AppState) -> Router<AppState> {
         .route(
             "/operation-knowledge/chunks",
             get(list_operation_knowledge_chunks).post(create_operation_knowledge_chunk),
+        )
+        .route(
+            "/operation-knowledge/review-queue",
+            get(list_operation_knowledge_review_queue),
         )
         .route(
             "/operation-knowledge/chunks/:id",
@@ -546,7 +557,7 @@ pub fn api_router(state: AppState) -> Router<AppState> {
             "/operation-knowledge/chunks/:id/relate/:target_id",
             axum::routing::delete(unrelate_operation_knowledge_chunk),
         )
-        // ── Phase G P1-4 · 软锁 + WebSocket 事件总线 ───────────────────────────
+        // ── Phase G P1-4 · advisory presence + WebSocket 事件总线 ─────────────
         .route(
             "/operation-knowledge/chunks/:id/lock",
             post(chunk_locks::acquire_chunk_lock).delete(chunk_locks::release_chunk_lock),
@@ -607,6 +618,10 @@ pub fn api_router(state: AppState) -> Router<AppState> {
         .route("/knowledge/ask/stream", get(ask_knowledge_stream))
         .route("/knowledge/metrics", get(knowledge_metrics))
         .route("/knowledge/operator-memory", get(list_operator_memory))
+        .route(
+            "/knowledge/operator-memory/:id/revoke",
+            post(revoke_operator_memory_http),
+        )
         .route(
             "/operation-knowledge/tools/open-slice",
             post(open_operation_knowledge_slices),
@@ -779,6 +794,7 @@ pub fn api_router(state: AppState) -> Router<AppState> {
         .route("/products/:product_id/archive", post(archive_product))
         .route("/products/:product_id/restore", post(restore_product))
         .route("/campaigns", post(create_campaign).get(list_campaigns))
+        .route("/campaigns/:id", patch(update_campaign_draft))
         .route("/campaigns/:id/preview", post(preview_campaign))
         .route("/campaigns/:id/dispatch", post(dispatch_campaign))
         .route("/campaigns/:id/sends", get(campaign_sends_report))

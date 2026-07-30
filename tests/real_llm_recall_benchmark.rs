@@ -1470,7 +1470,7 @@ async fn chat_update_and_verify(
 async fn recall_benchmark_maintenance_stability() {
     let mut evidence = CapabilityEvidence::new("recall_maintenance");
     let llm = require_real_llm!();
-    let app = TestApp::start().await;
+    let app = TestApp::start_repl_set().await;
     let mcp = dummy_mcp_server().await;
     let state = common::rebuild_app_state_with_real_llm(&app, llm, mcp.uri());
     let ws = "recall_maint_ws"; // 独立 ws 避免污染
@@ -1902,7 +1902,7 @@ async fn answer_reach_adopt(
 async fn recall_benchmark_gap_closed_loop_trajectory() {
     let mut evidence = CapabilityEvidence::new("recall_gap_closed_loop");
     let llm = require_real_llm!();
-    let app = TestApp::start().await;
+    let app = TestApp::start_repl_set().await;
     let mcp = dummy_mcp_server().await;
     let state = common::rebuild_app_state_with_real_llm(&app, llm, mcp.uri());
     let ws = "recall_closed_loop_ws"; // 独立 ws 避免污染

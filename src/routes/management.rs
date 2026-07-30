@@ -7,10 +7,11 @@ use axum::{
 use futures::TryStreamExt;
 use mongodb::{
     bson::{doc, to_bson, to_document, DateTime, Document},
-    options::FindOptions,
+    options::{FindOneAndUpdateOptions, FindOptions, ReturnDocument},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 
 use crate::{
@@ -48,6 +49,13 @@ pub(super) struct ManagementMessageRequest {
     dry_run: Option<bool>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ConfirmManagementCommandRequest {
+    account_id: String,
+    plan_hash: String,
+}
+
 #[derive(Debug, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct ManagementPlan {
@@ -80,53 +88,243 @@ pub(super) struct PlanExecution {
     pub calls: Vec<Value>,
     pub outcomes: Vec<(String, ToolOutcome)>,
     pub failed: Option<String>,
+    pub execution_unknown: bool,
 }
 
-/// 执行一组 plan tool_calls：对每个工具 insert tool_call → 调 execute_management_tool
-/// → 核实 outcome（assert_tool_outcome）→ 写终态（过闭集断言）→ 收集 calls/outcomes。
-/// 业务 Failed 与 Err 都"失败即止"（set failed + break）；Unverified 不算失败继续。
-/// post_message 与 confirm 共用，避免两份执行逻辑漂移（项目历史踩过 dual-path drift）。
-///
-/// 调用方决定要执行哪些 tool_calls：post_message 在 requires_confirmation 时传空切片
-/// （等价原 take(0)，不执行只暂存），否则传 plan.tool_calls；confirm 已确认全执行。
-/// 函数内部对传入切片做 `.take(12)` 上限（防一个 plan 塞超量工具）。
+const MANAGEMENT_EXECUTION_LEASE_MILLIS: i64 = 5 * 60 * 1000;
+
+fn management_plan_hash(plan: &ManagementPlan) -> AppResult<String> {
+    let bytes = serde_json::to_vec(plan)?;
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn management_tool_intent_key(
+    command_run_id: mongodb::bson::oid::ObjectId,
+    plan_hash: &str,
+    call_index: usize,
+) -> String {
+    format!("management-tool:v1:{command_run_id}:{plan_hash}:{call_index}")
+}
+
+fn tool_call_json(call: &AgentToolCall) -> Value {
+    json!({
+        "id": call.id.map(|id| id.to_hex()).unwrap_or_default(),
+        "toolName": call.tool_name,
+        "arguments": call.arguments,
+        "status": call.status,
+        "response": call.response,
+        "error": call.error,
+    })
+}
+
+async fn load_management_command_calls(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+    command_run_id: mongodb::bson::oid::ObjectId,
+) -> AppResult<Vec<Value>> {
+    let mut cursor = state
+        .db
+        .tool_calls()
+        .find(
+            doc! {
+                "workspace_id": workspace_id,
+                "account_id": account_id,
+                "command_run_id": command_run_id,
+            },
+            FindOptions::builder()
+                .sort(doc! { "call_index": 1, "created_at": 1 })
+                .build(),
+        )
+        .await?;
+    let mut calls = Vec::new();
+    while let Some(call) = cursor.try_next().await? {
+        calls.push(tool_call_json(&call));
+    }
+    Ok(calls)
+}
+
+fn persisted_tool_outcome(call: &AgentToolCall) -> Option<ToolOutcome> {
+    match call.status.as_str() {
+        "succeeded" | "dry_run" => Some(ToolOutcome::Succeeded),
+        "failed" => Some(ToolOutcome::Failed(
+            call.error
+                .clone()
+                .unwrap_or_else(|| "tool execution failed".to_string()),
+        )),
+        "executed_unverified" => {
+            Some(ToolOutcome::Unverified(call.error.clone().unwrap_or_else(
+                || "tool result requires verification".to_string(),
+            )))
+        }
+        "execution_unknown" => Some(ToolOutcome::ExecutionUnknown(
+            call.error
+                .clone()
+                .unwrap_or_else(|| "tool execution outcome is unknown".to_string()),
+        )),
+        _ => None,
+    }
+}
+
+async fn load_tool_call_by_intent(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+    intent_key: &str,
+) -> AppResult<AgentToolCall> {
+    state
+        .db
+        .tool_calls()
+        .find_one(
+            doc! {
+                "workspace_id": workspace_id,
+                "account_id": account_id,
+                "intent_key": intent_key,
+            },
+            None,
+        )
+        .await?
+        .ok_or_else(|| AppError::External("management tool intent missing".to_string()))
+}
+
+/// Execute a frozen plan through durable per-call intents. A terminal intent is
+/// reused. A prepared intent may be claimed exactly once. An intent left in
+/// executing by a crashed process is never replayed: it converges to
+/// execution_unknown and stops the remaining plan.
 pub(super) async fn execute_plan_tool_calls(
     state: &AppState,
     workspace_id: &str,
     account_id: &str,
     tool_calls: &[PlannedToolCall],
     command_run_id: mongodb::bson::oid::ObjectId,
+    plan_hash: &str,
     dry_run: bool,
     advertised: &HashSet<String>,
+    confirmed_admin: Option<&AuthenticatedAdmin>,
 ) -> AppResult<PlanExecution> {
     let mut calls = Vec::new();
     let mut outcomes: Vec<(String, ToolOutcome)> = Vec::new();
     let mut failed = None;
-    for planned in tool_calls.iter().take(12) {
+    let mut execution_unknown = false;
+    for (call_index, planned) in tool_calls.iter().take(12).enumerate() {
+        let intent_key = management_tool_intent_key(command_run_id, plan_hash, call_index);
         let arguments_doc = to_document(&planned.arguments).unwrap_or_else(|_| Document::new());
+        let now = DateTime::now();
         let call_start = AgentToolCall {
             id: None,
             workspace_id: workspace_id.to_string(),
             account_id: account_id.to_string(),
             command_run_id,
+            intent_key: Some(intent_key.clone()),
+            call_index: call_index as i32,
             tool_name: planned.tool_name.clone(),
             arguments: arguments_doc.clone(),
-            status: if should_dry_run_tool(&planned.tool_name, dry_run) {
-                "dry_run".to_string()
-            } else {
-                "running".to_string()
-            },
+            status: "prepared".to_string(),
             response: None,
             error: None,
-            created_at: DateTime::now(),
-            updated_at: DateTime::now(),
+            execution_started_at: None,
+            finalized_at: None,
+            created_at: now,
+            updated_at: now,
         };
         crate::models::assert_tool_call_status_valid(&call_start.status);
-        let call_result = state.db.tool_calls().insert_one(call_start, None).await?;
-        let call_id = call_result
-            .inserted_id
-            .as_object_id()
+        match state.db.tool_calls().insert_one(&call_start, None).await {
+            Ok(_) => {}
+            Err(error) if crate::routes::admin_taxonomies::is_duplicate_key_error(&error) => {}
+            Err(error) => return Err(error.into()),
+        }
+        let mut stored =
+            load_tool_call_by_intent(state, workspace_id, account_id, &intent_key).await?;
+
+        if let Some(outcome) = persisted_tool_outcome(&stored) {
+            calls.push(tool_call_json(&stored));
+            outcomes.push((planned.tool_name.clone(), outcome.clone()));
+            match outcome {
+                ToolOutcome::Failed(reason) => {
+                    failed = Some(reason);
+                    break;
+                }
+                ToolOutcome::ExecutionUnknown(reason) => {
+                    failed = Some(reason);
+                    execution_unknown = true;
+                    break;
+                }
+                ToolOutcome::Succeeded | ToolOutcome::Unverified(_) => continue,
+            }
+        }
+
+        if stored.status == "executing" {
+            let reason = "previous process stopped after execution began; outcome is unknown and the tool will not be replayed";
+            crate::models::assert_tool_call_status_valid("execution_unknown");
+            state
+                .db
+                .tool_calls()
+                .update_one(
+                    doc! {
+                        "_id": stored.id,
+                        "workspace_id": workspace_id,
+                        "account_id": account_id,
+                        "status": "executing",
+                    },
+                    doc! {
+                        "$set": {
+                            "status": "execution_unknown",
+                            "error": reason,
+                            "finalized_at": DateTime::now(),
+                            "updated_at": DateTime::now(),
+                        }
+                    },
+                    None,
+                )
+                .await?;
+            stored = load_tool_call_by_intent(state, workspace_id, account_id, &intent_key).await?;
+            calls.push(tool_call_json(&stored));
+            outcomes.push((
+                planned.tool_name.clone(),
+                ToolOutcome::ExecutionUnknown(reason.to_string()),
+            ));
+            failed = Some(reason.to_string());
+            execution_unknown = true;
+            break;
+        }
+        if stored.status != "prepared" {
+            return Err(AppError::Conflict(format!(
+                "management_tool_intent_invalid_status:{}",
+                stored.status
+            )));
+        }
+
+        let call_id = stored
+            .id
             .ok_or_else(|| AppError::External("tool call id missing".to_string()))?;
+        let execution_started_at = DateTime::now();
+        let claimed = state
+            .db
+            .tool_calls()
+            .update_one(
+                doc! {
+                    "_id": call_id,
+                    "workspace_id": workspace_id,
+                    "account_id": account_id,
+                    "status": "prepared",
+                },
+                doc! {
+                    "$set": {
+                        "status": "executing",
+                        "execution_started_at": execution_started_at,
+                        "updated_at": execution_started_at,
+                    }
+                },
+                None,
+            )
+            .await?;
+        if claimed.modified_count != 1 {
+            return Err(AppError::Conflict(
+                "management_tool_intent_claim_conflict".to_string(),
+            ));
+        }
         let result = execute_management_tool(
             state,
             workspace_id,
@@ -134,6 +332,7 @@ pub(super) async fn execute_plan_tool_calls(
             planned,
             dry_run,
             advertised,
+            confirmed_admin,
         )
         .await;
         let is_dry_run = should_dry_run_tool(&planned.tool_name, dry_run);
@@ -150,31 +349,39 @@ pub(super) async fn execute_plan_tool_calls(
                     (ToolOutcome::Succeeded, _) => "succeeded",
                     (ToolOutcome::Failed(_), _) => "failed",
                     (ToolOutcome::Unverified(_), _) => "executed_unverified",
+                    (ToolOutcome::ExecutionUnknown(_), _) => "execution_unknown",
                 };
                 let response_doc = to_document(&response).ok();
                 crate::models::assert_tool_call_status_valid(status_str);
-                state
+                let finalized = state
                     .db
                     .tool_calls()
                     .update_one(
-                        doc! { "_id": call_id },
+                        doc! {
+                            "_id": call_id,
+                            "workspace_id": workspace_id,
+                            "account_id": account_id,
+                            "status": "executing",
+                        },
                         doc! {
                             "$set": {
                                 "status": status_str,
                                 "response": response_doc,
+                                "finalized_at": DateTime::now(),
                                 "updated_at": DateTime::now()
                             }
                         },
                         None,
                     )
                     .await?;
-                calls.push(json!({
-                    "id": call_id.to_hex(),
-                    "toolName": planned.tool_name,
-                    "arguments": planned.arguments,
-                    "status": status_str,
-                    "response": response
-                }));
+                if finalized.modified_count != 1 {
+                    return Err(AppError::Conflict(
+                        "management_tool_finalize_conflict".to_string(),
+                    ));
+                }
+                stored =
+                    load_tool_call_by_intent(state, workspace_id, account_id, &intent_key).await?;
+                calls.push(tool_call_json(&stored));
                 outcomes.push((planned.tool_name.clone(), outcome.clone()));
                 // 业务 Failed 走的是 Ok(response) 分支（RPC 成功但结果失败），
                 // 与原 Err 分支"失败即止"语义对齐：设 failed 并 break。
@@ -187,28 +394,35 @@ pub(super) async fn execute_plan_tool_calls(
             Err(error) => {
                 let message = error.to_string();
                 crate::models::assert_tool_call_status_valid("failed");
-                state
+                let finalized = state
                     .db
                     .tool_calls()
                     .update_one(
-                        doc! { "_id": call_id },
+                        doc! {
+                            "_id": call_id,
+                            "workspace_id": workspace_id,
+                            "account_id": account_id,
+                            "status": "executing",
+                        },
                         doc! {
                             "$set": {
                                 "status": "failed",
                                 "error": &message,
+                                "finalized_at": DateTime::now(),
                                 "updated_at": DateTime::now()
                             }
                         },
                         None,
                     )
                     .await?;
-                calls.push(json!({
-                    "id": call_id.to_hex(),
-                    "toolName": planned.tool_name,
-                    "arguments": planned.arguments,
-                    "status": "failed",
-                    "error": message
-                }));
+                if finalized.modified_count != 1 {
+                    return Err(AppError::Conflict(
+                        "management_tool_finalize_conflict".to_string(),
+                    ));
+                }
+                stored =
+                    load_tool_call_by_intent(state, workspace_id, account_id, &intent_key).await?;
+                calls.push(tool_call_json(&stored));
                 failed = Some(message);
                 break;
             }
@@ -218,17 +432,23 @@ pub(super) async fn execute_plan_tool_calls(
         calls,
         outcomes,
         failed,
+        execution_unknown,
     })
 }
 
-/// 乐观锁过滤条件：仅命中本 workspace 下、状态为 pending_confirmation 的命令。
-/// 带 workspace_id 防 IDOR（不能跨 workspace 确认他人命令）；带 status 防二次确认
-/// / 防确认非待确认命令（confirm 与 reject 共用同一条件）。
 pub(super) fn build_confirm_filter(
     workspace_id: &str,
     run_id: &mongodb::bson::oid::ObjectId,
+    account_id: &str,
+    plan_hash: &str,
 ) -> Document {
-    doc! { "_id": run_id, "workspace_id": workspace_id, "status": "pending_confirmation" }
+    doc! {
+        "_id": run_id,
+        "workspace_id": workspace_id,
+        "account_id": account_id,
+        "plan_hash": plan_hash,
+        "status": "pending_confirmation",
+    }
 }
 
 pub(super) async fn create_management_session(
@@ -300,7 +520,8 @@ pub(super) async fn post_management_message(
         )
         .await?;
 
-    let tools = mcp::list_tools_for_account(&state, &payload.account_id).await?;
+    let tools =
+        mcp::list_tools_for_account(&state, &admin.current_workspace, &payload.account_id).await?;
     let tools = merge_product_tools(tools);
     let advertised_tools = advertised_tool_names(&tools);
     let context = management_context(&state, &admin.current_workspace, &payload.account_id).await?;
@@ -315,7 +536,24 @@ pub(super) async fn post_management_message(
     )
     .await?;
     apply_locked_send_content(&mut plan, &payload.content, effective_dry_run)?;
+    let plan_hash = management_plan_hash(&plan)?;
     let plan_doc = to_document(&plan)?;
+    let tool_names: Vec<&str> = plan
+        .tool_calls
+        .iter()
+        .map(|call| call.tool_name.as_str())
+        .collect();
+    let requires_confirmation = !effective_dry_run
+        && (plan.requires_confirmation
+            || plan.risk_level.eq_ignore_ascii_case("dangerous")
+            || plan_requires_confirmation(&tool_names, true));
+    let execution_token = (!requires_confirmation).then(|| uuid::Uuid::new_v4().to_string());
+    let execution_started_at = execution_token.as_ref().map(|_| DateTime::now());
+    let initial_status = if requires_confirmation {
+        "pending_confirmation"
+    } else {
+        "running"
+    };
     let prompt_versions = prompts::prompt_versions(
         &state.db,
         &admin.current_workspace,
@@ -330,10 +568,15 @@ pub(super) async fn post_management_message(
         account_id: payload.account_id.clone(),
         session_id,
         operator_message: payload.content.clone(),
-        status: "running".to_string(),
+        status: initial_status.to_string(),
         plan: Some(plan_doc.clone()),
+        plan_hash: Some(plan_hash.clone()),
         summary: plan.summary.clone(),
         error: None,
+        execution_token: execution_token.clone(),
+        execution_started_at,
+        confirmed_by: None,
+        confirmed_at: None,
         prompt_versions: prompt_versions.clone(),
         created_at: DateTime::now(),
         updated_at: DateTime::now(),
@@ -343,19 +586,6 @@ pub(super) async fn post_management_message(
         .inserted_id
         .as_object_id()
         .ok_or_else(|| AppError::External("command run id missing".to_string()))?;
-    let tool_names: Vec<&str> = plan
-        .tool_calls
-        .iter()
-        .map(|c| c.tool_name.as_str())
-        .collect();
-    let requires_confirmation = plan.requires_confirmation
-        || plan.risk_level.eq_ignore_ascii_case("dangerous")
-        // §1.2 第一期 dangerous 开关仍关（传 false，不放大权限），但 §4.3 verify/§4.2 irreversible
-        // 恒确认硬门无视开关：安全裁定交代码，不靠 LLM 自报 requiresConfirmation/riskLevel。
-        || plan_requires_confirmation(&tool_names, false);
-    // 抽公共执行函数后，"0 还是全部"由调用方传切片控制：requires_confirmation 时传空切片
-    // （等价原 take(0)，只暂存不执行），否则传全部 tool_calls（函数内 take(12) 上限保留）。
-    // confirm 与 post_message 共用同一执行函数，避免 dual-path drift。
     let exec = execute_plan_tool_calls(
         &state,
         &admin.current_workspace,
@@ -366,8 +596,10 @@ pub(super) async fn post_management_message(
             plan.tool_calls.as_slice()
         },
         run_id,
+        &plan_hash,
         effective_dry_run,
         &advertised_tools,
+        None,
     )
     .await?;
     let calls = exec.calls;
@@ -388,21 +620,55 @@ pub(super) async fn post_management_message(
     } else {
         "succeeded"
     };
-    state
-        .db
-        .command_runs()
-        .update_one(
-            doc! { "_id": run_id },
-            doc! {
-                "$set": {
-                    "status": final_status,
-                    "error": &failed,
-                    "updated_at": DateTime::now()
-                }
-            },
-            None,
-        )
-        .await?;
+    let finalized = if requires_confirmation {
+        state
+            .db
+            .command_runs()
+            .update_one(
+                doc! {
+                    "_id": run_id,
+                    "workspace_id": &admin.current_workspace,
+                    "account_id": &payload.account_id,
+                    "plan_hash": &plan_hash,
+                    "status": "pending_confirmation",
+                },
+                doc! { "$set": { "updated_at": DateTime::now() } },
+                None,
+            )
+            .await?
+    } else {
+        state
+            .db
+            .command_runs()
+            .update_one(
+                doc! {
+                    "_id": run_id,
+                    "workspace_id": &admin.current_workspace,
+                    "account_id": &payload.account_id,
+                    "plan_hash": &plan_hash,
+                    "status": "running",
+                    "execution_token": execution_token.as_deref(),
+                },
+                doc! {
+                    "$set": {
+                        "status": final_status,
+                        "error": &failed,
+                        "updated_at": DateTime::now(),
+                    },
+                    "$unset": {
+                        "execution_token": "",
+                        "execution_started_at": "",
+                    }
+                },
+                None,
+            )
+            .await?
+    };
+    if finalized.matched_count != 1 {
+        return Err(AppError::Conflict(
+            "management_command_finalize_conflict".to_string(),
+        ));
+    }
     let assistant_text = if requires_confirmation {
         if plan.summary.trim().is_empty() {
             "该指令涉及高风险或需要确认的动作，已生成计划但未执行。".to_string()
@@ -438,6 +704,8 @@ pub(super) async fn post_management_message(
     Ok(Json(json!({
         "command": {
             "id": run_id.to_hex(),
+            "accountId": payload.account_id,
+            "planHash": plan_hash,
             "status": final_status,
             "summary": assistant_text,
             "plan": plan,
@@ -447,7 +715,7 @@ pub(super) async fn post_management_message(
     })))
 }
 
-/// 确认并执行此前因高风险被暂存（pending_confirmation）的命令。
+/// Confirm and execute a frozen command that is pending explicit approval.
 /// 乐观锁仿 escalation/ledger.rs::resolve_escalation：find_one_and_update 仅命中
 /// pending_confirmation 原子改 running，二次确认/并发只一个命中，其余拿 None 幂等返回。
 /// filter 带 workspace_id 防 IDOR（不能跨 workspace 确认他人命令）。
@@ -455,26 +723,133 @@ pub(super) async fn confirm_management_command(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
+    Json(payload): Json<ConfirmManagementCommandRequest>,
 ) -> AppResult<Json<Value>> {
+    let account_id = payload.account_id.trim();
+    let requested_plan_hash = payload.plan_hash.trim();
+    if account_id.is_empty() || requested_plan_hash.is_empty() {
+        return Err(AppError::BadRequest(
+            "accountId and planHash are required".to_string(),
+        ));
+    }
+    validate_account(&state, &admin.current_workspace, account_id).await?;
     let run_id = parse_object_id(&id)?;
+
+    // Validate the frozen plan before taking the execution lease. Legacy
+    // commands without a plan hash and commands whose plan was changed after
+    // rendering are intentionally not executable.
+    let candidate = state
+        .db
+        .command_runs()
+        .find_one(
+            doc! {
+                "_id": run_id,
+                "workspace_id": &admin.current_workspace,
+                "account_id": account_id,
+                "plan_hash": requested_plan_hash,
+            },
+            None,
+        )
+        .await?;
+    let Some(candidate) = candidate else {
+        return Err(AppError::Conflict(
+            "management_command_binding_mismatch_or_legacy".to_string(),
+        ));
+    };
+    let plan: ManagementPlan = candidate
+        .plan
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| AppError::Conflict("management_plan_missing".to_string()))
+        .and_then(|document| {
+            mongodb::bson::from_document(document)
+                .map_err(|_| AppError::Conflict("management_plan_invalid".to_string()))
+        })?;
+    if management_plan_hash(&plan)? != requested_plan_hash {
+        return Err(AppError::Conflict(
+            "management_plan_hash_mismatch".to_string(),
+        ));
+    }
+
+    if !matches!(
+        candidate.status.as_str(),
+        "pending_confirmation" | "running"
+    ) {
+        let calls =
+            load_management_command_calls(&state, &admin.current_workspace, account_id, run_id)
+                .await?;
+        return Ok(Json(json!({
+            "status": candidate.status,
+            "summary": candidate.summary,
+            "toolCalls": calls,
+        })));
+    }
+
+    let now = DateTime::now();
+    let stale_before =
+        DateTime::from_millis(now.timestamp_millis() - MANAGEMENT_EXECUTION_LEASE_MILLIS);
+    let execution_token = uuid::Uuid::new_v4().to_string();
     let run = state
         .db
         .command_runs()
         .find_one_and_update(
-            build_confirm_filter(&admin.current_workspace, &run_id),
-            doc! { "$set": { "status": "running", "updated_at": DateTime::now() } },
-            None,
+            doc! {
+                "_id": run_id,
+                "workspace_id": &admin.current_workspace,
+                "account_id": account_id,
+                "plan_hash": requested_plan_hash,
+                "$or": [
+                    { "status": "pending_confirmation" },
+                    {
+                        "status": "running",
+                        "execution_started_at": { "$lte": stale_before },
+                    },
+                ],
+            },
+            doc! {
+                "$set": {
+                    "status": "running",
+                    "execution_token": &execution_token,
+                    "execution_started_at": now,
+                    "confirmed_by": admin.username.trim(),
+                    "confirmed_at": now,
+                    "updated_at": now,
+                }
+            },
+            FindOneAndUpdateOptions::builder()
+                .return_document(ReturnDocument::After)
+                .build(),
         )
         .await?;
     let Some(run) = run else {
-        return Ok(Json(json!({ "status": "already_processed_or_not_found" })));
+        let current = state
+            .db
+            .command_runs()
+            .find_one(
+                doc! {
+                    "_id": run_id,
+                    "workspace_id": &admin.current_workspace,
+                    "account_id": account_id,
+                    "plan_hash": requested_plan_hash,
+                },
+                None,
+            )
+            .await?;
+        let Some(current) = current else {
+            return Ok(Json(json!({ "status": "already_processed_or_not_found" })));
+        };
+        let calls =
+            load_management_command_calls(&state, &admin.current_workspace, account_id, run_id)
+                .await?;
+        return Ok(Json(json!({
+            "status": current.status,
+            "summary": current.summary,
+            "toolCalls": calls,
+        })));
     };
-    let plan: ManagementPlan = run
-        .plan
-        .as_ref()
-        .and_then(|d| mongodb::bson::from_document(d.clone()).ok())
-        .unwrap_or_default();
-    let tools = merge_product_tools(mcp::list_tools_for_account(&state, &run.account_id).await?);
+    let tools = merge_product_tools(
+        mcp::list_tools_for_account(&state, &admin.current_workspace, &run.account_id).await?,
+    );
     let advertised = advertised_tool_names(&tools);
     // 确认后真执行（非 dry_run），全执行已确认的 tool_calls（与 post_message 共用执行函数）。
     let exec = execute_plan_tool_calls(
@@ -483,25 +858,52 @@ pub(super) async fn confirm_management_command(
         &run.account_id,
         &plan.tool_calls,
         run_id,
+        requested_plan_hash,
         false,
         &advertised,
+        Some(&admin),
     )
     .await?;
     let summary = build_execution_summary(&exec.outcomes);
-    let final_status = if exec.failed.is_some() {
+    let final_status = if exec.execution_unknown {
+        "execution_unknown"
+    } else if exec.failed.is_some() {
         "failed"
     } else {
         "succeeded"
     };
-    state
+    let finalized = state
         .db
         .command_runs()
         .update_one(
-            doc! { "_id": run_id },
-            doc! { "$set": { "status": final_status, "summary": &summary, "error": &exec.failed, "updated_at": DateTime::now() } },
+            doc! {
+                "_id": run_id,
+                "workspace_id": &admin.current_workspace,
+                "account_id": account_id,
+                "plan_hash": requested_plan_hash,
+                "status": "running",
+                "execution_token": &execution_token,
+            },
+            doc! {
+                "$set": {
+                    "status": final_status,
+                    "summary": &summary,
+                    "error": &exec.failed,
+                    "updated_at": DateTime::now(),
+                },
+                "$unset": {
+                    "execution_token": "",
+                    "execution_started_at": "",
+                }
+            },
             None,
         )
         .await?;
+    if finalized.matched_count != 1 {
+        return Err(AppError::Conflict(
+            "management_command_finalize_conflict".to_string(),
+        ));
+    }
     state
         .db
         .management_messages()
@@ -531,13 +933,22 @@ pub(super) async fn reject_management_command(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
+    Json(payload): Json<ConfirmManagementCommandRequest>,
 ) -> AppResult<Json<Value>> {
+    let account_id = payload.account_id.trim();
+    let plan_hash = payload.plan_hash.trim();
+    if account_id.is_empty() || plan_hash.is_empty() {
+        return Err(AppError::BadRequest(
+            "accountId and planHash are required".to_string(),
+        ));
+    }
+    validate_account(&state, &admin.current_workspace, account_id).await?;
     let run_id = parse_object_id(&id)?;
     let run = state
         .db
         .command_runs()
         .find_one_and_update(
-            build_confirm_filter(&admin.current_workspace, &run_id),
+            build_confirm_filter(&admin.current_workspace, &run_id, account_id, plan_hash),
             doc! { "$set": { "status": "canceled", "updated_at": DateTime::now() } },
             None,
         )
@@ -604,6 +1015,7 @@ pub(super) async fn get_management_command(
         "item": {
             "id": run_id.to_hex(),
             "accountId": run.account_id,
+            "planHash": run.plan_hash,
             "status": run.status,
             "summary": run.summary,
             "error": run.error,
@@ -616,16 +1028,51 @@ pub(super) async fn get_management_command(
 
 pub(super) async fn get_tool_catalog(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Query(query): Query<AccountScopedQuery>,
 ) -> AppResult<Json<Value>> {
     let account_id = query
         .account_id
         .unwrap_or_else(|| state.config.default_account_id.clone());
-    let tools = merge_product_tools(mcp::list_tools_for_account(&state, &account_id).await?);
+    validate_account(&state, &admin.current_workspace, &account_id).await?;
+    let tools = merge_product_tools(
+        mcp::list_tools_for_account(&state, &admin.current_workspace, &account_id).await?,
+    );
     Ok(Json(json!({ "tools": tools })))
 }
 
+fn is_forbidden_raw_send_tool(tool_name: &str) -> bool {
+    tool_name.starts_with("message_send_")
+}
+
+fn remove_forbidden_raw_send_tools(value: &mut Value) {
+    match value {
+        Value::Array(items) => {
+            items.retain(|item| {
+                let name = item
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .or_else(|| item.as_str());
+                !name.is_some_and(is_forbidden_raw_send_tool)
+            });
+            for item in items {
+                remove_forbidden_raw_send_tools(item);
+            }
+        }
+        Value::Object(map) => {
+            for item in map.values_mut() {
+                remove_forbidden_raw_send_tools(item);
+            }
+        }
+        _ => {}
+    }
+}
+
 pub(super) fn merge_product_tools(mut tools: Value) -> Value {
+    // Raw MCP send tools bypass the product gateway's contact eligibility,
+    // content lock, review, ledger, and idempotency controls. Never advertise
+    // them to the planner; the execution fallback rejects them independently.
+    remove_forbidden_raw_send_tools(&mut tools);
     let product_tools = vec![
         json!({
             "name": "wechatagent.search_contacts",
@@ -798,11 +1245,11 @@ pub(super) fn merge_product_tools(mut tools: Value) -> Value {
         }),
         json!({
             "name": "wechatagent.edit_playbook",
-            "description": "编辑指定运营 playbook（方法论/口吻/禁则/成功标准等）。参数：playbookId，body（OperationPlaybookRequest：name、methodPrompt 等）。改本体并 +1 版本。"
+            "description": "编辑指定运营 playbook（立即改生产方法论）。参数：playbookId、accountId、expectedVersion，以及 name、methodPrompt 等完整正文。accountId/expectedVersion 必须复制当前 Playbook 上下文。"
         }),
         json!({
             "name": "wechatagent.set_default_playbook",
-            "description": "把指定运营 playbook 设为账号默认（生效）playbook。参数：playbookId。注：playbook 无独立发布动作，设为默认即生效。"
+            "description": "把指定运营 playbook 设为账号默认（立即生效）。参数：playbookId、accountId、expectedVersion，三者必须复制当前 Playbook 上下文。"
         }),
         json!({
             "name": "wechatagent.generate_playbook",
@@ -810,7 +1257,7 @@ pub(super) fn merge_product_tools(mut tools: Value) -> Value {
         }),
         json!({
             "name": "wechatagent.optimize_playbook",
-            "description": "用自然语言指令优化指定运营 playbook（内部跑 LLM）。参数：playbookId，body（OptimizePlaybookRequest：instruction）。"
+            "description": "用自然语言指令优化指定运营 playbook（内部跑 LLM，只生成新的非默认候选，不修改当前生产方法论）。参数：playbookId、accountId、expectedVersion、instruction；身份和版本必须复制当前 Playbook 上下文。"
         }),
         json!({
             "name": "wechatagent.edit_state_machine",
@@ -835,19 +1282,19 @@ pub(super) fn merge_product_tools(mut tools: Value) -> Value {
         }),
         json!({
             "name": "wechatagent.patch_knowledge_chunk",
-            "description": "局部修改指定知识切片内容（留修订历史）。参数：chunkId，body（ChunkPatchRequest）。"
+            "description": "局部修改指定知识切片内容并退回待审（留修订历史）。参数：chunkId、patch（可编辑内容字段对象），可选 reason。"
         }),
         json!({
             "name": "wechatagent.split_knowledge_chunk",
-            "description": "把一条知识切片拆成多条。参数：chunkId，body（ChunkSplitRequest）。"
+            "description": "按 Unicode 字符位置把一条知识切片拆成两条待审草稿。参数：chunkId、offset（正整数），可选 reason。"
         }),
         json!({
             "name": "wechatagent.merge_knowledge_chunk",
-            "description": "把指定知识切片与其它切片合并。参数：chunkId，body（ChunkMergeRequest）。"
+            "description": "把指定知识切片合并到同作用域目标并退回待审。参数：chunkId、targetId，可选 reason。"
         }),
         json!({
             "name": "wechatagent.relate_knowledge_chunk",
-            "description": "为指定知识切片建立与其它切片的关联关系。参数：chunkId，body（ChunkRelateRequest）。"
+            "description": "为指定知识切片建立关联。参数：chunkId、targetId、kind（references/requires/contradicts/clarifies/refines/superseded_by），可选 note/reason。"
         }),
         json!({
             "name": "wechatagent.batch_verify_chunks",
@@ -863,7 +1310,7 @@ pub(super) fn merge_product_tools(mut tools: Value) -> Value {
         }),
         json!({
             "name": "wechatagent.import_knowledge_text",
-            "description": "把整理好的文本知识导入为运营知识切片（落库 status=draft，需后续人核验）。参数：body（OperationKnowledgeImportApplyRequest：items 或 chunkedText 等）。"
+            "description": "提交当前确认管理员已生成的知识导入预览（落库 status=draft，需后续人核验）。参数：previewId、previewHash、chunks（每项含 candidateId 与可选 patch）；不能绕过 import-preview。"
         }),
         json!({
             "name": "wechatagent.import_knowledge_image",
@@ -872,15 +1319,15 @@ pub(super) fn merge_product_tools(mut tools: Value) -> Value {
         // ── 批 4：需小重构才接入的工具（抽内部 fn / scope 校验 / 字节 helper）──
         json!({
             "name": "wechatagent.cancel_outbox",
-            "description": "取消指定的待发送 outbox 条目（仅 pending/in_flight 可取消，可逆单对象）。参数：id（outbox 条目 id），cancelReason（取消原因，上限 200 字）。"
+            "description": "取消当前命令账号下指定的待发送 outbox 条目（仅 pending/in_flight 可取消，可逆单对象）。参数：id（outbox 条目 id），cancelReason（取消原因，上限 200 字）。"
         }),
         json!({
             "name": "wechatagent.approve_relationship_suggestion",
-            "description": "审核通过指定的 relationship_type 建议，回写好友的关系类型（经维度字典校验）。参数：id（建议 id），可选 reviewedBy。"
+            "description": "审核通过指定的 relationship_type 建议，回写好友的关系类型（经维度字典校验）。参数：id（建议 id）。审核 actor 固定记录为 management_agent。"
         }),
         json!({
             "name": "wechatagent.approve_taxonomy_candidate",
-            "description": "审核通过指定的标签候选并写入标签字典（出草稿性质）。仅可审 scope=global 或本账号的候选。参数：id（候选 id），canonicalValue（id、label、可选 aliases/description），可选 reviewedBy。"
+            "description": "审核通过指定的标签候选并写入标签字典（出草稿性质）。仅可审 scope=global 或本账号的候选。参数：id（候选 id），canonicalValue（id、label、可选 aliases/description）。审核 actor 固定记录为 management_agent。"
         }),
         json!({
             "name": "wechatagent.import_knowledge_pdf",
@@ -888,11 +1335,11 @@ pub(super) fn merge_product_tools(mut tools: Value) -> Value {
         }),
         json!({
             "name": "wechatagent.preview_campaign",
-            "description": "创建活动并预览圈中多少客户（只读，不发送）。先建活动再按条件圈人，返回命中人数+抽样示例。参数：title(活动名)，intentText(活动意图要点，将作为给客户的推送语境)，segmentFilter(圈人条件对象：productIds 买过的产品id数组、aftercare 售后状态 in_aftercare|expired|any、valueTier 价值分层 high|mid|low、customerStage 客户阶段，各项可选留空即不限)。返回 campaignId 供后续 dispatch。"
+            "description": "创建一条活动草稿并做纯计算圈人预览（不会发送）。返回 campaignId、specVersion、specHash、命中人数和抽样；后续 dispatch 必须原样携带 specVersion/specHash。参数：title(活动名)，intentText(活动意图要点)，segmentFilter(圈人条件对象：productIds、aftercare、valueTier、customerStage)。"
         }),
         json!({
             "name": "wechatagent.dispatch_campaign",
-            "description": "确认扇出活动推送：给圈中的每个客户创建主动跟进任务，由 AI 结合各自画像生成个性化话术并经发送网关逐条发出。高风险动作，执行前必须确认。参数：campaignId（先用 preview_campaign 拿到并核对命中人数）。"
+            "description": "确认扇出活动推送：按已确认的不可变规格动态重圈一次并冻结本批受众，再可靠物化逐人跟进任务。高风险动作，执行前必须确认。参数：campaignId、specVersion、specHash（三者必须来自同一次 preview_campaign 返回）。"
         }),
     ];
     match &mut tools {
@@ -1134,13 +1581,11 @@ pub(super) fn tool_effect(tool_name: &str) -> ToolEffect {
         | "wechatagent.query_metrics"
         | "wechatagent.query_health"
         | "wechatagent.query_inbox"
-        | "wechatagent.query_send_ledger"
-        | "wechatagent.preview_campaign" => (Readonly, true),
+        | "wechatagent.query_send_ledger" => (Readonly, true),
         // 低风险可逆写
         // agent-policy.md allows these raw MCP actions to run automatically
         // under the current phase-one policy. Keep that behavior explicit.
-        "message_send_text"
-        | "media_get"
+        "media_get"
         | "schedule_create"
         | "schedule_cancel"
         | "wechatagent.import_contacts"
@@ -1165,12 +1610,8 @@ pub(super) fn tool_effect(tool_name: &str) -> ToolEffect {
         | "wechatagent.review_task_now"
         | "wechatagent.cancel_task"
         | "wechatagent.resolve_principal_escalation"
-        // 批 3：策略编辑（soul/playbook 编辑出草稿、不放量；generate/optimize 跑 LLM 出草稿）= Low
+        // 批 3：Soul 编辑只改草稿；Playbook 相关写会直接改变运行时方法论，见 Dangerous 分支。
         | "wechatagent.edit_soul"
-        | "wechatagent.edit_playbook"
-        | "wechatagent.set_default_playbook"
-        | "wechatagent.generate_playbook"
-        | "wechatagent.optimize_playbook"
         | "wechatagent.promote_lesson"
         // 批 3：知识维护（可逆单对象写 / 落 draft 待核验）= Low
         | "wechatagent.archive_knowledge_chunk"
@@ -1187,9 +1628,14 @@ pub(super) fn tool_effect(tool_name: &str) -> ToolEffect {
         | "wechatagent.cancel_outbox"
         | "wechatagent.approve_relationship_suggestion"
         | "wechatagent.approve_taxonomy_candidate"
-        | "wechatagent.import_knowledge_pdf" => (Low, true),
+        | "wechatagent.import_knowledge_pdf"
+        | "wechatagent.preview_campaign" => (Low, true),
         // 高风险/宽影响（立即全量/改全局）
         "wechatagent.send_contact_message"
+        | "wechatagent.edit_playbook"
+        | "wechatagent.set_default_playbook"
+        | "wechatagent.generate_playbook"
+        | "wechatagent.optimize_playbook"
         | "wechatagent.publish_prompt_template"
         | "wechatagent.edit_state_machine"
         | "wechatagent.provider_activate"
@@ -1234,6 +1680,7 @@ pub(super) enum ToolOutcome {
     Succeeded,
     Failed(String),
     Unverified(String),
+    ExecutionUnknown(String),
 }
 
 /// 核实工具调用的"业务结果"——区别于"调用返回 Ok"。返回 Ok 不等于业务成功
@@ -1291,6 +1738,9 @@ pub(super) fn build_execution_summary(results: &[(String, ToolOutcome)]) -> Stri
             ToolOutcome::Succeeded => lines.push(format!("✅ {tool}：已完成")),
             ToolOutcome::Failed(why) => lines.push(format!("❌ {tool}：失败——{why}")),
             ToolOutcome::Unverified(why) => lines.push(format!("⚠️ {tool}：已执行待核实——{why}")),
+            ToolOutcome::ExecutionUnknown(why) => {
+                lines.push(format!("⛔ {tool}：执行结果未知，已停止自动重放——{why}"))
+            }
         }
     }
     lines.join("\n")
@@ -1300,28 +1750,16 @@ pub(super) fn build_execution_summary(results: &[(String, ToolOutcome)]) -> Stri
 /// 包成 AI 工具会"AI 调用被记成人确认"——故恒强制确认，不随第一期开关放行（spec §4.3）。
 /// batch_verify_chunks 同属 verify 类，一并恒确认；未进入显式风险表的动态工具也
 /// fail closed，避免 `tools/list` 新增能力在第一阶段 dangerous 总闸关闭时自动执行。
-pub(super) fn tool_always_requires_confirmation(tool_name: &str) -> bool {
-    matches!(
-        tool_name,
-        "wechatagent.verify_knowledge_chunk"
-            | "wechatagent.batch_verify_chunks"
-            | "wechatagent.dispatch_campaign"
-    ) || !tool_effect(tool_name).explicitly_classified
-}
-
-/// 第一期权限放大：dangerous_confirm_enabled 默认 false（见 spec §1.2），
-/// 此时即便有 dangerous 工具也不强制确认，先跑通功能。开关为后续收紧预留。
-/// 但 irreversible（reset/delete/销毁）+ verify 类（AI 永不自动 verify）+
-/// 未显式分类工具无视开关恒需确认——第一期即便放权也保留（spec §4.2/§4.3）。
+/// 所有真实副作用默认要求确认。仅只读工具以及经明确审查、无持久副作用的
+/// `media_get` / provider 连通性探测可直接执行。未分类工具始终 fail closed。
 pub(super) fn plan_requires_confirmation(
     tool_names: &[&str],
-    dangerous_confirm_enabled: bool,
+    _dangerous_confirm_enabled: bool,
 ) -> bool {
     tool_names.iter().any(|name| {
-        let risk = tool_effect(name).risk;
-        risk == ToolRisk::Irreversible
-            || tool_always_requires_confirmation(name)
-            || (dangerous_confirm_enabled && risk == ToolRisk::Dangerous)
+        let effect = tool_effect(name);
+        !effect.explicitly_classified
+            || (!effect.read_only && !matches!(*name, "media_get" | "wechatagent.provider_test"))
     })
 }
 
@@ -1342,6 +1780,7 @@ pub(super) async fn execute_management_tool(
     planned: &PlannedToolCall,
     dry_run: bool,
     advertised: &HashSet<String>,
+    confirmed_admin: Option<&AuthenticatedAdmin>,
 ) -> AppResult<Value> {
     // S-20 / Task 19：dry-run 模式下，所有非 read 类工具直接返回
     // would_execute 计划，不实际调用底层 MCP 或写库。
@@ -1365,6 +1804,7 @@ pub(super) async fn execute_management_tool(
             let query = string_arg(&planned.arguments, "query")?;
             mcp::logged_call_for_account(
                 state,
+                workspace_id,
                 account_id,
                 "contacts_search",
                 json!({ "query": query, "limit": 20 }),
@@ -1375,6 +1815,7 @@ pub(super) async fn execute_management_tool(
             let query = string_arg(&planned.arguments, "query")?;
             let result = mcp::logged_call_for_account(
                 state,
+                workspace_id,
                 account_id,
                 "contacts_search",
                 json!({ "query": query, "limit": 20 }),
@@ -1416,6 +1857,7 @@ pub(super) async fn execute_management_tool(
             if crate::webhooks::is_self_account(&contact.wxid, self_wxid.as_deref()) {
                 let _ = agent::write_event_for_account(
                     state,
+                    workspace_id,
                     account_id,
                     Some(&contact.wxid),
                     "contact.enable_rejected_self",
@@ -1522,6 +1964,7 @@ pub(super) async fn execute_management_tool(
                 .await?;
             let _ = agent::write_event_for_account(
                 state,
+                workspace_id,
                 account_id,
                 Some(&contact.wxid),
                 "contact.enabled_for_ops",
@@ -1548,6 +1991,7 @@ pub(super) async fn execute_management_tool(
                 .await?;
             let _ = agent::write_event_for_account(
                 state,
+                workspace_id,
                 account_id,
                 Some(&contact.wxid),
                 "contact.removed_from_ops",
@@ -1971,7 +2415,9 @@ pub(super) async fn execute_management_tool(
         // ── 批 2：运营态（单对象写）──
         "wechatagent.update_assist_override" => {
             let id = string_arg(&planned.arguments, "contactId")?;
-            let body = serde_json::from_value(planned.arguments.clone())
+            let arguments =
+                management_expected_account_bound_arguments(&planned.arguments, account_id)?;
+            let body = serde_json::from_value(arguments)
                 .map_err(|e| AppError::BadRequest(format!("参数解析失败: {e}")))?;
             let resp = crate::routes::contacts::update_assist_override(
                 State(state.clone()),
@@ -1984,7 +2430,9 @@ pub(super) async fn execute_management_tool(
         }
         "wechatagent.update_custom_instructions" => {
             let id = string_arg(&planned.arguments, "contactId")?;
-            let body = serde_json::from_value(planned.arguments.clone())
+            let arguments =
+                management_expected_account_bound_arguments(&planned.arguments, account_id)?;
+            let body = serde_json::from_value(arguments)
                 .map_err(|e| AppError::BadRequest(format!("参数解析失败: {e}")))?;
             let resp = crate::routes::contacts::update_custom_agent_instructions(
                 State(state.clone()),
@@ -1997,7 +2445,9 @@ pub(super) async fn execute_management_tool(
         }
         "wechatagent.update_manual_tags" => {
             let id = string_arg(&planned.arguments, "contactId")?;
-            let body = serde_json::from_value(planned.arguments.clone())
+            let arguments =
+                management_expected_account_bound_arguments(&planned.arguments, account_id)?;
+            let body = serde_json::from_value(arguments)
                 .map_err(|e| AppError::BadRequest(format!("参数解析失败: {e}")))?;
             let resp = crate::routes::contacts::update_manual_tags(
                 State(state.clone()),
@@ -2009,17 +2459,50 @@ pub(super) async fn execute_management_tool(
             Ok(resp.0)
         }
         "wechatagent.write_deal_events" => {
-            let id = string_arg(&planned.arguments, "contactId")?;
-            let body = serde_json::from_value(planned.arguments.clone())
-                .map_err(|e| AppError::BadRequest(format!("参数解析失败: {e}")))?;
-            let resp = crate::routes::contacts::add_deal_event(
-                State(state.clone()),
-                Extension(management_admin(workspace_id)),
-                Path(id),
-                Json(body),
+            let admin = confirmed_admin.ok_or_else(|| {
+                AppError::Conflict("deal_event_requires_confirmed_admin".to_string())
+            })?;
+            if admin.current_workspace != workspace_id || admin.username.trim().is_empty() {
+                return Err(AppError::Conflict(
+                    "deal_event_confirmed_admin_scope_mismatch".to_string(),
+                ));
+            }
+            let contact =
+                resolve_contact_arg(state, workspace_id, account_id, &planned.arguments).await?;
+            let amount = planned.arguments.get("amount").and_then(Value::as_i64);
+            let quantity = planned
+                .arguments
+                .get("quantity")
+                .and_then(Value::as_u64)
+                .map(u32::try_from)
+                .transpose()
+                .map_err(|_| AppError::BadRequest("quantity exceeds u32".to_string()))?;
+            let occurred_at_ms = planned
+                .arguments
+                .get("occurredAtMs")
+                .or_else(|| planned.arguments.get("occurred_at_ms"))
+                .and_then(Value::as_i64);
+            let outcome = add_outcome_event_inner(
+                state,
+                &contact,
+                OutcomeEventInput {
+                    source: "manual".to_string(),
+                    marked_by: admin.username.trim().to_string(),
+                    audit_summary: "management agent 经管理员确认登记成效事件".to_string(),
+                    amount,
+                    currency: optional_value_arg(&planned.arguments, "currency"),
+                    verification: Some("staff_confirmed".to_string()),
+                    event_kind: optional_value_arg(&planned.arguments, "eventKind")
+                        .or_else(|| optional_value_arg(&planned.arguments, "event_kind")),
+                    product_id: optional_value_arg(&planned.arguments, "productId")
+                        .or_else(|| optional_value_arg(&planned.arguments, "product_id")),
+                    quantity,
+                    note: optional_value_arg(&planned.arguments, "note"),
+                    occurred_at_ms,
+                },
             )
             .await?;
-            Ok(resp.0)
+            Ok(json!({ "ok": true, "event": outcome }))
         }
         "wechatagent.analyze_profile" => {
             let id = string_arg(&planned.arguments, "contactId")?;
@@ -2038,6 +2521,9 @@ pub(super) async fn execute_management_tool(
                 State(state.clone()),
                 Path(id),
                 Extension(management_admin(workspace_id)),
+                Json(crate::routes::tasks::TaskActionRequest::for_account(
+                    account_id,
+                )),
             )
             .await?;
             Ok(resp.0)
@@ -2048,6 +2534,9 @@ pub(super) async fn execute_management_tool(
                 State(state.clone()),
                 Path(id),
                 Extension(management_admin(workspace_id)),
+                Json(crate::routes::tasks::TaskActionRequest::for_account(
+                    account_id,
+                )),
             )
             .await?;
             Ok(resp.0)
@@ -2120,7 +2609,8 @@ pub(super) async fn execute_management_tool(
         }
         "wechatagent.edit_playbook" => {
             let id = string_arg(&planned.arguments, "playbookId")?;
-            let body = serde_json::from_value(planned.arguments.clone())
+            let arguments = management_account_bound_arguments(&planned.arguments, account_id)?;
+            let body = serde_json::from_value(arguments)
                 .map_err(|e| AppError::BadRequest(format!("参数解析失败: {e}")))?;
             let resp = crate::routes::playbooks::update_operation_playbook(
                 State(state.clone()),
@@ -2133,16 +2623,21 @@ pub(super) async fn execute_management_tool(
         }
         "wechatagent.set_default_playbook" => {
             let id = string_arg(&planned.arguments, "playbookId")?;
+            let arguments = management_account_bound_arguments(&planned.arguments, account_id)?;
+            let body = serde_json::from_value(arguments)
+                .map_err(|e| AppError::BadRequest(format!("参数解析失败: {e}")))?;
             let resp = crate::routes::playbooks::set_default_operation_playbook(
                 State(state.clone()),
                 Extension(management_admin(workspace_id)),
                 Path(id),
+                Json(body),
             )
             .await?;
             Ok(resp.0)
         }
         "wechatagent.generate_playbook" => {
-            let body = serde_json::from_value(planned.arguments.clone())
+            let arguments = management_account_bound_arguments(&planned.arguments, account_id)?;
+            let body = serde_json::from_value(arguments)
                 .map_err(|e| AppError::BadRequest(format!("参数解析失败: {e}")))?;
             let resp = crate::routes::playbooks::generate_operation_playbook(
                 State(state.clone()),
@@ -2154,7 +2649,8 @@ pub(super) async fn execute_management_tool(
         }
         "wechatagent.optimize_playbook" => {
             let id = string_arg(&planned.arguments, "playbookId")?;
-            let body = serde_json::from_value(planned.arguments.clone())
+            let arguments = management_account_bound_arguments(&planned.arguments, account_id)?;
+            let body = serde_json::from_value(arguments)
                 .map_err(|e| AppError::BadRequest(format!("参数解析失败: {e}")))?;
             let resp = crate::routes::playbooks::optimize_operation_playbook(
                 State(state.clone()),
@@ -2325,11 +2821,19 @@ pub(super) async fn execute_management_tool(
             Ok(resp.0)
         }
         "wechatagent.import_knowledge_text" => {
+            let admin = confirmed_admin.ok_or_else(|| {
+                AppError::Conflict("knowledge_import_requires_confirmed_admin".to_string())
+            })?;
+            if admin.current_workspace != workspace_id || admin.user_id.trim().is_empty() {
+                return Err(AppError::Conflict(
+                    "knowledge_import_confirmed_admin_scope_mismatch".to_string(),
+                ));
+            }
             let body = serde_json::from_value(planned.arguments.clone())
                 .map_err(|e| AppError::BadRequest(format!("参数解析失败: {e}")))?;
             let resp = crate::routes::knowledge::import_operation_knowledge_apply(
                 State(state.clone()),
-                Extension(management_admin(workspace_id)),
+                Extension(admin.clone()),
                 Json(body),
             )
             .await?;
@@ -2353,19 +2857,25 @@ pub(super) async fn execute_management_tool(
             let id = string_arg(&planned.arguments, "id")?;
             let reason = string_arg(&planned.arguments, "cancelReason")
                 .or_else(|_| string_arg(&planned.arguments, "cancel_reason"))?;
-            crate::routes::admin_outbox::cancel_outbox_inner(state, workspace_id, &id, &reason)
-                .await
+            crate::routes::admin_outbox::cancel_outbox_inner(
+                state,
+                workspace_id,
+                account_id,
+                &id,
+                &reason,
+            )
+            .await
         }
         "wechatagent.approve_relationship_suggestion" => {
             let id = string_arg(&planned.arguments, "id")?;
-            let payload = serde_json::from_value(planned.arguments.clone())
-                .or_else(|_| serde_json::from_value(json!({})))
-                .map_err(|e| AppError::BadRequest(format!("参数解析失败: {e}")))?;
+            let actor = crate::routes::shared::ReviewActor::system(
+                crate::routes::shared::SystemReviewActor::ManagementAgent,
+            );
             crate::routes::admin_relationship_suggestions::approve_relationship_suggestion_inner(
                 state,
                 workspace_id,
                 &id,
-                payload,
+                actor,
             )
             .await
         }
@@ -2375,12 +2885,16 @@ pub(super) async fn execute_management_tool(
             let id = string_arg(&planned.arguments, "id")?;
             let payload = serde_json::from_value(planned.arguments.clone())
                 .map_err(|e| AppError::BadRequest(format!("参数解析失败: {e}")))?;
+            let actor = crate::routes::shared::ReviewActor::system(
+                crate::routes::shared::SystemReviewActor::ManagementAgent,
+            );
             crate::routes::admin_taxonomy_candidates::approve_taxonomy_candidate_inner(
                 state,
                 workspace_id,
                 account_id,
                 &id,
                 payload,
+                actor,
             )
             .await
         }
@@ -2436,15 +2950,31 @@ pub(super) async fn execute_management_tool(
         }
         "wechatagent.dispatch_campaign" => {
             let campaign_id = string_arg(&planned.arguments, "campaignId")?;
+            let spec_hash = string_arg(&planned.arguments, "specHash")?;
+            let spec_version = planned
+                .arguments
+                .get("specVersion")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| AppError::BadRequest("specVersion is required".to_string()))?;
             let resp = crate::routes::campaigns::dispatch_campaign(
                 State(state.clone()),
                 Extension(management_admin(workspace_id)),
                 Path(campaign_id),
+                Json(crate::routes::campaigns::DispatchCampaignRequest {
+                    spec_hash,
+                    spec_version,
+                }),
             )
             .await?;
             Ok(resp.0)
         }
         _ => {
+            if is_forbidden_raw_send_tool(&planned.tool_name) {
+                return Err(AppError::BadRequest(format!(
+                    "raw send tool '{}' is forbidden; use wechatagent.send_contact_message",
+                    planned.tool_name
+                )));
+            }
             // 兜底分支：只允许把 tools/list 真实公布过的工具名透传给生产 MCP。
             if !advertised.contains(planned.tool_name.as_str()) {
                 return Err(AppError::BadRequest(format!(
@@ -2454,6 +2984,7 @@ pub(super) async fn execute_management_tool(
             }
             mcp::logged_call_for_account(
                 state,
+                workspace_id,
                 account_id,
                 &planned.tool_name,
                 planned.arguments.clone(),
@@ -2491,6 +3022,41 @@ pub(super) fn optional_value_arg(arguments: &Value, key: &str) -> Option<String>
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
+}
+
+fn management_account_bound_arguments(arguments: &Value, account_id: &str) -> AppResult<Value> {
+    let mut scoped = arguments.clone();
+    let map = scoped
+        .as_object_mut()
+        .ok_or_else(|| AppError::BadRequest("tool arguments must be an object".to_string()))?;
+    if let Some(requested) = map.get("accountId") {
+        if requested.as_str().map(str::trim) != Some(account_id) {
+            return Err(AppError::Conflict(
+                "management_tool_account_binding_mismatch".to_string(),
+            ));
+        }
+    }
+    map.insert("accountId".to_string(), json!(account_id));
+    Ok(scoped)
+}
+
+fn management_expected_account_bound_arguments(
+    arguments: &Value,
+    account_id: &str,
+) -> AppResult<Value> {
+    let mut scoped = arguments.clone();
+    let map = scoped
+        .as_object_mut()
+        .ok_or_else(|| AppError::BadRequest("tool arguments must be an object".to_string()))?;
+    if let Some(requested) = map.get("expectedAccountId") {
+        if requested.as_str().map(str::trim) != Some(account_id) {
+            return Err(AppError::Conflict(
+                "management_tool_account_binding_mismatch".to_string(),
+            ));
+        }
+    }
+    map.insert("expectedAccountId".to_string(), json!(account_id));
+    Ok(scoped)
 }
 
 pub(super) async fn resolve_contact_arg(
@@ -2579,11 +3145,65 @@ pub(super) async fn management_context(
     while let Some(asset) = assets.try_next().await? {
         asset_lines.push(format!("- [{}] {}", asset.kind, asset.title));
     }
+    let mut playbooks = state
+        .db
+        .operation_playbooks()
+        .find(
+            doc! {
+                "workspace_id": workspace_id,
+                "account_id": account_id,
+            },
+            FindOptions::builder()
+                .sort(doc! { "is_default": -1, "updated_at": -1 })
+                .limit(30)
+                .build(),
+        )
+        .await?;
+    let mut playbook_lines = Vec::new();
+    while let Some(playbook) = playbooks.try_next().await? {
+        playbook_lines.push(format!(
+            "- id={} accountId={} version={} isDefault={} name={}",
+            playbook.id.map(|id| id.to_hex()).unwrap_or_default(),
+            playbook.account_id,
+            playbook.version,
+            playbook.is_default,
+            playbook.name,
+        ));
+    }
+    let mut campaigns = state
+        .db
+        .campaigns()
+        .find(
+            doc! {
+                "workspaceId": workspace_id,
+                "accountId": account_id,
+                "status": { "$in": ["draft", "previewed"] },
+            },
+            FindOptions::builder()
+                .sort(doc! { "updatedAt": -1 })
+                .limit(20)
+                .build(),
+        )
+        .await?;
+    let mut campaign_lines = Vec::new();
+    while let Some(campaign) = campaigns.try_next().await? {
+        let Some(id) = campaign.id else { continue };
+        let spec_hash = crate::routes::campaigns::campaign_spec_hash_for_view(&campaign)?;
+        campaign_lines.push(format!(
+            "- id={} title={} specVersion={} specHash={}",
+            id.to_hex(),
+            campaign.title,
+            campaign.spec_version,
+            spec_hash
+        ));
+    }
     Ok(format!(
-        "当前账号: {}\n最近联系人:\n{}\n内容资产:\n{}",
+        "当前账号: {}\n最近联系人:\n{}\n内容资产:\n{}\n当前 Playbook（写操作必须复制 id/accountId/version）:\n{}\n待派发活动（dispatch 必须复制 specVersion/specHash）:\n{}",
         account_id,
         contact_lines.join("\n"),
-        asset_lines.join("\n")
+        asset_lines.join("\n"),
+        playbook_lines.join("\n"),
+        campaign_lines.join("\n")
     ))
 }
 
@@ -2606,6 +3226,7 @@ pub(super) async fn build_management_plan(
     );
     let value = agent::generate_agent_json(
         state,
+        workspace_id,
         Some(account_id),
         None,
         None,
@@ -2653,19 +3274,19 @@ mod tests {
 
     #[test]
     fn campaign_tools_risk_and_confirmation() {
-        // preview 只读（dry-run 下也执行返回圈人结果）
+        // preview 会先创建活动草稿，因此不是只读，也必须确认。
         assert_eq!(
             tool_effect("wechatagent.preview_campaign").risk,
-            ToolRisk::Readonly
+            ToolRisk::Low
         );
-        assert!(tool_effect("wechatagent.preview_campaign").read_only);
-        // dispatch 恒确认门——关键：dangerous 开关默认 false 下仍须确认
-        assert!(tool_always_requires_confirmation(
-            "wechatagent.dispatch_campaign"
+        assert!(!tool_effect("wechatagent.preview_campaign").read_only);
+        assert!(plan_requires_confirmation(
+            &["wechatagent.preview_campaign"],
+            false
         ));
         assert!(
             plan_requires_confirmation(&["wechatagent.dispatch_campaign"], false),
-            "dispatch 必须无视第一期 dangerous 开关恒走确认门"
+            "dispatch 必须恒走确认门"
         );
     }
 
@@ -2869,35 +3490,31 @@ mod tests {
             &["wechatagent.batch_verify_chunks"],
             false
         ));
-        assert!(tool_always_requires_confirmation(
-            "wechatagent.batch_verify_chunks"
-        ));
     }
 
     #[test]
-    fn confirmation_gate_off_by_default_phase1() {
-        // 第一期权限放大：dangerous_confirm_enabled=false 时即便有 dangerous 工具也不强制确认
-        assert!(!plan_requires_confirmation(
+    fn all_real_side_effects_require_confirmation() {
+        assert!(plan_requires_confirmation(
             &["wechatagent.send_contact_message"],
             false
         ));
-        // 开关打开后 dangerous 触发确认（为后续阶段预留）
         assert!(plan_requires_confirmation(
-            &["wechatagent.send_contact_message"],
-            true
+            &["wechatagent.update_contact_profile"],
+            false
         ));
-        // 全 readonly 永不需确认
         assert!(!plan_requires_confirmation(
             &["wechatagent.search_contacts"],
-            true
+            false
         ));
-        // irreversible 无视开关恒需确认（第一期即便放权也保留，spec §4.2）
+        assert!(!plan_requires_confirmation(&["media_get"], false));
+        assert!(!plan_requires_confirmation(
+            &["wechatagent.provider_test"],
+            false
+        ));
         assert!(plan_requires_confirmation(
             &["wechatagent.reset_domain"],
             false
         ));
-        // verify 类无视开关恒需确认（spec §4.3：AI 调 verify 会落 source=Human，
-        // 守"AI 永不自动 verify"——确认门不随第一期 dangerous 开关放行）
         assert!(plan_requires_confirmation(
             &["wechatagent.verify_knowledge_chunk"],
             false
@@ -2920,17 +3537,15 @@ mod tests {
     }
 
     #[test]
-    fn documented_raw_mcp_medium_tools_keep_phase_one_policy() {
-        for tool in [
-            "message_send_text",
-            "media_get",
-            "schedule_create",
-            "schedule_cancel",
-        ] {
+    fn reviewed_raw_mcp_tools_follow_side_effect_policy() {
+        assert!(!plan_requires_confirmation(&["media_get"], false));
+        for tool in ["schedule_create", "schedule_cancel"] {
             assert_eq!(tool_effect(tool).risk, ToolRisk::Low);
             assert!(tool_effect(tool).explicitly_classified);
-            assert!(!plan_requires_confirmation(&[tool], false));
+            assert!(plan_requires_confirmation(&[tool], false));
         }
+        assert!(!tool_effect("message_send_text").explicitly_classified);
+        assert!(plan_requires_confirmation(&["message_send_text"], false));
     }
 
     #[test]
@@ -3182,7 +3797,7 @@ mod tests {
         }));
         let names = advertised_tool_names(&merged);
         assert!(names.contains("account_list"));
-        assert!(names.contains("message_send_text"));
+        assert!(!names.contains("message_send_text"));
         assert!(names.contains("wechatagent.search_contacts"));
 
         // auth.allowed_tools 嵌套形态
@@ -3202,7 +3817,7 @@ mod tests {
         ]));
         let names = advertised_tool_names(&merged);
         assert!(names.contains("account_list"));
-        assert!(names.contains("message_send_text"));
+        assert!(!names.contains("message_send_text"));
         assert!(names.contains("wechatagent.update_contact_profile"));
     }
 
@@ -3220,10 +3835,17 @@ mod tests {
 
     #[test]
     fn confirm_filter_only_targets_pending_confirmation() {
-        let filter = build_confirm_filter("workspace1", &mongodb::bson::oid::ObjectId::new());
+        let filter = build_confirm_filter(
+            "workspace1",
+            &mongodb::bson::oid::ObjectId::new(),
+            "account1",
+            "plan-hash-1",
+        );
         // filter 必须含 status: pending_confirmation（防二次确认 / 防确认非待确认命令）
         // 且带 workspace_id（IDOR：不能跨 workspace 确认他人命令）
         assert_eq!(filter.get_str("workspace_id").unwrap(), "workspace1");
+        assert_eq!(filter.get_str("account_id").unwrap(), "account1");
+        assert_eq!(filter.get_str("plan_hash").unwrap(), "plan-hash-1");
         assert_eq!(filter.get_str("status").unwrap(), "pending_confirmation");
     }
 
@@ -3231,26 +3853,30 @@ mod tests {
     fn tool_call_status_closed_set() {
         use crate::models::ALLOWED_TOOL_CALL_STATUS;
         const EXPECTED: &[&str] = &[
-            "running",
+            "prepared",
+            "executing",
             "dry_run",
             "succeeded",
             "failed",
             "executed_unverified",
+            "execution_unknown",
         ];
         for s in EXPECTED {
             assert!(ALLOWED_TOOL_CALL_STATUS.contains(s), "缺少状态 {s}");
         }
-        assert_eq!(ALLOWED_TOOL_CALL_STATUS.len(), 5);
+        assert_eq!(ALLOWED_TOOL_CALL_STATUS.len(), 7);
     }
 
     #[test]
     fn assert_tool_call_status_accepts_all_valid() {
         for s in [
-            "running",
+            "prepared",
+            "executing",
             "dry_run",
             "succeeded",
             "failed",
             "executed_unverified",
+            "execution_unknown",
         ] {
             crate::models::assert_tool_call_status_valid(s); // 不 panic 即通过
         }

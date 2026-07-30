@@ -19,7 +19,7 @@ vi.mock("../../lib/api", () => ({
 }));
 
 const contact = (id: string): Contact =>
-  ({ id, agentStatus: "managed" } as Contact);
+  ({ id, accountId: "a1", agentStatus: "managed" } as Contact);
 
 const account = (id: string): Account =>
   ({ accountId: id, online: true } as Account);
@@ -41,8 +41,15 @@ const backendHealth = {
 describe("guide preview health", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    useContactStore.setState({ contacts: [], selected: contact("c1"), contactTab: "all" });
+    const selected = contact("c1");
+    useContactStore.setState({
+      contacts: [selected],
+      selected,
+      dataAccountId: "a1",
+      contactTab: "all",
+    });
     useAccountStore.setState({ accounts: [account("a1")], selectedAccountId: "a1" });
+    useUserOpsStore.getState().hydrateSelected(selected);
     useUserOpsStore.setState({ operationHealth: null, guidePreview: null });
     (api.post as ReturnType<typeof vi.fn>).mockResolvedValue({
       item: {

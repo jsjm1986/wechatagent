@@ -143,7 +143,7 @@ pub struct AppConfig {
     /// Phase D / D3：判定 contact "冷链路" 的阈值小时数。
     /// `last_outbound_at < now - 该小时数` 才会被纳入候选；默认 168（7 天）。
     pub cold_contact_threshold_hours: i64,
-    /// Phase D / D3：单 account 当日最多 emit 多少条冷重激活 follow_up；
+    /// Phase D / D3：单 workspace、UTC 当日最多 emit 多少条冷重激活 follow_up；
     /// 与 strategic_planner_daily_emit_cap 解耦，避免拖累常规 follow_up。默认 5。
     pub cold_contact_daily_emit_cap: i64,
     /// 决策请示通道：领导链尾失联（无更多决策人可改派）时，给客户发 AI 延期安抚
@@ -177,7 +177,7 @@ pub struct AppConfig {
     pub silence_threshold_seconds: i64,
     /// 沉默探测 worker 主循环间隔秒数。默认 600（10 分钟）。
     pub silence_signal_interval_seconds: u64,
-    /// 单 workspace 单 tick 最多落多少条沉默信号；防首跑信号风暴。默认 500。
+    /// 单 workspace、UTC 当日最多落多少条沉默信号；防并发/重启后超额及首跑风暴。默认 500。
     pub silence_signal_daily_cap: i64,
     /// S7 止血：dynamic_confidence 信 hit_rate 所需的最小样本数（hits+blocks）。
     /// 低于此值时只用 base（不被 1-2 个 reviewer 自评样本甩飞）。默认 5。
@@ -252,32 +252,28 @@ pub struct AppConfig {
     /// 察觉错配，**不参与任何 promote/rollback 判决**（强制门留 2.5-main-4，默认关）。默认 0.05。
     pub evolution_max_negative_reaction_increase: f64,
 
-    // ── Phase C / C5：threshold_overrides 自动 release（hold_rate close-loop） ──
+    // ── Phase C / C5：历史 threshold auto-release 参数（当前产品政策休眠） ──
     //
-    // 默认关停。`evolution_auto_release_enabled=true` 时演化器 tick 末尾会扫描
-    // status="eligible_for_release" 的 threshold proposal，回看
-    // `evolution_auto_release_window_hours` 小时窗口的 hold_rate / hit_rate 信号；
-    // 仍在异常区间 → 自动调 release_threshold（admin id="evolution_auto_release"）；
-    // 已回到正常区间 → 跳过留给 admin 显式判断。
-    //
-    // 自动通道仅适用于 threshold（纯统计可观测）；prompt 候选仍要 admin 二次确认。
-    // rollback 永远人工——Requirements 9.7 的硬约束。
-    /// Phase C / C5：是否启用 threshold proposal 自动 release。默认 false。
+    // HC-017 锁定“当前全部人工发布”。这些字段只为将来按 proposal 类型+方向
+    // 建立显式白名单时保留配置兼容，不能单独开启自动发布：
+    // `CURRENT_AUTO_RELEASE_POLICY_ENABLED=false` 是代码级硬闸，管理 API 也拒绝
+    // 写入 workspace 子闸 true。rollback 始终人工。
+    /// 历史自动发布总闸。当前即使配置 true 也会被 HC-017 代码政策闸否决。
     pub evolution_auto_release_enabled: bool,
-    /// Phase C / C5：自动 release 决策回看窗口（小时）。默认 336（14 天）。
+    /// 未来白名单策略预留的决策回看窗口（小时）。默认 336（14 天）。
     pub evolution_auto_release_window_hours: u32,
-    /// Phase C / C5：单 tick 自动 release 的 proposal 数量上限（防止一波打开过多 gate）。
+    /// 未来白名单策略预留的单 tick proposal 上限。
     pub evolution_auto_release_per_tick_cap: usize,
-    /// universal-domain-adaptation 2.5-main-4：自动 release 的「客户负反应强制门」开关。
-    /// 默认 false（字节等价：关时 auto_release 行为与 main-4 前完全一致）。开启后，
-    /// auto_release 在 `decide_auto_release` 判定放行**之后、实际调 release_threshold
-    /// 之前**，多过一道闸：回看窗口内当前**绝对**负反应率（按 `decision_reviews.outcome_status`
+    /// 未来白名单策略预留的「客户负反应强制门」开关。当前政策下不生效。
+    /// 若未来经产品决策启用，则在 `decide_auto_release` 判定放行之后、实际调
+    /// release_threshold 之前，多过一道闸：回看窗口内当前绝对负反应率。
+    /// 负反应率按 `decision_reviews.outcome_status`
     /// 经 active `DomainProfile.outcome_polarity` 分类，复用回路① 的 `classify_outcome_label`）
     /// 高于 [`Self::evolution_auto_release_max_negative_reaction_rate`] 时，强制 SKIP 该候选、
     /// 退回 admin 显式判断，**不自动放行阈值放松**。这是「拒绝自动放行」而非「回滚」，
     /// 不触碰 Requirements 9.7（rollback 永远手动）的硬约束。
     pub evolution_auto_release_negative_reaction_gate_enabled: bool,
-    /// universal-domain-adaptation 2.5-main-4：自动 release 负反应强制门的**绝对**阈值
+    /// 未来白名单策略预留的自动发布负反应绝对阈值
     /// （非 pre-3 的前/后窗口升幅 delta —— auto_release 在 release 前决策，没有「后窗口」
     /// 可比，故看当前窗口的绝对负反应率）。仅当
     /// [`Self::evolution_auto_release_negative_reaction_gate_enabled`]=true 时生效。
@@ -335,6 +331,14 @@ pub struct AppConfig {
     /// 留空则不 bootstrap（首次部署后建议清空 env）。
     pub bootstrap_admin_username: Option<String>,
     pub bootstrap_admin_password: Option<String>,
+    /// Shared `/auth/login` + `/auth/token` failure window in seconds.
+    pub auth_rate_limit_window_seconds: u64,
+    /// Maximum pending/failed attempts from one direct client in the window.
+    pub auth_rate_limit_client_capacity: u32,
+    /// Maximum pending/failed attempts against one normalized target in the window.
+    pub auth_rate_limit_target_capacity: u32,
+    /// Maximum pending/failed authentication attempts process-wide in the window.
+    pub auth_rate_limit_global_capacity: u32,
     /// webhook 是否校验 HMAC-SHA256(body, MCP_API_KEY) 签名（X-MCP-Signature 头）。
     /// 生产必须 true；staging/local 测试可以临时关掉。默认 true。
     pub webhook_verify_signature: bool,
@@ -401,6 +405,22 @@ impl std::fmt::Debug for AppConfig {
             )
             .field("webhook_verify_signature", &self.webhook_verify_signature)
             .field("session_cookie_secure", &self.session_cookie_secure)
+            .field(
+                "auth_rate_limit_window_seconds",
+                &self.auth_rate_limit_window_seconds,
+            )
+            .field(
+                "auth_rate_limit_client_capacity",
+                &self.auth_rate_limit_client_capacity,
+            )
+            .field(
+                "auth_rate_limit_target_capacity",
+                &self.auth_rate_limit_target_capacity,
+            )
+            .field(
+                "auth_rate_limit_global_capacity",
+                &self.auth_rate_limit_global_capacity,
+            )
             .field("jwt_enabled", &self.jwt_enabled)
             .field("jwt_ttl_minutes", &self.jwt_ttl_minutes)
             .field(
@@ -662,10 +682,18 @@ impl AppConfig {
             // ── Knowledge Digest Workstation ──
             knowledge_digest_enabled: parse_bool(&env_or("KNOWLEDGE_DIGEST_ENABLED", "false")),
             knowledge_digest_run_hour: env_or("KNOWLEDGE_DIGEST_RUN_HOUR", "9").parse()?,
-            knowledge_digest_run_token_budget: env_or("KNOWLEDGE_DIGEST_RUN_TOKEN_BUDGET", "24000")
-                .parse()?,
-            knowledge_digest_run_max_llm_calls: env_or("KNOWLEDGE_DIGEST_RUN_MAX_LLM_CALLS", "8")
-                .parse()?,
+            knowledge_digest_run_token_budget: parse_bounded_i64(
+                "KNOWLEDGE_DIGEST_RUN_TOKEN_BUDGET",
+                &env_or("KNOWLEDGE_DIGEST_RUN_TOKEN_BUDGET", "24000"),
+                1,
+                1_000_000,
+            )?,
+            knowledge_digest_run_max_llm_calls: parse_bounded_i32(
+                "KNOWLEDGE_DIGEST_RUN_MAX_LLM_CALLS",
+                &env_or("KNOWLEDGE_DIGEST_RUN_MAX_LLM_CALLS", "8"),
+                1,
+                100,
+            )?,
             knowledge_task_worker_interval_seconds: env_or(
                 "KNOWLEDGE_TASK_WORKER_INTERVAL_SECONDS",
                 "30",
@@ -697,6 +725,14 @@ impl AppConfig {
             bootstrap_admin_password: env::var("BOOTSTRAP_ADMIN_PASSWORD")
                 .ok()
                 .filter(|s| !s.trim().is_empty()),
+            auth_rate_limit_window_seconds: env_or("AUTH_RATE_LIMIT_WINDOW_SECONDS", "300")
+                .parse()?,
+            auth_rate_limit_client_capacity: env_or("AUTH_RATE_LIMIT_CLIENT_CAPACITY", "20")
+                .parse()?,
+            auth_rate_limit_target_capacity: env_or("AUTH_RATE_LIMIT_TARGET_CAPACITY", "10")
+                .parse()?,
+            auth_rate_limit_global_capacity: env_or("AUTH_RATE_LIMIT_GLOBAL_CAPACITY", "100")
+                .parse()?,
             webhook_verify_signature: parse_bool(&env_or("WEBHOOK_VERIFY_SIGNATURE", "true")),
             webhook_timestamp_skew_seconds: env_or("WEBHOOK_TIMESTAMP_SKEW_SECONDS", "300")
                 .parse()?,
@@ -731,6 +767,26 @@ fn parse_bool(value: &str) -> bool {
     )
 }
 
+fn parse_bounded_i64(key: &str, value: &str, min: i64, max: i64) -> anyhow::Result<i64> {
+    let parsed: i64 = value
+        .parse()
+        .map_err(|error| anyhow::anyhow!("invalid {key}: {error}"))?;
+    if !(min..=max).contains(&parsed) {
+        anyhow::bail!("{key} must be between {min} and {max}");
+    }
+    Ok(parsed)
+}
+
+fn parse_bounded_i32(key: &str, value: &str, min: i32, max: i32) -> anyhow::Result<i32> {
+    let parsed: i32 = value
+        .parse()
+        .map_err(|error| anyhow::anyhow!("invalid {key}: {error}"))?;
+    if !(min..=max).contains(&parsed) {
+        anyhow::bail!("{key} must be between {min} and {max}");
+    }
+    Ok(parsed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -759,5 +815,18 @@ mod tests {
     fn evolution_enabled_defaults_to_false() {
         assert_eq!(EVOLUTION_ENABLED_DEFAULT, "false");
         assert!(!parse_bool(EVOLUTION_ENABLED_DEFAULT));
+    }
+
+    #[test]
+    fn digest_budget_config_requires_bounded_positive_values() {
+        assert_eq!(
+            parse_bounded_i64("TOKEN", "12345", 1, 1_000_000).unwrap(),
+            12345
+        );
+        assert_eq!(parse_bounded_i32("CALLS", "3", 1, 100).unwrap(), 3);
+        assert!(parse_bounded_i64("TOKEN", "0", 1, 1_000_000).is_err());
+        assert!(parse_bounded_i64("TOKEN", "1000001", 1, 1_000_000).is_err());
+        assert!(parse_bounded_i32("CALLS", "0", 1, 100).is_err());
+        assert!(parse_bounded_i32("CALLS", "101", 1, 100).is_err());
     }
 }

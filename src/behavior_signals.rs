@@ -56,6 +56,7 @@ pub fn silence_dedupe_key(wxid: &str, last_outbound_at_ms: i64) -> String {
 /// 但不允许为负：inbound 早于记录的 outbound 属时钟/乱序，落 None 而非负值。
 pub fn build_reply_latency(
     workspace_id: &str,
+    account_id: &str,
     wxid: &str,
     inbound_message_id: &str,
     inbound_at: DateTime,
@@ -72,6 +73,7 @@ pub fn build_reply_latency(
     BehaviorSignal {
         id: None,
         workspace_id: workspace_id.to_string(),
+        account_id: account_id.to_string(),
         contact_wxid: wxid.to_string(),
         signal_type: "reply_latency".to_string(),
         observed_at: inbound_at,
@@ -93,6 +95,7 @@ pub fn build_reply_latency(
 /// 等多字节安全（不是字节数）。
 pub fn build_reply_length(
     workspace_id: &str,
+    account_id: &str,
     wxid: &str,
     inbound_message_id: &str,
     inbound_at: DateTime,
@@ -101,6 +104,7 @@ pub fn build_reply_length(
     BehaviorSignal {
         id: None,
         workspace_id: workspace_id.to_string(),
+        account_id: account_id.to_string(),
         contact_wxid: wxid.to_string(),
         signal_type: "reply_length".to_string(),
         observed_at: inbound_at,
@@ -134,6 +138,7 @@ pub fn is_reactivation(
 /// 构造一条 `reactivation` 观察（仅当 [`is_reactivation`] 为真时由调用方构造）。
 pub fn build_reactivation(
     workspace_id: &str,
+    account_id: &str,
     wxid: &str,
     inbound_message_id: &str,
     inbound_at: DateTime,
@@ -141,6 +146,7 @@ pub fn build_reactivation(
     BehaviorSignal {
         id: None,
         workspace_id: workspace_id.to_string(),
+        account_id: account_id.to_string(),
         contact_wxid: wxid.to_string(),
         signal_type: "reactivation".to_string(),
         observed_at: inbound_at,
@@ -163,6 +169,7 @@ pub fn build_reactivation(
 /// 的已沉默时长。
 pub fn build_silence(
     workspace_id: &str,
+    account_id: &str,
     wxid: &str,
     last_outbound_at: DateTime,
     observed_at: DateTime,
@@ -171,6 +178,7 @@ pub fn build_silence(
     BehaviorSignal {
         id: None,
         workspace_id: workspace_id.to_string(),
+        account_id: account_id.to_string(),
         contact_wxid: wxid.to_string(),
         signal_type: "silence".to_string(),
         observed_at,
@@ -294,7 +302,7 @@ mod tests {
 
     /// 回归门：`BehaviorSignal` 必须以 snake_case 落库。
     ///
-    /// 幂等索引 `{workspace_id, dedupe_key}` 的 `partialFilterExpression` 按
+    /// 幂等索引 `{workspace_id, account_id, dedupe_key}` 的 `partialFilterExpression` 按
     /// snake-case `dedupe_key` 匹配（`db/indexes.rs`）。若 struct 误加
     /// `#[serde(rename_all = "camelCase")]`，字段会序列化成 `dedupeKey`，partial
     /// filter 命中 0 文档 → unique 约束失效 → 重复信号全部落库（曾被
@@ -304,6 +312,7 @@ mod tests {
     fn serializes_to_snake_case_for_index_match() {
         let sig = build_reply_latency(
             "ws",
+            "acct",
             "wxid_a",
             "msg1",
             DateTime::from_millis(10_000),
@@ -316,6 +325,7 @@ mod tests {
             "幂等键必须落库为 dedupe_key"
         );
         assert!(doc.contains_key("workspace_id"), "必须落库为 workspace_id");
+        assert!(doc.contains_key("account_id"), "必须落库为 account_id");
         assert!(doc.contains_key("contact_wxid"), "必须落库为 contact_wxid");
         assert!(doc.contains_key("signal_type"), "必须落库为 signal_type");
         assert!(doc.contains_key("observed_at"), "必须落库为 observed_at");
@@ -332,7 +342,14 @@ mod tests {
     #[test]
     fn latency_none_when_no_prior_outbound() {
         // 从未出站过 → 没有基准，latency_ms 必须 None（不臆造 0）。
-        let sig = build_reply_latency("ws", "wxid_a", "msg1", DateTime::from_millis(10_000), None);
+        let sig = build_reply_latency(
+            "ws",
+            "acct",
+            "wxid_a",
+            "msg1",
+            DateTime::from_millis(10_000),
+            None,
+        );
         assert_eq!(sig.latency_ms, None);
         assert_eq!(sig.source, SOURCE_SYSTEM_OBSERVED);
         assert_eq!(sig.confidence, 1.0);
@@ -343,6 +360,7 @@ mod tests {
     fn latency_computed_from_last_outbound() {
         let sig = build_reply_latency(
             "ws",
+            "acct",
             "wxid_a",
             "msg2",
             DateTime::from_millis(10_000),
@@ -354,28 +372,42 @@ mod tests {
     #[test]
     fn latency_zero_is_allowed() {
         // 同毫秒回复 → 0 是合法的极快延迟，不该被丢成 None。
-        let sig = build_reply_latency("ws", "w", "m", DateTime::from_millis(5_000), Some(5_000));
+        let sig = build_reply_latency(
+            "ws",
+            "acct",
+            "w",
+            "m",
+            DateTime::from_millis(5_000),
+            Some(5_000),
+        );
         assert_eq!(sig.latency_ms, Some(0));
     }
 
     #[test]
     fn latency_negative_falls_to_none() {
         // inbound 早于记录 outbound → 时钟/乱序，落 None 而非负值。
-        let sig = build_reply_latency("ws", "w", "m", DateTime::from_millis(4_000), Some(5_000));
+        let sig = build_reply_latency(
+            "ws",
+            "acct",
+            "w",
+            "m",
+            DateTime::from_millis(4_000),
+            Some(5_000),
+        );
         assert_eq!(sig.latency_ms, None);
     }
 
     #[test]
     fn reply_length_counts_chars_not_bytes() {
         // 中文 + emoji：chars().count() 应数"字符"，不是字节。
-        let sig = build_reply_length("ws", "w", "m", DateTime::from_millis(1), "你好👋ok");
+        let sig = build_reply_length("ws", "acct", "w", "m", DateTime::from_millis(1), "你好👋ok");
         // 你(1) 好(1) 👋(1) o(1) k(1) = 5 chars；字节数会是 3+3+4+1+1=12。
         assert_eq!(sig.char_len, Some(5));
     }
 
     #[test]
     fn reply_length_empty_is_zero() {
-        let sig = build_reply_length("ws", "w", "m", DateTime::from_millis(1), "");
+        let sig = build_reply_length("ws", "acct", "w", "m", DateTime::from_millis(1), "");
         assert_eq!(sig.char_len, Some(0));
     }
 
@@ -406,6 +438,7 @@ mod tests {
     fn silence_is_always_censored() {
         let sig = build_silence(
             "ws",
+            "acct",
             "w",
             DateTime::from_millis(1_000),
             DateTime::from_millis(90_000),
@@ -421,6 +454,7 @@ mod tests {
         // observed_at 早于 outbound（乱序）→ silence_ms 夹到 0，不出负值。
         let sig = build_silence(
             "ws",
+            "acct",
             "w",
             DateTime::from_millis(5_000),
             DateTime::from_millis(1_000),
@@ -459,12 +493,20 @@ mod tests {
     #[test]
     fn builders_fill_ingest_time() {
         // 四个 builder 都必须填 ingest_time（落库时刻），否则数据工程无法识别采集延迟/回填。
-        let latency =
-            build_reply_latency("ws", "w", "m", DateTime::from_millis(10_000), Some(3_000));
-        let length = build_reply_length("ws", "w", "m", DateTime::from_millis(10_000), "hi");
-        let react = build_reactivation("ws", "w", "m", DateTime::from_millis(10_000));
+        let latency = build_reply_latency(
+            "ws",
+            "acct",
+            "w",
+            "m",
+            DateTime::from_millis(10_000),
+            Some(3_000),
+        );
+        let length =
+            build_reply_length("ws", "acct", "w", "m", DateTime::from_millis(10_000), "hi");
+        let react = build_reactivation("ws", "acct", "w", "m", DateTime::from_millis(10_000));
         let silence = build_silence(
             "ws",
+            "acct",
             "w",
             DateTime::from_millis(1_000),
             DateTime::from_millis(90_000),
@@ -483,7 +525,14 @@ mod tests {
         // observed_at = event_time（事实发生时刻，由调用方传入），ingest_time = 落库时刻；
         // 两者独立存在，event_time 不被 builder 篡改成 now()。
         let event_ms = 10_000;
-        let sig = build_reply_latency("ws", "w", "m", DateTime::from_millis(event_ms), Some(3_000));
+        let sig = build_reply_latency(
+            "ws",
+            "acct",
+            "w",
+            "m",
+            DateTime::from_millis(event_ms),
+            Some(3_000),
+        );
         assert_eq!(
             sig.observed_at.timestamp_millis(),
             event_ms,
@@ -497,6 +546,7 @@ mod tests {
         // R11：旧文档无 ingest_time 字段，反序列化必须回落 None，不报错。
         let doc = mongodb::bson::doc! {
             "workspace_id": "ws",
+            "account_id": "acct",
             "contact_wxid": "w",
             "signal_type": "reply_length",
             "observed_at": DateTime::from_millis(1),

@@ -56,6 +56,13 @@ fn report_accepts_failed_status_with_empty_cards() {
         cards: vec![],
         dismissed_card_ids: vec![],
         prompt_versions: doc! { "knowledge.digest.compose": "v1" },
+        attempt_generation: 0,
+        current_generation: 0,
+        latest_attempt_status: None,
+        latest_attempt_error_kind: None,
+        latest_attempt_at: None,
+        latest_attempt_budget_snapshot: Document::new(),
+        last_success_at: None,
     };
     let bson = mongodb::bson::to_bson(&report).expect("serialize");
     let doc: Document = bson.as_document().expect("doc").clone();
@@ -80,6 +87,13 @@ fn report_accepts_partial_status_with_budget_exceeded() {
         cards: vec![make_card("chunk_missing_field", "info", "fix_chunk")],
         dismissed_card_ids: vec![],
         prompt_versions: doc! { "knowledge.digest.compose": "v1" },
+        attempt_generation: 0,
+        current_generation: 0,
+        latest_attempt_status: None,
+        latest_attempt_error_kind: None,
+        latest_attempt_at: None,
+        latest_attempt_budget_snapshot: Document::new(),
+        last_success_at: None,
     };
     let bson = mongodb::bson::to_bson(&report).expect("serialize");
     let doc: Document = bson.as_document().expect("doc").clone();

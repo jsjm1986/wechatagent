@@ -3,8 +3,12 @@
 // 需要：本地 wechatagent 后端运行在 :8080，DB 有配置 Workspace Key 的账号
 
 const API_BASE = 'http://localhost:8080/api';
-const MCP_KEY = 'gwa_ba60a98aada58c10b77f6f20841c77c6c3c0506d9431871f';
-const MCP_BASE_URL = 'http://117.72.54.28:3001';
+const MCP_KEY = process.env.MCP_API_KEY;
+const MCP_BASE_URL = process.env.MCP_BASE_URL || 'http://117.72.54.28:3001';
+
+if (!MCP_KEY) {
+  throw new Error('MCP_API_KEY is required; secrets must not be stored in this script');
+}
 
 async function login() {
   const resp = await fetch(`${API_BASE}/auth/login`, {

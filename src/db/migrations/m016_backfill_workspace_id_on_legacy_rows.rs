@@ -10,10 +10,8 @@
 //! `DEFAULT_WORKSPACE_ID`（默认 `"default"`），同时兼容 camelCase 写法
 //! `workspaceId`（早期 P0 鉴权 / LLM 服务商等少数集合用了 BSON camelCase）。
 //!
-//! 生产守卫：`APP_ENV=production` 时 noop 返回（不自动 backfill）——P1-1 在生产
-//! 打开多租户前，运维必须显式 backfill。与 m014 同款 warn+Ok 形态：返回 Err 会在
-//! `mod.rs::run_with` 记录迁移前中断，迁移永不入账，每次启动重试重错（boot-brick），
-//! 且运维手工 backfill 后仍因未入账而再次砖机，无干净恢复路径。
+//! 生产环境由迁移 runner 的 `APPROVED_MIGRATIONS` 精确审批闸保护。未确认历史
+//! 无租户行归属前记录为 `blocked`；批准后幂等回填并转为 `applied`。
 //!
 //! 幂等：仅修改 `$exists: false` 的文档；二次执行 matched=0 即可。
 
@@ -89,13 +87,6 @@ const SNAKE_CASE_COLLECTIONS: &[&str] = &[
 const CAMEL_CASE_COLLECTIONS: &[&str] = &["llm_provider_configs", "campaigns", "campaign_sends"];
 
 pub(super) async fn run_step(db: &Database) -> AppResult<()> {
-    if std::env::var("APP_ENV").unwrap_or_default() == "production" {
-        tracing::warn!(
-            migration_id = "2026_05_X1_001_backfill_workspace_id_on_legacy_rows",
-            "production guard: skipped workspace_id backfill; run manually before enabling multi-tenant filtering"
-        );
-        return Ok(());
-    }
     let default_ws = std::env::var("DEFAULT_WORKSPACE_ID").unwrap_or_else(|_| "default".into());
     let raw = db.raw();
 
@@ -210,9 +201,9 @@ mod tests {
     const KNOWN_CAMEL_TENANT_COLLECTIONS: &[&str] =
         &["llm_provider_configs", "campaigns", "campaign_sends"];
 
-    /// 无单值 workspace_id 字段、绝不该进任一回填表(防回退,spec §2.C):
-    /// `admin_users` 用 `workspaces:Vec<String>`(auth/mod.rs:28-39);
-    /// `chunk_revisions` 无 ws 字段、靠 chunk_id 反查租户(models.rs:1613-1632)。
+    /// 绝不该走本迁移的默认 workspace 回填表（防回退,spec §2.C）：
+    /// `admin_users` 用 `workspaces:Vec<String>`；`chunk_revisions.workspace_id` 必须由
+    /// m039 通过父 chunk 精确推导，不能由 DEFAULT_WORKSPACE_ID 猜测。
     const MUST_NOT_BACKFILL: &[&str] = &["admin_users", "chunk_revisions"];
 
     /// 挡拼错 + 挡 snake/camel 归错类:SNAKE 表每个名字都必须 ∈ snake 审计全集。

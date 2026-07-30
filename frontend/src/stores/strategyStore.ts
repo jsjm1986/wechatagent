@@ -14,6 +14,13 @@ export type SavePromptResult =
   | { rejected: true; reason: string }
   | { error: true; reason: string };
 
+export type DomainProfileActivationResult = {
+  ok: boolean;
+  status: "completed" | "partial";
+  retryable: boolean;
+  errors?: Array<{ step: string; code: string; message: string }>;
+};
+
 interface StrategyState {
   souls: AgentSoul[];
   promptTemplates: PromptTemplate[];
@@ -44,7 +51,7 @@ interface StrategyActions {
   createPromptTemplate: () => Promise<void>;
   savePromptTemplate: (force?: boolean) => Promise<SavePromptResult>;
   publishPromptTemplate: (id: string, force?: boolean) => Promise<SavePromptResult>;
-  resetSystemPromptPack: () => Promise<void>;
+  resetSystemPromptPack: (confirmation: string) => Promise<void>;
   editSoul: (soul: AgentSoul) => void;
   newSoulDraftFor: (kind: string) => void;
   editPromptTemplate: (template: PromptTemplate) => void;
@@ -58,8 +65,7 @@ interface StrategyActions {
   setProfileDraft: (draft: DomainProfileDraft) => void;
   saveDomainProfile: () => Promise<void>;
   publishDomainProfile: (id: string) => Promise<{ id: string; riskyFields: string[] } | null>;
-  confirmRiskyActivation: (id: string) => Promise<void>;
-  activateDomainProfile: (id: string) => Promise<void>;
+  activateDomainProfile: (id: string) => Promise<DomainProfileActivationResult | null>;
   deleteDomainProfile: (id: string) => Promise<void>;
 }
 
@@ -158,9 +164,19 @@ export const useStrategyStore = create<StrategyState & StrategyActions>((set, ge
     useUiStore.getState().setError("");
 
     try {
-      await api.put(`/api/agent-souls/${editingSoulId}`, soulDraft);
+      const saved = await api.put<{ id?: string; version?: number }>(
+        `/api/agent-souls/${editingSoulId}`,
+        soulDraft
+      );
+      if (!saved?.id) {
+        set({ editingSoulId: "" });
+        throw new Error("保存人格版本后端未返回新版本 ID");
+      }
+      // PUT 追加不可变草稿；后续“发布”必须指向刚保存的新版本，而不是旧来源行。
+      set({ editingSoulId: saved.id });
       await get().loadStrategyData();
     } catch (error) {
+      set({ editingSoulId: "" });
       useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
     } finally {
       useUiStore.getState().setBusy(false);
@@ -209,7 +225,7 @@ export const useStrategyStore = create<StrategyState & StrategyActions>((set, ge
     useUiStore.getState().setError("");
 
     try {
-      const resp = await api.put<{ status?: string; reason?: string; diff?: string }>(
+      const resp = await api.put<{ id?: string; version?: number; status?: string; reason?: string; diff?: string }>(
         `/api/prompt-templates/${editingPromptId}`,
         promptPayload(promptDraft, force)
       );
@@ -217,6 +233,13 @@ export const useStrategyStore = create<StrategyState & StrategyActions>((set, ge
       if (resp && resp.status === "needs_human_confirm") {
         return { needsConfirm: true, reason: resp.reason ?? "", diff: resp.diff ?? "" };
       }
+      if (!resp?.id) {
+        set({ editingPromptId: "" });
+        throw new Error("保存提示词版本后端未返回新版本 ID");
+      }
+      // PUT appends an immutable draft. A subsequent publish must target the
+      // new draft, never the source version that was used to create it.
+      set({ editingPromptId: resp.id });
       await get().loadStrategyData();
       return { ok: true };
     } catch (error) {
@@ -226,6 +249,7 @@ export const useStrategyStore = create<StrategyState & StrategyActions>((set, ge
       if (message.includes("红线语义审查拒绝")) {
         return { rejected: true, reason: message };
       }
+      set({ editingPromptId: "" });
       useUiStore.getState().setError(message);
       return { error: true, reason: message };
     } finally {
@@ -260,12 +284,12 @@ export const useStrategyStore = create<StrategyState & StrategyActions>((set, ge
     }
   },
 
-  resetSystemPromptPack: async () => {
+  resetSystemPromptPack: async (confirmation: string) => {
     useUiStore.getState().setBusy(true);
     useUiStore.getState().setError("");
 
     try {
-      await api.post("/api/prompt-templates/reset-system-pack");
+      await api.post("/api/prompt-templates/reset-system-pack", { confirmation });
       set({
         editingPromptId: "",
         promptDraft: emptyPromptTemplateDraft()
@@ -400,22 +424,29 @@ export const useStrategyStore = create<StrategyState & StrategyActions>((set, ge
     const { editingProfile, profileDraft } = get();
     useUiStore.getState().setBusy(true);
     try {
+      let saved: { item?: DomainProfile };
       if (editingProfile?.id) {
         // update：PUT 到已有 id。后端 update 不消费顶层 profileId（只用 existing.profile_id），
         // 直接发 DomainProfileDraft（snake_case，flatten 进 profile）即可。
-        await api.put(`/api/admin/domain-profiles/${editingProfile.id}`, profileDraft);
+        saved = await api.put<{ item?: DomainProfile }>(
+          `/api/admin/domain-profiles/${editingProfile.id}`,
+          profileDraft,
+        );
       } else {
         // create：POST 无 id。后端 UpsertRequest 顶层读 camelCase `profileId`（rename），
         // DomainProfileDraft 只有 snake_case profile_id（会 flatten 进内层 profile），
         // 故必须显式补顶层 profileId，否则 create 因 profileId 为空被 400。
-        await api.post(`/api/admin/domain-profiles`, {
+        saved = await api.post<{ item?: DomainProfile }>(`/api/admin/domain-profiles`, {
           ...profileDraft,
           profileId: profileDraft.profile_id ?? ""
         });
       }
+      if (!saved.item?.id) {
+        throw new Error("保存行业配置后端未返回新草稿 ID");
+      }
       await get().loadDomainProfiles();
-      // 保存后清新建/编辑态，回到占位（与列表刷新一致）。
-      set({ editingProfile: null, isCreatingProfile: false });
+      // PUT/POST 都追加不可变草稿。继续选中新 ID，确保紧接着的发布不会误指向来源版本。
+      set({ editingProfile: saved.item, isCreatingProfile: false });
     } catch (error) {
       useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
     } finally {
@@ -428,34 +459,15 @@ export const useStrategyStore = create<StrategyState & StrategyActions>((set, ge
     try {
       const resp = await api.post<{
         ok: boolean;
-        pendingActivation?: boolean;
         riskyFields?: string[];
         id: string;
       }>(`/api/admin/domain-profiles/${id}/publish`, {});
       await get().loadDomainProfiles();
-      // 危险开关变更：后端落旁路稿不即时生效，返回 pendingActivation + 变更字段，
-      // 交调用方二次确认后调 confirmRiskyActivation 才生效。普通变更返回 null。
-      if (resp.pendingActivation) {
-        return { id: resp.id, riskyFields: resp.riskyFields ?? [] };
-      }
-      return null;
+      // 发布只移动 published-current 指针，任何字段都必须再显式 activate 才生效。
+      return { id: resp.id, riskyFields: resp.riskyFields ?? [] };
     } catch (error) {
       useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
       return null;
-    } finally {
-      useUiStore.getState().setBusy(false);
-    }
-  },
-
-  // 危险开关二次确认：对 publish 落的旁路稿调 rollout（推 current + demote + realign），
-  // 让新版本真正生效。复用 rollout 端点（无前置状态校验，旁路稿 current=false 适用）。
-  confirmRiskyActivation: async (id: string) => {
-    useUiStore.getState().setBusy(true);
-    try {
-      await api.post(`/api/admin/domain-profiles/${id}/rollout`, {});
-      await get().loadDomainProfiles();
-    } catch (error) {
-      useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
     } finally {
       useUiStore.getState().setBusy(false);
     }
@@ -464,10 +476,15 @@ export const useStrategyStore = create<StrategyState & StrategyActions>((set, ge
   activateDomainProfile: async (id: string) => {
     useUiStore.getState().setBusy(true);
     try {
-      await api.post(`/api/admin/domain-profiles/${id}/activate`, {});
+      const result = await api.post<DomainProfileActivationResult>(
+        `/api/admin/domain-profiles/${id}/activate`,
+        {},
+      );
       await get().loadDomainProfiles();
+      return result;
     } catch (error) {
       useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
+      return null;
     } finally {
       useUiStore.getState().setBusy(false);
     }

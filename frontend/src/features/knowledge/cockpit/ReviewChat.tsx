@@ -3,6 +3,7 @@ import { ShieldAlert } from "lucide-react";
 import { canGoLive } from "../trustTypes";
 import { useGoLive } from "./useGoLive";
 import { StatusBadge } from "../../../components/ui/StatusBadge";
+import { useAccountStore } from "../../../stores/accountStore";
 import styles from "./ReviewChat.module.css";
 
 // 本组件 props 用本地最小接口(避免与 index.tsx 的 ReviewChunkItem 循环依赖)。
@@ -23,6 +24,7 @@ export interface ReviewChatChunk {
   dynamicConfidence?: number | null;
   validFrom?: string | null;
   validTo?: string | null;
+  updatedAt?: string | null;
 }
 
 // 字段锁的英文键 → 大白话中文名;映射不到就显示原名。
@@ -83,6 +85,7 @@ function clip(text: string | null | undefined, max = 180): string {
 
 export function ReviewChat({ chunk, onResolved }: ReviewChatProps) {
   const { goLive, pending } = useGoLive();
+  const accountId = useAccountStore((state) => state.currentAccountId());
   const [sessionId, setSessionId] = useState<string | undefined>(undefined);
   const [turns, setTurns] = useState<ChatTurn[]>([]);
   const [draft, setDraft] = useState("");
@@ -108,7 +111,7 @@ export function ReviewChat({ chunk, onResolved }: ReviewChatProps) {
 
   const handleGoLive = async () => {
     setGoLiveError(null);
-    const r = await goLive({ sessionId, chunkId: chunk.id });
+    const r = await goLive({ sessionId, chunkId: chunk.id, accountId });
     if (r.ok) {
       onResolved();
       return;
@@ -146,6 +149,11 @@ export function ReviewChat({ chunk, onResolved }: ReviewChatProps) {
   const handleSend = async () => {
     const content = draft.trim();
     if (!content || sending) return;
+    const expectedUpdatedAt = chunk.updatedAt?.trim();
+    if (!expectedUpdatedAt) {
+      setGoLiveError("这条知识缺少版本信息，请刷新列表后再让 AI 修改。");
+      return;
+    }
     setDraft("");
     setTurns((prev) => [...prev, { role: "operator", text: content }]);
     setSending(true);
@@ -156,7 +164,8 @@ export function ReviewChat({ chunk, onResolved }: ReviewChatProps) {
         body: JSON.stringify({
           content,
           sessionId,
-          attachments: [{ chunk_id: chunk.id }],
+          accountId,
+          attachments: [{ chunkId: chunk.id, expectedUpdatedAt, operation: "update" }],
         }),
       });
       if (!resp.ok) {
@@ -166,21 +175,19 @@ export function ReviewChat({ chunk, onResolved }: ReviewChatProps) {
       const data = (await resp.json()) as Record<string, unknown>;
       if (typeof data.sessionId === "string") setSessionId(data.sessionId);
 
-      const turn = (data.turn ?? data) as Record<string, unknown>;
       const naturalReply =
-        typeof turn.naturalReply === "string"
-          ? turn.naturalReply
-          : typeof data.naturalReply === "string"
-            ? data.naturalReply
-            : typeof data.reply === "string"
-              ? data.reply
-              : "好的。";
-      const rawPatch = turn.patch ?? data.patch;
+        typeof data.naturalReply === "string" ? data.naturalReply : "好的。";
+      const responseMatchesSnapshot =
+        data.targetChunkId === chunk.id && data.expectedUpdatedAt === expectedUpdatedAt;
+      const rawPatch = responseMatchesSnapshot ? data.draftPreview : undefined;
       const patchObj =
         rawPatch && typeof rawPatch === "object" && !Array.isArray(rawPatch)
           ? (rawPatch as Record<string, unknown>)
           : undefined;
       const touched = !!patchObj;
+      if (!responseMatchesSnapshot) {
+        setGoLiveError("AI 返回的知识目标或版本已变化，请刷新后重试。");
+      }
       setTurns((prev) => [
         ...prev,
         { role: "ai", text: naturalReply, touchedChunk: touched, patch: patchObj },

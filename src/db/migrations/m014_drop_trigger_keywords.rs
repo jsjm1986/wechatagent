@@ -3,8 +3,8 @@
 //! Agent-first 渐进式披露形态接管之后，关键词快路径与 `trigger_keywords` 索引
 //! 一并下线。
 //!
-//! 生产环境守卫：`APP_ENV=production` 时 noop 返回，避免误删；
-//! 运维需在确认所有副本与备份不再依赖该字段后再手工 unset。
+//! 生产环境由迁移 runner 的 `APPROVED_MIGRATIONS` 精确审批闸保护；运维需先
+//! 确认所有副本与备份不再依赖该字段。
 
 use mongodb::bson::{doc, Document};
 
@@ -12,13 +12,6 @@ use crate::db::Database;
 use crate::error::AppResult;
 
 pub(super) async fn run_step(db: &Database) -> AppResult<()> {
-    if std::env::var("APP_ENV").unwrap_or_default() == "production" {
-        tracing::warn!(
-            migration_id = "2026_05_W4_002_drop_trigger_keywords",
-            "production guard: skipped trigger_keywords unset; run manually after backup verification"
-        );
-        return Ok(());
-    }
     let collections: [&str; 3] = [
         "operation_knowledge_documents",
         "operation_knowledge_items",

@@ -600,6 +600,7 @@ pub(crate) async fn dispatch_chat_tool_call(
     knowledge: &KnowledgeRuntime,
     db: &Database,
     workspace_id: &str,
+    account_id: &str,
     budget: &Arc<RunBudget>,
     state: &mut ToolDispatchState,
     anchor_match: Option<AnchorMatchFn>,
@@ -618,6 +619,7 @@ pub(crate) async fn dispatch_chat_tool_call(
     let arguments = call.arguments.clone();
     let tool_owned = tool.to_string();
     let workspace_id_owned = workspace_id.to_string();
+    let account_id_owned = account_id.to_string();
 
     // 把所有 dispatch 用 timeout 包住——与 sync 版本对齐。
     let result = tokio::time::timeout(TOOL_DISPATCH_TIMEOUT, async {
@@ -626,14 +628,30 @@ pub(crate) async fn dispatch_chat_tool_call(
             TOOL_SEARCH => exec_search(&arguments, knowledge, runtime),
             TOOL_OPEN_SLICE => exec_open_slice(&arguments, knowledge, runtime),
             TOOL_AUDIT_COMPLETENESS => {
-                exec_audit_completeness(&arguments, db, &workspace_id_owned).await
+                exec_audit_completeness(&arguments, db, &workspace_id_owned, &account_id_owned)
+                    .await
             }
-            TOOL_SEARCH_CHUNKS => exec_search_chunks(&arguments, db, &workspace_id_owned).await,
-            TOOL_PROPOSE_REPAIR => exec_propose_repair(&arguments, db, &workspace_id_owned).await,
-            TOOL_ANALYZE_LOGS => exec_analyze_logs(&arguments, db, &workspace_id_owned).await,
-            TOOL_OPEN_DOCUMENT => exec_open_document(&arguments, db, &workspace_id_owned).await,
+            TOOL_SEARCH_CHUNKS => {
+                exec_search_chunks(&arguments, db, &workspace_id_owned, &account_id_owned).await
+            }
+            TOOL_PROPOSE_REPAIR => {
+                exec_propose_repair(&arguments, db, &workspace_id_owned, &account_id_owned).await
+            }
+            TOOL_ANALYZE_LOGS => {
+                exec_analyze_logs(&arguments, db, &workspace_id_owned, &account_id_owned).await
+            }
+            TOOL_OPEN_DOCUMENT => {
+                exec_open_document(&arguments, db, &workspace_id_owned, &account_id_owned).await
+            }
             TOOL_VERIFY_ANCHOR => {
-                exec_verify_anchor(&arguments, db, &workspace_id_owned, anchor_match).await
+                exec_verify_anchor(
+                    &arguments,
+                    db,
+                    &workspace_id_owned,
+                    &account_id_owned,
+                    anchor_match,
+                )
+                .await
             }
             _ => unreachable!("chat tool whitelist enforced above"),
         }
@@ -654,7 +672,12 @@ pub(crate) async fn dispatch_chat_tool_call(
 // 输出：{ chunk_id, integrity_status, missing_fields, has_source_quote,
 //        verified_claim_count, evidence_count, completeness_score (0..=1) }；
 // 错误：invalid_input / unknown_chunk_id / db_error。
-async fn exec_audit_completeness(arguments: &Document, db: &Database, workspace_id: &str) -> Value {
+async fn exec_audit_completeness(
+    arguments: &Document,
+    db: &Database,
+    workspace_id: &str,
+    account_id: &str,
+) -> Value {
     let args: AuditCompletenessArgs = match parse_arguments(arguments) {
         Ok(args) => args,
         Err(detail) => return tool_error("invalid_input", &detail),
@@ -674,7 +697,10 @@ async fn exec_audit_completeness(arguments: &Document, db: &Database, workspace_
     };
     let chunk = match db
         .operation_knowledge_chunks()
-        .find_one(doc! { "_id": oid, "workspace_id": workspace_id }, None)
+        .find_one(
+            scoped_knowledge_filter(workspace_id, account_id, doc! { "_id": oid }),
+            None,
+        )
         .await
     {
         Ok(Some(c)) => c,
@@ -734,7 +760,12 @@ async fn exec_audit_completeness(arguments: &Document, db: &Database, workspace_
 //                  redacted }], hit_count, query }
 // 与 user-ops `knowledge.search` 行为相似但走 db query；snippet 仍按 verified
 // 闸门 redact。
-async fn exec_search_chunks(arguments: &Document, db: &Database, workspace_id: &str) -> Value {
+async fn exec_search_chunks(
+    arguments: &Document,
+    db: &Database,
+    workspace_id: &str,
+    account_id: &str,
+) -> Value {
     let args: SearchChunksArgs = match parse_arguments(arguments) {
         Ok(args) => args,
         Err(detail) => return tool_error("invalid_input", &detail),
@@ -754,7 +785,7 @@ async fn exec_search_chunks(arguments: &Document, db: &Database, workspace_id: &
     let only_verified = args.only_verified.unwrap_or(false);
 
     // 简单做法：拉前 200 条候选 in-memory 评分（避免引入 $text 索引依赖）。
-    let mut filter = doc! { "workspace_id": workspace_id };
+    let mut filter = scoped_knowledge_filter(workspace_id, account_id, Document::new());
     if only_verified {
         filter.insert("integrity_status", "verified");
     }
@@ -809,7 +840,12 @@ async fn exec_search_chunks(arguments: &Document, db: &Database, workspace_id: &
 // 输入：{ chunk_id }
 // 输出：{ chunk_id, suggestions: [...] }，每条 suggestion 形如
 // { field, reason, hint }；不直接写库（与 AI 永不自动 verify 红线一致）。
-async fn exec_propose_repair(arguments: &Document, db: &Database, workspace_id: &str) -> Value {
+async fn exec_propose_repair(
+    arguments: &Document,
+    db: &Database,
+    workspace_id: &str,
+    account_id: &str,
+) -> Value {
     let args: ProposeRepairArgs = match parse_arguments(arguments) {
         Ok(args) => args,
         Err(detail) => return tool_error("invalid_input", &detail),
@@ -829,7 +865,10 @@ async fn exec_propose_repair(arguments: &Document, db: &Database, workspace_id: 
     };
     let chunk = match db
         .operation_knowledge_chunks()
-        .find_one(doc! { "_id": oid, "workspace_id": workspace_id }, None)
+        .find_one(
+            scoped_knowledge_filter(workspace_id, account_id, doc! { "_id": oid }),
+            None,
+        )
         .await
     {
         Ok(Some(c)) => c,
@@ -888,7 +927,12 @@ async fn exec_propose_repair(arguments: &Document, db: &Database, workspace_id: 
 // 输出：{ window_hours, total_runs, blocked_or_held_runs, top_chunks, items }
 // items[i]: { run_id, blocked_reason, knowledge_ids, created_at }
 // 复用 KnowledgeUsageLog 的 blocked_reason 字段做 24h 块/hold 反查。
-async fn exec_analyze_logs(arguments: &Document, db: &Database, workspace_id: &str) -> Value {
+async fn exec_analyze_logs(
+    arguments: &Document,
+    db: &Database,
+    workspace_id: &str,
+    account_id: &str,
+) -> Value {
     let args: AnalyzeLogsArgs = match parse_arguments(arguments) {
         Ok(args) => args,
         Err(detail) => return tool_error("invalid_input", &detail),
@@ -902,18 +946,23 @@ async fn exec_analyze_logs(arguments: &Document, db: &Database, workspace_id: &s
     let cutoff = Utc::now() - ChronoDuration::hours(hours);
     let cutoff_bson = BsonDt::from_millis(cutoff.timestamp_millis());
 
-    let mut filter = doc! {
-        "workspace_id": workspace_id,
-        "created_at": { "$gte": cutoff_bson },
-    };
-    if let Some(account_id) = args
+    if args
         .account_id
         .as_deref()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some_and(|requested| requested != account_id)
     {
-        filter.insert("account_id", account_id);
+        return tool_error(
+            "account_scope_violation",
+            "accountId must match the chat account",
+        );
     }
+    let mut filter = doc! {
+        "workspace_id": workspace_id,
+        "account_id": account_id,
+        "created_at": { "$gte": cutoff_bson },
+    };
     if only_blocked {
         filter.insert(
             "$or",
@@ -989,7 +1038,12 @@ async fn exec_analyze_logs(arguments: &Document, db: &Database, workspace_id: &s
 // 输出：{ document_id, title, source_type, raw_content_excerpt, raw_content_truncated,
 //        raw_content_total_chars, summary }；
 // 错误：invalid_input / unknown_document_id / db_error。
-async fn exec_open_document(arguments: &Document, db: &Database, workspace_id: &str) -> Value {
+async fn exec_open_document(
+    arguments: &Document,
+    db: &Database,
+    workspace_id: &str,
+    account_id: &str,
+) -> Value {
     let args: OpenDocumentArgs = match parse_arguments(arguments) {
         Ok(args) => args,
         Err(detail) => return tool_error("invalid_input", &detail),
@@ -1010,7 +1064,10 @@ async fn exec_open_document(arguments: &Document, db: &Database, workspace_id: &
     let max_chars = args.max_chars.filter(|v| *v > 0).unwrap_or(4000).min(8000) as usize;
     let doc_record: OperationKnowledgeDocument = match db
         .operation_knowledge_documents()
-        .find_one(doc! { "_id": oid, "workspace_id": workspace_id }, None)
+        .find_one(
+            scoped_knowledge_filter(workspace_id, account_id, doc! { "_id": oid }),
+            None,
+        )
         .await
     {
         Ok(Some(d)) => d,
@@ -1051,6 +1108,7 @@ async fn exec_verify_anchor(
     arguments: &Document,
     db: &Database,
     workspace_id: &str,
+    account_id: &str,
     anchor_match: Option<AnchorMatchFn>,
 ) -> Value {
     let args: VerifyAnchorArgs = match parse_arguments(arguments) {
@@ -1072,7 +1130,10 @@ async fn exec_verify_anchor(
     };
     let chunk: OperationKnowledgeChunk = match db
         .operation_knowledge_chunks()
-        .find_one(doc! { "_id": oid, "workspace_id": workspace_id }, None)
+        .find_one(
+            scoped_knowledge_filter(workspace_id, account_id, doc! { "_id": oid }),
+            None,
+        )
         .await
     {
         Ok(Some(c)) => c,
@@ -1094,7 +1155,7 @@ async fn exec_verify_anchor(
     let parent: OperationKnowledgeDocument = match db
         .operation_knowledge_documents()
         .find_one(
-            doc! { "_id": document_oid, "workspace_id": workspace_id },
+            scoped_knowledge_filter(workspace_id, account_id, doc! { "_id": document_oid }),
             None,
         )
         .await
@@ -1168,6 +1229,19 @@ async fn exec_verify_anchor(
 }
 
 // ── 内部辅助 ────────────────────────────────────────────────────────────
+
+fn scoped_knowledge_filter(workspace_id: &str, account_id: &str, extra: Document) -> Document {
+    let mut filter = doc! {
+        "workspace_id": workspace_id,
+        "domain": "user_operations",
+        "$or": [
+            { "account_id": null },
+            { "account_id": account_id },
+        ],
+    };
+    filter.extend(extra);
+    filter
+}
 
 fn parse_arguments<T: for<'de> Deserialize<'de> + Default>(
     arguments: &Document,
@@ -1272,6 +1346,8 @@ mod tests {
             updated_at: BsonDt::now(),
             catalog_summary_persisted: None,
             catalog_version: None,
+            catalog_desired_generation: 0,
+            catalog_applied_generation: 0,
         }
     }
 
@@ -1552,6 +1628,47 @@ mod tests {
         assert_eq!(a.account_id.as_deref(), Some("acc-1"));
         assert_eq!(a.hours, Some(24));
         assert_eq!(a.only_blocked_or_held, Some(true));
+    }
+
+    #[tokio::test]
+    async fn analyze_logs_rejects_model_account_scope_expansion_before_db_access() {
+        let db = crate::db::Database::connect("mongodb://127.0.0.1:1/test", "wechatagent_test")
+            .await
+            .expect("lazy connect should not fail on URI parse");
+        let result = exec_analyze_logs(
+            &doc! { "accountId": "account_b" },
+            &db,
+            "ws_test",
+            "account_a",
+        )
+        .await;
+        assert_eq!(
+            result.get("error").and_then(Value::as_str),
+            Some("account_scope_violation")
+        );
+    }
+
+    #[test]
+    fn scoped_filter_allows_only_shared_or_current_account() {
+        let filter = scoped_knowledge_filter("ws", "account_a", doc! { "_id": ObjectId::new() });
+        assert_eq!(filter.get_str("workspace_id").unwrap(), "ws");
+        assert_eq!(filter.get_str("domain").unwrap(), "user_operations");
+        let branches = filter
+            .get_array("$or")
+            .expect("account visibility branches");
+        assert_eq!(branches.len(), 2);
+        assert!(branches.iter().any(|branch| {
+            branch
+                .as_document()
+                .and_then(|doc| doc.get("account_id"))
+                .is_some_and(|value| value == &mongodb::bson::Bson::Null)
+        }));
+        assert!(branches.iter().any(|branch| {
+            branch
+                .as_document()
+                .and_then(|doc| doc.get_str("account_id").ok())
+                == Some("account_a")
+        }));
     }
 
     #[test]

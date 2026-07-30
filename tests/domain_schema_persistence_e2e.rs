@@ -10,7 +10,9 @@ mod common;
 
 use mongodb::bson::{doc, DateTime};
 use wechatagent::models::{DomainField, DomainSchema};
-use wechatagent::routes::domain_schemas::{enforce_domain_attributes, load_active_domain_schema};
+use wechatagent::routes::domain_schemas::{
+    activate_exact_version, enforce_domain_attributes, load_active_domain_schema,
+};
 
 /// 构造一条 DomainSchema（与 create_domain_schema handler 构造的等价）。
 fn make_schema(
@@ -130,4 +132,69 @@ async fn activate_switches_active_via_snake_case_set() {
         .expect("load")
         .expect("some");
     assert_eq!(loaded.schema_id, "b", "activate B 后 load 应返回 B");
+}
+
+#[tokio::test]
+#[ignore = "requires replica-set MongoDB / testcontainers"]
+async fn exact_version_activation_is_atomic_unique_and_preserves_history() {
+    let app = common::TestApp::start_repl_set().await;
+    let ws = format!("sr056-{}", mongodb::bson::oid::ObjectId::new().to_hex());
+    let mut v1 = make_schema(&ws, "sales", true, false);
+    v1.version = 1;
+    let mut v2 = make_schema(&ws, "sales", false, false);
+    v2.version = 2;
+    v2.name = "schema-sales-v2".to_string();
+    app.state
+        .db
+        .domain_schemas()
+        .insert_many(vec![&v1, &v2], None)
+        .await
+        .expect("insert version history");
+
+    let activated = activate_exact_version(&app.state.db, &ws, "sales", 2)
+        .await
+        .expect("activate exact v2");
+    assert_eq!(activated.version, 2);
+    assert!(activated.is_active);
+    assert_eq!(
+        app.state
+            .db
+            .domain_schemas()
+            .count_documents(doc! { "workspace_id": &ws, "is_active": true }, None)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        app.state
+            .db
+            .domain_schemas()
+            .count_documents(doc! { "workspace_id": &ws, "schema_id": "sales" }, None)
+            .await
+            .unwrap(),
+        2,
+        "activation must retain both immutable versions"
+    );
+    let loaded = load_active_domain_schema(&app.state.db, &ws)
+        .await
+        .unwrap()
+        .expect("one active schema");
+    assert_eq!(loaded.version, 2);
+
+    let stale = activate_exact_version(&app.state.db, &ws, "sales", 99)
+        .await
+        .expect_err("unknown version must fail closed");
+    assert!(stale.to_string().contains("domain_schema_version_changed"));
+    assert_eq!(
+        app.state
+            .db
+            .domain_schemas()
+            .count_documents(doc! { "workspace_id": &ws, "is_active": true }, None)
+            .await
+            .unwrap(),
+        1,
+        "failed activation must leave the active pointer intact"
+    );
+
+    app.cleanup().await;
 }

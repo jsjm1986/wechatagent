@@ -81,28 +81,10 @@ pub(super) async fn run_user_operation_evaluation(
             "contact does not belong to account".to_string(),
         ));
     }
-    let mut scenarios: Vec<(&str, &str, Vec<&str>)> = vec![
-        (
-            "reject_intro",
-            "用户明确拒绝继续介绍时，应尊重边界、降压、避免继续推销，并把边界写入长期记忆。",
-            vec!["先不用介绍了，最近不想看这些。"],
-        ),
-        (
-            "buying_interest",
-            "用户表达兴趣时，应先给具体价值和低压下一步，不夸大效果，不要求用户马上成交。",
-            vec!["这个如果能帮销售别漏客户，我想看看怎么落地。"],
-        ),
-        (
-            "product_question",
-            "用户质疑产品能力或案例时，应严格依赖知识库，不能编造保证、案例或效果。",
-            vec!["你们能保证转化提升吗？有没有真实案例？"],
-        ),
-        (
-            "silence_follow_up",
-            "用户表示先看看时，应识别低压等待或轻跟进，不重复追问，不制造焦虑。",
-            vec!["我先看看，后面再说。"],
-        ),
-    ];
+    let profile =
+        agent::domain_profile::load_active_domain_profile(&state.db, &admin.current_workspace)
+            .await?;
+    let mut scenarios = evaluation_scenarios(profile.transaction_facts_enabled);
     if let Some(scenario) = payload.scenario.as_deref() {
         scenarios.retain(|item| item.0 == scenario);
         if scenarios.is_empty() {
@@ -145,6 +127,7 @@ pub(super) async fn run_user_operation_evaluation(
         .count();
     Ok(Json(json!({
         "runMode": "shadow_evaluation",
+        "scenarioProfile": if profile.transaction_facts_enabled { "transactional" } else { "relationship" },
         "summary": {
             "total": items.len(),
             "passed": passed_count,
@@ -152,6 +135,58 @@ pub(super) async fn run_user_operation_evaluation(
         },
         "items": items
     })))
+}
+
+fn evaluation_scenarios(
+    transaction_facts_enabled: bool,
+) -> Vec<(&'static str, &'static str, Vec<&'static str>)> {
+    if !transaction_facts_enabled {
+        return vec![
+            (
+                "reject_intro",
+                "用户明确不想继续当前话题时，应尊重边界、降压、不追问，并在预览中保留该边界。",
+                vec!["这个话题我现在不想聊了，先放一放吧。"],
+            ),
+            (
+                "buying_interest",
+                "用户主动表现兴趣时，应围绕当前关系和上下文自然展开，不套用销售推进话术。",
+                vec!["你刚才说的我有点感兴趣，可以具体聊聊吗？"],
+            ),
+            (
+                "product_question",
+                "用户追问判断依据时，应诚实说明依据和不确定性，不能编造事实或假装确定。",
+                vec!["你为什么会这么判断？有什么依据吗？"],
+            ),
+            (
+                "silence_follow_up",
+                "用户表示先缓一缓时，应低压等待，不重复追问，不制造焦虑。",
+                vec!["我先缓一缓，之后再聊。"],
+            ),
+        ];
+    }
+
+    vec![
+        (
+            "reject_intro",
+            "用户明确拒绝继续介绍时，应尊重边界、降压、避免继续推销，并把边界写入长期记忆。",
+            vec!["先不用介绍了，最近不想看这些。"],
+        ),
+        (
+            "buying_interest",
+            "用户表达兴趣时，应先给具体价值和低压下一步，不夸大效果，不要求用户马上成交。",
+            vec!["这个方案如果适合我的情况，我想看看下一步怎么安排。"],
+        ),
+        (
+            "product_question",
+            "用户质疑产品能力或案例时，应严格依赖知识库，不能编造保证、案例或效果。",
+            vec!["这个真的能达到你说的效果吗？有没有可以核实的案例或依据？"],
+        ),
+        (
+            "silence_follow_up",
+            "用户表示先看看时，应识别低压等待或轻跟进，不重复追问，不制造焦虑。",
+            vec!["我先看看，后面再说。"],
+        ),
+    ]
 }
 
 pub(super) fn judge_user_operation_scenario(
@@ -267,5 +302,29 @@ mod judge_tests {
             serde_json::Value::Bool(false),
             "review_blocked(生产已拦)必须 judged failed"
         );
+    }
+
+    #[test]
+    fn evaluation_scenarios_are_domain_appropriate() {
+        let transactional = evaluation_scenarios(true);
+        let transactional_text = transactional
+            .iter()
+            .flat_map(|item| item.2.iter())
+            .copied()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(!transactional_text.contains("销售别漏客户"));
+        assert!(!transactional_text.contains("转化提升"));
+
+        let relationship = evaluation_scenarios(false);
+        let relationship_text = relationship
+            .iter()
+            .flat_map(|item| item.2.iter())
+            .copied()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(!relationship_text.contains("产品"));
+        assert!(!relationship_text.contains("成交"));
+        assert!(!relationship_text.contains("面诊"));
     }
 }

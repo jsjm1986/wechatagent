@@ -27,6 +27,8 @@ type ActiveVersionMeta = {
   updatedAt?: string;
 };
 
+const RESET_SYSTEM_PROMPT_PACK_CONFIRMATION = "RESET PROMPT PACK";
+
 type OperationStatePolicyEntry = ActiveVersionMeta & {
   workspaceId?: string;
   domain: string;
@@ -47,6 +49,7 @@ type TaxonomyEntry = ActiveVersionMeta & {
     description?: string;
     aliases?: string[];
     status: string;
+    priorityWeight?: number | null;
     isReactivationTarget?: boolean;
     isTerminal?: boolean;
   };
@@ -686,6 +689,7 @@ function TaxonomiesAdmin({ busy }: { busy: boolean }) {
   const [info, setInfo] = useState<string | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editDraft, setEditDraft] = useState<EditDraft>({ label: "", aliases: "", description: "", isReactivationTarget: false, isTerminal: false });
+  const [editBaseline, setEditBaseline] = useState<EditDraft | null>(null);
   const { pageRows, pageCount, safePage, setPage } = usePagedList(items);
 
   async function reload() {
@@ -754,20 +758,37 @@ function TaxonomiesAdmin({ busy }: { busy: boolean }) {
       setError("显示名不能为空。");
       return;
     }
+    if (!editBaseline) {
+      setError("编辑快照已失效，请重新打开编辑器。");
+      return;
+    }
+    const normalizeAliases = (value: string) => value.split(/[,，]/).map((a) => a.trim()).filter((a) => a.length > 0);
+    const label = editDraft.label.trim();
+    const aliases = normalizeAliases(editDraft.aliases);
+    const baselineAliases = normalizeAliases(editBaseline.aliases);
+    const description = editDraft.description.trim();
+    const patch: Record<string, unknown> = {};
+    if (label !== editBaseline.label.trim()) patch.label = label;
+    if (JSON.stringify(aliases) !== JSON.stringify(baselineAliases)) patch.aliases = aliases;
+    if (description !== editBaseline.description.trim()) patch.description = description;
+    if (editDraft.isTerminal !== editBaseline.isTerminal) patch.isTerminal = editDraft.isTerminal;
+    if (editDraft.isReactivationTarget !== editBaseline.isReactivationTarget) {
+      patch.isReactivationTarget = editDraft.isReactivationTarget;
+    }
+    if (Object.keys(patch).length === 0) {
+      setInfo("没有改动。");
+      setEditingId(null);
+      setEditBaseline(null);
+      return;
+    }
     setActing(true);
     setError(null);
     setInfo(null);
     try {
-      const aliases = editDraft.aliases.split(/[,，]/).map((a) => a.trim()).filter((a) => a.length > 0);
-      await api.patch(`/api/admin/taxonomies/${id}`, {
-        label: editDraft.label.trim(),
-        aliases,
-        description: editDraft.description.trim(),
-        isTerminal: editDraft.isTerminal,
-        isReactivationTarget: editDraft.isReactivationTarget,
-      });
+      await api.patch(`/api/admin/taxonomies/${id}`, patch);
       setInfo("已更新。");
       setEditingId(null);
+      setEditBaseline(null);
       await reload();
     } catch (e) {
       setError((e as Error).message);
@@ -940,7 +961,7 @@ function TaxonomiesAdmin({ busy }: { busy: boolean }) {
             {editingId !== item.id && item.currentVersion !== false && (
               <div className={styles.buttonRow}>
                 <button type="button" className={styles.btnGhost}
-                  onClick={() => { setShowCreate(false); setEditingId(item.id); setEditDraft({ label: item.value.label, aliases: (item.value.aliases ?? []).join("，"), description: item.value.description ?? "", isReactivationTarget: item.value.isReactivationTarget ?? false, isTerminal: item.value.isTerminal ?? false }); setInfo(null); setError(null); }}
+                  onClick={() => { const next = { label: item.value.label, aliases: (item.value.aliases ?? []).join("，"), description: item.value.description ?? "", isReactivationTarget: item.value.isReactivationTarget ?? false, isTerminal: item.value.isTerminal ?? false }; setShowCreate(false); setEditingId(item.id); setEditDraft(next); setEditBaseline(next); setInfo(null); setError(null); }}
                   disabled={busy || acting}>编辑</button>
                 {item.value.status === "active" ? (
                   <button type="button" className={styles.btnGhost} onClick={() => void deprecateEntry(item.id)} disabled={busy || acting}>废弃</button>
@@ -984,7 +1005,7 @@ function TaxonomiesAdmin({ busy }: { busy: boolean }) {
                 </label>
                 <div className={styles.buttonRow}>
                   <button type="button" className={styles.btnPrimary} onClick={() => void submitEdit(item.id)} disabled={acting}>保存编辑</button>
-                  <button type="button" className={styles.btnGhost} onClick={() => setEditingId(null)} disabled={acting}>取消</button>
+                  <button type="button" className={styles.btnGhost} onClick={() => { setEditingId(null); setEditBaseline(null); }} disabled={acting}>取消</button>
                 </div>
               </div>
             )}
@@ -1243,12 +1264,19 @@ function TaxonomyCandidatesAdmin({ busy }: { busy: boolean }) {
 
 function ProfileStatusBadge({ profile }: { profile: DomainProfile }) {
   if (profile.is_active) {
-    return <span className={styles.badgeOk}>生效中</span>;
+    return (
+      <span className={styles.badgeOk}>
+        {profile.current_version ? "生效中" : "生效中（旧发布）"}
+      </span>
+    );
+  }
+  if (profile.release_status === "draft") {
+    return <span className={styles.badge}>草稿</span>;
   }
   if (profile.current_version) {
     return <span className={styles.badgeWarn}>待激活</span>;
   }
-  return <span className={styles.badge}>草稿</span>;
+  return <span className={styles.badge}>已发布历史</span>;
 }
 
 function ProfileTabBar({ tab, onSelect }: { tab: "list" | "generate"; onSelect: (t: "list" | "generate") => void }) {
@@ -1687,6 +1715,22 @@ function ProfileEditor({
                 />
                 必备
               </label>
+              <input
+                className={styles.input}
+                value={(cov.review_topic_aliases ?? []).join(", ")}
+                placeholder="review_topic_aliases（评审主题别名，逗号分隔）"
+                onChange={(e) => {
+                  const arr = [...(draft.coverage_dimensions ?? [])];
+                  arr[i] = {
+                    ...cov,
+                    review_topic_aliases: e.target.value
+                      .split(/[,，]/)
+                      .map((value) => value.trim())
+                      .filter(Boolean),
+                  };
+                  update({ coverage_dimensions: arr });
+                }}
+              />
               <input
                 className={styles.input}
                 value={cov.anchor_hint ?? ""}
@@ -2203,17 +2247,19 @@ function ProfileEditor({
         >
           {profile ? "保存修改" : "创建草稿"}
         </button>
-        {profile && !profile.is_active && (
+        {profile && (
           <>
             <ProfilePublishCard profileId={profile.id} onDone={onRefresh} />
-            <button
-              type="button"
-              className={styles.btnGhost}
-              onClick={onDelete}
-              disabled={busy}
-            >
-              删除
-            </button>
+            {profile.release_status === "draft" && !profile.is_active && (
+              <button
+                type="button"
+                className={styles.btnGhost}
+                onClick={onDelete}
+                disabled={busy}
+              >
+                删除草稿
+              </button>
+            )}
           </>
         )}
       </div>
@@ -2609,6 +2655,7 @@ export default function SystemStrategyFeature() {
 
 function SystemStrategyInner() {
   const busy = useUiStore((s) => s.busy);
+  const confirm = useConfirm();
   const {
     souls,
     promptTemplates,
@@ -2664,6 +2711,22 @@ function SystemStrategyInner() {
     e.preventDefault();
     void runSavePrompt();
   };
+  const handleResetSystemPromptPack = async () => {
+    const ok = await confirm({
+      title: "重置系统提示词包？",
+      body: (
+        <span>
+          这会替换当前 workspace 的 Prompt、Playbook 与 Domain Config，并重新绑定纳管联系人。
+          Soul 历史会保留，但其它运营配置可能被默认包覆盖。请先确认已有可恢复备份。
+        </span>
+      ),
+      tone: "danger",
+      confirmText: "确认重置",
+      requireText: RESET_SYSTEM_PROMPT_PACK_CONFIRMATION,
+    });
+    if (!ok) return;
+    await resetSystemPromptPack(RESET_SYSTEM_PROMPT_PACK_CONFIRMATION);
+  };
 
   return (
     <div className={styles.page}>
@@ -2711,7 +2774,7 @@ function SystemStrategyInner() {
           <button
             type="button"
             className={styles.btnGhost}
-            onClick={() => void resetSystemPromptPack()}
+            onClick={() => void handleResetSystemPromptPack()}
             disabled={busy}
           >
             重置系统提示词包 v2

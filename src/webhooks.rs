@@ -11,12 +11,12 @@ use governor::{
 };
 use hmac::{Hmac, Mac};
 use mongodb::{
-    bson::{doc, to_document, DateTime},
+    bson::{doc, oid::ObjectId, to_document, DateTime, Document},
     error::{ErrorKind, WriteFailure},
-    options::UpdateOptions,
+    options::{FindOptions, UpdateOptions},
 };
 use serde_json::Value;
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 
 use crate::{
     agent,
@@ -27,12 +27,301 @@ use crate::{
 
 type WebhookLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
 
-static WEBHOOK_LIMITERS: LazyLock<DashMap<String, Arc<WebhookLimiter>>> =
+static WEBHOOK_LIMITERS: LazyLock<DashMap<(String, String), Arc<WebhookLimiter>>> =
     LazyLock::new(DashMap::new);
 
-/// LP-14 / Task 20：返回 per-account 的令牌桶限流器，按需创建。
-fn limiter_for(account_id: &str, capacity: u32, window_seconds: u32) -> Arc<WebhookLimiter> {
-    if let Some(existing) = WEBHOOK_LIMITERS.get(account_id) {
+/// Durable, single-flight handoff from webhook ingestion to the Agent task
+/// worker. The task keeps this stable key across terminal states so a later
+/// inbound can revive the same row and fence any older owner.
+pub const DURABLE_INBOUND_REPLY_KIND: &str = "inbound_reply";
+const DURABLE_INBOUND_ACTIVE_KEY: &str = "inbound_reply";
+const HANDOFF_PENDING: &str = "pending";
+const HANDOFF_MATERIALIZED: &str = "materialized";
+const HANDOFF_DEFERRED: &str = "deferred";
+const HANDOFF_IGNORED: &str = "ignored_not_managed";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DurableInboundTask {
+    pub task_id: ObjectId,
+    pub run_at_ms: i64,
+}
+
+fn durable_inbound_task_id(workspace_id: &str, account_id: &str, wxid: &str) -> ObjectId {
+    let mut hasher = Sha256::new();
+    for value in [workspace_id, account_id, wxid, DURABLE_INBOUND_REPLY_KIND] {
+        hasher.update(value.as_bytes());
+        hasher.update([0]);
+    }
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 12];
+    bytes.copy_from_slice(&digest[..12]);
+    ObjectId::from_bytes(bytes)
+}
+
+pub async fn mark_inbound_handoff(
+    state: &AppState,
+    message_id: ObjectId,
+    status: &str,
+) -> AppResult<()> {
+    state
+        .db
+        .messages()
+        .clone_with_type::<Document>()
+        .update_one(
+            doc! { "_id": message_id, "handoff_status": HANDOFF_PENDING },
+            doc! { "$set": {
+                "handoff_status": status,
+                "handoff_updated_at": DateTime::now(),
+            } },
+            None,
+        )
+        .await?;
+    Ok(())
+}
+
+/// Materialize or refresh the one durable inbound task for a tenant/contact.
+/// Message order is `(created_at, _id)`: `created_at` is the primary arrival
+/// fact, while `_id` is only a deterministic tie-breaker for equal timestamps.
+/// ObjectId ordering alone is insufficient because different processes may
+/// generate non-monotonic random tails within the same second.
+pub async fn materialize_durable_inbound_task(
+    state: &AppState,
+    contact: &Contact,
+    inbound: &ConversationMessage,
+    debounce_window_ms: u64,
+) -> AppResult<DurableInboundTask> {
+    let message_id = inbound.id.ok_or_else(|| {
+        AppError::External("durable inbound handoff requires persisted message _id".to_string())
+    })?;
+    let task_id =
+        durable_inbound_task_id(&contact.workspace_id, &contact.account_id, &contact.wxid);
+    let run_at = DateTime::from_millis(
+        inbound
+            .created_at
+            .timestamp_millis()
+            .saturating_add(debounce_window_ms.min(i64::MAX as u64) as i64),
+    );
+    let now = DateTime::now();
+    let task = AgentTask {
+        id: Some(task_id),
+        workspace_id: contact.workspace_id.clone(),
+        account_id: contact.account_id.clone(),
+        contact_wxid: contact.wxid.clone(),
+        kind: DURABLE_INBOUND_REPLY_KIND.to_string(),
+        run_at,
+        expires_at: None,
+        content: message_id.to_hex(),
+        status: "pending".to_string(),
+        source_decision_id: None,
+        review_required: true,
+        attempt_count: 0,
+        max_attempts: 3,
+        next_retry_at: None,
+        gateway_status: None,
+        cancel_reason: None,
+        error: None,
+        claimed_at: None,
+        claim_recovery_count: 0,
+        created_at: now,
+        updated_at: now,
+    };
+    let mut insert_doc = to_document(&task)?;
+    insert_doc.insert("active_task_key", DURABLE_INBOUND_ACTIVE_KEY);
+    insert_doc.insert("latest_inbound_id", message_id);
+    insert_doc.insert("latest_inbound_created_at", inbound.created_at);
+
+    let tasks = state.db.tasks().clone_with_type::<Document>();
+    match tasks.insert_one(insert_doc, None).await {
+        Ok(_) => {}
+        Err(error) if is_duplicate_key_error(&error) => {
+            tasks
+                .update_one(
+                    doc! {
+                        "_id": task_id,
+                        "$or": [
+                            { "latest_inbound_created_at": { "$exists": false } },
+                            { "latest_inbound_created_at": null },
+                            { "latest_inbound_created_at": { "$lt": inbound.created_at } },
+                            {
+                                "latest_inbound_created_at": inbound.created_at,
+                                "$or": [
+                                    { "latest_inbound_id": { "$exists": false } },
+                                    { "latest_inbound_id": null },
+                                    { "latest_inbound_id": { "$lt": message_id } },
+                                ],
+                            },
+                        ],
+                    },
+                    doc! {
+                        "$set": {
+                            "workspace_id": &contact.workspace_id,
+                            "account_id": &contact.account_id,
+                            "contact_wxid": &contact.wxid,
+                            "kind": DURABLE_INBOUND_REPLY_KIND,
+                            "active_task_key": DURABLE_INBOUND_ACTIVE_KEY,
+                            "latest_inbound_id": message_id,
+                            "latest_inbound_created_at": inbound.created_at,
+                            "run_at": run_at,
+                            "content": message_id.to_hex(),
+                            "status": "pending",
+                            "review_required": true,
+                            "attempt_count": 0,
+                            "max_attempts": 3,
+                            "claim_recovery_count": 0,
+                            "updated_at": now,
+                        },
+                        "$unset": {
+                            "expires_at": "",
+                            "source_decision_id": "",
+                            "next_retry_at": "",
+                            "gateway_status": "",
+                            "cancel_reason": "",
+                            "error": "",
+                            "claimed_at": "",
+                            "claim_token": "",
+                            "outbox_decision_id": "",
+                            "prepared_commit_kind": "",
+                            "prepared_commit": "",
+                        },
+                    },
+                    None,
+                )
+                .await?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+
+    mark_inbound_handoff(state, message_id, HANDOFF_MATERIALIZED).await?;
+    let stored = tasks
+        .find_one(doc! { "_id": task_id }, None)
+        .await?
+        .ok_or_else(|| AppError::External("durable inbound task disappeared".to_string()))?;
+    let stored_run_at = stored
+        .get_datetime("run_at")
+        .copied()
+        .unwrap_or(run_at)
+        .timestamp_millis();
+    Ok(DurableInboundTask {
+        task_id,
+        run_at_ms: stored_run_at,
+    })
+}
+
+/// Recover messages persisted before their task handoff completed. This runs at
+/// the beginning of every task-worker tick and is safe to repeat.
+pub async fn reconcile_pending_inbound_handoffs(state: &AppState) -> AppResult<u64> {
+    use futures::TryStreamExt;
+
+    let mut cursor = state
+        .db
+        .messages()
+        .clone_with_type::<Document>()
+        .find(
+            doc! { "direction": "inbound", "handoff_status": HANDOFF_PENDING },
+            FindOptions::builder()
+                .sort(doc! { "created_at": 1, "_id": 1 })
+                .limit(100)
+                .build(),
+        )
+        .await?;
+    let mut recovered = 0u64;
+    while let Some(raw) = cursor.try_next().await? {
+        let inbound: ConversationMessage = mongodb::bson::from_document(raw).map_err(|error| {
+            AppError::External(format!("pending inbound handoff decode failed: {error}"))
+        })?;
+        let Some(message_id) = inbound.id else {
+            continue;
+        };
+        let contact = state
+            .db
+            .contacts()
+            .find_one(
+                doc! {
+                    "workspace_id": &inbound.workspace_id,
+                    "account_id": &inbound.account_id,
+                    "wxid": &inbound.contact_wxid,
+                },
+                None,
+            )
+            .await?;
+        // The process may have crashed after inserting the inbound fact but
+        // before the ordinary webhook path upserted its contact. Re-run the
+        // same idempotent contact materialization here. Explicitly
+        // non-operatable identities are terminal; an operatable new contact is
+        // recreated as `normal`, matching the uninterrupted webhook path.
+        let contact = match contact {
+            Some(contact) => Some(contact),
+            None if is_operatable_person(&inbound.contact_wxid) => {
+                upsert_webhook_contact(
+                    state,
+                    &inbound.workspace_id,
+                    &inbound.account_id,
+                    &inbound.contact_wxid,
+                    &Value::Null,
+                )
+                .await?
+            }
+            None => None,
+        };
+        let Some(contact) = contact else {
+            mark_inbound_handoff(state, message_id, HANDOFF_IGNORED).await?;
+            continue;
+        };
+        if contact.agent_status != AgentStatus::Managed {
+            mark_inbound_handoff(state, message_id, HANDOFF_IGNORED).await?;
+            continue;
+        }
+
+        let domain_config = agent::load_user_operation_domain_config_for_contact(
+            state,
+            &contact.workspace_id,
+            &contact.id.map(|id| id.to_hex()).unwrap_or_default(),
+        )
+        .await?;
+        let runtime =
+            crate::agent::UserRuntimeParameters::from_config(domain_config.as_ref(), state);
+        let active_profile =
+            agent::domain_profile::load_active_domain_profile(&state.db, &contact.workspace_id)
+                .await?;
+        let quiet = agent::quiet_hours::effective_quiet_hours_enabled(
+            &contact,
+            &active_profile,
+            runtime.quiet_hours_enabled,
+        ) && agent::quiet_hours::is_quiet_now(
+            runtime.quiet_hours_start,
+            runtime.quiet_hours_end,
+            runtime.quiet_hours_tz_offset_hours,
+        );
+        if quiet {
+            ensure_wake_followup_task(
+                state,
+                &contact,
+                runtime.quiet_hours_end,
+                runtime.quiet_hours_tz_offset_hours,
+            )
+            .await?;
+            mark_inbound_handoff(state, message_id, HANDOFF_DEFERRED).await?;
+        } else {
+            let window_ms = crate::agent::domain_profile::resolve_debounce_window_ms(
+                &active_profile,
+                state.config.message_debounce_window_ms,
+            );
+            materialize_durable_inbound_task(state, &contact, &inbound, window_ms).await?;
+        }
+        recovered = recovered.saturating_add(1);
+    }
+    Ok(recovered)
+}
+
+/// LP-14 / Task 20: return the tenant-scoped token bucket, creating it lazily.
+fn limiter_for(
+    workspace_id: &str,
+    account_id: &str,
+    capacity: u32,
+    window_seconds: u32,
+) -> Arc<WebhookLimiter> {
+    let key = (workspace_id.to_string(), account_id.to_string());
+    if let Some(existing) = WEBHOOK_LIMITERS.get(&key) {
         return existing.clone();
     }
     let cap = NonZeroU32::new(capacity.max(1)).unwrap();
@@ -41,7 +330,7 @@ fn limiter_for(account_id: &str, capacity: u32, window_seconds: u32) -> Arc<Webh
         .allow_burst(cap);
     let limiter = Arc::new(RateLimiter::direct(quota));
     WEBHOOK_LIMITERS
-        .entry(account_id.to_string())
+        .entry(key)
         .or_insert_with(|| limiter.clone())
         .clone()
 }
@@ -126,6 +415,7 @@ pub async fn run_debounce_pipeline(
     state: AppState,
     key: String,
     st: Arc<PendingState>,
+    workspace_id: String,
     account_id: String,
     from_wxid: String,
     app_id: Option<String>,
@@ -134,106 +424,114 @@ pub async fn run_debounce_pipeline(
     use std::panic::AssertUnwindSafe;
 
     let state_for_panic = state.clone();
+    let workspace_for_panic = workspace_id.clone();
     let account_for_panic = account_id.clone();
     let wxid_for_panic = from_wxid.clone();
     let app_for_panic = app_id.clone();
     let key_for_panic = key.clone();
 
-    let inner = async move {
-        loop {
-            // (a) 去抖睡眠——可被后到入站刷新 deadline 反复重置。
+    let inner =
+        async move {
             loop {
-                let now = now_ms();
-                let dl = st.deadline_ms.load(Ordering::Acquire);
-                if now >= dl {
-                    break;
+                // (a) 去抖睡眠——可被后到入站刷新 deadline 反复重置。
+                loop {
+                    let now = now_ms();
+                    let dl = st.deadline_ms.load(Ordering::Acquire);
+                    if now >= dl {
+                        break;
+                    }
+                    let wait = (dl - now).max(0) as u64;
+                    tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
                 }
-                let wait = (dl - now).max(0) as u64;
-                tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
-            }
 
-            // (b) 快照本轮 generation + 最新入站（锁立即释放，绝不跨 .await）。
-            let gen_at_start = st.generation.load(Ordering::Acquire);
-            let inbound = st.latest_inbound.lock().clone();
+                // (b) 快照本轮 generation + 最新入站（锁立即释放，绝不跨 .await）。
+                let gen_at_start = st.generation.load(Ordering::Acquire);
+                let inbound = st.latest_inbound.lock().clone();
 
-            // (c) reload contact——窗口期可能转 unmanaged / 被删，早退。
-            let contact = match reload_managed_contact(&state, &from_wxid, &account_id).await {
-                Ok(Some(c)) => c,
-                Ok(None) => {
-                    PENDING.remove(&key);
-                    return;
-                }
-                Err(error) => {
+                // (c) reload contact——窗口期可能转 unmanaged / 被删，早退。
+                let contact =
+                    match reload_managed_contact(&state, &workspace_id, &account_id, &from_wxid)
+                        .await
+                    {
+                        Ok(Some(c)) => c,
+                        Ok(None) => {
+                            PENDING.remove(&key);
+                            return;
+                        }
+                        Err(error) => {
+                            let _ = agent::write_event_for_account(
+                                &state,
+                                &workspace_id,
+                                &account_id,
+                                Some(&from_wxid),
+                                "agent_error",
+                                "failed",
+                                &format!("debounce reload contact failed: {error}"),
+                                app_id.clone().map(|v| doc! { "app_id": v }),
+                            )
+                            .await;
+                            PENDING.remove(&key);
+                            return;
+                        }
+                    };
+
+                // (d) 一次反应分析（每串只在最新入站上跑一次 → 串行化，修反应写竞态）。
+                // 旁路分析：失败只 warn，绝不阻断本轮回复。
+                if let Err(error) = agent::record_user_reaction(&state, &contact, &inbound).await {
                     let _ = agent::write_event_for_account(
                         &state,
+                        &workspace_id,
                         &account_id,
                         Some(&from_wxid),
                         "agent_error",
                         "failed",
-                        &format!("debounce reload contact failed: {error}"),
+                        &format!("record_user_reaction failed: {error}"),
                         app_id.clone().map(|v| doc! { "app_id": v }),
                     )
                     .await;
-                    PENDING.remove(&key);
+                }
+
+                // (e) 一次聚合网关（无条件执行——与 (d) 解耦：reaction 是对上一轮结果的旁路分析，
+                // 与生成本轮回复无因果依赖，其失败绝不该吞本轮应答）。带协作式抢占 guard：
+                // 运行期间 generation 变了即放弃。
+                let guard_state = st.clone();
+                let guard: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || {
+                    barge_in_triggered(gen_at_start, guard_state.generation.load(Ordering::Acquire))
+                });
+                if let Err(error) =
+                    agent::handle_managed_message_aggregated(&state, contact, &inbound, Some(guard))
+                        .await
+                {
+                    let _ = agent::write_event_for_account(
+                        &state,
+                        &workspace_id,
+                        &account_id,
+                        Some(&from_wxid),
+                        "agent_error",
+                        "failed",
+                        &error.to_string(),
+                        app_id.clone().map(|v| doc! { "app_id": v }),
+                    )
+                    .await;
+                }
+
+                // (f) 运行期间有新入站 → 重算（deadline 已被 register_inbound 刷新过）。
+                if barge_in_triggered(gen_at_start, st.generation.load(Ordering::Acquire)) {
+                    continue;
+                }
+
+                // (g) 原子退休：谓词在 shard 锁内复核 generation 未变才移除；若晚到
+                // 入站刚 bump 过 generation，谓词失败 → 不移除 → 回 loop 重算。
+                if PENDING
+                    .remove_if(&key, |_, s| {
+                        s.generation.load(Ordering::Acquire) == gen_at_start
+                    })
+                    .is_some()
+                {
                     return;
                 }
-            };
-
-            // (d) 一次反应分析（每串只在最新入站上跑一次 → 串行化，修反应写竞态）。
-            // 旁路分析：失败只 warn，绝不阻断本轮回复。
-            if let Err(error) = agent::record_user_reaction(&state, &contact, &inbound).await {
-                let _ = agent::write_event_for_account(
-                    &state,
-                    &account_id,
-                    Some(&from_wxid),
-                    "agent_error",
-                    "failed",
-                    &format!("record_user_reaction failed: {error}"),
-                    app_id.clone().map(|v| doc! { "app_id": v }),
-                )
-                .await;
             }
-
-            // (e) 一次聚合网关（无条件执行——与 (d) 解耦：reaction 是对上一轮结果的旁路分析，
-            // 与生成本轮回复无因果依赖，其失败绝不该吞本轮应答）。带协作式抢占 guard：
-            // 运行期间 generation 变了即放弃。
-            let guard_state = st.clone();
-            let guard: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || {
-                barge_in_triggered(gen_at_start, guard_state.generation.load(Ordering::Acquire))
-            });
-            if let Err(error) =
-                agent::handle_managed_message_aggregated(&state, contact, &inbound, Some(guard))
-                    .await
-            {
-                let _ = agent::write_event_for_account(
-                    &state,
-                    &account_id,
-                    Some(&from_wxid),
-                    "agent_error",
-                    "failed",
-                    &error.to_string(),
-                    app_id.clone().map(|v| doc! { "app_id": v }),
-                )
-                .await;
-            }
-
-            // (f) 运行期间有新入站 → 重算（deadline 已被 register_inbound 刷新过）。
-            if barge_in_triggered(gen_at_start, st.generation.load(Ordering::Acquire)) {
-                continue;
-            }
-
-            // (g) 原子退休：谓词在 shard 锁内复核 generation 未变才移除；若晚到
-            // 入站刚 bump 过 generation，谓词失败 → 不移除 → 回 loop 重算。
-            if PENDING
-                .remove_if(&key, |_, s| {
-                    s.generation.load(Ordering::Acquire) == gen_at_start
-                })
-                .is_some()
-            {
-                return;
-            }
-        }
-    };
+        };
 
     if let Err(panic_payload) = AssertUnwindSafe(inner).catch_unwind().await {
         // runner panic：写事件 + 移除 state，下条入站会重 spawn。一次 panic 最多
@@ -241,6 +539,7 @@ pub async fn run_debounce_pipeline(
         PENDING.remove(&key_for_panic);
         let panic_msg = panic_payload_message(&panic_payload);
         tracing::error!(
+            workspace_id = %workspace_for_panic,
             account_id = %account_for_panic,
             wxid = %wxid_for_panic,
             panic = %panic_msg,
@@ -248,6 +547,7 @@ pub async fn run_debounce_pipeline(
         );
         let _ = agent::write_event_for_account(
             &state_for_panic,
+            &workspace_for_panic,
             &account_for_panic,
             Some(&wxid_for_panic),
             "webhook_handler_panic",
@@ -263,15 +563,27 @@ pub async fn run_debounce_pipeline(
 /// （runner 应退休，只持久化不应答）。
 async fn reload_managed_contact(
     state: &AppState,
-    wxid: &str,
+    workspace_id: &str,
     account_id: &str,
+    wxid: &str,
 ) -> AppResult<Option<Contact>> {
     let contact = state
         .db
         .contacts()
-        .find_one(doc! { "account_id": account_id, "wxid": wxid }, None)
+        .find_one(
+            managed_contact_reload_filter(workspace_id, account_id, wxid),
+            None,
+        )
         .await?;
     Ok(contact.filter(|c| c.agent_status == AgentStatus::Managed))
+}
+
+fn managed_contact_reload_filter(workspace_id: &str, account_id: &str, wxid: &str) -> Document {
+    doc! {
+        "workspace_id": workspace_id,
+        "account_id": account_id,
+        "wxid": wxid,
+    }
 }
 
 pub async fn wechat_webhook(
@@ -373,15 +685,16 @@ pub async fn wechat_webhook(
         }
     }
 
-    // LP-14 / Task 20：per-account_id 限流；超额返回 429。
+    // LP-14 / Task 20: rate limits are isolated by workspace + account.
     let limiter = limiter_for(
+        &workspace_id,
         &account_id,
         state.config.webhook_rate_limit_capacity,
         state.config.webhook_rate_limit_window_seconds,
     );
     if let Err(neg) = limiter.check() {
         let retry_after = neg.wait_time_from(DefaultClock::default().now()).as_secs() + 1;
-        let _ = maybe_emit_rate_limit_event(&state, &account_id).await;
+        let _ = maybe_emit_rate_limit_event(&state, &workspace_id, &account_id).await;
         return Err(AppError::RateLimited {
             retry_after,
             account_id,
@@ -430,8 +743,13 @@ pub async fn wechat_webhook(
     // 领导回复分流：from_wxid 是本 workspace 的 principal_decider → 走请示通道，不进客户链路。
     // 必须在落库 / contact-managed 处理之前分流——领导可能同时也是某 contact，
     // consumed=true 时短路返回，避免领导自己的消息被当成客户入站处理。
-    if (crate::agent::escalation::lookup_principal_config(&state, &workspace_id, &from_wxid)
-        .await?)
+    if (crate::agent::escalation::lookup_principal_config(
+        &state,
+        &workspace_id,
+        &account_id,
+        &from_wxid,
+    )
+    .await?)
         .is_some()
     {
         let consumed = crate::agent::escalation::handle_principal_reply(
@@ -491,7 +809,7 @@ pub async fn wechat_webhook(
     // F1：解析入站消息类型 + 媒体引用，不再写死 None。
     let msg_type = parse_inbound_msg_type(&payload);
     let media_ref = extract_inbound_media_ref(&payload, msg_type);
-    let inbound = ConversationMessage {
+    let mut inbound = ConversationMessage {
         id: None,
         workspace_id: workspace_id.clone(),
         account_id: account_id.clone(),
@@ -506,8 +824,21 @@ pub async fn wechat_webhook(
         is_synthetic_relay: false,
         created_at: DateTime::now(),
     };
-    match state.db.messages().insert_one(&inbound, None).await {
-        Ok(_) => {}
+    // SR-177: the durable handoff marker is part of the same Mongo insert as
+    // the inbound fact. A crash after this write but before task materialization
+    // is recovered by `reconcile_pending_inbound_handoffs` on the task worker.
+    let mut inbound_doc = to_document(&inbound)?;
+    inbound_doc.insert("handoff_status", HANDOFF_PENDING);
+    match state
+        .db
+        .messages()
+        .clone_with_type::<Document>()
+        .insert_one(inbound_doc, None)
+        .await
+    {
+        Ok(result) => {
+            inbound.id = result.inserted_id.as_object_id();
+        }
         Err(error) if is_duplicate_key_error(&error) => {
             return Ok(Json(serde_json::json!({ "ok": true, "duplicate": true })));
         }
@@ -535,6 +866,9 @@ pub async fn wechat_webhook(
     let Some(contact) = contact else {
         // 非私聊真人（gh_ 公众号 / @chatroom 群）：消息已落库（见上方 messages().insert_one），
         // 但不建运营池联系人、不触发 Agent 流水线（这类 wxid 本就不可能 managed）。
+        if let Some(message_oid) = inbound.id {
+            let _ = mark_inbound_handoff(&state, message_oid, HANDOFF_IGNORED).await;
+        }
         return Ok(Json(
             serde_json::json!({ "ok": true, "skipped": "not_operatable_contact" }),
         ));
@@ -573,6 +907,7 @@ pub async fn wechat_webhook(
     collect_inbound_behavior_signals(
         &state,
         &workspace_id,
+        &account_id,
         &from_wxid,
         effective_message_id.as_deref(),
         &inbound.content,
@@ -606,7 +941,7 @@ pub async fn wechat_webhook(
         let runtime =
             crate::agent::UserRuntimeParameters::from_config(domain_config.as_ref(), &state);
         let active_profile =
-            agent::domain_profile::load_active_domain_profile(&state.db, &workspace_id).await;
+            agent::domain_profile::load_active_domain_profile(&state.db, &workspace_id).await?;
         let quiet = agent::quiet_hours::effective_quiet_hours_enabled(
             &contact,
             &active_profile,
@@ -624,35 +959,34 @@ pub async fn wechat_webhook(
                 runtime.quiet_hours_tz_offset_hours,
             )
             .await?;
+            if let Some(message_oid) = inbound.id {
+                mark_inbound_handoff(&state, message_oid, HANDOFF_DEFERRED).await?;
+            }
             deferred = true;
         } else {
-            let key = contact_key(&workspace_id, &account_id, &from_wxid);
             let active_profile =
                 crate::agent::domain_profile::load_active_domain_profile(&state.db, &workspace_id)
-                    .await;
+                    .await?;
             let window_ms = crate::agent::domain_profile::resolve_debounce_window_ms(
                 &active_profile,
                 state.config.message_debounce_window_ms,
             );
-            let (st, spawned_now) = register_inbound(key.clone(), inbound.clone(), window_ms);
-            if spawned_now {
-                let bg_state = state.clone();
-                let bg_account_id = account_id.clone();
-                let bg_from_wxid = from_wxid.clone();
-                let bg_app_id = app_id.clone();
-                tokio::spawn(async move {
-                    run_debounce_pipeline(
-                        bg_state,
-                        key,
-                        st,
-                        bg_account_id,
-                        bg_from_wxid,
-                        bg_app_id,
-                    )
-                    .await;
-                });
-            }
+            let durable_task =
+                materialize_durable_inbound_task(&state, &contact, &inbound, window_ms).await?;
+            let task_id = durable_task.task_id;
+            let run_at_ms = durable_task.run_at_ms;
+            let bg_state = state.clone();
+            tokio::spawn(async move {
+                let now_ms = DateTime::now().timestamp_millis();
+                let wait_ms = run_at_ms.saturating_sub(now_ms).max(0) as u64;
+                tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+                if let Err(error) = crate::tasks::run_due_task_by_id(&bg_state, task_id).await {
+                    tracing::error!(%task_id, %error, "durable inbound immediate wake failed; periodic worker will retry");
+                }
+            });
         }
+    } else if let Some(message_oid) = inbound.id {
+        mark_inbound_handoff(&state, message_oid, HANDOFF_IGNORED).await?;
     }
 
     Ok(Json(serde_json::json!({
@@ -737,6 +1071,7 @@ pub async fn ensure_wake_followup_task(
     // best-effort：失败只吞掉，绝不阻断 webhook ack。
     let _ = agent::write_event_for_account(
         state,
+        &contact.workspace_id,
         &contact.account_id,
         Some(&contact.wxid),
         "quiet_hours_deferred_inbound",
@@ -776,6 +1111,7 @@ fn stable_payload_hash(value: &Value) -> String {
 async fn collect_inbound_behavior_signals(
     state: &AppState,
     workspace_id: &str,
+    account_id: &str,
     wxid: &str,
     message_id: Option<&str>,
     content: &str,
@@ -791,12 +1127,20 @@ async fn collect_inbound_behavior_signals(
     let mut signals = vec![
         bs::build_reply_latency(
             workspace_id,
+            account_id,
             wxid,
             &dedupe_suffix,
             inbound_at,
             prev_last_outbound_ms,
         ),
-        bs::build_reply_length(workspace_id, wxid, &dedupe_suffix, inbound_at, content),
+        bs::build_reply_length(
+            workspace_id,
+            account_id,
+            wxid,
+            &dedupe_suffix,
+            inbound_at,
+            content,
+        ),
     ];
     if bs::is_reactivation(
         prev_last_inbound_ms,
@@ -805,6 +1149,7 @@ async fn collect_inbound_behavior_signals(
     ) {
         signals.push(bs::build_reactivation(
             workspace_id,
+            account_id,
             wxid,
             &dedupe_suffix,
             inbound_at,
@@ -1196,21 +1541,14 @@ fn rate_limit_event_dedupe_key(account_id: &str, day_bucket: i64) -> String {
     format!("rate_limit:{}:{}", account_id, day_bucket)
 }
 
-/// LP-14 / Task 20：限流命中时按 account 当日去重写一条 agent_event，避免事件爆量。
-///
-/// P1-2：旧实现 `find_one + insert_one` 在并发限流命中时存在 TOCTOU——
-/// 两条请求都查到 `None`，都写入，事件爆量。改为携带 `dedupe_key` 原子写：
-/// `dedupe_key = "rate_limit:{account}:{day_bucket}"`，配合 partial unique
-/// index（`workspace_id + dedupe_key`）让重复 insert 直接命中 dup-key error
-/// 后被吞掉；首条写入获胜，后续都视为"今天已记录"。
-async fn maybe_emit_rate_limit_event(state: &AppState, account_id: &str) -> AppResult<()> {
-    let day_ms: i64 = 24 * 60 * 60 * 1000;
-    let now_ms = DateTime::now().timestamp_millis();
-    let day_bucket = now_ms / day_ms;
-    let dedupe_key = rate_limit_event_dedupe_key(account_id, day_bucket);
-    let event = crate::models::AgentEvent {
+fn build_rate_limit_event(
+    workspace_id: &str,
+    account_id: &str,
+    day_bucket: i64,
+) -> crate::models::AgentEvent {
+    crate::models::AgentEvent {
         id: None,
-        workspace_id: state.config.default_workspace_id.clone(),
+        workspace_id: workspace_id.to_string(),
         account_id: account_id.to_string(),
         contact_wxid: None,
         kind: "webhook_rate_limited".to_string(),
@@ -1218,8 +1556,26 @@ async fn maybe_emit_rate_limit_event(state: &AppState, account_id: &str) -> AppR
         summary: "webhook 入口触发 per-account 限流".to_string(),
         details: None,
         created_at: DateTime::now(),
-        dedupe_key: Some(dedupe_key),
-    };
+        dedupe_key: Some(rate_limit_event_dedupe_key(account_id, day_bucket)),
+    }
+}
+
+/// LP-14 / Task 20：限流命中时按 account 当日去重写一条 agent_event，避免事件爆量。
+///
+/// P1-2：旧实现 `find_one + insert_one` 在并发限流命中时存在 TOCTOU——
+/// 两条请求都查到 `None`，都写入，事件爆量。改为携带 `dedupe_key` 原子写：
+/// `dedupe_key = "rate_limit:{account}:{day_bucket}"`，配合 partial unique
+/// index（`workspace_id + dedupe_key`）让重复 insert 直接命中 dup-key error
+/// 后被吞掉；首条写入获胜，后续都视为"今天已记录"。
+async fn maybe_emit_rate_limit_event(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+) -> AppResult<()> {
+    let day_ms: i64 = 24 * 60 * 60 * 1000;
+    let now_ms = DateTime::now().timestamp_millis();
+    let day_bucket = now_ms / day_ms;
+    let event = build_rate_limit_event(workspace_id, account_id, day_bucket);
     match state.db.events().insert_one(&event, None).await {
         Ok(_) => Ok(()),
         Err(error) if is_duplicate_key_error(&error) => Ok(()),
@@ -1537,6 +1893,14 @@ mod debounce_tests {
     }
 
     #[test]
+    fn managed_contact_reload_filter_is_fully_tenant_scoped() {
+        let filter = managed_contact_reload_filter("ws-a", "acct-a", "wx-a");
+        assert_eq!(filter.get_str("workspace_id").unwrap(), "ws-a");
+        assert_eq!(filter.get_str("account_id").unwrap(), "acct-a");
+        assert_eq!(filter.get_str("wxid").unwrap(), "wx-a");
+    }
+
+    #[test]
     fn next_deadline_adds_window() {
         assert_eq!(next_deadline_ms(1_000, 4_000), 5_000);
         assert_eq!(next_deadline_ms(0, 1_000), 1_000);
@@ -1820,6 +2184,24 @@ mod rate_limit_dedupe_tests {
         let a = rate_limit_event_dedupe_key("acct_a", 19_876);
         let b = rate_limit_event_dedupe_key("acct_b", 19_876);
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn limiter_segregates_same_account_id_by_workspace() {
+        let a = limiter_for("ws_a", "shared_account", 1, 60);
+        let b = limiter_for("ws_b", "shared_account", 1, 60);
+        assert!(!Arc::ptr_eq(&a, &b));
+    }
+
+    #[test]
+    fn rate_limit_event_preserves_resolved_tenant_scope() {
+        let event = build_rate_limit_event("ws_non_default", "shared_account", 19_876);
+        assert_eq!(event.workspace_id, "ws_non_default");
+        assert_eq!(event.account_id, "shared_account");
+        assert_eq!(
+            event.dedupe_key.as_deref(),
+            Some("rate_limit:shared_account:19876")
+        );
     }
 }
 

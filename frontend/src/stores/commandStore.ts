@@ -2,6 +2,7 @@ import { create } from "zustand";
 import type { CommandResult, AgentSoul, ContentAsset } from "../types";
 import { api } from "../lib/api";
 import { useUiStore } from "./uiStore";
+import { useAccountStore } from "./accountStore";
 
 interface CommandState {
   commandDraft: string;
@@ -16,6 +17,7 @@ interface CommandState {
 interface CommandActions {
   setCommandDraft: (value: string) => void;
   setCommandDryRun: (value: boolean) => void;
+  clearCommandResult: () => void;
   loadCommandData: (accountId?: string) => Promise<void>;
   runCommand: (accountId: string) => Promise<void>;
   confirmCommand: (id: string) => Promise<void>;
@@ -42,6 +44,8 @@ export const useCommandStore = create<CommandState & CommandActions>((set, get) 
   setCommandDraft: (value: string) => set({ commandDraft: value }),
 
   setCommandDryRun: (value: boolean) => set({ commandDryRun: value }),
+
+  clearCommandResult: () => set({ commandResult: null }),
 
   loadCommandData: async (accountId?: string) => {
     try {
@@ -89,7 +93,11 @@ export const useCommandStore = create<CommandState & CommandActions>((set, get) 
         }
       );
 
-      set({ commandResult: data.command });
+      // The operator may switch accounts while planning is in flight. Never
+      // render a stale account's plan under the newly selected account.
+      if (useAccountStore.getState().currentAccountId() === accountId) {
+        set({ commandResult: data.command });
+      }
 
       // 重新加载 tasks 来更新 pendingTasks
       const accountParam = `accountId=${accountId}`;
@@ -108,14 +116,33 @@ export const useCommandStore = create<CommandState & CommandActions>((set, get) 
   // 后端真执行已确认的计划，返回新 status + toolCalls，合进 commandResult。
   confirmCommand: async (id: string) => {
     if (!id) return;
+    const command = get().commandResult;
+    const currentAccountId = useAccountStore.getState().currentAccountId();
+    if (
+      !command ||
+      command.id !== id ||
+      !command.accountId ||
+      !command.planHash ||
+      command.accountId !== currentAccountId
+    ) {
+      useUiStore.getState().setError("该执行计划不属于当前账号或缺少冻结标识，请重新生成计划");
+      return;
+    }
     set({ commandBusy: true });
     useUiStore.getState().setError("");
     try {
       const data = await api.post<ConfirmResponse>(
-        `/api/management-agent/commands/${id}/confirm`
+        `/api/management-agent/commands/${id}/confirm`,
+        { accountId: command.accountId, planHash: command.planHash }
       );
       set((state) => {
-        if (!state.commandResult || state.commandResult.id !== id) return {};
+        if (
+          !state.commandResult ||
+          state.commandResult.id !== id ||
+          state.commandResult.accountId !== command.accountId ||
+          state.commandResult.planHash !== command.planHash ||
+          useAccountStore.getState().currentAccountId() !== command.accountId
+        ) return {};
         return {
           commandResult: {
             ...state.commandResult,
@@ -135,14 +162,33 @@ export const useCommandStore = create<CommandState & CommandActions>((set, get) 
   // 否决此前暂存的命令：后端原子改 canceled，未执行任何工具。
   rejectCommand: async (id: string) => {
     if (!id) return;
+    const command = get().commandResult;
+    const currentAccountId = useAccountStore.getState().currentAccountId();
+    if (
+      !command ||
+      command.id !== id ||
+      !command.accountId ||
+      !command.planHash ||
+      command.accountId !== currentAccountId
+    ) {
+      useUiStore.getState().setError("该执行计划不属于当前账号或缺少冻结标识，请重新生成计划");
+      return;
+    }
     set({ commandBusy: true });
     useUiStore.getState().setError("");
     try {
       const data = await api.post<ConfirmResponse>(
-        `/api/management-agent/commands/${id}/reject`
+        `/api/management-agent/commands/${id}/reject`,
+        { accountId: command.accountId, planHash: command.planHash }
       );
       set((state) => {
-        if (!state.commandResult || state.commandResult.id !== id) return {};
+        if (
+          !state.commandResult ||
+          state.commandResult.id !== id ||
+          state.commandResult.accountId !== command.accountId ||
+          state.commandResult.planHash !== command.planHash ||
+          useAccountStore.getState().currentAccountId() !== command.accountId
+        ) return {};
         return {
           commandResult: { ...state.commandResult, status: data.status },
         };

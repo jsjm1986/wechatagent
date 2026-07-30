@@ -6,7 +6,9 @@ mod common;
 use axum::Router;
 use mongodb::bson::{doc, oid::ObjectId, DateTime as BsonDateTime, Document};
 use reqwest::StatusCode;
+use std::sync::Arc;
 use tokio::net::TcpListener;
+use wechatagent::auth::jwt::{issue_jwt, JwtKeys};
 use wechatagent::auth::session::{create_session, lookup_session, AuthError};
 use wechatagent::auth::{AdminSession, AdminUser, SESSION_COOKIE_NAME};
 use wechatagent::models::{AgentStatus, Contact, Product};
@@ -30,6 +32,7 @@ struct RouteEvidence {
     expired_lookup_rejected: bool,
     expired_cookie_status: StatusCode,
     valid_cookie_status: StatusCode,
+    revoked_cookie_status: StatusCode,
 }
 
 fn admin_user() -> AdminUser {
@@ -114,7 +117,14 @@ fn product(workspace_id: &str, product_id: &str, name: &str) -> Product {
 }
 
 async fn start_api(app: &TestApp) -> anyhow::Result<(String, String, tokio::task::JoinHandle<()>)> {
-    let session = create_session(&app.state.db, &admin_user(), 1, WORKSPACE_A).await?;
+    let user = admin_user();
+    app.state
+        .db
+        .raw()
+        .collection::<AdminUser>("admin_users")
+        .insert_one(&user, None)
+        .await?;
+    let session = create_session(&app.state.db, &user, 1, WORKSPACE_A).await?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let router = Router::new()
@@ -268,6 +278,29 @@ async fn exercise_real_routes(app: &TestApp) -> anyhow::Result<RouteEvidence> {
         .status();
     let valid_cookie_status = client
         .get(format!("{base_url}/auth/me"))
+        .header(reqwest::header::COOKIE, &valid_cookie)
+        .send()
+        .await?
+        .status();
+
+    // Revoke workspace A after the session was issued. Middleware must read the
+    // authoritative AdminUser ACL on every request instead of trusting the
+    // workspace snapshot stored in the cookie session.
+    app.state
+        .db
+        .raw()
+        .collection::<AdminUser>("admin_users")
+        .update_one(
+            doc! { "user_id": "sr176-admin" },
+            doc! { "$set": {
+                "workspaces": [],
+                "default_workspace": mongodb::bson::Bson::Null,
+            } },
+            None,
+        )
+        .await?;
+    let revoked_cookie_status = client
+        .get(format!("{base_url}/auth/me"))
         .header(reqwest::header::COOKIE, valid_cookie)
         .send()
         .await?
@@ -285,6 +318,7 @@ async fn exercise_real_routes(app: &TestApp) -> anyhow::Result<RouteEvidence> {
         expired_lookup_rejected,
         expired_cookie_status,
         valid_cookie_status,
+        revoked_cookie_status,
     })
 }
 
@@ -315,4 +349,86 @@ async fn sr176_real_router_enforces_read_write_and_expired_session_boundaries() 
     assert!(evidence.expired_lookup_rejected);
     assert_eq!(evidence.expired_cookie_status, StatusCode::UNAUTHORIZED);
     assert_eq!(evidence.valid_cookie_status, StatusCode::OK);
+    assert_eq!(evidence.revoked_cookie_status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+#[ignore]
+async fn bearer_jwt_is_rejected_immediately_after_last_workspace_is_revoked() {
+    let app = TestApp::start().await;
+    let user = AdminUser {
+        user_id: "sr176-jwt-admin".into(),
+        username: "sr176-jwt-admin".into(),
+        password_hash: "unused".into(),
+        created_at: chrono::Utc::now(),
+        last_login_at: None,
+        workspaces: vec![WORKSPACE_A.into()],
+        default_workspace: Some(WORKSPACE_A.into()),
+    };
+    app.state
+        .db
+        .raw()
+        .collection::<AdminUser>("admin_users")
+        .insert_one(&user, None)
+        .await
+        .expect("seed JWT admin");
+
+    let mut state = app.state.clone();
+    state.config.jwt_enabled = true;
+    state.config.jwt_private_key_pem =
+        Some(include_str!("fixtures/jwt_test_private.pem").to_string());
+    state.config.jwt_public_key_pem =
+        Some(include_str!("fixtures/jwt_test_public.pem").to_string());
+    let keys = Arc::new(JwtKeys::from_config(&state.config).expect("load JWT test keys"));
+    let token = issue_jwt(&keys, &user.user_id, &user.username, WORKSPACE_A).expect("issue JWT");
+    state.jwt_keys = Some(keys);
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind JWT test API");
+    let address = listener.local_addr().expect("JWT test API address");
+    let router = Router::new()
+        .nest("/api", api_router(state.clone()))
+        .with_state(state);
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router)
+            .await
+            .expect("serve JWT test API");
+    });
+    let client = reqwest::Client::new();
+    let me_url = format!("http://{address}/api/auth/me");
+    let status_before = client
+        .get(&me_url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("request with authorized JWT")
+        .status();
+
+    app.state
+        .db
+        .raw()
+        .collection::<AdminUser>("admin_users")
+        .update_one(
+            doc! { "user_id": &user.user_id },
+            doc! { "$set": {
+                "workspaces": [],
+                "default_workspace": mongodb::bson::Bson::Null,
+            } },
+            None,
+        )
+        .await
+        .expect("revoke JWT admin ACL");
+    let status_after = client
+        .get(&me_url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("request with revoked JWT")
+        .status();
+
+    server.abort();
+    app.cleanup().await;
+    assert_eq!(status_before, StatusCode::OK);
+    assert_eq!(status_after, StatusCode::UNAUTHORIZED);
 }

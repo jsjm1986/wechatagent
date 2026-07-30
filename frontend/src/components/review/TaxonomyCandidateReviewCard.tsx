@@ -55,7 +55,7 @@ export function TaxonomyCandidateReviewCard({
     setInfo(null);
     try {
       const aliasList = aliases.split(/[,，]/).map((a) => a.trim()).filter((a) => a.length > 0);
-      const res = await api.postRaw<{ error?: string; message?: string }>(
+      const res = await api.postRaw<{ error?: string; message?: string; mergedIntoExisting?: boolean }>(
         `/api/admin/taxonomy-candidates/${candidate.id}/approve`,
         {
           canonicalValue: {
@@ -71,6 +71,8 @@ export function TaxonomyCandidateReviewCard({
       } else if (!res.ok) {
         setError(res.data?.message ?? res.data?.error ?? `HTTP ${res.status}`);
         return;
+      } else if (res.data?.mergedIntoExisting) {
+        setInfo(`已并入已有标签：${id.trim()}`);
       } else {
         setInfo(`已采纳：${id.trim()}`);
       }

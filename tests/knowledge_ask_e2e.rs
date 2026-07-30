@@ -243,9 +243,10 @@ async fn follow_relations_marks_contradiction_targets() {
     let source_id = source.id.unwrap().to_hex();
     insert(&app, &[source, support, contra]).await;
 
-    let (_catalog, prefetched) = follow_relations(&app.state, WS, &source_id, 1, &HashSet::new())
-        .await
-        .expect("follow_relations ok");
+    let (_catalog, prefetched) =
+        follow_relations(&app.state, WS, None, &source_id, 1, &HashSet::new())
+            .await
+            .expect("follow_relations ok");
 
     // B 与 C 都被拉入（contradicts 跟随但标记，不是跳过）。
     let b = prefetched
@@ -278,15 +279,16 @@ async fn open_chunk_redirects_superseded_to_current_version() {
     let new_chunk = verified_chunk("现行版", "新版正文");
     let new_id = new_chunk.id.unwrap().to_hex();
     let mut old_chunk = verified_chunk("旧版", "旧版正文");
+    old_chunk.status = "archived".to_string();
     old_chunk.superseded_by = Some(new_id.clone());
     let old_id = old_chunk.id.unwrap().to_hex();
     insert(&app, &[old_chunk, new_chunk]).await;
 
-    let full = open_chunk(&app.state, WS, &old_id)
+    let full = open_chunk(&app.state, WS, None, &old_id)
         .await
         .expect("open_chunk ok")
         .expect("应返回现行版而非 None");
-    assert_eq!(full.chunk_id, new_id, "open_chunk 应 redirect 到新版 id");
+    assert_eq!(full.chunk_id, new_id, "archived 旧版应 redirect 到新版 id");
     assert_eq!(full.body, "新版正文", "应返回现行版正文");
 }
 
@@ -312,9 +314,10 @@ async fn follow_relations_redirects_superseded_target() {
     let source_id = source.id.unwrap().to_hex();
     insert(&app, &[source, old_target, new_chunk]).await;
 
-    let (_catalog, prefetched) = follow_relations(&app.state, WS, &source_id, 1, &HashSet::new())
-        .await
-        .expect("follow_relations ok");
+    let (_catalog, prefetched) =
+        follow_relations(&app.state, WS, None, &source_id, 1, &HashSet::new())
+            .await
+            .expect("follow_relations ok");
 
     assert!(
         prefetched.iter().any(|c| c.chunk_id == new_id),
@@ -393,7 +396,7 @@ async fn open_chunk_follows_multi_hop_superseded_chain() {
     let v1_id = v1.id.unwrap().to_hex();
     insert(&app, &[v1, v2, v3]).await;
 
-    let full = open_chunk(&app.state, WS, &v1_id)
+    let full = open_chunk(&app.state, WS, None, &v1_id)
         .await
         .expect("open_chunk ok")
         .expect("应跟链返回 v3");
@@ -417,7 +420,7 @@ async fn open_chunk_stops_redirect_when_new_version_unverified() {
     insert(&app, &[old_chunk, draft_new]).await;
 
     // 新版未 verified → resolve 停在旧版 → open_chunk 返回旧版（仍 verified）。
-    let full = open_chunk(&app.state, WS, &old_id)
+    let full = open_chunk(&app.state, WS, None, &old_id)
         .await
         .expect("open_chunk ok")
         .expect("新版未审定时应停在旧版");
@@ -437,7 +440,7 @@ async fn open_chunk_self_cycle_superseded_terminates() {
     selfie.superseded_by = Some(self_id.clone());
     insert(&app, &[selfie]).await;
 
-    let full = open_chunk(&app.state, WS, &self_id)
+    let full = open_chunk(&app.state, WS, None, &self_id)
         .await
         .expect("open_chunk ok")
         .expect("自指环应停在自身");

@@ -6,6 +6,7 @@ import { GlobalErrorBanner } from "./app/GlobalErrorBanner";
 import { useAccountStore } from "./stores/accountStore";
 import { useUiStore } from "./stores/uiStore";
 import { useProfileStore } from "./stores/profileStore";
+import { invalidateChunks } from "./features/knowledge/chunkInvalidation";
 // 频道视图已全部迁出至 features/*；App 只保留启动引导 + 全局 chunk WebSocket。
 // 保留两个 re-export 让既有测试 `import { AutonomyOutcomesTab, formatRate } from "../App"` 继续解析。
 export { AutonomyOutcomesTab } from "./features/autonomy";
@@ -15,12 +16,12 @@ export { formatRate } from "./lib/format";
 // 推下来的 ChunkEvent 转成两类 window CustomEvent：
 //   - `wikiChunkLocked` / `wikiChunkUnlocked`：lock 状态变迁
 //   - `wikiChunkRevised`：chunk 被编辑（patch / archive / restore / split / merge / ...）
-// ChunkInspectorPane 监听 `wikiChunkRevised` 比对 chunkId 触发 reload，
-// 让两个 admin 同步看到对方的写入；锁徽章监听前两个事件实时刷新。
+// Compatibility consumers may still listen to `wikiChunkRevised`; Knowledge
+// collection views converge through `wikiChunksInvalidated`.
 //
-// 重连：onclose → 5s 后重试，最长 30s 退避。WebSocket 失败不阻塞业务功能，
-// 锁的状态在写入时仍然是真实的（acquire/release 走 HTTP）。
-type ChunkEventEnvelope =
+// 重连：onclose → 5s 后重试，最长 30s 退避。WebSocket/presence 失败不阻塞业务功能；
+// 它只提供协作提示，写入一致性由后端认证、事务与 CAS 负责。
+export type ChunkEventEnvelope =
   | { kind: "hello"; workspace: string }
   | { kind: "lagged" }
   | {
@@ -44,6 +45,30 @@ type ChunkEventEnvelope =
       revision_kind: string;
       actor: string;
     };
+
+export function dispatchChunkEvent(parsed: ChunkEventEnvelope): void {
+  switch (parsed.kind) {
+    case "hello":
+      return;
+    case "lagged":
+      invalidateChunks({ reason: "lagged" });
+      return;
+    case "locked":
+      window.dispatchEvent(new CustomEvent("wikiChunkLocked", { detail: parsed }));
+      return;
+    case "unlocked":
+      window.dispatchEvent(new CustomEvent("wikiChunkUnlocked", { detail: parsed }));
+      return;
+    case "revised":
+      window.dispatchEvent(new CustomEvent("wikiChunkRevised", { detail: parsed }));
+      invalidateChunks({
+        reason: "revised",
+        chunkId: parsed.chunk_id,
+        revisionKind: parsed.revision_kind,
+      });
+      return;
+  }
+}
 
 function useChunkEventStream() {
   useEffect(() => {
@@ -73,20 +98,7 @@ function useChunkEventStream() {
           return;
         }
         if (!parsed) return;
-        switch (parsed.kind) {
-          case "hello":
-          case "lagged":
-            return;
-          case "locked":
-            window.dispatchEvent(new CustomEvent("wikiChunkLocked", { detail: parsed }));
-            return;
-          case "unlocked":
-            window.dispatchEvent(new CustomEvent("wikiChunkUnlocked", { detail: parsed }));
-            return;
-          case "revised":
-            window.dispatchEvent(new CustomEvent("wikiChunkRevised", { detail: parsed }));
-            return;
-        }
+        dispatchChunkEvent(parsed);
       };
       socket.onclose = () => {
         scheduleReconnect();

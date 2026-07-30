@@ -129,9 +129,27 @@ const MEDIA_SEND_TOOLS: [&str; 3] = [
 /// 确保 asset 在 MCP 侧有有效 media_id：缓存命中（media_id 存在且未过 TTL）直接用，
 /// 否则读盘 base64 → `media_upload_base64` → 回写 media_id + updated_at。
 /// **不依赖"media_id 永久有效"假设**——TTL 过期即重传。
-async fn ensure_media_uploaded(state: &AppState, asset: &ContentAsset) -> AppResult<String> {
+fn media_asset_available_to_account(asset: &ContentAsset, account_id: &str) -> bool {
+    asset
+        .account_id
+        .as_deref()
+        .is_none_or(|owner| owner == account_id)
+}
+
+async fn ensure_media_uploaded(
+    state: &AppState,
+    asset: &ContentAsset,
+    account_id: &str,
+) -> AppResult<String> {
+    if !media_asset_available_to_account(asset, account_id) {
+        return Err(AppError::NotFound("asset not found".into()));
+    }
     let now = DateTime::now();
-    if let Some(mid) = asset.media_id.as_ref() {
+    // mediaId belongs to the MCP account that uploaded it. A shared asset can be sent by
+    // multiple accounts, so its scalar legacy cache cannot identify the owning account and
+    // must never be reused. Account-private assets remain safe to cache.
+    let cache_is_account_bound = asset.account_id.as_deref() == Some(account_id);
+    if let Some(mid) = asset.media_id.as_ref().filter(|_| cache_is_account_bound) {
         if media_id_cache_valid(asset.updated_at, state.config.media_id_cache_ttl_hours, now) {
             return Ok(mid.clone());
         }
@@ -141,19 +159,16 @@ async fn ensure_media_uploaded(state: &AppState, asset: &ContentAsset) -> AppRes
         .as_ref()
         .ok_or_else(|| AppError::External("asset has no file_path".into()))?;
     let root = std::path::Path::new(&state.config.media_storage_dir);
-    let bytes = media_storage::read_bytes(root, rel)
+    let bytes = media_storage::read_bytes_recovering(root, rel)
         .await
         .map_err(|e| AppError::External(format!("read media failed: {e}")))?;
     use base64::Engine;
     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
 
     // MCP 入参字段名以 server tools/list 为准；这里用占位形态，集成时对齐。
-    let account_id = asset
-        .account_id
-        .as_deref()
-        .unwrap_or(&state.config.default_account_id);
     let resp = crate::mcp::logged_call_for_account(
         state,
+        &asset.workspace_id,
         account_id,
         "media_upload_base64",
         json!({
@@ -222,10 +237,14 @@ pub(crate) async fn send_outbound_media(
     }
     let tool = mcp_tool_for_media_type(asset.media_type.as_deref().unwrap_or(""))
         .ok_or_else(|| AppError::External("unsupported media_type".into()))?;
-    let media_id = ensure_media_uploaded(state, &asset).await?;
+    if !media_asset_available_to_account(&asset, &contact.account_id) {
+        return Err(AppError::NotFound("asset not found".into()).into());
+    }
+    let media_id = ensure_media_uploaded(state, &asset, &contact.account_id).await?;
 
     let resp = crate::mcp::logged_send_call_for_account(
         state,
+        &contact.workspace_id,
         &contact.account_id,
         tool,
         json!({ "recipient": contact.wxid, "mediaId": media_id }),
@@ -233,10 +252,18 @@ pub(crate) async fn send_outbound_media(
     .await
     .map_err(super::types::OutboundSendError::from)?;
 
-    if !super::gateway::send_receipt_is_ok(&resp) {
-        return Err(super::types::OutboundSendError::SafeToRetry(
-            "media send returned a negative or unverifiable delivery receipt".into(),
-        ));
+    match super::gateway::classify_send_receipt(&resp) {
+        super::gateway::SendReceiptStatus::Succeeded => {}
+        super::gateway::SendReceiptStatus::ExplicitlyFailed => {
+            return Err(super::types::OutboundSendError::SafeToRetry(
+                "media send returned an explicit negative delivery receipt".into(),
+            ));
+        }
+        super::gateway::SendReceiptStatus::Inconclusive => {
+            return Err(super::types::OutboundSendError::DeliveryUncertain(
+                "media send returned an unverifiable delivery receipt".into(),
+            ));
+        }
     }
 
     // MCP 已成功 = 文件已送达客户，既成事实。此后落库失败**绝不**返 Err——
@@ -291,6 +318,7 @@ pub(crate) async fn send_outbound_media(
 ///   `Inconclusive`，禁止把“缺证据”误作“确认未送达”而重发。
 async fn mcp_media_delivery_verification(
     state: &AppState,
+    workspace_id: &str,
     account_id: &str,
     contact_wxid: &str,
     asset_id: &str,
@@ -304,7 +332,7 @@ async fn mcp_media_delivery_verification(
     let asset = state
         .db
         .content_assets()
-        .find_one(doc! { "_id": oid }, None)
+        .find_one(doc! { "_id": oid, "workspace_id": workspace_id }, None)
         .await?;
     // media_id 缺失 ⇒ send 的客户投递步骤尚不可能发生 ⇒ 安全放行。
     let media_id = match asset.and_then(|a| a.media_id) {
@@ -319,21 +347,13 @@ async fn mcp_media_delivery_verification(
         .db
         .mcp_logs()
         .count_documents(
-            doc! {
-                "account_id": account_id,
-                "tool_name": { "$in": MEDIA_SEND_TOOLS.to_vec() },
-                "request.recipient": contact_wxid,
-                "request.mediaId": &media_id,
-                "error": null,
-                "$or": [
-                    { "response.ok": true },
-                    {
-                        "response.ok": { "$exists": false },
-                        "response.newMsgId": { "$type": "string", "$ne": "" },
-                    },
-                ],
-                "created_at": { "$gte": lower_bound },
-            },
+            media_success_filter(
+                workspace_id,
+                account_id,
+                contact_wxid,
+                &media_id,
+                lower_bound,
+            ),
             None,
         )
         .await?;
@@ -344,16 +364,49 @@ async fn mcp_media_delivery_verification(
     })
 }
 
+fn media_success_filter(
+    workspace_id: &str,
+    account_id: &str,
+    contact_wxid: &str,
+    media_id: &str,
+    lower_bound: DateTime,
+) -> mongodb::bson::Document {
+    doc! {
+        "workspace_id": workspace_id,
+        "account_id": account_id,
+        "tool_name": { "$in": MEDIA_SEND_TOOLS.to_vec() },
+        "request.recipient": contact_wxid,
+        "request.mediaId": media_id,
+        "error": null,
+        "$or": [
+            { "response.ok": true },
+            {
+                "response.ok": { "$exists": false },
+                "response.newMsgId": { "$type": "string", "$ne": "" },
+            },
+        ],
+        "created_at": { "$gte": lower_bound },
+    }
+}
+
 /// dispatcher 在媒体条目崩溃恢复 / timeout / 歧义错误分支调用。
 pub(crate) async fn media_delivery_verification(
     state: &AppState,
+    workspace_id: &str,
     account_id: &str,
     contact_wxid: &str,
     asset_id: &str,
     entry_created_at: DateTime,
 ) -> AppResult<super::types::DeliveryVerification> {
-    mcp_media_delivery_verification(state, account_id, contact_wxid, asset_id, entry_created_at)
-        .await
+    mcp_media_delivery_verification(
+        state,
+        workspace_id,
+        account_id,
+        contact_wxid,
+        asset_id,
+        entry_created_at,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -378,6 +431,35 @@ mod tests {
         let now = DateTime::from_millis(1_000_000_000_000);
         let future = DateTime::from_millis(1_000_000_000_000 + 5000);
         assert!(!media_id_cache_valid(future, 24, now));
+    }
+
+    #[test]
+    fn media_asset_scope_allows_shared_or_owner_only() {
+        let mut shared = asset(Some(true), Some("approved"), Some("file"), None);
+        assert!(media_asset_available_to_account(&shared, "account-a"));
+        assert!(media_asset_available_to_account(&shared, "account-b"));
+
+        shared.account_id = Some("account-a".to_string());
+        assert!(media_asset_available_to_account(&shared, "account-a"));
+        assert!(!media_asset_available_to_account(&shared, "account-b"));
+    }
+
+    #[test]
+    fn media_success_filter_is_fully_tenant_scoped() {
+        let filter = media_success_filter(
+            "ws-b",
+            "account-a",
+            "wxid-customer",
+            "media-1",
+            DateTime::from_millis(123),
+        );
+        assert_eq!(filter.get_str("workspace_id").unwrap(), "ws-b");
+        assert_eq!(filter.get_str("account_id").unwrap(), "account-a");
+        assert_eq!(
+            filter.get_str("request.recipient").unwrap(),
+            "wxid-customer"
+        );
+        assert_eq!(filter.get_str("request.mediaId").unwrap(), "media-1");
     }
 
     fn asset(

@@ -1,0 +1,317 @@
+{
+  "schemaVersion": 1,
+  "auditId": "universal-test-coverage-47-domains",
+  "authority": "status_only",
+  "legacyArtifact": {
+    "path": ".kiro/specs/universal-test-coverage/deepread-verify-result-2026-06-30.json",
+    "sha256": "cd27427e18b088dd80c8f12e61fa8cf4bfe0b4f296dcd33e1581d424410613b4",
+    "evidenceCommit": "12d99b3b9fd42eae2293b5b3f0a1ff9fe982b7a8",
+    "classification": "legacy_inconclusive",
+    "limitations": [
+      "no_frozen_run_manifest_or_model_identifier",
+      "no_per_claim_path_locator_evidence",
+      "workflow_silently_dropped_failed_domains",
+      "D4_falsify_missing_required_arrays"
+    ]
+  },
+  "frozenInputs": [
+    {
+      "path": ".kiro/specs/universal-test-coverage/biz-domains-2026-06-30.json",
+      "sha256": "165071bba167f1fc038bc362526d921952552fb9eee3b235185dc9b7c2a6647b"
+    },
+    {
+      "path": ".kiro/specs/universal-test-coverage/audit-2026-06-30-anchors.json",
+      "sha256": "75b1cae61670b57bcd3a4fbe69222850159bb3b7adc1c7db38d1707f09dcd248"
+    }
+  ],
+  "summary": {
+    "total": 47,
+    "complete": 0,
+    "inconclusive": 47,
+    "failed": 0
+  },
+  "records": [
+    {
+      "domainId": "A1",
+      "domain": "Webhook入站主链路",
+      "status": "inconclusive",
+      "reason": "legacy_result_missing_v2_run_manifest_and_claim_evidence"
+    },
+    {
+      "domainId": "A2",
+      "domain": "去抖聚合调度",
+      "status": "inconclusive",
+      "reason": "legacy_result_missing_v2_run_manifest_and_claim_evidence"
+    },
+    {
+      "domainId": "A3",
+      "domain": "统一发送网关(决策→评审→发送编排)",
+      "status": "inconclusive",
+      "reason": "legacy_result_missing_v2_run_manifest_and_claim_evidence"
+    },
+    {
+      "domainId": "A4",
+      "domain": "Reply Agent决策(渐进式三档)",
+      "status": "inconclusive",
+      "reason": "legacy_result_missing_v2_run_manifest_and_claim_evidence"
+    },
+    {
+      "domainId": "A5",
+      "domain": "独立Review Agent+双闸",
+      "status": "inconclusive",
+      "reason": "legacy_result_missing_v2_run_manifest_and_claim_evidence"
+    },
+    {
+      "domainId": "A6",
+      "domain": "知识路由(catalog→search→open_slice)",
+      "status": "inconclusive",
+      "reason": "legacy_result_missing_v2_run_manifest_and_claim_evidence"
+    },
+    {
+      "domainId": "A7",
+      "domain": "Outbox发送+幂等+崩溃恢复",
+      "status": "inconclusive",
+      "reason": "legacy_result_missing_v2_run_manifest_and_claim_evidence"
+    },
+    {
+      "domainId": "A8",
+      "domain": "Follow-up任务worker",
+      "status": "inconclusive",
+      "reason": "legacy_result_missing_v2_run_manifest_and_claim_evidence"
+    },
+    {
+      "domainId": "B1",
+      "domain": "长期记忆固化(memoryCard)",
+      "status": "inconclusive",
+      "reason": "legacy_result_missing_v2_run_manifest_and_claim_evidence"
+    },
+    {
+      "domainId": "B2",
+      "domain": "用户反应分析(claim lock)",
+      "status": "inconclusive",
+      "reason": "legacy_result_missing_v2_run_manifest_and_claim_evidence"
+    },
+    {
+      "domainId": "B3",
+      "domain": "决策请示通道(幕后领导,非人工接管)",
+      "status": "inconclusive",
+      "reason": "legacy_result_missing_v2_run_manifest_and_claim_evidence"
+    },
+    {
+      "domainId": "B4",
+      "domain": "名片引荐(辅助模式受控例外)",
+      "status": "inconclusive",
+      "reason": "legacy_result_missing_v2_run_manifest_and_claim_evidence"
+    },
+    {
+      "domainId": "B5",
+      "domain": "双层标签字典+候选(taxonomy)",
+      "status": "inconclusive",
+      "reason": "legacy_result_missing_v2_run_manifest_and_claim_evidence"
+    },
+    {
+      "domainId": "B6",
+      "domain": "决策守卫+状态机迁移(guards)",
+      "status": "inconclusive",
+      "reason": "legacy_result_missing_v2_run_manifest_and_claim_evidence"
+    },
+    {
+      "domainId": "B7",
+      "domain": "RunBudget预算计数",
+      "status": "inconclusive",
+      "reason": "legacy_result_missing_v2_run_manifest_and_claim_evidence"
+    },
+    {
+      "domainId": "B8",
+      "domain": "Shadow模拟演练",
+      "status": "inconclusive",
+      "reason": "legacy_result_missing_v2_run_manifest_and_claim_evidence"
+    },
+    {
+      "domainId": "C1",
+      "domain": "campaign营销活动派发",
+      "status": "inconclusive",
+      "reason": "legacy_result_missing_v2_run_manifest_and_claim_evidence"
+    },
+    {
+      "domainId": "C2",
+      "domain": "evolution prompt自进化",
+      "status": "inconclusive",
+      "reason": "legacy_result_missing_v2_run_manifest_and_claim_evidence"
+    },
+    {
+      "domainId": "C3",
+      "domain": "content-assets分档注入",
+      "status": "inconclusive",
+      "reason": "legacy_result_missing_v2_run_manifest_and_claim_evidence"
+    },
+    {
+      "domainId": "C4",
+      "domain": "digital-twin关系类型建议",
+      "status": "inconclusive",
+      "reason": "legacy_result_missing_v2_run_manifest_and_claim_evidence"
+    },
+    {
+      "domainId": "C5",
+      "domain": "suspected-deals疑似成交核实",
+      "status": "inconclusive",
+      "reason": "legacy_result_missing_v2_run_manifest_and_claim_evidence"
+    },
+    {
+      "domainId": "C6",
+      "domain": "account send-pacing节流",
+      "status": "inconclusive",
+      "reason": "legacy_result_missing_v2_run_manifest_and_claim_evidence"
+    },
+    {
+      "domainId": "D1",
+      "domain": "知识导入(import/PDF/image vision)",
+      "status": "inconclusive",
+      "reason": "legacy_result_missing_v2_run_manifest_and_claim_evidence"
+    },
+    {
+      "domainId": "D2",
+      "domain": "知识chunk修复闭环",
+      "status": "inconclusive",
+      "reason": "legacy_result_missing_v2_run_manifest_and_claim_evidence"
+    },
+    {
+      "domainId": "D3",
+      "domain": "知识对话工作台(chat_turn→proposal)",
+      "status": "inconclusive",
+      "reason": "legacy_result_missing_v2_run_manifest_and_claim_evidence"
+    },
+    {
+      "domainId": "D4",
+      "domain": "知识缺口信号+sweep",
+      "status": "inconclusive",
+      "reason": "legacy_result_missing_v2_run_manifest_and_claim_evidence"
+    },
+    {
+      "domainId": "D5",
+      "domain": "知识日报digest",
+      "status": "inconclusive",
+      "reason": "legacy_result_missing_v2_run_manifest_and_claim_evidence"
+    },
+    {
+      "domainId": "D6",
+      "domain": "知识完整度审计+自动核验",
+      "status": "inconclusive",
+      "reason": "legacy_result_missing_v2_run_manifest_and_claim_evidence"
+    },
+    {
+      "domainId": "D7",
+      "domain": "知识问答(ask/stream)",
+      "status": "inconclusive",
+      "reason": "legacy_result_missing_v2_run_manifest_and_claim_evidence"
+    },
+    {
+      "domainId": "D8",
+      "domain": "自动采集ingest worker",
+      "status": "inconclusive",
+      "reason": "legacy_result_missing_v2_run_manifest_and_claim_evidence"
+    },
+    {
+      "domainId": "D9",
+      "domain": "知识对话长任务+catalog重建+feedback worker群",
+      "status": "inconclusive",
+      "reason": "legacy_result_missing_v2_run_manifest_and_claim_evidence"
+    },
+    {
+      "domainId": "E1",
+      "domain": "管理Agent(AI Command Center)",
+      "status": "inconclusive",
+      "reason": "legacy_result_missing_v2_run_manifest_and_claim_evidence"
+    },
+    {
+      "domainId": "F1",
+      "domain": "DomainProfile行业总装配单",
+      "status": "inconclusive",
+      "reason": "legacy_result_missing_v2_run_manifest_and_claim_evidence"
+    },
+    {
+      "domainId": "F2",
+      "domain": "domain_schemas+operation_domain_configs+state_policies",
+      "status": "inconclusive",
+      "reason": "legacy_result_missing_v2_run_manifest_and_claim_evidence"
+    },
+    {
+      "domainId": "F3",
+      "domain": "引导层AI生成配置(guide)",
+      "status": "inconclusive",
+      "reason": "legacy_result_missing_v2_run_manifest_and_claim_evidence"
+    },
+    {
+      "domainId": "G1",
+      "domain": "Prompt体系(pack/templates/souls/playbooks)",
+      "status": "inconclusive",
+      "reason": "legacy_result_missing_v2_run_manifest_and_claim_evidence"
+    },
+    {
+      "domainId": "H1",
+      "domain": "评测体系(场景+公式遵从)",
+      "status": "inconclusive",
+      "reason": "legacy_result_missing_v2_run_manifest_and_claim_evidence"
+    },
+    {
+      "domainId": "I1",
+      "domain": "账号管理",
+      "status": "inconclusive",
+      "reason": "legacy_result_missing_v2_run_manifest_and_claim_evidence"
+    },
+    {
+      "domainId": "I2",
+      "domain": "联系人管理+画像+手动标签",
+      "status": "inconclusive",
+      "reason": "legacy_result_missing_v2_run_manifest_and_claim_evidence"
+    },
+    {
+      "domainId": "I3",
+      "domain": "产品目录(products)",
+      "status": "inconclusive",
+      "reason": "legacy_result_missing_v2_run_manifest_and_claim_evidence"
+    },
+    {
+      "domainId": "I4",
+      "domain": "LLM provider热切换",
+      "status": "inconclusive",
+      "reason": "legacy_result_missing_v2_run_manifest_and_claim_evidence"
+    },
+    {
+      "domainId": "I5",
+      "domain": "鉴权(auth/session/JWT/workspace)",
+      "status": "inconclusive",
+      "reason": "legacy_result_missing_v2_run_manifest_and_claim_evidence"
+    },
+    {
+      "domainId": "I6",
+      "domain": "可观测/日志/成效",
+      "status": "inconclusive",
+      "reason": "legacy_result_missing_v2_run_manifest_and_claim_evidence"
+    },
+    {
+      "domainId": "J1",
+      "domain": "多租户workspace隔离(横切)",
+      "status": "inconclusive",
+      "reason": "legacy_result_missing_v2_run_manifest_and_claim_evidence"
+    },
+    {
+      "domainId": "J2",
+      "domain": "红线CI lint守门(横切)",
+      "status": "inconclusive",
+      "reason": "legacy_result_missing_v2_run_manifest_and_claim_evidence"
+    },
+    {
+      "domainId": "J3",
+      "domain": "DB迁移+索引(横切)",
+      "status": "inconclusive",
+      "reason": "legacy_result_missing_v2_run_manifest_and_claim_evidence"
+    },
+    {
+      "domainId": "J4",
+      "domain": "死代码识别(横切)",
+      "status": "inconclusive",
+      "reason": "legacy_result_missing_v2_run_manifest_and_claim_evidence"
+    }
+  ]
+}

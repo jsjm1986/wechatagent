@@ -394,9 +394,11 @@ fn redact_request_for_log(request: &mongodb::bson::Document) -> mongodb::bson::D
 
 pub async fn logged_call<A: Serialize>(
     state: &AppState,
+    workspace_id: &str,
     tool_name: &str,
     arguments: A,
 ) -> AppResult<Value> {
+    ensure_default_workspace_mcp_context(state, workspace_id)?;
     let request_doc = to_document(&serde_json::to_value(&arguments)?)?;
     let result = state.mcp.call_tool(tool_name, arguments).await;
     let (response, error) = match &result {
@@ -409,7 +411,7 @@ pub async fn logged_call<A: Serialize>(
         .insert_one(
             McpCallLog {
                 id: None,
-                workspace_id: state.config.default_workspace_id.clone(),
+                workspace_id: workspace_id.to_string(),
                 account_id: state.config.default_account_id.clone(),
                 tool_name: tool_name.to_string(),
                 request: redact_request_for_log(&request_doc),
@@ -425,11 +427,12 @@ pub async fn logged_call<A: Serialize>(
 
 pub async fn logged_call_for_account<A: Serialize>(
     state: &AppState,
+    workspace_id: &str,
     account_id: &str,
     tool_name: &str,
     arguments: A,
 ) -> AppResult<Value> {
-    let credentials = credentials_for_account(state, account_id).await?;
+    let credentials = credentials_for_account(state, workspace_id, account_id).await?;
     let arguments_value = serde_json::to_value(arguments)?;
     let request_doc = to_document(&arguments_value)?;
     let result = state
@@ -452,7 +455,7 @@ pub async fn logged_call_for_account<A: Serialize>(
         .insert_one(
             McpCallLog {
                 id: None,
-                workspace_id: state.config.default_workspace_id.clone(),
+                workspace_id: workspace_id.to_string(),
                 account_id: account_id.to_string(),
                 tool_name: tool_name.to_string(),
                 request: redact_request_for_log(&request_doc),
@@ -470,11 +473,12 @@ pub async fn logged_call_for_account<A: Serialize>(
 /// 同形的 `mcp_logs`。仅文本、媒体和名片投递路径使用。
 pub(crate) async fn logged_send_call_for_account<A: Serialize>(
     state: &AppState,
+    workspace_id: &str,
     account_id: &str,
     tool_name: &str,
     arguments: A,
 ) -> Result<Value, McpSendError> {
-    let credentials = credentials_for_account(state, account_id)
+    let credentials = credentials_for_account(state, workspace_id, account_id)
         .await
         .map_err(|err| McpSendError::SafeToRetry(err.to_string()))?;
     let arguments_value = serde_json::to_value(arguments)
@@ -501,7 +505,7 @@ pub(crate) async fn logged_send_call_for_account<A: Serialize>(
         .insert_one(
             McpCallLog {
                 id: None,
-                workspace_id: state.config.default_workspace_id.clone(),
+                workspace_id: workspace_id.to_string(),
                 account_id: account_id.to_string(),
                 tool_name: tool_name.to_string(),
                 request: redact_request_for_log(&request_doc),
@@ -515,8 +519,12 @@ pub(crate) async fn logged_send_call_for_account<A: Serialize>(
     result
 }
 
-pub async fn list_tools_for_account(state: &AppState, account_id: &str) -> AppResult<Value> {
-    let credentials = credentials_for_account(state, account_id).await?;
+pub async fn list_tools_for_account(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+) -> AppResult<Value> {
+    let credentials = credentials_for_account(state, workspace_id, account_id).await?;
     state
         .mcp
         .list_tools_with_key(
@@ -536,27 +544,82 @@ struct McpCredentials {
     account_alias: Option<String>,
 }
 
-async fn credentials_for_account(state: &AppState, account_id: &str) -> AppResult<McpCredentials> {
+fn ensure_default_workspace_mcp_context(state: &AppState, workspace_id: &str) -> AppResult<()> {
+    if !deployment_mcp_fallback_allowed(&state.config.default_workspace_id, workspace_id) {
+        return Err(AppError::BadRequest(
+            "workspace-level MCP credentials are only configured for the default workspace"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn deployment_mcp_fallback_allowed(default_workspace_id: &str, workspace_id: &str) -> bool {
+    workspace_id == default_workspace_id
+}
+
+fn mcp_account_filter(workspace_id: &str, account_id: &str) -> mongodb::bson::Document {
+    doc! {
+        "workspace_id": workspace_id,
+        "account_id": account_id,
+    }
+}
+
+fn roster_refresh_key(workspace_id: &str, account_id: &str) -> String {
+    format!("{workspace_id}|{account_id}")
+}
+
+async fn credentials_for_account(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+) -> AppResult<McpCredentials> {
     let account = state
         .db
         .accounts()
-        .find_one(
-            doc! {
-                "workspace_id": &state.config.default_workspace_id,
-                "account_id": account_id
-            },
-            None,
-        )
-        .await?;
-    let base_url = account
-        .as_ref()
-        .and_then(|item| item.mcp_base_url.clone())
-        .unwrap_or_else(|| state.config.mcp_base_url.clone());
-    let api_key = account
-        .as_ref()
-        .and_then(|item| item.mcp_api_key.clone())
-        .unwrap_or_else(|| state.config.mcp_api_key.clone());
-    let account_alias = account.as_ref().map(|item| item.alias.clone());
+        .find_one(mcp_account_filter(workspace_id, account_id), None)
+        .await?
+        .ok_or_else(|| {
+            AppError::NotFound(format!(
+                "MCP account {account_id} not found in workspace {workspace_id}"
+            ))
+        })?;
+    let configured_base_url = account
+        .mcp_base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let configured_api_key = account
+        .mcp_api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let allow_deployment_fallback =
+        deployment_mcp_fallback_allowed(&state.config.default_workspace_id, workspace_id);
+    let base_url = match (configured_base_url, allow_deployment_fallback) {
+        (Some(value), _) => value.to_string(),
+        (None, true) => state.config.mcp_base_url.clone(),
+        (None, false) => {
+            return Err(AppError::BadRequest(format!(
+            "MCP base URL is not configured for account {account_id} in workspace {workspace_id}"
+        )))
+        }
+    };
+    let api_key = match (configured_api_key, allow_deployment_fallback) {
+        (Some(value), _) => value.to_string(),
+        (None, true) => state.config.mcp_api_key.clone(),
+        (None, false) => {
+            return Err(AppError::BadRequest(format!(
+                "MCP API key is not configured for account {account_id} in workspace {workspace_id}"
+            )))
+        }
+    };
+    if base_url.trim().is_empty() || api_key.trim().is_empty() {
+        return Err(AppError::BadRequest(format!(
+            "MCP credentials are incomplete for account {account_id} in workspace {workspace_id}"
+        )));
+    }
+    let account_alias = Some(account.alias);
     Ok(McpCredentials {
         base_url,
         api_key,
@@ -833,6 +896,7 @@ fn roster_refresh_backoff_secs(attempt: usize) -> u64 {
 
 pub async fn fetch_roster_for_account(
     state: &AppState,
+    workspace_id: &str,
     account_id: &str,
 ) -> AppResult<RosterFetchOutcome> {
     // contacts_fetch_full 是全量好友工具（返回昵称/头像/性别等富化字段，无参）；
@@ -845,6 +909,7 @@ pub async fn fetch_roster_for_account(
     for attempt in 0..MAX_RETRIES {
         match logged_call_for_account(
             state,
+            workspace_id,
             account_id,
             "contacts_fetch_full",
             serde_json::json!({}),
@@ -966,6 +1031,7 @@ pub(crate) fn chat_search_hit(items: &serde_json::Value, content: &str, since_mi
 /// 同步落库、失败不写)。命中判据见 [`chat_search_hit`]。调用失败向上抛(由调用方回落本地日志)。
 pub async fn chat_search_outbound(
     state: &AppState,
+    workspace_id: &str,
     account_id: &str,
     peer: &str,
     content: &str,
@@ -974,6 +1040,7 @@ pub async fn chat_search_outbound(
     let since_iso = since.try_to_rfc3339_string().unwrap_or_default();
     let resp = logged_call_for_account(
         state,
+        workspace_id,
         account_id,
         "chat_search",
         serde_json::json!({
@@ -1004,12 +1071,13 @@ pub async fn chat_search_outbound(
 /// 任务在拉，前端多次轮询 / 多标签页 / force 连点都不叠加 spawn（防并发打爆 MCP SSE）。
 pub fn spawn_roster_refresh(state: AppState, workspace_id: String, account_id: String) {
     tokio::spawn(async move {
+        let refresh_key = roster_refresh_key(&workspace_id, &account_id);
         // single-flight抢锁:键已存在→已有同账号后台任务在拉,直接放弃(去重)。
         // insert返回旧值:Some(_)=已占用→放弃;None=抢到→继续。原子,无TOCTOU。
         if state
             .mcp
             .roster_refreshing
-            .insert(account_id.clone(), ())
+            .insert(refresh_key.clone(), ())
             .is_some()
         {
             return;
@@ -1017,10 +1085,10 @@ pub fn spawn_roster_refresh(state: AppState, workspace_id: String, account_id: S
         // RAII:本作用域结束(含return/panic)自动remove键释放锁。
         let _guard = RosterRefreshGuard {
             map: state.mcp.roster_refreshing.clone(),
-            key: account_id.clone(),
+            key: refresh_key,
         };
         for attempt in 0..ROSTER_REFRESH_MAX_RETRIES {
-            match fetch_roster_for_account(&state, &account_id).await {
+            match fetch_roster_for_account(&state, &workspace_id, &account_id).await {
                 Ok(outcome) if !outcome.syncing => {
                     if let Err(err) =
                         write_roster_snapshot(&state, &workspace_id, &account_id, &outcome.friends)
@@ -1103,7 +1171,10 @@ mod sse_parse_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::redact_request_for_log;
+    use super::{
+        deployment_mcp_fallback_allowed, mcp_account_filter, redact_request_for_log,
+        roster_refresh_key,
+    };
     use mongodb::bson::doc;
 
     #[test]
@@ -1146,6 +1217,32 @@ mod tests {
         let req = doc! { "recipient": "wxid_x", "mediaId": "mid_123" };
         let out = redact_request_for_log(&req);
         assert_eq!(out, req, "无 base64 key 时脱敏应与原 doc 相等");
+    }
+
+    #[test]
+    fn account_lookup_filter_is_workspace_and_account_scoped() {
+        let filter = mcp_account_filter("ws-b", "account-shared-id");
+        assert_eq!(filter.get_str("workspace_id").unwrap(), "ws-b");
+        assert_eq!(filter.get_str("account_id").unwrap(), "account-shared-id");
+        assert_eq!(filter.len(), 2);
+    }
+
+    #[test]
+    fn deployment_credentials_only_fallback_for_default_workspace() {
+        assert!(deployment_mcp_fallback_allowed("default", "default"));
+        assert!(!deployment_mcp_fallback_allowed("default", "tenant-b"));
+    }
+
+    #[test]
+    fn roster_refresh_key_distinguishes_same_account_across_workspaces() {
+        assert_ne!(
+            roster_refresh_key("ws-a", "same-account"),
+            roster_refresh_key("ws-b", "same-account")
+        );
+        assert_eq!(
+            roster_refresh_key("ws-a", "same-account"),
+            "ws-a|same-account"
+        );
     }
 
     #[test]

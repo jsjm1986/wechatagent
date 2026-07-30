@@ -8,8 +8,8 @@
 //!   id（`新客户` → `first_contact` 等），评分稳定可比对；
 //! - **CandidateNew / Deprecated 通过 risks 通道下游消费**，与 promote_risks /
 //!   `validate_and_promote` 保持同一管线，不需要新增写盘字段；
-//! - **不阻塞决策**：候选 upsert 是 `tokio::spawn` 异步的（fire-and-forget），
-//!   `taxonomy.rs:9` "候选 SHALL NOT 阻塞 Reply Agent" 硬约束。
+//! - **不阻塞决策**：这里只分类和规范化；候选由 Gateway 在终稿通过后写一次，
+//!   `taxonomy.rs:9` "候选 SHALL NOT 阻塞 Reply Agent" 硬约束不变。
 //!
 //! 校验维度：固定先做 `customer_stage` / `intent_level` 两项（LLM 已稳定输出，
 //! 字典已注入）。新增 `objection_type` / 自定义 `kind` 时只动本文件的
@@ -18,12 +18,10 @@
 //! 设计拆分：
 //! - [`classify_decision_tags`] 是纯函数：拿 cache + decision，**只**做 4 路分支
 //!   + alias 写回 + risks/candidate 收集，不触 db、不 spawn。便于离线 PBT/单测。
-//! - [`validate_and_normalize_decision`] 是生产入口：拿 db 句柄，调上面纯函数后
-//!   把 candidate 列表 fire-and-forget upsert。
+//! - [`validate_and_normalize_decision`] 是生产入口：拿 db 句柄和缓存做预审规范化，
+//!   但不持久化候选；Gateway 是 occurrence 的唯一写入责任点。
 
-use crate::agent::taxonomy::{
-    check_value, global_taxonomy_cache, upsert_candidate, TaxonomyCache, TaxonomyMatch,
-};
+use crate::agent::taxonomy::{check_value, global_taxonomy_cache, TaxonomyCache, TaxonomyMatch};
 use crate::agent::types::AgentDecision;
 use crate::db::Database;
 
@@ -40,7 +38,7 @@ use crate::db::Database;
 /// - `AliasActive(canonical)` → 写回 canonical id（reviewer 看到 canonical）；
 /// - `Deprecated` → push `taxonomy_deprecated_value:<kind>:<value>` risk；
 /// - `CandidateNew` → push `taxonomy_candidate:<kind>:<value>` risk + 收集到
-///   待 upsert 列表（由生产入口 [`validate_and_normalize_decision`] 异步落库）。
+///   待 upsert 列表（仅返回给纯函数测试；生产持久化由 Gateway 终稿阶段负责）。
 ///
 /// 返回 `(risks, candidates)`。**不**触发 review fail —— 候选偏离是软门。
 pub(crate) fn classify_decision_tags(
@@ -76,12 +74,12 @@ pub(crate) fn classify_decision_tags(
     (risks, candidates)
 }
 
-/// 生产入口：调 [`classify_decision_tags`] 拿 risks/candidates，candidate 列表
-/// 通过 `tokio::spawn` 异步 upsert（best-effort，失败仅 warn）。
+/// 生产入口：调 [`classify_decision_tags`] 拿 risks/candidates，但只返回 risks。
+/// Candidate occurrence 只能由 Gateway 在最终可发送决策上写一次，避免同一 run
+/// 在 Decision 与 Gateway 两条路径各累加一次。
 ///
 /// `dimension_kinds` 由调用方从 active DomainProfile 取（`decision_dimension_kinds`）。
-/// 仅要求 tokio runtime 在场（webhook / worker 入口都满足）。返回 risks 由调用方
-/// append 到 `promote_risks`。
+/// 返回 risks 由调用方 append 到 `promote_risks`。
 pub(crate) fn validate_and_normalize_decision(
     db: &Database,
     decision: &mut AgentDecision,
@@ -89,81 +87,19 @@ pub(crate) fn validate_and_normalize_decision(
     workspace_id: &str,
     scope_account_id: &str,
 ) -> Vec<String> {
-    let cache = global_taxonomy_cache(db);
-    let (risks, candidates) = classify_decision_tags(
+    let shadow_snapshot = super::budget::current_shadow_evaluation_snapshot();
+    let cache = match shadow_snapshot.as_ref() {
+        Some(snapshot) => snapshot.taxonomy_cache.clone(),
+        None => global_taxonomy_cache(db),
+    };
+    let (risks, _candidates) = classify_decision_tags(
         decision,
         dimension_kinds,
         workspace_id,
         scope_account_id,
         &cache,
     );
-    // 与 gateway 主循环同源：按 kind 从 decision.dimension_display_names 取 LLM 产的
-    // 中文名，随候选一起落库。二者写同一幂等键 (scope,kind,raw)，upsert 对已存在候选
-    // 不更新 display_name（先写者赢）——此处带名，避免本 fire-and-forget 路径的 None
-    // 抢先把 gateway 的中文名挡在门外。取的是同一个 decision，名字一致、幂等无害。
-    let named = attach_display_names(candidates, decision);
-    spawn_candidate_upserts(db, workspace_id, scope_account_id, named);
     risks
-}
-
-/// 把 `(kind, raw)` 候选列表按 `decision.dimension_display_names` 附上 LLM 产的
-/// 中文建议名 → `(kind, raw, Option<name>)`。与 gateway 主循环同源（复用同一取名
-/// 纯函数 `pick_dimension_display_name`）；缺名 → None → 候选回落英文裸值。
-fn attach_display_names(
-    candidates: Vec<(String, String)>,
-    decision: &AgentDecision,
-) -> Vec<(String, String, Option<String>)> {
-    candidates
-        .into_iter()
-        .map(|(kind, raw)| {
-            let name = crate::agent::gateway::pick_dimension_display_name(
-                &decision.dimension_display_names,
-                &kind,
-            )
-            .map(str::to_string);
-            (kind, raw, name)
-        })
-        .collect()
-}
-
-/// 把 `candidates`（含中文建议名）列表 fire-and-forget 写盘。抽到独立函数便于未来
-/// 加入熔断 / 限流策略。第三元 `Option<String>` = LLM 为自造新值产的中文名，作
-/// `upsert_candidate` 的 `suggested_display_name`（收件箱命名卡预填）；None 回落英文。
-fn spawn_candidate_upserts(
-    db: &Database,
-    workspace_id: &str,
-    scope_account_id: &str,
-    candidates: Vec<(String, String, Option<String>)>,
-) {
-    if candidates.is_empty() {
-        return;
-    }
-    let db = db.clone();
-    let workspace = workspace_id.to_string();
-    let scope = scope_account_id.to_string();
-    tokio::spawn(async move {
-        for (kind, raw, display_name) in candidates {
-            if let Err(err) = upsert_candidate(
-                &db,
-                &workspace,
-                &scope,
-                &kind,
-                &raw,
-                None,
-                0,
-                display_name.as_deref(),
-            )
-            .await
-            {
-                tracing::warn!(
-                    kind = %kind,
-                    raw_value = %raw,
-                    ?err,
-                    "taxonomy candidate upsert failed (best-effort)"
-                );
-            }
-        }
-    });
 }
 
 /// 测试入口：手动注入 cache（绕过全局单例 + db），便于 PBT。
@@ -415,29 +351,5 @@ mod tests {
             cands,
             vec![("emotional_state".to_string(), "焦虑不安".to_string())]
         );
-    }
-
-    #[test]
-    fn attach_display_names_picks_name_and_falls_back() {
-        // 生产入口 validate_and_normalize_decision 用同一个 attach_display_names：
-        // decision.dimensionDisplayNames 有名 → 候选带名；无名 → None（回落英文）。
-        use mongodb::bson::doc;
-        let mut d = AgentDecision::default();
-        d.dimension_display_names = doc! { "customer_stage": "焦虑观望" }; // 只给 stage 配名
-        let cands = vec![
-            ("customer_stage".to_string(), "anxious_watch".to_string()),
-            ("intent_level".to_string(), "probing".to_string()),
-        ];
-        let named = attach_display_names(cands, &d);
-        let stage = named
-            .iter()
-            .find(|(k, _, _)| k == "customer_stage")
-            .expect("stage");
-        assert_eq!(stage.2.as_deref(), Some("焦虑观望"));
-        let intent = named
-            .iter()
-            .find(|(k, _, _)| k == "intent_level")
-            .expect("intent");
-        assert_eq!(intent.2, None, "未配名维度回落 None");
     }
 }

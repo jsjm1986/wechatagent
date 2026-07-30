@@ -22,43 +22,69 @@ use crate::webhooks::is_operatable_person;
 pub async fn run_step(db: &Database) -> AppResult<()> {
     // (1) 删非真人 normal 记录。managed 一律保留（哪怕 gh_/群，只会在 step 3 被回填昵称，绝不删）。
     let mut deleted = 0u64;
-    let mut cursor = db
-        .contacts()
-        .find(doc! { "agent_status": "normal" }, None)
-        .await?;
-    let mut normal_wxids: Vec<String> = Vec::new();
+    // 未带完整租户三元组的历史行归属未知：在 m036 获批回填前必须跳过，
+    // 否则 typed cursor 会因缺字段中断整个安全纠偏迁移，或按裸 wxid 误删其它租户。
+    let scoped_identity_filter = doc! {
+        "workspace_id": { "$type": "string" },
+        "account_id": { "$type": "string" },
+        "wxid": { "$type": "string" },
+    };
+    let mut normal_filter = scoped_identity_filter.clone();
+    normal_filter.insert("agent_status", "normal");
+    let mut cursor = db.contacts().find(normal_filter, None).await?;
+    let mut normal_contacts: Vec<(String, String, String)> = Vec::new();
     while let Some(c) = cursor.try_next().await? {
-        normal_wxids.push(c.wxid);
+        normal_contacts.push((c.workspace_id, c.account_id, c.wxid));
     }
-    for wxid in &normal_wxids {
+    for (workspace_id, account_id, wxid) in &normal_contacts {
         if !is_operatable_person(wxid) {
             let r = db
                 .contacts()
-                .delete_many(doc! { "wxid": wxid, "agent_status": "normal" }, None)
+                .delete_many(
+                    doc! {
+                        "workspace_id": workspace_id,
+                        "account_id": account_id,
+                        "wxid": wxid,
+                        "agent_status": "normal",
+                    },
+                    None,
+                )
                 .await?;
             deleted += r.deleted_count;
         }
     }
 
-    // (2) 建 wxid -> (nickname, avatar_url) 映射（遍历所有 roster 快照）。
-    //     migration 不限定单一 account，故遍历所有 (workspace, account) 快照建全局映射。
-    let mut identity: HashMap<String, (Option<String>, Option<String>)> = HashMap::new();
-    let mut snap_cursor = db.roster_snapshots().find(doc! {}, None).await?;
+    // (2) 身份只能在同一 workspace/account 内回填；相同 wxid 在不同账号下
+    // 可以有不同备注、头像与可见身份，绝不能使用全局 wxid map。
+    let mut identity: HashMap<(String, String, String), (Option<String>, Option<String>)> =
+        HashMap::new();
+    let mut snap_cursor = db
+        .roster_snapshots()
+        .find(
+            doc! {
+                "workspace_id": { "$type": "string" },
+                "account_id": { "$type": "string" },
+            },
+            None,
+        )
+        .await?;
     while let Some(snap) = snap_cursor.try_next().await? {
         for f in snap.friends {
-            identity.entry(f.wxid).or_insert((f.nickname, f.avatar_url));
+            identity
+                .entry((snap.workspace_id.clone(), snap.account_id.clone(), f.wxid))
+                .or_insert((f.nickname, f.avatar_url));
         }
     }
 
     // (3) 遍历剩余 contacts：roster 命中→回填 nickname/avatar_url；nickname=="Demi" 且未命中→置 None。
     let mut enriched = 0u64;
     let mut demi_cleared = 0u64;
-    let mut all_cursor = db.contacts().find(doc! {}, None).await?;
+    let mut all_cursor = db.contacts().find(scoped_identity_filter, None).await?;
     while let Some(c) = all_cursor.try_next().await? {
         let wxid = c.wxid.clone();
         let mut set = Document::new();
         let mut unset = Document::new();
-        match identity.get(&wxid) {
+        match identity.get(&(c.workspace_id.clone(), c.account_id.clone(), wxid.clone())) {
             Some((nick, avatar)) => {
                 if let Some(n) = nick {
                     set.insert("nickname", n);

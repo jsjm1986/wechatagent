@@ -13,7 +13,12 @@ import {
 import { api, parseApiError } from "../../lib/api";
 import { ChunkReviewCard } from "../../components/review/ChunkReviewCard";
 import { parseCompleteness, parseIntegrityReport, type CompletenessView, type IntegrityReportView } from "./trustTypes";
-import { ChunkInspectorPane, classifyChunk, focusChunk, loadChunkOptions, type ReviewChunkItem, type ReviewCategory } from "./shared";
+import { ChunkInspectorPane, focusChunk, loadChunkOptions, type ReviewChunkItem, type ReviewCategory } from "./shared";
+import {
+  CHUNKS_INVALIDATED_EVENT,
+  useCoalescedReload,
+  type ChunkInvalidationDetail,
+} from "./chunkInvalidation";
 import { ReviewChat, type ReviewChatChunk } from "./cockpit/ReviewChat";
 import { useConfirm } from "../../components/ui/ConfirmDialog";
 import { ChunkPicker } from "../../components/ui/ChunkRef";
@@ -48,42 +53,26 @@ interface DocumentChunkRow {
   updatedAt?: string | null;
 }
 
-// GET /documents/:id 详情：含整替换 PUT 必须原样回带、避免被清空的字段
-// （rawContent / contentHash / lineIndex / sectionIndex 等）。注意 GET 详情
-// 不返回 productTags / businessTopics——这俩只在列表项里，提交时从列表项取。
+// GET /documents/:id response used to freeze the edit identity and version.
 interface DocumentDetail {
   id: string;
-  accountId?: string | null;
-  domain?: string | null;
-  sourceType?: string | null;
   sourceName?: string | null;
-  title?: string | null;
+  title: string;
   summary?: string | null;
   catalogSummary?: string | null;
-  routingMap?: string[] | null;
-  riskNotes?: string[] | null;
-  rawContent?: string | null;
-  contentHash?: string | null;
-  lineIndex?: unknown[] | null;
-  sectionIndex?: unknown[] | null;
-  status?: string | null;
-  version?: number | null;
+  version: number;
 }
 
 interface DocumentDetailResponse {
   item?: DocumentDetail | null;
 }
 
-// 编辑表单可改字段（少数元数据）；rawContent 等未编辑字段原样从 detail 回带。
 interface DocEditState {
   detail: DocumentDetail;
-  productTags: string[]; // 来自列表项
-  businessTopics: string[]; // 来自列表项
   title: string;
   summary: string;
   catalogSummary: string;
   sourceName: string;
-  status: string;
 }
 
 export function DocumentsView() {
@@ -102,12 +91,12 @@ export function DocumentsView() {
   // E4：文档级批量修复——展开区点「批量 AI 修复」打开 DocumentRepairPanel，
   // 它聚合该文档下 needs_review 切片，逐个复用 ChunkRepairPanel（落 draft+needs_review，AI 永不自动核验）。
   const [repairDoc, setRepairDoc] = useState<{ id: string; title: string } | null>(null);
-  // 编辑文档：点「编辑」先 GET /documents/:id 取完整文档回填，提交时把
-  // 未编辑字段（rawContent/contentHash/lineIndex/sectionIndex 等）原样带上，
-  // 避免后端 replace_one 整替换把它们清空。
+  // A request generation prevents a late detail response from replacing the
+  // currently selected document editor.
   const [editState, setEditState] = useState<DocEditState | null>(null);
   const [editLoadingId, setEditLoadingId] = useState<string | null>(null);
   const [editSaving, setEditSaving] = useState(false);
+  const editRequestGeneration = useRef(0);
   // E7：手工单条新建切片。展开表单 → POST /chunks。
   const [chunkFormOpen, setChunkFormOpen] = useState(false);
   const [chunkDraft, setChunkDraft] = useState({ title: "", body: "", summary: "", documentId: "" });
@@ -159,10 +148,10 @@ export function DocumentsView() {
 
   async function handleDelete(id: string) {
     const ok = await confirm({
-      title: "删除文档？",
-      body: "删除该文档会同时删除其下所有知识条目，且不可恢复。",
+      title: "归档文档？",
+      body: "归档后文档及其知识条目不再参与 AI 应答，但原文、修订历史和引用关系仍会保留。",
       tone: "danger",
-      confirmText: "确认删除",
+      confirmText: "确认归档",
     });
     if (!ok) return;
     try {
@@ -175,6 +164,8 @@ export function DocumentsView() {
   }
 
   async function openEdit(d: DocumentItem) {
+    const generation = ++editRequestGeneration.current;
+    setEditState(null);
     setEditLoadingId(d.id);
     setError(null);
     try {
@@ -182,24 +173,28 @@ export function DocumentsView() {
         `/api/operation-knowledge/documents/${encodeURIComponent(d.id)}`,
       );
       const detail = response.item;
-      if (!detail || detail.id !== d.id) {
+      if (
+        !detail ||
+        detail.id !== d.id ||
+        !Number.isInteger(detail.version) ||
+        detail.version < 0 ||
+        typeof detail.title !== "string" ||
+        !detail.title.trim()
+      ) {
         throw new Error("文档详情响应与当前文档不匹配，请刷新后重试。");
       }
+      if (generation !== editRequestGeneration.current) return;
       setEditState({
         detail,
-        // productTags / businessTopics 仅在列表项里（GET 详情不返回这俩）。
-        productTags: d.productTags ?? [],
-        businessTopics: d.businessTopics ?? [],
-        title: detail.title ?? d.title ?? "",
+        title: detail.title,
         summary: detail.summary ?? "",
         catalogSummary: detail.catalogSummary ?? "",
         sourceName: detail.sourceName ?? "",
-        status: detail.status ?? "active",
       });
     } catch (e) {
-      setError(String(e));
+      if (generation === editRequestGeneration.current) setError(String(e));
     } finally {
-      setEditLoadingId(null);
+      if (generation === editRequestGeneration.current) setEditLoadingId(null);
     }
   }
 
@@ -207,32 +202,28 @@ export function DocumentsView() {
     ev.preventDefault();
     if (!editState) return;
     if (!editState.title.trim()) return;
+    const { detail } = editState;
+    const body: Record<string, unknown> = {
+      version: detail.version,
+    };
+    const title = editState.title.trim();
+    const sourceName = editState.sourceName.trim() || null;
+    const summary = editState.summary.trim() || null;
+    const catalogSummary = editState.catalogSummary.trim() || null;
+    if (title !== detail.title.trim()) body.title = title;
+    if (sourceName !== (detail.sourceName?.trim() || null)) body.sourceName = sourceName;
+    if (summary !== (detail.summary?.trim() || null)) body.summary = summary;
+    if (catalogSummary !== (detail.catalogSummary?.trim() || null)) {
+      body.catalogSummary = catalogSummary;
+    }
+    if (Object.keys(body).length === 1) {
+      setEditState(null);
+      return;
+    }
     setEditSaving(true);
     setError(null);
-    const { detail } = editState;
-    // 整替换 PUT：未编辑字段原样从 detail 回带，绝不让 replace_one 清空
-    // rawContent / contentHash / lineIndex / sectionIndex / routingMap / riskNotes。
-    // productTags / businessTopics 从列表项带（GET 详情不返回）。
-    const body = {
-      accountId: detail.accountId ?? null,
-      domain: detail.domain ?? "user_operations",
-      sourceType: detail.sourceType ?? "imported_markdown",
-      sourceName: editState.sourceName.trim() || null,
-      title: editState.title.trim(),
-      summary: editState.summary.trim() || null,
-      catalogSummary: editState.catalogSummary.trim() || null,
-      routingMap: detail.routingMap ?? [],
-      riskNotes: detail.riskNotes ?? [],
-      productTags: editState.productTags,
-      businessTopics: editState.businessTopics,
-      rawContent: detail.rawContent ?? null,
-      contentHash: detail.contentHash ?? null,
-      lineIndex: detail.lineIndex ?? [],
-      sectionIndex: detail.sectionIndex ?? [],
-      status: editState.status || "active",
-    };
     try {
-      await api.put(`/api/operation-knowledge/documents/${encodeURIComponent(detail.id)}`, body);
+      await api.patch(`/api/operation-knowledge/documents/${encodeURIComponent(detail.id)}`, body);
       setEditState(null);
       await load();
     } catch (e) {
@@ -450,21 +441,20 @@ export function DocumentsView() {
             onChange={(e) => setEditState({ ...editState, sourceName: e.target.value })}
             className="wikiInput"
           />
-          <label className="wikiHint">状态</label>
-          <select
-            value={editState.status}
-            onChange={(e) => setEditState({ ...editState, status: e.target.value })}
-            className="wikiInput"
-          >
-            <option value="active">{statusLabel("active")}</option>
-            <option value="draft">{statusLabel("draft")}</option>
-            <option value="archived">{statusLabel("archived")}</option>
-          </select>
           <div style={{ display: "flex", gap: 8 }}>
             <button type="submit" className="wikiBtn primary" disabled={editSaving || !editState.title.trim()}>
               {editSaving ? "保存中…" : "保存修改"}
             </button>
-            <button type="button" className="wikiBtn" disabled={editSaving} onClick={() => setEditState(null)}>
+            <button
+              type="button"
+              className="wikiBtn"
+              disabled={editSaving}
+              onClick={() => {
+                editRequestGeneration.current += 1;
+                setEditState(null);
+                setEditLoadingId(null);
+              }}
+            >
               取消
             </button>
           </div>
@@ -522,7 +512,14 @@ export function DocumentsView() {
                   >
                     {editLoadingId === d.id ? "加载中…" : "编辑"}
                   </button>
-                  <button type="button" className="wikiArchiveRollback" onClick={() => handleDelete(d.id)}>删除</button>
+                  <button
+                    type="button"
+                    className="wikiArchiveRollback"
+                    disabled={d.status === "archived"}
+                    onClick={() => handleDelete(d.id)}
+                  >
+                    {d.status === "archived" ? "已归档" : "归档"}
+                  </button>
                 </td>
               </tr>
               {expandedDoc === d.id ? (
@@ -599,6 +596,7 @@ export function DocumentsView() {
 
 // ── G2 · ImportWizard · 三步条粘贴 → 预览 → 应用 ───────────────────────
 interface ImportPreviewChunk {
+  candidateId: string;
   title?: string | null;
   body?: string | null;
   summary?: string | null;
@@ -610,6 +608,8 @@ interface ImportPreviewChunk {
 }
 
 interface ImportPreviewResult {
+  previewId: string;
+  previewHash: string;
   document?: { title?: string; summary?: string; catalogSummary?: string } | null;
   items?: unknown[];
   chunks?: ImportPreviewChunk[];
@@ -718,6 +718,10 @@ export function ImportWizard() {
 
   // 用抽取结果填 preview 并进 step2（同步秒回与异步 job 完成共用）。
   function acceptPreviewResult(data: ImportPreviewResult) {
+    if (!data.previewId || !data.previewHash) {
+      setError("预览缺少服务端校验标识，请重新生成预览");
+      return;
+    }
     setPreview(data);
     const all = new Set<number>();
     (data.chunks ?? []).forEach((_, i) => all.add(i));
@@ -798,13 +802,17 @@ export function ImportWizard() {
     setError(null);
     try {
       const finalChunks = (preview.chunks ?? [])
-        .map((c, i) => ({ ...c, ...(edits[i] ?? {}) }))
-        .filter((_, i) => selected.has(i));
+        .map((candidate, index) => ({
+          candidateId: candidate.candidateId,
+          patch: edits[index] ?? {},
+          selected: selected.has(index),
+        }))
+        .filter((candidate) => candidate.selected)
+        .map(({ candidateId, patch }) => ({ candidateId, patch }));
       const payload = {
-        document: preview.document,
-        items: preview.items,
+        previewId: preview.previewId,
+        previewHash: preview.previewHash,
         chunks: finalChunks,
-        sourceName: sourceName.trim() || null
       };
       const r = await fetch("/api/operation-knowledge/import-apply", {
         method: "POST",
@@ -1020,7 +1028,7 @@ export function ImportWizard() {
               const merged = { ...c, ...e };
               const isOn = selected.has(i);
               return (
-                <div key={i} className={`wikiImportCandidate${isOn ? " selected" : ""}`}>
+                <div key={c.candidateId} className={`wikiImportCandidate${isOn ? " selected" : ""}`}>
                   <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                     <input type="checkbox" checked={isOn} onChange={() => toggle(i)} />
                     <span className="wikiArchiveTag">{wikiTypeLabel(merged.wikiType ?? undefined)}</span>
@@ -1527,14 +1535,9 @@ export function LintView() {
   );
 }
 
-// ReviewView：把 active chunks 客户端分类成 5 类待评审视图。
-//
-// 5 类（互斥优先级，从严到宽）：
-//   1. contested            integrityStatus=rejected — 被否的需要重新审视
-//   2. needs_review         integrityStatus=needs_review — 等待运营初审
-//   3. source_orphan        缺 sourceQuote 或 sourceAnchors — 无法定位回源文档
-//   4. pending_verification integrityStatus=needs_review 且 已有 sourceQuote — 距离 verify 一步之遥
-//   5. dependents_pending   relatedChunks 引用的 chunk 不在当前活跃集合 — 关系链残缺
+// ReviewView consumes the server-owned review projection. Categories are
+// facets, not an exclusive client-side priority: one draft may be both
+// needs_review and source_orphan.
 //
 // 处置走现有路由：
 //   - Verify  → POST /api/operation-knowledge/chunks/:id/verify
@@ -1550,66 +1553,105 @@ const REVIEW_CATEGORIES: { v: ReviewCategory; label: string; hint: string }[] = 
   { v: "dependents_pending", label: "关联不完整", hint: "关联到了已不在使用中的知识" }
 ];
 
-const DIM_LABELS: Record<string, string> = {
-  capability: "能力",
-  pricing: "定价",
-  caseEvidence: "案例",
-  effectClaims: "效果数据",
-  deliveryBoundary: "交付边界",
+type ReviewQueueItem = ReviewChunkItem & { reviewCategories: ReviewCategory[] };
+
+interface ReviewQueueResponse {
+  items: ReviewQueueItem[];
+  counts: Record<ReviewCategory, number>;
+  effectiveFilter: {
+    workspaceId: string;
+    domain: string;
+    lifecycleStatuses: string[];
+    dimension: { key: string; label: string; topicAliases: string[] } | null;
+  };
+}
+
+const EMPTY_REVIEW_COUNTS: Record<ReviewCategory, number> = {
+  contested: 0,
+  needs_review: 0,
+  source_orphan: 0,
+  pending_verification: 0,
+  dependents_pending: 0,
 };
 
 export function ReviewView({ initialDimFilter }: { initialDimFilter?: string | null } = {}) {
   const confirm = useConfirm();
-  const [items, setItems] = useState<ReviewChunkItem[]>([]);
+  const [items, setItems] = useState<ReviewQueueItem[]>([]);
+  const [counts, setCounts] = useState<Record<ReviewCategory, number>>(EMPTY_REVIEW_COUNTS);
+  const [effectiveFilter, setEffectiveFilter] = useState<ReviewQueueResponse["effectiveFilter"] | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [info, setInfo] = useState<string | null>(null);
+  const [syncNotice, setSyncNotice] = useState<string | null>(null);
   const [activeCategory, setActiveCategory] = useState<ReviewCategory>("needs_review");
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [batchBusy, setBatchBusy] = useState(false);
+  const requestGeneration = useRef(0);
   // T9：在主区打开「审核+对话」双栏(ReviewChat)；非空时替代列表。
   const [chatChunk, setChatChunk] = useState<ReviewChatChunk | null>(null);
 
-  async function load() {
+  const loadOnce = useCallback(async () => {
+    const generation = requestGeneration.current;
     setLoading(true);
     setError(null);
     try {
-      const r = await fetch("/api/operation-knowledge/chunks");
+      const params = new URLSearchParams();
+      if (initialDimFilter) params.set("dimension", initialDimFilter);
+      const query = params.toString();
+      const r = await fetch(`/api/operation-knowledge/review-queue${query ? `?${query}` : ""}`);
       if (!r.ok) throw await parseApiError(r);
-      const data = (await r.json()) as { items: ReviewChunkItem[] };
+      const data = (await r.json()) as ReviewQueueResponse;
+      if (generation !== requestGeneration.current) return;
       setItems(data.items ?? []);
+      setCounts({ ...EMPTY_REVIEW_COUNTS, ...(data.counts ?? {}) });
+      setEffectiveFilter(data.effectiveFilter ?? null);
+      setSelected((current) => {
+        const available = new Set((data.items ?? []).map((item) => item.id));
+        return new Set([...current].filter((id) => available.has(id)));
+      });
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e));
+      if (generation === requestGeneration.current) {
+        setItems([]);
+        setCounts(EMPTY_REVIEW_COUNTS);
+        setEffectiveFilter(null);
+        setSelected(new Set());
+        setError(e instanceof Error ? e.message : String(e));
+      }
     } finally {
-      setLoading(false);
+      if (generation === requestGeneration.current) setLoading(false);
     }
-  }
+  }, [initialDimFilter]);
+  const coalescedReload = useCoalescedReload(loadOnce);
+  const reload = useCallback(() => {
+    requestGeneration.current += 1;
+    setItems([]);
+    setCounts(EMPTY_REVIEW_COUNTS);
+    setEffectiveFilter(null);
+    setSelected(new Set());
+    setError(null);
+    return coalescedReload();
+  }, [coalescedReload]);
 
   useEffect(() => {
-    void load();
-  }, []);
+    void reload();
+  }, [reload]);
 
-  // 按优先级把每个 chunk 归入第一个命中的类别。
-  // 注意：active chunks 列表也包含 status=rejected 的（status 与 integrity_status 是两条轴）；
-  // contested 走 integrity_status，本视图不再二次过滤 status。
-  const classified = useMemo(() => {
-    const byId = new Set(items.map((i) => i.id));
-    const out = new Map<ReviewCategory, ReviewChunkItem[]>();
-    for (const cat of REVIEW_CATEGORIES) out.set(cat.v, []);
-    for (const it of items) {
-      const cat = classifyChunk(it, byId);
-      if (cat) out.get(cat)!.push(it);
-    }
-    return out;
-  }, [items]);
+  useEffect(() => {
+    const onInvalidated = (event: Event) => {
+      const detail = (event as CustomEvent<ChunkInvalidationDetail>).detail;
+      if (detail?.reason === "lagged") {
+        setSyncNotice("\u5b9e\u65f6\u66f4\u65b0\u6709\u79ef\u538b\uff0c\u6b63\u5728\u91cd\u65b0\u540c\u6b65\u8bc4\u5ba1\u961f\u5217\u2026");
+      }
+      void reload().finally(() => setSyncNotice(null));
+    };
+    window.addEventListener(CHUNKS_INVALIDATED_EVENT, onInvalidated);
+    return () => window.removeEventListener(CHUNKS_INVALIDATED_EVENT, onInvalidated);
+  }, [reload]);
 
-  const counts = useMemo(() => {
-    const m = new Map<ReviewCategory, number>();
-    for (const cat of REVIEW_CATEGORIES) m.set(cat.v, classified.get(cat.v)?.length ?? 0);
-    return m;
-  }, [classified]);
-
-  const visible = classified.get(activeCategory) ?? [];
+  const visible = useMemo(
+    () => items.filter((item) => item.reviewCategories.includes(activeCategory)),
+    [activeCategory, items],
+  );
 
   function toggleSelect(id: string) {
     setSelected((prev) => {
@@ -1642,7 +1684,7 @@ export function ReviewView({ initialDimFilter }: { initialDimFilter?: string | n
     const body =
       action === "verify"
         ? { ids, note: "batch verify (admin)" }
-        : { ids, reason: "batch archive (admin)", actor: "admin" };
+        : { ids, reason: "batch archive (admin)" };
     try {
       const r = await fetch(path, {
         method: "POST",
@@ -1664,7 +1706,7 @@ export function ReviewView({ initialDimFilter }: { initialDimFilter?: string | n
             : ""),
       );
       setSelected(new Set());
-      await load();
+      await reload();
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -1679,7 +1721,7 @@ export function ReviewView({ initialDimFilter }: { initialDimFilter?: string | n
           <h2>评审队列</h2>
         </div>
         <div className="wikiArchiveHeaderActions">
-          <button type="button" className="ghost wikiBtn" onClick={() => void load()} disabled={loading}>
+          <button type="button" className="ghost wikiBtn" onClick={() => void reload()} disabled={loading}>
             <RefreshCw size={14} />
             {loading ? "加载中…" : "刷新"}
           </button>
@@ -1687,15 +1729,17 @@ export function ReviewView({ initialDimFilter }: { initialDimFilter?: string | n
       </header>
       <div className="wikiToolbar">
         <span className="wikiHint">
-          仅展示活跃知识条目。确认 / 退回直接操作，AI 永不自动确认。
+          仅展示未归档且需要处置的草稿 / 活跃知识。确认 / 退回直接操作，AI 永不自动确认。
         </span>
       </div>
-      {initialDimFilter ? (
+      {effectiveFilter?.dimension ? (
         <div className="wikiAlert info">
-          从概览「{DIM_LABELS[initialDimFilter] ?? initialDimFilter}」维度下钻而来：下面是待初审的草稿，确认后这块知识才有机会被 AI 使用。
+          从概览「{effectiveFilter.dimension.label}」维度下钻；服务端按业务主题
+          {effectiveFilter.dimension.topicAliases.map((alias) => `「${alias}」`).join("、")} 精确筛选。
         </div>
       ) : null}
       {error ? <div className="wikiAlert error">{error}</div> : null}
+      {syncNotice ? <div className="wikiAlert info">{syncNotice}</div> : null}
       {info ? <div className="wikiAlert info">{info}</div> : null}
       {selected.size > 0 ? (
         <div className="wikiBatchToolbar">
@@ -1729,7 +1773,7 @@ export function ReviewView({ initialDimFilter }: { initialDimFilter?: string | n
       <div className="wikiLintLayout">
         <div className="wikiReviewFilter">
           {REVIEW_CATEGORIES.map((cat) => {
-            const c = counts.get(cat.v) ?? 0;
+            const c = counts[cat.v] ?? 0;
             return (
               <button
                 type="button"
@@ -1761,7 +1805,7 @@ export function ReviewView({ initialDimFilter }: { initialDimFilter?: string | n
                 chunk={chatChunk}
                 onResolved={() => {
                   setChatChunk(null);
-                  void load();
+                  void reload();
                 }}
               />
             </>
@@ -1785,7 +1829,7 @@ export function ReviewView({ initialDimFilter }: { initialDimFilter?: string | n
                     {/* 单 chunk 处置（展示 + verify-gate + verify/reject）走中立化共享卡片。
                         chunk={c}：传入列表已 pre-fetch 的整行，卡片不再发 GET-by-id（消除 N+1）。
                         onDone=load：处置成功后刷新列表/分类，重渲染本行拿到新数据。 */}
-                    <ChunkReviewCard chunkId={c.id} chunk={c} onDone={() => void load()} />
+                    <ChunkReviewCard chunkId={c.id} chunk={c} onDone={() => void reload()} />
                     <div className="wikiSignalActions">
                       <button
                         type="button"
@@ -1840,18 +1884,61 @@ export function ReviewView({ initialDimFilter }: { initialDimFilter?: string | n
 // 全部只读：本视图不修改 chunk，verify / reject 走 ReviewView。
 interface CatalogPersistedDocument {
   catalogSummaryPersisted?: string | null;
+  catalogDesiredGeneration?: number;
+  catalogAppliedGeneration?: number;
+  catalogFresh?: boolean;
 }
 
 interface CatalogPersistedView {
-  documents?: CatalogPersistedDocument[];
+  documents: CatalogPersistedDocument[];
 }
 
 interface CatalogLiveView {
-  item?: {
-    documents?: unknown[];
+  item: {
+    documents: unknown[];
     items?: unknown[];
     chunks?: unknown[];
-  } | null;
+  };
+}
+
+function isJsonObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+export function parseCatalogPersistedView(value: unknown): CatalogPersistedView | null {
+  if (!isJsonObject(value) || !Array.isArray(value.documents)) return null;
+  const documents: CatalogPersistedDocument[] = [];
+  for (const document of value.documents) {
+    if (!isJsonObject(document)) return null;
+    const summary = document.catalogSummaryPersisted;
+    const fresh = document.catalogFresh;
+    const desired = document.catalogDesiredGeneration;
+    const applied = document.catalogAppliedGeneration;
+    if (summary !== undefined && summary !== null && typeof summary !== "string") return null;
+    if (fresh !== undefined && typeof fresh !== "boolean") return null;
+    if (desired !== undefined && typeof desired !== "number") return null;
+    if (applied !== undefined && typeof applied !== "number") return null;
+    documents.push({
+      catalogSummaryPersisted: summary as string | null | undefined,
+      catalogFresh: fresh as boolean | undefined,
+      catalogDesiredGeneration: desired as number | undefined,
+      catalogAppliedGeneration: applied as number | undefined,
+    });
+  }
+  return { documents };
+}
+
+export function parseCatalogLiveView(value: unknown): CatalogLiveView | null {
+  if (!isJsonObject(value) || !isJsonObject(value.item) || !Array.isArray(value.item.documents)) {
+    return null;
+  }
+  return {
+    item: {
+      documents: value.item.documents,
+      items: Array.isArray(value.item.items) ? value.item.items : undefined,
+      chunks: Array.isArray(value.item.chunks) ? value.item.chunks : undefined,
+    },
+  };
 }
 
 interface LogsAnalyzeView {
@@ -1862,9 +1949,115 @@ interface LogsAnalyzeView {
   samples?: unknown[];
 }
 
+interface MetricScope {
+  kind?:
+    | "flow_window"
+    | "current_inventory"
+    | "retained_history"
+    | "rolling_window_cache"
+    | "mixed_current_and_retained_history";
+  consistency?: "non_snapshot" | "cached_snapshot";
+  asOf?: string | null;
+  start?: string | null;
+  windowHours?: number | null;
+  windowDays?: number | null;
+  updatedAt?: string | null;
+}
+
+interface PhaseRollupResponse {
+  asOf?: string | null;
+  metricScopes?: {
+    lifecycle?: MetricScope;
+    holdBreakdown?: MetricScope;
+    revisionReasons?: MetricScope;
+    reviewerMisjudge?: MetricScope;
+    negativeExamplePending?: MetricScope;
+    principalEscalations?: MetricScope;
+    reviewerStats?: MetricScope;
+    dealAttribution?: MetricScope;
+  };
+  lifecycle?: Array<{ lifecycle: string; count: number; outOfClosedSet?: boolean }>;
+  revisionReasons?: Array<{ reason: string; count: number }>;
+  reviewerMisjudge?: Array<{ kind: string; count: number }>;
+  negativeExamplePending?: number;
+  reviewerStats?: {
+    windowDays?: number;
+    considered?: number;
+    approved?: number;
+    approvedButUserNegative?: number;
+    passRate?: number;
+    misjudgeRate?: number;
+    updatedAt?: string | null;
+  };
+  principalEscalations?: {
+    byStatus?: Array<{ status: string; count: number; outOfClosedSet?: boolean }>;
+    pendingAgeBuckets?: Array<{ bucket: string; count: number }>;
+    oldestPendingAgeMs?: number;
+    relayDeliveryFailed?: number;
+  };
+  dealAttribution?: {
+    windowDays?: number;
+    dealAttributedHits?: number;
+    updatedAt?: string | null;
+  };
+}
+
+interface WorkerHealthResponse {
+  asOf?: string | null;
+  metricScopes?: {
+    chatTasks?: MetricScope;
+    gapSignals?: MetricScope;
+    lessonsLearned?: MetricScope;
+  };
+  chatTasks?: {
+    byStatus?: Array<{ status: string; count: number; outOfClosedSet?: boolean }>;
+    errorKindsTop?: Array<{ errorKind: string; count: number }>;
+  };
+  gapSignals?: {
+    byStatus?: Array<{ status: string; count: number; outOfClosedSet?: boolean }>;
+    pendingKindsTop?: Array<{ kind: string; count: number }>;
+    total?: number;
+    pending?: number;
+    resolved?: number;
+    historicalResolvedShare?: number | null;
+  };
+  lessonsLearned?: {
+    windowDays?: number;
+    patternTop?: Array<{ pattern: string; count: number; outOfClosedSet?: boolean }>;
+    blockedTotal?: number;
+  };
+}
+
+function metricScopeLabel(scope?: MetricScope): string {
+  if (!scope) return "口径未知";
+  switch (scope.kind) {
+    case "flow_window":
+      if (scope.windowHours) return `近 ${scope.windowHours} 小时`;
+      if (scope.windowDays) return `近 ${scope.windowDays} 天`;
+      return "滑动窗口";
+    case "current_inventory":
+      return "当前库存";
+    case "retained_history":
+      return "保留历史";
+    case "rolling_window_cache":
+      return scope.windowDays ? `${scope.windowDays} 天滚动缓存` : "滚动缓存";
+    case "mixed_current_and_retained_history":
+      return "当前积压 + 保留历史";
+    default:
+      return "口径未知";
+  }
+}
+
+function MetricScopeTag({ scope }: { scope?: MetricScope }) {
+  return <span className="wikiArchiveTag">{metricScopeLabel(scope)}</span>;
+}
+
 interface IngestSourceItem {
   sourceId: string;
   workspaceId: string;
+  sourceGeneration: number;
+  claimGeneration: number;
+  lockedUntil?: string | null;
   kind: string;
   url: string;
   label?: string | null;
@@ -2108,47 +2301,8 @@ export function ObservabilityDashboard() {
     maxEntries?: number;
     ttlSeconds?: number;
   } | null>(null);
-  const [phaseRollup, setPhaseRollup] = useState<{
-    windowHours?: number;
-    lifecycle?: Array<{ lifecycle: string; count: number; outOfClosedSet?: boolean }>;
-    revisionReasons?: Array<{ reason: string; count: number }>;
-    reviewerMisjudge?: Array<{ kind: string; count: number }>;
-    negativeExamplePending?: number;
-    reviewerStats?: {
-      windowDays?: number;
-      considered?: number;
-      approved?: number;
-      approvedButUserNegative?: number;
-      passRate?: number;
-      misjudgeRate?: number;
-    };
-    principalEscalations?: {
-      byStatus?: Array<{ status: string; count: number; outOfClosedSet?: boolean }>;
-      pendingAgeBuckets?: Array<{ bucket: string; count: number }>;
-      oldestPendingAgeMs?: number;
-      relayDeliveryFailed?: number;
-    };
-    dealAttribution?: { dealAttributedHits?: number; updatedAt?: string | null };
-  } | null>(null);
-  const [workerHealth, setWorkerHealth] = useState<{
-    chatTasks?: {
-      byStatus?: Array<{ status: string; count: number; outOfClosedSet?: boolean }>;
-      errorKindsTop?: Array<{ errorKind: string; count: number }>;
-    };
-    gapSignals?: {
-      byStatus?: Array<{ status: string; count: number; outOfClosedSet?: boolean }>;
-      pendingKindsTop?: Array<{ kind: string; count: number }>;
-      total?: number;
-      pending?: number;
-      resolved?: number;
-      sweepHitRate?: number;
-    };
-    lessonsLearned?: {
-      windowDays?: number;
-      patternTop?: Array<{ pattern: string; count: number; outOfClosedSet?: boolean }>;
-      blockedTotal?: number;
-    };
-  } | null>(null);
+  const [phaseRollup, setPhaseRollup] = useState<PhaseRollupResponse | null>(null);
+  const [workerHealth, setWorkerHealth] = useState<WorkerHealthResponse | null>(null);
   const [behaviorMetrics, setBehaviorMetrics] = useState<{
     items?: Array<{
       date?: string;
@@ -2166,6 +2320,9 @@ export function ObservabilityDashboard() {
   const load = useCallback(async () => {
     setPending(true);
     setError(null);
+    // A failed refresh must not leave the previous snapshot looking current.
+    setCatalog(null);
+    setCatalogLive(null);
     // 逐端点隔离:任一失败只让对应卡片空缺,不再整页全黑(此前 Promise.all + 无 r.ok 检查,
     // 任一端点 500/返回 HTML 即 JSON 解析抛错,八张卡全没)。
     async function safe<T>(url: string): Promise<T | null> {
@@ -2178,9 +2335,9 @@ export function ObservabilityDashboard() {
       }
     }
     try {
-      const [a, b, c, d, e, f, g, h, i] = await Promise.allSettled([
-        safe<CatalogPersistedView>("/api/operation-knowledge/catalog/persisted"),
-        safe<CatalogLiveView>("/api/operation-knowledge/catalog"),
+      const [aRaw, bRaw, c, d, e, f, g, h, i] = await Promise.allSettled([
+        safe<unknown>("/api/operation-knowledge/catalog/persisted"),
+        safe<unknown>("/api/operation-knowledge/catalog"),
         safe<unknown>("/api/operation-knowledge/completeness"),
         safe<unknown>("/api/operation-knowledge/integrity-report"),
         safe<LogsAnalyzeView>("/api/operation-knowledge/logs/analyze"),
@@ -2189,8 +2346,10 @@ export function ObservabilityDashboard() {
         safe<typeof workerHealth>("/api/admin/observability/worker-health"),
         safe<typeof behaviorMetrics>("/api/behavior-signal-metrics?limit=14"),
       ]).then((rs) => rs.map((r) => (r.status === "fulfilled" ? r.value : null)));
-      if (a) setCatalog(a as CatalogPersistedView);
-      if (b) setCatalogLive(b as CatalogLiveView);
+      const a = parseCatalogPersistedView(aRaw);
+      const b = parseCatalogLiveView(bRaw);
+      setCatalog(a);
+      setCatalogLive(b);
       if (c) setCompleteness(parseCompleteness(c));
       if (d) setIntegrity(parseIntegrityReport(d));
       if (e) setLogs(e as LogsAnalyzeView);
@@ -2231,13 +2390,16 @@ export function ObservabilityDashboard() {
     }
   }
 
-  const persistedTotal = (catalog?.documents ?? []).filter(
-    (document) =>
-      typeof document.catalogSummaryPersisted === "string" &&
-      document.catalogSummaryPersisted.trim().length > 0,
-  ).length;
-  const liveTotal = catalogLive?.item?.documents?.length ?? 0;
-  const drift = liveTotal - persistedTotal;
+  const persistedTotal = catalog === null
+    ? null
+    : catalog.documents.filter(
+        (document) =>
+          typeof document.catalogSummaryPersisted === "string" &&
+          document.catalogSummaryPersisted.trim().length > 0 &&
+          document.catalogFresh === true,
+      ).length;
+  const liveTotal = catalogLive === null ? null : catalogLive.item.documents.length;
+  const drift = persistedTotal === null || liveTotal === null ? null : liveTotal - persistedTotal;
 
   return (
     <div className="wikiArchiveShell wikiObservability">
@@ -2263,12 +2425,12 @@ export function ObservabilityDashboard() {
           </header>
           <dl className="wikiArchiveMeta">
             <dt>持久化</dt>
-            <dd>{persistedTotal}</dd>
+            <dd>{persistedTotal ?? "不可用"}</dd>
             <dt>实时</dt>
-            <dd>{liveTotal}</dd>
+            <dd>{liveTotal ?? "不可用"}</dd>
             <dt>偏差</dt>
-            <dd className={drift !== 0 ? "wikiObservabilityDrift" : undefined}>
-              {drift > 0 ? `+${drift}` : drift}
+            <dd className={drift !== null && drift !== 0 ? "wikiObservabilityDrift" : undefined}>
+              {drift === null ? "不可用" : drift > 0 ? `+${drift}` : drift}
             </dd>
           </dl>
           <button
@@ -2415,28 +2577,7 @@ export function ObservabilityDashboard() {
 function PhaseRollupPanel({
   data
 }: {
-  data: {
-    windowHours?: number;
-    lifecycle?: Array<{ lifecycle: string; count: number; outOfClosedSet?: boolean }>;
-    revisionReasons?: Array<{ reason: string; count: number }>;
-    reviewerMisjudge?: Array<{ kind: string; count: number }>;
-    negativeExamplePending?: number;
-    reviewerStats?: {
-      windowDays?: number;
-      considered?: number;
-      approved?: number;
-      approvedButUserNegative?: number;
-      passRate?: number;
-      misjudgeRate?: number;
-    };
-    principalEscalations?: {
-      byStatus?: Array<{ status: string; count: number; outOfClosedSet?: boolean }>;
-      pendingAgeBuckets?: Array<{ bucket: string; count: number }>;
-      oldestPendingAgeMs?: number;
-      relayDeliveryFailed?: number;
-    };
-    dealAttribution?: { dealAttributedHits?: number; updatedAt?: string | null };
-  } | null;
+  data: PhaseRollupResponse | null;
 }) {
   if (!data) {
     return null;
@@ -2446,7 +2587,6 @@ function PhaseRollupPanel({
   const revisionReasons = data.revisionReasons ?? [];
   const reviewerMisjudge = data.reviewerMisjudge ?? [];
   const negativeExamplePending = data.negativeExamplePending ?? 0;
-  const windowHours = data.windowHours ?? 24;
   const reviewerStats = data.reviewerStats ?? null;
   const reviewerStatsHasData =
     reviewerStats != null && (reviewerStats.considered ?? 0) > 0;
@@ -2466,12 +2606,13 @@ function PhaseRollupPanel({
     <section className="wikiObservabilityPhaseRollup">
       <header className="wikiObservabilityCardHead">
         <span className="wikiArchiveTag">phase-rollup</span>
-        <h4>Phase 0-D 自治信号（{windowHours}h）</h4>
+        <h4>Phase 0-D 自治信号</h4>
       </header>
       <div className="wikiObservabilityGrid">
         <article className="wikiObservabilityCard">
           <header className="wikiObservabilityCardHead">
             <span className="wikiArchiveTag">lifecycle</span>
+            <MetricScopeTag scope={data.metricScopes?.lifecycle} />
             <h4>运行终态</h4>
           </header>
           {lifecycleTotal === 0 ? (
@@ -2496,6 +2637,7 @@ function PhaseRollupPanel({
         <article className="wikiObservabilityCard">
           <header className="wikiObservabilityCardHead">
             <span className="wikiArchiveTag">revision</span>
+            <MetricScopeTag scope={data.metricScopes?.revisionReasons} />
             <h4>单轮改写高频原因</h4>
           </header>
           {revisionReasons.length === 0 ? (
@@ -2515,6 +2657,7 @@ function PhaseRollupPanel({
         <article className="wikiObservabilityCard">
           <header className="wikiObservabilityCardHead">
             <span className="wikiArchiveTag">reviewer</span>
+            <MetricScopeTag scope={data.metricScopes?.reviewerMisjudge} />
             <h4>审核员误判信号</h4>
           </header>
           {reviewerMisjudge.length === 0 ? (
@@ -2534,6 +2677,7 @@ function PhaseRollupPanel({
         <article className="wikiObservabilityCard">
           <header className="wikiObservabilityCardHead">
             <span className="wikiArchiveTag">negative-example</span>
+            <MetricScopeTag scope={data.metricScopes?.negativeExamplePending} />
             <h4>负例候选（待确认）</h4>
           </header>
           <dl className="wikiArchiveMeta">
@@ -2551,6 +2695,7 @@ function PhaseRollupPanel({
         <article className="wikiObservabilityCard">
           <header className="wikiObservabilityCardHead">
             <span className="wikiArchiveTag">reviewer-stats</span>
+            <MetricScopeTag scope={data.metricScopes?.reviewerStats} />
             <h4>审核员双脑表现</h4>
           </header>
           {reviewerStatsHasData ? (
@@ -2588,6 +2733,7 @@ function PhaseRollupPanel({
         <article className="wikiObservabilityCard">
           <header className="wikiObservabilityCardHead">
             <span className="wikiArchiveTag">escalation</span>
+            <MetricScopeTag scope={data.metricScopes?.principalEscalations} />
             <h4>请示通道（领导决策）</h4>
           </header>
           {escHasData ? (
@@ -2615,6 +2761,7 @@ function PhaseRollupPanel({
         <article className="wikiObservabilityCard">
           <header className="wikiObservabilityCardHead">
             <span className="wikiArchiveTag">deal-attribution</span>
+            <MetricScopeTag scope={data.metricScopes?.dealAttribution} />
             <h4>成交追认强化命中</h4>
           </header>
           {dealAttribution != null ? (
@@ -2637,30 +2784,12 @@ function PhaseRollupPanel({
 
 // G-后续Ⅱ/2 · ObservabilityDashboard 第二波卡片：worker 健康聚合
 //   - knowledge_chat_tasks 状态分布 + 失败 error_kind top
-//   - knowledge_gap_signals sweep 命中率 + pending kind top
+//   - knowledge_gap_signals 保留历史解决占比 + pending kind top
 //   - lessons_learned 14d pattern × review_status 矩阵 + blocked_total
 function WorkerHealthPanel({
   data
 }: {
-  data: {
-    chatTasks?: {
-      byStatus?: Array<{ status: string; count: number; outOfClosedSet?: boolean }>;
-      errorKindsTop?: Array<{ errorKind: string; count: number }>;
-    };
-    gapSignals?: {
-      byStatus?: Array<{ status: string; count: number; outOfClosedSet?: boolean }>;
-      pendingKindsTop?: Array<{ kind: string; count: number }>;
-      total?: number;
-      pending?: number;
-      resolved?: number;
-      sweepHitRate?: number;
-    };
-    lessonsLearned?: {
-      windowDays?: number;
-      patternTop?: Array<{ pattern: string; count: number; outOfClosedSet?: boolean }>;
-      blockedTotal?: number;
-    };
-  } | null;
+  data: WorkerHealthResponse | null;
 }) {
   if (!data) {
     return null;
@@ -2673,7 +2802,7 @@ function WorkerHealthPanel({
   const gapTotal = data.gapSignals?.total ?? 0;
   const gapPending = data.gapSignals?.pending ?? 0;
   const gapResolved = data.gapSignals?.resolved ?? 0;
-  const gapHitRate = data.gapSignals?.sweepHitRate ?? 0;
+  const historicalResolvedShare = data.gapSignals?.historicalResolvedShare ?? null;
   const lessonsPatterns = data.lessonsLearned?.patternTop ?? [];
   const lessonsBlocked = data.lessonsLearned?.blockedTotal ?? 0;
   const lessonsWindow = data.lessonsLearned?.windowDays ?? 14;
@@ -2688,6 +2817,7 @@ function WorkerHealthPanel({
         <article className="wikiObservabilityCard">
           <header className="wikiObservabilityCardHead">
             <span className="wikiArchiveTag">chat-tasks</span>
+            <MetricScopeTag scope={data.metricScopes?.chatTasks} />
             <h4>对话任务状态</h4>
           </header>
           {chatTotal === 0 ? (
@@ -2732,7 +2862,8 @@ function WorkerHealthPanel({
         <article className="wikiObservabilityCard">
           <header className="wikiObservabilityCardHead">
             <span className="wikiArchiveTag">gap-signals</span>
-            <h4>知识缺口 · 扫描命中率</h4>
+            <MetricScopeTag scope={data.metricScopes?.gapSignals} />
+            <h4>知识缺口 · 历史状态</h4>
           </header>
           <dl className="wikiArchiveMeta">
             <dt>总计</dt>
@@ -2743,9 +2874,11 @@ function WorkerHealthPanel({
             </dd>
             <dt>已处理</dt>
             <dd>{gapResolved}</dd>
-            <dt>命中率</dt>
-            <dd className={gapHitRate >= 0.5 ? "wikiObservabilityDrift" : undefined}>
-              {gapTotal === 0 ? "—" : `${(gapHitRate * 100).toFixed(1)}%`}
+            <dt>历史已解决占比</dt>
+            <dd>
+              {typeof historicalResolvedShare === "number"
+                ? `${(historicalResolvedShare * 100).toFixed(1)}%`
+                : "—"}
             </dd>
           </dl>
           {gapKinds.length > 0 ? (
@@ -2783,6 +2916,7 @@ function WorkerHealthPanel({
         <article className="wikiObservabilityCard">
           <header className="wikiObservabilityCardHead">
             <span className="wikiArchiveTag">lessons-learned</span>
+            <MetricScopeTag scope={data.metricScopes?.lessonsLearned} />
             <h4>经验沉淀（{lessonsWindow}天）</h4>
           </header>
           {lessonsPatterns.length === 0 ? (

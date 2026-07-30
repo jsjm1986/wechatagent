@@ -5,8 +5,9 @@
 //!
 //! 核心不变量（design.md §3.2 / requirements.md R13）：
 //!
-//! 1. **强幂等**：`idempotency_key = sha256(source_event_id:contact_wxid:content_hash)`
-//!    在 `agent_send_outbox` 上有 unique 索引；同一 (source_event, contact, content)
+//! 1. **强幂等**：业务幂等 hash 再由 `(workspace_id, account_id)` 包装为 v2 key，
+//!    在 `agent_send_outbox` 上有 tenant-scoped unique 索引；同一租户账号内的
+//!    (source_event, contact, content)
 //!    多次入队 SHALL 视为 [`EnqueueOutcome::IdempotentSkip`]，不重复发送。
 //! 2. **空 source_event_id 兜底**：跟进任务等场景下 source_event_id 可能为空，
 //!    此时 SHALL 走 `synthetic:run_id:contact_wxid:content_hash` 前缀，并写一条
@@ -180,6 +181,12 @@ pub struct EnqueueRequest {
 /// 由唯一索引兜底；本函数只关心"入队成功 vs 已存在 vs 真错"。
 pub async fn enqueue(state: &AppState, req: EnqueueRequest) -> Result<EnqueueOutcome, OutboxError> {
     // ── 入参校验 ────────────────────────────────────────────────────
+    if req.workspace_id.trim().is_empty() {
+        return Err(OutboxError::Invalid("workspace_id is empty".to_string()));
+    }
+    if req.account_id.trim().is_empty() {
+        return Err(OutboxError::Invalid("account_id is empty".to_string()));
+    }
     if req.contact_wxid.trim().is_empty() {
         return Err(OutboxError::Invalid("contact_wxid is empty".to_string()));
     }
@@ -212,7 +219,7 @@ pub async fn enqueue(state: &AppState, req: EnqueueRequest) -> Result<EnqueueOut
     // source_event_id 非空 → 走 `{source_event_id}:{contact}:{content_hash}` 分支，
     // 媒体 content 为空 → content_hash=sha256("") 对所有素材相同 → 同一入站发两个
     // 不同文件会撞键、第二个被误去重漏发。media_routes_synthetic 把该判定抽成纯函数。
-    let (idempotency_key, used_synthetic) = if media_routes_synthetic(
+    let (legacy_idempotency_key, used_synthetic) = if media_routes_synthetic(
         &req.media_asset_id,
         &req.referral_card_id,
         &req.source_event_id,
@@ -235,12 +242,15 @@ pub async fn enqueue(state: &AppState, req: EnqueueRequest) -> Result<EnqueueOut
         );
         (sha256_hex(key.as_bytes()), false)
     };
+    let idempotency_key =
+        scoped_outbox_idempotency_key(&req.workspace_id, &req.account_id, &legacy_idempotency_key);
 
     if used_synthetic {
         // 警告事件：synthetic 路径不算错误，但运维需要监控其频率（高频 = 跟进
         // 任务设计可能有问题）。
         let _ = write_outbox_event(
             state,
+            &req.workspace_id,
             &req.account_id,
             Some(&req.contact_wxid),
             "outbox_synthetic_idempotency_key",
@@ -309,6 +319,7 @@ pub async fn enqueue(state: &AppState, req: EnqueueRequest) -> Result<EnqueueOut
                 .unwrap_or_else(ObjectId::new);
             let _ = write_outbox_event(
                 state,
+                &req.workspace_id,
                 &req.account_id,
                 Some(&req.contact_wxid),
                 "outbox_created",
@@ -329,7 +340,14 @@ pub async fn enqueue(state: &AppState, req: EnqueueRequest) -> Result<EnqueueOut
         }
         Err(err) if is_duplicate_key_error(&err) => {
             let existing = collection
-                .find_one(doc! { "idempotency_key": &idempotency_key }, None)
+                .find_one(
+                    doc! {
+                        "workspace_id": &req.workspace_id,
+                        "account_id": &req.account_id,
+                        "idempotency_key": &idempotency_key,
+                    },
+                    None,
+                )
                 .await?
                 .ok_or_else(|| {
                     OutboxError::Invariant(format!(
@@ -343,6 +361,7 @@ pub async fn enqueue(state: &AppState, req: EnqueueRequest) -> Result<EnqueueOut
             })?;
             let _ = write_outbox_event(
                 state,
+                &req.workspace_id,
                 &req.account_id,
                 Some(&req.contact_wxid),
                 "outbox_idempotent_skip",
@@ -380,6 +399,33 @@ fn sha256_hex(bytes: &[u8]) -> String {
     out
 }
 
+/// Wrap the pre-tenant business idempotency hash in an unambiguous tenant scope.
+/// Length prefixes prevent delimiter ambiguity. The `v2:` marker makes m038 restart-safe.
+pub(crate) fn scoped_outbox_idempotency_key(
+    workspace_id: &str,
+    account_id: &str,
+    legacy_key: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"outbox-idempotency-v2");
+    for part in [workspace_id, account_id, legacy_key] {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part.as_bytes());
+    }
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        hex.push_str(&format!("{:02x}", byte));
+    }
+    format!("v2:{hex}")
+}
+
+pub(crate) fn is_scoped_outbox_idempotency_key(value: &str) -> bool {
+    value
+        .strip_prefix("v2:")
+        .is_some_and(|digest| digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
 /// 判定 mongodb 错误是否为 DuplicateKey（code 11000 / 11001）。
 fn is_duplicate_key_error(err: &mongodb::error::Error) -> bool {
     match &*err.kind {
@@ -401,6 +447,7 @@ fn is_duplicate_key_error(err: &mongodb::error::Error) -> bool {
 /// （outbox → gateway → outbox）；行为与之等价。
 pub(crate) async fn write_outbox_event(
     state: &AppState,
+    workspace_id: &str,
     account_id: &str,
     contact_wxid: Option<&str>,
     kind: &str,
@@ -414,7 +461,7 @@ pub(crate) async fn write_outbox_event(
         .insert_one(
             AgentEvent {
                 id: None,
-                workspace_id: state.config.default_workspace_id.clone(),
+                workspace_id: workspace_id.to_string(),
                 account_id: account_id.to_string(),
                 contact_wxid: contact_wxid.map(ToString::to_string),
                 kind: kind.to_string(),
@@ -676,6 +723,7 @@ pub async fn cancel_for_decision(
         accepted += 1;
         let _ = write_outbox_event(
             state,
+            &previous.workspace_id,
             &previous.account_id,
             Some(&previous.contact_wxid),
             if was_in_flight {
@@ -710,17 +758,20 @@ pub async fn cancel_for_decision(
 ///
 /// 行为：
 /// * 过滤条件 = `(workspace_id, account_id, contact_wxid, status ∈ {pending,
-///   in_flight})`。`workspace_id` 取 `state.config.default_workspace_id`，与
-///   其它路径一致（W3 阶段单 workspace）。
+///   in_flight})`。调用方必须传入联系人真实 workspace，不允许回落默认租户。
 /// * pending 成功终止写 `outbox_canceled`；in-flight 成功登记请求写
 ///   `outbox_cancel_requested`，绝不提前宣称已取消。
 /// * 返回真正被改动（终止或登记请求）的条数。任何条目的写失败即视为整体错误透传，调用方按
 ///   "best-effort" 处理（reaction 路径只 log，不影响反应记录）。
 pub async fn cancel_for_contact_on_user_reaction(
     state: &AppState,
+    workspace_id: &str,
     account_id: &str,
     contact_wxid: &str,
 ) -> Result<usize, OutboxError> {
+    if workspace_id.trim().is_empty() {
+        return Err(OutboxError::Invalid("workspace_id is empty".to_string()));
+    }
     if account_id.trim().is_empty() {
         return Err(OutboxError::Invalid("account_id is empty".to_string()));
     }
@@ -729,7 +780,6 @@ pub async fn cancel_for_contact_on_user_reaction(
     }
 
     let collection = state.db.collection_agent_send_outbox();
-    let workspace_id = state.config.default_workspace_id.clone();
     let cancelable_statuses: Vec<&str> = [OutboxStatus::Pending, OutboxStatus::InFlight]
         .iter()
         .map(|s| s.as_str())
@@ -741,7 +791,7 @@ pub async fn cancel_for_contact_on_user_reaction(
         "cancelable filter SHALL match outbox_status_is_user_cancelable",
     );
     let filter = doc! {
-        "workspace_id": &workspace_id,
+        "workspace_id": workspace_id,
         "account_id": account_id,
         "contact_wxid": contact_wxid,
         "status": { "$in": &cancelable_statuses },
@@ -758,7 +808,7 @@ pub async fn cancel_for_contact_on_user_reaction(
             .find_one_and_update(
                 doc! {
                     "_id": entry_id,
-                    "workspace_id": &workspace_id,
+                    "workspace_id": workspace_id,
                     "account_id": account_id,
                     "contact_wxid": contact_wxid,
                     "$or": [
@@ -840,6 +890,7 @@ pub async fn cancel_for_contact_on_user_reaction(
         accepted += 1;
         let _ = write_outbox_event(
             state,
+            workspace_id,
             account_id,
             Some(contact_wxid),
             event_kind,
@@ -910,6 +961,26 @@ mod tests {
     fn sha256_hex_distinguishes_inputs() {
         assert_ne!(sha256_hex(b"a"), sha256_hex(b"b"));
         assert_ne!(sha256_hex(b"hello"), sha256_hex(b"hello "));
+    }
+
+    #[test]
+    fn scoped_idempotency_key_is_stable_and_tenant_isolated() {
+        let legacy = sha256_hex(b"evt:wxid:content");
+        let first = scoped_outbox_idempotency_key("ws-a", "acc-a", &legacy);
+        assert_eq!(
+            first,
+            scoped_outbox_idempotency_key("ws-a", "acc-a", &legacy)
+        );
+        assert_ne!(
+            first,
+            scoped_outbox_idempotency_key("ws-b", "acc-a", &legacy)
+        );
+        assert_ne!(
+            first,
+            scoped_outbox_idempotency_key("ws-a", "acc-b", &legacy)
+        );
+        assert!(is_scoped_outbox_idempotency_key(&first));
+        assert!(!is_scoped_outbox_idempotency_key(&legacy));
     }
 
     #[test]

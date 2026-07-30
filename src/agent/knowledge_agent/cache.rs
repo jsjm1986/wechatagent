@@ -2,8 +2,10 @@
 //!
 //! 设计：
 //! - 进程级单例 [`OnceLock`] HashMap，TTL 默认 5 分钟。
-//! - Key = `(workspace_id, account_id, query_normalized, corpus_signature, max_rounds)`；
-//!   `corpus_signature` 由 `list_catalog` 的 chunk_id+updated_at 集合摘要而来，
+//! - Key = `(workspace_id, account_id, provider identity, prompt generation,
+//!   request filter, query_normalized, corpus_signature, max_rounds)`；
+//!   `corpus_signature` 由完整可见语料的
+//!   chunk_id+updated_at 集合摘要而来，
 //!   chunk 任一改动 → signature 变 → 自动失效。
 //! - Value = 完整 [`super::AnswerResult`] 克隆 + insert_at。
 //! - 容量上限 [`MAX_ENTRIES`]，溢出时按"最旧 insert_at"驱逐。
@@ -30,6 +32,11 @@ const MAX_ENTRIES: usize = 256;
 pub(super) struct CacheKey {
     pub workspace_id: String,
     pub account_id: Option<String>,
+    pub provider_id: String,
+    pub provider_model: String,
+    pub provider_generation: u64,
+    pub prompt_pack_version: u64,
+    pub filter_norm: String,
     pub query_norm: String,
     pub corpus_sig: u64,
     pub max_rounds: i32,
@@ -209,6 +216,11 @@ mod tests {
         CacheKey {
             workspace_id: "ws".into(),
             account_id: None,
+            provider_id: "provider".into(),
+            provider_model: "model".into(),
+            provider_generation: 0,
+            prompt_pack_version: 0,
+            filter_norm: "all".into(),
             query_norm: normalize_query(query),
             corpus_sig: 42,
             max_rounds: 3,
@@ -308,6 +320,42 @@ mod tests {
         put(k.clone(), mk_result("a"));
         k.corpus_sig = 99;
         assert!(get(&k).is_none());
+    }
+
+    #[test]
+    fn provider_identity_change_misses() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        clear_for_test();
+        let key = mk_key("same query");
+        put(key.clone(), mk_result("old"));
+
+        let mut changed = key.clone();
+        changed.provider_generation += 1;
+        assert!(get(&changed).is_none());
+
+        changed = key.clone();
+        changed.provider_model = "new-model".to_string();
+        assert!(get(&changed).is_none());
+
+        changed = key;
+        changed.provider_id = "new-provider".to_string();
+        assert!(get(&changed).is_none());
+    }
+
+    #[test]
+    fn request_semantics_change_misses() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        clear_for_test();
+        let key = mk_key("same query");
+        put(key.clone(), mk_result("old"));
+
+        let mut changed = key.clone();
+        changed.filter_norm = "wiki=methodology".to_string();
+        assert!(get(&changed).is_none());
+
+        changed = key;
+        changed.prompt_pack_version += 1;
+        assert!(get(&changed).is_none());
     }
 
     #[test]

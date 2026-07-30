@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { ConfirmProvider, useConfirm } from "../../components/ui/ConfirmDialog";
 import { api } from "../../lib/api";
 import { useAccountStore } from "../../stores/accountStore";
@@ -94,23 +94,74 @@ function cancellationRisk(item: OutboxItem): string {
 function OutboxPanelInner() {
   const accountId = useAccountStore((s) => s.currentAccountId());
   const confirm = useConfirm();
-  const [items, setItems] = useState<OutboxItem[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [err, setErr] = useState("");
+  const [snapshot, setSnapshot] = useState<{ accountId: string; items: OutboxItem[] }>({
+    accountId: "",
+    items: [],
+  });
+  const [status, setStatus] = useState({ accountId: "", loading: false, err: "" });
+  const scopeRef = useRef({ accountId, generation: 0 });
+
+  if (scopeRef.current.accountId !== accountId) {
+    scopeRef.current = {
+      accountId,
+      generation: scopeRef.current.generation + 1,
+    };
+  }
+  const items = snapshot.accountId === accountId
+    ? snapshot.items.filter((item) => item.accountId === accountId)
+    : [];
+  const loading = status.accountId === accountId && status.loading;
+  const err = status.accountId === accountId ? status.err : "";
 
   const load = useCallback(async () => {
-    setLoading(true);
-    setErr("");
+    const requestedAccountId = accountId;
+    const generation = ++scopeRef.current.generation;
+    setStatus({ accountId: requestedAccountId, loading: true, err: "" });
+    if (!requestedAccountId) {
+      setSnapshot({ accountId: "", items: [] });
+      setStatus({ accountId: "", loading: false, err: "" });
+      return;
+    }
     try {
-      const qs = accountId ? `?accountId=${encodeURIComponent(accountId)}` : "";
+      const qs = `?accountId=${encodeURIComponent(requestedAccountId)}`;
       const data = await api.get<{ items: OutboxItem[] }>(
         `/api/admin/outbox${qs}`
       );
-      setItems(data.items || []);
+      if (
+        scopeRef.current.generation !== generation ||
+        scopeRef.current.accountId !== requestedAccountId ||
+        useAccountStore.getState().currentAccountId() !== requestedAccountId
+      ) return;
+      const nextItems = data.items || [];
+      if (nextItems.some((item) => item.accountId !== requestedAccountId)) {
+        setSnapshot({ accountId: requestedAccountId, items: [] });
+        setStatus({
+          accountId: requestedAccountId,
+          loading: false,
+          err: "发件箱响应账号与当前账号不一致，已拒绝显示。",
+        });
+        return;
+      }
+      setSnapshot({ accountId: requestedAccountId, items: nextItems });
     } catch (e) {
-      setErr(e instanceof Error ? e.message : String(e));
+      if (
+        scopeRef.current.generation !== generation ||
+        scopeRef.current.accountId !== requestedAccountId
+      ) return;
+      setStatus({
+        accountId: requestedAccountId,
+        loading: false,
+        err: e instanceof Error ? e.message : String(e),
+      });
     } finally {
-      setLoading(false);
+      if (
+        scopeRef.current.generation === generation &&
+        scopeRef.current.accountId === requestedAccountId
+      ) {
+        setStatus((current) => current.accountId === requestedAccountId
+          ? { ...current, loading: false }
+          : current);
+      }
     }
   }, [accountId]);
 
@@ -119,6 +170,12 @@ function OutboxPanelInner() {
   }, [load]);
 
   async function cancel(item: OutboxItem) {
+    if (
+      !accountId ||
+      item.accountId !== accountId ||
+      useAccountStore.getState().currentAccountId() !== accountId
+    ) return;
+    const scope = { ...scopeRef.current };
     const identity = payloadIdentity(item.payload);
     const ok = await confirm({
       title: "确认取消这条发送？",
@@ -134,15 +191,35 @@ function OutboxPanelInner() {
       tone: "danger",
       confirmText: item.status === "in_flight" ? "请求取消" : "确认取消",
     });
-    if (!ok) return;
-    setErr("");
+    if (
+      !ok ||
+      scopeRef.current.generation !== scope.generation ||
+      scopeRef.current.accountId !== scope.accountId ||
+      item.accountId !== scope.accountId ||
+      useAccountStore.getState().currentAccountId() !== scope.accountId
+    ) return;
+    setStatus({ accountId: scope.accountId, loading: false, err: "" });
     try {
       await api.post(`/api/admin/outbox/${item.id}/cancel`, {
+        expectedAccountId: item.accountId,
         cancelReason: "admin_outbox_panel_cancel",
       });
+      if (
+        scopeRef.current.generation !== scope.generation ||
+        scopeRef.current.accountId !== scope.accountId ||
+        useAccountStore.getState().currentAccountId() !== scope.accountId
+      ) return;
       await load();
     } catch (e) {
-      setErr(e instanceof Error ? e.message : String(e));
+      if (
+        scopeRef.current.generation !== scope.generation ||
+        scopeRef.current.accountId !== scope.accountId
+      ) return;
+      setStatus({
+        accountId: scope.accountId,
+        loading: false,
+        err: e instanceof Error ? e.message : String(e),
+      });
     }
   }
 

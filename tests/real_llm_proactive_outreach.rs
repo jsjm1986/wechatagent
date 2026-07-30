@@ -314,7 +314,7 @@ async fn r2_5_2_planner_silent_followup_real_outreach() {
         return;
     };
     let judge = judge_client();
-    let app = TestApp::start().await;
+    let app = TestApp::start_repl_set().await;
     let mcp = start_mcp_mock().await;
     let state = common::rebuild_app_state_with_real_llm(&app, agent_llm, mcp.uri());
 

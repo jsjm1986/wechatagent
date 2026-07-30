@@ -12,7 +12,9 @@
   "promptKey": "user.reply",
   "promptTokens": 800,
   "runId": "run-1",
+  "runMode": "live",
   "status": "success",
   "totalTokens": 1000,
+  "usageKnown": true,
   "workspaceId": "ws-1"
 }

@@ -202,24 +202,29 @@ async fn lookup_dict(
     kind: &str,
     trimmed: &str,
     scope_account_id: &str,
-) -> DictLookup {
+) -> Result<DictLookup, String> {
     use crate::agent::taxonomy::{check_value, global_taxonomy_cache, kind_has_entries};
     let cache = global_taxonomy_cache(db);
-    cache.find_or_load(db, workspace_id).await;
-    match match_to_dict(check_value(
-        workspace_id,
-        kind,
-        trimmed,
-        scope_account_id,
-        &cache,
-    )) {
-        // check_value 对「字典空」与「值越界」都回 CandidateNew→Miss，这里用 kind_has_entries
-        // 细分：该 kind 无任何条目 → KindUnconfigured（未配置）。同一 cache，无中途 reload。
-        DictLookup::Miss if !kind_has_entries(workspace_id, kind, scope_account_id, &cache) => {
-            DictLookup::KindUnconfigured
-        }
-        other => other,
-    }
+    cache
+        .find_or_load(db, workspace_id)
+        .await
+        .map_err(|error| format!("taxonomy unavailable: {error}"))?;
+    Ok(
+        match match_to_dict(check_value(
+            workspace_id,
+            kind,
+            trimmed,
+            scope_account_id,
+            &cache,
+        )) {
+            // check_value 对「字典空」与「值越界」都回 CandidateNew→Miss，这里用 kind_has_entries
+            // 细分：该 kind 无任何条目 → KindUnconfigured（未配置）。同一 cache，无中途 reload。
+            DictLookup::Miss if !kind_has_entries(workspace_id, kind, scope_account_id, &cache) => {
+                DictLookup::KindUnconfigured
+            }
+            other => other,
+        },
+    )
 }
 
 /// DB 薄壳：查 registry + 字典，委托 classify_validation。未知 kind → 直通信任。
@@ -241,7 +246,10 @@ pub(crate) async fn validate_dimension_value(
     }
     // 非 Taxonomy 源不查字典（Miss 占位，CodeEnum/FreeText 分支不看 dict）。
     let dict = if matches!(spec.value_source, ValueSource::Taxonomy) {
-        lookup_dict(db, workspace_id, kind, raw.trim(), scope_account_id).await
+        match lookup_dict(db, workspace_id, kind, raw.trim(), scope_account_id).await {
+            Ok(dict) => dict,
+            Err(reason) => return DimValidation::Reject(reason),
+        }
     } else {
         DictLookup::Miss
     };

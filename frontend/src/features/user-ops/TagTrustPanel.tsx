@@ -23,7 +23,7 @@ export default function TagTrustPanel({
   onSaveManualTags
 }: {
   contact: Contact;
-  onSaveManualTags: (tags: string[]) => void;
+  onSaveManualTags: (contact: Contact, tags: string[]) => void;
 }) {
   const manualTags = contact.manualTags || [];
   const confirmedTags = contact.confirmedTags || [];
@@ -43,7 +43,7 @@ export default function TagTrustPanel({
       .split(/[,，]/)
       .map((t) => t.trim())
       .filter((t) => t.length > 0);
-    onSaveManualTags(tags);
+    onSaveManualTags(contact, tags);
     setEditing(false);
   };
 

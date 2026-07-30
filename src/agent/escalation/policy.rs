@@ -1,7 +1,7 @@
 //! ask_human 策略解析（纯函数）：ask_human_policy 存在则用它；否则回落旧
 //! principal_decider/high_risk_escalation_mode 字段映射（字节等价红线④）。无 IO。
 
-use crate::models::{AskHumanQuietHours, DeciderRef, OperationDomainConfig};
+use crate::models::{AskHumanPolicy, AskHumanQuietHours, DeciderRef, OperationDomainConfig};
 
 /// 解析后的请示策略（运行时唯一权威；旧字段仅 None 时兜底）。
 #[derive(Debug, Clone, PartialEq)]
@@ -40,6 +40,7 @@ pub(crate) fn resolve_ask_human_policy(config: &OperationDomainConfig) -> Resolv
             vec![DeciderRef {
                 wxid: w,
                 display_name: None,
+                account_id: None,
             }]
         })
         .unwrap_or_default();
@@ -53,6 +54,57 @@ pub(crate) fn resolve_ask_human_policy(config: &OperationDomainConfig) -> Resolv
         daily_push_cap: None,
         quiet_hours: None,
         timeout_hours: None,
+    }
+}
+
+/// Resolve a policy snapshot frozen on an escalation. Unlike the config resolver,
+/// this never consults legacy/current domain fields, so later config edits cannot
+/// change an in-flight escalation.
+pub(crate) fn resolve_ask_human_policy_snapshot(policy: &AskHumanPolicy) -> ResolvedAskHumanPolicy {
+    ResolvedAskHumanPolicy {
+        decider_chain: policy.decider_chain.clone(),
+        escalate_safety_guard: policy.escalate_safety_guard,
+        escalate_unverified_product: policy.escalate_unverified_product,
+        escalate_ai_policy_hold: policy.escalate_ai_policy_hold,
+        escalate_stuck: policy.escalate_stuck,
+        dedupe_window_hours: policy.dedupe_window_hours,
+        daily_push_cap: policy.daily_push_cap,
+        quiet_hours: policy.quiet_hours.clone(),
+        timeout_hours: policy.timeout_hours,
+    }
+}
+
+/// Freeze the resolved policy and bind every legacy account-less decider to the
+/// account that owns the triggering customer. New admin writes reject missing
+/// account ids; this fallback exists only for pre-account-binding configurations.
+pub(crate) fn freeze_ask_human_policy(
+    resolved: &ResolvedAskHumanPolicy,
+    legacy_account_id: &str,
+) -> AskHumanPolicy {
+    AskHumanPolicy {
+        decider_chain: resolved
+            .decider_chain
+            .iter()
+            .cloned()
+            .map(|mut decider| {
+                if decider
+                    .account_id
+                    .as_deref()
+                    .is_none_or(|value| value.trim().is_empty())
+                {
+                    decider.account_id = Some(legacy_account_id.to_string());
+                }
+                decider
+            })
+            .collect(),
+        escalate_safety_guard: resolved.escalate_safety_guard,
+        escalate_unverified_product: resolved.escalate_unverified_product,
+        escalate_ai_policy_hold: resolved.escalate_ai_policy_hold,
+        escalate_stuck: resolved.escalate_stuck,
+        dedupe_window_hours: resolved.dedupe_window_hours,
+        daily_push_cap: resolved.daily_push_cap,
+        quiet_hours: resolved.quiet_hours.clone(),
+        timeout_hours: resolved.timeout_hours,
     }
 }
 
@@ -181,6 +233,7 @@ mod tests {
             decider_chain: vec![DeciderRef {
                 wxid: "leader1".into(),
                 display_name: None,
+                account_id: Some("acc1".into()),
             }],
             escalate_safety_guard: true,
             escalate_unverified_product: true,
@@ -210,10 +263,12 @@ mod tests {
                 DeciderRef {
                     wxid: "leader1".into(),
                     display_name: None,
+                    account_id: Some("acc1".into()),
                 },
                 DeciderRef {
                     wxid: "leader2".into(),
                     display_name: None,
+                    account_id: Some("acc1".into()),
                 },
             ],
             escalate_safety_guard: true,
@@ -249,6 +304,7 @@ mod tests {
             decider_chain: vec![DeciderRef {
                 wxid: "leader1".into(),
                 display_name: None,
+                account_id: Some("acc1".into()),
             }],
             escalate_safety_guard: true,
             escalate_unverified_product: true,
@@ -306,6 +362,7 @@ mod tests {
             decider_chain: vec![DeciderRef {
                 wxid: "alice".into(),
                 display_name: Some("决策人A".into()),
+                account_id: Some("acc1".into()),
             }],
             escalate_safety_guard: true,
             escalate_unverified_product: false,
@@ -368,10 +425,12 @@ mod tests {
             DeciderRef {
                 wxid: "a".into(),
                 display_name: None,
+                account_id: Some("acc1".into()),
             },
             DeciderRef {
                 wxid: "b".into(),
                 display_name: None,
+                account_id: Some("acc1".into()),
             },
         ];
         // 当前 a，已等 25h > 24h → 转 b
@@ -392,10 +451,12 @@ mod tests {
             DeciderRef {
                 wxid: "a".into(),
                 display_name: None,
+                account_id: Some("acc1".into()),
             },
             DeciderRef {
                 wxid: "b".into(),
                 display_name: None,
+                account_id: Some("acc1".into()),
             },
         ];
         // timeout_hours=None → 无限等待，永不转
@@ -412,10 +473,12 @@ mod tests {
             DeciderRef {
                 wxid: "a".into(),
                 display_name: None,
+                account_id: Some("acc1".into()),
             },
             DeciderRef {
                 wxid: "b".into(),
                 display_name: None,
+                account_id: Some("acc1".into()),
             },
         ];
         // 当前 principal "ghost" 不在链中、已超时 → 回落链首 a。
@@ -435,10 +498,12 @@ mod tests {
             DeciderRef {
                 wxid: "a".into(),
                 display_name: None,
+                account_id: Some("acc1".into()),
             },
             DeciderRef {
                 wxid: "b".into(),
                 display_name: None,
+                account_id: Some("acc1".into()),
             },
         ];
         assert_eq!(
@@ -470,14 +535,17 @@ mod tests {
             DeciderRef {
                 wxid: "leader_a".into(),
                 display_name: None,
+                account_id: Some("acc1".into()),
             },
             DeciderRef {
                 wxid: "customer_x".into(),
                 display_name: None,
+                account_id: Some("acc1".into()),
             }, // 误配=客户
             DeciderRef {
                 wxid: "leader_c".into(),
                 display_name: None,
+                account_id: Some("acc1".into()),
             },
         ];
         // 当前 leader_a 超时，下一位是被误配的 customer_x → 必须跳过，改派给 leader_c。
@@ -497,10 +565,12 @@ mod tests {
             DeciderRef {
                 wxid: "leader_a".into(),
                 display_name: None,
+                account_id: Some("acc1".into()),
             },
             DeciderRef {
                 wxid: "customer_x".into(),
                 display_name: None,
+                account_id: Some("acc1".into()),
             },
         ];
         assert_eq!(

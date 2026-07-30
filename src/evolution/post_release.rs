@@ -81,19 +81,13 @@ pub async fn schedule_post_release_review(
     proposal_kind: &str,
     released_at: BsonDateTime,
 ) -> Result<(), EvolutionError> {
-    let scheduled_at = released_at_plus_hours(released_at, REVIEW_WINDOW_HOURS);
-    let doc = doc! {
-        "proposal_id": proposal_id,
-        "workspace_id": workspace_id,
-        "account_id": account_id,
-        "proposal_kind": proposal_kind,
-        "released_at": released_at,
-        "scheduled_at": scheduled_at,
-        "completed": false,
-        "actual_send_success_rate_delta": null,
-        "actual_5gate_hit_delta": doc! {},
-        "completed_at": null,
-    };
+    let doc = post_release_review_document(
+        proposal_id,
+        workspace_id,
+        account_id,
+        proposal_kind,
+        released_at,
+    );
     state
         .db
         .raw()
@@ -104,12 +98,42 @@ pub async fn schedule_post_release_review(
     Ok(())
 }
 
+/// Durable +24h review intent inserted by release transactions. Keeping the
+/// document constructor here makes the transactional and compatibility paths
+/// share one schema.
+pub(crate) fn post_release_review_document(
+    proposal_id: ObjectId,
+    workspace_id: &str,
+    account_id: &str,
+    proposal_kind: &str,
+    released_at: BsonDateTime,
+) -> Document {
+    let scheduled_at = released_at_plus_hours(released_at, REVIEW_WINDOW_HOURS);
+    doc! {
+        "proposal_id": proposal_id,
+        "workspace_id": workspace_id,
+        "account_id": account_id,
+        "proposal_kind": proposal_kind,
+        "protocol_version": 1,
+        "released_at": released_at,
+        "scheduled_at": scheduled_at,
+        "completed": false,
+        "actual_send_success_rate_delta": null,
+        "actual_5gate_hit_delta": doc! {},
+        "completed_at": null,
+    }
+}
+
 /// 扫一次 `scheduled_at <= now AND completed=false` 的待评测条目，逐条计算
 /// 24h 前/后窗口的 outcomes 切片差，落字段，置 `completed=true`，并写一条
 /// `agent_events kind="evolution_post_release_review"`。
 ///
 /// 返回本次完成的条目数（用于 tick 事件 summary）。
-pub async fn run_due_reviews(state: &AppState) -> Result<usize, EvolutionError> {
+pub async fn run_due_reviews(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+) -> Result<usize, EvolutionError> {
     let now = BsonDateTime::now();
     let mut cursor = state
         .db
@@ -117,6 +141,8 @@ pub async fn run_due_reviews(state: &AppState) -> Result<usize, EvolutionError> 
         .collection::<Document>("post_release_reviews")
         .find(
             doc! {
+                "workspace_id": workspace_id,
+                "account_id": account_id,
                 "completed": false,
                 "scheduled_at": { "$lte": now },
             },
@@ -395,8 +421,11 @@ pub(crate) async fn compute_negative_reaction_rate(
         .await
         .map_err(EvolutionError::from)?;
 
-    let profile =
-        crate::agent::domain_profile::load_active_domain_profile(&state.db, workspace_id).await;
+    let profile = crate::agent::domain_profile::load_active_domain_profile(&state.db, workspace_id)
+        .await
+        .map_err(|error| {
+            EvolutionError::Internal(format!("load active domain profile: {error}"))
+        })?;
     let (positive, negative) = resolve_effective_polarity(&profile.outcome_polarity);
 
     let mut hits: i64 = 0;

@@ -167,6 +167,7 @@ pub(super) async fn review_referral_card(
         };
         if let Err(e) = crate::agent::write_event_for_account(
             &state,
+            &admin.current_workspace,
             &account_id,
             None,
             "referral_card.reviewed",
@@ -226,6 +227,7 @@ pub(super) async fn toggle_referral_card(
         };
         if let Err(e) = crate::agent::write_event_for_account(
             &state,
+            &admin.current_workspace,
             &account_id,
             None,
             "referral_card.toggled",
@@ -287,6 +289,7 @@ pub(super) async fn delete_referral_card(
         };
         if let Err(e) = crate::agent::write_event_for_account(
             &state,
+            &admin.current_workspace,
             &account_id,
             None,
             "referral_card.deleted",

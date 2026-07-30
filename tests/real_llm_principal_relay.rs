@@ -426,6 +426,8 @@ fn pending_escalation(
         reason: "客户要求超出标准 9 折权限的特批折扣".to_string(),
         question_for_principal: "客户想要九折并要求仅此一次，是否同意？".to_string(),
         principal_wxid: principal_wxid.to_string(),
+        // 本套件聚焦已裁决后的客户 relay，不驱动首卡投递/超时改派协议。
+        protocol: None,
         decision: None,
         authorization_expires_at: None,
         is_generalizable: false,
@@ -434,6 +436,11 @@ fn pending_escalation(
         updated_at: now,
         resolved_at: None,
         resolved_via: None,
+        relay_state: None,
+        relay_task_id: None,
+        relay_enqueued_at: None,
+        relay_terminal_at: None,
+        relay_terminal_reason: None,
         last_holding_reply_ms: None,
         last_pushed_at_ms: None,
     }

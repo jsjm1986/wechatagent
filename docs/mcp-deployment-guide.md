@@ -19,7 +19,7 @@
 MCP_BASE_URL=http://117.72.54.28:3001
 
 # MCP API Key（用于调用 MCP 工具和验证 Webhook 签名）
-MCP_API_KEY=gwa_ba60a98aada58c10b77f6f20841c77c6c3c0506d9431871f
+MCP_API_KEY=<INJECT_FROM_SECRET_STORE>
 
 # Webhook 签名验证（可选，默认为 true）
 WEBHOOK_VERIFY_SIGNATURE=true
@@ -54,7 +54,7 @@ WEBHOOK_VERIFY_SIGNATURE=true
 
 ```bash
 curl -X POST http://117.72.54.28:3001/mcp \
-  -H "Authorization: Bearer gwa_ba60a98aada58c10b77f6f20841c77c6c3c0506d9431871f" \
+  -H "Authorization: Bearer $MCP_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "jsonrpc": "2.0",

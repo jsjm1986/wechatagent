@@ -143,7 +143,7 @@ async fn record_user_reaction_inner(
     // 让 reaction prompt 随 profile 声明轨迹维度（避免新增第二次 load）。
     let active_profile =
         crate::agent::domain_profile::load_active_domain_profile(&state.db, &contact.workspace_id)
-            .await;
+            .await?;
     let active_polarity = active_profile.outcome_polarity.clone();
     let active_traj_dims = active_profile.trajectory_dimensions.clone();
     let reaction_analysis = if budget_exceeded {
@@ -275,8 +275,13 @@ async fn record_user_reaction_inner(
     // 在用户已经表态"别再发了"之后继续推进过期决策。Best-effort：取消失败
     // 仅记录 warning，不影响 reaction 记录主路径成功落地。
     if outbox::outcome_signals_stop(&outcome_for_outbox) {
-        match outbox::cancel_for_contact_on_user_reaction(state, &contact.account_id, &contact.wxid)
-            .await
+        match outbox::cancel_for_contact_on_user_reaction(
+            state,
+            &contact.workspace_id,
+            &contact.account_id,
+            &contact.wxid,
+        )
+        .await
         {
             Ok(count) if count > 0 => {
                 tracing::info!(
@@ -311,18 +316,9 @@ async fn analyze_user_reaction(
     traj_dims: &[crate::models::TrajectoryDimension],
 ) -> AppResult<Document> {
     let memory = load_or_create_operating_memory(state, contact).await?;
-    let system = prompts::load_prompt(
-        &state.db,
-        &state.config.default_workspace_id,
-        "user.reaction.system",
-    )
-    .await?;
-    let task = prompts::load_prompt(
-        &state.db,
-        &state.config.default_workspace_id,
-        "user.reaction.task",
-    )
-    .await?;
+    let system =
+        prompts::load_prompt(&state.db, &contact.workspace_id, "user.reaction.system").await?;
+    let task = prompts::load_prompt(&state.db, &contact.workspace_id, "user.reaction.task").await?;
     // universal-domain-adaptation 第 18 点：active profile 声明了非销售域极性时，在 task
     // 之后追加一段本域 outcome 词表说明，引导模型按本行业语义判 outcomeStatus（而非套用
     // 写死的销售七态）。DEFAULT/老库（polarity == 销售默认）时返回 None → prompt 字节等价。
@@ -361,6 +357,7 @@ async fn analyze_user_reaction(
     );
     let value = generate_agent_json(
         state,
+        &contact.workspace_id,
         Some(&contact.account_id),
         Some(&contact.wxid),
         run_id,

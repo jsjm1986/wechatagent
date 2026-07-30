@@ -58,7 +58,7 @@ pub(in crate::routes) async fn get_operation_knowledge_catalog(
 /// `GET /api/operation-knowledge/catalog/persisted` —— knowledge-wiki Phase E：
 /// 读 `documents.catalog_summary_persisted` 持久化快照，O(1)。
 ///
-/// 返回每个 active document 的 `id / title / catalogVersion / catalogSummaryPersisted`。
+/// 返回每个 active document 的快照和 desired/applied generation freshness。
 /// 若 catalog_rebuild_worker 还没跑过 → `catalogSummaryPersisted=null`，
 /// 调用方应回退到 `/catalog`（live 聚合）。
 pub(in crate::routes) async fn get_operation_knowledge_catalog_persisted(
@@ -91,11 +91,17 @@ pub(in crate::routes) async fn get_operation_knowledge_catalog_persisted(
         .await?;
     let mut documents = Vec::new();
     while let Some(d) = cursor.try_next().await? {
+        let catalog_fresh = d.catalog_summary_persisted.is_some()
+            && d.catalog_desired_generation > 0
+            && d.catalog_applied_generation == d.catalog_desired_generation;
         documents.push(json!({
             "id": d.id.map(|id| id.to_hex()).unwrap_or_default(),
             "title": d.title,
             "catalogVersion": d.catalog_version,
             "catalogSummaryPersisted": d.catalog_summary_persisted,
+            "catalogDesiredGeneration": d.catalog_desired_generation,
+            "catalogAppliedGeneration": d.catalog_applied_generation,
+            "catalogFresh": catalog_fresh,
             "updatedAt": crate::models::dt_to_string(d.updated_at).unwrap_or_default(),
         }));
     }
@@ -657,7 +663,7 @@ pub async fn build_operation_knowledge_completeness(
     // 逐字 seed capability/pricing/caseEvidence/effectClaims/deliveryBoundary →
     // 行为字节等价（命中初值规则 + prompt JSON 骨架下方按同序生成）。
     let active_profile =
-        crate::agent::domain_profile::load_active_domain_profile(&state.db, workspace_id).await;
+        crate::agent::domain_profile::load_active_domain_profile(&state.db, workspace_id).await?;
     // 维度初值规则（DEFAULT 销售域逐字复刻原 fallback）：维度声明的 initial_signal
     // 决定初值由哪个客观计数驱动——"verified" 跟随「有 verified 切片」、"evidence" 跟随
     // 「有 evidence 切片」、None/未知 → 恒 false（保守缺失，原 pricing + 未知维度行为）。
@@ -743,11 +749,14 @@ pub async fn build_operation_knowledge_completeness(
         serde_json::to_string(&summaries).unwrap_or_default(),
         serde_json::to_string(&pending).unwrap_or_default()
     );
-    let audit = state
-        .llm
-        .generate_json(system, &user)
-        .await
-        .unwrap_or(fallback);
+    let generated = match &state.llm_registry {
+        Some(registry) => match registry.snapshot(workspace_id).await {
+            Ok(snapshot) => snapshot.generate_json(system, &user).await,
+            Err(error) => Err(error),
+        },
+        None => state.llm.generate_json(system, &user).await,
+    };
+    let audit = generated.unwrap_or(fallback);
     let resolved_mode =
         json_string(&audit, "answeringMode").unwrap_or_else(|| fallback_mode.to_string());
     // 认知状态闸：有任何待审定草稿就绝不宣称 fully_supported（见 [`clamp_answering_mode`]）。
@@ -807,6 +816,7 @@ mod tests {
                 key: "symptom".to_string(),
                 display_name: "症状".to_string(),
                 required: false,
+                review_topic_aliases: vec![],
                 anchor_hint: None,
                 initial_signal: None,
             },
@@ -814,6 +824,7 @@ mod tests {
                 key: "treatmentPlan".to_string(),
                 display_name: "治疗方案".to_string(),
                 required: false,
+                review_topic_aliases: vec![],
                 anchor_hint: None,
                 initial_signal: None,
             },
@@ -843,6 +854,7 @@ mod tests {
                 key: "a".to_string(),
                 display_name: "A".to_string(),
                 required: false,
+                review_topic_aliases: vec![],
                 anchor_hint: Some("锚点A".to_string()),
                 initial_signal: None,
             },
@@ -850,6 +862,7 @@ mod tests {
                 key: "b".to_string(),
                 display_name: "B".to_string(),
                 required: false,
+                review_topic_aliases: vec![],
                 anchor_hint: None,
                 initial_signal: None,
             },
@@ -857,6 +870,7 @@ mod tests {
                 key: "c".to_string(),
                 display_name: "C".to_string(),
                 required: false,
+                review_topic_aliases: vec![],
                 anchor_hint: Some("锚点C".to_string()),
                 initial_signal: None,
             },
@@ -909,6 +923,7 @@ mod tests {
             key: "consultation_stage".to_string(),
             display_name: "咨询阶段".to_string(),
             required: false,
+            review_topic_aliases: vec![],
             anchor_hint: None,
             initial_signal: None,
         }];

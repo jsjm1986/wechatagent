@@ -4,8 +4,8 @@ import { api } from "../../lib/api";
 import styles from "./AccountLogin.module.css";
 
 interface LoginBeginResponse {
-  login_session_id: string;
-  qr_code_base64?: string;
+  session_id: string;
+  qr_data_url?: string;
   login_page_url?: string;
   status?: string;
 }
@@ -28,14 +28,20 @@ export function AccountLogin({ onLoggedIn }: { onLoggedIn?: () => void }) {
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<{ wxid?: string; nickName?: string } | null>(null);
   const pollTimer = useRef<number | null>(null);
+  const loginGeneration = useRef(0);
 
   useEffect(() => {
     return () => {
+      loginGeneration.current += 1;
       if (pollTimer.current) window.clearTimeout(pollTimer.current);
     };
   }, []);
 
   const beginLogin = async () => {
+    const generation = loginGeneration.current + 1;
+    loginGeneration.current = generation;
+    if (pollTimer.current) window.clearTimeout(pollTimer.current);
+    const frozenAccountAlias = accountAlias.trim();
     setError(null);
     setSuccess(null);
     setQrDataUrl(null);
@@ -44,28 +50,35 @@ export function AccountLogin({ onLoggedIn }: { onLoggedIn?: () => void }) {
     setBusy(true);
     try {
       const data = await api.post<LoginBeginResponse>("/api/accounts/login/begin", {
-        accountAlias: accountAlias.trim() || undefined,
+        accountAlias: frozenAccountAlias || undefined,
         loginType,
         loginFlow,
       });
-      setQrDataUrl(data.qr_code_base64 || null);
+      if (loginGeneration.current !== generation) return;
+      if (!data.session_id) {
+        throw new Error("login response missing session_id");
+      }
+      setQrDataUrl(data.qr_data_url || null);
       setLoginPageUrl(data.login_page_url || null);
-      setSessionId(data.login_session_id);
-      if (data.login_session_id) startPolling(data.login_session_id);
+      setSessionId(data.session_id);
+      startPolling(data.session_id, frozenAccountAlias, generation);
     } catch (e) {
+      if (loginGeneration.current !== generation) return;
       setError(e instanceof Error ? e.message : "发起登录失败");
     } finally {
-      setBusy(false);
+      if (loginGeneration.current === generation) setBusy(false);
     }
   };
 
-  const startPolling = (sid: string) => {
+  const startPolling = (sid: string, frozenAccountAlias: string, generation: number) => {
+    if (loginGeneration.current !== generation) return;
     setPolling(true);
     const poll = async () => {
       try {
         const params = new URLSearchParams({ loginSessionId: sid });
-        if (accountAlias.trim()) params.append("accountAlias", accountAlias.trim());
+        if (frozenAccountAlias) params.append("accountAlias", frozenAccountAlias);
         const data = await api.get<LoginPollResponse>(`/api/accounts/login/poll?${params}`);
+        if (loginGeneration.current !== generation) return;
         if (data.status === "success") {
           setSuccess({ wxid: data.wxid, nickName: data.nick_name });
           setPolling(false);
@@ -75,7 +88,7 @@ export function AccountLogin({ onLoggedIn }: { onLoggedIn?: () => void }) {
           } catch {
             /* 同步失败不阻断登录成功提示，用户可手动点同步 */
           }
-          onLoggedIn?.();
+          if (loginGeneration.current === generation) onLoggedIn?.();
         } else if (data.status === "pending") {
           pollTimer.current = window.setTimeout(poll, 2500);
         } else {
@@ -83,6 +96,7 @@ export function AccountLogin({ onLoggedIn }: { onLoggedIn?: () => void }) {
           setPolling(false);
         }
       } catch (e) {
+        if (loginGeneration.current !== generation) return;
         setError(e instanceof Error ? e.message : "轮询失败");
         setPolling(false);
       }
@@ -91,6 +105,7 @@ export function AccountLogin({ onLoggedIn }: { onLoggedIn?: () => void }) {
   };
 
   const reset = () => {
+    loginGeneration.current += 1;
     if (pollTimer.current) window.clearTimeout(pollTimer.current);
     setQrDataUrl(null);
     setLoginPageUrl(null);

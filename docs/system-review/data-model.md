@@ -13,16 +13,16 @@
 
 | 分组 | 主要集合 | 租户/业务键 | 已确认约束与生命周期 |
 |---|---|---|---|
-| 账号与联系人 | `wechat_accounts`, `contacts`, `roster_snapshots` | `(workspace_id, account_id)`；contact 再加 `wxid` | account/contact/roster 均有复合唯一键，但单联系人 enable 按裸 account_id 校验（SR-080）；导入缺失身份字段会覆盖为 null（SR-081）；纳管状态与画像任务无事务/generation（SR-082/SR-083）；contact 的 outcome product 路径有 multikey 索引 |
-| 消息与任务 | `conversation_messages`, `agent_tasks`, `agent_events`, `import_jobs` | workspace/account/contact；message/task/event 幂等键 | message_id/dedupe partial unique；AgentTask 仅有 claimed_at、无 owner/generation fencing（SR-034）；outcome aggregation partial unique 缺 workspace（SR-036）；ImportJob 有 lease 但无 owner/generation fencing，终态 24h TTL（SR-136） |
-| 可靠发送 | `agent_send_outbox`, `agent_send_ledger` | account/contact/run/source event | outbox `idempotency_key` unique，含 lease/retry/pacing/finalize 索引；ledger 虽存 account 但查询/索引多处省略，且无 outbox delivery 唯一锚（SR-050）；名片恢复无送达核对（SR-052）；`in_flight` 取消无 generation/cancel token，不能阻止在途发送与后置副作用（SR-066） |
-| Agent 配置 | `agent_souls`, `prompt_templates`, `operation_playbooks`, `operation_domain_configs`, `operation_state_policies` | workspace + logical key + version | prompt version unique，但手动发布拆分 status/current 且物删历史（SR-055）；ops version unique、current 辅助索引非 unique（SR-008）；Soul 无 version/published unique，发布物删历史且非事务（SR-053）；Playbook 原地覆写且 default 无唯一/原子指针（SR-070/SR-071）；Operation Domain reset 物删全历史后再插默认（SR-074）；Guide 可在无服务端范围授权/typed validation 下直接改共享 Playbook 与 Domain runtime（SR-093/SR-094） |
+| 账号与联系人 | `wechat_accounts`, `contacts`, `roster_snapshots` | `(workspace_id, account_id)`；contact 再加 `wxid` | account/contact/roster 均有复合唯一键；单联系人 enable 已按 workspace+account 校验。导入为字段存在性 patch；批量纳管以 enrollment token、Contact CAS 与 durable initial-profile intent 防半提交/迟到复活；contact 的 outcome product 路径有 multikey 索引。 |
+| 消息与任务 | `conversation_messages`, `agent_tasks`, `agent_events`, `import_jobs` | workspace/account/contact；message/task/event 幂等键 | message_id/dedupe partial unique；AgentTask 所有权修复见 SR-034；outcome aggregation 的 partial unique 与迁移去重均含 workspace（SR-036，已部署并完成部署后 `rs0` 验证）；ImportJob claim 使用 generation+token fencing，终态 24h TTL（SR-136，已部署并完成部署后验证）。 |
+| 可靠发送 | `agent_send_outbox`, `agent_send_ledger` | workspace/account/contact/run/source event | Outbox v2 幂等身份与唯一索引均含 `(workspace_id, account_id)`，DuplicateKey 回读、账号 pacing 和 Reaction stop 取消也使用完整租户 scope（SR-025/026/027 已部署并完成真实 `rs0` 验证）；含 lease/retry/pacing/finalize 索引。Ledger 的剩余归因/送达锚问题见 SR-050；名片恢复无送达核对见 SR-052；在途取消与远端边界竞态见 SR-066。 |
+| Agent 配置 | `agent_souls`, `prompt_templates`, `operation_playbooks`, `operation_domain_configs`, `operation_state_policies` | workspace + logical key + version | ops Domain/Policy 保留多版本历史，版本键 unique、logical scope 的 current 为 partial unique；publish/rollout/rollback 用副本集事务切换，异常零/多 current 读侧 fail-closed。Prompt/Soul/Playbook/Domain reset 的独立生命周期问题见各自 SR。 |
 | 记忆与审查 | `operating_memories`, `memory_candidates`, `agent_decision_reviews`, `agent_run_logs`, `llm_call_logs`, `user_operation_guide_previews` | workspace/account/contact/run | operating memory 每 contact unique；run_id 索引；诊断日志默认 30d TTL；Guide preview 只有查询索引，无 base versions/hash、actor 或 committed outcome，旧候选可重放到新基线且提交后读失败会伪装业务失败（SR-058/SR-091/SR-095） |
-| 知识核心 | `operation_knowledge_documents`, `operation_knowledge_chunks`, `chunk_revisions`, `knowledge_usage_logs`, `knowledge_gap_signals`, `domain_schemas`, `domain_profiles`, `catalog_rebuild_jobs` | workspace/account/domain/document/chunk | revision/gap/job 幂等或唯一键；usage 35d TTL；chunk 按状态、类型、有效期、置信度索引；domain schema active 索引非 unique且删除按最新判断后删全血缘（SR-056）；domain profile 的 version/current/active 索引非 unique（SR-043），画像激活与状态机/policy/联系人迁移无统一提交（SR-072），高风险确认不绑定不可变候选（SR-073）；生成 JSON 键规范化可因 UTF-8 切片 panic（SR-089），raw draft 又被默认列表、统一人审与发布卡共同隐藏（SR-090） |
+| 知识核心 | `operation_knowledge_documents`, `operation_knowledge_chunks`, `chunk_revisions`, `knowledge_usage_logs`, `knowledge_gap_signals`, `domain_schemas`, `domain_profiles`, `catalog_rebuild_jobs` | workspace/account/domain/document/chunk | revision/gap/job 幂等或唯一键；usage 35d TTL；chunk 按状态、类型、有效期、置信度索引；catalog intent 与 revision/父文档 desired generation 同事务，worker 以 token/generation/lease fencing 原子推进 applied generation并暴露 freshness；domain schema/profile 与其它剩余风险见对应 SR。 |
 | 知识工作站 | `knowledge_chat_turns`, `knowledge_daily_reports`, `knowledge_chat_tasks`, `knowledge_operator_memory` | workspace/account/session/operator/date | 日报每天每账号 unique；task pending scan；operator memory `expires_at` TTL |
-| 字典与建议 | `system_taxonomies`, `taxonomy_candidates`, `relationship_type_suggestions`, `suspected_deal_signals` | workspace/scope/kind/value/contact | taxonomy canonical version unique，但 alias 无唯一归属（SR-046），合并既有 canonical 可假 approved（SR-061）；candidate 行唯一但同 run 双写使 occurrences 失真（SR-045）；relationship suggestion 全量 unique 使终态永久封口且 approve 非原子（SR-059/SR-060）；suspected deal 只对 pending partial unique，但 CAS-first 后续失败不可恢复（SR-057） |
-| 产品与活动 | `products`, `campaigns`, `campaign_sends` | workspace(+account)+product/campaign/contact | product id tenant unique；campaign send `(campaignId, contactWxid)` unique，但 CampaignSend→Task→Campaign 终态没有事务、generation 或 reconciler（SR-076）；preview 可把 completed 重开且 dry-run 写生产数据（SR-075）；Campaign BSON 为 camelCase |
-| 管理与请示 | `management_agent_sessions`, `management_agent_messages`, `agent_command_runs`, `agent_tool_calls`, `agent_principal_escalations` | workspace/account/session/contact | Management command/tool 只有普通 running→终态写，无 actor、lease、resume cursor 或幂等 intent（SR-058/SR-064）；short_code unique；pending escalation 去重键缺 account（SR-040），实体缺 domain/领导原文（SR-037/SR-041）；推送时间在真实送达前写入（SR-038）；resolved 与 relay task 非原子且无 durable intent（SR-054） |
+| 字典与建议 | `system_taxonomies`, `taxonomy_candidates`, `relationship_type_suggestions`, `suspected_deal_signals` | workspace/scope/kind/value/contact | taxonomy canonical version unique且每 logical value 的 current 为 partial unique，版本切换使用事务；alias 无唯一归属（SR-046），合并既有 canonical 可假 approved（SR-061）；candidate 行唯一但同 run 双写使 occurrences 失真（SR-045）；其它建议/成交闭环见对应 SR。 |
+| 产品与活动 | `products`, `campaigns`, `campaign_sends` | workspace(+account)+product/campaign/generation/contact | product id tenant unique；Campaign 草稿以 `specVersion/specHash` CAS 编辑，preview 零写；首次 dispatch 冻结 generation/spec/意图/受众。campaign send `(campaignId, contactWxid)` unique并以 `prepared→enqueued` 绑定确定性 task；task 先 `committing` 后放行为 `pending`，周期 reconciler 收敛中断点；Campaign BSON 为 camelCase。 |
+| 管理与请示 | `management_agent_sessions`, `management_agent_messages`, `agent_command_runs`, `agent_tool_calls`, `agent_principal_escalations` | workspace/account/session/contact/domain/policy-version/delivery-generation | short_code 全局 unique；pending escalation 以 `(workspace_id, account_id, contact_wxid, category)` partial unique；请示同行冻结 domain、policy、领导发送账号与卡片正文。每代卡片通过确定性 Outbox source id 投递，只有 `sent` 对账后写 `last_pushed_at_ms`；裁决同行持久化 relay intent/task id，客户转述送达或授权过期后写 `relay_state=terminal`。Contact 以 escalation id 集合维护 awaiting owner，单条终结不会误清其它等待项。Management command 冻结 workspace/account/plan hash 与 execution token；tool call 以 scoped partial-unique intent、`prepared→executing→terminal|execution_unknown` 状态机防止未知副作用自动重放。 |
 | 演化 | `experiments`, `proposals`, `shadow_replays`, `threshold_overrides`, `threshold_overrides_audit`, `post_release_reviews`, `evolution_runtime_flags` | workspace/account/experiment/proposal/gate | experiment id unique；proposal/replay/release 查询索引；audit append-only；prompt replay 源消息与历史/当前对照不满足隔离和单变量比较（SR-049）；worker 只消费 default scope（SR-085）；proposal 不冻结 base、rollback 不验证发布所有权（SR-086/SR-087）；post-release review 无唯一 intent/claim/finalize（SR-088） |
 | 认证与 provider | `admin_users`, `admin_sessions`, `llm_provider_configs` | username/session/workspaceId/providerId | username/session/provider tenant unique；session TTL；provider BSON camelCase，密钥明文模型字段 |
 | 采集与评测 | `behavior_signals`, `behavior_signal_metrics`, `ingest_sources`, `agent_outcome_metrics`, `evaluation_scenarios` | signal 仅 workspace/contact，遗漏 account；其余按 date/source/scenario | signal dedupe partial unique 也遗漏 account（SR-137）；source/scenario unique；outcome metrics TTL 默认 90d |
@@ -31,13 +31,13 @@
 
 | 实体 | 闭集 |
 |---|---|
-| `AgentTask.status` | `pending`, `running`, `retry`, `failed`, `cancelled`, `sent`, `completed`, `outbox_enqueued` |
+| `AgentTask.status` | `pending`, `running`, `committing`, `retry`, `failed`, `cancelled`, `sent`, `completed`, `outbox_enqueued` |
 | `ImportJob.status` | `pending`, `running`, `completed`, `failed` |
 | `Campaign.status` | `draft`, `previewed`, `confirmed`, `dispatching`, `completed`, `canceled` |
 | `AgentCommandRun.status` | `running`, `pending_confirmation`, `succeeded`, `failed`, `dry_run`, `canceled`（模型无集中闭集断言） |
 | `AgentToolCall.status` | `running`, `dry_run`, `succeeded`, `failed`, `executed_unverified` |
 | `KnowledgeChatTask.status` | `pending`, `running`, `completed`, `failed`, `cancelled` |
-| principal escalation | status=`pending|resolved`；verdict=`approved|rejected|conditional|deferred|delegated_back` |
+| principal escalation | status=`pending|resolved|delivery_failed`；card delivery=`pending_enqueue|queued|sent|failed_terminal|delivery_unknown`；relay=`pending|enqueued|terminal`；verdict=`approved|rejected|conditional|deferred|delegated_back` |
 | outbox（模型注释/索引） | `pending`, `in_flight`, `sent`, `failed_terminal`, `canceled`；写点待阶段 4 反查 |
 
 ## 迁移演进摘要
@@ -49,17 +49,17 @@
 | 版本与清理 | m009–m015 | prompt/ops 多版本、知识字段、开发期清理、state policy、active-version 字段 |
 | 多租户与状态 | m016–m019 | workspace 回填、task 去重、domain attributes 回填、state flags |
 | 行业字典 | m020–m028 | purchase lifecycle、churn、dormant、value tier、relationship、ask-human、trust、conversation mode |
+| 可靠性收口 | m029–m049 | 联系人身份、发送/版本协议、review cycle、请示 account-scoped pending 索引、principal awaiting owner 回填、ops 三表单-current收敛，以及旧 m043 marker 数据库的 Prompt planning-current 纠正重跑 |
 | 数据修复 | m029–m032 | contact identity、outcome 默认值、escalation push 时间、taxonomy workspace |
 
 ## 已确认的契约裂缝
 
 - m009 的 active/current 选择不符合注释，见 SR-007。
-- ops 三表 current partial index不唯一，见 SR-008。
 - m029 roster 回填映射丢失 tenant/account 维度，见 SR-009。
 - production guard 返回成功后仍记 marker，见 SR-010。
-- principal escalation 虽存 account，却在匹配与 pending 去重中丢失该维度，见 SR-040。
-- escalation 不保存 domain 与不可变领导原文，导致 timeout 策略串域及模型解释无法作为真人授权的可验证来源，见 SR-037、SR-041。
-- `last_pushed_at_ms`/`last_holding_reply_ms` 不是可靠送达事实，裸 MCP 与无 claim scanner 的裂缝见 SR-038、SR-039。
+- m049 以独立 marker 复用 m043 的 Prompt 全表 validation-before-write；2026-07-25 生产升级后 planning-only `group.policy`/`moment.policy` 保持 draft 且不再是 current，见 [生产发布记录](production-release-2026-07-25.md)。
+- principal escalation 的 account/domain/policy/delivery 身份已在 HC-013 收口；旧行由 m046/m047 审计或精确回填，不猜测旧 resolved 历史。
+- `last_pushed_at_ms` 现在只由 Outbox `sent` 事实写入；`last_holding_reply_ms` 仍是安抚节流时钟，不代表业务送达凭据。
 - `domain_profiles` 的 version/current/active 都没有数据库唯一约束，且生效切换为非事务多步写，见 SR-043。
 - `ProfileDimension.kind` 没有 Mongo 路径/保留名约束，开放信号与 `domain_attributes` 系统状态共用命名空间，见 SR-044。
 - taxonomy candidate 的 occurrences 被 Decision/Gateway 双写，正式 alias 又没有同 kind 唯一 claim，见 SR-045、SR-046。
@@ -76,27 +76,27 @@
 - suspected deal 在业务校验前 CAS approved，关系 suggestion 则先写 contact 后无 CAS 提交审核状态；两者均缺可恢复的 processing/intent，见 SR-057、SR-059。
 - Taxonomy/relationship/suspected-deal 审核主体来自客户端 reviewedBy，正式成交 marked_by 也继承该值，见 SR-058。
 - relationship suggestion 的终态行占用全量 unique 槽，后续新证据无法形成新 pending；taxonomy 合并既有 canonical 则提交 approved 但不写 raw alias，见 SR-060、SR-061。
-- Management 动态 MCP 透传允许裸 `message_send_text` 绕过生产 Gateway/Outbox，静态 Dangerous 分类又默认不触发代码确认门，见 SR-062、SR-063。
-- `agent_command_runs` / `agent_tool_calls` 没有可恢复执行协议；副作用与终态审计分离，崩溃后会留下永久 running 或不确定重放，见 SR-064。
-- Management 的 `write_deal_events` 把 LLM 参数缺省提升为 `staff_confirmed` 正式成交，见 SR-065；其真实 admin 身份丢失并入 SR-058。
+- Management 原始 `message_send_*` 已从动态目录剔除并在执行兜底拒绝；主动发送只走生产 Gateway/Review/Outbox。所有真实副作用默认要求代码层确认，未知工具 fail-closed；见 SR-062、SR-063 的修复证据。
+- `agent_command_runs` 冻结 account/plan hash 并持有 owner lease；`agent_tool_calls` 以 scoped partial-unique intent 和 CAS 状态机提交。崩溃遗留的 `executing` 收敛为 `execution_unknown` 且禁止自动重放，见 SR-064 的修复证据。
+- Management 的 `write_deal_events` 只允许显式确认路径传入真实认证管理员，LLM 仅起草 payload；`staff_confirmed.marked_by` 固定为认证用户名，见 SR-065 的修复证据。
 - Outbox 允许把 `in_flight` 标 canceled，却没有 generation/cancel token 阻止已运行 worker 发送及 finalize，见 SR-066。
 - Ask-Human 聚合遗漏 suspected deal，summary 又把数据库计数错误降为 0，见 SR-067、SR-068。
 - `operation_playbooks` 的 version 只是原地覆写计数，联系人绑定不按 version 冻结；default 由无事务多步写维护且没有唯一约束，见 SR-070、SR-071。
 - DomainProfile 激活跨 profile、state machine、state policy 与 contacts 顺序 best-effort 写，确认 intent 又没有内容 hash/version/actor/TTL，见 SR-072、SR-073。
 - Operation Domain reset 先删除该 logical domain 的所有版本再插默认，历史与恢复锚均不存在，见 SR-074。
-- Campaign preview 是隐藏写操作且不守终态；前端复用 draft 时又不保存后续编辑的 spec，见 SR-075、SR-077。
-- `campaign_sends` 唯一键只占去重位，不能原子绑定可 claim task 或 campaign 汇总；崩溃、补偿失败与并发可留下孤儿或重复执行，见 SR-076。
+- Campaign preview/草稿/dispatch 已按 HC-021 分离：preview 零写，草稿 PATCH 带 version CAS，dispatch 绑定 preview hash 并冻结受众；SR-075、SR-077 已修复，Mongo 副作用红线待 Docker 环境复验。
+- `campaign_sends` 已成为逐目标 durable intent，并与 deterministic task、generation 和后台 reconciler 组成可恢复提交协议；SR-076 已完成代码与协议单测，待真实 Mongo/worker 崩溃复验。
 - 自治监控以多次非快照计数拼接同一响应，且 run/outbox/revision 查询与现有索引形状不一致并含 contact N+1，见 SR-078、SR-079。
-- 单联系人 enable 丢失 workspace 账号维度，导入 helper 又把缺失身份字段解释为 null 覆盖，见 SR-080、SR-081。
-- 批量纳管先写 managed 再建画像任务，画像结果也没有 enrollment generation，失败会半提交且晚到任务可复活已禁用联系人，见 SR-082、SR-083。
-- 联系人列表为正式前端请求的最多 500 行逐条查询最新消息，见 SR-084。
+- 单联系人 enable 已按 workspace+account 隔离，账号注册与 self-wxid 判断使用联系人同一租户身份；SR-080 已正式部署，并以跨 workspace 同 account、外域 self-wxid 恰等于目标联系人的真实 Cookie Router 反例完成部署后 `rs0` 验证。共享导入 helper 使用字段存在性 patch，缺失/null 身份字段不再覆盖旧值，见 SR-081 修复证据。
+- 批量纳管已改为 `committing intent → Contact CAS → pending task` 的可恢复提交协议；画像写回由 enrollment token + task claim generation fencing，disable/hide 旋转代际并退休旧任务，见 SR-082、SR-083 修复证据。
+- 联系人列表已按当前页 wxid 一次聚合最新入站消息，删除逐联系人查询，见 SR-084 修复证据。
 - Evolution runtime flag 是 workspace 级，但唯一 worker、proposal 生成与 auto-release 固定 default workspace/account，见 SR-085。
 - Evolution proposal 未保存不可变评估基线，Prompt rollback 也不验证当前版本仍由该 proposal 拥有，见 SR-086、SR-087。
 - Evolution 生产提交后的 event 与 post-release review intent 不在同一提交协议，review scanner 又无 claim/CAS 且先终态后事件，见 SR-088。
 - `threshold_overrides` 允许同一 `source_proposal_id` 出现多条 active 行，Proposal 也不保存唯一 release outcome/generation；并发发布可重复生成覆盖，而 rollback 的 `update_one` 无法证明全部产物已失效，见 SR-133。
 - `agent_tasks` 对 Planner `kind=follow_up` 没有 business intent/dedupe key；现有任务唯一索引只覆盖 `outcome_aggregation`。`agent_events.dedupe_key` 虽有 partial unique，但 Planner 不写该字段，且 task/event 分步提交，无法为主动触达提供幂等所有权，见 SR-135。
 - Planner 的账号/分段“每日配额”没有独立持久模型；共享 cap靠当日 emit event 事后计数，calendar/renewal/reactivation 的专属 cap只是函数内计数器。模型无法原子证明某日某 scope/segment 已占用多少配额，见 SR-135。
-- `import_jobs` 的 `locked_until` 只表达时间，不保存 claim owner/token/generation；超时恢复并被新 worker 重新置为 running 后，旧执行的 heartbeat、progress 与终态写会再次满足同一个 status filter，见 SR-136。
+- `import_jobs` 已为每次 claim 持久化单调 `claim_generation` 与不可复用 `claim_token`；heartbeat、progress、终态和 stale scanner 的恢复 CAS 均绑定冻结所有权，旧执行不能覆盖重领后的新代次。m056 负责 legacy generation 的 fail-closed 幂等初始化，见 SR-136（真实副本集红线已通过，待部署）。
 - `behavior_signals` 的实体身份和 dedupe key 都没有 `account_id`，而 Contact 以 `(workspace_id,account_id,wxid)` 唯一；同 workspace 跨账号信号可碰撞，未碰撞样本也无法按账号归因，见 SR-137。
 - 行业画像生成会递归改写不受信任的 JSON 键，但以字符序号作为 UTF-8 字节偏移切片，非 ASCII 键可在草稿写入前触发 panic，见 SR-089。
 - AI 与手工 DomainProfile 草稿都写 `current_version=false`，而默认列表、Ask-Human collector 与发布卡读取链只接受 current，导致正式人审与发布路径不可达，见 SR-090。
@@ -118,16 +118,16 @@
 - 导入没有持久化 candidate/apply intent 或文档—Chunk 原子提交边界；准入仍依赖已删除的 items 实体，文档、Chunk 与 revision 可形成半提交和重复集合，见 SR-112。
 - `OperationKnowledgeChunk` 的通用 revision patch 仍可改写 `workspace_id/account_id/document_id/domain/status/integrity_status`；replacement filter 用旧 workspace、replacement 本体却可带新 workspace，模型身份和审核状态没有不可变约束，见 SR-113。
 - `ChunkRevision` 没有 workspace、committed state、before/after snapshot 或 current-generation 外键；写协议先 insert revision 后 replace 主行，且 provenance 参与 hash，使未提交动作与相同内容重复动作都可能进入正式 timeline，见 SR-114。
-- `catalog_rebuild_jobs` 只有 queued/processing/done/failed 与 started/finished 时间，没有 worker token、locked_until、desired/applied generation 或重试计划；processing 崩溃行与 failed 行都没有恢复协议，见 SR-115。
-- `KnowledgeUsageLog` 已持久化 workspace/account/contact 三维，`Contact` 也以 `(workspace_id,account_id,wxid)` 唯一；成交追认却在内存降维成 `(workspace_id,contact_wxid)`，让账号隔离在派生统计中丢失，见 SR-116。
-- `IngestSource` 没有 generation、next_run_at、claim owner/token/lease；checkpoint finalize 仅按 source_id 更新，无法拒绝旧 URL/旧状态的晚到结果，也无法阻止多 worker 同时导入，见 SR-117。
+- `catalog_rebuild_jobs` 已具备 queued/processing/done/superseded/discarded/failed 闭集、owner/token/claim generation、lease heartbeat、过期回收、有界退避和 desired/applied generation fencing；m052 为历史文档补 reconciliation intent，读侧以 `catalogFresh` 区分陈旧快照。SR-115 已进入正式 ELF，并完成部署后副本集动态验证。
+- `KnowledgeUsageLog` 持久化 workspace/account/contact 三维，`Contact` 以 `(workspace_id,account_id,wxid)` 唯一；成交追认现按 `(account_id,contact_wxid)` 分组并以完整三元身份读取 Contact。SR-116 已正式部署，候选与部署后同 wxid 双账号动态红线均证明归因不跨账号。
+- `IngestSource` 已具备配置 `source_generation` 与 claim owner/token/generation/lease；管理员更新递增配置代次并撤销旧 claim，Worker 原子领取、heartbeat、过期回收，并以完整配置快照和有效 claim fencing 所有终态。内容变化时知识图与 checkpoint 同事务提交，旧 URL/旧 owner 晚到会整批回滚；m053 幂等补齐历史代次。SR-117 已进入正式 ELF，并完成部署后副本集动态验证。
 - Catalog persisted/live API 没有共享响应模型：后端分别返回 `{documents}` 与 `{item}`，正式前端自定义 `{total,items}`/`{total}` 并把未知形状回落为 0，见 SR-118。
 - `KnowledgeDailyReport` 以 `(workspace_id,account_id,report_date)` 唯一，但同一行同时充当最近 attempt 与成功快照；失败/超预算 upsert 会把既有 cards 覆盖为空，模型没有 run generation、last-success 指针或可保留的 partial artifacts，见 SR-121。
-- Digest 的 Chunk 扫描、定时调度和 Prompt 读取没有共享的 tenant-scope 模型：定时任务只跑默认 workspace/account，health 查询遗漏 `account_id=null` 的共享知识，Prompt 又固定默认 workspace，见 SR-119。
+- Digest 已统一 tenant-scope：启用后的定时 helper 枚举所有持久 `(workspace_id,account_id)` 并逐账号隔离失败；Chunk health 可见域为当前账号私有行加 `account_id=null` 的 workspace 共享行；compose/summarize Prompt、LLM 审计、run 与报告读写继承同一真实 scope。SR-119 已正式部署并完成候选及部署后动态红线；当前环境仍配置 `KNOWLEDGE_DIGEST_ENABLED=false`，代码能力上线不等于运营启用。
 - Digest 配置持久契约声明 token/call 上限，执行模型却固定构造 `RunBudget(24000,8)`；报告中的 budget snapshot 记录硬编码限制而非部署配置，见 SR-120。
 - `KnowledgeChatTask` 只有 pending/running/terminal 状态与 started/finished 时间，没有 claim owner/token、lease、heartbeat、attempt、generation 或 next-step cursor；`completed_steps` 也没有唯一 step identity/committed outcome 约束，见 SR-122。
 - `StepOutcome` 没有 typed success/failure 状态，多个业务失败被编码为 Rust `Ok`，再落成 `completed_steps.status=ok`；模型无法区分“成功”“跳过”“需手工处理”和“副作用失败”，见 SR-123。
-- Digest cardId 的确定性输入不含 workspace/account，dismiss 写侧也不按 account 过滤；因此三元隔离只存在报告主键，卡片级 mutation identity 会在同 workspace 多账号间碰撞，见 SR-124。
+- Digest cardId 已由 `account_id + report_date + canonical card semantics` 稳定派生；直接 dismiss 使用 workspace+account+date+cardId，fenced Worker 使用 Task workspace+account（及报告日期）提交。SR-124 已正式部署；部署后同 cardId 双账号 Router/Worker 红线证明非目标日报完整 BSON 不变。
 - `KnowledgeChatTask.cards` 只是由请求 `cardIds` best-effort 反查的快照，`planned_steps` 没有 candidate id/hash、report generation 或 card→action→target 外键；Chat 正式路径可提交空 cards，客户端 targetChunkId 仍被直接持久化，任务模型无法证明执行内容来自运营选中的卡片，见 SR-125。
 - Knowledge 的测试证据没有独立的 immutable evaluation run/item 或 committed mutation outcome：离线评测把 expected Chunk id直接注入 mock 输出，闭环测试直接写 verified/关系/取代终态，Worker 测试又以 Rust `Ok` 代替业务成功；现有绿色结果不能作为召回率、维护闭环或 step outcome 的持久事实，见 SR-126。
 - Knowledge Ask 的 SSE 协议没有封闭业务终态模型：`TraceEvent::Step` 同时承载普通进度与 Agent failure，传输层 `close` 又同时结束成功、取消和失败；前端无法从类型上证明一次流已得到 answer 或 failed outcome。响应也不携带 `maxRounds`，导致 UI 将运行上限另写成 3，见 SR-127。

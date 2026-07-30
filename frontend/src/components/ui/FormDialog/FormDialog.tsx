@@ -50,6 +50,7 @@ export function FormDialogProvider({ children }: { children: ReactNode }) {
     setOpts(null);
     setValues({});
   }, []);
+  const close = useCallback(() => settle(null), [settle]);
 
   const missingRequired =
     !!opts &&
@@ -62,7 +63,7 @@ export function FormDialogProvider({ children }: { children: ReactNode }) {
   return (
     <FormDialogContext.Provider value={form}>
       {children}
-      <Overlay open={!!opts} onClose={() => settle(null)} labelledBy="formDialogTitle">
+      <Overlay open={!!opts} onClose={close} labelledBy="formDialogTitle">
         {opts && (
           <form
             className={styles.box}

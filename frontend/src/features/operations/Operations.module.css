@@ -56,6 +56,7 @@
 
 /* LLM 成本统计卡 */
 .usageGrid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 18px; }
+.usageScope { margin: 0 0 10px; color: var(--ink-3); font-size: 12px; }
 .usageCard {
   border-radius: var(--r-md); padding: 16px 18px;
   background: var(--surface-card); border: 1px solid var(--hairline);

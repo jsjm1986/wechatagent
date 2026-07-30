@@ -34,7 +34,7 @@ pub async fn active_view(
         &state.db,
         &admin.current_workspace,
     )
-    .await;
+    .await?;
 
     // 2) 维度声明（camelCase wire）。
     let dimensions: Vec<Value> = profile
@@ -83,7 +83,7 @@ pub async fn active_view(
     let cache = crate::agent::taxonomy::global_taxonomy_cache(&state.db);
     cache
         .find_or_load(&state.db, &admin.current_workspace)
-        .await;
+        .await?;
 
     // 5) 逐 kind 建取值字典 {kind: [{id, label}]}。scope 第二参传 current_workspace：
     //    dimension_values_with_labels 在 account 私有 scope 未命中时回落 global，

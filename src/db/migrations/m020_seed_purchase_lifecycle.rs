@@ -151,6 +151,7 @@ pub(super) fn example_profile_with_lifecycle(workspace_id: &str) -> crate::model
     // draft：不自动生效。引导/审核层 publish+activate 时再翻这两个标志。
     profile.is_active = false;
     profile.current_version = false;
+    profile.release_status = "draft".to_string();
     profile.seeded_by = Some("g1_migration".to_string());
     profile
 }
@@ -165,6 +166,11 @@ async fn seed_example_profile(db: &Database, now: DateTime) -> AppResult<()> {
     let mut profile = example_profile_with_lifecycle(workspace_id);
     profile.created_at = now;
     profile.updated_at = now;
+    crate::models::validate_domain_profile_dimensions(&profile).map_err(|error| {
+        crate::error::AppError::External(format!(
+            "invalid seeded domain profile dimensions: {error}"
+        ))
+    })?;
     let mut doc_to_set = mongodb::bson::to_document(&profile)?;
     doc_to_set.remove("_id");
     let result = collection

@@ -63,24 +63,25 @@ async fn authenticate_does_not_leak_user_existence() {
             .is_ok(),
         "正确凭据应成功"
     );
+    app.cleanup().await;
 }
 
 /// 设计意图:create_session 的 current_workspace 三级回退
-/// default_workspace → workspaces.first() → fallback。
+/// authorized default_workspace → workspaces.first() → fallback。
 #[tokio::test]
 #[ignore]
 async fn create_session_workspace_fallback_chain() {
     let app = TestApp::start().await;
     let db = &app.state.db;
 
-    // ① 有 default_workspace → 用它
+    // ① default_workspace 在 ACL 内 → 用它
     let u1 = AdminUser {
         user_id: "u1".into(),
         username: "u1".into(),
         password_hash: "x".into(),
         created_at: chrono::Utc::now(),
         last_login_at: None,
-        workspaces: vec!["ws_list_first".into()],
+        workspaces: vec!["ws_default".into(), "ws_list_first".into()],
         default_workspace: Some("ws_default".into()),
     };
     let s1 = create_session(db, &u1, 24, "ws_fallback")
@@ -88,9 +89,20 @@ async fn create_session_workspace_fallback_chain() {
         .expect("s1");
     assert_eq!(s1.current_workspace.as_deref(), Some("ws_default"));
 
+    // default_workspace 已从 ACL 移除 → 不得继续授予，改用首个 ACL workspace。
+    let stale_default = AdminUser {
+        workspaces: vec!["ws_list_first".into()],
+        ..u1.clone()
+    };
+    let stale = create_session(db, &stale_default, 24, "ws_fallback")
+        .await
+        .expect("stale default session");
+    assert_eq!(stale.current_workspace.as_deref(), Some("ws_list_first"));
+
     // ② 无 default、有 workspaces → 用 workspaces.first()
     let u2 = AdminUser {
         default_workspace: None,
+        workspaces: vec!["ws_list_first".into()],
         ..u1.clone()
     };
     let s2 = create_session(db, &u2, 24, "ws_fallback")
@@ -98,16 +110,15 @@ async fn create_session_workspace_fallback_chain() {
         .expect("s2");
     assert_eq!(s2.current_workspace.as_deref(), Some("ws_list_first"));
 
-    // ③ 都无 → 用 fallback
+    // ③ 空 ACL 是完整撤权，不再回落默认 workspace。
     let u3 = AdminUser {
         default_workspace: None,
         workspaces: vec![],
         ..u1.clone()
     };
-    let s3 = create_session(db, &u3, 24, "ws_fallback")
-        .await
-        .expect("s3");
-    assert_eq!(s3.current_workspace.as_deref(), Some("ws_fallback"));
+    let s3 = create_session(db, &u3, 24, "ws_fallback").await;
+    app.cleanup().await;
+    assert!(matches!(s3, Err(AuthError::NoAuthorizedWorkspace)));
 }
 
 /// 红线：真实过期 session lookup 必须返回 SessionExpired；活跃 session 登出保持幂等。
@@ -229,4 +240,5 @@ async fn switch_workspace_rejects_outside_acl() {
             "ACL 内的 workspace 不应触发 ACL 拒绝,实际 {e:?}"
         );
     }
+    app.cleanup().await;
 }

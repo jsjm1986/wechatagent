@@ -72,7 +72,7 @@ async fn read_profile_and_stage(
     stage_id: &str,
 ) -> anyhow::Result<(String, Vec<String>)> {
     let workspace_id = &app.state.config.default_workspace_id;
-    let profile = load_active_domain_profile(&app.state.db, workspace_id).await;
+    let profile = load_active_domain_profile(&app.state.db, workspace_id).await?;
     let stages = normalize_target_stages(
         &app.state.db,
         workspace_id,
@@ -108,10 +108,10 @@ async fn exercise_interleaved_databases(
     // Warm both databases before reading the first one. With the old shared
     // cache, B's warm-up overwrote A and the following A read returned B's
     // profile/taxonomy. Repeat in reverse order to cover both directions.
-    init_global_domain_profile_cache(&app_a.state.db).await;
-    init_global_taxonomy_cache(&app_a.state.db).await;
-    init_global_domain_profile_cache(&app_b.state.db).await;
-    init_global_taxonomy_cache(&app_b.state.db).await;
+    init_global_domain_profile_cache(&app_a.state.db).await?;
+    init_global_taxonomy_cache(&app_a.state.db).await?;
+    init_global_domain_profile_cache(&app_b.state.db).await?;
+    init_global_taxonomy_cache(&app_b.state.db).await?;
 
     let (profile, stages) = read_profile_and_stage(app_a, STAGE_A).await?;
     evidence.a_profiles.push(profile);
@@ -121,10 +121,10 @@ async fn exercise_interleaved_databases(
     evidence.b_profiles.push(profile);
     evidence.b_stages.push(stages);
 
-    init_global_domain_profile_cache(&app_b.state.db).await;
-    init_global_taxonomy_cache(&app_b.state.db).await;
-    init_global_domain_profile_cache(&app_a.state.db).await;
-    init_global_taxonomy_cache(&app_a.state.db).await;
+    init_global_domain_profile_cache(&app_b.state.db).await?;
+    init_global_taxonomy_cache(&app_b.state.db).await?;
+    init_global_domain_profile_cache(&app_a.state.db).await?;
+    init_global_taxonomy_cache(&app_a.state.db).await?;
 
     let (profile, stages) = read_profile_and_stage(app_b, STAGE_B).await?;
     evidence.b_profiles.push(profile);

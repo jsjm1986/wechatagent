@@ -9,6 +9,7 @@
 //! （min_hits）且强证据累积（min_strong_evidence）双达标。
 
 use crate::models::{BayesianPoint, BayesianSignal};
+use std::collections::HashSet;
 
 /// 槽位上限：最多同时正式占用 6 个观察维度。
 pub const MAX_BAYESIAN_SLOTS: usize = 6;
@@ -69,10 +70,12 @@ pub fn apply_bayesian_update(
     signals: &mut Vec<BayesianSignal>,
     observed: &[ObservedDimension],
     turn: i32,
+    source_run_id: &str,
     th: &SlotPromotionThreshold,
 ) {
+    let observed = normalize_observed_dimensions(observed);
     // 第一遍：更新已有信号或新建观察线，并截断 history。
-    for obs in observed {
+    for obs in &observed {
         // 强证据由代码侧据消息方向客观判定：本轮锚定客户 Inbound 消息的证据 >=1 即标记强证据点。
         let reason = if obs.strong_evidence_count >= 1 {
             Some(STRONG_POINT_MARKER.to_string())
@@ -80,12 +83,20 @@ pub fn apply_bayesian_update(
             None
         };
         if let Some(sig) = signals.iter_mut().find(|s| s.dimension == obs.dimension) {
+            if sig
+                .history
+                .iter()
+                .any(|point| point.source_run_id.as_deref() == Some(source_run_id))
+            {
+                continue;
+            }
             let value_changed = sig.current_value != obs.value;
             let confidence_changed = (sig.current_confidence - obs.confidence).abs() > f64::EPSILON;
             sig.current_value = obs.value.clone();
             sig.current_confidence = obs.confidence;
             sig.history.push(BayesianPoint {
                 turn,
+                source_run_id: Some(source_run_id.to_string()),
                 value: obs.value.clone(),
                 confidence: obs.confidence,
                 value_changed,
@@ -103,6 +114,7 @@ pub fn apply_bayesian_update(
                 locked: false,
                 history: vec![BayesianPoint {
                     turn,
+                    source_run_id: Some(source_run_id.to_string()),
                     value: obs.value.clone(),
                     confidence: obs.confidence,
                     value_changed: false,
@@ -134,6 +146,37 @@ pub fn apply_bayesian_update(
             }
         }
     }
+}
+
+/// Collapse one run to at most one observation per dimension. Repeated equal
+/// values keep the highest confidence and a single strong-evidence bit;
+/// conflicting values make the whole dimension ambiguous and contribute no
+/// hit. Order follows the first occurrence so slot allocation stays stable.
+fn normalize_observed_dimensions(observed: &[ObservedDimension]) -> Vec<ObservedDimension> {
+    let mut normalized: Vec<ObservedDimension> = Vec::new();
+    let mut conflicted = HashSet::new();
+    for item in observed {
+        if conflicted.contains(&item.dimension) {
+            continue;
+        }
+        if let Some(existing) = normalized
+            .iter_mut()
+            .find(|existing| existing.dimension == item.dimension)
+        {
+            if existing.value != item.value {
+                normalized.retain(|existing| existing.dimension != item.dimension);
+                conflicted.insert(item.dimension.clone());
+                continue;
+            }
+            existing.confidence = existing.confidence.max(item.confidence);
+            existing.strong_evidence_count = existing
+                .strong_evidence_count
+                .max(item.strong_evidence_count);
+            continue;
+        }
+        normalized.push(item.clone());
+    }
+    normalized
 }
 
 #[cfg(test)]
@@ -178,6 +221,7 @@ mod tests {
                     strong_evidence_count: 1,
                 }],
                 turn,
+                &format!("run-{turn}"),
                 &th,
             );
         }
@@ -206,6 +250,7 @@ mod tests {
                     strong_evidence_count: 1,
                 }],
                 0,
+                &format!("run-{d}"),
                 &th,
             );
         }
@@ -232,6 +277,7 @@ mod tests {
                     strong_evidence_count: 0,
                 }],
                 turn,
+                &format!("run-{turn}"),
                 &th,
             );
         }
@@ -256,10 +302,74 @@ mod tests {
                     strong_evidence_count: 1,
                 }],
                 turn,
+                &format!("run-{turn}"),
                 &th,
             );
         }
         let sig2 = signals2.iter().find(|s| s.dimension == "决策角色").unwrap();
         assert!(sig2.locked, "代码侧强证据累积达标即占槽，与 LLM 低置信无关");
+    }
+
+    #[test]
+    fn same_run_same_dimension_counts_once_and_retry_is_idempotent() {
+        let th = SlotPromotionThreshold {
+            min_hits: 2,
+            min_strong_evidence: 2,
+        };
+        let mut signals = vec![];
+        let repeated = vec![
+            ObservedDimension {
+                dimension: "预算".into(),
+                value: "高".into(),
+                confidence: 0.4,
+                strong_evidence_count: 1,
+            },
+            ObservedDimension {
+                dimension: "预算".into(),
+                value: "高".into(),
+                confidence: 0.9,
+                strong_evidence_count: 3,
+            },
+        ];
+        apply_bayesian_update(&mut signals, &repeated, 1, "run-a", &th);
+        apply_bayesian_update(&mut signals, &repeated, 1, "run-a", &th);
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].history.len(), 1);
+        assert_eq!(signals[0].current_confidence, 0.9);
+        assert!(!signals[0].locked, "one run must remain one hit");
+
+        apply_bayesian_update(&mut signals, &repeated, 2, "run-b", &th);
+        assert_eq!(signals[0].history.len(), 2);
+        assert!(signals[0].locked);
+    }
+
+    #[test]
+    fn conflicting_values_in_one_run_do_not_count() {
+        let th = SlotPromotionThreshold {
+            min_hits: 1,
+            min_strong_evidence: 1,
+        };
+        let mut signals = vec![];
+        apply_bayesian_update(
+            &mut signals,
+            &[
+                ObservedDimension {
+                    dimension: "预算".into(),
+                    value: "高".into(),
+                    confidence: 0.8,
+                    strong_evidence_count: 1,
+                },
+                ObservedDimension {
+                    dimension: "预算".into(),
+                    value: "低".into(),
+                    confidence: 0.8,
+                    strong_evidence_count: 1,
+                },
+            ],
+            1,
+            "run-conflict",
+            &th,
+        );
+        assert!(signals.is_empty());
     }
 }

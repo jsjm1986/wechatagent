@@ -389,7 +389,7 @@ pub(crate) fn is_duplicate_key_error(e: &mongodb::error::Error) -> bool {
 /// insert 侧据此区分两类 11000：短码碰撞（换种子重试）vs 同客户同类别已有 pending
 /// （并发漏过 has_pending 预检，静默当作"已存在"，不再重试、不报错）。
 pub(crate) const PENDING_DEDUPE_INDEX_NAME: &str =
-    "uniq_principal_escalation_pending_ws_contact_category";
+    "uniq_principal_escalation_pending_ws_account_contact_category";
 
 /// 据 dup-key 错误的 (code, message) 判定是否命中 pending 去重唯一索引。
 /// dup-key 错误 message 形如 `E11000 ... index: <name> dup key: ...`，据索引名识别。
@@ -498,6 +498,7 @@ mod tests {
             reason: "r".into(),
             question_for_principal: "q".into(),
             principal_wxid: "boss".into(),
+            protocol: None,
             decision: None,
             authorization_expires_at: None,
             is_generalizable: false,
@@ -508,6 +509,11 @@ mod tests {
             updated_at: mongodb::bson::DateTime::now(),
             resolved_at: None,
             resolved_via: None,
+            relay_state: None,
+            relay_task_id: None,
+            relay_enqueued_at: None,
+            relay_terminal_at: None,
+            relay_terminal_reason: None,
         }
     }
 

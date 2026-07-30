@@ -124,7 +124,7 @@ async fn seed_signal(
 #[tokio::test]
 #[ignore]
 async fn list_then_approve_lands_staff_confirmed_deal() {
-    let app = common::TestApp::start().await;
+    let app = common::TestApp::start_repl_set().await;
     let ws = app.state.config.default_workspace_id.clone();
 
     let contact = make_contact(&ws, "cust_deal_1");
@@ -157,7 +157,14 @@ async fn list_then_approve_lands_staff_confirmed_deal() {
         State(app.state.clone()),
         Extension(test_admin(&ws)),
         Path(signal_id.clone()),
-        Json(serde_json::from_value(json!({ "amount": 9900, "currency": "CNY" })).unwrap()),
+        Json(
+            serde_json::from_value(json!({
+                "amount": 9900,
+                "currency": "CNY",
+                "reviewedBy": "spoofed@attacker.invalid"
+            }))
+            .unwrap(),
+        ),
     )
     .await
     .expect("approve ok");
@@ -193,7 +200,211 @@ async fn list_then_approve_lands_staff_confirmed_deal() {
         .expect("signal exists");
     assert_eq!(updated.status, "approved");
     assert!(updated.reviewed_at.is_some());
-    assert_eq!(updated.reviewed_by.as_deref(), Some("test_admin"));
+    assert_eq!(
+        updated.reviewed_by.as_deref(),
+        Some("test_admin"),
+        "SR-058: reviewedBy 请求字段不得覆盖认证管理员"
+    );
+
+    // 审批、成交和审计是同一事务的三个结果。
+    assert_eq!(
+        app.state
+            .db
+            .events()
+            .count_documents(
+                doc! {
+                    "workspace_id": &ws,
+                    "contact_wxid": "cust_deal_1",
+                    "kind": "outcome_event_marked",
+                },
+                None,
+            )
+            .await
+            .expect("count outcome audit"),
+        1
+    );
+
+    // 重复审批必须在 pending CAS 处冲突，不能追加第二条成交或审计。
+    let duplicate = wechatagent::routes::admin_suspected_deals::approve_suspected_deal(
+        State(app.state.clone()),
+        Extension(test_admin(&ws)),
+        Path(signal_id.clone()),
+        Json(serde_json::from_value(json!({ "amount": 9900, "currency": "CNY" })).unwrap()),
+    )
+    .await;
+    assert!(duplicate.is_err(), "重复审批必须失败");
+    let after_duplicate = app
+        .state
+        .db
+        .contacts()
+        .find_one(doc! { "_id": oid }, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after_duplicate.outcome_events.len(), 1, "重复审批不得双计");
+    assert_eq!(
+        app.state
+            .db
+            .events()
+            .count_documents(
+                doc! {
+                    "workspace_id": &ws,
+                    "contact_wxid": "cust_deal_1",
+                    "kind": "outcome_event_marked",
+                },
+                None,
+            )
+            .await
+            .unwrap(),
+        1,
+        "重复审批不得重复写审计"
+    );
+}
+
+/// SR-057：金额等业务校验必须发生在 pending CAS 之前。非法请求可修正后重试，不能
+/// 留下 approved 但无 outcome 的漏登终态。本测试无需事务能力，因为预检应在启动事务前返回。
+#[tokio::test]
+#[ignore]
+async fn invalid_approve_payload_keeps_signal_pending_and_outcome_empty() {
+    let app = common::TestApp::start().await;
+    let ws = app.state.config.default_workspace_id.clone();
+    let contact = make_contact(&ws, "cust_deal_invalid");
+    let contact_id = contact.id.unwrap().to_hex();
+    app.state
+        .db
+        .contacts()
+        .insert_one(&contact, None)
+        .await
+        .unwrap();
+    let signal_id = seed_signal(&app.state, &ws, &contact_id, "pending").await;
+
+    let result = wechatagent::routes::admin_suspected_deals::approve_suspected_deal(
+        State(app.state.clone()),
+        Extension(test_admin(&ws)),
+        Path(signal_id.clone()),
+        Json(serde_json::from_value(json!({ "amount": -1, "currency": "CNY" })).unwrap()),
+    )
+    .await;
+    assert!(result.is_err(), "负金额必须被拒绝");
+
+    let signal = app
+        .state
+        .db
+        .collection_suspected_deal_signals()
+        .find_one(
+            doc! { "_id": ObjectId::parse_str(&signal_id).unwrap() },
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(signal.status, "pending", "预检失败必须保留可重试 pending");
+    let contact = app
+        .state
+        .db
+        .contacts()
+        .find_one(
+            doc! { "_id": ObjectId::parse_str(&contact_id).unwrap() },
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(contact.outcome_events.is_empty());
+}
+
+/// SR-057：事务内最后一步审计写失败时，先前的 signal CAS 和 outcome append 必须一起回滚。
+#[tokio::test]
+#[ignore]
+async fn audit_failure_rolls_back_signal_and_outcome() {
+    let app = common::TestApp::start_repl_set().await;
+    let ws = app.state.config.default_workspace_id.clone();
+    let contact = make_contact(&ws, "cust_deal_audit_failure");
+    let contact_id = contact.id.unwrap().to_hex();
+    app.state
+        .db
+        .contacts()
+        .insert_one(&contact, None)
+        .await
+        .unwrap();
+    let signal_id = seed_signal(&app.state, &ws, &contact_id, "pending").await;
+
+    let _ = app
+        .state
+        .db
+        .raw()
+        .create_collection("agent_events", None)
+        .await;
+    app.state
+        .db
+        .raw()
+        .run_command(
+            doc! {
+                "collMod": "agent_events",
+                "validator": { "kind": { "$ne": "outcome_event_marked" } },
+                "validationAction": "error",
+            },
+            None,
+        )
+        .await
+        .expect("install audit rejection validator");
+
+    let result = wechatagent::routes::admin_suspected_deals::approve_suspected_deal(
+        State(app.state.clone()),
+        Extension(test_admin(&ws)),
+        Path(signal_id.clone()),
+        Json(serde_json::from_value(json!({ "amount": 9900, "currency": "CNY" })).unwrap()),
+    )
+    .await;
+    assert!(result.is_err(), "审计写失败必须让审批失败");
+
+    let signal = app
+        .state
+        .db
+        .collection_suspected_deal_signals()
+        .find_one(
+            doc! { "_id": ObjectId::parse_str(&signal_id).unwrap() },
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        signal.status, "pending",
+        "事务 abort 后 signal 必须回到 pending"
+    );
+    let contact = app
+        .state
+        .db
+        .contacts()
+        .find_one(
+            doc! { "_id": ObjectId::parse_str(&contact_id).unwrap() },
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        contact.outcome_events.is_empty(),
+        "事务 abort 后不得留下成交"
+    );
+    assert_eq!(
+        app.state
+            .db
+            .events()
+            .count_documents(
+                doc! {
+                    "workspace_id": &ws,
+                    "contact_wxid": "cust_deal_audit_failure",
+                    "kind": "outcome_event_marked",
+                },
+                None,
+            )
+            .await
+            .unwrap(),
+        0,
+        "被 validator 拒绝的审计不得留下任何行"
+    );
 }
 
 /// 测试 3：reject 一条 pending → status==rejected + 记 reason。

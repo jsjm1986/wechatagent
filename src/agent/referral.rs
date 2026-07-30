@@ -140,6 +140,7 @@ pub(crate) async fn send_outbound_namecard(
     // ⚠️ MCP message_send_namecard 入参字段名待 server tools/list 确认，此处占位
     let resp = crate::mcp::logged_send_call_for_account(
         state,
+        &contact.workspace_id,
         &contact.account_id,
         "message_send_namecard",
         json!({ "recipient": contact.wxid, "targetWxid": card.target_wxid }),
@@ -147,10 +148,18 @@ pub(crate) async fn send_outbound_namecard(
     .await
     .map_err(super::types::OutboundSendError::from)?;
 
-    if !super::gateway::send_receipt_is_ok(&resp) {
-        return Err(super::types::OutboundSendError::SafeToRetry(
-            "namecard send returned a negative or unverifiable delivery receipt".into(),
-        ));
+    match super::gateway::classify_send_receipt(&resp) {
+        super::gateway::SendReceiptStatus::Succeeded => {}
+        super::gateway::SendReceiptStatus::ExplicitlyFailed => {
+            return Err(super::types::OutboundSendError::SafeToRetry(
+                "namecard send returned an explicit negative delivery receipt".into(),
+            ));
+        }
+        super::gateway::SendReceiptStatus::Inconclusive => {
+            return Err(super::types::OutboundSendError::DeliveryUncertain(
+                "namecard send returned an unverifiable delivery receipt".into(),
+            ));
+        }
     }
 
     // MCP 已成功 = 名片已送达客户，既成事实。此后落库/置态失败**绝不**返 Err——

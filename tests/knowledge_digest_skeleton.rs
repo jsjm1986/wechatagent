@@ -47,6 +47,13 @@ fn knowledge_daily_report_bson_roundtrip() {
         cards: vec![sample_card()],
         dismissed_card_ids: vec![],
         prompt_versions: doc! { "knowledge.digest.compose": "v1" },
+        attempt_generation: 0,
+        current_generation: 0,
+        latest_attempt_status: None,
+        latest_attempt_error_kind: None,
+        latest_attempt_at: None,
+        latest_attempt_budget_snapshot: Document::new(),
+        last_success_at: None,
     };
     let bson = to_bson(&report).expect("serialize");
     let doc: Document = bson.as_document().expect("doc").clone();
@@ -65,12 +72,21 @@ fn knowledge_chat_task_bson_roundtrip() {
         workspace_id: "default".to_string(),
         account_id: "default".to_string(),
         session_id: "sess_abc".to_string(),
+        owner_admin_id: Some("admin_1".to_string()),
         operator_id: Some("op_1".to_string()),
         cards: vec![sample_card()],
+        dispatch_binding: None,
         planned_steps: vec![doc! { "cardId": "x", "action": "fix_chunk" }],
         completed_steps: vec![],
+        step_intents: vec![],
         status: "pending".to_string(),
         error_kind: None,
+        attempts: 0,
+        claim_generation: 0,
+        worker_id: None,
+        claim_token: None,
+        locked_until: None,
+        heartbeat_at: None,
         created_at: DateTime::now(),
         started_at: None,
         finished_at: None,
@@ -94,6 +110,9 @@ fn knowledge_operator_memory_bson_roundtrip() {
         created_at: DateTime::now(),
         last_used_at: DateTime::now(),
         expires_at: None,
+        revoked_at: None,
+        revoked_by: None,
+        revocation_reason: None,
     };
     let doc = to_document(&mem).expect("serialize");
     let back: KnowledgeOperatorMemory =

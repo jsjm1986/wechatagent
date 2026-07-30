@@ -43,7 +43,7 @@ describe("ContactsView 运营池", () => {
       expect(screen.getByText(/区别于通讯录/)).toBeInTheDocument();
     });
 
-    it("待启用档行显示消息摘要 + 启用按钮（传了 onBatchEnable）", () => {
+    it("待启用档启用时冻结 contactId + wxid", async () => {
       const contacts = [
         {
           id: "1",
@@ -57,18 +57,23 @@ describe("ContactsView 运营池", () => {
           updatedAt: "2026-07-11T00:00:00Z"
         }
       ] as any;
+      const onBatchEnable = vi.fn().mockResolvedValue(undefined);
       render(
         <ContactsView
           {...baseProps}
           contactTab="normal"
           contacts={contacts}
-          onBatchEnable={vi.fn().mockResolvedValue(undefined)}
+          onBatchEnable={onBatchEnable}
         />
       );
       // 消息摘要仅待启用档渲染（legacy.tsx:659-661）。
       expect(screen.getByText(/想问下课程怎么收费/)).toBeInTheDocument();
       // 单人启用按钮仅 selectable（normal + onBatchEnable）时渲染（legacy.tsx:672-683）。
       expect(screen.getByText("启用 Agent")).toBeInTheDocument();
+      screen.getByText("启用 Agent").click();
+      expect(onBatchEnable).toHaveBeenCalledWith([
+        expect.objectContaining({ contactId: "1", wxid: "wxid_a" })
+      ]);
     });
 
     it("不传 onBatchEnable 时降级为只读列表：无启用按钮", () => {

@@ -37,7 +37,7 @@ fn admin(ws: &str) -> Extension<AuthenticatedAdmin> {
 #[tokio::test]
 #[ignore]
 async fn put_preserves_provenance_wiki_type_locked_fields_and_created_at() {
-    let app = TestApp::start().await;
+    let app = TestApp::start_repl_set().await;
     let ws = app.state.config.default_workspace_id.clone();
 
     let id = ObjectId::new();
@@ -162,7 +162,7 @@ async fn put_preserves_provenance_wiki_type_locked_fields_and_created_at() {
 #[tokio::test]
 #[ignore]
 async fn put_enforces_locked_fields_and_writes_audit_revision() {
-    let app = TestApp::start().await;
+    let app = TestApp::start_repl_set().await;
     let ws = app.state.config.default_workspace_id.clone();
 
     let id = ObjectId::new();
@@ -250,7 +250,7 @@ async fn put_enforces_locked_fields_and_writes_audit_revision() {
 #[tokio::test]
 #[ignore]
 async fn put_nonexistent_chunk_returns_not_found() {
-    let app = TestApp::start().await;
+    let app = TestApp::start_repl_set().await;
     let ws = app.state.config.default_workspace_id.clone();
 
     let body: OperationKnowledgeChunkRequest =

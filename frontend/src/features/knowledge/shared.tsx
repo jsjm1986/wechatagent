@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import {
   Archive,
   CheckCircle2,
@@ -21,6 +21,19 @@ import type { PickerChunk } from "../../components/ui/ChunkRef";
 import { type TrustChunkFields, chunkTypeLabel } from "./trustTypes";
 import { wikiTypeLabel, statusLabel, integrityStatusLabel, revisionOpLabel, revisionSourceLabel, relatedKindLabel } from "./labels";
 import { ChunkRepairPanel } from "./ChunkRepairPanel";
+import {
+  CHUNKS_INVALIDATED_EVENT,
+  invalidateChunks,
+  useCoalescedReload,
+  type ChunkInvalidationDetail,
+} from "./chunkInvalidation";
+import {
+  chunkMergeRequest,
+  chunkPatchRequest,
+  chunkRelateRequest,
+  chunkSplitRequest,
+  type ChunkRelationKind,
+} from "./chunkActionContracts";
 
 /// ChunkPicker 列表加载器:拉全部 chunk 供搜索选择,替代手输 ObjectId。
 /// 模块级缓存 20s,避免多个选择器/Inspector 首次聚焦各拉一次全量。
@@ -137,27 +150,6 @@ export interface ReviewChunkItem extends TrustChunkFields {
   updatedAt?: string | null;
 }
 
-export function classifyChunk(
-  c: ReviewChunkItem,
-  activeIds: Set<string>
-): ReviewCategory | null {
-  // 优先级：contested > needs_review > source_orphan > pending_verification > dependents_pending
-  if (c.integrityStatus === "rejected") return "contested";
-  const hasQuote = !!c.sourceQuote && c.sourceQuote.trim().length > 0;
-  const hasAnchor = (c.sourceAnchors?.length ?? 0) > 0;
-  if (c.integrityStatus === "needs_review") {
-    if (!hasQuote || !hasAnchor) return "source_orphan";
-    return "pending_verification";
-  }
-  if (!hasQuote || !hasAnchor) return "source_orphan";
-  if (c.relatedChunks && c.relatedChunks.length > 0) {
-    const broken = c.relatedChunks.some((r) => !activeIds.has(r.chunk_id));
-    if (broken) return "dependents_pending";
-  }
-  // verified 且关系完好的 chunk 不进 review 视图。
-  return null;
-}
-
 // ChunkInspectorPane：Explore 第三栏。监听 wikiFocusChunk 事件 → 拉单 chunk
 // 详情。lazy-load：首次聚焦才发起 list 请求；之后从本地 indexById 直接命中。
 export function ChunkInspectorPane({
@@ -172,24 +164,47 @@ export function ChunkInspectorPane({
   const [items, setItems] = useState<TreeChunkItem[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [reloadKey, setReloadKey] = useState(0);
+  const [syncNotice, setSyncNotice] = useState<string | null>(null);
+  const requestGeneration = useRef(0);
   const lock = useChunkInspectorLock(chunkId);
 
-  useEffect(() => {
+  const loadOnce = useCallback(async () => {
     if (!chunkId) return;
+    const generation = requestGeneration.current;
     setLoading(true);
     setError(null);
-    fetch("/api/operation-knowledge/chunks")
-      .then(async (r) => {
-        if (!r.ok) throw await parseApiError(r);
-        return r.json() as Promise<{ items: TreeChunkItem[] }>;
-      })
-      .then((data) => setItems(data.items ?? []))
-      .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)))
-      .finally(() => setLoading(false));
-  }, [chunkId, reloadKey]);
+    try {
+      const r = await fetch("/api/operation-knowledge/chunks");
+      if (!r.ok) throw await parseApiError(r);
+      const data = (await r.json()) as { items: TreeChunkItem[] };
+      if (generation === requestGeneration.current) setItems(data.items ?? []);
+    } catch (e: unknown) {
+      if (generation === requestGeneration.current) {
+        setItems(null);
+        setError(e instanceof Error ? e.message : String(e));
+      }
+    } finally {
+      if (generation === requestGeneration.current) setLoading(false);
+    }
+  }, [chunkId]);
+  const coalescedReload = useCoalescedReload(loadOnce);
+  const reload = useCallback(() => {
+    requestGeneration.current += 1;
+    setItems(null);
+    setError(null);
+    return coalescedReload();
+  }, [coalescedReload]);
 
-  const reload = () => setReloadKey((k) => k + 1);
+  useEffect(() => {
+    if (!chunkId) {
+      requestGeneration.current += 1;
+      setItems(null);
+      setLoading(false);
+      setError(null);
+      return;
+    }
+    void reload();
+  }, [chunkId, reload]);
   const confirm = useConfirm();
   const toast = useToast();
   const [unrelating, setUnrelating] = useState<string | null>(null);
@@ -210,7 +225,7 @@ export function ChunkInspectorPane({
         `/api/operation-knowledge/chunks/${encodeURIComponent(chunkId!)}/relate/${encodeURIComponent(targetId)}`,
       );
       toast.success("已解除关联");
-      reload();
+      invalidateChunks({ reason: "local", chunkId: chunkId! });
     } catch (e: unknown) {
       toast.error(e instanceof Error ? e.message : String(e));
     } finally {
@@ -218,18 +233,18 @@ export function ChunkInspectorPane({
     }
   }
 
-  // P1-4：另一端写入此 chunk 时自动 reload，让两个 admin 同步看到。
   useEffect(() => {
     if (!chunkId) return;
-    const onRevised = (e: Event) => {
-      const detail = (e as CustomEvent<{ chunk_id?: string }>).detail;
-      if (detail?.chunk_id === chunkId) {
-        setReloadKey((k) => k + 1);
+    const onInvalidated = (event: Event) => {
+      const detail = (event as CustomEvent<ChunkInvalidationDetail>).detail;
+      if (detail?.reason === "lagged") {
+        setSyncNotice("\u5b9e\u65f6\u66f4\u65b0\u6709\u79ef\u538b\uff0c\u6b63\u5728\u91cd\u65b0\u540c\u6b65\u77e5\u8bc6\u8be6\u60c5\u2026");
       }
+      void reload().finally(() => setSyncNotice(null));
     };
-    window.addEventListener("wikiChunkRevised", onRevised);
-    return () => window.removeEventListener("wikiChunkRevised", onRevised);
-  }, [chunkId]);
+    window.addEventListener(CHUNKS_INVALIDATED_EVENT, onInvalidated);
+    return () => window.removeEventListener(CHUNKS_INVALIDATED_EVENT, onInvalidated);
+  }, [chunkId, reload]);
 
   const indexById = useMemo(() => {
     const m = new Map<string, TreeChunkItem>();
@@ -276,6 +291,7 @@ export function ChunkInspectorPane({
         </div>
       </header>
       <div className="wikiInspectorBody">
+        {syncNotice ? <div className="wikiAlert info">{syncNotice}</div> : null}
         {chunkId ? <ChunkLockBadge lock={lock} /> : null}
         {!chunkId ? (
           <div className="wikiInspectorEmpty">
@@ -444,17 +460,21 @@ export function ChunkInspectorPane({
                 chunkId={chunk.id}
                 originalChunk={chunk as unknown as Record<string, unknown>}
                 onApplied={() => {
-                  reload();
-                  window.dispatchEvent(
-                    new CustomEvent("wikiChunkRevised", { detail: { chunk_id: chunk.id } }),
-                  );
+                  invalidateChunks({ reason: "local", chunkId: chunk.id });
                 }}
               />
             ) : null}
-            <ChunkActionsBar chunk={chunk} onChanged={reload} lockedByOther={lock.state === "other"} />
+            <ChunkActionsBar
+              chunk={chunk}
+              onChanged={() => invalidateChunks({ reason: "local", chunkId: chunk.id })}
+              presenceByOther={lock.state === "other"}
+            />
             <ChunkReferrersList chunkId={chunk.id} />
             <ChunkSourceSection chunkId={chunk.id} />
-            <ChunkRevisionsTimeline chunkId={chunk.id} onRolledBack={reload} />
+            <ChunkRevisionsTimeline
+              chunkId={chunk.id}
+              onRolledBack={() => invalidateChunks({ reason: "local", chunkId: chunk.id })}
+            />
           </>
         )}
       </div>
@@ -568,13 +588,13 @@ export function focusChunk(chunkId: string) {
   window.dispatchEvent(new CustomEvent("wikiFocusChunk", { detail: { chunkId } }));
 }
 
-// ── P1-4 · WebSocket 软锁 + 事件总线 ───────────────────────────────────────
+// ── P1-4 · WebSocket 协作 presence + 事件总线 ──────────────────────────────
 //
-// 锁状态机：
+// Presence 状态机：
 //   - 'idle' 初始；
-//   - 'self' 当前 admin 持锁，60s 心跳续期；
-//   - 'other' 已被他人持锁（409 返回 lock 信息）；
-//   - 'error' 网络错或 5xx，UI 静默退化为只读。
+//   - 'self' 当前 admin 已登记 presence，60s 心跳续期；
+//   - 'other' 他人也在查看/编辑（409 返回 presence 信息）；
+//   - 'error' 网络错或 5xx，仅失去协作提示，不影响 mutation。
 type LockHolder = {
   ownerUserId: string;
   ownerUsername: string;
@@ -603,7 +623,7 @@ function ChunkLockBadge({ lock }: { lock: ChunkLockState }) {
     return (
       <div className="wikiInspectorLockBadge wikiInspectorLockBadge--self" role="status">
         <span className="wikiInspectorLockDot" aria-hidden />
-        <span>我正在编辑{at ? ` · 自动续期至 ${at}` : ""}</span>
+        <span>已发送协作提示{at ? ` · 自动续期至 ${at}` : ""}</span>
       </div>
     );
   }
@@ -613,14 +633,14 @@ function ChunkLockBadge({ lock }: { lock: ChunkLockState }) {
     return (
       <div className="wikiInspectorLockBadge wikiInspectorLockBadge--other" role="status">
         <span className="wikiInspectorLockDot" aria-hidden />
-        <span>由 {who} 编辑中{at ? `（至 ${at}）` : ""} · 暂只读</span>
+        <span>由 {who} 查看或编辑中{at ? `（至 ${at}）` : ""} · 仅提示，不阻止提交</span>
       </div>
     );
   }
   return (
     <div className="wikiInspectorLockBadge wikiInspectorLockBadge--error" role="status">
       <span className="wikiInspectorLockDot" aria-hidden />
-      <span>锁信道异常 · {lock.reason}</span>
+      <span>协作提示不可用 · {lock.reason}（不影响提交）</span>
     </div>
   );
 }
@@ -689,7 +709,7 @@ function useChunkInspectorLock(chunkId: string | null): ChunkLockState {
       void acquire();
     }, 60000);
 
-    // WebSocket 推 unlocked 时刷一次（他人主动 release，给当前 admin 一次抢锁机会）
+    // WebSocket 推 unlocked 时刷新一次 presence（不影响 mutation 权限）。
     const onUnlocked = (e: Event) => {
       const detail = (e as CustomEvent<{ chunk_id?: string }>).detail;
       if (detail?.chunk_id === chunkId) {
@@ -699,7 +719,7 @@ function useChunkInspectorLock(chunkId: string | null): ChunkLockState {
     const onLocked = (e: Event) => {
       const detail = (e as CustomEvent<{ chunk_id?: string; owner_user_id?: string; owner_username?: string; expires_at?: string }>).detail;
       if (detail?.chunk_id === chunkId) {
-        // 别人加锁——只有不是我自己时才覆盖；我自己的 acquire 会先把状态写成 self。
+        // 别人登记 presence——只有不是我自己时才覆盖。
         setLock((prev) => {
           if (prev.state === "self" && prev.holder.ownerUserId === detail.owner_user_id) {
             return prev;
@@ -740,11 +760,11 @@ type ChunkActionState = { busy: string | null; error: string | null; info: strin
 function ChunkActionsBar({
   chunk,
   onChanged,
-  lockedByOther,
+  presenceByOther,
 }: {
   chunk: TreeChunkItem;
   onChanged: () => void;
-  lockedByOther?: boolean;
+  presenceByOther?: boolean;
 }) {
   const [state, setState] = useState<ChunkActionState>({ busy: null, error: null, info: null });
   const confirm = useConfirm();
@@ -774,8 +794,8 @@ function ChunkActionsBar({
   const id = encodeURIComponent(chunk.id);
   const isArchived = chunk.status === "archived";
   const isVerified = chunk.integrityStatus === "verified";
-  // 软锁:他人编辑中禁用一切写操作(此前 ChunkActionsBar 完全不读锁态,软锁形同虚设)
-  const writeDisabled = !!state.busy || !!lockedByOther;
+  // Presence 只作协作提示；真正并发保护由后端 transaction + CAS 提供。
+  const writeDisabled = !!state.busy;
 
   async function onPatch() {
     const v = await form({
@@ -785,10 +805,12 @@ function ChunkActionsBar({
       ],
     });
     if (!v) return;
-    await call("改写摘要", "POST", `/api/operation-knowledge/chunks/${id}/patch`, {
-      summary: v.summary || undefined,
-      actor: "admin",
-    });
+    await call(
+      "改写摘要",
+      "POST",
+      `/api/operation-knowledge/chunks/${id}/patch`,
+      chunkPatchRequest(v.summary),
+    );
   }
 
   async function onReject() {
@@ -810,35 +832,28 @@ function ChunkActionsBar({
       confirmText: "确认归档",
     });
     if (!ok) return;
-    await call("归档", "POST", `/api/operation-knowledge/chunks/${id}/archive`, { actor: "admin" });
+    await call("归档", "POST", `/api/operation-knowledge/chunks/${id}/archive`, {});
   }
 
   async function onSplit() {
     const v = await form({
       title: "拆分知识条目",
       fields: [
-        {
-          kind: "select",
-          name: "mode",
-          label: "拆分方式",
-          options: [
-            { value: "offset", label: "按字符位置（推荐）" },
-            { value: "regex", label: "按正则匹配（高级）" },
-          ],
-        },
-        { kind: "text", name: "cutoff", label: "切点", required: true, hint: "按字符位置：填一个整数，如 200（从第 200 个字处切开）；高级：填正则表达式" },
+        { kind: "text", name: "cutoff", label: "字符切点", required: true, hint: "填一个整数，如 200（从第 200 个字处切开）" },
       ],
     });
     if (!v) return;
-    const body =
-      v.mode === "offset"
-        ? { offset: Number(v.cutoff), actor: "admin" }
-        : { regex: v.cutoff, actor: "admin" };
-    if (v.mode === "offset" && !Number.isFinite(body.offset as number)) {
-      setState({ busy: null, error: "字符位置必须是整数", info: null });
+    const offset = Number(v.cutoff);
+    if (!Number.isInteger(offset) || offset <= 0) {
+      setState({ busy: null, error: "字符位置必须是正整数", info: null });
       return;
     }
-    await call("拆分", "POST", `/api/operation-knowledge/chunks/${id}/split`, body);
+    await call(
+      "拆分",
+      "POST",
+      `/api/operation-knowledge/chunks/${id}/split`,
+      chunkSplitRequest(offset),
+    );
   }
 
   async function onMerge() {
@@ -850,10 +865,12 @@ function ChunkActionsBar({
       ],
     });
     if (!v) return;
-    await call("合并", "POST", `/api/operation-knowledge/chunks/${id}/merge`, {
-      target_id: v.target,
-      actor: "admin",
-    });
+    await call(
+      "合并",
+      "POST",
+      `/api/operation-knowledge/chunks/${id}/merge`,
+      chunkMergeRequest(v.target),
+    );
   }
 
   async function onRelate() {
@@ -867,8 +884,11 @@ function ChunkActionsBar({
           name: "kind",
           label: "关系类型",
           options: [
-            { value: "supports", label: "支持" },
+            { value: "references", label: "引用" },
+            { value: "requires", label: "依赖" },
             { value: "contradicts", label: "矛盾" },
+            { value: "clarifies", label: "澄清" },
+            { value: "refines", label: "细化" },
             { value: "superseded_by", label: "被取代" },
           ],
         },
@@ -876,19 +896,21 @@ function ChunkActionsBar({
       ],
     });
     if (!v) return;
-    await call("关联", "POST", `/api/operation-knowledge/chunks/${id}/relate`, {
-      target_id: v.target,
-      kind: v.kind,
-      note: v.note || null,
-      actor: "admin",
-    });
+    await call(
+      "关联",
+      "POST",
+      `/api/operation-knowledge/chunks/${id}/relate`,
+      chunkRelateRequest(v.target, v.kind as ChunkRelationKind, v.note),
+    );
   }
 
   return (
     <section className="wikiInspectorSection">
       <div className="wikiInspectorSectionTitle">编辑动作</div>
-      {lockedByOther ? (
-        <div className="wikiAlert info">其他管理员正在编辑这条知识，已暂时锁定，无法修改。</div>
+      {presenceByOther ? (
+        <div className="wikiAlert info">
+          其他管理员也在查看或编辑这条知识；这是协作提示，仍可提交，冲突由版本校验拒绝。
+        </div>
       ) : null}
       <div className="wikiActionsBar">
         <button
@@ -926,7 +948,7 @@ function ChunkActionsBar({
           className="wikiBtn"
           disabled={writeDisabled || !isArchived}
           onClick={() =>
-            void call("恢复", "POST", `/api/operation-knowledge/chunks/${id}/restore`, { actor: "admin" })
+            void call("恢复", "POST", `/api/operation-knowledge/chunks/${id}/restore`, {})
           }
         >
           <Undo2 size={13} /> 恢复
@@ -1092,7 +1114,7 @@ export function ChunkRevisionsTimeline({
     try {
       const r = await fetch(
         `/api/operation-knowledge/chunks/${encodeURIComponent(chunkId)}/rollback/${encodeURIComponent(rid)}`,
-        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ actor: "admin" }) },
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({}) },
       );
       if (!r.ok) throw await parseApiError(r);
       setItems(null);

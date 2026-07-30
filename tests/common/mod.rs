@@ -249,7 +249,9 @@ impl TestApp {
         // 上面已 re-seed 销售域字典，这里把缓存对齐到本测试 DB 的字典内容，使后续
         // check_value / validate_dimension_value 能命中（否则缓存可能停留在空字典或
         // 别的测试 DB 状态）。warm_up 内部忽略 TTL 无条件 reload。
-        wechatagent::agent::init_global_taxonomy_cache(&db).await;
+        wechatagent::agent::init_global_taxonomy_cache(&db)
+            .await
+            .expect("warm taxonomy cache");
 
         // 同理预热**第二个**进程级 TTL 单例：active DomainProfile 缓存（domain_profile.rs
         // 的 GLOBAL_DOMAIN_PROFILE_CACHE，与 taxonomy 缓存同款 LazyLock+30s TTL）。
@@ -259,10 +261,19 @@ impl TestApp {
         // customer_stage 从 domain_signals 剔除 → C2 operation_state 派生回落
         // decision.operation_state。预热到本测试自己的 DB（无 active 行）→ 回落 DEFAULT
         // profile（声明 customer_stage participates_in_decision=true）→ 维度存活、派生正确。
-        wechatagent::agent::init_global_domain_profile_cache(&db).await;
+        wechatagent::agent::init_global_domain_profile_cache(&db)
+            .await
+            .expect("warm domain profile cache");
 
         let mcp = McpClient::new(config.mcp_base_url.clone(), config.mcp_api_key.clone())
             .expect("构造测试 mcp client 失败");
+        let auth_rate_limiter =
+            std::sync::Arc::new(wechatagent::auth::rate_limit::AuthRateLimiter::new(
+                config.auth_rate_limit_window_seconds,
+                config.auth_rate_limit_client_capacity,
+                config.auth_rate_limit_target_capacity,
+                config.auth_rate_limit_global_capacity,
+            ));
 
         let state = AppState {
             db,
@@ -281,6 +292,7 @@ impl TestApp {
             )
             .0,
             jwt_keys: None,
+            auth_rate_limiter,
             completeness_cache: std::sync::Arc::new(dashmap::DashMap::new()),
         };
         // M4 W4 Task 5.3：seed 完成后 fetch_add 一次，与 main.rs 行为一致。
@@ -431,6 +443,10 @@ fn test_config(mongodb_uri: String, mongodb_database: String) -> AppConfig {
         session_cookie_secure: false,
         bootstrap_admin_username: None,
         bootstrap_admin_password: None,
+        auth_rate_limit_window_seconds: 300,
+        auth_rate_limit_client_capacity: 1000,
+        auth_rate_limit_target_capacity: 1000,
+        auth_rate_limit_global_capacity: 1000,
         webhook_verify_signature: false,
         webhook_timestamp_skew_seconds: 300,
         jwt_enabled: false,
@@ -539,8 +555,40 @@ pub fn rebuild_app_state_with_mcp_url(app: &TestApp, mcp_url: String) -> AppStat
         chunk_locks: app.state.chunk_locks.clone(),
         chunk_event_bus: app.state.chunk_event_bus.clone(),
         jwt_keys: app.state.jwt_keys.clone(),
+        auth_rate_limiter: app.state.auth_rate_limiter.clone(),
         completeness_cache: app.state.completeness_cache.clone(),
     }
+}
+
+/// Build an explicitly enabled Evolution release state for tests that exercise
+/// the administrative release boundary. The shared TestApp remains disabled by
+/// default so unrelated tests cannot accidentally bypass the production gate.
+pub async fn evolution_release_state(app: &TestApp, workspace: &str) -> AppState {
+    let mut state = app.state.clone();
+    state.config.evolution_enabled = true;
+    state
+        .db
+        .raw()
+        .collection::<mongodb::bson::Document>("evolution_runtime_flags")
+        .update_one(
+            doc! { "workspace_id": workspace },
+            doc! {
+                "$set": {
+                    "workspace_id": workspace,
+                    "enabled": true,
+                    "rollout_percent": 100_i64,
+                    "threshold_auto_release_enabled": false,
+                    "updated_by": "integration-test",
+                    "updated_at": DateTime::now(),
+                }
+            },
+            mongodb::options::UpdateOptions::builder()
+                .upsert(true)
+                .build(),
+        )
+        .await
+        .expect("enable evolution release test gate");
+    state
 }
 
 /// 插入一条 `proposal_kind="prompt"`, `status="released"` 的 proposal，供
@@ -554,6 +602,62 @@ pub async fn insert_released_prompt_proposal(
 ) -> ObjectId {
     let id = ObjectId::new();
     let now = DateTime::now();
+    let version = prev.parse::<i32>().expect("previous prompt version");
+    let templates = state
+        .db
+        .raw()
+        .collection::<mongodb::bson::Document>("prompt_templates");
+    let current = templates
+        .find_one(
+            doc! {
+                "workspace_id": workspace,
+                "prompt_key": key,
+                "current_version": true,
+            },
+            None,
+        )
+        .await
+        .expect("read current prompt artifact")
+        .expect("current prompt artifact");
+    let current_id = current.get_object_id("_id").expect("current prompt _id");
+    let current_version = current.get_i32("version").expect("current prompt version");
+    let current_content = current.get_str("content").expect("current prompt content");
+    let released_revision = wechatagent::evolution::revision::prompt_revision(
+        current_id,
+        current_version,
+        current_content,
+    );
+    let base_revision = match templates
+        .find_one(
+            doc! {
+                "workspace_id": workspace,
+                "prompt_key": key,
+                "version": version,
+            },
+            None,
+        )
+        .await
+        .expect("read prompt rollback baseline")
+    {
+        Some(base) => wechatagent::evolution::revision::prompt_revision(
+            base.get_object_id("_id").expect("baseline prompt _id"),
+            base.get_i32("version").expect("baseline prompt version"),
+            base.get_str("content").expect("baseline prompt content"),
+        ),
+        None => wechatagent::evolution::revision::prompt_revision(
+            ObjectId::new(),
+            version,
+            "missing rollback baseline",
+        ),
+    };
+    templates
+        .update_one(
+            doc! { "_id": current_id, "current_version": true },
+            doc! { "$set": { "source_proposal_id": id } },
+            None,
+        )
+        .await
+        .expect("bind current prompt artifact to proposal");
     state
         .db
         .raw()
@@ -567,6 +671,8 @@ pub async fn insert_released_prompt_proposal(
                 "proposal_kind": "prompt",
                 "status": "released",
                 "proposed_template_key": key,
+                "base_revision": base_revision,
+                "released_revision": released_revision,
                 "previous_prompt_version": prev,
                 "created_at": now,
                 "updated_at": now,
@@ -607,6 +713,7 @@ pub fn rebuild_app_state_with_real_llm(
         chunk_locks: app.state.chunk_locks.clone(),
         chunk_event_bus: app.state.chunk_event_bus.clone(),
         jwt_keys: app.state.jwt_keys.clone(),
+        auth_rate_limiter: app.state.auth_rate_limiter.clone(),
         completeness_cache: app.state.completeness_cache.clone(),
     }
 }

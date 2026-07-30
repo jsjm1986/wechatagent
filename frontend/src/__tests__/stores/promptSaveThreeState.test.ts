@@ -34,10 +34,16 @@ describe("strategyStore.savePromptTemplate 三态", () => {
     });
   });
 
-  it("Pass(200 {ok:true}) → 返回 {ok:true} 且触发 reload", async () => {
-    (api.put as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ ok: true });
+  it("Pass appends a draft and hands the new id to subsequent publish", async () => {
+    (api.put as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      ok: true,
+      id: "pt-2",
+      version: 2,
+      status: "draft",
+    });
     const result = await useStrategyStore.getState().savePromptTemplate();
     expect(result).toEqual({ ok: true });
+    expect(useStrategyStore.getState().editingPromptId).toBe("pt-2");
     expect(useStrategyStore.getState().loadStrategyData).toHaveBeenCalledTimes(1);
   });
 
@@ -70,7 +76,7 @@ describe("strategyStore.savePromptTemplate 三态", () => {
   });
 
   it("force=true → PUT body 带 force:true（覆盖语义审查）", async () => {
-    (api.put as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ ok: true });
+    (api.put as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ ok: true, id: "pt-2" });
     await useStrategyStore.getState().savePromptTemplate(true);
     expect(api.put).toHaveBeenCalledWith(
       "/api/prompt-templates/pt-1",
@@ -84,6 +90,18 @@ describe("strategyStore.savePromptTemplate 三态", () => {
     (api.put as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error("HTTP 500"));
     const result = await useStrategyStore.getState().savePromptTemplate();
     expect(result).toMatchObject({ error: true });
+    expect(useStrategyStore.getState().editingPromptId).toBe("");
     expect(setError).toHaveBeenCalledWith("HTTP 500");
+  });
+
+  it("成功形状缺新版本 id 时清空旧发布目标并 fail closed", async () => {
+    const setError = vi.fn();
+    useUiStore.setState({ setError });
+    (api.put as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ ok: true });
+    const result = await useStrategyStore.getState().savePromptTemplate();
+    expect(result).toMatchObject({ error: true });
+    expect(useStrategyStore.getState().editingPromptId).toBe("");
+    expect(setError).toHaveBeenCalledWith("保存提示词版本后端未返回新版本 ID");
+    expect(useStrategyStore.getState().loadStrategyData).not.toHaveBeenCalled();
   });
 });

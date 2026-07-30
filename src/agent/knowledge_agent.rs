@@ -31,7 +31,7 @@ use crate::knowledge_wiki::structural_proposals::{propose_structural_change, Str
 use crate::models::OperationKnowledgeChunk;
 use crate::routes::AppState;
 
-use super::budget::current_run_budget;
+use super::budget::{current_run_budget, current_run_mode};
 use super::generate_agent_json;
 
 mod cache;
@@ -326,7 +326,8 @@ pub async fn answer(state: &AppState, req: AnswerRequest) -> AppResult<AnswerRes
             // merge-update 并入同一信号的 search_queries（dedup_key 同 → 命中并集分支）。
             // 失败/超时只丢日志，首次确定性落库已不可逆地完成。
             if let Some(q) = followup_query {
-                if let Some(followup) = generate_gap_followup_question(&state_clone, &q).await {
+                if let Some(followup) = generate_gap_followup_question(&state_clone, &ws, &q).await
+                {
                     if !followup.is_empty() && followup != q {
                         let mut enrich = candidate.clone();
                         enrich.search_queries = vec![followup];
@@ -358,16 +359,32 @@ pub async fn answer(state: &AppState, req: AnswerRequest) -> AppResult<AnswerRes
     Ok(result)
 }
 
+/// Run the same knowledge-agent reasoning in read-only mode. This deliberately
+/// bypasses the production wrapper that emits recall gap signals and
+/// structural proposals. LLM cost logs remain enabled and inherit the current
+/// `run_mode=shadow` task-local marker.
+pub(crate) async fn answer_read_only(
+    state: &AppState,
+    req: AnswerRequest,
+) -> AppResult<AnswerResult> {
+    answer_inner(state, req, None, None).await
+}
+
 /// 为「知识库查无可引用知识」生成一句面向人类运营的追问，供其用对话形式补全知识库。
 /// fire-and-forget：任何错误/超时返回 None，调用方回退到仅用原始 query。system/user
 /// 以字面量传入 `generate_agent_json`，不触 prompts.rs；prompt_key 仅作日志/缓存标签。
-async fn generate_gap_followup_question(state: &AppState, query: &str) -> Option<String> {
+async fn generate_gap_followup_question(
+    state: &AppState,
+    workspace_id: &str,
+    query: &str,
+) -> Option<String> {
     let system = "你是知识库补全助手。知识库对用户问题查无可引用知识。请只输出 JSON \
                   {\"question\":\"<一句精炼、面向人类运营的追问，引导其补充缺失知识>\"}，\
                   不要编造任何事实，只生成引导补全的问题。";
     let user = format!("用户原始问题：{query}\n请生成一句追问。");
     let v = super::generate_agent_json(
         state,
+        workspace_id,
         None,
         None,
         None,
@@ -687,23 +704,27 @@ async fn answer_inner(
         });
     }
 
-    // E4：相同 query × 相同 corpus 签名（chunk 集合 + dynamic_confidence + related_count）
-    // 命中 → 跳过整个 LLM 循环。chunk 任一更新都会让 dynamic_confidence 变 → 签名变。
+    // E4: cache identity covers every visible active/verified chunk and the
+    // exact provider registry generation. The full-corpus signature prevents
+    // edits outside the displayed top-30 (including relation targets) from
+    // leaving a stale answer cache entry valid.
     // 取消路径不查 cache（用户显式想重跑）。
-    let cache_key = if !is_cancelled(cancel) {
-        let sig_items: Vec<(String, i64)> = catalog
-            .iter()
-            .map(|e| {
-                let bits = e.dynamic_confidence.to_bits() as i64;
-                let mixed = bits ^ ((e.related_count as i64) << 8);
-                (e.chunk_id.clone(), mixed)
-            })
-            .collect();
+    let cache_key = if current_run_mode() != "shadow" && !is_cancelled(cancel) {
+        let corpus_sig =
+            visible_corpus_signature(state, &req.workspace_id, req.account_id.as_deref()).await?;
+        let provider = current_provider_cache_identity(state, &req.workspace_id).await?;
         let key = cache::CacheKey {
             workspace_id: req.workspace_id.clone(),
             account_id: req.account_id.clone(),
+            provider_id: provider.provider_id,
+            provider_model: provider.model,
+            provider_generation: provider.generation,
+            prompt_pack_version: state
+                .prompt_pack_version
+                .load(std::sync::atomic::Ordering::SeqCst),
+            filter_norm: normalized_filter_key(&req.filter),
             query_norm: cache::normalize_query(&req.query),
-            corpus_sig: cache::corpus_signature(&sig_items),
+            corpus_sig,
             max_rounds,
         };
         if let Some(cached) = cache::get(&key) {
@@ -745,12 +766,18 @@ async fn answer_inner(
             break;
         }
         if let Some(budget) = current_run_budget() {
-            if budget.is_exceeded() {
+            if budget.should_stop_optional_llm_calls() {
+                let stop_reason = if budget.is_exceeded() {
+                    "budget_exceeded"
+                } else {
+                    budget.mark_degraded("knowledge_agent_stopped_usage_unknown");
+                    "usage_unknown"
+                };
                 push_trace(
                     &mut tool_trace,
                     tx,
                     doc! {
-                        "tool": "budget_exceeded",
+                        "tool": stop_reason,
                         "round": round,
                     },
                 );
@@ -779,6 +806,7 @@ async fn answer_inner(
             });
             let value = super::generate_agent_json_streaming(
                 state,
+                &req.workspace_id,
                 req.account_id.as_deref(),
                 None,
                 None,
@@ -795,6 +823,7 @@ async fn answer_inner(
         } else {
             generate_agent_json(
                 state,
+                &req.workspace_id,
                 req.account_id.as_deref(),
                 None,
                 None,
@@ -841,21 +870,30 @@ async fn answer_inner(
 
         match action {
             AgentAction::ListCatalog { filter } => {
-                catalog = list_catalog(
-                    state,
-                    &req.workspace_id,
-                    req.account_id.as_deref(),
-                    &filter,
-                    Some(&req.query),
-                )
-                .await?;
+                let effective_filter = intersect_catalog_filters(&req.filter, &filter);
+                catalog = match effective_filter.as_ref() {
+                    Some(filter) => {
+                        list_catalog(
+                            state,
+                            &req.workspace_id,
+                            req.account_id.as_deref(),
+                            filter,
+                            Some(&req.query),
+                        )
+                        .await?
+                    }
+                    None => Vec::new(),
+                };
                 push_trace(
                     &mut tool_trace,
                     tx,
                     doc! {
                         "tool": "list_catalog",
                         "round": round,
-                        "filter": filter_to_doc(&filter),
+                        "filter": effective_filter
+                            .as_ref()
+                            .map(filter_to_doc)
+                            .unwrap_or_else(|| doc! { "impossible": true }),
                         "returned": catalog.len() as i32,
                     },
                 );
@@ -867,6 +905,7 @@ async fn answer_inner(
                     req.account_id.as_deref(),
                     &document_id,
                     Some(&req.query),
+                    &req.filter,
                 )
                 .await?;
                 let appended = entries.len() as i32;
@@ -889,7 +928,9 @@ async fn answer_inner(
                     if opened_seen.contains(&id) {
                         continue;
                     }
-                    match open_chunk(state, &req.workspace_id, &id).await? {
+                    match open_chunk(state, &req.workspace_id, req.account_id.as_deref(), &id)
+                        .await?
+                    {
                         Some(full) => {
                             // D3(b)：open_chunk 可能把已被取代的旧版 redirect 到现行版本，
                             // 故 opened_seen / opened_now 记 **full.chunk_id**（现行版 id）而非
@@ -918,9 +959,15 @@ async fn answer_inner(
             }
             AgentAction::FollowRelations { chunk_id, depth } => {
                 let depth = depth.unwrap_or(1).clamp(1, 2);
-                let (entries, prefetched) =
-                    follow_relations(state, &req.workspace_id, &chunk_id, depth, &opened_seen)
-                        .await?;
+                let (entries, prefetched) = follow_relations(
+                    state,
+                    &req.workspace_id,
+                    req.account_id.as_deref(),
+                    &chunk_id,
+                    depth,
+                    &opened_seen,
+                )
+                .await?;
                 let appended = entries.len() as i32;
                 merge_catalog(&mut catalog, entries);
                 // 关联目标的完整正文直接载入 opened（镜像 OpenChunk 分支），
@@ -987,7 +1034,17 @@ async fn answer_inner(
                     cancelled: false,
                 };
                 if let Some(k) = cache_key.clone() {
-                    cache::put(k, result.clone());
+                    // A hot swap may happen after lookup and before the final
+                    // LLM round. Never store a new generation's answer under
+                    // the generation observed at lookup.
+                    let provider =
+                        current_provider_cache_identity(state, &req.workspace_id).await?;
+                    if k.provider_id == provider.provider_id
+                        && k.provider_model == provider.model
+                        && k.provider_generation == provider.generation
+                    {
+                        cache::put(k, result.clone());
+                    }
                 }
                 return Ok(result);
             }
@@ -1121,6 +1178,7 @@ const MAX_REDIRECT_HOPS: usize = 8;
 async fn resolve_superseded(
     state: &AppState,
     workspace_id: &str,
+    account_id: Option<&str>,
     start: ObjectId,
 ) -> AppResult<ObjectId> {
     let mut current = start;
@@ -1130,7 +1188,10 @@ async fn resolve_superseded(
         let chunk = state
             .db
             .operation_knowledge_chunks()
-            .find_one(doc! { "_id": current, "workspace_id": workspace_id }, None)
+            .find_one(
+                chunk_scope_filter(workspace_id, account_id, doc! { "_id": current }),
+                None,
+            )
             .await?;
         let Some(chunk) = chunk else {
             return Ok(current);
@@ -1153,11 +1214,11 @@ async fn resolve_superseded(
             .db
             .operation_knowledge_chunks()
             .find_one(
-                doc! {
-                    "_id": next_oid,
-                    "workspace_id": workspace_id,
-                    "integrity_status": "verified",
-                },
+                visible_chunk_filter(
+                    workspace_id,
+                    account_id,
+                    doc! { "_id": next_oid, "integrity_status": "verified" },
+                ),
                 None,
             )
             .await?
@@ -1181,6 +1242,7 @@ async fn resolve_superseded(
 pub async fn open_chunk(
     state: &AppState,
     workspace_id: &str,
+    account_id: Option<&str>,
     chunk_id: &str,
 ) -> AppResult<Option<ChunkFull>> {
     let oid = match ObjectId::parse_str(chunk_id) {
@@ -1188,16 +1250,16 @@ pub async fn open_chunk(
         Err(_) => return Ok(None),
     };
     // D3(b)：先把已被取代的旧版 redirect 到现行版本（新版必须 verified）。
-    let resolved = resolve_superseded(state, workspace_id, oid).await?;
+    let resolved = resolve_superseded(state, workspace_id, account_id, oid).await?;
     let result = state
         .db
         .operation_knowledge_chunks()
         .find_one(
-            doc! {
-                "_id": resolved,
-                "workspace_id": workspace_id,
-                "integrity_status": "verified",
-            },
+            visible_chunk_filter(
+                workspace_id,
+                account_id,
+                doc! { "_id": resolved, "integrity_status": "verified" },
+            ),
             None,
         )
         .await?;
@@ -1215,6 +1277,7 @@ pub async fn open_document(
     account_id: Option<&str>,
     document_id: &str,
     query: Option<&str>,
+    filter: &CatalogFilter,
 ) -> AppResult<Vec<CatalogEntry>> {
     let doc_oid = match ObjectId::parse_str(document_id) {
         Ok(oid) => oid,
@@ -1224,11 +1287,21 @@ pub async fn open_document(
         "workspace_id": workspace_id,
         "domain": "user_operations",
         "document_id": doc_oid,
-        "status": "active",
-        "integrity_status": "verified",
+        "status": filter.status.clone().unwrap_or_else(|| "active".to_string()),
         "$or": account_or(account_id),
     };
-    let _ = &mut q;
+    if !filter.include_unverified {
+        q.insert("integrity_status", "verified");
+    }
+    if !filter.wiki_types.is_empty() {
+        q.insert("wiki_type", doc! { "$in": filter.wiki_types.clone() });
+    }
+    if !filter.business_topics.is_empty() {
+        q.insert(
+            "business_topics",
+            doc! { "$in": filter.business_topics.clone() },
+        );
+    }
     let mut cursor = state
         .db
         .operation_knowledge_chunks()
@@ -1256,6 +1329,7 @@ pub async fn open_document(
 pub async fn follow_relations(
     state: &AppState,
     workspace_id: &str,
+    account_id: Option<&str>,
     chunk_id: &str,
     depth: u32,
     opened_seen: &HashSet<String>,
@@ -1279,7 +1353,10 @@ pub async fn follow_relations(
             let chunk = state
                 .db
                 .operation_knowledge_chunks()
-                .find_one(doc! { "_id": oid, "workspace_id": workspace_id }, None)
+                .find_one(
+                    visible_chunk_filter(workspace_id, account_id, doc! { "_id": oid }),
+                    None,
+                )
                 .await?;
             let Some(chunk) = chunk else { continue };
             let related = chunk.related_chunks.unwrap_or_default();
@@ -1306,7 +1383,8 @@ pub async fn follow_relations(
                     Err(_) => continue,
                 };
                 // D3(b)：关系目标若已被取代，redirect 到现行版本再收集，避免旧版正文进 opened。
-                let resolved_oid = resolve_superseded(state, workspace_id, target_oid).await?;
+                let resolved_oid =
+                    resolve_superseded(state, workspace_id, account_id, target_oid).await?;
                 let resolved_hex = resolved_oid.to_hex();
                 // redirect 后的现行版可能已被 open / 已收集过 → 去重。
                 if opened_seen.contains(&resolved_hex) || !visited.insert(resolved_hex.clone()) {
@@ -1316,12 +1394,11 @@ pub async fn follow_relations(
                     .db
                     .operation_knowledge_chunks()
                     .find_one(
-                        doc! {
-                            "_id": resolved_oid,
-                            "workspace_id": workspace_id,
-                            "status": "active",
-                            "integrity_status": "verified",
-                        },
+                        visible_chunk_filter(
+                            workspace_id,
+                            account_id,
+                            doc! { "_id": resolved_oid, "integrity_status": "verified" },
+                        ),
                         None,
                     )
                     .await?
@@ -1869,6 +1946,169 @@ fn account_or(account_id: Option<&str>) -> Vec<Document> {
     }
 }
 
+/// Account/domain capability only. This intentionally does not require an
+/// active/verified row: an archived predecessor must remain readable just
+/// long enough to resolve its `superseded_by` pointer. Callers that expose
+/// content must apply [`visible_chunk_filter`] to the final target.
+fn chunk_scope_filter(workspace_id: &str, account_id: Option<&str>, extra: Document) -> Document {
+    let mut filter = doc! {
+        "workspace_id": workspace_id,
+        "domain": "user_operations",
+        "$or": account_or(account_id),
+    };
+    filter.extend(extra);
+    filter
+}
+
+fn visible_chunk_filter(workspace_id: &str, account_id: Option<&str>, extra: Document) -> Document {
+    let mut filter = chunk_scope_filter(
+        workspace_id,
+        account_id,
+        doc! {
+            "status": "active",
+            "integrity_status": "verified",
+        },
+    );
+    filter.extend(extra);
+    filter
+}
+
+async fn visible_corpus_signature(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: Option<&str>,
+) -> AppResult<u64> {
+    let options = FindOptions::builder()
+        .projection(doc! { "_id": 1_i32, "updated_at": 1_i32 })
+        .sort(doc! { "_id": 1_i32 })
+        .build();
+    let mut cursor = state
+        .db
+        .raw()
+        .collection::<Document>("operation_knowledge_chunks")
+        .find(
+            chunk_scope_filter(workspace_id, account_id, Document::new()),
+            options,
+        )
+        .await?;
+    let mut items = Vec::new();
+    while let Some(item) = cursor.try_next().await? {
+        let id = item
+            .get_object_id("_id")
+            .map(|value| value.to_hex())
+            .unwrap_or_else(|_| "missing-object-id".to_string());
+        let updated_at = item
+            .get_datetime("updated_at")
+            .map(|value| value.timestamp_millis())
+            .unwrap_or(i64::MIN);
+        items.push((id, updated_at));
+    }
+    Ok(cache::corpus_signature(&items))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProviderCacheIdentity {
+    provider_id: String,
+    model: String,
+    generation: u64,
+}
+
+async fn current_provider_cache_identity(
+    state: &AppState,
+    workspace_id: &str,
+) -> AppResult<ProviderCacheIdentity> {
+    match state.llm_registry.as_ref() {
+        Some(registry) => {
+            let snapshot = registry.snapshot(workspace_id).await?;
+            Ok(ProviderCacheIdentity {
+                provider_id: snapshot.meta.provider_id,
+                model: snapshot.meta.model,
+                generation: snapshot.generation,
+            })
+        }
+        None => Ok(ProviderCacheIdentity {
+            provider_id: "injected".to_string(),
+            model: state.config.openai_model.clone(),
+            generation: 0,
+        }),
+    }
+}
+
+fn normalized_filter_key(filter: &CatalogFilter) -> String {
+    fn normalized_values(values: &[String]) -> String {
+        let mut values: Vec<String> = values
+            .iter()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .collect();
+        values.sort();
+        values.dedup();
+        values.join("\u{1f}")
+    }
+
+    format!(
+        "wiki={};topics={};status={};include_unverified={}",
+        normalized_values(&filter.wiki_types),
+        normalized_values(&filter.business_topics),
+        filter.status.as_deref().map(str::trim).unwrap_or("active"),
+        filter.include_unverified,
+    )
+}
+
+fn intersect_catalog_filters(
+    base: &CatalogFilter,
+    requested: &CatalogFilter,
+) -> Option<CatalogFilter> {
+    fn intersect_values(base: &[String], requested: &[String]) -> Option<Vec<String>> {
+        let normalize = |values: &[String]| {
+            values
+                .iter()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .collect::<HashSet<_>>()
+        };
+        let base = normalize(base);
+        let requested = normalize(requested);
+        let both_scoped = !base.is_empty() && !requested.is_empty();
+        let mut values: Vec<String> = if base.is_empty() {
+            requested.into_iter().collect()
+        } else if requested.is_empty() {
+            base.into_iter().collect()
+        } else {
+            base.intersection(&requested).cloned().collect()
+        };
+        if both_scoped && values.is_empty() {
+            return None;
+        }
+        values.sort();
+        Some(values)
+    }
+
+    let explicit_status = |filter: &CatalogFilter| -> Option<String> {
+        filter
+            .status
+            .as_deref()
+            .map(str::trim)
+            .filter(|status| !status.is_empty())
+            .map(ToString::to_string)
+    };
+    let base_status = explicit_status(base).unwrap_or_else(|| "active".to_string());
+    if explicit_status(requested)
+        .as_deref()
+        .is_some_and(|requested| requested != base_status.as_str())
+    {
+        return None;
+    }
+    let status = Some(base_status);
+
+    Some(CatalogFilter {
+        wiki_types: intersect_values(&base.wiki_types, &requested.wiki_types)?,
+        business_topics: intersect_values(&base.business_topics, &requested.business_topics)?,
+        status,
+        include_unverified: base.include_unverified && requested.include_unverified,
+    })
+}
+
 /// 语言无关的 query↔文本相关度，落在 `[0,1]`：query 的检索信号在候选文本里被
 /// 覆盖的比例。CJK 用相邻字符 bigram（单字回退 unigram）、ASCII 用连续 alnum
 /// token。零依赖、对中英混排鲁棒，**不是**针对任何样本调过的特征——纯覆盖率。
@@ -2084,6 +2324,63 @@ mod tests {
 
         assert!(cited.is_empty());
         assert!(quotes.is_empty());
+    }
+
+    #[test]
+    fn catalog_filter_intersection_never_widens_initial_scope() {
+        let base = CatalogFilter {
+            wiki_types: vec!["methodology".to_string(), "finding".to_string()],
+            business_topics: vec!["sales".to_string()],
+            status: None,
+            include_unverified: false,
+        };
+        let requested = CatalogFilter {
+            wiki_types: vec!["finding".to_string(), "source".to_string()],
+            business_topics: Vec::new(),
+            status: None,
+            include_unverified: true,
+        };
+
+        let effective = intersect_catalog_filters(&base, &requested)
+            .expect("overlapping filters must remain satisfiable");
+        assert_eq!(effective.wiki_types, vec!["finding"]);
+        assert_eq!(effective.business_topics, vec!["sales"]);
+        assert_eq!(effective.status.as_deref(), Some("active"));
+        assert!(!effective.include_unverified);
+    }
+
+    #[test]
+    fn catalog_filter_intersection_rejects_conflicting_scope() {
+        let base = CatalogFilter {
+            wiki_types: vec!["methodology".to_string()],
+            status: None,
+            ..CatalogFilter::default()
+        };
+        let disjoint_type = CatalogFilter {
+            wiki_types: vec!["source".to_string()],
+            ..CatalogFilter::default()
+        };
+        assert!(intersect_catalog_filters(&base, &disjoint_type).is_none());
+
+        let archived = CatalogFilter {
+            status: Some("archived".to_string()),
+            ..CatalogFilter::default()
+        };
+        assert!(intersect_catalog_filters(&base, &archived).is_none());
+    }
+
+    #[test]
+    fn catalog_filter_intersection_inherits_non_default_status_when_model_omits_it() {
+        let base = CatalogFilter {
+            status: Some("draft".to_string()),
+            include_unverified: true,
+            ..CatalogFilter::default()
+        };
+
+        let effective = intersect_catalog_filters(&base, &CatalogFilter::default())
+            .expect("omitted model status must inherit the initial capability");
+        assert_eq!(effective.status.as_deref(), Some("draft"));
+        assert!(!effective.include_unverified);
     }
 
     #[test]

@@ -87,7 +87,7 @@ fn structured(id: &str, text: &str, due_at: Option<DateTime>) -> CommitmentRepr 
 #[tokio::test]
 #[ignore]
 async fn planner_emits_commitment_overdue_and_imminent_only() {
-    let app = common::TestApp::start().await;
+    let app = common::TestApp::start_repl_set().await;
     let now_ms = DateTime::now().timestamp_millis();
 
     // 1) overdue: due_at 在 5 小时前

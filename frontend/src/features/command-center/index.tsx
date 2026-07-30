@@ -18,7 +18,7 @@ type ResultTone = "good" | "error" | "warn" | "neutral";
 function resultTone(status?: string): ResultTone {
   const s = (status || "").toLowerCase();
   if (s.includes("succeeded") || s.includes("success") || s === "ok") return "good";
-  if (s.includes("fail") || s.includes("error") || s.includes("blocked")) return "error";
+  if (s.includes("fail") || s.includes("error") || s.includes("blocked") || s.includes("unknown")) return "error";
   if (s.includes("dry") || s.includes("warn") || s.includes("pending")) return "warn";
   return "neutral";
 }
@@ -37,10 +37,14 @@ function callStatusLabel(status: string): string {
       return "❌ 失败";
     case "executed_unverified":
       return "⚠️ 待核实";
+    case "execution_unknown":
+      return "⛔ 结果未知，已停止重放";
     case "dry_run":
       return "演练";
-    case "running":
+    case "executing":
       return "进行中";
+    case "prepared":
+      return "待执行";
     default:
       return status;
   }
@@ -104,6 +108,7 @@ const COMMAND_STATUS_LABELS: Record<string, string> = {
   running: "执行中",
   pending_confirmation: "待确认",
   failed: "已失败",
+  execution_unknown: "执行结果未知，已停止自动重放",
   dry_run: "演练（未真实执行）",
   succeeded: "已完成",
 };
@@ -119,6 +124,8 @@ export default function CommandCenterFeature() {
   const currentAccount = useAccountStore((s) => s.currentAccount());
 
   const managedCount = useContactStore((s) => s.managedCount());
+  const contactDataAccountId = useContactStore((s) => s.dataAccountId);
+  const loadContacts = useContactStore((s) => s.loadContacts);
 
   const {
     commandDraft,
@@ -130,6 +137,7 @@ export default function CommandCenterFeature() {
     pendingTasks,
     setCommandDraft,
     setCommandDryRun,
+    clearCommandResult,
     loadCommandData,
     runCommand,
     confirmCommand,
@@ -137,8 +145,17 @@ export default function CommandCenterFeature() {
   } = useCommandStore();
 
   useEffect(() => {
+    const result = useCommandStore.getState().commandResult;
+    if (result && result.accountId !== currentAccountId) {
+      clearCommandResult();
+    }
     loadCommandData(currentAccountId);
-  }, [currentAccountId, loadCommandData]);
+  }, [currentAccountId, clearCommandResult, loadCommandData]);
+
+  useEffect(() => {
+    if (!currentAccountId || contactDataAccountId === currentAccountId) return;
+    void loadContacts(currentAccountId, undefined, { silent: true });
+  }, [contactDataAccountId, currentAccountId, loadContacts]);
 
   const handleRunCommand = () => {
     if (currentAccountId) {
@@ -174,10 +191,15 @@ export default function CommandCenterFeature() {
           </div>
           <div className={styles.boundaryBox}>
             <strong>执行边界</strong>
-            <p>当前版本开放完整 MCP 工具目录给 Management Agent，所有调用通过后端账号凭证代理并写入审计日志。</p>
+            <p>Management Agent 仅使用经审核的工具目录；裸发送能力已隔离，真实副作用需确认并写入审计日志。</p>
           </div>
           {currentAccount?.id && (
-            <McpKeyForm accountId={currentAccount.id} configured={!!currentAccount.mcpKeyConfigured} />
+            <McpKeyForm
+              key={`${currentAccount.id}:${currentAccount.accountId}`}
+              accountRecordId={currentAccount.id}
+              accountId={currentAccount.accountId}
+              configured={!!currentAccount.mcpKeyConfigured}
+            />
           )}
         </aside>
 
@@ -234,9 +256,11 @@ export default function CommandCenterFeature() {
             </div>
           )}
 
-          {commandResult?.status === "pending_confirmation" && (
+          {commandResult?.status === "pending_confirmation" &&
+            commandResult.accountId === currentAccountId &&
+            !!commandResult.planHash && (
             <div className={styles.confirmBar}>
-              <span className={styles.confirmHint}>该计划包含高风险操作，确认前不会真实执行。</span>
+              <span className={styles.confirmHint}>该计划包含真实副作用操作，确认前不会执行。</span>
               <div className={styles.confirmActions}>
                 <button
                   className={styles.confirmBtn}

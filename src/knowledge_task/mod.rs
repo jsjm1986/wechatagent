@@ -18,8 +18,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
-use mongodb::options::FindOneOptions;
+use mongodb::bson::{doc, oid::ObjectId, Bson, DateTime, Document};
+use mongodb::options::{FindOneAndUpdateOptions, ReturnDocument};
 use tokio::sync::{watch, Mutex, RwLock};
 
 use crate::agent::RunBudget;
@@ -29,6 +29,8 @@ use crate::routes::AppState;
 /// 单次 task step 的 LLM 预算（保守值；超额走 fail-soft 标记本步失败）。
 const STEP_TOKEN_BUDGET: i64 = 8_000;
 const STEP_MAX_LLM_CALLS: i32 = 4;
+const TASK_LEASE_SECONDS: i64 = 120;
+const TASK_HEARTBEAT_SECONDS: u64 = 20;
 
 /// SSE 进度总线：`session_id → watch::Sender<u64>`，值是该 session 最新 turn_index。
 /// 每写一条新 turn 就 `send_modify(|v| *v += 1)`，订阅端拿到新版本号后回拉 history。
@@ -161,53 +163,697 @@ pub async fn worker_loop(state: AppState) {
     }
 }
 
-/// 单次 tick：取最早 pending task 的 sessionId 排队执行；同 sessionId 串行。
-pub async fn tick_once(state: &AppState, bus: &Arc<ChatProgressBus>) -> anyhow::Result<()> {
-    let collection = state.db.knowledge_chat_tasks();
-    let task = collection
-        .find_one(
-            doc! { "status": "pending" },
-            FindOneOptions::builder()
-                .sort(doc! { "created_at": 1 })
+fn task_worker_id() -> String {
+    let host = std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "unknown".to_string());
+    format!("{host}:{}:{}", std::process::id(), uuid::Uuid::new_v4())
+}
+
+fn task_lease_until(now: DateTime) -> DateTime {
+    DateTime::from_millis(now.timestamp_millis() + TASK_LEASE_SECONDS * 1000)
+}
+
+fn task_claim_filter(task_id: Option<ObjectId>, now: DateTime) -> Document {
+    let mut filter = doc! {
+        "$or": [
+            { "status": "pending" },
+            {
+                "status": "running",
+                "$or": [
+                    { "locked_until": { "$lte": now } },
+                    { "locked_until": null },
+                    { "locked_until": { "$exists": false } },
+                ],
+            },
+        ],
+    };
+    if let Some(task_id) = task_id {
+        filter.insert("_id", task_id);
+    }
+    filter
+}
+
+async fn claim_task(
+    state: &AppState,
+    task_id: Option<ObjectId>,
+) -> anyhow::Result<Option<KnowledgeChatTask>> {
+    let now = DateTime::now();
+    let worker_id = task_worker_id();
+    let claim_token = uuid::Uuid::new_v4().to_string();
+    let claimed = state
+        .db
+        .knowledge_chat_tasks()
+        .find_one_and_update(
+            task_claim_filter(task_id, now),
+            doc! {
+                "$set": {
+                    "status": "running",
+                    "worker_id": &worker_id,
+                    "claim_token": &claim_token,
+                    "locked_until": task_lease_until(now),
+                    "heartbeat_at": now,
+                    "started_at": now,
+                    "finished_at": null,
+                    "error_kind": null,
+                },
+                "$inc": {
+                    "attempts": 1i32,
+                    "claim_generation": 1i64,
+                },
+            },
+            FindOneAndUpdateOptions::builder()
+                .sort(doc! { "created_at": 1, "_id": 1 })
+                .return_document(ReturnDocument::After)
                 .build(),
         )
         .await?;
+    Ok(claimed)
+}
+
+fn task_claim_identity(task: &KnowledgeChatTask) -> anyhow::Result<Document> {
+    Ok(doc! {
+        "_id": task.id.ok_or_else(|| anyhow::anyhow!("knowledge task missing _id"))?,
+        "status": "running",
+        "worker_id": task.worker_id.as_deref().ok_or_else(|| anyhow::anyhow!("knowledge task missing worker_id"))?,
+        "claim_token": task.claim_token.as_deref().ok_or_else(|| anyhow::anyhow!("knowledge task missing claim_token"))?,
+        "claim_generation": task.claim_generation,
+    })
+}
+
+fn active_task_claim_filter(task: &KnowledgeChatTask, now: DateTime) -> anyhow::Result<Document> {
+    let mut filter = task_claim_identity(task)?;
+    filter.insert("locked_until", doc! { "$gt": now });
+    Ok(filter)
+}
+
+struct TaskHeartbeatGuard(tokio::task::JoinHandle<()>);
+
+impl Drop for TaskHeartbeatGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+fn spawn_task_heartbeat(
+    state: AppState,
+    task: KnowledgeChatTask,
+    transaction_gate: Arc<Mutex<()>>,
+) -> TaskHeartbeatGuard {
+    TaskHeartbeatGuard(tokio::spawn(async move {
+        let Ok(identity) = task_claim_identity(&task) else {
+            return;
+        };
+        let mut ticker = tokio::time::interval(Duration::from_secs(TASK_HEARTBEAT_SECONDS));
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let _gate = transaction_gate.lock().await;
+            let now = DateTime::now();
+            let mut live_identity = identity.clone();
+            live_identity.insert("locked_until", doc! { "$gt": now });
+            let result = state
+                .db
+                .knowledge_chat_tasks()
+                .update_one(
+                    live_identity,
+                    doc! { "$set": {
+                        "heartbeat_at": now,
+                        "locked_until": task_lease_until(now),
+                    } },
+                    None,
+                )
+                .await;
+            match result {
+                Ok(update) if update.matched_count == 1 => {}
+                Ok(_) => break,
+                Err(error) => {
+                    tracing::warn!(?error, "knowledge task heartbeat failed");
+                    break;
+                }
+            }
+        }
+    }))
+}
+
+fn collect_step_result(
+    entry: &Document,
+    needs_review: &mut Vec<String>,
+    failed_steps: &mut Vec<String>,
+    needs_manual_steps: &mut Vec<String>,
+    noop_steps: &mut Vec<String>,
+    committed_steps: &mut usize,
+) {
+    let step_id = entry.get_str("stepId").unwrap_or("").to_string();
+    match entry.get_str("status").unwrap_or("failed") {
+        "committed" => {
+            *committed_steps += 1;
+            if let Ok(chunk_id) = entry.get_str("chunkId") {
+                if !chunk_id.is_empty() {
+                    needs_review.push(chunk_id.to_string());
+                }
+            }
+        }
+        "noop" => noop_steps.push(step_id),
+        "needs_manual" => needs_manual_steps.push(step_id),
+        _ => failed_steps.push(step_id),
+    }
+}
+
+fn step_outcome_entry(
+    step_id: &str,
+    card_id: &str,
+    action: &str,
+    outcome: &StepOutcome,
+) -> Document {
+    let mut entry = doc! {
+        "stepId": step_id,
+        "cardId": card_id,
+        "action": action,
+        "status": outcome.verdict.as_str(),
+    };
+    if let Some(chunk_id) = outcome.chunk_id.as_deref() {
+        entry.insert("chunkId", chunk_id);
+    }
+    if outcome.verdict == StepVerdict::Failed && !outcome.message.trim().is_empty() {
+        entry.insert("error", outcome.message.clone());
+    }
+    if let Some(details) = outcome.details.as_ref() {
+        entry.insert("repairDraft", details.clone());
+    }
+    entry
+}
+
+fn find_step_intent(task: &KnowledgeChatTask, step_id: &str, action: &str) -> Option<Document> {
+    task.step_intents
+        .iter()
+        .find(|intent| {
+            intent.get_str("stepId").ok() == Some(step_id)
+                && intent.get_str("action").ok() == Some(action)
+        })
+        .and_then(|intent| intent.get_document("payload").ok())
+        .cloned()
+}
+
+async fn persist_step_intent(
+    state: &AppState,
+    task: &KnowledgeChatTask,
+    step_id: &str,
+    action: &str,
+    payload: Document,
+) -> anyhow::Result<Option<Document>> {
+    if let Some(existing) = find_step_intent(task, step_id, action) {
+        return Ok(Some(existing));
+    }
+
+    let mut filter = active_task_claim_filter(task, DateTime::now())?;
+    filter.insert(
+        "step_intents",
+        doc! { "$not": { "$elemMatch": { "stepId": step_id } } },
+    );
+    let intent = doc! {
+        "stepId": step_id,
+        "action": action,
+        "payload": payload.clone(),
+        "preparedAt": DateTime::now(),
+    };
+    let inserted = state
+        .db
+        .knowledge_chat_tasks()
+        .update_one(filter, doc! { "$push": { "step_intents": intent } }, None)
+        .await?;
+    if inserted.matched_count == 1 {
+        return Ok(Some(payload));
+    }
+
+    let current = state
+        .db
+        .knowledge_chat_tasks()
+        .find_one(active_task_claim_filter(task, DateTime::now())?, None)
+        .await?;
+    Ok(current.and_then(|row| find_step_intent(&row, step_id, action)))
+}
+
+enum MutatingStepPreparation {
+    Ready(Document),
+    Outcome(StepOutcome),
+}
+
+async fn prepare_mutating_step(
+    state: &AppState,
+    task: &KnowledgeChatTask,
+    step_id: &str,
+    action: &str,
+    step: &Document,
+) -> anyhow::Result<MutatingStepPreparation> {
+    match action {
+        "add_chunk" => {
+            let summary = step.get_str("summary").unwrap_or("").trim().to_string();
+            if summary.is_empty() {
+                return Ok(MutatingStepPreparation::Outcome(StepOutcome {
+                    verdict: StepVerdict::Failed,
+                    chunk_id: None,
+                    message: "缺 summary 上下文，未起草新条目".to_string(),
+                    details: None,
+                }));
+            }
+            let system = crate::prompts::load_prompt(
+                &state.db,
+                &task.workspace_id,
+                "knowledge.chat.draft_chunk",
+            )
+            .await
+            .unwrap_or_else(|_| {
+                "你是知识库对话 Agent，起草新切片草稿。只输出 JSON: {patch, missingFields, followupQuestions, naturalReply}.".to_string()
+            });
+            let user = format!(
+                r#"请基于下面的运营待办摘要起草一条新知识切片草稿。
+
+待办摘要：
+{summary}
+
+起草要求：
+- patch 必须含非空的 title、summary、body 三者。
+- body（正文）承载可验证事实，绝不能留空。
+- 信息不足以填某字段时，把字段名写进 missingFields，不要编造内容。
+
+只输出 JSON 起草一条新切片草稿。"#
+            );
+            let run_id = format!("knowledge-task-add-{step_id}");
+            match crate::agent::generate_agent_json(
+                state,
+                &task.workspace_id,
+                Some(&task.account_id),
+                None,
+                Some(&run_id),
+                "knowledge.chat.draft_chunk",
+                &system,
+                &user,
+            )
+            .await
+            {
+                Ok(value) => {
+                    let patch = value
+                        .get("patch")
+                        .and_then(|value| mongodb::bson::to_document(value).ok())
+                        .unwrap_or_default();
+                    if patch.is_empty() {
+                        Ok(MutatingStepPreparation::Outcome(StepOutcome {
+                            verdict: StepVerdict::Failed,
+                            chunk_id: None,
+                            message: "AI 未产出可落库的草稿字段".to_string(),
+                            details: None,
+                        }))
+                    } else {
+                        Ok(MutatingStepPreparation::Ready(doc! {
+                            "patch": patch,
+                            "summary": summary,
+                        }))
+                    }
+                }
+                Err(error) => Ok(MutatingStepPreparation::Outcome(StepOutcome {
+                    verdict: StepVerdict::Failed,
+                    chunk_id: None,
+                    message: format!("起草生成失败（{error}，fail-soft）"),
+                    details: None,
+                })),
+            }
+        }
+        "retag" => {
+            let Some(chunk_id) = step.get_str("targetChunkId").ok().map(str::to_string) else {
+                return Ok(MutatingStepPreparation::Outcome(StepOutcome {
+                    verdict: StepVerdict::Failed,
+                    chunk_id: None,
+                    message: "缺 targetChunkId，未重抽标签".to_string(),
+                    details: None,
+                }));
+            };
+            let Ok(object_id) = ObjectId::parse_str(&chunk_id) else {
+                return Ok(MutatingStepPreparation::Outcome(StepOutcome {
+                    verdict: StepVerdict::Failed,
+                    chunk_id: Some(chunk_id.clone()),
+                    message: format!("targetChunkId={chunk_id} 非法，未重抽标签"),
+                    details: None,
+                }));
+            };
+            let chunk = state
+                .db
+                .operation_knowledge_chunks()
+                .find_one(
+                    doc! {
+                        "_id": object_id,
+                        "workspace_id": &task.workspace_id,
+                        "domain": "user_operations",
+                        "$or": [
+                            { "account_id": null },
+                            { "account_id": &task.account_id },
+                        ],
+                    },
+                    None,
+                )
+                .await?;
+            let Some(chunk) = chunk else {
+                return Ok(MutatingStepPreparation::Outcome(StepOutcome {
+                    verdict: StepVerdict::Failed,
+                    chunk_id: Some(chunk_id.clone()),
+                    message: format!("chunk {chunk_id} 不存在，未重抽标签"),
+                    details: None,
+                }));
+            };
+            match crate::routes::knowledge::extract_knowledge_tags_inner(
+                state,
+                &task.workspace_id,
+                Some(&task.account_id),
+                &chunk.title,
+                chunk.body.as_deref().unwrap_or_default(),
+            )
+            .await
+            {
+                Ok((product_tags, business_topics)) => Ok(MutatingStepPreparation::Ready(doc! {
+                    "productTags": product_tags,
+                    "businessTopics": business_topics,
+                })),
+                Err(error) => Ok(MutatingStepPreparation::Outcome(StepOutcome {
+                    verdict: StepVerdict::NeedsManual,
+                    chunk_id: Some(chunk_id.clone()),
+                    message: format!("chunk {chunk_id} 重抽标签失败（{error}，fail-soft）"),
+                    details: None,
+                })),
+            }
+        }
+        "dismiss" => {
+            let card_id = step.get_str("cardId").unwrap_or("");
+            if ObjectId::parse_str(card_id).is_err() {
+                Ok(MutatingStepPreparation::Outcome(StepOutcome {
+                    verdict: StepVerdict::Failed,
+                    chunk_id: None,
+                    message: "缺有效 cardId，未忽略卡片".to_string(),
+                    details: None,
+                }))
+            } else {
+                Ok(MutatingStepPreparation::Ready(Document::new()))
+            }
+        }
+        _ => Err(anyhow::anyhow!("action is not mutating: {action}")),
+    }
+}
+
+async fn commit_mutating_step_once(
+    state: &AppState,
+    task: &KnowledgeChatTask,
+    step_id: &str,
+    card_id: &str,
+    action: &str,
+    step: &Document,
+    payload: Option<&Document>,
+) -> anyhow::Result<StepOutcome> {
+    let mut session = state.db.client().start_session(None).await?;
+    session.start_transaction(None).await?;
+    let result: anyhow::Result<StepOutcome> = async {
+        let mut ownership = active_task_claim_filter(task, DateTime::now())?;
+        ownership.insert(
+            "completed_steps",
+            doc! { "$not": { "$elemMatch": { "stepId": step_id } } },
+        );
+        if state
+            .db
+            .knowledge_chat_tasks()
+            .find_one_with_session(ownership.clone(), None, &mut session)
+            .await?
+            .is_none()
+        {
+            return Err(anyhow::anyhow!("knowledge_task_claim_lost"));
+        }
+
+        let outcome = match action {
+            "add_chunk" => {
+                let payload = payload.ok_or_else(|| anyhow::anyhow!("add_chunk intent missing"))?;
+                let patch = payload
+                    .get_document("patch")
+                    .map_err(|_| anyhow::anyhow!("add_chunk intent patch missing"))?;
+                let summary = payload.get_str("summary").unwrap_or("");
+                let result = crate::routes::knowledge::apply_create_chunk_with_session(
+                    state,
+                    &task.workspace_id,
+                    Some(&task.account_id),
+                    &format!("knowledge-task:{}:{step_id}", task.id.unwrap()),
+                    patch,
+                    None,
+                    summary,
+                    &mut session,
+                )
+                .await?;
+                let chunk_id = result
+                    .get("createdChunkId")
+                    .and_then(|value| value.as_str())
+                    .filter(|value| !value.trim().is_empty())
+                    .map(str::to_string)
+                    .ok_or_else(|| anyhow::anyhow!("add_chunk committed without createdChunkId"))?;
+                StepOutcome {
+                    verdict: StepVerdict::Committed,
+                    message: format!("已起草新知识切片草稿：{chunk_id}，请运营在编辑器审核"),
+                    chunk_id: Some(chunk_id),
+                    details: None,
+                }
+            }
+            "retag" => {
+                let payload = payload.ok_or_else(|| anyhow::anyhow!("retag intent missing"))?;
+                let chunk_id = step
+                    .get_str("targetChunkId")
+                    .map_err(|_| anyhow::anyhow!("retag targetChunkId missing"))?;
+                let product_tags = payload
+                    .get_array("productTags")
+                    .cloned()
+                    .unwrap_or_default();
+                let business_topics = payload
+                    .get_array("businessTopics")
+                    .cloned()
+                    .unwrap_or_default();
+                let patch = doc! {
+                    "productTags": Bson::Array(product_tags.clone()),
+                    "businessTopics": Bson::Array(business_topics.clone()),
+                };
+                crate::routes::knowledge::apply_update_chunk_with_session(
+                    state,
+                    &task.workspace_id,
+                    &task.account_id,
+                    chunk_id,
+                    &patch,
+                    "",
+                    None,
+                    &mut session,
+                )
+                .await?;
+                StepOutcome {
+                    verdict: StepVerdict::Committed,
+                    chunk_id: Some(chunk_id.to_string()),
+                    message: format!(
+                        "已为 chunk {chunk_id} 重抽标签（产品 {} / 主题 {}），落为待确认草稿",
+                        product_tags.len(),
+                        business_topics.len()
+                    ),
+                    details: None,
+                }
+            }
+            "dismiss" => {
+                let card_oid = ObjectId::parse_str(card_id)
+                    .map_err(|_| anyhow::anyhow!("dismiss cardId invalid"))?;
+                let report_date = step.get_str("reportDate").unwrap_or("");
+                let mut report_filter = doc! {
+                    "workspace_id": &task.workspace_id,
+                    "account_id": &task.account_id,
+                    "cards.cardId": card_oid,
+                };
+                if !report_date.is_empty() {
+                    report_filter.insert("report_date", report_date);
+                }
+                let updated = state
+                    .db
+                    .knowledge_daily_reports()
+                    .update_one_with_session(
+                        report_filter,
+                        doc! { "$addToSet": { "dismissed_card_ids": card_oid } },
+                        None,
+                        &mut session,
+                    )
+                    .await?;
+                if updated.matched_count == 0 {
+                    StepOutcome {
+                        verdict: StepVerdict::Failed,
+                        chunk_id: None,
+                        message: format!(
+                            "卡片 {card_id} 不属于当前 workspace/account/report，未忽略"
+                        ),
+                        details: None,
+                    }
+                } else if updated.modified_count == 0 {
+                    StepOutcome {
+                        verdict: StepVerdict::Noop,
+                        chunk_id: None,
+                        message: format!("卡片 {card_id} 已处于忽略状态"),
+                        details: None,
+                    }
+                } else {
+                    StepOutcome {
+                        verdict: StepVerdict::Committed,
+                        chunk_id: None,
+                        message: format!("已忽略卡片 {card_id}"),
+                        details: None,
+                    }
+                }
+            }
+            _ => return Err(anyhow::anyhow!("action is not mutating: {action}")),
+        };
+
+        let entry = step_outcome_entry(step_id, card_id, action, &outcome);
+        let persisted = state
+            .db
+            .knowledge_chat_tasks()
+            .update_one_with_session(
+                ownership,
+                doc! { "$push": { "completed_steps": entry } },
+                None,
+                &mut session,
+            )
+            .await?;
+        if persisted.matched_count != 1 {
+            return Err(anyhow::anyhow!("knowledge_task_claim_lost"));
+        }
+        Ok(outcome)
+    }
+    .await;
+
+    match result {
+        Ok(outcome) => {
+            crate::knowledge_wiki::chunk_revisions::commit_chunk_transaction(&mut session).await?;
+            Ok(outcome)
+        }
+        Err(error) => {
+            let _ = session.abort_transaction().await;
+            Err(error)
+        }
+    }
+}
+
+async fn persist_nonmutating_outcome_once(
+    state: &AppState,
+    task: &KnowledgeChatTask,
+    step_id: &str,
+    entry: Document,
+) -> anyhow::Result<bool> {
+    let mut outcome_filter = active_task_claim_filter(task, DateTime::now())?;
+    outcome_filter.insert(
+        "completed_steps",
+        doc! { "$not": { "$elemMatch": { "stepId": step_id } } },
+    );
+    let persisted = state
+        .db
+        .knowledge_chat_tasks()
+        .update_one(
+            outcome_filter,
+            doc! { "$push": { "completed_steps": entry } },
+            None,
+        )
+        .await?;
+    Ok(persisted.matched_count == 1)
+}
+
+fn task_final_status(failed_steps: &[String], needs_manual_steps: &[String]) -> &'static str {
+    if failed_steps.is_empty() && needs_manual_steps.is_empty() {
+        "completed"
+    } else {
+        "failed"
+    }
+}
+
+/// Thin production-path hooks for replica-set recovery redlines. They do not
+/// duplicate the worker protocol: tests use the same claim and transactional
+/// mutation helpers as the runtime worker.
+#[doc(hidden)]
+pub async fn claim_task_for_redline(
+    state: &AppState,
+    task_id: ObjectId,
+) -> anyhow::Result<Option<KnowledgeChatTask>> {
+    claim_task(state, Some(task_id)).await
+}
+
+#[doc(hidden)]
+pub async fn commit_add_chunk_step_for_redline(
+    state: &AppState,
+    task: &KnowledgeChatTask,
+    step_id: &str,
+    payload: &Document,
+) -> anyhow::Result<StepOutcome> {
+    commit_mutating_step_once(
+        state,
+        task,
+        step_id,
+        "",
+        "add_chunk",
+        &doc! { "stepId": step_id, "action": "add_chunk" },
+        Some(payload),
+    )
+    .await
+}
+
+/// 单次 tick：取最早 pending task 的 sessionId 排队执行；同 sessionId 串行。
+pub async fn tick_once(state: &AppState, bus: &Arc<ChatProgressBus>) -> anyhow::Result<()> {
+    let task = claim_task(state, None).await?;
     let Some(task) = task else {
         return Ok(());
     };
-    let session_id = task.session_id.clone();
-    let lock = bus.lock_for(&session_id).await;
+    let bus_key = crate::routes::knowledge::chat::chat_session_bus_key(
+        &task.workspace_id,
+        &task.account_id,
+        &task.session_id,
+    );
+    let lock = bus.lock_for(&bus_key).await;
     let _guard = lock.lock().await;
-    run_task(state, bus, task).await
+    run_claimed_task(state, bus, task).await
 }
 
 /// 执行单个任务：plannedSteps fail-soft 串行；每步写 progress turn；
-/// 全部完成写 summary turn；status 在 running / finished / failed / cancelled 之间迁移。
+/// 全部完成写 summary turn；status 在 running / completed / failed / cancelled 之间迁移。
 pub async fn run_task(
     state: &AppState,
     bus: &Arc<ChatProgressBus>,
     task: KnowledgeChatTask,
 ) -> anyhow::Result<()> {
-    let task_id = task.id.unwrap_or_else(ObjectId::new);
+    let task_id = task
+        .id
+        .ok_or_else(|| anyhow::anyhow!("knowledge task missing _id"))?;
+    let Some(claimed) = claim_task(state, Some(task_id)).await? else {
+        return Ok(());
+    };
+    run_claimed_task(state, bus, claimed).await
+}
+
+async fn run_claimed_task(
+    state: &AppState,
+    bus: &Arc<ChatProgressBus>,
+    task: KnowledgeChatTask,
+) -> anyhow::Result<()> {
+    let task_id = task
+        .id
+        .ok_or_else(|| anyhow::anyhow!("knowledge task missing _id"))?;
     let session_id = task.session_id.clone();
     let workspace_id = task.workspace_id.clone();
     let account_id = task.account_id.clone();
+    let bus_key = crate::routes::knowledge::chat::chat_session_bus_key(
+        &workspace_id,
+        &account_id,
+        &session_id,
+    );
     let collection = state.db.knowledge_chat_tasks();
+    let transaction_gate = Arc::new(Mutex::new(()));
+    let _heartbeat =
+        spawn_task_heartbeat(state.clone(), task.clone(), Arc::clone(&transaction_gate));
 
-    // 把 status 推进到 running；如果已经被取消，直接返回。
-    let started_at = DateTime::now();
-    let updated = collection
-        .update_one(
-            doc! { "_id": task_id, "status": "pending" },
-            doc! { "$set": { "status": "running", "started_at": started_at } },
-            None,
-        )
-        .await?;
-    if updated.matched_count == 0 {
-        // 任务已经被推进过（cancelled / 重复 tick）→ 既然不再触发后续 turn 写入，
-        // 顺便 close + schedule cleanup，避免长跑下 HashMap 单调增长。
-        bus.close(&session_id).await;
-        bus.schedule_cleanup(&session_id);
+    if collection
+        .find_one(active_task_claim_filter(&task, DateTime::now())?, None)
+        .await?
+        .is_none()
+    {
         return Ok(());
     }
 
@@ -223,7 +869,8 @@ pub async fn run_task(
     )
     .await?;
 
-    let mut completed_steps: Vec<Document> = Vec::with_capacity(total);
+    let mut completed_steps = Vec::with_capacity(task.completed_steps.len());
+    let mut completed_step_ids = HashSet::new();
     let mut needs_review: Vec<String> = Vec::new();
     let mut failed_steps: Vec<String> = Vec::new();
     let mut needs_manual_steps: Vec<String> = Vec::new();
@@ -231,17 +878,48 @@ pub async fn run_task(
     let mut committed_steps = 0usize;
     let mut cancelled = false;
 
+    for entry in &task.completed_steps {
+        let step_id = entry.get_str("stepId").unwrap_or("");
+        if step_id.is_empty() || !completed_step_ids.insert(step_id.to_string()) {
+            continue;
+        }
+        collect_step_result(
+            entry,
+            &mut needs_review,
+            &mut failed_steps,
+            &mut needs_manual_steps,
+            &mut noop_steps,
+            &mut committed_steps,
+        );
+        completed_steps.push(entry.clone());
+    }
+
     for (idx, step) in task.planned_steps.iter().enumerate() {
-        // 每步前检查 task.status；若 cancelled，立即停下并写 progress。
-        let current = collection.find_one(doc! { "_id": task_id }, None).await?;
-        if let Some(t) = current {
-            if t.status == "cancelled" {
-                cancelled = true;
-                break;
-            }
+        let step_id = step
+            .get_str("stepId")
+            .map(str::to_string)
+            .unwrap_or_else(|_| format!("legacy_step_{}", idx + 1));
+        if completed_step_ids.contains(&step_id) {
+            continue;
         }
 
-        let step_id = step.get_str("stepId").unwrap_or("").to_string();
+        // Side effects may start only while this exact generation still owns
+        // an unexpired lease. Cancellation and reclaim both make this miss.
+        if collection
+            .find_one(active_task_claim_filter(&task, DateTime::now())?, None)
+            .await?
+            .is_none()
+        {
+            cancelled = collection
+                .find_one(doc! { "_id": task_id, "status": "cancelled" }, None)
+                .await?
+                .is_some();
+            if cancelled {
+                break;
+            }
+            return Ok(());
+        }
+
         let action = step.get_str("action").unwrap_or("").to_string();
         let card_id = step.get_str("cardId").unwrap_or("").to_string();
         let summary_text = step.get_str("summary").unwrap_or("").to_string();
@@ -254,88 +932,87 @@ pub async fn run_task(
             i32::MAX,
         ));
 
-        let outcome = crate::agent::RUN_BUDGET
-            .scope(budget.clone(), async {
-                execute_step(state, &workspace_id, &account_id, &action, step).await
-            })
-            .await;
-
-        let mut entry = doc! {
-            "stepId": &step_id,
-            "cardId": &card_id,
-            "action": &action,
-        };
-        let progress_msg;
-        let mut step_details: Option<Document> = None;
-        match outcome {
-            Ok(StepOutcome {
-                verdict,
-                chunk_id,
-                message,
-                details,
-            }) => {
-                if verdict == StepVerdict::Committed {
-                    committed_steps += 1;
+        let is_mutating = matches!(action.as_str(), "add_chunk" | "retag" | "dismiss");
+        let (outcome, outcome_persisted) = if is_mutating {
+            let preparation = if let Some(payload) = find_step_intent(&task, &step_id, &action) {
+                MutatingStepPreparation::Ready(payload)
+            } else {
+                crate::agent::RUN_BUDGET
+                    .scope(budget.clone(), async {
+                        prepare_mutating_step(state, &task, &step_id, &action, step).await
+                    })
+                    .await?
+            };
+            match preparation {
+                MutatingStepPreparation::Outcome(outcome) => (outcome, false),
+                MutatingStepPreparation::Ready(payload) => {
+                    let Some(payload) =
+                        persist_step_intent(state, &task, &step_id, &action, payload).await?
+                    else {
+                        return Ok(());
+                    };
+                    let _gate = transaction_gate.lock().await;
+                    let outcome = commit_mutating_step_once(
+                        state,
+                        &task,
+                        &step_id,
+                        &card_id,
+                        &action,
+                        step,
+                        Some(&payload),
+                    )
+                    .await?;
+                    (outcome, true)
                 }
-                if verdict == StepVerdict::Committed {
-                    if let Some(cid) = chunk_id.as_deref() {
-                        needs_review.push(cid.to_string());
-                    }
-                }
-                if let Some(cid) = chunk_id.as_deref() {
-                    entry.insert("chunkId", cid);
-                }
-                entry.insert("status", verdict.as_str());
-                if verdict == StepVerdict::Failed && !message.trim().is_empty() {
-                    entry.insert("error", message.clone());
-                }
-                match verdict {
-                    StepVerdict::Committed => {}
-                    StepVerdict::Noop => noop_steps.push(step_id.clone()),
-                    StepVerdict::NeedsManual => needs_manual_steps.push(step_id.clone()),
-                    StepVerdict::Failed => failed_steps.push(step_id.clone()),
-                }
-                if let Some(d) = details.as_ref() {
-                    entry.insert("repairDraft", d.clone());
-                }
-                progress_msg = format!(
-                    "第 {}/{} 步 {} · {} · {}",
-                    idx + 1,
-                    total,
-                    verdict.as_str(),
-                    action,
-                    if message.is_empty() {
-                        summary_text.clone()
-                    } else {
-                        message
-                    }
-                );
-                step_details = details; // 供下方 write_progress_turn 的 turn details 使用
             }
-            Err(err) => {
-                let msg = format!("{err}");
-                entry.insert("status", "failed");
-                entry.insert("error", &msg);
-                failed_steps.push(step_id.clone());
-                progress_msg = format!(
-                    "第 {}/{} 步失败 · {} · {}（fail-soft，继续下一步）",
-                    idx + 1,
-                    total,
-                    action,
-                    msg
-                );
+        } else {
+            let outcome = crate::agent::RUN_BUDGET
+                .scope(budget.clone(), async {
+                    execute_step(state, &workspace_id, &account_id, &action, step).await
+                })
+                .await
+                .unwrap_or_else(|error| StepOutcome {
+                    verdict: StepVerdict::Failed,
+                    chunk_id: None,
+                    message: format!("{error}"),
+                    details: None,
+                });
+            (outcome, false)
+        };
+
+        let entry = step_outcome_entry(&step_id, &card_id, &action, &outcome);
+        if !outcome_persisted {
+            // Non-mutating outcomes and preparation failures have no business
+            // side effect to compose, but still require the current claim and
+            // stable stepId fence.
+            if !persist_nonmutating_outcome_once(state, &task, &step_id, entry.clone()).await? {
+                return Ok(());
             }
         }
 
+        collect_step_result(
+            &entry,
+            &mut needs_review,
+            &mut failed_steps,
+            &mut needs_manual_steps,
+            &mut noop_steps,
+            &mut committed_steps,
+        );
+        let progress_msg = format!(
+            "第 {}/{} 步 {} · {} · {}",
+            idx + 1,
+            total,
+            outcome.verdict.as_str(),
+            action,
+            if outcome.message.is_empty() {
+                summary_text
+            } else {
+                outcome.message.clone()
+            }
+        );
+        let step_details = outcome.details.clone();
+        completed_step_ids.insert(step_id.clone());
         completed_steps.push(entry.clone());
-        // append + persist
-        collection
-            .update_one(
-                doc! { "_id": task_id },
-                doc! { "$push": { "completed_steps": entry } },
-                None,
-            )
-            .await?;
         let mut turn_details = doc! {
             "taskId": task_id,
             "phase": "step",
@@ -357,14 +1034,14 @@ pub async fn run_task(
         .await?;
     }
 
-    let final_status = if cancelled {
-        "cancelled"
-    } else if failed_steps.len() == total && total > 0 {
-        "failed"
-    } else {
-        // P2-12：历史值 "finished" 重命名为 "completed"，与 ALLOWED_TASK_STATUS 对齐。
-        "completed"
-    };
+    if cancelled {
+        // The cancel endpoint already committed the authoritative terminal
+        // state. A cancelled owner no longer satisfies claim_identity.
+        return Ok(());
+    }
+    // P2-12：历史值 "finished" 重命名为 "completed"，与 ALLOWED_TASK_STATUS 对齐。
+    // SR-123：只有 committed/noop 组成的任务可完成；failed/needs_manual 都不得虚报成功。
+    let final_status = task_final_status(&failed_steps, &needs_manual_steps);
     debug_assert!(
         ALLOWED_TASK_STATUS.contains(&final_status),
         "final_status='{final_status}' 不在 ALLOWED_TASK_STATUS 闭集"
@@ -373,18 +1050,35 @@ pub async fn run_task(
     // 用 `status: "running"` 过滤：cancel 在循环检查之后到达时，状态已被
     // chat_task_cancel 改成 cancelled，filter 不会匹配，worker 不会把
     // cancelled 改写回 completed。正常 completed/failed 路径仍然命中。
-    collection
+    let error_kind = if !failed_steps.is_empty() {
+        Some("knowledge_task_step_failed")
+    } else if !needs_manual_steps.is_empty() {
+        Some("knowledge_task_needs_manual")
+    } else {
+        None
+    };
+    let finalized = collection
         .update_one(
-            doc! { "_id": task_id, "status": "running" },
+            active_task_claim_filter(&task, DateTime::now())?,
             doc! {
                 "$set": {
                     "status": final_status,
+                    "error_kind": error_kind,
                     "finished_at": finished_at,
-                }
+                },
+                "$unset": {
+                    "worker_id": "",
+                    "claim_token": "",
+                    "locked_until": "",
+                    "heartbeat_at": "",
+                },
             },
             None,
         )
         .await?;
+    if finalized.matched_count != 1 {
+        return Ok(());
+    }
 
     let dedup_review: Vec<String> = {
         let mut seen: HashSet<String> = HashSet::new();
@@ -393,19 +1087,16 @@ pub async fn run_task(
             .filter(|c| seen.insert(c.clone()))
             .collect()
     };
-    let summary_message = if cancelled {
-        format!("AI 派工任务被运营取消（taskId={task_id}）")
-    } else {
-        format!(
-            "AI 派工任务已完成 · 共 {} 步 · committed {} · noop {} · needs_manual {} · failed {} · 待运营审核 chunk {}",
-            total,
-            committed_steps,
-            noop_steps.len(),
-            needs_manual_steps.len(),
-            failed_steps.len(),
-            dedup_review.len()
-        )
-    };
+    let summary_message = format!(
+        "AI 派工任务已结束 · 状态 {} · 共 {} 步 · committed {} · noop {} · needs_manual {} · failed {} · 待运营审核 chunk {}",
+        final_status,
+        total,
+        committed_steps,
+        noop_steps.len(),
+        needs_manual_steps.len(),
+        failed_steps.len(),
+        dedup_review.len()
+    );
     write_summary_turn(
         state,
         bus,
@@ -462,14 +1153,15 @@ pub async fn run_task(
 
     // P1-6：终态后通知 SSE 订阅者关闭流——前端拉完最后一条 summary 后断
     // EventSource，避免「task 已经结束但 SSE 还在 keep-alive」浪费连接。
-    bus.close(&session_id).await;
+    bus.close(&bus_key).await;
 
     // P1-5：进入终态后异步清理 sender/lock；延迟 5 分钟，期间内仍允许 SSE 续连。
-    bus.schedule_cleanup(&session_id);
+    bus.schedule_cleanup(&bus_key);
 
     Ok(())
 }
 
+#[derive(Debug)]
 pub struct StepOutcome {
     /// 业务结果，而不是 Rust 调用是否成功。Worker 必须按此字段汇总，不能把
     /// `Ok(StepOutcome)` 一律记成成功。
@@ -542,6 +1234,7 @@ pub async fn execute_step(
             match crate::routes::knowledge::propose_chunk_repair_inner(
                 state,
                 workspace_id,
+                Some(_account_id),
                 object_id,
                 &run_id,
             )
@@ -618,6 +1311,7 @@ pub async fn execute_step(
             );
             match crate::agent::generate_agent_json(
                 state,
+                workspace_id,
                 Some(_account_id),
                 None,
                 Some(&run_id),
@@ -716,7 +1410,15 @@ pub async fn execute_step(
                 .db
                 .operation_knowledge_chunks()
                 .find_one(
-                    doc! { "_id": object_id, "workspace_id": workspace_id },
+                    doc! {
+                        "_id": object_id,
+                        "workspace_id": workspace_id,
+                        "domain": "user_operations",
+                        "$or": [
+                            { "account_id": null },
+                            { "account_id": _account_id },
+                        ],
+                    },
                     None,
                 )
                 .await?;
@@ -731,6 +1433,7 @@ pub async fn execute_step(
             let body = chunk.body.clone().unwrap_or_default();
             match crate::routes::knowledge::extract_knowledge_tags_inner(
                 state,
+                workspace_id,
                 Some(_account_id),
                 &chunk.title,
                 &body,
@@ -888,6 +1591,7 @@ pub async fn execute_step(
 async fn next_turn_index_atomic(
     state: &AppState,
     workspace_id: &str,
+    account_id: &str,
     session_id: &str,
 ) -> anyhow::Result<i32> {
     use mongodb::options::{FindOneAndUpdateOptions, ReturnDocument};
@@ -896,10 +1600,15 @@ async fn next_turn_index_atomic(
         .db
         .knowledge_chat_session_seqs()
         .find_one_and_update(
-            doc! { "_id": &key },
+            doc! {
+                "_id": &key,
+                "workspace_id": workspace_id,
+                "session_id": session_id,
+                "account_id": account_id,
+                "owner_admin_id": { "$type": "string" },
+            },
             doc! { "$inc": { "seq": 1i64 } },
             FindOneAndUpdateOptions::builder()
-                .upsert(true)
                 .return_document(ReturnDocument::After)
                 .build(),
         )
@@ -907,7 +1616,7 @@ async fn next_turn_index_atomic(
     let seq = updated
         .as_ref()
         .and_then(|d| d.get_i64("seq").ok())
-        .unwrap_or(1);
+        .ok_or_else(|| anyhow::anyhow!("chat_session_scope_conflict"))?;
     Ok(seq.try_into().unwrap_or(i32::MAX))
 }
 
@@ -968,7 +1677,7 @@ async fn write_kind_turn(
     // P1-7：worker 与 chat_turn / chat_task_create 三路并发写同 session 时，
     // `find_one(sort=desc).turn_index + 1` 会读到同一 last 制造重复索引。改成
     // `findOneAndUpdate $inc seq +1 upsert returnDocument=After` 单次原子调用。
-    let next_index = next_turn_index_atomic(state, workspace_id, session_id).await?;
+    let next_index = next_turn_index_atomic(state, workspace_id, account_id, session_id).await?;
     let turn = KnowledgeChatTurn {
         id: None,
         workspace_id: workspace_id.to_string(),
@@ -983,6 +1692,8 @@ async fn write_kind_turn(
         missing_fields: vec![],
         followup_questions: vec![],
         status: "pending".to_string(),
+        apply_result: None,
+        applied_at: None,
         tokens_used: 0,
         prompt_key: None,
         kind: Some(kind.to_string()),
@@ -994,13 +1705,42 @@ async fn write_kind_turn(
         .knowledge_chat_turns()
         .insert_one(turn, None)
         .await?;
-    bus.bump(session_id).await;
+    bus.bump(&crate::routes::knowledge::chat::chat_session_bus_key(
+        workspace_id,
+        account_id,
+        session_id,
+    ))
+    .await;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn task_terminal_status_never_hides_failed_or_manual_steps() {
+        assert_eq!(task_final_status(&[], &[]), "completed");
+        assert_eq!(task_final_status(&["failed".to_string()], &[]), "failed");
+        assert_eq!(task_final_status(&[], &["manual".to_string()]), "failed");
+    }
+
+    #[test]
+    fn claim_filter_accepts_pending_or_expired_running_only() {
+        let now = DateTime::from_millis(123_456);
+        let task_id = ObjectId::new();
+        let filter = task_claim_filter(Some(task_id), now);
+        assert_eq!(filter.get_object_id("_id").ok(), Some(task_id));
+        let choices = filter.get_array("$or").expect("claim choices");
+        assert_eq!(choices.len(), 2);
+        assert_eq!(
+            choices[0].as_document(),
+            Some(&doc! { "status": "pending" })
+        );
+        let recovery = choices[1].as_document().expect("recovery branch");
+        assert_eq!(recovery.get_str("status").ok(), Some("running"));
+        assert!(recovery.get_array("$or").is_ok());
+    }
 
     #[tokio::test]
     async fn chat_progress_bus_bumps_subscribers() {

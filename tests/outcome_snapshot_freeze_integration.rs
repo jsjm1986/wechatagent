@@ -154,7 +154,7 @@ async fn seed_pending_signal(
 #[tokio::test]
 #[ignore]
 async fn outcome_product_ref_freezes_snapshot_and_survives_later_price_change() {
-    let app = TestApp::start().await;
+    let app = TestApp::start_repl_set().await;
     let ws = app.state.config.default_workspace_id.clone();
 
     // seed active product。

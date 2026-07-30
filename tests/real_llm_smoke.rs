@@ -727,7 +727,7 @@ async fn t3_real_vision_extraction_keeps_needs_review() {
     let mut evidence = CapabilityEvidence::new("t3_vision_artifact");
     // vision 也需要真实 key（副模型走真实 HTTP）。
     let _llm = require_real_llm!();
-    let app = TestApp::start().await;
+    let app = TestApp::start_repl_set().await;
     let ws = app.state.config.default_workspace_id.clone();
 
     // seed 专职视觉副模型，文字主模型不存在 → handler 走 Dedicated 分支，

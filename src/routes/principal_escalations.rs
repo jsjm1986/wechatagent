@@ -8,8 +8,8 @@ use serde_json::{json, Value};
 
 use super::AppState;
 use crate::agent::escalation::{
-    enqueue_relay_task, list_escalations_by_workspace, reassign_escalation,
-    resolve_ask_human_policy, resolve_escalation, sanitize_verdict,
+    list_escalations_by_workspace, materialize_principal_card_delivery, reassign_escalation,
+    resolve_escalation, sanitize_verdict,
 };
 use crate::auth::AuthenticatedAdmin;
 use crate::error::{AppError, AppResult};
@@ -22,16 +22,16 @@ pub struct ListQuery {
     pub status: Option<String>,
 }
 
-/// GET /api/admin/principal-escalations?status=pending|resolved
+/// GET /api/admin/principal-escalations?status=pending|resolved|delivery_failed
 pub async fn list_principal_escalations(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
     Query(q): Query<ListQuery>,
 ) -> AppResult<Json<Value>> {
     let status = q.status.as_deref().unwrap_or("pending");
-    if status != "pending" && status != "resolved" {
+    if !crate::models::ALLOWED_PRINCIPAL_ESCALATION_STATUS.contains(&status) {
         return Err(AppError::BadRequest(
-            "status 只能是 pending|resolved".into(),
+            "status 只能是 pending|resolved|delivery_failed".into(),
         ));
     }
     let items = list_escalations_by_workspace(&state, &admin.current_workspace, status).await?;
@@ -113,12 +113,10 @@ pub async fn resolve_principal_escalation(
             None
         }
     });
-    let resolved = resolve_escalation(&state, &short_code, &decision, expires, "admin").await?;
+    let resolved = resolve_escalation(&state, &entry, &decision, expires, "admin").await?;
     if resolved.is_none() {
         return Ok(Json(json!({ "ok": true, "alreadyResolved": true })));
     }
-    // 非 deferred（deferred 已在上方短路返回）→ 起 relay task 用 AI 口吻转述客户。
-    enqueue_relay_task(&state, &entry).await?;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -135,35 +133,48 @@ pub async fn reassign_principal_escalation(
     Path(short_code): Path<String>,
     Json(body): Json<ReassignBody>,
 ) -> AppResult<Json<Value>> {
-    // 校验 to_wxid 在 decider_chain 内（取 current_version config 解析）。
-    let cfg = state
-        .db
-        .operation_domain_configs()
-        .find_one(
-            mongodb::bson::doc! {
-                "workspace_id": &admin.current_workspace,
-                "domain": "user_operations",
-                "current_version": true,
-            },
-            None,
-        )
-        .await?;
-    let in_chain = cfg
-        .as_ref()
-        .map(|c| {
-            let p = resolve_ask_human_policy(c);
-            p.decider_chain.iter().any(|d| d.wxid == body.to_wxid)
-        })
-        .unwrap_or(false);
-    if !in_chain {
-        return Err(AppError::BadRequest(
-            "to_wxid 不在该 workspace 的决策人链内".into(),
-        ));
-    }
-    let updated =
-        reassign_escalation(&state, &admin.current_workspace, &short_code, &body.to_wxid).await?;
-    if updated.is_none() {
+    let pending =
+        list_escalations_by_workspace(&state, &admin.current_workspace, "pending").await?;
+    let Some(entry) = pending
+        .into_iter()
+        .find(|entry| entry.short_code == short_code)
+    else {
         return Err(AppError::NotFound("无此 pending 请示或已处置".into()));
+    };
+    if body.to_wxid == entry.contact_wxid {
+        return Err(AppError::BadRequest("决策人不能是请示客户本人".into()));
     }
+    if body.to_wxid == entry.principal_wxid {
+        return Err(AppError::BadRequest("目标决策人已是当前决策人".into()));
+    }
+    let protocol = entry
+        .protocol
+        .as_ref()
+        .ok_or_else(|| AppError::Conflict("旧请示缺少冻结协议，不能自动改派".into()))?;
+    let decider = protocol
+        .policy
+        .decider_chain
+        .iter()
+        .find(|decider| decider.wxid == body.to_wxid)
+        .ok_or_else(|| AppError::BadRequest("to_wxid 不在该请示的冻结决策人链内".into()))?;
+    let account_id = decider
+        .account_id
+        .as_deref()
+        .filter(|account_id| !account_id.trim().is_empty())
+        .ok_or_else(|| AppError::BadRequest("目标决策人未绑定发送账号".into()))?
+        .to_string();
+    let updated = reassign_escalation(
+        &state,
+        &admin.current_workspace,
+        &short_code,
+        &entry.principal_wxid,
+        protocol.delivery_generation,
+        &body.to_wxid,
+        &account_id,
+    )
+    .await?
+    .ok_or_else(|| AppError::Conflict("当前投递尚未终结或请示已被并发处置，不能改派".into()))?;
+    // 即时尝试物化；若进程在此中断，worker 会按同一 generation 幂等补偿。
+    materialize_principal_card_delivery(&state, &updated).await?;
     Ok(Json(json!({ "ok": true })))
 }

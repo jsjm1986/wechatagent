@@ -74,13 +74,12 @@ pub(super) async fn list_evolution_experiments(
         .clamp(1, MAX_EXPERIMENT_LIMIT);
 
     let workspace_id = admin.current_workspace.clone();
-    let account_id = state.config.default_account_id.clone();
 
     let mut cursor = state
         .db
         .experiments()
         .find(
-            doc! { "workspace_id": &workspace_id, "account_id": &account_id },
+            doc! { "workspace_id": &workspace_id },
             FindOptions::builder()
                 .sort(doc! { "started_at": -1 })
                 .limit(limit)
@@ -95,11 +94,104 @@ pub(super) async fn list_evolution_experiments(
 
     let mut items = Vec::with_capacity(experiments.len());
     for exp in &experiments {
-        let proposals = load_proposal_summaries(&state, &exp.experiment_id).await?;
+        let proposals = load_proposal_summaries(
+            &state,
+            &exp.experiment_id,
+            &exp.workspace_id,
+            &exp.account_id,
+        )
+        .await?;
         items.push(experiment_summary_json(exp, proposals));
     }
 
-    Ok(Json(json!({ "items": items })))
+    let aggregate_7d = load_evolution_aggregate_7d(&state, &workspace_id).await?;
+    Ok(Json(json!({
+        "items": items,
+        "aggregate7d": aggregate_7d,
+    })))
+}
+
+/// Complete server-side seven-day window used by the dashboard cards. The
+/// browsing list above remains independently capped; metric coverage therefore
+/// never depends on how many rows happen to be visible in the UI.
+async fn load_evolution_aggregate_7d(state: &AppState, workspace_id: &str) -> AppResult<Value> {
+    const WINDOW_HOURS: i64 = 7 * 24;
+    let as_of = DateTime::now();
+    let window_start = DateTime::from_millis(
+        as_of
+            .timestamp_millis()
+            .saturating_sub(WINDOW_HOURS * 60 * 60 * 1000),
+    );
+
+    let mut experiment_cursor = state
+        .db
+        .experiments()
+        .find(
+            doc! {
+                "workspace_id": workspace_id,
+                "started_at": { "$gte": window_start, "$lte": as_of },
+            },
+            None,
+        )
+        .await?;
+    let mut experiment_ids = Vec::new();
+    while let Some(experiment) = experiment_cursor.try_next().await? {
+        experiment_ids.push(experiment.experiment_id);
+    }
+
+    let mut proposals = 0_i64;
+    let mut released = 0_i64;
+    let mut rolled_back = 0_i64;
+    let mut significance_evaluated = 0_i64;
+    let mut significance_passed = 0_i64;
+    if !experiment_ids.is_empty() {
+        let mut proposal_cursor = state
+            .db
+            .proposals()
+            .find(
+                doc! {
+                    "workspace_id": workspace_id,
+                    "experiment_id": { "$in": &experiment_ids },
+                },
+                None,
+            )
+            .await?;
+        while let Some(proposal) = proposal_cursor.try_next().await? {
+            proposals += 1;
+            match proposal.status.as_str() {
+                "released" => released += 1,
+                "rolled_back" => rolled_back += 1,
+                _ => {}
+            }
+            if let Some(passed) = proposal.significance_passed {
+                significance_evaluated += 1;
+                if passed {
+                    significance_passed += 1;
+                }
+            }
+        }
+    }
+
+    Ok(json!({
+        "experiments": experiment_ids.len() as i64,
+        "proposals": proposals,
+        "released": released,
+        "rolledBack": rolled_back,
+        "significancePassRate": if significance_evaluated == 0 {
+            Value::Null
+        } else {
+            json!(significance_passed as f64 / significance_evaluated as f64)
+        },
+        "coverage": {
+            "complete": true,
+            "source": "server_time_window",
+            "windowHours": WINDOW_HOURS,
+            "windowStart": datetime_to_rfc3339(window_start),
+            "windowEnd": datetime_to_rfc3339(as_of),
+            "asOf": datetime_to_rfc3339(as_of),
+            "experimentsScanned": experiment_ids.len() as i64,
+        },
+    }))
 }
 
 /// `GET /api/evolution/proposals/:id` —— 单条详情。
@@ -123,10 +215,23 @@ pub(super) async fn get_evolution_proposal_detail(
     let experiment = state
         .db
         .experiments()
-        .find_one(doc! { "experiment_id": &proposal.experiment_id }, None)
+        .find_one(
+            doc! {
+                "experiment_id": &proposal.experiment_id,
+                "workspace_id": &proposal.workspace_id,
+                "account_id": &proposal.account_id,
+            },
+            None,
+        )
         .await?;
 
-    let shadow_summary = aggregate_shadow_replays(&state, proposal_id).await?;
+    let shadow_summary = aggregate_shadow_replays(
+        &state,
+        proposal_id,
+        &proposal.workspace_id,
+        &proposal.account_id,
+    )
+    .await?;
     let current_state = load_current_state_for_diff(&state, &proposal).await?;
 
     Ok(Json(json!({
@@ -163,12 +268,24 @@ pub(super) async fn release_evolution_proposal(
         .ok_or_else(|| AppError::NotFound(format!("proposal not found: {id}")))?;
 
     match proposal.proposal_kind.as_str() {
-        "threshold" => release_threshold(&state, proposal_id, &admin.username)
-            .await
-            .map_err(evolution_error_to_app_error)?,
-        "prompt" => release_prompt(&state, proposal_id, &admin.username)
-            .await
-            .map_err(evolution_error_to_app_error)?,
+        "threshold" => release_threshold(
+            &state,
+            proposal_id,
+            &proposal.workspace_id,
+            &proposal.account_id,
+            &admin.username,
+        )
+        .await
+        .map_err(evolution_error_to_app_error)?,
+        "prompt" => release_prompt(
+            &state,
+            proposal_id,
+            &proposal.workspace_id,
+            &proposal.account_id,
+            &admin.username,
+        )
+        .await
+        .map_err(evolution_error_to_app_error)?,
         other => {
             return Err(AppError::BadRequest(format!(
                 "unknown proposal_kind: {other}"
@@ -209,12 +326,24 @@ pub(super) async fn rollback_evolution_proposal(
         .ok_or_else(|| AppError::NotFound(format!("proposal not found: {id}")))?;
 
     match proposal.proposal_kind.as_str() {
-        "threshold" => rollback_threshold(&state, proposal_id, &admin.username)
-            .await
-            .map_err(evolution_error_to_app_error)?,
-        "prompt" => rollback_prompt(&state, proposal_id, &admin.username)
-            .await
-            .map_err(evolution_error_to_app_error)?,
+        "threshold" => rollback_threshold(
+            &state,
+            proposal_id,
+            &proposal.workspace_id,
+            &proposal.account_id,
+            &admin.username,
+        )
+        .await
+        .map_err(evolution_error_to_app_error)?,
+        "prompt" => rollback_prompt(
+            &state,
+            proposal_id,
+            &proposal.workspace_id,
+            &proposal.account_id,
+            &admin.username,
+        )
+        .await
+        .map_err(evolution_error_to_app_error)?,
         other => {
             return Err(AppError::BadRequest(format!(
                 "unknown proposal_kind: {other}"
@@ -233,12 +362,18 @@ pub(super) async fn rollback_evolution_proposal(
 async fn load_proposal_summaries(
     state: &AppState,
     experiment_id: &str,
+    workspace_id: &str,
+    account_id: &str,
 ) -> AppResult<Vec<Proposal>> {
     let mut cursor = state
         .db
         .proposals()
         .find(
-            doc! { "experiment_id": experiment_id },
+            doc! {
+                "experiment_id": experiment_id,
+                "workspace_id": workspace_id,
+                "account_id": account_id,
+            },
             FindOptions::builder()
                 .sort(doc! { "created_at": 1 })
                 .build(),
@@ -251,11 +386,23 @@ async fn load_proposal_summaries(
     Ok(out)
 }
 
-async fn aggregate_shadow_replays(state: &AppState, proposal_id: ObjectId) -> AppResult<Value> {
+async fn aggregate_shadow_replays(
+    state: &AppState,
+    proposal_id: ObjectId,
+    workspace_id: &str,
+    account_id: &str,
+) -> AppResult<Value> {
     let mut cursor = state
         .db
         .shadow_replays()
-        .find(doc! { "proposal_id": proposal_id }, None)
+        .find(
+            doc! {
+                "proposal_id": proposal_id,
+                "workspace_id": workspace_id,
+                "account_id": account_id,
+            },
+            None,
+        )
         .await?;
     let mut completed = 0_i64;
     let mut failed = 0_i64;
@@ -301,6 +448,7 @@ async fn load_current_state_for_diff(state: &AppState, proposal: &Proposal) -> A
                         "workspace_id": &proposal.workspace_id,
                         "account_id": &proposal.account_id,
                         "gate_key": gate_key,
+                        "current_version": true,
                         "rolled_back_at": null,
                     },
                     mongodb::options::FindOneOptions::builder()
@@ -555,7 +703,7 @@ pub(super) struct UpdateRuntimeFlagRequest {
     /// 操作者审计字段；可选（未登录态写 "admin" 默认值）。
     #[serde(default)]
     updated_by: Option<String>,
-    /// EVO-3:per-workspace 自动 release 子闸。None 时不改(保持 upsert 既有值)。
+    /// 历史 workspace 自动发布子闸。None 时不改；HC-017 当前政策下 true 被拒绝。
     #[serde(default)]
     threshold_auto_release_enabled: Option<bool>,
 }
@@ -598,6 +746,15 @@ pub(super) async fn put_evolution_runtime_flag(
         .unwrap_or(DEFAULT_RELEASE_ADMIN);
     let now = DateTime::now();
 
+    if payload.threshold_auto_release_enabled == Some(true)
+        && !crate::evolution::auto_release::CURRENT_AUTO_RELEASE_POLICY_ENABLED
+    {
+        return Err(AppError::BadRequest(
+            "automatic Evolution release is disabled by the current human-release policy"
+                .to_string(),
+        ));
+    }
+
     let mut set_fields = doc! {
         "workspace_id": &workspace_id,
         "enabled": payload.enabled,
@@ -605,7 +762,7 @@ pub(super) async fn put_evolution_runtime_flag(
         "updated_by": updated_by,
         "updated_at": now,
     };
-    // EVO-3:子闸字段 None 时不写($set 缺省即保持 upsert 既有值)。
+    // 兼容存量字段：None 不写，false 可显式清旧值；true 已在上方按 HC-017 拒绝。
     if let Some(v) = payload.threshold_auto_release_enabled {
         set_fields.insert("threshold_auto_release_enabled", v);
     }
@@ -653,13 +810,9 @@ pub(super) async fn list_threshold_override_audit(
 ) -> AppResult<Json<Value>> {
     // FORBIDDEN: enqueue agent_send_outbox / mcp call
     let workspace_id = admin.current_workspace.clone();
-    let account_id = state.config.default_account_id.clone();
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
 
-    let mut filter = doc! {
-        "workspace_id": &workspace_id,
-        "account_id": &account_id,
-    };
+    let mut filter = doc! { "workspace_id": &workspace_id };
     if let Some(gate_key) = query.gate_key.as_deref().filter(|s| !s.trim().is_empty()) {
         filter.insert("gate_key", gate_key);
     }
@@ -685,6 +838,8 @@ pub(super) async fn list_threshold_override_audit(
 fn threshold_override_audit_json(a: &crate::models::ThresholdOverrideAudit) -> Value {
     json!({
         "id": a.id.map(|x| x.to_hex()),
+        "workspaceId": a.workspace_id,
+        "accountId": a.account_id,
         "gateKey": a.gate_key,
         "action": a.action,
         "previousValue": a.previous_value,
@@ -982,6 +1137,10 @@ mod tests {
             session_cookie_secure: false,
             bootstrap_admin_username: None,
             bootstrap_admin_password: None,
+            auth_rate_limit_window_seconds: 300,
+            auth_rate_limit_client_capacity: 20,
+            auth_rate_limit_target_capacity: 10,
+            auth_rate_limit_global_capacity: 100,
             webhook_verify_signature: false,
             webhook_timestamp_skew_seconds: 300,
             ingest_worker_enabled: false,
@@ -1029,6 +1188,11 @@ mod tests {
             gate_key: "fact_risk_block".to_string(),
             value: 5.5,
             source_proposal_id: ObjectId::parse_str("507f1f77bcf86cd799439012").unwrap(),
+            base_revision: Some("threshold-v1:baseline:4018000000000000".to_string()),
+            released_revision: Some(
+                "threshold-v1:507f1f77bcf86cd799439012:4016000000000000".to_string(),
+            ),
+            current_version: false,
             released_at: DateTime::from_millis(1_700_000_000_000),
             released_by: "admin-1".to_string(),
             rolled_back_at: Some(DateTime::from_millis(1_700_000_100_000)),
@@ -1117,6 +1281,10 @@ mod tests {
             critic_reasoning: Some("命中率证据充分".to_string()),
             expected_improvement_on: vec!["fact_accuracy".to_string()],
             risk_note: Some("低风险".to_string()),
+            base_revision: Some("threshold-v1:baseline:4018000000000000".to_string()),
+            released_revision: Some(
+                "threshold-v1:507f1f77bcf86cd799439012:4016000000000000".to_string(),
+            ),
             previous_prompt_version: Some("v11".to_string()),
             eval_metrics: doc! { "pValue": 0.03 },
             eval_replays_completed: 20,
@@ -1190,6 +1358,10 @@ mod tests {
             critic_reasoning: Some("命中率证据充分".to_string()),
             expected_improvement_on: vec!["fact_accuracy".to_string()],
             risk_note: Some("低风险".to_string()),
+            base_revision: Some("threshold-v1:baseline:4018000000000000".to_string()),
+            released_revision: Some(
+                "threshold-v1:507f1f77bcf86cd799439012:4016000000000000".to_string(),
+            ),
             previous_prompt_version: Some("v11".to_string()),
             eval_metrics: doc! { "pValue": 0.03 },
             eval_replays_completed: 20,
@@ -1248,6 +1420,10 @@ mod tests {
             critic_reasoning: Some("命中率证据充分".to_string()),
             expected_improvement_on: vec!["fact_accuracy".to_string()],
             risk_note: Some("低风险".to_string()),
+            base_revision: Some("threshold-v1:baseline:4018000000000000".to_string()),
+            released_revision: Some(
+                "threshold-v1:507f1f77bcf86cd799439012:4016000000000000".to_string(),
+            ),
             previous_prompt_version: Some("v11".to_string()),
             eval_metrics: doc! { "pValue": 0.03 },
             eval_replays_completed: 20,

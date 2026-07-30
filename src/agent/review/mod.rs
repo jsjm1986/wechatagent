@@ -5,8 +5,8 @@
 //!   prompt，对候选回复做评审；调用结束后串行执行
 //!   [`super::guards::enforce_decision_guards`] 的所有守卫并最终
 //!   `review_passed` 收敛 `approved` 标志；
-//! - `local_decision_review`：当预算超额或 review 不需要 LLM 介入时，
-//!   返回一个保守通过的本地评审结果（避免阻塞主流程）；
+//! - `local_decision_review`：当预算或调用边界阻止 Reviewer 执行时，
+//!   对拟发送正文 fail closed；仅主动沉默可本地完成；
 //! - `effective_review_mode` / `should_run_review`：根据 planner、decision
 //!   置信度等决定本轮使用 light 还是 full review；
 //! - `review_passed`：把多个评分阈值收敛成一个布尔，是其它子模块（gateway、
@@ -25,8 +25,8 @@ mod style;
 // review.rs 顶层可见性 re-export。
 pub(crate) use gates::{
     apply_dual_reviewer_disagreement, apply_revision_fallback, build_reviewer_decision_view,
-    decide_revision, derive_revision_failure, detect_dual_reviewer_disagreement, route_dual_gate,
-    DualReviewerDisagreement, RevisionDecision,
+    decide_revision, derive_revision_failure, detect_dual_reviewer_disagreement,
+    finalize_review_for_send_at, route_dual_gate, RevisionDecision,
 };
 pub use gates::{
     contact_has_principal_product_exemption, finalize_review_for_send, review_passed,
@@ -61,6 +61,8 @@ use super::types::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CatalogClaim {
     product_id: String,
+    /// Exact, non-empty substring copied from the final candidate reply.
+    source_quote: String,
     name: Option<String>,
     amount_minor: Option<i64>,
     currency: Option<String>,
@@ -163,6 +165,13 @@ fn parse_catalog_claim(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| schema_error("catalogClaims[].productId"))?
         .to_string();
+    let source_quote = root
+        .get("sourceQuote")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| schema_error("catalogClaims[].sourceQuote"))?
+        .to_string();
     let optional_string = |key: &str| -> AppResult<Option<String>> {
         match root.get(key) {
             Some(Value::Null) => Ok(None),
@@ -182,12 +191,19 @@ fn parse_catalog_claim(
         ),
         None => return Err(schema_error("catalogClaims[].amountMinor")),
     };
+    let name = optional_string("name")?;
+    let currency = optional_string("currency")?;
+    let sku = optional_string("sku")?;
+    if name.is_none() && amount_minor.is_none() && currency.is_none() && sku.is_none() {
+        return Err(schema_error("catalogClaims[].assertedFields"));
+    }
     Ok(CatalogClaim {
         product_id,
-        name: optional_string("name")?,
+        source_quote,
+        name,
         amount_minor,
-        currency: optional_string("currency")?,
-        sku: optional_string("sku")?,
+        currency,
+        sku,
     })
 }
 
@@ -205,7 +221,7 @@ Set requiresEvidence=true only when the candidate itself asserts or implies our 
 Do not mark empathy, ordinary conversation, a clarifying question, a statement about what the customer said, or a first-person promise to check and reply as requiring product evidence.
 When an active catalog is supplied, semantically extract every catalog-shaped fact asserted by the candidate: product identity/name, exact price, currency, and SKU. Map it to productId only when the candidate clearly refers to that catalog product. Use amountMinor in the catalog's smallest currency unit. Do not treat catalog summaries as proof of capabilities or outcomes.
 Set hasCatalogClaims=true when the candidate asserts at least one catalog-shaped product fact. Set catalogCoverageComplete=true only when every such fact has been represented without omission. Set hasNonCatalogEvidenceClaims=true for capability, effect, case, delivery, guarantee, discount not present in the catalog, or any other evidence-requiring fact that the catalog cannot prove.
-Every catalogClaims item must contain all keys; use null for a field the candidate does not assert. Output strict JSON only:
+Every catalogClaims item must contain all keys. sourceQuote must be an exact non-empty substring copied from the candidate reply and must span the complete clause containing the catalog-shaped assertion. Use null only for name, amountMinor, currency, or sku when that field is not asserted in sourceQuote. Never emit a productId-only item with all four asserted fields null. Output strict JSON only:
 {"requiresEvidence":false,"claimKinds":[],"hasCatalogClaims":false,"catalogCoverageComplete":true,"hasNonCatalogEvidenceClaims":false,"catalogClaims":[],"reason":"concise semantic reason"}"#;
     let catalog = active_products
         .iter()
@@ -229,6 +245,7 @@ Every catalogClaims item must contain all keys; use null for a field the candida
     }))?;
     let value = generate_agent_json(
         state,
+        &contact.workspace_id,
         Some(&contact.account_id),
         Some(&contact.wxid),
         run_id,
@@ -283,50 +300,280 @@ fn merge_independent_claim_verdict(
     );
 }
 
-fn catalog_claims_are_backed(verdict: &IndependentClaimVerdict, products: &[Product]) -> bool {
+fn catalog_claims_are_backed(
+    verdict: &IndependentClaimVerdict,
+    products: &[Product],
+    reply_text: &str,
+) -> bool {
     verdict.has_catalog_claims
         && verdict.catalog_coverage_complete
         && !verdict.has_non_catalog_evidence_claims
         && !verdict.catalog_claims.is_empty()
-        && verdict.catalog_claims.iter().all(|claim| {
-            products.iter().any(|product| {
-                product.product_id == claim.product_id
-                    && claim.name.as_ref().is_none_or(|name| name == &product.name)
-                    && claim
-                        .amount_minor
-                        .is_none_or(|amount| product.price == Some(amount))
-                    && claim
-                        .currency
-                        .as_ref()
-                        .is_none_or(|currency| product.currency.as_ref() == Some(currency))
-                    && claim
-                        .sku
-                        .as_ref()
-                        .is_none_or(|sku| product.sku.as_ref() == Some(sku))
-            })
+        && catalog_claims_match_reply(verdict, products, reply_text)
+}
+
+fn catalog_integrity_failed(
+    verdict: &IndependentClaimVerdict,
+    products: &[Product],
+    reply_text: &str,
+) -> bool {
+    let reply_mentions_catalog_product = products
+        .iter()
+        .any(|product| reply_mentions_catalog_fact(reply_text, product));
+    (reply_mentions_catalog_product && !verdict.has_catalog_claims)
+        || (verdict.has_catalog_claims
+            && (!verdict.catalog_coverage_complete
+                || !catalog_claims_match_reply(verdict, products, reply_text)))
+}
+
+fn catalog_claims_match_reply(
+    verdict: &IndependentClaimVerdict,
+    products: &[Product],
+    reply_text: &str,
+) -> bool {
+    let matched = verdict
+        .catalog_claims
+        .iter()
+        .filter_map(|claim| {
+            products
+                .iter()
+                .find(|product| catalog_claim_matches_product_reply(claim, product, reply_text))
+                .map(|product| (claim, product))
+        })
+        .collect::<Vec<_>>();
+    matched.len() == verdict.catalog_claims.len()
+        && products.iter().all(|product| {
+            reply_clauses(reply_text)
+                .filter(|clause| clause_mentions_catalog_fact(clause, product))
+                .all(|clause| {
+                    matched.iter().any(|(claim, matched_product)| {
+                        matched_product.product_id == product.product_id
+                            && normalized_clause(&claim.source_quote) == normalized_clause(clause)
+                    })
+                })
         })
 }
 
-fn catalog_integrity_failed(verdict: &IndependentClaimVerdict, products: &[Product]) -> bool {
-    verdict.has_catalog_claims
-        && (!verdict.catalog_coverage_complete
-            || !verdict.catalog_claims.iter().all(|claim| {
-                products.iter().any(|product| {
-                    product.product_id == claim.product_id
-                        && claim.name.as_ref().is_none_or(|name| name == &product.name)
-                        && claim
-                            .amount_minor
-                            .is_none_or(|amount| product.price == Some(amount))
-                        && claim
-                            .currency
-                            .as_ref()
-                            .is_none_or(|currency| product.currency.as_ref() == Some(currency))
-                        && claim
-                            .sku
-                            .as_ref()
-                            .is_none_or(|sku| product.sku.as_ref() == Some(sku))
-                })
-            }))
+fn catalog_claim_matches_product_reply(
+    claim: &CatalogClaim,
+    product: &Product,
+    reply_text: &str,
+) -> bool {
+    if product.product_id != claim.product_id || !reply_text.contains(&claim.source_quote) {
+        return false;
+    }
+    let quote = claim.source_quote.as_str();
+    let quote_identifies_product = quote.contains(&product.name)
+        || product
+            .sku
+            .as_deref()
+            .is_some_and(|sku| contains_ascii_case_insensitive(quote, sku));
+    if !quote_identifies_product {
+        return false;
+    }
+    let name_matches = match claim.name.as_deref() {
+        Some(name) => name == product.name && quote.contains(name),
+        None => !quote.contains(&product.name),
+    };
+    if !name_matches {
+        return false;
+    }
+    let sku_matches = match (claim.sku.as_deref(), product.sku.as_deref()) {
+        (Some(asserted), Some(catalog)) => {
+            asserted == catalog && contains_ascii_case_insensitive(quote, asserted)
+        }
+        (None, Some(catalog)) => !contains_ascii_case_insensitive(quote, catalog),
+        (None, None) => true,
+        (Some(_), None) => false,
+    };
+    if !sku_matches {
+        return false;
+    }
+    if product.price != claim.amount_minor && claim.amount_minor.is_some() {
+        return false;
+    }
+    let fact_remainder = catalog_fact_remainder(quote, product);
+    if !quote_numbers_match_amount(&fact_remainder, product, claim.amount_minor) {
+        return false;
+    }
+    let quoted_currency = quote_mentions_any_currency(&fact_remainder);
+    match claim.currency.as_deref() {
+        Some(currency) => {
+            if product.currency.as_deref() != Some(currency)
+                || !quote_mentions_currency(&fact_remainder, currency)
+                || quote_mentions_other_currency(&fact_remainder, currency)
+            {
+                return false;
+            }
+        }
+        None if quoted_currency => return false,
+        None => {}
+    }
+    true
+}
+
+fn reply_mentions_catalog_fact(reply_text: &str, product: &Product) -> bool {
+    reply_clauses(reply_text).any(|clause| clause_mentions_catalog_fact(clause, product))
+}
+
+fn clause_mentions_catalog_fact(clause: &str, product: &Product) -> bool {
+    clause.contains(&product.name)
+        || product
+            .sku
+            .as_deref()
+            .is_some_and(|sku| contains_ascii_case_insensitive(clause, sku))
+}
+
+fn reply_clauses(reply_text: &str) -> impl Iterator<Item = &str> {
+    reply_text
+        .split(|ch| matches!(ch, '。' | '！' | '？' | '!' | '?' | ';' | '；' | '\n'))
+        .map(str::trim)
+        .filter(|clause| !clause.is_empty())
+}
+
+fn normalized_clause(value: &str) -> &str {
+    value
+        .trim()
+        .trim_end_matches(['。', '！', '？', '!', '?', ';', '；'])
+        .trim_end()
+}
+
+fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
+    haystack
+        .to_ascii_lowercase()
+        .contains(&needle.to_ascii_lowercase())
+}
+
+fn quote_numbers_match_amount(
+    fact_remainder: &str,
+    product: &Product,
+    asserted_amount: Option<i64>,
+) -> bool {
+    let numbers = numeric_tokens(fact_remainder);
+    match asserted_amount {
+        Some(amount) if product.price == Some(amount) => {
+            !numbers.is_empty()
+                && numbers
+                    .iter()
+                    .all(|token| numeric_token_matches_minor_amount(token, amount))
+        }
+        Some(_) => false,
+        None => numbers.is_empty(),
+    }
+}
+
+fn catalog_fact_remainder(quote: &str, product: &Product) -> String {
+    let mut remainder = quote.replace(&product.name, " ");
+    if let Some(sku) = product.sku.as_deref() {
+        remainder = replace_ascii_case_insensitive(&remainder, sku, " ");
+    }
+    remainder
+}
+
+fn replace_ascii_case_insensitive(haystack: &str, needle: &str, replacement: &str) -> String {
+    if needle.is_empty() {
+        return haystack.to_string();
+    }
+    let lower_haystack = haystack.to_ascii_lowercase();
+    let lower_needle = needle.to_ascii_lowercase();
+    let mut out = String::with_capacity(haystack.len());
+    let mut cursor = 0;
+    while let Some(offset) = lower_haystack[cursor..].find(&lower_needle) {
+        let start = cursor + offset;
+        let end = start + needle.len();
+        out.push_str(&haystack[cursor..start]);
+        out.push_str(replacement);
+        cursor = end;
+    }
+    out.push_str(&haystack[cursor..]);
+    out
+}
+
+fn numeric_tokens(text: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    for ch in text.chars() {
+        if ch.is_ascii_digit() || ((ch == '.' || ch == ',') && !current.is_empty()) {
+            current.push(ch);
+        } else if !current.is_empty() {
+            tokens.push(current.trim_matches(['.', ',']).to_string());
+            current.clear();
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current.trim_matches(['.', ',']).to_string());
+    }
+    tokens
+        .into_iter()
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+fn numeric_token_matches_minor_amount(token: &str, amount_minor: i64) -> bool {
+    let normalized = token.replace(',', "");
+    let major = amount_minor / 100;
+    let minor = amount_minor % 100;
+    normalized == format!("{major}.{minor:02}") || (minor == 0 && normalized == major.to_string())
+}
+
+fn quote_mentions_any_currency(quote: &str) -> bool {
+    ["CNY", "RMB", "USD", "EUR", "GBP", "JPY"]
+        .iter()
+        .any(|code| contains_ascii_case_insensitive(quote, code))
+        || quote
+            .chars()
+            .any(|ch| matches!(ch, '¥' | '￥' | '$' | '€' | '£' | '元'))
+}
+
+fn quote_mentions_currency(quote: &str, currency: &str) -> bool {
+    if contains_ascii_case_insensitive(quote, currency) {
+        return true;
+    }
+    match currency {
+        "CNY" => {
+            contains_ascii_case_insensitive(quote, "RMB")
+                || quote.chars().any(|ch| matches!(ch, '¥' | '￥' | '元'))
+        }
+        "USD" => quote.contains('$'),
+        "EUR" => quote.contains('€'),
+        "GBP" => quote.contains('£'),
+        "JPY" => quote.chars().any(|ch| matches!(ch, '¥' | '￥')),
+        _ => false,
+    }
+}
+
+fn quote_mentions_other_currency(quote: &str, expected: &str) -> bool {
+    let explicit = [
+        ("CNY", &["CNY", "RMB"][..]),
+        ("USD", &["USD"][..]),
+        ("EUR", &["EUR"][..]),
+        ("GBP", &["GBP"][..]),
+        ("JPY", &["JPY"][..]),
+    ];
+    if explicit.iter().any(|(currency, aliases)| {
+        *currency != expected
+            && aliases
+                .iter()
+                .any(|alias| contains_ascii_case_insensitive(quote, alias))
+    }) {
+        return true;
+    }
+    match expected {
+        "CNY" => quote.chars().any(|ch| matches!(ch, '$' | '€' | '£')),
+        "USD" => quote
+            .chars()
+            .any(|ch| matches!(ch, '¥' | '￥' | '€' | '£' | '元')),
+        "EUR" => quote
+            .chars()
+            .any(|ch| matches!(ch, '¥' | '￥' | '$' | '£' | '元')),
+        "GBP" => quote
+            .chars()
+            .any(|ch| matches!(ch, '¥' | '￥' | '$' | '€' | '元')),
+        "JPY" => quote.chars().any(|ch| matches!(ch, '$' | '€' | '£' | '元')),
+        _ => quote
+            .chars()
+            .any(|ch| matches!(ch, '¥' | '￥' | '$' | '€' | '£' | '元')),
+    }
 }
 
 fn hold_for_catalog_integrity_failure(review: &mut DecisionReviewResult) {
@@ -384,8 +631,10 @@ pub(crate) async fn ensure_independent_claim_gate(
         .await
     {
         Ok(verdict) => {
-            let catalog_backed = catalog_claims_are_backed(&verdict, active_products);
-            let integrity_failed = catalog_integrity_failed(&verdict, active_products);
+            let catalog_backed =
+                catalog_claims_are_backed(&verdict, active_products, &decision.reply_text);
+            let integrity_failed =
+                catalog_integrity_failed(&verdict, active_products, &decision.reply_text);
             merge_independent_claim_verdict(review, &verdict, catalog_backed);
             if integrity_failed {
                 hold_for_catalog_integrity_failure(review);
@@ -467,13 +716,26 @@ mod independent_claim_gate_contract_tests {
         currency: &str,
         sku: &str,
     ) -> CatalogClaim {
+        let source_quote = format!(
+            "{name}（SKU {sku}）价格为 {:.2} {currency}",
+            amount_minor as f64 / 100.0
+        );
         CatalogClaim {
             product_id: product_id.to_string(),
+            source_quote,
             name: Some(name.to_string()),
             amount_minor: Some(amount_minor),
             currency: Some(currency.to_string()),
             sku: Some(sku.to_string()),
         }
+    }
+
+    fn reply_for_claims(claims: &[CatalogClaim]) -> String {
+        claims
+            .iter()
+            .map(|claim| claim.source_quote.as_str())
+            .collect::<Vec<_>>()
+            .join("。")
     }
 
     #[test]
@@ -521,6 +783,26 @@ mod independent_claim_gate_contract_tests {
                 "requiresEvidence": false, "claimKinds": [],
                 "hasCatalogClaims": false, "catalogCoverageComplete": false,
                 "hasNonCatalogEvidenceClaims": false, "catalogClaims": [], "reason": "bad coverage"
+            }),
+            json!({
+                "requiresEvidence": true, "claimKinds": ["catalog_fact"],
+                "hasCatalogClaims": true, "catalogCoverageComplete": true,
+                "hasNonCatalogEvidenceClaims": false,
+                "catalogClaims": [{
+                    "productId": "vip", "sourceQuote": "", "name": "年度会员",
+                    "amountMinor": 19900, "currency": "CNY", "sku": "VIP-1"
+                }],
+                "reason": "blank quote"
+            }),
+            json!({
+                "requiresEvidence": true, "claimKinds": ["catalog_fact"],
+                "hasCatalogClaims": true, "catalogCoverageComplete": true,
+                "hasNonCatalogEvidenceClaims": false,
+                "catalogClaims": [{
+                    "productId": "vip", "sourceQuote": "年度会员",
+                    "name": null, "amountMinor": null, "currency": null, "sku": null
+                }],
+                "reason": "product id only"
             }),
         ] {
             assert!(parse_independent_claim_verdict(value).is_err());
@@ -578,9 +860,35 @@ mod independent_claim_gate_contract_tests {
     #[test]
     fn exact_catalog_claim_is_backed() {
         let products = vec![product("vip", "年度会员", 19_900, "CNY", "VIP-1")];
-        let verdict = catalog_verdict(vec![claim("vip", "年度会员", 19_900, "CNY", "VIP-1")]);
-        assert!(catalog_claims_are_backed(&verdict, &products));
-        assert!(!catalog_integrity_failed(&verdict, &products));
+        let claims = vec![claim("vip", "年度会员", 19_900, "CNY", "VIP-1")];
+        let reply = reply_for_claims(&claims);
+        let verdict = catalog_verdict(claims);
+        assert!(catalog_claims_are_backed(&verdict, &products, &reply));
+        assert!(!catalog_integrity_failed(&verdict, &products, &reply));
+
+        let mut custom = product("custom", "定制服务", 0, "CNY", "unused");
+        custom.price = None;
+        custom.currency = None;
+        custom.sku = None;
+        let name_only = CatalogClaim {
+            product_id: "custom".to_string(),
+            source_quote: "我们可以提供定制服务".to_string(),
+            name: Some("定制服务".to_string()),
+            amount_minor: None,
+            currency: None,
+            sku: None,
+        };
+        let name_only_verdict = catalog_verdict(vec![name_only]);
+        assert!(catalog_claims_are_backed(
+            &name_only_verdict,
+            &[custom.clone()],
+            "我们可以提供定制服务"
+        ));
+        assert!(!catalog_integrity_failed(
+            &name_only_verdict,
+            &[custom],
+            "我们可以提供定制服务"
+        ));
     }
 
     #[test]
@@ -593,9 +901,10 @@ mod independent_claim_gate_contract_tests {
             claim("vip", "年度会员", 29_900, "CNY", "VIP-1"),
             claim("vip", "训练营", 29_900, "CNY", "COURSE-1"),
         ] {
+            let reply = bad_claim.source_quote.clone();
             let verdict = catalog_verdict(vec![bad_claim]);
-            assert!(!catalog_claims_are_backed(&verdict, &products));
-            assert!(catalog_integrity_failed(&verdict, &products));
+            assert!(!catalog_claims_are_backed(&verdict, &products, &reply));
+            assert!(catalog_integrity_failed(&verdict, &products, &reply));
         }
     }
 
@@ -605,12 +914,14 @@ mod independent_claim_gate_contract_tests {
             product("vip", "年度会员", 19_900, "CNY", "VIP-1"),
             product("course", "训练营", 29_900, "CNY", "COURSE-1"),
         ];
-        let verdict = catalog_verdict(vec![
+        let claims = vec![
             claim("vip", "年度会员", 19_900, "CNY", "VIP-1"),
             claim("course", "训练营", 99, "CNY", "COURSE-1"),
-        ]);
-        assert!(!catalog_claims_are_backed(&verdict, &products));
-        assert!(catalog_integrity_failed(&verdict, &products));
+        ];
+        let reply = reply_for_claims(&claims);
+        let verdict = catalog_verdict(claims);
+        assert!(!catalog_claims_are_backed(&verdict, &products, &reply));
+        assert!(catalog_integrity_failed(&verdict, &products, &reply));
     }
 
     #[test]
@@ -620,19 +931,29 @@ mod independent_claim_gate_contract_tests {
             claim("vip", "年度会员", 19_900, "USD", "VIP-1"),
             claim("vip", "年度会员", 19_900, "CNY", "VIP-X"),
         ] {
+            let reply = bad_claim.source_quote.clone();
             let verdict = catalog_verdict(vec![bad_claim]);
-            assert!(!catalog_claims_are_backed(&verdict, &products));
-            assert!(catalog_integrity_failed(&verdict, &products));
+            assert!(!catalog_claims_are_backed(&verdict, &products, &reply));
+            assert!(catalog_integrity_failed(&verdict, &products, &reply));
         }
+
+        let mut conflicting = claim("vip", "年度会员", 19_900, "CNY", "VIP-1");
+        conflicting.source_quote = "年度会员（SKU VIP-1）价格为 199.00 CNY / USD".to_string();
+        let reply = conflicting.source_quote.clone();
+        let verdict = catalog_verdict(vec![conflicting]);
+        assert!(!catalog_claims_are_backed(&verdict, &products, &reply));
+        assert!(catalog_integrity_failed(&verdict, &products, &reply));
     }
 
     #[test]
     fn incomplete_extraction_is_held_even_when_extracted_item_matches() {
         let products = vec![product("vip", "年度会员", 19_900, "CNY", "VIP-1")];
-        let mut verdict = catalog_verdict(vec![claim("vip", "年度会员", 19_900, "CNY", "VIP-1")]);
+        let claims = vec![claim("vip", "年度会员", 19_900, "CNY", "VIP-1")];
+        let reply = reply_for_claims(&claims);
+        let mut verdict = catalog_verdict(claims);
         verdict.catalog_coverage_complete = false;
-        assert!(!catalog_claims_are_backed(&verdict, &products));
-        assert!(catalog_integrity_failed(&verdict, &products));
+        assert!(!catalog_claims_are_backed(&verdict, &products, &reply));
+        assert!(catalog_integrity_failed(&verdict, &products, &reply));
 
         let mut review = DecisionReviewResult {
             approved: true,
@@ -651,10 +972,53 @@ mod independent_claim_gate_contract_tests {
     #[test]
     fn catalog_does_not_back_simultaneous_non_catalog_claims() {
         let products = vec![product("vip", "年度会员", 19_900, "CNY", "VIP-1")];
-        let mut verdict = catalog_verdict(vec![claim("vip", "年度会员", 19_900, "CNY", "VIP-1")]);
+        let claims = vec![claim("vip", "年度会员", 19_900, "CNY", "VIP-1")];
+        let reply = reply_for_claims(&claims);
+        let mut verdict = catalog_verdict(claims);
         verdict.has_non_catalog_evidence_claims = true;
-        assert!(!catalog_claims_are_backed(&verdict, &products));
-        assert!(!catalog_integrity_failed(&verdict, &products));
+        assert!(!catalog_claims_are_backed(&verdict, &products, &reply));
+        assert!(!catalog_integrity_failed(&verdict, &products, &reply));
+    }
+
+    #[test]
+    fn forged_quote_or_omitted_second_catalog_clause_is_rejected() {
+        let products = vec![
+            product("vip", "年度会员", 19_900, "CNY", "VIP-1"),
+            product("course", "训练营", 29_900, "CNY", "COURSE-1"),
+        ];
+        let vip = claim("vip", "年度会员", 19_900, "CNY", "VIP-1");
+        let reply = format!(
+            "{}。训练营（SKU COURSE-1）价格为 299.00 CNY",
+            vip.source_quote
+        );
+
+        let omitted = catalog_verdict(vec![vip.clone()]);
+        assert!(!catalog_claims_are_backed(&omitted, &products, &reply));
+        assert!(catalog_integrity_failed(&omitted, &products, &reply));
+
+        let mut forged = vip;
+        forged.source_quote = "年度会员（SKU VIP-1）价格为 199.00 CNY，今天特价".to_string();
+        let forged_verdict = catalog_verdict(vec![forged]);
+        assert!(!catalog_claims_are_backed(
+            &forged_verdict,
+            &products,
+            "年度会员（SKU VIP-1）价格为 199.00 CNY"
+        ));
+        assert!(catalog_integrity_failed(
+            &forged_verdict,
+            &products,
+            "年度会员（SKU VIP-1）价格为 199.00 CNY"
+        ));
+    }
+
+    #[test]
+    fn correct_clause_cannot_hide_wrong_second_price_for_same_product() {
+        let products = vec![product("vip", "年度会员", 19_900, "CNY", "VIP-1")];
+        let correct = claim("vip", "年度会员", 19_900, "CNY", "VIP-1");
+        let reply = format!("{}。年度会员现在只要 999.00 CNY", correct.source_quote);
+        let verdict = catalog_verdict(vec![correct]);
+        assert!(!catalog_claims_are_backed(&verdict, &products, &reply));
+        assert!(catalog_integrity_failed(&verdict, &products, &reply));
     }
 }
 
@@ -665,18 +1029,23 @@ mod independent_claim_gate_contract_tests {
 /// into zero. All send-gate scores are required integer values in 0..=10, and the product-claim
 /// decision must be an explicit boolean.
 fn parse_live_review(value: Value) -> AppResult<DecisionReviewResult> {
-    fn schema_error(field: &str) -> AppError {
-        AppError::External(format!("review_schema_invalid:{field}"))
+    fn schema_error(status: &str, field: &str) -> AppError {
+        AppError::External(format!("review_schema_{status}:{field}"))
     }
 
-    let root = value.as_object().ok_or_else(|| schema_error("root"))?;
-    if !matches!(root.get("approved"), Some(Value::Bool(_))) {
-        return Err(schema_error("approved"));
+    let root = value
+        .as_object()
+        .ok_or_else(|| schema_error("invalid", "root"))?;
+    match root.get("approved") {
+        None => return Err(schema_error("missing", "approved")),
+        Some(Value::Bool(_)) => {}
+        Some(_) => return Err(schema_error("invalid", "approved")),
     }
-    let scores = root
-        .get("scores")
-        .and_then(Value::as_object)
-        .ok_or_else(|| schema_error("scores"))?;
+    let scores = match root.get("scores") {
+        None => return Err(schema_error("missing", "scores")),
+        Some(Value::Object(scores)) => scores,
+        Some(_) => return Err(schema_error("invalid", "scores")),
+    };
     for (canonical, accepted) in [
         ("humanLike", &["humanLike"][..]),
         ("emotionalValue", &["emotionalValue"][..]),
@@ -688,26 +1057,45 @@ fn parse_live_review(value: Value) -> AppResult<DecisionReviewResult> {
         ("pressureRisk", &["pressureRisk"][..]),
         ("boundaryPrivacySafety", &["boundaryPrivacySafety"][..]),
     ] {
-        let raw = accepted.iter().find_map(|key| scores.get(*key));
-        let valid = raw
-            .and_then(Value::as_i64)
-            .is_some_and(|score| (0..=10).contains(&score));
+        let present = accepted
+            .iter()
+            .filter_map(|key| scores.get(*key))
+            .collect::<Vec<_>>();
+        if present.is_empty() {
+            return Err(schema_error("missing", canonical));
+        }
+        let valid = present.len() == 1
+            && present[0]
+                .as_i64()
+                .is_some_and(|score| (0..=10).contains(&score));
         if !valid {
-            return Err(schema_error(canonical));
+            return Err(schema_error("invalid", canonical));
         }
     }
-    let claim_analysis = root
-        .get("claimAnalysis")
-        .and_then(Value::as_object)
-        .ok_or_else(|| schema_error("claimAnalysis"))?;
-    if !matches!(
-        claim_analysis.get("requiresProductKnowledge"),
-        Some(Value::Bool(_))
-    ) {
-        return Err(schema_error("claimAnalysis.requiresProductKnowledge"));
+    let claim_analysis = match root.get("claimAnalysis") {
+        None => return Err(schema_error("missing", "claimAnalysis")),
+        Some(Value::Object(claim_analysis)) => claim_analysis,
+        Some(_) => return Err(schema_error("invalid", "claimAnalysis")),
+    };
+    match claim_analysis.get("requiresProductKnowledge") {
+        None => {
+            return Err(schema_error(
+                "missing",
+                "claimAnalysis.requiresProductKnowledge",
+            ))
+        }
+        Some(Value::Bool(_)) => {}
+        Some(_) => {
+            return Err(schema_error(
+                "invalid",
+                "claimAnalysis.requiresProductKnowledge",
+            ))
+        }
     }
 
-    serde_json::from_value(value).map_err(AppError::from)
+    let mut review: DecisionReviewResult = serde_json::from_value(value).map_err(AppError::from)?;
+    review.claim_analysis.insert("reviewScoreStatus", "valid");
+    Ok(review)
 }
 
 /// Convert an unusable live Reviewer payload into a structured fail-closed result.
@@ -718,6 +1106,11 @@ fn parse_live_review(value: Value) -> AppResult<DecisionReviewResult> {
 /// keeps the candidate reply away from the outbox.
 fn hold_for_review_schema_failure(error: &AppError) -> DecisionReviewResult {
     let error_summary = error.to_string().chars().take(160).collect::<String>();
+    let score_status = if error_summary.starts_with("review_schema_missing:") {
+        "missing"
+    } else {
+        "invalid"
+    };
     DecisionReviewResult {
         approved: false,
         scores: ReviewScores {
@@ -731,6 +1124,7 @@ fn hold_for_review_schema_failure(error: &AppError) -> DecisionReviewResult {
         },
         claim_analysis: mongodb::bson::doc! {
             "requiresProductKnowledge": true,
+            "reviewScoreStatus": score_status,
             "reviewSchemaValid": false,
             "reviewSchemaError": error_summary,
         },
@@ -775,6 +1169,10 @@ mod strict_review_wire_tests {
         assert!(parsed.approved);
         assert_eq!(parsed.scores.hallucination_score, 1);
         assert_eq!(parsed.scores.knowledge_grounding_score, 9);
+        assert_eq!(
+            parsed.claim_analysis.get_str("reviewScoreStatus").unwrap(),
+            "valid"
+        );
     }
 
     #[test]
@@ -791,18 +1189,39 @@ mod strict_review_wire_tests {
             value["scores"].as_object_mut().unwrap().remove(key);
             let error = parse_live_review(value).expect_err("missing score must fail");
             assert!(
-                error.to_string().starts_with("review_schema_invalid:"),
+                error.to_string().starts_with("review_schema_missing:"),
                 "key={key} error={error}"
             );
         }
     }
 
     #[test]
-    fn rejects_non_integer_and_out_of_range_scores() {
-        for bad in [json!(null), json!("2"), json!(2.5), json!(-1), json!(11)] {
+    fn rejects_non_integer_and_out_of_range_scores_for_every_gate() {
+        for key in [
+            "humanLike",
+            "emotionalValue",
+            "factRisk",
+            "productAccuracy",
+            "pressureRisk",
+            "boundaryPrivacySafety",
+        ] {
+            for bad in [json!(null), json!("2"), json!(2.5), json!(-1), json!(11)] {
+                let mut value = valid_review();
+                value["scores"][key] = bad;
+                assert!(parse_live_review(value).is_err(), "key={key}");
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_ambiguous_alias_and_canonical_score_pairs() {
+        for (alias, canonical) in [
+            ("factRisk", "hallucinationScore"),
+            ("productAccuracy", "knowledgeGroundingScore"),
+        ] {
             let mut value = valid_review();
-            value["scores"]["pressureRisk"] = bad;
-            assert!(parse_live_review(value).is_err());
+            value["scores"][canonical] = value["scores"][alias].clone();
+            assert!(parse_live_review(value).is_err(), "alias={alias}");
         }
     }
 
@@ -837,6 +1256,18 @@ mod strict_review_wire_tests {
             .claim_analysis
             .get_bool("requiresProductKnowledge")
             .unwrap());
+        assert_eq!(
+            held.claim_analysis.get_str("reviewScoreStatus").unwrap(),
+            "invalid"
+        );
+
+        let missing = hold_for_review_schema_failure(&AppError::External(
+            "review_schema_missing:pressureRisk".to_string(),
+        ));
+        assert_eq!(
+            missing.claim_analysis.get_str("reviewScoreStatus").unwrap(),
+            "missing"
+        );
     }
 }
 
@@ -846,7 +1277,11 @@ pub(crate) fn effective_review_mode(
     runtime: &UserRuntimeParameters,
     force_full: bool,
 ) -> &'static str {
-    if force_full || planner.risk_level == "high" || planner.knowledge_required {
+    if force_full
+        || runtime.distrust_self_reported_low_risk
+        || planner.risk_level == "high"
+        || planner.knowledge_required
+    {
         return "full";
     }
     // MP-10 / Task 14：低 confidence 强制 full review。
@@ -863,33 +1298,20 @@ pub(crate) fn effective_review_mode(
 
 pub(crate) fn should_run_review(
     decision: &AgentDecision,
-    planner: &RunPlannerResult,
-    runtime: &UserRuntimeParameters,
+    _planner: &RunPlannerResult,
+    _runtime: &UserRuntimeParameters,
 ) -> bool {
-    let confidence = decision.operation_state_confidence.unwrap_or(10);
+    // A sendable body must never authorize its own review bypass. Risk, confidence, and
+    // needs_review still select light/full review, but cannot decide whether review happens.
     decision.should_reply
-        && (decision.needs_review
-            || decision.risk_level == "high"
-            || planner.risk_level == "high"
-            || planner.knowledge_required
-            || confidence < runtime.operation_state_confidence_full_review_below
-            || runtime.distrust_self_reported_low_risk)
 }
 
-/// agent-autonomy-loop W2 / Task 3.1：`local_decision_review` 二态语义。
+/// Local terminal used when a strict Reviewer verdict was not executed.
 ///
-/// 旧语义：无论 budget 是否超额、`needs_review` 取值如何，本函数都返回
-/// `approved=true` + 一组保守评分；导致预算超额仍可能放过高风险回复。
-/// 新语义按 R3.7 / R3.8 / R3.10 拆成三种确定性路径：
-///
-/// * `budget.is_exceeded() && decision.needs_review == true`：返回
-///   `approved=false` + `risks=["budget_exceeded_no_review"]`；调用方
-///   （`finalize_review_for_send`）后续 SHALL 把 `autonomy_mode` 强制改写
-///   为 `"blocked"`，本函数本身不直接改写 decision；
-/// * `budget.is_exceeded() && decision.needs_review == false`：返回
-///   `approved=true` + `risks` 追加 `"local_review_low_risk_only"`，
-///   `autonomy_mode` 保持原值（低风险快速通道）；
-/// * 默认（未超额）：保留与旧实现一致的 `approved=true` + 保守评分。
+/// A sendable body always fails closed. Budget exhaustion uses the existing
+/// `budget_exceeded_no_review` contract so finalize returns `blocked_by_budget`;
+/// any other accidental local path becomes an auditable safety hold. A deliberate
+/// no-reply decision remains locally approvable because it has no outbound body.
 ///
 /// 注意：本函数不依赖 task-local `RUN_BUDGET`，调用方必须显式传入
 /// `&RunBudget`，便于 `simulation` 等持有自己 `Arc<RunBudget>` 的入口
@@ -900,81 +1322,66 @@ pub(crate) fn should_run_review(
 pub fn local_decision_review(
     decision: &AgentDecision,
     budget: &RunBudget,
-    runtime: &UserRuntimeParameters,
+    _runtime: &UserRuntimeParameters,
 ) -> DecisionReviewResult {
-    // reviewer 优化：本域声明「不信任自报低风险」时，本地兜底无法独立评估压迫感，
-    // 把 pressure_risk 从乐观 0 改为保守 `pressure_risk_block_at`（达关注线）。这是
-    // 「无法评估时从乐观转保守」的通用安全化，对任何高敏域一视同仁，不针对单一特征。
-    // DEFAULT（distrust=false）→ 0，与改造前逐字等价。
-    let fallback_pressure_risk = if runtime.distrust_self_reported_low_risk {
-        runtime.pressure_risk_block_at
-    } else {
-        0
-    };
-    let fallback_summary_suffix = if runtime.distrust_self_reported_low_risk {
-        "（本域高敏：本地兜底保守置 pressure_risk，未走 LLM）"
-    } else {
-        ""
-    };
-    if budget.is_exceeded() {
-        if decision.needs_review {
-            // R3.7：高风险路径 — 不放行，由 finalize 阶段补 autonomy_mode=blocked。
-            return DecisionReviewResult {
-                approved: false,
-                scores: ReviewScores {
-                    human_like: 0,
-                    emotional_value: 0,
-                    hallucination_score: 0,
-                    knowledge_grounding_score: 0,
-                    ..Default::default()
-                },
-                risks: vec!["budget_exceeded_no_review".to_string()],
-                review_summary:
-                    "预算超额且 needs_review=true：本地兜底拒绝放行，等待 finalize 强制 blocked"
-                        .to_string(),
-                ..Default::default()
-            };
-        }
-
-        // R3.8：低风险快速通道 — 仍然 approved，但显式标注本路径未走 LLM review。
+    if !decision.should_reply {
         return DecisionReviewResult {
             approved: true,
             scores: ReviewScores {
-                human_like: 8,
-                emotional_value: 7,
-                pressure_risk: fallback_pressure_risk,
+                human_like: 10,
+                emotional_value: 10,
                 hallucination_score: 0,
-                knowledge_grounding_score: if decision.knowledge_need == "required" {
-                    7
-                } else {
-                    10
-                },
+                knowledge_grounding_score: 10,
                 ..Default::default()
             },
-            risks: vec!["local_review_low_risk_only".to_string()],
-            review_summary: format!(
-                "预算超额但 needs_review=false：本地低风险快速通道放行{fallback_summary_suffix}"
-            ),
+            review_summary: "No outbound body; no Reviewer verdict is required".to_string(),
             ..Default::default()
         };
     }
 
-    // 默认路径（未超额）：与旧实现一致的保守 approved 结果。
-    DecisionReviewResult {
-        approved: true,
-        scores: ReviewScores {
-            human_like: 8,
-            emotional_value: 7,
-            pressure_risk: fallback_pressure_risk,
-            hallucination_score: 0,
-            knowledge_grounding_score: if decision.knowledge_need == "required" {
-                7
-            } else {
-                10
+    if budget.is_exceeded() {
+        return DecisionReviewResult {
+            approved: false,
+            scores: ReviewScores {
+                human_like: 0,
+                emotional_value: 0,
+                hallucination_score: 10,
+                knowledge_grounding_score: 0,
+                pressure_risk: 10,
+                boundary_privacy_safety: 0,
+                ..Default::default()
             },
+            claim_analysis: mongodb::bson::doc! {
+                "requiresProductKnowledge": true,
+                "reviewScoreStatus": "missing",
+            },
+            risks: vec!["budget_exceeded_no_review".to_string()],
+            review_summary: "Required Reviewer verdict unavailable because the run budget was exhausted; send blocked".to_string(),
+            ..Default::default()
+        };
+    }
+
+    DecisionReviewResult {
+        approved: false,
+        scores: ReviewScores {
+            human_like: 0,
+            emotional_value: 0,
+            hallucination_score: 10,
+            knowledge_grounding_score: 0,
+            pressure_risk: 10,
+            boundary_privacy_safety: 0,
             ..Default::default()
         },
-        review_summary: format!("低风险 fast_chat 本地轻量审核通过{fallback_summary_suffix}"),
+        claim_analysis: mongodb::bson::doc! {
+            "requiresProductKnowledge": true,
+            "reviewScoreStatus": "missing",
+        },
+        risks: vec!["required_reviewer_not_executed".to_string()],
+        review_summary: "Required Reviewer verdict was not executed; send blocked".to_string(),
+        should_hold: true,
+        hold_reason: "A sendable body has no strict Reviewer verdict".to_string(),
+        hold_category: HOLD_CATEGORY_BLOCKED_BY_SAFETY_GUARD.to_string(),
+        final_review_status: "blocked_by_safety_guard".to_string(),
         ..Default::default()
     }
 }
@@ -1108,19 +1515,25 @@ pub(crate) async fn review_decision(
     } else {
         "user.review.system"
     };
-    let system =
-        prompts::load_prompt(&state.db, &state.config.default_workspace_id, prompt_key).await?;
+    let system = prompts::load_prompt(&state.db, &contact.workspace_id, prompt_key).await?;
     // shadow replay：critic 候选若命中本 prompt_key（user.review.system /
     // user.review.light.system）则末尾追加片段，跑「原 prompt + 追加」真模型对照。
     // 现有调用点全传 None → 不触发 → review prompt 逐字不变（字节等价护栏）。
     let system = prompt_override
-        .map(|o| o.apply_if_matches(prompt_key, system.clone()))
+        .map(|o| o.use_frozen_base_if_matches(prompt_key, system.clone()))
         .unwrap_or(system);
     // universal-domain-adaptation H16-b：reviewer 的产品知识段也按 active profile 的
     // chunk_roles 渲染（与 Reply Agent 同源）。缓存命中即廉价；DEFAULT 销售四态字节等价。
-    let active_profile =
-        crate::agent::domain_profile::load_active_domain_profile(&state.db, &contact.workspace_id)
-            .await;
+    let active_profile = match super::budget::current_shadow_evaluation_snapshot() {
+        Some(snapshot) => snapshot.active_profile.clone(),
+        None => {
+            crate::agent::domain_profile::load_active_domain_profile(
+                &state.db,
+                &contact.workspace_id,
+            )
+            .await?
+        }
+    };
     // universal-domain-adaptation：review.system 链的全部 **prompt 类 profile override**
     // 收敛到 domain_profile.rs 的单一注入点 `apply_review_system_prompt_overrides`（C3 轻量
     // 约定）。它按固定顺序串起：①评审重点取向行（D）②软闸打分锚点 few-shot 段（T3）。
@@ -1143,6 +1556,9 @@ pub(crate) async fn review_decision(
         assist_override,
     );
     let system = append_assist_yield(system, assist_on);
+    let system = prompt_override
+        .map(|o| o.append_if_matches(prompt_key, system.clone()))
+        .unwrap_or(system);
     let runtime_text = serde_json::to_string(&runtime.as_document()).unwrap_or_default();
     let memory_card_text = serde_json::to_string(context_pack).unwrap_or_default();
     let memory_text = serde_json::to_string(&mongodb::bson::doc! {
@@ -1296,6 +1712,7 @@ Review 模式: {}
     // 双脑禁用时（second_reviewer_llm = None）退化为单 future，行为不变。
     let primary_future = generate_agent_json(
         state,
+        &contact.workspace_id,
         Some(&contact.account_id),
         Some(&contact.wxid),
         run_id,
@@ -1349,12 +1766,9 @@ Review 模式: {}
                 Err(error) => {
                     tracing::warn!(
                         ?error,
-                        "second reviewer schema validation failed — requiring conservative revision"
+                        "second reviewer schema validation failed - blocking send"
                     );
-                    apply_dual_reviewer_disagreement(
-                        &mut review,
-                        &DualReviewerDisagreement::ApprovedMismatch,
-                    );
+                    return Ok(hold_for_review_schema_failure(&error));
                 }
             },
             Err(error) => {
@@ -1385,12 +1799,10 @@ Review 模式: {}
 }
 
 #[cfg(test)]
-mod distrust_low_risk_tests {
+mod required_reviewer_tests {
     use super::*;
     use crate::agent::budget::RunBudget;
 
-    /// 自报低风险的回复：DEFAULT runtime（distrust=false）下 should_run_review 不触发，
-    /// 高敏 runtime（distrust=true）下强制走 LLM review。
     fn low_risk_decision() -> AgentDecision {
         let mut d = AgentDecision::default();
         d.should_reply = true;
@@ -1401,53 +1813,81 @@ mod distrust_low_risk_tests {
     }
 
     #[test]
-    fn should_run_review_forces_full_when_distrust_set() {
+    fn sendable_body_requires_review_when_distrust_is_set() {
         let decision = low_risk_decision();
         let planner = RunPlannerResult::default();
         let mut runtime = UserRuntimeParameters::default();
         runtime.distrust_self_reported_low_risk = true;
         assert!(
             should_run_review(&decision, &planner, &runtime),
-            "高敏域应强制走 LLM review，即使 Reply Agent 自报低风险"
+            "a sendable body must be reviewed even when it self-reports low risk"
         );
     }
 
     #[test]
-    fn should_run_review_unchanged_when_distrust_false() {
-        // 零扰动：DEFAULT 销售域自报低风险回复仍跳过 LLM review（与改造前一致）。
+    fn sendable_body_requires_review_in_default_profile() {
         let decision = low_risk_decision();
         let planner = RunPlannerResult::default();
         let runtime = UserRuntimeParameters::default();
         assert!(!runtime.distrust_self_reported_low_risk);
         assert!(
-            !should_run_review(&decision, &planner, &runtime),
-            "DEFAULT 域自报低风险回复应沿用既有判定（跳过 LLM review）"
+            should_run_review(&decision, &planner, &runtime),
+            "the default profile must not trust a draft to waive its own review"
         );
     }
 
     #[test]
-    fn local_decision_review_distrust_emits_nonzero_pressure() {
+    fn sensitivity_selects_full_without_restoring_a_review_bypass() {
+        let decision = low_risk_decision();
+        let planner = RunPlannerResult {
+            review_mode: "light".to_string(),
+            ..RunPlannerResult::default()
+        };
+        let mut runtime = UserRuntimeParameters::default();
+
+        assert_eq!(
+            effective_review_mode(&planner, &decision, &runtime, false),
+            "light"
+        );
+        runtime.distrust_self_reported_low_risk = true;
+        assert_eq!(
+            effective_review_mode(&planner, &decision, &runtime, false),
+            "full"
+        );
+        assert!(should_run_review(&decision, &planner, &runtime));
+    }
+
+    #[test]
+    fn local_review_never_approves_a_sendable_body() {
         let decision = low_risk_decision();
         let budget = RunBudget::new("run_distrust_test", i64::MAX, i32::MAX, i32::MAX);
         assert!(!budget.is_exceeded(), "未注入用量时不应超额");
 
-        // 高敏域兜底：pressure_risk 从乐观 0 抬到保守 block_at。
-        let mut high_sensitivity = UserRuntimeParameters::default();
-        high_sensitivity.distrust_self_reported_low_risk = true;
-        let result = local_decision_review(&decision, &budget, &high_sensitivity);
-        assert_eq!(
-            result.scores.pressure_risk, high_sensitivity.pressure_risk_block_at,
-            "高敏域本地兜底应保守置 pressure_risk = block_at，而非乐观 0"
-        );
-        assert_ne!(result.scores.pressure_risk, 0);
+        for distrust in [false, true] {
+            let mut runtime = UserRuntimeParameters::default();
+            runtime.distrust_self_reported_low_risk = distrust;
+            let result = local_decision_review(&decision, &budget, &runtime);
+            assert!(!result.approved, "distrust={distrust}");
+            assert!(result.should_hold, "distrust={distrust}");
+            assert_eq!(
+                result.final_review_status, "blocked_by_safety_guard",
+                "distrust={distrust}"
+            );
+            assert!(result
+                .risks
+                .iter()
+                .any(|risk| risk == "required_reviewer_not_executed"));
+        }
+    }
 
-        // 零扰动：DEFAULT 域兜底仍是 pressure_risk=0 + fast_chat summary。
-        let default_runtime = UserRuntimeParameters::default();
-        let baseline = local_decision_review(&decision, &budget, &default_runtime);
-        assert_eq!(baseline.scores.pressure_risk, 0);
-        assert!(
-            baseline.review_summary.contains("低风险 fast_chat"),
-            "DEFAULT 域兜底 summary 应逐字保留 fast_chat 文案"
-        );
+    #[test]
+    fn local_review_allows_deliberate_silence() {
+        let mut decision = low_risk_decision();
+        decision.should_reply = false;
+        decision.reply_text.clear();
+        let budget = RunBudget::new("run_silent", 1, 1, 1);
+        let result = local_decision_review(&decision, &budget, &UserRuntimeParameters::default());
+        assert!(result.approved);
+        assert!(!result.should_hold);
     }
 }

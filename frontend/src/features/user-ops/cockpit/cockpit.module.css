@@ -190,6 +190,17 @@
   margin-top: 2px;
 }
 
+.factEviction {
+  display: grid;
+  gap: 2px;
+}
+
+.factEvictionNote {
+  font-size: 12px;
+  color: var(--muted);
+  margin-top: 0;
+}
+
 /* 决策复盘：AI 内心独白（自治协议 9 字段）三分组展示。 */
 .protocolSection { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--hairline); }
 .protocolHeading { font-size: 12px; font-weight: 640; color: var(--ai); }

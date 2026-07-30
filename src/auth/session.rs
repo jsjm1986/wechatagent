@@ -25,6 +25,8 @@ pub enum AuthError {
     SessionExpired,
     #[error("session not found")]
     SessionNotFound,
+    #[error("admin has no authorized workspace")]
+    NoAuthorizedWorkspace,
     #[error("password hashing failed: {0}")]
     Password(#[from] password::PasswordError),
     #[error("mongo: {0}")]
@@ -114,11 +116,8 @@ pub async fn create_session(
     fallback_workspace: &str,
 ) -> Result<AdminSession, AuthError> {
     let now = Utc::now();
-    let initial_ws = user
-        .default_workspace
-        .clone()
-        .or_else(|| user.workspaces.first().cloned())
-        .unwrap_or_else(|| fallback_workspace.to_string());
+    let initial_ws = initial_authorized_workspace(user, fallback_workspace)
+        .ok_or(AuthError::NoAuthorizedWorkspace)?;
     let session = AdminSession {
         session_id: uuid::Uuid::new_v4().to_string(),
         admin_user_id: user.user_id.clone(),
@@ -129,6 +128,19 @@ pub async fn create_session(
     };
     admin_sessions(db).insert_one(&session, None).await?;
     Ok(session)
+}
+
+/// Select the login workspace from the current ACL. A stale `default_workspace`
+/// must never grant access after it has been removed from `workspaces`.
+pub fn initial_authorized_workspace(user: &AdminUser, _fallback_workspace: &str) -> Option<String> {
+    if user.workspaces.is_empty() {
+        return None;
+    }
+    user.default_workspace
+        .as_ref()
+        .filter(|workspace| user.workspaces.iter().any(|allowed| allowed == *workspace))
+        .cloned()
+        .or_else(|| user.workspaces.first().cloned())
 }
 
 /// 拿 session_id 查 session；未找到 / 已过期都返错。不更新 expires_at（不滚动续期，

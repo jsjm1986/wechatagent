@@ -173,6 +173,7 @@ pub(crate) async fn maybe_emit_unverified_warning(
     }
     let _ = write_event_for_account(
         state,
+        &contact.workspace_id,
         &contact.account_id,
         Some(&contact.wxid),
         "knowledge_unverified_warning",
@@ -453,6 +454,56 @@ pub(crate) async fn route_operation_knowledge(
     knowledge: &KnowledgeRuntime,
     run_id: Option<&str>,
 ) -> AppResult<KnowledgeRouteResult> {
+    route_operation_knowledge_inner(
+        state,
+        contact,
+        inbound,
+        recent_messages,
+        _memory,
+        _context_pack,
+        knowledge,
+        run_id,
+        false,
+    )
+    .await
+}
+
+pub(crate) async fn route_operation_knowledge_read_only(
+    state: &AppState,
+    contact: &Contact,
+    inbound: &ConversationMessage,
+    recent_messages: &[ConversationMessage],
+    memory: &OperatingMemory,
+    context_pack: &Document,
+    knowledge: &KnowledgeRuntime,
+    run_id: Option<&str>,
+) -> AppResult<KnowledgeRouteResult> {
+    route_operation_knowledge_inner(
+        state,
+        contact,
+        inbound,
+        recent_messages,
+        memory,
+        context_pack,
+        knowledge,
+        run_id,
+        true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn route_operation_knowledge_inner(
+    state: &AppState,
+    contact: &Contact,
+    inbound: &ConversationMessage,
+    recent_messages: &[ConversationMessage],
+    _memory: &OperatingMemory,
+    _context_pack: &Document,
+    knowledge: &KnowledgeRuntime,
+    run_id: Option<&str>,
+    read_only: bool,
+) -> AppResult<KnowledgeRouteResult> {
     if knowledge.documents.is_empty() && knowledge.chunks.is_empty() {
         return Ok(KnowledgeRouteResult {
             risk_level: "medium".to_string(),
@@ -498,17 +549,18 @@ pub(crate) async fn route_operation_knowledge(
         )
     };
 
-    let answer = super::knowledge_agent::answer(
-        state,
-        super::knowledge_agent::AnswerRequest {
-            workspace_id: contact.workspace_id.clone(),
-            account_id: Some(contact.account_id.clone()),
-            query: query.clone(),
-            filter: super::knowledge_agent::CatalogFilter::default(),
-            max_rounds: None,
-        },
-    )
-    .await?;
+    let request = super::knowledge_agent::AnswerRequest {
+        workspace_id: contact.workspace_id.clone(),
+        account_id: Some(contact.account_id.clone()),
+        query: query.clone(),
+        filter: super::knowledge_agent::CatalogFilter::default(),
+        max_rounds: None,
+    };
+    let answer = if read_only {
+        super::knowledge_agent::answer_read_only(state, request).await?
+    } else {
+        super::knowledge_agent::answer(state, request).await?
+    };
     let _ = run_id;
 
     // 保留 KnowledgeRouteResult 既有字段语义；selected_chunk_ids 直接用 agent

@@ -22,7 +22,18 @@ import { ChunkPicker } from "../../components/ui/ChunkRef";
 import { useConfirm } from "../../components/ui/ConfirmDialog";
 import { useToast } from "../../components/ui/Toast";
 import { EmptyState } from "../../components/ui/EmptyState";
+import { useAccountStore } from "../../stores/accountStore";
 import { severityLabel, priorityLabel, originLabel, draftKindLabel, taskStatusLabel, reportStatusLabel, digestCardKindLabel, digestSuggestedActionLabel, chatIntentLabel } from "./labels";
+
+function withAccountScope(path: string, accountId: string): string {
+  if (!accountId) return path;
+  const separator = path.includes("?") ? "&" : "?";
+  return `${path}${separator}${new URLSearchParams({ accountId }).toString()}`;
+}
+
+function chatSessionStorageKey(accountId: string): string {
+  return `knowledgeChat.sessionId.${encodeURIComponent(accountId || "__default__")}`;
+}
 
 interface ChatTurnView {
   role: "user" | "assistant";
@@ -48,7 +59,9 @@ interface ChatTurnResponse {
   naturalReply: string;
   draftKind?: string | null;
   draftPreview?: Record<string, unknown> | null;
-  plannedSteps?: Array<{ stepId?: string; cardId?: string; action: string; summary?: string }> | null;
+  plannedSteps?: DispatchStep[] | null;
+  digestSelection?: DigestSelectionBinding | null;
+  candidateHash?: string | null;
   missingFields?: string[];
   followupQuestions?: string[];
   canApply?: boolean;
@@ -56,19 +69,40 @@ interface ChatTurnResponse {
   targetPackId?: string | null;
 }
 
+interface DispatchStep {
+  stepId?: string;
+  cardId?: string;
+  action: string;
+  summary?: string;
+  targetChunkId?: string;
+}
+
+interface DigestSelectionBinding {
+  accountId: string;
+  reportId: string;
+  reportDate: string;
+  reportGeneration: number;
+  reportHash: string;
+  selectedCards: Array<{ cardId: string; cardHash: string }>;
+}
+
+interface PendingDispatchCandidate {
+  plannedSteps: DispatchStep[];
+  digestSelection: DigestSelectionBinding;
+  candidateHash: string;
+  sourceTurnIndex: number;
+}
+
 export function ChatWorkbench({ initialAttachChunkId }: { initialAttachChunkId?: string | null } = {}) {
   const confirm = useConfirm();
   const toast = useToast();
-  const [sessionId, setSessionId] = useState<string>(() => {
-    if (typeof window === "undefined") return "";
-    return window.localStorage.getItem("knowledgeChat.sessionId") ?? "";
-  });
+  const accountId = useAccountStore((state) => state.currentAccountId());
+  const accountRef = useRef(accountId);
+  const [sessionId, setSessionId] = useState("");
   const [draft, setDraft] = useState("");
   const [attachChunkId, setAttachChunkId] = useState<string>("");
   const [dispatching, setDispatching] = useState(false);
-  const [pendingSteps, setPendingSteps] = useState<
-    Array<{ stepId?: string; cardId?: string; action: string; summary?: string }>
-  >([]);
+  const [pendingDispatch, setPendingDispatch] = useState<PendingDispatchCandidate | null>(null);
 
   // B2：从待办收件箱「找 AI 协作」跳转过来时预填 chunkId。
   useEffect(() => {
@@ -81,19 +115,44 @@ export function ChatWorkbench({ initialAttachChunkId }: { initialAttachChunkId?:
   const [info, setInfo] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
+  useEffect(() => {
+    accountRef.current = accountId;
+    if (typeof window === "undefined") return;
+    const key = chatSessionStorageKey(accountId);
+    let sid = window.localStorage.getItem(key) ?? "";
+    if (!sid) {
+      const legacySid = window.localStorage.getItem("knowledgeChat.sessionId") ?? "";
+      if (legacySid) {
+        sid = legacySid;
+        window.localStorage.setItem(key, legacySid);
+        window.localStorage.removeItem("knowledgeChat.sessionId");
+      }
+    }
+    setSessionId(sid);
+    setTurns([]);
+    setPendingDispatch(null);
+    setError(null);
+    setInfo(null);
+  }, [accountId]);
+
   const persistSession = useCallback((sid: string) => {
     if (typeof window === "undefined") return;
-    if (sid) window.localStorage.setItem("knowledgeChat.sessionId", sid);
-    else window.localStorage.removeItem("knowledgeChat.sessionId");
-  }, []);
+    const key = chatSessionStorageKey(accountId);
+    if (sid) window.localStorage.setItem(key, sid);
+    else window.localStorage.removeItem(key);
+  }, [accountId]);
 
   const loadHistory = useCallback(async (sid: string) => {
     if (!sid) {
       setTurns([]);
       return;
     }
+    const requestedAccountId = accountId;
     try {
-      const r = await fetch(`/api/operation-knowledge/chat/${encodeURIComponent(sid)}`);
+      const r = await fetch(withAccountScope(
+        `/api/operation-knowledge/chat/${encodeURIComponent(sid)}`,
+        requestedAccountId,
+      ));
       if (!r.ok) throw await parseApiError(r);
       const data = (await r.json()) as { items: unknown[] };
       const items = Array.isArray(data.items) ? data.items : [];
@@ -114,11 +173,13 @@ export function ChatWorkbench({ initialAttachChunkId }: { initialAttachChunkId?:
           attachments: (obj.attachments as Array<{ chunkId?: string; itemId?: string }> | undefined) ?? []
         };
       });
-      setTurns(list);
+      if (accountRef.current === requestedAccountId) setTurns(list);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      if (accountRef.current === requestedAccountId) {
+        setError(e instanceof Error ? e.message : String(e));
+      }
     }
-  }, []);
+  }, [accountId]);
 
   useEffect(() => {
     if (sessionId) void loadHistory(sessionId);
@@ -127,11 +188,14 @@ export function ChatWorkbench({ initialAttachChunkId }: { initialAttachChunkId?:
   useEffect(() => {
     if (!sessionId || typeof window === "undefined" || typeof window.EventSource === "undefined") return;
     const handle = createSseReconnector(
-      `/api/knowledge/chat/sessions/${encodeURIComponent(sessionId)}/stream`,
+      withAccountScope(
+        `/api/knowledge/chat/sessions/${encodeURIComponent(sessionId)}/stream`,
+        accountId,
+      ),
       { onEvent: { turn: () => { void loadHistory(sessionId); } }, terminalEvents: ["close"] },
     );
     return () => handle.close();
-  }, [sessionId, loadHistory]);
+  }, [accountId, sessionId, loadHistory]);
 
   useEffect(() => {
     if (scrollRef.current) {
@@ -145,6 +209,7 @@ export function ChatWorkbench({ initialAttachChunkId }: { initialAttachChunkId?:
     setTurns([]);
     setDraft("");
     setAttachChunkId("");
+    setPendingDispatch(null);
     setError(null);
     setInfo(null);
   }
@@ -159,7 +224,8 @@ export function ChatWorkbench({ initialAttachChunkId }: { initialAttachChunkId?:
     setError(null);
     setInfo(null);
     try {
-      const body: Record<string, unknown> = { content };
+      const requestedAccountId = accountId;
+      const body: Record<string, unknown> = { content, accountId: requestedAccountId };
       if (sessionId) body.sessionId = sessionId;
       const aid = attachChunkId.trim();
       if (aid) body.attachments = [{ chunkId: aid }];
@@ -170,12 +236,23 @@ export function ChatWorkbench({ initialAttachChunkId }: { initialAttachChunkId?:
       });
       if (!r.ok) throw await parseApiError(r);
       const resp = (await r.json()) as ChatTurnResponse;
+      if (accountRef.current !== requestedAccountId) return;
       if (resp.sessionId !== sessionId) {
         setSessionId(resp.sessionId);
         persistSession(resp.sessionId);
       }
       if (Array.isArray(resp.plannedSteps) && resp.plannedSteps.length > 0) {
-        setPendingSteps(resp.plannedSteps);
+        if (resp.digestSelection && resp.candidateHash) {
+          setPendingDispatch({
+            plannedSteps: resp.plannedSteps,
+            digestSelection: resp.digestSelection,
+            candidateHash: resp.candidateHash,
+            sourceTurnIndex: resp.turnIndex,
+          });
+        } else {
+          setPendingDispatch(null);
+          setError("派工候选缺少服务端快照绑定，请重新生成后再确认");
+        }
       }
       setDraft("");
       await loadHistory(resp.sessionId);
@@ -197,16 +274,19 @@ export function ChatWorkbench({ initialAttachChunkId }: { initialAttachChunkId?:
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({})
+          body: JSON.stringify({ accountId })
         }
       );
       if (!r.ok) throw await parseApiError(r);
-      const data = (await r.json()) as { chunkId?: string; itemId?: string; status?: string };
-      const fid = data.chunkId || data.itemId;
-      setInfo(`已应用为草稿（${data.status ?? "draft"}）${fid ? `：${fid}` : ""}`);
-      if (data.chunkId) {
+      const data = (await r.json()) as {
+        result?: { createdChunkId?: string; updatedChunkId?: string; status?: string };
+      };
+      const result = data.result ?? {};
+      const chunkId = result.createdChunkId || result.updatedChunkId;
+      setInfo(`已应用为草稿（${result.status ?? "draft"}）${chunkId ? `：${chunkId}` : ""}`);
+      if (chunkId) {
         window.dispatchEvent(
-          new CustomEvent("wikiFocusChunk", { detail: { chunkId: data.chunkId } })
+          new CustomEvent("wikiFocusChunk", { detail: { chunkId } })
         );
       }
       await loadHistory(sessionId);
@@ -230,7 +310,10 @@ export function ChatWorkbench({ initialAttachChunkId }: { initialAttachChunkId?:
     setInfo(null);
     try {
       const r = await fetch(
-        `/api/operation-knowledge/chat/${encodeURIComponent(sessionId)}/discard`,
+        withAccountScope(
+          `/api/operation-knowledge/chat/${encodeURIComponent(sessionId)}/discard`,
+          accountId,
+        ),
         { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" }
       );
       if (!r.ok) throw await parseApiError(r);
@@ -250,7 +333,7 @@ export function ChatWorkbench({ initialAttachChunkId }: { initialAttachChunkId?:
 
   // E14：把当前会话的 plannedSteps 派工为长任务（后端串行 worker 执行）。
   async function confirmDispatch() {
-    if (!sessionId || pendingSteps.length === 0) return;
+    if (!sessionId || !pendingDispatch) return;
     setDispatching(true);
     setError(null);
     setInfo(null);
@@ -258,14 +341,24 @@ export function ChatWorkbench({ initialAttachChunkId }: { initialAttachChunkId?:
       const r = await fetch("/api/knowledge/chat/tasks", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ sessionId, plannedSteps: pendingSteps, cardIds: [] }),
+        body: JSON.stringify({
+          accountId,
+          sessionId,
+          digestSelection: pendingDispatch.digestSelection,
+          sourceTurnIndex: pendingDispatch.sourceTurnIndex,
+          candidateHash: pendingDispatch.candidateHash,
+          plannedSteps: pendingDispatch.plannedSteps,
+          cardIds: pendingDispatch.digestSelection.selectedCards.map((card) => card.cardId),
+        }),
       });
       if (!r.ok) throw await parseApiError(r);
       const data = (await r.json()) as { taskId?: string };
-      setPendingSteps([]);
+      setPendingDispatch(null);
       setInfo(`已派工长任务${data.taskId ? `：${data.taskId}` : ""}，可在右侧「派工跟踪」查看进度`);
       if (data.taskId) {
-        window.dispatchEvent(new CustomEvent("wikiTrackTask", { detail: { taskId: data.taskId } }));
+        window.dispatchEvent(new CustomEvent("wikiTrackTask", {
+          detail: { taskId: data.taskId, accountId },
+        }));
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -385,14 +478,14 @@ export function ChatWorkbench({ initialAttachChunkId }: { initialAttachChunkId?:
             <Trash2 size={14} /> 丢弃草稿
           </button>
         </div>
-        {pendingSteps.length > 0 ? (
+        {pendingDispatch ? (
           <div className="wikiChatDispatch">
             <div className="wikiChatDispatchHead">
               <span className="wikiArchiveTag">待确认派工</span>
-              <span className="wikiArchiveTimelineTime">AI 拆出 {pendingSteps.length} 步，确认后交后台执行</span>
+              <span className="wikiArchiveTimelineTime">AI 拆出 {pendingDispatch.plannedSteps.length} 步，确认后交后台执行</span>
             </div>
             <ul className="wikiChatFollowups">
-              {pendingSteps.map((s, i) => (
+              {pendingDispatch.plannedSteps.map((s, i) => (
                 <li key={s.stepId ?? i}>{s.action} · {s.summary ?? ""}</li>
               ))}
             </ul>
@@ -400,7 +493,7 @@ export function ChatWorkbench({ initialAttachChunkId }: { initialAttachChunkId?:
               <button type="button" className="primary" onClick={() => void confirmDispatch()} disabled={dispatching || !sessionId}>
                 {dispatching ? "派工中…" : "确认派工"}
               </button>
-              <button type="button" onClick={() => setPendingSteps([])} disabled={dispatching}>
+              <button type="button" onClick={() => setPendingDispatch(null)} disabled={dispatching}>
                 取消
               </button>
             </div>
@@ -572,6 +665,7 @@ export function KnowledgeInbox({
 
 interface DigestCardView {
   cardId: string;
+  cardHash?: string;
   kind: string;
   title: string;
   summary: string;
@@ -583,11 +677,18 @@ interface DigestCardView {
 
 interface DigestReportView {
   reportId?: string | null;
+  reportHash?: string;
   workspaceId: string;
   accountId: string;
   reportDate: string;
   status: string;
   errorKind?: string | null;
+  attemptGeneration?: number;
+  currentGeneration?: number;
+  latestAttemptStatus?: string | null;
+  latestAttemptErrorKind?: string | null;
+  latestAttemptAt?: string | null;
+  lastSuccessAt?: string | null;
   cards: DigestCardView[];
   dismissedCardIds: string[];
   generatedAt?: string;
@@ -599,6 +700,7 @@ function severityBadgeClass(sev: string): string {
 }
 
 export function DigestCanvas() {
+  const accountId = useAccountStore((state) => state.currentAccountId());
   const [report, setReport] = useState<DigestReportView | null>(null);
   const [pending, setPending] = useState(false);
   const [regen, setRegen] = useState(false);
@@ -618,19 +720,33 @@ export function DigestCanvas() {
 
   async function dispatchSelected() {
     if (selected.size === 0) return;
-    const steps = visibleCards
-      .filter((c) => selected.has(c.cardId) && c.suggestedAction !== "freeform")
-      .map((c, idx) => ({
-        stepId: `step_${idx + 1}`,
-        cardId: c.cardId,
-        action: c.suggestedAction,
-        summary: c.summary,
-        reportDate: report?.reportDate,
-      }));
-    if (steps.length === 0) {
+    const selectedCards = visibleCards.filter(
+      (card) => selected.has(card.cardId) && card.suggestedAction !== "freeform",
+    );
+    if (selectedCards.length === 0) {
       setError(new Error("选中的卡片都不可派工（仅查看类卡片无执行动作）"));
       return;
     }
+    if (
+      !report?.reportId ||
+      !report.reportHash ||
+      report.currentGeneration === undefined ||
+      selectedCards.some((card) => !card.cardHash)
+    ) {
+      setError(new Error("当前日报缺少服务端快照绑定，请刷新后重新选择"));
+      return;
+    }
+    const digestSelection: DigestSelectionBinding = {
+      accountId: report.accountId,
+      reportId: report.reportId,
+      reportDate: report.reportDate,
+      reportGeneration: report.currentGeneration,
+      reportHash: report.reportHash,
+      selectedCards: selectedCards.map((card) => ({
+        cardId: card.cardId,
+        cardHash: card.cardHash as string,
+      })),
+    };
     setDispatchingBatch(true);
     setError(null);
     try {
@@ -638,13 +754,19 @@ export function DigestCanvas() {
       const r = await fetch("/api/knowledge/chat/tasks", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ sessionId, plannedSteps: steps, cardIds: steps.map((s) => s.cardId) }),
+        body: JSON.stringify({
+          accountId: report.accountId,
+          sessionId,
+          digestSelection,
+        }),
       });
       if (!r.ok) throw await parseApiError(r);
       const data = (await r.json()) as { taskId?: string };
       setSelected(new Set());
       if (data.taskId) {
-        window.dispatchEvent(new CustomEvent("wikiTrackTask", { detail: { taskId: data.taskId } }));
+        window.dispatchEvent(new CustomEvent("wikiTrackTask", {
+          detail: { taskId: data.taskId, accountId },
+        }));
       }
     } catch (e) {
       setError(e instanceof Error ? e : new Error(String(e)));
@@ -654,12 +776,14 @@ export function DigestCanvas() {
   }
 
   async function load() {
+    const requestedAccountId = accountId;
     setPending(true);
     setError(null);
     try {
-      const r = await fetch("/api/knowledge/digest/today");
+      const r = await fetch(withAccountScope("/api/knowledge/digest/today", requestedAccountId));
       if (!r.ok) throw await parseApiError(r);
       const data = (await r.json()) as DigestReportView;
+      if (useAccountStore.getState().currentAccountId() !== requestedAccountId) return;
       setReport(data);
     } catch (e) {
       setError(e instanceof Error ? e : new Error(String(e)));
@@ -676,7 +800,7 @@ export function DigestCanvas() {
       const r = await fetch("/api/knowledge/digest/regenerate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ force: true })
+        body: JSON.stringify({ accountId, force: true })
       });
       if (!r.ok) throw await parseApiError(r);
       const data = (await r.json()) as DigestReportView;
@@ -689,10 +813,15 @@ export function DigestCanvas() {
   }
 
   async function dismiss(cardId: string) {
+    if (!report?.accountId) {
+      setError(new Error("当前日报缺少账号标识，无法忽略卡片"));
+      return;
+    }
     setDismissing((s) => new Set(s).add(cardId));
     try {
+      const query = new URLSearchParams({ accountId: report.accountId });
       const r = await fetch(
-        `/api/knowledge/digest/cards/${encodeURIComponent(cardId)}/dismiss`,
+        `/api/knowledge/digest/cards/${encodeURIComponent(cardId)}/dismiss?${query.toString()}`,
         { method: "POST" }
       );
       if (!r.ok) throw await parseApiError(r);
@@ -711,8 +840,12 @@ export function DigestCanvas() {
   }
 
   useEffect(() => {
+    setReport(null);
+    setSelected(new Set());
     void load();
-  }, []);
+    // load intentionally follows the account snapshot for this render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [accountId]);
 
   const visibleCards = useMemo(() => {
     if (!report) return [];
@@ -742,6 +875,13 @@ export function DigestCanvas() {
         </div>
       </div>
       {error ? <LlmErrorBanner error={error} onRetry={() => void load()} retrying={pending} /> : null}
+      {!error && report?.latestAttemptStatus && report.latestAttemptStatus !== "ok" ? (
+        <div className="wikiBannerError" role="alert">
+          最近重算{report.latestAttemptStatus === "running" ? "仍在进行" : "未成功"}
+          {report.latestAttemptErrorKind ? `（${report.latestAttemptErrorKind}）` : ""}；
+          {report.status === "ok" ? "当前继续展示上次成功结果。" : "当前没有可用的成功结果。"}
+        </div>
+      ) : null}
       {!error && visibleCards.length === 0 && !pending ? (
         <EmptyState
           icon={<FileBox size={28} />}
@@ -821,6 +961,7 @@ const TASK_FALLBACK_POLL_MAX_ATTEMPTS = 12;
 
 export function TaskRail() {
   const toast = useToast();
+  const accountId = useAccountStore((state) => state.currentAccountId());
   const [sessionId, setSessionId] = useState("");
   const [task, setTask] = useState<ChatTaskView | null>(null);
   const [pending, setPending] = useState(false);
@@ -836,7 +977,7 @@ export function TaskRail() {
 
   async function loadTaskList() {
     try {
-      const r = await fetch("/api/knowledge/chat/tasks");
+      const r = await fetch(withAccountScope("/api/knowledge/chat/tasks", accountId));
       if (!r.ok) {
         // 列表失败不阻塞手工跟踪，静默降级 + 轻量提示
         toast.error("任务列表加载失败，可手动输入任务 ID");
@@ -851,10 +992,20 @@ export function TaskRail() {
   }
 
   useEffect(() => {
+    trackedTaskIdRef.current = "";
+    snapshotGenerationRef.current += 1;
+    closeStream();
+    stopFallbackPolling();
+    setSessionId("");
+    setTask(null);
+    setTaskList([]);
+    setLiveTurns([]);
+    setStreamNotice("");
+    setError(null);
     void loadTaskList();
-    // loadTaskList 为组件内闭包（仅引用 setter/fetch）；空依赖仅在挂载时拉取一次。
+    // Reload and clear all task state whenever the selected account changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [accountId]);
 
   function closeStream() {
     sseRef.current?.close();
@@ -883,7 +1034,10 @@ export function TaskRail() {
     if (showPending) setPending(true);
     if (showPending) setError(null);
     try {
-      const r = await fetch(`/api/knowledge/chat/tasks/${encodeURIComponent(taskId)}`);
+      const r = await fetch(withAccountScope(
+        `/api/knowledge/chat/tasks/${encodeURIComponent(taskId)}`,
+        accountId,
+      ));
       if (!r.ok) throw await parseApiError(r);
       const data = (await r.json()) as ChatTaskView;
       if (
@@ -951,7 +1105,7 @@ export function TaskRail() {
     }
     setStreamNotice("正在连接实时进度…");
     sseRef.current = createSseReconnector(
-      `/api/knowledge/chat/sessions/${encodeURIComponent(sid)}/stream`,
+      withAccountScope(`/api/knowledge/chat/sessions/${encodeURIComponent(sid)}/stream`, accountId),
       {
         onEvent: {
           turn: (ev) => {
@@ -979,8 +1133,9 @@ export function TaskRail() {
   // E14：ChatWorkbench 派工成功后广播 wikiTrackTask，自动填入并跟踪新任务。
   useEffect(() => {
     function onTrack(ev: Event) {
-      const taskId = (ev as CustomEvent<{ taskId?: string }>).detail?.taskId;
-      if (taskId) {
+      const detail = (ev as CustomEvent<{ taskId?: string; accountId?: string }>).detail;
+      const taskId = detail?.taskId;
+      if (taskId && (!detail.accountId || detail.accountId === accountId)) {
         setSessionId(taskId);
         void loadTask(taskId);
         void loadTaskList();
@@ -990,7 +1145,7 @@ export function TaskRail() {
     return () => window.removeEventListener("wikiTrackTask", onTrack as EventListener);
     // loadTask 为稳定闭包（仅引用 setter）；空依赖避免重复绑定。
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [accountId]);
 
   async function loadTask(taskId: string) {
     const normalized = taskId.trim();
@@ -1013,7 +1168,10 @@ export function TaskRail() {
     setError(null);
     try {
       const r = await fetch(
-        `/api/knowledge/chat/tasks/${encodeURIComponent(task.taskId)}/cancel`,
+        withAccountScope(
+          `/api/knowledge/chat/tasks/${encodeURIComponent(task.taskId)}/cancel`,
+          accountId,
+        ),
         { method: "POST" }
       );
       if (!r.ok) throw await parseApiError(r);

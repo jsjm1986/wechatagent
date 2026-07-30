@@ -124,7 +124,7 @@ impl Database {
     /// 自学习采集管道 S1–S3：`behavior_signals` append-only 事件日志 typed
     /// accessor。只存系统观察到的客观行为量（reply_latency / reply_length /
     /// reactivation / silence），不含任何 LLM 解释。索引（含
-    /// `(workspace_id, dedupe_key)` partial unique 幂等约束）见 `db/indexes.rs`。
+    /// `(workspace_id, account_id, dedupe_key)` partial unique 幂等约束）见 `db/indexes.rs`。
     pub fn behavior_signals(&self) -> Collection<BehaviorSignal> {
         self.db.collection("behavior_signals")
     }
@@ -395,8 +395,8 @@ impl Database {
         self.db.collection("domain_profiles")
     }
 
-    /// catalog 重建队列：apply_chunk_revision 写完即 enqueue；catalog_rebuild_worker
-    /// 每 200ms 取一批 status=queued 落库 `documents.catalog_summary_persisted`。
+    /// catalog 重建队列：chunk/revision、父文档 desired generation 与 intent 同事务提交；
+    /// worker 通过 owner/token/lease 领取并原子推进 persisted snapshot generation。
     pub fn catalog_rebuild_jobs(&self) -> Collection<CatalogRebuildJob> {
         self.db.collection("catalog_rebuild_jobs")
     }

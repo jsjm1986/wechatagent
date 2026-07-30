@@ -23,7 +23,7 @@ use super::AppState;
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct DecisionReviewQuery {
-    account_id: Option<String>,
+    account_id: String,
     contact_id: Option<String>,
     contact_wxid: Option<String>,
     limit: Option<i64>,
@@ -34,15 +34,20 @@ pub(super) async fn list_decision_reviews(
     Extension(admin): Extension<AuthenticatedAdmin>,
     Query(query): Query<DecisionReviewQuery>,
 ) -> AppResult<Json<Value>> {
-    let account_id = query
-        .account_id
-        .unwrap_or_else(|| state.config.default_account_id.clone());
+    let account_id = query.account_id.trim();
+    if account_id.is_empty() {
+        return Err(AppError::BadRequest("accountId is required".to_string()));
+    }
+    validate_account(&state, &admin.current_workspace, account_id).await?;
     let mut filter = doc! {
         "workspace_id": &admin.current_workspace,
         "account_id": &account_id
     };
     if let Some(contact_id) = query.contact_id {
         let contact = find_contact_by_id(&state, &admin.current_workspace, &contact_id).await?;
+        if contact.account_id != account_id {
+            return Err(AppError::NotFound("contact not found".to_string()));
+        }
         filter.insert("contact_wxid", contact.wxid);
     } else if let Some(contact_wxid) = query.contact_wxid {
         if !contact_wxid.is_empty() {
@@ -62,7 +67,13 @@ pub(super) async fn list_decision_reviews(
         .await?;
     let mut items = Vec::new();
     while let Some(review) = cursor.try_next().await? {
-        let status = fetch_run_status(&state, review.run_id.as_deref()).await;
+        let status = fetch_run_status(
+            &state,
+            &admin.current_workspace,
+            account_id,
+            review.run_id.as_deref(),
+        )
+        .await;
         items.push(decision_review_json(
             review,
             status.final_review_status,
@@ -77,7 +88,13 @@ pub(super) async fn get_decision_review(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
+    Query(query): Query<DecisionReviewQuery>,
 ) -> AppResult<Json<Value>> {
+    let account_id = query.account_id.trim();
+    if account_id.is_empty() {
+        return Err(AppError::BadRequest("accountId is required".to_string()));
+    }
+    validate_account(&state, &admin.current_workspace, account_id).await?;
     let object_id = parse_object_id(&id)?;
     let review = state
         .db
@@ -85,13 +102,20 @@ pub(super) async fn get_decision_review(
         .find_one(
             doc! {
                 "_id": object_id,
-                "workspace_id": &admin.current_workspace
+                "workspace_id": &admin.current_workspace,
+                "account_id": account_id,
             },
             None,
         )
         .await?
         .ok_or_else(|| AppError::NotFound("decision review not found".to_string()))?;
-    let status = fetch_run_status(&state, review.run_id.as_deref()).await;
+    let status = fetch_run_status(
+        &state,
+        &admin.current_workspace,
+        account_id,
+        review.run_id.as_deref(),
+    )
+    .await;
     Ok(Json(json!({ "item": decision_review_json(
         review,
         status.final_review_status,
@@ -138,7 +162,12 @@ struct RunStatusView {
 /// 关联同 run_id 的 AgentRunLog，取 final_review_status（顶层 snake 字段）、
 /// review doc 内的 holdCategory（camelCase），以及 decision doc 内的 9 个自治协议字段。
 /// 纯读投影，缺失则回 None。
-async fn fetch_run_status(state: &AppState, run_id: Option<&str>) -> RunStatusView {
+async fn fetch_run_status(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+    run_id: Option<&str>,
+) -> RunStatusView {
     let Some(run_id) = run_id.filter(|s| !s.is_empty()) else {
         return RunStatusView {
             final_review_status: None,
@@ -149,7 +178,14 @@ async fn fetch_run_status(state: &AppState, run_id: Option<&str>) -> RunStatusVi
     match state
         .db
         .agent_run_logs()
-        .find_one(doc! { "run_id": run_id }, None)
+        .find_one(
+            doc! {
+                "workspace_id": workspace_id,
+                "account_id": account_id,
+                "run_id": run_id,
+            },
+            None,
+        )
         .await
     {
         Ok(Some(log)) => {

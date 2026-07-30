@@ -1,7 +1,6 @@
-//! 回归（Stage4 孤儿#3-A）：手动 publish_prompt_template 的 delete_many 必须放过
-//! seeded_by="evolution_release" 的历史行——否则会物删 evolution 灰度链留下的历史
-//! 版本，摧毁 rollback（rollback 靠 version=previous_version 找回历史行）。
-//! 默认 #[ignore]，需 Docker。
+//! SR-055: manual Prompt publication is an append-only, single-current switch.
+//! Historical system/evolution rows are retained and runtime never performs an
+//! implicit contact bucket over multiple `status=active` rows.
 
 mod common;
 
@@ -19,7 +18,14 @@ fn test_admin(ws: &str) -> AuthenticatedAdmin {
     }
 }
 
-fn make_row(ws: &str, key: &str, version: i32, status: &str, seeded_by: &str) -> PromptTemplate {
+fn make_row(
+    ws: &str,
+    key: &str,
+    version: i32,
+    status: &str,
+    current: bool,
+    seeded_by: &str,
+) -> PromptTemplate {
     let now = DateTime::now();
     PromptTemplate {
         id: Some(ObjectId::new()),
@@ -38,24 +44,24 @@ fn make_row(ws: &str, key: &str, version: i32, status: &str, seeded_by: &str) ->
         created_by: "manual".to_string(),
         created_at: now,
         updated_at: now,
-        current_version: status == "active",
+        current_version: current,
         previous_version: None,
         seeded_by: Some(seeded_by.to_string()),
         locale: None,
+        source_proposal_id: None,
     }
 }
 
 #[tokio::test]
-#[ignore]
-async fn publish_preserves_evolution_history_rows() {
-    let app = common::TestApp::start().await;
+#[ignore = "requires replica-set MongoDB / testcontainers"]
+async fn publish_preserves_all_history_and_switches_one_current() {
+    let app = common::TestApp::start_repl_set().await;
     let ws = app.state.config.default_workspace_id.clone();
     let key = "user.test.publish_guard";
 
-    // v1 system（应被删）、v2 evolution_release 历史行（必须存活）、v3 manual draft（被 publish）。
-    let sys = make_row(&ws, key, 1, "archived", "system");
-    let evo = make_row(&ws, key, 2, "active", "evolution_release");
-    let draft = make_row(&ws, key, 3, "draft", "manual");
+    let sys = make_row(&ws, key, 1, "archived", false, "system");
+    let evo = make_row(&ws, key, 2, "active", true, "evolution_release");
+    let draft = make_row(&ws, key, 3, "draft", false, "manual");
     let draft_id = draft.id.unwrap().to_hex();
     app.state
         .db
@@ -77,65 +83,62 @@ async fn publish_preserves_evolution_history_rows() {
     .expect("publish ok");
     assert_eq!(resp.0["ok"], true);
 
-    // 断言 1：evolution_release 历史行（v2）必须存活（修复前会被 delete_many 物删）。
-    let evo_after = app
+    let rows = app
         .state
         .db
         .prompt_templates()
-        .find_one(
-            doc! { "workspace_id": &ws, "prompt_key": key, "version": 2 },
-            None,
+        .find(
+            doc! { "workspace_id": &ws, "prompt_key": key },
+            mongodb::options::FindOptions::builder()
+                .sort(doc! { "version": 1 })
+                .build(),
         )
         .await
         .unwrap();
-    assert!(
-        evo_after.is_some(),
-        "seeded_by=evolution_release 的历史行必须在手动 publish 后存活（保住 rollback 链）"
-    );
-
-    // 断言 2：非 evolution 的 system 历史行（v1）被删（单版本清理语义保留）。
-    let sys_after = app
-        .state
-        .db
-        .prompt_templates()
-        .find_one(
-            doc! { "workspace_id": &ws, "prompt_key": key, "version": 1 },
-            None,
-        )
-        .await
-        .unwrap();
-    assert!(sys_after.is_none(), "非 evolution 历史行应被 publish 清理");
-
-    // 断言 3：被 publish 的 draft（v3）转为 active。
-    let draft_after = app
-        .state
-        .db
-        .prompt_templates()
-        .find_one(
-            doc! { "workspace_id": &ws, "prompt_key": key, "version": 3 },
-            None,
-        )
-        .await
-        .unwrap()
-        .expect("v3 row");
+    let rows: Vec<PromptTemplate> = futures::TryStreamExt::try_collect(rows).await.unwrap();
     assert_eq!(
-        draft_after.status, "active",
-        "被 publish 的 draft 应转 active"
+        rows.len(),
+        3,
+        "publication must retain every historical row"
     );
+    assert_eq!(
+        rows.iter().filter(|row| row.current_version).count(),
+        1,
+        "exactly one canonical current pointer must remain"
+    );
+    let old_system = rows.iter().find(|row| row.version == 1).unwrap();
+    assert_eq!(old_system.status, "archived");
+    assert!(!old_system.current_version);
+    let old_evolution = rows.iter().find(|row| row.version == 2).unwrap();
+    assert_eq!(old_evolution.status, "archived");
+    assert!(!old_evolution.current_version);
+    let published = rows.iter().find(|row| row.version == 3).unwrap();
+    assert_eq!(published.status, "active");
+    assert!(published.current_version);
 
-    // 断言 4：检测到 evolution 行时写了观测事件（边缘副作用可见）。
-    let ev = app
-        .state
-        .db
-        .events()
-        .find_one(
-            doc! { "workspace_id": &ws, "kind": "prompt_publish_kept_evolution_rows" },
-            None,
-        )
-        .await
-        .unwrap();
-    assert!(
-        ev.is_some(),
-        "检测到 evolution 行时应写 prompt_publish_kept_evolution_rows 观测事件"
+    let first = wechatagent::prompts::load_prompt_for_contact(
+        &app.state.db,
+        &ws,
+        key,
+        "contact-a",
+        Some("zh-CN"),
+    )
+    .await
+    .unwrap();
+    let second = wechatagent::prompts::load_prompt_for_contact(
+        &app.state.db,
+        &ws,
+        key,
+        "contact-b",
+        Some("en-US"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        first, second,
+        "contact identity must not select another Prompt"
     );
+    assert_eq!(first.1, Some(3));
+
+    app.cleanup().await;
 }

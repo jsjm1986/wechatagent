@@ -11,6 +11,7 @@ use axum::extract::{Extension, Path, State};
 use mongodb::bson::{doc, DateTime, Document};
 
 use wechatagent::auth::AuthenticatedAdmin;
+use wechatagent::error::AppError;
 use wechatagent::models::{AgentStatus, Contact};
 use wechatagent::routes::contacts::update_operation_profile;
 
@@ -118,6 +119,7 @@ async fn front_end_style_request_preserves_profile_attributes() {
         Path(id),
         axum::Json(
             serde_json::from_value(serde_json::json!({
+                "expectedAccountId": acc,
                 "relationshipType": "customer",
                 "lastCommitment": "下周回复",
             }))
@@ -154,6 +156,7 @@ async fn non_empty_profile_attributes_is_written() {
         Path(id),
         axum::Json(
             serde_json::from_value(serde_json::json!({
+                "expectedAccountId": acc,
                 "profileAttributes": { "budget": "low" },
             }))
             .expect("构造带 profileAttributes 的请求体"),
@@ -191,8 +194,11 @@ async fn updating_follow_up_policy_preserves_profile_attributes() {
         Extension(test_admin(&ws)),
         Path(id),
         axum::Json(
-            serde_json::from_value(serde_json::json!({ "followUpPolicy": "每周跟进" }))
-                .expect("构造带 followUpPolicy 的请求体"),
+            serde_json::from_value(serde_json::json!({
+                "expectedAccountId": acc,
+                "followUpPolicy": "每周跟进"
+            }))
+            .expect("构造带 followUpPolicy 的请求体"),
         ),
     )
     .await
@@ -209,4 +215,126 @@ async fn updating_follow_up_policy_preserves_profile_attributes() {
         c.profile_attributes, ai_attrs,
         "更新 follow_up_policy 不应清空 profile_attributes"
     );
+}
+
+/// SR-151: a contact must never adopt a Playbook owned by another account.
+#[tokio::test]
+#[ignore]
+async fn cross_account_playbook_is_rejected_with_zero_contact_write() {
+    let app = TestApp::start().await;
+    let ws = app.state.config.default_workspace_id.clone();
+    let acc = app.state.config.default_account_id.clone();
+    let other_acc = "other-account";
+    let id = seed(
+        &app,
+        managed_contact(&ws, &acc, "wx_sr151_cross", doc! { "stable": true }),
+    )
+    .await;
+
+    let mut foreign_playbook = wechatagent::prompts::default_playbook(&ws, other_acc);
+    foreign_playbook.name = "foreign playbook".to_string();
+    foreign_playbook.is_default = false;
+    let foreign_id = app
+        .state
+        .db
+        .operation_playbooks()
+        .insert_one(foreign_playbook, None)
+        .await
+        .expect("seed foreign playbook")
+        .inserted_id
+        .as_object_id()
+        .expect("foreign playbook id");
+    let contacts = app.state.db.contacts().clone_with_type::<Document>();
+    let object_id = mongodb::bson::oid::ObjectId::parse_str(&id).expect("contact id");
+    let before = contacts
+        .find_one(doc! { "_id": object_id }, None)
+        .await
+        .expect("load before")
+        .expect("contact exists");
+
+    let result = update_operation_profile(
+        State(app.state.clone()),
+        Extension(test_admin(&ws)),
+        Path(id),
+        axum::Json(
+            serde_json::from_value(serde_json::json!({
+                "expectedAccountId": acc,
+                "playbookId": foreign_id.to_hex(),
+                "followUpPolicy": "must not persist"
+            }))
+            .expect("construct cross-account request"),
+        ),
+    )
+    .await;
+
+    assert!(matches!(result, Err(AppError::NotFound(_))));
+    let after = contacts
+        .find_one(doc! { "_id": object_id }, None)
+        .await
+        .expect("load after")
+        .expect("contact exists");
+    assert_eq!(
+        after, before,
+        "foreign Playbook rejection must be zero-write"
+    );
+}
+
+/// SR-070: an AI-generated draft must not be bindable to a live contact.
+#[tokio::test]
+#[ignore]
+async fn draft_playbook_is_rejected_with_zero_contact_write() {
+    let app = TestApp::start().await;
+    let ws = app.state.config.default_workspace_id.clone();
+    let acc = app.state.config.default_account_id.clone();
+    let id = seed(
+        &app,
+        managed_contact(&ws, &acc, "wx_sr070_draft", doc! { "stable": true }),
+    )
+    .await;
+
+    let mut draft = wechatagent::prompts::default_playbook(&ws, &acc);
+    draft.name = "AI draft playbook".to_string();
+    draft.created_by = "agent_optimized".to_string();
+    draft.release_status = "draft".to_string();
+    draft.is_default = false;
+    let draft_id = app
+        .state
+        .db
+        .operation_playbooks()
+        .insert_one(draft, None)
+        .await
+        .expect("seed draft playbook")
+        .inserted_id
+        .as_object_id()
+        .expect("draft playbook id");
+    let contacts = app.state.db.contacts().clone_with_type::<Document>();
+    let object_id = mongodb::bson::oid::ObjectId::parse_str(&id).expect("contact id");
+    let before = contacts
+        .find_one(doc! { "_id": object_id }, None)
+        .await
+        .expect("load before")
+        .expect("contact exists");
+
+    let result = update_operation_profile(
+        State(app.state.clone()),
+        Extension(test_admin(&ws)),
+        Path(id),
+        axum::Json(
+            serde_json::from_value(serde_json::json!({
+                "expectedAccountId": acc,
+                "playbookId": draft_id.to_hex(),
+                "followUpPolicy": "must not persist"
+            }))
+            .expect("construct draft binding request"),
+        ),
+    )
+    .await;
+
+    assert!(matches!(result, Err(AppError::NotFound(_))));
+    let after = contacts
+        .find_one(doc! { "_id": object_id }, None)
+        .await
+        .expect("load after")
+        .expect("contact exists");
+    assert_eq!(after, before, "draft Playbook rejection must be zero-write");
 }

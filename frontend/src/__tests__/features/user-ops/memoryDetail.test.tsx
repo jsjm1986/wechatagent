@@ -56,6 +56,30 @@ describe("MemoryDetailView", () => {
     expect(screen.getByText(/客户是老板/)).toBeInTheDocument();
   });
 
+  it("显示因核心窗口容量淘汰的可追溯归档", () => {
+    render(
+      <MemoryDetailView
+        memoryCard={
+          {
+            coreFactEvictions: [
+              {
+                text: "客户曾明确要求纸质合同",
+                reason: "core_fact_capacity",
+                coreFactRank: 7,
+                evictedAt: "2026-07-24T10:00:00Z",
+              },
+            ],
+          } as any
+        }
+        onBack={() => {}}
+      />,
+    );
+    expect(screen.getByText("核心事实归档")).toBeInTheDocument();
+    expect(screen.getByText("客户曾明确要求纸质合同")).toBeInTheDocument();
+    expect(screen.getByText(/因核心事实窗口上限归档/)).toBeInTheDocument();
+    expect(screen.getByText(/原排名 7/)).toBeInTheDocument();
+  });
+
   it("onBack 返回按钮可点击", () => {
     const onBack = vi.fn();
     render(<MemoryDetailView memoryCard={{}} onBack={onBack} />);

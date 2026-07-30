@@ -13,7 +13,10 @@
     "description": "刚加上微信、还没业务对话",
     "displayName": "首次接触",
     "id": "first_contact",
+    "isReactivationTarget": false,
+    "isTerminal": false,
     "label": "首次接触",
+    "priorityWeight": 10,
     "status": "active"
   },
   "version": 1,

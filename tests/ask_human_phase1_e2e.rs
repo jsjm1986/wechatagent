@@ -33,17 +33,20 @@
 mod common;
 
 use axum::extract::{Extension, Json, Path, Query, State};
-use mongodb::bson::{doc, DateTime};
+use mongodb::{
+    bson::{doc, DateTime, Document},
+    options::UpdateOptions,
+};
 use serde_json::Value;
 
 use wechatagent::auth::AuthenticatedAdmin;
 use wechatagent::models::{
-    AgentPrincipalEscalation, OperationKnowledgeChunk, ESCALATION_CATEGORY_HIGH_RISK_GATED,
+    AgentPrincipalEscalation, AskHumanPolicy, DeciderRef, OperationKnowledgeChunk,
+    PrincipalEscalationProtocol, ESCALATION_CATEGORY_HIGH_RISK_GATED,
+    PRINCIPAL_CARD_DELIVERY_QUEUED, PRINCIPAL_CARD_DELIVERY_SENT,
     PRINCIPAL_ESCALATION_STATUS_PENDING,
 };
 use wechatagent::routes::AppState;
-use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// 构造测试 admin auth context（current_workspace 决定 handler 可见范围）。
 fn test_admin(workspace_id: &str) -> AuthenticatedAdmin {
@@ -52,6 +55,51 @@ fn test_admin(workspace_id: &str) -> AuthenticatedAdmin {
         username: "test_admin".to_string(),
         current_workspace: workspace_id.to_string(),
     }
+}
+
+/// 保存 ask-human 策略前建立后端权威校验所需的真实账号—联系人归属。
+async fn ensure_decider_identity(state: &AppState, ws: &str, account_id: &str, wxid: &str) {
+    let now = DateTime::now();
+    state
+        .db
+        .raw()
+        .collection::<Document>("wechat_accounts")
+        .update_one(
+            doc! { "workspace_id": ws, "account_id": account_id },
+            doc! { "$setOnInsert": {
+                "workspace_id": ws,
+                "account_id": account_id,
+                "alias": account_id,
+                "display_name": account_id,
+                "online": true,
+                "last_sync_at": now,
+                "capacity": 0i32,
+                "off_hours": [],
+                "created_at": now,
+                "updated_at": now,
+            } },
+            UpdateOptions::builder().upsert(true).build(),
+        )
+        .await
+        .expect("seed decider account identity");
+    state
+        .db
+        .raw()
+        .collection::<Document>("contacts")
+        .update_one(
+            doc! { "workspace_id": ws, "account_id": account_id, "wxid": wxid },
+            doc! { "$setOnInsert": {
+                "workspace_id": ws,
+                "account_id": account_id,
+                "wxid": wxid,
+                "agent_status": "normal",
+                "created_at": now,
+                "updated_at": now,
+            } },
+            UpdateOptions::builder().upsert(true).build(),
+        )
+        .await
+        .expect("seed decider contact identity");
 }
 
 /// seed 一条 pending 请示台账行（`insert_pending_escalation` 是 pub(crate) 不可达，
@@ -63,6 +111,31 @@ async fn seed_pending_escalation(
     principal: &str,
 ) -> AgentPrincipalEscalation {
     let now = DateTime::now();
+    let config = current_user_ops_config(state, ws).await;
+    let frozen_policy = config
+        .ask_human_policy
+        .clone()
+        .unwrap_or_else(|| AskHumanPolicy {
+            decider_chain: vec![DeciderRef {
+                wxid: principal.to_string(),
+                display_name: None,
+                account_id: Some("acc_test".to_string()),
+            }],
+            escalate_safety_guard: true,
+            escalate_unverified_product: true,
+            escalate_ai_policy_hold: false,
+            escalate_stuck: true,
+            dedupe_window_hours: None,
+            daily_push_cap: None,
+            quiet_hours: None,
+            timeout_hours: None,
+        });
+    let principal_account_id = frozen_policy
+        .decider_chain
+        .iter()
+        .find(|decider| decider.wxid == principal)
+        .and_then(|decider| decider.account_id.clone())
+        .unwrap_or_else(|| "acc_test".to_string());
     let entry = AgentPrincipalEscalation {
         id: None,
         workspace_id: ws.to_string(),
@@ -74,6 +147,17 @@ async fn seed_pending_escalation(
         reason: "测试卡点".to_string(),
         question_for_principal: "请领导定夺".to_string(),
         principal_wxid: principal.to_string(),
+        protocol: Some(PrincipalEscalationProtocol {
+            domain: config.domain,
+            policy_version: config.version,
+            policy: frozen_policy,
+            principal_account_id,
+            delivery_generation: 1,
+            delivery_state: PRINCIPAL_CARD_DELIVERY_SENT.to_string(),
+            delivery_content: "test principal card".to_string(),
+            delivery_outbox_id: None,
+            failure_cleanup_completed_at: None,
+        }),
         decision: None,
         authorization_expires_at: None,
         is_generalizable: false,
@@ -82,8 +166,13 @@ async fn seed_pending_escalation(
         updated_at: now,
         resolved_at: None,
         resolved_via: None,
+        relay_state: None,
+        relay_task_id: None,
+        relay_enqueued_at: None,
+        relay_terminal_at: None,
+        relay_terminal_reason: None,
         last_holding_reply_ms: None,
-        last_pushed_at_ms: None,
+        last_pushed_at_ms: Some(now.timestamp_millis()),
     };
     state
         .db
@@ -147,10 +236,11 @@ async fn put_ask_human_policy_persists_and_reads_back() {
         before.current_version,
         "前置：底座 config current_version=true"
     );
+    ensure_decider_identity(&app.state, &ws, "acc_test", "boss_wx").await;
 
     // 构造 AskHumanPolicy（camelCase wire 格式经 serde 反序列化）。
     let policy: wechatagent::models::AskHumanPolicy = serde_json::from_value(serde_json::json!({
-        "deciderChain": [{ "wxid": "boss_wx", "displayName": "王总" }],
+        "deciderChain": [{ "wxid": "boss_wx", "displayName": "王总", "accountId": "acc_test" }],
         "escalateSafetyGuard": true,
         "escalateUnverifiedProduct": true,
         "escalateAiPolicyHold": true,
@@ -199,6 +289,7 @@ async fn put_ask_human_policy_persists_and_reads_back() {
 async fn admin_resolve_enqueues_relay_and_marks_resolved() {
     let app = common::TestApp::start().await;
     let ws = app.state.config.default_workspace_id.clone();
+    ensure_decider_identity(&app.state, &ws, "acc_test", "a").await;
 
     let entry = seed_pending_escalation(&app.state, &ws, "cust1", "boss").await;
 
@@ -233,6 +324,9 @@ async fn admin_resolve_enqueues_relay_and_marks_resolved() {
         Some("admin"),
         "resolved_via=admin"
     );
+    assert_eq!(updated.relay_state.as_deref(), Some("enqueued"));
+    assert_eq!(updated.relay_task_id, updated.id);
+    assert!(updated.relay_enqueued_at.is_some());
 
     // relay task 入队（kind=principal_decision_relay，content=short_code）。
     let task_count = app
@@ -246,6 +340,102 @@ async fn admin_resolve_enqueues_relay_and_marks_resolved() {
         .await
         .expect("count relay tasks");
     assert_eq!(task_count, 1, "应恰好起一条 relay task");
+}
+
+/// A committed resolution whose task materialization was interrupted remains
+/// recoverable. Repeated worker reconciliation must converge to one task.
+#[tokio::test]
+#[ignore]
+async fn resolved_relay_intent_recovers_exactly_one_task() {
+    let app = common::TestApp::start().await;
+    let ws = app.state.config.default_workspace_id.clone();
+    let entry = seed_pending_escalation(&app.state, &ws, "cust-recovery", "boss").await;
+
+    let _ = wechatagent::routes::principal_escalations::resolve_principal_escalation(
+        State(app.state.clone()),
+        Extension(test_admin(&ws)),
+        Path(entry.short_code.clone()),
+        Json(
+            serde_json::from_value(serde_json::json!({
+                "verdict": "approved",
+                "substance": "恢复测试裁决",
+            }))
+            .expect("deserialize ResolveBody"),
+        ),
+    )
+    .await
+    .expect("resolve before interruption");
+
+    let resolved = app
+        .state
+        .db
+        .agent_principal_escalations()
+        .find_one(doc! { "short_code": &entry.short_code }, None)
+        .await
+        .expect("query resolved escalation")
+        .expect("resolved escalation exists");
+    let task_id = resolved.relay_task_id.expect("durable relay task id");
+
+    // Simulate an interruption after the resolution CAS but before task
+    // materialization/acknowledgement became durable.
+    app.state
+        .db
+        .tasks()
+        .delete_one(doc! { "_id": task_id }, None)
+        .await
+        .expect("remove materialized task for crash simulation");
+    app.state
+        .db
+        .agent_principal_escalations()
+        .update_one(
+            doc! { "_id": resolved.id.expect("escalation id") },
+            doc! {
+                "$set": { "relay_state": "pending" },
+                "$unset": { "relay_enqueued_at": "" },
+            },
+            None,
+        )
+        .await
+        .expect("restore interrupted durable intent");
+
+    assert_eq!(
+        wechatagent::agent::escalation::reconcile_pending_relay_intents(&app.state)
+            .await
+            .expect("first reconciliation"),
+        1
+    );
+    assert_eq!(
+        wechatagent::agent::escalation::reconcile_pending_relay_intents(&app.state)
+            .await
+            .expect("idempotent reconciliation"),
+        0
+    );
+    assert_eq!(
+        app.state
+            .db
+            .tasks()
+            .count_documents(
+                doc! {
+                    "_id": task_id,
+                    "kind": "principal_decision_relay",
+                    "content": &entry.short_code,
+                },
+                None,
+            )
+            .await
+            .expect("count recovered relay task"),
+        1
+    );
+    let recovered = app
+        .state
+        .db
+        .agent_principal_escalations()
+        .find_one(doc! { "_id": resolved.id.expect("escalation id") }, None)
+        .await
+        .expect("query recovered intent")
+        .expect("recovered intent exists");
+    assert_eq!(recovered.relay_state.as_deref(), Some("enqueued"));
+    assert!(recovered.relay_enqueued_at.is_some());
 }
 
 // ── 测试 3：admin resolve 幂等 ──────────────────────────────────────────────
@@ -324,10 +514,11 @@ async fn admin_resolve_is_idempotent() {
 async fn reassign_rejects_wxid_not_in_chain() {
     let app = common::TestApp::start().await;
     let ws = app.state.config.default_workspace_id.clone();
+    ensure_decider_identity(&app.state, &ws, "acc_test", "a").await;
 
     // 先把 decider_chain=[{wxid:"a"}] PUT 到 current config（含 a 不含 b）。
     let policy: wechatagent::models::AskHumanPolicy = serde_json::from_value(serde_json::json!({
-        "deciderChain": [{ "wxid": "a" }],
+        "deciderChain": [{ "wxid": "a", "accountId": "acc_test" }],
     }))
     .expect("deserialize policy");
     let _ = wechatagent::routes::domains::put_ask_human_policy(
@@ -557,40 +748,48 @@ async fn admin_deferred_keeps_escalation_pending() {
 
 // ── 测试 9（终审修 #2）：超时改派后 age 自 updated_at 起算，每位决策人拿到完整窗 ──
 
-/// decider_chain=[a,b,c]、timeout=24h，seed 一条 pending（principal=a），把 created_at
-/// 与 updated_at 都拨回 25h 前模拟超时。第一次 scan → a→b（reassign 把 updated_at 刷新
-/// 到 ~now）。**不再拨钟**直接第二次 scan → 仍是 b（NOT c），因为 b 的 age 此时 ~0 < 24h。
-/// 这证明 age 从 updated_at（最近改派）起算，链≥3 不再级联秒改派。（修前从 created_at
-/// 起算 → 第二次 scan 立刻 b→c，b 只拿到 ~30s。）
+/// decider_chain=[a,b,c]、timeout=24h。a 的已确认送达时刻拨回 25h 前后，scanner
+/// 只原子开启 b 的 generation 并写入 Outbox；b 仍为 queued 时重复扫描不得级联到 c。
+/// 只有 Outbox 进入 sent 且 reconciler 写回 last_pushed_at_ms 后，b 的完整 24h 窗才开始。
 #[tokio::test]
 #[ignore]
 async fn timeout_reassign_gives_each_decider_full_window() {
     let app = common::TestApp::start().await;
     let ws = app.state.config.default_workspace_id.clone();
-
-    // 改派要先推卡给 next decider（scan_escalation_timeouts 内「推成功才 reassign」红线）。
-    // 默认 app.state 的 mcp_base_url 是 test-mcp.invalid（不可达）→ 推卡 Err → 不改派。
-    // 故起 wiremock 返回 MCP 成功 envelope + rebuild state 指向它，让推卡走通。
-    let mcp = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/mcp"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "result": { "structuredContent": { "newMsgId": "mock_card_msg", "content": [] } }
-        })))
-        .mount(&mcp)
-        .await;
-    let state = common::rebuild_app_state_with_mcp_url(&app, mcp.uri());
+    for decider in ["a", "b", "c"] {
+        ensure_decider_identity(&app.state, &ws, "acc_test", decider).await;
+    }
+    let now = DateTime::now();
+    app.state
+        .db
+        .raw()
+        .collection::<Document>("contacts")
+        .insert_one(
+            doc! {
+                "workspace_id": &ws,
+                "account_id": "acc_test",
+                "wxid": "cust_chain",
+                "agent_status": "managed",
+                "created_at": now,
+                "updated_at": now,
+            },
+            None,
+        )
+        .await
+        .expect("seed timeout customer identity");
 
     // PUT 决策人链 [a,b,c] + timeout=24h 到 current config。
     let policy: wechatagent::models::AskHumanPolicy = serde_json::from_value(serde_json::json!({
-        "deciderChain": [{ "wxid": "a" }, { "wxid": "b" }, { "wxid": "c" }],
+        "deciderChain": [
+            { "wxid": "a", "accountId": "acc_test" },
+            { "wxid": "b", "accountId": "acc_test" },
+            { "wxid": "c", "accountId": "acc_test" }
+        ],
         "timeoutHours": 24.0,
     }))
     .expect("deserialize policy");
     let _ = wechatagent::routes::domains::put_ask_human_policy(
-        State(state.clone()),
+        State(app.state.clone()),
         Extension(test_admin(&ws)),
         Path("user_operations".to_string()),
         Json(policy),
@@ -598,27 +797,32 @@ async fn timeout_reassign_gives_each_decider_full_window() {
     .await
     .expect("put policy ok");
 
-    let entry = seed_pending_escalation(&state, &ws, "cust_chain", "a").await;
+    let entry = seed_pending_escalation(&app.state, &ws, "cust_chain", "a").await;
 
-    // 模拟"已过 25h"：把 created_at 与 updated_at 都拨回 25h 前（测试钟操纵，非 config 行）。
+    // 模拟 a 的卡已在 25h 前确认送达。
     let twenty_five_h_ago =
         DateTime::from_millis(DateTime::now().timestamp_millis() - 25 * 3600 * 1000);
-    state
+    app.state
         .db
         .agent_principal_escalations()
         .update_one(
             doc! { "short_code": &entry.short_code },
-            doc! { "$set": { "created_at": twenty_five_h_ago, "updated_at": twenty_five_h_ago } },
+            doc! { "$set": {
+                "created_at": twenty_five_h_ago,
+                "updated_at": twenty_five_h_ago,
+                "last_pushed_at_ms": twenty_five_h_ago.timestamp_millis(),
+            } },
             None,
         )
         .await
         .expect("backdate clock");
 
-    // 第一次 scan：age≈25h ≥ 24h，a 非链尾 → 推卡成功 → a→b。reassign 把 updated_at 刷新到 ~now。
-    wechatagent::agent::escalation::scan_escalation_timeouts(&state)
+    // 第一次 scan 只开启 b 的 generation=2 并物化唯一 Outbox，不跨远端边界。
+    wechatagent::agent::escalation::scan_escalation_timeouts(&app.state)
         .await
         .expect("first scan ok");
-    let after_first = state
+    let after_first = app
+        .state
         .db
         .agent_principal_escalations()
         .find_one(doc! { "short_code": &entry.short_code }, None)
@@ -626,21 +830,100 @@ async fn timeout_reassign_gives_each_decider_full_window() {
         .expect("query")
         .expect("exists");
     assert_eq!(after_first.principal_wxid, "b", "第一次超时扫描应 a→b");
+    let first_protocol = after_first.protocol.as_ref().expect("frozen protocol");
+    assert_eq!(first_protocol.delivery_generation, 2);
+    assert_eq!(
+        first_protocol.delivery_state,
+        PRINCIPAL_CARD_DELIVERY_QUEUED
+    );
+    let outbox_id = first_protocol
+        .delivery_outbox_id
+        .expect("generation 2 outbox");
+    assert!(
+        after_first.last_pushed_at_ms.is_none(),
+        "queued 尚未确认送达，不得启动 timeout"
+    );
 
-    // 第二次 scan：不再拨钟。b 的 updated_at 刚被 reassign 刷到 ~now → age≈0 < 24h → 不动。
-    wechatagent::agent::escalation::scan_escalation_timeouts(&state)
+    // queued 不属于 timeout eligible；重复扫描不得产生 generation=3 或第二条 Outbox。
+    wechatagent::agent::escalation::scan_escalation_timeouts(&app.state)
         .await
         .expect("second scan ok");
-    let after_second = state
+    let after_second = app
+        .state
         .db
         .agent_principal_escalations()
         .find_one(doc! { "short_code": &entry.short_code }, None)
         .await
         .expect("query")
         .expect("exists");
+    assert_eq!(after_second.principal_wxid, "b", "queued 阶段不得级联到 c");
     assert_eq!(
-        after_second.principal_wxid, "b",
-        "age 自 updated_at 起算 → b 应拿到完整 24h 窗，第二次 scan 仍是 b（NOT c）"
+        after_second.protocol.as_ref().unwrap().delivery_generation,
+        2
+    );
+    assert_eq!(
+        app.state
+            .db
+            .collection_agent_send_outbox()
+            .count_documents(doc! { "_id": outbox_id }, None)
+            .await
+            .expect("count generation outbox"),
+        1
+    );
+
+    // 模拟 dispatcher 的权威 sent 终态，再用生产 reconciler 写回计时起点。
+    let delivered_at = DateTime::now();
+    app.state
+        .db
+        .collection_agent_send_outbox()
+        .update_one(
+            doc! { "_id": outbox_id },
+            doc! { "$set": {
+                "status": "sent",
+                "sent_at": delivered_at,
+                "updated_at": delivered_at,
+            } },
+            None,
+        )
+        .await
+        .expect("mark generation outbox sent");
+    assert_eq!(
+        wechatagent::agent::escalation::reconcile_principal_card_deliveries(&app.state)
+            .await
+            .expect("reconcile sent generation"),
+        1
+    );
+    let delivered = app
+        .state
+        .db
+        .agent_principal_escalations()
+        .find_one(doc! { "short_code": &entry.short_code }, None)
+        .await
+        .expect("query delivered generation")
+        .expect("escalation exists");
+    assert_eq!(
+        delivered.protocol.as_ref().unwrap().delivery_state,
+        PRINCIPAL_CARD_DELIVERY_SENT
+    );
+    assert_eq!(
+        delivered.last_pushed_at_ms,
+        Some(delivered_at.timestamp_millis())
+    );
+
+    wechatagent::agent::escalation::scan_escalation_timeouts(&app.state)
+        .await
+        .expect("scan inside b full window");
+    let still_b = app
+        .state
+        .db
+        .agent_principal_escalations()
+        .find_one(doc! { "short_code": &entry.short_code }, None)
+        .await
+        .expect("query b window")
+        .expect("escalation exists");
+    assert_eq!(
+        still_b.principal_wxid, "b",
+        "b 从 sent 对账时刻起获得完整 24h 窗"
     );
 }
 
@@ -752,6 +1035,7 @@ async fn operation_domain_json_includes_ask_human_policy() {
         decider_chain: vec![wechatagent::models::DeciderRef {
             wxid: "wxid_boss".into(),
             display_name: Some("老板".into()),
+            account_id: Some("acc_test".into()),
         }],
         escalate_safety_guard: true,
         escalate_unverified_product: true,
@@ -870,4 +1154,73 @@ async fn inbox_relationship_suggestion_carries_evidence() {
         serde_json::json!("contact_e10"),
         "应投影 contact_id 入 contactWxid"
     );
+}
+
+/// SR-067：疑似成交必须进入统一待审箱和汇总计数；其它 workspace 及非 pending
+/// 历史不得泄漏或占用当前待办数。
+#[tokio::test]
+#[ignore]
+async fn inbox_and_summary_include_only_workspace_pending_suspected_deals() {
+    let app = common::TestApp::start().await;
+    let ws = app.state.config.default_workspace_id.clone();
+    let now = DateTime::now();
+
+    for (workspace_id, status, contact_id) in [
+        (ws.as_str(), "pending", "contact_pending"),
+        (ws.as_str(), "approved", "contact_approved"),
+        ("other_workspace", "pending", "contact_foreign"),
+    ] {
+        app.state
+            .db
+            .collection_suspected_deal_signals()
+            .insert_one(
+                wechatagent::models::SuspectedDealSignal {
+                    id: None,
+                    workspace_id: workspace_id.to_string(),
+                    account_id: "acc_test".to_string(),
+                    contact_id: contact_id.to_string(),
+                    value: "疑似成交·待核实".to_string(),
+                    evidence: Some("客户明确表达下单意向".to_string()),
+                    confidence: 88,
+                    status: status.to_string(),
+                    occurrences: 2,
+                    first_seen_at: now,
+                    last_seen_at: now,
+                    reviewed_at: None,
+                    reviewed_by: None,
+                },
+                None,
+            )
+            .await
+            .expect("seed suspected deal signal");
+    }
+
+    let inbox = wechatagent::routes::ask_human_inbox::ask_human_inbox(
+        State(app.state.clone()),
+        Extension(test_admin(&ws)),
+        Query(
+            serde_json::from_value(serde_json::json!({ "source": "suspected_deal" }))
+                .expect("deserialize InboxQuery"),
+        ),
+    )
+    .await
+    .expect("suspected deal inbox");
+    let items = inbox.0["items"].as_array().expect("items array");
+    assert_eq!(items.len(), 1, "只应投影当前 workspace 的 pending 信号");
+    assert_eq!(items[0]["source"], "suspected_deal");
+    assert_eq!(items[0]["contactWxid"], "contact_pending");
+    assert_eq!(items[0]["richComponent"], "suspectedDealReview");
+    assert_eq!(items[0]["confidence"], 88);
+    assert_eq!(items[0]["occurrences"], 2);
+
+    let summary = wechatagent::routes::ask_human_inbox::ask_human_summary(
+        State(app.state.clone()),
+        Extension(test_admin(&ws)),
+    )
+    .await
+    .expect("suspected deal summary");
+    assert_eq!(summary.0["counts"]["suspectedDeal"], 1);
+    assert_eq!(summary.0["suspectedDeal"], 1, "兼容顶层计数也必须一致");
+
+    app.cleanup().await;
 }

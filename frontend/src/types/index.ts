@@ -109,6 +109,10 @@ export type Contact = {
   personalityProfile?: PersonalityProfile;
   domainAttributes?: Record<string, unknown>;
   domainAttributesUpdatedAt?: string | null;
+  /** Planner 使用的停滞维度、当前值和该维度自身最后变更时间。 */
+  stagnationDimension?: string;
+  stagnationValue?: string | null;
+  stagnationUpdatedAt?: string | null;
   /** M3 / Task 80：承诺数组（M2 之后由 dialog → contact 同步），cockpit 侧只读展示。 */
   commitments?: ContactCommitment[];
   lastCommitment?: string;
@@ -212,6 +216,7 @@ export type EventItem = {
 
 export type TaskItem = {
   id: string;
+  accountId: string;
   contactWxid: string;
   kind: string;
   runAt?: string;
@@ -227,6 +232,7 @@ export type TaskItem = {
 
 export type ContentAsset = {
   id: string;
+  accountId?: string | null;
   kind: string;
   title: string;
   body?: string;
@@ -256,6 +262,12 @@ export type AgentSoul = {
   content: string;
   status: string;
   version: number;
+  previousVersion?: number | null;
+  seededBy?: string | null;
+  publishedAt?: string | null;
+  publishedBy?: string | null;
+  createdAt?: string | null;
+  updatedAt?: string | null;
 };
 
 export type CommandToolCall = {
@@ -269,6 +281,10 @@ export type CommandToolCall = {
 
 export type CommandResult = {
   id: string;
+  /** Frozen execution scope returned by the backend and echoed on confirm/reject. */
+  accountId: string;
+  /** SHA-256 binding for the exact plan rendered to the operator. */
+  planHash: string;
   status: string;
   summary: string;
   toolCalls: CommandToolCall[];
@@ -285,18 +301,31 @@ export type LlmUsageItem = {
   totalTokens: number;
   promptCacheHitTokens: number;
   promptCacheMissTokens: number;
+  usageKnown: boolean;
   error?: string;
   createdAt?: string;
 };
 
 export type LlmUsageResponse = {
+  asOf: string | null;
+  window: {
+    kind: "retained_logs";
+    start: string | null;
+    end: string | null;
+  };
   summary: {
     totalCalls: number;
     totalTokens: number;
     promptCacheHitTokens: number;
     promptCacheMissTokens: number;
     promptCacheHitRate: number;
+    knownUsageCalls: number;
+    unknownUsageCalls: number;
+    usageComplete: boolean;
   };
+  itemsReturned: number;
+  itemsLimit: number;
+  itemsTruncated: boolean;
   items: LlmUsageItem[];
 };
 
@@ -390,6 +419,7 @@ export type OperationPlaybook = {
   forbiddenRules?: string;
   successCriteria?: string;
   createdBy: string;
+  releaseStatus: "draft" | "published";
   isDefault: boolean;
   version: number;
   updatedAt?: string;
@@ -496,18 +526,32 @@ export type UserOperationGuidePreview = {
   healthScores: Record<string, unknown>;
   suggestedChanges: Record<string, unknown>;
   riskWarnings: string[];
+  candidateHash: string;
+  authoritativeChanges: GuideAuthoritativeChange[];
+  requiresStrongConfirmation: boolean;
+  playbookAffectedContacts: number;
   createdAt?: string;
   updatedAt?: string;
 };
 
 export type GuideSkippedField = { field: string; reason: string };
 
+export type GuideAuthoritativeChange = {
+  target: string;
+  field: string;
+  label: string;
+  before: unknown;
+  after: unknown;
+};
+
 export type UserOperationGuideApplyResult = {
-  contact: Contact;
-  operatingMemory: OperatingMemory;
-  health: OperationHealth;
+  committed: true;
+  previewId: string;
+  candidateHash: string;
+  committedAt?: string;
   appliedFields: string[];
   skippedFields: GuideSkippedField[];
+  impactScope: string;
 };
 
 export type SimulationTurn = {
@@ -589,6 +633,7 @@ export type CoverageDimension = {
   key: string;
   display_name: string;
   required: boolean;
+  review_topic_aliases?: string[];
   anchor_hint?: string | null;
   initial_signal?: string | null;
 };
@@ -719,6 +764,7 @@ export type DomainProfile = {
   version: number;
   current_version: boolean;
   previous_version: number | null;
+  release_status: "draft" | "published";
   is_active: boolean;
   seeded_by: string | null;
   created_at?: string;
@@ -773,6 +819,7 @@ export type GenerateProfileResponse = {
 export type DeciderRef = {
   wxid: string;
   displayName?: string;
+  accountId?: string;
 };
 
 export type AskHumanQuietHours = {

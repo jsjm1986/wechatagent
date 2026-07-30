@@ -63,16 +63,24 @@ git push origin main
 ```bash
 # MCP Server 配置
 MCP_BASE_URL=http://117.72.54.28:3001
-MCP_API_KEY=gwa_ba60a98aada58c10b77f6f20841c77c6c3c0506d9431871f
+MCP_API_KEY=<INJECT_FROM_SECRET_STORE>
 
 # Webhook 签名验证（生产环境必须开启）
 WEBHOOK_VERIFY_SIGNATURE=true
+
+# Admin login and JWT token issuance share one pre-Argon2 limiter.
+AUTH_RATE_LIMIT_WINDOW_SECONDS=300
+AUTH_RATE_LIMIT_CLIENT_CAPACITY=20
+AUTH_RATE_LIMIT_TARGET_CAPACITY=10
+AUTH_RATE_LIMIT_GLOBAL_CAPACITY=100
 
 # B-1 修复：升档 run token 预算（新增配置）
 RUN_TOKEN_BUDGET_ESCALATED=100000
 ```
 
 **重要**: 确认 `MCP_API_KEY` 与 MCP Server 配置完全一致（包括 `gwa_` 前缀）
+
+认证限流使用应用进程看到的直接 TCP 对端地址，且各副本独立计数。生产若通过反向代理或运行多个副本，必须在边缘层另设全局登录限流；不要通过开放信任 `X-Forwarded-For` 来替代。失败审计只保存进程盐化指纹，并由 Mongo TTL 在 90 天后自动清理。
 
 ---
 
@@ -209,7 +217,7 @@ curl http://localhost:8080/api/accounts/login/begin \
 
 ```bash
 curl -X POST http://117.72.54.28:3001/mcp \
-  -H "Authorization: Bearer gwa_ba60a98aada58c10b77f6f20841c77c6c3c0506d9431871f" \
+  -H "Authorization: Bearer $MCP_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "jsonrpc": "2.0",
@@ -279,7 +287,7 @@ mongo
   "wxid": "wxid_xxx",
   "nick_name": "昵称",
   "online": true,
-  "mcp_api_key": "gwa_ba60a98aada58c10b77f6f20841c77c6c3c0506d9431871f",
+  "mcp_api_key": "<redacted>",
   "mcp_base_url": "http://117.72.54.28:3001",
   ...
 }
@@ -339,7 +347,7 @@ mongo
 - [ ] 后端服务启动成功（日志显示监听 8080 端口）
 - [ ] 前端界面可访问（浏览器打开正常）
 - [ ] 新增"账号管理"频道出现在左侧菜单
-- [ ] 环境变量正确配置（`.env` 包含 MCP_BASE_URL/MCP_API_KEY/RUN_TOKEN_BUDGET_ESCALATED）
+- [ ] 环境变量正确配置（包含 MCP、run budget 与四个 `AUTH_RATE_LIMIT_*` 参数）
 - [ ] MCP Server 已配置 webhook URL
 - [ ] Webhook 端点可达（curl 测试返回 401 或 400，不是 404）
 - [ ] 微信账号登录流程可用（扫码成功）
@@ -398,7 +406,7 @@ journalctl -u wechatagent -n 50
 ```bash
 # 1. 检查 MCP Server 是否配置了 webhook URL
 curl http://117.72.54.28:3001/mcp \
-  -H "Authorization: Bearer gwa_ba60a98aada58c10b77f6f20841c77c6c3c0506d9431871f" \
+  -H "Authorization: Bearer $MCP_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","id":"1","method":"tools/call","params":{"name":"account_list","arguments":{}}}'
 
@@ -462,3 +470,14 @@ git checkout .env
 **预计总时间**: 30-60 分钟（取决于编译速度和网络状况）
 
 **关键联系人**: 如遇问题，参考文档或联系开发团队
+
+---
+
+## 2026-07-25 生产发布实录
+
+- 用户明确确认维护切换后，服务从后端 SHA-256 `b0b1a0cb56cb4abb03c1bb5d94ec9bc0c7396199a5d70318b82985ba0969198b` 切换到 `539effe4f0cc1f6962c495f7454cd51375a35c854ca246901a9de1b5375e8acf`。
+- 停服后先制作 MongoDB 切换点归档，再原子替换后端和干净前端；失败脚本可恢复旧文件与数据库。本次没有触发回滚。
+- 新前端为干净构建的 69 个文件；候选联合冒烟逐字节验证全部静态文件，生产切换再次核对首页与关键 JS/CSS/favicon。
+- m049 在生产应用成功，`group.policy`、`moment.policy` 保持 draft 且 `current_version=false`。
+- 切换后 12/12 次内外网健康检查通过，PID 无重启，MongoDB 保持 `rs0` 可写主节点，开放 Outbox 与近期失败任务均为 0。
+- 完整候选哈希、备份位置、回滚材料与结论边界见 [2026-07-25 生产发布证据](system-review/production-release-2026-07-25.md)。

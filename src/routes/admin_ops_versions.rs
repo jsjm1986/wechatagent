@@ -1,5 +1,5 @@
-//! Phase E / E5-T1：ops 三表（`operation_domain_configs` / `operation_state_policies`
-//! / `system_taxonomies`）的多版本灰度 admin REST。
+//! Ops 三张版本表（`operation_domain_configs` / `operation_state_policies` /
+//! `system_taxonomies`）的单-current版本管理 REST。
 //!
 //! 三表共享同一套 `(version, current_version, previous_version, seeded_by)` 四元字段
 //! （详见 [`crate::models::OperationDomainConfig`] / [`crate::models::OperationStatePolicy`]
@@ -8,17 +8,10 @@
 //!
 //! 行为约定（**非** prompt_templates 的 `delete_many` 硬清）：
 //!
-//! - `publish`：在指定 scope（`scope = (workspace_id, domain[, state_key/value.id])`）
-//!   下取 `max(version)` 当前已存在的 `previous_version`，写入新文档 `version+1`、
-//!   `current_version=true`、`previous_version=Some(prev_current.version)`、
-//!   `seeded_by=Some("manual")`，然后 **soft demote** 同 scope 的其他 row 为
-//!   `current_version=false`（不删数据，rollback 还需要它们）。
-//! - `rollout`：把 scope 下指定 `_id` 的 row promote 到 `current_version=true`，
-//!   同时 demote 其他 row。允许多 active 共存的灰度阶段使用（参考
-//!   [`crate::agent::runtime::load_user_operation_domain_config_for_resolve`] 的多版本读路径）。
+//! - `publish`：事务内分配 `max(version)+1`，降级旧 current，再插入新 current；
+//! - `rollout`：事务内把指定历史版本切成唯一 current；
 //! - `rollback`：以目标 row 的 `previous_version` 为索引找回上一版本，把它重新
-//!   promote 到 current，并 demote 当前 row。如果上一版本不存在或 `previous_version=None`
-//!   返回 `BadRequest`。
+//!   切成唯一 current。历史版本永不删除。
 //!
 //! 任何写入 taxonomy 的路径都立即调用 [`crate::agent::taxonomy::invalidate_global_taxonomy_cache`]，
 //! 让运行中 Reply / Review Agent 在下次校验 value 时重新 build 字典。
@@ -27,7 +20,12 @@ use axum::{
     extract::{Path, State},
     Extension, Json,
 };
-use mongodb::bson::{doc, DateTime, Document};
+use mongodb::{
+    bson::{doc, oid::ObjectId, to_document, DateTime, Document},
+    options::{FindOneOptions, FindOptions, TransactionOptions},
+    ClientSession,
+};
+use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::{
@@ -41,6 +39,272 @@ use crate::{
 use super::shared::parse_object_id;
 use super::AppState;
 
+const OPS_VERSION_CONFLICT: &str = "ops_version_switch_conflict";
+
+fn validated_operation_domain_runtime(config: &OperationDomainConfig) -> AppResult<Document> {
+    if config.domain != crate::agent::domain::USER_OPS_DOMAIN_ID {
+        return Ok(config.runtime_parameters.clone());
+    }
+    crate::agent::runtime::validate_and_normalize_user_runtime_parameters(
+        &config.runtime_parameters,
+    )
+    .map_err(AppError::BadRequest)
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct StatePolicyReconcileFailure {
+    pub state_key: String,
+    pub operation: &'static str,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct StatePolicyReconcileReport {
+    pub considered: usize,
+    pub unchanged: usize,
+    pub updated: usize,
+    pub inserted: usize,
+    pub preserved_manual: usize,
+    pub invalid_states: usize,
+    pub failures: Vec<StatePolicyReconcileFailure>,
+}
+
+impl StatePolicyReconcileReport {
+    pub(crate) fn is_complete(&self) -> bool {
+        self.invalid_states == 0 && self.failures.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct StateMachinePublishReport {
+    pub changed: bool,
+    pub policies: StatePolicyReconcileReport,
+}
+
+async fn commit_ops_transaction(session: &mut ClientSession) -> AppResult<()> {
+    loop {
+        match session.commit_transaction().await {
+            Ok(()) => return Ok(()),
+            Err(error) if error.contains_label("UnknownTransactionCommitResult") => continue,
+            Err(error) => {
+                tracing::warn!(error = %error, "operations version transaction commit failed");
+                return Err(AppError::Conflict(OPS_VERSION_CONFLICT.to_string()));
+            }
+        }
+    }
+}
+
+fn ops_transaction_error(error: AppError) -> AppError {
+    match error {
+        AppError::Db(db_error) => {
+            tracing::warn!(error = %db_error, "operations version transaction conflicted");
+            AppError::Conflict(OPS_VERSION_CONFLICT.to_string())
+        }
+        other => other,
+    }
+}
+
+async fn unique_current_id_with_session(
+    collection: &mongodb::Collection<Document>,
+    scope: &Document,
+    session: &mut ClientSession,
+) -> AppResult<ObjectId> {
+    let mut filter = scope.clone();
+    filter.insert("current_version", true);
+    let mut cursor = collection
+        .find_with_session(
+            filter,
+            FindOptions::builder()
+                .projection(doc! { "_id": 1_i32 })
+                .limit(2_i64)
+                .build(),
+            session,
+        )
+        .await?;
+    let first = cursor
+        .next(session)
+        .await
+        .transpose()?
+        .ok_or_else(|| AppError::Conflict("missing_current_ops_version".to_string()))?;
+    if cursor.next(session).await.transpose()?.is_some() {
+        return Err(AppError::Conflict(
+            "multiple_current_ops_versions".to_string(),
+        ));
+    }
+    first
+        .get_object_id("_id")
+        .map_err(|_| AppError::External("current ops version missing ObjectId".to_string()))
+}
+
+async fn unique_current_id(
+    db: &Database,
+    collection_name: &str,
+    scope: &Document,
+) -> AppResult<ObjectId> {
+    let collection = db.raw().collection::<Document>(collection_name);
+    let mut filter = scope.clone();
+    filter.insert("current_version", true);
+    let mut cursor = collection
+        .find(
+            filter,
+            FindOptions::builder()
+                .projection(doc! { "_id": 1_i32 })
+                .limit(2_i64)
+                .build(),
+        )
+        .await?;
+    use futures::TryStreamExt;
+    let first = cursor
+        .try_next()
+        .await?
+        .ok_or_else(|| AppError::Conflict("missing_current_ops_version".to_string()))?;
+    if cursor.try_next().await?.is_some() {
+        return Err(AppError::Conflict(
+            "multiple_current_ops_versions".to_string(),
+        ));
+    }
+    first
+        .get_object_id("_id")
+        .map_err(|_| AppError::External("current ops version missing ObjectId".to_string()))
+}
+
+async fn insert_new_current(
+    db: &Database,
+    collection_name: &str,
+    scope: Document,
+    expected_current_id: ObjectId,
+    mut new_entry: Document,
+) -> AppResult<(ObjectId, i32)> {
+    let collection = db.raw().collection::<Document>(collection_name);
+    let mut session = db.client().start_session(None).await?;
+    session
+        .start_transaction(TransactionOptions::builder().build())
+        .await?;
+    let result: AppResult<(ObjectId, i32)> = async {
+        let current_id = unique_current_id_with_session(&collection, &scope, &mut session).await?;
+        if current_id != expected_current_id {
+            return Err(AppError::Conflict("ops_current_changed".to_string()));
+        }
+        let latest = collection
+            .find_one_with_session(
+                scope.clone(),
+                FindOneOptions::builder()
+                    .sort(doc! { "version": -1_i32 })
+                    .projection(doc! { "version": 1_i32 })
+                    .build(),
+                &mut session,
+            )
+            .await?
+            .ok_or_else(|| AppError::Conflict("missing_ops_version_stream".to_string()))?;
+        let next_version = latest
+            .get_i32("version")
+            .map_err(|_| AppError::External("ops version is not int32".to_string()))?
+            .checked_add(1)
+            .ok_or_else(|| AppError::BadRequest("ops version overflow".to_string()))?;
+        let now = DateTime::now();
+        let mut current_filter = scope.clone();
+        current_filter.insert("_id", current_id);
+        current_filter.insert("current_version", true);
+        let demoted = collection
+            .update_one_with_session(
+                current_filter,
+                doc! { "$set": { "current_version": false, "updated_at": now } },
+                None,
+                &mut session,
+            )
+            .await?;
+        if demoted.modified_count != 1 {
+            return Err(AppError::Conflict("ops_current_changed".to_string()));
+        }
+        new_entry.remove("_id");
+        new_entry.insert("version", next_version);
+        new_entry.insert("current_version", true);
+        new_entry.insert("updated_at", now);
+        let inserted = collection
+            .insert_one_with_session(new_entry, None, &mut session)
+            .await?;
+        let inserted_id = inserted.inserted_id.as_object_id().ok_or_else(|| {
+            AppError::External("inserted ops version has no ObjectId".to_string())
+        })?;
+        Ok((inserted_id, next_version))
+    }
+    .await;
+    let value = match result {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = session.abort_transaction().await;
+            return Err(ops_transaction_error(error));
+        }
+    };
+    commit_ops_transaction(&mut session).await?;
+    Ok(value)
+}
+
+async fn switch_current(
+    db: &Database,
+    collection_name: &str,
+    scope: Document,
+    target_id: ObjectId,
+) -> AppResult<()> {
+    let collection = db.raw().collection::<Document>(collection_name);
+    let mut session = db.client().start_session(None).await?;
+    session
+        .start_transaction(TransactionOptions::builder().build())
+        .await?;
+    let result: AppResult<()> = async {
+        let mut target_filter = scope.clone();
+        target_filter.insert("_id", target_id);
+        let target = collection
+            .find_one_with_session(target_filter.clone(), None, &mut session)
+            .await?
+            .ok_or_else(|| AppError::Conflict("ops_target_changed".to_string()))?;
+        let current_id = unique_current_id_with_session(&collection, &scope, &mut session).await?;
+        if current_id == target_id {
+            return Ok(());
+        }
+        let now = DateTime::now();
+        let mut current_filter = scope.clone();
+        current_filter.insert("_id", current_id);
+        current_filter.insert("current_version", true);
+        let demoted = collection
+            .update_one_with_session(
+                current_filter,
+                doc! { "$set": { "current_version": false, "updated_at": now } },
+                None,
+                &mut session,
+            )
+            .await?;
+        if demoted.modified_count != 1 {
+            return Err(AppError::Conflict("ops_current_changed".to_string()));
+        }
+        target_filter.insert(
+            "current_version",
+            target.get_bool("current_version").unwrap_or(false),
+        );
+        let promoted = collection
+            .update_one_with_session(
+                target_filter,
+                doc! { "$set": { "current_version": true, "updated_at": now } },
+                None,
+                &mut session,
+            )
+            .await?;
+        if promoted.modified_count != 1 {
+            return Err(AppError::Conflict("ops_target_changed".to_string()));
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(error) = result {
+        let _ = session.abort_transaction().await;
+        return Err(ops_transaction_error(error));
+    }
+    commit_ops_transaction(&mut session).await
+}
+
 /// ── operation_domain_configs ──────────────────────────────────────────────────
 
 /// 插入一版新 current [`OperationDomainConfig`] 并 demote 同 `(workspace_id, domain)`
@@ -52,17 +316,15 @@ use super::AppState;
 /// `previous_version`（= `Some(source.version)`）/ `seeded_by`（由参数注入）/
 /// `updated_at`（= `now`）/ `id`（恒 `None`）。
 ///
-/// 事务性：本代码库不使用 MongoDB 多文档事务，沿用「先 insert 新 current，再 demote
-/// 其余」的 best-effort 顺序（与两个原实现逐字一致），保证「至多一条 current」不变量在
-/// 正常完成时成立。返回新插入行的 [`ObjectId`](mongodb::bson::oid::ObjectId)。
 async fn insert_new_current_domain_config(
-    coll: &mongodb::Collection<OperationDomainConfig>,
+    db: &Database,
     source: &OperationDomainConfig,
+    expected_current_id: ObjectId,
     state_machine: Document,
-    next_version: i32,
     seeded_by: String,
-    now: DateTime,
-) -> AppResult<mongodb::bson::oid::ObjectId> {
+) -> AppResult<(ObjectId, i32)> {
+    let now = DateTime::now();
+    let runtime_parameters = validated_operation_domain_runtime(source)?;
     let new_entry = OperationDomainConfig {
         id: None,
         workspace_id: source.workspace_id.clone(),
@@ -74,12 +336,12 @@ async fn insert_new_current_domain_config(
         tool_policy: source.tool_policy.clone(),
         automation_policy: source.automation_policy.clone(),
         review_policy: source.review_policy.clone(),
-        runtime_parameters: source.runtime_parameters.clone(),
+        runtime_parameters,
         state_machine,
         status: "active".to_string(),
         updated_at: now,
-        version: next_version,
-        current_version: true,
+        version: 0,
+        current_version: false,
         previous_version: Some(source.version),
         seeded_by: Some(seeded_by),
         principal_decider: source.principal_decider.clone(),
@@ -87,21 +349,67 @@ async fn insert_new_current_domain_config(
         ask_human_policy: source.ask_human_policy.clone(),
         assist_mode_enabled: source.assist_mode_enabled,
     };
-    let inserted = coll.insert_one(&new_entry, None).await?;
-    let inserted_id = inserted.inserted_id.as_object_id();
-    coll.update_many(
-        doc! {
-            "workspace_id": &source.workspace_id,
-            "domain": &source.domain,
-            "_id": { "$ne": inserted_id },
-        },
-        doc! { "$set": { "current_version": false, "updated_at": now } },
-        None,
+    let scope = doc! {
+        "workspace_id": &source.workspace_id,
+        "domain": &source.domain,
+    };
+    insert_new_current(
+        db,
+        "operation_domain_configs",
+        scope,
+        expected_current_id,
+        to_document(&new_entry)?,
+    )
+    .await
+}
+
+/// Append the built-in default as a new immutable current version. The old
+/// current row and every historical row remain intact; allocation and pointer
+/// switching reuse the same transaction/CAS protocol as ordinary publishing.
+pub(crate) async fn append_default_operation_domain_version(
+    db: &Database,
+    mut default_config: OperationDomainConfig,
+    seeded_by: String,
+) -> AppResult<(ObjectId, i32, i32)> {
+    if default_config.domain == crate::agent::domain::USER_OPS_DOMAIN_ID {
+        default_config.runtime_parameters =
+            crate::agent::runtime::validate_and_normalize_user_runtime_parameters(
+                &default_config.runtime_parameters,
+            )
+            .map_err(AppError::BadRequest)?;
+    }
+    let scope = doc! {
+        "workspace_id": &default_config.workspace_id,
+        "domain": &default_config.domain,
+    };
+    let expected_current_id = unique_current_id(db, "operation_domain_configs", &scope).await?;
+    let current = db
+        .operation_domain_configs()
+        .find_one(
+            doc! {
+                "_id": expected_current_id,
+                "workspace_id": &default_config.workspace_id,
+                "domain": &default_config.domain,
+                "current_version": true,
+            },
+            None,
+        )
+        .await?
+        .ok_or_else(|| AppError::Conflict("ops_current_changed".to_string()))?;
+    default_config.id = None;
+    default_config.version = 0;
+    default_config.current_version = false;
+    default_config.previous_version = Some(current.version);
+    default_config.seeded_by = Some(seeded_by);
+    let (id, version) = insert_new_current(
+        db,
+        "operation_domain_configs",
+        scope,
+        expected_current_id,
+        to_document(&default_config)?,
     )
     .await?;
-    inserted_id.ok_or_else(|| {
-        AppError::External("inserted operation domain config has no _id".to_string())
-    })
+    Ok((id, version, current.version))
 }
 
 pub(super) async fn publish_operation_domain_version(
@@ -118,21 +426,19 @@ pub(super) async fn publish_operation_domain_version(
         )
         .await?
         .ok_or_else(|| AppError::NotFound("operation domain config not found".to_string()))?;
-
     let scope = doc! {
         "workspace_id": &source.workspace_id,
         "domain": &source.domain,
     };
-    let next_version =
-        next_version_for_scope(state.db.operation_domain_configs(), scope.clone()).await?;
-    let now = DateTime::now();
-    let inserted_id = insert_new_current_domain_config(
-        &coll,
+    let expected_current_id =
+        unique_current_id(&state.db, "operation_domain_configs", &scope).await?;
+
+    let (inserted_id, next_version) = insert_new_current_domain_config(
+        &state.db,
         &source,
+        expected_current_id,
         source.state_machine.clone(),
-        next_version,
         "manual".to_string(),
-        now,
     )
     .await?;
     Ok(Json(json!({
@@ -195,9 +501,8 @@ pub(crate) fn is_refreshable_policy_seeded_by(seeded_by: &Option<String>) -> boo
 /// - **G12**：`rollout` / `rollback` 切 `operation_domain_configs` 的 current 版本但不碰 policy
 ///   → policy current 行与机器 `forbidsProactive` 漂移；切 current 后调本 helper 重对齐。
 ///
-/// **best-effort（关键）**：返回 `()` 而非 `Result`——per-state warn-and-continue，
-/// 单个 state 的查询/写入失败只 `warn!` 并继续下一个，绝不 `?` 向外传播把已成功提交的
-/// activate/publish/直编/rollback 主操作拖垮（与原 loop 及本模块整体哲学一致）。
+/// **best-effort（关键）**：逐 state 继续执行并返回结构化报告。调用方不会回滚已提交的
+/// 主操作，但必须把 `failures` 暴露为 partial，而不是只写日志后宣称完整成功。
 ///
 /// 幂等：只刷新「机器派生 / 可安全刷新」行（[`is_refreshable_policy_seeded_by`]），运营手工行
 /// 一律保留；已存在且 `(allowed, forbidden)` 一致的行内部 `continue` 不写；缺失行用
@@ -209,7 +514,8 @@ pub(crate) async fn reconcile_state_policies_for_machine(
     state_machine: &Document,
     policy_seeded_by: &str,
     now: DateTime,
-) {
+) -> StatePolicyReconcileReport {
+    let mut report = StatePolicyReconcileReport::default();
     let states = state_machine
         .get_array("states")
         .map(|arr| {
@@ -220,8 +526,10 @@ pub(crate) async fn reconcile_state_policies_for_machine(
         .unwrap_or_default();
     for state in &states {
         let Some(state_key) = state.get_str("key").ok().filter(|k| !k.is_empty()) else {
+            report.invalid_states += 1;
             continue;
         };
+        report.considered += 1;
         let forbids_proactive = state.get_bool("forbidsProactive").unwrap_or(false);
         let (allowed, forbidden) =
             crate::db::migrations::m013_seed_user_operation_state_policies::derive_state_policy_lists(
@@ -252,12 +560,14 @@ pub(crate) async fn reconcile_state_policies_for_machine(
             // 一致则不写。手工行（其它 seeded_by）一律 continue，与 m013 skip-existing 同红线。
             Ok(Some(existing)) => {
                 if !is_refreshable_policy_seeded_by(&existing.seeded_by) {
+                    report.preserved_manual += 1;
                     continue;
                 }
                 if existing.allowed == allowed && existing.forbidden == forbidden {
+                    report.unchanged += 1;
                     continue;
                 }
-                if let Err(err) = db
+                match db
                     .operation_state_policies()
                     .update_one(
                         doc! { "_id": existing.id },
@@ -273,13 +583,26 @@ pub(crate) async fn reconcile_state_policies_for_machine(
                     )
                     .await
                 {
-                    tracing::warn!(
-                        workspace_id,
-                        domain,
-                        state_key,
-                        error = %err,
-                        "reconcile_state_policies_for_machine: 刷新 operation_state_policy 失败（best-effort，跳过该 state 继续）"
-                    );
+                    Ok(result) if result.modified_count == 1 => report.updated += 1,
+                    Ok(_) => report.failures.push(StatePolicyReconcileFailure {
+                        state_key: state_key.to_string(),
+                        operation: "update",
+                        message: "policy row changed concurrently".to_string(),
+                    }),
+                    Err(err) => {
+                        tracing::warn!(
+                            workspace_id,
+                            domain,
+                            state_key,
+                            error = %err,
+                            "reconcile_state_policies_for_machine: 刷新 operation_state_policy 失败（best-effort，跳过该 state 继续）"
+                        );
+                        report.failures.push(StatePolicyReconcileFailure {
+                            state_key: state_key.to_string(),
+                            operation: "update",
+                            message: err.to_string(),
+                        });
+                    }
                 }
             }
             Ok(None) => {
@@ -288,7 +611,7 @@ pub(crate) async fn reconcile_state_policies_for_machine(
                 // version 1 会与历史 version 1 撞 (ws,domain,state_key,version) 唯一索引。
                 // 故按该 scope 现存最大 version+1 分配版本（复用 next_version_for_scope，
                 // 与 admin policy publish 同一真相），避开撞索引。
-                let next_policy_version = next_version_for_scope(
+                let next_policy_version = match next_version_for_scope(
                     db.operation_state_policies(),
                     doc! {
                         "workspace_id": workspace_id,
@@ -297,7 +620,17 @@ pub(crate) async fn reconcile_state_policies_for_machine(
                     },
                 )
                 .await
-                .unwrap_or(1);
+                {
+                    Ok(version) => version,
+                    Err(err) => {
+                        report.failures.push(StatePolicyReconcileFailure {
+                            state_key: state_key.to_string(),
+                            operation: "allocateVersion",
+                            message: err.to_string(),
+                        });
+                        continue;
+                    }
+                };
                 let policy = OperationStatePolicy {
                     id: None,
                     workspace_id: workspace_id.to_string(),
@@ -313,18 +646,26 @@ pub(crate) async fn reconcile_state_policies_for_machine(
                     previous_version: None,
                     seeded_by: Some(policy_seeded_by.to_string()),
                 };
-                if let Err(err) = db
+                match db
                     .operation_state_policies()
                     .insert_one(&policy, None)
                     .await
                 {
-                    tracing::warn!(
-                        workspace_id,
-                        domain,
-                        state_key,
-                        error = %err,
-                        "reconcile_state_policies_for_machine: 派生 operation_state_policy 失败（best-effort，跳过该 state 继续）"
-                    );
+                    Ok(_) => report.inserted += 1,
+                    Err(err) => {
+                        tracing::warn!(
+                            workspace_id,
+                            domain,
+                            state_key,
+                            error = %err,
+                            "reconcile_state_policies_for_machine: 派生 operation_state_policy 失败（best-effort，跳过该 state 继续）"
+                        );
+                        report.failures.push(StatePolicyReconcileFailure {
+                            state_key: state_key.to_string(),
+                            operation: "insert",
+                            message: err.to_string(),
+                        });
+                    }
                 }
             }
             Err(err) => {
@@ -335,47 +676,27 @@ pub(crate) async fn reconcile_state_policies_for_machine(
                     error = %err,
                     "reconcile_state_policies_for_machine: 查询 operation_state_policy 失败（best-effort，跳过该 state 继续）"
                 );
+                report.failures.push(StatePolicyReconcileFailure {
+                    state_key: state_key.to_string(),
+                    operation: "load",
+                    message: err.to_string(),
+                });
             }
         }
     }
+    report
 }
 
-/// 事务性 / current-flag 竞态边界（universal/H13 (3)，judgment call 已定）：
-///
-/// 沿用「先 insert 新 current（`current_version=true`），再 demote 同 scope 其余行」的
-/// best-effort 顺序，**不**引入事务、**不**加 `current_version=true` 唯一分区索引。理由：
-/// - 本代码库不使用 MongoDB 多文档事务（显式约定，见 [`insert_new_current_domain_config`]
-///   doc），且 testcontainers mongo 单节点无副本集 → 事务不可用。
-/// - `current_version=true` 唯一分区索引会强制 demote-then-insert 顺序，且 `ensure_indexes`
-///   用 `?` 非 best-effort，存量脏 current 行会**直接 brick 启动**（prod-117 部署炸雷），
-///   无配套清理不可加。
-///
-/// 残留竞态（accepted）——**诚实陈述其最坏端态**：在**真正并发的、本体各不相同**的 publish
-/// 下（同一 workspace 两次不同机器 publish 交错），insert-then-demote 的 demote 用
-/// `_id $ne inserted` 互斥，可走到**持久 0-current 端态**：
-/// ```text
-/// P1 insert vN+1 cur=true
-/// P2 insert vN+2 cur=true
-/// P1 demote (_id != P1) → P2(vN+2) cur=false
-/// P2 demote (_id != P2) → P1(vN+1) cur=false
-/// → 0 行 current，持续到下次 publish；其间 runtime 回落 DEFAULT-sales。
-/// ```
-/// 这**不是**良性方向（早期注释误称 insert-then-demote「避免 0-current 窗口」，错误，已订正）。
-/// 仍接受该残留，基于真实理由：
-/// (i) 极罕见：仅在「同 workspace、不同机器、真并发」publish 时触发，而 publish 是 admin-gated
-///     的低频运维动作；
-/// (ii) 下方 no-op 幂等消除了最常见触发器——「重复激活同一机器」（本体逐字节相等直接短路），
-///     使剩下的触发面只有罕见的「不同机器并发」；
-/// (iii) 自愈：下次任意 publish 会重新插一条 current 行，0-current 端态不会长期固化；
-/// (iv) `(workspace,domain,version)` 唯一索引仍挡住「重复 version」这个更危险的竞态；
-/// (v) 兜底方向（事务 / current 唯一索引）在本部署形态下不可用或会引入更坏故障（启动炸雷）。
+/// SR-008：状态机联动发布与 admin 版本动作共享单-current事务协议。
+/// 事务内先校验调用方看到的 current 未变化，再降级旧指针并插入新版本；并发
+/// publish 至多一个提交，另一个返回冲突。partial unique index 提供最终数据库约束。
 pub(crate) async fn publish_state_machine_version(
     db: &Database,
     workspace_id: &str,
     domain: &str,
     new_state_machine: Document,
     seeded_by: String,
-) -> AppResult<()> {
+) -> AppResult<StateMachinePublishReport> {
     let coll = db.operation_domain_configs();
     let Some(source) = coll
         .find_one(
@@ -388,12 +709,9 @@ pub(crate) async fn publish_state_machine_version(
         )
         .await?
     else {
-        tracing::warn!(
-            workspace_id,
-            domain,
-            "publish_state_machine_version: no current operation_domain_config row; skip publish (ensure_operation_domains 未 seed 底座)"
-        );
-        return Ok(());
+        return Err(AppError::Conflict(
+            "missing_current_operation_domain_config".to_string(),
+        ));
     };
 
     // universal/H13 (1) no-op 幂等：本体与当前 current 行逐字节相等 → 整个
@@ -407,7 +725,7 @@ pub(crate) async fn publish_state_machine_version(
         // 永不补。此处幂等 reconcile 补齐（已存在且一致的行内部 continue 不写，只补缺失/
         // 刷新陈旧机器派生行），再走原 no-op 短路。
         let policy_seeded_by = format!("statemachine_publish:{seeded_by}");
-        reconcile_state_policies_for_machine(
+        let policies = reconcile_state_policies_for_machine(
             db,
             workspace_id,
             domain,
@@ -421,14 +739,12 @@ pub(crate) async fn publish_state_machine_version(
             domain,
             "publish_state_machine_version: state machine unchanged, skip republish (no-op 幂等; policy 已 reconcile)"
         );
-        return Ok(());
+        return Ok(StateMachinePublishReport {
+            changed: false,
+            policies,
+        });
     }
 
-    let scope = doc! {
-        "workspace_id": workspace_id,
-        "domain": domain,
-    };
-    let next_version = next_version_for_scope(db.operation_domain_configs(), scope).await?;
     let now = DateTime::now();
     // policy 行的溯源标签：在 `seeded_by` 被 move 进 config insert 前先派生一个可区分的
     // 并行标签（`statemachine_publish:<原 seeded_by>`，如 `statemachine_publish:profile:edu-k12`），
@@ -439,15 +755,10 @@ pub(crate) async fn publish_state_machine_version(
     // 派生 policy 时还要读机器里的 states，故先 clone 一份本体，再把本体 move 进 insert helper，
     // clone 后用 `&states_doc` 喂 reconcile（admin 低频 publish 路径 clone 一次本体可接受）。
     let states_doc = new_state_machine.clone();
-    insert_new_current_domain_config(
-        &coll,
-        &source,
-        new_state_machine,
-        next_version,
-        seeded_by,
-        now,
-    )
-    .await?;
+    let source_id = source.id.ok_or_else(|| {
+        AppError::External("current operation domain config has no _id".to_string())
+    })?;
+    insert_new_current_domain_config(db, &source, source_id, new_state_machine, seeded_by).await?;
 
     // universal/H13 修补：状态机本体进 operation_domain_configs 不会自动让主动触达门生效。
     // 主动触达由派生表 operation_state_policies enforce（guards::enforce_state_action_policy
@@ -455,7 +766,7 @@ pub(crate) async fn publish_state_machine_version(
     // 在 publish 新机器后，按机器里每个 state 的 `forbidsProactive` 标志**联动重派生** policy
     // 行（复用 m013 的 `derive_state_policy_lists` 唯一真相），让非销售 profile 标
     // `forbidsProactive:true` 的 state 真正拦住主动发。best-effort，per-state warn-and-continue。
-    reconcile_state_policies_for_machine(
+    let policies = reconcile_state_policies_for_machine(
         db,
         workspace_id,
         domain,
@@ -464,7 +775,10 @@ pub(crate) async fn publish_state_machine_version(
         now,
     )
     .await;
-    Ok(())
+    Ok(StateMachinePublishReport {
+        changed: true,
+        policies,
+    })
 }
 
 pub(super) async fn rollout_operation_domain_version(
@@ -481,21 +795,16 @@ pub(super) async fn rollout_operation_domain_version(
         )
         .await?
         .ok_or_else(|| AppError::NotFound("operation domain config not found".to_string()))?;
+    validated_operation_domain_runtime(&target)?;
     let now = DateTime::now();
-    coll.update_one(
-        doc! { "_id": object_id },
-        doc! { "$set": { "current_version": true, "updated_at": now } },
-        None,
-    )
-    .await?;
-    coll.update_many(
+    switch_current(
+        &state.db,
+        "operation_domain_configs",
         doc! {
             "workspace_id": &target.workspace_id,
             "domain": &target.domain,
-            "_id": { "$ne": object_id },
         },
-        doc! { "$set": { "current_version": false, "updated_at": now } },
-        None,
+        object_id,
     )
     .await?;
     // G12：切 current 配置版本后按新 current 机器（target.state_machine）重派 policy，
@@ -549,24 +858,19 @@ pub(super) async fn rollback_operation_domain_version(
                 "previous version {prev_version} not found for rollback"
             ))
         })?;
+    validated_operation_domain_runtime(&prev)?;
     let prev_id = prev
         .id
         .ok_or_else(|| AppError::BadRequest("previous version has no _id".to_string()))?;
     let now = DateTime::now();
-    coll.update_one(
-        doc! { "_id": prev_id },
-        doc! { "$set": { "current_version": true, "updated_at": now } },
-        None,
-    )
-    .await?;
-    coll.update_many(
+    switch_current(
+        &state.db,
+        "operation_domain_configs",
         doc! {
             "workspace_id": &target.workspace_id,
             "domain": &target.domain,
-            "_id": { "$ne": prev_id },
         },
-        doc! { "$set": { "current_version": false, "updated_at": now } },
-        None,
+        prev_id,
     )
     .await?;
     // G12：rollback 切回历史版本 `prev` 后按其机器（prev.state_machine）重派 policy，
@@ -609,8 +913,8 @@ pub(super) async fn publish_operation_state_policy_version(
         "domain": &source.domain,
         "state_key": &source.state_key,
     };
-    let next_version =
-        next_version_for_scope(state.db.operation_state_policies(), scope.clone()).await?;
+    let expected_current_id =
+        unique_current_id(&state.db, "operation_state_policies", &scope).await?;
     let now = DateTime::now();
     let new_entry = OperationStatePolicy {
         id: None,
@@ -622,26 +926,22 @@ pub(super) async fn publish_operation_state_policy_version(
         recommended_pace: source.recommended_pace,
         status: "active".to_string(),
         updated_at: now,
-        version: next_version,
-        current_version: true,
+        version: 0,
+        current_version: false,
         previous_version: Some(source.version),
         seeded_by: Some("manual".to_string()),
     };
-    let inserted = coll.insert_one(&new_entry, None).await?;
-    coll.update_many(
-        doc! {
-            "workspace_id": &source.workspace_id,
-            "domain": &source.domain,
-            "state_key": &source.state_key,
-            "_id": { "$ne": inserted.inserted_id.as_object_id() },
-        },
-        doc! { "$set": { "current_version": false, "updated_at": now } },
-        None,
+    let (inserted_id, next_version) = insert_new_current(
+        &state.db,
+        "operation_state_policies",
+        scope,
+        expected_current_id,
+        to_document(&new_entry)?,
     )
     .await?;
     Ok(Json(json!({
         "ok": true,
-        "id": inserted.inserted_id.as_object_id().map(|i| i.to_hex()).unwrap_or_default(),
+        "id": inserted_id.to_hex(),
         "version": next_version,
         "previousVersion": source.version,
     })))
@@ -661,22 +961,15 @@ pub(super) async fn rollout_operation_state_policy_version(
         )
         .await?
         .ok_or_else(|| AppError::NotFound("operation state policy not found".to_string()))?;
-    let now = DateTime::now();
-    coll.update_one(
-        doc! { "_id": object_id },
-        doc! { "$set": { "current_version": true, "updated_at": now } },
-        None,
-    )
-    .await?;
-    coll.update_many(
+    switch_current(
+        &state.db,
+        "operation_state_policies",
         doc! {
             "workspace_id": &target.workspace_id,
             "domain": &target.domain,
             "state_key": &target.state_key,
-            "_id": { "$ne": object_id },
         },
-        doc! { "$set": { "current_version": false, "updated_at": now } },
-        None,
+        object_id,
     )
     .await?;
     Ok(Json(json!({ "ok": true, "version": target.version })))
@@ -718,22 +1011,15 @@ pub(super) async fn rollback_operation_state_policy_version(
     let prev_id = prev
         .id
         .ok_or_else(|| AppError::BadRequest("previous version has no _id".to_string()))?;
-    let now = DateTime::now();
-    coll.update_one(
-        doc! { "_id": prev_id },
-        doc! { "$set": { "current_version": true, "updated_at": now } },
-        None,
-    )
-    .await?;
-    coll.update_many(
+    switch_current(
+        &state.db,
+        "operation_state_policies",
         doc! {
             "workspace_id": &target.workspace_id,
             "domain": &target.domain,
             "state_key": &target.state_key,
-            "_id": { "$ne": prev_id },
         },
-        doc! { "$set": { "current_version": false, "updated_at": now } },
-        None,
+        prev_id,
     )
     .await?;
     Ok(Json(json!({ "ok": true, "rolledBackTo": prev_version })))
@@ -761,39 +1047,35 @@ pub async fn publish_taxonomy_version(
         "kind": &source.kind,
         "value.id": &source.value.id,
     };
-    let next_version =
-        next_version_for_scope(state.db.collection_system_taxonomies(), scope.clone()).await?;
+    let expected_current_id = unique_current_id(&state.db, "system_taxonomies", &scope).await?;
     let now = DateTime::now();
-    let new_entry = TaxonomyEntry {
+    let mut new_entry = TaxonomyEntry {
         id: None,
         workspace_id: admin.current_workspace.clone(),
         scope: source.scope.clone(),
         kind: source.kind.clone(),
         value: source.value.clone(),
         updated_at: now,
-        version: next_version,
-        current_version: true,
+        version: 0,
+        current_version: false,
         previous_version: Some(source.version),
         seeded_by: Some("manual".to_string()),
     };
-    let inserted = coll.insert_one(&new_entry, None).await?;
-    coll.update_many(
-        doc! {
-            "workspace_id": &admin.current_workspace,
-            "scope": &source.scope,
-            "kind": &source.kind,
-            "value.id": &source.value.id,
-            "_id": { "$ne": inserted.inserted_id.as_object_id() },
-        },
-        doc! { "$set": { "current_version": false, "updated_at": now } },
-        None,
+    let (inserted_id, next_version) = insert_new_current(
+        &state.db,
+        "system_taxonomies",
+        scope,
+        expected_current_id,
+        to_document(&new_entry)?,
     )
     .await?;
+    new_entry.version = next_version;
+    new_entry.current_version = true;
     invalidate_global_taxonomy_cache(&state.db);
     audit_taxonomy_change(&state, &admin, "publish", &new_entry).await;
     Ok(Json(json!({
         "ok": true,
-        "id": inserted.inserted_id.as_object_id().map(|i| i.to_hex()).unwrap_or_default(),
+        "id": inserted_id.to_hex(),
         "version": next_version,
         "previousVersion": source.version,
     })))
@@ -813,23 +1095,16 @@ pub async fn rollout_taxonomy_version(
         )
         .await?
         .ok_or_else(|| AppError::NotFound("taxonomy entry not found".to_string()))?;
-    let now = DateTime::now();
-    coll.update_one(
-        doc! { "_id": object_id, "workspace_id": &admin.current_workspace },
-        doc! { "$set": { "current_version": true, "updated_at": now } },
-        None,
-    )
-    .await?;
-    coll.update_many(
+    switch_current(
+        &state.db,
+        "system_taxonomies",
         doc! {
             "workspace_id": &admin.current_workspace,
             "scope": &target.scope,
             "kind": &target.kind,
             "value.id": &target.value.id,
-            "_id": { "$ne": object_id },
         },
-        doc! { "$set": { "current_version": false, "updated_at": now } },
-        None,
+        object_id,
     )
     .await?;
     invalidate_global_taxonomy_cache(&state.db);
@@ -874,23 +1149,16 @@ pub async fn rollback_taxonomy_version(
     let prev_id = prev
         .id
         .ok_or_else(|| AppError::BadRequest("previous version has no _id".to_string()))?;
-    let now = DateTime::now();
-    coll.update_one(
-        doc! { "_id": prev_id, "workspace_id": &admin.current_workspace },
-        doc! { "$set": { "current_version": true, "updated_at": now } },
-        None,
-    )
-    .await?;
-    coll.update_many(
+    switch_current(
+        &state.db,
+        "system_taxonomies",
         doc! {
             "workspace_id": &admin.current_workspace,
             "scope": &target.scope,
             "kind": &target.kind,
             "value.id": &target.value.id,
-            "_id": { "$ne": prev_id },
         },
-        doc! { "$set": { "current_version": false, "updated_at": now } },
-        None,
+        prev_id,
     )
     .await?;
     invalidate_global_taxonomy_cache(&state.db);

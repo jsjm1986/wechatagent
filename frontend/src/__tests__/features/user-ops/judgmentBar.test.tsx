@@ -1,5 +1,8 @@
 import { describe, it, expect } from "vitest";
-import { finalReviewTone } from "../../../features/user-ops/cockpit/JudgmentBar";
+import {
+  escalationCountLabel,
+  finalReviewTone,
+} from "../../../features/user-ops/cockpit/JudgmentBar";
 
 describe("finalReviewTone", () => {
   it("approved 系 → sent", () => {
@@ -18,5 +21,13 @@ describe("finalReviewTone", () => {
     expect(finalReviewTone("legacy_mode_unchecked")).toBe("other");
     expect(finalReviewTone(undefined)).toBe("other");
     expect(finalReviewTone("some_future_value")).toBe("other");
+  });
+});
+
+describe("escalationCountLabel", () => {
+  it("keeps zero distinct from unavailable", () => {
+    expect(escalationCountLabel(3)).toBe("待决策请示 3");
+    expect(escalationCountLabel(0)).toBeNull();
+    expect(escalationCountLabel(null)).toBe("请示计数不可用");
   });
 });

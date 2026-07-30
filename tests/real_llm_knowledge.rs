@@ -762,7 +762,7 @@ WechatAgent 是面向私域运营团队的 AI 自动化助手，帮助运营在�
 #[ignore]
 async fn k5_real_article_extraction_keeps_needs_review() {
     let llm = require_real_llm!();
-    let app = TestApp::start().await;
+    let app = TestApp::start_repl_set().await;
     let mcp = dummy_mcp_server().await;
     let state = common::rebuild_app_state_with_real_llm(&app, llm, mcp.uri());
 
@@ -776,7 +776,7 @@ async fn k5_real_article_extraction_keeps_needs_review() {
     // 直调抽取纯函数（经 ext_knowledge 导出）：绕过 handler 大/小文档 job 分流，
     // K5 只验真模型抽取结果，不涉及异步 job（大文档走 handler 会返 jobId 而非 body）。
     let body = unwrap_or_skip_transient!(
-        run_import_extraction(&state, &req, None).await,
+        run_import_extraction(&state, "default", &req, None).await,
         "真实文章抽取（不崩、JSON 能解析+normalize）"
     );
 
@@ -833,7 +833,7 @@ const K6_ARTICLE_IMAGE_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAWgAAACMAQAAAAB5P
 async fn k6_real_vision_article_extraction_keeps_needs_review() {
     let mut evidence = CapabilityEvidence::new("k6_vision_artifact");
     let _llm = require_real_llm!();
-    let app = TestApp::start().await;
+    let app = TestApp::start_repl_set().await;
     let ws = app.state.config.default_workspace_id.clone();
 
     // seed 专职视觉副模型。vision 端点独立配置（REAL_LLM_VISION_* 三元组）：deepseek
@@ -952,7 +952,7 @@ async fn k6_real_vision_article_extraction_keeps_needs_review() {
 async fn k7_real_auto_verify_provenance_gate_holds() {
     let mut evidence = CapabilityEvidence::new("k7_auto_verify_commit");
     let llm = require_real_llm!();
-    let app = TestApp::start().await;
+    let app = TestApp::start_repl_set().await;
     let mcp = dummy_mcp_server().await;
     let state = common::rebuild_app_state_with_real_llm(&app, llm, mcp.uri());
     let ws = state.config.default_workspace_id.clone();
@@ -1199,7 +1199,16 @@ async fn k9_real_tag_extraction_returns_two_arrays() {
     .expect("构造 ExtractKnowledgeTagsRequest");
 
     let resp = unwrap_or_skip_transient!(
-        extract_operation_knowledge_tags(State(state.clone()), Json(req)).await,
+        extract_operation_knowledge_tags(
+            State(state.clone()),
+            Extension(AuthenticatedAdmin {
+                user_id: "real-llm-knowledge".to_string(),
+                username: "real-llm-knowledge".to_string(),
+                current_workspace: "default".to_string(),
+            }),
+            Json(req),
+        )
+        .await,
         "真实标签抽取（不崩、JSON 能解析）"
     );
     let body = resp.0;

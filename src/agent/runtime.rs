@@ -8,12 +8,270 @@
 //! 同时提供 `as_document()` 方便回写到 prompt / agent_run_logs。
 
 use futures::TryStreamExt;
-use mongodb::bson::{doc, Document};
+use mongodb::bson::{doc, Bson, Document};
 use mongodb::options::FindOptions;
 
 use crate::error::AppResult;
 use crate::models::{Contact, OperationDomainConfig};
 use crate::routes::AppState;
+
+#[derive(Clone, Copy)]
+enum RuntimeParameterRule {
+    Integer { min: i64, max: i64 },
+    Boolean,
+}
+
+const USER_RUNTIME_PARAMETER_RULES: &[(&str, RuntimeParameterRule)] = &[
+    (
+        "recentMessageLimit",
+        RuntimeParameterRule::Integer { min: 1, max: 200 },
+    ),
+    (
+        "minReplyIntervalSeconds",
+        RuntimeParameterRule::Integer {
+            min: 0,
+            max: 86_400,
+        },
+    ),
+    (
+        "maxDailyTouches",
+        RuntimeParameterRule::Integer { min: 0, max: 100 },
+    ),
+    (
+        "maxPendingFollowUps",
+        RuntimeParameterRule::Integer { min: 0, max: 100 },
+    ),
+    (
+        "followUpExpiresHours",
+        RuntimeParameterRule::Integer { min: 1, max: 8_760 },
+    ),
+    (
+        "cooldownAfterNoReplyHours",
+        RuntimeParameterRule::Integer { min: 0, max: 8_760 },
+    ),
+    (
+        "hallucinationBlockAt",
+        RuntimeParameterRule::Integer { min: 1, max: 10 },
+    ),
+    (
+        "pressureRiskBlockAt",
+        RuntimeParameterRule::Integer { min: 1, max: 10 },
+    ),
+    (
+        "knowledgeGroundingBlockBelow",
+        RuntimeParameterRule::Integer { min: 1, max: 10 },
+    ),
+    (
+        "humanLikeRewriteBelow",
+        RuntimeParameterRule::Integer { min: 1, max: 10 },
+    ),
+    (
+        "emotionalValueRewriteBelow",
+        RuntimeParameterRule::Integer { min: 1, max: 10 },
+    ),
+    (
+        "operationStateConfidenceFullReviewBelow",
+        RuntimeParameterRule::Integer { min: 1, max: 10 },
+    ),
+    (
+        "runTokenBudget",
+        RuntimeParameterRule::Integer {
+            min: 1_000,
+            max: 2_000_000,
+        },
+    ),
+    (
+        "runTokenBudgetEscalated",
+        RuntimeParameterRule::Integer {
+            min: 1_000,
+            max: 2_000_000,
+        },
+    ),
+    (
+        "runMaxLlmCalls",
+        RuntimeParameterRule::Integer { min: 1, max: 20 },
+    ),
+    (
+        "simulationTokenBudget",
+        RuntimeParameterRule::Integer {
+            min: 1_000,
+            max: 2_000_000,
+        },
+    ),
+    (
+        "reactionTokenBudget",
+        RuntimeParameterRule::Integer {
+            min: 1_000,
+            max: 500_000,
+        },
+    ),
+    (
+        "reactionMaxLlmCalls",
+        RuntimeParameterRule::Integer { min: 1, max: 10 },
+    ),
+    ("autonomyProtocolEnabled", RuntimeParameterRule::Boolean),
+    (
+        "knowledgeMaxToolCalls",
+        RuntimeParameterRule::Integer { min: 1, max: 16 },
+    ),
+    (
+        "knowledgeOpenSliceMaxK",
+        RuntimeParameterRule::Integer { min: 1, max: 16 },
+    ),
+    (
+        "knowledgeSearchTopK",
+        RuntimeParameterRule::Integer { min: 1, max: 32 },
+    ),
+    (
+        "outboxPollIntervalSeconds",
+        RuntimeParameterRule::Integer { min: 1, max: 60 },
+    ),
+    (
+        "outboxLeaseSeconds",
+        RuntimeParameterRule::Integer { min: 10, max: 600 },
+    ),
+    ("quietHoursEnabled", RuntimeParameterRule::Boolean),
+    (
+        "quietHoursStart",
+        RuntimeParameterRule::Integer { min: 0, max: 23 },
+    ),
+    (
+        "quietHoursEnd",
+        RuntimeParameterRule::Integer { min: 0, max: 23 },
+    ),
+    (
+        "quietHoursTzOffsetHours",
+        RuntimeParameterRule::Integer { min: -12, max: 14 },
+    ),
+    (
+        "consolidationWindowCharBudget",
+        RuntimeParameterRule::Integer {
+            min: 1_000,
+            max: 16_000,
+        },
+    ),
+    (
+        "consolidationWindowMaxMessages",
+        RuntimeParameterRule::Integer { min: 10, max: 200 },
+    ),
+    (
+        "bayesianSlotMinHits",
+        RuntimeParameterRule::Integer { min: 1, max: 20 },
+    ),
+    (
+        "bayesianSlotMinStrong",
+        RuntimeParameterRule::Integer { min: 0, max: 20 },
+    ),
+];
+
+const GUIDE_RUNTIME_PARAMETER_KEYS: &[&str] = &[
+    "recentMessageLimit",
+    "minReplyIntervalSeconds",
+    "maxDailyTouches",
+    "maxPendingFollowUps",
+    "followUpExpiresHours",
+    "cooldownAfterNoReplyHours",
+    "quietHoursEnabled",
+    "quietHoursStart",
+    "quietHoursEnd",
+    "quietHoursTzOffsetHours",
+];
+
+fn integer_value(value: &Bson) -> Option<i64> {
+    match value {
+        Bson::Int32(value) => Some(i64::from(*value)),
+        Bson::Int64(value) => Some(*value),
+        _ => None,
+    }
+}
+
+fn equivalent_runtime_value(left: &Bson, right: &Bson) -> bool {
+    match (integer_value(left), integer_value(right)) {
+        (Some(left), Some(right)) => left == right,
+        _ => left == right,
+    }
+}
+
+/// Strict write-boundary schema for the user-operations runtime document.
+///
+/// The two legacy names are accepted and rewritten to the typed canonical
+/// names. Unknown keys and values that would otherwise be clamped or make the
+/// whole typed decode fall back to defaults are rejected before persistence.
+pub(crate) fn validate_and_normalize_user_runtime_parameters(
+    input: &Document,
+) -> Result<Document, String> {
+    let mut normalized = input.clone();
+    for (legacy, canonical) in [
+        ("factRiskBlockAt", "hallucinationBlockAt"),
+        ("productAccuracyBlockBelow", "knowledgeGroundingBlockBelow"),
+    ] {
+        let Some(legacy_value) = normalized.remove(legacy) else {
+            continue;
+        };
+        if let Some(canonical_value) = normalized.get(canonical) {
+            if !equivalent_runtime_value(&legacy_value, canonical_value) {
+                return Err(format!(
+                    "runtime parameter {legacy} conflicts with canonical {canonical}"
+                ));
+            }
+        } else {
+            normalized.insert(canonical, legacy_value);
+        }
+    }
+
+    for (key, value) in &normalized {
+        let Some((_, rule)) = USER_RUNTIME_PARAMETER_RULES
+            .iter()
+            .find(|(known, _)| *known == key.as_str())
+        else {
+            return Err(format!("unknown user runtime parameter: {key}"));
+        };
+        match rule {
+            RuntimeParameterRule::Boolean if !matches!(value, Bson::Boolean(_)) => {
+                return Err(format!("runtime parameter {key} must be boolean"));
+            }
+            RuntimeParameterRule::Integer { min, max } => {
+                let Some(number) = integer_value(value) else {
+                    return Err(format!("runtime parameter {key} must be an integer"));
+                };
+                if number < *min || number > *max {
+                    return Err(format!(
+                        "runtime parameter {key} must be between {min} and {max}"
+                    ));
+                }
+            }
+            RuntimeParameterRule::Boolean => {}
+        }
+    }
+
+    let run_budget = normalized
+        .get("runTokenBudget")
+        .and_then(integer_value)
+        .unwrap_or(150_000);
+    let escalated_budget = normalized
+        .get("runTokenBudgetEscalated")
+        .and_then(integer_value)
+        .unwrap_or(500_000);
+    if escalated_budget < run_budget {
+        return Err(
+            "runtime parameter runTokenBudgetEscalated must be >= runTokenBudget".to_string(),
+        );
+    }
+    Ok(normalized)
+}
+
+/// Guide may tune cadence/context only. Safety thresholds, model budgets,
+/// delivery leases, and protocol switches require the dedicated admin editor.
+pub(crate) fn validate_guide_runtime_parameter_patch(patch: &Document) -> Result<(), String> {
+    for key in patch.keys() {
+        if !GUIDE_RUNTIME_PARAMETER_KEYS.contains(&key.as_str()) {
+            return Err(format!(
+                "Guide cannot modify high-risk runtime parameter: {key}"
+            ));
+        }
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone)]
 pub struct UserRuntimeParameters {
@@ -90,13 +348,11 @@ pub struct UserRuntimeParameters {
     /// `blocked_unverified_product_claim`（R5.4 verified 强约束 + 漏判探针）任何
     /// 取值下都不变。
     pub grounding_gate_bypass_without_claim: bool,
-    /// reviewer 优化第一步：本域是否「不信任被审查者自报的低风险」。`false`
-    /// （DEFAULT/`from_config`/`Default`）= 沿用 `should_run_review` 既有判定（销售域
-    /// 字节等价）；`true` = 高敏域，should_reply 的回复一律强制走独立 LLM review，
-    /// 不再因 Reply Agent 自报 `needs_review=false` 走本地轻量兜底。由 active
+    /// reviewer 深度开关。所有 `should_reply=true` 的正文都必须经过独立 Reviewer；
+    /// `false`（DEFAULT/`from_config`/`Default`）允许常规低风险回复使用 light Reviewer，
+    /// `true` 则让高敏域强制使用 full Reviewer。它不再授权 Reply Agent 以自报
+    /// `needs_review=false` 跳过审核。由 active
     /// DomainProfile.distrust_self_reported_low_risk 派生，gateway 加载 profile 后覆盖。
-    /// 配套：预算超额仍只能本地兜底时，`local_decision_review` 在本标志为真时把
-    /// pressure_risk 从乐观 0 改为保守 `pressure_risk_block_at`（安全化，非点对点修补）。
     pub distrust_self_reported_low_risk: bool,
     /// tag-trust 子计划3 Task2：记忆归并宽窗口字符预算。`from_config` 把 typed
     /// 值 clamp 到 `[1000, 16000]`；Task3 的 `take_window_by_budget` 消费它决定
@@ -184,8 +440,8 @@ impl UserRuntimeParameters {
             // H14：from_config 不接 DomainProfile，默认 false=无条件 grounding 硬闸
             // （销售域字节等价）；gateway 加载 active profile 后覆盖。
             grounding_gate_bypass_without_claim: false,
-            // reviewer 优化：from_config 不接 DomainProfile，默认 false=沿用既有
-            // should_run_review 判定（销售域字节等价）；gateway 加载 active profile 后覆盖。
+            // reviewer 深度：from_config 不接 DomainProfile，默认 false=普通低风险可走
+            // light Reviewer；gateway 加载 active profile 后覆盖。
             distrust_self_reported_low_risk: false,
             // tag-trust 子计划3 Task2：归并宽窗口两参数走 typed → clamp 到合理带。
             consolidation_window_char_budget: typed
@@ -270,7 +526,7 @@ impl UserRuntimeParameters {
     /// 派生三项：
     /// - `grounding_gate_bypass_without_claim`（H14）：纯情感回复无产品声明时旁路
     ///   grounding 软分硬闸。
-    /// - `distrust_self_reported_low_risk`（reviewer 优化）：高敏域强制走 LLM review。
+    /// - `distrust_self_reported_low_risk`（reviewer 深度）：高敏域强制走 full Reviewer。
     /// - `threshold_overrides`（M2）：逐字段覆盖五闸阈值（None 回落不动）。
     ///
     /// DEFAULT 销售 profile（bypass=false/distrust=false/overrides=None）→ 三项均无扰动，
@@ -336,8 +592,7 @@ impl Default for UserRuntimeParameters {
             allowed_conversation_modes: default_conversation_modes(),
             // H14：PBT / 无 profile 入口默认 false=无条件 grounding 硬闸（销售域等价）。
             grounding_gate_bypass_without_claim: false,
-            // reviewer 优化：PBT / 无 profile 入口默认 false=沿用既有 should_run_review
-            // 判定（销售域等价）。
+            // reviewer 深度：PBT / 无 profile 入口默认 false=普通低风险可走 light Reviewer。
             distrust_self_reported_low_risk: false,
             // tag-trust 子计划3 Task2：与 from_config 同口径 clamp（默认值在带内，结果等价）。
             consolidation_window_char_budget: typed
@@ -481,6 +736,7 @@ pub async fn resolve_thresholds(
             doc! {
                 "workspace_id": &contact.workspace_id,
                 "account_id": &contact.account_id,
+                "current_version": true,
                 "rolled_back_at": null,
             },
             FindOptions::builder()
@@ -504,13 +760,12 @@ pub async fn resolve_thresholds(
 
 /// 内部 helper：避免与 `agent::decision::load_user_operation_domain_config_for_contact`
 /// 形成循环依赖（runtime.rs 不应反向依赖 decision.rs 的 pub(crate) 函数）。
-/// 行为与之等价：按 `(workspace_id, domain="user_operations", current_version=true)`
-/// 列取 active 集合，多条时按 `ab_bucket_for_contact(contact_id, n)` 哈希分桶；
-/// 0 条时退回 `current_version: { $exists: false }` 老形态以兼容 m015 之前的库。
+/// 行为与之等价：历史版本可驻留，但 scope 已存在时必须恰好一条 current；
+/// 多 current 或有历史却零 current 均 fail closed，不再隐式哈希分桶。
 async fn load_user_operation_domain_config_for_resolve(
     state: &AppState,
     workspace_id: &str,
-    contact_id: &str,
+    _contact_id: &str,
 ) -> AppResult<Option<OperationDomainConfig>> {
     use futures::TryStreamExt;
     let coll = state.db.operation_domain_configs();
@@ -528,24 +783,32 @@ async fn load_user_operation_domain_config_for_resolve(
         .try_collect()
         .await
         .map_err(crate::error::AppError::from)?;
-    if active.is_empty() {
-        return coll
-            .find_one(
-                doc! {
-                    "workspace_id": workspace_id,
-                    "domain": "user_operations",
-                    "current_version": { "$exists": false },
-                },
-                None,
-            )
-            .await
-            .map_err(crate::error::AppError::from);
-    }
     if active.len() == 1 {
         return Ok(Some(active.remove(0)));
     }
-    let bucket = crate::prompts::ab_bucket_for_contact(contact_id, active.len());
-    Ok(Some(active.swap_remove(bucket)))
+    if active.len() > 1 {
+        return Err(crate::error::AppError::Conflict(
+            "multiple_current_operation_domain_configs".to_string(),
+        ));
+    }
+    let scope_exists = coll
+        .find_one(
+            doc! {
+                "workspace_id": workspace_id,
+                "domain": "user_operations",
+            },
+            None,
+        )
+        .await
+        .map_err(crate::error::AppError::from)?
+        .is_some();
+    if scope_exists {
+        Err(crate::error::AppError::Conflict(
+            "missing_current_operation_domain_config".to_string(),
+        ))
+    } else {
+        Ok(None)
+    }
 }
 
 #[cfg(test)]
@@ -553,6 +816,55 @@ mod tests {
     use super::*;
     use crate::models::OperationDomainConfig;
     use mongodb::bson::DateTime as BsonDt;
+
+    #[test]
+    fn runtime_write_validator_normalizes_legacy_aliases() {
+        let normalized = validate_and_normalize_user_runtime_parameters(&doc! {
+            "factRiskBlockAt": 8,
+            "productAccuracyBlockBelow": 6,
+            "maxDailyTouches": 3,
+        })
+        .expect("legacy aliases should remain writable");
+        assert_eq!(normalized.get_i32("hallucinationBlockAt").ok(), Some(8));
+        assert_eq!(
+            normalized.get_i32("knowledgeGroundingBlockBelow").ok(),
+            Some(6)
+        );
+        assert!(!normalized.contains_key("factRiskBlockAt"));
+        assert!(!normalized.contains_key("productAccuracyBlockBelow"));
+    }
+
+    #[test]
+    fn runtime_write_validator_rejects_unknown_wrong_type_and_unsafe_range() {
+        for input in [
+            doc! { "unknownRuntimeKey": 1 },
+            doc! { "maxDailyTouches": "3" },
+            doc! { "maxDailyTouches": -1 },
+            doc! { "runTokenBudget": 200_000, "runTokenBudgetEscalated": 100_000 },
+        ] {
+            assert!(
+                validate_and_normalize_user_runtime_parameters(&input).is_err(),
+                "invalid runtime document should be rejected: {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn guide_runtime_patch_allows_cadence_but_rejects_high_risk_fields() {
+        assert!(validate_guide_runtime_parameter_patch(&doc! {
+            "maxDailyTouches": 2,
+            "quietHoursStart": 23,
+        })
+        .is_ok());
+        for key in [
+            "hallucinationBlockAt",
+            "runTokenBudget",
+            "outboxLeaseSeconds",
+            "autonomyProtocolEnabled",
+        ] {
+            assert!(validate_guide_runtime_parameter_patch(&doc! { key: 1 }).is_err());
+        }
+    }
 
     fn make_domain_config(params: Document) -> OperationDomainConfig {
         OperationDomainConfig {
@@ -711,10 +1023,10 @@ mod tests {
             runtime.grounding_gate_bypass_without_claim,
             "情感陪伴应旁路 grounding 软闸"
         );
-        // reviewer：高敏域强制走 LLM review。
+        // reviewer：高敏域强制走 full Reviewer。
         assert!(
             runtime.distrust_self_reported_low_risk,
-            "情感陪伴高敏域应不信任自报低风险"
+            "情感陪伴高敏域应使用 full Reviewer"
         );
     }
 

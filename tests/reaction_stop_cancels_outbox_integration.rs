@@ -3,7 +3,12 @@
 //! 命门在 `src/agent/reaction.rs:248` 的接线：
 //! ```ignore
 //! if outbox::outcome_signals_stop(&outcome_for_outbox) {
-//!     outbox::cancel_for_contact_on_user_reaction(state, &contact.account_id, &contact.wxid)
+//!     outbox::cancel_for_contact_on_user_reaction(
+//!         state,
+//!         &contact.workspace_id,
+//!         &contact.account_id,
+//!         &contact.wxid,
+//!     )
 //! }
 //! ```
 //! 三段各自有测试（映射 `reaction.rs` a6_tests / 规则闸 `outbox.rs` tests /

@@ -24,7 +24,7 @@ use wechatagent::error::AppError;
 use wechatagent::knowledge_wiki::chunk_revisions::{
     apply_chunk_revision, ProvenanceSource, RevisionOp, RevisionRequest,
 };
-use wechatagent::models::OperationKnowledgeChunk;
+use wechatagent::models::{OperationKnowledgeChunk, OperationKnowledgeDocument};
 
 use crate::common::TestApp;
 
@@ -32,7 +32,7 @@ use crate::common::TestApp;
 #[tokio::test]
 #[ignore]
 async fn apply_chunk_revision_ai_source_forces_draft_needs_review() {
-    let app = TestApp::start().await;
+    let app = TestApp::start_repl_set().await;
     let ws = app.state.config.default_workspace_id.clone();
 
     // seed 一条既有 chunk,故意置为 active + verified 作为反例初值:
@@ -125,7 +125,7 @@ async fn apply_chunk_revision_ai_source_forces_draft_needs_review() {
 #[tokio::test]
 #[ignore]
 async fn apply_chunk_revision_ai_patch_unions_product_tags_and_forces_draft() {
-    let app = TestApp::start().await;
+    let app = TestApp::start_repl_set().await;
     let ws = app.state.config.default_workspace_id.clone();
 
     // seed:既有 chunk 带 product_tags=["A"],status=active(AI patch 应把它打回 draft)。
@@ -226,12 +226,50 @@ async fn apply_chunk_revision_ai_patch_unions_product_tags_and_forces_draft() {
 async fn concurrent_chunk_patches_conflict_without_lost_update_or_orphan_revision() {
     const CONTENDERS: usize = 16;
 
-    let app = TestApp::start().await;
+    let app = TestApp::start_repl_set().await;
     let ws = app.state.config.default_workspace_id.clone();
     let chunk_oid = ObjectId::new();
+    let document_oid = ObjectId::new();
+    let now = BsonDt::now();
+    app.state
+        .db
+        .operation_knowledge_documents()
+        .insert_one(
+            OperationKnowledgeDocument {
+                id: Some(document_oid),
+                workspace_id: ws.clone(),
+                account_id: None,
+                domain: "user_operations".to_string(),
+                source_type: "test".to_string(),
+                source_name: None,
+                title: "concurrent patch parent".to_string(),
+                summary: None,
+                catalog_summary: None,
+                routing_map: Vec::new(),
+                risk_notes: Vec::new(),
+                product_tags: Vec::new(),
+                business_topics: Vec::new(),
+                raw_content: None,
+                content_hash: None,
+                line_index: Vec::new(),
+                section_index: Vec::new(),
+                status: "active".to_string(),
+                version: 1,
+                created_at: now,
+                updated_at: now,
+                catalog_summary_persisted: None,
+                catalog_version: None,
+                catalog_desired_generation: 0,
+                catalog_applied_generation: 0,
+            },
+            None,
+        )
+        .await
+        .expect("insert concurrent patch parent document");
     let seeded = OperationKnowledgeChunk {
         id: Some(chunk_oid),
         workspace_id: ws.clone(),
+        document_id: Some(document_oid),
         domain: "user_operations".to_string(),
         title: "concurrent patch target".to_string(),
         summary: Some("baseline summary".to_string()),
@@ -332,5 +370,197 @@ async fn concurrent_chunk_patches_conflict_without_lost_update_or_orphan_revisio
         revision_count,
         successful_summaries.len() as u64,
         "conflicted writes must not leave orphan revision rows"
+    );
+    let catalog_job_count = app
+        .state
+        .db
+        .catalog_rebuild_jobs()
+        .count_documents(doc! { "workspace_id": &ws }, None)
+        .await
+        .expect("count concurrent catalog jobs");
+    assert_eq!(
+        catalog_job_count,
+        successful_summaries.len() as u64,
+        "only committed writers may enqueue catalog rebuild jobs"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires replica-set MongoDB / testcontainers"]
+async fn chunk_replace_failure_rolls_back_revision_and_catalog_job() {
+    let app = TestApp::start_repl_set().await;
+    let ws = app.state.config.default_workspace_id.clone();
+    let chunk_oid = ObjectId::new();
+    let seeded = OperationKnowledgeChunk {
+        id: Some(chunk_oid),
+        workspace_id: ws.clone(),
+        document_id: Some(ObjectId::new()),
+        domain: "user_operations".to_string(),
+        title: "validator baseline".to_string(),
+        body: Some("stable body for transaction rollback validation".to_string()),
+        status: "active".to_string(),
+        priority: 0,
+        created_at: BsonDt::now(),
+        updated_at: BsonDt::now(),
+        ..Default::default()
+    };
+    app.state
+        .db
+        .operation_knowledge_chunks()
+        .insert_one(&seeded, None)
+        .await
+        .expect("insert validator target");
+    app.state
+        .db
+        .raw()
+        .run_command(
+            doc! {
+                "collMod": "operation_knowledge_chunks",
+                "validator": { "title": { "$ne": "validator-rejected" } },
+                "validationLevel": "strict",
+                "validationAction": "error",
+            },
+            None,
+        )
+        .await
+        .expect("install chunk replacement validator");
+
+    let result = apply_chunk_revision(
+        &app.state.db,
+        &ws,
+        chunk_oid,
+        RevisionRequest {
+            op: RevisionOp::Patch,
+            source: ProvenanceSource::Human,
+            patch: doc! { "title": "validator-rejected" },
+            reason: Some("force main-row write failure".to_string()),
+            actor: Some("transaction-test".to_string()),
+        },
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "validator must reject the main-row replacement"
+    );
+
+    let stored = app
+        .state
+        .db
+        .operation_knowledge_chunks()
+        .find_one(doc! { "_id": chunk_oid, "workspace_id": &ws }, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.title, "validator baseline");
+    assert_eq!(
+        app.state
+            .db
+            .chunk_revisions()
+            .count_documents(
+                doc! { "workspace_id": &ws, "chunk_id": chunk_oid.to_hex() },
+                None
+            )
+            .await
+            .unwrap(),
+        0,
+        "failed main-row write must roll back the provisional revision"
+    );
+    assert_eq!(
+        app.state
+            .db
+            .catalog_rebuild_jobs()
+            .count_documents(doc! { "workspace_id": &ws }, None)
+            .await
+            .unwrap(),
+        0,
+        "failed main-row write must not enqueue catalog work"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires replica-set MongoDB / testcontainers"]
+async fn audit_only_noop_keeps_main_row_exact_and_skips_catalog_job() {
+    let app = TestApp::start_repl_set().await;
+    let ws = app.state.config.default_workspace_id.clone();
+    let chunk_oid = ObjectId::new();
+    let seeded = OperationKnowledgeChunk {
+        id: Some(chunk_oid),
+        workspace_id: ws.clone(),
+        document_id: Some(ObjectId::new()),
+        domain: "user_operations".to_string(),
+        title: "no-op target".to_string(),
+        body: Some("content that must remain byte-for-byte stable".to_string()),
+        status: "draft".to_string(),
+        priority: 0,
+        created_at: BsonDt::now(),
+        updated_at: BsonDt::now(),
+        ..Default::default()
+    };
+    app.state
+        .db
+        .operation_knowledge_chunks()
+        .insert_one(&seeded, None)
+        .await
+        .expect("insert no-op target");
+    let before = app
+        .state
+        .db
+        .raw()
+        .collection::<mongodb::bson::Document>("operation_knowledge_chunks")
+        .find_one(doc! { "_id": chunk_oid }, None)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let applied = apply_chunk_revision(
+        &app.state.db,
+        &ws,
+        chunk_oid,
+        RevisionRequest {
+            op: RevisionOp::Patch,
+            source: ProvenanceSource::Human,
+            patch: doc! {},
+            reason: Some("audit-only no-op".to_string()),
+            actor: Some("transaction-test".to_string()),
+        },
+    )
+    .await
+    .expect("no-op revision should commit");
+    assert!(applied.unchanged);
+
+    let after = app
+        .state
+        .db
+        .raw()
+        .collection::<mongodb::bson::Document>("operation_knowledge_chunks")
+        .find_one(doc! { "_id": chunk_oid }, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after, before,
+        "audit-only no-op must not rewrite the main row"
+    );
+    let revision = app
+        .state
+        .db
+        .chunk_revisions()
+        .find_one(
+            doc! { "workspace_id": &ws, "revision_id": &applied.revision_id },
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("no-op audit revision");
+    assert_eq!(revision.before_snapshot, revision.after_snapshot);
+    assert_eq!(
+        app.state
+            .db
+            .catalog_rebuild_jobs()
+            .count_documents(doc! { "workspace_id": &ws }, None)
+            .await
+            .unwrap(),
+        0,
+        "audit-only no-op must not rebuild catalog content"
     );
 }

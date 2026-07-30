@@ -86,7 +86,7 @@ fn funnel_polarity_matches_category() {
 
 #[test]
 fn apply_category_semantics_sets_funnel_and_transaction_flags() {
-    // 漏斗型（销售）：funnel 开、交易事实开、grounding 不旁路、信任自报低风险。
+    // 漏斗型（销售）：funnel 开、交易事实开、grounding 不旁路、普通低风险可走 light Reviewer。
     let mut sales = default_domain_profile("ws-sales");
     apply_category_semantics(&mut sales, IdentityCategory::Sales);
     assert!(sales.operation_mode.funnel.enabled, "销售域 funnel 应开");
@@ -97,7 +97,7 @@ fn apply_category_semantics_sets_funnel_and_transaction_flags() {
     );
     assert!(
         !sales.distrust_self_reported_low_risk,
-        "销售域沿用既有 review 判定"
+        "销售域普通低风险可走 light Reviewer"
     );
 
     // 关系型（情感陪伴）：funnel 关、交易事实关、grounding 旁路、强制 LLM review。
@@ -114,7 +114,7 @@ fn apply_category_semantics_sets_funnel_and_transaction_flags() {
     );
     assert!(
         companion.distrust_self_reported_low_risk,
-        "高敏域强制走 LLM review"
+        "高敏域强制走 full Reviewer"
     );
 }
 

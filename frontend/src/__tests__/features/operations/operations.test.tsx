@@ -20,6 +20,8 @@ vi.mock("../../../lib/api", () => ({
 describe("OperationsFeature", () => {
   const mockLoadOperationsData = vi.fn();
   const mockCurrentAccountId = vi.fn();
+  const mockReviewTaskNow = vi.fn();
+  const mockCancelTask = vi.fn();
 
   beforeEach(() => {
     vi.clearAllMocks();
@@ -33,21 +35,32 @@ describe("OperationsFeature", () => {
     // Mock store implementations
     (useOperationsStore as any).mockReturnValue({
       events: [],
-      tasks: [{ id: "1", content: "测试任务", status: "pending" }],
+      tasks: [{ id: "1", accountId: "test-account-id", content: "测试任务", status: "pending" }],
       decisionReviews: [],
       llmUsage: {
+        asOf: "2026-07-20T00:00:00Z",
+        window: { kind: "retained_logs", start: null, end: "2026-07-20T00:00:00Z" },
         summary: {
           totalCalls: 0,
           totalTokens: 0,
           promptCacheHitTokens: 0,
           promptCacheMissTokens: 0,
           promptCacheHitRate: 0,
+          knownUsageCalls: 0,
+          unknownUsageCalls: 0,
+          usageComplete: true,
         },
+        itemsReturned: 0,
+        itemsLimit: 100,
+        itemsTruncated: false,
         items: [],
       },
       opsTab: "tasks",
+      dataAccountId: "test-account-id",
       setOpsTab: vi.fn(),
       loadOperationsData: mockLoadOperationsData,
+      reviewTaskNow: mockReviewTaskNow,
+      cancelTask: mockCancelTask,
     });
 
     // accountStore 既被 selector 形式订阅（effectiveAccountId 派生原始值），
@@ -89,8 +102,11 @@ describe("OperationsFeature", () => {
       decisionReviews: [],
       llmUsage: null,
       opsTab: "tasks",
+      dataAccountId: "test-account-id",
       setOpsTab: vi.fn(),
       loadOperationsData: mockLoadOperationsData,
+      reviewTaskNow: mockReviewTaskNow,
+      cancelTask: mockCancelTask,
     });
 
     render(<OperationsFeature />);
@@ -98,21 +114,27 @@ describe("OperationsFeature", () => {
     expect(screen.getByText("暂无跟进任务")).toBeInTheDocument();
   });
 
-  it("跟进任务行点击「取消」调用 cancel 端点", async () => {
+  it("跟进任务行点击「取消」把冻结任务实体交给 Store", async () => {
     render(<OperationsFeature />);
     const { fireEvent, waitFor } = await import("@testing-library/react");
     fireEvent.click(screen.getByText("取消"));
     await waitFor(() =>
-      expect(api.post).toHaveBeenCalledWith("/api/agent-tasks/1/cancel"),
+      expect(mockCancelTask).toHaveBeenCalledWith(
+        expect.objectContaining({ id: "1", accountId: "test-account-id" }),
+        "test-account-id",
+      ),
     );
   });
 
-  it("跟进任务行点击「立即复核」调用 review-now 端点", async () => {
+  it("跟进任务行点击「立即复核」把冻结任务实体交给 Store", async () => {
     render(<OperationsFeature />);
     const { fireEvent, waitFor } = await import("@testing-library/react");
     fireEvent.click(screen.getByText("立即复核"));
     await waitFor(() =>
-      expect(api.post).toHaveBeenCalledWith("/api/agent-tasks/1/review-now"),
+      expect(mockReviewTaskNow).toHaveBeenCalledWith(
+        expect.objectContaining({ id: "1", accountId: "test-account-id" }),
+        "test-account-id",
+      ),
     );
   });
   it("F15: loading 时显加载态而非空态", () => {
@@ -124,8 +146,11 @@ describe("OperationsFeature", () => {
       agentRuns: [],
       loading: true,
       opsTab: "tasks",
+      dataAccountId: "test-account-id",
       setOpsTab: vi.fn(),
       loadOperationsData: mockLoadOperationsData,
+      reviewTaskNow: mockReviewTaskNow,
+      cancelTask: mockCancelTask,
     });
 
     render(<OperationsFeature />);
@@ -151,8 +176,11 @@ describe("OperationsFeature", () => {
       llmUsage: null,
       agentRuns: [],
       opsTab: "events",
+      dataAccountId: "test-account-id",
       setOpsTab: vi.fn(),
       loadOperationsData: mockLoadOperationsData,
+      reviewTaskNow: mockReviewTaskNow,
+      cancelTask: mockCancelTask,
     });
 
     const { container } = render(<OperationsFeature />);
@@ -180,8 +208,11 @@ describe("OperationsFeature", () => {
       llmUsage: null,
       agentRuns: [],
       opsTab: "events",
+      dataAccountId: "test-account-id",
       setOpsTab: vi.fn(),
       loadOperationsData: mockLoadOperationsData,
+      reviewTaskNow: mockReviewTaskNow,
+      cancelTask: mockCancelTask,
     });
 
     render(<OperationsFeature />);
@@ -196,6 +227,9 @@ describe("operationsStore loading 生命周期(F15)", () => {
       "../../../stores/operationsStore",
     );
     const store = actual.useOperationsStore;
+    (useAccountStore as any).getState = () => ({
+      currentAccountId: () => "acc",
+    });
     // 受控 promise：让 5 个并行 api.get 的完成时机由测试掌控
     const resolvers: ((v: any) => void)[] = [];
     (api.get as any).mockImplementation(
@@ -244,8 +278,11 @@ describe("决策复盘 reviews tab 拦截四分支(C8)", () => {
       decisionReviews,
       llmUsage: null,
       opsTab: "reviews",
+      dataAccountId: "test-account-id",
       setOpsTab: vi.fn(),
       loadOperationsData: mockLoadOperationsData,
+      reviewTaskNow: vi.fn(),
+      cancelTask: vi.fn(),
     });
     const accountState = {
       accounts: [
@@ -335,9 +372,12 @@ describe("运行日志 runs tab + tier 遥测(C6+C9)", () => {
       llmUsage: null,
       agentRuns,
       opsTab: "runs",
+      dataAccountId: "test-account-id",
       setOpsTab: vi.fn(),
       loadOperationsData: mockLoadOperationsData,
       loadAgentRuns: vi.fn(),
+      reviewTaskNow: vi.fn(),
+      cancelTask: vi.fn(),
     });
     const accountState = {
       accounts: [

@@ -270,10 +270,11 @@ async fn three_rapid_inbounds_aggregate_into_single_gateway_run() {
             assert_eq!(i, 0, "只有首条 register 应 spawn，实际在 i={i}");
             let state = app.state.clone();
             let k = key.clone();
+            let workspace = contact.workspace_id.clone();
             let account = contact.account_id.clone();
             let from = wxid.to_string();
             spawn_handle = Some(tokio::spawn(async move {
-                run_debounce_pipeline(state, k, st, account, from, None).await;
+                run_debounce_pipeline(state, k, st, workspace, account, from, None).await;
             }));
         } else {
             assert_ne!(i, 0, "首条之外的 register 必须只 bump（spawned_now=false）");
@@ -344,10 +345,11 @@ async fn runner_uses_latest_inbound_snapshot_for_decision() {
     assert!(spawned_now, "首条 register 应 spawn runner");
     let state = app.state.clone();
     let k = key.clone();
+    let workspace = contact.workspace_id.clone();
     let account = contact.account_id.clone();
     let from = wxid.to_string();
     let handle = tokio::spawn(async move {
-        run_debounce_pipeline(state, k, st, account, from, None).await;
+        run_debounce_pipeline(state, k, st, workspace, account, from, None).await;
     });
 
     let (_st2, spawned_again) = register_inbound(key.clone(), latest.clone(), 50);
@@ -427,10 +429,11 @@ async fn late_inbound_bumps_generation_without_duplicate_spawn() {
 
     let state = app.state.clone();
     let k = key.clone();
+    let workspace = contact.workspace_id.clone();
     let account = contact.account_id.clone();
     let from = wxid.to_string();
     let handle = tokio::spawn(async move {
-        run_debounce_pipeline(state, k, st, account, from, None).await;
+        run_debounce_pipeline(state, k, st, workspace, account, from, None).await;
     });
 
     // 晚到入站：不重复 spawn，但 bump generation（保证不丢）。

@@ -77,9 +77,19 @@ pub(super) struct OperationKnowledgeChunkQuery {
     status: Option<String>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct OperationKnowledgeReviewQueueQuery {
+    dimension: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct OperationKnowledgeDocumentRequest {
+    /// Required by PUT as the optimistic-concurrency token. Create/import
+    /// requests may omit it; newly created documents always start at version 1.
+    #[serde(default)]
+    version: Option<i32>,
     account_id: Option<String>,
     #[serde(default = "default_user_operations_domain")]
     domain: String,
@@ -107,6 +117,51 @@ pub(super) struct OperationKnowledgeDocumentRequest {
     section_index: Vec<Document>,
     #[serde(default = "default_active_status")]
     status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(super) enum DocumentMetadataPatch<T> {
+    #[default]
+    Missing,
+    Null,
+    Value(T),
+}
+
+impl<'de, T> Deserialize<'de> for DocumentMetadataPatch<T>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(match Option::<T>::deserialize(deserializer)? {
+            Some(value) => Self::Value(value),
+            None => Self::Null,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct OperationKnowledgeDocumentPatchRequest {
+    version: i32,
+    #[serde(default)]
+    source_name: DocumentMetadataPatch<String>,
+    #[serde(default)]
+    title: DocumentMetadataPatch<String>,
+    #[serde(default)]
+    summary: DocumentMetadataPatch<String>,
+    #[serde(default)]
+    catalog_summary: DocumentMetadataPatch<String>,
+    #[serde(default)]
+    routing_map: DocumentMetadataPatch<Vec<String>>,
+    #[serde(default)]
+    risk_notes: DocumentMetadataPatch<Vec<String>>,
+    #[serde(default)]
+    product_tags: DocumentMetadataPatch<Vec<String>>,
+    #[serde(default)]
+    business_topics: DocumentMetadataPatch<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -391,6 +446,157 @@ pub(super) fn validate_operation_knowledge_chunk(
     Ok(())
 }
 
+/// Convert the public camelCase edit DTO into the storage-level patch accepted by
+/// `apply_chunk_revision`. Scope, lifecycle, review, provenance and lineage
+/// fields are deliberately absent: those are owned by the server and dedicated
+/// lifecycle endpoints.
+pub(super) fn normalize_editable_chunk_patch(value: &Value) -> AppResult<Document> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| AppError::BadRequest("patch must be a JSON object".to_string()))?;
+    let mut patch = Document::new();
+    for (public, incoming) in object {
+        let storage = match public.as_str() {
+            "title" => "title",
+            "summary" => "summary",
+            "body" => "body",
+            "knowledgeType" | "knowledge_type" => "knowledge_type",
+            "businessContext" | "business_context" => "business_context",
+            "applicableScenes" | "applicable_scenes" => "applicable_scenes",
+            "notApplicableScenes" | "not_applicable_scenes" => "not_applicable_scenes",
+            "productTags" | "product_tags" => "product_tags",
+            "businessTopics" | "business_topics" => "business_topics",
+            "sourceQuote" | "source_quote" => "source_quote",
+            "priority" => "priority",
+            other => {
+                return Err(AppError::BadRequest(format!(
+                    "chunk patch field is not editable: {other}"
+                )))
+            }
+        };
+        match storage {
+            "title" => {
+                let title = incoming.as_str().map(str::trim).filter(|s| !s.is_empty());
+                if title.is_none() {
+                    return Err(AppError::BadRequest(
+                        "chunk patch title must be a non-empty string".to_string(),
+                    ));
+                }
+            }
+            "summary" | "body" | "knowledge_type" | "business_context" | "source_quote" => {
+                if !incoming.is_null() && !incoming.is_string() {
+                    return Err(AppError::BadRequest(format!(
+                        "chunk patch field {public} must be a string or null"
+                    )));
+                }
+            }
+            "applicable_scenes" | "not_applicable_scenes" | "product_tags" | "business_topics" => {
+                let valid = incoming
+                    .as_array()
+                    .map(|items| items.iter().all(Value::is_string))
+                    .unwrap_or(false);
+                if !valid {
+                    return Err(AppError::BadRequest(format!(
+                        "chunk patch field {public} must be an array of strings"
+                    )));
+                }
+            }
+            "priority" => {
+                let priority = incoming
+                    .as_i64()
+                    .and_then(|value| i32::try_from(value).ok());
+                if priority.is_none() {
+                    return Err(AppError::BadRequest(
+                        "chunk patch priority must be a 32-bit integer".to_string(),
+                    ));
+                }
+            }
+            _ => unreachable!("editable field mapping is exhaustive"),
+        }
+        if patch.contains_key(storage) {
+            return Err(AppError::BadRequest(format!(
+                "chunk patch contains duplicate aliases for {storage}"
+            )));
+        }
+        let bson = if storage == "priority" {
+            Bson::Int32(
+                incoming
+                    .as_i64()
+                    .and_then(|value| i32::try_from(value).ok())
+                    .unwrap(),
+            )
+        } else {
+            mongodb::bson::to_bson(incoming)
+                .map_err(|e| AppError::BadRequest(format!("invalid patch value: {e}")))?
+        };
+        patch.insert(storage, bson);
+    }
+    if patch.is_empty() {
+        return Err(AppError::BadRequest(
+            "patch must contain at least one editable field".to_string(),
+        ));
+    }
+    Ok(patch)
+}
+
+/// Apply an externally supplied content edit through the production revision
+/// harness. Source anchors are derived by the server whenever the quote changes;
+/// callers cannot submit their own anchors or review state.
+pub(super) async fn apply_controlled_chunk_patch(
+    state: &AppState,
+    workspace_id: &str,
+    actor: &str,
+    chunk_id: ObjectId,
+    raw_patch: &Value,
+    source: crate::knowledge_wiki::chunk_revisions::ProvenanceSource,
+    reason: Option<String>,
+) -> AppResult<crate::knowledge_wiki::chunk_revisions::RevisionApplied> {
+    let mut patch = normalize_editable_chunk_patch(raw_patch)?;
+    if patch.contains_key("source_quote") {
+        let existing = state
+            .db
+            .operation_knowledge_chunks()
+            .find_one(doc! { "_id": chunk_id, "workspace_id": workspace_id }, None)
+            .await?
+            .ok_or_else(|| AppError::NotFound("operation knowledge chunk not found".to_string()))?;
+        let quote = patch.get_str("source_quote").unwrap_or_default();
+        let anchors = if let Some(document_id) = existing.document_id {
+            state
+                .db
+                .operation_knowledge_documents()
+                .find_one(
+                    doc! { "_id": document_id, "workspace_id": workspace_id },
+                    None,
+                )
+                .await?
+                .and_then(|document| document.raw_content)
+                .and_then(|raw| source_anchor_for_quote(&raw, Some(document_id), quote))
+                .map(|anchor| vec![anchor])
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        patch.insert(
+            "source_anchors",
+            mongodb::bson::to_bson(&anchors)
+                .map_err(|e| AppError::External(format!("serialize source anchors failed: {e}")))?,
+        );
+    }
+    crate::knowledge_wiki::chunk_revisions::apply_chunk_revision(
+        &state.db,
+        workspace_id,
+        chunk_id,
+        crate::knowledge_wiki::chunk_revisions::RevisionRequest {
+            op: crate::knowledge_wiki::chunk_revisions::RevisionOp::Patch,
+            source,
+            patch,
+            reason,
+            actor: Some(actor.to_string()),
+        },
+    )
+    .await
+}
+
 // operation_knowledge_from_request removed: OperationKnowledgeItem 已随 sales 旧库删除。
 
 pub(super) fn operation_knowledge_document_from_request(
@@ -455,6 +661,8 @@ pub(super) fn operation_knowledge_document_from_request(
         // knowledge-wiki Phase A: catalog 落库由 worker 异步填，写入侧默认 None。
         catalog_summary_persisted: None,
         catalog_version: None,
+        catalog_desired_generation: 0,
+        catalog_applied_generation: 0,
     }
 }
 
@@ -1296,6 +1504,75 @@ mod tests {
         assert!(msg.contains("source_anchors"));
     }
 
+    #[test]
+    fn editable_chunk_patch_maps_public_fields_and_rejects_managed_fields() {
+        let patch = normalize_editable_chunk_patch(&json!({
+            "summary": "new summary",
+            "productTags": ["product-a"],
+            "sourceQuote": "quoted source"
+        }))
+        .expect("editable patch");
+        assert_eq!(patch.get_str("summary").ok(), Some("new summary"));
+        assert!(patch.contains_key("product_tags"));
+        assert_eq!(patch.get_str("source_quote").ok(), Some("quoted source"));
+        assert!(!patch.contains_key("status"));
+
+        for managed in [
+            "workspaceId",
+            "accountId",
+            "documentId",
+            "status",
+            "integrityStatus",
+            "confidenceScore",
+            "provenance",
+            "sourceAnchors",
+            "previousVersionId",
+        ] {
+            let error = normalize_editable_chunk_patch(&json!({ managed: "forged" }))
+                .expect_err("managed field must be rejected");
+            assert!(
+                error.to_string().contains("not editable"),
+                "{managed}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn editable_chunk_patch_rejects_empty_and_duplicate_aliases() {
+        assert!(normalize_editable_chunk_patch(&json!({})).is_err());
+        let duplicate = normalize_editable_chunk_patch(&json!({
+            "businessTopics": ["a"],
+            "business_topics": ["b"]
+        }));
+        assert!(duplicate.is_err());
+    }
+
+    #[test]
+    fn editable_chunk_patch_rejects_wrong_value_shapes() {
+        for invalid in [
+            json!({ "title": { "forged": true } }),
+            json!({ "title": "   " }),
+            json!({ "summary": ["not", "text"] }),
+            json!({ "productTags": ["valid", 7] }),
+            json!({ "priority": 1.5 }),
+            json!({ "priority": i64::from(i32::MAX) + 1 }),
+        ] {
+            assert!(
+                normalize_editable_chunk_patch(&invalid).is_err(),
+                "invalid patch shape must be rejected: {invalid}"
+            );
+        }
+
+        let valid = normalize_editable_chunk_patch(&json!({
+            "summary": null,
+            "productTags": ["a", "b"],
+            "priority": 7
+        }))
+        .expect("valid nullable text, string array and i32 priority");
+        assert_eq!(valid.get_i32("priority").ok(), Some(7));
+        assert_eq!(valid.get("summary"), Some(&Bson::Null));
+    }
+
     /// F12-provenance：列表端点 `operation_knowledge_chunk_json` 必须把 chunk.provenance
     /// 下发给前端（camelCase），否则 ChunkInspectorPane（走列表端点）的来源区永远拿不到数据。
     /// 字段名对齐前端 ChunkProvenanceView（source/sourceDocId/sourceQuote/llmModelAlias/
@@ -1469,6 +1746,8 @@ mod tests {
             updated_at: DateTime::from_millis(1_700_000_100_000),
             catalog_summary_persisted: Some("持久化目录".to_string()),
             catalog_version: Some(3),
+            catalog_desired_generation: 3,
+            catalog_applied_generation: 3,
         };
         let projected = operation_knowledge_document_json(document);
         crate::routes::contract_snapshot::assert_contract_fixture(

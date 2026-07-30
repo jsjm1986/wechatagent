@@ -256,7 +256,8 @@ async fn normal_transition_uses_customer_stage_over_operation_state() {
         // customer_stage。这里复刻同一读法，打印 profile_id + 声明维度，定位真因。
         let active =
             wechatagent::agent::load_active_domain_profile(&app.state.db, &contact.workspace_id)
-                .await;
+                .await
+                .expect("load active domain profile");
         let declared: Vec<&str> = active
             .profile_dimensions
             .iter()

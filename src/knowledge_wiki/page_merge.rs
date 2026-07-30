@@ -252,6 +252,7 @@ pub fn apply_field_patch(
 const VOLATILE_FIELDS: &[&str] = &[
     "_id",
     "updated_at",
+    "provenance",
     "usage_stats",
     "dynamic_confidence",
     "integrity_score",
@@ -459,8 +460,18 @@ mod tests {
     fn hash_ignores_volatile_fields() {
         let now = mongodb::bson::DateTime::now();
         let later = mongodb::bson::DateTime::from_millis(now.timestamp_millis() + 86_400_000);
-        let a = doc! { "title": "T", "updated_at": now, "dynamic_confidence": 0.5 };
-        let b = doc! { "title": "T", "updated_at": later, "dynamic_confidence": 0.9 };
+        let a = doc! {
+            "title": "T",
+            "updated_at": now,
+            "dynamic_confidence": 0.5,
+            "provenance": { "source": "human", "edited_by": "a" },
+        };
+        let b = doc! {
+            "title": "T",
+            "updated_at": later,
+            "dynamic_confidence": 0.9,
+            "provenance": { "source": "ai", "edited_by": "b" },
+        };
         assert_eq!(compute_chunk_hash(&a), compute_chunk_hash(&b));
     }
 

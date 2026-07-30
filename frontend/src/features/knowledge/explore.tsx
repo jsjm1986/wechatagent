@@ -1,9 +1,14 @@
-import { useState, useEffect, useRef, useMemo, type FormEvent } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo, type FormEvent } from "react";
 import { ChevronDown, ChevronRight, Clock3, RefreshCw, Sparkles } from "lucide-react";
 import { parseApiError } from "../../lib/api";
 import { numberOr, stringOr, type TreeChunkItem } from "./shared";
 import { EmptyState } from "../../components/ui/EmptyState";
 import { wikiTypeLabel, statusLabel, integrityStatusLabel, relatedKindLabel } from "./labels";
+import {
+  CHUNKS_INVALIDATED_EVENT,
+  useCoalescedReload,
+  type ChunkInvalidationDetail,
+} from "./chunkInvalidation";
 
 interface AskSourceQuote {
   chunkId: string;
@@ -388,25 +393,59 @@ export function KnowledgeTreeView() {
   const [expandL1, setExpandL1] = useState<Set<string>>(new Set());
   const [expandL2, setExpandL2] = useState<Set<string>>(new Set()); // key = `${l1}|${l2}`
   const [showBody, setShowBody] = useState(false);
+  const requestGeneration = useRef(0);
 
-  async function load() {
+  const loadOnce = useCallback(async () => {
+    const generation = requestGeneration.current;
     setLoading(true);
     setError(null);
     try {
       const r = await fetch("/api/operation-knowledge/chunks");
       if (!r.ok) throw await parseApiError(r);
       const data = (await r.json()) as { items: TreeChunkItem[] };
-      setItems(data.items ?? []);
+      if (generation === requestGeneration.current) {
+        const next = data.items ?? [];
+        setItems(next);
+        setActiveId((current) =>
+          current && next.some((item) => item.id === current) ? current : null,
+        );
+      }
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e));
+      if (generation === requestGeneration.current) {
+        setItems([]);
+        setActiveId(null);
+        setError(e instanceof Error ? e.message : String(e));
+      }
     } finally {
-      setLoading(false);
+      if (generation === requestGeneration.current) setLoading(false);
     }
-  }
+  }, []);
+  const coalescedReload = useCoalescedReload(loadOnce);
+  const reload = useCallback(() => {
+    requestGeneration.current += 1;
+    setItems([]);
+    setActiveId(null);
+    setError(null);
+    return coalescedReload();
+  }, [coalescedReload]);
 
   useEffect(() => {
-    void load();
-  }, []);
+    void reload();
+  }, [reload]);
+
+  useEffect(() => {
+    const onInvalidated = (event: Event) => {
+      const detail = (event as CustomEvent<ChunkInvalidationDetail>).detail;
+      if (detail?.reason === "lagged") {
+        setInfo("\u5b9e\u65f6\u66f4\u65b0\u6709\u79ef\u538b\uff0c\u6b63\u5728\u91cd\u65b0\u540c\u6b65\u77e5\u8bc6\u6811\u2026");
+      }
+      void reload().finally(() => {
+        if (detail?.reason === "lagged") setInfo(null);
+      });
+    };
+    window.addEventListener(CHUNKS_INVALIDATED_EVENT, onInvalidated);
+    return () => window.removeEventListener(CHUNKS_INVALIDATED_EVENT, onInvalidated);
+  }, [reload]);
 
   const tree = useMemo(() => {
     // l1Key -> l2Key -> chunk[]
@@ -476,7 +515,7 @@ export function KnowledgeTreeView() {
   return (
     <div className="wikiPanelBody wikiTreeBody">
       <div className="wikiToolbar">
-        <button type="button" className="ghost" onClick={() => void load()} disabled={loading}>
+        <button type="button" className="ghost" onClick={() => void reload()} disabled={loading}>
           <RefreshCw size={14} />
           {loading ? "加载中…" : "刷新"}
         </button>

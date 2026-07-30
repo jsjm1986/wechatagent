@@ -80,7 +80,7 @@ fn silent_managed(wxid: &str) -> Contact {
 #[tokio::test]
 #[ignore]
 async fn planner_emits_follow_up_for_silent_managed_contacts_only() {
-    let app = common::TestApp::start().await;
+    let app = common::TestApp::start_repl_set().await;
     // 默认 silent_threshold = 72h；这里把 contact.last_inbound_at 设到 200h 前。
     let mut contacts = Vec::new();
     for idx in 0..5 {

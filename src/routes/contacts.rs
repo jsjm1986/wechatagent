@@ -7,10 +7,11 @@ use axum::{
 use futures::TryStreamExt;
 use mongodb::{
     bson::{doc, oid::ObjectId, to_bson, DateTime, Document, Regex},
-    options::{FindOneOptions, FindOptions},
+    options::FindOptions,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet};
 
 use crate::{
     agent,
@@ -26,9 +27,21 @@ use crate::{
 use super::shared::*;
 use super::AppState;
 
+fn required_expected_account_id(value: &str) -> AppResult<&str> {
+    let account_id = value.trim();
+    if account_id.is_empty() {
+        return Err(AppError::BadRequest(
+            "expectedAccountId is required".to_string(),
+        ));
+    }
+    Ok(account_id)
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OperationProfileRequest {
+    expected_account_id: String,
+    playbook_id: Option<String>,
     customer_stage: Option<String>,
     intent_level: Option<String>,
     /// §3.7 数字分身：关系类型（customer/peer/friend，走 system_taxonomies）。运营接入时
@@ -43,6 +56,7 @@ pub struct OperationProfileRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct OperatingMemoryRequest {
+    expected_account_id: String,
     // F-019：4 组各为 Option —— 缺组（None）时 PUT 不动该组，仅更新请求显式带上的组。
     // 前端 saveOperatingMemory 恒全量提交 4 组（userOpsStore.ts），行为不变；API 直调
     // 只传一组时不再把其余三组 $set 成空 Document 而清空（merge 而非整体覆盖）。
@@ -59,6 +73,7 @@ pub(super) struct OperatingMemoryRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AssistOverrideRequest {
+    expected_account_id: String,
     mode: String,
 }
 
@@ -79,7 +94,10 @@ pub(super) struct MemoryCandidateQuery {
 /// 全部字段可选：最小可用只需点一下"标记成效"，金额/币种/发生时间/备注按需回填。
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct DealEventRequest {
+pub struct DealEventRequest {
+    /// 前端打开成交表单时冻结的业务账号。联系人 ObjectId 与该账号必须同时匹配，
+    /// 防止切号后把旧联系人追加成效事件。
+    expected_account_id: String,
     /// 结果实际发生时间的毫秒时间戳（可选，缺省用服务端 now 作为 marked_at）。
     occurred_at_ms: Option<i64>,
     /// 成交金额，最小币种单位整数（分，19900=¥199.00）。前端 ×100 转分后传入。
@@ -136,6 +154,23 @@ pub(crate) fn preview_label_for_type(msg_type: Option<&str>, content: &str) -> S
         Some("system") => "[系统消息]".to_string(),
         Some(_) => "[消息]".to_string(),
     }
+}
+
+fn project_contact_for_dimension(contact: Contact, dimension: &str) -> ApiContact {
+    let mut api = ApiContact::from(contact);
+    api.apply_stagnation_dimension(dimension);
+    api
+}
+
+async fn project_contact(state: &AppState, contact: Contact) -> AppResult<ApiContact> {
+    let profile = agent::load_active_domain_profile(&state.db, &contact.workspace_id).await?;
+    Ok(project_contact_for_dimension(
+        contact,
+        profile
+            .stagnation_dimension
+            .as_deref()
+            .unwrap_or("customer_stage"),
+    ))
 }
 
 pub(super) async fn list_contacts(
@@ -198,15 +233,31 @@ pub(super) async fn list_contacts(
                 .collect(),
             _ => std::collections::HashMap::new(),
         };
-    let mut items = Vec::new();
+    let profile = agent::load_active_domain_profile(&state.db, &admin.current_workspace).await?;
+    let stagnation_dimension = profile
+        .stagnation_dimension
+        .as_deref()
+        .unwrap_or("customer_stage");
+    let mut contacts = Vec::new();
     while let Some(contact) = cursor.try_next().await? {
         // 双保险：即使 migration 已清，读时再过滤一次非真人（公众号 gh_/群
         // @chatroom），防历史残留或新 bug 漏写。复用 webhook 建档同源判据。
         if !crate::webhooks::is_operatable_person(&contact.wxid) {
             continue;
         }
+        contacts.push(contact);
+    }
+
+    // 一次聚合取本页每位联系人的最新入站，避免每行一次 find_one 的 N+1。
+    // 失败保持旧路径的 fail-soft 语义：列表仍返回，只是不展示预览。
+    let wxids = contacts.iter().map(|c| c.wxid.clone()).collect::<Vec<_>>();
+    let latest_inbound =
+        load_latest_inbound_previews(&state, &admin.current_workspace, &account_id, &wxids).await;
+
+    let mut items = Vec::with_capacity(contacts.len());
+    for contact in contacts {
         let wxid = contact.wxid.clone();
-        let mut api = ApiContact::from(contact);
+        let mut api = project_contact_for_dimension(contact, stagnation_dimension);
         // 读时兜底富化：仅补空字段，不覆盖已有 nickname/avatar（与建档 $set 语义一致）。
         if api.nickname.is_none() || api.avatar_url.is_none() {
             if let Some((roster_nick, roster_avatar)) = roster_identity.get(&wxid) {
@@ -218,33 +269,62 @@ pub(super) async fn list_contacts(
                 }
             }
         }
-        // 最近一条入站消息原文截断（待启用档展示，帮运营判断是否开 Agent）。
-        // direction 存储值为小写 "inbound"（MessageDirection serde rename_all="lowercase"）。
-        // 纯原文截断，非 LLM 摘要——normal 联系人不调 LLM。
-        if let Ok(Some(msg)) = state
-            .db
-            .messages()
-            .find_one(
-                doc! {
-                    "workspace_id": &admin.current_workspace,
-                    "account_id": &account_id,
-                    "contact_wxid": &wxid,
-                    "direction": "inbound",
-                },
-                FindOneOptions::builder()
-                    .sort(doc! { "created_at": -1 })
-                    .build(),
-            )
-            .await
-        {
-            api.last_inbound_preview = Some(preview_label_for_type(
-                msg.msg_type.as_deref(),
-                &msg.content,
-            ));
-        }
+        api.last_inbound_preview = latest_inbound.get(&wxid).cloned();
         items.push(api);
     }
     Ok(Json(json!({ "items": items })))
+}
+
+async fn load_latest_inbound_previews(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+    wxids: &[String],
+) -> HashMap<String, String> {
+    if wxids.is_empty() {
+        return HashMap::new();
+    }
+    let pipeline = latest_inbound_preview_pipeline(workspace_id, account_id, wxids);
+    let Ok(mut cursor) = state.db.messages().aggregate(pipeline, None).await else {
+        return HashMap::new();
+    };
+    let mut previews = HashMap::with_capacity(wxids.len());
+    loop {
+        match cursor.try_next().await {
+            Ok(Some(row)) => {
+                let Ok(wxid) = row.get_str("_id") else {
+                    continue;
+                };
+                let content = row.get_str("content").unwrap_or_default();
+                let msg_type = row.get_str("msg_type").ok();
+                previews.insert(wxid.to_string(), preview_label_for_type(msg_type, content));
+            }
+            Ok(None) => break,
+            Err(_) => return HashMap::new(),
+        }
+    }
+    previews
+}
+
+fn latest_inbound_preview_pipeline(
+    workspace_id: &str,
+    account_id: &str,
+    wxids: &[String],
+) -> Vec<Document> {
+    vec![
+        doc! { "$match": {
+            "workspace_id": workspace_id,
+            "account_id": account_id,
+            "contact_wxid": { "$in": wxids.to_vec() },
+            "direction": "inbound",
+        }},
+        doc! { "$sort": { "contact_wxid": 1, "created_at": -1, "_id": -1 } },
+        doc! { "$group": {
+            "_id": "$contact_wxid",
+            "content": { "$first": "$content" },
+            "msg_type": { "$first": "$msg_type" },
+        }},
+    ]
 }
 
 /// 计数端点的 filter 构造（抽纯函数便于单测口径正确性）。
@@ -318,6 +398,7 @@ pub(super) async fn search_contacts_endpoint(
     validate_account(&state, &admin.current_workspace, &account_id).await?;
     let result = mcp::logged_call_for_account(
         &state,
+        &admin.current_workspace,
         &account_id,
         "contacts_search",
         json!({
@@ -363,6 +444,7 @@ pub(super) async fn import_contacts_endpoint(
     {
         let result = mcp::logged_call_for_account(
             &state,
+            &admin.current_workspace,
             &account_id,
             "contacts_search",
             json!({ "query": query, "limit": 20 }),
@@ -378,6 +460,11 @@ pub(super) async fn import_contacts_endpoint(
             "either query or candidates is required".to_string(),
         ));
     };
+    let profile = agent::load_active_domain_profile(&state.db, &admin.current_workspace).await?;
+    let stagnation_dimension = profile
+        .stagnation_dimension
+        .as_deref()
+        .unwrap_or("customer_stage");
     let mut imported = Vec::new();
     for item in candidates {
         let contact_value = item.get("contact").unwrap_or(&item);
@@ -385,7 +472,7 @@ pub(super) async fn import_contacts_endpoint(
             upsert_contact_from_value(&state, &admin.current_workspace, &account_id, contact_value)
                 .await?
         {
-            imported.push(ApiContact::from(contact));
+            imported.push(project_contact_for_dimension(contact, stagnation_dimension));
         }
     }
     Ok(Json(json!({ "items": imported })))
@@ -408,6 +495,7 @@ pub(super) async fn search_import_contacts(
     validate_account(&state, &admin.current_workspace, &account_id).await?;
     let result = mcp::logged_call_for_account(
         &state,
+        &admin.current_workspace,
         &account_id,
         "contacts_search",
         json!({
@@ -421,6 +509,11 @@ pub(super) async fn search_import_contacts(
         .and_then(|value| value.as_array())
         .cloned()
         .unwrap_or_default();
+    let profile = agent::load_active_domain_profile(&state.db, &admin.current_workspace).await?;
+    let stagnation_dimension = profile
+        .stagnation_dimension
+        .as_deref()
+        .unwrap_or("customer_stage");
     let mut imported = Vec::new();
     for item in items {
         if let Some(contact_value) = item.get("contact") {
@@ -432,7 +525,7 @@ pub(super) async fn search_import_contacts(
             )
             .await?
             {
-                imported.push(ApiContact::from(contact));
+                imported.push(project_contact_for_dimension(contact, stagnation_dimension));
             }
         }
     }
@@ -449,7 +542,9 @@ pub(super) async fn get_contact(
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
     let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
-    Ok(Json(json!({ "item": ApiContact::from(contact) })))
+    Ok(Json(
+        json!({ "item": project_contact(&state, contact).await? }),
+    ))
 }
 
 /// `GET /api/contacts/:id/outcome-events`
@@ -773,7 +868,12 @@ async fn mark_initial_profile_task_sent(
                     "gateway_status": gateway_status,
                     "updated_at": DateTime::now(),
                 },
-                "$unset": { "claimed_at": "", "claim_token": "" }
+                "$unset": {
+                    "claimed_at": "",
+                    "claim_token": "",
+                    "active_task_key": "",
+                    "rerun_requested": "",
+                }
             },
             None,
         )
@@ -1002,8 +1102,421 @@ pub(crate) async fn reconcile_initial_profile_commit(
     } else {
         "stale_enrollment"
     };
-    let _ = crate::tasks::finalize_task_commit_if_owned(state, &claim, status).await?;
+    crate::models::assert_agent_task_status_valid("sent");
+    state
+        .db
+        .tasks()
+        .update_one(
+            claim.committing_filter(),
+            doc! {
+                "$set": {
+                    "status": "sent",
+                    "gateway_status": status,
+                    "updated_at": DateTime::now(),
+                },
+                "$unset": {
+                    "claim_token": "",
+                    "prepared_commit_kind": "",
+                    "prepared_commit": "",
+                    "active_task_key": "",
+                    "rerun_requested": "",
+                },
+            },
+            None,
+        )
+        .await?;
     Ok(())
+}
+
+const INITIAL_PROFILE_ACTIVE_KEY: &str = "initial_profile";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EnrollmentIntentResult {
+    ready: bool,
+    created: bool,
+}
+
+fn enrollment_intent_insert_policy(task: &Document) -> bool {
+    // Intents created before source binding were roster-origin and allowed Contact upsert.
+    task.get_bool("allow_contact_insert").unwrap_or(true)
+}
+
+fn is_duplicate_key_error(error: &mongodb::error::Error) -> bool {
+    use mongodb::error::{ErrorKind, WriteFailure};
+    match &*error.kind {
+        ErrorKind::Write(WriteFailure::WriteError(write_error)) => {
+            matches!(write_error.code, 11000 | 11001)
+        }
+        ErrorKind::BulkWrite(bulk) => bulk.write_errors.as_ref().is_some_and(|errors| {
+            errors
+                .iter()
+                .any(|error| matches!(error.code, 11000 | 11001))
+        }),
+        _ => false,
+    }
+}
+
+/// Resume the durable `initial_profile_enrollment` intent. The task is not claimable while
+/// this function is committing the Contact transition. A process crash can therefore only
+/// leave the task in `committing`, which the generic task reconciler scans before claiming work.
+pub(crate) async fn reconcile_initial_profile_enrollment(
+    state: &AppState,
+    task_id: ObjectId,
+) -> AppResult<bool> {
+    let tasks = state.db.tasks().clone_with_type::<Document>();
+    let Some(raw) = tasks
+        .find_one(
+            doc! {
+                "_id": task_id,
+                "kind": "initial_profile",
+                "status": "committing",
+                "prepared_commit_kind": "initial_profile_enrollment",
+            },
+            None,
+        )
+        .await?
+    else {
+        let Some(active) = tasks
+            .find_one(
+                doc! {
+                    "_id": task_id,
+                    "kind": "initial_profile",
+                    "status": { "$in": ["pending", "running", "retry"] },
+                    "active_task_key": INITIAL_PROFILE_ACTIVE_KEY,
+                },
+                None,
+            )
+            .await?
+        else {
+            return Ok(false);
+        };
+        let Ok(enrollment_token) = active.get_str("enrollment_token") else {
+            return Ok(false);
+        };
+        let workspace_id = active.get_str("workspace_id").unwrap_or_default();
+        let account_id = active.get_str("account_id").unwrap_or_default();
+        let contact_wxid = active.get_str("contact_wxid").unwrap_or_default();
+        let same_generation_is_managed = state
+            .db
+            .contacts()
+            .clone_with_type::<Document>()
+            .count_documents(
+                doc! {
+                    "workspace_id": workspace_id,
+                    "account_id": account_id,
+                    "wxid": contact_wxid,
+                    "agent_status": "managed",
+                    "enrollment_token": enrollment_token,
+                    "hidden_from_pool": { "$ne": true },
+                },
+                None,
+            )
+            .await?
+            == 1;
+        if same_generation_is_managed {
+            return Ok(true);
+        }
+
+        // The Contact generation has moved while this old task still owns the single-flight
+        // key. Retire it so a later request can create a fresh generation.
+        crate::models::assert_agent_task_status_valid("cancelled");
+        tasks
+            .update_one(
+                doc! {
+                    "_id": task_id,
+                    "status": { "$in": ["pending", "running", "retry"] },
+                    "active_task_key": INITIAL_PROFILE_ACTIVE_KEY,
+                    "enrollment_token": enrollment_token,
+                },
+                doc! {
+                    "$set": {
+                        "status": "cancelled",
+                        "gateway_status": "stale_enrollment_generation",
+                        "updated_at": DateTime::now(),
+                    },
+                    "$unset": {
+                        "claimed_at": "",
+                        "claim_token": "",
+                        "active_task_key": "",
+                        "rerun_requested": "",
+                    },
+                },
+                None,
+            )
+            .await?;
+        return Ok(false);
+    };
+    let prepared = raw.get_document("prepared_commit").map_err(|error| {
+        AppError::External(format!(
+            "initial-profile enrollment payload missing: {error}"
+        ))
+    })?;
+    let workspace_id = prepared.get_str("workspace_id").map_err(|error| {
+        AppError::External(format!(
+            "initial-profile enrollment workspace missing: {error}"
+        ))
+    })?;
+    let account_id = prepared.get_str("account_id").map_err(|error| {
+        AppError::External(format!(
+            "initial-profile enrollment account missing: {error}"
+        ))
+    })?;
+    let contact_wxid = prepared.get_str("contact_wxid").map_err(|error| {
+        AppError::External(format!(
+            "initial-profile enrollment contact missing: {error}"
+        ))
+    })?;
+    let enrollment_token = prepared.get_str("enrollment_token").map_err(|error| {
+        AppError::External(format!("initial-profile enrollment token missing: {error}"))
+    })?;
+    let contact_existed = prepared.get_bool("contact_existed").unwrap_or(false);
+    // Older durable intents predate this field and retain their original upsert semantics.
+    // Pool-origin intents always persist false and therefore can never recreate a stale row.
+    let allow_contact_insert = prepared.get_bool("allow_contact_insert").unwrap_or(true);
+    let contact_set = prepared
+        .get_document("contact_set")
+        .map_err(|error| {
+            AppError::External(format!("initial-profile contact patch missing: {error}"))
+        })?
+        .clone();
+
+    let mut contact_filter = doc! {
+        "workspace_id": workspace_id,
+        "account_id": account_id,
+        "wxid": contact_wxid,
+        "hidden_from_pool": { "$ne": true },
+        "agent_status": { "$ne": "managed" },
+    };
+    if let Ok(contact_id) = prepared.get_object_id("expected_contact_id") {
+        contact_filter.insert("_id", contact_id);
+    } else if !allow_contact_insert {
+        return Err(AppError::External(
+            "pool enrollment intent missing expected_contact_id".to_string(),
+        ));
+    }
+    if contact_existed {
+        let expected = prepared
+            .get_datetime("expected_contact_updated_at")
+            .map_err(|error| {
+                AppError::External(format!("initial-profile contact version missing: {error}"))
+            })?;
+        contact_filter.insert("updated_at", *expected);
+    }
+    let contact_update = match state
+        .db
+        .contacts()
+        .update_one(
+            contact_filter,
+            doc! {
+                "$set": contact_set,
+                "$setOnInsert": {
+                    "workspace_id": workspace_id,
+                    "account_id": account_id,
+                    "wxid": contact_wxid,
+                    "created_at": DateTime::now(),
+                },
+            },
+            mongodb::options::UpdateOptions::builder()
+                .upsert(allow_contact_insert && !contact_existed)
+                .build(),
+        )
+        .await
+    {
+        Ok(result) => Some(result),
+        // A concurrent contact insert can make an upsert lose the unique-key race.
+        // Treat it as an OCC miss and inspect whether this exact enrollment token won.
+        Err(error) if is_duplicate_key_error(&error) => None,
+        Err(error) => return Err(error.into()),
+    };
+
+    let committed = contact_update
+        .as_ref()
+        .is_some_and(|result| result.matched_count == 1 || result.upserted_id.is_some());
+    let already_committed = if committed {
+        true
+    } else {
+        state
+            .db
+            .contacts()
+            .clone_with_type::<Document>()
+            .count_documents(
+                doc! {
+                    "workspace_id": workspace_id,
+                    "account_id": account_id,
+                    "wxid": contact_wxid,
+                    "agent_status": "managed",
+                    "enrollment_token": enrollment_token,
+                    "hidden_from_pool": { "$ne": true },
+                },
+                None,
+            )
+            .await?
+            == 1
+    };
+
+    if !already_committed {
+        crate::models::assert_agent_task_status_valid("cancelled");
+        tasks
+            .update_one(
+                doc! {
+                    "_id": task_id,
+                    "status": "committing",
+                    "prepared_commit_kind": "initial_profile_enrollment",
+                },
+                doc! {
+                    "$set": {
+                        "status": "cancelled",
+                        "gateway_status": "stale_enrollment",
+                        "updated_at": DateTime::now(),
+                    },
+                    "$unset": {
+                        "active_task_key": "",
+                        "prepared_commit_kind": "",
+                        "prepared_commit": "",
+                    },
+                },
+                None,
+            )
+            .await?;
+        return Ok(false);
+    }
+
+    crate::models::assert_agent_task_status_valid("pending");
+    let released = tasks
+        .update_one(
+            doc! {
+                "_id": task_id,
+                "status": "committing",
+                "prepared_commit_kind": "initial_profile_enrollment",
+                "enrollment_token": enrollment_token,
+            },
+            doc! {
+                "$set": {
+                    "status": "pending",
+                    "gateway_status": "enrollment_committed",
+                    "updated_at": DateTime::now(),
+                },
+                "$unset": {
+                    "prepared_commit_kind": "",
+                    "prepared_commit": "",
+                },
+            },
+            None,
+        )
+        .await?;
+    Ok(released.matched_count == 1
+        || tasks
+            .count_documents(
+                doc! {
+                    "_id": task_id,
+                    "status": { "$in": ["pending", "running", "retry"] },
+                    "enrollment_token": enrollment_token,
+                },
+                None,
+            )
+            .await?
+            == 1)
+}
+
+async fn create_initial_profile_enrollment_intent(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+    contact_wxid: &str,
+    note: &str,
+    existing: Option<&Contact>,
+    mut contact_set: Document,
+    allow_contact_insert: bool,
+) -> AppResult<EnrollmentIntentResult> {
+    let now = DateTime::now();
+    let task_id = ObjectId::new();
+    let enrollment_token = uuid::Uuid::new_v4().to_string();
+    contact_set.insert("enrollment_token", &enrollment_token);
+    let mut prepared = doc! {
+        "workspace_id": workspace_id,
+        "account_id": account_id,
+        "contact_wxid": contact_wxid,
+        "enrollment_token": &enrollment_token,
+        "contact_existed": existing.is_some(),
+        "allow_contact_insert": allow_contact_insert,
+        "contact_set": contact_set,
+    };
+    if let Some(contact) = existing {
+        prepared.insert("expected_contact_updated_at", contact.updated_at);
+        if let Some(contact_id) = contact.id {
+            prepared.insert("expected_contact_id", contact_id);
+        }
+    } else if !allow_contact_insert {
+        return Err(AppError::Conflict(
+            "pool_contact_account_conflict".to_string(),
+        ));
+    }
+    let task = crate::models::AgentTask {
+        id: Some(task_id),
+        workspace_id: workspace_id.to_string(),
+        account_id: account_id.to_string(),
+        contact_wxid: contact_wxid.to_string(),
+        kind: "initial_profile".to_string(),
+        run_at: now,
+        expires_at: None,
+        content: note.to_string(),
+        status: "committing".to_string(),
+        source_decision_id: None,
+        review_required: false,
+        attempt_count: 0,
+        max_attempts: 3,
+        next_retry_at: None,
+        gateway_status: Some("enrollment_committing".to_string()),
+        cancel_reason: None,
+        error: None,
+        claimed_at: None,
+        claim_recovery_count: 0,
+        created_at: now,
+        updated_at: now,
+    };
+    crate::models::assert_agent_task_status_valid(&task.status);
+    let mut task_doc = mongodb::bson::to_document(&task)?;
+    task_doc.insert("active_task_key", INITIAL_PROFILE_ACTIVE_KEY);
+    task_doc.insert("enrollment_token", &enrollment_token);
+    task_doc.insert("allow_contact_insert", allow_contact_insert);
+    task_doc.insert("prepared_commit_kind", "initial_profile_enrollment");
+    task_doc.insert("prepared_commit", prepared);
+    let tasks = state.db.tasks().clone_with_type::<Document>();
+    let created = match tasks.insert_one(task_doc, None).await {
+        Ok(_) => true,
+        Err(error) if is_duplicate_key_error(&error) => false,
+        Err(error) => return Err(error.into()),
+    };
+    let effective_task_id = if created {
+        task_id
+    } else {
+        let active = tasks
+            .find_one(
+                doc! {
+                    "workspace_id": workspace_id,
+                    "account_id": account_id,
+                    "contact_wxid": contact_wxid,
+                    "active_task_key": INITIAL_PROFILE_ACTIVE_KEY,
+                },
+                None,
+            )
+            .await?
+            .ok_or_else(|| {
+                AppError::Conflict("initial_profile_intent_identity_lost".to_string())
+            })?;
+        if enrollment_intent_insert_policy(&active) != allow_contact_insert {
+            return Err(AppError::Conflict(
+                "initial_profile_intent_source_conflict".to_string(),
+            ));
+        }
+        active
+            .get_object_id("_id")
+            .map_err(|_| AppError::Conflict("initial_profile_intent_identity_lost".to_string()))?
+    };
+    Ok(EnrollmentIntentResult {
+        ready: reconcile_initial_profile_enrollment(state, effective_task_id).await?,
+        created,
+    })
 }
 
 pub async fn batch_enable_endpoint(
@@ -1017,6 +1530,15 @@ pub async fn batch_enable_endpoint(
     if payload.candidates.is_empty() {
         return Err(AppError::BadRequest("candidates is empty".to_string()));
     }
+    let pool_source = match payload.source.as_str() {
+        "pool" => true,
+        "roster" => false,
+        _ => {
+            return Err(AppError::BadRequest(
+                "source must be pool|roster".to_string(),
+            ))
+        }
+    };
     // account 必须在 wechat_accounts 注册(否则 webhook 入站会被 resolve_account_context 拒收)。
     // 保留 account 对象取 wxid：候选命中账号自身 wxid 时要拦（账号不能运营自己）。
     let account = state
@@ -1034,6 +1556,73 @@ pub async fn batch_enable_endpoint(
             ))
         })?;
     let account_self_wxid = account.wxid.clone();
+
+    // 运营池批量启用只能消费当前账号快照中的既有待启用联系人。整批校验必须在
+    // playbook 解析、Contact/Task/Audit 写入之前完成；任一候选不匹配则整批零写。
+    // contactId + wxid 双重冻结，避免 A 账号旧快照在切到 B 后被解释成 B 的候选。
+    let mut pool_contacts: HashMap<String, Contact> = HashMap::new();
+    if pool_source {
+        let mut contact_ids = Vec::with_capacity(payload.candidates.len());
+        let mut seen_contact_ids = HashSet::with_capacity(payload.candidates.len());
+        for candidate in &payload.candidates {
+            let contact_id = candidate.contact_id.as_deref().ok_or_else(|| {
+                AppError::BadRequest("pool candidate contactId is required".to_string())
+            })?;
+            let object_id = parse_object_id(contact_id)?;
+            if !seen_contact_ids.insert(object_id) {
+                return Err(AppError::BadRequest(
+                    "pool candidates contain duplicate contactId".to_string(),
+                ));
+            }
+            contact_ids.push(object_id);
+        }
+
+        let contacts: Vec<Contact> = state
+            .db
+            .contacts()
+            .find(
+                doc! {
+                    "_id": { "$in": contact_ids },
+                    "workspace_id": &admin.current_workspace,
+                    "account_id": &payload.account_id,
+                    "agent_status": "normal",
+                    "hidden_from_pool": { "$ne": true },
+                },
+                None,
+            )
+            .await?
+            .try_collect()
+            .await?;
+        if contacts.len() != payload.candidates.len() {
+            return Err(AppError::Conflict(
+                "pool_contact_account_conflict".to_string(),
+            ));
+        }
+        pool_contacts.clear();
+        for contact in contacts {
+            let contact_id = contact
+                .id
+                .ok_or_else(|| AppError::Conflict("pool_contact_identity_missing".to_string()))?
+                .to_hex();
+            pool_contacts.insert(contact_id, contact);
+        }
+        for candidate in &payload.candidates {
+            let contact_id = candidate
+                .contact_id
+                .as_deref()
+                .expect("validated contactId");
+            let Some(contact) = pool_contacts.get(contact_id) else {
+                return Err(AppError::Conflict(
+                    "pool_contact_account_conflict".to_string(),
+                ));
+            };
+            if contact.wxid != candidate.wxid {
+                return Err(AppError::Conflict(
+                    "pool_contact_account_conflict".to_string(),
+                ));
+            }
+        }
+    }
     // 可选统一 playbook：校验存在(用 enable 的解析器,None 则账号默认)。
     let playbook = resolve_playbook_for_contact(
         &state,
@@ -1058,12 +1647,31 @@ pub async fn batch_enable_endpoint(
     let mut enabled = 0i32;
     let mut queued = 0i32;
     let mut rejected_self = 0i32;
+    let mut rejected_non_human = 0i32;
     for cand in &payload.candidates {
+        // The server is the authority for operability. Never trust roster UI
+        // classification or a caller-supplied boolean.
+        if !crate::webhooks::is_operatable_person(&cand.wxid) {
+            rejected_non_human += 1;
+            let _ = agent::write_event_for_account(
+                &state,
+                &admin.current_workspace,
+                &payload.account_id,
+                Some(&cand.wxid),
+                "contact.enable_rejected_non_human",
+                "rejected",
+                "候选为系统账号、群或公众号，已拒绝纳入 AI 运营",
+                Some(doc! { "actor": &admin.username, "source": "batch_enable" }),
+            )
+            .await;
+            continue;
+        }
         // 账号不能运营自己：候选命中账号自身 wxid → 跳过并留审计。
         if crate::webhooks::is_self_account(&cand.wxid, account_self_wxid.as_deref()) {
             rejected_self += 1;
             let _ = agent::write_event_for_account(
                 &state,
+                &admin.current_workspace,
                 &payload.account_id,
                 Some(&cand.wxid),
                 "contact.enable_rejected_self",
@@ -1075,51 +1683,55 @@ pub async fn batch_enable_endpoint(
             continue;
         }
         // 幂等:已 managed 的不重复入队(但仍刷新 note/avatar)。
-        let existing = state
-            .db
-            .contacts()
-            .find_one(
-                doc! {
-                    "workspace_id": &admin.current_workspace,
-                    "account_id": &payload.account_id,
-                    "wxid": &cand.wxid,
-                },
-                None,
+        let existing = if pool_source {
+            Some(
+                pool_contacts
+                    .get(cand.contact_id.as_deref().expect("validated contactId"))
+                    .expect("validated pool contact")
+                    .clone(),
             )
-            .await?;
+        } else {
+            state
+                .db
+                .contacts()
+                .find_one(
+                    doc! {
+                        "workspace_id": &admin.current_workspace,
+                        "account_id": &payload.account_id,
+                        "wxid": &cand.wxid,
+                    },
+                    None,
+                )
+                .await?
+        };
         let already_managed = existing
             .as_ref()
             .map(|c| matches!(c.agent_status, crate::models::AgentStatus::Managed))
             .unwrap_or(false);
-        let enrollment_token = (!already_managed).then(|| uuid::Uuid::new_v4().to_string());
-
-        // upsert 联系人:置 managed + sharedNote + playbook。
+        // Build the complete Contact transition. New enrollments commit this patch through a
+        // durable, non-claimable task intent; already-managed contacts only refresh metadata.
         // nickname/remark/avatar_url 只在候选真的带值时才写——MCP 好友列表常缺 remark，
         // 若无条件 $set None 会把已入库联系人已有的备注/头像覆盖成 null（重入运营即丢数据）。
         let mut set_doc = doc! {
-            "workspace_id": &admin.current_workspace,
-            "account_id": &payload.account_id,
-            "wxid": &cand.wxid,
             "agent_status": "managed",
             "human_profile_note": &payload.shared_note,
             "playbook_id": playbook.id,
             "playbook_version": playbook.version,
             "updated_at": DateTime::now(),
         };
-        if let Some(token) = enrollment_token.as_deref() {
-            set_doc.insert("enrollment_token", token);
-        }
-        if let Some(nickname) = &cand.nickname {
-            set_doc.insert("nickname", nickname);
-        }
-        if let Some(remark) = &cand.remark {
-            set_doc.insert("remark", remark);
-        }
-        if let Some(avatar_url) = &cand.avatar_url {
-            set_doc.insert("avatar_url", avatar_url);
-        }
-        if let Some(sex) = cand.sex {
-            set_doc.insert("sex", sex);
+        if !pool_source {
+            if let Some(nickname) = &cand.nickname {
+                set_doc.insert("nickname", nickname);
+            }
+            if let Some(remark) = &cand.remark {
+                set_doc.insert("remark", remark);
+            }
+            if let Some(avatar_url) = &cand.avatar_url {
+                set_doc.insert("avatar_url", avatar_url);
+            }
+            if let Some(sex) = cand.sex {
+                set_doc.insert("sex", sex);
+            }
         }
         // 全新联系人（未入库，或已入库但从未被 Agent 运营过）同步落状态机 initial 态。
         // 老客户（is_previously_operated）不碰 operation_state——保留其已积累的运营历史，
@@ -1137,71 +1749,101 @@ pub async fn batch_enable_endpoint(
             set_doc.insert("operation_state_confidence", 6);
             set_doc.insert("operation_state_updated_at", DateTime::now());
         }
-        state
-            .db
-            .contacts()
-            .update_one(
-                doc! {
-                    "workspace_id": &admin.current_workspace,
-                    "account_id": &payload.account_id,
-                    "wxid": &cand.wxid,
-                },
-                doc! {
-                    "$set": set_doc,
-                    "$setOnInsert": { "created_at": DateTime::now() },
-                },
-                mongodb::options::UpdateOptions::builder()
-                    .upsert(true)
-                    .build(),
-            )
-            .await?;
-        enabled += 1;
-
-        if !already_managed {
-            // 入队异步初始画像任务。
-            let task = crate::models::AgentTask {
-                id: None,
-                workspace_id: admin.current_workspace.clone(),
-                account_id: payload.account_id.clone(),
-                contact_wxid: cand.wxid.clone(),
-                kind: "initial_profile".to_string(),
-                run_at: DateTime::now(),
-                expires_at: None,
-                content: payload.shared_note.clone(),
-                status: "pending".to_string(),
-                source_decision_id: None,
-                review_required: false,
-                attempt_count: 0,
-                max_attempts: 3,
-                next_retry_at: None,
-                gateway_status: None,
-                cancel_reason: None,
-                error: None,
-                claimed_at: None,
-                claim_recovery_count: 0,
-                created_at: DateTime::now(),
-                updated_at: DateTime::now(),
-            };
-            let mut task_doc = mongodb::bson::to_document(&task)?;
-            task_doc.insert(
-                "enrollment_token",
-                enrollment_token
-                    .as_deref()
-                    .expect("new enrollment has token"),
-            );
+        let newly_enrolled = if already_managed {
             state
                 .db
-                .tasks()
-                .clone_with_type::<Document>()
-                .insert_one(task_doc, None)
+                .contacts()
+                .update_one(
+                    doc! {
+                        "workspace_id": &admin.current_workspace,
+                        "account_id": &payload.account_id,
+                        "wxid": &cand.wxid,
+                        "agent_status": "managed",
+                    },
+                    doc! { "$set": set_doc },
+                    None,
+                )
                 .await?;
-            queued += 1;
-        }
+            false
+        } else {
+            let mut intent = create_initial_profile_enrollment_intent(
+                &state,
+                &admin.current_workspace,
+                &payload.account_id,
+                &cand.wxid,
+                &payload.shared_note,
+                existing.as_ref(),
+                set_doc,
+                !pool_source,
+            )
+            .await?;
+            // A disable/hide may have rotated the Contact generation just before this request,
+            // while the old initial-profile task still held the single-flight key. The first
+            // call retires that stale owner; retry once so this same request can create the new
+            // generation instead of reporting a misleading no-op.
+            if !intent.ready && !intent.created {
+                let mut retry_set = doc! {
+                    "agent_status": "managed",
+                    "human_profile_note": &payload.shared_note,
+                    "playbook_id": playbook.id,
+                    "playbook_version": playbook.version,
+                    "updated_at": DateTime::now(),
+                };
+                if !pool_source {
+                    if let Some(nickname) = &cand.nickname {
+                        retry_set.insert("nickname", nickname);
+                    }
+                    if let Some(remark) = &cand.remark {
+                        retry_set.insert("remark", remark);
+                    }
+                    if let Some(avatar_url) = &cand.avatar_url {
+                        retry_set.insert("avatar_url", avatar_url);
+                    }
+                    if let Some(sex) = cand.sex {
+                        retry_set.insert("sex", sex);
+                    }
+                }
+                if is_new_contact {
+                    retry_set.insert("operation_state", &initial_state);
+                    retry_set.insert(
+                        "operation_state_reason",
+                        "初次纳入 Agent 运营，等待后续互动确认阶段",
+                    );
+                    retry_set.insert("operation_state_confidence", 6);
+                    retry_set.insert("operation_state_updated_at", DateTime::now());
+                }
+                intent = create_initial_profile_enrollment_intent(
+                    &state,
+                    &admin.current_workspace,
+                    &payload.account_id,
+                    &cand.wxid,
+                    &payload.shared_note,
+                    existing.as_ref(),
+                    retry_set,
+                    !pool_source,
+                )
+                .await?;
+            }
+            if !intent.ready {
+                if pool_source {
+                    return Err(AppError::Conflict(
+                        "pool_contact_version_conflict".to_string(),
+                    ));
+                }
+                continue;
+            }
+            if intent.created {
+                queued += 1;
+            }
+            true
+        };
+        enabled += 1;
 
         // 仅对本轮真正新纳入的写加入审计，避免幂等重入刷屏。
-        if !already_managed {
+        if newly_enrolled {
             let _ = agent::write_event_for_account(
                 &state,
+                &admin.current_workspace,
                 &payload.account_id,
                 Some(&cand.wxid),
                 "contact.enabled_for_ops",
@@ -1216,9 +1858,19 @@ pub async fn batch_enable_endpoint(
             .await;
         }
     }
-    Ok(Json(
-        json!({ "enabled": enabled, "queued": queued, "rejectedSelf": rejected_self }),
-    ))
+    Ok(Json(json!({
+        "enabled": enabled,
+        "queued": queued,
+        "rejectedSelf": rejected_self,
+        "rejectedNonHuman": rejected_non_human,
+    })))
+}
+
+fn wechat_account_scope_filter(workspace_id: &str, account_id: &str) -> Document {
+    doc! {
+        "workspace_id": workspace_id,
+        "account_id": account_id,
+    }
 }
 
 pub(super) async fn enable_agent(
@@ -1227,19 +1879,30 @@ pub(super) async fn enable_agent(
     Path(id): Path<String>,
     Json(payload): Json<EnableAgentRequest>,
 ) -> AppResult<Json<Value>> {
+    let expected_account_id = required_expected_account_id(&payload.expected_account_id)?;
     if payload.human_profile_note.trim().is_empty() {
         return Err(AppError::BadRequest(
             "humanProfileNote is required".to_string(),
         ));
     }
-    let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
+    let contact =
+        find_contact_by_id_for_account(&state, &admin.current_workspace, expected_account_id, &id)
+            .await?;
+    if !crate::webhooks::is_operatable_person(&contact.wxid) {
+        return Err(AppError::BadRequest(
+            "系统账号、群或公众号不能启用 Agent 运营".to_string(),
+        ));
+    }
     // P1：先校验 contact.account_id 在 wechat_accounts 注册过。否则即使写 managed
     // 进去，webhook 入站时 resolve_account_context 也会因为 appId 匹配不到这个
     // account 直接 400 拒收，AI 永远不会回复。
     let account = state
         .db
         .accounts()
-        .find_one(doc! { "account_id": &contact.account_id }, None)
+        .find_one(
+            wechat_account_scope_filter(&contact.workspace_id, &contact.account_id),
+            None,
+        )
         .await?
         .ok_or_else(|| {
             AppError::BadRequest(format!(
@@ -1251,6 +1914,7 @@ pub(super) async fn enable_agent(
     if crate::webhooks::is_self_account(&contact.wxid, account.wxid.as_deref()) {
         let _ = agent::write_event_for_account(
             &state,
+            &contact.workspace_id,
             &contact.account_id,
             Some(&contact.wxid),
             "contact.enable_rejected_self",
@@ -1276,7 +1940,11 @@ pub(super) async fn enable_agent(
         .contacts()
         .clone_with_type::<Document>()
         .update_one(
-            doc! { "_id": contact.id, "workspace_id": &admin.current_workspace },
+            doc! {
+                "_id": contact.id,
+                "workspace_id": &admin.current_workspace,
+                "account_id": expected_account_id,
+            },
             doc! { "$set": {
                 "enrollment_token": &enrollment_token,
                 "updated_at": DateTime::now(),
@@ -1311,6 +1979,7 @@ pub(super) async fn enable_agent(
     }
     let _ = agent::write_event_for_account(
         &state,
+        &contact.workspace_id,
         &contact.account_id,
         Some(&contact.wxid),
         "contact.enabled_for_ops",
@@ -1324,7 +1993,9 @@ pub(super) async fn enable_agent(
     )
     .await;
     let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
-    Ok(Json(json!({ "item": ApiContact::from(contact) })))
+    Ok(Json(
+        json!({ "item": project_contact(&state, contact).await? }),
+    ))
 }
 
 pub(super) async fn disable_agent(
@@ -1350,8 +2021,10 @@ pub(super) async fn disable_agent(
         )
         .await?;
     let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
+    cancel_active_initial_profile_tasks(&state, &contact, "contact_disabled").await?;
     let _ = agent::write_event_for_account(
         &state,
+        &contact.workspace_id,
         &contact.account_id,
         Some(&contact.wxid),
         "contact.removed_from_ops",
@@ -1360,7 +2033,9 @@ pub(super) async fn disable_agent(
         Some(doc! { "actor": &admin.username, "source": "disable_agent" }),
     )
     .await;
-    Ok(Json(json!({ "item": ApiContact::from(contact) })))
+    Ok(Json(
+        json!({ "item": project_contact(&state, contact).await? }),
+    ))
 }
 
 /// `POST /api/contacts/:id/hide-from-pool`
@@ -1396,8 +2071,10 @@ pub(super) async fn hide_from_pool(
         return Err(AppError::NotFound("contact not found".to_string()));
     }
     let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
+    cancel_active_initial_profile_tasks(&state, &contact, "contact_hidden").await?;
     let _ = agent::write_event_for_account(
         &state,
+        &contact.workspace_id,
         &contact.account_id,
         Some(&contact.wxid),
         "contact.removed_from_ops",
@@ -1406,7 +2083,53 @@ pub(super) async fn hide_from_pool(
         Some(doc! { "actor": &admin.username, "source": "hide_from_pool" }),
     )
     .await;
-    Ok(Json(json!({ "item": ApiContact::from(contact) })))
+    Ok(Json(
+        json!({ "item": project_contact(&state, contact).await? }),
+    ))
+}
+
+/// Revoke every initial-profile generation that still owns the per-contact single-flight key.
+/// The caller rotates the Contact enrollment token first, so a worker that already copied a
+/// prepared payload cannot commit after this cancellation even if its final task CAS loses.
+async fn cancel_active_initial_profile_tasks(
+    state: &AppState,
+    contact: &Contact,
+    reason: &str,
+) -> AppResult<u64> {
+    crate::models::assert_agent_task_status_valid("cancelled");
+    let result = state
+        .db
+        .tasks()
+        .clone_with_type::<Document>()
+        .update_many(
+            doc! {
+                "workspace_id": &contact.workspace_id,
+                "account_id": &contact.account_id,
+                "contact_wxid": &contact.wxid,
+                "kind": "initial_profile",
+                "active_task_key": INITIAL_PROFILE_ACTIVE_KEY,
+                "status": { "$in": ["pending", "running", "retry", "failed", "committing"] },
+            },
+            doc! {
+                "$set": {
+                    "status": "cancelled",
+                    "gateway_status": reason,
+                    "cancel_reason": reason,
+                    "updated_at": DateTime::now(),
+                },
+                "$unset": {
+                    "active_task_key": "",
+                    "rerun_requested": "",
+                    "claimed_at": "",
+                    "claim_token": "",
+                    "prepared_commit_kind": "",
+                    "prepared_commit": "",
+                },
+            },
+            None,
+        )
+        .await?;
+    Ok(result.modified_count)
 }
 
 /// `POST /api/contacts/:id/revoke-principal-exemption`
@@ -1439,6 +2162,7 @@ pub(super) async fn revoke_principal_exemption(
     let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
     let _ = agent::write_event_for_account(
         &state,
+        &contact.workspace_id,
         &contact.account_id,
         Some(&contact.wxid),
         "contact.principal_exemption_revoked",
@@ -1447,7 +2171,9 @@ pub(super) async fn revoke_principal_exemption(
         Some(doc! { "actor": &admin.username, "source": "revoke_principal_exemption" }),
     )
     .await;
-    Ok(Json(json!({ "item": ApiContact::from(contact) })))
+    Ok(Json(
+        json!({ "item": project_contact(&state, contact).await? }),
+    ))
 }
 
 pub(super) async fn update_profile_note(
@@ -1457,7 +2183,10 @@ pub(super) async fn update_profile_note(
     Json(payload): Json<ProfileNoteRequest>,
 ) -> AppResult<Json<Value>> {
     let object_id = parse_object_id(&id)?;
-    let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
+    let expected_account_id = required_expected_account_id(&payload.expected_account_id)?;
+    let contact =
+        find_contact_by_id_for_account(&state, &admin.current_workspace, expected_account_id, &id)
+            .await?;
     let playbook = agent::load_operation_playbook_for_contact(&state, &contact).await?;
     let generated = agent::build_initial_operation_profile(
         &state,
@@ -1515,17 +2244,28 @@ pub(super) async fn update_profile_note(
     if !unset_doc.is_empty() {
         update_doc.insert("$unset", unset_doc);
     }
-    state
+    let result = state
         .db
         .contacts()
         .update_one(
-            doc! { "_id": object_id, "workspace_id": &admin.current_workspace },
+            doc! {
+                "_id": object_id,
+                "workspace_id": &admin.current_workspace,
+                "account_id": expected_account_id,
+            },
             update_doc,
             None,
         )
         .await?;
-    let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
-    Ok(Json(json!({ "item": ApiContact::from(contact) })))
+    if result.matched_count == 0 {
+        return Err(AppError::Conflict("contact_account_conflict".to_string()));
+    }
+    let contact =
+        find_contact_by_id_for_account(&state, &admin.current_workspace, expected_account_id, &id)
+            .await?;
+    Ok(Json(
+        json!({ "item": project_contact(&state, contact).await? }),
+    ))
 }
 
 /// 客户级辅助模式 override 闭集校验（缺口 2）。三态：default（回落账号级）/
@@ -1588,8 +2328,9 @@ pub async fn update_assist_override(
         ));
     }
     let object_id = parse_object_id(&id)?;
-    // workspace 隔离：跨 workspace / 不存在均 404（不泄漏存在性）。
-    find_contact_by_id(&state, &admin.current_workspace, &id).await?;
+    let expected_account_id = required_expected_account_id(&payload.expected_account_id)?;
+    find_contact_by_id_for_account(&state, &admin.current_workspace, expected_account_id, &id)
+        .await?;
     let attr = format!(
         "domain_attributes.{}",
         crate::models::ASSIST_MODE_OVERRIDE_ATTR
@@ -1600,15 +2341,22 @@ pub async fn update_assist_override(
     } else {
         doc! { "$set": { &attr: &payload.mode, "updated_at": now } }
     };
-    state
+    let result = state
         .db
         .contacts()
         .update_one(
-            doc! { "_id": object_id, "workspace_id": &admin.current_workspace },
+            doc! {
+                "_id": object_id,
+                "workspace_id": &admin.current_workspace,
+                "account_id": expected_account_id,
+            },
             update,
             None,
         )
         .await?;
+    if result.matched_count == 0 {
+        return Err(AppError::Conflict("contact_account_conflict".to_string()));
+    }
     Ok(Json(json!({ "ok": true, "mode": payload.mode })))
 }
 
@@ -1627,6 +2375,9 @@ pub(super) async fn update_custom_agent_instructions(
     Json(payload): Json<CustomAgentInstructionsRequest>,
 ) -> AppResult<Json<Value>> {
     let object_id = parse_object_id(&id)?;
+    let expected_account_id = required_expected_account_id(&payload.expected_account_id)?;
+    find_contact_by_id_for_account(&state, &admin.current_workspace, expected_account_id, &id)
+        .await?;
     let trimmed = payload.instructions.trim();
     if trimmed.chars().count() > 1000 {
         return Err(AppError::BadRequest(
@@ -1640,11 +2391,15 @@ pub(super) async fn update_custom_agent_instructions(
     } else {
         mongodb::bson::Bson::String(payload.instructions.clone())
     };
-    state
+    let result = state
         .db
         .contacts()
         .update_one(
-            doc! { "_id": object_id, "workspace_id": &admin.current_workspace },
+            doc! {
+                "_id": object_id,
+                "workspace_id": &admin.current_workspace,
+                "account_id": expected_account_id,
+            },
             doc! {
                 "$set": {
                     "custom_agent_instructions": value,
@@ -1654,12 +2409,21 @@ pub(super) async fn update_custom_agent_instructions(
             None,
         )
         .await?;
-    let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
-    Ok(Json(json!({ "item": ApiContact::from(contact) })))
+    if result.matched_count == 0 {
+        return Err(AppError::Conflict("contact_account_conflict".to_string()));
+    }
+    let contact =
+        find_contact_by_id_for_account(&state, &admin.current_workspace, expected_account_id, &id)
+            .await?;
+    Ok(Json(
+        json!({ "item": project_contact(&state, contact).await? }),
+    ))
 }
 
 #[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ManualTagsRequest {
+    pub expected_account_id: String,
     pub tags: Vec<String>,
 }
 
@@ -1673,14 +2437,20 @@ pub async fn update_manual_tags(
     Json(payload): Json<ManualTagsRequest>,
 ) -> AppResult<Json<Value>> {
     let object_id = parse_object_id(&id)?;
-    let _ = find_contact_by_id(&state, &admin.current_workspace, &id).await?; // 存在 + workspace scope 校验
+    let expected_account_id = required_expected_account_id(&payload.expected_account_id)?;
+    find_contact_by_id_for_account(&state, &admin.current_workspace, expected_account_id, &id)
+        .await?;
     let cleaned = normalize_manual_tags(&payload.tags);
     validate_manual_tags(&cleaned)?;
-    state
+    let result = state
         .db
         .contacts()
         .update_one(
-            doc! { "_id": object_id, "workspace_id": &admin.current_workspace },
+            doc! {
+                "_id": object_id,
+                "workspace_id": &admin.current_workspace,
+                "account_id": expected_account_id,
+            },
             doc! {
                 "$set": {
                     "manual_tags": &cleaned,
@@ -1691,8 +2461,15 @@ pub async fn update_manual_tags(
             None,
         )
         .await?;
-    let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
-    Ok(Json(json!({ "item": ApiContact::from(contact) })))
+    if result.matched_count == 0 {
+        return Err(AppError::Conflict("contact_account_conflict".to_string()));
+    }
+    let contact =
+        find_contact_by_id_for_account(&state, &admin.current_workspace, expected_account_id, &id)
+            .await?;
+    Ok(Json(
+        json!({ "item": project_contact(&state, contact).await? }),
+    ))
 }
 
 /// 去首尾空白、去空串、去重保序。自由文本，不查字典（设计选择）。
@@ -1790,7 +2567,22 @@ pub async fn update_operation_profile(
     Json(payload): Json<OperationProfileRequest>,
 ) -> AppResult<Json<Value>> {
     let object_id = parse_object_id(&id)?;
-    let current = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
+    let expected_account_id = required_expected_account_id(&payload.expected_account_id)?;
+    let current =
+        find_contact_by_id_for_account(&state, &admin.current_workspace, expected_account_id, &id)
+            .await?;
+    let selected_playbook = match payload.playbook_id.as_deref() {
+        Some(playbook_id) if !playbook_id.trim().is_empty() => Some(
+            resolve_playbook_for_contact(
+                &state,
+                &admin.current_workspace,
+                expected_account_id,
+                Some(playbook_id),
+            )
+            .await?,
+        ),
+        _ => None,
+    };
     // M1：admin 手填 stage/intent 经 taxonomy alias→canonical 归一（与 LLM 决策路径
     // 同口径），杜绝同一字段 canonical/alias 漂移污染下游派生。归一在 stage_changed
     // 判定之前，避免"admin 写 alias、库里是 canonical"被误判为变化。
@@ -1826,6 +2618,13 @@ pub async fn update_operation_profile(
         "profile_updated_at": DateTime::now(),
         "updated_at": DateTime::now(),
     };
+    if let Some(playbook) = selected_playbook {
+        let playbook_id = playbook
+            .id
+            .ok_or_else(|| AppError::External("operation playbook id missing".to_string()))?;
+        set_doc.insert("playbook_id", playbook_id);
+        set_doc.insert("playbook_version", playbook.version);
+    }
     // 与 gateway.rs 写回一致:profile_attributes 非空才写。前端「运营画像」表单
     // 不管理 profile_attributes(它由 AI 在 gateway 积累),PUT 时不带该字段 →
     // payload 反序列化为空 Document。无条件 $set 会把 AI 积累的画像清空(M13),
@@ -1872,11 +2671,15 @@ pub async fn update_operation_profile(
             set_doc.insert("domain_attributes.relationship_type", canonical);
         }
     }
-    state
+    let result = state
         .db
         .contacts()
         .update_one(
-            doc! { "_id": object_id, "workspace_id": &admin.current_workspace },
+            doc! {
+                "_id": object_id,
+                "workspace_id": &admin.current_workspace,
+                "account_id": expected_account_id,
+            },
             doc! {
                 "$set": set_doc,
                 "$unset": { "last_commitment": "" }
@@ -1884,8 +2687,15 @@ pub async fn update_operation_profile(
             None,
         )
         .await?;
-    let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
-    Ok(Json(json!({ "item": ApiContact::from(contact) })))
+    if result.matched_count == 0 {
+        return Err(AppError::Conflict("contact_account_conflict".to_string()));
+    }
+    let contact =
+        find_contact_by_id_for_account(&state, &admin.current_workspace, expected_account_id, &id)
+            .await?;
+    Ok(Json(
+        json!({ "item": project_contact(&state, contact).await? }),
+    ))
 }
 
 /// `POST /api/contacts/:id/deal-events`
@@ -1899,13 +2709,21 @@ pub async fn update_operation_profile(
 ///
 /// 写库走 `$push contact.outcome_events` + 一条 `outcome_event_marked` 审计事件，
 /// 落库核心委托给 [`add_outcome_event_inner`]（与将来支付回调共用同一路径）。
-pub(super) async fn add_deal_event(
+pub async fn add_deal_event(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
     Json(payload): Json<DealEventRequest>,
 ) -> AppResult<Json<Value>> {
-    let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
+    let expected_account_id = payload.expected_account_id.trim();
+    if expected_account_id.is_empty() {
+        return Err(AppError::BadRequest(
+            "expectedAccountId is required".to_string(),
+        ));
+    }
+    let contact =
+        find_contact_by_id_for_account(&state, &admin.current_workspace, expected_account_id, &id)
+            .await?;
     add_outcome_event_inner(
         &state,
         &contact,
@@ -1924,8 +2742,12 @@ pub(super) async fn add_deal_event(
         },
     )
     .await?;
-    let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
-    Ok(Json(json!({ "item": ApiContact::from(contact) })))
+    let contact =
+        find_contact_by_id_for_account(&state, &admin.current_workspace, expected_account_id, &id)
+            .await?;
+    Ok(Json(
+        json!({ "item": project_contact(&state, contact).await? }),
+    ))
 }
 
 pub(super) async fn analyze_contact_profile(
@@ -2004,7 +2826,9 @@ pub(super) async fn analyze_contact_profile(
         .update_one(doc! { "_id": contact.id }, update_doc, None)
         .await?;
     let updated = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
-    Ok(Json(json!({ "item": ApiContact::from(updated) })))
+    Ok(Json(
+        json!({ "item": project_contact(&state, updated).await? }),
+    ))
 }
 
 pub(super) async fn get_operating_memory(
@@ -2023,11 +2847,14 @@ pub(super) async fn update_operating_memory(
     Path(id): Path<String>,
     Json(payload): Json<OperatingMemoryRequest>,
 ) -> AppResult<Json<Value>> {
-    let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
+    let expected_account_id = required_expected_account_id(&payload.expected_account_id)?;
+    let contact =
+        find_contact_by_id_for_account(&state, &admin.current_workspace, expected_account_id, &id)
+            .await?;
     ensure_operating_memory(&state, &contact).await?;
     // F-019：只 $set 请求显式带上的组（None 的组保持不动），避免缺组被清空。
     let set_doc = build_operating_memory_set_doc(payload, DateTime::now());
-    state
+    let result = state
         .db
         .operating_memories()
         .update_one(
@@ -2040,6 +2867,9 @@ pub(super) async fn update_operating_memory(
             None,
         )
         .await?;
+    if result.matched_count == 0 {
+        return Err(AppError::Conflict("contact_account_conflict".to_string()));
+    }
     let memory = ensure_operating_memory(&state, &contact).await?;
     Ok(Json(json!({ "item": operating_memory_json(memory) })))
 }
@@ -2125,10 +2955,10 @@ pub(super) async fn run_contact_memory_consolidation(
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
     let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
-    agent::consolidate_contact_memory(&state, &contact, None).await?;
+    let task_id = agent::run_manual_memory_consolidation(&state, &contact, &admin.user_id).await?;
     let memory = ensure_operating_memory(&state, &contact).await?;
     Ok(Json(
-        json!({ "ok": true, "item": operating_memory_json(memory) }),
+        json!({ "ok": true, "taskId": task_id.to_hex(), "item": operating_memory_json(memory) }),
     ))
 }
 
@@ -2155,6 +2985,28 @@ pub(super) async fn get_operation_health(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enable_agent_account_lookup_is_workspace_scoped() {
+        assert_eq!(
+            wechat_account_scope_filter("ws-a", "account-1"),
+            doc! {
+                "workspace_id": "ws-a",
+                "account_id": "account-1",
+            }
+        );
+    }
+
+    #[test]
+    fn enrollment_intent_source_policy_is_fail_closed_for_pool() {
+        assert!(enrollment_intent_insert_policy(&doc! {}));
+        assert!(enrollment_intent_insert_policy(
+            &doc! { "allow_contact_insert": true }
+        ));
+        assert!(!enrollment_intent_insert_policy(
+            &doc! { "allow_contact_insert": false }
+        ));
+    }
 
     #[test]
     fn initial_profile_generation_is_scoped_by_enrollment_and_task() {
@@ -2237,9 +3089,38 @@ mod tests {
     }
 
     #[test]
+    fn latest_inbound_preview_pipeline_is_scoped_and_groups_once_per_contact() {
+        let wxids = vec!["wxid_a".to_string(), "wxid_b".to_string()];
+        let pipeline = latest_inbound_preview_pipeline("ws1", "acct1", &wxids);
+        assert_eq!(pipeline.len(), 3);
+        let filter = pipeline[0].get_document("$match").unwrap();
+        assert_eq!(filter.get_str("workspace_id").unwrap(), "ws1");
+        assert_eq!(filter.get_str("account_id").unwrap(), "acct1");
+        assert_eq!(filter.get_str("direction").unwrap(), "inbound");
+        assert_eq!(
+            filter
+                .get_document("contact_wxid")
+                .unwrap()
+                .get_array("$in")
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            pipeline[2]
+                .get_document("$group")
+                .unwrap()
+                .get_str("_id")
+                .unwrap(),
+            "$contact_wxid"
+        );
+    }
+
+    #[test]
     fn operating_memory_set_doc_full_submit_sets_all_groups() {
         // 前端全量提交 4 组（都 Some）→ 4 组全进 $set + updated_at。
         let payload = OperatingMemoryRequest {
+            expected_account_id: "acct".to_string(),
             user_understanding: Some(doc! { "a": 1 }),
             relationship_state: Some(doc! { "b": 2 }),
             product_fit: Some(doc! { "c": 3 }),
@@ -2258,6 +3139,7 @@ mod tests {
         // F-019：API 直调只传 relationship_state（其余 None）→ $set 只含该组 +
         // updated_at，缺组不进 $set 故库中原值不被清空（回归缺陷根因）。
         let payload = OperatingMemoryRequest {
+            expected_account_id: "acct".to_string(),
             user_understanding: None,
             relationship_state: Some(doc! { "stage": "warming" }),
             product_fit: None,

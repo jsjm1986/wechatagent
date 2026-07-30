@@ -153,12 +153,21 @@ fn make_managed_contact(workspace_id: &str, wxid: &str) -> Contact {
 /// 构造 `AssistOverrideRequest`（字段私有但派生 `Deserialize`，用 from_value 构造，
 /// 无需放开字段可见性——仿 `ext_knowledge` 请求体先例）。
 fn assist_override_request(mode: &str) -> AssistOverrideRequest {
-    serde_json::from_value(json!({ "mode": mode })).expect("build AssistOverrideRequest")
+    serde_json::from_value(json!({
+        "expectedAccountId": "default",
+        "mode": mode
+    }))
+    .expect("build AssistOverrideRequest")
 }
 
 /// 构造 `ReviewRequest`（同上）。
 fn review_request(status: &str, note: Option<&str>) -> ReviewRequest {
-    serde_json::from_value(json!({ "status": status, "note": note })).expect("build ReviewRequest")
+    serde_json::from_value(json!({
+        "expectedScope": "workspace",
+        "status": status,
+        "note": note
+    }))
+    .expect("build ReviewRequest")
 }
 
 /// 回查某 contact 的 `domain_attributes.assist_mode_override` 字段（缺口 2 断言用）。

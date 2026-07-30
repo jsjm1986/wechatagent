@@ -42,7 +42,7 @@ async fn critic_current(
 #[tokio::test]
 #[ignore]
 async fn reset_pack_preserves_evolution_critic_prompt() {
-    let app = TestApp::start().await;
+    let app = TestApp::start_repl_set().await;
     let workspace = app.state.config.default_workspace_id.clone();
     let account = app.state.config.default_account_id.clone();
 

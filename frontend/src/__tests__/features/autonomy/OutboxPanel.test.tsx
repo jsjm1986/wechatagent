@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
+import { act, render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 
 // OutboxPanel：approved 决策发送链路真相源（agent_send_outbox）的逐条只读 + 取消入口。
 // 后端 GET /api/admin/outbox + POST /api/admin/outbox/:id/cancel（带 cancelReason body）。
@@ -28,18 +28,38 @@ vi.mock("../../../lib/api", () => ({
     post: vi.fn().mockResolvedValue({ item: {} }),
   },
 }));
-vi.mock("../../../stores/accountStore", () => ({
-  useAccountStore: (sel?: (s: unknown) => unknown) => {
-    const st = { currentAccountId: () => "acc-1" };
-    return typeof sel === "function" ? sel(st) : st;
-  },
-}));
-
 import { api } from "../../../lib/api";
 import { OutboxPanel } from "../../../features/autonomy/OutboxPanel";
+import { useAccountStore } from "../../../stores/accountStore";
+
+const TEXT_ITEM = {
+  id: "OB1",
+  accountId: "acc-1",
+  status: "pending",
+  content: "待发文本",
+  payload: { kind: "text" as const, text: "待发文本" },
+  contactWxid: "wxid_alice",
+  createdAt: null,
+  cancelRequested: false,
+  cancelRequestedAt: null,
+  sendStartedAt: null,
+  reclaimedInFlight: false,
+  reclaimCount: 0,
+};
 
 describe("OutboxPanel", () => {
-  beforeEach(() => vi.clearAllMocks());
+  beforeEach(() => {
+    vi.clearAllMocks();
+    useAccountStore.setState({
+      accounts: [
+        { id: "record-1", accountId: "acc-1", alias: "A", displayName: "A", online: true },
+        { id: "record-2", accountId: "acc-2", alias: "B", displayName: "B", online: true },
+      ],
+      selectedAccountId: "acc-1",
+    });
+    vi.mocked(api.get).mockResolvedValue({ items: [TEXT_ITEM] });
+    vi.mocked(api.post).mockResolvedValue({ item: {} });
+  });
 
   it("拉取并渲染 outbox 逐条记录", async () => {
     render(<OutboxPanel />);
@@ -67,9 +87,45 @@ describe("OutboxPanel", () => {
     await waitFor(() =>
       expect(api.post).toHaveBeenCalledWith(
         "/api/admin/outbox/OB1/cancel",
-        expect.objectContaining({ cancelReason: expect.any(String) })
+        expect.objectContaining({
+          expectedAccountId: "acc-1",
+          cancelReason: expect.any(String),
+        })
       )
     );
+  });
+
+  it("确认框打开后切号会同步隐藏旧快照且不会取消旧账号条目", async () => {
+    render(<OutboxPanel />);
+    await screen.findByText("待发文本");
+    fireEvent.click(screen.getByRole("button", { name: "取消" }));
+    await screen.findByText("确认取消这条发送？");
+
+    act(() => useAccountStore.setState({ selectedAccountId: "acc-2" }));
+    expect(screen.queryByText("待发文本")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "确认取消" }));
+    await waitFor(() =>
+      expect(screen.queryByText("确认取消这条发送？")).not.toBeInTheDocument()
+    );
+    expect(api.post).not.toHaveBeenCalled();
+  });
+
+  it("A 慢 B 快时只提交 B 的发件箱快照", async () => {
+    let resolveA!: (value: { items: typeof TEXT_ITEM[] }) => void;
+    const itemB = { ...TEXT_ITEM, id: "OB-B", accountId: "acc-2", content: "B 待发", payload: { kind: "text" as const, text: "B 待发" } };
+    vi.mocked(api.get)
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveA = resolve; }))
+      .mockResolvedValueOnce({ items: [itemB] });
+
+    render(<OutboxPanel />);
+    await waitFor(() => expect(api.get).toHaveBeenCalledTimes(1));
+    act(() => useAccountStore.setState({ selectedAccountId: "acc-2" }));
+    expect(await screen.findByText("B 待发")).toBeInTheDocument();
+
+    resolveA({ items: [TEXT_ITEM] });
+    await waitFor(() => expect(screen.queryByText("待发文本")).not.toBeInTheDocument());
+    expect(screen.getByText("B 待发")).toBeInTheDocument();
   });
 
   it("明确显示取消请求中与送达待核验，且不再提供重复取消", async () => {

@@ -1,18 +1,64 @@
-//! Phase G P1-4：chunk 软锁生命周期集成测试。
+//! Phase G P1-4：chunk advisory presence 生命周期回归。
 //!
-//! 这个 suite 不需要 Docker（不连数据库），只验证软锁的纯逻辑：
-//!   - acquire 后 owner 续期、非 owner 撞锁 409；
-//!   - release 仅 owner 可调；
-//!   - 过期后非 owner 可重新 acquire。
-//!
-//! handler 直接调用，绕过 axum HTTP 层；admin 注入靠手工构造
-//! `AuthenticatedAdmin`。`AppState` 用 `TestApp::start` 仍需 Docker，
-//! 因此整个 suite 默认 `#[ignore]`，与其它集成测试一致。
+//! 默认测试覆盖事件/TTL；两个 ignored Handler 红线使用副本集 MongoDB 验证：
+//!   - 请求必须先验证 chunk 属于当前 workspace，跨 workspace 返回 404 且零 presence；
+//!   - 同 workspace 并发 acquire 恰好一个 200、一个 advisory 409；
+//!   - presence 只作协作提示，mutation 的写权仍由认证、事务与 CAS 决定。
 
 mod common;
 
+use std::sync::Arc;
+
+use axum::{
+    body::to_bytes,
+    extract::{Extension, Path, State},
+    http::StatusCode,
+    response::IntoResponse,
+    Json,
+};
 use chrono::Duration;
-use wechatagent::routes::chunk_locks::{ChunkEditLock, ChunkEvent, CHUNK_LOCK_TTL_SECONDS};
+use mongodb::bson::{oid::ObjectId, DateTime};
+use tokio::sync::Barrier;
+use wechatagent::{
+    auth::AuthenticatedAdmin,
+    models::OperationKnowledgeChunk,
+    routes::chunk_locks::{
+        acquire_chunk_lock, ChunkEditLock, ChunkEvent, LockAcquireRequest, CHUNK_LOCK_TTL_SECONDS,
+    },
+};
+
+use crate::common::TestApp;
+
+fn admin(user_id: &str, workspace_id: &str) -> AuthenticatedAdmin {
+    AuthenticatedAdmin {
+        user_id: user_id.to_string(),
+        username: user_id.to_string(),
+        current_workspace: workspace_id.to_string(),
+    }
+}
+
+async fn seed_chunk(app: &TestApp, workspace_id: &str) -> ObjectId {
+    let id = ObjectId::new();
+    app.state
+        .db
+        .operation_knowledge_chunks()
+        .insert_one(
+            OperationKnowledgeChunk {
+                id: Some(id),
+                workspace_id: workspace_id.to_string(),
+                domain: "user_operations".to_string(),
+                title: "presence target".to_string(),
+                status: "draft".to_string(),
+                created_at: DateTime::now(),
+                updated_at: DateTime::now(),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("seed presence target");
+    id
+}
 
 #[test]
 fn lock_ttl_constant_is_five_minutes() {
@@ -99,13 +145,88 @@ async fn broadcast_channel_delivers_to_late_subscriber() {
 }
 
 #[tokio::test]
+#[ignore = "requires replica-set MongoDB / testcontainers"]
+async fn cross_workspace_presence_is_not_found_and_leaves_no_entry() {
+    let app = TestApp::start_repl_set().await;
+    let owner_workspace = app.state.config.default_workspace_id.clone();
+    let chunk_id = seed_chunk(&app, &owner_workspace).await;
+
+    let response = acquire_chunk_lock(
+        State(app.state.clone()),
+        Extension(admin("foreign-admin", "foreign-workspace")),
+        Path(chunk_id.to_hex()),
+        Json(LockAcquireRequest::default()),
+    )
+    .await
+    .into_response();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert!(
+        app.state.chunk_locks.is_empty(),
+        "cross-workspace lookup must not create or expose advisory presence"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires replica-set MongoDB / testcontainers"]
+async fn concurrent_presence_acquire_has_one_owner_and_one_advisory_conflict() {
+    let app = TestApp::start_repl_set().await;
+    let workspace_id = app.state.config.default_workspace_id.clone();
+    let chunk_id = seed_chunk(&app, &workspace_id).await;
+    let barrier = Arc::new(Barrier::new(3));
+
+    let mut tasks = Vec::new();
+    for user_id in ["alice", "bob"] {
+        let state = app.state.clone();
+        let workspace_id = workspace_id.clone();
+        let chunk_id = chunk_id.to_hex();
+        let barrier = barrier.clone();
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            let response = acquire_chunk_lock(
+                State(state),
+                Extension(admin(user_id, &workspace_id)),
+                Path(chunk_id),
+                Json(LockAcquireRequest::default()),
+            )
+            .await
+            .into_response();
+            let status = response.status();
+            let body = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("read presence response");
+            let body: serde_json::Value =
+                serde_json::from_slice(&body).expect("decode presence response");
+            (status, body)
+        }));
+    }
+    barrier.wait().await;
+
+    let mut results = Vec::new();
+    for task in tasks {
+        results.push(task.await.expect("presence task"));
+    }
+    results.sort_by_key(|(status, _)| status.as_u16());
+    assert_eq!(results[0].0, StatusCode::OK);
+    assert_eq!(results[1].0, StatusCode::CONFLICT);
+    assert_eq!(results[0].1["advisory"], true);
+    assert_eq!(results[1].1["advisory"], true);
+    assert_eq!(results[1].1["error"], "chunk_presence_by_other");
+    assert_eq!(app.state.chunk_locks.len(), 1);
+    assert!(app
+        .state
+        .chunk_locks
+        .contains_key(&(workspace_id, chunk_id.to_hex())));
+}
+
+#[tokio::test]
 #[ignore]
 async fn lock_acquire_release_smoke_via_dashmap() {
     use dashmap::DashMap;
     use std::sync::Arc;
 
-    // 不走 handler、不走 axum：直接验证锁表的状态机契约。
-    let locks: Arc<DashMap<String, ChunkEditLock>> = Arc::new(DashMap::new());
+    // 不走 handler、不走 axum：直接验证 presence 表的复合 key。
+    let locks: Arc<DashMap<(String, String), ChunkEditLock>> = Arc::new(DashMap::new());
     let now = chrono::Utc::now();
     let lock = ChunkEditLock {
         chunk_id: "chunk_1".into(),
@@ -115,16 +236,17 @@ async fn lock_acquire_release_smoke_via_dashmap() {
         locked_at: now,
         expires_at: now + Duration::seconds(300),
     };
-    assert!(locks.insert("chunk_1".into(), lock.clone()).is_none());
+    let key = ("ws_a".to_string(), "chunk_1".to_string());
+    assert!(locks.insert(key.clone(), lock.clone()).is_none());
 
     // 同 owner 续期——返回旧值
     let renewed = ChunkEditLock {
         expires_at: now + Duration::seconds(600),
         ..lock.clone()
     };
-    assert!(locks.insert("chunk_1".into(), renewed).is_some());
+    assert!(locks.insert(key.clone(), renewed).is_some());
 
     // 释放
-    assert!(locks.remove("chunk_1").is_some());
-    assert!(locks.get("chunk_1").is_none());
+    assert!(locks.remove(&key).is_some());
+    assert!(locks.get(&key).is_none());
 }

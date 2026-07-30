@@ -12,6 +12,7 @@ import { ProfilePublishCard } from "../../components/review/ProfilePublishCard";
 import { ProposalReleaseCard } from "../../components/review/ProposalReleaseCard";
 import { LessonPromoteCard } from "../../components/review/LessonPromoteCard";
 import { TaxonomyCandidateReviewCard } from "../../components/review/TaxonomyCandidateReviewCard";
+import { SuspectedDealReviewCard } from "./inline/SuspectedDealReviewCard";
 import "./AskHuman.css";
 
 // summary 端点下发 camelCase key，inbox ?source= 过滤认 snake_case source id（两者由后端 ask_human_inbox.rs 定义）。
@@ -21,6 +22,7 @@ const SOURCE_META: { summaryKey: string; source: string; label: string }[] = [
   { summaryKey: "knowledgeReview", source: "knowledge_review", label: "知识核验" },
   { summaryKey: "taxonomyCandidate", source: "taxonomy_candidate", label: "标签候选" },
   { summaryKey: "relationshipSuggestion", source: "relationship_suggestion", label: "关系建议" },
+  { summaryKey: "suspectedDeal", source: "suspected_deal", label: "疑似成交" },
   { summaryKey: "gapSignal", source: "gap_signal", label: "知识缺口" },
   { summaryKey: "profileRisky", source: "profile_risky", label: "画像发布" },
   { summaryKey: "evolutionProposal", source: "evolution_proposal", label: "进化发布" },
@@ -33,6 +35,7 @@ const SOURCE_TONE: Record<string, string> = {
   knowledge_review: "scheduled",
   taxonomy_candidate: "neutral",
   relationship_suggestion: "neutral",
+  suspected_deal: "held",
   gap_signal: "held",
   profile_risky: "blocked",
   evolution_proposal: "running",
@@ -65,6 +68,19 @@ function renderRich(item: InboxItem, onDone: () => void) {
             occurrences: c.occurrences != null ? Number(c.occurrences) : undefined,
             suggestedDisplayName: c.suggestedDisplayName != null ? String(c.suggestedDisplayName) : undefined,
           }}
+          onDone={onDone}
+        />
+      );
+    }
+    case "suspectedDealReview": {
+      const deal = item.richParams ?? {};
+      return (
+        <SuspectedDealReviewCard
+          signalId={String(deal.signalId ?? item.id)}
+          contactId={String(deal.contactId ?? item.contactWxid ?? "")}
+          evidence={deal.evidence != null ? String(deal.evidence) : item.evidence}
+          confidence={deal.confidence != null ? Number(deal.confidence) : item.confidence}
+          occurrences={deal.occurrences != null ? Number(deal.occurrences) : item.occurrences}
           onDone={onDone}
         />
       );
@@ -156,6 +172,9 @@ function AskHumanView() {
     return useInboxStore.getState().items; // load 成功取新值，失败取保留的旧值（不 throw → 列表显旧数据）
   }, [load]);
 
+  const summaryErrors = summary?.errors ?? [];
+  const unavailableSources = new Set(summaryErrors.map((error) => error.source));
+
   return (
     <div className="askHumanChannel">
       <header className="askHumanHeader">
@@ -189,10 +208,21 @@ function AskHumanView() {
               {errors.length} 个来源暂时不可用：{errors.map((e) => SOURCE_META.find((m) => m.source === e.source)?.label ?? e.source).join("、")}
             </div>
           )}
+          {summary && summary.status !== "complete" && (
+            <div className="askHumanSourceErrors">
+              待办计数部分不可用：
+              {summaryErrors
+                .map((e) => SOURCE_META.find((m) => m.source === e.source)?.label ?? e.source)
+                .join("、") || "全部来源"}
+            </div>
+          )}
 
           <div className="askHumanSummary">
             {summary &&
-              SOURCE_META.map(({ summaryKey, source, label }) => (
+              SOURCE_META.map(({ summaryKey, source, label }) => {
+                const count = summary.counts[summaryKey];
+                const unavailable = count == null || unavailableSources.has(source);
+                return (
                 <button
                   key={source}
                   type="button"
@@ -207,9 +237,10 @@ function AskHumanView() {
                     setRefreshNonce((n) => n + 1); // 触发 ReviewQueue 重 fetch（经 load 读新 activeSource）
                   }}
                 >
-                  {label}: {summary[summaryKey] ?? 0}
+                  {label}: {unavailable ? "不可用" : count}
                 </button>
-              ))}
+                );
+              })}
           </div>
 
           <ReviewQueue<InboxItem>

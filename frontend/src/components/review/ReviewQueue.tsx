@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { Fragment, useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { useToast } from "../ui/Toast";
 
 export interface RowCtx {
@@ -27,16 +27,36 @@ export function ReviewQueue<T>({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [listGeneration, setListGeneration] = useState(0);
+  const acceptedGenerationRef = useRef(0);
+  const acceptedIdsRef = useRef<Set<string>>(new Set());
+  const loadingRef = useRef(false);
+  const loadRequestRef = useRef(0);
+  const getIdRef = useRef(getId);
+  getIdRef.current = getId;
 
   const load = useCallback(async () => {
+    const request = ++loadRequestRef.current;
+    loadingRef.current = true;
     setLoading(true);
     setError(null);
     try {
-      setItems(await fetchItems());
+      const nextItems = await fetchItems();
+      if (request !== loadRequestRef.current) return;
+      const nextGeneration = acceptedGenerationRef.current + 1;
+      acceptedGenerationRef.current = nextGeneration;
+      acceptedIdsRef.current = new Set(nextItems.map((item) => getIdRef.current(item)));
+      setItems(nextItems);
+      setListGeneration(nextGeneration);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      if (request === loadRequestRef.current) {
+        setError(e instanceof Error ? e.message : String(e));
+      }
     } finally {
-      setLoading(false);
+      if (request === loadRequestRef.current) {
+        loadingRef.current = false;
+        setLoading(false);
+      }
     }
   }, [fetchItems]);
 
@@ -44,9 +64,17 @@ export function ReviewQueue<T>({
     void load();
   }, [load, refreshToken]);
 
-  const makeCtx = (id: string): RowCtx => ({
-    busy: busyId === id,
+  const makeCtx = (id: string, generation: number): RowCtx => ({
+    busy: loading || busyId === id,
     runAction: async (fn, successMsg) => {
+      if (
+        loadingRef.current
+        || acceptedGenerationRef.current !== generation
+        || !acceptedIdsRef.current.has(id)
+      ) {
+        toast.error("待办列表已刷新，请在最新条目上重新操作");
+        return;
+      }
       setBusyId(id);
       try {
         await fn();
@@ -63,5 +91,16 @@ export function ReviewQueue<T>({
   if (loading && items.length === 0) return <div className="reviewQueueLoading">加载中…</div>;
   if (error) return <div className="reviewQueueError">加载失败：{error}</div>;
   if (items.length === 0) return <div className="reviewQueueEmpty">{emptyText ?? "暂无待处理项"}</div>;
-  return <div className="reviewQueueList">{items.map((it) => renderItem(it, makeCtx(getId(it))))}</div>;
+  return (
+    <div className="reviewQueueList">
+      {items.map((item) => {
+        const id = getId(item);
+        return (
+          <Fragment key={id}>
+            {renderItem(item, makeCtx(id, listGeneration))}
+          </Fragment>
+        );
+      })}
+    </div>
+  );
 }

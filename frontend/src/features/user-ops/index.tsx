@@ -93,6 +93,7 @@ function UserOpsFeatureInner() {
     generatePlaybookText,
     optimizePlaybookText,
     editingPlaybookId,
+    playbookScopeAccountId,
     guideBusy,
     simulationBusy,
     contactCounts,
@@ -116,6 +117,7 @@ function UserOpsFeatureInner() {
     setOptimizePlaybookText,
     setDomainDrafts,
     setMemoryDraft,
+    clearContactDetail,
     hydrateSelected,
     loadMessages,
     loadPlaybooks,
@@ -150,7 +152,7 @@ function UserOpsFeatureInner() {
     resetOperationDomain
   } = userOpsStore;
 
-  const { contacts, selected, contactTab, setSelected, setContactTab } = contactStore;
+  const { contacts, selected, dataAccountId, contactTab, setSelected, setContactTab } = contactStore;
   const { accounts, onlineCount } = accountStore;
   // 订阅派生的原始 accountId 字符串（切账号时值变 → effect 重拉），
   // 不要解构 currentAccountId 函数引用——它恒稳定，依赖它的 effect 永不触发。
@@ -160,6 +162,11 @@ function UserOpsFeatureInner() {
       : s.accounts[0]?.accountId ?? ""
   );
   const { busy, error, setBusy, setError } = uiStore;
+  const contactSnapshotIsCurrent = dataAccountId === effectiveAccountId;
+  const scopedContacts = contactSnapshotIsCurrent ? contacts : [];
+  const scopedSelected = contactSnapshotIsCurrent && selected?.accountId === effectiveAccountId
+    ? selected
+    : null;
 
   // 传统模式 prompts tab：复用 strategyStore 的 souls/prompt CRUD（与系统策略页同一套）
   const strategyStore = useStrategyStore();
@@ -192,8 +199,8 @@ function UserOpsFeatureInner() {
   // apply 成功后：有跳过字段就提示哪些被跳过（文案动态拼接，不硬编码字段名）。
   // appliedFields 语义偏大（含 memory/playbookPatch 等非枚举键、且 DropSilently 静默丢弃的字段亦计入），
   // 故成功文案中性化为“已处理”，避免让运营误以为“精确应用了 N 个字段”。
-  const onApplyGuide = async () => {
-    const res = await applyGuidePreview();
+  const onApplyGuide = async (confirmGlobalImpact = false) => {
+    const res = await applyGuidePreview(confirmGlobalImpact);
     if (!res) return;
     if (res.skippedFields.length) {
       toast.info(
@@ -213,10 +220,10 @@ function UserOpsFeatureInner() {
   const normalCount = contactCounts.normal;
 
   const filteredContacts = useMemo(() => {
-    if (contactTab === "managed") return contacts.filter((contact) => contact.agentStatus === "managed");
-    if (contactTab === "normal") return contacts.filter((contact) => contact.agentStatus === "normal");
-    return contacts;
-  }, [contacts, contactTab]);
+    if (contactTab === "managed") return scopedContacts.filter((contact) => contact.agentStatus === "managed");
+    if (contactTab === "normal") return scopedContacts.filter((contact) => contact.agentStatus === "normal");
+    return scopedContacts;
+  }, [scopedContacts, contactTab]);
 
   // 待办计数徽标——真实运营数据现由自包含 OperationsFeature/operationsStore 负责加载，
   // 这里不再用占位 tasks 反推；徽标后续可订阅 operationsStore.pending 派生。
@@ -235,13 +242,14 @@ function UserOpsFeatureInner() {
 
   // 挂载 + 切账号时加载主体数据（联系人列表 + 剧本），依赖 effectiveAccountId 原始值
   useEffect(() => {
+    clearContactDetail(effectiveAccountId);
     if (effectiveAccountId) {
       setSelected(null); // 切账号清掉上个账号选中的联系人，避免串号
       void loadContacts(effectiveAccountId);
       void loadContactCounts(effectiveAccountId);
       void loadPlaybooks(effectiveAccountId);
     }
-  }, [effectiveAccountId, loadContacts, loadContactCounts, loadPlaybooks, setSelected]);
+  }, [effectiveAccountId, clearContactDetail, loadContacts, loadContactCounts, loadPlaybooks, setSelected]);
 
   // 切到 traditional 模式时加载 souls/promptTemplates（prompts tab 复用 strategyStore）和 domains
   useEffect(() => {
@@ -253,11 +261,11 @@ function UserOpsFeatureInner() {
 
   // 选中联系人变化时的处理
   useEffect(() => {
-    if (selected) {
-      hydrateSelected(selected);
-      loadMessages(selected);
+    if (scopedSelected) {
+      hydrateSelected(scopedSelected);
+      loadMessages(scopedSelected);
     }
-  }, [selected, hydrateSelected, loadMessages]);
+  }, [scopedSelected, hydrateSelected, loadMessages]);
 
   return (
     <section className="userOpsWorkspace">
@@ -272,16 +280,18 @@ function UserOpsFeatureInner() {
             totalCount={contactCounts.all}
             managedCount={managedCount}
             normalCount={normalCount}
-            selected={selected}
+            selected={scopedSelected}
             onContactTab={setContactTab}
             onLoadAll={reloadFiltered}
             onOpenContact={openContact}
             onQuery={setSearchQuery}
+            selectionScope={effectiveAccountId}
             onBatchEnable={async (candidates) => {
               if (!effectiveAccountId || candidates.length === 0) return;
               try {
                 const res = await batchEnable({
                   accountId: effectiveAccountId,
+                  source: "pool",
                   candidates,
                   sharedNote: "从运营池批量启用"
                 });
@@ -320,7 +330,7 @@ function UserOpsFeatureInner() {
             relationshipType={relationshipType}
             referredSpecialistAt={referredSpecialistAt}
             profileEditDraft={profileEditDraft}
-            selected={selected}
+            selected={scopedSelected}
             selectedPlaybookId={selectedPlaybookId}
             simulationBusy={simulationBusy}
             simulationInput={simulationInput}
@@ -362,7 +372,7 @@ function UserOpsFeatureInner() {
             onChange={setTraditionalOpsTab}
           />
 
-          {traditionalOpsTab === "playbooks" && (
+          {traditionalOpsTab === "playbooks" && playbookScopeAccountId === effectiveAccountId && (
             <UserPlaybookPanel
               busy={busy}
               editingPlaybookId={editingPlaybookId}

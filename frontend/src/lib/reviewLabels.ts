@@ -105,7 +105,7 @@ export const ESCALATION_RESOLVED_VIA_LABELS: Record<string, string> = {
 };
 
 // prompt / soul / prompt_template / evaluation_scenario 版本生命周期状态。
-// 后端默认 draft(prompt_templates.rs:132)/ active(evaluation_scenario 默认)。
+// Prompt 默认 draft；评测场景只有完整金标时默认 active，否则默认 draft。
 export const VERSION_STATUS_LABELS: Record<string, string> = {
   draft: "草稿",
   active: "生效中",
@@ -308,6 +308,7 @@ export const EVENT_KIND_LABELS: Record<string, string> = {
   knowledge_chat_turn: "知识协作一轮",
   knowledge_chat_applied: "知识协作已应用",
   knowledge_operator_memory_added: "运营记忆已新增",
+  knowledge_operator_memory_revoked: "运营记忆已撤销",
   knowledge_repair_proposed: "知识修复提案",
   knowledge_repair_applied: "知识修复已应用",
   "media_asset.reviewed": "素材已审核",

@@ -5,7 +5,7 @@
 //!
 //! 1. `KnowledgeChatTask.planned_steps` 6 个合法 action 闭集（fix_chunk / add_chunk
 //!    / retag / review_evolution / analyze_logs / dismiss）+ status 闭集
-//!    （pending / running / finished / failed / cancelled）。
+//!    （pending / running / completed / failed / cancelled）。
 //! 2. `KnowledgeChatTurn { kind = "task_progress" | "task_summary" }` 能完整
 //!    BSON round-trip，attachments 里 phase / taskId / stepIndex / total 都保留。
 //! 3. `ChatProgressBus` 在并发场景下：`subscribe` 后 `bump` 必然让订阅者观察到
@@ -47,24 +47,33 @@ fn planned_step_action_enum_is_closed_set() {
 
 #[test]
 fn knowledge_chat_task_status_closed_set_round_trip() {
-    // pending → running → (finished | failed | cancelled) 是 worker 唯一合法迁移。
-    let allowed_statuses = ["pending", "running", "finished", "failed", "cancelled"];
+    // pending → running → (completed | failed | cancelled) 是 worker 唯一合法迁移。
+    let allowed_statuses = ["pending", "running", "completed", "failed", "cancelled"];
     for status in allowed_statuses {
         let task = KnowledgeChatTask {
             id: Some(ObjectId::new()),
             workspace_id: "default".to_string(),
             account_id: "default".to_string(),
             session_id: "sess_x".to_string(),
+            owner_admin_id: Some("admin_1".to_string()),
             operator_id: Some("op_1".to_string()),
             cards: vec![],
+            dispatch_binding: None,
             planned_steps: vec![doc! {
                 "stepId": "step_1",
                 "cardId": "card_a",
                 "action": "fix_chunk",
             }],
             completed_steps: vec![],
+            step_intents: vec![],
             status: status.to_string(),
             error_kind: None,
+            attempts: 0,
+            claim_generation: 0,
+            worker_id: None,
+            claim_token: None,
+            locked_until: None,
+            heartbeat_at: None,
             created_at: DateTime::now(),
             started_at: None,
             finished_at: None,
@@ -101,6 +110,8 @@ fn task_progress_turn_preserves_phase_payload() {
             missing_fields: vec![],
             followup_questions: vec![],
             status: "pending".to_string(),
+            apply_result: None,
+            applied_at: None,
             tokens_used: 0,
             prompt_key: None,
             kind: Some("task_progress".to_string()),
@@ -160,6 +171,8 @@ fn task_summary_turn_carries_review_and_failed_lists() {
         missing_fields: vec![],
         followup_questions: vec![],
         status: "pending".to_string(),
+        apply_result: None,
+        applied_at: None,
         tokens_used: 0,
         prompt_key: None,
         kind: Some("task_summary".to_string()),

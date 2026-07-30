@@ -50,7 +50,7 @@ mod tests {
 
     #[test]
     fn long_value_keeps_head_and_tail() {
-        let masked = mask_secret("sk-1234567890abcdef");
+        let masked = mask_secret("sk-synthetic-1234567890abcdef");
         assert!(masked.starts_with("sk-"));
         assert!(masked.ends_with("cdef"));
         assert!(masked.contains("****"));

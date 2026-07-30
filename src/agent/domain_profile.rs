@@ -32,7 +32,7 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use crate::db::Database;
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 use crate::models::{
     AnsweringModeProfile, BusinessFormula, ChunkRole, CommitmentMarkers, CoverageDimension,
     DomainProfile, MemoryDimension, OutcomePolarity, ProfileDimension,
@@ -776,11 +776,11 @@ pub fn default_domain_profile(workspace_id: &str) -> DomainProfile {
         },
         coverage_dimensions: vec![
             // 逐字复刻 catalog.rs 五维 + 命中锚点散文（H5-b：anchor_hint 注入审计 prompt）。
-            CoverageDimension { key: "capability".to_string(), display_name: "能力".to_string(), required: false, anchor_hint: Some("有 verified 切片陈述产品/服务\"能做什么\"的具体能力或功能事实。".to_string()), initial_signal: Some("verified".to_string()) },
-            CoverageDimension { key: "pricing".to_string(), display_name: "报价".to_string(), required: false, anchor_hint: Some("有 verified 切片含具体报价/计费/套餐金额（注意：仅 needs_review 草稿里的报价不计入 verifiedFact，而应置 pendingDraft=true 并入 gap）。".to_string()), initial_signal: None },
-            CoverageDimension { key: "caseEvidence".to_string(), display_name: "案例证据".to_string(), required: false, anchor_hint: Some("有 verified 切片描述**具体客户案例/实施成效**（含可核验的主体、场景或落地结果），即判 true。".to_string()), initial_signal: Some("evidence".to_string()) },
-            CoverageDimension { key: "effectClaims".to_string(), display_name: "效果声明".to_string(), required: false, anchor_hint: Some("有 verified 切片含**可核验的效果数据/量化成果**（如转化率提升、响应时长变化等具体数字），即判 true。".to_string()), initial_signal: Some("evidence".to_string()) },
-            CoverageDimension { key: "deliveryBoundary".to_string(), display_name: "交付边界".to_string(), required: false, anchor_hint: Some("有 verified 切片陈述交付方式/SLA/可用性/部署边界等具体条款。".to_string()), initial_signal: Some("verified".to_string()) },
+            CoverageDimension { key: "capability".to_string(), display_name: "能力".to_string(), required: false, review_topic_aliases: vec!["功能".to_string(), "产品能力".to_string(), "服务能力".to_string()], anchor_hint: Some("有 verified 切片陈述产品/服务\"能做什么\"的具体能力或功能事实。".to_string()), initial_signal: Some("verified".to_string()) },
+            CoverageDimension { key: "pricing".to_string(), display_name: "报价".to_string(), required: false, review_topic_aliases: vec!["定价".to_string(), "价格".to_string(), "计费".to_string(), "套餐".to_string()], anchor_hint: Some("有 verified 切片含具体报价/计费/套餐金额（注意：仅 needs_review 草稿里的报价不计入 verifiedFact，而应置 pendingDraft=true 并入 gap）。".to_string()), initial_signal: None },
+            CoverageDimension { key: "caseEvidence".to_string(), display_name: "案例证据".to_string(), required: false, review_topic_aliases: vec!["案例".to_string(), "客户案例".to_string(), "实施成效".to_string()], anchor_hint: Some("有 verified 切片描述**具体客户案例/实施成效**（含可核验的主体、场景或落地结果），即判 true。".to_string()), initial_signal: Some("evidence".to_string()) },
+            CoverageDimension { key: "effectClaims".to_string(), display_name: "效果声明".to_string(), required: false, review_topic_aliases: vec!["效果数据".to_string(), "量化成果".to_string(), "效果".to_string()], anchor_hint: Some("有 verified 切片含**可核验的效果数据/量化成果**（如转化率提升、响应时长变化等具体数字），即判 true。".to_string()), initial_signal: Some("evidence".to_string()) },
+            CoverageDimension { key: "deliveryBoundary".to_string(), display_name: "交付边界".to_string(), required: false, review_topic_aliases: vec!["交付".to_string(), "部署边界".to_string(), "SLA".to_string(), "可用性".to_string()], anchor_hint: Some("有 verified 切片陈述交付方式/SLA/可用性/部署边界等具体条款。".to_string()), initial_signal: Some("verified".to_string()) },
         ],
         // 逐字复刻 planner 写死的停滞计时维度（customer_stage）。
         stagnation_dimension: Some("customer_stage".to_string()),
@@ -797,8 +797,8 @@ pub fn default_domain_profile(workspace_id: &str) -> DomainProfile {
         per_relationship_operation_mode: None,
         // H14：DEFAULT 销售域 = false → grounding 软分数硬闸无条件生效（字节等价）。
         grounding_gate_bypass_without_claim: false,
-        // reviewer 优化：DEFAULT 销售域 = false → 沿用既有 should_run_review 判定
-        // （字节等价）；高敏域（情感陪伴）seed 时显式置 true 强制走 LLM review。
+        // reviewer 深度：DEFAULT 销售域 = false → 普通低风险可走 light Reviewer；
+        // 高敏域（情感陪伴）seed 时显式置 true 强制走 full Reviewer。
         distrust_self_reported_low_risk: false,
         // G4 #5：DEFAULT 是销售域（交易型）= true → 注入产品目录 + 持有投影段（逐字等价
         // 历史行为，反过拟合护栏）。非交易域 profile 显式置 false 关闭交易事实注入。
@@ -844,6 +844,7 @@ pub fn default_domain_profile(workspace_id: &str) -> DomainProfile {
         version: 1,
         current_version: true,
         previous_version: None,
+        release_status: "published".to_string(),
         seeded_by: Some("default".to_string()),
         is_active: true,
         created_at: now,
@@ -861,7 +862,7 @@ pub fn default_domain_profile(workspace_id: &str) -> DomainProfile {
 /// 价值契约（与设计 §5.2 对齐）：
 /// - `conversation_modes` 含 `intimate_companion`（H9：不只销售四模式）；
 /// - `grounding_gate_bypass_without_claim = true`（H14：纯情感回复不被 grounding 误拦）；
-/// - `distrust_self_reported_low_risk = true`（高敏域强制走 LLM review）；
+/// - `distrust_self_reported_low_risk = true`（高敏域强制走 full Reviewer）；
 /// - `transaction_facts_enabled = false`（G4 #5：非交易域不注入产品/持有事实）；
 /// - `operation_mode.funnel.enabled = false`（H8：陪伴不催进成交）。
 pub fn example_emotional_companion_profile(workspace_id: &str) -> DomainProfile {
@@ -966,13 +967,16 @@ pub fn example_sales_with_relationships_profile(workspace_id: &str) -> DomainPro
 
 /// 加载某 workspace 当前生效的 DomainProfile。
 ///
-/// 查 `is_active=true` 一条；无则 fallback 到 [`default_domain_profile`]。
-/// DB 错误也 fallback（不阻塞运行时；与 taxonomy cache warm_up 失败静默同精神）。
+/// 查唯一 `is_active=true` 行；一次成功查询明确无行时才 fallback 到
+/// [`default_domain_profile`]。数据库错误或同 workspace 多 active 均 fail-closed。
 ///
 /// **1G-c**：本函数现在走进程级 [`DomainProfileCache`]（30s TTL + publish 失效），
 /// 治理 1A/1C/1E/1F 引入的"每决策 / 每 planner tick 都查 DB"N+1。缓存未命中 /
 /// DB 空 / DB 错误时仍回落 [`default_domain_profile`]，与接缓存前逐字等价。
-pub async fn load_active_domain_profile(db: &Database, workspace_id: &str) -> DomainProfile {
+pub async fn load_active_domain_profile(
+    db: &Database,
+    workspace_id: &str,
+) -> AppResult<DomainProfile> {
     global_domain_profile_cache(db)
         .get_or_load(db, workspace_id)
         .await
@@ -1031,28 +1035,46 @@ impl DomainProfileCache {
         inner.fetched_at = None;
     }
 
-    /// 启动期预热：拉全部 active profile 填充缓存。失败静默（缓存留空，
-    /// 下次 `get_or_load` 重试）。
-    pub async fn warm_up(&self, db: &Database) {
-        if let Err(error) = self.reload_from_db(db).await {
-            tracing::warn!(
-                ?error,
-                "DomainProfileCache.warm_up failed; cache remains empty"
-            );
-        }
+    /// 启动期预热：拉全部 active profile 填充缓存。损坏指针或 DB 错误必须阻止启动。
+    pub async fn warm_up(&self, db: &Database) -> AppResult<()> {
+        self.reload_from_db(db).await
     }
 
     async fn reload_from_db(&self, db: &Database) -> AppResult<()> {
         use futures::TryStreamExt;
         let mut cursor = db
             .domain_profiles()
-            .find(doc! { "is_active": true, "current_version": true }, None)
+            .find(doc! { "is_active": true }, None)
             .await?;
         let mut entries: HashMap<String, DomainProfile> = HashMap::new();
         while let Some(profile) = cursor.try_next().await? {
-            // 同 workspace 多条 active（异常态）时后插入者赢——与 find_one 取任意一条
-            // 同语义；正常态每 workspace 至多一条 active+current。
-            entries.insert(profile.workspace_id.clone(), profile);
+            if profile.workspace_id.trim().is_empty()
+                || profile.workspace_id.trim() != profile.workspace_id
+                || profile.profile_id.trim().is_empty()
+                || profile.profile_id.trim() != profile.profile_id
+                || profile.version <= 0
+            {
+                return Err(AppError::Conflict(
+                    "domain_profile_active_identity_invalid".to_string(),
+                ));
+            }
+            crate::models::validate_domain_profile_dimensions(&profile).map_err(|error| {
+                tracing::error!(
+                    workspace_id = %profile.workspace_id,
+                    profile_id = %profile.profile_id,
+                    %error,
+                    "active domain profile has unsafe dimension keys"
+                );
+                AppError::Conflict("domain_profile_active_dimensions_invalid".to_string())
+            })?;
+            if entries
+                .insert(profile.workspace_id.clone(), profile)
+                .is_some()
+            {
+                return Err(AppError::Conflict(
+                    "multiple_active_domain_profiles".to_string(),
+                ));
+            }
         }
         let mut inner = self.inner.lock();
         inner.entries = entries;
@@ -1071,19 +1093,16 @@ impl DomainProfileCache {
     }
 
     /// 查找或自动加载：TTL 过期 → 重载全表；按 `workspace_id` 命中返回真实 profile
-    /// 的 clone，未命中回落 [`default_domain_profile`]（DB 错误时重载失败 → 缓存
-    /// 留空 → 同样回落 default，与接缓存前 `load_active_domain_profile` 逐字等价）。
-    pub(crate) async fn get_or_load(&self, db: &Database, workspace_id: &str) -> DomainProfile {
+    /// 的 clone，未命中回落 [`default_domain_profile`]。重载失败不使用 stale/默认值。
+    pub(crate) async fn get_or_load(
+        &self,
+        db: &Database,
+        workspace_id: &str,
+    ) -> AppResult<DomainProfile> {
         if self.is_stale() {
-            if let Err(error) = self.reload_from_db(db).await {
-                tracing::warn!(
-                    ?error,
-                    workspace_id,
-                    "DomainProfileCache.reload_from_db failed; falling back to DEFAULT_PROFILE"
-                );
-            }
+            self.reload_from_db(db).await?;
         }
-        self.lookup_or_default(workspace_id)
+        Ok(self.lookup_or_default(workspace_id))
     }
 
     /// 纯查表（无 IO）：命中返回真实 profile clone，未命中回落 default。抽出独立
@@ -1146,9 +1165,9 @@ pub(crate) fn global_domain_profile_cache(db: &Database) -> Arc<DomainProfileCac
     domain_profile_cache_for_identity(db.cache_identity(), db.cache_lifetime())
 }
 
-/// 启动期预热：由 `main.rs` 在 `ensure_indexes` 后调用。失败被静默。
-pub async fn init_global_domain_profile_cache(db: &Database) {
-    global_domain_profile_cache(db).warm_up(db).await;
+/// 启动期预热：由 `main.rs` 在 `ensure_indexes` 后调用。损坏配置阻止启动。
+pub async fn init_global_domain_profile_cache(db: &Database) -> AppResult<()> {
+    global_domain_profile_cache(db).warm_up(db).await
 }
 
 /// 引导层 publish/激活 profile 后调用以让缓存立即失效（Phase 3 接线）。
@@ -1345,6 +1364,15 @@ mod tests {
                 "deliveryBoundary"
             ]
         );
+        let pricing = p
+            .coverage_dimensions
+            .iter()
+            .find(|dimension| dimension.key == "pricing")
+            .expect("pricing dimension");
+        assert!(pricing
+            .review_topic_aliases
+            .iter()
+            .any(|alias| alias == "价格"));
     }
 
     #[test]
@@ -1451,8 +1479,8 @@ mod tests {
         // 换行业 = 情感/关系 profile 置 true 旁路。
         let p = default_domain_profile("ws-1");
         assert!(!p.grounding_gate_bypass_without_claim);
-        // reviewer 优化逐字等价护栏：DEFAULT_PROFILE = false → 沿用既有
-        // should_run_review 判定（销售域字节等价）；高敏域 seed 时才置 true。
+        // reviewer 深度护栏：DEFAULT_PROFILE = false → 普通低风险可走 light Reviewer；
+        // 高敏域 seed 时才置 true 强制 full Reviewer。
         assert!(!p.distrust_self_reported_low_risk);
         // G4 #5 逐字等价护栏：DEFAULT 是销售域（交易型）→ transaction_facts_enabled=true，
         // 决策注入产品目录 + 持有投影段，与改造前注入行为字节等价。注意此开关默认 false

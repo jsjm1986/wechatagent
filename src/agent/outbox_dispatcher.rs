@@ -33,7 +33,105 @@ use crate::routes::AppState;
 use super::outbox::{
     backoff_with_jitter_seeded, check_second_safety_gate_pure, write_outbox_event, OutboxStatus,
 };
-use super::run_envelope::SOURCE_KIND_MANUAL_SEND;
+use super::run_envelope::{SOURCE_KIND_MANUAL_SEND, SOURCE_KIND_PRINCIPAL_ESCALATION};
+
+fn principal_card_source_identity(source_event_id: &str) -> Option<(ObjectId, i64)> {
+    let mut parts = source_event_id.split(':');
+    if parts.next()? != "principal-card" {
+        return None;
+    }
+    let escalation_id = ObjectId::parse_str(parts.next()?).ok()?;
+    let generation = parts.next()?.parse::<i64>().ok()?;
+    if parts.next().is_some() || generation < 1 {
+        return None;
+    }
+    Some((escalation_id, generation))
+}
+
+/// Confirm that an internal principal card still belongs to the current frozen
+/// escalation generation. This is checked after claim and again at the last
+/// cancellable point so an admin resolution/reassignment cannot leave an old
+/// queued card authorized for delivery.
+///
+/// The enqueue operation necessarily precedes the escalation acknowledgement.
+/// If the dispatcher wins that narrow race, it completes the same generation
+/// CAS itself instead of canceling a valid card.
+async fn principal_card_send_is_authorized(
+    state: &AppState,
+    outbox_id: ObjectId,
+    entry: &OutboxEntry,
+) -> AppResult<bool> {
+    if entry.source_kind != SOURCE_KIND_PRINCIPAL_ESCALATION {
+        return Ok(true);
+    }
+    let Some((escalation_id, generation)) = principal_card_source_identity(&entry.source_event_id)
+    else {
+        return Ok(false);
+    };
+
+    let base_filter = doc! {
+        "_id": escalation_id,
+        "workspace_id": &entry.workspace_id,
+        "status": crate::models::PRINCIPAL_ESCALATION_STATUS_PENDING,
+        "principal_wxid": &entry.contact_wxid,
+        "protocol.principal_account_id": &entry.account_id,
+        "protocol.delivery_generation": generation,
+        "protocol.delivery_content": &entry.content,
+    };
+    let mut acknowledged_filter = base_filter.clone();
+    acknowledged_filter.insert(
+        "protocol.delivery_state",
+        crate::models::PRINCIPAL_CARD_DELIVERY_QUEUED,
+    );
+    acknowledged_filter.insert("protocol.delivery_outbox_id", outbox_id);
+    if state
+        .db
+        .agent_principal_escalations()
+        .find_one(acknowledged_filter, None)
+        .await?
+        .is_some()
+    {
+        return Ok(true);
+    }
+
+    let mut pending_ack_filter = base_filter.clone();
+    pending_ack_filter.insert(
+        "protocol.delivery_state",
+        crate::models::PRINCIPAL_CARD_DELIVERY_PENDING_ENQUEUE,
+    );
+    pending_ack_filter.insert("protocol.delivery_outbox_id", doc! { "$exists": false });
+    let acknowledged = state
+        .db
+        .agent_principal_escalations()
+        .update_one(
+            pending_ack_filter,
+            doc! { "$set": {
+                "protocol.delivery_state": crate::models::PRINCIPAL_CARD_DELIVERY_QUEUED,
+                "protocol.delivery_outbox_id": outbox_id,
+            } },
+            None,
+        )
+        .await?;
+    if acknowledged.modified_count == 1 {
+        return Ok(true);
+    }
+
+    // The escalation reconciler may have acknowledged the same outbox between
+    // our initial read and CAS. Re-read the exact current-generation identity
+    // before treating a zero-modification CAS as stale.
+    let mut concurrently_acknowledged_filter = base_filter;
+    concurrently_acknowledged_filter.insert(
+        "protocol.delivery_state",
+        crate::models::PRINCIPAL_CARD_DELIVERY_QUEUED,
+    );
+    concurrently_acknowledged_filter.insert("protocol.delivery_outbox_id", outbox_id);
+    Ok(state
+        .db
+        .agent_principal_escalations()
+        .find_one(concurrently_acknowledged_filter, None)
+        .await?
+        .is_some())
+}
 
 /// dispatcher 对**整条 send**（可含多次顺序 MCP 调用）的外层 timeout。
 ///
@@ -492,6 +590,7 @@ async fn complete_requested_cancel_before_send(
         .unwrap_or("cancel requested before remote send");
     let _ = write_event_with_cap(
         state,
+        &entry.workspace_id,
         entry_id,
         &entry.account_id,
         Some(&entry.contact_wxid),
@@ -648,6 +747,7 @@ async fn mark_delivery_unknown_if_owned(
     }
     let _ = write_event_with_cap(
         state,
+        &entry.workspace_id,
         entry_id,
         &entry.account_id,
         Some(&entry.contact_wxid),
@@ -706,6 +806,7 @@ async fn settle_late_cancel_as_delivery_unknown(
     }
     let _ = write_event_with_cap(
         state,
+        &entry.workspace_id,
         entry_id,
         &entry.account_id,
         Some(&entry.contact_wxid),
@@ -733,6 +834,9 @@ pub async fn second_safety_gate(
     state: &AppState,
     entry: &OutboxEntry,
 ) -> AppResult<Option<String>> {
+    if entry.source_kind == SOURCE_KIND_PRINCIPAL_ESCALATION {
+        return Ok(None);
+    }
     let now = DateTime::now();
     let contact = state
         .db
@@ -1380,8 +1484,9 @@ async fn finalize_delivered_text_decision(
                 )
                 .await?
         };
-        if relay_task.is_some() {
-            super::gateway::clear_awaiting_principal_state(state, contact).await?;
+        if let Some(relay_task) = relay_task.as_ref() {
+            super::escalation::terminalize_principal_relay_for_task(state, relay_task, "delivered")
+                .await?;
         }
 
         crate::models::assert_agent_task_status_valid("sent");
@@ -1979,6 +2084,7 @@ pub async fn cancel_entry(
     }
     let _ = write_event_with_cap(
         state,
+        &entry.workspace_id,
         entry_id,
         &entry.account_id,
         Some(&entry.contact_wxid),
@@ -2064,6 +2170,7 @@ pub async fn schedule_retry_or_terminal(
         }
         let _ = write_event_with_cap(
             state,
+            &entry.workspace_id,
             entry_id,
             &entry.account_id,
             Some(&entry.contact_wxid),
@@ -2109,6 +2216,7 @@ pub async fn schedule_retry_or_terminal(
         }
         let _ = write_event_with_cap(
             state,
+            &entry.workspace_id,
             entry_id,
             &entry.account_id,
             Some(&entry.contact_wxid),
@@ -2173,6 +2281,7 @@ pub async fn defer_account_offline(
     }
     let _ = write_event_with_cap(
         state,
+        &entry.workspace_id,
         entry_id,
         &entry.account_id,
         Some(&entry.contact_wxid),
@@ -2191,21 +2300,30 @@ pub async fn defer_account_offline(
     Ok(())
 }
 
-/// 查某账号 `agent_send_outbox` 中 `status=sent` 的最大 `sent_at`（毫秒）。
-/// 无 sent 历史返回 None。靠 (account_id,status,sent_at:-1) 索引取 limit(1)。
-async fn account_last_sent_at_ms(state: &AppState, account_id: &str) -> AppResult<Option<i64>> {
+/// 查某 workspace 内某账号 `agent_send_outbox` 中 `status=sent` 的最大 `sent_at`。
+/// 无 sent 历史返回 None。靠 (workspace_id,account_id,status,sent_at:-1) 索引取 limit(1)。
+async fn account_last_sent_at_ms(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+) -> AppResult<Option<i64>> {
     use mongodb::options::FindOneOptions;
     let collection = state.db.collection_agent_send_outbox();
     let opts = FindOneOptions::builder()
         .sort(doc! { "sent_at": -1 })
         .build();
     let doc = collection
-        .find_one(
-            doc! { "account_id": account_id, "status": OutboxStatus::Sent.as_str() },
-            opts,
-        )
+        .find_one(account_last_sent_filter(workspace_id, account_id), opts)
         .await?;
     Ok(doc.and_then(|e| e.sent_at).map(|d| d.timestamp_millis()))
+}
+
+fn account_last_sent_filter(workspace_id: &str, account_id: &str) -> Document {
+    doc! {
+        "workspace_id": workspace_id,
+        "account_id": account_id,
+        "status": OutboxStatus::Sent.as_str(),
+    }
 }
 
 /// 账号级发送间隔闸命中：把本条 reschedule 到 `last_sent_at + interval`。
@@ -2249,6 +2367,7 @@ async fn defer_account_pacing(
     }
     let _ = write_event_with_cap(
         state,
+        &entry.workspace_id,
         entry_id,
         &entry.account_id,
         Some(&entry.contact_wxid),
@@ -2275,6 +2394,7 @@ async fn defer_account_pacing(
 /// 内容的消息误判命中。
 async fn mcp_already_succeeded(
     state: &AppState,
+    workspace_id: &str,
     account_id: &str,
     contact_wxid: &str,
     content: &str,
@@ -2288,25 +2408,36 @@ async fn mcp_already_succeeded(
         .db
         .mcp_logs()
         .count_documents(
-            doc! {
-                "account_id": account_id,
-                "tool_name": "message_send_text",
-                "request.recipient": contact_wxid,
-                "request.content": content,
-                "error": null,
-                "$or": [
-                    { "response.ok": true },
-                    {
-                        "response.ok": { "$exists": false },
-                        "response.newMsgId": { "$type": "string", "$ne": "" },
-                    },
-                ],
-                "created_at": { "$gte": lower_bound },
-            },
+            mcp_success_filter(workspace_id, account_id, contact_wxid, content, lower_bound),
             None,
         )
         .await?;
     Ok(count > 0)
+}
+
+fn mcp_success_filter(
+    workspace_id: &str,
+    account_id: &str,
+    contact_wxid: &str,
+    content: &str,
+    lower_bound: DateTime,
+) -> Document {
+    doc! {
+        "workspace_id": workspace_id,
+        "account_id": account_id,
+        "tool_name": "message_send_text",
+        "request.recipient": contact_wxid,
+        "request.content": content,
+        "error": null,
+        "$or": [
+            { "response.ok": true },
+            {
+                "response.ok": { "$exists": false },
+                "response.newMsgId": { "$type": "string", "$ne": "" },
+            },
+        ],
+        "created_at": { "$gte": lower_bound },
+    }
 }
 
 /// post-hoc 防重发核对。缺少成功证据不等于确认未送达：只有权威查询明确未命中，
@@ -2331,6 +2462,7 @@ async fn verify_delivery(
     } else if let Some(asset_id) = entry.media_asset_id.as_deref() {
         super::media_send::media_delivery_verification(
             state,
+            &entry.workspace_id,
             &entry.account_id,
             &entry.contact_wxid,
             asset_id,
@@ -2342,6 +2474,7 @@ async fn verify_delivery(
             Duration::from_secs(CHAT_SEARCH_VERIFY_TIMEOUT_SECONDS),
             crate::mcp::chat_search_outbound(
                 state,
+                &entry.workspace_id,
                 &entry.account_id,
                 &entry.contact_wxid,
                 &entry.content,
@@ -2357,6 +2490,7 @@ async fn verify_delivery(
             Ok(Err(_)) | Err(_) => {
                 let hit = mcp_already_succeeded(
                     state,
+                    &entry.workspace_id,
                     &entry.account_id,
                     &entry.contact_wxid,
                     &entry.content,
@@ -2389,6 +2523,7 @@ async fn commit_verified_delivery(
     let delivered_at = DateTime::now();
     let _ = write_event_with_cap(
         state,
+        &entry.workspace_id,
         entry_id,
         &entry.account_id,
         Some(&entry.contact_wxid),
@@ -2462,7 +2597,10 @@ pub(crate) fn check_contact_status_pure(
     source_kind: &str,
     agent_status: &AgentStatus,
 ) -> Option<&'static str> {
-    if source_kind == SOURCE_KIND_MANUAL_SEND {
+    if matches!(
+        source_kind,
+        SOURCE_KIND_MANUAL_SEND | SOURCE_KIND_PRINCIPAL_ESCALATION
+    ) {
         return None;
     }
     match agent_status {
@@ -2483,6 +2621,17 @@ pub async fn process_entry(state: &AppState, entry: &OutboxEntry) -> AppResult<(
             return Ok(());
         }
     };
+
+    if !principal_card_send_is_authorized(state, entry_id, entry).await? {
+        cancel_entry(
+            state,
+            entry_id,
+            entry,
+            "principal_escalation_generation_no_longer_authorized",
+        )
+        .await?;
+        return Ok(());
+    }
 
     // SR-034 第一检查点：正常 Gateway 可能刚写入首段、尚未提交 task 授权；此时无损
     // defer。若 token/decision 已被新 owner 替换，则在任何业务查询和 MCP 前取消。
@@ -2600,7 +2749,9 @@ pub async fn process_entry(state: &AppState, entry: &OutboxEntry) -> AppResult<(
     // 防"连珠炮"——单 worker 串行 for 循环里跨客户/多段消息背靠背零间隔发出 = 机器特征。
     // 位置在 reclaim 幂等门之后（不误拦本该 post-hoc 标 sent 的条目）、发送之前。
     // 查询失败 fail-soft 放行（宁可漏限一次也不丢消息）。
-    if let Ok(Some(last_sent_ms)) = account_last_sent_at_ms(state, &entry.account_id).await {
+    if let Ok(Some(last_sent_ms)) =
+        account_last_sent_at_ms(state, &entry.workspace_id, &entry.account_id).await
+    {
         let interval_ms = super::pacing::account_send_interval_ms(
             fastrand::f64(),
             state.config.account_send_min_interval_ms,
@@ -2627,6 +2778,17 @@ pub async fn process_entry(state: &AppState, entry: &OutboxEntry) -> AppResult<(
         return Ok(());
     };
 
+    if !principal_card_send_is_authorized(state, entry_id, entry).await? {
+        cancel_entry(
+            state,
+            entry_id,
+            entry,
+            "principal_escalation_generation_no_longer_authorized",
+        )
+        .await?;
+        return Ok(());
+    }
+
     // Last cancellable point. The CAS fails when an admin/user cancellation request won, the
     // lease was reclaimed, or another owner replaced this claim. In every case this worker must
     // stop before invoking MCP.
@@ -2635,7 +2797,35 @@ pub async fn process_entry(state: &AppState, entry: &OutboxEntry) -> AppResult<(
     }
 
     let send_fut = async {
-        if let Some(card_id) = entry.referral_card_id.as_deref() {
+        if entry.source_kind == SOURCE_KIND_PRINCIPAL_ESCALATION {
+            let response = crate::mcp::logged_send_call_for_account(
+                state,
+                &entry.workspace_id,
+                &entry.account_id,
+                "message_send_text",
+                serde_json::json!({
+                    "recipient": &entry.contact_wxid,
+                    "content": &entry.content,
+                }),
+            )
+            .await
+            .map_err(super::types::OutboundSendError::from)?;
+            match super::gateway::classify_send_receipt(&response) {
+                super::gateway::SendReceiptStatus::Succeeded => Ok(response),
+                super::gateway::SendReceiptStatus::ExplicitlyFailed => {
+                    Err(super::types::OutboundSendError::SafeToRetry(
+                        "principal escalation card returned an explicit negative delivery receipt"
+                            .to_string(),
+                    ))
+                }
+                super::gateway::SendReceiptStatus::Inconclusive => {
+                    Err(super::types::OutboundSendError::DeliveryUncertain(
+                        "principal escalation card returned an unverifiable delivery receipt"
+                            .to_string(),
+                    ))
+                }
+            }
+        } else if let Some(card_id) = entry.referral_card_id.as_deref() {
             super::referral::send_outbound_namecard(state, &contact, card_id).await
         } else if let Some(asset_id) = entry.media_asset_id.as_deref() {
             super::media_send::send_outbound_media(state, &contact, asset_id).await
@@ -2659,6 +2849,7 @@ pub async fn process_entry(state: &AppState, entry: &OutboxEntry) -> AppResult<(
             let delivered_at = DateTime::now();
             let _ = write_event_with_cap(
                 state,
+                &entry.workspace_id,
                 entry_id,
                 &entry.account_id,
                 Some(&entry.contact_wxid),
@@ -2728,6 +2919,7 @@ pub(crate) fn decide_cap_action(count: u64, sentinel_already: bool) -> CapDecisi
 /// 防止 retry 风暴写爆 events，又保证仪表盘能感知"该 entry 被截断"。
 pub(crate) async fn write_event_with_cap(
     state: &AppState,
+    workspace_id: &str,
     outbox_id: ObjectId,
     account_id: &str,
     contact_wxid: Option<&str>,
@@ -2739,12 +2931,16 @@ pub(crate) async fn write_event_with_cap(
     let count = state
         .db
         .events()
-        .count_documents(doc! { "details.outbox_id": outbox_id }, None)
+        .count_documents(
+            doc! { "workspace_id": workspace_id, "details.outbox_id": outbox_id },
+            None,
+        )
         .await
         .unwrap_or(0);
     if count < PER_ENTRY_EVENT_CAP as u64 {
         return write_outbox_event(
             state,
+            workspace_id,
             account_id,
             contact_wxid,
             kind,
@@ -2759,6 +2955,7 @@ pub(crate) async fn write_event_with_cap(
         .events()
         .count_documents(
             doc! {
+                "workspace_id": workspace_id,
                 "details.outbox_id": outbox_id,
                 "details.kind": "event_cap_reached",
             },
@@ -2791,6 +2988,7 @@ pub(crate) async fn write_event_with_cap(
             };
             write_outbox_event(
                 state,
+                workspace_id,
                 account_id,
                 contact_wxid,
                 "outbox.event_cap_reached",
@@ -3121,6 +3319,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn pacing_and_delivery_filters_are_workspace_account_scoped() {
+        let pacing = account_last_sent_filter("ws-a", "acct-a");
+        assert_eq!(pacing.get_str("workspace_id").unwrap(), "ws-a");
+        assert_eq!(pacing.get_str("account_id").unwrap(), "acct-a");
+        assert_eq!(pacing.get_str("status").unwrap(), "sent");
+
+        let delivery = mcp_success_filter(
+            "ws-a",
+            "acct-a",
+            "wx-a",
+            "hello",
+            DateTime::from_millis(123),
+        );
+        assert_eq!(delivery.get_str("workspace_id").unwrap(), "ws-a");
+        assert_eq!(delivery.get_str("account_id").unwrap(), "acct-a");
+        assert_eq!(delivery.get_str("request.recipient").unwrap(), "wx-a");
+    }
+
     /// `worker_id` 含 hostname / pid / uuid 三段。
     #[test]
     fn worker_id_has_three_segments() {
@@ -3264,4 +3481,19 @@ mod tests {
         assert_eq!(effective_max_attempts(1), 1, "max_attempts>0 原样透传");
         assert_eq!(effective_max_attempts(5), 5, "max_attempts>0 原样透传");
     }
+}
+#[test]
+fn principal_card_source_identity_is_strict() {
+    let id = ObjectId::new();
+    assert_eq!(
+        principal_card_source_identity(&format!("principal-card:{}:2", id.to_hex())),
+        Some((id, 2))
+    );
+    assert!(principal_card_source_identity("principal-card:not-an-id:2").is_none());
+    assert!(principal_card_source_identity(&format!("principal-card:{}:0", id.to_hex())).is_none());
+    assert!(
+        principal_card_source_identity(&format!("principal-card:{}:2:extra", id.to_hex()))
+            .is_none()
+    );
+    assert!(principal_card_source_identity("evt-ordinary").is_none());
 }

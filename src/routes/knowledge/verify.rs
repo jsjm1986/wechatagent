@@ -48,7 +48,7 @@ pub struct KnowledgeVerifyRequest {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct KnowledgeAutoVerifyRequest {
     account_id: Option<String>,
     /// 模型置信度阈值（0-10），≥ 该值才算 verified；默认 7。
@@ -292,12 +292,17 @@ async fn auto_verify_operation_knowledge_chunks_inner(
     let mut rejected = 0i32;
     let mut needs_human_audit = 0i32;
     let mut processed = 0i32;
+    let mut failed = 0i32;
     let mut degraded = false;
 
     while let Some(chunk) = cursor.try_next().await? {
         let Some(chunk_id) = chunk.id else { continue };
-        if budget.is_exceeded() {
-            budget.mark_degraded("knowledge_auto_verify_stopped_budget_exceeded");
+        if budget.should_stop_optional_llm_calls() {
+            if budget.is_exceeded() {
+                budget.mark_degraded("knowledge_auto_verify_stopped_budget_exceeded");
+            } else {
+                budget.mark_degraded("knowledge_auto_verify_stopped_usage_unknown");
+            }
             degraded = true;
             break;
         }
@@ -334,6 +339,7 @@ source_anchors: {}
 
         let value = match agent::generate_agent_json(
             &state,
+            &workspace_id,
             Some(&account_id),
             None,
             Some(&run_id),
@@ -349,8 +355,6 @@ source_anchors: {}
                 continue;
             }
         };
-        processed += 1;
-
         let confidence = value
             .get("confidenceScore")
             .or_else(|| value.get("confidence_score"))
@@ -402,22 +406,14 @@ source_anchors: {}
         // AI 自己背书的 chunk 对客户报价，风险最高；其余三类同样不放行。
         final_status = enforce_verified_needs_human_audit(final_status);
 
-        match final_status.as_str() {
-            "verified" => verified += 1,
-            "rejected" => rejected += 1,
-            "needs_human_audit" => needs_human_audit += 1,
-            _ => needs_review += 1,
-        }
-
         // D2：auto_verify 的每条裁决也接回 apply_chunk_revision，留 chunk_revisions
         // 审计痕迹。**source=Rule**（非 Human）：裁决由 LLM 自评 + 规则闸门
         // （decide_auto_verify_status + enforce_verified_needs_human_audit + 抽样）做出，
         // admin 只触发了批处理、并未逐条审定——标 Rule 才如实反映"规则化批处理写入"，
         // 避免审计按 source 过滤时误判"运营逐条审定了这条"。created_by="auto_verify" 进一步
-        // 标识自动来源。perf：每条多一次 find_one+hash+revision insert+replace_one，但本循环
-        // 已逐条串行调 LLM（数十秒级），DB 这点开销可忽略。失败不阻断整体（best-effort，
-        // 沿用原 `let _ =` 容错姿态）。
-        let _ = apply_chunk_revision(
+        // 标识自动来源。只有 revision 事务提交后，才累计 processed/状态计数并写 usage log；
+        // 写失败保留原 Chunk、计入 failed，不能把模型建议伪装成已发生的业务裁决。
+        let applied = match apply_chunk_revision(
             &state.db,
             &workspace_id,
             chunk_id,
@@ -436,7 +432,28 @@ source_anchors: {}
                 actor: Some("auto_verify".to_string()),
             },
         )
-        .await;
+        .await
+        {
+            Ok(applied) => applied,
+            Err(error) => {
+                failed += 1;
+                tracing::warn!(
+                    workspace_id = %workspace_id,
+                    chunk_id = %chunk_id,
+                    error = %error,
+                    "knowledge auto-verify revision failed; decision not counted"
+                );
+                continue;
+            }
+        };
+        processed += 1;
+        match final_status.as_str() {
+            "verified" => verified += 1,
+            "rejected" => rejected += 1,
+            "needs_human_audit" => needs_human_audit += 1,
+            _ => needs_review += 1,
+        }
+
         let _ = state
             .db
             .knowledge_usage_logs()
@@ -452,6 +469,7 @@ source_anchors: {}
                         "kind": "knowledge_auto_verify",
                         "promptKey": "knowledge.auto_verify",
                         "chunkId": chunk_id.to_hex(),
+                        "revisionId": &applied.revision_id,
                         "confidenceScore": confidence,
                         "modelStatus": model_status,
                         "finalStatus": &final_status,
@@ -488,10 +506,11 @@ source_anchors: {}
                 kind: "knowledge_auto_verify_done".to_string(),
                 status: "success".to_string(),
                 summary: format!(
-                    "自动校验完成：verified={verified} needs_review={needs_review} rejected={rejected} needs_human_audit={needs_human_audit}"
+                    "自动校验完成：processed={processed} failed={failed} verified={verified} needs_review={needs_review} rejected={rejected} needs_human_audit={needs_human_audit}"
                 ),
                 details: Some(doc! {
                     "processed": processed,
+                    "failed": failed,
                     "verified": verified,
                     "needsReview": needs_review,
                     "rejected": rejected,
@@ -510,6 +529,7 @@ source_anchors: {}
 
     Ok(Json(json!({
         "processed": processed,
+        "failed": failed,
         "verified": verified,
         "needsReview": needs_review,
         "rejected": rejected,
@@ -565,6 +585,23 @@ pub fn enforce_verified_needs_human_audit(final_status: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_verify_request_accepts_only_published_camel_case_keys() {
+        let accepted: KnowledgeAutoVerifyRequest = serde_json::from_value(json!({
+            "confidenceThreshold": 9,
+            "humanAuditSampleRate": 0.3,
+            "limit": 50
+        }))
+        .expect("camelCase auto-verify request");
+        assert_eq!(accepted.confidence_threshold, Some(9));
+        assert_eq!(accepted.human_audit_sample_rate, Some(0.3));
+        assert!(serde_json::from_value::<KnowledgeAutoVerifyRequest>(json!({
+            "confidence_threshold": 9,
+            "human_audit_sample_rate": 0.3
+        }))
+        .is_err());
+    }
 
     /// 修复 C-②：product_fact 的 verified 被强制降级 needs_human_audit（堵报错价链路）。
     #[test]

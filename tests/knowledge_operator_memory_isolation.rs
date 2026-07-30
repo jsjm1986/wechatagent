@@ -40,6 +40,9 @@ fn fixture(workspace: &str, account: &str, operator: &str, kind: &str) -> Knowle
         created_at: BsonDt::now(),
         last_used_at: BsonDt::now(),
         expires_at: None,
+        revoked_at: None,
+        revoked_by: None,
+        revocation_reason: None,
     }
 }
 

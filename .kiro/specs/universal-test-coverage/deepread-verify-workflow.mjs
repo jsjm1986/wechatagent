@@ -56,7 +56,7 @@ const ALL_DOMAINS = [
   {"id":"J1","name":"多租户workspace隔离(横切)","newish":false,"loop_type":"crosscutting","entry":"全admin handler + db typed accessor + auth/middleware","core_rule":"几乎所有集合带workspace_id;admin handler普遍workspace隔离;切换workspace后读写按此隔离;IDOR防护","redlines":["跨workspace读写隔离(IDOR防护)","几乎所有集合workspace_id维度"],"focus":"横切!查所有admin端点是否真隔离;查workspace_isolation/products_workspace_isolation/IDOR sweep"},
   {"id":"J2","name":"红线CI lint守门(横切)","newish":false,"loop_type":"crosscutting","entry":"scripts/check-no-human-takeover.{sh,ps1} / check-no-model-hint.sh / check-evolution-isolation.sh / check-baseline.{sh,ps1}","core_rule":"四CI守门:no-human-takeover(src/agent|routes|evolution|frontend新增行禁转人工词表);no-model-hint(禁硬编码模型品牌名);evolution-isolation(evolution禁引用gateway/outbox/mcp主链路符号);baseline(lib≥350+4PBT≥33硬门)","redlines":["四lint命中即exit 1","baseline lib≥350/PBT≥33不回归","新work加测试不降基线"],"focus":"横切!字面级红线守门是否真拦;查四脚本逻辑与是否被绕过(如G6漏'转人工'历史问题)"},
   {"id":"J3","name":"DB迁移+索引(横切)","newish":false,"loop_type":"crosscutting","entry":"src/db/migrations/ + indexes.rs;main.rs先migrations::run后ensure_indexes","core_rule":"Database::connect不跑迁移/建索引;main.rs先migrations::run(某些重建集合)后ensure_indexes;m011/m012/m014带APP_ENV=production守卫(非prod才删);unique/partial unique索引是去重幂等基石","redlines":["migrations先于indexes顺序","APP_ENV=production守卫(生产117疑似未设潜在隐患)","唯一索引承载幂等去重"],"focus":"横切!迁移顺序/APP_ENV守卫生产隐患/索引幂等;查m018_backfill等迁移测试与生产APP_ENV"},
-  {"id":"J4","name":"死代码识别(横切)","newish":false,"loop_type":"crosscutting","entry":"operation_knowledge_items(已死) / pack repair 410死桩 / knowledge_task execute_step占位桩","core_rule":"operation_knowledge_items typed accessor已删,m011/m014物理清空,全src仅占位注释+410端点+migration零业务读写;pack修复propose依赖已删集合永返400死桩;knowledge_task execute_step Phase4占位桩6action不真改chunk","redlines":["死代码不应被测试当活路径误报","死桩端点行为(返400)是已知非bug"],"focus":"横切!识别死代码避免测试误判;确认哪些是真死桩(测试该跳过)哪些是占位待实装"},
+  {"id":"J4","name":"死代码识别(横切)","newish":false,"loop_type":"crosscutting","entry":"operation_knowledge_items(已死) / pack repair 410死桩 / knowledge_task execute_step占位桩","core_rule":"operation_knowledge_items typed accessor已删,m011/m014物理清空,全src仅占位注释+410端点+migration零业务读写;pack修复propose依赖已删集合永返400死桩;knowledge_task execute_step Phase4占位桩6action不真改chunk","redlines":["死代码不应被测试当活路径误报","死桩端点行为(返400)是已知非bug"],"focus":"横切!识别死代码避免测试误判;确认哪些是真死桩(测试该跳过)哪些是占位待实装"}
 ]
 
 
@@ -69,48 +69,94 @@ const BG =
 
 const DEEPREAD_SCHEMA = {
   type: 'object',
-  required: ['domain', 'design_behavior', 'correctness_layer'],
+  additionalProperties: false,
+  required: [
+    'domain_id', 'domain', 'design_behavior', 'redlines', 'existing_coverage',
+    'test_trust', 'test_trust_reason', 'correctness_layer', 'gaps',
+    'suspected_orphans', 'evidence'
+  ],
   properties: {
-    domain: { type: 'string' },
-    design_behavior: { type: 'string' },
+    domain_id: { type: 'string', minLength: 1 },
+    domain: { type: 'string', minLength: 1 },
+    design_behavior: { type: 'string', minLength: 1 },
     redlines: { type: 'array', items: { type: 'string' } },
-    existing_coverage: { type: 'string' },
-    test_trust: { type: 'string' },
-    correctness_layer: { type: 'string' },
+    existing_coverage: { type: 'string', minLength: 1 },
+    test_trust: { type: 'string', enum: ['可信', '假绿', '缺失'] },
+    test_trust_reason: { type: 'string', minLength: 1 },
+    correctness_layer: {
+      type: 'string',
+      enum: ['红线否定式', '设计意图正向', '正向质量主观', '孤儿行为无定义', '混合']
+    },
     gaps: { type: 'array', items: { type: 'string' } },
     suspected_orphans: { type: 'array', items: { type: 'string' } },
+    evidence: {
+      type: 'array', minItems: 1,
+      items: {
+        type: 'object', additionalProperties: false,
+        required: ['path', 'locator', 'claim'],
+        properties: {
+          path: { type: 'string', minLength: 1 },
+          locator: { type: 'string', minLength: 1 },
+          claim: { type: 'string', minLength: 1 },
+        },
+      },
+    },
   },
 }
 
 const FALSIFY_SCHEMA = {
   type: 'object',
-  required: ['domain', 'verdict', 'test_priority'],
+  additionalProperties: false,
+  required: [
+    'domain_id', 'domain', 'verified_gaps', 'refuted', 'confirmed_orphans',
+    'test_priority', 'verdict', 'evidence'
+  ],
   properties: {
-    domain: { type: 'string' },
+    domain_id: { type: 'string', minLength: 1 },
+    domain: { type: 'string', minLength: 1 },
     verified_gaps: { type: 'array', items: { type: 'string' } },
     refuted: { type: 'array', items: { type: 'string' } },
     confirmed_orphans: { type: 'array', items: { type: 'string' } },
     test_priority: { type: 'string', enum: ['P0_redline', 'P1_closed_loop', 'P2_quality', 'P3_crud'] },
-    verdict: { type: 'string' },
+    verdict: { type: 'string', minLength: 1 },
+    evidence: {
+      type: 'array', minItems: 1,
+      items: {
+        type: 'object', additionalProperties: false,
+        required: ['path', 'locator', 'claim'],
+        properties: {
+          path: { type: 'string', minLength: 1 },
+          locator: { type: 'string', minLength: 1 },
+          claim: { type: 'string', minLength: 1 },
+        },
+      },
+    },
   },
 }
 
 const MAX_CONC = 5
 
-// 重试包装:agent 抛错或返 null 都重试;耗尽仍失败返 null(不抛错,不拖垮工作流)
+// 重试包装：任何失败都保留 attempts/errors，耗尽后返回显式 failed outcome。
+// 禁止返回 null；域结果必须占据 manifest 中自己的槽位。
 async function agentRetry(prompt, opts, tries) {
   const n = tries || 3
+  const errors = []
   for (let i = 0; i < n; i++) {
     try {
       const r = await agent(prompt, opts)
-      if (r !== null && r !== undefined) return r
+      if (r !== null && r !== undefined) {
+        return { status: 'complete', attempts: i + 1, errors, payload: r }
+      }
+      errors.push('empty_result')
       log('[重试] ' + (opts.label || '') + ' 返回空 ' + (i + 1) + '/' + n)
     } catch (e) {
-      log('[重试] ' + (opts.label || '') + ' 异常 ' + (i + 1) + '/' + n + ': ' + String(e).slice(0, 100))
+      const message = String(e).slice(0, 500)
+      errors.push(message)
+      log('[重试] ' + (opts.label || '') + ' 异常 ' + (i + 1) + '/' + n + ': ' + message.slice(0, 100))
     }
   }
-  log('[放弃] ' + (opts.label || '') + ' ' + n + ' 次仍失败,跳过该步(不阻断工作流)')
-  return null
+  log('[失败] ' + (opts.label || '') + ' ' + n + ' 次仍失败；保留 failed outcome')
+  return { status: 'failed', attempts: n, errors, payload: null }
 }
 
 // 分批并发:每批 ≤size 并行,批间串行(并发上限硬控)
@@ -139,38 +185,145 @@ if (domains.length === 0) {
   log('错误:未取得业务域清单,终止')
   return { error: 'no_domains' }
 }
+
+// 可复现运行清单。沙箱不能自行读取文件或 git，因此调用者必须在启动前计算并传入
+// 冻结 commit、模型标识和三个输入 SHA-256；缺任一项直接拒绝启动，禁止生成一个
+// 看似完整、实际无法重放的审计工件。
+const runArgs = args || {}
+const SHA256_RE = /^[0-9a-f]{64}$/
+const COMMIT_RE = /^[0-9a-f]{40}$/
+const manifestErrors = []
+if (typeof runArgs.runId !== 'string' || !runArgs.runId.trim()) manifestErrors.push('runId')
+if (typeof runArgs.sourceCommit !== 'string' || !COMMIT_RE.test(runArgs.sourceCommit)) manifestErrors.push('sourceCommit')
+if (typeof runArgs.model !== 'string' || !runArgs.model.trim()) manifestErrors.push('model')
+for (const key of ['domainManifestSha256', 'anchorsSha256', 'workflowSha256']) {
+  if (typeof runArgs[key] !== 'string' || !SHA256_RE.test(runArgs[key])) manifestErrors.push(key)
+}
+if (manifestErrors.length) {
+  throw new Error('audit_run_manifest_invalid:' + manifestErrors.join(','))
+}
+const runManifest = {
+  runId: runArgs.runId,
+  sourceCommit: runArgs.sourceCommit,
+  model: runArgs.model,
+  startedAt: new Date().toISOString(),
+  inputs: {
+    domainManifest: {
+      path: '.kiro/specs/universal-test-coverage/biz-domains-2026-06-30.json',
+      sha256: runArgs.domainManifestSha256,
+    },
+    anchors: {
+      path: '.kiro/specs/universal-test-coverage/audit-2026-06-30-anchors.json',
+      sha256: runArgs.anchorsSha256,
+    },
+    workflow: {
+      path: '.kiro/specs/universal-test-coverage/deepread-verify-workflow.mjs',
+      sha256: runArgs.workflowSha256,
+    },
+  },
+  selectedDomainIds: domains.map((domain) => domain.id),
+}
+
+function identityErrors(payload, domain) {
+  const errors = []
+  if (!payload || payload.domain_id !== domain.id) errors.push('domain_id_mismatch')
+  if (!payload || payload.domain !== domain.name) errors.push('domain_name_mismatch')
+  return errors
+}
+
 log('收到 ' + domains.length + ' 个业务域,≤' + MAX_CONC + ' 并发分批;每域 深读→证伪,各带 3 次重试')
 
 const findings = await inBatches(domains, MAX_CONC, async (domain) => {
-  const deep = await agentRetry(
+  const deepread = await agentRetry(
     BG +
       ' 任务:深读业务域【' + domain.name + '】。入口:' + domain.entry + '。核心规则:' + domain.core_rule +
       '。已知红线:' + JSON.stringify(domain.redlines || []) +
       '。本域审计重点:' + (domain.focus || '端到端输入→决策→副作用链路') +
-      '。读该域相关代码后产出:design_behavior(按设计应有的行为,围绕上述审计重点,具体到可测步骤);' +
+      '。输出中的 domain_id 必须是【' + domain.id + '】、domain 必须是【' + domain.name + '】。' +
+      '读该域相关代码后产出:design_behavior(按设计应有的行为,围绕上述审计重点,具体到可测步骤);' +
       'redlines(硬红线数组);existing_coverage(查 scripts/biz-test/*.py 与 tests/ 下 .rs 的文件名+内容,说清现在测了什么、没测什么);' +
       'test_trust(可信|假绿|缺失 三选一+理由,特别警惕"测试通过但根本没断言实质行为"的假绿);' +
       'correctness_layer(该域正确性主要属哪层:红线否定式|设计意图正向|正向质量主观|孤儿行为无定义);' +
-      'gaps(未覆盖的关键行为);suspected_orphans(代码有实现但红线和文档都没定义对错的孤儿行为)。',
-    { schema: DEEPREAD_SCHEMA, label: '深读:' + domain.name, phase: '按域深读', model: 'opus' },
+      'gaps(未覆盖的关键行为);suspected_orphans(代码有实现但红线和文档都没定义对错的孤儿行为);' +
+      'evidence(至少一条,path+locator+claim,每个关键结论必须能回到源码或测试位置)。',
+    { schema: DEEPREAD_SCHEMA, label: '深读:' + domain.name, phase: '按域深读', model: runArgs.model },
     3
   )
-  if (!deep) return null
+  const base = {
+    domainId: domain.id,
+    domain: domain.name,
+    entry: domain.entry,
+    newish: domain.newish === true,
+  }
+  if (deepread.status === 'failed') {
+    return {
+      ...base,
+      status: 'failed',
+      reason: 'deepread_failed',
+      phases: { deepread, falsify: { status: 'failed', attempts: 0, errors: ['not_attempted'], payload: null } },
+    }
+  }
+  const deepIdentityErrors = identityErrors(deepread.payload, domain)
+  if (deepIdentityErrors.length) {
+    return {
+      ...base,
+      status: 'inconclusive',
+      reason: 'deepread_identity_mismatch',
+      phases: {
+        deepread: { ...deepread, errors: [...deepread.errors, ...deepIdentityErrors] },
+        falsify: { status: 'failed', attempts: 0, errors: ['not_attempted'], payload: null },
+      },
+    }
+  }
   const falsify = await agentRetry(
     BG +
       ' 任务:你是对抗验证者,独立证伪另一 agent 对业务域【' + domain.name + '】的深读结论(下方 JSON)。不要附和,主动找反证。' +
+      '输出中的 domain_id 必须是【' + domain.id + '】、domain 必须是【' + domain.name + '】。' +
       '逐条核对:①它列的 gaps 是真缺口,还是其实已有测试或代码覆盖、只是它没找到?用 grep 验证。' +
       '②它判的 test_trust(尤其假绿)是否属实——亲自打开那个测试读断言。' +
       '③suspected_orphans 是否真无定义,还是红线/文档其实有写、它漏读了?④补它漏掉的缺口。' +
       '产出 verified_gaps(证实的真缺口)/refuted(被推翻的夸大结论+理由)/confirmed_orphans(证实的孤儿行为)/' +
       'test_priority(P0_redline 红线硬门|P1_closed_loop 端到端闭环|P2_quality 正向质量|P3_crud)/verdict(一句话)。' +
-      '必须用 Grep/Read 实证,不空口。深读结论:\n' + JSON.stringify(deep),
-    { schema: FALSIFY_SCHEMA, label: '证伪:' + domain.name, phase: '对抗证伪', model: 'opus' },
+      'evidence 至少一条且每条含 path+locator+claim。必须用 Grep/Read 实证,不空口。深读结论:\n' + JSON.stringify(deepread.payload),
+    { schema: FALSIFY_SCHEMA, label: '证伪:' + domain.name, phase: '对抗证伪', model: runArgs.model },
     3
   )
-  return { domain: domain.name, entry: domain.entry, newish: domain.newish === true, deep, falsify }
+  if (falsify.status === 'failed') {
+    return {
+      ...base,
+      status: 'inconclusive',
+      reason: 'falsify_failed',
+      phases: { deepread, falsify },
+    }
+  }
+  const falsifyIdentityErrors = identityErrors(falsify.payload, domain)
+  if (falsifyIdentityErrors.length) {
+    return {
+      ...base,
+      status: 'inconclusive',
+      reason: 'falsify_identity_mismatch',
+      phases: { deepread, falsify: { ...falsify, errors: [...falsify.errors, ...falsifyIdentityErrors] } },
+    }
+  }
+  return {
+    ...base,
+    status: 'complete',
+    reason: null,
+    phases: { deepread, falsify },
+  }
 })
 
-const ok = findings.filter(Boolean)
-log('深读+证伪完成:' + ok.length + '/' + domains.length + ' 域有结论(失败已跳过,不阻断)')
-return { total: domains.length, completed: ok.length, findings: ok }
+const summary = findings.reduce(
+  (counts, finding) => {
+    counts[finding.status] += 1
+    return counts
+  },
+  { total: findings.length, complete: 0, inconclusive: 0, failed: 0 }
+)
+log(
+  '深读+证伪完成: total=' + summary.total +
+  ' complete=' + summary.complete +
+  ' inconclusive=' + summary.inconclusive +
+  ' failed=' + summary.failed
+)
+return { schemaVersion: 2, runManifest, summary, findings }

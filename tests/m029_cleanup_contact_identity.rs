@@ -233,3 +233,118 @@ async fn cleans_up_stale_contact_identity() {
     let e2 = raw_contact(&app, "gh_managed_keep").await.expect("E2 保留");
     assert_eq!(e2.get_str("agent_status").ok(), Some("managed"));
 }
+
+#[tokio::test]
+#[ignore]
+async fn same_wxid_uses_workspace_and_account_scoped_roster_identity() {
+    let app = common::TestApp::start().await;
+    let contacts = app.state.db.raw().collection::<Document>("contacts");
+    let rosters = app
+        .state
+        .db
+        .raw()
+        .collection::<Document>("roster_snapshots");
+    let now = mongodb::bson::DateTime::now();
+
+    for (workspace, account, nickname) in [
+        ("ws-a", "account-a", "Alice-A"),
+        ("ws-b", "account-b", "Alice-B"),
+    ] {
+        rosters
+            .insert_one(
+                doc! {
+                    "workspace_id": workspace,
+                    "account_id": account,
+                    "friends": [{
+                        "wxid": "shared-wxid",
+                        "nickname": nickname,
+                        "remark": mongodb::bson::Bson::Null,
+                        "avatar_url": format!("https://example.invalid/{workspace}.jpg"),
+                        "sex": mongodb::bson::Bson::Null,
+                        "is_non_human": false,
+                    }],
+                    "total": 1_i64,
+                    "fetched_at": now,
+                },
+                None,
+            )
+            .await
+            .expect("insert scoped roster");
+        contacts
+            .insert_one(
+                doc! {
+                    "workspace_id": workspace,
+                    "account_id": account,
+                    "wxid": "shared-wxid",
+                    "nickname": "Demi",
+                    "agent_status": "normal",
+                    "created_at": now,
+                    "updated_at": now,
+                },
+                None,
+            )
+            .await
+            .expect("insert scoped contact");
+    }
+
+    m029::run_step(&app.state.db)
+        .await
+        .expect("run scoped m029");
+
+    for (workspace, account, expected) in [
+        ("ws-a", "account-a", "Alice-A"),
+        ("ws-b", "account-b", "Alice-B"),
+    ] {
+        let contact = contacts
+            .find_one(
+                doc! {
+                    "workspace_id": workspace,
+                    "account_id": account,
+                    "wxid": "shared-wxid",
+                },
+                None,
+            )
+            .await
+            .expect("query scoped contact")
+            .expect("scoped contact remains");
+        assert_eq!(contact.get_str("nickname").ok(), Some(expected));
+    }
+
+    app.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn unscoped_legacy_contact_is_skipped_until_ownership_backfill() {
+    let app = common::TestApp::start().await;
+    let contacts = app.state.db.raw().collection::<Document>("contacts");
+    contacts
+        .insert_one(
+            doc! {
+                "account_id": "legacy-account",
+                "wxid": "gh_unscoped_legacy",
+                "nickname": "Demi",
+                "agent_status": "normal",
+                "created_at": mongodb::bson::DateTime::now(),
+                "updated_at": mongodb::bson::DateTime::now(),
+            },
+            None,
+        )
+        .await
+        .expect("insert unscoped legacy contact");
+
+    m029::run_step(&app.state.db)
+        .await
+        .expect("unscoped row must not abort safe reconciliation");
+
+    assert_eq!(
+        contacts
+            .count_documents(doc! { "wxid": "gh_unscoped_legacy" }, None)
+            .await
+            .expect("count unscoped row"),
+        1,
+        "ownership-unknown row must remain untouched until m036 is approved"
+    );
+
+    app.cleanup().await;
+}

@@ -36,6 +36,7 @@ async fn rollback_restores_archived_previous_to_active() {
         previous_version: None,
         seeded_by: Some("system".to_string()),
         locale: None,
+        source_proposal_id: None,
     };
     // 新版本行：evolution release 出来的 current。
     let new = PromptTemplate {
@@ -61,9 +62,15 @@ async fn rollback_restores_archived_previous_to_active() {
         common::insert_released_prompt_proposal(&app.state, &workspace, key, "1").await;
 
     // 执行回滚。
-    wechatagent::evolution::release::rollback_prompt(&app.state, proposal_id, "tester")
-        .await
-        .expect("rollback ok");
+    wechatagent::evolution::release::rollback_prompt(
+        &app.state,
+        proposal_id,
+        &workspace,
+        &app.state.config.default_account_id,
+        "tester",
+    )
+    .await
+    .expect("rollback ok");
 
     // version=1 行应被恢复为 current_version=true AND status=active。
     let restored = app
@@ -115,6 +122,7 @@ async fn rollback_aborts_when_previous_version_missing() {
         previous_version: Some(1),
         seeded_by: Some("evolution_release".to_string()),
         locale: None,
+        source_proposal_id: None,
     };
     app.state
         .db
@@ -128,8 +136,14 @@ async fn rollback_aborts_when_previous_version_missing() {
         common::insert_released_prompt_proposal(&app.state, &workspace, key, "1").await;
 
     // 执行回滚：应返 Err（找不到 version 1 行）。
-    let result =
-        wechatagent::evolution::release::rollback_prompt(&app.state, proposal_id, "tester").await;
+    let result = wechatagent::evolution::release::rollback_prompt(
+        &app.state,
+        proposal_id,
+        &workspace,
+        &app.state.config.default_account_id,
+        "tester",
+    )
+    .await;
     assert!(
         result.is_err(),
         "previous_version 行缺失时 rollback 必须返 Err，而非假成功"

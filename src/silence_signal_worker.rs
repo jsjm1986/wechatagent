@@ -15,7 +15,8 @@
 //!    判 true）才落信号；
 //! 3) `dedupe_key="silence:{wxid}:{last_outbound_at_ms}"` + partial unique 索引
 //!    保证同一条 outbound 只产一次沉默事件（重复 tick 幂等）；
-//! 4) 单 workspace 单 tick `silence_signal_daily_cap` 上限，防首跑信号风暴。
+//! 4) 单 workspace、UTC 当日持久 `silence_signal_daily_cap` 上限，防并发/重启后
+//!    重复消耗配额与首跑信号风暴。
 
 use std::time::Duration;
 
@@ -25,6 +26,7 @@ use tokio::time::sleep;
 
 use crate::behavior_signals;
 use crate::models::Contact;
+use crate::proactive_outreach::{CommitOutcome, DailyQuota};
 use crate::routes::AppState;
 
 /// 沉默探测 worker 主循环。flag=false 或 interval==0 时立刻 return（关停态）。
@@ -41,8 +43,23 @@ pub async fn run_silence_signal_worker(state: AppState) {
         "silence_signal_worker loop started"
     );
     loop {
-        if let Err(error) = tick(&state).await {
-            tracing::error!(error = %error, "silence_signal_worker tick failed");
+        match crate::account_scheduler::list_registered_account_scopes(&state).await {
+            Ok(scopes) => {
+                for scope in crate::account_scheduler::representative_workspace_scopes(&scopes) {
+                    if let Err(error) =
+                        scan_silence(&state, &scope.workspace_id, &scope.account_id).await
+                    {
+                        tracing::error!(
+                            error = %error,
+                            workspace_id = %scope.workspace_id,
+                            "silence_signal_worker workspace scan failed"
+                        );
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::error!(error = %error, "silence_signal_worker scope listing failed");
+            }
         }
         sleep(Duration::from_secs(
             state.config.silence_signal_interval_seconds.max(60),
@@ -53,20 +70,28 @@ pub async fn run_silence_signal_worker(state: AppState) {
 
 /// 单 tick 入口（lib 测试 + 主循环复用）。
 pub async fn tick(state: &AppState) -> anyhow::Result<()> {
-    scan_silence(state).await
+    let scopes = crate::account_scheduler::list_registered_account_scopes(state).await?;
+    for scope in crate::account_scheduler::representative_workspace_scopes(&scopes) {
+        scan_silence(state, &scope.workspace_id, &scope.account_id).await?;
+    }
+    Ok(())
 }
 
-async fn scan_silence(state: &AppState) -> anyhow::Result<()> {
-    let workspace_id = state.config.default_workspace_id.clone();
+async fn scan_silence(
+    state: &AppState,
+    workspace_id: &str,
+    audit_account_id: &str,
+) -> anyhow::Result<()> {
     let now = DateTime::now();
     let now_ms = now.timestamp_millis();
     let threshold_ms = state.config.silence_threshold_seconds.saturating_mul(1000);
     let silent_before = DateTime::from_millis(now_ms - threshold_ms);
 
-    let filter = silence_candidate_filter(&workspace_id, silent_before);
+    let filter = silence_candidate_filter(workspace_id, silent_before);
     let mut cursor = state.db.contacts().find(filter, None).await?;
 
     let daily_cap = state.config.silence_signal_daily_cap;
+    let already_emitted_today = count_today_silence_signals(state, workspace_id, now).await?;
     let mut scanned = 0i64;
     let mut emitted = 0i64;
 
@@ -75,26 +100,50 @@ async fn scan_silence(state: &AppState) -> anyhow::Result<()> {
         if !decide_silence_signal(&contact, now_ms, threshold_ms) {
             continue;
         }
-        if cap_reached(emitted, daily_cap) {
-            break;
-        }
         let Some(last_outbound) = contact.last_outbound_at else {
             continue;
         };
         let signal = behavior_signals::build_silence(
             &contact.workspace_id,
+            &contact.account_id,
             &contact.wxid,
             last_outbound,
             now,
         );
-        // 幂等落库：dedupe_key 撞索引 → persist_signal 返回 Ok(false)，不计 emit。
-        let workspace_id = contact.workspace_id.clone();
-        let result = behavior_signals::persist_signal(state, signal).await;
-        behavior_signals::record_signal_metric(state, &workspace_id, &result).await;
+        // Signal identity, daily quota and append-only observation commit in
+        // one transaction. Duplicate observations do not consume quota.
+        let signal_workspace_id = contact.workspace_id.clone();
+        let result = crate::proactive_outreach::commit_signal_with_daily_quota(
+            state,
+            signal,
+            "silence",
+            DailyQuota {
+                namespace: "silence_signal",
+                account_scope: None,
+                total_cap: daily_cap,
+                segment_cap: None,
+                initial_total: already_emitted_today,
+                initial_segment: already_emitted_today,
+            },
+        )
+        .await;
         match result {
-            Ok(true) => emitted += 1,
-            Ok(false) => {}
+            Ok(CommitOutcome::Emitted) => {
+                let metric_result = Ok(true);
+                behavior_signals::record_signal_metric(state, &signal_workspace_id, &metric_result)
+                    .await;
+                emitted += 1;
+            }
+            Ok(CommitOutcome::Duplicate) => {
+                let metric_result = Ok(false);
+                behavior_signals::record_signal_metric(state, &signal_workspace_id, &metric_result)
+                    .await;
+            }
+            Ok(CommitOutcome::Capped) => break,
             Err(error) => {
+                let metric_result = Err(anyhow::anyhow!(error.to_string()));
+                behavior_signals::record_signal_metric(state, &signal_workspace_id, &metric_result)
+                    .await;
                 tracing::warn!(
                     error = %error,
                     wxid = %contact.wxid,
@@ -106,7 +155,8 @@ async fn scan_silence(state: &AppState) -> anyhow::Result<()> {
 
     write_event(
         state,
-        &state.config.default_account_id,
+        workspace_id,
+        audit_account_id,
         "silence_signal_tick",
         "ok",
         &format!("silence_signal_worker tick: scanned {scanned}, emitted {emitted}"),
@@ -114,11 +164,33 @@ async fn scan_silence(state: &AppState) -> anyhow::Result<()> {
             "scanned": scanned,
             "emitted": emitted,
             "dailyCap": daily_cap,
+            "alreadyEmittedToday": already_emitted_today,
             "thresholdSeconds": state.config.silence_threshold_seconds,
         }),
     )
     .await?;
     Ok(())
+}
+
+async fn count_today_silence_signals(
+    state: &AppState,
+    workspace_id: &str,
+    now: DateTime,
+) -> anyhow::Result<i64> {
+    let day_start =
+        DateTime::from_millis(now.timestamp_millis().div_euclid(86_400_000) * 86_400_000);
+    Ok(state
+        .db
+        .behavior_signals()
+        .count_documents(
+            doc! {
+                "workspace_id": workspace_id,
+                "signal_type": "silence",
+                "observed_at": { "$gte": day_start },
+            },
+            None,
+        )
+        .await? as i64)
 }
 
 /// workspace 级沉默候选过滤：managed + `last_outbound_at` 早于阈值。
@@ -170,15 +242,25 @@ pub(crate) fn cap_reached(emitted: i64, daily_cap: i64) -> bool {
 
 async fn write_event(
     state: &AppState,
+    workspace_id: &str,
     account_id: &str,
     kind: &str,
     status: &str,
     summary: &str,
     details: Option<Document>,
 ) -> anyhow::Result<()> {
-    crate::agent::write_event_for_account(state, account_id, None, kind, status, summary, details)
-        .await
-        .map_err(|e| anyhow::anyhow!(e.to_string()))
+    crate::agent::write_event_for_account(
+        state,
+        workspace_id,
+        account_id,
+        None,
+        kind,
+        status,
+        summary,
+        details,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!(e.to_string()))
 }
 
 #[cfg(test)]

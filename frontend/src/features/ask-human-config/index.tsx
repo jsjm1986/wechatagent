@@ -24,17 +24,19 @@ function AskHumanConfigView() {
   const [draft, setDraft] = useState<AskHumanPolicy>(defaultPolicy());
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [loaded, setLoaded] = useState(false);
   const [saving, setSaving] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
     setLoadError(null);
+    setLoaded(false);
     try {
       const res = await api.get<{ item: unknown }>(`/api/operation-domains/${DOMAIN}`);
       setDraft(extractPolicy(res.item));
+      setLoaded(true);
     } catch (e) {
       setLoadError(e instanceof Error ? e.message : String(e));
-      setDraft(defaultPolicy());
     } finally {
       setLoading(false);
     }
@@ -66,6 +68,10 @@ function AskHumanConfigView() {
   }
 
   async function save() {
+    if (!loaded || loadError) {
+      toast.error("现有配置尚未成功读取，禁止覆盖保存");
+      return;
+    }
     const errs = validatePolicy(draft);
     if (errs.length > 0) {
       toast.error(errs[0]);
@@ -102,16 +108,17 @@ function AskHumanConfigView() {
     <div className={styles.page}>
       <header className={styles.header}>
         <h1 className={styles.title}>请示通道配置</h1>
-        <button type="button" className={styles.saveBtn} onClick={() => void save()} disabled={saving || loading}>
+        <button type="button" className={styles.saveBtn} onClick={() => void save()} disabled={saving || loading || !loaded || Boolean(loadError)}>
           {saving ? "保存中…" : "保存"}
         </button>
       </header>
 
-      {loadError && <div className={styles.loadError}>读取现有配置失败（已展示默认值，可编辑保存）：{loadError}</div>}
+      {loadError && <div className={styles.loadError} role="alert">读取现有配置失败，已禁止保存以避免覆盖线上策略：{loadError}</div>}
 
       <section className={styles.section}>
         <h2 className={styles.sectionTitle}>决策人链</h2>
         <DeciderChainEditor chain={draft.deciderChain} onChange={(c) => setDraft((d) => ({ ...d, deciderChain: c }))} />
+        <div className={styles.chainHint}>清空决策人链并保存，即明确关闭请示通道。</div>
       </section>
 
       <section className={styles.section}>
@@ -142,6 +149,19 @@ function AskHumanConfigView() {
           />
           <span className={styles.fieldUnit}>小时（留空=无限等待）</span>
         </div>
+        {draft.quietHours && (
+          <button
+            type="button"
+            className={styles.linkBtn}
+            onClick={() => setDraft((current) => {
+              const next = { ...current };
+              delete next.quietHours;
+              return next;
+            })}
+          >
+            清除静默时段
+          </button>
+        )}
         <div className={styles.chainHint}>主决策人多久没响应就转交链中下一位</div>
       </section>
 

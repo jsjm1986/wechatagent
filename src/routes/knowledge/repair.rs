@@ -20,7 +20,15 @@ use std::sync::Arc;
 
 use crate::auth::AuthenticatedAdmin;
 use crate::error::{AppError, AppResult};
-use crate::{agent, models::KnowledgeUsageLog, prompts};
+use crate::knowledge_wiki::chunk_revisions::{
+    apply_chunk_revision_with_session, commit_chunk_transaction, ProvenanceSource, RevisionOp,
+    RevisionRequest,
+};
+use crate::{
+    agent,
+    models::{AgentEvent, KnowledgeUsageLog},
+    prompts,
+};
 
 use super::super::shared::*;
 use super::super::AppState;
@@ -45,23 +53,27 @@ pub(in crate::routes) struct ChunkRepairAnswer {
 
 /// AI 修复 patch 落库后的"应用事件"上报体。
 ///
-/// 前端 `applyAiRepairPatch` 在调用现有 PUT（+ 可选 verify）成功后，再 POST
-/// 一次本端点，让审计链能拼出"AI 提议 → 操作员接受 → 落库"的闭环。本端点
-/// 不写知识库本身（patch 已通过现有 PUT 写过），只写一条 AgentEvent
-/// `kind=knowledge_repair_applied`，并把 `extras`（schema 没有容器、本轮未持
-/// 久化进业务字段的领域专属建议）也带进事件 details 里，避免审计黑洞。
+/// 前端 `applyAiRepairPatch` 把完整提案与 acceptedFields 一次提交到本端点。
+/// 服务端筛选受控字段、通过 revision harness 落为 draft+needs_review，并写入
+/// `kind=knowledge_repair_applied` 的 AgentEvent；`extras`（schema 没有容器的
+/// 领域专属建议）仅进入审计 details，不写业务字段。
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(in crate::routes) struct RepairApplyBody {
-    /// "chunk" / "pack"
+    /// Only "chunk" is supported. The legacy pack collection no longer exists.
     pub target_kind: String,
     pub target_id: String,
+    /// Full proposal patch returned by the Agent. The server applies only keys
+    /// named by accepted_fields and rejects non-editable business fields.
+    #[serde(default)]
+    pub patch: Value,
     pub session_id: Option<String>,
     pub turn: Option<u8>,
     /// 操作员实际接受落库的字段名列表（不含 extras）。
     #[serde(default)]
     pub accepted_fields: Vec<String>,
-    /// 操作员勾掉的字段名列表。
+    /// Compatibility input only. The server derives skipped fields from patch
+    /// minus accepted_fields and does not trust this client-reported list.
     #[serde(default)]
     pub skipped_fields: Vec<String>,
     /// AI 自评可信度（透传 propose/answer 返回的 confidenceHint，便于审计）。
@@ -69,7 +81,8 @@ pub(in crate::routes) struct RepairApplyBody {
     /// AI 在 patch.extras 输出的"领域专属字段建议"，schema 无对应容器，
     /// 当前仅作为审计快照保留，不影响业务字段。
     pub extras: Option<Value>,
-    /// 应用同时是否触发了运营确认（POST /verify）。
+    /// Legacy compatibility input. This endpoint never verifies; true is
+    /// rejected rather than recorded as an action that did not happen.
     #[serde(default)]
     pub then_verify: bool,
 }
@@ -218,34 +231,51 @@ async fn write_repair_usage_log(
 pub(crate) async fn propose_chunk_repair_inner(
     state: &AppState,
     workspace_id: &str,
+    account_scope: Option<&str>,
     chunk_object_id: ObjectId,
     run_id: &str,
 ) -> AppResult<Value> {
+    let mut chunk_filter = doc! {
+        "_id": chunk_object_id,
+        "workspace_id": workspace_id,
+    };
+    if let Some(account_id) = account_scope {
+        chunk_filter.insert("domain", "user_operations");
+        chunk_filter.insert(
+            "$or",
+            vec![
+                doc! { "account_id": null },
+                doc! { "account_id": account_id },
+            ],
+        );
+    }
     let chunk = state
         .db
         .operation_knowledge_chunks()
-        .find_one(
-            doc! {
-                "_id": chunk_object_id,
-                "workspace_id": workspace_id
-            },
-            None,
-        )
+        .find_one(chunk_filter, None)
         .await?
         .ok_or_else(|| AppError::NotFound("operation knowledge chunk not found".to_string()))?;
 
     // parent document（用于 sourceQuote 锚定）
     let document = if let Some(document_id) = chunk.document_id {
+        let mut document_filter = doc! {
+            "_id": document_id,
+            "workspace_id": workspace_id,
+        };
+        if let Some(account_id) = account_scope {
+            document_filter.insert("domain", "user_operations");
+            document_filter.insert(
+                "$or",
+                vec![
+                    doc! { "account_id": null },
+                    doc! { "account_id": account_id },
+                ],
+            );
+        }
         state
             .db
             .operation_knowledge_documents()
-            .find_one(
-                doc! {
-                    "_id": document_id,
-                    "workspace_id": workspace_id
-                },
-                None,
-            )
+            .find_one(document_filter, None)
             .await?
     } else {
         None
@@ -308,6 +338,7 @@ pub(crate) async fn propose_chunk_repair_inner(
     // 不建 budget、不 scope：直接调 generate_agent_json，token 计入调用方的 ambient scope。
     let value = agent::generate_agent_json(
         state,
+        workspace_id,
         Some(&account_id),
         None,
         Some(run_id),
@@ -389,7 +420,8 @@ pub async fn propose_chunk_repair(
     ));
     let parsed = agent::RUN_BUDGET
         .scope(budget.clone(), async {
-            propose_chunk_repair_inner(&state, &admin.current_workspace, object_id, &run_id).await
+            propose_chunk_repair_inner(&state, &admin.current_workspace, None, object_id, &run_id)
+                .await
         })
         .await?;
     Ok(Json(json!({
@@ -491,6 +523,7 @@ pub(in crate::routes) async fn answer_chunk_repair(
         .scope(budget.clone(), async {
             agent::generate_agent_json(
                 &state,
+                &admin.current_workspace,
                 Some(&account_id),
                 None,
                 Some(&run_id),
@@ -598,70 +631,66 @@ fn format_repair_apply_summary(
     )
 }
 
-/// AI 修复 patch 落库后的"应用事件"端点（POST /api/operation-knowledge/repair/applied）。
+/// AI 修复 patch 的唯一提交端点（POST /api/operation-knowledge/repair/applied）。
 ///
-/// 与 propose / answer 不同，本端点**不调 LLM、不查知识、不写知识本身**——它
-/// 只为闭合审计链路而存在：前端 `applyAiRepairPatch` 在已经把 patch 通过现有
-/// PUT 写进 chunk/pack（以及可选地走完 /verify）之后，再调用本端点，让
-/// `agent_events` 留下一条 `kind=knowledge_repair_applied` 行，details 里携带
+/// 与 propose / answer 不同，本端点不调 LLM。它把操作者接受的字段通过
+/// `apply_chunk_revision(source=ai)` 落为 draft+needs_review，然后写
+/// `agent_events kind=knowledge_repair_applied`，details 里携带
 /// 操作员实际接受/跳过了哪些字段、是否同时触发 verify、AI 自评可信度，以及
 /// AI 在 patch.extras 里输出但 schema 暂无容器的"领域专属字段建议"快照。
 ///
-/// 不做的事：
-/// - 不验证字段名合法性（前端已经过 PUT 校验，这里若再校一遍只会出现错位告警）；
-/// - 不写 KnowledgeUsageLog（usage log 已在 propose/answer 阶段记过，应用阶段
-///   只是事件，不再消耗 LLM）；
-/// - 不写主业务集合（patch 已通过现有 PUT 落库，重复写会破坏只读性）。
+/// 不做的事：不调用 verify、不信任客户端 lifecycle/scope 字段、不重复记录
+/// KnowledgeUsageLog。
 pub(in crate::routes) async fn record_repair_apply(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
     Json(body): Json<RepairApplyBody>,
 ) -> AppResult<Json<Value>> {
-    let kind_label = match body.target_kind.as_str() {
-        "chunk" => "chunk_repair_session",
-        "pack" => "pack_repair_session",
-        other => {
-            return Err(AppError::BadRequest(format!(
-                "unknown repair target kind: {other}"
-            )))
-        }
-    };
-
-    if body.target_id.trim().is_empty() {
-        return Err(AppError::BadRequest("targetId cannot be empty".to_string()));
+    if body.target_kind != "chunk" {
+        return Err(AppError::BadRequest(
+            "repair apply supports only chunk targets; legacy packs no longer exist".to_string(),
+        ));
     }
-
-    // 取 account_id：优先从被改写的对象上取，找不到就 fallback default_account_id。
-    // 不阻塞调用：任何错误都退化为 None 走 fallback。
-    let resolved_account = match body.target_kind.as_str() {
-        "chunk" => match parse_object_id(&body.target_id) {
-            Ok(oid) => state
-                .db
-                .operation_knowledge_chunks()
-                .find_one(
-                    doc! {
-                        "_id": oid,
-                        "workspace_id": &admin.current_workspace
-                    },
-                    None,
-                )
-                .await
-                .ok()
-                .flatten()
-                .and_then(|c| c.account_id),
-            Err(_) => None,
-        },
-        "pack" => {
-            // operation_knowledge_items 已删除；pack 维度的 account_id 解析回退到默认账号。
-            let _ = parse_object_id(&body.target_id);
-            None
+    if body.then_verify {
+        return Err(AppError::BadRequest(
+            "repair apply cannot verify knowledge; use the dedicated verify route".to_string(),
+        ));
+    }
+    let chunk_id = parse_object_id(&body.target_id)?;
+    let proposal = body
+        .patch
+        .as_object()
+        .ok_or_else(|| AppError::BadRequest("patch must be an object".to_string()))?;
+    let mut accepted_names = Vec::with_capacity(body.accepted_fields.len());
+    let mut accepted_set = std::collections::HashSet::new();
+    let mut accepted_patch = serde_json::Map::new();
+    for field in &body.accepted_fields {
+        if !accepted_set.insert(field.as_str()) {
+            return Err(AppError::BadRequest(format!(
+                "acceptedFields contains duplicate field: {field}"
+            )));
         }
-        _ => None,
-    };
-    let account_id = resolved_account.unwrap_or_else(|| state.config.default_account_id.clone());
-
-    let accepted_count = body.accepted_fields.len() as i32;
-    let skipped_count = body.skipped_fields.len() as i32;
+        let value = proposal.get(field).ok_or_else(|| {
+            AppError::BadRequest(format!("accepted field is absent from patch: {field}"))
+        })?;
+        accepted_names.push(field.clone());
+        accepted_patch.insert(field.clone(), value.clone());
+    }
+    if accepted_patch.is_empty() {
+        return Err(AppError::BadRequest(
+            "acceptedFields must contain at least one field".to_string(),
+        ));
+    }
+    let mut patch = normalize_editable_chunk_patch(&Value::Object(accepted_patch))?;
+    let skipped_fields: Vec<String> = proposal
+        .keys()
+        .filter(|field| field.as_str() != "extras" && !accepted_set.contains(field.as_str()))
+        .cloned()
+        .collect();
+    // Kept in the compatibility DTO, but deliberately not trusted for audit.
+    let _client_reported_skipped_fields = &body.skipped_fields;
+    let accepted_count = accepted_names.len() as i32;
+    let skipped_count = skipped_fields.len() as i32;
     let extras_doc = body
         .extras
         .as_ref()
@@ -670,40 +699,125 @@ pub(in crate::routes) async fn record_repair_apply(
     let extras_kind = classify_extras_kind(body.extras.as_ref());
 
     let summary = format_repair_apply_summary(
-        &body.target_kind,
+        "chunk",
         &body.target_id,
         accepted_count,
         skipped_count,
-        body.then_verify,
+        false,
     );
-
-    record_repair_event(
-        &state,
-        &admin.current_workspace,
-        &account_id,
-        "knowledge_repair_applied",
-        summary.clone(),
-        doc! {
-            "kind": kind_label,
-            "targetKind": &body.target_kind,
-            "targetId": &body.target_id,
-            "sessionId": body.session_id.clone().unwrap_or_default(),
-            "turn": body.turn.unwrap_or(0) as i32,
-            "acceptedFields": &body.accepted_fields,
-            "skippedFields": &body.skipped_fields,
-            "acceptedCount": accepted_count,
-            "skippedCount": skipped_count,
-            "thenVerify": body.then_verify,
-            "confidenceHint": body.confidence_hint.unwrap_or(0),
-            "extrasKind": extras_kind,
-            "extras": extras_doc,
-        },
-    )
+    let mut session = state.db.client().start_session(None).await?;
+    session.start_transaction(None).await?;
+    let transaction_result: AppResult<(String, String)> = async {
+        let chunk = state
+            .db
+            .operation_knowledge_chunks()
+            .find_one_with_session(
+                doc! { "_id": chunk_id, "workspace_id": &admin.current_workspace },
+                None,
+                &mut session,
+            )
+            .await?
+            .ok_or_else(|| AppError::NotFound("operation knowledge chunk not found".to_string()))?;
+        if patch.contains_key("source_quote") {
+            let quote = patch.get_str("source_quote").unwrap_or_default();
+            let anchors = if let Some(document_id) = chunk.document_id {
+                state
+                    .db
+                    .operation_knowledge_documents()
+                    .find_one_with_session(
+                        doc! { "_id": document_id, "workspace_id": &admin.current_workspace },
+                        None,
+                        &mut session,
+                    )
+                    .await?
+                    .and_then(|document| document.raw_content)
+                    .and_then(|raw| source_anchor_for_quote(&raw, Some(document_id), quote))
+                    .map(|anchor| vec![anchor])
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            patch.insert(
+                "source_anchors",
+                mongodb::bson::to_bson(&anchors).map_err(|error| {
+                    AppError::External(format!("serialize source anchors failed: {error}"))
+                })?,
+            );
+        }
+        let applied = apply_chunk_revision_with_session(
+            &state.db,
+            &admin.current_workspace,
+            chunk_id,
+            RevisionRequest {
+                op: RevisionOp::Patch,
+                source: ProvenanceSource::Ai,
+                patch,
+                reason: Some(format!(
+                    "AI repair session {} turn {}",
+                    body.session_id.clone().unwrap_or_default(),
+                    body.turn.unwrap_or(0)
+                )),
+                actor: Some(admin.username.clone()),
+            },
+            &mut session,
+        )
+        .await?;
+        let account_id = chunk
+            .account_id
+            .unwrap_or_else(|| state.config.default_account_id.clone());
+        state
+            .db
+            .events()
+            .insert_one_with_session(
+                AgentEvent {
+                    id: None,
+                    workspace_id: admin.current_workspace.clone(),
+                    account_id: account_id.clone(),
+                    contact_wxid: None,
+                    kind: "knowledge_repair_applied".to_string(),
+                    status: "success".to_string(),
+                    summary: summary.clone(),
+                    details: Some(doc! {
+                        "kind": "chunk_repair_session",
+                        "targetKind": "chunk",
+                        "targetId": &body.target_id,
+                        "revisionId": &applied.revision_id,
+                        "sessionId": body.session_id.clone().unwrap_or_default(),
+                        "turn": body.turn.unwrap_or(0) as i32,
+                        "acceptedFields": &accepted_names,
+                        "skippedFields": &skipped_fields,
+                        "acceptedCount": accepted_count,
+                        "skippedCount": skipped_count,
+                        "requestedThenVerify": false,
+                        "confidenceHint": body.confidence_hint.unwrap_or(0),
+                        "extrasKind": extras_kind,
+                        "extras": extras_doc,
+                    }),
+                    created_at: DateTime::now(),
+                    dedupe_key: None,
+                },
+                None,
+                &mut session,
+            )
+            .await?;
+        Ok((applied.revision_id, account_id))
+    }
     .await;
+    let (revision_id, _account_id) = match transaction_result {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = session.abort_transaction().await;
+            return Err(error);
+        }
+    };
+    commit_chunk_transaction(&mut session).await?;
 
     Ok(Json(json!({
         "ok": true,
         "summary": summary,
+        "revisionId": revision_id,
+        "status": "draft",
+        "integrityStatus": "needs_review",
         "extrasRecorded": extras_kind != "absent",
     })))
 }

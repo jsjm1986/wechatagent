@@ -122,11 +122,35 @@ pub(in crate::routes) async fn digest_regenerate(
 }
 
 /// `POST /api/knowledge/digest/cards/:id/dismiss`：把卡片标记为已忽略，画布灰显。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::routes) struct DigestDismissQuery {
+    pub account_id: String,
+}
+
+fn digest_card_filter(
+    workspace_id: &str,
+    account_id: &str,
+    report_date: &str,
+    card_id: ObjectId,
+) -> mongodb::bson::Document {
+    doc! {
+        "workspace_id": workspace_id,
+        "account_id": account_id,
+        "report_date": report_date,
+        "cards.cardId": card_id,
+    }
+}
+
 pub(in crate::routes) async fn digest_dismiss_card(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
     Path(card_id_hex): Path<String>,
+    Query(query): Query<DigestDismissQuery>,
 ) -> AppResult<Json<Value>> {
+    if query.account_id.trim().is_empty() {
+        return Err(AppError::BadRequest("accountId is required".to_string()));
+    }
     let card_id = ObjectId::parse_str(&card_id_hex)
         .map_err(|_| AppError::BadRequest(format!("invalid card_id: {card_id_hex}")))?;
     let report_date = chrono::Local::now().format("%Y-%m-%d").to_string();
@@ -135,11 +159,12 @@ pub(in crate::routes) async fn digest_dismiss_card(
         .db
         .knowledge_daily_reports()
         .update_one(
-            doc! {
-                "workspace_id": &admin.current_workspace,
-                "report_date": &report_date,
-                "cards.cardId": &card_id,
-            },
+            digest_card_filter(
+                &admin.current_workspace,
+                &query.account_id,
+                &report_date,
+                card_id,
+            ),
             doc! {
                 "$addToSet": { "dismissed_card_ids": &card_id }
             },
@@ -156,6 +181,7 @@ pub(in crate::routes) async fn digest_dismiss_card(
     Ok(Json(json!({
         "ok": true,
         "cardId": card_id_hex,
+        "accountId": query.account_id,
         "reportDate": report_date,
     })))
 }
@@ -167,6 +193,7 @@ fn serialize_digest_report(report: &crate::models::KnowledgeDailyReport) -> Json
         .map(|card| {
             json!({
                 "cardId": card.card_id.to_hex(),
+                "cardHash": crate::knowledge_digest::digest_card_snapshot_hash(card),
                 "kind": &card.kind,
                 "title": &card.title,
                 "summary": &card.summary,
@@ -179,6 +206,7 @@ fn serialize_digest_report(report: &crate::models::KnowledgeDailyReport) -> Json
         .collect();
     Json(json!({
         "reportId": report.id.map(|id| id.to_hex()),
+        "reportHash": crate::knowledge_digest::digest_report_snapshot_hash(report),
         "workspaceId": report.workspace_id,
         "accountId": report.account_id,
         "reportDate": report.report_date,
@@ -187,6 +215,13 @@ fn serialize_digest_report(report: &crate::models::KnowledgeDailyReport) -> Json
         "status": report.status,
         "errorKind": report.error_kind,
         "budgetSnapshot": serde_json::to_value(&report.budget_snapshot).unwrap_or(json!({})),
+        "attemptGeneration": report.attempt_generation,
+        "currentGeneration": report.current_generation,
+        "latestAttemptStatus": report.latest_attempt_status,
+        "latestAttemptErrorKind": report.latest_attempt_error_kind,
+        "latestAttemptAt": report.latest_attempt_at.and_then(crate::models::dt_to_string),
+        "latestAttemptBudgetSnapshot": serde_json::to_value(&report.latest_attempt_budget_snapshot).unwrap_or(json!({})),
+        "lastSuccessAt": report.last_success_at.and_then(crate::models::dt_to_string),
         "cards": cards_json,
         "dismissedCardIds": report
             .dismissed_card_ids
@@ -540,6 +575,16 @@ pub(in crate::routes) async fn knowledge_inbox(
 mod tests {
     use super::*;
 
+    #[test]
+    fn digest_dismiss_filter_is_scoped_by_workspace_and_account() {
+        let card_id = ObjectId::new();
+        let filter = digest_card_filter("ws-a", "acc-a", "2026-07-02", card_id);
+        assert_eq!(filter.get_str("workspace_id").unwrap(), "ws-a");
+        assert_eq!(filter.get_str("account_id").unwrap(), "acc-a");
+        assert_eq!(filter.get_str("report_date").unwrap(), "2026-07-02");
+        assert_eq!(filter.get_object_id("cards.cardId").unwrap(), card_id);
+    }
+
     // ── AI Inbox 聚合纯函数测试 ────────────────────────────────────────
 
     /// 不变量：digest 卡片 severity → inbox priority 三档映射稳定。
@@ -726,6 +771,13 @@ mod tests {
             cards: vec![card],
             dismissed_card_ids: vec![],
             prompt_versions: doc! {},
+            attempt_generation: 2,
+            current_generation: 1,
+            latest_attempt_status: Some("failed".to_string()),
+            latest_attempt_error_kind: Some("upstream_timeout".to_string()),
+            latest_attempt_at: Some(DateTime::now()),
+            latest_attempt_budget_snapshot: doc! { "token_budget": 12345_i64 },
+            last_success_at: Some(DateTime::now()),
         };
 
         let json_response = serialize_digest_report(&report);
@@ -745,6 +797,9 @@ mod tests {
         assert_eq!(c["suggestedAction"].as_str().unwrap(), "fix_chunk");
         assert!(c["targetRefs"].is_array());
         assert_eq!(c["kind"].as_str().unwrap(), "chunk_missing_field");
+        assert_eq!(json_val["attemptGeneration"].as_i64(), Some(2));
+        assert_eq!(json_val["currentGeneration"].as_i64(), Some(1));
+        assert_eq!(json_val["latestAttemptStatus"].as_str(), Some("failed"));
 
         // 确认 snake_case 键不存在（证明 rename_all 生效）
         assert!(

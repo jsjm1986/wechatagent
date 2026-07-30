@@ -616,7 +616,23 @@ CATALOG_REBUILD_WORKER_INTERVAL_SECONDS=3     # catalog rebuild worker tick；0 
 
 ### import_apply 协议变更
 
-`POST /api/operation-knowledge/import-apply` 不再让 LLM 返一次大 JSON。改要求 `---CHUNK: chunk_id---...---END CHUNK---` 流式块（fence-aware parse + unsafe path-like rejection + 流截断 warning）。每块独立校验 + 落库 + 写 chunk_revision (op=create, source=imported)。已闭合块照常落库（不全有总比全无好）。
+`POST /api/operation-knowledge/import-preview` 会把抽取结果保存为服务端导入 intent，并返回不可变的 `previewId`、`previewHash`；每条候选同时带稳定 `candidateId`。同步预览和异步 preview job 完成都使用同一封印逻辑。
+
+`POST /api/operation-knowledge/import-apply` 只接受：
+
+```json
+{
+  "previewId": "...",
+  "previewHash": "...",
+  "chunks": [
+    { "candidateId": "candidate-0001", "patch": { "title": "可选人工修订" } }
+  ]
+}
+```
+
+Apply 不再接受客户端回传的 `document`、废弃 `items`、账号、租户、审核状态或来源锚点。服务端按当前 workspace、预览创建管理员、已封印账号和原文重新构造所有 server-owned 字段，并只允许内容编辑白名单。Document、全部 Chunk、每条 create revision、catalog rebuild intent 与导入终态在同一 MongoDB 事务中提交；任一候选校验或写入失败整体回滚。相同请求重放返回持久化的稳定回执，不同候选/补丁重放返回冲突。
+
+PDF、图片和自动摄取保留各自的解析入口，但最终统一进入同一个事务提交内核。内核以 `workspace + account + sourceName + 完整文本` 的 SHA-256 派生稳定 Document/Chunk 身份；事务前完成 fence 解析与所有可采纳块校验，事务内一次写入 Document、全部 Chunk、每条 create revision 和 catalog rebuild intent。任一数据库/revision/catalog 写失败整批回滚；相同输入的并发调用或网络重试在核验完整已提交图后返回同一回执。所有导入 Chunk 均由服务端强制为 `draft + needs_review`，客户端或模型不能覆盖租户、账号、父文档及审核状态。
 
 ### record_chunk_hit fire-and-forget hook
 

@@ -8,7 +8,7 @@ Commits：`9c34d80`（Workspace Key 支持）+ `35a6125`（P0 缺口补全）
 
 ## 背景
 
-之前测试环境 MCP server 宕机，所有 MCP 调用走 C 类 BLOCKED 路径。现需正式接入真实 MCP server (117.72.54.28:3001)，使用 Workspace Key `gwa_ba60a98a...` 管理多账号。
+之前测试环境 MCP server 宕机，所有 MCP 调用走 C 类 BLOCKED 路径。现需正式接入真实 MCP server (117.72.54.28:3001)，使用由运行环境注入的 Workspace Key 管理多账号。
 
 ---
 
@@ -109,7 +109,7 @@ GET  /api/accounts/login/poll
 ```bash
 # .env
 MCP_BASE_URL=http://117.72.54.28:3001
-MCP_API_KEY=gwa_ba60a98aada58c10b77f6f20841c77c6c3c0506d9431871f
+MCP_API_KEY=<INJECT_FROM_SECRET_STORE>
 WEBHOOK_VERIFY_SIGNATURE=true
 ```
 

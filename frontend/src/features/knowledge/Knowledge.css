@@ -1965,6 +1965,25 @@
     color: var(--ink-3);
     font-family: var(--font-mono);
   }
+  .wikiMemoryItemActions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .wikiMemoryRevokeBtn {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    border: 0;
+    background: transparent;
+    color: var(--color-blocked);
+    font-size: 11.5px;
+    cursor: pointer;
+  }
+  .wikiMemoryRevokeBtn:disabled {
+    cursor: not-allowed;
+    opacity: 0.45;
+  }
   .wikiMemoryContent {
     font-size: 13px;
     line-height: 1.55;
@@ -2031,10 +2050,10 @@
     font-family: var(--font-body);
     text-align: center;
   }
-  /* P1-4 · 锁徽章：进入 Inspector 后实时显示当前 chunk 锁状态。
-   * self  — 自己持锁，绿点；
-   * other — 他人持锁（HTTP 409 或 ws 推 locked），琥珀点 + 暂只读语义；
-   * error — 锁信道异常（网络错或 5xx），灰点；UI 不阻塞但提醒。
+  /* P1-4 · 协作 presence：只提示谁正在查看/编辑，不代表写权限或互斥。
+   * self  — 自己的 presence，绿点；
+   * other — 他人 presence（HTTP 409 或 ws 推 locked），琥珀点；
+   * error — 提示信道异常（网络错或 5xx），灰点；mutation 仍由 CAS 保护。
    */
   .wikiInspectorLockBadge {
     display: flex;

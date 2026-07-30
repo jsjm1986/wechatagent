@@ -13,8 +13,10 @@ export const CANONICAL_KEYS = [
   "promptKey",
   "promptTokens",
   "runId",
+  "runMode",
   "status",
   "totalTokens",
+  "usageKnown",
   "workspaceId",
 ] as const;
 

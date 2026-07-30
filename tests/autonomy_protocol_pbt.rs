@@ -15,9 +15,8 @@
 //!   `needsRevision=true` 或 `approved=false`，则终态 SHALL 为
 //!   `gateway_status="revision_failed"` + `decision.should_reply=false`。
 //!
-//! - **P3 预算超额不发送**：R3.7 / R3.10 — 在 `RunBudget::is_exceeded() == true` 且
-//!   `decision.needs_review == true` 时，`local_decision_review` SHALL 返回
-//!   `approved == false` + `risks == ["budget_exceeded_no_review"]`。
+//! - **P3 未执行 Reviewer 不发送**：任何 `should_reply=true` 的正文在
+//!   `local_decision_review` 都不得获批；预算耗尽保留 `budget_exceeded_no_review` 终态。
 
 use proptest::prelude::*;
 use wechatagent::agent::{AgentDecision, RawAgentDecision, UserRuntimeParameters};
@@ -166,14 +165,11 @@ proptest! {
 }
 
 // ─────────────────────────────────────────────────────────────────
-// P3 预算超额不发送（task 4.13）
+// P3 未执行 Reviewer 不发送（task 4.13）
 // ─────────────────────────────────────────────────────────────────
 //
-// 性质本质：当 `RunBudget::is_exceeded() == true` 且 `decision.needs_review == true`
-// 时，`local_decision_review` SHALL 返回 `approved=false` + 唯一 risk =
-// `"budget_exceeded_no_review"`；当 `is_exceeded() == true` 且 `needs_review == false`
-// 时，应为 `approved=true` + risks 含 `"local_review_low_risk_only"`；当 budget
-// 未超额时，approved=true 且 risks 不含上述两个降级标记。
+// 性质本质：`needs_review` / 自报风险不得授权绕过独立 Reviewer。只要存在拟发送正文，
+// 本地 fallback 在预算是否耗尽的所有组合下都必须 `approved=false`。
 //
 // W3 / Task 4.13：`local_decision_review` 与 `RunBudget` 已通过 mod.rs / review.rs
 // 提升为 `pub`（仅 PBT 入口需要），其余 `current_run_budget` / `RUN_BUDGET` 仍为
@@ -198,10 +194,7 @@ proptest! {
     /// **Property 3 / Task 4.13 / Validates: R3.7, R3.8, R3.10**
     ///
     /// `local_decision_review` 在 budget 超额 / 未超额、`needs_review` true / false
-    /// 的全部组合下，必须严格满足三态决策表：
-    /// - `is_exceeded && needs_review` → `approved=false` + `risks==["budget_exceeded_no_review"]`
-    /// - `is_exceeded && !needs_review` → `approved=true` + risks 含 `local_review_low_risk_only`
-    /// - `!is_exceeded` → `approved=true` 且 risks 不含上述两个降级标记
+    /// 的全部组合下都不能批准拟发送正文。
     #[test]
     fn p3_budget_exceeded_no_review_consistent(
         (token_budget, max_llm_calls, force_exceeded, needs_review)
@@ -218,35 +211,24 @@ proptest! {
         }
 
         let mut decision = AgentDecision::default();
+        decision.should_reply = true;
+        decision.reply_text = "sendable body".to_string();
         decision.needs_review = needs_review;
-        // distrust=false 的 DEFAULT runtime：保持 PBT 三态语义字节等价。
         let runtime = UserRuntimeParameters::default();
         let result = local_decision_review(&decision, &budget, &runtime);
 
-        if force_exceeded && needs_review {
-            // R3.7：高风险路径，必须拒绝放行且唯一 risk 是 budget_exceeded_no_review。
-            prop_assert_eq!(result.approved, false);
+        prop_assert!(!result.approved);
+        if force_exceeded {
             prop_assert_eq!(
                 result.risks.as_slice(),
                 &["budget_exceeded_no_review".to_string()][..],
-                "needs_review=true 且超额时唯一 risk 必须是 budget_exceeded_no_review"
-            );
-        } else if force_exceeded && !needs_review {
-            // R3.8：低风险快速通道，approved=true 且必须显式标注未走 LLM review。
-            prop_assert!(result.approved, "needs_review=false 且超额时应放行");
-            prop_assert!(
-                result.risks.iter().any(|r| r == "local_review_low_risk_only"),
-                "needs_review=false 且超额时 risks 必须含 local_review_low_risk_only，实际：{:?}",
-                result.risks
+                "budget exhaustion must preserve the blocked_by_budget contract"
             );
         } else {
-            // R3.10：未超额路径不应出现以上两个 budget-降级标记。
-            prop_assert!(result.approved, "未超额时默认 approved=true");
+            prop_assert!(result.should_hold);
             prop_assert!(
-                !result.risks.iter().any(|r|
-                    r == "budget_exceeded_no_review" || r == "local_review_low_risk_only"
-                ),
-                "未超额时不应出现 budget 降级 risk，实际：{:?}",
+                result.risks.iter().any(|r| r == "required_reviewer_not_executed"),
+                "a non-budget local fallback must be an auditable safety hold: {:?}",
                 result.risks
             );
         }

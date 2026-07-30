@@ -33,16 +33,20 @@ describe("DomainSchemaEditor", () => {
   it("edit 模式回填已有 schema 且 schemaId 只读", () => {
     const existing = {
       schemaId: "x",
+      version: 7,
       name: "旧名",
       fields: [{ name: "f1", label: "字段1", kind: "string", required: false }],
       aliasDict: {},
       guardDsl: null,
     };
-    render(<DomainSchemaEditor mode="edit" initial={existing as never} onSubmit={vi.fn()} onCancel={vi.fn()} />);
+    const onSubmit = vi.fn();
+    render(<DomainSchemaEditor mode="edit" initial={existing as never} onSubmit={onSubmit} onCancel={vi.fn()} />);
     expect(screen.getByDisplayValue("旧名")).toBeInTheDocument();
     expect(screen.getByDisplayValue("字段1")).toBeInTheDocument();
     // edit 模式 schemaId 输入框只读
     const schemaIdInput = screen.getByDisplayValue("x") as HTMLInputElement;
     expect(schemaIdInput.disabled).toBe(true);
+    fireEvent.click(screen.getByText("保存"));
+    expect(onSubmit.mock.calls[0][0]).toHaveProperty("expectedVersion", 7);
   });
 });

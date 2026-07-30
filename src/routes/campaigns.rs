@@ -20,10 +20,12 @@ use axum::{Extension, Json};
 use futures::TryStreamExt;
 use mongodb::bson::oid::ObjectId;
 use mongodb::bson::{doc, DateTime, Document};
+use mongodb::options::{FindOneAndUpdateOptions, ReturnDocument};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
-use super::AppState;
+use super::{shared::validate_account, AppState};
 use crate::agent::run_envelope::SOURCE_KIND_FOLLOW_UP_TASK;
 
 /// 阶段1：Mongo 粗筛 filter。命中 outcome_events.productRef.productId 索引。
@@ -134,9 +136,95 @@ pub struct CreateCampaignRequest {
     pub account_id: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateCampaignDraftRequest {
+    pub title: String,
+    pub intent_text: String,
+    #[serde(default)]
+    pub segment_filter: SegmentFilter,
+    pub expected_spec_version: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DispatchCampaignRequest {
+    pub spec_hash: String,
+    pub spec_version: i64,
+}
+
+fn normalize_segment_filter(mut filter: SegmentFilter) -> SegmentFilter {
+    filter.product_ids = filter
+        .product_ids
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect();
+    filter.product_ids.sort();
+    filter.product_ids.dedup();
+    filter.aftercare = normalize_optional_text(filter.aftercare);
+    filter.value_tier = normalize_optional_text(filter.value_tier);
+    filter.customer_stage = normalize_optional_text(filter.customer_stage);
+    filter
+}
+
+fn normalize_optional_text(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn campaign_spec_hash(
+    workspace_id: &str,
+    account_id: &str,
+    title: &str,
+    intent_text: &str,
+    segment_filter: &SegmentFilter,
+) -> AppResult<String> {
+    let bytes = serde_json::to_vec(&json!({
+        "workspaceId": workspace_id,
+        "accountId": account_id,
+        "title": title,
+        "intentText": intent_text,
+        "segmentFilter": segment_filter,
+    }))?;
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
+fn current_campaign_spec_hash(campaign: &Campaign) -> AppResult<String> {
+    campaign_spec_hash(
+        &campaign.workspace_id,
+        &campaign.account_id,
+        &campaign.title,
+        &campaign.intent_text,
+        &campaign.segment_filter,
+    )
+}
+
+/// Management context and Campaign routes must expose the exact same frozen
+/// specification identity. Keep the hash implementation private and export
+/// only this read-only projection helper.
+pub fn campaign_spec_hash_for_view(campaign: &Campaign) -> AppResult<String> {
+    current_campaign_spec_hash(campaign)
+}
+
+fn deterministic_campaign_task_id(
+    campaign_id: ObjectId,
+    generation: i64,
+    contact_wxid: &str,
+) -> ObjectId {
+    let digest = Sha256::digest(format!(
+        "campaign-task:v1:{campaign_id}:{generation}:{contact_wxid}"
+    ));
+    let mut bytes = [0_u8; 12];
+    bytes.copy_from_slice(&digest[..12]);
+    ObjectId::from_bytes(bytes)
+}
+
 /// 自建活动 follow_up 任务（不调 planner 私有 emit_planner_follow_up；
 /// 形态对齐 management.rs:1461 create_follow_up_task）。
 pub(super) fn build_campaign_follow_up_task(
+    task_id: ObjectId,
     workspace_id: &str,
     account_id: &str,
     contact_wxid: &str,
@@ -145,7 +233,7 @@ pub(super) fn build_campaign_follow_up_task(
 ) -> AgentTask {
     let expires_at = DateTime::from_millis(now.timestamp_millis() + 48 * 60 * 60 * 1000);
     AgentTask {
-        id: None,
+        id: Some(task_id),
         workspace_id: workspace_id.to_string(),
         account_id: account_id.to_string(),
         contact_wxid: contact_wxid.to_string(),
@@ -153,7 +241,9 @@ pub(super) fn build_campaign_follow_up_task(
         run_at: now,
         expires_at: Some(expires_at),
         content: intent_text.to_string(),
-        status: "pending".to_string(),
+        // CampaignSend is the durable fanout intent. Keep the task outside the
+        // worker claim set until that intent has been finalized as enqueued.
+        status: "committing".to_string(),
         source_decision_id: None,
         review_required: true,
         attempt_count: 0,
@@ -240,17 +330,36 @@ pub async fn create_campaign(
         .account_id
         .filter(|a| !a.trim().is_empty())
         .unwrap_or_else(|| state.config.default_account_id.clone());
+    validate_account(&state, &admin.current_workspace, &account_id).await?;
+    let title = body.title.trim().to_string();
+    let intent_text = body.intent_text.trim().to_string();
+    let segment_filter = normalize_segment_filter(body.segment_filter);
+    let spec_hash = campaign_spec_hash(
+        &admin.current_workspace,
+        &account_id,
+        &title,
+        &intent_text,
+        &segment_filter,
+    )?;
     let campaign = Campaign {
         id: None,
         workspace_id: admin.current_workspace.clone(),
         account_id,
-        title: body.title.trim().to_string(),
-        intent_text: body.intent_text.trim().to_string(),
-        segment_filter: body.segment_filter,
+        title,
+        intent_text,
+        segment_filter,
+        spec_version: 1,
+        spec_hash: Some(spec_hash.clone()),
         status: "draft".to_string(),
         target_count: None,
         dispatched_count: 0,
         last_dispatch_target_count: None,
+        dispatch_generation: 0,
+        dispatch_spec_hash: None,
+        dispatch_audience: vec![],
+        dispatch_intent_text: None,
+        dispatch_started_at: None,
+        dispatch_completed_at: None,
         created_by: admin.username.clone(),
         created_at: now,
         updated_at: now,
@@ -258,7 +367,87 @@ pub async fn create_campaign(
     let res = state.db.campaigns().insert_one(&campaign, None).await?;
     Ok(Json(json!({
         "id": res.inserted_id.as_object_id().map(|i| i.to_hex()),
-        "status": "draft"
+        "status": "draft",
+        "specVersion": 1,
+        "specHash": spec_hash,
+    })))
+}
+
+pub async fn update_campaign_draft(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
+    Path(id): Path<String>,
+    Json(body): Json<UpdateCampaignDraftRequest>,
+) -> AppResult<Json<Value>> {
+    if body.title.trim().is_empty() || body.intent_text.trim().is_empty() {
+        return Err(AppError::BadRequest(
+            "title 与 intentText 不能为空".to_string(),
+        ));
+    }
+    if body.expected_spec_version < 1 {
+        return Err(AppError::BadRequest(
+            "expectedSpecVersion must be positive".to_string(),
+        ));
+    }
+    let oid = ObjectId::parse_str(&id)
+        .map_err(|_| AppError::BadRequest("非法 campaign id".to_string()))?;
+    let existing = state
+        .db
+        .campaigns()
+        .find_one(
+            doc! {
+                "_id": oid,
+                "workspaceId": &admin.current_workspace,
+                "status": { "$in": ["draft", "previewed"] },
+            },
+            None,
+        )
+        .await?
+        .ok_or_else(|| AppError::Conflict("campaign_spec_is_frozen".to_string()))?;
+    let title = body.title.trim().to_string();
+    let intent_text = body.intent_text.trim().to_string();
+    let segment_filter = normalize_segment_filter(body.segment_filter);
+    let spec_hash = campaign_spec_hash(
+        &existing.workspace_id,
+        &existing.account_id,
+        &title,
+        &intent_text,
+        &segment_filter,
+    )?;
+    let next_version = body.expected_spec_version + 1;
+    let mut update_filter = doc! {
+        "_id": oid,
+        "workspaceId": &admin.current_workspace,
+        "status": { "$in": ["draft", "previewed"] },
+    };
+    update_filter.extend(campaign_spec_version_filter(body.expected_spec_version));
+    let updated = state
+        .db
+        .campaigns()
+        .update_one(
+            update_filter,
+            doc! { "$set": {
+                "title": &title,
+                "intentText": &intent_text,
+                "segmentFilter": mongodb::bson::to_bson(&segment_filter)?,
+                "specVersion": next_version,
+                "specHash": &spec_hash,
+                "status": "draft",
+                "updatedAt": DateTime::now(),
+            }, "$unset": { "targetCount": "" } },
+            None,
+        )
+        .await?;
+    if updated.matched_count != 1 {
+        return Err(AppError::Conflict(
+            "campaign_spec_version_conflict".to_string(),
+        ));
+    }
+    Ok(Json(json!({
+        "campaignId": id,
+        "status": "draft",
+        "specVersion": next_version,
+        "specHash": spec_hash,
     })))
 }
 
@@ -278,6 +467,9 @@ pub async fn preview_campaign(
         )
         .await?
         .ok_or_else(|| AppError::NotFound("campaign not found".to_string()))?;
+    if !matches!(campaign.status.as_str(), "draft" | "previewed") {
+        return Err(AppError::Conflict("campaign_spec_is_frozen".to_string()));
+    }
     let hits = resolve_segment_contacts(
         &state,
         &campaign.workspace_id,
@@ -298,19 +490,12 @@ pub async fn preview_campaign(
             })
         })
         .collect();
-    assert_campaign_status_valid("previewed");
-    state
-        .db
-        .campaigns()
-        .update_one(
-            doc! { "_id": oid, "workspaceId": &admin.current_workspace },
-            doc! { "$set": { "status": "previewed", "targetCount": target, "updatedAt": DateTime::now() } },
-            None,
-        )
-        .await?;
+    let spec_hash = current_campaign_spec_hash(&campaign)?;
     Ok(Json(json!({
         "campaignId": id,
         "intentText": campaign.intent_text,
+        "specVersion": campaign.spec_version,
+        "specHash": spec_hash,
         "targetCount": target,
         "samples": samples,
     })))
@@ -323,10 +508,22 @@ pub(super) fn dispatch_allowed_from_status(status: &str) -> bool {
     matches!(status, "draft" | "previewed" | "dispatching")
 }
 
+fn campaign_spec_version_filter(expected: i64) -> Document {
+    if expected == 1 {
+        doc! { "$or": [
+            { "specVersion": 1_i64 },
+            { "specVersion": { "$exists": false } },
+        ] }
+    } else {
+        doc! { "specVersion": expected }
+    }
+}
+
 pub async fn dispatch_campaign(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
+    Json(body): Json<DispatchCampaignRequest>,
 ) -> AppResult<Json<Value>> {
     let oid = ObjectId::parse_str(&id)
         .map_err(|_| AppError::BadRequest("非法 campaign id".to_string()))?;
@@ -339,123 +536,411 @@ pub async fn dispatch_campaign(
         )
         .await?
         .ok_or_else(|| AppError::NotFound("campaign not found".to_string()))?;
-    // KC-02：置 dispatching 前先校验当前 status——completed/未知态拒绝重推，
-    // draft/previewed/dispatching 放行（dispatching 支持后续补偿回滚的重入恢复）。
     if !dispatch_allowed_from_status(&campaign.status) {
         return Err(AppError::BadRequest(format!(
             "当前活动状态 {} 不可派发（仅 draft/previewed/dispatching 可派发；completed 需另建活动）",
             campaign.status
         )));
     }
-    // 重新跑圈人（防预览后数据漂移）。
-    let hits = resolve_segment_contacts(
-        &state,
-        &campaign.workspace_id,
-        &campaign.account_id,
-        &campaign.segment_filter,
-        state.config.campaign_max_audience,
-    )
-    .await?;
-    if hits.is_empty() {
-        return Err(AppError::BadRequest("命中 0 人，无可推送对象".to_string()));
+    let requested_hash = body.spec_hash.trim();
+    if requested_hash.is_empty() || body.spec_version < 1 {
+        return Err(AppError::BadRequest(
+            "specHash and positive specVersion are required".to_string(),
+        ));
     }
+    let frozen = if campaign.status == "dispatching" {
+        validate_frozen_dispatch(&campaign, requested_hash, body.spec_version)?;
+        campaign
+    } else {
+        let actual_hash = current_campaign_spec_hash(&campaign)?;
+        if requested_hash != actual_hash || body.spec_version != campaign.spec_version {
+            return Err(AppError::Conflict(
+                "campaign_spec_confirmation_mismatch".to_string(),
+            ));
+        }
+        let hits = resolve_segment_contacts(
+            &state,
+            &campaign.workspace_id,
+            &campaign.account_id,
+            &campaign.segment_filter,
+            state.config.campaign_max_audience,
+        )
+        .await?;
+        if hits.is_empty() {
+            return Err(AppError::BadRequest("命中 0 人，无可推送对象".to_string()));
+        }
+        let audience: Vec<String> = hits.into_iter().map(|contact| contact.wxid).collect();
+        freeze_campaign_dispatch(
+            &state,
+            &campaign,
+            requested_hash,
+            body.spec_version,
+            &audience,
+        )
+        .await?
+    };
+    let dispatched = materialize_campaign_dispatch(&state, &frozen).await?;
+    Ok(Json(json!({
+        "campaignId": id,
+        "dispatchedCount": dispatched,
+        "status": "completed",
+        "dispatchGeneration": frozen.dispatch_generation,
+        "specHash": requested_hash,
+    })))
+}
+
+fn validate_frozen_dispatch(
+    campaign: &Campaign,
+    requested_hash: &str,
+    requested_version: i64,
+) -> AppResult<()> {
+    if campaign.dispatch_generation < 1
+        || campaign.dispatch_audience.is_empty()
+        || campaign.dispatch_spec_hash.as_deref() != Some(requested_hash)
+        || campaign.spec_version != requested_version
+        || campaign.dispatch_intent_text.is_none()
+    {
+        return Err(AppError::Conflict(
+            "campaign_dispatch_snapshot_missing_or_mismatched".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+async fn freeze_campaign_dispatch(
+    state: &AppState,
+    campaign: &Campaign,
+    spec_hash: &str,
+    spec_version: i64,
+    audience: &[String],
+) -> AppResult<Campaign> {
+    let campaign_id = campaign
+        .id
+        .ok_or_else(|| AppError::External("campaign id missing".to_string()))?;
+    let now = DateTime::now();
     assert_campaign_status_valid("dispatching");
-    state
+    let options = FindOneAndUpdateOptions::builder()
+        .return_document(ReturnDocument::After)
+        .build();
+    if let Some(frozen) = state
         .db
         .campaigns()
+        .find_one_and_update(
+            doc! {
+                "_id": campaign_id,
+                "workspaceId": &campaign.workspace_id,
+                "accountId": &campaign.account_id,
+                "status": { "$in": ["draft", "previewed"] },
+                "$and": [
+                    campaign_spec_version_filter(spec_version),
+                    { "$or": [
+                        { "specHash": spec_hash },
+                        { "specHash": { "$exists": false } },
+                        { "specHash": null },
+                    ] },
+                ],
+            },
+            doc! { "$set": {
+                "status": "dispatching",
+                "specHash": spec_hash,
+                "dispatchGeneration": campaign.dispatch_generation.max(0) + 1,
+                "dispatchSpecHash": spec_hash,
+                "dispatchAudience": audience,
+                "dispatchIntentText": &campaign.intent_text,
+                "dispatchStartedAt": now,
+                "targetCount": audience.len() as i64,
+                "updatedAt": now,
+            } },
+            options,
+        )
+        .await?
+    {
+        return Ok(frozen);
+    }
+    let current = state
+        .db
+        .campaigns()
+        .find_one(
+            doc! { "_id": campaign_id, "workspaceId": &campaign.workspace_id },
+            None,
+        )
+        .await?
+        .ok_or_else(|| AppError::NotFound("campaign not found".to_string()))?;
+    if current.status == "dispatching" {
+        validate_frozen_dispatch(&current, spec_hash, spec_version)?;
+        return Ok(current);
+    }
+    Err(AppError::Conflict(
+        "campaign_dispatch_claim_conflict".to_string(),
+    ))
+}
+
+async fn ensure_campaign_task(
+    state: &AppState,
+    campaign: &Campaign,
+    contact_wxid: &str,
+) -> AppResult<()> {
+    let campaign_id = campaign
+        .id
+        .ok_or_else(|| AppError::External("campaign id missing".to_string()))?;
+    let spec_hash = campaign
+        .dispatch_spec_hash
+        .as_deref()
+        .ok_or_else(|| AppError::Conflict("campaign_dispatch_spec_missing".to_string()))?;
+    let intent_text = campaign
+        .dispatch_intent_text
+        .as_deref()
+        .ok_or_else(|| AppError::Conflict("campaign_dispatch_intent_missing".to_string()))?;
+    let task_id =
+        deterministic_campaign_task_id(campaign_id, campaign.dispatch_generation, contact_wxid);
+    let now = DateTime::now();
+    let send = CampaignSend {
+        id: None,
+        workspace_id: campaign.workspace_id.clone(),
+        account_id: campaign.account_id.clone(),
+        campaign_id,
+        contact_wxid: contact_wxid.to_string(),
+        dispatch_generation: campaign.dispatch_generation,
+        spec_hash: Some(spec_hash.to_string()),
+        task_id: Some(task_id),
+        status: "prepared".to_string(),
+        created_at: now,
+        updated_at: Some(now),
+    };
+    match state.db.campaign_sends().insert_one(&send, None).await {
+        Ok(_) => {}
+        Err(error) if is_duplicate_key(&error) => {
+            let existing = state
+                .db
+                .campaign_sends()
+                .find_one(
+                    doc! { "campaignId": campaign_id, "contactWxid": contact_wxid },
+                    None,
+                )
+                .await?
+                .ok_or_else(|| AppError::Conflict("campaign_send_identity_lost".to_string()))?;
+            if existing.dispatch_generation != campaign.dispatch_generation
+                || existing.spec_hash.as_deref() != Some(spec_hash)
+                || existing.task_id != Some(task_id)
+            {
+                return Err(AppError::Conflict(
+                    "campaign_send_identity_conflict".to_string(),
+                ));
+            }
+        }
+        Err(error) => return Err(error.into()),
+    }
+
+    let task = build_campaign_follow_up_task(
+        task_id,
+        &campaign.workspace_id,
+        &campaign.account_id,
+        contact_wxid,
+        intent_text,
+        now,
+    );
+    assert_agent_task_status_valid(&task.status);
+    let mut task_document = mongodb::bson::to_document(&task)?;
+    task_document.insert("prepared_commit_kind", "campaign_fanout");
+    match state
+        .db
+        .tasks()
+        .clone_with_type::<Document>()
+        .insert_one(&task_document, None)
+        .await
+    {
+        Ok(_) => {}
+        Err(error) if is_duplicate_key(&error) => {
+            let matches = state
+                .db
+                .tasks()
+                .count_documents(
+                    doc! {
+                        "_id": task_id,
+                        "workspace_id": &campaign.workspace_id,
+                        "account_id": &campaign.account_id,
+                        "contact_wxid": contact_wxid,
+                        "kind": "follow_up",
+                        "content": intent_text,
+                    },
+                    None,
+                )
+                .await?;
+            if matches != 1 {
+                return Err(AppError::Conflict(
+                    "campaign_task_identity_conflict".to_string(),
+                ));
+            }
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let finalized = state
+        .db
+        .campaign_sends()
         .update_one(
-            doc! { "_id": oid, "workspaceId": &admin.current_workspace },
-            doc! { "$set": { "status": "dispatching", "updatedAt": DateTime::now() } },
+            doc! {
+                "campaignId": campaign_id,
+                "contactWxid": contact_wxid,
+                "dispatchGeneration": campaign.dispatch_generation,
+                "specHash": spec_hash,
+                "taskId": task_id,
+                "status": { "$in": ["prepared", "enqueued"] },
+            },
+            doc! { "$set": { "status": "enqueued", "updatedAt": DateTime::now() } },
             None,
         )
         .await?;
-    let now = DateTime::now();
-    let mut dispatched = 0i64;
-    for c in &hits {
-        // 活动级去重：先尝试插 campaign_sends（唯一索引 (campaignId, contactWxid)）。
-        // DuplicateKey → 已推过，跳过。
-        let send = CampaignSend {
-            id: None,
-            workspace_id: campaign.workspace_id.clone(),
-            account_id: campaign.account_id.clone(),
-            campaign_id: oid,
-            contact_wxid: c.wxid.clone(),
-            task_id: None,
-            status: "enqueued".to_string(),
-            created_at: now,
-        };
-        match state.db.campaign_sends().insert_one(&send, None).await {
-            Ok(send_res) => {
-                let send_id = send_res.inserted_id.as_object_id();
-                let task = build_campaign_follow_up_task(
-                    &campaign.workspace_id,
-                    &campaign.account_id,
-                    &c.wxid,
-                    &campaign.intent_text,
-                    now,
-                );
-                assert_agent_task_status_valid(&task.status);
-                // KC-01：建 task 失败 → 补偿删掉刚占位的 send,避免留下 task_id=None 的孤儿 send
-                // (重入撞去重跳过→客户永久漏推)。补偿删除 best-effort(let _)。
-                let task_res = match state.db.tasks().insert_one(&task, None).await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        if let Some(sid) = send_id {
-                            let _ = state
-                                .db
-                                .campaign_sends()
-                                .delete_one(doc! { "_id": sid }, None)
-                                .await;
-                        }
-                        return Err(e.into());
-                    }
-                };
-                // KC-03：回填 taskId 失败 → 补偿删 task + send,保持 all-or-nothing
-                // (否则 task 会真发但 report 显 pending 成效虚低)。
-                if let (Some(sid), Some(tid)) = (send_id, task_res.inserted_id.as_object_id()) {
-                    if let Err(e) = state
-                        .db
-                        .campaign_sends()
-                        .update_one(
-                            doc! { "_id": sid },
-                            doc! { "$set": { "taskId": tid } },
-                            None,
-                        )
-                        .await
-                    {
-                        let _ = state.db.tasks().delete_one(doc! { "_id": tid }, None).await;
-                        let _ = state
-                            .db
-                            .campaign_sends()
-                            .delete_one(doc! { "_id": sid }, None)
-                            .await;
-                        return Err(e.into());
-                    }
-                }
-                dispatched += 1;
-            }
-            Err(e) if is_duplicate_key(&e) => { /* 去重命中，跳过 */ }
-            Err(e) => return Err(e.into()),
+    if finalized.matched_count != 1 {
+        return Err(AppError::Conflict(
+            "campaign_send_finalize_conflict".to_string(),
+        ));
+    }
+    assert_agent_task_status_valid("pending");
+    let released = state
+        .db
+        .tasks()
+        .update_one(
+            doc! {
+                "_id": task_id,
+                "workspace_id": &campaign.workspace_id,
+                "account_id": &campaign.account_id,
+                "contact_wxid": contact_wxid,
+                "kind": "follow_up",
+                "content": intent_text,
+                "status": "committing",
+                "prepared_commit_kind": "campaign_fanout",
+            },
+            doc! {
+                "$set": { "status": "pending", "updated_at": DateTime::now() },
+                "$unset": { "prepared_commit_kind": "" },
+            },
+            None,
+        )
+        .await?;
+    if released.matched_count != 1 {
+        let already_released = state
+            .db
+            .tasks()
+            .count_documents(
+                doc! {
+                    "_id": task_id,
+                    "workspace_id": &campaign.workspace_id,
+                    "account_id": &campaign.account_id,
+                    "contact_wxid": contact_wxid,
+                    "kind": "follow_up",
+                    "content": intent_text,
+                    "status": { "$ne": "committing" },
+                    "prepared_commit_kind": { "$exists": false },
+                },
+                None,
+            )
+            .await?;
+        if already_released != 1 {
+            return Err(AppError::Conflict(
+                "campaign_task_release_conflict".to_string(),
+            ));
         }
     }
+    Ok(())
+}
+
+async fn materialize_campaign_dispatch(state: &AppState, campaign: &Campaign) -> AppResult<i64> {
+    validate_frozen_dispatch(
+        campaign,
+        campaign.dispatch_spec_hash.as_deref().unwrap_or_default(),
+        campaign.spec_version,
+    )?;
+    for contact_wxid in &campaign.dispatch_audience {
+        ensure_campaign_task(state, campaign, contact_wxid).await?;
+    }
+    let campaign_id = campaign
+        .id
+        .ok_or_else(|| AppError::External("campaign id missing".to_string()))?;
+    let expected = campaign.dispatch_audience.len() as i64;
+    let ready = state
+        .db
+        .campaign_sends()
+        .count_documents(
+            doc! {
+                "campaignId": campaign_id,
+                "dispatchGeneration": campaign.dispatch_generation,
+                "specHash": campaign.dispatch_spec_hash.as_deref(),
+                "status": "enqueued",
+                "taskId": { "$type": "objectId" },
+            },
+            None,
+        )
+        .await? as i64;
+    if ready != expected {
+        return Err(AppError::Conflict(format!(
+            "campaign_fanout_incomplete:{ready}/{expected}"
+        )));
+    }
     assert_campaign_status_valid("completed");
-    state
+    let completed = state
         .db
         .campaigns()
         .update_one(
-            doc! { "_id": oid, "workspaceId": &admin.current_workspace },
+            doc! {
+                "_id": campaign_id,
+                "workspaceId": &campaign.workspace_id,
+                "status": "dispatching",
+                "dispatchGeneration": campaign.dispatch_generation,
+                "dispatchSpecHash": campaign.dispatch_spec_hash.as_deref(),
+            },
             doc! { "$set": {
                 "status": "completed",
-                "dispatchedCount": dispatched,
-                "lastDispatchTargetCount": hits.len() as i64,
+                "dispatchedCount": expected,
+                "lastDispatchTargetCount": expected,
+                "dispatchCompletedAt": DateTime::now(),
                 "updatedAt": DateTime::now(),
             } },
             None,
         )
         .await?;
-    Ok(Json(
-        json!({ "campaignId": id, "dispatchedCount": dispatched, "status": "completed" }),
-    ))
+    if completed.matched_count != 1 {
+        let already_done = state
+            .db
+            .campaigns()
+            .count_documents(
+                doc! {
+                    "_id": campaign_id,
+                    "workspaceId": &campaign.workspace_id,
+                    "status": "completed",
+                    "dispatchGeneration": campaign.dispatch_generation,
+                    "dispatchSpecHash": campaign.dispatch_spec_hash.as_deref(),
+                },
+                None,
+            )
+            .await?;
+        if already_done != 1 {
+            return Err(AppError::Conflict("campaign_finalize_conflict".to_string()));
+        }
+    }
+    Ok(expected)
+}
+
+pub async fn reconcile_campaign_dispatches(state: &AppState) -> AppResult<u64> {
+    let mut cursor = state
+        .db
+        .campaigns()
+        .find(
+            doc! { "status": "dispatching" },
+            mongodb::options::FindOptions::builder().limit(20).build(),
+        )
+        .await?;
+    let mut reconciled = 0_u64;
+    while let Some(campaign) = cursor.try_next().await? {
+        match materialize_campaign_dispatch(state, &campaign).await {
+            Ok(_) => reconciled += 1,
+            Err(error) => tracing::error!(
+                campaign_id = ?campaign.id,
+                %error,
+                "campaign dispatch reconciliation deferred"
+            ),
+        }
+    }
+    Ok(reconciled)
 }
 
 /// 把一条 campaign_send 的真实推送结果归桶。输入 = 台账 status + 关联到的最新
@@ -792,6 +1277,75 @@ mod tests {
         assert!(!dispatch_allowed_from_status("赫赫"), "未知态 fail-safe 拒");
     }
 
+    #[test]
+    fn campaign_spec_version_filter_only_adopts_legacy_as_version_one() {
+        assert_eq!(
+            campaign_spec_version_filter(1),
+            doc! { "$or": [
+                { "specVersion": 1_i64 },
+                { "specVersion": { "$exists": false } },
+            ] }
+        );
+        assert_eq!(
+            campaign_spec_version_filter(2),
+            doc! { "specVersion": 2_i64 }
+        );
+    }
+
+    #[test]
+    fn campaign_spec_hash_is_stable_after_normalization_and_changes_with_content() {
+        let first = normalize_segment_filter(SegmentFilter {
+            product_ids: vec![" b ".into(), "a".into(), "a".into()],
+            aftercare: Some(" expired ".into()),
+            ..Default::default()
+        });
+        let second = normalize_segment_filter(SegmentFilter {
+            product_ids: vec!["a".into(), "b".into()],
+            aftercare: Some("expired".into()),
+            ..Default::default()
+        });
+        let first_hash = campaign_spec_hash("ws", "acc", "title", "intent", &first).unwrap();
+        let second_hash = campaign_spec_hash("ws", "acc", "title", "intent", &second).unwrap();
+        assert_eq!(first_hash, second_hash);
+        assert_ne!(
+            first_hash,
+            campaign_spec_hash("ws", "acc", "title", "changed", &second).unwrap()
+        );
+    }
+
+    #[test]
+    fn campaign_task_identity_is_deterministic_and_generation_scoped() {
+        let campaign_id = ObjectId::parse_str("64a1f0c2e4b0a1b2c3d4e5f6").unwrap();
+        let first = deterministic_campaign_task_id(campaign_id, 1, "wx_a");
+        assert_eq!(
+            first,
+            deterministic_campaign_task_id(campaign_id, 1, "wx_a")
+        );
+        assert_ne!(
+            first,
+            deterministic_campaign_task_id(campaign_id, 2, "wx_a")
+        );
+        assert_ne!(
+            first,
+            deterministic_campaign_task_id(campaign_id, 1, "wx_b")
+        );
+    }
+
+    #[test]
+    fn frozen_dispatch_validation_binds_hash_version_audience_and_intent() {
+        let mut campaign = base_campaign();
+        campaign.status = "dispatching".into();
+        campaign.dispatch_generation = 1;
+        campaign.dispatch_spec_hash = Some("hash".into());
+        campaign.dispatch_audience = vec!["wx_a".into()];
+        campaign.dispatch_intent_text = Some("intent".into());
+        assert!(validate_frozen_dispatch(&campaign, "hash", 1).is_ok());
+        assert!(validate_frozen_dispatch(&campaign, "other", 1).is_err());
+        assert!(validate_frozen_dispatch(&campaign, "hash", 2).is_err());
+        campaign.dispatch_audience.clear();
+        assert!(validate_frozen_dispatch(&campaign, "hash", 1).is_err());
+    }
+
     fn ev(verification: &str, pid: &str, qty: u32, kind: &str, amount: i64) -> OutcomeEvent {
         OutcomeEvent {
             marked_at: DateTime::from_millis(0),
@@ -881,10 +1435,18 @@ mod tests {
             title: "t".to_string(),
             intent_text: "i".to_string(),
             segment_filter: SegmentFilter::default(),
+            spec_version: 1,
+            spec_hash: None,
             status: "draft".to_string(),
             target_count: None,
             dispatched_count: 0,
             last_dispatch_target_count: None,
+            dispatch_generation: 0,
+            dispatch_spec_hash: None,
+            dispatch_audience: Vec::new(),
+            dispatch_intent_text: None,
+            dispatch_started_at: None,
+            dispatch_completed_at: None,
             created_by: "admin".to_string(),
             created_at: now,
             updated_at: now,
@@ -1006,11 +1568,13 @@ mod tests {
         // 自建 follow_up task（不调 planner 私有函数）：content=活动意图，
         // review_required=true，kind=follow_up，48h expiry，status=pending。
         let now = DateTime::from_millis(1_000_000);
-        let task = build_campaign_follow_up_task("ws", "acc", "wx1", "双11老客7折", now);
+        let task_id = ObjectId::new();
+        let task = build_campaign_follow_up_task(task_id, "ws", "acc", "wx1", "双11老客7折", now);
+        assert_eq!(task.id, Some(task_id));
         assert_eq!(task.kind, "follow_up");
         assert_eq!(task.content, "双11老客7折");
         assert!(task.review_required);
-        assert_eq!(task.status, "pending");
+        assert_eq!(task.status, "committing");
         assert_eq!(task.contact_wxid, "wx1");
         // 48h expiry
         assert_eq!(
@@ -1234,10 +1798,18 @@ mod tests {
             title: "双11老客7折".to_string(),
             intent_text: "内部意图不该泄漏".to_string(),
             segment_filter: SegmentFilter::default(),
+            spec_version: 1,
+            spec_hash: None,
             status: "completed".to_string(),
             target_count: Some(500),
             dispatched_count: 470,
             last_dispatch_target_count: None,
+            dispatch_generation: 1,
+            dispatch_spec_hash: Some("spec-hash".to_string()),
+            dispatch_audience: Vec::new(),
+            dispatch_intent_text: Some("内部意图不该泄漏".to_string()),
+            dispatch_started_at: Some(now),
+            dispatch_completed_at: Some(now),
             created_by: "admin".to_string(),
             created_at: now,
             updated_at: now,

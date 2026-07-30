@@ -27,6 +27,13 @@ async fn start_api(
         workspaces: vec![workspace_id.to_string()],
         default_workspace: Some(workspace_id.to_string()),
     };
+    app.state
+        .db
+        .raw()
+        .collection::<AdminUser>("admin_users")
+        .insert_one(&user, None)
+        .await
+        .expect("insert SR-172 admin ACL");
     let session = create_session(&app.state.db, &user, 1, workspace_id)
         .await
         .expect("create SR-172 session");

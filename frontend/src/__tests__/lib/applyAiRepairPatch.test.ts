@@ -16,25 +16,17 @@ const BASE = {
 };
 
 describe("applyAiRepairPatch", () => {
-  it("勾选2/4字段：PUT body只含勾选字段覆盖+原值其余保留（防清空），applied分组正确", async () => {
-    fetchSpy.mockResolvedValueOnce(okResp()).mockResolvedValueOnce(okResp());
+  it("勾选2/4字段：一次提交 proposal patch 与 acceptedFields，由服务端筛选落库", async () => {
+    fetchSpy.mockResolvedValueOnce(okResp());
     const r = await applyAiRepairPatch({ ...BASE, acceptedFieldNames: ["summary", "title"] });
     expect(r.ok).toBe(true);
-    // 第一个 fetch = PUT 落库
-    const [putUrl, putInit] = fetchSpy.mock.calls[0];
-    expect(putUrl).toContain("/api/operation-knowledge/chunks/c1");
-    expect(putInit.method).toBe("PUT");
-    const putBody = JSON.parse(putInit.body);
-    expect(putBody.summary).toBe("AI改的summary");   // 勾选→用patch值
-    expect(putBody.title).toBe("AI改的标题");          // 勾选→用patch值
-    expect(putBody.body).toBe("原body");               // 没勾→保留原值（防清空）
-    expect(putBody.sourceQuote).toBe("原quote");       // 没勾→保留原值（防清空，不被AI脑补覆盖）
-    // 第二个 fetch = applied 闭账
-    const [appliedUrl, appliedInit] = fetchSpy.mock.calls[1];
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    const [appliedUrl, appliedInit] = fetchSpy.mock.calls[0];
     expect(appliedUrl).toContain("/api/operation-knowledge/repair/applied");
     const aBody = JSON.parse(appliedInit.body);
     expect(aBody.targetKind).toBe("chunk");
     expect(aBody.targetId).toBe("c1");
+    expect(aBody.patch).toEqual(BASE.patch);
     expect(aBody.sessionId).toBe("s1");
     expect(aBody.acceptedFields.sort()).toEqual(["summary", "title"]);
     expect(aBody.skippedFields.sort()).toEqual(["body", "sourceQuote"]); // patch有但没勾
@@ -42,20 +34,12 @@ describe("applyAiRepairPatch", () => {
     expect(aBody).not.toHaveProperty("then_verify");   // serde命门：camelCase
   });
 
-  it("PUT落库失败：不发applied，返回apply_failed", async () => {
+  it("服务端提交失败：返回apply_failed", async () => {
     fetchSpy.mockResolvedValueOnce(errResp(400));
     const r = await applyAiRepairPatch({ ...BASE, acceptedFieldNames: ["summary"] });
     expect(r.ok).toBe(false);
     expect(r.reason).toBe("apply_failed");
-    expect(fetchSpy).toHaveBeenCalledTimes(1); // 没发 applied
-  });
-
-  it("落库成功但闭账失败：返回audit_failed（不误报落库失败），message提示已落库", async () => {
-    fetchSpy.mockResolvedValueOnce(okResp()).mockResolvedValueOnce(errResp(500));
-    const r = await applyAiRepairPatch({ ...BASE, acceptedFieldNames: ["summary"] });
-    expect(r.ok).toBe(false);
-    expect(r.reason).toBe("audit_failed");
-    expect(r.message).toMatch(/已落库/);
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
   });
 
   it("fetch reject 归一为 server_error 不冒泡", async () => {

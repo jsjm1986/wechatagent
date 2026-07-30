@@ -6,7 +6,7 @@ use axum::{
 };
 use futures::TryStreamExt;
 use mongodb::{
-    bson::{doc, DateTime, Document},
+    bson::{doc, Bson, DateTime, Document},
     options::FindOptions,
 };
 use serde::Deserialize;
@@ -97,9 +97,16 @@ pub(super) async fn create_evaluation_scenario(
     Extension(admin): Extension<AuthenticatedAdmin>,
     Json(payload): Json<EvaluationScenarioRequest>,
 ) -> AppResult<Json<Value>> {
-    if payload.scenario_id.trim().is_empty() {
-        return Err(AppError::BadRequest("scenarioId is required".to_string()));
-    }
+    let active_profile =
+        agent::domain_profile::load_active_domain_profile(&state.db, &admin.current_workspace)
+            .await?;
+    let formula_specs = evaluation_formula_specs(&active_profile);
+    let status = validated_scenario_status(
+        payload.status.as_deref(),
+        &payload.ground_truth,
+        &formula_specs,
+    )?;
+    validate_scenario_request(&state, &admin.current_workspace, &payload).await?;
     let now = DateTime::now();
     let scenario = EvaluationScenario {
         id: None,
@@ -112,7 +119,7 @@ pub(super) async fn create_evaluation_scenario(
         inbound_messages: payload.inbound_messages,
         ground_truth: payload.ground_truth,
         tags: payload.tags,
-        status: payload.status.unwrap_or_else(|| "active".to_string()),
+        status,
         created_at: now,
         updated_at: now,
     };
@@ -131,6 +138,16 @@ pub(super) async fn update_evaluation_scenario(
     Json(payload): Json<EvaluationScenarioRequest>,
 ) -> AppResult<Json<Value>> {
     let object_id = parse_object_id(&id)?;
+    let active_profile =
+        agent::domain_profile::load_active_domain_profile(&state.db, &admin.current_workspace)
+            .await?;
+    let formula_specs = evaluation_formula_specs(&active_profile);
+    let status = validated_scenario_status(
+        payload.status.as_deref(),
+        &payload.ground_truth,
+        &formula_specs,
+    )?;
+    validate_scenario_request(&state, &admin.current_workspace, &payload).await?;
     let result = state
         .db
         .evaluation_scenarios()
@@ -146,7 +163,7 @@ pub(super) async fn update_evaluation_scenario(
                     "inbound_messages": payload.inbound_messages,
                     "ground_truth": payload.ground_truth,
                     "tags": payload.tags,
-                    "status": payload.status.unwrap_or_else(|| "active".to_string()),
+                    "status": status,
                     "updated_at": DateTime::now()
                 }
             },
@@ -193,10 +210,7 @@ pub(super) async fn run_formula_adherence_evaluation(
     Json(payload): Json<FormulaAdherenceRequest>,
 ) -> AppResult<Json<Value>> {
     validate_account(&state, &admin.current_workspace, &payload.account_id).await?;
-    let mut filter = doc! {
-        "workspace_id": &admin.current_workspace,
-        "status": "active"
-    };
+    let mut filter = active_scenario_filter(&admin.current_workspace, &payload.account_id);
     if !payload.scenario_ids.is_empty() {
         filter.insert("scenario_id", doc! { "$in": payload.scenario_ids });
     }
@@ -228,10 +242,8 @@ pub(super) async fn run_formula_adherence_evaluation(
         })));
     }
 
-    // 波 C2：跨场景预算上限。simulate_user_dialogue 内部各自有一份子预算，
-    // 这里维护一个 evaluation 总预算上限：每个场景跑完后把子 run 实际 token
-    // 消耗（从 agent_run_logs 累加）汇总进来；超额就 break 并把 degraded
-    // 字段设为 true，items 中只保留已完成场景。
+    // 跨场景预算上限。每个 simulation 返回自己的 task-local RunBudgetSnapshot；
+    // 这里只累计本 evaluation 启动的子 run，不读取共享生产日志。
     let domain_config = state
         .db
         .operation_domain_configs()
@@ -254,55 +266,55 @@ pub(super) async fn run_formula_adherence_evaluation(
         .saturating_mul(scenarios.len() as i64);
 
     let base_contact = match payload.contact_id.as_deref() {
-        Some(id) => Some(find_contact_by_id(&state, &admin.current_workspace, id).await?),
+        Some(id) => Some(
+            find_contact_by_id_for_account(
+                &state,
+                &admin.current_workspace,
+                &payload.account_id,
+                id,
+            )
+            .await?,
+        ),
         None => None,
     };
 
-    let formulas = [
-        "trust",
-        "conversionReadiness",
-        "emotionalValue",
-        "nextBestActionScore",
-    ];
     // H15：经营公式 + 缺失回落 score key 从 active profile 读（替代写死四公式数组 +
     // score_key_for 映射）。profile.business_formulas 为空（老库无字段/profile 漏配）时
     // 回落内置销售四公式 + score_key_for——DEFAULT_PROFILE 已 seed 四公式，故等价。
     let active_profile =
         agent::domain_profile::load_active_domain_profile(&state.db, &admin.current_workspace)
-            .await;
-    let formula_specs: Vec<(String, String)> = if active_profile.business_formulas.is_empty() {
-        formulas
-            .iter()
-            .map(|k| (k.to_string(), score_key_for(k).to_string()))
-            .collect()
-    } else {
-        active_profile
-            .business_formulas
-            .iter()
-            .map(|f| {
-                let score_key = f
-                    .eval_score_key
-                    .clone()
-                    .unwrap_or_else(|| score_key_for(&f.key).to_string());
-                (f.key.clone(), score_key)
-            })
-            .collect()
-    };
+            .await?;
+    let formula_specs = evaluation_formula_specs(&active_profile);
     let mut items: Vec<Value> = Vec::new();
     let mut total_adherence = 0.0_f64;
     let mut counted = 0usize;
     let mut total_tokens_used: i64 = 0;
+    let mut total_llm_calls_used: i32 = 0;
+    let mut unknown_usage_calls: i32 = 0;
+    let mut unscored_count = 0usize;
     let mut degraded = false;
     let mut degraded_reason: Option<&'static str> = None;
     let mut processed_before_budget = 0_usize;
-    let evaluation_started_at = DateTime::now();
-
     for scenario in scenarios {
         // 波 C2：进入下一个场景前先看预算是否已经超额。
         if total_tokens_used >= total_token_budget {
             degraded = true;
             degraded_reason = Some("evaluation_budget_exceeded");
             break;
+        }
+        let truth = validate_ground_truth(&scenario.ground_truth, &formula_specs);
+        if !truth.is_valid() {
+            unscored_count += 1;
+            items.push(json!({
+                "scenarioId": scenario.scenario_id,
+                "title": scenario.title,
+                "groundTruth": &scenario.ground_truth,
+                "unscored": true,
+                "reason": "missing_or_invalid_ground_truth",
+                "missingGroundTruth": truth.missing,
+                "invalidGroundTruth": truth.invalid,
+            }));
+            continue;
         }
         let messages: Vec<String> = scenario.inbound_messages.clone();
         if messages.is_empty() {
@@ -321,29 +333,40 @@ pub(super) async fn run_formula_adherence_evaluation(
                 &seed_initial_state,
             )
         });
-        let turns = match agent::simulate_user_dialogue(&state, contact, messages).await {
-            Ok(t) => t,
+        let simulation =
+            match agent::simulate_user_dialogue_with_budget(&state, contact, messages).await {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    items.push(json!({
+                        "scenarioId": scenario.scenario_id,
+                        "error": err.to_string()
+                    }));
+                    continue;
+                }
+            };
+        total_tokens_used = total_tokens_used.saturating_add(simulation.budget.tokens_used);
+        total_llm_calls_used =
+            total_llm_calls_used.saturating_add(simulation.budget.llm_calls_used);
+        unknown_usage_calls =
+            unknown_usage_calls.saturating_add(simulation.budget.unknown_usage_calls);
+        let turns = match simulation.turns {
+            Ok(turns) => turns,
             Err(err) => {
                 items.push(json!({
                     "scenarioId": scenario.scenario_id,
-                    "error": err.to_string()
+                    "error": err.to_string(),
+                    "tokensUsed": simulation.budget.tokens_used,
+                    "llmCallsUsed": simulation.budget.llm_calls_used,
+                    "unknownUsageCalls": simulation.budget.unknown_usage_calls,
                 }));
+                if simulation.budget.unknown_usage_calls > 0 {
+                    degraded = true;
+                    degraded_reason = Some("evaluation_budget_usage_unknown");
+                    break;
+                }
                 continue;
             }
         };
-        // 波 C2：把这次 simulate 实际消耗的 token 累计到 evaluation 总预算。
-        // 用 evaluation 启动后的 agent_run_logs 时间戳过滤当前场景的子 run。
-        // 简化处理：累加自评测开始至今的所有 run（多场景共享 account），
-        // 不会重复计数因为我们每次循环之后才做一次累加。
-        let scenario_tokens = sum_scenario_tokens(
-            &state,
-            &admin.current_workspace,
-            &payload.account_id,
-            evaluation_started_at,
-        )
-        .await
-        .saturating_sub(total_tokens_used);
-        total_tokens_used = total_tokens_used.saturating_add(scenario_tokens);
 
         let last = turns.last();
         let mut deviations = serde_json::Map::new();
@@ -367,11 +390,11 @@ pub(super) async fn run_formula_adherence_evaluation(
                 continue;
             };
             let predicted_num = bson_to_f64(&predicted_value);
-            let truth_num = scenario
-                .ground_truth
+            let truth_num = truth
+                .values
                 .get(formula)
-                .map(bson_to_f64)
-                .unwrap_or(0.0);
+                .copied()
+                .expect("validated ground truth contains every formula");
             let delta = (predicted_num - truth_num).abs();
             deviations.insert(formula.to_string(), json!(delta));
             predicted.insert(formula.to_string(), json!(predicted_num));
@@ -391,6 +414,11 @@ pub(super) async fn run_formula_adherence_evaluation(
                 "invalidReason": "all_formulas_missing",
                 "missingFormulas": missing_count
             }));
+            if simulation.budget.unknown_usage_calls > 0 {
+                degraded = true;
+                degraded_reason = Some("evaluation_budget_usage_unknown");
+                break;
+            }
             continue;
         }
 
@@ -408,6 +436,11 @@ pub(super) async fn run_formula_adherence_evaluation(
             "adherenceScore": adherence_score,
             "missingFormulas": missing_count
         }));
+        if simulation.budget.unknown_usage_calls > 0 {
+            degraded = true;
+            degraded_reason = Some("evaluation_budget_usage_unknown");
+            break;
+        }
     }
 
     let mean_adherence = if counted > 0 {
@@ -439,6 +472,9 @@ pub(super) async fn run_formula_adherence_evaluation(
                     "degradedReason": degraded_reason.map(|s| s.to_string()),
                     "processedBeforeBudgetExceeded": processed_before_budget as i32,
                     "totalTokensUsed": total_tokens_used,
+                    "totalLlmCallsUsed": total_llm_calls_used,
+                    "unknownUsageCalls": unknown_usage_calls,
+                    "unscoredCount": unscored_count as i32,
                     "totalTokenBudget": total_token_budget,
                 }),
                 created_at: DateTime::now(),
@@ -456,39 +492,147 @@ pub(super) async fn run_formula_adherence_evaluation(
             "scenarioCount": counted,
             "meanAdherence": mean_adherence,
             "totalTokensUsed": total_tokens_used,
+            "totalLlmCallsUsed": total_llm_calls_used,
+            "unknownUsageCalls": unknown_usage_calls,
+            "usageComplete": unknown_usage_calls == 0,
+            "unscoredCount": unscored_count,
             "totalTokenBudget": total_token_budget
         },
         "items": items
     })))
 }
 
-/// 波 C2：累加从 `since` 起到现在 evaluation 这个 account 上的所有 agent_run_logs.tokens_used。
-async fn sum_scenario_tokens(
+#[derive(Debug, Default, PartialEq)]
+struct GroundTruthValidation {
+    values: std::collections::HashMap<String, f64>,
+    missing: Vec<String>,
+    invalid: Vec<String>,
+}
+
+impl GroundTruthValidation {
+    fn is_valid(&self) -> bool {
+        self.missing.is_empty() && self.invalid.is_empty()
+    }
+}
+
+fn evaluation_formula_specs(profile: &crate::models::DomainProfile) -> Vec<(String, String)> {
+    if profile.business_formulas.is_empty() {
+        crate::agent::domain_profile::default_business_formulas()
+    } else {
+        profile.business_formulas.clone()
+    }
+    .into_iter()
+    .map(|formula| {
+        let score_key = formula
+            .eval_score_key
+            .unwrap_or_else(|| score_key_for(&formula.key).to_string());
+        (formula.key, score_key)
+    })
+    .collect()
+}
+
+fn active_scenario_filter(workspace_id: &str, account_id: &str) -> Document {
+    doc! {
+        "workspace_id": workspace_id,
+        "status": "active",
+        "$or": [
+            { "account_id": { "$exists": false } },
+            { "account_id": null },
+            { "account_id": account_id },
+        ]
+    }
+}
+
+fn validate_ground_truth(
+    ground_truth: &Document,
+    formula_specs: &[(String, String)],
+) -> GroundTruthValidation {
+    let mut result = GroundTruthValidation::default();
+    for (formula, _) in formula_specs {
+        match ground_truth.get(formula) {
+            None => result.missing.push(formula.clone()),
+            Some(value) => match strict_score(value) {
+                Some(score) => {
+                    result.values.insert(formula.clone(), score);
+                }
+                None => result.invalid.push(formula.clone()),
+            },
+        }
+    }
+    result
+}
+
+fn strict_score(value: &Bson) -> Option<f64> {
+    let score = match value {
+        Bson::Int32(value) => *value as f64,
+        Bson::Int64(value) => *value as f64,
+        Bson::Double(value) => *value,
+        Bson::Decimal128(value) => value.to_string().parse().ok()?,
+        _ => return None,
+    };
+    score
+        .is_finite()
+        .then_some(score)
+        .filter(|score| (0.0..=10.0).contains(score))
+}
+
+fn validated_scenario_status(
+    requested: Option<&str>,
+    ground_truth: &Document,
+    formula_specs: &[(String, String)],
+) -> AppResult<String> {
+    let validation = validate_ground_truth(ground_truth, formula_specs);
+    let status = requested.unwrap_or_else(|| {
+        if validation.is_valid() {
+            "active"
+        } else {
+            "draft"
+        }
+    });
+    if !matches!(status, "active" | "draft") {
+        return Err(AppError::BadRequest(
+            "status must be active|draft".to_string(),
+        ));
+    }
+    if status == "active" && !validation.is_valid() {
+        return Err(AppError::BadRequest(format!(
+            "active scenario requires complete numeric 0..10 groundTruth; missing={:?}, invalid={:?}",
+            validation.missing, validation.invalid
+        )));
+    }
+    Ok(status.to_string())
+}
+
+async fn validate_scenario_request(
     state: &AppState,
     workspace_id: &str,
-    account_id: &str,
-    since: DateTime,
-) -> i64 {
-    let mut total = 0_i64;
-    let Ok(mut cur) = state
-        .db
-        .agent_run_logs()
-        .find(
-            doc! {
-                "workspace_id": workspace_id,
-                "account_id": account_id,
-                "created_at": { "$gte": since }
-            },
-            None,
-        )
-        .await
-    else {
-        return 0;
-    };
-    while let Ok(Some(run)) = cur.try_next().await {
-        total = total.saturating_add(run.tokens_used);
+    payload: &EvaluationScenarioRequest,
+) -> AppResult<()> {
+    if payload.scenario_id.trim().is_empty() {
+        return Err(AppError::BadRequest("scenarioId is required".to_string()));
     }
-    total
+    if payload.title.trim().is_empty() {
+        return Err(AppError::BadRequest("title is required".to_string()));
+    }
+    if payload.inbound_messages.is_empty()
+        || payload
+            .inbound_messages
+            .iter()
+            .any(|message| message.trim().is_empty())
+    {
+        return Err(AppError::BadRequest(
+            "inboundMessages must contain non-empty messages".to_string(),
+        ));
+    }
+    if let Some(account_id) = payload.account_id.as_deref() {
+        if account_id.trim().is_empty() {
+            return Err(AppError::BadRequest(
+                "accountId must not be empty".to_string(),
+            ));
+        }
+        validate_account(state, workspace_id, account_id).await?;
+    }
+    Ok(())
 }
 
 fn scenario_contact_from_seed(
@@ -660,6 +804,62 @@ mod tests {
         assert_eq!(score_key_for("emotionalValue"), "emotionalValue");
         assert_eq!(score_key_for("nextBestActionScore"), "relationshipProgress");
         assert_eq!(score_key_for("unknown"), "humanLike");
+    }
+
+    #[test]
+    fn active_scenario_filter_allows_global_and_requested_account_only() {
+        assert_eq!(
+            active_scenario_filter("ws-a", "account-a"),
+            doc! {
+                "workspace_id": "ws-a",
+                "status": "active",
+                "$or": [
+                    { "account_id": { "$exists": false } },
+                    { "account_id": null },
+                    { "account_id": "account-a" },
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn ground_truth_requires_every_formula_as_numeric_zero_to_ten() {
+        let specs = vec![
+            ("trust".to_string(), "humanLike".to_string()),
+            ("emotionalValue".to_string(), "emotionalValue".to_string()),
+        ];
+        let complete = validate_ground_truth(&doc! { "trust": 7, "emotionalValue": 8.5 }, &specs);
+        assert!(complete.is_valid());
+        assert_eq!(complete.values.get("trust"), Some(&7.0));
+
+        let decimal = "9.25".parse::<mongodb::bson::Decimal128>().unwrap();
+        let decimal_truth =
+            validate_ground_truth(&doc! { "trust": decimal, "emotionalValue": 8 }, &specs);
+        assert!(decimal_truth.is_valid());
+        assert_eq!(decimal_truth.values.get("trust"), Some(&9.25));
+
+        let invalid = validate_ground_truth(&doc! { "trust": "7", "emotionalValue": 11 }, &specs);
+        assert_eq!(invalid.invalid, vec!["trust", "emotionalValue"]);
+        assert!(invalid.missing.is_empty());
+
+        let missing = validate_ground_truth(&doc! { "trust": 7 }, &specs);
+        assert_eq!(missing.missing, vec!["emotionalValue"]);
+        assert!(!missing.is_valid());
+    }
+
+    #[test]
+    fn incomplete_truth_defaults_to_draft_and_cannot_be_explicitly_active() {
+        let specs = vec![("trust".to_string(), "humanLike".to_string())];
+        assert_eq!(
+            validated_scenario_status(None, &Document::new(), &specs).unwrap(),
+            "draft"
+        );
+        assert_eq!(
+            validated_scenario_status(None, &doc! { "trust": 7 }, &specs).unwrap(),
+            "active"
+        );
+        assert!(validated_scenario_status(Some("active"), &Document::new(), &specs).is_err());
+        assert!(validated_scenario_status(Some("archived"), &doc! { "trust": 7 }, &specs).is_err());
     }
 
     /// 第 77 点护栏补盲区：`score_key_for`（evaluations fallback 映射）与

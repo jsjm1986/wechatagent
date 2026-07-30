@@ -28,6 +28,7 @@ use mongodb::{
 use crate::routes::AppState;
 
 use super::error::EvolutionError;
+use super::revision::threshold_revision;
 
 /// 最大 per-tick threshold proposal 数。design.md §3.1 锁定为 4。
 const MAX_THRESHOLD_PROPOSALS_PER_TICK: usize = 4;
@@ -79,14 +80,13 @@ fn classify_gate_hit(final_review_status: &str) -> Option<&'static str> {
 pub async fn generate(
     state: &AppState,
     experiment_id: &str,
+    workspace_id: &str,
+    account_id: &str,
     cohort_run_ids: &[ObjectId],
 ) -> Result<Vec<crate::models::Proposal>, EvolutionError> {
     if cohort_run_ids.is_empty() {
         return Ok(Vec::new());
     }
-    let workspace_id = state.config.default_workspace_id.clone();
-    let account_id = state.config.default_account_id.clone();
-
     // 1. 把 cohort 内每条 run 拉出来，按 gate 累加命中数。
     let mut total_runs = 0_u64;
     let mut hit_counts: HashMap<&'static str, u64> = THRESHOLD_REASONABLE_BANDS
@@ -96,7 +96,14 @@ pub async fn generate(
     let mut cursor = state
         .db
         .agent_run_logs()
-        .find(doc! { "_id": { "$in": cohort_run_ids } }, None)
+        .find(
+            doc! {
+                "_id": { "$in": cohort_run_ids },
+                "workspace_id": workspace_id,
+                "account_id": account_id,
+            },
+            None,
+        )
         .await
         .map_err(EvolutionError::from)?;
     while let Some(run) = cursor.try_next().await.map_err(EvolutionError::from)? {
@@ -124,10 +131,9 @@ pub async fn generate(
     let total_runs_f = total_runs as f64;
 
     // 2. 算每 gate 的命中率与候选方向。
-    let cooldown_skipped = load_gate_cooldowns(state, &workspace_id, &account_id).await?;
+    let cooldown_skipped = load_gate_cooldowns(state, workspace_id, account_id).await?;
     // #155(P1)：候选的 current_value 必须基于当前生效 override，而非硬编码占位。
-    let active_overrides =
-        load_active_threshold_overrides(state, &workspace_id, &account_id).await?;
+    let active_overrides = load_active_threshold_overrides(state, workspace_id, account_id).await?;
     let now = DateTime::now();
 
     #[derive(Debug)]
@@ -141,6 +147,7 @@ pub async fn generate(
         clamped: bool,
         cooldown_active: bool,
         distance_from_band: f64,
+        base_revision: String,
     }
     let mut candidates: Vec<Candidate> = Vec::new();
     for (gate, lower, upper) in THRESHOLD_REASONABLE_BANDS {
@@ -150,9 +157,9 @@ pub async fn generate(
             // 已在目标区间，不产候选。
             continue;
         }
-        let current_value = active_overrides
-            .get(*gate)
-            .copied()
+        let active = active_overrides.get(*gate);
+        let current_value = active
+            .map(|override_row| override_row.value)
             .unwrap_or_else(|| default_threshold_value(state, gate));
         let step = if *gate == "planner_block_rate_threshold" {
             PLANNER_BLOCK_RATE_STEP
@@ -192,6 +199,10 @@ pub async fn generate(
             clamped,
             cooldown_active: cooldown_skipped.contains(&gate.to_string()),
             distance_from_band: distance,
+            base_revision: threshold_revision(
+                active.and_then(|override_row| override_row.id),
+                current_value,
+            ),
         });
     }
 
@@ -226,8 +237,8 @@ pub async fn generate(
         out.push(crate::models::Proposal {
             id: None,
             experiment_id: experiment_id.to_string(),
-            workspace_id: workspace_id.clone(),
-            account_id: account_id.clone(),
+            workspace_id: workspace_id.to_string(),
+            account_id: account_id.to_string(),
             proposal_kind: "threshold".to_string(),
             status: status.to_string(),
             gate_key: Some(c.gate.to_string()),
@@ -241,6 +252,8 @@ pub async fn generate(
             critic_reasoning: None,
             expected_improvement_on: vec![],
             risk_note: None,
+            base_revision: Some(c.base_revision),
+            released_revision: None,
             previous_prompt_version: None,
             eval_metrics: doc! {},
             eval_replays_completed: 0,
@@ -278,6 +291,7 @@ async fn load_gate_cooldowns(
                 "workspace_id": workspace_id,
                 "account_id": account_id,
                 "released_at": { "$gte": since },
+                "current_version": true,
                 "rolled_back_at": null,
             },
             FindOptions::builder()
@@ -320,7 +334,7 @@ async fn load_active_threshold_overrides(
     state: &AppState,
     workspace_id: &str,
     account_id: &str,
-) -> Result<HashMap<String, f64>, EvolutionError> {
+) -> Result<HashMap<String, ActiveThresholdOverride>, EvolutionError> {
     let mut cursor = state
         .db
         .threshold_overrides()
@@ -328,6 +342,7 @@ async fn load_active_threshold_overrides(
             doc! {
                 "workspace_id": workspace_id,
                 "account_id": account_id,
+                "current_version": true,
                 "rolled_back_at": null,
             },
             FindOptions::builder()
@@ -336,12 +351,21 @@ async fn load_active_threshold_overrides(
         )
         .await
         .map_err(EvolutionError::from)?;
-    let mut out: HashMap<String, f64> = HashMap::new();
+    let mut out: HashMap<String, ActiveThresholdOverride> = HashMap::new();
     while let Some(o) = cursor.try_next().await.map_err(EvolutionError::from)? {
         // 首见即最新（已按 released_at desc 排序），后续同 gate 跳过。
-        out.entry(o.gate_key).or_insert(o.value);
+        out.entry(o.gate_key).or_insert(ActiveThresholdOverride {
+            id: o.id,
+            value: o.value,
+        });
     }
     Ok(out)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ActiveThresholdOverride {
+    id: Option<ObjectId>,
+    value: f64,
 }
 
 /// 纯函数版本：给定 gate 名 / 当前阈值 / 命中率 / 区间，返回（建议值, 是否被 clamp）。

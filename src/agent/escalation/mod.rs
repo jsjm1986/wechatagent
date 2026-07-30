@@ -19,16 +19,25 @@ pub(crate) use policy::*;
 // 故单独 pub re-export 还原其原始 `pub` 可见性。
 pub use logic::fallback_holding_reply;
 
+/// Materialize durable principal-relay intents that survived an interrupted
+/// resolve request. The task worker calls this once per tick; the public seam
+/// also lets integration tests exercise the exact recovery path.
+pub async fn reconcile_pending_relay_intents(state: &AppState) -> AppResult<u64> {
+    ledger::reconcile_pending_relay_intents_once(state).await
+}
+
+pub async fn reconcile_principal_card_deliveries(state: &AppState) -> AppResult<u64> {
+    ledger::reconcile_principal_card_deliveries_once(state).await
+}
+
 use super::generate_agent_json;
 use super::outbox::{enqueue as outbox_enqueue, EnqueueOutcome, EnqueueRequest};
 use super::run_envelope::SOURCE_KIND_FOLLOW_UP_TASK;
 use super::types::{AgentDecision, DecisionReviewResult};
 use crate::error::{AppError, AppResult};
-use crate::mcp;
 use crate::models::{
     AgentDecisionReview, AgentPrincipalEscalation, AgentTask, Contact, OperationDomainConfig,
-    PrincipalDecision, AWAITING_PRINCIPAL_DECISION_ATTR, ESCALATION_CATEGORY_HIGH_RISK_GATED,
-    PRINCIPAL_VERDICT_DEFERRED,
+    PrincipalDecision, ESCALATION_CATEGORY_HIGH_RISK_GATED, PRINCIPAL_VERDICT_DEFERRED,
 };
 use crate::prompts;
 use crate::routes::AppState;
@@ -192,30 +201,23 @@ pub(crate) async fn escalate_held_decision(
     domain_config: Option<&OperationDomainConfig>,
     blocked_status: &str,
 ) -> AppResult<()> {
-    let policy = match domain_config {
-        Some(cfg) => crate::agent::escalation::resolve_ask_human_policy(cfg),
-        // domain_config 缺省时保持旧行为字节等价：parse_high_risk_mode(None)=DecisionOnly,
-        // 即 safety/product/stuck 升级、ai_policy 不升级。真正的「是否启用请示」由下方
-        // decider_chain 是否为空兜住(链空则 return Ok)。故此处不可短路 return。
-        None => crate::agent::escalation::ResolvedAskHumanPolicy {
-            decider_chain: vec![],
-            escalate_safety_guard: true,
-            escalate_unverified_product: true,
-            escalate_ai_policy_hold: false,
-            escalate_stuck: true,
-            dedupe_window_hours: None,
-            daily_push_cap: None,
-            quiet_hours: None,
-            timeout_hours: None,
-        },
+    let Some(domain_config) = domain_config else {
+        return Ok(());
     };
+    let policy = crate::agent::escalation::resolve_ask_human_policy(domain_config);
     if !should_escalate_held(blocked_status, &policy) {
         return Ok(());
     }
-    let Some(decider) = policy.decider_chain.first() else {
+    let frozen_policy = freeze_ask_human_policy(&policy, &contact.account_id);
+    let Some(decider) = frozen_policy.decider_chain.first() else {
         return Ok(()); // 决策人链空 = 本 workspace 未启用请示通道
     };
     let principal_wxid = decider.wxid.clone();
+    let principal_account_id = decider
+        .account_id
+        .as_deref()
+        .ok_or_else(|| AppError::BadRequest("决策人缺少发送账号".into()))?
+        .to_string();
     if principal_wxid == contact.wxid {
         return Err(AppError::BadRequest(
             "决策人配置等于客户 wxid，拒绝触发请示".into(),
@@ -233,6 +235,7 @@ pub(crate) async fn escalate_held_decision(
     if has_pending_for_contact(
         state,
         &contact.workspace_id,
+        &contact.account_id,
         &contact.wxid,
         ESCALATION_CATEGORY_HIGH_RISK_GATED,
     )
@@ -250,6 +253,12 @@ pub(crate) async fn escalate_held_decision(
         labels::blocked_status_zh(blocked_status),
         labels::risk_level_zh(&final_decision.risk_level),
     );
+    let customer_label = contact
+        .remark
+        .clone()
+        .or_else(|| contact.nickname.clone())
+        .or_else(|| contact.alias.clone())
+        .unwrap_or_else(|| contact.wxid.clone());
     let Some(entry) = insert_pending_escalation(
         state,
         &contact.workspace_id,
@@ -259,43 +268,18 @@ pub(crate) async fn escalate_held_decision(
         &reason,
         &question,
         &principal_wxid,
-        false, // 高风险硬闸件默认不泛化（领导裁决可能是个案）
+        false,
+        domain_config,
+        frozen_policy,
+        &principal_account_id,
+        &customer_label,
     )
     .await?
     else {
         // 并发已插入同客户同类别 pending（pending 去重索引兜住）→ 不重复推卡。
         return Ok(());
     };
-    let customer_label = contact
-        .remark
-        .clone()
-        .or_else(|| contact.nickname.clone())
-        .or_else(|| contact.alias.clone())
-        .unwrap_or_else(|| contact.wxid.clone());
-    let card = render_principal_card(&entry.short_code, &customer_label, &reason, &question);
-    mcp::logged_call_for_account(
-        state,
-        &contact.account_id,
-        "message_send_text",
-        serde_json::json!({ "recipient": principal_wxid, "content": card }),
-    )
-    .await?;
-    // 写 awaiting 标记（hold 路径不走 apply_agent_updates，需单独写），
-    // 否则下一轮 build_decision_signals_text 读不到等待信号。用 dotted key $set，不覆盖其它 domain_attributes。
-    let set_key = format!("domain_attributes.{}", AWAITING_PRINCIPAL_DECISION_ATTR);
-    state
-        .db
-        .contacts()
-        .update_one(
-            doc! {
-                "workspace_id": &contact.workspace_id,
-                "account_id": &contact.account_id,
-                "wxid": &contact.wxid,
-            },
-            doc! { "$set": { set_key: true, "domain_attributes_updated_at": DateTime::now() } },
-            None,
-        )
-        .await?;
+    materialize_principal_card_delivery(state, &entry).await?;
     Ok(())
 }
 
@@ -330,6 +314,11 @@ pub(crate) async fn handle_principal_decision_relay_with_claim(
         // （否则下一轮 build_decision_signals_text 仍读到"等待裁决"，永久压制对该议题的自主回复）
         // + 发一条不含 substance 的中性收尾话术（否则客户零反馈、被晾死）。
         // 下一轮客户来消息由 AI 正常对话延续。fail-soft：发话术失败不 return Err（清标记已成功）。
+        if !terminalize_principal_relay(state, &entry, "authorization_expired").await? {
+            // Another terminal path (normally a confirmed relay delivery) already owns the
+            // outcome. Do not enqueue a second, contradictory neutral close-out.
+            return Ok(());
+        }
         let contact = state
             .db
             .contacts()
@@ -343,15 +332,11 @@ pub(crate) async fn handle_principal_decision_relay_with_claim(
             )
             .await?;
         if let Some(contact) = contact {
-            // The authorization is no longer usable, so the customer must not remain stuck in
-            // the "awaiting principal decision" state while the neutral close-out is queued.
-            // Clear this before any best-effort generation/enqueue work: a downstream failure
-            // must not permanently suppress normal autonomous replies for this topic.
-            crate::agent::gateway::clear_awaiting_principal_state(state, &contact).await?;
             // Expired authorization is not a fact source. The neutral holding reply is reviewed
             // independently and then handed to the durable outbox rather than sent by bare MCP.
             let holding_text = generate_holding_reply(
                 state,
+                &contact.workspace_id,
                 &contact.account_id,
                 &contact.wxid,
                 HoldingReplyScene::ExpiredAuthorization,
@@ -441,12 +426,13 @@ pub(crate) async fn interpret_principal_reply(
     );
     let system = prompts::load_prompt(
         &state.db,
-        &state.config.default_workspace_id,
+        &escalation.workspace_id,
         "escalation.principal.interpret",
     )
     .await?;
     let value = generate_agent_json(
         state,
+        &escalation.workspace_id,
         Some(account_id),
         Some(&escalation.contact_wxid),
         None,
@@ -480,7 +466,8 @@ pub(crate) async fn handle_principal_reply(
     principal_wxid: &str,
     reply_text: &str,
 ) -> AppResult<bool> {
-    let pending = list_pending_for_principal(state, workspace_id, principal_wxid).await?;
+    let pending =
+        list_pending_for_principal(state, workspace_id, account_id, principal_wxid).await?;
     match match_principal_reply(reply_text, &pending) {
         ReplyMatch::NoPending => {
             tracing::info!(
@@ -499,8 +486,9 @@ pub(crate) async fn handle_principal_reply(
                 "您刚回复的是哪一条？目前挂着这几条：{list}，麻烦带上编号（如 #{}）再回我一次。",
                 codes.first().cloned().unwrap_or_default()
             );
-            mcp::logged_call_for_account(
+            crate::mcp::logged_call_for_account(
                 state,
+                workspace_id,
                 account_id,
                 "message_send_text",
                 serde_json::json!({ "recipient": principal_wxid, "content": ask }),
@@ -530,149 +518,117 @@ pub(crate) async fn handle_principal_reply(
                     None
                 }
             });
-            let resolved =
-                resolve_escalation(state, &short_code, &decision, expires, "wechat").await?;
+            let resolved = resolve_escalation(state, &entry, &decision, expires, "wechat").await?;
             if resolved.is_none() {
                 return Ok(true); // 已被并发 resolve；幂等。
             }
-            enqueue_relay_task(state, &entry).await?;
             Ok(true)
         }
     }
 }
 
-/// 超时转备选：扫所有 pending 请示，age > timeout_hours 且当前决策人非链尾 → 改派下一位 + 重推卡。
-/// AI 绝不替决策人拍板——只把请示转给链上下一位真人。timeout=None → 无限等待，不动。
-/// 顺序：gate(next) → 推卡 MCP → 推成功才 reassign（落库同时刷新 updated_at，age 自此起算）。
-/// gate 拦或推失败都【不改派】——原 principal 不变、age 仍超时，下一 tick 重新算出同一个
-/// next 再试，绝不把台账困在链尾（改派只发生在卡确实送达 next 之后）。
+/// 超时转备选：只扫描当前卡已由 Outbox 确认送达的新协议请示，并严格使用创建时冻结的
+/// policy/account 快照。改派以 escalation 单文档 CAS 开启下一 delivery generation，再由
+/// Outbox 幂等物化；这里不直接跨越 MCP 远端边界。
 pub async fn scan_escalation_timeouts(state: &AppState) -> AppResult<()> {
-    use futures::TryStreamExt;
     let now_ms = DateTime::now().timestamp_millis();
-    // 取所有 current_version config，建 workspace+domain → resolved policy 映射。
-    let configs: Vec<OperationDomainConfig> = state
-        .db
-        .operation_domain_configs()
-        .find(doc! { "current_version": true }, None)
-        .await?
-        .try_collect()
-        .await?;
-    for cfg in &configs {
-        let policy = resolve_ask_human_policy(cfg);
-        if policy.timeout_hours.is_none() {
+    for entry in list_timeout_eligible_escalations(state).await? {
+        let Some(protocol) = entry.protocol.as_ref() else {
             continue;
-        }
-        let pending = list_escalations_by_workspace(state, &cfg.workspace_id, "pending").await?;
-        for entry in pending {
-            let age_hours =
-                (now_ms - entry.updated_at.timestamp_millis()) as f64 / (3600.0 * 1000.0);
-            let Some(next) = next_decider_on_timeout(
-                &policy,
-                &entry.principal_wxid,
-                &entry.contact_wxid,
-                age_hours,
-            ) else {
-                // next_decider_on_timeout 返回 None 有两种情形：①尚未超时 ②已超时但到链尾。
-                // 仅情形②需安抚客户。policy.timeout_hours 在 :365 已确保 Some，可直接比对区分。
-                let timed_out = policy.timeout_hours.map_or(false, |t| age_hours >= t);
-                if timed_out {
-                    // 链尾：无更多决策人可改派。客户不能被永久晾着——发 AI 自主延期安抚话术，
-                    // 台账保持 pending 继续等领导。去重：每 holding_reply_min_interval_hours 最多一条。
-                    // 安抚发给**客户**（非领导推卡），故**不过** push_allowed（quiet_hours 约束打扰领导；
-                    // 客户安抚只受 min_interval 去重约束）。
-                    let min_interval_ms =
-                        (state.config.holding_reply_min_interval_hours * 3600.0 * 1000.0) as i64;
-                    let should_send = entry
-                        .last_holding_reply_ms
-                        .map_or(true, |last| now_ms - last >= min_interval_ms);
-                    if should_send {
-                        // Chain-tail holding reply: semantic review first, durable outbox second.
-                        let holding_text = generate_holding_reply(
-                            state,
-                            &entry.account_id,
-                            &entry.contact_wxid,
-                            HoldingReplyScene::ChainTail,
-                            None,
-                        )
-                        .await;
-                        let window_ms = min_interval_ms.max(1);
-                        let window = now_ms.div_euclid(window_ms);
-                        let enqueue_result = enqueue_holding_reply(
-                            state,
-                            &cfg.workspace_id,
-                            &entry.account_id,
-                            &entry.contact_wxid,
-                            format!("holding-chain-tail-{}-{window}", entry.short_code),
-                            format!("principal-chain-tail:{}:{window}", entry.short_code),
-                            None,
-                            holding_text,
-                        )
-                        .await;
-                        match enqueue_result {
-                            Ok(_) => {
-                                if let Err(e) = touch_last_holding_reply_ms(
-                                    state,
-                                    &cfg.workspace_id,
-                                    &entry.short_code,
-                                    now_ms,
-                                )
-                                .await
-                                {
-                                    tracing::warn!(short_code = %entry.short_code, error = ?e, "链尾安抚已入队但更新 last_holding_reply_ms 失败");
-                                }
+        };
+        let policy = resolve_ask_human_policy_snapshot(&protocol.policy);
+        let Some(last_pushed_at_ms) = entry.last_pushed_at_ms else {
+            continue;
+        };
+        let age_hours = (now_ms - last_pushed_at_ms) as f64 / (3600.0 * 1000.0);
+        let Some(next) = next_decider_on_timeout(
+            &policy,
+            &entry.principal_wxid,
+            &entry.contact_wxid,
+            age_hours,
+        ) else {
+            let timed_out = policy
+                .timeout_hours
+                .is_some_and(|timeout| age_hours >= timeout);
+            if timed_out {
+                let min_interval_ms =
+                    (state.config.holding_reply_min_interval_hours * 3600.0 * 1000.0) as i64;
+                let should_send = entry
+                    .last_holding_reply_ms
+                    .is_none_or(|last| now_ms - last >= min_interval_ms);
+                if should_send {
+                    let holding_text = generate_holding_reply(
+                        state,
+                        &entry.workspace_id,
+                        &entry.account_id,
+                        &entry.contact_wxid,
+                        HoldingReplyScene::ChainTail,
+                        None,
+                    )
+                    .await;
+                    let window_ms = min_interval_ms.max(1);
+                    let window = now_ms.div_euclid(window_ms);
+                    match enqueue_holding_reply(
+                        state,
+                        &entry.workspace_id,
+                        &entry.account_id,
+                        &entry.contact_wxid,
+                        format!("holding-chain-tail-{}-{window}", entry.short_code),
+                        format!("principal-chain-tail:{}:{window}", entry.short_code),
+                        None,
+                        holding_text,
+                    )
+                    .await
+                    {
+                        Ok(_) => {
+                            if let Err(error) = touch_last_holding_reply_ms(
+                                state,
+                                &entry.workspace_id,
+                                &entry.short_code,
+                                now_ms,
+                            )
+                            .await
+                            {
+                                tracing::warn!(short_code = %entry.short_code, ?error, "链尾安抚已入队但更新时间失败");
                             }
-                            Err(error) => {
-                                tracing::warn!(short_code = %entry.short_code, ?error, "chain-tail holding reply enqueue failed; retry remains eligible");
-                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(short_code = %entry.short_code, ?error, "chain-tail holding reply enqueue failed");
                         }
                     }
                 }
-                continue;
-            };
-            let next_wxid = next.wxid.clone();
-
-            // 骚扰门先于改派（关键）：此刻台账仍挂【原】principal，查 next 的 count/latest 不含本条，
-            // 无自我命中。命中则本 tick 不改派、不推——原 principal age 仍超时，下一 tick 会重新
-            // 算出同一个 next 再试（绝不把台账困在链尾：改派只发生在卡确实送达 next 之后）。
-            let since_ms = now_ms - 24 * 3600 * 1000;
-            let today = count_pushes_today(state, &cfg.workspace_id, &next_wxid, since_ms).await?;
-            let last_push = latest_push_ms(state, &cfg.workspace_id, &next_wxid).await?;
-            if !push_allowed(&policy, today, last_push, now_ms) {
-                continue; // 骚扰门拦：本 tick 跳过（不改派），待下一 tick
             }
-
-            // 先推卡给 next，推成功才改派落库（reassign 落库同时刷新 updated_at）。
-            let label = entry.contact_wxid.clone();
-            let card = render_principal_card(
-                &entry.short_code,
-                &label,
-                &entry.reason,
-                &entry.question_for_principal,
-            );
-            match mcp::logged_call_for_account(
-                state,
-                &entry.account_id,
-                "message_send_text",
-                serde_json::json!({ "recipient": &next_wxid, "content": card }),
-            )
-            .await
-            {
-                Ok(_) => {
-                    // 推达 next 才改派：principal_wxid → next，updated_at 刷新（age 自此起算）。
-                    // reassign 落库失败时 next 已收到卡（体验无损），下一 tick principal 仍是原值会
-                    // 重推同一个 next（幂等，可接受），不丢不卡死。
-                    if let Err(e) =
-                        reassign_escalation(state, &cfg.workspace_id, &entry.short_code, &next_wxid)
-                            .await
-                    {
-                        tracing::warn!(short_code = %entry.short_code, error = ?e, "改派推卡成功但落库改派失败，下一 tick 将重推");
-                    }
-                }
-                Err(e) => {
-                    // 推卡失败：不改派，原 principal/age 不变，下一 tick 重推给同一个 next。
-                    tracing::warn!(short_code = %entry.short_code, next = %next_wxid, error = ?e, "改派推卡失败，下一 tick 将重试");
-                }
-            }
+            continue;
+        };
+        let next_wxid = next.wxid.clone();
+        let Some(next_account_id) = next
+            .account_id
+            .as_deref()
+            .filter(|account_id| !account_id.trim().is_empty())
+            .map(str::to_string)
+        else {
+            tracing::error!(short_code = %entry.short_code, next = %next_wxid, "冻结决策人缺少发送账号，拒绝改派");
+            continue;
+        };
+        let since_ms = now_ms - 24 * 3600 * 1000;
+        let today = count_pushes_today(state, &entry.workspace_id, &next_wxid, since_ms).await?;
+        let last_push = latest_push_ms(state, &entry.workspace_id, &next_wxid).await?;
+        if !push_allowed(&policy, today, last_push, now_ms) {
+            continue;
+        }
+        if let Some(next_entry) = reassign_escalation(
+            state,
+            &entry.workspace_id,
+            &entry.short_code,
+            &entry.principal_wxid,
+            protocol.delivery_generation,
+            &next_wxid,
+            &next_account_id,
+        )
+        .await?
+        {
+            // 入队确认失败时保留 pending_enqueue，下一 worker tick 会按 generation 幂等补偿。
+            materialize_principal_card_delivery(state, &next_entry).await?;
         }
     }
     Ok(())

@@ -10,21 +10,18 @@
 //!     列待审建议；按 status 过滤（默认 pending），**强制 workspace 隔离**
 //!     （relationship_type_suggestions 是 contact 级、带 workspace_id 字段）。
 //! - `POST /api/admin/relationship-type-suggestions/:id/approve`
-//!     行为：
+//!     行为（validate-first + transaction）：
 //!       1. 读 suggestion（必须 `status=pending`，且属当前 workspace）。
 //!       2. `validate_dimension_value(relationship_type, AdminWrite)` 校验
 //!          `suggested_value`——approve 是运营权威确认动作=AdminWrite，越界恒
 //!          Reject → 返 400，不写 contact。取 Accept 的 canonical 值。
-//!       3. `find_contact_by_id`（workspace 隔离）→ 写
-//!          `domain_attributes.relationship_type = canonical`。
-//!       4. mark suggestion `status="approved"` + reviewed_at + reviewed_by。
+//!       3. 事务内以完整 suggestion 快照 + `status=pending` CAS，同时写 contact 的
+//!          `domain_attributes.relationship_type = canonical` 并终结 approved。
 //! - `POST /api/admin/relationship-type-suggestions/:id/reject`
 //!     body: `{ reason }` —— 写 `rejection_reason` 并 `status="rejected"`。
 //!
-//! 注意：approve 涉及「写 contact + 改 suggestion 状态」两步，MongoDB 单机部署
-//! 不支持事务，这里采用「先写 contact → 再改建议状态」的最佳努力顺序写。先写
-//! contact 是因为它才是业务生效点；若改建议状态失败，建议仍为 pending，下次
-//! approve 会重新校验并幂等地把 contact 写成同一 canonical 值（$set 幂等）。
+//! 该路径要求 MongoDB replica set。建议 CAS、联系人写入或 commit 任一步失败均不留下
+//! 「联系人已生效但建议仍 pending」或「建议 approved 但联系人未更新」的分裂状态。
 
 use axum::{
     extract::{Path, Query, State},
@@ -33,7 +30,7 @@ use axum::{
 };
 use futures::TryStreamExt;
 use mongodb::bson::{doc, DateTime};
-use mongodb::options::FindOptions;
+use mongodb::options::{FindOptions, TransactionOptions};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -56,18 +53,12 @@ pub(super) struct ListSuggestionsQuery {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct ApproveSuggestionRequest {
-    /// 可选：操作人标识（一般是 admin email / id），落入 `reviewed_by`。
-    #[serde(default)]
-    reviewed_by: Option<String>,
-}
+pub(super) struct ApproveSuggestionRequest {}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct RejectSuggestionRequest {
     reason: String,
-    #[serde(default)]
-    reviewed_by: Option<String>,
 }
 
 pub(super) async fn list_relationship_suggestions(
@@ -110,30 +101,30 @@ pub(super) async fn approve_relationship_suggestion(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
-    Json(payload): Json<ApproveSuggestionRequest>,
+    Json(_payload): Json<ApproveSuggestionRequest>,
 ) -> Result<Response, AppError> {
     // 抽内部 fn 后 REST handler 只负责包 Response，业务逻辑全在 inner——
     // 与管理 Agent 工具分支共用同一份校验 + 写 contact + 改状态流程，行为等价。
+    let actor = ReviewActor::from_admin(&admin)?;
     let value =
-        approve_relationship_suggestion_inner(&state, &admin.current_workspace, &id, payload)
-            .await?;
+        approve_relationship_suggestion_inner(&state, &admin.current_workspace, &id, actor).await?;
     Ok(Json(value).into_response())
 }
 
 /// approve_relationship_suggestion 的内部核心：workspace 隔离读 suggestion →
-/// AdminWrite 校验 suggested_value → 写 contact 的 domain_attributes.relationship_type
-/// → mark 建议 approved → 返回 `{"item": <suggestion json>}`。
+/// AdminWrite 校验 suggested_value → 事务内 snapshot CAS + contact 写入 + approved 终态
+/// → 返回 `{"item": <suggestion json>}`。
 /// 跨 workspace / 不存在的 _id 返 NotFound（不泄漏存在性）。
 pub(in crate::routes) async fn approve_relationship_suggestion_inner(
     state: &AppState,
     workspace_id: &str,
     id: &str,
-    payload: ApproveSuggestionRequest,
+    actor: ReviewActor,
 ) -> AppResult<Value> {
     let object_id = parse_object_id(id)?;
     let suggestions = state.db.collection_relationship_type_suggestions();
     // 查询带 workspace 过滤：跨 workspace 的 _id 返回 NotFound（不泄漏存在性）。
-    let suggestion = suggestions
+    let mut suggestion = suggestions
         .find_one(
             doc! { "_id": object_id, "workspace_id": workspace_id },
             None,
@@ -174,48 +165,102 @@ pub(in crate::routes) async fn approve_relationship_suggestion_inner(
 
     // workspace 隔离取 contact——确认建议指向的 contact 仍在当前 workspace
     // （跨 workspace / 不存在均 404，不写 contact）。
-    find_contact_by_id(state, workspace_id, &suggestion.contact_id).await?;
+    let contact = find_contact_by_id(state, workspace_id, &suggestion.contact_id).await?;
+    if contact.account_id != suggestion.account_id {
+        return Err(AppError::Conflict(
+            "relationship_suggestion_contact_identity_changed".to_string(),
+        ));
+    }
     let contact_oid = parse_object_id(&suggestion.contact_id)?;
 
     let now = DateTime::now();
-    // 第 1 步（业务生效点）：写 contact 的 domain_attributes.relationship_type。
-    // 点路径 $set 只覆盖该一个键，不动其它 domain_attributes。
-    state
-        .db
-        .contacts()
-        .update_one(
-            doc! { "_id": contact_oid, "workspace_id": workspace_id },
-            doc! {
-                "$set": {
-                    "domain_attributes.relationship_type": &canonical,
-                    "updated_at": now
-                }
-            },
-            None,
-        )
+    let mut session = state.db.client().start_session(None).await?;
+    session
+        .start_transaction(TransactionOptions::builder().build())
         .await?;
+    let transaction_result: AppResult<()> = async {
+        // Bind approval to the exact object that was validated. A concurrent gateway refresh
+        // changing value/contact/account makes this CAS fail instead of approving stale evidence.
+        let claimed = suggestions
+            .update_one_with_session(
+                doc! {
+                    "_id": object_id,
+                    "workspace_id": workspace_id,
+                    "account_id": &suggestion.account_id,
+                    "contact_id": &suggestion.contact_id,
+                    "suggested_value": &suggestion.suggested_value,
+                    "last_seen_at": suggestion.last_seen_at,
+                    "status": "pending",
+                },
+                doc! {
+                    "$set": {
+                        "status": "approved",
+                        "reviewed_at": now,
+                        "reviewed_by": actor.as_str(),
+                    }
+                },
+                None,
+                &mut session,
+            )
+            .await?;
+        if claimed.modified_count != 1 {
+            return Err(AppError::Conflict(
+                "relationship_suggestion_not_pending_or_changed".to_string(),
+            ));
+        }
 
-    // 第 2 步：mark 建议 approved。失败时 contact 已生效，建议仍 pending，下次
-    // approve 会重新校验并幂等写同值，业务不丢。
-    suggestions
-        .update_one(
-            doc! { "_id": object_id },
-            doc! {
-                "$set": {
-                    "status": "approved",
-                    "reviewed_at": now,
-                    "reviewed_by": payload.reviewed_by.as_deref().unwrap_or("admin")
-                }
-            },
-            None,
-        )
-        .await?;
+        // Merge the one reviewed field into the container. `$ifNull` supports legacy rows with
+        // an absent or explicit-null domain_attributes value; malformed non-document values fail
+        // the transaction instead of being silently replaced.
+        let contact_update = state
+            .db
+            .contacts()
+            .update_one_with_session(
+                doc! {
+                    "_id": contact_oid,
+                    "workspace_id": workspace_id,
+                    "account_id": &suggestion.account_id,
+                },
+                vec![doc! {
+                    "$set": {
+                        "domain_attributes": {
+                            "$mergeObjects": [
+                                { "$ifNull": ["$domain_attributes", {}] },
+                                { "relationship_type": &canonical },
+                            ]
+                        },
+                        "domain_attributes_updated_at": now,
+                        "updated_at": now,
+                    }
+                }],
+                None,
+                &mut session,
+            )
+            .await?;
+        if contact_update.matched_count != 1 {
+            return Err(AppError::Conflict(
+                "relationship_suggestion_contact_changed".to_string(),
+            ));
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(error) = transaction_result {
+        let _ = session.abort_transaction().await;
+        return Err(error);
+    }
+    loop {
+        match session.commit_transaction().await {
+            Ok(()) => break,
+            Err(error) if error.contains_label("UnknownTransactionCommitResult") => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
 
-    let updated = suggestions
-        .find_one(doc! { "_id": object_id }, None)
-        .await?
-        .ok_or_else(|| AppError::NotFound("suggestion not found".to_string()))?;
-    Ok(json!({ "item": relationship_suggestion_json(updated) }))
+    suggestion.status = "approved".to_string();
+    suggestion.reviewed_at = Some(now);
+    suggestion.reviewed_by = Some(actor.as_str().to_string());
+    Ok(json!({ "item": relationship_suggestion_json(suggestion) }))
 }
 
 pub(super) async fn reject_relationship_suggestion(
@@ -229,6 +274,7 @@ pub(super) async fn reject_relationship_suggestion(
     }
     let object_id = parse_object_id(&id)?;
     let suggestions = state.db.collection_relationship_type_suggestions();
+    let actor = ReviewActor::from_admin(&admin)?;
     let now = DateTime::now();
     let result = suggestions
         .update_one(
@@ -241,7 +287,7 @@ pub(super) async fn reject_relationship_suggestion(
                 "$set": {
                     "status": "rejected",
                     "reviewed_at": now,
-                    "reviewed_by": payload.reviewed_by.as_deref().unwrap_or("admin"),
+                    "reviewed_by": actor.as_str(),
                     "rejection_reason": payload.reason.trim()
                 }
             },
@@ -336,14 +382,12 @@ mod tests {
         assert_eq!(resolved, "pending");
     }
 
-    /// T8：approve 请求 reviewed_by 可缺省（serde default）。
+    /// SR-058：旧客户端即使提交 reviewedBy，也不会进入请求模型或覆盖可信 actor。
     #[test]
-    fn approve_request_reviewed_by_optional() {
-        let req: ApproveSuggestionRequest = serde_json::from_value(json!({})).unwrap();
-        assert!(req.reviewed_by.is_none());
-        let req2: ApproveSuggestionRequest =
-            serde_json::from_value(json!({ "reviewedBy": "alice@corp" })).unwrap();
-        assert_eq!(req2.reviewed_by.as_deref(), Some("alice@corp"));
+    fn approve_request_ignores_untrusted_reviewed_by() {
+        let _: ApproveSuggestionRequest = serde_json::from_value(json!({})).unwrap();
+        let _: ApproveSuggestionRequest =
+            serde_json::from_value(json!({ "reviewedBy": "spoofed@corp" })).unwrap();
     }
 
     /// T8：reject 请求要求 `reason` 字段（serde 默认 missing 报错）。

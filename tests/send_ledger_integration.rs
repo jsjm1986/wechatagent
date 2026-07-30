@@ -182,6 +182,49 @@ async fn sr050_outbox_anchor_is_idempotent_and_globally_unique() {
 
 #[tokio::test]
 #[ignore = "requires docker mongo"]
+async fn sr050_anchor_audit_rejects_duplicates_without_rewriting_history() {
+    let app = common::TestApp::start().await;
+    let collection = app.state.db.agent_send_ledger();
+    collection
+        .drop_index("uniq_send_ledger_outbox_id", None)
+        .await
+        .expect("drop unique index in isolated test database");
+
+    let outbox_id = ObjectId::new();
+    let mut first = make_row("ws1", "shared-wxid", "media", "asset-a");
+    first.account_id = "acct-a".to_string();
+    first.outbox_id = Some(outbox_id);
+    let mut second = make_row("ws1", "shared-wxid", "namecard", "card-b");
+    second.account_id = "acct-b".to_string();
+    second.outbox_id = Some(outbox_id);
+    collection
+        .insert_many([first, second], None)
+        .await
+        .expect("seed duplicate legacy anchors");
+
+    let before = collection
+        .count_documents(doc! { "outbox_id": outbox_id }, None)
+        .await
+        .unwrap();
+    let error =
+        wechatagent::db::migrations::m041_audit_send_ledger_anchors::run_step(&app.state.db)
+            .await
+            .expect_err("duplicate anchors require explicit operator reconciliation");
+    assert!(error.to_string().contains("duplicate outbox_id"));
+    let after = collection
+        .count_documents(doc! { "outbox_id": outbox_id }, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        after, before,
+        "audit must never delete or merge ledger rows"
+    );
+
+    app.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires docker mongo"]
 async fn sr050_recent_history_is_account_scoped_for_shared_wxid() {
     let app = common::TestApp::start().await;
     let mut account_a = make_row("ws1", "shared-wxid", "media", "asset-a");

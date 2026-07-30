@@ -18,6 +18,10 @@ use crate::agent::types::{
 };
 
 pub fn review_passed(review: &DecisionReviewResult, runtime: &UserRuntimeParameters) -> bool {
+    let live_scores_are_valid = review
+        .claim_analysis
+        .get_str("reviewScoreStatus")
+        .is_ok_and(|status| status == "valid");
     review.approved
         && review.scores.hallucination_score < runtime.fact_risk_block_at
         && review.scores.human_like >= runtime.human_like_rewrite_below
@@ -32,12 +36,13 @@ pub fn review_passed(review: &DecisionReviewResult, runtime: &UserRuntimeParamet
             || review.scores.knowledge_grounding_score >= runtime.product_accuracy_block_below)
         // Phase B / B1：恢复 pressure_risk 软闸 — `>=` 阈值视为压迫感过强，拦截。
         // 0 表示 reviewer 未给分（含老数据反序列化默认），不参与拦截。
-        && (review.scores.pressure_risk == 0
-            || review.scores.pressure_risk < runtime.pressure_risk_block_at)
+        && ((!live_scores_are_valid && review.scores.pressure_risk == 0)
+            || (review.scores.pressure_risk > 0
+                && review.scores.pressure_risk < runtime.pressure_risk_block_at))
         // boundary/privacy 软闸对偶（与 classify_dual_gate 的 boundary_privacy_safety
         // <= 3 判定同源）：1-3 低分（泄露内部画像/评判、暴露 AI 身份或幕后领导信息）
         // 拦截。0 = reviewer 未填 / 老数据豁免（同 pressure_risk）；>=4 放行。
-        && (review.scores.boundary_privacy_safety == 0
+        && ((!live_scores_are_valid && review.scores.boundary_privacy_safety == 0)
             || review.scores.boundary_privacy_safety > 3)
 }
 
@@ -113,6 +118,10 @@ pub(crate) fn classify_dual_gate(
     review: &DecisionReviewResult,
     runtime: &UserRuntimeParameters,
 ) -> DualGateClassification {
+    let live_scores_are_valid = review
+        .claim_analysis
+        .get_str("reviewScoreStatus")
+        .is_ok_and(|status| status == "valid");
     let mut hard_risks: Vec<String> = Vec::new();
     if review.scores.hallucination_score >= runtime.fact_risk_block_at {
         hard_risks.push(format!(
@@ -154,7 +163,13 @@ pub(crate) fn classify_dual_gate(
             review.scores.human_like, runtime.human_like_rewrite_below
         ));
     }
-    if review.scores.pressure_risk != 0
+    if live_scores_are_valid && review.scores.pressure_risk == 0 {
+        soft_risks.push("pressure_risk_0_unscored".to_string());
+        direction_parts.push(
+            "pressureRisk returned zero for a live review, so pressure safety was not established; rewrite conservatively and provide a concrete score."
+                .to_string(),
+        );
+    } else if review.scores.pressure_risk != 0
         && review.scores.pressure_risk >= runtime.pressure_risk_block_at
     {
         soft_risks.push(format!(
@@ -182,7 +197,9 @@ pub(crate) fn classify_dual_gate(
     // 渐进式三档+隐私维度(2026-06-23)：边界/隐私安全软闸。1-3 低分触发改写。
     // `!= 0` 仿照上方 pressure_risk 的老数据兼容豁免：缺省 0 表示 reviewer 未填
     // /旧持久化文档无此键，视为未评分不拦截；真低分(1-3)才命中软闸。
-    if review.scores.boundary_privacy_safety != 0 && review.scores.boundary_privacy_safety <= 3 {
+    if (live_scores_are_valid || review.scores.boundary_privacy_safety != 0)
+        && review.scores.boundary_privacy_safety <= 3
+    {
         soft_risks.push(format!(
             "boundary_privacy_safety_{}_le_3",
             review.scores.boundary_privacy_safety
@@ -581,6 +598,38 @@ pub fn finalize_review_for_send(
     priced_from_catalog: bool,
     principal_product_exempted: bool,
 ) -> FinalizeOutcome {
+    finalize_review_for_send_at(
+        review,
+        decision,
+        runtime,
+        _contact,
+        knowledge_chunks,
+        promote_risks,
+        _inbound_text,
+        commitment_markers,
+        priced_from_catalog,
+        principal_product_exempted,
+        mongodb::bson::DateTime::now(),
+    )
+}
+
+/// Same final safety aggregation as [`finalize_review_for_send`], evaluated at
+/// an explicit instant. Prompt Shadow uses one instant for both branches so a
+/// knowledge-expiry boundary cannot become an accidental second variable.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn finalize_review_for_send_at(
+    review: DecisionReviewResult,
+    decision: &mut AgentDecision,
+    runtime: &UserRuntimeParameters,
+    _contact: &crate::models::Contact,
+    knowledge_chunks: &[crate::models::OperationKnowledgeChunk],
+    promote_risks: Vec<String>,
+    _inbound_text: &str,
+    commitment_markers: &crate::models::CommitmentMarkers,
+    priced_from_catalog: bool,
+    principal_product_exempted: bool,
+    evaluated_at: mongodb::bson::DateTime,
+) -> FinalizeOutcome {
     let mut review = review;
     let mut pending_events: Vec<PendingFinalizeEvent> = Vec::new();
 
@@ -695,11 +744,10 @@ pub fn finalize_review_for_send(
     // 本次恢复范围；claim_analysis 缺失时按"非产品声明"放行（reviewer 软闸 +
     // knowledge_router verified-only corpus 仍在兜底）。
     if crate::agent::guards::claim_requires_product_knowledge(&review.claim_analysis) {
-        let now = mongodb::bson::DateTime::now();
         let verified_chunks = crate::agent::guards::compute_verified_chunks(
             &decision.used_knowledge_ids,
             knowledge_chunks,
-            now,
+            evaluated_at,
         );
         if verified_chunks.is_empty() && !priced_from_catalog && !principal_product_exempted {
             review.approved = false;
@@ -744,11 +792,10 @@ pub fn finalize_review_for_send(
         let class =
             crate::agent::guards::commitment_claim_class(&decision.reply_text, commitment_markers);
         if class != crate::agent::guards::CommitmentClass::None {
-            let now = mongodb::bson::DateTime::now();
             let verified = crate::agent::guards::compute_verified_chunks(
                 &decision.used_knowledge_ids,
                 knowledge_chunks,
-                now,
+                evaluated_at,
             );
             if verified.is_empty() {
                 match class {
@@ -1292,6 +1339,18 @@ mod review_passed_dual_gate_tests {
     }
 
     #[test]
+    fn review_passed_blocks_explicit_live_pressure_risk_zero() {
+        let runtime = UserRuntimeParameters::default();
+        let mut review = full_pass_review();
+        review.scores.pressure_risk = 0;
+        review.claim_analysis.insert("reviewScoreStatus", "valid");
+        assert!(
+            !review_passed(&review, &runtime),
+            "an explicit live pressure score of zero is unscored, not a legacy omission"
+        );
+    }
+
+    #[test]
     fn review_passed_blocks_when_human_like_below_threshold() {
         let runtime = UserRuntimeParameters::default();
         let mut review = full_pass_review();
@@ -1391,6 +1450,18 @@ mod review_passed_dual_gate_tests {
         assert!(
             review_passed(&review, &runtime),
             "boundary_privacy_safety=0（老数据/未填）必须视为豁免"
+        );
+    }
+
+    #[test]
+    fn review_passed_blocks_explicit_live_boundary_privacy_zero() {
+        let runtime = UserRuntimeParameters::default();
+        let mut review = full_pass_review();
+        review.scores.boundary_privacy_safety = 0;
+        review.claim_analysis.insert("reviewScoreStatus", "valid");
+        assert!(
+            !review_passed(&review, &runtime),
+            "an explicit live boundary score of zero is unsafe, not a legacy omission"
         );
     }
 }
@@ -1755,6 +1826,20 @@ mod dual_gate_classification_tests {
     }
 
     #[test]
+    fn classify_dual_gate_marks_explicit_live_pressure_zero_as_soft_failure() {
+        let runtime = UserRuntimeParameters::default();
+        let mut review = full_pass_review();
+        review.scores.pressure_risk = 0;
+        review.claim_analysis.insert("reviewScoreStatus", "valid");
+        match classify_dual_gate(&review, &runtime) {
+            DualGateClassification::SoftGateFailure { risks, .. } => {
+                assert!(risks.iter().any(|risk| risk == "pressure_risk_0_unscored"))
+            }
+            other => panic!("expected SoftGateFailure, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn reply_objective_features_reports_metrics_without_prejudging_questions() {
         // 纯 LLM 驱动：机器只报客观量 + 提示"按用户语境判断问句增减"，
         // 不替改写 Agent 预判"该加问句"（历史写死"可加反问"会在用户拒绝
@@ -1827,6 +1912,20 @@ mod dual_gate_classification_tests {
             classify_dual_gate(&review, &runtime),
             DualGateClassification::AllPass
         );
+    }
+
+    #[test]
+    fn classify_dual_gate_blocks_explicit_live_boundary_privacy_zero() {
+        let runtime = UserRuntimeParameters::default();
+        let mut review = full_pass_review();
+        review.scores.boundary_privacy_safety = 0;
+        review.claim_analysis.insert("reviewScoreStatus", "valid");
+        match classify_dual_gate(&review, &runtime) {
+            DualGateClassification::SoftGateFailure { risks, .. } => assert!(risks
+                .iter()
+                .any(|risk| risk == "boundary_privacy_safety_0_le_3")),
+            other => panic!("expected live zero boundary score to fail, got {other:?}"),
+        }
     }
 
     #[test]

@@ -208,11 +208,11 @@ pub struct AgentDecision {
     pub consolidation_needed: bool,
     #[serde(default, deserialize_with = "string_or_vec")]
     pub used_knowledge_ids: Vec<String>,
-    /// 客观购买事实增强 G2（2026-06-15 spec §5.4）：本轮回复**报价/推荐时引用的
-    /// 产品 product_id**（来自注入的「产品目录」段）。R5.4 据此判 `priced_from_catalog`：
-    /// 引用的 product_id ∈ 本 workspace active products → 视为结构化 verified 背书，
-    /// 与 verified_chunks 取或，避免 G2 准确报价被 `blocked_unverified_product_claim` 错杀。
-    /// 空（无报价 / 情感域）→ 不触发并联背书，行为与改造前等价。
+    /// 历史 Reply 协议字段：模型自报其引用的产品 ID。
+    ///
+    /// 仅为持久化/提示兼容保留，不能作为目录背书或发送授权证据。R5.4 的
+    /// `priced_from_catalog` 只由独立 ClaimGate 对最终正文提取、精确 quote 锚定并由
+    /// 服务端逐字段核对 active catalog 后产生。
     #[serde(default, deserialize_with = "string_or_vec")]
     pub quoted_product_ids: Vec<String>,
     #[serde(default)]
@@ -480,7 +480,7 @@ pub struct RawAgentDecision {
     pub reply_text: Option<String>,
     pub should_reply: Option<bool>,
     pub used_knowledge_ids: Option<Vec<String>>,
-    /// G2 报价引用的 product_id（spec §5.4，R5.4 priced_from_catalog 判定用）。
+    /// 历史兼容字段；模型自报值不参与 `priced_from_catalog` 授权判定。
     pub quoted_product_ids: Option<Vec<String>>,
     pub safe_claims_used: Option<Vec<String>>,
     pub knowledge_route: Option<KnowledgeRouteResult>,

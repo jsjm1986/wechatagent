@@ -343,12 +343,11 @@ pub(crate) fn compact_memory_card(card: &MemoryCardTyped) -> MemoryCardTyped {
 /// `bson::to_document(&MemoryCardTyped)` 一次性序列化，避免 typed/Document
 /// 双轨表示。
 ///
-/// 合并规则（HP-2 / Task 8）：
-/// - `previous.core_facts` 中未在 `discarded` 列表里的事实会被保留到结果，
-///   即使 `card.core_facts` 没显式列出它（避免新近性挤掉关键早期事实）。
-/// - `card.core_facts` 优先靠前；previous 中独有的项追加到末尾再统一截留。
-/// - 其它字段直接用 `card` 的值（recent_facts / preferences 等都属于
-///   "consolidator 自己负责按重要度排序" 的范畴）。
+/// 合并规则（HP-2 / Task 8 / SR-182）：
+/// - incoming 与 previous 的未 discarded core fact 先合并去重；
+/// - 合集按结构化来源、importance、confidence、updated_at、稳定 id/text 统一排序；
+/// - core 仍是最多 6 条的 prompt 投影窗口；容量淘汰项迁入 recent，并在
+///   `extra.coreFactEvictions` 留下有界审计，不再静默消失；
 /// - cap：`core_facts ≤ 6 / recent_facts ≤ 10 / deprecated_facts ≤ 20`，
 ///   `extra` 中数组类字段（`coreFacts / recentFacts` 历史字段，
 ///   `confirmedFacts / preferences / doNotDo / commitments / objections /
@@ -417,9 +416,102 @@ pub fn compact_memory_card_with_dimensions(
         }
     }
 
-    // typed 字段 cap。
-    compact.core_facts.truncate(6);
-    compact.recent_facts.truncate(10);
+    // SR-182：coreFacts 是有限 prompt 投影，不是永久事实库。对完整候选集做稳定、
+    // 可解释的统一排序，再把容量淘汰项迁到 recent 并记录审计。排序不依赖 incoming /
+    // previous 的拼接顺序，因此同一候选集重复 compact 得到同一 core 窗口。
+    compact.core_facts.sort_by(compare_core_fact_priority);
+    let eviction_at = DateTime::now();
+    let mut evicted = if compact.core_facts.len() > 6 {
+        compact.core_facts.split_off(6)
+    } else {
+        Vec::new()
+    };
+    for (offset, fact) in evicted.iter_mut().enumerate() {
+        annotate_core_fact_eviction(fact, 7 + offset, eviction_at);
+    }
+
+    let mut audits: Vec<Bson> = evicted
+        .iter()
+        .enumerate()
+        .map(|(offset, fact)| {
+            Bson::Document(core_fact_eviction_audit(fact, 7 + offset, eviction_at))
+        })
+        .collect();
+    if let Some(Bson::Array(existing)) = compact.extra.remove("coreFactEvictions") {
+        audits.extend(existing);
+    }
+    if let Some(previous_audits) =
+        previous.and_then(|card| card.extra.get_array("coreFactEvictions").ok())
+    {
+        audits.extend(previous_audits.iter().cloned());
+    }
+    if !audits.is_empty() {
+        let active_core_ids: std::collections::HashSet<&str> = compact
+            .core_facts
+            .iter()
+            .filter_map(|fact| match fact {
+                MemoryFactRepr::Structured(fact) if !fact.id.trim().is_empty() => {
+                    Some(fact.id.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        let active_core_texts: std::collections::HashSet<&str> = compact
+            .core_facts
+            .iter()
+            .map(MemoryFactRepr::as_text)
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        audits.retain(|item| {
+            let Some(doc) = item.as_document() else {
+                return false;
+            };
+            let id = doc.get_str("factId").unwrap_or_default();
+            let text = doc.get_str("text").unwrap_or_default();
+            // The archive describes facts outside the current core projection.
+            // If a later consolidation promotes the same stable id (or legacy
+            // text-only fact) back into core, the old eviction is no longer the
+            // current lifecycle state and must disappear from the control plane.
+            if (!id.is_empty() && active_core_ids.contains(id)) || active_core_texts.contains(text)
+            {
+                return false;
+            }
+            // An explicit discard is stronger than an earlier capacity eviction:
+            // do not keep presenting a fact as archived after the consolidator
+            // has deliberately removed it from long-term memory.
+            if discarded
+                .iter()
+                .any(|discarded_text| discarded_text == text)
+            {
+                return false;
+            }
+            let key = if id.is_empty() {
+                format!("text:{text}")
+            } else {
+                format!("id:{id}")
+            };
+            seen.insert(key)
+        });
+        audits.truncate(20);
+        compact
+            .extra
+            .insert("coreFactEvictions", Bson::Array(audits));
+    }
+
+    // 容量淘汰项排在原 recent 前，确保 previous=6 + incoming<=6 的全部溢出事实
+    // 均能进入 recent；去掉与 core/recent 的文本重复后再执行既有 cap 10。
+    evicted.extend(std::mem::take(&mut compact.recent_facts));
+    let core_texts: std::collections::HashSet<String> = compact
+        .core_facts
+        .iter()
+        .map(|fact| fact.as_text().to_string())
+        .collect();
+    let mut recent_seen = std::collections::HashSet::new();
+    evicted.retain(|fact| {
+        !core_texts.contains(fact.as_text()) && recent_seen.insert(fact.as_text().to_string())
+    });
+    evicted.truncate(10);
+    compact.recent_facts = evicted;
     compact.deprecated_facts.truncate(20);
 
     // extra 中的 free-form 数组也按既有 cap 把关。历史 wire shape 保持不变：
@@ -476,6 +568,96 @@ pub fn compact_memory_card_with_dimensions(
         limit_extra_array(&mut compact.extra, &dim.key, dim.cap);
     }
     compact
+}
+
+fn core_fact_source_authority(fact: &MemoryFactRepr) -> i32 {
+    let MemoryFactRepr::Structured(fact) = fact else {
+        return 0;
+    };
+    let mut score = 1;
+    if !fact.source_message_ids.is_empty() {
+        score += 8;
+    }
+    if fact
+        .evidence
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        score += 4;
+    }
+    if fact
+        .source_run_id
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        score += 2;
+    }
+    score
+}
+
+fn core_fact_importance(fact: &MemoryFactRepr) -> i32 {
+    match fact {
+        MemoryFactRepr::Structured(fact) => fact.importance,
+        MemoryFactRepr::Plain(_) => 5,
+    }
+}
+
+fn core_fact_confidence(fact: &MemoryFactRepr) -> i32 {
+    match fact {
+        MemoryFactRepr::Structured(fact) => fact.confidence,
+        MemoryFactRepr::Plain(_) => 7,
+    }
+}
+
+fn core_fact_updated_at(fact: &MemoryFactRepr) -> i64 {
+    match fact {
+        MemoryFactRepr::Structured(fact) => fact.updated_at.timestamp_millis(),
+        MemoryFactRepr::Plain(_) => 0,
+    }
+}
+
+fn core_fact_stable_key(fact: &MemoryFactRepr) -> &str {
+    match fact {
+        MemoryFactRepr::Structured(fact) if !fact.id.trim().is_empty() => fact.id.as_str(),
+        _ => fact.as_text(),
+    }
+}
+
+fn compare_core_fact_priority(left: &MemoryFactRepr, right: &MemoryFactRepr) -> std::cmp::Ordering {
+    core_fact_source_authority(right)
+        .cmp(&core_fact_source_authority(left))
+        .then_with(|| core_fact_importance(right).cmp(&core_fact_importance(left)))
+        .then_with(|| core_fact_confidence(right).cmp(&core_fact_confidence(left)))
+        .then_with(|| core_fact_updated_at(right).cmp(&core_fact_updated_at(left)))
+        .then_with(|| core_fact_stable_key(left).cmp(core_fact_stable_key(right)))
+        .then_with(|| left.as_text().cmp(right.as_text()))
+}
+
+fn annotate_core_fact_eviction(fact: &mut MemoryFactRepr, rank: usize, evicted_at: DateTime) {
+    if let MemoryFactRepr::Structured(fact) = fact {
+        fact.extra.insert("evictionReason", "core_fact_capacity");
+        fact.extra.insert("evictedAt", evicted_at);
+        fact.extra.insert("evictedFrom", "coreFacts");
+        fact.extra
+            .insert("coreFactRank", rank.min(i32::MAX as usize) as i32);
+    }
+}
+
+fn core_fact_eviction_audit(fact: &MemoryFactRepr, rank: usize, evicted_at: DateTime) -> Document {
+    let fact_id = match fact {
+        MemoryFactRepr::Structured(fact) => fact.id.as_str(),
+        MemoryFactRepr::Plain(_) => "",
+    };
+    doc! {
+        "factId": fact_id,
+        "text": fact.as_text(),
+        "reason": "core_fact_capacity",
+        "evictedAt": evicted_at,
+        "evictedFrom": "coreFacts",
+        "coreFactRank": rank.min(i32::MAX as usize) as i32,
+        "importance": core_fact_importance(fact),
+        "confidence": core_fact_confidence(fact),
+    }
 }
 
 fn limit_extra_array(doc: &mut Document, key: &str, max_items: usize) {
@@ -973,6 +1155,75 @@ pub async fn load_or_create_operating_memory(
         .ok_or_else(|| AppError::External("operating memory missing after insert".to_string()))
 }
 
+/// Shadow-safe operating-memory loader. Existing memory is returned byte for
+/// byte and a missing row is synthesized in memory only. It never inserts a
+/// row and never performs the live path's OCC seed update.
+pub(crate) async fn load_operating_memory_read_only(
+    state: &AppState,
+    contact: &Contact,
+) -> AppResult<OperatingMemory> {
+    if let Some(memory) = state
+        .db
+        .operating_memories()
+        .find_one(
+            doc! {
+                "workspace_id": &contact.workspace_id,
+                "account_id": &contact.account_id,
+                "contact_wxid": &contact.wxid
+            },
+            None,
+        )
+        .await?
+    {
+        return Ok(memory);
+    }
+
+    let domain_config = super::decision::load_user_operation_domain_config_for_contact(
+        state,
+        &contact.workspace_id,
+        &contact.wxid,
+    )
+    .await?;
+    let initial_state = super::guards::initial_operation_state_key(domain_config.as_ref());
+    let now = DateTime::now();
+    let mut memory = OperatingMemory {
+        id: None,
+        workspace_id: contact.workspace_id.clone(),
+        account_id: contact.account_id.clone(),
+        contact_wxid: contact.wxid.clone(),
+        user_understanding: Document::new(),
+        relationship_state: Document::new(),
+        product_fit: Document::new(),
+        next_action: doc! {
+            "currentState": contact.operation_state.clone().unwrap_or_else(|| initial_state.clone()),
+            "nextBestAction": "",
+            "goal": "",
+            "recommendedMove": "",
+            "avoid": "",
+            "timing": "",
+            "reason": ""
+        },
+        context_pack: default_context_pack(),
+        context_pack_version: 0,
+        context_pack_updated_at: None,
+        memory_card: default_memory_card(),
+        memory_card_version: 0,
+        memory_card_updated_at: None,
+        created_at: now,
+        updated_at: now,
+    };
+    let mut seeded = memory_card_from_contact(contact, &memory, &initial_state);
+    memory.memory_card_version = if memory_card_has_signal(&seeded) {
+        1
+    } else {
+        0
+    };
+    seeded.extra.insert("version", memory.memory_card_version);
+    memory.memory_card = seeded;
+    memory.memory_card_updated_at = (memory.memory_card_version > 0).then_some(now);
+    Ok(memory)
+}
+
 pub async fn handle_memory_consolidation_task(state: &AppState, task: AgentTask) -> AppResult<()> {
     handle_memory_consolidation_task_with_claim(state, task, None).await
 }
@@ -1334,10 +1585,10 @@ async fn consolidate_contact_memory_inner(
     // 截断。两处复用同一份，避免重复 IO。
     let active_profile =
         crate::agent::domain_profile::load_active_domain_profile(&state.db, &contact.workspace_id)
-            .await;
+            .await?;
     let system = prompts::load_prompt(
         &state.db,
-        &state.config.default_workspace_id,
+        &contact.workspace_id,
         "user.memory_consolidator.system",
     )
     .await
@@ -1346,7 +1597,7 @@ async fn consolidate_contact_memory_inner(
     });
     let task_prompt = prompts::load_prompt(
         &state.db,
-        &state.config.default_workspace_id,
+        &contact.workspace_id,
         "user.memory_consolidator.task",
     )
     .await
@@ -1447,6 +1698,7 @@ async fn consolidate_contact_memory_inner(
     );
     let mut value = generate_agent_json(
         state,
+        &contact.workspace_id,
         Some(&contact.account_id),
         Some(&contact.wxid),
         Some(&run_id),
@@ -1466,6 +1718,7 @@ async fn consolidate_contact_memory_inner(
     if value_has_non_atomic_fact(&value) {
         match generate_agent_json(
             state,
+            &contact.workspace_id,
             Some(&contact.account_id),
             Some(&contact.wxid),
             Some(&run_id),
@@ -1703,6 +1956,7 @@ async fn consolidate_contact_memory_inner(
     for details in &conflict_events {
         let _ = write_event_for_account(
             state,
+            &contact.workspace_id,
             &contact.account_id,
             Some(&contact.wxid),
             "memory_conflict_resolved",
@@ -1796,6 +2050,7 @@ async fn consolidate_contact_memory_inner(
     }
     write_event_for_account(
         state,
+        &contact.workspace_id,
         &contact.account_id,
         Some(&contact.wxid),
         "memory_consolidated",
@@ -2026,7 +2281,13 @@ fn memory_contact_projection_filter(
 /// Task's `running -> committing` CAS. Every projection below is idempotent: the memory document
 /// carries the exact task generation, contact projections are monotonic by memory-card version,
 /// candidates only transition from pending, and events use the existing unique dedupe key.
-pub(crate) async fn reconcile_memory_consolidation_commit(
+/// Recovery entry point for the durable memory commit protocol.
+///
+/// This is public only so integration redlines can replay persisted crash
+/// windows through the production reconciler. Application callers should
+/// create/claim a memory-consolidation task instead of invoking it directly.
+#[doc(hidden)]
+pub async fn reconcile_memory_consolidation_commit(
     state: &AppState,
     task_id: ObjectId,
 ) -> AppResult<()> {
@@ -2664,6 +2925,90 @@ pub(crate) async fn schedule_memory_consolidation_task(
     Ok(())
 }
 
+/// Run an operator-requested consolidation through the same durable task protocol as the
+/// background worker. The manual path deliberately does not wake or mutate an existing active
+/// task: another owner may already be running or replaying its prepared commit, and reporting that
+/// work as this HTTP request's synchronous result would be false. The contact-scoped partial unique
+/// index is the arbitration point; a duplicate becomes an explicit conflict.
+pub async fn run_manual_memory_consolidation(
+    state: &AppState,
+    contact: &Contact,
+    requested_by: &str,
+) -> AppResult<ObjectId> {
+    const ACTIVE_KEY: &str = "memory_consolidation";
+    let task_id = ObjectId::new();
+    let now = DateTime::now();
+    let task = AgentTask {
+        id: Some(task_id),
+        workspace_id: contact.workspace_id.clone(),
+        account_id: contact.account_id.clone(),
+        contact_wxid: contact.wxid.clone(),
+        kind: "memory_consolidation".to_string(),
+        run_at: now,
+        expires_at: None,
+        content: format!("管理员手动整理 requestedBy={}", requested_by.trim()),
+        status: "pending".to_string(),
+        source_decision_id: None,
+        review_required: false,
+        attempt_count: 0,
+        max_attempts: 3,
+        next_retry_at: None,
+        gateway_status: None,
+        cancel_reason: None,
+        error: None,
+        claimed_at: None,
+        claim_recovery_count: 0,
+        created_at: now,
+        updated_at: now,
+    };
+    let mut task_doc = to_document(&task)?;
+    task_doc.insert("active_task_key", ACTIVE_KEY);
+    task_doc.insert("manual_requested_by", requested_by.trim());
+    match state
+        .db
+        .tasks()
+        .clone_with_type::<Document>()
+        .insert_one(task_doc, None)
+        .await
+    {
+        Ok(_) => {}
+        Err(error) if crate::agent::escalation::is_duplicate_key_error(&error) => {
+            return Err(AppError::Conflict(
+                "memory_consolidation_already_active".to_string(),
+            ));
+        }
+        Err(error) => return Err(error.into()),
+    }
+
+    if !crate::tasks::run_due_task_by_id(state, task_id).await? {
+        return Err(AppError::Conflict(
+            "memory_consolidation_not_claimable".to_string(),
+        ));
+    }
+    let task_after = state
+        .db
+        .tasks()
+        .clone_with_type::<Document>()
+        .find_one(doc! { "_id": task_id }, None)
+        .await?
+        .ok_or_else(|| AppError::External("memory consolidation task disappeared".to_string()))?;
+    match task_after.get_str("status").unwrap_or_default() {
+        "sent" => Ok(task_id),
+        "committing" => Err(AppError::External(
+            "memory consolidation commit is durably pending recovery".to_string(),
+        )),
+        "retry" | "failed" => Err(AppError::External(
+            task_after
+                .get_str("error")
+                .unwrap_or("memory consolidation did not complete")
+                .to_string(),
+        )),
+        status => Err(AppError::External(format!(
+            "memory consolidation ended in unexpected task status: {status}"
+        ))),
+    }
+}
+
 /// knowledge-digest-workstation Phase 5：加载运营长期偏好记忆。
 ///
 /// 与 `consolidate_contact_memory` / `compact_memory_card_*` 物理隔离 —
@@ -2676,24 +3021,59 @@ pub(crate) async fn schedule_memory_consolidation_task(
 ///
 /// 返回的 Vec 已按 `lastUsedAt desc` 排好，调用方拼 prompt header 时
 /// 直接渲染即可。
-pub(crate) async fn load_operator_memory(
+pub async fn load_operator_memory(
     db: &crate::db::Database,
     workspace_id: &str,
     account_id: &str,
     operator_id: &str,
     top_n: i64,
 ) -> AppResult<Vec<crate::models::KnowledgeOperatorMemory>> {
+    load_operator_memory_with_touch(db, workspace_id, account_id, operator_id, top_n, true).await
+}
+
+/// Shadow-safe variant: reads the same preferences but does not renew
+/// `last_used_at`, so an evaluation cannot alter production retention/order.
+pub async fn load_operator_memory_read_only(
+    db: &crate::db::Database,
+    workspace_id: &str,
+    account_id: &str,
+    operator_id: &str,
+    top_n: i64,
+) -> AppResult<Vec<crate::models::KnowledgeOperatorMemory>> {
+    load_operator_memory_with_touch(db, workspace_id, account_id, operator_id, top_n, false).await
+}
+
+async fn load_operator_memory_with_touch(
+    db: &crate::db::Database,
+    workspace_id: &str,
+    account_id: &str,
+    operator_id: &str,
+    top_n: i64,
+    touch_last_used: bool,
+) -> AppResult<Vec<crate::models::KnowledgeOperatorMemory>> {
     use futures::TryStreamExt;
-    let now = DateTime::now();
+    // Prompt Shadow evaluates both branches at one immutable instant. Without
+    // this override an operator-memory row could expire between baseline and
+    // candidate even though no database document changed.
+    let now = crate::agent::budget::current_shadow_evaluation_snapshot()
+        .map(|snapshot| snapshot.evaluated_at)
+        .unwrap_or_else(DateTime::now);
     let filter = doc! {
         "workspace_id": workspace_id,
         "account_id": account_id,
         "operator_id": operator_id,
+        "$and": [{
+            "$or": [
+                { "revoked_at": { "$exists": false } },
+                { "revoked_at": null },
+            ],
+        }, {
         "$or": [
             { "expires_at": { "$exists": false } },
             { "expires_at": null },
             { "expires_at": { "$gt": now } },
         ],
+        }],
     };
     let opts = FindOptions::builder()
         .sort(doc! { "last_used_at": -1_i32 })
@@ -2712,13 +3092,19 @@ pub(crate) async fn load_operator_memory(
     {
         out.push(m);
     }
-    if !out.is_empty() {
+    if touch_last_used && !out.is_empty() {
         let ids: Vec<ObjectId> = out.iter().filter_map(|m| m.id).collect();
         if !ids.is_empty() {
             let _ = db
                 .knowledge_operator_memory()
                 .update_many(
-                    doc! { "_id": { "$in": ids } },
+                    doc! {
+                        "_id": { "$in": ids },
+                        "$or": [
+                            { "revoked_at": { "$exists": false } },
+                            { "revoked_at": null },
+                        ],
+                    },
                     doc! { "$set": { "last_used_at": now } },
                     None,
                 )
@@ -2735,11 +3121,12 @@ pub(crate) async fn load_operator_memory(
 pub(crate) fn format_operator_memory_for_reply_prompt(
     items: &[crate::models::KnowledgeOperatorMemory],
 ) -> String {
-    if items.is_empty() {
+    let active = items.iter().filter(|memory| memory.revoked_at.is_none());
+    if active.clone().next().is_none() {
         return String::new();
     }
     let mut buf = String::from("[运营偏好记忆]\n");
-    for m in items {
+    for m in active {
         buf.push_str(&format!("- ({}) {}\n", m.kind, m.content));
     }
     buf
@@ -2750,7 +3137,7 @@ pub(crate) fn format_operator_memory_for_reply_prompt(
 /// 同 `(workspace_id, account_id, operator_id, kind, content)` 命中时只
 /// bump `lastUsedAt`，不重复插入，避免运营把同一句话说两遍就刷出两条
 /// 重复 memory。
-pub(crate) async fn record_operator_memory(
+pub async fn record_operator_memory(
     db: &crate::db::Database,
     workspace_id: &str,
     account_id: &str,
@@ -2777,6 +3164,10 @@ pub(crate) async fn record_operator_memory(
         "operator_id": operator_id,
         "kind": kind_trim,
         "content": content_trim,
+        "$or": [
+            { "revoked_at": { "$exists": false } },
+            { "revoked_at": null },
+        ],
     };
     if let Some(existing) = db
         .knowledge_operator_memory()
@@ -2806,12 +3197,100 @@ pub(crate) async fn record_operator_memory(
         created_at: now,
         last_used_at: now,
         expires_at: None,
+        revoked_at: None,
+        revoked_by: None,
+        revocation_reason: None,
     };
     db.knowledge_operator_memory()
         .insert_one(&mem, None)
         .await
         .map_err(|e| AppError::External(format!("写入运营记忆失败：{e}")))?;
     Ok(mem)
+}
+
+#[derive(Debug, Clone)]
+pub struct OperatorMemoryRevokeOutcome {
+    pub memory: crate::models::KnowledgeOperatorMemory,
+    pub already_revoked: bool,
+}
+
+/// Soft-revoke one operator-memory row under its complete authorization scope.
+///
+/// A row outside `(workspace, account, operator)` is deliberately reported as
+/// not found so callers cannot use a memory id to probe another scope. Repeating
+/// the same revoke is idempotent and preserves the first audit actor/reason.
+pub async fn revoke_operator_memory(
+    db: &crate::db::Database,
+    workspace_id: &str,
+    account_id: &str,
+    operator_id: &str,
+    memory_id: ObjectId,
+    revoked_by: &str,
+    reason: &str,
+) -> AppResult<OperatorMemoryRevokeOutcome> {
+    let actor = revoked_by.trim();
+    let reason = reason.trim();
+    if actor.is_empty() {
+        return Err(AppError::BadRequest(
+            "revokedBy cannot be empty".to_string(),
+        ));
+    }
+    if reason.is_empty() || reason.chars().count() > 200 {
+        return Err(AppError::BadRequest(
+            "revocationReason must contain 1..=200 characters".to_string(),
+        ));
+    }
+    let scope = doc! {
+        "_id": memory_id,
+        "workspace_id": workspace_id,
+        "account_id": account_id,
+        "operator_id": operator_id,
+    };
+    let existing = db
+        .knowledge_operator_memory()
+        .find_one(scope.clone(), None)
+        .await
+        .map_err(|e| AppError::External(format!("failed to load operator memory: {e}")))?
+        .ok_or_else(|| AppError::NotFound("operator memory not found".to_string()))?;
+    if existing.revoked_at.is_some() {
+        return Ok(OperatorMemoryRevokeOutcome {
+            memory: existing,
+            already_revoked: true,
+        });
+    }
+
+    let now = DateTime::now();
+    let mut active_scope = scope.clone();
+    active_scope.insert(
+        "$or",
+        vec![
+            doc! { "revoked_at": { "$exists": false } },
+            doc! { "revoked_at": null },
+        ],
+    );
+    let result = db
+        .knowledge_operator_memory()
+        .update_one(
+            active_scope,
+            doc! { "$set": {
+                "revoked_at": now,
+                "revoked_by": actor,
+                "revocation_reason": reason,
+            }},
+            None,
+        )
+        .await
+        .map_err(|e| AppError::External(format!("failed to revoke operator memory: {e}")))?;
+    let memory = db
+        .knowledge_operator_memory()
+        .find_one(scope, None)
+        .await
+        .map_err(|e| AppError::External(format!("failed to reload operator memory: {e}")))?
+        .ok_or_else(|| AppError::NotFound("operator memory not found".to_string()))?;
+    Ok(OperatorMemoryRevokeOutcome {
+        memory,
+        already_revoked: result.modified_count == 0,
+    })
 }
 
 #[cfg(test)]
@@ -3723,6 +4202,9 @@ mod a6_tests {
             created_at: DateTime::from_millis(0),
             last_used_at: DateTime::from_millis(0),
             expires_at: None,
+            revoked_at: None,
+            revoked_by: None,
+            revocation_reason: None,
         }
     }
 
@@ -3747,6 +4229,19 @@ mod a6_tests {
     fn operator_memory_empty_yields_empty_segment() {
         let segment = format_operator_memory_for_reply_prompt(&[]);
         assert!(segment.is_empty());
+    }
+
+    #[test]
+    fn revoked_operator_memory_is_never_rendered_for_reply_prompt() {
+        let mut revoked = mk("rejection", "不要使用旧模板");
+        revoked.revoked_at = Some(DateTime::from_millis(1));
+        revoked.revoked_by = Some("admin-a".to_string());
+        revoked.revocation_reason = Some("规则已过期".to_string());
+
+        let segment =
+            format_operator_memory_for_reply_prompt(&[revoked, mk("preference", "回复保持简洁")]);
+        assert!(!segment.contains("不要使用旧模板"));
+        assert!(segment.contains("回复保持简洁"));
     }
 }
 

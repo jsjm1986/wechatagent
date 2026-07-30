@@ -81,7 +81,14 @@ async fn behavior_signal_dedupe_round_trip() {
     let state = &app.state;
 
     let inbound_at = DateTime::from_millis(10_000);
-    let sig = bs::build_reply_latency("default", "wxid_a", "msg1", inbound_at, Some(5_000));
+    let sig = bs::build_reply_latency(
+        "default",
+        "acct_test",
+        "wxid_a",
+        "msg1",
+        inbound_at,
+        Some(5_000),
+    );
 
     // 首次写入 → Ok(true)。
     let first = bs::persist_signal(state, sig.clone())
@@ -95,7 +102,14 @@ async fn behavior_signal_dedupe_round_trip() {
     assert!(!second, "同 dedupe_key 第二次写入应被幂等吞掉");
 
     // 不同 dedupe_key（reply_length 同 msg）→ 各落一条。
-    let len_sig = bs::build_reply_length("default", "wxid_a", "msg1", inbound_at, "你好👋");
+    let len_sig = bs::build_reply_length(
+        "default",
+        "acct_test",
+        "wxid_a",
+        "msg1",
+        inbound_at,
+        "你好👋",
+    );
     assert!(bs::persist_signal(state, len_sig)
         .await
         .expect("persist len"));
@@ -117,6 +131,7 @@ async fn behavior_signal_dedupe_round_trip() {
         .expect("find latency")
         .expect("latency exists");
     assert_eq!(stored.source, bs::SOURCE_SYSTEM_OBSERVED);
+    assert_eq!(stored.account_id, "acct_test");
     assert_eq!(stored.confidence, 1.0);
     assert!(!stored.censored);
     assert_eq!(stored.latency_ms, Some(5_000));
@@ -196,7 +211,7 @@ async fn deal_event_push_round_trip() {
 #[tokio::test]
 #[ignore = "需要 Docker / testcontainers MongoDB"]
 async fn silence_worker_single_round_idempotent() {
-    let app = TestApp::start().await;
+    let app = TestApp::start_repl_set().await;
     // 打开 worker flag + 极短阈值，让单轮 tick 立即判沉默。
     let mut state = app.state.clone();
     state.config.silence_signal_worker_enabled = true;

@@ -13,6 +13,7 @@
 use crate::evolution::lint::passes_forbidden_words;
 use crate::prompts::{
     normalize_prompt_content, DEFAULT_MODE_GATE_POLICY, DEFAULT_REPLY_REDLINE_ANCHORS,
+    DEFAULT_REPLY_SYSTEM_REDLINE_ANCHORS, DEFAULT_REPLY_TASK_REDLINE_ANCHORS,
     DEFAULT_REVIEWER_FEWSHOT, PROMPT_EVOLUTION_FORBIDDEN_KEYS,
 };
 use crate::routes::AppState;
@@ -37,9 +38,9 @@ pub fn required_anchors(template_key: &str) -> Vec<&'static str> {
             v.extend_from_slice(DEFAULT_REPLY_REDLINE_ANCHORS);
             v
         }
+        "user.reply.system" => DEFAULT_REPLY_SYSTEM_REDLINE_ANCHORS.to_vec(),
+        "user.reply.task" => DEFAULT_REPLY_TASK_REDLINE_ANCHORS.to_vec(),
         "user.review.system" => vec![DEFAULT_REVIEWER_FEWSHOT],
-        // user.reply.system / user.reply.task 含红线但暂无独立 DEFAULT_* 锚常量：
-        // 仍归强约束层（tier 判定里列出），靠禁用词闸兜底；如需更硬可后续为其抽锚。
         _ => Vec::new(),
     }
 }
@@ -47,7 +48,9 @@ pub fn required_anchors(template_key: &str) -> Vec<&'static str> {
 pub fn prompt_edit_tier(template_key: &str) -> PromptEditTier {
     // 禁止改：evolution critic（与 PROMPT_EVOLUTION_FORBIDDEN_KEYS 同源）。
     // 注：reset-system-pack 是 route handler 不是 template_key，靠不接入工具来禁。
-    if PROMPT_EVOLUTION_FORBIDDEN_KEYS.contains(&template_key) {
+    if PROMPT_EVOLUTION_FORBIDDEN_KEYS.contains(&template_key)
+        || template_key == "management.prompt_redline_review.system"
+    {
         return PromptEditTier::Forbidden;
     }
     // 可改但需强约束：含红线 / 锚的业务模板（真实 key，已核实存在）
@@ -107,14 +110,16 @@ pub enum PromptEditVerdict {
     NeedsHumanConfirm { diff: String, reason: String },
 }
 
-/// 提取新增/改动增量（行级朴素 diff——只要 new 中不在 old 的非空行）。
-/// 审增量比审整篇好判、省 token（spec §4.4）。
+/// Return complete normalized before/after snapshots for every semantic mutation.
+/// A set-based line diff can miss reorder-only edits and deletion of one duplicate
+/// line, so only CRLF-equivalent content is allowed to bypass semantic review.
 pub fn extract_diff(old: &str, new: &str) -> String {
-    let old_lines: std::collections::HashSet<&str> = old.lines().collect();
-    new.lines()
-        .filter(|l| !old_lines.contains(l) && !l.trim().is_empty())
-        .collect::<Vec<_>>()
-        .join("\n")
+    let old = normalize_prompt_content(old);
+    let new = normalize_prompt_content(new);
+    if old == new {
+        return String::new();
+    }
+    format!("=== BEFORE ===\n{old}\n=== AFTER ===\n{new}")
 }
 
 /// 末尾追加合成：原 prompt 正文逐字保留在开头（红线锚点据此天然通过锚闸），
@@ -138,7 +143,7 @@ pub async fn review_prompt_edit(
 ) -> PromptEditVerdict {
     let diff = extract_diff(old, new);
     if diff.trim().is_empty() {
-        // 无增量（纯删减已被锚闸挡过），无需语义审查
+        // CRLF-equivalent content is the only mutation-free case.
         return PromptEditVerdict::Pass;
     }
     // judge 的 system 指令从 prompt pack 加载（key=management.prompt_redline_review.system）；
@@ -159,9 +164,12 @@ pub async fn review_prompt_edit(
             };
         }
     };
-    let user = format!("待审提示词 key：{template_key}\n\n本次新增/改动内容：\n{diff}");
+    let user = format!(
+        "待审提示词 key：{template_key}\n\n本次变更的完整前后快照（必须同时审查删除与新增）：\n{diff}"
+    );
     let judge = crate::agent::generate_agent_json(
         state,
+        workspace_id,
         None,
         None,
         None,
@@ -318,12 +326,49 @@ mod tests {
     // LLM 真实判定行为留真模型 nightly 套件；此处只锁 diff 提取 + 三态形状。
 
     #[test]
-    fn extract_diff_isolates_added_lines() {
+    fn extract_diff_includes_complete_snapshots_for_additions() {
         let old = "第一行\n第二行";
         let new = "第一行\n第二行\n遇到难题转给后台老师跟进";
         let d = extract_diff(old, new);
+        assert!(d.contains("=== BEFORE ==="));
+        assert!(d.contains("=== AFTER ==="));
         assert!(d.contains("转给后台老师跟进"));
-        assert!(!d.contains("第一行")); // 只出增量，不重复未改部分
+        assert!(d.contains("第一行"));
+    }
+
+    #[test]
+    fn extract_diff_exposes_pure_deletions() {
+        let diff = extract_diff("保留行\n关键安全约束", "保留行");
+        assert!(diff.contains("=== BEFORE ===\n保留行\n关键安全约束"));
+        assert!(diff.contains("=== AFTER ===\n保留行"));
+    }
+
+    #[test]
+    fn extract_diff_exposes_reorder_and_duplicate_deletion() {
+        assert!(!extract_diff("alpha\nbeta", "beta\nalpha").is_empty());
+        assert!(!extract_diff("guard\nguard", "guard").is_empty());
+    }
+
+    #[test]
+    fn extract_diff_ignores_only_crlf_equivalence() {
+        assert!(extract_diff("alpha\r\nbeta", "alpha\nbeta").is_empty());
+    }
+
+    #[test]
+    fn semantic_reviewer_prompt_is_forbidden_from_self_edit() {
+        assert_eq!(
+            prompt_edit_tier("management.prompt_redline_review.system"),
+            PromptEditTier::Forbidden
+        );
+        assert!(
+            validate_prompt_edit("management.prompt_redline_review.system", "replacement").is_err()
+        );
+    }
+
+    #[test]
+    fn reply_system_and_task_require_runtime_contract_anchors() {
+        assert!(validate_prompt_edit("user.reply.system", "普通内容").is_err());
+        assert!(validate_prompt_edit("user.reply.task", "普通内容").is_err());
     }
 
     #[test]
@@ -348,6 +393,13 @@ mod tests {
         assert!(composed.ends_with(snippet));
         // 中间有空行分隔
         assert!(composed.contains("红线锚段\n\n补充"));
+    }
+
+    #[test]
+    fn compose_empty_snippet_is_byte_for_byte_noop() {
+        let current = "原始 prompt 正文  \n红线锚段\n";
+        assert_eq!(compose_appended_content(current, ""), current);
+        assert_eq!(compose_appended_content(current, " \n\t "), current);
     }
 
     #[test]

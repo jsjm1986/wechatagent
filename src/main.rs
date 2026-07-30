@@ -79,41 +79,30 @@ async fn async_main() -> anyhow::Result<()> {
     // 与 check_state_transition 的 fail-closed 路径配对——启动期先拒绝错误配置，
     // runtime defense-in-depth 兜底。
     run_active_domain_state_machine_sanity_check(&db).await?;
-    // Phase A / A3：启动期预热 system_taxonomies 进程级 cache。失败被静默
-    // （`init_global_taxonomy_cache` 内部 log warning），下一次 check_value 触发懒加载。
-    wechatagent::agent::init_global_taxonomy_cache(&db).await;
-    // universal-domain-adaptation 1G-c：同款预热 active DomainProfile 进程级 cache，
-    // 治理"每决策 / 每 planner tick 都查 domain_profiles"的 N+1。失败静默。
-    wechatagent::agent::init_global_domain_profile_cache(&db).await;
+    // Phase A / A3 + SR-008：启动期预热 system_taxonomies cache；版本流存在但
+    // 没有唯一 current 时 fail closed，不能以空字典继续服务。
+    wechatagent::agent::init_global_taxonomy_cache(&db).await?;
+    // universal-domain-adaptation 1G-c：同款预热 active DomainProfile 进程级 cache。
+    // 查询失败或多 active 是配置完整性错误，启动必须 fail closed。
+    wechatagent::agent::init_global_domain_profile_cache(&db).await?;
     // LLM 配置：DB 优先，缺则用 .env 当种子。
     // 启动时若 `llm_provider_configs` 没有 active 记录，写一条来自 .env 的
     // openai 形态默认记录；之后每次启动都按当前 active 记录构造 LlmClient。
     let active_provider = ensure_default_llm_provider(&db, &config).await?;
-    let active_format = LlmFormat::parse(&active_provider.format)?;
-    let llm_client = LlmClient::with_format(
-        active_provider.base_url.clone(),
-        active_provider.api_key.clone(),
-        active_provider.model.clone(),
-        active_format,
-        active_provider
-            .timeout_seconds
-            .unwrap_or(config.llm_timeout_seconds),
-        active_provider
-            .max_retries
-            .unwrap_or(config.llm_max_retries),
-        active_provider
-            .retry_base_ms
-            .unwrap_or(config.llm_retry_base_ms),
-    )?;
+    let active_providers = load_active_llm_providers(&db).await?;
+    let (llm_client, active_meta) = build_runtime_llm(&active_provider, &config)?;
     let registry = Arc::new(LlmRegistry::new(
+        config.default_workspace_id.clone(),
         llm_client,
-        LlmProviderMeta {
-            provider_id: active_provider.provider_id.clone(),
-            format: active_format,
-            model: active_provider.model.clone(),
-            base_url: active_provider.base_url.clone(),
-        },
+        active_meta,
     ));
+    for provider in active_providers {
+        if provider.workspace_id == config.default_workspace_id {
+            continue;
+        }
+        let (client, meta) = build_runtime_llm(&provider, &config)?;
+        registry.swap(&provider.workspace_id, client, meta).await;
+    }
     let llm: Arc<dyn LlmProvider> = registry.clone();
     // Phase E / E2：reviewer 双脑并行——`REVIEWER_DUAL_ENABLED=true` 且第二
     // provider 4 件套 (BASE_URL/API_KEY/MODEL/FORMAT) 齐备时，构建独立 LlmClient
@@ -192,6 +181,12 @@ async fn async_main() -> anyhow::Result<()> {
         )
         .0,
         jwt_keys: jwt_keys_arc,
+        auth_rate_limiter: Arc::new(wechatagent::auth::rate_limit::AuthRateLimiter::new(
+            config.auth_rate_limit_window_seconds,
+            config.auth_rate_limit_client_capacity,
+            config.auth_rate_limit_target_capacity,
+            config.auth_rate_limit_global_capacity,
+        )),
         completeness_cache: std::sync::Arc::new(dashmap::DashMap::new()),
     };
     // 启动期 LRU 缓存尚未建立，无需 bump；显式忽略返回的"是否写入"bool，保留 ? 传播错误。
@@ -229,6 +224,17 @@ async fn async_main() -> anyhow::Result<()> {
         if let Err(err) = run_outbox_dispatcher(s).await {
             tracing::error!(?err, "outbox dispatcher exited");
         }
+    });
+
+    // HC-006 / SR-017: reconcile local content-addressed media immediately at
+    // startup and hourly thereafter. This repairs DB-commit-before-rename
+    // crashes, removes orphans, and fail-closes rows whose object is missing.
+    spawn_supervised(state.clone(), "media_storage_reconciler", |s| async move {
+        wechatagent::media_storage::reconciler_loop(
+            s.db.clone(),
+            std::path::PathBuf::from(&s.config.media_storage_dir),
+        )
+        .await;
     });
 
     if state.config.strategic_planner_enabled {
@@ -347,9 +353,12 @@ async fn async_main() -> anyhow::Result<()> {
     let addr: SocketAddr = format!("{}:{}", config.app_host, config.app_port).parse()?;
     let listener = TcpListener::bind(addr).await?;
     tracing::info!("wechatagent listening on http://{}", addr);
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
     Ok(())
 }
 
@@ -483,6 +492,56 @@ async fn ensure_default_llm_provider(
     };
     db.llm_provider_configs().insert_one(&seed, None).await?;
     Ok(seed)
+}
+
+fn build_runtime_llm(
+    provider: &wechatagent::models::LlmProviderConfig,
+    config: &AppConfig,
+) -> anyhow::Result<(LlmClient, LlmProviderMeta)> {
+    let format = LlmFormat::parse(&provider.format)?;
+    let client = LlmClient::with_format(
+        provider.base_url.clone(),
+        provider.api_key.clone(),
+        provider.model.clone(),
+        format,
+        provider
+            .timeout_seconds
+            .unwrap_or(config.llm_timeout_seconds),
+        provider.max_retries.unwrap_or(config.llm_max_retries),
+        provider.retry_base_ms.unwrap_or(config.llm_retry_base_ms),
+    )?;
+    let meta = LlmProviderMeta {
+        provider_id: provider.provider_id.clone(),
+        format,
+        model: provider.model.clone(),
+        base_url: provider.base_url.clone(),
+    };
+    Ok((client, meta))
+}
+
+async fn load_active_llm_providers(
+    db: &wechatagent::db::Database,
+) -> anyhow::Result<Vec<wechatagent::models::LlmProviderConfig>> {
+    use futures::TryStreamExt;
+    use mongodb::bson::doc;
+    use std::collections::HashSet;
+
+    let mut cursor = db
+        .llm_provider_configs()
+        .find(doc! { "isActive": true }, None)
+        .await?;
+    let mut seen_workspaces = HashSet::new();
+    let mut providers = Vec::new();
+    while let Some(provider) = cursor.try_next().await? {
+        if !seen_workspaces.insert(provider.workspace_id.clone()) {
+            anyhow::bail!(
+                "multiple active LLM providers found for workspace {}",
+                provider.workspace_id
+            );
+        }
+        providers.push(provider);
+    }
+    Ok(providers)
 }
 
 /// S1.2 (Phase 0)：扫描所有 `status="active"` 的 `operation_domain_configs`，

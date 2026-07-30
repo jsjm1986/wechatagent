@@ -1,7 +1,8 @@
 //! 自学习采集管道（第一阶段）：`behavior_signals` 幂等性 PBT。
 //!
 //! 生产侧幂等由 `db/indexes.rs` 的 partial unique 索引
-//! `{ workspace_id:1, dedupe_key:1 }` 保证：同一 `dedupe_key` 的并发 / 重放写入
+//! `{ workspace_id:1, account_id:1, dedupe_key:1 }` 保证：同一账号内相同
+//! `dedupe_key` 的并发 / 重放写入
 //! 只成功一次（其余撞 11000，由 `behavior_signals::persist_signal` 吞成
 //! `Ok(false)`）。本 PBT 在内存里建模"索引 = 按 dedupe_key 去重的集合"，对
 //! 任意事件序列重放，断言去重后每个 dedupe_key 恰好落一次——即 Iron Law ⑤
@@ -50,6 +51,7 @@ proptest! {
             // 每条 inbound 都构造 latency 信号；同 (wxid,msg) 必撞同 key。
             let sig = bs::build_reply_latency(
                 "ws",
+                "acct",
                 &wxid,
                 &msg,
                 DateTime::from_millis(1_000),
@@ -88,6 +90,7 @@ proptest! {
             let observed = DateTime::from_millis(outbound_ms + delta + tick as i64);
             let sig = bs::build_silence(
                 "ws",
+                "acct",
                 "wxid_s",
                 DateTime::from_millis(outbound_ms),
                 observed,
@@ -101,6 +104,7 @@ proptest! {
         // 另一条不同 outbound → 必新增一个 key。
         let other = bs::build_silence(
             "ws",
+            "acct",
             "wxid_s",
             DateTime::from_millis(outbound_ms + delta),
             DateTime::from_millis(outbound_ms + delta + 1),
@@ -125,9 +129,9 @@ proptest! {
         let msg = format!("msg_{m}");
         let inbound_at = DateTime::from_millis(10_000);
 
-        let lat = bs::build_reply_latency("ws", &wxid, &msg, inbound_at, Some(1));
-        let len = bs::build_reply_length("ws", &wxid, &msg, inbound_at, "hi");
-        let react = bs::build_reactivation("ws", &wxid, &msg, inbound_at);
+        let lat = bs::build_reply_latency("ws", "acct", &wxid, &msg, inbound_at, Some(1));
+        let len = bs::build_reply_length("ws", "acct", &wxid, &msg, inbound_at, "hi");
+        let react = bs::build_reactivation("ws", "acct", &wxid, &msg, inbound_at);
 
         let keys: HashSet<_> = [
             lat.dedupe_key.clone(),
@@ -155,11 +159,12 @@ proptest! {
         let inbound_at = DateTime::from_millis(outbound_ms + latency_base + 1);
         let content: String = "x".repeat(content_len);
 
-        let lat = bs::build_reply_latency("ws", "w", "m", inbound_at, Some(outbound_ms));
-        let len = bs::build_reply_length("ws", "w", "m", inbound_at, &content);
-        let react = bs::build_reactivation("ws", "w", "m", inbound_at);
+        let lat = bs::build_reply_latency("ws", "acct", "w", "m", inbound_at, Some(outbound_ms));
+        let len = bs::build_reply_length("ws", "acct", "w", "m", inbound_at, &content);
+        let react = bs::build_reactivation("ws", "acct", "w", "m", inbound_at);
         let silence = bs::build_silence(
             "ws",
+            "acct",
             "w",
             DateTime::from_millis(outbound_ms),
             inbound_at,

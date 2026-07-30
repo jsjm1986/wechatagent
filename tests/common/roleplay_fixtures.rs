@@ -167,6 +167,7 @@ pub async fn override_review_prompt(
         previous_version: None,
         seeded_by: Some("roleplay_fixture".to_string()),
         locale: Some(prompts::DEFAULT_LOCALE.to_string()),
+        source_proposal_id: None,
     };
     app.state
         .db

@@ -141,13 +141,13 @@ Inbound / FollowUp
 
 Gateway 的正常生产路径会把 promote risks 交给 finalize，并在首稿及成功 revision 后执行状态动作门。管理发送没有 revision 通道，所以同时要求 finalize Approved 与 `review_passed`。但主链的 revision fallback 把安全含义不同的软闸混为一类：包括 boundary/privacy 低分在内的原稿会在改写故障或二审失败时被重新标为可发送，下游不再复审。
 
-审计上下文仍存在另一条租户分裂：decision/run 记录使用 contact workspace，但公共 `write_event_for_account` 固定写 default workspace，而事件 API 按管理员当前 workspace 读取。Gateway、Webhook、任务与 Worker 的大量事件因此可能从真实租户消失并出现在默认租户。账号日发送软上限计数也只按 account_id 聚合，不含 workspace，不过当前只产生告警、不影响发送。
+事件写入的租户裂缝已关闭：公共 Gateway/Outbox 事件 API 强制显式 `workspace_id`，Webhook 限流桶按 `(workspace_id, account_id)` 隔离，限流事件写入解析出的真实 scope。账号日发送软上限计数与真实 pacing 历史均按 `(workspace_id, account_id)` 聚合；软上限仍保持告警语义、不升级为发送硬门（SR-024/025 已部署并完成部署后动态验证）。
 
 ### Outbox 可靠投递闭环（B04D）
 
 ```text
 Gateway enqueue
-  → unique idempotency key
+  → unique(workspace_id, account_id, idempotency_key)
   → pending
   → atomic FIFO claim + 180s lease
   → in_flight
@@ -166,7 +166,7 @@ Gateway enqueue
 
 Gateway 的 `outbox_enqueuing` 是可恢复过程态：Dispatcher 在宽限期后按实际文本段数幂等修复 review/task，并最后 CAS run log。已 sent 但投递后副作用未完成时，Outbox marker 与 review finalizer lease 支持重跑；不会把发送事实倒退为 pending。名片没有 post-hoc 已发核对，因此 timeout/crash 边缘窗口仍可能重复发送名片。
 
-可靠投递状态机本身以 OutboxEntry.workspace_id 加载 contact/account，但外围键和公共服务仍有租户维度缺失：全局 unique 幂等键不含 workspace（SR-026）；reaction stop 批量取消固定 default workspace（SR-027）；事件固定 default workspace（SR-024）；账号 pacing 只按 account_id（SR-025）；真正 MCP 发送与 post-hoc 搜索仍只有 account_id（SR-011）。
+可靠投递状态机及其外围 SR-024～027 已按完整租户 scope 收口：事件与 Webhook 限流按 workspace+account，pacing 历史按 workspace+account，Outbox v2 幂等键和唯一索引按 workspace+account，Reaction stop 只取消同 workspace+account+contact 的 Outbox。部署后同源真实 Mongo 矩阵 4/4 证明跨 workspace 同名账号互不污染；真正 MCP 发送与 post-hoc 搜索的剩余边界继续由 SR-011 跟踪，不能由本矩阵外推关闭。
 
 ### Reaction 反馈回路（B04E）
 
@@ -180,7 +180,7 @@ latest inbound
   → best-effort side effects
        ├─ intent_trajectory push（cap 50）
        ├─ negative_example draft / needs_review
-       └─ stop/cooldown → cancel contact outbox                         ← SR-027
+       └─ stop/cooldown → cancel same workspace/account/contact outbox  ← SR-027 closed/deployed
 ```
 
 Reaction 是上一轮发送结果的旁路反馈，不是本轮回复的前置成功条件；失败不会阻断 Gateway。其 claim 恢复却不是带 fencing 的 lease：默认 60 秒后任何执行者都可把 analyzing 重置为 pending，而合法 LLM 重试墙钟可超过该阈值；旧 worker 最终仍可只按 `_id` 写回并执行副作用。单进程 Webhook runner 串行能降低概率，多副本不共享 PENDING，故旧、新分析覆盖与重复学习副作用成立，见 SR-028。
@@ -258,10 +258,12 @@ stale scan 读旧 claimed_at
 admin cancel → cancelled（不终止在途 future / 不撤销随后 Outbox）   ← SR-034
 
 all accounts → daily outcome task insert
-  → unique(kind, account_id, content)，workspace 缺失                ← SR-036
+  → unique(workspace_id, kind, account_id, content)
+  → m017 dedupe also groups by workspace/account/content
+  → sibling workspaces retain one legal task each                    ← SR-036 closed/deployed
 ```
 
-AgentTask 的 `claimed_at` 是活性提示而不是带所有权的 lease：没有 owner/generation，stale scanner 的读写也不是同一个 CAS。常驻 Worker 心跳能降低正常长任务误回收概率，却不能阻止扫描后续租竞态；review-now 根本没有心跳。更关键的是取消和失去 lease 都不会传播到 handler，FollowUp 仍可能创建 Outbox，旧执行者的无条件终态写也能覆盖新状态。过期 principal relay 还绕开 Outbox 直接发送并漏写终态，形成确定性的回收重发。每日 outcome 调度则在另一层把 workspace 从唯一键遗漏，导致同 account_id 租户静默缺指标。
+AgentTask 的所有权问题与 Outcome 调度的租户键是两个独立边界。Outcome task 已把 workspace 纳入唯一键与历史去重并完成部署后副本集验证（SR-036）；Task claim、取消和发送授权的剩余状态以对应 SR 的当前结论为准，不能用 Outcome 键修复外推。
 
 ### 决策请示与领导授权闭环（B04J）
 
@@ -496,8 +498,8 @@ contact import
   → unconditional identity $set(null)                            ← SR-081
 
 single-contact enable
-  → contact scoped by workspace
-  → account lookup by bare account_id                            ← SR-080
+  → contact scoped by workspace + expected account
+  → account/self-wxid lookup uses the same workspace + account    ← SR-080 closed/deployed
 
 batch enrollment
   → contact.agent_status=managed
@@ -695,8 +697,9 @@ catalog projection
 
 feedback attribution
   → workspace usage logs contain account_id
-  → regroup by bare contact_wxid + contact lookup without account
-  → one account deal marks another account logs as hits              ← SR-116
+  → regroup by (account_id, contact_wxid) inside workspace
+  → Contact lookup requires (workspace, account, wxid)
+  → same-wxid accounts remain attribution-isolated                   ← SR-116 closed/deployed
 
 ingest source
   → list due snapshot, no source claim/generation
@@ -712,9 +715,10 @@ ingest source
 
 ```text
 daily digest scope
-  ├─ cron generates only default workspace/default account
-  ├─ chunk health matches account exactly and omits shared chunks
-  └─ compose/summarize load prompts from default workspace            ← SR-119
+  ├─ enabled cron enumerates every persisted (workspace, account)
+  │    └─ one account failure does not stop later accounts
+  ├─ chunk health reads account-private + workspace-shared(null) rows
+  └─ compose/summarize prompts and LLM audit use the same real scope   ← SR-119 closed/deployed
 
 digest run
   ├─ config exposes token/call limits, generator hard-codes 24000/8   ← SR-120
@@ -729,9 +733,11 @@ knowledge task
        ├─ cancel does not fence an in-flight step/final summary        ← SR-122
        └─ many failure branches return Ok and are counted successful   ← SR-123
 
-deterministic digest cardId (without account)
-  → dismiss filters omit account
-  → same card in sibling account can be hidden                        ← SR-124
+deterministic digest cardId
+  → hash(account_id, report_date, canonical card semantics)
+  → direct dismiss filters workspace + account + date + cardId
+  → fenced worker filters task workspace + account (+ report date)
+  → same cardId in sibling accounts remains isolated                  ← SR-124 closed/deployed
 ```
 
 日报与任务共享同一个根问题：展示状态不是不可变执行事实。日报唯一行同时承担 last-success 与 latest-attempt，失败重算会抹掉健康快照；任务则把 running、step 副作用、进度 turn、summary 和 event 分散提交。日报应保存独立 run/generation，并让 current report 只指向最近 committed success；失败 attempt 与 partial artifacts 独立可查。
@@ -971,12 +977,14 @@ Downstream task claim, Gateway review and Outbox idempotency cannot deduplicate 
 
 ```text
 Import worker A claims J: pending → running
-  → A starts LLM preview
+  → atomically generation=G1, token=T1; A starts LLM preview
   → lease expires; recovery writes running → pending
 Import worker B claims J: pending → running
-  ├─ B owns the new execution only by convention
-  └─ A heartbeat/progress/final writes filter {_id, status=running}
-       → old A matches B's running state and may renew or finish J       ← SR-136
+  → atomically generation=G2, token=T2
+  ├─ B heartbeat/progress/final require {_id, running, G2, T2}
+  ├─ old A writes require {_id, running, G1, T1} → zero-match + cancel
+  └─ stale scanner freezes generation/token/claimed_at → cannot reclaim G2
+       → SR-136 closed in working tree and real-rs0 redlines; deployment pending
 
 workspace W
   ├─ account A + contact wxid X → signal key (type, X, message/time)
@@ -996,7 +1004,7 @@ Silence Signal tick
   → at most configured cap this tick, not this day                       ← SR-135
 ```
 
-The shared architectural gap is loss of durable identity at asynchronous boundaries. Import execution needs a claim generation, follow-up emission needs a business intent plus quota reservation, and behavior observations need the full tenant/account/contact identity. A mutable status value, an audit event written afterward, or a workspace-only dedupe key cannot substitute for those identities.
+The remaining shared architectural gap is loss of durable identity at asynchronous boundaries. Import execution now has a fenced claim generation/token (SR-136); follow-up emission still needs a business intent plus quota reservation, and behavior observations need the full tenant/account/contact identity. A mutable status value, an audit event written afterward, or a workspace-only dedupe key cannot substitute for those identities.
 
 ### Prompt pack 初始化与编辑信任边界（B07E）
 
@@ -1186,12 +1194,11 @@ Cockpit “运营风格模板” select
        └─ runtime continues reading persisted contact.playbook_id              ← SR-151
 
 non-default account B, contact CB
-  → GET /decision-reviews?contactId=CB (accountId omitted)
-       → backend starts filter with account_id=process default A
-       → resolves CB only to contact_wxid=W
-       → query {workspace, account=A, contact_wxid=W}
-            ├─ no A/W row → B appears to have no reviews
-            └─ A also has W → A reviews render under B                         ← SR-152
+  → GET /decision-reviews?accountId=B&contactId=CB
+       ├─ missing accountId → 400
+       ├─ account A cannot resolve B/CB → 404
+       └─ query {workspace, account=B, contact_wxid=W}
+            └─ list/detail join RunLog with the same full scope                ← SR-152 closed/deployed
 ```
 
 Visible selection, persisted configuration and query scope are separate facts unless one immutable identity is carried through the request. A UI control is not complete until the server echoes the saved binding, and a contact id must determine account scope rather than merely supply a reusable wxid.

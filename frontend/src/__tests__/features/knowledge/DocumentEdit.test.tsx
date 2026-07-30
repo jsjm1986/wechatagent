@@ -5,40 +5,37 @@ import { ConfirmProvider } from "../../../components/ui/ConfirmDialog";
 import { DocumentsView } from "../../../features/knowledge/steward";
 import { api } from "../../../lib/api";
 
-// E6：文档元数据编辑 PUT /operation-knowledge/documents/:id。
-// 后端是 replace_one 整文档替换（crud.rs update_operation_knowledge_document），
-// 任何漏传的字段会被清空。命门：点「编辑」先 GET /documents/:id 取完整文档
-// （含 rawContent / contentHash / lineIndex / sectionIndex），表单只暴露少数可改
-// 字段，但提交 PUT 时把未编辑字段原样带上，绝不让 replace_one 清空 rawContent。
+// Document metadata edits freeze the detail identity/version and send only
+// fields that the operator actually changed.
 
 const realFetch = globalThis.fetch;
 
 const DOC_ID = "doc-1";
-const RAW_CONTENT = "# 运营手册\n第一章 正文……长文本原文，绝不能被清空。";
+const RAW_CONTENT = "# immutable source\nsource body";
 const CONTENT_HASH = "sha256:deadbeef";
 
+const LIST_ITEM = {
+  id: DOC_ID,
+  title: "运营手册 v3",
+  summary: "旧摘要",
+  domain: "user_operations",
+  sourceType: "imported_markdown",
+  sourceName: "手册.md",
+  status: "active",
+  catalogSummary: "旧目录摘要",
+  updatedAt: "2026-06-20T00:00:00Z",
+  routingMap: ["定价", "交付"],
+  productTags: ["SaaS", "私有化"],
+  businessTopics: ["售前"],
+};
+
 // 列表 GET /documents → 返回一行（含 productTags/businessTopics，GET 详情不返回这俩）。
-function installListFetch() {
+function installListFetch(items = [LIST_ITEM]) {
   globalThis.fetch = vi.fn(async (url: unknown) => {
     const u = String(url);
     const body = u.includes("/documents")
       ? {
-          items: [
-            {
-              id: DOC_ID,
-              title: "运营手册 v3",
-              summary: "旧摘要",
-              domain: "user_operations",
-              sourceType: "imported_markdown",
-              sourceName: "手册.md",
-              status: "active",
-              catalogSummary: "旧目录摘要",
-              updatedAt: "2026-06-20T00:00:00Z",
-              routingMap: ["定价", "交付"],
-              productTags: ["SaaS", "私有化"],
-              businessTopics: ["售前"],
-            },
-          ],
+          items,
         }
       : { items: [] };
     return {
@@ -85,7 +82,7 @@ function renderView() {
   );
 }
 
-describe("DocumentsView — E6 文档元数据编辑（整替换回填全字段防清空）", () => {
+describe("DocumentsView — E6 文档元数据编辑（version CAS）", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     installListFetch();
@@ -95,9 +92,9 @@ describe("DocumentsView — E6 文档元数据编辑（整替换回填全字段�
     vi.restoreAllMocks();
   });
 
-  it("document edit PUTs full body including rawContent", async () => {
+  it("sends only the version and dirty metadata fields", async () => {
     const getSpy = vi.spyOn(api, "get").mockResolvedValue({ item: FULL_DETAIL } as never);
-    const putSpy = vi.spyOn(api, "put").mockResolvedValue({} as never);
+    const patchSpy = vi.spyOn(api, "patch").mockResolvedValue({} as never);
     const user = userEvent.setup();
     renderView();
 
@@ -123,23 +120,71 @@ describe("DocumentsView — E6 文档元数据编辑（整替换回填全字段�
     await user.click(saveBtn);
 
     await waitFor(() => {
-      expect(putSpy).toHaveBeenCalled();
+      expect(patchSpy).toHaveBeenCalled();
     });
-    const [url, body] = putSpy.mock.calls[0] as [string, Record<string, unknown>];
+    const [url, body] = patchSpy.mock.calls[0] as [string, Record<string, unknown>];
     expect(url).toBe(`/api/operation-knowledge/documents/${DOC_ID}`);
-    // 改后的 title + 未编辑的 rawContent 原值（未被清空）+ contentHash 原样带上。
-    expect(body).toEqual(
-      expect.objectContaining({
-        title: "运营手册 v4",
-        rawContent: RAW_CONTENT,
-        contentHash: CONTENT_HASH,
-      }),
-    );
-    // lineIndex / sectionIndex 原样回带（替换式 PUT 不丢索引）。
-    expect(body.lineIndex).toEqual(FULL_DETAIL.lineIndex);
-    expect(body.sectionIndex).toEqual(FULL_DETAIL.sectionIndex);
-    // productTags / businessTopics 来自列表项（GET 详情不返回这俩）。
-    expect(body.productTags).toEqual(["SaaS", "私有化"]);
-    expect(body.businessTopics).toEqual(["售前"]);
+    expect(body).toEqual({ version: 3, title: "运营手册 v4" });
+    expect(body).not.toHaveProperty("rawContent");
+    expect(body).not.toHaveProperty("contentHash");
+    expect(body).not.toHaveProperty("lineIndex");
+    expect(body).not.toHaveProperty("sectionIndex");
+  });
+
+  it("rejects a mismatched or versionless detail envelope", async () => {
+    vi.spyOn(api, "get").mockResolvedValue({
+      item: { ...FULL_DETAIL, id: "other", version: undefined },
+    } as never);
+    const patchSpy = vi.spyOn(api, "patch").mockResolvedValue({} as never);
+    const user = userEvent.setup();
+    renderView();
+
+    await screen.findByText("运营手册 v3");
+    await user.click(await screen.findByRole("button", { name: "编辑" }));
+
+    await screen.findByText(/文档详情响应与当前文档不匹配/);
+    expect(screen.queryByRole("button", { name: "保存修改" })).not.toBeInTheDocument();
+    expect(patchSpy).not.toHaveBeenCalled();
+  });
+
+  it("closes an unchanged edit without issuing a PATCH", async () => {
+    vi.spyOn(api, "get").mockResolvedValue({ item: FULL_DETAIL } as never);
+    const patchSpy = vi.spyOn(api, "patch").mockResolvedValue({} as never);
+    const user = userEvent.setup();
+    renderView();
+
+    await screen.findByText("运营手册 v3");
+    await user.click(await screen.findByRole("button", { name: "编辑" }));
+    await user.click(await screen.findByRole("button", { name: "保存修改" }));
+
+    await waitFor(() => {
+      expect(screen.queryByRole("button", { name: "保存修改" })).not.toBeInTheDocument();
+    });
+    expect(patchSpy).not.toHaveBeenCalled();
+  });
+
+  it("discards a late detail response after another document is selected", async () => {
+    const second = { ...LIST_ITEM, id: "doc-2", title: "第二份文档" };
+    installListFetch([LIST_ITEM, second]);
+    let resolveFirst!: (value: unknown) => void;
+    let resolveSecond!: (value: unknown) => void;
+    const first = new Promise((resolve) => { resolveFirst = resolve; });
+    const latest = new Promise((resolve) => { resolveSecond = resolve; });
+    vi.spyOn(api, "get").mockImplementation((url) => (
+      String(url).endsWith("doc-1") ? first : latest
+    ) as never);
+    const user = userEvent.setup();
+    renderView();
+
+    await screen.findByText("第二份文档");
+    const editButtons = await screen.findAllByRole("button", { name: "编辑" });
+    await user.click(editButtons[0]);
+    await user.click(editButtons[1]);
+    resolveSecond({ item: { ...FULL_DETAIL, id: "doc-2", title: "第二份文档", version: 9 } });
+    await screen.findByDisplayValue("第二份文档");
+    resolveFirst({ item: FULL_DETAIL });
+
+    await waitFor(() => expect(screen.getByDisplayValue("第二份文档")).toBeInTheDocument());
+    expect(screen.queryByDisplayValue("运营手册 v3")).not.toBeInTheDocument();
   });
 });

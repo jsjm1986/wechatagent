@@ -14,11 +14,11 @@
 //! - POST /admin/domain-profiles/generate → 调用 generate_agent_json → 候选落草稿
 //! - 候选状态正确：current_version=false, is_active=false, seeded_by="generated_by_ai"
 //!
-//! **Part C：真 route handler 集成（publish/rollout/rollback/update 直调）**
-//! - publish 已生效血缘 → realign 把 is_active 迁到新版本（即时生效，无回落 DEFAULT）
-//! - publish 纯草稿血缘 → realign noop（守人审红线）
-//! - rollback → active 迁回上一版本
-//! - update → $set 部分更新不清零未触碰字段 + 未知/托管键白名单过滤
+//! **Part C：真 route handler 集成（publish/activate/rollback/update 直调）**
+//! - publish 只移动 lineage 的 published-current 指针，旧 active 继续服务
+//! - activate 才原子切换 workspace 的 runtime-active 指针
+//! - rollback 只移动 published-current，不隐式切换 runtime-active
+//! - update 追加不可变草稿，来源版本保持不变
 //!
 //! ## 运行
 //! ```sh
@@ -31,22 +31,21 @@
 //! ```
 //!
 //! ## 红线
-//! - **AI 永不自动 activate**：AI 生成候选落草稿态（is_active=false、血缘从未 active），
-//!   必须人审 activate 才生效；真 publish handler 对这种血缘 realign noop（Part C 覆盖）。
-//! - **publish 语义**：草稿血缘 publish 定稿后须 activate；**已生效血缘** publish 新版本
-//!   则 realign 即时切换（运营改已生效配置即时生效，见 domain_profiles.rs 文件头）。
+//! - **AI 永不自动 activate**：AI 生成候选落草稿态，publish 后仍须人审 activate。
+//! - **publish 语义**：无论普通/危险字段、血缘是否曾生效，publish 都不改变 runtime-active。
 //! - **单活**：同 workspace 至多一条 is_active=true。
 
 mod common;
 
 use axum::extract::{Extension, Json, Path, State};
 use futures::TryStreamExt;
-use mongodb::bson::{doc, oid::ObjectId, DateTime};
+use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
 use mongodb::options::FindOptions;
 use serde_json::Value;
 use std::sync::Arc;
 use wechatagent::auth::AuthenticatedAdmin;
 use wechatagent::db::Database;
+use wechatagent::error::AppError;
 use wechatagent::llm::{LlmClient, LlmFormat};
 use wechatagent::models::{CommitmentMarkers, DomainProfile, OperationMode, OutcomePolarity};
 use wechatagent::routes::guide_profile::GenerateProfileRequest;
@@ -110,6 +109,7 @@ async fn db_create_profile(
         debounce_window_ms_override: None,
         current_version: false,
         previous_version: None,
+        release_status: "draft".to_string(),
         is_active: false,
         seeded_by: Some(seeded_by.to_string()),
         created_at: DateTime::now(),
@@ -160,6 +160,34 @@ async fn db_get_profile(db: &Database, id: ObjectId) -> DomainProfile {
         .expect("profile not found")
 }
 
+/// 从任意来源版本克隆一条同血缘的新不可变草稿，供真 publish/activate 流程测试。
+async fn db_append_draft_from(
+    db: &Database,
+    source_id: ObjectId,
+    display_name: &str,
+    description: &str,
+) -> ObjectId {
+    let mut draft = db_get_profile(db, source_id).await;
+    let source_version = draft.version;
+    draft.id = None;
+    draft.display_name = display_name.to_string();
+    draft.description = description.to_string();
+    draft.version = source_version + 1;
+    draft.previous_version = Some(source_version);
+    draft.release_status = "draft".to_string();
+    draft.current_version = false;
+    draft.is_active = false;
+    draft.created_at = DateTime::now();
+    draft.updated_at = DateTime::now();
+    db.domain_profiles()
+        .insert_one(&draft, None)
+        .await
+        .expect("insert successor draft")
+        .inserted_id
+        .as_object_id()
+        .expect("successor draft ObjectId")
+}
+
 /// 从 DB 里按 profile_id 找 current_version=true 的 profile。
 async fn db_find_current(
     db: &Database,
@@ -203,6 +231,46 @@ async fn db_active_count(db: &Database, workspace_id: &str) -> usize {
         )
         .await
         .expect("count") as usize
+}
+
+async fn workspace_collection_snapshot(
+    db: &Database,
+    collection: &str,
+    workspace_id: &str,
+) -> Vec<Document> {
+    let mut cursor = db
+        .raw()
+        .collection::<Document>(collection)
+        .find(
+            doc! { "workspace_id": workspace_id },
+            FindOptions::builder().sort(doc! { "_id": 1_i32 }).build(),
+        )
+        .await
+        .expect("snapshot collection");
+    let mut rows = Vec::new();
+    while let Some(row) = cursor.try_next().await.expect("snapshot row") {
+        rows.push(row);
+    }
+    rows
+}
+
+async fn activation_side_effect_snapshot(
+    db: &Database,
+    workspace_id: &str,
+) -> Vec<(&'static str, Vec<Document>)> {
+    let mut result = Vec::new();
+    for collection in [
+        "domain_profiles",
+        "operation_domain_configs",
+        "operation_state_policies",
+        "contacts",
+    ] {
+        result.push((
+            collection,
+            workspace_collection_snapshot(db, collection, workspace_id).await,
+        ));
+    }
+    result
 }
 
 // ── Part A：DB 层 CRUD + publish/activate ──────────────────────────────────
@@ -289,14 +357,9 @@ async fn e2e_update_only_edits_draft() {
     assert_eq!(p.is_active, false);
 }
 
-/// 纯草稿血缘的 DB 两步语义（手动复刻 DB 操作，**非真 handler**）：草稿 publish 定稿
-/// 后仍 is_active=false，须显式 activate 才生效。这里 publish 用 `$set current_version`
-/// 手动模拟，对「从未 active 的草稿血缘」而言 is_active 保持 false 是正确预期。
-///
-/// 注意：真 `publish_domain_profile` handler 对「**已生效血缘**」会调 realign 把
-/// is_active 迁到新版本（即时生效）——那条语义由 Part C 的
-/// `e2e_publish_handler_realigns_active_on_live_lineage` 覆盖。本测试只锁草稿两步流程，
-/// 勿据此断言「真 handler publish 永不动 is_active」（那是旧设计，已被 realign 取代）。
+/// 纯草稿血缘的 DB 两步语义（手动复刻 DB 操作，**非真 handler**）：publish 只移动
+/// published-current，仍须显式 activate 才能改变 runtime-active。该边界对首次发布、
+/// 已生效血缘、普通字段和风险字段完全一致。
 #[tokio::test]
 #[ignore]
 async fn e2e_draft_lineage_publish_then_activate_two_step() {
@@ -633,78 +696,144 @@ async fn e2e_generate_second_industry_profile() {
     assert!(all.len() >= 1, "列表应至少包含刚生成的 profile");
 }
 
-// ── Part C：真 route handler 集成（TEST-2/TEST-6 缺口）─────────────────────
-// 上面 Part A 的 publish/activate 是 db_* helper 手动复刻 DB 操作，**不调真 handler**，
-// 故 realign_active_to_current 真函数（Mongo filter/字段名/$ne）与 #2 的 $set 部分更新
-// merge 校验/白名单过滤全无集成覆盖。Part C 直调真 handler 补这块。
+// ── Part C：真 route handler 集成 ──────────────────────────────────────────
+// 这些 handler 使用 Mongo 多文档事务，必须运行在 replica set 测试环境。
 
-/// TEST-2 缺口：publish 一个**已生效血缘**的新版本 → 真 handler 的 realign 应把
-/// is_active 迁到新 current 行，使运行时充要条件 (is_active=true AND current_version=true)
-/// 恰好命中一行（新版本），不回落 DEFAULT。
+/// 永久非法的生成状态机必须在 active 指针首写前失败。不能先切换人格/阈值，
+/// 再把不可修复的内容错误伪装成可重试 partial。
 #[tokio::test]
 #[ignore]
-async fn e2e_publish_handler_realigns_active_on_live_lineage() {
-    let app = common::TestApp::start().await;
+async fn invalid_generated_machine_rejects_activation_with_zero_writes() {
+    let app = common::TestApp::start_repl_set().await;
     let db = app.state.db.clone();
     let ws = app.state.config.default_workspace_id.clone();
 
-    // v1：建草稿 → 手动置为已生效（current+active），模拟「这个 profile 正在线上跑」。
+    let active_id = db_create_profile(
+        &db,
+        &ws,
+        "stable-live",
+        "稳定配置",
+        "当前运行配置",
+        "manual",
+    )
+    .await;
+    db.domain_profiles()
+        .update_one(
+            doc! { "_id": active_id },
+            doc! { "$set": {
+                "release_status": "published",
+                "current_version": false,
+                "is_active": true,
+            } },
+            None,
+        )
+        .await
+        .expect("make stable profile active");
+
+    let invalid_id = db_create_profile(
+        &db,
+        &ws,
+        "invalid-candidate",
+        "非法候选",
+        "状态机引用不存在的状态",
+        "generated_by_ai",
+    )
+    .await;
+    db.domain_profiles()
+        .update_one(
+            doc! { "_id": invalid_id },
+            doc! { "$set": {
+                "release_status": "published",
+                "current_version": true,
+                "generated_state_machine": {
+                    "states": [{
+                        "key": "ready",
+                        "initial": true,
+                        "allowedFrom": ["missing"],
+                    }]
+                },
+            } },
+            None,
+        )
+        .await
+        .expect("seed invalid published current");
+
+    let before = activation_side_effect_snapshot(&db, &ws).await;
+    let error = wechatagent::routes::domain_profiles::activate_domain_profile(
+        State(app.state.clone()),
+        Extension(test_admin(&ws)),
+        Path(invalid_id.to_hex()),
+    )
+    .await
+    .expect_err("permanently invalid machine must reject activation");
+    assert!(matches!(error, AppError::BadRequest(_)));
+    assert_eq!(activation_side_effect_snapshot(&db, &ws).await, before);
+
+    assert!(db_get_profile(&db, active_id).await.is_active);
+    assert!(!db_get_profile(&db, invalid_id).await.is_active);
+    app.cleanup().await;
+}
+
+/// 已生效血缘发布 successor draft：published-current 移到 v2，但 runtime-active 仍为 v1；
+/// 随后显式 activate 才把运行时切到 v2。
+#[tokio::test]
+#[ignore]
+async fn e2e_publish_preserves_active_until_explicit_activate() {
+    let app = common::TestApp::start_repl_set().await;
+    let db = app.state.db.clone();
+    let ws = app.state.config.default_workspace_id.clone();
+
+    // v1 是已发布且正在运行的基线。
     let v1 = db_create_profile(&db, &ws, "retail-live", "零售", "零售运营", "manual").await;
     db.domain_profiles()
         .update_one(
             doc! { "_id": v1 },
-            doc! { "$set": { "current_version": true, "is_active": true } },
+            doc! { "$set": {
+                "release_status": "published",
+                "current_version": true,
+                "is_active": true,
+            } },
             None,
         )
         .await
         .expect("make v1 live");
+    let v2 = db_append_draft_from(&db, v1, "零售 v2", "待发布改动").await;
 
-    // 调真 publish handler（基于 v1 发布 v2）。
-    let resp = wechatagent::routes::domain_profiles::publish_domain_profile(
+    let publish = wechatagent::routes::domain_profiles::publish_domain_profile(
         State(app.state.clone()),
         Extension(test_admin(&ws)),
-        Path(v1.to_hex()),
+        Path(v2.to_hex()),
     )
     .await
     .expect("publish handler ok");
-    let body: Value = resp.0;
-    let v2_hex = body.get("id").and_then(|v| v.as_str()).expect("v2 id");
-    let v2 = ObjectId::parse_str(v2_hex).expect("v2 oid");
-
-    // 不变量：血缘内 (is_active AND current_version) 恰好一行，且是 v2。
-    let loadable = db
-        .domain_profiles()
-        .count_documents(
-            doc! { "workspace_id": &ws, "profile_id": "retail-live", "is_active": true, "current_version": true },
-            None,
-        )
-        .await
-        .expect("count loadable");
-    assert_eq!(
-        loadable, 1,
-        "publish 后恰一行可被运行时加载（无回落 DEFAULT）"
-    );
+    assert_eq!(publish.0["requiresActivation"], true);
 
     let v2_doc = db_get_profile(&db, v2).await;
-    assert!(
-        v2_doc.is_active && v2_doc.current_version,
-        "v2 既 active 又 current"
-    );
+    assert_eq!(v2_doc.release_status, "published");
+    assert!(v2_doc.current_version && !v2_doc.is_active);
     let v1_doc = db_get_profile(&db, v1).await;
-    assert!(!v1_doc.current_version, "v1 不再是 current");
-    assert!(!v1_doc.is_active, "realign 把 active 迁走，v1 不再 active");
+    assert!(!v1_doc.current_version && v1_doc.is_active);
+
+    let activated = wechatagent::routes::domain_profiles::activate_domain_profile(
+        State(app.state.clone()),
+        Extension(test_admin(&ws)),
+        Path(v2.to_hex()),
+    )
+    .await
+    .expect("activate handler ok");
+    assert_eq!(activated.0["status"], "completed");
+    assert!(db_get_profile(&db, v2).await.is_active);
+    assert!(!db_get_profile(&db, v1).await.is_active);
 }
 
-/// TEST-2 缺口：publish 一个**从未 active**的纯草稿血缘 → realign noop，新版本仍
-/// is_active=false（守住「AI 生成候选须人审 activate」红线）。
+/// 从未 active 的 AI 草稿发布后成为 published current，但仍没有 runtime-active。
 #[tokio::test]
 #[ignore]
-async fn e2e_publish_handler_noop_on_never_active_lineage() {
-    let app = common::TestApp::start().await;
+async fn e2e_publish_never_active_draft_requires_activate() {
+    let app = common::TestApp::start_repl_set().await;
     let db = app.state.db.clone();
     let ws = app.state.config.default_workspace_id.clone();
 
-    // 纯草稿：current_version=true 但从未 activate（is_active=false）。
     let v1 = db_create_profile(
         &db,
         &ws,
@@ -714,95 +843,79 @@ async fn e2e_publish_handler_noop_on_never_active_lineage() {
         "generated_by_ai",
     )
     .await;
-    db.domain_profiles()
-        .update_one(
-            doc! { "_id": v1 },
-            doc! { "$set": { "current_version": true } },
-            None,
-        )
-        .await
-        .expect("make v1 current draft");
 
-    let _ = wechatagent::routes::domain_profiles::publish_domain_profile(
+    let published = wechatagent::routes::domain_profiles::publish_domain_profile(
         State(app.state.clone()),
         Extension(test_admin(&ws)),
         Path(v1.to_hex()),
     )
     .await
     .expect("publish handler ok");
+    assert_eq!(published.0["requiresActivation"], true);
 
-    // 红线：血缘从未 active → publish 后仍无任何 active 行。
+    let row = db_get_profile(&db, v1).await;
+    assert_eq!(row.release_status, "published");
+    assert!(row.current_version && !row.is_active);
     let active = db_active_count(&db, &ws).await;
-    assert_eq!(
-        active, 0,
-        "草稿血缘 publish 后仍 0 个 active（须人审 activate）"
-    );
+    assert_eq!(active, 0, "publish 后仍须人审 activate");
 }
 
-/// TEST-2 缺口：rollback 真 handler 在已生效血缘上把 active 迁回上一版本。
+/// rollback 只回退 published-current；即使 v2 正在运行，也不会隐式把 active 切回 v1。
 #[tokio::test]
 #[ignore]
-async fn e2e_rollback_handler_realigns_active() {
-    let app = common::TestApp::start().await;
+async fn e2e_rollback_preserves_runtime_active() {
+    let app = common::TestApp::start_repl_set().await;
     let db = app.state.db.clone();
     let ws = app.state.config.default_workspace_id.clone();
 
-    // v1 已生效，publish v2（realign 后 v2 生效）。
     let v1 = db_create_profile(&db, &ws, "svc-rollback", "服务", "服务运营", "manual").await;
     db.domain_profiles()
         .update_one(
             doc! { "_id": v1 },
-            doc! { "$set": { "current_version": true, "is_active": true } },
+            doc! { "$set": {
+                "release_status": "published",
+                "current_version": true,
+                "is_active": true,
+            } },
             None,
         )
         .await
         .expect("make v1 live");
-    let pub_resp = wechatagent::routes::domain_profiles::publish_domain_profile(
+    let v2 = db_append_draft_from(&db, v1, "服务 v2", "第二版").await;
+    let _ = wechatagent::routes::domain_profiles::publish_domain_profile(
         State(app.state.clone()),
         Extension(test_admin(&ws)),
-        Path(v1.to_hex()),
+        Path(v2.to_hex()),
     )
     .await
     .expect("publish v2");
-    let v2_hex = pub_resp
-        .0
-        .get("id")
-        .and_then(|v| v.as_str())
-        .expect("v2 id")
-        .to_string();
+    let _ = wechatagent::routes::domain_profiles::activate_domain_profile(
+        State(app.state.clone()),
+        Extension(test_admin(&ws)),
+        Path(v2.to_hex()),
+    )
+    .await
+    .expect("activate v2");
 
-    // rollback v2 → 回到 v1（previous_version）。
     let _ = wechatagent::routes::domain_profiles::rollback_domain_profile(
         State(app.state.clone()),
         Extension(test_admin(&ws)),
-        Path(v2_hex),
+        Path(v2.to_hex()),
     )
     .await
     .expect("rollback handler ok");
 
-    // 不变量：回退后 v1 既 current 又 active，恰一行可加载。
     let v1_doc = db_get_profile(&db, v1).await;
-    assert!(
-        v1_doc.current_version && v1_doc.is_active,
-        "rollback 后 v1 既 current 又 active"
-    );
-    let loadable = db
-        .domain_profiles()
-        .count_documents(
-            doc! { "workspace_id": &ws, "profile_id": "svc-rollback", "is_active": true, "current_version": true },
-            None,
-        )
-        .await
-        .expect("count");
-    assert_eq!(loadable, 1, "rollback 后恰一行可加载");
+    let v2_doc = db_get_profile(&db, v2).await;
+    assert!(v1_doc.current_version && !v1_doc.is_active);
+    assert!(!v2_doc.current_version && v2_doc.is_active);
 }
 
-/// TEST-6 缺口：PUT update 真 handler 只 $set body 带来的字段，未触碰字段保持原值
-/// （验证 #2「不再整行 replace 清零」）。
+/// PUT 追加不可变草稿：来源版本保持不变，新草稿只覆盖请求字段并保留其余内容。
 #[tokio::test]
 #[ignore]
 async fn e2e_update_handler_partial_set_preserves_untouched_fields() {
-    let app = common::TestApp::start().await;
+    let app = common::TestApp::start_repl_set().await;
     let db = app.state.db.clone();
     let ws = app.state.config.default_workspace_id.clone();
 
@@ -824,7 +937,7 @@ async fn e2e_update_handler_partial_set_preserves_untouched_fields() {
     let body: wechatagent::routes::domain_profiles::UpsertRequest =
         serde_json::from_value(serde_json::json!({ "display_name": "新名" }))
             .expect("deserialize UpsertRequest without profileId");
-    let _ = wechatagent::routes::domain_profiles::update_domain_profile(
+    let response = wechatagent::routes::domain_profiles::update_domain_profile(
         State(app.state.clone()),
         Extension(test_admin(&ws)),
         Path(id.to_hex()),
@@ -833,27 +946,34 @@ async fn e2e_update_handler_partial_set_preserves_untouched_fields() {
     .await
     .expect("update handler ok");
 
-    let p = db_get_profile(&db, id).await;
-    assert_eq!(p.display_name, "新名", "display_name 被更新");
-    // 未触碰字段保持原值（核心：不再整行清零）。
-    assert_eq!(p.description, "原简介", "未带的 description 保持原值");
+    let new_id = ObjectId::parse_str(response.0["item"]["id"].as_str().expect("new draft id"))
+        .expect("new draft ObjectId");
+    assert_ne!(new_id, id, "PUT 必须追加新草稿，不能原地覆盖来源行");
+
+    let source = db_get_profile(&db, id).await;
+    assert_eq!(source.display_name, "原名", "来源版本保持不可变");
+    let draft = db_get_profile(&db, new_id).await;
+    assert_eq!(draft.display_name, "新名", "新草稿应用 display_name 覆盖");
+    assert_eq!(draft.description, "原简介", "未带的 description 保持原值");
     assert_eq!(
-        p.prompt_fragment.as_deref(),
+        draft.prompt_fragment.as_deref(),
         Some("原始业务上下文"),
         "未带的 prompt_fragment 保持原值"
     );
     assert!(
-        p.grounding_gate_bypass_without_claim,
+        draft.grounding_gate_bypass_without_claim,
         "未带的 grounding 开关保持原值"
     );
+    assert_eq!(draft.release_status, "draft");
+    assert!(!draft.current_version && !draft.is_active);
+    assert_eq!(draft.version, source.version + 1);
 }
 
-/// TEST-6 缺口 + CORRECT-1：PUT update 带未知键 → 白名单过滤，未知键不落库（防文档污染）；
-/// 且托管字段（is_active/version）经 strip 不被篡改。
+/// PUT 中未知键不落库，托管字段也不能篡改新草稿身份。
 #[tokio::test]
 #[ignore]
 async fn e2e_update_handler_drops_unknown_and_managed_keys() {
-    let app = common::TestApp::start().await;
+    let app = common::TestApp::start_repl_set().await;
     let db = app.state.db.clone();
     let ws = app.state.config.default_workspace_id.clone();
 
@@ -868,7 +988,7 @@ async fn e2e_update_handler_drops_unknown_and_managed_keys() {
             "version": 99,
         }))
         .expect("deserialize");
-    let _ = wechatagent::routes::domain_profiles::update_domain_profile(
+    let response = wechatagent::routes::domain_profiles::update_domain_profile(
         State(app.state.clone()),
         Extension(test_admin(&ws)),
         Path(id.to_hex()),
@@ -877,11 +997,13 @@ async fn e2e_update_handler_drops_unknown_and_managed_keys() {
     .await
     .expect("update handler ok");
 
-    // 用裸 Document 读，检查未知键是否落库。
+    let new_id = ObjectId::parse_str(response.0["item"]["id"].as_str().expect("new draft id"))
+        .expect("new draft ObjectId");
+    // 用裸 Document 读新草稿，检查未知键是否落库。
     let raw = db
         .domain_profiles()
         .clone_with_type::<mongodb::bson::Document>()
-        .find_one(doc! { "_id": id }, None)
+        .find_one(doc! { "_id": new_id }, None)
         .await
         .expect("find")
         .expect("doc");
@@ -894,21 +1016,21 @@ async fn e2e_update_handler_drops_unknown_and_managed_keys() {
         raw.get("totally_unknown_field").is_none(),
         "未知键不落库（CORRECT-1 白名单过滤）"
     );
-    // 托管字段未被篡改（strip_backend_managed_keys 剥离）。
-    let p = db_get_profile(&db, id).await;
-    assert!(!p.is_active, "is_active 不可经 PUT 篡改");
-    assert_eq!(p.version, 1, "version 不可经 PUT 篡改");
+    let draft = db_get_profile(&db, new_id).await;
+    assert!(!draft.is_active, "is_active 不可经 PUT 篡改");
+    assert_eq!(draft.version, 2, "version 必须由后端分配");
+    assert_eq!(draft.release_status, "draft");
+    assert_eq!(db_get_profile(&db, id).await.display_name, "原名");
 }
 
-// ── 分级二次确认：危险开关变更 publish 走旁路稿 + 确认 ──────────────────────
-// publish 已生效血缘时若危险字段有变更，落旁路稿（current=false）不即时生效，返回
-// pendingActivation；旧版本继续 current+active（零窗口）；经 rollout 二次确认才生效。
+// ── 风险字段审阅：所有发布统一等待显式 activate ──────────────────────────────
 
-/// 危险变更 publish → pendingActivation=true，旁路稿 current=false，旧 v1 仍 current+active。
+/// 危险变更 publish 返回 riskyFields，但与普通变更一样成为 published current；旧 active
+/// 继续服务，直到管理员显式 activate。
 #[tokio::test]
 #[ignore]
-async fn e2e_publish_risky_returns_pending_no_current_shift() {
-    let app = common::TestApp::start().await;
+async fn e2e_publish_risky_reports_fields_without_activation() {
+    let app = common::TestApp::start_repl_set().await;
     let db = app.state.db.clone();
     let ws = app.state.config.default_workspace_id.clone();
 
@@ -917,7 +1039,11 @@ async fn e2e_publish_risky_returns_pending_no_current_shift() {
     db.domain_profiles()
         .update_one(
             doc! { "_id": v1 },
-            doc! { "$set": { "current_version": true, "is_active": true } },
+            doc! { "$set": {
+                "release_status": "published",
+                "current_version": true,
+                "is_active": true,
+            } },
             None,
         )
         .await
@@ -925,21 +1051,20 @@ async fn e2e_publish_risky_returns_pending_no_current_shift() {
 
     // v2 草稿：同血缘，但改了危险字段（grounding_gate_bypass_without_claim=true +
     // distrust_self_reported_low_risk=true）。这是运营 create→update 出来的待发布稿。
-    let v2_src = db_create_profile(&db, &ws, "risky-live", "零售v2", "改风控开关", "manual").await;
+    let v2_src = db_append_draft_from(&db, v1, "零售v2", "改风控开关").await;
     db.domain_profiles()
         .update_one(
             doc! { "_id": v2_src },
             doc! { "$set": {
                 "grounding_gate_bypass_without_claim": true,
                 "distrust_self_reported_low_risk": true,
-                "version": 2_i32,
             } },
             None,
         )
         .await
         .expect("preset risky v2 draft");
 
-    // publish v2_src → 危险分支。
+    // publish v2_src：统一发布路径，风险字段只用于审阅提示。
     let resp = wechatagent::routes::domain_profiles::publish_domain_profile(
         State(app.state.clone()),
         Extension(test_admin(&ws)),
@@ -948,11 +1073,8 @@ async fn e2e_publish_risky_returns_pending_no_current_shift() {
     .await
     .expect("publish handler ok");
     let body: Value = resp.0;
-    assert_eq!(
-        body.get("pendingActivation").and_then(|v| v.as_bool()),
-        Some(true),
-        "危险变更 → pendingActivation=true"
-    );
+    assert_eq!(body["requiresActivation"], true);
+    assert!(body.get("pendingActivation").is_none());
     let risky: Vec<String> = body
         .get("riskyFields")
         .and_then(|v| v.as_array())
@@ -968,38 +1090,28 @@ async fn e2e_publish_risky_returns_pending_no_current_shift() {
         "riskyFields 列出两个变更的危险字段，实际={risky:?}"
     );
 
-    // 旁路稿（新版本 v3）current=false、is_active=false。
+    // 新版本已发布为 current，但未激活。
     let new_hex = body.get("id").and_then(|v| v.as_str()).expect("new id");
     let new_id = ObjectId::parse_str(new_hex).expect("oid");
-    let sideline = db_get_profile(&db, new_id).await;
-    assert!(!sideline.current_version, "旁路稿不占 current");
-    assert!(!sideline.is_active, "旁路稿不生效");
+    let published = db_get_profile(&db, new_id).await;
+    assert_eq!(published.release_status, "published");
+    assert!(published.current_version);
+    assert!(!published.is_active);
 
-    // 关键：旧 v1 仍唯一 current+active（零窗口期，运行时继续加载旧版本）。
+    // 旧 v1 不再是 published current，但仍是唯一 runtime active。
     let v1_doc = db_get_profile(&db, v1).await;
     assert!(
-        v1_doc.current_version && v1_doc.is_active,
-        "v1 仍 current+active"
+        !v1_doc.current_version && v1_doc.is_active,
+        "v1 仍是 runtime active"
     );
-    let loadable = db
-        .domain_profiles()
-        .count_documents(
-            doc! { "workspace_id": &ws, "profile_id": "risky-live", "is_active": true, "current_version": true },
-            None,
-        )
-        .await
-        .expect("count loadable");
-    assert_eq!(
-        loadable, 1,
-        "危险 publish 后仍恰一行可加载（旧版本，无窗口期回落）"
-    );
+    assert_eq!(db_active_count(&db, &ws).await, 1);
 }
 
-/// 二次确认：对旁路稿调 rollout → 推 current+demote+realign，新版本生效、单活。
+/// 风险版本也只能通过 activate 切换运行时；rollout 不具有激活权限。
 #[tokio::test]
 #[ignore]
-async fn e2e_confirm_activation_promotes_risky_draft() {
-    let app = common::TestApp::start().await;
+async fn e2e_risky_version_requires_explicit_activate() {
+    let app = common::TestApp::start_repl_set().await;
     let db = app.state.db.clone();
     let ws = app.state.config.default_workspace_id.clone();
 
@@ -1007,16 +1119,20 @@ async fn e2e_confirm_activation_promotes_risky_draft() {
     db.domain_profiles()
         .update_one(
             doc! { "_id": v1 },
-            doc! { "$set": { "current_version": true, "is_active": true } },
+            doc! { "$set": {
+                "release_status": "published",
+                "current_version": true,
+                "is_active": true,
+            } },
             None,
         )
         .await
         .expect("make v1 live");
-    let v2_src = db_create_profile(&db, &ws, "risky-confirm", "教培v2", "改人格", "manual").await;
+    let v2_src = db_append_draft_from(&db, v1, "教培v2", "改人格").await;
     db.domain_profiles()
         .update_one(
             doc! { "_id": v2_src },
-            doc! { "$set": { "soul_override": "新人格本体", "version": 2_i32 } },
+            doc! { "$set": { "soul_override": "新人格本体" } },
             None,
         )
         .await
@@ -1028,50 +1144,36 @@ async fn e2e_confirm_activation_promotes_risky_draft() {
     )
     .await
     .expect("publish risky");
-    let sideline_hex = pub_resp
+    let published_hex = pub_resp
         .0
         .get("id")
         .and_then(|v| v.as_str())
         .expect("id")
         .to_string();
-    let sideline_id = ObjectId::parse_str(&sideline_hex).expect("oid");
+    let published_id = ObjectId::parse_str(&published_hex).expect("oid");
 
-    // 运营二次确认 → rollout 旁路稿（confirm-path 复用 rollout）。
-    let _ = wechatagent::routes::domain_profiles::rollout_domain_profile(
+    // 显式 activate 才切换 runtime active。
+    let activated = wechatagent::routes::domain_profiles::activate_domain_profile(
         State(app.state.clone()),
         Extension(test_admin(&ws)),
-        Path(sideline_hex),
+        Path(published_hex),
     )
     .await
-    .expect("rollout (confirm) ok");
+    .expect("activate ok");
+    assert_eq!(activated.0["status"], "completed");
 
-    // 确认后旁路稿既 current 又 active，旧 v1 都让出。
-    let sideline = db_get_profile(&db, sideline_id).await;
-    assert!(
-        sideline.current_version && sideline.is_active,
-        "确认后旁路稿 current+active"
-    );
+    let published = db_get_profile(&db, published_id).await;
+    assert!(published.current_version && published.is_active);
     let v1_doc = db_get_profile(&db, v1).await;
-    assert!(
-        !v1_doc.current_version && !v1_doc.is_active,
-        "v1 让出 current+active"
-    );
-    let loadable = db
-        .domain_profiles()
-        .count_documents(
-            doc! { "workspace_id": &ws, "profile_id": "risky-confirm", "is_active": true, "current_version": true },
-            None,
-        )
-        .await
-        .expect("count");
-    assert_eq!(loadable, 1, "确认后恰一行可加载（新版本）");
+    assert!(!v1_doc.current_version && !v1_doc.is_active);
+    assert_eq!(db_active_count(&db, &ws).await, 1);
 }
 
-/// 普通字段变更（非危险）在已生效血缘上仍走即时生效（与 realign 基线等价），不触发分级。
+/// 普通字段变更与风险字段使用完全相同的 publish→activate 边界。
 #[tokio::test]
 #[ignore]
-async fn e2e_publish_nonrisky_live_lineage_still_realigns() {
-    let app = common::TestApp::start().await;
+async fn e2e_publish_nonrisky_also_waits_for_activate() {
+    let app = common::TestApp::start_repl_set().await;
     let db = app.state.db.clone();
     let ws = app.state.config.default_workspace_id.clone();
 
@@ -1079,17 +1181,21 @@ async fn e2e_publish_nonrisky_live_lineage_still_realigns() {
     db.domain_profiles()
         .update_one(
             doc! { "_id": v1 },
-            doc! { "$set": { "current_version": true, "is_active": true } },
+            doc! { "$set": {
+                "release_status": "published",
+                "current_version": true,
+                "is_active": true,
+            } },
             None,
         )
         .await
         .expect("make v1 live");
     // v2 草稿只改普通字段（display_name / description / prompt_fragment），无危险变更。
-    let v2_src = db_create_profile(&db, &ws, "nonrisky-live", "美业v2", "只改简介", "manual").await;
+    let v2_src = db_append_draft_from(&db, v1, "美业v2", "只改简介").await;
     db.domain_profiles()
         .update_one(
             doc! { "_id": v2_src },
-            doc! { "$set": { "prompt_fragment": "叠加业务上下文", "version": 2_i32 } },
+            doc! { "$set": { "prompt_fragment": "叠加业务上下文" } },
             None,
         )
         .await
@@ -1103,40 +1209,29 @@ async fn e2e_publish_nonrisky_live_lineage_still_realigns() {
     .await
     .expect("publish handler ok");
     let body: Value = resp.0;
-    // 普通分支：返回体不含 pendingActivation 键。
-    assert!(
-        body.get("pendingActivation").is_none(),
-        "普通字段变更不触发分级（无 pendingActivation）"
-    );
+    assert_eq!(body["requiresActivation"], true);
+    assert_eq!(body["riskyFields"].as_array().map(Vec::len), Some(0));
     let new_id =
         ObjectId::parse_str(body.get("id").and_then(|v| v.as_str()).expect("id")).expect("oid");
-    // 即时生效：realign 把 active 迁到新版本。
+    // 仅发布，不切换运行时。
     let new_doc = db_get_profile(&db, new_id).await;
     assert!(
-        new_doc.current_version && new_doc.is_active,
-        "普通变更即时生效（v2 current+active）"
+        new_doc.current_version && !new_doc.is_active,
+        "普通变更发布后仍等待 activate"
     );
-    let loadable = db
-        .domain_profiles()
-        .count_documents(
-            doc! { "workspace_id": &ws, "profile_id": "nonrisky-live", "is_active": true, "current_version": true },
-            None,
-        )
-        .await
-        .expect("count");
-    assert_eq!(loadable, 1, "即时生效后恰一行可加载（新版本）");
+    let old = db_get_profile(&db, v1).await;
+    assert!(!old.current_version && old.is_active);
 }
 
-/// 红线：纯草稿血缘（从未 active）即便改了危险字段，publish 也不触发分级（active_base=None）
-/// → 走普通分支 + realign noop → 仍须人审 activate。
+/// 无 active 基线时仍统一返回 requiresActivation，且发布后保持零 active。
 #[tokio::test]
 #[ignore]
-async fn e2e_publish_risky_on_draft_lineage_no_pending() {
-    let app = common::TestApp::start().await;
+async fn e2e_publish_first_version_still_requires_activate() {
+    let app = common::TestApp::start_repl_set().await;
     let db = app.state.db.clone();
     let ws = app.state.config.default_workspace_id.clone();
 
-    // 纯草稿血缘：current_version=true 但从未 activate（is_active=false），且带危险字段。
+    // 纯草稿血缘从未 activate，且带风险字段。
     let v1 = db_create_profile(
         &db,
         &ws,
@@ -1149,11 +1244,11 @@ async fn e2e_publish_risky_on_draft_lineage_no_pending() {
     db.domain_profiles()
         .update_one(
             doc! { "_id": v1 },
-            doc! { "$set": { "current_version": true, "soul_override": "AI 生成的人格" } },
+            doc! { "$set": { "soul_override": "AI 生成的人格" } },
             None,
         )
         .await
-        .expect("make v1 current draft with risky field");
+        .expect("set risky field");
 
     let resp = wechatagent::routes::domain_profiles::publish_domain_profile(
         State(app.state.clone()),
@@ -1163,14 +1258,11 @@ async fn e2e_publish_risky_on_draft_lineage_no_pending() {
     .await
     .expect("publish handler ok");
     let body: Value = resp.0;
-    // 血缘从未 active → active_base=None → 不触发分级。
-    assert!(
-        body.get("pendingActivation").is_none(),
-        "草稿血缘不触发分级（active_base=None）"
-    );
-    // 红线：realign noop → 仍 0 个 active（须人审 activate）。
+    assert_eq!(body["requiresActivation"], true);
+    let published = db_get_profile(&db, v1).await;
+    assert!(published.current_version && !published.is_active);
     let active = db_active_count(&db, &ws).await;
-    assert_eq!(active, 0, "草稿血缘 publish 后仍 0 个 active（守人审红线）");
+    assert_eq!(active, 0, "首次 publish 后仍须人审 activate");
 }
 
 // ── H13：activate 联动 publish 状态机本体到 operation_domain_configs ──────────────
@@ -1259,7 +1351,7 @@ async fn db_current_domain_config(
 #[tokio::test]
 #[ignore]
 async fn e2e_activate_publishes_generated_state_machine() {
-    let app = common::TestApp::start().await;
+    let app = common::TestApp::start_repl_set().await;
     let db = app.state.db.clone();
     let ws = app.state.config.default_workspace_id.clone();
 
@@ -1287,7 +1379,11 @@ async fn e2e_activate_publishes_generated_state_machine() {
     db.domain_profiles()
         .update_one(
             doc! { "_id": pid },
-            doc! { "$set": { "current_version": true, "generated_state_machine": &machine } },
+            doc! { "$set": {
+                "release_status": "published",
+                "current_version": true,
+                "generated_state_machine": &machine,
+            } },
             None,
         )
         .await
@@ -1344,7 +1440,7 @@ async fn e2e_activate_publishes_generated_state_machine() {
 #[tokio::test]
 #[ignore]
 async fn e2e_activate_without_machine_leaves_configs_unchanged() {
-    let app = common::TestApp::start().await;
+    let app = common::TestApp::start_repl_set().await;
     let db = app.state.db.clone();
     let ws = app.state.config.default_workspace_id.clone();
 
@@ -1357,7 +1453,7 @@ async fn e2e_activate_without_machine_leaves_configs_unchanged() {
     db.domain_profiles()
         .update_one(
             doc! { "_id": pid },
-            doc! { "$set": { "current_version": true } },
+            doc! { "$set": { "release_status": "published", "current_version": true } },
             None,
         )
         .await
@@ -1390,7 +1486,7 @@ async fn e2e_activate_without_machine_leaves_configs_unchanged() {
 #[tokio::test]
 #[ignore]
 async fn e2e_activate_derives_state_policies_for_forbids_proactive() {
-    let app = common::TestApp::start().await;
+    let app = common::TestApp::start_repl_set().await;
     let db = app.state.db.clone();
     let ws = app.state.config.default_workspace_id.clone();
 
@@ -1416,7 +1512,11 @@ async fn e2e_activate_derives_state_policies_for_forbids_proactive() {
     db.domain_profiles()
         .update_one(
             doc! { "_id": pid },
-            doc! { "$set": { "current_version": true, "generated_state_machine": &machine } },
+            doc! { "$set": {
+                "release_status": "published",
+                "current_version": true,
+                "generated_state_machine": &machine,
+            } },
             None,
         )
         .await
@@ -1475,7 +1575,11 @@ async fn activate_profile_with_machine(
     db.domain_profiles()
         .update_one(
             doc! { "_id": pid },
-            doc! { "$set": { "current_version": true, "generated_state_machine": machine } },
+            doc! { "$set": {
+                "release_status": "published",
+                "current_version": true,
+                "generated_state_machine": machine,
+            } },
             None,
         )
         .await
@@ -1518,7 +1622,7 @@ async fn db_state_policy(
 #[tokio::test]
 #[ignore]
 async fn republish_same_machine_is_noop() {
-    let app = common::TestApp::start().await;
+    let app = common::TestApp::start_repl_set().await;
     let db = app.state.db.clone();
     let ws = app.state.config.default_workspace_id.clone();
 
@@ -1557,7 +1661,7 @@ async fn republish_same_machine_is_noop() {
 #[tokio::test]
 #[ignore]
 async fn republish_toggled_forbids_proactive_refreshes_policy() {
-    let app = common::TestApp::start().await;
+    let app = common::TestApp::start_repl_set().await;
     let db = app.state.db.clone();
     let ws = app.state.config.default_workspace_id.clone();
 
@@ -1602,7 +1706,7 @@ async fn republish_toggled_forbids_proactive_refreshes_policy() {
 #[tokio::test]
 #[ignore]
 async fn operator_edited_policy_preserved_on_republish() {
-    let app = common::TestApp::start().await;
+    let app = common::TestApp::start_repl_set().await;
     let db = app.state.db.clone();
     let ws = app.state.config.default_workspace_id.clone();
 
@@ -1665,7 +1769,7 @@ async fn operator_edited_policy_preserved_on_republish() {
 #[tokio::test]
 #[ignore]
 async fn republish_refreshes_only_current_policy_version() {
-    let app = common::TestApp::start().await;
+    let app = common::TestApp::start_repl_set().await;
     let db = app.state.db.clone();
     let ws = app.state.config.default_workspace_id.clone();
 
@@ -1807,7 +1911,7 @@ async fn db_contact_operation_state(db: &Database, id: ObjectId) -> Option<Strin
 #[tokio::test]
 #[ignore]
 async fn activate_resets_stranded_contact_operation_state() {
-    let app = common::TestApp::start().await;
+    let app = common::TestApp::start_repl_set().await;
     let db = app.state.db.clone();
     let ws = app.state.config.default_workspace_id.clone();
 
@@ -1836,7 +1940,7 @@ async fn activate_resets_stranded_contact_operation_state() {
 #[tokio::test]
 #[ignore]
 async fn activate_preserves_valid_contact_operation_state() {
-    let app = common::TestApp::start().await;
+    let app = common::TestApp::start_repl_set().await;
     let db = app.state.db.clone();
     let ws = app.state.config.default_workspace_id.clone();
 
@@ -1865,7 +1969,7 @@ async fn activate_preserves_valid_contact_operation_state() {
 #[tokio::test]
 #[ignore]
 async fn activate_leaves_unset_operation_state_contact() {
-    let app = common::TestApp::start().await;
+    let app = common::TestApp::start_repl_set().await;
     let db = app.state.db.clone();
     let ws = app.state.config.default_workspace_id.clone();
 
@@ -1898,7 +2002,7 @@ async fn activate_leaves_unset_operation_state_contact() {
 #[tokio::test]
 #[ignore]
 async fn direct_edit_state_machine_rederives_policy() {
-    let app = common::TestApp::start().await;
+    let app = common::TestApp::start_repl_set().await;
     let db = app.state.db.clone();
     let ws = app.state.config.default_workspace_id.clone();
 

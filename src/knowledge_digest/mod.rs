@@ -30,6 +30,55 @@ use crate::routes::AppState;
 
 mod labels;
 
+/// Stable content identity for one card inside a visible digest snapshot.
+/// The hash covers every field that can affect what an operator is approving;
+/// callers must not treat the ObjectId alone as a version token.
+pub(crate) fn digest_card_snapshot_hash(card: &KnowledgeDigestCard) -> String {
+    use sha2::{Digest, Sha256};
+
+    let canonical = json!({
+        "cardId": card.card_id.to_hex(),
+        "kind": card.kind,
+        "title": card.title,
+        "summary": card.summary,
+        "targetRefs": card.target_refs,
+        "suggestedAction": card.suggested_action,
+        "severity": card.severity,
+        "metric": card.metric,
+    });
+    let bytes = serde_json::to_vec(&canonical).expect("digest card canonical JSON is serializable");
+    hex::encode(Sha256::digest(bytes))
+}
+
+/// Stable identity of the currently visible digest snapshot. Attempt audit
+/// fields are intentionally excluded: a failed regeneration may update those
+/// while the last successful cards and `current_generation` remain current.
+pub(crate) fn digest_report_snapshot_hash(report: &KnowledgeDailyReport) -> String {
+    use sha2::{Digest, Sha256};
+
+    let card_hashes = report
+        .cards
+        .iter()
+        .map(digest_card_snapshot_hash)
+        .collect::<Vec<_>>();
+    let canonical = json!({
+        "reportId": report.id.map(|id| id.to_hex()),
+        "workspaceId": report.workspace_id,
+        "accountId": report.account_id,
+        "reportDate": report.report_date,
+        "currentGeneration": report.current_generation,
+        "cardHashes": card_hashes,
+        "dismissedCardIds": report
+            .dismissed_card_ids
+            .iter()
+            .map(|id| id.to_hex())
+            .collect::<Vec<_>>(),
+    });
+    let bytes =
+        serde_json::to_vec(&canonical).expect("digest report canonical JSON is serializable");
+    hex::encode(Sha256::digest(bytes))
+}
+
 /// 主循环：`KNOWLEDGE_DIGEST_ENABLED=false` 时立即 return，等价于功能未启用。
 ///
 /// 启用时按 `KNOWLEDGE_DIGEST_RUN_HOUR`（运营时区，默认 9）计算到下一次本地
@@ -49,12 +98,42 @@ pub async fn worker_loop(state: AppState) {
         let wait = duration_until_next_run(run_hour);
         tracing::debug!(?wait, "knowledge digest worker sleeping until next run");
         sleep(wait).await;
-        let workspace_id = state.config.default_workspace_id.clone();
-        let account_id = state.config.default_account_id.clone();
-        if let Err(err) = generate_today_digest(&state, &workspace_id, &account_id).await {
-            tracing::warn!(?err, "knowledge digest tick failed; continuing");
+        if let Err(err) = generate_all_account_digests(&state).await {
+            tracing::warn!(
+                ?err,
+                "knowledge digest account enumeration failed; continuing"
+            );
         }
     }
+}
+
+/// Run one scheduled digest for every persisted account scope. A failure in one account is
+/// isolated and does not prevent later accounts from receiving their report.
+async fn generate_all_account_digests(state: &AppState) -> AppResult<usize> {
+    let mut cursor = state.db.accounts().find(doc! {}, None).await?;
+    let mut attempted = 0usize;
+    while let Some(account) = cursor.try_next().await? {
+        attempted += 1;
+        if let Err(err) =
+            generate_today_digest(state, &account.workspace_id, &account.account_id).await
+        {
+            tracing::warn!(
+                workspace_id = %account.workspace_id,
+                account_id = %account.account_id,
+                ?err,
+                "knowledge digest account tick failed; continuing"
+            );
+        }
+    }
+    Ok(attempted)
+}
+
+/// Narrow production-protocol harness for the scheduled account enumeration.
+/// It executes the same helper called by [`worker_loop`] without sleeping until
+/// the configured wall-clock hour.
+#[doc(hidden)]
+pub async fn generate_all_account_digests_for_redline(state: &AppState) -> AppResult<usize> {
+    generate_all_account_digests(state).await
 }
 
 /// 计算从现在到下一次 `run_hour:00` 的本地时间间隔。今天 `run_hour` 还没到则等到今天，
@@ -148,7 +227,8 @@ fn since_24h() -> BsonDateTime {
     BsonDateTime::from_millis(lower.timestamp_millis())
 }
 
-/// **只读**扫描 `operation_knowledge_chunks`：
+/// **只读**扫描当前账号可见的 `operation_knowledge_chunks`：账号私有行加
+/// `account_id=null` 的 workspace 共享行，与生产召回/Catalog 可见域一致。
 /// 1. `integrity_status ∈ {needs_review, missing_evidence}` 或非空 `missing_fields`；
 /// 2. `status="draft"` 且 `created_at` ≥ 7 天。
 async fn analyze_chunks_health(
@@ -158,22 +238,27 @@ async fn analyze_chunks_health(
 ) -> AppResult<Vec<ChunkHealthSignal>> {
     let now = chrono::Utc::now();
     let seven_days_ago = now - chrono::Duration::days(7);
-    let mut filter = ws_filter(workspace_id, account_id);
-    filter.insert(
-        "$or",
-        mongodb::bson::Bson::Array(vec![
-            mongodb::bson::Bson::Document(doc! {
-                "integrity_status": { "$in": ["needs_review", "missing_evidence"] }
-            }),
-            mongodb::bson::Bson::Document(doc! {
-                "source_quote": { "$in": [null, ""] }
-            }),
-            mongodb::bson::Bson::Document(doc! {
-                "status": "draft",
-                "created_at": { "$lte": BsonDateTime::from_millis(seven_days_ago.timestamp_millis()) }
-            }),
-        ]),
-    );
+    let filter = doc! {
+        "workspace_id": workspace_id,
+        "$and": [
+            {
+                "$or": [
+                    { "account_id": null },
+                    { "account_id": account_id },
+                ]
+            },
+            {
+                "$or": [
+                    { "integrity_status": { "$in": ["needs_review", "missing_evidence"] } },
+                    { "source_quote": { "$in": [null, ""] } },
+                    {
+                        "status": "draft",
+                        "created_at": { "$lte": BsonDateTime::from_millis(seven_days_ago.timestamp_millis()) }
+                    },
+                ]
+            },
+        ]
+    };
     let mut cursor = state
         .db
         .operation_knowledge_chunks()
@@ -345,8 +430,16 @@ async fn analyze_run_logs(
             .unwrap_or_else(|| "unknown".to_string());
         let summary = if idx < 6 {
             // 前 6 大 chunk 走 LLM summarize；超出走 fallback。
-            match summarize_block_runs(state, run_id, &chunk_id, &bucket.run_ids, &top_block_reason)
-                .await
+            match summarize_block_runs(
+                state,
+                workspace_id,
+                account_id,
+                run_id,
+                &chunk_id,
+                &bucket.run_ids,
+                &top_block_reason,
+            )
+            .await
             {
                 Ok(s) => s,
                 Err(err) => {
@@ -378,17 +471,14 @@ async fn analyze_run_logs(
 
 async fn summarize_block_runs(
     state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
     run_id: &str,
     chunk_id: &str,
     run_ids: &[String],
     top_block_reason: &str,
 ) -> AppResult<String> {
-    let system = load_prompt(
-        &state.db,
-        &state.config.default_workspace_id,
-        "knowledge.digest.summarize_logs",
-    )
-    .await?;
+    let system = load_prompt(&state.db, workspace_id, "knowledge.digest.summarize_logs").await?;
     let user = json!({
         "chunkId": chunk_id,
         "runs": run_ids.iter().take(8).map(|r| json!({
@@ -402,7 +492,8 @@ async fn summarize_block_runs(
     .to_string();
     let value = generate_agent_json(
         state,
-        None,
+        workspace_id,
+        Some(account_id),
         None,
         Some(run_id),
         "knowledge.digest.summarize_logs",
@@ -483,6 +574,8 @@ async fn analyze_evolution(
 /// 调 `knowledge.digest.compose` LLM 合成卡片数组；返回经过封闭枚举校验后的 `Vec<KnowledgeDigestCard>`。
 async fn compose_cards(
     state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
     run_id: &str,
     report_date: &str,
     chunk_health: &[ChunkHealthSignal],
@@ -490,12 +583,7 @@ async fn compose_cards(
     blocked: &[BlockSignal],
     evolution: &[EvolutionSignal],
 ) -> AppResult<Vec<KnowledgeDigestCard>> {
-    let system = load_prompt(
-        &state.db,
-        &state.config.default_workspace_id,
-        "knowledge.digest.compose",
-    )
-    .await?;
+    let system = load_prompt(&state.db, workspace_id, "knowledge.digest.compose").await?;
 
     let chunk_health_json: Vec<Value> = chunk_health
         .iter()
@@ -562,7 +650,8 @@ async fn compose_cards(
 
     let value = generate_agent_json(
         state,
-        None,
+        workspace_id,
+        Some(account_id),
         None,
         Some(run_id),
         "knowledge.digest.compose",
@@ -571,25 +660,46 @@ async fn compose_cards(
     )
     .await?;
 
-    let raw_arr = match &value {
-        Value::Array(a) => a.clone(),
-        Value::Object(obj) => obj
-            .get("cards")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default(),
-        _ => Vec::new(),
-    };
+    let raw_arr = digest_card_items(&value);
 
-    Ok(parse_cards_from_llm_array(raw_arr, report_date))
+    Ok(parse_cards_from_llm_array(raw_arr, account_id, report_date))
+}
+
+/// Normalize the two documented Digest response envelopes plus the singleton-card shape
+/// produced by the shared LLM parser.
+///
+/// `parse_json_content` intentionally unwraps a one-element object array (`[{...}]`) for
+/// object-oriented agent protocols. Digest is array-oriented, so a valid one-card response can
+/// arrive here as the card object itself. Only objects carrying all card discriminator fields are
+/// restored to a singleton array; unrelated objects remain empty. The restored item still passes
+/// through `parse_cards_from_llm_array`, which enforces every closed enum and field constraint.
+fn digest_card_items(value: &Value) -> Vec<Value> {
+    match value {
+        Value::Array(items) => items.clone(),
+        Value::Object(object) => {
+            if let Some(cards) = object.get("cards").and_then(Value::as_array) {
+                return cards.clone();
+            }
+            if ["kind", "title", "suggestedAction", "severity"]
+                .iter()
+                .all(|key| object.contains_key(*key))
+            {
+                vec![value.clone()]
+            } else {
+                Vec::new()
+            }
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// knowledge-digest-workstation R5：dismiss 卡片必须在 regenerate 后仍然生效。
 /// 老实现 `card_id = ObjectId::new()` 每次新随机 → regenerate 后 dismissed_card_ids
-/// 全部成孤儿。改成由 `(report_date, kind, target_refs_signature, title)` 派生
+/// 全部成孤儿。改成由 `(account_id, report_date, kind, target_refs_signature, title)` 派生
 /// sha256 前 12 字节 → ObjectId，让"同一天 + 同 kind + 同目标 + 同标题"的卡片
 /// 在 regenerate 后保持稳定 cardId。新卡片（运营当日新增问题）天然得到不同 id。
 fn stable_card_id(
+    account_id: &str,
     report_date: &str,
     kind: &str,
     target_refs: &[Document],
@@ -597,6 +707,8 @@ fn stable_card_id(
 ) -> ObjectId {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
+    hasher.update(account_id.as_bytes());
+    hasher.update(b"|");
     hasher.update(report_date.as_bytes());
     hasher.update(b"|");
     hasher.update(kind.as_bytes());
@@ -616,13 +728,41 @@ fn stable_card_id(
     ObjectId::from_bytes(bytes)
 }
 
+fn migrated_dismissed_card_ids(
+    existing: Option<&KnowledgeDailyReport>,
+    cards: &[KnowledgeDigestCard],
+) -> Vec<ObjectId> {
+    let Some(existing) = existing else {
+        return Vec::new();
+    };
+    existing
+        .cards
+        .iter()
+        .filter(|old| existing.dismissed_card_ids.contains(&old.card_id))
+        .filter_map(|old| {
+            cards
+                .iter()
+                .find(|new| {
+                    new.kind == old.kind
+                        && new.title == old.title
+                        && new.target_refs == old.target_refs
+                })
+                .map(|new| new.card_id)
+        })
+        .collect()
+}
+
 /// 从 LLM 返回的 raw JSON 数组校验/裁剪/排序成 [`KnowledgeDigestCard`]。
 /// 抽出此 helper 是为了让 smoke 测试覆盖封闭枚举 + 字段裁剪 + severity 排序，
 /// 而不需要真正起 LLM。
 ///
-/// `report_date` 与 (kind, target_refs, title) 一起派生稳定 cardId，让 regenerate
+/// `account_id`、`report_date` 与 (kind, target_refs, title) 一起派生稳定 cardId，让 regenerate
 /// 后用户已 dismiss 的卡片不会重新冒出来（R5）。
-fn parse_cards_from_llm_array(raw_arr: Vec<Value>, report_date: &str) -> Vec<KnowledgeDigestCard> {
+fn parse_cards_from_llm_array(
+    raw_arr: Vec<Value>,
+    account_id: &str,
+    report_date: &str,
+) -> Vec<KnowledgeDigestCard> {
     let allowed_kinds = [
         "chunk_missing_field",
         "chunk_low_hit_rate",
@@ -719,7 +859,7 @@ fn parse_cards_from_llm_array(raw_arr: Vec<Value>, report_date: &str) -> Vec<Kno
             d
         });
         cards.push(KnowledgeDigestCard {
-            card_id: stable_card_id(report_date, kind, &target_refs, &title),
+            card_id: stable_card_id(account_id, report_date, kind, &target_refs, &title),
             kind: kind.to_string(),
             title,
             summary,
@@ -760,16 +900,298 @@ pub(crate) async fn generate_today_digest(
     account_id: &str,
 ) -> AppResult<KnowledgeDailyReport> {
     let report_date = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let run_id = format!("digest_{}_{}", account_id, report_date);
+    let attempt_generation =
+        claim_digest_attempt(state, workspace_id, account_id, &report_date).await?;
+    let run_id = format!(
+        "digest_{}_{}_{}_g{}",
+        workspace_id, account_id, report_date, attempt_generation
+    );
 
-    let budget = Arc::new(RunBudget::new(run_id.clone(), 24_000, 8, i32::MAX));
+    let budget = digest_run_budget(
+        &run_id,
+        state.config.knowledge_digest_run_token_budget,
+        state.config.knowledge_digest_run_max_llm_calls,
+    );
     generate_today_digest_inner(
         state,
         workspace_id,
         account_id,
         &report_date,
         &run_id,
+        attempt_generation,
         budget,
+    )
+    .await
+}
+
+fn digest_run_budget(run_id: &str, token_budget: i64, max_llm_calls: i32) -> Arc<RunBudget> {
+    Arc::new(RunBudget::new(
+        run_id,
+        token_budget,
+        max_llm_calls,
+        i32::MAX,
+    ))
+}
+
+async fn claim_digest_attempt(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+    report_date: &str,
+) -> AppResult<i64> {
+    let filter = doc! {
+        "workspace_id": workspace_id,
+        "account_id": account_id,
+        "report_date": report_date,
+    };
+    let now = BsonDateTime::now();
+    let update = doc! {
+        "$setOnInsert": {
+            "workspace_id": workspace_id,
+            "account_id": account_id,
+            "report_date": report_date,
+            "generated_at": now,
+            "generated_by": "worker",
+            "status": "failed",
+            "error_kind": null,
+            "budget_snapshot": {},
+            "cards": [],
+            "dismissed_card_ids": [],
+            "prompt_versions": {},
+            "current_generation": 0i64,
+            "latest_attempt_budget_snapshot": {},
+        },
+        "$set": {
+            "latest_attempt_status": "running",
+            "latest_attempt_error_kind": null,
+            "latest_attempt_at": now,
+        },
+        "$inc": { "attempt_generation": 1i64 },
+    };
+    let upsert = FindOneAndUpdateOptions::builder()
+        .upsert(true)
+        .return_document(ReturnDocument::After)
+        .build();
+
+    match state
+        .db
+        .knowledge_daily_reports()
+        .find_one_and_update(filter.clone(), update.clone(), upsert)
+        .await
+    {
+        Ok(Some(report)) => Ok(report.attempt_generation),
+        Ok(None) => Err(AppError::Conflict(
+            "digest_attempt_claim_missing".to_string(),
+        )),
+        Err(error) if is_duplicate_key_error(&error) => {
+            // Concurrent first attempts can race on the unique report key.
+            // The loser retries as an update after the winner inserted it.
+            let retry = FindOneAndUpdateOptions::builder()
+                .return_document(ReturnDocument::After)
+                .build();
+            state
+                .db
+                .knowledge_daily_reports()
+                .find_one_and_update(
+                    filter,
+                    doc! {
+                        "$set": {
+                            "latest_attempt_status": "running",
+                            "latest_attempt_error_kind": null,
+                            "latest_attempt_at": BsonDateTime::now(),
+                        },
+                        "$inc": { "attempt_generation": 1i64 },
+                    },
+                    retry,
+                )
+                .await?
+                .map(|report| report.attempt_generation)
+                .ok_or_else(|| AppError::Conflict("digest_attempt_claim_race".to_string()))
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finalize_digest_attempt(
+    state: &AppState,
+    mut report_filter: Document,
+    attempt_generation: i64,
+    status: &str,
+    error_kind: Option<String>,
+    budget_snapshot: Document,
+    prompt_versions: Document,
+    serialized_cards: mongodb::bson::Bson,
+    migrated_dismissed: Vec<ObjectId>,
+    now: BsonDateTime,
+) -> AppResult<KnowledgeDailyReport> {
+    let workspace_id = report_filter
+        .get_str("workspace_id")
+        .map(str::to_owned)
+        .map_err(|_| AppError::Conflict("digest_attempt_identity_missing".to_string()))?;
+    let account_id = report_filter
+        .get_str("account_id")
+        .map(str::to_owned)
+        .map_err(|_| AppError::Conflict("digest_attempt_identity_missing".to_string()))?;
+    let report_date = report_filter
+        .get_str("report_date")
+        .map(str::to_owned)
+        .map_err(|_| AppError::Conflict("digest_attempt_identity_missing".to_string()))?;
+    report_filter.insert("attempt_generation", attempt_generation);
+    let current = state
+        .db
+        .knowledge_daily_reports()
+        .find_one(report_filter.clone(), None)
+        .await?;
+    let has_success = current
+        .as_ref()
+        .is_some_and(|report| report.last_success_at.is_some() || report.status == "ok");
+
+    let mut set = doc! {
+        "latest_attempt_status": status,
+        "latest_attempt_error_kind": error_kind.clone(),
+        "latest_attempt_at": now,
+        "latest_attempt_budget_snapshot": budget_snapshot.clone(),
+    };
+    if status == "ok" {
+        set.extend(doc! {
+            "generated_at": now,
+            "generated_by": "worker",
+            "status": "ok",
+            "error_kind": null,
+            "budget_snapshot": budget_snapshot,
+            "cards": serialized_cards,
+            "prompt_versions": prompt_versions,
+            "current_generation": attempt_generation,
+            "last_success_at": now,
+        });
+    } else if !has_success {
+        // First-ever failure remains visible, but later failures cannot erase
+        // a previously committed successful snapshot.
+        set.extend(doc! {
+            "generated_at": now,
+            "generated_by": "worker",
+            "status": status,
+            "error_kind": error_kind,
+            "budget_snapshot": budget_snapshot,
+            "cards": serialized_cards,
+            "prompt_versions": prompt_versions,
+        });
+    }
+
+    let mut update = doc! { "$set": set };
+    if status == "ok" && !migrated_dismissed.is_empty() {
+        update.insert(
+            "$addToSet",
+            doc! { "dismissed_card_ids": { "$each": migrated_dismissed } },
+        );
+    }
+    let options = FindOneAndUpdateOptions::builder()
+        .return_document(ReturnDocument::After)
+        .build();
+    if let Some(saved) = state
+        .db
+        .knowledge_daily_reports()
+        .find_one_and_update(report_filter, update, options)
+        .await?
+    {
+        return Ok(saved);
+    }
+
+    // A newer attempt owns the row. Return its authoritative visible snapshot
+    // instead of exposing this late result to a synchronous caller.
+    state
+        .db
+        .knowledge_daily_reports()
+        .find_one(
+            doc! {
+                "workspace_id": workspace_id,
+                "account_id": account_id,
+                "report_date": report_date,
+            },
+            None,
+        )
+        .await?
+        .ok_or_else(|| AppError::Conflict("digest_attempt_lost".to_string()))
+}
+
+fn is_duplicate_key_error(error: &mongodb::error::Error) -> bool {
+    use mongodb::error::{ErrorKind, WriteFailure};
+    match &*error.kind {
+        ErrorKind::Write(WriteFailure::WriteError(write_error)) => {
+            matches!(write_error.code, 11000 | 11001)
+        }
+        ErrorKind::BulkWrite(bulk) => bulk.write_errors.as_ref().is_some_and(|errors| {
+            errors
+                .iter()
+                .any(|write_error| matches!(write_error.code, 11000 | 11001))
+        }),
+        _ => false,
+    }
+}
+
+/// Narrow read-only harness for SR-119 visibility redlines. It executes the
+/// production health analyzer and exposes only stable chunk identities.
+#[doc(hidden)]
+pub async fn analyze_chunk_health_ids_for_redline(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+) -> AppResult<Vec<String>> {
+    Ok(analyze_chunks_health(state, workspace_id, account_id)
+        .await?
+        .into_iter()
+        .map(|signal| signal.chunk_id)
+        .collect())
+}
+
+/// Narrow production-protocol harness for SR-121 database redlines.
+#[doc(hidden)]
+pub async fn claim_digest_attempt_for_redline(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+    report_date: &str,
+) -> AppResult<i64> {
+    claim_digest_attempt(state, workspace_id, account_id, report_date).await
+}
+
+/// Finalize a precomputed digest outcome through the production generation
+/// fence. Tests supply cards directly so no LLM or prompt behavior is mocked.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub async fn finalize_digest_attempt_for_redline(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+    report_date: &str,
+    attempt_generation: i64,
+    status: &str,
+    error_kind: Option<String>,
+    cards: Vec<KnowledgeDigestCard>,
+) -> AppResult<KnowledgeDailyReport> {
+    let report_filter = doc! {
+        "workspace_id": workspace_id,
+        "account_id": account_id,
+        "report_date": report_date,
+    };
+    let existing = state
+        .db
+        .knowledge_daily_reports()
+        .find_one(report_filter.clone(), None)
+        .await?;
+    let migrated_dismissed = migrated_dismissed_card_ids(existing.as_ref(), &cards);
+    finalize_digest_attempt(
+        state,
+        report_filter,
+        attempt_generation,
+        status,
+        error_kind,
+        doc! { "token_budget": 12345i64, "max_llm_calls": 3i64 },
+        doc! { "knowledge.digest.compose": "redline" },
+        mongodb::bson::to_bson(&cards)?,
+        migrated_dismissed,
+        BsonDateTime::now(),
     )
     .await
 }
@@ -780,6 +1202,7 @@ async fn generate_today_digest_inner(
     account_id: &str,
     report_date: &str,
     run_id: &str,
+    attempt_generation: i64,
     budget: Arc<RunBudget>,
 ) -> AppResult<KnowledgeDailyReport> {
     RUN_BUDGET
@@ -790,6 +1213,7 @@ async fn generate_today_digest_inner(
                 account_id,
                 report_date,
                 run_id,
+                attempt_generation,
                 Arc::clone(&budget),
             )
             .await
@@ -803,6 +1227,7 @@ async fn do_generate(
     account_id: &str,
     report_date: &str,
     run_id: &str,
+    attempt_generation: i64,
     budget: Arc<RunBudget>,
 ) -> AppResult<KnowledgeDailyReport> {
     // 1. 4 路只读分析（任一失败 → status=failed + 写空 cards 报告）。
@@ -819,6 +1244,8 @@ async fn do_generate(
         let evolution = analyze_evolution(state, workspace_id, account_id).await?;
         let cards = compose_cards(
             state,
+            workspace_id,
+            account_id,
             run_id,
             report_date,
             &chunk_health,
@@ -870,53 +1297,56 @@ async fn do_generate(
         }
     };
 
-    // 2. upsert by `(workspace_id, account_id, report_date)`。
-    let now = BsonDateTime::now();
-    let serialized_cards =
-        mongodb::bson::to_bson(&cards).unwrap_or_else(|_| mongodb::bson::Bson::Array(Vec::new()));
-
-    let update = doc! {
-        "$set": {
-            "workspace_id": workspace_id,
-            "account_id": account_id,
-            "report_date": report_date,
-            "generated_at": now,
-            "generated_by": "worker",
-            "status": &status,
-            "error_kind": error_kind.clone(),
-            "budget_snapshot": budget_doc,
-            "cards": serialized_cards,
-            "prompt_versions": prompt_versions,
-        },
-        "$setOnInsert": {
-            "dismissed_card_ids": mongodb::bson::Bson::Array(Vec::new()),
-        },
+    // 2. Finalize only the latest claimed generation. A failed regeneration
+    // updates latest-attempt metadata but never replaces a successful snapshot.
+    // SR-124 rollout compatibility: account-scoped card ids differ from ids produced before
+    // this fix. Preserve dismissals by mapping dismissed cards from the existing report to
+    // semantically identical cards in this regeneration. $addToSet keeps concurrent dismisses.
+    let report_filter = doc! {
+        "workspace_id": workspace_id,
+        "account_id": account_id,
+        "report_date": report_date,
     };
-
-    let opts = FindOneAndUpdateOptions::builder()
-        .upsert(true)
-        .return_document(ReturnDocument::After)
-        .build();
-
-    let saved = state
+    let existing = state
         .db
         .knowledge_daily_reports()
-        .find_one_and_update(
-            doc! {
-                "workspace_id": workspace_id,
-                "account_id": account_id,
-                "report_date": report_date,
-            },
-            update,
-            opts,
-        )
-        .await?
-        .ok_or_else(|| {
-            AppError::External("upsert knowledge_daily_reports returned none".to_string())
-        })?;
+        .find_one(report_filter.clone(), None)
+        .await?;
+    let migrated_dismissed = migrated_dismissed_card_ids(existing.as_ref(), &cards);
+    let now = BsonDateTime::now();
+    let serialized_cards = mongodb::bson::to_bson(&cards)?;
+    let saved = finalize_digest_attempt(
+        state,
+        report_filter,
+        attempt_generation,
+        &status,
+        error_kind.clone(),
+        budget_doc,
+        prompt_versions,
+        serialized_cards,
+        migrated_dismissed,
+        now,
+    )
+    .await?;
+
+    let attempt_committed = saved.attempt_generation == attempt_generation;
+    let audit_status = if attempt_committed {
+        status.as_str()
+    } else {
+        "superseded"
+    };
+    let audit_error_kind = if attempt_committed {
+        error_kind.clone()
+    } else {
+        Some("digest_attempt_superseded".to_string())
+    };
 
     // 3. 旁路审计：knowledge_usage_logs（route_result.kind="digest_compose"）+ AgentEvent。
-    let card_count = cards.len() as i64;
+    let card_count = if attempt_committed {
+        cards.len() as i64
+    } else {
+        0
+    };
     let usage_log = KnowledgeUsageLog {
         id: None,
         workspace_id: workspace_id.to_string(),
@@ -926,15 +1356,15 @@ async fn do_generate(
         knowledge_ids: Vec::new(),
         route_result: doc! {
             "kind": "digest_compose",
-            "status": &status,
+            "status": audit_status,
             "cardCount": card_count,
             "reportDate": report_date,
             "tokensUsed": snapshot.tokens_used,
             "llmCallsUsed": snapshot.llm_calls_used as i64,
         },
         reply_text: None,
-        review_approved: status == "ok",
-        blocked_reason: error_kind.clone(),
+        review_approved: attempt_committed && status == "ok",
+        blocked_reason: audit_error_kind.clone(),
         tool_trace: Vec::new(),
         created_at: now,
     };
@@ -956,12 +1386,15 @@ async fn do_generate(
         account_id: account_id.to_string(),
         contact_wxid: None,
         kind: "knowledge_digest_generated".to_string(),
-        status: status.clone(),
-        summary: format!("AI 知识库日报合成完成：{} 张卡片（{}）", card_count, status),
+        status: audit_status.to_string(),
+        summary: format!(
+            "AI 知识库日报合成完成：{} 张卡片（{}）",
+            card_count, audit_status
+        ),
         details: Some(doc! {
             "reportDate": report_date,
             "cardCount": card_count,
-            "errorKind": error_kind.clone(),
+            "errorKind": audit_error_kind,
             "tokensUsed": snapshot.tokens_used,
             "llmCallsUsed": snapshot.llm_calls_used as i64,
         }),
@@ -1000,6 +1433,56 @@ mod tests {
         // 给一个 23 的边界值确保不 panic。
         let d = duration_until_next_run(23);
         assert!(d.as_secs() >= 60);
+    }
+
+    #[test]
+    fn digest_run_budget_uses_effective_config_values() {
+        let budget = digest_run_budget("digest-config-test", 12_345, 3);
+        let snapshot = budget.snapshot();
+        assert_eq!(snapshot.token_budget, 12_345);
+        assert_eq!(snapshot.max_llm_calls, 3);
+        assert_eq!(snapshot.tool_call_budget, i32::MAX);
+    }
+
+    #[test]
+    fn digest_card_items_restores_singleton_card_object_from_shared_llm_parser() {
+        let singleton = json!({
+            "kind": "chunk_missing_field",
+            "title": "缺 sourceQuote",
+            "summary": "AI 建议补完原文出处",
+            "targetRefs": [{"kind": "chunk", "id": "chunk-a"}],
+            "suggestedAction": "fix_chunk",
+            "severity": "warn"
+        });
+
+        let items = digest_card_items(&singleton);
+        assert_eq!(items, vec![singleton]);
+        let cards = parse_cards_from_llm_array(items, "acc-a", "2026-07-27");
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].kind, "chunk_missing_field");
+        assert_eq!(cards[0].suggested_action, "fix_chunk");
+        assert_eq!(cards[0].target_refs[0].get_str("id").unwrap(), "chunk-a");
+    }
+
+    #[test]
+    fn digest_card_items_rejects_unrelated_or_invalid_singleton_objects() {
+        assert!(digest_card_items(&json!({
+            "naturalReply": "not a digest card",
+            "plannedSteps": []
+        }))
+        .is_empty());
+
+        let invalid_enum = json!({
+            "kind": "unknown_card_kind",
+            "title": "invalid",
+            "summary": "must still pass the closed-enum parser",
+            "targetRefs": [{"kind": "chunk", "id": "chunk-a"}],
+            "suggestedAction": "fix_chunk",
+            "severity": "warn"
+        });
+        let items = digest_card_items(&invalid_enum);
+        assert_eq!(items.len(), 1, "shape normalization is not enum validation");
+        assert!(parse_cards_from_llm_array(items, "acc-a", "2026-07-27").is_empty());
     }
 
     /// Phase 2 smoke：LLM 返回**未知 kind / severity / suggestedAction** 时，
@@ -1042,7 +1525,7 @@ mod tests {
                 "suggestedAction": "freeform", "severity": "info"
             }),
         ];
-        let cards = parse_cards_from_llm_array(raw, "2026-05-24");
+        let cards = parse_cards_from_llm_array(raw, "acc-a", "2026-05-24");
         assert_eq!(cards.len(), 1, "只有第一张合法卡片可入库");
         assert_eq!(cards[0].kind, "chunk_missing_field");
         assert_eq!(cards[0].severity, "warn");
@@ -1079,7 +1562,7 @@ mod tests {
                 "severity": "warn"
             }),
         ];
-        let cards = parse_cards_from_llm_array(raw, "2026-05-24");
+        let cards = parse_cards_from_llm_array(raw, "acc-a", "2026-05-24");
         assert_eq!(cards.len(), 3);
         assert_eq!(cards[0].severity, "critical", "critical 必须排第一");
         assert_eq!(cards[1].severity, "warn", "warn 第二");
@@ -1111,7 +1594,7 @@ mod tests {
                 })
             })
             .collect();
-        let cards = parse_cards_from_llm_array(raw, "2026-05-24");
+        let cards = parse_cards_from_llm_array(raw, "acc-a", "2026-05-24");
         assert_eq!(cards.len(), 50, "单批必须裁剪到 ≤ 50");
     }
 
@@ -1131,7 +1614,7 @@ mod tests {
             "suggestedAction": "fix_chunk",
             "severity": "critical"
         })];
-        let cards = parse_cards_from_llm_array(raw, "2026-05-24");
+        let cards = parse_cards_from_llm_array(raw, "acc-a", "2026-05-24");
         assert_eq!(cards.len(), 1);
         assert_eq!(cards[0].target_refs.len(), 1);
         assert_eq!(cards[0].target_refs[0].get_str("id").unwrap_or(""), "abc");
@@ -1153,14 +1636,14 @@ mod tests {
             })]
         };
         // 同一天同一卡片：两次 parse 必须得到相同 cardId（regenerate 不破坏 dismiss）。
-        let first = parse_cards_from_llm_array(raw(), "2026-05-24");
-        let second = parse_cards_from_llm_array(raw(), "2026-05-24");
+        let first = parse_cards_from_llm_array(raw(), "acc-a", "2026-05-24");
+        let second = parse_cards_from_llm_array(raw(), "acc-a", "2026-05-24");
         assert_eq!(
             first[0].card_id, second[0].card_id,
             "同 (date,kind,refs,title) 必须派生相同 cardId"
         );
         // 不同日期 → 不同 cardId（昨日 dismiss 不影响今日）。
-        let other_day = parse_cards_from_llm_array(raw(), "2026-05-25");
+        let other_day = parse_cards_from_llm_array(raw(), "acc-a", "2026-05-25");
         assert_ne!(
             first[0].card_id, other_day[0].card_id,
             "不同 report_date 必须派生不同 cardId"
@@ -1168,10 +1651,68 @@ mod tests {
         // 同日不同 title → 不同 cardId（避免不同问题被误合并）。
         let mut diff_title = raw();
         diff_title[0]["title"] = json!("切片 abc 被 pressure_risk 拦截");
-        let diff = parse_cards_from_llm_array(diff_title, "2026-05-24");
+        let diff = parse_cards_from_llm_array(diff_title, "acc-a", "2026-05-24");
         assert_ne!(
             first[0].card_id, diff[0].card_id,
             "不同 title 必须派生不同 cardId"
         );
+        let other_account = parse_cards_from_llm_array(raw(), "acc-b", "2026-05-24");
+        assert_ne!(
+            first[0].card_id, other_account[0].card_id,
+            "不同 account_id 必须派生不同 cardId"
+        );
+    }
+
+    #[test]
+    fn migrated_dismissals_map_only_semantically_identical_cards() {
+        let old_dismissed_id = ObjectId::new();
+        let old_visible_id = ObjectId::new();
+        let new_dismissed_id = ObjectId::new();
+        let new_visible_id = ObjectId::new();
+        let card = |card_id, title: &str| KnowledgeDigestCard {
+            card_id,
+            kind: "chunk_missing_field".to_string(),
+            title: title.to_string(),
+            summary: "summary may change without changing card identity".to_string(),
+            target_refs: vec![doc! { "kind": "chunk", "id": "chunk-a" }],
+            suggested_action: "fix_chunk".to_string(),
+            severity: "warn".to_string(),
+            metric: None,
+        };
+        let existing = KnowledgeDailyReport {
+            id: Some(ObjectId::new()),
+            workspace_id: "ws-a".to_string(),
+            account_id: "acc-a".to_string(),
+            report_date: "2026-05-24".to_string(),
+            generated_at: BsonDateTime::now(),
+            generated_by: "worker".to_string(),
+            status: "ok".to_string(),
+            error_kind: None,
+            budget_snapshot: Document::new(),
+            cards: vec![
+                card(old_dismissed_id, "same card"),
+                card(old_visible_id, "visible card"),
+            ],
+            dismissed_card_ids: vec![old_dismissed_id],
+            prompt_versions: Document::new(),
+            attempt_generation: 1,
+            current_generation: 1,
+            latest_attempt_status: Some("ok".to_string()),
+            latest_attempt_error_kind: None,
+            latest_attempt_at: Some(BsonDateTime::now()),
+            latest_attempt_budget_snapshot: Document::new(),
+            last_success_at: Some(BsonDateTime::now()),
+        };
+        let regenerated = vec![
+            card(new_dismissed_id, "same card"),
+            card(new_visible_id, "visible card"),
+            card(ObjectId::new(), "new card"),
+        ];
+
+        assert_eq!(
+            migrated_dismissed_card_ids(Some(&existing), &regenerated),
+            vec![new_dismissed_id]
+        );
+        assert!(migrated_dismissed_card_ids(None, &regenerated).is_empty());
     }
 }

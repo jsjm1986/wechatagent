@@ -35,8 +35,13 @@ fn make_command_run(session_id: ObjectId, status: &str) -> AgentCommandRun {
         operator_message: "test".to_string(),
         status: status.to_string(),
         plan: None,
+        plan_hash: None,
         summary: "dry-run plan".to_string(),
         error: None,
+        execution_token: None,
+        execution_started_at: None,
+        confirmed_by: None,
+        confirmed_at: None,
         prompt_versions: Document::new(),
         created_at: now,
         updated_at: now,
@@ -50,6 +55,8 @@ fn make_tool_call(command_run_id: ObjectId, tool: &str, status: &str) -> AgentTo
         workspace_id: "default".to_string(),
         account_id: "default".to_string(),
         command_run_id,
+        intent_key: None,
+        call_index: 0,
         tool_name: tool.to_string(),
         arguments: doc! { "dry_run": true },
         status: status.to_string(),
@@ -61,6 +68,8 @@ fn make_tool_call(command_run_id: ObjectId, tool: &str, status: &str) -> AgentTo
             }
         }),
         error: None,
+        execution_started_at: None,
+        finalized_at: Some(now),
         created_at: now,
         updated_at: now,
     }
@@ -147,6 +156,8 @@ async fn dry_run_session_writes_dry_run_status_audit_only() {
         would.get_str("toolName").unwrap(),
         "contacts.update_profile_note"
     );
+
+    app.cleanup().await;
 }
 
 #[tokio::test]
@@ -180,4 +191,6 @@ async fn non_dry_run_session_uses_normal_status() {
         .unwrap()
         .unwrap();
     assert_eq!(stored.status, "completed");
+
+    app.cleanup().await;
 }

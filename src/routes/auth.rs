@@ -11,7 +11,9 @@
 //!
 //! 路由 mount 在 [`super::api_router`]；`/login` 走 middleware 白名单。
 
-use axum::{extract::State, Extension, Json};
+use std::net::SocketAddr;
+
+use axum::{extract::connect_info::ConnectInfo, extract::State, Extension, Json};
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use cookie::time::Duration as CookieDuration;
 use serde::{Deserialize, Serialize};
@@ -20,11 +22,12 @@ use serde_json::{json, Value};
 use crate::auth::is_workspace_authorized;
 use crate::auth::{
     jwt::issue_jwt,
+    rate_limit::{write_auth_failure_audit, AuthAuditSubject},
     session::{
-        authenticate, create_session, delete_session, get_admin_user, update_session_workspace,
-        AuthError,
+        authenticate, create_session, delete_session, get_admin_user, initial_authorized_workspace,
+        update_session_workspace, AuthError,
     },
-    AuthenticatedAdmin, SESSION_COOKIE_NAME,
+    AdminUser, AuthenticatedAdmin, SESSION_COOKIE_NAME,
 };
 use crate::error::{AppError, AppResult};
 
@@ -47,6 +50,7 @@ pub(super) struct LoginResponse {
 
 pub(super) async fn login(
     State(state): State<AppState>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
     jar: CookieJar,
     Json(req): Json<LoginRequest>,
 ) -> AppResult<(CookieJar, Json<LoginResponse>)> {
@@ -57,9 +61,9 @@ pub(super) async fn login(
             "username and password are required".into(),
         ));
     }
-    let user = authenticate(&state.db, username, password)
-        .await
-        .map_err(map_auth_error)?;
+    let client_identity = direct_client_identity(connect_info.as_ref());
+    let user =
+        authenticate_public_endpoint(&state, "login", &client_identity, username, password).await?;
     let ttl_hours = state.config.session_ttl_hours.max(1);
     let session = create_session(
         &state.db,
@@ -109,14 +113,8 @@ pub(super) async fn me(
         .await
         .map_err(map_auth_error)?;
     let workspaces = user
-        .as_ref()
-        .map(|u| u.workspaces.clone())
-        .unwrap_or_default();
-    let workspaces = if workspaces.is_empty() {
-        vec![state.config.default_workspace_id.clone()]
-    } else {
-        workspaces
-    };
+        .ok_or_else(|| AppError::Unauthorized("admin_user_not_found".into()))?
+        .workspaces;
     Ok(Json(json!({
         "username": admin.username,
         "userId": admin.user_id,
@@ -177,6 +175,9 @@ fn map_auth_error(e: AuthError) -> AppError {
         AuthError::InvalidCredentials => AppError::Unauthorized("invalid_credentials".into()),
         AuthError::SessionExpired => AppError::Unauthorized("session_expired".into()),
         AuthError::SessionNotFound => AppError::Unauthorized("session_not_found".into()),
+        AuthError::NoAuthorizedWorkspace => {
+            AppError::Unauthorized("no_authorized_workspace".into())
+        }
         AuthError::Password(_) => AppError::External(format!("password hashing: {}", e)),
         AuthError::Mongo(err) => AppError::Db(err),
     }
@@ -207,6 +208,7 @@ pub(super) struct IssueTokenResponse {
 
 pub(super) async fn issue_token(
     State(state): State<AppState>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
     Json(req): Json<IssueTokenRequest>,
 ) -> AppResult<Json<IssueTokenResponse>> {
     if !state.config.jwt_enabled {
@@ -223,14 +225,11 @@ pub(super) async fn issue_token(
             "username and password are required".into(),
         ));
     }
-    let user = authenticate(&state.db, username, password)
-        .await
-        .map_err(map_auth_error)?;
-    let ws = user
-        .default_workspace
-        .clone()
-        .or_else(|| user.workspaces.first().cloned())
-        .unwrap_or_else(|| state.config.default_workspace_id.clone());
+    let client_identity = direct_client_identity(connect_info.as_ref());
+    let user =
+        authenticate_public_endpoint(&state, "token", &client_identity, username, password).await?;
+    let ws = initial_authorized_workspace(&user, &state.config.default_workspace_id)
+        .ok_or_else(|| AppError::Unauthorized("no_authorized_workspace".into()))?;
     let token = issue_jwt(keys, &user.user_id, &user.username, &ws)?;
     Ok(Json(IssueTokenResponse {
         token,
@@ -238,4 +237,92 @@ pub(super) async fn issue_token(
         expires_in_minutes: keys.ttl_minutes,
         current_workspace: ws,
     }))
+}
+
+fn direct_client_identity(connect_info: Option<&ConnectInfo<SocketAddr>>) -> String {
+    connect_info
+        .map(|ConnectInfo(address)| address.ip().to_string())
+        .unwrap_or_else(|| "unknown-direct-peer".to_string())
+}
+
+/// Shared credential boundary for both public authentication endpoints.
+///
+/// Capacity is reserved before Argon2. Invalid credentials remain in the
+/// failure window; success clears failures for the same client+target pair.
+/// Infrastructure errors and cancelled requests release their reservation via
+/// `AuthAttemptPermit::drop` and therefore do not lock out valid credentials.
+async fn authenticate_public_endpoint(
+    state: &AppState,
+    entrypoint: &str,
+    client_identity: &str,
+    username: &str,
+    password: &str,
+) -> AppResult<AdminUser> {
+    let permit = match state.auth_rate_limiter.begin(client_identity, username) {
+        Ok(permit) => permit,
+        Err(denied) => {
+            if denied.should_audit {
+                audit_auth_failure(
+                    state,
+                    entrypoint,
+                    "rate_limited",
+                    &denied.subject,
+                    Some(denied.dimension),
+                    Some(denied.retry_after_seconds),
+                )
+                .await;
+            }
+            return Err(AppError::AuthRateLimited {
+                retry_after: denied.retry_after_seconds,
+            });
+        }
+    };
+    let subject = permit.audit_subject();
+    match authenticate(&state.db, username, password).await {
+        Ok(user) => {
+            permit.mark_success();
+            Ok(user)
+        }
+        Err(AuthError::InvalidCredentials) => {
+            permit.mark_invalid();
+            audit_auth_failure(
+                state,
+                entrypoint,
+                "invalid_credentials",
+                &subject,
+                None,
+                None,
+            )
+            .await;
+            Err(AppError::Unauthorized("invalid_credentials".into()))
+        }
+        Err(other) => Err(map_auth_error(other)),
+    }
+}
+
+async fn audit_auth_failure(
+    state: &AppState,
+    entrypoint: &str,
+    outcome: &str,
+    subject: &AuthAuditSubject,
+    dimension: Option<&str>,
+    retry_after_seconds: Option<u64>,
+) {
+    if let Err(error) = write_auth_failure_audit(
+        &state.db,
+        entrypoint,
+        outcome,
+        subject,
+        dimension,
+        retry_after_seconds,
+    )
+    .await
+    {
+        tracing::error!(
+            ?error,
+            entrypoint,
+            outcome,
+            "failed to persist authentication security audit"
+        );
+    }
 }

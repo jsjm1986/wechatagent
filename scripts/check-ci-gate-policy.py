@@ -12,6 +12,7 @@ WORKFLOW = pathlib.Path(".github/workflows/ci.yml")
 
 HARD_JOBS = {
     "baseline",
+    "credential-probe",
     "knowledge-evidence-gate",
     "tenant-isolation-security",
     "frontend-contract",
@@ -118,6 +119,26 @@ def main() -> int:
 
     if "baseline" in jobs and "python3 scripts/check-ci-gate-policy.py" not in jobs["baseline"]:
         failures.append("baseline must execute this CI gate policy checker")
+    if "baseline" in jobs and "python3 scripts/check-secrets.py" not in jobs["baseline"]:
+        failures.append("baseline must execute the tracked literal credential checker")
+    if "baseline" in jobs and "python3 scripts/check-task-status-manifest.py" not in jobs["baseline"]:
+        failures.append("baseline must execute the auditable task status checker")
+    if "baseline" in jobs and "python3 scripts/check-audit-status-manifest.py" not in jobs["baseline"]:
+        failures.append("baseline must execute the reproducible audit status checker")
+
+    if "credential-probe" in jobs:
+        block = jobs["credential-probe"]
+        condition = property_value(block, "if") or ""
+        if "dispatch_target == 'credential_probe'" not in condition:
+            failures.append("credential-probe must be restricted to its manual dispatch target")
+        for required in (
+            "secrets.RSXERMU_KEY",
+            "https://gateway.oeezzk.cn/v1",
+            "gpt-5.6-auto",
+            "HC001_CREDENTIAL_PROBE=ok",
+        ):
+            if required not in block:
+                failures.append(f"credential-probe is missing required binding {required!r}")
 
     print(
         f"[ci-gate-policy] hard={len(HARD_JOBS)} soft={len(SOFT_JOBS)} "

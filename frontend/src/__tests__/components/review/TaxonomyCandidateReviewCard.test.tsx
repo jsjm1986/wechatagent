@@ -79,6 +79,17 @@ describe("TaxonomyCandidateReviewCard", () => {
     await waitFor(() => expect(screen.getByText(/已存在/)).toBeTruthy());
   });
 
+  it("200 合并响应显示已并入已有标签", async () => {
+    vi.spyOn(api, "postRaw").mockResolvedValue({
+      ok: true,
+      status: 200,
+      data: { mergedIntoExisting: true },
+    } as never);
+    render(<TaxonomyCandidateReviewCard candidate={candidate} onDone={() => {}} />);
+    fireEvent.click(screen.getByRole("button", { name: "采纳" }));
+    await waitFor(() => expect(screen.getByText(/已并入已有标签/)).toBeTruthy());
+  });
+
   it("驳回需填原因，填后 POST reason 并回调 onDone", async () => {
     const onDone = vi.fn();
     const post = vi.spyOn(api, "post").mockResolvedValue({} as never);

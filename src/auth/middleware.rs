@@ -24,8 +24,8 @@ use axum::{
 use axum_extra::extract::cookie::CookieJar;
 
 use crate::auth::jwt::verify_jwt;
-use crate::auth::session::{lookup_session, AuthError};
-use crate::auth::{AuthenticatedAdmin, SESSION_COOKIE_NAME};
+use crate::auth::session::{get_admin_user, lookup_session, AuthError};
+use crate::auth::{is_workspace_authorized, AuthenticatedAdmin, SESSION_COOKIE_NAME};
 use crate::routes::AppState;
 
 /// 不需要登录就能访问的路径（已剥 `/api` 前缀）。
@@ -48,12 +48,28 @@ pub async fn require_session(
     if let Some(cookie) = jar.get(SESSION_COOKIE_NAME) {
         match lookup_session(&state.db, cookie.value()).await {
             Ok(session) => {
+                let user = match get_admin_user(&state.db, &session.admin_user_id).await {
+                    Ok(Some(user)) => user,
+                    Ok(None) => return Err(StatusCode::UNAUTHORIZED),
+                    Err(error) => {
+                        tracing::warn!(%error, "admin ACL lookup failed");
+                        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                    }
+                };
+                let current_workspace = session
+                    .current_workspace
+                    .unwrap_or_else(|| state.config.default_workspace_id.clone());
+                if !is_workspace_authorized(
+                    &current_workspace,
+                    &user.workspaces,
+                    &state.config.default_workspace_id,
+                ) {
+                    return Err(StatusCode::UNAUTHORIZED);
+                }
                 req.extensions_mut().insert(AuthenticatedAdmin {
-                    user_id: session.admin_user_id,
-                    username: session.username,
-                    current_workspace: session
-                        .current_workspace
-                        .unwrap_or_else(|| state.config.default_workspace_id.clone()),
+                    user_id: user.user_id,
+                    username: user.username,
+                    current_workspace,
                 });
                 return Ok(next.run(req).await);
             }
@@ -73,9 +89,24 @@ pub async fn require_session(
             if let Some(bearer) = extract_bearer(&req) {
                 match verify_jwt(keys, bearer) {
                     Ok(claims) => {
+                        let user = match get_admin_user(&state.db, &claims.sub).await {
+                            Ok(Some(user)) => user,
+                            Ok(None) => return Err(StatusCode::UNAUTHORIZED),
+                            Err(error) => {
+                                tracing::warn!(%error, "admin ACL lookup failed");
+                                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                            }
+                        };
+                        if !is_workspace_authorized(
+                            &claims.current_workspace,
+                            &user.workspaces,
+                            &state.config.default_workspace_id,
+                        ) {
+                            return Err(StatusCode::UNAUTHORIZED);
+                        }
                         req.extensions_mut().insert(AuthenticatedAdmin {
-                            user_id: claims.sub,
-                            username: claims.username,
+                            user_id: user.user_id,
+                            username: user.username,
                             current_workspace: claims.current_workspace,
                         });
                         return Ok(next.run(req).await);

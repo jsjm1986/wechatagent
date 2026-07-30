@@ -81,7 +81,7 @@ gh pr create --title "feat(mcp): MCP Server 真实接入完整实现" \
 ```bash
 # .env 文件配置
 MCP_BASE_URL=http://117.72.54.28:3001
-MCP_API_KEY=gwa_ba60a98aada58c10b77f6f20841c77c6c3c0506d9431871f
+MCP_API_KEY=<INJECT_FROM_SECRET_STORE>
 WEBHOOK_VERIFY_SIGNATURE=true
 ```
 
@@ -93,7 +93,7 @@ WEBHOOK_VERIFY_SIGNATURE=true
 **方式 B**: 通过 MCP 工具（如果支持 `set_webhook_url`）
 ```bash
 curl -X POST http://117.72.54.28:3001/mcp \
-  -H "Authorization: Bearer gwa_ba60a98aada58c10b77f6f20841c77c6c3c0506d9431871f" \
+  -H "Authorization: Bearer $MCP_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","id":"1","method":"tools/call","params":{"name":"set_webhook_url","arguments":{"account_alias":"t-1","webhook_url":"https://<域名>/webhooks/wechat"}}}'
 ```

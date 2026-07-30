@@ -41,13 +41,14 @@ use super::AppState;
 /// 已知限制由 `tests::to_snake_case_known_limitation_trailing_uppercase` 锁定。
 fn to_snake_case(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
-    for (i, c) in s.chars().enumerate() {
+    let chars: Vec<char> = s.chars().collect();
+    for (i, c) in chars.iter().copied().enumerate() {
         if c.is_ascii_uppercase() && i > 0 {
             // 检查是否需要在前面插入 _：前一个字符是字母/数字，后一个字符是字母
-            let prev = s[..i].chars().last();
-            let next = s[i..].chars().nth(1);
-            let prev_is_letter_or_digit = prev.map_or(false, |p| p.is_alphanumeric());
-            let next_is_lower = next.map_or(false, |n| n.is_ascii_lowercase());
+            let prev_is_letter_or_digit = chars[i - 1].is_alphanumeric();
+            let next_is_lower = chars
+                .get(i + 1)
+                .is_some_and(|next| next.is_ascii_lowercase());
             if prev_is_letter_or_digit && next_is_lower {
                 result.push('_');
             }
@@ -342,7 +343,7 @@ pub async fn generate_domain_profile_candidate(
 
     // C3：生成器 system 走 active profile 的领域中性引导语（DEFAULT 已去销售偏见）。
     let active_profile =
-        agent::domain_profile::load_active_domain_profile(&state.db, &workspace_id).await;
+        agent::domain_profile::load_active_domain_profile(&state.db, &workspace_id).await?;
     let system = match active_profile
         .methodology_generator_preamble
         .as_deref()
@@ -362,6 +363,7 @@ pub async fn generate_domain_profile_candidate(
     );
     let generated = agent::generate_agent_json(
         &state,
+        &workspace_id,
         None,
         None,
         None,
@@ -408,9 +410,10 @@ pub async fn generate_domain_profile_candidate(
     profile.profile_id = payload.profile_id.clone();
     profile.workspace_id = workspace_id.clone();
     profile.display_name = display_name;
-    profile.version = next_candidate_version(&state, &workspace_id, &payload.profile_id).await?;
+    profile.version = 0;
     profile.current_version = false; // 候选草稿:需人审 → publish → activate
     profile.previous_version = None;
+    profile.release_status = "draft".to_string();
     profile.is_active = false;
     profile.seeded_by = Some("generated_by_ai".to_string());
     profile.created_at = now;
@@ -451,16 +454,8 @@ pub async fn generate_domain_profile_candidate(
         }
     };
 
-    let inserted = state
-        .db
-        .domain_profiles()
-        .insert_one(&profile, None)
-        .await?;
-    let hex = inserted
-        .inserted_id
-        .as_object_id()
-        .map(|i| i.to_hex())
-        .unwrap_or_default();
+    let profile = super::domain_profiles::append_domain_profile_draft(&state.db, profile).await?;
+    let hex = profile.id.map(|i| i.to_hex()).unwrap_or_default();
 
     // 流 C：AI 建议的维度取值落候选层（绝不直接进 system_taxonomies——守「AI 永不自动
     // verify」红线），复用运行时同一候选 → admin approve 通路。confidence 传 10（即
@@ -493,31 +488,6 @@ pub async fn generate_domain_profile_candidate(
     })))
 }
 
-/// 候选版本号：同 (workspace, profile_id) 取 max(version)+1（与 3A-3 同口径）。
-async fn next_candidate_version(
-    state: &AppState,
-    workspace_id: &str,
-    profile_id: &str,
-) -> AppResult<i32> {
-    let raw = state.db.domain_profiles().clone_with_type::<Document>();
-    let mut cursor = raw
-        .find(
-            doc! { "workspace_id": workspace_id, "profile_id": profile_id },
-            FindOptions::builder()
-                .sort(doc! { "version": -1_i32 })
-                .limit(1_i64)
-                .projection(doc! { "version": 1_i32 })
-                .build(),
-        )
-        .await?;
-    let max = if let Some(d) = cursor.try_next().await? {
-        d.get_i32("version").unwrap_or(0)
-    } else {
-        0
-    };
-    Ok(max + 1)
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -545,6 +515,12 @@ mod tests {
         assert_eq!(to_snake_case("HTTPServer"), "http_server");
         // APIKey → api_key(K 后跟 e,在 K 前插下划线)。
         assert_eq!(to_snake_case("APIKey"), "api_key");
+    }
+
+    #[test]
+    fn to_snake_case_handles_non_ascii_prefix_without_byte_indexing() {
+        assert_eq!(to_snake_case("客户Stage"), "客户_stage");
+        assert_eq!(to_snake_case("éValue"), "é_value");
     }
 
     /// 已知限制锁定:末尾连续大写不插下划线(后面没有小写字母触发分隔)。

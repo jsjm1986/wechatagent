@@ -53,6 +53,8 @@ pub async fn insert_experiment_envelope(
 pub async fn update_experiment_status(
     state: &AppState,
     experiment_id: &str,
+    workspace_id: &str,
+    account_id: &str,
     new_status: &str,
 ) -> Result<(), EvolutionError> {
     if !matches!(
@@ -74,7 +76,11 @@ pub async fn update_experiment_status(
         .db
         .experiments()
         .update_one(
-            doc! { "experiment_id": experiment_id },
+            doc! {
+                "experiment_id": experiment_id,
+                "workspace_id": workspace_id,
+                "account_id": account_id,
+            },
             doc! { "$set": update },
             None,
         )
@@ -82,7 +88,7 @@ pub async fn update_experiment_status(
         .map_err(EvolutionError::from)?;
     if result.matched_count == 0 {
         return Err(EvolutionError::InvalidStatus(format!(
-            "experiment_id not found: {experiment_id}"
+            "experiment scope not found: {workspace_id}/{account_id}/{experiment_id}"
         )));
     }
     Ok(())

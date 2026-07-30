@@ -25,7 +25,7 @@ hit "list providers" 200 "$code"
 # 2) create
 code=$(curl -sS -o /tmp/lp.create.json -w "%{http_code}" -X POST "$BASE/api/admin/llm-providers" \
   -H 'content-type: application/json' \
-  -d "{\"providerId\":\"$PID\",\"name\":\"E2E Test\",\"format\":\"openai\",\"baseUrl\":\"https://api.example.invalid/v1\",\"apiKey\":\"sk-real-secret-abc1234567\",\"model\":\"gpt-4o-mini\"}")
+  -d "{\"providerId\":\"$PID\",\"name\":\"E2E Test\",\"format\":\"openai\",\"baseUrl\":\"https://api.example.invalid/v1\",\"apiKey\":\"sk-synthetic-create-key\",\"model\":\"gpt-4o-mini\"}")
 hit "create" 200 "$code"
 masked=$(grep -oE '"apiKeyMasked":"[^"]*"' /tmp/lp.create.json || true)
 if [[ "$masked" == *'****'* ]]; then PASS=$((PASS+1)); log OK "create masks api_key ($masked)"; else FAIL=$((FAIL+1)); log FAIL "create did not mask api_key: $masked"; fi
@@ -39,7 +39,7 @@ hit "update with masked key" 200 "$code"
 # 4) update with real new key
 code=$(curl -sS -o /tmp/lp.update2.json -w "%{http_code}" -X PUT "$BASE/api/admin/llm-providers/$PID" \
   -H 'content-type: application/json' \
-  -d "{\"providerId\":\"$PID\",\"name\":\"E2E Renamed\",\"format\":\"anthropic\",\"baseUrl\":\"https://api.anthropic.invalid\",\"apiKey\":\"sk-ant-new-key-xyz9876\",\"model\":\"claude-haiku-4-5\"}")
+  -d "{\"providerId\":\"$PID\",\"name\":\"E2E Renamed\",\"format\":\"anthropic\",\"baseUrl\":\"https://api.anthropic.invalid\",\"apiKey\":\"sk-synthetic-update-key\",\"model\":\"claude-haiku-4-5\"}")
 hit "update with real key + format switch" 200 "$code"
 
 # 5) activate

@@ -38,7 +38,10 @@ export const useInboxStore = create<InboxState>((set, get) => ({
       ]);
       set({
         items: sortItems(inbox.items),
-        errors: inbox.errors,
+        errors: [...inbox.errors, ...(summary?.errors ?? [])].filter(
+          (error, index, all) =>
+            all.findIndex((candidate) => candidate.source === error.source) === index,
+        ),
         summary: summary ?? get().summary,
         loading: false,
       });

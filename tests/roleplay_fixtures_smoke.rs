@@ -26,7 +26,9 @@ async fn p0_seed_active_profile_round_trips() {
     let app = TestApp::start().await;
     seed_emotional_companion_profile(&app).await;
 
-    let profile = load_active_domain_profile(&app.state.db, EMOTIONAL_COMPANION_WORKSPACE).await;
+    let profile = load_active_domain_profile(&app.state.db, EMOTIONAL_COMPANION_WORKSPACE)
+        .await
+        .expect("load emotional companion profile");
     // 命中的是 seed 的情感陪伴 profile，不是 DEFAULT 回落。
     assert_eq!(profile.profile_id, "emotional_companion_minimal");
     assert!(profile.is_active);
@@ -56,7 +58,9 @@ async fn p0_default_workspace_still_falls_back() {
     seed_emotional_companion_profile(&app).await;
 
     let default_ws = app.state.config.default_workspace_id.clone();
-    let profile = load_active_domain_profile(&app.state.db, &default_ws).await;
+    let profile = load_active_domain_profile(&app.state.db, &default_ws)
+        .await
+        .expect("load default profile");
     // 默认 ws 没 seed 情感 profile → 回落 DEFAULT（profile_id 不是情感的）。
     assert_ne!(profile.profile_id, "emotional_companion_minimal");
 }

@@ -14,6 +14,7 @@
 //! `pub(super) async fn run_step(db: &Database) -> AppResult<()>`；
 //! 跨 step 共享的纯函数 helper 集中在 [`helpers`] 子模块，便于直接单测。
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -22,10 +23,8 @@ use mongodb::{
     options::UpdateOptions,
 };
 
-use crate::error::AppResult;
-use crate::models::MigrationRecord;
-
 use super::Database;
+use crate::error::AppResult;
 
 mod helpers;
 
@@ -81,6 +80,61 @@ pub mod m030_backfill_outcome_event_defaults;
 pub mod m031_backfill_escalation_last_pushed_at;
 pub mod m032_backfill_taxonomy_workspace;
 mod m033_task_commit_indexes;
+mod m034_reconcile_review_fixes;
+mod m035_reconcile_legacy_cleanup;
+mod m036_reconcile_workspace_backfill;
+mod m037_materialize_admin_acl;
+mod m038_scope_outbox_idempotency;
+/// `pub`：集成测试会在启动迁移完成后插入 legacy revision/signal，再直接重跑本步，
+/// 验证精确回填、幂等和歧义 fail-closed。
+pub mod m039_scope_revision_and_behavior_identity;
+/// `pub`: integration tests rerun this corrective migration after seeding
+/// legacy threshold rows to prove election, revision backfill, and idempotency.
+pub mod m040_evolution_release_protocol;
+/// `pub`: integration tests seed legacy duplicate anchors after normal startup,
+/// then rerun the read-only audit to prove fail-closed/no-rewrite behavior.
+pub mod m041_audit_send_ledger_anchors;
+/// `pub`: integration tests seed legacy Soul rows after normal startup and
+/// rerun this reconciliation to prove fail-closed and idempotent behavior.
+pub mod m042_agent_soul_versions;
+/// `pub`: integration tests seed legacy split pointer/status rows after normal
+/// startup and rerun this reconciliation to prove validation-before-write.
+pub mod m043_prompt_single_current;
+/// `pub`: integration tests seed legacy DomainSchema rows after startup and
+/// rerun this pre-index audit to prove ambiguous data fails without rewrites.
+pub mod m044_domain_schema_single_active;
+/// `pub`: integration tests seed legacy relationship review indexes/rows after startup and
+/// rerun this migration to prove exact index retirement and fail-closed pending audits.
+pub mod m045_relationship_review_cycles;
+/// `pub`: integration tests can seed the retired principal-escalation index after startup and
+/// rerun this audit to prove exact retirement and full account-scoped pending identity.
+pub mod m046_scope_principal_escalation_pending;
+/// `pub`: integration tests may rerun the idempotent owner backfill after seeding
+/// legacy pending/new-protocol relay rows and active legacy relay tasks.
+pub mod m047_backfill_principal_awaiting_owners;
+/// `pub`: integration tests may seed zero/multiple current rows after startup
+/// and rerun this deterministic reconciliation before rebuilding unique indexes.
+pub mod m048_ops_single_current;
+/// Corrective rerun for upgraded databases whose m043 marker predates the
+/// planning-only prompt invariant. Integration tests exercise the real marker
+/// transition and startup alignment after this step.
+pub mod m049_reconcile_prompt_planning_currents;
+/// `pub`: integration tests may seed legacy canonical/alias ambiguity and rerun
+/// the validation-before-write identity-claims backfill.
+pub mod m050_taxonomy_identity_claims;
+/// Audit DomainProfile version/current/active identities before unique indexes.
+pub mod m051_domain_profile_release_invariants;
+/// Upgrade legacy catalog work to durable generations with recoverable leases.
+/// Integration tests rerun this idempotent step after seeding legacy jobs.
+pub mod m052_catalog_rebuild_leases;
+/// Upgrade auto-ingest sources to configuration generations and leased claims.
+pub mod m053_ingest_source_claims;
+/// Audit account-scoped Playbook default ownership before the partial unique index.
+pub mod m054_playbook_single_default;
+/// Audit and backfill the one-to-one Lesson promotion identity before unique indexes.
+pub mod m055_lesson_promotion_identity;
+/// Initialize legacy asynchronous import jobs for generation-fenced claims.
+pub mod m056_import_job_claims;
 
 /// Seed the built-in taxonomy template into one workspace without overwriting
 /// any operator-owned row. This is used lazily when an existing/new workspace
@@ -290,34 +344,212 @@ pub const MIGRATIONS: &[Migration] = &[
         id: "2026_07_033_task_commit_indexes",
         run: |db| Box::pin(m033_task_commit_indexes::run_step(db)),
     },
+    Migration {
+        id: "2026_07_034_reconcile_review_fixes",
+        run: |db| Box::pin(m034_reconcile_review_fixes::run_step(db)),
+    },
+    Migration {
+        id: "2026_07_035_reconcile_legacy_cleanup",
+        run: |db| Box::pin(m035_reconcile_legacy_cleanup::run_step(db)),
+    },
+    Migration {
+        id: "2026_07_036_reconcile_workspace_backfill",
+        run: |db| Box::pin(m036_reconcile_workspace_backfill::run_step(db)),
+    },
+    Migration {
+        id: "2026_07_037_materialize_admin_acl",
+        run: |db| Box::pin(m037_materialize_admin_acl::run_step(db)),
+    },
+    Migration {
+        id: "2026_07_038_scope_outbox_idempotency",
+        run: |db| Box::pin(m038_scope_outbox_idempotency::run_step(db)),
+    },
+    Migration {
+        id: "2026_07_039_scope_revision_and_behavior_identity",
+        run: |db| Box::pin(m039_scope_revision_and_behavior_identity::run_step(db)),
+    },
+    Migration {
+        id: "2026_07_040_evolution_release_protocol",
+        run: |db| Box::pin(m040_evolution_release_protocol::run_step(db)),
+    },
+    Migration {
+        id: "2026_07_041_audit_send_ledger_anchors",
+        run: |db| Box::pin(m041_audit_send_ledger_anchors::run_step(db)),
+    },
+    Migration {
+        id: "2026_07_042_agent_soul_versions",
+        run: |db| Box::pin(m042_agent_soul_versions::run_step(db)),
+    },
+    Migration {
+        id: "2026_07_043_prompt_single_current",
+        run: |db| Box::pin(m043_prompt_single_current::run_step(db)),
+    },
+    Migration {
+        id: "2026_07_044_domain_schema_single_active",
+        run: |db| Box::pin(m044_domain_schema_single_active::run_step(db)),
+    },
+    Migration {
+        id: "2026_07_045_relationship_review_cycles",
+        run: |db| Box::pin(m045_relationship_review_cycles::run_step(db)),
+    },
+    Migration {
+        id: "2026_07_046_scope_principal_escalation_pending",
+        run: |db| Box::pin(m046_scope_principal_escalation_pending::run_step(db)),
+    },
+    Migration {
+        id: "2026_07_047_backfill_principal_awaiting_owners",
+        run: |db| Box::pin(m047_backfill_principal_awaiting_owners::run_step(db)),
+    },
+    Migration {
+        id: "2026_07_048_ops_single_current",
+        run: |db| Box::pin(m048_ops_single_current::run_step(db)),
+    },
+    Migration {
+        id: "2026_07_049_reconcile_prompt_planning_currents",
+        run: |db| Box::pin(m049_reconcile_prompt_planning_currents::run_step(db)),
+    },
+    Migration {
+        id: "2026_07_050_taxonomy_identity_claims",
+        run: |db| Box::pin(m050_taxonomy_identity_claims::run_step(db)),
+    },
+    Migration {
+        id: "2026_07_051_domain_profile_release_invariants",
+        run: |db| Box::pin(m051_domain_profile_release_invariants::run_step(db)),
+    },
+    Migration {
+        id: "2026_07_052_catalog_rebuild_leases",
+        run: |db| Box::pin(m052_catalog_rebuild_leases::run_step(db)),
+    },
+    Migration {
+        id: "2026_07_053_ingest_source_claims",
+        run: |db| Box::pin(m053_ingest_source_claims::run_step(db)),
+    },
+    Migration {
+        id: "2026_07_054_playbook_single_default",
+        run: |db| Box::pin(m054_playbook_single_default::run_step(db)),
+    },
+    Migration {
+        id: "2026_07_055_lesson_promotion_identity",
+        run: |db| Box::pin(m055_lesson_promotion_identity::run_step(db)),
+    },
+    Migration {
+        id: "2026_07_056_import_job_claims",
+        run: |db| Box::pin(m056_import_job_claims::run_step(db)),
+    },
 ];
+
+const LEGACY_CLEANUP_APPROVAL: &str = "2026_07_035_reconcile_legacy_cleanup";
+const WORKSPACE_BACKFILL_APPROVAL: &str = "2026_07_036_reconcile_workspace_backfill";
+
+/// Return the exact corrective migration id that must be present in
+/// `APPROVED_MIGRATIONS` before a production process may execute this step.
+fn production_approval_gate(migration_id: &str) -> Option<&'static str> {
+    match migration_id {
+        "2026_05_V3_002_drop_legacy_sales_collections"
+        | "2026_05_V3_003_drop_legacy_taxonomy_seed"
+        | "2026_05_W4_002_drop_trigger_keywords"
+        | LEGACY_CLEANUP_APPROVAL => Some(LEGACY_CLEANUP_APPROVAL),
+        "2026_05_X1_001_backfill_workspace_id_on_legacy_rows" | WORKSPACE_BACKFILL_APPROVAL => {
+            Some(WORKSPACE_BACKFILL_APPROVAL)
+        }
+        _ => None,
+    }
+}
+
+fn approved_migrations_from_env() -> HashSet<String> {
+    std::env::var("APPROVED_MIGRATIONS")
+        .unwrap_or_default()
+        .split([',', ';', ' ', '\n', '\t'])
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
 
 /// 入口函数：扫描 `migrations` 集合，按顺序执行未应用的迁移。
 pub async fn run(db: &Database) -> AppResult<()> {
-    run_with(db, MIGRATIONS).await
+    let production = std::env::var("APP_ENV")
+        .map(|value| value.eq_ignore_ascii_case("production"))
+        .unwrap_or(false);
+    let approvals = approved_migrations_from_env();
+    run_with_policy(db, MIGRATIONS, production, &approvals).await
 }
 
 /// 测试友好的内部入口：允许传入自定义迁移列表，用于单元测试和快照重放。
 pub async fn run_with(db: &Database, migrations: &[Migration]) -> AppResult<()> {
+    run_with_policy(db, migrations, false, &HashSet::new()).await
+}
+
+/// Execute migrations with an explicit environment policy. Exposed so
+/// integration tests can prove the production blocked/approved transition
+/// without mutating process-global environment variables.
+pub async fn run_with_policy(
+    db: &Database,
+    migrations: &[Migration],
+    production: bool,
+    approvals: &HashSet<String>,
+) -> AppResult<()> {
     let collection = db.migrations();
     for migration in migrations {
         let existing = collection
             .find_one(doc! { "_id": migration.id }, None)
             .await?;
-        if existing.is_some() {
+        if existing
+            .as_ref()
+            .is_some_and(|record| record.status.as_deref() != Some("blocked"))
+        {
             tracing::debug!(
                 migration_id = migration.id,
                 "migration already applied, skipping"
             );
             continue;
         }
+
+        if production {
+            if let Some(gate_id) = production_approval_gate(migration.id) {
+                if !approvals.contains(gate_id) {
+                    let reason = format!(
+                        "production approval required: add {gate_id} to APPROVED_MIGRATIONS after backup and ownership verification"
+                    );
+                    collection
+                        .update_one(
+                            doc! { "_id": migration.id },
+                            doc! {
+                                "$set": {
+                                    "status": "blocked",
+                                    "reason": &reason,
+                                    "blocked_at": DateTime::now(),
+                                },
+                                "$unset": { "applied_at": "" },
+                            },
+                            UpdateOptions::builder().upsert(true).build(),
+                        )
+                        .await?;
+                    tracing::warn!(
+                        migration_id = migration.id,
+                        approval_gate = gate_id,
+                        "migration blocked pending explicit production approval"
+                    );
+                    continue;
+                }
+            }
+        }
+
         tracing::info!(migration_id = migration.id, "applying migration");
         (migration.run)(db).await?;
-        let record = MigrationRecord {
-            id: migration.id.to_string(),
-            applied_at: DateTime::now(),
-        };
-        collection.insert_one(record, None).await?;
+        collection
+            .update_one(
+                doc! { "_id": migration.id },
+                doc! {
+                    "$set": {
+                        "status": "applied",
+                        "applied_at": DateTime::now(),
+                    },
+                    "$unset": { "reason": "", "blocked_at": "" },
+                },
+                UpdateOptions::builder().upsert(true).build(),
+            )
+            .await?;
         tracing::info!(migration_id = migration.id, "migration applied");
     }
     Ok(())

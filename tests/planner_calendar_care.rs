@@ -132,7 +132,7 @@ async fn seed_active_profile(db: &wechatagent::db::Database, mut profile: Domain
 #[ignore]
 #[serial]
 async fn calendar_care_emits_for_emotional_profile_today_anniversary() {
-    let app = common::TestApp::start().await;
+    let app = common::TestApp::start_repl_set().await;
 
     // 情感陪伴 profile：calendar 开 + anniversaries date_dimension。
     seed_active_profile(
@@ -201,7 +201,19 @@ async fn calendar_care_emits_for_emotional_profile_today_anniversary() {
         "应写一条 strategic_planner_calendar_care 事件"
     );
 
-    // 幂等：再 tick，已有 pending follow_up → 不重复 emit。
+    // SR-135：即使首轮 task 已离开 active 状态，同一运营日、同一纪念日业务
+    // intent 也必须由稳定身份挡住，不能依赖 has_pending_follow_up 偶然去重。
+    let task_id = tasks[0].id.expect("calendar task id");
+    app.state
+        .db
+        .tasks()
+        .update_one(
+            doc! { "_id": task_id },
+            doc! { "$set": { "status": "sent" } },
+            None,
+        )
+        .await
+        .expect("mark first calendar task terminal");
     planner::tick(&app.state)
         .await
         .expect("second planner tick");
@@ -209,17 +221,32 @@ async fn calendar_care_emits_for_emotional_profile_today_anniversary() {
         .state
         .db
         .tasks()
-        .count_documents(care_filter, None)
+        .count_documents(
+            doc! {
+                "kind": "follow_up",
+                "contact_wxid": "user_companion",
+                "content": { "$regex": "^Planner: calendar_care" },
+            },
+            None,
+        )
         .await
         .expect("count after");
-    assert_eq!(after, 1, "存在 pending follow_up 时应幂等跳过");
+    assert_eq!(after, 1, "task 终态后同日重扫仍只能有一个业务 intent");
+    let events_after = app
+        .state
+        .db
+        .events()
+        .count_documents(doc! { "kind": "strategic_planner_calendar_care" }, None)
+        .await
+        .expect("count events after terminal rescan");
+    assert_eq!(events_after, 1, "重复扫描不得追加第二条 emit 审计");
 }
 
 #[tokio::test]
 #[ignore]
 #[serial]
 async fn calendar_care_no_emit_for_default_sales_profile() {
-    let app = common::TestApp::start().await;
+    let app = common::TestApp::start_repl_set().await;
 
     // DEFAULT 销售 profile：calendar 关、无 date_dimension → scan_calendar 整段 no-op。
     seed_active_profile(&app.state.db, default_domain_profile(WORKSPACE)).await;

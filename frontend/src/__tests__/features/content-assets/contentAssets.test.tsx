@@ -27,12 +27,14 @@ describe("ContentAssetsFeature", () => {
       assets: [
         {
           id: "asset1",
+          accountId: "test123",
           kind: "faq",
           title: "测试FAQ资产",
           body: "这是一个测试FAQ",
           minInjectTier: "lean"
         } as ContentAsset
       ],
+      assetsAccountId: "test123",
       assetDraft: {
         kind: "text",
         title: "",
@@ -40,6 +42,7 @@ describe("ContentAssetsFeature", () => {
         usageScene: "",
         minInjectTier: "full"
       },
+      assetDraftAccountId: "test123",
       setAssetDraft: vi.fn(),
       loadAssets: mockLoadAssets,
       createAsset: vi.fn(),
@@ -144,7 +147,10 @@ describe("ContentAssetsFeature", () => {
 
     fireEvent.click(screen.getByText("删除"));
     expect(confirmSpy).toHaveBeenCalledTimes(1);
-    expect(deleteAsset).toHaveBeenCalledWith("asset1", "test123");
+    expect(deleteAsset).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "asset1", accountId: "test123" }),
+      "test123"
+    );
     confirmSpy.mockRestore();
   });
 
@@ -154,12 +160,14 @@ describe("ContentAssetsFeature", () => {
       assets: [
         {
           id: "f1",
+          accountId: "test123",
           kind: "forbidden_expression",
           title: "保本承诺",
           body: "不得说保本",
           minInjectTier: "full"
         } as ContentAsset
       ],
+      assetsAccountId: "test123",
     });
     render(<ContentAssetsFeature />);
     expect(screen.getByText("恒注入")).toBeInTheDocument();

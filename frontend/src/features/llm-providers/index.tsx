@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Bot,
   Eye,
@@ -26,8 +26,14 @@ type LlmProviderItem = {
   model: string;
   isActive: boolean;
   timeoutSeconds?: number | null;
+  effectiveTimeoutSeconds: number;
+  timeoutSecondsSource: "provider" | "global_default";
   maxRetries?: number | null;
+  effectiveMaxRetries: number;
+  maxRetriesSource: "provider" | "global_default";
   retryBaseMs?: number | null;
+  effectiveRetryBaseMs: number;
+  retryBaseMsSource: "provider" | "global_default";
   supportsVision: boolean;
   isVisionActive: boolean;
   createdAt: number;
@@ -44,6 +50,11 @@ type LlmProviderTestResponse = {
   latencyMs: number;
   preview?: unknown;
   error?: { kind?: string; retryCount?: number; detail?: string; hint?: string };
+  activeUpdateApproval?: {
+    token: string;
+    expectedUpdatedAt: number;
+    expiresAt: number;
+  };
 };
 
 // 协议形态的中性判别值（UI 内部用），与后端品牌字面量解耦。
@@ -51,6 +62,9 @@ type ProtocolFormat = "chat" | "messages";
 
 type LlmProviderDraft = {
   isNew: boolean;
+  isActive: boolean;
+  isVisionActive: boolean;
+  updatedAt: number | null;
   providerId: string;
   name: string;
   format: ProtocolFormat;
@@ -78,9 +92,16 @@ function protocolLabel(format: ProtocolFormat): string {
   return format === "messages" ? "Messages 协议" : "Chat Completions 协议";
 }
 
+function valueSourceLabel(source: "provider" | "global_default"): string {
+  return source === "provider" ? "Provider 覆盖" : "全局默认";
+}
+
 function emptyLlmProviderDraft(): LlmProviderDraft {
   return {
     isNew: true,
+    isActive: false,
+    isVisionActive: false,
+    updatedAt: null,
     providerId: "",
     name: "",
     format: "chat",
@@ -97,6 +118,9 @@ function emptyLlmProviderDraft(): LlmProviderDraft {
 function draftFromItem(item: LlmProviderItem): LlmProviderDraft {
   return {
     isNew: false,
+    isActive: item.isActive,
+    isVisionActive: item.isVisionActive,
+    updatedAt: item.updatedAt,
     providerId: item.providerId,
     name: item.name,
     format: protocolFromWire(item.format),
@@ -119,7 +143,11 @@ export default function LlmProvidersFeature() {
   const [busy, setBusy] = useState(false);
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<LlmProviderTestResponse | null>(null);
+  const [activeUpdateApproval, setActiveUpdateApproval] = useState<
+    LlmProviderTestResponse["activeUpdateApproval"] | null
+  >(null);
   const [showApiKey, setShowApiKey] = useState(false);
+  const draftGenerationRef = useRef(0);
 
   async function refetch() {
     setLoading(true);
@@ -140,18 +168,33 @@ export default function LlmProvidersFeature() {
   }, []);
 
   function startCreate() {
+    draftGenerationRef.current += 1;
     setDraft(emptyLlmProviderDraft());
     setTestResult(null);
+    setActiveUpdateApproval(null);
   }
 
   function startEdit(item: LlmProviderItem) {
+    draftGenerationRef.current += 1;
     setDraft(draftFromItem(item));
     setTestResult(null);
+    setActiveUpdateApproval(null);
   }
 
   function cancelEdit() {
+    draftGenerationRef.current += 1;
     setDraft(null);
     setTestResult(null);
+    setActiveUpdateApproval(null);
+  }
+
+  function changeDraft(patch: Partial<LlmProviderDraft>) {
+    if (!draft) return;
+    draftGenerationRef.current += 1;
+    setDraft({ ...draft, ...patch });
+    setTesting(false);
+    setTestResult(null);
+    setActiveUpdateApproval(null);
   }
 
   function buildUpsertBody(d: LlmProviderDraft) {
@@ -164,15 +207,21 @@ export default function LlmProvidersFeature() {
       model: d.model.trim(),
       supportsVision: d.supportsVision
     };
-    if (d.timeoutSeconds.trim()) {
+    if (!d.timeoutSeconds.trim() && !d.isNew) {
+      body.timeoutSeconds = null;
+    } else if (d.timeoutSeconds.trim()) {
       const v = Number(d.timeoutSeconds);
       if (!Number.isNaN(v) && v > 0) body.timeoutSeconds = Math.floor(v);
     }
-    if (d.maxRetries.trim()) {
+    if (!d.maxRetries.trim() && !d.isNew) {
+      body.maxRetries = null;
+    } else if (d.maxRetries.trim()) {
       const v = Number(d.maxRetries);
       if (!Number.isNaN(v) && v >= 0) body.maxRetries = Math.floor(v);
     }
-    if (d.retryBaseMs.trim()) {
+    if (!d.retryBaseMs.trim() && !d.isNew) {
+      body.retryBaseMs = null;
+    } else if (d.retryBaseMs.trim()) {
       const v = Number(d.retryBaseMs);
       if (!Number.isNaN(v) && v > 0) body.retryBaseMs = Math.floor(v);
     }
@@ -195,12 +244,26 @@ export default function LlmProvidersFeature() {
       if (draft.isNew) {
         await api.post("/api/admin/llm-providers", body);
       } else {
+        if (draft.isActive) {
+          if (!activeUpdateApproval || draft.updatedAt !== activeUpdateApproval.expectedUpdatedAt) {
+            window.alert("当前激活配置必须先对这份草稿完成连通性测试");
+            return;
+          }
+          if (!window.confirm("确认发布这份已测试配置？保存后将立即热切换全部生产对话。")) {
+            return;
+          }
+          body.expectedUpdatedAt = activeUpdateApproval.expectedUpdatedAt;
+          body.activeUpdateConfirmed = true;
+          body.activeUpdateTestToken = activeUpdateApproval.token;
+        }
         await api.put(`/api/admin/llm-providers/${encodeURIComponent(draft.providerId)}`, body);
       }
       await refetch();
       setDraft(null);
       setTestResult(null);
+      setActiveUpdateApproval(null);
     } catch (err) {
+      if (draft.isActive) setActiveUpdateApproval(null);
       window.alert(`保存失败：${(err as Error).message}`);
     } finally {
       setBusy(false);
@@ -210,6 +273,10 @@ export default function LlmProvidersFeature() {
   async function deleteItem(item: LlmProviderItem) {
     if (item.isActive) {
       window.alert("当前激活配置不可删除，请先激活其它供应商");
+      return;
+    }
+    if (item.isVisionActive) {
+      window.alert("当前视觉模型不可删除，请先取消视觉指派或改派其它供应商");
       return;
     }
     if (!window.confirm(`确认删除供应商「${item.name || item.providerId}」？`)) return;
@@ -246,6 +313,13 @@ export default function LlmProvidersFeature() {
       window.alert("该供应商未勾选「支持图片输入」，请先在编辑里勾选后再指派为视觉模型");
       return;
     }
+    if (
+      activeFlag &&
+      !item.isVisionActive &&
+      !window.confirm(`确认将「${item.name || item.providerId}」设为视觉模型？当前视觉指派将被原子替换。`)
+    ) {
+      return;
+    }
     setBusy(true);
     try {
       await api.post(`/api/admin/llm-providers/${encodeURIComponent(item.providerId)}/vision`, {
@@ -260,43 +334,36 @@ export default function LlmProvidersFeature() {
   }
 
   async function runTest() {
+    if (!draft) return;
+    const requestGeneration = draftGenerationRef.current;
     setTestResult(null);
+    setActiveUpdateApproval(null);
     setTesting(true);
     try {
+      const normalized = buildUpsertBody(draft);
       const body: Record<string, unknown> = {};
       if (draft && !draft.isNew) {
-        body.providerId = draft.providerId;
-        body.format = toWireFormat(draft.format);
-        body.baseUrl = draft.baseUrl;
-        body.model = draft.model;
-        if (draft.apiKey && !draft.apiKey.includes("****")) body.apiKey = draft.apiKey;
-        if (draft.timeoutSeconds.trim()) {
-          const v = Number(draft.timeoutSeconds);
-          if (!Number.isNaN(v) && v > 0) body.timeoutSeconds = Math.floor(v);
-        }
+        Object.assign(body, normalized);
+        if (draft.apiKey.includes("****")) delete body.apiKey;
       } else if (draft) {
-        body.format = toWireFormat(draft.format);
-        body.baseUrl = draft.baseUrl;
-        body.apiKey = draft.apiKey;
-        body.model = draft.model;
-        if (draft.timeoutSeconds.trim()) {
-          const v = Number(draft.timeoutSeconds);
-          if (!Number.isNaN(v) && v > 0) body.timeoutSeconds = Math.floor(v);
-        }
+        Object.assign(body, normalized);
       }
       const result = await api.post<LlmProviderTestResponse>(
         "/api/admin/llm-providers/test",
         body
       );
+      if (draftGenerationRef.current !== requestGeneration) return;
       setTestResult(result);
+      setActiveUpdateApproval(result.ok ? result.activeUpdateApproval ?? null : null);
     } catch (err) {
+      if (draftGenerationRef.current !== requestGeneration) return;
       setTestResult({
         ok: false,
         latencyMs: 0,
         error: { kind: "client_error", detail: (err as Error).message }
       });
     } finally {
-      setTesting(false);
+      if (draftGenerationRef.current === requestGeneration) setTesting(false);
     }
   }
 
@@ -394,8 +461,9 @@ export default function LlmProvidersFeature() {
                     <div className={styles.metaRow}>
                       <dt>超时 / 重试</dt>
                       <dd>
-                        {item.timeoutSeconds ?? "默认"}s · 重试 {item.maxRetries ?? "默认"} 次 · 退避基线{" "}
-                        {item.retryBaseMs ?? "默认"}ms
+                        {item.effectiveTimeoutSeconds}s（{valueSourceLabel(item.timeoutSecondsSource)}） · 重试{" "}
+                        {item.effectiveMaxRetries} 次（{valueSourceLabel(item.maxRetriesSource)}） · 退避基线{" "}
+                        {item.effectiveRetryBaseMs}ms（{valueSourceLabel(item.retryBaseMsSource)}）
                       </dd>
                     </div>
                   </dl>
@@ -445,8 +513,14 @@ export default function LlmProvidersFeature() {
                       type="button"
                       className={styles.btnDanger}
                       onClick={() => void deleteItem(item)}
-                      disabled={busy || item.isActive}
-                      title={item.isActive ? "请先激活其它供应商后再删除" : "删除"}
+                      disabled={busy || item.isActive || item.isVisionActive}
+                      title={
+                        item.isActive
+                          ? "请先激活其它供应商后再删除"
+                          : item.isVisionActive
+                            ? "请先取消视觉指派或改派其它供应商"
+                            : "删除"
+                      }
                     >
                       <Trash2 size={13} /> 删除
                     </button>
@@ -489,7 +563,7 @@ export default function LlmProvidersFeature() {
             <button
               type="button"
               className={`${styles.protoCard}${draft.format === "chat" ? ` ${styles.protoCardSelected}` : ""}`}
-              onClick={() => setDraft({ ...draft, format: "chat" })}
+              onClick={() => changeDraft({ format: "chat" })}
               disabled={busy}
             >
               <div className={styles.protoTitle}>Chat Completions 协议</div>
@@ -499,7 +573,7 @@ export default function LlmProvidersFeature() {
             <button
               type="button"
               className={`${styles.protoCard}${draft.format === "messages" ? ` ${styles.protoCardSelected}` : ""}`}
-              onClick={() => setDraft({ ...draft, format: "messages" })}
+              onClick={() => changeDraft({ format: "messages" })}
               disabled={busy}
             >
               <div className={styles.protoTitle}>Messages 协议</div>
@@ -515,7 +589,7 @@ export default function LlmProvidersFeature() {
               <input
                 className={styles.input}
                 value={draft.providerId}
-                onChange={(e) => setDraft({ ...draft, providerId: e.target.value })}
+                onChange={(e) => changeDraft({ providerId: e.target.value })}
                 disabled={!draft.isNew || busy}
                 placeholder="如 my-llm-prod / gateway-a"
               />
@@ -526,7 +600,7 @@ export default function LlmProvidersFeature() {
               <input
                 className={styles.input}
                 value={draft.name}
-                onChange={(e) => setDraft({ ...draft, name: e.target.value })}
+                onChange={(e) => changeDraft({ name: e.target.value })}
                 disabled={busy}
                 placeholder="便于识别的展示名"
               />
@@ -536,7 +610,7 @@ export default function LlmProvidersFeature() {
               <input
                 className={styles.input}
                 value={draft.model}
-                onChange={(e) => setDraft({ ...draft, model: e.target.value })}
+                onChange={(e) => changeDraft({ model: e.target.value })}
                 disabled={busy}
                 placeholder={
                   draft.format === "messages"
@@ -554,7 +628,7 @@ export default function LlmProvidersFeature() {
               <input
                 className={styles.input}
                 value={draft.baseUrl}
-                onChange={(e) => setDraft({ ...draft, baseUrl: e.target.value })}
+                onChange={(e) => changeDraft({ baseUrl: e.target.value })}
                 disabled={busy}
                 placeholder={
                   draft.format === "messages"
@@ -583,7 +657,7 @@ export default function LlmProvidersFeature() {
                   className={styles.input}
                   type={showApiKey ? "text" : "password"}
                   value={draft.apiKey}
-                  onChange={(e) => setDraft({ ...draft, apiKey: e.target.value })}
+                  onChange={(e) => changeDraft({ apiKey: e.target.value })}
                   disabled={busy}
                   placeholder={draft.isNew ? "请填写 apiKey" : "保留 mask 占位则不更新"}
                   autoComplete="new-password"
@@ -614,9 +688,9 @@ export default function LlmProvidersFeature() {
                 type="number"
                 min={1}
                 value={draft.timeoutSeconds}
-                onChange={(e) => setDraft({ ...draft, timeoutSeconds: e.target.value })}
+                onChange={(e) => changeDraft({ timeoutSeconds: e.target.value })}
                 disabled={busy}
-                placeholder="默认沿用 .env"
+                placeholder="留空则使用全局默认"
               />
             </label>
             <label className={styles.field}>
@@ -626,9 +700,9 @@ export default function LlmProvidersFeature() {
                 type="number"
                 min={0}
                 value={draft.maxRetries}
-                onChange={(e) => setDraft({ ...draft, maxRetries: e.target.value })}
+                onChange={(e) => changeDraft({ maxRetries: e.target.value })}
                 disabled={busy}
-                placeholder="默认 3"
+                placeholder="留空则使用全局默认"
               />
             </label>
             <label className={styles.field}>
@@ -638,9 +712,9 @@ export default function LlmProvidersFeature() {
                 type="number"
                 min={1}
                 value={draft.retryBaseMs}
-                onChange={(e) => setDraft({ ...draft, retryBaseMs: e.target.value })}
+                onChange={(e) => changeDraft({ retryBaseMs: e.target.value })}
                 disabled={busy}
-                placeholder="默认 1500"
+                placeholder="留空则使用全局默认"
               />
             </label>
           </div>
@@ -652,7 +726,13 @@ export default function LlmProvidersFeature() {
                 className={styles.checkbox}
                 type="checkbox"
                 checked={draft.supportsVision}
-                onChange={(e) => setDraft({ ...draft, supportsVision: e.target.checked })}
+                onChange={(e) => {
+                  if (draft.isVisionActive && !e.target.checked) {
+                    window.alert("当前供应商仍是视觉模型，请先取消视觉指派或改派其它供应商");
+                    return;
+                  }
+                  changeDraft({ supportsVision: e.target.checked });
+                }}
                 disabled={busy}
               />
               <span>支持图片输入（多模态视觉）</span>
@@ -684,9 +764,14 @@ export default function LlmProvidersFeature() {
               type="button"
               className={styles.btnPrimary}
               onClick={() => void saveDraft()}
-              disabled={busy}
+              disabled={busy || (draft.isActive && !activeUpdateApproval)}
+              title={
+                draft.isActive && !activeUpdateApproval
+                  ? "请先对当前草稿完成连通性测试"
+                  : undefined
+              }
             >
-              {draft.isNew ? "创建" : "保存"}
+              {draft.isNew ? "创建" : draft.isActive ? "确认发布" : "保存"}
             </button>
           </div>
 
@@ -699,11 +784,16 @@ export default function LlmProvidersFeature() {
                 <span>耗时 {testResult.latencyMs} ms</span>
               </div>
               {testResult.ok ? (
-                <pre className={styles.testBody}>
-                  {typeof testResult.preview === "string"
-                    ? testResult.preview
-                    : JSON.stringify(testResult.preview, null, 2)}
-                </pre>
+                <div className={styles.testBody}>
+                  {draft.isActive && activeUpdateApproval && (
+                    <div>该测试结果可用于一次“确认发布”，修改任何字段后需重新测试。</div>
+                  )}
+                  <pre>
+                    {typeof testResult.preview === "string"
+                      ? testResult.preview
+                      : JSON.stringify(testResult.preview, null, 2)}
+                  </pre>
+                </div>
               ) : (
                 <div className={styles.testBody}>
                   <div>

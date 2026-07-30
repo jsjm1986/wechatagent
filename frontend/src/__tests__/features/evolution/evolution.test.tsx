@@ -25,7 +25,29 @@ describe("EvolutionFeature", () => {
         } as Response;
       }
       // /api/evolution/experiments
-      return { ok: true, json: async () => ({ items: [] }) } as Response;
+      const now = new Date().toISOString();
+      return {
+        ok: true,
+        json: async () => ({
+          items: [],
+          aggregate7d: {
+            experiments: 0,
+            proposals: 0,
+            released: 0,
+            rolledBack: 0,
+            significancePassRate: null,
+            coverage: {
+              complete: true,
+              source: "server_time_window",
+              windowHours: 168,
+              windowStart: now,
+              windowEnd: now,
+              asOf: now,
+              experimentsScanned: 0,
+            },
+          },
+        }),
+      } as Response;
     }) as typeof fetch;
 
     render(<EvolutionFeature />);

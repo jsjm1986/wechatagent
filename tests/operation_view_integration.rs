@@ -69,6 +69,7 @@ fn make_active_profile(workspace_id: &str, dimensions: Vec<ProfileDimension>) ->
         debounce_window_ms_override: None,
         current_version: true,
         previous_version: None,
+        release_status: "published".to_string(),
         is_active: true,
         seeded_by: Some("manual".to_string()),
         created_at: DateTime::now(),
@@ -154,8 +155,12 @@ async fn active_view_returns_dimensions_and_taxonomy_labels() {
 
     // 重新预热两个进程级缓存，使其对齐本测试刚种入的 DB 状态（warm_up 忽略 TTL
     // 无条件 reload；与 TestApp::start 内启动期预热同源）。
-    wechatagent::agent::init_global_taxonomy_cache(&db).await;
-    wechatagent::agent::init_global_domain_profile_cache(&db).await;
+    wechatagent::agent::init_global_taxonomy_cache(&db)
+        .await
+        .expect("warm taxonomy cache");
+    wechatagent::agent::init_global_domain_profile_cache(&db)
+        .await
+        .expect("warm domain profile cache");
 
     // 直调真 handler。
     let response = wechatagent::routes::operation_view::active_view(

@@ -1,7 +1,9 @@
-//! Phase C / C5：threshold proposal 自动 release（hold_rate close-loop）。
+//! Phase C / C5 历史 threshold auto-release 实现（HC-017 当前政策休眠）。
 //!
-//! Roadmap 原话："近 N 周（默认 14d）`hold_rate` 跌破阈值时自动写
-//! `threshold_overrides.gate_key`，经 `post_release` 评估通过才生效"。
+//! 当前产品边界是“全部 proposal 人工发布”。[`CURRENT_AUTO_RELEASE_POLICY_ENABLED`]
+//! 固定为 false，因此配置总闸和 workspace 子闸即使同时误开，本模块也在任何查询或
+//! 写入前返回零。下方决策实现仅为将来经产品确认后加入“类型+方向白名单”保留，
+//! 不能被现有配置单独激活。
 //!
 //! 触发链路：
 //! 1. 演化器 tick 末尾调 [`auto_release_eligible_thresholds`]；
@@ -15,10 +17,8 @@
 //!    "经 post_release 评估通过才生效"由现有 review 路径承担（不自动回滚 ——
 //!    Requirements 9.7：post-release 仅观测，回滚必须经 admin）。
 //!
-//! 自动通道**仅适用于 threshold**（纯统计可观测）；prompt 候选不在此路径，仍要
-//! admin 二次确认走 `POST /api/evolution/proposals/:id/release`。
-//!
-//! `evolution_auto_release_enabled=false` 时整段函数立即 return，零侧效。
+//! 历史实现仅覆盖 threshold；prompt 从未进入该路径。rollback 始终只能由 admin
+//! 发起。若未来开放白名单，仍必须先修改代码政策常量并补齐方向化回归证据。
 //!
 //! **隔离红线**：本文件继承 `evolution/` 模块的红线——严禁引用
 //! `crate::agent::gateway / outbox`、`crate::mcp::*` 等生产链路入口。
@@ -33,28 +33,35 @@ use crate::routes::AppState;
 use super::error::EvolutionError;
 use super::threshold::THRESHOLD_REASONABLE_BANDS;
 
-/// EVO-3:auto_release 双闸 —— env 全局总闸 AND per-workspace 子闸。
-/// 总闸关:整段不跑。总闸开:再看该 workspace 的 threshold_auto_release_enabled
-/// (文档缺失视作 None→关,默认保守不自动 release,镜像 is_evolution_enabled_for)。
+/// Product policy (HC-017): every Evolution proposal requires a human release
+/// during the current pre-production phase. Configuration flags remain in the
+/// schema for a future typed/directional allowlist, but cannot enable automatic
+/// release until this policy constant is deliberately changed with new tests.
+pub const CURRENT_AUTO_RELEASE_POLICY_ENABLED: bool = false;
+
+/// 代码政策硬闸 AND 历史 env 总闸 AND workspace 子闸。当前第一项恒 false。
 fn auto_release_gate_open(env_enabled: bool, flag_threshold_enabled: Option<bool>) -> bool {
-    env_enabled && flag_threshold_enabled.unwrap_or(false)
+    CURRENT_AUTO_RELEASE_POLICY_ENABLED && env_enabled && flag_threshold_enabled.unwrap_or(false)
 }
 
 /// 单 tick 自动 release 主入口。返回本 tick 实际触发自动 release 的条数。
 ///
-/// `evolution_auto_release_enabled=false` → 立即 return Ok(0)。任何下游错误均
+/// 当前代码政策硬闸为 false → 立即 return Ok(0)。任何下游错误均
 /// 被吞掉转 warn，避免一条候选的失败拖累整个 tick；调用方（`run_one_tick`）也
 /// 已用 `unwrap_or_else` 兜底。
-pub async fn auto_release_eligible_thresholds(state: &AppState) -> Result<usize, EvolutionError> {
-    if !state.config.evolution_auto_release_enabled {
+pub async fn auto_release_eligible_thresholds(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+) -> Result<usize, EvolutionError> {
+    if !CURRENT_AUTO_RELEASE_POLICY_ENABLED || !state.config.evolution_auto_release_enabled {
         return Ok(0);
     }
-    let workspace_id = state.config.default_workspace_id.clone();
     // EVO-3:总闸(env)开后,再读该 workspace 的子闸 threshold_auto_release_enabled。
     // 子闸关/文档缺失/读失败 → 不自动 release(保守,镜像 is_evolution_enabled_for 顺序)。
     // load_runtime_flag 返回 AppResult,这里 .ok().flatten() 把读失败也视作"子闸未开"——
     // auto_release 整体 best-effort,调用方 run_one_tick 已 unwrap_or_else 兜底,不让读失败透传。
-    let flag_threshold = crate::evolution::runtime_flag::load_runtime_flag(state, &workspace_id)
+    let flag_threshold = crate::evolution::runtime_flag::load_runtime_flag(state, workspace_id)
         .await
         .ok()
         .flatten()
@@ -62,7 +69,6 @@ pub async fn auto_release_eligible_thresholds(state: &AppState) -> Result<usize,
     if !auto_release_gate_open(state.config.evolution_auto_release_enabled, flag_threshold) {
         return Ok(0);
     }
-    let account_id = state.config.default_account_id.clone();
     let cap = state.config.evolution_auto_release_per_tick_cap.max(1);
     let window_hours = state.config.evolution_auto_release_window_hours.max(1) as i64;
 
@@ -72,8 +78,8 @@ pub async fn auto_release_eligible_thresholds(state: &AppState) -> Result<usize,
         .proposals()
         .find(
             doc! {
-                "workspace_id": &workspace_id,
-                "account_id": &account_id,
+                "workspace_id": workspace_id,
+                "account_id": account_id,
                 "proposal_kind": "threshold",
                 "status": "eligible_for_release",
             },
@@ -96,7 +102,7 @@ pub async fn auto_release_eligible_thresholds(state: &AppState) -> Result<usize,
             .saturating_sub(window_hours * 3600 * 1000),
     );
     let hit_rates =
-        compute_window_gate_hit_rates(state, &workspace_id, &account_id, window_start).await?;
+        compute_window_gate_hit_rates(state, workspace_id, account_id, window_start).await?;
 
     // 2.5-main-4：负反应强制门。仅当开关开启时算一次当前窗口的**绝对**负反应率
     // （per-tick 复用给所有候选，与 hit_rates 同窗口 [window_start, now) 同口径、
@@ -108,8 +114,8 @@ pub async fn auto_release_eligible_thresholds(state: &AppState) -> Result<usize,
     let negative_reaction_rate = if neg_gate_enabled {
         super::post_release::compute_negative_reaction_rate(
             state,
-            &workspace_id,
-            &account_id,
+            workspace_id,
+            account_id,
             window_start,
             now,
         )
@@ -177,8 +183,8 @@ pub async fn auto_release_eligible_thresholds(state: &AppState) -> Result<usize,
         // 决策事件先写——无论 release 成功失败都留审计。
         let _ = write_auto_release_decision_event(
             state,
-            &workspace_id,
-            &account_id,
+            workspace_id,
+            account_id,
             proposal_id,
             gate_key,
             observed,
@@ -194,7 +200,14 @@ pub async fn auto_release_eligible_thresholds(state: &AppState) -> Result<usize,
             continue;
         }
 
-        match super::release::release_threshold(state, proposal_id, "evolution_auto_release").await
+        match super::release::release_threshold(
+            state,
+            proposal_id,
+            workspace_id,
+            account_id,
+            "evolution_auto_release",
+        )
+        .await
         {
             Ok(()) => {
                 released += 1;
@@ -574,7 +587,9 @@ mod tests {
         // 总闸开 + 子闸关/缺失 → false(默认保守)
         assert!(!super::auto_release_gate_open(true, Some(false)));
         assert!(!super::auto_release_gate_open(true, None));
-        // 总闸开 + 子闸开 → true
-        assert!(super::auto_release_gate_open(true, Some(true)));
+        // Current product policy requires human release even when both legacy
+        // configuration gates are accidentally enabled.
+        assert!(!super::auto_release_gate_open(true, Some(true)));
+        assert!(!super::CURRENT_AUTO_RELEASE_POLICY_ENABLED);
     }
 }

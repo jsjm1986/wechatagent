@@ -935,7 +935,7 @@ pub async fn refresh_usage_stats_and_confidence(
     // DEFAULT_PROFILE seed 与回落同源 → 销售域字节等价。命中 1G-c 的 30s TTL 缓存。
     let (positive_outcomes, negative_outcomes) = if real_outcome_enabled {
         let profile =
-            crate::agent::domain_profile::load_active_domain_profile(db, workspace_id).await;
+            crate::agent::domain_profile::load_active_domain_profile(db, workspace_id).await?;
         resolve_effective_polarity(&profile.outcome_polarity)
     } else {
         // 回滚路径不查极性（走 review_approved），省一次 profile 解析。
@@ -1132,10 +1132,10 @@ pub async fn refresh_usage_stats_and_confidence(
 
 /// H11-linkage（spec §9 #9）：算出本批 usage logs 里被「已核实成交」追认的 log 下标。
 ///
-/// 按 `contact_wxid` 分组（无 contact_wxid 的 log 不参与——无成交归属），批量拉这些
-/// contact 的 `outcome_events`（一次 `find`，IDOR：filter 必含 workspace_id），对每个
-/// contact 用 [`crate::agent::entitlements::confirmed_deal_timestamps`] 取已核实正向
-/// 成交时刻，再用 [`attributed_log_indices`] 算"成交前最近 N 轮" log，映射回全局下标。
+/// 按 `(account_id, contact_wxid)` 分组（无 contact_wxid 的 log 不参与——无成交归属），
+/// 批量拉这些 contact 的 `outcome_events`（IDOR：filter 必含 workspace_id），对每个
+/// account/contact 用 [`crate::agent::entitlements::confirmed_deal_timestamps`] 取已核实
+/// 正向成交时刻，再用 [`attributed_log_indices`] 算"成交前最近 N 轮" log，映射回全局下标。
 ///
 /// best-effort 边界：无 contact_wxid 的 log、无成交的 contact → 不贡献追认。空批/全无
 /// 成交 → 返回空集（零扰动）。
@@ -1144,12 +1144,14 @@ async fn compute_deal_attributed_log_indices(
     workspace_id: &str,
     logs: &[crate::models::KnowledgeUsageLog],
 ) -> Result<HashSet<usize>, AppError> {
-    // contact_wxid → 该 contact 名下 (全局下标, created_at_ms) 列表。
-    let mut by_contact: HashMap<String, Vec<(usize, i64)>> = HashMap::new();
+    // (account_id, contact_wxid) → 该账号下 contact 的
+    // (全局下标, created_at_ms) 列表。同 workspace 不同账号可有相同 wxid，裸 wxid
+    // 分组会把账号 A 的成交错误追认到账号 B 的知识日志。
+    let mut by_contact: HashMap<(String, String), Vec<(usize, i64)>> = HashMap::new();
     for (idx, log) in logs.iter().enumerate() {
         if let Some(wxid) = log.contact_wxid.as_deref().filter(|w| !w.is_empty()) {
             by_contact
-                .entry(wxid.to_string())
+                .entry((log.account_id.clone(), wxid.to_string()))
                 .or_default()
                 .push((idx, log.created_at.timestamp_millis()));
         }
@@ -1158,12 +1160,27 @@ async fn compute_deal_attributed_log_indices(
         return Ok(HashSet::new());
     }
 
-    // 批量拉这些 contact 的 outcome_events（IDOR：filter 含 workspace_id）。
-    let wxids: Vec<&String> = by_contact.keys().collect();
+    // 一次拉回本 workspace 的候选账号/wxid；随后仍以复合键精确关联。
+    let account_ids: Vec<String> = by_contact
+        .keys()
+        .map(|(account_id, _)| account_id.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let wxids: Vec<String> = by_contact
+        .keys()
+        .map(|(_, wxid)| wxid.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
     let cursor = db
         .contacts()
         .find(
-            doc! { "workspace_id": workspace_id, "wxid": { "$in": &wxids } },
+            doc! {
+                "workspace_id": workspace_id,
+                "account_id": { "$in": &account_ids },
+                "wxid": { "$in": &wxids },
+            },
             None,
         )
         .await
@@ -1173,7 +1190,8 @@ async fn compute_deal_attributed_log_indices(
 
     let mut attributed: HashSet<usize> = HashSet::new();
     for contact in &contacts {
-        let Some(entries) = by_contact.get(&contact.wxid) else {
+        let key = (contact.account_id.clone(), contact.wxid.clone());
+        let Some(entries) = by_contact.get(&key) else {
             continue;
         };
         let deal_times: Vec<i64> =

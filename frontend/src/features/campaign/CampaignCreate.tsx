@@ -7,7 +7,8 @@ import { ProductMultiSelect } from "./ProductMultiSelect";
 import { StageSelect } from "./StageSelect";
 import styles from "./Campaign.module.css";
 
-interface PreviewResult { campaignId: string; targetCount: number; samples: { wxid: string; name: string }[]; }
+interface CampaignSpecIdentity { campaignId?: string; id?: string; specVersion: number; specHash: string; }
+interface PreviewResult extends CampaignSpecIdentity { campaignId: string; targetCount: number; samples: { wxid: string; name: string }[]; }
 
 export default function CampaignCreate() {
   const setView = useCampaignStore((s) => s.setView);
@@ -22,6 +23,8 @@ export default function CampaignCreate() {
   const [aftercare, setAftercare] = useState("");
   const [valueTier, setValueTier] = useState("");
   const [draftCampaignId, setDraftCampaignId] = useState<string | null>(null);
+  const [draftSpecVersion, setDraftSpecVersion] = useState<number | null>(null);
+  const [draftDirty, setDraftDirty] = useState(false);
   const [preview, setPreview] = useState<PreviewResult | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -41,15 +44,34 @@ export default function CampaignCreate() {
     setBusy(true);
     try {
       let id = draftCampaignId;
+      let specVersion = draftSpecVersion;
       if (!id) {
-        const created = await api.post<{ id: string }>("/api/campaigns", {
+        const created = await api.post<CampaignSpecIdentity & { id: string }>("/api/campaigns", {
           title: title.trim(), intentText: intentText.trim(), segmentFilter: segmentFilter(),
           accountId: currentAccountId() || undefined,
         });
         id = created.id;
+        specVersion = created.specVersion;
         setDraftCampaignId(id);
+        setDraftSpecVersion(specVersion);
+        setDraftDirty(false);
+      } else if (draftDirty) {
+        if (specVersion === null) throw new Error("活动规格版本缺失，请重新创建活动");
+        const updated = await api.patch<CampaignSpecIdentity>(`/api/campaigns/${id}`, {
+          title: title.trim(),
+          intentText: intentText.trim(),
+          segmentFilter: segmentFilter(),
+          expectedSpecVersion: specVersion,
+        });
+        if (updated.campaignId !== id) throw new Error("活动规格身份不匹配，请刷新后重试");
+        specVersion = updated.specVersion;
+        setDraftSpecVersion(specVersion);
+        setDraftDirty(false);
       }
       const r = await api.post<PreviewResult>(`/api/campaigns/${id}/preview`, {});
+      if (r.campaignId !== id || r.specVersion !== specVersion) {
+        throw new Error("活动预览规格已变化，请重新预览");
+      }
       setPreview(r);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -58,8 +80,12 @@ export default function CampaignCreate() {
     }
   };
 
-  // 改任一条件 → 作废旧 preview（但保留 draftCampaignId 复用），下次预览用同一 draft 重新圈人
-  const onCondChange = <T,>(setter: (v: T) => void) => (v: T) => { setter(v); setPreview(null); };
+  // 任一规格字段变化都使旧预览/确认身份失效；下一次预览先 CAS 保存完整草稿。
+  const onSpecChange = <T,>(setter: (v: T) => void) => (v: T) => {
+    setter(v);
+    setPreview(null);
+    setDraftDirty(true);
+  };
 
   return (
     <div className={styles.page}>
@@ -75,26 +101,26 @@ export default function CampaignCreate() {
         <div className={styles.form}>
           <label className={styles.field}>
             <span className={styles.fieldLabel}>活动标题</span>
-            <input className={styles.input} value={title} onChange={(e) => setTitle(e.target.value)} placeholder="如：双11老客续费7折" />
+            <input className={styles.input} value={title} onChange={(e) => onSpecChange(setTitle)(e.target.value)} placeholder="如：双11老客续费7折" />
           </label>
           <label className={styles.field}>
             <span className={styles.fieldLabel}>活动意图</span>
-            <textarea className={styles.textarea} value={intentText} onChange={(e) => setIntentText(e.target.value)} placeholder="活动要点，将作为给客户推送的语境，由 AI 据各自画像生成个性化话术" />
+            <textarea className={styles.textarea} value={intentText} onChange={(e) => onSpecChange(setIntentText)(e.target.value)} placeholder="活动要点，将作为给客户推送的语境，由 AI 据各自画像生成个性化话术" />
           </label>
 
           <div className={styles.fieldLabel}>圈人条件（各项可选，留空即不限）</div>
           <label className={styles.field}>
             <span className={styles.fieldSub}>买过的产品</span>
-            <ProductMultiSelect value={productIds} onChange={onCondChange(setProductIds)} />
+            <ProductMultiSelect value={productIds} onChange={onSpecChange(setProductIds)} />
           </label>
           <div className={styles.fieldRow}>
             <label className={styles.field}>
               <span className={styles.fieldSub}>客户阶段</span>
-              <StageSelect value={customerStage} onChange={onCondChange(setCustomerStage)} />
+              <StageSelect value={customerStage} onChange={onSpecChange(setCustomerStage)} />
             </label>
             <label className={styles.field}>
               <span className={styles.fieldSub}>售后状态</span>
-              <select className={styles.select} value={aftercare} onChange={(e) => onCondChange(setAftercare)(e.target.value)}>
+              <select className={styles.select} value={aftercare} onChange={(e) => onSpecChange(setAftercare)(e.target.value)}>
                 <option value="">不限</option>
                 <option value="in_aftercare">售后中</option>
                 <option value="expired">已到期</option>
@@ -102,7 +128,7 @@ export default function CampaignCreate() {
             </label>
             <label className={styles.field}>
               <span className={styles.fieldSub}>价值分层</span>
-              <select className={styles.select} value={valueTier} onChange={(e) => onCondChange(setValueTier)(e.target.value)}>
+              <select className={styles.select} value={valueTier} onChange={(e) => onSpecChange(setValueTier)(e.target.value)}>
                 <option value="">不限</option>
                 <option value="high">高</option>
                 <option value="mid">中</option>
@@ -126,6 +152,7 @@ export default function CampaignCreate() {
             </div>
           </div>
           <p className={styles.previewNote}>实际推送时会重新圈选，人数可能微调。</p>
+          <p className={styles.fieldHint}>已冻结确认身份：规格 v{preview.specVersion} · {preview.specHash.slice(0, 12)}…</p>
           {preview.samples.length > 0 && (
             <div className={styles.samples}>
               {preview.samples.map((s) => (

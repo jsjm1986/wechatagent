@@ -82,7 +82,7 @@ async fn insert(app: &TestApp, chunks: &[OperationKnowledgeChunk]) {
 #[tokio::test]
 #[ignore]
 async fn batch_verify_marks_three_chunks_verified() {
-    let app = TestApp::start().await;
+    let app = TestApp::start_repl_set().await;
     let ws = app.state.config.default_workspace_id.clone();
 
     let c1 = verifiable_chunk(&ws, "三步价格异议");
@@ -137,7 +137,7 @@ async fn batch_verify_marks_three_chunks_verified() {
 #[tokio::test]
 #[ignore]
 async fn batch_archive_skips_already_archived() {
-    let app = TestApp::start().await;
+    let app = TestApp::start_repl_set().await;
     let ws = app.state.config.default_workspace_id.clone();
 
     let mut c_active = verifiable_chunk(&ws, "活跃 chunk A");
@@ -158,7 +158,6 @@ async fn batch_archive_skips_already_archived() {
         Json(ChunkBatchArchiveRequest {
             ids: vec![id_a.clone(), id_b.clone(), id_arch.clone()],
             reason: Some("end-of-life".to_string()),
-            actor: Some("admin".to_string()),
         }),
     )
     .await
@@ -331,7 +330,7 @@ async fn revisions_for(
 #[tokio::test]
 #[ignore]
 async fn verify_writes_chunk_revision_audit_entry() {
-    let app = TestApp::start().await;
+    let app = TestApp::start_repl_set().await;
     let ws = app.state.config.default_workspace_id.clone();
 
     let chunk = verifiable_chunk(&ws, "单条 verify 审计链");
@@ -389,7 +388,7 @@ async fn verify_writes_chunk_revision_audit_entry() {
 #[tokio::test]
 #[ignore]
 async fn reject_writes_chunk_revision_with_reject_op() {
-    let app = TestApp::start().await;
+    let app = TestApp::start_repl_set().await;
     let ws = app.state.config.default_workspace_id.clone();
 
     let chunk = verifiable_chunk(&ws, "单条 reject 审计链");
@@ -425,7 +424,7 @@ async fn reject_writes_chunk_revision_with_reject_op() {
 #[tokio::test]
 #[ignore]
 async fn batch_verify_writes_one_revision_per_chunk() {
-    let app = TestApp::start().await;
+    let app = TestApp::start_repl_set().await;
     let ws = app.state.config.default_workspace_id.clone();
 
     let c1 = verifiable_chunk(&ws, "批量 A");
@@ -517,7 +516,7 @@ async fn verify_gate_blocks_and_writes_no_revision_without_anchor() {
 #[tokio::test]
 #[ignore]
 async fn auto_verify_writes_one_revision_per_processed_chunk() {
-    let app = TestApp::start().await;
+    let app = TestApp::start_repl_set().await;
     let ws = app.state.config.default_workspace_id.clone();
     let account_id = app.state.config.default_account_id.clone();
 

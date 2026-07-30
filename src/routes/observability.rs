@@ -21,7 +21,7 @@
 
 use axum::{extract::State, Extension, Json};
 use futures::TryStreamExt;
-use mongodb::bson::{doc, Document};
+use mongodb::bson::{doc, DateTime, Document};
 use serde_json::{json, Value};
 
 use crate::{
@@ -51,18 +51,107 @@ pub(super) async fn phase_rollup(
     Extension(admin): Extension<AuthenticatedAdmin>,
 ) -> AppResult<Json<Value>> {
     let workspace = admin.current_workspace.clone();
+    let as_of_ms = now_ms();
+    let window_start_ms = as_of_ms - WINDOW_MS;
 
-    let lifecycle = aggregate_lifecycle(&state, &workspace).await?;
-    let hold_breakdown = aggregate_hold_breakdown(&state, &workspace).await?;
-    let revision_reasons = aggregate_revision_reasons(&state, &workspace).await?;
-    let reviewer_misjudge = aggregate_reviewer_misjudge(&state, &workspace).await?;
+    let lifecycle = aggregate_lifecycle(&state, &workspace, window_start_ms, as_of_ms).await?;
+    let hold_breakdown =
+        aggregate_hold_breakdown(&state, &workspace, window_start_ms, as_of_ms).await?;
+    let revision_reasons =
+        aggregate_revision_reasons(&state, &workspace, window_start_ms, as_of_ms).await?;
+    let reviewer_misjudge =
+        aggregate_reviewer_misjudge(&state, &workspace, window_start_ms, as_of_ms).await?;
     let reviewer_stats = read_reviewer_stats(&state, &workspace).await?;
     let negative_example_pending = count_negative_example_pending(&state, &workspace).await?;
-    let principal_escalations = aggregate_escalation_health(&state, &workspace).await?;
+    let principal_escalations = aggregate_escalation_health(&state, &workspace, as_of_ms).await?;
     let deal_attribution = read_deal_attribution_stats(&state, &workspace).await?;
 
+    let flow_scope = metric_scope(
+        "flow_window",
+        "non_snapshot",
+        Some(as_of_ms),
+        Some(window_start_ms),
+        Some(24),
+        None,
+        None,
+    );
+    let inventory_scope = metric_scope(
+        "current_inventory",
+        "non_snapshot",
+        Some(as_of_ms),
+        None,
+        None,
+        None,
+        None,
+    );
+    let escalation_scope = metric_scope(
+        "mixed_current_and_retained_history",
+        "non_snapshot",
+        Some(as_of_ms),
+        None,
+        None,
+        None,
+        None,
+    );
+    let reviewer_window_days = reviewer_stats
+        .get("windowDays")
+        .and_then(Value::as_i64)
+        .filter(|days| *days > 0);
+    let reviewer_updated_at = reviewer_stats
+        .get("updatedAt")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let reviewer_updated_at_ms = reviewer_updated_at
+        .as_deref()
+        .and_then(|value| DateTime::parse_rfc3339_str(value).ok())
+        .map(|value| value.timestamp_millis());
+    let reviewer_scope = metric_scope(
+        "rolling_window_cache",
+        "cached_snapshot",
+        reviewer_updated_at_ms,
+        reviewer_updated_at_ms
+            .zip(reviewer_window_days)
+            .map(|(end, days)| end - days * 24 * 60 * 60 * 1000),
+        None,
+        reviewer_window_days,
+        reviewer_updated_at,
+    );
+    let deal_window_days = deal_attribution
+        .get("windowDays")
+        .and_then(Value::as_i64)
+        .filter(|days| *days > 0);
+    let deal_updated_at = deal_attribution
+        .get("updatedAt")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let deal_updated_at_ms = deal_updated_at
+        .as_deref()
+        .and_then(|value| DateTime::parse_rfc3339_str(value).ok())
+        .map(|value| value.timestamp_millis());
+    let deal_scope = metric_scope(
+        "rolling_window_cache",
+        "cached_snapshot",
+        deal_updated_at_ms,
+        deal_updated_at_ms
+            .zip(deal_window_days)
+            .map(|(end, days)| end - days * 24 * 60 * 60 * 1000),
+        None,
+        deal_window_days,
+        deal_updated_at,
+    );
+
     Ok(Json(json!({
-        "windowHours": 24,
+        "asOf": datetime_string(as_of_ms),
+        "metricScopes": {
+            "lifecycle": flow_scope.clone(),
+            "holdBreakdown": flow_scope.clone(),
+            "revisionReasons": flow_scope.clone(),
+            "reviewerMisjudge": flow_scope,
+            "negativeExamplePending": inventory_scope.clone(),
+            "principalEscalations": escalation_scope,
+            "reviewerStats": reviewer_scope,
+            "dealAttribution": deal_scope,
+        },
         "lifecycle": lifecycle,
         "holdBreakdown": hold_breakdown,
         "revisionReasons": revision_reasons,
@@ -74,11 +163,17 @@ pub(super) async fn phase_rollup(
     })))
 }
 
-async fn aggregate_lifecycle(state: &AppState, workspace: &str) -> AppResult<Value> {
-    let since = mongodb::bson::DateTime::from_millis(now_ms() - WINDOW_MS);
+async fn aggregate_lifecycle(
+    state: &AppState,
+    workspace: &str,
+    since_ms: i64,
+    as_of_ms: i64,
+) -> AppResult<Value> {
+    let since = DateTime::from_millis(since_ms);
+    let as_of = DateTime::from_millis(as_of_ms);
     let coll = state.db.raw().collection::<Document>("agent_run_logs");
     let pipeline = vec![
-        doc! { "$match": { "workspace_id": workspace, "created_at": { "$gte": since } } },
+        doc! { "$match": { "workspace_id": workspace, "created_at": { "$gte": since, "$lte": as_of } } },
         doc! { "$group": { "_id": "$lifecycle", "count": { "$sum": 1 } } },
     ];
     let mut cursor = coll.aggregate(pipeline, None).await?;
@@ -128,13 +223,19 @@ async fn aggregate_lifecycle(state: &AppState, workspace: &str) -> AppResult<Val
 /// 与 `outcomes_autonomy` 的 hold ratio 同源（都扫 `agent_run_logs` 上
 /// `final_review_status`），但前者是 7 日窗 + ratio，本函数是 24h 窗 + raw count，
 /// 与 [`aggregate_lifecycle`] 同 dashboard 卡片对齐。空集合稳定输出 3 个 0。
-async fn aggregate_hold_breakdown(state: &AppState, workspace: &str) -> AppResult<Value> {
-    let since = mongodb::bson::DateTime::from_millis(now_ms() - WINDOW_MS);
+async fn aggregate_hold_breakdown(
+    state: &AppState,
+    workspace: &str,
+    since_ms: i64,
+    as_of_ms: i64,
+) -> AppResult<Value> {
+    let since = DateTime::from_millis(since_ms);
+    let as_of = DateTime::from_millis(as_of_ms);
     let coll = state.db.raw().collection::<Document>("agent_run_logs");
     let pipeline = vec![
         doc! { "$match": {
             "workspace_id": workspace,
-            "created_at": { "$gte": since },
+            "created_at": { "$gte": since, "$lte": as_of },
             "final_review_status": {
                 "$in": [
                     "held_by_ai_policy",
@@ -175,13 +276,19 @@ async fn aggregate_hold_breakdown(state: &AppState, workspace: &str) -> AppResul
     Ok(Value::Array(items))
 }
 
-async fn aggregate_revision_reasons(state: &AppState, workspace: &str) -> AppResult<Value> {
-    let since = mongodb::bson::DateTime::from_millis(now_ms() - WINDOW_MS);
+async fn aggregate_revision_reasons(
+    state: &AppState,
+    workspace: &str,
+    since_ms: i64,
+    as_of_ms: i64,
+) -> AppResult<Value> {
+    let since = DateTime::from_millis(since_ms);
+    let as_of = DateTime::from_millis(as_of_ms);
     let coll = state.db.raw().collection::<Document>("agent_run_logs");
     let pipeline = vec![
         doc! { "$match": {
             "workspace_id": workspace,
-            "created_at": { "$gte": since },
+            "created_at": { "$gte": since, "$lte": as_of },
             "revision_reason": { "$exists": true, "$nin": [null, ""] },
         } },
         doc! { "$group": { "_id": "$revision_reason", "count": { "$sum": 1 } } },
@@ -205,8 +312,14 @@ async fn aggregate_revision_reasons(state: &AppState, workspace: &str) -> AppRes
     Ok(Value::Array(items))
 }
 
-async fn aggregate_reviewer_misjudge(state: &AppState, workspace: &str) -> AppResult<Value> {
-    let since = mongodb::bson::DateTime::from_millis(now_ms() - WINDOW_MS);
+async fn aggregate_reviewer_misjudge(
+    state: &AppState,
+    workspace: &str,
+    since_ms: i64,
+    as_of_ms: i64,
+) -> AppResult<Value> {
+    let since = DateTime::from_millis(since_ms);
+    let as_of = DateTime::from_millis(as_of_ms);
     let coll = state
         .db
         .raw()
@@ -214,7 +327,7 @@ async fn aggregate_reviewer_misjudge(state: &AppState, workspace: &str) -> AppRe
     let pipeline = vec![
         doc! { "$match": {
             "workspace_id": workspace,
-            "created_at": { "$gte": since },
+            "created_at": { "$gte": since, "$lte": as_of },
             "reviewer_misjudge_signal": { "$exists": true, "$ne": null },
         } },
         doc! { "$group": { "_id": "$reviewer_misjudge_signal", "count": { "$sum": 1 } } },
@@ -256,6 +369,7 @@ async fn read_reviewer_stats(state: &AppState, workspace: &str) -> AppResult<Val
         "approvedButUserNegative": doc.get_i64("approved_but_user_negative").unwrap_or(0),
         "passRate": doc.get_f64("pass_rate").unwrap_or(0.0),
         "misjudgeRate": doc.get_f64("misjudge_rate").unwrap_or(0.0),
+        "updatedAt": doc.get_datetime("updated_at").ok().and_then(|d| crate::models::dt_to_string(*d)),
     }))
 }
 
@@ -271,6 +385,7 @@ async fn read_deal_attribution_stats(state: &AppState, workspace: &str) -> AppRe
         return Ok(json!({}));
     };
     Ok(json!({
+        "windowDays": 30,
         "dealAttributedHits": doc.get_i64("deal_attributed_hits").unwrap_or(0),
         "updatedAt": doc.get_datetime("updated_at").ok().and_then(|d| crate::models::dt_to_string(*d)),
     }))
@@ -309,7 +424,12 @@ async fn count_negative_example_pending(state: &AppState, workspace: &str) -> Ap
 ///   是请示闭环"最后一公里"断裂的硬信号。
 ///
 /// 全只读，零写路径；workspace_id 强制 admin.current_workspace，与本面板其他聚合同源。
-async fn aggregate_escalation_health(state: &AppState, workspace: &str) -> AppResult<Value> {
+async fn aggregate_escalation_health(
+    state: &AppState,
+    workspace: &str,
+    as_of_ms: i64,
+) -> AppResult<Value> {
+    let as_of = DateTime::from_millis(as_of_ms);
     let coll = state
         .db
         .raw()
@@ -317,7 +437,7 @@ async fn aggregate_escalation_health(state: &AppState, workspace: &str) -> AppRe
 
     // ① status 分布（全量，不开窗——运营要看的是"现在积压多少 / 历史共处理多少"）。
     let pipeline_status = vec![
-        doc! { "$match": { "workspace_id": workspace } },
+        doc! { "$match": { "workspace_id": workspace, "created_at": { "$lte": as_of } } },
         doc! { "$group": { "_id": "$status", "count": { "$sum": 1 } } },
     ];
     let mut cursor = coll.aggregate(pipeline_status, None).await?;
@@ -350,10 +470,14 @@ async fn aggregate_escalation_health(state: &AppState, workspace: &str) -> AppRe
 
     // ② pending 年龄分桶：拉所有 pending 的 created_at，按距今分桶。pending 条目数
     //    天然有界（领导请示是低频事件），全量拉取无压力。
-    let now = now_ms();
+    let now = as_of_ms;
     let mut cur_pending = coll
         .find(
-            doc! { "workspace_id": workspace, "status": PRINCIPAL_ESCALATION_STATUS_PENDING },
+            doc! {
+                "workspace_id": workspace,
+                "status": PRINCIPAL_ESCALATION_STATUS_PENDING,
+                "created_at": { "$lte": as_of },
+            },
             mongodb::options::FindOptions::builder()
                 .projection(doc! { "created_at": 1 })
                 .build(),
@@ -387,6 +511,7 @@ async fn aggregate_escalation_health(state: &AppState, workspace: &str) -> AppRe
                 "workspace_id": workspace,
                 "kind": "principal_decision_relay",
                 "status": "failed",
+                "created_at": { "$lte": as_of },
             },
             None,
         )
@@ -425,6 +550,30 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+fn datetime_string(timestamp_ms: i64) -> Option<String> {
+    crate::models::dt_to_string(DateTime::from_millis(timestamp_ms))
+}
+
+fn metric_scope(
+    kind: &str,
+    consistency: &str,
+    as_of_ms: Option<i64>,
+    start_ms: Option<i64>,
+    window_hours: Option<i64>,
+    window_days: Option<i64>,
+    updated_at: Option<String>,
+) -> Value {
+    json!({
+        "kind": kind,
+        "consistency": consistency,
+        "asOf": as_of_ms.and_then(datetime_string),
+        "start": start_ms.and_then(datetime_string),
+        "windowHours": window_hours,
+        "windowDays": window_days,
+        "updatedAt": updated_at,
+    })
+}
+
 /// G-后续Ⅱ/2：worker 健康聚合 —— 一次 RTT 拉齐三类后台任务的状态分布，
 /// 给 admin ObservabilityDashboard 第二波卡片用。三类源都已经在 DB 里、
 /// admin UI 还看不到聚合视图：
@@ -446,28 +595,58 @@ pub(super) async fn worker_health(
     Extension(admin): Extension<AuthenticatedAdmin>,
 ) -> AppResult<Json<Value>> {
     let workspace = admin.current_workspace.clone();
+    let as_of_ms = now_ms();
+    let lessons_start_ms = as_of_ms - LESSONS_WINDOW_MS;
 
-    let chat_tasks = aggregate_chat_tasks(&state, &workspace).await?;
-    let gap_signals = aggregate_gap_signals(&state, &workspace).await?;
-    let lessons_learned = aggregate_lessons_learned(&state, &workspace).await?;
+    let chat_tasks = aggregate_chat_tasks(&state, &workspace, as_of_ms).await?;
+    let gap_signals = aggregate_gap_signals(&state, &workspace, as_of_ms).await?;
+    let lessons_learned =
+        aggregate_lessons_learned(&state, &workspace, lessons_start_ms, as_of_ms).await?;
+    let retained_scope = metric_scope(
+        "retained_history",
+        "non_snapshot",
+        Some(as_of_ms),
+        None,
+        None,
+        None,
+        None,
+    );
+    let lessons_scope = metric_scope(
+        "flow_window",
+        "non_snapshot",
+        Some(as_of_ms),
+        Some(lessons_start_ms),
+        None,
+        Some(14),
+        None,
+    );
 
     Ok(Json(json!({
-        "windowHours": 24,
-        "lessonsWindowDays": 14,
+        "asOf": datetime_string(as_of_ms),
+        "metricScopes": {
+            "chatTasks": retained_scope.clone(),
+            "gapSignals": retained_scope,
+            "lessonsLearned": lessons_scope,
+        },
         "chatTasks": chat_tasks,
         "gapSignals": gap_signals,
         "lessonsLearned": lessons_learned,
     })))
 }
 
-async fn aggregate_chat_tasks(state: &AppState, workspace: &str) -> AppResult<Value> {
+async fn aggregate_chat_tasks(
+    state: &AppState,
+    workspace: &str,
+    as_of_ms: i64,
+) -> AppResult<Value> {
+    let as_of = DateTime::from_millis(as_of_ms);
     let coll = state
         .db
         .raw()
         .collection::<Document>("knowledge_chat_tasks");
     // 全量 status 分布——不开 24h 窗，运营要看的是"现在 pending 多少 / 历史 fail 比例"。
     let pipeline = vec![
-        doc! { "$match": { "workspace_id": workspace } },
+        doc! { "$match": { "workspace_id": workspace, "created_at": { "$lte": as_of } } },
         doc! { "$group": { "_id": "$status", "count": { "$sum": 1 } } },
     ];
     let mut cursor = coll.aggregate(pipeline, None).await?;
@@ -502,6 +681,7 @@ async fn aggregate_chat_tasks(state: &AppState, workspace: &str) -> AppResult<Va
     let pipeline_err = vec![
         doc! { "$match": {
             "workspace_id": workspace,
+            "created_at": { "$lte": as_of },
             "status": "failed",
             "error_kind": { "$exists": true, "$nin": [null, ""] },
         } },
@@ -529,14 +709,19 @@ async fn aggregate_chat_tasks(state: &AppState, workspace: &str) -> AppResult<Va
     }))
 }
 
-async fn aggregate_gap_signals(state: &AppState, workspace: &str) -> AppResult<Value> {
+async fn aggregate_gap_signals(
+    state: &AppState,
+    workspace: &str,
+    as_of_ms: i64,
+) -> AppResult<Value> {
+    let as_of = DateTime::from_millis(as_of_ms);
     let coll = state
         .db
         .raw()
         .collection::<Document>("knowledge_gap_signals");
     // status 分布：pending = sweep 还没消化的；auto_resolved/applied/dismissed 之比是 sweep 命中率。
     let pipeline_status = vec![
-        doc! { "$match": { "workspace_id": workspace } },
+        doc! { "$match": { "workspace_id": workspace, "created_at": { "$lte": as_of } } },
         doc! { "$group": { "_id": "$status", "count": { "$sum": 1 } } },
     ];
     let mut cur_status = coll.aggregate(pipeline_status, None).await?;
@@ -580,6 +765,7 @@ async fn aggregate_gap_signals(state: &AppState, workspace: &str) -> AppResult<V
     let pipeline_kind = vec![
         doc! { "$match": {
             "workspace_id": workspace,
+            "created_at": { "$lte": as_of },
             "status": "pending",
         } },
         doc! { "$group": { "_id": "$kind", "count": { "$sum": 1 } } },
@@ -600,8 +786,8 @@ async fn aggregate_gap_signals(state: &AppState, workspace: &str) -> AppResult<V
         }
     }
 
-    // sweep hit rate：(auto_resolved + llm_resolved + applied) / total（excluding 'dismissed' 与 'pending'）
-    // —— 直观表征"上一轮 sweep 把多少 pending 消化掉了"。
+    // 这是保留历史中已解决状态的占比，不是某一轮 sweep 的命中率；集合没有 run/cohort
+    // 标识，无法从当前文档状态反推“上一轮处理了多少”。无样本时返回 null，而非伪造 0%。
     let total: i64 = status_items
         .iter()
         .filter_map(|v| v.get("count").and_then(Value::as_i64))
@@ -621,11 +807,7 @@ async fn aggregate_gap_signals(state: &AppState, workspace: &str) -> AppResult<V
         .filter(|v| v.get("status").and_then(Value::as_str) == Some("pending"))
         .filter_map(|v| v.get("count").and_then(Value::as_i64))
         .sum();
-    let hit_rate = if total > 0 {
-        resolved as f64 / total as f64
-    } else {
-        0.0
-    };
+    let historical_resolved_share = resolved_share(resolved, total);
 
     Ok(json!({
         "byStatus": status_items,
@@ -633,16 +815,26 @@ async fn aggregate_gap_signals(state: &AppState, workspace: &str) -> AppResult<V
         "total": total,
         "pending": pending,
         "resolved": resolved,
-        "sweepHitRate": hit_rate,
+        "historicalResolvedShare": historical_resolved_share,
     }))
+}
+
+fn resolved_share(resolved: i64, total: i64) -> Option<f64> {
+    (total > 0).then_some(resolved as f64 / total as f64)
 }
 
 /// 14d 滑窗：与 [`crate::knowledge_wiki::feedback_worker::run_one_round`]
 /// 调 `aggregate_lessons_for_workspace(_, _, 14)` 同窗口。
 const LESSONS_WINDOW_MS: i64 = 14 * 24 * 60 * 60 * 1000;
 
-async fn aggregate_lessons_learned(state: &AppState, workspace: &str) -> AppResult<Value> {
-    let since = mongodb::bson::DateTime::from_millis(now_ms() - LESSONS_WINDOW_MS);
+async fn aggregate_lessons_learned(
+    state: &AppState,
+    workspace: &str,
+    since_ms: i64,
+    as_of_ms: i64,
+) -> AppResult<Value> {
+    let since = DateTime::from_millis(since_ms);
+    let as_of = DateTime::from_millis(as_of_ms);
     let coll = state.db.raw().collection::<Document>("lessons_learned");
     // [`crate::knowledge_wiki::lessons_learned`] 写出的文档结构：
     //   { pattern_kind, count, review_status, updated_at, ... }
@@ -651,7 +843,7 @@ async fn aggregate_lessons_learned(state: &AppState, workspace: &str) -> AppResu
     let pipeline = vec![
         doc! { "$match": {
             "workspace_id": workspace,
-            "updated_at": { "$gte": since },
+            "updated_at": { "$gte": since, "$lte": as_of },
         } },
         doc! { "$group": {
             "_id": { "pattern": "$pattern_kind", "reviewStatus": "$review_status" },
@@ -829,10 +1021,12 @@ mod tests {
     }
 
     #[test]
-    fn principal_escalation_status_closed_set_is_two() {
+    fn principal_escalation_status_closed_set_includes_delivery_failure() {
         // 与 [`crate::models::ALLOWED_PRINCIPAL_ESCALATION_STATUS`] 同源；
         // 改了那边（新增第三种 status）必须更新本聚合的 known 数组与前端 UI。
-        assert_eq!(ALLOWED_PRINCIPAL_ESCALATION_STATUS.len(), 2);
+        assert_eq!(ALLOWED_PRINCIPAL_ESCALATION_STATUS.len(), 3);
         assert!(ALLOWED_PRINCIPAL_ESCALATION_STATUS.contains(&PRINCIPAL_ESCALATION_STATUS_PENDING));
+        assert!(ALLOWED_PRINCIPAL_ESCALATION_STATUS
+            .contains(&crate::models::PRINCIPAL_ESCALATION_STATUS_DELIVERY_FAILED));
     }
 }

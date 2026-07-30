@@ -78,6 +78,7 @@ fn run_log_held(run_id: &str) -> AgentRunLog {
         token_budget: 0,
         tokens_used: 0,
         llm_calls_used: 0,
+        unknown_usage_calls: 0,
         degraded_reasons: Vec::new(),
         lifecycle: "completed".to_string(),
         source_event_id: "evt_c8".to_string(),

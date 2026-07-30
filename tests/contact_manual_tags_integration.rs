@@ -15,6 +15,7 @@ use axum::extract::{Extension, Path, State};
 use mongodb::bson::{DateTime, Document};
 
 use wechatagent::auth::AuthenticatedAdmin;
+use wechatagent::error::AppError;
 use wechatagent::models::{AgentStatus, Contact};
 use wechatagent::routes::contacts::{
     normalize_manual_tags, update_manual_tags, validate_manual_tags, MANUAL_TAGS_MAX_COUNT,
@@ -144,8 +145,11 @@ async fn update_manual_tags_persists() {
         Extension(test_admin(&ws)),
         Path(id_hex.clone()),
         axum::Json(
-            serde_json::from_value(serde_json::json!({ "tags": ["VIP", "高意向"] }))
-                .expect("构造请求体"),
+            serde_json::from_value(serde_json::json!({
+                "expectedAccountId": acc,
+                "tags": ["VIP", "高意向"]
+            }))
+            .expect("构造请求体"),
         ),
     )
     .await
@@ -188,9 +192,63 @@ async fn update_manual_tags_cross_workspace_not_found() {
         Extension(test_admin("other_workspace")),
         Path(id_hex),
         axum::Json(
-            serde_json::from_value(serde_json::json!({ "tags": ["X"] })).expect("构造请求体"),
+            serde_json::from_value(serde_json::json!({
+                "expectedAccountId": acc,
+                "tags": ["X"]
+            }))
+            .expect("构造请求体"),
         ),
     )
     .await;
     assert!(result.is_err(), "跨 workspace 改 manual_tags 必须 NotFound");
+}
+
+/// SR-149：URL 指向 account-a 联系人但正文冻结 account-b 时，必须在任何写入前
+/// 返回 Conflict；完整联系人 BSON（含 manual_tags 审计字段与 updated_at）逐字不变。
+#[tokio::test]
+#[ignore]
+async fn update_manual_tags_wrong_account_is_conflict_and_zero_write() {
+    let app = TestApp::start().await;
+    let ws = app.state.config.default_workspace_id.clone();
+    let acc = app.state.config.default_account_id.clone();
+    let inserted = app
+        .state
+        .db
+        .contacts()
+        .insert_one(managed_contact(&ws, &acc, "wx_tag_scope"), None)
+        .await
+        .expect("seed contact");
+    let id = inserted.inserted_id.as_object_id().expect("oid");
+    let raw = app.state.db.raw().collection::<Document>("contacts");
+    let before = raw
+        .find_one(mongodb::bson::doc! { "_id": id }, None)
+        .await
+        .expect("read before")
+        .expect("contact exists");
+
+    let error = update_manual_tags(
+        State(app.state.clone()),
+        Extension(test_admin(&ws)),
+        Path(id.to_hex()),
+        axum::Json(
+            serde_json::from_value(serde_json::json!({
+                "expectedAccountId": "account-b",
+                "tags": ["不应写入"]
+            }))
+            .expect("构造错账号请求体"),
+        ),
+    )
+    .await
+    .expect_err("错账号人工标签必须被拒绝");
+    assert!(
+        matches!(error, AppError::Conflict(_)),
+        "错账号应返回 Conflict，实际: {error:?}"
+    );
+
+    let after = raw
+        .find_one(mongodb::bson::doc! { "_id": id }, None)
+        .await
+        .expect("read after")
+        .expect("contact remains");
+    assert_eq!(after, before, "错账号拒绝后联系人完整 BSON 必须零变化");
 }

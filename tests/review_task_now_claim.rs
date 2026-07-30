@@ -13,13 +13,13 @@
 
 mod common;
 
-use axum::extract::{Extension, Path, State};
+use axum::extract::{Extension, Json, Path, State};
 use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
 
 use wechatagent::auth::AuthenticatedAdmin;
 use wechatagent::error::AppError;
 use wechatagent::models::{AgentStatus, AgentTask, Contact};
-use wechatagent::routes::tasks::review_task_now;
+use wechatagent::routes::tasks::{cancel_agent_task, review_task_now, TaskActionRequest};
 
 use crate::common::TestApp;
 
@@ -29,6 +29,13 @@ fn test_admin(workspace_id: &str) -> AuthenticatedAdmin {
         username: "op_admin".to_string(),
         current_workspace: workspace_id.to_string(),
     }
+}
+
+fn task_action(account_id: &str) -> Json<TaskActionRequest> {
+    Json(
+        serde_json::from_value(serde_json::json!({ "expectedAccountId": account_id }))
+            .expect("task action request"),
+    )
 }
 
 /// 构造一条指定状态的 memory_consolidation 任务（该 kind 无候选时走 sent 早退，
@@ -136,6 +143,7 @@ async fn review_task_now_rejects_running_task() {
         State(app.state.clone()),
         Path(task_id.to_hex()),
         Extension(test_admin(&ws)),
+        task_action(&acc),
     )
     .await
     .expect_err("running 任务应被 CAS 拒绝");
@@ -178,6 +186,7 @@ async fn review_task_now_rejects_terminal_task() {
         State(app.state.clone()),
         Path(task_id.to_hex()),
         Extension(test_admin(&ws)),
+        task_action(&acc),
     )
     .await
     .expect_err("终态任务应被拒");
@@ -219,6 +228,7 @@ async fn review_task_now_claims_pending_and_clears_lease_on_success() {
         State(app.state.clone()),
         Path(task_id.to_hex()),
         Extension(test_admin(&ws)),
+        task_action(&acc),
     )
     .await
     .expect("pending 任务应被成功 claim 并跑完 handler");
@@ -244,4 +254,120 @@ async fn review_task_now_claims_pending_and_clears_lease_on_success() {
         stored.status, "sent",
         "memory_consolidation 无候选应走 sent 早退终态"
     );
+}
+
+/// SR-155：同 workspace 的错误账号不得复核或取消另一账号任务；任务和已绑定
+/// Outbox 都必须保持逐字不变，证明拒绝发生在 claim/cancel 的原子账号 CAS 上。
+#[tokio::test]
+#[ignore]
+async fn wrong_account_task_actions_are_conflict_with_zero_task_and_outbox_writes() {
+    let app = TestApp::start().await;
+    let ws = app.state.config.default_workspace_id.clone();
+    let task = task_with_status(&ws, "account-a", "wx_scope_guard", "pending");
+    let task_id = task.id.expect("task id");
+    app.state
+        .db
+        .tasks()
+        .insert_one(&task, None)
+        .await
+        .expect("insert account-a task");
+
+    let decision_id = ObjectId::new();
+    app.state
+        .db
+        .raw()
+        .collection::<Document>("agent_tasks")
+        .update_one(
+            doc! { "_id": task_id },
+            doc! { "$set": { "outbox_decision_id": decision_id } },
+            None,
+        )
+        .await
+        .expect("bind task decision");
+
+    let outbox_id = ObjectId::new();
+    let now = DateTime::now();
+    let outbox_collection = app
+        .state
+        .db
+        .raw()
+        .collection::<Document>("agent_send_outbox");
+    outbox_collection
+        .insert_one(
+            doc! {
+                "_id": outbox_id,
+                "workspace_id": &ws,
+                "account_id": "account-a",
+                "contact_wxid": "wx_scope_guard",
+                "run_id": "sr155-run",
+                "decision_id": decision_id,
+                "source_event_id": "sr155-event",
+                "source_kind": "follow_up",
+                "content": "must remain pending",
+                "content_hash": "sr155-hash",
+                "idempotency_key": format!("sr155-{}", outbox_id.to_hex()),
+                "attempt": 0,
+                "max_attempts": 3,
+                "status": "pending",
+                "cancel_requested": false,
+                "claim_generation": 0i64,
+                "reclaimed_in_flight": false,
+                "reclaim_count": 0,
+                "created_at": now,
+                "updated_at": now,
+            },
+            None,
+        )
+        .await
+        .expect("insert linked outbox");
+
+    let task_collection = app.state.db.raw().collection::<Document>("agent_tasks");
+    let task_before = task_collection
+        .find_one(doc! { "_id": task_id }, None)
+        .await
+        .expect("read task before")
+        .expect("task exists");
+    let outbox_before = outbox_collection
+        .find_one(doc! { "_id": outbox_id }, None)
+        .await
+        .expect("read outbox before")
+        .expect("outbox exists");
+
+    let review = review_task_now(
+        State(app.state.clone()),
+        Path(task_id.to_hex()),
+        Extension(test_admin(&ws)),
+        task_action("account-b"),
+    )
+    .await;
+    assert!(matches!(review, Err(AppError::Conflict(_))));
+
+    let cancel = cancel_agent_task(
+        State(app.state.clone()),
+        Path(task_id.to_hex()),
+        Extension(test_admin(&ws)),
+        task_action("account-b"),
+    )
+    .await;
+    assert!(matches!(cancel, Err(AppError::Conflict(_))));
+
+    let task_after = task_collection
+        .find_one(doc! { "_id": task_id }, None)
+        .await
+        .expect("read task after")
+        .expect("task remains");
+    let outbox_after = outbox_collection
+        .find_one(doc! { "_id": outbox_id }, None)
+        .await
+        .expect("read outbox after")
+        .expect("outbox remains");
+    assert_eq!(
+        task_after, task_before,
+        "rejected actions must not mutate task"
+    );
+    assert_eq!(
+        outbox_after, outbox_before,
+        "rejected cancel must not mutate linked outbox"
+    );
+    app.cleanup().await;
 }
