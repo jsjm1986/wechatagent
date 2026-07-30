@@ -42,12 +42,26 @@ def load_json(path: pathlib.Path, failures: list[str]) -> Any:
         return None
 
 
+def canonical_hash_bytes(content: bytes) -> bytes:
+    """Normalize UTF-8 text line endings before integrity hashing.
+
+    Git may materialize the same text blob as LF or CRLF depending on checkout
+    policy.  Audit hashes describe repository content, so those representations
+    must be equivalent.  Non-text artifacts remain byte-for-byte hashed.
+    """
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError:
+        return content
+    return text.replace("\r\n", "\n").replace("\r", "\n").encode("utf-8")
+
+
+def sha256_bytes(content: bytes) -> str:
+    return hashlib.sha256(canonical_hash_bytes(content)).hexdigest()
+
+
 def sha256(path: pathlib.Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
+    return sha256_bytes(path.read_bytes())
 
 
 def require_hash(entry: Any, label: str, failures: list[str]) -> pathlib.Path | None:
@@ -598,6 +612,12 @@ def main() -> int:
     parser.add_argument("--result", type=pathlib.Path, help="optional schema-v2 audit result")
     args = parser.parse_args()
     failures: list[str] = []
+
+    lf_digest = sha256_bytes(b"audit\ninput\n")
+    if lf_digest != sha256_bytes(b"audit\r\ninput\r\n") or lf_digest != sha256_bytes(
+        b"audit\rinput\r"
+    ):
+        failures.append("canonical text hashing must treat LF, CRLF, and CR as equivalent")
 
     domains_doc = load_json(DOMAIN_MANIFEST, failures)
     domains = domain_map(domains_doc, failures)

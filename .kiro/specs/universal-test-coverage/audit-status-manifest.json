@@ -4,7 +4,7 @@
   "authority": "status_only",
   "legacyArtifact": {
     "path": ".kiro/specs/universal-test-coverage/deepread-verify-result-2026-06-30.json",
-    "sha256": "cd27427e18b088dd80c8f12e61fa8cf4bfe0b4f296dcd33e1581d424410613b4",
+    "sha256": "cf5d1fdbdc344ee75731e74892c3525b11ca1f253700df8c007bac51fa16be24",
     "evidenceCommit": "12d99b3b9fd42eae2293b5b3f0a1ff9fe982b7a8",
     "classification": "legacy_inconclusive",
     "limitations": [
@@ -17,11 +17,11 @@
   "frozenInputs": [
     {
       "path": ".kiro/specs/universal-test-coverage/biz-domains-2026-06-30.json",
-      "sha256": "165071bba167f1fc038bc362526d921952552fb9eee3b235185dc9b7c2a6647b"
+      "sha256": "1207849bf76425c0019ef1ed1acb888782fd5f4c0ee12fd9ae9ff9d815a28a69"
     },
     {
       "path": ".kiro/specs/universal-test-coverage/audit-2026-06-30-anchors.json",
-      "sha256": "75b1cae61670b57bcd3a4fbe69222850159bb3b7adc1c7db38d1707f09dcd248"
+      "sha256": "419b1f9babeb4e54118d18ff85f0a6920c032097374a3383ed2452f128890a7e"
     }
   ],
   "summary": {
