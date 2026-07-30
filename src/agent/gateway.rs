@@ -211,7 +211,7 @@ pub async fn handle_follow_up_task_with_claim(
     .await
 }
 
-/// Execute a durable webhook handoff with inbound semantics while retaining the
+/// Execute durable webhook delivery with inbound semantics while retaining the
 /// AgentTask claim as the send-authorization fence. The task snapshot stores
 /// the exact persisted conversation message id in `content`; a later inbound
 /// refreshes the same task row, clears the old claim token, and therefore makes
@@ -5454,7 +5454,7 @@ async fn apply_agent_updates(
             }
             // upsert 锚是仅 `status=pending` 生效的 (workspace_id, contact_id) 部分唯一索引。
             // 同一审核周期重复观察刷新/累加现有 pending；approved/rejected 历史不复活也不
-            // 占槽，因此闭环后的新证据会插入下一周期 pending，并继续等待人工审核。
+            // 占槽，因此闭环后的新证据会插入下一周期 pending，并继续等待管理员审核。
             let filter = doc! {
                 "workspace_id": &contact.workspace_id,
                 "contact_id": &contact_id,

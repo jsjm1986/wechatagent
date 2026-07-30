@@ -412,7 +412,7 @@ source_anchors: {}
         // admin 只触发了批处理、并未逐条审定——标 Rule 才如实反映"规则化批处理写入"，
         // 避免审计按 source 过滤时误判"运营逐条审定了这条"。created_by="auto_verify" 进一步
         // 标识自动来源。只有 revision 事务提交后，才累计 processed/状态计数并写 usage log；
-        // 写失败保留原 Chunk、计入 failed，不能把模型建议伪装成已发生的业务裁决。
+        // 写失败保留原 Chunk、计入 failed，不能把上游候选伪装成已发生的业务裁决。
         let applied = match apply_chunk_revision(
             &state.db,
             &workspace_id,

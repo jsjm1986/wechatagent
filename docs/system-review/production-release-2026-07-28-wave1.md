@@ -27,10 +27,10 @@
 
 本批没有获得成功的部署后模型判定，因此不把 SR-139 的真实模型门记为通过。已串行触达并冻结以下事实，期间从未切换正式 active provider：
 
-- 正式 active `kr/claude-opus-4.7`：约 1.5 秒返回 Cloudflare HTTP 530 / error 1016；Prompt 编辑安全降级为人工确认。
-- 隔离 Router 的 NVIDIA `deepseek-ai/deepseek-v4-flash`：单次请求 120 秒未返回，客户端超时。
-- 隔离 Router 的 `claude-opus-4.8`：调用失败，未产生成功审查日志。
-- 隔离 Router 的 DashScope `qwen3.7-max-2026-05-17`：86 ms 返回 `Arrearage`（账号欠费）HTTP 400。
+- 正式 active `model_alias=provider_active_primary`：约 1.5 秒返回 Cloudflare HTTP 530 / error 1016；Prompt 编辑安全降级为管理员确认。
+- 隔离 Router 的 `model_alias=provider_isolated_timeout`：单次请求 120 秒未返回，客户端超时。
+- 隔离 Router 的 `model_alias=provider_isolated_review`：调用失败，未产生成功审查日志。
+- 隔离 Router 的 `model_alias=provider_isolated_arrearage`：86 ms 返回 `Arrearage`（账号欠费）HTTP 400。
 
 四次探针均先停隔离 Router、删除精确随机库并复核正式 PID/哈希；DashScope 在连通性门失败后没有创建临时 Prompt。结论是“真实路径已触达且失败时安全降级，成功响应受外部 provider 状态阻塞”，不是“模型质量通过”或“代码失败”。恢复外部模型可用性后仍需补一条成功的完整 `BEFORE/AFTER` 语义审查证据。
 

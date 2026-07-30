@@ -4,7 +4,7 @@
 //
 // 解耦 strategyStore（用户裁定 B 的核心）：本卡片不 import stores/strategyStore，直调
 // 发布与激活严格分离：publish 只把 draft 变成 published current，所有字段都必须再经
-// 人工 activate 才进入运行时。activate 的核心指针先提交，附属同步失败会返回 partial，
+// 管理员显式 activate 后才进入运行时。activate 的核心指针先提交，附属同步失败会返回 partial，
 // 卡片保留幂等重试入口。
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../../lib/api";
@@ -66,7 +66,7 @@ export function ProfilePublishCard({
         `/api/admin/domain-profiles/${encodeURIComponent(profileId)}/publish`,
         {},
       );
-      toast.success("已发布，等待人工激活");
+      toast.success("已发布，等待管理员激活");
       onDone?.();
       await load();
     } catch (e) {

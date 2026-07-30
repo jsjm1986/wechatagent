@@ -1,6 +1,6 @@
 //! Phase C / C5 历史 threshold auto-release 实现（HC-017 当前政策休眠）。
 //!
-//! 当前产品边界是“全部 proposal 人工发布”。[`CURRENT_AUTO_RELEASE_POLICY_ENABLED`]
+//! 当前产品边界是“全部 proposal 由管理员显式发布”。[`CURRENT_AUTO_RELEASE_POLICY_ENABLED`]
 //! 固定为 false，因此配置总闸和 workspace 子闸即使同时误开，本模块也在任何查询或
 //! 写入前返回零。下方决策实现仅为将来经产品确认后加入“类型+方向白名单”保留，
 //! 不能被现有配置单独激活。

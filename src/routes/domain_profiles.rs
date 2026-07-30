@@ -15,7 +15,7 @@
 //!
 //! 因此发布后允许「旧版本 active + 新版本 current」并存；运行时只按 workspace 的唯一
 //! `is_active=true` 读取，不要求 active 同时也是 current。此分离保证任何内容（包括普通字段）
-//! 都必须经过明确人工激活才生效。
+//! 都必须经过管理员明确激活才生效。
 //!
 //! **红线**：引导层 AI 生成的 profile 必须人审才能 activate（继承「AI 永不自动 verify」）；
 //! 候选不阻塞运行时（无 active 时回落 DEFAULT_PROFILE，零配置启动不变）。

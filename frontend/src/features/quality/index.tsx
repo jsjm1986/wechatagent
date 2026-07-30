@@ -284,7 +284,7 @@ export function FormulaAdherenceTab({ accountId }: { accountId?: string }) {
         抓最后一个 turn 的 <code>review.formulaBreakdown</code> 与 <code>scores</code>，
         与场景的 <code>ground_truth</code> 比较计算 adherence。整批共享一个累计 token 预算
         （每场景 simulationTokenBudget × scenarios 数），超额时返回部分结果 + degraded:true。
-        缺模型公式输出的场景标 invalid；缺失或非法人工金标的存量场景标 unscored，均不按 0
+        缺模型公式输出的场景标 invalid；缺失或非法管理员金标的存量场景标 unscored，均不按 0
         计入平均。预算只累计本次评测私有 simulation run；上游未报告 usage 时停止后续场景。
       </p>
       <EvaluationScenariosPanel accountId={accountId} />

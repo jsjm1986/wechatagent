@@ -141,7 +141,7 @@ export function EvaluationScenariosPanel({ accountId }: { accountId?: string }) 
     <div className={styles.panel}>
       <p className={styles.desc}>
         管理「公式遵守度」评测所依赖的评测场景。只有<strong>启用中</strong>的场景会被评测跑到。
-        每个生效场景必须绑定当前账号、输入消息序列及当前行业全部公式的 0–10 人工金标；缺失金标不会被解释为 0。
+        每个生效场景必须绑定当前账号、输入消息序列及当前行业全部公式的 0–10 管理员金标；缺失金标不会被解释为 0。
       </p>
 
       <form
