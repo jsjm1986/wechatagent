@@ -1,0 +1,12 @@
+{
+  "arguments": {
+    "query": "Alice"
+  },
+  "error": null,
+  "id": "507f1f77bcf86cd799439011",
+  "response": {
+    "count": 1
+  },
+  "status": "succeeded",
+  "toolName": "wechatagent.search_contacts"
+}

@@ -1077,10 +1077,10 @@ async fn apply_claimed_user_operation_guide_v3(
 #[cfg(test)]
 mod tests {
     use super::{
-        candidate_hash, guide_claim_filter, guide_owned_apply_filter, plan_impact,
+        candidate_hash, guide_claim_filter, guide_owned_apply_filter, plan_impact, receipt_json,
         requires_strong_confirmation, GUIDE_APPLY_PROTOCOL_VERSION,
     };
-    use crate::models::GuideFrozenPlan;
+    use crate::models::{GuideApplyReceipt, GuideFrozenPlan, GuideSkippedField};
     use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
 
     fn minimal_plan() -> GuideFrozenPlan {
@@ -1104,6 +1104,25 @@ mod tests {
             authoritative_changes: Vec::new(),
             playbook_affected_contacts: 0,
         }
+    }
+
+    #[test]
+    fn receipt_json_matches_contract_fixture() {
+        let receipt = GuideApplyReceipt {
+            preview_id: ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap(),
+            candidate_hash: "candidate-hash".to_string(),
+            committed_at: DateTime::from_millis(1_700_000_000_000),
+            applied_fields: vec!["humanProfileNote".to_string()],
+            skipped_fields: vec![GuideSkippedField {
+                field: "operationState".to_string(),
+                reason: "not_allowed".to_string(),
+            }],
+            impact_scope: "current_contact".to_string(),
+        };
+        crate::routes::contract_snapshot::assert_contract_fixture(
+            "guide_apply_receipt",
+            receipt_json(&receipt),
+        );
     }
 
     #[test]

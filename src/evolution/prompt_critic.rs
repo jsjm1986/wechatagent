@@ -422,9 +422,10 @@ fn buckets_summary_doc(buckets: &[(String, Vec<RunSample>)]) -> mongodb::bson::D
 }
 
 async fn load_reply_agent_template_text(state: &AppState, workspace_id: &str) -> String {
-    // 演化目标默认是 reply_agent_main；若该 key 缺失，给空字符串让 critic 也能跑
-    // （critic 仍应基于 failure buckets 给意见）。
-    load_prompt(&state.db, workspace_id, "reply_agent_main")
+    // Use a target that the shadow path can actually inject. If it is absent,
+    // keep the critic available from failure buckets without inventing a
+    // legacy prompt target that can never produce replay evidence.
+    load_prompt(&state.db, workspace_id, "user.reply.policy")
         .await
         .unwrap_or_default()
 }
@@ -605,7 +606,7 @@ mod tests {
     #[test]
     fn validate_diffs_rejects_oversized_snippet() {
         let huge: String = "a".repeat(CRITIC_FIELD_MAX_CHARS + 1);
-        let diffs = vec![mk_diff("reply_agent_main", "policy", "ok", &huge)];
+        let diffs = vec![mk_diff("user.reply.policy", "policy", "ok", &huge)];
         assert_eq!(validate_diffs(&diffs), Some("critic_schema_invalid"));
     }
 
@@ -613,7 +614,7 @@ mod tests {
     #[test]
     fn validate_diffs_rejects_oversized_summary() {
         let long_summary: String = "a".repeat(CRITIC_SUMMARY_MAX_CHARS + 1);
-        let diffs = vec![mk_diff("reply_agent_main", "policy", &long_summary, "x")];
+        let diffs = vec![mk_diff("user.reply.policy", "policy", &long_summary, "x")];
         assert_eq!(validate_diffs(&diffs), Some("critic_schema_invalid"));
     }
 
@@ -628,7 +629,7 @@ mod tests {
             "遇到投诉时，建议切换到{}{}{}{}以稳住客户",
             '\u{4eba}', '\u{5de5}', '\u{63a5}', '\u{7ba1}',
         );
-        let diffs = vec![mk_diff("reply_agent_main", "policy", "ok", &forbidden)];
+        let diffs = vec![mk_diff("user.reply.policy", "policy", "ok", &forbidden)];
         assert_eq!(validate_diffs(&diffs), Some("forbidden_literal"));
     }
 
@@ -651,7 +652,7 @@ mod tests {
     #[test]
     fn validate_diffs_accepts_clean_input() {
         let diffs = vec![mk_diff(
-            "reply_agent_main",
+            "user.reply.policy",
             "policy",
             "增强对未验证产品事实的更保守措辞",
             "若知识库未命中，请用'我先核实下再答'的兜底句式，避免编造事实",
@@ -668,8 +669,8 @@ mod tests {
             '\u{4eba}', '\u{5de5}', '\u{4ecb}', '\u{5165}',
         );
         let diffs = vec![
-            mk_diff("reply_agent_main", "policy", "ok", "正常 snippet"),
-            mk_diff("reply_agent_main", "soul", "ok", &forbidden),
+            mk_diff("user.reply.policy", "policy", "ok", "正常 snippet"),
+            mk_diff("user.reply.policy", "soul", "ok", &forbidden),
         ];
         assert_eq!(validate_diffs(&diffs), Some("forbidden_literal"));
     }

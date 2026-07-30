@@ -1,0 +1,16 @@
+{
+  "appliedFields": [
+    "humanProfileNote"
+  ],
+  "candidateHash": "candidate-hash",
+  "committed": true,
+  "committedAt": "2023-11-14T22:13:20Z",
+  "impactScope": "current_contact",
+  "previewId": "507f1f77bcf86cd799439011",
+  "skippedFields": [
+    {
+      "field": "operationState",
+      "reason": "not_allowed"
+    }
+  ]
+}

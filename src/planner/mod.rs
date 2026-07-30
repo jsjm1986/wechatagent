@@ -90,7 +90,13 @@ fn contact_stagnation_value(contact: &Contact, dim: &str) -> String {
         .domain_attributes
         .as_ref()
         .and_then(|attributes| attributes.get(dim))
-        .map(ToString::to_string)
+        // BSON Display renders strings with JSON quotes. Preserve the raw
+        // business value for stable generation identities; non-string custom
+        // dimensions retain their canonical BSON rendering.
+        .map(|value| match value {
+            mongodb::bson::Bson::String(text) => text.clone(),
+            other => other.to_string(),
+        })
         .unwrap_or_else(|| "<missing>".to_string())
 }
 

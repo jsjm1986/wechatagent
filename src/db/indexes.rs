@@ -350,10 +350,9 @@ fn principal_card_delivery_reconcile_index() -> IndexModel {
         })
         .options(
             IndexOptions::builder()
-                .name("principal_card_delivery_reconcile_idx".to_string())
+                .name("principal_card_delivery_reconcile_v2_idx".to_string())
                 .partial_filter_expression(doc! {
                     "status": "pending",
-                    "protocol.delivery_state": { "$in": ["pending_enqueue", "queued"] },
                 })
                 .build(),
         )
@@ -1722,6 +1721,30 @@ mod tests {
     }
 
     #[test]
+    fn principal_card_delivery_reconcile_index_uses_legal_partial_filter() {
+        let index = principal_card_delivery_reconcile_index();
+        assert_eq!(
+            index.keys,
+            doc! {
+                "status": 1,
+                "protocol.delivery_state": 1,
+                "_id": 1,
+            }
+        );
+        let options = index
+            .options
+            .expect("principal card delivery reconcile index options");
+        assert_eq!(
+            options.name.as_deref(),
+            Some("principal_card_delivery_reconcile_v2_idx")
+        );
+        assert_eq!(
+            options.partial_filter_expression,
+            Some(doc! { "status": "pending" })
+        );
+    }
+
+    #[test]
     fn principal_pending_dedupe_index_uses_full_contact_identity() {
         let index = principal_escalation_pending_dedupe_index();
         assert_eq!(
@@ -3044,6 +3067,13 @@ async fn ensure_evolution_indexes(db: &Database) -> anyhow::Result<()> {
     db.agent_principal_escalations()
         .create_index(principal_relay_pending_index(), None)
         .await?;
+    // MongoDB partial indexes reject `$in` (Error 67). Retire the original
+    // definition before creating the compatible v2 index; otherwise servers
+    // that previously accepted it would fail startup with IndexOptionsConflict.
+    let _ = db
+        .agent_principal_escalations()
+        .drop_index("principal_card_delivery_reconcile_idx", None)
+        .await;
     db.agent_principal_escalations()
         .create_index(principal_card_delivery_reconcile_index(), None)
         .await?;

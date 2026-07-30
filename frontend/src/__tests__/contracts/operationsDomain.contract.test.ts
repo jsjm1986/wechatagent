@@ -8,6 +8,7 @@ import agentRunFixture from "../../contracts/agent_run.fixture.json";
 import decisionReviewFixture from "../../contracts/decision_review.fixture.json";
 import guidePreviewFixture from "../../contracts/guide_preview.fixture.json";
 import operationHealthFixture from "../../contracts/operation_health.fixture.json";
+import guideApplyReceiptFixture from "../../contracts/guide_apply_receipt.fixture.json";
 import { CANONICAL_KEYS as BEHAVIOR_SIGNAL_KEYS } from "../../contracts/behaviorSignalMetric.contract";
 import { CANONICAL_KEYS as OUTCOME_KEYS } from "../../contracts/outcomeMetric.contract";
 import { CANONICAL_KEYS as LLM_CALL_LOG_KEYS } from "../../contracts/llmCallLog.contract";
@@ -17,6 +18,7 @@ import { CANONICAL_KEYS as AGENT_RUN_KEYS } from "../../contracts/agentRun.contr
 import { CANONICAL_KEYS as DECISION_REVIEW_KEYS } from "../../contracts/decisionReview.contract";
 import { CANONICAL_KEYS as GUIDE_PREVIEW_KEYS } from "../../contracts/guidePreview.contract";
 import { CANONICAL_KEYS as OPERATION_HEALTH_KEYS } from "../../contracts/operationHealth.contract";
+import { CANONICAL_KEYS as GUIDE_APPLY_RECEIPT_KEYS } from "../../contracts/guideApplyReceipt.contract";
 
 // 后端投影写出的 fixture（线上真相源）与前端 CANONICAL_KEYS 双向键集对账。
 // missingInFrontend=后端发了前端没声明;deadInFrontend=前端声明了后端没发。
@@ -55,4 +57,6 @@ describe("契约: 运营/Agent 域投影键集对账", () => {
     assertKeysMatch("guidePreview", guidePreviewFixture, GUIDE_PREVIEW_KEYS));
   it("operation_health 聚合投影（顶层 scores+items）", () =>
     assertKeysMatch("operationHealth", operationHealthFixture, OPERATION_HEALTH_KEYS));
+  it("guide_apply_receipt 投影", () =>
+    assertKeysMatch("guideApplyReceipt", guideApplyReceiptFixture, GUIDE_APPLY_RECEIPT_KEYS));
 });

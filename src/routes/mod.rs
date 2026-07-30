@@ -1139,6 +1139,14 @@ mod tests {
             // publish_state_machine_version / rollout / rollback / domains.rs 直编路由复用，
             // 不直接绑 HTTP。
             "reconcile_state_policies_for_machine",
+            // admin_ops_versions.rs: transactional version append core used by
+            // the reset handler; not an axum extractor signature.
+            "append_default_operation_domain_version",
+            // contacts.rs: durable prepared-commit reconciler invoked by the task worker.
+            "reconcile_initial_profile_enrollment",
+            // domain_schemas.rs: exact-version activation core used by the HTTP
+            // handler and integration tests.
+            "activate_exact_version",
             // knowledge/chat.rs：chat_apply 落库内核（强制 draft+needs_review），被
             // chat_turn / chat_task 复用、不直接绑 HTTP；knowledge_chat_apply_integration.rs
             // 通过 `pub` 直调断言"AI 永不自动 verify"红线。
@@ -1156,6 +1164,15 @@ mod tests {
             // knowledge/chat.rs：chunk 更新落库内核（强制 draft+needs_review），被 chat_apply
             // 与 knowledge_task worker（retag action）复用、不直接绑 HTTP。
             "apply_update_chunk",
+            // Transaction-aware worker cores. Their callers own the MongoDB
+            // session and compose these writes with durable task state.
+            "ingest_chunked_text_with_session",
+            "apply_create_chunk_with_session",
+            "apply_update_chunk_with_session",
+            // shared.rs: validate/prepare and transactional persist halves of
+            // outcome recording, reused by suspected-deal approval.
+            "prepare_outcome_event",
+            "persist_prepared_outcome_event_with_session",
             // contacts.rs：批量托管异步初始画像任务处理器，被 tasks.rs worker
             // （task.kind=="initial_profile"）调用、不直接绑 HTTP。
             "handle_initial_profile_task",

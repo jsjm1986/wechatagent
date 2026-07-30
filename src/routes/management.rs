@@ -3246,6 +3246,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tool_call_json_matches_contract_fixture() {
+        let call = AgentToolCall {
+            id: Some(mongodb::bson::oid::ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap()),
+            workspace_id: "ws-1".to_string(),
+            account_id: "acc-1".to_string(),
+            command_run_id: mongodb::bson::oid::ObjectId::parse_str("507f1f77bcf86cd799439012")
+                .unwrap(),
+            intent_key: Some("management-tool:v1:fixture".to_string()),
+            call_index: 0,
+            tool_name: "wechatagent.search_contacts".to_string(),
+            arguments: doc! { "query": "Alice" },
+            status: "succeeded".to_string(),
+            response: Some(doc! { "count": 1 }),
+            error: None,
+            execution_started_at: Some(DateTime::from_millis(1_700_000_000_000)),
+            finalized_at: Some(DateTime::from_millis(1_700_000_000_100)),
+            created_at: DateTime::from_millis(1_700_000_000_000),
+            updated_at: DateTime::from_millis(1_700_000_000_100),
+        };
+        crate::routes::contract_snapshot::assert_contract_fixture(
+            "tool_call",
+            tool_call_json(&call),
+        );
+    }
+
+    #[test]
     fn tool_effect_classifies_risk() {
         assert_eq!(
             tool_effect("wechatagent.search_contacts").risk,

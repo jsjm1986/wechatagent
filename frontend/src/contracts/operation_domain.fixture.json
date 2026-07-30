@@ -3,6 +3,7 @@
     "dailyPushCap": 10,
     "deciderChain": [
       {
+        "accountId": "acc-1",
         "displayName": "张总",
         "wxid": "wxid_leader"
       }
