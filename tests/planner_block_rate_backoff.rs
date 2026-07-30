@@ -104,6 +104,7 @@ async fn insert_run_log(app: &common::TestApp, wxid: &str, status: &str) {
 #[ignore]
 async fn planner_silent_segment_skips_when_block_rate_above_threshold() {
     let app = common::TestApp::start_repl_set().await;
+    common::ensure_test_account(&app.state, "default", "default").await;
 
     // 一个 managed + 静默 contact。
     app.state
@@ -205,6 +206,7 @@ async fn planner_silent_segment_skips_when_block_rate_above_threshold() {
 #[ignore]
 async fn planner_silent_segment_passes_when_under_min_runs() {
     let app = common::TestApp::start_repl_set().await;
+    common::ensure_test_account(&app.state, "default", "default").await;
 
     app.state
         .db

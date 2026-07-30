@@ -163,7 +163,8 @@ fn assist_override_request(mode: &str) -> AssistOverrideRequest {
 /// 构造 `ReviewRequest`（同上）。
 fn review_request(status: &str, note: Option<&str>) -> ReviewRequest {
     serde_json::from_value(json!({
-        "expectedScope": "workspace",
+        "expectedScope": "account",
+        "expectedAccountId": "default",
         "status": status,
         "note": note
     }))

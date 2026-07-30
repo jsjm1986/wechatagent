@@ -133,6 +133,7 @@ async fn seed_active_profile(db: &wechatagent::db::Database, mut profile: Domain
 #[serial]
 async fn calendar_care_emits_for_emotional_profile_today_anniversary() {
     let app = common::TestApp::start_repl_set().await;
+    common::ensure_test_account(&app.state, WORKSPACE, ACCOUNT).await;
 
     // 情感陪伴 profile：calendar 开 + anniversaries date_dimension。
     seed_active_profile(
@@ -247,6 +248,7 @@ async fn calendar_care_emits_for_emotional_profile_today_anniversary() {
 #[serial]
 async fn calendar_care_no_emit_for_default_sales_profile() {
     let app = common::TestApp::start_repl_set().await;
+    common::ensure_test_account(&app.state, WORKSPACE, ACCOUNT).await;
 
     // DEFAULT 销售 profile：calendar 关、无 date_dimension → scan_calendar 整段 no-op。
     seed_active_profile(&app.state.db, default_domain_profile(WORKSPACE)).await;

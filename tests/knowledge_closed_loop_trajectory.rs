@@ -104,6 +104,7 @@ async fn chat_apply_verify_then_answer_is_auditable_closed_loop() {
     let app = TestApp::start_repl_set().await;
     let result = AssertUnwindSafe(async {
         reset_ws(&app).await;
+        common::ensure_test_account(&app.state, WS, &app.state.config.default_account_id).await;
         let admin = AuthenticatedAdmin {
             user_id: "closed_loop_admin".into(),
             username: "closed_loop_admin".into(),

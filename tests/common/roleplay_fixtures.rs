@@ -138,8 +138,8 @@ pub fn disable_quiet_hours_for_contact(contact: &mut Contact) {
 /// **时序红线**：必须在 `TestApp::start()`**之后**调用——`start()` 内部
 /// `ensure_prompt_pack_v2` 会 `delete_many` 再 insert，提前覆写会被清掉（设计 §5.3）。
 ///
-/// 机制：插入一条同 `(workspace_id, prompt_key)`、`status="active"`、`version` 更高
-/// 的模板。`load_prompt` 按 `version desc` 取一条，故新版本胜出。
+/// 机制：先释放现有 canonical current pointer，再插入测试 override 作为新 current。
+/// 这与生产的 single-current 索引契约一致。
 pub async fn override_review_prompt(
     app: &TestApp,
     workspace_id: &str,
@@ -169,6 +169,24 @@ pub async fn override_review_prompt(
         locale: Some(prompts::DEFAULT_LOCALE.to_string()),
         source_proposal_id: None,
     };
+    app.state
+        .db
+        .prompt_templates()
+        .update_many(
+            doc! {
+                "workspace_id": workspace_id,
+                "prompt_key": prompt_key,
+                "current_version": true,
+            },
+            doc! { "$set": {
+                "current_version": false,
+                "status": "archived",
+                "updated_at": now,
+            }},
+            None,
+        )
+        .await
+        .expect("archive current review prompt");
     app.state
         .db
         .prompt_templates()

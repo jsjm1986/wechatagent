@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use mongodb::bson::{doc, oid::ObjectId, DateTime};
+use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
 use serde_json::Value;
 use testcontainers::ContainerAsync;
 use testcontainers_modules::mongo::Mongo;
@@ -33,8 +33,59 @@ use wechatagent::db::Database;
 use wechatagent::error::{AppError, AppResult};
 use wechatagent::llm::{ChatUsage, LlmJsonResult, LlmProvider};
 use wechatagent::mcp::McpClient;
+use wechatagent::models::WechatAccount;
 use wechatagent::prompts;
 use wechatagent::routes::AppState;
+
+pub fn test_account_document(workspace_id: &str, account_id: &str) -> Document {
+    let now = DateTime::now();
+    mongodb::bson::to_document(&WechatAccount {
+        id: None,
+        workspace_id: workspace_id.to_string(),
+        account_id: account_id.to_string(),
+        alias: account_id.to_string(),
+        display_name: account_id.to_string(),
+        app_id: None,
+        wxid: None,
+        nick_name: None,
+        avatar_url: None,
+        mcp_base_url: None,
+        mcp_api_key: None,
+        webhook_secret: None,
+        online: true,
+        status: Some("active".to_string()),
+        last_sync_at: now,
+        capacity: 0,
+        persona_tag: None,
+        off_hours: Vec::new(),
+        created_at: now,
+        updated_at: now,
+    })
+    .expect("serialize test account")
+}
+
+/// Register an account scope required by workers and scoped MCP resolution.
+///
+/// The upsert is intentionally insert-only: tests that seed account-specific
+/// credentials keep them, while worker tests can opt in without weakening the
+/// production fail-closed behavior for unknown accounts.
+pub async fn ensure_test_account(state: &AppState, workspace_id: &str, account_id: &str) {
+    state
+        .db
+        .accounts()
+        .update_one(
+            doc! {
+                "workspace_id": workspace_id,
+                "account_id": account_id,
+            },
+            doc! { "$setOnInsert": test_account_document(workspace_id, account_id) },
+            mongodb::options::UpdateOptions::builder()
+                .upsert(true)
+                .build(),
+        )
+        .await
+        .expect("ensure test account");
+}
 
 /// 手写 LLM 生成器，用预先排队好的响应满足后续调用。
 ///
@@ -51,7 +102,12 @@ impl TestLlmGenerator {
     pub fn push_response(&self, value: Value) {
         let result = LlmJsonResult {
             value,
-            usage: ChatUsage::default(),
+            // A queued mock response models a successful upstream response.
+            // Zero tokens are measured zero, not missing usage telemetry.
+            usage: ChatUsage {
+                usage_known: true,
+                ..Default::default()
+            },
             latency_ms: 0,
             model: "test-model".to_string(),
             retry_count: 0,

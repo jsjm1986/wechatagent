@@ -50,15 +50,9 @@ async fn reconcile_prompt_currents(db: &Database) -> AppResult<()> {
         else {
             continue;
         };
-        // Promote first, then demote the rest. A process stop between the two
-        // writes can temporarily leave multiple currents, but never zero;
-        // rerunning this unmarked idempotent migration reconciles to one.
-        coll.update_one(
-            doc! { "_id": target_id },
-            doc! { "$set": { "current_version": true } },
-            None,
-        )
-        .await?;
+        // The single-current unique index may already exist on an upgraded
+        // database. Demote the old pointer before promoting the winner so the
+        // corrective migration can run under that index without E11000.
         coll.update_many(
             doc! {
                 "workspace_id": workspace_id,
@@ -66,6 +60,12 @@ async fn reconcile_prompt_currents(db: &Database) -> AppResult<()> {
                 "_id": { "$ne": target_id },
             },
             doc! { "$set": { "current_version": false } },
+            None,
+        )
+        .await?;
+        coll.update_one(
+            doc! { "_id": target_id },
+            doc! { "$set": { "current_version": true } },
             None,
         )
         .await?;

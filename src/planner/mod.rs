@@ -1684,6 +1684,7 @@ async fn scan_stage_stagnation(
 ///   跨年（12-31 + lookahead 落到次年 01-01）与闰年 02-29 由"按月日集合匹配"自然覆盖。
 /// - `recurring=false`（"YYYY-MM-DD"）：比完整年月日，落在 [today, today+lookahead] 内即 true。
 /// - 解析失败（旧库纯字符串条目 / 非法日期）→ false（向后兼容，不 panic）。
+#[cfg(test)]
 pub(crate) fn anniversary_due_today(
     entry: &AnniversaryEntry,
     today_year: i32,

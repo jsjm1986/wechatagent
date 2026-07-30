@@ -27,9 +27,7 @@ use wechatagent::agent::{
     handle_managed_message, process_entry, reclaim_expired_leases, second_safety_gate,
     EnqueueOutcome, EnqueueRequest, OutboxStatus,
 };
-use wechatagent::models::{
-    Contact, ConversationMessage, MessageDirection, ReferralCard, WechatAccount,
-};
+use wechatagent::models::{Contact, ConversationMessage, MessageDirection, ReferralCard};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -94,37 +92,7 @@ fn make_contact(wxid: &str) -> Contact {
 /// workspace; this row proves the account exists without weakening the
 /// production fail-closed boundary for unknown accounts.
 async fn seed_default_mcp_account(state: &wechatagent::routes::AppState) {
-    let now = DateTime::now();
-    state
-        .db
-        .accounts()
-        .insert_one(
-            WechatAccount {
-                id: Some(ObjectId::new()),
-                workspace_id: "default".to_string(),
-                account_id: "default".to_string(),
-                alias: "outbox_delivery_redline".to_string(),
-                display_name: "Outbox delivery redline account".to_string(),
-                app_id: Some(format!("outbox-redline-{}", ObjectId::new().to_hex())),
-                wxid: Some("wxid_outbox_redline_self".to_string()),
-                nick_name: None,
-                avatar_url: None,
-                mcp_base_url: None,
-                mcp_api_key: None,
-                webhook_secret: None,
-                online: true,
-                status: Some("active".to_string()),
-                last_sync_at: now,
-                capacity: 0,
-                persona_tag: None,
-                off_hours: Vec::new(),
-                created_at: now,
-                updated_at: now,
-            },
-            None,
-        )
-        .await
-        .expect("seed scoped MCP account");
+    common::ensure_test_account(state, "default", "default").await;
 }
 
 /// 每次请求返回唯一 `newMsgId` 的成功 responder。
@@ -500,6 +468,7 @@ async fn happy_path_enqueue_claim_send_sent() {
     let app = common::TestApp::start().await;
     let mcp_server = start_mcp_mock_success().await;
     let state = common::rebuild_app_state_with_mcp_url(&app, mcp_server.uri());
+    seed_default_mcp_account(&state).await;
 
     let contact = make_contact("user_happy");
     state
@@ -884,6 +853,7 @@ async fn mixed_run_status_is_order_independent() {
     let app = common::TestApp::start().await;
     let mcp_server = start_mcp_mock_success().await;
     let state = common::rebuild_app_state_with_mcp_url(&app, mcp_server.uri());
+    seed_default_mcp_account(&state).await;
 
     let contact = make_contact("audit_mixed_run_status");
     state
@@ -1392,6 +1362,7 @@ async fn crash_recovery_worker_b_reclaims_after_lease_expires() {
     let app = common::TestApp::start().await;
     let mcp_server = start_mcp_mock_success().await;
     let state = common::rebuild_app_state_with_mcp_url(&app, mcp_server.uri());
+    seed_default_mcp_account(&state).await;
 
     let contact = make_contact("user_crash");
     state
@@ -1467,6 +1438,7 @@ async fn idempotency_key_yields_at_most_one_mcp_send() {
     let app = common::TestApp::start().await;
     let mcp_server = start_mcp_mock_success().await;
     let state = common::rebuild_app_state_with_mcp_url(&app, mcp_server.uri());
+    seed_default_mcp_account(&state).await;
 
     let contact = make_contact("user_idem");
     state
@@ -1555,6 +1527,7 @@ async fn over_soft_cap_emits_warning_event() {
     let app = common::TestApp::start().await;
     let mcp_server = start_mcp_mock_success().await;
     let mut state = common::rebuild_app_state_with_mcp_url(&app, mcp_server.uri());
+    seed_default_mcp_account(&state).await;
     // cap=1：预置 1 条 sent 后再发一条即达上限，触发 warning。
     state.config.account_daily_send_soft_cap = 1;
 
@@ -1642,6 +1615,7 @@ async fn under_soft_cap_emits_no_warning_event() {
     let app = common::TestApp::start().await;
     let mcp_server = start_mcp_mock_success().await;
     let state = common::rebuild_app_state_with_mcp_url(&app, mcp_server.uri());
+    seed_default_mcp_account(&state).await;
     // 默认 cap=500，一条发送远未达上限。
 
     let contact = make_contact("user_softcap_under");
@@ -1821,6 +1795,7 @@ async fn account_pacing_gate_allows_after_interval() {
     let app = common::TestApp::start().await;
     let mcp_server = start_mcp_mock_success().await;
     let mut state = common::rebuild_app_state_with_mcp_url(&app, mcp_server.uri());
+    seed_default_mcp_account(&state).await;
     state.config.account_send_min_interval_ms = 2000;
     state.config.account_send_max_interval_ms = 2000;
 
@@ -1898,6 +1873,7 @@ async fn account_pacing_gate_isolates_accounts() {
     let app = common::TestApp::start().await;
     let mcp_server = start_mcp_mock_success().await;
     let mut state = common::rebuild_app_state_with_mcp_url(&app, mcp_server.uri());
+    seed_default_mcp_account(&state).await;
     state.config.account_send_min_interval_ms = 2000;
     state.config.account_send_max_interval_ms = 2000;
 
@@ -1971,6 +1947,7 @@ async fn account_pacing_gate_first_send_not_blocked() {
     let app = common::TestApp::start().await;
     let mcp_server = start_mcp_mock_success().await;
     let mut state = common::rebuild_app_state_with_mcp_url(&app, mcp_server.uri());
+    seed_default_mcp_account(&state).await;
     state.config.account_send_min_interval_ms = 2000;
     state.config.account_send_max_interval_ms = 2000;
 
@@ -2402,6 +2379,7 @@ async fn reclaim_gate_precedes_pacing_gate() {
 #[ignore]
 async fn reclaim_text_verifies_via_chat_search_before_local() {
     let app = common::TestApp::start().await;
+    seed_default_mcp_account(&app.state).await;
     let contact = make_contact("user_reclaim_chat_search");
     app.state
         .db

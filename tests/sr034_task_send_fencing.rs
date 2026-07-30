@@ -352,6 +352,7 @@ async fn same_claim_authorization_allows_exactly_one_remote_send() {
     let app = common::TestApp::start().await;
     let mcp = start_mcp().await;
     let state = common::rebuild_app_state_with_mcp_url(&app, mcp.uri());
+    common::ensure_test_account(&state, "default", "default").await;
     let contact = contact("sr034-authorized");
     state
         .db

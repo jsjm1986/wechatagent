@@ -111,6 +111,7 @@ pub(crate) fn freeze_ask_human_policy(
 /// KD-04：from_wxid 是否是该 config 解析后 decider_chain 的成员。
 /// 复用 resolve_ask_human_policy（已内含旧 principal_decider 回落），故新旧配置都覆盖，
 /// 且覆盖链中全部决策人（含改派后的 next 决策人）。纯函数、无 IO。
+#[cfg(test)]
 pub(crate) fn is_decider_for_config(config: &OperationDomainConfig, from_wxid: &str) -> bool {
     resolve_ask_human_policy(config)
         .decider_chain

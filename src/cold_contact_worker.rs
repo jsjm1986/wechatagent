@@ -246,6 +246,7 @@ pub(crate) fn cold_candidate_passes_in_memory(contact: &Contact, _now_ms: i64) -
 /// 提取出来纯粹是为了让 `cap_reached(live_count, daily_cap)` 可单测：
 /// `live_count >= daily_cap` 时返回 true（应停止 emit）。`daily_cap == 0`
 /// 关停冷链路；负值视为 0；i64 溢出由 saturating 形式预防。
+#[cfg(test)]
 pub(crate) fn cap_reached(live_count: i64, daily_cap: i64) -> bool {
     let cap = daily_cap.max(0);
     live_count.max(0) >= cap

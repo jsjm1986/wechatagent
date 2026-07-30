@@ -235,6 +235,7 @@ pub fn decide_silence_signal(contact: &Contact, now_ms: i64, threshold_ms: i64) 
 }
 
 /// 单 tick emit cap：`emitted >= cap` 时停止。`cap <= 0` 关停（任意 emit 都停）。
+#[cfg(test)]
 pub(crate) fn cap_reached(emitted: i64, daily_cap: i64) -> bool {
     let cap = daily_cap.max(0);
     emitted.max(0) >= cap

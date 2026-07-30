@@ -1113,6 +1113,7 @@ async fn delivery_commits_promise_and_follow_up_only_after_sent() {
     let review_id = outbox.decision_id.expect("decision id");
     let mcp = start_delivery_mock().await;
     let state = common::rebuild_app_state_with_mcp_url(&app, mcp.uri());
+    common::ensure_test_account(&state, "default", "default").await;
     let claimed = atomic_claim_pending(&state, "full-flow-delivery", 60)
         .await
         .expect("claim pending outbox")

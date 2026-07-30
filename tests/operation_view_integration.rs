@@ -144,10 +144,16 @@ async fn active_view_returns_dimensions_and_taxonomy_labels() {
         .await
         .expect("insert active profile");
 
-    // 种 system_taxonomies：customer_stage:first_contact→初次接触。
+    // 种一条测试专属 taxonomy identity。默认 seed 已把 `first_contact`
+    // 声明为 `new_contact` 的 alias，不能再把它注册成第二个 canonical id。
     db.collection_system_taxonomies()
         .insert_one(
-            &make_taxonomy_entry(&ws, "customer_stage", "first_contact", "初次接触"),
+            &make_taxonomy_entry(
+                &ws,
+                "customer_stage",
+                "operation_view_first_contact",
+                "初次接触",
+            ),
             None,
         )
         .await
@@ -188,15 +194,15 @@ async fn active_view_returns_dimensions_and_taxonomy_labels() {
     assert_eq!(customer_stage_dim["displayName"], "客户阶段");
     assert_eq!(customer_stage_dim["participatesInDecision"], true);
 
-    // taxonomies.customer_stage[0] == {id:"first_contact", label:"初次接触"}。
+    // taxonomies.customer_stage 含测试专属 id→label 映射。
     let cs_values = body["taxonomies"]["customer_stage"]
         .as_array()
         .expect("customer_stage taxonomy array");
     assert!(
         cs_values
             .iter()
-            .any(|v| v["id"] == "first_contact" && v["label"] == "初次接触"),
-        "customer_stage 取值字典应含 first_contact→初次接触，实际: {cs_values:?}"
+            .any(|v| v["id"] == "operation_view_first_contact" && v["label"] == "初次接触"),
+        "customer_stage 取值字典应含测试专属 id→初次接触，实际: {cs_values:?}"
     );
 
     // M3：taxonomies 必含 relationship_type 键（即便取值为空数组），验证 ∪ 逻辑——

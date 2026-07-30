@@ -212,6 +212,7 @@ async fn deal_event_push_round_trip() {
 #[ignore = "需要 Docker / testcontainers MongoDB"]
 async fn silence_worker_single_round_idempotent() {
     let app = TestApp::start_repl_set().await;
+    common::ensure_test_account(&app.state, "default", "default").await;
     // 打开 worker flag + 极短阈值，让单轮 tick 立即判沉默。
     let mut state = app.state.clone();
     state.config.silence_signal_worker_enabled = true;

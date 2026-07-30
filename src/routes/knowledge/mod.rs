@@ -733,6 +733,7 @@ pub(super) fn operation_knowledge_chunk_from_request(
 /// `distortion_risks` 等请求体**能表达**的字段——它们的 integrity 判定由 handler 里的
 /// `apply_chunk_integrity` / `coerce_integrity_against_d2_gate` 负责，本函数不引入任何
 /// 自动 verify。
+#[cfg(test)]
 pub(super) fn preserve_unmodeled_chunk_fields(
     mut next: OperationKnowledgeChunk,
     existing: &OperationKnowledgeChunk,
@@ -1262,6 +1263,7 @@ fn chunk_verify_gate_reason(has_source_quote: bool, has_source_anchor: bool) -> 
 /// 调用方后门 D2 收口：create/PUT chunk 落库前，若调用方提交 `integrity_status="verified"`
 /// 但缺 sourceQuote 或 source_anchors（未过 D2 闸），降级为 needs_review 并留审计痕迹。
 /// 与 import 路径「锚点只作审核线索、最终 needs_review」语义一致；正路仍是走 /verify。
+#[cfg(test)]
 pub(in crate::routes) fn coerce_integrity_against_d2_gate(
     payload: &mut OperationKnowledgeChunkRequest,
 ) {

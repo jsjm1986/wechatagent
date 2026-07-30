@@ -85,7 +85,8 @@ async fn exercise_committed_add(app: &TestApp) -> anyhow::Result<()> {
 #[tokio::test]
 #[ignore]
 async fn committed_add_has_real_draft_side_effect() {
-    let app = TestApp::start().await;
+    // add_chunk commits a chunk + immutable revision in one transaction.
+    let app = TestApp::start_repl_set().await;
     let result = exercise_committed_add(&app).await;
     app.cleanup().await;
     result.expect("committed add must persist a draft");
