@@ -64,6 +64,7 @@ PRIVATE_URI = re.compile(
 )
 PRIVATE_KEY_MARKER = "-----BEGIN " + "PRIVATE KEY-----"
 MAX_UNTRACKED_BYTES = 5 * 1024 * 1024
+FORBIDDEN_TRACKED_PATHS = {".env.e2e"}
 
 # HC-001: this repository secret belongs to one provider configuration.  A
 # secret-only rotation is unsafe if a workflow still sends the replacement to
@@ -187,6 +188,10 @@ def candidate_files(include_untracked: bool) -> tuple[list[pathlib.Path], set[pa
 
 def scan_repository(include_untracked: bool = False) -> list[Finding]:
     findings: list[Finding] = []
+    tracked = git_files("--cached")
+    for path in tracked:
+        if path.as_posix() in FORBIDDEN_TRACKED_PATHS:
+            findings.append(Finding(path.as_posix(), 1, "private-env-must-not-be-tracked"))
     candidates, untracked = candidate_files(include_untracked)
     for path in candidates:
         if not path.is_file():
@@ -263,6 +268,7 @@ def self_test() -> None:
         for finding in scan_text(".github/workflows/binding-positive.yml", binding_positive)
     } == {"rotated-secret-provider-binding"}
     assert not scan_text(".github/workflows/binding-negative.yml", binding_negative)
+    assert ".env.e2e" in FORBIDDEN_TRACKED_PATHS
 
 
 def main() -> int:
