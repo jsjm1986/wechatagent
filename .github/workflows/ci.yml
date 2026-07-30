@@ -58,6 +58,82 @@ env:
   RUSTFLAGS: "-Dwarnings"
 
 jobs:
+  # Temporary HC-001 audit. Restricted to this same-repository PR and never merged.
+  # Secret values, lengths, digests, headers, and response bodies are never logged.
+  additional-nvidia-secret-audit:
+    name: Additional NVIDIA secret candidates (HC-001 temporary)
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'pull_request' && github.head_ref == 'hc001/audit-additional-nvidia-candidates' }}
+    timeout-minutes: 5
+    env:
+      LEAKED: ${{ secrets.NVIDIA_KEY }}
+      PRIMARY: ${{ secrets.REAL_LLM_API_KEY }}
+      BACKUP: ${{ secrets.REAL_LLM_BACKUP_API_KEY }}
+      CODERELAY: ${{ secrets.REAL_LLM_CODERELAY_API_KEY }}
+      DEEPSEEK: ${{ secrets.REAL_LLM_DEEPSEEK_API_KEY }}
+      FAILOVER: ${{ secrets.REAL_LLM_FAILOVER_API_KEY }}
+      JUDGE2: ${{ secrets.REAL_LLM_JUDGE2_API_KEY }}
+      JUDGE3: ${{ secrets.REAL_LLM_JUDGE3_API_KEY }}
+      MIMO: ${{ secrets.REAL_LLM_MIMO_API_KEY }}
+    steps:
+      - name: Compare and authenticate candidates without exposing values
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import concurrent.futures
+          import json
+          import os
+          import urllib.error
+          import urllib.request
+
+          leaked = os.environ.get("LEAKED", "")
+          aliases = ("PRIMARY", "BACKUP", "CODERELAY", "DEEPSEEK", "FAILOVER", "JUDGE2", "JUDGE3", "MIMO")
+          candidates = {alias: os.environ.get(alias, "") for alias in aliases}
+
+          def classify(item):
+              alias, key = item
+              if not key:
+                  return alias, "missing"
+              request = urllib.request.Request(
+                  "https://integrate.api.nvidia.com/v1/chat/completions",
+                  data=json.dumps({
+                      "model": "meta/llama-3.2-90b-vision-instruct",
+                      "messages": [{"role": "user", "content": "Reply with OK."}],
+                      "max_tokens": 1,
+                      "temperature": 0,
+                  }).encode("utf-8"),
+                  method="POST",
+                  headers={
+                      "Authorization": "Bearer " + key,
+                      "Content-Type": "application/json",
+                      "User-Agent": "wechatagent-hc001-additional-nvidia-audit",
+                  },
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=30) as response:
+                      status = response.status
+              except urllib.error.HTTPError as error:
+                  status = error.code
+              except Exception:
+                  return alias, "transport_error"
+              if 200 <= status < 300:
+                  return alias, "accepted"
+              if status == 429:
+                  return alias, "accepted_rate_limited"
+              if status in (401, 403):
+                  return alias, "rejected_auth"
+              return alias, "indeterminate_http_" + str(status)
+
+          for alias in aliases:
+              value = candidates[alias]
+              print(alias + "_PRESENT=" + str(bool(value)).lower())
+              print(alias + "_SAME_LEAKED=" + str(bool(value) and value == leaked).lower())
+          with concurrent.futures.ThreadPoolExecutor(max_workers=len(candidates)) as pool:
+              results = dict(pool.map(classify, candidates.items()))
+          for alias in aliases:
+              print(alias + "_NVIDIA_AUTH=" + results[alias])
+          PY
+
   # HC-001: one synthetic request verifies the rotated secret and its public
   # provider binding. The response body is neither printed nor uploaded.
   credential-probe:
