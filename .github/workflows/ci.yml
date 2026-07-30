@@ -210,6 +210,9 @@ jobs:
           python3 scripts/check-secrets.py --self-test
           python3 scripts/check-secrets.py
 
+      - name: Test biz-test cleanup command generation
+        run: python3 scripts/biz-test/test_cleanup.py
+
       # SR-004: keep critical business/security evidence blocking while the broad
       # Docker suite and variable model-quality suites remain diagnostic/nightly.
       - name: Check CI hard/soft gate policy (SR-004)
