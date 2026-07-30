@@ -9,10 +9,7 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum EvolutionError {
     #[error("evolution budget exceeded: tokens_used={tokens_used}, calls_used={calls_used}")]
-    BudgetExceeded {
-        tokens_used: i64,
-        calls_used: i32,
-    },
+    BudgetExceeded { tokens_used: i64, calls_used: i32 },
     #[error("envelope state invalid: {0}")]
     InvalidStatus(String),
     #[error("mongo error: {0}")]

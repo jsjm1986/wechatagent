@@ -49,11 +49,16 @@ type JudgmentBarProps = {
   contact: Contact;
   latestReview?: DecisionReview;
   health: OperationHealth | null;
-  escalationCount: number;
+  escalationCount: number | null;
   taxonomies: TaxonomyMap;
   onRiskClick: () => void;
   onEscalationClick: () => void;
 };
+
+export function escalationCountLabel(count: number | null): string | null {
+  if (count === null) return "请示计数不可用";
+  return count > 0 ? `待决策请示 ${count}` : null;
+}
 
 export function JudgmentBar({
   contact,
@@ -88,8 +93,8 @@ export function JudgmentBar({
   const inQuietHours = quiet?.inQuietHours === true;
   const wakeTime = formatWakeTime(quiet?.nextWakeAt);
 
-  // 请示灯：待裁决计数 > 0 亮蓝可点，跳统一收件箱。
-  const hasEscalation = escalationCount > 0;
+  // 请示灯：正数可点击；null 显示不可用，不能和真实 0 混淆。
+  const escalationLabel = escalationCountLabel(escalationCount);
 
   return (
     <div className={styles.judgmentBar} role="group" aria-label="AI 当前判断">
@@ -126,12 +131,18 @@ export function JudgmentBar({
         </span>
       )}
 
-      {hasEscalation && (
-        <button type="button" className={`${styles.chip} ${styles.chipScheduled} ${styles.chipButton}`} onClick={onEscalationClick}>
-          <Sparkles size={13} />
-          待决策请示 {escalationCount}
-        </button>
-      )}
+      {escalationLabel &&
+        (escalationCount === null ? (
+          <span className={`${styles.chip} ${styles.chipHeld}`}>
+            <Sparkles size={13} />
+            {escalationLabel}
+          </span>
+        ) : (
+          <button type="button" className={`${styles.chip} ${styles.chipScheduled} ${styles.chipButton}`} onClick={onEscalationClick}>
+            <Sparkles size={13} />
+            {escalationLabel}
+          </button>
+        ))}
     </div>
   );
 }

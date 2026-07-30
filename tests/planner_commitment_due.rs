@@ -87,7 +87,8 @@ fn structured(id: &str, text: &str, due_at: Option<DateTime>) -> CommitmentRepr 
 #[tokio::test]
 #[ignore]
 async fn planner_emits_commitment_overdue_and_imminent_only() {
-    let app = common::TestApp::start().await;
+    let app = common::TestApp::start_repl_set().await;
+    common::ensure_test_account(&app.state, "default", "default").await;
     let now_ms = DateTime::now().timestamp_millis();
 
     // 1) overdue: due_at 在 5 小时前
@@ -139,10 +140,7 @@ async fn planner_emits_commitment_overdue_and_imminent_only() {
     app.state
         .db
         .contacts()
-        .insert_many(
-            &[overdue, imminent, plain, future, normal, cooled],
-            None,
-        )
+        .insert_many(&[overdue, imminent, plain, future, normal, cooled], None)
         .await
         .expect("insert seed contacts");
 
@@ -213,7 +211,10 @@ async fn planner_emits_commitment_overdue_and_imminent_only() {
         .count_documents(doc! { "kind": "strategic_planner_commitment_tick" }, None)
         .await
         .expect("count commitment tick events");
-    assert_eq!(commitment_tick, 1, "每 tick 应记录一条 commitment_tick 事件");
+    assert_eq!(
+        commitment_tick, 1,
+        "每 tick 应记录一条 commitment_tick 事件"
+    );
 
     let overdue_emit = app
         .state

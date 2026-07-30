@@ -79,10 +79,7 @@ fn dispatch_planned_steps_respect_card_id_and_action_closed_set() {
     let mut seen_step_ids = std::collections::HashSet::new();
     for step in steps {
         let step_id = step["stepId"].as_str().unwrap();
-        assert!(
-            seen_step_ids.insert(step_id.to_string()),
-            "stepId 必须唯一"
-        );
+        assert!(seen_step_ids.insert(step_id.to_string()), "stepId 必须唯一");
         let card_id = step["cardId"].as_str().unwrap();
         assert!(
             allowed_card_ids.contains(&card_id),
@@ -139,7 +136,8 @@ fn dispatch_natural_reply_does_not_use_forbidden_phrases() {
         "hand-off",
         "hand off",
     ];
-    let reply = "我会按以下三步串行处理：先补切片出处，再重抽标签，最后提示评估候选；完成后请运营确认。";
+    let reply =
+        "我会按以下三步串行处理：先补切片出处，再重抽标签，最后提示评估候选；完成后请运营确认。";
     for word in forbidden {
         assert!(
             !reply.contains(word),

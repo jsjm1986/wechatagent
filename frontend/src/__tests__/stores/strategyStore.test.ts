@@ -20,7 +20,7 @@ describe("strategyStore.saveDomainProfile create/update 双路（D5 死链路修
   });
 
   it("无 editingProfile（新建）时走 POST /api/admin/domain-profiles", async () => {
-    (api.post as any).mockResolvedValue({ item: { id: "new1" } });
+    (api.post as any).mockResolvedValue({ item: { id: "new1", release_status: "draft" } });
     useStrategyStore.setState({
       editingProfile: null,
       profileDraft: { profile_id: "p_new", display_name: "新域" },
@@ -31,10 +31,11 @@ describe("strategyStore.saveDomainProfile create/update 双路（D5 死链路修
       expect.objectContaining({ profileId: "p_new" }),
     );
     expect(api.put).not.toHaveBeenCalled();
+    expect(useStrategyStore.getState().editingProfile?.id).toBe("new1");
   });
 
-  it("有 editingProfile（编辑）时走 PUT /api/admin/domain-profiles/:id", async () => {
-    (api.put as any).mockResolvedValue({ item: { id: "x1" } });
+  it("编辑已存在版本时锁定后端返回的新草稿 ID", async () => {
+    (api.put as any).mockResolvedValue({ item: { id: "x2", release_status: "draft" } });
     useStrategyStore.setState({
       editingProfile: { id: "x1" } as any,
       profileDraft: { display_name: "改" },
@@ -45,5 +46,15 @@ describe("strategyStore.saveDomainProfile create/update 双路（D5 死链路修
       expect.anything(),
     );
     expect(api.post).not.toHaveBeenCalled();
+    expect(useStrategyStore.getState().editingProfile?.id).toBe("x2");
+  });
+
+  it("SR-138: reset 请求必须携带精确认短语", async () => {
+    (api.post as any).mockResolvedValue({ ok: true });
+    await useStrategyStore.getState().resetSystemPromptPack("RESET PROMPT PACK");
+    expect(api.post).toHaveBeenCalledWith(
+      "/api/prompt-templates/reset-system-pack",
+      { confirmation: "RESET PROMPT PACK" },
+    );
   });
 });

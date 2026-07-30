@@ -50,6 +50,7 @@ import { GATEWAY_STATUS_LABELS, NEXT_BEST_ACTION_TYPE_LABELS, VERSION_STATUS_LAB
 import { useProfileStore, labelFor } from "../../stores/profileStore";
 import type { TaxonomyMap } from "../../stores/profileStore";
 import { useUserOpsStore } from "../../stores/userOpsStore";
+import { useAccountStore } from "../../stores/accountStore";
 import { overdueHours, formatRelativeTime } from "./poolHelpers";
 import TagTrustPanel from "./TagTrustPanel";
 import PersonalityPanel from "./PersonalityPanel";
@@ -198,10 +199,13 @@ export function UserOpsModeHeader({ mode, onMode }: { mode: UserOpsMode; onMode:
 }
 
 
-export function ChangePreview({ changes, readableChanges }: { changes: Record<string, unknown>; readableChanges?: string[] }) {
-  const items = readableChanges?.length
-    ? readableChanges.map((value) => ({ label: "将执行", value }))
-    : readableChangeItems(changes);
+export function ChangePreview({ authoritativeChanges }: {
+  authoritativeChanges: Array<{ target: string; label: string; before: unknown; after: unknown }>;
+}) {
+  const items = authoritativeChanges.map((change) => ({
+    label: `${change.target} / ${change.label}`,
+    value: `${formatChangeValue(change.before)} → ${formatChangeValue(change.after)}`,
+  }));
   if (!items.length) return <EmptyInline text="这次建议不需要直接改配置。" />;
   return (
     <div className="changePreviewList">
@@ -441,6 +445,7 @@ export function TraditionalOpsTabs({
 
 /** 批量启用候选（对齐 userOpsStore.batchEnable payload.candidates 形状）。 */
 export type BatchEnableCandidate = {
+  contactId: string;
   wxid: string;
   nickname?: string | null;
   remark?: string | null;
@@ -451,6 +456,7 @@ export type BatchEnableCandidate = {
 // contact → batch 候选映射（Contact 无 sex 字段，回落 null）。
 function toBatchCandidate(contact: Contact): BatchEnableCandidate {
   return {
+    contactId: contact.id,
     wxid: contact.wxid,
     nickname: contact.nickname ?? null,
     remark: contact.remark ?? null,
@@ -490,6 +496,7 @@ export function ContactsView({
   onLoadAll,
   onOpenContact,
   onQuery,
+  selectionScope,
   onBatchEnable,
   onHideFromPool
 }: {
@@ -504,6 +511,7 @@ export function ContactsView({
   onLoadAll: () => void;
   onOpenContact: (contact: Contact) => void;
   onQuery: (value: string) => void;
+  selectionScope?: string;
   // 批量/单人启用回调（index.tsx 注入：调 batchEnable + toast + 刷新列表/计数）。
   // 可选——纯展示渲染（如单元测试）不传时降级为只读列表。
   onBatchEnable?: (candidates: BatchEnableCandidate[]) => Promise<void>;
@@ -513,6 +521,12 @@ export function ContactsView({
   const [selectedWxids, setSelectedWxids] = useState<Set<string>>(new Set());
   const [batching, setBatching] = useState(false);
   const nowMs = Date.now();
+
+  // Selection belongs to one account snapshot. Account switches must destroy it
+  // before any action can reuse stale contact identities under the next account.
+  useEffect(() => {
+    setSelectedWxids(new Set());
+  }, [selectionScope]);
 
   // 待启用档才开放勾选（Agent 已在运营、全部档混档不勾选）。
   const selectable = contactTab === "normal" && !!onBatchEnable;
@@ -1115,7 +1129,7 @@ export function UserPlaybookPanel({
               onClick={() => onEditPlaybook(playbook)}
             >
               <strong>{playbook.name}</strong>
-              <span>v{playbook.version} / {playbookCreatedByLabel(playbook.createdBy)}{playbook.isDefault ? " / 默认" : ""}</span>
+              <span>v{playbook.version} / {playbookCreatedByLabel(playbook.createdBy)}{playbook.releaseStatus === "draft" ? " / 草稿" : ""}{playbook.isDefault ? " / 默认" : ""}</span>
               <p>{playbook.description || playbook.methodPrompt}</p>
             </button>
           ))}
@@ -1798,6 +1812,8 @@ function readableChangeItems(changes: Record<string, unknown>) {
 
 
 export function impactScopeLabel(scope?: string) {
+  if (scope === "workspace_user_operations") return "影响整个工作区的用户运营";
+  if (scope === "shared_playbook") return "影响共享运营剧本";
   if (scope === "all_user_operations") return "影响所有用户运营";
   if (scope === "agent_personality") return "影响 Agent 整体人格";
   return "只影响当前好友";
@@ -1841,17 +1857,18 @@ export function PlannerViewSection({ contact }: { contact: Contact | null }) {
   if (!contact) {
     return null;
   }
-  const stageUpdatedAt = contact.domainAttributesUpdatedAt;
-  const stageRaw = (() => {
-    const attrs = contact.domainAttributes;
-    if (!attrs || typeof attrs !== "object") return "";
-    const stage = (attrs as Record<string, unknown>).customer_stage;
-    return typeof stage === "string" ? stage : "";
-  })();
-  // 走字典翻译：英文 canonical → 中文 display_name；按 status 分流渲染（见下方 stageNode）。
-  const stageResult = stageRaw ? labelFor(taxonomies, "customer_stage", stageRaw) : null;
+  const stagnationDimension = contact.stagnationDimension || "customer_stage";
+  const stagnationValue = contact.stagnationValue || "";
+  const stagnationUpdatedAt = contact.stagnationUpdatedAt;
+  const stagnationDimensionLabel =
+    dimensions.find((dimension) => dimension.kind === stagnationDimension)?.displayName ||
+    (stagnationDimension === "customer_stage" ? "运营阶段" : stagnationDimension);
+  // 值和时间必须来自后端同一个 Planner 停滞维度投影，不能从容器更新时间推断。
+  const stageResult = stagnationValue
+    ? labelFor(taxonomies, stagnationDimension, stagnationValue)
+    : null;
   const commitments = (contact.commitments ?? []).slice(0, 5);
-  const hasStage = !!stageUpdatedAt;
+  const hasStage = !!stagnationValue || !!stagnationUpdatedAt;
   const hasCommitments = commitments.length > 0;
   const lastMode = (contact as { lastConversationMode?: string | null }).lastConversationMode || null;
   const hasMode = !!lastMode;
@@ -1881,7 +1898,7 @@ export function PlannerViewSection({ contact }: { contact: Contact | null }) {
       )}
       {hasStage && (
         <div data-testid="planner-stage-row" style={{ fontSize: 13, color: "#444", marginBottom: 8 }}>
-          运营阶段 {(() => {
+          {stagnationDimensionLabel} {(() => {
             if (!stageResult) return <strong>未分层</strong>;
             if (stageResult.status === "unknown_value") {
               return (
@@ -1899,7 +1916,7 @@ export function PlannerViewSection({ contact }: { contact: Contact | null }) {
             }
             return <strong>{stageResult.text}</strong>;
           })()}
-          ：自 <span>{formatStageTimestamp(stageUpdatedAt!)}</span> 起未变更
+          ：自 <span>{stagnationUpdatedAt ? formatStageTimestamp(stagnationUpdatedAt) : "时间未知"}</span> 起未变更
         </div>
       )}
       {hasCommitments && (
@@ -1955,6 +1972,7 @@ export function PlannerViewSection({ contact }: { contact: Contact | null }) {
  *  选中客户 wxid 变化时随画像同生命周期重新拉取；客户端故障置空不崩页。 */
 
 export function SendHistorySection({ wxid }: { wxid: string }) {
+  const accountId = useAccountStore((s) => s.currentAccountId());
   const [items, setItems] = useState<SendHistoryItem[]>([]);
   const [loaded, setLoaded] = useState(false);
   // 区分「拉取失败」与「确实没发过」：失败时绝不渲染"还没发过"这句事实性断言，
@@ -1970,8 +1988,16 @@ export function SendHistorySection({ wxid }: { wxid: string }) {
       setLoaded(true);
       return;
     }
+    if (!accountId) {
+      setFailed(true);
+      setLoaded(true);
+      return;
+    }
+    const params = new URLSearchParams({ accountId });
     api
-      .get<{ items: SendHistoryItem[] }>(`/api/contacts/${wxid}/send-history`)
+      .get<{ items: SendHistoryItem[] }>(
+        `/api/contacts/${encodeURIComponent(wxid)}/send-history?${params}`
+      )
       .then((res) => {
         if (!alive) return;
         setItems(Array.isArray(res.items) ? res.items : []);
@@ -1985,7 +2011,7 @@ export function SendHistorySection({ wxid }: { wxid: string }) {
     return () => {
       alive = false;
     };
-  }, [wxid]);
+  }, [accountId, wxid]);
 
   if (loaded && failed) {
     return (

@@ -9,6 +9,7 @@
 
 #![allow(dead_code)]
 
+pub mod capability_evidence;
 pub mod dynamic;
 pub mod generalization;
 pub mod identity_generator;
@@ -22,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use mongodb::bson::{doc, oid::ObjectId, DateTime};
+use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
 use serde_json::Value;
 use testcontainers::ContainerAsync;
 use testcontainers_modules::mongo::Mongo;
@@ -32,8 +33,59 @@ use wechatagent::db::Database;
 use wechatagent::error::{AppError, AppResult};
 use wechatagent::llm::{ChatUsage, LlmJsonResult, LlmProvider};
 use wechatagent::mcp::McpClient;
+use wechatagent::models::WechatAccount;
 use wechatagent::prompts;
 use wechatagent::routes::AppState;
+
+pub fn test_account_document(workspace_id: &str, account_id: &str) -> Document {
+    let now = DateTime::now();
+    mongodb::bson::to_document(&WechatAccount {
+        id: None,
+        workspace_id: workspace_id.to_string(),
+        account_id: account_id.to_string(),
+        alias: account_id.to_string(),
+        display_name: account_id.to_string(),
+        app_id: None,
+        wxid: None,
+        nick_name: None,
+        avatar_url: None,
+        mcp_base_url: None,
+        mcp_api_key: None,
+        webhook_secret: None,
+        online: true,
+        status: Some("active".to_string()),
+        last_sync_at: now,
+        capacity: 0,
+        persona_tag: None,
+        off_hours: Vec::new(),
+        created_at: now,
+        updated_at: now,
+    })
+    .expect("serialize test account")
+}
+
+/// Register an account scope required by workers and scoped MCP resolution.
+///
+/// The upsert is intentionally insert-only: tests that seed account-specific
+/// credentials keep them, while worker tests can opt in without weakening the
+/// production fail-closed behavior for unknown accounts.
+pub async fn ensure_test_account(state: &AppState, workspace_id: &str, account_id: &str) {
+    state
+        .db
+        .accounts()
+        .update_one(
+            doc! {
+                "workspace_id": workspace_id,
+                "account_id": account_id,
+            },
+            doc! { "$setOnInsert": test_account_document(workspace_id, account_id) },
+            mongodb::options::UpdateOptions::builder()
+                .upsert(true)
+                .build(),
+        )
+        .await
+        .expect("ensure test account");
+}
 
 /// 手写 LLM 生成器，用预先排队好的响应满足后续调用。
 ///
@@ -50,7 +102,12 @@ impl TestLlmGenerator {
     pub fn push_response(&self, value: Value) {
         let result = LlmJsonResult {
             value,
-            usage: ChatUsage::default(),
+            // A queued mock response models a successful upstream response.
+            // Zero tokens are measured zero, not missing usage telemetry.
+            usage: ChatUsage {
+                usage_known: true,
+                ..Default::default()
+            },
             latency_ms: 0,
             model: "test-model".to_string(),
             retry_count: 0,
@@ -87,6 +144,37 @@ impl TestLlmGenerator {
     }
 }
 
+/// 独立语义 ClaimGate 的严格“无需事实证据”响应。
+///
+/// Gateway 在每轮 Review 后都会再调用一次 `user.review.claim_gate`。集成测试必须显式
+/// 排入完整 schema，避免旧的 Reply→Review 两段 fixture 被第三次调用错位消费。
+pub fn independent_claim_gate_pass_json() -> Value {
+    serde_json::json!({
+        "requiresEvidence": false,
+        "claimKinds": [],
+        "hasCatalogClaims": false,
+        "catalogCoverageComplete": true,
+        "hasNonCatalogEvidenceClaims": false,
+        "catalogClaims": [],
+        "reason": "The candidate contains no independently verifiable business claim."
+    })
+}
+
+/// Independent ClaimGate verdict for a capability statement that must be backed by verified
+/// operation knowledge. This fixture is used only where the test has seeded and cited a verified
+/// chunk; it must not be used to bypass evidence checks in generic gateway-flow tests.
+pub fn independent_claim_gate_verified_knowledge_json() -> Value {
+    serde_json::json!({
+        "requiresEvidence": true,
+        "claimKinds": ["product_capability"],
+        "hasCatalogClaims": false,
+        "catalogCoverageComplete": true,
+        "hasNonCatalogEvidenceClaims": true,
+        "catalogClaims": [],
+        "reason": "The candidate asserts a product capability backed by cited verified knowledge."
+    })
+}
+
 #[async_trait]
 impl LlmProvider for TestLlmGenerator {
     async fn generate_json(&self, _system: &str, _user: &str) -> AppResult<Value> {
@@ -120,7 +208,8 @@ impl LlmProvider for TestLlmGenerator {
 pub struct TestApp {
     pub state: AppState,
     pub llm: Arc<TestLlmGenerator>,
-    _container: ContainerAsync<Mongo>,
+    _container: Option<ContainerAsync<Mongo>>,
+    external_mongo: bool,
 }
 
 impl TestApp {
@@ -148,26 +237,36 @@ impl TestApp {
         // OnceCell 一旦填充即不可变。
         let _ = wechatagent::APP_STARTED_AT.set(mongodb::bson::DateTime::now());
 
-        let container = if repl_set {
-            Mongo::repl_set()
-                .start()
+        // CI/default remains Testcontainers. Environments with a trusted local mongod but no
+        // Docker may opt in explicitly; every TestApp still gets a random isolated database.
+        let external_uri = std::env::var("TEST_MONGODB_URI")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        let external_mongo = external_uri.is_some();
+        let (container, uri) = if let Some(uri) = external_uri {
+            (None, uri)
+        } else {
+            let container = if repl_set {
+                Mongo::repl_set()
+                    .start()
+                    .await
+                    .expect("启动 mongo replica set 容器失败")
+            } else {
+                Mongo::default().start().await.expect("启动 mongo 容器失败")
+            };
+            let host = container.get_host().await.expect("获取容器 host 失败");
+            let port = container
+                .get_host_port_ipv4(27017)
                 .await
-                .expect("启动 mongo replica set 容器失败")
-        } else {
-            Mongo::default().start().await.expect("启动 mongo 容器失败")
-        };
-        let host = container.get_host().await.expect("获取容器 host 失败");
-        let port = container
-            .get_host_port_ipv4(27017)
-            .await
-            .expect("获取容器端口失败");
-        // 单节点 replica set 必须带 directConnection=true：否则驱动会按 RS 拓扑做
-        // server discovery，连到 rs.initiate() 在容器内 advertise 的 hostname（宿主不可达）
-        // → 连接挂起 / 超时。directConnection 强制单服务器直连，事务仍可在 RS 成员上提交。
-        let uri = if repl_set {
-            format!("mongodb://{host}:{port}/?directConnection=true")
-        } else {
-            format!("mongodb://{host}:{port}")
+                .expect("获取容器端口失败");
+            // 单节点 replica set 必须带 directConnection=true：否则驱动会按 RS 拓扑做
+            // server discovery，连到容器内 advertise 的 hostname（宿主不可达）。
+            let uri = if repl_set {
+                format!("mongodb://{host}:{port}/?directConnection=true")
+            } else {
+                format!("mongodb://{host}:{port}")
+            };
+            (Some(container), uri)
         };
         let db_name = format!("wechatagent_test_{}", uuid::Uuid::new_v4().simple());
 
@@ -206,7 +305,9 @@ impl TestApp {
         // 上面已 re-seed 销售域字典，这里把缓存对齐到本测试 DB 的字典内容，使后续
         // check_value / validate_dimension_value 能命中（否则缓存可能停留在空字典或
         // 别的测试 DB 状态）。warm_up 内部忽略 TTL 无条件 reload。
-        wechatagent::agent::init_global_taxonomy_cache(&db).await;
+        wechatagent::agent::init_global_taxonomy_cache(&db)
+            .await
+            .expect("warm taxonomy cache");
 
         // 同理预热**第二个**进程级 TTL 单例：active DomainProfile 缓存（domain_profile.rs
         // 的 GLOBAL_DOMAIN_PROFILE_CACHE，与 taxonomy 缓存同款 LazyLock+30s TTL）。
@@ -216,10 +317,19 @@ impl TestApp {
         // customer_stage 从 domain_signals 剔除 → C2 operation_state 派生回落
         // decision.operation_state。预热到本测试自己的 DB（无 active 行）→ 回落 DEFAULT
         // profile（声明 customer_stage participates_in_decision=true）→ 维度存活、派生正确。
-        wechatagent::agent::init_global_domain_profile_cache(&db).await;
+        wechatagent::agent::init_global_domain_profile_cache(&db)
+            .await
+            .expect("warm domain profile cache");
 
         let mcp = McpClient::new(config.mcp_base_url.clone(), config.mcp_api_key.clone())
             .expect("构造测试 mcp client 失败");
+        let auth_rate_limiter =
+            std::sync::Arc::new(wechatagent::auth::rate_limit::AuthRateLimiter::new(
+                config.auth_rate_limit_window_seconds,
+                config.auth_rate_limit_client_capacity,
+                config.auth_rate_limit_target_capacity,
+                config.auth_rate_limit_global_capacity,
+            ));
 
         let state = AppState {
             db,
@@ -238,6 +348,7 @@ impl TestApp {
             )
             .0,
             jwt_keys: None,
+            auth_rate_limiter,
             completeness_cache: std::sync::Arc::new(dashmap::DashMap::new()),
         };
         // M4 W4 Task 5.3：seed 完成后 fetch_add 一次，与 main.rs 行为一致。
@@ -249,6 +360,20 @@ impl TestApp {
             state,
             llm,
             _container: container,
+            external_mongo,
+        }
+    }
+
+    /// Explicitly remove the random database when TEST_MONGODB_URI is used. Container-backed
+    /// databases are removed with their container and need no manual cleanup.
+    pub async fn cleanup(self) {
+        if self.external_mongo {
+            self.state
+                .db
+                .raw()
+                .drop(None)
+                .await
+                .expect("删除外部 Mongo 隔离测试库失败");
         }
     }
 }
@@ -374,6 +499,10 @@ fn test_config(mongodb_uri: String, mongodb_database: String) -> AppConfig {
         session_cookie_secure: false,
         bootstrap_admin_username: None,
         bootstrap_admin_password: None,
+        auth_rate_limit_window_seconds: 300,
+        auth_rate_limit_client_capacity: 1000,
+        auth_rate_limit_target_capacity: 1000,
+        auth_rate_limit_global_capacity: 1000,
         webhook_verify_signature: false,
         webhook_timestamp_skew_seconds: 300,
         jwt_enabled: false,
@@ -387,7 +516,8 @@ fn test_config(mongodb_uri: String, mongodb_database: String) -> AppConfig {
     }
 }
 
-/// 轮询等待指定 outbox entry 进入终态（sent / failed_terminal / canceled）。
+/// 轮询等待指定 outbox entry 进入终态（sent / failed_terminal / canceled /
+/// delivery_unknown）。
 ///
 /// W4 / Task 5.8（R13.10 / requirements.md:549）：集成测试 helper —— dispatcher
 /// 异步推进状态机，调用方需要"决策入队 → worker 抢占 → 终态"完整链路结束。
@@ -409,7 +539,7 @@ pub async fn wait_for_outbox_processed(
             last_status = entry.status.clone();
             if matches!(
                 entry.status.as_str(),
-                "sent" | "failed_terminal" | "canceled"
+                "sent" | "failed_terminal" | "canceled" | "delivery_unknown"
             ) {
                 return entry;
             }
@@ -426,7 +556,8 @@ pub async fn wait_for_outbox_processed(
 ///
 /// W6 / Task 7.4（R0.7 / R13.10）：happy_path_run 集成测试在调用 `handle_managed_message`
 /// 之后并不掌握 `outbox._id`，只有 `run_id`，因此需要按 `run_id` 字段轮询。命中
-/// 终态 `sent / failed_terminal / canceled` 立即返回；超时 panic 报告最后状态。
+/// 终态 `sent / failed_terminal / canceled / delivery_unknown` 立即返回；超时 panic
+/// 报告最后状态。
 pub async fn wait_for_outbox_processed_by_run_id(
     state: &AppState,
     run_id: &str,
@@ -444,7 +575,7 @@ pub async fn wait_for_outbox_processed_by_run_id(
             last_status = entry.status.clone();
             if matches!(
                 entry.status.as_str(),
-                "sent" | "failed_terminal" | "canceled"
+                "sent" | "failed_terminal" | "canceled" | "delivery_unknown"
             ) {
                 return entry;
             }
@@ -480,8 +611,40 @@ pub fn rebuild_app_state_with_mcp_url(app: &TestApp, mcp_url: String) -> AppStat
         chunk_locks: app.state.chunk_locks.clone(),
         chunk_event_bus: app.state.chunk_event_bus.clone(),
         jwt_keys: app.state.jwt_keys.clone(),
+        auth_rate_limiter: app.state.auth_rate_limiter.clone(),
         completeness_cache: app.state.completeness_cache.clone(),
     }
+}
+
+/// Build an explicitly enabled Evolution release state for tests that exercise
+/// the administrative release boundary. The shared TestApp remains disabled by
+/// default so unrelated tests cannot accidentally bypass the production gate.
+pub async fn evolution_release_state(app: &TestApp, workspace: &str) -> AppState {
+    let mut state = app.state.clone();
+    state.config.evolution_enabled = true;
+    state
+        .db
+        .raw()
+        .collection::<mongodb::bson::Document>("evolution_runtime_flags")
+        .update_one(
+            doc! { "workspace_id": workspace },
+            doc! {
+                "$set": {
+                    "workspace_id": workspace,
+                    "enabled": true,
+                    "rollout_percent": 100_i64,
+                    "threshold_auto_release_enabled": false,
+                    "updated_by": "integration-test",
+                    "updated_at": DateTime::now(),
+                }
+            },
+            mongodb::options::UpdateOptions::builder()
+                .upsert(true)
+                .build(),
+        )
+        .await
+        .expect("enable evolution release test gate");
+    state
 }
 
 /// 插入一条 `proposal_kind="prompt"`, `status="released"` 的 proposal，供
@@ -495,6 +658,62 @@ pub async fn insert_released_prompt_proposal(
 ) -> ObjectId {
     let id = ObjectId::new();
     let now = DateTime::now();
+    let version = prev.parse::<i32>().expect("previous prompt version");
+    let templates = state
+        .db
+        .raw()
+        .collection::<mongodb::bson::Document>("prompt_templates");
+    let current = templates
+        .find_one(
+            doc! {
+                "workspace_id": workspace,
+                "prompt_key": key,
+                "current_version": true,
+            },
+            None,
+        )
+        .await
+        .expect("read current prompt artifact")
+        .expect("current prompt artifact");
+    let current_id = current.get_object_id("_id").expect("current prompt _id");
+    let current_version = current.get_i32("version").expect("current prompt version");
+    let current_content = current.get_str("content").expect("current prompt content");
+    let released_revision = wechatagent::evolution::revision::prompt_revision(
+        current_id,
+        current_version,
+        current_content,
+    );
+    let base_revision = match templates
+        .find_one(
+            doc! {
+                "workspace_id": workspace,
+                "prompt_key": key,
+                "version": version,
+            },
+            None,
+        )
+        .await
+        .expect("read prompt rollback baseline")
+    {
+        Some(base) => wechatagent::evolution::revision::prompt_revision(
+            base.get_object_id("_id").expect("baseline prompt _id"),
+            base.get_i32("version").expect("baseline prompt version"),
+            base.get_str("content").expect("baseline prompt content"),
+        ),
+        None => wechatagent::evolution::revision::prompt_revision(
+            ObjectId::new(),
+            version,
+            "missing rollback baseline",
+        ),
+    };
+    templates
+        .update_one(
+            doc! { "_id": current_id, "current_version": true },
+            doc! { "$set": { "source_proposal_id": id } },
+            None,
+        )
+        .await
+        .expect("bind current prompt artifact to proposal");
     state
         .db
         .raw()
@@ -508,6 +727,8 @@ pub async fn insert_released_prompt_proposal(
                 "proposal_kind": "prompt",
                 "status": "released",
                 "proposed_template_key": key,
+                "base_revision": base_revision,
+                "released_revision": released_revision,
                 "previous_prompt_version": prev,
                 "created_at": now,
                 "updated_at": now,
@@ -548,6 +769,7 @@ pub fn rebuild_app_state_with_real_llm(
         chunk_locks: app.state.chunk_locks.clone(),
         chunk_event_bus: app.state.chunk_event_bus.clone(),
         jwt_keys: app.state.jwt_keys.clone(),
+        auth_rate_limiter: app.state.auth_rate_limiter.clone(),
         completeness_cache: app.state.completeness_cache.clone(),
     }
 }

@@ -43,6 +43,7 @@ import type {
   ProposalSummary,
   ExperimentItem,
   ExperimentsResponse,
+  EvolutionAggregate7d,
   ShadowReplaySample,
   ShadowReplaysSummary,
   ProposalDetail,
@@ -59,6 +60,7 @@ export type {
   ProposalSummary,
   ExperimentItem,
   ExperimentsResponse,
+  EvolutionAggregate7d,
   ShadowReplaySample,
   ShadowReplaysSummary,
   ProposalDetail,
@@ -128,48 +130,11 @@ function auditActionLabel(action?: string | null): string {
   }
 }
 
-/// 7 天聚合（client 端从 experiments[] 推算 — 不打额外请求；后端尚未提供专用聚合 endpoint）。
-export function aggregateLast7Days(items: ExperimentItem[]): {
-  experiments: number;
-  proposals: number;
-  released: number;
-  rolledBack: number;
-  significancePassRate: number | null;
-} {
-  const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
-  let experiments = 0;
-  let proposals = 0;
-  let released = 0;
-  let rolledBack = 0;
-  let evaluated = 0;
-  let passed = 0;
-  for (const item of items) {
-    const startedMs = Date.parse(item.experiment.startedAt);
-    if (Number.isNaN(startedMs) || startedMs < cutoff) continue;
-    experiments += 1;
-    proposals += item.proposals.length;
-    for (const p of item.proposals) {
-      if (p.status === "released") released += 1;
-      if (p.status === "rolled_back") rolledBack += 1;
-      if (p.significancePassed !== null) {
-        evaluated += 1;
-        if (p.significancePassed === true) passed += 1;
-      }
-    }
-  }
-  return {
-    experiments,
-    proposals,
-    released,
-    rolledBack,
-    significancePassRate: evaluated === 0 ? null : passed / evaluated,
-  };
-}
-
 // ── 主组件 ──
 
 export function EvolutionCenterTab({ enabled = true }: { enabled?: boolean }) {
   const [items, setItems] = useState<ExperimentItem[]>([]);
+  const [serverAggregate, setServerAggregate] = useState<EvolutionAggregate7d | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string>("");
   const [selectedProposalId, setSelectedProposalId] = useState<string | null>(null);
@@ -202,6 +167,7 @@ export function EvolutionCenterTab({ enabled = true }: { enabled?: boolean }) {
   async function saveFlag() {
     setFlagBusy(true);
     setFlagMsg("");
+    setFlagError("");
     try {
       // 开=全量：enabled 时若高级灰度值为 0 则按 100 全量；关时保留原 rollout 值。
       const advanced = Math.max(0, Math.min(100, Number(rollout) || 0));
@@ -210,11 +176,14 @@ export function EvolutionCenterTab({ enabled = true }: { enabled?: boolean }) {
         enabled: flagEnabled,
         rolloutPercent: pct,
       });
-      setFlagEnabled(Boolean(resp.flag?.enabled ?? flagEnabled));
-      setRollout(String(resp.flag?.rolloutPercent ?? pct));
+      if (!resp.flag) throw new Error("保存成功响应缺少权威运行时配置");
+      setFlagEnabled(Boolean(resp.flag.enabled));
+      setRollout(String(resp.flag.rolloutPercent));
       setFlagMsg("演化中心总开关已保存");
     } catch (e) {
-      setFlagMsg(e instanceof Error ? e.message : String(e));
+      const message = e instanceof Error ? e.message : String(e);
+      setFlagError(message);
+      setFlagMsg(message);
     } finally {
       setFlagBusy(false);
     }
@@ -223,6 +192,7 @@ export function EvolutionCenterTab({ enabled = true }: { enabled?: boolean }) {
   async function saveFlagWith(nextEnabled: boolean) {
     setFlagBusy(true);
     setFlagMsg("");
+    setFlagError("");
     try {
       const advanced = Math.max(0, Math.min(100, Number(rollout) || 0));
       const pct = nextEnabled ? (advanced === 0 ? 100 : advanced) : advanced;
@@ -230,11 +200,14 @@ export function EvolutionCenterTab({ enabled = true }: { enabled?: boolean }) {
         enabled: nextEnabled,
         rolloutPercent: pct,
       });
-      setFlagEnabled(Boolean(resp.flag?.enabled ?? nextEnabled));
-      setRollout(String(resp.flag?.rolloutPercent ?? pct));
+      if (!resp.flag) throw new Error("保存成功响应缺少权威运行时配置");
+      setFlagEnabled(Boolean(resp.flag.enabled));
+      setRollout(String(resp.flag.rolloutPercent));
       setFlagMsg("演化中心总开关已保存");
     } catch (e) {
-      setFlagMsg(e instanceof Error ? e.message : String(e));
+      const message = e instanceof Error ? e.message : String(e);
+      setFlagError(message);
+      setFlagMsg(message);
     } finally {
       setFlagBusy(false);
     }
@@ -272,7 +245,11 @@ export function EvolutionCenterTab({ enabled = true }: { enabled?: boolean }) {
     setError("");
     try {
       const data = await apiGet<ExperimentsResponse>("/api/evolution/experiments?limit=20");
+      if (!data.aggregate7d?.coverage?.complete) {
+        throw new Error("服务端未返回完整的近 7 天统计覆盖");
+      }
       setItems(data.items || []);
+      setServerAggregate(data.aggregate7d);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -289,10 +266,6 @@ export function EvolutionCenterTab({ enabled = true }: { enabled?: boolean }) {
     void load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [enabled, envAllowed, flagEnabled]);
-
-  // useMemo 必须在任何早返回之前调用——hooks 调用顺序在每次渲染必须一致，
-  // 否则 envAllowed null→bool 跳变时早返回路径的 hook 数量不同 → React 崩溃。
-  const aggregate = useMemo(() => aggregateLast7Days(items), [items]);
 
   const proposalsFlat = useMemo<ProposalSummary[]>(
     () => items.flatMap((it) => it.proposals).sort((a, b) => b.createdAt.localeCompare(a.createdAt)),
@@ -336,16 +309,21 @@ export function EvolutionCenterTab({ enabled = true }: { enabled?: boolean }) {
         </div>
       )}
       <header className={styles.aggregate}>
-        <AggregateCard label="近 7 天实验" value={aggregate.experiments} testid="agg-experiments" />
-        <AggregateCard label="候选总数" value={aggregate.proposals} testid="agg-proposals" />
-        <AggregateCard label="已发布" value={aggregate.released} testid="agg-released" />
-        <AggregateCard label="已回滚" value={aggregate.rolledBack} testid="agg-rolled-back" />
+        <AggregateCard label="近 7 天实验" value={serverAggregate?.experiments ?? "—"} testid="agg-experiments" />
+        <AggregateCard label="候选总数" value={serverAggregate?.proposals ?? "—"} testid="agg-proposals" />
+        <AggregateCard label="已发布" value={serverAggregate?.released ?? "—"} testid="agg-released" />
+        <AggregateCard label="已回滚" value={serverAggregate?.rolledBack ?? "—"} testid="agg-rolled-back" />
         <AggregateCard
           label="显著性通过率"
-          value={formatPercent(aggregate.significancePassRate)}
+          value={formatPercent(serverAggregate?.significancePassRate ?? null)}
           testid="agg-significance"
         />
       </header>
+      <div data-testid="aggregate-coverage" role="status">
+        {serverAggregate?.coverage.complete
+          ? `完整 ${serverAggregate.coverage.windowHours} 小时窗口，扫描 ${serverAggregate.coverage.experimentsScanned} 个实验；截至 ${serverAggregate.coverage.asOf}`
+          : "近 7 天完整统计尚未加载"}
+      </div>
 
       <div className={styles.flagPanel} data-testid="runtime-flag-panel">
         <div className={styles.flagRow}>
@@ -354,8 +332,7 @@ export function EvolutionCenterTab({ enabled = true }: { enabled?: boolean }) {
               type="checkbox"
               checked={flagEnabled}
               onChange={(e) => {
-                setFlagEnabled(e.target.checked);
-                // 状态更新后保存：用新值直接 PUT，避免读到旧 state。
+                // 仅在 PUT 返回权威保存结果后更新本地状态；失败保持原值。
                 void saveFlagWith(e.target.checked);
               }}
               disabled={flagBusy}
@@ -384,7 +361,11 @@ export function EvolutionCenterTab({ enabled = true }: { enabled?: boolean }) {
           </button>
         </div>
         {flagMsg && (
-          <div className={styles.flagMsg} data-testid="runtime-flag-msg">
+          <div
+            className={styles.flagMsg}
+            data-testid="runtime-flag-msg"
+            role={flagError ? "alert" : "status"}
+          >
             {flagMsg}
           </div>
         )}

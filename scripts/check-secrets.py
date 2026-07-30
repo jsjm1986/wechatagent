@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Enforce the provider binding for the rotated GitHub Actions credential.
+"""Fail when source candidates contain credentials or unsafe provider bindings.
 
-Only workflow files are inspected. Findings report path, line, and rule; the
-credential value is never read, printed, hashed, or accepted by this tool.
+The checker deliberately reports only path, line and rule. It never prints the
+candidate value or a reversible digest. The CI default scans tracked files.
+Local audits may add ``--include-untracked``; oversized untracked candidates
+then fail closed instead of being silently skipped.
 """
 
 from __future__ import annotations
@@ -178,12 +180,7 @@ def git_files(*arguments: str) -> list[pathlib.Path]:
 def candidate_files(include_untracked: bool) -> tuple[list[pathlib.Path], set[pathlib.Path]]:
     tracked = git_files("--cached")
     untracked = git_files("--others", "--exclude-standard") if include_untracked else []
-    workflows = {
-        path
-        for path in tracked + untracked
-        if path.as_posix().startswith(".github/workflows/")
-    }
-    return sorted(workflows), set(untracked) & workflows
+    return sorted(set(tracked + untracked)), set(untracked)
 
 
 def scan_repository(include_untracked: bool = False) -> list[Finding]:

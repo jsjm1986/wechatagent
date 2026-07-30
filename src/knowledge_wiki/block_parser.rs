@@ -100,9 +100,9 @@ pub fn parse_chunk_blocks(input: &str) -> (Vec<ParsedChunkBlock>, ParseWarnings)
                 }
                 State::Inside { id, body: _ } => {
                     // 上一块没看到 ---END CHUNK---，就被新的 ---CHUNK: 打断 → 流截断
-                    warnings.items.push(ParseWarning::UnterminatedFence {
-                        id: id.to_string(),
-                    });
+                    warnings
+                        .items
+                        .push(ParseWarning::UnterminatedFence { id: id.to_string() });
                 }
             }
             // 安全 id 守门
@@ -177,9 +177,9 @@ pub fn parse_chunk_blocks(input: &str) -> (Vec<ParsedChunkBlock>, ParseWarnings)
         }
         State::Inside { id, body: _ } => {
             if id != "__unsafe__" {
-                warnings.items.push(ParseWarning::UnterminatedFence {
-                    id: id.to_string(),
-                });
+                warnings
+                    .items
+                    .push(ParseWarning::UnterminatedFence { id: id.to_string() });
             }
         }
     }
@@ -213,16 +213,7 @@ fn is_safe_block_id(id: &str) -> bool {
     id.chars().all(|c| {
         !matches!(
             c,
-            '/' | '\\'
-                | '<'
-                | '>'
-                | '|'
-                | '?'
-                | '*'
-                | '"'
-                | ':'
-                | '\0'..='\x1f'
-                | '\x7f'
+            '/' | '\\' | '<' | '>' | '|' | '?' | '*' | '"' | ':' | '\0'..='\x1f' | '\x7f'
         )
     })
 }
@@ -377,7 +368,8 @@ mod tests {
 
     #[test]
     fn warns_on_unterminated_last_block_but_keeps_earlier() {
-        let input = "---CHUNK: a---\n{\"body\":\"x\"}\n---END CHUNK---\n---CHUNK: b---\n{\"body\":\"y\"}\n";
+        let input =
+            "---CHUNK: a---\n{\"body\":\"x\"}\n---END CHUNK---\n---CHUNK: b---\n{\"body\":\"y\"}\n";
         let (blocks, warns) = parse_chunk_blocks(input);
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].id, "a");
@@ -403,10 +395,9 @@ mod tests {
         let input = "---CHUNK: a---\n{\"title\":\"T\"}\n---END CHUNK---\n";
         let (blocks, warns) = parse_chunk_blocks(input);
         assert!(blocks.is_empty());
-        assert!(warns
-            .items
-            .iter()
-            .any(|w| matches!(w, ParseWarning::InvalidJson { reason, .. } if reason.contains("empty"))));
+        assert!(warns.items.iter().any(
+            |w| matches!(w, ParseWarning::InvalidJson { reason, .. } if reason.contains("empty"))
+        ));
     }
 
     #[test]
@@ -431,7 +422,8 @@ mod tests {
 
     #[test]
     fn warns_on_stray_text_outside_fences() {
-        let input = "preamble noise\n---CHUNK: a---\n{\"body\":\"x\"}\n---END CHUNK---\ntrailer noise\n";
+        let input =
+            "preamble noise\n---CHUNK: a---\n{\"body\":\"x\"}\n---END CHUNK---\ntrailer noise\n";
         let (_blocks, warns) = parse_chunk_blocks(input);
         assert_eq!(
             warns

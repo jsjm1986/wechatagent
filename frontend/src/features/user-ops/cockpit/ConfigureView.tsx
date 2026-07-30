@@ -94,8 +94,9 @@ export function ConfigureView(props: CockpitPanelProps) {
   );
   if (!selected) return null;
   const currentPlaybook =
-    playbooks.find((playbook) => playbook.id === selectedPlaybookId) ||
+    playbooks.find((playbook) => playbook.id === selectedPlaybookId && playbook.releaseStatus === "published") ||
     playbooks.find((playbook) => playbook.isDefault);
+  const publishedPlaybooks = playbooks.filter((playbook) => playbook.releaseStatus === "published");
   const examples = [
     "更像朋友一点，自然一些",
     "这个用户比较忙，降低主动打扰频率",
@@ -135,12 +136,18 @@ export function ConfigureView(props: CockpitPanelProps) {
           <label>
             <span>运营风格模板</span>
             <select value={selectedPlaybookId} onChange={(event) => onSelectedPlaybook(event.target.value)}>
-              {playbooks.map((playbook) => (
+              {publishedPlaybooks.map((playbook) => (
                 <option key={playbook.id} value={playbook.id}>
                   {playbook.name}{playbook.isDefault ? " / 默认" : ""}
                 </option>
               ))}
             </select>
+            {selected.agentStatus === "managed" && (
+              <button className="secondary" onClick={onSaveRelationshipType} disabled={busy || !selectedPlaybookId} type="button">
+                <SquarePen size={16} />
+                保存运营风格
+              </button>
+            )}
           </label>
           <label>
             <span>你对这个用户的判断</span>
@@ -323,13 +330,24 @@ export function ConfigureView(props: CockpitPanelProps) {
               </div>
               <strong>修改预览</strong>
               <p>{guidePreview.summary}</p>
-              <ChangePreview changes={guidePreview.suggestedChanges} readableChanges={guidePreview.readableChanges} />
+              <ChangePreview authoritativeChanges={guidePreview.authoritativeChanges} />
               {guidePreview.riskWarnings.length > 0 && (
                 <div className="riskList">
                   {guidePreview.riskWarnings.map((warning, index) => <span key={`${warning}-${index}`}>{warning}</span>)}
                 </div>
               )}
-              <button onClick={onApplyGuidePreview} disabled={guideBusy}>
+              <button
+                onClick={() => {
+                  if (
+                    guidePreview.requiresStrongConfirmation &&
+                    !window.confirm(
+                      `${guidePreview.scopeReason}\n\n这不是单联系人修改。确认应用服务端列出的全部变更？`,
+                    )
+                  ) return;
+                  onApplyGuidePreview(guidePreview.requiresStrongConfirmation);
+                }}
+                disabled={guideBusy || !guidePreview.candidateHash}
+              >
                 确认应用
               </button>
             </div>

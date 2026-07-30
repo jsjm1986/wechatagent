@@ -26,7 +26,13 @@ pub(super) async fn run_step(db: &Database) -> AppResult<()> {
     // draft/inactive：运营手动 activate 才生效。
     profile.current_version = false;
     profile.is_active = false;
+    profile.release_status = "draft".to_string();
     profile.seeded_by = Some("system".to_string());
+    crate::models::validate_domain_profile_dimensions(&profile).map_err(|error| {
+        crate::error::AppError::External(format!(
+            "invalid seeded domain profile dimensions: {error}"
+        ))
+    })?;
     let mut doc_to_set = mongodb::bson::to_document(&profile)?;
     doc_to_set.remove("_id");
     let result = collection

@@ -1,5 +1,7 @@
 import { describe, it, expect } from "vitest";
-import { sortItems, severityRank, type InboxItem } from "../../lib/inboxApi";
+import { fetchSummary, sortItems, severityRank, type InboxItem } from "../../lib/inboxApi";
+import { api } from "../../lib/api";
+import { vi } from "vitest";
 
 function item(p: Partial<InboxItem>): InboxItem {
   return {
@@ -33,5 +35,21 @@ describe("sortItems", () => {
     const copy = [...input];
     sortItems(input);
     expect(input).toEqual(copy);
+  });
+});
+
+describe("fetchSummary", () => {
+  it("preserves unavailable counts as null", async () => {
+    vi.spyOn(api, "get").mockResolvedValueOnce({
+      status: "partial",
+      asOf: "2026-07-20T00:00:00Z",
+      counts: { principalEscalation: null, knowledgeReview: 2 },
+      errors: [{ source: "principal_escalation", error: "count unavailable" }],
+      total: null,
+    });
+    const summary = await fetchSummary();
+    expect(summary.counts.principalEscalation).toBeNull();
+    expect(summary.counts.knowledgeReview).toBe(2);
+    expect(summary.status).toBe("partial");
   });
 });

@@ -92,7 +92,10 @@ fn empty_state_machine_fails_closed() {
     // 启动期 sanity check 会拒绝这种配置；runtime 这里是 defense-in-depth。
     let cfg = empty_state_machine_config();
     let blocked = check_state_transition(Some(&cfg), Some("foo"), "bar");
-    assert!(blocked.is_some(), "empty state_machine + active domain 必须 fail-closed");
+    assert!(
+        blocked.is_some(),
+        "empty state_machine + active domain 必须 fail-closed"
+    );
     let reason = blocked.unwrap();
     assert!(reason.contains("state_transition_invalid"));
     assert!(reason.contains("state_machine_empty"));
@@ -109,7 +112,10 @@ fn unknown_target_state_fails_closed() {
     assert!(blocked.is_some(), "未登记 target 必须 fail-closed 拦截");
     let reason = blocked.unwrap();
     assert!(reason.contains("state_transition_invalid"));
-    assert!(reason.contains("unknown_target"), "拦截理由应标 unknown_target，实际：{reason}");
+    assert!(
+        reason.contains("unknown_target"),
+        "拦截理由应标 unknown_target，实际：{reason}"
+    );
 }
 
 #[test]
@@ -156,7 +162,10 @@ fn whitespace_from_treated_as_empty() {
     // 仅含空白的 from 应当被 trim 后视为 empty → 走 empty 分支。
     assert!(check_state_transition(Some(&cfg), Some("   "), "new_contact").is_none());
     let blocked = check_state_transition(Some(&cfg), Some("   "), "B");
-    assert!(blocked.is_some(), "trim 后空 from + non-new_contact target 必须拦截");
+    assert!(
+        blocked.is_some(),
+        "trim 后空 from + non-new_contact target 必须拦截"
+    );
 }
 
 proptest! {

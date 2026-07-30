@@ -12,7 +12,7 @@
 //!   contact_key 唯一，测试间零 generation/deadline 串扰。
 //! - MockLlm 队列空返回 `Err`（非 panic）→ push 足量响应，用 `llm.calls()` 断言实际触达。
 //! - 全新 contact 首轮 reaction claim 拿不到已 sent 的 decision_review → 跳过 reaction
-//!   LLM（0 调用）；单轮聚合只消费 decision + review = **2 次** LLM。
+//!   LLM（0 调用）；单轮聚合消费 decision + review + 独立 ClaimGate = **3 次** LLM。
 //! - 真 async runner 的"网关执行中途抢占"本质是竞态（MockLlm 响应近乎瞬时，晚到
 //!   入站只会落在去抖 sleep 期而非 gateway 期）→ 无法确定性复现。Step2/Step3 因此
 //!   **降级为可确定性验证的子命题**（见各测试注释与报告），绝不写靠 sleep 凑时序的
@@ -137,6 +137,7 @@ fn review_agent_pass_json(review_summary: &str) -> serde_json::Value {
             "relationshipProgress": 7,
             "conversionReadiness": 6,
             "pressureRisk": 2,
+            "boundaryPrivacySafety": 9,
             "factRisk": 1,
         },
         "claimAnalysis": {
@@ -157,17 +158,18 @@ fn review_agent_pass_json(review_summary: &str) -> serde_json::Value {
     })
 }
 
-/// 入队 `rounds` 轮聚合网关所需响应（每轮 decision + review 各一条，FIFO 顺序）。
+/// 入队 `rounds` 轮聚合网关所需响应（每轮 decision + review + ClaimGate，FIFO 顺序）。
 /// 多入队几轮不会误消费——MockLlm 队列空才报错，用不完的响应留在队里无害。
 fn push_gateway_rounds(app: &common::TestApp, rounds: usize) {
     for _ in 0..rounds {
         app.llm.push_response(reply_agent_decision_json(
-            "我们一般 2~4 周可上线，预算和场景深度相关，要不要先按你们的优先级排排序？",
+            "理解，你们同时在看周期和预算。我们先按最重要的场景排一下，再一起把范围收敛？",
             "客户主动询问实施周期与预算，回复能确认需求颗粒度并降低决策摩擦，是关键推进时机。",
         ));
-        app.llm.push_response(review_agent_pass_json(
-            "回复语气良好、不越界承诺，可放行。",
-        ));
+        app.llm
+            .push_response(review_agent_pass_json("回复语气良好、不越界承诺，可放行。"));
+        app.llm
+            .push_response(common::independent_claim_gate_pass_json());
     }
 }
 
@@ -220,7 +222,7 @@ async fn count_run_logs(app: &common::TestApp, contact: &Contact) -> u64 {
 /// 连发 3 条入站，全部落在同一去抖窗口内 → runner 只跑一次聚合网关：
 /// - agent_run_logs 该 contact **恰好 1 行**（3 条聚合成 1 次运行，非 3 次）；
 /// - outbox 入队 **恰好 1 行**（只发一次，不重复回复）；
-/// - `llm.calls() == 2`（单轮 decision + review；全新 contact reaction claim 空跳过）。
+/// - `llm.calls() == 3`（decision + review + ClaimGate；reaction claim 空跳过）。
 #[tokio::test]
 #[ignore]
 async fn three_rapid_inbounds_aggregate_into_single_gateway_run() {
@@ -252,7 +254,7 @@ async fn three_rapid_inbounds_aggregate_into_single_gateway_run() {
             .expect("insert inbound message");
     }
 
-    // 单轮聚合只需 2 条；push 2 轮量做冗余护栏（用不完无害）。
+    // 单轮聚合只需 3 条；push 2 轮量做冗余护栏（用不完无害）。
     push_gateway_rounds(&app, 2);
 
     let key = contact_key(&contact.workspace_id, &contact.account_id, wxid);
@@ -268,10 +270,11 @@ async fn three_rapid_inbounds_aggregate_into_single_gateway_run() {
             assert_eq!(i, 0, "只有首条 register 应 spawn，实际在 i={i}");
             let state = app.state.clone();
             let k = key.clone();
+            let workspace = contact.workspace_id.clone();
             let account = contact.account_id.clone();
             let from = wxid.to_string();
             spawn_handle = Some(tokio::spawn(async move {
-                run_debounce_pipeline(state, k, st, account, from, None).await;
+                run_debounce_pipeline(state, k, st, workspace, account, from, None).await;
             }));
         } else {
             assert_ne!(i, 0, "首条之外的 register 必须只 bump（spawned_now=false）");
@@ -294,8 +297,8 @@ async fn three_rapid_inbounds_aggregate_into_single_gateway_run() {
     );
     assert_eq!(
         app.llm.calls(),
-        2,
-        "单轮聚合只应触达 decision + review 两次 LLM（reaction claim 空跳过），实际 {} 次",
+        3,
+        "单轮聚合应触达 decision + review + ClaimGate 三次 LLM，实际 {} 次",
         app.llm.calls()
     );
 }
@@ -342,10 +345,11 @@ async fn runner_uses_latest_inbound_snapshot_for_decision() {
     assert!(spawned_now, "首条 register 应 spawn runner");
     let state = app.state.clone();
     let k = key.clone();
+    let workspace = contact.workspace_id.clone();
     let account = contact.account_id.clone();
     let from = wxid.to_string();
     let handle = tokio::spawn(async move {
-        run_debounce_pipeline(state, k, st, account, from, None).await;
+        run_debounce_pipeline(state, k, st, workspace, account, from, None).await;
     });
 
     let (_st2, spawned_again) = register_inbound(key.clone(), latest.clone(), 50);
@@ -372,8 +376,13 @@ async fn runner_uses_latest_inbound_snapshot_for_decision() {
         "runner 应快照最新入站做决策，inbound_message_id 实际 {:?}",
         review.inbound_message_id
     );
-    // 聚合仍只跑一轮（无中途抢占）→ 只 2 次 LLM、outbox 1 行。
-    assert_eq!(app.llm.calls(), 2, "单轮聚合只应 2 次 LLM，实际 {}", app.llm.calls());
+    // 聚合仍只跑一轮（无中途抢占）→ 3 次 LLM、outbox 1 行。
+    assert_eq!(
+        app.llm.calls(),
+        3,
+        "单轮聚合只应 3 次 LLM，实际 {}",
+        app.llm.calls()
+    );
     let run_logs = count_run_logs(&app, &contact).await;
     assert_eq!(run_logs, 1, "聚合应只产 1 次运行，实际 {run_logs} 行");
 }
@@ -420,10 +429,11 @@ async fn late_inbound_bumps_generation_without_duplicate_spawn() {
 
     let state = app.state.clone();
     let k = key.clone();
+    let workspace = contact.workspace_id.clone();
     let account = contact.account_id.clone();
     let from = wxid.to_string();
     let handle = tokio::spawn(async move {
-        run_debounce_pipeline(state, k, st, account, from, None).await;
+        run_debounce_pipeline(state, k, st, workspace, account, from, None).await;
     });
 
     // 晚到入站：不重复 spawn，但 bump generation（保证不丢）。

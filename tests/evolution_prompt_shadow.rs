@@ -114,7 +114,7 @@ fn make_run_log(contact_wxid: &str, inbound_message_id: &str) -> AgentRunLog {
     let scores = doc! {
         "humanLike": 8_i32,
         "emotionalValue": 7_i32,
-        "factRisk": 1_i32,
+        "factRisk": 9_i32,
         "pressureRisk": 2_i32,
         "productAccuracy": 9_i32,
     };
@@ -138,6 +138,7 @@ fn make_run_log(contact_wxid: &str, inbound_message_id: &str) -> AgentRunLog {
         token_budget: 0,
         tokens_used: 0,
         llm_calls_used: 0,
+        unknown_usage_calls: 0,
         degraded_reasons: vec![],
         lifecycle: "completed".to_string(),
         // shadow / replay retention 探针据此反查真实历史消息（snake_case message_id）。
@@ -182,6 +183,8 @@ fn make_prompt_proposal(key: &str, diff_snippet: &str) -> Proposal {
         critic_reasoning: None,
         expected_improvement_on: vec![],
         risk_note: None,
+        base_revision: None,
+        released_revision: None,
         previous_prompt_version: None,
         eval_metrics: Document::new(),
         eval_replays_completed: 0,
@@ -195,6 +198,34 @@ fn make_prompt_proposal(key: &str, diff_snippet: &str) -> Proposal {
         created_at: now,
         updated_at: now,
     }
+}
+
+/// Bind the proposal to the exact prompt artifact evaluated by Shadow.
+async fn freeze_prompt_base(state: &AppState, proposal: &mut Proposal) {
+    let key = proposal
+        .proposed_template_key
+        .as_deref()
+        .expect("prompt proposal key");
+    let template = state
+        .db
+        .prompt_templates()
+        .find_one(
+            doc! {
+                "workspace_id": &proposal.workspace_id,
+                "prompt_key": key,
+                "status": "active",
+                "current_version": true,
+            },
+            None,
+        )
+        .await
+        .expect("query frozen prompt base")
+        .expect("active prompt base");
+    proposal.base_revision = Some(wechatagent::evolution::revision::prompt_revision(
+        template.id.expect("prompt template id"),
+        template.version,
+        &template.content,
+    ));
 }
 
 /// Reply Agent 决策 JSON（shouldReply=true，分数全过；mock 让 decide_reply 确定返回）。
@@ -259,7 +290,10 @@ fn review_pass_json() -> serde_json::Value {
 }
 
 /// 读出本 proposal 写下的唯一一条 shadow_replays 行。
-async fn fetch_replay(state: &AppState, proposal_id: ObjectId) -> wechatagent::models::ShadowReplay {
+async fn fetch_replay(
+    state: &AppState,
+    proposal_id: ObjectId,
+) -> wechatagent::models::ShadowReplay {
     state
         .db
         .shadow_replays()
@@ -304,12 +338,18 @@ async fn run_shadow_replay_prompt_completed_fills_both_sides() {
         .await
         .expect("insert source run log");
 
-    let proposal = make_prompt_proposal(TARGET_KEY, "补充：本行业语气更稳重，先确认优先级再给建议。");
+    let mut proposal =
+        make_prompt_proposal(TARGET_KEY, "补充：本行业语气更稳重，先确认优先级再给建议。");
+    freeze_prompt_base(&app.state, &mut proposal).await;
     let proposal_id = proposal.id.expect("proposal id present");
 
-    // shadow 内部：知识库为空 → 路由 0 次 LLM；decide_reply 1 次 + review_decision 1 次。
-    app.llm.push_response(reply_decision_json());
-    app.llm.push_response(review_pass_json());
+    // 知识库为空时不跑知识 LLM；终态仍与生产一样运行独立 ClaimGate。
+    for _ in 0..2 {
+        app.llm.push_response(reply_decision_json());
+        app.llm.push_response(review_pass_json());
+        app.llm
+            .push_response(common::independent_claim_gate_pass_json());
+    }
 
     let before_calls = app.llm.calls();
     wechatagent::evolution::replay::run_shadow_replay(&app.state, &proposal, source_run_id)
@@ -318,17 +358,34 @@ async fn run_shadow_replay_prompt_completed_fills_both_sides() {
     let after_calls = app.llm.calls();
     assert_eq!(
         after_calls - before_calls,
-        2,
-        "completed 路径应恰好调用 2 次 LLM（decide ×1 + review ×1）"
+        6,
+        "baseline/candidate should each call Reply, Review, and ClaimGate"
     );
 
     let replay = fetch_replay(&app.state, proposal_id).await;
-    assert_eq!(replay.status, "completed", "shadow_replay 应 completed，实际 {:?}", replay);
-    assert!(replay.failure_reason.is_none(), "completed 不应带 failure_reason");
+    assert_eq!(
+        replay.status, "completed",
+        "shadow_replay 应 completed，实际 {:?}",
+        replay
+    );
+    assert!(
+        replay.failure_reason.is_none(),
+        "completed 不应带 failure_reason"
+    );
     assert!(
         !replay.original_5gate_hit.is_empty(),
         "G4：源 run review.scores 应推回非空的 original_5gate_hit，实际 {:?}",
         replay.original_5gate_hit
+    );
+    assert_eq!(
+        replay.original_5gate_hit.get_bool("fact_risk_block").ok(),
+        Some(false),
+        "baseline must come from the frozen rerun, not the historical source score"
+    );
+    assert_eq!(
+        replay.original_final_review_status.as_deref(),
+        Some("approved"),
+        "baseline terminal must come from the full frozen baseline path"
     );
     assert!(
         !replay.new_5gate_hit.is_empty(),
@@ -343,7 +400,15 @@ async fn run_shadow_replay_prompt_completed_fills_both_sides() {
         replay.new_self_critique_addressed.is_some(),
         "新侧 selfCritiqueAddressed 应从 review 读出"
     );
-    assert_eq!(replay.source_run_id, source_run_id, "source_run_id 透传一致");
+    assert_eq!(
+        replay.new_final_review_status.as_deref(),
+        Some("approved"),
+        "新侧终态必须来自生产同源 finalize，而不是仅凭五闸分数推断"
+    );
+    assert_eq!(
+        replay.source_run_id, source_run_id,
+        "source_run_id 透传一致"
+    );
 }
 
 /// source_message_unavailable：source_event_id 指向不存在的 message。
@@ -388,7 +453,11 @@ async fn run_shadow_replay_prompt_failed_when_message_missing() {
     );
 
     let replay = fetch_replay(&app.state, proposal_id).await;
-    assert_eq!(replay.status, "failed", "message 缺失应 failed，实际 {:?}", replay);
+    assert_eq!(
+        replay.status, "failed",
+        "message 缺失应 failed，实际 {:?}",
+        replay
+    );
     assert_eq!(
         replay.failure_reason.as_deref(),
         Some("source_message_unavailable"),
@@ -435,7 +504,11 @@ async fn run_shadow_replay_prompt_failed_when_contact_missing() {
         .expect("run_shadow_replay ok（failed 是业务结果而非 Err）");
 
     let replay = fetch_replay(&app.state, proposal_id).await;
-    assert_eq!(replay.status, "failed", "contact 缺失应 failed，实际 {:?}", replay);
+    assert_eq!(
+        replay.status, "failed",
+        "contact 缺失应 failed，实际 {:?}",
+        replay
+    );
     assert_eq!(
         replay.failure_reason.as_deref(),
         Some("contact_unavailable"),

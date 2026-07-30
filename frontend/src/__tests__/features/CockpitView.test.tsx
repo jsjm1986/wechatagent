@@ -31,17 +31,19 @@ describe("CockpitView", () => {
 
   it("三计数卡口径：待审草稿=needsReview / D2 降级=anchorsMissing / 知识缺口=gap-signals pending", async () => {
     render(<CockpitView onOpenReview={() => {}} onOpenAutoVerify={() => {}} />);
-    await waitFor(() => expect(screen.getByText("待审草稿")).toBeInTheDocument());
+    // 三张卡的标题首屏就存在；必须等待并行请求全部提交状态，不能把静态标题
+    // 当成“数据已加载”的同步点，否则慢 runner 会在初始 `—` 帧上偶发失败。
+    await waitFor(() => {
+      const draftCard = screen.getByText("待审草稿").closest("button");
+      expect(draftCard?.textContent).toContain("12"); // needsReview
 
-    const draftCard = screen.getByText("待审草稿").closest("button");
-    expect(draftCard?.textContent).toContain("12"); // needsReview
+      const d2Card = screen.getByText("缺原文出处").closest("button");
+      expect(d2Card?.textContent).toContain("2"); // anchorsMissing
+      expect(d2Card?.textContent).toContain("已启用但没填原文出处，AI 用前需补齐");
 
-    const d2Card = screen.getByText("缺原文出处").closest("button");
-    expect(d2Card?.textContent).toContain("2"); // anchorsMissing
-    expect(d2Card?.textContent).toContain("已启用但没填原文出处，AI 用前需补齐");
-
-    const gapCard = screen.getByText("知识缺口").closest("button");
-    expect(gapCard?.textContent).toContain("3"); // gap-signals pending 计数 = signals.length
+      const gapCard = screen.getByText("知识缺口").closest("button");
+      expect(gapCard?.textContent).toContain("3"); // gap-signals pending 计数 = signals.length
+    });
   });
 
   it("渲染 completeness.gaps 缺口明细列表", async () => {

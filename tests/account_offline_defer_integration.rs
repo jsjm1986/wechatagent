@@ -307,10 +307,7 @@ async fn offline_account_defers_without_consuming_attempt() {
     let evt_count = state
         .db
         .events()
-        .count_documents(
-            doc! { "kind": "agent.send_deferred_account_offline" },
-            None,
-        )
+        .count_documents(doc! { "kind": "agent.send_deferred_account_offline" }, None)
         .await
         .expect("count events");
     assert!(

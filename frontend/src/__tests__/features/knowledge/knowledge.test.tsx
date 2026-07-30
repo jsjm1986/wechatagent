@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import KnowledgeFeature from "../../../features/knowledge";
@@ -83,7 +83,7 @@ describe("KnowledgeFeature — 一体化频道（全量重塑视觉壳）", () =
     expect(workbenchBtn?.className).not.toContain("active");
   });
 
-  it("派工创建 POST chat/tasks 含 sessionId + plannedSteps（camelCase wire 键）", async () => {
+  it("SR-125: Chat 派工提交服务端候选封印与来源 turn", async () => {
     const user = userEvent.setup();
     // ChatWorkbench 派工要求已有 sessionId（后端 sessionId 非空校验）；预置进 localStorage。
     window.localStorage.setItem("knowledgeChat.sessionId", "S1");
@@ -106,9 +106,26 @@ describe("KnowledgeFeature — 一体化频道（全量重塑视觉壳）", () =
         return jsonResp({
           sessionId: "S1",
           turnIndex: 1,
-          intent: "draft",
+          intent: "digest_action",
           naturalReply: "已为你拆分步骤",
-          plannedSteps: [{ action: "create_chunk", summary: "分析最近 24h 拦截日志" }],
+          plannedSteps: [{
+            stepId: "step_1",
+            cardId: "0123456789abcdef01234567",
+            action: "analyze_logs",
+            summary: "分析最近 24h 拦截日志",
+          }],
+          digestSelection: {
+            accountId: "",
+            reportId: "fedcba987654321001234567",
+            reportDate: "2026-07-27",
+            reportGeneration: 4,
+            reportHash: "report-hash",
+            selectedCards: [{
+              cardId: "0123456789abcdef01234567",
+              cardHash: "card-hash",
+            }],
+          },
+          candidateHash: "candidate-hash",
         });
       }
       // 派工提交。
@@ -158,10 +175,20 @@ describe("KnowledgeFeature — 一体化频道（全量重塑视觉壳）", () =
       expect(call).toBeTruthy();
       const body = JSON.parse((call as unknown as [string, { body: string }])[1].body);
       expect(body).toHaveProperty("sessionId");
-      expect(body).toHaveProperty("plannedSteps");
-      expect(Array.isArray(body.plannedSteps)).toBe(true);
-      // 每个 step 必须带 action（后端 ALLOWED_TASK_ACTIONS 闭集校验，缺则 400）。
-      expect(body.plannedSteps[0]).toHaveProperty("action");
+      expect(body.sourceTurnIndex).toBe(1);
+      expect(body.candidateHash).toBe("candidate-hash");
+      expect(body.digestSelection).toEqual({
+        accountId: "",
+        reportId: "fedcba987654321001234567",
+        reportDate: "2026-07-27",
+        reportGeneration: 4,
+        reportHash: "report-hash",
+        selectedCards: [{
+          cardId: "0123456789abcdef01234567",
+          cardHash: "card-hash",
+        }],
+      });
+      expect(body.cardIds).toEqual(["0123456789abcdef01234567"]);
     } finally {
       window.localStorage.removeItem("knowledgeChat.sessionId");
     }
@@ -250,5 +277,71 @@ describe("DomainSchemaTab — D9 字段表写表单（create/edit/delete 对接 
     await screen.findByText("还没有配置字段表");
     expect(screen.queryByText(/不能直接改内容/)).toBeNull();
     expect(screen.getByText(/创建、编辑、删除字段表/)).toBeInTheDocument();
+  });
+
+  it("SR-056: 同 slug 多版本的编辑、激活、删除均绑定所选 expectedVersion", async () => {
+    const items = [
+      {
+        schemaId: "sales",
+        workspaceId: "default",
+        name: "销售字段 v2",
+        version: 2,
+        fields: [],
+        aliasDict: {},
+        guardDsl: null,
+        isActive: true,
+        createdAt: 2,
+        updatedAt: 2,
+      },
+      {
+        schemaId: "sales",
+        workspaceId: "default",
+        name: "销售字段 v1",
+        version: 1,
+        fields: [],
+        aliasDict: {},
+        guardDsl: null,
+        isActive: false,
+        createdAt: 1,
+        updatedAt: 1,
+      },
+    ];
+    const fetchMock = vi.fn(async (_url: unknown, init?: { method?: string }) => {
+      const body = init?.method ? { ok: true } : { items };
+      return {
+        ok: true,
+        status: 200,
+        async json() { return body; },
+        async text() { return JSON.stringify(body); },
+      } as unknown as Response;
+    });
+    globalThis.fetch = fetchMock as typeof fetch;
+    const user = userEvent.setup();
+    renderTab();
+
+    await screen.findByText("销售字段 v1");
+    await user.click(screen.getAllByRole("button", { name: "编辑" })[1]);
+    await user.click(screen.getByRole("button", { name: "保存" }));
+    await waitFor(() => {
+      const put = fetchMock.mock.calls.find((call) => (call[1] as { method?: string })?.method === "PUT");
+      expect(put).toBeTruthy();
+      const payload = JSON.parse((put as unknown as [string, { body: string }])[1].body);
+      expect(payload).toMatchObject({ schemaId: "sales", expectedVersion: 1 });
+    });
+
+    await user.click(await screen.findByRole("button", { name: "设为当前使用" }));
+    await user.click(await screen.findByRole("button", { name: "确认切换" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      "/api/admin/domain-schemas/sales/activate?expectedVersion=1",
+      { method: "POST" },
+    ));
+
+    const deleteButtons = await screen.findAllByRole("button", { name: "删除" });
+    await user.click(deleteButtons.find((button) => !button.hasAttribute("disabled"))!);
+    await user.click(await screen.findByRole("button", { name: "确认删除" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      "/api/admin/domain-schemas/sales?expectedVersion=1",
+      { method: "DELETE" },
+    ));
   });
 });

@@ -3,9 +3,144 @@
 //! 所有索引创建语句集中在 [`ensure_all`]，由 [`super::Database::ensure_indexes`]
 //! 调用。运行时其它路径不应该再调用 `create_index`。
 
-use mongodb::{bson::doc, options::IndexOptions, IndexModel};
+use futures::TryStreamExt;
+use mongodb::{
+    bson::{doc, Document},
+    options::IndexOptions,
+    IndexModel,
+};
+use std::collections::HashSet;
 
 use super::Database;
+
+fn llm_vision_active_unique_index() -> IndexModel {
+    IndexModel::builder()
+        .keys(doc! { "workspaceId": 1 })
+        .options(
+            IndexOptions::builder()
+                .name("uniq_llm_vision_active_workspace".to_string())
+                .unique(true)
+                .partial_filter_expression(doc! { "isVisionActive": true })
+                .build(),
+        )
+        .build()
+}
+
+fn domain_profile_version_unique_index() -> IndexModel {
+    IndexModel::builder()
+        .keys(doc! { "workspace_id": 1, "profile_id": 1, "version": 1 })
+        .options(
+            IndexOptions::builder()
+                .name("domain_profiles_ws_id_version_unique".to_string())
+                .unique(true)
+                .build(),
+        )
+        .build()
+}
+
+fn domain_profile_current_unique_index() -> IndexModel {
+    IndexModel::builder()
+        .keys(doc! { "workspace_id": 1, "profile_id": 1 })
+        .options(
+            IndexOptions::builder()
+                .name("domain_profiles_ws_id_current_unique".to_string())
+                .unique(true)
+                .partial_filter_expression(doc! { "current_version": true })
+                .build(),
+        )
+        .build()
+}
+
+fn domain_profile_active_unique_index() -> IndexModel {
+    IndexModel::builder()
+        .keys(doc! { "workspace_id": 1 })
+        .options(
+            IndexOptions::builder()
+                .name("domain_profiles_ws_active_unique".to_string())
+                .unique(true)
+                .partial_filter_expression(doc! { "is_active": true })
+                .build(),
+        )
+        .build()
+}
+
+fn operation_playbook_default_unique_index() -> IndexModel {
+    IndexModel::builder()
+        .keys(doc! { "workspace_id": 1, "account_id": 1 })
+        .options(
+            IndexOptions::builder()
+                .name("uniq_operation_playbook_default_per_account".to_string())
+                .unique(true)
+                .partial_filter_expression(doc! { "is_default": true })
+                .build(),
+        )
+        .build()
+}
+
+async fn validate_llm_vision_assignments(db: &Database) -> anyhow::Result<()> {
+    let mut cursor = db
+        .llm_provider_configs()
+        .find(doc! { "isVisionActive": true }, None)
+        .await?;
+    let mut workspaces = HashSet::new();
+    while let Some(provider) = cursor.try_next().await? {
+        if !provider.supports_vision {
+            return Err(anyhow::anyhow!(
+                "LLM provider {} in workspace {} is assigned for vision without supportsVision",
+                provider.provider_id,
+                provider.workspace_id
+            ));
+        }
+        if !workspaces.insert(provider.workspace_id.clone()) {
+            return Err(anyhow::anyhow!(
+                "workspace {} has multiple active vision providers",
+                provider.workspace_id
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn relationship_suggestion_pending_unique_index() -> IndexModel {
+    IndexModel::builder()
+        .keys(doc! { "workspace_id": 1, "contact_id": 1 })
+        .options(
+            IndexOptions::builder()
+                .name("uniq_relationship_pending_ws_contact".to_string())
+                .unique(true)
+                .partial_filter_expression(doc! { "status": "pending" })
+                .build(),
+        )
+        .build()
+}
+
+fn lesson_identity_unique_index() -> IndexModel {
+    IndexModel::builder()
+        .keys(doc! { "workspace_id": 1, "lesson_id": 1 })
+        .options(
+            IndexOptions::builder()
+                .name("uniq_lessons_learned_ws_lesson".to_string())
+                .unique(true)
+                .build(),
+        )
+        .build()
+}
+
+fn lesson_promotion_chunk_unique_index() -> IndexModel {
+    IndexModel::builder()
+        .keys(doc! { "workspace_id": 1, "provenance.source_doc_id": 1 })
+        .options(
+            IndexOptions::builder()
+                .name("uniq_kchunks_lesson_promotion_source".to_string())
+                .unique(true)
+                .partial_filter_expression(doc! {
+                    "provenance.source": "lesson_promotion",
+                    "provenance.source_doc_id": { "$type": "string" },
+                })
+                .build(),
+        )
+        .build()
+}
 
 fn gap_signals_pending_dedup_index() -> IndexModel {
     IndexModel::builder()
@@ -43,6 +178,56 @@ fn outbox_delivery_finalize_pending_index() -> IndexModel {
         .build()
 }
 
+fn outbox_idempotency_unique_index() -> IndexModel {
+    IndexModel::builder()
+        .keys(doc! {
+            "workspace_id": 1,
+            "account_id": 1,
+            "idempotency_key": 1,
+        })
+        .options(
+            IndexOptions::builder()
+                .name("uniq_outbox_ws_account_idempotency".to_string())
+                .unique(true)
+                .build(),
+        )
+        .build()
+}
+
+fn management_tool_intent_unique_index() -> IndexModel {
+    IndexModel::builder()
+        .keys(doc! {
+            "workspace_id": 1,
+            "account_id": 1,
+            "intent_key": 1,
+        })
+        .options(
+            IndexOptions::builder()
+                .name("uniq_management_tool_intent".to_string())
+                .unique(true)
+                .partial_filter_expression(doc! { "intent_key": { "$type": "string" } })
+                .build(),
+        )
+        .build()
+}
+
+fn campaign_dispatch_recovery_index() -> IndexModel {
+    IndexModel::builder()
+        .keys(doc! {
+            "workspaceId": 1,
+            "accountId": 1,
+            "status": 1,
+            "updatedAt": 1,
+        })
+        .options(
+            IndexOptions::builder()
+                .name("campaign_dispatch_recovery_idx".to_string())
+                .partial_filter_expression(doc! { "status": "dispatching" })
+                .build(),
+        )
+        .build()
+}
+
 fn agent_run_log_outbox_enqueuing_index() -> IndexModel {
     IndexModel::builder()
         .keys(doc! { "status": 1, "created_at": 1, "_id": 1 })
@@ -55,6 +240,403 @@ fn agent_run_log_outbox_enqueuing_index() -> IndexModel {
         .build()
 }
 
+fn outcome_aggregation_task_dedupe_index() -> IndexModel {
+    IndexModel::builder()
+        .keys(doc! {
+            "workspace_id": 1,
+            "kind": 1,
+            "account_id": 1,
+            "content": 1,
+        })
+        .options(
+            IndexOptions::builder()
+                .unique(true)
+                .partial_filter_expression(doc! { "kind": "outcome_aggregation" })
+                .name("uniq_outcome_aggregation_ws_kind_account_content".to_string())
+                .build(),
+        )
+        .build()
+}
+
+fn proactive_daily_quota_ttl_index() -> IndexModel {
+    IndexModel::builder()
+        .keys(doc! { "expires_at": 1 })
+        .options(
+            IndexOptions::builder()
+                .name("proactive_daily_quotas_expires_ttl".to_string())
+                .expire_after(std::time::Duration::from_secs(0))
+                .build(),
+        )
+        .build()
+}
+
+fn taxonomy_active_identity_unique_index() -> IndexModel {
+    IndexModel::builder()
+        .keys(doc! {
+            "workspace_id": 1,
+            "scope": 1,
+            "kind": 1,
+            "value.identityClaims": 1,
+        })
+        .options(
+            IndexOptions::builder()
+                .name("uniq_sys_tax_ws_scope_kind_active_identity".to_string())
+                .unique(true)
+                .partial_filter_expression(doc! {
+                    "current_version": true,
+                    "value.status": "active",
+                })
+                .build(),
+        )
+        .build()
+}
+
+fn memory_active_task_key_index() -> IndexModel {
+    IndexModel::builder()
+        .keys(doc! {
+            "workspace_id": 1,
+            "account_id": 1,
+            "contact_wxid": 1,
+            "active_task_key": 1,
+        })
+        .options(
+            IndexOptions::builder()
+                .unique(true)
+                .partial_filter_expression(doc! {
+                    "active_task_key": { "$type": "string" },
+                })
+                .name("uniq_memory_active_task_key".to_string())
+                .build(),
+        )
+        .build()
+}
+
+fn inbound_handoff_pending_index() -> IndexModel {
+    IndexModel::builder()
+        .keys(doc! { "handoff_status": 1, "created_at": 1, "_id": 1 })
+        .options(
+            IndexOptions::builder()
+                .name("inbound_handoff_pending_idx".to_string())
+                .partial_filter_expression(doc! {
+                    "direction": "inbound",
+                    "handoff_status": "pending",
+                })
+                .build(),
+        )
+        .build()
+}
+
+fn principal_relay_pending_index() -> IndexModel {
+    IndexModel::builder()
+        .keys(doc! { "relay_state": 1, "resolved_at": 1, "_id": 1 })
+        .options(
+            IndexOptions::builder()
+                .name("principal_relay_pending_idx".to_string())
+                .partial_filter_expression(doc! {
+                    "status": "resolved",
+                    "relay_state": "pending",
+                })
+                .build(),
+        )
+        .build()
+}
+
+fn principal_card_delivery_reconcile_index() -> IndexModel {
+    IndexModel::builder()
+        .keys(doc! {
+            "status": 1,
+            "protocol.delivery_state": 1,
+            "_id": 1,
+        })
+        .options(
+            IndexOptions::builder()
+                .name("principal_card_delivery_reconcile_v2_idx".to_string())
+                .partial_filter_expression(doc! {
+                    "status": "pending",
+                })
+                .build(),
+        )
+        .build()
+}
+
+fn principal_card_timeout_index() -> IndexModel {
+    IndexModel::builder()
+        .keys(doc! {
+            "status": 1,
+            "protocol.delivery_state": 1,
+            "last_pushed_at_ms": 1,
+            "_id": 1,
+        })
+        .options(
+            IndexOptions::builder()
+                .name("principal_card_timeout_idx".to_string())
+                .partial_filter_expression(doc! {
+                    "status": "pending",
+                    "protocol.delivery_state": "sent",
+                    "protocol.policy.timeoutHours": { "$type": "number" },
+                    "last_pushed_at_ms": { "$type": "number" },
+                })
+                .build(),
+        )
+        .build()
+}
+
+fn principal_escalation_pending_dedupe_index() -> IndexModel {
+    IndexModel::builder()
+        .keys(doc! {
+            "workspace_id": 1,
+            "account_id": 1,
+            "contact_wxid": 1,
+            "category": 1,
+        })
+        .options(
+            IndexOptions::builder()
+                .unique(true)
+                .partial_filter_expression(doc! { "status": "pending" })
+                .name("uniq_principal_escalation_pending_ws_account_contact_category".to_string())
+                .build(),
+        )
+        .build()
+}
+
+fn send_ledger_outbox_unique_index() -> IndexModel {
+    IndexModel::builder()
+        .keys(doc! { "outbox_id": 1 })
+        .options(
+            IndexOptions::builder()
+                .name("uniq_send_ledger_outbox_id".to_string())
+                .unique(true)
+                .partial_filter_expression(doc! { "outbox_id": { "$type": "objectId" } })
+                .build(),
+        )
+        .build()
+}
+
+fn agent_soul_version_unique_index() -> IndexModel {
+    IndexModel::builder()
+        .keys(doc! { "workspace_id": 1, "agent_kind": 1, "version": 1 })
+        .options(
+            IndexOptions::builder()
+                .name("uniq_agent_soul_ws_kind_version".to_string())
+                .unique(true)
+                .build(),
+        )
+        .build()
+}
+
+fn agent_soul_published_unique_index() -> IndexModel {
+    IndexModel::builder()
+        .keys(doc! { "workspace_id": 1, "agent_kind": 1 })
+        .options(
+            IndexOptions::builder()
+                .name("uniq_agent_soul_published_ws_kind".to_string())
+                .unique(true)
+                .partial_filter_expression(doc! { "status": "published" })
+                .build(),
+        )
+        .build()
+}
+
+fn send_ledger_contact_history_index() -> IndexModel {
+    IndexModel::builder()
+        .keys(doc! {
+            "workspace_id": 1,
+            "account_id": 1,
+            "contact_wxid": 1,
+            "sent_at": -1,
+        })
+        .build()
+}
+
+fn send_ledger_target_stats_index() -> IndexModel {
+    IndexModel::builder()
+        .keys(doc! {
+            "workspace_id": 1,
+            "account_id": 1,
+            "send_kind": 1,
+            "target_id": 1,
+        })
+        .build()
+}
+
+pub(crate) fn behavior_signal_identity_index() -> IndexModel {
+    IndexModel::builder()
+        .keys(doc! { "workspace_id": 1, "account_id": 1, "dedupe_key": 1 })
+        .options(
+            IndexOptions::builder()
+                .unique(true)
+                .name("uniq_behavior_signals_ws_account_dedupe_key".to_string())
+                .partial_filter_expression(doc! {
+                    "dedupe_key": { "$type": "string" }
+                })
+                .build(),
+        )
+        .build()
+}
+
+pub(crate) fn behavior_signal_timeline_index() -> IndexModel {
+    IndexModel::builder()
+        .keys(doc! {
+            "workspace_id": 1,
+            "account_id": 1,
+            "contact_wxid": 1,
+            "observed_at": -1,
+        })
+        .build()
+}
+
+pub(crate) fn chunk_revision_identity_index() -> IndexModel {
+    IndexModel::builder()
+        .keys(doc! { "workspace_id": 1, "chunk_id": 1, "revision_id": -1 })
+        .options(
+            IndexOptions::builder()
+                .name("chunk_revisions_ws_chunk_rev_idx".to_string())
+                .build(),
+        )
+        .build()
+}
+
+pub(crate) fn chunk_revision_timeline_index() -> IndexModel {
+    IndexModel::builder()
+        .keys(doc! { "workspace_id": 1, "created_at": -1 })
+        .options(
+            IndexOptions::builder()
+                .name("chunk_revisions_ws_created_at_idx".to_string())
+                .build(),
+        )
+        .build()
+}
+
+fn index_option_semantics(options: Option<&IndexOptions>) -> anyhow::Result<Document> {
+    let mut semantics = mongodb::bson::to_document(&options.cloned().unwrap_or_default())?;
+    // MongoDB returns the server-selected index version, and historical
+    // deployments may have retained a different name for the same index.
+    // Neither changes query or constraint semantics. Every other serialized
+    // option (unique, sparse, partial filter, TTL, collation, hidden, storage
+    // engine, wildcard projection, etc.) remains part of the equality check.
+    semantics.remove("name");
+    semantics.remove("v");
+    Ok(semantics)
+}
+
+fn equivalent_index_options(
+    existing: Option<&IndexOptions>,
+    desired: Option<&IndexOptions>,
+) -> anyhow::Result<bool> {
+    Ok(index_option_semantics(existing)? == index_option_semantics(desired)?)
+}
+
+fn is_namespace_not_found(error: &mongodb::error::Error) -> bool {
+    matches!(
+        error.kind.as_ref(),
+        mongodb::error::ErrorKind::Command(command) if command.code == 26
+    )
+}
+
+async fn ensure_index_or_equivalent_name(
+    collection: mongodb::Collection<Document>,
+    desired: IndexModel,
+) -> anyhow::Result<()> {
+    let desired_name = desired
+        .options
+        .as_ref()
+        .and_then(|options| options.name.as_deref())
+        .unwrap_or("<generated>");
+    let desired_semantics = index_option_semantics(desired.options.as_ref())?;
+    let mut indexes = match collection.list_indexes(None).await {
+        Ok(indexes) => indexes,
+        Err(error) if is_namespace_not_found(&error) => {
+            // create_index historically created an absent collection as part
+            // of fresh-database startup. Preserve that behavior while only
+            // treating NamespaceNotFound as proof that no conflicting index
+            // can exist; every other list failure remains fatal.
+            collection.create_index(desired, None).await?;
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let mut equivalent_names = Vec::new();
+
+    while let Some(existing) = indexes.try_next().await? {
+        if existing.keys != desired.keys {
+            continue;
+        }
+        let existing_name = existing
+            .options
+            .as_ref()
+            .and_then(|options| options.name.clone());
+        let options_equivalent =
+            equivalent_index_options(existing.options.as_ref(), desired.options.as_ref())?;
+        let existing_semantics = index_option_semantics(existing.options.as_ref())?;
+        if !options_equivalent {
+            anyhow::bail!(
+                "collection {} has index {:?} with keys {:?} but incompatible options {:?}; expected index {} options {:?}",
+                collection.name(),
+                existing_name,
+                desired.keys,
+                existing_semantics,
+                desired_name,
+                desired_semantics,
+            );
+        }
+        equivalent_names.push(existing_name);
+    }
+
+    if !equivalent_names.is_empty() {
+        tracing::info!(
+            collection = collection.name(),
+            desired_index = desired_name,
+            existing_indexes = ?equivalent_names,
+            "reusing semantically equivalent index with historical name"
+        );
+        return Ok(());
+    }
+
+    collection.create_index(desired, None).await?;
+    Ok(())
+}
+
+async fn retire_indexes_with_keys(
+    collection: mongodb::Collection<Document>,
+    legacy_keys: &[Document],
+) -> anyhow::Result<()> {
+    let mut cursor = collection.list_indexes(None).await?;
+    let mut legacy_names = Vec::new();
+    while let Some(index) = cursor.try_next().await? {
+        if legacy_keys.iter().any(|keys| index.keys == *keys) {
+            if let Some(name) = index.options.and_then(|options| options.name) {
+                legacy_names.push(name);
+            }
+        }
+    }
+    for name in legacy_names {
+        collection.drop_index(name, None).await?;
+    }
+    Ok(())
+}
+
+async fn retire_legacy_behavior_signal_indexes(db: &Database) -> anyhow::Result<()> {
+    retire_indexes_with_keys(
+        db.raw().collection::<Document>("behavior_signals"),
+        &[
+            doc! { "workspace_id": 1, "dedupe_key": 1 },
+            doc! { "workspace_id": 1, "contact_wxid": 1, "observed_at": -1 },
+        ],
+    )
+    .await
+}
+
+async fn retire_legacy_chunk_revision_indexes(db: &Database) -> anyhow::Result<()> {
+    retire_indexes_with_keys(
+        db.raw().collection::<Document>("chunk_revisions"),
+        &[
+            doc! { "chunk_id": 1, "revision_id": -1 },
+            doc! { "created_at": -1 },
+        ],
+    )
+    .await
+}
+
 pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
     db.accounts()
         .create_index(
@@ -65,11 +647,21 @@ pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
             None,
         )
         .await?;
+    // Replace the historical non-unique app_id index. If stored duplicates
+    // exist, creating the unique index fails startup explicitly so operators
+    // can reconcile ownership instead of routing webhooks nondeterministically.
+    let _ = db.accounts().drop_index("app_id_1", None).await;
     db.accounts()
         .create_index(
             IndexModel::builder()
                 .keys(doc! { "app_id": 1 })
-                .options(IndexOptions::builder().sparse(true).build())
+                .options(
+                    IndexOptions::builder()
+                        .name("uniq_wechat_accounts_app_id".to_string())
+                        .unique(true)
+                        .partial_filter_expression(doc! { "app_id": { "$type": "string" } })
+                        .build(),
+                )
                 .build(),
             None,
         )
@@ -107,6 +699,23 @@ pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
             None,
         )
         .await?;
+    // 联系人列表批量取每位联系人最新入站：match workspace/account/direction/contact，
+    // 再按 contact+created_at 分组取首条。direction 放在 contact 前以匹配等值谓词。
+    db.messages()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! {
+                    "workspace_id": 1,
+                    "account_id": 1,
+                    "direction": 1,
+                    "contact_wxid": 1,
+                    "created_at": -1,
+                    "_id": -1,
+                })
+                .build(),
+            None,
+        )
+        .await?;
     db.messages()
         .create_index(
             IndexModel::builder()
@@ -130,6 +739,11 @@ pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
             None,
         )
         .await?;
+    // SR-177 crash recovery scans only inbound facts whose durable task
+    // handoff has not yet been materialized.
+    db.messages()
+        .create_index(inbound_handoff_pending_index(), None)
+        .await?;
     db.tasks()
         .create_index(
             IndexModel::builder()
@@ -152,31 +766,27 @@ pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
             None,
         )
         .await?;
-    // P1-1：outcome_aggregation 任务幂等去重靠 (kind, account_id, content) 唯一约束。
+    // P1-1：outcome_aggregation 任务幂等去重靠
+    // (workspace_id, kind, account_id, content) 唯一约束。
     // tasks.rs::ensure_today_outcome_aggregation_tasks 之前用 find_one 后 insert_one
     // 存在 TOCTOU；改原子 insert + 11000 dup-key 视作"已存在"前必须有此索引。
     // partial filter 限定 kind 否则会误伤其他 kind 同 content 的合法重复（如
     // follow_up 同一 contact 不同回合的内容）。
     db.tasks()
-        .create_index(
-            IndexModel::builder()
-                .keys(doc! {
-                    "kind": 1,
-                    "account_id": 1,
-                    "content": 1
-                })
-                .options(
-                    IndexOptions::builder()
-                        .unique(true)
-                        .partial_filter_expression(
-                            doc! { "kind": "outcome_aggregation" },
-                        )
-                        .name("uniq_outcome_aggregation_kind_account_content".to_string())
-                        .build(),
-                )
-                .build(),
-            None,
-        )
+        .create_index(outcome_aggregation_task_dedupe_index(), None)
+        .await?;
+    // Memory consolidation uses a durable lease key rather than find-then-insert. Terminal
+    // transitions remove active_task_key atomically, so historical rows remain outside the
+    // partial unique index while every newly scheduled task is single-flight per contact.
+    db.tasks()
+        .create_index(memory_active_task_key_index(), None)
+        .await?;
+    // Proactive daily buckets are short-lived concurrency controls, not the
+    // audit source of truth. Task/event rows retain the durable intent while
+    // this TTL prevents one small document per scope/day from growing forever.
+    db.raw()
+        .collection::<Document>("proactive_daily_quotas")
+        .create_index(proactive_daily_quota_ttl_index(), None)
         .await?;
     // 异步导入 job：前端按 workspace 跨会话发现进行中 job。
     db.import_jobs()
@@ -247,35 +857,20 @@ pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
         )
         .await?;
     // 自学习采集管道 S1–S5：behavior_signals append-only 事件日志。
-    //   - `(workspace_id, dedupe_key)` partial unique：幂等键，同一观察重复采集
+    //   - `(workspace_id, account_id, dedupe_key)` partial unique：账号内幂等键，同一观察重复采集
     //     只落一次。partialFilterExpression 用 `$type: "string"`（等价 $exists 但
     //     更严）——绝不能用 `$in`，会触发 Error 67 让 ensure_indexes panic。
     //   - `(workspace_id, contact_wxid, observed_at desc)`：按联系人取近期信号。
     db.behavior_signals()
-        .create_index(
-            IndexModel::builder()
-                .keys(doc! { "workspace_id": 1, "dedupe_key": 1 })
-                .options(
-                    IndexOptions::builder()
-                        .unique(true)
-                        .name("uniq_behavior_signals_workspace_dedupe_key".to_string())
-                        .partial_filter_expression(doc! {
-                            "dedupe_key": { "$type": "string" }
-                        })
-                        .build(),
-                )
-                .build(),
-            None,
-        )
+        .create_index(behavior_signal_identity_index(), None)
         .await?;
     db.behavior_signals()
-        .create_index(
-            IndexModel::builder()
-                .keys(doc! { "workspace_id": 1, "contact_wxid": 1, "observed_at": -1 })
-                .build(),
-            None,
-        )
+        .create_index(behavior_signal_timeline_index(), None)
         .await?;
+    // Both final indexes now exist. Only after that point may a previously
+    // applied m039 deployment retire its historical workspace-only indexes.
+    // Matching exact keys avoids deleting unrelated operator-created indexes.
+    retire_legacy_behavior_signal_indexes(db).await?;
     // P3 采集健康度：behavior_signal_metrics 每日每 workspace 三态计数聚合。
     //   `_id="{workspace_id}:{date}"` 已天然唯一（$inc upsert 幂等），无需额外 unique；
     //   仅加 `(workspace_id, date desc)` 供 REST 端点按时间倒序拉近期健康度。
@@ -329,21 +924,15 @@ pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
         .await?;
     // 主动发送台账：单客户发送历史（按时间倒序）。
     db.agent_send_ledger()
-        .create_index(
-            IndexModel::builder()
-                .keys(doc! { "workspace_id": 1, "contact_wxid": 1, "sent_at": -1 })
-                .build(),
-            None,
-        )
+        .create_index(send_ledger_contact_history_index(), None)
         .await?;
     // 主动发送台账：素材/名片维度聚合。
     db.agent_send_ledger()
-        .create_index(
-            IndexModel::builder()
-                .keys(doc! { "workspace_id": 1, "send_kind": 1, "target_id": 1 })
-                .build(),
-            None,
-        )
+        .create_index(send_ledger_target_stats_index(), None)
+        .await?;
+    // 每个已确认送达的 Outbox 事实最多产生一条台账。历史无 outbox_id 行不入约束。
+    db.agent_send_ledger()
+        .create_index(send_ledger_outbox_unique_index(), None)
         .await?;
     // 主动发送台账：回扫服务索引。匹配 scan 查询形状
     // （filter { outcome_evaluated_at: { $exists: false } } + sort { sent_at: 1 }，
@@ -364,6 +953,12 @@ pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
             None,
         )
         .await?;
+    db.agent_souls()
+        .create_index(agent_soul_version_unique_index(), None)
+        .await?;
+    db.agent_souls()
+        .create_index(agent_soul_published_unique_index(), None)
+        .await?;
     db.operation_playbooks()
         .create_index(
             IndexModel::builder()
@@ -373,6 +968,9 @@ pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
                 .build(),
             None,
         )
+        .await?;
+    db.operation_playbooks()
+        .create_index(operation_playbook_default_unique_index(), None)
         .await?;
     db.prompt_templates()
         .create_index(
@@ -414,6 +1012,9 @@ pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
                 .build(),
             None,
         )
+        .await?;
+    db.operation_knowledge_chunks()
+        .create_index(lesson_promotion_chunk_unique_index(), None)
         .await?;
     db.operation_knowledge_chunks()
         .create_index(
@@ -509,9 +1110,7 @@ pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
     // 会全表扫高写入量的 decision_reviews。非 unique：不假设一 run 一 review。
     db.decision_reviews()
         .create_index(
-            IndexModel::builder()
-                .keys(doc! { "run_id": 1 })
-                .build(),
+            IndexModel::builder().keys(doc! { "run_id": 1 }).build(),
             None,
         )
         .await?;
@@ -590,15 +1189,14 @@ pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
             None,
         )
         .await?;
-    // #154：crash-recovery post-hoc 核对（outbox_dispatcher::mcp_already_succeeded）
-    // 在热路径上 count `mcp_call_logs` by (account_id, tool_name, created_at>=lb)。
-    // 无索引时 reclaim 一次就全表扫 mcp_call_logs（高写入量集合）。复合索引让
-    // 候选集先按 account_id+tool_name+时间窗收敛，request.recipient/content/error
+    // #154 / SR-025：crash-recovery post-hoc 核对在热路径上按
+    // (workspace_id, account_id, tool_name, created_at>=lb) 查询。复合索引先按租户、
+    // 账号、工具和时间窗收敛，request.recipient/content/error
     // 作残余过滤。
     db.mcp_logs()
         .create_index(
             IndexModel::builder()
-                .keys(doc! { "account_id": 1, "tool_name": 1, "created_at": -1 })
+                .keys(doc! { "workspace_id": 1, "account_id": 1, "tool_name": 1, "created_at": -1 })
                 .build(),
             None,
         )
@@ -644,6 +1242,9 @@ pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
                 .build(),
             None,
         )
+        .await?;
+    db.tool_calls()
+        .create_index(management_tool_intent_unique_index(), None)
         .await?;
     // S-19 / Task 17：outcome metrics TTL 索引（默认 90 天）。
     let ttl_days: u64 = std::env::var("OUTCOME_METRICS_TTL_DAYS")
@@ -756,12 +1357,219 @@ mod tests {
     use super::*;
 
     #[test]
-    fn gap_signal_dedup_index_is_pending_partial_unique() {
-        let index = gap_signals_pending_dedup_index();
+    fn campaign_dispatch_recovery_index_is_partial() {
+        let index = campaign_dispatch_recovery_index();
         assert_eq!(
             index.keys,
-            doc! { "workspace_id": 1, "dedup_key": 1 }
+            doc! { "workspaceId": 1, "accountId": 1, "status": 1, "updatedAt": 1 }
         );
+        let options = index.options.expect("campaign recovery index options");
+        assert_eq!(
+            options.name.as_deref(),
+            Some("campaign_dispatch_recovery_idx")
+        );
+        assert_eq!(
+            options.partial_filter_expression,
+            Some(doc! { "status": "dispatching" })
+        );
+    }
+
+    #[test]
+    fn management_tool_intent_index_is_scoped_partial_unique() {
+        let index = management_tool_intent_unique_index();
+        assert_eq!(
+            index.keys,
+            doc! { "workspace_id": 1, "account_id": 1, "intent_key": 1 }
+        );
+        let options = index.options.expect("management intent index options");
+        assert_eq!(options.unique, Some(true));
+        assert_eq!(options.name.as_deref(), Some("uniq_management_tool_intent"));
+        assert_eq!(
+            options.partial_filter_expression,
+            Some(doc! { "intent_key": { "$type": "string" } })
+        );
+    }
+
+    #[test]
+    fn proactive_daily_quota_index_expires_at_absolute_time() {
+        let index = proactive_daily_quota_ttl_index();
+        assert_eq!(index.keys, doc! { "expires_at": 1 });
+        let options = index.options.expect("proactive quota ttl options");
+        assert_eq!(
+            options.name.as_deref(),
+            Some("proactive_daily_quotas_expires_ttl")
+        );
+        assert_eq!(
+            options.expire_after,
+            Some(std::time::Duration::from_secs(0))
+        );
+    }
+
+    #[test]
+    fn chunk_revision_scoped_indexes_do_not_reuse_legacy_names() {
+        let identity = chunk_revision_identity_index();
+        assert_eq!(
+            identity.keys,
+            doc! { "workspace_id": 1, "chunk_id": 1, "revision_id": -1 }
+        );
+        assert_eq!(
+            identity
+                .options
+                .expect("revision identity options")
+                .name
+                .as_deref(),
+            Some("chunk_revisions_ws_chunk_rev_idx")
+        );
+
+        let timeline = chunk_revision_timeline_index();
+        assert_eq!(timeline.keys, doc! { "workspace_id": 1, "created_at": -1 });
+        assert_eq!(
+            timeline
+                .options
+                .expect("revision timeline options")
+                .name
+                .as_deref(),
+            Some("chunk_revisions_ws_created_at_idx")
+        );
+    }
+
+    #[test]
+    fn equivalent_index_options_ignore_only_name_and_server_version() {
+        let desired = IndexOptions::builder().name("new_name".to_string()).build();
+        let historical: IndexOptions = mongodb::bson::from_document(doc! {
+            "name": "old_name",
+            "v": 2,
+        })
+        .expect("historical index options");
+        assert!(equivalent_index_options(Some(&historical), Some(&desired)).unwrap());
+
+        for incompatible in [
+            IndexOptions::builder()
+                .name("old_name".to_string())
+                .unique(true)
+                .build(),
+            IndexOptions::builder()
+                .name("old_name".to_string())
+                .partial_filter_expression(doc! { "workspace_id": "default" })
+                .build(),
+            IndexOptions::builder()
+                .name("old_name".to_string())
+                .hidden(true)
+                .build(),
+        ] {
+            assert!(!equivalent_index_options(Some(&incompatible), Some(&desired)).unwrap());
+        }
+    }
+
+    #[test]
+    fn relationship_suggestion_index_is_pending_partial_unique() {
+        let index = relationship_suggestion_pending_unique_index();
+        assert_eq!(index.keys, doc! { "workspace_id": 1, "contact_id": 1 });
+        let options = index
+            .options
+            .expect("relationship suggestion index options");
+        assert_eq!(options.unique, Some(true));
+        assert_eq!(
+            options.name.as_deref(),
+            Some("uniq_relationship_pending_ws_contact")
+        );
+        assert_eq!(
+            options.partial_filter_expression,
+            Some(doc! { "status": "pending" })
+        );
+    }
+
+    #[test]
+    fn lesson_promotion_indexes_lock_lesson_and_chunk_identity() {
+        let lesson = lesson_identity_unique_index();
+        assert_eq!(lesson.keys, doc! { "workspace_id": 1, "lesson_id": 1 });
+        let lesson_options = lesson.options.expect("lesson identity options");
+        assert_eq!(lesson_options.unique, Some(true));
+        assert_eq!(
+            lesson_options.name.as_deref(),
+            Some("uniq_lessons_learned_ws_lesson")
+        );
+
+        let chunk = lesson_promotion_chunk_unique_index();
+        assert_eq!(
+            chunk.keys,
+            doc! { "workspace_id": 1, "provenance.source_doc_id": 1 }
+        );
+        let chunk_options = chunk.options.expect("lesson chunk identity options");
+        assert_eq!(chunk_options.unique, Some(true));
+        assert_eq!(
+            chunk_options.partial_filter_expression,
+            Some(doc! {
+                "provenance.source": "lesson_promotion",
+                "provenance.source_doc_id": { "$type": "string" },
+            })
+        );
+    }
+
+    #[test]
+    fn llm_vision_active_index_is_workspace_partial_unique() {
+        let index = llm_vision_active_unique_index();
+        assert_eq!(index.keys, doc! { "workspaceId": 1 });
+        let options = index.options.expect("vision active index options");
+        assert_eq!(options.unique, Some(true));
+        assert_eq!(
+            options.name.as_deref(),
+            Some("uniq_llm_vision_active_workspace")
+        );
+        assert_eq!(
+            options.partial_filter_expression,
+            Some(doc! { "isVisionActive": true })
+        );
+    }
+
+    #[test]
+    fn domain_profile_release_indexes_lock_version_current_and_active() {
+        let version = domain_profile_version_unique_index();
+        assert_eq!(
+            version.keys,
+            doc! { "workspace_id": 1, "profile_id": 1, "version": 1 }
+        );
+        assert_eq!(version.options.as_ref().and_then(|o| o.unique), Some(true));
+
+        let current = domain_profile_current_unique_index();
+        assert_eq!(current.keys, doc! { "workspace_id": 1, "profile_id": 1 });
+        let current_options = current.options.expect("current index options");
+        assert_eq!(current_options.unique, Some(true));
+        assert_eq!(
+            current_options.partial_filter_expression,
+            Some(doc! { "current_version": true })
+        );
+
+        let active = domain_profile_active_unique_index();
+        assert_eq!(active.keys, doc! { "workspace_id": 1 });
+        let active_options = active.options.expect("active index options");
+        assert_eq!(active_options.unique, Some(true));
+        assert_eq!(
+            active_options.partial_filter_expression,
+            Some(doc! { "is_active": true })
+        );
+    }
+
+    #[test]
+    fn playbook_default_index_is_account_scoped_partial_unique() {
+        let index = operation_playbook_default_unique_index();
+        assert_eq!(index.keys, doc! { "workspace_id": 1, "account_id": 1 });
+        let options = index.options.expect("playbook default index options");
+        assert_eq!(options.unique, Some(true));
+        assert_eq!(
+            options.name.as_deref(),
+            Some("uniq_operation_playbook_default_per_account")
+        );
+        assert_eq!(
+            options.partial_filter_expression,
+            Some(doc! { "is_default": true })
+        );
+    }
+
+    #[test]
+    fn gap_signal_dedup_index_is_pending_partial_unique() {
+        let index = gap_signals_pending_dedup_index();
+        assert_eq!(index.keys, doc! { "workspace_id": 1, "dedup_key": 1 });
 
         let options = index.options.expect("dedup index options");
         assert_eq!(options.unique, Some(true));
@@ -799,14 +1607,190 @@ mod tests {
     #[test]
     fn agent_run_log_outbox_enqueuing_index_matches_reconcile_scan() {
         let index = agent_run_log_outbox_enqueuing_index();
-        assert_eq!(
-            index.keys,
-            doc! { "status": 1, "created_at": 1, "_id": 1 }
-        );
+        assert_eq!(index.keys, doc! { "status": 1, "created_at": 1, "_id": 1 });
         let options = index.options.expect("stale enqueue index options");
         assert_eq!(
             options.partial_filter_expression,
             Some(doc! { "status": "outbox_enqueuing" })
+        );
+    }
+
+    #[test]
+    fn outcome_task_dedupe_index_is_workspace_scoped() {
+        let index = outcome_aggregation_task_dedupe_index();
+        assert_eq!(
+            index.keys,
+            doc! {
+                "workspace_id": 1,
+                "kind": 1,
+                "account_id": 1,
+                "content": 1,
+            }
+        );
+        let options = index.options.expect("outcome task index options");
+        assert_eq!(options.unique, Some(true));
+        assert_eq!(
+            options.partial_filter_expression,
+            Some(doc! { "kind": "outcome_aggregation" })
+        );
+    }
+
+    #[test]
+    fn taxonomy_identity_index_is_active_current_partial_unique() {
+        let index = taxonomy_active_identity_unique_index();
+        assert_eq!(
+            index.keys,
+            doc! {
+                "workspace_id": 1,
+                "scope": 1,
+                "kind": 1,
+                "value.identityClaims": 1,
+            }
+        );
+        let options = index.options.expect("taxonomy identity index options");
+        assert_eq!(options.unique, Some(true));
+        assert_eq!(
+            options.name.as_deref(),
+            Some("uniq_sys_tax_ws_scope_kind_active_identity")
+        );
+        assert_eq!(
+            options.partial_filter_expression,
+            Some(doc! {
+                "current_version": true,
+                "value.status": "active",
+            })
+        );
+    }
+
+    #[test]
+    fn memory_active_task_index_is_tenant_contact_scoped() {
+        let index = memory_active_task_key_index();
+        assert_eq!(
+            index.keys,
+            doc! {
+                "workspace_id": 1,
+                "account_id": 1,
+                "contact_wxid": 1,
+                "active_task_key": 1,
+            }
+        );
+        let options = index.options.expect("memory task index options");
+        assert_eq!(options.unique, Some(true));
+        assert_eq!(
+            options.partial_filter_expression,
+            Some(doc! { "active_task_key": { "$type": "string" } })
+        );
+    }
+
+    #[test]
+    fn inbound_handoff_pending_index_matches_recovery_scan() {
+        let index = inbound_handoff_pending_index();
+        assert_eq!(
+            index.keys,
+            doc! { "handoff_status": 1, "created_at": 1, "_id": 1 }
+        );
+        let options = index.options.expect("inbound handoff index options");
+        assert_eq!(options.unique, None);
+        assert_eq!(
+            options.partial_filter_expression,
+            Some(doc! {
+                "direction": "inbound",
+                "handoff_status": "pending",
+            })
+        );
+    }
+
+    #[test]
+    fn principal_relay_pending_index_matches_reconcile_scan() {
+        let index = principal_relay_pending_index();
+        assert_eq!(
+            index.keys,
+            doc! { "relay_state": 1, "resolved_at": 1, "_id": 1 }
+        );
+        let options = index
+            .options
+            .expect("principal relay pending index options");
+        assert_eq!(options.unique, None);
+        assert_eq!(
+            options.partial_filter_expression,
+            Some(doc! {
+                "status": "resolved",
+                "relay_state": "pending",
+            })
+        );
+    }
+
+    #[test]
+    fn principal_card_delivery_reconcile_index_uses_legal_partial_filter() {
+        let index = principal_card_delivery_reconcile_index();
+        assert_eq!(
+            index.keys,
+            doc! {
+                "status": 1,
+                "protocol.delivery_state": 1,
+                "_id": 1,
+            }
+        );
+        let options = index
+            .options
+            .expect("principal card delivery reconcile index options");
+        assert_eq!(
+            options.name.as_deref(),
+            Some("principal_card_delivery_reconcile_v2_idx")
+        );
+        assert_eq!(
+            options.partial_filter_expression,
+            Some(doc! { "status": "pending" })
+        );
+    }
+
+    #[test]
+    fn principal_pending_dedupe_index_uses_full_contact_identity() {
+        let index = principal_escalation_pending_dedupe_index();
+        assert_eq!(
+            index.keys,
+            doc! {
+                "workspace_id": 1,
+                "account_id": 1,
+                "contact_wxid": 1,
+                "category": 1,
+            }
+        );
+        let options = index.options.expect("principal pending dedupe options");
+        assert_eq!(options.unique, Some(true));
+        assert_eq!(
+            options.partial_filter_expression,
+            Some(doc! { "status": "pending" })
+        );
+    }
+
+    #[test]
+    fn send_ledger_indexes_are_account_scoped_and_outbox_unique() {
+        assert_eq!(
+            send_ledger_contact_history_index().keys,
+            doc! {
+                "workspace_id": 1,
+                "account_id": 1,
+                "contact_wxid": 1,
+                "sent_at": -1,
+            }
+        );
+        assert_eq!(
+            send_ledger_target_stats_index().keys,
+            doc! {
+                "workspace_id": 1,
+                "account_id": 1,
+                "send_kind": 1,
+                "target_id": 1,
+            }
+        );
+        let unique = send_ledger_outbox_unique_index();
+        assert_eq!(unique.keys, doc! { "outbox_id": 1 });
+        let options = unique.options.expect("send ledger unique options");
+        assert_eq!(options.unique, Some(true));
+        assert_eq!(
+            options.partial_filter_expression,
+            Some(doc! { "outbox_id": { "$type": "objectId" } })
         );
     }
 }
@@ -839,6 +1823,10 @@ async fn ensure_llm_provider_indexes(db: &Database) -> anyhow::Result<()> {
                 .build(),
             None,
         )
+        .await?;
+    validate_llm_vision_assignments(db).await?;
+    db.llm_provider_configs()
+        .create_index(llm_vision_active_unique_index(), None)
         .await?;
     Ok(())
 }
@@ -889,6 +1877,9 @@ async fn ensure_campaigns_indexes(db: &Database) -> anyhow::Result<()> {
             None,
         )
         .await?;
+    db.campaigns()
+        .create_index(campaign_dispatch_recovery_index(), None)
+        .await?;
     db.campaign_sends()
         .create_index(
             IndexModel::builder()
@@ -904,7 +1895,7 @@ async fn ensure_campaigns_indexes(db: &Database) -> anyhow::Result<()> {
 /// agent-autonomy-loop W0 / R13.1：`agent_send_outbox` 索引。
 ///
 /// - `(account_id, status, next_retry_at)`：dispatcher worker 扫描待发送条目。
-/// - `idempotency_key` 唯一：强幂等门，DuplicateKey 视为 `IdempotentSkip`。
+/// - `(workspace_id, account_id, idempotency_key)` 唯一：租户内强幂等门。
 /// - `(status, locked_until)`：崩溃恢复扫描过期 lease。
 /// - `(source_event_id, contact_wxid)`：按入站事件追溯发送链路。
 async fn ensure_agent_send_outbox_indexes(db: &Database) -> anyhow::Result<()> {
@@ -917,13 +1908,7 @@ async fn ensure_agent_send_outbox_indexes(db: &Database) -> anyhow::Result<()> {
         )
         .await?;
     db.collection_agent_send_outbox()
-        .create_index(
-            IndexModel::builder()
-                .keys(doc! { "idempotency_key": 1 })
-                .options(IndexOptions::builder().unique(true).build())
-                .build(),
-            None,
-        )
+        .create_index(outbox_idempotency_unique_index(), None)
         .await?;
     db.collection_agent_send_outbox()
         .create_index(
@@ -941,13 +1926,13 @@ async fn ensure_agent_send_outbox_indexes(db: &Database) -> anyhow::Result<()> {
             None,
         )
         .await?;
-    // 账号级发送间隔闸：查某账号 status=sent 的最大 sent_at（pacing guard）。
+    // workspace 内账号级发送间隔闸：查某账号 status=sent 的最大 sent_at。
     // 现有 (account_id,status,next_retry_at) 排序键不是 sent_at，无法支撑 sent_at 倒序，
     // 会触发内存 SORT 随历史线性恶化，故单建此索引。
     db.collection_agent_send_outbox()
         .create_index(
             IndexModel::builder()
-                .keys(doc! { "account_id": 1, "status": 1, "sent_at": -1 })
+                .keys(doc! { "workspace_id": 1, "account_id": 1, "status": 1, "sent_at": -1 })
                 .build(),
             None,
         )
@@ -985,20 +1970,18 @@ async fn ensure_system_taxonomies_indexes(db: &Database) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Phase E5-T1：ops 三表 active_versions 灰度索引切换。
+/// Ops 三表保留多版本历史，但每个逻辑 scope 只允许一个 current 指针。
 ///
 /// 旧形态：(workspace_id, domain) / (workspace_id, domain, state_key) /
 /// (scope, kind, value.id) 三个 unique 索引一一对应一行；同 key 不能同时存在
 /// 多个版本，无法做灰度。
 ///
-/// 新形态：用 `version: i32` 把 unique 索引扩到 4-tuple，多版本同时驻留；读
-/// 路径用 `(workspace_id, domain[, state_key/value.id], current_version=true)`
-/// 部分索引筛 active 集合。配合 `ab_bucket_for_contact(contact_id)` 选 active
-/// 集合中的某一个。
+/// `version: i32` 扩展业务唯一键以保留历史；m048 在索引创建前收敛存量
+/// current 指针，随后 partial unique index 从数据库层阻止再次出现多 current。
 ///
-/// 二次启动安全：`drop_index` 用 best-effort（旧索引可能在升级前已被运维手工
-/// 清理，也可能本就不存在），失败不阻塞 ensure_all 主流程；新 unique 索引
-/// 由 MongoDB 在已存在时静默 noop。
+/// 升级顺序：先以新名称建立只含 logical scope key 的 partial unique index，
+/// 成功后才 best-effort 删除旧的 `(scope..., current_version)` 非唯一辅助索引。
+/// 因此首次升级和后续重启都不会主动撤掉已经生效的唯一约束。
 async fn ensure_ops_versioned_indexes(db: &Database) -> anyhow::Result<()> {
     // ── operation_domain_configs ──
     let _ = db
@@ -1022,10 +2005,11 @@ async fn ensure_ops_versioned_indexes(db: &Database) -> anyhow::Result<()> {
     db.operation_domain_configs()
         .create_index(
             IndexModel::builder()
-                .keys(doc! { "workspace_id": 1, "domain": 1, "current_version": 1 })
+                .keys(doc! { "workspace_id": 1, "domain": 1 })
                 .options(
                     IndexOptions::builder()
-                        .name("op_domain_ws_domain_current_idx".to_string())
+                        .name("uniq_op_domain_ws_domain_current".to_string())
+                        .unique(true)
                         .partial_filter_expression(doc! { "current_version": true })
                         .build(),
                 )
@@ -1033,6 +2017,10 @@ async fn ensure_ops_versioned_indexes(db: &Database) -> anyhow::Result<()> {
             None,
         )
         .await?;
+    let _ = db
+        .operation_domain_configs()
+        .drop_index("op_domain_ws_domain_current_idx", None)
+        .await;
 
     // ── operation_state_policies ──
     let _ = db
@@ -1065,11 +2053,11 @@ async fn ensure_ops_versioned_indexes(db: &Database) -> anyhow::Result<()> {
                     "workspace_id": 1,
                     "domain": 1,
                     "state_key": 1,
-                    "current_version": 1,
                 })
                 .options(
                     IndexOptions::builder()
-                        .name("op_state_policy_ws_domain_state_current_idx".to_string())
+                        .name("uniq_op_state_policy_ws_domain_state_current".to_string())
+                        .unique(true)
                         .partial_filter_expression(doc! { "current_version": true })
                         .build(),
                 )
@@ -1077,12 +2065,15 @@ async fn ensure_ops_versioned_indexes(db: &Database) -> anyhow::Result<()> {
             None,
         )
         .await?;
+    let _ = db
+        .operation_state_policies()
+        .drop_index("op_state_policy_ws_domain_state_current_idx", None)
+        .await;
 
     // ── system_taxonomies ──
     //
-    // 旧 (scope, kind, value.id) unique 索引由 ensure_system_taxonomies_indexes
-    // 继续创建（兼容旧路径），这里只补 4-tuple 与 current_version 部分索引。
-    // 多版本驻留时旧 unique 会冲突 —— 改为非唯一时机由 W5/W6 一并迁移。
+    // 退役旧的非 workspace / 非版本索引以及早期同名非 unique current 索引；
+    // m048 已在本 helper 运行前收敛指针，因此可安全建立版本唯一与 partial unique。
     for legacy_name in [
         "scope_1_kind_1_value.id_1",
         "sys_tax_scope_kind_value_version_unique",
@@ -1121,11 +2112,11 @@ async fn ensure_ops_versioned_indexes(db: &Database) -> anyhow::Result<()> {
                     "scope": 1,
                     "kind": 1,
                     "value.id": 1,
-                    "current_version": 1,
                 })
                 .options(
                     IndexOptions::builder()
-                        .name("sys_tax_ws_scope_kind_value_current_idx".to_string())
+                        .name("uniq_sys_tax_ws_scope_kind_value_current".to_string())
+                        .unique(true)
                         .partial_filter_expression(doc! { "current_version": true })
                         .build(),
                 )
@@ -1133,6 +2124,16 @@ async fn ensure_ops_versioned_indexes(db: &Database) -> anyhow::Result<()> {
             None,
         )
         .await?;
+    // SR-046: canonical ids and aliases share one active identity namespace.
+    // `value.identityClaims` is an array, so this compound unique multikey
+    // index rejects alias↔alias and alias↔canonical races at commit time.
+    db.collection_system_taxonomies()
+        .create_index(taxonomy_active_identity_unique_index(), None)
+        .await?;
+    let _ = db
+        .collection_system_taxonomies()
+        .drop_index("sys_tax_ws_scope_kind_value_current_idx", None)
+        .await;
     Ok(())
 }
 
@@ -1142,10 +2143,7 @@ async fn ensure_ops_versioned_indexes(db: &Database) -> anyhow::Result<()> {
 /// - `(scope, kind, raw_value)` 唯一：`upsert_candidate` 幂等键，重复值仅累加
 ///   `occurrences` / 更新 `last_seen_at`。
 async fn ensure_taxonomy_candidates_indexes(db: &Database) -> anyhow::Result<()> {
-    for legacy_name in [
-        "scope_1_kind_1_status_1",
-        "scope_1_kind_1_raw_value_1",
-    ] {
+    for legacy_name in ["scope_1_kind_1_status_1", "scope_1_kind_1_raw_value_1"] {
         let _ = db
             .collection_taxonomy_candidates()
             .drop_index(legacy_name, None)
@@ -1183,22 +2181,15 @@ async fn ensure_taxonomy_candidates_indexes(db: &Database) -> anyhow::Result<()>
 
 /// 数字分身建议链 T5：`relationship_type_suggestions` 索引。
 ///
-/// - `(workspace_id, contact_id)` 唯一：幂等 upsert 锚——同一 contact 在租户内只
-///   一条关系类型建议，重复观察累加 `occurrences` / 刷新 `last_seen_at`，
-///   DuplicateKey 视为「建议已存在」。
+/// - `(workspace_id, contact_id)` 仅 `status=pending` 时唯一：重复观察累加
+///   `occurrences` / 刷新 `last_seen_at`；终态历史不占槽，新证据可开启下一审核周期。
 /// - `(workspace_id, status)`：后台审核列表按 status（pending/approved/rejected）筛选。
 ///
 /// 字段为 snake_case：`RelationshipTypeSuggestion` 未加 `#[serde(rename_all)]`，
 /// BSON 层即 snake_case，须与此处索引字段逐字一致。
 async fn ensure_relationship_type_suggestions_indexes(db: &Database) -> anyhow::Result<()> {
     db.collection_relationship_type_suggestions()
-        .create_index(
-            IndexModel::builder()
-                .keys(doc! { "workspace_id": 1, "contact_id": 1 })
-                .options(IndexOptions::builder().unique(true).build())
-                .build(),
-            None,
-        )
+        .create_index(relationship_suggestion_pending_unique_index(), None)
         .await?;
     db.collection_relationship_type_suggestions()
         .create_index(
@@ -1263,10 +2254,12 @@ async fn ensure_suspected_deal_signals_indexes(db: &Database) -> anyhow::Result<
 /// 多版本辅助索引。
 ///
 /// - `experiments`：`(workspace_id, account_id, started_at desc)` 列表查询；
-///   `(experiment_id)` 唯一保证 envelope 不重复 insert（Requirements 1.3）。
+///   `(experiment_id)` 唯一保证 envelope 不重复 insert；另有
+///   `(workspace_id, account_id, experiment_id)` 支撑租户内关联查询（Requirements 1.3）。
 /// - `proposals`：`(workspace_id, account_id, status, created_at desc)` 后台
-///   按状态分页；`(experiment_id)` 反查 cohort 下所有 proposal（Requirements 5.x）。
-/// - `shadow_replays`：`(proposal_id)` 聚合；`(workspace_id, account_id,
+///   按状态分页；`(workspace_id, account_id, experiment_id)` 反查 cohort 下所有
+///   proposal（Requirements 5.x）。
+/// - `shadow_replays`：`(workspace_id, account_id, proposal_id)` 聚合；`(workspace_id, account_id,
 ///   started_at desc)` 后台监控（Requirements 5.x）。
 /// - `threshold_overrides`：`(workspace_id, account_id, gate_key, released_at
 ///   desc)` 是 `resolve_thresholds` 取最新有效值的核心查询路径（Requirements 6.2）。
@@ -1279,6 +2272,18 @@ async fn ensure_evolution_indexes(db: &Database) -> anyhow::Result<()> {
         .create_index(
             IndexModel::builder()
                 .keys(doc! { "workspace_id": 1, "account_id": 1, "started_at": -1 })
+                .build(),
+            None,
+        )
+        .await?;
+    db.experiments()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! {
+                    "workspace_id": 1,
+                    "account_id": 1,
+                    "experiment_id": 1,
+                })
                 .build(),
             None,
         )
@@ -1310,7 +2315,11 @@ async fn ensure_evolution_indexes(db: &Database) -> anyhow::Result<()> {
     db.proposals()
         .create_index(
             IndexModel::builder()
-                .keys(doc! { "experiment_id": 1 })
+                .keys(doc! {
+                    "workspace_id": 1,
+                    "account_id": 1,
+                    "experiment_id": 1,
+                })
                 .build(),
             None,
         )
@@ -1320,7 +2329,11 @@ async fn ensure_evolution_indexes(db: &Database) -> anyhow::Result<()> {
     db.shadow_replays()
         .create_index(
             IndexModel::builder()
-                .keys(doc! { "proposal_id": 1 })
+                .keys(doc! {
+                    "workspace_id": 1,
+                    "account_id": 1,
+                    "proposal_id": 1,
+                })
                 .build(),
             None,
         )
@@ -1348,6 +2361,46 @@ async fn ensure_evolution_indexes(db: &Database) -> anyhow::Result<()> {
                     "gate_key": 1,
                     "released_at": -1,
                 })
+                .build(),
+            None,
+        )
+        .await?;
+    db.threshold_overrides()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! {
+                    "workspace_id": 1,
+                    "account_id": 1,
+                    "gate_key": 1,
+                })
+                .options(
+                    IndexOptions::builder()
+                        .name("uniq_threshold_current_per_scoped_gate".to_string())
+                        .unique(true)
+                        .partial_filter_expression(doc! { "current_version": true })
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
+    db.threshold_overrides()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! {
+                    "workspace_id": 1,
+                    "account_id": 1,
+                    "source_proposal_id": 1,
+                })
+                .options(
+                    IndexOptions::builder()
+                        .name("uniq_threshold_artifact_per_proposal".to_string())
+                        .unique(true)
+                        .partial_filter_expression(doc! {
+                            "source_proposal_id": { "$type": "objectId" },
+                        })
+                        .build(),
+                )
                 .build(),
             None,
         )
@@ -1387,12 +2440,22 @@ async fn ensure_evolution_indexes(db: &Database) -> anyhow::Result<()> {
     db.post_release_reviews()
         .create_index(
             IndexModel::builder()
-                .keys(doc! { "proposal_id": 1 })
+                .keys(doc! {
+                    "workspace_id": 1,
+                    "account_id": 1,
+                    "proposal_id": 1,
+                })
+                .options(
+                    IndexOptions::builder()
+                        .name("uniq_post_release_review_protocol_v1".to_string())
+                        .unique(true)
+                        .partial_filter_expression(doc! { "protocol_version": 1 })
+                        .build(),
+                )
                 .build(),
             None,
         )
         .await?;
-
     // prompt_templates 多版本辅助：(workspace_id, prompt_key, current_version)
     // 用于 ensure_prompt_pack_v2 + release_prompt 在同 key 下定位 current 那条；
     // (workspace_id, prompt_key, version) 唯一保证多版本不冲突。
@@ -1400,6 +2463,38 @@ async fn ensure_evolution_indexes(db: &Database) -> anyhow::Result<()> {
         .create_index(
             IndexModel::builder()
                 .keys(doc! { "workspace_id": 1, "prompt_key": 1, "current_version": 1 })
+                .build(),
+            None,
+        )
+        .await?;
+    db.prompt_templates()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "workspace_id": 1, "prompt_key": 1 })
+                .options(
+                    IndexOptions::builder()
+                        .name("uniq_prompt_current_pointer".to_string())
+                        .unique(true)
+                        .partial_filter_expression(doc! { "current_version": true })
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
+    db.prompt_templates()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "workspace_id": 1, "source_proposal_id": 1 })
+                .options(
+                    IndexOptions::builder()
+                        .name("uniq_prompt_artifact_per_proposal".to_string())
+                        .unique(true)
+                        .partial_filter_expression(doc! {
+                            "source_proposal_id": { "$type": "objectId" },
+                        })
+                        .build(),
+                )
                 .build(),
             None,
         )
@@ -1440,7 +2535,7 @@ async fn ensure_evolution_indexes(db: &Database) -> anyhow::Result<()> {
     db.knowledge_chat_tasks()
         .create_index(
             IndexModel::builder()
-                .keys(doc! { "status": 1, "created_at": 1 })
+                .keys(doc! { "status": 1, "locked_until": 1, "created_at": 1 })
                 .build(),
             None,
         )
@@ -1512,32 +2607,14 @@ async fn ensure_evolution_indexes(db: &Database) -> anyhow::Result<()> {
     //
     // 旧 chunks 索引（document_id+item_id+status / status+priority）
     // 仍然保留，召回算法零改动。
-    db.chunk_revisions()
-        .create_index(
-            IndexModel::builder()
-                .keys(doc! { "chunk_id": 1, "revision_id": -1 })
-                .options(
-                    IndexOptions::builder()
-                        .name("chunk_revisions_chunk_rev_idx".to_string())
-                        .build(),
-                )
-                .build(),
-            None,
-        )
+    let chunk_revisions = db.raw().collection::<Document>("chunk_revisions");
+    ensure_index_or_equivalent_name(chunk_revisions.clone(), chunk_revision_identity_index())
         .await?;
-    db.chunk_revisions()
-        .create_index(
-            IndexModel::builder()
-                .keys(doc! { "created_at": -1 })
-                .options(
-                    IndexOptions::builder()
-                        .name("chunk_revisions_created_at_idx".to_string())
-                        .build(),
-                )
-                .build(),
-            None,
-        )
-        .await?;
+    ensure_index_or_equivalent_name(chunk_revisions, chunk_revision_timeline_index()).await?;
+    // As with behavior signals, an already-recorded m039 migration will not
+    // rerun. Retire the unscoped indexes only after both scoped replacements
+    // are known to exist, preserving continuous query coverage on upgrades.
+    retire_legacy_chunk_revision_indexes(db).await?;
     db.knowledge_gap_signals()
         .create_index(
             IndexModel::builder()
@@ -1597,13 +2674,22 @@ async fn ensure_evolution_indexes(db: &Database) -> anyhow::Result<()> {
             None,
         )
         .await?;
+    // m044 validates all rows before index creation. Existing deployments may
+    // still have these non-unique helper indexes, so replace them explicitly.
+    for legacy_name in [
+        "domain_schemas_ws_id_version_idx",
+        "domain_schemas_ws_active_idx",
+    ] {
+        let _ = db.domain_schemas().drop_index(legacy_name, None).await;
+    }
     db.domain_schemas()
         .create_index(
             IndexModel::builder()
-                .keys(doc! { "workspace_id": 1, "schema_id": 1, "version": -1 })
+                .keys(doc! { "workspace_id": 1, "schema_id": 1, "version": 1 })
                 .options(
                     IndexOptions::builder()
-                        .name("domain_schemas_ws_id_version_idx".to_string())
+                        .name("domain_schemas_ws_id_version_unique".to_string())
+                        .unique(true)
                         .build(),
                 )
                 .build(),
@@ -1613,36 +2699,49 @@ async fn ensure_evolution_indexes(db: &Database) -> anyhow::Result<()> {
     db.domain_schemas()
         .create_index(
             IndexModel::builder()
-                .keys(doc! { "workspace_id": 1, "is_active": 1 })
+                .keys(doc! { "workspace_id": 1 })
                 .options(
                     IndexOptions::builder()
-                        .name("domain_schemas_ws_active_idx".to_string())
+                        .name("domain_schemas_ws_active_unique".to_string())
+                        .unique(true)
+                        .partial_filter_expression(doc! { "is_active": true })
                         .build(),
                 )
                 .build(),
             None,
         )
         .await?;
+    for legacy_name in [
+        "domain_profiles_ws_id_version_idx",
+        "domain_profiles_ws_active_idx",
+    ] {
+        let _ = db.domain_profiles().drop_index(legacy_name, None).await;
+    }
     db.domain_profiles()
-        .create_index(
-            IndexModel::builder()
-                .keys(doc! { "workspace_id": 1, "profile_id": 1, "version": -1 })
-                .options(
-                    IndexOptions::builder()
-                        .name("domain_profiles_ws_id_version_idx".to_string())
-                        .build(),
-                )
-                .build(),
-            None,
-        )
+        .create_index(domain_profile_version_unique_index(), None)
         .await?;
     db.domain_profiles()
+        .create_index(domain_profile_current_unique_index(), None)
+        .await?;
+    db.domain_profiles()
+        .create_index(domain_profile_active_unique_index(), None)
+        .await?;
+    let _ = db
+        .catalog_rebuild_jobs()
+        .drop_index("catalog_jobs_status_queued_idx", None)
+        .await;
+    db.catalog_rebuild_jobs()
         .create_index(
             IndexModel::builder()
-                .keys(doc! { "workspace_id": 1, "is_active": 1 })
+                .keys(doc! {
+                    "status": 1,
+                    "next_retry_at": 1,
+                    "target_generation": 1,
+                    "queued_at": 1,
+                })
                 .options(
                     IndexOptions::builder()
-                        .name("domain_profiles_ws_active_idx".to_string())
+                        .name("catalog_jobs_retry_claim_idx".to_string())
                         .build(),
                 )
                 .build(),
@@ -1652,10 +2751,10 @@ async fn ensure_evolution_indexes(db: &Database) -> anyhow::Result<()> {
     db.catalog_rebuild_jobs()
         .create_index(
             IndexModel::builder()
-                .keys(doc! { "workspace_id": 1, "status": 1, "queued_at": 1 })
+                .keys(doc! { "status": 1, "locked_until": 1 })
                 .options(
                     IndexOptions::builder()
-                        .name("catalog_jobs_status_queued_idx".to_string())
+                        .name("catalog_jobs_lease_reclaim_idx".to_string())
                         .build(),
                 )
                 .build(),
@@ -1769,6 +2868,65 @@ async fn ensure_evolution_indexes(db: &Database) -> anyhow::Result<()> {
             None,
         )
         .await?;
+    // Authentication failures are append-only security audit rows containing
+    // only process-salted fingerprints. These indexes support recent incident
+    // review by client or target without storing raw usernames or addresses.
+    let auth_security_events = db
+        .raw()
+        .collection::<mongodb::bson::Document>("auth_security_events");
+    auth_security_events
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "created_at": -1 })
+                .options(
+                    IndexOptions::builder()
+                        .name("auth_security_events_created_at_idx".to_string())
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
+    auth_security_events
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "expires_at": 1 })
+                .options(
+                    IndexOptions::builder()
+                        .name("auth_security_events_expires_ttl_v1".to_string())
+                        .expire_after(std::time::Duration::from_secs(0))
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
+    auth_security_events
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "client_fingerprint": 1, "created_at": -1 })
+                .options(
+                    IndexOptions::builder()
+                        .name("auth_security_events_client_created_idx".to_string())
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
+    auth_security_events
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "target_fingerprint": 1, "created_at": -1 })
+                .options(
+                    IndexOptions::builder()
+                        .name("auth_security_events_target_created_idx".to_string())
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
 
     // ── P1-6 auto-ingest ──────────────────────────────────────────────────
     // ingest_sources：worker 每轮扫 (workspace_id, kind, status="active") 决定要拉哪些 source。
@@ -1779,6 +2937,21 @@ async fn ensure_evolution_indexes(db: &Database) -> anyhow::Result<()> {
                 .options(
                     IndexOptions::builder()
                         .name("ingest_sources_ws_kind_status_idx".to_string())
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
+    // Lease recovery and active/failing candidate scans. The worker still
+    // performs a source-id CAS after scanning; this index bounds the scan.
+    db.ingest_sources()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "status": 1, "locked_until": 1, "last_fetched_at": 1 })
+                .options(
+                    IndexOptions::builder()
+                        .name("ingest_sources_lease_reclaim_idx".to_string())
                         .build(),
                 )
                 .build(),
@@ -1858,6 +3031,10 @@ async fn ensure_evolution_indexes(db: &Database) -> anyhow::Result<()> {
             None,
         )
         .await?;
+    db.raw()
+        .collection::<mongodb::bson::Document>("lessons_learned")
+        .create_index(lesson_identity_unique_index(), None)
+        .await?;
 
     // agent_principal_escalations：复合查询索引 + 短码唯一索引
     db.agent_principal_escalations()
@@ -1887,26 +3064,31 @@ async fn ensure_evolution_indexes(db: &Database) -> anyhow::Result<()> {
             None,
         )
         .await?;
-    // 同客户同类别只允许一条 pending 请示：escalate_held_decision / trigger_principal_escalation
+    db.agent_principal_escalations()
+        .create_index(principal_relay_pending_index(), None)
+        .await?;
+    // MongoDB partial indexes reject `$in` (Error 67). Retire the original
+    // definition before creating the compatible v2 index; otherwise servers
+    // that previously accepted it would fail startup with IndexOptionsConflict.
+    let _ = db
+        .agent_principal_escalations()
+        .drop_index("principal_card_delivery_reconcile_idx", None)
+        .await;
+    db.agent_principal_escalations()
+        .create_index(principal_card_delivery_reconcile_index(), None)
+        .await?;
+    db.agent_principal_escalations()
+        .create_index(principal_card_timeout_index(), None)
+        .await?;
+    // 同账号客户同类别只允许一条 pending 请示：完整业务身份是
+    // (workspace, account, contact)。不同账号可复用同一 wxid，不能互相压制。
     // 此前用 has_pending_for_contact (count) 后再 insert_pending_escalation，存在 TOCTOU——
     // follow-up worker 与 webhook debounce runner 是两个独立 tokio 任务，可并发跑同一 contact，
     // 各 count 到 0 → 各插一条 → 领导被推两张卡。partial filter 限定 status=pending 否则会
     // 误伤 resolved 历史（同客户同类别本就可多次历史请示）。insert 侧捕获本索引的 11000
     // dup-key 当作"已存在 pending"静默跳过推卡（见 ledger::insert_pending_escalation）。
     db.agent_principal_escalations()
-        .create_index(
-            IndexModel::builder()
-                .keys(doc! { "workspace_id": 1, "contact_wxid": 1, "category": 1 })
-                .options(
-                    IndexOptions::builder()
-                        .unique(true)
-                        .partial_filter_expression(doc! { "status": "pending" })
-                        .name("uniq_principal_escalation_pending_ws_contact_category".to_string())
-                        .build(),
-                )
-                .build(),
-            None,
-        )
+        .create_index(principal_escalation_pending_dedupe_index(), None)
         .await?;
 
     Ok(())

@@ -1,4 +1,5 @@
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
 import { FormDialogProvider, useFormDialog, type FormField } from "../../../../components/ui/FormDialog";
 
@@ -56,5 +57,21 @@ describe("FormDialog", () => {
     await screen.findByText("拆分知识条目");
     fireEvent.click(screen.getByRole("button", { name: "取消" }));
     await waitFor(() => expect(results).toEqual([null]));
+  });
+
+  it("逐键输入后续字段时保持焦点并保留完整值", async () => {
+    const user = userEvent.setup();
+    const results = setup([
+      { kind: "text", name: "target", label: "目标" },
+      { kind: "text", name: "note", label: "备注" },
+    ]);
+    await screen.findByText("拆分知识条目");
+    const note = screen.getByLabelText(/备注/);
+    await user.click(note);
+    await user.type(note, "abc");
+    expect(note).toHaveFocus();
+    expect(note).toHaveValue("abc");
+    await user.click(screen.getByRole("button", { name: "确定" }));
+    await waitFor(() => expect(results).toEqual([{ target: "", note: "abc" }]));
   });
 });

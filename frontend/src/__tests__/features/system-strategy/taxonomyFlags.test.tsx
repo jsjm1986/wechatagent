@@ -86,4 +86,44 @@ describe("TaxonomiesAdmin 终态 / 再激活 flag 配置（D6）", () => {
     expect(body.value.isTerminal).toBe(false);
     expect(body.value.isReactivationTarget).toBe(false);
   });
+
+  it("编辑时完整回显 flags，显式切换只 PATCH 变化的 flag", async () => {
+    const item = {
+      id: "taxonomy-runtime-flags",
+      scope: "global",
+      kind: "customer_stage",
+      value: {
+        id: "dormant_reactivation",
+        label: "休眠再激活",
+        aliases: [],
+        description: "",
+        status: "active",
+        priorityWeight: 10,
+        isTerminal: true,
+        isReactivationTarget: true,
+      },
+      version: 1,
+      currentVersion: true,
+      previousVersion: null,
+      seededBy: "system",
+      updatedAt: "",
+    };
+    vi.spyOn(api, "get").mockImplementation((url: string) =>
+      Promise.resolve((url.includes("/api/admin/taxonomies") ? { items: [item] } : { items: [] }) as never),
+    );
+    const patch = vi.spyOn(api, "patch").mockResolvedValue({ item } as never);
+
+    render(<SystemStrategyFeature />);
+    selectTab("标签与状态");
+    fireEvent.click(await screen.findByText("编辑"));
+    expect(screen.getByLabelText(/可作再激活目标/)).toBeChecked();
+    expect(screen.getByLabelText(/终态/)).toBeChecked();
+    fireEvent.click(screen.getByLabelText(/可作再激活目标/));
+    fireEvent.click(screen.getByText("保存编辑"));
+
+    await waitFor(() => expect(patch).toHaveBeenCalledWith(
+      "/api/admin/taxonomies/taxonomy-runtime-flags",
+      { isReactivationTarget: false },
+    ));
+  });
 });

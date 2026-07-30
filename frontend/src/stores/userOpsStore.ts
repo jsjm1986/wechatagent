@@ -38,8 +38,11 @@ interface UserOpsState {
   memoryDraft: OperatingMemoryDraft;
   operationHealth: OperationHealth | null;
   decisionReviews: DecisionReview[];
+  detailAccountId: string;
+  detailContactId: string;
+  detailGeneration: number;
   // 判断条请示灯（Task 3）：统一收件箱里待本人裁决的请示数量（principalEscalation）。
-  escalationPendingCount: number;
+  escalationPendingCount: number | null;
 
   // 表单/草稿
   searchQuery: string;
@@ -57,6 +60,7 @@ interface UserOpsState {
   profileEditDraft: { lastCommitment?: string; followUpPolicy?: string };
   guideInstruction: string;
   guidePreview: UserOperationGuidePreview | null;
+  guidePreviewGeneration: number;
   simulationInput: string;
   simulationTurns: SimulationTurn[];
   selectedPlaybookId: string;
@@ -67,6 +71,10 @@ interface UserOpsState {
   generatePlaybookText: string;
   optimizePlaybookText: string;
   editingPlaybookId: string;
+  editingPlaybookAccountId: string;
+  editingPlaybookVersion: number | null;
+  playbookScopeAccountId: string;
+  playbookRequestGeneration: number;
 
   // Domain 配置相关
   operationDomains: OperationDomainConfig[];
@@ -108,6 +116,7 @@ interface UserOpsActions {
 
   // 核心业务方法
   hydrateSelected: (contact: Contact) => void;
+  clearContactDetail: (accountId: string) => void;
   loadMessages: (contact: Contact) => Promise<void>;
   loadEscalationCount: () => Promise<void>;
   loadPlaybooks: (accountId: string) => Promise<void>;
@@ -117,7 +126,8 @@ interface UserOpsActions {
   loadRoster: (accountId: string, opts?: { force?: boolean }) => Promise<{ items: RosterEntry[]; syncing: boolean }>;
   batchEnable: (payload: {
     accountId: string;
-    candidates: { wxid: string; nickname?: string | null; remark?: string | null; avatarUrl?: string | null; sex?: number | null }[];
+    source: "pool" | "roster";
+    candidates: { contactId?: string; wxid: string; nickname?: string | null; remark?: string | null; avatarUrl?: string | null; sex?: number | null }[];
     sharedNote: string;
     playbookId?: string;
   }) => Promise<{ enabled: number; queued: number }>;
@@ -132,10 +142,10 @@ interface UserOpsActions {
   saveOperationProfile: () => Promise<void>;
   saveOperatingMemory: () => Promise<void>;
   clearReferral: (contactId: string) => Promise<void>;
-  saveManualTags: (tags: string[]) => Promise<void>;
+  saveManualTags: (contact: Contact, tags: string[]) => Promise<void>;
   analyzeProfile: () => Promise<void>;
   previewGuideInstruction: (instruction: string) => Promise<void>;
-  applyGuidePreview: () => Promise<UserOperationGuideApplyResult | null>;
+  applyGuidePreview: (confirmGlobalImpact?: boolean) => Promise<UserOperationGuideApplyResult | null>;
   runMemoryConsolidation: () => Promise<void>;
   runDialogueSimulation: () => Promise<void>;
   createPlaybook: () => Promise<void>;
@@ -287,17 +297,20 @@ function playbookPayload(draft: PlaybookDraft) {
 // （后端 GET /api/contacts 支持 q 子串过滤已导入好友）。
 async function refreshContacts(currentAccountId: string | null, q?: string) {
   if (!currentAccountId) return;
+  await useContactStore.getState().loadContacts(currentAccountId, q);
+}
 
-  try {
-    const params = [`accountId=${encodeURIComponent(currentAccountId)}`];
-    params.push("limit=500");
-    const trimmed = q?.trim();
-    if (trimmed) params.push(`q=${encodeURIComponent(trimmed)}`);
-    const contactData = await api.get<{ items: Contact[] }>(`/api/contacts?${params.join("&")}`);
-    useContactStore.getState().setContacts(contactData.items);
-  } catch (error) {
-    useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
-  }
+function detailActionIsCurrent(state: UserOpsState, contact: Contact | null): contact is Contact {
+  if (!contact) return false;
+  const currentAccountId = useAccountStore.getState().currentAccountId();
+  const contactState = useContactStore.getState();
+  return Boolean(currentAccountId)
+    && contact.accountId === currentAccountId
+    && contactState.dataAccountId === currentAccountId
+    && contactState.selected?.id === contact.id
+    && contactState.selected?.accountId === currentAccountId
+    && state.detailAccountId === currentAccountId
+    && state.detailContactId === contact.id;
 }
 
 export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) => ({
@@ -311,7 +324,10 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
   memoryDraft: emptyMemoryDraft(),
   operationHealth: null,
   decisionReviews: [],
-  escalationPendingCount: 0,
+  detailAccountId: "",
+  detailContactId: "",
+  detailGeneration: 0,
+  escalationPendingCount: null,
 
   profileNote: "",
   customAgentInstructions: "",
@@ -323,6 +339,7 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
   searchQuery: "",
   guideInstruction: "",
   guidePreview: null,
+  guidePreviewGeneration: 0,
   simulationInput: "我最近在看 AI 运营，想了解你们能做到什么程度。\n我们现在几百个客户，销售经常跟丢，但我不想做机器人群发。\n如果客户三天没回，你们会一直追吗？",
   simulationTurns: [],
   selectedPlaybookId: "",
@@ -332,6 +349,10 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
   generatePlaybookText: "我们运营 AI 软件定制客户，希望像真实顾问朋友一样长期理解用户，在信任不受损的前提下自然推进需求沟通、方案确认和成交。",
   optimizePlaybookText: "让方法更像真人朋友，减少营销感；对高意向用户更自然地主动推进；对沉默客户降低打扰频率。",
   editingPlaybookId: "",
+  editingPlaybookAccountId: "",
+  editingPlaybookVersion: null,
+  playbookScopeAccountId: "",
+  playbookRequestGeneration: 0,
 
   // Domain 配置相关
   operationDomains: [],
@@ -364,9 +385,41 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
   setDomainDrafts: (drafts) => set({ domainDrafts: drafts }),
   setMemoryDraft: (patch) => set((s) => ({ memoryDraft: { ...s.memoryDraft, ...patch } })),
 
+  clearContactDetail: (accountId) => set((state) => ({
+    messages: [],
+    operatingMemory: null,
+    memoryCandidates: [],
+    memoryDraft: emptyMemoryDraft(),
+    operationHealth: null,
+    decisionReviews: [],
+    detailAccountId: accountId,
+    detailContactId: "",
+    detailGeneration: state.detailGeneration + 1,
+    profileNote: "",
+    customAgentInstructions: "",
+    assistOverride: "default",
+    relationshipType: "",
+    referredSpecialistAt: undefined,
+    referredCardId: undefined,
+    profileEditDraft: {},
+    selectedPlaybookId: "",
+    guidePreview: null,
+    guidePreviewGeneration: state.guidePreviewGeneration + 1,
+    guideBusy: false,
+  })),
+
   // 选中联系人时同步状态
   hydrateSelected: (contact) => {
-    set({
+    set((state) => ({
+      messages: [],
+      operatingMemory: null,
+      memoryCandidates: [],
+      memoryDraft: emptyMemoryDraft(),
+      operationHealth: null,
+      decisionReviews: [],
+      detailAccountId: contact.accountId,
+      detailContactId: contact.id,
+      detailGeneration: state.detailGeneration + 1,
       profileNote: contact.humanProfileNote || "",
       customAgentInstructions: contact.customAgentInstructions || "",
       assistOverride:
@@ -392,19 +445,42 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
         followUpPolicy: contact.followUpPolicy || "",
       },
       selectedPlaybookId: contact.playbookId || "",
-      guidePreview: null
-    });
+      guidePreview: null,
+      guidePreviewGeneration: state.guidePreviewGeneration + 1,
+      guideBusy: false,
+    }));
   },
 
   // 加载选中联系人的数据
   loadMessages: async (contact) => {
+    const accountId = contact.accountId;
+    const detailGeneration = get().detailGeneration;
+    const contactState = useContactStore.getState();
+    if (
+      useAccountStore.getState().currentAccountId() !== accountId ||
+      contactState.dataAccountId !== accountId ||
+      contactState.selected?.id !== contact.id ||
+      contactState.selected?.accountId !== accountId ||
+      get().detailAccountId !== accountId ||
+      get().detailContactId !== contact.id
+    ) return;
     const [messagesR, memoryR, candidateR, reviewsR, healthR] = await Promise.allSettled([
       api.get<{ items: Message[] }>(`/api/conversations/${contact.id}/messages?limit=50`),
       api.get<{ item: OperatingMemory }>(`/api/contacts/${contact.id}/operating-memory`),
       api.get<{ items: MemoryCandidateItem[] }>(`/api/contacts/${contact.id}/memory-candidates?limit=30`),
-      api.get<{ items: DecisionReview[] }>(`/api/decision-reviews?contactId=${contact.id}&limit=20`),
+      api.get<{ items: DecisionReview[] }>(`/api/decision-reviews?accountId=${encodeURIComponent(accountId)}&contactId=${contact.id}&limit=20`),
       api.get<OperationHealth>(`/api/contacts/${contact.id}/operation-health`),
     ]);
+    const currentContactState = useContactStore.getState();
+    if (
+      get().detailGeneration !== detailGeneration ||
+      get().detailAccountId !== accountId ||
+      get().detailContactId !== contact.id ||
+      useAccountStore.getState().currentAccountId() !== accountId ||
+      currentContactState.dataAccountId !== accountId ||
+      currentContactState.selected?.id !== contact.id ||
+      currentContactState.selected?.accountId !== accountId
+    ) return;
     set({
       messages: messagesR.status === "fulfilled" ? messagesR.value.items : [],
       operatingMemory: memoryR.status === "fulfilled" ? memoryR.value.item : null,
@@ -424,30 +500,67 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
         firstErr.reason instanceof Error ? firstErr.reason.message : String(firstErr.reason),
       );
     }
-    // 判断条请示灯：与选中联系人数据并行加载（失败不阻断，优雅降级为 0）。
+  // 判断条请示灯：与选中联系人数据并行加载；失败保留 unknown，不能伪装成 0。
     void get().loadEscalationCount();
   },
 
   // 判断条请示灯：拉统一收件箱 summary，取待本人裁决的请示数（principalEscalation）。
-  // 失败/字段缺失回落 0（不弹错、不渲染此 chip）——纯观测灯，不阻断驾驶舱。
+  // 失败/字段缺失为 null（不可用），与真实 0 明确区分。
   loadEscalationCount: async () => {
     try {
       const summary = await fetchSummary();
-      const count = typeof summary.principalEscalation === "number" ? summary.principalEscalation : 0;
+      const value = summary.counts.principalEscalation;
+      const count = typeof value === "number" ? value : null;
       set({ escalationPendingCount: count });
     } catch {
-      set({ escalationPendingCount: 0 });
+      set({ escalationPendingCount: null });
     }
   },
 
   // 加载剧本列表
   loadPlaybooks: async (accountId) => {
+    if (!accountId) return;
+    const generation = get().playbookRequestGeneration + 1;
+    const accountChanged = get().playbookScopeAccountId !== accountId;
+    set({
+      playbookScopeAccountId: accountId,
+      playbookRequestGeneration: generation,
+      ...(accountChanged
+        ? {
+            playbooks: [],
+            editingPlaybookId: "",
+            editingPlaybookAccountId: "",
+            editingPlaybookVersion: null,
+            playbookDraft: emptyPlaybookDraft(),
+            generatePlaybookText: "",
+            optimizePlaybookText: ""
+          }
+        : {})
+    });
     try {
-      const accountParam = accountId ? `accountId=${encodeURIComponent(accountId)}` : "";
-      const data = await api.get<{ items: OperationPlaybook[] }>(`/api/operation-playbooks${accountParam ? `?${accountParam}` : ""}`);
+      const data = await api.get<{ items: OperationPlaybook[] }>(
+        `/api/operation-playbooks?accountId=${encodeURIComponent(accountId)}`
+      );
+      const current = get();
+      if (
+        current.playbookRequestGeneration !== generation ||
+        current.playbookScopeAccountId !== accountId ||
+        useAccountStore.getState().currentAccountId() !== accountId
+      ) {
+        return;
+      }
+      if (data.items.some((playbook) => playbook.accountId !== accountId)) {
+        throw new Error("Playbook 响应账号不匹配");
+      }
       set({ playbooks: data.items });
     } catch (error) {
-      useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
+      const current = get();
+      if (
+        current.playbookRequestGeneration === generation &&
+        current.playbookScopeAccountId === accountId
+      ) {
+        useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
+      }
     }
   },
 
@@ -493,7 +606,7 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
 
   // 批量托管：把勾选好友一次性置 managed + 共享运营备注，后端异步入队 initial_profile 生成画像。
   batchEnable: async (payload) => {
-    return await api.post<{ enabled: number; queued: number }>(
+    return await api.post<{ enabled: number; queued: number; rejectedSelf?: number; rejectedNonHuman?: number }>(
       "/api/contacts/batch-enable",
       payload
     );
@@ -524,16 +637,18 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
   enableAgent: async () => {
     const selected = useContactStore.getState().selected;
     const currentAccountId = useAccountStore.getState().currentAccountId();
-    const { profileNote } = get();
+    const { profileNote, selectedPlaybookId } = get();
 
-    if (!selected) return;
+    if (!detailActionIsCurrent(get(), selected)) return;
 
-    useUiStore.getState().setBusy(true);
+    set({ guideBusy: true });
     useUiStore.getState().setError("");
 
     try {
       await api.post(`/api/contacts/${selected.id}/enable-agent`, {
-        humanProfileNote: profileNote || undefined
+        expectedAccountId: selected.accountId,
+        humanProfileNote: profileNote || undefined,
+        playbookId: selectedPlaybookId || undefined,
       });
       await refreshContacts(currentAccountId);
     } catch (error) {
@@ -566,13 +681,14 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
     const currentAccountId = useAccountStore.getState().currentAccountId();
     const { profileNote } = get();
 
-    if (!selected) return;
+    if (!detailActionIsCurrent(get(), selected)) return;
 
     useUiStore.getState().setBusy(true);
     useUiStore.getState().setError("");
 
     try {
       await api.put(`/api/contacts/${selected.id}/profile-note`, {
+        expectedAccountId: selected.accountId,
         humanProfileNote: profileNote || undefined
       });
       await refreshContacts(currentAccountId);
@@ -588,14 +704,15 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
     const currentAccountId = useAccountStore.getState().currentAccountId();
     const { customAgentInstructions } = get();
 
-    if (!selected) return;
+    if (!detailActionIsCurrent(get(), selected)) return;
 
     useUiStore.getState().setBusy(true);
     useUiStore.getState().setError("");
 
     try {
       await api.put(`/api/contacts/${selected.id}/custom-agent-instructions`, {
-        customAgentInstructions: customAgentInstructions || undefined
+        expectedAccountId: selected.accountId,
+        instructions: customAgentInstructions
       });
       await refreshContacts(currentAccountId);
     } catch (error) {
@@ -610,13 +727,14 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
     const currentAccountId = useAccountStore.getState().currentAccountId();
     const { assistOverride } = get();
 
-    if (!selected) return;
+    if (!detailActionIsCurrent(get(), selected)) return;
 
     useUiStore.getState().setBusy(true);
     useUiStore.getState().setError("");
 
     try {
       await api.put(`/api/contacts/${selected.id}/assist-override`, {
+        expectedAccountId: selected.accountId,
         mode: assistOverride
       });
       await refreshContacts(currentAccountId);
@@ -630,15 +748,17 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
   saveOperationProfile: async () => {
     const selected = useContactStore.getState().selected;
     const currentAccountId = useAccountStore.getState().currentAccountId();
-    const { relationshipType, profileEditDraft } = get();
+    const { relationshipType, profileEditDraft, selectedPlaybookId } = get();
 
-    if (!selected) return;
+    if (!detailActionIsCurrent(get(), selected)) return;
 
     useUiStore.getState().setBusy(true);
     useUiStore.getState().setError("");
 
     try {
       await api.put(`/api/contacts/${selected.id}/operation-profile`, {
+        expectedAccountId: selected.accountId,
+        playbookId: selectedPlaybookId || undefined,
         relationshipType: relationshipType || undefined,
         lastCommitment: profileEditDraft.lastCommitment || undefined,
         followUpPolicy: profileEditDraft.followUpPolicy || undefined,
@@ -656,7 +776,7 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
     const currentAccountId = useAccountStore.getState().currentAccountId();
     const { memoryDraft } = get();
 
-    if (!selected) return;
+    if (!detailActionIsCurrent(get(), selected)) return;
 
     useUiStore.getState().setBusy(true);
     useUiStore.getState().setError("");
@@ -664,7 +784,10 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
     try {
       // A2：把扁平 23 字段 memoryDraft 归组成后端要求的四个嵌套 Document
       // （userUnderstanding/relationshipState/productFit/nextAction）后整体 $set。
-      await api.put(`/api/contacts/${selected.id}/operating-memory`, groupMemoryDraft(memoryDraft));
+      await api.put(`/api/contacts/${selected.id}/operating-memory`, {
+        expectedAccountId: selected.accountId,
+        ...groupMemoryDraft(memoryDraft),
+      });
       await refreshContacts(currentAccountId);
     } catch (error) {
       useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
@@ -688,17 +811,20 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
     }
   },
 
-  saveManualTags: async (tags: string[]) => {
+  saveManualTags: async (contact, tags) => {
     // 标签可信度改造 - 运营录入层：保存运营录入标签，后端权威覆盖。
     const currentAccountId = useAccountStore.getState().currentAccountId();
     const selected = useContactStore.getState().selected;
-    if (!selected) return;
+    if (!detailActionIsCurrent(get(), contact) || selected?.id !== contact.id) return;
 
     useUiStore.getState().setBusy(true);
     useUiStore.getState().setError("");
 
     try {
-      await api.put(`/api/contacts/${selected.id}/manual-tags`, { tags });
+      await api.put(`/api/contacts/${contact.id}/manual-tags`, {
+        expectedAccountId: contact.accountId,
+        tags,
+      });
       await refreshContacts(currentAccountId);
     } catch (error) {
       useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
@@ -729,9 +855,14 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
     const selected = useContactStore.getState().selected;
     const currentAccountId = useAccountStore.getState().currentAccountId();
 
-    if (!selected || !currentAccountId) return;
+    if (!selected || !currentAccountId || !detailActionIsCurrent(get(), selected)) return;
+    const requestGeneration = get().guidePreviewGeneration + 1;
 
-    set({ guideBusy: true });
+    set({
+      guideBusy: true,
+      guidePreview: null,
+      guidePreviewGeneration: requestGeneration,
+    });
     useUiStore.getState().setError("");
 
     try {
@@ -740,6 +871,19 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
         contactId: selected.id,
         instruction
       });
+
+      if (
+        get().guidePreviewGeneration !== requestGeneration ||
+        !detailActionIsCurrent(get(), selected)
+      ) {
+        return;
+      }
+      if (
+        data.item.accountId !== currentAccountId ||
+        data.item.contactId !== selected.id
+      ) {
+        throw new Error("guide_preview_identity_conflict");
+      }
 
       const next: Partial<UserOpsState> = { guidePreview: data.item };
       // FE-1：直接用后端构建好的 health（scores + canonical 7 项 items，与正常加载
@@ -750,18 +894,35 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
       }
       set(next);
     } catch (error) {
-      useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
+      if (
+        get().guidePreviewGeneration === requestGeneration &&
+        detailActionIsCurrent(get(), selected)
+      ) {
+        useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
+      }
     } finally {
-      set({ guideBusy: false });
+      if (get().guidePreviewGeneration === requestGeneration) {
+        set({ guideBusy: false });
+      }
     }
   },
 
-  applyGuidePreview: async () => {
+  applyGuidePreview: async (confirmGlobalImpact = false) => {
     const selected = useContactStore.getState().selected;
     const currentAccountId = useAccountStore.getState().currentAccountId();
-    const { guidePreview } = get();
+    const { guidePreview, guidePreviewGeneration } = get();
 
-    if (!selected || !guidePreview) return null;
+    if (
+      !selected ||
+      !currentAccountId ||
+      !guidePreview ||
+      !detailActionIsCurrent(get(), selected) ||
+      guidePreview.accountId !== currentAccountId ||
+      guidePreview.contactId !== selected.id ||
+      !guidePreview.candidateHash
+    ) {
+      return null;
+    }
 
     useUiStore.getState().setBusy(true);
     useUiStore.getState().setError("");
@@ -769,22 +930,48 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
     try {
       const data = await api.post<{ item: UserOperationGuideApplyResult }>(
         "/api/user-operations/guide/apply",
-        { previewId: guidePreview.id }
+        {
+          previewId: guidePreview.id,
+          expectedAccountId: currentAccountId,
+          expectedContactId: selected.id,
+          candidateHash: guidePreview.candidateHash,
+          confirmGlobalImpact,
+        }
       );
 
-      set({
-        operatingMemory: data.item.operatingMemory,
+      if (
+        get().guidePreviewGeneration !== guidePreviewGeneration ||
+        !detailActionIsCurrent(get(), selected)
+      ) {
+        return null;
+      }
+
+      set((state) => ({
         guidePreview: null,
-        operationHealth: data.item.health
-      });
+        guidePreviewGeneration: state.guidePreviewGeneration + 1,
+        guideBusy: false,
+      }));
 
       await refreshContacts(currentAccountId);
+      const refreshed = useContactStore.getState().contacts.find((item) => item.id === selected.id);
+      if (refreshed && detailActionIsCurrent(get(), selected)) {
+        useContactStore.getState().setSelected(refreshed);
+        get().hydrateSelected(refreshed);
+        await get().loadMessages(refreshed);
+      }
       return data.item;
     } catch (error) {
-      useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
+      if (
+        get().guidePreviewGeneration === guidePreviewGeneration &&
+        detailActionIsCurrent(get(), selected)
+      ) {
+        useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
+      }
       return null;
     } finally {
-      useUiStore.getState().setBusy(false);
+      if (get().guidePreviewGeneration === guidePreviewGeneration) {
+        set({ guideBusy: false });
+      }
     }
   },
 
@@ -844,8 +1031,13 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
   createPlaybook: async () => {
     const { playbookDraft } = get();
     const currentAccountId = useAccountStore.getState().currentAccountId();
+    const requestGeneration = get().playbookRequestGeneration;
 
-    if (!playbookDraft.name.trim() || !currentAccountId) return;
+    if (
+      !playbookDraft.name.trim() ||
+      !currentAccountId ||
+      get().playbookScopeAccountId !== currentAccountId
+    ) return;
 
     useUiStore.getState().setBusy(true);
     useUiStore.getState().setError("");
@@ -856,12 +1048,19 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
         ...playbookPayload(playbookDraft)
       });
 
-      set({
-        playbookDraft: emptyPlaybookDraft(),
-        editingPlaybookId: ""
-      });
-
-      await get().loadPlaybooks(currentAccountId);
+      if (
+        useAccountStore.getState().currentAccountId() === currentAccountId &&
+        get().playbookScopeAccountId === currentAccountId &&
+        get().playbookRequestGeneration === requestGeneration
+      ) {
+        set({
+          playbookDraft: emptyPlaybookDraft(),
+          editingPlaybookId: "",
+          editingPlaybookAccountId: "",
+          editingPlaybookVersion: null
+        });
+        await get().loadPlaybooks(currentAccountId);
+      }
     } catch (error) {
       useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
     } finally {
@@ -870,21 +1069,51 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
   },
 
   savePlaybook: async () => {
-    const { playbookDraft, editingPlaybookId } = get();
+    const {
+      playbookDraft,
+      editingPlaybookId,
+      editingPlaybookAccountId,
+      editingPlaybookVersion,
+      playbookScopeAccountId
+    } = get();
     const currentAccountId = useAccountStore.getState().currentAccountId();
 
-    if (!editingPlaybookId || !playbookDraft.name.trim() || !currentAccountId) return;
+    if (
+      !editingPlaybookId ||
+      !playbookDraft.name.trim() ||
+      !currentAccountId ||
+      editingPlaybookAccountId !== currentAccountId ||
+      playbookScopeAccountId !== currentAccountId ||
+      editingPlaybookVersion === null
+    ) {
+      if (editingPlaybookAccountId && editingPlaybookAccountId !== currentAccountId) {
+        set({
+          editingPlaybookId: "",
+          editingPlaybookAccountId: "",
+          editingPlaybookVersion: null,
+          playbookDraft: emptyPlaybookDraft()
+        });
+      }
+      return;
+    }
 
     useUiStore.getState().setBusy(true);
     useUiStore.getState().setError("");
 
     try {
-      await api.put(`/api/operation-playbooks/${editingPlaybookId}`, {
-        accountId: currentAccountId,
+      const result = await api.put<{ version: number }>(`/api/operation-playbooks/${editingPlaybookId}`, {
+        accountId: editingPlaybookAccountId,
+        expectedVersion: editingPlaybookVersion,
         ...playbookPayload(playbookDraft)
       });
-
-      await get().loadPlaybooks(currentAccountId);
+      if (
+        useAccountStore.getState().currentAccountId() === editingPlaybookAccountId &&
+        get().editingPlaybookId === editingPlaybookId &&
+        get().editingPlaybookVersion === editingPlaybookVersion
+      ) {
+        set({ editingPlaybookVersion: result.version });
+        await get().loadPlaybooks(editingPlaybookAccountId);
+      }
     } catch (error) {
       useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
     } finally {
@@ -893,19 +1122,43 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
   },
 
   optimizePlaybook: async (id) => {
-    const { optimizePlaybookText } = get();
+    const {
+      optimizePlaybookText,
+      editingPlaybookId,
+      editingPlaybookAccountId,
+      editingPlaybookVersion,
+      playbookScopeAccountId
+    } = get();
     const currentAccountId = useAccountStore.getState().currentAccountId();
 
-    if (!optimizePlaybookText.trim() || !currentAccountId) return;
+    if (
+      !optimizePlaybookText.trim() ||
+      !currentAccountId ||
+      id !== editingPlaybookId ||
+      editingPlaybookAccountId !== currentAccountId ||
+      playbookScopeAccountId !== currentAccountId ||
+      editingPlaybookVersion === null
+    ) return;
 
     useUiStore.getState().setBusy(true);
     useUiStore.getState().setError("");
 
     try {
       const data = await api.post<{ item: OperationPlaybook }>(`/api/operation-playbooks/${id}/optimize`, {
-        prompt: optimizePlaybookText
+        accountId: editingPlaybookAccountId,
+        expectedVersion: editingPlaybookVersion,
+        instruction: optimizePlaybookText
       });
 
+      if (
+        useAccountStore.getState().currentAccountId() !== editingPlaybookAccountId ||
+        get().editingPlaybookId !== id ||
+        get().editingPlaybookVersion !== editingPlaybookVersion ||
+        data.item.accountId !== editingPlaybookAccountId ||
+        !data.item.id ||
+        data.item.id === id ||
+        data.item.version !== editingPlaybookVersion + 1
+      ) return;
       set({
         playbookDraft: {
           name: data.item.name,
@@ -921,7 +1174,11 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
           successCriteria: data.item.successCriteria || "",
           isDefault: data.item.isDefault
         },
-        editingPlaybookId: id
+        // AI optimization returns a new non-default candidate. Keep the source
+        // row untouched and move the editor to the candidate identity.
+        editingPlaybookId: data.item.id,
+        editingPlaybookAccountId,
+        editingPlaybookVersion: data.item.version
       });
     } catch (error) {
       useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
@@ -933,8 +1190,13 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
   generatePlaybook: async () => {
     const { generatePlaybookText } = get();
     const currentAccountId = useAccountStore.getState().currentAccountId();
+    const requestGeneration = get().playbookRequestGeneration;
 
-    if (!generatePlaybookText.trim() || !currentAccountId) return;
+    if (
+      !generatePlaybookText.trim() ||
+      !currentAccountId ||
+      get().playbookScopeAccountId !== currentAccountId
+    ) return;
 
     useUiStore.getState().setBusy(true);
     useUiStore.getState().setError("");
@@ -942,9 +1204,15 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
     try {
       const data = await api.post<{ item: OperationPlaybook }>("/api/operation-playbooks/generate", {
         accountId: currentAccountId,
-        prompt: generatePlaybookText
+        description: generatePlaybookText
       });
 
+      if (
+        useAccountStore.getState().currentAccountId() !== currentAccountId ||
+        get().playbookScopeAccountId !== currentAccountId ||
+        get().playbookRequestGeneration !== requestGeneration ||
+        data.item.accountId !== currentAccountId
+      ) return;
       set({
         playbookDraft: {
           name: data.item.name,
@@ -960,7 +1228,9 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
           successCriteria: data.item.successCriteria || "",
           isDefault: data.item.isDefault
         },
-        editingPlaybookId: ""
+        editingPlaybookId: data.item.id,
+        editingPlaybookAccountId: data.item.accountId,
+        editingPlaybookVersion: data.item.version
       });
     } catch (error) {
       useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
@@ -971,15 +1241,26 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
 
   setDefaultPlaybook: async (id) => {
     const currentAccountId = useAccountStore.getState().currentAccountId();
+    const playbook = get().playbooks.find(
+      (item) => item.id === id && item.accountId === currentAccountId
+    );
 
-    if (!currentAccountId) return;
+    if (!currentAccountId || get().playbookScopeAccountId !== currentAccountId || !playbook) return;
 
     useUiStore.getState().setBusy(true);
     useUiStore.getState().setError("");
 
     try {
-      await api.post(`/api/operation-playbooks/${id}/set-default`, {});
-      await get().loadPlaybooks(currentAccountId);
+      await api.post(`/api/operation-playbooks/${id}/set-default`, {
+        accountId: playbook.accountId,
+        expectedVersion: playbook.version
+      });
+      if (
+        useAccountStore.getState().currentAccountId() === currentAccountId &&
+        get().playbookScopeAccountId === currentAccountId
+      ) {
+        await get().loadPlaybooks(currentAccountId);
+      }
     } catch (error) {
       useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
     } finally {
@@ -988,8 +1269,16 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
   },
 
   editPlaybook: (playbook) => {
+    const currentAccountId = useAccountStore.getState().currentAccountId();
+    if (
+      !currentAccountId ||
+      playbook.accountId !== currentAccountId ||
+      get().playbookScopeAccountId !== currentAccountId
+    ) return;
     set({
       editingPlaybookId: playbook.id,
+      editingPlaybookAccountId: playbook.accountId,
+      editingPlaybookVersion: playbook.version,
       playbookDraft: {
         name: playbook.name,
         description: playbook.description || "",
@@ -1010,6 +1299,8 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
   newPlaybookDraft: () => {
     set({
       editingPlaybookId: "",
+      editingPlaybookAccountId: "",
+      editingPlaybookVersion: null,
       playbookDraft: emptyPlaybookDraft()
     });
   },

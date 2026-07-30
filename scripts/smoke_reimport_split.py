@@ -160,11 +160,12 @@ def import_one(name: str, sub_title: str, content: str, existing_sources: set[st
             "POST",
             "/operation-knowledge/import-apply",
             {
-                "accountId": ACCOUNT_ID,
-                "sourceName": full_source,
-                "document": doc,
-                "items": items,
-                "chunks": chunks,
+                "previewId": preview.get("previewId"),
+                "previewHash": preview.get("previewHash"),
+                "chunks": [
+                    {"candidateId": chunk.get("candidateId"), "patch": {}}
+                    for chunk in chunks
+                ],
             },
             timeout=180,
             retries=1,

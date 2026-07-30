@@ -40,10 +40,7 @@ use super::budget::EvolutionBudget;
 use super::error::EvolutionError;
 
 /// Block-class gates with `score >= threshold` 触发（分数越高越危险）。
-const BLOCK_DIRECTION_GTE: &[&str] = &[
-    "fact_risk_block",
-    "pressure_risk_block",
-];
+const BLOCK_DIRECTION_GTE: &[&str] = &["fact_risk_block", "pressure_risk_block"];
 
 /// Block / rewrite 类用 `score < threshold` 触发（分数越低越触发）。
 /// 注意 `product_accuracy_score_block` 走 < 方向：业务上"产品准确度过低 →
@@ -60,6 +57,8 @@ const REWRITE_DIRECTION_LT: &[&str] = &[
 pub async fn eval_all(
     state: &AppState,
     experiment_id: &str,
+    workspace_id: &str,
+    account_id: &str,
     budget: &mut EvolutionBudget,
 ) -> Result<(), EvolutionError> {
     // 1. 加载本 experiment 下 status=pending_eval 的所有 proposals。
@@ -69,6 +68,8 @@ pub async fn eval_all(
         .find(
             doc! {
                 "experiment_id": experiment_id,
+                "workspace_id": workspace_id,
+                "account_id": account_id,
                 "status": "pending_eval",
             },
             None,
@@ -87,13 +88,18 @@ pub async fn eval_all(
     let envelope_doc = state
         .db
         .experiments()
-        .find_one(doc! { "experiment_id": experiment_id }, None)
+        .find_one(
+            doc! {
+                "experiment_id": experiment_id,
+                "workspace_id": workspace_id,
+                "account_id": account_id,
+            },
+            None,
+        )
         .await
         .map_err(EvolutionError::from)?
         .ok_or_else(|| {
-            EvolutionError::InvalidStatus(format!(
-                "experiment_id not found: {experiment_id}"
-            ))
+            EvolutionError::InvalidStatus(format!("experiment_id not found: {experiment_id}"))
         })?;
     let threshold_runs = envelope_doc.cohort_threshold_run_ids.clone();
     let prompt_runs = envelope_doc.cohort_prompt_run_ids.clone();
@@ -120,14 +126,9 @@ pub async fn eval_all(
             // 不启动 LLM——所以 W3 的 budget 主要在 W2 的 prompt_critic 阶段消耗。
             // 这里仍调 exhausted 占位以保持后续接入完整 LLM 时一处控制。
             if budget.exhausted() {
-                let _ = insert_replay_failed(
-                    state,
-                    &proposal,
-                    pid,
-                    src,
-                    "evolution_budget_exceeded",
-                )
-                .await;
+                let _ =
+                    insert_replay_failed(state, &proposal, pid, src, "evolution_budget_exceeded")
+                        .await;
                 continue;
             }
 
@@ -160,7 +161,14 @@ pub async fn run_shadow_replay(
     let original = match state
         .db
         .agent_run_logs()
-        .find_one(doc! { "_id": source_run_id }, None)
+        .find_one(
+            doc! {
+                "_id": source_run_id,
+                "workspace_id": &proposal.workspace_id,
+                "account_id": &proposal.account_id,
+            },
+            None,
+        )
         .await
         .map_err(AppError::from)?
     {
@@ -186,10 +194,12 @@ pub async fn run_shadow_replay(
     //    的 source_event_id 查 messages 必 miss——也按 source_message_unavailable 短路。
     if proposal.proposal_kind == "prompt" {
         let inbound_id = original.source_event_id.trim();
+        let contact_wxid = original.contact_wxid.as_deref().unwrap_or("").trim();
         let probe_ok = original.source_kind
             == crate::agent::run_envelope::SOURCE_KIND_INBOUND_MESSAGE
             && !inbound_id.is_empty()
-            && !inbound_id.starts_with("synthetic:");
+            && !inbound_id.starts_with("synthetic:")
+            && !contact_wxid.is_empty();
         let count = if probe_ok {
             // ConversationMessage 无 rename_all → BSON 字段是 snake_case `message_id`
             // （见 models.rs ConversationMessage、db/indexes.rs:49 的索引、webhooks.rs
@@ -199,7 +209,15 @@ pub async fn run_shadow_replay(
             state
                 .db
                 .messages()
-                .count_documents(doc! { "message_id": inbound_id }, None)
+                .count_documents(
+                    prompt_shadow_retention_message_filter(
+                        &proposal.workspace_id,
+                        &proposal.account_id,
+                        contact_wxid,
+                        inbound_id,
+                    ),
+                    None,
+                )
                 .await
                 .map_err(AppError::from)?
         } else {
@@ -239,6 +257,20 @@ pub async fn run_shadow_replay(
     };
 
     persist_replay(state, proposal, source_run_id, started_at, outcome).await
+}
+
+fn prompt_shadow_retention_message_filter(
+    workspace_id: &str,
+    account_id: &str,
+    contact_wxid: &str,
+    message_id: &str,
+) -> Document {
+    doc! {
+        "workspace_id": workspace_id,
+        "account_id": account_id,
+        "contact_wxid": contact_wxid,
+        "message_id": message_id,
+    }
 }
 
 /// Threshold 重判：纯函数，输入候选 + 原 run 的 review.scores，返回 5 闸新命中向量。
@@ -298,7 +330,9 @@ fn evaluate_threshold(proposal: &Proposal, original: &AgentRunLog) -> ReplayOutc
         // 终态 original.final_review_status，若终态是非-5gate 因素(blocked_by_budget/
         // ai_waiting_for_more_context 等)会让 original 侧算"发送失败"、new 侧 5闸算"成功"，
         // 凭空 +send_delta 虚假翻越 min_send_success_delta 门。两侧同口径后唯一变量是被改 gate。
-        original_final_review_status: Some(final_status_from_5gate(&original_5gate_hit).to_string()),
+        original_final_review_status: Some(
+            final_status_from_5gate(&original_5gate_hit).to_string(),
+        ),
         original_5gate_hit,
         original_self_critique_addressed: None,
         new_final_review_status: Some(new_final.to_string()),
@@ -411,7 +445,9 @@ fn scores_to_5gate_hit(scores: &Document) -> Document {
 fn final_status_from_5gate(hit: &Document) -> &'static str {
     let any_block_hit = hit.get_bool("fact_risk_block").unwrap_or(false)
         || hit.get_bool("pressure_risk_block").unwrap_or(false)
-        || hit.get_bool("product_accuracy_score_block").unwrap_or(false);
+        || hit
+            .get_bool("product_accuracy_score_block")
+            .unwrap_or(false);
     let any_rewrite_hit = hit.get_bool("human_like_score_rewrite").unwrap_or(false)
         || hit.get_bool("emotional_value_rewrite").unwrap_or(false);
     if any_block_hit {
@@ -453,11 +489,15 @@ fn prompt_sample_to_outcome(
         .as_ref()
         .map(scores_to_5gate_hit)
         .unwrap_or_default();
-    let original_final = sample
-        .original_scores
-        .as_ref()
-        .map(|_| final_status_from_5gate(&original_5gate_hit).to_string());
-    let new_final = final_status_from_5gate(&new_5gate_hit).to_string();
+    let original_final = sample.original_final_review_status.or_else(|| {
+        sample
+            .original_scores
+            .as_ref()
+            .map(|_| final_status_from_5gate(&original_5gate_hit).to_string())
+    });
+    let new_final = sample
+        .new_final_review_status
+        .unwrap_or_else(|| final_status_from_5gate(&new_5gate_hit).to_string());
 
     ReplayOutcome {
         completed: true,
@@ -466,7 +506,7 @@ fn prompt_sample_to_outcome(
         original_5gate_hit,
         original_self_critique_addressed: sample.original_self_critique_addressed,
         new_final_review_status: Some(new_final),
-        new_review_risks: Vec::new(),
+        new_review_risks: sample.new_review_risks,
         new_token_cost: None,
         new_self_critique_addressed: sample.new_self_critique_addressed,
         new_5gate_hit,
@@ -544,7 +584,12 @@ async fn persist_replay(
         workspace_id: proposal.workspace_id.clone(),
         account_id: proposal.account_id.clone(),
         source_run_id,
-        status: if outcome.completed { "completed" } else { "failed" }.to_string(),
+        status: if outcome.completed {
+            "completed"
+        } else {
+            "failed"
+        }
+        .to_string(),
         failure_reason: outcome.failure_reason,
         original_final_review_status: outcome.original_final_review_status,
         original_5gate_hit: outcome.original_5gate_hit,
@@ -609,6 +654,15 @@ mod tests {
     use super::*;
     use mongodb::bson::doc;
 
+    #[test]
+    fn prompt_shadow_retention_probe_uses_full_message_scope() {
+        let filter = prompt_shadow_retention_message_filter("ws-a", "acct-a", "wxid-a", "msg-a");
+        assert_eq!(filter.get_str("workspace_id").unwrap(), "ws-a");
+        assert_eq!(filter.get_str("account_id").unwrap(), "acct-a");
+        assert_eq!(filter.get_str("contact_wxid").unwrap(), "wxid-a");
+        assert_eq!(filter.get_str("message_id").unwrap(), "msg-a");
+    }
+
     fn mk_run_log(scores: Document, final_status: &str) -> AgentRunLog {
         AgentRunLog {
             id: Some(ObjectId::new()),
@@ -628,6 +682,7 @@ mod tests {
             token_budget: 0,
             tokens_used: 0,
             llm_calls_used: 0,
+            unknown_usage_calls: 0,
             degraded_reasons: vec![],
             lifecycle: "completed".to_string(),
             source_event_id: "msg_x".to_string(),
@@ -668,6 +723,8 @@ mod tests {
             critic_reasoning: None,
             expected_improvement_on: vec![],
             risk_note: None,
+            base_revision: None,
+            released_revision: None,
             previous_prompt_version: None,
             eval_metrics: Document::new(),
             eval_replays_completed: 0,
@@ -772,7 +829,8 @@ mod tests {
         let outcome = evaluate_threshold(&proposal, &run);
         assert!(outcome.completed);
         assert_eq!(
-            outcome.new_5gate_hit
+            outcome
+                .new_5gate_hit
                 .get_bool("emotional_value_rewrite")
                 .unwrap(),
             true

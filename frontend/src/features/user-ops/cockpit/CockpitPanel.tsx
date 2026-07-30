@@ -60,7 +60,7 @@ export type CockpitPanelProps = {
   simulationInput: string;
   simulationTurns: SimulationTurn[];
   onAnalyzeProfile: () => void;
-  onApplyGuidePreview: () => void;
+  onApplyGuidePreview: (confirmGlobalImpact?: boolean) => void;
   onDisableAgent: () => void;
   onEnableAgent: () => void;
   onGuideInstruction: (value: string) => void;
@@ -76,7 +76,7 @@ export type CockpitPanelProps = {
   onSaveCustomAgentInstructions: () => void;
   onSaveAssistOverride: () => void;
   onSaveRelationshipType: () => void;
-  onSaveManualTags: (tags: string[]) => void;
+  onSaveManualTags: (contact: Contact, tags: string[]) => void;
   onMemoryDraftChange: (patch: Partial<OperatingMemoryDraft>) => void;
   onSaveOperatingMemory: () => void;
   onSelectedPlaybook: (value: string) => void;

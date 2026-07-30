@@ -68,6 +68,32 @@ function makeExperimentItem(proposals: ProposalSummary[]): ExperimentItem {
   };
 }
 
+function makeExperimentsResponse(items: ExperimentItem[]) {
+  const proposals = items.flatMap((item) => item.proposals);
+  const evaluated = proposals.filter((proposal) => proposal.significancePassed !== null);
+  const passed = evaluated.filter((proposal) => proposal.significancePassed === true).length;
+  const now = new Date().toISOString();
+  return {
+    items,
+    aggregate7d: {
+      experiments: items.length,
+      proposals: proposals.length,
+      released: proposals.filter((proposal) => proposal.status === "released").length,
+      rolledBack: proposals.filter((proposal) => proposal.status === "rolled_back").length,
+      significancePassRate: evaluated.length === 0 ? null : passed / evaluated.length,
+      coverage: {
+        complete: true,
+        source: "server_time_window",
+        windowHours: 168,
+        windowStart: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString(),
+        windowEnd: now,
+        asOf: now,
+        experimentsScanned: items.length,
+      },
+    },
+  };
+}
+
 function makeDetail(over: Partial<ProposalDetailResponse["proposal"]>): ProposalDetailResponse {
   return {
     proposal: {
@@ -146,7 +172,7 @@ describe("EvolutionCenterTab", () => {
     fetchMock.mockResolvedValueOnce(mockRuntimeFlag());
     fetchMock.mockResolvedValueOnce({
       ok: true,
-      json: async () => ({ items: [makeExperimentItem(proposals)] }),
+      json: async () => makeExperimentsResponse([makeExperimentItem(proposals)]),
     });
 
     render(<EvolutionCenterTab enabled={true} />);
@@ -182,7 +208,8 @@ describe("EvolutionCenterTab", () => {
     fetchMock.mockResolvedValueOnce(mockRuntimeFlag());
     fetchMock.mockResolvedValueOnce({
       ok: true,
-      json: async () => ({ items: [makeExperimentItem([eligibleProposal, releasedProposal])] }),
+      json: async () =>
+        makeExperimentsResponse([makeExperimentItem([eligibleProposal, releasedProposal])]),
     });
     // 第一次详情 fetch（点 eligible 行）
     fetchMock.mockResolvedValueOnce({
@@ -264,7 +291,7 @@ describe("EvolutionCenterTab", () => {
     fetchMock.mockResolvedValueOnce(mockRuntimeFlag());
     fetchMock.mockResolvedValueOnce({
       ok: true,
-      json: async () => ({ items: [makeExperimentItem([promptProposal])] }),
+      json: async () => makeExperimentsResponse([makeExperimentItem([promptProposal])]),
     });
     fetchMock.mockResolvedValueOnce({
       ok: true,
@@ -336,7 +363,7 @@ describe("EvolutionCenterTab", () => {
     fetchMock.mockResolvedValueOnce(mockRuntimeFlag({ enabled: true, rolloutPercent: 100 }));
     fetchMock.mockResolvedValueOnce({
       ok: true,
-      json: async () => ({ items: [] }),
+      json: async () => makeExperimentsResponse([]),
     });
     // PUT 响应（保存灰度后回写）。复刻后端真实结构：{ ok, flag: { 内层 } }。
     fetchMock.mockResolvedValueOnce({
@@ -381,7 +408,7 @@ describe("EvolutionCenterTab", () => {
     fetchMock.mockResolvedValueOnce(mockRuntimeFlag({ enabled: true, rolloutPercent: 100 }));
     fetchMock.mockResolvedValueOnce({
       ok: true,
-      json: async () => ({ items: [] }),
+      json: async () => makeExperimentsResponse([]),
     });
     // 「读取当前配置」按钮再次 GET(call#3)。复刻后端真实结构：配置体在 .flag 子对象里
     //（外层还有 workspaceId / envEvolutionEnabled）。读回必须从 .flag 内层取，否则恒显 0。
@@ -421,7 +448,7 @@ describe("EvolutionCenterTab", () => {
     fetchMock.mockResolvedValueOnce(mockRuntimeFlag());
     fetchMock.mockResolvedValueOnce({
       ok: true,
-      json: async () => ({ items: [] }),
+      json: async () => makeExperimentsResponse([]),
     });
     // 审计 GET 返回一条 release 行（后端真实字段）。
     fetchMock.mockResolvedValueOnce({
@@ -470,7 +497,7 @@ describe("EvolutionCenterTab", () => {
     fetchMock.mockResolvedValueOnce(mockRuntimeFlag());
     fetchMock.mockResolvedValueOnce({
       ok: true,
-      json: async () => ({ items: [] }),
+      json: async () => makeExperimentsResponse([]),
     });
     fetchMock.mockResolvedValueOnce({
       ok: true,
@@ -505,9 +532,10 @@ describe("EvolutionCenterTab", () => {
     // 历史实验须可见，否则管理员误判"演化从未运行"。返回 1 条历史让提示条命中。
     fetchMock.mockResolvedValueOnce({
       ok: true,
-      json: async () => ({
-        items: [makeExperimentItem([makeProposal({ id: "e".repeat(24), status: "released" })])],
-      }),
+      json: async () =>
+        makeExperimentsResponse([
+          makeExperimentItem([makeProposal({ id: "e".repeat(24), status: "released" })]),
+        ]),
     });
     render(<EvolutionCenterTab enabled={true} />);
     await waitFor(() => {
@@ -533,13 +561,21 @@ describe("EvolutionCenterTab", () => {
 
   it("打开总开关 PUT 写 enabled:true + rolloutPercent:100", async () => {
     fetchMock.mockResolvedValueOnce(mockRuntimeFlag({ envEvolutionEnabled: true, enabled: false, rolloutPercent: 0 }));
-    // PUT 响应
+    // 关闭态也先加载历史实验。
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => makeExperimentsResponse([]),
+    });
+    // PUT 权威回读。
     fetchMock.mockResolvedValueOnce({
       ok: true,
       json: async () => ({ ok: true, flag: { enabled: true, rolloutPercent: 100 } }),
     });
-    // 打开后 flagEnabled→true 会触发 load(experiments)
-    fetchMock.mockResolvedValueOnce({ ok: true, json: async () => ({ items: [] }) });
+    // 权威回读使 flagEnabled→true 后再次刷新 experiments。
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => makeExperimentsResponse([]),
+    });
 
     render(<EvolutionCenterTab enabled={true} />);
     await waitFor(() => screen.getByText("演化中心总开关"));
@@ -555,6 +591,54 @@ describe("EvolutionCenterTab", () => {
       expect(body.enabled).toBe(true);
       expect(body.rolloutPercent).toBe(100);
     });
+    await waitFor(() => expect(toggle).toBeChecked());
+  });
+
+  it("服务端未提供完整 7 天 coverage 时不从可见列表伪造指标", async () => {
+    fetchMock.mockResolvedValueOnce(mockRuntimeFlag());
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        items: [makeExperimentItem([makeProposal({ status: "released" })])],
+      }),
+    });
+
+    render(<EvolutionCenterTab enabled={true} />);
+
+    await waitFor(() => {
+      expect(screen.getByRole("alert")).toHaveTextContent("未返回完整的近 7 天统计覆盖");
+    });
+    expect(screen.getByTestId("agg-experiments")).toHaveTextContent("—");
+    expect(screen.getByTestId("aggregate-coverage")).toHaveTextContent("尚未加载");
+    expect(screen.queryByTestId(`proposal-row-${"0".repeat(20)}abcd`)).toBeNull();
+  });
+
+  it("总开关 PUT 失败时保持服务端原值并显示错误", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockRuntimeFlag({ envEvolutionEnabled: true, enabled: false, rolloutPercent: 0 }),
+    );
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => makeExperimentsResponse([]),
+    });
+    fetchMock.mockResolvedValueOnce({
+      ok: false,
+      text: async () => "save failed",
+    });
+
+    render(<EvolutionCenterTab enabled={true} />);
+    const toggle = (await screen.findByText("演化中心总开关"))
+      .closest("label")!
+      .querySelector("input")!;
+    expect(toggle).not.toBeChecked();
+
+    fireEvent.click(toggle);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("runtime-flag-msg")).toHaveTextContent("save failed");
+    });
+    expect(screen.getByTestId("runtime-flag-msg")).toHaveAttribute("role", "alert");
+    expect(toggle).not.toBeChecked();
   });
 
   it("runtime-flag 拉取失败时显错误+重试,不卡在加载中", async () => {

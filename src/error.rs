@@ -44,6 +44,10 @@ pub enum AppError {
         retry_after: u64,
         account_id: String,
     },
+    /// Shared admin login/token rate limit. The response intentionally exposes
+    /// neither the normalized username nor either internal fingerprint.
+    #[error("authentication rate limited, retry after {retry_after}s")]
+    AuthRateLimited { retry_after: u64 },
     /// LLM 上游（DeepSeek / OpenAI 兼容端点）经过完整重试后仍不可达。
     /// 由 [`crate::llm::generate_json_with_usage`] 在 retry 耗尽后产出，
     /// 把网络层 / 上游 5xx / 限流的 raw 错误归并为带分类的可观测错误。
@@ -94,6 +98,17 @@ impl IntoResponse for AppError {
                 }
                 response
             }
+            AppError::AuthRateLimited { retry_after } => {
+                let mut response = (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(json!({ "error": "auth_rate_limited" })),
+                )
+                    .into_response();
+                if let Ok(value) = retry_after.to_string().parse() {
+                    response.headers_mut().insert("Retry-After", value);
+                }
+                response
+            }
             AppError::LlmUnavailable {
                 kind,
                 retry_count,
@@ -131,11 +146,7 @@ impl IntoResponse for AppError {
                     _ => "internal_error",
                 };
                 tracing::error!(error_kind = kind, detail = %self, "request failed with 502");
-                (
-                    StatusCode::BAD_GATEWAY,
-                    Json(json!({ "error": kind })),
-                )
-                    .into_response()
+                (StatusCode::BAD_GATEWAY, Json(json!({ "error": kind }))).into_response()
             }
         }
     }
@@ -163,5 +174,15 @@ mod tests {
         let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v, json!({ "error": "internal_error" }));
+    }
+
+    #[tokio::test]
+    async fn auth_rate_limit_maps_to_private_429_with_retry_after() {
+        let resp = AppError::AuthRateLimited { retry_after: 17 }.into_response();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(resp.headers().get("Retry-After").unwrap(), "17");
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v, json!({ "error": "auth_rate_limited" }));
     }
 }

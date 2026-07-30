@@ -49,10 +49,22 @@ describe("bucketTone / bucketLabel", () => {
 describe("CampaignFeature", () => {
   beforeEach(() => vi.clearAllMocks());
 
+  function mockCampaignState(overrides: Record<string, unknown>) {
+    const state = {
+      selectedCampaignId: "c1",
+      report,
+      loading: false,
+      lastAttemptedId: "c1",
+      loadReport: vi.fn(),
+      page: 0,
+      setPage: vi.fn(),
+      ...overrides,
+    };
+    (useCampaignStore as any).mockImplementation((sel?: any) => sel ? sel(state) : state);
+  }
+
   it("selectedCampaignId=null 渲 EmptyState", () => {
-    (useCampaignStore as any).mockReturnValue({
-      selectedCampaignId: null, report: null, loading: false, loadReport: vi.fn(),
-    });
+    mockCampaignState({ selectedCampaignId: null, report: null });
     render(<CampaignFeature />);
     expect(screen.getByText("暂无活动结果")).toBeInTheDocument();
   });
@@ -80,20 +92,15 @@ describe("CampaignFeature", () => {
   });
 
   it("空 items 渲明细空态", () => {
-    (useCampaignStore as any).mockReturnValue({
-      selectedCampaignId: "c1",
+    mockCampaignState({
       report: { ...report, items: [], summary: { ...report.summary, targetCount: 0, sent: 0, pending: 0, blocked: {}, escalated: {} } },
-      loading: false, loadReport: vi.fn(), page: 0, setPage: vi.fn(),
     });
     render(<CampaignFeature />);
     expect(screen.getByText("暂无推送明细")).toBeInTheDocument();
   });
 
   it("点某桶 chip 后明细表只剩该桶行", () => {
-    (useCampaignStore as any).mockImplementation((sel?: any) => {
-      const state = { selectedCampaignId: "c1", report, loading: false, lastAttemptedId: "c1", loadReport: vi.fn(), page: 0, setPage: vi.fn() };
-      return sel ? sel(state) : state;
-    });
+    mockCampaignState({});
     render(<CampaignFeature />);
     // 初始 5 行
     expect(screen.getAllByTestId("detail-row")).toHaveLength(5);
@@ -106,5 +113,24 @@ describe("CampaignFeature", () => {
     const rows = screen.getAllByTestId("detail-row");
     expect(rows).toHaveLength(1);
     expect(rows[0]).toHaveTextContent("赵六");
+  });
+
+  it("report 身份与当前活动错位时隐藏明细并禁用导出", () => {
+    (useCampaignStore as any).mockImplementation((sel?: any) => {
+      const state = {
+        selectedCampaignId: "c2",
+        report,
+        loading: true,
+        lastAttemptedId: "c2",
+        loadReport: vi.fn(),
+        page: 0,
+        setPage: vi.fn(),
+      };
+      return sel ? sel(state) : state;
+    });
+    render(<CampaignFeature />);
+    expect(screen.queryByText("双11老客续费7折")).toBeNull();
+    expect(screen.queryByTestId("detail-row")).toBeNull();
+    expect(screen.getByRole("button", { name: /导出 CSV/ })).toBeDisabled();
   });
 });

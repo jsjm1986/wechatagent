@@ -21,9 +21,10 @@ use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
 use wechatagent::models::{
     AgentPrincipalEscalation, AgentStatus, AgentTask, AskHumanPolicy, AskHumanQuietHours, Contact,
     ConversationMessage, DeciderRef, OperationKnowledgeChunk, PrincipalDecision,
-    AWAITING_PRINCIPAL_DECISION_ATTR, ESCALATION_CATEGORY_OUT_OF_SCOPE,
-    PRINCIPAL_ESCALATION_STATUS_PENDING, PRINCIPAL_ESCALATION_STATUS_RESOLVED,
-    PRINCIPAL_RELAY_SENTINEL, PRINCIPAL_VERDICT_CONDITIONAL,
+    PrincipalEscalationProtocol, WechatAccount, AWAITING_PRINCIPAL_DECISION_ATTR,
+    ESCALATION_CATEGORY_OUT_OF_SCOPE, PRINCIPAL_CARD_DELIVERY_QUEUED, PRINCIPAL_CARD_DELIVERY_SENT,
+    PRINCIPAL_ESCALATION_STATUS_DELIVERY_FAILED, PRINCIPAL_ESCALATION_STATUS_PENDING,
+    PRINCIPAL_ESCALATION_STATUS_RESOLVED, PRINCIPAL_RELAY_SENTINEL, PRINCIPAL_VERDICT_CONDITIONAL,
 };
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -83,6 +84,42 @@ fn minimal_contact(wxid: &str) -> Contact {
     }
 }
 
+async fn seed_online_default_account(app: &common::TestApp) {
+    let now = DateTime::now();
+    app.state
+        .db
+        .accounts()
+        .insert_one(
+            WechatAccount {
+                id: Some(ObjectId::new()),
+                workspace_id: "default".to_string(),
+                account_id: "default".to_string(),
+                alias: "hc013_test".to_string(),
+                display_name: "HC-013 test account".to_string(),
+                app_id: Some("hc013-test-app".to_string()),
+                wxid: Some("wxid_hc013_test_account".to_string()),
+                nick_name: None,
+                avatar_url: None,
+                // Default-workspace tests intentionally exercise the deployment fallback from
+                // the rebuilt AppState, whose MCP URL points at the per-test WireMock server.
+                mcp_base_url: None,
+                mcp_api_key: None,
+                webhook_secret: None,
+                online: true,
+                status: Some("active".to_string()),
+                last_sync_at: now,
+                capacity: 0,
+                persona_tag: None,
+                off_hours: Vec::new(),
+                created_at: now,
+                updated_at: now,
+            },
+            None,
+        )
+        .await
+        .expect("insert online default test account");
+}
+
 /// 一条 pending 请示台账。镜像 escalation::insert_pending_escalation 写入的形状。
 fn minimal_pending_escalation(short_code: &str, contact_wxid: &str) -> AgentPrincipalEscalation {
     let now = DateTime::now();
@@ -97,6 +134,31 @@ fn minimal_pending_escalation(short_code: &str, contact_wxid: &str) -> AgentPrin
         reason: "超出标准 9 折权限".to_string(),
         question_for_principal: "是否同意 8 折？".to_string(),
         principal_wxid: "boss_wxid".to_string(),
+        protocol: Some(PrincipalEscalationProtocol {
+            domain: "user_operations".to_string(),
+            policy_version: 1,
+            policy: AskHumanPolicy {
+                decider_chain: vec![DeciderRef {
+                    wxid: "boss_wxid".to_string(),
+                    display_name: None,
+                    account_id: Some("default".to_string()),
+                }],
+                escalate_safety_guard: true,
+                escalate_unverified_product: true,
+                escalate_ai_policy_hold: false,
+                escalate_stuck: true,
+                dedupe_window_hours: None,
+                daily_push_cap: None,
+                quiet_hours: None,
+                timeout_hours: None,
+            },
+            principal_account_id: "default".to_string(),
+            delivery_generation: 1,
+            delivery_state: PRINCIPAL_CARD_DELIVERY_SENT.to_string(),
+            delivery_content: "test principal card".to_string(),
+            delivery_outbox_id: None,
+            failure_cleanup_completed_at: None,
+        }),
         decision: None,
         authorization_expires_at: None,
         is_generalizable: false,
@@ -107,6 +169,11 @@ fn minimal_pending_escalation(short_code: &str, contact_wxid: &str) -> AgentPrin
         updated_at: now,
         resolved_at: None,
         resolved_via: None,
+        relay_state: None,
+        relay_task_id: None,
+        relay_enqueued_at: None,
+        relay_terminal_at: None,
+        relay_terminal_reason: None,
     }
 }
 
@@ -413,10 +480,65 @@ async fn insert_pending_with_updated_at(
     principal: &str,
     updated_at: DateTime,
 ) {
+    if app
+        .state
+        .db
+        .contacts()
+        .find_one(
+            doc! {
+                "workspace_id": "default",
+                "account_id": "default",
+                "wxid": "cust_timeout",
+            },
+            None,
+        )
+        .await
+        .expect("query timeout customer")
+        .is_none()
+    {
+        app.state
+            .db
+            .contacts()
+            .insert_one(minimal_contact("cust_timeout"), None)
+            .await
+            .expect("insert timeout customer");
+    }
     let mut entry = minimal_pending_escalation(short_code, "cust_timeout");
     entry.principal_wxid = principal.to_string();
+    let config = app
+        .state
+        .db
+        .operation_domain_configs()
+        .find_one(
+            doc! { "workspace_id": "default", "domain": "user_operations", "current_version": true },
+            None,
+        )
+        .await
+        .expect("query frozen policy config")
+        .expect("seeded user_operations config");
+    let frozen_policy = config
+        .ask_human_policy
+        .expect("timeout tests configure ask_human_policy before seeding escalation");
+    let principal_account_id = frozen_policy
+        .decider_chain
+        .iter()
+        .find(|decider| decider.wxid == principal)
+        .and_then(|decider| decider.account_id.clone())
+        .unwrap_or_else(|| "default".to_string());
+    entry.protocol = Some(PrincipalEscalationProtocol {
+        domain: config.domain,
+        policy_version: config.version,
+        policy: frozen_policy,
+        principal_account_id,
+        delivery_generation: 1,
+        delivery_state: PRINCIPAL_CARD_DELIVERY_SENT.to_string(),
+        delivery_content: "test principal card".to_string(),
+        delivery_outbox_id: None,
+        failure_cleanup_completed_at: None,
+    });
     entry.created_at = updated_at;
     entry.updated_at = updated_at;
+    entry.last_pushed_at_ms = Some(updated_at.timestamp_millis());
     app.state
         .db
         .agent_principal_escalations()
@@ -435,15 +557,22 @@ async fn find_escalation(app: &common::TestApp, short_code: &str) -> AgentPrinci
         .expect("escalation must exist")
 }
 
-/// §14.10a（#5 + #6 成功路径）：主决策人超时 → 改派下一位 + 推卡成功 → 台账 principal_wxid
-/// 改为下一位，且 updated_at 被刷新（age 自推卡成功起算）。验证超时改派主链路在补了骚扰门
-/// 检查后仍正常工作。
+/// §14.10a：主决策人超时只开启下一投递代次；只有 Outbox 确认 sent 并对账后，
+/// `last_pushed_at_ms` / `updated_at` 才刷新并启动下一位决策人的超时窗。
 #[tokio::test]
 #[ignore]
 async fn t_timeout_reassign_pushes_and_touches_updated_at() {
     let app = common::TestApp::start().await;
     let mcp = start_mcp_mock_success().await;
     let state = common::rebuild_app_state_with_mcp_url(&app, mcp.uri());
+    seed_online_default_account(&app).await;
+
+    state
+        .db
+        .contacts()
+        .insert_one(minimal_contact("backup"), None)
+        .await
+        .expect("insert backup contact");
 
     // 决策人链 boss → backup，timeout 1h。无骚扰门字段（全 None → 全放行）。
     set_ask_human_policy(
@@ -453,10 +582,12 @@ async fn t_timeout_reassign_pushes_and_touches_updated_at() {
                 DeciderRef {
                     wxid: "boss".into(),
                     display_name: None,
+                    account_id: Some("default".into()),
                 },
                 DeciderRef {
                     wxid: "backup".into(),
                     display_name: None,
+                    account_id: Some("default".into()),
                 },
             ],
             escalate_safety_guard: true,
@@ -479,26 +610,59 @@ async fn t_timeout_reassign_pushes_and_touches_updated_at() {
         .await
         .expect("scan timeouts");
 
-    let after = find_escalation(&app, "T10A").await;
+    let queued = find_escalation(&app, "T10A").await;
+    assert_eq!(queued.principal_wxid, "backup");
+    let protocol = queued.protocol.as_ref().expect("frozen protocol");
+    assert_eq!(protocol.delivery_generation, 2);
+    assert_eq!(protocol.delivery_state, PRINCIPAL_CARD_DELIVERY_QUEUED);
+    assert!(queued.last_pushed_at_ms.is_none());
+
+    let claimed = wechatagent::agent::atomic_claim_pending(&state, "timeout-success", 60)
+        .await
+        .expect("claim generation outbox")
+        .expect("generation outbox exists");
+    wechatagent::agent::process_entry(&state, &claimed)
+        .await
+        .expect("deliver generation outbox");
     assert_eq!(
-        after.principal_wxid, "backup",
-        "超时应改派给链中下一位决策人"
+        wechatagent::agent::escalation::reconcile_principal_card_deliveries(&state)
+            .await
+            .expect("reconcile sent generation"),
+        1
     );
+
+    let delivered = find_escalation(&app, "T10A").await;
+    assert_eq!(
+        delivered.protocol.as_ref().unwrap().delivery_state,
+        PRINCIPAL_CARD_DELIVERY_SENT
+    );
+    assert!(delivered.last_pushed_at_ms.is_some());
     assert!(
-        after.updated_at.timestamp_millis() > two_hours_ago.timestamp_millis(),
-        "推卡成功后 updated_at 应被刷新（age 自推卡成功起算）"
+        delivered.updated_at.timestamp_millis() > two_hours_ago.timestamp_millis(),
+        "只有 sent 对账后才刷新下一位决策人的超时起点"
     );
 }
 
-/// §14.10b（推失败不改派，命门）：gate 过 → 推卡 MCP **失败** → **不改派**（principal_wxid
-/// 仍是 boss 原值，updated_at 保持旧值）。原 principal age 仍超时，下一 tick 会重新算出同一个
-/// next 重推。重构后改派只发生在卡确实送达 next 之后，故推失败绝不把台账推进到链尾。
+/// §14.10b：下一代次 Outbox 重试耗尽后，对账把请示收敛为 delivery_failed，
+/// 清掉 awaiting 并释放 pending 唯一槽；同客户同类别可重新建立新请示。
 #[tokio::test]
 #[ignore]
-async fn t_timeout_reassign_push_failure_does_not_reassign() {
+async fn t_timeout_reassign_terminal_delivery_failure_releases_pending() {
     let app = common::TestApp::start().await;
     let mcp = start_mcp_mock_failure().await;
     let state = common::rebuild_app_state_with_mcp_url(&app, mcp.uri());
+    seed_online_default_account(&app).await;
+
+    let mut customer = minimal_contact("cust_timeout");
+    let mut attributes = Document::new();
+    attributes.insert(AWAITING_PRINCIPAL_DECISION_ATTR, true);
+    customer.domain_attributes = Some(attributes);
+    state
+        .db
+        .contacts()
+        .insert_many([customer, minimal_contact("backup")], None)
+        .await
+        .expect("insert customer and backup contacts");
 
     set_ask_human_policy(
         &app,
@@ -507,10 +671,12 @@ async fn t_timeout_reassign_push_failure_does_not_reassign() {
                 DeciderRef {
                     wxid: "boss".into(),
                     display_name: None,
+                    account_id: Some("default".into()),
                 },
                 DeciderRef {
                     wxid: "backup".into(),
                     display_name: None,
+                    account_id: Some("default".into()),
                 },
             ],
             escalate_safety_guard: true,
@@ -532,17 +698,70 @@ async fn t_timeout_reassign_push_failure_does_not_reassign() {
         .await
         .expect("scan timeouts");
 
-    let after = find_escalation(&app, "T10B").await;
-    // 推卡失败 → 不改派：principal_wxid 仍是 boss（未推进到链尾）。
+    let queued = find_escalation(&app, "T10B").await;
+    assert_eq!(queued.principal_wxid, "backup");
+    let outbox_id = queued
+        .protocol
+        .as_ref()
+        .and_then(|protocol| protocol.delivery_outbox_id)
+        .expect("generation outbox id");
+    for attempt in 0..3 {
+        state
+            .db
+            .collection_agent_send_outbox()
+            .update_one(
+                doc! { "_id": outbox_id },
+                doc! { "$set": { "next_retry_at": null } },
+                None,
+            )
+            .await
+            .expect("clear retry delay");
+        let claimed = wechatagent::agent::atomic_claim_pending(
+            &state,
+            &format!("timeout-failure-{attempt}"),
+            60,
+        )
+        .await
+        .expect("claim failed generation")
+        .expect("generation remains claimable");
+        wechatagent::agent::process_entry(&state, &claimed)
+            .await
+            .expect("process failed generation");
+    }
+
     assert_eq!(
-        after.principal_wxid, "boss",
-        "推卡失败不得改派，principal_wxid 应保持原值"
+        wechatagent::agent::escalation::reconcile_principal_card_deliveries(&state)
+            .await
+            .expect("reconcile terminal failure"),
+        1
     );
-    // 未改派 → updated_at 保持旧值，下一 tick age 仍超时会重推同一个 next。
+    let failed = find_escalation(&app, "T10B").await;
+    assert_eq!(failed.status, PRINCIPAL_ESCALATION_STATUS_DELIVERY_FAILED);
+    assert!(failed
+        .protocol
+        .as_ref()
+        .and_then(|protocol| protocol.failure_cleanup_completed_at)
+        .is_some());
+    let customer = state
+        .db
+        .contacts()
+        .find_one(
+            doc! { "workspace_id": "default", "account_id": "default", "wxid": "cust_timeout" },
+            None,
+        )
+        .await
+        .expect("query customer")
+        .expect("customer exists");
+    assert!(!customer
+        .domain_attributes
+        .as_ref()
+        .and_then(|attrs| attrs.get_bool(AWAITING_PRINCIPAL_DECISION_ATTR).ok())
+        .unwrap_or(false));
+
+    insert_pending_with_updated_at(&app, "T10B2", "boss", DateTime::now()).await;
     assert_eq!(
-        after.updated_at.timestamp_millis(),
-        two_hours_ago.timestamp_millis(),
-        "推卡失败不改派时 updated_at 不得刷新，否则 age 归零、下一 tick 不再重试"
+        find_escalation(&app, "T10B2").await.status,
+        PRINCIPAL_ESCALATION_STATUS_PENDING
     );
 }
 
@@ -553,10 +772,6 @@ async fn t_timeout_reassign_push_failure_does_not_reassign() {
 #[ignore]
 async fn t_timeout_reassign_blocked_by_quiet_hours_skips_push() {
     let app = common::TestApp::start().await;
-    // 用 success mock：若 quiet_hours 未拦住，会推卡成功 + 改派；
-    // 拦住则不改派 → principal_wxid 保持 boss。故断言能干净区分两种行为。
-    let mcp = start_mcp_mock_success().await;
-    let state = common::rebuild_app_state_with_mcp_url(&app, mcp.uri());
 
     // 构造一个**确定性命中当前小时**的静默窗：[now_hour, (now_hour+23)%24)。
     // in_quiet_hours 对该窗（除「下一小时」外覆盖全部 23 小时）判定当前小时恒为 true，
@@ -569,10 +784,12 @@ async fn t_timeout_reassign_blocked_by_quiet_hours_skips_push() {
                 DeciderRef {
                     wxid: "boss".into(),
                     display_name: None,
+                    account_id: Some("default".into()),
                 },
                 DeciderRef {
                     wxid: "backup".into(),
                     display_name: None,
+                    account_id: Some("default".into()),
                 },
             ],
             escalate_safety_guard: true,
@@ -594,7 +811,7 @@ async fn t_timeout_reassign_blocked_by_quiet_hours_skips_push() {
     let two_hours_ago = DateTime::from_millis(DateTime::now().timestamp_millis() - 2 * 3600 * 1000);
     insert_pending_with_updated_at(&app, "T10C", "boss", two_hours_ago).await;
 
-    wechatagent::agent::escalation::scan_escalation_timeouts(&state)
+    wechatagent::agent::escalation::scan_escalation_timeouts(&app.state)
         .await
         .expect("scan timeouts");
 
@@ -619,8 +836,6 @@ async fn t_timeout_reassign_blocked_by_quiet_hours_skips_push() {
 #[ignore]
 async fn t_timeout_reassign_cap_one_not_self_blocked() {
     let app = common::TestApp::start().await;
-    let mcp = start_mcp_mock_success().await;
-    let state = common::rebuild_app_state_with_mcp_url(&app, mcp.uri());
 
     set_ask_human_policy(
         &app,
@@ -629,10 +844,12 @@ async fn t_timeout_reassign_cap_one_not_self_blocked() {
                 DeciderRef {
                     wxid: "boss".into(),
                     display_name: None,
+                    account_id: Some("default".into()),
                 },
                 DeciderRef {
                     wxid: "backup".into(),
                     display_name: None,
+                    account_id: Some("default".into()),
                 },
             ],
             escalate_safety_guard: true,
@@ -651,7 +868,7 @@ async fn t_timeout_reassign_cap_one_not_self_blocked() {
     let two_hours_ago = DateTime::from_millis(DateTime::now().timestamp_millis() - 2 * 3600 * 1000);
     insert_pending_with_updated_at(&app, "T10D", "boss", two_hours_ago).await;
 
-    wechatagent::agent::escalation::scan_escalation_timeouts(&state)
+    wechatagent::agent::escalation::scan_escalation_timeouts(&app.state)
         .await
         .expect("scan timeouts");
 
@@ -660,19 +877,17 @@ async fn t_timeout_reassign_cap_one_not_self_blocked() {
         after.principal_wxid, "backup",
         "cap=1 不应被改派的这条自己误命中，backup 应收到卡并改派成功"
     );
-    assert!(
-        after.updated_at.timestamp_millis() > two_hours_ago.timestamp_millis(),
-        "推卡成功 + 改派 → updated_at 应刷新"
-    );
+    let protocol = after.protocol.as_ref().expect("frozen protocol");
+    assert_eq!(protocol.delivery_generation, 2);
+    assert_eq!(protocol.delivery_state, PRINCIPAL_CARD_DELIVERY_QUEUED);
+    assert!(after.last_pushed_at_ms.is_none());
 }
 
-/// §14.10e（验 #1 链尾不困死 + 推失败重试同一 next）：链 [boss, backup]，无骚扰门，timeout 1h。
-/// 第一次 scan 用 failure mock → 推失败 → 不改派（principal 仍 boss）。第二次 scan 换 success mock
-/// → 重新算出同一个 next=backup → 推成功 → 改派到 backup。旧实现第一次就把 principal 改成 backup
-/// （链尾），第二次 next_decider_on_timeout(backup) 返回 None → 永不重推，backup 永久收不到卡。
+/// §14.10e：两个 scanner 并发读取同一超时行时，generation CAS + Outbox
+/// idempotency key 必须收敛为一次改派和一条 generation=2 Outbox。
 #[tokio::test]
 #[ignore]
-async fn t_timeout_reassign_push_failure_retries_same_next_on_next_tick() {
+async fn t_timeout_reassign_concurrent_scans_enqueue_one_generation() {
     let app = common::TestApp::start().await;
 
     set_ask_human_policy(
@@ -682,10 +897,12 @@ async fn t_timeout_reassign_push_failure_retries_same_next_on_next_tick() {
                 DeciderRef {
                     wxid: "boss".into(),
                     display_name: None,
+                    account_id: Some("default".into()),
                 },
                 DeciderRef {
                     wxid: "backup".into(),
                     display_name: None,
+                    account_id: Some("default".into()),
                 },
             ],
             escalate_safety_guard: true,
@@ -703,37 +920,108 @@ async fn t_timeout_reassign_push_failure_retries_same_next_on_next_tick() {
     let two_hours_ago = DateTime::from_millis(DateTime::now().timestamp_millis() - 2 * 3600 * 1000);
     insert_pending_with_updated_at(&app, "T10E", "boss", two_hours_ago).await;
 
-    // 第一次 tick：推卡失败 → 不改派。
-    let mcp_fail = start_mcp_mock_failure().await;
-    let state_fail = common::rebuild_app_state_with_mcp_url(&app, mcp_fail.uri());
-    wechatagent::agent::escalation::scan_escalation_timeouts(&state_fail)
-        .await
-        .expect("scan timeouts (fail tick)");
-    let after_fail = find_escalation(&app, "T10E").await;
-    assert_eq!(
-        after_fail.principal_wxid, "boss",
-        "首 tick 推失败应不改派，principal 仍是 boss（未推进到链尾）"
+    let (left, right) = tokio::join!(
+        wechatagent::agent::escalation::scan_escalation_timeouts(&app.state),
+        wechatagent::agent::escalation::scan_escalation_timeouts(&app.state),
     );
-    assert_eq!(
-        after_fail.updated_at.timestamp_millis(),
-        two_hours_ago.timestamp_millis(),
-        "推失败不改派 → updated_at 不刷新，下 tick age 仍超时"
-    );
+    left.expect("left scanner");
+    right.expect("right scanner");
 
-    // 第二次 tick：换 success mock（指向另一个 wiremock）→ 重推达同一个 next=backup → 改派。
-    let mcp_ok = start_mcp_mock_success().await;
-    let state_ok = common::rebuild_app_state_with_mcp_url(&app, mcp_ok.uri());
-    wechatagent::agent::escalation::scan_escalation_timeouts(&state_ok)
-        .await
-        .expect("scan timeouts (success tick)");
-    let after_ok = find_escalation(&app, "T10E").await;
+    let after = find_escalation(&app, "T10E").await;
+    assert_eq!(after.principal_wxid, "backup");
+    let protocol = after.protocol.as_ref().expect("frozen protocol");
+    assert_eq!(protocol.delivery_generation, 2);
+    let escalation_id = after.id.expect("escalation id");
     assert_eq!(
-        after_ok.principal_wxid, "backup",
-        "下一 tick 应重推达同一个 next=backup 并改派（旧实现因链尾 None 永不重推）"
+        app.state
+            .db
+            .collection_agent_send_outbox()
+            .count_documents(
+                doc! { "source_event_id": format!("principal-card:{}:2", escalation_id.to_hex()) },
+                None,
+            )
+            .await
+            .expect("count generation outbox"),
+        1
     );
-    assert!(
-        after_ok.updated_at.timestamp_millis() > two_hours_ago.timestamp_millis(),
-        "重推成功 + 改派 → updated_at 应刷新"
+}
+
+/// A claimed generation-1 card must be canceled before the remote boundary
+/// after the escalation has advanced to generation 2.
+#[tokio::test]
+#[ignore]
+async fn t_stale_principal_card_generation_is_canceled_before_remote_send() {
+    let app = common::TestApp::start().await;
+    let mcp = start_mcp_mock_success().await;
+    let state = common::rebuild_app_state_with_mcp_url(&app, mcp.uri());
+
+    let escalation_id = ObjectId::new();
+    let mut escalation = minimal_pending_escalation("T10F", "cust_stale_generation");
+    escalation.id = Some(escalation_id);
+    escalation.principal_wxid = "backup".to_string();
+    let protocol = escalation.protocol.as_mut().expect("frozen protocol");
+    protocol.principal_account_id = "default".to_string();
+    protocol.delivery_generation = 2;
+    protocol.delivery_state = PRINCIPAL_CARD_DELIVERY_QUEUED.to_string();
+    protocol.delivery_content = "current generation card".to_string();
+    state
+        .db
+        .agent_principal_escalations()
+        .insert_one(&escalation, None)
+        .await
+        .expect("insert generation 2 escalation");
+
+    let stale_outbox_id = match wechatagent::agent::enqueue(
+        &state,
+        wechatagent::agent::EnqueueRequest {
+            workspace_id: "default".to_string(),
+            account_id: "default".to_string(),
+            contact_wxid: "boss_wxid".to_string(),
+            run_id: format!("principal-card:{}:1", escalation_id.to_hex()),
+            decision_id: None,
+            source_event_id: format!("principal-card:{}:1", escalation_id.to_hex()),
+            source_kind: "principal_escalation".to_string(),
+            content: "stale generation card".to_string(),
+            media_asset_id: None,
+            referral_card_id: None,
+            max_attempts: 3,
+        },
+    )
+    .await
+    .expect("enqueue stale generation")
+    {
+        wechatagent::agent::EnqueueOutcome::Created { outbox_id, .. } => outbox_id,
+        other => panic!("expected created stale outbox, got {other:?}"),
+    };
+    let claimed = wechatagent::agent::atomic_claim_pending(&state, "stale-generation", 60)
+        .await
+        .expect("claim stale generation")
+        .expect("stale generation outbox exists");
+
+    wechatagent::agent::process_entry(&state, &claimed)
+        .await
+        .expect("stale generation is canceled");
+
+    let stored = state
+        .db
+        .collection_agent_send_outbox()
+        .find_one(doc! { "_id": stale_outbox_id }, None)
+        .await
+        .expect("query stale outbox")
+        .expect("stale outbox exists");
+    assert_eq!(stored.status, "canceled");
+    assert_eq!(
+        stored.cancel_reason.as_deref(),
+        Some("principal_escalation_generation_no_longer_authorized")
+    );
+    assert!(stored.send_started_at.is_none());
+    assert_eq!(
+        mcp.received_requests()
+            .await
+            .expect("read MCP requests")
+            .len(),
+        0,
+        "stale generation must be fenced before any remote request"
     );
 }
 
@@ -745,8 +1033,6 @@ async fn t_timeout_reassign_push_failure_retries_same_next_on_next_tick() {
 #[ignore]
 async fn t_timeout_chain_tail_sends_holding_reply_once_within_interval() {
     let app = common::TestApp::start().await;
-    let mcp = start_mcp_mock_success().await;
-    let state = common::rebuild_app_state_with_mcp_url(&app, mcp.uri());
 
     set_ask_human_policy(
         &app,
@@ -754,6 +1040,7 @@ async fn t_timeout_chain_tail_sends_holding_reply_once_within_interval() {
             decider_chain: vec![DeciderRef {
                 wxid: "boss".into(),
                 display_name: None,
+                account_id: Some("default".into()),
             }],
             escalate_safety_guard: true,
             escalate_unverified_product: true,
@@ -771,7 +1058,7 @@ async fn t_timeout_chain_tail_sends_holding_reply_once_within_interval() {
     insert_pending_with_updated_at(&app, "T12", "boss", two_hours_ago).await;
 
     // 第一次 scan：链尾 → 发安抚 + 记 last_holding_reply_ms。
-    wechatagent::agent::escalation::scan_escalation_timeouts(&state)
+    wechatagent::agent::escalation::scan_escalation_timeouts(&app.state)
         .await
         .expect("scan 1");
     let after1 = find_escalation(&app, "T12").await;
@@ -779,7 +1066,7 @@ async fn t_timeout_chain_tail_sends_holding_reply_once_within_interval() {
     assert!(after1.last_holding_reply_ms.is_some(), "应记录安抚发送时刻");
 
     // 第二次 scan（紧接，min_interval=6h 未到）：不重复发。
-    wechatagent::agent::escalation::scan_escalation_timeouts(&state)
+    wechatagent::agent::escalation::scan_escalation_timeouts(&app.state)
         .await
         .expect("scan 2");
     let after2 = find_escalation(&app, "T12").await;
@@ -797,7 +1084,7 @@ async fn insert_resolved_expired_escalation(
     app: &common::TestApp,
     short_code: &str,
     contact_wxid: &str,
-) {
+) -> ObjectId {
     let mut entry = minimal_pending_escalation(short_code, contact_wxid);
     entry.status = PRINCIPAL_ESCALATION_STATUS_RESOLVED.to_string();
     let now = DateTime::now();
@@ -817,7 +1104,10 @@ async fn insert_resolved_expired_escalation(
         .agent_principal_escalations()
         .insert_one(&entry, None)
         .await
-        .expect("insert resolved+expired escalation");
+        .expect("insert resolved+expired escalation")
+        .inserted_id
+        .as_object_id()
+        .expect("inserted escalation id")
 }
 
 /// 按 wxid 读回 contact（断言 awaiting 标记态）。增量 helper。
@@ -899,6 +1189,7 @@ fn relay_review_pass_json() -> serde_json::Value {
             "relationshipProgress": 7,
             "conversionReadiness": 6,
             "pressureRisk": 2,
+            "boundaryPrivacySafety": 9,
             "factRisk": 1
         },
         "claimAnalysis": {
@@ -928,6 +1219,7 @@ async fn t_relay_expired_authorization_clears_awaiting_and_sends_neutral() {
     let app = common::TestApp::start().await;
     let mcp = start_mcp_mock_success().await;
     let state = common::rebuild_app_state_with_mcp_url(&app, mcp.uri());
+    seed_online_default_account(&app).await;
 
     let wxid = "cust_expired";
 
@@ -944,7 +1236,7 @@ async fn t_relay_expired_authorization_clears_awaiting_and_sends_neutral() {
         .expect("insert contact with awaiting marker");
 
     // resolved + decision.substance + 授权已过期（now-1h）。
-    insert_resolved_expired_escalation(&app, "X11A", wxid).await;
+    let escalation_id = insert_resolved_expired_escalation(&app, "X11A", wxid).await;
 
     // 触发 relay task 处理（经公共入口 handle_follow_up_task → handle_principal_decision_relay）。
     wechatagent::agent::handle_follow_up_task(&state, relay_task_for("X11A", wxid))
@@ -959,8 +1251,46 @@ async fn t_relay_expired_authorization_clears_awaiting_and_sends_neutral() {
         .and_then(|d| d.get_bool(AWAITING_PRINCIPAL_DECISION_ATTR).ok())
         .unwrap_or(false);
     assert!(!awaiting, "授权过期早退也必须清 awaiting 标记");
+    let terminal = app
+        .state
+        .db
+        .agent_principal_escalations()
+        .find_one(doc! { "_id": escalation_id }, None)
+        .await
+        .expect("query terminal escalation")
+        .expect("terminal escalation exists");
+    assert_eq!(
+        terminal.relay_state.as_deref(),
+        Some(wechatagent::models::PRINCIPAL_RELAY_STATE_TERMINAL)
+    );
+    assert_eq!(
+        terminal.relay_terminal_reason.as_deref(),
+        Some("authorization_expired")
+    );
+    assert!(terminal.relay_terminal_at.is_some());
 
-    // 断言②：客户收到一条中性收尾话术（MCP 桩收到 message_send_text），且不复述过期 substance。
+    // 中性收尾先进入 durable outbox；测试显式驱动 dispatcher 后再检查 MCP。
+    let claimed = wechatagent::agent::atomic_claim_pending(&state, "expired-relay-test", 60)
+        .await
+        .expect("claim expired relay holding")
+        .expect("expired relay holding must be enqueued");
+    wechatagent::agent::process_entry(&state, &claimed)
+        .await
+        .expect("dispatch expired relay holding");
+    let stored = state
+        .db
+        .collection_agent_send_outbox()
+        .find_one(doc! { "_id": claimed.id.expect("claimed outbox id") }, None)
+        .await
+        .expect("query expired relay holding outbox")
+        .expect("expired relay holding outbox exists");
+    assert_eq!(
+        stored.status, "sent",
+        "expired relay holding must reach sent; cancel_reason={:?}, last_error={:?}",
+        stored.cancel_reason, stored.last_error
+    );
+
+    // 断言②：客户收到一条中性收尾话术，且不复述过期 substance。
     let recv = mcp
         .received_requests()
         .await
@@ -982,6 +1312,95 @@ async fn t_relay_expired_authorization_clears_awaiting_and_sends_neutral() {
         !all.contains("8 折") && !all.contains("8折"),
         "中性收尾绝不复述过期 substance 的具体承诺/数字，实际：{all}"
     );
+}
+
+/// 同一客户可同时拥有不同类别的两条等待项。终结其中一条只能移除自己的稳定 owner；
+/// 另一条仍活跃时 coarse awaiting 必须保持 true，直到最后一条也终结。
+#[tokio::test]
+#[ignore]
+async fn terminalizing_one_relay_preserves_another_awaiting_owner() {
+    let app = common::TestApp::start().await;
+    let wxid = "cust_two_relay_owners";
+    app.state
+        .db
+        .contacts()
+        .insert_one(minimal_contact(wxid), None)
+        .await
+        .expect("insert contact");
+
+    let first_id = insert_resolved_expired_escalation(&app, "OWNR1", wxid).await;
+    let second_id = insert_resolved_expired_escalation(&app, "OWNR2", wxid).await;
+    let awaiting_key = format!(
+        "domain_attributes.{}",
+        wechatagent::models::AWAITING_PRINCIPAL_DECISION_ATTR
+    );
+    let owners_key = format!(
+        "domain_attributes.{}",
+        wechatagent::models::AWAITING_PRINCIPAL_DECISION_IDS_ATTR
+    );
+    let mut owner_set = Document::new();
+    owner_set.insert(awaiting_key, true);
+    owner_set.insert(owners_key, vec![first_id.to_hex(), second_id.to_hex()]);
+    app.state
+        .db
+        .contacts()
+        .update_one(
+            doc! { "workspace_id": "default", "account_id": "default", "wxid": wxid },
+            doc! { "$set": owner_set },
+            None,
+        )
+        .await
+        .expect("seed two awaiting owners");
+
+    wechatagent::agent::handle_follow_up_task(&app.state, relay_task_for("OWNR1", wxid))
+        .await
+        .expect("terminalize first relay");
+    let after_first = find_contact(&app, wxid).await;
+    let attrs = after_first.domain_attributes.expect("domain attributes");
+    assert_eq!(
+        attrs.get_bool(AWAITING_PRINCIPAL_DECISION_ATTR).ok(),
+        Some(true),
+        "second owner must keep awaiting=true"
+    );
+    assert_eq!(
+        attrs
+            .get_array(wechatagent::models::AWAITING_PRINCIPAL_DECISION_IDS_ATTR)
+            .expect("owner array"),
+        &vec![second_id.to_hex().into()]
+    );
+
+    wechatagent::agent::handle_follow_up_task(&app.state, relay_task_for("OWNR2", wxid))
+        .await
+        .expect("terminalize second relay");
+    let after_second = find_contact(&app, wxid).await;
+    let attrs = after_second.domain_attributes.expect("domain attributes");
+    assert_eq!(
+        attrs.get_bool(AWAITING_PRINCIPAL_DECISION_ATTR).ok(),
+        Some(false)
+    );
+    assert!(attrs
+        .get_array(wechatagent::models::AWAITING_PRINCIPAL_DECISION_IDS_ATTR)
+        .expect("owner array")
+        .is_empty());
+
+    for id in [first_id, second_id] {
+        let terminal = app
+            .state
+            .db
+            .agent_principal_escalations()
+            .find_one(doc! { "_id": id }, None)
+            .await
+            .expect("query terminal escalation")
+            .expect("terminal escalation exists");
+        assert_eq!(
+            terminal.relay_state.as_deref(),
+            Some(wechatagent::models::PRINCIPAL_RELAY_STATE_TERMINAL)
+        );
+        assert_eq!(
+            terminal.relay_terminal_reason.as_deref(),
+            Some("authorization_expired")
+        );
+    }
 }
 
 /// relay 候选泄漏内部字段时，安全门必须在入队前拦截；客户仍处于 awaiting，
@@ -1035,6 +1454,8 @@ async fn blocked_relay_preserves_awaiting_and_cancels_task_without_outbox() {
         "给客户的错误转述：verdict=approved",
     ));
     app.llm.push_response(relay_review_pass_json());
+    app.llm
+        .push_response(common::independent_claim_gate_pass_json());
 
     wechatagent::agent::handle_follow_up_task(&app.state, task)
         .await

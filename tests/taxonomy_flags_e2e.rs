@@ -1,13 +1,7 @@
-//! Task 7 / D6：字典 `is_terminal` / `is_reactivation_target` 可配置——序列化 +
-//! 落库往返集成测试（`#[ignore]`，需要 Docker / testcontainers MongoDB）。
+//! SR-168：字典运行字段完整投影与 dirty PATCH 的真实 Router/Mongo 红线。
 //!
-//! `admin_taxonomies` 的 create / patch handler 是 `pub(super)`，测试 crate 不可直调
-//! （沿用 `workspace_isolation.rs` / `operation_view_integration.rs` 的先例：核心
-//! 行为下沉到数据层时测数据层）。这里验证的是 Task 7 唯一有回归风险的环节——
-//! patch handler 用 **camelCase** 键 `value.isTerminal` / `value.isReactivationTarget`
-//! 写 `$set`，必须与 `TaxonomyValue`（`#[serde(rename_all = "camelCase")]`）反序列化
-//! 的 wire 键完全对齐（本项目曾 4 次踩 rename 坑）。键名写错会静默失效——`update_one`
-//! 仍 matched，但读回的 struct 字段不变。
+//! 经认证 API 先 GET 验证 priority/terminal/reactivation 三个运行字段完整投影，
+//! 再仅 PATCH label；响应与强类型 Mongo 读回都必须保留三个运行字段原值。
 //!
 //! ## 运行
 //! ```sh
@@ -16,12 +10,18 @@
 
 mod common;
 
+use axum::Router;
+use chrono::Utc;
 use mongodb::bson::{doc, DateTime};
+use reqwest::StatusCode;
+use tokio::net::TcpListener;
+use wechatagent::auth::{session::create_session, AdminUser, SESSION_COOKIE_NAME};
 use wechatagent::models::{TaxonomyEntry, TaxonomyValue};
+use wechatagent::routes::api_router;
 
 use crate::common::TestApp;
 
-/// 构造一条 active 的 global taxonomy 取值条目（两 flag 初值 false）。
+/// 构造一条携带非默认运行语义的 active global taxonomy 条目。
 fn make_entry(workspace_id: &str, kind: &str, id: &str) -> TaxonomyEntry {
     TaxonomyEntry {
         id: None,
@@ -34,9 +34,9 @@ fn make_entry(workspace_id: &str, kind: &str, id: &str) -> TaxonomyEntry {
             description: String::new(),
             aliases: vec![],
             status: "active".to_string(),
-            priority_weight: None,
-            is_terminal: false,
-            is_reactivation_target: false,
+            priority_weight: Some(73),
+            is_terminal: true,
+            is_reactivation_target: true,
         },
         updated_at: DateTime::now(),
         version: 1,
@@ -46,50 +46,101 @@ fn make_entry(workspace_id: &str, kind: &str, id: &str) -> TaxonomyEntry {
     }
 }
 
+async fn start_api(
+    app: &TestApp,
+    workspace_id: &str,
+) -> (String, String, tokio::task::JoinHandle<()>) {
+    let admin = AdminUser {
+        user_id: "taxonomy_admin".to_string(),
+        username: "taxonomy_admin".to_string(),
+        password_hash: "x".to_string(),
+        created_at: Utc::now(),
+        last_login_at: None,
+        workspaces: vec![workspace_id.to_string()],
+        default_workspace: Some(workspace_id.to_string()),
+    };
+    app.state
+        .db
+        .raw()
+        .collection::<AdminUser>("admin_users")
+        .insert_one(&admin, None)
+        .await
+        .expect("seed taxonomy admin");
+    let session = create_session(&app.state.db, &admin, 1, workspace_id)
+        .await
+        .expect("create taxonomy admin session");
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind API");
+    let address = listener.local_addr().expect("API address");
+    let router = Router::new()
+        .nest("/api", api_router(app.state.clone()))
+        .with_state(app.state.clone());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router).await.expect("serve API");
+    });
+    (
+        format!("http://{address}/api"),
+        format!("{SESSION_COOKIE_NAME}={}", session.session_id),
+        server,
+    )
+}
+
 #[tokio::test]
 #[ignore = "requires docker (testcontainers mongo)"]
-async fn patch_camelcase_keys_persist_both_flags() {
+async fn label_only_patch_preserves_runtime_fields_and_projects_them() {
     let app = TestApp::start().await;
+    let workspace_id = app.state.config.default_workspace_id.clone();
     let coll = app.state.db.collection_system_taxonomies();
 
-    // 种一条两 flag = false 的条目。
-    let entry = make_entry(
-        &app.state.config.default_workspace_id,
-        "customer_stage",
-        "task7_flag_target",
-    );
+    let entry = make_entry(&workspace_id, "customer_stage", "task7_flag_target");
     let inserted = coll
         .insert_one(&entry, None)
         .await
         .expect("insert taxonomy entry");
     let oid = inserted.inserted_id.as_object_id().expect("object id");
 
-    // 复刻 patch_taxonomy 的 set_doc：camelCase 键（与 value.displayName 同款）。
-    coll.update_one(
-        doc! { "_id": oid },
-        doc! { "$set": {
-            "value.isTerminal": true,
-            "value.isReactivationTarget": true,
-        } },
-        None,
-    )
-    .await
-    .expect("update flags");
+    let (base_url, cookie, server) = start_api(&app, &workspace_id).await;
+    let client = reqwest::Client::new();
 
-    // 读回并反序列化为强类型 struct——若键名 casing 写错，update 仍 matched 但这两
-    // 字段会保持 false，断言失败。
+    let listed = client
+        .get(format!("{base_url}/admin/taxonomies?kind=customer_stage"))
+        .header(reqwest::header::COOKIE, &cookie)
+        .send()
+        .await
+        .expect("list taxonomies");
+    assert_eq!(listed.status(), StatusCode::OK);
+    let listed: serde_json::Value = listed.json().await.expect("decode taxonomy list");
+    let projected = listed["items"]
+        .as_array()
+        .expect("taxonomy items")
+        .iter()
+        .find(|item| item["id"] == oid.to_hex())
+        .expect("seeded taxonomy projected");
+    assert_eq!(projected["value"]["priorityWeight"], 73);
+    assert_eq!(projected["value"]["isTerminal"], true);
+    assert_eq!(projected["value"]["isReactivationTarget"], true);
+
+    let patched = client
+        .patch(format!("{base_url}/admin/taxonomies/{}", oid.to_hex()))
+        .header(reqwest::header::COOKIE, &cookie)
+        .json(&serde_json::json!({ "label": "renamed only" }))
+        .send()
+        .await
+        .expect("patch taxonomy label");
+    assert_eq!(patched.status(), StatusCode::OK);
+    let patched: serde_json::Value = patched.json().await.expect("decode patch response");
+    assert_eq!(patched["item"]["value"]["label"], "renamed only");
+    assert_eq!(patched["item"]["value"]["priorityWeight"], 73);
+    assert_eq!(patched["item"]["value"]["isTerminal"], true);
+    assert_eq!(patched["item"]["value"]["isReactivationTarget"], true);
+
     let reloaded: TaxonomyEntry = coll
         .find_one(doc! { "_id": oid }, None)
         .await
         .expect("find_one")
         .expect("entry present");
-
-    assert!(
-        reloaded.value.is_terminal,
-        "value.isTerminal camelCase 键应落库并反序列化为 true"
-    );
-    assert!(
-        reloaded.value.is_reactivation_target,
-        "value.isReactivationTarget camelCase 键应落库并反序列化为 true"
-    );
+    assert_eq!(reloaded.value.display_name, "renamed only");
+    assert_eq!(reloaded.value.priority_weight, Some(73));
+    assert!(reloaded.value.is_terminal);
+    assert!(reloaded.value.is_reactivation_target);
+    server.abort();
 }

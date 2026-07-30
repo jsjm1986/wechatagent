@@ -13,6 +13,7 @@
 pub mod jwt;
 pub mod middleware;
 pub mod password;
+pub mod rate_limit;
 pub mod session;
 
 use chrono::{DateTime, Utc};
@@ -68,17 +69,14 @@ pub struct AuthenticatedAdmin {
 pub const SESSION_COOKIE_NAME: &str = "wa_session";
 
 /// 判定 `resolved` workspace 是否在 admin 的允许列表内。
-/// 空列表 = 单租户回落语义：只允许默认 workspace（与 `switch_workspace` 同源）。
+/// 空列表 = 无权限。历史“空列表代表默认 workspace”的行由 m037 一次性固化为
+/// `[DEFAULT_WORKSPACE_ID]`；迁移完成后，清空列表必须能即时撤掉最后一个权限。
 pub fn is_workspace_authorized(
     resolved: &str,
     user_workspaces: &[String],
-    default_workspace_id: &str,
+    _default_workspace_id: &str,
 ) -> bool {
-    if user_workspaces.is_empty() {
-        resolved == default_workspace_id
-    } else {
-        user_workspaces.iter().any(|w| w == resolved)
-    }
+    user_workspaces.iter().any(|w| w == resolved)
 }
 
 #[cfg(test)]
@@ -86,9 +84,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn empty_acl_allows_only_default_workspace() {
+    fn empty_acl_denies_every_workspace() {
         let acl: Vec<String> = vec![];
-        assert!(is_workspace_authorized("default", &acl, "default"));
+        assert!(!is_workspace_authorized("default", &acl, "default"));
         assert!(!is_workspace_authorized("other", &acl, "default"));
     }
 

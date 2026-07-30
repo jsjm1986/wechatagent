@@ -6,13 +6,21 @@ export interface GoLiveResult {
   message?: string;
 }
 
-export async function runGoLive(input: { sessionId?: string; chunkId: string }): Promise<GoLiveResult> {
+export async function runGoLive(input: {
+  sessionId?: string;
+  chunkId: string;
+  accountId?: string;
+}): Promise<GoLiveResult> {
   try {
     // 1. 有 sessionId 才先 apply(对话改过草稿);无则跳过直接 verify
     if (input.sessionId) {
       const applyResp = await fetch(
         `/api/operation-knowledge/chat/${encodeURIComponent(input.sessionId)}/apply`,
-        { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" }
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ accountId: input.accountId || null }),
+        }
       );
       if (!applyResp.ok) {
         return { ok: false, reason: "apply_failed" };
@@ -40,7 +48,11 @@ export async function runGoLive(input: { sessionId?: string; chunkId: string }):
 export function useGoLive() {
   const [pending, setPending] = useState(false);
   const [result, setResult] = useState<GoLiveResult | null>(null);
-  const goLive = useCallback(async (input: { sessionId?: string; chunkId: string }) => {
+  const goLive = useCallback(async (input: {
+    sessionId?: string;
+    chunkId: string;
+    accountId?: string;
+  }) => {
     setPending(true);
     try {
       const r = await runGoLive(input);

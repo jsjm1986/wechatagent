@@ -1,4 +1,5 @@
 {
+  "claimGeneration": 7,
   "createdAt": "2023-11-03T08:26:40Z",
   "failureStreak": 2,
   "ingestCount": 7,
@@ -7,7 +8,9 @@
   "lastError": null,
   "lastEtag": "\"etag-xyz\"",
   "lastFetchedAt": "2023-11-14T22:13:20Z",
+  "lockedUntil": null,
   "scheduleMinutes": 60,
+  "sourceGeneration": 3,
   "sourceId": "ing_abc123",
   "status": "active",
   "updatedAt": "2023-11-14T22:15:00Z",

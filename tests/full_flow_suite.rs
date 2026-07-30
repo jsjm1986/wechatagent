@@ -155,6 +155,7 @@ async fn seed_verified_chunk(
         summary: Some(body.to_string()),
         body: Some(body.to_string()),
         source_quote: Some(body.to_string()),
+        source_anchors: vec![doc! { "sourceQuote": body }],
         integrity_status: Some("verified".to_string()),
         confidence_score: Some(88),
         status: "active".to_string(),
@@ -254,6 +255,7 @@ fn review_agent_pass_json(
             "relationshipProgress": 7,
             "conversionReadiness": 6,
             "pressureRisk": 2,
+            "boundaryPrivacySafety": 9,
             "factRisk": 1,
         },
         "claimAnalysis": {
@@ -331,7 +333,7 @@ async fn full_flow_a1_direct_approved_enqueues_outbox() {
         .expect("insert inbound message");
 
     app.llm.push_response(reply_agent_decision_json(
-        "可以，落地试点我们一般先圈一个核心场景跑通，要不要先按你们最急的场景来定试点范围？",
+        "可以，我们先从你们最急的场景聊起，把试点范围收窄一点，你觉得呢？",
         "客户主动提出进入试点落地，这是把关系推进到执行阶段的关键时机，回复能直接降低决策摩擦。",
         "not_required",
     ));
@@ -340,6 +342,8 @@ async fn full_flow_a1_direct_approved_enqueues_outbox() {
         "",
         "回复承接试点诉求、不越界承诺，语气自然，可直接放行。",
     ));
+    app.llm
+        .push_response(common::independent_claim_gate_pass_json());
 
     let before = app.llm.calls();
     handle_managed_message(&app.state, contact.clone(), &inbound)
@@ -347,8 +351,8 @@ async fn full_flow_a1_direct_approved_enqueues_outbox() {
         .expect("handle_managed_message ok");
     assert_eq!(
         app.llm.calls() - before,
-        2,
-        "直发路径：Reply ×1 + Review ×1 = 2 次 LLM 调用"
+        3,
+        "直发路径：Reply ×1 + Review ×1 + ClaimGate ×1 = 3 次 LLM 调用"
     );
 
     let log = fetch_run_log(&app, &contact).await;
@@ -400,18 +404,20 @@ async fn full_flow_a2_single_shot_revision() {
         .expect("insert inbound message");
 
     app.llm.push_response(reply_agent_decision_json(
-        "理解你们在做横向对比。我们一般 2~4 周可上线，预算区间和场景深度直接相关，要不要先按你们的优先级排排序？",
+        "理解你们在做横向对比。周期和预算先不急着下结论，我们先把最重要的场景排一下？",
         "客户主动询问实施周期与预算，回复能确认需求颗粒度并降低决策摩擦，是关键推进时机。",
         "not_required",
     ));
     app.llm.push_response(review_agent_pass_json(
         true,
-        "去掉对预算区间的模糊措辞，给出更具体的 2~4 周分阶段交付样例，并明确指出我们不会在此轮强推报价。",
+        "把回复再收敛一些，先承接横向对比，再确认最优先场景；不要给未经核实的周期或报价。",
         "首版语气良好，但预算与交付描述偏笼统，需要按 revisionDirection 修正后再放行。",
     ));
+    app.llm
+        .push_response(common::independent_claim_gate_pass_json());
     app.llm.push_response(reply_agent_decision_json(
-        "理解你们在做横向对比。常见落地节奏是：第 1~2 周梳理流程并接通试点账号，第 3~4 周扩到核心场景，预算我们这轮只做范围确认，等优先级清楚再给报价更稳。",
-        "客户主动询问节奏与预算，按修正方向给出更具体的分阶段交付样例并明确不强推报价，能直接降低对方的决策压力。",
+        "理解，你们在做横向对比。周期和预算先不急着下结论，我们先确定最优先的场景，再按范围往下拆，会更稳。",
+        "客户主动询问节奏与预算，按修正方向先确认优先场景且不输出未经核实的周期或报价，能直接降低对方的决策压力。",
         "not_required",
     ));
     app.llm.push_response(review_agent_pass_json(
@@ -419,6 +425,8 @@ async fn full_flow_a2_single_shot_revision() {
         "",
         "二轮回复已按 revisionDirection 收敛信息密度，不再有笼统措辞，可以放行。",
     ));
+    app.llm
+        .push_response(common::independent_claim_gate_pass_json());
 
     let before = app.llm.calls();
     handle_managed_message(&app.state, contact.clone(), &inbound)
@@ -426,8 +434,8 @@ async fn full_flow_a2_single_shot_revision() {
         .expect("handle_managed_message ok");
     assert_eq!(
         app.llm.calls() - before,
-        4,
-        "revision 路径：Reply ×2 + Review ×2 = 4 次 LLM 调用"
+        6,
+        "revision 路径：Reply ×2 + Review ×2 + ClaimGate ×2 = 6 次 LLM 调用"
     );
 
     let log = fetch_run_log(&app, &contact).await;
@@ -560,6 +568,14 @@ async fn full_flow_a4_knowledge_tool_loop() {
         }],
         "answer": "我们已形成企业 IM 场景的能力清单，覆盖账号纳管、自动应答、手动指令三类核心能力。",
     }));
+    let mut lean_probe = reply_agent_decision_json(
+        "我先核对一下具体能力清单，再给你准确答复。",
+        "客户在问具体产品能力，Lean 档没有业务知识，应先升 Full 读取已选知识。",
+        "required",
+    );
+    lean_probe["sufficiency"] = json!("need_more_context");
+    lean_probe["missingTier"] = json!("full");
+    app.llm.push_response(lean_probe);
     app.llm.push_response(reply_agent_decision_json(
         "我们已经形成了企业 IM 场景下的能力清单，按你们的接入侧重点会优先覆盖账号纳管、自动应答、手动指令三类，要不要我先发一份场景对照？",
         "客户明确询问能力覆盖范围，结合知识库切片给出三类核心能力对照，是把对话推进到具体方案的关键时机。",
@@ -570,6 +586,8 @@ async fn full_flow_a4_knowledge_tool_loop() {
         "",
         "知识路由已扫过 list_catalog/open_chunk/answer，回复未越界做产品承诺，整体可放行。",
     ));
+    app.llm
+        .push_response(common::independent_claim_gate_verified_knowledge_json());
 
     let before = app.llm.calls();
     handle_managed_message(&app.state, contact.clone(), &inbound)
@@ -577,8 +595,8 @@ async fn full_flow_a4_knowledge_tool_loop() {
         .expect("handle_managed_message ok");
     assert_eq!(
         app.llm.calls() - before,
-        4,
-        "tool-loop 路径：knowledge_agent ×2（open_chunk + answer）+ Reply ×1 + Review ×1 = 4 次"
+        6,
+        "tool-loop 路径：knowledge_agent ×2 + Reply Lean/Full ×2 + Review ×1 + ClaimGate ×1 = 6 次"
     );
 
     let log = fetch_run_log(&app, &contact).await;
@@ -653,7 +671,7 @@ async fn full_flow_b1_barge_in_aborts_before_outbox() {
         .expect("insert inbound message");
 
     app.llm.push_response(reply_agent_decision_json(
-        "我们一般 2~4 周可上线，预算和场景深度相关，要不要先按你们的优先级排排序？",
+        "周期和预算需要结合场景范围再确认，我们先按你们最优先的场景排一下？",
         "客户主动询问实施周期与预算，回复能确认需求颗粒度并降低决策摩擦，是关键推进时机。",
         "not_required",
     ));
@@ -662,6 +680,8 @@ async fn full_flow_b1_barge_in_aborts_before_outbox() {
         "",
         "回复语气良好、不越界承诺，可放行——但本测试用 guard 模拟期间到达更新入站。",
     ));
+    app.llm
+        .push_response(common::independent_claim_gate_pass_json());
 
     let guard: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(|| true);
     handle_managed_message_aggregated(&app.state, contact.clone(), &inbound, Some(guard))
@@ -718,7 +738,7 @@ async fn full_flow_b2_no_barge_in_completes_normally() {
         .expect("insert inbound message");
 
     app.llm.push_response(reply_agent_decision_json(
-        "我们一般 2~4 周可上线，预算和场景深度相关，要不要先按你们的优先级排排序？",
+        "周期和预算需要结合场景范围再确认，我们先按你们最优先的场景排一下？",
         "客户主动询问实施周期与预算，回复能确认需求颗粒度并降低决策摩擦，是关键推进时机。",
         "not_required",
     ));
@@ -727,6 +747,8 @@ async fn full_flow_b2_no_barge_in_completes_normally() {
         "",
         "回复语气良好、不越界承诺，可放行。",
     ));
+    app.llm
+        .push_response(common::independent_claim_gate_pass_json());
 
     let called = Arc::new(AtomicBool::new(false));
     let called_in = called.clone();
@@ -799,7 +821,7 @@ async fn full_flow_b3_barge_in_then_recompute_sends_once() {
         .await
         .expect("insert inbound 1");
     app.llm.push_response(reply_agent_decision_json(
-        "我们一般 2~4 周可上线，要不要先按你们的优先级排排序？",
+        "周期需要结合场景范围再确认，我们先按你们的优先级排一下？",
         "客户询问实施周期，回复能降低决策摩擦。",
         "not_required",
     ));
@@ -808,6 +830,8 @@ async fn full_flow_b3_barge_in_then_recompute_sends_once() {
         "",
         "首版可放行，但本遍用 guard 模拟期间到达更新入站。",
     ));
+    app.llm
+        .push_response(common::independent_claim_gate_pass_json());
     let guard_true: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(|| true);
     handle_managed_message_aggregated(&app.state, contact.clone(), &inbound_1, Some(guard_true))
         .await
@@ -846,7 +870,7 @@ async fn full_flow_b3_barge_in_then_recompute_sends_once() {
         .await
         .expect("insert inbound 2");
     app.llm.push_response(reply_agent_decision_json(
-        "我们一般 2~4 周可上线，预算和场景深度相关；既然想尽快定，要不要先按最急的场景圈个试点范围？",
+        "周期和预算需要结合场景范围再确认；既然想尽快定，要不要先按最急的场景圈个试点范围？",
         "客户合并询问周期 + 预算并表达急迫，聚合后一次性承接能降低决策摩擦、推进到执行。",
         "not_required",
     ));
@@ -855,6 +879,8 @@ async fn full_flow_b3_barge_in_then_recompute_sends_once() {
         "",
         "重算回复承接了合并后的完整诉求，不越界承诺，可放行。",
     ));
+    app.llm
+        .push_response(common::independent_claim_gate_pass_json());
     let guard_false: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(|| false);
     handle_managed_message_aggregated(&app.state, contact.clone(), &inbound_2, Some(guard_false))
         .await
@@ -914,6 +940,8 @@ async fn pending_delivery_is_not_learned_as_user_reaction() {
         "",
         "回复承接需求且无越界承诺，可以放行。",
     ));
+    app.llm
+        .push_response(common::independent_claim_gate_pass_json());
     handle_managed_message(&app.state, contact.clone(), &first)
         .await
         .expect("first gateway run");
@@ -1037,6 +1065,8 @@ async fn delivery_commits_promise_and_follow_up_only_after_sent() {
         "",
         "回复给出后续动作，未涉及产品效果承诺，可以放行。",
     ));
+    app.llm
+        .push_response(common::independent_claim_gate_pass_json());
     handle_managed_message(&app.state, contact.clone(), &inbound)
         .await
         .expect("gateway run");
@@ -1083,6 +1113,7 @@ async fn delivery_commits_promise_and_follow_up_only_after_sent() {
     let review_id = outbox.decision_id.expect("decision id");
     let mcp = start_delivery_mock().await;
     let state = common::rebuild_app_state_with_mcp_url(&app, mcp.uri());
+    common::ensure_test_account(&state, "default", "default").await;
     let claimed = atomic_claim_pending(&state, "full-flow-delivery", 60)
         .await
         .expect("claim pending outbox")

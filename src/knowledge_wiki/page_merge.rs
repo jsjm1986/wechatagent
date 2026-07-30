@@ -71,7 +71,9 @@ pub enum RevisionError {
     #[error("locked field '{field}' is not allowed in patch")]
     LockedFieldInPatch { field: String },
     /// patch 后 body 长度低于既有 70%（疑似 LLM 截断）。
-    #[error("patched body length {new_len} below 70% of existing {old_len} (threshold {threshold:.2})")]
+    #[error(
+        "patched body length {new_len} below 70% of existing {old_len} (threshold {threshold:.2})"
+    )]
     BodyTruncated {
         old_len: usize,
         new_len: usize,
@@ -153,7 +155,10 @@ fn bson_string_array(b: Option<&Bson>) -> Option<Vec<String>> {
 /// 运营 per-chunk 锁定字段被改动时静默覆盖回 existing、其余字段正常写；
 /// 不并入 `apply_field_patch` 的硬拒集（那会连坐毙掉同一 patch 里的合法字段）。
 pub fn effective_locked_fields(existing: &Document) -> Vec<String> {
-    let mut out: Vec<String> = DEFAULT_LOCKED_FIELDS.iter().map(|s| s.to_string()).collect();
+    let mut out: Vec<String> = DEFAULT_LOCKED_FIELDS
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     let mut seen: BTreeSet<String> = out.iter().cloned().collect();
     if let Ok(arr) = existing.get_array("locked_fields") {
         for b in arr {
@@ -247,6 +252,7 @@ pub fn apply_field_patch(
 const VOLATILE_FIELDS: &[&str] = &[
     "_id",
     "updated_at",
+    "provenance",
     "usage_stats",
     "dynamic_confidence",
     "integrity_score",
@@ -379,8 +385,14 @@ mod tests {
         let patch = doc! { "product_tags": ["B"] };
         let merged = union_array_fields(&base, &existing, &patch, &["product_tags"]);
         let tags = merged.get_array("product_tags").unwrap();
-        assert!(tags.contains(&Bson::String("A".into())), "既有 tag A 不得丢失（KB-09）");
-        assert!(tags.contains(&Bson::String("B".into())), "patch 新增 tag B 须在");
+        assert!(
+            tags.contains(&Bson::String("A".into())),
+            "既有 tag A 不得丢失（KB-09）"
+        );
+        assert!(
+            tags.contains(&Bson::String("B".into())),
+            "patch 新增 tag B 须在"
+        );
         // 标量字段沿用 base（保标量 patch 结果）。
         assert_eq!(merged.get_str("title").unwrap(), "标量patch后的值");
     }
@@ -448,8 +460,18 @@ mod tests {
     fn hash_ignores_volatile_fields() {
         let now = mongodb::bson::DateTime::now();
         let later = mongodb::bson::DateTime::from_millis(now.timestamp_millis() + 86_400_000);
-        let a = doc! { "title": "T", "updated_at": now, "dynamic_confidence": 0.5 };
-        let b = doc! { "title": "T", "updated_at": later, "dynamic_confidence": 0.9 };
+        let a = doc! {
+            "title": "T",
+            "updated_at": now,
+            "dynamic_confidence": 0.5,
+            "provenance": { "source": "human", "edited_by": "a" },
+        };
+        let b = doc! {
+            "title": "T",
+            "updated_at": later,
+            "dynamic_confidence": 0.9,
+            "provenance": { "source": "ai", "edited_by": "b" },
+        };
         assert_eq!(compute_chunk_hash(&a), compute_chunk_hash(&b));
     }
 
@@ -457,7 +479,10 @@ mod tests {
     fn effective_locked_unions_default_with_runtime_and_dedups() {
         // 无运营锁 → 恰是 DEFAULT。
         let bare = doc! { "title": "T" };
-        assert_eq!(effective_locked_fields(&bare).len(), DEFAULT_LOCKED_FIELDS.len());
+        assert_eq!(
+            effective_locked_fields(&bare).len(),
+            DEFAULT_LOCKED_FIELDS.len()
+        );
         // 运营锁定 "title"（非 DEFAULT）+ 重复一个 DEFAULT 项 "chunk_id"（应去重）。
         let with_lock = doc! { "locked_fields": ["title", "chunk_id"] };
         let eff = effective_locked_fields(&with_lock);
@@ -476,7 +501,15 @@ mod tests {
         let merged = doc! { "title": "AI改的新标题", "summary": "AI改的新摘要" };
         let locked: Vec<&str> = vec!["title"]; // 模拟 DEFAULT ∪ existing.locked_fields 里的运营锁
         let out = enforce_locked_fields(&merged, &existing, &locked);
-        assert_eq!(out.get_str("title").unwrap(), "旧标题", "锁定字段 title 须覆盖回 existing");
-        assert_eq!(out.get_str("summary").unwrap(), "AI改的新摘要", "未锁字段 summary 正常保留");
+        assert_eq!(
+            out.get_str("title").unwrap(),
+            "旧标题",
+            "锁定字段 title 须覆盖回 existing"
+        );
+        assert_eq!(
+            out.get_str("summary").unwrap(),
+            "AI改的新摘要",
+            "未锁字段 summary 正常保留"
+        );
     }
 }

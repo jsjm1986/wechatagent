@@ -21,14 +21,14 @@ describe("defaultPolicy", () => {
 describe("extractPolicy", () => {
   it("完整 askHumanPolicy 原样抽出", () => {
     const item = { askHumanPolicy: {
-      deciderChain: [{ wxid: "w1", displayName: "老板" }],
+      deciderChain: [{ wxid: "w1", displayName: "老板", accountId: "acc1" }],
       escalateSafetyGuard: false, escalateUnverifiedProduct: true,
       escalateAiPolicyHold: true, escalateStuck: false,
       dedupeWindowHours: 6, dailyPushCap: 3,
       quietHours: { startHour: 22, endHour: 7, tzOffsetHours: 8 }, timeoutHours: 24,
     } };
     const p = extractPolicy(item);
-    expect(p.deciderChain).toEqual([{ wxid: "w1", displayName: "老板" }]);
+    expect(p.deciderChain).toEqual([{ wxid: "w1", displayName: "老板", accountId: "acc1" }]);
     expect(p.escalateSafetyGuard).toBe(false);
     expect(p.quietHours).toEqual({ startHour: 22, endHour: 7, tzOffsetHours: 8 });
     expect(p.timeoutHours).toBe(24);
@@ -40,8 +40,8 @@ describe("extractPolicy", () => {
     expect(extractPolicy("garbage")).toEqual(defaultPolicy());
   });
   it("部分字段缺 → 缺的补默认, 有的保留", () => {
-    const p = extractPolicy({ askHumanPolicy: { deciderChain: [{ wxid: "w1" }] } });
-    expect(p.deciderChain).toEqual([{ wxid: "w1" }]);
+    const p = extractPolicy({ askHumanPolicy: { deciderChain: [{ wxid: "w1", accountId: "acc1" }] } });
+    expect(p.deciderChain).toEqual([{ wxid: "w1", accountId: "acc1" }]);
     expect(p.escalateSafetyGuard).toBe(true);
     expect(p.escalateAiPolicyHold).toBe(false);
     expect(p.timeoutHours).toBeUndefined();
@@ -50,17 +50,20 @@ describe("extractPolicy", () => {
 
 describe("validatePolicy", () => {
   const ok: PolicyLike = {
-    deciderChain: [{ wxid: "w1" }], escalateSafetyGuard: true, escalateUnverifiedProduct: true,
+    deciderChain: [{ wxid: "w1", accountId: "acc1" }], escalateSafetyGuard: true, escalateUnverifiedProduct: true,
     escalateAiPolicyHold: false, escalateStuck: true,
   };
   it("合法策略 → 空错误数组", () => {
     expect(validatePolicy(ok as never)).toEqual([]);
   });
-  it("空决策人链 → 报错", () => {
-    expect(validatePolicy({ ...ok, deciderChain: [] } as never)).toContain("至少配置一个决策人");
+  it("空决策人链是显式关闭态", () => {
+    expect(validatePolicy({ ...ok, deciderChain: [] } as never)).toEqual([]);
   });
   it("决策人 wxid 空白 → 报错", () => {
-    expect(validatePolicy({ ...ok, deciderChain: [{ wxid: "  " }] } as never).length).toBeGreaterThan(0);
+    expect(validatePolicy({ ...ok, deciderChain: [{ wxid: "  ", accountId: "acc1" }] } as never).length).toBeGreaterThan(0);
+  });
+  it("决策人未绑定发送账号 → 报错", () => {
+    expect(validatePolicy({ ...ok, deciderChain: [{ wxid: "w1" }] } as never)).toContain("决策人必须绑定发送账号");
   });
   it("quietHours 小时越界(>23) → 报错", () => {
     expect(validatePolicy({ ...ok, quietHours: { startHour: 24, endHour: 7, tzOffsetHours: 8 } } as never).length).toBeGreaterThan(0);

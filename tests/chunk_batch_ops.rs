@@ -28,9 +28,7 @@ use wechatagent::routes::ext_knowledge::{
     list_chunk_referrers, reject_operation_knowledge_chunk, verify_operation_knowledge_chunk,
     KnowledgeAutoVerifyRequest, KnowledgeVerifyRequest,
 };
-use wechatagent::routes::{
-    ChunkBatchArchiveRequest, ChunkBatchVerifyRequest, ChunkReferrersQuery,
-};
+use wechatagent::routes::{ChunkBatchArchiveRequest, ChunkBatchVerifyRequest, ChunkReferrersQuery};
 
 use crate::common::TestApp;
 
@@ -59,7 +57,9 @@ fn verifiable_chunk(workspace_id: &str, title: &str) -> OperationKnowledgeChunk 
         wiki_type: Some("methodology".to_string()),
         status: "active".to_string(),
         integrity_status: Some("needs_review".to_string()),
-        source_quote: Some("引文文本：客户提出价格异议时，先共情、再说明价值、最后给方案。".to_string()),
+        source_quote: Some(
+            "引文文本：客户提出价格异议时，先共情、再说明价值、最后给方案。".to_string(),
+        ),
         source_anchors: vec![anchor],
         priority: 0,
         created_at: BsonDt::now(),
@@ -82,7 +82,7 @@ async fn insert(app: &TestApp, chunks: &[OperationKnowledgeChunk]) {
 #[tokio::test]
 #[ignore]
 async fn batch_verify_marks_three_chunks_verified() {
-    let app = TestApp::start().await;
+    let app = TestApp::start_repl_set().await;
     let ws = app.state.config.default_workspace_id.clone();
 
     let c1 = verifiable_chunk(&ws, "三步价格异议");
@@ -107,7 +107,10 @@ async fn batch_verify_marks_three_chunks_verified() {
 
     let verified = body["verified"].as_array().expect("verified array");
     assert_eq!(verified.len(), 3, "all three verified: {body:?}");
-    assert!(body["skipped"].as_array().map(|a| a.is_empty()).unwrap_or(false));
+    assert!(body["skipped"]
+        .as_array()
+        .map(|a| a.is_empty())
+        .unwrap_or(false));
     assert_eq!(body["note"].as_str(), Some("admin batch verify"));
 
     // 实际 DB 状态必须切到 verified
@@ -134,7 +137,7 @@ async fn batch_verify_marks_three_chunks_verified() {
 #[tokio::test]
 #[ignore]
 async fn batch_archive_skips_already_archived() {
-    let app = TestApp::start().await;
+    let app = TestApp::start_repl_set().await;
     let ws = app.state.config.default_workspace_id.clone();
 
     let mut c_active = verifiable_chunk(&ws, "活跃 chunk A");
@@ -155,7 +158,6 @@ async fn batch_archive_skips_already_archived() {
         Json(ChunkBatchArchiveRequest {
             ids: vec![id_a.clone(), id_b.clone(), id_arch.clone()],
             reason: Some("end-of-life".to_string()),
-            actor: Some("admin".to_string()),
         }),
     )
     .await
@@ -168,12 +170,16 @@ async fn batch_archive_skips_already_archived() {
     // 至少 2 条 archived（id_a, id_b）；id_arch 走 RevisionRequest::Archive 又一次：
     // apply_chunk_revision 对已 archived 的 chunk 仍可能成功（写新 revision），
     // 也可能 skipped。两种行为都接受 — 关键是 a/b 必落在 archived 中。
-    let archived_set: std::collections::HashSet<&str> = archived
-        .iter()
-        .filter_map(|v| v.as_str())
-        .collect();
-    assert!(archived_set.contains(id_a.as_str()), "id_a archived: {body:?}");
-    assert!(archived_set.contains(id_b.as_str()), "id_b archived: {body:?}");
+    let archived_set: std::collections::HashSet<&str> =
+        archived.iter().filter_map(|v| v.as_str()).collect();
+    assert!(
+        archived_set.contains(id_a.as_str()),
+        "id_a archived: {body:?}"
+    );
+    assert!(
+        archived_set.contains(id_b.as_str()),
+        "id_b archived: {body:?}"
+    );
     assert!(
         archived.len() + skipped.len() == 3,
         "total processed = 3: {body:?}"
@@ -300,7 +306,10 @@ async fn batch_verify_skips_chunk_without_quote() {
 // 都在 chunk_revisions 落一条 op/source/created_by/hash 正确的不可变历史。
 
 /// 取某 chunk 的全部 chunk_revisions（按 created_at 升序），供审计断言。
-async fn revisions_for(app: &TestApp, chunk_id_hex: &str) -> Vec<wechatagent::models::ChunkRevision> {
+async fn revisions_for(
+    app: &TestApp,
+    chunk_id_hex: &str,
+) -> Vec<wechatagent::models::ChunkRevision> {
     use futures::TryStreamExt;
     app.state
         .db
@@ -321,7 +330,7 @@ async fn revisions_for(app: &TestApp, chunk_id_hex: &str) -> Vec<wechatagent::mo
 #[tokio::test]
 #[ignore]
 async fn verify_writes_chunk_revision_audit_entry() {
-    let app = TestApp::start().await;
+    let app = TestApp::start_repl_set().await;
     let ws = app.state.config.default_workspace_id.clone();
 
     let chunk = verifiable_chunk(&ws, "单条 verify 审计链");
@@ -379,16 +388,17 @@ async fn verify_writes_chunk_revision_audit_entry() {
 #[tokio::test]
 #[ignore]
 async fn reject_writes_chunk_revision_with_reject_op() {
-    let app = TestApp::start().await;
+    let app = TestApp::start_repl_set().await;
     let ws = app.state.config.default_workspace_id.clone();
 
     let chunk = verifiable_chunk(&ws, "单条 reject 审计链");
     let id = chunk.id.unwrap().to_hex();
     insert(&app, &[chunk]).await;
 
-    let _ = reject_operation_knowledge_chunk(State(app.state.clone()), admin(&app), Path(id.clone()))
-        .await
-        .expect("reject ok");
+    let _ =
+        reject_operation_knowledge_chunk(State(app.state.clone()), admin(&app), Path(id.clone()))
+            .await
+            .expect("reject ok");
 
     let stored = app
         .state
@@ -414,7 +424,7 @@ async fn reject_writes_chunk_revision_with_reject_op() {
 #[tokio::test]
 #[ignore]
 async fn batch_verify_writes_one_revision_per_chunk() {
-    let app = TestApp::start().await;
+    let app = TestApp::start_repl_set().await;
     let ws = app.state.config.default_workspace_id.clone();
 
     let c1 = verifiable_chunk(&ws, "批量 A");
@@ -439,7 +449,11 @@ async fn batch_verify_writes_one_revision_per_chunk() {
     // 每条恰好一条 op=verify revision，且 reason 透传 note。
     for id_hex in [&id1, &id2, &id3] {
         let revs = revisions_for(&app, id_hex).await;
-        assert_eq!(revs.len(), 1, "chunk {id_hex} 应恰好一条 revision: {revs:?}");
+        assert_eq!(
+            revs.len(),
+            1,
+            "chunk {id_hex} 应恰好一条 revision: {revs:?}"
+        );
         assert_eq!(revs[0].op, "verify");
         assert_eq!(revs[0].source, "human");
         assert_eq!(revs[0].created_by.as_deref(), Some("test_admin"));
@@ -502,7 +516,7 @@ async fn verify_gate_blocks_and_writes_no_revision_without_anchor() {
 #[tokio::test]
 #[ignore]
 async fn auto_verify_writes_one_revision_per_processed_chunk() {
-    let app = TestApp::start().await;
+    let app = TestApp::start_repl_set().await;
     let ws = app.state.config.default_workspace_id.clone();
     let account_id = app.state.config.default_account_id.clone();
 
@@ -544,7 +558,11 @@ async fn auto_verify_writes_one_revision_per_processed_chunk() {
     // 每条 chunk 恰好一条 op=verify / source=rule / created_by=auto_verify 的 revision。
     for id_hex in [&id1, &id2] {
         let revs = revisions_for(&app, id_hex).await;
-        assert_eq!(revs.len(), 1, "chunk {id_hex} 应恰好一条 revision: {revs:?}");
+        assert_eq!(
+            revs.len(),
+            1,
+            "chunk {id_hex} 应恰好一条 revision: {revs:?}"
+        );
         let rev = &revs[0];
         assert_eq!(rev.op, "verify", "auto_verify revision op 必须为 verify");
         assert_eq!(

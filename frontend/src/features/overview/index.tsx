@@ -1,6 +1,5 @@
 import { useEffect } from "react";
 import { RefreshCw, ArrowRight } from "lucide-react";
-import { api } from "../../lib/api";
 import { Avatar } from "../../components/ui/Avatar";
 import { StatusBadge, type StatusTone } from "../../components/ui/StatusBadge";
 import { EmptyState } from "../../components/ui/EmptyState";
@@ -30,7 +29,8 @@ function contactStateLabel(contact: Contact): { tone: StatusTone; label: string 
 
 export default function OverviewFeature() {
   const contacts = useContactStore((s) => s.contacts);
-  const setContacts = useContactStore((s) => s.setContacts);
+  const dataAccountId = useContactStore((s) => s.dataAccountId);
+  const loadContacts = useContactStore((s) => s.loadContacts);
   const managedCount = useContactStore((s) => s.managedCount());
   const taxonomies = useProfileStore((s) => s.taxonomies);
   const normalCount = useContactStore((s) => s.normalCount());
@@ -39,26 +39,18 @@ export default function OverviewFeature() {
   const currentAccountId = useAccountStore((s) => s.currentAccountId());
   const setChannel = useNavigationStore((s) => s.setChannel);
 
-  // F-015：工作台首屏自行拉取联系人填充 contactStore（此前仅用户运营页填充，
-  // 首次直接进工作台时统计卡/联系人池恒显 0）。仅当 store 为空时拉一次，避免
-  // 与用户运营页已加载的数据重复请求；带 accountId 防回落 default_account_id 查空。
+  const scopedContacts = dataAccountId === currentAccountId ? contacts : [];
+
+  // 工作台只消费当前账号快照。scope 不一致时立即以空态渲染，并静默加载当前账号；
+  // 迟到响应由 contactStore 的 generation 守卫丢弃。
   useEffect(() => {
     if (!currentAccountId) return;
-    if (useContactStore.getState().contacts.length > 0) return;
-    void (async () => {
-      try {
-        const data = await api.get<{ items: Contact[] }>(
-          `/api/contacts?accountId=${encodeURIComponent(currentAccountId)}`
-        );
-        setContacts(data.items);
-      } catch {
-        // 工作台概览非关键路径，拉取失败静默（用户进用户运营页会重试）
-      }
-    })();
-  }, [currentAccountId, setContacts]);
+    if (useContactStore.getState().dataAccountId === currentAccountId) return;
+    void loadContacts(currentAccountId, undefined, { silent: true });
+  }, [currentAccountId, loadContacts]);
 
-  const managed = contacts.filter((c) => c.agentStatus === "managed");
-  const deliveryRate = contacts.length > 0 ? Math.round((managedCount / contacts.length) * 100) : 0;
+  const managed = scopedContacts.filter((c) => c.agentStatus === "managed");
+  const deliveryRate = scopedContacts.length > 0 ? Math.round((managedCount / scopedContacts.length) * 100) : 0;
   const now = new Date();
   const clock = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
   const liveContacts = managed.slice(0, 5);
@@ -74,12 +66,12 @@ export default function OverviewFeature() {
         <button className={styles.stat} onClick={() => setChannel("userOps")}>
           <div className={styles.sh}><div className={styles.k}>托管联系人</div><div className={styles.badge}>累计</div></div>
           <div className={styles.v}>{managedCount}</div>
-          <div className={`${styles.t} ${styles.up}`}>共 {contacts.length} 位联系人 <span className={styles.mut}>· {normalCount} 普通</span></div>
+          <div className={`${styles.t} ${styles.up}`}>共 {scopedContacts.length} 位联系人 <span className={styles.mut}>· {normalCount} 普通</span></div>
         </button>
         <button className={`${styles.stat} ${styles.key}`} onClick={() => setChannel("userOps")}>
           <div className={styles.sh}><div className={styles.k}>托管覆盖率</div><div className={styles.badge}>实时</div></div>
           <div className={styles.v}>{deliveryRate}<small>%</small></div>
-          <div className={`${styles.t} ${styles.up}`}>{managedCount} / {contacts.length} <span className={styles.mut}>已纳入运营</span></div>
+          <div className={`${styles.t} ${styles.up}`}>{managedCount} / {scopedContacts.length} <span className={styles.mut}>已纳入运营</span></div>
         </button>
         <button className={styles.stat} onClick={() => setChannel("overview")}>
           <div className={styles.sh}><div className={styles.k}>在线账号</div><div className={styles.badge}>MCP</div></div>

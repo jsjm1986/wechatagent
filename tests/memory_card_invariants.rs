@@ -3,8 +3,8 @@
 //!
 //! 性质：
 //! 1. compact 后 `core_facts.len() <= 6`、`recent_facts.len() <= 10`；
-//! 2. previous core_facts 中**未在 discarded 列表里**的事实，必然出现在
-//!    compact 后的 core_facts 里（保留性，避免新近性挤掉关键事实）；
+//! 2. previous core_facts 中**未在 discarded 列表里**的事实，在 core 超 cap 时
+//!    仍可从 core/recent 或 `coreFactEvictions` 审计中追溯；
 //! 3. compact 后 core_facts 里不会出现 discarded 列表中的事实。
 //!
 //! task 6.3：`compact_memory_card_with_previous` 已从 `Document` 入参 / 返回
@@ -18,29 +18,29 @@ use mongodb::bson::doc;
 use proptest::prelude::*;
 #[allow(deprecated)] // task 6.3：保留兼容别名调用以验证语义等价性。
 use wechatagent::agent::compact_memory_card_typed;
-use wechatagent::agent::compact_memory_card_with_previous;
 use wechatagent::agent::compact_memory_card_with_dimensions;
-use wechatagent::models::{MemoryCardTyped, MemoryDimension, MemoryFactRepr};
+use wechatagent::agent::compact_memory_card_with_previous;
+use wechatagent::models::{MemoryCardTyped, MemoryDimension, MemoryFact, MemoryFactRepr};
 
 /// 用 `Vec<String>` 构造 typed 形态的 memoryCard（core / recent 各自）。
 fn typed_card_with_core_recent(core: &[String], recent: &[String]) -> MemoryCardTyped {
     MemoryCardTyped {
-        core_facts: core
-            .iter()
-            .cloned()
-            .map(MemoryFactRepr::Plain)
-            .collect(),
-        recent_facts: recent
-            .iter()
-            .cloned()
-            .map(MemoryFactRepr::Plain)
-            .collect(),
+        core_facts: core.iter().cloned().map(MemoryFactRepr::Plain).collect(),
+        recent_facts: recent.iter().cloned().map(MemoryFactRepr::Plain).collect(),
         ..Default::default()
     }
 }
 
 fn texts(facts: &[MemoryFactRepr]) -> Vec<String> {
     facts.iter().map(|f| f.as_text().to_string()).collect()
+}
+
+fn structured_fact(id: &str, text: &str, importance: i32, confidence: i32) -> MemoryFactRepr {
+    let mut fact = MemoryFact::from_plain_text(text.to_string());
+    fact.id = id.to_string();
+    fact.importance = importance;
+    fact.confidence = confidence;
+    MemoryFactRepr::Structured(fact)
 }
 
 proptest! {
@@ -100,22 +100,26 @@ proptest! {
         let result = compact_memory_card_with_previous(&new_card, Some(&prev_card), &discarded);
         let core_after = texts(&result.core_facts);
 
-        // 性质 2：previous 中不在 discarded 的、且未被 cap 截掉的事实仍在结果里。
-        // 真实合并顺序：new 优先靠前，然后追加 previous 中独有的项；最后保留前 6 条。
-        // 因此 previous 独有且没有 discarded 的项，可能因 new 占满前 6 个位置被截掉。
-        // 但只要总长度 ≤ 6，prev 中所有未 discarded 的项必然保留。
-        let total_potential = new_unique.len() + prev_unique.iter()
-            .filter(|f| !discarded.contains(f) && !new_unique.contains(f))
-            .count();
-        if total_potential <= 6 {
-            for fact in &prev_unique {
-                if discarded.contains(fact) { continue; }
-                prop_assert!(
-                    core_after.contains(fact),
-                    "previous core_fact {} 未 discarded 且总数 ≤ 6 应保留，但 result.core_facts={:?}",
-                    fact, core_after
-                );
-            }
+        // 性质 2：不再在超 cap 时跳过断言。previous 中未 discarded 的事实必须
+        // 位于 core 或 recent；若未来 recent 已满，仍须存在 eviction audit。
+        let recent_after = texts(&result.recent_facts);
+        let eviction_texts: Vec<String> = result.extra
+            .get_array("coreFactEvictions")
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(|item| item.as_document())
+            .filter_map(|doc| doc.get_str("text").ok().map(ToString::to_string))
+            .collect();
+        for fact in &prev_unique {
+            if discarded.contains(fact) { continue; }
+            prop_assert!(
+                core_after.contains(fact)
+                    || recent_after.contains(fact)
+                    || eviction_texts.contains(fact),
+                "previous core_fact {} 未 discarded 必须可追溯；core={:?}, recent={:?}, evictions={:?}",
+                fact, core_after, recent_after, eviction_texts
+            );
         }
 
         // 性质 3：discarded 项绝不出现在结果里。
@@ -160,8 +164,190 @@ fn compact_keeps_leading_items_after_cap() {
     );
     assert_eq!(
         texts(&result.recent_facts),
-        vec!["r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9"]
+        vec!["c6", "c7", "r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7"]
     );
+    let audits = result.extra.get_array("coreFactEvictions").unwrap();
+    assert_eq!(audits.len(), 2);
+    assert_eq!(
+        audits[0].as_document().unwrap().get_str("text").unwrap(),
+        "c6"
+    );
+    assert_eq!(
+        audits[0].as_document().unwrap().get_str("reason").unwrap(),
+        "core_fact_capacity"
+    );
+}
+
+#[test]
+fn core_fact_eviction_archive_survives_when_next_round_does_not_echo_it() {
+    let first = compact_memory_card_with_previous(
+        &typed_card_with_core_recent(&(0..8).map(|i| format!("c{i}")).collect::<Vec<_>>(), &[]),
+        None,
+        &[],
+    );
+    assert_eq!(first.extra.get_array("coreFactEvictions").unwrap().len(), 2);
+
+    let next = compact_memory_card_with_previous(
+        &typed_card_with_core_recent(&[], &[]),
+        Some(&first),
+        &[],
+    );
+    let archived: Vec<&str> = next
+        .extra
+        .get_array("coreFactEvictions")
+        .unwrap()
+        .iter()
+        .filter_map(|item| item.as_document())
+        .filter_map(|doc| doc.get_str("text").ok())
+        .collect();
+    assert_eq!(archived, vec!["c6", "c7"]);
+}
+
+#[test]
+fn explicit_discard_removes_prior_capacity_archive() {
+    let first = compact_memory_card_with_previous(
+        &typed_card_with_core_recent(&(0..8).map(|i| format!("c{i}")).collect::<Vec<_>>(), &[]),
+        None,
+        &[],
+    );
+
+    let next = compact_memory_card_with_previous(
+        &typed_card_with_core_recent(&[], &[]),
+        Some(&first),
+        &["c6".to_string()],
+    );
+    let archived: Vec<&str> = next
+        .extra
+        .get_array("coreFactEvictions")
+        .unwrap()
+        .iter()
+        .filter_map(|item| item.as_document())
+        .filter_map(|doc| doc.get_str("text").ok())
+        .collect();
+    assert_eq!(archived, vec!["c7"]);
+}
+
+#[test]
+fn promoted_core_fact_is_removed_from_prior_capacity_archive() {
+    let first = compact_memory_card_with_previous(
+        &typed_card_with_core_recent(&(0..8).map(|i| format!("c{i}")).collect::<Vec<_>>(), &[]),
+        None,
+        &[],
+    );
+    assert_eq!(
+        first
+            .extra
+            .get_array("coreFactEvictions")
+            .unwrap()
+            .iter()
+            .filter_map(|item| item.as_document())
+            .filter_map(|doc| doc.get_str("text").ok())
+            .collect::<Vec<_>>(),
+        vec!["c6", "c7"]
+    );
+
+    let next = compact_memory_card_with_previous(
+        &MemoryCardTyped {
+            core_facts: vec![structured_fact("promoted-c6", "c6", 10, 10)],
+            ..Default::default()
+        },
+        Some(&first),
+        &[],
+    );
+    assert!(texts(&next.core_facts).contains(&"c6".to_string()));
+    let archived: Vec<&str> = next
+        .extra
+        .get_array("coreFactEvictions")
+        .unwrap()
+        .iter()
+        .filter_map(|item| item.as_document())
+        .filter_map(|doc| doc.get_str("text").ok())
+        .collect();
+    assert!(!archived.contains(&"c6"));
+    assert!(archived.contains(&"c7"));
+}
+
+#[test]
+fn core_fact_priority_is_stable_and_not_incoming_first() {
+    let facts = vec![
+        structured_fact("low-z", "low z", 1, 1),
+        structured_fact("high-b", "high b", 10, 9),
+        structured_fact("low-a", "low a", 1, 1),
+        structured_fact("high-a", "high a", 10, 9),
+        structured_fact("mid-b", "mid b", 5, 5),
+        structured_fact("mid-a", "mid a", 5, 5),
+        structured_fact("evicted", "evicted", 0, 0),
+    ];
+    let mut reversed = facts.clone();
+    reversed.reverse();
+
+    let left = compact_memory_card_with_previous(
+        &MemoryCardTyped {
+            core_facts: facts,
+            ..Default::default()
+        },
+        None,
+        &[],
+    );
+    let right = compact_memory_card_with_previous(
+        &MemoryCardTyped {
+            core_facts: reversed,
+            ..Default::default()
+        },
+        None,
+        &[],
+    );
+
+    assert_eq!(texts(&left.core_facts), texts(&right.core_facts));
+    assert_eq!(
+        texts(&left.core_facts),
+        vec!["high a", "high b", "mid a", "mid b", "low a", "low z"]
+    );
+    let MemoryFactRepr::Structured(evicted) = &left.recent_facts[0] else {
+        panic!("structured fact must remain structured after capacity eviction");
+    };
+    assert_eq!(
+        evicted.extra.get_str("evictionReason").unwrap(),
+        "core_fact_capacity"
+    );
+    assert_eq!(evicted.extra.get_i32("coreFactRank").unwrap(), 7);
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 64, ..ProptestConfig::default() })]
+
+    /// SR-182 红线：previous 已满 6 条，再来 1..=6 条新事实时，任何未 discarded
+    /// 候选都不能静默消失；core 仍 cap 6，溢出项进入 recent 且留审计。
+    #[test]
+    fn over_cap_core_facts_remain_traceable(
+        incoming_count in 1usize..=6usize,
+    ) {
+        let previous: Vec<String> = (0..6).map(|i| format!("old-{i}")).collect();
+        let incoming: Vec<String> = (0..incoming_count).map(|i| format!("new-{i}")).collect();
+        let prev = typed_card_with_core_recent(&previous, &[]);
+        let next = typed_card_with_core_recent(&incoming, &[]);
+        let result = compact_memory_card_with_previous(&next, Some(&prev), &[]);
+        let core = texts(&result.core_facts);
+        let recent = texts(&result.recent_facts);
+        let audits = result.extra.get_array("coreFactEvictions").expect("capacity audit");
+        let audit_texts: Vec<String> = audits.iter()
+            .filter_map(|item| item.as_document())
+            .filter_map(|doc| doc.get_str("text").ok().map(ToString::to_string))
+            .collect();
+
+        prop_assert_eq!(core.len(), 6);
+        prop_assert_eq!(recent.len(), incoming_count);
+        prop_assert_eq!(audits.len(), incoming_count);
+        for fact in previous.iter().chain(incoming.iter()) {
+            prop_assert!(
+                core.contains(fact) || recent.contains(fact),
+                "fact {fact} silently disappeared: core={core:?}, recent={recent:?}"
+            );
+        }
+        for fact in &recent {
+            prop_assert!(audit_texts.contains(fact));
+        }
+    }
 }
 
 #[test]
@@ -170,8 +356,14 @@ fn previous_core_fact_persists_after_compact_when_under_cap() {
     let new = typed_card_with_core_recent(&["baz".to_string()], &[]);
     let result = compact_memory_card_with_previous(&new, Some(&prev), &[]);
     let cores = texts(&result.core_facts);
-    assert!(cores.contains(&"foo".to_string()), "foo 必须保留: {cores:?}");
-    assert!(cores.contains(&"bar".to_string()), "bar 必须保留: {cores:?}");
+    assert!(
+        cores.contains(&"foo".to_string()),
+        "foo 必须保留: {cores:?}"
+    );
+    assert!(
+        cores.contains(&"bar".to_string()),
+        "bar 必须保留: {cores:?}"
+    );
     assert!(
         cores.contains(&"baz".to_string()),
         "新 fact baz 必须存在: {cores:?}"
@@ -182,8 +374,7 @@ fn previous_core_fact_persists_after_compact_when_under_cap() {
 fn discarded_fact_is_dropped() {
     let prev = typed_card_with_core_recent(&["foo".to_string(), "bar".to_string()], &[]);
     let new = typed_card_with_core_recent(&[], &[]);
-    let result =
-        compact_memory_card_with_previous(&new, Some(&prev), &["foo".to_string()]);
+    let result = compact_memory_card_with_previous(&new, Some(&prev), &["foo".to_string()]);
     let cores = texts(&result.core_facts);
     assert!(
         !cores.contains(&"foo".to_string()),
@@ -371,14 +562,32 @@ fn emotional_companion_profile_memory_dimensions_end_to_end() {
 
     // ① cap 截断：三槽各按自己的 cap 截留（防无界增长）。
     let mut extra = mongodb::bson::Document::new();
-    extra.insert("emotionHistory", (0..30).map(|i| format!("e{i}")).collect::<Vec<_>>());
-    extra.insert("anniversaries", (0..30).map(|i| format!("a{i}")).collect::<Vec<_>>());
-    extra.insert("importantEvents", (0..30).map(|i| format!("v{i}")).collect::<Vec<_>>());
-    let card = MemoryCardTyped { extra, ..Default::default() };
+    extra.insert(
+        "emotionHistory",
+        (0..30).map(|i| format!("e{i}")).collect::<Vec<_>>(),
+    );
+    extra.insert(
+        "anniversaries",
+        (0..30).map(|i| format!("a{i}")).collect::<Vec<_>>(),
+    );
+    extra.insert(
+        "importantEvents",
+        (0..30).map(|i| format!("v{i}")).collect::<Vec<_>>(),
+    );
+    let card = MemoryCardTyped {
+        extra,
+        ..Default::default()
+    };
     let compacted = compact_memory_card_with_dimensions(&card, None, &[], &emotional_dims);
-    assert_eq!(compacted.extra.get_array("emotionHistory").unwrap().len(), 10);
+    assert_eq!(
+        compacted.extra.get_array("emotionHistory").unwrap().len(),
+        10
+    );
     assert_eq!(compacted.extra.get_array("anniversaries").unwrap().len(), 5);
-    assert_eq!(compacted.extra.get_array("importantEvents").unwrap().len(), 8);
+    assert_eq!(
+        compacted.extra.get_array("importantEvents").unwrap().len(),
+        8
+    );
 
     // ② candidate type 派生：candidate_type=true 的情绪史/重要事件进合法集，
     // 纪念日（false）不进；fact/conflict 固定派生；销售槽（preferences 等）不出现。
@@ -386,10 +595,15 @@ fn emotional_companion_profile_memory_dimensions_end_to_end() {
     assert!(guidance.contains("emotionHistory"));
     assert!(guidance.contains("importantEvents"));
     assert!(guidance.contains("fact") && guidance.contains("conflict"));
-    assert!(!guidance.contains("anniversaries"), "candidate_type=false 不进候选 type");
-    assert!(!guidance.contains("objection"), "销售槽不应出现在情感 profile 候选 type");
+    assert!(
+        !guidance.contains("anniversaries"),
+        "candidate_type=false 不进候选 type"
+    );
+    assert!(
+        !guidance.contains("objection"),
+        "销售槽不应出现在情感 profile 候选 type"
+    );
 }
-
 
 // ── agent-autonomy-loop W5 / Task 6.8 扩展 ─────────────────────────────
 
@@ -451,12 +665,15 @@ fn full_card_round_trip_preserves_extra_fields() {
     let doc = to_document(&card).expect("serialize");
     // 回归断言：序列化后顶层不应同时出现两份 coreProfile/relationshipState。
     assert_eq!(doc.iter().filter(|(k, _)| *k == "coreProfile").count(), 1);
-    assert_eq!(doc.iter().filter(|(k, _)| *k == "relationshipState").count(), 1);
+    assert_eq!(
+        doc.iter()
+            .filter(|(k, _)| *k == "relationshipState")
+            .count(),
+        1
+    );
     let back: MemoryCardTyped = from_document(doc).expect("deserialize");
     assert_eq!(
-        back.extra
-            .get_str("custom_field")
-            .ok(),
+        back.extra.get_str("custom_field").ok(),
         Some("未识别字段也应保留")
     );
     assert_eq!(

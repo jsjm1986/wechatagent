@@ -61,13 +61,27 @@ function formatSize(bytes?: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+const EMPTY_ASSET_DRAFT = {
+  kind: "text",
+  title: "",
+  body: "",
+  usageScene: "",
+  minInjectTier: "full",
+};
+
 export default function ContentAssetsFeature() {
   const currentAccountId = useAccountStore((s) => s.currentAccountId());
+  return <ContentAssetsWorkbench key={currentAccountId} currentAccountId={currentAccountId} />;
+}
+
+function ContentAssetsWorkbench({ currentAccountId }: { currentAccountId: string }) {
   const busy = useUiStore((s) => s.busy);
 
   const {
     assets,
+    assetsAccountId,
     assetDraft,
+    assetDraftAccountId,
     setAssetDraft,
     loadAssets,
     createAsset,
@@ -94,9 +108,19 @@ export default function ContentAssetsFeature() {
   // 列表按标签筛选
   const [filterTag, setFilterTag] = useState("");
 
+  const scopedDraft = assetDraftAccountId === currentAccountId
+    ? assetDraft
+    : EMPTY_ASSET_DRAFT;
+  const scopedAssets = assetsAccountId === currentAccountId
+    ? assets.filter((asset) => !asset.accountId || asset.accountId === currentAccountId)
+    : [];
+
   useEffect(() => {
-    loadAssets(currentAccountId);
-  }, [currentAccountId, loadAssets]);
+    useUiStore.getState().setBusy(false);
+    useUiStore.getState().setError("");
+    setAssetDraft(currentAccountId, EMPTY_ASSET_DRAFT);
+    void loadAssets(currentAccountId);
+  }, [currentAccountId, loadAssets, setAssetDraft]);
 
   const handleFilter = (event: FormEvent) => {
     event.preventDefault();
@@ -132,8 +156,8 @@ export default function ContentAssetsFeature() {
     }
   };
 
-  const mediaAssets = assets.filter((a) => a.kind === "media");
-  const textAssets = assets.filter((a) => a.kind !== "media");
+  const mediaAssets = scopedAssets.filter((a) => a.kind === "media");
+  const textAssets = scopedAssets.filter((a) => a.kind !== "media");
 
   return (
     <div className={styles.page}>
@@ -176,7 +200,7 @@ export default function ContentAssetsFeature() {
             </div>
           </form>
 
-          {assets.length === 0 ? (
+          {scopedAssets.length === 0 ? (
             <EmptyState title="暂无内容资产" hint="在右侧新增文本、FAQ、话术或品牌语气，供 Agent 自主运营调用。" />
           ) : (
             <>
@@ -188,9 +212,9 @@ export default function ContentAssetsFeature() {
                       asset={asset}
                       busy={busy}
                       onEditMeta={(fields) =>
-                        void editAssetMeta(asset.id, fields, currentAccountId)
+                        void editAssetMeta(asset, fields, currentAccountId)
                       }
-                      onDelete={() => void deleteAsset(asset.id, currentAccountId)}
+                      onDelete={() => void deleteAsset(asset, currentAccountId)}
                     />
                   ))}
                 </div>
@@ -208,17 +232,17 @@ export default function ContentAssetsFeature() {
                         asset={asset}
                         busy={busy}
                         onApprove={() =>
-                          void reviewMediaAsset(asset.id, "approved", undefined, currentAccountId)
+                          void reviewMediaAsset(asset, "approved", undefined, currentAccountId)
                         }
                         onToggleSendable={(sendable) =>
-                          void toggleAssetSendable(asset.id, sendable, currentAccountId)
+                          void toggleAssetSendable(asset, sendable, currentAccountId)
                         }
-                        onDelete={() => void deleteAsset(asset.id, currentAccountId)}
+                        onDelete={() => void deleteAsset(asset, currentAccountId)}
                         onEditMeta={(fields) =>
-                          void editAssetMeta(asset.id, fields, currentAccountId)
+                          void editAssetMeta(asset, fields, currentAccountId)
                         }
                         onReplaceFile={(form) =>
-                          void replaceAssetFile(asset.id, form, currentAccountId)
+                          void replaceAssetFile(asset, form, currentAccountId)
                         }
                       />
                     ))}
@@ -243,15 +267,16 @@ export default function ContentAssetsFeature() {
                 <span className={styles.fieldLabel}>类型</span>
                 <select
                   className={styles.select}
-                  value={assetDraft.kind}
+                  value={scopedDraft.kind}
                   onChange={(event) => {
                     const kind = event.target.value;
                     // 切到禁用表达时注入档字段被隐藏（后端恒注入、无视 minInjectTier），
                     // 同步把 draft 值归位默认档，避免残留上次所选档位落库（死字段、不整洁）。
                     setAssetDraft(
+                      currentAccountId,
                       kind === "forbidden_expression"
-                        ? { ...assetDraft, kind, minInjectTier: "full" }
-                        : { ...assetDraft, kind }
+                        ? { ...scopedDraft, kind, minInjectTier: "full" }
+                        : { ...scopedDraft, kind }
                     );
                   }}
                 >
@@ -264,33 +289,33 @@ export default function ContentAssetsFeature() {
                 <span className={styles.fieldLabel}>标题</span>
                 <input
                   className={styles.input}
-                  value={assetDraft.title}
-                  onChange={(event) => setAssetDraft({ ...assetDraft, title: event.target.value })}
+                  value={scopedDraft.title}
+                  onChange={(event) => setAssetDraft(currentAccountId, { ...scopedDraft, title: event.target.value })}
                 />
               </label>
               <label className={styles.field}>
                 <span className={styles.fieldLabel}>正文</span>
                 <textarea
                   className={styles.textarea}
-                  value={assetDraft.body}
-                  onChange={(event) => setAssetDraft({ ...assetDraft, body: event.target.value })}
+                  value={scopedDraft.body}
+                  onChange={(event) => setAssetDraft(currentAccountId, { ...scopedDraft, body: event.target.value })}
                 />
               </label>
               <label className={styles.field}>
                 <span className={styles.fieldLabel}>使用场景</span>
                 <input
                   className={styles.input}
-                  value={assetDraft.usageScene}
-                  onChange={(event) => setAssetDraft({ ...assetDraft, usageScene: event.target.value })}
+                  value={scopedDraft.usageScene}
+                  onChange={(event) => setAssetDraft(currentAccountId, { ...scopedDraft, usageScene: event.target.value })}
                 />
               </label>
-              {assetDraft.kind !== "forbidden_expression" && (
+              {scopedDraft.kind !== "forbidden_expression" && (
                 <label className={styles.field}>
                   <span className={styles.fieldLabel}>最低注入档</span>
                   <select
                     className={styles.select}
-                    value={assetDraft.minInjectTier}
-                    onChange={(event) => setAssetDraft({ ...assetDraft, minInjectTier: event.target.value })}
+                    value={scopedDraft.minInjectTier}
+                    onChange={(event) => setAssetDraft(currentAccountId, { ...scopedDraft, minInjectTier: event.target.value })}
                   >
                     <option value="lean">精简档（任何对话都注入，最常生效）</option>
                     <option value="relational">关系档（进入关系经营时注入）</option>
@@ -299,7 +324,7 @@ export default function ContentAssetsFeature() {
                   <span className={styles.hint}>核心禁语/口吻选精简档时刻生效；重型话术/长 FAQ 选完整档。</span>
                 </label>
               )}
-              <button className={styles.submit} type="submit" disabled={busy || !assetDraft.title.trim()}>
+              <button className={styles.submit} type="submit" disabled={busy || !scopedDraft.title.trim()}>
                 保存资产
               </button>
             </div>
@@ -455,6 +480,9 @@ function TextAssetRow({
       <div className={styles.rowHead}>
         <strong className={styles.rowTitle}>{asset.title}</strong>
         <span style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+          <span className={styles.kind}>
+            {asset.accountId ? `账号专属 · ${asset.accountId}` : "全账号共享"}
+          </span>
           <span className={styles.kind}>{kindLabel(asset.kind)}</span>
           <span className={styles.kind}>
             {asset.kind === "forbidden_expression" ? FORBIDDEN_TIER_BADGE : tierLabel(asset.minInjectTier)}
@@ -622,8 +650,13 @@ function MediaAssetRow({
         <div className={styles.mediaMeta}>
           <div className={styles.rowHead}>
             <strong className={styles.rowTitle}>{asset.title}</strong>
-            <span className={`${styles.badge} ${isApproved ? styles.badgeApproved : styles.badgeDraft}`}>
-              {isApproved ? "可发送" : "草稿待审"}
+            <span style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+              <span className={styles.kind}>
+                {asset.accountId ? `账号专属 · ${asset.accountId}` : "全账号共享"}
+              </span>
+              <span className={`${styles.badge} ${isApproved ? styles.badgeApproved : styles.badgeDraft}`}>
+                {isApproved ? "可发送" : "草稿待审"}
+              </span>
             </span>
           </div>
           <p className={styles.metaLine}>

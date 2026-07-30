@@ -30,9 +30,11 @@ pub async fn active_view(
 ) -> AppResult<Json<Value>> {
     // 1) 加载当前 workspace 的 active DomainProfile（无 active 时回落 DEFAULT 销售
     //    profile，不会 panic）。
-    let profile =
-        crate::agent::domain_profile::load_active_domain_profile(&state.db, &admin.current_workspace)
-            .await;
+    let profile = crate::agent::domain_profile::load_active_domain_profile(
+        &state.db,
+        &admin.current_workspace,
+    )
+    .await?;
 
     // 2) 维度声明（camelCase wire）。
     let dimensions: Vec<Value> = profile
@@ -66,17 +68,22 @@ pub async fn active_view(
     // seed migration 里（m006 / m023 / m021 / m020）：这些维度在部分 profile 下不进
     // profile_dimensions，前端 labelFor 拿不到字典就只能显示英文 id。恒定补上下发范围，
     // 前端即可翻译，无需新建映射。
-    for extra in ["objection_type", "value_tier", "churn_reason", "purchase_lifecycle"] {
+    for extra in [
+        "objection_type",
+        "value_tier",
+        "churn_reason",
+        "purchase_lifecycle",
+    ] {
         if !kinds.iter().any(|k| k == extra) {
             kinds.push(extra.to_string());
         }
     }
 
     // 4) 预热进程级 taxonomy cache（冷 / 过期缓存会返回空，必须先 find_or_load）。
-    let cache = crate::agent::taxonomy::global_taxonomy_cache();
+    let cache = crate::agent::taxonomy::global_taxonomy_cache(&state.db);
     cache
         .find_or_load(&state.db, &admin.current_workspace)
-        .await;
+        .await?;
 
     // 5) 逐 kind 建取值字典 {kind: [{id, label}]}。scope 第二参传 current_workspace：
     //    dimension_values_with_labels 在 account 私有 scope 未命中时回落 global，

@@ -1,6 +1,7 @@
 /target
 /target-pbt
 /target-check
+/.cargo-target-*/
 /frontend/node_modules
 /frontend/dist
 /frontend/target-pbt
@@ -11,6 +12,9 @@ npm-debug.log*
 *.log
 __pycache__/
 /tmp/
+/.tmp/
+/audit/**/target/
+/audit/**/node_modules/
 /.superpowers/
 /.claude/
 /scripts/e2e/node_modules

@@ -1,7 +1,7 @@
 //! ask_human 策略解析（纯函数）：ask_human_policy 存在则用它；否则回落旧
 //! principal_decider/high_risk_escalation_mode 字段映射（字节等价红线④）。无 IO。
 
-use crate::models::{AskHumanQuietHours, DeciderRef, OperationDomainConfig};
+use crate::models::{AskHumanPolicy, AskHumanQuietHours, DeciderRef, OperationDomainConfig};
 
 /// 解析后的请示策略（运行时唯一权威；旧字段仅 None 时兜底）。
 #[derive(Debug, Clone, PartialEq)]
@@ -36,7 +36,13 @@ pub(crate) fn resolve_ask_human_policy(config: &OperationDomainConfig) -> Resolv
     let chain = config
         .principal_decider
         .clone()
-        .map(|w| vec![DeciderRef { wxid: w, display_name: None }])
+        .map(|w| {
+            vec![DeciderRef {
+                wxid: w,
+                display_name: None,
+                account_id: None,
+            }]
+        })
         .unwrap_or_default();
     ResolvedAskHumanPolicy {
         decider_chain: chain,
@@ -51,9 +57,61 @@ pub(crate) fn resolve_ask_human_policy(config: &OperationDomainConfig) -> Resolv
     }
 }
 
+/// Resolve a policy snapshot frozen on an escalation. Unlike the config resolver,
+/// this never consults legacy/current domain fields, so later config edits cannot
+/// change an in-flight escalation.
+pub(crate) fn resolve_ask_human_policy_snapshot(policy: &AskHumanPolicy) -> ResolvedAskHumanPolicy {
+    ResolvedAskHumanPolicy {
+        decider_chain: policy.decider_chain.clone(),
+        escalate_safety_guard: policy.escalate_safety_guard,
+        escalate_unverified_product: policy.escalate_unverified_product,
+        escalate_ai_policy_hold: policy.escalate_ai_policy_hold,
+        escalate_stuck: policy.escalate_stuck,
+        dedupe_window_hours: policy.dedupe_window_hours,
+        daily_push_cap: policy.daily_push_cap,
+        quiet_hours: policy.quiet_hours.clone(),
+        timeout_hours: policy.timeout_hours,
+    }
+}
+
+/// Freeze the resolved policy and bind every legacy account-less decider to the
+/// account that owns the triggering customer. New admin writes reject missing
+/// account ids; this fallback exists only for pre-account-binding configurations.
+pub(crate) fn freeze_ask_human_policy(
+    resolved: &ResolvedAskHumanPolicy,
+    legacy_account_id: &str,
+) -> AskHumanPolicy {
+    AskHumanPolicy {
+        decider_chain: resolved
+            .decider_chain
+            .iter()
+            .cloned()
+            .map(|mut decider| {
+                if decider
+                    .account_id
+                    .as_deref()
+                    .is_none_or(|value| value.trim().is_empty())
+                {
+                    decider.account_id = Some(legacy_account_id.to_string());
+                }
+                decider
+            })
+            .collect(),
+        escalate_safety_guard: resolved.escalate_safety_guard,
+        escalate_unverified_product: resolved.escalate_unverified_product,
+        escalate_ai_policy_hold: resolved.escalate_ai_policy_hold,
+        escalate_stuck: resolved.escalate_stuck,
+        dedupe_window_hours: resolved.dedupe_window_hours,
+        daily_push_cap: resolved.daily_push_cap,
+        quiet_hours: resolved.quiet_hours.clone(),
+        timeout_hours: resolved.timeout_hours,
+    }
+}
+
 /// KD-04：from_wxid 是否是该 config 解析后 decider_chain 的成员。
 /// 复用 resolve_ask_human_policy（已内含旧 principal_decider 回落），故新旧配置都覆盖，
 /// 且覆盖链中全部决策人（含改派后的 next 决策人）。纯函数、无 IO。
+#[cfg(test)]
 pub(crate) fn is_decider_for_config(config: &OperationDomainConfig, from_wxid: &str) -> bool {
     resolve_ask_human_policy(config)
         .decider_chain
@@ -117,7 +175,11 @@ pub(crate) fn next_decider_on_timeout<'a>(
     }
     // 起点：current 在链中→下一位（idx+1）；current 不在链（KD-06：admin 改 decider_chain 删/换人
     // 后的孤儿 pending）→ 回落链首（起点 0）让孤儿重新入链。
-    let start = match policy.decider_chain.iter().position(|d| d.wxid == current_wxid) {
+    let start = match policy
+        .decider_chain
+        .iter()
+        .position(|d| d.wxid == current_wxid)
+    {
         Some(idx) => idx + 1,
         None => 0,
     };
@@ -169,7 +231,11 @@ mod tests {
         // 旧逻辑只认 principal_decider → 领导 wxid 不被识别；新谓词应识别。
         let mut cfg = base_config();
         cfg.ask_human_policy = Some(AskHumanPolicy {
-            decider_chain: vec![DeciderRef { wxid: "leader1".into(), display_name: None }],
+            decider_chain: vec![DeciderRef {
+                wxid: "leader1".into(),
+                display_name: None,
+                account_id: Some("acc1".into()),
+            }],
             escalate_safety_guard: true,
             escalate_unverified_product: true,
             escalate_ai_policy_hold: false,
@@ -179,8 +245,14 @@ mod tests {
             quiet_hours: None,
             timeout_hours: None,
         });
-        assert!(is_decider_for_config(&cfg, "leader1"), "decider_chain 成员必须被识别为决策人");
-        assert!(cfg.principal_decider.is_none(), "本用例前提：principal_decider=None（推荐配置）");
+        assert!(
+            is_decider_for_config(&cfg, "leader1"),
+            "decider_chain 成员必须被识别为决策人"
+        );
+        assert!(
+            cfg.principal_decider.is_none(),
+            "本用例前提：principal_decider=None（推荐配置）"
+        );
     }
 
     #[test]
@@ -189,8 +261,16 @@ mod tests {
         let mut cfg = base_config();
         cfg.ask_human_policy = Some(AskHumanPolicy {
             decider_chain: vec![
-                DeciderRef { wxid: "leader1".into(), display_name: None },
-                DeciderRef { wxid: "leader2".into(), display_name: None },
+                DeciderRef {
+                    wxid: "leader1".into(),
+                    display_name: None,
+                    account_id: Some("acc1".into()),
+                },
+                DeciderRef {
+                    wxid: "leader2".into(),
+                    display_name: None,
+                    account_id: Some("acc1".into()),
+                },
             ],
             escalate_safety_guard: true,
             escalate_unverified_product: true,
@@ -201,7 +281,10 @@ mod tests {
             quiet_hours: None,
             timeout_hours: None,
         });
-        assert!(is_decider_for_config(&cfg, "leader2"), "链中非首位（改派 next）也须被识别");
+        assert!(
+            is_decider_for_config(&cfg, "leader2"),
+            "链中非首位（改派 next）也须被识别"
+        );
     }
 
     #[test]
@@ -209,14 +292,21 @@ mod tests {
         // 旧配置兼容：只设 principal_decider、ask_human_policy=None → resolve 回落 → 识别。
         let mut cfg = base_config();
         cfg.principal_decider = Some("oldboss".into());
-        assert!(is_decider_for_config(&cfg, "oldboss"), "旧 principal_decider 经 resolve 回落仍须识别");
+        assert!(
+            is_decider_for_config(&cfg, "oldboss"),
+            "旧 principal_decider 经 resolve 回落仍须识别"
+        );
     }
 
     #[test]
     fn kd04_non_decider_returns_false() {
         let mut cfg = base_config();
         cfg.ask_human_policy = Some(AskHumanPolicy {
-            decider_chain: vec![DeciderRef { wxid: "leader1".into(), display_name: None }],
+            decider_chain: vec![DeciderRef {
+                wxid: "leader1".into(),
+                display_name: None,
+                account_id: Some("acc1".into()),
+            }],
             escalate_safety_guard: true,
             escalate_unverified_product: true,
             escalate_ai_policy_hold: false,
@@ -226,14 +316,20 @@ mod tests {
             quiet_hours: None,
             timeout_hours: None,
         });
-        assert!(!is_decider_for_config(&cfg, "stranger"), "非决策人不得被识别");
+        assert!(
+            !is_decider_for_config(&cfg, "stranger"),
+            "非决策人不得被识别"
+        );
     }
 
     #[test]
     fn kd04_empty_chain_returns_false() {
         // 未启用请示通道（decider_chain 空 + principal_decider None）→ 任何 wxid 都不是决策人。
         let cfg = base_config();
-        assert!(!is_decider_for_config(&cfg, "anyone"), "未启用请示通道时任何 wxid 都非决策人");
+        assert!(
+            !is_decider_for_config(&cfg, "anyone"),
+            "未启用请示通道时任何 wxid 都非决策人"
+        );
     }
 
     #[test]
@@ -264,7 +360,11 @@ mod tests {
         let mut cfg = base_config();
         cfg.high_risk_escalation_mode = Some("all".into());
         cfg.ask_human_policy = Some(AskHumanPolicy {
-            decider_chain: vec![DeciderRef { wxid: "alice".into(), display_name: Some("决策人A".into()) }],
+            decider_chain: vec![DeciderRef {
+                wxid: "alice".into(),
+                display_name: Some("决策人A".into()),
+                account_id: Some("acc1".into()),
+            }],
             escalate_safety_guard: true,
             escalate_unverified_product: false,
             escalate_ai_policy_hold: false,
@@ -304,8 +404,8 @@ mod tests {
     #[test]
     fn push_blocked_when_daily_cap_reached() {
         let p = resolved_with(Some(3), None);
-        assert!(push_allowed(&p, 2, None, 1_000));   // 未达上限
-        assert!(!push_allowed(&p, 3, None, 1_000));  // 达上限
+        assert!(push_allowed(&p, 2, None, 1_000)); // 未达上限
+        assert!(!push_allowed(&p, 3, None, 1_000)); // 达上限
     }
 
     #[test]
@@ -323,11 +423,22 @@ mod tests {
         let mut p = resolved_with(None, None);
         p.timeout_hours = Some(24.0);
         p.decider_chain = vec![
-            DeciderRef { wxid: "a".into(), display_name: None },
-            DeciderRef { wxid: "b".into(), display_name: None },
+            DeciderRef {
+                wxid: "a".into(),
+                display_name: None,
+                account_id: Some("acc1".into()),
+            },
+            DeciderRef {
+                wxid: "b".into(),
+                display_name: None,
+                account_id: Some("acc1".into()),
+            },
         ];
         // 当前 a，已等 25h > 24h → 转 b
-        assert_eq!(next_decider_on_timeout(&p, "a", "customer_x", 25.0).map(|d| d.wxid.as_str()), Some("b"));
+        assert_eq!(
+            next_decider_on_timeout(&p, "a", "customer_x", 25.0).map(|d| d.wxid.as_str()),
+            Some("b")
+        );
         // 未超时 → None
         assert_eq!(next_decider_on_timeout(&p, "a", "customer_x", 10.0), None);
         // 已是链尾 b → None（继续等）
@@ -338,8 +449,16 @@ mod tests {
     fn next_decider_none_when_timeout_unset() {
         let mut p = resolved_with(None, None);
         p.decider_chain = vec![
-            DeciderRef { wxid: "a".into(), display_name: None },
-            DeciderRef { wxid: "b".into(), display_name: None },
+            DeciderRef {
+                wxid: "a".into(),
+                display_name: None,
+                account_id: Some("acc1".into()),
+            },
+            DeciderRef {
+                wxid: "b".into(),
+                display_name: None,
+                account_id: Some("acc1".into()),
+            },
         ];
         // timeout_hours=None → 无限等待，永不转
         assert_eq!(next_decider_on_timeout(&p, "a", "customer_x", 9999.0), None);
@@ -352,8 +471,16 @@ mod tests {
         let mut p = resolved_with(None, None);
         p.timeout_hours = Some(24.0);
         p.decider_chain = vec![
-            DeciderRef { wxid: "a".into(), display_name: None },
-            DeciderRef { wxid: "b".into(), display_name: None },
+            DeciderRef {
+                wxid: "a".into(),
+                display_name: None,
+                account_id: Some("acc1".into()),
+            },
+            DeciderRef {
+                wxid: "b".into(),
+                display_name: None,
+                account_id: Some("acc1".into()),
+            },
         ];
         // 当前 principal "ghost" 不在链中、已超时 → 回落链首 a。
         assert_eq!(
@@ -369,8 +496,16 @@ mod tests {
         let mut p = resolved_with(None, None);
         p.timeout_hours = Some(24.0);
         p.decider_chain = vec![
-            DeciderRef { wxid: "a".into(), display_name: None },
-            DeciderRef { wxid: "b".into(), display_name: None },
+            DeciderRef {
+                wxid: "a".into(),
+                display_name: None,
+                account_id: Some("acc1".into()),
+            },
+            DeciderRef {
+                wxid: "b".into(),
+                display_name: None,
+                account_id: Some("acc1".into()),
+            },
         ];
         assert_eq!(
             next_decider_on_timeout(&p, "b", "customer_x", 99.0),
@@ -385,7 +520,10 @@ mod tests {
         let mut p = resolved_with(None, None);
         p.timeout_hours = Some(24.0);
         p.decider_chain = vec![];
-        assert_eq!(next_decider_on_timeout(&p, "ghost", "customer_x", 99.0), None);
+        assert_eq!(
+            next_decider_on_timeout(&p, "ghost", "customer_x", 99.0),
+            None
+        );
     }
 
     #[test]
@@ -395,9 +533,21 @@ mod tests {
         let mut p = resolved_with(None, None);
         p.timeout_hours = Some(24.0);
         p.decider_chain = vec![
-            DeciderRef { wxid: "leader_a".into(), display_name: None },
-            DeciderRef { wxid: "customer_x".into(), display_name: None }, // 误配=客户
-            DeciderRef { wxid: "leader_c".into(), display_name: None },
+            DeciderRef {
+                wxid: "leader_a".into(),
+                display_name: None,
+                account_id: Some("acc1".into()),
+            },
+            DeciderRef {
+                wxid: "customer_x".into(),
+                display_name: None,
+                account_id: Some("acc1".into()),
+            }, // 误配=客户
+            DeciderRef {
+                wxid: "leader_c".into(),
+                display_name: None,
+                account_id: Some("acc1".into()),
+            },
         ];
         // 当前 leader_a 超时，下一位是被误配的 customer_x → 必须跳过，改派给 leader_c。
         assert_eq!(
@@ -413,8 +563,16 @@ mod tests {
         let mut p = resolved_with(None, None);
         p.timeout_hours = Some(24.0);
         p.decider_chain = vec![
-            DeciderRef { wxid: "leader_a".into(), display_name: None },
-            DeciderRef { wxid: "customer_x".into(), display_name: None },
+            DeciderRef {
+                wxid: "leader_a".into(),
+                display_name: None,
+                account_id: Some("acc1".into()),
+            },
+            DeciderRef {
+                wxid: "customer_x".into(),
+                display_name: None,
+                account_id: Some("acc1".into()),
+            },
         ];
         assert_eq!(
             next_decider_on_timeout(&p, "leader_a", "customer_x", 99.0),
@@ -427,17 +585,29 @@ mod tests {
     fn in_quiet_hours_cross_midnight_and_tz() {
         use crate::models::AskHumanQuietHours;
         // 跨午夜窗 22:00–06:00, tz=0（UTC）。now=23:00 → 窗内；now=12:00 → 窗外。
-        let qh = AskHumanQuietHours { start_hour: 22, end_hour: 6, tz_offset_hours: 0 };
-        let h23 = 23 * 3600 * 1000i64;       // 23:00 UTC
-        let h12 = 12 * 3600 * 1000i64;       // 12:00 UTC
-        assert!(in_quiet_hours(&qh, h23));   // 跨午夜窗内
-        assert!(!in_quiet_hours(&qh, h12));  // 窗外
-        // tz=+8：UTC 18:00 → 本地 02:00（在 22–06 窗内）。
-        let qh8 = AskHumanQuietHours { start_hour: 22, end_hour: 6, tz_offset_hours: 8 };
-        let utc18 = 18 * 3600 * 1000i64;     // UTC 18:00 → 本地 02:00
+        let qh = AskHumanQuietHours {
+            start_hour: 22,
+            end_hour: 6,
+            tz_offset_hours: 0,
+        };
+        let h23 = 23 * 3600 * 1000i64; // 23:00 UTC
+        let h12 = 12 * 3600 * 1000i64; // 12:00 UTC
+        assert!(in_quiet_hours(&qh, h23)); // 跨午夜窗内
+        assert!(!in_quiet_hours(&qh, h12)); // 窗外
+                                            // tz=+8：UTC 18:00 → 本地 02:00（在 22–06 窗内）。
+        let qh8 = AskHumanQuietHours {
+            start_hour: 22,
+            end_hour: 6,
+            tz_offset_hours: 8,
+        };
+        let utc18 = 18 * 3600 * 1000i64; // UTC 18:00 → 本地 02:00
         assert!(in_quiet_hours(&qh8, utc18));
         // 非跨午夜窗 09:00–17:00, tz=0：now=12:00 窗内、now=20:00 窗外。
-        let day = AskHumanQuietHours { start_hour: 9, end_hour: 17, tz_offset_hours: 0 };
+        let day = AskHumanQuietHours {
+            start_hour: 9,
+            end_hour: 17,
+            tz_offset_hours: 0,
+        };
         assert!(in_quiet_hours(&day, h12));
         assert!(!in_quiet_hours(&day, 20 * 3600 * 1000i64));
     }

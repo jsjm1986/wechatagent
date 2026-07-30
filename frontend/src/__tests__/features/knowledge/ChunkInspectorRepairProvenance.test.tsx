@@ -13,14 +13,21 @@ const realFetch = globalThis.fetch;
 const CHUNK_ID = "chunk-x";
 
 // 给单条 chunk 装 fetch：/lock 返回 self 占位，/chunks 返回该 chunk。
-function installFetch(chunk: Record<string, unknown>) {
+function installFetch(chunk: Record<string, unknown>, presenceByOther = false) {
   globalThis.fetch = vi.fn(async (url: unknown) => {
     const u = String(url);
     if (u.includes("/lock")) {
-      const body = { lock: { owner_user_id: "u1", owner_username: "admin", expires_at: "" } };
+      const body = {
+        advisory: true,
+        lock: {
+          owner_user_id: presenceByOther ? "u2" : "u1",
+          owner_username: presenceByOther ? "another-admin" : "admin",
+          expires_at: "",
+        },
+      };
       return {
-        ok: true,
-        status: 200,
+        ok: !presenceByOther,
+        status: presenceByOther ? 409 : 200,
         async json() {
           return body;
         },
@@ -96,5 +103,16 @@ describe("ChunkInspectorPane — Task5 修复入口 + provenance 来源", () => 
     renderInspector();
     await screen.findByText("无来源知识");
     expect(screen.queryByText("来源")).toBeNull();
+  });
+
+  it("他人 presence 只作协作提示，不禁用编辑动作", async () => {
+    installFetch(
+      { id: CHUNK_ID, title: "协作中的知识", integrityStatus: "needs_review" },
+      true,
+    );
+    renderInspector();
+    expect(await screen.findByText(/仅提示，不阻止提交/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "改摘要" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: /拆分/ })).toBeEnabled();
   });
 });

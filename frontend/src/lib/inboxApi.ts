@@ -30,7 +30,13 @@ export interface InboxResponse {
   items: InboxItem[];
   errors: SourceError[];
 }
-export type InboxSummary = Record<string, number>;
+export interface InboxSummary {
+  status: "complete" | "partial" | "error";
+  asOf: string | null;
+  counts: Record<string, number | null>;
+  errors: SourceError[];
+  total: number | null;
+}
 
 export function severityRank(s: string): number {
   switch (s) {
@@ -61,5 +67,41 @@ export async function fetchInbox(source?: string): Promise<InboxResponse> {
 }
 
 export async function fetchSummary(): Promise<InboxSummary> {
-  return api.get<InboxSummary>("/api/admin/ask-human/summary");
+  const raw = await api.get<Record<string, unknown>>("/api/admin/ask-human/summary");
+  const nestedCounts = raw.counts;
+  const counts =
+    nestedCounts && typeof nestedCounts === "object" && !Array.isArray(nestedCounts)
+      ? Object.fromEntries(
+          Object.entries(nestedCounts).map(([key, value]) => [
+            key,
+            typeof value === "number" ? value : null,
+          ]),
+        )
+      : Object.fromEntries(
+          Object.entries(raw)
+            .filter(([key]) => !["status", "asOf", "errors", "total"].includes(key))
+            .map(([key, value]) => [key, typeof value === "number" ? value : null]),
+        );
+  const errors = Array.isArray(raw.errors)
+    ? raw.errors.filter(
+        (value): value is SourceError =>
+          !!value &&
+          typeof value === "object" &&
+          typeof (value as SourceError).source === "string" &&
+          typeof (value as SourceError).error === "string",
+      )
+    : [];
+  const status =
+    raw.status === "partial" || raw.status === "error" || raw.status === "complete"
+      ? raw.status
+      : errors.length > 0
+        ? "partial"
+        : "complete";
+  return {
+    status,
+    asOf: typeof raw.asOf === "string" ? raw.asOf : null,
+    counts,
+    errors,
+    total: typeof raw.total === "number" ? raw.total : null,
+  };
 }

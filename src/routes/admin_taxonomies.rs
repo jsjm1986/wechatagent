@@ -5,7 +5,7 @@
 //!
 //! - `GET /api/admin/taxonomies?scope=&kind=&include_deprecated=`
 //! - `POST /api/admin/taxonomies` 新增条目，依赖 `(scope, kind, value.id)` 唯一索引。
-//! - `PATCH /api/admin/taxonomies/:id` 局部更新（label / aliases / description / deprecated）。
+//! - `PATCH /api/admin/taxonomies/:id` 局部更新（含运行时 priority/terminal/reactivation 字段）。
 //! - `DELETE /api/admin/taxonomies/:id` 软删除：`value.status = "deprecated"`，
 //!   保留历史值以便对历史 run / 审核留档继续可读。
 //!
@@ -28,7 +28,7 @@ use crate::{
     agent::taxonomy::invalidate_global_taxonomy_cache,
     auth::AuthenticatedAdmin,
     error::{AppError, AppResult},
-    models::{TaxonomyEntry, TaxonomyValue},
+    models::{taxonomy_identity_claims, TaxonomyEntry, TaxonomyValue},
 };
 
 use super::shared::*;
@@ -178,7 +178,7 @@ pub(super) async fn create_taxonomy(
         .await
     {
         Ok(result) => {
-            invalidate_global_taxonomy_cache();
+            invalidate_global_taxonomy_cache(&state.db);
             let mut entry_with_id = entry;
             entry_with_id.id = result.inserted_id.as_object_id();
             Ok(Json(json!({ "item": taxonomy_entry_json(entry_with_id) })).into_response())
@@ -205,6 +205,18 @@ pub(super) async fn patch_taxonomy(
     Json(payload): Json<PatchTaxonomyRequest>,
 ) -> AppResult<Json<Value>> {
     let object_id = parse_object_id(&id)?;
+    let collection = state.db.collection_system_taxonomies();
+    let existing = collection
+        .find_one(
+            doc! {
+                "_id": object_id,
+                "workspace_id": &admin.current_workspace,
+                "current_version": true,
+            },
+            None,
+        )
+        .await?
+        .ok_or_else(|| AppError::NotFound("taxonomy entry not found".to_string()))?;
 
     let mut set_doc = Document::new();
     if let Some(label) = payload.label {
@@ -215,12 +227,13 @@ pub(super) async fn patch_taxonomy(
         set_doc.insert("value.displayName", trimmed);
     }
     if let Some(aliases) = payload.aliases {
-        let cleaned: Vec<String> = aliases
+        let cleaned = taxonomy_identity_claims(&existing.value.id, &aliases)
             .into_iter()
-            .map(|alias| alias.trim().to_string())
-            .filter(|alias| !alias.is_empty())
-            .collect();
+            .skip(1)
+            .collect::<Vec<_>>();
+        let claims = taxonomy_identity_claims(&existing.value.id, &cleaned);
         set_doc.insert("value.aliases", to_bson(&cleaned)?);
+        set_doc.insert("value.identityClaims", to_bson(&claims)?);
     }
     if let Some(description) = payload.description {
         set_doc.insert("value.description", description);
@@ -238,13 +251,10 @@ pub(super) async fn patch_taxonomy(
         set_doc.insert("value.isReactivationTarget", is_reactivation_target);
     }
     if set_doc.is_empty() {
-        return Err(AppError::BadRequest(
-            "至少要传 label / aliases / description / deprecated 之一".to_string(),
-        ));
+        return Err(AppError::BadRequest("至少要传一个可更新字段".to_string()));
     }
     set_doc.insert("updated_at", DateTime::now());
 
-    let collection = state.db.collection_system_taxonomies();
     let result = collection
         .update_one(
             doc! {
@@ -255,11 +265,18 @@ pub(super) async fn patch_taxonomy(
             doc! { "$set": set_doc },
             None,
         )
-        .await?;
+        .await
+        .map_err(|error| {
+            if is_duplicate_key_error(&error) {
+                AppError::Conflict("taxonomy_identity_claim_conflict".to_string())
+            } else {
+                error.into()
+            }
+        })?;
     if result.matched_count == 0 {
         return Err(AppError::NotFound("taxonomy entry not found".to_string()));
     }
-    invalidate_global_taxonomy_cache();
+    invalidate_global_taxonomy_cache(&state.db);
     let entry = collection
         .find_one(
             doc! {
@@ -301,7 +318,7 @@ pub(super) async fn delete_taxonomy(
     if result.matched_count == 0 {
         return Err(AppError::NotFound("taxonomy entry not found".to_string()));
     }
-    invalidate_global_taxonomy_cache();
+    invalidate_global_taxonomy_cache(&state.db);
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -329,6 +346,9 @@ pub(super) fn taxonomy_entry_json(entry: TaxonomyEntry) -> Value {
             "description": entry.value.description,
             "aliases": entry.value.aliases,
             "status": entry.value.status,
+            "priorityWeight": entry.value.priority_weight,
+            "isTerminal": entry.value.is_terminal,
+            "isReactivationTarget": entry.value.is_reactivation_target,
         },
         "updatedAt": crate::models::dt_to_string(entry.updated_at),
         // Phase E / E5-T1：active_versions 灰度字段。
@@ -393,6 +413,9 @@ mod tests {
         assert_eq!(value["value"]["displayName"], "首次接触");
         assert_eq!(value["value"]["aliases"], json!(["new_lead"]));
         assert_eq!(value["value"]["status"], "active");
+        assert_eq!(value["value"]["priorityWeight"], Value::Null);
+        assert_eq!(value["value"]["isTerminal"], false);
+        assert_eq!(value["value"]["isReactivationTarget"], false);
     }
 
     /// W3 / Task 4.8：默认列表过滤 `include_deprecated=false` 不显式给出时
@@ -437,8 +460,7 @@ mod tests {
 
     /// 契约快照:taxonomy_entry_json。TaxonomyEntry 9 字段 + TaxonomyValue 8 字段全量构造
     /// (previous_version/seeded_by/priority_weight 三个 Option 给 Some);id→hex;
-    /// updated_at→RFC3339。顶层 9 键,value 是嵌套对象(6 子键,内部形状由快照固定不进对账)。
-    /// TaxonomyValue 的 priority_weight/is_terminal/is_reactivation_target 投影不下发,但须赋值。
+    /// updated_at→RFC3339。顶层 9 键；value 完整投影可编辑与运行时消费字段。
     #[test]
     fn taxonomy_entry_json_matches_contract_fixture() {
         use mongodb::bson::{oid::ObjectId, DateTime};

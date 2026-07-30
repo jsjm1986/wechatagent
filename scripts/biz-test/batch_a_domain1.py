@@ -24,7 +24,7 @@ def main() -> None:
     t0 = time.time()
     preview = _lib.api_bg(
         "POST", "/api/operation-knowledge/import-preview",
-        {"sourceName": "biztest_edu_article", "content": content},
+        {"accountId": account_id, "sourceName": "biztest_edu_article", "content": content},
         admin=True, max_wait=720, tag="import",
     )
     print(f"  耗时 {time.time()-t0:.1f}s")
@@ -54,12 +54,17 @@ def main() -> None:
                 "文章含'保证学会/包教包会/全市第一'等夸大,应进 forbiddenClaims")
 
     # import-apply 落库 → 验红线：全 needs_review
-    doc = preview.get("document", {})
     print(f"[{DOMAIN}] import-apply 落库...")
     applied = _lib.api(
         "POST", "/api/operation-knowledge/import-apply",
-        {"accountId": account_id, "sourceName": "biztest_edu_article",
-         "document": doc, "items": items, "chunks": chunks},
+        {
+            "previewId": preview.get("previewId"),
+            "previewHash": preview.get("previewHash"),
+            "chunks": [
+                {"candidateId": chunk.get("candidateId"), "patch": {}}
+                for chunk in chunks
+            ],
+        },
         admin=True, timeout=120,
     )
     print(f"  applied={str(applied)[:200]}")

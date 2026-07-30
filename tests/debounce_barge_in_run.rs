@@ -128,6 +128,7 @@ fn review_agent_pass_json(review_summary: &str) -> serde_json::Value {
             "relationshipProgress": 7,
             "conversionReadiness": 6,
             "pressureRisk": 2,
+            "boundaryPrivacySafety": 9,
             "factRisk": 1,
         },
         "claimAnalysis": {
@@ -178,12 +179,14 @@ async fn barge_in_aborts_before_outbox_and_does_not_advance_last_run() {
 
     // 决策 + 审查都成功——本就会走到落盘 / 入队，正好被 guard 在检查点拦下。
     app.llm.push_response(reply_agent_decision_json(
-        "我们一般 2~4 周可上线，预算和场景深度相关，要不要先按你们的优先级排排序？",
+        "理解，你们同时在看周期和预算。我们先按最重要的场景排一下，再一起把范围收敛？",
         "客户主动询问实施周期与预算，回复能确认需求颗粒度并降低决策摩擦，是关键推进时机。",
     ));
     app.llm.push_response(review_agent_pass_json(
         "回复语气良好、不越界承诺，可放行——但本测试用 guard 模拟期间到达更新入站。",
     ));
+    app.llm
+        .push_response(common::independent_claim_gate_pass_json());
 
     // guard 恒 true：模拟"这次生成期间用户又发了新消息"。
     let guard: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(|| true);
@@ -270,12 +273,13 @@ async fn no_barge_in_completes_normally_and_enqueues_outbox() {
         .expect("insert inbound message");
 
     app.llm.push_response(reply_agent_decision_json(
-        "我们一般 2~4 周可上线，预算和场景深度相关，要不要先按你们的优先级排排序？",
+        "理解，你们同时在看周期和预算。我们先按最重要的场景排一下，再一起把范围收敛？",
         "客户主动询问实施周期与预算，回复能确认需求颗粒度并降低决策摩擦，是关键推进时机。",
     ));
-    app.llm.push_response(review_agent_pass_json(
-        "回复语气良好、不越界承诺，可放行。",
-    ));
+    app.llm
+        .push_response(review_agent_pass_json("回复语气良好、不越界承诺，可放行。"));
+    app.llm
+        .push_response(common::independent_claim_gate_pass_json());
 
     // guard 恒 false：去抖窗口已结束、无更新入站，正常发送。
     let called = Arc::new(AtomicBool::new(false));

@@ -7,8 +7,8 @@
 //!     body: `{ canonicalValue: { id, label, aliases? } }`
 //!     行为：
 //!       1. 读 candidate（必须 `status=pending`）。
-//!       2. 写 `system_taxonomies`：以 `(scope, kind, canonicalValue.id)` 为唯一键
-//!          插入条目；若已存在（11000）合并别名后视为成功。
+//!       2. 写 `system_taxonomies`：新 canonical 新建版本；已有 current canonical
+//!          则继承其运行字段，合并候选原值/请求 aliases，并追加 current 版本。
 //!       3. 改 candidate `status="approved"`、`reviewed_at=now`。
 //!       4. `invalidate_global_taxonomy_cache`。
 //!     三步在同一 MongoDB transaction 中完成；并发 approve/reject 只有一个能从
@@ -21,7 +21,6 @@
 
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
     response::{IntoResponse, Response},
     Extension, Json,
 };
@@ -55,9 +54,6 @@ pub(super) struct ListCandidatesQuery {
 #[serde(rename_all = "camelCase")]
 pub(super) struct ApproveCandidateRequest {
     canonical_value: ApproveCanonicalValue,
-    /// 可选：操作人标识（一般是 admin email / id），落入 `reviewed_by`。
-    #[serde(default)]
-    reviewed_by: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -76,8 +72,6 @@ pub(super) struct ApproveCanonicalValue {
 #[serde(rename_all = "camelCase")]
 pub(super) struct RejectCandidateRequest {
     reason: String,
-    #[serde(default)]
-    reviewed_by: Option<String>,
 }
 
 pub(super) async fn list_taxonomy_candidates(
@@ -128,30 +122,21 @@ pub(super) async fn approve_taxonomy_candidate(
     Json(payload): Json<ApproveCandidateRequest>,
 ) -> Result<Response, AppError> {
     let object_id = parse_object_id(&id)?;
+    let actor = ReviewActor::from_admin(&admin)?;
     let outcome = approve_candidate_transaction(
         &state,
         &admin.current_workspace,
         object_id,
         None,
         &payload,
+        &actor,
     )
     .await?;
-    if outcome.duplicate {
-        return Ok((
-            StatusCode::CONFLICT,
-            Json(json!({
-                "error": "duplicate_taxonomy",
-                "message": format!(
-                    "(scope={}, kind={}, value.id={}) 已存在；候选已置为 approved",
-                    outcome.candidate.scope,
-                    outcome.candidate.kind,
-                    payload.canonical_value.id
-                )
-            })),
-        )
-            .into_response());
-    }
-    Ok(Json(json!({ "item": taxonomy_candidate_json(outcome.candidate) })).into_response())
+    Ok(Json(json!({
+        "item": taxonomy_candidate_json(outcome.candidate),
+        "mergedIntoExisting": outcome.merged_into_existing,
+    }))
+    .into_response())
 }
 
 pub(super) async fn reject_taxonomy_candidate(
@@ -165,6 +150,7 @@ pub(super) async fn reject_taxonomy_candidate(
     }
     let object_id = parse_object_id(&id)?;
     let candidates = state.db.collection_taxonomy_candidates();
+    let actor = ReviewActor::from_admin(&admin)?;
     let now = DateTime::now();
     let result = candidates
         .update_one(
@@ -177,7 +163,7 @@ pub(super) async fn reject_taxonomy_candidate(
                 "$set": {
                     "status": "rejected",
                     "reviewed_at": now,
-                    "reviewed_by": payload.reviewed_by.as_deref().unwrap_or("admin"),
+                    "reviewed_by": actor.as_str(),
                     // candidate 模型暂未声明 reason 字段（W0 占位）；以
                     // dynamic field 写入 BSON，仍然可被 mongo shell / UI 看到。
                     "rejection_reason": payload.reason.trim()
@@ -211,9 +197,9 @@ pub(in crate::routes) fn taxonomy_scope_allows(candidate_scope: &str, account_id
 
 /// approve_taxonomy_candidate 的管理 Agent 工具侧入口：在 REST 版本基础上**新增
 /// scope 校验**（管理者只能 approve global 或自己 account_id 的候选）。校验通过后
-/// 复用与 REST handler 完全相同的「写字典（幂等跳重复）→ mark approved →
-/// 刷新缓存」流程，返回结构化 `{"item": <candidate json>}`，重复 canonical value
-/// 时返 [`AppError::Conflict`]（管理 Agent 当 Err 处理）。
+/// 复用与 REST handler 完全相同的「新建 canonical 或并入已有 canonical alias →
+/// mark approved → 刷新缓存」事务，返回结构化 candidate 与
+/// `mergedIntoExisting`，已存在 canonical 是成功合并而不是冲突。
 ///
 /// 注：REST handler（无 Extension、无 account 来源）保持原样不加 scope 校验，
 /// 维持现状不回归——scope 校验只在工具侧（有可信 account_id）施加。
@@ -223,6 +209,7 @@ pub(in crate::routes) async fn approve_taxonomy_candidate_inner(
     account_id: &str,
     id: &str,
     payload: ApproveCandidateRequest,
+    actor: ReviewActor,
 ) -> AppResult<Value> {
     let object_id = parse_object_id(id)?;
     let outcome = approve_candidate_transaction(
@@ -231,22 +218,18 @@ pub(in crate::routes) async fn approve_taxonomy_candidate_inner(
         object_id,
         Some(account_id),
         &payload,
+        &actor,
     )
     .await?;
-    if outcome.duplicate {
-        return Err(AppError::Conflict(format!(
-            "duplicate_taxonomy: (scope={}, kind={}, value.id={}) 已存在；候选已置为 approved",
-            outcome.candidate.scope,
-            outcome.candidate.kind,
-            payload.canonical_value.id
-        )));
-    }
-    Ok(json!({ "item": taxonomy_candidate_json(outcome.candidate) }))
+    Ok(json!({
+        "item": taxonomy_candidate_json(outcome.candidate),
+        "mergedIntoExisting": outcome.merged_into_existing,
+    }))
 }
 
 struct ApproveOutcome {
     candidate: TaxonomyCandidate,
-    duplicate: bool,
+    merged_into_existing: bool,
 }
 
 async fn approve_candidate_transaction(
@@ -255,6 +238,7 @@ async fn approve_candidate_transaction(
     candidate_id: mongodb::bson::oid::ObjectId,
     authorized_account_id: Option<&str>,
     payload: &ApproveCandidateRequest,
+    actor: &ReviewActor,
 ) -> AppResult<ApproveOutcome> {
     if payload.canonical_value.id.trim().is_empty()
         || payload.canonical_value.label.trim().is_empty()
@@ -311,85 +295,121 @@ async fn approve_candidate_transaction(
             ));
         }
 
-        let mut aliases: Vec<String> = payload
-            .canonical_value
-            .aliases
-            .iter()
-            .map(|alias| alias.trim().to_string())
-            .filter(|alias| !alias.is_empty())
-            .collect();
-        let raw = candidate.raw_value.trim().to_string();
-        if !raw.is_empty()
-            && raw != payload.canonical_value.id.trim()
-            && !aliases.iter().any(|alias| alias == &raw)
-        {
-            aliases.push(raw);
-        }
+        let canonical_id = payload.canonical_value.id.trim();
+        let requested_aliases = normalized_aliases(
+            &[],
+            &payload.canonical_value.aliases,
+            &candidate.raw_value,
+            canonical_id,
+        );
         let taxonomies = state.db.collection_system_taxonomies();
         let taxonomy_scope = doc! {
             "workspace_id": workspace_id,
             "scope": &candidate.scope,
             "kind": &candidate.kind,
-            "value.id": payload.canonical_value.id.trim(),
+            "value.id": canonical_id,
         };
-        let current = taxonomies
-            .find_one_with_session(
+        let mut current_cursor = taxonomies
+            .find_with_session(
                 doc! {
                     "workspace_id": workspace_id,
                     "scope": &candidate.scope,
                     "kind": &candidate.kind,
-                    "value.id": payload.canonical_value.id.trim(),
+                    "value.id": canonical_id,
                     "current_version": true,
                 },
-                None,
+                FindOptions::builder().limit(2).build(),
                 &mut session,
             )
             .await?;
-        let latest = if current.is_none() {
-            taxonomies
-                .find_one_with_session(
-                    taxonomy_scope,
-                    FindOneOptions::builder()
-                        .sort(doc! { "version": -1_i32 })
-                        .build(),
-                    &mut session,
-                )
-                .await?
+        let mut current_rows = Vec::with_capacity(2);
+        while let Some(row) = current_cursor.next(&mut session).await.transpose()? {
+            current_rows.push(row);
+        }
+        if current_rows.len() > 1 {
+            return Err(AppError::Conflict(
+                "taxonomy_multiple_current_versions".to_string(),
+            ));
+        }
+        let current = current_rows.pop();
+        let latest = taxonomies
+            .find_one_with_session(
+                taxonomy_scope,
+                FindOneOptions::builder()
+                    .sort(doc! { "version": -1_i32 })
+                    .build(),
+                &mut session,
+            )
+            .await?;
+        let merged_into_existing = current.is_some();
+        let entry = if let Some(current) = current {
+            let aliases =
+                normalized_aliases(&current.value.aliases, &requested_aliases, "", canonical_id);
+            if aliases == current.value.aliases {
+                None
+            } else {
+                let next_version = next_taxonomy_version(latest.as_ref())?;
+                let previous_version = current.version;
+                let current_id = current.id.ok_or_else(|| {
+                    AppError::External("current taxonomy missing _id".to_string())
+                })?;
+                let retired = taxonomies
+                    .update_one_with_session(
+                        doc! {
+                            "_id": current_id,
+                            "workspace_id": workspace_id,
+                            "version": current.version,
+                            "current_version": true,
+                        },
+                        doc! { "$set": { "current_version": false } },
+                        None,
+                        &mut session,
+                    )
+                    .await?;
+                if retired.modified_count != 1 {
+                    return Err(AppError::Conflict(
+                        "taxonomy_current_version_changed".to_string(),
+                    ));
+                }
+                let mut next = current;
+                next.id = None;
+                next.value.aliases = aliases;
+                next.updated_at = now;
+                next.version = next_version;
+                next.current_version = true;
+                next.previous_version = Some(previous_version);
+                next.seeded_by = Some("manual".to_string());
+                Some(next)
+            }
         } else {
-            None
+            let next_version = next_taxonomy_version(latest.as_ref())?;
+            Some(TaxonomyEntry {
+                id: None,
+                workspace_id: candidate.workspace_id.clone(),
+                scope: candidate.scope.clone(),
+                kind: candidate.kind.clone(),
+                value: TaxonomyValue {
+                    id: canonical_id.to_string(),
+                    display_name: payload.canonical_value.label.trim().to_string(),
+                    description: payload
+                        .canonical_value
+                        .description
+                        .clone()
+                        .unwrap_or_else(|| candidate.evidence.clone().unwrap_or_default()),
+                    aliases: requested_aliases,
+                    status: "active".to_string(),
+                    priority_weight: None,
+                    is_terminal: false,
+                    is_reactivation_target: false,
+                },
+                updated_at: now,
+                version: next_version,
+                current_version: true,
+                previous_version: latest.as_ref().map(|entry| entry.version),
+                seeded_by: Some("manual".to_string()),
+            })
         };
-        let duplicate = current.is_some();
-        let next_version = latest
-            .as_ref()
-            .map(|entry| entry.version.saturating_add(1))
-            .unwrap_or(1);
-        let previous_version = latest.as_ref().map(|entry| entry.version);
-        let entry = TaxonomyEntry {
-            id: None,
-            workspace_id: candidate.workspace_id.clone(),
-            scope: candidate.scope.clone(),
-            kind: candidate.kind.clone(),
-            value: TaxonomyValue {
-                id: payload.canonical_value.id.trim().to_string(),
-                display_name: payload.canonical_value.label.trim().to_string(),
-                description: payload
-                    .canonical_value
-                    .description
-                    .clone()
-                    .unwrap_or_else(|| candidate.evidence.clone().unwrap_or_default()),
-                aliases,
-                status: "active".to_string(),
-                priority_weight: None,
-                is_terminal: false,
-                is_reactivation_target: false,
-            },
-            updated_at: now,
-            version: next_version,
-            current_version: true,
-            previous_version,
-            seeded_by: Some("manual".to_string()),
-        };
-        if !duplicate {
+        if let Some(entry) = entry {
             taxonomies
                 .insert_one_with_session(&entry, None, &mut session)
                 .await?;
@@ -406,7 +426,7 @@ async fn approve_candidate_transaction(
                     "$set": {
                         "status": "approved",
                         "reviewed_at": now,
-                        "reviewed_by": payload.reviewed_by.as_deref().unwrap_or("admin"),
+                        "reviewed_by": actor.as_str(),
                     }
                 },
                 None,
@@ -421,35 +441,76 @@ async fn approve_candidate_transaction(
         let mut updated = candidate;
         updated.status = "approved".to_string();
         updated.reviewed_at = Some(now);
-        updated.reviewed_by = Some(
-            payload
-                .reviewed_by
-                .clone()
-                .unwrap_or_else(|| "admin".to_string()),
-        );
-        Ok((updated, duplicate))
+        updated.reviewed_by = Some(actor.as_str().to_string());
+        Ok((updated, merged_into_existing))
     }
     .await;
 
-    let (candidate, duplicate) = match transaction_result {
+    let (candidate, merged_into_existing) = match transaction_result {
         Ok(outcome) => outcome,
         Err(error) => {
             let _ = session.abort_transaction().await;
-            return Err(error);
+            return Err(match error {
+                AppError::Db(ref db_error)
+                    if super::admin_taxonomies::is_duplicate_key_error(db_error) =>
+                {
+                    AppError::Conflict("taxonomy_identity_claim_conflict".to_string())
+                }
+                other => other,
+            });
         }
     };
     loop {
         match session.commit_transaction().await {
             Ok(()) => break,
             Err(error) if error.contains_label("UnknownTransactionCommitResult") => continue,
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                return Err(if super::admin_taxonomies::is_duplicate_key_error(&error) {
+                    AppError::Conflict("taxonomy_identity_claim_conflict".to_string())
+                } else {
+                    error.into()
+                })
+            }
         }
     }
-    invalidate_global_taxonomy_cache();
+    invalidate_global_taxonomy_cache(&state.db);
     Ok(ApproveOutcome {
         candidate,
-        duplicate,
+        merged_into_existing,
     })
+}
+
+fn next_taxonomy_version(latest: Option<&TaxonomyEntry>) -> AppResult<i32> {
+    match latest {
+        Some(entry) => entry
+            .version
+            .checked_add(1)
+            .ok_or_else(|| AppError::External("taxonomy version overflow".to_string())),
+        None => Ok(1),
+    }
+}
+
+fn normalized_aliases(
+    existing: &[String],
+    requested: &[String],
+    raw_value: &str,
+    canonical_id: &str,
+) -> Vec<String> {
+    let canonical_id = canonical_id.trim();
+    let mut aliases = Vec::new();
+    for value in existing
+        .iter()
+        .map(String::as_str)
+        .chain(requested.iter().map(String::as_str))
+        .chain(std::iter::once(raw_value))
+    {
+        let value = value.trim();
+        if value.is_empty() || value == canonical_id || aliases.iter().any(|alias| alias == value) {
+            continue;
+        }
+        aliases.push(value.to_string());
+    }
+    aliases
 }
 
 pub(super) fn taxonomy_candidate_json(item: TaxonomyCandidate) -> Value {
@@ -539,6 +600,51 @@ mod tests {
         assert_eq!(req.canonical_value.id, "price_objection");
         assert_eq!(req.canonical_value.label, "价格异议");
         assert!(req.canonical_value.aliases.is_empty());
+    }
+
+    #[test]
+    fn alias_merge_is_trimmed_stable_and_excludes_canonical_id() {
+        assert_eq!(
+            normalized_aliases(
+                &["existing".to_string(), " padded ".to_string()],
+                &[
+                    "existing".to_string(),
+                    "new-alias".to_string(),
+                    "canonical".to_string(),
+                ],
+                " raw-value ",
+                "canonical",
+            ),
+            vec!["existing", "padded", "new-alias", "raw-value"]
+        );
+    }
+
+    #[test]
+    fn next_version_uses_history_max_and_rejects_overflow() {
+        let mut latest = TaxonomyEntry {
+            id: None,
+            workspace_id: "ws".to_string(),
+            scope: "global".to_string(),
+            kind: "kind".to_string(),
+            value: TaxonomyValue {
+                id: "value".to_string(),
+                display_name: "Value".to_string(),
+                description: String::new(),
+                aliases: Vec::new(),
+                status: "active".to_string(),
+                priority_weight: None,
+                is_terminal: false,
+                is_reactivation_target: false,
+            },
+            updated_at: DateTime::now(),
+            version: 7,
+            current_version: false,
+            previous_version: None,
+            seeded_by: None,
+        };
+        assert_eq!(next_taxonomy_version(Some(&latest)).unwrap(), 8);
+        latest.version = i32::MAX;
+        assert!(next_taxonomy_version(Some(&latest)).is_err());
     }
 
     /// W3 / Task 4.8：reject 请求要求 `reason` 字段（serde 默认 missing 报错）。

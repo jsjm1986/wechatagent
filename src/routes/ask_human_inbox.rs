@@ -73,10 +73,7 @@ fn non_empty(s: &str) -> Option<String> {
 
 /// 单条请示 → InboxItem（具名以便单测）。保留富字段
 /// category/question_for_principal/contact_wxid/principal_wxid，避免决策人盲裁。
-fn escalation_to_inbox_item(
-    e: &crate::models::AgentPrincipalEscalation,
-    now_ms: i64,
-) -> InboxItem {
+fn escalation_to_inbox_item(e: &crate::models::AgentPrincipalEscalation, now_ms: i64) -> InboxItem {
     InboxItem {
         source: "principal_escalation".into(),
         id: e.short_code.clone(),
@@ -102,11 +99,7 @@ fn escalation_to_inbox_item(
 }
 
 /// 请示通道 pending → InboxItem（inline）。
-async fn collect_escalations(
-    state: &AppState,
-    ws: &str,
-    now_ms: i64,
-) -> AppResult<Vec<InboxItem>> {
+async fn collect_escalations(state: &AppState, ws: &str, now_ms: i64) -> AppResult<Vec<InboxItem>> {
     let items =
         crate::agent::escalation::list_escalations_by_workspace(state, ws, "pending").await?;
     Ok(items
@@ -146,7 +139,13 @@ async fn collect_knowledge_review(
                 source: "knowledge_review".into(),
                 id: id.clone(),
                 title: c.title.clone(),
-                summary: c.body.clone().unwrap_or_default().chars().take(80).collect(),
+                summary: c
+                    .body
+                    .clone()
+                    .unwrap_or_default()
+                    .chars()
+                    .take(80)
+                    .collect(),
                 severity: "medium".into(),
                 created_at: None,
                 age_hours: 0.0,
@@ -196,10 +195,9 @@ fn taxonomy_candidate_to_inbox_item(
         // 人话标题：以 AI 新识别的取值为主语，不暴露裸维度键（维度中文名前端补）。
         title: format!("AI 新识别标签：{}", c.raw_value),
         // 折叠预览：优先 evidence，无则通用框定。
-        summary: c
-            .evidence
-            .clone()
-            .unwrap_or_else(|| "AI 在对话中识别到一个尚未收录的取值，请确认是否纳入标签字典".into()),
+        summary: c.evidence.clone().unwrap_or_else(|| {
+            "AI 在对话中识别到一个尚未收录的取值，请确认是否纳入标签字典".into()
+        }),
         severity: "low".into(),
         created_at: Some(c.last_seen_at),
         age_hours: age_hours_of(Some(c.last_seen_at), now_ms),
@@ -274,7 +272,10 @@ async fn collect_relationship_suggestions(
                 source: "relationship_suggestion".into(),
                 id,
                 title: format!("关系类型建议：{}", r.suggested_value),
-                summary: r.evidence.clone().unwrap_or_else(|| r.suggested_value.clone()),
+                summary: r
+                    .evidence
+                    .clone()
+                    .unwrap_or_else(|| r.suggested_value.clone()),
                 severity: "low".into(),
                 created_at: Some(r.last_seen_at),
                 age_hours: age_hours_of(Some(r.last_seen_at), now_ms),
@@ -293,6 +294,75 @@ async fn collect_relationship_suggestions(
                 integrity_status: None,
             }
         })
+        .collect())
+}
+
+/// 疑似成交 pending → rich。审批需要可选金额/币种和必填驳回原因，不能复用
+/// 空 body 的通用通过/拒绝按钮，因此由专用卡片处置。
+fn suspected_deal_to_inbox_item(
+    signal: &crate::models::SuspectedDealSignal,
+    now_ms: i64,
+) -> InboxItem {
+    let id = signal.id.map(|value| value.to_hex()).unwrap_or_default();
+    let mut params = doc! {
+        "signalId": id.clone(),
+        "accountId": signal.account_id.clone(),
+        "contactId": signal.contact_id.clone(),
+        "value": signal.value.clone(),
+        "confidence": signal.confidence,
+        "occurrences": signal.occurrences,
+    };
+    if let Some(evidence) = &signal.evidence {
+        params.insert("evidence", evidence.clone());
+    }
+    InboxItem {
+        source: "suspected_deal".into(),
+        id,
+        title: signal.value.clone(),
+        summary: signal
+            .evidence
+            .clone()
+            .unwrap_or_else(|| "AI 识别到疑似成交信号，请运营核实后再登记成交".into()),
+        severity: "high".into(),
+        created_at: Some(signal.first_seen_at),
+        age_hours: age_hours_of(Some(signal.first_seen_at), now_ms),
+        action_kind: "rich".into(),
+        rich_component: Some("suspectedDealReview".into()),
+        rich_params: Some(params),
+        category: None,
+        question_for_principal: None,
+        contact_wxid: non_empty(&signal.contact_id),
+        principal_wxid: None,
+        evidence: signal.evidence.clone(),
+        confidence: Some(signal.confidence),
+        occurrences: Some(signal.occurrences),
+        kind: None,
+        signal_severity: None,
+        integrity_status: None,
+    }
+}
+
+async fn collect_suspected_deals(
+    state: &AppState,
+    ws: &str,
+    now_ms: i64,
+) -> AppResult<Vec<InboxItem>> {
+    use futures::TryStreamExt;
+    let cursor = state
+        .db
+        .collection_suspected_deal_signals()
+        .find(
+            doc! { "workspace_id": ws, "status": "pending" },
+            mongodb::options::FindOptions::builder()
+                .sort(doc! { "last_seen_at": -1 })
+                .limit(100)
+                .build(),
+        )
+        .await?;
+    let rows: Vec<crate::models::SuspectedDealSignal> = cursor.try_collect().await?;
+    Ok(rows
+        .into_iter()
+        .map(|signal| suspected_deal_to_inbox_item(&signal, now_ms))
         .collect())
 }
 
@@ -325,11 +395,7 @@ fn gap_to_inbox_item(g: &crate::models::KnowledgeGapSignal, now_ms: i64) -> Inbo
 }
 
 /// 知识缺口信号 pending → inline。
-async fn collect_gap_signals(
-    state: &AppState,
-    ws: &str,
-    now_ms: i64,
-) -> AppResult<Vec<InboxItem>> {
+async fn collect_gap_signals(state: &AppState, ws: &str, now_ms: i64) -> AppResult<Vec<InboxItem>> {
     use futures::TryStreamExt;
     let cursor = state
         .db
@@ -346,7 +412,20 @@ async fn collect_gap_signals(
         .collect())
 }
 
-/// profile 待激活草稿(current_version=true && is_active=false) → rich。
+fn reviewable_profile_filter(workspace_id: &str) -> Document {
+    doc! {
+        "workspace_id": workspace_id,
+        "is_active": false,
+        "$or": [
+            { "release_status": "draft" },
+            { "release_status": "published", "current_version": true },
+        ],
+    }
+}
+
+/// Unpublished drafts and published-current rows waiting for activation both
+/// belong to the existing rich review card. Historical published rows remain
+/// excluded.
 async fn collect_profile_drafts(
     state: &AppState,
     ws: &str,
@@ -357,7 +436,7 @@ async fn collect_profile_drafts(
         .db
         .domain_profiles()
         .find(
-            doc! { "workspace_id": ws, "current_version": true, "is_active": false },
+            reviewable_profile_filter(ws),
             mongodb::options::FindOptions::builder().limit(50).build(),
         )
         .await?;
@@ -366,11 +445,20 @@ async fn collect_profile_drafts(
         .into_iter()
         .map(|p| {
             let id = p.id.map(|o| o.to_hex()).unwrap_or_default();
+            let is_draft = p.release_status == "draft";
             InboxItem {
                 source: "profile_risky".into(),
                 id: id.clone(),
-                title: format!("待激活画像：{}", p.display_name),
-                summary: "AI 生成的运营画像草稿待人审激活".into(),
+                title: format!(
+                    "{}画像：{}",
+                    if is_draft { "待发布" } else { "待激活" },
+                    p.display_name
+                ),
+                summary: if is_draft {
+                    "行业画像草稿待人审发布".into()
+                } else {
+                    "已发布行业画像待人审激活".into()
+                },
                 severity: "high".into(),
                 created_at: Some(p.created_at),
                 age_hours: age_hours_of(Some(p.created_at), now_ms),
@@ -517,14 +605,36 @@ pub async fn ask_human_inbox(
         };
     }
 
-    collect_source!("principal_escalation", collect_escalations(&state, ws, now_ms));
-    collect_source!("knowledge_review", collect_knowledge_review(&state, ws, now_ms));
-    collect_source!("taxonomy_candidate", collect_taxonomy_candidates(&state, ws, now_ms));
-    collect_source!("relationship_suggestion", collect_relationship_suggestions(&state, ws, now_ms));
+    collect_source!(
+        "principal_escalation",
+        collect_escalations(&state, ws, now_ms)
+    );
+    collect_source!(
+        "knowledge_review",
+        collect_knowledge_review(&state, ws, now_ms)
+    );
+    collect_source!(
+        "taxonomy_candidate",
+        collect_taxonomy_candidates(&state, ws, now_ms)
+    );
+    collect_source!(
+        "relationship_suggestion",
+        collect_relationship_suggestions(&state, ws, now_ms)
+    );
+    collect_source!(
+        "suspected_deal",
+        collect_suspected_deals(&state, ws, now_ms)
+    );
     collect_source!("gap_signal", collect_gap_signals(&state, ws, now_ms));
     collect_source!("profile_risky", collect_profile_drafts(&state, ws, now_ms));
-    collect_source!("evolution_proposal", collect_evolution_proposals(&state, ws, now_ms));
-    collect_source!("lessons_learned", collect_lessons_learned(&state, ws, now_ms));
+    collect_source!(
+        "evolution_proposal",
+        collect_evolution_proposals(&state, ws, now_ms)
+    );
+    collect_source!(
+        "lessons_learned",
+        collect_lessons_learned(&state, ws, now_ms)
+    );
 
     Ok(Json(json!({ "items": items, "errors": errors })))
 }
@@ -535,71 +645,145 @@ pub async fn ask_human_summary(
     Extension(admin): Extension<AuthenticatedAdmin>,
 ) -> AppResult<Json<Value>> {
     let ws = &admin.current_workspace;
-    let escalations = state
-        .db
-        .agent_principal_escalations()
-        .count_documents(doc! { "workspace_id": ws, "status": "pending" }, None)
-        .await
-        .unwrap_or(0);
-    let knowledge = state
-        .db
-        .operation_knowledge_chunks()
-        .count_documents(doc! { "workspace_id": ws, "integrity_status": { "$in": knowledge_review_statuses().to_vec() } }, None)
-        .await
-        .unwrap_or(0);
-    let taxonomy_candidate = state
-        .db
-        .collection_taxonomy_candidates()
-        .count_documents(pending_global_taxonomy_filter(ws), None)
-        .await
-        .unwrap_or(0);
-    let relationship_suggestion = state
-        .db
-        .collection_relationship_type_suggestions()
-        .count_documents(doc! { "workspace_id": ws, "status": "pending" }, None)
-        .await
-        .unwrap_or(0);
-    let gap_signal = state
-        .db
-        .knowledge_gap_signals()
-        .count_documents(doc! { "workspace_id": ws, "status": "pending" }, None)
-        .await
-        .unwrap_or(0);
-    let profile_risky = state
-        .db
-        .domain_profiles()
-        .count_documents(
-            doc! { "workspace_id": ws, "current_version": true, "is_active": false },
+    let escalations_collection = state.db.agent_principal_escalations();
+    let knowledge_collection = state.db.operation_knowledge_chunks();
+    let taxonomy_collection = state.db.collection_taxonomy_candidates();
+    let relationship_collection = state.db.collection_relationship_type_suggestions();
+    let suspected_deal_collection = state.db.collection_suspected_deal_signals();
+    let gap_collection = state.db.knowledge_gap_signals();
+    let profile_collection = state.db.domain_profiles();
+    let proposal_collection = state.db.proposals();
+    let lessons_collection = state.db.raw().collection::<Document>("lessons_learned");
+    let (
+        escalations,
+        knowledge,
+        taxonomy_candidate,
+        relationship_suggestion,
+        suspected_deal,
+        gap_signal,
+        profile_risky,
+        evolution_proposal,
+        lessons_learned,
+    ) = tokio::join!(
+        escalations_collection
+            .count_documents(doc! { "workspace_id": ws, "status": "pending" }, None),
+        knowledge_collection.count_documents(
+            doc! { "workspace_id": ws, "integrity_status": { "$in": knowledge_review_statuses().to_vec() } },
             None,
-        )
-        .await
-        .unwrap_or(0);
-    let evolution_proposal = state
-        .db
-        .proposals()
-        .count_documents(doc! { "workspace_id": ws, "status": "eligible_for_release" }, None)
-        .await
-        .unwrap_or(0);
-    let lessons_learned = state
-        .db
-        .raw()
-        .collection::<Document>("lessons_learned")
-        .count_documents(
-            doc! { "workspace_id": ws, "review_status": "pending_review" },
+        ),
+        taxonomy_collection
+            .count_documents(pending_global_taxonomy_filter(ws), None),
+        relationship_collection
+            .count_documents(doc! { "workspace_id": ws, "status": "pending" }, None),
+        suspected_deal_collection
+            .count_documents(doc! { "workspace_id": ws, "status": "pending" }, None),
+        gap_collection
+            .count_documents(doc! { "workspace_id": ws, "status": "pending" }, None),
+        profile_collection.count_documents(reviewable_profile_filter(ws), None),
+        proposal_collection.count_documents(
+            doc! { "workspace_id": ws, "status": "eligible_for_release" },
             None,
-        )
-        .await
-        .unwrap_or(0);
-    Ok(Json(json!({
-        "principalEscalation": escalations,
-        "knowledgeReview": knowledge,
-        "taxonomyCandidate": taxonomy_candidate,
-        "relationshipSuggestion": relationship_suggestion,
-        "gapSignal": gap_signal,
-        "profileRisky": profile_risky,
-        "evolutionProposal": evolution_proposal,
-        "lessonsLearned": lessons_learned,
-    })))
+        ),
+        lessons_collection
+            .count_documents(
+                doc! { "workspace_id": ws, "review_status": "pending_review" },
+                None,
+            ),
+    );
+
+    let mut counts = Vec::with_capacity(9);
+    macro_rules! record_count {
+        ($key:literal, $source:literal, $result:expr) => {
+            counts.push((
+                $key,
+                $source,
+                $result.map_err(|error| {
+                    tracing::warn!(
+                        source = $source,
+                        error = %error,
+                        "ask-human summary count unavailable"
+                    );
+                    "count unavailable".to_string()
+                }),
+            ));
+        };
+    }
+    record_count!("principalEscalation", "principal_escalation", escalations);
+    record_count!("knowledgeReview", "knowledge_review", knowledge);
+    record_count!(
+        "taxonomyCandidate",
+        "taxonomy_candidate",
+        taxonomy_candidate
+    );
+    record_count!(
+        "relationshipSuggestion",
+        "relationship_suggestion",
+        relationship_suggestion
+    );
+    record_count!("suspectedDeal", "suspected_deal", suspected_deal);
+    record_count!("gapSignal", "gap_signal", gap_signal);
+    record_count!("profileRisky", "profile_risky", profile_risky);
+    record_count!(
+        "evolutionProposal",
+        "evolution_proposal",
+        evolution_proposal
+    );
+    record_count!("lessonsLearned", "lessons_learned", lessons_learned);
+
+    Ok(Json(build_summary_response(counts, DateTime::now())))
+}
+
+fn build_summary_response(
+    results: Vec<(&'static str, &'static str, Result<u64, String>)>,
+    as_of: DateTime,
+) -> Value {
+    let source_count = results.len();
+    let mut counts = serde_json::Map::new();
+    let mut legacy = serde_json::Map::new();
+    let mut errors = Vec::new();
+    let mut total = 0u64;
+
+    for (key, source, result) in results {
+        let value = match result {
+            Ok(count) => {
+                total = total.saturating_add(count);
+                json!(count)
+            }
+            Err(error) => {
+                errors.push(json!({ "source": source, "error": error }));
+                Value::Null
+            }
+        };
+        counts.insert(key.to_string(), value.clone());
+        legacy.insert(key.to_string(), value);
+    }
+
+    let status = match errors.len() {
+        0 => "complete",
+        failed if failed == source_count => "error",
+        _ => "partial",
+    };
+    let mut response = serde_json::Map::new();
+    response.insert("status".into(), json!(status));
+    response.insert(
+        "asOf".into(),
+        crate::models::dt_to_string(as_of)
+            .map(Value::String)
+            .unwrap_or(Value::Null),
+    );
+    response.insert("counts".into(), Value::Object(counts));
+    response.insert("errors".into(), Value::Array(errors));
+    response.insert(
+        "total".into(),
+        if status == "complete" {
+            json!(total)
+        } else {
+            Value::Null
+        },
+    );
+    // Compatibility for clients that still read the original top-level keys.
+    response.extend(legacy);
+    Value::Object(response)
 }
 
 #[cfg(test)]
@@ -620,6 +804,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn reviewable_profile_filter_includes_drafts_and_pending_activation_only() {
+        assert_eq!(
+            reviewable_profile_filter("ws-a"),
+            doc! {
+                "workspace_id": "ws-a",
+                "is_active": false,
+                "$or": [
+                    { "release_status": "draft" },
+                    { "release_status": "published", "current_version": true },
+                ],
+            }
+        );
+    }
+
     fn test_escalation_fixture() -> AgentPrincipalEscalation {
         let now = DateTime::now();
         AgentPrincipalEscalation {
@@ -633,6 +832,7 @@ mod tests {
             reason: "客户想要折扣，超出 AI 职权".into(),
             question_for_principal: "能否给折扣".into(),
             principal_wxid: "wxid_boss".into(),
+            protocol: None,
             decision: None,
             authorization_expires_at: None,
             is_generalizable: false,
@@ -643,6 +843,11 @@ mod tests {
             updated_at: now,
             resolved_at: None,
             resolved_via: None,
+            relay_state: None,
+            relay_task_id: None,
+            relay_enqueued_at: None,
+            relay_terminal_at: None,
+            relay_terminal_reason: None,
         }
     }
 
@@ -750,9 +955,16 @@ mod tests {
         // id=None 时 hex 落空串；本测聚焦 rich 分类与富字段，用 None 固定路径。
         let item = taxonomy_candidate_to_inbox_item(&c, 0);
         assert_eq!(item.action_kind, "rich");
-        assert_eq!(item.rich_component.as_deref(), Some("taxonomyCandidateReview"));
+        assert_eq!(
+            item.rich_component.as_deref(),
+            Some("taxonomyCandidateReview")
+        );
         // title 不再以裸维度键作主语（回归防护：不得再出现 "标签候选：emotional_state"）。
-        assert!(!item.title.contains("emotional_state"), "title 不应暴露裸维度键: {}", item.title);
+        assert!(
+            !item.title.contains("emotional_state"),
+            "title 不应暴露裸维度键: {}",
+            item.title
+        );
         // 顶层富字段与 relationship_suggestion 对称接出。
         assert_eq!(item.evidence.as_deref(), Some("客户连续两条消息表达担心"));
         assert_eq!(item.confidence, Some(7));
@@ -767,7 +979,10 @@ mod tests {
         assert_eq!(params.get_str("scope").unwrap(), "global");
         assert_eq!(params.get_str("kind").unwrap(), "emotional_state");
         assert_eq!(params.get_str("rawValue").unwrap(), "anxious");
-        assert_eq!(params.get_str("evidence").unwrap(), "客户连续两条消息表达担心");
+        assert_eq!(
+            params.get_str("evidence").unwrap(),
+            "客户连续两条消息表达担心"
+        );
         assert_eq!(params.get_i32("confidence").unwrap(), 7);
         assert_eq!(params.get_i32("occurrences").unwrap(), 3);
         assert_eq!(params.get_str("suggestedDisplayName").unwrap(), "焦虑");
@@ -801,11 +1016,68 @@ mod tests {
     }
 
     #[test]
+    fn suspected_deal_projects_to_dedicated_rich_review() {
+        let now = DateTime::from_millis(1_700_000_000_000);
+        let signal = crate::models::SuspectedDealSignal {
+            id: Some(mongodb::bson::oid::ObjectId::new()),
+            workspace_id: "ws1".into(),
+            account_id: "acc1".into(),
+            contact_id: "contact1".into(),
+            value: "疑似成交·待核实".into(),
+            evidence: Some("客户明确表示准备付款".into()),
+            confidence: 86,
+            status: "pending".into(),
+            occurrences: 2,
+            first_seen_at: now,
+            last_seen_at: now,
+            reviewed_at: None,
+            reviewed_by: None,
+        };
+
+        let item = suspected_deal_to_inbox_item(&signal, now.timestamp_millis());
+        assert_eq!(item.source, "suspected_deal");
+        assert_eq!(item.action_kind, "rich");
+        assert_eq!(item.rich_component.as_deref(), Some("suspectedDealReview"));
+        assert_eq!(item.contact_wxid.as_deref(), Some("contact1"));
+        assert_eq!(item.evidence.as_deref(), Some("客户明确表示准备付款"));
+        assert_eq!(item.confidence, Some(86));
+        assert_eq!(item.occurrences, Some(2));
+        let params = item.rich_params.expect("dedicated review params");
+        assert_eq!(params.get_str("accountId").unwrap(), "acc1");
+        assert_eq!(params.get_str("contactId").unwrap(), "contact1");
+        assert_eq!(params.get_i32("confidence").unwrap(), 86);
+    }
+
+    #[test]
     fn knowledge_review_statuses_includes_needs_human_audit() {
         // KB-08 病根锚死：审核收件箱必须同时认 needs_human_audit,
         // 否则 auto_verify 分诊出的切片从收件箱消失(黑洞)。防回退成只查 needs_review。
         let s = knowledge_review_statuses();
         assert!(s.contains(&"needs_review"), "必须含 needs_review");
-        assert!(s.contains(&"needs_human_audit"), "必须含 needs_human_audit(KB-08 黑洞根因)");
+        assert!(
+            s.contains(&"needs_human_audit"),
+            "必须含 needs_human_audit(KB-08 黑洞根因)"
+        );
+    }
+
+    #[test]
+    fn summary_partial_failure_is_null_not_zero() {
+        let value = build_summary_response(
+            vec![
+                ("principalEscalation", "principal_escalation", Ok(2)),
+                (
+                    "knowledgeReview",
+                    "knowledge_review",
+                    Err("count unavailable".to_string()),
+                ),
+            ],
+            DateTime::from_millis(1_700_000_000_000),
+        );
+        assert_eq!(value["status"], "partial");
+        assert_eq!(value["counts"]["principalEscalation"], 2);
+        assert!(value["counts"]["knowledgeReview"].is_null());
+        assert!(value["knowledgeReview"].is_null());
+        assert!(value["total"].is_null());
+        assert_eq!(value["errors"][0]["source"], "knowledge_review");
     }
 }

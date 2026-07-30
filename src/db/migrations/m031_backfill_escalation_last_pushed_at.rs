@@ -49,7 +49,10 @@ mod tests {
     fn filter_targets_missing_field_only() {
         let f = backfill_filter();
         let cond = f.get_document("last_pushed_at_ms").unwrap();
-        assert!(!cond.get_bool("$exists").unwrap(), "只命中 last_pushed_at_ms 缺失的行");
+        assert!(
+            !cond.get_bool("$exists").unwrap(),
+            "只命中 last_pushed_at_ms 缺失的行"
+        );
     }
 
     #[test]

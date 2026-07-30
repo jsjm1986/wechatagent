@@ -116,4 +116,24 @@ describe("AskView — F17 stale closure 误抑制错误横幅", () => {
     // 修复后：resetForSubmit 已同步清空 resultRef → 错误横幅必须出现。
     expect(screen.getByText(/流式连接错误/)).toBeTruthy();
   });
+
+  it("业务 failed 终态展示服务端通用文案并结束 pending", async () => {
+    render(<AskView />);
+    const textarea = screen.getByPlaceholderText(/向知识库提一个问题/);
+    fireEvent.change(textarea, { target: { value: "触发失败" } });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /提问/ }));
+    });
+
+    await act(async () => {
+      FakeESForF17.instances[0].emit("failed", {
+        code: "knowledge_agent_failed",
+        message: "知识问答暂时失败，请稍后重试。",
+      });
+    });
+
+    expect(screen.getByText("知识问答暂时失败，请稍后重试。")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "提问" })).toBeTruthy();
+    expect(FakeESForF17.instances[0].closed).toBe(true);
+  });
 });

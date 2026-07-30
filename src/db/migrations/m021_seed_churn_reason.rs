@@ -214,8 +214,8 @@ mod tests {
     /// → AI 输出的流失原因永远落不进 domain_attributes.churn_reason）。
     #[test]
     fn churn_reason_dimension_doc_deserializes_with_correct_field_names() {
-        let dim: ProfileDimension =
-            mongodb::bson::from_document(churn_reason_dimension_doc()).expect("doc 字段名须与 ProfileDimension serde 对齐");
+        let dim: ProfileDimension = mongodb::bson::from_document(churn_reason_dimension_doc())
+            .expect("doc 字段名须与 ProfileDimension serde 对齐");
         assert_eq!(dim.kind, CHURN_REASON_KIND);
         assert!(
             dim.participates_in_decision,

@@ -31,7 +31,7 @@ describe("TagTrustPanel", () => {
     fireEvent.click(screen.getByText("编辑"));
     fireEvent.change(screen.getByPlaceholderText(/逗号分隔/), { target: { value: "VIP, 老客户" } });
     fireEvent.click(screen.getByText("保存"));
-    await waitFor(() => expect(onSave).toHaveBeenCalledWith(["VIP", "老客户"]));
+    await waitFor(() => expect(onSave).toHaveBeenCalledWith(baseContact, ["VIP", "老客户"]));
   });
 
   it("F11: AI 确信标签显示 strong_evidence 来源徽标", () => {

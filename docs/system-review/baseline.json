@@ -1,0 +1,14 @@
+{
+  "repository": "jsjm1986/wechatagent",
+  "pull_request": 223,
+  "url": "https://github.com/jsjm1986/wechatagent/pull/223",
+  "state_at_freeze": "OPEN",
+  "title_at_freeze": "feat(taxonomy): 分类体系多租户隔离 + management MCP 工具 fail-closed",
+  "base_ref": "main",
+  "base_oid": "9d28b73fd041ed3e46fee17b5a5011c572b0a40c",
+  "head_ref": "fix/management-raw-mcp-fail-closed",
+  "head_oid": "12d99b3b9fd42eae2293b5b3f0a1ff9fe982b7a8",
+  "pr_updated_at_at_freeze": "2026-07-17T05:09:27Z",
+  "frozen_at": "2026-07-17T13:09:04+08:00",
+  "tracked_files": 1243
+}

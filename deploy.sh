@@ -15,6 +15,8 @@ PROJECT_DIR="/root/wechatagent"
 BRANCH="fix/dispatcher-send-timeout-alignment"
 SERVICE_NAME="wechatagent"
 
+: "${MCP_API_KEY:?MCP_API_KEY must be injected by the deployment environment}"
+
 echo "📍 步骤 1: 拉取最新代码"
 cd $PROJECT_DIR
 git fetch origin
@@ -45,8 +47,8 @@ if ! grep -q "MCP_BASE_URL" .env; then
 fi
 
 if ! grep -q "MCP_API_KEY" .env; then
-    echo "⚠️  .env 缺少 MCP_API_KEY，正在添加..."
-    echo "MCP_API_KEY=gwa_ba60a98aada58c10b77f6f20841c77c6c3c0506d9431871f" >> .env
+    echo "⚠️  .env 缺少 MCP_API_KEY，使用部署环境注入值..."
+    printf 'MCP_API_KEY=%s\n' "$MCP_API_KEY" >> .env
 fi
 
 if ! grep -q "RUN_TOKEN_BUDGET_ESCALATED" .env; then
@@ -57,6 +59,19 @@ fi
 if ! grep -q "WEBHOOK_VERIFY_SIGNATURE" .env; then
     echo "⚠️  .env 缺少 WEBHOOK_VERIFY_SIGNATURE，正在添加..."
     echo "WEBHOOK_VERIFY_SIGNATURE=true" >> .env
+fi
+
+if ! grep -q "AUTH_RATE_LIMIT_WINDOW_SECONDS" .env; then
+    echo "AUTH_RATE_LIMIT_WINDOW_SECONDS=300" >> .env
+fi
+if ! grep -q "AUTH_RATE_LIMIT_CLIENT_CAPACITY" .env; then
+    echo "AUTH_RATE_LIMIT_CLIENT_CAPACITY=20" >> .env
+fi
+if ! grep -q "AUTH_RATE_LIMIT_TARGET_CAPACITY" .env; then
+    echo "AUTH_RATE_LIMIT_TARGET_CAPACITY=10" >> .env
+fi
+if ! grep -q "AUTH_RATE_LIMIT_GLOBAL_CAPACITY" .env; then
+    echo "AUTH_RATE_LIMIT_GLOBAL_CAPACITY=100" >> .env
 fi
 
 echo "✓ 环境变量检查完成"

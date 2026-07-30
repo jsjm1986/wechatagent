@@ -143,10 +143,7 @@ async fn non_person_chatroom_persists_message_but_no_contact() {
         )
         .await
         .expect("query contact");
-    assert!(
-        contact.is_none(),
-        "@chatroom 群绝不能进运营池 contacts"
-    );
+    assert!(contact.is_none(), "@chatroom 群绝不能进运营池 contacts");
 }
 
 /// 真人 wxid + roster 命中：contact.nickname / avatar_url 来自 roster 快照，

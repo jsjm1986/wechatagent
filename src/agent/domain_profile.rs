@@ -28,11 +28,11 @@
 use mongodb::bson::doc;
 use parking_lot::Mutex as PlMutex;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use crate::db::Database;
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 use crate::models::{
     AnsweringModeProfile, BusinessFormula, ChunkRole, CommitmentMarkers, CoverageDimension,
     DomainProfile, MemoryDimension, OutcomePolarity, ProfileDimension,
@@ -490,8 +490,7 @@ pub const DEFAULT_REVIEWER_REVIEW_FOCUS: &str =
 
 /// universal-domain-adaptation D：reviewer user prompt 评审原则里写死的「转化平衡」整条
 /// bullet（`- ` 之后的整句）。`apply_reviewer_balance_principle` 以它为锚做精确替换。
-pub const DEFAULT_REVIEWER_BALANCE_PRINCIPLE: &str =
-    "转化平衡：既允许适度推进，也不能伤害信任。";
+pub const DEFAULT_REVIEWER_BALANCE_PRINCIPLE: &str = "转化平衡：既允许适度推进，也不能伤害信任。";
 
 /// universal-domain-adaptation D：把 active profile 的 `reviewer_orientation.review_focus`
 /// 应用到 reviewer **system** prompt。`None`（DEFAULT/老库）→ 原样返回（销售取向逐字保留、
@@ -640,10 +639,8 @@ pub fn apply_reply_policy_prompt_overrides(policy: &str, profile: &DomainProfile
 pub fn apply_review_system_prompt_overrides(system: &str, profile: &DomainProfile) -> String {
     let orientation = profile.reviewer_orientation.as_ref();
     // 1. 评审重点取向行（D）。
-    let system = apply_reviewer_review_focus(
-        system,
-        orientation.and_then(|o| o.review_focus.as_deref()),
-    );
+    let system =
+        apply_reviewer_review_focus(system, orientation.and_then(|o| o.review_focus.as_deref()));
     // 2. 软闸打分锚点 few-shot 段（T3）。
     apply_reviewer_fewshot(
         &system,
@@ -693,9 +690,7 @@ pub fn render_answering_mode_rules(profile: Option<&AnsweringModeProfile>) -> St
         profile.and_then(|p| p.fully_supported.as_ref()),
         DEFAULT_ANSWERING_RULE_FULLY_SUPPORTED,
     );
-    format!(
-        "- relationship_only: {r}\n- product_safe: {p_safe}\n- fully_supported: {f}"
-    )
+    format!("- relationship_only: {r}\n- product_safe: {p_safe}\n- fully_supported: {f}")
 }
 
 /// I：三档前端标签（label）解析，按 `AnsweringModeProfile.{档}.label` 覆盖、`None` 回落
@@ -781,11 +776,11 @@ pub fn default_domain_profile(workspace_id: &str) -> DomainProfile {
         },
         coverage_dimensions: vec![
             // 逐字复刻 catalog.rs 五维 + 命中锚点散文（H5-b：anchor_hint 注入审计 prompt）。
-            CoverageDimension { key: "capability".to_string(), display_name: "能力".to_string(), required: false, anchor_hint: Some("有 verified 切片陈述产品/服务\"能做什么\"的具体能力或功能事实。".to_string()), initial_signal: Some("verified".to_string()) },
-            CoverageDimension { key: "pricing".to_string(), display_name: "报价".to_string(), required: false, anchor_hint: Some("有 verified 切片含具体报价/计费/套餐金额（注意：仅 needs_review 草稿里的报价不计入 verifiedFact，而应置 pendingDraft=true 并入 gap）。".to_string()), initial_signal: None },
-            CoverageDimension { key: "caseEvidence".to_string(), display_name: "案例证据".to_string(), required: false, anchor_hint: Some("有 verified 切片描述**具体客户案例/实施成效**（含可核验的主体、场景或落地结果），即判 true。".to_string()), initial_signal: Some("evidence".to_string()) },
-            CoverageDimension { key: "effectClaims".to_string(), display_name: "效果声明".to_string(), required: false, anchor_hint: Some("有 verified 切片含**可核验的效果数据/量化成果**（如转化率提升、响应时长变化等具体数字），即判 true。".to_string()), initial_signal: Some("evidence".to_string()) },
-            CoverageDimension { key: "deliveryBoundary".to_string(), display_name: "交付边界".to_string(), required: false, anchor_hint: Some("有 verified 切片陈述交付方式/SLA/可用性/部署边界等具体条款。".to_string()), initial_signal: Some("verified".to_string()) },
+            CoverageDimension { key: "capability".to_string(), display_name: "能力".to_string(), required: false, review_topic_aliases: vec!["功能".to_string(), "产品能力".to_string(), "服务能力".to_string()], anchor_hint: Some("有 verified 切片陈述产品/服务\"能做什么\"的具体能力或功能事实。".to_string()), initial_signal: Some("verified".to_string()) },
+            CoverageDimension { key: "pricing".to_string(), display_name: "报价".to_string(), required: false, review_topic_aliases: vec!["定价".to_string(), "价格".to_string(), "计费".to_string(), "套餐".to_string()], anchor_hint: Some("有 verified 切片含具体报价/计费/套餐金额（注意：仅 needs_review 草稿里的报价不计入 verifiedFact，而应置 pendingDraft=true 并入 gap）。".to_string()), initial_signal: None },
+            CoverageDimension { key: "caseEvidence".to_string(), display_name: "案例证据".to_string(), required: false, review_topic_aliases: vec!["案例".to_string(), "客户案例".to_string(), "实施成效".to_string()], anchor_hint: Some("有 verified 切片描述**具体客户案例/实施成效**（含可核验的主体、场景或落地结果），即判 true。".to_string()), initial_signal: Some("evidence".to_string()) },
+            CoverageDimension { key: "effectClaims".to_string(), display_name: "效果声明".to_string(), required: false, review_topic_aliases: vec!["效果数据".to_string(), "量化成果".to_string(), "效果".to_string()], anchor_hint: Some("有 verified 切片含**可核验的效果数据/量化成果**（如转化率提升、响应时长变化等具体数字），即判 true。".to_string()), initial_signal: Some("evidence".to_string()) },
+            CoverageDimension { key: "deliveryBoundary".to_string(), display_name: "交付边界".to_string(), required: false, review_topic_aliases: vec!["交付".to_string(), "部署边界".to_string(), "SLA".to_string(), "可用性".to_string()], anchor_hint: Some("有 verified 切片陈述交付方式/SLA/可用性/部署边界等具体条款。".to_string()), initial_signal: Some("verified".to_string()) },
         ],
         // 逐字复刻 planner 写死的停滞计时维度（customer_stage）。
         stagnation_dimension: Some("customer_stage".to_string()),
@@ -802,8 +797,8 @@ pub fn default_domain_profile(workspace_id: &str) -> DomainProfile {
         per_relationship_operation_mode: None,
         // H14：DEFAULT 销售域 = false → grounding 软分数硬闸无条件生效（字节等价）。
         grounding_gate_bypass_without_claim: false,
-        // reviewer 优化：DEFAULT 销售域 = false → 沿用既有 should_run_review 判定
-        // （字节等价）；高敏域（情感陪伴）seed 时显式置 true 强制走 LLM review。
+        // reviewer 深度：DEFAULT 销售域 = false → 普通低风险可走 light Reviewer；
+        // 高敏域（情感陪伴）seed 时显式置 true 强制走 full Reviewer。
         distrust_self_reported_low_risk: false,
         // G4 #5：DEFAULT 是销售域（交易型）= true → 注入产品目录 + 持有投影段（逐字等价
         // 历史行为，反过拟合护栏）。非交易域 profile 显式置 false 关闭交易事实注入。
@@ -849,6 +844,7 @@ pub fn default_domain_profile(workspace_id: &str) -> DomainProfile {
         version: 1,
         current_version: true,
         previous_version: None,
+        release_status: "published".to_string(),
         seeded_by: Some("default".to_string()),
         is_active: true,
         created_at: now,
@@ -866,7 +862,7 @@ pub fn default_domain_profile(workspace_id: &str) -> DomainProfile {
 /// 价值契约（与设计 §5.2 对齐）：
 /// - `conversation_modes` 含 `intimate_companion`（H9：不只销售四模式）；
 /// - `grounding_gate_bypass_without_claim = true`（H14：纯情感回复不被 grounding 误拦）；
-/// - `distrust_self_reported_low_risk = true`（高敏域强制走 LLM review）；
+/// - `distrust_self_reported_low_risk = true`（高敏域强制走 full Reviewer）；
 /// - `transaction_facts_enabled = false`（G4 #5：非交易域不注入产品/持有事实）；
 /// - `operation_mode.funnel.enabled = false`（H8：陪伴不催进成交）。
 pub fn example_emotional_companion_profile(workspace_id: &str) -> DomainProfile {
@@ -890,15 +886,17 @@ pub fn example_emotional_companion_profile(workspace_id: &str) -> DomainProfile 
     profile.operation_mode.calendar.enabled = true;
     // §3.7：声明一个带日期语义的记忆维度 anniversaries，consolidator 据 date_dimension
     // 引导 LLM 输出结构化日期对象（AnniversaryEntry），scan_calendar 据此做今日匹配。
-    profile.memory_dimensions.push(crate::models::MemoryDimension {
-        key: "anniversaries".to_string(),
-        display_name: "纪念日".to_string(),
-        cap: 8,
-        is_core: true,
-        prompt_hint: Some("生日 / 相识纪念 / 重要日子（含日期）".to_string()),
-        candidate_type: false,
-        date_dimension: true,
-    });
+    profile
+        .memory_dimensions
+        .push(crate::models::MemoryDimension {
+            key: "anniversaries".to_string(),
+            display_name: "纪念日".to_string(),
+            cap: 8,
+            is_core: true,
+            prompt_hint: Some("生日 / 相识纪念 / 重要日子（含日期）".to_string()),
+            candidate_type: false,
+            date_dimension: true,
+        });
     profile.prompt_fragment = Some(
         "本行业目标是长期陪伴、情绪承接、尊重对方节奏与边界，不是成交推进。\
          主动关心、轻量追问本身是正当行为，不等于施压。"
@@ -969,14 +967,17 @@ pub fn example_sales_with_relationships_profile(workspace_id: &str) -> DomainPro
 
 /// 加载某 workspace 当前生效的 DomainProfile。
 ///
-/// 查 `is_active=true` 一条；无则 fallback 到 [`default_domain_profile`]。
-/// DB 错误也 fallback（不阻塞运行时；与 taxonomy cache warm_up 失败静默同精神）。
+/// 查唯一 `is_active=true` 行；一次成功查询明确无行时才 fallback 到
+/// [`default_domain_profile`]。数据库错误或同 workspace 多 active 均 fail-closed。
 ///
 /// **1G-c**：本函数现在走进程级 [`DomainProfileCache`]（30s TTL + publish 失效），
 /// 治理 1A/1C/1E/1F 引入的"每决策 / 每 planner tick 都查 DB"N+1。缓存未命中 /
 /// DB 空 / DB 错误时仍回落 [`default_domain_profile`]，与接缓存前逐字等价。
-pub async fn load_active_domain_profile(db: &Database, workspace_id: &str) -> DomainProfile {
-    global_domain_profile_cache()
+pub async fn load_active_domain_profile(
+    db: &Database,
+    workspace_id: &str,
+) -> AppResult<DomainProfile> {
+    global_domain_profile_cache(db)
         .get_or_load(db, workspace_id)
         .await
 }
@@ -1034,25 +1035,46 @@ impl DomainProfileCache {
         inner.fetched_at = None;
     }
 
-    /// 启动期预热：拉全部 active profile 填充缓存。失败静默（缓存留空，
-    /// 下次 `get_or_load` 重试）。
-    pub async fn warm_up(&self, db: &Database) {
-        if let Err(error) = self.reload_from_db(db).await {
-            tracing::warn!(?error, "DomainProfileCache.warm_up failed; cache remains empty");
-        }
+    /// 启动期预热：拉全部 active profile 填充缓存。损坏指针或 DB 错误必须阻止启动。
+    pub async fn warm_up(&self, db: &Database) -> AppResult<()> {
+        self.reload_from_db(db).await
     }
 
     async fn reload_from_db(&self, db: &Database) -> AppResult<()> {
         use futures::TryStreamExt;
         let mut cursor = db
             .domain_profiles()
-            .find(doc! { "is_active": true, "current_version": true }, None)
+            .find(doc! { "is_active": true }, None)
             .await?;
         let mut entries: HashMap<String, DomainProfile> = HashMap::new();
         while let Some(profile) = cursor.try_next().await? {
-            // 同 workspace 多条 active（异常态）时后插入者赢——与 find_one 取任意一条
-            // 同语义；正常态每 workspace 至多一条 active+current。
-            entries.insert(profile.workspace_id.clone(), profile);
+            if profile.workspace_id.trim().is_empty()
+                || profile.workspace_id.trim() != profile.workspace_id
+                || profile.profile_id.trim().is_empty()
+                || profile.profile_id.trim() != profile.profile_id
+                || profile.version <= 0
+            {
+                return Err(AppError::Conflict(
+                    "domain_profile_active_identity_invalid".to_string(),
+                ));
+            }
+            crate::models::validate_domain_profile_dimensions(&profile).map_err(|error| {
+                tracing::error!(
+                    workspace_id = %profile.workspace_id,
+                    profile_id = %profile.profile_id,
+                    %error,
+                    "active domain profile has unsafe dimension keys"
+                );
+                AppError::Conflict("domain_profile_active_dimensions_invalid".to_string())
+            })?;
+            if entries
+                .insert(profile.workspace_id.clone(), profile)
+                .is_some()
+            {
+                return Err(AppError::Conflict(
+                    "multiple_active_domain_profiles".to_string(),
+                ));
+            }
         }
         let mut inner = self.inner.lock();
         inner.entries = entries;
@@ -1071,19 +1093,16 @@ impl DomainProfileCache {
     }
 
     /// 查找或自动加载：TTL 过期 → 重载全表；按 `workspace_id` 命中返回真实 profile
-    /// 的 clone，未命中回落 [`default_domain_profile`]（DB 错误时重载失败 → 缓存
-    /// 留空 → 同样回落 default，与接缓存前 `load_active_domain_profile` 逐字等价）。
-    pub(crate) async fn get_or_load(&self, db: &Database, workspace_id: &str) -> DomainProfile {
+    /// 的 clone，未命中回落 [`default_domain_profile`]。重载失败不使用 stale/默认值。
+    pub(crate) async fn get_or_load(
+        &self,
+        db: &Database,
+        workspace_id: &str,
+    ) -> AppResult<DomainProfile> {
         if self.is_stale() {
-            if let Err(error) = self.reload_from_db(db).await {
-                tracing::warn!(
-                    ?error,
-                    workspace_id,
-                    "DomainProfileCache.reload_from_db failed; falling back to DEFAULT_PROFILE"
-                );
-            }
+            self.reload_from_db(db).await?;
         }
-        self.lookup_or_default(workspace_id)
+        Ok(self.lookup_or_default(workspace_id))
     }
 
     /// 纯查表（无 IO）：命中返回真实 profile clone，未命中回落 default。抽出独立
@@ -1115,18 +1134,40 @@ impl DomainProfileCache {
     }
 }
 
-static GLOBAL_DOMAIN_PROFILE_CACHE: std::sync::LazyLock<Arc<DomainProfileCache>> =
-    std::sync::LazyLock::new(|| Arc::new(DomainProfileCache::new()));
-
-/// 进程级单例 cache 句柄；[`load_active_domain_profile`] 在没有注入自定义 cache
-/// 时使用本入口。
-pub(crate) fn global_domain_profile_cache() -> Arc<DomainProfileCache> {
-    GLOBAL_DOMAIN_PROFILE_CACHE.clone()
+struct DomainProfileCacheRegistryEntry {
+    database_lifetime: Weak<()>,
+    cache: Arc<DomainProfileCache>,
 }
 
-/// 启动期预热：由 `main.rs` 在 `ensure_indexes` 后调用。失败被静默。
-pub async fn init_global_domain_profile_cache(db: &Database) {
-    GLOBAL_DOMAIN_PROFILE_CACHE.warm_up(db).await;
+static DOMAIN_PROFILE_CACHE_REGISTRY: std::sync::LazyLock<
+    PlMutex<HashMap<u64, DomainProfileCacheRegistryEntry>>,
+> = std::sync::LazyLock::new(|| PlMutex::new(HashMap::new()));
+
+fn domain_profile_cache_for_identity(
+    identity: u64,
+    database_lifetime: Weak<()>,
+) -> Arc<DomainProfileCache> {
+    let mut registry = DOMAIN_PROFILE_CACHE_REGISTRY.lock();
+    registry.retain(|_, entry| entry.database_lifetime.upgrade().is_some());
+    registry
+        .entry(identity)
+        .or_insert_with(|| DomainProfileCacheRegistryEntry {
+            database_lifetime,
+            cache: Arc::new(DomainProfileCache::new()),
+        })
+        .cache
+        .clone()
+}
+
+/// 返回当前 [`Database`] 连接身份所属的 cache；同一连接的 clone 共享实例，
+/// 独立连接（包括并行测试数据库）互不共享。
+pub(crate) fn global_domain_profile_cache(db: &Database) -> Arc<DomainProfileCache> {
+    domain_profile_cache_for_identity(db.cache_identity(), db.cache_lifetime())
+}
+
+/// 启动期预热：由 `main.rs` 在 `ensure_indexes` 后调用。损坏配置阻止启动。
+pub async fn init_global_domain_profile_cache(db: &Database) -> AppResult<()> {
+    global_domain_profile_cache(db).warm_up(db).await
 }
 
 /// 引导层 publish/激活 profile 后调用以让缓存立即失效（Phase 3 接线）。
@@ -1135,13 +1176,18 @@ pub async fn init_global_domain_profile_cache(db: &Database) {
 /// 进程级缓存，否则 30s TTL 窗口内 `load_active_domain_profile` 仍返回 seed 前的
 /// 旧值（roleplay-fuzz P0 fixture 落地依赖此入口）。生产语义不变——引导层 publish
 /// profile 后本就应调用它。
-pub fn invalidate_global_domain_profile_cache() {
-    GLOBAL_DOMAIN_PROFILE_CACHE.invalidate();
+pub fn invalidate_global_domain_profile_cache(db: &Database) {
+    global_domain_profile_cache(db).invalidate();
 }
 
 /// H18：解析该 profile 的去抖窗口，None 回落 config 全局默认。
-pub(crate) fn resolve_debounce_window_ms(profile: &crate::models::DomainProfile, config_default: u64) -> u64 {
-    profile.debounce_window_ms_override.unwrap_or(config_default)
+pub(crate) fn resolve_debounce_window_ms(
+    profile: &crate::models::DomainProfile,
+    config_default: u64,
+) -> u64 {
+    profile
+        .debounce_window_ms_override
+        .unwrap_or(config_default)
 }
 
 /// 取「参与决策」的维度 kind 列表（对应旧 `TAGGED_FIELDS` 成员集合）。
@@ -1253,14 +1299,22 @@ mod tests {
     #[test]
     fn debounce_window_none_falls_back_to_config_default() {
         let p = default_domain_profile("ws");
-        assert_eq!(resolve_debounce_window_ms(&p, 4000), 4000, "DEFAULT 无 override 回落 env 默认");
+        assert_eq!(
+            resolve_debounce_window_ms(&p, 4000),
+            4000,
+            "DEFAULT 无 override 回落 env 默认"
+        );
     }
 
     #[test]
     fn debounce_window_some_overrides_config() {
         let mut p = default_domain_profile("ws");
         p.debounce_window_ms_override = Some(8000);
-        assert_eq!(resolve_debounce_window_ms(&p, 4000), 8000, "Some 覆盖 env 默认");
+        assert_eq!(
+            resolve_debounce_window_ms(&p, 4000),
+            8000,
+            "Some 覆盖 env 默认"
+        );
     }
 
     #[test]
@@ -1295,11 +1349,30 @@ mod tests {
     #[test]
     fn default_profile_coverage_matches_catalog_five_dims() {
         let p = default_domain_profile("ws-1");
-        let keys: Vec<&str> = p.coverage_dimensions.iter().map(|c| c.key.as_str()).collect();
+        let keys: Vec<&str> = p
+            .coverage_dimensions
+            .iter()
+            .map(|c| c.key.as_str())
+            .collect();
         assert_eq!(
             keys,
-            vec!["capability", "pricing", "caseEvidence", "effectClaims", "deliveryBoundary"]
+            vec![
+                "capability",
+                "pricing",
+                "caseEvidence",
+                "effectClaims",
+                "deliveryBoundary"
+            ]
         );
+        let pricing = p
+            .coverage_dimensions
+            .iter()
+            .find(|dimension| dimension.key == "pricing")
+            .expect("pricing dimension");
+        assert!(pricing
+            .review_topic_aliases
+            .iter()
+            .any(|alias| alias == "价格"));
     }
 
     #[test]
@@ -1406,8 +1479,8 @@ mod tests {
         // 换行业 = 情感/关系 profile 置 true 旁路。
         let p = default_domain_profile("ws-1");
         assert!(!p.grounding_gate_bypass_without_claim);
-        // reviewer 优化逐字等价护栏：DEFAULT_PROFILE = false → 沿用既有
-        // should_run_review 判定（销售域字节等价）；高敏域 seed 时才置 true。
+        // reviewer 深度护栏：DEFAULT_PROFILE = false → 普通低风险可走 light Reviewer；
+        // 高敏域 seed 时才置 true 强制 full Reviewer。
         assert!(!p.distrust_self_reported_low_risk);
         // G4 #5 逐字等价护栏：DEFAULT 是销售域（交易型）→ transaction_facts_enabled=true，
         // 决策注入产品目录 + 持有投影段，与改造前注入行为字节等价。注意此开关默认 false
@@ -1423,10 +1496,7 @@ mod tests {
         // G4 #5：情感陪伴是非交易域 → 显式关交易事实注入，即便 admin 误配产品表也不让
         // "已购买X"裸入情感对话。派生自 default（true），必须被显式覆盖为 false。
         let p = example_emotional_companion_profile("ws-1");
-        assert!(
-            !p.transaction_facts_enabled,
-            "情感陪伴域必须关交易事实注入"
-        );
+        assert!(!p.transaction_facts_enabled, "情感陪伴域必须关交易事实注入");
     }
 
     #[test]
@@ -1437,17 +1507,34 @@ mod tests {
         let p = default_domain_profile("ws-1");
         assert_eq!(p.chunk_roles.len(), 4);
         let keys: Vec<&str> = p.chunk_roles.iter().map(|r| r.key.as_str()).collect();
-        assert_eq!(keys, vec!["product_fact", "style_template", "peer_case", "negative_example"]);
+        assert_eq!(
+            keys,
+            vec![
+                "product_fact",
+                "style_template",
+                "peer_case",
+                "negative_example"
+            ]
+        );
         // 顺序字段升序 0..3，与渲染函数固定输出顺序一致。
-        assert_eq!(p.chunk_roles.iter().map(|r| r.order).collect::<Vec<_>>(), vec![0, 1, 2, 3]);
+        assert_eq!(
+            p.chunk_roles.iter().map(|r| r.order).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
         // 仅 product_fact 是 fallback 桶（未命中任何 key 的 chunk 归入）。
         assert!(p.chunk_roles[0].is_fallback);
         assert!(p.chunk_roles[1..].iter().all(|r| !r.is_fallback));
         // header 逐字复刻 knowledge_router::format_operation_knowledge_for_prompt 的 order[]。
         assert_eq!(p.chunk_roles[0].header, "【产品事实 product_fact】仅 verified 切片可用作产品声明背书；needs_review/rejected 不作背书。");
-        assert_eq!(p.chunk_roles[1].header, "【语气模板 style_template】作为 few-shot 参考；不直接复制内容，仅借鉴节奏与措辞。");
+        assert_eq!(
+            p.chunk_roles[1].header,
+            "【语气模板 style_template】作为 few-shot 参考；不直接复制内容，仅借鉴节奏与措辞。"
+        );
         assert_eq!(p.chunk_roles[2].header, "【同行案例 peer_case】仅作 reference，不作我方产品承诺；引用必须显式标注「行业经验/同行案例」。");
-        assert_eq!(p.chunk_roles[3].header, "【反例 negative_example】don't-do 列表；候选回复语气/结构若与本段相似，必须改写。");
+        assert_eq!(
+            p.chunk_roles[3].header,
+            "【反例 negative_example】don't-do 列表；候选回复语气/结构若与本段相似，必须改写。"
+        );
     }
 
     #[test]
@@ -1460,7 +1547,10 @@ mod tests {
         };
         let p = default_domain_profile("ws-1");
         // 正极 = buying_signal 单词（回路① classify→Hit 的唯一字面量）。
-        assert_eq!(p.outcome_polarity.positive, vec!["user_replied_buying_signal"]);
+        assert_eq!(
+            p.outcome_polarity.positive,
+            vec!["user_replied_buying_signal"]
+        );
         // 负极 = objection/stop_requested/unsubscribed/negative/complaint 五词
         // （回路① classify→Block + reaction.rs::is_negative_outcome 旧 5 词）。
         assert_eq!(
@@ -1476,11 +1566,17 @@ mod tests {
         // 同源锁死：seed 与回落常量逐元素相等，杜绝手抄漂移。
         assert_eq!(
             p.outcome_polarity.positive,
-            DEFAULT_POSITIVE_OUTCOMES.iter().map(|s| s.to_string()).collect::<Vec<_>>()
+            DEFAULT_POSITIVE_OUTCOMES
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
         );
         assert_eq!(
             p.outcome_polarity.negative,
-            DEFAULT_NEGATIVE_OUTCOMES.iter().map(|s| s.to_string()).collect::<Vec<_>>()
+            DEFAULT_NEGATIVE_OUTCOMES
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
         );
     }
 
@@ -1503,8 +1599,14 @@ mod tests {
         assert_eq!(parsed.profile_dimensions.len(), 2);
         assert_eq!(parsed.commitment_markers.product_effect.len(), 5);
         // H11：outcome_polarity 经 BSON 往返不丢（camelCase positive/negative）。
-        assert_eq!(parsed.outcome_polarity.positive, p.outcome_polarity.positive);
-        assert_eq!(parsed.outcome_polarity.negative, p.outcome_polarity.negative);
+        assert_eq!(
+            parsed.outcome_polarity.positive,
+            p.outcome_polarity.positive
+        );
+        assert_eq!(
+            parsed.outcome_polarity.negative,
+            p.outcome_polarity.negative
+        );
         // H15：business_formulas 经 BSON 往返不丢（camelCase key/expression/displayName/evalScoreKey）。
         assert_eq!(parsed.business_formulas, p.business_formulas);
         // H17：memory_dimensions 经 BSON 往返不丢（camelCase key/displayName/cap/isCore/promptHint/candidateType）。
@@ -1540,11 +1642,19 @@ mod tests {
             .expect("per_relationship 往返不丢");
         assert_eq!(parsed_map.len(), 2);
         assert!(
-            parsed_map.get("customer").expect("customer 那套").funnel.enabled,
+            parsed_map
+                .get("customer")
+                .expect("customer 那套")
+                .funnel
+                .enabled,
             "customer 三全开往返保持"
         );
         assert_eq!(
-            parsed_map.get("friend").expect("friend 那套").funnel.enabled,
+            parsed_map
+                .get("friend")
+                .expect("friend 那套")
+                .funnel
+                .enabled,
             false,
             "friend 关 funnel 往返保持"
         );
@@ -1642,7 +1752,10 @@ mod tests {
             ("confirmedFacts", 12, false),
             ("conflicts", 6, false),
         ];
-        assert_eq!(got, expected, "DEFAULT 记忆维度 key/cap/candidate_type 必须逐字锁死");
+        assert_eq!(
+            got, expected,
+            "DEFAULT 记忆维度 key/cap/candidate_type 必须逐字锁死"
+        );
         // coreFacts/recentFacts/deprecatedFacts 是 typed 骨架固定 cap，不得混进 memory_dimensions。
         assert!(
             !dims.iter().any(|d| matches!(
@@ -1689,7 +1802,10 @@ mod tests {
         ];
         let out = render_memory_candidate_types_guidance(&dims);
         assert!(out.contains("fact"), "fact 固定派生");
-        assert!(out.contains("emotionHistory"), "candidate_type=true 进合法集");
+        assert!(
+            out.contains("emotionHistory"),
+            "candidate_type=true 进合法集"
+        );
         assert!(out.contains("conflict"), "conflict 固定派生");
         assert!(
             !out.contains("anniversaries"),
@@ -1716,10 +1832,16 @@ mod tests {
         let f = default_business_formulas();
         assert_eq!(f.len(), 4);
         assert_eq!(f[0].key, "trust");
-        assert_eq!(f[0].expression, "Credibility + Reliability + Intimacy − SelfOrientation");
+        assert_eq!(
+            f[0].expression,
+            "Credibility + Reliability + Intimacy − SelfOrientation"
+        );
         assert_eq!(f[0].eval_score_key.as_deref(), Some("humanLike"));
         assert_eq!(f[1].key, "conversionReadiness");
-        assert_eq!(f[1].expression, "Motivation × ProductFit × Timing × Trust ÷ Friction");
+        assert_eq!(
+            f[1].expression,
+            "Motivation × ProductFit × Timing × Trust ÷ Friction"
+        );
         assert_eq!(f[1].eval_score_key.as_deref(), Some("conversionReadiness"));
         assert_eq!(f[2].key, "emotionalValue");
         assert_eq!(
@@ -1834,8 +1956,14 @@ mod tests {
     #[test]
     fn formula_key_pascal_capitalizes_first() {
         assert_eq!(formula_key_pascal("trust"), "Trust");
-        assert_eq!(formula_key_pascal("conversionReadiness"), "ConversionReadiness");
-        assert_eq!(formula_key_pascal("nextBestActionScore"), "NextBestActionScore");
+        assert_eq!(
+            formula_key_pascal("conversionReadiness"),
+            "ConversionReadiness"
+        );
+        assert_eq!(
+            formula_key_pascal("nextBestActionScore"),
+            "NextBestActionScore"
+        );
         assert_eq!(formula_key_pascal(""), "");
     }
 
@@ -1936,9 +2064,15 @@ mod tests {
     #[test]
     fn apply_conversation_mode_policy_none_is_byte_identical() {
         // DEFAULT_PROFILE / 老库 = None → 原样返回，销售判定段逐字保留、零变化。
-        assert_eq!(apply_conversation_mode_policy(SAMPLE_POLICY, None), SAMPLE_POLICY);
+        assert_eq!(
+            apply_conversation_mode_policy(SAMPLE_POLICY, None),
+            SAMPLE_POLICY
+        );
         // 空串 / 纯空白同样视为未覆盖。
-        assert_eq!(apply_conversation_mode_policy(SAMPLE_POLICY, Some("   ")), SAMPLE_POLICY);
+        assert_eq!(
+            apply_conversation_mode_policy(SAMPLE_POLICY, Some("   ")),
+            SAMPLE_POLICY
+        );
     }
 
     #[test]
@@ -1958,7 +2092,10 @@ mod tests {
     #[test]
     fn apply_conversation_mode_policy_adds_heading_when_missing() {
         // 运营漏写标题时补锚，保证下游段衔接。
-        let out = apply_conversation_mode_policy(SAMPLE_POLICY, Some("用户表达情绪 → empathetic_support。"));
+        let out = apply_conversation_mode_policy(
+            SAMPLE_POLICY,
+            Some("用户表达情绪 → empathetic_support。"),
+        );
         assert!(out.starts_with(POLICY_CONVERSATION_MODE_SECTION_HEADING));
         assert!(out.contains("empathetic_support"));
         assert!(out.contains("## 模式与 5 闸的关系"));
@@ -1976,7 +2113,10 @@ mod tests {
         assert_eq!(apply_conversation_mode_enum_list(text, &[]), text);
         // 显式默认四模式 → 同样字节等价。
         let default_modes = crate::agent::runtime::default_conversation_modes();
-        assert_eq!(apply_conversation_mode_enum_list(text, &default_modes), text);
+        assert_eq!(
+            apply_conversation_mode_enum_list(text, &default_modes),
+            text
+        );
     }
 
     /// 非销售模式集 → 数组形与竖线形两处枚举列表都被替换为本行业模式。
@@ -1992,7 +2132,9 @@ mod tests {
         let out = apply_conversation_mode_enum_list(text, &modes);
         // 数组形替换为本行业三模式。
         assert!(
-            out.contains("[\"intimate_companion\", \"casual_relationship\", \"boundary_protection\"]"),
+            out.contains(
+                "[\"intimate_companion\", \"casual_relationship\", \"boundary_protection\"]"
+            ),
             "数组形未按 profile 替换：{out}"
         );
         // 竖线形替换为本行业三模式。
@@ -2001,8 +2143,14 @@ mod tests {
             "竖线形未按 profile 替换：{out}"
         );
         // 写死的销售四模式列表不再残留（消除矛盾指令）。
-        assert!(!out.contains("\"value_exchange\", \"consultative\""), "销售数组形残留：{out}");
-        assert!(!out.contains("value_exchange | consultative"), "销售竖线形残留：{out}");
+        assert!(
+            !out.contains("\"value_exchange\", \"consultative\""),
+            "销售数组形残留：{out}"
+        );
+        assert!(
+            !out.contains("value_exchange | consultative"),
+            "销售竖线形残留：{out}"
+        );
     }
 
     /// 只替换精确的枚举列表子串，不触碰各模式的散文描述（boundary_protection 红线段保留）。
@@ -2011,7 +2159,10 @@ mod tests {
         // 模拟「## 模式与 5 闸的关系」段里逐模式散文 + 红线（不含枚举列表子串形态）。
         let prose = "- **boundary_protection**：禁止任何主动话术；严禁承诺真人。\n\
                      - **consultative**：所有产品声明必须由 verified_chunks 支撑。";
-        let modes = vec!["intimate_companion".to_string(), "boundary_protection".to_string()];
+        let modes = vec![
+            "intimate_companion".to_string(),
+            "boundary_protection".to_string(),
+        ];
         let out = apply_conversation_mode_enum_list(prose, &modes);
         // 散文逐字保留（无数组/竖线枚举列表子串可匹配 → 不动）。
         assert_eq!(out, prose, "散文描述段不应被触碰");
@@ -2029,8 +2180,14 @@ mod tests {
     /// DEFAULT / None / 空白覆盖 → reviewer system「评审重点」行逐字保留、字节等价。
     #[test]
     fn apply_reviewer_review_focus_none_is_byte_identical() {
-        assert_eq!(apply_reviewer_review_focus(SAMPLE_REVIEW_SYSTEM, None), SAMPLE_REVIEW_SYSTEM);
-        assert_eq!(apply_reviewer_review_focus(SAMPLE_REVIEW_SYSTEM, Some("   ")), SAMPLE_REVIEW_SYSTEM);
+        assert_eq!(
+            apply_reviewer_review_focus(SAMPLE_REVIEW_SYSTEM, None),
+            SAMPLE_REVIEW_SYSTEM
+        );
+        assert_eq!(
+            apply_reviewer_review_focus(SAMPLE_REVIEW_SYSTEM, Some("   ")),
+            SAMPLE_REVIEW_SYSTEM
+        );
         // 覆盖文本恰等于写死销售取向 → 也不替换（幂等、无扰动）。
         assert_eq!(
             apply_reviewer_review_focus(SAMPLE_REVIEW_SYSTEM, Some(DEFAULT_REVIEWER_REVIEW_FOCUS)),
@@ -2058,16 +2215,28 @@ mod tests {
     #[test]
     fn apply_reviewer_review_focus_no_anchor_is_noop() {
         let custom = "评分范围 0-10。\n判 HumanLikeScore 时……";
-        assert_eq!(apply_reviewer_review_focus(custom, Some("本域取向。")), custom);
+        assert_eq!(
+            apply_reviewer_review_focus(custom, Some("本域取向。")),
+            custom
+        );
     }
 
     /// DEFAULT / None / 空白覆盖 → reviewer user「转化平衡」条逐字保留、字节等价。
     #[test]
     fn apply_reviewer_balance_principle_none_is_byte_identical() {
-        assert_eq!(apply_reviewer_balance_principle(SAMPLE_REVIEW_USER, None), SAMPLE_REVIEW_USER);
-        assert_eq!(apply_reviewer_balance_principle(SAMPLE_REVIEW_USER, Some("  ")), SAMPLE_REVIEW_USER);
         assert_eq!(
-            apply_reviewer_balance_principle(SAMPLE_REVIEW_USER, Some(DEFAULT_REVIEWER_BALANCE_PRINCIPLE)),
+            apply_reviewer_balance_principle(SAMPLE_REVIEW_USER, None),
+            SAMPLE_REVIEW_USER
+        );
+        assert_eq!(
+            apply_reviewer_balance_principle(SAMPLE_REVIEW_USER, Some("  ")),
+            SAMPLE_REVIEW_USER
+        );
+        assert_eq!(
+            apply_reviewer_balance_principle(
+                SAMPLE_REVIEW_USER,
+                Some(DEFAULT_REVIEWER_BALANCE_PRINCIPLE)
+            ),
             SAMPLE_REVIEW_USER
         );
     }
@@ -2158,8 +2327,14 @@ mod tests {
     #[test]
     fn apply_reviewer_orientation_fields_fall_back_independently() {
         // 只覆盖 balance_principle，review_focus=None → system 仍为销售取向。
-        assert_eq!(apply_reviewer_review_focus(SAMPLE_REVIEW_SYSTEM, None), SAMPLE_REVIEW_SYSTEM);
-        let user_out = apply_reviewer_balance_principle(SAMPLE_REVIEW_USER, Some("关系平衡：真诚靠近、不制造依赖。"));
+        assert_eq!(
+            apply_reviewer_review_focus(SAMPLE_REVIEW_SYSTEM, None),
+            SAMPLE_REVIEW_SYSTEM
+        );
+        let user_out = apply_reviewer_balance_principle(
+            SAMPLE_REVIEW_USER,
+            Some("关系平衡：真诚靠近、不制造依赖。"),
+        );
         assert!(user_out.contains("关系平衡："));
     }
 
@@ -2259,7 +2434,9 @@ mod tests {
         let got = render_answering_mode_rules(Some(&profile));
         assert!(got.contains("- relationship_only: 只能纯倾听陪伴，不触及任何专业判断。"));
         // product_safe 未声明 → 回落写死销售释义。
-        assert!(got.contains("- product_safe: 可回答部分产品/服务能力，但报价、案例、效果或交付边界仍不足。"));
+        assert!(got.contains(
+            "- product_safe: 可回答部分产品/服务能力，但报价、案例、效果或交付边界仍不足。"
+        ));
         assert!(got.contains("- fully_supported: 可在已验证边界内深入交流。"));
         // key 恒定（认知阶梯），三档齐全。
         assert_eq!(got.matches("- relationship_only:").count(), 1);
@@ -2274,10 +2451,17 @@ mod tests {
         // None → 三档写死销售标签。
         assert_eq!(
             answering_mode_labels(None),
-            ("仅关系维护".to_string(), "可安全讲产品".to_string(), "完全支撑".to_string())
+            (
+                "仅关系维护".to_string(),
+                "可安全讲产品".to_string(),
+                "完全支撑".to_string()
+            )
         );
         let profile = AnsweringModeProfile {
-            relationship_only: Some(AnsweringModeDescriptor { rule: None, label: Some("纯陪伴倾听".to_string()) }),
+            relationship_only: Some(AnsweringModeDescriptor {
+                rule: None,
+                label: Some("纯陪伴倾听".to_string()),
+            }),
             product_safe: None,
             fully_supported: None,
         };
@@ -2383,8 +2567,14 @@ mod tests {
         ];
         let cache = taxonomy_cache_for_tests(vec![]);
         let out = render_decision_dimensions_guidance(&dims, "ws-1", "acct-1", &cache);
-        assert!(out.contains("domainSignals"), "应告知 LLM 走 domainSignals 容器");
-        assert!(out.contains("purchase_lifecycle"), "非销售参与决策维度进指引");
+        assert!(
+            out.contains("domainSignals"),
+            "应告知 LLM 走 domainSignals 容器"
+        );
+        assert!(
+            out.contains("purchase_lifecycle"),
+            "非销售参与决策维度进指引"
+        );
         assert!(out.contains("购买生命周期"), "带 display_name");
         assert!(out.contains("未购买/已购买"), "带 description 语义");
         assert!(

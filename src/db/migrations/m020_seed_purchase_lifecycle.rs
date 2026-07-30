@@ -134,10 +134,9 @@ pub(super) fn example_profile_with_lifecycle(workspace_id: &str) -> crate::model
     let mut profile = default_domain_profile(workspace_id);
     profile.profile_id = EXAMPLE_PROFILE_ID.to_string();
     profile.display_name = "销售 + 购买生命周期（示例草稿）".to_string();
-    profile.description =
-        "在销售域两维基础上追加「购买生命周期」参与决策维度的示例草稿；未激活，\
+    profile.description = "在销售域两维基础上追加「购买生命周期」参与决策维度的示例草稿；未激活，\
          运营在审核 UI 确认后 publish+activate 生效。"
-            .to_string();
+        .to_string();
     profile.profile_dimensions.push(ProfileDimension {
         kind: G1_DIMENSION_KIND.to_string(),
         display_name: "购买生命周期".to_string(),
@@ -152,6 +151,7 @@ pub(super) fn example_profile_with_lifecycle(workspace_id: &str) -> crate::model
     // draft：不自动生效。引导/审核层 publish+activate 时再翻这两个标志。
     profile.is_active = false;
     profile.current_version = false;
+    profile.release_status = "draft".to_string();
     profile.seeded_by = Some("g1_migration".to_string());
     profile
 }
@@ -166,6 +166,11 @@ async fn seed_example_profile(db: &Database, now: DateTime) -> AppResult<()> {
     let mut profile = example_profile_with_lifecycle(workspace_id);
     profile.created_at = now;
     profile.updated_at = now;
+    crate::models::validate_domain_profile_dimensions(&profile).map_err(|error| {
+        crate::error::AppError::External(format!(
+            "invalid seeded domain profile dimensions: {error}"
+        ))
+    })?;
     let mut doc_to_set = mongodb::bson::to_document(&profile)?;
     doc_to_set.remove("_id");
     let result = collection
@@ -218,7 +223,10 @@ mod tests {
             .iter()
             .map(|d| d.kind.as_str())
             .collect();
-        assert_eq!(kinds, vec!["customer_stage", "intent_level", G1_DIMENSION_KIND]);
+        assert_eq!(
+            kinds,
+            vec!["customer_stage", "intent_level", G1_DIMENSION_KIND]
+        );
         // G1 维度参与决策。
         let g1 = p
             .profile_dimensions

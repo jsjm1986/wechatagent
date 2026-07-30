@@ -7,12 +7,13 @@
 mod common;
 
 use axum::extract::{Extension, State};
-use mongodb::bson::{doc, Document, DateTime, oid::ObjectId};
+use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
 
 use wechatagent::auth::AuthenticatedAdmin;
 use wechatagent::error::AppError;
 use wechatagent::models::{AgentStatus, AgentTask, Contact, WechatAccount};
 use wechatagent::routes::contacts::{batch_enable_endpoint, handle_initial_profile_task};
+use wechatagent::routes::upsert_contact_from_value;
 
 use crate::common::TestApp;
 
@@ -58,7 +59,11 @@ async fn seed_account(app: &TestApp, ws: &str, account_id: &str) {
         .expect("seed account");
 }
 
-fn req(account_id: &str, wxids: &[&str], shared_note: &str) -> wechatagent::models::BatchEnableRequest {
+fn req(
+    account_id: &str,
+    wxids: &[&str],
+    shared_note: &str,
+) -> wechatagent::models::BatchEnableRequest {
     let candidates: Vec<_> = wxids
         .iter()
         .map(|w| {
@@ -72,10 +77,31 @@ fn req(account_id: &str, wxids: &[&str], shared_note: &str) -> wechatagent::mode
         .collect();
     serde_json::from_value(serde_json::json!({
         "accountId": account_id,
+        "source": "roster",
         "candidates": candidates,
         "sharedNote": shared_note,
     }))
     .expect("构造 BatchEnableRequest")
+}
+
+fn pool_req(
+    account_id: &str,
+    contact_id: ObjectId,
+    wxid: &str,
+) -> wechatagent::models::BatchEnableRequest {
+    serde_json::from_value(serde_json::json!({
+        "accountId": account_id,
+        "source": "pool",
+        "candidates": [{
+            "contactId": contact_id.to_hex(),
+            "wxid": wxid,
+            // 故意携伪造身份字段；pool 路径不得采信客户端身份。
+            "nickname": "旧账号快照昵称",
+            "avatarUrl": "https://stale.example/avatar.png",
+        }],
+        "sharedNote": "不应写入",
+    }))
+    .expect("构造 pool BatchEnableRequest")
 }
 
 #[tokio::test]
@@ -110,6 +136,504 @@ async fn unregistered_account_rejected() {
     .await
     .expect_err("未注册 account 应 400");
     assert!(matches!(err, AppError::BadRequest(_)), "应为 BadRequest");
+}
+
+/// SR-153：A 账号运营池旧快照切到 B 后，即使 wxid/contactId 一并提交，服务端也必须
+/// 在 playbook、Contact、Task、Audit 的任何副作用前整批拒绝，不能把 A 候选解释成 B。
+#[tokio::test]
+#[ignore]
+async fn pool_candidate_from_other_account_is_conflict_and_zero_write() {
+    let app = TestApp::start().await;
+    let ws = app.state.config.default_workspace_id.clone();
+    let target_account = app.state.config.default_account_id.clone();
+    seed_account(&app, &ws, &target_account).await;
+
+    let stale_account = "account-a-stale";
+    let inserted = app
+        .state
+        .db
+        .contacts()
+        .insert_one(
+            make_contact(
+                &ws,
+                stale_account,
+                "wx_cross_account_pool",
+                AgentStatus::Normal,
+            ),
+            None,
+        )
+        .await
+        .expect("seed stale account contact");
+    let contact_id = inserted.inserted_id.as_object_id().expect("contact oid");
+    let raw_contacts = app.state.db.raw().collection::<Document>("contacts");
+    let before_contact = raw_contacts
+        .find_one(doc! { "_id": contact_id }, None)
+        .await
+        .expect("read before contact")
+        .expect("contact exists");
+    let before_tasks = app
+        .state
+        .db
+        .tasks()
+        .count_documents(doc! { "workspace_id": &ws }, None)
+        .await
+        .expect("count tasks before");
+    let before_events = app
+        .state
+        .db
+        .events()
+        .count_documents(doc! { "workspace_id": &ws }, None)
+        .await
+        .expect("count events before");
+
+    let error = batch_enable_endpoint(
+        State(app.state.clone()),
+        Extension(test_admin(&ws)),
+        axum::Json(pool_req(
+            &target_account,
+            contact_id,
+            "wx_cross_account_pool",
+        )),
+    )
+    .await
+    .expect_err("跨账号 pool 候选必须拒绝");
+    assert!(
+        matches!(error, AppError::Conflict(_)),
+        "跨账号 pool 候选应返回 Conflict，实际: {error:?}"
+    );
+
+    let after_contact = raw_contacts
+        .find_one(doc! { "_id": contact_id }, None)
+        .await
+        .expect("read after contact")
+        .expect("contact remains");
+    assert_eq!(after_contact, before_contact, "联系人完整 BSON 必须零变化");
+    assert_eq!(
+        app.state
+            .db
+            .tasks()
+            .count_documents(doc! { "workspace_id": &ws }, None)
+            .await
+            .expect("count tasks after"),
+        before_tasks,
+        "拒绝前后任务数必须不变"
+    );
+    assert_eq!(
+        app.state
+            .db
+            .events()
+            .count_documents(doc! { "workspace_id": &ws }, None)
+            .await
+            .expect("count events after"),
+        before_events,
+        "拒绝前后审计事件数必须不变"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn sparse_import_preserves_identity_and_non_human_import_is_zero_write() {
+    let app = TestApp::start().await;
+    let ws = app.state.config.default_workspace_id.clone();
+    let acc = app.state.config.default_account_id.clone();
+    let mut contact = make_contact(&ws, &acc, "wx_import_patch", AgentStatus::Normal);
+    contact.nickname = Some("原昵称".to_string());
+    contact.remark = Some("原备注".to_string());
+    contact.alias = Some("原别名".to_string());
+    app.state
+        .db
+        .contacts()
+        .insert_one(contact, None)
+        .await
+        .expect("seed import contact");
+
+    upsert_contact_from_value(
+        &app.state,
+        &ws,
+        &acc,
+        &serde_json::json!({ "wxid": "wx_import_patch" }),
+    )
+    .await
+    .expect("sparse import")
+    .expect("contact remains");
+    let unchanged = app
+        .state
+        .db
+        .contacts()
+        .find_one(
+            doc! { "workspace_id": &ws, "account_id": &acc, "wxid": "wx_import_patch" },
+            None,
+        )
+        .await
+        .expect("read sparse import")
+        .expect("contact exists");
+    assert_eq!(unchanged.nickname.as_deref(), Some("原昵称"));
+    assert_eq!(unchanged.remark.as_deref(), Some("原备注"));
+    assert_eq!(unchanged.alias.as_deref(), Some("原别名"));
+
+    upsert_contact_from_value(
+        &app.state,
+        &ws,
+        &acc,
+        &serde_json::json!({ "wxid": "wx_import_patch", "nickname": "新昵称" }),
+    )
+    .await
+    .expect("single-field import")
+    .expect("contact remains");
+    let patched = app
+        .state
+        .db
+        .contacts()
+        .find_one(
+            doc! { "workspace_id": &ws, "account_id": &acc, "wxid": "wx_import_patch" },
+            None,
+        )
+        .await
+        .expect("read patched import")
+        .expect("contact exists");
+    assert_eq!(patched.nickname.as_deref(), Some("新昵称"));
+    assert_eq!(patched.remark.as_deref(), Some("原备注"));
+    assert_eq!(patched.alias.as_deref(), Some("原别名"));
+
+    for wxid in [
+        "fmessage",
+        "weixin",
+        "gh_official",
+        "room@chatroom",
+        "corp@openim",
+    ] {
+        assert!(upsert_contact_from_value(
+            &app.state,
+            &ws,
+            &acc,
+            &serde_json::json!({ "wxid": wxid, "nickname": "系统账号" }),
+        )
+        .await
+        .expect("non-human import")
+        .is_none());
+    }
+    assert_eq!(
+        app.state
+            .db
+            .contacts()
+            .count_documents(
+                doc! { "workspace_id": &ws, "account_id": &acc, "wxid": { "$in": ["fmessage", "weixin", "gh_official", "room@chatroom", "corp@openim"] } },
+                None,
+            )
+            .await
+            .expect("count non-human imports"),
+        0
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn batch_rejects_non_human_candidates_without_contact_or_task() {
+    let app = TestApp::start().await;
+    let ws = app.state.config.default_workspace_id.clone();
+    let acc = app.state.config.default_account_id.clone();
+    seed_account(&app, &ws, &acc).await;
+    let wxids = [
+        "fmessage",
+        "weixin",
+        "gh_official",
+        "room@chatroom",
+        "corp@openim",
+    ];
+
+    let out = batch_enable_endpoint(
+        State(app.state.clone()),
+        Extension(test_admin(&ws)),
+        axum::Json(req(&acc, &wxids, "不应落库")),
+    )
+    .await
+    .expect("mixed non-human batch returns itemized rejection")
+    .0;
+    assert_eq!(out["enabled"], 0);
+    assert_eq!(out["queued"], 0);
+    assert_eq!(out["rejectedNonHuman"], wxids.len() as i64);
+    assert_eq!(
+        app.state
+            .db
+            .contacts()
+            .count_documents(doc! { "workspace_id": &ws, "account_id": &acc }, None)
+            .await
+            .expect("count contacts"),
+        0
+    );
+    assert_eq!(
+        app.state
+            .db
+            .tasks()
+            .count_documents(
+                doc! { "workspace_id": &ws, "account_id": &acc, "kind": "initial_profile" },
+                None
+            )
+            .await
+            .expect("count tasks"),
+        0
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn task_insert_failure_never_leaves_managed_contact() {
+    let app = TestApp::start().await;
+    let ws = app.state.config.default_workspace_id.clone();
+    let acc = app.state.config.default_account_id.clone();
+    seed_account(&app, &ws, &acc).await;
+
+    app.state
+        .db
+        .raw()
+        .run_command(
+            doc! {
+                "collMod": "agent_tasks",
+                "validator": { "kind": { "$ne": "initial_profile" } },
+                "validationAction": "error",
+            },
+            None,
+        )
+        .await
+        .expect("install initial-profile rejection validator");
+
+    let result = batch_enable_endpoint(
+        State(app.state.clone()),
+        Extension(test_admin(&ws)),
+        axum::Json(req(&acc, &["wx_task_failure"], "故障注入")),
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "task insert failure must surface to caller"
+    );
+    assert_eq!(
+        app.state
+            .db
+            .contacts()
+            .count_documents(
+                doc! {
+                    "workspace_id": &ws,
+                    "account_id": &acc,
+                    "wxid": "wx_task_failure",
+                    "agent_status": "managed",
+                },
+                None,
+            )
+            .await
+            .expect("count half-committed contacts"),
+        0,
+        "durable task intent must exist before managed becomes visible"
+    );
+
+    app.state
+        .db
+        .raw()
+        .run_command(
+            doc! {
+                "collMod": "agent_tasks",
+                "validator": {},
+                "validationLevel": "off",
+            },
+            None,
+        )
+        .await
+        .expect("remove initial-profile rejection validator");
+}
+
+#[tokio::test]
+#[ignore]
+async fn concurrent_batch_enable_has_one_active_initial_profile_intent() {
+    let app = TestApp::start().await;
+    let ws = app.state.config.default_workspace_id.clone();
+    let acc = app.state.config.default_account_id.clone();
+    seed_account(&app, &ws, &acc).await;
+
+    let first = batch_enable_endpoint(
+        State(app.state.clone()),
+        Extension(test_admin(&ws)),
+        axum::Json(req(&acc, &["wx_single_flight"], "并发一")),
+    );
+    let second = batch_enable_endpoint(
+        State(app.state.clone()),
+        Extension(test_admin(&ws)),
+        axum::Json(req(&acc, &["wx_single_flight"], "并发二")),
+    );
+    let (first, second) = tokio::join!(first, second);
+    let first = first.expect("first concurrent enrollment").0;
+    let second = second.expect("second concurrent enrollment").0;
+    assert_eq!(
+        first["queued"].as_i64().unwrap() + second["queued"].as_i64().unwrap(),
+        1
+    );
+
+    assert_eq!(
+        app.state
+            .db
+            .tasks()
+            .count_documents(
+                doc! {
+                    "workspace_id": &ws,
+                    "account_id": &acc,
+                    "contact_wxid": "wx_single_flight",
+                    "kind": "initial_profile",
+                    "active_task_key": "initial_profile",
+                },
+                None,
+            )
+            .await
+            .expect("count active enrollment intents"),
+        1
+    );
+    assert_eq!(
+        app.state
+            .db
+            .contacts()
+            .count_documents(
+                doc! {
+                    "workspace_id": &ws,
+                    "account_id": &acc,
+                    "wxid": "wx_single_flight",
+                    "agent_status": "managed",
+                },
+                None,
+            )
+            .await
+            .expect("count managed contact"),
+        1
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn rotated_generation_retires_old_task_and_reenables_in_same_request() {
+    let app = TestApp::start().await;
+    let ws = app.state.config.default_workspace_id.clone();
+    let acc = app.state.config.default_account_id.clone();
+    seed_account(&app, &ws, &acc).await;
+
+    let first = batch_enable_endpoint(
+        State(app.state.clone()),
+        Extension(test_admin(&ws)),
+        axum::Json(req(&acc, &["wx_generation"], "第一代")),
+    )
+    .await
+    .expect("first enrollment")
+    .0;
+    assert_eq!(first["enabled"], 1);
+    assert_eq!(first["queued"], 1);
+
+    let old_task = app
+        .state
+        .db
+        .tasks()
+        .clone_with_type::<Document>()
+        .find_one(
+            doc! {
+                "workspace_id": &ws,
+                "account_id": &acc,
+                "contact_wxid": "wx_generation",
+                "active_task_key": "initial_profile",
+            },
+            None,
+        )
+        .await
+        .expect("read first task")
+        .expect("first task exists");
+    let old_task_id = old_task.get_object_id("_id").expect("old task id");
+    let old_token = old_task
+        .get_str("enrollment_token")
+        .expect("old enrollment token")
+        .to_string();
+
+    // Simulate the narrow crash window after disable rotated the Contact generation but before
+    // it cancelled the old task. The next enable request must repair this without user retry.
+    let rotated_token = uuid::Uuid::new_v4().to_string();
+    app.state
+        .db
+        .contacts()
+        .update_one(
+            doc! {
+                "workspace_id": &ws,
+                "account_id": &acc,
+                "wxid": "wx_generation",
+                "agent_status": "managed",
+                "enrollment_token": &old_token,
+            },
+            doc! { "$set": {
+                "agent_status": "normal",
+                "enrollment_token": &rotated_token,
+                "updated_at": DateTime::now(),
+            } },
+            None,
+        )
+        .await
+        .expect("rotate generation");
+
+    let second = batch_enable_endpoint(
+        State(app.state.clone()),
+        Extension(test_admin(&ws)),
+        axum::Json(req(&acc, &["wx_generation"], "第二代")),
+    )
+    .await
+    .expect("same request repairs stale generation")
+    .0;
+    assert_eq!(second["enabled"], 1);
+    assert_eq!(second["queued"], 1);
+
+    let old_after = app
+        .state
+        .db
+        .tasks()
+        .clone_with_type::<Document>()
+        .find_one(doc! { "_id": old_task_id }, None)
+        .await
+        .expect("read retired task")
+        .expect("retired task remains for audit");
+    assert_eq!(old_after.get_str("status").unwrap(), "cancelled");
+    assert!(old_after.get("active_task_key").is_none());
+
+    let active = app
+        .state
+        .db
+        .tasks()
+        .clone_with_type::<Document>()
+        .find_one(
+            doc! {
+                "workspace_id": &ws,
+                "account_id": &acc,
+                "contact_wxid": "wx_generation",
+                "active_task_key": "initial_profile",
+            },
+            None,
+        )
+        .await
+        .expect("read active generation")
+        .expect("new active generation exists");
+    assert_ne!(active.get_object_id("_id").unwrap(), old_task_id);
+    let new_token = active.get_str("enrollment_token").unwrap();
+    assert_ne!(new_token, old_token);
+    assert_ne!(new_token, rotated_token);
+
+    assert_eq!(
+        app.state
+            .db
+            .contacts()
+            .clone_with_type::<Document>()
+            .count_documents(
+                doc! {
+                    "workspace_id": &ws,
+                    "account_id": &acc,
+                    "wxid": "wx_generation",
+                    "agent_status": "managed",
+                    "enrollment_token": new_token,
+                },
+                None,
+            )
+            .await
+            .expect("verify new generation contact"),
+        1
+    );
 }
 
 #[tokio::test]
@@ -153,7 +677,10 @@ async fn batch_enables_and_queues_initial_profile_tasks() {
         .await
         .expect("query")
         .expect("contact exists");
-    assert_eq!(c.human_profile_note.as_deref(), Some("统一运营备注：热情专业"));
+    assert_eq!(
+        c.human_profile_note.as_deref(),
+        Some("统一运营备注：热情专业")
+    );
     assert_eq!(c.avatar_url.as_deref(), Some("http://img/wx_b1"));
     assert_eq!(c.sex, Some(1), "候选带的 sex 应落库到 Contact.sex");
     // 竞态修复：全新客户在 batch upsert 阶段即同步拿到状态机 initial 态（不等异步画像回填），
@@ -318,7 +845,11 @@ async fn batch_preserves_previously_operated_state_but_seeds_new() {
         Some("deal_won"),
         "老客户已积累的 operation_state 不得被批量托管覆盖"
     );
-    assert_eq!(vet.operation_state_confidence, Some(9), "老客户 confidence 不被覆盖");
+    assert_eq!(
+        vet.operation_state_confidence,
+        Some(9),
+        "老客户 confidence 不被覆盖"
+    );
 
     // 全新客户：同步拿到状态机 initial 态。
     let fresh = app
@@ -429,7 +960,10 @@ async fn initial_profile_task_marks_sent_when_unmanaged() {
     app.state
         .db
         .contacts()
-        .insert_one(make_contact(&ws, &acc, "wx_unmanaged", AgentStatus::Normal), None)
+        .insert_one(
+            make_contact(&ws, &acc, "wx_unmanaged", AgentStatus::Normal),
+            None,
+        )
         .await
         .expect("seed unmanaged contact");
 
@@ -454,7 +988,10 @@ async fn initial_profile_task_marks_sent_when_unmanaged() {
         .await
         .expect("query task")
         .expect("task exists");
-    assert_eq!(stored.status, "sent", "非 managed 早退也必须写终态 sent，不得停 running");
+    assert_eq!(
+        stored.status, "sent",
+        "非 managed 早退也必须写终态 sent，不得停 running"
+    );
     assert_eq!(stored.gateway_status.as_deref(), Some("unmanaged"));
 }
 
@@ -489,6 +1026,9 @@ async fn initial_profile_task_marks_sent_when_contact_gone() {
         .await
         .expect("query task")
         .expect("task exists");
-    assert_eq!(stored.status, "sent", "联系人不存在早退也必须写终态 sent，不得停 running");
+    assert_eq!(
+        stored.status, "sent",
+        "联系人不存在早退也必须写终态 sent，不得停 running"
+    );
     assert_eq!(stored.gateway_status.as_deref(), Some("contact_gone"));
 }

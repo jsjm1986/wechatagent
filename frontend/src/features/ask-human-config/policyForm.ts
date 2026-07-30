@@ -34,7 +34,12 @@ export function extractPolicy(domainItem: unknown): AskHumanPolicy {
         const wxid = (it as Record<string, unknown>).wxid;
         if (typeof wxid !== "string") return [];
         const dn = (it as Record<string, unknown>).displayName;
-        return [{ wxid, ...(typeof dn === "string" ? { displayName: dn } : {}) }];
+        const accountId = (it as Record<string, unknown>).accountId;
+        return [{
+          wxid,
+          ...(typeof dn === "string" ? { displayName: dn } : {}),
+          ...(typeof accountId === "string" ? { accountId } : {}),
+        }];
       })
     : [];
   let quietHours: AskHumanQuietHours | undefined;
@@ -64,12 +69,14 @@ export function extractPolicy(domainItem: unknown): AskHumanPolicy {
 // 校验草稿；返回错误消息数组（空 = 通过）。前端体验校验，后端是权威。
 export function validatePolicy(p: AskHumanPolicy): string[] {
   const errs: string[] = [];
-  if (!p.deciderChain || p.deciderChain.length === 0) {
-    errs.push("至少配置一个决策人");
-  }
+  // 空链是后端定义的显式关闭态，不是校验错误。
   for (const d of p.deciderChain ?? []) {
     if (!d.wxid || d.wxid.trim().length === 0) {
       errs.push("决策人 wxid 不能为空");
+      break;
+    }
+    if (!d.accountId || d.accountId.trim().length === 0) {
+      errs.push("决策人必须绑定发送账号");
       break;
     }
   }

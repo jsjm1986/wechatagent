@@ -204,10 +204,7 @@ mod tests {
             ]
         };
         let changed = merge_allowed_from_defaults(&mut machine, &defaults);
-        assert!(
-            !changed,
-            "无需改动时返回 false，避免对 mongo 做空 update"
-        );
+        assert!(!changed, "无需改动时返回 false，避免对 mongo 做空 update");
     }
 
     /// H13 / m019：补齐 initial / forbidsProactive 标志，只补缺失不覆盖运营人员值，
@@ -227,12 +224,19 @@ mod tests {
             ]
         };
         let changed = merge_state_flag_defaults(&mut machine, &defaults);
-        assert!(changed, "new_contact.initial + cooldown.forbidsProactive 应被补齐");
+        assert!(
+            changed,
+            "new_contact.initial + cooldown.forbidsProactive 应被补齐"
+        );
 
         let states = machine.get_array("states").unwrap();
         let nc = states[0].as_document().unwrap();
         assert_eq!(nc.get_bool("initial").unwrap(), true);
-        assert_eq!(nc.get_str("name").unwrap(), "改过名", "不覆盖运营人员已写字段");
+        assert_eq!(
+            nc.get_str("name").unwrap(),
+            "改过名",
+            "不覆盖运营人员已写字段"
+        );
         assert!(!nc.contains_key("forbidsProactive"), "false 默认不落库");
         let cd = states[1].as_document().unwrap();
         assert_eq!(cd.get_bool("forbidsProactive").unwrap(), true);
@@ -251,7 +255,9 @@ mod tests {
         };
         let changed = merge_state_flag_defaults(&mut machine, &defaults);
         assert!(!changed, "已存在的标志不被覆盖 → 无改动");
-        let nc = machine.get_array("states").unwrap()[0].as_document().unwrap();
+        let nc = machine.get_array("states").unwrap()[0]
+            .as_document()
+            .unwrap();
         assert_eq!(nc.get_bool("initial").unwrap(), false);
     }
 }

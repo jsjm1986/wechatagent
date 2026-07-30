@@ -511,7 +511,7 @@ export function DomainSchemaTab() {
     void load();
   }, []);
 
-  async function activate(schemaId: string, name: string) {
+  async function activate(schemaId: string, version: number, name: string) {
     const ok = await confirm({
       title: "切换为当前使用的字段表？",
       body: `切换后，AI 将改用「${name}」来判断客户的阶段、意向和异议，正在进行的会话会立即生效。`,
@@ -519,10 +519,11 @@ export function DomainSchemaTab() {
       confirmText: "确认切换",
     });
     if (!ok) return;
-    setActivating(schemaId);
+    const activationKey = `${schemaId}@${version}`;
+    setActivating(activationKey);
     setError(null);
     try {
-      const r = await fetch(`/api/admin/domain-schemas/${encodeURIComponent(schemaId)}/activate`, {
+      const r = await fetch(`/api/admin/domain-schemas/${encodeURIComponent(schemaId)}/activate?expectedVersion=${version}`, {
         method: "POST",
       });
       if (!r.ok) throw await parseApiError(r);
@@ -548,7 +549,7 @@ export function DomainSchemaTab() {
         body: JSON.stringify(body),
       });
       if (!r.ok) throw await parseApiError(r);
-      toast.success(isEdit ? "已更新字段表" : "已新建字段表（未激活，可在列表设为当前使用）");
+      toast.success(isEdit ? "已创建字段表新版本（未激活）" : "已新建字段表（未激活，可在列表设为当前使用）");
       setEditing(null);
       await load();
     } catch (e: unknown) {
@@ -570,7 +571,10 @@ export function DomainSchemaTab() {
     if (!ok) return;
     setError(null);
     try {
-      const r = await fetch(`/api/admin/domain-schemas/${encodeURIComponent(s.schemaId)}`, { method: "DELETE" });
+      const r = await fetch(
+        `/api/admin/domain-schemas/${encodeURIComponent(s.schemaId)}?expectedVersion=${s.version}`,
+        { method: "DELETE" },
+      );
       if (!r.ok) throw await parseApiError(r);
       toast.success("已删除");
       await load();
@@ -636,10 +640,10 @@ export function DomainSchemaTab() {
                     <button
                       type="button"
                       className="primary"
-                      onClick={() => void activate(s.schemaId, s.name)}
-                      disabled={activating === s.schemaId}
+                      onClick={() => void activate(s.schemaId, s.version, s.name)}
+                      disabled={activating === `${s.schemaId}@${s.version}`}
                     >
-                      {activating === s.schemaId ? "切换中…" : "设为当前使用"}
+                      {activating === `${s.schemaId}@${s.version}` ? "切换中…" : "设为当前使用"}
                     </button>
                   )}
                   <button type="button" className="ghost" onClick={() => setEditing({ mode: "edit", initial: s })}>
@@ -1400,7 +1404,10 @@ export function MemoryDrawer() {
   const [items, setItems] = useState<OperatorMemoryView[]>([]);
   const [kind, setKind] = useState("");
   const [pending, setPending] = useState(false);
+  const [revokingId, setRevokingId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const confirm = useConfirm();
+  const toast = useToast();
 
   async function load() {
     setPending(true);
@@ -1425,6 +1432,42 @@ export function MemoryDrawer() {
     void load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [kind]);
+
+  async function revoke(memory: OperatorMemoryView) {
+    if (!memory.id || revokingId) return;
+    const memoryId = memory.id;
+    const frozen = { ...memory, id: memoryId };
+    const ok = await confirm({
+      title: "撤销这条运营记忆？",
+      body: `撤销后，AI 后续起草将不再参考「${frozen.content}」。审计记录会保留。`,
+      tone: "danger",
+      confirmText: "确认撤销",
+    });
+    if (!ok) return;
+    setRevokingId(frozen.id);
+    setError(null);
+    try {
+      const response = await fetch(
+        `/api/knowledge/operator-memory/${encodeURIComponent(frozen.id)}/revoke`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            accountId: frozen.accountId,
+            operatorId: frozen.operatorId,
+            reason: "运营在记忆抽屉中撤销",
+          }),
+        },
+      );
+      if (!response.ok) throw await parseApiError(response);
+      setItems((current) => current.filter((item) => item.id !== frozen.id));
+      toast.success("运营记忆已撤销，后续起草不再使用");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRevokingId(null);
+    }
+  }
 
   return (
     <div className="wikiMemoryDrawer">
@@ -1461,7 +1504,17 @@ export function MemoryDrawer() {
           <li className={`wikiMemoryItem kind-${m.kind}`} key={m.id ?? `${m.kind}-${m.createdAt}`}>
             <div className="wikiMemoryItemHead">
               <span className={`wikiMemoryKind kind-${m.kind}`}>{operatorMemoryKindLabel(m.kind)}</span>
-              <span className="wikiMemoryOperator">{m.operatorId}</span>
+              <div className="wikiMemoryItemActions">
+                <span className="wikiMemoryOperator">{m.operatorId}</span>
+                <button
+                  type="button"
+                  className="wikiMemoryRevokeBtn"
+                  disabled={!m.id || revokingId !== null}
+                  onClick={() => void revoke(m)}
+                >
+                  <Undo2 size={12} /> {revokingId === m.id ? "撤销中" : "撤销"}
+                </button>
+              </div>
             </div>
             <div className="wikiMemoryContent">{m.content}</div>
             <div className="wikiMemoryFoot">

@@ -12,20 +12,22 @@
 //!    池子里随机挑一条作为 hook 摘要写入 `agent_tasks.content`；池空时退化为
 //!    "Planner: cold_reactivation since {last_outbound_ts}"，让 gateway 走默认
 //!    Reply Agent 决策（不绕开 outbox / 安全门）；
-//! 4) 单 account 当日 `cold_contact_daily_emit_cap` 上限保护；
+//! 4) 单 workspace、UTC 当日持久 `cold_contact_daily_emit_cap` 上限保护；
 //! 5) 写 `cold_contact_emit` / `cold_contact_tick` 事件，与 strategic planner
 //!    事件 kind 命名空间隔离。
 //!
 //! 不绕过 gateway：emit 出来的 follow_up 由 tasks worker 拉起，再走标准
 //! `handle_follow_up_task` → outbox → MCP；本 worker 仅负责选 contact + 写任务。
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use futures::TryStreamExt;
 use mongodb::bson::{doc, DateTime, Document};
 use tokio::time::sleep;
 
-use crate::models::{AgentTask, Contact};
+use crate::models::Contact;
+use crate::proactive_outreach::{CommitOutcome, DailyQuota, FollowUpIntent};
 use crate::routes::AppState;
 
 /// 冷联系人 worker 主循环。`cold_contact_worker_enabled=false` 时立刻 return，
@@ -42,8 +44,23 @@ pub async fn run_cold_contact_worker(state: AppState) {
         "cold_contact_worker loop started"
     );
     loop {
-        if let Err(error) = tick(&state).await {
-            tracing::error!(error = %error, "cold_contact_worker tick failed");
+        match crate::account_scheduler::list_registered_account_scopes(&state).await {
+            Ok(scopes) => {
+                for scope in crate::account_scheduler::representative_workspace_scopes(&scopes) {
+                    if let Err(error) =
+                        scan_cold_outbound(&state, &scope.workspace_id, &scope.account_id).await
+                    {
+                        tracing::error!(
+                            error = %error,
+                            workspace_id = %scope.workspace_id,
+                            "cold_contact_worker workspace scan failed"
+                        );
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::error!(error = %error, "cold_contact_worker scope listing failed");
+            }
         }
         sleep(Duration::from_secs(
             state.config.strategic_planner_interval_seconds.max(60),
@@ -54,11 +71,18 @@ pub async fn run_cold_contact_worker(state: AppState) {
 
 /// 单 tick 入口（lib 测试 + 主循环复用）。任何一段失败短路返回。
 pub async fn tick(state: &AppState) -> anyhow::Result<()> {
-    scan_cold_outbound(state).await
+    let scopes = crate::account_scheduler::list_registered_account_scopes(state).await?;
+    for scope in crate::account_scheduler::representative_workspace_scopes(&scopes) {
+        scan_cold_outbound(state, &scope.workspace_id, &scope.account_id).await?;
+    }
+    Ok(())
 }
 
-async fn scan_cold_outbound(state: &AppState) -> anyhow::Result<()> {
-    let workspace_id = state.config.default_workspace_id.clone();
+async fn scan_cold_outbound(
+    state: &AppState,
+    workspace_id: &str,
+    audit_account_id: &str,
+) -> anyhow::Result<()> {
     let now = DateTime::now();
     let now_ms = now.timestamp_millis();
     let threshold_ms = state
@@ -71,14 +95,13 @@ async fn scan_cold_outbound(state: &AppState) -> anyhow::Result<()> {
     // 下其它 account 的 cold contact 永远不会被重激活。改成 workspace 级扫描；
     // emit 仍按 contact 自带 account_id（粘性绑定，不绕过 account_scheduler 的
     // "已绑定 contact 仍走原账号" 不变量）。
-    let filter = cold_candidate_filter_workspace(&workspace_id, cold_before);
+    let filter = cold_candidate_filter_workspace(workspace_id, cold_before);
     let mut cursor = state.db.contacts().find(filter, None).await?;
 
     let daily_cap = state.config.cold_contact_daily_emit_cap;
-    let already_emitted_today =
-        count_today_cold_emit_workspace(state, &workspace_id, now).await?;
+    let already_emitted_today = count_today_cold_emit_workspace(state, workspace_id, now).await?;
 
-    let peer_hooks = load_peer_case_hooks(state, &workspace_id).await.unwrap_or_default();
+    let mut peer_hooks_by_account: HashMap<String, Vec<String>> = HashMap::new();
 
     let mut scanned = 0i64;
     let mut emitted = 0i64;
@@ -91,15 +114,6 @@ async fn scan_cold_outbound(state: &AppState) -> anyhow::Result<()> {
         if has_pending_follow_up(state, &contact).await? {
             continue;
         }
-        // P1-3：每个候选 emit 之前重新拉一次"今日已 emit 数"，作为 hard cap。
-        // 旧实现只在 tick 起始读一次 count，并在内存里 decrement 一个本地
-        // counter，并发 tick 之间会让真实 emit 数翻倍。改为每轮 re-count，
-        // 让 cap 与 cold_contact_emit 事件 collection 真实实时对齐。
-        let live_count =
-            count_today_cold_emit_workspace(state, &workspace_id, now).await?;
-        if cap_reached(live_count, daily_cap) {
-            break;
-        }
         // S4 (Phase 0)：写一条 account_scheduler_assignment 审计——contact 已经
         // 绑定 account，scheduler 结果只用作"哪个时间被路由到哪个账号"的统一
         // 审计流。失败被吞掉（assign_account 内部已 best-effort 写事件）。
@@ -111,42 +125,66 @@ async fn scan_cold_outbound(state: &AppState) -> anyhow::Result<()> {
         )
         .await;
 
-        let hook = pick_hook(&peer_hooks, &contact.wxid);
+        if !peer_hooks_by_account.contains_key(&contact.account_id) {
+            let hooks = load_peer_case_hooks(state, workspace_id, &contact.account_id)
+                .await
+                .unwrap_or_default();
+            peer_hooks_by_account.insert(contact.account_id.clone(), hooks);
+        }
+        let hook = peer_hooks_by_account
+            .get(&contact.account_id)
+            .and_then(|hooks| pick_hook(hooks, &contact.wxid));
         let last_outbound_repr = contact
             .last_outbound_at
             .map(|d| d.timestamp_millis().to_string())
             .unwrap_or_else(|| "never".to_string());
         let content = match hook.as_deref() {
-            Some(hook_text) => format!(
-                "Planner: cold_reactivation since {last_outbound_repr} | hook={hook_text}"
-            ),
+            Some(hook_text) => {
+                format!("Planner: cold_reactivation since {last_outbound_repr} | hook={hook_text}")
+            }
             None => format!("Planner: cold_reactivation since {last_outbound_repr}"),
         };
-        emit_cold_follow_up(state, &contact, content, now).await?;
-        write_event(
+        let outcome = crate::proactive_outreach::commit_follow_up(
             state,
-            &contact.account_id,
-            Some(&contact.wxid),
-            "cold_contact_emit",
-            "emitted",
-            "Planner: cold_reactivation emitted",
-            Some(doc! {
-                "source": "cold_contact_worker",
-                "lastOutboundAt": contact
-                    .last_outbound_at
-                    .map(|d| d.timestamp_millis())
-                    .unwrap_or(0),
-                "thresholdHours": state.config.cold_contact_threshold_hours,
-                "hookSelected": hook.is_some(),
-            }),
+            FollowUpIntent {
+                contact: contact.clone(),
+                segment: "cold_contact",
+                subject: format!("last-outbound:{last_outbound_repr}"),
+                content,
+                event_kind: "cold_contact_emit",
+                event_summary: "Planner: cold_reactivation emitted".to_string(),
+                event_details: doc! {
+                    "source": "cold_contact_worker",
+                    "lastOutboundAt": contact
+                        .last_outbound_at
+                        .map(|d| d.timestamp_millis())
+                        .unwrap_or(0),
+                    "thresholdHours": state.config.cold_contact_threshold_hours,
+                    "hookSelected": hook.is_some(),
+                },
+                now,
+                quota: DailyQuota {
+                    namespace: "cold_contact",
+                    account_scope: None,
+                    total_cap: daily_cap,
+                    segment_cap: None,
+                    initial_total: already_emitted_today,
+                    initial_segment: already_emitted_today,
+                },
+            },
         )
         .await?;
-        emitted += 1;
+        match outcome {
+            CommitOutcome::Emitted => emitted += 1,
+            CommitOutcome::Duplicate => continue,
+            CommitOutcome::Capped => break,
+        }
     }
 
     write_event(
         state,
-        &state.config.default_account_id,
+        workspace_id,
+        audit_account_id,
         None,
         "cold_contact_tick",
         "ok",
@@ -208,6 +246,7 @@ pub(crate) fn cold_candidate_passes_in_memory(contact: &Contact, _now_ms: i64) -
 /// 提取出来纯粹是为了让 `cap_reached(live_count, daily_cap)` 可单测：
 /// `live_count >= daily_cap` 时返回 true（应停止 emit）。`daily_cap == 0`
 /// 关停冷链路；负值视为 0；i64 溢出由 saturating 形式预防。
+#[cfg(test)]
 pub(crate) fn cap_reached(live_count: i64, daily_cap: i64) -> bool {
     let cap = daily_cap.max(0);
     live_count.max(0) >= cap
@@ -239,41 +278,6 @@ async fn count_today_cold_emit_workspace(
     Ok(count as i64)
 }
 
-async fn emit_cold_follow_up(
-    state: &AppState,
-    contact: &Contact,
-    content: String,
-    now: DateTime,
-) -> anyhow::Result<()> {
-    let expires_hours: i64 = 48;
-    let expires_at = DateTime::from_millis(now.timestamp_millis() + expires_hours * 60 * 60 * 1000);
-    let task = AgentTask {
-        id: None,
-        workspace_id: contact.workspace_id.clone(),
-        account_id: contact.account_id.clone(),
-        contact_wxid: contact.wxid.clone(),
-        kind: "follow_up".to_string(),
-        run_at: now,
-        expires_at: Some(expires_at),
-        content,
-        status: "pending".to_string(),
-        source_decision_id: None,
-        review_required: true,
-        attempt_count: 0,
-        max_attempts: 3,
-        next_retry_at: None,
-        gateway_status: None,
-        cancel_reason: None,
-        error: None,
-        claimed_at: None,
-        claim_recovery_count: 0,
-        created_at: now,
-        updated_at: now,
-    };
-    state.db.tasks().insert_one(task, None).await?;
-    Ok(())
-}
-
 async fn has_pending_follow_up(state: &AppState, contact: &Contact) -> anyhow::Result<bool> {
     let count = state
         .db
@@ -294,6 +298,7 @@ async fn has_pending_follow_up(state: &AppState, contact: &Contact) -> anyhow::R
 
 async fn write_event(
     state: &AppState,
+    workspace_id: &str,
     account_id: &str,
     contact_wxid: Option<&str>,
     kind: &str,
@@ -303,6 +308,7 @@ async fn write_event(
 ) -> anyhow::Result<()> {
     crate::agent::write_event_for_account(
         state,
+        workspace_id,
         account_id,
         contact_wxid,
         kind,
@@ -322,7 +328,11 @@ async fn write_event(
 ///
 /// ①-b 红线：只取 integrity_status="verified" 的 peer_case——对客推送文案必须内容
 /// 已核实（active/approved 是启用门，verified 是内容门，双门都过才可推送给客户）。
-async fn load_peer_case_hooks(state: &AppState, workspace_id: &str) -> anyhow::Result<Vec<String>> {
+async fn load_peer_case_hooks(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+) -> anyhow::Result<Vec<String>> {
     let mut cursor = state
         .db
         .raw()
@@ -333,6 +343,10 @@ async fn load_peer_case_hooks(state: &AppState, workspace_id: &str) -> anyhow::R
                 "chunk_type": "peer_case",
                 "status": { "$in": ["active", "approved"] },
                 "integrity_status": "verified",
+                "$or": [
+                    { "account_id": null },
+                    { "account_id": account_id },
+                ],
             },
             None,
         )

@@ -109,12 +109,13 @@ mod tests {
 
         // 非实体投影豁免清单(helper / 非 model→Value / 异步生成器 / 其它批次域),逐条注明理由。
         const ALLOWLIST: &[&str] = &[
-            "bson_from_json",          // helper:JSON→BSON Document,非投影
-            "bson_doc_to_json",        // helper:Document→Value 通用桥
-            "parse_warning_to_json",   // 解析告警,非实体投影
-            "vision_generate_json",    // async LLM 调用,非 model→Value
-            "lesson_doc_to_json",      // 入参是裸 Document 非 model(批次2 评估纳入)
-            "cohort_run_ids_json",     // helper:返回裸数组(json!([hex...]))非对象投影,无顶层键集;形状由 proposal 详情端点 cohortRunIds 键间接覆盖
+            "bson_from_json",        // helper:JSON→BSON Document,非投影
+            "bson_doc_to_json",      // helper:Document→Value 通用桥
+            "parse_warning_to_json", // 解析告警,非实体投影
+            "vision_generate_json",  // async LLM 调用,非 model→Value
+            "canonical_json",        // import hash canonicalizer, not an API projection
+            "lesson_doc_to_json",    // 入参是裸 Document 非 model(批次2 评估纳入)
+            "cohort_run_ids_json", // helper:返回裸数组(json!([hex...]))非对象投影,无顶层键集;形状由 proposal 详情端点 cohortRunIds 键间接覆盖
         ];
 
         fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {

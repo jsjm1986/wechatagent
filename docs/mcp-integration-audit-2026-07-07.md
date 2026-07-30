@@ -2,7 +2,7 @@
 
 ## 环境
 - **MCP Server**: `http://117.72.54.28:3001`
-- **API Key**: `gwa_ba60a98aada58c10b77f6f20841c77c6c3c0506d9431871f`（Workspace Key）
+- **API Key**: `<redacted>`（由部署环境的 secret 注入）
 - **当前实现**: `src/mcp.rs`（commit `b640ce4`）
 
 ## 活体测试结果（✅ 全绿）
@@ -44,7 +44,7 @@
 
 **当前架构假设**: 每个微信账号配置独立的 Account Key（存在 `wechat_accounts.mcp_api_key`），`credentials_for_account` 按 `account_id` 查库拿到该账号专属的 `base_url` 和 `api_key`。
 
-**实际情况**: 提供的 Key `gwa_ba60a98a...` 是 **Workspace Key**（`scope=workspace`，`bound_account_id=null`，管理多个账号）。按 MCP guide 和 `auth_whoami` 响应：
+**实际情况**: 提供的凭证是 **Workspace Key**（`scope=workspace`，`bound_account_id=null`，管理多个账号）。按 MCP guide 和 `auth_whoami` 响应：
 
 > Workspace Key 调用 **账号类工具**（如 `message_send_text`/`contacts_search`/`account_list`）时，**必须在 `arguments` 里传 `account_alias`**，否则 server 不知道操作哪个微信号。
 

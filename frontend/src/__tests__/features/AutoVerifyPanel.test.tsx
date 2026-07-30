@@ -9,12 +9,19 @@ describe("AutoVerifyPanel", () => {
     expect(screen.getByText(/留.*复查/)).toBeInTheDocument();
   });
   it("点开始筛 → 调 auto-verify,结果分三堆显示", async () => {
-    globalThis.fetch = vi.fn(() => Promise.resolve({ ok: true, json: () => Promise.resolve({
+    const fetchMock = vi.fn((_input: RequestInfo | URL, _init?: RequestInit) => Promise.resolve({ ok: true, json: () => Promise.resolve({
       processed: 50, verified: 31, needsReview: 14, rejected: 0, needsHumanAudit: 5,
-    }) } as Response)) as unknown as typeof fetch;
+    }) } as Response));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
     render(<AutoVerifyPanel />);
     fireEvent.click(screen.getByRole("button", { name: /开始筛/ }));
     await waitFor(() => expect(screen.getByText("31")).toBeInTheDocument());
+    const request = fetchMock.mock.calls[0]?.[1] as RequestInit;
+    expect(JSON.parse(String(request.body))).toEqual({
+      confidenceThreshold: 7,
+      humanAuditSampleRate: 0.3,
+      limit: 50,
+    });
     expect(screen.getByText("5")).toBeInTheDocument();   // 留复查
     expect(screen.getByText("14")).toBeInTheDocument();  // 没把握
   });

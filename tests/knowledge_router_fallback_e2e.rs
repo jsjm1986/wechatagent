@@ -29,7 +29,12 @@ use crate::common::TestApp;
 
 const ACCOUNT: &str = "default"; // 与 TestApp 的 default_workspace_id 对齐
 
-fn verified_chunk(workspace_id: &str, title: &str, wiki_type: &str, conf: f64) -> OperationKnowledgeChunk {
+fn verified_chunk(
+    workspace_id: &str,
+    title: &str,
+    wiki_type: &str,
+    conf: f64,
+) -> OperationKnowledgeChunk {
     OperationKnowledgeChunk {
         id: Some(ObjectId::new()),
         workspace_id: workspace_id.to_string(),
@@ -95,9 +100,15 @@ async fn router_falls_back_to_top_n_when_agent_cites_nothing() {
         "sourceQuotes": [],
     }));
 
-    let result = test_knowledge_route_for_contact(&app.state, None, &app.state.config.default_workspace_id, ACCOUNT, "随便问个问题")
-        .await
-        .expect("route");
+    let result = test_knowledge_route_for_contact(
+        &app.state,
+        None,
+        &app.state.config.default_workspace_id,
+        ACCOUNT,
+        "随便问个问题",
+    )
+    .await
+    .expect("route");
 
     let route = result.get_document("route").expect("route doc");
     let selected: Vec<String> = route
@@ -130,10 +141,19 @@ async fn router_falls_back_to_top_n_when_agent_cites_nothing() {
         .collect();
     let selected_types: Vec<&str> = selected
         .iter()
-        .map(|id| by_id.get(id).expect("known id").wiki_type.as_deref().unwrap_or(""))
+        .map(|id| {
+            by_id
+                .get(id)
+                .expect("known id")
+                .wiki_type
+                .as_deref()
+                .unwrap_or("")
+        })
         .collect();
     assert!(
-        selected_types.iter().all(|&t| matches!(t, "thesis" | "methodology" | "entity")),
+        selected_types
+            .iter()
+            .all(|&t| matches!(t, "thesis" | "methodology" | "entity")),
         "top-5 必须按 wiki_type_priority 倒排，不应包含低优先级 source, got {selected_types:?}"
     );
     assert_eq!(
@@ -142,7 +162,10 @@ async fn router_falls_back_to_top_n_when_agent_cites_nothing() {
         "thesis 优先级最高，应全选"
     );
     assert_eq!(
-        selected_types.iter().filter(|&&t| t == "methodology").count(),
+        selected_types
+            .iter()
+            .filter(|&&t| t == "methodology")
+            .count(),
         2,
         "methodology 第二档，应全选"
     );
@@ -191,9 +214,15 @@ async fn router_falls_back_when_agent_cites_chunks_outside_corpus() {
         }],
     }));
 
-    let result = test_knowledge_route_for_contact(&app.state, None, &app.state.config.default_workspace_id, ACCOUNT, "查个东西")
-        .await
-        .expect("route");
+    let result = test_knowledge_route_for_contact(
+        &app.state,
+        None,
+        &app.state.config.default_workspace_id,
+        ACCOUNT,
+        "查个东西",
+    )
+    .await
+    .expect("route");
     let route = result.get_document("route").expect("route doc");
     let selected: Vec<String> = route
         .get_array("selectedChunkIds")
@@ -203,7 +232,8 @@ async fn router_falls_back_when_agent_cites_chunks_outside_corpus() {
         .collect();
 
     assert_eq!(
-        selected, vec![real_hex],
+        selected,
+        vec![real_hex],
         "fallback 应回填 corpus 中唯一的 chunk"
     );
     assert_eq!(route.get_str("knowledgeCoverage").ok(), Some("weak"));
@@ -227,9 +257,15 @@ async fn router_returns_missing_when_corpus_completely_empty() {
 
     // 不入队任何 LLM 响应；如果代码错误地走到 knowledge_agent / LLM 都会报错。
 
-    let result = test_knowledge_route_for_contact(&app.state, None, &app.state.config.default_workspace_id, ACCOUNT, "什么都没有")
-        .await
-        .expect("route");
+    let result = test_knowledge_route_for_contact(
+        &app.state,
+        None,
+        &app.state.config.default_workspace_id,
+        ACCOUNT,
+        "什么都没有",
+    )
+    .await
+    .expect("route");
 
     let route = result.get_document("route").expect("route doc");
     assert_eq!(
@@ -237,9 +273,7 @@ async fn router_returns_missing_when_corpus_completely_empty() {
         Some("missing"),
         "空 corpus 必须 missing"
     );
-    let selected = route
-        .get_array("selectedChunkIds")
-        .expect("ids");
+    let selected = route.get_array("selectedChunkIds").expect("ids");
     assert!(selected.is_empty(), "missing 路径不应选任何 chunk");
     assert_eq!(app.llm.calls(), 0, "空 corpus 不应触达 LLM");
 }

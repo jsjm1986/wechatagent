@@ -9,6 +9,7 @@
 //! （min_hits）且强证据累积（min_strong_evidence）双达标。
 
 use crate::models::{BayesianPoint, BayesianSignal};
+use std::collections::HashSet;
 
 /// 槽位上限：最多同时正式占用 6 个观察维度。
 pub const MAX_BAYESIAN_SLOTS: usize = 6;
@@ -27,7 +28,10 @@ pub struct SlotPromotionThreshold {
 
 impl Default for SlotPromotionThreshold {
     fn default() -> Self {
-        Self { min_hits: 3, min_strong_evidence: 2 }
+        Self {
+            min_hits: 3,
+            min_strong_evidence: 2,
+        }
     }
 }
 
@@ -41,7 +45,11 @@ pub struct ObservedDimension {
 }
 
 /// 占槽门：跨多轮命中 + 强证据累积双达标才占。一两句话（hit=1）永远不够。
-pub fn should_promote(hit_count: i32, strong_evidence_count: i32, th: &SlotPromotionThreshold) -> bool {
+pub fn should_promote(
+    hit_count: i32,
+    strong_evidence_count: i32,
+    th: &SlotPromotionThreshold,
+) -> bool {
     hit_count >= th.min_hits && strong_evidence_count >= th.min_strong_evidence
 }
 
@@ -62,10 +70,12 @@ pub fn apply_bayesian_update(
     signals: &mut Vec<BayesianSignal>,
     observed: &[ObservedDimension],
     turn: i32,
+    source_run_id: &str,
     th: &SlotPromotionThreshold,
 ) {
+    let observed = normalize_observed_dimensions(observed);
     // 第一遍：更新已有信号或新建观察线，并截断 history。
-    for obs in observed {
+    for obs in &observed {
         // 强证据由代码侧据消息方向客观判定：本轮锚定客户 Inbound 消息的证据 >=1 即标记强证据点。
         let reason = if obs.strong_evidence_count >= 1 {
             Some(STRONG_POINT_MARKER.to_string())
@@ -73,12 +83,20 @@ pub fn apply_bayesian_update(
             None
         };
         if let Some(sig) = signals.iter_mut().find(|s| s.dimension == obs.dimension) {
+            if sig
+                .history
+                .iter()
+                .any(|point| point.source_run_id.as_deref() == Some(source_run_id))
+            {
+                continue;
+            }
             let value_changed = sig.current_value != obs.value;
             let confidence_changed = (sig.current_confidence - obs.confidence).abs() > f64::EPSILON;
             sig.current_value = obs.value.clone();
             sig.current_confidence = obs.confidence;
             sig.history.push(BayesianPoint {
                 turn,
+                source_run_id: Some(source_run_id.to_string()),
                 value: obs.value.clone(),
                 confidence: obs.confidence,
                 value_changed,
@@ -96,6 +114,7 @@ pub fn apply_bayesian_update(
                 locked: false,
                 history: vec![BayesianPoint {
                     turn,
+                    source_run_id: Some(source_run_id.to_string()),
                     value: obs.value.clone(),
                     confidence: obs.confidence,
                     value_changed: false,
@@ -129,47 +148,111 @@ pub fn apply_bayesian_update(
     }
 }
 
+/// Collapse one run to at most one observation per dimension. Repeated equal
+/// values keep the highest confidence and a single strong-evidence bit;
+/// conflicting values make the whole dimension ambiguous and contribute no
+/// hit. Order follows the first occurrence so slot allocation stays stable.
+fn normalize_observed_dimensions(observed: &[ObservedDimension]) -> Vec<ObservedDimension> {
+    let mut normalized: Vec<ObservedDimension> = Vec::new();
+    let mut conflicted = HashSet::new();
+    for item in observed {
+        if conflicted.contains(&item.dimension) {
+            continue;
+        }
+        if let Some(existing) = normalized
+            .iter_mut()
+            .find(|existing| existing.dimension == item.dimension)
+        {
+            if existing.value != item.value {
+                normalized.retain(|existing| existing.dimension != item.dimension);
+                conflicted.insert(item.dimension.clone());
+                continue;
+            }
+            existing.confidence = existing.confidence.max(item.confidence);
+            existing.strong_evidence_count = existing
+                .strong_evidence_count
+                .max(item.strong_evidence_count);
+            continue;
+        }
+        normalized.push(item.clone());
+    }
+    normalized
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn no_promote_below_threshold() {
-        let th = SlotPromotionThreshold { min_hits: 3, min_strong_evidence: 2 };
+        let th = SlotPromotionThreshold {
+            min_hits: 3,
+            min_strong_evidence: 2,
+        };
         assert!(!should_promote(2, 2, &th)); // hits 不够
         assert!(!should_promote(3, 1, &th)); // 强证据不够
-        assert!(should_promote(3, 2, &th));  // 双达标
+        assert!(should_promote(3, 2, &th)); // 双达标
     }
 
     #[test]
     fn single_mention_never_promotes() {
         // 用户红线：一两句话不能占槽。
-        let th = SlotPromotionThreshold { min_hits: 3, min_strong_evidence: 2 };
+        let th = SlotPromotionThreshold {
+            min_hits: 3,
+            min_strong_evidence: 2,
+        };
         assert!(!should_promote(1, 1, &th));
     }
 
     #[test]
     fn history_capped_at_100() {
-        let th = SlotPromotionThreshold { min_hits: 1, min_strong_evidence: 0 };
+        let th = SlotPromotionThreshold {
+            min_hits: 1,
+            min_strong_evidence: 0,
+        };
         let mut signals = vec![];
         for turn in 0..150 {
-            apply_bayesian_update(&mut signals, &[ObservedDimension {
-                dimension: "价格敏感度".into(), value: "高".into(), confidence: 0.6, strong_evidence_count: 1,
-            }], turn, &th);
+            apply_bayesian_update(
+                &mut signals,
+                &[ObservedDimension {
+                    dimension: "价格敏感度".into(),
+                    value: "高".into(),
+                    confidence: 0.6,
+                    strong_evidence_count: 1,
+                }],
+                turn,
+                &format!("run-{turn}"),
+                &th,
+            );
         }
-        let sig = signals.iter().find(|s| s.dimension == "价格敏感度").unwrap();
+        let sig = signals
+            .iter()
+            .find(|s| s.dimension == "价格敏感度")
+            .unwrap();
         assert!(sig.locked);
         assert!(sig.history.len() <= 100);
     }
 
     #[test]
     fn never_exceeds_six_locked_slots() {
-        let th = SlotPromotionThreshold { min_hits: 1, min_strong_evidence: 0 };
+        let th = SlotPromotionThreshold {
+            min_hits: 1,
+            min_strong_evidence: 0,
+        };
         let mut signals = vec![];
         for d in 0..10 {
-            apply_bayesian_update(&mut signals, &[ObservedDimension {
-                dimension: format!("dim{d}"), value: "v".into(), confidence: 0.5, strong_evidence_count: 1,
-            }], 0, &th);
+            apply_bayesian_update(
+                &mut signals,
+                &[ObservedDimension {
+                    dimension: format!("dim{d}"),
+                    value: "v".into(),
+                    confidence: 0.5,
+                    strong_evidence_count: 1,
+                }],
+                0,
+                &format!("run-{d}"),
+                &th,
+            );
         }
         assert!(signals.iter().filter(|s| s.locked).count() <= MAX_BAYESIAN_SLOTS);
     }
@@ -177,26 +260,116 @@ mod tests {
     #[test]
     fn promotion_uses_code_side_strong_not_confidence() {
         // Option B：占槽强证据口径取自代码侧（Inbound 锚定数），不信 LLM 自报 confidence。
-        let th = SlotPromotionThreshold { min_hits: 3, min_strong_evidence: 2 };
+        let th = SlotPromotionThreshold {
+            min_hits: 3,
+            min_strong_evidence: 2,
+        };
 
         // 高置信(0.9)但代码侧强证据=0：跨 5 轮命中达 min_hits，仍不应占槽（strong=0 < 2）。
         let mut signals = vec![];
         for turn in 0..5 {
-            apply_bayesian_update(&mut signals, &[ObservedDimension {
-                dimension: "价格敏感度".into(), value: "高".into(), confidence: 0.9, strong_evidence_count: 0,
-            }], turn, &th);
+            apply_bayesian_update(
+                &mut signals,
+                &[ObservedDimension {
+                    dimension: "价格敏感度".into(),
+                    value: "高".into(),
+                    confidence: 0.9,
+                    strong_evidence_count: 0,
+                }],
+                turn,
+                &format!("run-{turn}"),
+                &th,
+            );
         }
-        let sig = signals.iter().find(|s| s.dimension == "价格敏感度").unwrap();
-        assert!(!sig.locked, "高置信但代码侧强证据=0 不得占槽（confidence 不再驱动占槽）");
+        let sig = signals
+            .iter()
+            .find(|s| s.dimension == "价格敏感度")
+            .unwrap();
+        assert!(
+            !sig.locked,
+            "高置信但代码侧强证据=0 不得占槽（confidence 不再驱动占槽）"
+        );
 
         // 低置信(0.3)但代码侧强证据=1：跨 3 轮累积 hits=3 且 strong=3 >= 2 → 占槽。
         let mut signals2 = vec![];
         for turn in 0..3 {
-            apply_bayesian_update(&mut signals2, &[ObservedDimension {
-                dimension: "决策角色".into(), value: "拍板人".into(), confidence: 0.3, strong_evidence_count: 1,
-            }], turn, &th);
+            apply_bayesian_update(
+                &mut signals2,
+                &[ObservedDimension {
+                    dimension: "决策角色".into(),
+                    value: "拍板人".into(),
+                    confidence: 0.3,
+                    strong_evidence_count: 1,
+                }],
+                turn,
+                &format!("run-{turn}"),
+                &th,
+            );
         }
         let sig2 = signals2.iter().find(|s| s.dimension == "决策角色").unwrap();
         assert!(sig2.locked, "代码侧强证据累积达标即占槽，与 LLM 低置信无关");
+    }
+
+    #[test]
+    fn same_run_same_dimension_counts_once_and_retry_is_idempotent() {
+        let th = SlotPromotionThreshold {
+            min_hits: 2,
+            min_strong_evidence: 2,
+        };
+        let mut signals = vec![];
+        let repeated = vec![
+            ObservedDimension {
+                dimension: "预算".into(),
+                value: "高".into(),
+                confidence: 0.4,
+                strong_evidence_count: 1,
+            },
+            ObservedDimension {
+                dimension: "预算".into(),
+                value: "高".into(),
+                confidence: 0.9,
+                strong_evidence_count: 3,
+            },
+        ];
+        apply_bayesian_update(&mut signals, &repeated, 1, "run-a", &th);
+        apply_bayesian_update(&mut signals, &repeated, 1, "run-a", &th);
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].history.len(), 1);
+        assert_eq!(signals[0].current_confidence, 0.9);
+        assert!(!signals[0].locked, "one run must remain one hit");
+
+        apply_bayesian_update(&mut signals, &repeated, 2, "run-b", &th);
+        assert_eq!(signals[0].history.len(), 2);
+        assert!(signals[0].locked);
+    }
+
+    #[test]
+    fn conflicting_values_in_one_run_do_not_count() {
+        let th = SlotPromotionThreshold {
+            min_hits: 1,
+            min_strong_evidence: 1,
+        };
+        let mut signals = vec![];
+        apply_bayesian_update(
+            &mut signals,
+            &[
+                ObservedDimension {
+                    dimension: "预算".into(),
+                    value: "高".into(),
+                    confidence: 0.8,
+                    strong_evidence_count: 1,
+                },
+                ObservedDimension {
+                    dimension: "预算".into(),
+                    value: "低".into(),
+                    confidence: 0.8,
+                    strong_evidence_count: 1,
+                },
+            ],
+            1,
+            "run-conflict",
+            &th,
+        );
+        assert!(signals.is_empty());
     }
 }

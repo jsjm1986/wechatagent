@@ -1,6 +1,6 @@
 //! 专属顾问名片引荐：辅助模式判定、候选过滤/渲染（纯函数）、
 //! send_outbound_namecard、置「已引荐」态。
-use crate::error::{AppError, AppResult};
+use crate::error::AppError;
 use crate::models::{ConversationMessage, MessageDirection, ReferralCard};
 use crate::routes::AppState;
 use mongodb::bson::{doc, oid::ObjectId, to_document, DateTime};
@@ -116,7 +116,7 @@ pub(crate) async fn send_outbound_namecard(
     state: &AppState,
     contact: &crate::models::Contact,
     card_id: &str,
-) -> AppResult<Value> {
+) -> Result<Value, super::types::OutboundSendError> {
     let oid = ObjectId::parse_str(card_id).map_err(|_| AppError::External("bad card_id".into()))?;
     // 查询带 workspace_id scope（防跨租户读名片，与 send_outbound_media 的 IDOR 防御对齐）。
     let card = state
@@ -133,22 +133,33 @@ pub(crate) async fn send_outbound_namecard(
     if !validate_card_sendable(&card, &contact.account_id) {
         return Err(AppError::External(
             "referral card not sendable (draft/disabled/account mismatch)".into(),
-        ));
+        )
+        .into());
     }
 
     // ⚠️ MCP message_send_namecard 入参字段名待 server tools/list 确认，此处占位
-    let resp = crate::mcp::logged_call_for_account(
+    let resp = crate::mcp::logged_send_call_for_account(
         state,
+        &contact.workspace_id,
         &contact.account_id,
         "message_send_namecard",
         json!({ "recipient": contact.wxid, "targetWxid": card.target_wxid }),
     )
-    .await?;
+    .await
+    .map_err(super::types::OutboundSendError::from)?;
 
-    if !super::gateway::send_receipt_is_ok(&resp) {
-        return Err(AppError::External(
-            "namecard send returned a negative or unverifiable delivery receipt".into(),
-        ));
+    match super::gateway::classify_send_receipt(&resp) {
+        super::gateway::SendReceiptStatus::Succeeded => {}
+        super::gateway::SendReceiptStatus::ExplicitlyFailed => {
+            return Err(super::types::OutboundSendError::SafeToRetry(
+                "namecard send returned an explicit negative delivery receipt".into(),
+            ));
+        }
+        super::gateway::SendReceiptStatus::Inconclusive => {
+            return Err(super::types::OutboundSendError::DeliveryUncertain(
+                "namecard send returned an unverifiable delivery receipt".into(),
+            ));
+        }
     }
 
     // MCP 已成功 = 名片已送达客户，既成事实。此后落库/置态失败**绝不**返 Err——

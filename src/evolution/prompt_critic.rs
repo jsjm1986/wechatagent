@@ -3,13 +3,13 @@
 //! 输入：cohort 内的 failure runs（按 `final_review_status` 分桶）。
 //! 输出：≤ 4 条 prompt 候选 [`crate::models::Proposal`]。
 //!
-//! 调用路径：本模块直接调 `state.llm.generate_json_with_usage`，
+//! 调用路径：生产态按 workspace 从 `state.llm_registry` 获取 immutable snapshot，
 //! **不**通过 `agent::generate_agent_json`——后者会读 task-local `RunBudget`
 //! 而我们在 worker 任务里没有设置 RunBudget；同时我们需要 LLM usage 数值
 //! 把 token 计入 [`super::EvolutionBudget`]。
 //!
 //! 隔离红线：本文件不引入 `crate::agent::gateway/outbox/mcp` 任何符号；
-//! 直接使用 `state.llm` + `state.db`，与生产 Reply 链路完全分离。
+//! 测试注入态（registry=None）才回退 `state.llm` mock；与生产 Reply 链路完全分离。
 //!
 //! 失败 / 安全 drop 策略（design.md §3.2 / §9.3）：
 //! - schema 反序列化失败 / 字段超长 → 整批 drop，写入一条占位 proposal
@@ -25,7 +25,10 @@
 use std::collections::HashMap;
 
 use futures::TryStreamExt;
-use mongodb::bson::{doc, oid::ObjectId, DateTime};
+use mongodb::{
+    bson::{doc, oid::ObjectId, DateTime},
+    options::FindOneOptions,
+};
 use serde::Deserialize;
 
 use crate::prompts::{load_prompt, PROMPT_EVOLUTION_FORBIDDEN_KEYS};
@@ -35,6 +38,7 @@ use super::budget::EvolutionBudget;
 use super::cohort::Cohorts;
 use super::error::EvolutionError;
 use super::lint::passes_forbidden_words;
+use super::revision::prompt_revision;
 
 /// 单次 tick 允许产出的 prompt proposal 数。design.md §3.2 锁定为 4。
 pub const MAX_PROMPT_PROPOSALS_PER_TICK: usize = 4;
@@ -45,6 +49,16 @@ const CRITIC_SUMMARY_MAX_CHARS: usize = 200;
 
 /// Critic prompt 在 `prompt_templates` 中的固定 key（与 prompts.rs 保持一致）。
 const CRITIC_PROMPT_KEY: &str = "evolution_critic_v1";
+
+/// Prompt Shadow 真实执行链中可注入的完整目标闭集。其它 key 即使由 Critic
+/// 输出，也不能形成有效对照证据，必须在 proposal 生成前拒绝。
+pub const EVOLVABLE_PROMPT_TARGETS: &[&str] = &[
+    "user.reply.system",
+    "user.reply.policy",
+    "user.reply.task",
+    "user.review.system",
+    "user.review.light.system",
+];
 
 /// `expectedImprovementOn` 数组中允许出现的 gate / metric key。Critic 偶尔会
 /// 编造新 key，超出此集合的会被静默忽略（不 drop 整批，仅过滤）。
@@ -85,6 +99,8 @@ struct CriticDiff {
 pub async fn generate(
     state: &AppState,
     experiment_id: &str,
+    workspace_id: &str,
+    account_id: &str,
     cohorts: &Cohorts,
     budget: &mut EvolutionBudget,
 ) -> Result<Vec<crate::models::Proposal>, EvolutionError> {
@@ -96,13 +112,13 @@ pub async fn generate(
         return Ok(Vec::new());
     }
 
-    let workspace_id = state.config.default_workspace_id.clone();
-    let account_id = state.config.default_account_id.clone();
     let now = DateTime::now();
 
     // 1. 拉 cohort.prompt 内 run 的关键字段，按 final_review_status 分桶采样。
     let buckets = sample_failure_buckets(
         state,
+        workspace_id,
+        account_id,
         &cohorts.prompt,
         state
             .config
@@ -115,9 +131,12 @@ pub async fn generate(
     }
 
     // 2. 加载 critic 自身的 system prompt + 当前 reply_agent 主模板原文供 critic 参考。
-    let critic_system = load_prompt(&state.db, &workspace_id, CRITIC_PROMPT_KEY).await
-        .map_err(|e| EvolutionError::Internal(format!("load_prompt(evolution_critic_v1) failed: {e}")))?;
-    let reply_agent_template = load_reply_agent_template_text(state, &workspace_id).await;
+    let critic_system = load_prompt(&state.db, workspace_id, CRITIC_PROMPT_KEY)
+        .await
+        .map_err(|e| {
+            EvolutionError::Internal(format!("load_prompt(evolution_critic_v1) failed: {e}"))
+        })?;
+    let reply_agent_template = load_reply_agent_template_text(state, workspace_id).await;
 
     // 3. 拼 user 输入：JSON 体，包含模板原文 + 失败桶。
     let user_payload = build_user_payload(&reply_agent_template, &buckets);
@@ -127,10 +146,27 @@ pub async fn generate(
         return Ok(Vec::new());
     }
     let started_at = std::time::Instant::now();
-    let llm_result = state
-        .llm
-        .generate_json_with_usage(&critic_system, &user_payload)
-        .await;
+    let (llm_result, provider_model) = match &state.llm_registry {
+        Some(registry) => match registry.snapshot(workspace_id).await {
+            Ok(snapshot) => {
+                let model = snapshot.meta.model.clone();
+                (
+                    snapshot
+                        .generate_json_with_usage(&critic_system, &user_payload)
+                        .await,
+                    model,
+                )
+            }
+            Err(error) => (Err(error), "workspace-provider-missing".to_string()),
+        },
+        None => (
+            state
+                .llm
+                .generate_json_with_usage(&critic_system, &user_payload)
+                .await,
+            state.config.openai_model.clone(),
+        ),
+    };
     // 5. 写一条 llm_call_logs（无论成败），把消耗算入 EvolutionBudget。
     match &llm_result {
         Ok(r) => {
@@ -141,10 +177,11 @@ pub async fn generate(
                 .insert_one(
                     crate::models::LlmCallLog {
                         id: None,
-                        workspace_id: workspace_id.clone(),
-                        account_id: Some(account_id.clone()),
+                        workspace_id: workspace_id.to_string(),
+                        account_id: Some(account_id.to_string()),
                         contact_wxid: None,
                         run_id: Some(experiment_id.to_string()),
+                        run_mode: "evolution".to_string(),
                         prompt_key: CRITIC_PROMPT_KEY.to_string(),
                         model: r.model.clone(),
                         status: "success".to_string(),
@@ -154,6 +191,7 @@ pub async fn generate(
                         total_tokens: r.usage.total_tokens,
                         prompt_cache_hit_tokens: r.usage.prompt_cache_hit_tokens,
                         prompt_cache_miss_tokens: r.usage.prompt_cache_miss_tokens,
+                        usage_known: r.usage.is_known(),
                         error: None,
                         retry_count: r.retry_count as i32,
                         final_status: Some("success".to_string()),
@@ -171,12 +209,13 @@ pub async fn generate(
                 .insert_one(
                     crate::models::LlmCallLog {
                         id: None,
-                        workspace_id: workspace_id.clone(),
-                        account_id: Some(account_id.clone()),
+                        workspace_id: workspace_id.to_string(),
+                        account_id: Some(account_id.to_string()),
                         contact_wxid: None,
                         run_id: Some(experiment_id.to_string()),
+                        run_mode: "evolution".to_string(),
                         prompt_key: CRITIC_PROMPT_KEY.to_string(),
-                        model: state.config.openai_model.clone(),
+                        model: provider_model,
                         status: "failed".to_string(),
                         latency_ms: started_at.elapsed().as_millis() as i64,
                         prompt_tokens: 0,
@@ -184,6 +223,7 @@ pub async fn generate(
                         total_tokens: 0,
                         prompt_cache_hit_tokens: 0,
                         prompt_cache_miss_tokens: 0,
+                        usage_known: false,
                         error: Some(e.to_string()),
                         retry_count: 0,
                         final_status: Some("failed".to_string()),
@@ -194,8 +234,8 @@ pub async fn generate(
                 .await;
             return Ok(vec![mk_drop_proposal(
                 experiment_id,
-                &workspace_id,
-                &account_id,
+                workspace_id,
+                account_id,
                 "critic_llm_call_failed",
                 now,
             )]);
@@ -209,8 +249,8 @@ pub async fn generate(
         Err(_) => {
             return Ok(vec![mk_drop_proposal(
                 experiment_id,
-                &workspace_id,
-                &account_id,
+                workspace_id,
+                account_id,
                 "critic_schema_invalid",
                 now,
             )]);
@@ -224,8 +264,8 @@ pub async fn generate(
     if let Some(reason) = validate_diffs(&parsed.diffs) {
         return Ok(vec![mk_drop_proposal(
             experiment_id,
-            &workspace_id,
-            &account_id,
+            workspace_id,
+            account_id,
             reason,
             now,
         )]);
@@ -234,7 +274,7 @@ pub async fn generate(
     // 8. 截断到 4 条；多余的写 rejected_below_threshold + exceeded_per_tick_quota。
     let mut out = Vec::with_capacity(parsed.diffs.len());
     for (idx, diff) in parsed.diffs.into_iter().enumerate() {
-        let (status, failure_reason) = if idx < MAX_PROMPT_PROPOSALS_PER_TICK {
+        let (mut status, mut failure_reason) = if idx < MAX_PROMPT_PROPOSALS_PER_TICK {
             ("pending_eval", None)
         } else {
             (
@@ -247,11 +287,17 @@ pub async fn generate(
             .into_iter()
             .filter(|k| ALLOWED_EXPECTED_IMPROVEMENTS.contains(&k.as_str()))
             .collect();
+        let base_revision =
+            load_prompt_base_revision(state, workspace_id, &diff.template_key).await?;
+        if base_revision.is_none() {
+            status = "rejected_below_threshold";
+            failure_reason = Some("prompt_base_missing".to_string());
+        }
         out.push(crate::models::Proposal {
             id: None,
             experiment_id: experiment_id.to_string(),
-            workspace_id: workspace_id.clone(),
-            account_id: account_id.clone(),
+            workspace_id: workspace_id.to_string(),
+            account_id: account_id.to_string(),
             proposal_kind: "prompt".to_string(),
             status: status.to_string(),
             gate_key: None,
@@ -268,6 +314,8 @@ pub async fn generate(
             critic_reasoning: diff.risk_note.clone(),
             expected_improvement_on,
             risk_note: diff.risk_note,
+            base_revision,
+            released_revision: None,
             previous_prompt_version: None,
             eval_metrics: doc! {},
             eval_replays_completed: 0,
@@ -290,6 +338,8 @@ pub async fn generate(
 /// 顺序由首次见到的顺序决定。
 async fn sample_failure_buckets(
     state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
     cohort_run_ids: &[ObjectId],
     sample_per_bucket: usize,
 ) -> Result<Vec<(String, Vec<RunSample>)>, EvolutionError> {
@@ -298,7 +348,14 @@ async fn sample_failure_buckets(
     let mut cursor = state
         .db
         .agent_run_logs()
-        .find(doc! { "_id": { "$in": cohort_run_ids } }, None)
+        .find(
+            doc! {
+                "_id": { "$in": cohort_run_ids },
+                "workspace_id": workspace_id,
+                "account_id": account_id,
+            },
+            None,
+        )
         .await
         .map_err(EvolutionError::from)?;
     while let Some(run) = cursor.try_next().await.map_err(EvolutionError::from)? {
@@ -365,9 +422,10 @@ fn buckets_summary_doc(buckets: &[(String, Vec<RunSample>)]) -> mongodb::bson::D
 }
 
 async fn load_reply_agent_template_text(state: &AppState, workspace_id: &str) -> String {
-    // 演化目标默认是 reply_agent_main；若该 key 缺失，给空字符串让 critic 也能跑
-    // （critic 仍应基于 failure buckets 给意见）。
-    load_prompt(&state.db, workspace_id, "reply_agent_main")
+    // Use a target that the shadow path can actually inject. If it is absent,
+    // keep the critic available from failure buckets without inventing a
+    // legacy prompt target that can never produce replay evidence.
+    load_prompt(&state.db, workspace_id, "user.reply.policy")
         .await
         .unwrap_or_default()
 }
@@ -399,8 +457,36 @@ fn validate_diffs(diffs: &[CriticDiff]) -> Option<&'static str> {
         if PROMPT_EVOLUTION_FORBIDDEN_KEYS.contains(&diff.template_key.as_str()) {
             return Some("self_referential_critic_prompt");
         }
+        if !EVOLVABLE_PROMPT_TARGETS.contains(&diff.template_key.as_str()) {
+            return Some("unsupported_prompt_target");
+        }
     }
     None
+}
+
+async fn load_prompt_base_revision(
+    state: &AppState,
+    workspace_id: &str,
+    prompt_key: &str,
+) -> Result<Option<String>, EvolutionError> {
+    let template = state
+        .db
+        .prompt_templates()
+        .find_one(
+            doc! {
+                "workspace_id": workspace_id,
+                "prompt_key": prompt_key,
+                "current_version": true,
+            },
+            FindOneOptions::default(),
+        )
+        .await
+        .map_err(EvolutionError::from)?;
+    Ok(template.and_then(|template| {
+        template
+            .id
+            .map(|id| prompt_revision(id, template.version, &template.content))
+    }))
 }
 
 fn mk_drop_proposal(
@@ -428,6 +514,8 @@ fn mk_drop_proposal(
         critic_reasoning: None,
         expected_improvement_on: vec![],
         risk_note: None,
+        base_revision: None,
+        released_revision: None,
         previous_prompt_version: None,
         eval_metrics: doc! {},
         eval_replays_completed: 0,
@@ -518,7 +606,7 @@ mod tests {
     #[test]
     fn validate_diffs_rejects_oversized_snippet() {
         let huge: String = "a".repeat(CRITIC_FIELD_MAX_CHARS + 1);
-        let diffs = vec![mk_diff("reply_agent_main", "policy", "ok", &huge)];
+        let diffs = vec![mk_diff("user.reply.policy", "policy", "ok", &huge)];
         assert_eq!(validate_diffs(&diffs), Some("critic_schema_invalid"));
     }
 
@@ -526,7 +614,7 @@ mod tests {
     #[test]
     fn validate_diffs_rejects_oversized_summary() {
         let long_summary: String = "a".repeat(CRITIC_SUMMARY_MAX_CHARS + 1);
-        let diffs = vec![mk_diff("reply_agent_main", "policy", &long_summary, "x")];
+        let diffs = vec![mk_diff("user.reply.policy", "policy", &long_summary, "x")];
         assert_eq!(validate_diffs(&diffs), Some("critic_schema_invalid"));
     }
 
@@ -541,12 +629,7 @@ mod tests {
             "遇到投诉时，建议切换到{}{}{}{}以稳住客户",
             '\u{4eba}', '\u{5de5}', '\u{63a5}', '\u{7ba1}',
         );
-        let diffs = vec![mk_diff(
-            "reply_agent_main",
-            "policy",
-            "ok",
-            &forbidden,
-        )];
+        let diffs = vec![mk_diff("user.reply.policy", "policy", "ok", &forbidden)];
         assert_eq!(validate_diffs(&diffs), Some("forbidden_literal"));
     }
 
@@ -559,14 +642,17 @@ mod tests {
             "改善 critic 自身",
             "更激进地建议改动",
         )];
-        assert_eq!(validate_diffs(&diffs), Some("self_referential_critic_prompt"));
+        assert_eq!(
+            validate_diffs(&diffs),
+            Some("self_referential_critic_prompt")
+        );
     }
 
     /// 全部合法 → None（不 drop）。
     #[test]
     fn validate_diffs_accepts_clean_input() {
         let diffs = vec![mk_diff(
-            "reply_agent_main",
+            "user.reply.policy",
             "policy",
             "增强对未验证产品事实的更保守措辞",
             "若知识库未命中，请用'我先核实下再答'的兜底句式，避免编造事实",
@@ -583,8 +669,8 @@ mod tests {
             '\u{4eba}', '\u{5de5}', '\u{4ecb}', '\u{5165}',
         );
         let diffs = vec![
-            mk_diff("reply_agent_main", "policy", "ok", "正常 snippet"),
-            mk_diff("reply_agent_main", "soul", "ok", &forbidden),
+            mk_diff("user.reply.policy", "policy", "ok", "正常 snippet"),
+            mk_diff("user.reply.policy", "soul", "ok", &forbidden),
         ];
         assert_eq!(validate_diffs(&diffs), Some("forbidden_literal"));
     }
@@ -592,13 +678,7 @@ mod tests {
     /// drop proposal 的 schema 字段：kind=prompt，status=rejected_below_threshold。
     #[test]
     fn drop_proposal_uses_prompt_kind_and_rejected_status() {
-        let p = mk_drop_proposal(
-            "exp_x",
-            "ws",
-            "acct",
-            "forbidden_literal",
-            DateTime::now(),
-        );
+        let p = mk_drop_proposal("exp_x", "ws", "acct", "forbidden_literal", DateTime::now());
         assert_eq!(p.proposal_kind, "prompt");
         assert_eq!(p.status, "rejected_below_threshold");
         assert_eq!(p.failure_reason.as_deref(), Some("forbidden_literal"));

@@ -184,7 +184,14 @@ mod tests {
             None,
         );
         let bson = mongodb::bson::to_document(&p).expect("serialize");
-        for forbidden in ["apply", "applied", "commit", "committed", "delete", "deleted"] {
+        for forbidden in [
+            "apply",
+            "applied",
+            "commit",
+            "committed",
+            "delete",
+            "deleted",
+        ] {
             assert!(
                 !bson.contains_key(forbidden),
                 "proposal must not carry field '{forbidden}'",

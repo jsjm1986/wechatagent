@@ -41,11 +41,7 @@ pub(super) async fn run_step(db: &Database) -> AppResult<()> {
     ];
     let result = db
         .contacts()
-        .update_many(
-            doc! { "commitments": { "$exists": false } },
-            pipeline,
-            None,
-        )
+        .update_many(doc! { "commitments": { "$exists": false } }, pipeline, None)
         .await?;
     tracing::info!(
         migration_id = "2026_05_008_contact_commitments_reshape",

@@ -3,34 +3,41 @@
 //! 现状：catalog 是每次请求实时聚合（`routes::knowledge::build_operation_knowledge_catalog`），
 //! N 个 chunk → O(N) 拼装。
 //!
-//! 改造：写入路径 `apply_chunk_revision` enqueue 一条 `catalog_rebuild_jobs`；
-//! 本 worker 每 N 秒取一批 `status="queued"` 的 job：
+//! Every chunk mutation advances a document generation and enqueues one durable
+//! intent in the same transaction. The worker leases queued or expired work:
 //!
 //! 1. 按 `document_id` group 聚合该 document 下所有 active chunk；
 //! 2. 渲染 `catalog_summary_persisted`（markdown 摘要）；
-//! 3. 自增 `catalog_version`；
-//! 4. job 标 `done` / `failed`（带 last_error）。
+//! 3. atomically persist only the latest desired generation;
+//! 4. finalize by owner/token/generation CAS, with bounded retry.
 //!
 //! 设计要点：
 //! - **后向兼容**：`catalog_summary_persisted` 是 `Option<String>`，旧 doc 读出 None
 //!   不影响现有路由；
-//! - **零阻塞**：写入路径 enqueue 是 best-effort，worker 异步处理；
+//! - **durable intent**: chunk/revision/document generation/job commit together;
 //! - **空闲休眠**：取不到 job 时 sleep `interval_secs`，CPU 不空转；
-//! - **失败容错**：单 job 报错只标 failed + last_error，不 panic worker；
+//! - **crash recovery**: expired leases are reclaimed and stale owners are fenced;
 //! - **零新依赖**：用 `tracing` + 既有 mongo accessor。
 
 use std::time::Duration;
 
 use futures::TryStreamExt;
-use mongodb::bson::{doc, oid::ObjectId, DateTime};
-use mongodb::options::FindOneAndUpdateOptions;
+use mongodb::{
+    bson::{doc, oid::ObjectId, DateTime, Document},
+    options::{FindOneAndUpdateOptions, ReturnDocument},
+};
 use tokio::time::sleep;
 
 use crate::db::Database;
 use crate::error::AppError;
+use crate::knowledge_wiki::chunk_revisions::commit_chunk_transaction;
+use crate::models::CatalogRebuildJob;
 
 /// 单次循环最多领取的 job 数。避免 worker 在大批量 enqueue 时长占数据库连接。
 const BATCH_SIZE: usize = 16;
+const LEASE_SECONDS: i64 = 60;
+const MAX_ATTEMPTS: i32 = 5;
+const MAX_RETRY_DELAY_SECONDS: i64 = 300;
 
 /// catalog rebuild worker 主循环。
 ///
@@ -46,10 +53,7 @@ pub async fn catalog_rebuild_worker_loop(db: Database, interval_secs: u64) {
         return;
     }
     let interval = Duration::from_secs(interval_secs);
-    tracing::info!(
-        interval_secs,
-        "catalog_rebuild_worker started"
-    );
+    tracing::info!(interval_secs, "catalog_rebuild_worker started");
     loop {
         match drain_pending_jobs(&db).await {
             Ok(n) if n > 0 => {
@@ -64,50 +68,356 @@ pub async fn catalog_rebuild_worker_loop(db: Database, interval_secs: u64) {
     }
 }
 
-/// 取一批 queued job 处理，返回处理条数。
-///
-/// 每条 job 走 `claim_one_job` 原子领取（`status: queued -> processing`），
-/// 然后 `rebuild_one_document` 渲染落库，最后 `mark_job_done` / `mark_job_failed`。
+/// Process at most one bounded batch. Queued/retry work and expired processing
+/// leases are all claimable; every side effect is fenced by the returned token.
 async fn drain_pending_jobs(db: &Database) -> Result<usize, AppError> {
+    fail_exhausted_recoverable_jobs(db).await?;
+    let worker = worker_id();
     let mut processed = 0usize;
     while processed < BATCH_SIZE {
-        let claimed = claim_one_job(db).await?;
-        let job = match claimed {
+        let claimed = claim_one_job(db, &worker).await?;
+        let mut job = match claimed {
             Some(j) => j,
             None => break,
         };
-        let job_id = job.job_id.clone();
-        let workspace_id = job.workspace_id.clone();
-        let document_id = job.document_id;
-        match rebuild_one_document(db, &workspace_id, document_id).await {
-            Ok(_) => {
-                mark_job_done(db, &job_id).await?;
-            }
-            Err(e) => {
-                let msg = format!("{e}");
-                tracing::warn!(job_id = %job_id, error = %msg, "catalog rebuild job failed");
-                mark_job_failed(db, &job_id, &msg).await?;
+        if job.target_generation <= 0 {
+            match upgrade_legacy_claim(db, &job).await {
+                Ok(upgraded) => job = upgraded,
+                Err(error) => {
+                    let message = error.to_string();
+                    tracing::warn!(
+                        job_id = %job.job_id,
+                        error = %message,
+                        "catalog legacy claim upgrade failed"
+                    );
+                    let _ = requeue_or_fail_owned_job(db, &job, &message).await;
+                    processed += 1;
+                    continue;
+                }
             }
         }
+        let heartbeat = spawn_claim_heartbeat(db.clone(), job.clone());
+        let rendered = render_one_document(db, &job.workspace_id, job.document_id).await;
+        match rendered {
+            Ok(rendered) => {
+                if let Err(error) = finalize_rendered_catalog(db, &job, &rendered).await {
+                    let message = error.to_string();
+                    tracing::warn!(
+                        job_id = %job.job_id,
+                        claim_generation = job.claim_generation,
+                        error = %message,
+                        "catalog rebuild finalize failed"
+                    );
+                    let _ = requeue_or_fail_owned_job(db, &job, &message).await;
+                }
+            }
+            Err(error) => {
+                let message = error.to_string();
+                tracing::warn!(job_id = %job.job_id, error = %message, "catalog rebuild job failed");
+                let _ = requeue_or_fail_owned_job(db, &job, &message).await;
+            }
+        }
+        heartbeat.abort();
+        let _ = heartbeat.await;
         processed += 1;
     }
     Ok(processed)
 }
 
-/// 原子领取一条 queued job：`findOneAndUpdate(status="queued") => status="processing"`。
-async fn claim_one_job(db: &Database) -> Result<Option<crate::models::CatalogRebuildJob>, AppError> {
+/// Public single-batch entrypoint for recovery tests and operational repair.
+/// Production normally reaches this through `catalog_rebuild_worker_loop`.
+pub async fn run_catalog_rebuild_batch(db: &Database) -> Result<usize, AppError> {
+    drain_pending_jobs(db).await
+}
+
+fn worker_id() -> String {
+    let host = std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "unknown".to_string());
+    format!("{host}:{}:{}", std::process::id(), uuid::Uuid::new_v4())
+}
+
+fn lease_until(now: DateTime) -> DateTime {
+    DateTime::from_millis(now.timestamp_millis() + LEASE_SECONDS * 1000)
+}
+
+fn retry_delay_seconds(attempts: i32) -> i64 {
+    let exponent = attempts.saturating_sub(1).clamp(0, 8) as u32;
+    (1_i64 << exponent).min(MAX_RETRY_DELAY_SECONDS)
+}
+
+fn claim_identity_filter(job: &CatalogRebuildJob) -> Option<Document> {
+    let mut filter = doc! {
+        "job_id": &job.job_id,
+        "workspace_id": &job.workspace_id,
+        "document_id": job.document_id,
+        "status": "processing",
+        "worker_id": job.worker_id.as_deref()?,
+        "claim_token": job.claim_token.as_deref()?,
+        "claim_generation": job.claim_generation,
+    };
+    if job.target_generation <= 0 {
+        filter.insert(
+            "$or",
+            vec![
+                doc! { "target_generation": { "$exists": false } },
+                doc! { "target_generation": null },
+                doc! { "target_generation": { "$lte": 0i64 } },
+            ],
+        );
+    } else {
+        filter.insert("target_generation", job.target_generation);
+    }
+    Some(filter)
+}
+
+async fn upgrade_legacy_claim(
+    db: &Database,
+    job: &CatalogRebuildJob,
+) -> Result<CatalogRebuildJob, AppError> {
+    const MAX_UPGRADE_ATTEMPTS: usize = 3;
+    for attempt in 0..MAX_UPGRADE_ATTEMPTS {
+        match upgrade_legacy_claim_once(db, job).await {
+            Ok(upgraded) => return Ok(upgraded),
+            Err(error)
+                if attempt + 1 < MAX_UPGRADE_ATTEMPTS && retryable_finalize_error(&error) =>
+            {
+                tokio::task::yield_now().await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("bounded catalog legacy-upgrade loop always returns")
+}
+
+async fn upgrade_legacy_claim_once(
+    db: &Database,
+    job: &CatalogRebuildJob,
+) -> Result<CatalogRebuildJob, AppError> {
     let now = DateTime::now();
-    let filter = doc! { "status": "queued" };
+    let mut claim_filter = claim_identity_filter(job)
+        .ok_or_else(|| AppError::Conflict("catalog_claim_missing_identity".to_string()))?;
+    claim_filter.insert("locked_until", doc! { "$gte": now });
+    let mut session = db.client().start_session(None).await?;
+    session.start_transaction(None).await?;
+    let result: Result<Option<i64>, AppError> = async {
+        if db
+            .catalog_rebuild_jobs()
+            .find_one_with_session(claim_filter.clone(), None, &mut session)
+            .await?
+            .is_none()
+        {
+            return Err(AppError::Conflict("catalog_claim_lost".to_string()));
+        }
+        let Some(parent) = db
+            .operation_knowledge_documents()
+            .find_one_with_session(
+                doc! {
+                    "_id": job.document_id,
+                    "workspace_id": &job.workspace_id,
+                },
+                None,
+                &mut session,
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        let target = parent
+            .catalog_desired_generation
+            .max(parent.catalog_applied_generation)
+            .checked_add(1)
+            .ok_or_else(|| AppError::Conflict("catalog_generation_exhausted".to_string()))?;
+        let desired_filter = if parent.catalog_desired_generation == 0 {
+            doc! {
+                "$or": [
+                    { "catalog_desired_generation": 0i64 },
+                    { "catalog_desired_generation": { "$exists": false } },
+                    { "catalog_desired_generation": null },
+                ]
+            }
+        } else {
+            doc! { "catalog_desired_generation": parent.catalog_desired_generation }
+        };
+        let mut parent_filter = doc! {
+            "_id": job.document_id,
+            "workspace_id": &job.workspace_id,
+        };
+        parent_filter.extend(desired_filter);
+        let advanced = db
+            .operation_knowledge_documents()
+            .update_one_with_session(
+                parent_filter,
+                doc! { "$set": { "catalog_desired_generation": target } },
+                None,
+                &mut session,
+            )
+            .await?;
+        if advanced.matched_count != 1 {
+            return Err(AppError::Conflict(
+                "catalog_generation_conflict".to_string(),
+            ));
+        }
+        let upgraded = db
+            .catalog_rebuild_jobs()
+            .update_one_with_session(
+                claim_filter,
+                doc! { "$set": { "target_generation": target } },
+                None,
+                &mut session,
+            )
+            .await?;
+        if upgraded.matched_count != 1 {
+            return Err(AppError::Conflict("catalog_claim_lost".to_string()));
+        }
+        Ok(Some(target))
+    }
+    .await;
+    match result {
+        Ok(target) => {
+            commit_chunk_transaction(&mut session).await?;
+            let mut upgraded = job.clone();
+            if let Some(target) = target {
+                upgraded.target_generation = target;
+            }
+            Ok(upgraded)
+        }
+        Err(error) => {
+            let _ = session.abort_transaction().await;
+            Err(error)
+        }
+    }
+}
+
+fn spawn_claim_heartbeat(db: Database, job: CatalogRebuildJob) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker =
+            tokio::time::interval(Duration::from_secs((LEASE_SECONDS / 3).max(1) as u64));
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let now = DateTime::now();
+            let Some(mut filter) = claim_identity_filter(&job) else {
+                return;
+            };
+            filter.insert("locked_until", doc! { "$gte": now });
+            match db
+                .catalog_rebuild_jobs()
+                .update_one(
+                    filter,
+                    doc! { "$set": { "locked_until": lease_until(now) } },
+                    None,
+                )
+                .await
+            {
+                Ok(result) if result.matched_count == 1 => {}
+                Ok(_) => return,
+                Err(error) => {
+                    tracing::warn!(
+                        job_id = %job.job_id,
+                        error = %error,
+                        "catalog rebuild heartbeat failed"
+                    );
+                }
+            }
+        }
+    })
+}
+
+async fn fail_exhausted_recoverable_jobs(db: &Database) -> Result<(), AppError> {
+    let now = DateTime::now();
+    db.catalog_rebuild_jobs()
+        .update_many(
+            doc! {
+                "attempts": { "$gte": MAX_ATTEMPTS },
+                "$or": [
+                    { "status": "queued" },
+                    {
+                        "status": "processing",
+                        "$or": [
+                            { "locked_until": { "$lt": now } },
+                            { "locked_until": null },
+                            { "locked_until": { "$exists": false } },
+                        ],
+                    },
+                ],
+            },
+            doc! {
+                "$set": {
+                    "status": "failed",
+                    "finished_at": now,
+                    "last_error": "catalog rebuild attempts exhausted",
+                },
+                "$unset": {
+                    "worker_id": "",
+                    "claim_token": "",
+                    "locked_until": "",
+                    "next_retry_at": "",
+                },
+            },
+            None,
+        )
+        .await?;
+    Ok(())
+}
+
+/// Atomically claim new work or reclaim an expired worker. `next_retry_at`
+/// gates ordinary retries; an expired processing lease is immediately eligible.
+async fn claim_one_job(
+    db: &Database,
+    worker: &str,
+) -> Result<Option<crate::models::CatalogRebuildJob>, AppError> {
+    let now = DateTime::now();
+    let token = uuid::Uuid::new_v4().to_string();
+    let filter = doc! {
+        "attempts": { "$lt": MAX_ATTEMPTS },
+        "$or": [
+            {
+                "status": "queued",
+                "$or": [
+                    { "next_retry_at": { "$exists": false } },
+                    { "next_retry_at": null },
+                    { "next_retry_at": { "$lte": now } },
+                ],
+            },
+            {
+                "status": "processing",
+                "$or": [
+                    { "locked_until": { "$lt": now } },
+                    { "locked_until": null },
+                    { "locked_until": { "$exists": false } },
+                ],
+            },
+            {
+                "status": "failed",
+                "$or": [
+                    { "target_generation": { "$exists": false } },
+                    { "target_generation": null },
+                    { "target_generation": { "$lte": 0i64 } },
+                ],
+            },
+        ],
+    };
     let update = doc! {
         "$set": {
             "status": "processing",
+            "worker_id": worker,
+            "claim_token": &token,
+            "locked_until": lease_until(now),
             "started_at": now,
         },
-        "$inc": { "attempts": 1i32 },
+        "$inc": {
+            "attempts": 1i32,
+            "claim_generation": 1i64,
+        },
+        "$unset": {
+            "finished_at": "",
+            "next_retry_at": "",
+        },
     };
     let opts = FindOneAndUpdateOptions::builder()
-        .return_document(mongodb::options::ReturnDocument::After)
-        .sort(doc! { "queued_at": 1 })
+        .return_document(ReturnDocument::After)
+        .sort(doc! { "target_generation": 1, "queued_at": 1, "_id": 1 })
         .build();
     let claimed = db
         .catalog_rebuild_jobs()
@@ -116,17 +426,18 @@ async fn claim_one_job(db: &Database) -> Result<Option<crate::models::CatalogReb
     Ok(claimed)
 }
 
-/// 渲染单个 document 的 catalog 落库。
+/// Render only. The persistent projection is written later in the same
+/// transaction that consumes the active claim.
 ///
 /// 步骤：
 /// 1. 拉该 document 下所有 `status="active"` 的 chunk（不含 archived）；
 /// 2. 按 `priority` desc 排序，渲染 markdown；
 /// 3. `findOneAndUpdate documents._id == doc_id` `$set catalog_summary_persisted` `$inc catalog_version`。
-async fn rebuild_one_document(
+async fn render_one_document(
     db: &Database,
     workspace_id: &str,
     document_id: ObjectId,
-) -> Result<(), AppError> {
+) -> Result<String, AppError> {
     let mut chunk_cursor = db
         .operation_knowledge_chunks()
         .find(
@@ -147,26 +458,7 @@ async fn rebuild_one_document(
         chunks.push(c);
     }
 
-    let rendered = render_persisted_catalog(&chunks);
-
-    db.operation_knowledge_documents()
-        .update_one(
-            doc! {
-                "_id": document_id,
-                "workspace_id": workspace_id,
-            },
-            doc! {
-                "$set": {
-                    "catalog_summary_persisted": &rendered,
-                    "updated_at": DateTime::now(),
-                },
-                "$inc": { "catalog_version": 1i64 },
-            },
-            None,
-        )
-        .await?;
-
-    Ok(())
+    Ok(render_persisted_catalog(&chunks))
 }
 
 /// 把 chunk 列表渲染为 markdown 形式的 persisted catalog。
@@ -187,10 +479,9 @@ pub fn render_persisted_catalog(chunks: &[crate::models::OperationKnowledgeChunk
     }
     let mut buf = String::with_capacity(chunks.len() * 256);
     for c in chunks {
-        let id = c
-            .id
-            .map(|o| o.to_hex())
-            .unwrap_or_else(|| String::from("?"));
+        let id =
+            c.id.map(|o| o.to_hex())
+                .unwrap_or_else(|| String::from("?"));
         let wiki_type = c
             .wiki_type
             .as_deref()
@@ -206,11 +497,7 @@ pub fn render_persisted_catalog(chunks: &[crate::models::OperationKnowledgeChunk
             .dynamic_confidence
             .map(|v| format!("{:.2}", v))
             .unwrap_or_else(|| "—".to_string());
-        let hits = c
-            .usage_stats
-            .as_ref()
-            .map(|u| u.hit_count_30d)
-            .unwrap_or(0);
+        let hits = c.usage_stats.as_ref().map(|u| u.hit_count_30d).unwrap_or(0);
         let excerpt = c
             .summary
             .as_deref()
@@ -235,37 +522,260 @@ pub fn render_persisted_catalog(chunks: &[crate::models::OperationKnowledgeChunk
     buf
 }
 
-async fn mark_job_done(db: &Database, job_id: &str) -> Result<(), AppError> {
-    db.catalog_rebuild_jobs()
-        .update_one(
-            doc! { "job_id": job_id },
-            doc! {
-                "$set": {
-                    "status": "done",
-                    "finished_at": DateTime::now(),
-                    "last_error": null,
-                },
-            },
-            None,
-        )
-        .await?;
-    Ok(())
+fn active_claim_filter(job: &CatalogRebuildJob, now: DateTime) -> Result<Document, AppError> {
+    let worker_id = job
+        .worker_id
+        .as_deref()
+        .ok_or_else(|| AppError::Conflict("catalog_claim_missing_owner".to_string()))?;
+    let claim_token = job
+        .claim_token
+        .as_deref()
+        .ok_or_else(|| AppError::Conflict("catalog_claim_missing_token".to_string()))?;
+    let mut filter = doc! {
+        "job_id": &job.job_id,
+        "workspace_id": &job.workspace_id,
+        "document_id": job.document_id,
+        "status": "processing",
+        "worker_id": worker_id,
+        "claim_token": claim_token,
+        "claim_generation": job.claim_generation,
+        "locked_until": { "$gte": now },
+    };
+    if job.target_generation <= 0 {
+        filter.insert(
+            "$or",
+            vec![
+                doc! { "target_generation": { "$exists": false } },
+                doc! { "target_generation": null },
+                doc! { "target_generation": { "$lte": 0i64 } },
+            ],
+        );
+    } else {
+        filter.insert("target_generation", job.target_generation);
+    }
+    Ok(filter)
 }
 
-async fn mark_job_failed(db: &Database, job_id: &str, err: &str) -> Result<(), AppError> {
-    db.catalog_rebuild_jobs()
+async fn finalize_rendered_catalog(
+    db: &Database,
+    job: &CatalogRebuildJob,
+    rendered: &str,
+) -> Result<(), AppError> {
+    const MAX_FINALIZE_ATTEMPTS: usize = 3;
+    for attempt in 0..MAX_FINALIZE_ATTEMPTS {
+        match finalize_rendered_catalog_once(db, job, rendered).await {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if attempt + 1 < MAX_FINALIZE_ATTEMPTS && retryable_finalize_error(&error) =>
+            {
+                tokio::task::yield_now().await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("bounded catalog finalize loop always returns")
+}
+
+fn retryable_finalize_error(error: &AppError) -> bool {
+    match error {
+        AppError::Db(error) => error.contains_label("TransientTransactionError"),
+        AppError::Conflict(code) => code == "catalog_generation_conflict",
+        _ => false,
+    }
+}
+
+async fn finalize_rendered_catalog_once(
+    db: &Database,
+    job: &CatalogRebuildJob,
+    rendered: &str,
+) -> Result<(), AppError> {
+    let now = DateTime::now();
+    let claim_filter = active_claim_filter(job, now)?;
+    let mut session = db.client().start_session(None).await?;
+    session.start_transaction(None).await?;
+    let result: Result<(), AppError> = async {
+        let owned = db
+            .catalog_rebuild_jobs()
+            .find_one_with_session(claim_filter.clone(), None, &mut session)
+            .await?;
+        if owned.is_none() {
+            return Err(AppError::Conflict("catalog_claim_lost".to_string()));
+        }
+        let Some(parent) = db
+            .operation_knowledge_documents()
+            .find_one_with_session(
+                doc! {
+                    "_id": job.document_id,
+                    "workspace_id": &job.workspace_id,
+                },
+                None,
+                &mut session,
+            )
+            .await?
+        else {
+            let discarded = db
+                .catalog_rebuild_jobs()
+                .update_one_with_session(
+                    claim_filter,
+                    doc! {
+                        "$set": {
+                            "status": "discarded",
+                            "finished_at": now,
+                            "last_error": "parent document no longer exists",
+                        },
+                        "$unset": {
+                            "worker_id": "",
+                            "claim_token": "",
+                            "locked_until": "",
+                            "next_retry_at": "",
+                        },
+                    },
+                    None,
+                    &mut session,
+                )
+                .await?;
+            if discarded.matched_count != 1 {
+                return Err(AppError::Conflict("catalog_claim_lost".to_string()));
+            }
+            return Ok(());
+        };
+
+        if parent.catalog_applied_generation >= job.target_generation
+            || parent.catalog_desired_generation > job.target_generation
+        {
+            let superseded = db
+                .catalog_rebuild_jobs()
+                .update_one_with_session(
+                    claim_filter,
+                    doc! {
+                        "$set": {
+                            "status": "superseded",
+                            "finished_at": now,
+                            "last_error": null,
+                        },
+                        "$unset": {
+                            "worker_id": "",
+                            "claim_token": "",
+                            "locked_until": "",
+                            "next_retry_at": "",
+                        },
+                    },
+                    None,
+                    &mut session,
+                )
+                .await?;
+            if superseded.matched_count != 1 {
+                return Err(AppError::Conflict("catalog_claim_lost".to_string()));
+            }
+            return Ok(());
+        }
+
+        let updated = db
+            .operation_knowledge_documents()
+            .update_one_with_session(
+                doc! {
+                    "_id": job.document_id,
+                    "workspace_id": &job.workspace_id,
+                    "catalog_desired_generation": job.target_generation,
+                    "catalog_applied_generation": parent.catalog_applied_generation,
+                },
+                doc! {
+                    "$set": {
+                        "catalog_summary_persisted": rendered,
+                        "catalog_applied_generation": job.target_generation,
+                    },
+                    "$inc": { "catalog_version": 1i64 },
+                },
+                None,
+                &mut session,
+            )
+            .await?;
+        if updated.matched_count != 1 {
+            return Err(AppError::Conflict(
+                "catalog_generation_conflict".to_string(),
+            ));
+        }
+        let finished = db
+            .catalog_rebuild_jobs()
+            .update_one_with_session(
+                claim_filter,
+                doc! {
+                    "$set": {
+                        "status": "done",
+                        "finished_at": now,
+                        "last_error": null,
+                    },
+                    "$unset": {
+                        "worker_id": "",
+                        "claim_token": "",
+                        "locked_until": "",
+                        "next_retry_at": "",
+                    },
+                },
+                None,
+                &mut session,
+            )
+            .await?;
+        if finished.matched_count != 1 {
+            return Err(AppError::Conflict("catalog_claim_lost".to_string()));
+        }
+        Ok(())
+    }
+    .await;
+    match result {
+        Ok(()) => commit_chunk_transaction(&mut session).await,
+        Err(error) => {
+            let _ = session.abort_transaction().await;
+            Err(error)
+        }
+    }
+}
+
+async fn requeue_or_fail_owned_job(
+    db: &Database,
+    job: &CatalogRebuildJob,
+    error: &str,
+) -> Result<(), AppError> {
+    let now = DateTime::now();
+    let filter = active_claim_filter(job, now)?;
+    let (status, next_retry_at) = if job.attempts >= MAX_ATTEMPTS {
+        ("failed", None)
+    } else {
+        (
+            "queued",
+            Some(DateTime::from_millis(
+                now.timestamp_millis()
+                    .saturating_add(retry_delay_seconds(job.attempts) * 1000),
+            )),
+        )
+    };
+    let mut set = doc! {
+        "status": status,
+        "last_error": error,
+    };
+    if let Some(next_retry_at) = next_retry_at {
+        set.insert("next_retry_at", next_retry_at);
+    } else {
+        set.insert("finished_at", now);
+    }
+    let result = db
+        .catalog_rebuild_jobs()
         .update_one(
-            doc! { "job_id": job_id },
+            filter,
             doc! {
-                "$set": {
-                    "status": "failed",
-                    "finished_at": DateTime::now(),
-                    "last_error": err,
+                "$set": set,
+                "$unset": {
+                    "worker_id": "",
+                    "claim_token": "",
+                    "locked_until": "",
                 },
             },
             None,
         )
         .await?;
+    if result.matched_count != 1 {
+        return Err(AppError::Conflict("catalog_claim_lost".to_string()));
+    }
     Ok(())
 }
 

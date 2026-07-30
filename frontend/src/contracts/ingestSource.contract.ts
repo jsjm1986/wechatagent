@@ -5,6 +5,9 @@
 export const CANONICAL_KEYS = [
   "sourceId",
   "workspaceId",
+  "sourceGeneration",
+  "claimGeneration",
+  "lockedUntil",
   "kind",
   "url",
   "label",

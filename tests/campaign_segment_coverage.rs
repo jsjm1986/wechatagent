@@ -47,12 +47,25 @@ async fn m030_backfills_missing_verification_and_event_kind() {
         .await
         .expect("find")
         .expect("contact exists");
-    let ev = after.get_array("outcome_events").unwrap()[0].as_document().unwrap();
-    assert_eq!(ev.get_str("verification").unwrap(), "staff_confirmed", "缺 verification 补默认");
-    assert_eq!(ev.get_str("eventKind").unwrap(), "deal", "缺 eventKind 补默认");
+    let ev = after.get_array("outcome_events").unwrap()[0]
+        .as_document()
+        .unwrap();
+    assert_eq!(
+        ev.get_str("verification").unwrap(),
+        "staff_confirmed",
+        "缺 verification 补默认"
+    );
+    assert_eq!(
+        ev.get_str("eventKind").unwrap(),
+        "deal",
+        "缺 eventKind 补默认"
+    );
     // productRef 原值不被破坏
     assert_eq!(
-        ev.get_document("productRef").unwrap().get_str("productId").unwrap(),
+        ev.get_document("productRef")
+            .unwrap()
+            .get_str("productId")
+            .unwrap(),
         "vip"
     );
 }
@@ -99,9 +112,19 @@ async fn m030_does_not_overwrite_existing_values() {
         .await
         .expect("find")
         .expect("exists");
-    let ev = after.get_array("outcome_events").unwrap()[0].as_document().unwrap();
-    assert_eq!(ev.get_str("verification").unwrap(), "conversation_inferred", "已有值不被覆盖");
-    assert_eq!(ev.get_str("eventKind").unwrap(), "reversal", "已有 reversal 不被改成 deal");
+    let ev = after.get_array("outcome_events").unwrap()[0]
+        .as_document()
+        .unwrap();
+    assert_eq!(
+        ev.get_str("verification").unwrap(),
+        "conversation_inferred",
+        "已有值不被覆盖"
+    );
+    assert_eq!(
+        ev.get_str("eventKind").unwrap(),
+        "reversal",
+        "已有 reversal 不被改成 deal"
+    );
 }
 
 /// 端到端：缺字段老成交客户，用防线 A 等价的粗筛查询能命中(回填前靠 $exists/$ne 就纳入)。
@@ -153,7 +176,10 @@ async fn coarse_query_includes_legacy_event_missing_fields() {
         .count_documents(coarse, None)
         .await
         .expect("count");
-    assert_eq!(count, 1, "缺 verification/eventKind 的老成交老客户须被粗筛纳入(KC-05 修复)");
+    assert_eq!(
+        count, 1,
+        "缺 verification/eventKind 的老成交老客户须被粗筛纳入(KC-05 修复)"
+    );
 }
 
 /// C1 回归哨兵：只有 outcome_events(无 deal_events)的文档,跑 m030 后**不得**被凭空
@@ -219,6 +245,12 @@ async fn m030_does_not_create_deal_events_key_on_outcome_events_only_doc() {
         .expect("类型化 Contact 读取不得因 deal_events/outcome_events 双键 duplicate_field 崩")
         .expect("contact exists");
     assert_eq!(typed.outcome_events.len(), 1, "回填后成交事件仍在");
-    assert_eq!(typed.outcome_events[0].verification, "staff_confirmed", "缺 verification 补默认");
-    assert_eq!(typed.outcome_events[0].event_kind, "deal", "缺 event_kind 补默认");
+    assert_eq!(
+        typed.outcome_events[0].verification, "staff_confirmed",
+        "缺 verification 补默认"
+    );
+    assert_eq!(
+        typed.outcome_events[0].event_kind, "deal",
+        "缺 event_kind 补默认"
+    );
 }

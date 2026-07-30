@@ -18,10 +18,7 @@ use axum::{
     Extension, Json,
 };
 use futures::TryStreamExt;
-use mongodb::{
-    bson::doc,
-    options::FindOptions,
-};
+use mongodb::{bson::doc, options::FindOptions};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -220,9 +217,6 @@ mod tests {
             seeded_by: Some("manual".to_string()),
         };
         let value = operation_state_policy_json(policy);
-        crate::routes::contract_snapshot::assert_contract_fixture(
-            "operation_state_policy",
-            value,
-        );
+        crate::routes::contract_snapshot::assert_contract_fixture("operation_state_policy", value);
     }
 }

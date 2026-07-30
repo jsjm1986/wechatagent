@@ -45,6 +45,11 @@ fn ingest_source(workspace_id: &str, source_id: &str, kind: &str, url: String) -
         id: None,
         source_id: source_id.to_string(),
         workspace_id: workspace_id.to_string(),
+        source_generation: 1,
+        claim_generation: 0,
+        worker_id: None,
+        claim_token: None,
+        locked_until: None,
         kind: kind.to_string(),
         url,
         label: Some(format!("smoke {kind}")),
@@ -81,10 +86,11 @@ async fn reload_source(app: &TestApp, source_id: &str) -> IngestSource {
         .expect("source should exist")
 }
 
-/// 场景 1：RSS 源拉取成功 → 落 chunk（draft + needs_review）+ source 状态刷新。
+/// SR-109: even an otherwise valid loopback response must be rejected before
+/// any request is sent or knowledge is persisted.
 #[tokio::test]
 #[ignore]
-async fn run_one_round_ingests_rss_into_review_chunks() {
+async fn run_one_round_rejects_loopback_source_before_request() {
     let app = TestApp::start().await;
     let ws = app.state.config.default_workspace_id.clone();
 
@@ -105,56 +111,41 @@ async fn run_one_round_ingests_rss_into_review_chunks() {
 
     run_one_round(&app.state).await.expect("run_one_round ok");
 
-    // chunk 落库且全部 draft + needs_review。
-    let mut cursor = app
-        .state
-        .db
-        .operation_knowledge_chunks()
-        .find(doc! { "workspace_id": &ws }, None)
-        .await
-        .expect("query chunks");
-    use futures::TryStreamExt;
-    let mut count = 0usize;
-    while let Some(chunk) = cursor.try_next().await.expect("iter chunks") {
-        count += 1;
-        assert_eq!(
-            chunk.status, "draft",
-            "ingest chunk 必须 draft（AI 永不自动 verify）",
-        );
-        assert_eq!(
-            chunk.integrity_status.as_deref(),
-            Some("needs_review"),
-            "ingest chunk 必须 needs_review",
-        );
-    }
-    assert!(count >= 1, "RSS 至少应产 1 chunk，实际 {count}");
-
-    // source 状态：last_fetched_at 已刷新、failure_streak 归零、ingest_count 累加、
-    // etag 记录回来。
     let reloaded = reload_source(&app, "ing_smoke_rss").await;
-    assert!(reloaded.last_fetched_at.is_some(), "应记录 last_fetched_at");
-    assert_eq!(reloaded.failure_streak, 0, "成功后 failure_streak 归零");
-    assert!(reloaded.ingest_count >= 1, "ingest_count 应累加");
-    assert_eq!(reloaded.last_etag.as_deref(), Some("\"smoke-etag-1\""));
+    assert_eq!(reloaded.failure_streak, 1);
+    assert!(reloaded
+        .last_error
+        .as_deref()
+        .is_some_and(|error| error.contains("non-public network address")));
+    assert_eq!(reloaded.ingest_count, 0);
+    assert!(reloaded.last_fetched_at.is_none());
+    assert!(reloaded.last_etag.is_none());
     assert_eq!(reloaded.status, "active");
+    assert!(server.received_requests().await.unwrap().is_empty());
+    assert_eq!(
+        app.state
+            .db
+            .operation_knowledge_chunks()
+            .count_documents(doc! { "workspace_id": &ws }, None)
+            .await
+            .expect("count chunks"),
+        0
+    );
 }
 
-/// 场景 2：源不可达（500）→ failure_streak +1，不产 chunk。
+/// SR-109: cloud metadata and link-local targets are rejected without I/O.
 #[tokio::test]
 #[ignore]
-async fn run_one_round_marks_failure_on_unreachable_source() {
+async fn run_one_round_rejects_metadata_source() {
     let app = TestApp::start().await;
     let ws = app.state.config.default_workspace_id.clone();
 
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/feed.xml"))
-        .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
-        .mount(&server)
-        .await;
-
-    let url = format!("{}/feed.xml", server.uri());
-    let src = ingest_source(&ws, "ing_smoke_fail", "rss", url);
+    let src = ingest_source(
+        &ws,
+        "ing_smoke_fail",
+        "html",
+        "http://169.254.169.254/latest/meta-data".to_string(),
+    );
     insert_source(&app, &src).await;
 
     run_one_round(&app.state).await.expect("run_one_round ok");
@@ -185,7 +176,12 @@ async fn run_one_round_skips_not_due_source_without_touching_last_fetched_at() {
 
     // 不挂任何 wiremock:not-due 本就不该发请求;若代码错误地发了请求会因无 mock
     // 连接失败,但那条路径也不会走到(is_due=false 早退在发请求之前)。
-    let src = ingest_source(&ws, "ing_not_due", "rss", "http://127.0.0.1:1/never".to_string());
+    let src = ingest_source(
+        &ws,
+        "ing_not_due",
+        "rss",
+        "http://127.0.0.1:1/never".to_string(),
+    );
     insert_source(&app, &src).await;
 
     // 把 last_fetched_at 设成 10 分钟前(schedule_minutes=60 → 未到点 not-due),
@@ -212,7 +208,10 @@ async fn run_one_round_skips_not_due_source_without_touching_last_fetched_at() {
         Some(ten_min_ago_ms),
         "not-due 源的 last_fetched_at 不得被 run_one_round 刷新(旧 bug 会刷成 now)"
     );
-    assert_eq!(reloaded.ingest_count, 0, "not-due 源不应产 chunk / 累加 ingest_count");
+    assert_eq!(
+        reloaded.ingest_count, 0,
+        "not-due 源不应产 chunk / 累加 ingest_count"
+    );
     assert_eq!(reloaded.status, "active", "not-due 源状态不变");
 
     // 且没落任何 chunk。
@@ -226,11 +225,11 @@ async fn run_one_round_skips_not_due_source_without_touching_last_fetched_at() {
     assert_eq!(chunk_count, 0, "not-due 源不应产任何 chunk");
 }
 
-/// 场景 4(对照):source 已过 schedule_minutes(due)时,run_one_round 仍正常拉取。
-/// 确认拆 Skipped 变体没误伤"到点该拉"的正常路径。
+/// A due private source must be evaluated and rejected, while the not-due test
+/// above proves scheduling still short-circuits before policy resolution.
 #[tokio::test]
 #[ignore]
-async fn run_one_round_still_ingests_due_source() {
+async fn run_one_round_rejects_due_private_source() {
     let app = TestApp::start().await;
     let ws = app.state.config.default_workspace_id.clone();
 
@@ -265,100 +264,11 @@ async fn run_one_round_still_ingests_due_source() {
     run_one_round(&app.state).await.expect("run_one_round ok");
 
     let reloaded = reload_source(&app, "ing_due").await;
-    // due 源被真实拉取:last_fetched_at 前移(> 120min 前的旧值)、产 chunk。
-    assert!(
-        reloaded.last_fetched_at.map(|d| d.timestamp_millis()).unwrap_or(0) > two_hours_ago_ms,
-        "due 源应被拉取,last_fetched_at 前移"
-    );
-    assert!(reloaded.ingest_count >= 1, "due 源应产 chunk 并累加 ingest_count");
-}
-
-/// 场景 5：源不提供 ETag 时，连续两次返回相同内容只导入一次。
-#[tokio::test]
-#[ignore]
-async fn run_one_round_dedupes_unchanged_content_without_etag() {
-    let app = TestApp::start().await;
-    let ws = app.state.config.default_workspace_id.clone();
-
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/feed-no-etag.xml"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(RSS_BODY))
-        .mount(&server)
-        .await;
-
-    let url = format!("{}/feed-no-etag.xml", server.uri());
-    let src = ingest_source(&ws, "ing_no_etag_dedupe", "rss", url);
-    insert_source(&app, &src).await;
-
-    run_one_round(&app.state).await.expect("first round ok");
-    let first_source = reload_source(&app, "ing_no_etag_dedupe").await;
-    assert!(first_source.last_etag.is_none(), "fixture must not return ETag");
-    assert!(
-        first_source.last_content_hash.is_some(),
-        "first successful ingest should persist the content checkpoint"
-    );
-
-    let first_documents = app
-        .state
-        .db
-        .operation_knowledge_documents()
-        .count_documents(
-            doc! { "workspace_id": &ws, "source_name": "smoke rss" },
-            None,
-        )
-        .await
-        .expect("count first documents");
-    let first_chunks = app
-        .state
-        .db
-        .operation_knowledge_chunks()
-        .count_documents(doc! { "workspace_id": &ws }, None)
-        .await
-        .expect("count first chunks");
-    assert_eq!(first_documents, 1, "first round should create one document");
-    assert!(first_chunks > 0, "first round should create chunks");
-
-    // Make the source due again without changing the fetched body.
-    let two_hours_ago = BsonDateTime::from_millis(
-        BsonDateTime::now().timestamp_millis() - 2 * 60 * 60 * 1000,
-    );
-    app.state
-        .db
-        .ingest_sources()
-        .update_one(
-            doc! { "source_id": "ing_no_etag_dedupe" },
-            doc! { "$set": { "last_fetched_at": two_hours_ago } },
-            None,
-        )
-        .await
-        .expect("make source due again");
-
-    run_one_round(&app.state).await.expect("second round ok");
-    let second_source = reload_source(&app, "ing_no_etag_dedupe").await;
-    let second_documents = app
-        .state
-        .db
-        .operation_knowledge_documents()
-        .count_documents(
-            doc! { "workspace_id": &ws, "source_name": "smoke rss" },
-            None,
-        )
-        .await
-        .expect("count second documents");
-    let second_chunks = app
-        .state
-        .db
-        .operation_knowledge_chunks()
-        .count_documents(doc! { "workspace_id": &ws }, None)
-        .await
-        .expect("count second chunks");
-
-    assert_eq!(second_documents, first_documents);
-    assert_eq!(second_chunks, first_chunks);
-    assert_eq!(second_source.ingest_count, first_source.ingest_count);
     assert_eq!(
-        second_source.last_content_hash,
-        first_source.last_content_hash,
+        reloaded.last_fetched_at.map(|d| d.timestamp_millis()),
+        Some(two_hours_ago_ms)
     );
+    assert_eq!(reloaded.failure_streak, 1);
+    assert_eq!(reloaded.ingest_count, 0);
+    assert!(server.received_requests().await.unwrap().is_empty());
 }

@@ -89,11 +89,38 @@ pub(crate) async fn chat_reply_with_tools_loop<'a>(
     knowledge: &KnowledgeRuntime,
     db: &Database,
     workspace_id: &str,
+    account_id: &str,
     budget: Arc<RunBudget>,
     anchor_match: Option<AnchorMatchFn>,
     reply_fn: ChatReplyFn<'a>,
 ) -> Result<ChatToolLoopOutcome, ChatToolLoopError> {
+    chat_reply_with_tools_loop_with_timeout(
+        runtime,
+        knowledge,
+        db,
+        workspace_id,
+        account_id,
+        budget,
+        anchor_match,
+        reply_fn,
+        CHAT_TOOL_LOOP_TOTAL_TIMEOUT,
+    )
+    .await
+}
+
+async fn chat_reply_with_tools_loop_with_timeout<'a>(
+    runtime: &UserRuntimeParameters,
+    knowledge: &KnowledgeRuntime,
+    db: &Database,
+    workspace_id: &str,
+    account_id: &str,
+    budget: Arc<RunBudget>,
+    anchor_match: Option<AnchorMatchFn>,
+    reply_fn: ChatReplyFn<'a>,
+    total_timeout: Duration,
+) -> Result<ChatToolLoopOutcome, ChatToolLoopError> {
     let loop_started = std::time::Instant::now();
+    let deadline = tokio::time::Instant::now() + total_timeout;
     let max_loops = CHAT_TOOL_LOOP_MAX_LOOPS;
     let mut accumulated_results = String::new();
     let mut tool_trace: Vec<Document> = Vec::new();
@@ -106,7 +133,7 @@ pub(crate) async fn chat_reply_with_tools_loop<'a>(
     let mut loop_count: i32 = 0;
 
     while loop_count < max_loops {
-        if loop_started.elapsed() > CHAT_TOOL_LOOP_TOTAL_TIMEOUT {
+        if tokio::time::Instant::now() >= deadline {
             return Err(ChatToolLoopError::Timeout {
                 elapsed_ms: loop_started.elapsed().as_millis() as i64,
                 risks,
@@ -115,7 +142,18 @@ pub(crate) async fn chat_reply_with_tools_loop<'a>(
         }
 
         let truncated = truncate_tool_results(&accumulated_results, &mut risks);
-        let (decision, promote_risks) = reply_fn(&truncated, loop_count).await?;
+        let (decision, promote_risks) =
+            match tokio::time::timeout_at(deadline, reply_fn(&truncated, loop_count)).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    risks.push("chat_tool_loop_timeout".to_string());
+                    return Err(ChatToolLoopError::Timeout {
+                        elapsed_ms: loop_started.elapsed().as_millis() as i64,
+                        risks,
+                        tool_trace,
+                    });
+                }
+            };
         loop_count += 1;
         last_promote_risks = promote_risks;
 
@@ -130,7 +168,9 @@ pub(crate) async fn chat_reply_with_tools_loop<'a>(
                     knowledge,
                     db,
                     workspace_id,
+                    account_id,
                     &budget,
+                    deadline,
                     anchor_match,
                     &mut state,
                     &mut tool_trace,
@@ -140,6 +180,14 @@ pub(crate) async fn chat_reply_with_tools_loop<'a>(
                     &mut failure_streak,
                 )
                 .await;
+                if dispatch_outcome.timed_out {
+                    risks.push("chat_tool_loop_timeout".to_string());
+                    return Err(ChatToolLoopError::Timeout {
+                        elapsed_ms: loop_started.elapsed().as_millis() as i64,
+                        risks,
+                        tool_trace,
+                    });
+                }
                 if dispatch_outcome.force_stop {
                     last_decision = Some(decision);
                     break;
@@ -204,6 +252,7 @@ pub(crate) async fn chat_reply_with_tools_loop<'a>(
 
 struct DispatchTurnOutcome {
     force_stop: bool,
+    timed_out: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -213,7 +262,9 @@ async fn dispatch_chat_turn(
     knowledge: &KnowledgeRuntime,
     db: &Database,
     workspace_id: &str,
+    account_id: &str,
     budget: &Arc<RunBudget>,
+    deadline: tokio::time::Instant,
     anchor_match: Option<AnchorMatchFn>,
     state: &mut ToolDispatchState,
     tool_trace: &mut Vec<Document>,
@@ -230,17 +281,30 @@ async fn dispatch_chat_turn(
 
     for call in calls {
         let started = std::time::Instant::now();
-        let result = dispatch_chat_tool_call(
-            &call,
-            runtime,
-            knowledge,
-            db,
-            workspace_id,
-            budget,
-            state,
-            anchor_match,
+        let result = match tokio::time::timeout_at(
+            deadline,
+            dispatch_chat_tool_call(
+                &call,
+                runtime,
+                knowledge,
+                db,
+                workspace_id,
+                account_id,
+                budget,
+                state,
+                anchor_match,
+            ),
         )
-        .await;
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                return DispatchTurnOutcome {
+                    force_stop: true,
+                    timed_out: true,
+                };
+            }
+        };
         *tool_calls_dispatched += 1;
         let latency_ms = started.elapsed().as_millis() as i64;
         let trace_entry = build_tool_trace_entry(&call, &result, latency_ms);
@@ -254,17 +318,26 @@ async fn dispatch_chat_turn(
         append_tool_result_to_context(accumulated_results, &call, &result);
         if *failure_streak >= CHAT_TOOL_FAILURE_STREAK_LIMIT {
             risks.push("chat_tool_call_failure_streak".to_string());
-            return DispatchTurnOutcome { force_stop: true };
+            return DispatchTurnOutcome {
+                force_stop: true,
+                timed_out: false,
+            };
         }
         if matches!(
             result.get("error").and_then(|v| v.as_str()),
             Some("budget_exceeded")
         ) {
             risks.push("chat_tool_budget_exhausted".to_string());
-            return DispatchTurnOutcome { force_stop: true };
+            return DispatchTurnOutcome {
+                force_stop: true,
+                timed_out: false,
+            };
         }
     }
-    DispatchTurnOutcome { force_stop: false }
+    DispatchTurnOutcome {
+        force_stop: false,
+        timed_out: false,
+    }
 }
 
 fn build_tool_trace_entry(call: &ToolCallRequest, result: &Value, latency_ms: i64) -> Document {
@@ -306,17 +379,12 @@ fn build_tool_trace_entry(call: &ToolCallRequest, result: &Value, latency_ms: i6
     doc
 }
 
-fn append_tool_result_to_context(
-    accumulated: &mut String,
-    call: &ToolCallRequest,
-    result: &Value,
-) {
-    let arguments_json = match mongodb::bson::Bson::from(call.arguments.clone())
-        .into_relaxed_extjson()
-    {
-        Value::Object(map) => Value::Object(map),
-        other => other,
-    };
+fn append_tool_result_to_context(accumulated: &mut String, call: &ToolCallRequest, result: &Value) {
+    let arguments_json =
+        match mongodb::bson::Bson::from(call.arguments.clone()).into_relaxed_extjson() {
+            Value::Object(map) => Value::Object(map),
+            other => other,
+        };
     let segment = format!(
         "\n[system tool result]\ntool: {}\narguments: {}\nresult: {}\n",
         call.tool,
@@ -341,10 +409,7 @@ fn truncate_tool_results(accumulated: &str, risks: &mut Vec<String>) -> String {
     total[drop_count..].iter().collect()
 }
 
-fn strip_extra_tool_calls(
-    mut decision: AgentDecision,
-    risks: &mut Vec<String>,
-) -> AgentDecision {
+fn strip_extra_tool_calls(mut decision: AgentDecision, risks: &mut Vec<String>) -> AgentDecision {
     if !decision.tool_calls.is_empty() {
         risks.push("chat_final_phase_extra_tool_calls_dropped".to_string());
         decision.tool_calls.clear();
@@ -459,6 +524,7 @@ mod tests {
             &knowledge,
             &db,
             "ws_test",
+            "account_test",
             budget.clone(),
             None,
             reply_fn,
@@ -468,7 +534,11 @@ mod tests {
 
         // 真实断言：1) reply_fn 仅被调一次（final 一轮就退）；2) 留下 final decision；
         // 3) 没有 tool 派发（tool_trace 空 / 没消耗 tool_call 配额）。
-        assert_eq!(call_count.load(Ordering::SeqCst), 1, "final 路径应该只调用一次 reply_fn");
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "final 路径应该只调用一次 reply_fn"
+        );
         assert_eq!(outcome.decision.decision_phase, "final");
         assert_eq!(outcome.decision.reply_text, "OK");
         assert!(
@@ -477,7 +547,79 @@ mod tests {
             outcome.tool_trace
         );
         let snap = budget.snapshot();
-        assert_eq!(snap.tool_calls_used, 0, "final-only 路径不应消耗 tool_call 配额");
+        assert_eq!(
+            snap.tool_calls_used, 0,
+            "final-only 路径不应消耗 tool_call 配额"
+        );
+    }
+
+    #[tokio::test]
+    async fn absolute_deadline_cancels_a_slow_reply_call() {
+        let db = crate::db::Database::connect("mongodb://127.0.0.1:1/test", "wechatagent_test")
+            .await
+            .expect("lazy connect should not fail on URI parse");
+        let reply_fn: ChatReplyFn<'static> = Box::new(|_, _| {
+            Box::pin(async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                Ok((final_decision(), Vec::new()))
+            })
+        });
+
+        let result = chat_reply_with_tools_loop_with_timeout(
+            &runtime(),
+            &empty_knowledge(),
+            &db,
+            "ws_test",
+            "account_test",
+            budget(8),
+            None,
+            reply_fn,
+            Duration::from_millis(20),
+        )
+        .await;
+
+        match result {
+            Err(ChatToolLoopError::Timeout { risks, .. }) => assert!(
+                risks.iter().any(|risk| risk == "chat_tool_loop_timeout"),
+                "timeout must carry a stable risk code: {risks:?}"
+            ),
+            other => panic!("slow reply must hit the absolute deadline: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn four_tool_calling_rounds_are_normalized_to_final() {
+        let db = crate::db::Database::connect("mongodb://127.0.0.1:1/test", "wechatagent_test")
+            .await
+            .expect("lazy connect should not fail on URI parse");
+        let decisions = Arc::new(parking_lot::Mutex::new(vec![
+            intermediate(Vec::new()),
+            intermediate(Vec::new()),
+            intermediate(Vec::new()),
+            intermediate(Vec::new()),
+        ]));
+        let call_count = Arc::new(AtomicI32::new(0));
+
+        let outcome = chat_reply_with_tools_loop(
+            &runtime(),
+            &empty_knowledge(),
+            &db,
+            "ws_test",
+            "account_test",
+            budget(8),
+            None,
+            scripted_reply_fn(decisions, call_count.clone()),
+        )
+        .await
+        .expect("loop exhaustion should return a normalized outcome");
+
+        assert_eq!(call_count.load(Ordering::SeqCst), CHAT_TOOL_LOOP_MAX_LOOPS);
+        assert_eq!(outcome.decision.decision_phase, "final");
+        assert!(outcome.decision.tool_calls.is_empty());
+        assert!(outcome
+            .risks
+            .iter()
+            .any(|risk| risk == "chat_tool_loop_exhausted"));
     }
 
     /// 验证常量与设计金标一致：CHAT_TOOL_CALLS_PER_TURN_CAP=6,

@@ -27,7 +27,7 @@ on:
   # 避开整点减 GitHub 调度拥塞。
   schedule:
     - cron: '17 19 * * *'
-  # 手动触发：**绕过**所有 needs 前置链立即起跑，用于快速验证单测修复。两个互斥目标：
+  # 手动触发：单项诊断目标绕过 needs；nightly_full 则复用完整 nightly 串行依赖链。
   # - dispatch_target=ops（默认）：单独跑某一个 real_llm_ops_smoke 测试（填 ops_test，默认 t15），
   #   不必等 real-llm → recall → ops 串行排队 1+ 小时。
   # - dispatch_target=roleplay_docker：只跑 roleplay-fuzz P0 那几个需要 Docker（testcontainers
@@ -36,13 +36,15 @@ on:
   workflow_dispatch:
     inputs:
       dispatch_target:
-        description: '手动单跑目标（ops=单个 real_llm_ops_smoke / roleplay_docker=roleplay P0 Docker 夹具 / roleplay_p2=情感陪伴全链 E2E 真模型 / reviewer_calibration=reviewer 高压识别校准 / roleplay_arc=R5.1 LLM 演客户动态博弈链）'
+        description: '手动目标（nightly_full=完整真模型链；其余为单项诊断）'
         required: true
         default: 'ops'
         type: choice
         options:
           - credential_probe
           - ops
+          - nightly_full
+          - smoke_t4
           - roleplay_docker
           - roleplay_p2
           - reviewer_calibration
@@ -56,6 +58,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-Dwarnings"
+  # Production and deep async integration paths use an 8 MiB Rust thread stack. Keep this at
+  # workflow scope so every current and future test harness gets the same runtime contract.
+  RUST_MIN_STACK: "8388608"
 
 jobs:
   # HC-001: one synthetic request verifies the rotated secret and its public
@@ -73,7 +78,9 @@ jobs:
     steps:
       - name: Require rotated credential
         if: ${{ env.REAL_LLM_API_KEY == '' }}
-        run: exit 1
+        run: |
+          echo "::error::RSXERMU_KEY is not configured"
+          exit 1
       - name: Probe one synthetic JSON response
         shell: bash
         run: |
@@ -107,7 +114,8 @@ jobs:
           choices = payload.get("choices") or []
           content = choices[0].get("message", {}).get("content", "") if choices else ""
           content = content.strip().removeprefix("```json").removesuffix("```").strip()
-          if json.loads(content).get("ok") is not True:
+          parsed = json.loads(content)
+          if parsed.get("ok") is not True:
               raise SystemExit("provider probe returned unexpected JSON")
           print("HC001_CREDENTIAL_PROBE=ok")
           PY
@@ -197,10 +205,21 @@ jobs:
         shell: bash
         run: bash scripts/test-ci-lints.sh
 
-      - name: Check rotated LLM secret binding (HC-001)
+      - name: Check credentials and rotated provider binding (HC-001)
         run: |
           python3 scripts/check-secrets.py --self-test
           python3 scripts/check-secrets.py
+
+      # SR-004: keep critical business/security evidence blocking while the broad
+      # Docker suite and variable model-quality suites remain diagnostic/nightly.
+      - name: Check CI hard/soft gate policy (SR-004)
+        run: python3 scripts/check-ci-gate-policy.py
+
+      - name: Check auditable Kiro task statuses (SR-179)
+        run: python3 scripts/check-task-status-manifest.py
+
+      - name: Check reproducible 47-domain audit status (SR-183)
+        run: python3 scripts/check-audit-status-manifest.py
 
   integration:
     name: Integration tests (Docker / testcontainers)
@@ -256,7 +275,102 @@ jobs:
         # --no-fail-fast：跑完所有 test 二进制再汇总，不在第一个失败的二进制处
         # abort（cargo 默认 fail-fast 会 exit 101 后跳过剩余 ~96 个测试，拿不到
         # 真实绿/红分布）。本 job continue-on-error，失败不阻塞合并。
-        run: cargo test --no-fail-fast -- --ignored
+        # HC-028 是专用真实模型硬门：它只从受控配置 Mongo 读取 Provider，且按设计
+        # 缺配置必须失败。普通 Docker 体检没有、也不应获得该生产配置，因此这里只
+        # 显式排除这一条；测试本身的严格失败语义保持不变。
+        run: >-
+          cargo test --no-fail-fast -- --ignored
+          --skip real_digest_chat_task_worker_produces_committed_repair_artifact
+
+  knowledge-evidence-gate:
+    name: Knowledge evidence gate (SR-126)
+    runs-on: ubuntu-latest
+    needs: changes
+    if: ${{ github.event_name != 'workflow_dispatch' && needs.changes.outputs.backend != 'false' }}
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /usr/local/share/boost /usr/local/share/powershell \
+            /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force || true
+          df -h
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry / target
+        uses: Swatinem/rust-cache@v2
+
+      # Keep the broad ignored suite as a soft diagnostic job. These five behaviors are the
+      # blocking evidence for retrieval ranking, Chat apply/verify/recall, and Worker outcomes.
+      - name: Run production-ranked recall, real maintenance loop, and Worker verdicts
+        shell: bash
+        env:
+          RUSTFLAGS: ""
+          RUST_MIN_STACK: "8388608"
+        run: |
+          recall_count="$(cargo test --test knowledge_agent_eval -- --list | grep -c '^knowledge_agent_eval_set_meets_thresholds: test$')"
+          test "$recall_count" -eq 1
+          loop_count="$(cargo test --test knowledge_closed_loop_trajectory -- --list | grep -c '^chat_apply_verify_then_answer_is_auditable_closed_loop: test$')"
+          test "$loop_count" -eq 1
+          verdict_count="$(cargo test --test knowledge_worker_behavior_integration -- --list | grep -c '^execute_step_reports_typed_business_verdicts: test$')"
+          test "$verdict_count" -eq 1
+          committed_count="$(cargo test --test knowledge_worker_behavior_integration -- --list | grep -c '^committed_add_has_real_draft_side_effect: test$')"
+          test "$committed_count" -eq 1
+          summary_count="$(cargo test --test knowledge_worker_behavior_integration -- --list | grep -c '^run_task_persists_mixed_verdict_buckets: test$')"
+          test "$summary_count" -eq 1
+          cargo test --test knowledge_agent_eval knowledge_agent_eval_set_meets_thresholds -- --ignored --exact --nocapture
+          cargo test --test knowledge_closed_loop_trajectory chat_apply_verify_then_answer_is_auditable_closed_loop -- --ignored --exact --nocapture
+          cargo test --test knowledge_worker_behavior_integration execute_step_reports_typed_business_verdicts -- --ignored --exact --nocapture
+          cargo test --test knowledge_worker_behavior_integration committed_add_has_real_draft_side_effect -- --ignored --exact --nocapture
+          cargo test --test knowledge_worker_behavior_integration run_task_persists_mixed_verdict_buckets -- --ignored --exact --nocapture
+
+  tenant-isolation-security:
+    name: Tenant isolation security gate (SR-176)
+    runs-on: ubuntu-latest
+    needs: changes
+    if: ${{ github.event_name != 'workflow_dispatch' && needs.changes.outputs.backend != 'false' }}
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # This hard gate compiles only the two real-entrypoint test binaries. Keep the
+      # broad ignored integration suite above as a soft diagnostic job.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /usr/local/share/boost /usr/local/share/powershell \
+            /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force || true
+          df -h
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry / target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run real Router, auth-rate-limit, and expired-session redlines
+        shell: bash
+        env:
+          RUSTFLAGS: ""
+          RUST_MIN_STACK: "8388608"
+        run: |
+          router_count="$(cargo test --test sr176_real_route_isolation -- --list | grep -c '^sr176_real_router_enforces_read_write_and_expired_session_boundaries: test$')"
+          test "$router_count" -eq 1
+          auth_count="$(cargo test --test auth_middleware_integration -- --list | grep -c '^expired_session_rejected_and_logout_idempotent: test$')"
+          test "$auth_count" -eq 1
+          auth_rate_count="$(cargo test --test sr016_auth_rate_limit -- --list | grep -c '^login_and_token_share_limit_and_write_redacted_audit: test$')"
+          test "$auth_rate_count" -eq 1
+          cargo test --test sr176_real_route_isolation sr176_real_router_enforces_read_write_and_expired_session_boundaries -- --ignored --exact --nocapture
+          cargo test --test auth_middleware_integration expired_session_rejected_and_logout_idempotent -- --ignored --exact --nocapture
+          cargo test --test sr016_auth_rate_limit login_and_token_share_limit_and_write_redacted_audit -- --ignored --exact --nocapture
 
   frontend-contract:
     name: 前端契约对账 (tsc + vitest)
@@ -285,7 +399,7 @@ jobs:
   real-llm:
     name: Real-LLM smoke (真实大模型 / MCP 桩)
     runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'schedule' }}
+    if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.dispatch_target == 'nightly_full') }}
     # 并发治理：作为 5 个 real-llm group 串行链的链头（smoke→recall→ops→quality→adversarial，
     # 各组 max-parallel:1）→ 全局任意时刻仅 1 matrix 实例打 rsxermu → 守并发上限 2。
     # （GitHub job-level concurrency group 不能串行化同 run 内 matrix，会 cancel 而非排队，故用 needs 链。）
@@ -330,6 +444,13 @@ jobs:
         if: ${{ env.REAL_LLM_API_KEY != '' }}
         uses: Swatinem/rust-cache@v2
 
+      # rust-cache may restore target/real_llm_ledger from an older run. Start this producer
+      # with an empty ledger so stale capability outcomes can never be uploaded as current proof.
+      - name: Reset real-LLM evidence ledger
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        shell: bash
+        run: rm -rf target/real_llm_ledger && mkdir -p target/real_llm_ledger
+
       # 真实大模型 smoke：T1/T2/T3 默认 #[ignore]，靠 --ignored 触发。
       # 密钥只走 GitHub Secrets（REAL_LLM_API_KEY），永不进代码/日志；
       # 端点 / 模型名是非密钥，可硬写。--nocapture 让 eprintln! 的 skip/诊断
@@ -339,6 +460,7 @@ jobs:
         if: ${{ env.REAL_LLM_API_KEY != '' }}
         env:
           RUSTFLAGS: ""
+          RUST_MIN_STACK: "8388608"
           # 文本主链路（T1/T2）走 gpt-5.6-auto（OpenAI /v1/chat/completions）。
           REAL_LLM_BASE_URL: https://gateway.oeezzk.cn/v1
           REAL_LLM_MODEL: gpt-5.6-auto
@@ -419,7 +541,7 @@ jobs:
   real-llm-recall:
     name: Real-LLM knowledge recall benchmark (${{ matrix.t }} / MCP 桩)
     runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'schedule' }}
+    if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.dispatch_target == 'nightly_full') }}
     # NVIDIA integrate 免费层 RPM 硬墙：5 个 real-LLM job-group 并行时瞬时 ~9 runner 同打
     # 一把 key 必爆 429（实测 retry 6 次仍全 skip 假绿）。max-parallel 只在单 matrix 内限并发、
     # 不能跨 group 协调，故用 needs 链把 5 个 group 串行化（smoke→recall→ops→quality→adversarial），
@@ -470,6 +592,13 @@ jobs:
         if: ${{ env.REAL_LLM_API_KEY != '' }}
         uses: Swatinem/rust-cache@v2
 
+      # Every matrix shard uploads its own artifact. Clear cached evidence first so each shard
+      # contributes only outcomes produced by this run/attempt.
+      - name: Reset real-LLM evidence ledger
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        shell: bash
+        run: rm -rf target/real_llm_ledger && mkdir -p target/real_llm_ledger
+
       # 召回率基准：默认 #[ignore]，靠 --ignored 触发。文本主链 kimi-k2.6
       # （NVIDIA integrate，OpenAI 兼容）。RECALL_STABILITY_RUNS 控制每条 query 跑几次量化
       # 跨轮稳定性（首版 N=3 抗墙，spec 定稿 5；矩阵 6 行业 × N 调用量大，先 3 跑通再放开）。
@@ -514,7 +643,7 @@ jobs:
   real-llm-ops:
     name: Real-LLM ops smoke (${{ matrix.t }} / MCP 桩)
     runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'schedule' }}
+    if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.dispatch_target == 'nightly_full') }}
     # 串行链第 3 环（见 real-llm-recall 注释：跨 group 串行守 rsxermu 并发 2）。
     needs: real-llm-recall
     continue-on-error: true
@@ -654,6 +783,77 @@ jobs:
           REAL_LLM_JUDGE_FORMAT: openai
         run: cargo test --no-fail-fast --test real_llm_ops_smoke ${{ github.event.inputs.ops_test }} -- --ignored --nocapture
 
+  # Strict manual gate for the complete Reply -> Review -> send -> Reaction stop arc.
+  # This job intentionally has no continue-on-error: provider errors, weak content,
+  # review failures, reaction misclassification, or a duplicate send make the job red.
+  real-llm-smoke-t4:
+    name: Real-LLM smoke T4 strict transcript
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.dispatch_target == 'smoke_t4' }}
+    timeout-minutes: 60
+    env:
+      REAL_LLM_API_KEY: ${{ secrets.RSXERMU_KEY }}
+      REAL_LLM_LEDGER: target/real_llm_ledger
+    steps:
+      - name: Require REAL_LLM_API_KEY
+        if: ${{ env.REAL_LLM_API_KEY == '' }}
+        run: |
+          echo "::error::REAL_LLM_API_KEY is required for the strict T4 gate."
+          exit 1
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /usr/local/share/boost /usr/local/share/powershell \
+            /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force || true
+          df -h
+
+      - name: Install Rust toolchain
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and target
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run deterministic async ownership redlines
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        env:
+          RUSTFLAGS: ""
+          RUST_MIN_STACK: "8388608"
+        shell: bash
+        run: |
+          count="$(cargo test --test outbox_integration -- --list | grep -c '^delivery_redline_.*: test$')"
+          test "$count" -eq 5
+          cargo test --test outbox_integration delivery_redline_ -- --ignored --nocapture
+          reaction_count="$(cargo test --test reaction_claim_lock -- --list | grep -c '^reaction_redline_.*: test$')"
+          test "$reaction_count" -eq 2
+          cargo test --test reaction_claim_lock reaction_redline_ -- --ignored --nocapture
+
+      - name: Run strict T4 with full transcript
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        env:
+          RUSTFLAGS: ""
+          RUST_MIN_STACK: "8388608"
+          REAL_LLM_BASE_URL: https://gateway.oeezzk.cn/v1
+          REAL_LLM_MODEL: gpt-5.6-auto
+          REAL_LLM_FORMAT: openai
+        run: cargo test --test real_llm_smoke t4_real_reply_review_reaction_stop_cancels_before_second_send -- --ignored --exact --nocapture
+
+      - name: Upload T4 business transcript
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-llm-smoke-t4-business-transcript
+          path: target/real_llm_ledger/t4_business_transcript.json
+          if-no-files-found: warn
+          retention-days: 30
+
   # 知识库内容质量套件（real_llm_knowledge_quality.rs Q1–Q7）——「裁判校准层」重构后
   # 升级为跨家族裁判团（MiMo 双 checkpoint mimo-v2.5-pro + mimo-v2.5，外加**异族** Qwen
   # via DashScope，#618 最高 ROI 杠杆兑现）+ 跨裁判分歧效度门 + 每 Q 金标 good/bad 校准锚
@@ -677,7 +877,7 @@ jobs:
   real-llm-quality:
     name: Real-LLM knowledge quality (${{ matrix.q }} 双裁判 / MCP 桩)
     runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'schedule' }}
+    if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.dispatch_target == 'nightly_full') }}
     # 串行链第 4 环（见 real-llm-recall 注释：跨 group 串行守 rsxermu 并发 2）。
     needs: real-llm-ops
     continue-on-error: true
@@ -724,6 +924,12 @@ jobs:
       - name: Cache cargo registry / target
         if: ${{ env.REAL_LLM_API_KEY != '' }}
         uses: Swatinem/rust-cache@v2
+
+      # Quality is a matrix job as well; never let a cached Q3/Q4 outcome survive into this shard.
+      - name: Reset real-LLM evidence ledger
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        shell: bash
+        run: rm -rf target/real_llm_ledger && mkdir -p target/real_llm_ledger
 
       - name: cargo test --test real_llm_knowledge_quality ${{ matrix.q }}
         if: ${{ env.REAL_LLM_API_KEY != '' }}
@@ -783,7 +989,7 @@ jobs:
   real-llm-adversarial:
     name: Real-LLM adversarial (${{ matrix.arc }})
     runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'schedule' }}
+    if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.dispatch_target == 'nightly_full') }}
     # 串行链末环（见 real-llm-recall 注释：跨 group 串行守 rsxermu 并发 2）。
     needs: real-llm-quality
     continue-on-error: true
@@ -1127,12 +1333,12 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
   # 真模型红线门（R2.2 跨域全链 / R2.5.3 请示通道 / R5 动态对抗 / 主动外联）。
   #
-  # 这 4 个文件过去**无任何带 key 的专用 CI 入口**——只在无 key 的 integration job 里
+  # 这些 redline 文件过去**无任何带 key 的专用 CI 入口**——只在无 key 的 integration job 里
   # 被编译，require_real_llm! 取不到 key 即 return（skip=PASS），承载的转真人/泄露身份/
   # relay 不暴露真人等**确定性红线断言从不在真 LLM 下执行 = 假绿**（深度审查 G1 critical）。
   # 本 job 给它们补真 key 入口。
   #
-  # 与其余 real-llm group 不同：**本 job 不设 continue-on-error**（G2）。这 4 个文件经红线
+  # 与其余 real-llm group 不同：**本 job 不设 continue-on-error**（G2）。这些文件经红线
   # 词表硬化后，主体是确定性红线 panic + unwrap_or_skip_transient!（端点抖动→skip 不 fail）。
   # 故红线击穿必须真红卡合并，而端点 5xx/超时仍走 skip 不误红。串行链末环（needs adversarial，
   # 守 rsxermu 并发 ≤2）。matrix 内 max-parallel:1 同理。
@@ -1144,7 +1350,7 @@ jobs:
     # 字符串级 lint 兜底，真模型对话行为红线由 nightly 全量回归 + 手动 workflow_dispatch 单跑）。
     # 保留 needs: real-llm-adversarial 让 nightly 时排在能力套件链末，串行守 rsxermu 并发≤2。
     needs: real-llm-adversarial
-    if: ${{ github.event_name == 'schedule' }}
+    if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.dispatch_target == 'nightly_full') }}
     timeout-minutes: 90
     strategy:
       fail-fast: false
@@ -1157,6 +1363,7 @@ jobs:
           - real_llm_dynamic_adversarial
           - real_llm_digital_twin_arc
           - real_llm_principal_relay
+          - real_llm_roleplay_arc
     env:
       REAL_LLM_API_KEY: ${{ secrets.RSXERMU_KEY }}
       ROLEPLAYER_API_KEY: ${{ secrets.NVIDIA_KEY }}
@@ -1190,6 +1397,12 @@ jobs:
       - name: Cache cargo registry / target
         if: ${{ env.REAL_LLM_API_KEY != '' }}
         uses: Swatinem/rust-cache@v2
+
+      # Each redline matrix shard must upload only evidence produced by this run/attempt.
+      - name: Reset real-LLM evidence ledger
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        shell: bash
+        run: rm -rf target/real_llm_ledger && mkdir -p target/real_llm_ledger
 
       # 被测 agent = gpt-5.6-auto；cross_domain 的 judge / dynamic 的轨迹裁判
       # 走 codex-auto-review（OpenAI）；dynamic 的 roleplayer 第三族用 NVIDIA（异端点，缺则
@@ -1240,7 +1453,7 @@ jobs:
     # job（redline 也移走），无 ledger 可汇总，故一起移到 schedule。nightly 时 redline
     # 跑完它汇总（needs 保证顺序），download pattern `*ledger*` 抓能力套件 + redline 全部 ledger。
     needs: [real-llm-redline]
-    if: ${{ github.event_name == 'schedule' }}
+    if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.dispatch_target == 'nightly_full') }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -1260,3 +1473,10 @@ jobs:
           # 持续抖动致大面积 skip 才红）。可按实际调。
           REAL_LLM_MAX_SKIP: "12"
         run: bash scripts/check-skip-ledger.sh
+      # SR-128/SR-178：skip 总量门之外，关键能力与红线必须各自产出可审计的正向终态。
+      # 缺失、重复、零调用、零产物、零断言、inconclusive/infra_skip 均硬失败，
+      # 防止 continue-on-error 的上游矩阵或测试内 early-return 形成假绿。
+      - name: Check required capability outcomes
+        env:
+          REAL_LLM_LEDGER: target/real_llm_ledger
+        run: python3 scripts/check-capability-outcomes.py

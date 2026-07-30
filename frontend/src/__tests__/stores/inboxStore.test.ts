@@ -23,7 +23,13 @@ describe("inboxStore.load", () => {
       items: [{ source: "principal_escalation", id: "a", title: "", summary: "", severity: "high", createdAt: null, ageHours: 0, actionKind: "inline" }],
       errors: [{ source: "taxonomy_candidate", error: "boom" }],
     });
-    fs.mockResolvedValue({ principalEscalation: 1 });
+    fs.mockResolvedValue({
+      status: "complete",
+      asOf: null,
+      counts: { principalEscalation: 1 },
+      errors: [],
+      total: 1,
+    });
     await useInboxStore.getState().load();
     const s = useInboxStore.getState();
     expect(s.items).toHaveLength(1);

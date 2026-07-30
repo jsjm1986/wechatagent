@@ -3,6 +3,7 @@
 use mongodb::{
     bson::{doc, oid::ObjectId, to_bson, to_document, Bson, DateTime, Document},
     options::{FindOneOptions, UpdateOptions},
+    ClientSession,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -20,6 +21,39 @@ use crate::{
 use super::AppState;
 use crate::auth::{is_workspace_authorized, session::get_admin_user, AuthenticatedAdmin};
 
+/// Closed set of non-human actors allowed to perform review actions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::routes) enum SystemReviewActor {
+    ManagementAgent,
+}
+
+/// Trusted review identity. The inner value cannot be supplied by request JSON.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::routes) struct ReviewActor(String);
+
+impl ReviewActor {
+    pub(in crate::routes) fn from_admin(admin: &AuthenticatedAdmin) -> AppResult<Self> {
+        let username = admin.username.trim();
+        if username.is_empty() {
+            return Err(AppError::Unauthorized(
+                "authenticated_admin_missing_username".to_string(),
+            ));
+        }
+        Ok(Self(username.to_string()))
+    }
+
+    pub(in crate::routes) fn system(actor: SystemReviewActor) -> Self {
+        let value = match actor {
+            SystemReviewActor::ManagementAgent => "system:management_agent",
+        };
+        Self(value.to_string())
+    }
+
+    pub(in crate::routes) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// guide apply 中被跳过的越界字段(LLM 产出但不在字典/状态机内)。
 /// 仅 guide 路径(apply_contact_changes)产出 —— 手动表单(contacts.rs)/审批
 /// (admin_relationship_suggestions)路径的 AdminWrite 越界仍硬拒 400,不收集。
@@ -29,6 +63,15 @@ pub struct SkippedField {
     pub field: String,
     /// 人类可读原因,如 "非法的 operation_state 迁移:...";直接回流给前端 toast。
     pub reason: String,
+}
+
+impl From<&SkippedField> for crate::models::GuideSkippedField {
+    fn from(value: &SkippedField) -> Self {
+        Self {
+            field: value.field.clone(),
+            reason: value.reason.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -106,7 +149,12 @@ pub(super) fn insert_domain_stage_fields(
     // C-01：admin 直写路径不驱动 stagnation 计时的主逻辑（不载 active_profile），传 None
     // 保持 customer_stage 语义（字节等价于改造前）。AI 决策路径（gateway）才按 active
     // profile 的 stagnation_dimension 动态化。
-    crate::agent::domain_signals::insert_domain_signal_values(set_doc, &signals, stage_changed, None);
+    crate::agent::domain_signals::insert_domain_signal_values(
+        set_doc,
+        &signals,
+        stage_changed,
+        None,
+    );
     set_doc.insert("domain_attributes_updated_at", DateTime::now());
 }
 
@@ -184,6 +232,35 @@ pub(super) async fn find_contact_by_id(
         .ok_or_else(|| AppError::NotFound("contact not found".to_string()))
 }
 
+/// 按联系人 ObjectId + workspace + 业务账号精确取回。
+///
+/// 用于账号上下文可切换的高权威写入口。ObjectId 存在但账号不匹配时返回 409，
+/// 让调用方能区分“旧页面身份已漂移”与普通不存在，同时保证任何业务写入前零副作用。
+pub(super) async fn find_contact_by_id_for_account(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+    id: &str,
+) -> AppResult<Contact> {
+    let object_id = parse_object_id(id)?;
+    let contact = state
+        .db
+        .contacts()
+        .find_one(
+            doc! {
+                "_id": object_id,
+                "workspace_id": workspace_id,
+            },
+            None,
+        )
+        .await?
+        .ok_or_else(|| AppError::NotFound("contact not found".to_string()))?;
+    if contact.account_id != account_id {
+        return Err(AppError::Conflict("contact_account_conflict".to_string()));
+    }
+    Ok(contact)
+}
+
 pub async fn upsert_contact_from_value(
     state: &AppState,
     workspace_id: &str,
@@ -199,19 +276,15 @@ pub async fn upsert_contact_from_value(
     let Some(wxid) = wxid else {
         return Ok(None);
     };
-    let nickname = contact_value
-        .get("nickName")
-        .or_else(|| contact_value.get("nickname"))
-        .and_then(|v| v.as_str())
-        .map(ToString::to_string);
-    let remark = contact_value
-        .get("remark")
-        .and_then(|v| v.as_str())
-        .map(ToString::to_string);
-    let alias = contact_value
-        .get("alias")
-        .and_then(|v| v.as_str())
-        .map(ToString::to_string);
+    // Imports are patch operations. Missing/null identity fields mean "leave the
+    // stored value unchanged"; clearing identity requires a dedicated explicit
+    // operation. This applies equally to REST, deprecated search-import and the
+    // Management tool because all three paths share this helper.
+    if !crate::webhooks::is_operatable_person(&wxid) {
+        return Ok(None);
+    }
+    let mut set_doc = contact_identity_patch(contact_value);
+    set_doc.insert("updated_at", DateTime::now());
 
     state
         .db
@@ -223,12 +296,7 @@ pub async fn upsert_contact_from_value(
                 "wxid": &wxid
             },
             doc! {
-                "$set": {
-                    "nickname": &nickname,
-                    "remark": &remark,
-                    "alias": &alias,
-                    "updated_at": DateTime::now()
-                },
+                "$set": set_doc,
                 "$setOnInsert": {
                     "workspace_id": workspace_id,
                     "account_id": account_id,
@@ -253,6 +321,24 @@ pub async fn upsert_contact_from_value(
         )
         .await?;
     Ok(contact)
+}
+
+fn contact_identity_patch(contact_value: &Value) -> Document {
+    let mut patch = Document::new();
+    if let Some(value) = contact_value
+        .get("nickName")
+        .or_else(|| contact_value.get("nickname"))
+        .and_then(Value::as_str)
+    {
+        patch.insert("nickname", value);
+    }
+    if let Some(value) = contact_value.get("remark").and_then(Value::as_str) {
+        patch.insert("remark", value);
+    }
+    if let Some(value) = contact_value.get("alias").and_then(Value::as_str) {
+        patch.insert("alias", value);
+    }
+    patch
 }
 
 pub(super) async fn ensure_operating_memory(
@@ -283,8 +369,8 @@ pub(super) async fn ensure_operating_memory(
                 seeded_with_version
                     .extra
                     .insert("version", memory.memory_card_version);
-                let seeded_doc = mongodb::bson::to_document(&seeded_with_version)
-                    .unwrap_or_default();
+                let seeded_doc =
+                    mongodb::bson::to_document(&seeded_with_version).unwrap_or_default();
                 memory.memory_card = seeded_with_version;
                 memory.memory_card_updated_at = Some(updated_at);
                 memory.updated_at = updated_at;
@@ -374,7 +460,8 @@ pub(super) async fn ensure_operating_memory(
         created_at: DateTime::now(),
         updated_at: DateTime::now(),
     };
-    let mut seeded_typed = agent::effective_memory_card_for_contact(&memory, contact, &initial_state);
+    let mut seeded_typed =
+        agent::effective_memory_card_for_contact(&memory, contact, &initial_state);
     memory.memory_card_version = if agent::memory_card_has_signal(&seeded_typed) {
         1
     } else {
@@ -445,7 +532,8 @@ pub(super) async fn resolve_playbook_for_contact(
                 doc! {
                     "_id": object_id,
                     "workspace_id": workspace_id,
-                    "account_id": account_id
+                    "account_id": account_id,
+                    "release_status": "published",
                 },
                 None,
             )
@@ -494,7 +582,7 @@ pub(super) async fn compute_quiet_hours_view(
     let domain_config =
         agent::load_user_operation_domain_config(state, &contact.workspace_id).await?;
     let runtime = agent::UserRuntimeParameters::from_config(domain_config.as_ref(), state);
-    let profile = agent::load_active_domain_profile(&state.db, &contact.workspace_id).await;
+    let profile = agent::load_active_domain_profile(&state.db, &contact.workspace_id).await?;
     let quiet_hours_enabled = agent::quiet_hours::effective_quiet_hours_enabled(
         contact,
         &profile,
@@ -530,13 +618,48 @@ pub(super) async fn compute_quiet_hours_view(
 pub(super) fn health_items_from_scores(scores: &Document) -> Value {
     let score = |key: &str| scores.get_i32(key).unwrap_or(0);
     json!([
-        health_item("userUnderstanding", "用户理解完整度", score("userUnderstanding"), "身份、痛点、动机、偏好和禁忌是否清楚"),
-        health_item("relationshipQuality", "信任关系质量", score("relationshipQuality"), "当前互动是否适合推进，是否需要先建立信任"),
-        health_item("productFit", "产品匹配清晰度", score("productFit"), "是否知道用户需求与产品价值之间的真实匹配"),
-        health_item("rhythmRisk", "跟进节奏风险", score("rhythmRisk"), "是否存在过度打扰或冷却中的风险"),
-        health_item("knowledgeGrounding", "知识匹配度", score("knowledgeGrounding"), "回应是否被 verified 知识支撑"),
-        health_item("hallucinationRisk", "幻觉风险", score("hallucinationRisk"), "是否可能出现编造案例、承诺结果或产品事实不准确"),
-        health_item("pressureRisk", "销售压迫感风险", score("pressureRisk"), "表达是否可能显得催促、强推或过度营销")
+        health_item(
+            "userUnderstanding",
+            "用户理解完整度",
+            score("userUnderstanding"),
+            "身份、痛点、动机、偏好和禁忌是否清楚"
+        ),
+        health_item(
+            "relationshipQuality",
+            "信任关系质量",
+            score("relationshipQuality"),
+            "当前互动是否适合推进，是否需要先建立信任"
+        ),
+        health_item(
+            "productFit",
+            "产品匹配清晰度",
+            score("productFit"),
+            "是否知道用户需求与产品价值之间的真实匹配"
+        ),
+        health_item(
+            "rhythmRisk",
+            "跟进节奏风险",
+            score("rhythmRisk"),
+            "是否存在过度打扰或冷却中的风险"
+        ),
+        health_item(
+            "knowledgeGrounding",
+            "知识匹配度",
+            score("knowledgeGrounding"),
+            "回应是否被 verified 知识支撑"
+        ),
+        health_item(
+            "hallucinationRisk",
+            "幻觉风险",
+            score("hallucinationRisk"),
+            "是否可能出现编造案例、承诺结果或产品事实不准确"
+        ),
+        health_item(
+            "pressureRisk",
+            "销售压迫感风险",
+            score("pressureRisk"),
+            "表达是否可能显得催促、强推或过度营销"
+        )
     ])
 }
 
@@ -669,7 +792,9 @@ pub(super) async fn prepare_contact_changes(
         set_doc.insert("human_profile_note", value);
     }
     if let Some(value) = doc_get_string_vec(changes, "tags") {
-        set_doc.insert("tags", to_bson(&value)?);
+        let cleaned = super::contacts::normalize_manual_tags(&value);
+        super::contacts::validate_manual_tags(&cleaned)?;
+        set_doc.insert("manual_tags", to_bson(&cleaned)?);
     }
     if let Some(value) = doc_get_string(changes, "customerStage") {
         // guide 路径(LLM 产值):越界 → 记 skipped 跳过(不像 contacts.rs 手动表单那样硬拒)。
@@ -722,7 +847,12 @@ pub(super) async fn prepare_contact_changes(
             // M2:customer_stage 实际变化时同步刷新 customer_stage_updated_at(归一后再比较)。
             let prev = contact_domain_str(contact, "customer_stage");
             let stage_changed = prev.as_deref().map(|s| s != value.as_str()).unwrap_or(true);
-            insert_domain_stage_fields(&mut set_doc, Some(&value), intent.as_deref(), stage_changed);
+            insert_domain_stage_fields(
+                &mut set_doc,
+                Some(&value),
+                intent.as_deref(),
+                stage_changed,
+            );
         } else if intent.is_some() {
             // stage 越界/缺席但 intent 通过:仍写 intent(stage_changed=false,不刷 stage 计时)。
             insert_domain_stage_fields(&mut set_doc, None, intent.as_deref(), false);
@@ -800,10 +930,7 @@ pub(super) async fn prepare_contact_changes(
     Ok((set_doc, skipped))
 }
 
-pub(super) fn prepare_memory_changes(
-    memory: &OperatingMemory,
-    changes: &Document,
-) -> Document {
+pub(super) fn prepare_memory_changes(memory: &OperatingMemory, changes: &Document) -> Document {
     let Some(memory_patch) = doc_get_document(changes, "memory") else {
         return Document::new();
     };
@@ -863,20 +990,19 @@ pub(super) async fn prepare_domain_changes(
     state: &AppState,
     workspace_id: &str,
     changes: &Document,
-) -> AppResult<Option<(mongodb::bson::oid::ObjectId, Document, DateTime)>> {
+) -> AppResult<Option<(mongodb::bson::oid::ObjectId, Document, DateTime, i32)>> {
     let Some(runtime_patch) = doc_get_document(changes, "domainRuntimeParameters") else {
         return Ok(None);
     };
     if runtime_patch.is_empty() {
         return Ok(None);
     }
+    crate::agent::runtime::validate_guide_runtime_parameter_patch(&runtime_patch)
+        .map_err(AppError::BadRequest)?;
     let Some(config) = state
         .db
         .operation_domain_configs()
-        .find_one(
-            current_user_operations_domain_filter(workspace_id),
-            None,
-        )
+        .find_one(current_user_operations_domain_filter(workspace_id), None)
         .await?
     else {
         return Err(AppError::Conflict(
@@ -889,7 +1015,9 @@ pub(super) async fn prepare_domain_changes(
     let updated_at = config.updated_at;
     let mut runtime = config.runtime_parameters;
     merge_document(&mut runtime, runtime_patch);
-    Ok(Some((config_id, runtime, updated_at)))
+    let runtime = crate::agent::runtime::validate_and_normalize_user_runtime_parameters(&runtime)
+        .map_err(AppError::BadRequest)?;
+    Ok(Some((config_id, runtime, updated_at, config.version)))
 }
 
 fn current_user_operations_domain_filter(workspace_id: &str) -> Document {
@@ -1026,8 +1154,12 @@ wxid：{}
         contact.remark.as_deref().unwrap_or(""),
         contact.human_profile_note.as_deref().unwrap_or(""),
         agent::render_tags_for_prompt(&contact.manual_tags, &contact.confirmed_tags),
-        contact_domain_str(contact, "customer_stage").as_deref().unwrap_or(""),
-        contact_domain_str(contact, "intent_level").as_deref().unwrap_or(""),
+        contact_domain_str(contact, "customer_stage")
+            .as_deref()
+            .unwrap_or(""),
+        contact_domain_str(contact, "intent_level")
+            .as_deref()
+            .unwrap_or(""),
         contact.follow_up_policy.as_deref().unwrap_or(""),
         contact.operation_state.as_deref().unwrap_or(""),
         contact.operation_state_reason.as_deref().unwrap_or(""),
@@ -1060,6 +1192,17 @@ pub(super) fn guide_preview_json(preview: UserOperationGuidePreview) -> Value {
     // 让前端直接消费正确量纲/风险反转的 items，不必自己重建。无论 scores 来自 LLM
     // 还是 health_scores_document 兜底，都过同一组装。
     let health_items = health_items_from_scores(&preview.health_scores);
+    let authoritative_changes = preview
+        .frozen_plan
+        .as_ref()
+        .map(|plan| plan.authoritative_changes.clone())
+        .unwrap_or_default();
+    let playbook_affected_contacts = preview
+        .frozen_plan
+        .as_ref()
+        .map(|plan| plan.playbook_affected_contacts)
+        .unwrap_or_default();
+    let requires_strong_confirmation = preview.impact_scope != "current_contact";
     json!({
         "id": preview.id.map(|id| id.to_hex()).unwrap_or_default(),
         "accountId": preview.account_id,
@@ -1078,6 +1221,10 @@ pub(super) fn guide_preview_json(preview: UserOperationGuidePreview) -> Value {
         "healthScores": preview.health_scores,
         "suggestedChanges": preview.suggested_changes,
         "riskWarnings": preview.risk_warnings,
+        "candidateHash": preview.candidate_hash.unwrap_or_default(),
+        "authoritativeChanges": authoritative_changes,
+        "requiresStrongConfirmation": requires_strong_confirmation,
+        "playbookAffectedContacts": playbook_affected_contacts,
         "createdAt": crate::models::dt_to_string(preview.created_at),
         "updatedAt": crate::models::dt_to_string(preview.updated_at)
     })
@@ -1150,12 +1297,20 @@ pub(super) fn memory_candidate_json(item: MemoryCandidate) -> Value {
 }
 
 pub(super) fn llm_call_log_json(item: LlmCallLog) -> Value {
+    let usage_known = item.usage_known
+        || item.status == "cache_hit"
+        || item.prompt_tokens != 0
+        || item.completion_tokens != 0
+        || item.total_tokens != 0
+        || item.prompt_cache_hit_tokens != 0
+        || item.prompt_cache_miss_tokens != 0;
     json!({
         "id": item.id.map(|id| id.to_hex()).unwrap_or_default(),
         "workspaceId": item.workspace_id,
         "accountId": item.account_id,
         "contactWxid": item.contact_wxid,
         "runId": item.run_id,
+        "runMode": if item.run_mode.trim().is_empty() { "live" } else { item.run_mode.as_str() },
         "promptKey": item.prompt_key,
         "model": item.model,
         "status": item.status,
@@ -1165,6 +1320,7 @@ pub(super) fn llm_call_log_json(item: LlmCallLog) -> Value {
         "totalTokens": item.total_tokens,
         "promptCacheHitTokens": item.prompt_cache_hit_tokens,
         "promptCacheMissTokens": item.prompt_cache_miss_tokens,
+        "usageKnown": usage_known,
         "error": item.error,
         "createdAt": crate::models::dt_to_string(item.created_at)
     })
@@ -1247,28 +1403,6 @@ pub(super) fn json_document_any(value: &Value, keys: &[&str]) -> Option<Document
             .and_then(|item| to_document(item).ok())
             .filter(|doc| !doc.is_empty())
     })
-}
-
-pub(super) fn json_string_vec_any(value: &Value, keys: &[&str]) -> Vec<String> {
-    keys.iter()
-        .find_map(|key| {
-            value.get(*key).and_then(|item| {
-                if let Some(items) = item.as_array() {
-                    Some(
-                        items
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .map(str::trim)
-                            .filter(|text| !text.is_empty())
-                            .map(ToString::to_string)
-                            .collect::<Vec<_>>(),
-                    )
-                } else {
-                    item.as_str().map(|text| vec![text.trim().to_string()])
-                }
-            })
-        })
-        .unwrap_or_default()
 }
 
 pub(super) fn json_string(value: &Value, key: &str) -> Option<String> {
@@ -1439,6 +1573,20 @@ pub(crate) struct OutcomeEventInput {
     pub occurred_at_ms: Option<i64>,
 }
 
+/// 已完成全部业务校验、产品解引用与 BSON 构造的一次成效事件写入。
+///
+/// 构造本对象不修改数据库；调用方可在普通写路径直接提交，也可把它放进更大的
+/// Mongo transaction（如疑似成交审批的 signal CAS + outcome append + audit）。
+pub(crate) struct PreparedOutcomeEvent {
+    contact_id: ObjectId,
+    workspace_id: String,
+    account_id: String,
+    outcome_event: OutcomeEvent,
+    outcome_event_bson: Bson,
+    audit_event: crate::models::AgentEvent,
+    updated_at: DateTime,
+}
+
 /// 往 `contact.outcome_events` append 一条成效事件 + 写一条 `outcome_event_marked` 审计，
 /// 返回构造出的 [`OutcomeEvent`]。
 ///
@@ -1453,6 +1601,21 @@ pub(crate) async fn add_outcome_event_inner(
     contact: &Contact,
     input: OutcomeEventInput,
 ) -> AppResult<OutcomeEvent> {
+    let prepared = prepare_outcome_event(state, contact, input).await?;
+    let outcome_event = prepared.outcome_event.clone();
+    persist_prepared_outcome_event(state, &prepared).await?;
+    Ok(outcome_event)
+}
+
+/// 只做校验与构造，不修改 contact、agent_events 或任何审批状态。
+///
+/// 疑似成交审批必须在调用本函数成功后才能尝试 pending CAS；因此金额、币种、产品归属
+/// 等错误会保留 signal=pending，可修正请求后重试。
+pub(crate) async fn prepare_outcome_event(
+    state: &AppState,
+    contact: &Contact,
+    input: OutcomeEventInput,
+) -> AppResult<PreparedOutcomeEvent> {
     // find_contact_by_id 必带 `_id` 查回，理论不可能为 None；显式兜底不 silent unwrap。
     let object_id = contact
         .id
@@ -1541,26 +1704,16 @@ pub(crate) async fn add_outcome_event_inner(
         product_ref: product_ref.clone(),
         event_kind: event_kind.clone(),
     };
-    state
-        .db
-        .contacts()
-        .update_one(
-            doc! { "_id": object_id, "workspace_id": &contact.workspace_id },
-            doc! {
-                "$push": { "outcome_events": to_bson(&outcome_event)? },
-                "$set": { "updated_at": now },
-            },
-            None,
-        )
-        .await?;
-    agent::write_event_for_account(
-        state,
-        &contact.account_id,
-        Some(&contact.wxid),
-        "outcome_event_marked",
-        "ok",
-        &input.audit_summary,
-        Some(doc! {
+    let outcome_event_bson = to_bson(&outcome_event)?;
+    let audit_event = crate::models::AgentEvent {
+        id: None,
+        workspace_id: contact.workspace_id.clone(),
+        account_id: contact.account_id.clone(),
+        contact_wxid: Some(contact.wxid.clone()),
+        kind: "outcome_event_marked".to_string(),
+        status: "ok".to_string(),
+        summary: input.audit_summary,
+        details: Some(doc! {
             "source": &input.source,
             "markedBy": &input.marked_by,
             "amount": input.amount,
@@ -1569,9 +1722,88 @@ pub(crate) async fn add_outcome_event_inner(
             "eventKind": &event_kind,
             "productId": product_ref.as_ref().map(|p| p.product_id.clone()),
         }),
-    )
-    .await?;
-    Ok(outcome_event)
+        created_at: now,
+        dedupe_key: None,
+    };
+    Ok(PreparedOutcomeEvent {
+        contact_id: object_id,
+        workspace_id: contact.workspace_id.clone(),
+        account_id: contact.account_id.clone(),
+        outcome_event,
+        outcome_event_bson,
+        audit_event,
+        updated_at: now,
+    })
+}
+
+async fn persist_prepared_outcome_event(
+    state: &AppState,
+    prepared: &PreparedOutcomeEvent,
+) -> AppResult<()> {
+    let updated = state
+        .db
+        .contacts()
+        .update_one(
+            doc! {
+                "_id": prepared.contact_id,
+                "workspace_id": &prepared.workspace_id,
+                "account_id": &prepared.account_id,
+            },
+            doc! {
+                "$push": { "outcome_events": prepared.outcome_event_bson.clone() },
+                "$set": { "updated_at": prepared.updated_at },
+            },
+            None,
+        )
+        .await?;
+    if updated.matched_count != 1 {
+        return Err(AppError::Conflict(
+            "contact_changed_before_outcome_append".to_string(),
+        ));
+    }
+    state
+        .db
+        .events()
+        .insert_one(&prepared.audit_event, None)
+        .await?;
+    Ok(())
+}
+
+/// 在调用方已有 transaction 中提交 prepared outcome + 审计。
+/// transaction abort 时两条写入与调用方的审批 CAS 一并回滚。
+pub(crate) async fn persist_prepared_outcome_event_with_session(
+    state: &AppState,
+    prepared: &PreparedOutcomeEvent,
+    session: &mut ClientSession,
+) -> AppResult<()> {
+    let updated = state
+        .db
+        .contacts()
+        .update_one_with_session(
+            doc! {
+                "_id": prepared.contact_id,
+                "workspace_id": &prepared.workspace_id,
+                "account_id": &prepared.account_id,
+            },
+            doc! {
+                "$push": { "outcome_events": prepared.outcome_event_bson.clone() },
+                "$set": { "updated_at": prepared.updated_at },
+            },
+            None,
+            session,
+        )
+        .await?;
+    if updated.matched_count != 1 {
+        return Err(AppError::Conflict(
+            "contact_changed_before_outcome_append".to_string(),
+        ));
+    }
+    state
+        .db
+        .events()
+        .insert_one_with_session(&prepared.audit_event, None, session)
+        .await?;
+    Ok(())
 }
 
 /// #H3：解析请求目标 workspace 并校验 ∈ admin ACL，堵认证后水平越权。
@@ -1605,11 +1837,18 @@ pub(super) async fn resolve_authorized_workspace(
         .await
         .map_err(|e| match e {
             crate::auth::session::AuthError::Mongo(err) => AppError::Db(err),
+            crate::auth::session::AuthError::NoAuthorizedWorkspace => {
+                AppError::Unauthorized("no_authorized_workspace".into())
+            }
             other => AppError::External(format!("admin lookup: {other}")),
         })?
         .ok_or_else(|| AppError::Unauthorized("admin_user_not_found".into()))?;
 
-    if !is_workspace_authorized(&resolved, &user.workspaces, &state.config.default_workspace_id) {
+    if !is_workspace_authorized(
+        &resolved,
+        &user.workspaces,
+        &state.config.default_workspace_id,
+    ) {
         return Err(AppError::BadRequest("workspace_not_in_user_acl".into()));
     }
     Ok(resolved)
@@ -1617,13 +1856,56 @@ pub(super) async fn resolve_authorized_workspace(
 
 #[cfg(test)]
 mod tests {
+    use super::contact_identity_patch;
     use super::current_user_operations_domain_filter;
     use super::escape_regex_literal;
     use super::insert_domain_stage_fields;
     use super::{guide_preview_json, health_items_from_scores};
     use super::{validate_deal_verification, validate_event_kind};
+    use super::{ReviewActor, SystemReviewActor};
     use crate::models::UserOperationGuidePreview;
     use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
+
+    #[test]
+    fn contact_import_identity_patch_only_updates_explicit_strings() {
+        assert_eq!(
+            contact_identity_patch(&serde_json::json!({
+                "wxid": "wx_real",
+                "nickName": "新昵称"
+            })),
+            doc! { "nickname": "新昵称" }
+        );
+        assert_eq!(
+            contact_identity_patch(&serde_json::json!({
+                "wxid": "wx_real",
+                "nickname": null,
+                "remark": "新备注",
+                "alias": null
+            })),
+            doc! { "remark": "新备注" }
+        );
+        assert!(contact_identity_patch(&serde_json::json!({ "wxid": "wx_real" })).is_empty());
+    }
+
+    #[test]
+    fn review_actor_accepts_only_authenticated_or_closed_system_identity() {
+        let admin = crate::auth::AuthenticatedAdmin {
+            user_id: "admin-id".to_string(),
+            username: "  alice  ".to_string(),
+            current_workspace: "ws-1".to_string(),
+        };
+        assert_eq!(ReviewActor::from_admin(&admin).unwrap().as_str(), "alice");
+
+        let missing_username = crate::auth::AuthenticatedAdmin {
+            username: "   ".to_string(),
+            ..admin
+        };
+        assert!(ReviewActor::from_admin(&missing_username).is_err());
+        assert_eq!(
+            ReviewActor::system(SystemReviewActor::ManagementAgent).as_str(),
+            "system:management_agent"
+        );
+    }
 
     #[test]
     fn guide_domain_patch_targets_only_current_version() {
@@ -1655,6 +1937,9 @@ mod tests {
             health_scores: scores,
             suggested_changes: Document::new(),
             risk_warnings: vec![],
+            frozen_plan: None,
+            candidate_hash: None,
+            apply_receipt: None,
             created_at: DateTime::now(),
             updated_at: DateTime::now(),
         }
@@ -1712,8 +1997,14 @@ mod tests {
         );
 
         // scores 仍随响应返回；旧 `healthScores` 键保留以兼容现有读端。
-        assert!(body["health"]["scores"].is_object(), "health.scores 应保留 scores document");
-        assert!(body["healthScores"].is_object(), "healthScores 旧键应保留向后兼容");
+        assert!(
+            body["health"]["scores"].is_object(),
+            "health.scores 应保留 scores document"
+        );
+        assert!(
+            body["healthScores"].is_object(),
+            "healthScores 旧键应保留向后兼容"
+        );
     }
 
     /// DRY 抽出的 `health_items_from_scores` 与组装函数同口径：缺失键回落 0、
@@ -1827,10 +2118,7 @@ mod tests {
     // conversation_inferred 绝不经直登通道（与 §5.5 红线一致）。
     #[test]
     fn validate_deal_verification_rejects_conversation_inferred_via_direct_path() {
-        assert_eq!(
-            validate_deal_verification(None).unwrap(),
-            "staff_confirmed"
-        );
+        assert_eq!(validate_deal_verification(None).unwrap(), "staff_confirmed");
         assert_eq!(
             validate_deal_verification(Some("")).unwrap(),
             "staff_confirmed"
@@ -1862,6 +2150,7 @@ mod tests {
             account_id: Some("acc-1".to_string()),
             contact_wxid: Some("wxid_abc".to_string()),
             run_id: Some("run-1".to_string()),
+            run_mode: "live".to_string(),
             prompt_key: "user.reply".to_string(),
             model: "provider-a".to_string(),
             status: "success".to_string(),
@@ -1871,6 +2160,7 @@ mod tests {
             total_tokens: 1000,
             prompt_cache_hit_tokens: 600,
             prompt_cache_miss_tokens: 200,
+            usage_known: true,
             error: Some("none".to_string()),
             retry_count: 1,
             final_status: Some("success".to_string()),
@@ -1963,6 +2253,7 @@ mod tests {
             token_budget: 8000,
             tokens_used: 1200,
             llm_calls_used: 3,
+            unknown_usage_calls: 0,
             degraded_reasons: vec!["none".to_string()],
             lifecycle: "completed".to_string(),
             source_event_id: "evt-1".to_string(),
@@ -2012,9 +2303,7 @@ mod tests {
             review_summary: Some("通过".to_string()),
             playbook_id: Some(ObjectId::parse_str("64a1f2c3e4b5a697889a0002").unwrap()),
             playbook_version: Some(2),
-            used_knowledge_ids: vec![
-                ObjectId::parse_str("64a1f2c3e4b5a697889a0003").unwrap(),
-            ],
+            used_knowledge_ids: vec![ObjectId::parse_str("64a1f2c3e4b5a697889a0003").unwrap()],
             prompt_versions: doc! { "user.reply": "v2" },
             operation_state: Some("negotiation".to_string()),
             next_best_action: doc! { "action": "follow_up" },
@@ -2025,6 +2314,10 @@ mod tests {
             outcome_status: Some("replied".to_string()),
             reaction_analysis: doc! { "sentiment": "positive" },
             reaction_claimed_at: Some(DateTime::from_millis(1_700_000_050_000)),
+            reaction_claim_token: Some("reaction-claim-1".to_string()),
+            reaction_claim_generation: 1,
+            source_task_id: None,
+            source_task_claim_token: None,
             reviewer_misjudge_signal: Some("none".to_string()),
             expected_text_segments: 1,
             status: "approved".to_string(),
@@ -2083,6 +2376,9 @@ mod tests {
             },
             suggested_changes: doc! { "tone": "warmer" },
             risk_warnings: vec!["勿过度承诺".to_string()],
+            frozen_plan: None,
+            candidate_hash: Some("candidate-hash".to_string()),
+            apply_receipt: None,
             created_at: DateTime::from_millis(1_700_000_000_000),
             updated_at: DateTime::from_millis(1_700_000_100_000),
         };
@@ -2126,7 +2422,9 @@ mod tests {
             bayesian_signals: vec![],
             personality_profile: None,
             tags_version: 0,
-            domain_attributes: Some(doc! { "customer_stage": "negotiation", "intent_level": "high" }),
+            domain_attributes: Some(
+                doc! { "customer_stage": "negotiation", "intent_level": "high" },
+            ),
             domain_attributes_updated_at: None,
             commitments: vec![],
             follow_up_policy: Some("每周一次".to_string()),
@@ -2200,6 +2498,10 @@ mod tests {
             outcome_status: None,
             reaction_analysis: Document::new(),
             reaction_claimed_at: None,
+            reaction_claim_token: None,
+            reaction_claim_generation: 0,
+            source_task_id: None,
+            source_task_claim_token: None,
             reviewer_misjudge_signal: None,
             expected_text_segments: 0,
             status: "approved".to_string(),
@@ -2316,7 +2618,10 @@ mod tests {
             &intent_values,
         );
         assert!(prompt.contains("合法值"), "应注入'合法值'引导段");
-        assert!(prompt.contains("need_discovery"), "应含状态机/字典 canonical key");
+        assert!(
+            prompt.contains("need_discovery"),
+            "应含状态机/字典 canonical key"
+        );
         assert!(prompt.contains("高意向"), "应含字典中文标签");
 
         // 空切片:输出"暂无受控取值"兜底,不 panic。

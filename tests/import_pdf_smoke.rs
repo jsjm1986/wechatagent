@@ -92,10 +92,8 @@ fn minimal_pdf(text: &str) -> Vec<u8> {
     }
     // trailer
     buf.extend_from_slice(
-        format!(
-            "trailer\n<< /Size {obj_count} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n"
-        )
-        .as_bytes(),
+        format!("trailer\n<< /Size {obj_count} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+            .as_bytes(),
     );
     buf
 }
@@ -104,7 +102,7 @@ fn minimal_pdf(text: &str) -> Vec<u8> {
 #[tokio::test]
 #[ignore]
 async fn import_pdf_with_fence_produces_review_chunks() {
-    let app = TestApp::start().await;
+    let app = TestApp::start_repl_set().await;
     let ws = app.state.config.default_workspace_id.clone();
 
     let fence_text = "---CHUNK: pdf-c1---\n# 价格异议处理\n先共情再说价值最后给方案。\n---END---";
@@ -126,7 +124,7 @@ async fn import_pdf_with_fence_produces_review_chunks() {
 #[tokio::test]
 #[ignore]
 async fn import_pdf_without_fence_falls_back_to_blob() {
-    let app = TestApp::start().await;
+    let app = TestApp::start_repl_set().await;
     let ws = app.state.config.default_workspace_id.clone();
 
     let plain = "这是一段没有任何 fence 标记的普通 PDF 正文。应当落一个待切分 blob chunk。";
@@ -136,7 +134,10 @@ async fn import_pdf_without_fence_falls_back_to_blob() {
         .await
         .expect("import_pdf_bytes ok");
 
-    assert!(outcome.fallback_blob, "无 fence 应触发 fallback blob: {outcome:?}");
+    assert!(
+        outcome.fallback_blob,
+        "无 fence 应触发 fallback blob: {outcome:?}"
+    );
     assert_eq!(
         outcome.chunk_ids.len(),
         1,

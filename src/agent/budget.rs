@@ -16,6 +16,7 @@
 
 use std::sync::Arc;
 
+use mongodb::bson::Document;
 use parking_lot::Mutex as PlMutex;
 
 /// agent-autonomy-loop W3 / Task 4.1：预算硬上限错误，由
@@ -29,9 +30,7 @@ use parking_lot::Mutex as PlMutex;
 pub enum BudgetError {
     /// `tool_calls_used >= tool_call_budget`：任何后续 tool call SHALL
     /// 立即返回 `budget_exceeded` 而不实际执行（R4.3）。
-    #[error(
-        "tool_call budget exceeded: tool_calls_used={used} >= tool_call_budget={budget}"
-    )]
+    #[error("tool_call budget exceeded: tool_calls_used={used} >= tool_call_budget={budget}")]
     ToolCallsExceeded { used: i32, budget: i32 },
     /// `tokens_used + tokens_consumed > token_budget`：本次 tool call 想
     /// 累计的 snippet / body token 数会越过 token 硬上限（R4.3）。
@@ -53,6 +52,10 @@ pub enum BudgetError {
 /// 原子地占用 1 次 tool call + N tokens，越界返回 [`BudgetError`]。
 pub struct RunBudget {
     pub run_id: String,
+    /// `live` for production work; `shadow` for simulations/replays.  The
+    /// mode is task-local through `RUN_BUDGET`, so nested LLM and memory reads
+    /// can enforce the same side-effect boundary without widening every API.
+    pub run_mode: String,
     pub token_budget: i64,
     pub max_llm_calls: i32,
     /// agent-autonomy-loop W3 / Task 4.1：单 run tool call 数硬上限。
@@ -61,6 +64,11 @@ pub struct RunBudget {
     pub tool_call_budget: i32,
     pub tokens_used: PlMutex<i64>,
     pub llm_calls_used: PlMutex<i32>,
+    /// Number of upstream attempts whose usage is unavailable, including
+    /// successful responses without usage and failed attempts without a
+    /// trustworthy token report.
+    /// `tokens_used` intentionally remains the sum of reported values only.
+    pub unknown_usage_calls: PlMutex<i32>,
     /// agent-autonomy-loop W3 / Task 4.1：单 run 已执行的 tool call 累计数；
     /// 与 [`Self::llm_calls_used`] **独立** 计数（R4.3：1 次 LLM = 0 次 tool）。
     pub tool_calls_used: PlMutex<i32>,
@@ -69,6 +77,9 @@ pub struct RunBudget {
     /// tokens_used 真实累计。只在 gateway 升档分支经 grant_escalated_ceiling 授予。
     pub escalation_bonus: PlMutex<i64>,
     pub degraded_reasons: PlMutex<Vec<String>>,
+    /// 本 run 实际装载的 prompt 版本。Shadow override 等运行期改写可能与随后查询到的
+    /// canonical current 不同，因此审计仍沿调用链记录真实命中值。
+    pub prompt_versions: PlMutex<Document>,
 }
 
 impl RunBudget {
@@ -80,23 +91,42 @@ impl RunBudget {
     ) -> Self {
         Self {
             run_id: run_id.into(),
+            run_mode: "live".to_string(),
             token_budget,
             max_llm_calls,
             tool_call_budget,
             tokens_used: PlMutex::new(0),
             llm_calls_used: PlMutex::new(0),
+            unknown_usage_calls: PlMutex::new(0),
             tool_calls_used: PlMutex::new(0),
             escalation_bonus: PlMutex::new(0),
             degraded_reasons: PlMutex::new(Vec::new()),
+            prompt_versions: PlMutex::new(Document::new()),
         }
+    }
+
+    pub fn with_run_mode(mut self, run_mode: impl Into<String>) -> Self {
+        self.run_mode = run_mode.into();
+        self
     }
 
     /// 累计 1 次 LLM 调用与本次返回的 token 数。
     /// 不会检查上限——is_exceeded() 由调用方在下一个降级点 / revision
     /// 入口负责检查。
     pub fn record_call(&self, tokens: i64) {
+        self.record_call_with_usage(tokens, true);
+    }
+
+    /// Record an LLM call while preserving whether token usage was reported.
+    /// Unknown usage never masquerades as zero and never fabricates an
+    /// estimate. It is tracked independently for audit and optional-call
+    /// gating; hard token-overrun semantics remain based on reported tokens.
+    pub fn record_call_with_usage(&self, tokens: i64, usage_known: bool) {
         *self.tokens_used.lock() += tokens.max(0);
         *self.llm_calls_used.lock() += 1;
+        if !usage_known {
+            *self.unknown_usage_calls.lock() += 1;
+        }
     }
 
     /// B-1 修复：把本 run 的有效 token gating 上限抬到 `max(token_budget, escalated_total)`。
@@ -156,21 +186,44 @@ impl RunBudget {
             || *self.tool_calls_used.lock() >= self.tool_call_budget
     }
 
+    /// Stop additive LLM work when the hard budget is exhausted or token
+    /// usage can no longer be proven to remain within budget. This must not be
+    /// used to reject an already generated production reply or to replace a
+    /// required safety review.
+    pub fn should_stop_optional_llm_calls(&self) -> bool {
+        self.is_exceeded() || *self.unknown_usage_calls.lock() > 0
+    }
+
     pub fn mark_degraded(&self, reason: impl Into<String>) {
         self.degraded_reasons.lock().push(reason.into());
+    }
+
+    /// 记录本 run 实际命中的模板版本。`None` 表示走内置 fallback，不写伪版本。
+    /// 同一 key 在渐进式升档/revision 中重复装载时版本应稳定；后写同值幂等。
+    pub fn record_prompt_version(&self, key: &str, version: Option<i32>) {
+        if let Some(version) = version {
+            self.prompt_versions.lock().insert(key, version);
+        }
+    }
+
+    pub fn prompt_versions(&self) -> Document {
+        self.prompt_versions.lock().clone()
     }
 
     pub fn snapshot(&self) -> RunBudgetSnapshot {
         RunBudgetSnapshot {
             run_id: self.run_id.clone(),
+            run_mode: self.run_mode.clone(),
             token_budget: self.token_budget,
             max_llm_calls: self.max_llm_calls,
             tool_call_budget: self.tool_call_budget,
             tokens_used: *self.tokens_used.lock(),
             llm_calls_used: *self.llm_calls_used.lock(),
+            unknown_usage_calls: *self.unknown_usage_calls.lock(),
             tool_calls_used: *self.tool_calls_used.lock(),
             escalation_bonus: *self.escalation_bonus.lock(),
             degraded_reasons: self.degraded_reasons.lock().clone(),
+            prompt_versions: self.prompt_versions.lock().clone(),
         }
     }
 }
@@ -179,14 +232,17 @@ impl RunBudget {
 #[allow(dead_code)]
 pub struct RunBudgetSnapshot {
     pub run_id: String,
+    pub run_mode: String,
     pub token_budget: i64,
     pub max_llm_calls: i32,
     pub tool_call_budget: i32,
     pub tokens_used: i64,
     pub llm_calls_used: i32,
+    pub unknown_usage_calls: i32,
     pub tool_calls_used: i32,
     pub escalation_bonus: i64,
     pub degraded_reasons: Vec<String>,
+    pub prompt_versions: Document,
 }
 
 tokio::task_local! {
@@ -196,9 +252,39 @@ tokio::task_local! {
     pub(crate) static RUN_BUDGET: Arc<RunBudget>;
 }
 
+/// Immutable inputs shared by both branches of one prompt-shadow comparison.
+///
+/// Normal live/simulation calls do not install this scope and continue loading
+/// current values. Prompt Shadow installs it around preparation and both A/B
+/// branches so TTL cache refreshes and wall-clock boundaries cannot introduce
+/// a second variable besides the candidate snippet.
+#[derive(Clone)]
+pub(crate) struct ShadowEvaluationSnapshot {
+    pub active_profile: crate::models::DomainProfile,
+    pub active_products: Vec<crate::models::Product>,
+    pub evaluated_at: mongodb::bson::DateTime,
+    pub taxonomy_cache: Arc<super::taxonomy::TaxonomyCache>,
+}
+
+tokio::task_local! {
+    pub(crate) static SHADOW_EVALUATION_SNAPSHOT: Arc<ShadowEvaluationSnapshot>;
+}
+
+pub(crate) fn current_shadow_evaluation_snapshot() -> Option<Arc<ShadowEvaluationSnapshot>> {
+    SHADOW_EVALUATION_SNAPSHOT.try_with(Arc::clone).ok()
+}
+
 /// 安全获取当前 task-local 的 budget；不在 scope 内时返回 None。
 pub(crate) fn current_run_budget() -> Option<Arc<RunBudget>> {
     RUN_BUDGET.try_with(Arc::clone).ok()
+}
+
+/// Current execution mode. Calls outside a scoped run are production/live by
+/// default; only an explicit shadow scope may suppress business mutations.
+pub(crate) fn current_run_mode() -> String {
+    current_run_budget()
+        .map(|budget| budget.run_mode.clone())
+        .unwrap_or_else(|| "live".to_string())
 }
 
 #[cfg(test)]
@@ -290,6 +376,35 @@ mod tests {
     }
 
     #[test]
+    fn unknown_usage_is_audited_without_fabricating_tokens_or_hard_overrun() {
+        let budget = RunBudget::new("run_unknown", 100, 10, 16);
+        budget.record_call_with_usage(0, false);
+        let snap = budget.snapshot();
+        assert_eq!(
+            snap.tokens_used, 0,
+            "unknown usage must not become an estimate"
+        );
+        assert_eq!(snap.llm_calls_used, 1);
+        assert_eq!(snap.unknown_usage_calls, 1);
+        assert!(
+            !budget.is_exceeded(),
+            "unknown usage is not a proven hard overrun"
+        );
+        assert!(
+            budget.should_stop_optional_llm_calls(),
+            "optional LLM work must stop once token headroom is unknowable"
+        );
+    }
+
+    #[test]
+    fn reported_zero_usage_remains_known_and_does_not_stop_optional_work() {
+        let budget = RunBudget::new("run_zero", 100, 10, 16);
+        budget.record_call_with_usage(0, true);
+        assert_eq!(budget.snapshot().unknown_usage_calls, 0);
+        assert!(!budget.should_stop_optional_llm_calls());
+    }
+
+    #[test]
     fn grant_escalated_ceiling_raises_effective_token_budget() {
         let budget = RunBudget::new("run_e", 30_000, 6, 6);
         budget.record_call(40_000);
@@ -307,7 +422,10 @@ mod tests {
         budget.grant_escalated_ceiling(100_000);
         budget.grant_escalated_ceiling(100_000);
         budget.record_call(90_000);
-        assert!(!budget.is_exceeded(), "90000 < 100000，重复授予同值无副作用");
+        assert!(
+            !budget.is_exceeded(),
+            "90000 < 100000，重复授予同值无副作用"
+        );
         budget.record_call(20_000);
         assert!(budget.is_exceeded(), "110000 >= 100000");
     }
@@ -329,7 +447,10 @@ mod tests {
         budget.record_call(60);
         assert!(!budget.is_exceeded());
         budget.record_call(50);
-        assert!(budget.is_exceeded(), "未授予时 110 >= 100 base，行为逐字不变");
+        assert!(
+            budget.is_exceeded(),
+            "未授予时 110 >= 100 base，行为逐字不变"
+        );
     }
 
     #[test]
@@ -346,5 +467,25 @@ mod tests {
             }
             other => panic!("expected TokensExceeded, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn prompt_versions_record_actual_hits_and_ignore_fallbacks() {
+        let budget = RunBudget::new("run_prompt_versions", 100, 6, 6);
+
+        budget.record_prompt_version("user.reply.system", Some(3));
+        budget.record_prompt_version("user.reply.policy", None);
+        budget.record_prompt_version("user.reply.task", Some(7));
+        // 渐进式升档会再次装载同一模板；重复记录应保持幂等。
+        budget.record_prompt_version("user.reply.system", Some(3));
+
+        let versions = budget.prompt_versions();
+        assert_eq!(versions.get_i32("user.reply.system").unwrap(), 3);
+        assert_eq!(versions.get_i32("user.reply.task").unwrap(), 7);
+        assert!(
+            !versions.contains_key("user.reply.policy"),
+            "内置 fallback 不得伪造数据库模板版本"
+        );
+        assert_eq!(budget.snapshot().prompt_versions, versions);
     }
 }

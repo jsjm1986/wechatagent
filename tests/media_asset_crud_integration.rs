@@ -25,7 +25,7 @@
 
 mod common;
 
-use axum::extract::{Extension, Json, Path, State};
+use axum::extract::{Extension, Json, Path, Query, State};
 use mongodb::bson::{doc, oid::ObjectId, DateTime};
 use serde_json::json;
 
@@ -33,8 +33,9 @@ use wechatagent::auth::AuthenticatedAdmin;
 use wechatagent::error::AppError;
 use wechatagent::models::ContentAsset;
 use wechatagent::routes::media_assets::{
-    delete_content_asset, toggle_content_asset_sendable, update_content_asset_meta,
-    ToggleSendableRequest, UpdateMetaRequest,
+    delete_content_asset, review_media_asset, toggle_content_asset_sendable,
+    update_content_asset_meta, AssetScopeRequest, ReviewRequest, ToggleSendableRequest,
+    UpdateMetaRequest,
 };
 use wechatagent::routes::AppState;
 
@@ -93,21 +94,34 @@ fn make_asset(
 /// 构造 `UpdateMetaRequest`（字段私有但派生 `Deserialize`，用 from_value 构造——
 /// 仿簇 B `ReviewRequest` / `assist_override_request` 先例，无需放开字段可见性）。
 fn update_meta_request(value: serde_json::Value) -> UpdateMetaRequest {
+    let mut value = value;
+    value
+        .as_object_mut()
+        .expect("request object")
+        .insert("expectedScope".into(), json!("workspace"));
     serde_json::from_value(value).expect("build UpdateMetaRequest")
 }
 
 /// 构造 `ToggleSendableRequest`（同上）。
 fn toggle_request(sendable: bool) -> ToggleSendableRequest {
-    serde_json::from_value(json!({ "sendable": sendable })).expect("build ToggleSendableRequest")
+    serde_json::from_value(json!({
+        "expectedScope": "workspace",
+        "sendable": sendable
+    }))
+    .expect("build ToggleSendableRequest")
+}
+
+fn workspace_scope() -> Query<AssetScopeRequest> {
+    Query(
+        serde_json::from_value(json!({ "expectedScope": "workspace" }))
+            .expect("build workspace asset scope"),
+    )
 }
 
 /// 克隆 `AppState`，把 `media_storage_dir` 指向进程内唯一临时目录，返回 (state, root)。
 /// 复用 `TestApp` 已建好的 Mongo 容器 / LLM mock，仅覆盖文件落盘根目录，避免多测试撞文件。
 fn state_with_unique_media_dir(app: &common::TestApp) -> (AppState, std::path::PathBuf) {
-    let root = std::env::temp_dir().join(format!(
-        "aqgc_media_{}",
-        ObjectId::new().to_hex()
-    ));
+    let root = std::env::temp_dir().join(format!("aqgc_media_{}", ObjectId::new().to_hex()));
     let mut config = app.state.config.clone();
     config.media_storage_dir = root.to_string_lossy().to_string();
     let mut state = app.state.clone();
@@ -164,6 +178,7 @@ async fn edit_meta_updates_fields_keeps_review_status() {
         Some("approved"),
         "改元数据不应退审，review_status 仍为 approved"
     );
+    app.cleanup().await;
 }
 
 // ── edit 元数据：target_stages 越界 → 400 ─────────────────────────────────────
@@ -208,6 +223,7 @@ async fn edit_meta_out_of_dict_stage_rejected() {
         unchanged.target_stages, None,
         "越界被拒后 target_stages 不应落地"
     );
+    app.cleanup().await;
 }
 
 // ── toggle：写 sendable ───────────────────────────────────────────────────────
@@ -253,6 +269,7 @@ async fn toggle_sets_sendable() {
         Some(false),
         "toggle(false) 应写入 sendable=false"
     );
+    app.cleanup().await;
 }
 
 // ── toggle：跨 workspace 404（IDOR） ─────────────────────────────────────────
@@ -290,11 +307,8 @@ async fn toggle_cross_workspace_404() {
     let unchanged = find_asset(&app.state, "other_ws", foreign_id)
         .await
         .expect("foreign asset exists");
-    assert_eq!(
-        unchanged.sendable,
-        Some(true),
-        "跨 workspace 写必须不落地"
-    );
+    assert_eq!(unchanged.sendable, Some(true), "跨 workspace 写必须不落地");
+    app.cleanup().await;
 }
 
 // ── delete：无兄弟引用 → DB 记录删 + 物理文件删 ───────────────────────────────
@@ -310,8 +324,8 @@ async fn delete_removes_db_and_file_when_no_siblings() {
     // 真落一个物理文件。
     let bytes = b"unique-asset-bytes";
     let sha = wechatagent::media_storage::sha256_hex(bytes);
-    let rel = wechatagent::media_storage::safe_relative_path(ws, &sha, "pdf")
-        .expect("safe rel path");
+    let rel =
+        wechatagent::media_storage::safe_relative_path(ws, &sha, "pdf").expect("safe rel path");
     wechatagent::media_storage::store_bytes(&root, &rel, bytes)
         .await
         .expect("store bytes");
@@ -332,6 +346,7 @@ async fn delete_removes_db_and_file_when_no_siblings() {
         State(state.clone()),
         Extension(admin),
         Path(asset_id.to_hex()),
+        workspace_scope(),
     )
     .await
     .expect("delete 应成功");
@@ -342,13 +357,11 @@ async fn delete_removes_db_and_file_when_no_siblings() {
         "delete 后 DB 记录应消失"
     );
     // 物理文件也没了（无兄弟引用 → 引用计数为 0 → 物理删）。
-    assert!(
-        !root.join(&rel).exists(),
-        "无兄弟引用时物理文件应被删除"
-    );
+    assert!(!root.join(&rel).exists(), "无兄弟引用时物理文件应被删除");
 
     // 清理临时目录。
     let _ = tokio::fs::remove_dir_all(&root).await;
+    app.cleanup().await;
 }
 
 // ── delete：有兄弟引用 → DB 记录删但物理文件保留（核心回归） ──────────────────
@@ -367,8 +380,8 @@ async fn delete_keeps_file_when_sibling_references_it() {
     // 真落一个物理文件。
     let bytes = b"shared-asset-bytes";
     let sha = wechatagent::media_storage::sha256_hex(bytes);
-    let rel = wechatagent::media_storage::safe_relative_path(ws, &sha, "pdf")
-        .expect("safe rel path");
+    let rel =
+        wechatagent::media_storage::safe_relative_path(ws, &sha, "pdf").expect("safe rel path");
     wechatagent::media_storage::store_bytes(&root, &rel, bytes)
         .await
         .expect("store bytes");
@@ -397,6 +410,7 @@ async fn delete_keeps_file_when_sibling_references_it() {
         State(state.clone()),
         Extension(admin),
         Path(id_a.to_hex()),
+        workspace_scope(),
     )
     .await
     .expect("delete a 应成功");
@@ -418,6 +432,7 @@ async fn delete_keeps_file_when_sibling_references_it() {
 
     // 清理临时目录。
     let _ = tokio::fs::remove_dir_all(&root).await;
+    app.cleanup().await;
 }
 
 // ── delete：跨 workspace 404（IDOR） ─────────────────────────────────────────
@@ -443,6 +458,7 @@ async fn delete_cross_workspace_404() {
         State(app.state.clone()),
         Extension(admin),
         Path(foreign_id.to_hex()),
+        workspace_scope(),
     )
     .await;
     assert!(
@@ -457,4 +473,122 @@ async fn delete_cross_workspace_404() {
             .is_some(),
         "跨 workspace 删除必须不生效"
     );
+    app.cleanup().await;
+}
+
+// ── SR-160：账号私有素材的实体 scope 是所有写动作的 CAS 身份 ────────────────
+
+#[tokio::test]
+#[ignore]
+async fn wrong_asset_scope_is_conflict_with_zero_document_and_audit_writes() {
+    let app = common::TestApp::start().await;
+    let workspace = app.state.config.default_workspace_id.clone();
+    let admin = test_admin(&workspace);
+    let mut asset = make_asset(
+        &workspace,
+        "account-a private asset",
+        "draft",
+        true,
+        None,
+        None,
+    );
+    asset.account_id = Some("account-a".to_string());
+    let asset_id = asset.id.expect("asset id");
+    app.state
+        .db
+        .content_assets()
+        .insert_one(&asset, None)
+        .await
+        .expect("seed private asset");
+    let collection = app
+        .state
+        .db
+        .raw()
+        .collection::<mongodb::bson::Document>("content_assets");
+    let before = collection
+        .find_one(doc! { "_id": asset_id }, None)
+        .await
+        .expect("read before")
+        .expect("asset exists");
+
+    let wrong_review: ReviewRequest = serde_json::from_value(json!({
+        "expectedScope": "account",
+        "expectedAccountId": "account-b",
+        "status": "approved",
+        "note": "must not persist"
+    }))
+    .expect("review request");
+    let review_result = review_media_asset(
+        State(app.state.clone()),
+        Extension(admin.clone()),
+        Path(asset_id.to_hex()),
+        Json(wrong_review),
+    )
+    .await;
+    assert!(matches!(review_result, Err(AppError::Conflict(_))));
+
+    let workspace_meta: UpdateMetaRequest = serde_json::from_value(json!({
+        "expectedScope": "workspace",
+        "title": "must not persist"
+    }))
+    .expect("meta request");
+    let meta_result = update_content_asset_meta(
+        State(app.state.clone()),
+        Extension(admin.clone()),
+        Path(asset_id.to_hex()),
+        Json(workspace_meta),
+    )
+    .await;
+    assert!(matches!(meta_result, Err(AppError::Conflict(_))));
+
+    let wrong_toggle: ToggleSendableRequest = serde_json::from_value(json!({
+        "expectedScope": "account",
+        "expectedAccountId": "account-b",
+        "sendable": false
+    }))
+    .expect("toggle request");
+    let toggle_result = toggle_content_asset_sendable(
+        State(app.state.clone()),
+        Extension(admin.clone()),
+        Path(asset_id.to_hex()),
+        Json(wrong_toggle),
+    )
+    .await;
+    assert!(matches!(toggle_result, Err(AppError::Conflict(_))));
+
+    let delete_result = delete_content_asset(
+        State(app.state.clone()),
+        Extension(admin),
+        Path(asset_id.to_hex()),
+        workspace_scope(),
+    )
+    .await;
+    assert!(matches!(delete_result, Err(AppError::Conflict(_))));
+
+    let after = collection
+        .find_one(doc! { "_id": asset_id }, None)
+        .await
+        .expect("read after")
+        .expect("asset remains");
+    let audit_count = app
+        .state
+        .db
+        .events()
+        .count_documents(
+            doc! {
+                "workspace_id": &workspace,
+                "kind": "media_asset.reviewed",
+                "details.asset_id": asset_id.to_hex(),
+            },
+            None,
+        )
+        .await
+        .expect("count review audit");
+
+    assert_eq!(
+        after, before,
+        "all rejected scope writes must leave BSON unchanged"
+    );
+    assert_eq!(audit_count, 0, "rejected review must not write audit");
+    app.cleanup().await;
 }

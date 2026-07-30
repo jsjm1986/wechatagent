@@ -5,10 +5,7 @@ use axum::{
     Extension, Json,
 };
 use futures::TryStreamExt;
-use mongodb::{
-    bson::{doc, DateTime},
-    options::{FindOneOptions, FindOptions},
-};
+use mongodb::{bson::doc, options::FindOptions};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -53,6 +50,23 @@ pub(super) struct PromptTemplateRequest {
 pub struct PublishRequest {
     #[serde(default)]
     force: Option<bool>,
+}
+
+pub const RESET_SYSTEM_PROMPT_PACK_CONFIRMATION: &str = "RESET PROMPT PACK";
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct ResetSystemPromptPackRequest {
+    confirmation: String,
+}
+
+fn validate_reset_confirmation(value: &str) -> AppResult<()> {
+    if value != RESET_SYSTEM_PROMPT_PACK_CONFIRMATION {
+        return Err(AppError::BadRequest(
+            "prompt_pack_reset_confirmation_mismatch".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 pub(super) async fn list_prompt_templates(
@@ -104,52 +118,38 @@ pub(super) async fn create_prompt_template(
     // #2 修复：create 与 update 对齐，过字面双闸（禁用词 + 锚完整性）。
     // create 是写入全新整篇内容，对整篇过双闸语义正确；不加 LLM 第三闸
     //（无 old 基线做 diff，且该 draft 最终须经 publish，publish 关口兜 LLM 闸）。
-    crate::routes::management_prompt_edit::validate_prompt_edit(&payload.prompt_key, &payload.content)
-        .map_err(AppError::BadRequest)?;
-    let latest = state
-        .db
-        .prompt_templates()
-        .find_one(
-            doc! {
-                "workspace_id": &admin.current_workspace,
-                "prompt_key": &payload.prompt_key
-            },
-            FindOneOptions::builder()
-                .sort(doc! { "version": -1 })
-                .build(),
-        )
-        .await?;
-    let version = latest.map(|item| item.version + 1).unwrap_or(1);
-    let template = PromptTemplate {
-        id: None,
-        workspace_id: admin.current_workspace.clone(),
-        prompt_key: payload.prompt_key,
-        agent_kind: payload.agent_kind,
-        layer: payload.layer,
-        title: payload.title,
-        description: normalize_optional(payload.description),
-        content: payload.content,
-        status: "draft".to_string(),
-        version,
-        prompt_pack_version: "custom".to_string(),
-        created_by: "manual".to_string(),
-        created_at: DateTime::now(),
-        updated_at: DateTime::now(),
-        // 后台手工创建时尚未发布；publish_prompt_template 负责 current_version 切换。
-        current_version: false,
-        previous_version: None,
-        seeded_by: Some("manual".to_string()),
-        locale: normalize_optional(payload.locale)
-            .or_else(|| Some(prompts::DEFAULT_LOCALE.to_string())),
-    };
-    let result = state
-        .db
-        .prompt_templates()
-        .insert_one(template, None)
-        .await?;
-    Ok(Json(
-        json!({ "id": result.inserted_id.as_object_id().map(|id| id.to_hex()) }),
-    ))
+    crate::routes::management_prompt_edit::validate_prompt_edit(
+        &payload.prompt_key,
+        &payload.content,
+    )
+    .map_err(AppError::BadRequest)?;
+    let description = normalize_optional(payload.description);
+    let locale =
+        normalize_optional(payload.locale).or_else(|| Some(prompts::DEFAULT_LOCALE.to_string()));
+    let draft = crate::prompt_template_versions::append_version(
+        &state.db,
+        &admin.current_workspace,
+        crate::prompt_template_versions::NewPromptTemplateVersion {
+            prompt_key: &payload.prompt_key,
+            agent_kind: &payload.agent_kind,
+            layer: &payload.layer,
+            title: &payload.title,
+            description: description.as_deref(),
+            content: &payload.content,
+            prompt_pack_version: "custom",
+            actor: &admin.user_id,
+            seeded_by: "manual",
+            locale: locale.as_deref(),
+            previous_version: None,
+            source_proposal_id: None,
+        },
+    )
+    .await?;
+    Ok(Json(json!({
+        "id": draft.id.map(|id| id.to_hex()).unwrap_or_default(),
+        "version": draft.version,
+        "status": draft.status,
+    })))
 }
 
 pub(super) async fn update_prompt_template(
@@ -161,30 +161,32 @@ pub(super) async fn update_prompt_template(
     validate_prompt_template_input(&payload)?;
     // 自然语言编辑硬门（fail-closed）：三层分级 + 字面双闸（禁用词 + 锚完整性）。
     // 单点拦截——无论走管理 agent 工具还是管理员直接 PUT，命中即拒、不落库。
-    crate::routes::management_prompt_edit::validate_prompt_edit(&payload.prompt_key, &payload.content)
-        .map_err(AppError::BadRequest)?;
+    crate::routes::management_prompt_edit::validate_prompt_edit(
+        &payload.prompt_key,
+        &payload.content,
+    )
+    .map_err(AppError::BadRequest)?;
     let object_id = parse_object_id(&id)?;
+    let source = state
+        .db
+        .prompt_templates()
+        .find_one(
+            doc! { "_id": object_id, "workspace_id": &admin.current_workspace },
+            None,
+        )
+        .await?
+        .ok_or_else(|| AppError::NotFound("prompt template not found".to_string()))?;
+    if source.prompt_key != payload.prompt_key {
+        return Err(AppError::Conflict("prompt_key_is_immutable".to_string()));
+    }
     // Task 6.6 第三闸：LLM 红线语义审查（审 diff 增量）。force=true 跳过（管理者已逐字核对）。
     let force = payload.force.unwrap_or(false);
     if !force {
-        let old_content = state
-            .db
-            .prompt_templates()
-            .find_one(
-                doc! {
-                    "_id": object_id,
-                    "workspace_id": &admin.current_workspace
-                },
-                None,
-            )
-            .await?
-            .map(|t| t.content)
-            .unwrap_or_default();
         match crate::routes::management_prompt_edit::review_prompt_edit(
             &state,
             &admin.current_workspace,
             &payload.prompt_key,
-            &old_content,
+            &source.content,
             &payload.content,
         )
         .await
@@ -208,33 +210,36 @@ pub(super) async fn update_prompt_template(
             }
         }
     }
-    state
-        .db
-        .prompt_templates()
-        .update_one(
-            doc! {
-                "_id": object_id,
-                "workspace_id": &admin.current_workspace
-            },
-            doc! {
-                "$set": {
-                    "prompt_key": payload.prompt_key,
-                    "agent_kind": payload.agent_kind,
-                    "layer": payload.layer,
-                    "title": payload.title,
-                    "description": normalize_optional(payload.description),
-                    "content": payload.content,
-                    // 防 PR#42 启动对齐 align_prompt_specs 把被编辑的系统种子行
-                    // （seeded_by="system" 且内容≠DEFAULT）归档重种回 DEFAULT。
-                    // 置 "manual" 让 align 跳过，保住管理者编辑活过重启。
-                    "seeded_by": "manual",
-                    "updated_at": DateTime::now()
-                }
-            },
-            None,
-        )
-        .await?;
-    Ok(Json(json!({ "ok": true })))
+    let description = normalize_optional(payload.description);
+    let locale = normalize_optional(payload.locale)
+        .or(source.locale.clone())
+        .or_else(|| Some(prompts::DEFAULT_LOCALE.to_string()));
+    let draft = crate::prompt_template_versions::append_edited_draft(
+        &state.db,
+        &admin.current_workspace,
+        object_id,
+        crate::prompt_template_versions::NewPromptTemplateVersion {
+            prompt_key: &payload.prompt_key,
+            agent_kind: &payload.agent_kind,
+            layer: &payload.layer,
+            title: &payload.title,
+            description: description.as_deref(),
+            content: &payload.content,
+            prompt_pack_version: "custom",
+            actor: &admin.user_id,
+            seeded_by: "manual",
+            locale: locale.as_deref(),
+            previous_version: Some(source.version),
+            source_proposal_id: None,
+        },
+    )
+    .await?;
+    Ok(Json(json!({
+        "ok": true,
+        "id": draft.id.map(|id| id.to_hex()).unwrap_or_default(),
+        "version": draft.version,
+        "status": draft.status,
+    })))
 }
 
 pub async fn publish_prompt_template(
@@ -268,22 +273,14 @@ pub async fn publish_prompt_template(
 
     // 闸 3 LLM 语义审查（审 diff 增量）。force=true 跳过（管理者已逐字核对）。
     if !force {
-        // old 基线 = 当前 current_version=true（回退 status=active）那条的 content；
-        // 查不到则空串（全文当增量审，与 update 加载 old 同构）。
-        let old_content = state
-            .db
-            .prompt_templates()
-            .find_one(
-                doc! {
-                    "workspace_id": &template.workspace_id,
-                    "prompt_key": &template.prompt_key,
-                    "current_version": true
-                },
-                None,
-            )
-            .await?
-            .map(|t| t.content)
-            .unwrap_or_default();
+        let old_content = crate::prompt_template_versions::load_current_for_publish(
+            &state.db,
+            &template.workspace_id,
+            &template.prompt_key,
+        )
+        .await?
+        .map(|row| row.content)
+        .unwrap_or_default();
         match crate::routes::management_prompt_edit::review_prompt_edit(
             &state,
             &admin.current_workspace,
@@ -312,84 +309,36 @@ pub async fn publish_prompt_template(
         }
     }
 
-    // evolution 守卫：seeded_by="evolution_release" 的历史行是 rollback 链所需
-    //（rollback_prompt 靠 version=previous_version 找回），手动 publish 的单版本清理
-    // 绝不物删它们——镜像 prompts::align_prompt_specs 的同款 evolution 守卫。
-    let evolution_rows = state
-        .db
-        .prompt_templates()
-        .count_documents(
-            doc! {
-                "workspace_id": &template.workspace_id,
-                "prompt_key": &template.prompt_key,
-                "seeded_by": "evolution_release",
-            },
-            None,
-        )
-        .await?;
+    let published = crate::prompt_template_versions::publish_version(
+        &state.db,
+        &admin.current_workspace,
+        object_id,
+        &admin.user_id,
+    )
+    .await?;
     state
-        .db
-        .prompt_templates()
-        .delete_many(
-            doc! {
-                "workspace_id": &template.workspace_id,
-                "prompt_key": &template.prompt_key,
-                "_id": { "$ne": object_id },
-                "seeded_by": { "$ne": "evolution_release" }
-            },
-            None,
-        )
-        .await?;
-    // 边缘副作用可见化：该 key 存在 evolution 灰度链历史行时，手动 publish 会让本行
-    // 与 evolution 行并存为多条 active 参与 A/B。写观测事件交 admin 在演化页收口。
-    if evolution_rows > 0 {
-        let _ = state
-            .db
-            .events()
-            .insert_one(
-                crate::models::AgentEvent {
-                    id: None,
-                    workspace_id: template.workspace_id.clone(),
-                    account_id: state.config.default_account_id.clone(),
-                    contact_wxid: None,
-                    kind: "prompt_publish_kept_evolution_rows".to_string(),
-                    status: "warn".to_string(),
-                    summary: format!(
-                        "手动 publish prompt_key={} 时保留了 {} 条 evolution 历史行（未物删，保住 rollback）；该 key 若正处 evolution 灰度，请在演化页收口多版本 A/B。",
-                        template.prompt_key, evolution_rows
-                    ),
-                    details: Some(doc! {
-                        "prompt_key": &template.prompt_key,
-                        "kept_evolution_rows": evolution_rows as i64,
-                    }),
-                    created_at: DateTime::now(),
-                    dedupe_key: None,
-                },
-                None,
-            )
-            .await;
-    }
-    state
-        .db
-        .prompt_templates()
-        .update_one(
-            doc! { "_id": object_id },
-            doc! { "$set": { "status": "active", "updated_at": DateTime::now() } },
-            None,
-        )
-        .await?;
-    let _ = template;
-    Ok(Json(json!({ "ok": true })))
+        .prompt_pack_version
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    Ok(Json(json!({
+        "ok": true,
+        "id": published.id.map(|id| id.to_hex()).unwrap_or_default(),
+        "version": published.version,
+    })))
 }
 
 pub(super) async fn reset_system_prompt_pack(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
+    Json(payload): Json<ResetSystemPromptPackRequest>,
 ) -> AppResult<Json<Value>> {
-    prompts::reset_prompt_pack_v2(
+    // Validate before the first database write. The UI confirmation is a UX
+    // guard; this server-side token is the authoritative bypass-resistant gate.
+    validate_reset_confirmation(&payload.confirmation)?;
+    prompts::reset_prompt_pack_v2_as_actor(
         &state.db,
         &admin.current_workspace,
         &state.config.default_account_id,
+        &admin.user_id,
     )
     .await?;
     // M4 W4 Task 5.3：reset 是显式销毁性 reseed，必须 bump 让 LRU cache 失效。
@@ -462,8 +411,26 @@ mod tests {
             previous_version: Some(10),
             seeded_by: Some("system".to_string()),
             locale: Some("zh-CN".to_string()),
+            source_proposal_id: None,
         };
         let value = prompt_template_json(template);
         crate::routes::contract_snapshot::assert_contract_fixture("prompt_template", value);
+    }
+
+    #[test]
+    fn reset_confirmation_is_exact_and_unknown_fields_are_rejected() {
+        assert!(validate_reset_confirmation(RESET_SYSTEM_PROMPT_PACK_CONFIRMATION).is_ok());
+        assert!(validate_reset_confirmation("").is_err());
+        assert!(validate_reset_confirmation("reset prompt pack").is_err());
+
+        let parsed = serde_json::from_value::<ResetSystemPromptPackRequest>(json!({
+            "confirmation": RESET_SYSTEM_PROMPT_PACK_CONFIRMATION
+        }));
+        assert!(parsed.is_ok());
+        let unknown = serde_json::from_value::<ResetSystemPromptPackRequest>(json!({
+            "confirmation": RESET_SYSTEM_PROMPT_PACK_CONFIRMATION,
+            "force": true
+        }));
+        assert!(unknown.is_err());
     }
 }

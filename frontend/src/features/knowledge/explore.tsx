@@ -1,9 +1,14 @@
-import { useState, useEffect, useRef, useMemo, type FormEvent } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo, type FormEvent } from "react";
 import { ChevronDown, ChevronRight, Clock3, RefreshCw, Sparkles } from "lucide-react";
 import { parseApiError } from "../../lib/api";
 import { numberOr, stringOr, type TreeChunkItem } from "./shared";
 import { EmptyState } from "../../components/ui/EmptyState";
 import { wikiTypeLabel, statusLabel, integrityStatusLabel, relatedKindLabel } from "./labels";
+import {
+  CHUNKS_INVALIDATED_EVENT,
+  useCoalescedReload,
+  type ChunkInvalidationDetail,
+} from "./chunkInvalidation";
 
 interface AskSourceQuote {
   chunkId: string;
@@ -23,6 +28,13 @@ interface AskResult {
   truncated: boolean;
   tookMs: number;
 }
+
+interface AskFailedEvent {
+  code?: string;
+  message?: string;
+}
+
+const ASK_MAX_ROUNDS = 4;
 
 // AskView：把 /api/knowledge/ask 包装成"输入 → answer + cited 卡片 + tool_trace 时间线"。
 //
@@ -48,6 +60,7 @@ export function AskView() {
   // 而 setResult 是异步 state —— 必须在每个 setResult 处同步置 ref，否则 error
   // handler 读到的是上一轮的旧 result（stale closure），导致新查询失败时错误横幅被误抑制。
   const resultRef = useRef<AskResult | null>(null);
+  const streamOutcomeRef = useRef<"idle" | "pending" | "answered" | "failed" | "cancelled">("idle");
 
   // 组件卸载/重新提交时关掉旧 EventSource，避免连接泄漏。
   useEffect(() => () => {
@@ -59,6 +72,7 @@ export function AskView() {
     setError(null);
     setResult(null);
     resultRef.current = null;
+    streamOutcomeRef.current = "idle";
     setLiveTrace([]);
     setStreamText("");
     setOpenCited(new Set());
@@ -102,6 +116,7 @@ export function AskView() {
   function submitStream(q: string) {
     setPending(true);
     resetForSubmit();
+    streamOutcomeRef.current = "pending";
     setShowTrace(true);
     const startedAt = Date.now();
     const params = new URLSearchParams({ query: q });
@@ -135,13 +150,32 @@ export function AskView() {
         const next: AskResult = { ...data, tookMs: data.tookMs ?? Date.now() - startedAt };
         setResult(next);
         resultRef.current = next;
+        streamOutcomeRef.current = "answered";
       } catch (err) {
+        streamOutcomeRef.current = "failed";
         setError(err instanceof Error ? err.message : "解析 answer 帧失败");
       }
     });
+    es.addEventListener("failed", (ev) => {
+      let message = "知识问答暂时失败，请稍后重试。";
+      try {
+        const data = JSON.parse((ev as MessageEvent).data) as AskFailedEvent;
+        if (typeof data.message === "string" && data.message.trim()) {
+          message = data.message;
+        }
+      } catch {
+        // 失败帧自身格式异常时仍展示稳定通用文案。
+      }
+      streamOutcomeRef.current = "failed";
+      setError(message);
+      es.close();
+      esRef.current = null;
+      setPending(false);
+    });
     es.addEventListener("error", () => {
-      // 浏览器在 close 后也会触发 error；只在还没拿到 answer 时报警，避免误报。
-      if (!resultRef.current) {
+      // 浏览器在主动 close 后也可能触发 error；只有仍处于 pending 才是连接异常。
+      if (streamOutcomeRef.current === "pending" && !resultRef.current) {
+        streamOutcomeRef.current = "failed";
         setError("流式连接错误（请关闭实时模式或重试）");
       }
       es.close();
@@ -149,6 +183,10 @@ export function AskView() {
       setPending(false);
     });
     es.addEventListener("close", () => {
+      if (streamOutcomeRef.current === "pending" && !resultRef.current) {
+        streamOutcomeRef.current = "failed";
+        setError("流式连接在返回结果前结束，请重试。");
+      }
       es.close();
       esRef.current = null;
       setPending(false);
@@ -159,6 +197,7 @@ export function AskView() {
   // agent 在下一个 cancel checkpoint 自行收尾并发出 cancelled answer 帧。
   // 此处前端不等 answer 帧，直接把 pending 置 false，UI 立即解锁。
   function cancelStream() {
+    streamOutcomeRef.current = "cancelled";
     esRef.current?.close();
     esRef.current = null;
     setPending(false);
@@ -255,7 +294,7 @@ export function AskView() {
             <span>
               <Clock3 size={12} /> {result.tookMs} ms
             </span>
-            <span>轮次：{result.roundsUsed}/3</span>
+            <span>轮次：{result.roundsUsed}/{ASK_MAX_ROUNDS}</span>
             {result.truncated ? (
               <span className="wikiBadge warn">已截断</span>
             ) : null}
@@ -354,25 +393,59 @@ export function KnowledgeTreeView() {
   const [expandL1, setExpandL1] = useState<Set<string>>(new Set());
   const [expandL2, setExpandL2] = useState<Set<string>>(new Set()); // key = `${l1}|${l2}`
   const [showBody, setShowBody] = useState(false);
+  const requestGeneration = useRef(0);
 
-  async function load() {
+  const loadOnce = useCallback(async () => {
+    const generation = requestGeneration.current;
     setLoading(true);
     setError(null);
     try {
       const r = await fetch("/api/operation-knowledge/chunks");
       if (!r.ok) throw await parseApiError(r);
       const data = (await r.json()) as { items: TreeChunkItem[] };
-      setItems(data.items ?? []);
+      if (generation === requestGeneration.current) {
+        const next = data.items ?? [];
+        setItems(next);
+        setActiveId((current) =>
+          current && next.some((item) => item.id === current) ? current : null,
+        );
+      }
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e));
+      if (generation === requestGeneration.current) {
+        setItems([]);
+        setActiveId(null);
+        setError(e instanceof Error ? e.message : String(e));
+      }
     } finally {
-      setLoading(false);
+      if (generation === requestGeneration.current) setLoading(false);
     }
-  }
+  }, []);
+  const coalescedReload = useCoalescedReload(loadOnce);
+  const reload = useCallback(() => {
+    requestGeneration.current += 1;
+    setItems([]);
+    setActiveId(null);
+    setError(null);
+    return coalescedReload();
+  }, [coalescedReload]);
 
   useEffect(() => {
-    void load();
-  }, []);
+    void reload();
+  }, [reload]);
+
+  useEffect(() => {
+    const onInvalidated = (event: Event) => {
+      const detail = (event as CustomEvent<ChunkInvalidationDetail>).detail;
+      if (detail?.reason === "lagged") {
+        setInfo("\u5b9e\u65f6\u66f4\u65b0\u6709\u79ef\u538b\uff0c\u6b63\u5728\u91cd\u65b0\u540c\u6b65\u77e5\u8bc6\u6811\u2026");
+      }
+      void reload().finally(() => {
+        if (detail?.reason === "lagged") setInfo(null);
+      });
+    };
+    window.addEventListener(CHUNKS_INVALIDATED_EVENT, onInvalidated);
+    return () => window.removeEventListener(CHUNKS_INVALIDATED_EVENT, onInvalidated);
+  }, [reload]);
 
   const tree = useMemo(() => {
     // l1Key -> l2Key -> chunk[]
@@ -442,7 +515,7 @@ export function KnowledgeTreeView() {
   return (
     <div className="wikiPanelBody wikiTreeBody">
       <div className="wikiToolbar">
-        <button type="button" className="ghost" onClick={() => void load()} disabled={loading}>
+        <button type="button" className="ghost" onClick={() => void reload()} disabled={loading}>
           <RefreshCw size={14} />
           {loading ? "加载中…" : "刷新"}
         </button>

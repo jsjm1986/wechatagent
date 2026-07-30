@@ -18,6 +18,47 @@ use crate::models::{
     OperationKnowledgeDocument,
 };
 
+/// outbox 执行客户发送时的失败边界。业务决策已由模型完成；这里仅表达执行器能否
+/// 证明“客户投递请求尚未造成不可逆副作用”。
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum OutboundSendError {
+    #[error("safe to retry: {0}")]
+    SafeToRetry(String),
+    #[error("delivery uncertain: {0}")]
+    DeliveryUncertain(String),
+}
+
+/// 对已经越过 outbox 最后可取消点的发送做事后核验时的三态结果。
+/// `NotDelivered` 只能由权威查询明确未命中，或由发送前置条件证明客户投递尚未发生；
+/// 缺少证据不是 `NotDelivered`，而是 `Inconclusive`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeliveryVerification {
+    Delivered,
+    NotDelivered,
+    Inconclusive,
+}
+
+impl From<crate::error::AppError> for OutboundSendError {
+    fn from(value: crate::error::AppError) -> Self {
+        Self::SafeToRetry(value.to_string())
+    }
+}
+
+impl From<mongodb::error::Error> for OutboundSendError {
+    fn from(value: mongodb::error::Error) -> Self {
+        Self::SafeToRetry(value.to_string())
+    }
+}
+
+impl From<crate::mcp::McpSendError> for OutboundSendError {
+    fn from(value: crate::mcp::McpSendError) -> Self {
+        match value {
+            crate::mcp::McpSendError::SafeToRetry(reason) => Self::SafeToRetry(reason),
+            crate::mcp::McpSendError::DeliveryUncertain(reason) => Self::DeliveryUncertain(reason),
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct GeneratedOperationProfile {
@@ -167,11 +208,11 @@ pub struct AgentDecision {
     pub consolidation_needed: bool,
     #[serde(default, deserialize_with = "string_or_vec")]
     pub used_knowledge_ids: Vec<String>,
-    /// 客观购买事实增强 G2（2026-06-15 spec §5.4）：本轮回复**报价/推荐时引用的
-    /// 产品 product_id**（来自注入的「产品目录」段）。R5.4 据此判 `priced_from_catalog`：
-    /// 引用的 product_id ∈ 本 workspace active products → 视为结构化 verified 背书，
-    /// 与 verified_chunks 取或，避免 G2 准确报价被 `blocked_unverified_product_claim` 错杀。
-    /// 空（无报价 / 情感域）→ 不触发并联背书，行为与改造前等价。
+    /// 历史 Reply 协议字段：模型自报其引用的产品 ID。
+    ///
+    /// 仅为持久化/提示兼容保留，不能作为目录背书或发送授权证据。R5.4 的
+    /// `priced_from_catalog` 只由独立 ClaimGate 对最终正文提取、精确 quote 锚定并由
+    /// 服务端逐字段核对 active catalog 后产生。
     #[serde(default, deserialize_with = "string_or_vec")]
     pub quoted_product_ids: Vec<String>,
     #[serde(default)]
@@ -416,16 +457,16 @@ pub struct RawAgentDecision {
     pub risk_self_check: Option<String>,
 
     // ── 业务必填字段（R3.1 / R3.2 / R3.3） ──
-    pub risk_level: Option<String>,        // low | medium | high
-    pub knowledge_need: Option<String>,    // not_required | required | insufficient
-    pub run_mode: Option<String>,          // fast_chat | memory_candidate | knowledge_grounded | high_risk
-    pub autonomy_mode: Option<String>,     // auto | assisted | blocked
+    pub risk_level: Option<String>,     // low | medium | high
+    pub knowledge_need: Option<String>, // not_required | required | insufficient
+    pub run_mode: Option<String>, // fast_chat | memory_candidate | knowledge_grounded | high_risk
+    pub autonomy_mode: Option<String>, // auto | assisted | blocked
     pub needs_review: Option<bool>,
     pub operation_state: Option<String>,
     pub consolidation_needed: Option<bool>,
 
     // ── R4 工具循环协议 ──
-    pub decision_phase: Option<String>,    // tool_calling | final
+    pub decision_phase: Option<String>, // tool_calling | final
     pub tool_calls: Option<Vec<ToolCallRequest>>,
 
     // ── R8 自由信号 ──
@@ -439,7 +480,7 @@ pub struct RawAgentDecision {
     pub reply_text: Option<String>,
     pub should_reply: Option<bool>,
     pub used_knowledge_ids: Option<Vec<String>>,
-    /// G2 报价引用的 product_id（spec §5.4，R5.4 priced_from_catalog 判定用）。
+    /// 历史兼容字段；模型自报值不参与 `priced_from_catalog` 授权判定。
     pub quoted_product_ids: Option<Vec<String>>,
     pub safe_claims_used: Option<Vec<String>>,
     pub knowledge_route: Option<KnowledgeRouteResult>,
@@ -545,8 +586,12 @@ const RAW_FINAL: &str = "final";
 
 const RISK_LEVEL_VALUES: &[&str] = &["low", "medium", "high"];
 const KNOWLEDGE_NEED_VALUES: &[&str] = &["not_required", "required", "insufficient"];
-const RUN_MODE_VALUES: &[&str] =
-    &["fast_chat", "memory_candidate", "knowledge_grounded", "high_risk"];
+const RUN_MODE_VALUES: &[&str] = &[
+    "fast_chat",
+    "memory_candidate",
+    "knowledge_grounded",
+    "high_risk",
+];
 const AUTONOMY_MODE_VALUES: &[&str] = &["auto", "assisted", "blocked"];
 const CONVERSATION_MODE_VALUES: &[&str] = &[
     "casual_relationship",
@@ -574,11 +619,7 @@ fn count_hanzi(s: &str) -> usize {
 
 /// R1.3 / R3.5：必填字符串（trim 后非空）；空或仅空白 SHALL 追加
 /// `missing_required_field:<name>` 并返回空字符串（落入 AgentDecision 默认）。
-fn check_required_string(
-    field: Option<String>,
-    name: &str,
-    risks: &mut Vec<String>,
-) -> String {
+fn check_required_string(field: Option<String>, name: &str, risks: &mut Vec<String>) -> String {
     match field {
         Some(value) if !value.trim().is_empty() => value,
         _ => {
@@ -618,11 +659,7 @@ fn check_required_enum(
 
 /// R3.1：必填 bool。`None` 视为未输出 → `missing_required_field:<name>`；
 /// 类型非法（在 RawAgentDecision 反序列化层直接报错）此处 None 兜底归为 missing。
-fn check_required_bool(
-    field: Option<bool>,
-    name: &str,
-    risks: &mut Vec<String>,
-) -> bool {
+fn check_required_bool(field: Option<bool>, name: &str, risks: &mut Vec<String>) -> bool {
     match field {
         Some(v) => v,
         None => {
@@ -702,16 +739,15 @@ impl RawAgentDecision {
         // 注入（active DomainProfile.conversation_modes，由 gateway 在加载 profile
         // 后写入 runtime.allowed_conversation_modes）。空时回落到内置销售域四模式
         // `CONVERSATION_MODE_VALUES`（DEFAULT 逐字等价 + 兼容 PBT/无 profile 入口）。
-        let conversation_mode_values: Vec<&str> =
-            if runtime.allowed_conversation_modes.is_empty() {
-                CONVERSATION_MODE_VALUES.to_vec()
-            } else {
-                runtime
-                    .allowed_conversation_modes
-                    .iter()
-                    .map(String::as_str)
-                    .collect()
-            };
+        let conversation_mode_values: Vec<&str> = if runtime.allowed_conversation_modes.is_empty() {
+            CONVERSATION_MODE_VALUES.to_vec()
+        } else {
+            runtime
+                .allowed_conversation_modes
+                .iter()
+                .map(String::as_str)
+                .collect()
+        };
         let conversation_mode = check_required_enum(
             self.conversation_mode.clone(),
             "conversation_mode",
@@ -724,11 +760,8 @@ impl RawAgentDecision {
             "consolidation_needed",
             &mut risks,
         );
-        let operation_state = check_required_string(
-            self.operation_state.clone(),
-            "operation_state",
-            &mut risks,
-        );
+        let operation_state =
+            check_required_string(self.operation_state.clone(), "operation_state", &mut risks);
 
         // R1.3 7 字段始终必填（trim 后非空）
         let user_understanding = check_required_string(
@@ -741,11 +774,8 @@ impl RawAgentDecision {
             "relationship_read",
             &mut risks,
         );
-        let operation_goal = check_required_string(
-            self.operation_goal.clone(),
-            "operation_goal",
-            &mut risks,
-        );
+        let operation_goal =
+            check_required_string(self.operation_goal.clone(), "operation_goal", &mut risks);
         let knowledge_need_reason = check_required_string(
             self.knowledge_need_reason.clone(),
             "knowledge_need_reason",
@@ -756,16 +786,10 @@ impl RawAgentDecision {
             "memory_update_reason",
             &mut risks,
         );
-        let self_critique = check_required_string(
-            self.self_critique.clone(),
-            "self_critique",
-            &mut risks,
-        );
-        let risk_self_check = check_required_string(
-            self.risk_self_check.clone(),
-            "risk_self_check",
-            &mut risks,
-        );
+        let self_critique =
+            check_required_string(self.self_critique.clone(), "self_critique", &mut risks);
+        let risk_self_check =
+            check_required_string(self.risk_self_check.clone(), "risk_self_check", &mut risks);
 
         // R1.4 互斥必填（whyShouldReply / whySkipReply 由 should_reply 决定）
         let should_reply = self.should_reply.unwrap_or(false);
@@ -781,9 +805,8 @@ impl RawAgentDecision {
         }
 
         // R1.5 / R1.6 条件长度判定
-        let is_low_routine = risk_level == "low"
-            && knowledge_need == "not_required"
-            && !consolidation_needed;
+        let is_low_routine =
+            risk_level == "low" && knowledge_need == "not_required" && !consolidation_needed;
         let is_critical_turn = risk_level == "high"
             || run_mode == "high_risk"
             || knowledge_need == "required"
@@ -807,27 +830,19 @@ impl RawAgentDecision {
                     continue;
                 }
                 if value.trim() == "unchanged" || count_unicode_chars(value) < 20 {
-                    risks.push(format!(
-                        "insufficient_detail_in_critical_turn:{}",
-                        name
-                    ));
+                    risks.push(format!("insufficient_detail_in_critical_turn:{}", name));
                 }
             }
 
             // R1.6：回复理由（命中那一个）≥ 30 unicode chars 含 ≥ 12 hanzi
             if should_reply {
-                if !why_should_reply.is_empty()
-                    && !is_valid_reply_reason(&why_should_reply, 30, 12)
+                if !why_should_reply.is_empty() && !is_valid_reply_reason(&why_should_reply, 30, 12)
                 {
-                    risks.push(
-                        "insufficient_detail_in_critical_turn:why_should_reply".to_string(),
-                    );
+                    risks.push("insufficient_detail_in_critical_turn:why_should_reply".to_string());
                 }
-            } else if !why_skip_reply.is_empty()
-                && !is_valid_reply_reason(&why_skip_reply, 30, 12)
+            } else if !why_skip_reply.is_empty() && !is_valid_reply_reason(&why_skip_reply, 30, 12)
             {
-                risks
-                    .push("insufficient_detail_in_critical_turn:why_skip_reply".to_string());
+                risks.push("insufficient_detail_in_critical_turn:why_skip_reply".to_string());
             }
         } else if is_low_routine {
             // 低风险常规轮：5 字段（user_understanding / relationship_read /
@@ -843,10 +858,7 @@ impl RawAgentDecision {
                     continue;
                 }
                 if count_unicode_chars(value) < 6 {
-                    risks.push(format!(
-                        "insufficient_detail_in_critical_turn:{}",
-                        name
-                    ));
+                    risks.push(format!("insufficient_detail_in_critical_turn:{}", name));
                 }
             }
         }
@@ -1863,7 +1875,9 @@ mod validate_and_promote_tests {
         let (_decision, risks) = raw.validate_and_promote(&runtime);
 
         assert!(
-            risks.iter().any(|r| r == "invalid_tool_call:knowledge.unknown"),
+            risks
+                .iter()
+                .any(|r| r == "invalid_tool_call:knowledge.unknown"),
             "应追加 invalid_tool_call risk，实际 risks={:?}",
             risks
         );
@@ -1933,21 +1947,13 @@ mod validate_and_promote_tests {
             operation_state: Some("active".to_string()),
             // 故意给 user_understanding=unchanged，应被关键变化轮拒绝
             user_understanding: Some("unchanged".to_string()),
-            relationship_read: Some(
-                "用户对产品功能与价格表达明显的关注与试探".to_string(),
-            ),
-            operation_goal: Some(
-                "建立信任并引导对方进入下一阶段的产品评估对话".to_string(),
-            ),
-            knowledge_need_reason: Some(
-                "需要核实产品定价细节避免给出错误的报价信息".to_string(),
-            ),
+            relationship_read: Some("用户对产品功能与价格表达明显的关注与试探".to_string()),
+            operation_goal: Some("建立信任并引导对方进入下一阶段的产品评估对话".to_string()),
+            knowledge_need_reason: Some("需要核实产品定价细节避免给出错误的报价信息".to_string()),
             memory_update_reason: Some(
                 "用户提及具体预算区间，需写入 recent_facts 以便后续跟进".to_string(),
             ),
-            self_critique: Some(
-                "上一轮回复略显急切，本轮放慢节奏并增加问题确认环节".to_string(),
-            ),
+            self_critique: Some("上一轮回复略显急切，本轮放慢节奏并增加问题确认环节".to_string()),
             risk_self_check: Some(
                 "需避免对未验证产品功能做承诺，仅引用 verified 知识切片".to_string(),
             ),
@@ -2056,16 +2062,25 @@ mod validate_and_promote_tests {
         // 顶层用 snake_case（LLM 偶发形态）。
         let snake = r#"{"customer_stage":"decision","intent_level":"high"}"#;
         let raw: RawAgentDecision = serde_json::from_str(snake).expect("parse snake");
-        assert_eq!(raw.customer_stage.as_deref(), Some("decision"),
-            "顶层 snake_case customer_stage 须经 alias 吸收");
-        assert_eq!(raw.intent_level.as_deref(), Some("high"),
-            "顶层 snake_case intent_level 须经 alias 吸收");
+        assert_eq!(
+            raw.customer_stage.as_deref(),
+            Some("decision"),
+            "顶层 snake_case customer_stage 须经 alias 吸收"
+        );
+        assert_eq!(
+            raw.intent_level.as_deref(),
+            Some("high"),
+            "顶层 snake_case intent_level 须经 alias 吸收"
+        );
 
         // camelCase 主名仍照常工作（rename_all 主形态不受 alias 影响）。
         let camel = r#"{"customerStage":"evaluation","intentLevel":"medium"}"#;
         let raw2: RawAgentDecision = serde_json::from_str(camel).expect("parse camel");
-        assert_eq!(raw2.customer_stage.as_deref(), Some("evaluation"),
-            "camelCase 主名仍须正常解析");
+        assert_eq!(
+            raw2.customer_stage.as_deref(),
+            Some("evaluation"),
+            "camelCase 主名仍须正常解析"
+        );
         assert_eq!(raw2.intent_level.as_deref(), Some("medium"));
     }
 
@@ -2261,7 +2276,9 @@ mod namecard_directive_tests {
         });
         let runtime = runtime_default(true);
         let (decision, _risks) = raw.validate_and_promote(&runtime);
-        let card = decision.namecard_to_send.expect("namecard must carry through");
+        let card = decision
+            .namecard_to_send
+            .expect("namecard must carry through");
         assert_eq!(card.card_id, "c1");
     }
 }
@@ -2290,7 +2307,10 @@ mod dimension_display_names_tests {
         let runtime = runtime_default(true);
         let (decision, _risks) = raw.validate_and_promote(&runtime);
         assert_eq!(
-            decision.dimension_display_names.get_str("customer_stage").ok(),
+            decision
+                .dimension_display_names
+                .get_str("customer_stage")
+                .ok(),
             Some("焦虑观望"),
             "dimensionDisplayNames 必须 carry-through，实际 {:?}",
             decision.dimension_display_names
@@ -2541,7 +2561,10 @@ mod decision_review_result_tests {
         }
         // 合法值不应被识别为禁用
         for canonical in HOLD_CATEGORY_VALUES {
-            assert!(!is_forbidden_hold_category(canonical), "canonical={canonical}");
+            assert!(
+                !is_forbidden_hold_category(canonical),
+                "canonical={canonical}"
+            );
         }
         // 任意未知字符串也不算禁用（仅在 hold_category 校验环节被矫正）
         assert!(!is_forbidden_hold_category("ai_thinking_more"));

@@ -36,6 +36,7 @@ async fn rollback_restores_archived_previous_to_active() {
         previous_version: None,
         seeded_by: Some("system".to_string()),
         locale: None,
+        source_proposal_id: None,
     };
     // 新版本行：evolution release 出来的 current。
     let new = PromptTemplate {
@@ -49,27 +50,45 @@ async fn rollback_restores_archived_previous_to_active() {
         seeded_by: Some("evolution_release".to_string()),
         ..old.clone()
     };
-    app.state.db.prompt_templates().insert_many(vec![&old, &new], None).await.unwrap();
+    app.state
+        .db
+        .prompt_templates()
+        .insert_many(vec![&old, &new], None)
+        .await
+        .unwrap();
 
     // 构造一个 released 的 prompt proposal，previous_prompt_version="1"。
-    let proposal_id = common::insert_released_prompt_proposal(&app.state, &workspace, key, "1").await;
+    let proposal_id =
+        common::insert_released_prompt_proposal(&app.state, &workspace, key, "1").await;
 
     // 执行回滚。
-    wechatagent::evolution::release::rollback_prompt(&app.state, proposal_id, "tester")
-        .await
-        .expect("rollback ok");
+    wechatagent::evolution::release::rollback_prompt(
+        &app.state,
+        proposal_id,
+        &workspace,
+        &app.state.config.default_account_id,
+        "tester",
+    )
+    .await
+    .expect("rollback ok");
 
     // version=1 行应被恢复为 current_version=true AND status=active。
     let restored = app
         .state
         .db
         .prompt_templates()
-        .find_one(doc! { "workspace_id": &workspace, "prompt_key": key, "version": 1 }, None)
+        .find_one(
+            doc! { "workspace_id": &workspace, "prompt_key": key, "version": 1 },
+            None,
+        )
         .await
         .unwrap()
         .expect("v1 row");
     assert_eq!(restored.current_version, true, "v1 应被置回 current");
-    assert_eq!(restored.status, "active", "v1 的 status 必须恢复为 active（治本点）");
+    assert_eq!(
+        restored.status, "active",
+        "v1 的 status 必须恢复为 active（治本点）"
+    );
 }
 
 /// 回归（Stage4 孤儿#3-B）：rollback 的 previous_version 历史行不存在时（如被手动
@@ -103,16 +122,28 @@ async fn rollback_aborts_when_previous_version_missing() {
         previous_version: Some(1),
         seeded_by: Some("evolution_release".to_string()),
         locale: None,
+        source_proposal_id: None,
     };
-    app.state.db.prompt_templates().insert_one(&current, None).await.unwrap();
+    app.state
+        .db
+        .prompt_templates()
+        .insert_one(&current, None)
+        .await
+        .unwrap();
 
     // released proposal，previous_prompt_version="1"（但 version 1 行不存在）。
     let proposal_id =
         common::insert_released_prompt_proposal(&app.state, &workspace, key, "1").await;
 
     // 执行回滚：应返 Err（找不到 version 1 行）。
-    let result =
-        wechatagent::evolution::release::rollback_prompt(&app.state, proposal_id, "tester").await;
+    let result = wechatagent::evolution::release::rollback_prompt(
+        &app.state,
+        proposal_id,
+        &workspace,
+        &app.state.config.default_account_id,
+        "tester",
+    )
+    .await;
     assert!(
         result.is_err(),
         "previous_version 行缺失时 rollback 必须返 Err，而非假成功"
@@ -137,7 +168,10 @@ async fn rollback_aborts_when_previous_version_missing() {
         .state
         .db
         .prompt_templates()
-        .find_one(doc! { "workspace_id": &workspace, "prompt_key": key, "version": 2 }, None)
+        .find_one(
+            doc! { "workspace_id": &workspace, "prompt_key": key, "version": 2 },
+            None,
+        )
         .await
         .unwrap()
         .expect("v2 row");

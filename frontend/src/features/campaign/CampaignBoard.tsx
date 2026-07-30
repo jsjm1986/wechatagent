@@ -30,12 +30,21 @@ export default function CampaignBoard() {
   const lastAttemptedId = useCampaignStore((s) => s.lastAttemptedId);
   const page = useCampaignStore((s) => s.page);
   const setPage = useCampaignStore((s) => s.setPage);
+  const currentReport = report?.campaignId === selectedCampaignId ? report : null;
 
   useEffect(() => {
-    if (selectedCampaignId && !report && !loading && selectedCampaignId !== lastAttemptedId) {
+    const mismatched = !!report && report.campaignId !== selectedCampaignId;
+    if (selectedCampaignId && !currentReport && !loading && (selectedCampaignId !== lastAttemptedId || mismatched)) {
       void loadReport(selectedCampaignId);
     }
-  }, [selectedCampaignId, report, loading, lastAttemptedId, loadReport]);
+  }, [selectedCampaignId, report, currentReport, loading, lastAttemptedId, loadReport]);
+
+  useEffect(() => {
+    setFilter("all");
+    // openReport already resets the store page. Keep this effect scoped to the
+    // selected identity so a changing function reference cannot reset a bucket
+    // immediately after the operator clicks it.
+  }, [selectedCampaignId]);
 
   if (!selectedCampaignId) {
     return (
@@ -49,8 +58,8 @@ export default function CampaignBoard() {
     );
   }
 
-  const summary = report?.summary;
-  const items: CampaignSendItem[] = report?.items ?? [];
+  const summary = currentReport?.summary;
+  const items: CampaignSendItem[] = currentReport?.items ?? [];
   const shown = filter === "all" ? items : items.filter((it) => it.status === filter);
   const pageCount = Math.max(1, Math.ceil(shown.length / PAGE_SIZE));
   const safePage = Math.min(page, pageCount - 1);
@@ -67,9 +76,9 @@ export default function CampaignBoard() {
         <div className={styles.head}>
           <div className={styles.headL}>
             <span className={styles.eyebrow}>Campaign Result</span>
-            <span className={styles.title}>{report ? report.title : "—"}</span>
+            <span className={styles.title}>{currentReport ? currentReport.title : "—"}</span>
           </div>
-          {report && <StatusBadge tone="scheduled">{campaignStatusLabel(report.status)}</StatusBadge>}
+          {currentReport && <StatusBadge tone="scheduled">{campaignStatusLabel(currentReport.status)}</StatusBadge>}
         </div>
         <div className={styles.metrics}>
           {BUCKETS.map((b) => (

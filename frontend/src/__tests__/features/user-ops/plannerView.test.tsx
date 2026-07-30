@@ -12,6 +12,9 @@ const baseContact = {
   wxid: "wx1",
   domainAttributes: { customer_stage: "first_contact", intent_level: "high" },
   domainAttributesUpdatedAt: "2026-06-26T00:00:00Z",
+  stagnationDimension: "customer_stage",
+  stagnationValue: "first_contact",
+  stagnationUpdatedAt: "2026-06-01T00:00:00Z",
   commitments: [],
 } as unknown as Contact;
 
@@ -80,5 +83,46 @@ describe("PlannerViewSection 多维度看板(A4)", () => {
     const c = { ...baseContact, lastConversationMode: "consultative" } as any;
     render(<PlannerViewSection contact={c} />);
     expect(screen.getByText("顾问咨询")).toBeInTheDocument();
+  });
+
+  it("阶段时间只读专用停滞时间，不使用容器更新时间", () => {
+    setStore(
+      [{ kind: "customer_stage", displayName: "客户阶段", participatesInDecision: true }],
+      { customer_stage: [{ id: "first_contact", label: "首次接触" }] },
+    );
+    render(<PlannerViewSection contact={baseContact} />);
+    const row = screen.getByTestId("planner-stage-row");
+    expect(row.textContent).toContain("2026-06-01");
+    expect(row.textContent).not.toContain("2026-06-26");
+  });
+
+  it("自定义停滞维度显示同源值和时间", () => {
+    setStore(
+      [{ kind: "relationship_closeness", displayName: "关系亲密度", participatesInDecision: true }],
+      { relationship_closeness: [{ id: "close", label: "亲密" }] },
+    );
+    const contact = {
+      ...baseContact,
+      stagnationDimension: "relationship_closeness",
+      stagnationValue: "close",
+      stagnationUpdatedAt: "2026-05-02T00:00:00Z",
+    } as Contact;
+    render(<PlannerViewSection contact={contact} />);
+    const row = screen.getByTestId("planner-stage-row");
+    expect(row.textContent).toContain("关系亲密度");
+    expect(row.textContent).toContain("亲密");
+    expect(row.textContent).toContain("2026-05-02");
+  });
+
+  it("停滞时间缺失时明确显示未知，不借用容器时间", () => {
+    setStore(
+      [{ kind: "customer_stage", displayName: "客户阶段", participatesInDecision: true }],
+      { customer_stage: [{ id: "first_contact", label: "首次接触" }] },
+    );
+    const contact = { ...baseContact, stagnationUpdatedAt: null } as Contact;
+    render(<PlannerViewSection contact={contact} />);
+    const row = screen.getByTestId("planner-stage-row");
+    expect(row.textContent).toContain("时间未知");
+    expect(row.textContent).not.toContain("06/26");
   });
 });

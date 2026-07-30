@@ -15,7 +15,9 @@
 use mongodb::bson::{doc, DateTime};
 use mongodb::options::UpdateOptions;
 
-use crate::agent::entitlements::{VALUE_TIER_HIGH, VALUE_TIER_KIND, VALUE_TIER_LOW, VALUE_TIER_MID};
+use crate::agent::entitlements::{
+    VALUE_TIER_HIGH, VALUE_TIER_KIND, VALUE_TIER_LOW, VALUE_TIER_MID,
+};
 use crate::db::Database;
 use crate::error::AppResult;
 use crate::models::{TaxonomyEntry, TaxonomyValue};

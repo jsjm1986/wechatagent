@@ -31,7 +31,7 @@ beforeEach(() => {
   useUserOpsStore.setState({ clearReferral: vi.fn() } as any);
 });
 
-function renderView() {
+function renderView(overrides: Partial<CockpitPanelProps> = {}) {
   const props = {
     busy: false,
     guideBusy: false,
@@ -73,6 +73,7 @@ function renderView() {
     onSaveOperatingMemory: vi.fn(),
     onSelectedPlaybook: vi.fn(),
     onSimulationInput: vi.fn(),
+    ...overrides,
   } as unknown as CockpitPanelProps;
   render(<ConfigureView {...props} />);
 }
@@ -127,5 +128,87 @@ describe("ConfigureView 4-tab", () => {
     fireEvent.click(screen.getByRole("tab", { name: "工具" }));
     expect(screen.getByText("影子验证")).toBeInTheDocument();
     expect(screen.getByText("Agent 已确认和待整理的信息")).toBeInTheDocument();
+  });
+
+  it("managed contact has an explicit action to persist the selected operating style", () => {
+    const onSaveRelationshipType = vi.fn();
+    renderView({
+      playbooks: [{ id: "pb-1", accountId: "A1", name: "Consultant", methodPrompt: "method", createdBy: "manual", releaseStatus: "published", isDefault: false, version: 3 }],
+      selectedPlaybookId: "pb-1",
+      onSaveRelationshipType,
+    } as Partial<CockpitPanelProps>);
+
+    fireEvent.click(screen.getByRole("button", { name: "保存运营风格" }));
+    expect(onSaveRelationshipType).toHaveBeenCalledTimes(1);
+  });
+
+  it("renders only the authoritative diff and ignores model suggested changes", () => {
+    renderView({
+      guidePreview: {
+        id: "preview-1",
+        accountId: "A1",
+        contactId: "c1",
+        contactWxid: "wx1",
+        instruction: "guide",
+        mode: "smart",
+        status: "pending",
+        summary: "model summary",
+        impactScope: "current_contact",
+        scopeReason: "Only this contact.",
+        readableChanges: ["MODEL READABLE CHANGE"],
+        healthScores: {},
+        suggestedChanges: { humanProfileNote: "MODEL SUGGESTED VALUE" },
+        riskWarnings: [],
+        candidateHash: "candidate-hash",
+        authoritativeChanges: [{
+          target: "contact",
+          field: "human_profile_note",
+          label: "human_profile_note",
+          before: "old note",
+          after: "authoritative note",
+        }],
+        requiresStrongConfirmation: false,
+        playbookAffectedContacts: 0,
+      },
+    } as Partial<CockpitPanelProps>);
+
+    fireEvent.click(screen.getByRole("tab", { name: "指令" }));
+    expect(screen.getByText("old note → authoritative note")).toBeInTheDocument();
+    expect(screen.queryByText("MODEL SUGGESTED VALUE")).toBeNull();
+    expect(screen.queryByText("MODEL READABLE CHANGE")).toBeNull();
+  });
+
+  it("does not apply shared impact when strong confirmation is cancelled", () => {
+    const onApplyGuidePreview = vi.fn();
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    renderView({
+      onApplyGuidePreview,
+      guidePreview: {
+        id: "preview-shared",
+        accountId: "A1",
+        contactId: "c1",
+        contactWxid: "wx1",
+        instruction: "guide",
+        mode: "smart",
+        status: "pending",
+        summary: "shared change",
+        impactScope: "shared_playbook",
+        scopeReason: "Changes a shared playbook.",
+        readableChanges: [],
+        healthScores: {},
+        suggestedChanges: {},
+        riskWarnings: [],
+        candidateHash: "candidate-hash",
+        authoritativeChanges: [],
+        requiresStrongConfirmation: true,
+        playbookAffectedContacts: 12,
+      },
+    } as Partial<CockpitPanelProps>);
+
+    fireEvent.click(screen.getByRole("tab", { name: "指令" }));
+    fireEvent.click(screen.getByRole("button", { name: "确认应用" }));
+    expect(confirm).toHaveBeenCalledTimes(1);
+    expect(onApplyGuidePreview).not.toHaveBeenCalled();
+    confirm.mockRestore();
   });
 });

@@ -14,25 +14,26 @@ use crate::error::AppResult;
 use crate::models::{Contact, ConversationMessage, MessageDirection, OperationDomainConfig};
 use crate::routes::AppState;
 
-use super::budget::{RunBudget, RUN_BUDGET};
+use super::budget::{RunBudget, RunBudgetSnapshot, RUN_BUDGET};
 use super::decision::{
-    decide_reply, load_operation_playbook_for_contact, load_user_operation_domain_config_for_contact,
+    decide_reply_with_promote, load_operation_playbook_for_contact,
+    load_user_operation_domain_config_for_contact,
 };
 use super::gateway::{
     load_context_messages, load_pending_tasks, precheck_send_gateway, simulation_gateway_document,
 };
-use super::guards::{
-    normalize_decision_runtime, normalize_decision_state, planner_from_decision,
-};
+use super::guards::{normalize_decision_runtime, normalize_decision_state, planner_from_decision};
 use super::knowledge_router::{
-    empty_knowledge_route, load_operation_knowledge,
-    route_operation_knowledge, route_used_knowledge_ids, select_operation_knowledge_chunks,
+    empty_knowledge_route, load_operation_knowledge, route_operation_knowledge_read_only,
+    route_used_knowledge_ids, select_operation_knowledge_chunks,
 };
 use super::memory::{
-    effective_memory_card_for_contact, load_or_create_operating_memory, next_memory_card_version,
+    effective_memory_card_for_contact, load_operating_memory_read_only, next_memory_card_version,
 };
-use super::review::{effective_review_mode, local_decision_review, review_decision, review_passed};
+use super::review::{effective_review_mode, local_decision_review, review_decision};
 use super::runtime::UserRuntimeParameters;
+use super::shadow_finalize::finalize_shadow_decision;
+use super::sufficiency::PromptTier;
 use super::types::{AgentTrigger, RunPlannerResult, UserOperationSimulationTurn};
 
 pub async fn simulate_user_dialogue(
@@ -40,6 +41,26 @@ pub async fn simulate_user_dialogue(
     contact: Contact,
     messages: Vec<String>,
 ) -> AppResult<Vec<UserOperationSimulationTurn>> {
+    simulate_user_dialogue_with_budget(state, contact, messages)
+        .await?
+        .turns
+}
+
+/// One isolated simulation result together with the task-local budget that
+/// produced it. Keeping the `AppResult` inside the outcome is deliberate:
+/// failed simulations may already have consumed LLM calls, and callers such
+/// as formula evaluation must account for that usage before handling the
+/// business error.
+pub(crate) struct SimulationRunOutcome {
+    pub(crate) turns: AppResult<Vec<UserOperationSimulationTurn>>,
+    pub(crate) budget: RunBudgetSnapshot,
+}
+
+pub(crate) async fn simulate_user_dialogue_with_budget(
+    state: &AppState,
+    contact: Contact,
+    messages: Vec<String>,
+) -> AppResult<SimulationRunOutcome> {
     let domain_config =
         load_user_operation_domain_config_for_contact(state, &contact.workspace_id, &contact.wxid)
             .await?;
@@ -49,14 +70,20 @@ pub async fn simulate_user_dialogue(
     crate::agent::runtime::resolve_thresholds(state, &contact)
         .await?
         .apply_to_runtime(&mut runtime);
+    let active_profile =
+        super::domain_profile::load_active_domain_profile(&state.db, &contact.workspace_id).await?;
+    runtime.apply_active_profile(&active_profile);
     let run_id = uuid::Uuid::new_v4().to_string();
-    let budget = Arc::new(RunBudget::new(
-        run_id.clone(),
-        runtime.simulation_token_budget,
-        runtime.run_max_llm_calls,
-        runtime.knowledge_max_tool_calls,
-    ));
-    RUN_BUDGET
+    let budget = Arc::new(
+        RunBudget::new(
+            run_id.clone(),
+            runtime.simulation_token_budget,
+            runtime.run_max_llm_calls,
+            runtime.knowledge_max_tool_calls,
+        )
+        .with_run_mode("shadow"),
+    );
+    let turns = RUN_BUDGET
         .scope(
             budget.clone(),
             simulate_user_dialogue_inner(
@@ -66,10 +93,12 @@ pub async fn simulate_user_dialogue(
                 domain_config,
                 runtime,
                 run_id,
-                budget,
+                budget.clone(),
             ),
         )
-        .await
+        .await;
+    let budget = budget.snapshot();
+    Ok(SimulationRunOutcome { turns, budget })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -83,7 +112,7 @@ async fn simulate_user_dialogue_inner(
     budget: Arc<RunBudget>,
 ) -> AppResult<Vec<UserOperationSimulationTurn>> {
     let playbook = load_operation_playbook_for_contact(state, &contact).await?;
-    let memory = load_or_create_operating_memory(state, &contact).await?;
+    let memory = load_operating_memory_read_only(state, &contact).await?;
     let operation_knowledge = load_operation_knowledge(state, &contact).await?;
     let pending_tasks = load_pending_tasks(state, &contact).await?;
     let mut history = load_context_messages(state, &contact, &runtime).await?;
@@ -137,7 +166,7 @@ async fn simulate_user_dialogue_inner(
             route.reason = "模拟预算超额：跳过知识路由，沿用空知识做保守决策".to_string();
             route
         } else {
-            route_operation_knowledge(
+            route_operation_knowledge_read_only(
                 state,
                 &contact,
                 &inbound,
@@ -151,7 +180,7 @@ async fn simulate_user_dialogue_inner(
         };
         let selected_chunks =
             select_operation_knowledge_chunks(&operation_knowledge.chunks, &knowledge_route);
-        let mut decision = decide_reply(
+        let (mut decision, promote_risks) = decide_reply_with_promote(
             state,
             &contact,
             &inbound,
@@ -167,6 +196,7 @@ async fn simulate_user_dialogue_inner(
             None,
             Some(&run_id),
             None,
+            PromptTier::Full,
         )
         .await?;
         normalize_decision_state(&mut decision, domain_config.as_ref());
@@ -205,16 +235,28 @@ async fn simulate_user_dialogue_inner(
             )
             .await?
         };
+        let finalized = finalize_shadow_decision(
+            state,
+            &contact,
+            &inbound,
+            decision,
+            review,
+            &runtime,
+            &selected_chunks,
+            promote_risks,
+            &run_id,
+        )
+        .await?;
+        let decision = finalized.decision;
+        let review = finalized.review;
         let status = if !gateway.allowed {
-            "gateway_blocked"
-        } else if decision.should_reply && !review_passed(&review, &runtime) {
-            "review_blocked"
-        } else if decision.should_reply {
-            "would_send"
+            "gateway_blocked".to_string()
+        } else if finalized.final_status == "approved" {
+            "would_send".to_string()
         } else {
-            "no_reply"
-        }
-        .to_string();
+            finalized.final_status
+        };
+        let would_send = status == "would_send";
         let current_state = contact
             .operation_state
             .clone()
@@ -243,7 +285,7 @@ async fn simulate_user_dialogue_inner(
             },
         });
         history.push(inbound);
-        if decision.should_reply && review_passed(&review, &runtime) {
+        if would_send {
             history.push(ConversationMessage {
                 id: None,
                 workspace_id: contact.workspace_id.clone(),

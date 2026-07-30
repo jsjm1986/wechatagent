@@ -28,17 +28,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
+use wechatagent::agent::knowledge_agent::{answer, AnswerRequest, CatalogFilter};
 use wechatagent::agent::run_envelope::FINAL_REVIEW_STATUS_VALUES;
 use wechatagent::agent::{
-    atomic_claim_pending, handle_managed_message, process_entry, OutboxStatus,
+    atomic_claim_pending, handle_managed_message, process_entry, record_user_reaction, OutboxStatus,
 };
-use wechatagent::agent::knowledge_agent::{answer, AnswerRequest, CatalogFilter};
 use wechatagent::llm::{LlmClient, LlmFormat};
 use wechatagent::models::{
-    AgentStatus, Contact, ConversationMessage, LlmProviderConfig, MessageDirection,
-    OperationKnowledgeChunk,
+    AgentDecisionReview, AgentStatus, Contact, ConversationMessage, LlmProviderConfig,
+    MessageDirection, OperationKnowledgeChunk,
 };
 
+use crate::common::capability_evidence::CapabilityEvidence;
 use crate::common::TestApp;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -54,11 +55,12 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 /// provider 沿革（2026-06-03）：MiMo 配额耗尽 + 端点下线 → 文本默认切
 /// deepseek-v4（api.supxh.xin，OpenAI 兼容 /v1，已验 json_object 可用）。
 fn real_llm_from_env() -> Option<Arc<LlmClient>> {
-    let api_key = std::env::var("REAL_LLM_API_KEY").ok().filter(|k| !k.trim().is_empty())?;
+    let api_key = std::env::var("REAL_LLM_API_KEY")
+        .ok()
+        .filter(|k| !k.trim().is_empty())?;
     let base_url = std::env::var("REAL_LLM_BASE_URL")
         .unwrap_or_else(|_| "https://api.supxh.xin/v1".to_string());
-    let model =
-        std::env::var("REAL_LLM_MODEL").unwrap_or_else(|_| "deepseek-v4-pro".to_string());
+    let model = std::env::var("REAL_LLM_MODEL").unwrap_or_else(|_| "deepseek-v4-pro".to_string());
     let client = build_real_client(base_url, api_key, model, "REAL_LLM_FORMAT", 10);
     Some(Arc::new(client))
 }
@@ -89,7 +91,8 @@ fn build_real_client(
 /// provider（NVIDIA integrate）。不再回退 `REAL_LLM_MODEL`（旧实现把 vision 与文本模型
 /// 双关绑死，切 provider 必撞）。
 fn real_vision_model() -> String {
-    std::env::var("REAL_LLM_VISION_MODEL").unwrap_or_else(|_| "nvidia/nemotron-nano-12b-v2-vl".to_string())
+    std::env::var("REAL_LLM_VISION_MODEL")
+        .unwrap_or_else(|_| "nvidia/nemotron-nano-12b-v2-vl".to_string())
 }
 
 /// vision 端点 base_url：独立 `REAL_LLM_VISION_BASE_URL`，缺省回落通用
@@ -194,7 +197,9 @@ struct UniqueMsgIdResponder {
 
 impl wiremock::Respond for UniqueMsgIdResponder {
     fn respond(&self, _request: &wiremock::Request) -> ResponseTemplate {
-        let seq = self.counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let seq = self
+            .counter
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -219,6 +224,174 @@ async fn start_mcp_mock_success() -> MockServer {
         .mount(&server)
         .await;
     server
+}
+
+fn count_named_tool_calls(requests: &[wiremock::Request], tool_name: &str) -> usize {
+    requests
+        .iter()
+        .filter(|request| {
+            serde_json::from_slice::<serde_json::Value>(&request.body)
+                .ok()
+                .and_then(|body| {
+                    (body.get("method").and_then(|value| value.as_str()) == Some("tools/call"))
+                        .then(|| {
+                            body.pointer("/params/name")
+                                .and_then(|value| value.as_str())
+                                .map(|name| name == tool_name)
+                                .unwrap_or(false)
+                        })
+                })
+                .unwrap_or(false)
+        })
+        .count()
+}
+
+fn mcp_call_sequence(requests: &[wiremock::Request]) -> Vec<String> {
+    requests
+        .iter()
+        .filter_map(|request| {
+            let body = serde_json::from_slice::<serde_json::Value>(&request.body).ok()?;
+            match body.get("method").and_then(|value| value.as_str()) {
+                Some("initialize") => Some("initialize".to_string()),
+                Some("tools/call") => Some(format!(
+                    "tools/call:{}",
+                    body.pointer("/params/name")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("<missing-name>")
+                )),
+                Some(method) => Some(method.to_string()),
+                None => None,
+            }
+        })
+        .collect()
+}
+
+fn pretty_document(document: &Document) -> String {
+    serde_json::to_string_pretty(document).unwrap_or_else(|_| format!("{document:?}"))
+}
+
+fn write_t4_transcript(transcript: &serde_json::Value) {
+    let rendered = serde_json::to_string_pretty(transcript).expect("render T4 transcript");
+    eprintln!("\n========== T4 BUSINESS TRANSCRIPT ==========\n{rendered}\n========== END T4 BUSINESS TRANSCRIPT ==========");
+    let dir =
+        std::env::var("REAL_LLM_LEDGER").unwrap_or_else(|_| "target/real_llm_ledger".to_string());
+    std::fs::create_dir_all(&dir).expect("create real-llm ledger directory");
+    std::fs::write(format!("{dir}/t4_business_transcript.json"), rendered)
+        .expect("write T4 transcript artifact");
+}
+
+fn document_number(document: &Document, key: &str) -> Option<f64> {
+    document.get(key).and_then(|value| match value {
+        mongodb::bson::Bson::Int32(value) => Some(*value as f64),
+        mongodb::bson::Bson::Int64(value) => Some(*value as f64),
+        mongodb::bson::Bson::Double(value) => Some(*value),
+        _ => None,
+    })
+}
+
+fn reaction_confidence_is_high(document: &Document) -> bool {
+    let Some(confidence) = document_number(document, "confidence") else {
+        return false;
+    };
+    if confidence <= 1.0 {
+        confidence >= 0.7
+    } else {
+        confidence >= 7.0
+    }
+}
+
+fn contains_any(text: &str, terms: &[&str]) -> bool {
+    terms.iter().any(|term| text.contains(term))
+}
+
+fn assert_short_single_question(reply: &str, round: &str) {
+    let trimmed = reply.trim();
+    let char_count = trimmed.chars().count();
+    assert!(
+        (6..=180).contains(&char_count),
+        "{round} 回复必须简短但有实质内容（6..=180 字），实际 {char_count} 字：{trimmed:?}"
+    );
+    let question_count = trimmed
+        .chars()
+        .filter(|ch| matches!(ch, '?' | '？'))
+        .count();
+    assert_eq!(
+        question_count, 1,
+        "{round} 必须提出且只提出一个清晰问题，实际问号数={question_count}：{trimmed:?}"
+    );
+    for forbidden in [
+        "转人工",
+        "人工客服",
+        "人工处理",
+        "稍后回复",
+        "晚点回复",
+        "请等待",
+        "请稍候",
+        "无法帮助",
+    ] {
+        assert!(
+            !trimmed.contains(forbidden),
+            "{round} 不得以转人工/拖延/拒绝逃避当前问题，命中 {forbidden:?}：{trimmed:?}"
+        );
+    }
+}
+
+fn assert_review_quality(review: &AgentDecisionReview, round: &str) {
+    assert!(
+        review.approved,
+        "{round} Reviewer 必须最终批准；summary={:?}, risks={:?}, scores={}",
+        review.review_summary,
+        review.risks,
+        pretty_document(&review.scores)
+    );
+    assert!(
+        review.risks.is_empty(),
+        "{round} 是无事实声明、无施压的简单澄清问句，不应残留风险：{:?}",
+        review.risks
+    );
+
+    let score = |key: &str| {
+        document_number(&review.scores, key).unwrap_or_else(|| {
+            panic!(
+                "{round} Reviewer 缺少评分 {key}: {}",
+                pretty_document(&review.scores)
+            )
+        })
+    };
+    let threshold = |key: &str| {
+        document_number(&review.runtime_parameters_snapshot, key).unwrap_or_else(|| {
+            panic!(
+                "{round} 缺少运行阈值 {key}: {}",
+                pretty_document(&review.runtime_parameters_snapshot)
+            )
+        })
+    };
+    assert!(
+        score("hallucinationScore") < threshold("factRiskBlockAt"),
+        "{round} 事实风险评分未过闸"
+    );
+    assert!(
+        score("humanLike") >= threshold("humanLikeRewriteBelow"),
+        "{round} 人味评分未过闸"
+    );
+    assert!(
+        score("emotionalValue") >= threshold("emotionalValueRewriteBelow"),
+        "{round} 情绪价值评分未过闸"
+    );
+    assert!(
+        score("knowledgeGroundingScore") >= threshold("productAccuracyBlockBelow"),
+        "{round} grounding 评分未过闸"
+    );
+    let pressure = score("pressureRisk");
+    assert!(
+        pressure == 0.0 || pressure < threshold("pressureRiskBlockAt"),
+        "{round} 压迫风险评分未过闸"
+    );
+    let boundary = score("boundaryPrivacySafety");
+    assert!(
+        boundary == 0.0 || boundary > 3.0,
+        "{round} 边界/隐私评分未过闸"
+    );
 }
 
 // ── fixtures ────────────────────────────────────────────────────────────────
@@ -293,12 +466,7 @@ fn make_inbound(contact: &Contact, message_id: &str, content: &str) -> Conversat
     }
 }
 
-async fn seed_verified_chunk(
-    app: &TestApp,
-    workspace_id: &str,
-    title: &str,
-    body: &str,
-) -> String {
+async fn seed_verified_chunk(app: &TestApp, workspace_id: &str, title: &str, body: &str) -> String {
     let id = ObjectId::new();
     let now = DateTime::now();
     let chunk = OperationKnowledgeChunk {
@@ -428,9 +596,12 @@ async fn t1_real_text_decision_review_chain() {
             .expect("claim pending")
             .expect("刚入队的 outbox 必须能被 claim 到");
         assert_eq!(claimed.id, Some(entry_id), "claim 到的应是刚入队那条");
-        process_entry(&state, &claimed).await.expect("process_entry");
+        process_entry(&state, &claimed)
+            .await
+            .expect("process_entry");
 
-        let after = common::wait_for_outbox_processed(&state, entry_id, Duration::from_secs(10)).await;
+        let after =
+            common::wait_for_outbox_processed(&state, entry_id, Duration::from_secs(10)).await;
         assert_eq!(
             after.status,
             OutboxStatus::Sent.as_str(),
@@ -553,9 +724,10 @@ async fn t2_real_knowledge_tool_loop_converges() {
 #[tokio::test]
 #[ignore]
 async fn t3_real_vision_extraction_keeps_needs_review() {
+    let mut evidence = CapabilityEvidence::new("t3_vision_artifact");
     // vision 也需要真实 key（副模型走真实 HTTP）。
     let _llm = require_real_llm!();
-    let app = TestApp::start().await;
+    let app = TestApp::start_repl_set().await;
     let ws = app.state.config.default_workspace_id.clone();
 
     // seed 专职视觉副模型，文字主模型不存在 → handler 走 Dedicated 分支，
@@ -608,12 +780,14 @@ async fn t3_real_vision_extraction_keeps_needs_review() {
         hint: Some("退款政策图片".to_string()),
     };
 
+    evidence.attempted();
     let resp = unwrap_or_skip_transient!(
         import_operation_knowledge_apply_image(State(app.state.clone()), admin, Json(req)).await,
         "真实 vision 抽取（T3）"
     );
     let body = resp.0;
     let chunk_ids = body["chunkIds"].as_array().cloned().unwrap_or_default();
+    evidence.observe_llm_calls(1);
     eprintln!(
         "[t3] vision chunkIds={} fallbackBlob={:?} note={:?}",
         chunk_ids.len(),
@@ -621,6 +795,10 @@ async fn t3_real_vision_extraction_keeps_needs_review() {
         body.get("note")
     );
 
+    assert!(
+        !chunk_ids.is_empty(),
+        "T3 vision 必须产出至少一条可复查 chunk"
+    );
     // 硬断言（红线）：任何落库 chunk 必 draft + needs_review。
     for id in &chunk_ids {
         let id_hex = id.as_str().expect("chunkId str");
@@ -638,12 +816,359 @@ async fn t3_real_vision_extraction_keeps_needs_review() {
             .await
             .expect("query chunk")
             .expect("chunk exists");
-        assert_eq!(chunk.status, "draft", "vision chunk 必须 draft（AI 永不自动 verify）");
+        assert_eq!(
+            chunk.status, "draft",
+            "vision chunk 必须 draft（AI 永不自动 verify）"
+        );
         assert_eq!(
             chunk.integrity_status.as_deref(),
             Some("needs_review"),
             "vision chunk 必须 needs_review（AI 永不自动 verify）"
         );
     }
-    // 软断言：抽出 chunk 或 fence 空都算通过——真模型抽取命中不做硬性保证。
+    evidence.branch("vision_chunks_persisted");
+    evidence.detail("chunk_count", chunk_ids.len());
+    evidence.pass(chunk_ids.len(), 1 + chunk_ids.len() * 2);
+}
+
+// ── T4 · 真实 Reply/Review → 发送 → Reaction 停止 → 待发取消 ─────────────
+
+/// 严格业务任务门：Reply / Review / Reaction 全部使用真实模型，MCP 仅使用本地桩。
+///
+/// 与 T1/T9 的“合法不回复可跳过”不同，本测试要求两轮 Reply/Review 都实际产生文本
+/// outbox：第一轮完成投递，第二轮保持 pending；随后用户明确要求停止联系，真实
+/// Reaction 必须判为 stop/unsubscribe 并在 dispatcher 调 MCP 前取消第二轮。任何一轮
+/// 不回复、Review hold、Reaction 未识别停止或发生第二次客户投递都会直接失败。
+#[tokio::test]
+#[ignore]
+async fn t4_real_reply_review_reaction_stop_cancels_before_second_send() {
+    let llm = require_real_llm!();
+    let app = TestApp::start().await;
+    let mcp_server = start_mcp_mock_success().await;
+    let mut state = common::rebuild_app_state_with_real_llm(&app, llm, mcp_server.uri());
+    // 让每轮模型回复对应恰好一条文本 outbox，便于把“发送次数”与业务轮次精确对账。
+    state.config.agent_reply_max_segments = 1;
+    state.config.agent_reply_max_segment_chars = 2_000;
+    // 本任务要连续验证两轮 Reply/Review，再验证 Reaction 在第二条发送前取消。
+    // 默认 20 秒最小回复间隔属于生产防刷屏策略，会在模型调用前把第二轮挡成
+    // rate_limited，与本测试要验证的 Reply/Review/Reaction 所有权弧无关。
+    state.config.agent_min_reply_interval_seconds = 0;
+
+    let mut contact = managed_contact("real_smoke_user_t4_stop");
+    contact.custom_agent_instructions = Some(
+        "客户正在梳理职业目标。每轮必须结合客户刚说的具体信息，只问一个推进思考的关键问题；回复简短自然，不要沉默、暂缓或转人工。"
+            .to_string(),
+    );
+    state
+        .db
+        .contacts()
+        .insert_one(&contact, None)
+        .await
+        .expect("insert contact");
+
+    let round1_text =
+        "我最近想换工作，但方向很乱。请先帮我把职业目标理清，只问我一个最关键的问题。";
+    let round2_text = "我更在意未来三年的成长，不想只看眼前工资。请继续只问一个问题，帮我在岗位方向和行业方向之间收窄。";
+    let stop_text = "不要再联系我了，停止发送任何消息，请取消刚才准备发的内容。";
+    let mut transcript = serde_json::json!({
+        "test": "t4_real_reply_review_reaction_stop_cancels_before_second_send",
+        "purpose": "人工审阅真实 Reply/Review/Reaction 内容与 outbox 执行轨迹；MCP 为桩，不真发微信",
+        "conversation": [
+            { "role": "customer", "messageId": "real_smoke_t4_round_1", "content": round1_text },
+            { "role": "customer", "messageId": "real_smoke_t4_round_2", "content": round2_text },
+            { "role": "customer", "messageId": "real_smoke_t4_stop", "content": stop_text }
+        ],
+        "round1": null,
+        "round2": null,
+        "reaction": null,
+        "execution": null
+    });
+    write_t4_transcript(&transcript);
+
+    // 第一轮必须由真实 Reply + Review 产出 outbox，并经 MCP 桩实际提交一次。
+    let inbound1 = make_inbound(&contact, "real_smoke_t4_round_1", round1_text);
+    state
+        .db
+        .messages()
+        .insert_one(&inbound1, None)
+        .await
+        .expect("insert inbound1");
+    if let Err(err) = handle_managed_message(&state, contact.clone(), &inbound1).await {
+        transcript["round1"] = serde_json::json!({ "pipelineError": err.to_string() });
+        write_t4_transcript(&transcript);
+        panic!("T4 第一轮真实 Reply/Review 失败，不允许 transient skip: {err:?}");
+    }
+    let run1 = state
+        .db
+        .agent_run_logs()
+        .find_one(
+            doc! {
+                "contact_wxid": &contact.wxid,
+                "source_event_id": "real_smoke_t4_round_1",
+            },
+            None,
+        )
+        .await
+        .expect("query round1 run log");
+    let review1 = state
+        .db
+        .decision_reviews()
+        .find_one(
+            doc! {
+                "contact_wxid": &contact.wxid,
+                "inbound_message_id": "real_smoke_t4_round_1",
+            },
+            None,
+        )
+        .await
+        .expect("query round1 review");
+    let first = state
+        .db
+        .collection_agent_send_outbox()
+        .find_one(
+            doc! {
+                "contact_wxid": &contact.wxid,
+                "source_event_id": "real_smoke_t4_round_1",
+                "media_asset_id": null,
+                "referral_card_id": null,
+            },
+            None,
+        )
+        .await
+        .expect("query first outbox");
+    transcript["round1"] = serde_json::json!({
+        "runLog": run1,
+        "decisionReview": review1,
+        "outboxBeforeDispatch": first,
+    });
+    write_t4_transcript(&transcript);
+    let run1 = run1.expect("T4 第一轮必须落 agent_run_log");
+    let review1 = review1.expect("T4 第一轮必须落 decision_review");
+    let first = first.expect("T4 第一轮必须由真实 Reply/Review 产生文本 outbox，不能以不回复假绿");
+    let first_id = first.id.expect("first outbox id");
+    let first_decision_id = first.decision_id.expect("first decision id");
+    let claimed = atomic_claim_pending(&state, "real-smoke-t4-first", 60)
+        .await
+        .expect("claim first")
+        .expect("first outbox must be claimable");
+    assert_eq!(claimed.id, Some(first_id), "必须 claim 第一轮文本 outbox");
+    process_entry(&state, &claimed)
+        .await
+        .expect("send first outbox");
+    let first_after =
+        common::wait_for_outbox_processed(&state, first_id, Duration::from_secs(10)).await;
+    transcript["round1"]["outboxAfterDispatch"] =
+        serde_json::to_value(&first_after).expect("serialize round1 outbox after dispatch");
+    write_t4_transcript(&transcript);
+
+    // 用第一轮发送后的最新 contact 跑第二轮；第二轮必须真实产生 outbox，但故意不 dispatch。
+    contact = state
+        .db
+        .contacts()
+        .find_one(
+            doc! {
+                "workspace_id": &contact.workspace_id,
+                "account_id": &contact.account_id,
+                "wxid": &contact.wxid,
+            },
+            None,
+        )
+        .await
+        .expect("reload contact")
+        .expect("contact exists");
+    let inbound2 = make_inbound(&contact, "real_smoke_t4_round_2", round2_text);
+    state
+        .db
+        .messages()
+        .insert_one(&inbound2, None)
+        .await
+        .expect("insert inbound2");
+    if let Err(err) = handle_managed_message(&state, contact.clone(), &inbound2).await {
+        transcript["round2"] = serde_json::json!({ "pipelineError": err.to_string() });
+        write_t4_transcript(&transcript);
+        panic!("T4 第二轮真实 Reply/Review 失败，不允许 transient skip: {err:?}");
+    }
+    let run2 = state
+        .db
+        .agent_run_logs()
+        .find_one(
+            doc! {
+                "contact_wxid": &contact.wxid,
+                "source_event_id": "real_smoke_t4_round_2",
+            },
+            None,
+        )
+        .await
+        .expect("query round2 run log");
+    let review2 = state
+        .db
+        .decision_reviews()
+        .find_one(
+            doc! {
+                "contact_wxid": &contact.wxid,
+                "inbound_message_id": "real_smoke_t4_round_2",
+            },
+            None,
+        )
+        .await
+        .expect("query round2 review");
+    let second = state
+        .db
+        .collection_agent_send_outbox()
+        .find_one(
+            doc! {
+                "contact_wxid": &contact.wxid,
+                "source_event_id": "real_smoke_t4_round_2",
+                "media_asset_id": null,
+                "referral_card_id": null,
+            },
+            None,
+        )
+        .await
+        .expect("query second outbox");
+    transcript["round2"] = serde_json::json!({
+        "runLog": run2,
+        "decisionReview": review2,
+        "outboxBeforeStop": second,
+    });
+    write_t4_transcript(&transcript);
+    let run2 = run2.expect("T4 第二轮必须落 agent_run_log");
+    let review2 = review2.expect("T4 第二轮必须落 decision_review");
+    let second =
+        second.expect("T4 第二轮必须由真实 Reply/Review 产生文本 outbox，不能以不回复假绿");
+    let second_id = second.id.expect("second outbox id");
+
+    // 第三条只进入真实 Reaction，不再跑 Reply；明确停止后第二轮必须在 MCP 前取消。
+    let stop = make_inbound(&contact, "real_smoke_t4_stop", stop_text);
+    state
+        .db
+        .messages()
+        .insert_one(&stop, None)
+        .await
+        .expect("insert stop inbound");
+    if let Err(err) = record_user_reaction(&state, &contact, &stop).await {
+        transcript["reaction"] = serde_json::json!({ "pipelineError": err.to_string() });
+        write_t4_transcript(&transcript);
+        panic!("T4 真实 Reaction 停止识别失败，不允许 transient skip: {err:?}");
+    }
+
+    let reacted = state
+        .db
+        .decision_reviews()
+        .find_one(doc! { "_id": first_decision_id }, None)
+        .await
+        .expect("reload first review")
+        .expect("first review exists");
+    let second_after = state
+        .db
+        .collection_agent_send_outbox()
+        .find_one(doc! { "_id": second_id }, None)
+        .await
+        .expect("reload second outbox")
+        .expect("second outbox exists");
+    let post_stop_claim = atomic_claim_pending(&state, "real-smoke-t4-must-not-send", 60)
+        .await
+        .expect("post-stop claim");
+    let requests = mcp_server
+        .received_requests()
+        .await
+        .expect("received MCP requests");
+    let sequence = mcp_call_sequence(&requests);
+    let mcp_bodies: Vec<serde_json::Value> = requests
+        .iter()
+        .filter_map(|request| serde_json::from_slice(&request.body).ok())
+        .collect();
+    transcript["reaction"] = serde_json::json!({
+        "claimedSentReviewId": first_decision_id.to_hex(),
+        "outcomeStatus": reacted.outcome_status,
+        "analysis": reacted.reaction_analysis,
+        "reviewAfterReaction": reacted,
+    });
+    transcript["round2"]["outboxAfterStop"] =
+        serde_json::to_value(&second_after).expect("serialize round2 outbox after stop");
+    transcript["execution"] = serde_json::json!({
+        "mcpCallSequence": sequence,
+        "mcpJsonRpcBodies": mcp_bodies,
+        "messageSendTextCalls": count_named_tool_calls(&requests, "message_send_text"),
+        "postStopClaimedEntry": post_stop_claim,
+    });
+    // Iron rule: 完整证据先输出并落 artifact，再做任何内容/评分/状态断言。
+    write_t4_transcript(&transcript);
+
+    let reply1 = first.content.trim();
+    let reply2 = second.content.trim();
+    assert_short_single_question(reply1, "第一轮");
+    assert_short_single_question(reply2, "第二轮");
+    assert!(
+        contains_any(
+            reply1,
+            &["职业", "工作", "方向", "目标", "岗位", "行业", "优先"]
+        ),
+        "第一轮必须针对职业目标混乱，而不是泛泛寒暄：{reply1:?}"
+    );
+    assert!(
+        contains_any(reply2, &["成长", "三年", "岗位", "行业", "方向", "能力"]),
+        "第二轮必须承接三年成长与岗位/行业收窄：{reply2:?}"
+    );
+    assert_ne!(reply1, reply2, "两轮不得复读同一句模板");
+    assert_review_quality(&review1, "第一轮");
+    assert_review_quality(&review2, "第二轮");
+    for (round, run) in [("第一轮", &run1), ("第二轮", &run2)] {
+        assert!(
+            run.llm_calls_used >= 2,
+            "{round} 必须真实调用 Reply + Reviewer，实际 llm_calls_used={}",
+            run.llm_calls_used
+        );
+        assert!(
+            matches!(
+                run.final_review_status.as_str(),
+                "approved" | "revision_applied_approved"
+            ),
+            "{round} 最终评审状态必须批准，实际={:?}",
+            run.final_review_status
+        );
+        assert!(
+            run.degraded_reasons.is_empty(),
+            "{round} 不允许靠降级路径通过：{:?}",
+            run.degraded_reasons
+        );
+    }
+    assert_eq!(first_after.status, OutboxStatus::Sent.as_str());
+    assert_eq!(second.status, OutboxStatus::Pending.as_str());
+    assert!(
+        matches!(
+            reacted.outcome_status.as_deref(),
+            Some("user_replied_stop_requested" | "user_replied_unsubscribed")
+        ),
+        "真实 Reaction 必须识别明确停止/退订，实际={:?} analysis={}",
+        reacted.outcome_status,
+        pretty_document(&reacted.reaction_analysis)
+    );
+    assert!(
+        reacted
+            .reaction_analysis
+            .get_bool("stopRequested")
+            .unwrap_or(false),
+        "Reaction outcome 与 stopRequested 标志必须一致：{}",
+        pretty_document(&reacted.reaction_analysis)
+    );
+    assert!(
+        reaction_confidence_is_high(&reacted.reaction_analysis),
+        "如此明确的停止原话必须高置信识别：{}",
+        pretty_document(&reacted.reaction_analysis)
+    );
+    assert_eq!(second_after.status, OutboxStatus::Canceled.as_str());
+    assert_eq!(
+        second_after.cancel_reason.as_deref(),
+        Some("user_reaction_stop_requested")
+    );
+    assert!(
+        post_stop_claim.is_none(),
+        "停止后的第二轮 outbox 不得再被 claim"
+    );
+    assert_eq!(
+        count_named_tool_calls(&requests, "message_send_text"),
+        1,
+        "只有第一轮允许客户投递；第二轮必须被 Reaction 在 MCP 前取消"
+    );
 }

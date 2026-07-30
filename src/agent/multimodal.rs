@@ -72,8 +72,7 @@ pub async fn describe_inbound_image(
     image_base64: &str,
     mime: &str,
 ) -> AppResult<String> {
-    let provider =
-        crate::routes::knowledge::select_vision_provider(state, workspace_id).await?;
+    let provider = crate::routes::knowledge::select_vision_provider(state, workspace_id).await?;
     let system_prompt = "你是客户消息的图片理解助手。任务：用中文如实描述这张图片里的可见内容，\
 便于后续对话理解客户想表达什么。只描述真实可见的内容，绝不编造、补全或推断图中没有的东西；\
 看不清就如实说看不清。返回严格 JSON：{\"description\": <一段自然语言描述字符串>}。";
@@ -85,6 +84,7 @@ pub async fn describe_inbound_image(
         user_prompt,
         image_base64,
         mime,
+        "description",
     )
     .await?;
     let description = value
@@ -109,10 +109,13 @@ pub async fn describe_inbound_image(
 /// 客户始终只跟 AI 对话。措辞合规由 CI 文本门（scripts/check-no-* 系列）在 diff 层兜底。
 pub fn non_text_transition_reply(msg_type: &str) -> String {
     match msg_type {
-        "image" => "我看到您发的图片啦～方便简单文字描述下您想了解什么吗？这样我能更准确帮您看～".to_string(),
+        "image" => "我看到您发的图片啦～方便简单文字描述下您想了解什么吗？这样我能更准确帮您看～"
+            .to_string(),
         "voice" => "收到您的语音啦～方便文字打一下吗？我好第一时间帮您看～".to_string(),
         "video" => "收到您发的视频啦～方便文字简单说下重点吗？我好帮您处理～".to_string(),
-        "link" | "appmsg" => "收到您分享的链接啦～方便文字说下您想了解哪方面吗？我帮您看～".to_string(),
+        "link" | "appmsg" => {
+            "收到您分享的链接啦～方便文字说下您想了解哪方面吗？我帮您看～".to_string()
+        }
         "miniprogram" => "收到您发的小程序啦～方便文字说下您的需求吗？我好帮您～".to_string(),
         "file" => "收到您发的文件啦～方便文字简单说下里面的关键信息吗？我好帮您看～".to_string(),
         // unknown 及其它一切非文本类型的兜底：保证永远有一条自然回复。

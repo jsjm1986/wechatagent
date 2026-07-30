@@ -13,8 +13,13 @@
 
 mod common;
 
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use std::time::Duration;
 
+use axum::{extract::State, routing::post, Json, Router};
 use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
 use serde_json::json;
 use wechatagent::agent::{
@@ -22,7 +27,7 @@ use wechatagent::agent::{
     handle_managed_message, process_entry, reclaim_expired_leases, second_safety_gate,
     EnqueueOutcome, EnqueueRequest, OutboxStatus,
 };
-use wechatagent::models::{Contact, ConversationMessage, MessageDirection};
+use wechatagent::models::{Contact, ConversationMessage, MessageDirection, ReferralCard};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -80,6 +85,14 @@ fn make_contact(wxid: &str) -> Contact {
         created_at: now,
         updated_at: now,
     }
+}
+
+/// Seed the account identity required by the scoped MCP resolver. The mock URL
+/// and key intentionally remain deployment-level defaults for the default
+/// workspace; this row proves the account exists without weakening the
+/// production fail-closed boundary for unknown accounts.
+async fn seed_default_mcp_account(state: &wechatagent::routes::AppState) {
+    common::ensure_test_account(state, "default", "default").await;
 }
 
 /// 每次请求返回唯一 `newMsgId` 的成功 responder。
@@ -206,7 +219,8 @@ async fn start_mcp_mock_success() -> MockServer {
     server
 }
 
-/// 启 wiremock，POST /mcp 一律返回 500 失败，便于覆盖 retry-then-terminal 路径。
+/// 初始化握手即返回 500：客户投递请求尚未发出，属于可证明的安全重试，
+/// 用于覆盖 retry-then-terminal 路径。
 async fn start_mcp_mock_failure() -> MockServer {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -215,6 +229,129 @@ async fn start_mcp_mock_failure() -> MockServer {
         .mount(&server)
         .await;
     server
+}
+
+/// 初始化成功，但真正的 message_send_text 返回 HTTP 500；chat_search 也不可用。
+/// 这模拟“客户投递请求可能已被远端接收，但本地没有可信回执”的歧义边界。
+struct AmbiguousSendResponder;
+
+impl wiremock::Respond for AmbiguousSendResponder {
+    fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap_or_default();
+        if body.get("method").and_then(|v| v.as_str()) == Some("initialize") {
+            return ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": { "protocolVersion": "2024-11-05", "capabilities": {} }
+            }));
+        }
+        ResponseTemplate::new(500).set_body_string("ambiguous failure after request boundary")
+    }
+}
+
+async fn start_mcp_mock_ambiguous_send() -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .respond_with(AmbiguousSendResponder)
+        .mount(&server)
+        .await;
+    server
+}
+
+#[derive(Clone)]
+struct BlockingMcpState {
+    reached_tx: tokio::sync::watch::Sender<usize>,
+    release: Arc<tokio::sync::Notify>,
+    send_calls: Arc<AtomicUsize>,
+}
+
+struct BlockingMcpServer {
+    base_url: String,
+    reached_rx: tokio::sync::watch::Receiver<usize>,
+    release: Arc<tokio::sync::Notify>,
+    send_calls: Arc<AtomicUsize>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+async fn blocking_mcp_handler(
+    State(state): State<BlockingMcpState>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let id = body.get("id").cloned().unwrap_or_else(|| json!(1));
+    if body.get("method").and_then(|value| value.as_str()) == Some("initialize") {
+        return Json(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": { "protocolVersion": "2024-11-05", "capabilities": {} }
+        }));
+    }
+
+    let tool_name = body
+        .pointer("/params/name")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    let sequence = if tool_name.starts_with("message_send_") {
+        let sequence = state.send_calls.fetch_add(1, Ordering::SeqCst) + 1;
+        let _ = state.reached_tx.send(sequence);
+        state.release.notified().await;
+        sequence
+    } else {
+        0
+    };
+    Json(json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {
+            "structuredContent": {
+                "newMsgId": format!("blocking_mcp_msg_{sequence}"),
+                "content": []
+            }
+        }
+    }))
+}
+
+async fn start_blocking_mcp_server() -> BlockingMcpServer {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind blocking MCP server");
+    let address = listener.local_addr().expect("blocking MCP address");
+    let (reached_tx, reached_rx) = tokio::sync::watch::channel(0usize);
+    let release = Arc::new(tokio::sync::Notify::new());
+    let send_calls = Arc::new(AtomicUsize::new(0));
+    let router = Router::new()
+        .route("/mcp", post(blocking_mcp_handler))
+        .with_state(BlockingMcpState {
+            reached_tx,
+            release: release.clone(),
+            send_calls: send_calls.clone(),
+        });
+    let task = tokio::spawn(async move {
+        axum::serve(listener, router)
+            .await
+            .expect("serve blocking MCP server");
+    });
+    BlockingMcpServer {
+        base_url: format!("http://{address}"),
+        reached_rx,
+        release,
+        send_calls,
+        task,
+    }
+}
+
+async fn wait_until_remote_received_send(server: &mut BlockingMcpServer) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while *server.reached_rx.borrow() == 0 {
+            server
+                .reached_rx
+                .changed()
+                .await
+                .expect("blocking MCP watch sender alive");
+        }
+    })
+    .await
+    .expect("remote MCP did not receive send request in time");
 }
 
 /// HTTP/JSON-RPC 均成功，但业务信封显式 `ok=false` 且没有 `newMsgId`。
@@ -238,6 +375,26 @@ async fn start_mcp_mock_negative_receipt() -> MockServer {
     server
 }
 
+/// HTTP/JSON-RPC 成功，但业务信封既无显式 `ok` 也无稳定 `newMsgId`。
+/// 请求已经越过远端边界，缺少可信回执不能被解释成“明确未送达”。
+async fn start_mcp_mock_inconclusive_receipt() -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "structuredContent": {
+                    "content": []
+                }
+            }
+        })))
+        .mount(&server)
+        .await;
+    server
+}
+
 /// 统计 wiremock 收到的真实"发送"调用数（JSON-RPC method==tools/call）。
 /// MCP Streamable-HTTP 每个新会话首次调用前先发一次 `initialize` 握手，那是会话
 /// 建立、不是发送；用原始 received_requests().len() 当发送数会把握手误算进去。
@@ -251,6 +408,25 @@ fn count_tool_calls(requests: &[wiremock::Request]) -> usize {
                     v.get("method")
                         .and_then(|m| m.as_str())
                         .map(|s| s == "tools/call")
+                })
+                .unwrap_or(false)
+        })
+        .count()
+}
+
+fn count_named_tool_calls(requests: &[wiremock::Request], tool_name: &str) -> usize {
+    requests
+        .iter()
+        .filter(|request| {
+            serde_json::from_slice::<serde_json::Value>(&request.body)
+                .ok()
+                .and_then(|body| {
+                    if body.get("method").and_then(|value| value.as_str()) != Some("tools/call") {
+                        return None;
+                    }
+                    body.pointer("/params/name")
+                        .and_then(|value| value.as_str())
+                        .map(|name| name == tool_name)
                 })
                 .unwrap_or(false)
         })
@@ -292,6 +468,7 @@ async fn happy_path_enqueue_claim_send_sent() {
     let app = common::TestApp::start().await;
     let mcp_server = start_mcp_mock_success().await;
     let state = common::rebuild_app_state_with_mcp_url(&app, mcp_server.uri());
+    seed_default_mcp_account(&state).await;
 
     let contact = make_contact("user_happy");
     state
@@ -396,6 +573,165 @@ async fn negative_mcp_receipt_is_retried_without_outbound_record() {
     assert_eq!(
         outbound_count, 0,
         "未获成功凭据不得写 outbound conversation record"
+    );
+}
+
+/// 名片请求已经到达 MCP，但成功 HTTP 信封缺少可信送达字段时，不能自动重放。
+/// 名片没有权威 post-hoc 查询，因此必须收敛到 `delivery_unknown` 并等待人工核验。
+#[tokio::test]
+#[ignore]
+async fn delivery_redline_namecard_inconclusive_receipt_is_not_replayed() {
+    let app = common::TestApp::start().await;
+    let mcp_server = start_mcp_mock_inconclusive_receipt().await;
+    let state = common::rebuild_app_state_with_mcp_url(&app, mcp_server.uri());
+    seed_default_mcp_account(&state).await;
+    let contact = make_contact("namecard_inconclusive_receipt");
+    state
+        .db
+        .contacts()
+        .insert_one(&contact, None)
+        .await
+        .expect("insert contact");
+
+    let card_id = ObjectId::new();
+    let now = DateTime::now();
+    state
+        .db
+        .referral_cards()
+        .insert_one(
+            ReferralCard {
+                id: Some(card_id),
+                workspace_id: contact.workspace_id.clone(),
+                account_id: Some(contact.account_id.clone()),
+                target_wxid: "wxid_inconclusive_advisor".to_string(),
+                display_name: "Inconclusive advisor".to_string(),
+                send_trigger_hint: "receipt redline".to_string(),
+                target_stages: vec![],
+                tags: vec![],
+                enabled: true,
+                review_status: "approved".to_string(),
+                review_note: None,
+                created_at: now,
+                updated_at: now,
+            },
+            None,
+        )
+        .await
+        .expect("insert referral card");
+
+    let mut request = enqueue_request(
+        "run_namecard_inconclusive_receipt",
+        "evt_namecard_inconclusive_receipt",
+        &contact.wxid,
+    );
+    request.content.clear();
+    request.referral_card_id = Some(card_id.to_hex());
+    let outbox_id = match enqueue(&state, request).await.expect("enqueue namecard") {
+        EnqueueOutcome::Created { outbox_id, .. } => outbox_id,
+        other => panic!("expected Created, got {other:?}"),
+    };
+    let claimed = atomic_claim_pending(&state, "worker-namecard-inconclusive", 60)
+        .await
+        .expect("claim namecard")
+        .expect("namecard entry claimed");
+    process_entry(&state, &claimed)
+        .await
+        .expect("process namecard");
+
+    let stored = common::wait_for_outbox_processed(&state, outbox_id, Duration::from_secs(5)).await;
+    assert_eq!(stored.status, OutboxStatus::DeliveryUnknown.as_str());
+    assert_eq!(stored.attempt, 0, "不确定送达不得排入自动重试");
+    assert!(stored
+        .last_error
+        .as_deref()
+        .unwrap_or_default()
+        .contains("automatic replay disabled"));
+    assert!(
+        atomic_claim_pending(&state, "must-not-replay-inconclusive-card", 60)
+            .await
+            .expect("post-receipt claim")
+            .is_none()
+    );
+
+    let outbound_count = state
+        .db
+        .messages()
+        .count_documents(
+            doc! {
+                "workspace_id": &contact.workspace_id,
+                "account_id": &contact.account_id,
+                "contact_wxid": &contact.wxid,
+                "direction": "outbound",
+                "msg_type": "namecard",
+            },
+            None,
+        )
+        .await
+        .expect("count outbound namecard records");
+    assert_eq!(outbound_count, 0, "不可信回执不得伪记已送达名片");
+
+    let requests = mcp_server
+        .received_requests()
+        .await
+        .expect("received MCP requests");
+    assert_eq!(
+        count_named_tool_calls(&requests, "message_send_namecard"),
+        1,
+        "名片物理发送请求只能发生一次"
+    );
+}
+
+/// 客户投递请求发出后收到 HTTP 500 时，不能把“无成功日志”当成“确认未送达”。
+/// 条目必须进入 delivery_unknown，且后续 claim 不得造成第二次客户投递。
+#[tokio::test]
+#[ignore]
+async fn delivery_redline_ambiguous_http_failure_is_not_automatically_replayed() {
+    let app = common::TestApp::start().await;
+    let mcp_server = start_mcp_mock_ambiguous_send().await;
+    let state = common::rebuild_app_state_with_mcp_url(&app, mcp_server.uri());
+    seed_default_mcp_account(&state).await;
+    let contact = make_contact("audit_ambiguous_http");
+    state
+        .db
+        .contacts()
+        .insert_one(&contact, None)
+        .await
+        .expect("insert contact");
+
+    let outbox_id = match enqueue(
+        &state,
+        enqueue_request("audit_run_ambiguous", "audit_evt_ambiguous", &contact.wxid),
+    )
+    .await
+    .expect("enqueue")
+    {
+        EnqueueOutcome::Created { outbox_id, .. } => outbox_id,
+        other => panic!("expected Created, got {other:?}"),
+    };
+    let claimed = atomic_claim_pending(&state, "audit-ambiguous", 60)
+        .await
+        .expect("claim")
+        .expect("entry claimed");
+    process_entry(&state, &claimed)
+        .await
+        .expect("process entry");
+
+    let stored = common::wait_for_outbox_processed(&state, outbox_id, Duration::from_secs(5)).await;
+    assert_eq!(stored.status, OutboxStatus::DeliveryUnknown.as_str());
+    assert_eq!(stored.attempt, 0, "歧义结果不得消耗后自动重放");
+    assert!(atomic_claim_pending(&state, "must-not-replay", 60)
+        .await
+        .expect("second claim")
+        .is_none());
+
+    let requests = mcp_server
+        .received_requests()
+        .await
+        .expect("received requests");
+    assert_eq!(
+        count_named_tool_calls(&requests, "message_send_text"),
+        1,
+        "客户投递请求只能发生一次；chat_search 核验调用不计为发送"
     );
 }
 
@@ -517,6 +853,7 @@ async fn mixed_run_status_is_order_independent() {
     let app = common::TestApp::start().await;
     let mcp_server = start_mcp_mock_success().await;
     let state = common::rebuild_app_state_with_mcp_url(&app, mcp_server.uri());
+    seed_default_mcp_account(&state).await;
 
     let contact = make_contact("audit_mixed_run_status");
     state
@@ -640,9 +977,14 @@ async fn user_reaction_stop_cancels_all_pending() {
         other => panic!("expected Created, got {other:?}"),
     };
 
-    let canceled = cancel_for_contact_on_user_reaction(&state, &contact.account_id, &contact.wxid)
-        .await
-        .expect("cancel ok");
+    let canceled = cancel_for_contact_on_user_reaction(
+        &state,
+        &contact.workspace_id,
+        &contact.account_id,
+        &contact.wxid,
+    )
+    .await
+    .expect("cancel ok");
     assert_eq!(canceled, 2, "both pending entries should be canceled");
 
     let collection = state.db.collection_agent_send_outbox();
@@ -658,6 +1000,292 @@ async fn user_reaction_stop_cancels_all_pending() {
             Some("user_reaction_stop_requested")
         );
     }
+}
+
+/// worker 已 claim、但尚未越过 MCP 边界时，用户停止请求必须赢得最后一次 CAS。
+/// process_entry 使用旧 claim 快照继续运行也不得调用 message_send_text。
+#[tokio::test]
+#[ignore]
+async fn delivery_redline_in_flight_stop_request_fences_remote_send() {
+    let app = common::TestApp::start().await;
+    let mcp_server = start_mcp_mock_success().await;
+    let state = common::rebuild_app_state_with_mcp_url(&app, mcp_server.uri());
+    seed_default_mcp_account(&state).await;
+    let contact = make_contact("user_stop_after_claim");
+    state
+        .db
+        .contacts()
+        .insert_one(&contact, None)
+        .await
+        .expect("insert contact");
+
+    let outbox_id = match enqueue(
+        &state,
+        enqueue_request(
+            "run_stop_after_claim",
+            "evt_stop_after_claim",
+            &contact.wxid,
+        ),
+    )
+    .await
+    .expect("enqueue")
+    {
+        EnqueueOutcome::Created { outbox_id, .. } => outbox_id,
+        other => panic!("expected Created, got {other:?}"),
+    };
+    let claimed = atomic_claim_pending(&state, "worker-before-stop", 60)
+        .await
+        .expect("claim")
+        .expect("entry claimed");
+    assert_eq!(claimed.id, Some(outbox_id));
+
+    let accepted = cancel_for_contact_on_user_reaction(
+        &state,
+        &contact.workspace_id,
+        &contact.account_id,
+        &contact.wxid,
+    )
+    .await
+    .expect("persist stop request");
+    assert_eq!(accepted, 1);
+    process_entry(&state, &claimed)
+        .await
+        .expect("stale owner must stop safely");
+
+    let stored = common::wait_for_outbox_processed(&state, outbox_id, Duration::from_secs(5)).await;
+    assert_eq!(stored.status, OutboxStatus::Canceled.as_str());
+    assert_eq!(
+        stored.cancel_reason.as_deref(),
+        Some("user_reaction_stop_requested")
+    );
+    let requests = mcp_server
+        .received_requests()
+        .await
+        .expect("received requests");
+    assert_eq!(count_named_tool_calls(&requests, "message_send_text"), 0);
+}
+
+/// The remote endpoint has received the customer send request, but has not replied yet.
+/// A cancellation at this point is best-effort only: a later success receipt must settle to
+/// `sent`, preserve the cancellation audit marker, and never trigger a second physical send.
+#[tokio::test]
+#[ignore]
+async fn delivery_redline_late_cancel_after_remote_acceptance_settles_sent_once() {
+    let app = common::TestApp::start().await;
+    let mut mcp_server = start_blocking_mcp_server().await;
+    let state = common::rebuild_app_state_with_mcp_url(&app, mcp_server.base_url.clone());
+    seed_default_mcp_account(&state).await;
+    let contact = make_contact("user_stop_after_remote_acceptance");
+    state
+        .db
+        .contacts()
+        .insert_one(&contact, None)
+        .await
+        .expect("insert contact");
+
+    let outbox_id = match enqueue(
+        &state,
+        enqueue_request(
+            "run_stop_after_remote_acceptance",
+            "evt_stop_after_remote_acceptance",
+            &contact.wxid,
+        ),
+    )
+    .await
+    .expect("enqueue")
+    {
+        EnqueueOutcome::Created { outbox_id, .. } => outbox_id,
+        other => panic!("expected Created, got {other:?}"),
+    };
+    let claimed = atomic_claim_pending(&state, "worker-late-cancel", 60)
+        .await
+        .expect("claim")
+        .expect("entry claimed");
+    let worker_state = state.clone();
+    let worker = tokio::spawn(async move { process_entry(&worker_state, &claimed).await });
+
+    wait_until_remote_received_send(&mut mcp_server).await;
+    let crossed_boundary = state
+        .db
+        .collection_agent_send_outbox()
+        .find_one(doc! { "_id": outbox_id }, None)
+        .await
+        .expect("query crossed-boundary entry")
+        .expect("entry exists");
+    assert_eq!(crossed_boundary.status, OutboxStatus::InFlight.as_str());
+    assert!(
+        crossed_boundary.send_started_at.is_some(),
+        "remote request was observed, so the durable boundary marker must exist"
+    );
+
+    let accepted = cancel_for_contact_on_user_reaction(
+        &state,
+        &contact.workspace_id,
+        &contact.account_id,
+        &contact.wxid,
+    )
+    .await
+    .expect("persist late cancellation request");
+    assert_eq!(accepted, 1);
+    let cancel_pending = state
+        .db
+        .collection_agent_send_outbox()
+        .find_one(doc! { "_id": outbox_id }, None)
+        .await
+        .expect("query cancellation request")
+        .expect("entry exists");
+    assert_eq!(cancel_pending.status, OutboxStatus::InFlight.as_str());
+    assert!(cancel_pending.cancel_requested);
+
+    mcp_server.release.notify_one();
+    worker
+        .await
+        .expect("dispatcher task join")
+        .expect("dispatcher result");
+    let stored = common::wait_for_outbox_processed(&state, outbox_id, Duration::from_secs(5)).await;
+    assert_eq!(stored.status, OutboxStatus::Sent.as_str());
+    assert!(
+        stored.cancel_requested,
+        "late cancellation remains auditable"
+    );
+    assert_eq!(
+        stored.cancel_reason.as_deref(),
+        Some("user_reaction_stop_requested")
+    );
+    assert_eq!(mcp_server.send_calls.load(Ordering::SeqCst), 1);
+    assert!(
+        atomic_claim_pending(&state, "must-not-replay-late-cancel", 60)
+            .await
+            .expect("post-send claim")
+            .is_none(),
+        "a late cancellation plus success receipt must not create a replay"
+    );
+    let outbound_count = state
+        .db
+        .messages()
+        .count_documents(
+            doc! {
+                "contact_wxid": &contact.wxid,
+                "direction": "outbound",
+            },
+            None,
+        )
+        .await
+        .expect("count outbound records");
+    assert_eq!(
+        outbound_count, 1,
+        "delivery side effects must finalize once"
+    );
+    mcp_server.task.abort();
+}
+
+/// A namecard request reached the remote endpoint and the worker then crashed before a receipt.
+/// Since namecards have no authoritative post-hoc lookup, lease recovery must stop in
+/// `delivery_unknown`; returning to pending would permit a duplicate physical card send.
+#[tokio::test]
+#[ignore]
+async fn delivery_redline_namecard_crash_after_remote_boundary_is_not_replayed() {
+    let app = common::TestApp::start().await;
+    let mut mcp_server = start_blocking_mcp_server().await;
+    let state = common::rebuild_app_state_with_mcp_url(&app, mcp_server.base_url.clone());
+    seed_default_mcp_account(&state).await;
+    let contact = make_contact("namecard_crash_after_remote_boundary");
+    state
+        .db
+        .contacts()
+        .insert_one(&contact, None)
+        .await
+        .expect("insert contact");
+    let card_id = ObjectId::new();
+    let now = DateTime::now();
+    state
+        .db
+        .referral_cards()
+        .insert_one(
+            ReferralCard {
+                id: Some(card_id),
+                workspace_id: contact.workspace_id.clone(),
+                account_id: Some(contact.account_id.clone()),
+                target_wxid: "wxid_test_advisor".to_string(),
+                display_name: "Test advisor".to_string(),
+                send_trigger_hint: "integration redline".to_string(),
+                target_stages: vec![],
+                tags: vec![],
+                enabled: true,
+                review_status: "approved".to_string(),
+                review_note: None,
+                created_at: now,
+                updated_at: now,
+            },
+            None,
+        )
+        .await
+        .expect("insert approved referral card");
+
+    let mut request = enqueue_request(
+        "run_namecard_crash_boundary",
+        "evt_namecard_crash_boundary",
+        &contact.wxid,
+    );
+    request.content.clear();
+    request.referral_card_id = Some(card_id.to_hex());
+    let outbox_id = match enqueue(&state, request).await.expect("enqueue namecard") {
+        EnqueueOutcome::Created { outbox_id, .. } => outbox_id,
+        other => panic!("expected Created, got {other:?}"),
+    };
+    let claimed = atomic_claim_pending(&state, "worker-namecard-crash", 60)
+        .await
+        .expect("claim namecard")
+        .expect("namecard entry claimed");
+    let worker_state = state.clone();
+    let worker = tokio::spawn(async move { process_entry(&worker_state, &claimed).await });
+
+    wait_until_remote_received_send(&mut mcp_server).await;
+    let crossed_boundary = state
+        .db
+        .collection_agent_send_outbox()
+        .find_one(doc! { "_id": outbox_id }, None)
+        .await
+        .expect("query namecard boundary")
+        .expect("entry exists");
+    assert!(crossed_boundary.send_started_at.is_some());
+    assert_eq!(mcp_server.send_calls.load(Ordering::SeqCst), 1);
+
+    worker.abort();
+    let _ = worker.await;
+    mcp_server.release.notify_one();
+    state
+        .db
+        .collection_agent_send_outbox()
+        .update_one(
+            doc! { "_id": outbox_id },
+            doc! { "$set": { "locked_until": DateTime::from_millis(0) } },
+            None,
+        )
+        .await
+        .expect("expire crashed worker lease");
+    let reclaimed = reclaim_expired_leases(&state)
+        .await
+        .expect("reclaim crashed namecard worker");
+    assert_eq!(reclaimed, 1);
+
+    let stored = common::wait_for_outbox_processed(&state, outbox_id, Duration::from_secs(5)).await;
+    assert_eq!(stored.status, OutboxStatus::DeliveryUnknown.as_str());
+    assert!(stored
+        .last_error
+        .as_deref()
+        .unwrap_or_default()
+        .contains("manual verification"));
+    assert!(atomic_claim_pending(&state, "must-not-replay-namecard", 60)
+        .await
+        .expect("post-crash claim")
+        .is_none());
+    assert_eq!(
+        mcp_server.send_calls.load(Ordering::SeqCst),
+        1,
+        "namecard physical send must not be replayed after an uncertain crash"
+    );
+    mcp_server.task.abort();
 }
 
 // ── Case 4: 30-min stale → second_safety_gate cancels ───────────────────
@@ -734,6 +1362,7 @@ async fn crash_recovery_worker_b_reclaims_after_lease_expires() {
     let app = common::TestApp::start().await;
     let mcp_server = start_mcp_mock_success().await;
     let state = common::rebuild_app_state_with_mcp_url(&app, mcp_server.uri());
+    seed_default_mcp_account(&state).await;
 
     let contact = make_contact("user_crash");
     state
@@ -809,6 +1438,7 @@ async fn idempotency_key_yields_at_most_one_mcp_send() {
     let app = common::TestApp::start().await;
     let mcp_server = start_mcp_mock_success().await;
     let state = common::rebuild_app_state_with_mcp_url(&app, mcp_server.uri());
+    seed_default_mcp_account(&state).await;
 
     let contact = make_contact("user_idem");
     state
@@ -897,6 +1527,7 @@ async fn over_soft_cap_emits_warning_event() {
     let app = common::TestApp::start().await;
     let mcp_server = start_mcp_mock_success().await;
     let mut state = common::rebuild_app_state_with_mcp_url(&app, mcp_server.uri());
+    seed_default_mcp_account(&state).await;
     // cap=1：预置 1 条 sent 后再发一条即达上限，触发 warning。
     state.config.account_daily_send_soft_cap = 1;
 
@@ -984,6 +1615,7 @@ async fn under_soft_cap_emits_no_warning_event() {
     let app = common::TestApp::start().await;
     let mcp_server = start_mcp_mock_success().await;
     let state = common::rebuild_app_state_with_mcp_url(&app, mcp_server.uri());
+    seed_default_mcp_account(&state).await;
     // 默认 cap=500，一条发送远未达上限。
 
     let contact = make_contact("user_softcap_under");
@@ -1163,6 +1795,7 @@ async fn account_pacing_gate_allows_after_interval() {
     let app = common::TestApp::start().await;
     let mcp_server = start_mcp_mock_success().await;
     let mut state = common::rebuild_app_state_with_mcp_url(&app, mcp_server.uri());
+    seed_default_mcp_account(&state).await;
     state.config.account_send_min_interval_ms = 2000;
     state.config.account_send_max_interval_ms = 2000;
 
@@ -1240,6 +1873,7 @@ async fn account_pacing_gate_isolates_accounts() {
     let app = common::TestApp::start().await;
     let mcp_server = start_mcp_mock_success().await;
     let mut state = common::rebuild_app_state_with_mcp_url(&app, mcp_server.uri());
+    seed_default_mcp_account(&state).await;
     state.config.account_send_min_interval_ms = 2000;
     state.config.account_send_max_interval_ms = 2000;
 
@@ -1313,6 +1947,7 @@ async fn account_pacing_gate_first_send_not_blocked() {
     let app = common::TestApp::start().await;
     let mcp_server = start_mcp_mock_success().await;
     let mut state = common::rebuild_app_state_with_mcp_url(&app, mcp_server.uri());
+    seed_default_mcp_account(&state).await;
     state.config.account_send_min_interval_ms = 2000;
     state.config.account_send_max_interval_ms = 2000;
 
@@ -1691,11 +2326,11 @@ async fn reclaim_gate_precedes_pacing_gate() {
         OutboxStatus::Pending.as_str(),
         "若 status=pending 说明 pacing 闸被误挪到 reclaim 门之前，已发过的消息被拦成僵尸条目"
     );
-    // last_error 是 reclaim 分支专属 marker(:685)——确认确实走的是 2B post-hoc，
+    // last_error 是 reclaim 分支专属 marker——确认确实走的是 2B post-hoc，
     // 而非碰巧走真实发送（后者 last_error 为 None、且会有 MCP 调用）。
     let last_error = entry.last_error.clone().unwrap_or_default();
     assert!(
-        last_error.contains("MCP already succeeded"),
+        last_error.contains("delivery was confirmed post-hoc"),
         "应走 reclaim 2B post-hoc 分支（last_error 带专属 marker），实际 last_error={last_error:?}"
     );
     assert!(entry.worker_id.is_none(), "标 sent 时 worker_id 应清空");
@@ -1744,6 +2379,7 @@ async fn reclaim_gate_precedes_pacing_gate() {
 #[ignore]
 async fn reclaim_text_verifies_via_chat_search_before_local() {
     let app = common::TestApp::start().await;
+    seed_default_mcp_account(&app.state).await;
     let contact = make_contact("user_reclaim_chat_search");
     app.state
         .db
@@ -1899,6 +2535,7 @@ fn review_agent_pass_json(review_summary: &str) -> serde_json::Value {
             "relationshipProgress": 7,
             "conversionReadiness": 6,
             "pressureRisk": 2,
+            "boundaryPrivacySafety": 9,
             "factRisk": 1,
         },
         "claimAnalysis": {

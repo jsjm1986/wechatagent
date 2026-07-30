@@ -4,8 +4,11 @@ use axum::{
     extract::{Path, Query, State},
     Extension, Json,
 };
-use mongodb::bson::{doc, Bson, DateTime, Document};
-use mongodb::options::FindOptions;
+use mongodb::options::{FindOptions, TransactionOptions};
+use mongodb::{
+    bson::{doc, Bson, DateTime, Document},
+    ClientSession,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -25,54 +28,35 @@ use super::*;
 // 2) 数组字段 union（应用层完成，零 LLM 风险）
 // 3) 70% body 长度阈值（LLM 截断/偷懒拒收）
 // 4) AI source 强制 status=draft + integrity_status=needs_review
-// 5) 双写 chunk_revisions + chunks，先 history 后最新
-// 6) enqueue catalog_rebuild_jobs（best-effort）
+// 5) 同一事务写 chunk_revisions + chunks，并以 updated_at CAS 防并发覆盖
+// 6) 同一事务推进父 Document catalog generation 并写 durable rebuild intent
 
 use crate::knowledge_wiki::chunk_revisions::{
-    apply_chunk_revision, cleanup_dangling_refs, ProvenanceSource, RevisionApplied, RevisionOp,
+    apply_chunk_revision, apply_chunk_revision_with_session, commit_chunk_transaction,
+    rollback_chunk_revision_with_session, ProvenanceSource, RevisionApplied, RevisionOp,
     RevisionRequest,
 };
+use crate::knowledge_wiki::page_merge::effective_locked_fields;
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(in crate::routes) struct ChunkPatchRequest {
-    /// 字段级 patch；不允许携带 locked_fields。
+    /// Public camelCase content patch. Scope, lifecycle and review fields are
+    /// rejected by `normalize_editable_chunk_patch`.
     pub patch: Value,
-    /// "ai" / "human" / "rule" / "imported"。
-    #[serde(default = "default_chunk_patch_source")]
-    pub source: String,
     pub reason: Option<String>,
-    pub actor: Option<String>,
-}
-
-fn default_chunk_patch_source() -> String {
-    "human".to_string()
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(in crate::routes) struct ChunkArchiveRequest {
     pub reason: Option<String>,
-    pub actor: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(in crate::routes) struct ChunkRollbackRequest {
-    pub actor: Option<String>,
-}
-
-/// JSON Value → BSON Document（用于 ChunkPatchRequest.patch）。
-fn json_object_to_document(v: &Value) -> AppResult<Document> {
-    let obj = v
-        .as_object()
-        .ok_or_else(|| AppError::BadRequest("patch 必须是 JSON 对象".to_string()))?;
-    let bson_value: Bson = mongodb::bson::to_bson(obj)
-        .map_err(|e| AppError::BadRequest(format!("patch 转 BSON 失败: {e}")))?;
-    match bson_value {
-        Bson::Document(d) => Ok(d),
-        _ => Err(AppError::BadRequest("patch 必须是 JSON 对象".to_string())),
-    }
+    pub reason: Option<String>,
 }
 
 fn revision_applied_to_json(r: &RevisionApplied) -> Value {
@@ -95,20 +79,14 @@ pub(in crate::routes) async fn patch_operation_knowledge_chunk(
     Json(payload): Json<ChunkPatchRequest>,
 ) -> AppResult<Json<Value>> {
     let object_id = parse_object_id(&id)?;
-    let patch = json_object_to_document(&payload.patch)?;
-    let source: ProvenanceSource = payload.source.parse()?;
-    let req = RevisionRequest {
-        op: RevisionOp::Patch,
-        source,
-        patch,
-        reason: payload.reason,
-        actor: payload.actor,
-    };
-    let applied = apply_chunk_revision(
-        &state.db,
+    let applied = apply_controlled_chunk_patch(
+        &state,
         &admin.current_workspace,
+        &admin.username,
         object_id,
-        req,
+        &payload.patch,
+        ProvenanceSource::Human,
+        payload.reason,
     )
     .await?;
     super::super::chunk_locks::broadcast_chunk_revised_in(
@@ -121,8 +99,9 @@ pub(in crate::routes) async fn patch_operation_knowledge_chunk(
     Ok(Json(revision_applied_to_json(&applied)))
 }
 
-/// `POST /operation-knowledge/chunks/:id/archive` — 软删（status=archived）+
-/// 删除级联（清空其它 chunk 的 related_chunks 引用）。
+/// `POST /operation-knowledge/chunks/:id/archive` — 软归档。
+/// Relations remain intact so archived knowledge and its immutable revisions
+/// stay traceable; only a future privileged purge may remove graph edges.
 pub(in crate::routes) async fn archive_operation_knowledge_chunk(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
@@ -135,22 +114,9 @@ pub(in crate::routes) async fn archive_operation_knowledge_chunk(
         source: ProvenanceSource::Human,
         patch: Document::new(),
         reason: payload.reason,
-        actor: payload.actor,
+        actor: Some(admin.username.clone()),
     };
-    let applied = apply_chunk_revision(
-        &state.db,
-        &admin.current_workspace,
-        object_id,
-        req,
-    )
-    .await?;
-    let cleaned = cleanup_dangling_refs(
-        &state.db,
-        &admin.current_workspace,
-        &applied.chunk_id,
-    )
-    .await
-    .unwrap_or(0);
+    let applied = apply_chunk_revision(&state.db, &admin.current_workspace, object_id, req).await?;
     super::super::chunk_locks::broadcast_chunk_revised_in(
         &state,
         &admin.current_workspace,
@@ -158,11 +124,7 @@ pub(in crate::routes) async fn archive_operation_knowledge_chunk(
         "archive",
         &admin.username,
     );
-    let mut value = revision_applied_to_json(&applied);
-    if let Some(o) = value.as_object_mut() {
-        o.insert("cleanedReferences".to_string(), json!(cleaned));
-    }
-    Ok(Json(value))
+    Ok(Json(revision_applied_to_json(&applied)))
 }
 
 /// `POST /operation-knowledge/chunks/:id/restore` — 取消 archive。
@@ -178,15 +140,9 @@ pub(in crate::routes) async fn restore_operation_knowledge_chunk(
         source: ProvenanceSource::Human,
         patch: Document::new(),
         reason: payload.reason,
-        actor: payload.actor,
+        actor: Some(admin.username.clone()),
     };
-    let applied = apply_chunk_revision(
-        &state.db,
-        &admin.current_workspace,
-        object_id,
-        req,
-    )
-    .await?;
+    let applied = apply_chunk_revision(&state.db, &admin.current_workspace, object_id, req).await?;
     super::super::chunk_locks::broadcast_chunk_revised_in(
         &state,
         &admin.current_workspace,
@@ -197,16 +153,10 @@ pub(in crate::routes) async fn restore_operation_knowledge_chunk(
     Ok(Json(revision_applied_to_json(&applied)))
 }
 
-/// `POST /operation-knowledge/chunks/:id/rollback/:revision_id` — 回滚到某 revision
-/// 之前的 chunk 状态。
-///
-/// 实现方式：找到目标 revision，反向应用 patch（把 patch 中每个 key 的值改回
-/// `before_hash` 时刻的内容）。简化：当前不支持精确"还原到某个时间点"，仅支持
-/// "把当前 chunk 的关键字段重写为目标 revision 的 patch 中字段的反值"——所以
-/// 通常用法是回滚最近一次 patch（其它复杂场景请用 `/patch` 显式指定）。
-///
-/// 写入仍走 apply_chunk_revision(op=Rollback)，留下"我回滚到了 X"的痕迹而非
-/// 物理删除 history。
+/// `POST /operation-knowledge/chunks/:id/rollback/:revision_id` restores the
+/// exact state immediately before the selected revision. Identity, tenant,
+/// lock and runtime-stat fields remain server-owned, and restored content must
+/// be reviewed again. Legacy revisions without snapshots fail closed.
 pub(in crate::routes) async fn rollback_operation_knowledge_chunk(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
@@ -214,72 +164,28 @@ pub(in crate::routes) async fn rollback_operation_knowledge_chunk(
     Json(payload): Json<ChunkRollbackRequest>,
 ) -> AppResult<Json<Value>> {
     let object_id = parse_object_id(&id)?;
-    // 找目标 revision
-    let target = state
-        .db
-        .chunk_revisions()
-        .find_one(
-            doc! {
-                "chunk_id": object_id.to_hex(),
-                "revision_id": &revision_id,
-            },
-            None,
-        )
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("revision {revision_id} not found")))?;
-    // 找它的"前一条"revision —— 即 created_at < target.created_at 的最近一条
-    let prev = state
-        .db
-        .chunk_revisions()
-        .find_one(
-            doc! {
-                "chunk_id": object_id.to_hex(),
-                "created_at": { "$lt": target.created_at },
-            },
-            mongodb::options::FindOneOptions::builder()
-                .sort(doc! { "created_at": -1 })
-                .build(),
-        )
+    let mut session = state.db.client().start_session(None).await?;
+    session
+        .start_transaction(TransactionOptions::builder().build())
         .await?;
-    // 简化策略：rollback 时把目标 revision 的 patch 中所有 key 设为前一条 revision
-    // patch 中相应字段的值；前一条不存在或字段不存在 → 移除（用 $unset，但这里
-    // 走 apply_chunk_revision 路径，所以用 BSON Null 表示移除意图，由
-    // apply_field_patch 兼容处理为空字符串/空数组）。
-    //
-    // 因为 apply_chunk_revision 不直接支持 $unset，我们在 patch 中只回填能找到
-    // 的字段；找不到的字段提示 caller "无法完整回滚某些字段"。
-    let mut rollback_patch = Document::new();
-    let mut missing: Vec<String> = Vec::new();
-    if let Some(prev_rev) = &prev {
-        for key in target.patch.keys() {
-            if let Some(prev_val) = prev_rev.patch.get(key) {
-                rollback_patch.insert(key, prev_val.clone());
-            } else {
-                missing.push(key.to_string());
-            }
-        }
-    } else {
-        for key in target.patch.keys() {
-            missing.push(key.to_string());
-        }
-    }
-    let req = RevisionRequest {
-        op: RevisionOp::Rollback,
-        source: ProvenanceSource::Human,
-        patch: rollback_patch,
-        reason: Some(format!(
-            "rollback to revision {revision_id}; missing_fields={}",
-            missing.len()
-        )),
-        actor: payload.actor,
-    };
-    let applied = apply_chunk_revision(
+    let result = rollback_chunk_revision_with_session(
         &state.db,
         &admin.current_workspace,
         object_id,
-        req,
+        &revision_id,
+        &admin.username,
+        payload.reason,
+        &mut session,
     )
-    .await?;
+    .await;
+    let applied = match result {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = session.abort_transaction().await;
+            return Err(error);
+        }
+    };
+    commit_chunk_transaction(&mut session).await?;
     super::super::chunk_locks::broadcast_chunk_revised_in(
         &state,
         &admin.current_workspace,
@@ -290,7 +196,6 @@ pub(in crate::routes) async fn rollback_operation_knowledge_chunk(
     let mut value = revision_applied_to_json(&applied);
     if let Some(o) = value.as_object_mut() {
         o.insert("rollbackTo".to_string(), json!(revision_id));
-        o.insert("missingFields".to_string(), json!(missing));
     }
     Ok(Json(value))
 }
@@ -313,8 +218,7 @@ pub(in crate::routes) async fn list_operation_knowledge_chunk_revisions(
 ) -> AppResult<Json<Value>> {
     use futures::TryStreamExt;
     let object_id = parse_object_id(&id)?;
-    // 多租户隔离：先确认该 chunk 属于当前 workspace，再列其编辑历史
-    // （chunk_revisions 自身不带 workspace_id，靠父 chunk 授权）。
+    // 多租户隔离：父 chunk 授权与 revision 自身 workspace filter 双重收口。
     state
         .db
         .operation_knowledge_chunks()
@@ -334,7 +238,13 @@ pub(in crate::routes) async fn list_operation_knowledge_chunk_revisions(
     let revisions: Vec<_> = state
         .db
         .chunk_revisions()
-        .find(doc! { "chunk_id": object_id.to_hex() }, opts)
+        .find(
+            doc! {
+                "workspace_id": &admin.current_workspace,
+                "chunk_id": object_id.to_hex(),
+            },
+            opts,
+        )
         .await?
         .try_collect()
         .await?;
@@ -363,27 +273,132 @@ pub(in crate::routes) async fn list_operation_knowledge_chunk_revisions(
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(in crate::routes) struct ChunkSplitRequest {
-    /// 把当前 chunk 内容按这一段拆分成 N 份的锚点描述（仅记入 reason，
-    /// 实际拆分由 caller 提供新 chunks 内容）。
-    pub split_anchor: Option<String>,
-    /// N 个新 chunk 的 patch 描述（每份至少含 title + body）。
-    pub new_chunks: Vec<Value>,
+    /// Unicode character offset in the existing body (or summary fallback).
+    /// The server derives both child chunks and all scope fields.
+    pub offset: usize,
     pub reason: Option<String>,
-    pub actor: Option<String>,
 }
 
 /// `POST /operation-knowledge/chunks/:id/split` — 拆分 chunk。
 ///
-/// 行为：
-/// 1. 把原 chunk 标 archived（写一条 op=split revision）；
-/// 2. 复制原 chunk 的 metadata（domain / wiki_type / workspace_id / document_id），
-///    覆盖 caller 提供的字段，新建 N 个 chunk（每份写 op=create revision，
-///    `previous_version_id` 指向原 chunk）。
-///
-/// 失败回滚不做 atomicity 保证（按 LLW 简化策略：split/merge 是低频运营动作，
-/// 失败时 admin 直接看 history 修复）。
+/// The caller supplies only a character offset. Both children inherit scope and
+/// classification from the source and always start as draft+needs_review. The
+/// source is archived only after both children and their revisions exist.
+async fn split_operation_knowledge_chunk_in_transaction(
+    state: &AppState,
+    admin: &AuthenticatedAdmin,
+    object_id: mongodb::bson::oid::ObjectId,
+    payload: ChunkSplitRequest,
+    session: &mut ClientSession,
+) -> AppResult<(RevisionApplied, Vec<String>)> {
+    let workspace_id = &admin.current_workspace;
+    let original = state
+        .db
+        .operation_knowledge_chunks()
+        .find_one_with_session(
+            doc! { "_id": object_id, "workspace_id": workspace_id },
+            None,
+            session,
+        )
+        .await?
+        .ok_or_else(|| AppError::NotFound("operation knowledge chunk not found".to_string()))?;
+    if original.status == "archived" {
+        return Err(AppError::BadRequest(
+            "archived chunk cannot be split".to_string(),
+        ));
+    }
+    let text = original
+        .body
+        .as_deref()
+        .or(original.summary.as_deref())
+        .unwrap_or_default();
+    let char_count = text.chars().count();
+    if payload.offset == 0 || payload.offset >= char_count {
+        return Err(AppError::BadRequest(format!(
+            "offset must be between 1 and {} Unicode characters",
+            char_count.saturating_sub(1)
+        )));
+    }
+    let left: String = text.chars().take(payload.offset).collect();
+    let right: String = text.chars().skip(payload.offset).collect();
+    if left.trim().is_empty() || right.trim().is_empty() {
+        return Err(AppError::BadRequest(
+            "split would create an empty chunk".to_string(),
+        ));
+    }
+
+    // Create both derived chunks first. A failure leaves the original active.
+    let mut new_ids: Vec<String> = Vec::new();
+    for (index, body) in [left.trim(), right.trim()].into_iter().enumerate() {
+        let now = DateTime::now();
+        let mut child = original.clone();
+        child.id = None;
+        child.title = format!("{}（{}/2）", original.title, index + 1);
+        child.body = Some(body.to_string());
+        child.summary = None;
+        // The original quote/anchors proved the original claim set. Once the
+        // body is split they cannot be assumed to prove either derived child.
+        // Fresh evidence must be supplied before the dedicated verify route can
+        // promote a child again.
+        child.source_quote = None;
+        child.source_anchors.clear();
+        child.status = "draft".to_string();
+        child.integrity_status = Some("needs_review".to_string());
+        child.confidence_score = Some(0);
+        child.created_at = now;
+        child.updated_at = now;
+        child.previous_version_id = Some(object_id.to_hex());
+        child.superseded_by = None;
+        child.related_chunks = None;
+        child.usage_stats = None;
+        child.dynamic_confidence = None;
+        child.integrity_score = None;
+        let inserted = state
+            .db
+            .operation_knowledge_chunks()
+            .insert_one_with_session(child, None, session)
+            .await?;
+        let oid = inserted.inserted_id.as_object_id().ok_or_else(|| {
+            AppError::External("split child insert did not return ObjectId".to_string())
+        })?;
+        apply_chunk_revision_with_session(
+            &state.db,
+            workspace_id,
+            oid,
+            RevisionRequest {
+                op: RevisionOp::Create,
+                source: ProvenanceSource::Human,
+                patch: Document::new(),
+                reason: Some(format!("split from chunk {}", object_id.to_hex())),
+                actor: Some(admin.username.clone()),
+            },
+            session,
+        )
+        .await?;
+        new_ids.push(oid.to_hex());
+    }
+
+    let archived = apply_chunk_revision_with_session(
+        &state.db,
+        workspace_id,
+        object_id,
+        RevisionRequest {
+            op: RevisionOp::Split,
+            source: ProvenanceSource::Human,
+            patch: doc! { "status": "archived" },
+            reason: payload
+                .reason
+                .or_else(|| Some(format!("split at {}", payload.offset))),
+            actor: Some(admin.username.clone()),
+        },
+        session,
+    )
+    .await?;
+    Ok((archived, new_ids))
+}
+
 pub(in crate::routes) async fn split_operation_knowledge_chunk(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
@@ -391,108 +406,43 @@ pub(in crate::routes) async fn split_operation_knowledge_chunk(
     Json(payload): Json<ChunkSplitRequest>,
 ) -> AppResult<Json<Value>> {
     let object_id = parse_object_id(&id)?;
-    let workspace_id = &admin.current_workspace;
-    if payload.new_chunks.is_empty() {
-        return Err(AppError::BadRequest(
-            "new_chunks 不可为空，至少需要 1 份新 chunk".to_string(),
-        ));
+    let mut session = state.db.client().start_session(None).await?;
+    session
+        .start_transaction(TransactionOptions::builder().build())
+        .await?;
+    let result = split_operation_knowledge_chunk_in_transaction(
+        &state,
+        &admin,
+        object_id,
+        payload,
+        &mut session,
+    )
+    .await;
+    let (archived, new_ids) = match result {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = session.abort_transaction().await;
+            return Err(error);
+        }
+    };
+    commit_chunk_transaction(&mut session).await?;
+
+    for chunk_id in &new_ids {
+        super::super::chunk_locks::broadcast_chunk_revised_in(
+            &state,
+            &admin.current_workspace,
+            chunk_id,
+            "create",
+            &admin.username,
+        );
     }
-    let original = state
-        .db
-        .operation_knowledge_chunks()
-        .find_one(
-            doc! { "_id": object_id, "workspace_id": workspace_id },
-            None,
-        )
-        .await?
-        .ok_or_else(|| AppError::NotFound("operation knowledge chunk not found".to_string()))?;
-    // 1) 原 chunk archive
-    let archive_req = RevisionRequest {
-        op: RevisionOp::Split,
-        source: ProvenanceSource::Human,
-        patch: Document::new(),
-        reason: payload
-            .reason
-            .clone()
-            .or_else(|| Some(format!("split into {} new chunks", payload.new_chunks.len()))),
-        actor: payload.actor.clone(),
-    };
-    // 用 archive 语义但 op 标 Split（apply_chunk_revision 内部把 status 设 archived）
-    let mut archive_patch = Document::new();
-    archive_patch.insert("status", "archived");
-    let archive_req = RevisionRequest {
-        patch: archive_patch,
-        ..archive_req
-    };
-    let archived = apply_chunk_revision(&state.db, workspace_id, object_id, archive_req).await?;
     super::super::chunk_locks::broadcast_chunk_revised_in(
         &state,
-        workspace_id,
+        &admin.current_workspace,
         &archived.chunk_id,
         "split",
         &admin.username,
     );
-    // 2) 创建 N 个新 chunk
-    let mut new_ids: Vec<String> = Vec::new();
-    let now = DateTime::now();
-    for raw in &payload.new_chunks {
-        let mut new_doc = Document::new();
-        new_doc.insert("workspace_id", workspace_id);
-        new_doc.insert("account_id", original.account_id.clone());
-        new_doc.insert(
-            "document_id",
-            original
-                .document_id
-                .map(Bson::ObjectId)
-                .unwrap_or(Bson::Null),
-        );
-        new_doc.insert("domain", original.domain.clone());
-        new_doc.insert("title", "拆分草稿（待编辑）");
-        new_doc.insert("status", "draft");
-        new_doc.insert("integrity_status", "needs_review");
-        new_doc.insert("priority", original.priority);
-        new_doc.insert("created_at", now);
-        new_doc.insert("updated_at", now);
-        new_doc.insert(
-            "wiki_type",
-            original
-                .wiki_type
-                .clone()
-                .unwrap_or_else(|| "entity".to_string()),
-        );
-        new_doc.insert("previous_version_id", object_id.to_hex());
-        // 合并 caller 给出的字段（title / body / summary 等）
-        let raw_doc = json_object_to_document(raw)?;
-        for (k, v) in raw_doc.iter() {
-            new_doc.insert(k, v.clone());
-        }
-        let inserted = state
-            .db
-            .operation_knowledge_chunks()
-            .insert_one(
-                mongodb::bson::from_document::<crate::models::OperationKnowledgeChunk>(new_doc.clone())
-                    .map_err(|e| AppError::BadRequest(format!("split 新 chunk 字段不合法: {e}")))?,
-                None,
-            )
-            .await?;
-        if let Some(oid) = inserted.inserted_id.as_object_id() {
-            // 写一条 create revision（source=human，便于审计）
-            let create_req = RevisionRequest {
-                op: RevisionOp::Create,
-                source: ProvenanceSource::Human,
-                patch: raw_doc,
-                reason: Some(format!(
-                    "split from chunk {} (anchor={})",
-                    object_id.to_hex(),
-                    payload.split_anchor.clone().unwrap_or_default()
-                )),
-                actor: payload.actor.clone(),
-            };
-            // 该 chunk 在 DB 中已存在，apply_chunk_revision 会读它再写一次（幂等）
-            let _ = apply_chunk_revision(&state.db, workspace_id, oid, create_req).await;
-            new_ids.push(oid.to_hex());
-        }
-    }
     Ok(Json(json!({
         "ok": true,
         "archived": revision_applied_to_json(&archived),
@@ -501,24 +451,154 @@ pub(in crate::routes) async fn split_operation_knowledge_chunk(
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(in crate::routes) struct ChunkMergeRequest {
-    /// 合并目标的 chunk_id。
-    pub merge_target_id: String,
-    /// "into_target": 内容并入 target，原 chunk 归档；
-    /// "new_chunk": 双 archive，创建新 chunk（new_chunks[0] 为新 chunk 字段集）。
-    #[serde(default = "default_merge_strategy")]
-    pub merge_strategy: String,
-    pub new_chunk: Option<Value>,
+    /// Existing target chunk. Both source and target must have identical domain
+    /// and account scope; the target owns all resulting scope fields.
+    pub target_id: String,
     pub reason: Option<String>,
-    pub actor: Option<String>,
 }
 
-fn default_merge_strategy() -> String {
-    "into_target".to_string()
+async fn merge_operation_knowledge_chunk_in_transaction(
+    state: &AppState,
+    admin: &AuthenticatedAdmin,
+    object_id: mongodb::bson::oid::ObjectId,
+    payload: ChunkMergeRequest,
+    session: &mut ClientSession,
+) -> AppResult<(RevisionApplied, RevisionApplied)> {
+    let target_id = parse_object_id(&payload.target_id)?;
+    let workspace_id = &admin.current_workspace;
+    if object_id == target_id {
+        return Err(AppError::BadRequest(
+            "cannot merge a chunk into itself".to_string(),
+        ));
+    }
+    let source = state
+        .db
+        .operation_knowledge_chunks()
+        .find_one_with_session(
+            doc! { "_id": object_id, "workspace_id": workspace_id },
+            None,
+            session,
+        )
+        .await?
+        .ok_or_else(|| AppError::NotFound("source chunk not found".to_string()))?;
+    let target = state
+        .db
+        .operation_knowledge_chunks()
+        .find_one_with_session(
+            doc! { "_id": target_id, "workspace_id": workspace_id },
+            None,
+            session,
+        )
+        .await?
+        .ok_or_else(|| AppError::NotFound("target chunk not found".to_string()))?;
+    if source.status == "archived" || target.status == "archived" {
+        return Err(AppError::BadRequest(
+            "archived chunks cannot participate in merge".to_string(),
+        ));
+    }
+    if source.domain != target.domain || source.account_id != target.account_id {
+        return Err(AppError::BadRequest(
+            "merge target must have the same domain and account scope".to_string(),
+        ));
+    }
+
+    fn join_distinct(first: Option<&str>, second: Option<&str>) -> Option<String> {
+        let first = first.map(str::trim).filter(|s| !s.is_empty());
+        let second = second.map(str::trim).filter(|s| !s.is_empty());
+        match (first, second) {
+            (Some(a), Some(b)) if a == b => Some(a.to_string()),
+            (Some(a), Some(b)) => Some(format!("{a}\n\n{b}")),
+            (Some(a), None) | (None, Some(a)) => Some(a.to_string()),
+            (None, None) => None,
+        }
+    }
+    let mut target_patch = Document::new();
+    if let Some(body) = join_distinct(target.body.as_deref(), source.body.as_deref()) {
+        target_patch.insert("body", body);
+    }
+    if let Some(summary) = join_distinct(target.summary.as_deref(), source.summary.as_deref()) {
+        target_patch.insert("summary", summary);
+    }
+    for (key, values) in [
+        ("applicable_scenes", &source.applicable_scenes),
+        ("not_applicable_scenes", &source.not_applicable_scenes),
+        ("product_tags", &source.product_tags),
+        ("business_topics", &source.business_topics),
+    ] {
+        if !values.is_empty() {
+            target_patch.insert(
+                key,
+                mongodb::bson::to_bson(values).map_err(|e| {
+                    AppError::External(format!("serialize merge field {key} failed: {e}"))
+                })?,
+            );
+        }
+    }
+    if target_patch.is_empty() {
+        return Err(AppError::BadRequest(
+            "source chunk has no mergeable content".to_string(),
+        ));
+    }
+    // The merged claim set needs fresh evidence before it can be verified.
+    target_patch.insert("source_quote", "");
+    target_patch.insert("source_anchors", Bson::Array(Vec::new()));
+
+    // Per-chunk locks are enforced by the revision harness by preserving the
+    // existing value. That behavior is right for ordinary mixed-field edits,
+    // but merge must be all-or-nothing at the semantic level: silently dropping
+    // any source content and then archiving the source would lose knowledge.
+    let target_document = mongodb::bson::to_document(&target)
+        .map_err(|e| AppError::External(format!("serialize merge target failed: {e}")))?;
+    let locked = effective_locked_fields(&target_document);
+    let blocked: Vec<_> = target_patch
+        .keys()
+        .filter(|key| locked.iter().any(|locked_key| locked_key == *key))
+        .cloned()
+        .collect();
+    if !blocked.is_empty() {
+        return Err(AppError::BadRequest(format!(
+            "merge target locks required fields: {}",
+            blocked.join(", ")
+        )));
+    }
+
+    let tgt = apply_chunk_revision_with_session(
+        &state.db,
+        workspace_id,
+        target_id,
+        RevisionRequest {
+            op: RevisionOp::Merge,
+            source: ProvenanceSource::Human,
+            patch: target_patch,
+            reason: payload
+                .reason
+                .clone()
+                .or_else(|| Some(format!("merged from chunk {}", object_id.to_hex()))),
+            actor: Some(admin.username.clone()),
+        },
+        session,
+    )
+    .await?;
+    let arch = apply_chunk_revision_with_session(
+        &state.db,
+        workspace_id,
+        object_id,
+        RevisionRequest {
+            op: RevisionOp::Merge,
+            source: ProvenanceSource::Human,
+            patch: doc! { "status": "archived", "superseded_by": target_id.to_hex() },
+            reason: payload.reason,
+            actor: Some(admin.username.clone()),
+        },
+        session,
+    )
+    .await?;
+    Ok((tgt, arch))
 }
 
-/// `POST /operation-knowledge/chunks/:id/merge` — 合并 chunk。
+/// `POST /operation-knowledge/chunks/:id/merge` — atomically merge into target.
 pub(in crate::routes) async fn merge_operation_knowledge_chunk(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
@@ -526,178 +606,75 @@ pub(in crate::routes) async fn merge_operation_knowledge_chunk(
     Json(payload): Json<ChunkMergeRequest>,
 ) -> AppResult<Json<Value>> {
     let object_id = parse_object_id(&id)?;
-    let target_id = parse_object_id(&payload.merge_target_id)?;
-    let workspace_id = &admin.current_workspace;
-    match payload.merge_strategy.as_str() {
-        "into_target" => {
-            // 把原 chunk 归档，target chunk 接收一些字段（数组字段会自动 union）
-            let archive = RevisionRequest {
-                op: RevisionOp::Merge,
-                source: ProvenanceSource::Human,
-                patch: doc! { "status": "archived", "superseded_by": target_id.to_hex() },
-                reason: payload.reason.clone(),
-                actor: payload.actor.clone(),
-            };
-            let arch = apply_chunk_revision(&state.db, workspace_id, object_id, archive).await?;
-            // target chunk 写一条 merge revision（patch=空，意在记录"我吸收了原 chunk"）
-            let target_req = RevisionRequest {
-                op: RevisionOp::Merge,
-                source: ProvenanceSource::Human,
-                patch: doc! { "previous_version_id": object_id.to_hex() },
-                reason: Some(format!("merged from chunk {}", object_id.to_hex())),
-                actor: payload.actor.clone(),
-            };
-            let tgt = apply_chunk_revision(&state.db, workspace_id, target_id, target_req).await?;
-            super::super::chunk_locks::broadcast_chunk_revised_in(
-                &state,
-                workspace_id,
-                &arch.chunk_id,
-                "merge",
-                &admin.username,
-            );
-            super::super::chunk_locks::broadcast_chunk_revised_in(
-                &state,
-                workspace_id,
-                &tgt.chunk_id,
-                "merge",
-                &admin.username,
-            );
-            Ok(Json(json!({
-                "ok": true,
-                "archived": revision_applied_to_json(&arch),
-                "target": revision_applied_to_json(&tgt),
-            })))
+    let mut session = state.db.client().start_session(None).await?;
+    session
+        .start_transaction(TransactionOptions::builder().build())
+        .await?;
+    let result = merge_operation_knowledge_chunk_in_transaction(
+        &state,
+        &admin,
+        object_id,
+        payload,
+        &mut session,
+    )
+    .await;
+    let (tgt, arch) = match result {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = session.abort_transaction().await;
+            return Err(error);
         }
-        "new_chunk" => {
-            // 双 archive + 新 chunk
-            let arch_a = apply_chunk_revision(
-                &state.db,
-                workspace_id,
-                object_id,
-                RevisionRequest {
-                    op: RevisionOp::Merge,
-                    source: ProvenanceSource::Human,
-                    patch: doc! { "status": "archived" },
-                    reason: payload.reason.clone(),
-                    actor: payload.actor.clone(),
-                },
-            )
-            .await?;
-            let arch_b = apply_chunk_revision(
-                &state.db,
-                workspace_id,
-                target_id,
-                RevisionRequest {
-                    op: RevisionOp::Merge,
-                    source: ProvenanceSource::Human,
-                    patch: doc! { "status": "archived" },
-                    reason: payload.reason.clone(),
-                    actor: payload.actor.clone(),
-                },
-            )
-            .await?;
-            let raw = payload.new_chunk.ok_or_else(|| {
-                AppError::BadRequest(
-                    "merge_strategy=new_chunk 时必须提供 new_chunk 字段".to_string(),
-                )
-            })?;
-            let raw_doc = json_object_to_document(&raw)?;
-            let now = DateTime::now();
-            let mut new_doc = raw_doc.clone();
-            new_doc.insert("workspace_id", workspace_id);
-            new_doc.insert("status", "draft");
-            new_doc.insert("integrity_status", "needs_review");
-            new_doc.insert("created_at", now);
-            new_doc.insert("updated_at", now);
-            if !new_doc.contains_key("priority") {
-                new_doc.insert("priority", 0i32);
-            }
-            if !new_doc.contains_key("title") {
-                new_doc.insert("title", "合并草稿（待编辑）");
-            }
-            if !new_doc.contains_key("domain") {
-                new_doc.insert("domain", "user");
-            }
-            if !new_doc.contains_key("wiki_type") {
-                new_doc.insert("wiki_type", "entity");
-            }
-            new_doc.insert(
-                "previous_version_id",
-                format!("{}+{}", object_id.to_hex(), target_id.to_hex()),
-            );
-            let inserted = state
-                .db
-                .operation_knowledge_chunks()
-                .insert_one(
-                    mongodb::bson::from_document::<crate::models::OperationKnowledgeChunk>(
-                        new_doc.clone(),
-                    )
-                    .map_err(|e| {
-                        AppError::BadRequest(format!("merge 新 chunk 字段不合法: {e}"))
-                    })?,
-                    None,
-                )
-                .await?;
-            let new_id = inserted
-                .inserted_id
-                .as_object_id()
-                .map(|o| o.to_hex())
-                .unwrap_or_default();
-            super::super::chunk_locks::broadcast_chunk_revised_in(
-                &state,
-                workspace_id,
-                &arch_a.chunk_id,
-                "merge",
-                &admin.username,
-            );
-            super::super::chunk_locks::broadcast_chunk_revised_in(
-                &state,
-                workspace_id,
-                &arch_b.chunk_id,
-                "merge",
-                &admin.username,
-            );
-            if !new_id.is_empty() {
-                super::super::chunk_locks::broadcast_chunk_revised_in(
-                    &state,
-                    workspace_id,
-                    &new_id,
-                    "create",
-                    &admin.username,
-                );
-            }
-            Ok(Json(json!({
-                "ok": true,
-                "archivedA": revision_applied_to_json(&arch_a),
-                "archivedB": revision_applied_to_json(&arch_b),
-                "newChunkId": new_id,
-            })))
+    };
+    commit_chunk_transaction(&mut session).await?;
+
+    for changed in [&tgt, &arch] {
+        super::super::chunk_locks::broadcast_chunk_revised_in(
+            &state,
+            &admin.current_workspace,
+            &changed.chunk_id,
+            "merge",
+            &admin.username,
+        );
+    }
+    Ok(Json(json!({
+        "ok": true,
+        "archived": revision_applied_to_json(&arch),
+        "target": revision_applied_to_json(&tgt),
+    })))
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(in crate::routes) enum ChunkRelationKind {
+    SupersededBy,
+    References,
+    Requires,
+    Contradicts,
+    Clarifies,
+    Refines,
+}
+
+impl ChunkRelationKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::SupersededBy => "superseded_by",
+            Self::References => "references",
+            Self::Requires => "requires",
+            Self::Contradicts => "contradicts",
+            Self::Clarifies => "clarifies",
+            Self::Refines => "refines",
         }
-        other => Err(AppError::BadRequest(format!(
-            "merge_strategy='{other}' 不合法，应为 into_target | new_chunk"
-        ))),
     }
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(in crate::routes) struct ChunkRelateRequest {
     pub target_id: String,
-    /// "superseded_by" / "references" / "requires" / "contradicts" / "clarifies" / "refines"
-    pub kind: String,
+    pub kind: ChunkRelationKind,
     pub note: Option<String>,
     pub reason: Option<String>,
-    pub actor: Option<String>,
 }
-
-const ALLOWED_RELATION_KINDS: &[&str] = &[
-    "superseded_by",
-    "references",
-    "requires",
-    "contradicts",
-    "clarifies",
-    "refines",
-];
 
 /// `POST /operation-knowledge/chunks/:id/relate` — 添加一条 related_chunks。
 pub(in crate::routes) async fn relate_operation_knowledge_chunk(
@@ -707,27 +684,13 @@ pub(in crate::routes) async fn relate_operation_knowledge_chunk(
     Json(payload): Json<ChunkRelateRequest>,
 ) -> AppResult<Json<Value>> {
     let object_id = parse_object_id(&id)?;
-    if !ALLOWED_RELATION_KINDS.contains(&payload.kind.as_str()) {
-        return Err(AppError::BadRequest(format!(
-            "relation kind '{}' 不合法，应为 {}",
-            payload.kind,
-            ALLOWED_RELATION_KINDS.join(" | "),
-        )));
-    }
-    // target 必须存在（同 workspace）
     let target_oid = parse_object_id(&payload.target_id)?;
-    state
-        .db
-        .operation_knowledge_chunks()
-        .find_one(
-            doc! {
-                "_id": target_oid,
-                "workspace_id": &admin.current_workspace,
-            },
-            None,
-        )
-        .await?
-        .ok_or_else(|| AppError::NotFound("relate target chunk not found".to_string()))?;
+    if object_id == target_oid {
+        return Err(AppError::BadRequest(
+            "cannot relate a chunk to itself".to_string(),
+        ));
+    }
+    let relation_kind = payload.kind.as_str();
     let existing = state
         .db
         .operation_knowledge_chunks()
@@ -740,17 +703,46 @@ pub(in crate::routes) async fn relate_operation_knowledge_chunk(
         )
         .await?
         .ok_or_else(|| AppError::NotFound("operation knowledge chunk not found".to_string()))?;
+    // The target must be visible from the source capability. A private source may
+    // point to shared or same-account knowledge; a shared source may only point
+    // to shared knowledge. This prevents relation traversal from becoming an
+    // account-to-account read tunnel.
+    let target_visibility = match existing.account_id.as_deref() {
+        Some(account_id) => vec![
+            doc! { "account_id": null },
+            doc! { "account_id": account_id },
+        ],
+        None => vec![doc! { "account_id": null }],
+    };
+    state
+        .db
+        .operation_knowledge_chunks()
+        .find_one(
+            doc! {
+                "_id": target_oid,
+                "workspace_id": &admin.current_workspace,
+                "domain": &existing.domain,
+                "$or": target_visibility,
+            },
+            None,
+        )
+        .await?
+        .ok_or_else(|| {
+            AppError::BadRequest(
+                "relate target is outside the source account visibility scope".to_string(),
+            )
+        })?;
     let mut related = existing.related_chunks.clone().unwrap_or_default();
     // 同 (target_id, kind) 已存在 → 视为幂等成功，更新 note
     if let Some(found) = related
         .iter_mut()
-        .find(|r| r.chunk_id == payload.target_id && r.kind == payload.kind)
+        .find(|r| r.chunk_id == payload.target_id && r.kind == relation_kind)
     {
         found.note = payload.note.clone().or_else(|| found.note.clone());
     } else {
         related.push(crate::models::RelatedRef {
             chunk_id: payload.target_id.clone(),
-            kind: payload.kind.clone(),
+            kind: relation_kind.to_string(),
             note: payload.note.clone(),
         });
     }
@@ -764,18 +756,12 @@ pub(in crate::routes) async fn relate_operation_knowledge_chunk(
         reason: payload.reason.or_else(|| {
             Some(format!(
                 "relate -> {} ({})",
-                payload.target_id, payload.kind
+                payload.target_id, relation_kind
             ))
         }),
-        actor: payload.actor,
+        actor: Some(admin.username.clone()),
     };
-    let applied = apply_chunk_revision(
-        &state.db,
-        &admin.current_workspace,
-        object_id,
-        req,
-    )
-    .await?;
+    let applied = apply_chunk_revision(&state.db, &admin.current_workspace, object_id, req).await?;
     super::super::chunk_locks::broadcast_chunk_revised_in(
         &state,
         &admin.current_workspace,
@@ -831,15 +817,9 @@ pub(in crate::routes) async fn unrelate_operation_knowledge_chunk(
                 .map_err(|e| AppError::External(format!("serialize related_chunks failed: {e}")))?
         },
         reason: Some(format!("unrelate -> {target_id}")),
-        actor: None,
+        actor: Some(admin.username.clone()),
     };
-    let applied = apply_chunk_revision(
-        &state.db,
-        &admin.current_workspace,
-        object_id,
-        req,
-    )
-    .await?;
+    let applied = apply_chunk_revision(&state.db, &admin.current_workspace, object_id, req).await?;
     super::super::chunk_locks::broadcast_chunk_revised_in(
         &state,
         &admin.current_workspace,
@@ -849,10 +829,7 @@ pub(in crate::routes) async fn unrelate_operation_knowledge_chunk(
     );
     let mut value = revision_applied_to_json(&applied);
     if let Some(o) = value.as_object_mut() {
-        o.insert(
-            "removed".to_string(),
-            json!(original_len - kept.len()),
-        );
+        o.insert("removed".to_string(), json!(original_len - kept.len()));
     }
     Ok(Json(value))
 }
@@ -890,10 +867,7 @@ pub async fn list_chunk_referrers(
     let mut items: Vec<Value> = Vec::new();
     while cur.advance().await? {
         let chunk = cur.deserialize_current()?;
-        let chunk_id = chunk
-            .id
-            .map(|o| o.to_hex())
-            .unwrap_or_default();
+        let chunk_id = chunk.id.map(|o| o.to_hex()).unwrap_or_default();
         let related = chunk.related_chunks.clone().unwrap_or_default();
         let matched: Vec<&_> = related
             .iter()
@@ -1019,8 +993,6 @@ pub struct ChunkBatchArchiveRequest {
     pub ids: Vec<String>,
     #[serde(default)]
     pub reason: Option<String>,
-    #[serde(default)]
-    pub actor: Option<String>,
 }
 
 /// `POST /operation-knowledge/chunks/batch-archive`
@@ -1051,16 +1023,9 @@ pub async fn batch_archive_chunks(
             source: ProvenanceSource::Human,
             patch: Document::new(),
             reason: payload.reason.clone(),
-            actor: payload.actor.clone(),
+            actor: Some(admin.username.clone()),
         };
-        match apply_chunk_revision(
-            &state.db,
-            &admin.current_workspace,
-            object_id,
-            req,
-        )
-        .await
-        {
+        match apply_chunk_revision(&state.db, &admin.current_workspace, object_id, req).await {
             Ok(_) => archived.push(id.clone()),
             Err(e) => skipped.push(json!({ "id": id, "reason": format!("{}", e) })),
         }
@@ -1088,5 +1053,56 @@ mod contract_tests {
         };
         let projected = revision_applied_to_json(&applied);
         crate::routes::contract_snapshot::assert_contract_fixture("revision_applied", projected);
+    }
+
+    #[test]
+    fn chunk_action_requests_accept_only_the_published_wire_contract() {
+        let patch: ChunkPatchRequest = serde_json::from_value(json!({
+            "patch": { "summary": "updated" }
+        }))
+        .expect("published patch body");
+        assert_eq!(patch.patch["summary"], "updated");
+
+        let split: ChunkSplitRequest =
+            serde_json::from_value(json!({ "offset": 5 })).expect("published split body");
+        assert_eq!(split.offset, 5);
+
+        let merge: ChunkMergeRequest = serde_json::from_value(json!({
+            "targetId": "507f1f77bcf86cd799439011"
+        }))
+        .expect("published merge body");
+        assert_eq!(merge.target_id, "507f1f77bcf86cd799439011");
+
+        let relate: ChunkRelateRequest = serde_json::from_value(json!({
+            "targetId": "507f1f77bcf86cd799439012",
+            "kind": "references",
+            "note": "source"
+        }))
+        .expect("published relate body");
+        assert_eq!(relate.kind, ChunkRelationKind::References);
+
+        assert!(serde_json::from_value::<ChunkPatchRequest>(json!({
+            "summary": "wrong level"
+        }))
+        .is_err());
+        assert!(serde_json::from_value::<ChunkSplitRequest>(json!({
+            "offset": 5,
+            "newChunks": []
+        }))
+        .is_err());
+        assert!(serde_json::from_value::<ChunkMergeRequest>(json!({
+            "target_id": "507f1f77bcf86cd799439011"
+        }))
+        .is_err());
+        assert!(serde_json::from_value::<ChunkRelateRequest>(json!({
+            "target_id": "507f1f77bcf86cd799439012",
+            "kind": "references"
+        }))
+        .is_err());
+        assert!(serde_json::from_value::<ChunkRelateRequest>(json!({
+            "targetId": "507f1f77bcf86cd799439012",
+            "kind": "supports"
+        }))
+        .is_err());
     }
 }

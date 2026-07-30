@@ -1,6 +1,7 @@
 import { useEffect, useState, useCallback } from "react";
 import { ChunkRepairPanel } from "./ChunkRepairPanel";
 import { integrityStatusLabel } from "./labels";
+import { invalidateChunks } from "./chunkInvalidation";
 
 interface ChunkView {
   id: string;
@@ -83,9 +84,7 @@ export function DocumentRepairPanel({
                   onApplied={() => {
                     setDoneIds((prev) => new Set(prev).add(chunk.id));
                     setExpandedId(null);
-                    window.dispatchEvent(
-                      new CustomEvent("wikiChunkRevised", { detail: { chunk_id: chunk.id } }),
-                    );
+                    invalidateChunks({ reason: "local", chunkId: chunk.id });
                     onRepaired?.();
                   }}
                 />

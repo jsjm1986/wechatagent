@@ -93,6 +93,13 @@ pub(super) async fn update_operation_domain(
     Json(mut payload): Json<OperationDomainRequest>,
 ) -> AppResult<Json<Value>> {
     validate_operation_domain_input(&payload)?;
+    if domain == crate::agent::domain::USER_OPS_DOMAIN_ID {
+        payload.runtime_parameters =
+            crate::agent::runtime::validate_and_normalize_user_runtime_parameters(
+                &payload.runtime_parameters,
+            )
+            .map_err(AppError::BadRequest)?;
+    }
     validate_state_machine(&payload.state_machine)?;
     normalize_state_machine_allow_from_any(&mut payload.state_machine);
     ensure_operation_domains(&state, &admin.current_workspace).await?;
@@ -209,10 +216,53 @@ pub async fn put_ask_human_policy(
     Path(domain): Path<String>,
     Json(policy): Json<crate::models::AskHumanPolicy>,
 ) -> AppResult<Json<Value>> {
-    // 校验：decider_chain wxid 非空；quiet_hours 小时范围。
+    // 空链是显式关闭态。非空链中的每位决策人必须绑定当前 workspace 下的真实
+    // 发送账号，并且该 wxid 确实属于该账号通讯录，防止内部卡从错误账号发出。
     for d in &policy.decider_chain {
         if d.wxid.trim().is_empty() {
             return Err(AppError::BadRequest("decider_chain wxid 不能为空".into()));
+        }
+        let account_id = d
+            .account_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| AppError::BadRequest("决策人必须绑定发送账号".into()))?;
+        let account_exists = state
+            .db
+            .accounts()
+            .count_documents(
+                doc! {
+                    "workspace_id": &admin.current_workspace,
+                    "account_id": account_id,
+                },
+                None,
+            )
+            .await?
+            > 0;
+        if !account_exists {
+            return Err(AppError::BadRequest(format!(
+                "决策人账号 {account_id} 不属于当前 workspace"
+            )));
+        }
+        let contact_exists = state
+            .db
+            .contacts()
+            .count_documents(
+                doc! {
+                    "workspace_id": &admin.current_workspace,
+                    "account_id": account_id,
+                    "wxid": d.wxid.trim(),
+                },
+                None,
+            )
+            .await?
+            > 0;
+        if !contact_exists {
+            return Err(AppError::BadRequest(format!(
+                "决策人 {} 不在账号 {account_id} 的通讯录中",
+                d.wxid.trim()
+            )));
         }
     }
     if let Some(qh) = &policy.quiet_hours {
@@ -251,23 +301,31 @@ pub(super) async fn reset_operation_domain(
     else {
         return Err(AppError::NotFound("operation domain not found".to_string()));
     };
-    state
-        .db
-        .operation_domain_configs()
-        .delete_many(
-            doc! {
-                "workspace_id": &admin.current_workspace,
-                "domain": &domain
-            },
-            None,
+    let state_machine = default_config.state_machine.clone();
+    let (id, version, previous_version) =
+        super::admin_ops_versions::append_default_operation_domain_version(
+            &state.db,
+            default_config,
+            format!("admin_reset:{}", admin.username),
         )
         .await?;
-    state
-        .db
-        .operation_domain_configs()
-        .insert_one(default_config, None)
-        .await?;
-    Ok(Json(json!({ "ok": true })))
+    let policies = super::admin_ops_versions::reconcile_state_policies_for_machine(
+        &state.db,
+        &admin.current_workspace,
+        &domain,
+        &state_machine,
+        "statemachine_publish:admin_reset",
+        DateTime::now(),
+    )
+    .await;
+    Ok(Json(json!({
+        "ok": true,
+        "id": id.to_hex(),
+        "version": version,
+        "previousVersion": previous_version,
+        "status": if policies.is_complete() { "completed" } else { "partial" },
+        "statePolicies": policies,
+    })))
 }
 
 pub(super) fn operation_domain_json(config: OperationDomainConfig) -> Value {
@@ -476,7 +534,6 @@ pub(super) async fn find_operation_domain(
     .ok_or_else(|| AppError::NotFound("operation domain not found".to_string()))
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -626,6 +683,7 @@ mod tests {
                 decider_chain: vec![DeciderRef {
                     wxid: "wxid_leader".to_string(),
                     display_name: Some("张总".to_string()),
+                    account_id: Some("acc-1".to_string()),
                 }],
                 escalate_safety_guard: true,
                 escalate_unverified_product: true,

@@ -23,7 +23,11 @@ use crate::common::TestApp;
 async fn ensure_indexes_survives_multi_version_domain_configs() {
     let app = TestApp::start().await;
     // TestApp::start 已跑首次 ensure_indexes(空库单 version 底座)。
-    let coll = app.state.db.raw().collection::<Document>("operation_domain_configs");
+    let coll = app
+        .state
+        .db
+        .raw()
+        .collection::<Document>("operation_domain_configs");
     // 手工插同 (ws, domain) 的第 2 行 version=2,模拟 admin publish 攒下的多版本行。
     coll.insert_one(
         doc! {
@@ -51,18 +55,21 @@ async fn ensure_indexes_survives_multi_version_domain_configs() {
 #[ignore]
 async fn ensure_indexes_survives_multi_version_state_policies() {
     let app = TestApp::start().await;
-    let coll = app.state.db.raw().collection::<Document>("operation_state_policies");
-    // 先 seed v1 底座:TestApp::start 后 operation_state_policies 为空——m013(migrations::run,
-    // 早于 ensure_prompt_pack_v2)遍历 operation_domain_configs 生成 policy,但 domain_configs
-    // 要到 ensure_prompt_pack_v2 才 seed,故 m013 跑时读到 0 行 domain_configs → seed 出 0 行
-    // state_policies。缺了这条 v1 行,下面单插 1 行 v2 时旧 3-key unique 建在单行上不会 E11000,
-    // 测试即便在旧 bug 存在时也会 pass(空转)。补上同 (ws, domain, state_key) 的 v1 行后,
-    // 与 v2 行共享 (default, user_operations, new_contact) → 旧 3-key unique 重建时撞重复键。
+    let coll = app
+        .state
+        .db
+        .raw()
+        .collection::<Document>("operation_state_policies");
+    // 使用测试专属 scope，避免依赖 TestApp 启动后默认 policy 是否已经物化。
+    // 两行只差 version，仍能精确复现旧 3-key unique 的 boot-brick 条件。
+    let workspace = "ops-versioned-index-test";
+    let domain = "test_domain";
+    let state_key = "test_state";
     coll.insert_one(
         doc! {
-            "workspace_id": "default",
-            "domain": "user_operations",
-            "state_key": "new_contact",
+            "workspace_id": workspace,
+            "domain": domain,
+            "state_key": state_key,
             "version": 1_i32,
             "current_version": true,
         },
@@ -72,9 +79,9 @@ async fn ensure_indexes_survives_multi_version_state_policies() {
     .expect("seed v1 state policy 底座");
     coll.insert_one(
         doc! {
-            "workspace_id": "default",
-            "domain": "user_operations",
-            "state_key": "new_contact",
+            "workspace_id": workspace,
+            "domain": domain,
+            "state_key": state_key,
             "version": 2_i32,
             "current_version": false,
         },
@@ -96,7 +103,11 @@ async fn ensure_indexes_survives_multi_version_state_policies() {
 #[ignore]
 async fn four_tuple_unique_still_blocks_duplicate_version() {
     let app = TestApp::start().await;
-    let coll = app.state.db.raw().collection::<Document>("operation_domain_configs");
+    let coll = app
+        .state
+        .db
+        .raw()
+        .collection::<Document>("operation_domain_configs");
     // 先确保 4-tuple unique 已建(TestApp::start 已跑 ensure_indexes;此处再跑一次幂等)。
     app.state.db.ensure_indexes().await.expect("ensure indexes");
     // 插第一行 (ws=dup_ws, domain=dup_domain, version=1)。

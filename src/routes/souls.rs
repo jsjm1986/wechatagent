@@ -5,18 +5,15 @@ use axum::{
     Extension, Json,
 };
 use futures::TryStreamExt;
-use mongodb::{
-    bson::{doc, DateTime},
-    options::{FindOneOptions, FindOptions},
-};
+use mongodb::{bson::doc, options::FindOptions};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::{
     auth::AuthenticatedAdmin,
     error::{AppError, AppResult},
-    models::AgentSoul,
     prompts,
+    soul_versions::{self, NewSoulVersion},
 };
 
 use super::shared::*;
@@ -54,7 +51,12 @@ pub(super) async fn list_agent_souls(
             "content": soul.content,
             "status": soul.status,
             "version": soul.version,
-            "updatedAt": crate::models::dt_to_string(soul.updated_at)
+            "previousVersion": soul.previous_version,
+            "seededBy": soul.seeded_by,
+            "publishedAt": soul.published_at.and_then(crate::models::dt_to_string),
+            "publishedBy": soul.published_by,
+            "createdAt": crate::models::dt_to_string(soul.created_at),
+            "updatedAt": crate::models::dt_to_string(soul.updated_at),
         }));
     }
     Ok(Json(json!({ "items": items })))
@@ -65,41 +67,22 @@ pub(super) async fn create_agent_soul(
     Extension(admin): Extension<AuthenticatedAdmin>,
     Json(payload): Json<AgentSoulRequest>,
 ) -> AppResult<Json<Value>> {
-    if payload.agent_kind.trim().is_empty() || payload.content.trim().is_empty() {
-        return Err(AppError::BadRequest(
-            "agentKind and content are required".to_string(),
-        ));
-    }
-    let latest = state
-        .db
-        .agent_souls()
-        .find_one(
-            doc! {
-                "workspace_id": &admin.current_workspace,
-                "agent_kind": &payload.agent_kind
-            },
-            FindOneOptions::builder()
-                .sort(doc! { "version": -1 })
-                .build(),
-        )
-        .await?;
-    let version = latest.map(|item| item.version + 1).unwrap_or(1);
-    let soul = AgentSoul {
-        id: None,
-        workspace_id: admin.current_workspace.clone(),
-        agent_kind: payload.agent_kind,
-        name: payload.name,
-        content: payload.content,
-        status: "draft".to_string(),
-        version,
-        created_at: DateTime::now(),
-        updated_at: DateTime::now(),
-        seeded_by: Some("manual".to_string()),
-    };
-    let result = state.db.agent_souls().insert_one(soul, None).await?;
-    Ok(Json(
-        json!({ "id": result.inserted_id.as_object_id().map(|id| id.to_hex()) }),
-    ))
+    let soul = soul_versions::append_version(
+        &state.db,
+        &admin.current_workspace,
+        NewSoulVersion {
+            agent_kind: &payload.agent_kind,
+            name: &payload.name,
+            content: &payload.content,
+            seeded_by: "manual",
+            previous_version: None,
+        },
+    )
+    .await?;
+    Ok(Json(json!({
+        "id": soul.id.map(|id| id.to_hex()),
+        "version": soul.version
+    })))
 }
 
 pub(super) async fn update_agent_soul(
@@ -117,26 +100,21 @@ pub(super) async fn update_agent_soul(
         ));
     }
     let object_id = parse_object_id(&id)?;
-    state
-        .db
-        .agent_souls()
-        .update_one(
-            doc! {
-                "_id": object_id,
-                "workspace_id": &admin.current_workspace
-            },
-            doc! {
-                "$set": {
-                    "agent_kind": payload.agent_kind,
-                    "name": payload.name,
-                    "content": payload.content,
-                    "updated_at": DateTime::now()
-                }
-            },
-            None,
-        )
-        .await?;
-    Ok(Json(json!({ "ok": true })))
+    let soul = soul_versions::append_edited_draft(
+        &state.db,
+        &admin.current_workspace,
+        object_id,
+        &payload.agent_kind,
+        &payload.name,
+        &payload.content,
+        "manual",
+    )
+    .await?;
+    Ok(Json(json!({
+        "ok": true,
+        "id": soul.id.map(|id| id.to_hex()),
+        "version": soul.version
+    })))
 }
 
 pub(super) async fn publish_agent_soul(
@@ -145,46 +123,27 @@ pub(super) async fn publish_agent_soul(
     Extension(admin): Extension<AuthenticatedAdmin>,
 ) -> AppResult<Json<Value>> {
     let object_id = parse_object_id(&id)?;
-    let soul = state
-        .db
-        .agent_souls()
-        .find_one(
-            doc! { "_id": object_id, "workspace_id": &admin.current_workspace },
-            None,
-        )
-        .await?
-        .ok_or_else(|| AppError::NotFound("agent soul not found".to_string()))?;
+    let soul = soul_versions::publish_version(
+        &state.db,
+        &admin.current_workspace,
+        object_id,
+        &admin.user_id,
+    )
+    .await?;
     state
-        .db
-        .agent_souls()
-        .delete_many(
-            doc! {
-                "workspace_id": &admin.current_workspace,
-                "agent_kind": &soul.agent_kind,
-                "_id": { "$ne": object_id }
-            },
-            None,
-        )
-        .await?;
-    state
-        .db
-        .agent_souls()
-        .update_one(
-            doc! { "_id": object_id, "workspace_id": &admin.current_workspace },
-            doc! { "$set": { "status": "published", "updated_at": DateTime::now() } },
-            None,
-        )
-        .await?;
-    Ok(Json(json!({ "ok": true })))
+        .prompt_pack_version
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    Ok(Json(json!({
+        "ok": true,
+        "id": soul.id.map(|id| id.to_hex()),
+        "version": soul.version
+    })))
 }
 
 pub(super) async fn ensure_default_souls(state: &AppState, workspace_id: &str) -> AppResult<()> {
-    let wrote = prompts::ensure_prompt_pack_v2(
-        &state.db,
-        workspace_id,
-        &state.config.default_account_id,
-    )
-    .await?;
+    let wrote =
+        prompts::ensure_prompt_pack_v2(&state.db, workspace_id, &state.config.default_account_id)
+            .await?;
     if wrote {
         state
             .prompt_pack_version

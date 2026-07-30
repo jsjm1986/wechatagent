@@ -28,11 +28,12 @@ mod common;
 
 use axum::extract::{Extension, Json, State};
 use futures::TryStreamExt;
-use mongodb::bson::{doc, oid::ObjectId};
+use mongodb::bson::{doc, oid::ObjectId, DateTime};
 use serde_json::json;
 
 use wechatagent::auth::AuthenticatedAdmin;
-use wechatagent::models::OperationKnowledgeChunk;
+use wechatagent::llm::ChatUsage;
+use wechatagent::models::{DomainField, DomainSchema, OperationKnowledgeChunk};
 // `mod verify` 在 routes/knowledge/mod.rs 是**私有**模块,但 handler 经 `pub use verify::*`
 // 再导出,故按再导出路径引用(不能走 `...::verify::...` 私有模块路径)。
 use wechatagent::routes::knowledge::auto_verify_operation_knowledge_chunks;
@@ -86,7 +87,7 @@ fn seed_chunk(workspace_id: &str, idx: usize) -> OperationKnowledgeChunk {
 #[tokio::test]
 #[ignore]
 async fn auto_verify_handler_enforces_needs_human_audit() {
-    let app = TestApp::start().await;
+    let app = TestApp::start_repl_set().await;
     let ws = app.state.config.default_workspace_id.clone();
 
     // seed 3 条齐证据、待审的 chunk(3 条规避 5% 抽样随机性,见文件头说明)。
@@ -102,12 +103,21 @@ async fn auto_verify_handler_enforces_needs_human_audit() {
     // 每条 chunk 一次 LLM 调用:mock 返「LLM 自称 verified + 高 confidence」。
     // 若无 enforce 接线,这会让 decide_auto_verify_status 判成 verified 并落库。
     for _ in 0..3 {
-        app.llm.push_response(json!({
-            "confidenceScore": 10,
-            "integrityStatus": "verified",
-            "verifiedClaims": [],
-            "distortionRisks": []
-        }));
+        app.llm.push_response_with_usage(
+            json!({
+                "confidenceScore": 10,
+                "integrityStatus": "verified",
+                "verifiedClaims": [],
+                "distortionRisks": []
+            }),
+            ChatUsage {
+                prompt_tokens: 10,
+                completion_tokens: 10,
+                total_tokens: 20,
+                usage_known: true,
+                ..Default::default()
+            },
+        );
     }
 
     // 调 handler:confidenceThreshold=0 让 confidence>=threshold 恒真(隔离出 enforce
@@ -176,5 +186,113 @@ async fn auto_verify_handler_enforces_needs_human_audit() {
             .iter()
             .map(|c| c.integrity_status.clone())
             .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn auto_verify_counts_only_committed_revisions() {
+    let app = TestApp::start_repl_set().await;
+    let ws = app.state.config.default_workspace_id.clone();
+    let mut chunk = seed_chunk(&ws, 99);
+    let chunk_id = chunk.id.expect("seed chunk id");
+    chunk.domain_attributes = Some(doc! {});
+    app.state
+        .db
+        .operation_knowledge_chunks()
+        .insert_one(chunk, None)
+        .await
+        .expect("seed chunk");
+    app.state
+        .db
+        .domain_schemas()
+        .insert_one(
+            DomainSchema {
+                id: None,
+                schema_id: "required-stage".to_string(),
+                workspace_id: ws.clone(),
+                name: "required stage".to_string(),
+                version: 1,
+                fields: vec![DomainField {
+                    name: "stage".to_string(),
+                    label: "Stage".to_string(),
+                    kind: "string".to_string(),
+                    required: true,
+                    allowed_values: None,
+                    alias_of: None,
+                }],
+                alias_dict: doc! {},
+                guard_dsl: None,
+                is_active: true,
+                created_at: DateTime::now(),
+                updated_at: DateTime::now(),
+            },
+            None,
+        )
+        .await
+        .expect("seed active schema");
+    app.llm.push_response(json!({
+        "confidenceScore": 10,
+        "integrityStatus": "verified",
+        "verifiedClaims": [],
+        "distortionRisks": []
+    }));
+
+    let response = auto_verify_operation_knowledge_chunks(
+        State(app.state.clone()),
+        Extension(test_admin(&ws)),
+        Json(
+            serde_json::from_value(json!({
+                "confidenceThreshold": 0,
+                "humanAuditSampleRate": 0.05,
+                "limit": 1
+            }))
+            .expect("auto verify request"),
+        ),
+    )
+    .await
+    .expect("batch itself remains available when one revision fails")
+    .0;
+
+    assert_eq!(response["processed"], json!(0));
+    assert_eq!(response["failed"], json!(1));
+    assert_eq!(response["needsHumanAudit"], json!(0));
+    let stored = app
+        .state
+        .db
+        .operation_knowledge_chunks()
+        .find_one(doc! { "_id": chunk_id, "workspace_id": &ws }, None)
+        .await
+        .expect("reload chunk")
+        .expect("chunk remains");
+    assert_eq!(stored.integrity_status.as_deref(), Some("needs_review"));
+    assert_eq!(stored.confidence_score, Some(50));
+    assert_eq!(
+        app.state
+            .db
+            .chunk_revisions()
+            .count_documents(
+                doc! { "workspace_id": &ws, "chunk_id": chunk_id.to_hex() },
+                None,
+            )
+            .await
+            .expect("count revisions"),
+        0
+    );
+    assert_eq!(
+        app.state
+            .db
+            .knowledge_usage_logs()
+            .count_documents(
+                doc! {
+                    "workspace_id": &ws,
+                    "knowledge_ids": chunk_id,
+                    "route_result.kind": "knowledge_auto_verify",
+                },
+                None,
+            )
+            .await
+            .expect("count usage logs"),
+        0
     );
 }

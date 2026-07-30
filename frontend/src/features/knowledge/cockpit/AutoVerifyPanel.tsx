@@ -51,10 +51,10 @@ export function AutoVerifyPanel(_props: { onClose?: () => void }) {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
-          confidence_threshold: THRESHOLD[tightness],
+          confidenceThreshold: THRESHOLD[tightness],
           // 勾选「留一批复查」→ 30% 抽审；取消 → 仍保留 5% 硬下限（后端不允许 0：
           // 产品声明类已全量强制人审，其余类也始终留一批抽看，红线姿态不可被关掉）。
-          human_audit_sample_rate: keepReview ? 0.3 : 0.05,
+          humanAuditSampleRate: keepReview ? 0.3 : 0.05,
           limit: count,
         }),
       });

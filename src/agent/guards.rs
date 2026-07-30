@@ -8,7 +8,9 @@
 
 use mongodb::bson::Document;
 
-use crate::models::{CommitmentMarkers, OperationDomainConfig, OperationKnowledgeChunk, OperationStatePolicy};
+use crate::models::{
+    CommitmentMarkers, OperationDomainConfig, OperationKnowledgeChunk, OperationStatePolicy,
+};
 
 use super::types::{doc_bool, AgentDecision, RunPlannerResult};
 
@@ -187,9 +189,7 @@ pub fn check_state_transition(
         // C2 走 rejected 分支：保留旧 operation_state + 写审计事件，reply 不受影响（fail-soft）。
         // customer_stage 的 CandidateNew 仍按既有 taxonomy candidate 流程落库待人审，二者解耦。
         // DEFAULT 销售域 9 态均在状态机内，合法 to 恒命中，不受影响。
-        return Some(format!(
-            "state_transition_invalid: unknown_target to={to}"
-        ));
+        return Some(format!("state_transition_invalid: unknown_target to={to}"));
     };
     if target.get_bool("allowFromAny").unwrap_or(false) {
         return None;
@@ -272,7 +272,9 @@ pub fn enforce_state_action_policy(
     policy: Option<&OperationStatePolicy>,
     action: &str,
 ) -> Result<(), String> {
-    let Some(policy) = policy else { return Ok(()); };
+    let Some(policy) = policy else {
+        return Ok(());
+    };
     if policy.status != "active" {
         return Ok(());
     }
@@ -385,8 +387,7 @@ pub(crate) enum CommitmentClass {
 /// （向后兼容 + 防御老库/异常 profile）。**单一真相源**：`default_domain_profile` 的
 /// `commitment_markers` seed 逐字复刻这两组，由 `default_profile_commitment_markers_match_guards_const`
 /// 跨模块等价测试锁死（防 seed 与 fallback 漂移）。提到模块级 `pub(crate)` 即为供该测试引用。
-pub(crate) const PRODUCT_EFFECT_MARKERS: [&str; 5] =
-    ["成功率", "见效", "回款", "百分之", "百分百"];
+pub(crate) const PRODUCT_EFFECT_MARKERS: [&str; 5] = ["成功率", "见效", "回款", "百分之", "百分百"];
 /// 见 [`PRODUCT_EFFECT_MARKERS`]：纯语气类绝对化承诺 fallback const。
 pub(crate) const TONE_ONLY_MARKERS: [&str; 3] = ["保证", "一定能", "绝对"];
 
@@ -433,8 +434,8 @@ pub(crate) fn commitment_claim_class(
 mod policy_tests {
     //! Phase B / B4：`classify_decision_action` + `enforce_state_action_policy` 单测。
     use super::*;
-    use crate::models::OperationStatePolicy;
     use crate::agent::types::FollowUpDecision;
+    use crate::models::OperationStatePolicy;
     use mongodb::bson::DateTime;
 
     fn mk_policy(state: &str, allowed: &[&str], forbidden: &[&str]) -> OperationStatePolicy {
@@ -552,39 +553,72 @@ mod policy_tests {
     #[test]
     fn commitment_class_product_effect_on_data_words() {
         let m = crate::agent::domain_profile::default_domain_profile("ws").commitment_markers;
-        assert_eq!(commitment_claim_class("我们的成功率高达95%", &m), CommitmentClass::ProductEffect);
-        assert_eq!(commitment_claim_class("三天就见效", &m), CommitmentClass::ProductEffect);
-        assert_eq!(commitment_claim_class("保证按时回款", &m), CommitmentClass::ProductEffect);
+        assert_eq!(
+            commitment_claim_class("我们的成功率高达95%", &m),
+            CommitmentClass::ProductEffect
+        );
+        assert_eq!(
+            commitment_claim_class("三天就见效", &m),
+            CommitmentClass::ProductEffect
+        );
+        assert_eq!(
+            commitment_claim_class("保证按时回款", &m),
+            CommitmentClass::ProductEffect
+        );
     }
 
     #[test]
     fn commitment_class_tone_only_on_soft_words() {
         let m = crate::agent::domain_profile::default_domain_profile("ws").commitment_markers;
-        assert_eq!(commitment_claim_class("我保证认真对待您的问题", &m), CommitmentClass::ToneOnly);
-        assert_eq!(commitment_claim_class("这事绝对不怪你", &m), CommitmentClass::ToneOnly);
-        assert_eq!(commitment_claim_class("这个方案一定能帮到你", &m), CommitmentClass::ToneOnly);
+        assert_eq!(
+            commitment_claim_class("我保证认真对待您的问题", &m),
+            CommitmentClass::ToneOnly
+        );
+        assert_eq!(
+            commitment_claim_class("这事绝对不怪你", &m),
+            CommitmentClass::ToneOnly
+        );
+        assert_eq!(
+            commitment_claim_class("这个方案一定能帮到你", &m),
+            CommitmentClass::ToneOnly
+        );
     }
 
     #[test]
     fn commitment_class_product_effect_wins_when_both_present() {
         // 同时含语气词「一定能」和效果词「成功率」→ 取更危险的 ProductEffect
         let m = crate::agent::domain_profile::default_domain_profile("ws").commitment_markers;
-        assert_eq!(commitment_claim_class("一定能把成功率做上去", &m), CommitmentClass::ProductEffect);
+        assert_eq!(
+            commitment_claim_class("一定能把成功率做上去", &m),
+            CommitmentClass::ProductEffect
+        );
     }
 
     #[test]
     fn commitment_class_none_on_plain_reply() {
         let m = crate::agent::domain_profile::default_domain_profile("ws").commitment_markers;
-        assert_eq!(commitment_claim_class("好的，我先了解下你的具体情况", &m), CommitmentClass::None);
+        assert_eq!(
+            commitment_claim_class("好的，我先了解下你的具体情况", &m),
+            CommitmentClass::None
+        );
     }
 
     #[test]
     fn commitment_class_empty_markers_falls_back_to_const() {
         // H4：profile 词表两组皆空 → 回落内置销售域 const（向后兼容/防御）。
         let empty = CommitmentMarkers::default();
-        assert_eq!(commitment_claim_class("我们的成功率高达95%", &empty), CommitmentClass::ProductEffect);
-        assert_eq!(commitment_claim_class("我保证认真对待", &empty), CommitmentClass::ToneOnly);
-        assert_eq!(commitment_claim_class("好的，我先了解下", &empty), CommitmentClass::None);
+        assert_eq!(
+            commitment_claim_class("我们的成功率高达95%", &empty),
+            CommitmentClass::ProductEffect
+        );
+        assert_eq!(
+            commitment_claim_class("我保证认真对待", &empty),
+            CommitmentClass::ToneOnly
+        );
+        assert_eq!(
+            commitment_claim_class("好的，我先了解下", &empty),
+            CommitmentClass::None
+        );
     }
 
     #[test]
@@ -594,10 +628,19 @@ mod policy_tests {
             product_effect: vec!["根治率".to_string(), "包好".to_string()],
             tone_only: vec!["一定治好".to_string()],
         };
-        assert_eq!(commitment_claim_class("我们根治率很高", &medical), CommitmentClass::ProductEffect);
-        assert_eq!(commitment_claim_class("这病一定治好", &medical), CommitmentClass::ToneOnly);
+        assert_eq!(
+            commitment_claim_class("我们根治率很高", &medical),
+            CommitmentClass::ProductEffect
+        );
+        assert_eq!(
+            commitment_claim_class("这病一定治好", &medical),
+            CommitmentClass::ToneOnly
+        );
         // 销售域 const 词在医疗 profile 下不再命中（词表已替换，非叠加）。
-        assert_eq!(commitment_claim_class("三天就见效", &medical), CommitmentClass::None);
+        assert_eq!(
+            commitment_claim_class("三天就见效", &medical),
+            CommitmentClass::None
+        );
     }
 }
 
@@ -686,7 +729,10 @@ mod cross_domain_state_machine_tests {
     fn cross_domain_illegal_transitions_rejected() {
         let cfg = medical_domain_config();
         let reason = check_state_transition(Some(&cfg), Some("initial_consult"), "treated");
-        assert!(reason.is_some(), "初诊直接→已治疗应被拦（跳过方案确认/复诊）");
+        assert!(
+            reason.is_some(),
+            "初诊直接→已治疗应被拦（跳过方案确认/复诊）"
+        );
         assert!(
             reason.unwrap().contains("state_transition_invalid"),
             "拦截理由须含 state_transition_invalid"
@@ -832,10 +878,12 @@ mod is_verified_tests {
         c.valid_to = None;
 
         c.integrity_status = Some("Verified".into());
-        assert!(!is_verified(&c, now), "大写变体须精确不匹配(口径对齐召回侧)");
+        assert!(
+            !is_verified(&c, now),
+            "大写变体须精确不匹配(口径对齐召回侧)"
+        );
 
         c.integrity_status = Some("VERIFIED".into());
         assert!(!is_verified(&c, now));
     }
 }
-

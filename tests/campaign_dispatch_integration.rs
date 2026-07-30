@@ -9,12 +9,16 @@
 mod common;
 
 use axum::extract::{Extension, Path, State};
+use axum::Json;
 use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
 
 use wechatagent::auth::AuthenticatedAdmin;
-use wechatagent::models::{AgentStatus, Campaign, CampaignSend, Contact, SegmentFilter};
-use wechatagent::routes::campaigns::dispatch_campaign;
-use wechatagent::routes::campaigns::preview_campaign;
+use wechatagent::models::{AgentStatus, Campaign, Contact, SegmentFilter, WechatAccount};
+use wechatagent::routes::campaigns::{
+    campaign_spec_hash_for_view, create_campaign, dispatch_campaign, preview_campaign,
+    reconcile_campaign_dispatches, update_campaign_draft, CreateCampaignRequest,
+    DispatchCampaignRequest, UpdateCampaignDraftRequest,
+};
 
 use crate::common::TestApp;
 
@@ -23,6 +27,32 @@ fn test_admin(workspace_id: &str) -> AuthenticatedAdmin {
         user_id: "camp_admin".to_string(),
         username: "camp_admin".to_string(),
         current_workspace: workspace_id.to_string(),
+    }
+}
+
+fn make_account(workspace_id: &str, account_id: &str) -> WechatAccount {
+    let now = DateTime::now();
+    WechatAccount {
+        id: None,
+        workspace_id: workspace_id.to_string(),
+        account_id: account_id.to_string(),
+        alias: account_id.to_string(),
+        display_name: account_id.to_string(),
+        app_id: None,
+        wxid: None,
+        nick_name: None,
+        avatar_url: None,
+        mcp_base_url: None,
+        mcp_api_key: None,
+        webhook_secret: None,
+        online: true,
+        status: None,
+        last_sync_at: now,
+        capacity: 0,
+        persona_tag: None,
+        off_hours: Vec::new(),
+        created_at: now,
+        updated_at: now,
     }
 }
 
@@ -88,14 +118,104 @@ fn make_campaign(ws: &str, acc: &str) -> Campaign {
         title: "促活".to_string(),
         intent_text: "回访问候".to_string(),
         segment_filter: SegmentFilter::default(),
+        spec_version: 1,
+        spec_hash: None,
         status: "draft".to_string(),
         target_count: None,
         dispatched_count: 0,
         last_dispatch_target_count: None,
+        dispatch_generation: 0,
+        dispatch_spec_hash: None,
+        dispatch_audience: Vec::new(),
+        dispatch_intent_text: None,
+        dispatch_started_at: None,
+        dispatch_completed_at: None,
         created_by: "camp_admin".to_string(),
         created_at: now,
         updated_at: now,
     }
+}
+
+/// Build the dispatch request from the production Campaign hash implementation.
+/// Integration tests deliberately do not duplicate the canonicalization/hash algorithm.
+async fn dispatch_current_spec(
+    app: &TestApp,
+    admin_workspace: &str,
+    campaign_id: ObjectId,
+) -> wechatagent::error::AppResult<Json<serde_json::Value>> {
+    let campaign = app
+        .state
+        .db
+        .campaigns()
+        .find_one(doc! { "_id": campaign_id }, None)
+        .await?
+        .expect("campaign exists before dispatch");
+    let spec_hash = campaign_spec_hash_for_view(&campaign)?;
+    dispatch_campaign(
+        State(app.state.clone()),
+        Extension(test_admin(admin_workspace)),
+        Path(campaign_id.to_hex()),
+        Json(DispatchCampaignRequest {
+            spec_hash,
+            spec_version: campaign.spec_version,
+        }),
+    )
+    .await
+}
+
+/// Campaign identity is `(workspace_id, account_id)`. An account with the same
+/// public id in another workspace must not authorize a draft in this workspace.
+#[tokio::test]
+#[ignore]
+async fn create_rejects_account_owned_by_another_workspace_without_writing() {
+    let app = TestApp::start().await;
+    let workspace_id = app.state.config.default_workspace_id.clone();
+    let account_id = "shared_campaign_account";
+    app.state
+        .db
+        .accounts()
+        .insert_one(make_account("other_workspace", account_id), None)
+        .await
+        .expect("seed same account id in another workspace");
+    let before = app
+        .state
+        .db
+        .campaigns()
+        .count_documents(doc! {}, None)
+        .await
+        .expect("count campaigns before");
+
+    let result = create_campaign(
+        State(app.state.clone()),
+        Extension(test_admin(&workspace_id)),
+        Json(CreateCampaignRequest {
+            title: "tenant scope guard".to_string(),
+            intent_text: "must not persist".to_string(),
+            segment_filter: SegmentFilter::default(),
+            account_id: Some(account_id.to_string()),
+        }),
+    )
+    .await;
+
+    let rejected_wrong_workspace = matches!(result, Err(wechatagent::error::AppError::NotFound(_)));
+    let after = app
+        .state
+        .db
+        .campaigns()
+        .count_documents(doc! {}, None)
+        .await
+        .expect("count campaigns after");
+    let zero_writes = after == before;
+    app.cleanup().await;
+
+    assert!(
+        rejected_wrong_workspace,
+        "an account owned only by another workspace must be rejected"
+    );
+    assert!(
+        zero_writes,
+        "invalid tenant account must produce zero writes: before={before}, after={after}"
+    );
 }
 
 /// 红线:命中 0 人(无匹配 contact)→ BadRequest,不静默"派发成功 0 人"。
@@ -107,15 +227,15 @@ async fn dispatch_zero_hits_rejected() {
     let acc = app.state.config.default_account_id.clone();
     let campaign = make_campaign(&ws, &acc);
     let cid = campaign.id.unwrap();
-    app.state.db.campaigns().insert_one(&campaign, None).await.expect("seed campaign");
+    app.state
+        .db
+        .campaigns()
+        .insert_one(&campaign, None)
+        .await
+        .expect("seed campaign");
     // 不 seed 任何 contact → 命中 0 人
 
-    let result = dispatch_campaign(
-        State(app.state.clone()),
-        Extension(test_admin(&ws)),
-        Path(cid.to_hex()),
-    )
-    .await;
+    let result = dispatch_current_spec(&app, &ws, cid).await;
     assert!(result.is_err(), "命中 0 人必须 BadRequest,不静默成功");
 }
 
@@ -128,16 +248,126 @@ async fn dispatch_cross_workspace_not_found() {
     let acc = app.state.config.default_account_id.clone();
     let campaign = make_campaign(&ws, &acc);
     let cid = campaign.id.unwrap();
-    app.state.db.campaigns().insert_one(&campaign, None).await.expect("seed campaign");
+    app.state
+        .db
+        .campaigns()
+        .insert_one(&campaign, None)
+        .await
+        .expect("seed campaign");
 
     // 用 other_workspace 视角 dispatch → filter {_id, workspaceId:other} 不匹配 → NotFound
-    let result = dispatch_campaign(
+    let result = dispatch_current_spec(&app, "other_workspace", cid).await;
+    assert!(result.is_err(), "跨 workspace dispatch 必须 NotFound");
+}
+
+/// SR-075: preview rejects terminal campaigns and leaves the campaign document byte-for-byte
+/// unchanged. A later contact therefore cannot reopen or expand a completed campaign.
+#[tokio::test]
+#[ignore]
+async fn preview_completed_campaign_is_zero_write() {
+    let app = TestApp::start().await;
+    let ws = app.state.config.default_workspace_id.clone();
+    let acc = app.state.config.default_account_id.clone();
+    let mut campaign = make_campaign(&ws, &acc);
+    campaign.status = "completed".to_string();
+    let cid = campaign.id.unwrap();
+    app.state
+        .db
+        .campaigns()
+        .insert_one(&campaign, None)
+        .await
+        .unwrap();
+    app.state
+        .db
+        .contacts()
+        .insert_one(make_contact(&ws, &acc, "wx_late"), None)
+        .await
+        .unwrap();
+    let raw = app.state.db.raw().collection::<Document>("campaigns");
+    let before = raw
+        .find_one(doc! { "_id": cid }, None)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let result = preview_campaign(
         State(app.state.clone()),
-        Extension(test_admin("other_workspace")),
+        Extension(test_admin(&ws)),
         Path(cid.to_hex()),
     )
     .await;
-    assert!(result.is_err(), "跨 workspace dispatch 必须 NotFound");
+    assert!(matches!(
+        result,
+        Err(wechatagent::error::AppError::Conflict(_))
+    ));
+    let after = raw
+        .find_one(doc! { "_id": cid }, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after, before,
+        "terminal preview must have zero campaign writes"
+    );
+}
+
+/// SR-077: saving a changed draft spec with CAS must alter the persisted spec and the next
+/// pure preview must evaluate that new spec, not the first-created one.
+#[tokio::test]
+#[ignore]
+async fn draft_patch_is_consumed_by_next_preview() {
+    let app = TestApp::start().await;
+    let ws = app.state.config.default_workspace_id.clone();
+    let acc = app.state.config.default_account_id.clone();
+    let campaign = make_campaign(&ws, &acc);
+    let cid = campaign.id.unwrap();
+    app.state
+        .db
+        .campaigns()
+        .insert_one(&campaign, None)
+        .await
+        .unwrap();
+
+    let mut won = make_contact(&ws, &acc, "wx_won");
+    won.domain_attributes = Some(doc! { "customer_stage": "won" });
+    let mut lead = make_contact(&ws, &acc, "wx_lead");
+    lead.domain_attributes = Some(doc! { "customer_stage": "lead" });
+    app.state.db.contacts().insert_one(won, None).await.unwrap();
+    app.state
+        .db
+        .contacts()
+        .insert_one(lead, None)
+        .await
+        .unwrap();
+
+    let updated = update_campaign_draft(
+        State(app.state.clone()),
+        Extension(test_admin(&ws)),
+        Path(cid.to_hex()),
+        Json(UpdateCampaignDraftRequest {
+            title: "new title".into(),
+            intent_text: "new intent".into(),
+            segment_filter: SegmentFilter {
+                customer_stage: Some("won".into()),
+                ..Default::default()
+            },
+            expected_spec_version: 1,
+        }),
+    )
+    .await
+    .expect("draft patch succeeds");
+    assert_eq!(updated.0["specVersion"].as_i64(), Some(2));
+
+    let preview = preview_campaign(
+        State(app.state.clone()),
+        Extension(test_admin(&ws)),
+        Path(cid.to_hex()),
+    )
+    .await
+    .expect("preview updated spec");
+    assert_eq!(preview.0["targetCount"].as_i64(), Some(1));
+    assert_eq!(preview.0["intentText"].as_str(), Some("new intent"));
+    assert_eq!(preview.0["specVersion"].as_i64(), Some(2));
 }
 
 /// 设计意图:命中 N 人 → 建 N 条 follow_up task(走 gateway 的证据);
@@ -154,10 +384,25 @@ async fn dispatch_builds_tasks_then_rejects_repeat_after_completed() {
     let acc = app.state.config.default_account_id.clone();
     let campaign = make_campaign(&ws, &acc);
     let cid = campaign.id.unwrap();
-    app.state.db.campaigns().insert_one(&campaign, None).await.expect("seed campaign");
+    app.state
+        .db
+        .campaigns()
+        .insert_one(&campaign, None)
+        .await
+        .expect("seed campaign");
     // seed 2 个 managed contact → 命中 2 人
-    app.state.db.contacts().insert_one(make_contact(&ws, &acc, "wx_a"), None).await.expect("seed wx_a");
-    app.state.db.contacts().insert_one(make_contact(&ws, &acc, "wx_b"), None).await.expect("seed wx_b");
+    app.state
+        .db
+        .contacts()
+        .insert_one(make_contact(&ws, &acc, "wx_a"), None)
+        .await
+        .expect("seed wx_a");
+    app.state
+        .db
+        .contacts()
+        .insert_one(make_contact(&ws, &acc, "wx_b"), None)
+        .await
+        .expect("seed wx_b");
 
     let tasks_before = app
         .state
@@ -168,20 +413,22 @@ async fn dispatch_builds_tasks_then_rejects_repeat_after_completed() {
         .expect("count tasks before");
 
     // 首次 dispatch
-    let resp1 = dispatch_campaign(
-        State(app.state.clone()),
-        Extension(test_admin(&ws)),
-        Path(cid.to_hex()),
-    )
-    .await
-    .expect("首次 dispatch 应成功");
+    let resp1 = dispatch_current_spec(&app, &ws, cid)
+        .await
+        .expect("首次 dispatch 应成功");
     assert_eq!(
         resp1.0["dispatchedCount"].as_i64(),
         Some(2),
         "命中 2 人首次 dispatch 应派 2 条,实际 {}",
         resp1.0["dispatchedCount"]
     );
-    let tasks_after_1 = app.state.db.tasks().count_documents(doc! {}, None).await.expect("count after 1");
+    let tasks_after_1 = app
+        .state
+        .db
+        .tasks()
+        .count_documents(doc! {}, None)
+        .await
+        .expect("count after 1");
     assert_eq!(
         tasks_after_1 - tasks_before,
         2,
@@ -190,37 +437,56 @@ async fn dispatch_builds_tasks_then_rejects_repeat_after_completed() {
 
     // 首次成功后 campaign 已置 completed → 二次 dispatch 被 KC-02 status 门以 BadRequest 拒。
     // (KC-02 前旧契约靠 unique 索引幂等返 dispatchedCount=0,现由门直接拒绝取代。)
-    let result2 = dispatch_campaign(
-        State(app.state.clone()),
-        Extension(test_admin(&ws)),
-        Path(cid.to_hex()),
-    )
-    .await;
+    let result2 = dispatch_current_spec(&app, &ws, cid).await;
     assert!(
         matches!(result2, Err(wechatagent::error::AppError::BadRequest(_))),
         "首次成功后 campaign=completed,二次 dispatch 应被 status 门以 BadRequest 拒,实际 {:?}",
         result2.map(|r| r.0.clone())
     );
     // 门在圈人前拦截 → 二次不新增任何 task(比旧的 unique 去重更早、更强的防重推)。
-    let tasks_after_2 = app.state.db.tasks().count_documents(doc! {}, None).await.expect("count after 2");
-    assert_eq!(tasks_after_2, tasks_after_1, "二次 dispatch 被门拒后不应新增 task");
+    let tasks_after_2 = app
+        .state
+        .db
+        .tasks()
+        .count_documents(doc! {}, None)
+        .await
+        .expect("count after 2");
+    assert_eq!(
+        tasks_after_2, tasks_after_1,
+        "二次 dispatch 被门拒后不应新增 task"
+    );
 }
 
-/// KC-01/03 补偿回滚：dispatch 循环中 agent_tasks insert 被 validator 拒 → task insert 失败
-/// → 补偿删掉刚占位的 send → campaign_sends 无孤儿（该 contact 无残留 send 记录）、dispatch 返 Err。
+/// HC-021 durable fanout：task insert 被 validator 拒后保留 prepared send intent；
+/// 解除故障后 reconciler 用同一冻结身份恢复确定性 task，并提交 campaign completed。
 #[tokio::test]
 #[ignore]
-async fn dispatch_task_insert_failure_rolls_back_send() {
+async fn dispatch_task_insert_failure_is_reconciled_from_prepared_intent() {
     let app = TestApp::start().await;
     let ws = app.state.config.default_workspace_id.clone();
     let acc = app.state.config.default_account_id.clone();
     let campaign = make_campaign(&ws, &acc);
     let cid = campaign.id.unwrap();
-    app.state.db.campaigns().insert_one(&campaign, None).await.expect("seed campaign");
-    app.state.db.contacts().insert_one(make_contact(&ws, &acc, "wx_rollback"), None).await.expect("seed contact");
+    app.state
+        .db
+        .campaigns()
+        .insert_one(&campaign, None)
+        .await
+        .expect("seed campaign");
+    app.state
+        .db
+        .contacts()
+        .insert_one(make_contact(&ws, &acc, "wx_rollback"), None)
+        .await
+        .expect("seed contact");
 
     // 装 validator：让 agent_tasks 的 insert 确定性失败（拒绝所有 kind=follow_up 的插入）。
-    let _ = app.state.db.raw().create_collection("agent_tasks", None).await;
+    let _ = app
+        .state
+        .db
+        .raw()
+        .create_collection("agent_tasks", None)
+        .await;
     app.state
         .db
         .raw()
@@ -235,23 +501,64 @@ async fn dispatch_task_insert_failure_rolls_back_send() {
         .await
         .expect("install agent_tasks validator");
 
-    let result = dispatch_campaign(
-        State(app.state.clone()),
-        Extension(test_admin(&ws)),
-        Path(cid.to_hex()),
-    )
-    .await;
+    let result = dispatch_current_spec(&app, &ws, cid).await;
     assert!(result.is_err(), "task insert 失败应中断并返 Err");
 
-    // 核心：补偿回滚后无孤儿 send（该 campaign 下 0 条 campaign_sends）。
-    let orphan_sends = app
+    let prepared = app
         .state
         .db
         .campaign_sends()
-        .count_documents(doc! { "campaignId": cid }, None)
+        .find_one(doc! { "campaignId": cid }, None)
         .await
-        .expect("count sends");
-    assert_eq!(orphan_sends, 0, "task insert 失败须补偿删除 send,不留孤儿(KC-01)");
+        .expect("read prepared send")
+        .expect("prepared send must remain durable");
+    assert_eq!(prepared.status, "prepared");
+    assert!(prepared.task_id.is_some());
+    let frozen = app
+        .state
+        .db
+        .campaigns()
+        .find_one(doc! { "_id": cid }, None)
+        .await
+        .expect("read frozen campaign")
+        .expect("frozen campaign");
+    assert_eq!(frozen.status, "dispatching");
+    assert_eq!(frozen.dispatch_audience, vec!["wx_rollback"]);
+
+    app.state
+        .db
+        .raw()
+        .run_command(
+            doc! {
+                "collMod": "agent_tasks",
+                "validator": {},
+                "validationLevel": "off",
+            },
+            None,
+        )
+        .await
+        .expect("remove agent_tasks validator");
+    assert_eq!(reconcile_campaign_dispatches(&app.state).await.unwrap(), 1);
+
+    let recovered = app
+        .state
+        .db
+        .campaigns()
+        .find_one(doc! { "_id": cid }, None)
+        .await
+        .expect("read recovered campaign")
+        .expect("recovered campaign");
+    assert_eq!(recovered.status, "completed");
+    assert_eq!(recovered.dispatched_count, 1);
+    assert_eq!(
+        app.state
+            .db
+            .tasks()
+            .count_documents(doc! { "_id": prepared.task_id.unwrap() }, None)
+            .await
+            .unwrap(),
+        1
+    );
 }
 
 /// KC-02 status 门：completed 活动 dispatch → BadRequest（防重复推送）。
@@ -264,15 +571,20 @@ async fn dispatch_completed_campaign_rejected() {
     let mut campaign = make_campaign(&ws, &acc);
     campaign.status = "completed".to_string();
     let cid = campaign.id.unwrap();
-    app.state.db.campaigns().insert_one(&campaign, None).await.expect("seed campaign");
-    app.state.db.contacts().insert_one(make_contact(&ws, &acc, "wx_done"), None).await.expect("seed contact");
+    app.state
+        .db
+        .campaigns()
+        .insert_one(&campaign, None)
+        .await
+        .expect("seed campaign");
+    app.state
+        .db
+        .contacts()
+        .insert_one(make_contact(&ws, &acc, "wx_done"), None)
+        .await
+        .expect("seed contact");
 
-    let result = dispatch_campaign(
-        State(app.state.clone()),
-        Extension(test_admin(&ws)),
-        Path(cid.to_hex()),
-    )
-    .await;
+    let result = dispatch_current_spec(&app, &ws, cid).await;
     // 精确断言 status 门的 BadRequest（非圈人/NotFound 等其它早退）——门在圈人前(:314)，
     // 已 seed contact 对齐 ws，故唯一可达 Err 即 status 门；类型断言抵御未来 handler 早退分支变动。
     assert!(
@@ -292,10 +604,20 @@ async fn preview_rejects_when_coarse_audience_exceeds_max() {
     let acc = app.state.config.default_account_id.clone();
     let campaign = make_campaign(&ws, &acc);
     let cid = campaign.id.unwrap();
-    app.state.db.campaigns().insert_one(&campaign, None).await.expect("seed campaign");
+    app.state
+        .db
+        .campaigns()
+        .insert_one(&campaign, None)
+        .await
+        .expect("seed campaign");
     // seed 4 个 managed contact（> 上限 3）→ 粗筛候选超限
     for wx in ["wx_1", "wx_2", "wx_3", "wx_4"] {
-        app.state.db.contacts().insert_one(make_contact(&ws, &acc, wx), None).await.expect("seed contact");
+        app.state
+            .db
+            .contacts()
+            .insert_one(make_contact(&ws, &acc, wx), None)
+            .await
+            .expect("seed contact");
     }
     let result = preview_campaign(
         State(app.state.clone()),
@@ -320,10 +642,20 @@ async fn preview_succeeds_at_exactly_max() {
     let acc = app.state.config.default_account_id.clone();
     let campaign = make_campaign(&ws, &acc);
     let cid = campaign.id.unwrap();
-    app.state.db.campaigns().insert_one(&campaign, None).await.expect("seed campaign");
+    app.state
+        .db
+        .campaigns()
+        .insert_one(&campaign, None)
+        .await
+        .expect("seed campaign");
     // seed 正好 3 个 → 不超限（空 filter：粗筛=精筛，全部命中）
     for wx in ["wx_1", "wx_2", "wx_3"] {
-        app.state.db.contacts().insert_one(make_contact(&ws, &acc, wx), None).await.expect("seed contact");
+        app.state
+            .db
+            .contacts()
+            .insert_one(make_contact(&ws, &acc, wx), None)
+            .await
+            .expect("seed contact");
     }
     let resp = preview_campaign(
         State(app.state.clone()),
@@ -332,7 +664,11 @@ async fn preview_succeeds_at_exactly_max() {
     )
     .await
     .expect("正好等于上限应成功");
-    assert_eq!(resp.0["targetCount"].as_i64(), Some(3), "targetCount 应为 3");
+    assert_eq!(
+        resp.0["targetCount"].as_i64(),
+        Some(3),
+        "targetCount 应为 3"
+    );
 }
 
 /// KC-06：dispatch 成功后回刷 lastDispatchTargetCount == 本次命中人数，与 dispatchedCount
@@ -345,17 +681,28 @@ async fn dispatch_backfills_last_dispatch_target_count() {
     let acc = app.state.config.default_account_id.clone();
     let campaign = make_campaign(&ws, &acc);
     let cid = campaign.id.unwrap();
-    app.state.db.campaigns().insert_one(&campaign, None).await.expect("seed campaign");
-    app.state.db.contacts().insert_one(make_contact(&ws, &acc, "wx_x"), None).await.expect("seed wx_x");
-    app.state.db.contacts().insert_one(make_contact(&ws, &acc, "wx_y"), None).await.expect("seed wx_y");
+    app.state
+        .db
+        .campaigns()
+        .insert_one(&campaign, None)
+        .await
+        .expect("seed campaign");
+    app.state
+        .db
+        .contacts()
+        .insert_one(make_contact(&ws, &acc, "wx_x"), None)
+        .await
+        .expect("seed wx_x");
+    app.state
+        .db
+        .contacts()
+        .insert_one(make_contact(&ws, &acc, "wx_y"), None)
+        .await
+        .expect("seed wx_y");
 
-    let _ = dispatch_campaign(
-        State(app.state.clone()),
-        Extension(test_admin(&ws)),
-        Path(cid.to_hex()),
-    )
-    .await
-    .expect("dispatch 应成功");
+    let _ = dispatch_current_spec(&app, &ws, cid)
+        .await
+        .expect("dispatch 应成功");
 
     // 类型化读回 Campaign，断言回刷字段。
     let reloaded = app
@@ -371,89 +718,8 @@ async fn dispatch_backfills_last_dispatch_target_count() {
         Some(2),
         "命中 2 人应回刷 lastDispatchTargetCount=2"
     );
-    assert_eq!(reloaded.dispatched_count, 2, "首次全新命中 dispatchedCount=2");
-}
-
-/// KC-06 哨兵加强：**去重时 lastDispatchTargetCount 与 dispatchedCount 分叉**——
-/// 锁死 `lastDispatchTargetCount = hits.len()`（本次粗筛命中总数）语义，而非
-/// `= dispatched`（去重后新入队数）。上面的 `dispatch_backfills_last_dispatch_target_count`
-/// 只覆盖"无去重"（两值巧合都 = 2），无法区分正确实现与写成 `= dispatched` 的错误实现。
-///
-/// 场景 = 重入恢复（campaign 状态 dispatching，KC-02 放行）：wx_p 上一轮已建 send 台账
-/// （预置一条既存 campaign_send 占住去重位），wx_q 尚未推。本轮 dispatch：
-/// - wx_p：insert campaign_send 撞 (campaignId, contactWxid) 唯一索引 DuplicateKey → 跳过，
-///   dispatched 不自增（campaigns.rs:439）。
-/// - wx_q：全新 → dispatched += 1（campaigns.rs:437）。
-/// 于是 `dispatchedCount == 1`（去重后新入队）**但** `lastDispatchTargetCount == 2`
-/// （粗筛仍命中 2 人，campaigns.rs:452 写 `hits.len()`）——二者分叉。若有人把回刷改写成
-/// `lastDispatchTargetCount = dispatched`，本测试立刻绿变红（真哨兵）。
-#[tokio::test]
-#[ignore]
-async fn dispatch_last_dispatch_target_count_diverges_on_dedup() {
-    let app = TestApp::start().await;
-    let ws = app.state.config.default_workspace_id.clone();
-    let acc = app.state.config.default_account_id.clone();
-    // 重入恢复：dispatching 态放行（KC-02 dispatch_allowed_from_status，campaigns.rs:323）。
-    let mut campaign = make_campaign(&ws, &acc);
-    campaign.status = "dispatching".to_string();
-    let cid = campaign.id.unwrap();
-    app.state.db.campaigns().insert_one(&campaign, None).await.expect("seed campaign");
-    // 命中 2 人（空 filter：粗筛=精筛，workspace+account 内全部 managed contact）。
-    app.state.db.contacts().insert_one(make_contact(&ws, &acc, "wx_p"), None).await.expect("seed wx_p");
-    app.state.db.contacts().insert_one(make_contact(&ws, &acc, "wx_q"), None).await.expect("seed wx_q");
-
-    // 预置一条既存 campaign_send（campaignId=本活动, contactWxid=wx_p）占住去重位——
-    // 模拟 wx_p 上一轮已推过。CampaignSend serde rename_all=camelCase（models.rs:622），
-    // campaign_id→campaignId / contact_wxid→contactWxid，与唯一索引键
-    // (campaignId, contactWxid)（indexes.rs:784）一致，故本轮对 wx_p 的 insert 必撞 DuplicateKey。
-    let existing_send = CampaignSend {
-        id: None,
-        workspace_id: ws.clone(),
-        account_id: acc.clone(),
-        campaign_id: cid,
-        contact_wxid: "wx_p".to_string(),
-        task_id: None,
-        status: "enqueued".to_string(),
-        created_at: DateTime::now(),
-    };
-    app.state
-        .db
-        .campaign_sends()
-        .insert_one(&existing_send, None)
-        .await
-        .expect("seed 既存 campaign_send（占 wx_p 去重位）");
-
-    let resp = dispatch_campaign(
-        State(app.state.clone()),
-        Extension(test_admin(&ws)),
-        Path(cid.to_hex()),
-    )
-    .await
-    .expect("dispatch 应成功");
-    // 响应层：wx_q 新入队、wx_p 撞去重跳过 → dispatchedCount=1。
     assert_eq!(
-        resp.0["dispatchedCount"].as_i64(),
-        Some(1),
-        "wx_p 撞去重跳过、仅 wx_q 新入队 → dispatchedCount=1,实际 {}",
-        resp.0["dispatchedCount"]
-    );
-
-    // 类型化读回 Campaign，断言两字段分叉（2 ≠ 1）——锁死 hits.len() 语义。
-    let reloaded = app
-        .state
-        .db
-        .campaigns()
-        .find_one(doc! { "_id": cid }, None)
-        .await
-        .expect("query campaign")
-        .expect("campaign exists");
-    assert_eq!(
-        reloaded.dispatched_count, 1,
-        "去重后新入队数 dispatchedCount=1（wx_p 跳过）"
-    );
-    assert_eq!(
-        reloaded.last_dispatch_target_count,
-        Some(2),
-        "粗筛命中总数 lastDispatchTargetCount=2（含被去重的 wx_p）——若写成 =dispatched(1) 即绿变红"
+        reloaded.dispatched_count, 2,
+        "首次全新命中 dispatchedCount=2"
     );
 }

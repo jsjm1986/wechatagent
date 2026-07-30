@@ -1,5 +1,10 @@
 # Implementation Plan
 
+> **Authoritative delivery status (SR-179, 2026-07-24):** the `[~]` markers below
+> are historical planning marks only. They do not mean implemented, production-wired,
+> or verified. The sole status authority is `../task-status-manifest.json`, enforced by
+> `scripts/check-task-status-manifest.py` in the blocking baseline CI job.
+
 > 中文标题：用户运营 Agent 鲁棒性强化 — 实现计划
 >
 > 对应文档：`requirements.md`、`design.md`
@@ -26,7 +31,7 @@
 
 ## 第 1 批 — 低风险独立改动
 
-- [x] 1. 补齐缺失索引到 ensure_indexes
+- [~] 1. 补齐缺失索引到 ensure_indexes
   - 在 `src/db.rs::ensure_indexes` 中增加 `wechat_accounts.{app_id}` sparse 索引
   - 增加 `agent_tasks.{workspace_id, account_id, contact_wxid, kind, status}` 复合索引
   - 增加 `agent_decision_reviews.{workspace_id, account_id, contact_wxid, status, outcome_status}` partial 索引（filter `outcome_status: { $in: ["pending", "analyzing"] }`）
@@ -34,7 +39,7 @@
   - 验证 `cargo check` 通过；启动一次 wechatagent 后用 `db.collection.getIndexes()` 校验索引存在
   - _Requirements: 13.1, 13.2, 13.3, 13.4, 13.5, 13.6, 13.7_
 
-- [x] 2. group/moment 种子状态改为 draft
+- [~] 2. group/moment 种子状态改为 draft
   - 修改 `src/prompts.rs`：给 `SoulSpec` 和 `PromptSpec` 增加 `status: &'static str` 字段
   - `soul_specs()` 中 `group` 和 `moment` 两条改为 `status: "draft"`，其它两条 `status: "published"`
   - `prompt_specs()` 中 `group.policy`、`moment.policy` 改为 `status: "draft"`，其它仍 `status: "active"`
@@ -44,7 +49,7 @@
   - 前端 `groupOps` / `momentOps` 频道 `NextPhasePanel` 文案改为"对应 Soul 与 Prompt 已存在但运行时未实现，可在系统策略页查看草稿模板"
   - _Requirements: 17.1, 17.2, 17.3, 17.4, 17.5, 17.6, 17.7_
 
-- [x] 3. LLM_EXACT_CACHE 替换为 LRU
+- [~] 3. LLM_EXACT_CACHE 替换为 LRU
   - 在 `Cargo.toml` 添加 `lru = "0.12"`、`parking_lot = "0.12"`
   - 修改 `src/agent.rs` 中 `LLM_EXACT_CACHE` 静态：从 `Mutex<HashMap>` 改为 `parking_lot::Mutex<LruCache<String, Value>>`，容量 256
   - 移除"超 256 整体 clear"逻辑；用 LRU 自动淘汰最久未用项
@@ -52,7 +57,7 @@
   - 命中时仍写 `llm_call_logs.status = "cache_hit"`
   - _Requirements: 15.1, 15.2, 15.3, 15.4, 15.5, 15.6_
 
-- [x] 4. 测试基础设施
+- [~] 4. 测试基础设施
   - 在 `Cargo.toml` 添加 dev-dependencies：`mockall = "0.13"`、`proptest = "1.5"`、`testcontainers = "0.23"`、`testcontainers-modules = { version = "0.11", features = ["mongo"] }`、`fastrand = "2"`
   - 把 `LlmClient` 改为 trait `LlmGenerator`（async-trait）+ impl，`AppState.llm` 改为 `Arc<dyn LlmGenerator>`
   - 用 `mockall::automock` 给 `LlmGenerator` 自动生成 `MockLlmGenerator`
@@ -63,7 +68,7 @@
 
 ## 第 2 批 — 数据迁移基础
 
-- [x] 5. db::migrations 模块 + 启动调用
+- [~] 5. db::migrations 模块 + 启动调用
   - 创建 `src/db/migrations.rs`，定义 `Migration` struct（id + run fn）和 `MIGRATIONS` 常量数组
   - 实现 `pub async fn run(db: &Database) -> AppResult<()>`，扫描 `migrations` 集合的已应用版本，按顺序执行未应用的迁移并写入版本记录
   - 把 `src/db.rs` 拆为 `src/db/mod.rs`（Database struct + collection accessors）+ `src/db/indexes.rs`（ensure_indexes）+ `src/db/migrations.rs`
@@ -72,7 +77,7 @@
   - 添加单元测试：迁移幂等性（运行两次只应用一次）
   - _Requirements: 2.6_
 
-- [x] 6. last_inbound_at / last_outbound_at 字段拆分 + 迁移
+- [~] 6. last_inbound_at / last_outbound_at 字段拆分 + 迁移
   - 修改 `src/models.rs::Contact`：增加 `last_inbound_at: Option<DateTime>`、`last_outbound_at: Option<DateTime>`，保留 `last_message_at`
   - 修改 `src/models.rs::ApiContact`：暴露新字段（camelCase）
   - 修改 `src/webhooks.rs`：入站消息 update_one 同时设置 `last_inbound_at = now`、`last_message_at = now`
@@ -82,14 +87,14 @@
   - 添加单元测试：入站只动 inbound、出站只动 outbound、follow-up `context_changed` 正确判定
   - _Requirements: 2.1, 2.2, 2.3, 2.4, 2.5, 2.6_
 
-- [x] 7. claimed_at 字段引入 worker
+- [~] 7. claimed_at 字段引入 worker
   - 修改 `src/models.rs::AgentTask`：增加 `claimed_at: Option<DateTime>`、`claim_recovery_count: i32`
   - 修改 `src/tasks.rs::tick`：claim 时 `$set: { claimed_at: now }`
   - 在 `src/main.rs` 中用 `tokio::sync::OnceCell` 记录 `APP_STARTED_AT`（在 `Database::connect` 之前填充）
   - 添加单元测试：claim 后 task 的 claimed_at 非 None
   - _Requirements: 1.2_
 
-- [x] 8. memoryCard 拆分 coreFacts/recentFacts + 迁移
+- [~] 8. memoryCard 拆分 coreFacts/recentFacts + 迁移
   - 创建 `src/models/memory.rs`，定义 `MemoryCard` 强类型 struct（含 `core_facts: Vec<String>`、`recent_facts: Vec<String>`，移除 `active_facts`）
   - 修改 `src/agent.rs::default_memory_card`：默认 `coreFacts: []`、`recentFacts: []`，移除 `activeFacts`
   - 修改 `src/agent.rs::memory_card_from_contact`：把 contact seed 写入 `coreFacts`（最多 6 条）
@@ -102,7 +107,7 @@
 
 ## 第 3 批 — 运行时行为变更
 
-- [x] 9. Worker stale running 自动回收
+- [~] 9. Worker stale running 自动回收
   - 在 `src/tasks.rs` 添加 `reclaim_stale_running_tasks(state)` 函数，扫描 `running` 且 `claimed_at < now - timeout`（或 claimed_at 缺失但 updated_at < APP_STARTED_AT）的任务
   - 用 atomic compare-and-set `update_one(filter: { _id, status: "running" }, ...)` 重置为 `retry`，写 `gateway_status="claim_timeout_recovered"`、`next_retry_at=now`，**不**增加 `attempt_count`，但 `claim_recovery_count += 1`
   - 写 `agent_events kind="task_claim_recovered" status="recovered"`，details 含 task_id、kind、previous_attempt_count、stuck_seconds
@@ -112,7 +117,7 @@
   - 集成测试 `tests/worker_reclaim.rs`：插入 stale running task，跑一次 tick，断言任务变 `retry`、`agent_events` 写入；连续触发 3 次后任务变 `failed`
   - _Requirements: 1.1, 1.3, 1.4, 1.5, 1.6_
 
-- [x] 10. record_user_reaction 加 claim 锁
+- [~] 10. record_user_reaction 加 claim 锁
   - 修改 `src/models.rs::AgentDecisionReview`：`outcome_status` 字符串支持 `"analyzing"` 值；增加 `reaction_claimed_at: Option<DateTime>`
   - 修改 `src/agent.rs::record_user_reaction`：先用 `find_one_and_update` 把符合条件的 review 从 `pending`/null 改为 `analyzing` 并写 `reaction_claimed_at = now`；找不到就直接 return
   - 拿到 review 后调用 LLM 分析，分析后用 `update_one(_id)` 把 outcome_status 写为最终值
@@ -121,7 +126,7 @@
   - 集成测试 `tests/reaction_claim_lock.rs`：spawn 10 个并发 webhook 处理同 contact + mock LLM 计数器，断言 LLM 计数 ≤ 1
   - _Requirements: 3.1, 3.2, 3.3, 3.4, 3.5, 3.6_
 
-- [x] 11. LLM 重试改为指数退避，JSON 错误不重试
+- [~] 11. LLM 重试改为指数退避，JSON 错误不重试
   - 修改 `src/llm.rs::is_retryable_llm_error`：移除 `AppError::Json(_)` 分支
   - 修改 `src/llm.rs::generate_json_with_usage`：用指数退避 `base * 2^(attempt-1) + jitter(0..base)`；从响应 `Retry-After` header 取秒数（要先在 `generate_json_once` 内保留响应 headers），实际等待 = `max(指数退避, Retry-After * 1000)`
   - 把 `retry_base_ms` 默认改为 1000，`max_retries` 仍 3
@@ -132,7 +137,7 @@
   - 单元测试 `tests/llm_retry_jitter.rs`：mock 返回 429 + `Retry-After: 5`，断言总等待 ≥ 5s；mock 返回非 JSON 内容，断言只调一次（无重试）
   - _Requirements: 4.1, 4.2, 4.3, 4.4, 4.5, 4.6_
 
-- [x] 12. 字符串级 fact-risk 兜底 guard
+- [~] 12. 字符串级 fact-risk 兜底 guard
   - 在 `src/agent.rs`（或 `src/agent/guards.rs`）新增 `ProductClaimMarkers` struct，含 markers（literal/regex pattern + reason）和 whitelist phrases（含 window_chars）
   - 实现 `ProductClaimMarkers::scan(reply_text) -> Vec<MarkerHit>`、`passes_whitelist(hit) -> bool`
   - 在 `src/prompts.rs::prompt_specs()` 添加新 prompt key `user.review.product_claim_markers`，其 content 是 JSON（含上述 markers/whitelist）
@@ -142,7 +147,7 @@
   - 单元测试 `tests/string_fact_risk_guard.rs`：4+ case（命中 / 白名单豁免 / 模型已声明 safe / 已引用知识）
   - _Requirements: 6.1, 6.2, 6.3, 6.4, 6.5, 6.6, 6.7, 6.8_ 
 
-- [x] 13. 状态机 allowedFrom 校验
+- [~] 13. 状态机 allowedFrom 校验
   - 修改 `src/prompts.rs::default_user_operation_state_machine`：每个 state 加 `allowedFrom`（按 design 中给定的合理默认）；`cooldown` 加 `allowFromAny: true`
   - 在 `src/agent.rs`（或新 `agent/guards.rs`）添加 `OperationStateSpec` 反序列化辅助 struct（含 allowedFrom/allowFromAny），`fn check_state_transition(decision, contact, config) -> Option<String>`
   - 修改 `enforce_decision_guards`：调用 `check_state_transition`，非法时 fact_risk=max(_,6)、approved=false、push 一条 `state_transition_invalid: from=<a> to=<b>` 到 risks
@@ -151,7 +156,7 @@
   - PBT 测试 `tests/state_transition_pbt.rs`：proptest 随机生成 (from, to) 对，断言 `should_allow ⇔ ¬blocked`
   - _Requirements: 7.1, 7.2, 7.3, 7.4, 7.5, 7.6, 7.7_
 
-- [x] 14. 消费 operation_state_confidence 触发 full review
+- [~] 14. 消费 operation_state_confidence 触发 full review
   - `OperationDomainConfig.runtime_parameters` 添加默认字段 `operationStateConfidenceFullReviewBelow: 4`
   - 修改 `src/agent.rs::UserRuntimeParameters::from_config`：读取该字段（默认 4）
   - 修改 `src/agent.rs::effective_review_mode`：在原条件之外增加 `if confidence < threshold => "full"`，并在 `agent_run_logs.planner.confidence_override_triggered = true`
@@ -161,7 +166,7 @@
 
 ## 第 4 批 — 成本与可观测性
 
-- [x] 15. 单 run LLM 预算与降级链
+- [~] 15. 单 run LLM 预算与降级链
   - 创建 `src/agent/budget.rs`：`RunBudget` struct（token_budget / max_llm_calls / tokens_used / llm_calls_used / degraded_reasons）
   - `Arc<Mutex<RunBudget>>` 形式由 `run_user_operation_gateway` 创建并向下传递
   - 在 `agent::generate_agent_json` 调用方包装：每次返回后调 `budget.lock().record_call(&usage)`；超额时返回 `AppError::BudgetExceeded`
@@ -173,7 +178,7 @@
   - 单元测试：构造低 budget，run 完成后 degraded_reasons 含相应字符串、review 未调 LLM
   - _Requirements: 5.1, 5.2, 5.3, 5.4, 5.5, 5.6, 5.7_
 
-- [x] 16. 知识库未验证告警 + auto-verify 接口
+- [~] 16. 知识库未验证告警 + auto-verify 接口
   - 在 `src/agent.rs::load_operation_knowledge` 调用后或 run 入口添加 `maybe_emit_unverified_warning`：检测 `total_chunks > 0 && verified_chunks == 0`，当日按 contact_wxid 去重写 `agent_events kind="knowledge_unverified_warning" status="warn"`
   - 添加新接口 `POST /api/operation-knowledge/auto-verify`，body `{ accountId, confidenceThreshold = 7, humanAuditSampleRate = 0.1 }`
   - 实现：串行处理 `needs_review` chunks，每条调 LLM `knowledge.auto_verify` prompt（新建）评估 confidence；按 threshold 自动标 verified；按 sampleRate 随机标 `needs_human_audit`；受 RunBudget 约束（复用 simulationTokenBudget）
@@ -182,7 +187,7 @@
   - 前端 `App.tsx` 知识库面板顶部显示 `verified` 占比和未验证条数；占比 > 50% 显示橙色警示
   - _Requirements: 9.1, 9.2, 9.3, 9.4, 9.5, 9.6, 9.7_
 
-- [x] 17. 长 horizon outcome metrics
+- [~] 17. 长 horizon outcome metrics
   - 在 `src/db.rs` 添加 `agent_outcome_metrics` collection accessor + TTL 索引（`{ created_at: 1 }` expireAfterSeconds = 90d，可配置 `OUTCOME_METRICS_TTL_DAYS`）
   - 添加 `AgentOutcomeMetric` struct：account_id / horizon / date / reply_rate / conversation_depth / human_handoff_success_rate / agent_block_rate / daily_run_count / daily_run_token_total
   - 在 `src/tasks.rs` 添加新 task kind `outcome_aggregation`，入口处确保当日所有 (account, horizon) 都有任务
@@ -191,7 +196,7 @@
   - 单元测试：插入合成数据，跑 handler，断言指标计算正确
   - _Requirements: 19.1, 19.2, 19.3, 19.4, 19.5, 19.6, 19.7_
 
-- [x] 18. 公式遵守度评测脚手架
+- [~] 18. 公式遵守度评测脚手架
   - 在 `src/db.rs` 添加 `evaluation_scenarios` collection
   - 添加 `EvaluationScenario` 模型 + CRUD 接口（`GET /api/evaluation-scenarios`、`POST /api/evaluation-scenarios`、`PUT/DELETE /api/evaluation-scenarios/:id`）
   - 添加新接口 `POST /api/user-operations/evaluations/formula-adherence`：加载场景（或按 scenarioIds/tags 过滤），逐个调 `simulate_user_dialogue`，抓最后一 turn 的 `decision.formula_breakdown` + `review.scores`，对比 ground_truth 计算偏差和 adherence_score
@@ -201,7 +206,7 @@
   - 写 `agent_events kind="formula_adherence_evaluated"`
   - _Requirements: 18.1, 18.2, 18.3, 18.4, 18.5, 18.6, 18.7, 18.8_
 
-- [x] 19. Management Agent dry-run 模式
+- [~] 19. Management Agent dry-run 模式
   - 修改 `src/models.rs::ManagementAgentSession`：增加 `dry_run: bool`（默认 false）
   - 修改 `src/routes.rs::CreateSessionRequest`：接受 `dryRun: bool`，写入 session
   - 修改 `src/routes.rs::ManagementMessageRequest`：增加 `dryRun: Option<bool>` 单次覆盖
@@ -216,7 +221,7 @@
 
 ## 第 5 批 — 重构与拆分
 
-- [x] 20. Webhook per-account 限流
+- [~] 20. Webhook per-account 限流
   - `Cargo.toml` 添加 `governor = "0.7"`、`dashmap = "6"`
   - 在 `src/webhooks.rs` 实现 per-`account_id` 令牌桶（`DashMap<String, Arc<DefaultDirectRateLimiter>>` + `governor`）
   - `AppConfig` 新增 `webhook_rate_limit_window_seconds: u32`（默认 60）、`webhook_rate_limit_capacity: u32`（默认 30）
@@ -227,7 +232,7 @@
   - 集成测试：连续 31 次相同 account 请求，断言第 31 次返回 429
   - _Requirements: 14.1, 14.2, 14.3, 14.4, 14.5, 14.6_
 
-- [x] 21. 核心 Document 字段强类型化
+- [~] 21. 核心 Document 字段强类型化
   - 创建 `src/models/runtime.rs`：`RuntimeParameters` struct + `defaults` 子模块 + `From<RuntimeParameters> for Document` 实现
   - 创建 `src/models/memory.rs`：`MemoryCard`、`MemoryCardCoreProfile`、`MemoryCardRelationshipState`、`UserUnderstanding`、`ProductFit`、`NextActionMemory`（都用 `#[serde(rename_all = "camelCase")]` + `#[serde(default)]`）+ From 实现
   - 给 `OperationDomainConfig` 加辅助方法 `runtime_parameters_typed(&self) -> RuntimeParameters`
@@ -236,7 +241,7 @@
   - 保留现有 Document 字段以兼容老调用点；后续小迭代再彻底替换
   - _Requirements: 12.1, 12.2, 12.3, 12.4, 12.5, 12.6_
 
-- [x] 22. routes.rs 拆分到 src/routes/ 子模块
+- [~] 22. routes.rs 拆分到 src/routes/ 子模块
   - 创建 `src/routes/mod.rs`：保留 `AppState`、`api_router`、`pub use` 子模块的入口
   - 拆分 `src/routes.rs` 内容到子模块：`accounts.rs / contacts.rs / conversations.rs / tasks.rs / events.rs / assets.rs / knowledge.rs / playbooks.rs / domains.rs / prompt_templates.rs / souls.rs / reviews.rs / evaluations.rs / simulations.rs / management.rs / guides.rs / outcome_metrics.rs / health.rs / shared.rs`
   - `shared.rs` 收纳跨模块 helpers（`parse_object_id` / `validate_account` / `find_contact_by_id` / `upsert_contact_from_value` 等）
@@ -245,7 +250,7 @@
   - 删除原 `src/routes.rs`
   - _Requirements: 11.1, 11.3, 11.4, 11.5, 11.6, 11.7_
 
-- [x] 23. agent.rs 拆分到 src/agent/ 子模块
+- [~] 23. agent.rs 拆分到 src/agent/ 子模块
   - 创建 `src/agent/mod.rs`：保留 type alias / `pub use`、入口 fn（`run_user_operation_gateway` / `handle_managed_message` / `handle_follow_up_task` / `handle_memory_consolidation_task` / `consolidate_contact_memory` / `record_user_reaction` / `send_contact_message_gateway` / `simulate_user_dialogue` / `test_knowledge_route_for_contact` / `build_initial_operation_profile` / `write_event_for_account` 等）
   - 拆分到子模块：`types.rs / runtime.rs / gateway.rs / decision.rs / review.rs / knowledge_router.rs / memory.rs / reaction.rs / simulation.rs / guards.rs / budget.rs`
   - 每个子模块顶部加 `//!` 中文 doc-comment 说明职责
@@ -253,7 +258,7 @@
   - 删除原 `src/agent.rs`
   - _Requirements: 11.2, 11.3, 11.4, 11.5, 11.6, 11.7_
 
-- [x] 24. 补齐 PBT 与回归测试
+- [~] 24. 补齐 PBT 与回归测试
   - `tests/state_transition_pbt.rs`：proptest 验证 Property 1（≥3 属性 cases）
   - `tests/memory_card_invariants.rs`：proptest 验证 Property 2（`coreFacts ≤ 6 && recentFacts ≤ 10 && coreFacts 保留性`）
   - `tests/reaction_claim_lock.rs`：N=10 并发 webhook，断言 LLM 计数 ≤ 1（与任务 10 中的测试合并）

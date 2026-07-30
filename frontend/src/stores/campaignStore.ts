@@ -44,6 +44,7 @@ interface CampaignState {
   report: CampaignReport | null;
   loading: boolean;
   lastAttemptedId: string | null;
+  reportRequestGeneration: number;
   view: "list" | "create" | "board";
   campaigns: CampaignListItem[];
   listLoading: boolean;
@@ -62,6 +63,7 @@ export const useCampaignStore = create<CampaignState>((set, get) => ({
   report: null,
   loading: false,
   lastAttemptedId: null,
+  reportRequestGeneration: 0,
   view: "list",
   campaigns: [],
   listLoading: false,
@@ -73,14 +75,33 @@ export const useCampaignStore = create<CampaignState>((set, get) => ({
     void get().loadReport(id);
   },
   loadReport: async (id) => {
-    set({ loading: true, lastAttemptedId: id });
+    const generation = get().reportRequestGeneration + 1;
+    set((state) => ({
+      loading: true,
+      lastAttemptedId: id,
+      reportRequestGeneration: generation,
+      report: state.report?.campaignId === id ? state.report : null,
+    }));
     try {
       const r = await api.get<CampaignReport>(`/api/campaigns/${id}/sends`);
-      set({ report: r });
+      const current = get();
+      if (
+        current.reportRequestGeneration === generation &&
+        current.selectedCampaignId === id &&
+        r.campaignId === id
+      ) {
+        set({ report: r });
+      }
     } catch (e) {
-      useUiStore.getState().setError(e instanceof Error ? e.message : String(e));
+      const current = get();
+      if (current.reportRequestGeneration === generation && current.selectedCampaignId === id) {
+        useUiStore.getState().setError(e instanceof Error ? e.message : String(e));
+      }
     } finally {
-      set({ loading: false });
+      const current = get();
+      if (current.reportRequestGeneration === generation && current.selectedCampaignId === id) {
+        set({ loading: false });
+      }
     }
   },
   setView: (v) => set({ view: v }),
@@ -96,5 +117,5 @@ export const useCampaignStore = create<CampaignState>((set, get) => ({
     }
   },
   setPage: (n) => set({ page: n }),
-  clear: () => set({ selectedCampaignId: null, report: null, loading: false, lastAttemptedId: null, view: "list", campaigns: [], listLoading: false, listLoaded: false, page: 0 }),
+  clear: () => set((state) => ({ selectedCampaignId: null, report: null, loading: false, lastAttemptedId: null, reportRequestGeneration: state.reportRequestGeneration + 1, view: "list", campaigns: [], listLoading: false, listLoaded: false, page: 0 })),
 }));

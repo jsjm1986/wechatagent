@@ -14,7 +14,10 @@ fn default_config_three_families_distinct() {
     assert_eq!(fps.len(), 3, "应有 agent/roleplayer/judge 三角色");
     let fam: Vec<String> = fps.iter().map(|f| f.family()).collect();
     assert_ne!(fam[0], fam[1], "agent vs roleplayer 默认应异族");
-    assert_ne!(fam[0], fam[2], "agent vs judge 默认应异族（同 host rsxermu 不同 vendor claude/gpt）");
+    assert_ne!(
+        fam[0], fam[2],
+        "agent vs judge 默认应异族（同 host rsxermu 不同 vendor claude/gpt）"
+    );
     assert_ne!(fam[1], fam[2], "roleplayer vs judge 默认应异族");
 }
 
@@ -45,7 +48,11 @@ fn exact_same_provider_is_same_family() {
         base_url: "https://rsxermu666.cn".into(),
         model: "claude-opus-4-8".into(),
     };
-    assert_eq!(a.family(), b.family(), "完全同 provider 应判同族（硬门据此 panic）");
+    assert_eq!(
+        a.family(),
+        b.family(),
+        "完全同 provider 应判同族（硬门据此 panic）"
+    );
 }
 
 #[test]
@@ -55,7 +62,11 @@ fn vendor_prefix_extraction() {
         base_url: "https://integrate.api.nvidia.com/v1".into(),
         model: "meta/llama-3.3-70b-instruct".into(),
     };
-    assert_eq!(nvidia.family(), "integrate.api.nvidia.com|meta", "厂商段取 / 前");
+    assert_eq!(
+        nvidia.family(),
+        "integrate.api.nvidia.com|meta",
+        "厂商段取 / 前"
+    );
 
     let mimo = ProviderFingerprint {
         role: "x".into(),

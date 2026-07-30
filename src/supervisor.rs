@@ -79,6 +79,7 @@ where
                     );
                     let _ = crate::agent::write_event_for_account(
                         &state,
+                        &state.config.default_workspace_id,
                         "system",
                         None,
                         "background_worker_panic",

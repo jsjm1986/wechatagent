@@ -3,11 +3,9 @@
 // 后，老页（system-strategy）与统一收件箱频道都从这里 import，发布/激活逻辑不再各持一份。
 //
 // 解耦 strategyStore（用户裁定 B 的核心）：本卡片不 import stores/strategyStore，直调
-// api 同一 RAW 端点（publish 的 RAW 返回 {ok,pendingActivation?,riskyFields?,id} 见
-// strategyStore.ts:355 实证）。零跨 feature import：只依赖 react/lib/api/ui providers。
-//
-// 高风险发布两段式（不可省）：publish 返 pendingActivation=true（改了高风险开关，新版本
-// 定稿但未生效）→ useConfirm 模态二次确认 → POST /rollout 才真正生效；普通字段发布即生效。
+// 发布与激活严格分离：publish 只把 draft 变成 published current，所有字段都必须再经
+// 管理员显式 activate 后才进入运行时。activate 的核心指针先提交，附属同步失败会返回 partial，
+// 卡片保留幂等重试入口。
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../../lib/api";
 import type { GeneratedStateMachine } from "../../types";
@@ -20,6 +18,7 @@ interface ProfileLite {
   display_name?: string;
   is_active?: boolean;
   current_version?: boolean;
+  release_status?: "draft" | "published";
   // H13：AI 生成状态机本体（draft）。外层 snake_case，内层 key camelCase（绕过 normalize_json_keys）。
   // 激活前供管理员审阅 states/goal/advanceSignals/riskRules（AI 不自我核验、审阅后才激活）。
   generated_state_machine?: GeneratedStateMachine | null;
@@ -41,9 +40,10 @@ export function ProfilePublishCard({
   const load = useCallback(async () => {
     setError(null);
     try {
-      // 单 profile 无专用 GET：拉列表后按 id 过滤（与老页 loadDomainProfiles 一致）。
-      const { items } = await api.get<{ items: ProfileLite[] }>("/api/admin/domain-profiles");
-      setProfile(items.find((p) => p.id === profileId) ?? null);
+      const { item } = await api.get<{ item: ProfileLite }>(
+        `/api/admin/domain-profiles/${encodeURIComponent(profileId)}`,
+      );
+      setProfile(item);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -56,37 +56,17 @@ export function ProfilePublishCard({
   async function publish() {
     const ok = await confirm({
       title: "确认发布此版本？",
-      body:
-        "普通字段（名称/简介/业务上下文等）发布后即时生效；若改动了高风险开关" +
-        "（人格本体/方法论/风控阈值/自学习极性等），会要求二次确认后才生效。",
+      body: "发布后进入待激活状态，当前运行中的行业配置不会改变。请审阅发布结果后再单独激活。",
       confirmText: "确认发布",
     });
     if (!ok) return;
     setBusy(true);
     try {
-      const res = await api.post<{ pendingActivation?: boolean; riskyFields?: string[] }>(
+      await api.post<{ riskyFields?: string[] }>(
         `/api/admin/domain-profiles/${encodeURIComponent(profileId)}/publish`,
         {},
       );
-      if (res.pendingActivation) {
-        const fields =
-          res.riskyFields && res.riskyFields.length > 0 ? res.riskyFields.join("、") : "（未知字段）";
-        const proceed = await confirm({
-          title: "高风险字段改动，确认立即生效？",
-          body: `本次改动涉及高风险字段：${fields}。新版本已定稿但尚未生效，当前仍运行旧版本。`,
-          tone: "danger",
-          confirmText: "确认生效",
-        });
-        if (!proceed) {
-          // 已定稿未生效；不 rollout，刷新展示让管理员看到「待激活」态。
-          toast.info("新版本已定稿，未生效");
-          onDone?.();
-          await load();
-          return;
-        }
-        await api.post(`/api/admin/domain-profiles/${encodeURIComponent(profileId)}/rollout`, {});
-      }
-      toast.success("已发布");
+      toast.success("已发布，等待管理员激活");
       onDone?.();
       await load();
     } catch (e) {
@@ -105,8 +85,22 @@ export function ProfilePublishCard({
     if (!ok) return;
     setBusy(true);
     try {
-      await api.post(`/api/admin/domain-profiles/${encodeURIComponent(profileId)}/activate`, {});
-      toast.success("已激活");
+      const result = await api.post<{
+        status: "completed" | "partial";
+        retryable?: boolean;
+        errors?: Array<{ step?: string; message?: string }>;
+      }>(`/api/admin/domain-profiles/${encodeURIComponent(profileId)}/activate`, {});
+      if (result.status === "partial") {
+        const failed = (result.errors ?? [])
+          .map((item) => item.step)
+          .filter((step): step is string => Boolean(step))
+          .join("、");
+        toast.error(
+          `行业配置核心已激活，但附属同步未完成${failed ? `（${failed}）` : ""}。请点击“重试附属同步”。`,
+        );
+      } else {
+        toast.success("已完整激活");
+      }
       onDone?.();
       await load();
     } catch (e) {
@@ -120,12 +114,22 @@ export function ProfilePublishCard({
   if (!profile) return <div className="profilePublishLoading">加载中…</div>;
 
   const states = profile.generated_state_machine?.states ?? [];
+  const releaseStatus = profile.release_status ?? "published";
+  const statusText = profile.is_active
+    ? profile.current_version
+      ? "生效中"
+      : "生效中（旧发布）"
+    : releaseStatus === "draft"
+      ? "草稿"
+      : profile.current_version
+        ? "已发布 · 待激活"
+        : "已发布历史";
 
   return (
     <div className="profilePublishCard">
       <div className="profilePublishName">{profile.display_name ?? profileId}</div>
       <div className="profilePublishStatus">
-        {profile.is_active ? "已激活" : profile.current_version ? "待激活" : "草稿"}
+        {statusText}
       </div>
       {states.length > 0 && (
         <div className="profilePublishStateMachine">
@@ -169,14 +173,19 @@ export function ProfilePublishCard({
         </div>
       )}
       <div className="profilePublishActions">
-        {!profile.is_active && !profile.current_version && (
+        {releaseStatus === "draft" && !profile.is_active && (
           <button type="button" disabled={busy} onClick={() => void publish()}>
             发布
           </button>
         )}
-        {!profile.is_active && profile.current_version && (
+        {releaseStatus === "published" && profile.current_version && !profile.is_active && (
           <button type="button" disabled={busy} onClick={() => void activate()}>
             激活生效
+          </button>
+        )}
+        {releaseStatus === "published" && profile.current_version && profile.is_active && (
+          <button type="button" disabled={busy} onClick={() => void activate()}>
+            重试附属同步
           </button>
         )}
       </div>

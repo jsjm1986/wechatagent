@@ -22,10 +22,7 @@ fn candidate_library_covers_at_least_four_categories() {
         .iter()
         .map(|s| s.category.as_str())
         .collect();
-    assert!(
-        cats.len() >= 4,
-        "候选库必须覆盖 ≥4 大类，实际={cats:?}"
-    );
+    assert!(cats.len() >= 4, "候选库必须覆盖 ≥4 大类，实际={cats:?}");
     // 四大类必须各至少有一个具体行业。
     for expected in ["sales", "companion", "peer_social", "formal_business"] {
         assert!(
@@ -89,7 +86,7 @@ fn funnel_polarity_matches_category() {
 
 #[test]
 fn apply_category_semantics_sets_funnel_and_transaction_flags() {
-    // 漏斗型（销售）：funnel 开、交易事实开、grounding 不旁路、信任自报低风险。
+    // 漏斗型（销售）：funnel 开、交易事实开、grounding 不旁路、普通低风险可走 light Reviewer。
     let mut sales = default_domain_profile("ws-sales");
     apply_category_semantics(&mut sales, IdentityCategory::Sales);
     assert!(sales.operation_mode.funnel.enabled, "销售域 funnel 应开");
@@ -100,24 +97,24 @@ fn apply_category_semantics_sets_funnel_and_transaction_flags() {
     );
     assert!(
         !sales.distrust_self_reported_low_risk,
-        "销售域沿用既有 review 判定"
+        "销售域普通低风险可走 light Reviewer"
     );
 
     // 关系型（情感陪伴）：funnel 关、交易事实关、grounding 旁路、强制 LLM review。
     let mut companion = default_domain_profile("ws-comp");
     apply_category_semantics(&mut companion, IdentityCategory::Companion);
-    assert!(!companion.operation_mode.funnel.enabled, "陪伴域 funnel 应关");
     assert!(
-        !companion.transaction_facts_enabled,
-        "陪伴域不注入交易事实"
+        !companion.operation_mode.funnel.enabled,
+        "陪伴域 funnel 应关"
     );
+    assert!(!companion.transaction_facts_enabled, "陪伴域不注入交易事实");
     assert!(
         companion.grounding_gate_bypass_without_claim,
         "陪伴域 grounding 软闸旁路（纯情感回复不被误拦）"
     );
     assert!(
         companion.distrust_self_reported_low_risk,
-        "高敏域强制走 LLM review"
+        "高敏域强制走 full Reviewer"
     );
 }
 

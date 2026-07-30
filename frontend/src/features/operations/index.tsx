@@ -4,7 +4,6 @@ import { EmptyState } from "../../components/ui/EmptyState";
 import { StatusBadge, type StatusTone } from "../../components/ui/StatusBadge";
 import { useOperationsStore } from "../../stores/operationsStore";
 import { useAccountStore } from "../../stores/accountStore";
-import { api } from "../../lib/api";
 import { FINAL_REVIEW_STATUS_LABELS, GATEWAY_STATUS_LABELS, HOLD_CATEGORY_LABELS, NEXT_BEST_ACTION_TYPE_LABELS, REVIEW_SCORE_LABELS, EVENT_KIND_LABELS, EVENT_STATUS_LABELS, labelOf } from "../../lib/reviewLabels";
 import type { DecisionReview, AgentRunItem } from "../../types";
 import styles from "./Operations.module.css";
@@ -179,6 +178,11 @@ function blockedLabel(review: DecisionReview): string {
 }
 
 export default function OperationsFeature() {
+  const currentAccountId = useAccountStore((s) => s.currentAccountId());
+  return <OperationsWorkbench key={currentAccountId} currentAccountId={currentAccountId} />;
+}
+
+function OperationsWorkbench({ currentAccountId }: { currentAccountId: string }) {
   const {
     events,
     tasks,
@@ -186,16 +190,23 @@ export default function OperationsFeature() {
     llmUsage,
     agentRuns,
     loading,
+    dataAccountId,
     opsTab,
     setOpsTab,
-    loadOperationsData
+    loadOperationsData,
+    reviewTaskNow,
+    cancelTask
   } = useOperationsStore();
 
-  const currentAccountId = useAccountStore((s) =>
-    s.accounts.some((a) => a.accountId === s.selectedAccountId)
-      ? s.selectedAccountId
-      : s.accounts[0]?.accountId ?? ""
-  );
+  const snapshotIsCurrent = dataAccountId === currentAccountId;
+  const scopedEvents = snapshotIsCurrent ? events : [];
+  const scopedTasks = snapshotIsCurrent
+    ? tasks.filter((task) => task.accountId === currentAccountId)
+    : [];
+  const scopedDecisionReviews = snapshotIsCurrent ? decisionReviews : [];
+  const scopedLlmUsage = snapshotIsCurrent ? llmUsage : null;
+  const scopedAgentRuns = snapshotIsCurrent ? agentRuns : [];
+  const scopedLoading = snapshotIsCurrent && loading;
 
   useEffect(() => {
     loadOperationsData(currentAccountId);
@@ -212,8 +223,8 @@ export default function OperationsFeature() {
     { id: "llm", label: "LLM 成本" }
   ];
 
-  const usage = llmUsage?.summary;
-  const usageItems = llmUsage?.items || [];
+  const usage = scopedLlmUsage?.summary;
+  const usageItems = scopedLlmUsage?.items || [];
 
   return (
     <div className={styles.page}>
@@ -239,9 +250,9 @@ export default function OperationsFeature() {
         </div>
 
         {opsTab === "tasks" &&
-          (loading ? (
+          (scopedLoading ? (
             <EmptyState title="加载中…" hint="正在拉取运营数据。" />
-          ) : tasks.length === 0 ? (
+          ) : scopedTasks.length === 0 ? (
             <EmptyState title="暂无跟进任务" hint="Agent 排程的跟进会在这里按计划呈现。" />
           ) : (
             <table className={styles.table}>
@@ -254,7 +265,7 @@ export default function OperationsFeature() {
                 </tr>
               </thead>
               <tbody>
-                {tasks.map((task) => (
+                {scopedTasks.map((task) => (
                   <tr key={task.id}>
                     <td><StatusBadge tone={taskStatusTone(task.status)}>{labelOf(TASK_STATUS_LABELS, task.status)}</StatusBadge></td>
                     <td>{task.content}</td>
@@ -263,20 +274,14 @@ export default function OperationsFeature() {
                       <button
                         type="button"
                         className={styles.linkBtn}
-                        onClick={async () => {
-                          await api.post(`/api/agent-tasks/${task.id}/review-now`);
-                          loadOperationsData(currentAccountId);
-                        }}
+                        onClick={() => void reviewTaskNow(task, currentAccountId)}
                       >
                         立即复核
                       </button>
                       <button
                         type="button"
                         className={styles.linkBtn}
-                        onClick={async () => {
-                          await api.post(`/api/agent-tasks/${task.id}/cancel`);
-                          loadOperationsData(currentAccountId);
-                        }}
+                        onClick={() => void cancelTask(task, currentAccountId)}
                       >
                         取消
                       </button>
@@ -288,13 +293,13 @@ export default function OperationsFeature() {
           ))}
 
         {opsTab === "events" &&
-          (loading ? (
+          (scopedLoading ? (
             <EmptyState title="加载中…" hint="正在拉取运营数据。" />
-          ) : events.length === 0 ? (
+          ) : scopedEvents.length === 0 ? (
             <EmptyState title="暂无运营事件" hint="跟进任务、Agent 决策与拦截会按时间在这里呈现。" />
           ) : (
             <ol className={styles.timeline}>
-              {events.map((event) => {
+              {scopedEvents.map((event) => {
                 const tone = eventTone(event.status);
                 return (
                   <li key={event.id} className={`${styles.tItem} ${styles[tone]}`}>
@@ -324,9 +329,9 @@ export default function OperationsFeature() {
           ))}
 
         {opsTab === "reviews" &&
-          (loading ? (
+          (scopedLoading ? (
             <EmptyState title="加载中…" hint="正在拉取运营数据。" />
-          ) : decisionReviews.length === 0 ? (
+          ) : scopedDecisionReviews.length === 0 ? (
             <EmptyState title="暂无复核记录" hint="独立复盘 Agent 的结论与评分会在这里留痕。" />
           ) : (
             <table className={styles.table}>
@@ -341,7 +346,7 @@ export default function OperationsFeature() {
                 </tr>
               </thead>
               <tbody>
-                {decisionReviews.map((review) => (
+                {scopedDecisionReviews.map((review) => (
                   <tr key={review.id}>
                     <td><StatusBadge tone={reviewTone(review)}>{review.approved ? "通过" : blockedLabel(review)}</StatusBadge></td>
                     <td>{nextBestActionLabel(review.nextBestAction)}</td>
@@ -356,9 +361,9 @@ export default function OperationsFeature() {
           ))}
 
         {opsTab === "runs" &&
-          (loading ? (
+          (scopedLoading ? (
             <EmptyState title="加载中…" hint="正在拉取运营数据。" />
-          ) : agentRuns.length === 0 ? (
+          ) : scopedAgentRuns.length === 0 ? (
             <EmptyState title="暂无运行日志" hint="AI 每轮决策的运行记录（含档位遥测）会在这里留痕。" />
           ) : (
             <table className={styles.table}>
@@ -372,7 +377,7 @@ export default function OperationsFeature() {
                 </tr>
               </thead>
               <tbody>
-                {agentRuns.map((run) => {
+                {scopedAgentRuns.map((run) => {
                   const tier = tierTelemetry(run);
                   const expanded = expandedRunId === (run.runId || run.id);
                   return (
@@ -393,6 +398,11 @@ export default function OperationsFeature() {
 
         {opsTab === "llm" && (
           <>
+            <div className={styles.usageScope}>
+              保留日志全量汇总
+              {scopedLlmUsage?.window?.start ? ` · 自 ${formatTime(scopedLlmUsage.window.start)}` : ""}
+              {scopedLlmUsage?.asOf ? ` · 截至 ${formatTime(scopedLlmUsage.asOf)}` : ""}
+            </div>
             <div className={styles.usageGrid}>
               <div className={styles.usageCard}>
                 <div className={styles.usageK}>调用次数</div>
@@ -400,7 +410,11 @@ export default function OperationsFeature() {
               </div>
               <div className={styles.usageCard}>
                 <div className={styles.usageK}>总 token</div>
-                <div className={styles.usageV}>{usage?.totalTokens ?? 0}</div>
+                <div className={styles.usageV}>
+                  {(usage?.unknownUsageCalls ?? 0) > 0
+                    ? `至少 ${usage?.totalTokens ?? 0}（${usage?.unknownUsageCalls} 次未知）`
+                    : (usage?.totalTokens ?? 0)}
+                </div>
               </div>
               <div className={styles.usageCard}>
                 <div className={styles.usageK}>缓存命中 token</div>
@@ -411,17 +425,23 @@ export default function OperationsFeature() {
                 <div className={`${styles.usageV} ${styles.key}`}>{Math.round((usage?.promptCacheHitRate ?? 0) * 100)}%</div>
               </div>
             </div>
-            {loading ? (
+            {scopedLoading ? (
               <EmptyState title="加载中…" hint="正在拉取运营数据。" />
             ) : usageItems.length === 0 ? (
               <EmptyState title="暂无 LLM 调用记录" hint="Agent 的每次模型调用都会在这里计量成本。" />
             ) : (
-              <table className={styles.table}>
+              <>
+                <div className={styles.usageScope}>
+                  最近 {scopedLlmUsage?.itemsReturned ?? usageItems.length} 条明细
+                  {scopedLlmUsage?.itemsTruncated ? `（全量 ${usage?.totalCalls ?? 0} 次，明细已截断）` : ""}
+                </div>
+                <table className={styles.table}>
                 <thead>
                   <tr>
                     <th>提示词</th>
                     <th>状态</th>
                     <th>耗时</th>
+                    <th>Token</th>
                     <th>命中</th>
                     <th>未命中</th>
                     <th>时间</th>
@@ -433,13 +453,15 @@ export default function OperationsFeature() {
                       <td>{item.promptKey}</td>
                       <td className={styles.cellMuted}>{LLM_CALL_STATUS_LABELS[item.status] ?? item.status}</td>
                       <td className={styles.cellNum}>{item.latencyMs}ms</td>
+                      <td className={styles.cellNum}>{item.usageKnown ? item.totalTokens : "未知"}</td>
                       <td className={styles.cellNum}>{item.promptCacheHitTokens}</td>
                       <td className={styles.cellNum}>{item.promptCacheMissTokens}</td>
                       <td className={styles.cellMuted}>{formatTime(item.createdAt)}</td>
                     </tr>
                   ))}
                 </tbody>
-              </table>
+                </table>
+              </>
             )}
           </>
         )}

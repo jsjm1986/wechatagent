@@ -30,6 +30,60 @@ use mongodb::bson::doc;
 use crate::models::{HourRange, WechatAccount};
 use crate::routes::AppState;
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AccountScope {
+    pub workspace_id: String,
+    pub account_id: String,
+}
+
+fn normalize_account_scopes<I>(items: I) -> Vec<AccountScope>
+where
+    I: IntoIterator<Item = AccountScope>,
+{
+    let mut scopes: Vec<_> = items
+        .into_iter()
+        .filter(|scope| {
+            !scope.workspace_id.trim().is_empty() && !scope.account_id.trim().is_empty()
+        })
+        .collect();
+    scopes.sort();
+    scopes.dedup();
+    scopes
+}
+
+/// Return every persisted tenant/account capability in stable order.
+///
+/// Worker scheduling deliberately does not filter on `online`: offline accounts
+/// may still own managed contacts and durable tasks, while delivery enforces
+/// connectivity later. Empty legacy identifiers are fail-closed.
+pub async fn list_registered_account_scopes(state: &AppState) -> anyhow::Result<Vec<AccountScope>> {
+    let mut cursor = state.db.accounts().find(doc! {}, None).await?;
+    let mut scopes = Vec::new();
+    while let Some(account) = cursor.try_next().await? {
+        scopes.push(AccountScope {
+            workspace_id: account.workspace_id,
+            account_id: account.account_id,
+        });
+    }
+    Ok(normalize_account_scopes(scopes))
+}
+
+/// Collapse sorted account scopes to one real account per workspace. Workspace-
+/// level workers use the account only as the audit-event anchor; candidate work
+/// remains scoped by each contact's own account.
+pub fn representative_workspace_scopes(scopes: &[AccountScope]) -> Vec<AccountScope> {
+    let mut representatives = Vec::new();
+    let mut previous_workspace: Option<&str> = None;
+    for scope in scopes {
+        if previous_workspace == Some(scope.workspace_id.as_str()) {
+            continue;
+        }
+        representatives.push(scope.clone());
+        previous_workspace = Some(scope.workspace_id.as_str());
+    }
+    representatives
+}
+
 /// 给定 (workspace_id, contact_wxid, persona_tag) → 决策一个 account_id。
 ///
 /// `persona_tag = None` 时回退到"默认 persona"（取 workspace 默认 account），
@@ -94,6 +148,7 @@ pub async fn assign_account(
     // 审计：写一条 account_scheduler_assignment。
     let _ = crate::agent::write_event_for_account(
         state,
+        workspace_id,
         &assigned,
         Some(contact_wxid),
         "account_scheduler_assignment",
@@ -355,7 +410,10 @@ mod tests {
         assert!(is_in_off_hours(&ranges, hour_in_offset(utc_midnight_ms, 0)));
         // 正确用 +8 偏移：本地 08:00,不在任何 off 区间（修复后行为）。
         assert_eq!(hour_in_offset(utc_midnight_ms, 8), 8);
-        assert!(!is_in_off_hours(&ranges, hour_in_offset(utc_midnight_ms, 8)));
+        assert!(!is_in_off_hours(
+            &ranges,
+            hour_in_offset(utc_midnight_ms, 8)
+        ));
     }
 
     #[test]
@@ -377,7 +435,9 @@ mod tests {
         let mut acc1 = 0;
         let mut acc2 = 0;
         for i in 0..200 {
-            let pick = stable_pick(&pool, &format!("wxid_{}", i)).account_id.clone();
+            let pick = stable_pick(&pool, &format!("wxid_{}", i))
+                .account_id
+                .clone();
             if pick == "acc_1" {
                 acc1 += 1;
             } else {
@@ -386,5 +446,62 @@ mod tests {
         }
         // 不要求严格 1:1，但两侧都至少有 1/4，否则散列烂得离谱。
         assert!(acc1 > 50 && acc2 > 50, "{} vs {}", acc1, acc2);
+    }
+
+    #[test]
+    fn worker_scopes_are_sorted_deduplicated_and_reject_empty_ids() {
+        let scopes = normalize_account_scopes([
+            AccountScope {
+                workspace_id: "ws-b".into(),
+                account_id: "acc-2".into(),
+            },
+            AccountScope {
+                workspace_id: "ws-a".into(),
+                account_id: "acc-1".into(),
+            },
+            AccountScope {
+                workspace_id: "ws-b".into(),
+                account_id: "acc-2".into(),
+            },
+            AccountScope {
+                workspace_id: "".into(),
+                account_id: "dirty".into(),
+            },
+        ]);
+        assert_eq!(
+            scopes,
+            vec![
+                AccountScope {
+                    workspace_id: "ws-a".into(),
+                    account_id: "acc-1".into(),
+                },
+                AccountScope {
+                    workspace_id: "ws-b".into(),
+                    account_id: "acc-2".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn workspace_projection_keeps_one_real_account_per_workspace() {
+        let scopes = vec![
+            AccountScope {
+                workspace_id: "ws-a".into(),
+                account_id: "acc-1".into(),
+            },
+            AccountScope {
+                workspace_id: "ws-a".into(),
+                account_id: "acc-2".into(),
+            },
+            AccountScope {
+                workspace_id: "ws-b".into(),
+                account_id: "acc-3".into(),
+            },
+        ];
+        assert_eq!(
+            representative_workspace_scopes(&scopes),
+            vec![scopes[0].clone(), scopes[2].clone()]
+        );
     }
 }

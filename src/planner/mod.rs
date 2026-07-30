@@ -16,10 +16,14 @@
 use std::time::Duration;
 
 use futures::TryStreamExt;
-use mongodb::bson::{doc, DateTime, Document};
+use mongodb::{
+    bson::{doc, oid::ObjectId, DateTime, Document},
+    options::FindOneOptions,
+};
 use tokio::time::sleep;
 
-use crate::models::{AgentTask, AnniversaryEntry, CommitmentRepr, Contact};
+use crate::models::{AnniversaryEntry, CommitmentRepr, Contact};
+use crate::proactive_outreach::{CommitOutcome, DailyQuota, FollowUpIntent};
 use crate::routes::AppState;
 
 /// 旧 `customer_stage` 字段已迁入 `Contact.domain_attributes`。这两个 helper 把
@@ -81,6 +85,35 @@ fn contact_stagnation_updated_at(contact: &Contact, dim: &str) -> Option<DateTim
         .or_else(|| contact_customer_stage_updated_at(contact))
 }
 
+fn contact_stagnation_value(contact: &Contact, dim: &str) -> String {
+    contact
+        .domain_attributes
+        .as_ref()
+        .and_then(|attributes| attributes.get(dim))
+        // BSON Display renders strings with JSON quotes. Preserve the raw
+        // business value for stable generation identities; non-string custom
+        // dimensions retain their canonical BSON rendering.
+        .map(|value| match value {
+            mongodb::bson::Bson::String(text) => text.clone(),
+            other => other.to_string(),
+        })
+        .unwrap_or_else(|| "<missing>".to_string())
+}
+
+/// Encode business-generation facts without delimiter ambiguity. All callers
+/// pass arrays/tuples only, so serde_json's compact Value rendering is stable.
+fn canonical_subject(prefix: &str, facts: serde_json::Value) -> String {
+    format!("{prefix}:{facts}")
+}
+
+fn stage_stagnation_subject(contact: &Contact, config: &PlannerStageConfig) -> String {
+    let dimension = config.stagnation_dimension.as_str();
+    let value = contact_stagnation_value(contact, dimension);
+    let generation =
+        contact_stagnation_updated_at(contact, dimension).map(|updated| updated.timestamp_millis());
+    canonical_subject("stage", serde_json::json!([dimension, value, generation]))
+}
+
 /// 扫描器结束时输出的统计信息（写入 `*_tick` 事件 detail）。
 #[derive(Debug, Default, Clone, Copy)]
 struct ScanCounters {
@@ -96,30 +129,24 @@ pub async fn run_strategic_planner(state: AppState) {
         interval_seconds = state.config.strategic_planner_interval_seconds,
         silent_threshold_hours = state.config.strategic_planner_silent_threshold_hours,
         daily_emit_cap = state.config.strategic_planner_daily_emit_cap,
-        commitment_imminent_window_hours =
-            state.config.strategic_planner_commitment_imminent_window_hours,
-        stage_stagnation_threshold_days =
-            state.config.strategic_planner_stage_stagnation_threshold_days,
+        commitment_imminent_window_hours = state
+            .config
+            .strategic_planner_commitment_imminent_window_hours,
+        stage_stagnation_threshold_days = state
+            .config
+            .strategic_planner_stage_stagnation_threshold_days,
         "strategic planner loop started"
     );
     loop {
-        if let Err(error) = scan_silent(&state).await {
-            tracing::error!(error = %error, "strategic planner silent scan failed");
-        }
-        if let Err(error) = scan_commitments(&state).await {
-            tracing::error!(error = %error, "strategic planner commitment scan failed");
-        }
-        if let Err(error) = scan_stage_stagnation(&state).await {
-            tracing::error!(error = %error, "strategic planner stage_stagnation scan failed");
-        }
-        if let Err(error) = scan_calendar(&state).await {
-            tracing::error!(error = %error, "strategic planner calendar scan failed");
-        }
-        if let Err(error) = scan_renewal(&state).await {
-            tracing::error!(error = %error, "strategic planner renewal scan failed");
-        }
-        if let Err(error) = scan_reactivation(&state).await {
-            tracing::error!(error = %error, "strategic planner reactivation scan failed");
+        match crate::account_scheduler::list_registered_account_scopes(&state).await {
+            Ok(scopes) => {
+                for scope in scopes {
+                    run_scope_scans_isolated(&state, &scope).await;
+                }
+            }
+            Err(error) => {
+                tracing::error!(error = %error, "strategic planner account scope listing failed");
+            }
         }
         sleep(Duration::from_secs(
             state.config.strategic_planner_interval_seconds,
@@ -133,13 +160,67 @@ pub async fn run_strategic_planner(state: AppState) {
 /// 生产 loop（[`run_strategic_planner`]）逐段独立 try 以避免相互拖累；这里允许
 /// 短路是因为测试需要"任何一段失败立即可见"的语义。
 pub async fn tick(state: &AppState) -> anyhow::Result<()> {
-    scan_silent(state).await?;
-    scan_commitments(state).await?;
-    scan_stage_stagnation(state).await?;
-    scan_calendar(state).await?;
-    scan_renewal(state).await?;
-    scan_reactivation(state).await?;
+    let scopes = crate::account_scheduler::list_registered_account_scopes(state).await?;
+    for scope in scopes {
+        scan_scope(state, &scope).await?;
+    }
     Ok(())
+}
+
+async fn scan_scope(
+    state: &AppState,
+    scope: &crate::account_scheduler::AccountScope,
+) -> anyhow::Result<()> {
+    scan_silent(state, &scope.workspace_id, &scope.account_id).await?;
+    scan_commitments(state, &scope.workspace_id, &scope.account_id).await?;
+    scan_stage_stagnation(state, &scope.workspace_id, &scope.account_id).await?;
+    scan_calendar(state, &scope.workspace_id, &scope.account_id).await?;
+    scan_renewal(state, &scope.workspace_id, &scope.account_id).await?;
+    scan_reactivation(state, &scope.workspace_id, &scope.account_id).await?;
+    Ok(())
+}
+
+async fn run_scope_scans_isolated(
+    state: &AppState,
+    scope: &crate::account_scheduler::AccountScope,
+) {
+    macro_rules! run_segment {
+        ($name:literal, $future:expr) => {
+            if let Err(error) = $future.await {
+                tracing::error!(
+                    error = %error,
+                    workspace_id = %scope.workspace_id,
+                    account_id = %scope.account_id,
+                    segment = $name,
+                    "strategic planner scope scan failed"
+                );
+            }
+        };
+    }
+    run_segment!(
+        "silent",
+        scan_silent(state, &scope.workspace_id, &scope.account_id)
+    );
+    run_segment!(
+        "commitment",
+        scan_commitments(state, &scope.workspace_id, &scope.account_id)
+    );
+    run_segment!(
+        "stage_stagnation",
+        scan_stage_stagnation(state, &scope.workspace_id, &scope.account_id)
+    );
+    run_segment!(
+        "calendar",
+        scan_calendar(state, &scope.workspace_id, &scope.account_id)
+    );
+    run_segment!(
+        "renewal",
+        scan_renewal(state, &scope.workspace_id, &scope.account_id)
+    );
+    run_segment!(
+        "reactivation",
+        scan_reactivation(state, &scope.workspace_id, &scope.account_id)
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -181,6 +262,28 @@ async fn count_today_emit_events(
     Ok(count as i64)
 }
 
+async fn count_today_segment_events(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+    event_kinds: &[&str],
+    now: DateTime,
+) -> anyhow::Result<i64> {
+    Ok(state
+        .db
+        .events()
+        .count_documents(
+            doc! {
+                "workspace_id": workspace_id,
+                "account_id": account_id,
+                "kind": { "$in": event_kinds },
+                "created_at": { "$gte": day_start_before(now) },
+            },
+            None,
+        )
+        .await? as i64)
+}
+
 /// 当日起点（以 epoch 整数小时近似 UTC 0 点；与 `tasks.rs::today_date_string`
 /// 同款粗近似，足够 daily-cap 这种"按日计数"的语义）。
 fn day_start_before(now: DateTime) -> DateTime {
@@ -190,50 +293,48 @@ fn day_start_before(now: DateTime) -> DateTime {
     DateTime::from_millis(day_index * day_ms)
 }
 
-/// 共享 emit helper：把"调用方拼好的 content"写成一条 follow_up 任务。
-///
-/// 三个扫描器都调它；M1 silent / M2 commitment / M2 stage_stagnation 各自负责
-/// 拼出语义清晰的 `Planner: <reason> ...` content 前缀，Reply Agent 在执行 task
-/// 时按 content 推断"为什么发起"。
-async fn emit_planner_follow_up(
+async fn commit_planner_follow_up(
     state: &AppState,
     contact: &Contact,
+    segment: &'static str,
+    subject: String,
     content: String,
+    event_kind: &'static str,
+    event_summary: String,
+    event_details: Document,
     now: DateTime,
-) -> anyhow::Result<()> {
-    // 默认给 48 小时 expiry，与 `RuntimeParametersTyped::default().follow_up_expires_hours`
-    // 对齐；Planner 不读 OperationDomainConfig，避免重建 runtime。
-    let expires_hours: i64 = 48;
-    let expires_at = DateTime::from_millis(now.timestamp_millis() + expires_hours * 60 * 60 * 1000);
-    let task = AgentTask {
-        id: None,
-        workspace_id: contact.workspace_id.clone(),
-        account_id: contact.account_id.clone(),
-        contact_wxid: contact.wxid.clone(),
-        kind: "follow_up".to_string(),
-        run_at: now,
-        expires_at: Some(expires_at),
-        content,
-        status: "pending".to_string(),
-        source_decision_id: None,
-        review_required: true,
-        attempt_count: 0,
-        max_attempts: 3,
-        next_retry_at: None,
-        gateway_status: None,
-        cancel_reason: None,
-        error: None,
-        claimed_at: None,
-        claim_recovery_count: 0,
-        created_at: now,
-        updated_at: now,
-    };
-    state.db.tasks().insert_one(task, None).await?;
-    Ok(())
+    total_cap: i64,
+    segment_cap: Option<i64>,
+    initial_total: i64,
+    initial_segment: i64,
+) -> anyhow::Result<CommitOutcome> {
+    crate::proactive_outreach::commit_follow_up(
+        state,
+        FollowUpIntent {
+            contact: contact.clone(),
+            segment,
+            subject,
+            content,
+            event_kind,
+            event_summary,
+            event_details,
+            now,
+            quota: DailyQuota {
+                namespace: "strategic_planner",
+                account_scope: Some(contact.account_id.clone()),
+                total_cap,
+                segment_cap,
+                initial_total,
+                initial_segment,
+            },
+        },
+    )
+    .await
 }
 
 async fn write_event(
     state: &AppState,
+    workspace_id: &str,
     account_id: &str,
     contact_wxid: Option<&str>,
     kind: &str,
@@ -243,6 +344,7 @@ async fn write_event(
 ) -> anyhow::Result<()> {
     crate::agent::write_event_for_account(
         state,
+        workspace_id,
         account_id,
         contact_wxid,
         kind,
@@ -275,6 +377,7 @@ async fn has_pending_follow_up(state: &AppState, contact: &Contact) -> anyhow::R
 /// 写一条 `*_capped` 事件并 break——剩余余额耗尽时短路。
 async fn write_capped_event(
     state: &AppState,
+    workspace_id: &str,
     account_id: &str,
     counters: ScanCounters,
     daily_cap: i64,
@@ -283,6 +386,7 @@ async fn write_capped_event(
 ) -> anyhow::Result<()> {
     write_event(
         state,
+        workspace_id,
         account_id,
         None,
         "strategic_planner_capped",
@@ -303,9 +407,7 @@ async fn write_capped_event(
 // 段 1：silent（M1）
 // ---------------------------------------------------------------------------
 
-async fn scan_silent(state: &AppState) -> anyhow::Result<()> {
-    let workspace_id = state.config.default_workspace_id.clone();
-    let account_id = state.config.default_account_id.clone();
+async fn scan_silent(state: &AppState, workspace_id: &str, account_id: &str) -> anyhow::Result<()> {
     let now = DateTime::now();
     let now_ms = now.timestamp_millis();
     let global_threshold_hours = state.config.strategic_planner_silent_threshold_hours;
@@ -315,7 +417,7 @@ async fn scan_silent(state: &AppState) -> anyhow::Result<()> {
     // DB 仍按全局阈值粗筛（粗筛 = 全局阈值即所有可能候选的上界，按 contact override
     // 再收紧只会让候选更少，绝不会漏）；逐 contact 的 enabled 短路 + 阈值收紧在内存做。
     let profile =
-        crate::agent::domain_profile::load_active_domain_profile(&state.db, &workspace_id).await;
+        crate::agent::domain_profile::load_active_domain_profile(&state.db, &workspace_id).await?;
 
     let filter = silent_candidate_filter(&workspace_id, &account_id, silent_before);
     let mut cursor = state.db.contacts().find(filter, None).await?;
@@ -323,6 +425,14 @@ async fn scan_silent(state: &AppState) -> anyhow::Result<()> {
     let daily_cap = state.config.strategic_planner_daily_emit_cap;
     let already_emitted_today =
         count_today_emit_events(state, &workspace_id, &account_id, now).await?;
+    let segment_emitted_today = count_today_segment_events(
+        state,
+        workspace_id,
+        account_id,
+        &["strategic_planner_emit"],
+        now,
+    )
+    .await?;
     let mut remaining = daily_cap.saturating_sub(already_emitted_today);
     let mut counters = ScanCounters::default();
 
@@ -351,6 +461,7 @@ async fn scan_silent(state: &AppState) -> anyhow::Result<()> {
         if remaining <= 0 {
             write_capped_event(
                 state,
+                &workspace_id,
                 &account_id,
                 counters,
                 daily_cap,
@@ -375,37 +486,43 @@ async fn scan_silent(state: &AppState) -> anyhow::Result<()> {
             .last_inbound_at
             .map(|d| d.timestamp_millis().to_string())
             .unwrap_or_else(|| "unknown".to_string());
-        emit_planner_follow_up(
+        let silent_hours = silent_hours_for(&contact, now_ms);
+        let outcome = commit_planner_follow_up(
             state,
             &contact,
+            "silent",
+            format!("last-inbound:{last_inbound_repr}"),
             format!("Planner: silent_follow_up since {last_inbound_repr}"),
-            now,
-        )
-        .await?;
-        let silent_hours = silent_hours_for(&contact, now_ms);
-        write_event(
-            state,
-            &contact.account_id,
-            Some(&contact.wxid),
             "strategic_planner_emit",
-            "emitted",
-            &format!("Planner: silent_follow_up emitted (silent {silent_hours}h)"),
-            Some(doc! {
+            format!("Planner: silent_follow_up emitted (silent {silent_hours}h)"),
+            doc! {
                 "source": "strategic_planner",
                 "silentHours": silent_hours,
                 "lastInboundAt": contact
                     .last_inbound_at
                     .map(|d| d.timestamp_millis())
                     .unwrap_or(0),
-            }),
+            },
+            now,
+            daily_cap,
+            None,
+            already_emitted_today,
+            segment_emitted_today,
         )
         .await?;
-        counters.emitted += 1;
-        remaining -= 1;
+        match outcome {
+            CommitOutcome::Emitted => {
+                counters.emitted += 1;
+                remaining -= 1;
+            }
+            CommitOutcome::Duplicate => continue,
+            CommitOutcome::Capped => break,
+        }
     }
 
     write_event(
         state,
+        &workspace_id,
         &account_id,
         None,
         "strategic_planner_tick",
@@ -476,7 +593,9 @@ fn silent_hours_for(contact: &Contact, now_ms: i64) -> i64 {
     // R14：i64::saturating_sub 在负数时不会 clamp 到 0（saturate at i64::MIN），
     // 时钟回退 / 测试夹具 last_inbound > now_ms 会导致 silent_hours 为负，
     // 让下游比较语义出错。这里显式 max(0) 防御。
-    let diff_ms = now_ms.saturating_sub(last_inbound.timestamp_millis()).max(0);
+    let diff_ms = now_ms
+        .saturating_sub(last_inbound.timestamp_millis())
+        .max(0);
     diff_ms / (60 * 60 * 1000)
 }
 
@@ -593,8 +712,14 @@ pub(crate) fn pick_commitment_emit_target(
             None => Some(candidate),
             Some(prev) => {
                 // overdue 优先于 imminent；同 reason 内取更早的 due_at。
-                let prev_score = (matches!(prev.reason, CommitmentReason::Overdue), -prev.due_at.timestamp_millis());
-                let cand_score = (matches!(candidate.reason, CommitmentReason::Overdue), -candidate.due_at.timestamp_millis());
+                let prev_score = (
+                    matches!(prev.reason, CommitmentReason::Overdue),
+                    -prev.due_at.timestamp_millis(),
+                );
+                let cand_score = (
+                    matches!(candidate.reason, CommitmentReason::Overdue),
+                    -candidate.due_at.timestamp_millis(),
+                );
                 if cand_score > prev_score {
                     Some(candidate)
                 } else {
@@ -606,20 +731,20 @@ pub(crate) fn pick_commitment_emit_target(
     best
 }
 
-/// 反查 `agent_events`：某个 commitment_id 在最近 dedup_hours 内是否已被 emit 过。
-async fn commitment_recently_emitted(
+/// Return the latest committed emit for this commitment. A caller inside the
+/// dedupe window skips it; once the window expires, the event `_id` becomes
+/// the predecessor for the next deterministic intent. Concurrent scanners
+/// therefore derive the same next generation even at a time-window boundary.
+async fn latest_commitment_emit(
     state: &AppState,
     contact: &Contact,
     commitment_id: &str,
-    now: DateTime,
-    dedup_hours: i64,
-) -> anyhow::Result<bool> {
-    let dedup_ms = dedup_hours.saturating_mul(60 * 60 * 1000);
-    let since = DateTime::from_millis(now.timestamp_millis() - dedup_ms);
-    let count = state
+) -> anyhow::Result<Option<(ObjectId, DateTime)>> {
+    let row = state
         .db
         .events()
-        .count_documents(
+        .clone_with_type::<Document>()
+        .find_one(
             doc! {
                 "workspace_id": &contact.workspace_id,
                 "account_id": &contact.account_id,
@@ -631,12 +756,14 @@ async fn commitment_recently_emitted(
                     ],
                 },
                 "details.commitmentId": commitment_id,
-                "created_at": { "$gte": since },
             },
-            None,
+            FindOneOptions::builder()
+                .sort(doc! { "created_at": -1, "_id": -1 })
+                .build(),
         )
         .await?;
-    Ok(count > 0)
+    row.map(|row| Ok((row.get_object_id("_id")?, *row.get_datetime("created_at")?)))
+        .transpose()
 }
 
 /// content 前缀里 text 字段截断长度，避免 task content 越界 prompt。
@@ -653,20 +780,24 @@ fn snippet_for_content(text: &str, max_chars: usize) -> String {
     out
 }
 
-async fn scan_commitments(state: &AppState) -> anyhow::Result<()> {
-    let workspace_id = state.config.default_workspace_id.clone();
-    let account_id = state.config.default_account_id.clone();
+async fn scan_commitments(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+) -> anyhow::Result<()> {
     let now = DateTime::now();
-    let global_imminent_window = state.config.strategic_planner_commitment_imminent_window_hours;
+    let global_imminent_window = state
+        .config
+        .strategic_planner_commitment_imminent_window_hours;
     let fallback_due_hours = state.config.strategic_planner_commitment_fallback_due_hours;
     let dedup_hours = state.config.strategic_planner_commitment_emit_dedup_hours;
     let priority_enabled = state.config.strategic_planner_priority_enabled;
     // universal-domain-adaptation H8/1C：每 tick 加载一次 active profile，复用它构造漏斗
     // 排序配置 + 取行业默认范式（commitment enabled/窗口）。
     let profile =
-        crate::agent::domain_profile::load_active_domain_profile(&state.db, &workspace_id).await;
+        crate::agent::domain_profile::load_active_domain_profile(&state.db, &workspace_id).await?;
     let stage_config =
-        build_planner_stage_config(state, &workspace_id, &account_id, &profile).await;
+        build_planner_stage_config(state, &workspace_id, &account_id, &profile).await?;
 
     let filter = commitment_candidate_filter(&workspace_id, &account_id);
     let mut cursor = state.db.contacts().find(filter, None).await?;
@@ -674,11 +805,22 @@ async fn scan_commitments(state: &AppState) -> anyhow::Result<()> {
     let daily_cap = state.config.strategic_planner_daily_emit_cap;
     let already_emitted_today =
         count_today_emit_events(state, &workspace_id, &account_id, now).await?;
+    let segment_emitted_today = count_today_segment_events(
+        state,
+        workspace_id,
+        account_id,
+        &[
+            "strategic_planner_commitment_overdue",
+            "strategic_planner_commitment_imminent",
+        ],
+        now,
+    )
+    .await?;
     let mut remaining = daily_cap.saturating_sub(already_emitted_today);
     let mut counters = ScanCounters::default();
 
     // 第一阶段：扫描 + 内存过滤（managed/cooldown/dedup/pending），收集候选。
-    let mut candidates: Vec<(Contact, CommitmentEmitTarget)> = Vec::new();
+    let mut candidates: Vec<(Contact, CommitmentEmitTarget, Option<ObjectId>)> = Vec::new();
     while let Some(contact) = cursor.try_next().await? {
         counters.scanned += 1;
         if !managed_and_not_in_cooldown(&contact) {
@@ -695,28 +837,43 @@ async fn scan_commitments(state: &AppState) -> anyhow::Result<()> {
             .commitment
             .imminent_window_hours
             .unwrap_or(global_imminent_window);
-        let Some(target) = pick_commitment_emit_target(&contact, now, imminent_window, fallback_due_hours) else {
+        let Some(target) =
+            pick_commitment_emit_target(&contact, now, imminent_window, fallback_due_hours)
+        else {
             continue;
         };
-        if commitment_recently_emitted(state, &contact, &target.id, now, dedup_hours).await? {
+        let predecessor = latest_commitment_emit(state, &contact, &target.id).await?;
+        let dedup_ms = dedup_hours.max(0).saturating_mul(60 * 60 * 1000);
+        if dedup_ms > 0
+            && predecessor.as_ref().is_some_and(|(_, emitted_at)| {
+                now.timestamp_millis() - emitted_at.timestamp_millis() < dedup_ms
+            })
+        {
             continue;
         }
         if has_pending_follow_up(state, &contact).await? {
             continue;
         }
-        candidates.push((contact, target));
+        candidates.push((contact, target, predecessor.map(|(id, _)| id)));
     }
 
     // 第二阶段：跨 contact 优先级稳定排序。priority_enabled=false 时退回 cursor 自然顺序。
     if priority_enabled {
-        candidates.sort_by(|a, b| commitment_priority_key(&a.0, &a.1, &stage_config).cmp(&commitment_priority_key(&b.0, &b.1, &stage_config)));
+        candidates.sort_by(|a, b| {
+            commitment_priority_key(&a.0, &a.1, &stage_config).cmp(&commitment_priority_key(
+                &b.0,
+                &b.1,
+                &stage_config,
+            ))
+        });
     }
 
     // 第三阶段：按优先级序消费 daily cap，对每个候选检查 block-rate 反馈环。
-    for (contact, target) in candidates {
+    for (contact, target, predecessor) in candidates {
         if remaining <= 0 {
             write_capped_event(
                 state,
+                &workspace_id,
                 &account_id,
                 counters,
                 daily_cap,
@@ -745,35 +902,53 @@ async fn scan_commitments(state: &AppState) -> anyhow::Result<()> {
             id = target.id,
             due_ms = due_at_ms,
         );
-        emit_planner_follow_up(state, &contact, content, now).await?;
-        write_event(
+        let predecessor = predecessor
+            .map(|id| id.to_hex())
+            .unwrap_or_else(|| "genesis".to_string());
+        let outcome = commit_planner_follow_up(
             state,
-            &contact.account_id,
-            Some(&contact.wxid),
+            &contact,
+            "commitment",
+            canonical_subject(
+                "commitment",
+                serde_json::json!([target.id, due_at_ms, predecessor]),
+            ),
+            content,
             target.reason.event_kind(),
-            "emitted",
-            &format!(
+            format!(
                 "Planner: {} emitted (id={}, due_at={})",
                 target.reason.label(),
                 target.id,
                 due_at_ms
             ),
-            Some(doc! {
+            doc! {
                 "source": "strategic_planner",
                 "reason": target.reason.label(),
                 "commitmentId": &target.id,
                 "dueAt": due_at_ms,
                 "isFallbackDue": target.is_fallback_due,
                 "textSnippet": snippet,
-            }),
+            },
+            now,
+            daily_cap,
+            None,
+            already_emitted_today,
+            segment_emitted_today,
         )
         .await?;
-        counters.emitted += 1;
-        remaining -= 1;
+        match outcome {
+            CommitOutcome::Emitted => {
+                counters.emitted += 1;
+                remaining -= 1;
+            }
+            CommitOutcome::Duplicate => continue,
+            CommitOutcome::Capped => break,
+        }
     }
 
     write_event(
         state,
+        &workspace_id,
         &account_id,
         None,
         "strategic_planner_commitment_tick",
@@ -906,7 +1081,7 @@ pub(crate) async fn build_planner_stage_config(
     workspace_id: &str,
     account_id: &str,
     profile: &crate::models::DomainProfile,
-) -> PlannerStageConfig {
+) -> anyhow::Result<PlannerStageConfig> {
     use crate::agent::taxonomy::{dimension_value_weights, global_taxonomy_cache};
 
     let stagnation_dimension = profile
@@ -914,8 +1089,8 @@ pub(crate) async fn build_planner_stage_config(
         .clone()
         .unwrap_or_else(|| "customer_stage".to_string());
 
-    let cache = global_taxonomy_cache();
-    cache.find_or_load(&state.db, workspace_id).await;
+    let cache = global_taxonomy_cache(&state.db);
+    cache.find_or_load(&state.db, workspace_id).await?;
 
     let mut config = PlannerStageConfig {
         stage_weights: std::collections::HashMap::new(),
@@ -944,7 +1119,7 @@ pub(crate) async fn build_planner_stage_config(
             config.intent_weights.insert(id, w);
         }
     }
-    config
+    Ok(config)
 }
 
 /// universal-domain-adaptation H8 + §3.7：解析单个 contact 的**有效运营范式**。
@@ -1171,7 +1346,13 @@ pub(crate) fn commitment_priority_key(
     let stage_w = -config.stage_weight(contact_customer_stage(contact).as_deref());
     let value_w = -value_tier_weight(contact_value_tier(contact).as_deref());
     let intent_w = -config.intent_weight(contact_intent_level(contact).as_deref());
-    (reason_ord, stage_w, value_w, intent_w, target.due_at.timestamp_millis())
+    (
+        reason_ord,
+        stage_w,
+        value_w,
+        intent_w,
+        target.due_at.timestamp_millis(),
+    )
 }
 
 /// stage_stagnation 段排序键。返回的元组按 **升序** 排序时，**值越小越优先 emit**。
@@ -1238,9 +1419,8 @@ async fn should_skip_for_block_rate(
     if window_hours <= 0 || min_runs <= 0 || threshold <= 0.0 {
         return Ok(None);
     }
-    let since = DateTime::from_millis(
-        now.timestamp_millis() - window_hours.saturating_mul(60 * 60 * 1000),
-    );
+    let since =
+        DateTime::from_millis(now.timestamp_millis() - window_hours.saturating_mul(60 * 60 * 1000));
     let mut cursor = state
         .db
         .agent_run_logs()
@@ -1302,21 +1482,22 @@ async fn write_backoff_event(
     details.insert("segment", segment);
     write_event(
         state,
+        &contact.workspace_id,
         &contact.account_id,
         Some(&contact.wxid),
         kind,
         "skipped",
-        &format!(
-            "Planner: {segment} skipped (AI 自主回退：block-rate above threshold)"
-        ),
+        &format!("Planner: {segment} skipped (AI 自主回退：block-rate above threshold)"),
         Some(details),
     )
     .await
 }
 
-async fn scan_stage_stagnation(state: &AppState) -> anyhow::Result<()> {
-    let workspace_id = state.config.default_workspace_id.clone();
-    let account_id = state.config.default_account_id.clone();
+async fn scan_stage_stagnation(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+) -> anyhow::Result<()> {
     let now = DateTime::now();
     let now_ms = now.timestamp_millis();
     let global_threshold_days = state
@@ -1329,9 +1510,9 @@ async fn scan_stage_stagnation(state: &AppState) -> anyhow::Result<()> {
     // universal-domain-adaptation H8/1C：每 tick 加载一次 active profile，复用它构造漏斗
     // 排序配置 + 取行业默认范式（funnel enabled/停滞阈值）。
     let profile =
-        crate::agent::domain_profile::load_active_domain_profile(&state.db, &workspace_id).await;
+        crate::agent::domain_profile::load_active_domain_profile(&state.db, &workspace_id).await?;
     let stage_config =
-        build_planner_stage_config(state, &workspace_id, &account_id, &profile).await;
+        build_planner_stage_config(state, &workspace_id, &account_id, &profile).await?;
     let stage_updated_before =
         DateTime::from_millis(now_ms - global_threshold_days.saturating_mul(24 * 60 * 60 * 1000));
     let inbound_before =
@@ -1349,6 +1530,14 @@ async fn scan_stage_stagnation(state: &AppState) -> anyhow::Result<()> {
     let daily_cap = state.config.strategic_planner_daily_emit_cap;
     let already_emitted_today =
         count_today_emit_events(state, &workspace_id, &account_id, now).await?;
+    let segment_emitted_today = count_today_segment_events(
+        state,
+        workspace_id,
+        account_id,
+        &["strategic_planner_stage_stagnation"],
+        now,
+    )
+    .await?;
     let mut remaining = daily_cap.saturating_sub(already_emitted_today);
     let mut counters = ScanCounters::default();
 
@@ -1371,7 +1560,8 @@ async fn scan_stage_stagnation(state: &AppState) -> anyhow::Result<()> {
             .funnel
             .stagnation_threshold_days
             .unwrap_or(global_threshold_days);
-        let stage_updated = contact_stagnation_updated_at(&contact, &stage_config.stagnation_dimension);
+        let stage_updated =
+            contact_stagnation_updated_at(&contact, &stage_config.stagnation_dimension);
         if idle_days_since(stage_updated, now_ms) < effective_threshold_days {
             continue;
         }
@@ -1383,7 +1573,10 @@ async fn scan_stage_stagnation(state: &AppState) -> anyhow::Result<()> {
 
     // 第二阶段：跨 contact 优先级稳定排序。priority_enabled=false 时退回 cursor 自然顺序。
     if priority_enabled {
-        candidates.sort_by(|a, b| stage_stagnation_priority_key(a, now_ms, &stage_config).cmp(&stage_stagnation_priority_key(b, now_ms, &stage_config)));
+        candidates.sort_by(|a, b| {
+            stage_stagnation_priority_key(a, now_ms, &stage_config)
+                .cmp(&stage_stagnation_priority_key(b, now_ms, &stage_config))
+        });
     }
 
     // 第三阶段：按优先级序消费 daily cap，对每个候选检查 block-rate 反馈环。
@@ -1391,6 +1584,7 @@ async fn scan_stage_stagnation(state: &AppState) -> anyhow::Result<()> {
         if remaining <= 0 {
             write_capped_event(
                 state,
+                &workspace_id,
                 &account_id,
                 counters,
                 daily_cap,
@@ -1410,35 +1604,50 @@ async fn scan_stage_stagnation(state: &AppState) -> anyhow::Result<()> {
             write_backoff_event(state, "stage_stagnation", &contact, payload).await?;
             continue;
         }
-        let stage = contact_customer_stage(&contact)
-            .unwrap_or_else(|| "unknown".to_string());
-        let stage_updated = contact_customer_stage_updated_at(&contact);
+        let stage = contact_customer_stage(&contact).unwrap_or_else(|| "unknown".to_string());
+        let stagnation_dimension = stage_config.stagnation_dimension.as_str();
+        let stagnation_value = contact_stagnation_value(&contact, stagnation_dimension);
+        let stage_updated = contact_stagnation_updated_at(&contact, stagnation_dimension);
         let idle_days = idle_days_since(stage_updated, now_ms);
         let content = format!("Planner: stage_stagnation (stage={stage}, idle={idle_days}d)");
-        emit_planner_follow_up(state, &contact, content, now).await?;
-        write_event(
+        let outcome = commit_planner_follow_up(
             state,
-            &contact.account_id,
-            Some(&contact.wxid),
+            &contact,
+            "stage_stagnation",
+            stage_stagnation_subject(&contact, &stage_config),
+            content,
             "strategic_planner_stage_stagnation",
-            "emitted",
-            &format!("Planner: stage_stagnation emitted (stage={stage}, idle={idle_days}d)"),
-            Some(doc! {
+            format!("Planner: stage_stagnation emitted (stage={stage}, idle={idle_days}d)"),
+            doc! {
                 "source": "strategic_planner",
                 "stage": &stage,
+                "stagnationDimension": stagnation_dimension,
+                "stagnationValue": stagnation_value,
                 "idleDays": idle_days,
                 "stageUpdatedAt": stage_updated
                     .map(|d| d.timestamp_millis())
                     .unwrap_or(0),
-            }),
+            },
+            now,
+            daily_cap,
+            None,
+            already_emitted_today,
+            segment_emitted_today,
         )
         .await?;
-        counters.emitted += 1;
-        remaining -= 1;
+        match outcome {
+            CommitOutcome::Emitted => {
+                counters.emitted += 1;
+                remaining -= 1;
+            }
+            CommitOutcome::Duplicate => continue,
+            CommitOutcome::Capped => break,
+        }
     }
 
     write_event(
         state,
+        &workspace_id,
         &account_id,
         None,
         "strategic_planner_stage_stagnation_tick",
@@ -1475,6 +1684,7 @@ async fn scan_stage_stagnation(state: &AppState) -> anyhow::Result<()> {
 ///   跨年（12-31 + lookahead 落到次年 01-01）与闰年 02-29 由"按月日集合匹配"自然覆盖。
 /// - `recurring=false`（"YYYY-MM-DD"）：比完整年月日，落在 [today, today+lookahead] 内即 true。
 /// - 解析失败（旧库纯字符串条目 / 非法日期）→ false（向后兼容，不 panic）。
+#[cfg(test)]
 pub(crate) fn anniversary_due_today(
     entry: &AnniversaryEntry,
     today_year: i32,
@@ -1482,26 +1692,60 @@ pub(crate) fn anniversary_due_today(
     today_day: u32,
     lookahead_days: i64,
 ) -> bool {
+    anniversary_occurrence(entry, today_year, today_month, today_day, lookahead_days).is_some()
+}
+
+/// Return the concrete calendar occurrence matched by the lookahead window.
+/// Recurring entries are anchored to the matching year, so a reminder emitted
+/// one day early and a scan on the anniversary itself share one business
+/// generation instead of producing two intents.
+fn anniversary_occurrence(
+    entry: &AnniversaryEntry,
+    today_year: i32,
+    today_month: u32,
+    today_day: u32,
+    lookahead_days: i64,
+) -> Option<(i32, u32, u32)> {
     let lookahead = lookahead_days.max(0);
     if entry.recurring {
-        let Some((m, d)) = parse_month_day(&entry.date) else {
-            return false;
-        };
+        let (m, d) = parse_month_day(&entry.date)?;
         // 逐日向后看：把今日起 lookahead+1 天的 (月,日) 集合算出来，命中即 true。
         // 用 epoch 天推进，自然跨月/跨年；闰年 02-29 仅在该日真实存在时落入集合。
-        (0..=lookahead).any(|offset| {
-            let (_, om, od) = civil_from_offset(today_year, today_month, today_day, offset);
-            om == m && od == d
+        (0..=lookahead).find_map(|offset| {
+            let occurrence = civil_from_offset(today_year, today_month, today_day, offset);
+            (occurrence.1 == m && occurrence.2 == d).then_some(occurrence)
         })
     } else {
-        let Some((y, m, d)) = parse_full_date(&entry.date) else {
-            return false;
-        };
-        (0..=lookahead).any(|offset| {
-            let (oy, om, od) = civil_from_offset(today_year, today_month, today_day, offset);
-            oy == y && om == m && od == d
+        let expected = parse_full_date(&entry.date)?;
+        (0..=lookahead).find_map(|offset| {
+            let occurrence = civil_from_offset(today_year, today_month, today_day, offset);
+            (occurrence == expected).then_some(occurrence)
         })
     }
+}
+
+type CalendarOccurrenceIdentity = (String, String, bool, String);
+
+fn calendar_occurrence_identity(
+    dimension: &str,
+    entry: &AnniversaryEntry,
+    occurrence: (i32, u32, u32),
+) -> CalendarOccurrenceIdentity {
+    (
+        dimension.to_string(),
+        entry.date.trim().to_string(),
+        entry.recurring,
+        format!(
+            "{:04}-{:02}-{:02}",
+            occurrence.0, occurrence.1, occurrence.2
+        ),
+    )
+}
+
+fn calendar_occurrence_subject(occurrences: &mut Vec<CalendarOccurrenceIdentity>) -> String {
+    occurrences.sort();
+    occurrences.dedup();
+    canonical_subject("occurrences", serde_json::json!(occurrences))
 }
 
 /// 解析 "MM-DD" → (month, day)，范围合法才返回。
@@ -1567,20 +1811,20 @@ fn anniversaries_from_extra(extra: &Document, key: &str) -> Vec<AnniversaryEntry
         return Vec::new();
     };
     arr.iter()
-        .filter_map(|item| {
-            mongodb::bson::from_bson::<AnniversaryEntry>(item.clone()).ok()
-        })
+        .filter_map(|item| mongodb::bson::from_bson::<AnniversaryEntry>(item.clone()).ok())
         .filter(|e| !e.date.trim().is_empty())
         .collect()
 }
 
-async fn scan_calendar(state: &AppState) -> anyhow::Result<()> {
-    let workspace_id = state.config.default_workspace_id.clone();
-    let account_id = state.config.default_account_id.clone();
+async fn scan_calendar(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+) -> anyhow::Result<()> {
     let now = DateTime::now();
     // §3.7：每 tick 加载一次 active profile，取行业默认范式 + date_dimension 维度。
     let profile =
-        crate::agent::domain_profile::load_active_domain_profile(&state.db, &workspace_id).await;
+        crate::agent::domain_profile::load_active_domain_profile(&state.db, &workspace_id).await?;
     // 行业默认 calendar 关 → 整段对该行业 no-op（销售域天然跳过，零 DB 扫描）。
     // contact override 仍可在下方逐个开启，故这里只在「行业默认关 且 无任何 contact
     // override 开」时整体短路——但 override 在 contact 上、需逐条看，故不在此提前 return；
@@ -1612,6 +1856,14 @@ async fn scan_calendar(state: &AppState) -> anyhow::Result<()> {
     let regular_cap = state.config.strategic_planner_daily_emit_cap;
     let already_emitted_today =
         count_today_emit_events(state, &workspace_id, &account_id, now).await?;
+    let segment_emitted_today = count_today_segment_events(
+        state,
+        workspace_id,
+        account_id,
+        &["strategic_planner_calendar_care"],
+        now,
+    )
+    .await?;
     let mut counters = ScanCounters::default();
     let mut calendar_emitted_today: i64 = 0;
 
@@ -1643,10 +1895,18 @@ async fn scan_calendar(state: &AppState) -> anyhow::Result<()> {
         let card = crate::agent::effective_memory_card(&memory);
         // 收集本 contact 今日/临近命中的纪念日（跨所有 date_dimension 槽）。
         let mut due_labels: Vec<String> = Vec::new();
+        let mut due_occurrences: Vec<CalendarOccurrenceIdentity> = Vec::new();
         for key in &date_dims {
             for entry in anniversaries_from_extra(&card.extra, key) {
-                if anniversary_due_today(&entry, today_y, today_m, today_d, effective_lookahead) {
+                if let Some((year, month, day)) =
+                    anniversary_occurrence(&entry, today_y, today_m, today_d, effective_lookahead)
+                {
                     due_labels.push(entry.label.clone());
+                    due_occurrences.push(calendar_occurrence_identity(
+                        key,
+                        &entry,
+                        (year, month, day),
+                    ));
                 }
             }
         }
@@ -1662,6 +1922,7 @@ async fn scan_calendar(state: &AppState) -> anyhow::Result<()> {
         {
             write_event(
                 state,
+                &workspace_id,
                 &account_id,
                 None,
                 "strategic_planner_calendar_capped",
@@ -1684,33 +1945,49 @@ async fn scan_calendar(state: &AppState) -> anyhow::Result<()> {
             continue;
         }
         let labels_joined = due_labels.join("、");
-        emit_planner_follow_up(
+        let occurrence_subject = calendar_occurrence_subject(&mut due_occurrences);
+        let outcome = commit_planner_follow_up(
             state,
             &contact,
+            "calendar",
+            occurrence_subject,
             format!("Planner: calendar_care 今日/临近纪念日：{labels_joined}"),
-            now,
-        )
-        .await?;
-        write_event(
-            state,
-            &contact.account_id,
-            Some(&contact.wxid),
             "strategic_planner_calendar_care",
-            "emitted",
-            &format!("Planner: calendar_care emitted（{labels_joined}）"),
-            Some(doc! {
+            format!("Planner: calendar_care emitted（{labels_joined}）"),
+            doc! {
                 "source": "strategic_planner",
                 "labels": &due_labels,
+                "occurrences": due_occurrences
+                    .iter()
+                    .map(|(dimension, date, recurring, occurrence)| doc! {
+                        "dimension": dimension,
+                        "date": date,
+                        "recurring": recurring,
+                        "occurrence": occurrence,
+                    })
+                    .collect::<Vec<_>>(),
                 "lookaheadDays": effective_lookahead,
-            }),
+            },
+            now,
+            regular_cap,
+            Some(effective_cap),
+            already_emitted_today,
+            segment_emitted_today,
         )
         .await?;
-        counters.emitted += 1;
-        calendar_emitted_today += 1;
+        match outcome {
+            CommitOutcome::Emitted => {
+                counters.emitted += 1;
+                calendar_emitted_today += 1;
+            }
+            CommitOutcome::Duplicate => continue,
+            CommitOutcome::Capped => break,
+        }
     }
 
     write_event(
         state,
+        &workspace_id,
         &account_id,
         None,
         "strategic_planner_calendar_tick",
@@ -1782,12 +2059,14 @@ pub(crate) fn renewal_due_soon(
 /// → 整段提前短路（省全表扫描），与 calendar 的 `date_dims.is_empty()` 短路同款权衡。粗过滤
 /// 放宽到「profile 默认开或 per_relationship 任一关系类型开」（见 [`renewal_scan_should_run`]），
 /// 故数字分身按关系类型开启的续费范式不再被默认层吞掉。
-async fn scan_renewal(state: &AppState) -> anyhow::Result<()> {
-    let workspace_id = state.config.default_workspace_id.clone();
-    let account_id = state.config.default_account_id.clone();
+async fn scan_renewal(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+) -> anyhow::Result<()> {
     let now = DateTime::now();
     let profile =
-        crate::agent::domain_profile::load_active_domain_profile(&state.db, &workspace_id).await;
+        crate::agent::domain_profile::load_active_domain_profile(&state.db, &workspace_id).await?;
     // 扫描器级粗过滤（省 DB 扫描）：profile 默认范式开 renewal 或 per_relationship 任一
     // 关系类型开 renewal 即放行整段扫描；逐 contact 的有效范式仍由 resolve_operation_mode
     // 三级解析兜底。contact 级 override 单独开（profile 默认关 + per_relationship 也无）的
@@ -1811,6 +2090,14 @@ async fn scan_renewal(state: &AppState) -> anyhow::Result<()> {
     let regular_cap = state.config.strategic_planner_daily_emit_cap;
     let already_emitted_today =
         count_today_emit_events(state, &workspace_id, &account_id, now).await?;
+    let segment_emitted_today = count_today_segment_events(
+        state,
+        workspace_id,
+        account_id,
+        &["strategic_planner_renewal_reminder"],
+        now,
+    )
+    .await?;
     let mut counters = ScanCounters::default();
     let mut renewal_emitted_today: i64 = 0;
 
@@ -1831,14 +2118,17 @@ async fn scan_renewal(state: &AppState) -> anyhow::Result<()> {
             usize::MAX,
         );
         // 收集临近到期/刚过期的产品名。
-        let due_products: Vec<String> = entitlements
+        let due_entitlements: Vec<_> = entitlements
             .iter()
             .filter(|e| renewal_due_soon(e.expires_at, now, effective_lookahead, effective_grace))
-            .map(|e| e.name.clone())
             .collect();
-        if due_products.is_empty() {
+        if due_entitlements.is_empty() {
             continue;
         }
+        let due_products: Vec<String> = due_entitlements
+            .iter()
+            .map(|entitlement| entitlement.name.clone())
+            .collect();
         if has_pending_follow_up(state, &contact).await? {
             continue;
         }
@@ -1847,6 +2137,7 @@ async fn scan_renewal(state: &AppState) -> anyhow::Result<()> {
         {
             write_event(
                 state,
+                &workspace_id,
                 &account_id,
                 None,
                 "strategic_planner_renewal_capped",
@@ -1869,36 +2160,53 @@ async fn scan_renewal(state: &AppState) -> anyhow::Result<()> {
             continue;
         }
         let products_joined = due_products.join("、");
-        emit_planner_follow_up(
+        let mut renewal_anchors: Vec<(String, Option<i64>)> = due_entitlements
+            .iter()
+            .map(|entitlement| {
+                (
+                    entitlement.product_id.clone(),
+                    entitlement.expires_at.map(|value| value.timestamp_millis()),
+                )
+            })
+            .collect();
+        renewal_anchors.sort();
+        renewal_anchors.dedup();
+        let outcome = commit_planner_follow_up(
             state,
             &contact,
+            "renewal",
+            canonical_subject("entitlements", serde_json::json!(renewal_anchors)),
             format!(
                 "Planner: renewal_reminder 客户持有产品临近到期，主动推进续费（续费=最高优先级销售，挽留优先；若客户犹豫则诊断顾虑）：{products_joined}"
             ),
-            now,
-        )
-        .await?;
-        write_event(
-            state,
-            &contact.account_id,
-            Some(&contact.wxid),
             "strategic_planner_renewal_reminder",
-            "emitted",
-            &format!("Planner: renewal_reminder emitted（{products_joined}）"),
-            Some(doc! {
+            format!("Planner: renewal_reminder emitted（{products_joined}）"),
+            doc! {
                 "source": "strategic_planner",
                 "products": &due_products,
                 "lookaheadDays": effective_lookahead,
                 "graceDays": effective_grace,
-            }),
+            },
+            now,
+            regular_cap,
+            Some(effective_cap),
+            already_emitted_today,
+            segment_emitted_today,
         )
         .await?;
-        counters.emitted += 1;
-        renewal_emitted_today += 1;
+        match outcome {
+            CommitOutcome::Emitted => {
+                counters.emitted += 1;
+                renewal_emitted_today += 1;
+            }
+            CommitOutcome::Duplicate => continue,
+            CommitOutcome::Capped => break,
+        }
     }
 
     write_event(
         state,
+        &workspace_id,
         &account_id,
         None,
         "strategic_planner_renewal_tick",
@@ -1923,33 +2231,30 @@ async fn scan_renewal(state: &AppState) -> anyhow::Result<()> {
 /// 段 6：reactivation（G5 阶段2 流失老客定期再激活）
 /// ---------------------------------------------------------------------------
 
-/// 距上次再激活 emit 是否在 cadence_days 窗口内（定期低频节奏门控，照
-/// [`commitment_recently_emitted`] 模式，但按「再激活主题」而非 commitmentId 去重）。
-/// 反查该 contact 的 `strategic_planner_reactivation` emit 事件——cadence 内有过即跳过，
-/// 落实「定期再激活、绝不放任也绝不刷屏」。
-async fn reactivation_recently_emitted(
+/// Latest reactivation event, used both as the cadence check and as the
+/// predecessor of the next deterministic reactivation intent.
+async fn latest_reactivation_emit(
     state: &AppState,
     contact: &Contact,
-    now: DateTime,
-    cadence_days: i64,
-) -> anyhow::Result<bool> {
-    let cadence_ms = cadence_days.max(0).saturating_mul(24 * 60 * 60 * 1000);
-    let since = DateTime::from_millis(now.timestamp_millis() - cadence_ms);
-    let count = state
+) -> anyhow::Result<Option<(ObjectId, DateTime)>> {
+    let row = state
         .db
         .events()
-        .count_documents(
+        .clone_with_type::<Document>()
+        .find_one(
             doc! {
                 "workspace_id": &contact.workspace_id,
                 "account_id": &contact.account_id,
                 "contact_wxid": &contact.wxid,
                 "kind": "strategic_planner_reactivation",
-                "created_at": { "$gte": since },
             },
-            None,
+            FindOneOptions::builder()
+                .sort(doc! { "created_at": -1, "_id": -1 })
+                .build(),
         )
         .await?;
-    Ok(count > 0)
+    row.map(|row| Ok((row.get_object_id("_id")?, *row.get_datetime("created_at")?)))
+        .transpose()
 }
 
 /// MongoDB 端粗筛：managed + 非冷却 + customer_stage ∈ 再激活目标集合（stage_config 派生，
@@ -1983,12 +2288,14 @@ pub(crate) fn reactivation_candidate_filter(
 /// （现状被 TERMINAL_STAGES 排除出 stage_stagnation、无任何段唤醒，本扫描器补此空白）。
 /// 零扰动：DEFAULT/销售域 profile reactivation.enabled=false 且无 per_relationship 开
 /// reactivation → 整段提前短路。粗过滤同 scan_renewal 放宽到 per_relationship 任一开。
-async fn scan_reactivation(state: &AppState) -> anyhow::Result<()> {
-    let workspace_id = state.config.default_workspace_id.clone();
-    let account_id = state.config.default_account_id.clone();
+async fn scan_reactivation(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+) -> anyhow::Result<()> {
     let now = DateTime::now();
     let profile =
-        crate::agent::domain_profile::load_active_domain_profile(&state.db, &workspace_id).await;
+        crate::agent::domain_profile::load_active_domain_profile(&state.db, &workspace_id).await?;
     // 扫描器级粗过滤：profile 默认范式开 reactivation 或 per_relationship 任一开即放行；
     // 逐 contact 走 resolve_operation_mode 三级解析。contact 级 override 单独开的边缘不在此层
     // 覆盖（同 scan_renewal，省 DB 扫描）。DEFAULT（默认关 + 无 per_relationship）→ 零扫描、字节等价。
@@ -2001,13 +2308,21 @@ async fn scan_reactivation(state: &AppState) -> anyhow::Result<()> {
     let global_reactivation_cap = state.config.strategic_planner_reactivation_daily_cap;
 
     let stage_config =
-        build_planner_stage_config(state, &workspace_id, &account_id, &profile).await;
+        build_planner_stage_config(state, &workspace_id, &account_id, &profile).await?;
     let filter = reactivation_candidate_filter(&workspace_id, &account_id, &stage_config);
     let mut cursor = state.db.contacts().find(filter, None).await?;
 
     let regular_cap = state.config.strategic_planner_daily_emit_cap;
     let already_emitted_today =
         count_today_emit_events(state, &workspace_id, &account_id, now).await?;
+    let segment_emitted_today = count_today_segment_events(
+        state,
+        workspace_id,
+        account_id,
+        &["strategic_planner_reactivation"],
+        now,
+    )
+    .await?;
     let mut counters = ScanCounters::default();
     let mut reactivation_emitted_today: i64 = 0;
 
@@ -2017,9 +2332,18 @@ async fn scan_reactivation(state: &AppState) -> anyhow::Result<()> {
         if !mode.reactivation.enabled {
             continue;
         }
-        let effective_dormant = mode.reactivation.dormant_days.unwrap_or(global_dormant_days);
-        let effective_cadence = mode.reactivation.cadence_days.unwrap_or(global_cadence_days);
-        let effective_cap = mode.reactivation.daily_cap.unwrap_or(global_reactivation_cap);
+        let effective_dormant = mode
+            .reactivation
+            .dormant_days
+            .unwrap_or(global_dormant_days);
+        let effective_cadence = mode
+            .reactivation
+            .cadence_days
+            .unwrap_or(global_cadence_days);
+        let effective_cap = mode
+            .reactivation
+            .daily_cap
+            .unwrap_or(global_reactivation_cap);
         // 休眠时长门控：进入 dormant_reactivation 满 dormant_days 才唤醒（避免刚流失就立刻骚扰）。
         // 休眠起点 = customer_stage_updated_at（进入休眠态时刷新，C2 同步点写）。
         let dormant_since = contact_customer_stage_updated_at(&contact);
@@ -2036,7 +2360,13 @@ async fn scan_reactivation(state: &AppState) -> anyhow::Result<()> {
             continue;
         }
         // cadence 节奏门控：cadence_days 内已唤醒过则跳过（定期低频，不刷屏）。
-        if reactivation_recently_emitted(state, &contact, now, effective_cadence).await? {
+        let predecessor = latest_reactivation_emit(state, &contact).await?;
+        let cadence_ms = effective_cadence.max(0).saturating_mul(24 * 60 * 60 * 1000);
+        if cadence_ms > 0
+            && predecessor.as_ref().is_some_and(|(_, emitted_at)| {
+                now.timestamp_millis() - emitted_at.timestamp_millis() < cadence_ms
+            })
+        {
             continue;
         }
         if has_pending_follow_up(state, &contact).await? {
@@ -2047,6 +2377,7 @@ async fn scan_reactivation(state: &AppState) -> anyhow::Result<()> {
         {
             write_event(
                 state,
+                &workspace_id,
                 &account_id,
                 None,
                 "strategic_planner_reactivation_capped",
@@ -2083,7 +2414,6 @@ async fn scan_reactivation(state: &AppState) -> anyhow::Result<()> {
             ),
             None => "Planner: reactivation 休眠老客定期价值唤醒（无明确流失原因，低压重连、绝不放任老客）".to_string(),
         };
-        emit_planner_follow_up(state, &contact, content, now).await?;
         let mut details = doc! {
             "source": "strategic_planner",
             "dormantDays": effective_dormant,
@@ -2092,25 +2422,47 @@ async fn scan_reactivation(state: &AppState) -> anyhow::Result<()> {
         if let Some(reason) = &churn_reason {
             details.insert("churnReason", reason);
         }
-        write_event(
+        let dormant_generation = dormant_since
+            .map(|value| value.timestamp_millis().to_string())
+            .unwrap_or_else(|| "legacy".to_string());
+        let predecessor = predecessor
+            .map(|(id, _)| id.to_hex())
+            .unwrap_or_else(|| "genesis".to_string());
+        let outcome = commit_planner_follow_up(
             state,
-            &contact.account_id,
-            Some(&contact.wxid),
+            &contact,
+            "reactivation",
+            canonical_subject(
+                "dormant",
+                serde_json::json!([dormant_generation, predecessor]),
+            ),
+            content,
             "strategic_planner_reactivation",
-            "emitted",
-            &format!(
+            format!(
                 "Planner: reactivation emitted（churn_reason={}）",
                 churn_reason.as_deref().unwrap_or("<none>")
             ),
-            Some(details),
+            details,
+            now,
+            regular_cap,
+            Some(effective_cap),
+            already_emitted_today,
+            segment_emitted_today,
         )
         .await?;
-        counters.emitted += 1;
-        reactivation_emitted_today += 1;
+        match outcome {
+            CommitOutcome::Emitted => {
+                counters.emitted += 1;
+                reactivation_emitted_today += 1;
+            }
+            CommitOutcome::Duplicate => continue,
+            CommitOutcome::Capped => break,
+        }
     }
 
     write_event(
         state,
+        &workspace_id,
         &account_id,
         None,
         "strategic_planner_reactivation_tick",
@@ -2246,7 +2598,10 @@ mod tests {
     fn attrs_with_stage_updated(stage: &str, updated_at_ms: i64) -> Document {
         let mut d = Document::new();
         d.insert("customer_stage", stage);
-        d.insert("customer_stage_updated_at", DateTime::from_millis(updated_at_ms));
+        d.insert(
+            "customer_stage_updated_at",
+            DateTime::from_millis(updated_at_ms),
+        );
         d
     }
 
@@ -2507,8 +2862,7 @@ mod tests {
             commitments: vec![entry_no_due("id-nodue", 98 * 60 * 60 * 1000)],
             ..template()
         };
-        let target =
-            pick_commitment_emit_target(&contact, now, 8, 4).expect("fallback imminent");
+        let target = pick_commitment_emit_target(&contact, now, 8, 4).expect("fallback imminent");
         assert_eq!(target.reason, CommitmentReason::Imminent);
         assert!(target.is_fallback_due);
     }
@@ -2518,11 +2872,7 @@ mod tests {
     fn commitment_skips_structured_without_id() {
         let now = dt(10_000_000);
         let contact = Contact {
-            commitments: vec![entry(
-                "",
-                "无 id",
-                Some(dt(now.timestamp_millis() - 1_000)),
-            )],
+            commitments: vec![entry("", "无 id", Some(dt(now.timestamp_millis() - 1_000)))],
             ..template()
         };
         assert!(pick_commitment_emit_target(&contact, now, 8, 0).is_none());
@@ -2658,9 +3008,15 @@ mod tests {
         };
         let filter = stage_stagnation_candidate_filter("ws", "acc", dt(1_000), dt(2_000), &c);
         let dbg = format!("{filter:?}");
-        assert!(dbg.contains("relationship_ended"), "终态集未用配置值：{dbg}");
+        assert!(
+            dbg.contains("relationship_ended"),
+            "终态集未用配置值：{dbg}"
+        );
         // 销售默认终态不再写死出现。
-        assert!(!dbg.contains("customer_success"), "不应残留写死销售终态：{dbg}");
+        assert!(
+            !dbg.contains("customer_success"),
+            "不应残留写死销售终态：{dbg}"
+        );
     }
 
     #[test]
@@ -2701,7 +3057,12 @@ mod tests {
         let imminent = make_target("b", now_ms + 1_000, CommitmentReason::Imminent);
         let key_a = commitment_priority_key(&contact, &overdue, &cfg());
         let key_b = commitment_priority_key(&contact, &imminent, &cfg());
-        assert!(key_a < key_b, "overdue {:?} should sort before imminent {:?}", key_a, key_b);
+        assert!(
+            key_a < key_b,
+            "overdue {:?} should sort before imminent {:?}",
+            key_a,
+            key_b
+        );
     }
 
     /// commitment_priority_key：同 reason 同 due 时，stage 价值高（commitment_followup）优先于 new_contact。
@@ -2719,7 +3080,8 @@ mod tests {
             ..template()
         };
         assert!(
-            commitment_priority_key(&high, &target, &cfg()) < commitment_priority_key(&low, &target, &cfg()),
+            commitment_priority_key(&high, &target, &cfg())
+                < commitment_priority_key(&low, &target, &cfg()),
             "commitment_followup should sort before new_contact"
         );
     }
@@ -2738,19 +3100,23 @@ mod tests {
             domain_attributes: Some(attrs_with_stage_intent("solution_fit", "low")),
             ..template()
         };
-        assert!(commitment_priority_key(&hot, &target, &cfg()) < commitment_priority_key(&cold, &target, &cfg()));
+        assert!(
+            commitment_priority_key(&hot, &target, &cfg())
+                < commitment_priority_key(&cold, &target, &cfg())
+        );
     }
 
     /// commitment_priority_key：同 reason / stage / intent 时，更早 due_at 的更优先。
     #[test]
     fn commitment_priority_earlier_due_first() {
         let now_ms: i64 = 10_000_000;
-        let contact = Contact {
-            ..template()
-        };
+        let contact = Contact { ..template() };
         let early = make_target("e", now_ms - 5_000, CommitmentReason::Overdue);
         let late = make_target("l", now_ms - 1_000, CommitmentReason::Overdue);
-        assert!(commitment_priority_key(&contact, &early, &cfg()) < commitment_priority_key(&contact, &late, &cfg()));
+        assert!(
+            commitment_priority_key(&contact, &early, &cfg())
+                < commitment_priority_key(&contact, &late, &cfg())
+        );
     }
 
     /// stage_stagnation_priority_key：同停滞天数下，commitment_followup 阶段优先于 relationship_building。
@@ -2794,6 +3160,48 @@ mod tests {
                 < stage_stagnation_priority_key(&stale_15d, now_ms, &cfg()),
             "30d stale should sort before 15d stale"
         );
+    }
+
+    #[test]
+    fn stage_stagnation_subject_tracks_configured_dimension_generation() {
+        let mut contact = template();
+        contact.domain_attributes = Some(doc! {
+            "customer_stage": "need_discovery",
+            "customer_stage_updated_at": DateTime::from_millis(100),
+            "relationship_closeness": "warm",
+            "relationship_closeness_updated_at": DateTime::from_millis(200),
+        });
+        let custom = PlannerStageConfig {
+            stagnation_dimension: "relationship_closeness".to_string(),
+            ..PlannerStageConfig::default()
+        };
+        let first = stage_stagnation_subject(&contact, &custom);
+        assert_eq!(first, stage_stagnation_subject(&contact, &custom));
+        assert_eq!(first, "stage:[\"relationship_closeness\",\"warm\",200]");
+
+        let default_subject = stage_stagnation_subject(&contact, &PlannerStageConfig::default());
+        assert_ne!(
+            first, default_subject,
+            "dimension changes are new intent generations"
+        );
+
+        contact
+            .domain_attributes
+            .as_mut()
+            .expect("attributes")
+            .insert("relationship_closeness", "close");
+        assert_ne!(first, stage_stagnation_subject(&contact, &custom));
+
+        contact
+            .domain_attributes
+            .as_mut()
+            .expect("attributes")
+            .insert(
+                "relationship_closeness_updated_at",
+                DateTime::from_millis(300),
+            );
+        let updated = stage_stagnation_subject(&contact, &custom);
+        assert_eq!(updated, "stage:[\"relationship_closeness\",\"close\",300]");
     }
 
     /// stage_priority_weight：覆盖默认分支（None / 未识别 stage）走 fallback=20，
@@ -2891,10 +3299,18 @@ mod tests {
             Some("nonsense"),
             None,
         ] {
-            assert_eq!(c.stage_weight(stage), stage_priority_weight(stage), "stage={stage:?}");
+            assert_eq!(
+                c.stage_weight(stage),
+                stage_priority_weight(stage),
+                "stage={stage:?}"
+            );
         }
         for level in [Some("high"), Some("medium"), Some("low"), Some("x"), None] {
-            assert_eq!(c.intent_weight(level), intent_level_weight(level), "level={level:?}");
+            assert_eq!(
+                c.intent_weight(level),
+                intent_level_weight(level),
+                "level={level:?}"
+            );
         }
         for stage in ["customer_success", "cooldown", "dormant_reactivation"] {
             assert!(c.is_terminal_stage(stage), "{stage} 应为终态");
@@ -2963,7 +3379,10 @@ mod tests {
     fn stagnation_updated_at_prefers_configured_dim_when_present() {
         let mut c = template();
         let mut attrs = attrs_with_stage_updated("need_discovery", 100);
-        attrs.insert("relationship_closeness_updated_at", DateTime::from_millis(777));
+        attrs.insert(
+            "relationship_closeness_updated_at",
+            DateTime::from_millis(777),
+        );
         c.domain_attributes = Some(attrs);
         assert_eq!(
             contact_stagnation_updated_at(&c, "relationship_closeness"),
@@ -2980,7 +3399,10 @@ mod tests {
         attrs.insert("customer_stage", "need_discovery");
         // 故意不写任何 *_updated_at。
         c.domain_attributes = Some(attrs);
-        assert_eq!(contact_stagnation_updated_at(&c, "relationship_closeness"), None);
+        assert_eq!(
+            contact_stagnation_updated_at(&c, "relationship_closeness"),
+            None
+        );
     }
 
     /// 永不驱动铁律（子计划4 Task4）的契约守护测试。
@@ -3000,7 +3422,8 @@ mod tests {
         let now_ms = now.timestamp_millis();
         let mut base = template();
         base.last_inbound_at = Some(dt(now_ms - 30 * 24 * 60 * 60 * 1000));
-        let mut attrs = attrs_with_stage_updated("need_discovery", now_ms - 30 * 24 * 60 * 60 * 1000);
+        let mut attrs =
+            attrs_with_stage_updated("need_discovery", now_ms - 30 * 24 * 60 * 60 * 1000);
         attrs.insert("value_tier", "high");
         attrs.insert("intent_level", "high");
         base.domain_attributes = Some(attrs);
@@ -3015,6 +3438,7 @@ mod tests {
                 locked: true,
                 history: vec![crate::models::BayesianPoint {
                     turn: 3,
+                    source_run_id: Some("planner-fixture-run".to_string()),
                     value: "decision_maker".to_string(),
                     confidence: 0.82,
                     value_changed: true,
@@ -3095,8 +3519,14 @@ mod tests {
         // blocked-like
         assert_eq!(classify_review_status("held_by_ai_policy"), (1, 0));
         assert_eq!(classify_review_status("blocked_by_safety_guard"), (1, 0));
-        assert_eq!(classify_review_status("ai_waiting_for_more_context"), (1, 0));
-        assert_eq!(classify_review_status("blocked_unverified_product_claim"), (1, 0));
+        assert_eq!(
+            classify_review_status("ai_waiting_for_more_context"),
+            (1, 0)
+        );
+        assert_eq!(
+            classify_review_status("blocked_unverified_product_claim"),
+            (1, 0)
+        );
         assert_eq!(classify_review_status("blocked_by_budget"), (1, 0));
         assert_eq!(classify_review_status("revision_failed"), (1, 0));
         // ok-like
@@ -3133,7 +3563,10 @@ mod tests {
         assert!(m.funnel.enabled, "funnel 默认开");
         assert!(m.silence.enabled, "silence 默认开");
         assert!(m.commitment.enabled, "commitment 默认开");
-        assert_eq!(m.funnel.stagnation_threshold_days, None, "阈值默认 None 回落 config");
+        assert_eq!(
+            m.funnel.stagnation_threshold_days, None,
+            "阈值默认 None 回落 config"
+        );
         assert_eq!(m.silence.threshold_hours, None);
         assert_eq!(m.commitment.imminent_window_hours, None);
     }
@@ -3142,9 +3575,15 @@ mod tests {
     #[test]
     fn h8_resolve_falls_back_to_profile_when_no_override() {
         let contact = template();
-        assert!(contact.operation_mode_override.is_none(), "template 默认无 override");
+        assert!(
+            contact.operation_mode_override.is_none(),
+            "template 默认无 override"
+        );
         let profile_mode = crate::models::OperationMode {
-            funnel: crate::models::FunnelMode { enabled: false, stagnation_threshold_days: Some(30) },
+            funnel: crate::models::FunnelMode {
+                enabled: false,
+                stagnation_threshold_days: Some(30),
+            },
             ..crate::models::OperationMode::default()
         };
         let resolved = resolve_operation_mode(&contact, &profile_with_mode(profile_mode.clone()));
@@ -3158,15 +3597,28 @@ mod tests {
         let mut contact = template();
         // 该客户「只维护不推进」：单独关 funnel。
         contact.operation_mode_override = Some(crate::models::OperationMode {
-            funnel: crate::models::FunnelMode { enabled: false, stagnation_threshold_days: None },
-            silence: crate::models::SilenceMode { enabled: true, threshold_hours: Some(240) },
+            funnel: crate::models::FunnelMode {
+                enabled: false,
+                stagnation_threshold_days: None,
+            },
+            silence: crate::models::SilenceMode {
+                enabled: true,
+                threshold_hours: Some(240),
+            },
             ..crate::models::OperationMode::default()
         });
         // profile 范式三全开（销售型）——但 override 优先。
         let profile_mode = crate::models::OperationMode::default();
         let resolved = resolve_operation_mode(&contact, &profile_with_mode(profile_mode.clone()));
-        assert!(!resolved.funnel.enabled, "override 关 funnel 覆盖 profile 的开");
-        assert_eq!(resolved.silence.threshold_hours, Some(240), "override 自定义静默阈值生效");
+        assert!(
+            !resolved.funnel.enabled,
+            "override 关 funnel 覆盖 profile 的开"
+        );
+        assert_eq!(
+            resolved.silence.threshold_hours,
+            Some(240),
+            "override 自定义静默阈值生效"
+        );
     }
 
     /// §3.7：contact 有 relationship_type 且 profile per_relationship 命中 → 用该关系类型那套。
@@ -3183,8 +3635,7 @@ mod tests {
         };
         let mut map = std::collections::BTreeMap::new();
         map.insert("friend".to_string(), friend_mode.clone());
-        let profile =
-            profile_with_relationship_modes(crate::models::OperationMode::default(), map);
+        let profile = profile_with_relationship_modes(crate::models::OperationMode::default(), map);
         let resolved = resolve_operation_mode(&contact, &profile);
         assert_eq!(resolved, friend_mode, "命中 friend 那套范式");
         assert!(!resolved.funnel.enabled, "friend 关 funnel 生效");
@@ -3208,7 +3659,10 @@ mod tests {
         let default_mode = crate::models::OperationMode::default();
         let profile = profile_with_relationship_modes(default_mode.clone(), map);
         let resolved = resolve_operation_mode(&contact, &profile);
-        assert_eq!(resolved, default_mode, "未命中 key → 回落 profile.operation_mode");
+        assert_eq!(
+            resolved, default_mode,
+            "未命中 key → 回落 profile.operation_mode"
+        );
         assert!(resolved.funnel.enabled, "回落默认范式 funnel 仍开");
     }
 
@@ -3235,15 +3689,17 @@ mod tests {
                 ..crate::models::OperationMode::default()
             },
         );
-        let profile =
-            profile_with_relationship_modes(crate::models::OperationMode::default(), map);
+        let profile = profile_with_relationship_modes(crate::models::OperationMode::default(), map);
         let resolved = resolve_operation_mode(&contact, &profile);
         assert_eq!(
             resolved.silence.threshold_hours,
             Some(999),
             "override 优先于 relationship_type"
         );
-        assert!(resolved.funnel.enabled, "override 未关 funnel（friend 那套被跳过）");
+        assert!(
+            resolved.funnel.enabled,
+            "override 未关 funnel（friend 那套被跳过）"
+        );
     }
 
     /// §3.7：DEFAULT profile（per_relationship=None）+ contact 有 relationship_type →
@@ -3252,7 +3708,10 @@ mod tests {
     fn default_profile_none_map_ignores_relationship_type() {
         let contact = with_relationship_type(template(), "customer");
         let profile = crate::agent::domain_profile::default_domain_profile("default");
-        assert!(profile.per_relationship_operation_mode.is_none(), "DEFAULT profile 无多套");
+        assert!(
+            profile.per_relationship_operation_mode.is_none(),
+            "DEFAULT profile 无多套"
+        );
         let resolved = resolve_operation_mode(&contact, &profile);
         assert_eq!(resolved, profile.operation_mode, "回落默认范式");
     }
@@ -3280,10 +3739,7 @@ mod tests {
         customer.renewal.enabled = true;
         let mut map = std::collections::BTreeMap::new();
         map.insert("customer".to_string(), customer);
-        let profile = profile_with_relationship_modes(
-            crate::models::OperationMode::default(),
-            map,
-        );
+        let profile = profile_with_relationship_modes(crate::models::OperationMode::default(), map);
         assert!(
             !profile.operation_mode.renewal.enabled,
             "profile 默认层仍关（只 per_relationship 开）"
@@ -3301,7 +3757,10 @@ mod tests {
         mode.renewal.enabled = true;
         let profile = profile_with_mode(mode);
         assert!(profile.per_relationship_operation_mode.is_none());
-        assert!(renewal_scan_should_run(&profile), "profile 默认开 renewal → 应扫");
+        assert!(
+            renewal_scan_should_run(&profile),
+            "profile 默认开 renewal → 应扫"
+        );
     }
 
     /// G03 reactivation 同 renewal：DEFAULT → 不扫；per_relationship 任一开 → 应扫。
@@ -3321,10 +3780,7 @@ mod tests {
         customer.reactivation.enabled = true;
         let mut map = std::collections::BTreeMap::new();
         map.insert("customer".to_string(), customer);
-        let profile = profile_with_relationship_modes(
-            crate::models::OperationMode::default(),
-            map,
-        );
+        let profile = profile_with_relationship_modes(crate::models::OperationMode::default(), map);
         assert!(
             !profile.operation_mode.reactivation.enabled,
             "profile 默认层仍关（只 per_relationship 开）"
@@ -3341,11 +3797,11 @@ mod tests {
     fn scan_should_not_run_when_per_relationship_all_disabled() {
         // per_relationship 有 friend 那套，但 renewal/reactivation 都关（默认）。
         let mut map = std::collections::BTreeMap::new();
-        map.insert("friend".to_string(), crate::models::OperationMode::default());
-        let profile = profile_with_relationship_modes(
+        map.insert(
+            "friend".to_string(),
             crate::models::OperationMode::default(),
-            map,
         );
+        let profile = profile_with_relationship_modes(crate::models::OperationMode::default(), map);
         assert!(
             !renewal_scan_should_run(&profile),
             "per_relationship 全关 renewal + 默认关 → 不扫"
@@ -3364,13 +3820,20 @@ mod tests {
         let global_silent_hours = 48_i64;
         let global_stagnation_days = 7_i64;
         let global_imminent_hours = 12_i64;
-        assert_eq!(m.silence.threshold_hours.unwrap_or(global_silent_hours), global_silent_hours);
         assert_eq!(
-            m.funnel.stagnation_threshold_days.unwrap_or(global_stagnation_days),
+            m.silence.threshold_hours.unwrap_or(global_silent_hours),
+            global_silent_hours
+        );
+        assert_eq!(
+            m.funnel
+                .stagnation_threshold_days
+                .unwrap_or(global_stagnation_days),
             global_stagnation_days
         );
         assert_eq!(
-            m.commitment.imminent_window_hours.unwrap_or(global_imminent_hours),
+            m.commitment
+                .imminent_window_hours
+                .unwrap_or(global_imminent_hours),
             global_imminent_hours
         );
     }
@@ -3389,8 +3852,12 @@ mod tests {
         let contact = template();
         assert!(contact.operation_mode_override.is_none());
         let profile = crate::agent::domain_profile::default_domain_profile("default");
-        assert!(crate::agent::quiet_hours::effective_quiet_hours_enabled(&contact, &profile, true));
-        assert!(!crate::agent::quiet_hours::effective_quiet_hours_enabled(&contact, &profile, false));
+        assert!(crate::agent::quiet_hours::effective_quiet_hours_enabled(
+            &contact, &profile, true
+        ));
+        assert!(!crate::agent::quiet_hours::effective_quiet_hours_enabled(
+            &contact, &profile, false
+        ));
     }
 
     /// H19：override Some(false) → 关闭静默（即便全局开），夜间不被压制。
@@ -3399,12 +3866,16 @@ mod tests {
     fn h19_override_false_disables_quiet_hours() {
         let mut contact = template();
         contact.operation_mode_override = Some(crate::models::OperationMode {
-            quiet_hours: crate::models::QuietHoursMode { enabled_override: Some(false) },
+            quiet_hours: crate::models::QuietHoursMode {
+                enabled_override: Some(false),
+            },
             ..crate::models::OperationMode::default()
         });
         let profile = crate::agent::domain_profile::default_domain_profile("default");
         // 全局开，但 contact 范式关 → 有效为关。
-        assert!(!crate::agent::quiet_hours::effective_quiet_hours_enabled(&contact, &profile, true));
+        assert!(!crate::agent::quiet_hours::effective_quiet_hours_enabled(
+            &contact, &profile, true
+        ));
     }
 
     /// H19：override Some(true) → 强制开启（即便全局关）。
@@ -3412,11 +3883,15 @@ mod tests {
     fn h19_override_true_forces_quiet_hours() {
         let mut contact = template();
         contact.operation_mode_override = Some(crate::models::OperationMode {
-            quiet_hours: crate::models::QuietHoursMode { enabled_override: Some(true) },
+            quiet_hours: crate::models::QuietHoursMode {
+                enabled_override: Some(true),
+            },
             ..crate::models::OperationMode::default()
         });
         let profile = crate::agent::domain_profile::default_domain_profile("default");
-        assert!(crate::agent::quiet_hours::effective_quiet_hours_enabled(&contact, &profile, false));
+        assert!(crate::agent::quiet_hours::effective_quiet_hours_enabled(
+            &contact, &profile, false
+        ));
     }
 
     /// H19：QuietHoursMode 默认 enabled_override = None（DEFAULT 等价根护栏）。
@@ -3428,7 +3903,9 @@ mod tests {
         );
         // OperationMode::default() 内含的 quiet_hours 也是 None。
         assert_eq!(
-            crate::models::OperationMode::default().quiet_hours.enabled_override,
+            crate::models::OperationMode::default()
+                .quiet_hours
+                .enabled_override,
             None
         );
     }
@@ -3436,7 +3913,11 @@ mod tests {
     // ── §3.7 scan_calendar：CalendarMode 默认 + anniversary_due_today 纯函数 ──
 
     fn anni(label: &str, date: &str, recurring: bool) -> AnniversaryEntry {
-        AnniversaryEntry { label: label.to_string(), date: date.to_string(), recurring }
+        AnniversaryEntry {
+            label: label.to_string(),
+            date: date.to_string(),
+            recurring,
+        }
     }
 
     /// 根护栏：CalendarMode 默认 enabled=false（主动情绪触达销售域绝不默认开）。
@@ -3518,7 +3999,10 @@ mod tests {
         let contact = template();
         let profile_mode = crate::models::OperationMode::default();
         let resolved = resolve_operation_mode(&contact, &profile_with_mode(profile_mode.clone()));
-        assert!(!resolved.renewal.enabled, "DEFAULT 销售域 renewal 关 → scan_renewal 对该 contact no-op");
+        assert!(
+            !resolved.renewal.enabled,
+            "DEFAULT 销售域 renewal 关 → scan_renewal 对该 contact no-op"
+        );
     }
 
     /// 交易域 profile 显式开 renewal → resolve 后 renewal.enabled=true（续费触达启用）。
@@ -3546,8 +4030,14 @@ mod tests {
     #[test]
     fn reactivation_mode_default_disabled() {
         assert!(!crate::models::ReactivationMode::default().enabled);
-        assert_eq!(crate::models::ReactivationMode::default().dormant_days, None);
-        assert_eq!(crate::models::ReactivationMode::default().cadence_days, None);
+        assert_eq!(
+            crate::models::ReactivationMode::default().dormant_days,
+            None
+        );
+        assert_eq!(
+            crate::models::ReactivationMode::default().cadence_days,
+            None
+        );
         assert_eq!(crate::models::ReactivationMode::default().daily_cap, None);
         // OperationMode::default() 内含的 reactivation 也是关的（DEFAULT 销售域 scan_reactivation no-op）。
         assert!(!crate::models::OperationMode::default().reactivation.enabled);
@@ -3636,7 +4126,10 @@ mod tests {
             ..crate::models::OperationMode::default()
         };
         let resolved = resolve_operation_mode(&contact, &profile_with_mode(profile_mode.clone()));
-        assert!(resolved.reactivation.enabled, "交易域 profile 开 reactivation 生效");
+        assert!(
+            resolved.reactivation.enabled,
+            "交易域 profile 开 reactivation 生效"
+        );
         assert_eq!(resolved.reactivation.dormant_days, Some(45));
         assert_eq!(resolved.reactivation.cadence_days, Some(60));
     }
@@ -3645,51 +4138,148 @@ mod tests {
     #[test]
     fn anniversary_recurring_hits_today() {
         // 今日 2026-03-15，生日 03-15，lookahead 0 → 命中。
-        assert!(anniversary_due_today(&anni("她生日", "03-15", true), 2026, 3, 15, 0));
+        assert!(anniversary_due_today(
+            &anni("她生日", "03-15", true),
+            2026,
+            3,
+            15,
+            0
+        ));
         // 非今日（03-16）→ 不命中。
-        assert!(!anniversary_due_today(&anni("她生日", "03-16", true), 2026, 3, 15, 0));
+        assert!(!anniversary_due_today(
+            &anni("她生日", "03-16", true),
+            2026,
+            3,
+            15,
+            0
+        ));
     }
 
     /// recurring 纪念日：lookahead 窗口内命中（提前 N 天）。
     #[test]
     fn anniversary_recurring_hits_within_lookahead() {
         // 今日 03-13，生日 03-15，lookahead 2 → 命中（03-13→03-15 含端点）。
-        assert!(anniversary_due_today(&anni("她生日", "03-15", true), 2026, 3, 13, 2));
+        assert!(anniversary_due_today(
+            &anni("她生日", "03-15", true),
+            2026,
+            3,
+            13,
+            2
+        ));
         // lookahead 1 → 03-15 超出 [03-13, 03-14] → 不命中。
-        assert!(!anniversary_due_today(&anni("她生日", "03-15", true), 2026, 3, 13, 1));
+        assert!(!anniversary_due_today(
+            &anni("她生日", "03-15", true),
+            2026,
+            3,
+            13,
+            1
+        ));
+    }
+
+    #[test]
+    fn calendar_occurrence_subject_is_stable_from_lookahead_to_due_day() {
+        let entry = anni("birthday label", "03-15", true);
+        let early_occurrence =
+            anniversary_occurrence(&entry, 2026, 3, 14, 1).expect("lookahead occurrence");
+        let due_day_occurrence =
+            anniversary_occurrence(&entry, 2026, 3, 15, 0).expect("due-day occurrence");
+        assert_eq!(early_occurrence, due_day_occurrence);
+
+        let mut early = vec![calendar_occurrence_identity(
+            "anniversaries",
+            &entry,
+            early_occurrence,
+        )];
+        let mut due_day = vec![calendar_occurrence_identity(
+            "anniversaries",
+            &entry,
+            due_day_occurrence,
+        )];
+        assert_eq!(
+            calendar_occurrence_subject(&mut early),
+            calendar_occurrence_subject(&mut due_day)
+        );
     }
 
     /// recurring 跨年边界：今日 12-31，lookahead 让窗口跨到次年 01-01。
     #[test]
     fn anniversary_recurring_crosses_year_boundary() {
         // 今日 2026-12-31，纪念日 01-01，lookahead 1 → 窗口 {12-31, 01-01} 含 01-01 → 命中。
-        assert!(anniversary_due_today(&anni("元旦纪念", "01-01", true), 2026, 12, 31, 1));
+        assert!(anniversary_due_today(
+            &anni("元旦纪念", "01-01", true),
+            2026,
+            12,
+            31,
+            1
+        ));
         // lookahead 0 → 只看 12-31 → 不命中 01-01。
-        assert!(!anniversary_due_today(&anni("元旦纪念", "01-01", true), 2026, 12, 31, 0));
+        assert!(!anniversary_due_today(
+            &anni("元旦纪念", "01-01", true),
+            2026,
+            12,
+            31,
+            0
+        ));
     }
 
     /// recurring 闰年 02-29：闰年当天命中。
     #[test]
     fn anniversary_recurring_leap_day() {
         // 2024 是闰年，今日 02-29、纪念日 02-29 → 命中。
-        assert!(anniversary_due_today(&anni("特殊日", "02-29", true), 2024, 2, 29, 0));
+        assert!(anniversary_due_today(
+            &anni("特殊日", "02-29", true),
+            2024,
+            2,
+            29,
+            0
+        ));
     }
 
     /// one-off 完整日期：年月日全等才命中，往年同月日不命中。
     #[test]
     fn anniversary_one_off_matches_full_date() {
         // 一次性事件 2026-03-15，今日 2026-03-15 → 命中。
-        assert!(anniversary_due_today(&anni("签约一周年", "2026-03-15", false), 2026, 3, 15, 0));
+        assert!(anniversary_due_today(
+            &anni("签约一周年", "2026-03-15", false),
+            2026,
+            3,
+            15,
+            0
+        ));
         // 次年同月日（2027-03-15）→ one-off 不循环 → 不命中。
-        assert!(!anniversary_due_today(&anni("签约一周年", "2026-03-15", false), 2027, 3, 15, 0));
+        assert!(!anniversary_due_today(
+            &anni("签约一周年", "2026-03-15", false),
+            2027,
+            3,
+            15,
+            0
+        ));
     }
 
     /// 向后兼容 / 容错：非法或旧纯文本日期 → 不命中（不 panic）。
     #[test]
     fn anniversary_malformed_date_is_not_due() {
-        assert!(!anniversary_due_today(&anni("旧条目", "下个月15号", true), 2026, 3, 15, 5));
-        assert!(!anniversary_due_today(&anni("空", "", true), 2026, 3, 15, 5));
-        assert!(!anniversary_due_today(&anni("越界月", "13-40", true), 2026, 3, 15, 5));
+        assert!(!anniversary_due_today(
+            &anni("旧条目", "下个月15号", true),
+            2026,
+            3,
+            15,
+            5
+        ));
+        assert!(!anniversary_due_today(
+            &anni("空", "", true),
+            2026,
+            3,
+            15,
+            5
+        ));
+        assert!(!anniversary_due_today(
+            &anni("越界月", "13-40", true),
+            2026,
+            3,
+            15,
+            5
+        ));
     }
 
     /// extra 容器解析：结构化对象被读出，旧纯字符串条目被跳过（向后兼容）。

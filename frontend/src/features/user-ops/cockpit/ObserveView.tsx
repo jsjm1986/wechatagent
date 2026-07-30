@@ -33,7 +33,7 @@ type ObserveViewProps = {
   memoryDraft: OperatingMemoryDraft;
   health: OperationHealth | null;
   operatingMemory: OperatingMemory | null;
-  onSaveManualTags: (tags: string[]) => void;
+  onSaveManualTags: (contact: Contact, tags: string[]) => void;
   onDrilldown: (d: Drilldown) => void;
 };
 

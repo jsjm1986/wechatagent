@@ -126,20 +126,20 @@ fn missing_conversation_mode_pushes_missing_required_field() {
 fn known_drift_values_rejected_with_invalid_enum_value() {
     let runtime = UserRuntimeParameters::default();
     let drift_values = &[
-        "Casual_Relationship",  // 大小写错误
-        "casualrelationship",   // 缺少下划线
-        "consult",              // 截断
-        "consultive",           // 拼写错误
-        "sales",                // 邻近概念但非协议词
-        "support",              // 邻近概念
-        "boundary",             // 截断
-        "value",                // 截断
-        "顾问销售",             // 中文同义
-        "寒暄",                 // 中文同义
-        "auto",                 // 跨字段污染（autonomy_mode 的值）
-        "low",                  // 跨字段污染（risk_level 的值）
-        "unknown",              // 占位词
-        "null",                 // JSON null 字面量
+        "Casual_Relationship", // 大小写错误
+        "casualrelationship",  // 缺少下划线
+        "consult",             // 截断
+        "consultive",          // 拼写错误
+        "sales",               // 邻近概念但非协议词
+        "support",             // 邻近概念
+        "boundary",            // 截断
+        "value",               // 截断
+        "顾问销售",            // 中文同义
+        "寒暄",                // 中文同义
+        "auto",                // 跨字段污染（autonomy_mode 的值）
+        "low",                 // 跨字段污染（risk_level 的值）
+        "unknown",             // 占位词
+        "null",                // JSON null 字面量
     ];
     for val in drift_values {
         let mut raw = build_low_routine_baseline_raw();
@@ -174,10 +174,9 @@ fn known_drift_values_rejected_with_invalid_enum_value() {
 fn invalid_mode_strategy() -> impl Strategy<Value = String> {
     proptest::string::string_regex("[a-z0-9_]{1,32}")
         .expect("regex compiles")
-        .prop_filter(
-            "must NOT be one of the four valid modes",
-            |s| !VALID_MODES.iter().any(|v| *v == s.as_str()),
-        )
+        .prop_filter("must NOT be one of the four valid modes", |s| {
+            !VALID_MODES.iter().any(|v| *v == s.as_str())
+        })
 }
 
 proptest! {

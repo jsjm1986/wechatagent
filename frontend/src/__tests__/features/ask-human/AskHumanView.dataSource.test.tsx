@@ -63,7 +63,13 @@ describe("AskHumanView 单数据源", () => {
       items: [item("low1", "low", 1), item("high1", "high", 2), item("med1", "medium", 3)],
       errors: [],
     });
-    fs.mockResolvedValue({ principalEscalation: 0 });
+    fs.mockResolvedValue({
+      status: "complete",
+      asOf: null,
+      counts: { principalEscalation: 0 },
+      errors: [],
+      total: 0,
+    });
 
     const { container } = render(<AskHumanFeature />);
 
@@ -76,7 +82,7 @@ describe("AskHumanView 单数据源", () => {
 
   it("单次刷新只 fetch 一次 inbox（mount 1 次 + 刷新 1 次 = 2，非旧的双倍）", async () => {
     fi.mockResolvedValue({ items: [item("a", "high")], errors: [] });
-    fs.mockResolvedValue({});
+    fs.mockResolvedValue({ status: "complete", asOf: null, counts: {}, errors: [], total: 0 });
 
     render(<AskHumanFeature />);
     await screen.findByText("t-a");
@@ -92,7 +98,7 @@ describe("AskHumanView 单数据源", () => {
 
   it("降级一致：刷新失败时 fatalError 横幅出现且列表仍显旧数据（不走 error 短路）", async () => {
     fi.mockResolvedValueOnce({ items: [item("keep", "high")], errors: [] });
-    fs.mockResolvedValue({});
+    fs.mockResolvedValue({ status: "complete", asOf: null, counts: {}, errors: [], total: 0 });
 
     render(<AskHumanFeature />);
     await screen.findByText("t-keep");
@@ -119,7 +125,13 @@ describe("AskHumanView 单数据源", () => {
         errors: [],
       }),
     );
-    fs.mockResolvedValue({ knowledgeReview: 1 });
+    fs.mockResolvedValue({
+      status: "complete",
+      asOf: null,
+      counts: { knowledgeReview: 1 },
+      errors: [],
+      total: 1,
+    });
 
     render(<AskHumanFeature />);
     await screen.findByText("t-all");
@@ -141,7 +153,13 @@ describe("AskHumanView 单数据源", () => {
       ],
       errors: [],
     });
-    fs.mockResolvedValue({ knowledgeReview: 2 });
+    fs.mockResolvedValue({
+      status: "complete",
+      asOf: null,
+      counts: { knowledgeReview: 2 },
+      errors: [],
+      total: 2,
+    });
 
     render(<AskHumanFeature />);
     await screen.findByText("t-audit");
@@ -153,5 +171,22 @@ describe("AskHumanView 单数据源", () => {
     expect(badges[0].className).toContain("inboxTag--held");
     // verified 的那条不显徽章（tag=undefined）。
     expect(screen.getByText("t-plain")).toBeTruthy();
+  });
+
+  it("summary source errors render unavailable instead of a false zero", async () => {
+    fi.mockResolvedValue({ items: [item("a", "high")], errors: [] });
+    fs.mockResolvedValue({
+      status: "partial",
+      asOf: "2026-07-20T00:00:00Z",
+      counts: { principalEscalation: null, knowledgeReview: 3 },
+      errors: [{ source: "principal_escalation", error: "count unavailable" }],
+      total: null,
+    });
+
+    render(<AskHumanFeature />);
+    await screen.findByText("t-a");
+    expect(screen.getByText("请示裁决: 不可用")).toBeTruthy();
+    expect(screen.queryByText("请示裁决: 0")).toBeNull();
+    expect(screen.getByText("知识核验: 3")).toBeTruthy();
   });
 });

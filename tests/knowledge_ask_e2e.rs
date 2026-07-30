@@ -38,6 +38,8 @@ fn verified_chunk(title: &str, body: &str) -> OperationKnowledgeChunk {
         title: title.to_string(),
         summary: Some(format!("摘要：{title}")),
         body: Some(body.to_string()),
+        source_quote: Some(body.to_string()),
+        source_anchors: vec![doc! { "sourceQuote": body }],
         wiki_type: Some("methodology".to_string()),
         status: "active".to_string(),
         integrity_status: Some("verified".to_string()),
@@ -96,7 +98,7 @@ async fn ask_returns_answer_with_cited_when_corpus_has_relevant_chunks() {
         "sourceQuotes": [{
             "chunkId": chunk_hex.clone(),
             "quote": "Step1 共情；Step2 说价值；Step3 给方案。",
-            "sourceAnchorIndex": null,
+            "sourceAnchorIndex": 0,
         }],
     }));
 
@@ -131,9 +133,7 @@ async fn ask_returns_no_relevant_when_corpus_empty() {
 
     // 不入队任何 LLM 响应；如果代码错误地调 LLM，pop_or_error 会立即报错。
 
-    let result = answer(&app.state, req("任何 query"))
-        .await
-        .expect("answer");
+    let result = answer(&app.state, req("任何 query")).await.expect("answer");
 
     assert_eq!(result.answer, "知识库无相关内容。");
     assert!(result.cited_chunk_ids.is_empty());
@@ -166,9 +166,7 @@ async fn ask_falls_back_to_truncated_when_llm_never_emits_answer() {
         }));
     }
 
-    let result = answer(&app.state, req("question"))
-        .await
-        .expect("answer");
+    let result = answer(&app.state, req("question")).await.expect("answer");
 
     assert!(result.truncated, "4 轮未 answer 必须 truncated=true");
     assert_eq!(
@@ -197,9 +195,7 @@ async fn ask_skips_unverified_chunks_in_catalog() {
     chunk.integrity_status = Some("needs_review".to_string());
     insert(&app, &[chunk]).await;
 
-    let result = answer(&app.state, req("query"))
-        .await
-        .expect("answer");
+    let result = answer(&app.state, req("query")).await.expect("answer");
 
     assert_eq!(
         result.answer, "知识库无相关内容。",
@@ -248,7 +244,7 @@ async fn follow_relations_marks_contradiction_targets() {
     insert(&app, &[source, support, contra]).await;
 
     let (_catalog, prefetched) =
-        follow_relations(&app.state, WS, &source_id, 1, &HashSet::new())
+        follow_relations(&app.state, WS, None, &source_id, 1, &HashSet::new())
             .await
             .expect("follow_relations ok");
 
@@ -257,7 +253,10 @@ async fn follow_relations_marks_contradiction_targets() {
         .iter()
         .find(|c| c.chunk_id == support_id)
         .expect("B 应被作为支撑拉入");
-    assert_eq!(b.relation_role, None, "references 目标不带 contradiction 标记");
+    assert_eq!(
+        b.relation_role, None,
+        "references 目标不带 contradiction 标记"
+    );
 
     let c = prefetched
         .iter()
@@ -280,15 +279,16 @@ async fn open_chunk_redirects_superseded_to_current_version() {
     let new_chunk = verified_chunk("现行版", "新版正文");
     let new_id = new_chunk.id.unwrap().to_hex();
     let mut old_chunk = verified_chunk("旧版", "旧版正文");
+    old_chunk.status = "archived".to_string();
     old_chunk.superseded_by = Some(new_id.clone());
     let old_id = old_chunk.id.unwrap().to_hex();
     insert(&app, &[old_chunk, new_chunk]).await;
 
-    let full = open_chunk(&app.state, WS, &old_id)
+    let full = open_chunk(&app.state, WS, None, &old_id)
         .await
         .expect("open_chunk ok")
         .expect("应返回现行版而非 None");
-    assert_eq!(full.chunk_id, new_id, "open_chunk 应 redirect 到新版 id");
+    assert_eq!(full.chunk_id, new_id, "archived 旧版应 redirect 到新版 id");
     assert_eq!(full.body, "新版正文", "应返回现行版正文");
 }
 
@@ -315,7 +315,7 @@ async fn follow_relations_redirects_superseded_target() {
     insert(&app, &[source, old_target, new_chunk]).await;
 
     let (_catalog, prefetched) =
-        follow_relations(&app.state, WS, &source_id, 1, &HashSet::new())
+        follow_relations(&app.state, WS, None, &source_id, 1, &HashSet::new())
             .await
             .expect("follow_relations ok");
 
@@ -360,13 +360,11 @@ async fn answer_cites_redirected_current_version_end_to_end() {
         "sourceQuotes": [{
             "chunkId": new_id.clone(),
             "quote": "现行版正文：价格异议三步法",
-            "sourceAnchorIndex": null,
+            "sourceAnchorIndex": 0,
         }],
     }));
 
-    let result = answer(&app.state, req("价格异议"))
-        .await
-        .expect("answer");
+    let result = answer(&app.state, req("价格异议")).await.expect("answer");
 
     // cite⊆opened 修复成立：cite 新版 id 不被丢，cited 非空且恰为新版。
     assert_eq!(
@@ -398,7 +396,7 @@ async fn open_chunk_follows_multi_hop_superseded_chain() {
     let v1_id = v1.id.unwrap().to_hex();
     insert(&app, &[v1, v2, v3]).await;
 
-    let full = open_chunk(&app.state, WS, &v1_id)
+    let full = open_chunk(&app.state, WS, None, &v1_id)
         .await
         .expect("open_chunk ok")
         .expect("应跟链返回 v3");
@@ -422,7 +420,7 @@ async fn open_chunk_stops_redirect_when_new_version_unverified() {
     insert(&app, &[old_chunk, draft_new]).await;
 
     // 新版未 verified → resolve 停在旧版 → open_chunk 返回旧版（仍 verified）。
-    let full = open_chunk(&app.state, WS, &old_id)
+    let full = open_chunk(&app.state, WS, None, &old_id)
         .await
         .expect("open_chunk ok")
         .expect("新版未审定时应停在旧版");
@@ -442,7 +440,7 @@ async fn open_chunk_self_cycle_superseded_terminates() {
     selfie.superseded_by = Some(self_id.clone());
     insert(&app, &[selfie]).await;
 
-    let full = open_chunk(&app.state, WS, &self_id)
+    let full = open_chunk(&app.state, WS, None, &self_id)
         .await
         .expect("open_chunk ok")
         .expect("自指环应停在自身");

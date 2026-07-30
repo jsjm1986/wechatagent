@@ -132,42 +132,42 @@ pub(crate) fn project_entitlements(
 
     let entitlements = agg
         .into_iter()
-        .map(|(product_id, owned_since, quantity, snapshot_name, expiry_anchors)| {
-            // 解引用活产品：取活名。下架/改名 → 回落快照名。
-            let active = active_products.iter().find(|p| p.product_id == product_id);
-            let name = active
-                .map(|p| p.name.clone())
-                .unwrap_or(snapshot_name);
-            // G4 #4 + A：售后到期 = 各正向成交锚 max(occurred + 该笔 days)。
-            // 每笔 days 优先用成交时冻结的快照，缺失（老成交未登记）才回落活产品表。
-            // archived 产品活引用解不到，但快照仍在 → in_aftercare 不丢（#4）；
-            // 续费/复购各笔独立续窗、取最晚到期 → 刚续费客户不被按首购判过期（A）。
-            let active_days = active.and_then(entitlement_days_of);
-            let expires_ms = expiry_anchors
-                .iter()
-                .filter_map(|(occurred_ms, snap_days)| {
-                    snap_days
-                        .or(active_days)
-                        .filter(|d| *d > 0)
-                        .map(|d| occurred_ms + d * 86_400_000)
-                })
-                .max();
-            let (in_aftercare, expires_at) = match expires_ms {
-                Some(ms) => {
-                    let within = now.timestamp_millis() <= ms;
-                    (Some(within), Some(DateTime::from_millis(ms)))
+        .map(
+            |(product_id, owned_since, quantity, snapshot_name, expiry_anchors)| {
+                // 解引用活产品：取活名。下架/改名 → 回落快照名。
+                let active = active_products.iter().find(|p| p.product_id == product_id);
+                let name = active.map(|p| p.name.clone()).unwrap_or(snapshot_name);
+                // G4 #4 + A：售后到期 = 各正向成交锚 max(occurred + 该笔 days)。
+                // 每笔 days 优先用成交时冻结的快照，缺失（老成交未登记）才回落活产品表。
+                // archived 产品活引用解不到，但快照仍在 → in_aftercare 不丢（#4）；
+                // 续费/复购各笔独立续窗、取最晚到期 → 刚续费客户不被按首购判过期（A）。
+                let active_days = active.and_then(entitlement_days_of);
+                let expires_ms = expiry_anchors
+                    .iter()
+                    .filter_map(|(occurred_ms, snap_days)| {
+                        snap_days
+                            .or(active_days)
+                            .filter(|d| *d > 0)
+                            .map(|d| occurred_ms + d * 86_400_000)
+                    })
+                    .max();
+                let (in_aftercare, expires_at) = match expires_ms {
+                    Some(ms) => {
+                        let within = now.timestamp_millis() <= ms;
+                        (Some(within), Some(DateTime::from_millis(ms)))
+                    }
+                    None => (None, None),
+                };
+                Entitlement {
+                    product_id,
+                    name,
+                    owned_since,
+                    quantity: quantity.max(0) as u32,
+                    in_aftercare,
+                    expires_at,
                 }
-                None => (None, None),
-            };
-            Entitlement {
-                product_id,
-                name,
-                owned_since,
-                quantity: quantity.max(0) as u32,
-                in_aftercare,
-                expires_at,
-            }
-        })
+            },
+        )
         .collect();
 
     (entitlements, total)
@@ -197,13 +197,8 @@ pub(crate) fn format_entitlements_hint(entitlements: &[Entitlement], total: usiz
             parts.push(format!("共 {} 件", e.quantity));
         }
         match (e.in_aftercare, e.expires_at) {
-            (Some(true), Some(exp)) => parts.push(format!(
-                "售后/有效期内（至 {}）",
-                fmt_date(exp)
-            )),
-            (Some(false), Some(exp)) => {
-                parts.push(format!("有效期已过（{} 截止）", fmt_date(exp)))
-            }
+            (Some(true), Some(exp)) => parts.push(format!("售后/有效期内（至 {}）", fmt_date(exp))),
+            (Some(false), Some(exp)) => parts.push(format!("有效期已过（{} 截止）", fmt_date(exp))),
             _ => {}
         }
         lines.push(format!("- {}", parts.join("，")));
@@ -361,30 +356,15 @@ pub(crate) fn render_transaction_facts_sections(
         return (String::new(), String::new(), String::new());
     }
     let product_catalog_text = format_product_catalog_for_prompt(active_products);
-    let (entitlements, total) =
-        project_entitlements(outcome_events, active_products, now, ENTITLEMENTS_PROMPT_CAP);
+    let (entitlements, total) = project_entitlements(
+        outcome_events,
+        active_products,
+        now,
+        ENTITLEMENTS_PROMPT_CAP,
+    );
     let entitlements_text = format_entitlements_hint(&entitlements, total);
     let suspected_deal_text = render_suspected_deal_guidance(active_products);
     (product_catalog_text, entitlements_text, suspected_deal_text)
-}
-
-/// R5.4 `priced_from_catalog` 判定（spec §5.4）：决策引用的 product_id 是否有任一
-/// 命中本 workspace 的 active 产品。命中 → G2 结构化报价视为已背书，与 verified_chunks
-/// 取或，避免准确报价被 `blocked_unverified_product_claim` 错杀。
-///
-/// 只认 active（§5.4.4：新报价读活表，archived 不进可报价集合 → 引用 archived 报新价仍触发红线）。
-/// 空 quoted_ids / 空产品表 → 恒假 → 零扰动。
-pub(crate) fn priced_from_active_catalog(
-    quoted_product_ids: &[String],
-    active_products: &[Product],
-) -> bool {
-    if quoted_product_ids.is_empty() || active_products.is_empty() {
-        return false;
-    }
-    quoted_product_ids.iter().any(|qid| {
-        let q = qid.trim();
-        !q.is_empty() && active_products.iter().any(|p| p.product_id == q)
-    })
 }
 
 /// 客观购买事实增强 spec §6（G4 当 G1 的客观锚）：G1「购买生命周期」维度的
@@ -531,7 +511,11 @@ mod tests {
 
     use crate::models::OutcomeProductRef;
 
-    fn ev(verification: &str, product: Option<(&str, &str, u32)>, occurred_ms: i64) -> OutcomeEvent {
+    fn ev(
+        verification: &str,
+        product: Option<(&str, &str, u32)>,
+        occurred_ms: i64,
+    ) -> OutcomeEvent {
         OutcomeEvent {
             marked_at: DateTime::from_millis(occurred_ms),
             occurred_at: Some(DateTime::from_millis(occurred_ms)),
@@ -580,7 +564,11 @@ mod tests {
     #[test]
     fn conversation_inferred_never_enters_projection() {
         let now = DateTime::from_millis(1_000_000);
-        let events = vec![ev("conversation_inferred", Some(("p1", "疑似买的", 1)), 100)];
+        let events = vec![ev(
+            "conversation_inferred",
+            Some(("p1", "疑似买的", 1)),
+            100,
+        )];
         let (ents, total) = project_entitlements(&events, &[], now, 10);
         assert!(ents.is_empty(), "conversation_inferred 绝不进 G4 投影");
         assert_eq!(total, 0);
@@ -616,7 +604,10 @@ mod tests {
         assert_eq!(ents[0].product_id, "vip");
         assert_eq!(ents[0].quantity, 3, "件数累计");
         assert_eq!(ents[0].owned_since.timestamp_millis(), 100, "取最早一笔");
-        assert_eq!(ents[0].in_aftercare, None, "无 entitlement_days 规则 → 无时效");
+        assert_eq!(
+            ents[0].in_aftercare, None,
+            "无 entitlement_days 规则 → 无时效"
+        );
     }
 
     #[test]
@@ -627,8 +618,12 @@ mod tests {
         let prod = product("course", "训练营", doc! { "entitlement_days": 30i64 });
         let events = vec![ev("staff_confirmed", Some(("course", "训练营", 1)), 0)];
 
-        let (within, _) =
-            project_entitlements(&events, &[prod.clone()], DateTime::from_millis(10 * day), 10);
+        let (within, _) = project_entitlements(
+            &events,
+            &[prod.clone()],
+            DateTime::from_millis(10 * day),
+            10,
+        );
         assert_eq!(within[0].in_aftercare, Some(true), "第10天在售后期内");
         assert!(within[0].expires_at.is_some());
 
@@ -665,8 +660,7 @@ mod tests {
         // 成交时冻结售后期 30 天的快照；active_products 传空模拟产品已 archived/删除。
         let events = vec![ev_with_days("course", "训练营", 0, Some(30))];
 
-        let (within, _) =
-            project_entitlements(&events, &[], DateTime::from_millis(10 * day), 10);
+        let (within, _) = project_entitlements(&events, &[], DateTime::from_millis(10 * day), 10);
         assert_eq!(
             within[0].in_aftercare,
             Some(true),
@@ -678,8 +672,7 @@ mod tests {
             "expires_at 按快照 30 天算出"
         );
 
-        let (expired, _) =
-            project_entitlements(&events, &[], DateTime::from_millis(40 * day), 10);
+        let (expired, _) = project_entitlements(&events, &[], DateTime::from_millis(40 * day), 10);
         assert_eq!(expired[0].in_aftercare, Some(false), "第40天超快照售后期");
     }
 
@@ -705,8 +698,7 @@ mod tests {
         // 快照无 days（未登记的老成交）→ 回落活产品表的 entitlement_days。
         let events = vec![ev_with_days("course", "训练营", 0, None)];
         let prod = product("course", "训练营", doc! { "entitlement_days": 30i64 });
-        let (ents, _) =
-            project_entitlements(&events, &[prod], DateTime::from_millis(10 * day), 10);
+        let (ents, _) = project_entitlements(&events, &[prod], DateTime::from_millis(10 * day), 10);
         assert_eq!(
             ents[0].in_aftercare,
             Some(true),
@@ -725,7 +717,11 @@ mod tests {
         ];
         // owned_since 仍取最早（资历语义不变）。
         let (ents, _) = project_entitlements(&events, &[], DateTime::from_millis(35 * day), 10);
-        assert_eq!(ents[0].owned_since.timestamp_millis(), 0, "资历仍记首购 Day0");
+        assert_eq!(
+            ents[0].owned_since.timestamp_millis(),
+            0,
+            "资历仍记首购 Day0"
+        );
         assert_eq!(
             ents[0].expires_at.map(|d| d.timestamp_millis()),
             Some(55 * day),
@@ -790,8 +786,8 @@ mod tests {
         // 都带快照，此组合仅理论存在；此测试把该降级行为钉成显式契约，防未来误改成"延窗"。
         let day = 86_400_000i64;
         let events = vec![
-            ev_with_days("course", "训练营", 0, Some(30)),       // 首购带快照 30 天 → 到 Day30
-            ev_with_days("course", "训练营", 25 * day, None),    // 续费缺快照
+            ev_with_days("course", "训练营", 0, Some(30)), // 首购带快照 30 天 → 到 Day30
+            ev_with_days("course", "训练营", 25 * day, None), // 续费缺快照
         ];
         // active_products 空 = 产品已 archived → 续费锚回落失败、被丢。
         let (ents, _) = project_entitlements(&events, &[], DateTime::from_millis(20 * day), 10);
@@ -862,37 +858,6 @@ mod tests {
     }
 
     #[test]
-    fn priced_from_active_catalog_hits_active_id_only() {        let p1 = product("vip", "年度会员", Document::new());
-        let p2 = product("course", "训练营", Document::new());
-        let active = vec![p1, p2];
-
-        // 命中 active id → true
-        assert!(priced_from_active_catalog(
-            &["vip".to_string()],
-            &active
-        ));
-        // 多个引用，任一命中即 true
-        assert!(priced_from_active_catalog(
-            &["unknown".to_string(), "course".to_string()],
-            &active
-        ));
-        // 全不命中 → false
-        assert!(!priced_from_active_catalog(
-            &["ghost".to_string()],
-            &active
-        ));
-        // 空引用 → false（零扰动）
-        assert!(!priced_from_active_catalog(&[], &active));
-        // 空产品表 → false（零扰动）
-        assert!(!priced_from_active_catalog(&["vip".to_string()], &[]));
-        // 空白字符串引用不算命中
-        assert!(!priced_from_active_catalog(
-            &["   ".to_string()],
-            &active
-        ));
-    }
-
-    #[test]
     fn suspected_deal_guidance_zero_perturbation_when_no_products() {
         // 无产品域（情感陪伴）→ 空串，task prompt 字节等价。
         assert_eq!(render_suspected_deal_guidance(&[]), "");
@@ -919,10 +884,7 @@ mod tests {
             concat!("hand", "off"),
         ];
         for forbidden in forbidden_words {
-            assert!(
-                !g.contains(forbidden),
-                "疑似成交指引不得含禁词 {forbidden}"
-            );
+            assert!(!g.contains(forbidden), "疑似成交指引不得含禁词 {forbidden}");
         }
     }
 
@@ -941,7 +903,10 @@ mod tests {
         assert!(g.contains("新证据"), "仅在明确新证据时产出");
         assert!(g.contains("不要每轮"), "关系类型是稳定属性，不每轮改判");
         // 反过拟合护栏：行业中性，不写死某行业判断规则。
-        assert!(g.contains("字典"), "取值按本账号 relationship_type 字典，保持行业中性");
+        assert!(
+            g.contains("字典"),
+            "取值按本账号 relationship_type 字典，保持行业中性"
+        );
     }
 
     #[test]
@@ -982,14 +947,21 @@ mod tests {
         let p = product("vip", "年度会员", Document::new());
         let catalog = format_product_catalog_for_prompt(&[p]);
         assert!(catalog.contains("199.00 CNY"), "价格须渲染成元：{catalog}");
-        assert!(!catalog.contains("19900"), "绝不能把分值原样喂给 AI：{catalog}");
+        assert!(
+            !catalog.contains("19900"),
+            "绝不能把分值原样喂给 AI：{catalog}"
+        );
     }
 
     #[test]
     fn transaction_facts_gate_off_yields_all_empty_even_with_products() {
         // G4 #5 闸门核心：非交易域（enabled=false）即便产品表非空 + 有真成交，三段一律空串。
         let now = DateTime::from_millis(1_000_000);
-        let products = vec![product("vip", "年度会员", doc! { "entitlement_days": 30i64 })];
+        let products = vec![product(
+            "vip",
+            "年度会员",
+            doc! { "entitlement_days": 30i64 },
+        )];
         let events = vec![ev("staff_confirmed", Some(("vip", "年度会员", 1)), 100)];
         let (catalog, ents, suspected) =
             render_transaction_facts_sections(false, &products, &events, now);
@@ -1002,7 +974,11 @@ mod tests {
     fn transaction_facts_gate_on_renders_three_sections() {
         // 交易域（enabled=true）+ 产品非空 + 有成交 → 三段都非空。
         let now = DateTime::from_millis(1_000_000);
-        let products = vec![product("vip", "年度会员", doc! { "entitlement_days": 30i64 })];
+        let products = vec![product(
+            "vip",
+            "年度会员",
+            doc! { "entitlement_days": 30i64 },
+        )];
         let events = vec![ev("staff_confirmed", Some(("vip", "年度会员", 1)), 100)];
         let (catalog, ents, suspected) =
             render_transaction_facts_sections(true, &products, &events, now);
@@ -1015,8 +991,7 @@ mod tests {
     fn transaction_facts_gate_on_empty_products_zero_perturbation() {
         // 交易域但产品表空（未配置）→ 三段仍空串，与无产品域零扰动一致。
         let now = DateTime::from_millis(1_000_000);
-        let (catalog, ents, suspected) =
-            render_transaction_facts_sections(true, &[], &[], now);
+        let (catalog, ents, suspected) = render_transaction_facts_sections(true, &[], &[], now);
         assert_eq!(catalog, "");
         assert_eq!(ents, "");
         assert_eq!(suspected, "");
@@ -1046,7 +1021,11 @@ mod tests {
         let (ents, total) = project_entitlements(&events, &[], now, 10);
         assert_eq!(total, 1);
         assert_eq!(ents[0].quantity, 2, "净件数 = 3 - 1");
-        assert_eq!(ents[0].owned_since.timestamp_millis(), 100, "reversal 不刷新购买时刻");
+        assert_eq!(
+            ents[0].owned_since.timestamp_millis(),
+            100,
+            "reversal 不刷新购买时刻"
+        );
     }
 
     #[test]
@@ -1072,8 +1051,7 @@ mod tests {
         }"#;
         let ev: OutcomeEvent = serde_json::from_str(json).expect("旧 OutcomeEvent 须可反序列化");
         assert_eq!(ev.event_kind, "deal", "缺 event_kind 缺省 deal");
-        let (ents, _) =
-            project_entitlements(&[ev], &[], DateTime::from_millis(1_000_000), 10);
+        let (ents, _) = project_entitlements(&[ev], &[], DateTime::from_millis(1_000_000), 10);
         assert_eq!(ents.len(), 1, "旧正向成交照常进投影");
     }
 
@@ -1093,9 +1071,15 @@ mod tests {
     #[test]
     fn reconcile_empty_projection_never_corrects() {
         // G4 投影空 → 无客观证据 → 尊重 LLM 推断（含 not_purchased），不纠偏。
-        assert_eq!(reconcile_g1_with_entitlements(Some(G1_NOT_PURCHASED), &[]), None);
+        assert_eq!(
+            reconcile_g1_with_entitlements(Some(G1_NOT_PURCHASED), &[]),
+            None
+        );
         assert_eq!(reconcile_g1_with_entitlements(None, &[]), None);
-        assert_eq!(reconcile_g1_with_entitlements(Some(G1_REPURCHASE), &[]), None);
+        assert_eq!(
+            reconcile_g1_with_entitlements(Some(G1_REPURCHASE), &[]),
+            None
+        );
     }
 
     #[test]
@@ -1132,9 +1116,18 @@ mod tests {
     fn reconcile_purchase_semantic_labels_not_corrected() {
         // 含购买语义的标签与"已购买"客观态不冲突 → 不纠偏。
         let ents = vec![entitlement(Some(true))];
-        assert_eq!(reconcile_g1_with_entitlements(Some(G1_PURCHASED), &ents), None);
-        assert_eq!(reconcile_g1_with_entitlements(Some(G1_AFTERCARE), &ents), None);
-        assert_eq!(reconcile_g1_with_entitlements(Some(G1_REPURCHASE), &ents), None);
+        assert_eq!(
+            reconcile_g1_with_entitlements(Some(G1_PURCHASED), &ents),
+            None
+        );
+        assert_eq!(
+            reconcile_g1_with_entitlements(Some(G1_AFTERCARE), &ents),
+            None
+        );
+        assert_eq!(
+            reconcile_g1_with_entitlements(Some(G1_REPURCHASE), &ents),
+            None
+        );
     }
 
     #[test]
@@ -1180,7 +1173,11 @@ mod tests {
         ];
         let times = confirmed_deal_timestamps(&events);
         let ms: Vec<i64> = times.iter().map(|t| t.timestamp_millis()).collect();
-        assert_eq!(ms, vec![100, 200], "只取 staff_confirmed/payment_verified 的正向成交");
+        assert_eq!(
+            ms,
+            vec![100, 200],
+            "只取 staff_confirmed/payment_verified 的正向成交"
+        );
     }
 
     #[test]
@@ -1304,8 +1301,11 @@ mod tests {
     fn classify_value_tier_handles_misconfigured_thresholds() {
         // 配反：mid=400000 > high=300000。归一后 lo=300000, hi=400000。
         assert_eq!(classify_value_tier(250000, 400000, 300000), VALUE_TIER_LOW);
-        assert_eq!(classify_value_tier(350000, 400000, 300000), VALUE_TIER_MID, "mid 档仍可达，未被吞");
+        assert_eq!(
+            classify_value_tier(350000, 400000, 300000),
+            VALUE_TIER_MID,
+            "mid 档仍可达，未被吞"
+        );
         assert_eq!(classify_value_tier(450000, 400000, 300000), VALUE_TIER_HIGH);
     }
 }
-

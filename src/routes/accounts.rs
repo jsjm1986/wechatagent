@@ -25,6 +25,7 @@ use super::AppState;
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateAccountMcpKeyRequest {
+    expected_account_id: String,
     mcp_api_key: String,
     mcp_base_url: Option<String>,
 }
@@ -65,7 +66,8 @@ pub async fn sync_accounts(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
 ) -> AppResult<Json<Value>> {
-    let result = mcp::logged_call(&state, "account_list", json!({})).await?;
+    let result =
+        mcp::logged_call(&state, &admin.current_workspace, "account_list", json!({})).await?;
     let items = result
         .get("items")
         .and_then(|value| value.as_array())
@@ -180,12 +182,22 @@ pub async fn update_account_mcp_key(
     if payload.mcp_api_key.trim().is_empty() {
         return Err(AppError::BadRequest("mcpApiKey is required".to_string()));
     }
+    let expected_account_id = payload.expected_account_id.trim();
+    if expected_account_id.is_empty() {
+        return Err(AppError::BadRequest(
+            "expectedAccountId is required".to_string(),
+        ));
+    }
     let object_id = parse_object_id(&id)?;
     let result = state
         .db
         .accounts()
         .update_one(
-            doc! { "_id": object_id, "workspace_id": &admin.current_workspace },
+            doc! {
+                "_id": object_id,
+                "workspace_id": &admin.current_workspace,
+                "account_id": expected_account_id,
+            },
             doc! {
                 "$set": {
                     "mcp_api_key": payload.mcp_api_key,
@@ -197,7 +209,7 @@ pub async fn update_account_mcp_key(
         )
         .await?;
     if result.matched_count == 0 {
-        return Err(AppError::NotFound("account not found".to_string()));
+        return Err(AppError::Conflict("account_identity_conflict".to_string()));
     }
     Ok(Json(json!({ "ok": true })))
 }
@@ -270,10 +282,17 @@ pub async fn login_begin(
             .await?
             .ok_or_else(|| AppError::NotFound(format!("account alias {} not found", alias)))?;
 
-        mcp::logged_call_for_account(&state, &account.account_id, "login_begin", arguments).await?
+        mcp::logged_call_for_account(
+            &state,
+            &admin.current_workspace,
+            &account.account_id,
+            "login_begin",
+            arguments,
+        )
+        .await?
     } else {
         // Account Key 模式：使用默认 credentials
-        mcp::logged_call(&state, "login_begin", arguments).await?
+        mcp::logged_call(&state, &admin.current_workspace, "login_begin", arguments).await?
     };
 
     Ok(Json(result))
@@ -317,9 +336,16 @@ pub async fn login_poll(
             .await?
             .ok_or_else(|| AppError::NotFound(format!("account alias {} not found", alias)))?;
 
-        mcp::logged_call_for_account(&state, &account.account_id, "login_poll", arguments).await?
+        mcp::logged_call_for_account(
+            &state,
+            &admin.current_workspace,
+            &account.account_id,
+            "login_poll",
+            arguments,
+        )
+        .await?
     } else {
-        mcp::logged_call(&state, "login_poll", arguments).await?
+        mcp::logged_call(&state, &admin.current_workspace, "login_poll", arguments).await?
     };
 
     Ok(Json(result))

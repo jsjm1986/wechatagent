@@ -1,14 +1,26 @@
-//! HP-3 / Task 10 回归：record_user_reaction 的 atomic claim 锁。
+//! Reaction claim ownership regressions.
 //!
 //! 默认 `#[ignore]`，需要 Docker（testcontainers MongoDB）。
-//!
-//! 端到端"N 个并发 webhook 触发同 contact 至多 1 次 LLM 调用"由 PBT 在
-//! Task 24 中收口；本文件提供 schema 和模型层面的回归。
+//! 所有 claim / reclaim / finalize 都走 `record_user_reaction` 生产入口；测试只在
+//! ABA 用例中回拨 `reaction_claimed_at`，模拟 worker 超时，不复制 Mongo 状态机。
 
 mod common;
 
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
+
+use async_trait::async_trait;
 use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
-use wechatagent::models::AgentDecisionReview;
+use serde_json::{json, Value};
+use tokio::sync::{watch, Notify};
+use wechatagent::agent::{enqueue, record_user_reaction, EnqueueOutcome, EnqueueRequest};
+use wechatagent::error::{AppError, AppResult};
+use wechatagent::llm::{ChatUsage, LlmJsonResult, LlmProvider};
+use wechatagent::models::{
+    AgentDecisionReview, AgentStatus, Contact, ConversationMessage, MessageDirection,
+};
 
 fn pending_review(workspace: &str, account: &str, wxid: &str) -> AgentDecisionReview {
     AgentDecisionReview {
@@ -38,6 +50,10 @@ fn pending_review(workspace: &str, account: &str, wxid: &str) -> AgentDecisionRe
         outcome_status: Some("pending".to_string()),
         reaction_analysis: Document::new(),
         reaction_claimed_at: None,
+        reaction_claim_token: None,
+        reaction_claim_generation: 0,
+        source_task_id: None,
+        source_task_claim_token: None,
         reviewer_misjudge_signal: None,
         expected_text_segments: 0,
         status: "sent".to_string(),
@@ -45,121 +61,386 @@ fn pending_review(workspace: &str, account: &str, wxid: &str) -> AgentDecisionRe
     }
 }
 
-#[tokio::test]
-#[ignore]
-async fn analyzing_state_can_be_claimed_atomically() {
-    let app = common::TestApp::start().await;
-    let review = pending_review("default", "default", "user_concurrent");
-    let id = review.id.expect("id present");
-    app.state
-        .db
-        .decision_reviews()
-        .insert_one(&review, None)
-        .await
-        .expect("insert pending review");
-
-    // 第一次 claim：pending → analyzing 应成功。
-    let first = app
-        .state
-        .db
-        .decision_reviews()
-        .find_one_and_update(
-            doc! {
-                "_id": id,
-                "$or": [
-                    { "outcome_status": null },
-                    { "outcome_status": "pending" }
-                ]
-            },
-            doc! {
-                "$set": {
-                    "outcome_status": "analyzing",
-                    "reaction_claimed_at": DateTime::now()
-                }
-            },
-            None,
-        )
-        .await
-        .unwrap();
-    assert!(first.is_some(), "first claim should succeed");
-
-    // 第二次相同条件 claim：因为 outcome_status 现在是 analyzing，filter 不命中。
-    let second = app
-        .state
-        .db
-        .decision_reviews()
-        .find_one_and_update(
-            doc! {
-                "_id": id,
-                "$or": [
-                    { "outcome_status": null },
-                    { "outcome_status": "pending" }
-                ]
-            },
-            doc! {
-                "$set": {
-                    "outcome_status": "analyzing",
-                    "reaction_claimed_at": DateTime::now()
-                }
-            },
-            None,
-        )
-        .await
-        .unwrap();
-    assert!(second.is_none(), "concurrent second claim should fail");
+fn managed_contact(wxid: &str) -> Contact {
+    let now = DateTime::now();
+    Contact {
+        id: Some(ObjectId::new()),
+        workspace_id: "default".to_string(),
+        account_id: "default".to_string(),
+        wxid: wxid.to_string(),
+        nickname: Some("reaction fencing test".to_string()),
+        remark: None,
+        alias: None,
+        avatar_url: None,
+        sex: None,
+        agent_status: AgentStatus::Managed,
+        human_profile_note: None,
+        agent_profile: None,
+        memory_summary: None,
+        playbook_id: None,
+        playbook_version: None,
+        manual_tags: Vec::new(),
+        confirmed_tags: Vec::new(),
+        bayesian_signals: Vec::new(),
+        personality_profile: None,
+        manual_tags_updated_at: None,
+        manual_tags_by: None,
+        tags_version: 0,
+        domain_attributes: None,
+        domain_attributes_updated_at: None,
+        commitments: Vec::new(),
+        follow_up_policy: None,
+        operation_state: Some("need_discovery".to_string()),
+        operation_state_reason: None,
+        operation_state_confidence: Some(7),
+        operation_state_updated_at: None,
+        cooldown_until: None,
+        operation_policy: Document::new(),
+        profile_attributes: Document::new(),
+        profile_updated_at: None,
+        last_message_at: Some(now),
+        last_inbound_at: Some(now),
+        last_outbound_at: None,
+        last_agent_run_at: None,
+        custom_agent_instructions: None,
+        operation_mode_override: None,
+        last_outbound_style: None,
+        intent_trajectory: Vec::new(),
+        locale: None,
+        outcome_events: Vec::new(),
+        created_at: now,
+        updated_at: now,
+    }
 }
 
-/// Task 24：N=10 并发 claim 测试。所有并发请求中至多 1 个能成功 claim 到 analyzing。
-#[tokio::test]
-#[ignore]
-async fn ten_concurrent_claims_at_most_one_succeeds() {
-    let app = common::TestApp::start().await;
-    let review = pending_review("default", "default", "user_n10");
-    let id = review.id.expect("id present");
-    app.state
+fn inbound(wxid: &str, message_id: &str, content: &str) -> ConversationMessage {
+    ConversationMessage {
+        id: Some(ObjectId::new()),
+        workspace_id: "default".to_string(),
+        account_id: "default".to_string(),
+        contact_wxid: wxid.to_string(),
+        message_id: Some(message_id.to_string()),
+        dedupe_key: None,
+        direction: MessageDirection::Inbound,
+        content: content.to_string(),
+        msg_type: None,
+        media_ref: None,
+        raw: None,
+        is_synthetic_relay: false,
+        created_at: DateTime::now(),
+    }
+}
+
+struct BlockingReactionProvider {
+    call_count: AtomicUsize,
+    reached: watch::Sender<usize>,
+    release_first: Notify,
+}
+
+impl BlockingReactionProvider {
+    fn new() -> (Arc<Self>, watch::Receiver<usize>) {
+        let (reached, receiver) = watch::channel(0usize);
+        (
+            Arc::new(Self {
+                call_count: AtomicUsize::new(0),
+                reached,
+                release_first: Notify::new(),
+            }),
+            receiver,
+        )
+    }
+
+    fn calls(&self) -> usize {
+        self.call_count.load(Ordering::SeqCst)
+    }
+
+    fn release_first(&self) {
+        self.release_first.notify_one();
+    }
+
+    async fn next_result(&self) -> AppResult<LlmJsonResult> {
+        let call = self.call_count.fetch_add(1, Ordering::SeqCst);
+        let _ = self.reached.send(call + 1);
+        let value = match call {
+            0 => {
+                self.release_first.notified().await;
+                json!({ "stopRequested": true })
+            }
+            1 => json!({ "buyingSignal": true }),
+            other => {
+                return Err(AppError::External(format!(
+                    "unexpected reaction LLM call index {other}"
+                )))
+            }
+        };
+        Ok(LlmJsonResult {
+            value,
+            usage: ChatUsage::default(),
+            latency_ms: 0,
+            model: "blocking-reaction-test".to_string(),
+            retry_count: 0,
+        })
+    }
+}
+
+#[async_trait]
+impl LlmProvider for BlockingReactionProvider {
+    async fn generate_json(&self, _system: &str, _user: &str) -> AppResult<Value> {
+        Ok(self.next_result().await?.value)
+    }
+
+    async fn generate_json_with_usage(
+        &self,
+        _system: &str,
+        _user: &str,
+    ) -> AppResult<LlmJsonResult> {
+        self.next_result().await
+    }
+}
+
+async fn wait_for_provider_calls(receiver: &mut watch::Receiver<usize>, expected: usize) {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while *receiver.borrow() < expected {
+            receiver
+                .changed()
+                .await
+                .expect("blocking reaction provider still alive");
+        }
+    })
+    .await
+    .expect("reaction LLM call did not start in time");
+}
+
+async fn seed_contact_and_review(
+    state: &wechatagent::routes::AppState,
+    wxid: &str,
+) -> (Contact, ObjectId) {
+    let contact = managed_contact(wxid);
+    state
+        .db
+        .contacts()
+        .insert_one(&contact, None)
+        .await
+        .expect("insert contact");
+    let review = pending_review("default", "default", wxid);
+    let review_id = review.id.expect("review id");
+    state
         .db
         .decision_reviews()
         .insert_one(&review, None)
         .await
         .expect("insert pending review");
+    (contact, review_id)
+}
 
-    let mut handles = Vec::new();
-    for _ in 0..10 {
-        let db = app.state.db.clone();
-        let task_id = id;
-        handles.push(tokio::spawn(async move {
-            db.decision_reviews()
-                .find_one_and_update(
-                    doc! {
-                        "_id": task_id,
-                        "$or": [
-                            { "outcome_status": null },
-                            { "outcome_status": "pending" }
-                        ]
-                    },
-                    doc! {
-                        "$set": {
-                            "outcome_status": "analyzing",
-                            "reaction_claimed_at": DateTime::now()
-                        }
-                    },
-                    None,
-                )
-                .await
-                .map(|opt| opt.is_some())
-                .unwrap_or(false)
-        }));
-    }
-
-    let mut successful_claims = 0;
-    for handle in handles {
-        if handle.await.unwrap_or(false) {
-            successful_claims += 1;
-        }
-    }
-    assert_eq!(
-        successful_claims, 1,
-        "N=10 并发 claim 中应恰好 1 个成功，实际 {}",
-        successful_claims
+#[tokio::test]
+#[ignore]
+async fn reaction_redline_concurrent_entry_cannot_start_second_analysis() {
+    let app = common::TestApp::start().await;
+    let (provider, mut reached) = BlockingReactionProvider::new();
+    let state = common::rebuild_app_state_with_real_llm(
+        &app,
+        provider.clone(),
+        "http://test-mcp.invalid".to_string(),
     );
+    let (contact, review_id) = seed_contact_and_review(&state, "reaction_concurrent").await;
+
+    let first_state = state.clone();
+    let first_contact = contact.clone();
+    let first = tokio::spawn(async move {
+        record_user_reaction(
+            &first_state,
+            &first_contact,
+            &inbound("reaction_concurrent", "inbound-first", "先处理这一条"),
+        )
+        .await
+    });
+    wait_for_provider_calls(&mut reached, 1).await;
+
+    record_user_reaction(
+        &state,
+        &contact,
+        &inbound("reaction_concurrent", "inbound-second", "并发到达的第二条"),
+    )
+    .await
+    .expect("second production entry returns without stealing active claim");
+    assert_eq!(
+        provider.calls(),
+        1,
+        "active claim must suppress a second LLM call"
+    );
+
+    provider.release_first();
+    first
+        .await
+        .expect("first reaction task join")
+        .expect("first reaction result");
+    let stored = state
+        .db
+        .decision_reviews()
+        .find_one(doc! { "_id": review_id }, None)
+        .await
+        .expect("query review")
+        .expect("review exists");
+    assert_eq!(
+        stored.outcome_status.as_deref(),
+        Some("user_replied_stop_requested")
+    );
+    assert_eq!(stored.reaction_claim_generation, 1);
+    assert!(stored.reaction_claim_token.is_none());
+
+    app.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn reaction_redline_stale_owner_cannot_overwrite_or_cancel_after_reclaim() {
+    let app = common::TestApp::start().await;
+    let (provider, mut reached) = BlockingReactionProvider::new();
+    let mut state = common::rebuild_app_state_with_real_llm(
+        &app,
+        provider.clone(),
+        "http://test-mcp.invalid".to_string(),
+    );
+    state.config.reaction_analysis_claim_timeout_seconds = 1;
+    let wxid = "reaction_reclaim_aba";
+    let (contact, review_id) = seed_contact_and_review(&state, wxid).await;
+
+    let outbox_id = match enqueue(
+        &state,
+        EnqueueRequest {
+            workspace_id: "default".to_string(),
+            account_id: "default".to_string(),
+            contact_wxid: wxid.to_string(),
+            run_id: "reaction-reclaim-outbox".to_string(),
+            decision_id: None,
+            source_event_id: "reaction-reclaim-source".to_string(),
+            source_kind: "inbound_message".to_string(),
+            content: "must survive stale stop result".to_string(),
+            media_asset_id: None,
+            referral_card_id: None,
+            max_attempts: 3,
+        },
+    )
+    .await
+    .expect("enqueue pending outbox")
+    {
+        EnqueueOutcome::Created { outbox_id, .. } => outbox_id,
+        other => panic!("expected created outbox, got {other:?}"),
+    };
+
+    let stale_state = state.clone();
+    let stale_contact = contact.clone();
+    let stale = tokio::spawn(async move {
+        record_user_reaction(
+            &stale_state,
+            &stale_contact,
+            &inbound(wxid, "inbound-stale", "不要再联系我"),
+        )
+        .await
+    });
+    wait_for_provider_calls(&mut reached, 1).await;
+
+    let first_claim = state
+        .db
+        .decision_reviews()
+        .find_one(doc! { "_id": review_id }, None)
+        .await
+        .expect("query first claim")
+        .expect("review exists");
+    let first_token = first_claim
+        .reaction_claim_token
+        .clone()
+        .expect("first claim has token");
+    assert_eq!(first_claim.outcome_status.as_deref(), Some("analyzing"));
+    assert_eq!(first_claim.reaction_claim_generation, 1);
+
+    // Fault injection only: make the current lease old. The second invocation performs the
+    // production reclaim and claim transitions itself.
+    state
+        .db
+        .decision_reviews()
+        .update_one(
+            doc! { "_id": review_id, "reaction_claim_token": &first_token },
+            doc! { "$set": { "reaction_claimed_at": DateTime::from_millis(0) } },
+            None,
+        )
+        .await
+        .expect("backdate first reaction claim");
+
+    record_user_reaction(
+        &state,
+        &contact,
+        &inbound(wxid, "inbound-current", "我想继续了解"),
+    )
+    .await
+    .expect("new owner completes through production entry");
+    wait_for_provider_calls(&mut reached, 2).await;
+
+    let current = state
+        .db
+        .decision_reviews()
+        .find_one(doc! { "_id": review_id }, None)
+        .await
+        .expect("query current outcome")
+        .expect("review exists");
+    assert_eq!(
+        current.outcome_status.as_deref(),
+        Some("user_replied_buying_signal")
+    );
+    assert_eq!(current.reaction_claim_generation, 2);
+    assert!(current.reaction_claim_token.is_none());
+
+    provider.release_first();
+    stale
+        .await
+        .expect("stale reaction task join")
+        .expect("stale reaction returns without committing");
+
+    let final_review = state
+        .db
+        .decision_reviews()
+        .find_one(doc! { "_id": review_id }, None)
+        .await
+        .expect("query final review")
+        .expect("review exists");
+    assert_eq!(
+        final_review.outcome_status.as_deref(),
+        Some("user_replied_buying_signal"),
+        "stale stop result must not overwrite the current owner"
+    );
+    assert_eq!(final_review.reaction_claim_generation, 2);
+    assert!(final_review.reviewer_misjudge_signal.is_none());
+
+    let stored_contact = state
+        .db
+        .contacts()
+        .find_one(doc! { "_id": contact.id }, None)
+        .await
+        .expect("query contact")
+        .expect("contact exists");
+    assert_eq!(
+        stored_contact.intent_trajectory.len(),
+        1,
+        "only the current owner may append trajectory"
+    );
+    assert_eq!(
+        stored_contact.intent_trajectory[0].intent,
+        "user_replied_buying_signal"
+    );
+
+    let outbox = state
+        .db
+        .collection_agent_send_outbox()
+        .find_one(doc! { "_id": outbox_id }, None)
+        .await
+        .expect("query outbox")
+        .expect("outbox exists");
+    assert_eq!(
+        outbox.status, "pending",
+        "stale stop result must not cancel pending delivery intents"
+    );
+    assert_eq!(provider.calls(), 2);
+
+    app.cleanup().await;
 }

@@ -78,11 +78,7 @@ fn silent_managed(wxid: &str) -> Contact {
 
 /// 直接插入一条原始 BSON `agent_run_logs`，避免重复声明全部字段。
 async fn insert_run_log(app: &common::TestApp, wxid: &str, status: &str) {
-    let raw = app
-        .state
-        .db
-        .raw()
-        .collection::<Document>("agent_run_logs");
+    let raw = app.state.db.raw().collection::<Document>("agent_run_logs");
     raw.insert_one(
         doc! {
             "_id": ObjectId::new(),
@@ -107,7 +103,8 @@ async fn insert_run_log(app: &common::TestApp, wxid: &str, status: &str) {
 #[tokio::test]
 #[ignore]
 async fn planner_silent_segment_skips_when_block_rate_above_threshold() {
-    let app = common::TestApp::start().await;
+    let app = common::TestApp::start_repl_set().await;
+    common::ensure_test_account(&app.state, "default", "default").await;
 
     // 一个 managed + 静默 contact。
     app.state
@@ -198,11 +195,7 @@ async fn planner_silent_segment_skips_when_block_rate_above_threshold() {
     let rate = detail
         .get_f64("blockRate")
         .expect("blockRate field present");
-    assert!(
-        rate >= 0.6,
-        "blockRate {} 应当 >= 0.6 阈值",
-        rate
-    );
+    assert!(rate >= 0.6, "blockRate {} 应当 >= 0.6 阈值", rate);
     let blocked = detail.get_i64("blockedCount").expect("blockedCount");
     let ok = detail.get_i64("okCount").expect("okCount");
     assert_eq!(blocked, 4);
@@ -212,7 +205,8 @@ async fn planner_silent_segment_skips_when_block_rate_above_threshold() {
 #[tokio::test]
 #[ignore]
 async fn planner_silent_segment_passes_when_under_min_runs() {
-    let app = common::TestApp::start().await;
+    let app = common::TestApp::start_repl_set().await;
+    common::ensure_test_account(&app.state, "default", "default").await;
 
     app.state
         .db
@@ -238,7 +232,10 @@ async fn planner_silent_segment_passes_when_under_min_runs() {
         )
         .await
         .expect("count follow_up");
-    assert_eq!(task_count, 1, "min_runs 未达时反馈环不参与判定，应正常 emit");
+    assert_eq!(
+        task_count, 1,
+        "min_runs 未达时反馈环不参与判定，应正常 emit"
+    );
 
     let backoff_events = app
         .state

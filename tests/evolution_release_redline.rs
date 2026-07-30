@@ -42,6 +42,25 @@ async fn insert_eligible_prompt_proposal(
 ) -> ObjectId {
     let id = ObjectId::new();
     let now = DateTime::now();
+    let current = state
+        .db
+        .prompt_templates()
+        .find_one(
+            doc! {
+                "workspace_id": workspace,
+                "prompt_key": key,
+                "current_version": true,
+            },
+            None,
+        )
+        .await
+        .expect("read current prompt template")
+        .expect("current prompt template");
+    let base_revision = wechatagent::evolution::revision::prompt_revision(
+        current.id.expect("current prompt id"),
+        current.version,
+        &current.content,
+    );
     state
         .db
         .raw()
@@ -57,6 +76,7 @@ async fn insert_eligible_prompt_proposal(
                 "proposed_template_key": key,
                 "proposed_section": "policy",
                 "diff_snippet": diff_snippet,
+                "base_revision": base_revision,
                 "created_at": now,
                 "updated_at": now,
             },
@@ -105,17 +125,24 @@ async fn proposal_status(state: &wechatagent::routes::AppState, id: ObjectId) ->
 async fn release_prompt_rejects_forbidden_word_snippet() {
     let app = common::TestApp::start_repl_set().await;
     let workspace = app.state.config.default_workspace_id.clone();
+    let state = common::evolution_release_state(&app, &workspace).await;
 
     let (before_version, before_content) =
-        current_version_snapshot(&app.state, &workspace, TARGET_KEY).await;
+        current_version_snapshot(&state, &workspace, TARGET_KEY).await;
 
     // 末尾追加片段含禁用词 → compose 后过闸 1 必拒。
     let snippet = format!("遇到难题就{}给后台", forbidden_phrase());
     let proposal_id =
-        insert_eligible_prompt_proposal(&app.state, &workspace, TARGET_KEY, &snippet).await;
+        insert_eligible_prompt_proposal(&state, &workspace, TARGET_KEY, &snippet).await;
 
-    let result =
-        wechatagent::evolution::release::release_prompt(&app.state, proposal_id, "admin").await;
+    let result = wechatagent::evolution::release::release_prompt(
+        &state,
+        proposal_id,
+        &workspace,
+        &app.state.config.default_account_id,
+        "admin",
+    )
+    .await;
 
     // 1. 返回 RedlineGateRejected（不是 InvalidStatus / 其它）。
     match result {
@@ -125,13 +152,13 @@ async fn release_prompt_rejects_forbidden_word_snippet() {
 
     // 2. prompt_templates 没有新版本：current 行版本号 + 内容均不变。
     let (after_version, after_content) =
-        current_version_snapshot(&app.state, &workspace, TARGET_KEY).await;
+        current_version_snapshot(&state, &workspace, TARGET_KEY).await;
     assert_eq!(after_version, before_version, "被拒不应写入新版本");
     assert_eq!(after_content, before_content, "被拒不应改动 current 内容");
 
     // 3. proposal.status 仍是 eligible_for_release（未推进 released）。
     assert_eq!(
-        proposal_status(&app.state, proposal_id).await,
+        proposal_status(&state, proposal_id).await,
         "eligible_for_release",
         "被拒的 proposal 不应推进到 released"
     );
@@ -147,21 +174,28 @@ async fn release_prompt_rejects_forbidden_word_snippet() {
 async fn release_prompt_rejects_semantic_violation_snippet() {
     let app = common::TestApp::start_repl_set().await;
     let workspace = app.state.config.default_workspace_id.clone();
+    let state = common::evolution_release_state(&app, &workspace).await;
 
     let (before_version, before_content) =
-        current_version_snapshot(&app.state, &workspace, TARGET_KEY).await;
+        current_version_snapshot(&state, &workspace, TARGET_KEY).await;
 
     // 纯业务措辞（无禁词、原文逐字保留 → 过闸 1+2），靠 mock 让闸 3 判违规。
     let snippet = "补充：遇到复杂情况优先安抚情绪。";
     let proposal_id =
-        insert_eligible_prompt_proposal(&app.state, &workspace, TARGET_KEY, snippet).await;
+        insert_eligible_prompt_proposal(&state, &workspace, TARGET_KEY, snippet).await;
 
     // 闸 3 调一次 generate_agent_json（review_prompt_edit）→ 排一条 violation=true。
     app.llm
         .push_response(json!({ "violation": true, "reason": "变相引入真人转介" }));
 
-    let result =
-        wechatagent::evolution::release::release_prompt(&app.state, proposal_id, "admin").await;
+    let result = wechatagent::evolution::release::release_prompt(
+        &state,
+        proposal_id,
+        &workspace,
+        &app.state.config.default_account_id,
+        "admin",
+    )
+    .await;
 
     match result {
         Err(EvolutionError::RedlineGateRejected(_)) => {}
@@ -169,11 +203,14 @@ async fn release_prompt_rejects_semantic_violation_snippet() {
     }
 
     let (after_version, after_content) =
-        current_version_snapshot(&app.state, &workspace, TARGET_KEY).await;
+        current_version_snapshot(&state, &workspace, TARGET_KEY).await;
     assert_eq!(after_version, before_version, "语义闸拒绝不应写入新版本");
-    assert_eq!(after_content, before_content, "语义闸拒绝不应改动 current 内容");
     assert_eq!(
-        proposal_status(&app.state, proposal_id).await,
+        after_content, before_content,
+        "语义闸拒绝不应改动 current 内容"
+    );
+    assert_eq!(
+        proposal_status(&state, proposal_id).await,
         "eligible_for_release",
         "被语义闸拒绝的 proposal 不应推进到 released"
     );
@@ -188,30 +225,44 @@ async fn release_prompt_rejects_semantic_violation_snippet() {
 async fn release_prompt_accepts_clean_append_snippet() {
     let app = common::TestApp::start_repl_set().await;
     let workspace = app.state.config.default_workspace_id.clone();
+    let state = common::evolution_release_state(&app, &workspace).await;
 
     let (before_version, before_content) =
-        current_version_snapshot(&app.state, &workspace, TARGET_KEY).await;
+        current_version_snapshot(&state, &workspace, TARGET_KEY).await;
 
     let snippet = "补充：本行业语气更稳重。";
     let proposal_id =
-        insert_eligible_prompt_proposal(&app.state, &workspace, TARGET_KEY, snippet).await;
+        insert_eligible_prompt_proposal(&state, &workspace, TARGET_KEY, snippet).await;
 
     // 闸 3 判合规。
     app.llm.push_response(json!({ "violation": false }));
 
-    wechatagent::evolution::release::release_prompt(&app.state, proposal_id, "admin")
-        .await
-        .expect("合法追加片段应放行");
+    wechatagent::evolution::release::release_prompt(
+        &state,
+        proposal_id,
+        &workspace,
+        &app.state.config.default_account_id,
+        "admin",
+    )
+    .await
+    .expect("合法追加片段应放行");
 
     // 新 current 行：version+1，内容 = 原文开头 + 片段结尾（末尾追加语义）。
     let (after_version, after_content) =
-        current_version_snapshot(&app.state, &workspace, TARGET_KEY).await;
-    assert_eq!(after_version, before_version + 1, "放行应写入 version+1 新版本");
+        current_version_snapshot(&state, &workspace, TARGET_KEY).await;
+    assert_eq!(
+        after_version,
+        before_version + 1,
+        "放行应写入 version+1 新版本"
+    );
     assert!(
         after_content.starts_with(before_content.trim_end()),
         "新内容应以原 prompt 正文开头（红线逐字保留）"
     );
-    assert!(after_content.trim_end().ends_with(snippet), "新内容应以追加片段结尾");
+    assert!(
+        after_content.trim_end().ends_with(snippet),
+        "新内容应以追加片段结尾"
+    );
 
     // proposal 推进到 released + 记录被替换的旧版本号。
     let released = app
@@ -222,7 +273,10 @@ async fn release_prompt_accepts_clean_append_snippet() {
         .await
         .unwrap()
         .expect("proposal exists");
-    assert_eq!(released.status, "released", "放行后 proposal 应推进到 released");
+    assert_eq!(
+        released.status, "released",
+        "放行后 proposal 应推进到 released"
+    );
     assert_eq!(
         released.previous_prompt_version.as_deref(),
         Some(before_version.to_string().as_str()),

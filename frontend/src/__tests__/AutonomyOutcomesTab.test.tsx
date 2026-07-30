@@ -46,9 +46,11 @@ type MetricsBody = {
     sent: number;
     canceled: number;
     failedTerminal: number;
+    deliveryUnknown: number;
     sendSuccessRate: number | null;
     canceledRate: number | null;
     failedTerminalRate: number | null;
+    deliveryUnknownRate: number | null;
   };
   planner?: PlannerSection;
 };
@@ -92,9 +94,11 @@ function emptyMetrics(): MetricsBody {
       sent: 0,
       canceled: 0,
       failedTerminal: 0,
+      deliveryUnknown: 0,
       sendSuccessRate: null,
       canceledRate: null,
       failedTerminalRate: null,
+      deliveryUnknownRate: null,
     },
   };
 }
@@ -148,11 +152,11 @@ describe("AutonomyOutcomesTab — 自治回路监控 Tab", () => {
 
     // 7 个 metric card（revisionTrigger / revisionPass / unverifiedClaim /
     // taxonomyCandidate / selfCritiqueAddressed / autonomyAuto / assisted-blocked）
-    // + 3 个 outbox 单元格（sendSuccessRate / canceledRate / failedTerminalRate）
-    // = 10 个独立 "—" 文本节点。HoldBar 三条 bar 的文本是 "—（0 条）"
+    // + 4 个 outbox 单元格（含 deliveryUnknownRate）
+    // = 11 个独立 "—" 文本节点。HoldBar 三条 bar 的文本是 "—（0 条）"
     // 拼成单节点，不计入这里。
     const dashes = screen.getAllByText("—");
-    expect(dashes.length).toBeGreaterThanOrEqual(10);
+    expect(dashes.length).toBeGreaterThanOrEqual(11);
 
     // 单独断言三条 hold bar 也渲染为 dash + 0 条
     expect(screen.getAllByText(/—（0 条）/)).toHaveLength(3);

@@ -70,7 +70,7 @@ fn admin(username: &str, workspace: &str) -> AuthenticatedAdmin {
 #[tokio::test]
 #[ignore = "requires docker (testcontainers mongo)"]
 async fn publish_taxonomy_writes_audit_event_with_admin_identity() {
-    let app = TestApp::start().await;
+    let app = TestApp::start_repl_set().await;
     let coll = app.state.db.collection_system_taxonomies();
 
     let entry = make_entry(
@@ -122,9 +122,20 @@ async fn publish_taxonomy_writes_audit_event_with_admin_identity() {
 #[tokio::test]
 #[ignore = "requires docker (testcontainers mongo)"]
 async fn rollout_taxonomy_writes_audit_event() {
-    let app = TestApp::start().await;
+    let app = TestApp::start_repl_set().await;
     let coll = app.state.db.collection_system_taxonomies();
 
+    let current = make_entry(
+        &app.state.config.default_workspace_id,
+        "intent_level",
+        "orphan4_rollout",
+        2,
+        true,
+        Some(1),
+    );
+    coll.insert_one(&current, None)
+        .await
+        .expect("insert current");
     let entry = make_entry(
         &app.state.config.default_workspace_id,
         "intent_level",
@@ -165,7 +176,7 @@ async fn rollout_taxonomy_writes_audit_event() {
 #[tokio::test]
 #[ignore = "requires docker (testcontainers mongo)"]
 async fn rollback_taxonomy_writes_audit_event_for_restored_version() {
-    let app = TestApp::start().await;
+    let app = TestApp::start_repl_set().await;
     let coll = app.state.db.collection_system_taxonomies();
 
     // 种 v1（历史）+ v2（current，previous_version=1）

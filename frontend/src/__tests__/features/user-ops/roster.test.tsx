@@ -56,7 +56,7 @@ describe("RosterView — 通讯录批量托管视图（Task 8）", () => {
     postMock.mockResolvedValue({ enabled: 2, queued: 2 });
     seedAccount();
     // rosterCache 是 store 单例、跨用例常驻——每例清空，避免上一例的缓存命中污染本例 mock。
-    useUserOpsStore.setState({ rosterCache: {} });
+    useUserOpsStore.setState({ rosterCache: {}, playbooks: [] });
   });
 
   it("渲染全量好友，managed 行不可勾选", async () => {
@@ -104,10 +104,12 @@ describe("RosterView — 通讯录批量托管视图（Task 8）", () => {
       expect(call).toBeTruthy();
       const body = call![1] as {
         accountId: string;
+        source: string;
         candidates: { wxid: string }[];
         sharedNote: string;
       };
       expect(body.accountId).toBe("acc1");
+      expect(body.source).toBe("roster");
       expect(Array.isArray(body.candidates)).toBe(true);
       expect(body.candidates).toHaveLength(2);
       expect(body.candidates.map((c) => c.wxid).sort()).toEqual(["wx_new1", "wx_new2"]);
@@ -245,7 +247,7 @@ describe("RosterView — 通讯录批量托管视图（Task 8）", () => {
     expect(await screen.findByText("好友60")).toBeInTheDocument();
   });
 
-  it("非真人账号默认折叠，真人正常显示，展开后可见", async () => {
+  it("非真人账号默认折叠，展开后只读且不可提交", async () => {
     getMock.mockResolvedValue({
       items: [
         { wxid: "wx_real", nickname: "张三", remark: null, avatarUrl: null, sex: 1, isNonHuman: false, agentStatus: "not_imported" },
@@ -263,6 +265,46 @@ describe("RosterView — 通讯录批量托管视图（Task 8）", () => {
     // 展开后可见。
     await user.click(screen.getByText(/系统账号/).closest("button") as HTMLButtonElement);
     expect(await screen.findByText("朋友推荐消息")).toBeInTheDocument();
+    const systemCard = screen.getByText("朋友推荐消息").closest("button");
+    expect(systemCard).toBeDisabled();
+    await user.click(systemCard as HTMLButtonElement);
+    expect(screen.queryByText(/已选 1 人/)).not.toBeInTheDocument();
+  });
+
+  it("批量托管的 Playbook 下拉不展示 AI 草稿", async () => {
+    useUserOpsStore.setState({
+      playbooks: [
+        {
+          id: "published-playbook",
+          accountId: "acc1",
+          name: "已发布方法",
+          methodPrompt: "published",
+          createdBy: "manual",
+          releaseStatus: "published",
+          isDefault: false,
+          version: 1,
+        },
+        {
+          id: "draft-playbook",
+          accountId: "acc1",
+          name: "AI 草稿方法",
+          methodPrompt: "draft",
+          createdBy: "agent",
+          releaseStatus: "draft",
+          isDefault: false,
+          version: 1,
+        },
+      ],
+    });
+    const user = userEvent.setup();
+    render(
+      <ToastProvider>
+        <RosterView />
+      </ToastProvider>
+    );
+    await user.click((await screen.findByText("新好友一")).closest("button") as HTMLButtonElement);
+    expect(screen.getByRole("option", { name: "已发布方法" })).toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: "AI 草稿方法" })).not.toBeInTheDocument();
   });
 
   it("二次 loadRoster 命中缓存不重复请求，force 才重拉", async () => {

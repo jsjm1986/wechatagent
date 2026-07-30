@@ -192,7 +192,10 @@ fn revision_id_unique() {
     let mut seen = BTreeSet::new();
     for _ in 0..1000 {
         let revision_id = format!("rev_{}_{}", chunk_id, uuid::Uuid::new_v4().simple());
-        assert!(seen.insert(revision_id), "duplicate revision id within 1000 generations");
+        assert!(
+            seen.insert(revision_id),
+            "duplicate revision id within 1000 generations"
+        );
     }
 }
 

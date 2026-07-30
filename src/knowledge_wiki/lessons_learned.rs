@@ -63,7 +63,7 @@ pub async fn aggregate_lessons_for_workspace(
 
     let mut report = LessonsAggregateReport::default();
     let profile =
-        crate::agent::domain_profile::load_active_domain_profile(&state.db, workspace_id).await;
+        crate::agent::domain_profile::load_active_domain_profile(&state.db, workspace_id).await?;
     let (positive_outcomes, _) =
         super::gap_signals::resolve_effective_polarity(&profile.outcome_polarity);
 

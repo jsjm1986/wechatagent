@@ -13,60 +13,300 @@
 //! 全部默认 `#[ignore]`，需要 Docker（testcontainers MongoDB）；CI 用
 //! `cargo test --test run_envelope_integration -- --ignored` 触发。
 //!
-//! NOTE：用例 4 在 W1 task 2.5 把 gateway 入口改造完成后真正可端到端验证；
-//! 当前实现里 gateway 还没接入 `catch_unwind` 包装层，因此 4 用 `update_run_envelope_terminal`
-//! 直接模拟 panic-hook 推进 lifecycle 的等价语义（写入 `failed_before_decision` +
-//! `error_summary="unhandled_panic: ..."` 后断言能正确读回）。
-
 mod common;
 
-use mongodb::bson::doc;
-use wechatagent::agent::run_envelope::{
-    is_valid_lifecycle_transition, update_run_envelope_terminal, write_run_envelope_started,
-    AgentRunLogTerminalFields, EVENT_RUN_ENVELOPE_RECOVERED_VIA_INSERT,
-    LIFECYCLE_FAILED_BEFORE_DECISION, LIFECYCLE_STARTED, SOURCE_KIND_INBOUND_MESSAGE,
+use std::{
+    panic::AssertUnwindSafe,
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    },
 };
+
+use async_trait::async_trait;
+use futures::FutureExt;
+use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
+use serde_json::Value;
+use wechatagent::agent::handle_managed_message;
+use wechatagent::agent::run_envelope::{
+    update_run_envelope_terminal, write_run_envelope_started, AgentRunLogTerminalFields,
+    EVENT_RUN_ENVELOPE_RECOVERED_VIA_INSERT, LIFECYCLE_FAILED_AFTER_DECISION,
+    LIFECYCLE_FAILED_BEFORE_DECISION, LIFECYCLE_RUNNING, LIFECYCLE_STARTED,
+    SOURCE_KIND_INBOUND_MESSAGE,
+};
+use wechatagent::db::Database;
+use wechatagent::error::{AppError, AppResult};
+use wechatagent::llm::{ChatUsage, LlmJsonResult, LlmProvider};
+use wechatagent::models::{AgentStatus, Contact, ConversationMessage, MessageDirection};
+
+#[derive(Clone, Copy)]
+enum ProbeOutcome {
+    Error,
+    Panic,
+}
+
+struct EnvelopeOrderProbeLlm {
+    db: Database,
+    source_event_id: String,
+    saw_started: Arc<AtomicBool>,
+    outcome: ProbeOutcome,
+}
+
+impl EnvelopeOrderProbeLlm {
+    async fn observe_then_stop(&self) -> AppResult<()> {
+        let saw_started = self
+            .db
+            .agent_run_logs()
+            .find_one(
+                doc! {
+                    "source_event_id": &self.source_event_id,
+                    "lifecycle": LIFECYCLE_STARTED,
+                },
+                None,
+            )
+            .await?
+            .is_some();
+        self.saw_started.store(saw_started, Ordering::SeqCst);
+        match self.outcome {
+            ProbeOutcome::Error => Err(AppError::External("probe llm failure".to_string())),
+            ProbeOutcome::Panic => panic!("probe llm panic"),
+        }
+    }
+}
+
+#[async_trait]
+impl LlmProvider for EnvelopeOrderProbeLlm {
+    async fn generate_json(&self, _system: &str, _user: &str) -> AppResult<Value> {
+        self.observe_then_stop().await?;
+        unreachable!("probe provider always stops")
+    }
+
+    async fn generate_json_with_usage(
+        &self,
+        _system: &str,
+        _user: &str,
+    ) -> AppResult<LlmJsonResult> {
+        self.observe_then_stop().await?;
+        unreachable!("probe provider always stops")
+    }
+}
+
+struct DecisionThenPanicProbeLlm {
+    db: Database,
+    source_event_id: String,
+    call_count: AtomicUsize,
+    saw_running: Arc<AtomicBool>,
+}
+
+impl DecisionThenPanicProbeLlm {
+    async fn next_value(&self) -> AppResult<Value> {
+        let call = self.call_count.fetch_add(1, Ordering::SeqCst);
+        if call == 0 {
+            return Ok(serde_json::json!({
+                "decisionPhase": "final",
+                "userUnderstanding": "客户希望了解方案，当前需求清晰。",
+                "relationshipRead": "客户处于初步咨询阶段，沟通氛围正常。",
+                "operationGoal": "先回应核心问题并确认下一步需求。",
+                "knowledgeNeedReason": "当前回复不需要额外产品事实。",
+                "memoryUpdateReason": "本轮没有必须写入长期记忆的新事实。",
+                "selfCritique": "保持简洁，不做未经验证的承诺。",
+                "whyShouldReply": "客户提出了明确问题，需要及时回应。",
+                "whySkipReply": "",
+                "riskSelfCheck": "不涉及价格、效果或隐私承诺。",
+                "riskLevel": "medium",
+                "knowledgeNeed": "not_required",
+                "runMode": "fast_chat",
+                "autonomyMode": "auto",
+                "needsReview": true,
+                "consolidationNeeded": false,
+                "operationState": "need_discovery",
+                "shouldReply": true,
+                "replyText": "可以，我先按你的场景梳理一下方案。",
+                "usedKnowledgeIds": [],
+                "conversationMode": "consultative",
+                "conversationModeReason": "客户正在咨询方案，采用顾问式回应。"
+            }));
+        }
+
+        let saw_running = self
+            .db
+            .agent_run_logs()
+            .find_one(
+                doc! {
+                    "source_event_id": &self.source_event_id,
+                    "lifecycle": LIFECYCLE_RUNNING,
+                },
+                None,
+            )
+            .await?
+            .is_some();
+        self.saw_running.store(saw_running, Ordering::SeqCst);
+        panic!("probe review panic after decision")
+    }
+}
+
+#[async_trait]
+impl LlmProvider for DecisionThenPanicProbeLlm {
+    async fn generate_json(&self, _system: &str, _user: &str) -> AppResult<Value> {
+        self.next_value().await
+    }
+
+    async fn generate_json_with_usage(
+        &self,
+        _system: &str,
+        _user: &str,
+    ) -> AppResult<LlmJsonResult> {
+        Ok(LlmJsonResult {
+            value: self.next_value().await?,
+            usage: ChatUsage::default(),
+            latency_ms: 0,
+            model: "decision-then-panic-probe".to_string(),
+            retry_count: 0,
+        })
+    }
+}
+
+fn managed_contact(wxid: &str) -> Contact {
+    let now = DateTime::now();
+    Contact {
+        id: Some(ObjectId::new()),
+        workspace_id: "default".to_string(),
+        account_id: "default".to_string(),
+        wxid: wxid.to_string(),
+        nickname: Some("信封测试联系人".to_string()),
+        remark: None,
+        alias: None,
+        avatar_url: None,
+        sex: None,
+        agent_status: AgentStatus::Managed,
+        human_profile_note: None,
+        custom_agent_instructions: None,
+        operation_mode_override: None,
+        agent_profile: None,
+        memory_summary: None,
+        playbook_id: None,
+        playbook_version: None,
+        manual_tags: Vec::new(),
+        manual_tags_updated_at: None,
+        manual_tags_by: None,
+        confirmed_tags: Vec::new(),
+        bayesian_signals: Vec::new(),
+        personality_profile: None,
+        tags_version: 0,
+        domain_attributes: None,
+        domain_attributes_updated_at: None,
+        commitments: Vec::new(),
+        follow_up_policy: None,
+        operation_state: Some("need_discovery".to_string()),
+        operation_state_reason: None,
+        operation_state_confidence: Some(7),
+        operation_state_updated_at: None,
+        cooldown_until: None,
+        operation_policy: Document::new(),
+        profile_attributes: Document::new(),
+        profile_updated_at: None,
+        last_message_at: Some(now),
+        last_inbound_at: Some(now),
+        last_outbound_at: None,
+        last_agent_run_at: None,
+        last_outbound_style: None,
+        intent_trajectory: Vec::new(),
+        outcome_events: Vec::new(),
+        locale: None,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+fn inbound(contact: &Contact, message_id: &str) -> ConversationMessage {
+    ConversationMessage {
+        id: Some(ObjectId::new()),
+        workspace_id: contact.workspace_id.clone(),
+        account_id: contact.account_id.clone(),
+        contact_wxid: contact.wxid.clone(),
+        message_id: Some(message_id.to_string()),
+        dedupe_key: None,
+        direction: MessageDirection::Inbound,
+        content: "请介绍一下方案".to_string(),
+        msg_type: None,
+        media_ref: None,
+        raw: None,
+        is_synthetic_relay: false,
+        created_at: DateTime::now(),
+    }
+}
+
+async fn state_with_probe(
+    app: &common::TestApp,
+    source_event_id: &str,
+    outcome: ProbeOutcome,
+) -> (wechatagent::routes::AppState, Arc<AtomicBool>) {
+    let saw_started = Arc::new(AtomicBool::new(false));
+    let probe: Arc<dyn LlmProvider> = Arc::new(EnvelopeOrderProbeLlm {
+        db: app.state.db.clone(),
+        source_event_id: source_event_id.to_string(),
+        saw_started: saw_started.clone(),
+        outcome,
+    });
+    let state =
+        common::rebuild_app_state_with_real_llm(app, probe, app.state.config.mcp_base_url.clone());
+    (state, saw_started)
+}
 
 #[tokio::test]
 #[ignore]
 async fn envelope_started_written_before_any_llm_call() {
-    // R0.1 / R0.5 / R0.10.a：先调 write_run_envelope_started，再尝试 LLM 调用
-    // （这里不调真实 LLM，断言"信封已落库"即满足 R0.10.a 的不变量）。
     let app = common::TestApp::start().await;
+    let contact = managed_contact("wxid_envelope_order");
+    let inbound = inbound(&contact, "evt_inbound_order");
+    app.state
+        .db
+        .contacts()
+        .insert_one(&contact, None)
+        .await
+        .expect("insert contact");
+    app.state
+        .db
+        .messages()
+        .insert_one(&inbound, None)
+        .await
+        .expect("insert inbound");
+    let (state, saw_started) =
+        state_with_probe(&app, "evt_inbound_order", ProbeOutcome::Error).await;
 
-    let run_id = "run_envelope_first_test";
-    write_run_envelope_started(
-        &app.state.db,
-        run_id,
-        &app.state.config.default_workspace_id,
-        &app.state.config.default_account_id,
-        Some("wxid_test"),
-        "evt_inbound_001",
-        SOURCE_KIND_INBOUND_MESSAGE,
-        "reply",
-    )
-    .await
-    .expect("envelope insert SHALL succeed before any LLM call");
+    let result = handle_managed_message(&state, contact.clone(), &inbound).await;
+    assert!(result.is_err(), "probe LLM failure must propagate");
+    assert!(
+        saw_started.load(Ordering::SeqCst),
+        "LLM invocation must observe the started envelope already persisted"
+    );
 
     let log = app
         .state
         .db
         .agent_run_logs()
-        .find_one(doc! { "run_id": run_id }, None)
+        .find_one(doc! { "source_event_id": "evt_inbound_order" }, None)
         .await
         .expect("query agent_run_logs")
         .expect("envelope record present");
 
-    assert_eq!(log.lifecycle, LIFECYCLE_STARTED);
-    assert_eq!(log.run_id, run_id);
-    assert_eq!(log.source_event_id, "evt_inbound_001");
+    assert_eq!(log.lifecycle, LIFECYCLE_FAILED_BEFORE_DECISION);
+    assert_eq!(log.status, "internal_error");
+    assert_eq!(log.source_event_id, "evt_inbound_order");
     assert_eq!(log.source_kind, SOURCE_KIND_INBOUND_MESSAGE);
-    // gateway_status 占位为 "pending"
-    assert_eq!(
-        log.gateway_result.get_str("gatewayStatus").ok(),
-        Some("pending")
-    );
-    assert_eq!(log.final_review_status, "");
+    assert!(log
+        .error_summary
+        .as_deref()
+        .unwrap_or_default()
+        .contains("probe llm failure"));
+    let count = app
+        .state
+        .db
+        .agent_run_logs()
+        .count_documents(doc! { "source_event_id": "evt_inbound_order" }, None)
+        .await
+        .expect("count run logs");
+    assert_eq!(count, 1, "terminal write must update the original envelope");
 }
 
 #[tokio::test]
@@ -108,8 +348,7 @@ async fn same_run_id_second_insert_triggers_duplicate_key_error() {
     );
     let err_msg = format!("{:?}", result.unwrap_err());
     assert!(
-        err_msg.to_lowercase().contains("duplicate")
-            || err_msg.to_lowercase().contains("e11000"),
+        err_msg.to_lowercase().contains("duplicate") || err_msg.to_lowercase().contains("e11000"),
         "错误信息 SHALL 含 duplicate 关键字, err={}",
         err_msg
     );
@@ -169,51 +408,35 @@ async fn update_one_falls_back_to_insert_with_recovery_event() {
 #[tokio::test]
 #[ignore]
 async fn panic_in_pipeline_marks_lifecycle_failed_before_decision() {
-    // R0.6：catch_unwind 包装层 panic → update lifecycle = failed_before_decision +
-    // error_summary 非空。当前 W1 task 2.5 还在并行编写，gateway 入口尚未接入
-    // catch_unwind 包装；这里直接调用 update_run_envelope_terminal 模拟 panic-hook
-    // 在捕获 panic 后写库的等价语义。
     let app = common::TestApp::start().await;
+    let contact = managed_contact("wxid_envelope_panic");
+    let inbound = inbound(&contact, "evt_inbound_panic");
+    app.state
+        .db
+        .contacts()
+        .insert_one(&contact, None)
+        .await
+        .expect("insert contact");
+    app.state
+        .db
+        .messages()
+        .insert_one(&inbound, None)
+        .await
+        .expect("insert inbound");
+    let (state, saw_started) =
+        state_with_probe(&app, "evt_inbound_panic", ProbeOutcome::Panic).await;
 
-    let run_id = "run_envelope_panic_test";
-    write_run_envelope_started(
-        &app.state.db,
-        run_id,
-        &app.state.config.default_workspace_id,
-        &app.state.config.default_account_id,
-        Some("wxid_panic"),
-        "evt_panic_001",
-        SOURCE_KIND_INBOUND_MESSAGE,
-        "reply",
-    )
-    .await
-    .expect("envelope insert");
-
-    // 模拟 catch_unwind 包装层捕获到 panic，按 R0.6 把 lifecycle 推进。
-    // 同时验证 lifecycle FSM 允许 started → failed_before_decision。
-    assert!(is_valid_lifecycle_transition(
-        LIFECYCLE_STARTED,
-        LIFECYCLE_FAILED_BEFORE_DECISION
-    ));
-
-    let panic_message = "Reply Agent panicked at decision.rs:42 — divide by zero";
-    update_run_envelope_terminal(
-        &app.state.db,
-        run_id,
-        AgentRunLogTerminalFields {
-            lifecycle: Some(LIFECYCLE_FAILED_BEFORE_DECISION.to_string()),
-            error_summary: Some(format!("unhandled_panic: {}", panic_message)),
-            ..Default::default()
-        },
-    )
-    .await
-    .expect("update lifecycle on panic");
+    let result = AssertUnwindSafe(handle_managed_message(&state, contact, &inbound))
+        .catch_unwind()
+        .await;
+    assert!(result.is_err(), "gateway must preserve panic propagation");
+    assert!(saw_started.load(Ordering::SeqCst));
 
     let log = app
         .state
         .db
         .agent_run_logs()
-        .find_one(doc! { "run_id": run_id }, None)
+        .find_one(doc! { "source_event_id": "evt_inbound_panic" }, None)
         .await
         .expect("query agent_run_logs")
         .expect("envelope present");
@@ -221,9 +444,81 @@ async fn panic_in_pipeline_marks_lifecycle_failed_before_decision() {
     assert!(
         log.error_summary
             .as_deref()
-            .map(|s| s.starts_with("unhandled_panic:") && !s.is_empty())
+            .map(|s| s == "unhandled_panic: probe llm panic")
             .unwrap_or(false),
-        "error_summary SHALL 以 'unhandled_panic:' 开头且非空, actual={:?}",
+        "error_summary must retain panic payload, actual={:?}",
         log.error_summary
     );
+}
+
+#[tokio::test]
+#[ignore]
+async fn panic_after_reply_decision_marks_lifecycle_failed_after_decision() {
+    let app = common::TestApp::start().await;
+    let contact = managed_contact("wxid_envelope_after_decision");
+    let inbound = inbound(&contact, "evt_inbound_after_decision");
+    app.state
+        .db
+        .contacts()
+        .insert_one(&contact, None)
+        .await
+        .expect("insert contact");
+    app.state
+        .db
+        .messages()
+        .insert_one(&inbound, None)
+        .await
+        .expect("insert inbound");
+
+    let saw_running = Arc::new(AtomicBool::new(false));
+    let probe: Arc<dyn LlmProvider> = Arc::new(DecisionThenPanicProbeLlm {
+        db: app.state.db.clone(),
+        source_event_id: "evt_inbound_after_decision".to_string(),
+        call_count: AtomicUsize::new(0),
+        saw_running: saw_running.clone(),
+    });
+    let state =
+        common::rebuild_app_state_with_real_llm(&app, probe, app.state.config.mcp_base_url.clone());
+
+    let result = AssertUnwindSafe(handle_managed_message(&state, contact, &inbound))
+        .catch_unwind()
+        .await;
+    assert!(result.is_err(), "review panic must propagate");
+    assert!(
+        saw_running.load(Ordering::SeqCst),
+        "review invocation must observe started → running after Reply decision"
+    );
+
+    let log = app
+        .state
+        .db
+        .agent_run_logs()
+        .find_one(
+            doc! { "source_event_id": "evt_inbound_after_decision" },
+            None,
+        )
+        .await
+        .expect("query agent_run_logs")
+        .expect("envelope present");
+    assert_eq!(log.lifecycle, LIFECYCLE_FAILED_AFTER_DECISION);
+    assert_eq!(log.status, "internal_error");
+    assert_eq!(
+        log.error_summary.as_deref(),
+        Some("unhandled_panic: probe review panic after decision")
+    );
+    assert!(
+        !log.decision.is_empty(),
+        "running transition stores decision snapshot"
+    );
+    let count = app
+        .state
+        .db
+        .agent_run_logs()
+        .count_documents(
+            doc! { "source_event_id": "evt_inbound_after_decision" },
+            None,
+        )
+        .await
+        .expect("count run logs");
+    assert_eq!(count, 1, "failure must close the original envelope");
 }

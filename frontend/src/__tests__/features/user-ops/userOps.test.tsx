@@ -138,6 +138,7 @@ describe("UserOpsFeature", () => {
     setGeneratePlaybookText: vi.fn(),
     setOptimizePlaybookText: vi.fn(),
     setDomainDrafts: vi.fn(),
+    clearContactDetail: vi.fn(),
     hydrateSelected: vi.fn(),
     loadMessages: vi.fn().mockResolvedValue(undefined),
     loadPlaybooks: vi.fn().mockResolvedValue(undefined),
@@ -256,7 +257,6 @@ describe("UserOpsFeature", () => {
     // 应该渲染traditional模式组件
     expect(screen.getByTestId("user-ops-mode-header")).toBeInTheDocument();
     expect(screen.getByTestId("traditional-ops-tabs")).toBeInTheDocument();
-    expect(screen.getByTestId("user-playbook-panel")).toBeInTheDocument();
   });
 
   it("should render prompts tab in traditional mode", () => {

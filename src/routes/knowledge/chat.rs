@@ -5,23 +5,126 @@ use axum::{
     Extension, Json,
 };
 use futures::TryStreamExt;
-use mongodb::bson::{doc, oid::ObjectId, Bson, DateTime, Document};
-use serde::Deserialize;
+use mongodb::{
+    bson::{doc, oid::ObjectId, Bson, DateTime, Document},
+    ClientSession,
+};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::agent;
 use crate::auth::AuthenticatedAdmin;
 use crate::error::{AppError, AppResult};
-use crate::agent;
 
 use super::super::shared::*;
 use super::super::AppState;
 use super::*;
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatAttachmentOperation {
+    Update,
+}
+
+fn forced_chat_intent(operation: Option<ChatAttachmentOperation>) -> Option<&'static str> {
+    match operation {
+        Some(ChatAttachmentOperation::Update) => Some("update_chunk"),
+        None => None,
+    }
+}
+
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ChatAttachment {
     pub chunk_id: Option<String>,
     pub item_id: Option<String>,
+    #[serde(default)]
+    pub expected_updated_at: Option<String>,
+    #[serde(default)]
+    pub operation: Option<ChatAttachmentOperation>,
+}
+
+fn parse_expected_chunk_updated_at(value: &str) -> AppResult<DateTime> {
+    DateTime::parse_rfc3339_str(value.trim()).map_err(|_| {
+        AppError::BadRequest("attachments.expectedUpdatedAt must be RFC3339".to_string())
+    })
+}
+
+async fn freeze_chat_chunk_attachments(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+    attachments: &mut [ChatAttachment],
+) -> AppResult<()> {
+    for attachment in attachments {
+        if attachment.operation.is_some()
+            && attachment
+                .chunk_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_none()
+        {
+            return Err(AppError::BadRequest(
+                "attachments.operation requires chunkId".to_string(),
+            ));
+        }
+        let Some(chunk_id) = attachment
+            .chunk_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let object_id = parse_object_id(chunk_id)?;
+        let chunk = state
+            .db
+            .operation_knowledge_chunks()
+            .find_one(
+                doc! {
+                    "_id": object_id,
+                    "workspace_id": workspace_id,
+                    "domain": "user_operations",
+                    "$or": [
+                        { "account_id": null },
+                        { "account_id": account_id },
+                    ],
+                },
+                None,
+            )
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("chunk {chunk_id} not found")))?;
+        if let Some(expected) = attachment.expected_updated_at.as_deref() {
+            let expected = parse_expected_chunk_updated_at(expected)?;
+            if expected.timestamp_millis() != chunk.updated_at.timestamp_millis() {
+                return Err(AppError::Conflict("chat_chunk_snapshot_stale".to_string()));
+            }
+        }
+        attachment.expected_updated_at =
+            Some(chunk.updated_at.try_to_rfc3339_string().map_err(|error| {
+                AppError::External(format!("serialize chunk updated_at failed: {error}"))
+            })?);
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DigestSelectedCardBinding {
+    pub card_id: String,
+    pub card_hash: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DigestSelectionBinding {
+    pub account_id: String,
+    pub report_id: String,
+    pub report_date: String,
+    pub report_generation: i64,
+    pub report_hash: String,
+    pub selected_cards: Vec<DigestSelectedCardBinding>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -37,18 +140,21 @@ pub struct ChatTurnRequest {
     /// 引用的切片 / 知识包；本轮只取第 1 条（≤ 1 attachments）。
     #[serde(default)]
     pub attachments: Vec<ChatAttachment>,
+    /// SR-125: explicit operator-selected digest snapshot. Without this
+    /// binding a digest_action turn may explain how to select cards, but it
+    /// cannot produce an executable dispatch candidate.
+    #[serde(default)]
+    pub digest_selection: Option<DigestSelectionBinding>,
 }
 
 pub async fn chat_turn(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
-    Json(body): Json<ChatTurnRequest>,
+    Json(mut body): Json<ChatTurnRequest>,
 ) -> AppResult<Json<Value>> {
     let trimmed = body.content.trim();
     if trimmed.is_empty() {
-        return Err(AppError::BadRequest(
-            "content cannot be empty".to_string(),
-        ));
+        return Err(AppError::BadRequest("content cannot be empty".to_string()));
     }
     let session_id = body
         .session_id
@@ -61,6 +167,22 @@ pub async fn chat_turn(
         .account_id
         .clone()
         .unwrap_or_else(|| state.config.default_account_id.clone());
+    validate_account(&state, &admin.current_workspace, &account_id).await?;
+    freeze_chat_chunk_attachments(
+        &state,
+        &admin.current_workspace,
+        &account_id,
+        &mut body.attachments,
+    )
+    .await?;
+    ensure_chat_session_identity(
+        &state,
+        &admin.current_workspace,
+        &account_id,
+        &session_id,
+        &admin.user_id,
+    )
+    .await?;
     let operator_id = body
         .operator_id
         .as_deref()
@@ -70,17 +192,22 @@ pub async fn chat_turn(
         .unwrap_or_else(|| "default".to_string());
 
     // 加载历史 turns（按 turn_index 升序）
-    let history = load_chat_history(&state, &admin.current_workspace, &account_id, &session_id).await?;
+    let history =
+        load_chat_history(&state, &admin.current_workspace, &account_id, &session_id).await?;
     // P1-7：原子预分配两个 turn_index——user turn + assistant turn，避免并发
     // 写者读到同一 last 制造重复索引。返回的是分配后的最大 seq；user 拿
     // `assistant_index - 1`、assistant 拿 `assistant_index`。
-    let assistant_index =
-        allocate_next_turn_indices(&state, &admin.current_workspace, &session_id, 2).await?;
+    let assistant_index = allocate_next_turn_indices(
+        &state,
+        &admin.current_workspace,
+        &account_id,
+        &session_id,
+        &admin.user_id,
+        2,
+    )
+    .await?;
     let next_index = assistant_index - 1;
-    let assistant_turns_so_far = history
-        .iter()
-        .filter(|t| t.role == "assistant")
-        .count() as i32;
+    let assistant_turns_so_far = history.iter().filter(|t| t.role == "assistant").count() as i32;
     if assistant_turns_so_far >= CHAT_MAX_TURNS_PER_SESSION {
         return Err(AppError::BadRequest(format!(
             "session {session_id} 已达 {CHAT_MAX_TURNS_PER_SESSION} 轮上限，请「应用为草稿」或开启新会话"
@@ -98,6 +225,7 @@ pub async fn chat_turn(
         None,
         trimmed,
         &body.attachments,
+        &[],
         None,
         &[],
         &[],
@@ -111,6 +239,10 @@ pub async fn chat_turn(
     let chunk_attached = attachment
         .and_then(|a| a.chunk_id.as_deref())
         .filter(|s| !s.trim().is_empty());
+    let chunk_expected_updated_at = attachment
+        .and_then(|a| a.expected_updated_at.as_deref())
+        .filter(|s| !s.trim().is_empty());
+    let chunk_operation = attachment.and_then(|a| a.operation);
     let item_attached = attachment
         .and_then(|a| a.item_id.as_deref())
         .filter(|s| !s.trim().is_empty());
@@ -133,7 +265,10 @@ pub async fn chat_turn(
                 &session_id,
                 trimmed,
                 chunk_attached,
+                chunk_expected_updated_at,
+                chunk_operation,
                 item_attached,
+                body.digest_selection.as_ref(),
                 &history,
             )
             .await
@@ -157,11 +292,11 @@ pub async fn chat_turn(
         .map(|arr| {
             arr.iter()
                 .filter_map(|x| {
-                    x.as_str()
-                        .map(|s| s.to_string())
-                        .or_else(|| {
-                            x.get("field").and_then(|f| f.as_str()).map(|s| s.to_string())
-                        })
+                    x.as_str().map(|s| s.to_string()).or_else(|| {
+                        x.get("field")
+                            .and_then(|f| f.as_str())
+                            .map(|s| s.to_string())
+                    })
                 })
                 .collect()
         })
@@ -190,15 +325,16 @@ pub async fn chat_turn(
         .get("promptKey")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    // knowledge-digest-workstation Phase 4 / P4.4：digest_action intent 命中时
-    // LLM 出 plannedSteps + estimatedLlmCalls，转发给前端弹「派工确认」小卡。
+    // SR-125：digest_action 返回的是后端按日报权威卡片重建的候选；
+    // action / summary / target 均不再来自 LLM 或客户端。
     let planned_steps = result.get("plannedSteps").cloned();
-    let estimated_llm_calls = result
-        .get("estimatedLlmCalls")
-        .and_then(|v| v.as_i64());
-    let can_apply = patch.is_some()
-        && missing_fields.is_empty()
-        && draft_kind.is_some();
+    let estimated_llm_calls = result.get("estimatedLlmCalls").and_then(|v| v.as_i64());
+    let digest_selection = result.get("digestSelection").cloned();
+    let candidate_hash = result
+        .get("candidateHash")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let can_apply = patch.is_some() && missing_fields.is_empty() && draft_kind.is_some();
     let tokens_used = budget.snapshot().tokens_used;
 
     // 写 assistant turn
@@ -206,12 +342,54 @@ pub async fn chat_turn(
         (Some(c), _) => vec![ChatAttachment {
             chunk_id: Some(c.clone()),
             item_id: None,
+            expected_updated_at: result
+                .get("expectedUpdatedAt")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .or_else(|| {
+                    body.attachments
+                        .iter()
+                        .find(|attachment| attachment.chunk_id.as_deref() == Some(c.as_str()))
+                        .and_then(|attachment| attachment.expected_updated_at.clone())
+                }),
+            operation: body
+                .attachments
+                .iter()
+                .find(|attachment| attachment.chunk_id.as_deref() == Some(c.as_str()))
+                .and_then(|attachment| attachment.operation),
         }],
         (None, Some(p)) => vec![ChatAttachment {
             chunk_id: None,
             item_id: Some(p.clone()),
+            expected_updated_at: None,
+            operation: None,
         }],
         _ => body.attachments,
+    };
+    let candidate_attachment = match (
+        digest_selection.as_ref(),
+        candidate_hash.as_deref(),
+        planned_steps.as_ref(),
+    ) {
+        (Some(selection), Some(hash), Some(Value::Array(steps))) if !steps.is_empty() => {
+            let selection_doc = bson_from_json(selection).map_err(|error| {
+                AppError::Conflict(format!("digest_dispatch_candidate_invalid: {error}"))
+            })?;
+            let step_docs = steps
+                .iter()
+                .map(bson_from_json)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| {
+                    AppError::Conflict(format!("digest_dispatch_candidate_invalid: {error}"))
+                })?;
+            vec![doc! {
+                "kind": "digest_dispatch_candidate",
+                "candidateHash": hash,
+                "digestSelection": selection_doc,
+                "plannedSteps": step_docs,
+            }]
+        }
+        _ => Vec::new(),
     };
 
     write_chat_turn(
@@ -224,6 +402,7 @@ pub async fn chat_turn(
         Some(&intent),
         &natural_reply,
         &attachments_for_assistant,
+        &candidate_attachment,
         patch.as_ref(),
         &missing_fields,
         &followups,
@@ -288,9 +467,7 @@ pub async fn chat_turn(
         &admin.current_workspace,
         &account_id,
         "knowledge_chat_turn",
-        format!(
-            "AI 对话补完 sessionId={session_id} 第 {assistant_index} 轮 intent={intent}"
-        ),
+        format!("AI 对话补完 sessionId={session_id} 第 {assistant_index} 轮 intent={intent}"),
         doc! {
             "kind": "chunk_chat_session",
             "sessionId": &session_id,
@@ -314,21 +491,39 @@ pub async fn chat_turn(
         "draftPreview": patch,
         "plannedSteps": planned_steps,
         "estimatedLlmCalls": estimated_llm_calls,
+        "digestSelection": digest_selection,
+        "candidateHash": candidate_hash,
         "missingFields": missing_fields,
         "followupQuestions": followups,
         "canApply": can_apply,
         "targetChunkId": target_chunk_id,
         "targetPackId": target_pack_id,
+        "expectedUpdatedAt": result.get("expectedUpdatedAt").cloned(),
         "promptKey": prompt_key,
         "tokensUsed": tokens_used,
         "budget": budget_document(&budget),
     })))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::routes) struct ChatSessionScopeQuery {
+    pub account_id: Option<String>,
+}
+
+fn expected_chat_account(account_id: Option<&str>, default_account_id: &str) -> String {
+    account_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(default_account_id)
+        .to_string()
+}
+
 pub(in crate::routes) async fn chat_history(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
     Path(session_id): Path<String>,
+    Query(query): Query<ChatSessionScopeQuery>,
 ) -> AppResult<Json<Value>> {
     let trimmed = session_id.trim();
     if trimmed.is_empty() {
@@ -336,15 +531,31 @@ pub(in crate::routes) async fn chat_history(
             "sessionId cannot be empty".to_string(),
         ));
     }
+    let account_id = expected_chat_account(
+        query.account_id.as_deref(),
+        &state.config.default_account_id,
+    );
+    validate_account(&state, &admin.current_workspace, &account_id).await?;
+    require_chat_session_identity(
+        &state,
+        &admin.current_workspace,
+        &account_id,
+        trimmed,
+        &admin.user_id,
+    )
+    .await?;
     let mut cursor = state
         .db
         .knowledge_chat_turns()
         .find(
             doc! {
                 "workspace_id": &admin.current_workspace,
+                "account_id": &account_id,
                 "session_id": trimmed,
             },
-            FindOptions::builder().sort(doc! { "turn_index": 1 }).build(),
+            FindOptions::builder()
+                .sort(doc! { "turn_index": 1 })
+                .build(),
         )
         .await?;
     let mut items: Vec<Value> = vec![];
@@ -376,93 +587,206 @@ pub async fn chat_apply(
             "sessionId cannot be empty".to_string(),
         ));
     }
-    let history = load_chat_history(&state, &admin.current_workspace, "*", &trimmed).await?;
+    let account_id =
+        expected_chat_account(body.account_id.as_deref(), &state.config.default_account_id);
+    validate_account(&state, &admin.current_workspace, &account_id).await?;
+    require_chat_session_identity(
+        &state,
+        &admin.current_workspace,
+        &account_id,
+        &trimmed,
+        &admin.user_id,
+    )
+    .await?;
+    const MAX_TRANSACTION_ATTEMPTS: usize = 3;
+    for attempt in 0..MAX_TRANSACTION_ATTEMPTS {
+        match chat_apply_once(&state, &admin, &account_id, &trimmed).await {
+            Ok(receipt) => return Ok(Json(receipt)),
+            Err(error)
+                if attempt + 1 < MAX_TRANSACTION_ATTEMPTS
+                    && is_transient_chat_apply_error(&error) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(AppError::Conflict(
+        "chat_apply_transaction_conflict".to_string(),
+    ))
+}
+
+fn is_transient_chat_apply_error(error: &AppError) -> bool {
+    matches!(
+        error,
+        AppError::Db(db_error) if db_error.contains_label("TransientTransactionError")
+    )
+}
+
+async fn chat_apply_once(
+    state: &AppState,
+    admin: &AuthenticatedAdmin,
+    account_id: &str,
+    session_id: &str,
+) -> AppResult<Value> {
+    let mut session = state.db.client().start_session(None).await?;
+    session.start_transaction(None).await?;
+    let result =
+        chat_apply_in_transaction(state, admin, account_id, session_id, &mut session).await;
+    let receipt = match result {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            let _ = session.abort_transaction().await;
+            return Err(error);
+        }
+    };
+    crate::knowledge_wiki::chunk_revisions::commit_chunk_transaction(&mut session).await?;
+    Ok(receipt)
+}
+
+async fn chat_apply_in_transaction(
+    state: &AppState,
+    admin: &AuthenticatedAdmin,
+    account_id: &str,
+    session_id: &str,
+    session: &mut ClientSession,
+) -> AppResult<Value> {
+    state
+        .db
+        .knowledge_chat_session_seqs()
+        .find_one_with_session(
+            doc! {
+                "_id": chat_session_row_id(&admin.current_workspace, session_id),
+                "workspace_id": &admin.current_workspace,
+                "session_id": session_id,
+                "account_id": account_id,
+                "owner_admin_id": &admin.user_id,
+            },
+            None,
+            session,
+        )
+        .await?
+        .ok_or_else(|| AppError::NotFound("chat session not found".to_string()))?;
+
+    let history = load_chat_history_with_session(
+        state,
+        &admin.current_workspace,
+        account_id,
+        session_id,
+        session,
+    )
+    .await?;
     let last_assistant = history
         .iter()
         .rev()
-        .find(|t| t.role == "assistant" && t.status == "pending" && t.patch.is_some())
+        .find(|turn| turn.role == "assistant" && turn.patch.is_some())
         .ok_or_else(|| {
             AppError::BadRequest(
                 "session 没有可应用的 AI 草稿（需要先发起 chat 让 AI 起草）".to_string(),
             )
         })?;
+    if last_assistant.status == "applied" {
+        let receipt = last_assistant
+            .apply_result
+            .clone()
+            .ok_or_else(|| AppError::Conflict("chat_apply_receipt_missing".to_string()))?;
+        return Ok(Bson::Document(receipt).into());
+    }
+    if last_assistant.status != "pending" {
+        return Err(AppError::Conflict(format!(
+            "chat_draft_not_applicable:{}",
+            last_assistant.status
+        )));
+    }
 
+    let turn_id = last_assistant
+        .id
+        .ok_or_else(|| AppError::External("chat turn missing _id".to_string()))?;
     let intent = last_assistant.intent.as_deref().unwrap_or("freeform");
     let patch = last_assistant
         .patch
         .as_ref()
         .ok_or_else(|| AppError::BadRequest("最近一轮 AI 没有 patch".to_string()))?;
+    let claimed = state
+        .db
+        .knowledge_chat_turns()
+        .update_one_with_session(
+            doc! {
+                "_id": turn_id,
+                "workspace_id": &admin.current_workspace,
+                "account_id": account_id,
+                "session_id": session_id,
+                "role": "assistant",
+                "status": "pending",
+            },
+            doc! { "$set": { "status": "applying", "updated_at": DateTime::now() } },
+            None,
+            session,
+        )
+        .await?;
+    if claimed.matched_count != 1 {
+        return Err(AppError::Conflict("chat_apply_claim_conflict".to_string()));
+    }
 
-    let account_id = body
-        .account_id
-        .clone()
-        .or_else(|| {
-            if last_assistant.account_id.is_empty() {
-                None
-            } else {
-                Some(last_assistant.account_id.clone())
-            }
-        })
-        .unwrap_or_else(|| state.config.default_account_id.clone());
-
-    // 取出 attachments 中的 chunk_id / item_id（assistant 已回填）
+    let operator_statement = history
+        .iter()
+        .filter(|turn| turn.role == "user")
+        .map(|turn| turn.content.trim())
+        .filter(|content| !content.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
     let target_chunk_id = last_assistant
         .attachments
         .iter()
-        .filter_map(|a| a.get_str("chunk_id").ok())
-        .find(|s| !s.is_empty())
-        .map(|s| s.to_string());
+        .filter_map(|attachment| attachment.get_str("chunk_id").ok())
+        .find(|value| !value.is_empty());
+    let target_chunk_expected_updated_at = last_assistant
+        .attachments
+        .iter()
+        .find(|attachment| {
+            attachment
+                .get_str("chunk_id")
+                .ok()
+                .is_some_and(|value| Some(value) == target_chunk_id)
+        })
+        .and_then(|attachment| attachment.get_str("expected_updated_at").ok());
     let target_pack_id = last_assistant
         .attachments
         .iter()
-        .filter_map(|a| a.get_str("item_id").ok())
-        .find(|s| !s.is_empty())
-        .map(|s| s.to_string());
+        .filter_map(|attachment| attachment.get_str("item_id").ok())
+        .find(|value| !value.is_empty());
 
     let result_value = match intent {
         "create_chunk" => {
-            // chat 新建知识无父文档，溯源 = 运营在本会话里的陈述。拼接所有 user-role
-            // turn 的正文作为 operator_statement，交给 apply_create_chunk 锚定 sourceQuote。
-            let operator_statement = history
-                .iter()
-                .filter(|t| t.role == "user")
-                .map(|t| t.content.trim())
-                .filter(|c| !c.is_empty())
-                .collect::<Vec<_>>()
-                .join("\n");
-            // chat 新建知识默认落 workspace 共享域（account_id=null），与 seed/import/manual
-            // 等所有其它写入口一致——只有运营显式绑定了某个**非 default** 账号时才把切片私有化
-            // 到该账号。否则共享，使共享域召回（account_id=None）与任意联系人生产召回
-            // （account_id=Some(contact) 匹配 null OR contact）都能检索到对话补的知识。
-            let create_account_id: Option<String> = body
-                .account_id
-                .clone()
-                .or_else(|| {
-                    if last_assistant.account_id.is_empty() {
-                        None
-                    } else {
-                        Some(last_assistant.account_id.clone())
-                    }
-                })
-                .filter(|a| !a.is_empty() && *a != state.config.default_account_id);
-            apply_create_chunk(&state, &admin.current_workspace, create_account_id.as_deref(), &trimmed, patch, target_pack_id.as_deref(), &operator_statement)
-                .await?
+            let create_account_id =
+                (account_id != state.config.default_account_id).then_some(account_id);
+            apply_create_chunk_with_session(
+                state,
+                &admin.current_workspace,
+                create_account_id,
+                session_id,
+                patch,
+                target_pack_id,
+                &operator_statement,
+                session,
+            )
+            .await?
         }
         "update_chunk" => {
-            let chunk_id = target_chunk_id.clone().ok_or_else(|| {
+            let chunk_id = target_chunk_id.ok_or_else(|| {
                 AppError::BadRequest("update_chunk 需要 attachments.chunkId".to_string())
             })?;
-            // 与 create_chunk 分支对称：拼接本会话所有 user-role turn 正文作为
-            // operator_statement，供 apply_update_chunk 在 patch 改了 sourceQuote 时重新
-            // 锚定 source_anchors——避免"新 quote + 旧 anchor 失配"绕过 D2 verify 闸。
-            let operator_statement = history
-                .iter()
-                .filter(|t| t.role == "user")
-                .map(|t| t.content.trim())
-                .filter(|c| !c.is_empty())
-                .collect::<Vec<_>>()
-                .join("\n");
-            apply_update_chunk(&state, &admin.current_workspace, &account_id, &chunk_id, patch, &operator_statement).await?
+            apply_update_chunk_with_session(
+                state,
+                &admin.current_workspace,
+                account_id,
+                chunk_id,
+                patch,
+                &operator_statement,
+                target_chunk_expected_updated_at,
+                session,
+            )
+            .await?
         }
         other => {
             return Err(AppError::BadRequest(format!(
@@ -471,47 +795,105 @@ pub async fn chat_apply(
         }
     };
 
-    // 标 turn applied
+    let result_bson = mongodb::bson::to_bson(&result_value)?;
+    let receipt = doc! {
+        "ok": true,
+        "sessionId": session_id,
+        "intent": intent,
+        "result": result_bson.clone(),
+    };
+    let now = DateTime::now();
     state
         .db
-        .knowledge_chat_turns()
-        .update_one(
-            doc! {
-                "_id": last_assistant.id.expect("turn must have id"),
-                "workspace_id": &admin.current_workspace,
+        .events()
+        .insert_one_with_session(
+            crate::models::AgentEvent {
+                id: None,
+                workspace_id: admin.current_workspace.clone(),
+                account_id: account_id.to_string(),
+                contact_wxid: None,
+                kind: "knowledge_chat_applied".to_string(),
+                status: "success".to_string(),
+                summary: format!("AI 对话产物落库为草稿 sessionId={session_id} intent={intent}"),
+                details: Some(doc! {
+                    "kind": "chunk_chat_session",
+                    "sessionId": session_id,
+                    "turnId": turn_id,
+                    "intent": intent,
+                    "result": result_bson,
+                }),
+                created_at: now,
+                dedupe_key: Some(format!("knowledge_chat_apply:{}", turn_id.to_hex())),
             },
-            doc! { "$set": { "status": "applied", "updated_at": DateTime::now() } },
             None,
+            session,
         )
         .await?;
+    let finalized = state
+        .db
+        .knowledge_chat_turns()
+        .update_one_with_session(
+            doc! {
+                "_id": turn_id,
+                "workspace_id": &admin.current_workspace,
+                "account_id": account_id,
+                "session_id": session_id,
+                "status": "applying",
+            },
+            doc! {
+                "$set": {
+                    "status": "applied",
+                    "apply_result": receipt.clone(),
+                    "applied_at": now,
+                    "updated_at": now,
+                }
+            },
+            None,
+            session,
+        )
+        .await?;
+    if finalized.matched_count != 1 {
+        return Err(AppError::Conflict(
+            "chat_apply_finalize_conflict".to_string(),
+        ));
+    }
+    Ok(Bson::Document(receipt).into())
+}
 
-    record_repair_event(
-        &state,
-        &admin.current_workspace,
-        &account_id,
-        "knowledge_chat_applied",
-        format!("AI 对话产物落库为草稿 sessionId={trimmed} intent={intent}"),
-        doc! {
-            "kind": "chunk_chat_session",
-            "sessionId": &trimmed,
-            "intent": intent,
-            "result": mongodb::bson::to_bson(&result_value).unwrap_or(Bson::Null),
-        },
-    )
-    .await;
-
-    Ok(Json(json!({
-        "ok": true,
-        "sessionId": trimmed,
-        "intent": intent,
-        "result": result_value,
-    })))
+async fn load_chat_history_with_session(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+    session_id: &str,
+    session: &mut ClientSession,
+) -> AppResult<Vec<KnowledgeChatTurn>> {
+    let mut cursor = state
+        .db
+        .knowledge_chat_turns()
+        .find_with_session(
+            doc! {
+                "workspace_id": workspace_id,
+                "account_id": account_id,
+                "session_id": session_id,
+            },
+            FindOptions::builder()
+                .sort(doc! { "turn_index": 1 })
+                .build(),
+            session,
+        )
+        .await?;
+    let mut items = Vec::new();
+    while let Some(turn) = cursor.next(session).await.transpose()? {
+        items.push(turn);
+    }
+    Ok(items)
 }
 
 pub(in crate::routes) async fn chat_discard(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
     Path(session_id): Path<String>,
+    Query(query): Query<ChatSessionScopeQuery>,
 ) -> AppResult<Json<Value>> {
     let trimmed = session_id.trim();
     if trimmed.is_empty() {
@@ -519,12 +901,26 @@ pub(in crate::routes) async fn chat_discard(
             "sessionId cannot be empty".to_string(),
         ));
     }
+    let account_id = expected_chat_account(
+        query.account_id.as_deref(),
+        &state.config.default_account_id,
+    );
+    validate_account(&state, &admin.current_workspace, &account_id).await?;
+    require_chat_session_identity(
+        &state,
+        &admin.current_workspace,
+        &account_id,
+        trimmed,
+        &admin.user_id,
+    )
+    .await?;
     let res = state
         .db
         .knowledge_chat_turns()
         .update_many(
             doc! {
                 "workspace_id": &admin.current_workspace,
+                "account_id": &account_id,
                 "session_id": trimmed,
                 "status": "pending",
             },
@@ -541,6 +937,132 @@ pub(in crate::routes) async fn chat_discard(
 
 // ----- chat 内部辅助 -------------------------------------------------------
 
+fn chat_session_row_id(workspace_id: &str, session_id: &str) -> String {
+    format!("{workspace_id}|{session_id}")
+}
+
+pub(crate) fn chat_session_bus_key(
+    workspace_id: &str,
+    account_id: &str,
+    session_id: &str,
+) -> String {
+    format!("{workspace_id}|{account_id}|{session_id}")
+}
+
+fn is_duplicate_key_error(error: &mongodb::error::Error) -> bool {
+    use mongodb::error::{ErrorKind, WriteFailure};
+
+    match error.kind.as_ref() {
+        ErrorKind::Write(WriteFailure::WriteError(write_error)) => {
+            is_duplicate_key_code(write_error.code)
+        }
+        ErrorKind::BulkWrite(failure) => failure.write_errors.as_ref().is_some_and(|errors| {
+            errors
+                .iter()
+                .any(|write_error| is_duplicate_key_code(write_error.code))
+        }),
+        // findOneAndUpdate with upsert can report an _id collision as a command
+        // error rather than a write error. It still represents the same OCC miss.
+        ErrorKind::Command(command_error) => is_duplicate_key_code(command_error.code),
+        _ => false,
+    }
+}
+
+fn is_duplicate_key_code(code: i32) -> bool {
+    matches!(code, 11000 | 11001)
+}
+
+async fn ensure_chat_session_identity(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+    session_id: &str,
+    owner_admin_id: &str,
+) -> AppResult<()> {
+    use mongodb::options::{FindOneAndUpdateOptions, ReturnDocument};
+
+    let key = chat_session_row_id(workspace_id, session_id);
+    let now = DateTime::now();
+    let result = state
+        .db
+        .knowledge_chat_session_seqs()
+        .find_one_and_update(
+            doc! {
+                "_id": &key,
+                "$or": [
+                    {
+                        "workspace_id": workspace_id,
+                        "session_id": session_id,
+                        "account_id": account_id,
+                        "owner_admin_id": owner_admin_id,
+                    },
+                    {
+                        "workspace_id": { "$exists": false },
+                        "session_id": { "$exists": false },
+                        "account_id": { "$exists": false },
+                        "owner_admin_id": { "$exists": false },
+                    },
+                ],
+            },
+            doc! {
+                "$setOnInsert": {
+                    "seq": 0_i64,
+                    "created_at": now,
+                },
+                "$set": {
+                    "workspace_id": workspace_id,
+                    "session_id": session_id,
+                    "account_id": account_id,
+                    "owner_admin_id": owner_admin_id,
+                    "updated_at": now,
+                },
+            },
+            FindOneAndUpdateOptions::builder()
+                .upsert(true)
+                .return_document(ReturnDocument::After)
+                .build(),
+        )
+        .await;
+    match result {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(AppError::Conflict(
+            "chat_session_scope_conflict".to_string(),
+        )),
+        Err(error) if is_duplicate_key_error(&error) => Err(AppError::Conflict(
+            "chat_session_scope_conflict".to_string(),
+        )),
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn require_chat_session_identity(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+    session_id: &str,
+    owner_admin_id: &str,
+) -> AppResult<()> {
+    let row = state
+        .db
+        .knowledge_chat_session_seqs()
+        .find_one(
+            doc! {
+                "_id": chat_session_row_id(workspace_id, session_id),
+                "workspace_id": workspace_id,
+                "session_id": session_id,
+                "account_id": account_id,
+                "owner_admin_id": owner_admin_id,
+            },
+            None,
+        )
+        .await?;
+    if row.is_some() {
+        Ok(())
+    } else {
+        Err(AppError::NotFound("chat session not found".to_string()))
+    }
+}
+
 /// P1-7：原子分配下一个 `turn_index`。
 ///
 /// 历史路径是「`find_one(sort=desc).turn_index + 1`」，并发两个写者会读到同一
@@ -555,20 +1077,27 @@ pub(in crate::routes) async fn chat_discard(
 pub(in crate::routes) async fn allocate_next_turn_indices(
     state: &AppState,
     workspace_id: &str,
+    account_id: &str,
     session_id: &str,
+    owner_admin_id: &str,
     count: u32,
 ) -> AppResult<i32> {
     use mongodb::options::{FindOneAndUpdateOptions, ReturnDocument};
     let n = count.max(1) as i64;
-    let key = format!("{}|{}", workspace_id, session_id);
+    let key = chat_session_row_id(workspace_id, session_id);
     let updated = state
         .db
         .knowledge_chat_session_seqs()
         .find_one_and_update(
-            doc! { "_id": &key },
+            doc! {
+                "_id": &key,
+                "workspace_id": workspace_id,
+                "session_id": session_id,
+                "account_id": account_id,
+                "owner_admin_id": owner_admin_id,
+            },
             doc! { "$inc": { "seq": n } },
             FindOneAndUpdateOptions::builder()
-                .upsert(true)
                 .return_document(ReturnDocument::After)
                 .build(),
         )
@@ -576,7 +1105,7 @@ pub(in crate::routes) async fn allocate_next_turn_indices(
     let seq = updated
         .as_ref()
         .and_then(|d| d.get_i64("seq").ok())
-        .unwrap_or(n);
+        .ok_or_else(|| AppError::Conflict("chat_session_scope_conflict".to_string()))?;
     // turn_index 字段在模型里是 i32；上限远超 i32::MAX 时直接 saturating，
     // 单 session ≥ 21 亿 turn 不在产品语义范围内。
     Ok(seq.try_into().unwrap_or(i32::MAX))
@@ -600,7 +1129,9 @@ async fn load_chat_history(
         .knowledge_chat_turns()
         .find(
             filter,
-            FindOptions::builder().sort(doc! { "turn_index": 1 }).build(),
+            FindOptions::builder()
+                .sort(doc! { "turn_index": 1 })
+                .build(),
         )
         .await?;
     let mut items = vec![];
@@ -621,6 +1152,7 @@ async fn write_chat_turn(
     intent: Option<&str>,
     content: &str,
     attachments: &[ChatAttachment],
+    extra_attachments: &[Document],
     patch: Option<&Value>,
     missing_fields: &[String],
     followups: &[Value],
@@ -628,7 +1160,7 @@ async fn write_chat_turn(
     tokens_used: i64,
     prompt_key: Option<&str>,
 ) -> AppResult<()> {
-    let attachments_doc: Vec<Document> = attachments
+    let mut attachments_doc: Vec<Document> = attachments
         .iter()
         .filter_map(|a| {
             let mut d = Document::new();
@@ -638,6 +1170,16 @@ async fn write_chat_turn(
             if let Some(i) = a.item_id.as_deref().filter(|s| !s.is_empty()) {
                 d.insert("item_id", i.to_string());
             }
+            if let Some(expected) = a
+                .expected_updated_at
+                .as_deref()
+                .filter(|value| !value.is_empty())
+            {
+                d.insert("expected_updated_at", expected.to_string());
+            }
+            if a.operation == Some(ChatAttachmentOperation::Update) {
+                d.insert("operation", "update");
+            }
             if d.is_empty() {
                 None
             } else {
@@ -645,6 +1187,7 @@ async fn write_chat_turn(
             }
         })
         .collect();
+    attachments_doc.extend(extra_attachments.iter().cloned());
     let patch_doc = patch
         .and_then(|p| mongodb::bson::to_bson(p).ok())
         .and_then(|b| match b {
@@ -678,6 +1221,8 @@ async fn write_chat_turn(
                 missing_fields: missing_fields.to_vec(),
                 followup_questions: followup_docs,
                 status: status.to_string(),
+                apply_result: None,
+                applied_at: None,
                 tokens_used,
                 prompt_key: prompt_key.map(|s| s.to_string()),
                 created_at: DateTime::now(),
@@ -750,7 +1295,9 @@ fn synthesize_natural_reply_from_patch(out: &Value) -> Option<String> {
             arr.iter()
                 .filter_map(|x| {
                     x.as_str().map(|s| s.to_string()).or_else(|| {
-                        x.get("field").and_then(|f| f.as_str()).map(|s| s.to_string())
+                        x.get("field")
+                            .and_then(|f| f.as_str())
+                            .map(|s| s.to_string())
                     })
                 })
                 .map(|s| field_label(&s).to_string())
@@ -763,7 +1310,10 @@ fn synthesize_natural_reply_from_patch(out: &Value) -> Option<String> {
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
     {
-        format!("我已经按您的要求起草好{}，拟定的标题是「{t}」。", filled.join("、"))
+        format!(
+            "我已经按您的要求起草好{}，拟定的标题是「{t}」。",
+            filled.join("、")
+        )
     } else {
         format!("我已经为您起草好了{}。", filled.join("、"))
     };
@@ -789,46 +1339,53 @@ async fn run_chat_turn_pipeline(
     session_id: &str,
     user_content: &str,
     chunk_attached: Option<&str>,
+    chunk_expected_updated_at: Option<&str>,
+    chunk_operation: Option<ChatAttachmentOperation>,
     item_attached: Option<&str>,
+    digest_selection: Option<&DigestSelectionBinding>,
     history: &[KnowledgeChatTurn],
 ) -> AppResult<Value> {
     // knowledge-digest-workstation Phase 5：先取运营长期偏好记忆，作为
     // intent 分类与下游分支的 prompt header。与 contacts.memory_card 物理
     // 隔离（仅触达 knowledge_operator_memory collection）。
-    let operator_memory = agent::load_operator_memory(
-        &state.db,
-        workspace_id,
-        account_id,
-        operator_id,
-        5,
-    )
-    .await
-    .unwrap_or_default();
+    let operator_memory =
+        agent::load_operator_memory(&state.db, workspace_id, account_id, operator_id, 5)
+            .await
+            .unwrap_or_default();
     let operator_memory_header = render_operator_memory_for_prompt(&operator_memory);
 
     // 1. intent 分类
-    let intent_result = classify_intent(
-        state,
-        workspace_id,
-        account_id,
-        session_id,
-        user_content,
-        chunk_attached,
-        item_attached,
-        history,
-        &operator_memory_header,
-    )
-    .await?;
+    let intent_result = if digest_selection.is_some() {
+        json!({ "intent": "digest_action" })
+    } else if let Some(intent) = forced_chat_intent(chunk_operation) {
+        json!({ "intent": intent, "targetChunkId": chunk_attached })
+    } else {
+        classify_intent(
+            state,
+            workspace_id,
+            account_id,
+            session_id,
+            user_content,
+            chunk_attached,
+            item_attached,
+            history,
+            &operator_memory_header,
+        )
+        .await?
+    };
     let intent = intent_result
         .get("intent")
         .and_then(|v| v.as_str())
         .unwrap_or("freeform")
         .to_string();
-    let target_chunk_id = intent_result
-        .get("targetChunkId")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .or_else(|| chunk_attached.map(|s| s.to_string()));
+    // An explicit operator attachment is authoritative. The model may classify the
+    // requested operation, but it cannot redirect an edit to a different chunk.
+    let target_chunk_id = chunk_attached.map(str::to_owned).or_else(|| {
+        intent_result
+            .get("targetChunkId")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    });
     let target_pack_id = intent_result
         .get("targetPackId")
         .and_then(|v| v.as_str())
@@ -865,6 +1422,7 @@ async fn run_chat_turn_pipeline(
                 session_id,
                 user_content,
                 &chunk_id,
+                chunk_expected_updated_at,
                 history,
             )
             .await?;
@@ -879,6 +1437,7 @@ async fn run_chat_turn_pipeline(
                 account_id,
                 session_id,
                 user_content,
+                digest_selection,
                 history,
             )
             .await?;
@@ -900,12 +1459,32 @@ async fn run_chat_turn_pipeline(
             v["promptKey"] = json!("knowledge.chat.intent");
             v
         }
-        _ => clarify_for_chat(state, workspace_id, account_id, session_id, user_content, history)
-            .await
-            .map(|mut v| {
-                v["promptKey"] = json!("knowledge.chat.clarify");
-                v
-            })?,
+        "revoke_operator_memory" => {
+            let mut v = revoke_operator_memory_for_chat(
+                state,
+                workspace_id,
+                account_id,
+                operator_id,
+                &intent_result,
+            )
+            .await?;
+            v["draftKind"] = json!("operator_memory");
+            v["promptKey"] = json!("knowledge.chat.intent");
+            v
+        }
+        _ => clarify_for_chat(
+            state,
+            workspace_id,
+            account_id,
+            session_id,
+            user_content,
+            history,
+        )
+        .await
+        .map(|mut v| {
+            v["promptKey"] = json!("knowledge.chat.clarify");
+            v
+        })?,
     };
 
     out["intent"] = json!(intent);
@@ -933,7 +1512,14 @@ fn render_chat_history_for_prompt(history: &[KnowledgeChatTurn]) -> String {
         return "（暂无历史）".to_string();
     }
     let mut s = String::new();
-    for t in history.iter().rev().take(6).collect::<Vec<_>>().iter().rev() {
+    for t in history
+        .iter()
+        .rev()
+        .take(6)
+        .collect::<Vec<_>>()
+        .iter()
+        .rev()
+    {
         s.push_str(&format!(
             "- [{}] {}: {}\n",
             t.turn_index,
@@ -950,11 +1536,12 @@ fn render_chat_history_for_prompt(history: &[KnowledgeChatTurn]) -> String {
 fn render_operator_memory_for_prompt(
     memories: &[crate::models::KnowledgeOperatorMemory],
 ) -> String {
-    if memories.is_empty() {
+    let active = memories.iter().filter(|memory| memory.revoked_at.is_none());
+    if active.clone().next().is_none() {
         return String::new();
     }
     let mut s = String::from("【运营长期偏好（仅作上下文，不要写回 chunk patch）】\n");
-    for m in memories.iter().take(5) {
+    for m in active.take(5) {
         let kind_label = match m.kind.as_str() {
             "preference" => "偏好",
             "rejection" => "红线",
@@ -1047,16 +1634,21 @@ async fn run_chat_with_tools(
         UserRuntimeParameters,
     };
 
-    // 拉 KnowledgeRuntime 快照：documents / items / verified chunks。
-    // 与 user-ops `load_operation_knowledge` 的形态对齐，但简化为按 workspace
-    // 全量取（chat 不绑定到具体 contact，没有 account_filter）。limit 与 user-ops
-    // 一致，避免 KnowledgeRuntime 跨 chunk 数量发散。
+    // Load only shared or current-account knowledge into the in-memory tool runtime.
     let workspace_id = workspace_id_in.to_string();
     let documents: Vec<OperationKnowledgeDocument> = state
         .db
         .operation_knowledge_documents()
         .find(
-            doc! { "workspace_id": &workspace_id, "domain": "user_operations", "status": "active" },
+            doc! {
+                "workspace_id": &workspace_id,
+                "domain": "user_operations",
+                "status": "active",
+                "$or": [
+                    { "account_id": null },
+                    { "account_id": account_id },
+                ],
+            },
             FindOptions::builder()
                 .sort(doc! { "updated_at": -1_i32 })
                 .limit(80)
@@ -1074,6 +1666,10 @@ async fn run_chat_with_tools(
                 "domain": "user_operations",
                 "status": "active",
                 "integrity_status": "verified",
+                "$or": [
+                    { "account_id": null },
+                    { "account_id": account_id },
+                ],
             },
             FindOptions::builder()
                 .sort(doc! { "priority": -1_i32, "updated_at": -1_i32 })
@@ -1083,10 +1679,7 @@ async fn run_chat_with_tools(
         .await?
         .try_collect()
         .await?;
-    let knowledge = KnowledgeRuntime {
-        documents,
-        chunks,
-    };
+    let knowledge = KnowledgeRuntime { documents, chunks };
     let runtime = UserRuntimeParameters::default();
 
     // 取当前 RUN_BUDGET（chat_turn handler 已经 scope 进来了）；
@@ -1108,6 +1701,7 @@ async fn run_chat_with_tools(
 
     // reply_fn 闭包：每轮被 chat_reply_with_tools_loop 调用。
     let state_arc = Arc::new(state.clone());
+    let workspace_id_owned = workspace_id.clone();
     let account_id_owned = account_id.to_string();
     let session_id_owned = session_id.to_string();
     let run_key_owned = run_key.to_string();
@@ -1119,6 +1713,7 @@ async fn run_chat_with_tools(
 
     let reply_fn: ChatReplyFn<'_> = Box::new(move |tool_results: &str, loop_count: i32| {
         let state_arc = Arc::clone(&state_arc);
+        let workspace_id_owned = workspace_id_owned.clone();
         let account_id_owned = account_id_owned.clone();
         let session_id_owned = session_id_owned.clone();
         let run_key_owned = run_key_owned.clone();
@@ -1135,11 +1730,10 @@ async fn run_chat_with_tools(
             } else {
                 format!("{user_owned}\n\n[system tool result]{tool_results_owned}")
             };
-            let run_id = format!(
-                "chat-{session_id_owned}-{run_key_owned}-loop-{loop_count}"
-            );
+            let run_id = format!("chat-{session_id_owned}-{run_key_owned}-loop-{loop_count}");
             let value = agent::generate_agent_json(
                 &state_arc,
+                &workspace_id_owned,
                 Some(&account_id_owned),
                 None,
                 Some(&run_id),
@@ -1153,8 +1747,7 @@ async fn run_chat_with_tools(
                 *guard = Some(value.clone());
             }
             // 反序列化为 RawAgentDecision，再 promote 到 AgentDecision。
-            let raw: RawAgentDecision =
-                serde_json::from_value(value).map_err(AppError::from)?;
+            let raw: RawAgentDecision = serde_json::from_value(value).map_err(AppError::from)?;
             let (decision, promote_risks) = raw.validate_and_promote(&runtime_for_fn);
             Ok((decision, promote_risks))
         });
@@ -1168,36 +1761,69 @@ async fn run_chat_with_tools(
         &knowledge,
         &state.db,
         &workspace_id,
+        account_id,
         budget,
         Some(source_anchor_for_quote_ffi as agent::AnchorMatchFn),
         reply_fn,
     )
     .await;
     let final_value = match outcome {
-        Ok(_outcome) => {
-            // 取最后一轮 LLM 原始 JSON 作为 final payload。
-            // 若 last_raw 为空（reply_fn 一次都没调用成功），用 empty object 兜底。
-            last_raw
-                .lock()
-                .ok()
-                .and_then(|g| g.clone())
-                .unwrap_or_else(|| {
-                    json!({
-                        "decisionPhase": "final",
-                        "naturalReply": "（AI 未给出回复）",
-                    })
-                })
-        }
+        Ok(outcome) => finalize_chat_tool_loop_payload(
+            last_raw.lock().ok().and_then(|g| g.clone()),
+            &outcome.decision.decision_phase,
+            &outcome.risks,
+        ),
         Err(ChatToolLoopError::Timeout { elapsed_ms, .. }) => {
             // 超时——返回温和 final，让上层 handler 仍能写 turn 与 event。
             json!({
                 "decisionPhase": "final",
                 "naturalReply": format!("（AI 工具循环超时 elapsed_ms={elapsed_ms}，请稍后再试或换个说法）"),
+                "toolLoopTruncated": true,
+                "toolLoopStopReason": "timeout",
             })
         }
         Err(ChatToolLoopError::Reply(err)) => return Err(err),
     };
     Ok(final_value)
+}
+
+fn finalize_chat_tool_loop_payload(
+    raw: Option<Value>,
+    normalized_phase: &str,
+    risks: &[String],
+) -> Value {
+    let raw_is_final = raw
+        .as_ref()
+        .and_then(|value| value.get("decisionPhase"))
+        .and_then(Value::as_str)
+        == Some("final");
+    if raw_is_final && normalized_phase == "final" {
+        return raw.expect("raw_is_final requires a raw payload");
+    }
+    json!({
+        "decisionPhase": "final",
+        "naturalReply": "（AI 工具探索未能完成，请稍后重试或补充更具体的信息。）",
+        "toolLoopTruncated": true,
+        "toolLoopStopReason": forced_chat_final_reason(risks),
+    })
+}
+
+fn forced_chat_final_reason(risks: &[String]) -> &'static str {
+    if risks
+        .iter()
+        .any(|risk| risk == "chat_tool_budget_exhausted")
+    {
+        "budget_exhausted"
+    } else if risks
+        .iter()
+        .any(|risk| risk == "chat_tool_call_failure_streak")
+    {
+        "tool_failure_streak"
+    } else if risks.iter().any(|risk| risk == "chat_tool_loop_exhausted") {
+        "loop_exhausted"
+    } else {
+        "forced_stop"
+    }
 }
 
 /// `verify_anchor` 工具的 source_quote→anchor 模糊匹配实现适配器。
@@ -1267,7 +1893,10 @@ async fn update_operator_memory_for_chat(
         "context" => "背景",
         other => other,
     };
-    let summary = format!("已记下您的{kind_label}：{}", truncate_for_prompt(&content, 80));
+    let summary = format!(
+        "已记下您的{kind_label}：{}",
+        truncate_for_prompt(&content, 80)
+    );
     record_repair_event(
         state,
         workspace_id,
@@ -1294,6 +1923,87 @@ async fn update_operator_memory_for_chat(
     }))
 }
 
+async fn revoke_operator_memory_for_chat(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+    operator_id: &str,
+    intent_result: &Value,
+) -> AppResult<Value> {
+    let memory_id = intent_result
+        .get("memoryId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let Some(memory_id) = memory_id else {
+        return Ok(json!({
+            "naturalReply": "请把要撤销的 memoryId 发给我，我只会撤销该账号下属于您的那一条运营记忆。",
+            "missingFields": ["memoryId"],
+            "followupQuestions": [{
+                "id": "q1",
+                "field": "memoryId",
+                "question": "要撤销哪一条运营记忆？请提供 memoryId。",
+            }],
+        }));
+    };
+    let object_id = ObjectId::parse_str(memory_id)
+        .map_err(|_| AppError::BadRequest("memoryId is invalid".to_string()))?;
+    let reason = intent_result
+        .get("revocationReason")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("operator requested revocation");
+    let outcome = agent::revoke_operator_memory(
+        &state.db,
+        workspace_id,
+        account_id,
+        operator_id,
+        object_id,
+        operator_id,
+        reason,
+    )
+    .await?;
+    let memory = outcome.memory;
+    let summary = if outcome.already_revoked {
+        format!("运营记忆 {} 已经撤销，无需重复处理", memory_id)
+    } else {
+        format!(
+            "已撤销运营记忆 {}：{}",
+            memory_id,
+            truncate_for_prompt(&memory.content, 80)
+        )
+    };
+    if !outcome.already_revoked {
+        record_repair_event(
+            state,
+            workspace_id,
+            account_id,
+            "knowledge_operator_memory_revoked",
+            summary.clone(),
+            doc! {
+                "kind": "operator_memory",
+                "memoryId": memory_id,
+                "operatorId": operator_id,
+                "revocationReason": reason,
+            },
+        )
+        .await;
+    }
+    Ok(json!({
+        "naturalReply": format!("{summary}。这条内容不会再注入后续起草。"),
+        "missingFields": Vec::<String>::new(),
+        "followupQuestions": Vec::<Value>::new(),
+        "operatorMemory": {
+            "id": memory.id.map(|id| id.to_hex()),
+            "kind": memory.kind,
+            "content": memory.content,
+            "revokedAt": memory.revoked_at.and_then(|value| value.try_to_rfc3339_string().ok()),
+            "alreadyRevoked": outcome.already_revoked,
+        }
+    }))
+}
+
 async fn classify_intent(
     state: &AppState,
     workspace_id: &str,
@@ -1312,7 +2022,7 @@ async fn classify_intent(
     )
     .await
     .unwrap_or_else(|_| {
-        "你是知识库对话 Agent，仅识别意图。只输出 JSON: {intent, confidence, targetChunkId?, targetPackId?, memoryKind?, memoryContent?, userIntentSummary}.".to_string()
+        "你是知识库对话 Agent，仅识别意图。只输出 JSON: {intent, confidence, targetChunkId?, targetPackId?, memoryKind?, memoryContent?, memoryId?, revocationReason?, userIntentSummary}.".to_string()
     });
     let system = if operator_memory_header.is_empty() {
         system_base
@@ -1329,7 +2039,7 @@ async fn classify_intent(
 最近历史（最多 6 条）：
 {}
 
-请输出 JSON，intent 必须在 [create_chunk, update_chunk, clarify_chunk, digest_action, update_operator_memory, freeform] 中。"#,
+请输出 JSON，intent 必须在 [create_chunk, update_chunk, clarify_chunk, digest_action, update_operator_memory, revoke_operator_memory, freeform] 中。运营要求撤销记忆时必须选择 revoke_operator_memory，并从原话提取 memoryId；不要把撤销请求误判为新增记忆。"#,
         chunk_attached.unwrap_or("(无)"),
         item_attached.unwrap_or("(无)"),
         render_chat_history_for_prompt(history),
@@ -1337,6 +2047,7 @@ async fn classify_intent(
     let run_id = format!("chat-{session_id}-intent");
     agent::generate_agent_json(
         state,
+        workspace_id,
         Some(account_id),
         None,
         Some(&run_id),
@@ -1414,21 +2125,31 @@ async fn update_chunk_for_chat(
     session_id: &str,
     user_content: &str,
     chunk_id: &str,
+    expected_updated_at: Option<&str>,
     history: &[KnowledgeChatTurn],
 ) -> AppResult<Value> {
     let oid = parse_object_id(chunk_id)?;
+    let mut chunk_filter = doc! {
+        "_id": oid,
+        "workspace_id": workspace_id,
+        "domain": "user_operations",
+        "$or": [
+            { "account_id": null },
+            { "account_id": account_id },
+        ],
+    };
+    if let Some(expected) = expected_updated_at {
+        chunk_filter.insert("updated_at", parse_expected_chunk_updated_at(expected)?);
+    }
     let chunk = state
         .db
         .operation_knowledge_chunks()
-        .find_one(
-            doc! {
-                "_id": oid,
-                "workspace_id": workspace_id,
-            },
-            None,
-        )
+        .find_one(chunk_filter, None)
         .await?
-        .ok_or_else(|| AppError::NotFound(format!("chunk {chunk_id} not found")))?;
+        .ok_or_else(|| AppError::Conflict("chat_chunk_snapshot_stale".to_string()))?;
+    let frozen_updated_at = chunk.updated_at.try_to_rfc3339_string().map_err(|error| {
+        AppError::External(format!("serialize chunk updated_at failed: {error}"))
+    })?;
     let document_payload = if let Some(document_id) = chunk.document_id {
         state
             .db
@@ -1437,6 +2158,11 @@ async fn update_chunk_for_chat(
                 doc! {
                     "_id": document_id,
                     "workspace_id": workspace_id,
+                    "domain": "user_operations",
+                    "$or": [
+                        { "account_id": null },
+                        { "account_id": account_id },
+                    ],
                 },
                 None,
             )
@@ -1480,7 +2206,7 @@ async fn update_chunk_for_chat(
         render_chat_history_for_prompt(history),
     );
     let augmented_system = augment_chat_system_with_tools(&system);
-    run_chat_with_tools(
+    let mut result = run_chat_with_tools(
         state,
         workspace_id,
         account_id,
@@ -1490,7 +2216,9 @@ async fn update_chunk_for_chat(
         augmented_system,
         user,
     )
-    .await
+    .await?;
+    result["expectedUpdatedAt"] = json!(frozen_updated_at);
+    Ok(result)
 }
 
 async fn clarify_for_chat(
@@ -1548,22 +2276,17 @@ async fn dispatch_digest_action_for_chat(
     account_id: &str,
     session_id: &str,
     user_content: &str,
+    digest_selection: Option<&DigestSelectionBinding>,
     history: &[KnowledgeChatTurn],
 ) -> AppResult<Value> {
-    let system = prompts::load_prompt(
-        &state.db,
-        workspace_id,
-        "knowledge.digest.dispatch",
-    )
-    .await
-    .unwrap_or_else(|_| {
-        "你是 AI 调度器，把运营勾的卡片拆成 plannedSteps。只输出 JSON: {plannedSteps, estimatedLlmCalls, naturalReply}.".to_string()
-    });
-
-    // 取今日日报里未 dismiss 的卡片摘要（≤ 20 条）作为参考
-    // 卡片实际勾选由前端在 attachments 里传，但本轮 chat 不收 cardIds —— 让 LLM
-    // 看到全量候选 + 运营自然语言去匹配（运营常说"把这 3 张 fix 了"）。
     let report_date = chrono::Local::now().format("%Y-%m-%d").to_string();
+    if let Some(selection) = digest_selection {
+        if selection.account_id != account_id || selection.report_date != report_date {
+            return Err(AppError::Conflict(
+                "digest_dispatch_snapshot_stale".to_string(),
+            ));
+        }
+    }
     let report = state
         .db
         .knowledge_daily_reports()
@@ -1575,26 +2298,39 @@ async fn dispatch_digest_action_for_chat(
             },
             None,
         )
-        .await?;
-    let mut card_summaries: Vec<Value> = vec![];
-    if let Some(r) = report {
-        for c in r.cards.iter().take(20) {
-            if r.dismissed_card_ids.contains(&c.card_id) {
-                continue;
-            }
-            card_summaries.push(json!({
-                "cardId": c.card_id.to_hex(),
-                "kind": c.kind,
-                "title": c.title,
-                "summary": c.summary,
-                "suggestedAction": c.suggested_action,
-                "severity": c.severity,
-            }));
-        }
-    }
+        .await?
+        .ok_or_else(|| AppError::Conflict("digest_dispatch_report_missing".to_string()))?;
 
-    let user = format!(
-        r#"运营本轮输入：
+    let binding = if let Some(selection) = digest_selection {
+        selection.clone()
+    } else {
+        let system = prompts::load_prompt(
+            &state.db,
+            workspace_id,
+            "knowledge.digest.dispatch",
+        )
+        .await
+        .unwrap_or_else(|_| {
+            "你是 AI 调度器，从候选卡片中挑选与运营要求相符的 cardId。只输出 JSON: {plannedSteps:[{cardId}], naturalReply}.".to_string()
+        });
+        let card_summaries = report
+            .cards
+            .iter()
+            .filter(|card| !report.dismissed_card_ids.contains(&card.card_id))
+            .take(20)
+            .map(|card| {
+                json!({
+                    "cardId": card.card_id.to_hex(),
+                    "kind": card.kind,
+                    "title": card.title,
+                    "summary": card.summary,
+                    "suggestedAction": card.suggested_action,
+                    "severity": card.severity,
+                })
+            })
+            .collect::<Vec<_>>();
+        let user = format!(
+            r#"运营本轮输入：
 {user_content}
 
 今日日报候选卡片（最多 20 条，未被 dismiss）：
@@ -1603,23 +2339,84 @@ async fn dispatch_digest_action_for_chat(
 最近历史（最多 6 条）：
 {history}
 
-请按 system 中 schema 输出 plannedSteps（步数 ≤ 8、总 estimatedLlmCalls ≤ 12）。
-每个 step 必须含 stepId / cardId / action / summary / estimatedLlmCalls。
-action 必须在 [fix_chunk, add_chunk, retag, review_evolution, analyze_logs, dismiss] 中。"#,
-        cards = serde_json::to_string_pretty(&card_summaries).unwrap_or_else(|_| "[]".to_string()),
-        history = render_chat_history_for_prompt(history),
-    );
-    let run_id = format!("chat-{session_id}-dispatch");
-    agent::generate_agent_json(
-        state,
-        Some(account_id),
-        None,
-        Some(&run_id),
-        "knowledge.digest.dispatch",
-        &system,
-        &user,
-    )
-    .await
+只挑选确实匹配的 cardId，最多 8 张。action、summary、target 不由你决定。"#,
+            cards =
+                serde_json::to_string_pretty(&card_summaries).unwrap_or_else(|_| "[]".to_string()),
+            history = render_chat_history_for_prompt(history),
+        );
+        let run_id = format!("chat-{session_id}-dispatch");
+        let llm_value = agent::generate_agent_json(
+            state,
+            workspace_id,
+            Some(account_id),
+            None,
+            Some(&run_id),
+            "knowledge.digest.dispatch",
+            &system,
+            &user,
+        )
+        .await?;
+        let allowed = report
+            .cards
+            .iter()
+            .filter(|card| !report.dismissed_card_ids.contains(&card.card_id))
+            .map(|card| (card.card_id.to_hex(), card))
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut seen = std::collections::HashSet::new();
+        let selected_cards = llm_value
+            .get("plannedSteps")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|step| step.get("cardId").and_then(Value::as_str))
+            .filter(|card_id| seen.insert((*card_id).to_string()))
+            .filter_map(|card_id| {
+                allowed.get(card_id).map(|card| DigestSelectedCardBinding {
+                    card_id: card_id.to_string(),
+                    card_hash: crate::knowledge_digest::digest_card_snapshot_hash(card),
+                })
+            })
+            .take(8)
+            .collect::<Vec<_>>();
+        if selected_cards.is_empty() {
+            return Ok(json!({
+                "naturalReply": llm_value
+                    .get("naturalReply")
+                    .and_then(Value::as_str)
+                    .unwrap_or("没有找到可安全绑定的日报卡片，请先在今日摘要中勾选后再派工。"),
+                "plannedSteps": [],
+                "estimatedLlmCalls": 0,
+            }));
+        }
+        DigestSelectionBinding {
+            account_id: account_id.to_string(),
+            report_id: report
+                .id
+                .ok_or_else(|| AppError::Conflict("digest_report_identity_missing".to_string()))?
+                .to_hex(),
+            report_date: report.report_date.clone(),
+            report_generation: report.current_generation,
+            report_hash: crate::knowledge_digest::digest_report_snapshot_hash(&report),
+            selected_cards,
+        }
+    };
+
+    let resolved = resolve_digest_selection(&report, &binding)?;
+    let planned_steps = resolved
+        .steps
+        .iter()
+        .map(|step| serde_json::to_value(step).unwrap_or_else(|_| json!({})))
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "naturalReply": format!(
+            "已按当前日报锁定 {} 张卡片及其执行目标，请确认后派工。",
+            planned_steps.len()
+        ),
+        "plannedSteps": planned_steps,
+        "estimatedLlmCalls": planned_steps.len(),
+        "digestSelection": binding,
+        "candidateHash": resolved.candidate_hash,
+    }))
 }
 
 /// create / update 两条对话补库路径共用的「运营陈述 → sourceQuote → source_anchors」
@@ -1674,6 +2471,41 @@ pub async fn apply_create_chunk(
     target_pack_id: Option<&str>,
     operator_statement: &str,
 ) -> AppResult<Value> {
+    let mut session = state.db.client().start_session(None).await?;
+    session.start_transaction(None).await?;
+    let result = apply_create_chunk_with_session(
+        state,
+        workspace_id,
+        account_id,
+        session_id,
+        patch,
+        target_pack_id,
+        operator_statement,
+        &mut session,
+    )
+    .await;
+    let value = match result {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = session.abort_transaction().await;
+            return Err(error);
+        }
+    };
+    crate::knowledge_wiki::chunk_revisions::commit_chunk_transaction(&mut session).await?;
+    Ok(value)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn apply_create_chunk_with_session(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: Option<&str>,
+    session_id: &str,
+    patch: &Document,
+    target_pack_id: Option<&str>,
+    operator_statement: &str,
+    session: &mut ClientSession,
+) -> AppResult<Value> {
     let patch_value: Value = mongodb::bson::Bson::Document(patch.clone()).into();
     let mut payload = chunk_request_from_chat_patch(&patch_value, account_id, target_pack_id);
     // 强制：AI 永不自动 verify
@@ -1689,19 +2521,31 @@ pub async fn apply_create_chunk(
     }
 
     validate_operation_knowledge_chunk(&payload)?;
-    let chunk = operation_knowledge_chunk_from_request(state, workspace_id, payload, None)?;
-    let inserted = state
+    let chunk_id = ObjectId::new();
+    let chunk =
+        operation_knowledge_chunk_from_request(state, workspace_id, payload, Some(chunk_id))?;
+    state
         .db
         .operation_knowledge_chunks()
-        .insert_one(chunk, None)
+        .insert_one_with_session(chunk, None, session)
         .await?;
-    let new_id = inserted
-        .inserted_id
-        .as_object_id()
-        .map(|o| o.to_hex())
-        .unwrap_or_default();
+    let applied = crate::knowledge_wiki::chunk_revisions::apply_chunk_revision_with_session(
+        &state.db,
+        workspace_id,
+        chunk_id,
+        crate::knowledge_wiki::chunk_revisions::RevisionRequest {
+            op: crate::knowledge_wiki::chunk_revisions::RevisionOp::Create,
+            source: crate::knowledge_wiki::chunk_revisions::ProvenanceSource::Ai,
+            patch: Document::new(),
+            reason: Some("知识对话创建草稿".to_string()),
+            actor: Some("knowledge_chat".to_string()),
+        },
+        session,
+    )
+    .await?;
     Ok(json!({
-        "createdChunkId": new_id,
+        "createdChunkId": chunk_id.to_hex(),
+        "revisionId": applied.revision_id,
         "sessionId": session_id,
         "status": "draft",
         "integrityStatus": "needs_review",
@@ -1711,12 +2555,64 @@ pub async fn apply_create_chunk(
 pub(crate) async fn apply_update_chunk(
     state: &AppState,
     workspace_id: &str,
-    _account_id: &str,
+    account_id: &str,
     chunk_id: &str,
     patch: &Document,
     operator_statement: &str,
 ) -> AppResult<Value> {
+    let mut session = state.db.client().start_session(None).await?;
+    session.start_transaction(None).await?;
+    let result = apply_update_chunk_with_session(
+        state,
+        workspace_id,
+        account_id,
+        chunk_id,
+        patch,
+        operator_statement,
+        None,
+        &mut session,
+    )
+    .await;
+    let value = match result {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = session.abort_transaction().await;
+            return Err(error);
+        }
+    };
+    crate::knowledge_wiki::chunk_revisions::commit_chunk_transaction(&mut session).await?;
+    Ok(value)
+}
+
+pub(crate) async fn apply_update_chunk_with_session(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+    chunk_id: &str,
+    patch: &Document,
+    operator_statement: &str,
+    expected_updated_at: Option<&str>,
+    session: &mut ClientSession,
+) -> AppResult<Value> {
     let oid = parse_object_id(chunk_id)?;
+    let mut chunk_filter = doc! {
+        "_id": oid,
+        "workspace_id": workspace_id,
+        "domain": "user_operations",
+        "$or": [
+            { "account_id": null },
+            { "account_id": account_id },
+        ],
+    };
+    if let Some(expected) = expected_updated_at {
+        chunk_filter.insert("updated_at", parse_expected_chunk_updated_at(expected)?);
+    }
+    state
+        .db
+        .operation_knowledge_chunks()
+        .find_one_with_session(chunk_filter, None, session)
+        .await?
+        .ok_or_else(|| AppError::Conflict("chat_chunk_snapshot_stale".to_string()))?;
     let mut update_doc = Document::new();
     for key in [
         "title",
@@ -1777,7 +2673,7 @@ pub(crate) async fn apply_update_chunk(
     // 审计行 + 数组字段 union（既有 tag 不被整体替换丢弃）+ locked_fields 守门（KB-11）；
     // source=Ai 自动强制 status=draft + integrity_status=needs_review（"AI 永不自动 verify"红线不破）。
     // update_doc 已含 patch 前重算的 source_anchors（复数,不撞 DEFAULT 锁的 source_anchor 单数）。
-    let applied = crate::knowledge_wiki::chunk_revisions::apply_chunk_revision(
+    let applied = crate::knowledge_wiki::chunk_revisions::apply_chunk_revision_with_session(
         &state.db,
         workspace_id,
         oid,
@@ -1788,11 +2684,12 @@ pub(crate) async fn apply_update_chunk(
             reason: Some("知识对话应用草稿".to_string()),
             actor: Some("knowledge_chat".to_string()),
         },
+        session,
     )
     .await?;
-    let _ = applied; // source=Ai 恒 draft+needs_review，响应回填固定形状（语义正确）
     Ok(json!({
         "updatedChunkId": chunk_id,
+        "revisionId": applied.revision_id,
         "fieldsTouched": fields_touched,
         "status": "draft",
         "integrityStatus": "needs_review",
@@ -1859,6 +2756,13 @@ pub(in crate::routes) struct ChatTaskCreateRequest {
     pub session_id: String,
     pub account_id: Option<String>,
     pub operator_id: Option<String>,
+    pub digest_selection: DigestSelectionBinding,
+    #[serde(default)]
+    pub source_turn_index: Option<i32>,
+    #[serde(default)]
+    pub candidate_hash: Option<String>,
+    // Legacy wire fields are accepted only for consistency checks. They are
+    // never used as the source of action, summary, report date, or target.
     #[serde(default)]
     pub card_ids: Vec<String>,
     #[serde(default)]
@@ -1882,6 +2786,165 @@ pub(in crate::routes) fn extract_chunk_ref(
     None
 }
 
+#[derive(Debug)]
+struct ResolvedDigestSelection {
+    cards: Vec<crate::models::KnowledgeDigestCard>,
+    steps: Vec<Document>,
+    candidate_hash: String,
+}
+
+fn digest_candidate_hash(binding: &DigestSelectionBinding, steps: &[Document]) -> String {
+    use sha2::{Digest, Sha256};
+
+    let canonical = json!({
+        "accountId": binding.account_id,
+        "reportId": binding.report_id,
+        "reportDate": binding.report_date,
+        "reportGeneration": binding.report_generation,
+        "reportHash": binding.report_hash,
+        "selectedCards": binding.selected_cards.iter().map(|selected| json!({
+            "cardId": selected.card_id,
+            "cardHash": selected.card_hash,
+        })).collect::<Vec<_>>(),
+        "plannedSteps": steps,
+    });
+    let bytes = serde_json::to_vec(&canonical).expect("dispatch candidate canonical JSON");
+    hex::encode(Sha256::digest(bytes))
+}
+
+fn resolve_digest_selection(
+    report: &crate::models::KnowledgeDailyReport,
+    binding: &DigestSelectionBinding,
+) -> AppResult<ResolvedDigestSelection> {
+    let report_id = report
+        .id
+        .ok_or_else(|| AppError::Conflict("digest_report_identity_missing".to_string()))?;
+    if binding.account_id != report.account_id
+        || binding.report_id != report_id.to_hex()
+        || binding.report_date != report.report_date
+        || binding.report_generation != report.current_generation
+        || binding.report_hash != crate::knowledge_digest::digest_report_snapshot_hash(report)
+    {
+        return Err(AppError::Conflict(
+            "digest_dispatch_snapshot_stale".to_string(),
+        ));
+    }
+    if binding.selected_cards.is_empty() || binding.selected_cards.len() > 8 {
+        return Err(AppError::BadRequest(
+            "selectedCards 必须包含 1..=8 张卡片".to_string(),
+        ));
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    let mut cards = Vec::with_capacity(binding.selected_cards.len());
+    let mut steps = Vec::with_capacity(binding.selected_cards.len());
+    for (idx, selected) in binding.selected_cards.iter().enumerate() {
+        if !seen.insert(selected.card_id.clone()) {
+            return Err(AppError::BadRequest(
+                "selectedCards.cardId 不得重复".to_string(),
+            ));
+        }
+        let card_id = ObjectId::parse_str(&selected.card_id).map_err(|_| {
+            AppError::BadRequest(format!("invalid selected cardId: {}", selected.card_id))
+        })?;
+        let card = report
+            .cards
+            .iter()
+            .find(|card| card.card_id == card_id)
+            .ok_or_else(|| AppError::Conflict("digest_dispatch_card_missing".to_string()))?;
+        if report.dismissed_card_ids.contains(&card_id) {
+            return Err(AppError::Conflict(
+                "digest_dispatch_card_dismissed".to_string(),
+            ));
+        }
+        if selected.card_hash != crate::knowledge_digest::digest_card_snapshot_hash(card) {
+            return Err(AppError::Conflict(
+                "digest_dispatch_card_changed".to_string(),
+            ));
+        }
+        if card.suggested_action == "freeform" {
+            return Err(AppError::BadRequest(format!(
+                "card {} is not dispatchable",
+                selected.card_id
+            )));
+        }
+        if ![
+            "fix_chunk",
+            "add_chunk",
+            "retag",
+            "review_evolution",
+            "dismiss",
+        ]
+        .contains(&card.suggested_action.as_str())
+        {
+            return Err(AppError::BadRequest(format!(
+                "card {} has unsupported suggestedAction={}",
+                selected.card_id, card.suggested_action
+            )));
+        }
+
+        let mut step = doc! {
+            "stepId": format!("step_{}", idx + 1),
+            "cardId": &selected.card_id,
+            "action": &card.suggested_action,
+            "summary": &card.summary,
+            "reportDate": &report.report_date,
+        };
+        if let Some(chunk_id) = extract_chunk_ref(&card.target_refs) {
+            step.insert("targetChunkId", chunk_id);
+        }
+        cards.push(card.clone());
+        steps.push(step);
+    }
+
+    Ok(ResolvedDigestSelection {
+        cards,
+        candidate_hash: digest_candidate_hash(binding, &steps),
+        steps,
+    })
+}
+
+fn legacy_dispatch_payload_matches(
+    card_ids: &[String],
+    planned_steps: &[Value],
+    resolved: &ResolvedDigestSelection,
+) -> AppResult<()> {
+    let authoritative_ids = resolved
+        .steps
+        .iter()
+        .filter_map(|step| step.get_str("cardId").ok())
+        .collect::<Vec<_>>();
+    if !card_ids.is_empty()
+        && card_ids.iter().map(String::as_str).collect::<Vec<_>>() != authoritative_ids
+    {
+        return Err(AppError::Conflict(
+            "digest_dispatch_card_selection_mismatch".to_string(),
+        ));
+    }
+    if planned_steps.is_empty() {
+        return Ok(());
+    }
+    if planned_steps.len() != resolved.steps.len() {
+        return Err(AppError::Conflict(
+            "digest_dispatch_step_count_mismatch".to_string(),
+        ));
+    }
+    for (idx, (provided, authoritative)) in
+        planned_steps.iter().zip(resolved.steps.iter()).enumerate()
+    {
+        for key in ["cardId", "action", "targetChunkId"] {
+            let provided_value = provided.get(key).and_then(Value::as_str);
+            let authoritative_value = authoritative.get_str(key).ok();
+            if provided_value.is_some() && provided_value != authoritative_value {
+                return Err(AppError::Conflict(format!(
+                    "plannedSteps[{idx}].{key} does not match selected digest card"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(in crate::routes) async fn chat_task_create(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
@@ -1891,37 +2954,28 @@ pub(in crate::routes) async fn chat_task_create(
     if session_id.is_empty() {
         return Err(AppError::BadRequest("sessionId 不能为空".to_string()));
     }
-    if body.planned_steps.is_empty() {
-        return Err(AppError::BadRequest(
-            "plannedSteps 不能为空，请先经 chat dispatch 拿到步骤计划".to_string(),
-        ));
-    }
-    if body.planned_steps.len() > 8 {
-        return Err(AppError::BadRequest(
-            "plannedSteps 步数超过 8 条，请由前端分批派工".to_string(),
-        ));
-    }
     let account_id = body
         .account_id
         .clone()
         .unwrap_or_else(|| state.config.default_account_id.clone());
+    validate_account(&state, &admin.current_workspace, &account_id).await?;
+    ensure_chat_session_identity(
+        &state,
+        &admin.current_workspace,
+        &account_id,
+        session_id,
+        &admin.user_id,
+    )
+    .await?;
 
-    // 把 plannedSteps 序列化成 BSON Document 数组（每条至少含 stepId/cardId/action）。
-    // P1-4：action 闭集校验——只接受 worker `execute_step` 已实装的 6 种 action；
-    // 越界（如 LLM 幻觉出 `delete_chunk`）必须在入库前 400 拦掉，不能依赖 worker
-    // 的 fail-soft match-arm 兜底（fail-soft 会污染 completed_steps + summary 计数）。
-    // 该名单与 `parse_cards_from_llm_array` 的 allowed_actions 保持一致。
-    const ALLOWED_TASK_ACTIONS: &[&str] = &[
-        "fix_chunk",
-        "add_chunk",
-        "retag",
-        "review_evolution",
-        "analyze_logs",
-        "dismiss",
-    ];
-    // 先加载今日日报，用其 cards 的 target_refs 构建 cardId → chunk id 解析表。
-    // 卡片驱动/对话驱动两条路的 step.cardId 都引用今日日报卡片。
-    let report_date = chrono::Local::now().format("%Y-%m-%d").to_string();
+    if body.digest_selection.account_id != account_id {
+        return Err(AppError::Conflict(
+            "digest_dispatch_account_mismatch".to_string(),
+        ));
+    }
+
+    // SR-125：任务创建重新读取当前权威日报，并由选中的 card 快照重建步骤。
+    // 客户端传来的 plannedSteps/cardIds 仅做一致性检查，绝不作为写入来源。
     let report = state
         .db
         .knowledge_daily_reports()
@@ -1929,60 +2983,69 @@ pub(in crate::routes) async fn chat_task_create(
             doc! {
                 "workspace_id": &admin.current_workspace,
                 "account_id": &account_id,
-                "report_date": &report_date,
+                "report_date": &body.digest_selection.report_date,
             },
             None,
         )
-        .await?;
-    let mut card_chunk_map: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
-    if let Some(r) = report.as_ref() {
-        for c in &r.cards {
-            if let Some(cid) = extract_chunk_ref(&c.target_refs) {
-                card_chunk_map.insert(c.card_id.to_hex(), cid);
-            }
+        .await?
+        .ok_or_else(|| AppError::Conflict("digest_dispatch_report_missing".to_string()))?;
+    let resolved = resolve_digest_selection(&report, &body.digest_selection)?;
+    legacy_dispatch_payload_matches(&body.card_ids, &body.planned_steps, &resolved)?;
+
+    if let Some(provided_hash) = body.candidate_hash.as_deref() {
+        if provided_hash != resolved.candidate_hash {
+            return Err(AppError::Conflict(
+                "digest_dispatch_candidate_changed".to_string(),
+            ));
         }
     }
 
-    let mut steps_doc: Vec<Document> = Vec::with_capacity(body.planned_steps.len());
-    for (idx, step) in body.planned_steps.iter().enumerate() {
-        let mut d = bson_from_json(step)
-            .map_err(|e| AppError::BadRequest(format!("plannedSteps[{idx}] 非法 JSON: {e}")))?;
-        if d.get_str("stepId").is_err() {
-            d.insert("stepId", format!("step_{}", idx + 1));
-        }
-        let action = d.get_str("action").map_err(|_| {
-            AppError::BadRequest(format!("plannedSteps[{idx}].action 缺失"))
+    // Chat 确认路径必须回读原 assistant turn 中的服务端候选封印。画布直派没有
+    // sourceTurnIndex，但仍受 report/currentGeneration/reportHash/cardHash 全套约束。
+    if let Some(source_turn_index) = body.source_turn_index {
+        let provided_hash = body.candidate_hash.as_deref().ok_or_else(|| {
+            AppError::BadRequest(
+                "candidateHash is required when sourceTurnIndex is provided".to_string(),
+            )
         })?;
-        if !ALLOWED_TASK_ACTIONS.contains(&action) {
-            return Err(AppError::BadRequest(format!(
-                "plannedSteps[{idx}].action='{action}' 不在允许集合内：{:?}",
-                ALLOWED_TASK_ACTIONS
-            )));
+        let source_turn = state
+            .db
+            .knowledge_chat_turns()
+            .find_one(
+                doc! {
+                    "workspace_id": &admin.current_workspace,
+                    "account_id": &account_id,
+                    "session_id": session_id,
+                    "turn_index": source_turn_index,
+                    "role": "assistant",
+                    "intent": "digest_action",
+                },
+                None,
+            )
+            .await?
+            .ok_or_else(|| AppError::Conflict("digest_dispatch_source_turn_missing".to_string()))?;
+        let sealed = source_turn.attachments.iter().any(|attachment| {
+            attachment.get_str("kind").ok() == Some("digest_dispatch_candidate")
+                && attachment.get_str("candidateHash").ok() == Some(provided_hash)
+        });
+        if !sealed {
+            return Err(AppError::Conflict(
+                "digest_dispatch_candidate_unsealed".to_string(),
+            ));
         }
-        // 派工落库时解析 targetChunkId：若 step 已带（对话驱动 LLM 可能直接给）则尊重，
-        // 否则按 cardId 从今日日报卡片 target_refs 解析。fix_chunk/retag 需要它。
-        if d.get_str("targetChunkId").is_err() {
-            if let Ok(card_id) = d.get_str("cardId") {
-                if let Some(chunk_id) = card_chunk_map.get(card_id) {
-                    d.insert("targetChunkId", chunk_id.clone());
-                }
-            }
-        }
-        steps_doc.push(d);
     }
 
-    // cards 快照：从今日日报里反查（best-effort，缺失也允许落 task）。
-    let mut card_snapshots: Vec<crate::models::KnowledgeDigestCard> = vec![];
-    if let Some(r) = report.as_ref() {
-        for cid_hex in &body.card_ids {
-            if let Ok(oid) = ObjectId::parse_str(cid_hex) {
-                if let Some(c) = r.cards.iter().find(|c| c.card_id == oid) {
-                    card_snapshots.push(c.clone());
-                }
-            }
-        }
+    let binding_doc = bson_from_json(&serde_json::to_value(&body.digest_selection)?)
+        .map_err(|error| AppError::Conflict(format!("digest_dispatch_binding_invalid: {error}")))?;
+    let mut dispatch_binding = doc! {
+        "protocol": "digest_dispatch_v1",
+        "candidateHash": &resolved.candidate_hash,
+        "digestSelection": binding_doc,
+    };
+    if let Some(source_turn_index) = body.source_turn_index {
+        dispatch_binding.insert("sourceTurnIndex", source_turn_index);
     }
+    let total_steps = resolved.steps.len();
 
     let task_id = ObjectId::new();
     let task = crate::models::KnowledgeChatTask {
@@ -1990,12 +3053,21 @@ pub(in crate::routes) async fn chat_task_create(
         workspace_id: admin.current_workspace.clone(),
         account_id: account_id.clone(),
         session_id: session_id.to_string(),
+        owner_admin_id: Some(admin.user_id.clone()),
         operator_id: body.operator_id.clone(),
-        cards: card_snapshots,
-        planned_steps: steps_doc,
+        cards: resolved.cards,
+        dispatch_binding: Some(dispatch_binding),
+        planned_steps: resolved.steps,
         completed_steps: vec![],
+        step_intents: vec![],
         status: "pending".to_string(),
         error_kind: None,
+        attempts: 0,
+        claim_generation: 0,
+        worker_id: None,
+        claim_token: None,
+        locked_until: None,
+        heartbeat_at: None,
         created_at: DateTime::now(),
         started_at: None,
         finished_at: None,
@@ -2008,7 +3080,15 @@ pub(in crate::routes) async fn chat_task_create(
 
     // 立刻写一条 task_progress turn 记录派工已落库。
     // P1-7：原子分配新 turn_index，避免与并发 chat_turn / worker 写入冲突。
-    let next_index = allocate_next_turn_indices(&state, &admin.current_workspace, session_id, 1).await?;
+    let next_index = allocate_next_turn_indices(
+        &state,
+        &admin.current_workspace,
+        &account_id,
+        session_id,
+        &admin.user_id,
+        1,
+    )
+    .await?;
     let turn = KnowledgeChatTurn {
         id: None,
         workspace_id: admin.current_workspace.clone(),
@@ -2019,14 +3099,15 @@ pub(in crate::routes) async fn chat_task_create(
         intent: Some("digest_action".to_string()),
         content: format!(
             "AI 已收到派工，taskId={}，共 {} 步，等待 worker 串行执行",
-            task_id,
-            body.planned_steps.len()
+            task_id, total_steps
         ),
         attachments: vec![doc! { "taskId": task_id, "phase": "queued" }],
         patch: None,
         missing_fields: vec![],
         followup_questions: vec![],
         status: "pending".to_string(),
+        apply_result: None,
+        applied_at: None,
         tokens_used: 0,
         prompt_key: None,
         kind: Some("task_progress".to_string()),
@@ -2038,19 +3119,27 @@ pub(in crate::routes) async fn chat_task_create(
         .knowledge_chat_turns()
         .insert_one(turn, None)
         .await?;
-    state.chat_progress_bus.bump(session_id).await;
+    state
+        .chat_progress_bus
+        .bump(&chat_session_bus_key(
+            &admin.current_workspace,
+            &account_id,
+            session_id,
+        ))
+        .await;
 
     Ok(Json(json!({
         "taskId": task_id.to_hex(),
         "sessionId": session_id,
         "status": "pending",
-        "totalSteps": body.planned_steps.len() as i32,
+        "totalSteps": total_steps as i32,
     })))
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(in crate::routes) struct ChatTaskListQuery {
+    pub account_id: Option<String>,
     pub status: Option<String>,
     pub limit: Option<i64>,
 }
@@ -2069,7 +3158,16 @@ pub(in crate::routes) async fn chat_task_list(
     Extension(admin): Extension<AuthenticatedAdmin>,
     Query(query): Query<ChatTaskListQuery>,
 ) -> AppResult<Json<Value>> {
-    let mut filter = doc! { "workspace_id": &admin.current_workspace };
+    let account_id = expected_chat_account(
+        query.account_id.as_deref(),
+        &state.config.default_account_id,
+    );
+    validate_account(&state, &admin.current_workspace, &account_id).await?;
+    let mut filter = doc! {
+        "workspace_id": &admin.current_workspace,
+        "account_id": &account_id,
+        "owner_admin_id": &admin.user_id,
+    };
     if let Some(status) = query.status.as_ref().filter(|s| !s.trim().is_empty()) {
         filter.insert("status", status.trim());
     }
@@ -2089,6 +3187,7 @@ pub(in crate::routes) async fn chat_task_list(
     while let Some(task) = cursor.try_next().await? {
         items.push(json!({
             "taskId": task.id.map(|i| i.to_hex()).unwrap_or_default(),
+            "accountId": task.account_id,
             "sessionId": task.session_id,
             "status": task.status,
             "errorKind": task.error_kind,
@@ -2107,20 +3206,32 @@ pub(in crate::routes) async fn chat_task_get(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id_hex): Path<String>,
+    Query(query): Query<ChatSessionScopeQuery>,
 ) -> AppResult<Json<Value>> {
+    let account_id = expected_chat_account(
+        query.account_id.as_deref(),
+        &state.config.default_account_id,
+    );
+    validate_account(&state, &admin.current_workspace, &account_id).await?;
     let oid = ObjectId::parse_str(&id_hex)
         .map_err(|_| AppError::BadRequest(format!("invalid task id: {id_hex}")))?;
     let task = state
         .db
         .knowledge_chat_tasks()
         .find_one(
-            doc! { "_id": oid, "workspace_id": &admin.current_workspace },
+            doc! {
+                "_id": oid,
+                "workspace_id": &admin.current_workspace,
+                "account_id": &account_id,
+                "owner_admin_id": &admin.user_id,
+            },
             None,
         )
         .await?
         .ok_or_else(|| AppError::NotFound(format!("knowledge_chat_task {id_hex} 不存在")))?;
     Ok(Json(json!({
         "taskId": task.id.map(|i| i.to_hex()).unwrap_or_default(),
+        "accountId": task.account_id,
         "sessionId": task.session_id,
         "status": task.status,
         "errorKind": task.error_kind,
@@ -2145,7 +3256,13 @@ pub(in crate::routes) async fn chat_task_cancel(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id_hex): Path<String>,
+    Query(query): Query<ChatSessionScopeQuery>,
 ) -> AppResult<Json<Value>> {
+    let account_id = expected_chat_account(
+        query.account_id.as_deref(),
+        &state.config.default_account_id,
+    );
+    validate_account(&state, &admin.current_workspace, &account_id).await?;
     let oid = ObjectId::parse_str(&id_hex)
         .map_err(|_| AppError::BadRequest(format!("invalid task id: {id_hex}")))?;
     let res = state
@@ -2155,9 +3272,22 @@ pub(in crate::routes) async fn chat_task_cancel(
             doc! {
                 "_id": oid,
                 "workspace_id": &admin.current_workspace,
+                "account_id": &account_id,
+                "owner_admin_id": &admin.user_id,
                 "status": doc! { "$in": ["pending", "running"] }
             },
-            doc! { "$set": { "status": "cancelled", "finished_at": DateTime::now() } },
+            doc! {
+                "$set": {
+                    "status": "cancelled",
+                    "finished_at": DateTime::now(),
+                },
+                "$unset": {
+                    "worker_id": "",
+                    "claim_token": "",
+                    "locked_until": "",
+                    "heartbeat_at": "",
+                },
+            },
             None,
         )
         .await?;
@@ -2169,7 +3299,12 @@ pub(in crate::routes) async fn chat_task_cancel(
             .db
             .knowledge_chat_tasks()
             .find_one(
-                doc! { "_id": oid, "workspace_id": &admin.current_workspace },
+                doc! {
+                    "_id": oid,
+                    "workspace_id": &admin.current_workspace,
+                    "account_id": &account_id,
+                    "owner_admin_id": &admin.user_id,
+                },
                 None,
             )
             .await?;
@@ -2189,7 +3324,9 @@ pub(in crate::routes) async fn chat_task_cancel(
             }
         }
     }
-    Ok(Json(json!({ "ok": true, "taskId": id_hex, "status": "cancelled" })))
+    Ok(Json(
+        json!({ "ok": true, "taskId": id_hex, "status": "cancelled" }),
+    ))
 }
 
 /// `GET /api/knowledge/chat/sessions/:sid/stream`：SSE 推送最新 turn_index。
@@ -2200,13 +3337,37 @@ pub(in crate::routes) async fn chat_task_cancel(
 /// 事件应主动关闭 + 不再重连，避免占用连接。
 pub(in crate::routes) async fn chat_session_stream(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(session_id): Path<String>,
-) -> axum::response::Sse<
-    impl futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
+    Query(query): Query<ChatSessionScopeQuery>,
+) -> AppResult<
+    axum::response::Sse<
+        impl futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
+    >,
 > {
-    use axum::response::sse::{Event, KeepAlive, Sse};
     use crate::knowledge_task::CLOSE_SENTINEL;
-    let rx = state.chat_progress_bus.subscribe(&session_id).await;
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    let session_id = session_id.trim().to_string();
+    if session_id.is_empty() {
+        return Err(AppError::BadRequest(
+            "sessionId cannot be empty".to_string(),
+        ));
+    }
+    let account_id = expected_chat_account(
+        query.account_id.as_deref(),
+        &state.config.default_account_id,
+    );
+    validate_account(&state, &admin.current_workspace, &account_id).await?;
+    require_chat_session_identity(
+        &state,
+        &admin.current_workspace,
+        &account_id,
+        &session_id,
+        &admin.user_id,
+    )
+    .await?;
+    let bus_key = chat_session_bus_key(&admin.current_workspace, &account_id, &session_id);
+    let rx = state.chat_progress_bus.subscribe(&bus_key).await;
     // 用 futures::stream::unfold 把 watch::Receiver 转成 SSE Stream，
     // 避免引入 tokio-stream 新依赖。state 是 (Receiver, closed) 元组——一旦
     // 推过 close event 就把 closed=true，下一次 poll 时直接 return None。
@@ -2226,12 +3387,53 @@ pub(in crate::routes) async fn chat_session_stream(
         let event = Event::default().event("turn").data(v.to_string());
         Some((Ok::<_, std::convert::Infallible>(event), (rx, false)))
     });
-    Sse::new(stream).keep_alive(KeepAlive::default())
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_attachment_accepts_frozen_camel_case_contract_only() {
+        let attachment: ChatAttachment = serde_json::from_value(json!({
+            "chunkId": "64a1f2c3e4b5a6978899aabb",
+            "expectedUpdatedAt": "2026-07-27T03:00:00Z",
+            "operation": "update"
+        }))
+        .expect("camelCase attachment");
+        assert_eq!(
+            attachment.chunk_id.as_deref(),
+            Some("64a1f2c3e4b5a6978899aabb")
+        );
+        assert_eq!(
+            attachment.expected_updated_at.as_deref(),
+            Some("2026-07-27T03:00:00Z")
+        );
+        assert_eq!(attachment.operation, Some(ChatAttachmentOperation::Update));
+        assert!(serde_json::from_value::<ChatAttachment>(json!({
+            "chunk_id": "64a1f2c3e4b5a6978899aabb"
+        }))
+        .is_err());
+        assert!(serde_json::from_value::<ChatAttachment>(json!({
+            "chunkId": "64a1f2c3e4b5a6978899aabb",
+            "operation": "create"
+        }))
+        .is_err());
+        assert_eq!(
+            forced_chat_intent(attachment.operation),
+            Some("update_chunk")
+        );
+        assert_eq!(forced_chat_intent(None), None);
+    }
+
+    #[test]
+    fn duplicate_key_codes_are_classified_without_widening_other_db_errors() {
+        assert!(is_duplicate_key_code(11000));
+        assert!(is_duplicate_key_code(11001));
+        assert!(!is_duplicate_key_code(10999));
+        assert!(!is_duplicate_key_code(112));
+    }
 
     // resolve_quote_anchors 是 create / update 两条对话补库路径共用的 D2 锚定规则。
     // 这些单测把"quote 与 anchor 必须成对"的不变量钉死在本地 lib 层——`apply_*_chunk`
@@ -2327,12 +3529,121 @@ mod tests {
         assert_eq!(clamp_task_list_limit(Some(10)), 10, "区间内原值");
         assert_eq!(clamp_task_list_limit(Some(9999)), 200, "上界 clamp 到 200");
     }
+
+    #[test]
+    fn tool_calling_raw_payload_is_replaced_by_explicit_final_fallback() {
+        let raw = json!({
+            "decisionPhase": "tool_calling",
+            "toolCalls": [{ "tool": "knowledge.search", "arguments": { "query": "x" } }]
+        });
+        let payload = finalize_chat_tool_loop_payload(
+            Some(raw),
+            "final",
+            &["chat_tool_loop_exhausted".to_string()],
+        );
+        assert_eq!(payload["decisionPhase"], "final");
+        assert_eq!(payload["toolLoopTruncated"], true);
+        assert_eq!(payload["toolLoopStopReason"], "loop_exhausted");
+        assert!(payload.get("toolCalls").is_none());
+    }
+
+    #[test]
+    fn genuine_final_raw_payload_is_preserved() {
+        let raw =
+            json!({ "decisionPhase": "final", "naturalReply": "done", "patch": { "title": "t" } });
+        let payload = finalize_chat_tool_loop_payload(Some(raw.clone()), "final", &[]);
+        assert_eq!(payload, raw);
+    }
+
+    #[test]
+    fn revoked_operator_memory_is_never_rendered_for_chat_prompt() {
+        let now = DateTime::from_millis(1);
+        let revoked = crate::models::KnowledgeOperatorMemory {
+            id: Some(ObjectId::new()),
+            workspace_id: "ws-a".to_string(),
+            account_id: "account-a".to_string(),
+            operator_id: "operator-a".to_string(),
+            kind: "rejection".to_string(),
+            content: "不要使用旧模板".to_string(),
+            created_at: now,
+            last_used_at: now,
+            expires_at: None,
+            revoked_at: Some(now),
+            revoked_by: Some("admin-a".to_string()),
+            revocation_reason: Some("规则已过期".to_string()),
+        };
+        let active = crate::models::KnowledgeOperatorMemory {
+            id: Some(ObjectId::new()),
+            content: "回复保持简洁".to_string(),
+            revoked_at: None,
+            revoked_by: None,
+            revocation_reason: None,
+            ..revoked.clone()
+        };
+
+        let rendered = render_operator_memory_for_prompt(&[revoked, active]);
+        assert!(!rendered.contains("不要使用旧模板"));
+        assert!(rendered.contains("回复保持简洁"));
+    }
 }
 
 #[cfg(test)]
 mod dispatch_resolution_tests {
-    use super::extract_chunk_ref;
-    use mongodb::bson::doc;
+    use super::{
+        extract_chunk_ref, legacy_dispatch_payload_matches, resolve_digest_selection,
+        DigestSelectedCardBinding, DigestSelectionBinding,
+    };
+    use crate::models::{KnowledgeDailyReport, KnowledgeDigestCard};
+    use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
+    use serde_json::json;
+
+    fn bound_report() -> (KnowledgeDailyReport, DigestSelectionBinding) {
+        let report_id = ObjectId::new();
+        let card_id = ObjectId::new();
+        let card = KnowledgeDigestCard {
+            card_id,
+            kind: "chunk_missing_field".to_string(),
+            title: "缺少出处".to_string(),
+            summary: "为切片补充出处".to_string(),
+            target_refs: vec![doc! { "kind": "chunk", "id": "chunk-authoritative" }],
+            suggested_action: "fix_chunk".to_string(),
+            severity: "warn".to_string(),
+            metric: None,
+        };
+        let report = KnowledgeDailyReport {
+            id: Some(report_id),
+            workspace_id: "ws-a".to_string(),
+            account_id: "account-a".to_string(),
+            report_date: "2026-07-27".to_string(),
+            generated_at: DateTime::now(),
+            generated_by: "worker".to_string(),
+            status: "ok".to_string(),
+            error_kind: None,
+            budget_snapshot: Document::new(),
+            cards: vec![card.clone()],
+            dismissed_card_ids: vec![],
+            prompt_versions: Document::new(),
+            attempt_generation: 3,
+            current_generation: 3,
+            latest_attempt_status: Some("ok".to_string()),
+            latest_attempt_error_kind: None,
+            latest_attempt_at: Some(DateTime::now()),
+            latest_attempt_budget_snapshot: Document::new(),
+            last_success_at: Some(DateTime::now()),
+        };
+        let binding = DigestSelectionBinding {
+            account_id: report.account_id.clone(),
+            report_id: report_id.to_hex(),
+            report_date: report.report_date.clone(),
+            report_generation: report.current_generation,
+            report_hash: crate::knowledge_digest::digest_report_snapshot_hash(&report),
+            selected_cards: vec![DigestSelectedCardBinding {
+                card_id: card_id.to_hex(),
+                card_hash: crate::knowledge_digest::digest_card_snapshot_hash(&card),
+            }],
+        };
+        (report, binding)
+    }
 
     #[test]
     fn extract_chunk_ref_returns_first_chunk_id() {
@@ -2357,5 +3668,46 @@ mod dispatch_resolution_tests {
             doc! { "kind": "chunk", "id": "c9" },
         ];
         assert_eq!(extract_chunk_ref(&refs), Some("c9".to_string()));
+    }
+
+    #[test]
+    fn dispatch_steps_are_rebuilt_from_authoritative_digest_card() {
+        let (report, binding) = bound_report();
+        let resolved = resolve_digest_selection(&report, &binding).expect("valid binding");
+        assert_eq!(resolved.steps.len(), 1);
+        assert_eq!(resolved.steps[0].get_str("action").unwrap(), "fix_chunk");
+        assert_eq!(
+            resolved.steps[0].get_str("targetChunkId").unwrap(),
+            "chunk-authoritative"
+        );
+        assert_eq!(
+            resolved.steps[0].get_str("summary").unwrap(),
+            "为切片补充出处"
+        );
+    }
+
+    #[test]
+    fn tampered_client_action_or_target_is_rejected() {
+        let (report, binding) = bound_report();
+        let resolved = resolve_digest_selection(&report, &binding).expect("valid binding");
+        let tampered = vec![json!({
+            "cardId": binding.selected_cards[0].card_id,
+            "action": "dismiss",
+            "targetChunkId": "chunk-attacker-controlled"
+        })];
+        let error = legacy_dispatch_payload_matches(&[], &tampered, &resolved)
+            .expect_err("tampered client step must be rejected");
+        assert!(error
+            .to_string()
+            .contains("does not match selected digest card"));
+    }
+
+    #[test]
+    fn stale_report_generation_is_rejected() {
+        let (report, mut binding) = bound_report();
+        binding.report_generation -= 1;
+        let error = resolve_digest_selection(&report, &binding)
+            .expect_err("stale generation must not dispatch");
+        assert_eq!(error.to_string(), "digest_dispatch_snapshot_stale");
     }
 }

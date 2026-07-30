@@ -41,13 +41,14 @@ use super::AppState;
 /// 已知限制由 `tests::to_snake_case_known_limitation_trailing_uppercase` 锁定。
 fn to_snake_case(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
-    for (i, c) in s.chars().enumerate() {
+    let chars: Vec<char> = s.chars().collect();
+    for (i, c) in chars.iter().copied().enumerate() {
         if c.is_ascii_uppercase() && i > 0 {
             // 检查是否需要在前面插入 _：前一个字符是字母/数字，后一个字符是字母
-            let prev = s[..i].chars().last();
-            let next = s[i..].chars().nth(1);
-            let prev_is_letter_or_digit = prev.map_or(false, |p| p.is_alphanumeric());
-            let next_is_lower = next.map_or(false, |n| n.is_ascii_lowercase());
+            let prev_is_letter_or_digit = chars[i - 1].is_alphanumeric();
+            let next_is_lower = chars
+                .get(i + 1)
+                .is_some_and(|next| next.is_ascii_lowercase());
             if prev_is_letter_or_digit && next_is_lower {
                 result.push('_');
             }
@@ -70,9 +71,7 @@ fn normalize_json_keys(value: Value) -> Value {
                 .collect();
             Value::Object(normalized)
         }
-        Value::Array(arr) => {
-            Value::Array(arr.into_iter().map(normalize_json_keys).collect())
-        }
+        Value::Array(arr) => Value::Array(arr.into_iter().map(normalize_json_keys).collect()),
         other => other,
     }
 }
@@ -210,7 +209,10 @@ async fn gather_knowledge_titles(state: &AppState, workspace_id: &str) -> String
         .await;
     let mut titles: Vec<String> = Vec::new();
     if let Ok(cursor) = cursor {
-        let raw = cursor.try_collect::<Vec<Document>>().await.unwrap_or_default();
+        let raw = cursor
+            .try_collect::<Vec<Document>>()
+            .await
+            .unwrap_or_default();
         for d in raw {
             if let Ok(t) = d.get_str("title") {
                 if !t.trim().is_empty() {
@@ -222,7 +224,10 @@ async fn gather_knowledge_titles(state: &AppState, workspace_id: &str) -> String
     if titles.is_empty() {
         String::new()
     } else {
-        format!("\n\n已导入的行业文档（标题，供你理解本行业术语/字段）：\n{}", titles.join("\n"))
+        format!(
+            "\n\n已导入的行业文档（标题，供你理解本行业术语/字段）：\n{}",
+            titles.join("\n")
+        )
     }
 }
 
@@ -322,7 +327,9 @@ pub async fn generate_domain_profile_candidate(
     Json(payload): Json<GenerateProfileRequest>,
 ) -> AppResult<Json<Value>> {
     if payload.business_description.trim().is_empty() {
-        return Err(AppError::BadRequest("businessDescription 不能为空".to_string()));
+        return Err(AppError::BadRequest(
+            "businessDescription 不能为空".to_string(),
+        ));
     }
     if payload.profile_id.trim().is_empty() {
         return Err(AppError::BadRequest("profileId 不能为空".to_string()));
@@ -336,7 +343,7 @@ pub async fn generate_domain_profile_candidate(
 
     // C3：生成器 system 走 active profile 的领域中性引导语（DEFAULT 已去销售偏见）。
     let active_profile =
-        agent::domain_profile::load_active_domain_profile(&state.db, &workspace_id).await;
+        agent::domain_profile::load_active_domain_profile(&state.db, &workspace_id).await?;
     let system = match active_profile
         .methodology_generator_preamble
         .as_deref()
@@ -356,6 +363,7 @@ pub async fn generate_domain_profile_candidate(
     );
     let generated = agent::generate_agent_json(
         &state,
+        &workspace_id,
         None,
         None,
         None,
@@ -402,9 +410,10 @@ pub async fn generate_domain_profile_candidate(
     profile.profile_id = payload.profile_id.clone();
     profile.workspace_id = workspace_id.clone();
     profile.display_name = display_name;
-    profile.version = next_candidate_version(&state, &workspace_id, &payload.profile_id).await?;
+    profile.version = 0;
     profile.current_version = false; // 候选草稿:需人审 → publish → activate
     profile.previous_version = None;
+    profile.release_status = "draft".to_string();
     profile.is_active = false;
     profile.seeded_by = Some("generated_by_ai".to_string());
     profile.created_at = now;
@@ -445,12 +454,8 @@ pub async fn generate_domain_profile_candidate(
         }
     };
 
-    let inserted = state.db.domain_profiles().insert_one(&profile, None).await?;
-    let hex = inserted
-        .inserted_id
-        .as_object_id()
-        .map(|i| i.to_hex())
-        .unwrap_or_default();
+    let profile = super::domain_profiles::append_domain_profile_draft(&state.db, profile).await?;
+    let hex = profile.id.map(|i| i.to_hex()).unwrap_or_default();
 
     // 流 C：AI 建议的维度取值落候选层（绝不直接进 system_taxonomies——守「AI 永不自动
     // verify」红线），复用运行时同一候选 → admin approve 通路。confidence 传 10（即
@@ -483,34 +488,11 @@ pub async fn generate_domain_profile_candidate(
     })))
 }
 
-/// 候选版本号：同 (workspace, profile_id) 取 max(version)+1（与 3A-3 同口径）。
-async fn next_candidate_version(
-    state: &AppState,
-    workspace_id: &str,
-    profile_id: &str,
-) -> AppResult<i32> {
-    let raw = state.db.domain_profiles().clone_with_type::<Document>();
-    let mut cursor = raw
-        .find(
-            doc! { "workspace_id": workspace_id, "profile_id": profile_id },
-            FindOptions::builder()
-                .sort(doc! { "version": -1_i32 })
-                .limit(1_i64)
-                .projection(doc! { "version": 1_i32 })
-                .build(),
-        )
-        .await?;
-    let max = if let Some(d) = cursor.try_next().await? {
-        d.get_i32("version").unwrap_or(0)
-    } else {
-        0
-    };
-    Ok(max + 1)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{coerce_scalar_string_fields, extract_suggested_values, normalize_json_keys, to_snake_case};
+    use super::{
+        coerce_scalar_string_fields, extract_suggested_values, normalize_json_keys, to_snake_case,
+    };
     use serde_json::json;
 
     /// 生产输入的正确性基线:LLM 实际输出的典型 camelCase key 必须正确归一化。
@@ -533,6 +515,12 @@ mod tests {
         assert_eq!(to_snake_case("HTTPServer"), "http_server");
         // APIKey → api_key(K 后跟 e,在 K 前插下划线)。
         assert_eq!(to_snake_case("APIKey"), "api_key");
+    }
+
+    #[test]
+    fn to_snake_case_handles_non_ascii_prefix_without_byte_indexing() {
+        assert_eq!(to_snake_case("客户Stage"), "客户_stage");
+        assert_eq!(to_snake_case("éValue"), "é_value");
     }
 
     /// 已知限制锁定:末尾连续大写不插下划线(后面没有小写字母触发分隔)。
@@ -577,7 +565,10 @@ mod tests {
         let out = coerce_scalar_string_fields(input);
         assert!(out["prompt_fragment"].is_string(), "对象应被压平成字符串");
         let s = out["prompt_fragment"].as_str().unwrap();
-        assert!(s.contains("客户处境") && s.contains("先倾听"), "内容须保留: {s}");
+        assert!(
+            s.contains("客户处境") && s.contains("先倾听"),
+            "内容须保留: {s}"
+        );
         // 本就是字符串的 description 原样不动。
         assert_eq!(out["description"], json!("正常字符串"));
     }
@@ -747,8 +738,8 @@ mod tests {
         });
         let normalized = coerce_scalar_string_fields(normalize_json_keys(generated));
         let doc = to_profile_doc(normalized);
-        let profile: crate::models::DomainProfile = mongodb::bson::from_document(doc)
-            .expect("嵌套 description 对象应被 coerce 压平(G32)");
+        let profile: crate::models::DomainProfile =
+            mongodb::bson::from_document(doc).expect("嵌套 description 对象应被 coerce 压平(G32)");
         assert!(
             !profile.profile_dimensions[0].description.is_empty(),
             "压平后的 description 须保留内容"
@@ -769,8 +760,14 @@ mod tests {
         });
         let normalized = coerce_scalar_string_fields(normalize_json_keys(generated));
         // normalize 后键应为 snake_case，值保留。
-        assert_eq!(normalized["soul_override"], json!("我是教培行业的陪伴式顾问"));
-        assert!(normalized.get("soulOverride").is_none(), "camelCase 键不应残留");
+        assert_eq!(
+            normalized["soul_override"],
+            json!("我是教培行业的陪伴式顾问")
+        );
+        assert!(
+            normalized.get("soulOverride").is_none(),
+            "camelCase 键不应残留"
+        );
         // from_document 落 DomainProfile，三 Option 字段为 Some。
         let doc = to_profile_doc(normalized);
         let profile: crate::models::DomainProfile =
@@ -901,7 +898,8 @@ mod tests {
             .expect("应抽出 stateMachine");
 
         // (1) 抽出的 stateMachine 经 to_document 后内层 key 仍是 camelCase。
-        let sm_doc = mongodb::bson::to_document(&raw_state_machine).expect("stateMachine → Document");
+        let sm_doc =
+            mongodb::bson::to_document(&raw_state_machine).expect("stateMachine → Document");
         let states = sm_doc.get_array("states").expect("states 数组应在");
         let first = states[0].as_document().expect("首态应是 document");
         assert!(

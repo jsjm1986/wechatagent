@@ -1,0 +1,238 @@
+{
+  "schemaVersion": 1,
+  "statusAuthority": "This manifest, not historical markdown checkboxes, is authoritative for delivery status.",
+  "asOf": "2026-07-24",
+  "specs": {
+    "autonomy": ".kiro/specs/agent-autonomy-loop/tasks.md",
+    "evolution": ".kiro/specs/agent-self-evolution/tasks.md",
+    "hardening": ".kiro/specs/user-ops-agent-hardening/tasks.md"
+  },
+  "records": [
+    {
+      "spec": "autonomy",
+      "taskIds": ["1", "2", "3", "4", "5", "6", "7", "1.1", "1.2", "1.3", "1.4", "1.5", "1.6"],
+      "state": "partial",
+      "implementation": ["src/db/indexes.rs", "src/models.rs", "scripts/check-baseline.sh"],
+      "productionEntrypoints": ["src/main.rs"],
+      "tests": [],
+      "ciJobs": [],
+      "note": "Historical wave parents and W0 mix shipped code, obsolete migration names, and acceptance claims that were not all rerun on one frozen revision."
+    },
+    {
+      "spec": "autonomy",
+      "taskIds": ["2.1", "2.2", "2.3", "2.4", "2.5", "2.6"],
+      "state": "production_wired",
+      "implementation": ["src/agent/run_envelope.rs#write_run_envelope_started", "src/agent/types.rs#RawAgentDecision"],
+      "productionEntrypoints": ["src/agent/gateway.rs#write_run_envelope_started"],
+      "tests": ["tests/run_envelope_integration.rs#envelope_started_written_before_any_llm_call"],
+      "ciJobs": []
+    },
+    {
+      "spec": "autonomy",
+      "taskIds": ["3.1", "3.2", "3.3", "3.4", "3.5", "3.6", "3.7"],
+      "state": "production_wired",
+      "implementation": ["src/agent/review/gates.rs#finalize_review_for_send", "src/agent/review/mod.rs#local_decision_review"],
+      "productionEntrypoints": ["src/agent/gateway.rs#finalize_review_for_send"],
+      "tests": ["tests/autonomy_protocol_pbt.rs#p2_single_shot_revision_caps_reply_calls_at_two"],
+      "ciJobs": []
+    },
+    {
+      "spec": "autonomy",
+      "taskIds": ["3.8", "4.16", "5.9", "6.11", "7.9"],
+      "state": "partial",
+      "implementation": ["scripts/check-baseline.sh"],
+      "productionEntrypoints": [],
+      "tests": [],
+      "ciJobs": ["baseline"],
+      "note": "Checkpoint wording claimed all tests passed, but the historical acceptance sets include soft, removed, or non-equivalent tests."
+    },
+    {
+      "spec": "autonomy",
+      "taskIds": ["4.1", "4.2", "4.6", "4.7", "4.8", "4.9"],
+      "state": "production_wired",
+      "implementation": ["src/agent/knowledge_tools.rs", "src/agent/taxonomy.rs", "src/routes/admin_taxonomies.rs"],
+      "productionEntrypoints": ["src/routes/knowledge/chat.rs#chat_reply_with_tools_loop", "src/routes/mod.rs#admin_taxonomies"],
+      "tests": ["tests/taxonomy_flags_e2e.rs"],
+      "ciJobs": []
+    },
+    {
+      "spec": "autonomy",
+      "taskIds": ["4.3", "4.5"],
+      "state": "sunset_not_shipped",
+      "implementation": [],
+      "productionEntrypoints": [],
+      "tests": [],
+      "ciJobs": [],
+      "note": "The requested reply_with_tools_loop production path was never wired and was later removed; a different knowledge-chat tool loop exists."
+    },
+    {
+      "spec": "autonomy",
+      "taskIds": ["4.4", "4.10", "4.12", "4.13", "4.14", "4.15"],
+      "state": "implemented",
+      "implementation": ["tests/autonomy_protocol_pbt.rs", "src/agent/taxonomy.rs"],
+      "productionEntrypoints": [],
+      "tests": ["tests/autonomy_protocol_pbt.rs#p1_autonomy_required_fields_violation_always_emits_risk_tag"],
+      "ciJobs": []
+    },
+    {
+      "spec": "autonomy",
+      "taskIds": ["4.11"],
+      "state": "partial",
+      "implementation": ["src/agent/taxonomy.rs"],
+      "productionEntrypoints": ["src/agent/gateway.rs"],
+      "tests": [],
+      "ciJobs": [],
+      "note": "Taxonomy behavior exists, but the specifically claimed P6 property is not present in autonomy_protocol_pbt."
+    },
+    {
+      "spec": "autonomy",
+      "taskIds": ["5.1", "5.2", "5.3", "5.4", "5.5", "5.6"],
+      "state": "production_wired",
+      "implementation": ["src/agent/outbox.rs", "src/agent/outbox_dispatcher.rs#process_entry"],
+      "productionEntrypoints": ["src/agent/gateway.rs#enqueue", "src/main.rs#run_outbox_dispatcher"],
+      "tests": ["tests/outbox_integration.rs#happy_path_enqueue_claim_send_sent"],
+      "ciJobs": []
+    },
+    {
+      "spec": "autonomy",
+      "taskIds": ["5.7"],
+      "state": "implemented",
+      "implementation": ["src/agent/outbox.rs", "src/agent/outbox_dispatcher.rs"],
+      "productionEntrypoints": [],
+      "tests": ["tests/outbox_integration.rs#idempotency_key_yields_at_most_one_mcp_send"],
+      "ciJobs": []
+    },
+    {
+      "spec": "autonomy",
+      "taskIds": ["5.8"],
+      "state": "partial",
+      "implementation": ["tests/outbox_integration.rs"],
+      "productionEntrypoints": ["src/agent/outbox_dispatcher.rs#process_entry"],
+      "tests": ["tests/outbox_integration.rs#delivery_redline_in_flight_stop_request_fences_remote_send"],
+      "ciJobs": ["real-llm-smoke-t4"],
+      "note": "Real dispatcher barriers now exist, but the historical arbitrary-state PBT claim is not equivalent and the dynamic gate has not been evidenced on this working tree."
+    },
+    {
+      "spec": "autonomy",
+      "taskIds": ["6.1", "6.2", "6.3", "6.4", "6.5", "6.6", "6.7"],
+      "state": "production_wired",
+      "implementation": ["src/agent/memory.rs", "src/models.rs#MemoryCardTyped"],
+      "productionEntrypoints": ["src/tasks.rs#handle_memory_consolidation_task_with_claim"],
+      "tests": ["tests/memory_card_invariants.rs"],
+      "ciJobs": []
+    },
+    {
+      "spec": "autonomy",
+      "taskIds": ["6.8", "6.9", "6.10"],
+      "state": "implemented",
+      "implementation": ["tests/memory_card_invariants.rs", "src/agent/memory.rs"],
+      "productionEntrypoints": [],
+      "tests": ["tests/memory_card_invariants.rs"],
+      "ciJobs": []
+    },
+    {
+      "spec": "autonomy",
+      "taskIds": ["7.1", "7.2", "7.7"],
+      "state": "production_wired",
+      "implementation": ["src/routes/outcomes_autonomy.rs", "frontend/src/features/autonomy/index.tsx", "scripts/check-no-human-takeover.sh"],
+      "productionEntrypoints": ["src/routes/mod.rs#/outcomes/autonomy", ".github/workflows/ci.yml#check-no-human-takeover.sh"],
+      "tests": ["tests/outcomes_autonomy_endpoint.rs"],
+      "ciJobs": []
+    },
+    {
+      "spec": "autonomy",
+      "taskIds": ["7.3", "7.4", "7.5", "7.6", "7.8"],
+      "state": "partial",
+      "implementation": ["tests/happy_path_run.rs", "src/agent/run_envelope.rs"],
+      "productionEntrypoints": ["src/agent/gateway.rs"],
+      "tests": ["tests/happy_path_run.rs"],
+      "ciJobs": [],
+      "note": "Artifacts exist, but the historical end-to-end and all-tests-passed acceptance statements are not bound to one blocking artifact."
+    },
+    {
+      "spec": "evolution",
+      "taskIds": ["1", "2", "3", "4", "5", "6"],
+      "state": "partial",
+      "implementation": ["src/evolution/mod.rs", "src/routes/evolution.rs"],
+      "productionEntrypoints": ["src/main.rs#run_evolutionary_worker"],
+      "tests": ["tests/evolution_prompt_shadow.rs"],
+      "ciJobs": [],
+      "note": "Wave parents include removed acceptance artifacts and therefore cannot inherit a blanket done state."
+    },
+    {
+      "spec": "evolution",
+      "taskIds": ["1.1", "1.2", "1.3", "1.4", "1.5", "2.1", "2.2", "2.3", "2.4", "2.5", "3.1", "3.2", "3.3", "3.4", "3.5", "4.1", "4.2", "4.3", "4.4", "4.5", "4.6", "5.1", "5.2", "5.3", "5.4", "5.5", "5.6", "5.7", "5.8"],
+      "state": "production_wired",
+      "implementation": ["src/evolution/mod.rs#run_one_tick", "src/evolution/replay.rs#run_shadow_replay", "src/evolution/release.rs#release_threshold", "src/routes/evolution.rs"],
+      "productionEntrypoints": ["src/main.rs#run_evolutionary_worker", "src/routes/mod.rs#/evolution"],
+      "tests": ["tests/evolution_prompt_shadow.rs#run_shadow_replay_prompt_completed_fills_both_sides", "tests/evolution_release_redline.rs#release_prompt_accepts_clean_append_snippet"],
+      "ciJobs": []
+    },
+    {
+      "spec": "evolution",
+      "taskIds": ["1.6", "2.6", "3.6", "4.7", "5.10"],
+      "state": "implemented",
+      "implementation": ["src/evolution/mod.rs", "frontend/src/__tests__/features/evolution/evolution.test.tsx"],
+      "productionEntrypoints": [],
+      "tests": ["tests/evolution_prompt_shadow.rs", "frontend/src/__tests__/features/evolution/evolution.test.tsx"],
+      "ciJobs": []
+    },
+    {
+      "spec": "evolution",
+      "taskIds": ["4.8", "5.9"],
+      "state": "sunset_not_shipped",
+      "implementation": [],
+      "productionEntrypoints": [],
+      "tests": [],
+      "ciJobs": [],
+      "note": "The named significance PBT and four testcontainer E2E files were deleted; later tests are useful but not equivalent to the original acceptance claim."
+    },
+    {
+      "spec": "evolution",
+      "taskIds": ["6.1", "6.2", "6.3", "6.4"],
+      "state": "implemented",
+      "implementation": ["scripts/check-evolution-isolation.sh", "docs/agent-policy.md", "docs/architecture.md", "docs/data-and-api.md"],
+      "productionEntrypoints": [],
+      "tests": ["scripts/check-evolution-isolation.sh"],
+      "ciJobs": ["baseline"]
+    },
+    {
+      "spec": "evolution",
+      "taskIds": ["6.5", "6.6"],
+      "state": "partial",
+      "implementation": ["scripts/check-baseline.sh", "src/evolution/mod.rs"],
+      "productionEntrypoints": ["src/main.rs#run_evolutionary_worker"],
+      "tests": [],
+      "ciJobs": ["baseline"],
+      "note": "The historical baseline and manual smoke claims are not reproducibly bound to a frozen commit and complete artifact set."
+    },
+    {
+      "spec": "hardening",
+      "taskIds": ["1", "2", "3", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20"],
+      "state": "production_wired",
+      "implementation": ["src/db/indexes.rs", "src/tasks.rs#reclaim_stale_running_tasks", "src/agent/reaction.rs#record_user_reaction", "src/routes/management.rs#execute_management_tool", "src/webhooks.rs"],
+      "productionEntrypoints": ["src/main.rs", "src/routes/mod.rs", "src/webhooks.rs"],
+      "tests": ["tests/reaction_claim_lock.rs#reaction_redline_concurrent_entry_cannot_start_second_analysis", "tests/worker_reclaim.rs#stale_running_task_is_recovered_to_retry", "tests/dry_run_isolation.rs#dry_run_session_writes_dry_run_status_audit_only"],
+      "ciJobs": []
+    },
+    {
+      "spec": "hardening",
+      "taskIds": ["4", "21", "22", "23"],
+      "state": "implemented",
+      "implementation": ["tests/common/mod.rs", "src/models.rs", "src/routes/mod.rs", "src/agent/mod.rs"],
+      "productionEntrypoints": [],
+      "tests": ["tests/common/mod.rs"],
+      "ciJobs": []
+    },
+    {
+      "spec": "hardening",
+      "taskIds": ["24"],
+      "state": "partial",
+      "implementation": ["tests/worker_reclaim.rs", "tests/reaction_claim_lock.rs", "tests/last_inbound_split.rs", "tests/dry_run_isolation.rs"],
+      "productionEntrypoints": ["src/tasks.rs#reclaim_stale_running_tasks", "src/agent/reaction.rs#record_user_reaction"],
+      "tests": ["tests/worker_reclaim.rs", "tests/reaction_claim_lock.rs", "tests/last_inbound_split.rs", "tests/dry_run_isolation.rs"],
+      "ciJobs": ["integration"],
+      "note": "Several tests now exercise production helpers, but the original list also contains copied-update tests and only a soft broad integration job."
+    }
+  ]
+}

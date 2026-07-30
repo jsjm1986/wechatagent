@@ -128,7 +128,10 @@ async fn quiet_hours_defers_inbound_and_is_idempotent() {
         .count_documents(event_filter.clone(), None)
         .await
         .expect("count deferral events");
-    assert_eq!(event_count, 1, "应写 1 条 quiet_hours_deferred_inbound 观测事件");
+    assert_eq!(
+        event_count, 1,
+        "应写 1 条 quiet_hours_deferred_inbound 观测事件"
+    );
 
     let event = app
         .state

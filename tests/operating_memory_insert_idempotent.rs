@@ -80,9 +80,7 @@ async fn concurrent_first_touch_inserts_all_succeed() {
 
     // 全部返回 Ok（同一 contact_wxid 的文档）；无一返回 Err。
     for r in &results {
-        let mem = r
-            .as_ref()
-            .expect("load_or_create 不应因并发 dup-key 失败");
+        let mem = r.as_ref().expect("load_or_create 不应因并发 dup-key 失败");
         assert_eq!(mem.contact_wxid, "wxid_conc3");
     }
 

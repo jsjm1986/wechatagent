@@ -61,9 +61,11 @@ function metricsBody(over: Partial<Metrics> = {}): Metrics {
       sent: 3,
       canceled: 1,
       failedTerminal: 0,
+      deliveryUnknown: 0,
       sendSuccessRate: 0.75,
       canceledRate: 0.25,
       failedTerminalRate: 0,
+      deliveryUnknownRate: 0,
     },
     ...over,
   };

@@ -88,7 +88,7 @@
 
 **验证**:
 - 活体测试成功：initialize ✓、auth_whoami ✓、tools/list (136工具) ✓
-- 核实 Key 身份：Workspace Key（`gwa_ba60a98a...`），管理 1 个账号 alias="t-1"
+- 核实 Key 身份：Workspace Key（值仅由运行环境注入），管理 1 个账号 alias="t-1"
 - 协议层 100% 兼容：Streamable-HTTP、会话管理、SSE 解析、鉴权全正确
 
 **文档**: `docs/mcp-integration-audit-2026-07-07.md`
@@ -240,7 +240,7 @@ gh pr create --title "feat: 端到端测试 + MCP 真实接入完整实现" \
 ```bash
 # .env 文件
 MCP_BASE_URL=http://117.72.54.28:3001
-MCP_API_KEY=gwa_ba60a98aada58c10b77f6f20841c77c6c3c0506d9431871f
+MCP_API_KEY=<INJECT_FROM_SECRET_STORE>
 WEBHOOK_VERIFY_SIGNATURE=true
 RUN_TOKEN_BUDGET_ESCALATED=100000  # B-1 修复新增配置
 ```
@@ -310,3 +310,15 @@ RUN_TOKEN_BUDGET_ESCALATED=100000  # B-1 修复新增配置
 **代码统计**: 13 commits / ~2,200 行代码 / ~2,100 行文档 / 10 份交付文档
 
 **质量保证**: 前端 448 测试全绿 / 后端 1814 测试全绿 / 13 组频道四方对账全通过
+
+---
+
+## 2026-07-25 后续生产发布更新
+
+本节是对 2026-07-07 历史总结的后续事实补充，不重写当时的测试数字或分支描述。
+
+- 用户已明确确认并完成生产切换；新后端 SHA-256 为 `539effe4f0cc1f6962c495f7454cd51375a35c854ca246901a9de1b5375e8acf`，干净前端为 69 个文件。
+- m049 已在生产 applied，planning-only Prompt 保持 draft 且 `current_version=false`。
+- 切换后 12/12 次内外网健康、PID 无重启、Mongo 主节点、Outbox 与近期失败任务门均通过。
+- 切换点数据库备份、旧后端/前端及日志均保留；未执行未经确认的测试库或备份清理。
+- 本次发布不能替代仍明确标为待 Actions、真实模型、真实 MCP 或其它动态验证的审查项。完整证据见 [2026-07-25 生产发布记录](system-review/production-release-2026-07-25.md)。

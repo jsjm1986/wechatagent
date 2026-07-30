@@ -3,7 +3,12 @@
 //! 命门在 `src/agent/reaction.rs:248` 的接线：
 //! ```ignore
 //! if outbox::outcome_signals_stop(&outcome_for_outbox) {
-//!     outbox::cancel_for_contact_on_user_reaction(state, &contact.account_id, &contact.wxid)
+//!     outbox::cancel_for_contact_on_user_reaction(
+//!         state,
+//!         &contact.workspace_id,
+//!         &contact.account_id,
+//!         &contact.wxid,
+//!     )
 //! }
 //! ```
 //! 三段各自有测试（映射 `reaction.rs` a6_tests / 规则闸 `outbox.rs` tests /
@@ -22,9 +27,7 @@ mod common;
 use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
 use serde_json::json;
 use wechatagent::agent::{enqueue, record_user_reaction, EnqueueRequest};
-use wechatagent::models::{
-    AgentDecisionReview, Contact, ConversationMessage, MessageDirection,
-};
+use wechatagent::models::{AgentDecisionReview, Contact, ConversationMessage, MessageDirection};
 
 /// 构造一个 managed contact（reaction 路径 claim filter 不看 agent_status，但
 /// 保持 Managed 与生产语义一致）。字段严格按 `src/models.rs:132` Contact 结构体
@@ -114,6 +117,10 @@ fn sent_review(workspace: &str, account: &str, wxid: &str) -> AgentDecisionRevie
         outcome_status: Some("pending".to_string()),
         reaction_analysis: Document::new(),
         reaction_claimed_at: None,
+        reaction_claim_token: None,
+        reaction_claim_generation: 0,
+        source_task_id: None,
+        source_task_claim_token: None,
         reviewer_misjudge_signal: None,
         expected_text_segments: 0,
         // 关键：claim filter 要求 status="sent"。

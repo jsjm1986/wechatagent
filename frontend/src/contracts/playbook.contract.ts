@@ -11,6 +11,7 @@ export const CANONICAL_KEYS = [
   "methodPrompt",
   "name",
   "profileMethod",
+  "releaseStatus",
   "replyStyle",
   "stageMethod",
   "successCriteria",

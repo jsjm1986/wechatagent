@@ -126,6 +126,28 @@ describe("SystemStrategy Feature", () => {
     selectTab("经验教训");
     expect(await screen.findByText("暂无教训聚合（窗口内无命中样本）")).toBeInTheDocument();
   });
+
+  it("SR-138: reset 取消时零调用，输入精确认短语后才提交", async () => {
+    const reset = vi.fn().mockResolvedValue(undefined);
+    useStrategyStore.setState({ resetSystemPromptPack: reset });
+    render(<SystemStrategyFeature />);
+
+    fireEvent.click(screen.getByRole("button", { name: "重置系统提示词包 v2" }));
+    expect(await screen.findByText("重置系统提示词包？")).toBeInTheDocument();
+    expect(screen.getByText(/替换当前 workspace 的 Prompt、Playbook 与 Domain Config/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "取消" }));
+    expect(reset).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "重置系统提示词包 v2" }));
+    const submit = await screen.findByRole("button", { name: "确认重置" });
+    expect(submit).toBeDisabled();
+    fireEvent.change(screen.getByPlaceholderText("RESET PROMPT PACK"), {
+      target: { value: "RESET PROMPT PACK" },
+    });
+    expect(submit).not.toBeDisabled();
+    fireEvent.click(submit);
+    await waitFor(() => expect(reset).toHaveBeenCalledWith("RESET PROMPT PACK"));
+  });
 });
 
 describe("TaxonomiesAdmin 新增条目", () => {
@@ -172,7 +194,7 @@ describe("TaxonomiesAdmin 编辑与废弃恢复", () => {
 
   const activeItem = {
     id: "id_active", scope: "global", kind: "customer_stage",
-    value: { id: "need_discovery", label: "需求挖掘", aliases: ["挖需求"], description: "", status: "active" },
+    value: { id: "need_discovery", label: "需求挖掘", aliases: ["挖需求"], description: "", status: "active", priorityWeight: 60, isTerminal: true, isReactivationTarget: true },
     version: 1, currentVersion: true, previousVersion: null, seededBy: "manual", updatedAt: "",
   };
   const deprecatedItem = {
@@ -189,7 +211,7 @@ describe("TaxonomiesAdmin 编辑与废弃恢复", () => {
     );
   }
 
-  it("编辑提交 PATCH /:id，body 仅 label/aliases/description（无 id/scope/kind）", async () => {
+  it("普通改名只 PATCH label，不覆盖运行时 taxonomy flags", async () => {
     seedTaxonomyGet(activeItem);
     const patch = vi.spyOn(api, "patch").mockResolvedValue({ item: activeItem } as never);
     render(<SystemStrategyFeature />);
@@ -198,9 +220,7 @@ describe("TaxonomiesAdmin 编辑与废弃恢复", () => {
     fireEvent.change(screen.getByDisplayValue("需求挖掘"), { target: { value: "需求探索阶段" } });
     fireEvent.click(screen.getByText("保存编辑"));
     await waitFor(() => expect(patch).toHaveBeenCalled());
-    expect(patch).toHaveBeenCalledWith("/api/admin/taxonomies/id_active", {
-      label: "需求探索阶段", aliases: ["挖需求"], description: "", isTerminal: false, isReactivationTarget: false,
-    });
+    expect(patch).toHaveBeenCalledWith("/api/admin/taxonomies/id_active", { label: "需求探索阶段" });
   });
 
   it("active 条目显示「废弃」，点击调 api.delete", async () => {
@@ -364,7 +384,7 @@ describe("DomainProfile completeness 维度 anchor_hint+initial_signal", () => {
   });
 
   // 让 ProfileEditor 进入编辑态并塞入一条 coverage_dimension，setProfileDraft 改成 spy，
-  // 断言 anchor_hint / initial_signal 两输入框 onChange 写回数组该项且不误删其它字段。
+  // 断言 review_topic_aliases / anchor_hint / initial_signal 写回数组该项且不误删其它字段。
   function seedProfileDraftWithCoverage(setProfileDraft: (draft: DomainProfileDraft) => void) {
     useStrategyStore.setState({
       editingProfile: null,
@@ -379,18 +399,25 @@ describe("DomainProfile completeness 维度 anchor_hint+initial_signal", () => {
     });
   }
 
-  it("D11: completeness 维度可编辑 anchor_hint 与 initial_signal 并提交", async () => {
+  it("D11: completeness 维度可编辑评审主题别名、anchor_hint 与 initial_signal", async () => {
     const setProfileDraft = vi.fn();
     seedProfileDraftWithCoverage(setProfileDraft);
 
     render(<SystemStrategyFeature />);
     selectTab("行业配置");
 
-    // anchor_hint 输入框写入文本 → 写回该行 anchor_hint，保留 key/display_name/required
-    const anchorInput = await screen.findByPlaceholderText(/anchor_hint/i);
-    fireEvent.change(anchorInput, { target: { value: "在对话开场探明" } });
+    const aliasesInput = await screen.findByPlaceholderText(/review_topic_aliases/i);
+    fireEvent.change(aliasesInput, { target: { value: "预算, 报价，计费" } });
     await waitFor(() => expect(setProfileDraft).toHaveBeenCalled());
     let lastArg = setProfileDraft.mock.calls.at(-1)?.[0];
+    expect(lastArg.coverage_dimensions[0].review_topic_aliases).toEqual(["预算", "报价", "计费"]);
+    expect(lastArg.coverage_dimensions[0].key).toBe("need");
+
+    // anchor_hint 输入框写入文本 → 写回该行 anchor_hint，保留 key/display_name/required
+    const anchorInput = screen.getByPlaceholderText(/anchor_hint/i);
+    fireEvent.change(anchorInput, { target: { value: "在对话开场探明" } });
+    await waitFor(() => expect(setProfileDraft).toHaveBeenCalled());
+    lastArg = setProfileDraft.mock.calls.at(-1)?.[0];
     expect(lastArg.coverage_dimensions[0].anchor_hint).toBe("在对话开场探明");
     expect(lastArg.coverage_dimensions[0].key).toBe("need");
     expect(lastArg.coverage_dimensions[0].display_name).toBe("需求");

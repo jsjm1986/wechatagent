@@ -7,6 +7,7 @@ const chunk = {
   id: "c1", title: "企业版年费 12800", summary: "含 5 个坐席",
   sourceQuote: "企业版一年 12800", sourceAnchors: [{ startLine: 1 }],
   integrityStatus: "needs_review", status: "draft",
+  updatedAt: "2026-07-27T03:00:00Z",
 };
 
 describe("ReviewChat", () => {
@@ -60,19 +61,20 @@ describe("ReviewChat", () => {
     expect(onResolved).not.toHaveBeenCalled();
   });
   it("对话产 patch → AI 回合下渲染 patch diff 预览(字段中文label + 新值)", async () => {
-    globalThis.fetch = vi.fn(() =>
+    const fetchMock = vi.fn((_input: RequestInfo | URL, _init?: RequestInit) =>
       Promise.resolve({
         ok: true,
         json: () =>
           Promise.resolve({
             sessionId: "s1",
-            turn: {
-              naturalReply: "好的,已经按你说的改好了。",
-              patch: { title: "企业版年费 19800", summary: "含 10 个坐席" },
-            },
+            naturalReply: "好的,已经按你说的改好了。",
+            targetChunkId: "c1",
+            expectedUpdatedAt: "2026-07-27T03:00:00Z",
+            draftPreview: { title: "企业版年费 19800", summary: "含 10 个坐席" },
           }),
       } as Response)
-    ) as unknown as typeof fetch;
+    );
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
     render(<ReviewChat chunk={chunk as never} onResolved={() => {}} />);
     await userEvent.type(screen.getByPlaceholderText(/让 AI 改这条/), "把年费改成 19800");
     await userEvent.click(screen.getByRole("button", { name: /发送/ }));
@@ -82,6 +84,12 @@ describe("ReviewChat", () => {
     // patch 预览:新值
     expect(screen.getByText(/企业版年费 19800/)).toBeInTheDocument();
     expect(screen.getByText(/含 10 个坐席/)).toBeInTheDocument();
+    const request = fetchMock.mock.calls[0]?.[1] as RequestInit;
+    expect(JSON.parse(String(request.body)).attachments).toEqual([{
+      chunkId: "c1",
+      expectedUpdatedAt: "2026-07-27T03:00:00Z",
+      operation: "update",
+    }]);
   });
   it("patch 键为 snake_case / 未知键 → label 兜底(已知映射中文,未知显原键)", async () => {
     globalThis.fetch = vi.fn(() =>
@@ -90,10 +98,10 @@ describe("ReviewChat", () => {
         json: () =>
           Promise.resolve({
             sessionId: "s2",
-            turn: {
-              naturalReply: "改好了。",
-              patch: { knowledge_type: "product_fact", customField: "abc" },
-            },
+            naturalReply: "改好了。",
+            targetChunkId: "c1",
+            expectedUpdatedAt: "2026-07-27T03:00:00Z",
+            draftPreview: { knowledge_type: "product_fact", customField: "abc" },
           }),
       } as Response)
     ) as unknown as typeof fetch;
@@ -104,5 +112,22 @@ describe("ReviewChat", () => {
     await waitFor(() => expect(screen.getByText(/知识类型/)).toBeInTheDocument());
     // 未知键不吞,显原键名
     expect(screen.getByText(/customField/)).toBeInTheDocument();
+  });
+  it("响应目标或冻结版本不匹配时不展示 patch", async () => {
+    globalThis.fetch = vi.fn(() => Promise.resolve({
+      ok: true,
+      json: () => Promise.resolve({
+        sessionId: "s3",
+        naturalReply: "改好了。",
+        targetChunkId: "other",
+        expectedUpdatedAt: "2026-07-27T03:00:00Z",
+        draftPreview: { title: "不应展示" },
+      }),
+    } as Response)) as unknown as typeof fetch;
+    render(<ReviewChat chunk={chunk as never} onResolved={() => {}} />);
+    await userEvent.type(screen.getByPlaceholderText(/让 AI 改这条/), "改标题");
+    await userEvent.click(screen.getByRole("button", { name: /发送/ }));
+    await waitFor(() => expect(screen.getByText(/目标或版本已变化/)).toBeInTheDocument());
+    expect(screen.queryByText("不应展示")).not.toBeInTheDocument();
   });
 });

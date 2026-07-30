@@ -251,7 +251,12 @@ proptest! {
 
 #[test]
 fn default_union_keys_include_core_array_fields() {
-    for k in &["tags", "search_terms", "applicable_scenes", "business_topics"] {
+    for k in &[
+        "tags",
+        "search_terms",
+        "applicable_scenes",
+        "business_topics",
+    ] {
         assert!(
             DEFAULT_UNION_ARRAY_KEYS.contains(k),
             "DEFAULT_UNION_ARRAY_KEYS missing required key '{}'",

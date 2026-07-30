@@ -44,7 +44,11 @@ export function DeciderChainEditor({
     .filter((c) => (q.trim() ? contactLabel(c).includes(q) || c.wxid.includes(q) : true));
 
   function add(c: Contact) {
-    onChange([...chain, { wxid: c.wxid, displayName: contactLabel(c) }]);
+    if (!c.accountId) {
+      setError("该联系人缺少账号归属，无法加入决策链");
+      return;
+    }
+    onChange([...chain, { wxid: c.wxid, displayName: contactLabel(c), accountId: c.accountId }]);
     setPicking(false);
     setQ("");
   }
@@ -66,6 +70,7 @@ export function DeciderChainEditor({
         <div key={d.wxid} className={styles.chainRow}>
           <span className={styles.chainName} title={d.wxid}>
             {d.displayName ?? d.wxid}
+            <span className={styles.chainWxid}>{d.accountId ? `账号 ${d.accountId}` : "未绑定账号"}</span>
           </span>
           <div className={styles.chainActions}>
             <button type="button" aria-label="上移" disabled={idx === 0} onClick={() => move(idx, -1)}>↑</button>

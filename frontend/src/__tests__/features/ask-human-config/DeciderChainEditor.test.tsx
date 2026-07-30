@@ -7,8 +7,8 @@ vi.mock("../../../lib/api", () => ({ api: { get: vi.fn() } }));
 
 const CONTACTS = {
   items: [
-    { id: "1", wxid: "wxid_a", nickname: "阿伟", agentStatus: "managed", tags: [] },
-    { id: "2", wxid: "wxid_b", remark: "李总", agentStatus: "normal", tags: [] },
+    { id: "1", accountId: "acc1", wxid: "wxid_a", nickname: "阿伟", agentStatus: "managed", tags: [] },
+    { id: "2", accountId: "acc1", wxid: "wxid_b", remark: "李总", agentStatus: "normal", tags: [] },
   ],
 };
 
@@ -23,7 +23,7 @@ describe("DeciderChainEditor", () => {
     fireEvent.click(screen.getByText(/从联系人添加/));
     await waitFor(() => screen.getByText("阿伟"));
     fireEvent.click(screen.getByText("阿伟"));
-    expect(onChange).toHaveBeenCalledWith([{ wxid: "wxid_a", displayName: "阿伟" }]);
+    expect(onChange).toHaveBeenCalledWith([{ wxid: "wxid_a", displayName: "阿伟", accountId: "acc1" }]);
   });
 
   it("已在链中的 wxid 从候选排除", async () => {

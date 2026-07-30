@@ -40,6 +40,16 @@
 .table tbody tr:last-child td { border-bottom: none; }
 
 .contentCell { max-width: 360px; word-break: break-word; white-space: pre-wrap; }
+.payloadLabel { display: block; font-weight: 600; color: var(--ink-1); }
+.payloadIdentity, .recoveryWarning {
+  display: block; margin-top: 4px; font-size: 11px; line-height: 1.4; color: var(--ink-3);
+}
+.recoveryWarning { color: var(--color-blocked); }
+.confirmBody { display: grid; gap: 5px; }
+.risk {
+  margin-top: 5px; padding: 8px 10px; border-radius: var(--r-sm);
+  color: var(--color-blocked); background: var(--fill-blocked);
+}
 .muted { color: var(--ink-4); }
 
 /* 取消：文字链接型按钮（非实心蓝），与 Autonomy 展开按钮同语言 */

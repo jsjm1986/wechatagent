@@ -286,6 +286,29 @@
 .simpleActionMeta { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 6px; font-size: 12px; color: var(--ink-2); }
 .simpleActionButtons { display: flex; gap: 8px; margin-top: 12px; }
 
+/* 疑似成交专用审核卡：金额/币种与驳回原因是业务提交参数，不能降级成空 body 操作。 */
+.suspectedDealReviewCard { display: flex; flex-direction: column; gap: 10px; }
+.suspectedDealFields { display: grid; grid-template-columns: minmax(0, 2fr) minmax(90px, 1fr); gap: 10px; }
+.suspectedDealFields label,
+.suspectedDealRejectReason { display: grid; gap: 5px; font-size: 12.5px; color: var(--ink-2); }
+.suspectedDealFields input,
+.suspectedDealRejectReason textarea {
+  width: 100%;
+  box-sizing: border-box;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-sm);
+  padding: 8px 10px;
+  color: var(--ink-1);
+  background: var(--surface, #fff);
+  font: inherit;
+}
+.suspectedDealRejectReason textarea { min-height: 72px; resize: vertical; }
+.suspectedDealReviewError { font-size: 12.5px; color: var(--color-blocked); }
+
+@media (max-width: 640px) {
+  .suspectedDealFields { grid-template-columns: 1fr; }
+}
+
 /* 卡内动作按钮（三张知识卡的按钮无 className，作用域到卡容器内，与 header 按钮同款描边规范） */
 .chunkReviewCard button,
 .profilePublishCard button,

@@ -7,9 +7,9 @@
 use mongodb::bson::DateTime;
 use tokio::sync::OnceCell;
 
+pub mod account_scheduler;
 pub mod agent;
 pub mod auth;
-pub mod account_scheduler;
 pub mod behavior_signals;
 pub mod cold_contact_worker;
 pub mod config;
@@ -24,12 +24,16 @@ pub mod llm;
 pub mod mcp;
 pub mod media_storage;
 pub mod models;
+pub(crate) mod outbound_fetch;
 pub mod planner;
-pub mod prompts;
+pub mod proactive_outreach;
 pub mod prompt_guard;
+pub mod prompt_template_versions;
+pub mod prompts;
 pub mod routes;
 pub mod secret;
 pub mod silence_signal_worker;
+pub mod soul_versions;
 pub mod supervisor;
 pub mod tasks;
 pub mod webhooks;

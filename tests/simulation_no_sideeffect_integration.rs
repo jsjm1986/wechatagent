@@ -11,9 +11,14 @@
 
 mod common;
 
+use std::collections::BTreeMap;
+
+use futures::TryStreamExt;
 use mongodb::bson::{doc, DateTime, Document};
+use serde_json::json;
 
 use wechatagent::agent::simulate_user_dialogue;
+use wechatagent::llm::ChatUsage;
 use wechatagent::models::{AgentStatus, Contact};
 
 use crate::common::TestApp;
@@ -69,71 +74,192 @@ fn managed_contact(ws: &str, acc: &str, wxid: &str) -> Contact {
     }
 }
 
-/// 红线:跑 simulate_user_dialogue 前后,outbox 与 outbound 消息计数不变(零副作用)。
+async fn business_snapshot(app: &TestApp) -> BTreeMap<String, Vec<Document>> {
+    let mut names = app
+        .state
+        .db
+        .raw()
+        .list_collection_names(None)
+        .await
+        .expect("list collections");
+    names.sort();
+
+    let mut snapshot = BTreeMap::new();
+    for name in names {
+        if name == "llm_call_logs" {
+            continue;
+        }
+        let mut docs: Vec<Document> = app
+            .state
+            .db
+            .raw()
+            .collection::<Document>(&name)
+            .find(doc! {}, None)
+            .await
+            .unwrap_or_else(|error| panic!("find collection {name}: {error}"))
+            .try_collect()
+            .await
+            .unwrap_or_else(|error| panic!("collect collection {name}: {error}"));
+        docs.sort_by_key(|document| format!("{:?}|{:?}", document.get("_id"), document));
+        snapshot.insert(name, docs);
+    }
+    snapshot
+}
+
+fn reply_decision_json() -> serde_json::Value {
+    json!({
+        "decisionPhase": "final",
+        "userUnderstanding": "客户刚开始接触，希望先了解彼此并说明当前最需要解决的问题。",
+        "relationshipRead": "这是初次交流，关系尚在建立，适合用一个轻量问题继续了解。",
+        "operationGoal": "自然回应并邀请客户说明当前最关心的问题，不做任何产品承诺。",
+        "knowledgeNeedReason": "本轮只是建立基本上下文，不需要调用产品或业务知识。",
+        "memoryUpdateReason": "当前没有形成需要持久化的新事实，仅保留本轮上下文即可。",
+        "selfCritique": "回复应保持简短自然，只问一个问题，避免连续追问或提前推销。",
+        "whyShouldReply": "客户主动发来消息，礼貌回应并询问一个轻量问题有助于继续交流。",
+        "whySkipReply": "",
+        "riskSelfCheck": "回复不包含价格、效果、隐私或未经验证的事实，也不作绝对承诺。",
+        "riskLevel": "medium",
+        "knowledgeNeed": "not_required",
+        "runMode": "fast_chat",
+        "autonomyMode": "auto",
+        "needsReview": true,
+        "consolidationNeeded": false,
+        "operationState": "new_contact",
+        "shouldReply": true,
+        "replyText": "你好，很高兴认识你。方便先说说你现在最想解决的问题吗？",
+        "usedKnowledgeIds": [],
+        "conversationMode": "casual_relationship",
+        "conversationModeReason": "初次交流以自然建立关系和了解背景为主。"
+    })
+}
+
+fn review_pass_json() -> serde_json::Value {
+    json!({
+        "approved": true,
+        "scores": {
+            "humanLike": 9,
+            "emotionalValue": 8,
+            "productAccuracy": 9,
+            "boundaryPrivacySafety": 9,
+            "relationshipProgress": 8,
+            "conversionReadiness": 5,
+            "pressureRisk": 1,
+            "factRisk": 1
+        },
+        "claimAnalysis": {
+            "hasProductClaim": false,
+            "requiresProductKnowledge": false,
+            "knowledgeSupported": true,
+            "reason": "回复只做自然问候和轻量澄清，不包含产品事实。"
+        },
+        "risks": [],
+        "rewriteInstruction": "",
+        "reviewSummary": "表达自然、边界安全，可以发送。",
+        "needsRevision": false,
+        "revisionDirection": "",
+        "shouldHold": false,
+        "holdReason": "",
+        "holdCategory": "",
+        "selfCritiqueAddressed": true
+    })
+}
+
+fn known_usage() -> ChatUsage {
+    ChatUsage {
+        prompt_tokens: 10,
+        completion_tokens: 5,
+        total_tokens: 15,
+        usage_known: true,
+        ..Default::default()
+    }
+}
+
+/// 红线：完整 Shadow 链结束后，成本日志之外的数据库逐文档不变。
 #[tokio::test]
 #[ignore]
-async fn simulation_writes_no_outbox_no_outbound() {
+async fn simulation_has_no_business_side_effects() {
     let app = TestApp::start().await;
     let ws = app.state.config.default_workspace_id.clone();
     let acc = app.state.config.default_account_id.clone();
     let contact = managed_contact(&ws, &acc, "wx_sim");
 
-    let outbox_before = app
-        .state
+    // Seed a preference with an old timestamp. The live loader renews
+    // last_used_at; Shadow must read the same row without touching it.
+    app.state
         .db
-        .collection_agent_send_outbox()
-        .count_documents(doc! {}, None)
+        .raw()
+        .collection::<Document>("knowledge_operator_memory")
+        .insert_one(
+            doc! {
+                "workspace_id": &ws,
+                "account_id": &acc,
+                "operator_id": &acc,
+                "kind": "preference",
+                "content": "回复保持简洁",
+                "created_at": DateTime::from_millis(1_000),
+                "last_used_at": DateTime::from_millis(1_000),
+                "expires_at": null,
+            },
+            None,
+        )
         .await
-        .expect("count outbox before");
-    let outbound_before = app
-        .state
-        .db
-        .messages()
-        .count_documents(doc! { "direction": "outbound" }, None)
-        .await
-        .expect("count outbound before");
+        .expect("seed operator memory");
 
-    // 推几条宽松 LLM 响应驱动 knowledge-route/decide/review 链。无论链路结果如何,
-    // 零副作用红线都必须成立(should_reply=true 也只产 would_send,不落 outbox)。
-    for _ in 0..6 {
-        app.llm.push_response(serde_json::json!({
-            "should_reply": true,
-            "reply_text": "您好,很高兴为您服务",
-            "approved": true,
-            "scores": { "humanLike": 8, "emotionalValue": 7, "hallucinationScore": 1, "knowledgeGroundingScore": 8, "pressureRisk": 2 }
-        }));
+    let before = business_snapshot(&app).await;
+    let started_at = DateTime::now();
+
+    app.llm
+        .push_response_with_usage(reply_decision_json(), known_usage());
+    app.llm
+        .push_response_with_usage(review_pass_json(), known_usage());
+    app.llm
+        .push_response_with_usage(common::independent_claim_gate_pass_json(), known_usage());
+
+    let turns = simulate_user_dialogue(&app.state, contact, vec!["你好".to_string()])
+        .await
+        .expect("shadow simulation must complete");
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0].status, "would_send");
+
+    let after = business_snapshot(&app).await;
+    let changed_collections: Vec<String> = before
+        .keys()
+        .chain(after.keys())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .filter(|name| before.get(*name) != after.get(*name))
+        .map(|name| name.clone())
+        .collect();
+    if let Some(name) = changed_collections.first() {
+        panic!(
+            "Shadow changed business collections {changed_collections:?}; first={name}; before={:?}; after={:?}",
+            before.get(name),
+            after.get(name),
+        );
     }
 
-    // 跑 2 轮对话。即便 LLM 响应 schema 不完全匹配导致内部 fail-soft,零副作用仍须成立,
-    // 故对结果宽容(Ok/Err 都接受),只断言无写入副作用。
-    let _ = simulate_user_dialogue(
-        &app.state,
-        contact,
-        vec!["你们有什么产品".to_string(), "多少钱".to_string()],
-    )
-    .await;
-
-    let outbox_after = app
+    let logs: Vec<Document> = app
         .state
         .db
-        .collection_agent_send_outbox()
-        .count_documents(doc! {}, None)
+        .raw()
+        .collection::<Document>("llm_call_logs")
+        .find(
+            doc! {
+                "workspace_id": &ws,
+                "contact_wxid": "wx_sim",
+                "created_at": { "$gte": started_at },
+            },
+            None,
+        )
         .await
-        .expect("count outbox after");
-    let outbound_after = app
-        .state
-        .db
-        .messages()
-        .count_documents(doc! { "direction": "outbound" }, None)
+        .expect("query shadow llm logs")
+        .try_collect()
         .await
-        .expect("count outbound after");
+        .expect("collect shadow llm logs");
+    assert_eq!(logs.len(), 3, "Reply、Review、ClaimGate 应各留一条成本日志");
+    assert!(logs
+        .iter()
+        .all(|log| log.get_str("run_mode") == Ok("shadow")));
 
-    assert_eq!(
-        outbox_after, outbox_before,
-        "Shadow 模拟绝不能写 agent_send_outbox(红线)"
-    );
-    assert_eq!(
-        outbound_after, outbound_before,
-        "Shadow 模拟绝不能写 outbound 消息(红线)"
-    );
+    app.cleanup().await;
 }

@@ -60,8 +60,7 @@ def main() -> None:
     print("health =", _request("GET", "/health"))
 
     banner("[A2] 手工创建 document（绕 LLM）")
-    # 使用 import-apply 但 chunks 段我们手填（以避免任何 LLM 触发）。
-    # 先调 create_operation_knowledge_document
+    # 直接调用 document/chunk CRUD 手工落库，不触发 import-preview/apply 或 LLM。
     doc_body = {
         "accountId": ACCOUNT_ID,
         "domain": "user_operations",

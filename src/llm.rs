@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -144,6 +145,18 @@ struct AnthropicUsage {
     output_tokens: i64,
 }
 
+impl From<AnthropicUsage> for ChatUsage {
+    fn from(usage: AnthropicUsage) -> Self {
+        Self {
+            prompt_tokens: usage.input_tokens,
+            completion_tokens: usage.output_tokens,
+            total_tokens: usage.input_tokens.saturating_add(usage.output_tokens),
+            usage_known: true,
+            ..Default::default()
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Default, Clone)]
 pub struct ChatUsage {
     #[serde(default)]
@@ -156,6 +169,29 @@ pub struct ChatUsage {
     pub prompt_cache_hit_tokens: i64,
     #[serde(default)]
     pub prompt_cache_miss_tokens: i64,
+    /// Whether the upstream response actually contained a usage object.
+    ///
+    /// A missing usage object is not the same as a measured zero. Some relay
+    /// providers omit usage entirely; keeping that distinction prevents cost
+    /// and run-budget telemetry from presenting an unknown value as zero.
+    #[serde(default)]
+    pub usage_known: bool,
+}
+
+impl ChatUsage {
+    fn reported(mut self) -> Self {
+        self.usage_known = true;
+        self
+    }
+
+    pub fn is_known(&self) -> bool {
+        self.usage_known
+            || self.prompt_tokens != 0
+            || self.completion_tokens != 0
+            || self.total_tokens != 0
+            || self.prompt_cache_hit_tokens != 0
+            || self.prompt_cache_miss_tokens != 0
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -374,7 +410,9 @@ impl LlmClient {
                 if is_openai_sse_body(&text) {
                     let (acc, _) = aggregate_openai_sse(&text);
                     if acc.trim().is_empty() {
-                        return Err(AppError::External("LLM SSE body 聚合后内容为空".to_string()));
+                        return Err(AppError::External(
+                            "LLM SSE body 聚合后内容为空".to_string(),
+                        ));
                     }
                     Ok(acc)
                 } else {
@@ -495,7 +533,7 @@ impl LlmClient {
                     "LLM SSE body 聚合后内容为空".to_string(),
                 ));
             }
-            (acc, sse_usage.unwrap_or_default())
+            (acc, sse_usage.map(ChatUsage::reported).unwrap_or_default())
         } else {
             let parsed: ChatCompletionResponse = serde_json::from_str(&text)?;
             let c = parsed
@@ -503,7 +541,7 @@ impl LlmClient {
                 .first()
                 .map(|choice| choice.message.content.clone())
                 .ok_or_else(|| AppError::External("LLM returned no choices".to_string()))?;
-            (c, parsed.usage.unwrap_or_default())
+            (c, parsed.usage.map(ChatUsage::reported).unwrap_or_default())
         };
         Ok((
             LlmJsonResult {
@@ -573,7 +611,7 @@ impl LlmClient {
                     "LLM SSE body 聚合后内容为空".to_string(),
                 ));
             }
-            (acc, sse_usage.unwrap_or_default())
+            (acc, sse_usage.map(ChatUsage::reported).unwrap_or_default())
         } else {
             let parsed: ChatCompletionResponse = serde_json::from_str(&text)?;
             let c = parsed
@@ -581,7 +619,7 @@ impl LlmClient {
                 .first()
                 .map(|choice| choice.message.content.clone())
                 .ok_or_else(|| AppError::External("LLM returned no choices".to_string()))?;
-            (c, parsed.usage.unwrap_or_default())
+            (c, parsed.usage.map(ChatUsage::reported).unwrap_or_default())
         };
         Ok(LlmJsonResult {
             value: self
@@ -673,15 +711,7 @@ impl LlmClient {
                 }
             })
             .ok_or_else(|| AppError::External("LLM returned no choices".to_string()))?;
-        let usage = parsed
-            .usage
-            .map(|u| ChatUsage {
-                prompt_tokens: u.input_tokens,
-                completion_tokens: u.output_tokens,
-                total_tokens: u.input_tokens.saturating_add(u.output_tokens),
-                ..Default::default()
-            })
-            .unwrap_or_default();
+        let usage = parsed.usage.map(ChatUsage::from).unwrap_or_default();
         let cleaned = strip_reasoning_prefix(content);
         let value = self.parse_or_repair(&cleaned).await?;
         Ok((
@@ -786,7 +816,7 @@ impl LlmClient {
                         Err(_) => continue,
                     };
                     if let Some(u) = parsed.usage {
-                        usage = Some(u);
+                        usage = Some(u.reported());
                     }
                     if let Some(content) = parsed
                         .choices
@@ -1132,9 +1162,13 @@ fn aggregate_openai_sse(text: &str) -> (String, Option<ChatUsage>) {
             Err(_) => continue,
         };
         if let Some(u) = parsed.usage {
-            usage = Some(u);
+            usage = Some(u.reported());
         }
-        if let Some(c) = parsed.choices.first().and_then(|ch| ch.delta.content.as_ref()) {
+        if let Some(c) = parsed
+            .choices
+            .first()
+            .and_then(|ch| ch.delta.content.as_ref())
+        {
             acc.push_str(c);
         }
     }
@@ -1243,9 +1277,9 @@ fn extract_embedded_json(text: &str) -> Option<Value> {
         let Some(block) = balanced_block(text, start) else {
             continue;
         };
-        let parsed = serde_json::from_str::<Value>(block)
-            .ok()
-            .or_else(|| repair_loose_json(block).and_then(|r| serde_json::from_str::<Value>(&r).ok()));
+        let parsed = serde_json::from_str::<Value>(block).ok().or_else(|| {
+            repair_loose_json(block).and_then(|r| serde_json::from_str::<Value>(&r).ok())
+        });
         match parsed {
             // 对象：generate_json 期望形态，立即返回。
             Some(v @ Value::Object(_)) => return Some(v),
@@ -1343,17 +1377,37 @@ pub(crate) fn repair_loose_json(input: &str) -> Option<String> {
             continue;
         }
         match c {
-            '"' => { in_string = true; out.push(c); }
-            '{' => { depth_obj += 1; out.push(c); }
-            '}' => { depth_obj -= 1; out.push(c); }
-            '[' => { depth_arr += 1; out.push(c); }
-            ']' => { depth_arr -= 1; out.push(c); }
+            '"' => {
+                in_string = true;
+                out.push(c);
+            }
+            '{' => {
+                depth_obj += 1;
+                out.push(c);
+            }
+            '}' => {
+                depth_obj -= 1;
+                out.push(c);
+            }
+            '[' => {
+                depth_arr += 1;
+                out.push(c);
+            }
+            ']' => {
+                depth_arr -= 1;
+                out.push(c);
+            }
             ',' => {
                 // peek non-whitespace next char
                 let mut peek_iter = chars.clone();
                 let mut next_significant = None;
                 while let Some(&p) = peek_iter.peek() {
-                    if p.is_whitespace() { peek_iter.next(); } else { next_significant = Some(p); break; }
+                    if p.is_whitespace() {
+                        peek_iter.next();
+                    } else {
+                        next_significant = Some(p);
+                        break;
+                    }
                 }
                 match next_significant {
                     Some('}') | Some(']') => {
@@ -1390,7 +1444,7 @@ pub struct LlmProviderMeta {
     pub base_url: String,
 }
 
-/// 热替换 LLM 客户端 wrapper。
+/// Workspace-scoped hot-swappable LLM client registry.
 ///
 /// 行为：
 /// - 持有 `Arc<LlmClient>` + `LlmProviderMeta`，由 `tokio::sync::RwLock` 保护，
@@ -1400,37 +1454,176 @@ pub struct LlmProviderMeta {
 ///   避免持锁期间发起 HTTP 阻塞 swap。
 /// - 不缓存解析结果——只关心客户端实例本身的替换。
 pub struct LlmRegistry {
-    inner: tokio::sync::RwLock<LlmRegistryInner>,
+    default_workspace_id: String,
+    inner: tokio::sync::RwLock<HashMap<String, LlmRegistryInner>>,
 }
 
 struct LlmRegistryInner {
     client: std::sync::Arc<LlmClient>,
     meta: LlmProviderMeta,
+    generation: u64,
+}
+
+/// Immutable view of one registry generation.
+///
+/// A request that obtains this snapshot keeps the matching client, metadata,
+/// and generation even if an administrator hot-swaps the registry while the
+/// request is in flight. This gives exact-cache lookup and the upstream call
+/// the same linearization point.
+#[derive(Clone)]
+pub struct LlmRegistrySnapshot {
+    client: std::sync::Arc<LlmClient>,
+    pub meta: LlmProviderMeta,
+    pub generation: u64,
+}
+
+impl LlmRegistrySnapshot {
+    pub async fn generate_json(&self, system: &str, user: &str) -> AppResult<Value> {
+        self.client.generate_json(system, user).await
+    }
+
+    pub async fn generate_json_with_usage(
+        &self,
+        system: &str,
+        user: &str,
+    ) -> AppResult<LlmJsonResult> {
+        self.client.generate_json_with_usage(system, user).await
+    }
+
+    pub async fn generate_json_streaming(
+        &self,
+        system: &str,
+        user: &str,
+        token_tx: UnboundedSender<String>,
+    ) -> AppResult<LlmJsonResult> {
+        self.client
+            .generate_json_streaming(system, user, token_tx)
+            .await
+    }
+
+    pub async fn generate_json_with_image(
+        &self,
+        system: &str,
+        user: &str,
+        image_base64: &str,
+        mime: &str,
+    ) -> AppResult<Value> {
+        self.client
+            .generate_json_with_image(system, user, image_base64, mime)
+            .await
+    }
+}
+
+#[async_trait]
+impl LlmProvider for LlmRegistrySnapshot {
+    async fn generate_json(&self, system: &str, user: &str) -> AppResult<Value> {
+        LlmRegistrySnapshot::generate_json(self, system, user).await
+    }
+
+    async fn generate_json_with_usage(&self, system: &str, user: &str) -> AppResult<LlmJsonResult> {
+        LlmRegistrySnapshot::generate_json_with_usage(self, system, user).await
+    }
+
+    async fn generate_json_streaming(
+        &self,
+        system: &str,
+        user: &str,
+        token_tx: UnboundedSender<String>,
+    ) -> AppResult<LlmJsonResult> {
+        LlmRegistrySnapshot::generate_json_streaming(self, system, user, token_tx).await
+    }
+
+    async fn generate_json_with_image(
+        &self,
+        system: &str,
+        user: &str,
+        image_base64: &str,
+        mime: &str,
+    ) -> AppResult<Value> {
+        LlmRegistrySnapshot::generate_json_with_image(self, system, user, image_base64, mime).await
+    }
 }
 
 impl LlmRegistry {
-    pub fn new(client: LlmClient, meta: LlmProviderMeta) -> Self {
-        Self {
-            inner: tokio::sync::RwLock::new(LlmRegistryInner {
+    pub fn new(
+        default_workspace_id: impl Into<String>,
+        client: LlmClient,
+        meta: LlmProviderMeta,
+    ) -> Self {
+        let default_workspace_id = default_workspace_id.into();
+        let mut entries = HashMap::new();
+        entries.insert(
+            default_workspace_id.clone(),
+            LlmRegistryInner {
                 client: std::sync::Arc::new(client),
                 meta,
-            }),
+                generation: 0,
+            },
+        );
+        Self {
+            default_workspace_id,
+            inner: tokio::sync::RwLock::new(entries),
         }
     }
 
-    pub async fn current_meta(&self) -> LlmProviderMeta {
-        self.inner.read().await.meta.clone()
+    pub async fn current_meta(&self, workspace_id: &str) -> Option<LlmProviderMeta> {
+        self.inner
+            .read()
+            .await
+            .get(workspace_id)
+            .map(|entry| entry.meta.clone())
     }
 
-    /// 用新 client 原子替换当前实例。`active_provider_id` 等元数据由调用方透传。
-    pub async fn swap(&self, client: LlmClient, meta: LlmProviderMeta) {
+    pub async fn snapshot(&self, workspace_id: &str) -> AppResult<LlmRegistrySnapshot> {
+        let guard = self.inner.read().await;
+        let entry = guard
+            .get(workspace_id)
+            .ok_or_else(|| AppError::LlmUnavailable {
+                kind: "workspace_provider_missing".to_string(),
+                detail: format!("no active LLM provider is loaded for workspace {workspace_id}"),
+                hint: "configure and activate an LLM provider for this workspace".to_string(),
+                retry_count: 0,
+            })?;
+        Ok(LlmRegistrySnapshot {
+            client: entry.client.clone(),
+            meta: entry.meta.clone(),
+            generation: entry.generation,
+        })
+    }
+
+    /// Atomically replace one workspace client. A newly loaded workspace starts
+    /// at generation 0; subsequent replacements increment only that workspace.
+    pub async fn swap(&self, workspace_id: &str, client: LlmClient, meta: LlmProviderMeta) -> u64 {
         let mut guard = self.inner.write().await;
-        guard.client = std::sync::Arc::new(client);
-        guard.meta = meta;
+        match guard.get_mut(workspace_id) {
+            Some(entry) => {
+                entry.client = std::sync::Arc::new(client);
+                entry.meta = meta;
+                entry.generation = entry
+                    .generation
+                    .checked_add(1)
+                    .expect("LLM registry generation overflow");
+                entry.generation
+            }
+            None => {
+                guard.insert(
+                    workspace_id.to_string(),
+                    LlmRegistryInner {
+                        client: std::sync::Arc::new(client),
+                        meta,
+                        generation: 0,
+                    },
+                );
+                0
+            }
+        }
     }
 
     async fn current(&self) -> std::sync::Arc<LlmClient> {
-        self.inner.read().await.client.clone()
+        self.snapshot(&self.default_workspace_id)
+            .await
+            .expect("default workspace LLM provider must remain loaded")
+            .client
     }
 }
 
@@ -1474,11 +1667,111 @@ impl LlmProvider for LlmRegistry {
 mod tests {
     use super::*;
 
+    fn registry_test_client(model: &str) -> LlmClient {
+        LlmClient::new(
+            "http://127.0.0.1:1".to_string(),
+            "test-key".to_string(),
+            model.to_string(),
+            1,
+            1,
+            100,
+        )
+        .expect("build registry test client")
+    }
+
+    fn registry_test_meta(provider: &str, model: &str) -> LlmProviderMeta {
+        LlmProviderMeta {
+            provider_id: provider.to_string(),
+            format: LlmFormat::Openai,
+            model: model.to_string(),
+            base_url: "http://127.0.0.1:1".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn registry_snapshots_pin_client_identity_and_swap_generation() {
+        let registry = LlmRegistry::new(
+            "ws-a",
+            registry_test_client("model-a"),
+            registry_test_meta("provider-a", "model-a"),
+        );
+        let before = registry.snapshot("ws-a").await.unwrap();
+        assert_eq!(before.generation, 0);
+        assert_eq!(before.meta.provider_id, "provider-a");
+        assert_eq!(before.client.model, "model-a");
+
+        let generation = registry
+            .swap(
+                "ws-a",
+                registry_test_client("model-b"),
+                registry_test_meta("provider-b", "model-b"),
+            )
+            .await;
+        assert_eq!(generation, 1);
+        let after = registry.snapshot("ws-a").await.unwrap();
+        assert_eq!(after.generation, 1);
+        assert_eq!(after.meta.provider_id, "provider-b");
+        assert_eq!(after.client.model, "model-b");
+
+        // An in-flight request keeps the exact client/meta generation it
+        // obtained before the swap.
+        assert_eq!(before.generation, 0);
+        assert_eq!(before.meta.provider_id, "provider-a");
+        assert_eq!(before.client.model, "model-a");
+
+        // Re-activating or editing the same provider is still a new runtime
+        // generation and must not reuse responses from the prior client.
+        let generation = registry
+            .swap(
+                "ws-a",
+                registry_test_client("model-b"),
+                registry_test_meta("provider-b", "model-b"),
+            )
+            .await;
+        assert_eq!(generation, 2);
+        assert_eq!(registry.snapshot("ws-a").await.unwrap().generation, 2);
+    }
+
+    #[tokio::test]
+    async fn registry_isolates_workspace_clients_and_generations() {
+        let registry = LlmRegistry::new(
+            "ws-a",
+            registry_test_client("model-a"),
+            registry_test_meta("provider-a", "model-a"),
+        );
+        assert!(registry.snapshot("ws-b").await.is_err());
+        assert_eq!(
+            registry
+                .swap(
+                    "ws-b",
+                    registry_test_client("model-b"),
+                    registry_test_meta("provider-b", "model-b"),
+                )
+                .await,
+            0
+        );
+        registry
+            .swap(
+                "ws-a",
+                registry_test_client("model-a2"),
+                registry_test_meta("provider-a2", "model-a2"),
+            )
+            .await;
+        let a = registry.snapshot("ws-a").await.unwrap();
+        let b = registry.snapshot("ws-b").await.unwrap();
+        assert_eq!(a.meta.provider_id, "provider-a2");
+        assert_eq!(a.generation, 1);
+        assert_eq!(b.meta.provider_id, "provider-b");
+        assert_eq!(b.generation, 0);
+    }
+
     #[test]
     fn detects_sse_body_vs_plain_json() {
         assert!(is_openai_sse_body("data: {\"choices\":[]}\n\ndata: [DONE]"));
         assert!(is_openai_sse_body("\n  data: {\"x\":1}"));
-        assert!(!is_openai_sse_body("{\"choices\":[{\"message\":{\"content\":\"hi\"}}]}"));
+        assert!(!is_openai_sse_body(
+            "{\"choices\":[{\"message\":{\"content\":\"hi\"}}]}"
+        ));
         assert!(!is_openai_sse_body(""));
     }
 
@@ -1502,6 +1795,41 @@ mod tests {
     }
 
     #[test]
+    fn sse_usage_presence_distinguishes_reported_zero_from_unknown() {
+        let reported_zero = "data: {\"choices\":[{\"delta\":{\"content\":\"{}\"}}]}\n\
+                             data: {\"choices\":[],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0,\"total_tokens\":0}}\n\
+                             data: [DONE]";
+        let (_, usage) = aggregate_openai_sse(reported_zero);
+        let usage = usage.expect("explicit usage object must be retained");
+        assert!(usage.is_known(), "reported zero is a measured value");
+        assert_eq!(usage.total_tokens, 0);
+
+        let omitted = "data: {\"choices\":[{\"delta\":{\"content\":\"{}\"}}]}\n\
+                       data: [DONE]";
+        let (_, usage) = aggregate_openai_sse(omitted);
+        assert!(usage.is_none(), "omitted usage must remain unknown");
+    }
+
+    #[test]
+    fn anthropic_usage_presence_distinguishes_reported_zero_from_unknown() {
+        let reported: AnthropicMessageResponse = serde_json::from_str(
+            r#"{"content":[{"type":"text","text":"{}"}],"usage":{"input_tokens":0,"output_tokens":0}}"#,
+        )
+        .unwrap();
+        let usage = reported.usage.map(ChatUsage::from).unwrap_or_default();
+        assert!(usage.is_known(), "reported zero is a measured value");
+        assert_eq!(usage.total_tokens, 0);
+
+        let omitted: AnthropicMessageResponse =
+            serde_json::from_str(r#"{"content":[{"type":"text","text":"{}"}]}"#).unwrap();
+        assert!(!omitted
+            .usage
+            .map(ChatUsage::from)
+            .unwrap_or_default()
+            .is_known());
+    }
+
+    #[test]
     fn strips_think_prefix_only_when_present() {
         assert_eq!(
             strip_reasoning_prefix("<think>reasoning here</think>{\"k\":1}"),
@@ -1516,7 +1844,8 @@ mod tests {
     #[test]
     fn sse_with_think_prefix_parses_to_json() {
         // 端到端：gpt 风格 SSE（带 <think> 前缀）聚合后能被 parse_json_content 解析。
-        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"<think>hmm</think>{\\\"ok\\\"\"}}]}\n\
+        let body =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"<think>hmm</think>{\\\"ok\\\"\"}}]}\n\
                     data: {\"choices\":[{\"delta\":{\"content\":\":true}\"}}]}\n\
                     data: [DONE]";
         let (acc, _) = aggregate_openai_sse(body);
@@ -1547,7 +1876,9 @@ mod tests {
         // 经 Cloudflare 的端点（rsxermu）源站慢/抖时回 520/522/524——属瞬时不可达应重试。
         // status 段是 reqwest 渲染的 "524 <unknown status code>"，故串里含 "LLM HTTP 524"。
         for code in ["520", "522", "524"] {
-            let err = AppError::External(format!("LLM HTTP {code} <unknown status code>: origin timeout"));
+            let err = AppError::External(format!(
+                "LLM HTTP {code} <unknown status code>: origin timeout"
+            ));
             assert!(
                 is_retryable_llm_error(&err),
                 "Cloudflare {code} 应可重试（端点抖动，非配置错）"
@@ -1827,14 +2158,21 @@ mod tests {
         let body = r#"{"content":[{"type":"text","text":"我将为您生成完整配置。"},{"type":"tool_use","name":"WebFetch","input":{"url":"https://x"}}],"stop_reason":"tool_use"}"#;
         let parsed: AnthropicMessageResponse = serde_json::from_str(body).unwrap();
         let diag = detect_tool_use_hijack(&parsed).expect("应识别 tool_use 劫持");
-        assert!(diag.contains("llm_tool_use_instead_of_json"), "诊断: {diag}");
-        assert!(diag.contains("我将为您生成"), "诊断须含 text 开场白前缀: {diag}");
+        assert!(
+            diag.contains("llm_tool_use_instead_of_json"),
+            "诊断: {diag}"
+        );
+        assert!(
+            diag.contains("我将为您生成"),
+            "诊断须含 text 开场白前缀: {diag}"
+        );
     }
 
     #[test]
     fn detect_tool_use_hijack_flags_stop_reason_only() {
         // 即便 content 里暂无 tool_use block，stop_reason=tool_use 也要拦。
-        let body = r#"{"content":[{"type":"text","text":"让我查一下。"}],"stop_reason":"tool_use"}"#;
+        let body =
+            r#"{"content":[{"type":"text","text":"让我查一下。"}],"stop_reason":"tool_use"}"#;
         let parsed: AnthropicMessageResponse = serde_json::from_str(body).unwrap();
         assert!(detect_tool_use_hijack(&parsed).is_some());
     }
@@ -1842,7 +2180,8 @@ mod tests {
     #[test]
     fn detect_tool_use_hijack_passes_normal_text_response() {
         // 正常一次性 JSON 输出（end_turn，纯 text）不得误判。
-        let body = r#"{"content":[{"type":"text","text":"{\"ok\":true}"}],"stop_reason":"end_turn"}"#;
+        let body =
+            r#"{"content":[{"type":"text","text":"{\"ok\":true}"}],"stop_reason":"end_turn"}"#;
         let parsed: AnthropicMessageResponse = serde_json::from_str(body).unwrap();
         assert!(detect_tool_use_hijack(&parsed).is_none());
     }
@@ -1850,17 +2189,12 @@ mod tests {
     #[test]
     fn temperature_defaults_to_02_and_setter_overrides() {
         // 生产构造默认 0.2（决策稳定）；with_temperature 链式覆盖（roleplayer 用 0.8）。
-        let c = LlmClient::new(
-            "http://x".into(),
-            "k".into(),
-            "m".into(),
-            10,
-            1,
-            100,
-        )
-        .unwrap();
+        let c = LlmClient::new("http://x".into(), "k".into(), "m".into(), 10, 1, 100).unwrap();
         assert!((c.temperature - 0.2).abs() < f64::EPSILON, "默认应 0.2");
         let hot = c.with_temperature(0.8);
-        assert!((hot.temperature - 0.8).abs() < f64::EPSILON, "setter 应覆盖到 0.8");
+        assert!(
+            (hot.temperature - 0.8).abs() < f64::EPSILON,
+            "setter 应覆盖到 0.8"
+        );
     }
 }

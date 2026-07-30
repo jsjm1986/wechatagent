@@ -1,5 +1,5 @@
-// AI 修复 patch 落库 + 闭账。照 useGoLive.ts 的 runGoLive 形态返回 {ok,reason}，不抛错。
-// 防清空：PUT body 从 originalChunk 出发，只用勾选字段覆盖。
+// AI 修复 patch 落库 + 闭账。服务端按 acceptedFields 从 proposal patch 取值，
+// 统一经过 revision harness；客户端不再先 PUT 整个 Chunk。
 // 红线：thenVerify 恒 false（落库只到 draft+needs_review，AI 永不自动 verify）。
 export interface ApplyRepairInput {
   chunkId: string;
@@ -19,21 +19,11 @@ export interface ApplyRepairResult {
 
 export async function applyAiRepairPatch(input: ApplyRepairInput): Promise<ApplyRepairResult> {
   const accepted = new Set(input.acceptedFieldNames);
-  // 防清空：从原 chunk 值出发，只覆盖勾选字段。
-  const putBody: Record<string, unknown> = { ...input.originalChunk };
-  for (const name of input.acceptedFieldNames) {
-    if (name in input.patch) putBody[name] = input.patch[name];
-  }
+  void input.originalChunk; // retained in the public type for caller compatibility
   // skipped = patch 里有、但没勾选的字段名。
   const skippedFields = Object.keys(input.patch).filter((k) => k !== "extras" && !accepted.has(k));
 
   try {
-    const putResp = await fetch(
-      `/api/operation-knowledge/chunks/${encodeURIComponent(input.chunkId)}`,
-      { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(putBody) },
-    );
-    if (!putResp.ok) return { ok: false, reason: "apply_failed" };
-
     const appliedResp = await fetch(
       `/api/operation-knowledge/repair/applied`,
       {
@@ -42,6 +32,7 @@ export async function applyAiRepairPatch(input: ApplyRepairInput): Promise<Apply
         body: JSON.stringify({
           targetKind: "chunk",
           targetId: input.chunkId,
+          patch: input.patch,
           sessionId: input.sessionId,
           turn: input.turn,
           acceptedFields: input.acceptedFieldNames,
@@ -53,7 +44,7 @@ export async function applyAiRepairPatch(input: ApplyRepairInput): Promise<Apply
       },
     );
     if (!appliedResp.ok) {
-      return { ok: false, reason: "audit_failed", message: "已落库为草稿，但审计记录写入失败" };
+      return { ok: false, reason: "apply_failed" };
     }
     return { ok: true };
   } catch {

@@ -1,13 +1,16 @@
 # System Architecture
 
+> Documentation snapshot: checked against commit `d60d3d85f8e193160dca8df185de0daef004a6b6` plus the uncommitted SR-001--SR-183 closure worktree on 2026-07-24. This is not deployment verification; source code and `.env.example` are authoritative if this document drifts. Sections explicitly labelled as recommendations are not shipped topology.
+
 ## Current Architecture
 
 ```text
 React Admin
   -> Rust Axum API
-    -> MongoDB
-    -> MCP Server
-    -> DeepSeek/OpenAI-compatible API
+     + supervised background workers (same process)
+    -> MongoDB (business state, queues, leases, audit)
+    -> workspace-scoped OpenAI-compatible LLM providers
+    -> durable Outbox -> second safety gate -> MCP Server
 ```
 
 当前系统是一个 Rust 单体服务：
@@ -49,16 +52,18 @@ Infrastructure
 ## Current Backend Modules
 
 ```text
-src/main.rs       启动、路由、静态文件、worker
-src/config.rs     环境变量配置
-src/db.rs         MongoDB 连接和索引
-src/models.rs     数据结构
-src/mcp.rs        MCP JSON-RPC 客户端
-src/llm.rs        OpenAI-compatible LLM 客户端
-src/agent.rs      私聊 Agent 决策和执行
-src/routes.rs     后台 API
-src/webhooks.rs   微信消息 webhook
-src/tasks.rs      跟进任务 worker
+src/main.rs          启动、路由、静态文件、受监督 worker 注册
+src/config.rs        环境变量配置与默认值
+src/db/              MongoDB typed accessors、迁移和索引
+src/models.rs        数据结构
+src/mcp.rs           workspace/account scoped MCP JSON-RPC 客户端
+src/llm.rs           OpenAI-compatible LLM client/provider 抽象
+src/agent/           Gateway、决策、Review、Memory、Outbox 与发送调度
+src/routes/          后台 API
+src/webhooks.rs      微信消息 webhook 与 durable inbound handoff
+src/tasks.rs         fenced 跟进任务 worker
+src/evolution/       与生产发送链物理隔离的演化器
+src/knowledge_*      Knowledge Agent、日报、长任务与 Wiki worker
 ```
 
 ## Agent Types
@@ -102,42 +107,38 @@ src/services/task_service.rs
 POST /webhooks/wechat
 → 解析 appId/fromWxid/content/messageId
 → 定位微信账号和联系人
-→ 保存 inbound message
+→ 在 ACK 前持久化 inbound message / pending handoff
 → 如果 contact.agent_status != managed，停止
-→ 构建 Agent 上下文
-→ 调用 LLM 生成决策
-→ 调用 MCP message_send_text
-→ 保存 outbound message
-→ 更新画像/记忆/任务
-→ 写入事件日志
+→ 去抖 runner 领取 generation，进入 run_user_operation_gateway
+→ reload scope context → knowledge route → Reply → independent Review
+→ precheck/finalize/state-action safety gates
+→ 写 durable agent_send_outbox（先于任何 MCP 发送）
+→ outbox dispatcher claim/lease + second safety gate
+→ MCP 发送；timeout/reclaim 先做 post-hoc delivery verification
+→ 收敛 outbound/run/task/audit 状态，异步分析反应与记忆
 ```
 
 后续群聊 webhook 应使用独立流程，不复用私聊自动回复逻辑。
 
 ## Worker Flow
 
-当前任务 worker：
+跟进任务与发送 worker：
 
 ```text
-定时扫描 pending task
-→ 到期任务置为 running
-→ 调用 MCP 发送
-→ 成功置 sent
-→ 失败置 failed
-→ 写入事件日志
+定时扫描 pending/retry task
+→ claim token + generation + lease 原子领取（stale 可恢复）
+→ 到期任务走同一 run_user_operation_gateway
+→ Gateway 提交 task-bound outbox intent
+→ outbox dispatcher 独立 claim 并在 MCP 前复核 task owner/generation
+→ sent / retry / failed / canceled 以 fenced CAS 收敛
+→ 周期恢复器重建 webhook handoff 与过期任务，不依赖进程内唤醒保证正确性
 ```
 
-后续应补充：
-
-- 重试次数
-- 下次重试时间
-- 失败分类
-- 任务来源模块
-- 幂等键
+上述正确性依赖 Mongo 中的 durable task/outbox、幂等键、lease 和 fencing；进程内即时唤醒只用于降低延迟。
 
 ## Evolution Worker Flow（M4 / agent-self-evolution）
 
-可选后台 tick（`EVOLUTION_ENABLED=true` 才起；默认 false）。完整设计见 `docs/agent-policy.md` 自我演化章节。运行链路：
+可选后台 tick。worker 由主进程注册，但 `EVOLUTION_ENABLED=false`（默认）时立即退出；显式设为 true 后仍需 workspace Mongo runtime flag 放行。当前代码政策 `CURRENT_AUTO_RELEASE_POLICY_ENABLED=false` 强制所有 proposal 人工发布，旧自动发布配置不能绕过。完整设计见 `docs/agent-policy.md` 自我演化章节。运行链路：
 
 ```text
 [evolution::tick] 每 EVOLUTION_TICK_SECONDS 触发一次
@@ -330,7 +331,7 @@ fire-and-forget: knowledge_wiki::gap_signals::record_chunk_hit
 one Rust process
 one MongoDB
 external MCP Server
-external DeepSeek API
+external OpenAI-compatible LLM provider(s)
 ```
 
 当任务量或 webhook 量上升后，再考虑：
@@ -338,12 +339,12 @@ external DeepSeek API
 - API 和 worker 进程拆分
 - 队列系统
 - 多实例部署
-- webhook 签名校验
-- 日志/指标采集
+- 跨副本 lease/锁与共享媒体存储
+- 集中式日志/指标后端
 
 ## Phase 0 → E5-T1 时代图（updated）
 
-本节是 `## Webhook Flow` / `## Worker Flow` 之后的补丁——把 Phase 0 → E5-T1 的实际链路落到一处。两份原图保留了"当前最小可运行链路"的语义；本节描绘的是 reaction / outbox / multi-account / multi-locale / reviewer 双模 / ops 三表灰度全部接通后的真实形态。
+本节保留 Phase 0 → E5-T1 的详细历史演进说明；顶部 `Current Architecture`、`Webhook Flow` 与源码是当前事实入口。字段或阶段名若与源码冲突，以源码和本页快照标记为准。
 
 ### 私聊 Webhook Flow（全链路）
 
@@ -387,27 +388,26 @@ POST /webhooks/wechat
 ### Worker Flow（多 worker 并行）
 
 ```text
-tokio::spawn 主进程内 9 条 loop（启停由 env / mongo flag 控制）：
+`spawn_supervised` 在主进程最多注册 13 条 loop（部分由 env/interval/Mongo flag 立即关闭）：
 
-1. tasks::worker_loop                  follow-up task 调度，走同一 gateway
-2. outbox_dispatcher::run_outbox_dispatcher  五状态机 + idempotency + retry/backoff
-3. planner::run_strategic_planner_loop  M3 strategic planner（commitment due / silent followup）
-4. evolution::worker（EVOLUTION_ENABLED=true 时启）  threshold / prompt 灰度 + post_release
-5. knowledge_wiki::feedback_worker      30d 滑窗 usage_stats / dynamic_confidence + structural lint
+1. task_worker                          follow-up/durable inbound task，走同一 gateway
+2. import_worker                        异步知识导入 job
+3. outbox_dispatcher                    durable send claim / second gate / MCP / retry
+4. media_storage_reconciler             本地内容寻址媒体启动恢复与周期一致性扫描
+5. strategic_planner                    commitment due / silent followup（默认关）
+6. cold_contact_worker                  冷联系人重激活（默认关）
+7. silence_signal_worker                沉默删失信号（默认关）
+8. evolutionary_worker                  env + Mongo 双闸（默认关；发布仍人工）
+9. knowledge_digest_worker              日报合成（默认关）
+10. knowledge_task_worker               chat plannedSteps 长任务（默认 30s）
+11. catalog_rebuild_worker              documents.catalog_summary_persisted 增量重写（默认 3s）
+12. knowledge_feedback_worker           30d usage_stats / dynamic_confidence + structural lint
                                         + sweep_stale_signals + lessons_learned 14d 聚合
                                         （dynamic_confidence 带最小样本门 DYNAMIC_CONFIDENCE_MIN_SAMPLES；
                                          hit/block 标签默认取真实用户反应 outcome_status，按 run_id join
                                          decision_reviews，沉默删失排除——DYNAMIC_CONFIDENCE_REAL_OUTCOME_ENABLED
                                          默认 true，置 false 退回 reviewer 自评 review_approved 旧统计）
-6. catalog_rebuild_worker               documents.catalog_summary_persisted 增量重写
-7. knowledge_digest::run_loop           日报工作站（chat-only async tools）
-8. cold_contact_worker                  按 last_outbound_at 阈值挑联系人 → peer_case 钩子重激活
-                                        （COLD_CONTACT_WORKER_ENABLED env 开关，默认 false）
-9. silence_signal_worker                按 last_outbound_at 阈值挑"久未回复"联系人 → 落
-                                        censored=true 沉默信号（只采集不发消息；
-                                        SILENCE_SIGNAL_WORKER_ENABLED env 开关，默认 false）
-                                        采集三态（写入/去重/失败）按天 $inc 进 behavior_signal_metrics
-                                        （webhook 采集点同写；BEHAVIOR_SIGNAL_METRICS_ENABLED 默认 false）
+13. ingest_worker                       active ingest source 条件抓取（默认关）
 ```
 
 ### Phase 0 → E5-T1 新增 collection / 字段速查

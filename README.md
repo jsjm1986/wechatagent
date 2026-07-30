@@ -1,5 +1,7 @@
 # WechatAgent
 
+> Documentation snapshot: checked against commit `d60d3d85f8e193160dca8df185de0daef004a6b6` plus the uncommitted SR-001--SR-183 closure worktree on 2026-07-24. This is not deployment verification; runtime code and `.env.example` remain authoritative when this summary drifts.
+
 一个基于 Rust + MongoDB + MCP Server 的微信私聊运营 AI Agent。
 
 第一版只做私聊好友运营：所有好友默认是普通好友，只有人工加入 `managed` 后才由 Agent 自动回复、更新画像、创建跟进任务。
@@ -10,8 +12,8 @@
 React Admin
   -> Rust Axum API
     -> MongoDB: 好友、消息、画像、任务、日志
-    -> MCP Server: 微信账号、联系人、发消息
-    -> DeepSeek/OpenAI Compatible API: 画像生成和运营决策
+    -> LLM Provider Registry: 画像、知识路由、回复与独立 Review
+    -> Agent Gateway -> durable Outbox -> second safety gate -> MCP Server
 ```
 
 核心规则：
@@ -29,16 +31,14 @@ React Admin
 Copy-Item .env.example .env
 ```
 
-必填：
+启动必填（其余项有默认值，可按部署覆盖）：
 
 ```text
-MONGODB_URI
-MCP_BASE_URL
 MCP_API_KEY
-OPENAI_BASE_URL=https://api.deepseek.com
 OPENAI_API_KEY
-OPENAI_MODEL=deepseek-v4-flash
 ```
+
+`MONGODB_URI`、`MCP_BASE_URL`、`OPENAI_BASE_URL` 和 `OPENAI_MODEL` 均有代码默认值；生产部署仍应显式配置，避免误连开发默认端点。
 
 如果当前 MCP Key 是 Account Key，可以保持默认不传 `account_alias`。服务端会绑定到该 Key 对应的微信账号。
 
@@ -117,9 +117,10 @@ newMsgId / msgId
 
 ## 演化器（Evolution worker / M4）
 
-可选的后台演化器：每 6 小时（`EVOLUTION_TICK_SECONDS` 默认 21600）按 cohort 选样，对 5 闸阈值与运营 prompt 各产 ≤ N 条候选，进 shadow replay + 显著性检验，admin 在前端 EvolutionCenterTab 手工 release / rollback。
+可选的后台演化器：每 6 小时（`EVOLUTION_TICK_SECONDS` 默认 21600）按 cohort 选样，生成阈值与运营 prompt 候选，进入 shadow replay + 显著性检验；当前产品政策要求 admin 在前端手工 release / rollback。
 
-- 主开关：`EVOLUTION_ENABLED=false`（默认关，运维需显式打开）。
+- 双闸：`EVOLUTION_ENABLED=false` 是默认关闭的运维硬锁；只有显式设为 `true` 后，workspace 的 Mongo runtime flag 才能进一步放行灰度。
+- 自动发布：即使旧配置字段被打开，代码政策常量 `CURRENT_AUTO_RELEASE_POLICY_ENABLED=false` 仍强制当前全部人工发布。
 - 已发布的 `threshold_overrides` / `prompt_templates` 在主开关关停后**不回退**，由 admin 手工 rollback。
 - 演化器走独立模块 `src/evolution/`，CI lint（`scripts/check-evolution-isolation.{sh,ps1}`）守住"不调用 gateway / outbox / MCP"红线，确保演化器对生产链路零副作用。
 - 完整设计与安全边界见 `docs/agent-policy.md` 自我演化章节。
@@ -157,6 +158,6 @@ cd frontend
 npm run build
 ```
 
-CI 合并门：执行 `scripts/check-baseline.ps1`（Windows）或 `scripts/check-baseline.sh`（Linux / CI），核验 `cargo test --lib >= 78` 与 4 个 PBT 文件累计 `>= 33`，任一不达标即 `exit 1`。
+CI 合并门：执行 `scripts/check-baseline.ps1`（Windows）或 `scripts/check-baseline.sh`（Linux / CI），核验 `cargo test --lib >= 350`、`cargo check --tests` 在 `-D warnings` 下通过，以及 4 个 PBT 文件累计 `>= 33`；任一不达标即 `exit 1`。
 
 文本严禁词 lint：`scripts/check-no-human-takeover.{sh,ps1}` 扫 `src/agent/ src/routes/ src/evolution/ frontend/src/` 新增行禁用 `human / 人工 / 接管 / takeover / hand-off`；演化器隔离 lint：`scripts/check-evolution-isolation.{sh,ps1}` 扫 `src/evolution/` 是否引用 gateway / outbox / MCP（M4 演化器必须保持独立）。

@@ -11,6 +11,7 @@ export interface DomainSchemaFieldDraft {
 }
 export interface DomainSchemaUpsertBody {
   schemaId: string;
+  expectedVersion?: number;
   name: string;
   fields: DomainSchemaFieldDraft[];
   aliasDict: Record<string, string>;
@@ -18,6 +19,7 @@ export interface DomainSchemaUpsertBody {
 }
 interface InitialSchema {
   schemaId: string;
+  version: number;
   name: string;
   fields: DomainSchemaFieldDraft[];
   aliasDict?: Record<string, string>;
@@ -60,6 +62,7 @@ export function DomainSchemaEditor({
     }
     const body: DomainSchemaUpsertBody = {
       schemaId: schemaId.trim(),
+      ...(mode === "edit" && initial ? { expectedVersion: initial.version } : {}),
       name: name.trim(),
       fields: fields.map((f) => ({
         name: f.name.trim(),

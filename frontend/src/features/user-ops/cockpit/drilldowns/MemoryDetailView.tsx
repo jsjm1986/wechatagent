@@ -30,6 +30,32 @@ const PLAIN_SECTIONS = [
   { key: "conflicts", label: "记忆冲突" }
 ] as const;
 
+type CoreFactEvictionView = {
+  text: string;
+  reason: string;
+  evictedAt?: string;
+  coreFactRank?: number;
+};
+
+function coreFactEvictions(memoryCard?: Record<string, unknown>): CoreFactEvictionView[] {
+  const value = memoryCard?.coreFactEvictions;
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item): CoreFactEvictionView | null => {
+      if (!item || typeof item !== "object") return null;
+      const record = item as Record<string, unknown>;
+      const text = stringField(record, "text").trim();
+      if (!text) return null;
+      return {
+        text,
+        reason: stringField(record, "reason").trim(),
+        evictedAt: stringField(record, "evictedAt").trim() || undefined,
+        coreFactRank: typeof record.coreFactRank === "number" ? record.coreFactRank : undefined
+      };
+    })
+    .filter((item): item is CoreFactEvictionView => item !== null);
+}
+
 export function MemoryDetailView({
   memoryCard,
   onBack
@@ -49,8 +75,9 @@ export function MemoryDetailView({
   const plainItems = PLAIN_SECTIONS
     .map((section) => ({ ...section, values: contextPackList(memoryCard, section.key) }))
     .filter((section) => section.values.length > 0);
+  const evictions = coreFactEvictions(memoryCard);
 
-  const empty = !factItems.length && !plainItems.length && !profile && !relation;
+  const empty = !factItems.length && !plainItems.length && !evictions.length && !profile && !relation;
 
   return (
     <section className="smartTabPanel">
@@ -107,6 +134,23 @@ export function MemoryDetailView({
               ))}
             </div>
           ))}
+          {evictions.length > 0 && (
+            <div>
+              <span>核心事实归档</span>
+              {evictions.map((eviction, index) => (
+                <div className={styles.factEviction} key={`${eviction.text}-${index}`}>
+                  <p>{eviction.text}</p>
+                  <p className={styles.factEvictionNote}>
+                    {eviction.reason === "core_fact_capacity"
+                      ? "因核心事实窗口上限归档"
+                      : "已从核心事实窗口归档"}
+                    {typeof eviction.coreFactRank === "number" ? ` · 原排名 ${eviction.coreFactRank}` : ""}
+                    {eviction.evictedAt ? ` · ${eviction.evictedAt}` : ""}
+                  </p>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
     </section>

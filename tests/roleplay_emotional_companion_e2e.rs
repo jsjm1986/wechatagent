@@ -57,14 +57,14 @@ use wechatagent::agent::handle_managed_message;
 use wechatagent::agent::run_envelope::{FINAL_REVIEW_STATUS_VALUES, GATEWAY_STATUS_VALUES};
 use wechatagent::error::{AppError, AppResult};
 use wechatagent::llm::{LlmClient, LlmFormat, LlmJsonResult, LlmProvider};
-use wechatagent::models::{
-    AgentStatus, Contact, ConversationMessage, MessageDirection,
-};
+use wechatagent::models::{AgentStatus, Contact, ConversationMessage, MessageDirection};
 use wechatagent::routes::AppState;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use crate::common::roleplay_fixtures::{seed_emotional_companion_profile_in_workspace, RoleplayLedger};
+use crate::common::roleplay_fixtures::{
+    seed_emotional_companion_profile_in_workspace, RoleplayLedger,
+};
 use crate::common::TestApp;
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -77,11 +77,19 @@ use crate::common::TestApp;
 
 /// 从 env 构造真实文本主 provider。缺 `REAL_LLM_API_KEY` → None（调用方自我跳过）。
 fn real_llm_from_env() -> Option<Arc<LlmClient>> {
-    let api_key = std::env::var("REAL_LLM_API_KEY").ok().filter(|k| !k.trim().is_empty())?;
+    let api_key = std::env::var("REAL_LLM_API_KEY")
+        .ok()
+        .filter(|k| !k.trim().is_empty())?;
     let base_url = std::env::var("REAL_LLM_BASE_URL")
         .unwrap_or_else(|_| "https://token-plan-cn.xiaomimimo.com/v1".to_string());
     let model = std::env::var("REAL_LLM_MODEL").unwrap_or_else(|_| "mimo-v2.5-pro".to_string());
-    let client = build_real_client(base_url, api_key, model, "REAL_LLM_FORMAT", primary_max_retries());
+    let client = build_real_client(
+        base_url,
+        api_key,
+        model,
+        "REAL_LLM_FORMAT",
+        primary_max_retries(),
+    );
     Some(Arc::new(client))
 }
 
@@ -127,7 +135,9 @@ struct FailoverProvider {
 #[async_trait::async_trait]
 impl LlmProvider for FailoverProvider {
     async fn generate_json(&self, system: &str, user: &str) -> AppResult<serde_json::Value> {
-        self.generate_json_with_usage(system, user).await.map(|r| r.value)
+        self.generate_json_with_usage(system, user)
+            .await
+            .map(|r| r.value)
     }
 
     async fn generate_json_with_usage(&self, system: &str, user: &str) -> AppResult<LlmJsonResult> {
@@ -173,12 +183,20 @@ fn primary_max_retries() -> u32 {
 /// 构造最强模型 client（llama-3.3-70b @ NVIDIA integrate）。缺 `REAL_LLM_JUDGE_API_KEY` → None。
 /// 既作独立裁判，也作 agent 备胎链首选。
 fn strongest_model_client() -> Option<Arc<LlmClient>> {
-    let key = std::env::var("REAL_LLM_JUDGE_API_KEY").ok().filter(|k| !k.trim().is_empty())?;
+    let key = std::env::var("REAL_LLM_JUDGE_API_KEY")
+        .ok()
+        .filter(|k| !k.trim().is_empty())?;
     let base = std::env::var("REAL_LLM_JUDGE_BASE_URL")
         .unwrap_or_else(|_| "https://integrate.api.nvidia.com/v1".to_string());
     let model = std::env::var("REAL_LLM_JUDGE_MODEL")
         .unwrap_or_else(|_| "meta/llama-3.3-70b-instruct".to_string());
-    Some(Arc::new(build_real_client(base, key, model, "REAL_LLM_JUDGE_FORMAT", 5)))
+    Some(Arc::new(build_real_client(
+        base,
+        key,
+        model,
+        "REAL_LLM_JUDGE_FORMAT",
+        5,
+    )))
 }
 
 fn failover_model_list() -> Vec<String> {
@@ -202,7 +220,9 @@ fn failover_backups() -> Vec<Arc<LlmClient>> {
         let base = std::env::var("REAL_LLM_FAILOVER_BASE_URL")
             .unwrap_or_else(|_| "https://integrate.api.nvidia.com/v1".to_string());
         backups.extend(failover_model_list().into_iter().filter_map(|m| {
-            LlmClient::new(base.clone(), key.clone(), m, 180, 5, 2500).ok().map(Arc::new)
+            LlmClient::new(base.clone(), key.clone(), m, 180, 5, 2500)
+                .ok()
+                .map(Arc::new)
         }));
     }
     backups
@@ -211,7 +231,10 @@ fn failover_backups() -> Vec<Arc<LlmClient>> {
 fn wrap_with_failover(primary_label: String, primary: Arc<LlmClient>) -> Arc<dyn LlmProvider> {
     let mut clients = vec![primary];
     clients.extend(failover_backups());
-    Arc::new(FailoverProvider { primary_label, clients })
+    Arc::new(FailoverProvider {
+        primary_label,
+        clients,
+    })
 }
 
 fn real_llm_with_failover() -> Option<Arc<dyn LlmProvider>> {
@@ -232,12 +255,17 @@ fn judge_provider(state: &AppState) -> Arc<dyn LlmProvider> {
                 let base = std::env::var("REAL_LLM_FAILOVER_BASE_URL")
                     .unwrap_or_else(|_| "https://integrate.api.nvidia.com/v1".to_string());
                 clients.extend(failover_model_list().into_iter().filter_map(|m| {
-                    LlmClient::new(base.clone(), key.clone(), m, 180, 5, 2500).ok().map(Arc::new)
+                    LlmClient::new(base.clone(), key.clone(), m, 180, 5, 2500)
+                        .ok()
+                        .map(Arc::new)
                 }));
             }
             let label = std::env::var("REAL_LLM_JUDGE_MODEL")
                 .unwrap_or_else(|_| "meta/llama-3.3-70b-instruct".to_string());
-            Arc::new(FailoverProvider { primary_label: label, clients })
+            Arc::new(FailoverProvider {
+                primary_label: label,
+                clients,
+            })
         }
         None => state.llm.clone(),
     }
@@ -316,7 +344,9 @@ struct UniqueMsgIdResponder {
 
 impl wiremock::Respond for UniqueMsgIdResponder {
     fn respond(&self, _request: &wiremock::Request) -> ResponseTemplate {
-        let seq = self.counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let seq = self
+            .counter
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -330,7 +360,9 @@ async fn start_mcp_mock_success() -> MockServer {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/mcp"))
-        .respond_with(UniqueMsgIdResponder { counter: std::sync::atomic::AtomicU64::new(0) })
+        .respond_with(UniqueMsgIdResponder {
+            counter: std::sync::atomic::AtomicU64::new(0),
+        })
         .mount(&server)
         .await;
     server
@@ -637,19 +669,34 @@ async fn p2_emotional_companion_night_low_mood_arc() {
     seed_emotional_companion_profile_in_workspace(&app, "default").await;
 
     let contact = emotional_contact("roleplay_p2_emotional_user");
-    state.db.contacts().insert_one(&contact, None).await.expect("insert contact");
+    state
+        .db
+        .contacts()
+        .insert_one(&contact, None)
+        .await
+        .expect("insert contact");
 
     let ledger = RoleplayLedger::for_fixture("emotional_companion_minimal");
 
     // 设计 §6.2：夜间情绪低落用户 4 轮固定台词。
     let arc = [
         ("scene_night_low_mood_t1", "睡不着，突然觉得挺没意思的。"),
-        ("scene_night_low_mood_t2", "也不是要你解决，就是有点撑不住。"),
-        ("scene_night_low_mood_t3", "你别一直问我问题，我现在脑子很乱。"),
+        (
+            "scene_night_low_mood_t2",
+            "也不是要你解决，就是有点撑不住。",
+        ),
+        (
+            "scene_night_low_mood_t3",
+            "你别一直问我问题，我现在脑子很乱。",
+        ),
         ("scene_night_low_mood_t4", "嗯，你在就好。"),
     ];
 
-    let latest = || FindOneOptions::builder().sort(doc! { "created_at": -1 }).build();
+    let latest = || {
+        FindOneOptions::builder()
+            .sort(doc! { "created_at": -1 })
+            .build()
+    };
     let mut prev_reply = String::new();
     let mut prev_questions = 0usize;
     let mut approved_turns = 0usize;
@@ -659,7 +706,12 @@ async fn p2_emotional_companion_night_low_mood_arc() {
         let turn = i + 1;
         let msg_id = format!("roleplay_p2_inbound_{turn}");
         let inbound = make_inbound(&contact, &msg_id, content);
-        state.db.messages().insert_one(&inbound, None).await.expect("insert inbound");
+        state
+            .db
+            .messages()
+            .insert_one(&inbound, None)
+            .await
+            .expect("insert inbound");
 
         // clone：内存副本 last_agent_run_at 恒 None，绕过 min_reply_interval（设计 §5.2）。
         unwrap_or_skip_transient!(
@@ -698,7 +750,10 @@ async fn p2_emotional_companion_night_low_mood_arc() {
         let review = state
             .db
             .decision_reviews()
-            .find_one(doc! { "contact_wxid": &contact.wxid, "inbound_message_id": &msg_id }, latest())
+            .find_one(
+                doc! { "contact_wxid": &contact.wxid, "inbound_message_id": &msg_id },
+                latest(),
+            )
             .await
             .expect("query decision_review");
 
@@ -938,7 +993,8 @@ async fn p2_emotional_companion_night_low_mood_arc() {
         }
 
         // ⑦ 情感陪伴中性 judge（只观测，返回各维 median 供背离对照）。
-        let judge_medians = run_emotional_judge(&state, &ledger, scene_id, content, &reply_text).await;
+        let judge_medians =
+            run_emotional_judge(&state, &ledger, scene_id, content, &reply_text).await;
 
         // ⑦a/⑦b/⑦b2 都只需 judge median（jm）。reviewer 分按需在分支内取——⑦a/⑦b 的
         //     "reviewer 误杀"判定需要 reviewer pressure，但 ⑦b2 的"agent 低质"判定**不依赖**

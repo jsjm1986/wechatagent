@@ -12,28 +12,42 @@
 mod indexes;
 pub mod migrations;
 
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Weak,
+};
+
 use mongodb::{options::ClientOptions, Client, Collection, Database as MongoDatabase};
 
 use crate::models::{
     AgentCommandRun, AgentDecisionReview, AgentEvent, AgentOutcomeMetric, AgentPrincipalEscalation,
-    AgentRunLog, AgentSendLedger, AgentSoul,
-    AgentTask, AgentToolCall, BehaviorSignal, BehaviorSignalMetric, Campaign, CampaignSend, CatalogRebuildJob,
-    ChunkRevision, Contact,
-    ContentAsset, ConversationMessage, DomainProfile, DomainSchema, EvaluationScenario, Experiment, IngestSource,
-    KnowledgeChatTask, KnowledgeChatTurn, KnowledgeDailyReport, KnowledgeGapSignal,
-    ImportJob, KnowledgeOperatorMemory, KnowledgeUsageLog, LlmCallLog, LlmProviderConfig,
+    AgentRunLog, AgentSendLedger, AgentSoul, AgentTask, AgentToolCall, BehaviorSignal,
+    BehaviorSignalMetric, Campaign, CampaignSend, CatalogRebuildJob, ChunkRevision, Contact,
+    ContentAsset, ConversationMessage, DomainProfile, DomainSchema, EvaluationScenario, Experiment,
+    ImportJob, IngestSource, KnowledgeChatTask, KnowledgeChatTurn, KnowledgeDailyReport,
+    KnowledgeGapSignal, KnowledgeOperatorMemory, KnowledgeUsageLog, LlmCallLog, LlmProviderConfig,
     ManagementAgentMessage, ManagementAgentSession, McpCallLog, MemoryCandidate, MigrationRecord,
     OperatingMemory, OperationDomainConfig, OperationKnowledgeChunk, OperationKnowledgeDocument,
-    OperationPlaybook, OutboxEntry, PostReleaseReview, Product, PromptTemplate,
-    Proposal, ReferralCard, RelationshipTypeSuggestion, ShadowReplay, SuspectedDealSignal, TaxonomyCandidate, TaxonomyEntry,
-    ThresholdOverride, ThresholdOverrideAudit, UserOperationGuidePreview, WechatAccount,
+    OperationPlaybook, OutboxEntry, PostReleaseReview, Product, PromptTemplate, Proposal,
+    ReferralCard, RelationshipTypeSuggestion, ShadowReplay, SuspectedDealSignal, TaxonomyCandidate,
+    TaxonomyEntry, ThresholdOverride, ThresholdOverrideAudit, UserOperationGuidePreview,
+    WechatAccount,
 };
 
 #[derive(Clone)]
 pub struct Database {
     db: MongoDatabase,
     client: Client,
+    /// Process-local identity shared by clones of this connection wrapper.
+    ///
+    /// Runtime caches use it to isolate independent Mongo databases/connections
+    /// that happen to contain the same workspace ids. It is intentionally not a
+    /// persisted database identifier and has no business semantics.
+    cache_identity: u64,
+    cache_lifetime: Arc<()>,
 }
+
+static NEXT_DATABASE_CACHE_IDENTITY: AtomicU64 = AtomicU64::new(1);
 
 impl Database {
     pub async fn connect(uri: &str, database: &str) -> anyhow::Result<Self> {
@@ -44,6 +58,8 @@ impl Database {
         Ok(Self {
             db,
             client,
+            cache_identity: NEXT_DATABASE_CACHE_IDENTITY.fetch_add(1, Ordering::Relaxed),
+            cache_lifetime: Arc::new(()),
         })
     }
 
@@ -71,6 +87,18 @@ impl Database {
         &self.db
     }
 
+    /// Stable process-local cache identity. `Database::clone()` preserves it;
+    /// a separate `connect` call receives a new identity even for the same URI.
+    pub(crate) fn cache_identity(&self) -> u64 {
+        self.cache_identity
+    }
+
+    /// Lifetime token for process-local cache registries. Registries retain a
+    /// strong cache only while at least one clone of this `Database` exists.
+    pub(crate) fn cache_lifetime(&self) -> Weak<()> {
+        Arc::downgrade(&self.cache_lifetime)
+    }
+
     pub fn contacts(&self) -> Collection<Contact> {
         self.db.collection("contacts")
     }
@@ -96,7 +124,7 @@ impl Database {
     /// 自学习采集管道 S1–S3：`behavior_signals` append-only 事件日志 typed
     /// accessor。只存系统观察到的客观行为量（reply_latency / reply_length /
     /// reactivation / silence），不含任何 LLM 解释。索引（含
-    /// `(workspace_id, dedupe_key)` partial unique 幂等约束）见 `db/indexes.rs`。
+    /// `(workspace_id, account_id, dedupe_key)` partial unique 幂等约束）见 `db/indexes.rs`。
     pub fn behavior_signals(&self) -> Collection<BehaviorSignal> {
         self.db.collection("behavior_signals")
     }
@@ -367,8 +395,8 @@ impl Database {
         self.db.collection("domain_profiles")
     }
 
-    /// catalog 重建队列：apply_chunk_revision 写完即 enqueue；catalog_rebuild_worker
-    /// 每 200ms 取一批 status=queued 落库 `documents.catalog_summary_persisted`。
+    /// catalog 重建队列：chunk/revision、父文档 desired generation 与 intent 同事务提交；
+    /// worker 通过 owner/token/lease 领取并原子推进 persisted snapshot generation。
     pub fn catalog_rebuild_jobs(&self) -> Collection<CatalogRebuildJob> {
         self.db.collection("catalog_rebuild_jobs")
     }

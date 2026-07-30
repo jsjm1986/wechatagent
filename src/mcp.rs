@@ -24,6 +24,16 @@ use crate::{
 /// 转述）也以本值为唯一阻塞上界。
 pub(crate) const MCP_CLIENT_TIMEOUT_SECONDS: u64 = 60;
 
+/// 客户消息发送的边界结果。`SafeToRetry` 表示请求可证明没有进入不可逆投递；
+/// `DeliveryUncertain` 表示发送请求可能已被远端接收，但本地没有可信回执。
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum McpSendError {
+    #[error("safe to retry: {0}")]
+    SafeToRetry(String),
+    #[error("delivery uncertain: {0}")]
+    DeliveryUncertain(String),
+}
+
 #[derive(Clone)]
 pub struct McpClient {
     base_url: String,
@@ -115,7 +125,9 @@ impl McpClient {
             )));
         }
         if let Some(error) = parse_mcp_response_body(&body)?.get("error") {
-            return Err(AppError::External(format!("MCP initialize failed: {error}")));
+            return Err(AppError::External(format!(
+                "MCP initialize failed: {error}"
+            )));
         }
         // 有状态 server 返回 session-id；无状态 server 可不返回（兼容两类）。
         Ok(session_id)
@@ -211,6 +223,88 @@ impl McpClient {
             .unwrap_or(Value::Null))
     }
 
+    /// 客户消息发送专用调用。与通用 `call_tool_with_key` 的区别是显式保留
+    /// “请求是否可能已经越过远端投递边界”的事实，供 outbox 决定能否自动重试。
+    async fn call_send_tool_with_key(
+        &self,
+        base_url: &str,
+        api_key: &str,
+        tool_name: &str,
+        mut arguments: Value,
+        account_alias: Option<&str>,
+    ) -> Result<Value, McpSendError> {
+        if let (Some(alias), Some(obj)) = (account_alias, arguments.as_object_mut()) {
+            if !obj.contains_key("account_alias") {
+                obj.insert("account_alias".to_string(), json!(alias));
+            }
+        }
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": uuid::Uuid::new_v4().to_string(),
+            "method": "tools/call",
+            "params": { "name": tool_name, "arguments": arguments }
+        });
+
+        // initialize 尚未提交客户消息，因此这里的任何失败都可安全重试。
+        let session_id = self
+            .ensure_session(base_url, api_key)
+            .await
+            .map_err(|err| McpSendError::SafeToRetry(err.to_string()))?;
+        let mut req = self
+            .client
+            .post(format!("{}/mcp", base_url.trim_end_matches('/')))
+            .header(AUTHORIZATION, format!("Bearer {}", api_key))
+            .header(CONTENT_TYPE, "application/json")
+            .header(ACCEPT, "application/json, text/event-stream");
+        if let Some(ref sid) = session_id {
+            req = req.header("mcp-session-id", sid);
+        }
+
+        // 从 send() 开始，请求可能已经到达远端。网络错误、非成功 HTTP、body 读取或
+        // 解析失败都不能证明消息未投递，必须停止自动重放。
+        let response = req
+            .json(&request)
+            .send()
+            .await
+            .map_err(|err| McpSendError::DeliveryUncertain(err.to_string()))?;
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .map_err(|err| McpSendError::DeliveryUncertain(err.to_string()))?;
+        if !status.is_success() {
+            return Err(McpSendError::DeliveryUncertain(format!(
+                "MCP HTTP {status}: {}",
+                truncate_for_error(&body)
+            )));
+        }
+        let body = parse_mcp_response_body(&body)
+            .map_err(|err| McpSendError::DeliveryUncertain(err.to_string()))?;
+        if let Some(error) = body.get("error") {
+            return Err(McpSendError::SafeToRetry(format!(
+                "MCP tool {tool_name} failed: {error}"
+            )));
+        }
+        let result = body.get("result");
+        if result
+            .and_then(|value| value.get("isError"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            let detail = result
+                .and_then(|value| value.get("content"))
+                .map(ToString::to_string)
+                .unwrap_or_default();
+            return Err(McpSendError::SafeToRetry(format!(
+                "MCP tool {tool_name} returned isError: {detail}"
+            )));
+        }
+        Ok(result
+            .and_then(|value| value.get("structuredContent"))
+            .cloned()
+            .unwrap_or(Value::Null))
+    }
+
     pub async fn list_tools_with_key(
         &self,
         base_url: &str,
@@ -293,19 +387,18 @@ fn parse_mcp_response_body(body: &str) -> AppResult<Value> {
 fn redact_request_for_log(request: &mongodb::bson::Document) -> mongodb::bson::Document {
     let mut doc = request.clone();
     if let Ok(b64) = request.get_str("base64") {
-        doc.insert(
-            "base64",
-            format!("<redacted base64: {} chars>", b64.len()),
-        );
+        doc.insert("base64", format!("<redacted base64: {} chars>", b64.len()));
     }
     doc
 }
 
 pub async fn logged_call<A: Serialize>(
     state: &AppState,
+    workspace_id: &str,
     tool_name: &str,
     arguments: A,
 ) -> AppResult<Value> {
+    ensure_default_workspace_mcp_context(state, workspace_id)?;
     let request_doc = to_document(&serde_json::to_value(&arguments)?)?;
     let result = state.mcp.call_tool(tool_name, arguments).await;
     let (response, error) = match &result {
@@ -318,7 +411,7 @@ pub async fn logged_call<A: Serialize>(
         .insert_one(
             McpCallLog {
                 id: None,
-                workspace_id: state.config.default_workspace_id.clone(),
+                workspace_id: workspace_id.to_string(),
                 account_id: state.config.default_account_id.clone(),
                 tool_name: tool_name.to_string(),
                 request: redact_request_for_log(&request_doc),
@@ -334,11 +427,12 @@ pub async fn logged_call<A: Serialize>(
 
 pub async fn logged_call_for_account<A: Serialize>(
     state: &AppState,
+    workspace_id: &str,
     account_id: &str,
     tool_name: &str,
     arguments: A,
 ) -> AppResult<Value> {
-    let credentials = credentials_for_account(state, account_id).await?;
+    let credentials = credentials_for_account(state, workspace_id, account_id).await?;
     let arguments_value = serde_json::to_value(arguments)?;
     let request_doc = to_document(&arguments_value)?;
     let result = state
@@ -361,7 +455,7 @@ pub async fn logged_call_for_account<A: Serialize>(
         .insert_one(
             McpCallLog {
                 id: None,
-                workspace_id: state.config.default_workspace_id.clone(),
+                workspace_id: workspace_id.to_string(),
                 account_id: account_id.to_string(),
                 tool_name: tool_name.to_string(),
                 request: redact_request_for_log(&request_doc),
@@ -375,8 +469,62 @@ pub async fn logged_call_for_account<A: Serialize>(
     result
 }
 
-pub async fn list_tools_for_account(state: &AppState, account_id: &str) -> AppResult<Value> {
-    let credentials = credentials_for_account(state, account_id).await?;
+/// 客户发送专用日志入口：保留 [`McpSendError`] 的边界分类，同时写与通用调用
+/// 同形的 `mcp_logs`。仅文本、媒体和名片投递路径使用。
+pub(crate) async fn logged_send_call_for_account<A: Serialize>(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+    tool_name: &str,
+    arguments: A,
+) -> Result<Value, McpSendError> {
+    let credentials = credentials_for_account(state, workspace_id, account_id)
+        .await
+        .map_err(|err| McpSendError::SafeToRetry(err.to_string()))?;
+    let arguments_value = serde_json::to_value(arguments)
+        .map_err(|err| McpSendError::SafeToRetry(err.to_string()))?;
+    let request_doc =
+        to_document(&arguments_value).map_err(|err| McpSendError::SafeToRetry(err.to_string()))?;
+    let result = state
+        .mcp
+        .call_send_tool_with_key(
+            &credentials.base_url,
+            &credentials.api_key,
+            tool_name,
+            arguments_value,
+            credentials.account_alias.as_deref(),
+        )
+        .await;
+    let (response, error) = match &result {
+        Ok(value) => (to_document(value).ok(), None),
+        Err(err) => (None, Some(err.to_string())),
+    };
+    let _ = state
+        .db
+        .mcp_logs()
+        .insert_one(
+            McpCallLog {
+                id: None,
+                workspace_id: workspace_id.to_string(),
+                account_id: account_id.to_string(),
+                tool_name: tool_name.to_string(),
+                request: redact_request_for_log(&request_doc),
+                response,
+                error,
+                created_at: DateTime::now(),
+            },
+            None,
+        )
+        .await;
+    result
+}
+
+pub async fn list_tools_for_account(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+) -> AppResult<Value> {
+    let credentials = credentials_for_account(state, workspace_id, account_id).await?;
     state
         .mcp
         .list_tools_with_key(
@@ -396,27 +544,82 @@ struct McpCredentials {
     account_alias: Option<String>,
 }
 
-async fn credentials_for_account(state: &AppState, account_id: &str) -> AppResult<McpCredentials> {
+fn ensure_default_workspace_mcp_context(state: &AppState, workspace_id: &str) -> AppResult<()> {
+    if !deployment_mcp_fallback_allowed(&state.config.default_workspace_id, workspace_id) {
+        return Err(AppError::BadRequest(
+            "workspace-level MCP credentials are only configured for the default workspace"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn deployment_mcp_fallback_allowed(default_workspace_id: &str, workspace_id: &str) -> bool {
+    workspace_id == default_workspace_id
+}
+
+fn mcp_account_filter(workspace_id: &str, account_id: &str) -> mongodb::bson::Document {
+    doc! {
+        "workspace_id": workspace_id,
+        "account_id": account_id,
+    }
+}
+
+fn roster_refresh_key(workspace_id: &str, account_id: &str) -> String {
+    format!("{workspace_id}|{account_id}")
+}
+
+async fn credentials_for_account(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+) -> AppResult<McpCredentials> {
     let account = state
         .db
         .accounts()
-        .find_one(
-            doc! {
-                "workspace_id": &state.config.default_workspace_id,
-                "account_id": account_id
-            },
-            None,
-        )
-        .await?;
-    let base_url = account
-        .as_ref()
-        .and_then(|item| item.mcp_base_url.clone())
-        .unwrap_or_else(|| state.config.mcp_base_url.clone());
-    let api_key = account
-        .as_ref()
-        .and_then(|item| item.mcp_api_key.clone())
-        .unwrap_or_else(|| state.config.mcp_api_key.clone());
-    let account_alias = account.as_ref().map(|item| item.alias.clone());
+        .find_one(mcp_account_filter(workspace_id, account_id), None)
+        .await?
+        .ok_or_else(|| {
+            AppError::NotFound(format!(
+                "MCP account {account_id} not found in workspace {workspace_id}"
+            ))
+        })?;
+    let configured_base_url = account
+        .mcp_base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let configured_api_key = account
+        .mcp_api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let allow_deployment_fallback =
+        deployment_mcp_fallback_allowed(&state.config.default_workspace_id, workspace_id);
+    let base_url = match (configured_base_url, allow_deployment_fallback) {
+        (Some(value), _) => value.to_string(),
+        (None, true) => state.config.mcp_base_url.clone(),
+        (None, false) => {
+            return Err(AppError::BadRequest(format!(
+            "MCP base URL is not configured for account {account_id} in workspace {workspace_id}"
+        )))
+        }
+    };
+    let api_key = match (configured_api_key, allow_deployment_fallback) {
+        (Some(value), _) => value.to_string(),
+        (None, true) => state.config.mcp_api_key.clone(),
+        (None, false) => {
+            return Err(AppError::BadRequest(format!(
+                "MCP API key is not configured for account {account_id} in workspace {workspace_id}"
+            )))
+        }
+    };
+    if base_url.trim().is_empty() || api_key.trim().is_empty() {
+        return Err(AppError::BadRequest(format!(
+            "MCP credentials are incomplete for account {account_id} in workspace {workspace_id}"
+        )));
+    }
+    let account_alias = Some(account.alias);
     Ok(McpCredentials {
         base_url,
         api_key,
@@ -451,10 +654,18 @@ fn roster_result_is_empty_cache(result: &serde_json::Value) -> bool {
         // result.friends / result.contacts 等存在且是数组（哪怕空）→ 已就绪。
         _ => {
             // 若解析能拿到任何数组候选（含空数组），视为已就绪；完全无数组候选 → 空 cache。
-            let has_any_array = ["/result/friends", "/result/contacts", "/result/list",
-                "/contacts", "/friends", "/list", "/items", "/data"]
-                .iter()
-                .any(|k| result.pointer(k).and_then(|v| v.as_array()).is_some());
+            let has_any_array = [
+                "/result/friends",
+                "/result/contacts",
+                "/result/list",
+                "/contacts",
+                "/friends",
+                "/list",
+                "/items",
+                "/data",
+            ]
+            .iter()
+            .any(|k| result.pointer(k).and_then(|v| v.as_array()).is_some());
             !has_any_array
         }
     }
@@ -474,13 +685,17 @@ fn first_str(obj: &serde_json::Map<String, serde_json::Value>, keys: &[&str]) ->
 /// 从对象里挑第一个「元素像联系人」的数组值：元素带 wxid/userName/username 键，
 /// 或元素是纯字符串（contacts_fetch_cache 的 wxid 字符串数组）。
 /// 命名候选之外再兜一层「按内容识别数组」——避免 server 用列表外的新 key 时整表解析成空。
-fn contact_like_array(obj: &serde_json::Map<String, serde_json::Value>) -> Option<Vec<serde_json::Value>> {
+fn contact_like_array(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Option<Vec<serde_json::Value>> {
     for value in obj.values() {
         if let Some(arr) = value.as_array() {
             let looks_like_contacts = arr.first().is_some_and(|first| {
                 first.as_str().is_some()
                     || first.as_object().is_some_and(|o| {
-                        ["wxid", "userName", "UserName", "username"].iter().any(|k| o.contains_key(*k))
+                        ["wxid", "userName", "UserName", "username"]
+                            .iter()
+                            .any(|k| o.contains_key(*k))
                     })
             });
             if looks_like_contacts {
@@ -494,9 +709,19 @@ fn contact_like_array(obj: &serde_json::Map<String, serde_json::Value>) -> Optio
 /// 微信官方保留系统账号 wxid（业界通用白名单）——这些不是真人好友，
 /// 通讯录里标记为非真人（前端默认折叠）。公众号无可靠字段识别，不在此列。
 const WECHAT_SYSTEM_ACCOUNTS: &[&str] = &[
-    "fmessage", "qqmail", "weixin", "mphelper", "medianote",
-    "qmessage", "floatbottle", "tmessage", "qqsync", "newsapp",
-    "filehelper", "weibo", "brandsessionholder",
+    "fmessage",
+    "qqmail",
+    "weixin",
+    "mphelper",
+    "medianote",
+    "qmessage",
+    "floatbottle",
+    "tmessage",
+    "qqsync",
+    "newsapp",
+    "filehelper",
+    "weibo",
+    "brandsessionholder",
 ];
 
 /// 判定 wxid 是否微信官方保留系统账号（业界通用白名单）。这些不是能运营的真人
@@ -608,7 +833,15 @@ fn parse_roster_items(result: &serde_json::Value) -> Vec<RosterFriend> {
                 remark: first_str(obj, &["remark", "Remark", "conRemark"]),
                 avatar_url: first_str(
                     obj,
-                    &["bigHeadImgUrl", "smallHeadImgUrl", "bigHeadImg", "smallHeadImg", "headImgUrl", "avatarUrl", "headimgurl"],
+                    &[
+                        "bigHeadImgUrl",
+                        "smallHeadImgUrl",
+                        "bigHeadImg",
+                        "smallHeadImg",
+                        "headImgUrl",
+                        "avatarUrl",
+                        "headimgurl",
+                    ],
                 ),
                 sex: obj
                     .get("sex")
@@ -630,7 +863,10 @@ fn roster_outcome_from_result(result: &serde_json::Value) -> RosterFetchOutcome 
     let friends = parse_roster_items(result);
     if !friends.is_empty() {
         // 铁律：解析出任何好友一定就绪（否则前端无限重拉且清空运营勾选）。
-        return RosterFetchOutcome { friends, syncing: false };
+        return RosterFetchOutcome {
+            friends,
+            syncing: false,
+        };
     }
     // 空列表：区分「真 0 好友（就绪）」vs「未就绪（同步中）」。
     // contacts_fetch_full 有权威 status：ready → 就绪；其它 → 同步中。refreshing:true 带全量
@@ -650,8 +886,7 @@ const ROSTER_REFRESH_MAX_RETRIES: usize = 5;
 
 /// 快照是否过期（龄 > ROSTER_SNAPSHOT_STALE_HOURS）。
 pub(crate) fn snapshot_is_stale(fetched_at: DateTime, now: DateTime) -> bool {
-    now.timestamp_millis() - fetched_at.timestamp_millis()
-        > ROSTER_SNAPSHOT_STALE_HOURS * 3600_000
+    now.timestamp_millis() - fetched_at.timestamp_millis() > ROSTER_SNAPSHOT_STALE_HOURS * 3600_000
 }
 
 /// 后台重试退避秒数：3 * 2^attempt（3/6/12/24/48…）。
@@ -661,6 +896,7 @@ fn roster_refresh_backoff_secs(attempt: usize) -> u64 {
 
 pub async fn fetch_roster_for_account(
     state: &AppState,
+    workspace_id: &str,
     account_id: &str,
 ) -> AppResult<RosterFetchOutcome> {
     // contacts_fetch_full 是全量好友工具（返回昵称/头像/性别等富化字段，无参）；
@@ -673,6 +909,7 @@ pub async fn fetch_roster_for_account(
     for attempt in 0..MAX_RETRIES {
         match logged_call_for_account(
             state,
+            workspace_id,
             account_id,
             "contacts_fetch_full",
             serde_json::json!({}),
@@ -794,6 +1031,7 @@ pub(crate) fn chat_search_hit(items: &serde_json::Value, content: &str, since_mi
 /// 同步落库、失败不写)。命中判据见 [`chat_search_hit`]。调用失败向上抛(由调用方回落本地日志)。
 pub async fn chat_search_outbound(
     state: &AppState,
+    workspace_id: &str,
     account_id: &str,
     peer: &str,
     content: &str,
@@ -802,6 +1040,7 @@ pub async fn chat_search_outbound(
     let since_iso = since.try_to_rfc3339_string().unwrap_or_default();
     let resp = logged_call_for_account(
         state,
+        workspace_id,
         account_id,
         "chat_search",
         serde_json::json!({
@@ -832,12 +1071,13 @@ pub async fn chat_search_outbound(
 /// 任务在拉，前端多次轮询 / 多标签页 / force 连点都不叠加 spawn（防并发打爆 MCP SSE）。
 pub fn spawn_roster_refresh(state: AppState, workspace_id: String, account_id: String) {
     tokio::spawn(async move {
+        let refresh_key = roster_refresh_key(&workspace_id, &account_id);
         // single-flight抢锁:键已存在→已有同账号后台任务在拉,直接放弃(去重)。
         // insert返回旧值:Some(_)=已占用→放弃;None=抢到→继续。原子,无TOCTOU。
         if state
             .mcp
             .roster_refreshing
-            .insert(account_id.clone(), ())
+            .insert(refresh_key.clone(), ())
             .is_some()
         {
             return;
@@ -845,10 +1085,10 @@ pub fn spawn_roster_refresh(state: AppState, workspace_id: String, account_id: S
         // RAII:本作用域结束(含return/panic)自动remove键释放锁。
         let _guard = RosterRefreshGuard {
             map: state.mcp.roster_refreshing.clone(),
-            key: account_id.clone(),
+            key: refresh_key,
         };
         for attempt in 0..ROSTER_REFRESH_MAX_RETRIES {
-            match fetch_roster_for_account(&state, &account_id).await {
+            match fetch_roster_for_account(&state, &workspace_id, &account_id).await {
                 Ok(outcome) if !outcome.syncing => {
                     if let Err(err) =
                         write_roster_snapshot(&state, &workspace_id, &account_id, &outcome.friends)
@@ -865,9 +1105,9 @@ pub fn spawn_roster_refresh(state: AppState, workspace_id: String, account_id: S
                 }
             }
             if attempt + 1 < ROSTER_REFRESH_MAX_RETRIES {
-                tokio::time::sleep(std::time::Duration::from_secs(
-                    roster_refresh_backoff_secs(attempt),
-                ))
+                tokio::time::sleep(std::time::Duration::from_secs(roster_refresh_backoff_secs(
+                    attempt,
+                )))
                 .await;
             }
         }
@@ -901,7 +1141,8 @@ mod sse_parse_tests {
     #[test]
     fn parses_sse_multiline_data_concatenated() {
         // SSE 规范：单事件多条 data 行按 \n 拼接后才是完整负载。
-        let body = "event: message\ndata: {\"jsonrpc\":\"2.0\",\ndata: \"id\":\"m\",\"result\":{}}\n\n";
+        let body =
+            "event: message\ndata: {\"jsonrpc\":\"2.0\",\ndata: \"id\":\"m\",\"result\":{}}\n\n";
         let v = parse_mcp_response_body(body).expect("多行 data 拼接后应解析");
         assert_eq!(v.pointer("/id"), Some(&serde_json::json!("m")));
     }
@@ -930,7 +1171,10 @@ mod sse_parse_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::redact_request_for_log;
+    use super::{
+        deployment_mcp_fallback_allowed, mcp_account_filter, redact_request_for_log,
+        roster_refresh_key,
+    };
     use mongodb::bson::doc;
 
     #[test]
@@ -960,7 +1204,11 @@ mod tests {
             "content": &long_content,
         };
         let out = redact_request_for_log(&req);
-        assert_eq!(out.get_str("content").unwrap(), long_content, "content 一字不动");
+        assert_eq!(
+            out.get_str("content").unwrap(),
+            long_content,
+            "content 一字不动"
+        );
         assert_eq!(out.get_str("recipient").unwrap(), "wxid_customer_a");
     }
 
@@ -972,11 +1220,41 @@ mod tests {
     }
 
     #[test]
+    fn account_lookup_filter_is_workspace_and_account_scoped() {
+        let filter = mcp_account_filter("ws-b", "account-shared-id");
+        assert_eq!(filter.get_str("workspace_id").unwrap(), "ws-b");
+        assert_eq!(filter.get_str("account_id").unwrap(), "account-shared-id");
+        assert_eq!(filter.len(), 2);
+    }
+
+    #[test]
+    fn deployment_credentials_only_fallback_for_default_workspace() {
+        assert!(deployment_mcp_fallback_allowed("default", "default"));
+        assert!(!deployment_mcp_fallback_allowed("default", "tenant-b"));
+    }
+
+    #[test]
+    fn roster_refresh_key_distinguishes_same_account_across_workspaces() {
+        assert_ne!(
+            roster_refresh_key("ws-a", "same-account"),
+            roster_refresh_key("ws-b", "same-account")
+        );
+        assert_eq!(
+            roster_refresh_key("ws-a", "same-account"),
+            "ws-a|same-account"
+        );
+    }
+
+    #[test]
     fn non_human_exclusion_filter_structure_and_whitelist() {
         // 结构断言：顶层 $nor 四条件，白名单来自单一数据源 WECHAT_SYSTEM_ACCOUNTS。
         let f = super::non_human_exclusion_filter();
         let nor = f.get_array("$nor").expect("应含 $nor 顶层键");
-        assert_eq!(nor.len(), 4, "$nor 应含 gh_/@chatroom/@openim/白名单 四条件");
+        assert_eq!(
+            nor.len(),
+            4,
+            "$nor 应含 gh_/@chatroom/@openim/白名单 四条件"
+        );
         // gh_ 前缀条件（^gh_ 锚定开头）。
         let gh = nor[0].as_document().unwrap();
         assert_eq!(
@@ -986,13 +1264,20 @@ mod tests {
         // @chatroom 群会话子串条件。
         let room = nor[1].as_document().unwrap();
         assert_eq!(
-            room.get_document("wxid").unwrap().get_str("$regex").unwrap(),
+            room.get_document("wxid")
+                .unwrap()
+                .get_str("$regex")
+                .unwrap(),
             "@chatroom"
         );
         // @openim 企业微信/开放 IM 号子串条件。
         let openim = nor[2].as_document().unwrap();
         assert_eq!(
-            openim.get_document("wxid").unwrap().get_str("$regex").unwrap(),
+            openim
+                .get_document("wxid")
+                .unwrap()
+                .get_str("$regex")
+                .unwrap(),
             "@openim"
         );
         // 系统号白名单 $in，须与 WECHAT_SYSTEM_ACCOUNTS 同源（含 weixin/newsapp）。
@@ -1080,7 +1365,11 @@ mod roster_parse_tests {
             "contacts": [ { "wxid": "wx_top", "nickName": "顶层好友" } ]
         });
         let out = parse_roster_items(&v);
-        assert_eq!(out.len(), 1, "应回落到顶层 contacts 数组，而非被非数组的高优先键短路成空");
+        assert_eq!(
+            out.len(),
+            1,
+            "应回落到顶层 contacts 数组，而非被非数组的高优先键短路成空"
+        );
         assert_eq!(out[0].wxid, "wx_top");
     }
 
@@ -1154,9 +1443,17 @@ mod roster_parse_tests {
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].wxid, "wxid_full1");
         assert_eq!(out[0].nickname.as_deref(), Some("富化好友"));
-        assert_eq!(out[0].avatar_url.as_deref(), Some("http://img/big"), "bigHeadImgUrl 必须命中");
+        assert_eq!(
+            out[0].avatar_url.as_deref(),
+            Some("http://img/big"),
+            "bigHeadImgUrl 必须命中"
+        );
         assert_eq!(out[0].sex, Some(1));
-        assert_eq!(out[1].avatar_url.as_deref(), Some("http://img/small"), "smallHeadImgUrl 回退命中");
+        assert_eq!(
+            out[1].avatar_url.as_deref(),
+            Some("http://img/small"),
+            "smallHeadImgUrl 回退命中"
+        );
         assert_eq!(out[1].sex, Some(2));
     }
 
@@ -1396,7 +1693,10 @@ mod system_account_tests {
                 .map(|r| r.contains("@openim"))
                 .unwrap_or(false)
         });
-        assert!(has_openim, "DB 侧过滤器必须含 @openim，与 is_operatable_person 同源");
+        assert!(
+            has_openim,
+            "DB 侧过滤器必须含 @openim，与 is_operatable_person 同源"
+        );
     }
 }
 
@@ -1410,9 +1710,15 @@ mod roster_snapshot_policy_tests {
         let base = 1_700_000_000_000i64; // ms
         let now = DateTime::from_millis(base);
         // 23h 前 → 未过期。
-        assert!(!snapshot_is_stale(DateTime::from_millis(base - 23 * 3600_000), now));
+        assert!(!snapshot_is_stale(
+            DateTime::from_millis(base - 23 * 3600_000),
+            now
+        ));
         // 25h 前 → 过期。
-        assert!(snapshot_is_stale(DateTime::from_millis(base - 25 * 3600_000), now));
+        assert!(snapshot_is_stale(
+            DateTime::from_millis(base - 25 * 3600_000),
+            now
+        ));
     }
 
     #[test]
@@ -1442,7 +1748,10 @@ mod roster_refresh_lock_tests {
         let map: Arc<dashmap::DashMap<String, ()>> = Arc::new(dashmap::DashMap::new());
         {
             map.insert("acc1".to_string(), ());
-            let _guard = RosterRefreshGuard { map: map.clone(), key: "acc1".to_string() };
+            let _guard = RosterRefreshGuard {
+                map: map.clone(),
+                key: "acc1".to_string(),
+            };
             assert_eq!(map.len(), 1);
         }
         assert_eq!(map.len(), 0, "guard drop 后键应被移除");
@@ -1471,7 +1780,10 @@ mod roster_refresh_lock_tests {
     fn distinct_accounts_are_independent() {
         let map: Arc<dashmap::DashMap<String, ()>> = Arc::new(dashmap::DashMap::new());
         assert!(map.insert("acc1".to_string(), ()).is_none());
-        assert!(map.insert("acc2".to_string(), ()).is_none(), "不同账号各自独立键,互不阻塞");
+        assert!(
+            map.insert("acc2".to_string(), ()).is_none(),
+            "不同账号各自独立键,互不阻塞"
+        );
         assert_eq!(map.len(), 2);
     }
 }
@@ -1485,7 +1797,7 @@ mod chat_search_hit_tests {
     const SINCE: i64 = 1_700_000_000_000;
     // SINCE 之后 1 分钟。
     const AFTER: &str = "2023-11-14T22:14:20.000Z"; // = 1_700_000_060_000ms 附近，> SINCE
-    // SINCE 之前。
+                                                    // SINCE 之前。
     const BEFORE: &str = "2023-11-14T00:00:00.000Z"; // < SINCE
 
     #[test]
@@ -1529,4 +1841,3 @@ mod chat_search_hit_tests {
         assert!(chat_search_hit(&items, "目标内容", SINCE));
     }
 }
-

@@ -173,7 +173,10 @@ mod tests {
         assert!(!out.contains(crate::models::PRINCIPAL_RELAY_SENTINEL));
         assert!(!out.contains("<user>"));
         assert!(out.contains("verdict=y")); // 字段标记不是剥除目标，只剥哨兵本身
-        // 无哨兵的正常历史与 strip_injection_tags 等价（byte-equivalence 护栏）。
-        assert_eq!(history_prompt_content("你好<user>hi</user>"), strip_injection_tags("你好<user>hi</user>"));
+                                            // 无哨兵的正常历史与 strip_injection_tags 等价（byte-equivalence 护栏）。
+        assert_eq!(
+            history_prompt_content("你好<user>hi</user>"),
+            strip_injection_tags("你好<user>hi</user>")
+        );
     }
 }

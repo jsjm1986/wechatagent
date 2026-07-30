@@ -14,7 +14,7 @@
 use std::sync::atomic::Ordering;
 
 use mongodb::{
-    bson::{doc, oid::ObjectId, DateTime},
+    bson::{doc, oid::ObjectId, DateTime, Document},
     options::{FindOneOptions, TransactionOptions},
     ClientSession,
 };
@@ -22,6 +22,145 @@ use mongodb::{
 use crate::routes::AppState;
 
 use super::error::EvolutionError;
+use super::revision::{
+    content_sha256, parse_prompt_revision, parse_threshold_revision, prompt_revision,
+    threshold_revision,
+};
+
+async fn ensure_release_gate_open(
+    state: &AppState,
+    workspace_id: &str,
+) -> Result<(), EvolutionError> {
+    if !state.config.evolution_enabled {
+        return Err(EvolutionError::InvalidStatus(
+            "evolution release disabled by EVOLUTION_ENABLED".to_string(),
+        ));
+    }
+    let flag = super::runtime_flag::load_runtime_flag(state, workspace_id)
+        .await
+        .map_err(|e| EvolutionError::Internal(format!("load evolution runtime flag: {e}")))?;
+    if !flag.map(|value| value.enabled).unwrap_or(false) {
+        return Err(EvolutionError::InvalidStatus(format!(
+            "evolution release disabled for workspace={workspace_id}"
+        )));
+    }
+    Ok(())
+}
+
+fn release_event_document(
+    kind: &str,
+    workspace_id: &str,
+    account_id: &str,
+    proposal_id: ObjectId,
+    admin: &str,
+    extra: Option<Document>,
+    created_at: DateTime,
+) -> Document {
+    let mut details = doc! {
+        "proposal_id": proposal_id,
+        "released_by": admin,
+    };
+    if let Some(extra) = extra {
+        for (key, value) in extra {
+            details.insert(key, value);
+        }
+    }
+    doc! {
+        "workspace_id": workspace_id,
+        "account_id": account_id,
+        "contact_wxid": null,
+        "kind": kind,
+        "status": "ok",
+        "summary": format!("evolution release: {kind} by {admin} for proposal {proposal_id}"),
+        "details": details,
+        "created_at": created_at,
+        "dedupe_key": format!("evolution:{kind}:{proposal_id}"),
+    }
+}
+
+async fn insert_release_observability_with_session(
+    state: &AppState,
+    session: &mut ClientSession,
+    kind: &str,
+    workspace_id: &str,
+    account_id: &str,
+    proposal_id: ObjectId,
+    proposal_kind: &str,
+    admin: &str,
+    extra: Option<Document>,
+    now: DateTime,
+) -> Result<(), EvolutionError> {
+    state
+        .db
+        .raw()
+        .collection::<Document>("agent_events")
+        .insert_one_with_session(
+            release_event_document(
+                kind,
+                workspace_id,
+                account_id,
+                proposal_id,
+                admin,
+                extra,
+                now,
+            ),
+            None,
+            session,
+        )
+        .await
+        .map_err(EvolutionError::from)?;
+    state
+        .db
+        .raw()
+        .collection::<Document>("post_release_reviews")
+        .insert_one_with_session(
+            super::post_release::post_release_review_document(
+                proposal_id,
+                workspace_id,
+                account_id,
+                proposal_kind,
+                now,
+            ),
+            None,
+            session,
+        )
+        .await
+        .map_err(EvolutionError::from)?;
+    Ok(())
+}
+
+async fn insert_event_with_session(
+    state: &AppState,
+    session: &mut ClientSession,
+    kind: &str,
+    workspace_id: &str,
+    account_id: &str,
+    proposal_id: ObjectId,
+    admin: &str,
+    extra: Option<Document>,
+    now: DateTime,
+) -> Result<(), EvolutionError> {
+    state
+        .db
+        .raw()
+        .collection::<Document>("agent_events")
+        .insert_one_with_session(
+            release_event_document(
+                kind,
+                workspace_id,
+                account_id,
+                proposal_id,
+                admin,
+                extra,
+                now,
+            ),
+            None,
+            session,
+        )
+        .await
+        .map_err(EvolutionError::from)?;
+    Ok(())
+}
 
 /// 把 status="eligible_for_release" 的 threshold proposal 落地到 `threshold_overrides`。
 ///
@@ -36,15 +175,27 @@ use super::error::EvolutionError;
 pub async fn release_threshold(
     state: &AppState,
     proposal_id: ObjectId,
+    workspace_id: &str,
+    account_id: &str,
     admin: &str,
 ) -> Result<(), EvolutionError> {
+    ensure_release_gate_open(state, workspace_id).await?;
     let proposal = state
         .db
         .proposals()
-        .find_one(doc! { "_id": proposal_id }, None)
+        .find_one(
+            doc! {
+                "_id": proposal_id,
+                "workspace_id": workspace_id,
+                "account_id": account_id,
+            },
+            None,
+        )
         .await
         .map_err(EvolutionError::from)?
-        .ok_or_else(|| EvolutionError::InvalidStatus(format!("proposal not found: {proposal_id}")))?;
+        .ok_or_else(|| {
+            EvolutionError::InvalidStatus(format!("proposal not found: {proposal_id}"))
+        })?;
 
     if proposal.proposal_kind != "threshold" {
         return Err(EvolutionError::InvalidStatus(format!(
@@ -68,11 +219,25 @@ pub async fn release_threshold(
             "threshold proposal missing proposed_value: {proposal_id}"
         ))
     })?;
+    let base_revision = proposal.base_revision.clone().ok_or_else(|| {
+        EvolutionError::InvalidStatus(format!(
+            "threshold proposal missing base_revision: {proposal_id}"
+        ))
+    })?;
+    let parsed_base = parse_threshold_revision(&base_revision).ok_or_else(|| {
+        EvolutionError::InvalidStatus(format!(
+            "threshold proposal has invalid base_revision: {proposal_id}"
+        ))
+    })?;
+    if proposal.current_value.map(|value| value.to_bits()) != Some(parsed_base.value.to_bits()) {
+        return Err(EvolutionError::InvalidStatus(format!(
+            "threshold proposal current_value does not match base_revision: {proposal_id}"
+        )));
+    }
 
     let now = DateTime::now();
-    let workspace_id = proposal.workspace_id.clone();
-    let account_id = proposal.account_id.clone();
-
+    let override_id = ObjectId::new();
+    let released_revision = threshold_revision(Some(override_id), proposed_value);
     let client = state.db.client();
     let mut session = client
         .start_session(None)
@@ -84,36 +249,94 @@ pub async fn release_threshold(
         .await
         .map_err(EvolutionError::from)?;
 
+    let overrides = state.db.raw().collection::<Document>("threshold_overrides");
+
+    match parsed_base.source_id {
+        Some(base_id) => {
+            let retired = overrides
+                .update_one_with_session(
+                    doc! {
+                        "_id": base_id,
+                        "workspace_id": workspace_id,
+                        "account_id": account_id,
+                        "gate_key": &gate_key,
+                        "value": parsed_base.value,
+                        "current_version": true,
+                        "rolled_back_at": null,
+                    },
+                    doc! { "$set": { "current_version": false } },
+                    None,
+                    &mut session,
+                )
+                .await
+                .map_err(EvolutionError::from)?;
+            if retired.matched_count != 1 {
+                return Err(EvolutionError::InvalidStatus(format!(
+                    "threshold base revision changed before release: {workspace_id}/{account_id}/{gate_key}"
+                )));
+            }
+        }
+        None => {
+            let current_count = overrides
+                .count_documents_with_session(
+                    doc! {
+                        "workspace_id": workspace_id,
+                        "account_id": account_id,
+                        "gate_key": &gate_key,
+                        "current_version": true,
+                        "rolled_back_at": null,
+                    },
+                    None,
+                    &mut session,
+                )
+                .await
+                .map_err(EvolutionError::from)?;
+            if current_count != 0 {
+                return Err(EvolutionError::InvalidStatus(format!(
+                    "threshold baseline changed before release: {workspace_id}/{account_id}/{gate_key}"
+                )));
+            }
+        }
+    }
+
     let override_doc = doc! {
-        "workspace_id": &workspace_id,
-        "account_id": &account_id,
+        "_id": override_id,
+        "workspace_id": workspace_id,
+        "account_id": account_id,
         "gate_key": &gate_key,
         "value": proposed_value,
         "source_proposal_id": proposal_id,
+        "base_revision": &base_revision,
+        "released_revision": &released_revision,
+        "current_version": true,
         "released_at": now,
         "released_by": admin,
         "rolled_back_at": null,
         "rolled_back_by": null,
     };
-    state
-        .db
-        .raw()
-        .collection::<mongodb::bson::Document>("threshold_overrides")
+    overrides
         .insert_one_with_session(override_doc, None, &mut session)
         .await
         .map_err(EvolutionError::from)?;
 
-    state
+    let proposal_update = state
         .db
         .raw()
         .collection::<mongodb::bson::Document>("proposals")
         .update_one_with_session(
-            doc! { "_id": proposal_id },
+            doc! {
+                "_id": proposal_id,
+                "workspace_id": workspace_id,
+                "account_id": account_id,
+                "status": "eligible_for_release",
+                "base_revision": &base_revision,
+            },
             doc! {
                 "$set": {
                     "status": "released",
                     "released_at": now,
                     "released_by": admin,
+                    "released_revision": &released_revision,
                     "updated_at": now,
                 }
             },
@@ -122,12 +345,17 @@ pub async fn release_threshold(
         )
         .await
         .map_err(EvolutionError::from)?;
+    if proposal_update.matched_count != 1 {
+        return Err(EvolutionError::InvalidStatus(format!(
+            "threshold proposal scope/status changed before release: {workspace_id}/{account_id}/{proposal_id}"
+        )));
+    }
 
     // #155(P1)：audit 行与 override / proposal 推进写在同一 transaction，commit 前
     // 完成。旧实现 commit 后才 best-effort 写 + 仅 warn，阈值变更可能无审计行生效。
     let release_audit = build_threshold_override_audit(
-        &workspace_id,
-        &account_id,
+        workspace_id,
+        account_id,
         &gate_key,
         "released",
         proposal.current_value,
@@ -144,36 +372,27 @@ pub async fn release_threshold(
         .await
         .map_err(EvolutionError::from)?;
 
-    commit_with_session(&mut session).await?;
-
-    write_release_event(
+    insert_release_observability_with_session(
         state,
+        &mut session,
         "evolution_threshold_released",
-        &workspace_id,
-        &account_id,
+        workspace_id,
+        account_id,
         proposal_id,
+        "threshold",
         admin,
         Some(doc! {
             "gate_key": &gate_key,
             "proposed_value": proposed_value,
-            "current_value": proposal.current_value.unwrap_or(0.0),
+            "current_value": parsed_base.value,
+            "base_revision": &base_revision,
+            "released_revision": &released_revision,
         }),
+        now,
     )
     .await?;
 
-    // M4 W4 Task 5.6：登记 +24h post-release review 任务。失败仅 warn，不影响 release。
-    if let Err(e) = super::post_release::schedule_post_release_review(
-        state,
-        proposal_id,
-        &workspace_id,
-        &account_id,
-        "threshold",
-        now,
-    )
-    .await
-    {
-        tracing::warn!(?e, "schedule_post_release_review failed for threshold release; continuing");
-    }
+    commit_with_session(&mut session).await?;
 
     Ok(())
 }
@@ -198,15 +417,27 @@ pub async fn release_threshold(
 pub async fn release_prompt(
     state: &AppState,
     proposal_id: ObjectId,
+    workspace_id: &str,
+    account_id: &str,
     admin: &str,
 ) -> Result<(), EvolutionError> {
+    ensure_release_gate_open(state, workspace_id).await?;
     let proposal = state
         .db
         .proposals()
-        .find_one(doc! { "_id": proposal_id }, None)
+        .find_one(
+            doc! {
+                "_id": proposal_id,
+                "workspace_id": workspace_id,
+                "account_id": account_id,
+            },
+            None,
+        )
         .await
         .map_err(EvolutionError::from)?
-        .ok_or_else(|| EvolutionError::InvalidStatus(format!("proposal not found: {proposal_id}")))?;
+        .ok_or_else(|| {
+            EvolutionError::InvalidStatus(format!("proposal not found: {proposal_id}"))
+        })?;
 
     if proposal.proposal_kind != "prompt" {
         return Err(EvolutionError::InvalidStatus(format!(
@@ -230,17 +461,26 @@ pub async fn release_prompt(
             "prompt proposal missing diff_snippet: {proposal_id}"
         ))
     })?;
-
-    let workspace_id = proposal.workspace_id.clone();
-    let account_id = proposal.account_id.clone();
+    let base_revision = proposal.base_revision.clone().ok_or_else(|| {
+        EvolutionError::InvalidStatus(format!(
+            "prompt proposal missing base_revision: {proposal_id}"
+        ))
+    })?;
+    let parsed_base = parse_prompt_revision(&base_revision).ok_or_else(|| {
+        EvolutionError::InvalidStatus(format!(
+            "prompt proposal has invalid base_revision: {proposal_id}"
+        ))
+    })?;
 
     let current = state
         .db
         .prompt_templates()
         .find_one(
             doc! {
-                "workspace_id": &workspace_id,
+                "_id": parsed_base.template_id,
+                "workspace_id": workspace_id,
                 "prompt_key": &prompt_key,
+                "version": parsed_base.version,
                 "current_version": true,
             },
             FindOneOptions::default(),
@@ -252,10 +492,16 @@ pub async fn release_prompt(
                 "no current_version prompt template for key={prompt_key} workspace={workspace_id}"
             ))
         })?;
+    if content_sha256(&current.content) != parsed_base.content_sha256 {
+        return Err(EvolutionError::InvalidStatus(format!(
+            "prompt base content changed before release: workspace={workspace_id} key={prompt_key}"
+        )));
+    }
 
     // ── 红线三闸（与管理员手动编辑路径同源,从 prompt_guard 复用）──
     // 末尾追加:原 prompt 正文逐字保留,critic 片段追加到末尾。
-    let new_content = crate::prompt_guard::compose_appended_content(&current.content, &append_snippet);
+    let new_content =
+        crate::prompt_guard::compose_appended_content(&current.content, &append_snippet);
     // 闸 1+2:禁词 + 锚点完整性（原文保留 → 锚点天然过;不过说明原 prompt 已缺锚,fail-closed 正确）
     crate::prompt_guard::validate_prompt_edit(&prompt_key, &new_content)
         .map_err(EvolutionError::RedlineGateRejected)?;
@@ -287,6 +533,8 @@ pub async fn release_prompt(
     let old_version = current.version;
     let new_version = old_version + 1;
     let now = DateTime::now();
+    let new_template_id = ObjectId::new();
+    let released_revision = prompt_revision(new_template_id, new_version, &new_content);
 
     let client = state.db.client();
     let mut session = client
@@ -298,19 +546,23 @@ pub async fn release_prompt(
         .await
         .map_err(EvolutionError::from)?;
 
-    state
+    let current_update = state
         .db
         .raw()
         .collection::<mongodb::bson::Document>("prompt_templates")
         .update_one_with_session(
             doc! {
-                "workspace_id": &workspace_id,
+                "_id": parsed_base.template_id,
+                "workspace_id": workspace_id,
                 "prompt_key": &prompt_key,
+                "version": parsed_base.version,
+                "content": &current.content,
                 "current_version": true,
             },
             doc! {
                 "$set": {
                     "current_version": false,
+                    "status": "archived",
                     "updated_at": now,
                 }
             },
@@ -319,16 +571,22 @@ pub async fn release_prompt(
         )
         .await
         .map_err(EvolutionError::from)?;
+    if current_update.matched_count != 1 {
+        return Err(EvolutionError::InvalidStatus(format!(
+            "current prompt changed before release: workspace={workspace_id} key={prompt_key}"
+        )));
+    }
 
     let new_template = doc! {
-        "workspace_id": &workspace_id,
+        "_id": new_template_id,
+        "workspace_id": workspace_id,
         "prompt_key": &prompt_key,
         "agent_kind": &current.agent_kind,
         "layer": &current.layer,
         "title": &current.title,
         "description": current.description.clone().unwrap_or_default(),
         "content": &new_content,
-        "status": &current.status,
+        "status": "active",
         "version": new_version,
         "prompt_pack_version": &current.prompt_pack_version,
         "created_by": admin,
@@ -337,6 +595,8 @@ pub async fn release_prompt(
         "current_version": true,
         "previous_version": old_version,
         "seeded_by": "evolution_release",
+        "locale": current.locale.clone(),
+        "source_proposal_id": proposal_id,
     };
     state
         .db
@@ -346,17 +606,24 @@ pub async fn release_prompt(
         .await
         .map_err(EvolutionError::from)?;
 
-    state
+    let proposal_update = state
         .db
         .raw()
         .collection::<mongodb::bson::Document>("proposals")
         .update_one_with_session(
-            doc! { "_id": proposal_id },
+            doc! {
+                "_id": proposal_id,
+                "workspace_id": workspace_id,
+                "account_id": account_id,
+                "status": "eligible_for_release",
+                "base_revision": &base_revision,
+            },
             doc! {
                 "$set": {
                     "status": "released",
                     "released_at": now,
                     "released_by": admin,
+                    "released_revision": &released_revision,
                     "previous_prompt_version": old_version.to_string(),
                     "updated_at": now,
                 }
@@ -366,41 +633,37 @@ pub async fn release_prompt(
         )
         .await
         .map_err(EvolutionError::from)?;
+    if proposal_update.matched_count != 1 {
+        return Err(EvolutionError::InvalidStatus(format!(
+            "prompt proposal scope/status changed before release: {workspace_id}/{account_id}/{proposal_id}"
+        )));
+    }
 
-    commit_with_session(&mut session).await?;
-
-    // commit 后再 bump cache version——commit 失败时 cache 不会被错误地标脏。
-    state.prompt_pack_version.fetch_add(1, Ordering::SeqCst);
-
-    write_release_event(
+    insert_release_observability_with_session(
         state,
+        &mut session,
         "evolution_prompt_released",
-        &workspace_id,
-        &account_id,
+        workspace_id,
+        account_id,
         proposal_id,
+        "prompt",
         admin,
         Some(doc! {
             "prompt_key": &prompt_key,
             "old_version": old_version,
             "new_version": new_version,
             "section": proposal.proposed_section.clone().unwrap_or_default(),
+            "base_revision": &base_revision,
+            "released_revision": &released_revision,
         }),
+        now,
     )
     .await?;
 
-    // M4 W4 Task 5.6：登记 +24h post-release review 任务。失败仅 warn，不影响 release。
-    if let Err(e) = super::post_release::schedule_post_release_review(
-        state,
-        proposal_id,
-        &workspace_id,
-        &account_id,
-        "prompt",
-        now,
-    )
-    .await
-    {
-        tracing::warn!(?e, "schedule_post_release_review failed for prompt release; continuing");
-    }
+    commit_with_session(&mut session).await?;
+
+    // commit 后再 bump cache version——commit 失败时 cache 不会被错误地标脏。
+    state.prompt_pack_version.fetch_add(1, Ordering::SeqCst);
 
     Ok(())
 }
@@ -428,15 +691,26 @@ async fn commit_with_session(session: &mut ClientSession) -> Result<(), Evolutio
 pub async fn rollback_threshold(
     state: &AppState,
     proposal_id: ObjectId,
+    workspace_id: &str,
+    account_id: &str,
     admin: &str,
 ) -> Result<(), EvolutionError> {
     let proposal = state
         .db
         .proposals()
-        .find_one(doc! { "_id": proposal_id }, None)
+        .find_one(
+            doc! {
+                "_id": proposal_id,
+                "workspace_id": workspace_id,
+                "account_id": account_id,
+            },
+            None,
+        )
         .await
         .map_err(EvolutionError::from)?
-        .ok_or_else(|| EvolutionError::InvalidStatus(format!("proposal not found: {proposal_id}")))?;
+        .ok_or_else(|| {
+            EvolutionError::InvalidStatus(format!("proposal not found: {proposal_id}"))
+        })?;
 
     if proposal.proposal_kind != "threshold" {
         return Err(EvolutionError::InvalidStatus(format!(
@@ -450,11 +724,38 @@ pub async fn rollback_threshold(
             proposal.status
         )));
     }
+    let gate_key = proposal.gate_key.clone().ok_or_else(|| {
+        EvolutionError::InvalidStatus(format!(
+            "threshold proposal missing gate_key: {proposal_id}"
+        ))
+    })?;
+    let released_revision = proposal.released_revision.clone().ok_or_else(|| {
+        EvolutionError::InvalidStatus(format!(
+            "threshold proposal missing released_revision: {proposal_id}"
+        ))
+    })?;
+    let released = parse_threshold_revision(&released_revision).ok_or_else(|| {
+        EvolutionError::InvalidStatus(format!(
+            "threshold proposal has invalid released_revision: {proposal_id}"
+        ))
+    })?;
+    let released_id = released.source_id.ok_or_else(|| {
+        EvolutionError::InvalidStatus(format!(
+            "threshold released_revision has no artifact id: {proposal_id}"
+        ))
+    })?;
+    let base_revision = proposal.base_revision.clone().ok_or_else(|| {
+        EvolutionError::InvalidStatus(format!(
+            "threshold proposal missing base_revision: {proposal_id}"
+        ))
+    })?;
+    let base = parse_threshold_revision(&base_revision).ok_or_else(|| {
+        EvolutionError::InvalidStatus(format!(
+            "threshold proposal has invalid base_revision: {proposal_id}"
+        ))
+    })?;
 
     let now = DateTime::now();
-    let workspace_id = proposal.workspace_id.clone();
-    let account_id = proposal.account_id.clone();
-
     let client = state.db.client();
     let mut session = client
         .start_session(None)
@@ -465,17 +766,25 @@ pub async fn rollback_threshold(
         .await
         .map_err(EvolutionError::from)?;
 
-    state
+    let override_update = state
         .db
         .raw()
         .collection::<mongodb::bson::Document>("threshold_overrides")
         .update_one_with_session(
             doc! {
+                "_id": released_id,
                 "source_proposal_id": proposal_id,
+                "workspace_id": workspace_id,
+                "account_id": account_id,
+                "gate_key": &gate_key,
+                "value": released.value,
+                "released_revision": &released_revision,
+                "current_version": true,
                 "rolled_back_at": null,
             },
             doc! {
                 "$set": {
+                    "current_version": false,
                     "rolled_back_at": now,
                     "rolled_back_by": admin,
                 }
@@ -485,13 +794,53 @@ pub async fn rollback_threshold(
         )
         .await
         .map_err(EvolutionError::from)?;
+    if override_update.matched_count != 1 {
+        return Err(EvolutionError::InvalidStatus(format!(
+            "threshold artifact is no longer current or owned by proposal: {workspace_id}/{account_id}/{proposal_id}"
+        )));
+    }
 
-    state
+    if let Some(base_id) = base.source_id {
+        let restored = state
+            .db
+            .raw()
+            .collection::<Document>("threshold_overrides")
+            .update_one_with_session(
+                doc! {
+                    "_id": base_id,
+                    "workspace_id": workspace_id,
+                    "account_id": account_id,
+                    "gate_key": &gate_key,
+                    "value": base.value,
+                    "released_revision": &base_revision,
+                    "current_version": false,
+                    "rolled_back_at": null,
+                },
+                doc! { "$set": { "current_version": true } },
+                None,
+                &mut session,
+            )
+            .await
+            .map_err(EvolutionError::from)?;
+        if restored.matched_count != 1 {
+            return Err(EvolutionError::InvalidStatus(format!(
+                "threshold rollback predecessor unavailable: {workspace_id}/{account_id}/{gate_key}"
+            )));
+        }
+    }
+
+    let proposal_update = state
         .db
         .raw()
         .collection::<mongodb::bson::Document>("proposals")
         .update_one_with_session(
-            doc! { "_id": proposal_id },
+            doc! {
+                "_id": proposal_id,
+                "workspace_id": workspace_id,
+                "account_id": account_id,
+                "status": "released",
+                "released_revision": &released_revision,
+            },
             doc! {
                 "$set": {
                     "status": "rolled_back",
@@ -505,13 +854,18 @@ pub async fn rollback_threshold(
         )
         .await
         .map_err(EvolutionError::from)?;
+    if proposal_update.matched_count != 1 {
+        return Err(EvolutionError::InvalidStatus(format!(
+            "threshold proposal scope/status changed before rollback: {workspace_id}/{account_id}/{proposal_id}"
+        )));
+    }
 
     // #155(P1)：rollback 的 audit 行也写进同一 transaction，commit 前完成。
     // previous = 被回滚的 proposed_value；new_value 留 None（回滚后回到 baseline 或
     // 更早 override，由审计读路径自行还原）。
     let rollback_audit = build_threshold_override_audit(
-        &workspace_id,
-        &account_id,
+        workspace_id,
+        account_id,
         proposal.gate_key.as_deref().unwrap_or(""),
         "rolled_back",
         proposal.proposed_value,
@@ -528,21 +882,25 @@ pub async fn rollback_threshold(
         .await
         .map_err(EvolutionError::from)?;
 
-    commit_with_session(&mut session).await?;
-
-    write_release_event(
+    insert_event_with_session(
         state,
+        &mut session,
         "evolution_rollback_completed",
-        &workspace_id,
-        &account_id,
+        workspace_id,
+        account_id,
         proposal_id,
         admin,
         Some(doc! {
             "kind": "threshold",
-            "gate_key": proposal.gate_key.clone().unwrap_or_default(),
+            "gate_key": &gate_key,
+            "rolled_back_revision": &released_revision,
+            "restored_revision": &base_revision,
         }),
+        now,
     )
     .await?;
+
+    commit_with_session(&mut session).await?;
 
     Ok(())
 }
@@ -555,15 +913,26 @@ pub async fn rollback_threshold(
 pub async fn rollback_prompt(
     state: &AppState,
     proposal_id: ObjectId,
+    workspace_id: &str,
+    account_id: &str,
     admin: &str,
 ) -> Result<(), EvolutionError> {
     let proposal = state
         .db
         .proposals()
-        .find_one(doc! { "_id": proposal_id }, None)
+        .find_one(
+            doc! {
+                "_id": proposal_id,
+                "workspace_id": workspace_id,
+                "account_id": account_id,
+            },
+            None,
+        )
         .await
         .map_err(EvolutionError::from)?
-        .ok_or_else(|| EvolutionError::InvalidStatus(format!("proposal not found: {proposal_id}")))?;
+        .ok_or_else(|| {
+            EvolutionError::InvalidStatus(format!("proposal not found: {proposal_id}"))
+        })?;
 
     if proposal.proposal_kind != "prompt" {
         return Err(EvolutionError::InvalidStatus(format!(
@@ -582,19 +951,22 @@ pub async fn rollback_prompt(
             "prompt proposal missing proposed_template_key: {proposal_id}"
         ))
     })?;
-    let previous_version_str = proposal.previous_prompt_version.clone().ok_or_else(|| {
+    let base_revision = proposal.base_revision.clone().ok_or_else(|| {
         EvolutionError::InvalidStatus(format!(
-            "prompt proposal missing previous_prompt_version (was it released by W4 release_prompt?): {proposal_id}"
+            "prompt proposal missing base_revision; legacy rollback rejected: {proposal_id}"
         ))
     })?;
-    let previous_version: i32 = previous_version_str.parse().map_err(|_| {
+    let parsed_base = parse_prompt_revision(&base_revision).ok_or_else(|| {
         EvolutionError::InvalidStatus(format!(
-            "prompt proposal previous_prompt_version not parseable as i32: {previous_version_str}"
+            "prompt proposal has invalid base_revision: {proposal_id}"
+        ))
+    })?;
+    let released_revision = proposal.released_revision.clone().ok_or_else(|| {
+        EvolutionError::InvalidStatus(format!(
+            "prompt proposal missing released_revision; legacy rollback rejected: {proposal_id}"
         ))
     })?;
 
-    let workspace_id = proposal.workspace_id.clone();
-    let account_id = proposal.account_id.clone();
     let now = DateTime::now();
 
     let client = state.db.client();
@@ -607,20 +979,92 @@ pub async fn rollback_prompt(
         .await
         .map_err(EvolutionError::from)?;
 
-    // 1. 把当前 current 置 false
-    state
+    let templates = state
         .db
         .raw()
-        .collection::<mongodb::bson::Document>("prompt_templates")
-        .update_one_with_session(
+        .collection::<mongodb::bson::Document>("prompt_templates");
+
+    // 1. 只有该 proposal 仍拥有 current 产物且内容 revision 未漂移时，才能撤销。
+    let current = templates
+        .find_one_with_session(
             doc! {
-                "workspace_id": &workspace_id,
+                "workspace_id": workspace_id,
                 "prompt_key": &prompt_key,
                 "current_version": true,
+                "source_proposal_id": proposal_id,
+            },
+            None,
+            &mut session,
+        )
+        .await
+        .map_err(EvolutionError::from)?
+        .ok_or_else(|| {
+            EvolutionError::InvalidStatus(format!(
+                "prompt rollback rejected because proposal artifact is no longer current: {workspace_id}/{prompt_key}/{proposal_id}"
+            ))
+        })?;
+    let current_id = current.get_object_id("_id").map_err(|_| {
+        EvolutionError::InvalidStatus(format!(
+            "current prompt artifact missing _id: {proposal_id}"
+        ))
+    })?;
+    let current_version = current.get_i32("version").map_err(|_| {
+        EvolutionError::InvalidStatus(format!(
+            "current prompt artifact missing version: {proposal_id}"
+        ))
+    })?;
+    let current_content = current.get_str("content").map_err(|_| {
+        EvolutionError::InvalidStatus(format!(
+            "current prompt artifact missing content: {proposal_id}"
+        ))
+    })?;
+    if prompt_revision(current_id, current_version, current_content) != released_revision {
+        return Err(EvolutionError::InvalidStatus(format!(
+            "prompt released artifact revision changed before rollback: {proposal_id}"
+        )));
+    }
+
+    // 2. 冻结基线历史行必须仍存在且 hash 一致。
+    let restored_base = templates
+        .find_one_with_session(
+            doc! {
+                "_id": parsed_base.template_id,
+                "workspace_id": workspace_id,
+                "prompt_key": &prompt_key,
+                "version": parsed_base.version,
+            },
+            None,
+            &mut session,
+        )
+        .await
+        .map_err(EvolutionError::from)?
+        .ok_or_else(|| {
+            EvolutionError::InvalidStatus(format!(
+                "rollback target prompt baseline no longer exists: {proposal_id}"
+            ))
+        })?;
+    let restored_content = restored_base.get_str("content").map_err(|_| {
+        EvolutionError::InvalidStatus(format!(
+            "rollback target prompt baseline missing content: {proposal_id}"
+        ))
+    })?;
+    if content_sha256(restored_content) != parsed_base.content_sha256 {
+        return Err(EvolutionError::InvalidStatus(format!(
+            "rollback target prompt baseline content changed: {proposal_id}"
+        )));
+    }
+
+    let current_update = templates
+        .update_one_with_session(
+            doc! {
+                "_id": current_id,
+                "current_version": true,
+                "source_proposal_id": proposal_id,
             },
             doc! {
                 "$set": {
                     "current_version": false,
+                    "status": "archived",
                     "updated_at": now,
                 }
             },
@@ -629,17 +1073,21 @@ pub async fn rollback_prompt(
         )
         .await
         .map_err(EvolutionError::from)?;
+    if current_update.matched_count != 1 {
+        return Err(EvolutionError::InvalidStatus(format!(
+            "current prompt changed before rollback: workspace={workspace_id} key={prompt_key}"
+        )));
+    }
 
-    // 2. 把 previous_version 那条重新置 true
-    let restored = state
-        .db
-        .raw()
-        .collection::<mongodb::bson::Document>("prompt_templates")
+    // 3. 只恢复 proposal 冻结的基线行，不按可碰撞的 version 猜目标。
+    let restored = templates
         .update_one_with_session(
             doc! {
-                "workspace_id": &workspace_id,
+                "_id": parsed_base.template_id,
+                "workspace_id": workspace_id,
                 "prompt_key": &prompt_key,
-                "version": previous_version,
+                "version": parsed_base.version,
+                "current_version": false,
             },
             doc! {
                 "$set": {
@@ -653,21 +1101,25 @@ pub async fn rollback_prompt(
         )
         .await
         .map_err(EvolutionError::from)?;
-    // previous_version 行不存在（如被手动 publish 物删历史）→ 中止事务返错，避免翻掉
-    // 当前 current 后无 current 可用的静默假成功。早返丢 session 即中止未提交事务。
-    if restored.matched_count == 0 {
+    if restored.matched_count != 1 {
         return Err(EvolutionError::InvalidStatus(format!(
-            "rollback 目标 prompt 版本 {previous_version}（key={prompt_key}）不存在，已中止回滚（历史行是否被物删？）"
+            "rollback target prompt baseline changed before restore: {proposal_id}"
         )));
     }
 
-    // 3. 推 proposal 到 rolled_back
-    state
+    // 4. 推 proposal 到 rolled_back。
+    let proposal_update = state
         .db
         .raw()
         .collection::<mongodb::bson::Document>("proposals")
         .update_one_with_session(
-            doc! { "_id": proposal_id },
+            doc! {
+                "_id": proposal_id,
+                "workspace_id": workspace_id,
+                "account_id": account_id,
+                "status": "released",
+                "released_revision": &released_revision,
+            },
             doc! {
                 "$set": {
                     "status": "rolled_back",
@@ -681,65 +1133,42 @@ pub async fn rollback_prompt(
         )
         .await
         .map_err(EvolutionError::from)?;
+    if proposal_update.matched_count != 1 {
+        return Err(EvolutionError::InvalidStatus(format!(
+            "prompt proposal scope/status changed before rollback: {workspace_id}/{account_id}/{proposal_id}"
+        )));
+    }
+
+    state
+        .db
+        .raw()
+        .collection::<Document>("agent_events")
+        .insert_one_with_session(
+            release_event_document(
+                "evolution_rollback_completed",
+                workspace_id,
+                account_id,
+                proposal_id,
+                admin,
+                Some(doc! {
+                    "kind": "prompt",
+                    "prompt_key": &prompt_key,
+                    "rolled_back_to_version": parsed_base.version,
+                    "released_revision": &released_revision,
+                    "restored_revision": &base_revision,
+                }),
+                now,
+            ),
+            None,
+            &mut session,
+        )
+        .await
+        .map_err(EvolutionError::from)?;
 
     commit_with_session(&mut session).await?;
 
     state.prompt_pack_version.fetch_add(1, Ordering::SeqCst);
 
-    write_release_event(
-        state,
-        "evolution_rollback_completed",
-        &workspace_id,
-        &account_id,
-        proposal_id,
-        admin,
-        Some(doc! {
-            "kind": "prompt",
-            "prompt_key": &prompt_key,
-            "rolled_back_to_version": previous_version,
-        }),
-    )
-    .await?;
-
-    Ok(())
-}
-
-async fn write_release_event(
-    state: &AppState,
-    kind: &str,
-    workspace_id: &str,
-    account_id: &str,
-    proposal_id: ObjectId,
-    admin: &str,
-    extra: Option<mongodb::bson::Document>,
-) -> Result<(), EvolutionError> {
-    let mut details = doc! {
-        "proposal_id": proposal_id,
-        "released_by": admin,
-    };
-    if let Some(extra) = extra {
-        for (k, v) in extra {
-            details.insert(k, v);
-        }
-    }
-    let event = crate::models::AgentEvent {
-        id: None,
-        workspace_id: workspace_id.to_string(),
-        account_id: account_id.to_string(),
-        contact_wxid: None,
-        kind: kind.to_string(),
-        status: "ok".to_string(),
-        summary: format!("evolution release: {kind} by {admin} for proposal {proposal_id}"),
-        details: Some(details),
-        created_at: DateTime::now(),
-        dedupe_key: None,
-    };
-    state
-        .db
-        .events()
-        .insert_one(event, None)
-        .await
-        .map_err(EvolutionError::from)?;
     Ok(())
 }
 
@@ -796,8 +1225,9 @@ mod tests {
     /// （`tests/evolution_threshold_e2e.rs` / `tests/evolution_prompt_e2e.rs`）。
     #[test]
     fn invalid_status_messages_carry_actionable_context() {
-        let e =
-            EvolutionError::InvalidStatus("proposal not eligible for release (status=pending_eval)".to_string());
+        let e = EvolutionError::InvalidStatus(
+            "proposal not eligible for release (status=pending_eval)".to_string(),
+        );
         let msg = format!("{e}");
         assert!(msg.contains("eligible"));
         assert!(msg.contains("pending_eval"));

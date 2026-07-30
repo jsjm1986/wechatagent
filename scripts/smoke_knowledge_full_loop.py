@@ -89,11 +89,12 @@ def main() -> None:
         "POST",
         "/operation-knowledge/import-apply",
         {
-            "accountId": ACCOUNT_ID,
-            "sourceName": "OpsDesk 值班手册节选（冒烟）",
-            "document": doc_summary,
-            "items": items,
-            "chunks": chunks,
+            "previewId": preview.get("previewId"),
+            "previewHash": preview.get("previewHash"),
+            "chunks": [
+                {"candidateId": chunk.get("candidateId"), "patch": {}}
+                for chunk in chunks
+            ],
         },
         timeout=120,
     )

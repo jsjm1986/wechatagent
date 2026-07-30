@@ -6,8 +6,9 @@ use axum::{
 };
 use futures::TryStreamExt;
 use mongodb::{
-    bson::{doc, DateTime},
-    options::{FindOneOptions, FindOptions},
+    bson::{doc, oid::ObjectId, DateTime},
+    options::{FindOneOptions, FindOptions, TransactionOptions},
+    ClientSession,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -23,6 +24,32 @@ use crate::{
 use super::shared::*;
 use super::AppState;
 
+const PLAYBOOK_DEFAULT_CONFLICT: &str = "playbook_default_conflict";
+
+async fn commit_playbook_transaction(session: &mut ClientSession) -> AppResult<()> {
+    loop {
+        match session.commit_transaction().await {
+            Ok(()) => return Ok(()),
+            Err(error) if error.contains_label("UnknownTransactionCommitResult") => continue,
+            Err(error) => {
+                let _ = session.abort_transaction().await;
+                tracing::warn!(error = %error, "playbook transaction commit failed");
+                return Err(AppError::Conflict(PLAYBOOK_DEFAULT_CONFLICT.to_string()));
+            }
+        }
+    }
+}
+
+fn playbook_transaction_error(error: AppError) -> AppError {
+    match error {
+        AppError::Db(db_error) => {
+            tracing::warn!(error = %db_error, "playbook transaction conflicted");
+            AppError::Conflict(PLAYBOOK_DEFAULT_CONFLICT.to_string())
+        }
+        other => other,
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct OperationPlaybookQuery {
@@ -31,20 +58,21 @@ pub(super) struct OperationPlaybookQuery {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct OperationPlaybookRequest {
-    account_id: Option<String>,
-    name: String,
-    description: Option<String>,
-    method_prompt: String,
-    profile_method: Option<String>,
-    tag_method: Option<String>,
-    stage_method: Option<String>,
-    intent_method: Option<String>,
-    follow_up_method: Option<String>,
-    reply_style: Option<String>,
-    forbidden_rules: Option<String>,
-    success_criteria: Option<String>,
-    is_default: Option<bool>,
+pub struct OperationPlaybookRequest {
+    pub account_id: Option<String>,
+    pub expected_version: Option<i32>,
+    pub name: String,
+    pub description: Option<String>,
+    pub method_prompt: String,
+    pub profile_method: Option<String>,
+    pub tag_method: Option<String>,
+    pub stage_method: Option<String>,
+    pub intent_method: Option<String>,
+    pub follow_up_method: Option<String>,
+    pub reply_style: Option<String>,
+    pub forbidden_rules: Option<String>,
+    pub success_criteria: Option<String>,
+    pub is_default: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -57,7 +85,16 @@ pub(super) struct GeneratePlaybookRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct OptimizePlaybookRequest {
+    account_id: String,
+    expected_version: i32,
     instruction: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaybookMutationIdentity {
+    pub account_id: String,
+    pub expected_version: i32,
 }
 
 pub(super) async fn list_operation_playbooks(
@@ -68,6 +105,7 @@ pub(super) async fn list_operation_playbooks(
     let account_id = query
         .account_id
         .unwrap_or_else(|| state.config.default_account_id.clone());
+    validate_account(&state, &admin.current_workspace, &account_id).await?;
     ensure_default_playbook(&state, &admin.current_workspace, &account_id).await?;
     let mut cursor = state
         .db
@@ -97,24 +135,24 @@ pub(super) async fn create_operation_playbook(
     let account_id = payload
         .account_id
         .unwrap_or_else(|| state.config.default_account_id.clone());
+    validate_account(&state, &admin.current_workspace, &account_id).await?;
     validate_playbook_input(&payload.name, &payload.method_prompt)?;
-    let is_default = payload.is_default.unwrap_or(false)
+    let make_default = payload.is_default.unwrap_or(false)
         || state
             .db
             .operation_playbooks()
             .find_one(
                 doc! {
                     "workspace_id": &admin.current_workspace,
-                    "account_id": &account_id
+                    "account_id": &account_id,
+                    "release_status": "published",
+                    "is_default": true,
                 },
                 None,
             )
             .await?
             .is_none();
-    if is_default {
-        unset_default_playbooks(&state, &admin.current_workspace, &account_id).await?;
-    }
-    let playbook = OperationPlaybook {
+    let mut playbook = OperationPlaybook {
         id: None,
         workspace_id: admin.current_workspace.clone(),
         account_id,
@@ -130,49 +168,73 @@ pub(super) async fn create_operation_playbook(
         forbidden_rules: normalize_optional(payload.forbidden_rules),
         success_criteria: normalize_optional(payload.success_criteria),
         created_by: "manual".to_string(),
-        is_default,
+        release_status: "published".to_string(),
+        // Default ownership is assigned only by the transaction below. A
+        // failed insert can therefore never leave the account with no default.
+        is_default: false,
         version: 1,
         created_at: DateTime::now(),
         updated_at: DateTime::now(),
     };
-    let result = state
-        .db
-        .operation_playbooks()
-        .insert_one(playbook, None)
-        .await?;
-    Ok(Json(
-        json!({ "id": result.inserted_id.as_object_id().map(|id| id.to_hex()) }),
-    ))
+    playbook = insert_playbook(&state, playbook, make_default).await?;
+    Ok(Json(json!({
+        "id": playbook.id.map(|id| id.to_hex()),
+        "item": playbook_json(playbook),
+    })))
 }
 
-pub(super) async fn update_operation_playbook(
+pub async fn update_operation_playbook(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
     Json(payload): Json<OperationPlaybookRequest>,
 ) -> AppResult<Json<Value>> {
     validate_playbook_input(&payload.name, &payload.method_prompt)?;
+    let account_id = payload
+        .account_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::BadRequest("accountId is required".to_string()))?
+        .to_string();
+    let expected_version = payload
+        .expected_version
+        .filter(|version| *version > 0)
+        .ok_or_else(|| AppError::BadRequest("positive expectedVersion is required".to_string()))?;
+    validate_account(&state, &admin.current_workspace, &account_id).await?;
     let object_id = parse_object_id(&id)?;
     let existing = state
         .db
         .operation_playbooks()
         .find_one(
-            doc! {
-                "_id": object_id,
-                "workspace_id": &admin.current_workspace
-            },
+            playbook_mutation_filter(
+                object_id,
+                &admin.current_workspace,
+                &account_id,
+                expected_version,
+            ),
             None,
         )
         .await?
-        .ok_or_else(|| AppError::NotFound("operation playbook not found".to_string()))?;
-    if payload.is_default.unwrap_or(existing.is_default) {
-        unset_default_playbooks(&state, &admin.current_workspace, &existing.account_id).await?;
+        .ok_or_else(|| AppError::Conflict("playbook_identity_or_version_conflict".to_string()))?;
+    if payload
+        .is_default
+        .is_some_and(|requested| requested != existing.is_default)
+    {
+        return Err(AppError::BadRequest(
+            "isDefault is managed by the dedicated set-default endpoint".to_string(),
+        ));
     }
-    state
+    let updated = state
         .db
         .operation_playbooks()
         .update_one(
-            doc! { "_id": object_id },
+            playbook_mutation_filter(
+                object_id,
+                &admin.current_workspace,
+                &account_id,
+                expected_version,
+            ),
             doc! {
                 "$set": {
                     "name": payload.name,
@@ -186,51 +248,46 @@ pub(super) async fn update_operation_playbook(
                     "reply_style": normalize_optional(payload.reply_style),
                     "forbidden_rules": normalize_optional(payload.forbidden_rules),
                     "success_criteria": normalize_optional(payload.success_criteria),
-                    "is_default": payload.is_default.unwrap_or(existing.is_default),
-                    "version": existing.version + 1,
+                    "release_status": "published",
+                    "is_default": existing.is_default,
+                    "version": expected_version + 1,
                     "updated_at": DateTime::now()
                 }
             },
             None,
         )
         .await?;
-    Ok(Json(json!({ "ok": true })))
+    if updated.matched_count != 1 {
+        return Err(AppError::Conflict(
+            "playbook_identity_or_version_conflict".to_string(),
+        ));
+    }
+    Ok(Json(json!({ "ok": true, "version": expected_version + 1 })))
 }
 
-pub(super) async fn set_default_operation_playbook(
+pub async fn set_default_operation_playbook(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
+    Json(payload): Json<PlaybookMutationIdentity>,
 ) -> AppResult<Json<Value>> {
+    let account_id = payload.account_id.trim();
+    if account_id.is_empty() || payload.expected_version < 1 {
+        return Err(AppError::BadRequest(
+            "accountId and positive expectedVersion are required".to_string(),
+        ));
+    }
+    validate_account(&state, &admin.current_workspace, account_id).await?;
     let object_id = parse_object_id(&id)?;
-    let playbook = state
-        .db
-        .operation_playbooks()
-        .find_one(
-            doc! {
-                "_id": object_id,
-                "workspace_id": &admin.current_workspace
-            },
-            None,
-        )
-        .await?
-        .ok_or_else(|| AppError::NotFound("operation playbook not found".to_string()))?;
-    unset_default_playbooks(&state, &admin.current_workspace, &playbook.account_id).await?;
-    state
-        .db
-        .operation_playbooks()
-        .update_one(
-            doc! { "_id": object_id },
-            doc! {
-                "$set": {
-                    "is_default": true,
-                    "updated_at": DateTime::now()
-                }
-            },
-            None,
-        )
-        .await?;
-    Ok(Json(json!({ "ok": true })))
+    let playbook = switch_default_playbook(
+        &state,
+        &admin.current_workspace,
+        account_id,
+        object_id,
+        payload.expected_version,
+    )
+    .await?;
+    Ok(Json(json!({ "ok": true, "version": playbook.version })))
 }
 
 pub(super) async fn generate_operation_playbook(
@@ -251,7 +308,7 @@ pub(super) async fn generate_operation_playbook(
     // C3：active profile 可声明行业专属生成器引导语,覆盖领域中性 DEFAULT(去销售偏见)。
     let active_profile =
         agent::domain_profile::load_active_domain_profile(&state.db, &admin.current_workspace)
-            .await;
+            .await?;
     let system = match active_profile
         .methodology_generator_preamble
         .as_deref()
@@ -264,6 +321,7 @@ pub(super) async fn generate_operation_playbook(
     let user = build_playbook_generation_prompt(&payload.description);
     let generated = agent::generate_agent_json(
         &state,
+        &admin.current_workspace,
         Some(&payload.account_id),
         None,
         None,
@@ -272,23 +330,9 @@ pub(super) async fn generate_operation_playbook(
         &user,
     )
     .await?;
-    let exists = state
-        .db
-        .operation_playbooks()
-        .find_one(
-            doc! {
-                "workspace_id": &admin.current_workspace,
-                "account_id": &payload.account_id
-            },
-            None,
-        )
-        .await?
-        .is_some();
-    let is_default = !exists;
-    if is_default {
-        unset_default_playbooks(&state, &admin.current_workspace, &payload.account_id).await?;
-    }
-    let playbook = OperationPlaybook {
+    // AI generation only creates a reviewable candidate. It never acquires the
+    // production default pointer, including on a previously empty account.
+    let mut playbook = OperationPlaybook {
         id: None,
         workspace_id: admin.current_workspace.clone(),
         account_id: payload.account_id,
@@ -306,7 +350,8 @@ pub(super) async fn generate_operation_playbook(
         forbidden_rules: json_string_any(&generated, &["forbiddenRules", "forbidden_rules"]),
         success_criteria: json_string_any(&generated, &["successCriteria", "success_criteria"]),
         created_by: "agent".to_string(),
-        is_default,
+        release_status: "draft".to_string(),
+        is_default: false,
         version: 1,
         created_at: DateTime::now(),
         updated_at: DateTime::now(),
@@ -314,11 +359,13 @@ pub(super) async fn generate_operation_playbook(
     let result = state
         .db
         .operation_playbooks()
-        .insert_one(playbook, None)
+        .insert_one(&playbook, None)
         .await?;
-    Ok(Json(
-        json!({ "id": result.inserted_id.as_object_id().map(|id| id.to_hex()) }),
-    ))
+    playbook.id = result.inserted_id.as_object_id();
+    Ok(Json(json!({
+        "id": playbook.id.map(|id| id.to_hex()),
+        "item": playbook_json(playbook),
+    })))
 }
 
 pub(super) async fn optimize_operation_playbook(
@@ -330,19 +377,28 @@ pub(super) async fn optimize_operation_playbook(
     if payload.instruction.trim().is_empty() {
         return Err(AppError::BadRequest("instruction is required".to_string()));
     }
+    let account_id = payload.account_id.trim();
+    if account_id.is_empty() || payload.expected_version < 1 {
+        return Err(AppError::BadRequest(
+            "accountId and positive expectedVersion are required".to_string(),
+        ));
+    }
+    validate_account(&state, &admin.current_workspace, account_id).await?;
     let object_id = parse_object_id(&id)?;
     let existing = state
         .db
         .operation_playbooks()
         .find_one(
-            doc! {
-                "_id": object_id,
-                "workspace_id": &admin.current_workspace
-            },
+            playbook_mutation_filter(
+                object_id,
+                &admin.current_workspace,
+                account_id,
+                payload.expected_version,
+            ),
             None,
         )
         .await?
-        .ok_or_else(|| AppError::NotFound("operation playbook not found".to_string()))?;
+        .ok_or_else(|| AppError::Conflict("playbook_identity_or_version_conflict".to_string()))?;
     let system = prompts::load_prompt(
         &state.db,
         &admin.current_workspace,
@@ -352,7 +408,7 @@ pub(super) async fn optimize_operation_playbook(
     // C3：active profile 可声明行业专属生成器引导语,覆盖领域中性 DEFAULT(去销售偏见)。
     let active_profile =
         agent::domain_profile::load_active_domain_profile(&state.db, &admin.current_workspace)
-            .await;
+            .await?;
     let system = match active_profile
         .methodology_generator_preamble
         .as_deref()
@@ -365,7 +421,8 @@ pub(super) async fn optimize_operation_playbook(
     let user = build_playbook_optimization_prompt(&existing, &payload.instruction);
     let generated = agent::generate_agent_json(
         &state,
-        Some(&existing.account_id),
+        &admin.current_workspace,
+        Some(account_id),
         None,
         None,
         "playbook.optimizer",
@@ -394,45 +451,43 @@ pub(super) async fn optimize_operation_playbook(
         .or(existing.forbidden_rules);
     let success_criteria = json_string_any(&generated, &["successCriteria", "success_criteria"])
         .or(existing.success_criteria);
-    state
+    let version = payload
+        .expected_version
+        .checked_add(1)
+        .ok_or_else(|| AppError::Conflict("playbook_version_exhausted".to_string()))?;
+    let now = DateTime::now();
+    let mut candidate = OperationPlaybook {
+        id: None,
+        workspace_id: admin.current_workspace.clone(),
+        account_id: account_id.to_string(),
+        name,
+        description,
+        method_prompt,
+        profile_method,
+        tag_method,
+        stage_method,
+        intent_method,
+        follow_up_method,
+        reply_style,
+        forbidden_rules,
+        success_criteria,
+        created_by: "agent_optimized".to_string(),
+        release_status: "draft".to_string(),
+        is_default: false,
+        version,
+        created_at: now,
+        updated_at: now,
+    };
+    let inserted = state
         .db
         .operation_playbooks()
-        .update_one(
-            doc! { "_id": object_id },
-            doc! {
-                "$set": {
-                    "name": name,
-                    "description": description,
-                    "method_prompt": method_prompt,
-                    "profile_method": profile_method,
-                    "tag_method": tag_method,
-                    "stage_method": stage_method,
-                    "intent_method": intent_method,
-                    "follow_up_method": follow_up_method,
-                    "reply_style": reply_style,
-                    "forbidden_rules": forbidden_rules,
-                    "success_criteria": success_criteria,
-                    "created_by": "agent_optimized",
-                    "version": existing.version + 1,
-                    "updated_at": DateTime::now()
-                }
-            },
-            None,
-        )
+        .insert_one(&candidate, None)
         .await?;
-    let updated = state
-        .db
-        .operation_playbooks()
-        .find_one(
-            doc! {
-                "_id": object_id,
-                "workspace_id": &admin.current_workspace
-            },
-            None,
-        )
-        .await?
-        .ok_or_else(|| AppError::NotFound("operation playbook not found".to_string()))?;
-    Ok(Json(json!({ "item": playbook_json(updated) })))
+    candidate.id = inserted.inserted_id.as_object_id();
+    Ok(Json(json!({
+        "sourceId": object_id.to_hex(),
+        "item": playbook_json(candidate),
+    })))
 }
 
 pub(super) fn playbook_json(playbook: OperationPlaybook) -> Value {
@@ -452,6 +507,7 @@ pub(super) fn playbook_json(playbook: OperationPlaybook) -> Value {
         "forbiddenRules": playbook.forbidden_rules,
         "successCriteria": playbook.success_criteria,
         "createdBy": playbook.created_by,
+        "releaseStatus": playbook.release_status,
         "isDefault": playbook.is_default,
         "version": playbook.version,
         "updatedAt": crate::models::dt_to_string(playbook.updated_at)
@@ -467,65 +523,305 @@ pub(super) fn validate_playbook_input(name: &str, method_prompt: &str) -> AppRes
     Ok(())
 }
 
+fn playbook_mutation_filter(
+    object_id: ObjectId,
+    workspace_id: &str,
+    account_id: &str,
+    expected_version: i32,
+) -> mongodb::bson::Document {
+    doc! {
+        "_id": object_id,
+        "workspace_id": workspace_id,
+        "account_id": account_id,
+        "version": expected_version,
+    }
+}
+
+async fn insert_playbook(
+    state: &AppState,
+    mut playbook: OperationPlaybook,
+    make_default: bool,
+) -> AppResult<OperationPlaybook> {
+    if !make_default {
+        let inserted = state
+            .db
+            .operation_playbooks()
+            .insert_one(&playbook, None)
+            .await?;
+        playbook.id = inserted.inserted_id.as_object_id();
+        return Ok(playbook);
+    }
+
+    playbook.release_status = "published".to_string();
+    playbook.is_default = true;
+    if find_default_playbook(state, &playbook.workspace_id, &playbook.account_id)
+        .await?
+        .is_none()
+    {
+        return match state
+            .db
+            .operation_playbooks()
+            .insert_one(&playbook, None)
+            .await
+        {
+            Ok(inserted) => {
+                playbook.id = inserted.inserted_id.as_object_id();
+                Ok(playbook)
+            }
+            Err(error) if is_duplicate_key_error(&error) => {
+                Err(AppError::Conflict(PLAYBOOK_DEFAULT_CONFLICT.to_string()))
+            }
+            Err(error) => Err(error.into()),
+        };
+    }
+
+    // Replacing an existing default is the only path that needs a transaction:
+    // demotion and promotion must become visible atomically.
+    let mut session = state.db.client().start_session(None).await?;
+    session
+        .start_transaction(TransactionOptions::builder().build())
+        .await?;
+    let result: AppResult<OperationPlaybook> = async {
+        let mut cursor = state
+            .db
+            .operation_playbooks()
+            .find_with_session(
+                doc! {
+                    "workspace_id": &playbook.workspace_id,
+                    "account_id": &playbook.account_id,
+                    "release_status": "published",
+                    "is_default": true,
+                },
+                FindOptions::builder().limit(2).build(),
+                &mut session,
+            )
+            .await?;
+        let current = cursor.next(&mut session).await.transpose()?;
+        if cursor.next(&mut session).await.transpose()?.is_some() {
+            return Err(AppError::Conflict("multiple_default_playbooks".to_string()));
+        }
+        drop(cursor);
+        if let Some(current) = current {
+            let current_id = current
+                .id
+                .ok_or_else(|| AppError::External("default playbook missing _id".to_string()))?;
+            let demoted = state
+                .db
+                .operation_playbooks()
+                .update_one_with_session(
+                    doc! {
+                        "_id": current_id,
+                        "workspace_id": &playbook.workspace_id,
+                        "account_id": &playbook.account_id,
+                        "is_default": true,
+                    },
+                    doc! { "$set": { "is_default": false, "updated_at": DateTime::now() } },
+                    None,
+                    &mut session,
+                )
+                .await?;
+            if demoted.modified_count != 1 {
+                return Err(AppError::Conflict(PLAYBOOK_DEFAULT_CONFLICT.to_string()));
+            }
+        }
+        let inserted = state
+            .db
+            .operation_playbooks()
+            .insert_one_with_session(&playbook, None, &mut session)
+            .await?;
+        playbook.id = inserted.inserted_id.as_object_id();
+        Ok(playbook)
+    }
+    .await;
+    let playbook = match result {
+        Ok(playbook) => playbook,
+        Err(error) => {
+            let _ = session.abort_transaction().await;
+            return Err(playbook_transaction_error(error));
+        }
+    };
+    commit_playbook_transaction(&mut session).await?;
+    Ok(playbook)
+}
+
+fn is_duplicate_key_error(error: &mongodb::error::Error) -> bool {
+    use mongodb::error::{ErrorKind, WriteFailure};
+
+    matches!(
+        error.kind.as_ref(),
+        ErrorKind::Write(WriteFailure::WriteError(write_error)) if write_error.code == 11000
+    )
+}
+
+async fn switch_default_playbook(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+    target_id: ObjectId,
+    expected_version: i32,
+) -> AppResult<OperationPlaybook> {
+    let mut session = state.db.client().start_session(None).await?;
+    session
+        .start_transaction(TransactionOptions::builder().build())
+        .await?;
+    let result: AppResult<OperationPlaybook> = async {
+        let mut target = state
+            .db
+            .operation_playbooks()
+            .find_one_with_session(
+                playbook_mutation_filter(target_id, workspace_id, account_id, expected_version),
+                None,
+                &mut session,
+            )
+            .await?
+            .ok_or_else(|| {
+                AppError::Conflict("playbook_identity_or_version_conflict".to_string())
+            })?;
+        if !matches!(target.release_status.as_str(), "draft" | "published") {
+            return Err(AppError::Conflict(
+                "playbook_release_status_invalid".to_string(),
+            ));
+        }
+        let mut cursor = state
+            .db
+            .operation_playbooks()
+            .find_with_session(
+                doc! {
+                    "workspace_id": workspace_id,
+                    "account_id": account_id,
+                    "release_status": "published",
+                    "is_default": true,
+                },
+                FindOptions::builder().limit(2).build(),
+                &mut session,
+            )
+            .await?;
+        let current = cursor.next(&mut session).await.transpose()?;
+        if cursor.next(&mut session).await.transpose()?.is_some() {
+            return Err(AppError::Conflict("multiple_default_playbooks".to_string()));
+        }
+        drop(cursor);
+        if current.as_ref().and_then(|row| row.id) == Some(target_id) {
+            return Ok(target);
+        }
+        if let Some(current) = current {
+            let current_id = current
+                .id
+                .ok_or_else(|| AppError::External("default playbook missing _id".to_string()))?;
+            let demoted = state
+                .db
+                .operation_playbooks()
+                .update_one_with_session(
+                    doc! {
+                        "_id": current_id,
+                        "workspace_id": workspace_id,
+                        "account_id": account_id,
+                        "is_default": true,
+                    },
+                    doc! { "$set": { "is_default": false, "updated_at": DateTime::now() } },
+                    None,
+                    &mut session,
+                )
+                .await?;
+            if demoted.modified_count != 1 {
+                return Err(AppError::Conflict(PLAYBOOK_DEFAULT_CONFLICT.to_string()));
+            }
+        }
+        let now = DateTime::now();
+        let promoted = state
+            .db
+            .operation_playbooks()
+            .update_one_with_session(
+                doc! {
+                    "_id": target_id,
+                    "workspace_id": workspace_id,
+                    "account_id": account_id,
+                    "version": expected_version,
+                    "is_default": false,
+                },
+                doc! {
+                    "$set": {
+                        "release_status": "published",
+                        "is_default": true,
+                        "updated_at": now,
+                    }
+                },
+                None,
+                &mut session,
+            )
+            .await?;
+        if promoted.modified_count != 1 {
+            return Err(AppError::Conflict(PLAYBOOK_DEFAULT_CONFLICT.to_string()));
+        }
+        target.is_default = true;
+        target.release_status = "published".to_string();
+        target.updated_at = now;
+        Ok(target)
+    }
+    .await;
+    let target = match result {
+        Ok(target) => target,
+        Err(error) => {
+            let _ = session.abort_transaction().await;
+            return Err(playbook_transaction_error(error));
+        }
+    };
+    commit_playbook_transaction(&mut session).await?;
+    Ok(target)
+}
+
 pub(super) async fn ensure_default_playbook(
     state: &AppState,
     workspace_id: &str,
     account_id: &str,
 ) -> AppResult<OperationPlaybook> {
-    if let Some(playbook) = state
+    if let Some(playbook) = find_default_playbook(state, workspace_id, account_id).await? {
+        return Ok(playbook);
+    }
+    let playbook = prompts::default_playbook(workspace_id, account_id);
+    match insert_playbook(state, playbook, true).await {
+        Ok(playbook) => Ok(playbook),
+        Err(AppError::Conflict(_)) => {
+            // Two first reads may race on an empty account. The partial unique
+            // index chooses one committed default; the loser converges by
+            // reading that winner instead of failing the list request. The
+            // winner may still be finishing its commit, so use a short bounded
+            // convergence window rather than an unbounded retry loop.
+            for _ in 0..4 {
+                if let Some(playbook) =
+                    find_default_playbook(state, workspace_id, account_id).await?
+                {
+                    return Ok(playbook);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            Err(AppError::Conflict(PLAYBOOK_DEFAULT_CONFLICT.to_string()))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn find_default_playbook(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+) -> AppResult<Option<OperationPlaybook>> {
+    state
         .db
         .operation_playbooks()
         .find_one(
             doc! {
                 "workspace_id": workspace_id,
                 "account_id": account_id,
-                "is_default": true
+                "release_status": "published",
+                "is_default": true,
             },
             FindOneOptions::builder()
                 .sort(doc! { "updated_at": -1 })
                 .build(),
         )
-        .await?
-    {
-        return Ok(playbook);
-    }
-    let playbook = prompts::default_playbook(workspace_id, account_id);
-    let result = state
-        .db
-        .operation_playbooks()
-        .insert_one(playbook, None)
-        .await?;
-    let id = result
-        .inserted_id
-        .as_object_id()
-        .ok_or_else(|| AppError::External("operation playbook id missing".to_string()))?;
-    state
-        .db
-        .operation_playbooks()
-        .find_one(doc! { "_id": id }, None)
-        .await?
-        .ok_or_else(|| AppError::External("operation playbook not found after insert".to_string()))
-}
-
-pub(super) async fn unset_default_playbooks(
-    state: &AppState,
-    workspace_id: &str,
-    account_id: &str,
-) -> AppResult<()> {
-    state
-        .db
-        .operation_playbooks()
-        .update_many(
-            doc! {
-                "workspace_id": workspace_id,
-                "account_id": account_id,
-                "is_default": true
-            },
-            doc! { "$set": { "is_default": false, "updated_at": DateTime::now() } },
-            None,
-        )
-        .await?;
-    Ok(())
+        .await
+        .map_err(AppError::from)
 }
 
 pub(super) fn build_playbook_generation_prompt(description: &str) -> String {
@@ -637,6 +933,7 @@ mod tests {
             forbidden_rules: Some("不承诺无依据效果".to_string()),
             success_criteria: Some("客户主动询价".to_string()),
             created_by: "admin-1".to_string(),
+            release_status: "published".to_string(),
             is_default: true,
             version: 3,
             created_at: DateTime::from_millis(1_700_000_000_000),

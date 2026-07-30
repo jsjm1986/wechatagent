@@ -19,7 +19,10 @@ mod tests {
 
     #[test]
     fn maps_known_block_reasons() {
-        assert_eq!(block_reason_zh("blocked_unverified_product_claim"), "产品说法未经核实");
+        assert_eq!(
+            block_reason_zh("blocked_unverified_product_claim"),
+            "产品说法未经核实"
+        );
         assert_eq!(block_reason_zh("blocked_by_required_field"), "必填信息缺失");
         assert_eq!(block_reason_zh("blocked_by_budget"), "本轮算力预算耗尽");
         assert_eq!(block_reason_zh("blocked_by_safety_guard"), "安全门拦截");

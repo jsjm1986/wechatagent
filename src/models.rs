@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
-use mongodb::bson::{oid::ObjectId, DateTime, Document};
-use serde::{Deserialize, Deserializer, Serialize};
+use mongodb::bson::{oid::ObjectId, Bson, DateTime, Document};
+use serde::{ser::SerializeStruct, Deserialize, Deserializer, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -118,7 +118,10 @@ impl std::fmt::Debug for WechatAccount {
             )
             .field(
                 "webhook_secret",
-                &self.webhook_secret.as_deref().map(crate::secret::mask_secret),
+                &self
+                    .webhook_secret
+                    .as_deref()
+                    .map(crate::secret::mask_secret),
             )
             .field("online", &self.online)
             .field("status", &self.status)
@@ -248,9 +251,8 @@ pub struct Contact {
     #[serde(default, alias = "deal_events")]
     pub outcome_events: Vec<OutcomeEvent>,
     /// Phase E / E3：联系人语种（BCP-47 短形式，如 `zh-CN` / `en-US`）。
-    /// `load_prompt_for_contact` 在 prompt_templates 多 locale 并存时按本字段
-    /// 选最匹配版本；缺字段时反序列化为 None，由 `contact_locale_or_default`
-    /// 回退到 [`DEFAULT_LOCALE`]（`zh-CN`），向前兼容历史 contact 文档。
+    /// PromptTemplate 已改为每个 key 唯一 current；本字段仍供其它本地化路径使用。
+    /// 缺字段时反序列化为 None，向前兼容历史 contact 文档。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub locale: Option<String>,
     pub created_at: DateTime,
@@ -306,6 +308,9 @@ impl From<ConfirmedTag> for ApiConfirmedTag {
 #[serde(rename_all = "camelCase")]
 pub struct BayesianPoint {
     pub turn: i32,
+    /// Durable idempotency anchor: one point per run and dimension.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_run_id: Option<String>,
     pub value: String,
     pub confidence: f64,
     pub value_changed: bool,
@@ -403,7 +408,11 @@ impl From<PersonalityProfile> for ApiPersonalityProfile {
             agreeableness: p.agreeableness,
             neuroticism: p.neuroticism,
             updated_at: dt_to_string(p.updated_at),
-            snapshots: p.snapshots.into_iter().map(ApiPersonalitySnapshot::from).collect(),
+            snapshots: p
+                .snapshots
+                .into_iter()
+                .map(ApiPersonalitySnapshot::from)
+                .collect(),
         }
     }
 }
@@ -581,6 +590,15 @@ pub struct Campaign {
     pub intent_text: String,
     #[serde(default)]
     pub segment_filter: SegmentFilter,
+    /// Monotonic identity of the editable draft specification. Dispatch binds
+    /// the human confirmation to both this version and `spec_hash`.
+    #[serde(default = "default_campaign_spec_version")]
+    pub spec_version: i64,
+    /// SHA-256 of workspace/account/title/intent/filter after normalization.
+    /// Legacy rows may omit it; read paths recompute it, while any new write
+    /// materializes the value before dispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec_hash: Option<String>,
     /// draft / previewed / confirmed / dispatching / completed / canceled（闭集，
     /// 见 [`ALLOWED_CAMPAIGN_STATUS`]）。
     pub status: String,
@@ -593,9 +611,28 @@ pub struct Campaign {
     /// serde 补 None（无破坏，Campaign 无 deny_unknown_fields）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_dispatch_target_count: Option<i64>,
+    /// Frozen fanout identity. The first dispatch CAS writes all four fields
+    /// in one Campaign document; recovery consumes this exact audience rather
+    /// than re-running a moving segment query.
+    #[serde(default)]
+    pub dispatch_generation: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_spec_hash: Option<String>,
+    #[serde(default)]
+    pub dispatch_audience: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_intent_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_started_at: Option<DateTime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_completed_at: Option<DateTime>,
     pub created_by: String,
     pub created_at: DateTime,
     pub updated_at: DateTime,
+}
+
+fn default_campaign_spec_version() -> i64 {
+    1
 }
 
 /// 活动人群圈选条件。各维 AND；空 = 不约束该维。
@@ -627,11 +664,18 @@ pub struct CampaignSend {
     pub account_id: String,
     pub campaign_id: ObjectId,
     pub contact_wxid: String,
+    /// Frozen Campaign dispatch generation and specification identity.
+    #[serde(default)]
+    pub dispatch_generation: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<ObjectId>,
-    /// `enqueued`（已建 follow_up 任务）/ `skipped_duplicate`（去重命中）。
+    /// `prepared`（durable intent 已落）/ `enqueued`（确定性 task 已存在）。
     pub status: String,
     pub created_at: DateTime,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<DateTime>,
 }
 
 /// `campaigns.status` 封闭枚举。所有写入路径在 `$set: { status: ... }` 前
@@ -667,13 +711,13 @@ pub fn assert_campaign_status_valid(status: &str) {
 /// - **沉默 = 删失**（Law ②）：`signal_type="silence"` 的事件 `censored=true`，
 ///   下游绝不可当作负反馈喂入任何评分。
 /// - **每条信号带元数据**（Law ④）：`source`/`observed_at`/`confidence`/`dedupe_key`。
-/// - **幂等**（Law ⑤）：`(workspace_id, dedupe_key)` partial unique index 约束，
+/// - **幂等**（Law ⑤）：`(workspace_id, account_id, dedupe_key)` partial unique index 约束，
 ///   同一观察重复采集只落一次。
 ///
 /// 本阶段只采集、不消费——任何学习公式都不读它，直到积累到可学样本量。
 ///
 /// 字段一律 snake_case 落库（与 [`ConversationMessage`] 等同库结构一致）：索引
-/// `{workspace_id, dedupe_key}` 的 `partialFilterExpression` 按 snake-case 字段名
+/// `{workspace_id, account_id, dedupe_key}` 的 `partialFilterExpression` 按 snake-case 字段名
 /// 匹配，若改成 camelCase 会让 partial filter 命中 0 文档 → unique 约束形同虚设、
 /// 重复信号全部落库（已被 `behavior_signal_smoke` 集成测试逮到）。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -681,6 +725,7 @@ pub struct BehaviorSignal {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
     pub id: Option<ObjectId>,
     pub workspace_id: String,
+    pub account_id: String,
     pub contact_wxid: String,
     /// `"reply_latency"` | `"reply_length"` | `"reactivation"` | `"silence"`。
     pub signal_type: String,
@@ -873,6 +918,7 @@ pub struct AgentTask {
 pub const ALLOWED_AGENT_TASK_STATUS: &[&str] = &[
     "pending",
     "running",
+    "committing",
     "retry",
     "failed",
     "cancelled",
@@ -949,12 +995,45 @@ pub struct ImportJob {
     #[serde(default)]
     pub progress_failed: i32,
     pub status: String,
+    /// Admin identity that created this preview. New apply requests must match
+    /// it exactly; legacy rows without an owner are not consumable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_admin_id: Option<String>,
+    /// SHA-256 over the server-sealed preview payload. The apply endpoint
+    /// requires this value and rejects stale or forged preview bodies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_hash: Option<String>,
+    /// Apply lifecycle independent from the extraction worker lifecycle:
+    /// `ready` -> `applying` -> `applied`. The transition and all imported
+    /// artifacts are committed in one MongoDB transaction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apply_status: Option<String>,
+    /// Stable hash of the selected candidate ids plus their editable patches.
+    /// A replay must carry the same hash to receive the committed receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apply_request_hash: Option<String>,
+    /// Stable receipt returned after a committed apply. Network retries read
+    /// this field instead of creating a second document/chunk set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apply_result: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_at: Option<DateTime>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claimed_at: Option<DateTime>,
+    /// Monotonic ownership generation. Every claim increments this value;
+    /// heartbeat, progress, and terminal writes must match it together with
+    /// `claim_token` so a reclaimed worker cannot regain authority when the
+    /// row returns to `running` under a new owner.
+    #[serde(default)]
+    pub claim_generation: i64,
+    /// Unforgeable identity for the current running owner. Pending and
+    /// terminal rows omit it; legacy running rows may omit it until reclaimed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_token: Option<String>,
     #[serde(default)]
     pub claim_recovery_count: i32,
     /// TTL 清扫锚点：worker 落终态（completed/failed）时置 `now + 24h`；
@@ -1020,7 +1099,10 @@ mod chunk_classification_tests {
         assert_eq!(coerce_wiki_type(Some("  ".to_string())), None);
         assert_eq!(coerce_wiki_type(None), None);
         // 前后空白被 trim 后仍命中闭集。
-        assert_eq!(coerce_wiki_type(Some("  methodology ".to_string())).as_deref(), Some("methodology"));
+        assert_eq!(
+            coerce_wiki_type(Some("  methodology ".to_string())).as_deref(),
+            Some("methodology")
+        );
     }
 
     #[test]
@@ -1061,7 +1143,18 @@ pub struct AgentEvent {
 pub struct MigrationRecord {
     #[serde(rename = "_id")]
     pub id: String,
-    pub applied_at: DateTime,
+    /// Missing while the migration is waiting for an explicit production
+    /// approval. Legacy records always deserialize as `Some`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_at: Option<DateTime>,
+    /// `applied` or `blocked`. Legacy rows have no status and remain treated as
+    /// applied by the runner for backward compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_at: Option<DateTime>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1166,6 +1259,15 @@ pub struct AgentSoul {
     /// 为后续 souls 版本化/启动对齐预留（本期对齐逻辑暂不消费）。
     #[serde(default)]
     pub seeded_by: Option<String>,
+    /// 创建本版本时所基于的前一版本号；首版为 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_version: Option<i32>,
+    /// 本版本最近一次被发布的时间。历史行缺失时保持 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published_at: Option<DateTime>,
+    /// 发布审计身份。历史行缺失时保持 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1185,10 +1287,9 @@ pub struct PromptTemplate {
     pub created_by: String,
     pub created_at: DateTime,
     pub updated_at: DateTime,
-    /// agent-self-evolution M4 / W0 Task 1.5：多版本支持。`true` 表示当前生效版本。
-    /// 同 `(workspace_id, prompt_key)` 下应至多有一条 `current_version=true`，由
-    /// `release_prompt` 在 mongo 事务内保证。缺字段时反序列化为 `false`，
-    /// `2026_05_M4_001_prompt_template_versioned` 迁移把历史唯一一条置 `true`。
+    /// Canonical runtime pointer. 同 `(workspace_id, prompt_key)` 下恰有一条
+    /// `current_version=true + status=active`（纯 draft 流可暂时为零），由共享事务发布
+    /// helper 保证；m043 收敛旧 status/current 分裂。
     #[serde(default)]
     pub current_version: bool,
     /// agent-self-evolution M4：被替换的上一版本号（rollback 时取回它）。
@@ -1197,13 +1298,14 @@ pub struct PromptTemplate {
     /// agent-self-evolution M4：写入来源（`"system"` / `"legacy_migration"` /
     /// `"evolution_release"` 等），方便排查谁改的。
     pub seeded_by: Option<String>,
-    /// Phase E / E3：模板语种（BCP-47 短形式，如 `zh-CN` / `en-US`）。
-    /// `load_prompt_for_contact` 优先选 `(workspace_id, prompt_key, locale)` 三元
-    /// 全匹配的 active 版本；未命中时 fallback 到 `DEFAULT_LOCALE` 的版本。
-    /// 缺字段时反序列化为 None，由 `template_locale_or_default` 回退到 `zh-CN`，
-    /// 与历史模板（无 locale 字段）兼容。
+    /// 模板语种元数据（BCP-47 短形式）。运行时只读 canonical current，不再按
+    /// locale 在多条 active 历史版本间分桶；缺字段仍兼容为 None。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub locale: Option<String>,
+    /// Evolution release ownership. Only rows produced by a proposal carry it;
+    /// rollback uses it to prove the current artifact still belongs to that proposal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_proposal_id: Option<ObjectId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1224,10 +1326,16 @@ pub struct OperationPlaybook {
     pub forbidden_rules: Option<String>,
     pub success_criteria: Option<String>,
     pub created_by: String,
+    #[serde(default = "default_playbook_release_status")]
+    pub release_status: String,
     pub is_default: bool,
     pub version: i32,
     pub created_at: DateTime,
     pub updated_at: DateTime,
+}
+
+fn default_playbook_release_status() -> String {
+    "published".to_string()
 }
 
 /// 请示通道决策人引用：wxid + 可选展示名（前端选好友时填）。
@@ -1237,6 +1345,11 @@ pub struct DeciderRef {
     pub wxid: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    /// Account used to send the internal escalation card and receive this
+    /// decider's reply. Legacy rows omit it and fall back to the customer
+    /// account only when a new escalation is created.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
 }
 
 /// 请示推送静默时段（领导休息时间不推卡）。tz_offset_hours 复用运营时区偏移。
@@ -1309,6 +1422,9 @@ pub struct ReferralCard {
 pub struct AgentSendLedger {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
     pub id: Option<ObjectId>,
+    /// 不可变送达事实锚点。新写入必须携带对应 Outbox `_id`；历史行缺失时仍可读取。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outbox_id: Option<ObjectId>,
     pub workspace_id: String,
     pub account_id: String,
     pub contact_wxid: String,
@@ -1472,10 +1588,9 @@ pub struct EvolutionRuntimeFlag {
     /// 审计：上次写入者（admin id / system worker name）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_by: Option<String>,
-    /// Phase C / C5：closed-loop 自动 release 开关。`true` 时显著性 + 邻接性
-    /// 双过滤通过的 threshold proposal 由 evolution worker 自动 release 而无需
-    /// admin 点击；`false`（默认）保持 M4 W4 的 admin 二次确认行为。env
-    /// `EVOLUTION_ENABLED=false` 时该字段无意义（worker 不跑）。
+    /// 历史 closed-loop 自动发布子闸。HC-017 当前政策要求全部人工发布，故
+    /// `true` 也不能越过代码政策硬闸，管理 API 会拒绝新写 true。字段仅为未来
+    /// 按 proposal 类型+方向建立白名单时保留存量兼容。
     #[serde(default)]
     pub threshold_auto_release_enabled: bool,
     pub updated_at: DateTime,
@@ -1577,6 +1692,12 @@ pub struct OperationKnowledgeDocument {
     /// 单调递增版本号；前端 `If-None-Match` 走 304。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catalog_version: Option<i64>,
+    /// Chunk 事务已承诺的最新 catalog 代次。每次 durable intent 入队时递增。
+    #[serde(default)]
+    pub catalog_desired_generation: i64,
+    /// 已原子写入 `catalog_summary_persisted` 的代次。小于 desired 表示快照陈旧。
+    #[serde(default)]
+    pub catalog_applied_generation: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1692,14 +1813,20 @@ pub const ALLOWED_WIKI_TYPE: &[&str] = &[
 ];
 
 /// `chunk_type` 4 类运营用途闭集（描述"运营时怎么用它"）。与 [`ALLOWED_WIKI_TYPE`] 正交。
-pub const ALLOWED_CHUNK_TYPE: &[&str] =
-    &["product_fact", "style_template", "peer_case", "negative_example"];
+pub const ALLOWED_CHUNK_TYPE: &[&str] = &[
+    "product_fact",
+    "style_template",
+    "peer_case",
+    "negative_example",
+];
 
 /// 落库前归一 `wiki_type`：合法值透传；空/闭集外（含 LLM 幻觉分类，如 `"产品介绍"`）→ `None`。
 /// 归一而非拒绝：LLM 幻觉是预期输入，不该让整条 chunk 写入失败丢掉正确 body；
 /// 落 `None` 后由 `wiki_type_priority` 兜底为 `entity`（`knowledge_agent.rs`）。越界时留痕。
 pub fn coerce_wiki_type(raw: Option<String>) -> Option<String> {
-    let value = raw.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())?;
+    let value = raw
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())?;
     if ALLOWED_WIKI_TYPE.contains(&value.as_str()) {
         Some(value)
     } else {
@@ -1714,9 +1841,7 @@ pub fn coerce_wiki_type(raw: Option<String>) -> Option<String> {
 /// 落库前归一 `chunk_type`：合法值透传；空/闭集外 → `product_fact`（最保守、走 verified-only）。
 /// 归一而非拒绝，理由同 [`coerce_wiki_type`]。越界时留痕。
 pub fn coerce_chunk_type(raw: Option<String>) -> String {
-    let value = raw
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+    let value = raw.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     match value {
         Some(v) if ALLOWED_CHUNK_TYPE.contains(&v.as_str()) => v,
         Some(v) => {
@@ -1820,6 +1945,7 @@ pub struct UsageStats {
 pub struct ChunkRevision {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
     pub id: Option<ObjectId>,
+    pub workspace_id: String,
     pub chunk_id: String,
     pub revision_id: String,
     /// 操作语义 ∈ {create, patch, split, merge, rollback, archive, restore, verify, unverify, reject}。
@@ -1829,6 +1955,12 @@ pub struct ChunkRevision {
     pub patch: Document,
     pub before_hash: String,
     pub after_hash: String,
+    /// Complete immutable states around this revision. Legacy revisions may
+    /// omit them; such rows remain readable but cannot support exact rollback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_snapshot: Option<Document>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_snapshot: Option<Document>,
     /// 写入来源 ∈ {ai, human, rule, imported}。
     pub source: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1887,6 +2019,21 @@ pub struct IngestSource {
     pub id: Option<ObjectId>,
     pub source_id: String,
     pub workspace_id: String,
+    /// Monotonic administrator-owned configuration generation. Any CRUD
+    /// mutation increments it and revokes the current worker claim, fencing
+    /// results fetched from an older URL/configuration snapshot.
+    #[serde(default)]
+    pub source_generation: i64,
+    /// Monotonic execution-attempt generation. Incremented on every claim or
+    /// expired-lease reclaim and paired with an unguessable claim token.
+    #[serde(default)]
+    pub claim_generation: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locked_until: Option<DateTime>,
     /// 闭集：`"rss"` / `"html"`。
     pub kind: String,
     pub url: String,
@@ -2088,13 +2235,10 @@ pub struct DomainProfile {
     /// 任何取值下都不变。运行时经 `UserRuntimeParameters` 同名字段消费。
     #[serde(default)]
     pub grounding_gate_bypass_without_claim: bool,
-    /// reviewer 优化第一步：本域是否「不信任被审查者自报的低风险」。`false`
-    /// （DEFAULT/老库 serde 默认）= 沿用 `should_run_review` 既有判定（销售域字节
-    /// 等价），Reply Agent 自报 `needs_review=false` 且 confidence 高的回复走本地
-    /// 轻量兜底；`true` = 纯关系/情感等高敏域，should_reply 的回复一律强制走独立
-    /// LLM review（`review_decision`），不再因自报低风险被本地兜底无脑放行。
-    /// 依据：情感追问回复被自我豁免门挡在 reviewer 之外、本地兜底写死 pressure_risk=0
-    /// 的盲区。运行时经 `UserRuntimeParameters` 同名字段消费。
+    /// reviewer 深度开关。所有 `should_reply=true` 的正文都必须经过独立 Reviewer；
+    /// `false`（DEFAULT/老库 serde 默认）允许常规低风险回复使用 light Reviewer，
+    /// `true` 让纯关系/情感等高敏域强制使用 full Reviewer。该字段不再授权模型以
+    /// `needs_review=false` 跳过审核。运行时经 `UserRuntimeParameters` 同名字段消费。
     #[serde(default)]
     pub distrust_self_reported_low_risk: bool,
     /// 客观购买事实增强 G4 #5：本域是否为**交易型域**、决策 prompt 注入产品目录段 +
@@ -2204,12 +2348,23 @@ pub struct DomainProfile {
     pub current_version: bool,
     #[serde(default)]
     pub previous_version: Option<i32>,
+    /// Release lifecycle is independent from the runtime active pointer.
+    /// New edits are immutable `draft` rows; publish changes the selected row
+    /// to `published`, while historical published rows remain published.
+    /// Legacy rows default conservatively to published so an old artifact is
+    /// never mistaken for an editable draft.
+    #[serde(default = "default_domain_profile_release_status")]
+    pub release_status: String,
     /// 写入来源：`generated_by_ai` / `manual` / `default`。
     #[serde(default)]
     pub seeded_by: Option<String>,
     pub is_active: bool,
     pub created_at: DateTime,
     pub updated_at: DateTime,
+}
+
+fn default_domain_profile_release_status() -> String {
+    "published".to_string()
 }
 
 /// universal-domain-adaptation M2：五闸风险阈值的 per-profile 覆盖。
@@ -2302,7 +2457,6 @@ pub struct AnsweringModeDescriptor {
     pub label: Option<String>,
 }
 
-
 /// + 各自阈值。三驱动力对应 planner 三扫描器（funnel→`scan_stage_stagnation`、
 /// silence→`scan_silent`、commitment→`scan_commitments`）。
 ///
@@ -2379,7 +2533,10 @@ pub struct FunnelMode {
 
 impl Default for FunnelMode {
     fn default() -> Self {
-        Self { enabled: true, stagnation_threshold_days: None }
+        Self {
+            enabled: true,
+            stagnation_threshold_days: None,
+        }
     }
 }
 
@@ -2395,7 +2552,10 @@ pub struct SilenceMode {
 
 impl Default for SilenceMode {
     fn default() -> Self {
-        Self { enabled: true, threshold_hours: None }
+        Self {
+            enabled: true,
+            threshold_hours: None,
+        }
     }
 }
 
@@ -2412,7 +2572,10 @@ pub struct CommitmentMode {
 
 impl Default for CommitmentMode {
     fn default() -> Self {
-        Self { enabled: true, imminent_window_hours: None }
+        Self {
+            enabled: true,
+            imminent_window_hours: None,
+        }
     }
 }
 
@@ -2431,7 +2594,9 @@ pub struct QuietHoursMode {
 
 impl Default for QuietHoursMode {
     fn default() -> Self {
-        Self { enabled_override: None }
+        Self {
+            enabled_override: None,
+        }
     }
 }
 
@@ -2457,7 +2622,11 @@ pub struct CalendarMode {
 
 impl Default for CalendarMode {
     fn default() -> Self {
-        Self { enabled: false, lookahead_days: None, daily_cap: None }
+        Self {
+            enabled: false,
+            lookahead_days: None,
+            daily_cap: None,
+        }
     }
 }
 
@@ -2485,7 +2654,12 @@ pub struct RenewalMode {
 
 impl Default for RenewalMode {
     fn default() -> Self {
-        Self { enabled: false, lookahead_days: None, grace_days: None, daily_cap: None }
+        Self {
+            enabled: false,
+            lookahead_days: None,
+            grace_days: None,
+            daily_cap: None,
+        }
     }
 }
 
@@ -2516,7 +2690,12 @@ pub struct ReactivationMode {
 
 impl Default for ReactivationMode {
     fn default() -> Self {
-        Self { enabled: false, dormant_days: None, cadence_days: None, daily_cap: None }
+        Self {
+            enabled: false,
+            dormant_days: None,
+            cadence_days: None,
+            daily_cap: None,
+        }
     }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2529,6 +2708,200 @@ pub struct ProfileDimension {
     /// 注入 prompt 的语义说明（如「就诊阶段：初诊/复诊/方案确认/已治疗」）。
     #[serde(default)]
     pub description: String,
+}
+
+/// Keys owned by system-maintained `contact.domain_attributes` state. A
+/// DomainProfile dimension is ultimately written through a Mongo dotted path,
+/// so allowing one of these names would let an ordinary model signal replace
+/// authorization, delivery, relationship, or audit state.
+const RESERVED_PROFILE_DIMENSION_KINDS: &[&str] = &[
+    "assist_mode_override",
+    "awaiting_principal_decision",
+    "awaiting_principal_decision_ids",
+    "contact_wxid",
+    "objection_type",
+    "principal_product_exemption",
+    "referred_card_id",
+    "referred_specialist_at",
+    "relationship_type",
+    "source",
+    "source_review_id",
+    "user_reaction_outcome",
+    "value_tier",
+];
+
+/// Validate the namespace used by dynamic profile dimensions before it is
+/// concatenated into `domain_attributes.<kind>` Mongo update paths.
+///
+/// Industry-defined dimensions remain open-ended, but their physical key must
+/// be one canonical ASCII snake-case component, unique within the profile, and
+/// outside the system-owned namespace. The `_updated_at` suffix is reserved
+/// because each accepted dimension owns `<kind>_updated_at` as its clock.
+pub fn validate_profile_dimension_kinds<'a>(
+    kinds: impl IntoIterator<Item = &'a str>,
+) -> Result<(), String> {
+    use std::collections::HashSet;
+
+    let mut seen = HashSet::new();
+    for kind in kinds {
+        let bytes = kind.as_bytes();
+        let valid_shape = (1..=64).contains(&bytes.len())
+            && bytes[0].is_ascii_lowercase()
+            && bytes
+                .iter()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_');
+        if !valid_shape {
+            return Err(format!(
+                "profile dimension kind {kind:?} must match ^[a-z][a-z0-9_]{{0,63}}$"
+            ));
+        }
+        if kind.ends_with("_updated_at") || RESERVED_PROFILE_DIMENSION_KINDS.contains(&kind) {
+            return Err(format!(
+                "profile dimension kind {kind:?} is reserved by domain_attributes"
+            ));
+        }
+        if !seen.insert(kind) {
+            return Err(format!("duplicate profile dimension kind: {kind}"));
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_domain_profile_dimensions(profile: &DomainProfile) -> Result<(), String> {
+    validate_profile_dimension_kinds(
+        profile
+            .profile_dimensions
+            .iter()
+            .map(|dim| dim.kind.as_str()),
+    )?;
+
+    use std::collections::{HashMap, HashSet};
+    let mut coverage_keys = HashSet::new();
+    let mut review_topic_owners: HashMap<String, String> = HashMap::new();
+    for dimension in &profile.coverage_dimensions {
+        let key = dimension.key.as_str();
+        let key_bytes = key.as_bytes();
+        let valid_key = (1..=64).contains(&key_bytes.len())
+            && key_bytes[0].is_ascii_lowercase()
+            && key_bytes.iter().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_uppercase()
+                    || byte.is_ascii_digit()
+                    || *byte == b'_'
+            });
+        if !valid_key {
+            return Err(format!(
+                "coverage dimension key {key:?} must match ^[a-z][A-Za-z0-9_]{{0,63}}$"
+            ));
+        }
+        if !coverage_keys.insert(key) {
+            return Err(format!("duplicate coverage dimension key: {key}"));
+        }
+
+        let display_name = dimension.display_name.as_str();
+        if display_name.trim() != display_name || !(1..=64).contains(&display_name.chars().count())
+        {
+            return Err(format!(
+                "coverage dimension display name {display_name:?} must be trimmed and 1..=64 characters"
+            ));
+        }
+
+        for topic in [key, display_name] {
+            let normalized = topic.to_lowercase();
+            if let Some(owner) = review_topic_owners.insert(normalized, key.to_string()) {
+                return Err(format!(
+                    "coverage review topic {topic:?} is shared by dimensions {owner} and {key}"
+                ));
+            }
+        }
+        for alias in &dimension.review_topic_aliases {
+            if alias.trim() != alias || !(1..=64).contains(&alias.chars().count()) {
+                return Err(format!(
+                    "coverage review topic alias {alias:?} must be trimmed and 1..=64 characters"
+                ));
+            }
+            if let Some(owner) = review_topic_owners.insert(alias.to_lowercase(), key.to_string()) {
+                return Err(format!(
+                    "coverage review topic alias {alias:?} is shared by dimensions {owner} and {key}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod profile_dimension_validation_tests {
+    use super::{
+        validate_domain_profile_dimensions, validate_profile_dimension_kinds, CoverageDimension,
+    };
+
+    #[test]
+    fn accepts_open_canonical_dimension_names() {
+        assert!(validate_profile_dimension_kinds([
+            "customer_stage",
+            "parent_emotion_state",
+            "subject2",
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn rejects_dynamic_path_reserved_and_duplicate_names() {
+        for kind in [
+            "",
+            " customer_stage",
+            "customer.stage",
+            "$customer_stage",
+            "CustomerStage",
+            "客户阶段",
+            "value_tier",
+            "awaiting_principal_decision",
+            "custom_updated_at",
+        ] {
+            assert!(
+                validate_profile_dimension_kinds([kind]).is_err(),
+                "unsafe dimension kind should be rejected: {kind:?}"
+            );
+        }
+        assert!(validate_profile_dimension_kinds(["trust_level", "trust_level"]).is_err());
+    }
+
+    #[test]
+    fn coverage_review_topics_are_canonical_and_unambiguous() {
+        let mut profile = crate::agent::domain_profile::default_domain_profile("ws-review");
+        profile.coverage_dimensions = vec![CoverageDimension {
+            key: "consultationStage".to_string(),
+            display_name: "咨询阶段".to_string(),
+            required: false,
+            review_topic_aliases: vec!["咨询进度".to_string()],
+            anchor_hint: None,
+            initial_signal: None,
+        }];
+        assert!(validate_domain_profile_dimensions(&profile).is_ok());
+
+        profile.coverage_dimensions[0]
+            .review_topic_aliases
+            .push(" CONSULTATIONSTAGE".to_string());
+        assert!(validate_domain_profile_dimensions(&profile).is_err());
+
+        profile.coverage_dimensions[0].review_topic_aliases = vec!["咨询阶段".to_string()];
+        assert!(validate_domain_profile_dimensions(&profile).is_err());
+
+        profile.coverage_dimensions[0].review_topic_aliases = vec!["咨询进度".to_string()];
+        profile.coverage_dimensions.push(CoverageDimension {
+            key: "treatmentPlan".to_string(),
+            display_name: "方案".to_string(),
+            required: false,
+            review_topic_aliases: vec!["咨询进度".to_string()],
+            anchor_hint: None,
+            initial_signal: None,
+        });
+        assert!(
+            validate_domain_profile_dimensions(&profile).is_err(),
+            "one normalized review topic must not map to multiple dimensions"
+        );
+    }
 }
 
 /// 绝对化承诺词表，按 `commitment_claim_class` 分两类（替代 `guards.rs` 写死词表）。
@@ -2549,6 +2922,12 @@ pub struct CoverageDimension {
     pub display_name: String,
     #[serde(default)]
     pub required: bool,
+    /// Exact `OperationKnowledgeChunk.business_topics` values accepted when an
+    /// operator drills from this coverage dimension into the review queue.
+    /// The dimension key and display name are always accepted as implicit
+    /// aliases; this list only carries additional domain-specific spellings.
+    #[serde(default)]
+    pub review_topic_aliases: Vec<String>,
     /// universal-domain-adaptation H5-b：本维度判 `verifiedFact=true` 的命中锚点
     /// 语义（注入 completeness 审计 prompt 的「命中锚点」段，替代 `catalog.rs` 写死的
     /// 销售五维锚点散文）。`None` 时该维度不产出锚点行（DEFAULT_PROFILE 五维逐字
@@ -2720,8 +3099,8 @@ pub struct BusinessFormula {
     pub eval_score_key: Option<String>,
 }
 
-/// catalog 重建队列：`apply_chunk_revision` 写完即 enqueue；catalog_rebuild_worker
-/// 每 200ms 取一批 status=queued 落库 `documents.catalog_summary_persisted`。
+/// Catalog durable intent：与 chunk revision 和父文档 desired generation 同事务提交；
+/// worker 以 owner/token/lease fencing 领取，终态与 persisted snapshot 同事务写入。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CatalogRebuildJob {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
@@ -2730,10 +3109,24 @@ pub struct CatalogRebuildJob {
     pub workspace_id: String,
     pub document_id: ObjectId,
     pub queued_at: DateTime,
-    /// queued / running / done / failed。
+    /// 本 intent 对应的父 Document desired generation。
+    #[serde(default)]
+    pub target_generation: i64,
+    /// queued / processing / done / superseded / discarded / failed。
     pub status: String,
     #[serde(default)]
     pub attempts: i32,
+    /// 每次 claim/reclaim 单调递增；与 claim_token 一起用于 fencing/audit。
+    #[serde(default)]
+    pub claim_generation: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locked_until: Option<DateTime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_retry_at: Option<DateTime>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2788,8 +3181,14 @@ pub struct KnowledgeChatTurn {
     /// assistant 提出的追问列表（≤ 3 条）。
     #[serde(default)]
     pub followup_questions: Vec<Document>,
-    /// "pending" | "applied" | "discarded"
+    /// "pending" | "applying" | "applied" | "discarded"
     pub status: String,
+    /// chat apply 提交成功后的稳定回执。网络丢包或客户端重试时直接返回该
+    /// 回执，不再次创建 Chunk / revision。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apply_result: Option<Document>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_at: Option<DateTime>,
     /// 本轮 LLM 大致 token 消耗（用 BudgetSnapshot.tokens 累计）。
     pub tokens_used: i64,
     pub prompt_key: Option<String>,
@@ -2847,6 +3246,20 @@ pub struct AgentDecisionReview {
     pub reaction_analysis: Document,
     #[serde(default)]
     pub reaction_claimed_at: Option<DateTime>,
+    /// Reaction 分析每次 claim 生成的不可复用 fencing token。分析结果与其后的业务
+    /// 副作用只有在 `_id + outcome_status=analyzing + token` 仍匹配时才能提交。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reaction_claim_token: Option<String>,
+    /// Reaction claim 的单调审计代次；正确性由不可复用 token 保证。
+    #[serde(default)]
+    pub reaction_claim_generation: i64,
+    /// 该决策若由异步 AgentTask 产生，记录任务与当次不可复用 claim token。
+    /// Dispatcher 发送前据此核对任务已由同一 owner 授权为 `outbox_enqueued`；
+    /// 旧 worker 即使在失权窗口写出了 Outbox，也不能触达远端 MCP。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_task_id: Option<ObjectId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_task_claim_token: Option<String>,
     /// Phase C / C1: reviewer 误判信号（reviewer 判断与用户实际反应不一致时记录）。
     /// 取值：`approved_but_user_negative` / `blocked_but_user_positive` / None。
     /// 由 `record_user_reaction_inner` 在 reaction_analysis 写入后计算并 $set 同步落库，
@@ -2893,6 +3306,12 @@ pub struct AgentRunLog {
     /// MP-5 / Task 15：本次 run 实际 LLM 调用次数。
     #[serde(default)]
     pub llm_calls_used: i32,
+    /// 本次 run 中 usage 不可知的上游调用次数（含缺 usage 的成功响应与失败调用）。
+    ///
+    /// `tokens_used` 只累计上游明确报告的 token；该字段非零时，真实总量未知，
+    /// 不能把未报告部分解释为 0。老数据缺字段时默认 0。
+    #[serde(default)]
+    pub unknown_usage_calls: i32,
     /// MP-5 / Task 15：本次 run 触发的降级原因列表（"review_skipped_budget_exceeded" 等）。
     #[serde(default)]
     pub degraded_reasons: Vec<String>,
@@ -2992,7 +3411,8 @@ pub struct AgentRunLog {
 /// 用于 Reply Agent → review → MCP 发送之间的可靠链路（持久化 / 幂等 / 重试 /
 /// 取消）。具体语义详见 design.md §3.2 与 requirements.md R13；本期 W0 仅用作
 /// `Database::collection_agent_send_outbox` 的类型绑定，最终字段约束（如
-/// `idempotency_key` 唯一索引、`status` 枚举值 `pending|in_flight|sent|failed_terminal|canceled`）
+/// `idempotency_key` 唯一索引、`status` 枚举值
+/// `pending|in_flight|sent|failed_terminal|canceled|delivery_unknown`）
 /// 在 W4 task 5.x 中落地。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutboxEntry {
@@ -3025,6 +3445,27 @@ pub struct OutboxEntry {
     pub next_retry_at: Option<DateTime>,
     pub worker_id: Option<String>,
     pub locked_until: Option<DateTime>,
+    /// 每次 atomic claim 生成的不可复用 fencing token。所有 worker 状态推进都必须
+    /// 同时匹配 `_id + status=in_flight + worker_id + claim_token`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_token: Option<String>,
+    /// claim/reclaim 的单调审计代次；正确性以 claim_token CAS 为准。
+    #[serde(default)]
+    pub claim_generation: i64,
+    /// in-flight 取消不能伪装成已取消：先记录请求，worker 在进入 MCP 前原子复查。
+    #[serde(default)]
+    pub cancel_requested: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancel_requested_at: Option<DateTime>,
+    /// worker 已跨过“最后可取消点”并准备调用远端 MCP。此后取消只能等待真实回执；
+    /// 崩溃且无法核验时进入 delivery_unknown，禁止自动重发。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_started_at: Option<DateTime>,
+    /// SR-034：Task claim 提交发送意图后写入的不可变授权标记。仅由持有同一
+    /// `claim_token` 且成功把 task CAS 到 `outbox_enqueued` 的 owner 写入；
+    /// dispatcher 的最后远端边界 CAS 必须匹配该 token。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_send_authorization_token: Option<String>,
     /// 崩溃恢复标记：`reclaim_expired_leases` 把一条 `in_flight`（lease 过期）
     /// 改回 `pending` 时置 true。说明上一个 worker 抢占后在写 `sent` 前消失
     /// （OOM / 部署 / panic），它**可能已把消息送达 MCP/微信**。dispatcher 重发
@@ -3079,7 +3520,7 @@ pub struct TaxonomyEntry {
 
 /// agent-autonomy-loop W0：`TaxonomyEntry.value` 内嵌结构。字段名采用 camelCase
 /// 以便与 design.md 中"value.id"等索引路径一致（详见 R8.1 唯一索引）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaxonomyValue {
     /// 字典 key（如 `"first_contact"`），不是 BSON `_id`。
@@ -3107,6 +3548,48 @@ pub struct TaxonomyValue {
     /// 目标集合替代写死的 `"dormant_reactivation"` 字面量。
     #[serde(default)]
     pub is_reactivation_target: bool,
+}
+
+/// Build the one namespace claimed by a taxonomy value. The canonical id is
+/// always first; aliases are trimmed, deduplicated in stable order, and may not
+/// claim the canonical id a second time.
+pub(crate) fn taxonomy_identity_claims(canonical_id: &str, aliases: &[String]) -> Vec<String> {
+    let canonical_id = canonical_id.trim();
+    let mut claims = Vec::with_capacity(aliases.len() + 1);
+    if !canonical_id.is_empty() {
+        claims.push(canonical_id.to_string());
+    }
+    for alias in aliases {
+        let alias = alias.trim();
+        if alias.is_empty() || claims.iter().any(|claim| claim == alias) {
+            continue;
+        }
+        claims.push(alias.to_string());
+    }
+    claims
+}
+
+/// `value.identityClaims` is a derived persistence field used by MongoDB's
+/// unique multikey index. Computing it in the serializer keeps every typed
+/// writer (seed, create, candidate merge, publish) on the same invariant.
+impl Serialize for TaxonomyValue {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let identity_claims = taxonomy_identity_claims(&self.id, &self.aliases);
+        let mut state = serializer.serialize_struct("TaxonomyValue", 9)?;
+        state.serialize_field("id", &self.id)?;
+        state.serialize_field("displayName", &self.display_name)?;
+        state.serialize_field("description", &self.description)?;
+        state.serialize_field("aliases", &self.aliases)?;
+        state.serialize_field("identityClaims", &identity_claims)?;
+        state.serialize_field("status", &self.status)?;
+        state.serialize_field("priorityWeight", &self.priority_weight)?;
+        state.serialize_field("isTerminal", &self.is_terminal)?;
+        state.serialize_field("isReactivationTarget", &self.is_reactivation_target)?;
+        state.end()
+    }
 }
 
 /// agent-autonomy-loop W0：`taxonomy_candidates` 集合占位结构。
@@ -3152,8 +3635,9 @@ pub(crate) fn default_taxonomy_workspace_id() -> String {
 ///
 /// 模块 B「数字分身」识别联系人关系类型（customer / peer / friend）走保守闭环：
 /// LLM 产出建议 → 不直接生效 → 运营审核确认才回写 `contact`（画像保守红线）。
-/// 本结构是该链第一步的存储载体——同一 `(workspace_id, contact_id)` 只一条建议
-/// （索引 unique 幂等锚，重复观察累加 `occurrences` / 刷新 `last_seen_at`）。
+/// 本结构是该链第一步的存储载体——同一 `(workspace_id, contact_id)` 至多一条
+/// `pending` 建议（部分唯一索引作幂等锚，重复观察累加 `occurrences` / 刷新
+/// `last_seen_at`）；终态历史不占槽，后续新证据可开启下一审核周期。
 /// 仿 [`TaxonomyCandidate`] 的 snake_case BSON + serde default 形态。T6 写入信号、
 /// T8 建审核路由。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3223,6 +3707,10 @@ pub struct LlmCallLog {
     pub account_id: Option<String>,
     pub contact_wxid: Option<String>,
     pub run_id: Option<String>,
+    /// `live`, `shadow`, or another explicitly named diagnostic execution
+    /// mode. Legacy rows deserialize to an empty value.
+    #[serde(default)]
+    pub run_mode: String,
     pub prompt_key: String,
     pub model: String,
     pub status: String,
@@ -3232,6 +3720,12 @@ pub struct LlmCallLog {
     pub total_tokens: i64,
     pub prompt_cache_hit_tokens: i64,
     pub prompt_cache_miss_tokens: i64,
+    /// True only when the upstream returned usage data, or when this was a
+    /// cache hit whose zero upstream usage is known by construction. Missing
+    /// on legacy rows defaults to false; API projection also recognizes
+    /// legacy non-zero token rows as known.
+    #[serde(default)]
+    pub usage_known: bool,
     pub error: Option<String>,
     /// HP-4 / Task 11：本次调用前发生的重试次数（0 表示一次成功，max_retries-1 表示走完所有重试才成功/失败）。
     #[serde(default)]
@@ -3240,6 +3734,73 @@ pub struct LlmCallLog {
     #[serde(default)]
     pub final_status: Option<String>,
     pub created_at: DateTime,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GuideSkippedField {
+    pub field: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GuideAuthoritativeChange {
+    pub target: String,
+    pub field: String,
+    pub label: String,
+    pub before: Bson,
+    pub after: Bson,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GuideFrozenPlan {
+    pub contact_updated_at: DateTime,
+    pub memory_updated_at: DateTime,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub playbook_id: Option<ObjectId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub playbook_version: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain_config_id: Option<ObjectId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain_version: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain_updated_at: Option<DateTime>,
+    #[serde(default)]
+    pub contact_set: Document,
+    #[serde(default)]
+    pub contact_timestamp_fields: Vec<String>,
+    #[serde(default)]
+    pub memory_set: Document,
+    #[serde(default)]
+    pub memory_timestamp_fields: Vec<String>,
+    #[serde(default)]
+    pub playbook_set: Document,
+    #[serde(default)]
+    pub playbook_timestamp_fields: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain_runtime_parameters: Option<Document>,
+    #[serde(default)]
+    pub applied_fields: Vec<String>,
+    #[serde(default)]
+    pub skipped_fields: Vec<GuideSkippedField>,
+    #[serde(default)]
+    pub authoritative_changes: Vec<GuideAuthoritativeChange>,
+    #[serde(default)]
+    pub playbook_affected_contacts: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GuideApplyReceipt {
+    pub preview_id: ObjectId,
+    pub candidate_hash: String,
+    pub committed_at: DateTime,
+    #[serde(default)]
+    pub applied_fields: Vec<String>,
+    #[serde(default)]
+    pub skipped_fields: Vec<GuideSkippedField>,
+    pub impact_scope: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3266,6 +3827,16 @@ pub struct UserOperationGuidePreview {
     pub suggested_changes: Document,
     #[serde(default)]
     pub risk_warnings: Vec<String>,
+    /// Protocol v3 freezes the exact validated write plan and all directly
+    /// affected baselines. Legacy previews deserialize but cannot be applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frozen_plan: Option<GuideFrozenPlan>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_hash: Option<String>,
+    /// Written in the same transaction as the business mutations. A replay of
+    /// an already-applied preview returns this receipt without reapplying.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apply_receipt: Option<GuideApplyReceipt>,
     pub created_at: DateTime,
     pub updated_at: DateTime,
 }
@@ -3307,8 +3878,21 @@ pub struct AgentCommandRun {
     pub operator_message: String,
     pub status: String,
     pub plan: Option<Document>,
+    /// SHA-256 of the frozen ManagementPlan. Legacy commands without this
+    /// binding cannot be confirmed and must be planned again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_hash: Option<String>,
     pub summary: String,
     pub error: Option<String>,
+    /// Lease token for the process currently executing this command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_started_at: Option<DateTime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmed_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmed_at: Option<DateTime>,
     #[serde(default)]
     pub prompt_versions: Document,
     pub created_at: DateTime,
@@ -3322,19 +3906,36 @@ pub struct AgentToolCall {
     pub workspace_id: String,
     pub account_id: String,
     pub command_run_id: ObjectId,
+    /// Stable per-command call identity. A partial unique index prevents a
+    /// retry or recovery pass from creating a second side-effect intent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent_key: Option<String>,
+    #[serde(default)]
+    pub call_index: i32,
     pub tool_name: String,
     pub arguments: Document,
     pub status: String,
     pub response: Option<Document>,
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_started_at: Option<DateTime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finalized_at: Option<DateTime>,
     pub created_at: DateTime,
     pub updated_at: DateTime,
 }
 
 /// `AgentToolCall.status` 合法闭集（管理 agent 工具调用终态）。
 /// executed_unverified：已执行但业务结果无法核实（spec §3.3，诚实优于好看）。
-pub const ALLOWED_TOOL_CALL_STATUS: &[&str] =
-    &["running", "dry_run", "succeeded", "failed", "executed_unverified"];
+pub const ALLOWED_TOOL_CALL_STATUS: &[&str] = &[
+    "prepared",
+    "executing",
+    "dry_run",
+    "succeeded",
+    "failed",
+    "executed_unverified",
+    "execution_unknown",
+];
 
 /// `agent_tool_calls.status` 写入站点闭集断言。命中闭集外值 panic(debug) / tracing::error!(release)。
 #[track_caller]
@@ -3379,6 +3980,12 @@ pub struct AgentOutcomeMetric {
     pub daily_run_count: i64,
     #[serde(default)]
     pub daily_run_token_total: i64,
+    /// 产生本次投影的 AgentTask。旧文档缺失时为 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_task_id: Option<ObjectId>,
+    /// 目标文档上的单调 fencing generation：更旧的 task owner 不得覆盖更新结果。
+    #[serde(default)]
+    pub source_task_claim_generation: i64,
     pub created_at: DateTime,
 }
 
@@ -3418,6 +4025,7 @@ fn default_evaluation_scenario_status() -> String {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EnableAgentRequest {
+    pub expected_account_id: String,
     pub human_profile_note: String,
     pub playbook_id: Option<String>,
 }
@@ -3425,6 +4033,8 @@ pub struct EnableAgentRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BatchEnableCandidate {
+    #[serde(default)]
+    pub contact_id: Option<String>,
     pub wxid: String,
     #[serde(default)]
     pub nickname: Option<String>,
@@ -3440,6 +4050,7 @@ pub struct BatchEnableCandidate {
 #[serde(rename_all = "camelCase")]
 pub struct BatchEnableRequest {
     pub account_id: String,
+    pub source: String,
     pub candidates: Vec<BatchEnableCandidate>,
     pub shared_note: String,
     #[serde(default)]
@@ -3449,6 +4060,7 @@ pub struct BatchEnableRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProfileNoteRequest {
+    pub expected_account_id: String,
     pub human_profile_note: String,
 }
 
@@ -3458,6 +4070,7 @@ pub struct ProfileNoteRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CustomAgentInstructionsRequest {
+    pub expected_account_id: String,
     #[serde(default)]
     pub instructions: String,
 }
@@ -3552,6 +4165,12 @@ pub struct ApiContact {
     pub personality_profile: Option<ApiPersonalityProfile>,
     pub domain_attributes: Option<Document>,
     pub domain_attributes_updated_at: Option<String>,
+    /// Planner-facing stagnation facts. These three fields are projected from
+    /// the same domain dimension and timestamp that drive planner selection;
+    /// clients must not infer them from the container-level updated_at.
+    pub stagnation_dimension: String,
+    pub stagnation_value: Option<String>,
+    pub stagnation_updated_at: Option<String>,
     pub commitments: Vec<ApiCommitment>,
     pub follow_up_policy: Option<String>,
     pub operation_state: Option<String>,
@@ -3575,7 +4194,7 @@ pub struct ApiContact {
 
 impl From<Contact> for ApiContact {
     fn from(contact: Contact) -> Self {
-        Self {
+        let mut api = Self {
             id: contact.id.map(|id| id.to_hex()).unwrap_or_default(),
             workspace_id: contact.workspace_id,
             account_id: contact.account_id,
@@ -3616,7 +4235,14 @@ impl From<Contact> for ApiContact {
             domain_attributes_updated_at: contact
                 .domain_attributes_updated_at
                 .and_then(dt_to_string),
-            commitments: contact.commitments.iter().map(ApiCommitment::from).collect(),
+            stagnation_dimension: "customer_stage".to_string(),
+            stagnation_value: None,
+            stagnation_updated_at: None,
+            commitments: contact
+                .commitments
+                .iter()
+                .map(ApiCommitment::from)
+                .collect(),
             follow_up_policy: contact.follow_up_policy,
             operation_state: contact.operation_state,
             operation_state_reason: contact.operation_state_reason,
@@ -3633,7 +4259,41 @@ impl From<Contact> for ApiContact {
             // From<Contact> 无 DB 访问，真实预览由 list_contacts 查询后单独填充。
             last_inbound_preview: None,
             updated_at: dt_to_string(contact.updated_at).unwrap_or_default(),
-        }
+        };
+        api.apply_stagnation_dimension("customer_stage");
+        api
+    }
+}
+
+impl ApiContact {
+    /// Project the exact dimension/value/timestamp used by Planner stagnation
+    /// logic. Custom dimensions fall back to the legacy customer-stage clock
+    /// for existing contacts, matching planner::contact_stagnation_updated_at.
+    pub fn apply_stagnation_dimension(&mut self, dimension: &str) {
+        let dimension = match dimension.trim() {
+            "" => "customer_stage",
+            value => value,
+        };
+        self.stagnation_dimension = dimension.to_string();
+        self.stagnation_value = self
+            .domain_attributes
+            .as_ref()
+            .and_then(|attributes| attributes.get_str(dimension).ok())
+            .map(str::to_string);
+        let timestamp_key = format!("{dimension}_updated_at");
+        self.stagnation_updated_at = self
+            .domain_attributes
+            .as_ref()
+            .and_then(|attributes| attributes.get_datetime(&timestamp_key).ok().copied())
+            .or_else(|| {
+                self.domain_attributes.as_ref().and_then(|attributes| {
+                    attributes
+                        .get_datetime("customer_stage_updated_at")
+                        .ok()
+                        .copied()
+                })
+            })
+            .and_then(dt_to_string);
     }
 }
 
@@ -3641,13 +4301,49 @@ pub fn dt_to_string(dt: DateTime) -> Option<String> {
     dt.try_to_rfc3339_string().ok()
 }
 
-/// 请示台账状态闭集。pending=已推送领导待回；resolved=真人已裁决并已起 relay。
+/// 请示台账状态闭集。pending=当前领导卡已送达或正在可靠投递；resolved=真人已裁决，
+/// 且新协议已在同行持久化 relay intent；delivery_failed=领导卡可靠重试耗尽，已释放
+/// pending 去重槽并保留审计历史。
 pub const PRINCIPAL_ESCALATION_STATUS_PENDING: &str = "pending";
 pub const PRINCIPAL_ESCALATION_STATUS_RESOLVED: &str = "resolved";
+pub const PRINCIPAL_ESCALATION_STATUS_DELIVERY_FAILED: &str = "delivery_failed";
 pub const ALLOWED_PRINCIPAL_ESCALATION_STATUS: &[&str] = &[
     PRINCIPAL_ESCALATION_STATUS_PENDING,
     PRINCIPAL_ESCALATION_STATUS_RESOLVED,
+    PRINCIPAL_ESCALATION_STATUS_DELIVERY_FAILED,
 ];
+
+pub const PRINCIPAL_RELAY_STATE_PENDING: &str = "pending";
+pub const PRINCIPAL_RELAY_STATE_ENQUEUED: &str = "enqueued";
+pub const PRINCIPAL_RELAY_STATE_TERMINAL: &str = "terminal";
+
+pub const PRINCIPAL_CARD_DELIVERY_PENDING_ENQUEUE: &str = "pending_enqueue";
+pub const PRINCIPAL_CARD_DELIVERY_QUEUED: &str = "queued";
+pub const PRINCIPAL_CARD_DELIVERY_SENT: &str = "sent";
+pub const PRINCIPAL_CARD_DELIVERY_FAILED_TERMINAL: &str = "failed_terminal";
+pub const PRINCIPAL_CARD_DELIVERY_UNKNOWN: &str = "delivery_unknown";
+
+/// Immutable policy identity plus the mutable delivery cursor for one
+/// escalation. Keeping this on the escalation row prevents timeout workers
+/// from guessing a later current config and gives each re-assignment a
+/// single-document generation CAS.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrincipalEscalationProtocol {
+    pub domain: String,
+    pub policy_version: i32,
+    pub policy: AskHumanPolicy,
+    pub principal_account_id: String,
+    #[serde(default)]
+    pub delivery_generation: i64,
+    pub delivery_state: String,
+    pub delivery_content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_outbox_id: Option<ObjectId>,
+    /// `delivery_failed` 后清理联系人 awaiting 标记的 durable acknowledgement。
+    /// 清理先执行、此字段后写；进程中断时 reconciler 可安全重试。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_cleanup_completed_at: Option<DateTime>,
+}
 
 /// 请示触发的三类边界（实质驱动）。
 pub const ESCALATION_CATEGORY_OUT_OF_SCOPE: &str = "out_of_scope_decision";
@@ -3663,6 +4359,10 @@ pub const ALLOWED_ESCALATION_CATEGORY: &[&str] = &[
 /// admin 看板据此显示「等待中」；等待期 pre-check 据此识别。统一占位模型下这只是可观测标记，
 /// 不是 hold category——触发请示的 run 本身是 Approved，占位已正常发出。
 pub const AWAITING_PRINCIPAL_DECISION_ATTR: &str = "awaiting_principal_decision";
+/// Durable per-escalation ownership behind the coarse awaiting boolean. New protocol
+/// transitions add/remove only their own stable escalation id, so concurrent create and
+/// terminal transitions cannot clear another request's marker.
+pub const AWAITING_PRINCIPAL_DECISION_IDS_ATTR: &str = "awaiting_principal_decision_ids";
 
 /// A 类领导授权豁免记录挂在 Contact.domain_attributes 的这个 key（doc-only 子文档）。
 /// 领导针对该客户授权后写入 `{ granted: true, ... }`；R5.4 产品门据此并联放行该客户的
@@ -3757,7 +4457,7 @@ pub struct AgentPrincipalEscalation {
     pub contact_wxid: String,
     /// 人类可读短码，如 "E1A2"。全局唯一。
     pub short_code: String,
-    /// pending / resolved，见 ALLOWED_PRINCIPAL_ESCALATION_STATUS。
+    /// pending / resolved / delivery_failed，见 ALLOWED_PRINCIPAL_ESCALATION_STATUS。
     pub status: String,
     /// 三类触发之一，见 ALLOWED_ESCALATION_CATEGORY。
     pub category: String,
@@ -3767,6 +4467,11 @@ pub struct AgentPrincipalEscalation {
     pub question_for_principal: String,
     /// 推给领导的 wxid（= 该 workspace 的 principal_decider）。
     pub principal_wxid: String,
+    /// New-protocol rows freeze domain/policy/account identity and the card
+    /// delivery generation here. Legacy rows remain readable as None and are
+    /// deliberately not auto-routed by the timeout scanner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<PrincipalEscalationProtocol>,
     /// resolved 时填：真人裁决解读结果。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision: Option<PrincipalDecision>,
@@ -3796,6 +4501,23 @@ pub struct AgentPrincipalEscalation {
     /// 裁决来源审计："wechat"（领导微信回复）/ "admin"（管理员在后台直接裁决）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_via: Option<String>,
+    /// Durable relay intent state for new-protocol resolutions: pending / enqueued / terminal.
+    /// Legacy resolved rows omit this field and are intentionally not guessed or replayed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_state: Option<String>,
+    /// Deterministic AgentTask id materialized from this escalation's `_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_task_id: Option<ObjectId>,
+    /// Time at which the durable intent was confirmed as an AgentTask.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_enqueued_at: Option<DateTime>,
+    /// Time at which customer waiting ended, either because the relay was confirmed delivered
+    /// or because its authorization expired and the neutral close-out path took ownership.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_terminal_at: Option<DateTime>,
+    /// Stable audit reason such as `delivered` or `authorization_expired`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_terminal_reason: Option<String>,
 }
 
 // LP-12 / Task 21：核心 Document 字段的强类型版本。
@@ -4311,10 +5033,16 @@ mod typed {
                 }
             }
             if !(0..=10).contains(&self.confidence) {
-                errors.push(format!("memory_fact_confidence_out_of_range:{}", self.confidence));
+                errors.push(format!(
+                    "memory_fact_confidence_out_of_range:{}",
+                    self.confidence
+                ));
             }
             if !(0..=10).contains(&self.importance) {
-                errors.push(format!("memory_fact_importance_out_of_range:{}", self.importance));
+                errors.push(format!(
+                    "memory_fact_importance_out_of_range:{}",
+                    self.importance
+                ));
             }
             if let Some(reason) = &self.deprecation_reason {
                 let reason_len = reason.chars().count();
@@ -4657,7 +5385,11 @@ mod typed {
             };
             assert_eq!(
                 card.live_dimension_names(),
-                vec!["孩子年龄".to_string(), "预算".to_string(), "决策角色".to_string()]
+                vec![
+                    "孩子年龄".to_string(),
+                    "预算".to_string(),
+                    "决策角色".to_string()
+                ]
             );
         }
 
@@ -4775,6 +5507,13 @@ pub struct Proposal {
     #[serde(default)]
     pub expected_improvement_on: Vec<String>,
     pub risk_note: Option<String>,
+    /// Immutable identity of the configuration evaluated by this proposal.
+    /// Missing legacy candidates are intentionally not releasable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_revision: Option<String>,
+    /// Immutable identity of the artifact created at release time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub released_revision: Option<String>,
     /// release 路径回滚专用：被替换的旧 prompt 版本号（rollback 取回它）。
     pub previous_prompt_version: Option<String>,
     /// 显著性测试结果（design.md §4.6）。
@@ -4842,6 +5581,16 @@ pub struct ThresholdOverride {
     pub gate_key: String,
     pub value: f64,
     pub source_proposal_id: ObjectId,
+    /// Proposal baseline consumed to create this successor override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_revision: Option<String>,
+    /// Immutable identity of this released override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub released_revision: Option<String>,
+    /// Administrative current pointer. Historical rows remain append-only;
+    /// a partial unique index permits at most one true row per scoped gate.
+    #[serde(default)]
+    pub current_version: bool,
     pub released_at: DateTime,
     pub released_by: String,
     pub rolled_back_at: Option<DateTime>,
@@ -4968,6 +5717,24 @@ pub struct KnowledgeDailyReport {
     /// 本次合成用到的 prompt 版本号；查问题用。
     #[serde(default)]
     pub prompt_versions: Document,
+    /// Monotonic generation assigned when a digest attempt starts. Finalize
+    /// must match this value so a late attempt cannot overwrite a newer one.
+    #[serde(default)]
+    pub attempt_generation: i64,
+    /// Generation that produced the currently visible successful snapshot.
+    #[serde(default)]
+    pub current_generation: i64,
+    /// Outcome of the latest attempt, independent from the visible snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_attempt_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_attempt_error_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_attempt_at: Option<DateTime>,
+    #[serde(default)]
+    pub latest_attempt_budget_snapshot: Document,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_success_at: Option<DateTime>,
 }
 
 /// `KnowledgeChatTask.status` 的封闭枚举。任何 DB 写入若不属于该集合应被拒绝。
@@ -4984,17 +5751,31 @@ pub struct KnowledgeChatTask {
     pub workspace_id: String,
     pub account_id: String,
     pub session_id: String,
+    /// 创建任务的已认证管理员。新任务必须携带；历史任务缺失时保持 None，
+    /// 不会被新的管理员任务查询入口枚举或操作。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_admin_id: Option<String>,
     pub operator_id: Option<String>,
     /// 任务起源 cards 快照（运营勾的那批；不动 `knowledge_daily_reports`）。
     #[serde(default)]
     pub cards: Vec<KnowledgeDigestCard>,
-    /// `[{cardId, action, targetChunkId?, hint?}]`，由
-    /// `knowledge.digest.dispatch` LLM 拆出，后端校验后落库。
+    /// SR-125：运营确认时的服务端绑定，包含 report/card hash、候选 hash
+    /// 与可选 source turn。历史任务缺失时保持 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_binding: Option<Document>,
+    /// `[{cardId, action, targetChunkId?, hint?}]`。新任务由服务端从已绑定
+    /// digest cards 重建；LLM/客户端字段不得覆盖 action 或 target。
     #[serde(default)]
     pub planned_steps: Vec<Document>,
-    /// `[{cardId, action, chunkId?, error?}]`，worker 每完成一步追加。
+    /// `[{cardId, action, status, chunkId?, error?}]`，worker 每完成一步追加；
+    /// `status` 闭集为 `committed|noop|needs_manual|failed`，不得用 Rust `Ok` 冒充成功。
     #[serde(default)]
     pub completed_steps: Vec<Document>,
+    /// Prepared mutation payloads keyed by stable `stepId`. Expensive or
+    /// nondeterministic preparation is persisted before a side effect so a
+    /// reclaimed worker replays the same intent.
+    #[serde(default)]
+    pub step_intents: Vec<Document>,
     /// `pending` / `running` / `completed` / `failed` / `cancelled`。封闭枚举，
     /// 见 [`ALLOWED_TASK_STATUS`]。历史值 `"finished"` 已被 P2-12 重命名为
     /// `"completed"`：与 outbox / evolution 的 `"completed"` / `"failed"` 终态语义对齐，
@@ -5003,6 +5784,19 @@ pub struct KnowledgeChatTask {
     /// 失败时的错误分类。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_kind: Option<String>,
+    /// Claim/reclaim audit count and fencing generation.
+    #[serde(default)]
+    pub attempts: i32,
+    #[serde(default)]
+    pub claim_generation: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locked_until: Option<DateTime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heartbeat_at: Option<DateTime>,
     pub created_at: DateTime,
     pub started_at: Option<DateTime>,
     pub finished_at: Option<DateTime>,
@@ -5023,6 +5817,14 @@ pub struct KnowledgeOperatorMemory {
     pub created_at: DateTime,
     pub last_used_at: DateTime,
     pub expires_at: Option<DateTime>,
+    /// Soft-revocation audit fields. Revoked rows remain queryable for audit but
+    /// must never be injected into an Agent prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked_at: Option<DateTime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revocation_reason: Option<String>,
 }
 
 /// LLM 服务商配置。一个 workspace 可以同时存在多条记录，但只有一条 `is_active=true`
@@ -5097,7 +5899,8 @@ mod typed_tests {
 
     #[test]
     fn intent_trajectory_entry_legacy_objection_round_trips() {
-        let legacy = mongodb::bson::doc! { "turnIndex": 3, "intent": "advance", "objectionType": "price" };
+        let legacy =
+            mongodb::bson::doc! { "turnIndex": 3, "intent": "advance", "objectionType": "price" };
         let e: IntentTrajectoryEntry = mongodb::bson::from_document(legacy).unwrap();
         assert_eq!(e.objection_type.as_deref(), Some("price"));
         assert!(e.dimensions.is_empty(), "老数据 dimensions 默认空");
@@ -5168,8 +5971,7 @@ mod typed_tests {
     #[test]
     fn runtime_parameters_typed_reads_escalated_budget() {
         let doc = doc! { "runTokenBudgetEscalated": 120000_i64 };
-        let p: RuntimeParametersTyped =
-            mongodb::bson::from_document(doc).expect("deserialize");
+        let p: RuntimeParametersTyped = mongodb::bson::from_document(doc).expect("deserialize");
         assert_eq!(p.run_token_budget_escalated, 120000);
     }
 
@@ -5481,7 +6283,11 @@ mod typed_tests {
             MemoryFactRepr::Plain(_) => panic!("Structured 应原样保留"),
         }
         // 二次调用应返回 0（幂等）。
-        assert_eq!(card.auto_upgrade_plain_facts(), 0, "幂等：第二次升级应当 0 条");
+        assert_eq!(
+            card.auto_upgrade_plain_facts(),
+            0,
+            "幂等：第二次升级应当 0 条"
+        );
     }
 
     #[test]
@@ -5534,6 +6340,8 @@ mod typed_tests {
             agent_block_rate: None,
             daily_run_count: 0,
             daily_run_token_total: 0,
+            source_task_id: None,
+            source_task_claim_generation: 0,
             created_at: DateTime::now(),
         };
         // BSON round-trip 保持 None。
@@ -5678,6 +6486,12 @@ mod typed_tests {
             next_retry_at: None,
             worker_id: None,
             locked_until: None,
+            claim_token: None,
+            claim_generation: 0,
+            cancel_requested: false,
+            cancel_requested_at: None,
+            send_started_at: None,
+            task_send_authorization_token: None,
             reclaimed_in_flight: false,
             reclaim_count: 0,
             created_at: now,
@@ -5842,7 +6656,10 @@ mod typed_tests {
         let doc = mongodb::bson::to_document(&signal).expect("serialize SuspectedDealSignal");
         assert_eq!(doc.get_str("workspace_id").unwrap(), "ws-1");
         assert_eq!(doc.get_str("account_id").unwrap(), "acc-1");
-        assert_eq!(doc.get_str("contact_id").unwrap(), "507f1f77bcf86cd799439011");
+        assert_eq!(
+            doc.get_str("contact_id").unwrap(),
+            "507f1f77bcf86cd799439011"
+        );
         assert_eq!(doc.get_str("value").unwrap(), "疑似成交·待核实");
         assert_eq!(doc.get_str("status").unwrap(), "pending");
         assert_eq!(doc.get_i32("confidence").unwrap(), 75);
@@ -5891,8 +6708,7 @@ mod typed_tests {
         assert_eq!(doc.get_str("experiment_id").unwrap(), "exp_2026_05_001");
         assert_eq!(doc.get_str("status").unwrap(), "collecting");
         assert_eq!(doc.get_i32("window_hours").unwrap(), 72);
-        let parsed: Experiment =
-            mongodb::bson::from_document(doc).expect("deserialize Experiment");
+        let parsed: Experiment = mongodb::bson::from_document(doc).expect("deserialize Experiment");
         assert_eq!(parsed.experiment_id, exp.experiment_id);
         assert_eq!(parsed.cohort_threshold_run_ids.len(), 1);
         assert!(parsed.cohort_prompt_run_ids.is_empty());
@@ -5920,6 +6736,8 @@ mod typed_tests {
             critic_reasoning: None,
             expected_improvement_on: vec![],
             risk_note: None,
+            base_revision: Some("threshold-v1:baseline:4018000000000000".to_string()),
+            released_revision: None,
             previous_prompt_version: None,
             eval_metrics: doc! {},
             eval_replays_completed: 0,
@@ -5939,8 +6757,7 @@ mod typed_tests {
         assert_eq!(doc.get_f64("current_value").unwrap(), 6.0);
         let cohort = doc.get_document("cohort_notes").unwrap();
         assert_eq!(cohort.get_f64("hit_rate_observed").unwrap(), 0.42);
-        let parsed: Proposal =
-            mongodb::bson::from_document(doc).expect("deserialize Proposal");
+        let parsed: Proposal = mongodb::bson::from_document(doc).expect("deserialize Proposal");
         assert_eq!(parsed.proposed_value, Some(7.0));
         assert!(parsed.proposed_template_key.is_none());
     }
@@ -5963,9 +6780,17 @@ mod typed_tests {
             proposed_section: Some("policy".to_string()),
             diff_summary: Some("强化 product fact-check 兜底语句".to_string()),
             diff_snippet: Some("…在引用产品参数前必须确认 knowledge chunk…".to_string()),
-            critic_reasoning: Some("过去 30 条失败 cohort 中 12 条触发 fact_risk_block".to_string()),
+            critic_reasoning: Some(
+                "过去 30 条失败 cohort 中 12 条触发 fact_risk_block".to_string(),
+            ),
             expected_improvement_on: vec!["blocked_unverified_product_claim".to_string()],
             risk_note: None,
+            base_revision: Some(format!(
+                "prompt-v1:{}:3:{}",
+                mongodb::bson::oid::ObjectId::new().to_hex(),
+                "a".repeat(64)
+            )),
+            released_revision: None,
             previous_prompt_version: Some("v3".to_string()),
             eval_metrics: doc! {},
             eval_replays_completed: 0,
@@ -5982,9 +6807,11 @@ mod typed_tests {
         let doc = mongodb::bson::to_document(&p).expect("serialize Proposal");
         assert_eq!(doc.get_str("proposal_kind").unwrap(), "prompt");
         assert_eq!(doc.get_str("proposed_section").unwrap(), "policy");
-        let parsed: Proposal =
-            mongodb::bson::from_document(doc).expect("deserialize Proposal");
-        assert_eq!(parsed.proposed_template_key.as_deref(), Some("reply_agent_main"));
+        let parsed: Proposal = mongodb::bson::from_document(doc).expect("deserialize Proposal");
+        assert_eq!(
+            parsed.proposed_template_key.as_deref(),
+            Some("reply_agent_main")
+        );
         assert_eq!(parsed.expected_improvement_on.len(), 1);
         assert_eq!(parsed.previous_prompt_version.as_deref(), Some("v3"));
     }
@@ -6037,6 +6864,12 @@ mod typed_tests {
             gate_key: "human_like_score_rewrite".to_string(),
             value: 6.5,
             source_proposal_id: proposal_id,
+            base_revision: Some("threshold-v1:baseline:4018000000000000".to_string()),
+            released_revision: Some(format!(
+                "threshold-v1:{}:401a000000000000",
+                proposal_id.to_hex()
+            )),
+            current_version: true,
             released_at: now,
             released_by: "admin@local".to_string(),
             rolled_back_at: None,
@@ -6086,8 +6919,10 @@ mod typed_tests {
     #[test]
     fn m4_migration_id_is_after_2026_05_009() {
         // `0` (0x30) < `M` (0x4D)：`2026_05_009...` < `2026_05_M4_001...`。
-        assert!("2026_05_009_contact_customer_stage_updated_at_backfill"
-            < "2026_05_M4_001_prompt_template_versioned");
+        assert!(
+            "2026_05_009_contact_customer_stage_updated_at_backfill"
+                < "2026_05_M4_001_prompt_template_versioned"
+        );
     }
 
     /// knowledge-wiki Phase A：旧 chunk 文档（无 wiki_type / domain_attributes /
@@ -6216,12 +7051,15 @@ mod typed_tests {
         let now = DateTime::now();
         let rev = ChunkRevision {
             id: None,
+            workspace_id: "ws_test".to_string(),
             chunk_id: "chk_x".to_string(),
             revision_id: "rev_chk_x_001".to_string(),
             op: "patch".to_string(),
             patch: doc! { "summary": "new" },
             before_hash: "h_before".to_string(),
             after_hash: "h_after".to_string(),
+            before_snapshot: Some(doc! { "summary": "old" }),
+            after_snapshot: Some(doc! { "summary": "new" }),
             source: "ai".to_string(),
             reason: Some("补出处".to_string()),
             created_at: now,
@@ -6229,10 +7067,18 @@ mod typed_tests {
         };
         let doc = mongodb::bson::to_document(&rev).expect("serialize ChunkRevision");
         assert_eq!(doc.get_str("op").unwrap(), "patch");
+        assert_eq!(doc.get_str("workspace_id").unwrap(), "ws_test");
         let parsed: ChunkRevision =
             mongodb::bson::from_document(doc).expect("deserialize ChunkRevision");
         assert_eq!(parsed.revision_id, "rev_chk_x_001");
         assert_eq!(parsed.source, "ai");
+        assert_eq!(
+            parsed
+                .before_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.get_str("summary").ok()),
+            Some("old")
+        );
     }
 
     #[test]
@@ -6256,8 +7102,7 @@ mod typed_tests {
             resolved_at: None,
         };
         let doc = mongodb::bson::to_document(&sig).expect("serialize");
-        let parsed: KnowledgeGapSignal =
-            mongodb::bson::from_document(doc).expect("deserialize");
+        let parsed: KnowledgeGapSignal = mongodb::bson::from_document(doc).expect("deserialize");
         assert_eq!(parsed.kind, "broken_link");
         assert_eq!(parsed.affected_chunk_ids.len(), 2);
     }
@@ -6317,6 +7162,8 @@ mod typed_tests {
             mongodb::bson::from_document(raw).expect("legacy doc deserialize");
         assert!(d.catalog_summary_persisted.is_none());
         assert!(d.catalog_version.is_none());
+        assert_eq!(d.catalog_desired_generation, 0);
+        assert_eq!(d.catalog_applied_generation, 0);
     }
 }
 
@@ -6328,14 +7175,19 @@ mod principal_escalation_model_tests {
     fn principal_escalation_status_closed_set_is_self_consistent() {
         assert!(ALLOWED_PRINCIPAL_ESCALATION_STATUS.contains(&PRINCIPAL_ESCALATION_STATUS_PENDING));
         assert!(ALLOWED_PRINCIPAL_ESCALATION_STATUS.contains(&PRINCIPAL_ESCALATION_STATUS_RESOLVED));
-        assert_eq!(ALLOWED_PRINCIPAL_ESCALATION_STATUS.len(), 2);
+        assert!(ALLOWED_PRINCIPAL_ESCALATION_STATUS
+            .contains(&PRINCIPAL_ESCALATION_STATUS_DELIVERY_FAILED));
+        assert_eq!(ALLOWED_PRINCIPAL_ESCALATION_STATUS.len(), 3);
     }
 
     #[test]
     fn awaiting_principal_decision_attr_key_is_stable() {
         // set（Task 18 apply_agent_updates）与 unset（Task 16 clear_awaiting_principal_state）
         // 必须用同一个 key，否则等待标记清不掉。锁死常量值防回归。
-        assert_eq!(AWAITING_PRINCIPAL_DECISION_ATTR, "awaiting_principal_decision");
+        assert_eq!(
+            AWAITING_PRINCIPAL_DECISION_ATTR,
+            "awaiting_principal_decision"
+        );
     }
 
     #[test]
@@ -6398,7 +7250,11 @@ mod objective_purchase_facts_model_tests {
         }"#;
         let ev: OutcomeEvent = serde_json::from_str(legacy).expect("legacy doc should deserialize");
         assert_eq!(ev.verification, "staff_confirmed");
-        assert_eq!(ev.amount, Some(19900), "金额是最小币种单位整数（分），19900=¥199.00");
+        assert_eq!(
+            ev.amount,
+            Some(19900),
+            "金额是最小币种单位整数（分），19900=¥199.00"
+        );
         assert!(ev.product_ref.is_none());
         // §4.5：旧文档无 event_kind → 缺省 deal（正向成交），退款逆转语义不影响存量。
         assert_eq!(ev.event_kind, "deal");
@@ -6584,7 +7440,9 @@ mod content_asset_compat_tests {
             file_path: Some("ws1/ab/abcd.xlsx".into()),
             file_name: Some("产品报价单.xlsx".into()),
             file_size: Some(20480),
-            mime_type: Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet".into()),
+            mime_type: Some(
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet".into(),
+            ),
             file_sha256: Some("abcd".into()),
             sendable: Some(true),
             send_trigger_hint: Some("客户问价格时发".into()),
@@ -6607,7 +7465,7 @@ mod content_asset_compat_tests {
 
 #[cfg(test)]
 mod referral_card_compat_tests {
-    use super::{ReferralCard, OperationDomainConfig};
+    use super::{OperationDomainConfig, ReferralCard};
     use mongodb::bson::{doc, DateTime};
 
     #[test]
@@ -6676,6 +7534,7 @@ mod send_ledger_compat_tests {
     fn ledger_roundtrips() {
         let row = AgentSendLedger {
             id: None,
+            outbox_id: Some(mongodb::bson::oid::ObjectId::new()),
             workspace_id: "ws1".into(),
             account_id: "acct1".into(),
             contact_wxid: "wxid_cust".into(),
@@ -6706,8 +7565,8 @@ mod send_ledger_compat_tests {
             "send_kind": "namecard", "target_id": "c1", "target_title": "张顾问",
             "run_id": "r1", "sent_at": DateTime::now(),
         };
-        let row: AgentSendLedger = mongodb::bson::from_document(legacy)
-            .expect("legacy ledger row must deserialize");
+        let row: AgentSendLedger =
+            mongodb::bson::from_document(legacy).expect("legacy ledger row must deserialize");
         assert_eq!(row.send_kind, "namecard");
         assert!(row.responded.is_none());
         assert!(row.outcome_evaluated_at.is_none());
@@ -6753,6 +7612,7 @@ mod tag_trust_tests {
             locked: true,
             history: vec![BayesianPoint {
                 turn: 3,
+                source_run_id: Some("run-3".to_string()),
                 value: "高".to_string(),
                 confidence: 0.7,
                 value_changed: false,
@@ -6803,13 +7663,85 @@ mod tag_trust_tests {
         let c: Contact = bson::from_document(minimal_doc).expect("deserialize minimal contact");
 
         // 验证新字段取默认值
-        assert!(c.manual_tags.is_empty(), "manual_tags should default to empty Vec");
-        assert!(c.manual_tags_updated_at.is_none(), "manual_tags_updated_at should default to None");
-        assert!(c.manual_tags_by.is_none(), "manual_tags_by should default to None");
-        assert!(c.confirmed_tags.is_empty(), "confirmed_tags should default to empty Vec");
-        assert!(c.bayesian_signals.is_empty(), "bayesian_signals should default to empty Vec");
-        assert!(c.personality_profile.is_none(), "personality_profile should default to None");
+        assert!(
+            c.manual_tags.is_empty(),
+            "manual_tags should default to empty Vec"
+        );
+        assert!(
+            c.manual_tags_updated_at.is_none(),
+            "manual_tags_updated_at should default to None"
+        );
+        assert!(
+            c.manual_tags_by.is_none(),
+            "manual_tags_by should default to None"
+        );
+        assert!(
+            c.confirmed_tags.is_empty(),
+            "confirmed_tags should default to empty Vec"
+        );
+        assert!(
+            c.bayesian_signals.is_empty(),
+            "bayesian_signals should default to empty Vec"
+        );
+        assert!(
+            c.personality_profile.is_none(),
+            "personality_profile should default to None"
+        );
         assert_eq!(c.tags_version, 0, "tags_version should default to 0");
+    }
+
+    #[test]
+    fn api_contact_projects_planner_stagnation_facts() {
+        use mongodb::bson::{doc, DateTime};
+
+        let minimal_doc = doc! {
+            "_id": bson::oid::ObjectId::new(),
+            "workspace_id": "ws_test",
+            "account_id": "acc_test",
+            "wxid": "wxid_test",
+            "agent_status": "normal",
+            "domain_attributes": {
+                "customer_stage": "need_discovery",
+                "customer_stage_updated_at": DateTime::from_millis(1_000),
+                "relationship_closeness": "trusted",
+                "relationship_closeness_updated_at": DateTime::from_millis(2_000),
+            },
+            "domain_attributes_updated_at": DateTime::from_millis(9_000),
+            "created_at": DateTime::now(),
+            "updated_at": DateTime::now(),
+        };
+        let contact: Contact =
+            bson::from_document(minimal_doc).expect("deserialize contact with dimensions");
+        let mut api = ApiContact::from(contact);
+
+        assert_eq!(api.stagnation_dimension, "customer_stage");
+        assert_eq!(api.stagnation_value.as_deref(), Some("need_discovery"));
+        assert_eq!(
+            api.stagnation_updated_at,
+            dt_to_string(DateTime::from_millis(1_000))
+        );
+
+        api.apply_stagnation_dimension("relationship_closeness");
+        assert_eq!(api.stagnation_dimension, "relationship_closeness");
+        assert_eq!(api.stagnation_value.as_deref(), Some("trusted"));
+        assert_eq!(
+            api.stagnation_updated_at,
+            dt_to_string(DateTime::from_millis(2_000))
+        );
+
+        if let Some(attributes) = api.domain_attributes.as_mut() {
+            attributes.remove("relationship_closeness_updated_at");
+        }
+        api.apply_stagnation_dimension("relationship_closeness");
+        assert_eq!(
+            api.stagnation_updated_at,
+            dt_to_string(DateTime::from_millis(1_000)),
+            "legacy contacts must use the same customer-stage clock fallback as Planner"
+        );
+        assert_ne!(
+            api.stagnation_updated_at, api.domain_attributes_updated_at,
+            "container updates must never masquerade as stagnation changes"
+        );
     }
 
     #[test]
@@ -6828,8 +7760,7 @@ mod tag_trust_tests {
             "created_at": DateTime::now(),
             "updated_at": DateTime::now(),
         };
-        let mut c: Contact =
-            bson::from_document(minimal_doc).expect("deserialize minimal contact");
+        let mut c: Contact = bson::from_document(minimal_doc).expect("deserialize minimal contact");
         c.manual_tags = vec!["VIP".to_string(), "价格敏感".to_string()];
         c.confirmed_tags = vec![ConfirmedTag {
             value: "价格敏感".to_string(),
@@ -6844,18 +7775,32 @@ mod tag_trust_tests {
         let api = ApiContact::from(c);
 
         // manual 的 "VIP" 与 confirmed 的 "价格敏感" 都应出现在合并 tags 中。
-        assert!(api.tags.contains(&"VIP".to_string()), "merged tags should include manual VIP");
+        assert!(
+            api.tags.contains(&"VIP".to_string()),
+            "merged tags should include manual VIP"
+        );
         assert!(
             api.tags.contains(&"价格敏感".to_string()),
             "merged tags should include confirmed value 价格敏感"
         );
         // manual 已含 "价格敏感"，confirmed 同值不应重复 → 合并后只 2 个。
-        assert_eq!(api.tags.len(), 2, "duplicate confirmed value must not be appended twice");
+        assert_eq!(
+            api.tags.len(),
+            2,
+            "duplicate confirmed value must not be appended twice"
+        );
         // manual 在前，保序。
-        assert_eq!(api.tags[0], "VIP", "manual tags should come first in merged order");
+        assert_eq!(
+            api.tags[0], "VIP",
+            "manual tags should come first in merged order"
+        );
 
         // confirmed_tags 单独投影：长度 1，value 正确。
-        assert_eq!(api.confirmed_tags.len(), 1, "confirmed_tags should project 1 entry");
+        assert_eq!(
+            api.confirmed_tags.len(),
+            1,
+            "confirmed_tags should project 1 entry"
+        );
         assert_eq!(api.confirmed_tags[0].value, "价格敏感");
     }
 
@@ -6876,8 +7821,7 @@ mod tag_trust_tests {
             "created_at": DateTime::now(),
             "updated_at": DateTime::now(),
         };
-        let mut c: Contact =
-            bson::from_document(minimal_doc).expect("deserialize minimal contact");
+        let mut c: Contact = bson::from_document(minimal_doc).expect("deserialize minimal contact");
         c.confirmed_tags = vec![ConfirmedTag {
             value: "价格敏感".to_string(),
             evidences: vec![],
@@ -6919,9 +7863,12 @@ mod tag_trust_tests {
             "created_at": DateTime::now(),
             "updated_at": DateTime::now(),
         };
-        let mut c: Contact =
-            bson::from_document(minimal_doc).expect("deserialize minimal contact");
-        let facet = PersonalityFacet { score: 0.5, confidence: 0.3, evidence_refs: vec![] };
+        let mut c: Contact = bson::from_document(minimal_doc).expect("deserialize minimal contact");
+        let facet = PersonalityFacet {
+            score: 0.5,
+            confidence: 0.3,
+            evidence_refs: vec![],
+        };
         c.personality_profile = Some(PersonalityProfile {
             openness: facet.clone(),
             conscientiousness: facet.clone(),
@@ -6955,7 +7902,14 @@ mod campaign_model_tests {
 
     #[test]
     fn campaign_status_closed_set_covers_lifecycle() {
-        for s in ["draft", "previewed", "confirmed", "dispatching", "completed", "canceled"] {
+        for s in [
+            "draft",
+            "previewed",
+            "confirmed",
+            "dispatching",
+            "completed",
+            "canceled",
+        ] {
             assert!(ALLOWED_CAMPAIGN_STATUS.contains(&s), "缺少状态 {s}");
         }
         assert_eq!(ALLOWED_CAMPAIGN_STATUS.len(), 6);
@@ -6964,7 +7918,14 @@ mod campaign_model_tests {
     #[test]
     fn assert_campaign_status_accepts_valid_rejects_unknown() {
         // 合法值不 panic
-        for s in ["draft", "previewed", "confirmed", "dispatching", "completed", "canceled"] {
+        for s in [
+            "draft",
+            "previewed",
+            "confirmed",
+            "dispatching",
+            "completed",
+            "canceled",
+        ] {
             assert_campaign_status_valid(s);
         }
         // 闭集外值在 debug 下 panic（用 catch_unwind 验证）
@@ -6994,9 +7955,12 @@ mod campaign_model_tests {
             account_id: "acc".into(),
             campaign_id: ObjectId::new(),
             contact_wxid: "wx1".into(),
+            dispatch_generation: 1,
+            spec_hash: Some("spec-hash".into()),
             task_id: None,
             status: "enqueued".into(),
             created_at: DateTime::now(),
+            updated_at: Some(DateTime::now()),
         };
         let doc = mongodb::bson::to_document(&cs).unwrap();
         let back: CampaignSend = mongodb::bson::from_document(doc).unwrap();
@@ -7054,8 +8018,7 @@ mod conversation_message_relay_tests {
             "is_synthetic_relay": true,
             "created_at": mongodb::bson::DateTime::now(),
         };
-        let msg: ConversationMessage =
-            mongodb::bson::from_document(doc).expect("deserialize");
+        let msg: ConversationMessage = mongodb::bson::from_document(doc).expect("deserialize");
         assert!(
             !msg.is_synthetic_relay,
             "反序列化必须忽略输入里的 is_synthetic_relay，恒取 default(false)——这是不可伪造的根基"
@@ -7075,8 +8038,7 @@ mod conversation_message_relay_tests {
             "raw": mongodb::bson::Bson::Null,
             "created_at": mongodb::bson::DateTime::now(),
         };
-        let msg: ConversationMessage =
-            mongodb::bson::from_document(doc).expect("deserialize");
+        let msg: ConversationMessage = mongodb::bson::from_document(doc).expect("deserialize");
         assert!(!msg.is_synthetic_relay);
     }
 }
@@ -7137,7 +8099,10 @@ mod wechat_account_debug_tests {
     #[test]
     fn debug_masks_webhook_secret() {
         let dbg = format!("{:?}", sample());
-        assert!(!dbg.contains("super-secret-value"), "raw webhook_secret leaked into Debug: {dbg}");
+        assert!(
+            !dbg.contains("super-secret-value"),
+            "raw webhook_secret leaked into Debug: {dbg}"
+        );
     }
 }
 

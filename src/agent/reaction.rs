@@ -2,8 +2,9 @@
 //!
 //! 该模块负责对用户最新入站消息做异步反应分析（"用户是不是在表达
 //! 购买信号 / 反对 / 停止 / 不分类"），并通过 atomic claim 防止并发
-//! webhook 重复触发分析。`reclaim_stuck` 兜底把卡死在 `analyzing`
-//! 状态超过阈值的 review 重置为 `pending`，避免分析进程崩溃后永远卡死。
+//! webhook 重复触发分析。每次 claim 使用不可复用 token；`reclaim_stuck` 兜底把
+//! 卡死在 `analyzing` 状态超过阈值的 review 重置为 `pending`，旧执行者随后即使
+//! 返回也无法覆盖新结果或重复执行轨迹、学习与 Outbox 取消副作用。
 //!
 //! 波 A1：reaction 路径整体进入 `RUN_BUDGET.scope`，让 LLM 调用计入
 //! `agent_run_logs.tokens_used` 并能在预算超额时降级到 `user_replied_unclassified`。
@@ -76,7 +77,10 @@ async fn record_user_reaction_inner(
             },
             doc! {
                 "$set": { "outcome_status": "pending" },
-                "$unset": { "reaction_claimed_at": "" }
+                "$unset": {
+                    "reaction_claimed_at": "",
+                    "reaction_claim_token": "",
+                }
             },
             None,
         )
@@ -94,11 +98,14 @@ async fn record_user_reaction_inner(
             { "outcome_status": "pending" }
         ]
     };
+    let reaction_claim_token = uuid::Uuid::new_v4().to_string();
     let claim_update = doc! {
         "$set": {
             "outcome_status": "analyzing",
-            "reaction_claimed_at": DateTime::now()
-        }
+            "reaction_claimed_at": DateTime::now(),
+            "reaction_claim_token": &reaction_claim_token,
+        },
+        "$inc": { "reaction_claim_generation": 1i64 },
     };
     let claim_options = mongodb::options::FindOneAndUpdateOptions::builder()
         .sort(doc! { "created_at": -1 })
@@ -136,7 +143,7 @@ async fn record_user_reaction_inner(
     // 让 reaction prompt 随 profile 声明轨迹维度（避免新增第二次 load）。
     let active_profile =
         crate::agent::domain_profile::load_active_domain_profile(&state.db, &contact.workspace_id)
-            .await;
+            .await?;
     let active_polarity = active_profile.outcome_polarity.clone();
     let active_traj_dims = active_profile.trajectory_dimensions.clone();
     let reaction_analysis = if budget_exceeded {
@@ -185,15 +192,37 @@ async fn record_user_reaction_inner(
     if let Some(signal) = reviewer_misjudge_signal.as_ref() {
         update_set.insert("reviewer_misjudge_signal", signal);
     }
-    state
+    let mut update_unset = doc! {
+        "reaction_claimed_at": "",
+        "reaction_claim_token": "",
+    };
+    if reviewer_misjudge_signal.is_none() {
+        update_unset.insert("reviewer_misjudge_signal", "");
+    }
+    let committed = state
         .db
         .decision_reviews()
         .update_one(
-            doc! { "_id": review_id },
-            doc! { "$set": update_set },
+            doc! {
+                "_id": review_id,
+                "outcome_status": "analyzing",
+                "reaction_claim_token": &reaction_claim_token,
+            },
+            doc! {
+                "$set": update_set,
+                "$unset": update_unset,
+            },
             None,
         )
         .await?;
+    if committed.matched_count == 0 {
+        tracing::info!(
+            review_id = %review_id,
+            reaction_claim_token = %reaction_claim_token,
+            "discarded stale reaction result after claim ownership changed"
+        );
+        return Ok(());
+    }
 
     // Phase D / D1：把 reaction outcome 追加到 contact.intent_trajectory（滑窗 50）。
     // mongo `$push + $slice: -50` 一步完成 append + 上限裁剪；并发追加（同一 contact
@@ -248,6 +277,7 @@ async fn record_user_reaction_inner(
     if outbox::outcome_signals_stop(&outcome_for_outbox) {
         match outbox::cancel_for_contact_on_user_reaction(
             state,
+            &contact.workspace_id,
             &contact.account_id,
             &contact.wxid,
         )
@@ -286,18 +316,9 @@ async fn analyze_user_reaction(
     traj_dims: &[crate::models::TrajectoryDimension],
 ) -> AppResult<Document> {
     let memory = load_or_create_operating_memory(state, contact).await?;
-    let system = prompts::load_prompt(
-        &state.db,
-        &state.config.default_workspace_id,
-        "user.reaction.system",
-    )
-    .await?;
-    let task = prompts::load_prompt(
-        &state.db,
-        &state.config.default_workspace_id,
-        "user.reaction.task",
-    )
-    .await?;
+    let system =
+        prompts::load_prompt(&state.db, &contact.workspace_id, "user.reaction.system").await?;
+    let task = prompts::load_prompt(&state.db, &contact.workspace_id, "user.reaction.task").await?;
     // universal-domain-adaptation 第 18 点：active profile 声明了非销售域极性时，在 task
     // 之后追加一段本域 outcome 词表说明，引导模型按本行业语义判 outcomeStatus（而非套用
     // 写死的销售七态）。DEFAULT/老库（polarity == 销售默认）时返回 None → prompt 字节等价。
@@ -326,14 +347,17 @@ async fn analyze_user_reaction(
         contact.nickname.clone().unwrap_or_default(),
         // task 6.3：`effective_memory_card` 现在返回 `MemoryCardTyped`；
         // prompt 序列化为 JSON 时在边界 `to_document()` 一次性转换。
-        serde_json::to_string(&effective_memory_card(&memory).to_document())
-            .unwrap_or_default(),
+        serde_json::to_string(&effective_memory_card(&memory).to_document()).unwrap_or_default(),
         serde_json::to_string(&memory).unwrap_or_default(),
         // H10：客户内容剥哨兵保持不变量(本 prompt 非转述契约,字节等价)。
-        crate::agent::prompt_isolation::inbound_prompt_content(&inbound.content, inbound.is_synthetic_relay)
+        crate::agent::prompt_isolation::inbound_prompt_content(
+            &inbound.content,
+            inbound.is_synthetic_relay
+        )
     );
     let value = generate_agent_json(
         state,
+        &contact.workspace_id,
         Some(&contact.account_id),
         Some(&contact.wxid),
         run_id,
@@ -394,7 +418,10 @@ pub(crate) fn reaction_outcome_status(analysis: &Document) -> String {
 fn default_outcome_polarity_for_reaction() -> crate::models::OutcomePolarity {
     crate::models::OutcomePolarity {
         positive: vec!["user_replied_buying_signal".to_string()],
-        negative: DEFAULT_NEGATIVE_OUTCOMES.iter().map(|s| s.to_string()).collect(),
+        negative: DEFAULT_NEGATIVE_OUTCOMES
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
     }
 }
 
@@ -530,7 +557,10 @@ pub(crate) fn effective_negative_outcomes(
     polarity: &crate::models::OutcomePolarity,
 ) -> Vec<String> {
     if polarity.negative.is_empty() {
-        DEFAULT_NEGATIVE_OUTCOMES.iter().map(|s| s.to_string()).collect()
+        DEFAULT_NEGATIVE_OUTCOMES
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
     } else {
         polarity.negative.clone()
     }
@@ -854,9 +884,18 @@ mod a6_tests {
             doc! { "outcomeStatus": "user_replied_buying_signal", "buyingSignal": true },
         ];
         let hint = format_reaction_hint(&recent);
-        assert!(hint.contains("[最近用户反应回顾]"), "hint should have header");
-        assert!(hint.contains("user_replied_objection"), "first turn status missing");
-        assert!(hint.contains("user_replied_buying_signal"), "second turn status missing");
+        assert!(
+            hint.contains("[最近用户反应回顾]"),
+            "hint should have header"
+        );
+        assert!(
+            hint.contains("user_replied_objection"),
+            "first turn status missing"
+        );
+        assert!(
+            hint.contains("user_replied_buying_signal"),
+            "second turn status missing"
+        );
         assert!(hint.contains("摘要=嫌贵"), "summary should be rendered");
         assert!(hint.contains("buying=true"));
         assert!(hint.contains("objection=true"));
@@ -933,16 +972,21 @@ mod a6_tests {
         // 证明极性来自配置：自定义负极集下,情感域"转冷"触发,原销售 objection 不触发。
         let negative = ["user_went_cold"];
         assert_eq!(
-            compute_reviewer_misjudge_signal_with_polarity(true, "user_went_cold", &negative).as_deref(),
+            compute_reviewer_misjudge_signal_with_polarity(true, "user_went_cold", &negative)
+                .as_deref(),
             Some("approved_but_user_negative")
         );
         // 原销售负词在情感 profile 下不触发反向训练。
-        assert!(
-            compute_reviewer_misjudge_signal_with_polarity(true, "user_replied_objection", &negative).is_none()
-        );
+        assert!(compute_reviewer_misjudge_signal_with_polarity(
+            true,
+            "user_replied_objection",
+            &negative
+        )
+        .is_none());
         // reviewer 未放行始终不触发(与极性无关)。
         assert!(
-            compute_reviewer_misjudge_signal_with_polarity(false, "user_went_cold", &negative).is_none()
+            compute_reviewer_misjudge_signal_with_polarity(false, "user_went_cold", &negative)
+                .is_none()
         );
     }
 
@@ -981,13 +1025,19 @@ mod a6_tests {
         let neg = companion_polarity().negative;
         let neg_refs: Vec<&str> = neg.iter().map(|s| s.as_str()).collect();
         assert_eq!(
-            compute_reviewer_misjudge_signal_with_polarity(true, "user_went_cold", &neg_refs).as_deref(),
+            compute_reviewer_misjudge_signal_with_polarity(true, "user_went_cold", &neg_refs)
+                .as_deref(),
             Some("approved_but_user_negative"),
             "情感域负反应(转冷)应触发 Block 反向训练"
         );
         // 极性错配检出：销售负词 objection 在情感域**不**触发（极性随 profile，非写死销售）。
         assert!(
-            compute_reviewer_misjudge_signal_with_polarity(true, "user_replied_objection", &neg_refs).is_none(),
+            compute_reviewer_misjudge_signal_with_polarity(
+                true,
+                "user_replied_objection",
+                &neg_refs
+            )
+            .is_none(),
             "销售负词 objection 在情感域不应触发 Block（极性错配须被隔离）"
         );
     }
@@ -1010,7 +1060,10 @@ mod a6_tests {
             "Censored 删失态(unclassified)绝不能触发 Block（沉默≠负反应，Iron Law ②）"
         );
         // 跨域不变量：销售极性下沉默同样是 unclassified（删失语义域无关、不可配）。
-        let sales_status = reaction_outcome_status_with_polarity(&silent, &default_outcome_polarity_for_reaction());
+        let sales_status = reaction_outcome_status_with_polarity(
+            &silent,
+            &default_outcome_polarity_for_reaction(),
+        );
         assert_eq!(
             sales_status, "user_replied_unclassified",
             "删失语义域无关：销售域沉默也是 unclassified"
@@ -1028,7 +1081,10 @@ mod a6_tests {
             "stopRequested 是域无关红线，情感域也必须识别"
         );
         assert_eq!(
-            reaction_outcome_status_with_polarity(&analysis, &default_outcome_polarity_for_reaction()),
+            reaction_outcome_status_with_polarity(
+                &analysis,
+                &default_outcome_polarity_for_reaction()
+            ),
             "user_replied_stop_requested"
         );
     }
@@ -1039,7 +1095,10 @@ mod a6_tests {
     fn reaction_outcome_default_polarity_matches_hardcoded_verbatim() {
         // 逐字护栏：DEFAULT 极性下 buyingSignal flag → user_replied_buying_signal（字节等价）。
         let analysis = doc! { "buyingSignal": true };
-        assert_eq!(reaction_outcome_status(&analysis), "user_replied_buying_signal");
+        assert_eq!(
+            reaction_outcome_status(&analysis),
+            "user_replied_buying_signal"
+        );
     }
 
     #[test]
@@ -1082,7 +1141,10 @@ mod a6_tests {
         let empty = crate::models::OutcomePolarity::default();
         assert_eq!(
             effective_negative_outcomes(&empty),
-            DEFAULT_NEGATIVE_OUTCOMES.iter().map(|s| s.to_string()).collect::<Vec<_>>()
+            DEFAULT_NEGATIVE_OUTCOMES
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
         );
         let custom = crate::models::OutcomePolarity {
             positive: vec![],

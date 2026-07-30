@@ -26,7 +26,7 @@ use axum::{
 use futures::TryStreamExt;
 use mongodb::{
     bson::{doc, oid::ObjectId, Document},
-    options::FindOptions,
+    options::{FindOptions, TransactionOptions},
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -34,13 +34,15 @@ use serde_json::{json, Value};
 use crate::{
     auth::AuthenticatedAdmin,
     error::{AppError, AppResult},
-    models::{dt_to_string, OperationKnowledgeChunk},
+    models::{dt_to_string, ChunkProvenance, OperationKnowledgeChunk},
 };
 
 use super::AppState;
 
 const DEFAULT_LIST_LIMIT: i64 = 50;
 const MAX_LIST_LIMIT: i64 = 200;
+const LESSON_PROMOTION_SOURCE: &str = "lesson_promotion";
+const LESSON_PROMOTION_MAX_ATTEMPTS: usize = 5;
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -136,8 +138,9 @@ pub(crate) fn validate_promote_request(
 /// - chunk `integrity_status=needs_review` + `status=draft`：必须经 chunk review
 ///   queue 才能流向 cold_contact_worker / knowledge_router 召回，红线复用现有
 ///   verify 路径，不在本接口开旁路。
-/// - lesson `review_status` flip 为 `promoted`，`promoted_chunk_id` 写回字符串
-///   形态的新 chunk hex id；幂等：再次 POST 直接返回已有 id，不重复 insert。
+/// - Chunk、Lesson CAS 与审计在同一事务提交；Lesson `_id` 同时作为新 Chunk `_id`，
+///   `provenance.source_doc_id=lesson_id` 再由 partial unique 索引锁住一对一身份。
+/// - 幂等：再次或并发 POST 都收敛到同一个 chunk id，不重复 insert。
 pub(super) async fn promote_lesson_to_peer_case(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
@@ -150,140 +153,261 @@ pub(super) async fn promote_lesson_to_peer_case(
     }
     let (title, body, summary_opt) = validate_promote_request(&payload)?;
 
-    let lessons_coll = state
-        .db
-        .raw()
-        .collection::<Document>("lessons_learned");
-    let lesson = lessons_coll
-        .find_one(
-            doc! {
-                "lesson_id": lesson_id_trim,
-                "workspace_id": &admin.current_workspace,
-            },
-            None,
+    let lesson_id = lesson_id_trim.to_string();
+    for attempt in 0..LESSON_PROMOTION_MAX_ATTEMPTS {
+        match promote_lesson_once(
+            &state,
+            &admin,
+            &lesson_id,
+            &title,
+            &body,
+            summary_opt.as_deref(),
         )
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("lesson_id={} not found", lesson_id_trim)))?;
-
-    // 幂等：已 promoted 直接返回。
-    let existing_chunk_id = lesson
-        .get("promoted_chunk_id")
-        .and_then(|b| b.as_str().map(str::to_string));
-    let existing_status = lesson
-        .get_str("review_status")
-        .ok()
-        .map(str::to_string)
-        .unwrap_or_default();
-    if existing_status == "promoted" {
-        if let Some(chunk_id) = existing_chunk_id {
-            return Ok(Json(json!({
-                "lessonId": lesson_id_trim,
-                "promotedChunkId": chunk_id,
-                "alreadyPromoted": true,
-            })));
+        .await
+        {
+            Ok((chunk_id, already_promoted)) => {
+                return Ok(Json(json!({
+                    "lessonId": lesson_id,
+                    "promotedChunkId": chunk_id.to_hex(),
+                    "alreadyPromoted": already_promoted,
+                })));
+            }
+            Err(error)
+                if attempt + 1 < LESSON_PROMOTION_MAX_ATTEMPTS
+                    && retryable_lesson_promotion_error(&error) =>
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            Err(error) => return Err(error),
         }
     }
+    Err(AppError::Conflict(
+        "lesson_promotion_concurrent_change".to_string(),
+    ))
+}
 
-    let pattern_kind = lesson
-        .get_str("pattern_kind")
-        .ok()
-        .map(str::to_string)
-        .unwrap_or_default();
-
-    let now = mongodb::bson::DateTime::now();
-    let new_id = ObjectId::new();
-    let chunk = OperationKnowledgeChunk {
-        id: Some(new_id),
-        workspace_id: admin.current_workspace.clone(),
-        account_id: None,
-        document_id: None,
-        item_id: None,
-        domain: "user_operations".to_string(),
-        knowledge_type: Some("peer_case".to_string()),
-        business_context: Some(format!("lessons_learned::{pattern_kind}")),
-        title,
-        summary: summary_opt,
-        body: Some(body),
-        applicable_scenes: Vec::new(),
-        not_applicable_scenes: Vec::new(),
-        product_tags: Vec::new(),
-        business_topics: Vec::new(),
-        source_quote: None,
-        source_anchors: Vec::new(),
-        // 红线：peer_case 也走 review queue，admin 须在 chunk review 二次确认才能 verify。
-        integrity_status: Some("needs_review".to_string()),
-        confidence_score: None,
-        status: "draft".to_string(),
-        priority: 0,
-        created_at: now,
-        updated_at: now,
-        wiki_type: Some("finding".to_string()),
-        domain_attributes: None,
-        provenance: None,
-        valid_from: Some(now),
-        valid_to: None,
-        superseded_by: None,
-        previous_version_id: None,
-        related_chunks: None,
-        usage_stats: None,
-        dynamic_confidence: None,
-        integrity_score: None,
-        locked_fields: None,
-        chunk_type: "peer_case".to_string(),
-    };
-    state
-        .db
-        .operation_knowledge_chunks()
-        .insert_one(chunk, None)
+async fn promote_lesson_once(
+    state: &AppState,
+    admin: &AuthenticatedAdmin,
+    lesson_id: &str,
+    title: &str,
+    body: &str,
+    summary: Option<&str>,
+) -> AppResult<(ObjectId, bool)> {
+    let lessons = state.db.raw().collection::<Document>("lessons_learned");
+    let chunks = state.db.operation_knowledge_chunks();
+    let mut session = state.db.client().start_session(None).await?;
+    session
+        .start_transaction(TransactionOptions::builder().build())
         .await?;
 
-    // chunk_revisions 留痕同 admin 编辑路径同源；这里走最小化记录：
-    // 直接在 lesson 写回 promoted_chunk_id + review_status，chunk 自身的 review
-    // queue 会被 admin 在 verify 时再 patch。
-    lessons_coll
-        .update_one(
-            doc! { "lesson_id": lesson_id_trim },
-            doc! {
-                "$set": {
-                    "promoted_chunk_id": new_id.to_hex(),
+    let result: AppResult<(ObjectId, bool)> = async {
+        let lesson = lessons
+            .find_one_with_session(
+                doc! {
+                    "workspace_id": &admin.current_workspace,
+                    "lesson_id": lesson_id,
+                },
+                None,
+                &mut session,
+            )
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("lesson_id={lesson_id} not found")))?;
+        let lesson_oid = lesson.get_object_id("_id").map_err(|_| {
+            AppError::External(format!("lesson_id={lesson_id} missing ObjectId _id"))
+        })?;
+        let review_status = match lesson.get("review_status") {
+            None | Some(mongodb::bson::Bson::Null) => "pending_review",
+            Some(mongodb::bson::Bson::String(value)) => value.as_str(),
+            Some(_) => {
+                return Err(AppError::Conflict(
+                    "lesson_review_status_invalid".to_string(),
+                ))
+            }
+        };
+
+        if review_status == "promoted" {
+            let chunk_id = lesson
+                .get_str("promoted_chunk_id")
+                .ok()
+                .and_then(|value| ObjectId::parse_str(value).ok())
+                .ok_or_else(|| {
+                    AppError::Conflict("lesson_promoted_chunk_missing".to_string())
+                })?;
+            let linked = chunks
+                .find_one_with_session(
+                    doc! {
+                        "_id": chunk_id,
+                        "workspace_id": &admin.current_workspace,
+                        "provenance.source": LESSON_PROMOTION_SOURCE,
+                        "provenance.source_doc_id": lesson_id,
+                    },
+                    None,
+                    &mut session,
+                )
+                .await?;
+            if linked.is_none() {
+                return Err(AppError::Conflict(
+                    "lesson_promoted_chunk_identity_mismatch".to_string(),
+                ));
+            }
+            return Ok((chunk_id, true));
+        }
+        if review_status != "pending_review"
+            || !matches!(
+                lesson.get("promoted_chunk_id"),
+                None | Some(mongodb::bson::Bson::Null)
+            )
+        {
+            return Err(AppError::Conflict(
+                "lesson_not_pending_review".to_string(),
+            ));
+        }
+        let pattern_kind = lesson
+            .get_str("pattern_kind")
+            .map_err(|_| AppError::Conflict("lesson_pattern_kind_invalid".to_string()))?;
+        if pattern_kind.is_empty() || pattern_kind.trim() != pattern_kind {
+            return Err(AppError::Conflict(
+                "lesson_pattern_kind_invalid".to_string(),
+            ));
+        }
+
+        let now = mongodb::bson::DateTime::now();
+        let chunk = OperationKnowledgeChunk {
+            id: Some(lesson_oid),
+            workspace_id: admin.current_workspace.clone(),
+            account_id: None,
+            document_id: None,
+            item_id: None,
+            domain: "user_operations".to_string(),
+            knowledge_type: Some("peer_case".to_string()),
+            business_context: Some(format!("lessons_learned::{pattern_kind}")),
+            title: title.to_string(),
+            summary: summary.map(str::to_string),
+            body: Some(body.to_string()),
+            applicable_scenes: Vec::new(),
+            not_applicable_scenes: Vec::new(),
+            product_tags: Vec::new(),
+            business_topics: Vec::new(),
+            source_quote: None,
+            source_anchors: Vec::new(),
+            integrity_status: Some("needs_review".to_string()),
+            confidence_score: None,
+            status: "draft".to_string(),
+            priority: 0,
+            created_at: now,
+            updated_at: now,
+            wiki_type: Some("finding".to_string()),
+            domain_attributes: None,
+            provenance: Some(ChunkProvenance {
+                source: LESSON_PROMOTION_SOURCE.to_string(),
+                source_doc_id: Some(lesson_id.to_string()),
+                source_quote: None,
+                llm_model_alias: None,
+                edited_at: now,
+                edited_by: Some(admin.username.clone()),
+            }),
+            valid_from: Some(now),
+            valid_to: None,
+            superseded_by: None,
+            previous_version_id: None,
+            related_chunks: None,
+            usage_stats: None,
+            dynamic_confidence: None,
+            integrity_score: None,
+            locked_fields: None,
+            chunk_type: "peer_case".to_string(),
+        };
+        chunks
+            .insert_one_with_session(chunk, None, &mut session)
+            .await?;
+
+        let promoted = lessons
+            .update_one_with_session(
+                doc! {
+                    "_id": lesson_oid,
+                    "workspace_id": &admin.current_workspace,
+                    "lesson_id": lesson_id,
+                    "$and": [
+                        { "$or": [
+                            { "review_status": "pending_review" },
+                            { "review_status": { "$exists": false } },
+                            { "review_status": null },
+                        ] },
+                        { "$or": [
+                            { "promoted_chunk_id": { "$exists": false } },
+                            { "promoted_chunk_id": null },
+                        ] },
+                    ],
+                },
+                doc! { "$set": {
+                    "promoted_chunk_id": lesson_oid.to_hex(),
                     "review_status": "promoted",
                     "updated_at": now,
+                } },
+                None,
+                &mut session,
+            )
+            .await?;
+        if promoted.modified_count != 1 {
+            return Err(AppError::Conflict(
+                "lesson_promotion_concurrent_change".to_string(),
+            ));
+        }
+
+        state
+            .db
+            .events()
+            .insert_one_with_session(
+                crate::models::AgentEvent {
+                    id: None,
+                    workspace_id: admin.current_workspace.clone(),
+                    account_id: state.config.default_account_id.clone(),
+                    contact_wxid: None,
+                    kind: "lesson_promoted_to_peer_case".to_string(),
+                    status: "ok".to_string(),
+                    summary: format!(
+                        "lesson_id={lesson_id} promoted to peer_case chunk={} (pending chunk review)",
+                        lesson_oid.to_hex()
+                    ),
+                    details: Some(doc! {
+                        "lesson_id": lesson_id,
+                        "pattern_kind": pattern_kind,
+                        "chunk_id": lesson_oid.to_hex(),
+                        "chunk_type": "peer_case",
+                        "integrity_status": "needs_review",
+                    }),
+                    created_at: now,
+                    dedupe_key: None,
                 },
-            },
-            None,
-        )
-        .await?;
+                None,
+                &mut session,
+            )
+            .await?;
+        Ok((lesson_oid, false))
+    }
+    .await;
 
-    // 写一条 agent_events 审计；与 lessons_learned 是 admin 显式动作的红线对齐。
-    let event = crate::models::AgentEvent {
-        id: None,
-        workspace_id: admin.current_workspace.clone(),
-        account_id: state.config.default_account_id.clone(),
-        contact_wxid: None,
-        kind: "lesson_promoted_to_peer_case".to_string(),
-        status: "ok".to_string(),
-        summary: format!(
-            "lesson_id={} promoted to peer_case chunk={} (pending chunk review)",
-            lesson_id_trim,
-            new_id.to_hex()
-        ),
-        details: Some(doc! {
-            "lesson_id": lesson_id_trim,
-            "pattern_kind": &pattern_kind,
-            "chunk_id": new_id.to_hex(),
-            "chunk_type": "peer_case",
-            "integrity_status": "needs_review",
-        }),
-        created_at: now,
-        dedupe_key: None,
+    let outcome = match result {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let _ = session.abort_transaction().await;
+            return Err(error);
+        }
     };
-    let _ = state.db.events().insert_one(event, None).await;
+    loop {
+        match session.commit_transaction().await {
+            Ok(()) => return Ok(outcome),
+            Err(error) if error.contains_label("UnknownTransactionCommitResult") => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
 
-    Ok(Json(json!({
-        "lessonId": lesson_id_trim,
-        "promotedChunkId": new_id.to_hex(),
-        "alreadyPromoted": false,
-    })))
+fn retryable_lesson_promotion_error(error: &AppError) -> bool {
+    matches!(error, AppError::Db(db_error) if
+        db_error.contains_label("TransientTransactionError")
+            || super::admin_taxonomies::is_duplicate_key_error(db_error))
 }
 
 fn lesson_doc_to_json(doc: &Document) -> Value {

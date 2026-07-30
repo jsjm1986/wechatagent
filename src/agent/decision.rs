@@ -8,6 +8,8 @@
 //! 所有 prompt 加载、上下文格式化、调用 LLM 都集中在这里；其它子模块
 //! 通过 `pub(crate)` 调用 `decide_reply` 复用同一份 prompt 渲染逻辑。
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use mongodb::bson::{doc, to_document, DateTime, Document};
 
 use crate::error::{AppError, AppResult};
@@ -20,7 +22,9 @@ use crate::routes::AppState;
 
 use super::generate_agent_json;
 use super::knowledge_router::format_operation_knowledge_for_prompt_with_roles;
-use super::memory::{format_operator_memory_for_reply_prompt, load_operator_memory};
+use super::memory::{
+    format_operator_memory_for_reply_prompt, load_operator_memory, load_operator_memory_read_only,
+};
 use super::reaction::format_reaction_hint;
 use super::runtime::UserRuntimeParameters;
 use super::types::{
@@ -29,19 +33,48 @@ use super::types::{
 };
 use crate::models::AgentTask;
 
-/// critic 候选的 prompt 覆盖：按 key 命中则末尾追加片段(复用阶段一 compose_appended_content),
-/// 供 shadow replay 用「原 prompt + 追加片段」跑真模型对照。
+/// critic 候选的 prompt 覆盖。目标 key 先强制使用 proposal 冻结的基线正文，
+/// 经现有 profile/domain 变换后再追加候选片段；`applied` 证明本次 replay
+/// 确实经过目标注入点，避免普通运行被误计为候选证据。
 pub struct PromptOverride {
-    pub target_prompt_key: String,
-    pub append_snippet: String,
+    target_prompt_key: String,
+    append_snippet: String,
+    frozen_base_content: String,
+    applied: AtomicBool,
 }
 impl PromptOverride {
-    pub fn apply_if_matches(&self, prompt_key: &str, loaded: String) -> String {
+    pub fn new(
+        target_prompt_key: String,
+        append_snippet: String,
+        frozen_base_content: String,
+    ) -> Self {
+        Self {
+            target_prompt_key,
+            append_snippet,
+            frozen_base_content,
+            applied: AtomicBool::new(false),
+        }
+    }
+
+    pub fn use_frozen_base_if_matches(&self, prompt_key: &str, loaded: String) -> String {
         if prompt_key == self.target_prompt_key {
-            crate::prompt_guard::compose_appended_content(&loaded, &self.append_snippet)
+            self.frozen_base_content.clone()
         } else {
             loaded
         }
+    }
+
+    pub fn append_if_matches(&self, prompt_key: &str, rendered: String) -> String {
+        if prompt_key == self.target_prompt_key {
+            self.applied.store(true, Ordering::Release);
+            crate::prompt_guard::compose_appended_content(&rendered, &self.append_snippet)
+        } else {
+            rendered
+        }
+    }
+
+    pub fn was_applied(&self) -> bool {
+        self.applied.load(Ordering::Acquire)
     }
 }
 
@@ -55,8 +88,7 @@ pub async fn build_initial_operation_profile(
     let playbook_text = playbook.map(format_playbook_for_prompt).unwrap_or_else(|| {
         "未配置运营方法。请根据运营备注自由生成克制、真实、可执行的运营画像。".to_string()
     });
-    let domain_config =
-        load_user_operation_domain_config(state, workspace_id).await?;
+    let domain_config = load_user_operation_domain_config(state, workspace_id).await?;
     let domain_text = domain_config
         .as_ref()
         .map(format_operation_domain_config_for_prompt)
@@ -67,33 +99,22 @@ pub async fn build_initial_operation_profile(
     // painPoints/「下一阶段运营目标」）强行框住，且无任何本行业语境。这里镜像 H3
     // （decide_reply_with_promote 的 prompt_fragment 业务上下文层）注入本行业语义。
     // DEFAULT 销售域 prompt_fragment=None → 空串、prompt 字节等价（反过拟合护栏）。
-    let active_profile = super::domain_profile::load_active_domain_profile(
-        &state.db,
-        workspace_id,
-    )
-    .await;
+    let active_profile =
+        super::domain_profile::load_active_domain_profile(&state.db, workspace_id).await?;
     let business_context = render_business_context_fragment(
         active_profile.prompt_fragment.as_deref(),
         "本行业业务上下文（运营配置，补充运营方法与域策略）：",
     );
-    let system = prompts::load_prompt(
-        &state.db,
-        workspace_id,
-        "user.initial_profile.system",
-    )
-    .await?;
-    let task_template = prompts::load_prompt(
-        &state.db,
-        workspace_id,
-        "user.initial_profile.task",
-    )
-    .await?;
+    let system =
+        prompts::load_prompt(&state.db, workspace_id, "user.initial_profile.system").await?;
+    let task_template =
+        prompts::load_prompt(&state.db, workspace_id, "user.initial_profile.task").await?;
     // C-02：比照 live reply 路径，让初始画像建档时也告知 LLM 本行业记忆槽位 + 参与决策的
     // typed 维度，否则非销售域（情感陪伴/同行/朋友）首屏画像被 user.initial_profile.task 的
     // 销售 schema 单方框住、本行业维度既不告知也不采集（须等首条 inbound 后 live reply 自愈）。
     // DEFAULT 销售域两函数均返空串 → prompt 字节等价（反过拟合护栏）。
-    let taxonomy_cache = crate::agent::taxonomy::global_taxonomy_cache();
-    taxonomy_cache.find_or_load(&state.db, workspace_id).await;
+    let taxonomy_cache = crate::agent::taxonomy::global_taxonomy_cache(&state.db);
+    taxonomy_cache.find_or_load(&state.db, workspace_id).await?;
     let task_template = format!(
         "{task_template}{}{}",
         super::domain_profile::render_memory_candidate_types_guidance(
@@ -121,6 +142,7 @@ pub async fn build_initial_operation_profile(
     );
     let value = generate_agent_json(
         state,
+        workspace_id,
         None,
         None,
         None,
@@ -182,47 +204,7 @@ pub async fn build_initial_operation_profile(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn decide_reply(
-    state: &AppState,
-    contact: &Contact,
-    inbound: &ConversationMessage,
-    recent_messages: &[ConversationMessage],
-    pending_tasks: &[AgentTask],
-    playbook: Option<&OperationPlaybook>,
-    domain_config: Option<&OperationDomainConfig>,
-    runtime: &UserRuntimeParameters,
-    memory: &OperatingMemory,
-    context_pack: &Document,
-    knowledge_chunks: &[OperationKnowledgeChunk],
-    knowledge_route: &KnowledgeRouteResult,
-    rewrite_instruction: Option<&str>,
-    run_id: Option<&str>,
-    prompt_override: Option<&PromptOverride>,
-) -> AppResult<AgentDecision> {
-    let (decision, _risks) = decide_reply_with_promote(
-        state,
-        contact,
-        inbound,
-        recent_messages,
-        pending_tasks,
-        playbook,
-        domain_config,
-        runtime,
-        memory,
-        context_pack,
-        knowledge_chunks,
-        knowledge_route,
-        rewrite_instruction,
-        run_id,
-        prompt_override,
-        crate::agent::sufficiency::PromptTier::Full,
-    )
-    .await?;
-    Ok(decision)
-}
-
-/// agent-autonomy-loop W2 / Task 3.4：与 [`decide_reply`] 相同上下文与 prompt，
+/// agent-autonomy-loop W2 / Task 3.4：运行 Reply 决策并额外返回协议风险，
 /// 但额外返回 [`RawAgentDecision::validate_and_promote`] 聚合的协议违规标签
 /// （`promote_risks`），供 gateway 主路径在 `finalize_review_for_send` 阶段
 /// 把"missing_required_field / invalid_enum_value / invalid_type /
@@ -241,13 +223,20 @@ pub(crate) async fn decide_reply(
 async fn load_recent_reaction_hint(state: &AppState, contact: &Contact) -> String {
     use futures::TryStreamExt;
     use mongodb::options::FindOptions;
-    let filter = build_reaction_hint_filter(&contact.workspace_id, &contact.account_id, &contact.wxid);
+    let filter =
+        build_reaction_hint_filter(&contact.workspace_id, &contact.account_id, &contact.wxid);
     let opts = FindOptions::builder()
         .sort(reaction_hint_sort())
         .limit(REACTION_HINT_LIMIT)
         .projection(reaction_hint_projection())
         .build();
-    let cursor = match state.db.decision_reviews().clone_with_type::<Document>().find(filter, opts).await {
+    let cursor = match state
+        .db
+        .decision_reviews()
+        .clone_with_type::<Document>()
+        .find(filter, opts)
+        .await
+    {
         Ok(c) => c,
         Err(error) => {
             tracing::warn!(?error, "load_recent_reaction_hint find failed");
@@ -332,7 +321,8 @@ pub(crate) async fn decide_reply_with_promote(
     // 铁律：Full 档两标志均 true，所有槽位与改造前逐字等价（现有调用点全传 Full）。
     let include_relational = matches!(
         tier,
-        crate::agent::sufficiency::PromptTier::Relational | crate::agent::sufficiency::PromptTier::Full
+        crate::agent::sufficiency::PromptTier::Relational
+            | crate::agent::sufficiency::PromptTier::Full
     );
     let include_business = matches!(tier, crate::agent::sufficiency::PromptTier::Full);
     // universal-domain-adaptation H2 + H9 + H3 + H12：加载本 workspace 当前生效的
@@ -340,21 +330,26 @@ pub(crate) async fn decide_reply_with_promote(
     // 多处复用：① H3 prompt_fragment 注入系统提示的「业务上下文」层；② H9
     // conversationMode 允许集合覆盖 runtime；③ H2 维度校验 decision_dimension_kinds；
     // ④ H12 soul_override / methodology_override 替换出厂人格 / 方法论本体。
-    let active_profile =
-        super::domain_profile::load_active_domain_profile(&state.db, &contact.workspace_id).await;
-    // H12：Soul 层回落链 = profile.soul_override ?? DB published soul ?? 内置销售域兜底。
-    // DEFAULT_PROFILE 的 soul_override=None → 走 DB published + 兜底，与改造前逐字等价。
+    let shadow_snapshot = super::budget::current_shadow_evaluation_snapshot();
+    let active_profile = match shadow_snapshot.as_ref() {
+        Some(snapshot) => snapshot.active_profile.clone(),
+        None => {
+            super::domain_profile::load_active_domain_profile(&state.db, &contact.workspace_id)
+                .await?
+        }
+    };
+    // H12：显式 profile override 优先；否则必须读取该 workspace 唯一 published Soul。
+    // 缺失或多指针均 fail-closed，避免静默换成人格不同的内置短句继续执行真实任务。
     let soul = match non_empty_override(active_profile.soul_override.as_deref()) {
         Some(s) => s,
-        None => load_published_soul(state, "user").await?.unwrap_or_else(|| {
-            "你是长期运行的微信私域运营 AI Agent。你只为已纳管好友服务，目标是自然、克制、持续推进关系和业务目标。".to_string()
-        }),
+        None => load_published_soul(state, &contact.workspace_id, "user").await?,
     };
     // 文本资产分档注入（2026-06-29）：不再绑死 Full，按当前轮 tier 过滤每条 min_inject_tier。
     // best-effort：DB 故障 → 空串（不阻塞决策，同 reaction_hint / sendable 路径）。
-    let (referable_assets, forbidden_assets) = load_context_assets(state, &contact.workspace_id, &contact.account_id, tier)
-        .await
-        .unwrap_or_default();
+    let (referable_assets, forbidden_assets) =
+        load_context_assets(state, &contact.workspace_id, &contact.account_id, tier)
+            .await
+            .unwrap_or_default();
     // media-asset Task 8 + ③升档盲区修复（2026-06-27）：加载可发送素材（sendable+approved）。
     // **恒加载**（任何档，只需 account_id）：让 Lean 档也能注入「素材线索概览」，使 Reply Agent
     // 在第一程就知道库里有哪些可发素材 + 运营标注的 send_trigger_hint，据此自评本轮客户消息
@@ -394,6 +389,7 @@ pub(crate) async fn decide_reply_with_promote(
         super::send_ledger::recent_sends_for_contact(
             state,
             &contact.workspace_id,
+            &contact.account_id,
             &contact.wxid,
             "media",
             10,
@@ -497,7 +493,10 @@ pub(crate) async fn decide_reply_with_promote(
         String::new()
     };
     let knowledge_text = if include_business {
-        format_operation_knowledge_for_prompt_with_roles(knowledge_chunks, &active_profile.chunk_roles)
+        format_operation_knowledge_for_prompt_with_roles(
+            knowledge_chunks,
+            &active_profile.chunk_roles,
+        )
     } else {
         String::new()
     };
@@ -580,7 +579,12 @@ pub(crate) async fn decide_reply_with_promote(
     // entitlements::render_transaction_facts_sections 纯函数（可单测、双重保险）。
     // 业务组：仅 Full 档加载产品目录/持有投影/疑似成交。非 Full 跳过 DB、三段空串。
     let active_products = if include_business && active_profile.transaction_facts_enabled {
-        super::entitlements::load_active_products(&state.db, &contact.workspace_id).await
+        match shadow_snapshot.as_ref() {
+            Some(snapshot) => snapshot.active_products.clone(),
+            None => {
+                super::entitlements::load_active_products(&state.db, &contact.workspace_id).await
+            }
+        }
     } else {
         Vec::new()
     };
@@ -589,7 +593,10 @@ pub(crate) async fn decide_reply_with_promote(
             active_profile.transaction_facts_enabled,
             &active_products,
             &contact.outcome_events,
-            DateTime::now(),
+            shadow_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.evaluated_at)
+                .unwrap_or_else(DateTime::now),
         )
     } else {
         (String::new(), String::new(), String::new())
@@ -609,41 +616,61 @@ pub(crate) async fn decide_reply_with_promote(
     // best-effort：DB 故障 → 空串。
     // 关系组：Lean 跳过 DB、空串占位。
     let operator_memory_text = if include_relational {
-        load_operator_memory(
-            &state.db,
-            &contact.workspace_id,
-            &contact.account_id,
-            &contact.account_id,
-            5,
-        )
-        .await
-        .map(|items| format_operator_memory_for_reply_prompt(&items))
-        .unwrap_or_default()
+        let loaded = if super::budget::current_run_mode() == "shadow" {
+            load_operator_memory_read_only(
+                &state.db,
+                &contact.workspace_id,
+                &contact.account_id,
+                &contact.account_id,
+                5,
+            )
+            .await
+        } else {
+            load_operator_memory(
+                &state.db,
+                &contact.workspace_id,
+                &contact.account_id,
+                &contact.account_id,
+                5,
+            )
+            .await
+        };
+        loaded
+            .map(|items| format_operator_memory_for_reply_prompt(&items))
+            .unwrap_or_default()
     } else {
         String::new()
     };
-    // Phase C / C4：prompt A/B 灰度。当 (workspace, prompt_key) 下存在多条
-    // status="active" 的版本时，按 hash(contact.wxid) % count 选一份；同一 contact
-    // 永远拿同一份 prompt，保证 A/B 一致性。单 active 版本时退化为 load_prompt 行为。
-    let (system_contract, _system_version) = prompts::load_prompt_for_contact(
+    // PromptTemplate 只认唯一 current 指针；contact/locale 参数仅保留调用兼容性，
+    // 不再从多条 active 历史版本中隐式分桶。
+    let (system_contract, system_version) = prompts::load_prompt_for_contact(
         &state.db,
-        &state.config.default_workspace_id,
+        &contact.workspace_id,
         "user.reply.system",
         &contact.wxid,
         contact.locale.as_deref(),
     )
     .await?;
+    if let Some(budget) = super::budget::current_run_budget() {
+        budget.record_prompt_version("user.reply.system", system_version);
+    }
     let system_contract = prompt_override
-        .map(|o| o.apply_if_matches("user.reply.system", system_contract.clone()))
+        .map(|o| o.use_frozen_base_if_matches("user.reply.system", system_contract.clone()))
         .unwrap_or(system_contract);
-    let (policy, _policy_version) = prompts::load_prompt_for_contact(
+    let system_contract = prompt_override
+        .map(|o| o.append_if_matches("user.reply.system", system_contract.clone()))
+        .unwrap_or(system_contract);
+    let (policy, policy_version) = prompts::load_prompt_for_contact(
         &state.db,
-        &state.config.default_workspace_id,
+        &contact.workspace_id,
         "user.reply.policy",
         &contact.wxid,
         contact.locale.as_deref(),
     )
     .await?;
+    if let Some(budget) = super::budget::current_run_budget() {
+        budget.record_prompt_version("user.reply.policy", policy_version);
+    }
     // universal-domain-adaptation：reply.policy 链的全部 **prompt 类 profile override**
     // 收敛到 domain_profile.rs 的单一注入点 `apply_reply_policy_prompt_overrides`（C3 轻量
     // 约定）。它按固定顺序串起：①经营公式段单一真相源（H15，剥离遗留内联段→注入 active
@@ -653,18 +680,28 @@ pub(crate) async fn decide_reply_with_promote(
     // 内容完全一致，零运行时影响）、销售域零行为变化（语义等价护栏见 domain_profile.rs `#[cfg(test)]`）。
     // **红线**：boundary_protection 不放宽边界保护硬规则段不在任何替换范围、任何行业写死守护。
     // 新增 reply.policy 类 prompt override 字段时，加进那个 helper（勿在此散接）——见 helper 文档。
-    let policy = super::domain_profile::apply_reply_policy_prompt_overrides(&policy, &active_profile);
     let policy = prompt_override
-        .map(|o| o.apply_if_matches("user.reply.policy", policy.clone()))
+        .map(|o| o.use_frozen_base_if_matches("user.reply.policy", policy.clone()))
         .unwrap_or(policy);
-    let (task_template, _task_version) = prompts::load_prompt_for_contact(
+    let policy =
+        super::domain_profile::apply_reply_policy_prompt_overrides(&policy, &active_profile);
+    let policy = prompt_override
+        .map(|o| o.append_if_matches("user.reply.policy", policy.clone()))
+        .unwrap_or(policy);
+    let (task_template, task_version) = prompts::load_prompt_for_contact(
         &state.db,
-        &state.config.default_workspace_id,
+        &contact.workspace_id,
         "user.reply.task",
         &contact.wxid,
         contact.locale.as_deref(),
     )
     .await?;
+    if let Some(budget) = super::budget::current_run_budget() {
+        budget.record_prompt_version("user.reply.task", task_version);
+    }
+    let task_template = prompt_override
+        .map(|o| o.use_frozen_base_if_matches("user.reply.task", task_template.clone()))
+        .unwrap_or(task_template);
     // universal-domain-adaptation H17：在静态 task prompt 后追加本行业 memoryCandidates
     // 合法 type 指引（DEFAULT 销售八维→空串、Reply Agent prompt 字节不变、销售零扰动；
     // 情感等非销售 profile→告知 LLM 本行业候选类型，让情感记忆能作为 candidate 写出）。
@@ -693,10 +730,20 @@ pub(crate) async fn decide_reply_with_promote(
     // 只有 customer_stage/intent_level 两维（typed）→ 空串、prompt 字节等价；
     // 换非销售行业（含本专题的 purchase_lifecycle）→ 注入维度语义 + domainSignals
     // 输出位置，让维度值能真正从 LLM 流到 AgentDecision.domain_signals。
-    let taxonomy_cache = crate::agent::taxonomy::global_taxonomy_cache();
-    taxonomy_cache
-        .find_or_load(&state.db, &contact.workspace_id)
-        .await;
+    let taxonomy_cache = match shadow_snapshot.as_ref() {
+        Some(snapshot) => snapshot.taxonomy_cache.clone(),
+        None => crate::agent::taxonomy::global_taxonomy_cache(&state.db),
+    };
+    if shadow_snapshot.is_some() {
+        // The task-local cache is a deep copy and cannot be invalidated by a
+        // concurrent admin taxonomy write.
+    } else if super::current_run_mode() == "shadow" {
+        taxonomy_cache.find_or_load_read_only(&state.db).await?;
+    } else {
+        taxonomy_cache
+            .find_or_load(&state.db, &contact.workspace_id)
+            .await?;
+    }
     let task_template = format!(
         "{task_template}{}",
         super::domain_profile::render_decision_dimensions_guidance(
@@ -714,7 +761,7 @@ pub(crate) async fn decide_reply_with_promote(
         &active_profile.conversation_modes,
     );
     let task_template = prompt_override
-        .map(|o| o.apply_if_matches("user.reply.task", task_template.clone()))
+        .map(|o| o.append_if_matches("user.reply.task", task_template.clone()))
         .unwrap_or(task_template);
     // R-prompt-v3：Operator Instruction 层（最高优先级）。运营人员可在后台对
     // 单个联系人写一段 ≤ 1000 字的特别指令，覆盖 Soul + Policy 的默认人格判定
@@ -818,7 +865,11 @@ pub(crate) async fn decide_reply_with_promote(
         contact
             .domain_attributes
             .as_ref()
-            .and_then(|doc| doc.get_str("purchase_lifecycle").ok().map(|s| s.to_string()))
+            .and_then(|doc| {
+                doc.get_str("purchase_lifecycle")
+                    .ok()
+                    .map(|s| s.to_string())
+            })
             .unwrap_or_default()
     } else {
         String::new()
@@ -974,11 +1025,15 @@ pub(crate) async fn decide_reply_with_promote(
         history,
         // H10：合法 relay（is_synthetic_relay=true）保留哨兵触发转述模式；
         // 一切非合法-relay 消息（含客户伪造哨兵）剥哨兵，LLM 永不对客户输入进入转述模式。
-        crate::agent::prompt_isolation::inbound_prompt_content(&inbound.content, inbound.is_synthetic_relay)
+        crate::agent::prompt_isolation::inbound_prompt_content(
+            &inbound.content,
+            inbound.is_synthetic_relay
+        )
     );
 
     let value = generate_agent_json(
         state,
+        &contact.workspace_id,
         Some(&contact.account_id),
         Some(&contact.wxid),
         run_id,
@@ -1046,7 +1101,8 @@ pub async fn load_operation_playbook_for_contact(
                 doc! {
                     "_id": id,
                     "workspace_id": &contact.workspace_id,
-                    "account_id": &contact.account_id
+                    "account_id": &contact.account_id,
+                    "release_status": "published",
                 },
                 None,
             )
@@ -1062,6 +1118,7 @@ pub async fn load_operation_playbook_for_contact(
             doc! {
                 "workspace_id": &contact.workspace_id,
                 "account_id": &contact.account_id,
+                "release_status": "published",
                 "is_default": true
             },
             FindOneOptions::builder()
@@ -1087,30 +1144,23 @@ pub(crate) async fn initial_operation_state_for_contact(
     state: &AppState,
     contact: &Contact,
 ) -> AppResult<String> {
-    let domain_config = load_user_operation_domain_config_for_contact(
-        state,
-        &contact.workspace_id,
-        &contact.wxid,
-    )
-    .await?;
-    Ok(super::guards::initial_operation_state_key(domain_config.as_ref()))
+    let domain_config =
+        load_user_operation_domain_config_for_contact(state, &contact.workspace_id, &contact.wxid)
+            .await?;
+    Ok(super::guards::initial_operation_state_key(
+        domain_config.as_ref(),
+    ))
 }
 
-/// Phase E5-T1：active_versions 灰度感知 loader。
+/// SR-008：加载唯一 current 运营域配置。
 ///
-/// 选择规则：
-///   1. 拉所有 `(workspace_id, domain="user_operations", current_version=true)` 行；
-///   2. 0 行 → 退回 `current_version: { $exists: false }` 的老形态（向前兼容老库）；
-///   3. 1 行 → 直接返回；
-///   4. ≥2 行 → 用 `prompts::ab_bucket_for_contact(contact_id, n)` 哈希挑一份；
-///      `contact_id` 为空字符串时退化为桶 0（admin / 模拟路径不分桶，稳定可重放）。
-///
-/// `(workspace_id, domain, current_version=true)` 部分索引由
-/// `db::indexes::ensure_ops_versioned_indexes` 创建，索引保命中。
+/// 历史版本可以驻留，但运行时不再把异常的多 current 当作隐式 A/B。scope 完全
+/// 不存在时返回 `None`；只要已有版本流却没有 current，或发现多个 current，就
+/// fail closed。m048 与 partial unique index 分别负责升级收敛和持续约束。
 pub(crate) async fn load_user_operation_domain_config_for_contact(
     state: &AppState,
     workspace_id: &str,
-    contact_id: &str,
+    _contact_id: &str,
 ) -> AppResult<Option<OperationDomainConfig>> {
     use futures::TryStreamExt;
     use mongodb::bson::doc;
@@ -1129,41 +1179,48 @@ pub(crate) async fn load_user_operation_domain_config_for_contact(
         .try_collect()
         .await
         .map_err(AppError::from)?;
-    if active.is_empty() {
-        // 老库（pre-E5-T1，缺 current_version 字段）兜底；m015 backfill 后这条
-        // 路径不会再命中，仅做单次升级窗口的防御。
-        return coll
-            .find_one(
-                doc! {
-                    "workspace_id": workspace_id,
-                    "domain": "user_operations",
-                    "current_version": { "$exists": false },
-                },
-                None,
-            )
-            .await
-            .map_err(AppError::from);
-    }
     if active.len() == 1 {
         return Ok(Some(active.remove(0)));
     }
-    let bucket = crate::prompts::ab_bucket_for_contact(contact_id, active.len());
-    Ok(Some(active.swap_remove(bucket)))
+    if active.len() > 1 {
+        return Err(AppError::Conflict(
+            "multiple_current_operation_domain_configs".to_string(),
+        ));
+    }
+    let scope_exists = coll
+        .find_one(
+            doc! {
+                "workspace_id": workspace_id,
+                "domain": "user_operations",
+            },
+            None,
+        )
+        .await
+        .map_err(AppError::from)?
+        .is_some();
+    if scope_exists {
+        Err(AppError::Conflict(
+            "missing_current_operation_domain_config".to_string(),
+        ))
+    } else {
+        Ok(None)
+    }
 }
 
 /// Phase B / B4：按 `(workspace_id, domain="user_operations", state_key)` 加载
-/// `operation_state_policies` 行。无行 / 老库无 collection / `state_key` 为空均
-/// 返回 `Ok(None)` —— 调用方 `enforce_state_action_policy(None, ...)` fallthrough，
-/// 向前兼容（老部署不被 Phase B 引入新边界破坏）。
+/// `operation_state_policies` 行。只有完全没有 current `user_operations` 状态机的
+/// 老部署才允许缺 policy 时返回 `Ok(None)`；只要状态机已存在，每个运行态都必须有
+/// 唯一、active 的 current policy，否则 fail closed，避免状态机切换与 policy 派生之间
+/// 的短暂失败窗口放行本应被禁止的客户动作。
 ///
-/// Phase E5-T1：与 [`load_user_operation_domain_config_for_contact`] 同形的
-/// active_versions 灰度感知 loader。`contact_id` 用于在多版本 active 集合上
-/// 哈希分桶；admin / 模拟路径可传空字符串，退化为桶 0 稳定可重放。
+/// SR-008：与 [`load_user_operation_domain_config_for_contact`] 同形的唯一 current
+/// loader。无该 state 的任何版本时保持 `None` 兼容；已有历史却没有唯一 current
+/// 时 fail closed，禁止状态保护门因损坏指针静默失效。
 pub(crate) async fn load_operation_state_policy_for_contact(
     state: &AppState,
     workspace_id: &str,
     state_key: &str,
-    contact_id: &str,
+    _contact_id: &str,
 ) -> AppResult<Option<crate::models::OperationStatePolicy>> {
     use futures::TryStreamExt;
     use mongodb::bson::doc;
@@ -1187,25 +1244,46 @@ pub(crate) async fn load_operation_state_policy_for_contact(
         .try_collect()
         .await
         .map_err(AppError::from)?;
-    if active.is_empty() {
-        return coll
-            .find_one(
-                doc! {
-                    "workspace_id": workspace_id,
-                    "domain": "user_operations",
-                    "state_key": key,
-                    "current_version": { "$exists": false },
-                },
-                None,
-            )
-            .await
-            .map_err(AppError::from);
-    }
     if active.len() == 1 {
-        return Ok(Some(active.remove(0)));
+        let policy = active.remove(0);
+        if policy.status != "active" {
+            return Err(AppError::Conflict(
+                "inactive_current_operation_state_policy".to_string(),
+            ));
+        }
+        return Ok(Some(policy));
     }
-    let bucket = crate::prompts::ab_bucket_for_contact(contact_id, active.len());
-    Ok(Some(active.swap_remove(bucket)))
+    if active.len() > 1 {
+        return Err(AppError::Conflict(
+            "multiple_current_operation_state_policies".to_string(),
+        ));
+    }
+    let scope_exists = coll
+        .find_one(
+            doc! {
+                "workspace_id": workspace_id,
+                "domain": "user_operations",
+                "state_key": key,
+            },
+            None,
+        )
+        .await
+        .map_err(AppError::from)?
+        .is_some();
+    if scope_exists {
+        Err(AppError::Conflict(
+            "missing_current_operation_state_policy".to_string(),
+        ))
+    } else if load_user_operation_domain_config_for_contact(state, workspace_id, _contact_id)
+        .await?
+        .is_some()
+    {
+        Err(AppError::Conflict(
+            "missing_current_operation_state_policy".to_string(),
+        ))
+    } else {
+        Ok(None)
+    }
 }
 
 pub(crate) fn format_operation_domain_config_for_prompt(config: &OperationDomainConfig) -> String {
@@ -1382,25 +1460,14 @@ fn non_empty_override(value: Option<&str>) -> Option<String> {
 
 pub(crate) async fn load_published_soul(
     state: &AppState,
+    workspace_id: &str,
     agent_kind: &str,
-) -> AppResult<Option<String>> {
-    use mongodb::bson::doc;
-    use mongodb::options::FindOneOptions;
-    let soul = state
-        .db
-        .agent_souls()
-        .find_one(
-            doc! {
-                "workspace_id": &state.config.default_workspace_id,
-                "agent_kind": agent_kind,
-                "status": "published"
-            },
-            FindOneOptions::builder()
-                .sort(doc! { "version": -1, "updated_at": -1 })
-                .build(),
-        )
-        .await?;
-    Ok(soul.map(|item| item.content))
+) -> AppResult<String> {
+    Ok(
+        crate::soul_versions::load_unique_published(&state.db, workspace_id, agent_kind)
+            .await?
+            .content,
+    )
 }
 
 /// media-asset Task 8：加载本 workspace + account 下「可发送素材」（sendable +
@@ -1768,7 +1835,10 @@ mod persona_override_tests {
     //! 「回落原出厂本体」。DEFAULT_PROFILE 两 override 均 None 必须返回 None（回落），
     //! 保证销售域字节不变。
 
-    use super::{assemble_system_prompt, format_knowledge_route_for_prompt, non_empty_override, render_business_context_fragment, render_safety_donts_commitments};
+    use super::{
+        assemble_system_prompt, format_knowledge_route_for_prompt, non_empty_override,
+        render_business_context_fragment, render_safety_donts_commitments,
+    };
     use mongodb::bson::doc;
 
     #[test]
@@ -1813,13 +1883,8 @@ mod persona_override_tests {
     fn assemble_system_prompt_layers_order_and_separators() {
         // 全段非空：Soul \n\n Contract \n\n Policy + BusinessContext + OperatorInstruction
         // （后两段自带前导 \n\n，故拼装处不再加分隔符——直接紧贴）。
-        let out = assemble_system_prompt(
-            "SOUL",
-            "CONTRACT",
-            "POLICY",
-            "\n\nBUSINESS",
-            "\n\nOPERATOR",
-        );
+        let out =
+            assemble_system_prompt("SOUL", "CONTRACT", "POLICY", "\n\nBUSINESS", "\n\nOPERATOR");
         assert_eq!(out, "SOUL\n\nCONTRACT\n\nPOLICY\n\nBUSINESS\n\nOPERATOR");
     }
 
@@ -1828,7 +1893,10 @@ mod persona_override_tests {
     #[test]
     fn assemble_system_prompt_default_degenerates_to_three_layers() {
         let out = assemble_system_prompt("SOUL", "CONTRACT", "POLICY", "", "");
-        assert_eq!(out, "SOUL\n\nCONTRACT\n\nPOLICY", "DEFAULT 域应退化为三层、无多余分隔符");
+        assert_eq!(
+            out, "SOUL\n\nCONTRACT\n\nPOLICY",
+            "DEFAULT 域应退化为三层、无多余分隔符"
+        );
     }
 
     /// 修复 #104：DEFAULT_PROFILE prompt_fragment=None → business_context 空串。
@@ -1886,14 +1954,23 @@ mod persona_override_tests {
         };
         let out = format_knowledge_route_for_prompt(&route);
         assert!(out.contains("neededCategories"), "保留 neededCategories");
-        assert!(out.contains("selectedKnowledgeIds"), "保留 selectedKnowledgeIds");
+        assert!(
+            out.contains("selectedKnowledgeIds"),
+            "保留 selectedKnowledgeIds"
+        );
         assert!(out.contains("knowledgeCoverage"), "保留 knowledgeCoverage");
         assert!(out.contains("missingKnowledge"), "保留 missingKnowledge");
-        assert!(!out.contains("命中产品事实切片"), "剔除 reason 内容（防越权承接措辞回流）");
+        assert!(
+            !out.contains("命中产品事实切片"),
+            "剔除 reason 内容（防越权承接措辞回流）"
+        );
         assert!(!out.contains("\"reason\""), "剔除 reason 字段 key");
         assert!(!out.contains("toolTrace"), "剔除 toolTrace");
         assert!(!out.contains("evidenceExcerpts"), "剔除 evidenceExcerpts");
-        assert!(!out.contains("selectedChunkRankings"), "剔除 selectedChunkRankings");
+        assert!(
+            !out.contains("selectedChunkRankings"),
+            "剔除 selectedChunkRankings"
+        );
         assert!(!out.contains("某条摘录"), "剔除 evidenceExcerpts 内容");
     }
 
@@ -1902,8 +1979,7 @@ mod persona_override_tests {
     fn format_knowledge_route_empty_is_valid_json_without_debug_keys() {
         use crate::agent::types::KnowledgeRouteResult;
         let out = format_knowledge_route_for_prompt(&KnowledgeRouteResult::default());
-        let parsed: serde_json::Value =
-            serde_json::from_str(&out).expect("产出必须是合法 JSON");
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("产出必须是合法 JSON");
         assert!(parsed.is_object(), "产出应为 JSON 对象");
         assert!(!out.contains("toolTrace"));
         assert!(!out.contains("evidenceExcerpts"));
@@ -1925,7 +2001,10 @@ mod persona_override_tests {
         assert!(out.contains("doNotDo"), "安全子片必须含 doNotDo 键");
         assert!(out.contains("commitments"), "安全子片必须含 commitments 键");
         assert!(out.contains("不要催单"), "doNotDo 实际内容必须随档注入");
-        assert!(out.contains("周五前发报价单"), "commitments 实际内容必须随档注入");
+        assert!(
+            out.contains("周五前发报价单"),
+            "commitments 实际内容必须随档注入"
+        );
     }
 
     /// §3 铁律的另一面：Relational / Full 档下槽6 memory_text 的 `memoryCard` 字段已含
@@ -1938,7 +2017,10 @@ mod persona_override_tests {
             "commitments": ["周五前发报价单"],
         };
         assert_eq!(
-            render_safety_donts_commitments(crate::agent::sufficiency::PromptTier::Relational, &pack),
+            render_safety_donts_commitments(
+                crate::agent::sufficiency::PromptTier::Relational,
+                &pack
+            ),
             "",
             "Relational 档应空串（完整 memory_card 已含），避免重复注入"
         );
@@ -1957,7 +2039,10 @@ mod persona_override_tests {
         let out =
             render_safety_donts_commitments(crate::agent::sufficiency::PromptTier::Lean, &empty);
         assert!(out.contains("doNotDo"), "缺字段时仍应有 doNotDo 键骨架");
-        assert!(out.contains("commitments"), "缺字段时仍应有 commitments 键骨架");
+        assert!(
+            out.contains("commitments"),
+            "缺字段时仍应有 commitments 键骨架"
+        );
     }
 
     /// A/T2：**同构测试**——复刻 decision.rs reply.policy 组装链里
@@ -1995,7 +2080,10 @@ mod persona_override_tests {
             !out.contains(crate::prompts::DEFAULT_MODE_GATE_POLICY),
             "销售锚段应被整体替换、不残留：{out}"
         );
-        assert!(out.contains("前置内容") && out.contains("后置内容"), "锚段外文本应原样保留");
+        assert!(
+            out.contains("前置内容") && out.contains("后置内容"),
+            "锚段外文本应原样保留"
+        );
 
         // override=None → 链路对 policy 字节不变（销售域字节等价护栏）。
         let none_after_conv = apply_conversation_mode_policy(&policy, None);
@@ -2103,14 +2191,12 @@ mod persona_override_tests {
         use super::render_tags_for_prompt;
         use crate::models::ConfirmedTag;
         use mongodb::bson::DateTime;
-        let confirmed = vec![
-            ConfirmedTag {
-                value: "价格敏感".to_string(),
-                evidences: vec![],
-                confirmed_at: DateTime::from_millis(0),
-                confirmed_by: "consolidation".to_string(),
-            },
-        ];
+        let confirmed = vec![ConfirmedTag {
+            value: "价格敏感".to_string(),
+            evidences: vec![],
+            confirmed_at: DateTime::from_millis(0),
+            confirmed_by: "consolidation".to_string(),
+        }];
         let out = render_tags_for_prompt(&[], &confirmed);
         assert!(out.contains("价格敏感"));
         assert!(out.contains("AI 判断"));
@@ -2122,14 +2208,12 @@ mod persona_override_tests {
         use crate::models::ConfirmedTag;
         use mongodb::bson::DateTime;
         let manual = vec!["VIP".to_string()];
-        let confirmed = vec![
-            ConfirmedTag {
-                value: "价格敏感".to_string(),
-                evidences: vec![],
-                confirmed_at: DateTime::from_millis(0),
-                confirmed_by: "consolidation".to_string(),
-            },
-        ];
+        let confirmed = vec![ConfirmedTag {
+            value: "价格敏感".to_string(),
+            evidences: vec![],
+            confirmed_at: DateTime::from_millis(0),
+            confirmed_by: "consolidation".to_string(),
+        }];
         let out = render_tags_for_prompt(&manual, &confirmed);
         assert!(out.contains("VIP"));
         assert!(out.contains("价格敏感"));
@@ -2144,13 +2228,20 @@ mod prompt_override_tests {
 
     #[test]
     fn prompt_override_appends_only_on_key_match() {
-        let ov = PromptOverride { target_prompt_key: "user.reply.policy".into(), append_snippet: "补充约束".into() };
-        // 命中 key → 末尾追加（复用 compose_appended_content 语义:原文开头+片段结尾）
-        let hit = ov.apply_if_matches("user.reply.policy", "原策略正文".into());
-        assert!(hit.starts_with("原策略正文"));
+        let ov = PromptOverride::new(
+            "user.reply.policy".into(),
+            "补充约束".into(),
+            "冻结策略正文".into(),
+        );
+        let base = ov.use_frozen_base_if_matches("user.reply.policy", "A/B 策略正文".into());
+        assert_eq!(base, "冻结策略正文");
+        // 命中 key → 末尾追加（复用 compose_appended_content 语义:冻结原文+片段）
+        let hit = ov.append_if_matches("user.reply.policy", base);
+        assert!(hit.starts_with("冻结策略正文"));
         assert!(hit.ends_with("补充约束"));
+        assert!(ov.was_applied());
         // 不命中 key → 原样逐字返回（字节等价护栏）
-        let miss = ov.apply_if_matches("user.reply.system", "系统契约正文".into());
+        let miss = ov.append_if_matches("user.reply.system", "系统契约正文".into());
         assert_eq!(miss, "系统契约正文");
     }
 }
@@ -2170,7 +2261,10 @@ mod tier_injection_tests {
     #[test]
     fn relational_asset_hidden_in_lean_visible_from_relational() {
         assert!(!asset_visible_at_tier(Some("relational"), PromptTier::Lean));
-        assert!(asset_visible_at_tier(Some("relational"), PromptTier::Relational));
+        assert!(asset_visible_at_tier(
+            Some("relational"),
+            PromptTier::Relational
+        ));
         assert!(asset_visible_at_tier(Some("relational"), PromptTier::Full));
     }
 
@@ -2187,7 +2281,10 @@ mod tier_injection_tests {
         assert!(!asset_visible_at_tier(None, PromptTier::Lean));
         assert!(!asset_visible_at_tier(None, PromptTier::Relational));
         assert!(asset_visible_at_tier(None, PromptTier::Full));
-        assert!(!asset_visible_at_tier(Some("garbage"), PromptTier::Relational));
+        assert!(!asset_visible_at_tier(
+            Some("garbage"),
+            PromptTier::Relational
+        ));
         assert!(asset_visible_at_tier(Some("garbage"), PromptTier::Full));
     }
 
@@ -2207,7 +2304,7 @@ mod tier_injection_tests {
 
 #[cfg(test)]
 mod render_assets_tests {
-    use super::{render_referable_assets, render_forbidden_assets};
+    use super::{render_forbidden_assets, render_referable_assets};
     use crate::models::ContentAsset;
     use mongodb::bson::DateTime;
 
@@ -2253,9 +2350,11 @@ mod render_assets_tests {
 
     #[test]
     fn forbidden_renders_without_kind_label() {
-        let out = render_forbidden_assets(vec![
-            asset("forbidden_expression", "保本承诺", Some("不得说保本保收益")),
-        ]);
+        let out = render_forbidden_assets(vec![asset(
+            "forbidden_expression",
+            "保本承诺",
+            Some("不得说保本保收益"),
+        )]);
         assert_eq!(out, "- 保本承诺: 不得说保本保收益");
     }
 
@@ -2267,8 +2366,14 @@ mod render_assets_tests {
 
     #[test]
     fn none_body_renders_empty_without_panic() {
-        assert_eq!(render_referable_assets(vec![asset("text", "无正文", None)]), "- [text] 无正文: ");
-        assert_eq!(render_forbidden_assets(vec![asset("forbidden_expression", "禁语无正文", None)]), "- 禁语无正文: ");
+        assert_eq!(
+            render_referable_assets(vec![asset("text", "无正文", None)]),
+            "- [text] 无正文: "
+        );
+        assert_eq!(
+            render_forbidden_assets(vec![asset("forbidden_expression", "禁语无正文", None)]),
+            "- 禁语无正文: "
+        );
     }
 }
 
@@ -2288,7 +2393,7 @@ mod context_assets_filter_tests {
         let kind = f.get_document("kind").unwrap();
         let arr = kind.get_array("$in").unwrap();
         assert_eq!(arr.len(), 4); // text/faq/script/brand_voice
-        // 非 Full 档：tier_cond 只有 $in，无 $exists 兜底
+                                  // 非 Full 档：tier_cond 只有 $in，无 $exists 兜底
         let and = f.get_array("$and").unwrap();
         let tier_cond = and[0].as_document().unwrap();
         let mit = tier_cond.get_document("min_inject_tier").unwrap();
@@ -2319,7 +2424,7 @@ mod context_assets_filter_tests {
         assert_eq!(f.get_str("workspace_id").ok(), Some("ws"));
         assert_eq!(f.get_str("kind").ok(), Some("forbidden_expression"));
         assert!(f.contains_key("$or")); // account
-        // 恒注入证据：filter 完全不含 min_inject_tier / tier 相关键
+                                        // 恒注入证据：filter 完全不含 min_inject_tier / tier 相关键
         assert!(!f.contains_key("min_inject_tier"));
         assert!(!f.contains_key("$and"));
     }

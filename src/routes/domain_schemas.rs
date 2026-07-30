@@ -9,11 +9,10 @@
 //! 路由（全部挂在 `/api/admin/domain-schemas` 下）：
 //!
 //! - `GET    /admin/domain-schemas`              列表（按 workspace_id）
-//! - `POST   /admin/domain-schemas`              新建（自动 version=既有 max+1）
-//! - `PUT    /admin/domain-schemas/:id`          更新（id 是 schema_id slug）
-//! - `DELETE /admin/domain-schemas/:id`          删除（不允许删 active 那条）
-//! - `POST   /admin/domain-schemas/:id/activate` 切换 active：把同 workspace 其它
-//!   active 全部置 false，再把目标置 true。
+//! - `POST   /admin/domain-schemas`              创建全新 lineage（固定 version=1）
+//! - `PUT    /admin/domain-schemas/:id`          从 expectedVersion 追加 inactive 新版
+//! - `DELETE /admin/domain-schemas/:id`          精确删除 expectedVersion 非 active 版
+//! - `POST   /admin/domain-schemas/:id/activate` 事务切换 expectedVersion 为唯一 active
 //!
 //! 校验红线（在 [`validate_schema_payload`] 内集中处理）：
 //! - `fields.len() <= 64`
@@ -27,8 +26,9 @@ use axum::{
     Extension, Json,
 };
 use futures::TryStreamExt;
-use mongodb::bson::{doc, to_bson, DateTime, Document};
-use mongodb::options::{FindOneOptions, FindOptions};
+use mongodb::bson::{doc, DateTime, Document};
+use mongodb::error::{ErrorKind, WriteFailure};
+use mongodb::options::{FindOneOptions, FindOptions, TransactionOptions};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -89,6 +89,8 @@ pub(super) struct ListQuery {
     /// 仅返 active：默认 false（admin 看历史版本）。
     #[serde(default)]
     active_only: bool,
+    /// Mutation routes require this optimistic identity token. List ignores it.
+    expected_version: Option<i32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -103,6 +105,9 @@ pub(super) struct UpsertRequest {
     pub alias_dict: serde_json::Value,
     #[serde(default)]
     pub guard_dsl: Option<String>,
+    /// Required by PUT; omitted by create. It binds the edit to the selected row.
+    #[serde(default)]
+    pub expected_version: Option<i32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -148,8 +153,7 @@ impl From<&DomainSchema> for DomainSchemaView {
                 alias_of: f.alias_of.clone(),
             })
             .collect();
-        let alias_dict = mongodb::bson::Bson::Document(s.alias_dict.clone())
-            .into_relaxed_extjson();
+        let alias_dict = mongodb::bson::Bson::Document(s.alias_dict.clone()).into_relaxed_extjson();
         Self {
             schema_id: s.schema_id.clone(),
             workspace_id: s.workspace_id.clone(),
@@ -170,7 +174,8 @@ pub(super) async fn list_domain_schemas(
     Extension(admin): Extension<AuthenticatedAdmin>,
     Query(params): Query<ListQuery>,
 ) -> AppResult<Json<Value>> {
-    let workspace_id = resolve_authorized_workspace(&state, &admin, params.workspace_id.clone()).await?;
+    let workspace_id =
+        resolve_authorized_workspace(&state, &admin, params.workspace_id.clone()).await?;
     let mut filter = doc! { "workspace_id": &workspace_id };
     if params.active_only {
         filter.insert("is_active", true);
@@ -197,23 +202,42 @@ pub(super) async fn create_domain_schema(
     Extension(admin): Extension<AuthenticatedAdmin>,
     Json(body): Json<UpsertRequest>,
 ) -> AppResult<Json<Value>> {
-    let workspace_id = resolve_authorized_workspace(&state, &admin, body.workspace_id.clone()).await?;
-    if body.schema_id.trim().is_empty() {
+    let workspace_id =
+        resolve_authorized_workspace(&state, &admin, body.workspace_id.clone()).await?;
+    let schema_id = body.schema_id.trim();
+    if schema_id.is_empty() {
         return Err(AppError::BadRequest("schemaId 不能为空".to_string()));
+    }
+    if schema_id != body.schema_id {
+        return Err(AppError::BadRequest(
+            "schemaId 不得包含首尾空白".to_string(),
+        ));
     }
     if body.name.trim().is_empty() {
         return Err(AppError::BadRequest("name 不能为空".to_string()));
     }
+    let lineage_exists = state
+        .db
+        .domain_schemas()
+        .find_one(
+            doc! { "workspace_id": &workspace_id, "schema_id": schema_id },
+            None,
+        )
+        .await?
+        .is_some();
+    if lineage_exists {
+        return Err(AppError::Conflict(
+            "domain_schema_lineage_already_exists".to_string(),
+        ));
+    }
     let (fields, alias_dict_doc) = validate_schema_payload(&body.fields, &body.alias_dict)?;
-    // 同 workspace + 同 schema_id 取 max version + 1（同名升级）
-    let next_version = next_version_for(&state, &workspace_id, &body.schema_id).await?;
     let now = DateTime::now();
     let cfg = DomainSchema {
         id: None,
-        schema_id: body.schema_id.clone(),
+        schema_id: schema_id.to_string(),
         workspace_id: workspace_id.clone(),
         name: body.name.clone(),
-        version: next_version,
+        version: 1,
         fields,
         alias_dict: alias_dict_doc,
         guard_dsl: body.guard_dsl.clone(),
@@ -226,7 +250,7 @@ pub(super) async fn create_domain_schema(
         .domain_schemas()
         .insert_one(&cfg, None)
         .await
-        .map_err(|err| AppError::BadRequest(format!("创建失败: {err}")))?;
+        .map_err(map_domain_schema_insert_error)?;
     Ok(Json(json!({ "item": DomainSchemaView::from(&cfg) })))
 }
 
@@ -236,51 +260,56 @@ pub(super) async fn update_domain_schema(
     Path(schema_id): Path<String>,
     Json(body): Json<UpsertRequest>,
 ) -> AppResult<Json<Value>> {
-    let workspace_id = resolve_authorized_workspace(&state, &admin, body.workspace_id.clone()).await?;
-    let existing = state
+    let workspace_id =
+        resolve_authorized_workspace(&state, &admin, body.workspace_id.clone()).await?;
+    let expected_version = require_expected_version(body.expected_version)?;
+    if body.schema_id != schema_id {
+        return Err(AppError::Conflict(
+            "domain_schema_id_is_immutable".to_string(),
+        ));
+    }
+    if body.name.trim().is_empty() {
+        return Err(AppError::BadRequest("name 不能为空".to_string()));
+    }
+    let source = state
         .db
         .domain_schemas()
         .find_one(
-            doc! { "workspace_id": &workspace_id, "schema_id": &schema_id },
-            FindOneOptions::builder()
-                .sort(doc! { "version": -1 })
-                .build(),
+            doc! {
+                "workspace_id": &workspace_id,
+                "schema_id": &schema_id,
+                "version": expected_version,
+            },
+            None,
         )
         .await?
-        .ok_or_else(|| AppError::NotFound(format!("schema {schema_id} not found")))?;
+        .ok_or_else(|| AppError::Conflict("domain_schema_version_changed".to_string()))?;
     let (fields, alias_dict_doc) = validate_schema_payload(&body.fields, &body.alias_dict)?;
-    let fields_bson = to_bson(&fields)?;
+    let next_version = next_version_for(&state, &workspace_id, &schema_id).await?;
     let now = DateTime::now();
-    let mut update = doc! {
-        "name": &body.name,
-        "fields": fields_bson,
-        "alias_dict": alias_dict_doc,
-        "updated_at": now,
+    let successor = DomainSchema {
+        id: None,
+        schema_id: source.schema_id,
+        workspace_id: source.workspace_id,
+        name: body.name,
+        version: next_version,
+        fields,
+        alias_dict: alias_dict_doc,
+        guard_dsl: body.guard_dsl,
+        is_active: false,
+        created_at: now,
+        updated_at: now,
     };
-    if let Some(g) = &body.guard_dsl {
-        update.insert("guard_dsl", g);
-    } else {
-        update.insert("guard_dsl", mongodb::bson::Bson::Null);
-    }
     state
         .db
         .domain_schemas()
-        .update_one(
-            doc! { "workspace_id": &workspace_id, "schema_id": &schema_id, "version": existing.version },
-            doc! { "$set": update },
-            None,
-        )
-        .await?;
-    let refreshed = state
-        .db
-        .domain_schemas()
-        .find_one(
-            doc! { "workspace_id": &workspace_id, "schema_id": &schema_id, "version": existing.version },
-            None,
-        )
-        .await?
-        .ok_or_else(|| AppError::NotFound("schema 更新后未找到".to_string()))?;
-    Ok(Json(json!({ "item": DomainSchemaView::from(&refreshed) })))
+        .insert_one(&successor, None)
+        .await
+        .map_err(map_domain_schema_insert_error)?;
+    Ok(Json(json!({
+        "item": DomainSchemaView::from(&successor),
+        "previousVersion": expected_version,
+    })))
 }
 
 pub(super) async fn delete_domain_schema(
@@ -289,15 +318,19 @@ pub(super) async fn delete_domain_schema(
     Path(schema_id): Path<String>,
     Query(params): Query<ListQuery>,
 ) -> AppResult<Json<Value>> {
-    let workspace_id = resolve_authorized_workspace(&state, &admin, params.workspace_id.clone()).await?;
+    let workspace_id =
+        resolve_authorized_workspace(&state, &admin, params.workspace_id.clone()).await?;
+    let expected_version = require_expected_version(params.expected_version)?;
     let existing = state
         .db
         .domain_schemas()
         .find_one(
-            doc! { "workspace_id": &workspace_id, "schema_id": &schema_id },
-            FindOneOptions::builder()
-                .sort(doc! { "version": -1 })
-                .build(),
+            doc! {
+                "workspace_id": &workspace_id,
+                "schema_id": &schema_id,
+                "version": expected_version,
+            },
+            None,
         )
         .await?
         .ok_or_else(|| AppError::NotFound(format!("schema {schema_id} not found")))?;
@@ -306,14 +339,24 @@ pub(super) async fn delete_domain_schema(
             "请先启用其它 schema 再删除当前激活的版本".to_string(),
         ));
     }
-    state
+    let deleted = state
         .db
         .domain_schemas()
-        .delete_many(
-            doc! { "workspace_id": &workspace_id, "schema_id": &schema_id },
+        .delete_one(
+            doc! {
+                "workspace_id": &workspace_id,
+                "schema_id": &schema_id,
+                "version": expected_version,
+                "is_active": false,
+            },
             None,
         )
         .await?;
+    if deleted.deleted_count != 1 {
+        return Err(AppError::Conflict(
+            "domain_schema_version_changed".to_string(),
+        ));
+    }
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -323,68 +366,179 @@ pub(super) async fn activate_domain_schema(
     Path(schema_id): Path<String>,
     Query(params): Query<ListQuery>,
 ) -> AppResult<Json<Value>> {
-    let workspace_id = resolve_authorized_workspace(&state, &admin, params.workspace_id.clone()).await?;
-    let target = state
-        .db
-        .domain_schemas()
-        .find_one(
-            doc! { "workspace_id": &workspace_id, "schema_id": &schema_id },
-            FindOneOptions::builder()
-                .sort(doc! { "version": -1 })
-                .build(),
-        )
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("schema {schema_id} not found")))?;
-    let now = DateTime::now();
-    state
-        .db
-        .domain_schemas()
-        .update_many(
-            doc! {
-                "workspace_id": &workspace_id,
-                "is_active": true,
-            },
-            doc! { "$set": { "is_active": false, "updated_at": now } },
-            None,
-        )
-        .await?;
-    state
-        .db
-        .domain_schemas()
-        .update_one(
-            doc! {
-                "workspace_id": &workspace_id,
-                "schema_id": &schema_id,
-                "version": target.version,
-            },
-            doc! { "$set": { "is_active": true, "updated_at": now } },
-            None,
-        )
-        .await?;
-    let refreshed = state
-        .db
-        .domain_schemas()
-        .find_one(
-            doc! {
-                "workspace_id": &workspace_id,
-                "schema_id": &schema_id,
-                "version": target.version,
-            },
-            None,
-        )
-        .await?
-        .ok_or_else(|| AppError::NotFound("schema 激活后未找到".to_string()))?;
+    let workspace_id =
+        resolve_authorized_workspace(&state, &admin, params.workspace_id.clone()).await?;
+    let expected_version = require_expected_version(params.expected_version)?;
+    let refreshed =
+        activate_exact_version(&state.db, &workspace_id, &schema_id, expected_version).await?;
     Ok(Json(json!({
         "ok": true,
         "item": DomainSchemaView::from(&refreshed),
     })))
 }
 
-async fn next_version_for(
-    state: &AppState,
+fn require_expected_version(value: Option<i32>) -> AppResult<i32> {
+    match value {
+        Some(version) if version > 0 => Ok(version),
+        _ => Err(AppError::BadRequest(
+            "expectedVersion 必须是正整数".to_string(),
+        )),
+    }
+}
+
+fn map_domain_schema_insert_error(error: mongodb::error::Error) -> AppError {
+    if is_duplicate_key_error(&error) {
+        tracing::warn!(error = %error, "domain schema version allocation conflicted");
+        AppError::Conflict("domain_schema_version_allocation_conflict".to_string())
+    } else {
+        AppError::Db(error)
+    }
+}
+
+fn is_duplicate_key_error(error: &mongodb::error::Error) -> bool {
+    match &*error.kind {
+        ErrorKind::Write(WriteFailure::WriteError(write_error)) => {
+            matches!(write_error.code, 11000 | 11001)
+        }
+        ErrorKind::BulkWrite(bulk) => bulk.write_errors.as_ref().is_some_and(|errors| {
+            errors
+                .iter()
+                .any(|error| matches!(error.code, 11000 | 11001))
+        }),
+        _ => false,
+    }
+}
+
+/// Atomically move the workspace-wide active pointer to one exact schema row.
+pub async fn activate_exact_version(
+    db: &crate::db::Database,
     workspace_id: &str,
     schema_id: &str,
-) -> AppResult<i32> {
+    expected_version: i32,
+) -> AppResult<DomainSchema> {
+    if workspace_id.trim().is_empty() || schema_id.trim().is_empty() || expected_version <= 0 {
+        return Err(AppError::BadRequest(
+            "invalid domain schema activation".to_string(),
+        ));
+    }
+    let coll = db.domain_schemas();
+    let mut session = db.client().start_session(None).await?;
+    session
+        .start_transaction(TransactionOptions::builder().build())
+        .await?;
+    let result: AppResult<DomainSchema> = async {
+        let target = coll
+            .find_one_with_session(
+                doc! {
+                    "workspace_id": workspace_id,
+                    "schema_id": schema_id,
+                    "version": expected_version,
+                },
+                None,
+                &mut session,
+            )
+            .await?
+            .ok_or_else(|| AppError::Conflict("domain_schema_version_changed".to_string()))?;
+        let target_id = target
+            .id
+            .ok_or_else(|| AppError::External("domain schema missing _id".to_string()))?;
+        let mut cursor = coll
+            .find_with_session(
+                doc! { "workspace_id": workspace_id, "is_active": true },
+                FindOptions::builder().limit(2).build(),
+                &mut session,
+            )
+            .await?;
+        let mut active = Vec::with_capacity(2);
+        while let Some(row) = cursor.next(&mut session).await.transpose()? {
+            active.push(row);
+        }
+        if active.len() > 1 {
+            return Err(AppError::Conflict(
+                "multiple_active_domain_schemas".to_string(),
+            ));
+        }
+        if active.first().and_then(|row| row.id) == Some(target_id) {
+            return Ok(target);
+        }
+        let now = DateTime::now();
+        if let Some(current) = active.pop() {
+            let current_id = current.id.ok_or_else(|| {
+                AppError::External("active domain schema missing _id".to_string())
+            })?;
+            let demoted = coll
+                .update_one_with_session(
+                    doc! {
+                        "_id": current_id,
+                        "workspace_id": workspace_id,
+                        "is_active": true,
+                    },
+                    doc! { "$set": { "is_active": false, "updated_at": now } },
+                    None,
+                    &mut session,
+                )
+                .await?;
+            if demoted.modified_count != 1 {
+                return Err(AppError::Conflict(
+                    "domain_schema_active_changed".to_string(),
+                ));
+            }
+        }
+        let promoted = coll
+            .update_one_with_session(
+                doc! {
+                    "_id": target_id,
+                    "workspace_id": workspace_id,
+                    "schema_id": schema_id,
+                    "version": expected_version,
+                    "is_active": false,
+                },
+                doc! { "$set": { "is_active": true, "updated_at": now } },
+                None,
+                &mut session,
+            )
+            .await?;
+        if promoted.modified_count != 1 {
+            return Err(AppError::Conflict(
+                "domain_schema_target_changed".to_string(),
+            ));
+        }
+        let mut target = target;
+        target.is_active = true;
+        target.updated_at = now;
+        Ok(target)
+    }
+    .await;
+    let activated = match result {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = session.abort_transaction().await;
+            return Err(match error {
+                AppError::Db(db_error) => {
+                    tracing::warn!(error = %db_error, "domain schema activation conflicted");
+                    AppError::Conflict("domain_schema_activation_conflict".to_string())
+                }
+                other => other,
+            });
+        }
+    };
+    loop {
+        match session.commit_transaction().await {
+            Ok(()) => break,
+            Err(error) if error.contains_label("UnknownTransactionCommitResult") => continue,
+            Err(error) => {
+                let _ = session.abort_transaction().await;
+                tracing::warn!(error = %error, "domain schema activation commit failed");
+                return Err(AppError::Conflict(
+                    "domain_schema_activation_conflict".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(activated)
+}
+
+async fn next_version_for(state: &AppState, workspace_id: &str, schema_id: &str) -> AppResult<i32> {
     let latest = state
         .db
         .domain_schemas()
@@ -415,18 +569,14 @@ fn validate_schema_payload(
     alias_dict_value: &Value,
 ) -> AppResult<(Vec<DomainField>, Document)> {
     if incoming_fields.len() > 64 {
-        return Err(AppError::BadRequest(
-            "fields 数量不得超过 64".to_string(),
-        ));
+        return Err(AppError::BadRequest("fields 数量不得超过 64".to_string()));
     }
     let mut seen_names = std::collections::HashSet::new();
     let mut fields = Vec::with_capacity(incoming_fields.len());
     for f in incoming_fields {
         let name = f.name.trim();
         if name.is_empty() {
-            return Err(AppError::BadRequest(
-                "field.name 不能为空".to_string(),
-            ));
+            return Err(AppError::BadRequest("field.name 不能为空".to_string()));
         }
         if BASE_FIELD_BLACKLIST.contains(&name) {
             return Err(AppError::BadRequest(format!(
@@ -502,14 +652,24 @@ pub async fn load_active_domain_schema(
     db: &crate::db::Database,
     workspace_id: &str,
 ) -> AppResult<Option<DomainSchema>> {
-    let found = db
+    let mut cursor = db
         .domain_schemas()
-        .find_one(
+        .find(
             doc! { "workspace_id": workspace_id, "is_active": true },
-            None,
+            FindOptions::builder().limit(2).build(),
         )
         .await?;
-    Ok(found)
+    let mut rows = Vec::with_capacity(2);
+    while let Some(row) = cursor.try_next().await? {
+        rows.push(row);
+    }
+    match rows.len() {
+        0 => Ok(None),
+        1 => Ok(rows.pop()),
+        _ => Err(AppError::External(
+            "multiple_active_domain_schemas".to_string(),
+        )),
+    }
 }
 
 /// universal-domain-adaptation D1-a：按 active `DomainSchema` 校验 / 重写一份 chunk 的
@@ -527,10 +687,7 @@ pub async fn load_active_domain_schema(
 ///
 /// 返回 rewrite 后的 `Document`（调用方据此落库）。schema 未声明的额外字段原样保留
 /// （schema 是"必填/枚举/别名"约束层，不是白名单，行业自定义扩展字段不被剔除）。
-pub fn enforce_domain_attributes(
-    schema: &DomainSchema,
-    attrs: &Document,
-) -> AppResult<Document> {
+pub fn enforce_domain_attributes(schema: &DomainSchema, attrs: &Document) -> AppResult<Document> {
     use mongodb::bson::Bson;
 
     // 1. alias 透明 rewrite：别名 key → canonical key。
@@ -645,11 +802,9 @@ mod tests {
 
     #[test]
     fn validate_payload_rejects_alias_pointing_to_unknown_field() {
-        let err = validate_schema_payload(
-            &[enum_field()],
-            &json!({"客户阶段": "non_existent_field"}),
-        )
-        .unwrap_err();
+        let err =
+            validate_schema_payload(&[enum_field()], &json!({"客户阶段": "non_existent_field"}))
+                .unwrap_err();
         assert!(matches!(err, AppError::BadRequest(_)));
     }
 
@@ -671,8 +826,7 @@ mod tests {
 
     #[test]
     fn validate_payload_rejects_non_string_alias_value() {
-        let err =
-            validate_schema_payload(&[enum_field()], &json!({"客户阶段": 123})).unwrap_err();
+        let err = validate_schema_payload(&[enum_field()], &json!({"客户阶段": 123})).unwrap_err();
         assert!(matches!(err, AppError::BadRequest(_)));
     }
 

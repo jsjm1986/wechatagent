@@ -55,6 +55,24 @@ export interface ExperimentItem {
 
 export interface ExperimentsResponse {
   items: ExperimentItem[];
+  aggregate7d: EvolutionAggregate7d;
+}
+
+export interface EvolutionAggregate7d {
+  experiments: number;
+  proposals: number;
+  released: number;
+  rolledBack: number;
+  significancePassRate: number | null;
+  coverage: {
+    complete: boolean;
+    source: string;
+    windowHours: number;
+    windowStart: string;
+    windowEnd: string;
+    asOf: string;
+    experimentsScanned: number;
+  };
 }
 
 export interface ShadowReplaySample {

@@ -34,6 +34,7 @@ type FormulaItem = {
   adherenceScore?: number;
   invalid?: boolean;
   invalidReason?: string;
+  unscored?: boolean;
   missingFormulas?: number;
   skipped?: boolean;
   reason?: string;
@@ -48,6 +49,10 @@ type FormulaSummary = {
   totalTokensUsed?: number;
   totalTokenBudget?: number;
   processedBeforeBudgetExceeded?: number;
+  totalLlmCallsUsed?: number;
+  unknownUsageCalls?: number;
+  usageComplete?: boolean;
+  unscoredCount?: number;
   reason?: string;
 };
 
@@ -279,9 +284,10 @@ export function FormulaAdherenceTab({ accountId }: { accountId?: string }) {
         抓最后一个 turn 的 <code>review.formulaBreakdown</code> 与 <code>scores</code>，
         与场景的 <code>ground_truth</code> 比较计算 adherence。整批共享一个累计 token 预算
         （每场景 simulationTokenBudget × scenarios 数），超额时返回部分结果 + degraded:true。
-        缺四个公式的场景标 invalid，不静默按 0 计入平均。
+        缺模型公式输出的场景标 invalid；缺失或非法管理员金标的存量场景标 unscored，均不按 0
+        计入平均。预算只累计本次评测私有 simulation run；上游未报告 usage 时停止后续场景。
       </p>
-      <EvaluationScenariosPanel />
+      <EvaluationScenariosPanel accountId={accountId} />
       <div className={styles.toolbar}>
         <button className={styles.btnPrimary} onClick={() => void run()} disabled={busy || !accountId}>
           {busy ? "评测中" : "开始评测"}
@@ -304,6 +310,11 @@ export function FormulaAdherenceTab({ accountId }: { accountId?: string }) {
               {summary.totalTokenBudget.toLocaleString()}
               {summary.processedBeforeBudgetExceeded !== undefined &&
                 ` · 超额前完成 ${summary.processedBeforeBudgetExceeded} 个`}
+              {summary.totalLlmCallsUsed !== undefined &&
+                ` · LLM 调用 ${summary.totalLlmCallsUsed} 次`}
+              {(summary.unscoredCount ?? 0) > 0 && ` · 未评分 ${summary.unscoredCount} 个`}
+              {summary.usageComplete === false &&
+                ` · ${summary.unknownUsageCalls ?? 0} 次调用未报告 token usage`}
             </small>
           )}
         </div>
@@ -320,7 +331,10 @@ export function FormulaAdherenceTab({ accountId }: { accountId?: string }) {
           </thead>
           <tbody>
             {items.map((item) => (
-              <tr key={item.scenarioId} className={item.invalid ? styles.rowInvalid : ""}>
+              <tr
+                key={item.scenarioId}
+                className={item.invalid || item.unscored ? styles.rowInvalid : ""}
+              >
                 <td>
                   <strong>{item.title || item.scenarioId}</strong>
                   <br />
@@ -331,6 +345,8 @@ export function FormulaAdherenceTab({ accountId }: { accountId?: string }) {
                     ? `❌ ${item.error}`
                     : item.skipped
                     ? `⏭ ${item.reason || "skipped"}`
+                    : item.unscored
+                    ? `⚠ ${item.reason || "unscored"}`
                     : item.invalid
                     ? `⚠ ${item.invalidReason || "invalid"}`
                     : "✓ 完成"}

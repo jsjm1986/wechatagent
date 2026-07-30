@@ -89,12 +89,20 @@ mod tests {
         assert!(map.contains_key("input"));
         assert_eq!(map.get_str("as").unwrap(), "ev");
         // in 是 $mergeObjects([默认值底, $$ev])——默认在前(底)、元素在后(覆盖)
-        let merge = map.get_document("in").unwrap().get_array("$mergeObjects").unwrap();
+        let merge = map
+            .get_document("in")
+            .unwrap()
+            .get_array("$mergeObjects")
+            .unwrap();
         assert_eq!(merge.len(), 2);
         let base = merge[0].as_document().unwrap();
         assert_eq!(base.get_str("verification").unwrap(), "staff_confirmed");
         assert_eq!(base.get_str("eventKind").unwrap(), "deal");
-        assert_eq!(merge[1].as_str().unwrap(), "$$ev", "元素本身须在末位覆盖默认值(只补缺失键)");
+        assert_eq!(
+            merge[1].as_str().unwrap(),
+            "$$ev",
+            "元素本身须在末位覆盖默认值(只补缺失键)"
+        );
     }
 
     #[test]
@@ -107,7 +115,11 @@ mod tests {
             let keys: Vec<&String> = filter.keys().collect();
             assert_eq!(keys.len(), 1, "过滤器必须只含单字段,严禁 $or 跨字段");
             assert_eq!(keys[0], field);
-            assert!(filter.get_document(field).unwrap().get_bool("$exists").unwrap());
+            assert!(filter
+                .get_document(field)
+                .unwrap()
+                .get_bool("$exists")
+                .unwrap());
             // 绝不含 $or(共享过滤器是 C1 根因)
             assert!(filter.get("$or").is_none(), "backfill_filter 不得含 $or");
         }

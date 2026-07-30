@@ -37,6 +37,7 @@ fn make_user_template(workspace: &str, key: &str, status: &str) -> PromptTemplat
         previous_version: None,
         seeded_by: Some("manual".to_string()),
         locale: Some(prompts::DEFAULT_LOCALE.to_string()),
+        source_proposal_id: None,
     }
 }
 
@@ -48,7 +49,8 @@ async fn ensure_prompt_pack_does_not_delete_user_active_templates() {
     let account = app.state.config.default_account_id.clone();
 
     // 运营自定义模板（active 与 draft 各一条），key 不在 spec 中。
-    let active = make_user_template(&workspace, "user.custom.active_only", "active");
+    let mut active = make_user_template(&workspace, "user.custom.active_only", "active");
+    active.current_version = true;
     let draft = make_user_template(&workspace, "user.custom.draft_only", "draft");
     app.state
         .db
@@ -106,10 +108,7 @@ async fn ensure_prompt_pack_seeds_all_spec_keys() {
     let workspace = app.state.config.default_workspace_id.clone();
 
     // 跑了一遍 prompt pack v2 后，spec 里的两个新 key 都应已落地。
-    for key in [
-        "user.review.product_claim_markers",
-        "knowledge.auto_verify",
-    ] {
+    for key in ["user.review.product_claim_markers", "knowledge.auto_verify"] {
         let template = app
             .state
             .db
@@ -135,9 +134,9 @@ async fn ensure_prompt_pack_seeds_all_spec_keys() {
 /// 用一个真实 spec key（user.reply.soul 等价的系统 key）模拟：先把它的 current system 行
 /// content 改脏，重跑 ensure，应被对齐回 spec 内容。
 #[tokio::test]
-#[ignore]
+#[ignore = "requires replica-set MongoDB / testcontainers"]
 async fn align_refreshes_drifted_system_row_and_archives_old() {
-    let app = common::TestApp::start().await;
+    let app = common::TestApp::start_repl_set().await;
     let workspace = app.state.config.default_workspace_id.clone();
     let account = app.state.config.default_account_id.clone();
 
@@ -187,7 +186,10 @@ async fn align_refreshes_drifted_system_row_and_archives_old() {
         .await
         .unwrap()
         .expect("current row exists");
-    assert_ne!(current.content, "STALE_DRIFTED_CONTENT", "脏内容应被 spec 对齐覆盖");
+    assert_ne!(
+        current.content, "STALE_DRIFTED_CONTENT",
+        "脏内容应被 spec 对齐覆盖"
+    );
 
     // 旧脏行应被归档（archived），而非物理删除。
     let archived = app
@@ -204,28 +206,41 @@ async fn align_refreshes_drifted_system_row_and_archives_old() {
     assert_eq!(archived.unwrap().status, "archived");
 }
 
-/// evolution 边界：某 key 存在 seeded_by=evolution_release 的行时，对齐跳过该 key，
+/// evolution 边界：某 key 的唯一 current 来自 evolution_release 时，对齐跳过该 key，
 /// evolution 行原样保留、未被归档。
 #[tokio::test]
-#[ignore]
+#[ignore = "requires replica-set MongoDB / testcontainers"]
 async fn align_skips_keys_with_evolution_release_chain() {
-    let app = common::TestApp::start().await;
+    let app = common::TestApp::start_repl_set().await;
     let workspace = app.state.config.default_workspace_id.clone();
     let account = app.state.config.default_account_id.clone();
 
     let specs = wechatagent::prompts::prompt_specs_for_test();
     let key = specs.first().expect("spec").0.clone();
 
-    // 模拟 evolution release：插入一条 seeded_by=evolution_release 的 current active 行。
-    let mut evo = make_user_template(&workspace, &key, "active");
+    // 模拟 evolution release：先追加 draft，再走共享事务发布，避免制造双 current。
+    let mut evo = make_user_template(&workspace, &key, "draft");
     evo.seeded_by = Some("evolution_release".to_string());
-    evo.current_version = true;
+    evo.current_version = false;
     // make_user_template 默认 version=1，与该 key 已 seed 的 system 行 version=1 在唯一索引
     // (workspace_id, prompt_key, version) 上撞 E11000；evolution release 出来的行本就是更高
     // 版本，这里设 2 避让。align 的 evolution 守卫按 seeded_by 识别、不看 version。
     evo.version = 2;
     evo.content = "EVOLUTION_TUNED_CONTENT".to_string();
-    app.state.db.prompt_templates().insert_one(&evo, None).await.unwrap();
+    app.state
+        .db
+        .prompt_templates()
+        .insert_one(&evo, None)
+        .await
+        .unwrap();
+    wechatagent::prompt_template_versions::publish_version(
+        &app.state.db,
+        &workspace,
+        evo.id.expect("evolution draft id"),
+        "evolution-test",
+    )
+    .await
+    .expect("publish evolution current");
 
     // 制造 Ok(None)（模拟版本 bump 前的旧库）：把所有行的 pack version 改旧。
     // evo 行也被改旧没关系——align 的 evolution 守卫按 seeded_by 识别，不看 version。
@@ -304,14 +319,183 @@ async fn align_is_idempotent_when_spec_unchanged() {
     assert_eq!(count_before, count_after, "spec 未变重跑不应新增行");
 }
 
+/// m043 may leave an active built-in spec with draft-only history after clearing an invalid
+/// pointer. Startup alignment must preserve that operator draft and append/publish a built-in
+/// runtime version; the strict runtime reader remains fail-closed before recovery.
+#[tokio::test]
+#[ignore = "requires replica-set MongoDB / testcontainers"]
+async fn align_recovers_builtin_draft_only_stream_without_publishing_the_draft() {
+    let app = common::TestApp::start_repl_set().await;
+    let workspace = app.state.config.default_workspace_id.clone();
+    let account = app.state.config.default_account_id.clone();
+    let key = "user.reply.system";
+
+    let original = app
+        .state
+        .db
+        .prompt_templates()
+        .find_one(
+            doc! {
+                "workspace_id": &workspace,
+                "prompt_key": key,
+                "current_version": true,
+            },
+            None,
+        )
+        .await
+        .expect("query original current")
+        .expect("original current exists");
+    let original_id = original.id.expect("original id");
+    app.state
+        .db
+        .prompt_templates()
+        .update_one(
+            doc! { "_id": original_id },
+            doc! { "$set": {
+                "status": "draft",
+                "current_version": false,
+                "seeded_by": "manual",
+                "content": "operator draft must remain unpublished",
+                "updated_at": DateTime::now(),
+            } },
+            None,
+        )
+        .await
+        .expect("model post-m043 draft-only stream");
+
+    assert!(wechatagent::prompt_template_versions::load_unique_current(
+        &app.state.db,
+        &workspace,
+        key,
+    )
+    .await
+    .expect_err("runtime reader must reject draft-only stream")
+    .to_string()
+    .contains("current_prompt_missing"));
+
+    assert!(
+        wechatagent::prompts::ensure_prompt_pack_v2(&app.state.db, &workspace, &account,)
+            .await
+            .expect("startup alignment recovers draft-only stream")
+    );
+
+    let preserved = app
+        .state
+        .db
+        .prompt_templates()
+        .find_one(doc! { "_id": original_id }, None)
+        .await
+        .expect("query preserved draft")
+        .expect("draft remains");
+    assert_eq!(preserved.status, "draft");
+    assert!(!preserved.current_version);
+    assert_eq!(preserved.content, "operator draft must remain unpublished");
+
+    let current =
+        wechatagent::prompt_template_versions::load_unique_current(&app.state.db, &workspace, key)
+            .await
+            .expect("strict runtime read after recovery")
+            .expect("recovered current exists");
+    assert_eq!(current.status, "active");
+    assert!(current.current_version);
+    assert_eq!(current.seeded_by.as_deref(), Some("system"));
+    assert_ne!(current.id, Some(original_id));
+
+    let count_after_first = app
+        .state
+        .db
+        .prompt_templates()
+        .count_documents(doc! { "workspace_id": &workspace, "prompt_key": key }, None)
+        .await
+        .expect("count versions after recovery");
+    assert!(
+        !wechatagent::prompts::ensure_prompt_pack_v2(&app.state.db, &workspace, &account,)
+            .await
+            .expect("idempotent startup alignment")
+    );
+    let count_after_second = app
+        .state
+        .db
+        .prompt_templates()
+        .count_documents(doc! { "workspace_id": &workspace, "prompt_key": key }, None)
+        .await
+        .expect("count versions after idempotent rerun");
+    assert_eq!(count_after_first, count_after_second);
+
+    app.cleanup().await;
+}
+
+/// Planning-only specs are intentionally draft. Startup and reruns must never turn them into
+/// runtime current/active rows, including after m043 clears the old bootstrap pointer.
+#[tokio::test]
+#[ignore = "requires replica-set MongoDB / testcontainers"]
+async fn planning_prompt_specs_remain_non_current_drafts() {
+    let app = common::TestApp::start_repl_set().await;
+    let workspace = app.state.config.default_workspace_id.clone();
+    let account = app.state.config.default_account_id.clone();
+
+    let mut before = Vec::new();
+    for key in ["group.policy", "moment.policy"] {
+        let rows = app
+            .state
+            .db
+            .prompt_templates()
+            .count_documents(doc! { "workspace_id": &workspace, "prompt_key": key }, None)
+            .await
+            .expect("count planning prompt versions");
+        assert!(rows >= 1, "planning prompt must have a visible draft");
+        assert_eq!(
+            app.state
+                .db
+                .prompt_templates()
+                .count_documents(
+                    doc! {
+                        "workspace_id": &workspace,
+                        "prompt_key": key,
+                        "$or": [
+                            { "current_version": true },
+                            { "status": "active" },
+                        ],
+                    },
+                    None,
+                )
+                .await
+                .expect("count invalid planning prompt pointers"),
+            0,
+            "planning prompt {key} must remain unpublished"
+        );
+        before.push((key, rows));
+    }
+
+    assert!(
+        !wechatagent::prompts::ensure_prompt_pack_v2(&app.state.db, &workspace, &account)
+            .await
+            .expect("idempotent planning prompt alignment")
+    );
+    for (key, rows) in before {
+        assert_eq!(
+            app.state
+                .db
+                .prompt_templates()
+                .count_documents(doc! { "workspace_id": &workspace, "prompt_key": key }, None)
+                .await
+                .expect("count planning prompt versions after rerun"),
+            rows,
+            "planning prompt rerun must not allocate a new version"
+        );
+    }
+
+    app.cleanup().await;
+}
+
 /// 终审 #1 核心回归：版本号匹配（不改 prompt_pack_version）但 system 行内容漂移时，
 /// 重跑 ensure_prompt_pack_v2 仍应对齐回 spec。
 /// 与 align_refreshes_drifted_system_row_and_archives_old 的区别：那个测试改旧版本号制造
 /// Ok(None)；本测试保持当前版本号（旧结构会走 Ok(Some) 不对齐），验证不再版本盲。
 #[tokio::test]
-#[ignore]
+#[ignore = "requires replica-set MongoDB / testcontainers"]
 async fn align_refreshes_drift_even_when_pack_version_matches() {
-    let app = common::TestApp::start().await;
+    let app = common::TestApp::start_repl_set().await;
     let workspace = app.state.config.default_workspace_id.clone();
     let account = app.state.config.default_account_id.clone();
 
@@ -368,17 +552,18 @@ async fn align_refreshes_drift_even_when_pack_version_matches() {
     assert_eq!(archived.unwrap().status, "archived");
 }
 
-/// 终审 Minor #3 回归：archived GC（delete_redundant）在非空库路径每次启动都跑。
-/// 预置一条孤立 archived 行 → 重跑 ensure（不改版本号，走非空库）→ 该行被清除。
+/// SR-055：archived Prompt 是不可变历史，启动对齐不得把它当冗余数据清除。
+/// 预置一条孤立 archived 行 → 重跑 ensure → 该行仍保留。
 #[tokio::test]
 #[ignore]
-async fn delete_redundant_runs_on_nonempty_db_each_startup() {
+async fn archived_prompt_history_survives_nonempty_startup() {
     let app = common::TestApp::start().await;
     let workspace = app.state.config.default_workspace_id.clone();
     let account = app.state.config.default_account_id.clone();
 
     // 预置一条孤立的 archived 行（key 不在 spec 中，不参与对齐）。
-    let mut archived_row = make_user_template(&workspace, "user.custom.archived_orphan", "archived");
+    let mut archived_row =
+        make_user_template(&workspace, "user.custom.archived_orphan", "archived");
     archived_row.current_version = false;
     app.state
         .db
@@ -405,7 +590,7 @@ async fn delete_redundant_runs_on_nonempty_db_each_startup() {
         .await
         .expect("rerun ensure");
 
-    // archived 行应被 GC 清除。
+    // archived Prompt 历史必须保留。
     let after = app
         .state
         .db
@@ -416,22 +601,23 @@ async fn delete_redundant_runs_on_nonempty_db_each_startup() {
         )
         .await
         .unwrap();
-    assert!(after.is_none(), "archived 孤立行应被 delete_redundant 在非空库路径清除");
+    assert!(after.is_some(), "archived Prompt 历史不得被启动对齐清除");
 }
 
 /// 终审 Minor #1 回归：ensure_prompt_pack_v2 返回"是否写入",供运行时调用点据此失效 LRU。
 /// spec 漂移→返回 true；spec 一致(幂等)→返回 false。
 #[tokio::test]
-#[ignore]
+#[ignore = "requires replica-set MongoDB / testcontainers"]
 async fn ensure_returns_true_on_write_false_on_idempotent() {
-    let app = common::TestApp::start().await;
+    let app = common::TestApp::start_repl_set().await;
     let workspace = app.state.config.default_workspace_id.clone();
     let account = app.state.config.default_account_id.clone();
 
     // 第一次重跑(spec 与 DB 一致)应幂等 → 返回 false(无写入)。
-    let wrote_idempotent = wechatagent::prompts::ensure_prompt_pack_v2(&app.state.db, &workspace, &account)
-        .await
-        .expect("rerun ensure");
+    let wrote_idempotent =
+        wechatagent::prompts::ensure_prompt_pack_v2(&app.state.db, &workspace, &account)
+            .await
+            .expect("rerun ensure");
     assert!(!wrote_idempotent, "spec 一致时应幂等无写入→false");
 
     // 制造漂移:把一个 system 行 content 改脏(不改版本号)。
@@ -449,8 +635,12 @@ async fn ensure_returns_true_on_write_false_on_idempotent() {
         .unwrap();
 
     // 再跑应检测到漂移→对齐写入→返回 true。
-    let wrote_after_drift = wechatagent::prompts::ensure_prompt_pack_v2(&app.state.db, &workspace, &account)
-        .await
-        .expect("rerun ensure");
-    assert!(wrote_after_drift, "spec 漂移时对齐写入→true(供调用点失效LRU)");
+    let wrote_after_drift =
+        wechatagent::prompts::ensure_prompt_pack_v2(&app.state.db, &workspace, &account)
+            .await
+            .expect("rerun ensure");
+    assert!(
+        wrote_after_drift,
+        "spec 漂移时对齐写入→true(供调用点失效LRU)"
+    );
 }

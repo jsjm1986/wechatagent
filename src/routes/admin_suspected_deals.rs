@@ -5,28 +5,22 @@
 //! gateway 把它 upsert 进待核实专表（`status=pending`，见 gateway.rs）。
 //!
 //! **红线：AI 永不直写 `outcome_events`**。疑似成交信号只进待核实队列，**只有运营
-//! approve 才调 [`add_outcome_event_inner`] 落正式成交**，且 `verification` 强制
+//! approve 才在事务内提交已校验的正式成交**，且 `verification` 强制
 //! `Some("staff_confirmed")`——AI 侧的 `conversation_inferred` 疑似线索绝不直登成交。
 //!
 //! - `GET /api/admin/suspected-deals?status=pending`
 //!     列待核实信号；按 status 过滤（默认 pending），**强制 workspace 隔离**。
 //! - `POST /api/admin/suspected-deals/:id/approve`
-//!     行为（**CAS-first**，财务安全顺序）：
-//!       1. 读 signal（属当前 workspace），仅为拿 contact_id。
-//!       2. **原子 CAS 占位**：`update_one(filter:{_id, workspace_id, status:"pending"},
-//!          $set:{status:"approved", reviewed_at, reviewed_by})`；`matched_count==0`
-//!          （并发/已审/跨 workspace）→ NotFound，**绝不落成交**。
-//!       3. CAS 成功后才 `find_contact_by_id`（workspace 隔离）+ **落正式成交**：
-//!          `add_outcome_event_inner(verification=staff_confirmed, source="manual",
-//!          event_kind="deal", marked_by=<admin>)`。
+//!     行为（**validate-first + transaction**）：
+//!       1. workspace 隔离读取 signal/contact，校验金额、币种、产品并冻结成交快照；
+//!          任一错误均保持 signal=pending，可修正后重试。
+//!       2. Mongo transaction 内以 `status:"pending"` CAS 成 approved，同时 append
+//!          contact.outcome_events 与 agent_events 审计；任一步失败全部回滚。
 //! - `POST /api/admin/suspected-deals/:id/reject`
 //!     body: `{ reason }` —— 写 `rejection_reason` 并 `status="rejected"`。
 //!
-//! 注意：approve 涉及「改信号状态 + 落成交」两步，MongoDB 单机部署不支持事务。
-//! `outcome_events` 是 append-only 无 dedup，故这里采用 **CAS-first**：先原子地把信号
-//! 从 pending 占位改 approved，再落成交。重复 approve 在 CAS 步（status 已非 pending →
-//! matched==0）即被挡，根治财务双计；代价是「CAS 成功但落成交失败 → 已 approved 但未落
-//! 成交」的漏登假阴——可由运营走 add_deal_event 手动补登，对 append-only 财务远比双计可接受。
+//! 该路径要求 MongoDB replica set（项目其它发布/激活事务同一部署前提）。重复 approve
+//! 在事务 CAS 处冲突，不会重复 append；提交结果不确定时按 Mongo 推荐规则重试 commit。
 
 use axum::{
     extract::{Path, Query, State},
@@ -35,7 +29,7 @@ use axum::{
 };
 use futures::TryStreamExt;
 use mongodb::bson::{doc, DateTime};
-use mongodb::options::FindOptions;
+use mongodb::options::{FindOptions, TransactionOptions};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -58,9 +52,6 @@ pub struct ListSuspectedDealsQuery {
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ApproveSuspectedDealRequest {
-    /// 可选：操作人标识（一般是 admin email / id），落入 `reviewed_by`。
-    #[serde(default)]
-    reviewed_by: Option<String>,
     /// 可选：成交金额（最小币种单位整数，如分）。
     #[serde(default)]
     amount: Option<i64>,
@@ -76,8 +67,6 @@ pub struct ApproveSuspectedDealRequest {
 #[serde(rename_all = "camelCase")]
 pub struct RejectSuspectedDealRequest {
     reason: String,
-    #[serde(default)]
-    reviewed_by: Option<String>,
 }
 
 pub async fn list_suspected_deals(
@@ -126,16 +115,9 @@ pub async fn approve_suspected_deal(
     Ok(Json(value).into_response())
 }
 
-/// approve_suspected_deal 的内部核心（**CAS-first**）：workspace 隔离读 signal（仅为
-/// 拿 contact_id）→ **原子 CAS 把信号从 pending 占位改 approved** → CAS 成功后才落正式
-/// 成交（verification=staff_confirmed）→ 返回 `{"item": <signal json>}`。
+/// approve_suspected_deal 的内部核心：先完成所有可预检条件，再在 transaction 中
+/// 原子提交 pending CAS + 正式成交 + 审计。
 /// 跨 workspace / 不存在 / 已非 pending 的 _id 返 NotFound（不泄漏存在性）。
-///
-/// **为什么先 CAS 再落成交**：`outcome_events` 是 append-only 无 dedup。若反过来「先落成交
-/// 再改状态」，步间崩溃会留下 pending 信号 → 重试 approve 再 append → 财务双计。CAS-first
-/// 让重复 approve 在第 1 步 CAS（status 已非 pending → matched==0）就被挡，根本到不了落成交，
-/// 把「双计假阳」换成「CAS 成功但落成交失败 → 已 approved 但未落成交」的「漏登假阴」——漏登
-/// 可由运营走 add_deal_event 手动补登，对 append-only 财务数据远比双计可接受。
 async fn approve_suspected_deal_inner(
     state: &AppState,
     admin: &AuthenticatedAdmin,
@@ -145,58 +127,25 @@ async fn approve_suspected_deal_inner(
     let workspace_id = &admin.current_workspace;
     let object_id = parse_object_id(id)?;
     let signals = state.db.collection_suspected_deal_signals();
-    // 读 signal 仅为拿 contact_id（落成交需要）；pending 校验以下方 CAS 的 matched_count
-    // 为准（防 TOCTOU）。查询带 workspace 过滤：跨 workspace 的 _id 返回 NotFound。
-    let signal = signals
-        .find_one(doc! { "_id": object_id, "workspace_id": workspace_id }, None)
+    // 事务前读取仅用于完成全部业务校验；最终 pending 状态以下方事务 CAS 为准。
+    let mut signal = signals
+        .find_one(
+            doc! { "_id": object_id, "workspace_id": workspace_id },
+            None,
+        )
         .await?
         .ok_or_else(|| AppError::NotFound("suspected deal signal not found".to_string()))?;
 
-    let reviewer = payload
-        .reviewed_by
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToString::to_string)
-        .unwrap_or_else(|| admin.username.clone());
+    let reviewer = ReviewActor::from_admin(admin)?;
 
-    // 第 1 步（CAS 占位，先于落成交）：原子地把信号从 pending 改 approved。filter 带
-    // status:"pending" + workspace_id —— matched==0 说明并发/已审/跨 workspace，此时
-    // **绝不落成交**直接返回，重复 approve 在此被挡，根治 append-only 财务双计。
-    let now = DateTime::now();
-    let cas = signals
-        .update_one(
-            doc! {
-                "_id": object_id,
-                "workspace_id": workspace_id,
-                "status": "pending"
-            },
-            doc! {
-                "$set": {
-                    "status": "approved",
-                    "reviewed_at": now,
-                    "reviewed_by": &reviewer
-                }
-            },
-            None,
-        )
-        .await?;
-    if cas.matched_count == 0 {
-        return Err(AppError::NotFound(
-            "suspected deal signal not found or not pending".to_string(),
-        ));
-    }
-
-    // 第 2 步（CAS 成功后才执行）：workspace 隔离取 contact + 落正式成交。**红线**：
-    // verification 强制 staff_confirmed——疑似线索经人审核实后才落成交，AI 永不直写 outcome。
-    // 若此步失败 → 信号已 approved 但未落成交（漏登假阴，运营可手动补登），不会双计。
+    // validate-first：联系人、金额、币种、产品归属及产品快照全部在任何状态写入前完成。
     let contact = find_contact_by_id(state, workspace_id, &signal.contact_id).await?;
-    add_outcome_event_inner(
+    let prepared = prepare_outcome_event(
         state,
         &contact,
         OutcomeEventInput {
             source: "manual".to_string(),
-            marked_by: reviewer.clone(),
+            marked_by: reviewer.as_str().to_string(),
             audit_summary: "疑似成交运营核实确认".to_string(),
             amount: payload.amount,
             currency: payload.currency,
@@ -210,11 +159,64 @@ async fn approve_suspected_deal_inner(
     )
     .await?;
 
-    let updated = signals
-        .find_one(doc! { "_id": object_id, "workspace_id": workspace_id }, None)
-        .await?
-        .ok_or_else(|| AppError::NotFound("suspected deal signal not found".to_string()))?;
-    Ok(json!({ "item": suspected_deal_json(updated) }))
+    let now = DateTime::now();
+    let mut session = state.db.client().start_session(None).await?;
+    session
+        .start_transaction(TransactionOptions::builder().build())
+        .await?;
+    let transaction_result: AppResult<()> = async {
+        let cas = signals
+            .update_one_with_session(
+                doc! {
+                    "_id": object_id,
+                    "workspace_id": workspace_id,
+                    "status": "pending",
+                },
+                doc! {
+                    "$set": {
+                        "status": "approved",
+                        "reviewed_at": now,
+                        "reviewed_by": reviewer.as_str(),
+                    }
+                },
+                None,
+                &mut session,
+            )
+            .await?;
+        if cas.modified_count != 1 {
+            return Err(AppError::Conflict("suspected_deal_not_pending".to_string()));
+        }
+        persist_prepared_outcome_event_with_session(state, &prepared, &mut session).await?;
+        Ok(())
+    }
+    .await;
+    if let Err(error) = transaction_result {
+        let _ = session.abort_transaction().await;
+        return Err(match error {
+            AppError::Db(db_error) => {
+                tracing::warn!(error = %db_error, "suspected deal approval transaction conflicted");
+                AppError::Conflict("suspected_deal_approval_conflict".to_string())
+            }
+            other => other,
+        });
+    }
+    loop {
+        match session.commit_transaction().await {
+            Ok(()) => break,
+            Err(error) if error.contains_label("UnknownTransactionCommitResult") => continue,
+            Err(error) => {
+                tracing::warn!(error = %error, "suspected deal approval commit failed");
+                return Err(AppError::Conflict(
+                    "suspected_deal_approval_conflict".to_string(),
+                ));
+            }
+        }
+    }
+
+    signal.status = "approved".to_string();
+    signal.reviewed_at = Some(now);
+    signal.reviewed_by = Some(reviewer.as_str().to_string());
+    Ok(json!({ "item": suspected_deal_json(signal) }))
 }
 
 pub async fn reject_suspected_deal(
@@ -228,6 +230,7 @@ pub async fn reject_suspected_deal(
     }
     let object_id = parse_object_id(&id)?;
     let signals = state.db.collection_suspected_deal_signals();
+    let reviewer = ReviewActor::from_admin(&admin)?;
     let now = DateTime::now();
     let result = signals
         .update_one(
@@ -240,7 +243,7 @@ pub async fn reject_suspected_deal(
                 "$set": {
                     "status": "rejected",
                     "reviewed_at": now,
-                    "reviewed_by": payload.reviewed_by.as_deref().unwrap_or("admin"),
+                    "reviewed_by": reviewer.as_str(),
                     "rejection_reason": payload.reason.trim()
                 }
             },
@@ -337,7 +340,6 @@ mod tests {
     #[test]
     fn approve_request_fields_optional() {
         let req: ApproveSuspectedDealRequest = serde_json::from_value(json!({})).unwrap();
-        assert!(req.reviewed_by.is_none());
         assert!(req.amount.is_none());
         assert!(req.currency.is_none());
         assert!(req.product_id.is_none());
@@ -345,7 +347,6 @@ mod tests {
             json!({ "reviewedBy": "alice@corp", "amount": 9900, "currency": "CNY", "productId": "p-1" }),
         )
         .unwrap();
-        assert_eq!(req2.reviewed_by.as_deref(), Some("alice@corp"));
         assert_eq!(req2.amount, Some(9900));
         assert_eq!(req2.currency.as_deref(), Some("CNY"));
         assert_eq!(req2.product_id.as_deref(), Some("p-1"));

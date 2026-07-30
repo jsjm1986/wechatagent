@@ -140,7 +140,7 @@ async fn image_import_with_no_provider_at_all_is_rejected() {
 #[tokio::test]
 #[ignore]
 async fn image_import_with_vision_capable_primary_produces_review_chunks() {
-    let app = TestApp::start().await;
+    let app = TestApp::start_repl_set().await;
     let ws = app.state.config.default_workspace_id.clone();
 
     insert_provider(&app, &provider(&ws, "vision_primary", true, true, false)).await;
@@ -190,28 +190,26 @@ async fn image_import_with_vision_capable_primary_produces_review_chunks() {
     }
 }
 
-/// 场景 4：vision 返回空 fence → 不产 chunk，但不报错（返回 note）。
+/// 场景 4：vision 返回空 fence → fail-closed 报错，且不产 chunk。
 #[tokio::test]
 #[ignore]
-async fn image_import_with_empty_vision_output_yields_no_chunk() {
+async fn image_import_with_empty_vision_output_is_rejected() {
     let app = TestApp::start().await;
     let ws = app.state.config.default_workspace_id.clone();
 
     insert_provider(&app, &provider(&ws, "vision_primary", true, true, false)).await;
     app.llm.push_response(json!({ "fence": "" }));
 
-    let resp = import_operation_knowledge_apply_image(
+    let result = import_operation_knowledge_apply_image(
         State(app.state.clone()),
         admin(&app),
         Json(image_req()),
     )
-    .await
-    .expect("空 fence 应正常返回");
-    let body = resp.0;
-
+    .await;
+    let err = result.expect_err("空 fence 必须 fail-closed");
     assert!(
-        body["chunkIds"].as_array().map(|a| a.is_empty()).unwrap_or(false),
-        "空 fence 不应产 chunk: {body:?}",
+        format!("{err}").contains("missing non-empty `fence`"),
+        "错误应明确指出 fence 缺失，实际：{err}",
     );
     let count = app
         .state

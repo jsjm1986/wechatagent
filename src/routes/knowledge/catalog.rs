@@ -58,7 +58,7 @@ pub(in crate::routes) async fn get_operation_knowledge_catalog(
 /// `GET /api/operation-knowledge/catalog/persisted` —— knowledge-wiki Phase E：
 /// 读 `documents.catalog_summary_persisted` 持久化快照，O(1)。
 ///
-/// 返回每个 active document 的 `id / title / catalogVersion / catalogSummaryPersisted`。
+/// 返回每个 active document 的快照和 desired/applied generation freshness。
 /// 若 catalog_rebuild_worker 还没跑过 → `catalogSummaryPersisted=null`，
 /// 调用方应回退到 `/catalog`（live 聚合）。
 pub(in crate::routes) async fn get_operation_knowledge_catalog_persisted(
@@ -91,11 +91,17 @@ pub(in crate::routes) async fn get_operation_knowledge_catalog_persisted(
         .await?;
     let mut documents = Vec::new();
     while let Some(d) = cursor.try_next().await? {
+        let catalog_fresh = d.catalog_summary_persisted.is_some()
+            && d.catalog_desired_generation > 0
+            && d.catalog_applied_generation == d.catalog_desired_generation;
         documents.push(json!({
             "id": d.id.map(|id| id.to_hex()).unwrap_or_default(),
             "title": d.title,
             "catalogVersion": d.catalog_version,
             "catalogSummaryPersisted": d.catalog_summary_persisted,
+            "catalogDesiredGeneration": d.catalog_desired_generation,
+            "catalogAppliedGeneration": d.catalog_applied_generation,
+            "catalogFresh": catalog_fresh,
             "updatedAt": crate::models::dt_to_string(d.updated_at).unwrap_or_default(),
         }));
     }
@@ -127,8 +133,7 @@ pub(in crate::routes) async fn get_operation_knowledge_completeness(
     if let Some(item) = hit {
         return Ok(Json(json!({ "item": item })));
     }
-    let item =
-        build_operation_knowledge_completeness(&state, &workspace_id, &account_id).await?;
+    let item = build_operation_knowledge_completeness(&state, &workspace_id, &account_id).await?;
     state.completeness_cache.insert(key, (now_ms, item.clone()));
     Ok(Json(json!({ "item": item })))
 }
@@ -143,8 +148,7 @@ pub(in crate::routes) async fn refresh_operation_knowledge_completeness(
         .unwrap_or_else(|| state.config.default_account_id.clone());
     let workspace_id = admin.current_workspace.clone();
     // F-013：refresh 强制重算（忽略 TTL），算完写回缓存刷新后续 GET。
-    let item =
-        build_operation_knowledge_completeness(&state, &workspace_id, &account_id).await?;
+    let item = build_operation_knowledge_completeness(&state, &workspace_id, &account_id).await?;
     let now_ms = mongodb::bson::DateTime::now().timestamp_millis();
     state
         .completeness_cache
@@ -471,10 +475,7 @@ fn build_coverage_anchors(dims: &[crate::models::CoverageDimension]) -> String {
 /// `{ key, label, verifiedFact, methodologyOnly, pendingDraft, state }`，顺序按维度
 /// 声明序。前端据此动态渲染完整度看板（不再写死销售五维）。某维度在 coverage 对象里
 /// 缺失（LLM 漏返/降级）→ 回落 `state="missing"` 的全 false 默认。纯函数、cfg(test) 锁。
-fn build_dimension_list(
-    dims: &[crate::models::CoverageDimension],
-    coverage: &Value,
-) -> Vec<Value> {
+fn build_dimension_list(dims: &[crate::models::CoverageDimension], coverage: &Value) -> Vec<Value> {
     dims.iter()
         .map(|dim| {
             let flags = coverage.get(dim.key.as_str()).cloned().unwrap_or_else(|| {
@@ -623,7 +624,8 @@ pub async fn build_operation_knowledge_completeness(
     let mut fallback_gaps: Vec<String> = Vec::new();
     if verified == 0 {
         fallback_gaps.push(
-            "能力/边界/证据维度均缺已验证客观事实，需补采可核验事实切片并审定后方可对客".to_string(),
+            "能力/边界/证据维度均缺已验证客观事实，需补采可核验事实切片并审定后方可对客"
+                .to_string(),
         );
     }
     if needs_review > 0 {
@@ -661,7 +663,7 @@ pub async fn build_operation_knowledge_completeness(
     // 逐字 seed capability/pricing/caseEvidence/effectClaims/deliveryBoundary →
     // 行为字节等价（命中初值规则 + prompt JSON 骨架下方按同序生成）。
     let active_profile =
-        crate::agent::domain_profile::load_active_domain_profile(&state.db, workspace_id).await;
+        crate::agent::domain_profile::load_active_domain_profile(&state.db, workspace_id).await?;
     // 维度初值规则（DEFAULT 销售域逐字复刻原 fallback）：维度声明的 initial_signal
     // 决定初值由哪个客观计数驱动——"verified" 跟随「有 verified 切片」、"evidence" 跟随
     // 「有 evidence 切片」、None/未知 → 恒 false（保守缺失，原 pricing + 未知维度行为）。
@@ -747,11 +749,14 @@ pub async fn build_operation_knowledge_completeness(
         serde_json::to_string(&summaries).unwrap_or_default(),
         serde_json::to_string(&pending).unwrap_or_default()
     );
-    let audit = state
-        .llm
-        .generate_json(system, &user)
-        .await
-        .unwrap_or(fallback);
+    let generated = match &state.llm_registry {
+        Some(registry) => match registry.snapshot(workspace_id).await {
+            Ok(snapshot) => snapshot.generate_json(system, &user).await,
+            Err(error) => Err(error),
+        },
+        None => state.llm.generate_json(system, &user).await,
+    };
+    let audit = generated.unwrap_or(fallback);
     let resolved_mode =
         json_string(&audit, "answeringMode").unwrap_or_else(|| fallback_mode.to_string());
     // 认知状态闸：有任何待审定草稿就绝不宣称 fully_supported（见 [`clamp_answering_mode`]）。
@@ -807,8 +812,22 @@ mod tests {
     #[test]
     fn coverage_skeleton_custom_dims_align_to_longest() {
         let dims = vec![
-            crate::models::CoverageDimension { key: "symptom".to_string(), display_name: "症状".to_string(), required: false, anchor_hint: None, initial_signal: None },
-            crate::models::CoverageDimension { key: "treatmentPlan".to_string(), display_name: "治疗方案".to_string(), required: false, anchor_hint: None, initial_signal: None },
+            crate::models::CoverageDimension {
+                key: "symptom".to_string(),
+                display_name: "症状".to_string(),
+                required: false,
+                review_topic_aliases: vec![],
+                anchor_hint: None,
+                initial_signal: None,
+            },
+            crate::models::CoverageDimension {
+                key: "treatmentPlan".to_string(),
+                display_name: "治疗方案".to_string(),
+                required: false,
+                review_topic_aliases: vec![],
+                anchor_hint: None,
+                initial_signal: None,
+            },
         ];
         let got = build_coverage_skeleton(&dims);
         // 最长 key = "treatmentPlan":（15 字符），symptom 行补到同宽。
@@ -831,9 +850,30 @@ mod tests {
     #[test]
     fn coverage_anchors_skips_none_hint() {
         let dims = vec![
-            crate::models::CoverageDimension { key: "a".to_string(), display_name: "A".to_string(), required: false, anchor_hint: Some("锚点A".to_string()), initial_signal: None },
-            crate::models::CoverageDimension { key: "b".to_string(), display_name: "B".to_string(), required: false, anchor_hint: None, initial_signal: None },
-            crate::models::CoverageDimension { key: "c".to_string(), display_name: "C".to_string(), required: false, anchor_hint: Some("锚点C".to_string()), initial_signal: None },
+            crate::models::CoverageDimension {
+                key: "a".to_string(),
+                display_name: "A".to_string(),
+                required: false,
+                review_topic_aliases: vec![],
+                anchor_hint: Some("锚点A".to_string()),
+                initial_signal: None,
+            },
+            crate::models::CoverageDimension {
+                key: "b".to_string(),
+                display_name: "B".to_string(),
+                required: false,
+                review_topic_aliases: vec![],
+                anchor_hint: None,
+                initial_signal: None,
+            },
+            crate::models::CoverageDimension {
+                key: "c".to_string(),
+                display_name: "C".to_string(),
+                required: false,
+                review_topic_aliases: vec![],
+                anchor_hint: Some("锚点C".to_string()),
+                initial_signal: None,
+            },
         ];
         let got = build_coverage_anchors(&dims);
         assert_eq!(got, "  - a：锚点A\n  - c：锚点C");
@@ -855,7 +895,13 @@ mod tests {
         let keys: Vec<&str> = list.iter().map(|d| d["key"].as_str().unwrap()).collect();
         assert_eq!(
             keys,
-            vec!["capability", "pricing", "caseEvidence", "effectClaims", "deliveryBoundary"]
+            vec![
+                "capability",
+                "pricing",
+                "caseEvidence",
+                "effectClaims",
+                "deliveryBoundary"
+            ]
         );
         for (d, dim) in list.iter().zip(p.coverage_dimensions.iter()) {
             assert_eq!(d["label"].as_str().unwrap(), dim.display_name);
@@ -873,9 +919,14 @@ mod tests {
     /// M4：换行业维度（非销售 key）→ dimensionList 按其声明序与 display_name 渲染。
     #[test]
     fn dimension_list_custom_dims_use_own_key_and_label() {
-        let dims = vec![
-            crate::models::CoverageDimension { key: "consultation_stage".to_string(), display_name: "咨询阶段".to_string(), required: false, anchor_hint: None, initial_signal: None },
-        ];
+        let dims = vec![crate::models::CoverageDimension {
+            key: "consultation_stage".to_string(),
+            display_name: "咨询阶段".to_string(),
+            required: false,
+            review_topic_aliases: vec![],
+            anchor_hint: None,
+            initial_signal: None,
+        }];
         let coverage = json!({});
         let list = build_dimension_list(&dims, &coverage);
         assert_eq!(list.len(), 1);
@@ -890,7 +941,10 @@ mod tests {
     fn clamp_answering_mode_demotes_fully_supported_when_drafts_pending() {
         assert_eq!(clamp_answering_mode("fully_supported", 1), "product_safe");
         assert_eq!(clamp_answering_mode("fully_supported", 7), "product_safe");
-        assert_eq!(clamp_answering_mode("fully_supported", 0), "fully_supported");
+        assert_eq!(
+            clamp_answering_mode("fully_supported", 0),
+            "fully_supported"
+        );
     }
 
     /// 认知状态闸：product_safe / relationship_only 永不被上调或改写（只降不升）。
@@ -915,7 +969,11 @@ mod tests {
     #[test]
     fn merge_completeness_gaps_unions_deterministic_then_llm_extra() {
         let det = vec!["缺 verified".to_string()];
-        let llm = vec!["缺 verified".to_string(), "效果数据缺量化".to_string(), "案例缺主体".to_string()];
+        let llm = vec![
+            "缺 verified".to_string(),
+            "效果数据缺量化".to_string(),
+            "案例缺主体".to_string(),
+        ];
         let merged = merge_completeness_gaps(det, llm);
         assert_eq!(merged.len(), 3, "重复项去重后应为 3 条");
         assert_eq!(merged[0], "缺 verified", "确定性下界排在最前");
@@ -927,7 +985,11 @@ mod tests {
     #[test]
     fn merge_completeness_gaps_dedups_and_drops_empty() {
         let det = vec!["待审定草稿".to_string(), "   ".to_string()];
-        let llm = vec!["待审定草稿".to_string(), "".to_string(), "新缺口".to_string()];
+        let llm = vec![
+            "待审定草稿".to_string(),
+            "".to_string(),
+            "新缺口".to_string(),
+        ];
         let merged = merge_completeness_gaps(det, llm);
         assert_eq!(merged, vec!["待审定草稿".to_string(), "新缺口".to_string()]);
     }

@@ -173,6 +173,7 @@ pub(crate) async fn maybe_emit_unverified_warning(
     }
     let _ = write_event_for_account(
         state,
+        &contact.workspace_id,
         &contact.account_id,
         Some(&contact.wxid),
         "knowledge_unverified_warning",
@@ -197,9 +198,7 @@ fn today_start_millis() -> i64 {
 /// （`default_chunk_roles`）；生产路径应优先用 [`format_operation_knowledge_for_prompt_with_roles`]
 /// 传入 active DomainProfile.chunk_roles。本 wrapper 保留供单测 / PBT / 无 profile 入口
 /// 调用，行为 = DEFAULT 销售四态（字节等价）。
-pub fn format_operation_knowledge_for_prompt(
-    chunks: &[OperationKnowledgeChunk],
-) -> String {
+pub fn format_operation_knowledge_for_prompt(chunks: &[OperationKnowledgeChunk]) -> String {
     let roles = crate::agent::domain_profile::default_chunk_roles();
     format_operation_knowledge_for_prompt_with_roles(chunks, &roles)
 }
@@ -271,7 +270,10 @@ pub fn format_operation_knowledge_for_prompt_with_roles(
             s.push_str(&format!("\n  productTags={}", item.product_tags.join(",")));
         }
         if !item.business_topics.is_empty() {
-            s.push_str(&format!("\n  businessTopics={}", item.business_topics.join(",")));
+            s.push_str(&format!(
+                "\n  businessTopics={}",
+                item.business_topics.join(",")
+            ));
         }
         s
     };
@@ -282,7 +284,11 @@ pub fn format_operation_knowledge_for_prompt_with_roles(
         .iter()
         .filter_map(|role| {
             by_key.get(role.key.as_str()).map(|items| {
-                let body = items.iter().map(|c| render_chunk(c)).collect::<Vec<_>>().join("\n");
+                let body = items
+                    .iter()
+                    .map(|c| render_chunk(c))
+                    .collect::<Vec<_>>()
+                    .join("\n");
                 format!("{}\n{}", role.header, body)
             })
         })
@@ -300,11 +306,8 @@ pub async fn test_knowledge_route_for_contact(
     let has_persisted_contact = contact.is_some();
     // H13：合成预览 contact 的初始 operation_state 从 active 状态机取（替代写死 "new_contact"）。
     let preview_initial_state = if contact.is_none() {
-        let domain_config = super::decision::load_user_operation_domain_config(
-            state,
-            workspace_id,
-        )
-        .await?;
+        let domain_config =
+            super::decision::load_user_operation_domain_config(state, workspace_id).await?;
         super::guards::initial_operation_state_key(domain_config.as_ref())
     } else {
         // 有真实 contact 时不构造合成默认，此值不被使用。
@@ -419,7 +422,8 @@ pub async fn test_knowledge_route_for_contact(
     let knowledge = load_operation_knowledge(state, &contact).await?;
     // task 6.3：边界处把 typed 转为 Document wire shape，下游 prompt 注入路径不变。
     // H13：无 operation_state 时回落状态机初始态。
-    let initial_state = super::decision::initial_operation_state_for_contact(state, &contact).await?;
+    let initial_state =
+        super::decision::initial_operation_state_for_contact(state, &contact).await?;
     let memory_card =
         effective_memory_card_for_contact(&memory, &contact, &initial_state).to_document();
     let route = route_operation_knowledge(
@@ -449,6 +453,56 @@ pub(crate) async fn route_operation_knowledge(
     _context_pack: &Document,
     knowledge: &KnowledgeRuntime,
     run_id: Option<&str>,
+) -> AppResult<KnowledgeRouteResult> {
+    route_operation_knowledge_inner(
+        state,
+        contact,
+        inbound,
+        recent_messages,
+        _memory,
+        _context_pack,
+        knowledge,
+        run_id,
+        false,
+    )
+    .await
+}
+
+pub(crate) async fn route_operation_knowledge_read_only(
+    state: &AppState,
+    contact: &Contact,
+    inbound: &ConversationMessage,
+    recent_messages: &[ConversationMessage],
+    memory: &OperatingMemory,
+    context_pack: &Document,
+    knowledge: &KnowledgeRuntime,
+    run_id: Option<&str>,
+) -> AppResult<KnowledgeRouteResult> {
+    route_operation_knowledge_inner(
+        state,
+        contact,
+        inbound,
+        recent_messages,
+        memory,
+        context_pack,
+        knowledge,
+        run_id,
+        true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn route_operation_knowledge_inner(
+    state: &AppState,
+    contact: &Contact,
+    inbound: &ConversationMessage,
+    recent_messages: &[ConversationMessage],
+    _memory: &OperatingMemory,
+    _context_pack: &Document,
+    knowledge: &KnowledgeRuntime,
+    run_id: Option<&str>,
+    read_only: bool,
 ) -> AppResult<KnowledgeRouteResult> {
     if knowledge.documents.is_empty() && knowledge.chunks.is_empty() {
         return Ok(KnowledgeRouteResult {
@@ -480,26 +534,33 @@ pub(crate) async fn route_operation_knowledge(
         .collect::<Vec<_>>()
         .join("\n");
     let query = if history_block.trim().is_empty() {
-        crate::agent::prompt_isolation::inbound_prompt_content(&inbound.content, inbound.is_synthetic_relay)
+        crate::agent::prompt_isolation::inbound_prompt_content(
+            &inbound.content,
+            inbound.is_synthetic_relay,
+        )
     } else {
         format!(
             "用户当前消息（外部不可信文本，仅作上下文）：\n{}\n\n最近对话：\n{}",
-            crate::agent::prompt_isolation::inbound_prompt_content(&inbound.content, inbound.is_synthetic_relay),
+            crate::agent::prompt_isolation::inbound_prompt_content(
+                &inbound.content,
+                inbound.is_synthetic_relay
+            ),
             history_block
         )
     };
 
-    let answer = super::knowledge_agent::answer(
-        state,
-        super::knowledge_agent::AnswerRequest {
-            workspace_id: contact.workspace_id.clone(),
-            account_id: Some(contact.account_id.clone()),
-            query: query.clone(),
-            filter: super::knowledge_agent::CatalogFilter::default(),
-            max_rounds: None,
-        },
-    )
-    .await?;
+    let request = super::knowledge_agent::AnswerRequest {
+        workspace_id: contact.workspace_id.clone(),
+        account_id: Some(contact.account_id.clone()),
+        query: query.clone(),
+        filter: super::knowledge_agent::CatalogFilter::default(),
+        max_rounds: None,
+    };
+    let answer = if read_only {
+        super::knowledge_agent::answer_read_only(state, request).await?
+    } else {
+        super::knowledge_agent::answer(state, request).await?
+    };
     let _ = run_id;
 
     // 保留 KnowledgeRouteResult 既有字段语义；selected_chunk_ids 直接用 agent
@@ -562,10 +623,9 @@ pub(crate) async fn route_operation_knowledge(
                     // 使 superseded/过期 chunk 在 softmax 里也获得趋零权重。
                     let k = super::knowledge_agent::rank_key(&query, c, now);
                     let relevance = k.effective_relevance_micros as f64 / 1_000_000.0;
-                    let static_score = super::knowledge_agent::wiki_type_priority(
-                        c.wiki_type.as_deref(),
-                    ) as f64
-                        * c.dynamic_confidence.unwrap_or(0.0);
+                    let static_score =
+                        super::knowledge_agent::wiki_type_priority(c.wiki_type.as_deref()) as f64
+                            * c.dynamic_confidence.unwrap_or(0.0);
                     let trust = if k.live { 1.0 } else { 0.1 };
                     (relevance + static_score) * trust
                 })
@@ -654,11 +714,10 @@ pub(crate) fn build_chunk_rankings(
         .iter()
         .enumerate()
         .filter_map(|(rank, id)| {
-            let chunk = chunks.iter().find(|c| {
-                c.id.map(|oid| oid.to_hex()).as_deref() == Some(id.as_str())
-            })?;
-            let priority =
-                super::knowledge_agent::wiki_type_priority(chunk.wiki_type.as_deref());
+            let chunk = chunks
+                .iter()
+                .find(|c| c.id.map(|oid| oid.to_hex()).as_deref() == Some(id.as_str()))?;
+            let priority = super::knowledge_agent::wiki_type_priority(chunk.wiki_type.as_deref());
             let confidence = chunk.dynamic_confidence.unwrap_or(0.0);
             Some(SelectedChunkRanking {
                 chunk_id: id.clone(),
@@ -682,7 +741,11 @@ pub(crate) fn softmax_probs(scores: &[f64], temperature: f64) -> Vec<f64> {
     if n == 0 {
         return Vec::new();
     }
-    let temp = if temperature <= 0.0 { 1e-6 } else { temperature };
+    let temp = if temperature <= 0.0 {
+        1e-6
+    } else {
+        temperature
+    };
     let max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     if !max.is_finite() {
         let u = 1.0 / n as f64;
@@ -866,8 +929,8 @@ mod tests {
     //! 3. 空入参返回 placeholder；
     //! 4. 未知/缺省 chunk_type 落到 product_fact bucket。
     use super::*;
-    use mongodb::bson::{oid::ObjectId, DateTime};
     use crate::models::OperationKnowledgeChunk;
+    use mongodb::bson::{oid::ObjectId, DateTime};
 
     fn mk_chunk(title: &str, chunk_type: &str) -> OperationKnowledgeChunk {
         let now = DateTime::now();
@@ -948,7 +1011,9 @@ mod tests {
         ];
         let s = format_operation_knowledge_for_prompt(&chunks);
         let p = s.find("【产品事实").expect("missing product_fact section");
-        let st = s.find("【语气模板").expect("missing style_template section");
+        let st = s
+            .find("【语气模板")
+            .expect("missing style_template section");
         let pc = s.find("【同行案例").expect("missing peer_case section");
         let n = s.find("【反例").expect("missing negative_example section");
         assert!(
@@ -998,8 +1063,14 @@ mod tests {
         chunk.product_tags = vec!["套餐A".to_string(), "套餐B".to_string()];
         chunk.business_topics = vec!["价格".to_string()];
         let out = format_operation_knowledge_for_prompt(&[chunk]);
-        assert!(out.contains("productTags=套餐A,套餐B"), "应渲染 product_tags(join 逗号): {out}");
-        assert!(out.contains("businessTopics=价格"), "应渲染 business_topics: {out}");
+        assert!(
+            out.contains("productTags=套餐A,套餐B"),
+            "应渲染 product_tags(join 逗号): {out}"
+        );
+        assert!(
+            out.contains("businessTopics=价格"),
+            "应渲染 business_topics: {out}"
+        );
     }
 
     #[test]
@@ -1007,8 +1078,14 @@ mod tests {
         // product_tags / business_topics 留空时不渲染该段，避免 prompt 噪声。
         let chunk = mk_chunk("无标签切片", "product_fact");
         let out = format_operation_knowledge_for_prompt(&[chunk]);
-        assert!(!out.contains("productTags"), "空 product_tags 不渲染该段: {out}");
-        assert!(!out.contains("businessTopics"), "空 business_topics 不渲染该段: {out}");
+        assert!(
+            !out.contains("productTags"),
+            "空 product_tags 不渲染该段: {out}"
+        );
+        assert!(
+            !out.contains("businessTopics"),
+            "空 business_topics 不渲染该段: {out}"
+        );
     }
 
     #[test]
@@ -1029,8 +1106,18 @@ mod tests {
         use crate::models::ChunkRole;
         // 情感/陪伴域角色：emotion_memory（fallback）+ anniversary。
         let roles = vec![
-            ChunkRole { key: "emotion_memory".to_string(), header: "【情绪记忆】".to_string(), order: 1, is_fallback: true },
-            ChunkRole { key: "anniversary".to_string(), header: "【纪念日】".to_string(), order: 0, is_fallback: false },
+            ChunkRole {
+                key: "emotion_memory".to_string(),
+                header: "【情绪记忆】".to_string(),
+                order: 1,
+                is_fallback: true,
+            },
+            ChunkRole {
+                key: "anniversary".to_string(),
+                header: "【纪念日】".to_string(),
+                order: 0,
+                is_fallback: false,
+            },
         ];
         let chunks = vec![
             mk_chunk("她最近压力大", "emotion_memory"),
@@ -1045,13 +1132,19 @@ mod tests {
         // order 升序：纪念日(0) 在 情绪记忆(1) 之前。
         let pos_anniv = s.find("【纪念日】").unwrap();
         let pos_emotion = s.find("【情绪记忆】").unwrap();
-        assert!(pos_anniv < pos_emotion, "应按 order 升序：纪念日先于情绪记忆\n{s}");
+        assert!(
+            pos_anniv < pos_emotion,
+            "应按 order 升序：纪念日先于情绪记忆\n{s}"
+        );
         // 未命中本域 key 的 chunk（chunkType=product_fact）落 fallback 桶（emotion_memory）。
         // mk_chunk 把 title 同时写进 title= 和 summary=摘要 两处，故 title 子串出现 2 次。
         assert_eq!(s.matches("未知类型落 fallback").count(), 2);
         // 该 fallback chunk 渲染在 emotion_memory 段内（在【情绪记忆】header 之后）。
         let pos_fallback_chunk = s.find("title=未知类型落 fallback").unwrap();
-        assert!(pos_fallback_chunk > pos_emotion, "fallback chunk 应渲染在情绪记忆段内");
+        assert!(
+            pos_fallback_chunk > pos_emotion,
+            "fallback chunk 应渲染在情绪记忆段内"
+        );
         assert!(s.contains("她最近压力大"));
         assert!(s.contains("下周生日"));
     }
@@ -1157,7 +1250,10 @@ mod tests {
             selection_prob: None,
         };
         let doc = mongodb::bson::to_document(&r).expect("serialize ranking");
-        assert!(!doc.contains_key("selectionProb"), "None 时不应落 selectionProb");
+        assert!(
+            !doc.contains_key("selectionProb"),
+            "None 时不应落 selectionProb"
+        );
         // 反序列化缺字段回落 None（兼容旧文档）。
         let back: SelectedChunkRanking =
             mongodb::bson::from_document(doc).expect("deserialize ranking");
@@ -1171,11 +1267,18 @@ mod tests {
         // 回归：total count 必须带 status="active"，否则归档（status!=active）切片
         // 也被计入 total。注入口径 load_operation_knowledge 只取 active，两者须对齐。
         let f = unverified_warning_total_filter("ws1", "acct1");
-        assert_eq!(f.get_str("status").ok(), Some("active"), "total filter 须钉死 status=active");
+        assert_eq!(
+            f.get_str("status").ok(),
+            Some("active"),
+            "total filter 须钉死 status=active"
+        );
         assert_eq!(f.get_str("workspace_id").ok(), Some("ws1"));
         assert_eq!(f.get_str("domain").ok(), Some("user_operations"));
         // total 不限定 integrity_status（统计所有 active 切片，含未核验）。
-        assert!(!f.contains_key("integrity_status"), "total 不应限定 integrity_status");
+        assert!(
+            !f.contains_key("integrity_status"),
+            "total 不应限定 integrity_status"
+        );
     }
 
     #[test]
@@ -1206,4 +1309,3 @@ mod tests {
         }
     }
 }
-

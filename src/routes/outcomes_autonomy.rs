@@ -93,11 +93,7 @@ fn parse_horizon_since(horizon: Option<&str>) -> Option<DateTime> {
 ///
 /// 命中 W6 (`account_id, final_review_status, created_at`) /
 /// (`account_id, autonomy_mode, created_at`) 复合索引；进一步过滤交给计数 stage。
-fn build_horizon_filter(
-    workspace_id: &str,
-    account_id: &str,
-    horizon: Option<&str>,
-) -> Document {
+fn build_horizon_filter(workspace_id: &str, account_id: &str, horizon: Option<&str>) -> Document {
     let mut filter = doc! {
         "workspace_id": workspace_id,
         "account_id": account_id,
@@ -251,9 +247,7 @@ pub async fn get_autonomy_outcomes(
             }
         },
     );
-    let total_runs = runs
-        .count_documents(upgraded_filter.clone(), None)
-        .await?;
+    let total_runs = runs.count_documents(upgraded_filter.clone(), None).await?;
 
     let legacy_runs = runs
         .count_documents(
@@ -283,10 +277,7 @@ pub async fn get_autonomy_outcomes(
 
     let held_by_ai_policy = runs
         .count_documents(
-            merge_filter(
-                &base,
-                doc! { "final_review_status": "held_by_ai_policy" },
-            ),
+            merge_filter(&base, doc! { "final_review_status": "held_by_ai_policy" }),
             None,
         )
         .await?;
@@ -367,7 +358,8 @@ pub async fn get_autonomy_outcomes(
         )
         .await?;
 
-    // 发送链路（outbox）状态行：sent / canceled / failed_terminal / 总入队数。
+    // 发送链路（outbox）状态行：sent / canceled / failed_terminal /
+    // delivery_unknown / 总入队数。
     // outbox `created_at` 与 run `created_at` 同一个 horizon 视角即可。
     let outbox_base = build_horizon_filter(&workspace_id, &account_id, horizon_label);
     let outbox_total = outbox.count_documents(outbox_base.clone(), None).await?;
@@ -386,9 +378,16 @@ pub async fn get_autonomy_outcomes(
             None,
         )
         .await?;
+    let outbox_delivery_unknown = outbox
+        .count_documents(
+            merge_filter(&outbox_base, doc! { "status": "delivery_unknown" }),
+            None,
+        )
+        .await?;
 
     // M3 / Task 70：planner 三段 tick / emit / capped / backoff 聚合给前端展示。
-    let planner_section = fetch_planner_section(&state, &workspace_id, &account_id, horizon_label).await?;
+    let planner_section =
+        fetch_planner_section(&state, &workspace_id, &account_id, horizon_label).await?;
 
     Ok(Json(json!({
         "horizon": horizon_label.unwrap_or("24h"),
@@ -432,9 +431,11 @@ pub async fn get_autonomy_outcomes(
             "sent": outbox_sent,
             "canceled": outbox_canceled,
             "failedTerminal": outbox_failed_terminal,
+            "deliveryUnknown": outbox_delivery_unknown,
             "sendSuccessRate": ratio(outbox_sent, outbox_total),
             "canceledRate": ratio(outbox_canceled, outbox_total),
             "failedTerminalRate": ratio(outbox_failed_terminal, outbox_total),
+            "deliveryUnknownRate": ratio(outbox_delivery_unknown, outbox_total),
         },
         "planner": planner_section,
     })))

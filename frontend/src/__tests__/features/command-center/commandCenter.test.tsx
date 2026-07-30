@@ -78,6 +78,8 @@ describe("CommandCenterFeature", () => {
     useCommandStore.setState({
       commandResult: {
         id: "run-hex-1",
+        accountId: "test123",
+        planHash: "plan-hash-1",
         status: "pending_confirmation",
         summary: "该计划包含高风险操作，等待确认。",
         toolCalls: [
@@ -94,6 +96,8 @@ describe("CommandCenterFeature", () => {
     useCommandStore.setState({
       commandResult: {
         id: "run-hex-2",
+        accountId: "test123",
+        planHash: "plan-hash-2",
         status: "succeeded",
         summary: "已执行。",
         toolCalls: [
@@ -110,6 +114,8 @@ describe("CommandCenterFeature", () => {
     useCommandStore.setState({
       commandResult: {
         id: "run-hex-3",
+        accountId: "test123",
+        planHash: "plan-hash-3",
         status: "succeeded",
         summary: "已执行。",
         toolCalls: [
@@ -125,6 +131,8 @@ describe("CommandCenterFeature", () => {
     useCommandStore.setState({
       commandResult: {
         id: "run-hex-4",
+        accountId: "test123",
+        planHash: "plan-hash-4",
         status: "succeeded",
         summary: "已执行。",
         toolCalls: [
@@ -146,6 +154,8 @@ describe("CommandCenterFeature", () => {
     useCommandStore.setState({
       commandResult: {
         id: "run-hex-5",
+        accountId: "test123",
+        planHash: "plan-hash-5",
         status: "succeeded",
         summary: "已执行。",
         toolCalls: [

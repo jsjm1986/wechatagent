@@ -35,6 +35,7 @@ describe("campaignStore", () => {
   });
 
   it("loadReport 成功写入 report 并清 loading", async () => {
+    useCampaignStore.setState({ selectedCampaignId: "c1" });
     (api.get as any).mockResolvedValue(sample);
     await useCampaignStore.getState().loadReport("c1");
     const s = useCampaignStore.getState();
@@ -44,6 +45,7 @@ describe("campaignStore", () => {
   });
 
   it("loadReport 失败时不抛、loading 归位、report 保持 null", async () => {
+    useCampaignStore.setState({ selectedCampaignId: "c1" });
     (api.get as any).mockRejectedValue(new Error("boom"));
     await useCampaignStore.getState().loadReport("c1");
     const s = useCampaignStore.getState();
@@ -52,6 +54,7 @@ describe("campaignStore", () => {
   });
 
   it("loadReport 失败也会记录 lastAttemptedId（守卫用）", async () => {
+    useCampaignStore.setState({ selectedCampaignId: "c1" });
     (api.get as any).mockRejectedValue(new Error("boom"));
     await useCampaignStore.getState().loadReport("c1");
     expect(useCampaignStore.getState().lastAttemptedId).toBe("c1");
@@ -74,6 +77,40 @@ describe("campaignStore", () => {
     expect(s.selectedCampaignId).toBeNull();
     expect(s.report).toBeNull();
     expect(s.loading).toBe(false);
+  });
+
+  it("A 慢 B 快：A 迟到响应不能覆盖 B 报告或 loading", async () => {
+    let resolveA!: (value: CampaignReport) => void;
+    let resolveB!: (value: CampaignReport) => void;
+    const pendingA = new Promise<CampaignReport>((resolve) => { resolveA = resolve; });
+    const pendingB = new Promise<CampaignReport>((resolve) => { resolveB = resolve; });
+    (api.get as any)
+      .mockReturnValueOnce(pendingA)
+      .mockReturnValueOnce(pendingB);
+    const reportB: CampaignReport = { ...sample, campaignId: "c2", title: "B" };
+
+    useCampaignStore.getState().openReport("c1");
+    useCampaignStore.getState().openReport("c2");
+    resolveB(reportB);
+    await pendingB;
+    await Promise.resolve();
+    expect(useCampaignStore.getState().report).toEqual(reportB);
+    expect(useCampaignStore.getState().loading).toBe(false);
+
+    resolveA(sample);
+    await pendingA;
+    await Promise.resolve();
+    expect(useCampaignStore.getState().selectedCampaignId).toBe("c2");
+    expect(useCampaignStore.getState().report).toEqual(reportB);
+    expect(useCampaignStore.getState().loading).toBe(false);
+  });
+
+  it("响应 campaignId 与请求不一致时拒绝提交", async () => {
+    useCampaignStore.setState({ selectedCampaignId: "c1" });
+    (api.get as any).mockResolvedValue({ ...sample, campaignId: "wrong" });
+    await useCampaignStore.getState().loadReport("c1");
+    expect(useCampaignStore.getState().report).toBeNull();
+    expect(useCampaignStore.getState().loading).toBe(false);
   });
 });
 
