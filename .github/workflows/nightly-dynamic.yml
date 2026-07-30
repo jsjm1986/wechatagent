@@ -23,7 +23,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # R5.1 LLM 演客户动态博弈链（三族异族 R5.0.1：agent=claude-opus-4-8（RSXERMU/Anthropic）、
+  # R5.1 LLM 演客户动态博弈链（三族异族 R5.0.1：agent=gpt-5.6-auto（RSXERMU/OpenAI）、
   # roleplayer=NVIDIA llama-3.3-70b（NVIDIA_KEY，第三族，独立端点不占 rsxermu 并发））。
   roleplay-arc-nightly:
     name: Roleplay R5.1 动态博弈链 (nightly / 三族真模型)
@@ -65,16 +65,16 @@ jobs:
         if: ${{ env.REAL_LLM_API_KEY != '' && env.ROLEPLAYER_API_KEY != '' }}
         uses: Swatinem/rust-cache@v2
 
-      # 被测 agent = claude-opus-4-8（rsxermu666.cn / Anthropic 非流式）；roleplayer 走
+      # 被测 agent = gpt-5.6-auto（gateway.oeezzk.cn / OpenAI）；roleplayer 走
       # NVIDIA llama-3.3-70b @ temperature 0.8。两端点异厂商天然异族，且 NVIDIA 异端点
       # 不占 rsxermu 并发。
       - name: cargo test --test real_llm_roleplay_arc (3 异族真模型 + testcontainers)
         if: ${{ env.REAL_LLM_API_KEY != '' && env.ROLEPLAYER_API_KEY != '' }}
         env:
           RUSTFLAGS: ""
-          REAL_LLM_BASE_URL: https://rsxermu666.cn
-          REAL_LLM_MODEL: claude-opus-4-8
-          REAL_LLM_FORMAT: anthropic
+          REAL_LLM_BASE_URL: https://gateway.oeezzk.cn/v1
+          REAL_LLM_MODEL: gpt-5.6-auto
+          REAL_LLM_FORMAT: openai
           ROLEPLAYER_BASE_URL: https://integrate.api.nvidia.com/v1
           ROLEPLAYER_MODEL: meta/llama-3.3-70b-instruct
           ROLEPLAYER_FORMAT: openai
