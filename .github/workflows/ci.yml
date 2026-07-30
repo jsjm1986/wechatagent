@@ -58,6 +58,84 @@ env:
   RUSTFLAGS: "-Dwarnings"
 
 jobs:
+  # Temporary HC-001 audit. This job is restricted to the dedicated same-repo
+  # audit PR and is never intended to merge. It reports only typed status.
+  nvidia-secret-audit:
+    name: NVIDIA secret candidate audit (HC-001 temporary)
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'pull_request' && github.head_ref == 'hc001/audit-nvidia-secret-candidates' }}
+    timeout-minutes: 10
+    env:
+      CURRENT_KEY: ${{ secrets.NVIDIA_KEY }}
+      VISION_JUDGE_KEY: ${{ secrets.VISION_JUDGE_API_KEY }}
+      LEGACY_VISION_KEY: ${{ secrets.REAL_LLM_VISION_API_KEY }}
+    steps:
+      - name: Compare and probe candidates without exposing values
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.error
+          import urllib.request
+
+          candidates = {
+              "CURRENT": os.environ.get("CURRENT_KEY", ""),
+              "VISION_JUDGE": os.environ.get("VISION_JUDGE_KEY", ""),
+              "LEGACY_VISION": os.environ.get("LEGACY_VISION_KEY", ""),
+          }
+          models = {
+              "ROLEPLAYER": "meta/llama-3.3-70b-instruct",
+              "QWEN_JUDGE": "qwen/qwen3-next-80b-a3b-instruct",
+              "GLM_JUDGE": "z-ai/glm-5.1",
+              "VISION_JUDGE": "meta/llama-3.2-90b-vision-instruct",
+          }
+
+          def classify(key, model):
+              if not key:
+                  return "missing"
+              request = urllib.request.Request(
+                  "https://integrate.api.nvidia.com/v1/chat/completions",
+                  data=json.dumps({
+                      "model": model,
+                      "messages": [{"role": "user", "content": "Reply with OK."}],
+                      "max_tokens": 1,
+                      "temperature": 0,
+                  }).encode("utf-8"),
+                  method="POST",
+                  headers={
+                      "Authorization": "Bearer " + key,
+                      "Content-Type": "application/json",
+                      "User-Agent": "wechatagent-hc001-nvidia-secret-audit",
+                  },
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=45) as response:
+                      status = response.status
+              except urllib.error.HTTPError as error:
+                  status = error.code
+              except Exception:
+                  return "transport_error"
+              if 200 <= status < 300:
+                  return "accepted"
+              if status == 429:
+                  return "accepted_rate_limited"
+              if status in (401, 403):
+                  return "rejected_auth"
+              return "indeterminate_http_" + str(status)
+
+          aliases = list(candidates)
+          for alias in aliases:
+              print(alias + "_PRESENT=" + str(bool(candidates[alias])).lower())
+          for index, left in enumerate(aliases):
+              for right in aliases[index + 1:]:
+                  equal = bool(candidates[left]) and candidates[left] == candidates[right]
+                  print(left + "_EQ_" + right + "=" + str(equal).lower())
+          for alias, key in candidates.items():
+              for role, model in models.items():
+                  print(alias + "_" + role + "=" + classify(key, model))
+          PY
+
   # HC-001: one synthetic request verifies the rotated secret and its public
   # provider binding. The response body is neither printed nor uploaded.
   credential-probe:
