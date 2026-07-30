@@ -6,7 +6,7 @@
 /frontend/dist
 /frontend/target-pbt
 .env
-.env.e2e
+/.env.e2e
 .DS_Store
 npm-debug.log*
 *.log

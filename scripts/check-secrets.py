@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail when source candidates contain a high-confidence literal credential.
+"""Fail when source candidates contain credentials or unsafe provider bindings.
 
 The checker deliberately reports only path, line and rule. It never prints the
 candidate value or a reversible digest. The CI default scans tracked files.
@@ -66,6 +66,7 @@ PRIVATE_URI = re.compile(
 )
 PRIVATE_KEY_MARKER = "-----BEGIN " + "PRIVATE KEY-----"
 MAX_UNTRACKED_BYTES = 5 * 1024 * 1024
+FORBIDDEN_TRACKED_PATHS = {".env.e2e"}
 
 # HC-001: this repository secret belongs to one provider configuration.  A
 # secret-only rotation is unsafe if a workflow still sends the replacement to
@@ -80,10 +81,14 @@ ROTATED_WORKFLOW_BINDINGS = {
     "REAL_LLM_JUDGE_MODEL": "codex-auto-review",
     "REAL_LLM_JUDGE1_MODEL": "codex-auto-review",
     "REAL_LLM_JUDGE_LITE_MODEL": "codex-auto-review",
+    "REAL_LLM_JUDGE_FORMAT": "openai",
+    "REAL_LLM_VISION_BASE_URL": "https://gateway.oeezzk.cn/v1",
+    "REAL_LLM_VISION_MODEL": "gpt-5.6-auto",
 }
 WORKFLOW_BINDING_ASSIGNMENT = re.compile(
     r"^\s*(?P<name>REAL_LLM_(?:BASE_URL|MODEL|FORMAT|JUDGE_BASE_URL|"
-    r"JUDGE_MODEL|JUDGE1_MODEL|JUDGE_LITE_MODEL))\s*:\s*(?P<value>[^#\r\n]+?)\s*$"
+    r"JUDGE_MODEL|JUDGE1_MODEL|JUDGE_LITE_MODEL|JUDGE_FORMAT|"
+    r"VISION_BASE_URL|VISION_MODEL))\s*:\s*(?P<value>[^#\r\n]+?)\s*$"
 )
 
 
@@ -180,6 +185,10 @@ def candidate_files(include_untracked: bool) -> tuple[list[pathlib.Path], set[pa
 
 def scan_repository(include_untracked: bool = False) -> list[Finding]:
     findings: list[Finding] = []
+    tracked = git_files("--cached")
+    for path in tracked:
+        if path.as_posix() in FORBIDDEN_TRACKED_PATHS:
+            findings.append(Finding(path.as_posix(), 1, "private-env-must-not-be-tracked"))
     candidates, untracked = candidate_files(include_untracked)
     for path in candidates:
         if not path.is_file():
@@ -234,6 +243,9 @@ def self_test() -> None:
             "REAL_LLM_FORMAT: openai",
             "REAL_LLM_JUDGE_BASE_URL: https://gateway.oeezzk.cn/v1",
             "REAL_LLM_JUDGE_MODEL: codex-auto-review",
+            "REAL_LLM_JUDGE_FORMAT: openai",
+            "REAL_LLM_VISION_BASE_URL: https://gateway.oeezzk.cn/v1",
+            "REAL_LLM_VISION_MODEL: gpt-5.6-auto",
         )
     )
     assert scan_text("positive-token", positive_token)
@@ -253,6 +265,7 @@ def self_test() -> None:
         for finding in scan_text(".github/workflows/binding-positive.yml", binding_positive)
     } == {"rotated-secret-provider-binding"}
     assert not scan_text(".github/workflows/binding-negative.yml", binding_negative)
+    assert ".env.e2e" in FORBIDDEN_TRACKED_PATHS
 
 
 def main() -> int:
