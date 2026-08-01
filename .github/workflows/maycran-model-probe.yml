@@ -39,16 +39,18 @@ jobs:
               "deepseek-v4-pro",
           ]
 
-          def probe(model, extra_headers):
-              body = json.dumps({
+          def probe(model, extra_headers, *, include_max_tokens=True, direct=False):
+              payload = {
                   "model": model,
                   "temperature": 0,
-                  "max_tokens": 16,
                   "messages": [
                       {"role": "system", "content": "Return strict JSON only."},
                       {"role": "user", "content": "Return {\"ok\":true}."},
                   ],
-              }).encode()
+              }
+              if include_max_tokens:
+                  payload["max_tokens"] = 16
+              body = json.dumps(payload).encode()
               headers = {
                   "Authorization": f"Bearer {os.environ['MAYCRAN_API_KEY']}",
                   "Content-Type": "application/json",
@@ -61,8 +63,13 @@ jobs:
               )
               status = 0
               valid_shape = False
+              opener = (
+                  urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                  if direct
+                  else urllib.request.build_opener()
+              )
               try:
-                  with urllib.request.urlopen(request, timeout=60) as response:
+                  with opener.open(request, timeout=60) as response:
                       status = response.status
                       payload = json.load(response)
                       valid_shape = bool(
@@ -95,6 +102,24 @@ jobs:
               status, valid_shape = probe("claude-sonnet-4-6", headers)
               print(
                   f"HEADER_PROBE profile={profile} status={status} "
+                  f"valid_shape={str(valid_shape).lower()}"
+              )
+
+          request_profiles = {
+              "max_tokens_default_network": (True, False),
+              "no_max_tokens_default_network": (False, False),
+              "max_tokens_direct": (True, True),
+              "no_max_tokens_direct": (False, True),
+          }
+          for profile, (include_max_tokens, direct) in request_profiles.items():
+              status, valid_shape = probe(
+                  "claude-sonnet-4-6",
+                  header_profiles["production_ua"],
+                  include_max_tokens=include_max_tokens,
+                  direct=direct,
+              )
+              print(
+                  f"REQUEST_PROBE profile={profile} status={status} "
                   f"valid_shape={str(valid_shape).lower()}"
               )
 
