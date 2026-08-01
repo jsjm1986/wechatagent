@@ -104,14 +104,9 @@ macro_rules! unwrap_or_skip_transient {
                 detail,
                 ..
             }) => {
-                let cfg_err_4xx = kind == "endpoint_not_found"
-                    || (kind == "http_4xx"
-                        && !detail.contains("HTTP 401")
-                        && !detail.contains("HTTP 402"));
-                if cfg_err_4xx {
+                if !wechatagent::llm::is_transient_llm_unavailable_kind(&kind) {
                     panic!(
-                        "{}：配置错误（kind={kind}），非端点抖动——4xx 多为 baseUrl/model/path 配错，\
-                         不当瞬时 skip 假绿（R0.3）。detail={detail}",
+                        "{}：非瞬时 LLM 错误（kind={kind}），不得 skip 假绿。detail={detail}",
                         $what
                     );
                 }
@@ -819,8 +814,17 @@ async fn run_query_n_times(state: &AppState, ws: &str, query: &str, n: usize) ->
         match answer(state, req).await {
             Ok(result) => results.push(result),
             Err(wechatagent::error::AppError::LlmUnavailable {
-                kind, retry_count, ..
+                kind,
+                retry_count,
+                detail,
+                ..
             }) => {
+                assert!(
+                    wechatagent::llm::is_transient_llm_unavailable_kind(&kind),
+                    "query={query} round={}/{} 非瞬时 LLM 错误不得跳过：kind={kind}, detail={detail}",
+                    i + 1,
+                    n
+                );
                 eprintln!(
                     "skip: query={} round={}/{} —— 真模型上游瞬时不可达（kind={}, retry_count={}），跳过本次",
                     query, i+1, n, kind, retry_count
@@ -1249,8 +1253,16 @@ async fn recall_all(
                 results.insert(case.name.clone(), (reach, adopt));
             }
             Err(wechatagent::error::AppError::LlmUnavailable {
-                kind, retry_count, ..
+                kind,
+                retry_count,
+                detail,
+                ..
             }) => {
+                assert!(
+                    wechatagent::llm::is_transient_llm_unavailable_kind(&kind),
+                    "case={} 非瞬时 LLM 错误不得跳过：kind={kind}, detail={detail}",
+                    case.name
+                );
                 eprintln!(
                     "[RECALL-MAINT] skip case={} —— 真模型上游瞬时不可达（kind={}, retry_count={}），记录空集跳过",
                     case.name, kind, retry_count
@@ -1882,8 +1894,15 @@ async fn answer_reach_adopt(
             Some((reach_set(&result), adopt_set(&result), observed_rounds))
         }
         Err(wechatagent::error::AppError::LlmUnavailable {
-            kind, retry_count, ..
+            kind,
+            retry_count,
+            detail,
+            ..
         }) => {
+            assert!(
+                wechatagent::llm::is_transient_llm_unavailable_kind(&kind),
+                "RECALL-CLOSED 非瞬时 LLM 错误不得跳过：kind={kind}, detail={detail}"
+            );
             eprintln!(
                 "[RECALL-CLOSED] skip —— 真模型上游瞬时不可达（kind={}, retry_count={}）",
                 kind, retry_count

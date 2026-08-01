@@ -356,6 +356,14 @@ impl LlmClient {
         if let Ok(value) = parse_json_content(cleaned) {
             return Ok(value);
         }
+        // 部分中转网关会用 HTTP 200 + 普通文本返回账户/凭据错误。此时内容并不包含
+        // 可修复的 JSON，继续回喂同一端点只会重复计费或重复失败。先转成稳定的非瞬时
+        // 错误，让生产诊断和真实模型测试都不会把“欠费/过期”误当成端点抖动。
+        if let Some(reason) = account_unavailable_reason(cleaned) {
+            return Err(AppError::External(format!(
+                "llm_account_unavailable: {reason}"
+            )));
+        }
         // 第三层：回喂 LLM 修复。每次修复响应只走 parse_json_content（不再回喂，断递归）。
         let mut attempts_diag: Vec<String> = Vec::new();
         for attempt in 1..=REPAIR_MAX_ATTEMPTS {
@@ -996,7 +1004,12 @@ fn classify_llm_error_for_user(error: &AppError, retry_count: u32) -> AppError {
             }
         }
         AppError::External(msg) => {
-            if msg.contains("LLM HTTP 429") {
+            if msg.contains("llm_account_unavailable") {
+                (
+                    "account_unavailable",
+                    "上游 LLM 账户不可用（余额不足、欠费或凭据已过期）。请恢复额度或更新凭据后重试。",
+                )
+            } else if msg.contains("LLM HTTP 429") {
                 (
                     "rate_limited",
                     "上游 LLM 触发限流（429），已多次重试。建议 30 秒后再试，或在 .env 中调高 LLM_RETRY_BASE_MS。",
@@ -1043,6 +1056,40 @@ fn classify_llm_error_for_user(error: &AppError, retry_count: u32) -> AppError {
         detail,
         hint: hint.to_string(),
     }
+}
+
+/// 真实模型测试只允许这些真正的瞬时基础设施错误跳过。未知、新增或账户/配置类
+/// 错误默认返回 false（fail closed），避免测试框架显示绿色但业务链路根本没运行。
+pub fn is_transient_llm_unavailable_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "rate_limited"
+            | "http_5xx"
+            | "timeout"
+            | "connect_failed"
+            | "network_error"
+            | "body_decode_error"
+    )
+}
+
+fn account_unavailable_reason(content: &str) -> Option<&'static str> {
+    let normalized = content.trim().to_ascii_lowercase();
+    let balance_unavailable = content.contains("余额不足")
+        || content.contains("欠费")
+        || normalized.contains("insufficient balance")
+        || normalized.contains("insufficient credit")
+        || normalized.contains("payment required")
+        || normalized.contains("arrearage");
+    if balance_unavailable {
+        return Some("insufficient_balance");
+    }
+
+    let credential_unavailable = content.contains("密钥已过期")
+        || content.contains("密钥过期")
+        || content.contains("API Key 已过期")
+        || normalized.contains("api key has expired")
+        || normalized.contains("expired api key");
+    credential_unavailable.then_some("credential_expired")
 }
 
 /// `AppError` 没实现 `Clone`，但 BudgetExceeded 是结构化 fields，需要原样转出。
@@ -1905,6 +1952,31 @@ mod tests {
     }
 
     #[test]
+    fn transient_unavailable_kind_is_fail_closed() {
+        for kind in [
+            "rate_limited",
+            "http_5xx",
+            "timeout",
+            "connect_failed",
+            "network_error",
+            "body_decode_error",
+        ] {
+            assert!(is_transient_llm_unavailable_kind(kind), "{kind}");
+        }
+        for kind in [
+            "account_unavailable",
+            "endpoint_not_found",
+            "http_4xx",
+            "empty_response",
+            "json_decode_error",
+            "external_error",
+            "unknown",
+        ] {
+            assert!(!is_transient_llm_unavailable_kind(kind), "{kind}");
+        }
+    }
+
+    #[test]
     fn tool_use_hijack_is_retryable() {
         // claude 偶发无视禁工具约束返回 tool_use block 而非 JSON(~25%,长任务高发)。
         // detect_tool_use_hijack 抛 External("llm_tool_use_instead_of_json: ...")。
@@ -2148,6 +2220,28 @@ mod tests {
             msg.contains("json_decode") && msg.contains("raw_head"),
             "错误须含结构化诊断（json_decode + raw_head），实际: {msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn parse_or_repair_rejects_account_message_without_network_repair() {
+        let client = unreachable_client();
+        let err = client
+            .parse_or_repair("您的余额不足以完成本次请求，功能受限，请立即充值。")
+            .await
+            .expect_err("账户错误不能进入 JSON 修复");
+        assert_eq!(
+            err.to_string(),
+            "llm_account_unavailable: insufficient_balance"
+        );
+
+        let classified = classify_llm_error_for_user(&err, 0);
+        match classified {
+            AppError::LlmUnavailable { kind, .. } => {
+                assert_eq!(kind, "account_unavailable");
+                assert!(!is_transient_llm_unavailable_kind(&kind));
+            }
+            other => panic!("expected LlmUnavailable, got {other:?}"),
+        }
     }
 
     // 长任务防御：claude 偶发 tool_use 劫持（真内容跑进 tool_use block，text 只剩开场白）。

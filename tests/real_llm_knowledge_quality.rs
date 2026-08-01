@@ -302,13 +302,9 @@ macro_rules! unwrap_or_skip_transient {
                 detail,
                 ..
             }) => {
-                let cfg_err_4xx = kind == "endpoint_not_found"
-                    || (kind == "http_4xx"
-                        && !detail.contains("HTTP 401")
-                        && !detail.contains("HTTP 402"));
-                if cfg_err_4xx {
+                if !wechatagent::llm::is_transient_llm_unavailable_kind(&kind) {
                     panic!(
-                        "{}：配置错误（kind={kind}），非端点抖动——4xx 多为 baseUrl/model/path 配错，\n                         不当瞬时 skip 假绿（R0.3）。detail={detail}",
+                        "{}：非瞬时 LLM 错误（kind={kind}），不得 skip 假绿。detail={detail}",
                         $what
                     );
                 }
@@ -1018,7 +1014,7 @@ async fn run_quality_panel(
     ground_truth: &str,
     dims: &[&str],
     image_base64: Option<&str>,
-) -> Option<PanelOutcome> {
+) -> AppResult<Option<PanelOutcome>> {
     // panel × K 全并发。
     let mut futs = Vec::new();
     for (ji, j) in panel.iter().enumerate() {
@@ -1042,14 +1038,22 @@ async fn run_quality_panel(
 
     // 按裁判下标 bucket 每次采样的 JudgeScore。
     let mut buckets: Vec<Vec<JudgeScore>> = (0..panel.len()).map(|_| Vec::new()).collect();
+    let mut first_transient_error = None;
     for (ji, r) in results {
         match r {
             Ok(s) => buckets[ji].push(s),
-            Err(wechatagent::error::AppError::LlmUnavailable { .. }) => {}
-            Err(e) => eprintln!(
-                "[质量裁判团][{qid}/{scene}][{}] 一次采样失败（仅诊断）: {e:?}",
-                panel[ji].label
-            ),
+            Err(e) => {
+                let transient = matches!(
+                    &e,
+                    wechatagent::error::AppError::LlmUnavailable { kind, .. }
+                        if wechatagent::llm::is_transient_llm_unavailable_kind(kind)
+                );
+                if transient {
+                    first_transient_error.get_or_insert(e);
+                } else {
+                    return Err(e);
+                }
+            }
         }
     }
 
@@ -1110,7 +1114,10 @@ async fn run_quality_panel(
     }
 
     if per_judge.is_empty() {
-        return None;
+        return match first_transient_error {
+            Some(error) => Err(error),
+            None => Ok(None),
+        };
     }
 
     // 跨裁判 overall 分歧（效度代理）写台账。
@@ -1131,10 +1138,10 @@ async fn run_quality_panel(
         );
     }
 
-    Some(PanelOutcome {
+    Ok(Some(PanelOutcome {
         per_judge,
         sample_scores,
-    })
+    }))
 }
 
 /// 校准：让**每个裁判**对该 Q 的金标 good/bad 各打 [`CALIB_RUNS`] 次（全并发），
@@ -1178,22 +1185,37 @@ async fn panel_calibrated(
         }
         let goods = join_all(good_futs).await;
         let bads = join_all(bad_futs).await;
-        let good_vals: Vec<f64> = goods
-            .into_iter()
-            .filter_map(|r| r.ok().map(|s| s.overall))
-            .collect();
-        let bad_vals: Vec<f64> = bads
-            .into_iter()
-            .filter_map(|r| r.ok().map(|s| s.overall))
-            .collect();
+        let collect_scores =
+            |results: Vec<AppResult<JudgeScore>>| -> AppResult<(Vec<f64>, Option<AppError>)> {
+                let mut values = Vec::new();
+                let mut first_transient_error = None;
+                for result in results {
+                    match result {
+                        Ok(score) => values.push(score.overall),
+                        Err(error) => {
+                            let transient = matches!(
+                                &error,
+                                wechatagent::error::AppError::LlmUnavailable { kind, .. }
+                                    if wechatagent::llm::is_transient_llm_unavailable_kind(kind)
+                            );
+                            if transient {
+                                first_transient_error.get_or_insert(error);
+                            } else {
+                                return Err(error);
+                            }
+                        }
+                    }
+                }
+                Ok((values, first_transient_error))
+            };
+        let (good_vals, good_error) = collect_scores(goods)?;
+        let (bad_vals, bad_error) = collect_scores(bads)?;
         if good_vals.is_empty() || bad_vals.is_empty() {
-            // 瞬时不可达：向上抛 LlmUnavailable，调用方按 skip 处理（不算失败）。
-            return Err(wechatagent::error::AppError::LlmUnavailable {
-                kind: "calib_judge_unavailable".to_string(),
-                retry_count: CALIB_RUNS as u32,
-                detail: format!("{qid} 校准锚对裁判 {} 全部采样不可达", j.label),
-                hint: "真模型上游抖动，按计划 skip 不算质量失败".to_string(),
-            });
+            // 只有真实瞬时错误才会到这里；保留原始 kind/detail，避免聚合层把账户或
+            // 配置错误改写成可跳过的“裁判不可用”。
+            return Err(good_error
+                .or(bad_error)
+                .expect("empty judge scores must retain transient error"));
         }
         let g = median(&good_vals);
         let b = median(&bad_vals);
@@ -1285,7 +1307,7 @@ async fn evaluate_quality_panel(
         dims,
         image_base64,
     )
-    .await
+    .await?
     {
         Some(o) => o,
         None => {
@@ -2071,7 +2093,9 @@ async fn q2_article_extraction_quality() {
     let judge_ok = match &panel {
         Some(p) => match panel_calibrated(p, "Q2", &Q2_CALIB).await {
             Ok(ok) => ok,
-            Err(wechatagent::error::AppError::LlmUnavailable { .. }) => {
+            Err(wechatagent::error::AppError::LlmUnavailable { kind, .. })
+                if wechatagent::llm::is_transient_llm_unavailable_kind(&kind) =>
+            {
                 eprintln!("skip judge: Q2 校准锚瞬时不可达，本轮只跑确定性召回断言");
                 false
             }
@@ -2179,7 +2203,7 @@ async fn q2_article_extraction_quality() {
                 )
                 .await
                 {
-                    Some(outcome) => {
+                    Ok(Some(outcome)) => {
                         let verdict = decide_quality(
                             &outcome.judge_stats(),
                             MIN_QUALITY_FLOOR,
@@ -2191,12 +2215,13 @@ async fn q2_article_extraction_quality() {
                         ledger_verdict("Q2", spec.source_name, &verdict, &meds);
                         handle_verdict("Q2", spec.source_name, verdict);
                     }
-                    None => {
+                    Ok(None) => {
                         eprintln!(
                             "[Q2-JUDGE] {} 双裁判无有效采样，跳过该条 judge",
                             spec.source_name
                         );
                     }
+                    Err(error) => panic!("Q2 裁判出现非瞬时错误，不得跳过假绿：{error:?}"),
                 }
             }
         }

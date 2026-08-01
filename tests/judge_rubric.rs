@@ -180,7 +180,7 @@ async fn quality_gate_fails_when_all_samples_fail() {
 }
 
 #[tokio::test]
-#[should_panic(expected = "端点配错")]
+#[should_panic(expected = "非瞬时错误")]
 async fn endpoint_misconfig_panics_even_observe_only() {
     set_judge_env();
     let r = build_judge_rubric(&default_domain_profile("ws"));
@@ -194,7 +194,8 @@ async fn endpoint_misconfig_panics_even_observe_only() {
 }
 
 #[tokio::test]
-async fn account_level_402_not_misconfig_observe_swallows() {
+#[should_panic(expected = "非瞬时错误")]
+async fn account_level_402_panics_even_observe_only() {
     set_judge_env();
     let r = build_judge_rubric(&default_domain_profile("ws"));
     let judge = FailingJudge {
@@ -202,12 +203,8 @@ async fn account_level_402_not_misconfig_observe_swallows() {
         detail: "LLM HTTP 402: insufficient balance".into(),
         calls: AtomicUsize::new(0),
     };
-    // 账户级 402 不算端点配错 → ObserveOnly 照常吞，返 None 不 panic。
-    let out = run_judge_graded(&judge, &r, "t", "in", "reply", 1, JudgeGate::ObserveOnly).await;
-    assert!(
-        out.is_none(),
-        "402 账户级应按 gate 处置，ObserveOnly 返 None"
-    );
+    // 账户/额度错误不是瞬时抖动；即便 ObserveOnly 也必须失败，不能让测试假绿。
+    let _ = run_judge_graded(&judge, &r, "t", "in", "reply", 1, JudgeGate::ObserveOnly).await;
 }
 
 #[tokio::test]

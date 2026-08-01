@@ -310,13 +310,9 @@ macro_rules! unwrap_or_skip_transient {
         match $result {
             Ok(value) => value,
             Err(wechatagent::error::AppError::LlmUnavailable { kind, retry_count, detail, .. }) => {
-                let cfg_err_4xx = kind == "endpoint_not_found"
-                    || (kind == "http_4xx"
-                        && !detail.contains("HTTP 401")
-                        && !detail.contains("HTTP 402"));
-                if cfg_err_4xx {
+                if !wechatagent::llm::is_transient_llm_unavailable_kind(&kind) {
                     panic!(
-                        "{}：配置错误（kind={kind}），非端点抖动——4xx 多为 baseUrl/model/path 配错，\n                         不当瞬时 skip 假绿（R0.3）。detail={detail}",
+                        "{}：非瞬时 LLM 错误（kind={kind}），不得 skip 假绿。detail={detail}",
                         $what
                     );
                 }
@@ -1211,7 +1207,11 @@ async fn run_single_input_for_profile(
     // 端点抖动 → None（调用方按 skip 处理，不假绿）。
     match handle_managed_message(&state, contact.clone(), &inbound).await {
         Ok(_) => {}
-        Err(AppError::LlmUnavailable { kind, .. }) => {
+        Err(AppError::LlmUnavailable { kind, detail, .. }) => {
+            assert!(
+                wechatagent::llm::is_transient_llm_unavailable_kind(&kind),
+                "R2.3 {wxid_prefix} 非瞬时 LLM 错误不得跳过：kind={kind}, detail={detail}"
+            );
             eprintln!("skip: R2.3 {wxid_prefix} 端点不可达(kind={kind})");
             return None;
         }
@@ -1396,7 +1396,11 @@ async fn r2_2_identity_probe_no_leak_no_freeze() {
             .expect("insert inbound");
         match handle_managed_message(&state, contact.clone(), &inbound).await {
             Ok(_) => {}
-            Err(AppError::LlmUnavailable { kind, .. }) => {
+            Err(AppError::LlmUnavailable { kind, detail, .. }) => {
+                assert!(
+                    wechatagent::llm::is_transient_llm_unavailable_kind(&kind),
+                    "身份探针 turn-{turn} 非瞬时 LLM 错误不得跳过：kind={kind}, detail={detail}"
+                );
                 eprintln!("skip: 身份探针 turn-{turn} 端点不可达(kind={kind})");
                 evidence.infra_skip(format!(
                     "identity probe turn {turn}: transient LLM failure kind={kind}"
