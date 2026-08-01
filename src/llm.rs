@@ -1017,6 +1017,11 @@ fn classify_llm_error_for_user(error: &AppError, retry_count: u32) -> AppError {
                     "account_unavailable",
                     "上游 LLM 账户不可用（余额不足、欠费或凭据已过期）。请恢复额度或更新凭据后重试。",
                 )
+            } else if is_transient_model_routing_error(msg) {
+                (
+                    "model_routing_unavailable",
+                    "上游兼容网关当前没有可承接该模型的账户路由，已多次重试。请稍后再试。",
+                )
             } else if msg.contains("LLM HTTP 429") {
                 (
                     "rate_limited",
@@ -1072,6 +1077,7 @@ pub fn is_transient_llm_unavailable_kind(kind: &str) -> bool {
     matches!(
         kind,
         "rate_limited"
+            | "model_routing_unavailable"
             | "http_5xx"
             | "timeout"
             | "connect_failed"
@@ -1106,6 +1112,18 @@ fn error_clone_or_external(error: &AppError) -> AppError {
     AppError::External(error.to_string())
 }
 
+/// Some compatible gateways return HTTP 404 while a requested model's dynamic
+/// account group is temporarily unavailable. This is distinct from an invalid
+/// endpoint: the response explicitly says the model is not supported by any
+/// currently configured account in the group, and the same request succeeds
+/// again once routing recovers.
+fn is_transient_model_routing_error(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    normalized.contains("llm http 404")
+        && normalized.contains("model_not_found")
+        && normalized.contains("not supported by any configured account in this group")
+}
+
 /// HP-4：可重试错误判定。
 ///
 /// **不**把 `AppError::Json(_)` 当可重试 —— 模型确定性吐出非 JSON 时，重试
@@ -1114,7 +1132,8 @@ pub fn is_retryable_llm_error(error: &AppError) -> bool {
     match error {
         AppError::Http(err) => err.is_timeout() || err.is_connect(),
         AppError::External(message) => {
-            message.contains("LLM HTTP 429")
+            is_transient_model_routing_error(message)
+                || message.contains("LLM HTTP 429")
                 || message.contains("LLM HTTP 500")
                 || message.contains("LLM HTTP 502")
                 || message.contains("LLM HTTP 503")
@@ -1960,9 +1979,41 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_model_group_404_is_retryable_but_plain_404_is_not() {
+        let routing_error = AppError::External(
+            r#"LLM HTTP 404 Not Found: {"error":{"message":"Model \"claude-sonnet-4.6\" is not supported by any configured account in this group","type":"model_not_found"}}"#
+                .to_string(),
+        );
+        assert!(is_retryable_llm_error(&routing_error));
+        match classify_llm_error_for_user(&routing_error, 3) {
+            AppError::LlmUnavailable {
+                kind, retry_count, ..
+            } => {
+                assert_eq!(kind, "model_routing_unavailable");
+                assert_eq!(retry_count, 3);
+                assert!(is_transient_llm_unavailable_kind(&kind));
+            }
+            other => panic!("expected LlmUnavailable, got {other:?}"),
+        }
+
+        for message in [
+            "LLM HTTP 404: route not found",
+            r#"LLM HTTP 404: {"error":{"type":"model_not_found"}}"#,
+            "LLM HTTP 404: not supported by any configured account in this group",
+        ] {
+            let err = AppError::External(message.to_string());
+            assert!(
+                !is_retryable_llm_error(&err),
+                "ordinary or incomplete 404 evidence must fail closed: {message}"
+            );
+        }
+    }
+
+    #[test]
     fn transient_unavailable_kind_is_fail_closed() {
         for kind in [
             "rate_limited",
+            "model_routing_unavailable",
             "http_5xx",
             "timeout",
             "connect_failed",

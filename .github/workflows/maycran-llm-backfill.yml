@@ -2,24 +2,14 @@ name: Maycran LLM backfill (temporary)
 
 on:
   workflow_dispatch:
-
-permissions:
-  contents: read
-
-concurrency:
-  group: maycran-llm-backfill
-  cancel-in-progress: false
-
-jobs:
-  backfill:
-    name: Maycran backfill (${{ matrix.target }})
-    runs-on: ubuntu-latest
-    timeout-minutes: 360
-    strategy:
-      fail-fast: false
-      max-parallel: 1
-      matrix:
-        target:
+    inputs:
+      target:
+        description: Backfill target to run
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
           - real_llm_smoke
           - domain_profile_e2e
           - real_llm_knowledge
@@ -37,6 +27,24 @@ jobs:
           - real_llm_roleplay_arc
           - roleplay_emotional_companion_e2e
           - roleplay_reviewer_pressure_calibration
+
+permissions:
+  contents: read
+
+concurrency:
+  group: maycran-llm-backfill
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    name: Maycran backfill (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        target: ${{ fromJSON(inputs.target == 'all' && '["real_llm_smoke","domain_profile_e2e","real_llm_knowledge","real_llm_recall_benchmark","real_llm_ops_smoke","real_llm_knowledge_quality","real_llm_progressive_tier","real_llm_adversarial","real_llm_cross_domain_arc","real_llm_principal_channel","real_llm_proactive_outreach","real_llm_dynamic_adversarial","real_llm_digital_twin_arc","real_llm_principal_relay","real_llm_roleplay_arc","roleplay_emotional_companion_e2e","roleplay_reviewer_pressure_calibration"]' || format('["{0}"]', inputs.target)) }}
     env:
       RUSTFLAGS: ""
       RUST_MIN_STACK: "8388608"

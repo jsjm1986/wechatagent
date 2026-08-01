@@ -28,6 +28,7 @@ jobs:
         run: |
           cargo test --locked --lib action_policy_
           cargo test --locked --lib client_sends_gateway_compatible_default_headers
+          cargo test --locked --lib dynamic_model_group_404_is_retryable_but_plain_404_is_not
 
       - name: Compile affected integration targets
         run: |
