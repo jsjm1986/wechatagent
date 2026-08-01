@@ -609,7 +609,19 @@ async fn e2e_generate_second_industry_profile() {
 
     // Candidate persistence commits multiple release-pointer writes atomically.
     let app = common::TestApp::start_repl_set().await;
-    let admin = test_admin(&app.state.config.default_workspace_id);
+    let workspace_id = app.state.config.default_workspace_id.clone();
+    let admin = test_admin(&workspace_id);
+    // 每个 tokio test 使用独立数据库，不能依赖上一条 real-LLM 测试留下的行业画像。
+    // 在本测试内种入第一行业，随后验证 AI 生成的第二行业草稿与它并存。
+    let existing_id = db_create_profile(
+        &app.state.db,
+        &workspace_id,
+        "emotional-companion-care",
+        "情感陪伴 · 深度关怀",
+        "情感陪伴",
+        "manual",
+    )
+    .await;
 
     let llm = match LlmClient::with_format(
         base_url.clone().unwrap(),
@@ -694,9 +706,27 @@ async fn e2e_generate_second_industry_profile() {
         p.prompt_fragment.as_ref().is_some_and(|s| !s.is_empty()),
         "AI 应生成 prompt_fragment"
     );
-    // 验证多 profile 并存（之前生成过 emotional-companion-care）
-    let all = db_list_current(&app.state.db, &app.state.config.default_workspace_id).await;
-    assert!(all.len() >= 1, "列表应至少包含刚生成的 profile");
+    // 生产列表按 workspace 返回全部版本，包含 current_version=false 的待审草稿。
+    // 用同形过滤验证两个行业都可见，不能误用只查 current 的 Part A helper。
+    let mut cursor = app
+        .state
+        .db
+        .domain_profiles()
+        .find(doc! { "workspace_id": &workspace_id }, None)
+        .await
+        .expect("list workspace profiles");
+    let mut all = Vec::new();
+    while let Some(profile) = cursor.try_next().await.expect("list next profile") {
+        all.push(profile);
+    }
+    assert!(
+        all.iter().any(|profile| profile.id == Some(existing_id)),
+        "列表应保留测试内种入的第一行业 profile"
+    );
+    assert!(
+        all.iter().any(|profile| profile.id == Some(id)),
+        "列表应包含刚生成且尚未 publish 的第二行业草稿"
+    );
 }
 
 // ── Part C：真 route handler 集成 ──────────────────────────────────────────
