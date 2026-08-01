@@ -1,0 +1,175 @@
+name: Maycran LLM backfill (temporary)
+
+on:
+  push:
+    branches:
+      - test/maycran-llm-backfill-20260802
+
+permissions:
+  contents: read
+
+concurrency:
+  group: maycran-llm-backfill
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    name: Maycran backfill (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        target:
+          - real_llm_smoke
+          - domain_profile_e2e
+          - real_llm_knowledge
+          - real_llm_recall_benchmark
+          - real_llm_ops_smoke
+          - real_llm_knowledge_quality
+          - real_llm_progressive_tier
+          - real_llm_adversarial
+          - real_llm_cross_domain_arc
+          - real_llm_principal_channel
+          - real_llm_proactive_outreach
+          - real_llm_dynamic_adversarial
+          - real_llm_digital_twin_arc
+          - real_llm_principal_relay
+          - real_llm_roleplay_arc
+          - roleplay_emotional_companion_e2e
+          - roleplay_reviewer_pressure_calibration
+    env:
+      RUSTFLAGS: ""
+      RUST_MIN_STACK: "8388608"
+      REAL_LLM_API_KEY: ${{ secrets.MAYCRAN_KEY }}
+      REAL_LLM_BASE_URL: https://api.maycran.com/v1
+      REAL_LLM_MODEL: claude-sonnet-4-6
+      REAL_LLM_FORMAT: openai
+      REAL_LLM_VISION_API_KEY: ${{ secrets.MAYCRAN_KEY }}
+      REAL_LLM_VISION_BASE_URL: https://api.maycran.com/v1
+      REAL_LLM_VISION_MODEL: claude-sonnet-4-6
+      REAL_LLM_JUDGE: "1"
+      JUDGE_SAMPLES: "1"
+      REAL_LLM_JUDGE_API_KEY: ${{ secrets.MAYCRAN_KEY }}
+      REAL_LLM_JUDGE_BASE_URL: https://api.maycran.com/v1
+      REAL_LLM_JUDGE_MODEL: qwen3-coder-next
+      REAL_LLM_JUDGE1_MODEL: qwen3-coder-next
+      REAL_LLM_JUDGE_LITE_MODEL: qwen3-coder-next
+      REAL_LLM_JUDGE_FORMAT: openai
+      QWEN_JUDGE_API_KEY: ${{ secrets.MAYCRAN_KEY }}
+      QWEN_JUDGE_BASE_URL: https://api.maycran.com/v1
+      QWEN_JUDGE_MODEL: qwen3-coder-next
+      ROLEPLAYER_API_KEY: ${{ secrets.NVIDIA_KEY }}
+      ROLEPLAYER_BASE_URL: https://integrate.api.nvidia.com/v1
+      ROLEPLAYER_MODEL: meta/llama-3.3-70b-instruct
+      ROLEPLAYER_FORMAT: openai
+      ROLEPLAYER_TEMPERATURE: "0.8"
+      REAL_LLM_JUDGE2_API_KEY: ${{ secrets.NVIDIA_KEY }}
+      REAL_LLM_JUDGE2_BASE_URL: https://integrate.api.nvidia.com/v1
+      REAL_LLM_JUDGE2_MODEL: meta/llama-3.3-70b-instruct
+      VISION_JUDGE_API_KEY: ${{ secrets.VISION_JUDGE_API_KEY }}
+      VISION_JUDGE_BASE_URL: https://integrate.api.nvidia.com/v1
+      VISION_JUDGE_MODEL: meta/llama-3.2-90b-vision-instruct
+      REAL_LLM_VISION_BACKUP_API_KEY: ${{ secrets.VISION_JUDGE_API_KEY }}
+      REAL_LLM_VISION_BACKUP_BASE_URL: https://integrate.api.nvidia.com/v1
+      REAL_LLM_VISION_BACKUP_MODEL: meta/llama-3.2-90b-vision-instruct
+      REAL_LLM_LEDGER: target/real_llm_ledger
+      RECALL_STABILITY_RUNS: "3"
+    steps:
+      - name: Require temporary credentials
+        shell: bash
+        run: |
+          test -n "$REAL_LLM_API_KEY" || { echo "::error::MAYCRAN_KEY is missing"; exit 1; }
+          test -n "$ROLEPLAYER_API_KEY" || { echo "::error::NVIDIA_KEY is missing"; exit 1; }
+
+      - name: Checkout temporary branch
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        shell: bash
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /usr/local/share/boost /usr/local/share/powershell \
+            /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force || true
+          df -h
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: maycran-backfill
+
+      - name: Reset evidence ledger
+        shell: bash
+        run: rm -rf "$REAL_LLM_LEDGER" && mkdir -p "$REAL_LLM_LEDGER"
+
+      - name: Run real-LLM target serially
+        shell: bash
+        run: |
+          set +e
+          cargo test --locked --no-fail-fast --test "${{ matrix.target }}" \
+            -- --ignored --test-threads=1 --nocapture 2>&1 | tee test.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          printf '%s\n' "$rc" > test.rc
+
+      - name: Enforce real execution and positive evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          rc=$(cat test.rc 2>/dev/null || printf '99')
+          test "$rc" = 0 || { echo "::error::cargo test exited $rc"; exit 1; }
+          python3 - <<'PY'
+          import json
+          import pathlib
+          import re
+
+          log = pathlib.Path("test.log").read_text(encoding="utf-8", errors="replace")
+          results = [int(value) for value in re.findall(r"test result: ok\. (\d+) passed", log)]
+          if not results or sum(results) <= 0:
+              raise SystemExit("no ignored tests actually passed")
+          skip_patterns = (r"(?im)^\s*skip:", r"(?im)\[SKIP\]", r"(?im)infra_skip")
+          for pattern in skip_patterns:
+              if re.search(pattern, log):
+                  raise SystemExit(f"runtime skip marker found: {pattern}")
+
+          root = pathlib.Path("target/real_llm_ledger")
+          skip_ledger = root / "skip_ledger.jsonl"
+          if skip_ledger.exists() and skip_ledger.read_text(encoding="utf-8").strip():
+              raise SystemExit("skip_ledger is not empty")
+
+          failures = []
+          outcomes = list(root.rglob("capability_outcome.*.json"))
+          for path in outcomes:
+              row = json.loads(path.read_text(encoding="utf-8"))
+              if row.get("verdict") != "pass":
+                  failures.append(
+                      f"{row.get('case_id')}: {row.get('verdict')} "
+                      f"{row.get('skipped_reason', '')}"
+                  )
+              elif row.get("attempted") is not True or row.get("llm_calls", 0) <= 0:
+                  failures.append(f"{row.get('case_id')}: missing positive LLM evidence")
+          if failures:
+              raise SystemExit("; ".join(failures))
+          print(
+              f"strict backfill passed: tests={sum(results)} "
+              f"capability_outcomes={len(outcomes)} skips=0"
+          )
+          PY
+
+      - name: Upload backfill evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: maycran-backfill-${{ matrix.target }}
+          path: |
+            test.log
+            test.rc
+            target/real_llm_ledger/
+          if-no-files-found: warn
+          retention-days: 30
