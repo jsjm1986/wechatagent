@@ -1307,7 +1307,7 @@ async fn evaluate_quality_panel(
         dims,
         image_base64,
     )
-    .await
+    .await?
     {
         Some(o) => o,
         None => {
