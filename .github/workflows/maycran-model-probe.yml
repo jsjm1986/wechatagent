@@ -19,27 +19,66 @@ jobs:
         shell: bash
         run: test -n "$MAYCRAN_API_KEY" || { echo "::error::MAYCRAN_KEY is missing"; exit 1; }
 
-      - name: List available model IDs
+      - name: Probe candidate model IDs
         shell: bash
         run: |
           python3 - <<'PY'
           import json
           import os
+          import urllib.error
           import urllib.request
 
-          request = urllib.request.Request(
-              "https://api.maycran.com/v1/models",
-              headers={"Authorization": f"Bearer {os.environ['MAYCRAN_API_KEY']}"},
-          )
-          with urllib.request.urlopen(request, timeout=30) as response:
-              payload = json.load(response)
-          model_ids = sorted(
-              row["id"]
-              for row in payload.get("data", [])
-              if isinstance(row, dict) and isinstance(row.get("id"), str)
-          )
-          if not model_ids:
-              raise SystemExit("Maycran /models returned no model IDs")
-          print("AVAILABLE_MODEL_IDS")
-          print("\n".join(model_ids))
+          candidates = [
+              "claude-sonnet-4-6",
+              "claude-sonnet-4.6",
+              "claude-sonnet-4-5",
+              "claude-opus-4-6",
+              "gpt-5.6-auto",
+              "codex-auto-review",
+              "qwen3-coder-next",
+              "deepseek-v4-pro",
+          ]
+          successes = []
+          for model in candidates:
+              body = json.dumps({
+                  "model": model,
+                  "temperature": 0,
+                  "max_tokens": 16,
+                  "messages": [
+                      {"role": "system", "content": "Return strict JSON only."},
+                      {"role": "user", "content": "Return {\"ok\":true}."},
+                  ],
+              }).encode()
+              request = urllib.request.Request(
+                  "https://api.maycran.com/v1/chat/completions",
+                  data=body,
+                  headers={
+                      "Authorization": f"Bearer {os.environ['MAYCRAN_API_KEY']}",
+                      "Content-Type": "application/json",
+                  },
+              )
+              status = 0
+              valid_shape = False
+              try:
+                  with urllib.request.urlopen(request, timeout=60) as response:
+                      status = response.status
+                      payload = json.load(response)
+                      valid_shape = bool(
+                          isinstance(payload, dict)
+                          and isinstance(payload.get("choices"), list)
+                          and payload["choices"]
+                          and isinstance(payload["choices"][0], dict)
+                          and isinstance(payload["choices"][0].get("message"), dict)
+                          and isinstance(payload["choices"][0]["message"].get("content"), str)
+                      )
+              except urllib.error.HTTPError as error:
+                  status = error.code
+              except Exception:
+                  status = -1
+              print(f"MODEL_PROBE model={model} status={status} valid_shape={str(valid_shape).lower()}")
+              if 200 <= status < 300 and valid_shape:
+                  successes.append(model)
+          if not successes:
+              raise SystemExit("No candidate model produced a valid chat-completions response")
+          print("USABLE_MODELS " + " ".join(successes))
           PY
