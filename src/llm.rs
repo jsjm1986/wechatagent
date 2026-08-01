@@ -3,13 +3,15 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures::StreamExt;
-use reqwest::header::HeaderMap;
+use reqwest::header::{HeaderMap, HeaderValue, ACCEPT};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::sleep;
 
 use crate::error::{AppError, AppResult};
+
+const LLM_USER_AGENT: &str = "Mozilla/5.0 wechatagent-llm/1.0";
 
 /// 上游协议形态。
 ///
@@ -300,6 +302,8 @@ impl LlmClient {
         max_retries: u32,
         retry_base_ms: u64,
     ) -> anyhow::Result<Self> {
+        let mut default_headers = HeaderMap::new();
+        default_headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key,
@@ -307,6 +311,12 @@ impl LlmClient {
             format,
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(timeout_seconds))
+                // Some OpenAI-compatible gateways route or reject requests by
+                // generic HTTP client headers. Keep these defaults at the
+                // client boundary so text, vision, streaming, Anthropic, and
+                // JSON-repair requests all share the same accepted identity.
+                .default_headers(default_headers)
+                .user_agent(LLM_USER_AGENT)
                 // 防 chunked body 中段被中间设备/CDN 静默掐断 ——
                 // smoke 时观测到 DeepSeek HTTP/1.1 chunked stream 偶发在 60s
                 // 时被中断（status=200 但 body 解码失败）。开 tcp_keepalive
@@ -2290,5 +2300,39 @@ mod tests {
             (hot.temperature - 0.8).abs() < f64::EPSILON,
             "setter 应覆盖到 0.8"
         );
+    }
+
+    #[tokio::test]
+    async fn client_sends_gateway_compatible_default_headers() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(header("accept", "application/json"))
+            .and(header("user-agent", LLM_USER_AGENT))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{ "message": { "content": "{\"ok\":true}" } }],
+                "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = LlmClient::new(
+            format!("{}/v1", server.uri()),
+            "test-key".into(),
+            "test-model".into(),
+            10,
+            1,
+            100,
+        )
+        .expect("build client");
+        let response = client
+            .generate_json("Return JSON.", "Return {\"ok\":true}.")
+            .await
+            .expect("matching request headers must reach the mock");
+        assert_eq!(response.get("ok").and_then(Value::as_bool), Some(true));
     }
 }

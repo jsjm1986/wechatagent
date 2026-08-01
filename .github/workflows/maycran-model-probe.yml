@@ -38,8 +38,8 @@ jobs:
               "qwen3-coder-next",
               "deepseek-v4-pro",
           ]
-          successes = []
-          for model in candidates:
+
+          def probe(model, extra_headers):
               body = json.dumps({
                   "model": model,
                   "temperature": 0,
@@ -49,15 +49,15 @@ jobs:
                       {"role": "user", "content": "Return {\"ok\":true}."},
                   ],
               }).encode()
+              headers = {
+                  "Authorization": f"Bearer {os.environ['MAYCRAN_API_KEY']}",
+                  "Content-Type": "application/json",
+              }
+              headers.update(extra_headers)
               request = urllib.request.Request(
                   "https://api.maycran.com/v1/chat/completions",
                   data=body,
-                  headers={
-                      "Authorization": f"Bearer {os.environ['MAYCRAN_API_KEY']}",
-                      "Content-Type": "application/json",
-                      "Accept": "application/json",
-                      "User-Agent": "Mozilla/5.0 MaycranModelProbe/1.0",
-                  },
+                  headers=headers,
               )
               status = 0
               valid_shape = False
@@ -77,6 +77,27 @@ jobs:
                   status = error.code
               except Exception:
                   status = -1
+              return status, valid_shape
+
+          header_profiles = {
+              "default": {},
+              "accept_only": {"Accept": "application/json"},
+              "ua_only": {"User-Agent": "Mozilla/5.0 MaycranModelProbe/1.0"},
+              "accept_and_ua": {
+                  "Accept": "application/json",
+                  "User-Agent": "Mozilla/5.0 MaycranModelProbe/1.0",
+              },
+          }
+          for profile, headers in header_profiles.items():
+              status, valid_shape = probe("claude-sonnet-4-6", headers)
+              print(
+                  f"HEADER_PROBE profile={profile} status={status} "
+                  f"valid_shape={str(valid_shape).lower()}"
+              )
+
+          successes = []
+          for model in candidates:
+              status, valid_shape = probe(model, header_profiles["accept_and_ua"])
               print(f"MODEL_PROBE model={model} status={status} valid_shape={str(valid_shape).lower()}")
               if 200 <= status < 300 and valid_shape:
                   successes.append(model)

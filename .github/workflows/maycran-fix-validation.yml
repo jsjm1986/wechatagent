@@ -25,7 +25,9 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run action-policy regression tests
-        run: cargo test --locked --lib action_policy_
+        run: |
+          cargo test --locked --lib action_policy_
+          cargo test --locked --lib client_sends_gateway_compatible_default_headers
 
       - name: Compile affected integration targets
         run: |
