@@ -508,7 +508,15 @@ async fn t1_real_text_decision_review_chain() {
     let llm = require_real_llm!();
     let app = TestApp::start().await;
     let mcp_server = start_mcp_mock_success().await;
-    let state = common::rebuild_app_state_with_real_llm(&app, llm, mcp_server.uri());
+    let mut state = common::rebuild_app_state_with_real_llm(&app, llm, mcp_server.uri());
+    // T1 验证 Reply/Review → outbox → MCP 的主链，不重复验证多段 FIFO（该语义由
+    // outbox_integration 覆盖）。固定为单段，避免把任意 find_one 命中的后续分段
+    // 与 atomic_claim_pending 合法领取的首段错误比较。
+    state.config.agent_reply_max_segments = 1;
+    state.config.agent_reply_max_segment_chars = 2_000;
+    // Dispatcher 的账号级 MCP 解析 fail-closed：账号必须先在 wechat_accounts 注册。
+    // TestApp 默认只 seed playbook，不 seed 账号；缺这一行会在 MCP 前安全重试回 pending。
+    common::ensure_test_account(&state, "default", "default").await;
 
     let contact = managed_contact("real_smoke_user_t1");
     state
@@ -573,6 +581,7 @@ async fn t1_real_text_decision_review_chain() {
             doc! {
                 "workspace_id": &contact.workspace_id,
                 "contact_wxid": &contact.wxid,
+                "source_event_id": "real_smoke_msg_t1",
                 // Safety-held inbound runs may enqueue a decision-less
                 // acknowledgement placeholder. Only a decision-backed row is
                 // evidence of the approved Reply/Review path exercised here.
@@ -841,6 +850,9 @@ async fn t4_real_reply_review_reaction_stop_cancels_before_second_send() {
     let app = TestApp::start().await;
     let mcp_server = start_mcp_mock_success().await;
     let mut state = common::rebuild_app_state_with_real_llm(&app, llm, mcp_server.uri());
+    // 与生产 dispatcher 一致，账号必须已注册后才能解析账号级 MCP 凭据。未注册时
+    // process_entry 会按 safe-to-retry 语义把条目退回 pending，测试会误判为未消费。
+    common::ensure_test_account(&state, "default", "default").await;
     // 让每轮模型回复对应恰好一条文本 outbox，便于把“发送次数”与业务轮次精确对账。
     state.config.agent_reply_max_segments = 1;
     state.config.agent_reply_max_segment_chars = 2_000;
