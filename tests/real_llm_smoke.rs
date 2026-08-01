@@ -860,6 +860,24 @@ async fn t4_real_reply_review_reaction_stop_cancels_before_second_send() {
     // 默认 20 秒最小回复间隔属于生产防刷屏策略，会在模型调用前把第二轮挡成
     // rate_limited，与本测试要验证的 Reply/Review/Reaction 所有权弧无关。
     state.config.agent_min_reply_interval_seconds = 0;
+    let runtime_override = state
+        .db
+        .operation_domain_configs()
+        .update_one(
+            doc! {
+                "workspace_id": &state.config.default_workspace_id,
+                "domain": "user_operations",
+                "current_version": true,
+            },
+            doc! { "$set": { "runtime_parameters.minReplyIntervalSeconds": 0_i32 } },
+            None,
+        )
+        .await
+        .expect("disable persisted min reply interval for T4");
+    assert_eq!(
+        runtime_override.matched_count, 1,
+        "T4 必须覆盖唯一 current operation_domain_config 的持久化最小回复间隔"
+    );
 
     let mut contact = managed_contact("real_smoke_user_t4_stop");
     contact.custom_agent_instructions = Some(
