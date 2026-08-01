@@ -573,6 +573,10 @@ async fn t1_real_text_decision_review_chain() {
             doc! {
                 "workspace_id": &contact.workspace_id,
                 "contact_wxid": &contact.wxid,
+                // Safety-held inbound runs may enqueue a decision-less
+                // acknowledgement placeholder. Only a decision-backed row is
+                // evidence of the approved Reply/Review path exercised here.
+                "decision_id": { "$type": "objectId" },
             },
             None,
         )
@@ -580,7 +584,7 @@ async fn t1_real_text_decision_review_chain() {
         .expect("query outbox");
 
     if let Some(entry) = outbox_entry {
-        // 有 outbox 行（approved 路径）：claim + process 必须推进到 sent。
+        // 有 decision-backed outbox 行（approved 路径）：claim + process 必须推进到 sent。
         let entry_id = entry.id.expect("outbox _id");
         let claimed = atomic_claim_pending(&state, "real_smoke_worker_t1", 60)
             .await
@@ -601,10 +605,10 @@ async fn t1_real_text_decision_review_chain() {
         );
         eprintln!("[t1] outbox → sent（真模型 approved 并经桩 MCP 完成投递）");
     } else {
-        // 无 outbox 行：真模型这轮选择不回复 / 被闸门 hold —— 也是合法终态，
-        // 只要 final_review_status 在闭集内即可（上面已断言）。
+        // 无 approved reply outbox：真模型这轮选择不回复 / 被闸门 hold（即使另有
+        // decision-less acknowledgement placeholder）也是合法终态。
         eprintln!(
-            "[t1] 本轮无 outbox（final_review_status={}）—— 合法的不发终态",
+            "[t1] 本轮无 approved reply outbox（final_review_status={}）—— 合法的不发终态",
             log.final_review_status
         );
     }

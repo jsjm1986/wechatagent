@@ -55,6 +55,8 @@ jobs:
                   headers={
                       "Authorization": f"Bearer {os.environ['MAYCRAN_API_KEY']}",
                       "Content-Type": "application/json",
+                      "Accept": "application/json",
+                      "User-Agent": "Mozilla/5.0 MaycranModelProbe/1.0",
                   },
               )
               status = 0

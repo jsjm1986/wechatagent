@@ -104,6 +104,35 @@ pub(crate) fn operation_state_key_by_name(
         .and_then(|state| state.get_str("key").ok().map(ToString::to_string))
 }
 
+/// Resolve the state whose action policy applies before persisting a proposed
+/// state transition.
+///
+/// A model-proposed state may be used only when it exists in the active state
+/// machine and the transition from the contact's current state is legal. An
+/// unknown or illegal proposal is still preserved on the decision so the
+/// existing persistence path can reject and audit it, but it must not be used
+/// to query a nonexistent policy before that rejection happens.
+pub(crate) fn action_policy_state_key(
+    domain_config: Option<&OperationDomainConfig>,
+    current_state: Option<&str>,
+    proposed_state: Option<&str>,
+) -> Option<String> {
+    let current = current_state
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let proposed = proposed_state
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    proposed
+        .filter(|candidate| {
+            operation_state_exists(domain_config, candidate)
+                && (current == Some(*candidate)
+                    || check_state_transition(domain_config, current, candidate).is_none())
+        })
+        .or(current)
+        .map(ToString::to_string)
+}
+
 pub(crate) fn operation_states(domain_config: Option<&OperationDomainConfig>) -> Vec<Document> {
     domain_config
         .and_then(|config| config.state_machine.get_array("states").ok())
@@ -548,6 +577,35 @@ mod policy_tests {
         let action = classify_decision_action(&d);
         assert_eq!(action, "reply");
         assert!(enforce_state_action_policy(Some(&p), action).is_err());
+    }
+
+    #[test]
+    fn action_policy_uses_legal_proposed_state() {
+        let config = crate::prompts::default_domain_configs("ws")
+            .into_iter()
+            .next()
+            .expect("default user operations config");
+        assert_eq!(
+            action_policy_state_key(Some(&config), Some("need_discovery"), Some("solution_fit"))
+                .as_deref(),
+            Some("solution_fit")
+        );
+    }
+
+    #[test]
+    fn action_policy_keeps_current_state_for_illegal_or_unknown_proposal() {
+        let config = crate::prompts::default_domain_configs("ws")
+            .into_iter()
+            .next()
+            .expect("default user operations config");
+        for proposed in ["customer_success", "invented_by_model"] {
+            assert_eq!(
+                action_policy_state_key(Some(&config), Some("need_discovery"), Some(proposed))
+                    .as_deref(),
+                Some("need_discovery"),
+                "proposal={proposed}"
+            );
+        }
     }
 
     #[test]

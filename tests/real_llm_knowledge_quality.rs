@@ -2455,6 +2455,8 @@ async fn q4_chat_workstation_quality() {
     let mcp = dummy_mcp_server().await;
     let state = common::rebuild_app_state_with_real_llm(&app, llm.clone(), mcp.uri());
     let ws = state.config.default_workspace_id.clone();
+    let account_id = state.config.default_account_id.clone();
+    common::ensure_test_account(&state, &ws, &account_id).await;
 
     let chunks_before = state
         .db
@@ -2470,7 +2472,7 @@ async fn q4_chat_workstation_quality() {
     });
     let req: ChatTurnRequest = serde_json::from_value(json!({
         "sessionId": null,
-        "accountId": null,
+        "accountId": account_id,
         "operatorId": "q4_operator",
         "content": "帮我新建一条知识切片，知识类型是产品能力，请起草标题、摘要和正文。\
                     以下是运营已确认、可直接作为 sourceQuote 的原文出处，请原样写入：\

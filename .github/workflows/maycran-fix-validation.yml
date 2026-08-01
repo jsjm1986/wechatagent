@@ -1,0 +1,36 @@
+name: Maycran fix validation (temporary)
+
+on:
+  push:
+    branches:
+      - test/maycran-llm-backfill-20260802
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: maycran-fix-validation
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run action-policy regression tests
+        run: cargo test --locked --lib action_policy_
+
+      - name: Compile affected integration targets
+        run: |
+          cargo test --locked --no-run \
+            --test real_llm_smoke \
+            --test real_llm_knowledge \
+            --test real_llm_knowledge_quality \
+            --test domain_profile_e2e

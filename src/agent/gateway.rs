@@ -48,9 +48,9 @@ use super::decision::{
 };
 use super::escalation;
 use super::guards::{
-    check_state_transition, classify_decision_action, enforce_state_action_policy,
-    initial_operation_state_key, normalize_decision_runtime, normalize_decision_state,
-    planner_from_decision,
+    action_policy_state_key, check_state_transition, classify_decision_action,
+    enforce_state_action_policy, initial_operation_state_key, normalize_decision_runtime,
+    normalize_decision_state, planner_from_decision,
 };
 use super::knowledge_router::{
     empty_knowledge_route, load_operation_knowledge, maybe_emit_unverified_warning,
@@ -524,6 +524,7 @@ async fn send_contact_message_gateway_inner(
         apply_state_action_gate(
             state,
             &contact,
+            domain_config.as_ref(),
             &mut decision,
             &mut review,
             &mut finalize_status,
@@ -1495,25 +1496,22 @@ pub(crate) fn should_run_send(outbox_eligible: bool, media_pending: bool) -> boo
 async fn apply_state_action_gate(
     state: &AppState,
     contact: &Contact,
+    domain_config: Option<&OperationDomainConfig>,
     final_decision: &mut AgentDecision,
     review: &mut DecisionReviewResult,
     finalize_status: &mut GatewayStatusFinal,
     run_id: &str,
 ) -> AppResult<()> {
-    let operation_state = final_decision
-        .operation_state
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .or_else(|| {
-            contact
-                .operation_state
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string)
-        });
+    // The proposed state has not been persisted yet. Use it only when it is a
+    // legal transition in the active machine; otherwise enforce the contact's
+    // current policy and let apply_agent_updates reject/audit the bad proposal.
+    // This prevents an LLM-invented state from causing a premature
+    // missing_current_operation_state_policy error.
+    let operation_state = action_policy_state_key(
+        domain_config,
+        contact.operation_state.as_deref(),
+        final_decision.operation_state.as_deref(),
+    );
     let operation_state = match operation_state {
         Some(value) => value,
         None => initial_operation_state_for_contact(state, contact).await?,
@@ -2368,6 +2366,7 @@ async fn run_user_operation_gateway_inner(
         apply_state_action_gate(
             state,
             &contact,
+            domain_config.as_ref(),
             &mut final_decision,
             &mut review,
             &mut finalize_status,
@@ -2654,6 +2653,7 @@ async fn run_user_operation_gateway_inner(
                         apply_state_action_gate(
                             state,
                             &contact,
+                            domain_config.as_ref(),
                             &mut final_decision,
                             &mut review,
                             &mut finalize_status,

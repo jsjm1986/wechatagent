@@ -493,7 +493,9 @@ async fn e2e_generate_candidate_is_draft() {
         return;
     }
 
-    let app = common::TestApp::start().await;
+    // Candidate persistence uses the same transactional release protocol as
+    // the admin create/update routes, so this real-LLM path needs a replica set.
+    let app = common::TestApp::start_repl_set().await;
     let admin = test_admin(&app.state.config.default_workspace_id);
 
     // LlmClient::new 不发网络请求，只存配置。万一构造失败（格式错误），skip。
@@ -605,7 +607,8 @@ async fn e2e_generate_second_industry_profile() {
         return;
     }
 
-    let app = common::TestApp::start().await;
+    // Candidate persistence commits multiple release-pointer writes atomically.
+    let app = common::TestApp::start_repl_set().await;
     let admin = test_admin(&app.state.config.default_workspace_id);
 
     let llm = match LlmClient::with_format(
