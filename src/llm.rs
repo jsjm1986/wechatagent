@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures::StreamExt;
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT};
+use reqwest::header::HeaderMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::mpsc::UnboundedSender;
@@ -302,8 +302,6 @@ impl LlmClient {
         max_retries: u32,
         retry_base_ms: u64,
     ) -> anyhow::Result<Self> {
-        let mut default_headers = HeaderMap::new();
-        default_headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key,
@@ -311,11 +309,11 @@ impl LlmClient {
             format,
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(timeout_seconds))
-                // Some OpenAI-compatible gateways route or reject requests by
-                // generic HTTP client headers. Keep these defaults at the
-                // client boundary so text, vision, streaming, Anthropic, and
-                // JSON-repair requests all share the same accepted identity.
-                .default_headers(default_headers)
+                // Some OpenAI-compatible gateways reject the default reqwest
+                // identity. Keep a stable user agent at the client boundary so
+                // text, vision, streaming, Anthropic, and JSON-repair requests
+                // all share the same accepted identity without changing their
+                // content negotiation (especially SSE streaming).
                 .user_agent(LLM_USER_AGENT)
                 // 防 chunked body 中段被中间设备/CDN 静默掐断 ——
                 // smoke 时观测到 DeepSeek HTTP/1.1 chunked stream 偶发在 60s
@@ -2310,7 +2308,6 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
-            .and(header("accept", "application/json"))
             .and(header("user-agent", LLM_USER_AGENT))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "choices": [{ "message": { "content": "{\"ok\":true}" } }],
