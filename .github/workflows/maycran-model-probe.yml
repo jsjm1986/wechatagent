@@ -154,6 +154,8 @@ jobs:
           shared-key: maycran-fix-validation
 
       - name: Probe through production LlmClient
-        run: >-
-          cargo test --locked --test maycran_transport_probe
-          production_client_reaches_candidate_models -- --ignored --nocapture
+        run: |
+          cargo test --locked --test maycran_transport_probe \
+            production_client_reaches_candidate_models -- --ignored --nocapture
+          cargo test --locked --test maycran_transport_probe \
+            production_client_handles_business_prompt_sizes -- --ignored --nocapture
