@@ -75,13 +75,9 @@ macro_rules! unwrap_or_skip_transient {
         match $result {
             Ok(value) => value,
             Err(wechatagent::error::AppError::LlmUnavailable { kind, retry_count, detail, .. }) => {
-                let cfg_err_4xx = kind == "endpoint_not_found"
-                    || (kind == "http_4xx"
-                        && !detail.contains("HTTP 401")
-                        && !detail.contains("HTTP 402"));
-                if cfg_err_4xx {
+                if !wechatagent::llm::is_transient_llm_unavailable_kind(&kind) {
                     panic!(
-                        "{}：配置错误（kind={kind}），非端点抖动——4xx 多为 baseUrl/model/path 配错，不当瞬时 skip 假绿（R0.3）。detail={detail}",
+                        "{}：非瞬时 LLM 错误（kind={kind}），不得 skip 假绿。detail={detail}",
                         $what
                     );
                 }

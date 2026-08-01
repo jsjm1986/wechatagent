@@ -288,17 +288,15 @@ fn median(samples: &[i64]) -> Option<i64> {
     Some(s[s.len() / 2])
 }
 
-/// 判定 judge 调用错误是否「端点配错」（4xx 非账户级），即便 ObserveOnly 也应 fail
-/// （堵 R0.3：漏 /v1→405 被当抖动吞的假绿）。账户级 401/402 与端点抖动（5xx/超时/
-/// 限流）不算配错，照常按 gate 处置。
-fn is_endpoint_misconfig(e: &AppError) -> bool {
-    if let AppError::LlmUnavailable { kind, detail, .. } = e {
-        return kind == "endpoint_not_found"
-            || (kind == "http_4xx"
-                && !detail.contains("HTTP 401")
-                && !detail.contains("HTTP 402"));
-    }
-    false
+/// 判定 judge 调用是否为不可跳过的非瞬时 LLM 错误。只有公共白名单中的限流、
+/// 5xx、超时、连接/网络和响应体中断允许 `ObserveOnly` 降级；账户、配置、解析、
+/// 空响应以及未知错误均 fail closed，避免「裁判没真正运行但测试绿色」。
+fn is_non_transient_llm_failure(e: &AppError) -> bool {
+    matches!(
+        e,
+        AppError::LlmUnavailable { kind, .. }
+            if !wechatagent::llm::is_transient_llm_unavailable_kind(kind)
+    )
 }
 
 /// R1.2 统一分级 judge：用 profile 派生 rubric 给一条 reply 打分（K 次采样取 median）。
@@ -306,7 +304,7 @@ fn is_endpoint_misconfig(e: &AppError) -> bool {
 /// - `judge`：裁判 provider（调用方传入，须与被测 agent 异族——R5.0.1）。
 /// - `rubric`：`build_judge_rubric(profile)` 的产出。
 /// - `gate`：`QualityGate` → K 次全失败 assert fail；`ObserveOnly` → 失败返 None 不 panic。
-/// - 任一采样命中**端点配错 4xx**（非 401/402）→ 无论 gate 都 panic（R0.3）。
+/// - 任一采样命中非瞬时 LLM 错误 → 无论 gate 都 panic，不得假绿。
 /// - `REAL_LLM_JUDGE` 未设 `=1` → 直接返 None 跳过（本地零成本，与现状一致）。
 ///
 /// 返回 `Some(JudgeOutcome)`（至少一次成功采样）或 `None`（跳过/全失败且 ObserveOnly）。
@@ -360,9 +358,10 @@ pub async fn run_judge_graded(
                 }
             }
             Err(e) => {
-                // 端点配错（漏 /v1 等）→ 无论 gate 都 fail，不当抖动吞（R0.3）。
-                if is_endpoint_misconfig(&e) {
-                    panic!("[裁判:{label}] judge 端点配错（4xx 非账户级），非抖动——堵 R0.3 假绿: {e:?}");
+                // 非瞬时错误（账户/配置/解析/未知）→ 无论 gate 都 fail；只有公共
+                // 白名单中的真实端点抖动可由 ObserveOnly 降级。
+                if is_non_transient_llm_failure(&e) {
+                    panic!("[裁判:{label}] judge 非瞬时错误，不得按抖动跳过假绿: {e:?}");
                 }
                 eprintln!("[裁判:{label}][sample {}/{k}] 调用失败: {e:?}", i + 1);
             }
