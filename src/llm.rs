@@ -2231,7 +2231,7 @@ mod tests {
             .expect_err("账户错误不能进入 JSON 修复");
         assert_eq!(
             err.to_string(),
-            "external error: llm_account_unavailable: insufficient_balance"
+            "llm_account_unavailable: insufficient_balance"
         );
 
         let classified = classify_llm_error_for_user(&err, 0);
