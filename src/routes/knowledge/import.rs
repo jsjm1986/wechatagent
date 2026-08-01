@@ -1339,6 +1339,17 @@ fn require_non_empty_vision_text(value: Value, field: &str) -> AppResult<Value> 
     }
 }
 
+const VISION_REQUIRED_FIELD_MAX_ATTEMPTS: usize = 3;
+
+fn vision_user_prompt_for_attempt(base: &str, field: &str, attempt: usize) -> String {
+    if attempt == 0 {
+        return base.to_string();
+    }
+    format!(
+        "{base}\n\n上一次响应缺少必需字段。请严格返回一个 JSON 对象，其中 `{field}` 必须是非空字符串；不要改用其它字段名，也不要返回解释文字。"
+    )
+}
+
 /// 解析本 workspace 的视觉模型 provider（供知识库导入与运营 Agent 入站图片理解
 /// 复用，避免两处各写一套选择逻辑）：
 /// a. active 文字主模型本身 supports_vision → 固定当前 workspace registry snapshot；
@@ -1438,80 +1449,136 @@ pub(crate) async fn vision_generate_json(
 ) -> AppResult<Value> {
     match provider {
         VisionProvider::Runtime(snapshot) => {
-            let generated = match snapshot {
-                Some(snapshot) => {
-                    snapshot
-                        .generate_json_with_image(system_prompt, user_prompt, image_base64, mime)
-                        .await
+            let mut last_contract_error = None;
+            for attempt in 0..VISION_REQUIRED_FIELD_MAX_ATTEMPTS {
+                let attempt_prompt =
+                    vision_user_prompt_for_attempt(user_prompt, required_text_field, attempt);
+                let generated = match snapshot {
+                    Some(snapshot) => {
+                        snapshot
+                            .generate_json_with_image(
+                                system_prompt,
+                                &attempt_prompt,
+                                image_base64,
+                                mime,
+                            )
+                            .await
+                    }
+                    None => {
+                        state
+                            .llm
+                            .generate_json_with_image(
+                                system_prompt,
+                                &attempt_prompt,
+                                image_base64,
+                                mime,
+                            )
+                            .await
+                    }
+                };
+                let value = generated.map_err(|e| match e {
+                    // 瞬时不可达（429/限流/配额耗尽/网关超时）原样透传结构化变体，
+                    // 让上游（测试 skip 宏、网关回退逻辑）按瞬时态处理而非当成内容失败。
+                    AppError::LlmUnavailable { .. } => e,
+                    other => AppError::External(format!("LLM vision 抽取失败: {other}")),
+                })?;
+                match require_non_empty_vision_text(value, required_text_field) {
+                    Ok(value) => return Ok(value),
+                    Err(error) => {
+                        last_contract_error = Some(error);
+                        if attempt + 1 < VISION_REQUIRED_FIELD_MAX_ATTEMPTS {
+                            tracing::warn!(
+                                field = required_text_field,
+                                attempt = attempt + 1,
+                                "runtime vision model omitted required content; retrying contract"
+                            );
+                        }
+                    }
                 }
-                None => {
-                    state
-                        .llm
-                        .generate_json_with_image(system_prompt, user_prompt, image_base64, mime)
-                        .await
-                }
-            };
-            let value = generated.map_err(|e| match e {
-                // 瞬时不可达（429/限流/配额耗尽/网关超时）原样透传结构化变体，
-                // 让上游（测试 skip 宏、网关回退逻辑）按瞬时态处理而非当成内容失败。
-                AppError::LlmUnavailable { .. } => e,
-                other => AppError::External(format!("LLM vision 抽取失败: {other}")),
-            })?;
-            require_non_empty_vision_text(value, required_text_field)
+            }
+            Err(last_contract_error.unwrap_or_else(|| {
+                AppError::External("LLM vision response contract failed".to_string())
+            }))
         }
         VisionProvider::Dedicated(candidates) => {
             let mut last_failure: Option<AppError> = None;
             let mut result: Option<AppResult<Value>> = None;
             for (idx, (model, client)) in candidates.iter().enumerate() {
-                match client
-                    .generate_json_with_image(system_prompt, user_prompt, image_base64, mime)
-                    .await
-                {
-                    Ok(v) => match require_non_empty_vision_text(v, required_text_field) {
-                        Ok(v) => {
-                            result = Some(Ok(v));
-                            break;
-                        }
-                        Err(error) => {
+                let mut candidate_contract_failed = false;
+                for attempt in 0..VISION_REQUIRED_FIELD_MAX_ATTEMPTS {
+                    let attempt_prompt =
+                        vision_user_prompt_for_attempt(user_prompt, required_text_field, attempt);
+                    match client
+                        .generate_json_with_image(
+                            system_prompt,
+                            &attempt_prompt,
+                            image_base64,
+                            mime,
+                        )
+                        .await
+                    {
+                        Ok(v) => match require_non_empty_vision_text(v, required_text_field) {
+                            Ok(v) => {
+                                result = Some(Ok(v));
+                                break;
+                            }
+                            Err(error) => {
+                                last_failure = Some(error);
+                                if attempt + 1 < VISION_REQUIRED_FIELD_MAX_ATTEMPTS {
+                                    tracing::warn!(
+                                        model = %model,
+                                        field = required_text_field,
+                                        attempt = attempt + 1,
+                                        "vision model omitted required content; retrying contract"
+                                    );
+                                } else {
+                                    candidate_contract_failed = true;
+                                }
+                            }
+                        },
+                        Err(e @ AppError::LlmUnavailable { .. }) => {
                             if idx + 1 < candidates.len() {
                                 tracing::warn!(
                                     model = %model,
                                     next = %candidates[idx + 1].0,
-                                    field = required_text_field,
-                                    "vision model returned empty required content; trying backup"
+                                    error = %e,
+                                    "视觉模型瞬时不可达，自动切换到下一备用模型"
                                 );
                             } else {
                                 tracing::warn!(
                                     model = %model,
-                                    field = required_text_field,
-                                    "vision model returned empty required content; no backup remains"
+                                    error = %e,
+                                    "视觉模型瞬时不可达，已无更多备用模型可切换"
                                 );
                             }
-                            last_failure = Some(error);
+                            last_failure = Some(e);
+                            break;
                         }
-                    },
-                    Err(e @ AppError::LlmUnavailable { .. }) => {
-                        if idx + 1 < candidates.len() {
-                            tracing::warn!(
-                                model = %model,
-                                next = %candidates[idx + 1].0,
-                                error = %e,
-                                "视觉模型瞬时不可达，自动切换到下一备用模型"
-                            );
-                        } else {
-                            tracing::warn!(
-                                model = %model,
-                                error = %e,
-                                "视觉模型瞬时不可达，已无更多备用模型可切换"
-                            );
+                        Err(other) => {
+                            result = Some(Err(AppError::External(format!(
+                                "LLM vision 抽取失败: {other}"
+                            ))));
+                            break;
                         }
-                        last_failure = Some(e);
                     }
-                    Err(other) => {
-                        result = Some(Err(AppError::External(format!(
-                            "LLM vision 抽取失败: {other}"
-                        ))));
-                        break;
+                }
+                if result.is_some() {
+                    break;
+                }
+                if candidate_contract_failed {
+                    if idx + 1 < candidates.len() {
+                        tracing::warn!(
+                            model = %model,
+                            next = %candidates[idx + 1].0,
+                            field = required_text_field,
+                            "vision model exhausted required-content retries; trying backup"
+                        );
+                    } else {
+                        tracing::warn!(
+                            model = %model,
+                            field = required_text_field,
+                            "vision model exhausted required-content retries; no backup remains"
+                        );
                     }
                 }
             }
@@ -2142,6 +2209,14 @@ mod tests {
             "description"
         )
         .is_ok());
+    }
+
+    #[test]
+    fn vision_contract_retry_prompt_names_the_required_field() {
+        assert_eq!(vision_user_prompt_for_attempt("base", "fence", 0), "base");
+        let retry = vision_user_prompt_for_attempt("base", "fence", 1);
+        assert!(retry.contains("`fence`"));
+        assert!(retry.contains("非空字符串"));
     }
 
     #[test]

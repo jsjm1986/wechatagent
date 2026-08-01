@@ -335,9 +335,19 @@ fn assert_review_quality(review: &AgentDecisionReview, round: &str) {
         review.risks,
         pretty_document(&review.scores)
     );
+    // taxonomy_candidate* 是未知维度值的软审计通道，按设计不触发 review fail；
+    // 它不代表回复内容存在事实、施压或边界风险。其余风险仍必须为空。
+    let substantive_risks: Vec<_> = review
+        .risks
+        .iter()
+        .filter(|risk| {
+            !risk.starts_with("taxonomy_candidate:") && !risk.starts_with("taxonomy_candidate_new:")
+        })
+        .collect();
     assert!(
-        review.risks.is_empty(),
-        "{round} 是无事实声明、无施压的简单澄清问句，不应残留风险：{:?}",
+        substantive_risks.is_empty(),
+        "{round} 是无事实声明、无施压的简单澄清问句，不应残留实质风险：{:?}（全部审计标签={:?}）",
+        substantive_risks,
         review.risks
     );
 
