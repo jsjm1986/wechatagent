@@ -133,3 +133,27 @@ jobs:
               raise SystemExit("No candidate model produced a valid chat-completions response")
           print("USABLE_MODELS " + " ".join(successes))
           PY
+
+  rust-client:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      MAYCRAN_API_KEY: ${{ secrets.MAYCRAN_KEY }}
+      MAYCRAN_BASE_URL: https://api.maycran.com/v1
+    steps:
+      - name: Require temporary credential
+        shell: bash
+        run: test -n "$MAYCRAN_API_KEY" || { echo "::error::MAYCRAN_KEY is missing"; exit 1; }
+
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: maycran-fix-validation
+
+      - name: Probe through production LlmClient
+        run: >-
+          cargo test --locked --test maycran_transport_probe
+          production_client_reaches_candidate_models -- --ignored --nocapture
