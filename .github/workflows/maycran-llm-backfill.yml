@@ -1,9 +1,7 @@
 name: Maycran LLM backfill (temporary)
 
 on:
-  push:
-    branches:
-      - test/maycran-llm-backfill-20260802
+  workflow_dispatch:
 
 permissions:
   contents: read
