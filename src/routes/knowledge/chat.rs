@@ -1692,7 +1692,7 @@ fn render_operator_memory_for_prompt(
 /// - 限制 toolCalls 数量与 final 字段约束。
 ///
 /// 注意：本函数只追加协议提示，不删除/改写原 prompt 内容。
-const CHAT_MUTATION_TOOL_LOOP_MAX_LOOPS: i32 = 2;
+const CHAT_MUTATION_TOOL_LOOP_MAX_LOOPS: i32 = 1;
 const CHAT_CLARIFY_TOOL_LOOP_MAX_LOOPS: i32 = 3;
 
 fn augment_chat_system_with_tools(base: &str, max_loops: i32) -> String {
@@ -3664,7 +3664,10 @@ mod tests {
     #[test]
     fn chat_tool_loop_limits_preserve_the_four_call_turn_budget() {
         assert_eq!(CHAT_MAX_LLM_CALLS_PER_TURN, 4);
-        assert_eq!(1 + CHAT_MUTATION_TOOL_LOOP_MAX_LOOPS + 1, 4);
+        assert_eq!(
+            1 + CHAT_MUTATION_TOOL_LOOP_MAX_LOOPS + CHAT_DRAFT_CONTRACT_MAX_REPAIRS as i32,
+            4
+        );
         assert_eq!(1 + CHAT_CLARIFY_TOOL_LOOP_MAX_LOOPS, 4);
     }
 
