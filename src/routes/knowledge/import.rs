@@ -198,6 +198,70 @@ const IMPORT_SEGMENT_TARGET_CHARS: usize = 3000;
 const IMPORT_SEGMENT_HARD_MAX_CHARS: usize = 5000;
 /// 每段抽取并发度：匹配生产端点真实 ~2 线程，避免 tool_use 争用。
 const IMPORT_EXTRACT_CONCURRENCY: usize = 2;
+const IMPORT_CONTENT_CONTRACT_MAX_ATTEMPTS: usize = 3;
+
+fn import_extraction_has_content_or_reason(value: &Value) -> bool {
+    let has_content = ["items", "chunks"].iter().any(|key| {
+        value
+            .get(*key)
+            .and_then(Value::as_array)
+            .is_some_and(|items| !items.is_empty())
+    });
+    let has_reason = value
+        .get("noKnowledgeReason")
+        .or_else(|| value.get("no_knowledge_reason"))
+        .and_then(Value::as_str)
+        .is_some_and(|reason| !reason.trim().is_empty());
+    has_content || has_reason
+}
+
+fn import_user_prompt_for_attempt(base: &str, attempt: usize) -> String {
+    if attempt == 0 {
+        return base.to_string();
+    }
+    format!(
+        "{base}\n\nThe previous response contained no reviewable knowledge. Return at least one entry in `items` or `chunks`. Only when the source truly contains no extractable operational knowledge may both arrays be empty, and then `noKnowledgeReason` must be a non-empty string. Do not return only `document`."
+    )
+}
+
+async fn generate_import_segment(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: Option<&str>,
+    system: &str,
+    base_user_prompt: &str,
+) -> AppResult<Value> {
+    let mut last_contract_error = None;
+    for attempt in 0..IMPORT_CONTENT_CONTRACT_MAX_ATTEMPTS {
+        let user = import_user_prompt_for_attempt(base_user_prompt, attempt);
+        let value = agent::generate_agent_json(
+            state,
+            workspace_id,
+            account_id,
+            None,
+            None,
+            "knowledge.import.preview",
+            system,
+            &user,
+        )
+        .await?;
+        if import_extraction_has_content_or_reason(&value) {
+            return Ok(value);
+        }
+        last_contract_error = Some(AppError::External(
+            "knowledge import response omitted items/chunks and noKnowledgeReason".to_string(),
+        ));
+        if attempt + 1 < IMPORT_CONTENT_CONTRACT_MAX_ATTEMPTS {
+            tracing::warn!(
+                attempt = attempt + 1,
+                "knowledge import response omitted reviewable content; retrying contract"
+            );
+        }
+    }
+    Err(last_contract_error.unwrap_or_else(|| {
+        AppError::External("knowledge import content contract failed".to_string())
+    }))
+}
 
 /// 把长文档确定性切分为多段，每段随后独立调 LLM 抽取（输出小、不截断）。
 ///
@@ -580,13 +644,10 @@ async fn run_import_extraction_controlled(
                     let user = LONG_IMPORT_PROMPT_TEMPLATE
                         .replace("{SOURCE_NAME}", &source_name)
                         .replace("{CONTENT}", &segment);
-                    let result = agent::generate_agent_json(
+                    let result = generate_import_segment(
                         state,
                         &workspace_id,
                         account_id.as_deref(),
-                        None,
-                        None,
-                        "knowledge.import.preview",
                         system,
                         &user,
                     )
@@ -671,6 +732,19 @@ async fn run_import_extraction_controlled(
         .flatten()
         .map(|item| normalize_operation_knowledge_preview_chunk(item, &payload))
         .collect::<Vec<_>>();
+    let no_knowledge_reason = if items.is_empty() && chunks.is_empty() {
+        values.iter().find_map(|value| {
+            value
+                .get("noKnowledgeReason")
+                .or_else(|| value.get("no_knowledge_reason"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|reason| !reason.is_empty())
+                .map(ToString::to_string)
+        })
+    } else {
+        None
+    };
 
     // D2 锚定：仍对完整原文跑一次，每 chunk 的 sourceQuote 在全文锚定（红线不动）。
     let integrity_report = integrity_report_for_preview(&payload.content, &mut chunks);
@@ -678,6 +752,7 @@ async fn run_import_extraction_controlled(
         "document": document,
         "items": items,
         "chunks": chunks,
+        "noKnowledgeReason": no_knowledge_reason,
         "integrityReport": integrity_report,
         "importReport": {
             "totalSegments": total_segments,
@@ -2154,6 +2229,42 @@ pub async fn ingest_chunked_text(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn import_content_contract_requires_content_or_explicit_reason() {
+        assert!(import_extraction_has_content_or_reason(&json!({
+            "items": [{"title": "item"}],
+            "chunks": []
+        })));
+        assert!(import_extraction_has_content_or_reason(&json!({
+            "items": [],
+            "chunks": [{"title": "chunk"}]
+        })));
+        assert!(import_extraction_has_content_or_reason(&json!({
+            "items": [],
+            "chunks": [],
+            "noKnowledgeReason": "source contains no operational knowledge"
+        })));
+        assert!(!import_extraction_has_content_or_reason(&json!({
+            "document": {"title": "title only"},
+            "items": [],
+            "chunks": []
+        })));
+        assert!(!import_extraction_has_content_or_reason(&json!({
+            "items": [],
+            "chunks": [],
+            "no_knowledge_reason": "   "
+        })));
+    }
+
+    #[test]
+    fn import_contract_retry_prompt_names_required_outputs() {
+        assert_eq!(import_user_prompt_for_attempt("base", 0), "base");
+        let retry = import_user_prompt_for_attempt("base", 1);
+        assert!(retry.contains("`items`"));
+        assert!(retry.contains("`chunks`"));
+        assert!(retry.contains("`noKnowledgeReason`"));
+    }
 
     #[test]
     fn all_failed_import_segments_preserve_structured_llm_error() {

@@ -29,6 +29,9 @@ jobs:
           cargo test --locked --lib action_policy_
           cargo test --locked --lib client_sends_gateway_compatible_default_headers
           cargo test --locked --lib dynamic_model_group_404_is_retryable_but_plain_404_is_not
+          cargo test --locked --lib import_content_contract_requires_content_or_explicit_reason
+          cargo test --locked --lib import_contract_retry_prompt_names_required_outputs
+          cargo test --locked --lib all_failed_import_segments_preserve_structured_llm_error
 
       - name: Compile affected integration targets
         run: |
