@@ -215,12 +215,45 @@ fn import_extraction_has_content_or_reason(value: &Value) -> bool {
     has_content || has_reason
 }
 
-fn import_user_prompt_for_attempt(base: &str, attempt: usize) -> String {
+fn import_user_prompt_for_attempt(
+    base: &str,
+    source_name: &str,
+    content: &str,
+    attempt: usize,
+) -> String {
     if attempt == 0 {
         return base.to_string();
     }
+    let retry_instruction = if attempt == 1 {
+        "原文含有产品、退款、SLA、实施或对接等运营事实时，chunks 必须至少包含一项。每个 chunk 只整理原文明确陈述的事实。"
+    } else {
+        "请按原文标题拆分；至少返回一个 chunk。若无法细分，可将一段完整原文作为一个 draft chunk，禁止只返回 document。"
+    };
     format!(
-        "{base}\n\nThe previous response contained no reviewable knowledge. Return at least one entry in `items` or `chunks`. Only when the source truly contains no extractable operational knowledge may both arrays be empty, and then `noKnowledgeReason` must be a non-empty string. Do not return only `document`."
+        r#"这是第 {attempt} 次内容合约修复。上一次响应只有文档元数据，没有任何可复查知识。
+只输出严格 JSON 对象，使用以下最小结构：
+{{
+  "document": {{"title": "来源标题"}},
+  "items": [],
+  "chunks": [
+    {{
+      "title": "原文中的知识主题",
+      "summary": "忠于原文的简短摘要",
+      "body": "可独立复查的原文事实及其限定条件",
+      "sourceQuote": "支撑该事实的原文短句",
+      "wikiType": "finding",
+      "chunkType": "product_fact",
+      "status": "draft"
+    }}
+  ],
+  "noKnowledgeReason": null
+}}
+{retry_instruction}
+只有原文确实完全不含可提取的运营知识时，才允许 items/chunks 同时为空；此时 noKnowledgeReason 必须是非空字符串。
+
+来源名称：{source_name}
+原文：
+{content}"#
     )
 }
 
@@ -230,10 +263,12 @@ async fn generate_import_segment(
     account_id: Option<&str>,
     system: &str,
     base_user_prompt: &str,
+    source_name: &str,
+    content: &str,
 ) -> AppResult<Value> {
     let mut last_contract_error = None;
     for attempt in 0..IMPORT_CONTENT_CONTRACT_MAX_ATTEMPTS {
-        let user = import_user_prompt_for_attempt(base_user_prompt, attempt);
+        let user = import_user_prompt_for_attempt(base_user_prompt, source_name, content, attempt);
         let value = agent::generate_agent_json(
             state,
             workspace_id,
@@ -650,6 +685,8 @@ async fn run_import_extraction_controlled(
                         account_id.as_deref(),
                         system,
                         &user,
+                        &source_name,
+                        &segment,
                     )
                     .await;
                     if result.is_ok() {
@@ -2259,11 +2296,22 @@ mod tests {
 
     #[test]
     fn import_contract_retry_prompt_names_required_outputs() {
-        assert_eq!(import_user_prompt_for_attempt("base", 0), "base");
-        let retry = import_user_prompt_for_attempt("base", 1);
-        assert!(retry.contains("`items`"));
-        assert!(retry.contains("`chunks`"));
-        assert!(retry.contains("`noKnowledgeReason`"));
+        assert_eq!(
+            import_user_prompt_for_attempt("base", "source", "content", 0),
+            "base"
+        );
+        let retry = import_user_prompt_for_attempt("base", "source", "content", 1);
+        assert!(retry.contains("\"items\""));
+        assert!(retry.contains("\"chunks\""));
+        assert!(retry.contains("\"noKnowledgeReason\""));
+        assert!(retry.contains("content"));
+        assert!(retry.contains("第 1 次"));
+        assert!(!retry.contains("base"));
+
+        let final_retry = import_user_prompt_for_attempt("base", "source", "content", 2);
+        assert!(final_retry.contains("按原文标题拆分"));
+        assert!(final_retry.contains("第 2 次"));
+        assert_ne!(retry, final_retry);
     }
 
     #[test]
