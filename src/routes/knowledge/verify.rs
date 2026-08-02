@@ -247,6 +247,20 @@ fn doc_i32_with_default(doc: Option<&Document>, key: &str, default: i32) -> i32 
     .unwrap_or(default)
 }
 
+fn auto_verify_all_llm_calls_failed_error(
+    processed: i32,
+    llm_attempted: i32,
+    llm_failed: i32,
+    first_error: Option<AppError>,
+) -> Option<AppError> {
+    if processed == 0 && llm_attempted > 0 && llm_failed == llm_attempted {
+        return Some(first_error.unwrap_or_else(|| {
+            AppError::External("knowledge auto-verify: all LLM calls failed".to_string())
+        }));
+    }
+    None
+}
+
 async fn auto_verify_operation_knowledge_chunks_inner(
     state: AppState,
     workspace_id: String,
@@ -294,6 +308,9 @@ async fn auto_verify_operation_knowledge_chunks_inner(
     let mut processed = 0i32;
     let mut failed = 0i32;
     let mut degraded = false;
+    let mut llm_attempted = 0i32;
+    let mut llm_failed = 0i32;
+    let mut first_llm_error: Option<AppError> = None;
 
     while let Some(chunk) = cursor.try_next().await? {
         let Some(chunk_id) = chunk.id else { continue };
@@ -337,6 +354,7 @@ source_anchors: {}
             serde_json::to_string(&chunk.source_anchors).unwrap_or_default(),
         );
 
+        llm_attempted += 1;
         let value = match agent::generate_agent_json(
             &state,
             &workspace_id,
@@ -350,8 +368,13 @@ source_anchors: {}
         .await
         {
             Ok(v) => v,
-            Err(_) => {
+            Err(error) => {
                 // 单条失败不阻断整体；保留原状态，进入下一条。
+                failed += 1;
+                llm_failed += 1;
+                if first_llm_error.is_none() {
+                    first_llm_error = Some(error);
+                }
                 continue;
             }
         };
@@ -494,6 +517,15 @@ source_anchors: {}
             .await;
     }
 
+    if let Some(error) = auto_verify_all_llm_calls_failed_error(
+        processed,
+        llm_attempted,
+        llm_failed,
+        first_llm_error,
+    ) {
+        return Err(error);
+    }
+
     let _ = state
         .db
         .events()
@@ -585,6 +617,37 @@ pub fn enforce_verified_needs_human_audit(final_status: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_verify_all_llm_failures_preserve_structured_error() {
+        let error = auto_verify_all_llm_calls_failed_error(
+            0,
+            2,
+            2,
+            Some(AppError::LlmUnavailable {
+                kind: "model_routing_unavailable".to_string(),
+                retry_count: 9,
+                detail: "no route".to_string(),
+                hint: "retry".to_string(),
+            }),
+        )
+        .expect("all LLM calls failed");
+        assert!(matches!(
+            error,
+            AppError::LlmUnavailable {
+                kind,
+                retry_count: 9,
+                ..
+            } if kind == "model_routing_unavailable"
+        ));
+    }
+
+    #[test]
+    fn auto_verify_partial_success_is_not_batch_failure() {
+        assert!(auto_verify_all_llm_calls_failed_error(1, 2, 1, None).is_none());
+        assert!(auto_verify_all_llm_calls_failed_error(0, 2, 1, None).is_none());
+        assert!(auto_verify_all_llm_calls_failed_error(0, 0, 0, None).is_none());
+    }
 
     #[test]
     fn auto_verify_request_accepts_only_published_camel_case_keys() {

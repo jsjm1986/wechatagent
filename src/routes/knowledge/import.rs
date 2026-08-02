@@ -278,6 +278,17 @@ fn split_oversized_by_paragraph(block: &str) -> Vec<String> {
     windows
 }
 
+fn all_import_segments_failed_error(
+    total_segments: usize,
+    first_error: Option<AppError>,
+) -> AppError {
+    first_error.unwrap_or_else(|| {
+        AppError::External(format!(
+            "import preview: all {total_segments} segment extractions failed"
+        ))
+    })
+}
+
 /// 合并多段 LLM 抽取出的 document 原始值（标量取首个非空；数组字段取并集去重）。
 /// rawContent / lineIndex / sectionIndex 不在此处理——由
 /// `normalize_operation_knowledge_preview_document` 从完整 `payload.content` 重算。
@@ -610,6 +621,7 @@ async fn run_import_extraction_controlled(
     let mut values: Vec<Value> = Vec::new();
     let mut succeeded = 0usize;
     let mut failed = 0usize;
+    let mut first_error: Option<AppError> = None;
     for (idx, result) in ordered {
         match result {
             Ok(value) => {
@@ -624,13 +636,17 @@ async fn run_import_extraction_controlled(
                     error = %err,
                     "import preview: segment extraction failed (skipped)"
                 );
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
             }
         }
     }
     if values.is_empty() {
-        return Err(AppError::External(format!(
-            "import preview: 全部 {total_segments} 段抽取均失败"
-        )));
+        return Err(all_import_segments_failed_error(
+            total_segments,
+            first_error,
+        ));
     }
 
     // 合并 document（确定性，不额外调 LLM）。
@@ -2138,6 +2154,27 @@ pub async fn ingest_chunked_text(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn all_failed_import_segments_preserve_structured_llm_error() {
+        let error = all_import_segments_failed_error(
+            2,
+            Some(AppError::LlmUnavailable {
+                kind: "model_routing_unavailable".to_string(),
+                retry_count: 9,
+                detail: "no route".to_string(),
+                hint: "retry".to_string(),
+            }),
+        );
+        assert!(matches!(
+            error,
+            AppError::LlmUnavailable {
+                kind,
+                retry_count: 9,
+                ..
+            } if kind == "model_routing_unavailable"
+        ));
+    }
 
     #[test]
     fn shared_ingest_identity_is_stable_and_scope_sensitive() {
