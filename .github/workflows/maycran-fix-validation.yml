@@ -32,6 +32,9 @@ jobs:
           cargo test --locked --lib import_content_contract_requires_content_or_explicit_reason
           cargo test --locked --lib import_contract_retry_prompt_names_required_outputs
           cargo test --locked --lib all_failed_import_segments_preserve_structured_llm_error
+          cargo test --locked --lib chat_draft_contract_repair_only_targets_contradictory_empty_proposals
+          cargo test --locked --lib chat_draft_contract_repair_prompts_are_distinct_and_require_a_patch_or_questions
+          cargo test --locked --lib exhausted_chat_draft_contract_is_explicitly_not_applyable
 
       - name: Compile affected integration targets
         run: |

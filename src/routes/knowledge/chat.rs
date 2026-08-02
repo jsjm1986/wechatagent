@@ -285,7 +285,7 @@ pub async fn chat_turn(
         .and_then(|v| v.as_str())
         .unwrap_or("（AI 未给出回复）")
         .to_string();
-    let patch = result.get("patch").cloned();
+    let patch = usable_chat_patch(&result);
     let missing_fields: Vec<String> = result
         .get("missingFields")
         .and_then(|v| v.as_array())
@@ -1328,6 +1328,82 @@ fn synthesize_natural_reply_from_patch(out: &Value) -> Option<String> {
     Some(reply)
 }
 
+const CHAT_DRAFT_CONTRACT_MAX_REPAIRS: usize = 2;
+
+fn chat_draft_requires_contract_repair(value: &Value) -> bool {
+    let has_usable_patch = usable_chat_patch(value).is_some();
+    let has_declared_missing_fields = value
+        .get("missingFields")
+        .and_then(Value::as_array)
+        .is_some_and(|fields| !fields.is_empty());
+    !has_usable_patch && !has_declared_missing_fields
+}
+
+fn usable_chat_patch(value: &Value) -> Option<Value> {
+    value
+        .get("patch")
+        .filter(|patch| patch.as_object().is_some_and(|object| !object.is_empty()))
+        .cloned()
+}
+
+fn chat_draft_contract_repair_prompt(
+    user_content: &str,
+    previous: &Value,
+    attempt: usize,
+) -> String {
+    let previous = serde_json::to_string(previous).unwrap_or_default();
+    format!(
+        r#"Draft contract repair attempt {attempt}.
+The previous final response declared no missing fields but omitted a usable `patch` object.
+Return one strict JSON object with `decisionPhase="final"`.
+
+If the operator supplied enough facts, return:
+{{
+  "decisionPhase": "final",
+  "patch": {{
+    "title": "non-empty title",
+    "summary": "non-empty summary",
+    "body": "non-empty factual body"
+  }},
+  "missingFields": [],
+  "followupQuestions": [],
+  "naturalReply": "non-empty operator-facing summary"
+}}
+
+If facts are genuinely insufficient, omit `patch`, put every missing field in a non-empty
+`missingFields` array, and ask matching questions. Never return both no patch and an empty
+`missingFields` array. Do not call tools.
+
+Original operator request:
+{user_content}
+
+Previous invalid response:
+{}"#,
+        truncate_for_prompt(&previous, 4000)
+    )
+}
+
+fn mark_chat_draft_contract_incomplete(mut value: Value) -> Value {
+    if !value.is_object() {
+        value = json!({});
+    }
+    value["missingFields"] = json!(["patch"]);
+    value["followupQuestions"] = json!([{
+        "id": "q_patch",
+        "field": "patch",
+        "question": "The draft response was incomplete. Please ask me to draft it again."
+    }]);
+    let reply_blank = value
+        .get("naturalReply")
+        .and_then(Value::as_str)
+        .is_none_or(|reply| reply.trim().is_empty());
+    if reply_blank {
+        value["naturalReply"] =
+            json!("The draft response was incomplete and cannot be applied. Please try again.");
+    }
+    value
+}
+
 /// chat_turn 的核心 LLM 编排：先识别 intent，再分流到对应子 prompt。
 /// 返回的 Value 至少包含 intent / naturalReply；可选 patch / missingFields /
 /// followupQuestions / draftKind / targetChunkId / targetPackId / promptKey。
@@ -2105,17 +2181,49 @@ async fn draft_chunk_for_chat(
         render_chat_history_for_prompt(history),
     );
     let augmented_system = augment_chat_system_with_tools(&system);
-    run_chat_with_tools(
+    let mut result = run_chat_with_tools(
         state,
         workspace_id,
         account_id,
         session_id,
         "draft",
         "knowledge.chat.draft_chunk",
-        augmented_system,
+        augmented_system.clone(),
         user,
     )
-    .await
+    .await?;
+
+    for attempt in 1..=CHAT_DRAFT_CONTRACT_MAX_REPAIRS {
+        if !chat_draft_requires_contract_repair(&result) {
+            break;
+        }
+        let Some(budget) = agent::current_run_budget() else {
+            break;
+        };
+        let snapshot = budget.snapshot();
+        if budget.is_exceeded() || snapshot.llm_calls_used >= snapshot.max_llm_calls {
+            budget.mark_degraded("knowledge_chat_draft_contract_repair_budget_exhausted");
+            break;
+        }
+        let repair_user = chat_draft_contract_repair_prompt(user_content, &result, attempt);
+        let run_id = format!("chat-{session_id}-draft-contract-{attempt}");
+        result = agent::generate_agent_json(
+            state,
+            workspace_id,
+            Some(account_id),
+            None,
+            Some(&run_id),
+            "knowledge.chat.draft_chunk",
+            &augmented_system,
+            &repair_user,
+        )
+        .await?;
+    }
+
+    if chat_draft_requires_contract_repair(&result) {
+        result = mark_chat_draft_contract_incomplete(result);
+    }
+    Ok(result)
 }
 
 async fn update_chunk_for_chat(
@@ -3393,6 +3501,61 @@ pub(in crate::routes) async fn chat_session_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_draft_contract_repair_only_targets_contradictory_empty_proposals() {
+        assert!(chat_draft_requires_contract_repair(&json!({
+            "decisionPhase": "final",
+            "missingFields": []
+        })));
+        assert!(chat_draft_requires_contract_repair(&json!({
+            "patch": null,
+            "missingFields": []
+        })));
+        assert!(chat_draft_requires_contract_repair(&json!({
+            "patch": {},
+            "missingFields": []
+        })));
+        assert!(!chat_draft_requires_contract_repair(&json!({
+            "patch": { "title": "draft" },
+            "missingFields": []
+        })));
+        assert!(!chat_draft_requires_contract_repair(&json!({
+            "missingFields": ["body"]
+        })));
+        assert!(usable_chat_patch(&json!({ "patch": null })).is_none());
+        assert!(usable_chat_patch(&json!({ "patch": {} })).is_none());
+        assert_eq!(
+            usable_chat_patch(&json!({ "patch": { "title": "draft" } })),
+            Some(json!({ "title": "draft" }))
+        );
+    }
+
+    #[test]
+    fn chat_draft_contract_repair_prompts_are_distinct_and_require_a_patch_or_questions() {
+        let previous = json!({ "missingFields": [], "naturalReply": "done" });
+        let first = chat_draft_contract_repair_prompt("operator facts", &previous, 1);
+        let second = chat_draft_contract_repair_prompt("operator facts", &previous, 2);
+        assert_ne!(first, second);
+        for prompt in [&first, &second] {
+            assert!(prompt.contains("operator facts"));
+            assert!(prompt.contains("\"patch\""));
+            assert!(prompt.contains("missingFields"));
+            assert!(prompt.contains("Never return both no patch"));
+        }
+    }
+
+    #[test]
+    fn exhausted_chat_draft_contract_is_explicitly_not_applyable() {
+        let marked = mark_chat_draft_contract_incomplete(json!({
+            "decisionPhase": "final",
+            "missingFields": [],
+            "naturalReply": "incomplete"
+        }));
+        assert_eq!(marked["missingFields"], json!(["patch"]));
+        assert_eq!(marked["followupQuestions"][0]["field"], "patch");
+        assert_eq!(marked["naturalReply"], "incomplete");
+    }
 
     #[test]
     fn chat_attachment_accepts_frozen_camel_case_contract_only() {
