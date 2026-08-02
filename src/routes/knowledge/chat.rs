@@ -1692,7 +1692,10 @@ fn render_operator_memory_for_prompt(
 /// - 限制 toolCalls 数量与 final 字段约束。
 ///
 /// 注意：本函数只追加协议提示，不删除/改写原 prompt 内容。
-fn augment_chat_system_with_tools(base: &str) -> String {
+const CHAT_MUTATION_TOOL_LOOP_MAX_LOOPS: i32 = 2;
+const CHAT_CLARIFY_TOOL_LOOP_MAX_LOOPS: i32 = 3;
+
+fn augment_chat_system_with_tools(base: &str, max_loops: i32) -> String {
     let tool_list = agent::ALLOWED_CHAT_TOOL_NAMES.join(" / ");
     format!(
         r#"{base}
@@ -1704,7 +1707,7 @@ fn augment_chat_system_with_tools(base: &str) -> String {
   工具的入参字段名遵循 camelCase（如 chunkId / documentId / itemId / sourceQuote / topK / onlyVerified / hours）。
 - `tool_calling` 中间轮 **不要** 输出 `naturalReply / patch / missingFields / followupQuestions`；这些字段只在 `final` 轮给。
 - 当不再需要更多工具结果、可以给运营回复时，输出 `decisionPhase=final` + 业务字段（naturalReply / patch? / missingFields? / followupQuestions?）；不要再带 toolCalls。
-- 单 turn 最多 4 轮工具循环、6 次 LLM call；超过会被 budget 截断。
+- 本路径最多 {max_loops} 轮工具循环；超过会被截断并转入最终业务合约处理。
 - 每轮工具结果会以 `[system tool result]` 段附加到 user prompt 末尾，下一轮直接读。
 - 不要伪造工具结果；只能使用实际返回的内容。
 "#
@@ -1731,6 +1734,7 @@ async fn run_chat_with_tools(
     session_id: &str,
     run_key: &str,
     prompt_key: &str,
+    max_loops: i32,
     system: String,
     user: String,
 ) -> AppResult<Value> {
@@ -1874,6 +1878,7 @@ async fn run_chat_with_tools(
         budget,
         Some(source_anchor_for_quote_ffi as agent::AnchorMatchFn),
         reply_fn,
+        max_loops,
     )
     .await;
     let final_value = match outcome {
@@ -2213,7 +2218,8 @@ async fn draft_chunk_for_chat(
         serde_json::to_string_pretty(&pack_payload).unwrap_or_default(),
         render_chat_history_for_prompt(history),
     );
-    let augmented_system = augment_chat_system_with_tools(&system);
+    let augmented_system =
+        augment_chat_system_with_tools(&system, CHAT_MUTATION_TOOL_LOOP_MAX_LOOPS);
     let mut result = run_chat_with_tools(
         state,
         workspace_id,
@@ -2221,7 +2227,8 @@ async fn draft_chunk_for_chat(
         session_id,
         "draft",
         "knowledge.chat.draft_chunk",
-        augmented_system.clone(),
+        CHAT_MUTATION_TOOL_LOOP_MAX_LOOPS,
+        augmented_system,
         user,
     )
     .await?;
@@ -2247,7 +2254,7 @@ async fn draft_chunk_for_chat(
             None,
             Some(&run_id),
             "knowledge.chat.draft_chunk",
-            &augmented_system,
+            &system,
             &repair_user,
         )
         .await?;
@@ -2348,7 +2355,8 @@ async fn update_chunk_for_chat(
         serde_json::to_string_pretty(&document_payload).unwrap_or_default(),
         render_chat_history_for_prompt(history),
     );
-    let augmented_system = augment_chat_system_with_tools(&system);
+    let augmented_system =
+        augment_chat_system_with_tools(&system, CHAT_MUTATION_TOOL_LOOP_MAX_LOOPS);
     let mut result = run_chat_with_tools(
         state,
         workspace_id,
@@ -2356,7 +2364,8 @@ async fn update_chunk_for_chat(
         session_id,
         "update",
         "knowledge.chat.update_chunk",
-        augmented_system.clone(),
+        CHAT_MUTATION_TOOL_LOOP_MAX_LOOPS,
+        augmented_system,
         user,
     )
     .await?;
@@ -2383,7 +2392,7 @@ async fn update_chunk_for_chat(
             None,
             Some(&run_id),
             "knowledge.chat.update_chunk",
-            &augmented_system,
+            &system,
             &repair_user,
         )
         .await?;
@@ -2423,7 +2432,8 @@ async fn clarify_for_chat(
 请按 system 中 schema 输出 JSON。"#,
         render_chat_history_for_prompt(history),
     );
-    let augmented_system = augment_chat_system_with_tools(&system);
+    let augmented_system =
+        augment_chat_system_with_tools(&system, CHAT_CLARIFY_TOOL_LOOP_MAX_LOOPS);
     run_chat_with_tools(
         state,
         workspace_id,
@@ -2431,6 +2441,7 @@ async fn clarify_for_chat(
         session_id,
         "clarify",
         "knowledge.chat.clarify",
+        CHAT_CLARIFY_TOOL_LOOP_MAX_LOOPS,
         augmented_system,
         user,
     )
@@ -3648,6 +3659,13 @@ mod tests {
             assert!(prompt.contains("Preserve all other fields by omitting them"));
             assert!(prompt.contains("Never return both no patch"));
         }
+    }
+
+    #[test]
+    fn chat_tool_loop_limits_preserve_the_four_call_turn_budget() {
+        assert_eq!(CHAT_MAX_LLM_CALLS_PER_TURN, 4);
+        assert_eq!(1 + CHAT_MUTATION_TOOL_LOOP_MAX_LOOPS + 1, 4);
+        assert_eq!(1 + CHAT_CLARIFY_TOOL_LOOP_MAX_LOOPS, 4);
     }
 
     #[test]
