@@ -1813,26 +1813,35 @@ async fn t9_real_user_reaction_outcome_in_closed_set() {
         "第一轮决策+审查链路必须 Ok"
     );
 
-    // 若真模型 approved → 入队 outbox，推一次 dispatcher 到 sent（命中 MCP 桩）。
-    if let Some(entry) = state
-        .db
-        .collection_agent_send_outbox()
-        .find_one(doc! { "contact_wxid": &contact.wxid }, None)
+    // 若真模型 approved → 可能按空行/长度拆成多条 outbox。必须以 FIFO 实际 claim
+    // 到的 _id 为准逐段推进；先无排序 find_one 一个 id、再只处理首段会在二者不是
+    // 同一行时永远等待一条尚未 claim 的 pending 段。
+    let mut dispatched_segments = 0usize;
+    while let Some(claimed) = atomic_claim_pending(&state, "real_ops_worker_t9", 60)
         .await
-        .expect("query outbox")
+        .expect("claim pending")
     {
-        let entry_id = entry.id.expect("outbox _id");
-        if let Some(claimed) = atomic_claim_pending(&state, "real_ops_worker_t9", 60)
+        assert_eq!(
+            claimed.contact_wxid, contact.wxid,
+            "t9 dispatcher must only claim this isolated contact"
+        );
+        assert!(
+            dispatched_segments < state.config.agent_reply_max_segments,
+            "t9 claimed more text segments than the configured maximum"
+        );
+        let claimed_id = claimed.id.expect("claimed outbox _id");
+        process_entry(&state, &claimed)
             .await
-            .expect("claim pending")
-        {
-            process_entry(&state, &claimed)
-                .await
-                .expect("process_entry");
-            let _ =
-                common::wait_for_outbox_processed(&state, entry_id, Duration::from_secs(10)).await;
-        }
+            .expect("process_entry");
+        let processed =
+            common::wait_for_outbox_processed(&state, claimed_id, Duration::from_secs(10)).await;
+        assert_eq!(
+            processed.status, "sent",
+            "the successful MCP stub must send every claimed t9 segment"
+        );
+        dispatched_segments += 1;
     }
+    eprintln!("[t9] 第一轮已发送 outbox 分段数={dispatched_segments}");
 
     // 只有存在 status=sent 的 decision_review 时，反应分析才有可 claim 的对象。
     // 真模型这轮若选择不发（held/blocked），没有 sent review —— 跳过断言但不算失败

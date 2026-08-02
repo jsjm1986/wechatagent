@@ -45,5 +45,6 @@ jobs:
             --test real_llm_smoke \
             --test real_llm_knowledge \
             --test real_llm_recall_benchmark \
+            --test real_llm_ops_smoke \
             --test real_llm_knowledge_quality \
             --test domain_profile_e2e
