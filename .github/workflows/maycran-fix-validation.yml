@@ -35,6 +35,7 @@ jobs:
           cargo test --locked --lib chat_draft_contract_repair_only_targets_contradictory_empty_proposals
           cargo test --locked --lib chat_draft_contract_repair_prompts_are_distinct_and_require_a_patch_or_questions
           cargo test --locked --lib exhausted_chat_draft_contract_is_explicitly_not_applyable
+          cargo test --locked --lib chat_update_contract_repair_prompts_are_scoped_and_distinct
 
       - name: Compile affected integration targets
         run: |

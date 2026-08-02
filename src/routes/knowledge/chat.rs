@@ -1404,6 +1404,39 @@ fn mark_chat_draft_contract_incomplete(mut value: Value) -> Value {
     value
 }
 
+fn chat_update_contract_repair_prompt(
+    user_content: &str,
+    current_chunk: &str,
+    previous: &Value,
+    attempt: usize,
+) -> String {
+    let previous = serde_json::to_string(previous).unwrap_or_default();
+    format!(
+        r#"Update contract repair attempt {attempt}.
+The previous final response declared no missing fields but omitted a usable `patch` object.
+Return one strict JSON object with `decisionPhase="final"`.
+
+If the operator supplied enough facts, return a non-empty `patch` containing only the fields
+the operator explicitly requested to change. Preserve all other fields by omitting them. Do not
+invent facts or rewrite fields that were not requested. Also return empty `missingFields` and
+`followupQuestions` arrays, plus a non-empty `naturalReply`.
+
+If the requested update is genuinely unsupported by the operator request or current chunk,
+omit `patch`, put every missing field in a non-empty `missingFields` array, and ask matching
+questions. Never return both no patch and an empty `missingFields` array. Do not call tools.
+
+Original operator request:
+{user_content}
+
+Current chunk snapshot:
+{current_chunk}
+
+Previous invalid response:
+{}"#,
+        truncate_for_prompt(&previous, 4000)
+    )
+}
+
 /// chat_turn 的核心 LLM 编排：先识别 intent，再分流到对应子 prompt。
 /// 返回的 Value 至少包含 intent / naturalReply；可选 patch / missingFields /
 /// followupQuestions / draftKind / targetChunkId / targetPackId / promptKey。
@@ -2258,6 +2291,9 @@ async fn update_chunk_for_chat(
     let frozen_updated_at = chunk.updated_at.try_to_rfc3339_string().map_err(|error| {
         AppError::External(format!("serialize chunk updated_at failed: {error}"))
     })?;
+    let current_chunk =
+        serde_json::to_string_pretty(&operation_knowledge_chunk_json(chunk.clone()))
+            .unwrap_or_default();
     let document_payload = if let Some(document_id) = chunk.document_id {
         state
             .db
@@ -2308,8 +2344,7 @@ async fn update_chunk_for_chat(
 {}
 
 请仅对运营提到的字段做改动；其它字段省略。"#,
-        serde_json::to_string_pretty(&operation_knowledge_chunk_json(chunk.clone()))
-            .unwrap_or_default(),
+        &current_chunk,
         serde_json::to_string_pretty(&document_payload).unwrap_or_default(),
         render_chat_history_for_prompt(history),
     );
@@ -2321,10 +2356,42 @@ async fn update_chunk_for_chat(
         session_id,
         "update",
         "knowledge.chat.update_chunk",
-        augmented_system,
+        augmented_system.clone(),
         user,
     )
     .await?;
+
+    for attempt in 1..=CHAT_DRAFT_CONTRACT_MAX_REPAIRS {
+        if !chat_draft_requires_contract_repair(&result) {
+            break;
+        }
+        let Some(budget) = agent::current_run_budget() else {
+            break;
+        };
+        let snapshot = budget.snapshot();
+        if budget.is_exceeded() || snapshot.llm_calls_used >= snapshot.max_llm_calls {
+            budget.mark_degraded("knowledge_chat_update_contract_repair_budget_exhausted");
+            break;
+        }
+        let repair_user =
+            chat_update_contract_repair_prompt(user_content, &current_chunk, &result, attempt);
+        let run_id = format!("chat-{session_id}-update-contract-{attempt}");
+        result = agent::generate_agent_json(
+            state,
+            workspace_id,
+            Some(account_id),
+            None,
+            Some(&run_id),
+            "knowledge.chat.update_chunk",
+            &augmented_system,
+            &repair_user,
+        )
+        .await?;
+    }
+
+    if chat_draft_requires_contract_repair(&result) {
+        result = mark_chat_draft_contract_incomplete(result);
+    }
     result["expectedUpdatedAt"] = json!(frozen_updated_at);
     Ok(result)
 }
@@ -3555,6 +3622,32 @@ mod tests {
         assert_eq!(marked["missingFields"], json!(["patch"]));
         assert_eq!(marked["followupQuestions"][0]["field"], "patch");
         assert_eq!(marked["naturalReply"], "incomplete");
+    }
+
+    #[test]
+    fn chat_update_contract_repair_prompts_are_scoped_and_distinct() {
+        let previous = json!({ "missingFields": [], "naturalReply": "done" });
+        let current = r#"{"title":"existing","summary":"old"}"#;
+        let first = chat_update_contract_repair_prompt(
+            "only update summary and productTags",
+            current,
+            &previous,
+            1,
+        );
+        let second = chat_update_contract_repair_prompt(
+            "only update summary and productTags",
+            current,
+            &previous,
+            2,
+        );
+        assert_ne!(first, second);
+        for prompt in [&first, &second] {
+            assert!(prompt.contains("only update summary and productTags"));
+            assert!(prompt.contains(current));
+            assert!(prompt.contains("only the fields"));
+            assert!(prompt.contains("Preserve all other fields by omitting them"));
+            assert!(prompt.contains("Never return both no patch"));
+        }
     }
 
     #[test]
