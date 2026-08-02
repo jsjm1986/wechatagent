@@ -1368,7 +1368,7 @@ async fn chat_create_and_verify(
     }))
     .expect("构造 KnowledgeVerifyRequest");
 
-    verify_operation_knowledge_chunk(
+    let _ = verify_operation_knowledge_chunk(
         State(state.clone()),
         Extension(admin.clone()),
         Path(chunk_id.clone()),
@@ -1450,7 +1450,7 @@ async fn chat_update_and_verify(
         "verifiedClaims": null
     }))
     .expect("construct update KnowledgeVerifyRequest");
-    verify_operation_knowledge_chunk(
+    let _ = verify_operation_knowledge_chunk(
         State(state.clone()),
         Extension(admin.clone()),
         Path(chunk_id.to_string()),
@@ -1529,7 +1529,15 @@ async fn recall_benchmark_maintenance_stability() {
     );
 
     // 变更A·新增：补一条缺知识
-    let create_content = "帮我新建一条知识切片：我们的高级版支持API集成对接，可以与客户现有CRM系统无缝连接。知识类型是产品能力，请起草标题、摘要和正文。";
+    let create_content = "帮我新建一条独立知识切片，不挂到任何 pack。以下内容均由运营核实，\
+        可直接作为事实原文：‘高级版支持 API 集成对接，可以与客户现有 CRM 系统连接。’\
+        标题写‘高级版 API 与 CRM 集成’，知识类型是产品能力，业务上下文是企业客户系统集成咨询；\
+        摘要和正文都准确保留上述事实。适用场景是客户咨询高级版 API 或 CRM 对接；\
+        不适用场景是客户咨询基础版价格。可安全表述‘高级版支持 API 集成’和‘可与现有 CRM 系统连接’；\
+        禁止表述‘无需客户提供接口资料’。证据项和 sourceQuote 都原样使用引号中的事实原文；\
+        产品标签是高级版、API、CRM，业务主题是系统集成、接口对接；\
+        routingCard 写客户咨询高级版 API 或 CRM 对接时打开。以上信息已完整，其他细节不属于本切片范围，\
+        不应列为缺失字段；请返回非空 patch、空 missingFields，并起草可供运营确认的 proposal。";
 
     let created_chunk_id = chat_create_and_verify(&state, ws, &admin, create_content)
         .await
@@ -1985,9 +1993,17 @@ async fn recall_benchmark_gap_closed_loop_trajectory() {
         current_workspace: ws.to_string(),
     };
     let create_content = format!(
-        "帮我新建一条知识切片回应这个反复被问到的缺口：{gap_query} \
-         事实依据：我们支持美元(USD)、欧元(EUR)、港币(HKD)三种海外货币结算，\
-         跨境结算手续费为交易金额的 1.5%。知识类型是产品政策，请起草标题、摘要和正文。"
+        "帮我新建一条独立知识切片回应这个反复被问到的缺口：{gap_query}，不挂到任何 pack。\
+         以下内容均由运营核实，可直接作为事实原文：\
+         ‘海外结算支持美元(USD)、欧元(EUR)、港币(HKD)；跨境结算手续费固定为交易金额的 1.5%，\
+         不另设最低或最高手续费；币种换算按结算发起时支付通道展示的实时汇率执行。’\
+         标题写‘海外结算币种与手续费’，知识类型是产品政策，业务上下文是客户咨询跨境支付结算；\
+         摘要和正文都准确保留上述事实。适用场景是客户询问支持币种、手续费或换算汇率；\
+         不适用场景是客户询问境内支付价格。可安全表述上述三种币种、1.5% 固定费率和实时汇率口径；\
+         禁止表述‘支持所有币种’或‘跨境结算免手续费’。证据项和 sourceQuote 都原样使用引号中的事实原文；\
+         产品标签是跨境结算、海外支付，业务主题是支持币种、手续费、汇率；\
+         routingCard 写客户咨询海外结算币种、费率或汇率时打开。以上政策边界已完整，其他细节不属于本切片范围，\
+         不应列为缺失字段；请返回非空 patch、空 missingFields，并起草可供运营确认的 proposal。"
     );
     let created_chunk_id = chat_create_and_verify(&state, ws, &admin, &create_content)
         .await
