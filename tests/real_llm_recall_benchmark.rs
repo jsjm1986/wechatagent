@@ -1319,10 +1319,11 @@ async fn chat_create_and_verify(
         || body.get("canApply").and_then(|value| value.as_bool()) != Some(true)
     {
         return Err(format!(
-            "create proposal not applicable: intent={:?} canApply={:?} missingFields={:?}",
+            "create proposal not applicable: intent={:?} canApply={:?} missingFields={:?} budget={:?}",
             body.get("intent"),
             body.get("canApply"),
-            body.get("missingFields")
+            body.get("missingFields"),
+            body.get("budget")
         ));
     }
 
@@ -1407,10 +1408,11 @@ async fn chat_update_and_verify(
         || body.get("canApply").and_then(|v| v.as_bool()) != Some(true)
     {
         return Err(format!(
-            "update branch not applicable: intent={:?} canApply={:?} missingFields={:?}",
+            "update branch not applicable: intent={:?} canApply={:?} missingFields={:?} budget={:?}",
             body.get("intent"),
             body.get("canApply"),
-            body.get("missingFields")
+            body.get("missingFields"),
+            body.get("budget")
         ));
     }
     let session_id = body

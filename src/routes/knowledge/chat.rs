@@ -3664,6 +3664,12 @@ mod tests {
     #[test]
     fn chat_tool_loop_limits_preserve_the_four_call_turn_budget() {
         assert_eq!(CHAT_MAX_LLM_CALLS_PER_TURN, 4);
+        assert_eq!(CHAT_TOKEN_BUDGET_PER_LLM_CALL, 6_000);
+        assert_eq!(CHAT_TOKEN_BUDGET_PER_TURN, 24_000);
+        assert_eq!(
+            CHAT_TOKEN_BUDGET_PER_TURN,
+            CHAT_TOKEN_BUDGET_PER_LLM_CALL * CHAT_MAX_LLM_CALLS_PER_TURN as i64
+        );
         assert_eq!(
             1 + CHAT_MUTATION_TOOL_LOOP_MAX_LOOPS + CHAT_DRAFT_CONTRACT_MAX_REPAIRS as i32,
             4

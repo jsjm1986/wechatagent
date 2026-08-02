@@ -1352,8 +1352,10 @@ async fn record_repair_event(
 //    把守。
 // ===========================================================================
 
-const CHAT_TOKEN_BUDGET_PER_TURN: i64 = 6_000;
 const CHAT_MAX_LLM_CALLS_PER_TURN: i32 = 4;
+const CHAT_TOKEN_BUDGET_PER_LLM_CALL: i64 = 6_000;
+const CHAT_TOKEN_BUDGET_PER_TURN: i64 =
+    CHAT_TOKEN_BUDGET_PER_LLM_CALL * CHAT_MAX_LLM_CALLS_PER_TURN as i64;
 const CHAT_MAX_TURNS_PER_SESSION: i32 = 8;
 const CHAT_MAX_FOLLOWUPS: usize = 3;
 
