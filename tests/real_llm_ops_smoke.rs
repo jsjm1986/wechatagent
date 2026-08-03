@@ -1816,12 +1816,14 @@ async fn t9_real_user_reaction_outcome_in_closed_set() {
         .await
         .expect("insert contact");
 
-    // ① 第一轮：inbound → 决策 → 审查 → outbox。真模型若 approved 就把 outbox 推到 sent，
-    //    这样才有一条 status=sent 的 decision_review 供 record_user_reaction claim。
+    // ① 第一轮：inbound → 决策 → 审查 → outbox。选一个不依赖产品知识的安全咨询，
+    //    避免产品事实门合法拦截后只发送 decision_id=None 的客户回应占位；本测试必须
+    //    造出一条与真实 decision review 关联的 sent outbox，才能验证 reaction reward 回路。
+    let first_message_id = "real_ops_msg_t9_1";
     let inbound1 = make_inbound(
         &contact,
-        "real_ops_msg_t9_1",
-        "你们这个产品我挺感兴趣的，能简单介绍下能帮我解决什么问题吗？",
+        first_message_id,
+        "Our team collaboration has been messy lately. What information should I share first so you can help me sort out the problem?",
     );
     state
         .db
@@ -1832,6 +1834,34 @@ async fn t9_real_user_reaction_outcome_in_closed_set() {
     unwrap_or_skip_transient!(
         handle_managed_message(&state, contact.clone(), &inbound1).await,
         "第一轮决策+审查链路必须 Ok"
+    );
+
+    // 锁定这条 inbound 产生的 review。不能按 contact 宽查，否则可能把客户回应占位
+    // （decision_id=None）或同 contact 的其它 review 误当成 reward 前置样本。
+    let first_review = state
+        .db
+        .decision_reviews()
+        .find_one(
+            doc! {
+                "workspace_id": &contact.workspace_id,
+                "account_id": &contact.account_id,
+                "contact_wxid": &contact.wxid,
+                "inbound_message_id": first_message_id,
+            },
+            None,
+        )
+        .await
+        .expect("query t9 first review")
+        .expect("t9 first inbound must create a decision review");
+    let first_review_id = first_review.id.expect("t9 first review _id");
+    assert!(
+        first_review.approved,
+        "t9 first review must be approved so the real reaction path is reachable; status={:?}",
+        first_review.status
+    );
+    assert_eq!(
+        first_review.status, "outbox_enqueued",
+        "t9 first approved review must enqueue a real reply before dispatch"
     );
 
     // 若真模型 approved → 可能按空行/长度拆成多条 outbox。必须以 FIFO 实际 claim
@@ -1845,6 +1875,11 @@ async fn t9_real_user_reaction_outcome_in_closed_set() {
         assert_eq!(
             claimed.contact_wxid, contact.wxid,
             "t9 dispatcher must only claim this isolated contact"
+        );
+        assert_eq!(
+            claimed.decision_id,
+            Some(first_review_id),
+            "t9 must dispatch the review-linked real reply, not a decision_id=None ack placeholder"
         );
         assert!(
             dispatched_segments < state.config.agent_reply_max_segments,
@@ -1863,23 +1898,24 @@ async fn t9_real_user_reaction_outcome_in_closed_set() {
         dispatched_segments += 1;
     }
     eprintln!("[t9] 第一轮已发送 outbox 分段数={dispatched_segments}");
+    assert!(
+        dispatched_segments > 0,
+        "t9 first review must produce at least one review-linked sent outbox segment"
+    );
 
-    // 只有存在 status=sent 的 decision_review 时，反应分析才有可 claim 的对象。
-    // 真模型这轮若选择不发（held/blocked），没有 sent review —— 跳过断言但不算失败
-    // （反应回路本身依赖"已发出"前提，是合法的不可达分支）。
+    // process_entry 在最后一个文本分段送达后同步 finalization。既然上面已确认发送，
+    // 对应 review 必须进入 sent；否则是发送/review 关联或 finalization 回归，不能 return 假绿。
     let sent_review = state
         .db
         .decision_reviews()
-        .find_one(
-            doc! { "contact_wxid": &contact.wxid, "status": "sent" },
-            None,
-        )
+        .find_one(doc! { "_id": first_review_id }, None)
         .await
-        .expect("query sent review");
-    if sent_review.is_none() {
-        eprintln!("[t9] 第一轮真模型未发出（无 sent review）—— 跳过反应分析断言（合法分支）");
-        return;
-    }
+        .expect("reload t9 first review")
+        .expect("t9 first review must still exist");
+    assert_eq!(
+        sent_review.status, "sent",
+        "t9 review-linked outbox was sent but decision review did not finalize"
+    );
 
     // ② 第二轮：投一条带明确买入信号的用户回复，跑真实反应分析。
     let inbound2 = make_inbound(
@@ -1903,15 +1939,12 @@ async fn t9_real_user_reaction_outcome_in_closed_set() {
     let reacted = state
         .db
         .decision_reviews()
-        .find_one(
-            doc! { "contact_wxid": &contact.wxid, "status": "sent" },
-            None,
-        )
+        .find_one(doc! { "_id": first_review_id, "status": "sent" }, None)
         .await
         .expect("reload review")
         .expect("sent review exists");
     let allowed_outcomes = [
-        "pending",
+        "user_replied_positive",
         "user_replied_buying_signal",
         "user_replied_objection",
         "user_replied_stop_requested",
@@ -1920,13 +1953,24 @@ async fn t9_real_user_reaction_outcome_in_closed_set() {
         "user_replied_complaint",
         "user_replied_unclassified",
         "user_replied_neutral",
+        "user_replied_continue_exploring",
     ];
-    if let Some(outcome) = reacted.outcome_status.as_deref() {
-        assert!(
-            allowed_outcomes.contains(&outcome),
-            "outcome_status 必须 ∈ 反应分析闭集 {allowed_outcomes:?}，实际 = {outcome:?}"
-        );
-    }
+    let outcome = reacted
+        .outcome_status
+        .as_deref()
+        .expect("t9 reaction must commit a non-null outcome_status");
+    assert!(
+        allowed_outcomes.contains(&outcome),
+        "outcome_status 必须 ∈ 反应分析闭集 {allowed_outcomes:?}，实际 = {outcome:?}"
+    );
+    assert_ne!(
+        outcome, "pending",
+        "t9 reaction must actually run; pending is only the pre-analysis state"
+    );
+    assert!(
+        !reacted.reaction_analysis.is_empty(),
+        "t9 reaction must persist non-empty analysis evidence"
+    );
     eprintln!(
         "[t9] outcome_status={:?}（真模型对买入信号回复的判定，必须 ∈ 闭集）",
         reacted.outcome_status

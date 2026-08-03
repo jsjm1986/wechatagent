@@ -27,6 +27,11 @@ on:
           - real_llm_roleplay_arc
           - roleplay_emotional_companion_e2e
           - roleplay_reviewer_pressure_calibration
+      test_filter:
+        description: Optional exact cargo test-name filter for targeted validation
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -85,6 +90,7 @@ jobs:
       REAL_LLM_VISION_BACKUP_MODEL: meta/llama-3.2-90b-vision-instruct
       REAL_LLM_LEDGER: target/real_llm_ledger
       RECALL_STABILITY_RUNS: "3"
+      TEST_FILTER: ${{ inputs.test_filter }}
     steps:
       - name: Require temporary credentials
         shell: bash
@@ -119,9 +125,18 @@ jobs:
       - name: Run real-LLM target serially
         shell: bash
         run: |
+          test_args=()
+          runner_args=(--ignored --test-threads=1 --nocapture)
+          if [[ -n "$TEST_FILTER" ]]; then
+            test_args+=("$TEST_FILTER")
+            runner_args+=(--exact)
+          fi
+          printf 'target=%s test_filter=%s\n' \
+            '${{ matrix.target }}' "${TEST_FILTER:-<all>}" | tee test.log
           set +e
           cargo test --locked --no-fail-fast --test "${{ matrix.target }}" \
-            -- --ignored --test-threads=1 --nocapture 2>&1 | tee test.log
+            "${test_args[@]}" -- "${runner_args[@]}" \
+            2>&1 | tee -a test.log
           rc=${PIPESTATUS[0]}
           set -e
           printf '%s\n' "$rc" > test.rc
