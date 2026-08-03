@@ -568,7 +568,7 @@ fn spread(xs: &[f64]) -> f64 {
 /// 用同一真模型作内容质检员，对 `model_output` 按 `dims` 逐维 0–10 打分。
 /// 对照 `ground_truth` 判断 grounding/准确性，发现幻觉/偏离/遗漏扣分。只输出 JSON。
 /// system prompt 内嵌通用锚定量表（[`JUDGE_RUBRIC`]），降低方差、避免题材漂移。
-async fn judge_quality(
+async fn judge_quality_once(
     llm: &dyn LlmProvider,
     task: &str,
     model_output: &str,
@@ -598,6 +598,43 @@ async fn judge_quality(
         None => llm.generate_json(&system, &user).await?,
     };
     Ok(parse_judge_value(&value))
+}
+
+const JUDGE_OUTER_ATTEMPTS: usize = 3;
+
+fn judge_retry_delay_secs(completed_attempt: usize) -> Option<u64> {
+    (completed_attempt < JUDGE_OUTER_ATTEMPTS).then_some(3 * completed_attempt as u64)
+}
+
+/// Retry errors already classified as transient by the production client. The
+/// client's inner loop handles raw HTTP failures; this outer budget covers a
+/// fully exhausted request without turning an otherwise valid panel into a
+/// green skip.
+async fn judge_quality(
+    llm: &dyn LlmProvider,
+    task: &str,
+    model_output: &str,
+    ground_truth: &str,
+    dims: &[&str],
+    image_base64: Option<&str>,
+) -> AppResult<JudgeScore> {
+    for attempt in 1..=JUDGE_OUTER_ATTEMPTS {
+        match judge_quality_once(llm, task, model_output, ground_truth, dims, image_base64).await {
+            Ok(score) => return Ok(score),
+            Err(error) if is_failover_worthy(&error) => {
+                if let Some(delay_secs) = judge_retry_delay_secs(attempt) {
+                    eprintln!(
+                        "[JUDGE-RETRY] attempt={attempt}/{JUDGE_OUTER_ATTEMPTS} delay_secs={delay_secs} transient_error={error}"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+                } else {
+                    return Err(error);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("bounded judge retry loop always returns")
 }
 
 /// 跑 [`JUDGE_RUNS`] 次 `judge_quality`，对 overall 与各维**分别取中位**，控真模型方差。
@@ -851,11 +888,12 @@ fn hetero_qwen_judge() -> Option<QualityJudge> {
 /// 跨家族独立性（核心防线，不退回单裁判自评）：
 ///   - 裁判① llama-3.2-90b-vision @ NVIDIA（meta 家族；VISION_JUDGE_API_KEY）；
 ///   - 裁判② nemotron-vl backup @ NVIDIA（nvidia 家族；复用 REAL_LLM_VISION_BACKUP_*）。
-/// 被测 Q3 抽取走 nemotron-nano-12b-v2-vl(nvidia)，裁判用 llama-vision(meta 异家族)，与被测不同家族，
-/// decide_quality 跨裁判分歧门照常生效。两端点各裹 wrap_with_failover 抗瞬时抖动。
+/// The primary judge is Meta Llama Vision and the second judge is NVIDIA
+/// Nemotron VL. Each keeps an auditable model identity and uses bounded
+/// transient retries at the judge-call layer.
 ///
-/// 缺主 vision 裁判 key（VISION_JUDGE_API_KEY）→ None（调用方 skip，不构造不可靠裁判）。
-/// 缺异族备胎 key → 退化为单 vision 裁判（仍可判分，但跨家族分歧门失效，记一句告警）。
+/// 缺主 vision 裁判 key（VISION_JUDGE_API_KEY）→ None；严格 Q3 调用方会硬失败。
+/// 缺第二裁判 key → 仅构造单裁判；严格 Q3 调用方同样硬失败，不产假绿证据。
 fn vision_judge_panel() -> Option<Vec<QualityJudge>> {
     let g_key = std::env::var("VISION_JUDGE_API_KEY")
         .ok()
@@ -874,17 +912,18 @@ fn vision_judge_panel() -> Option<Vec<QualityJudge>> {
     )
     .ok()?;
     let mut panel = vec![QualityJudge {
-        label: "gpt5.5-vision",
+        label: "llama-vision-meta",
         model: g_model,
         client: Arc::new(g),
     }];
-    // 异族多模态裁判：kimi-k2.6 @ NVIDIA（moonshot 家族，与 GPT 跨家族）。复用 vision 备胎 env。
+    // 第二多模态裁判：Nemotron VL（nvidia 家族，与主裁判 meta 家族不同）。
+    // 复用 vision backup env，但不接入任何共享 failover 链，保持模型身份可审计。
     if let Ok(k_key) = std::env::var("REAL_LLM_VISION_BACKUP_API_KEY") {
         if !k_key.trim().is_empty() {
             let k_base = std::env::var("REAL_LLM_VISION_BACKUP_BASE_URL")
                 .unwrap_or_else(|_| "https://integrate.api.nvidia.com/v1".to_string());
             let k_model = std::env::var("REAL_LLM_VISION_BACKUP_MODEL")
-                .unwrap_or_else(|_| "moonshotai/kimi-k2.6".to_string());
+                .unwrap_or_else(|_| "nvidia/nemotron-nano-12b-v2-vl".to_string());
             if let Ok(k) = LlmClient::new(
                 k_base,
                 k_key,
@@ -894,7 +933,7 @@ fn vision_judge_panel() -> Option<Vec<QualityJudge>> {
                 2500,
             ) {
                 panel.push(QualityJudge {
-                    label: "kimi-vision-hetero",
+                    label: "nemotron-vision-hetero",
                     model: k_model,
                     client: Arc::new(k),
                 });
@@ -903,8 +942,8 @@ fn vision_judge_panel() -> Option<Vec<QualityJudge>> {
     }
     if panel.len() < 2 {
         eprintln!(
-            "[vision 裁判团] 未配置 REAL_LLM_VISION_BACKUP_API_KEY，仅单 vision 裁判（gpt5.5）；\
-             跨家族分歧门失效——配置异族多模态 key 可启用跨家族裁判照出家族级盲区"
+            "[vision 裁判团] 未配置 REAL_LLM_VISION_BACKUP_API_KEY，仅单 vision 裁判；\
+             严格 Q3 将硬失败，必须配置第二个不同模型"
         );
     }
     Some(panel)
@@ -1217,6 +1256,7 @@ async fn panel_calibrated(
     panel: &[QualityJudge],
     qid: &str,
     anchor: &CalibAnchor,
+    calibration_image_base64: Option<&str>,
 ) -> AppResult<bool> {
     let mut all_ok = true;
     let mut calibrated_judges = 0usize;
@@ -1234,7 +1274,7 @@ async fn panel_calibrated(
                     anchor.good,
                     anchor.truth,
                     anchor.dims,
-                    None,
+                    calibration_image_base64,
                 )
                 .await
             });
@@ -1246,7 +1286,7 @@ async fn panel_calibrated(
                     anchor.bad,
                     anchor.truth,
                     anchor.dims,
-                    None,
+                    calibration_image_base64,
                 )
                 .await
             });
@@ -1364,9 +1404,10 @@ async fn evaluate_quality_panel(
     ground_truth: &str,
     dims: &[&str],
     anchor: &CalibAnchor,
+    calibration_image_base64: Option<&str>,
     image_base64: Option<&str>,
 ) -> AppResult<QualityVerdict> {
-    if !panel_calibrated(panel, qid, anchor).await? {
+    if !panel_calibrated(panel, qid, anchor, calibration_image_base64).await? {
         let v = QualityVerdict::SkipCalib;
         ledger_verdict(qid, scene, &v, &[]);
         return Ok(v);
@@ -1483,6 +1524,7 @@ macro_rules! judge_quality_panel {
                 q_dims($qid),
                 calib_anchor_for($qid),
                 None,
+                None,
             )
             .await,
             concat!($qid, " 双裁判校准判分")
@@ -1495,32 +1537,33 @@ macro_rules! judge_quality_panel {
 /// 喂给裁判，让它直接对比「图 vs 抽取文本」的保真/覆盖——纯文本裁判看不到图、只能据文本
 /// ground-truth 判分，是 Q3 永久 SKIP(divergent) 的根因。多模态裁判真看图后该根因消除，
 /// 且仍是跨家族多裁判（保留 decide_quality 跨裁判分歧门，不退回单裁判自评）。
-/// 缺 vision 裁判 key → skip（不构造不可靠裁判，不算被测对象失败）。
+/// Strict Q3 evidence requires two configured vision judges and a pass verdict.
 macro_rules! judge_quality_panel_vision {
-    ($qid:expr, $scene:expr, $task:expr, $output:expr, $truth:expr, $image:expr) => {{
-        let panel = match vision_judge_panel() {
-            Some(p) => p,
-            None => {
-                eprintln!("[QUALITY][{}/{}] skip: 无法构造 vision 裁判团（缺 VISION_JUDGE_API_KEY）", $qid, $scene);
-                return;
-            }
-        };
-        let verdict = unwrap_or_skip_transient!(
-            evaluate_quality_panel(
-                &panel,
-                $qid,
-                $scene,
-                $task,
-                $output,
-                $truth,
-                q_dims($qid),
-                calib_anchor_for($qid),
-                Some($image),
-            )
-            .await,
-            concat!($qid, " vision 裁判校准判分")
+    ($qid:expr, $scene:expr, $task:expr, $output:expr, $truth:expr, $calib_image:expr, $image:expr) => {{
+        let panel = vision_judge_panel().expect("Q3 strict run requires a vision judge panel");
+        assert!(
+            panel.len() >= 2,
+            "Q3 strict run requires at least two configured vision judges"
         );
-        handle_verdict($qid, $scene, verdict)
+        let verdict = evaluate_quality_panel(
+            &panel,
+            $qid,
+            $scene,
+            $task,
+            $output,
+            $truth,
+            q_dims($qid),
+            calib_anchor_for($qid),
+            Some($calib_image),
+            Some($image),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("Q3 strict vision judge failed: {error}"));
+        assert!(
+            handle_verdict($qid, $scene, verdict),
+            "Q3 strict evidence requires a pass verdict; skip is not evidence"
+        );
+        true
     }};
 }
 
@@ -2164,7 +2207,7 @@ async fn q2_article_extraction_quality() {
     // 严格 backfill：每位裁判都必须通过 Q2 金标校准；校准缺失/瞬态耗尽均硬失败，
     // 不允许只跑确定性召回后把测试记成绿色。
     let panel = quality_judge_panel().expect("Q2 strict run requires a configured judge panel");
-    let judge_ok = panel_calibrated(&panel, "Q2", &Q2_CALIB)
+    let judge_ok = panel_calibrated(&panel, "Q2", &Q2_CALIB, None)
         .await
         .unwrap_or_else(|error| panic!("Q2 judge calibration failed: {error}"));
     assert!(
@@ -2377,6 +2420,7 @@ async fn q2_article_extraction_quality() {
 // 复用 K6 的中文条款图 fixture。
 
 const Q3_ARTICLE_IMAGE_BASE64: &str = include_str!("fixtures/k6_article_image.b64");
+const Q3_CALIB_IMAGE_BASE64: &str = include_str!("fixtures/q3_registration_calib_image.b64");
 
 #[tokio::test]
 #[ignore]
@@ -2434,7 +2478,7 @@ async fn q3_vision_extraction_quality() {
         let backup_base = std::env::var("REAL_LLM_VISION_BACKUP_BASE_URL")
             .unwrap_or_else(|_| "https://integrate.api.nvidia.com/v1".to_string());
         let backup_model = std::env::var("REAL_LLM_VISION_BACKUP_MODEL")
-            .unwrap_or_else(|_| "nvidia/llama-3.1-nemotron-nano-vl-8b-v1".to_string());
+            .unwrap_or_else(|_| "nvidia/nemotron-nano-12b-v2-vl".to_string());
         let backup_cfg = LlmProviderConfig {
             id: Some(ObjectId::new()),
             workspace_id: ws.clone(),
@@ -2475,10 +2519,9 @@ async fn q3_vision_extraction_quality() {
     };
 
     evidence.attempted();
-    let resp = unwrap_or_skip_transient!(
-        import_operation_knowledge_apply_image(State(app.state.clone()), admin, Json(req)).await,
-        "Q3 真实 vision 抽取"
-    );
+    let resp = import_operation_knowledge_apply_image(State(app.state.clone()), admin, Json(req))
+        .await
+        .unwrap_or_else(|error| panic!("Q3 strict vision extraction failed: {error}"));
     let body = resp.0;
     let chunk_ids = body["chunkIds"].as_array().cloned().unwrap_or_default();
     evidence.observe_llm_calls(1);
@@ -2519,7 +2562,8 @@ async fn q3_vision_extraction_quality() {
     // Q3 走**跨家族多模态裁判团**：把原图一并喂裁判，裁判直接看图对比抽取文本的保真/覆盖。
     // 这是比「给纯文本裁判补 OCR-truth」更根本的修法——裁判真看图，图本身即 ground-truth，
     // 消除纯文本裁判「无参考文本→判捏造」的根因（Q3 永久 SKIP 的病根）。仍是跨家族多裁判
-    // （gpt5.5 + 异族 kimi），decide_quality 跨裁判分歧门保留，不退回单裁判自评。
+    // (Meta Llama Vision + NVIDIA Nemotron VL), preserving the cross-judge
+    // divergence gate instead of falling back to single-model self-review.
     // truth 文本降级为**辅助对照**（OCR 自图片，非倒推）：裁判以所见图为准，truth 仅作交叉校验。
     let judged = judge_quality_panel_vision!(
         "Q3",
@@ -2533,12 +2577,10 @@ async fn q3_vision_extraction_quality() {
 2) SLA：承诺 99.95% 月度可用性，低于 99.9% 赔 30%、低于 99.5% 赔 50%；\
 3) 实施周期：2 到 4 周，前两周梳理流程接通试点、后两周扩到核心场景；\
 4) 对接方式：支持 OpenAPI 与 Webhook，提供沙箱与示例代码。",
+        Q3_CALIB_IMAGE_BASE64.trim(),
         Q3_ARTICLE_IMAGE_BASE64.trim()
     );
-    if !judged {
-        evidence.inconclusive("vision artifact exists but judge panel produced no pass verdict");
-        return;
-    }
+    assert!(judged, "Q3 strict vision judge must pass");
     evidence.observe_llm_calls(2);
     evidence.branch("vision_artifact_judged_pass");
     evidence.detail("chunk_count", chunk_ids.len());
@@ -3022,6 +3064,14 @@ fn q2_document_retry_budget_is_finite_and_backoff_is_bounded() {
     assert_eq!(q2_retry_delay_secs(2), Some(10));
     assert_eq!(q2_retry_delay_secs(3), None);
     assert_eq!(q2_retry_delay_secs(4), None);
+}
+
+#[test]
+fn judge_retry_budget_is_finite_and_backoff_is_bounded() {
+    assert_eq!(judge_retry_delay_secs(1), Some(3));
+    assert_eq!(judge_retry_delay_secs(2), Some(6));
+    assert_eq!(judge_retry_delay_secs(3), None);
+    assert_eq!(judge_retry_delay_secs(4), None);
 }
 
 #[test]

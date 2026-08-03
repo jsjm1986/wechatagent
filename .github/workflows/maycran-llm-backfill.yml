@@ -92,7 +92,7 @@ jobs:
       VISION_JUDGE_MODEL: meta/llama-3.2-90b-vision-instruct
       REAL_LLM_VISION_BACKUP_API_KEY: ${{ secrets.VISION_JUDGE_API_KEY }}
       REAL_LLM_VISION_BACKUP_BASE_URL: https://integrate.api.nvidia.com/v1
-      REAL_LLM_VISION_BACKUP_MODEL: nvidia/llama-3.1-nemotron-nano-vl-8b-v1
+      REAL_LLM_VISION_BACKUP_MODEL: nvidia/nemotron-nano-12b-v2-vl
       REAL_LLM_LEDGER: target/real_llm_ledger
       RECALL_STABILITY_RUNS: "3"
       TEST_FILTER: ${{ inputs.test_filter }}
