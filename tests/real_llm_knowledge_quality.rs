@@ -897,8 +897,8 @@ fn independent_judge2() -> Option<QualityJudge> {
         .filter(|key| !key.trim().is_empty())?;
     let base_url = std::env::var("REAL_LLM_JUDGE2_BASE_URL")
         .unwrap_or_else(|_| "https://integrate.api.nvidia.com/v1".to_string());
-    let model =
-        std::env::var("REAL_LLM_JUDGE2_MODEL").unwrap_or_else(|_| "z-ai/glm-5.1".to_string());
+    let model = std::env::var("REAL_LLM_JUDGE2_MODEL")
+        .unwrap_or_else(|_| "nvidia/nemotron-nano-12b-v2-vl".to_string());
     let client = LlmClient::new(
         base_url,
         api_key,

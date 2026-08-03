@@ -84,9 +84,11 @@ jobs:
       REAL_LLM_FAILOVER_API_KEY: ${{ secrets.NVIDIA_KEY }}
       REAL_LLM_FAILOVER_BASE_URL: https://integrate.api.nvidia.com/v1
       REAL_LLM_FAILOVER_MODELS: meta/llama-3.3-70b-instruct,z-ai/glm-5.1,stepfun-ai/step-3.7-flash
-      REAL_LLM_JUDGE2_API_KEY: ${{ secrets.NVIDIA_KEY }}
+      # Independent second text judge. Reuse the vision credential/model pair already
+      # proven live by strict Q3; text-only JSON requests are supported by this VL model.
+      REAL_LLM_JUDGE2_API_KEY: ${{ secrets.VISION_JUDGE_API_KEY }}
       REAL_LLM_JUDGE2_BASE_URL: https://integrate.api.nvidia.com/v1
-      REAL_LLM_JUDGE2_MODEL: qwen/qwen3-next-80b-a3b-instruct
+      REAL_LLM_JUDGE2_MODEL: nvidia/nemotron-nano-12b-v2-vl
       VISION_JUDGE_API_KEY: ${{ secrets.VISION_JUDGE_API_KEY }}
       VISION_JUDGE_BASE_URL: https://integrate.api.nvidia.com/v1
       VISION_JUDGE_MODEL: meta/llama-3.2-90b-vision-instruct
