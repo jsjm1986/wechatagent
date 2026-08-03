@@ -39,6 +39,11 @@ jobs:
           cargo test --locked --lib chat_tool_loop_limits_preserve_the_four_call_turn_budget
           cargo test --locked --lib requested_tool_loop_limit_is_enforced
 
+      - name: Run failover classification regression test
+        run: |
+          cargo test --locked --test real_llm_ops_smoke \
+            failover_uses_shared_transient_error_classification
+
       - name: Compile affected integration targets
         run: |
           cargo test --locked --no-run \
@@ -47,4 +52,11 @@ jobs:
             --test real_llm_recall_benchmark \
             --test real_llm_ops_smoke \
             --test real_llm_knowledge_quality \
+            --test real_llm_adversarial \
+            --test real_llm_cross_domain_arc \
+            --test real_llm_principal_channel \
+            --test real_llm_principal_relay \
+            --test real_llm_progressive_tier \
+            --test roleplay_emotional_companion_e2e \
+            --test roleplay_reviewer_pressure_calibration \
             --test domain_profile_e2e

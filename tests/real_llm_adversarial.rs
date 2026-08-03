@@ -124,11 +124,9 @@ fn build_real_client(
 fn is_failover_worthy(e: &AppError) -> bool {
     match e {
         AppError::LlmUnavailable { kind, detail, .. } => match kind.as_str() {
-            "rate_limited" | "http_5xx" | "timeout" | "connect_failed" | "body_decode_error"
-            | "network_error" => true,
             // 账户/密钥级 4xx（欠费 402 / 未授权 401）：独立端点能救 → 切备胎。
             "http_4xx" => detail.contains("HTTP 402") || detail.contains("HTTP 401"),
-            _ => false,
+            _ => wechatagent::llm::is_transient_llm_unavailable_kind(kind),
         },
         // 极少数 raw reqwest 错误未经 classify 直接冒泡（理论上 generate_json_with_usage
         // 已全归并，这里兜底）：仅超时 / 连接失败可切。

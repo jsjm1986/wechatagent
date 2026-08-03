@@ -120,15 +120,32 @@ fn build_real_client(
 fn is_failover_worthy(e: &AppError) -> bool {
     match e {
         AppError::LlmUnavailable { kind, detail, .. } => match kind.as_str() {
-            "rate_limited" | "http_5xx" | "timeout" | "connect_failed" | "body_decode_error"
-            | "network_error" => true,
             // 账户/密钥级 4xx（欠费 402 / 未授权 401）：独立端点能救 → 切备胎。
             "http_4xx" => detail.contains("HTTP 402") || detail.contains("HTTP 401"),
-            _ => false,
+            _ => wechatagent::llm::is_transient_llm_unavailable_kind(kind),
         },
         AppError::Http(h) => h.is_timeout() || h.is_connect(),
         _ => false,
     }
+}
+
+#[test]
+fn failover_uses_shared_transient_error_classification() {
+    let routing_error = AppError::LlmUnavailable {
+        kind: "model_routing_unavailable".to_string(),
+        retry_count: 9,
+        detail: "no route".to_string(),
+        hint: "retry".to_string(),
+    };
+    assert!(is_failover_worthy(&routing_error));
+
+    let request_error = AppError::LlmUnavailable {
+        kind: "http_4xx".to_string(),
+        retry_count: 0,
+        detail: "HTTP 400 Bad Request".to_string(),
+        hint: "fix request".to_string(),
+    };
+    assert!(!is_failover_worthy(&request_error));
 }
 
 /// 顺序 failover provider：`clients = [主, 备1, 备2, ...]`（已按延迟升序）。

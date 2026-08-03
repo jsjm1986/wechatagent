@@ -118,15 +118,9 @@ fn build_real_client(
 /// 才切；4xx/json 解析失败/空响应等「换模型也没用」的错误 fail-fast 直接抛。
 fn is_failover_worthy(e: &AppError) -> bool {
     match e {
-        AppError::LlmUnavailable { kind, .. } => matches!(
-            kind.as_str(),
-            "rate_limited"
-                | "http_5xx"
-                | "timeout"
-                | "connect_failed"
-                | "body_decode_error"
-                | "network_error"
-        ),
+        AppError::LlmUnavailable { kind, .. } => {
+            wechatagent::llm::is_transient_llm_unavailable_kind(kind)
+        }
         AppError::Http(h) => h.is_timeout() || h.is_connect(),
         _ => false,
     }

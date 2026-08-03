@@ -14,10 +14,13 @@ jobs:
     timeout-minutes: 5
     env:
       MAYCRAN_API_KEY: ${{ secrets.MAYCRAN_KEY }}
+      NVIDIA_API_KEY: ${{ secrets.NVIDIA_KEY }}
     steps:
       - name: Require temporary credential
         shell: bash
-        run: test -n "$MAYCRAN_API_KEY" || { echo "::error::MAYCRAN_KEY is missing"; exit 1; }
+        run: |
+          test -n "$MAYCRAN_API_KEY" || { echo "::error::MAYCRAN_KEY is missing"; exit 1; }
+          test -n "$NVIDIA_API_KEY" || { echo "::error::NVIDIA_KEY is missing"; exit 1; }
 
       - name: Probe candidate model IDs
         shell: bash
@@ -132,6 +135,41 @@ jobs:
           if not successes:
               raise SystemExit("No candidate model produced a valid chat-completions response")
           print("USABLE_MODELS " + " ".join(successes))
+
+          nvidia_model = "meta/llama-3.3-70b-instruct"
+          nvidia_payload = json.dumps({
+              "model": nvidia_model,
+              "temperature": 0,
+              "max_tokens": 16,
+              "messages": [
+                  {"role": "system", "content": "Return strict JSON only."},
+                  {"role": "user", "content": "Return {\"ok\":true}."},
+              ],
+          }).encode()
+          nvidia_request = urllib.request.Request(
+              "https://integrate.api.nvidia.com/v1/chat/completions",
+              data=nvidia_payload,
+              headers={
+                  "Authorization": f"Bearer {os.environ['NVIDIA_API_KEY']}",
+                  "Content-Type": "application/json",
+              },
+          )
+          try:
+              with urllib.request.urlopen(nvidia_request, timeout=60) as response:
+                  nvidia_response = json.load(response)
+          except Exception as error:
+              raise SystemExit(f"NVIDIA failover probe failed: {type(error).__name__}") from error
+          nvidia_valid = bool(
+              isinstance(nvidia_response, dict)
+              and isinstance(nvidia_response.get("choices"), list)
+              and nvidia_response["choices"]
+              and isinstance(nvidia_response["choices"][0], dict)
+              and isinstance(nvidia_response["choices"][0].get("message"), dict)
+              and isinstance(nvidia_response["choices"][0]["message"].get("content"), str)
+          )
+          if not nvidia_valid:
+              raise SystemExit("NVIDIA failover probe returned an invalid response shape")
+          print(f"NVIDIA_FAILOVER_PROBE model={nvidia_model} valid_shape=true")
           PY
 
   rust-client:

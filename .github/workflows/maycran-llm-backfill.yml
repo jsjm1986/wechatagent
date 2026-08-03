@@ -71,6 +71,9 @@ jobs:
       ROLEPLAYER_MODEL: meta/llama-3.3-70b-instruct
       ROLEPLAYER_FORMAT: openai
       ROLEPLAYER_TEMPERATURE: "0.8"
+      REAL_LLM_FAILOVER_API_KEY: ${{ secrets.NVIDIA_KEY }}
+      REAL_LLM_FAILOVER_BASE_URL: https://integrate.api.nvidia.com/v1
+      REAL_LLM_FAILOVER_MODELS: meta/llama-3.3-70b-instruct
       REAL_LLM_JUDGE2_API_KEY: ${{ secrets.NVIDIA_KEY }}
       REAL_LLM_JUDGE2_BASE_URL: https://integrate.api.nvidia.com/v1
       REAL_LLM_JUDGE2_MODEL: meta/llama-3.3-70b-instruct
