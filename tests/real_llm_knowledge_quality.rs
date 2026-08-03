@@ -771,9 +771,9 @@ const QUALITY_BORDERLINE_BAND: f64 = 1.0;
 // REAL_LLM_VISION_MODEL 现在专供 Q3 vision 走 MiMo 多模态（deepseek 非多模态），两者
 // 不能再共用一个 env（旧实现把 judge-lite 和 vision 模型双关绑死，切 provider 必撞）。
 //
-// Qwen 走**独立 env**（QWEN_JUDGE_API_KEY / _BASE_URL / _MODEL），与 deepseek 的
-// REAL_LLM_* 解耦：缺 Qwen key → 自动回落到 deepseek 双 checkpoint（行为不退化，CI 不挂）；
-// 缺文本裁判 key（REAL_LLM_API_KEY）→ None（调用方 skip，沿用原语义）。
+// 异族裁判走两套独立 env：QWEN_JUDGE_* 与 REAL_LLM_JUDGE2_*。它们不接 SUT failover，
+// 也不会把相同 model 重复计票；缺任一套配置时只省略对应裁判。缺文本裁判 key
+// （REAL_LLM_API_KEY）→ None（调用方 skip，沿用原语义）。
 
 struct QualityJudge {
     label: &'static str,
@@ -781,8 +781,8 @@ struct QualityJudge {
     client: Arc<dyn LlmProvider>,
 }
 
-/// 构造质量套件跨家族裁判团：deepseek 双 checkpoint（必备）+ 可选异族 Qwen（DashScope）。
-/// 文本裁判 key（REAL_LLM_API_KEY）缺失 → None（调用方 skip）；Qwen key 缺失 → 回落 2 裁判。
+/// 构造质量套件跨家族裁判团：主端点双 checkpoint + 最多两位独立异族裁判。
+/// 文本裁判 key（REAL_LLM_API_KEY）缺失 → None；异族 key 缺失 → 省略对应裁判。
 fn quality_judge_panel() -> Option<Vec<QualityJudge>> {
     std::env::var("REAL_LLM_API_KEY")
         .ok()
@@ -841,7 +841,7 @@ fn quality_judge_panel() -> Option<Vec<QualityJudge>> {
             client: Arc::new(c2),
         },
     ];
-    // 异族裁判（与 deepseek 跨厂商）。独立 env，缺则回落同家族双 checkpoint，不退化。
+    // 异族裁判使用独立 env 和独立 client，不接 SUT 的共享 failover 链。
     if let Some(hetero) = hetero_qwen_judge() {
         panel.push(hetero);
     } else {
@@ -849,6 +849,16 @@ fn quality_judge_panel() -> Option<Vec<QualityJudge>> {
             "[质量裁判团] 未配置 QWEN_JUDGE_API_KEY，回落 deepseek 双 checkpoint（同家族）；\
              配置异族 key 可启用跨家族裁判，照出家族级盲区"
         );
+    }
+    if let Some(judge2) = independent_judge2() {
+        if panel.iter().any(|judge| judge.model == judge2.model) {
+            eprintln!(
+                "[质量裁判团] REAL_LLM_JUDGE2_MODEL={} 与已有裁判重复，拒绝重复计票",
+                judge2.model
+            );
+        } else {
+            panel.push(judge2);
+        }
     }
     Some(panel)
 }
@@ -876,6 +886,32 @@ fn hetero_qwen_judge() -> Option<QualityJudge> {
         label: "qwen-hetero",
         model,
         client: Arc::new(c),
+    })
+}
+
+/// 第二位可选异族裁判。该槽与主端点双 checkpoint、QWEN_JUDGE_* 均独立接线；
+/// 调用方会按真实 model 去重，防止“两个标签、同一模型”的伪独立证据。
+fn independent_judge2() -> Option<QualityJudge> {
+    let api_key = std::env::var("REAL_LLM_JUDGE2_API_KEY")
+        .ok()
+        .filter(|key| !key.trim().is_empty())?;
+    let base_url = std::env::var("REAL_LLM_JUDGE2_BASE_URL")
+        .unwrap_or_else(|_| "https://integrate.api.nvidia.com/v1".to_string());
+    let model =
+        std::env::var("REAL_LLM_JUDGE2_MODEL").unwrap_or_else(|_| "z-ai/glm-5.1".to_string());
+    let client = LlmClient::new(
+        base_url,
+        api_key,
+        model.clone(),
+        180,
+        primary_max_retries(),
+        2500,
+    )
+    .ok()?;
+    Some(QualityJudge {
+        label: "judge2-hetero",
+        model,
+        client: Arc::new(client),
     })
 }
 
