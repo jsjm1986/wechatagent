@@ -40,7 +40,7 @@
 
 mod common;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
 use std::sync::Arc;
 
@@ -215,12 +215,29 @@ fn failover_key_present() -> bool {
         .is_some()
 }
 
-/// 主模型重试次数：统一 **6 次指数退避**（base 2500ms：≈2.5+5+10+20+40+80s，且尊重 Retry-After
-/// 头取 max）熬过 NVIDIA 限流窗。**不再因"有备胎"就 fail-fast 早切**——备胎现已同源 NVIDIA
-/// integrate 同 key（[[reference_llm_backup_gpt55]]），切了照样撞同一 429，早切反让全链秒耗尽 →
-/// 测试全 skip 假绿。timeout 墙已 45→90min 给足，宁可主模型多等也要拿真分。
+/// 主候选的单模型重试次数。默认 10；长矩阵 backfill 可通过 env 降低单候选预算，
+/// 把时间留给同端点异模型与异端点候选。所有候选耗尽后，Q2 还会按文档做有限重试。
 fn primary_max_retries() -> u32 {
-    10
+    std::env::var("REAL_LLM_PRIMARY_MAX_RETRIES")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(10)
+}
+
+fn comma_separated_models(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+const Q2_MAX_DOCUMENT_ATTEMPTS: usize = 3;
+
+fn q2_retry_delay_secs(completed_attempt: usize) -> Option<u64> {
+    (completed_attempt < Q2_MAX_DOCUMENT_ATTEMPTS).then_some(5 * completed_attempt as u64)
 }
 
 /// 构建异端点备胎链（默认 NVIDIA integrate 端点）。缺 key → 空 vec（退化 primary-only）。
@@ -241,27 +258,49 @@ fn failover_backups() -> Vec<Arc<LlmClient>> {
         .collect()
 }
 
-/// 备胎模型清单（逗号分隔，env 可覆盖；异族链避开被测 kimi 与裁判 llama-3.3-70b/qwen）。备胎各自保留 5 次重试。
+/// 异端点备胎模型清单（逗号分隔，env 可覆盖）。每个候选保留 5 次内部重试。
 fn failover_model_list() -> Vec<String> {
-    std::env::var("REAL_LLM_FAILOVER_MODELS")
-        .unwrap_or_else(|_| {
-            "z-ai/glm-5.1,stepfun-ai/step-3.7-flash,nvidia/llama-3.3-nemotron-super-49b-v1.5"
-                .to_string()
-        })
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect()
+    let raw = std::env::var("REAL_LLM_FAILOVER_MODELS").unwrap_or_else(|_| {
+        "z-ai/glm-5.1,stepfun-ai/step-3.7-flash,nvidia/llama-3.3-nemotron-super-49b-v1.5"
+            .to_string()
+    });
+    comma_separated_models(&raw)
 }
 
-/// 把主模型 client 包成带异端点备胎链的 FailoverProvider。
-fn wrap_with_failover(primary_label: String, primary: Arc<LlmClient>) -> Arc<dyn LlmProvider> {
-    let mut clients = vec![primary];
-    clients.extend(failover_backups());
-    Arc::new(FailoverProvider {
-        primary_label,
-        clients,
-    })
+/// Extra SUT candidates on the primary endpoint. A model-routing outage can be
+/// model-specific, so try independently probed model families before crossing
+/// to the external failover endpoint. Judges keep their own candidate chains;
+/// this list is used only by the system under test.
+fn sut_same_endpoint_backups(primary_model: &str) -> Vec<Arc<LlmClient>> {
+    let raw = match std::env::var("REAL_LLM_SAME_ENDPOINT_FAILOVER_MODELS") {
+        Ok(value) => value,
+        Err(_) => return Vec::new(),
+    };
+    let key = match std::env::var("REAL_LLM_API_KEY") {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ => return Vec::new(),
+    };
+    let base = std::env::var("REAL_LLM_BASE_URL")
+        .unwrap_or_else(|_| "https://api.supxh.xin/v1".to_string());
+    let retries = std::env::var("REAL_LLM_CANDIDATE_MAX_RETRIES")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(3);
+
+    comma_separated_models(&raw)
+        .into_iter()
+        .filter(|model| model != primary_model)
+        .map(|model| {
+            Arc::new(build_real_client(
+                base.clone(),
+                key.clone(),
+                model,
+                "REAL_LLM_FORMAT",
+                retries,
+            ))
+        })
+        .collect()
 }
 
 /// 被测 SUT 用的真实 provider：主 deepseek + 异端点备胎链。缺主 key → None（调用方 skip）。
@@ -269,7 +308,13 @@ fn real_llm_with_failover() -> Option<Arc<dyn LlmProvider>> {
     let primary = real_llm_from_env()?;
     let primary_label =
         std::env::var("REAL_LLM_MODEL").unwrap_or_else(|_| "deepseek-v4-pro".to_string());
-    Some(wrap_with_failover(primary_label, primary))
+    let mut clients = vec![primary];
+    clients.extend(sut_same_endpoint_backups(&primary_label));
+    clients.extend(failover_backups());
+    Some(Arc::new(FailoverProvider {
+        primary_label,
+        clients,
+    }))
 }
 
 macro_rules! require_real_llm {
@@ -695,6 +740,7 @@ const QUALITY_BORDERLINE_BAND: f64 = 1.0;
 
 struct QualityJudge {
     label: &'static str,
+    model: String,
     client: Arc<dyn LlmProvider>,
 }
 
@@ -730,30 +776,32 @@ fn quality_judge_panel() -> Option<Vec<QualityJudge>> {
         .ok()
         .filter(|m| !m.trim().is_empty())
         .unwrap_or_else(|| pro.clone());
-    // 重试 (180, primary_max_retries(), 2500)。每个 checkpoint 再裹 wrap_with_failover：
-    // 主裁判瞬时不可用时切异端点备胎，让判分流程跑完拿真分。
+    // 裁判保持各自独立的端点/模型，不接 SUT 的通用备援链。否则多个裁判同时故障时
+    // 会收敛到同一个备援模型，形成“标签三位、底层一位”的伪独立证据。
     let c1 = build_real_client(
         judge_base.clone(),
         judge_key.clone(),
-        pro,
+        pro.clone(),
         "REAL_LLM_JUDGE_FORMAT",
         primary_max_retries(),
     );
     let c2 = build_real_client(
         judge_base,
         judge_key,
-        lite,
+        lite.clone(),
         "REAL_LLM_JUDGE_FORMAT",
         primary_max_retries(),
     );
     let mut panel = vec![
         QualityJudge {
             label: "deepseek-pro",
-            client: wrap_with_failover("deepseek-pro".to_string(), Arc::new(c1)),
+            model: pro,
+            client: Arc::new(c1),
         },
         QualityJudge {
             label: "deepseek-flash",
-            client: wrap_with_failover("deepseek-flash".to_string(), Arc::new(c2)),
+            model: lite,
+            client: Arc::new(c2),
         },
     ];
     // 异族裁判（与 deepseek 跨厂商）。独立 env，缺则回落同家族双 checkpoint，不退化。
@@ -777,12 +825,20 @@ fn hetero_qwen_judge() -> Option<QualityJudge> {
     let base_url = std::env::var("QWEN_JUDGE_BASE_URL")
         .unwrap_or_else(|_| "https://dashscope.aliyuncs.com/compatible-mode/v1".to_string());
     let model = std::env::var("QWEN_JUDGE_MODEL").unwrap_or_else(|_| "qwen3.7-max".to_string());
-    // 重试 (180, primary_max_retries(), 2500)：与文本裁判一致；DashScope 偶有限流。
-    // 同样裹 wrap_with_failover：异族裁判瞬时不可用时切备胎兜底，不让 calib/判分 skip。
-    let c = LlmClient::new(base_url, api_key, model, 180, primary_max_retries(), 2500).ok()?;
+    // 重试 (180, primary_max_retries(), 2500)：与文本裁判一致；保持独立端点/模型。
+    let c = LlmClient::new(
+        base_url,
+        api_key,
+        model.clone(),
+        180,
+        primary_max_retries(),
+        2500,
+    )
+    .ok()?;
     Some(QualityJudge {
         label: "qwen-hetero",
-        client: wrap_with_failover("qwen-hetero".to_string(), Arc::new(c)),
+        model,
+        client: Arc::new(c),
     })
 }
 
@@ -808,10 +864,19 @@ fn vision_judge_panel() -> Option<Vec<QualityJudge>> {
         .unwrap_or_else(|_| "https://integrate.api.nvidia.com/v1".to_string());
     let g_model = std::env::var("VISION_JUDGE_MODEL")
         .unwrap_or_else(|_| "meta/llama-3.2-90b-vision-instruct".to_string());
-    let g = LlmClient::new(g_base, g_key, g_model, 180, primary_max_retries(), 2500).ok()?;
+    let g = LlmClient::new(
+        g_base,
+        g_key,
+        g_model.clone(),
+        180,
+        primary_max_retries(),
+        2500,
+    )
+    .ok()?;
     let mut panel = vec![QualityJudge {
         label: "gpt5.5-vision",
-        client: wrap_with_failover("gpt5.5-vision".to_string(), Arc::new(g)),
+        model: g_model,
+        client: Arc::new(g),
     }];
     // 异族多模态裁判：kimi-k2.6 @ NVIDIA（moonshot 家族，与 GPT 跨家族）。复用 vision 备胎 env。
     if let Ok(k_key) = std::env::var("REAL_LLM_VISION_BACKUP_API_KEY") {
@@ -820,11 +885,18 @@ fn vision_judge_panel() -> Option<Vec<QualityJudge>> {
                 .unwrap_or_else(|_| "https://integrate.api.nvidia.com/v1".to_string());
             let k_model = std::env::var("REAL_LLM_VISION_BACKUP_MODEL")
                 .unwrap_or_else(|_| "moonshotai/kimi-k2.6".to_string());
-            if let Ok(k) = LlmClient::new(k_base, k_key, k_model, 180, primary_max_retries(), 2500)
-            {
+            if let Ok(k) = LlmClient::new(
+                k_base,
+                k_key,
+                k_model.clone(),
+                180,
+                primary_max_retries(),
+                2500,
+            ) {
                 panel.push(QualityJudge {
                     label: "kimi-vision-hetero",
-                    client: wrap_with_failover("kimi-vision-hetero".to_string(), Arc::new(k)),
+                    model: k_model,
+                    client: Arc::new(k),
                 });
             }
         }
@@ -1081,7 +1153,7 @@ async fn run_quality_panel(
                 "quality",
                 json!({
                     "suite": "quality", "sha": git_sha(), "ts_ms": DateTime::now().timestamp_millis(),
-                    "qid": qid, "scene": scene, "judge": j.label, "dim": k,
+                    "qid": qid, "scene": scene, "judge": j.label, "model": &j.model, "dim": k,
                     "median": dmed, "spread": spread(&vals), "ok_calls": buckets[ji].len(),
                 }),
             );
@@ -1098,7 +1170,7 @@ async fn run_quality_panel(
             "quality",
             json!({
                 "suite": "quality", "sha": git_sha(), "ts_ms": DateTime::now().timestamp_millis(),
-                "qid": qid, "scene": scene, "judge": j.label, "dim": "overall",
+                "qid": qid, "scene": scene, "judge": j.label, "model": &j.model, "dim": "overall",
                 "median": omed, "spread": ospread, "ok_calls": buckets[ji].len(),
             }),
         );
@@ -1138,15 +1210,17 @@ async fn run_quality_panel(
     }))
 }
 
-/// 校准：让**每个裁判**对该 Q 的金标 good/bad 各打 [`CALIB_RUNS`] 次（全并发），
-/// 要求每裁判 good_overall - bad_overall ≥ [`CALIB_MIN_GAP`]。任一裁判拉不开 → 返回
-/// false（裁判此刻分辨不了好坏，本 Q skip——裁判问题不算被测对象失败）。写校准台账。
+/// 校准：让每个裁判对该 Q 的金标 good/bad 各打 [`CALIB_RUNS`] 次。单个裁判若因
+/// 瞬时错误完全无样本，可从本轮面板缺席；至少两位独立裁判必须有有效样本，且每位
+/// good_overall - bad_overall 均须达到 [`CALIB_MIN_GAP`]。写校准台账。
 async fn panel_calibrated(
     panel: &[QualityJudge],
     qid: &str,
     anchor: &CalibAnchor,
 ) -> AppResult<bool> {
     let mut all_ok = true;
+    let mut calibrated_judges = 0usize;
+    let mut calibrated_models = BTreeSet::new();
     for j in panel {
         // good 与 bad 各 CALIB_RUNS 次，全并发。
         let mut good_futs = Vec::new();
@@ -1205,12 +1279,17 @@ async fn panel_calibrated(
         let (good_vals, good_error) = collect_scores(goods)?;
         let (bad_vals, bad_error) = collect_scores(bads)?;
         if good_vals.is_empty() || bad_vals.is_empty() {
-            // 只有真实瞬时错误才会到这里；保留原始 kind/detail，避免聚合层把账户或
-            // 配置错误改写成可跳过的“裁判不可用”。
-            return Err(good_error
+            let error = good_error
                 .or(bad_error)
-                .expect("empty judge scores must retain transient error"));
+                .expect("empty judge scores must retain transient error");
+            eprintln!(
+                "[CALIB][{qid}][{}] unavailable_this_round transient_error={error}",
+                j.label
+            );
+            continue;
         }
+        calibrated_judges += 1;
+        calibrated_models.insert(j.model.clone());
         let g = median(&good_vals);
         let b = median(&bad_vals);
         let ok = calib_gap_ok(g, b, CALIB_MIN_GAP);
@@ -1223,6 +1302,7 @@ async fn panel_calibrated(
             json!({
                 "suite": "quality", "kind": "calib", "sha": git_sha(),
                 "ts_ms": DateTime::now().timestamp_millis(), "qid": qid, "judge": j.label,
+                "model": &j.model,
                 "good_overall": g, "bad_overall": b, "gap": g - b, "ok": ok,
             }),
         );
@@ -1230,7 +1310,7 @@ async fn panel_calibrated(
             all_ok = false;
         }
     }
-    Ok(all_ok)
+    Ok(calibrated_judges >= 2 && calibrated_models.len() >= 2 && all_ok)
 }
 
 /// 记一行三态裁决到台账（供反放水审计：skip_divergent 必伴随 cross_divergence>max）。
@@ -2064,7 +2144,7 @@ async fn q1_retrieval_price_objection_quality() {
 //
 // 这是演示完整科学方法论的旗舰用例，直接落实用户红线「不能针对某一文章特殊优化，
 // 这个是作弊行为」：
-//   1. 跑 corpus_matrix() 全 10 类文档（差异极大的题材），每条:
+//   1. 跑 corpus_matrix() 全 16 类文档（差异极大的题材），每条:
 //      - 硬命中红线：抽出 ≥1 条 ∧ 每条恒 draft + needs_review；
 //      - 确定性「参考事实原子单元召回」reference_recall（零模型方差、可复现）；
 //      - 中位 judge（K 次取中位 + 离散度）量化专业度。
@@ -2081,25 +2161,16 @@ async fn q2_article_extraction_quality() {
     let mcp = dummy_mcp_server().await;
     let state = common::rebuild_app_state_with_real_llm(&app, llm.clone(), mcp.uri());
 
-    // 双裁判校准：每裁判对 Q2 金标（会议纪要题材，与被测文档解耦）须拉开 good/bad；
-    // 任一裁判拉不开 → 本轮跳过 judge 断言（确定性召回仍跑，不受裁判影响）。
-    let panel = quality_judge_panel();
-    let judge_ok = match &panel {
-        Some(p) => match panel_calibrated(p, "Q2", &Q2_CALIB).await {
-            Ok(ok) => ok,
-            Err(wechatagent::error::AppError::LlmUnavailable { kind, .. })
-                if wechatagent::llm::is_transient_llm_unavailable_kind(&kind) =>
-            {
-                eprintln!("skip judge: Q2 校准锚瞬时不可达，本轮只跑确定性召回断言");
-                false
-            }
-            Err(e) => panic!("Q2 校准锚异常：{e}"),
-        },
-        None => {
-            eprintln!("skip judge: 无法构造裁判团（缺 key），本轮只跑确定性召回断言");
-            false
-        }
-    };
+    // 严格 backfill：每位裁判都必须通过 Q2 金标校准；校准缺失/瞬态耗尽均硬失败，
+    // 不允许只跑确定性召回后把测试记成绿色。
+    let panel = quality_judge_panel().expect("Q2 strict run requires a configured judge panel");
+    let judge_ok = panel_calibrated(&panel, "Q2", &Q2_CALIB)
+        .await
+        .unwrap_or_else(|error| panic!("Q2 judge calibration failed: {error}"));
+    assert!(
+        judge_ok,
+        "Q2 judge calibration must pass; skipping is not evidence"
+    );
 
     let mut train_recalls: Vec<f64> = Vec::new();
     let mut holdout_recalls: Vec<f64> = Vec::new();
@@ -2114,10 +2185,46 @@ async fn q2_article_extraction_quality() {
 
         // 直调抽取纯函数（经 ext_knowledge 导出）：绕过 handler 大/小文档 job 分流，
         // Q2 只验真模型抽取质量，不涉及异步 job。
-        let body = unwrap_or_skip_transient!(
-            run_import_extraction(&state, "default", &req, None).await,
-            "Q2 真实文章抽取"
-        );
+        // A 16-document shard must not discard all previous evidence because a
+        // single document hit a brief dual-endpoint outage. Retry this exact
+        // document independently; after the bounded budget, fail loudly rather
+        // than returning an `ok` test with only a prefix of the corpus covered.
+        let mut body = None;
+        let mut terminal_error = None;
+        for attempt in 1..=Q2_MAX_DOCUMENT_ATTEMPTS {
+            match run_import_extraction(&state, "default", &req, None).await {
+                Ok(value) => {
+                    body = Some(value);
+                    break;
+                }
+                Err(error) if is_failover_worthy(&error) => {
+                    terminal_error = Some(error);
+                    if let Some(delay_secs) = q2_retry_delay_secs(attempt) {
+                        eprintln!(
+                            "[Q2-RETRY] source={} attempt={}/{} delay_secs={} transient_error={}",
+                            spec.source_name,
+                            attempt,
+                            Q2_MAX_DOCUMENT_ATTEMPTS,
+                            delay_secs,
+                            terminal_error.as_ref().expect("error just stored")
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+                    }
+                }
+                Err(error) => panic!(
+                    "Q2[{}] extraction failed with non-retryable error: {error}",
+                    spec.source_name
+                ),
+            }
+        }
+        let body = body.unwrap_or_else(|| {
+            panic!(
+                "Q2[{}] extraction failed after {} attempts; no skip allowed: {}",
+                spec.source_name,
+                Q2_MAX_DOCUMENT_ATTEMPTS,
+                terminal_error.expect("failed attempts retain the final error")
+            )
+        });
         let chunks = body["chunks"].as_array().cloned().unwrap_or_default();
         let items = body["items"].as_array().cloned().unwrap_or_default();
 
@@ -2178,45 +2285,47 @@ async fn q2_article_extraction_quality() {
             Split::Holdout => holdout_recalls.push(recall),
         }
 
-        // 双裁判判分（裁判可用时）：量化专业度，三态裁决——每文档 Fail 才 panic，
-        // skip（分歧/有效裁判不足/瞬时不可达）只诊断不阻断；确定性召回断言独立于此。
-        if judge_ok && !chunks.is_empty() {
-            if let Some(p) = &panel {
-                let model_output =
-                    serde_json::to_string_pretty(&body["chunks"]).unwrap_or_default();
-                match run_quality_panel(
-                    p,
-                    "Q2",
-                    spec.source_name,
-                    "评估 AI 从一篇资料中抽取出的知识切片：是否穷尽覆盖原文每个信息单元、\
+        // 严格判分：每篇都必须拿到有效 panel 并形成 Pass。Fail、分歧、裁判不足、
+        // 瞬态耗尽都不是完整 backfill 证据，必须硬失败。
+        {
+            let judged_output = json!({
+                "chunks": body["chunks"].clone(),
+                "items": body["items"].clone(),
+            });
+            let model_output = serde_json::to_string_pretty(&judged_output).unwrap_or_default();
+            match run_quality_panel(
+                &panel,
+                "Q2",
+                spec.source_name,
+                "评估 AI 从一篇资料中抽取出的知识切片：是否穷尽覆盖原文每个信息单元、\
 标题摘要是否准确、正文是否保真不丢关键数字与表述、有无编造原文没有的内容。",
-                    &model_output,
-                    spec.content,
-                    q_dims("Q2"),
-                    None,
-                )
-                .await
-                {
-                    Ok(Some(outcome)) => {
-                        let verdict = decide_quality(
-                            &outcome.judge_stats(),
-                            MIN_QUALITY_FLOOR,
-                            divergence_max(),
-                            intra_spread_max(),
-                        );
-                        let meds: Vec<f64> =
-                            outcome.judge_stats().iter().map(|(m, _)| *m).collect();
-                        ledger_verdict("Q2", spec.source_name, &verdict, &meds);
-                        handle_verdict("Q2", spec.source_name, verdict);
-                    }
-                    Ok(None) => {
-                        eprintln!(
-                            "[Q2-JUDGE] {} 双裁判无有效采样，跳过该条 judge",
-                            spec.source_name
-                        );
-                    }
-                    Err(error) => panic!("Q2 裁判出现非瞬时错误，不得跳过假绿：{error:?}"),
+                &model_output,
+                spec.content,
+                q_dims("Q2"),
+                None,
+            )
+            .await
+            {
+                Ok(Some(outcome)) => {
+                    let verdict = decide_quality(
+                        &outcome.judge_stats(),
+                        MIN_QUALITY_FLOOR,
+                        divergence_max(),
+                        intra_spread_max(),
+                    );
+                    let meds: Vec<f64> = outcome.judge_stats().iter().map(|(m, _)| *m).collect();
+                    ledger_verdict("Q2", spec.source_name, &verdict, &meds);
+                    assert!(
+                        handle_verdict("Q2", spec.source_name, verdict),
+                        "Q2[{}] judge verdict skipped; strict evidence requires pass",
+                        spec.source_name
+                    );
                 }
+                Ok(None) => panic!(
+                    "Q2[{}] judge panel produced no valid samples",
+                    spec.source_name
+                ),
+                Err(error) => panic!("Q2 judge failed; no skip allowed: {error:?}"),
             }
         }
     }
@@ -2897,6 +3006,22 @@ fn median_and_spread_match_definition() {
     assert_eq!(median(&[]), 0.0);
     assert_eq!(spread(&[2.0, 7.0, 4.0]), 5.0);
     assert_eq!(spread(&[]), 0.0);
+}
+
+#[test]
+fn comma_separated_model_candidates_are_trimmed_and_empty_entries_removed() {
+    assert_eq!(
+        comma_separated_models(" qwen3-coder-next, ,deepseek-v4-pro,,"),
+        vec!["qwen3-coder-next", "deepseek-v4-pro"]
+    );
+}
+
+#[test]
+fn q2_document_retry_budget_is_finite_and_backoff_is_bounded() {
+    assert_eq!(q2_retry_delay_secs(1), Some(5));
+    assert_eq!(q2_retry_delay_secs(2), Some(10));
+    assert_eq!(q2_retry_delay_secs(3), None);
+    assert_eq!(q2_retry_delay_secs(4), None);
 }
 
 #[test]

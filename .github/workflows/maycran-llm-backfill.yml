@@ -57,6 +57,9 @@ jobs:
       REAL_LLM_BASE_URL: https://api.maycran.com/v1
       REAL_LLM_MODEL: claude-sonnet-4-6
       REAL_LLM_FORMAT: openai
+      REAL_LLM_PRIMARY_MAX_RETRIES: "3"
+      REAL_LLM_CANDIDATE_MAX_RETRIES: "3"
+      REAL_LLM_SAME_ENDPOINT_FAILOVER_MODELS: qwen3-coder-next,deepseek-v4-pro,claude-opus-4-6
       REAL_LLM_VISION_API_KEY: ${{ secrets.MAYCRAN_KEY }}
       REAL_LLM_VISION_BASE_URL: https://api.maycran.com/v1
       REAL_LLM_VISION_MODEL: claude-sonnet-4-6
@@ -80,7 +83,7 @@ jobs:
       ROLEPLAYER_TEMPERATURE: "0.8"
       REAL_LLM_FAILOVER_API_KEY: ${{ secrets.NVIDIA_KEY }}
       REAL_LLM_FAILOVER_BASE_URL: https://integrate.api.nvidia.com/v1
-      REAL_LLM_FAILOVER_MODELS: meta/llama-3.3-70b-instruct
+      REAL_LLM_FAILOVER_MODELS: meta/llama-3.3-70b-instruct,z-ai/glm-5.1,stepfun-ai/step-3.7-flash
       REAL_LLM_JUDGE2_API_KEY: ${{ secrets.NVIDIA_KEY }}
       REAL_LLM_JUDGE2_BASE_URL: https://integrate.api.nvidia.com/v1
       REAL_LLM_JUDGE2_MODEL: meta/llama-3.3-70b-instruct
@@ -244,9 +247,17 @@ jobs:
                       and row.get("qid") == qid
                   ]
                   judges = {row.get("judge") for row in calibrations if row.get("judge")}
+                  judge_models = {
+                      row.get("model") for row in calibrations if row.get("model")
+                  }
                   if len(judges) < 2:
                       raise SystemExit(
                           f"{qid} needs at least two calibrated judges; got {sorted(judges)}"
+                      )
+                  if len(judge_models) < 2:
+                      raise SystemExit(
+                          f"{qid} needs at least two distinct calibrated models; "
+                          f"got {sorted(judge_models)}"
                       )
                   failed_calibrations = [
                       row for row in calibrations if row.get("ok") is not True
