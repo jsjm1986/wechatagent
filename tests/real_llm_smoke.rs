@@ -335,9 +335,19 @@ fn assert_review_quality(review: &AgentDecisionReview, round: &str) {
         review.risks,
         pretty_document(&review.scores)
     );
+    // taxonomy_candidate* 是未知维度值的软审计通道，按设计不触发 review fail；
+    // 它不代表回复内容存在事实、施压或边界风险。其余风险仍必须为空。
+    let substantive_risks: Vec<_> = review
+        .risks
+        .iter()
+        .filter(|risk| {
+            !risk.starts_with("taxonomy_candidate:") && !risk.starts_with("taxonomy_candidate_new:")
+        })
+        .collect();
     assert!(
-        review.risks.is_empty(),
-        "{round} 是无事实声明、无施压的简单澄清问句，不应残留风险：{:?}",
+        substantive_risks.is_empty(),
+        "{round} 是无事实声明、无施压的简单澄清问句，不应残留实质风险：{:?}（全部审计标签={:?}）",
+        substantive_risks,
         review.risks
     );
 
@@ -508,7 +518,15 @@ async fn t1_real_text_decision_review_chain() {
     let llm = require_real_llm!();
     let app = TestApp::start().await;
     let mcp_server = start_mcp_mock_success().await;
-    let state = common::rebuild_app_state_with_real_llm(&app, llm, mcp_server.uri());
+    let mut state = common::rebuild_app_state_with_real_llm(&app, llm, mcp_server.uri());
+    // T1 验证 Reply/Review → outbox → MCP 的主链，不重复验证多段 FIFO（该语义由
+    // outbox_integration 覆盖）。固定为单段，避免把任意 find_one 命中的后续分段
+    // 与 atomic_claim_pending 合法领取的首段错误比较。
+    state.config.agent_reply_max_segments = 1;
+    state.config.agent_reply_max_segment_chars = 2_000;
+    // Dispatcher 的账号级 MCP 解析 fail-closed：账号必须先在 wechat_accounts 注册。
+    // TestApp 默认只 seed playbook，不 seed 账号；缺这一行会在 MCP 前安全重试回 pending。
+    common::ensure_test_account(&state, "default", "default").await;
 
     let contact = managed_contact("real_smoke_user_t1");
     state
@@ -573,6 +591,11 @@ async fn t1_real_text_decision_review_chain() {
             doc! {
                 "workspace_id": &contact.workspace_id,
                 "contact_wxid": &contact.wxid,
+                "source_event_id": "real_smoke_msg_t1",
+                // Safety-held inbound runs may enqueue a decision-less
+                // acknowledgement placeholder. Only a decision-backed row is
+                // evidence of the approved Reply/Review path exercised here.
+                "decision_id": { "$type": "objectId" },
             },
             None,
         )
@@ -580,7 +603,7 @@ async fn t1_real_text_decision_review_chain() {
         .expect("query outbox");
 
     if let Some(entry) = outbox_entry {
-        // 有 outbox 行（approved 路径）：claim + process 必须推进到 sent。
+        // 有 decision-backed outbox 行（approved 路径）：claim + process 必须推进到 sent。
         let entry_id = entry.id.expect("outbox _id");
         let claimed = atomic_claim_pending(&state, "real_smoke_worker_t1", 60)
             .await
@@ -601,10 +624,10 @@ async fn t1_real_text_decision_review_chain() {
         );
         eprintln!("[t1] outbox → sent（真模型 approved 并经桩 MCP 完成投递）");
     } else {
-        // 无 outbox 行：真模型这轮选择不回复 / 被闸门 hold —— 也是合法终态，
-        // 只要 final_review_status 在闭集内即可（上面已断言）。
+        // 无 approved reply outbox：真模型这轮选择不回复 / 被闸门 hold（即使另有
+        // decision-less acknowledgement placeholder）也是合法终态。
         eprintln!(
-            "[t1] 本轮无 outbox（final_review_status={}）—— 合法的不发终态",
+            "[t1] 本轮无 approved reply outbox（final_review_status={}）—— 合法的不发终态",
             log.final_review_status
         );
     }
@@ -837,6 +860,9 @@ async fn t4_real_reply_review_reaction_stop_cancels_before_second_send() {
     let app = TestApp::start().await;
     let mcp_server = start_mcp_mock_success().await;
     let mut state = common::rebuild_app_state_with_real_llm(&app, llm, mcp_server.uri());
+    // 与生产 dispatcher 一致，账号必须已注册后才能解析账号级 MCP 凭据。未注册时
+    // process_entry 会按 safe-to-retry 语义把条目退回 pending，测试会误判为未消费。
+    common::ensure_test_account(&state, "default", "default").await;
     // 让每轮模型回复对应恰好一条文本 outbox，便于把“发送次数”与业务轮次精确对账。
     state.config.agent_reply_max_segments = 1;
     state.config.agent_reply_max_segment_chars = 2_000;
@@ -844,6 +870,24 @@ async fn t4_real_reply_review_reaction_stop_cancels_before_second_send() {
     // 默认 20 秒最小回复间隔属于生产防刷屏策略，会在模型调用前把第二轮挡成
     // rate_limited，与本测试要验证的 Reply/Review/Reaction 所有权弧无关。
     state.config.agent_min_reply_interval_seconds = 0;
+    let runtime_override = state
+        .db
+        .operation_domain_configs()
+        .update_one(
+            doc! {
+                "workspace_id": &state.config.default_workspace_id,
+                "domain": "user_operations",
+                "current_version": true,
+            },
+            doc! { "$set": { "runtime_parameters.minReplyIntervalSeconds": 0_i32 } },
+            None,
+        )
+        .await
+        .expect("disable persisted min reply interval for T4");
+    assert_eq!(
+        runtime_override.matched_count, 1,
+        "T4 必须覆盖唯一 current operation_domain_config 的持久化最小回复间隔"
+    );
 
     let mut contact = managed_contact("real_smoke_user_t4_stop");
     contact.custom_agent_instructions = Some(

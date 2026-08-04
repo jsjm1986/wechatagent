@@ -198,7 +198,9 @@ async fn image_import_with_empty_vision_output_is_rejected() {
     let ws = app.state.config.default_workspace_id.clone();
 
     insert_provider(&app, &provider(&ws, "vision_primary", true, true, false)).await;
-    app.llm.push_response(json!({ "fence": "" }));
+    for _ in 0..3 {
+        app.llm.push_response(json!({ "fence": "" }));
+    }
 
     let result = import_operation_knowledge_apply_image(
         State(app.state.clone()),

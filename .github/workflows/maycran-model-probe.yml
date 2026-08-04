@@ -1,0 +1,199 @@
+name: Maycran model probe (temporary)
+
+on:
+  push:
+    branches:
+      - test/maycran-llm-backfill-20260802
+
+permissions:
+  contents: read
+
+jobs:
+  models:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      MAYCRAN_API_KEY: ${{ secrets.MAYCRAN_KEY }}
+      NVIDIA_API_KEY: ${{ secrets.NVIDIA_KEY }}
+    steps:
+      - name: Require temporary credential
+        shell: bash
+        run: |
+          test -n "$MAYCRAN_API_KEY" || { echo "::error::MAYCRAN_KEY is missing"; exit 1; }
+          test -n "$NVIDIA_API_KEY" || { echo "::error::NVIDIA_KEY is missing"; exit 1; }
+
+      - name: Probe candidate model IDs
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.error
+          import urllib.request
+
+          candidates = [
+              "claude-sonnet-4-6",
+              "claude-sonnet-4.6",
+              "claude-sonnet-4-5",
+              "claude-opus-4-6",
+              "gpt-5.6-auto",
+              "codex-auto-review",
+              "qwen3-coder-next",
+              "deepseek-v4-pro",
+          ]
+
+          def probe(model, extra_headers, *, include_max_tokens=True, direct=False):
+              payload = {
+                  "model": model,
+                  "temperature": 0,
+                  "messages": [
+                      {"role": "system", "content": "Return strict JSON only."},
+                      {"role": "user", "content": "Return {\"ok\":true}."},
+                  ],
+              }
+              if include_max_tokens:
+                  payload["max_tokens"] = 16
+              body = json.dumps(payload).encode()
+              headers = {
+                  "Authorization": f"Bearer {os.environ['MAYCRAN_API_KEY']}",
+                  "Content-Type": "application/json",
+              }
+              headers.update(extra_headers)
+              request = urllib.request.Request(
+                  "https://api.maycran.com/v1/chat/completions",
+                  data=body,
+                  headers=headers,
+              )
+              status = 0
+              valid_shape = False
+              opener = (
+                  urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                  if direct
+                  else urllib.request.build_opener()
+              )
+              try:
+                  with opener.open(request, timeout=60) as response:
+                      status = response.status
+                      payload = json.load(response)
+                      valid_shape = bool(
+                          isinstance(payload, dict)
+                          and isinstance(payload.get("choices"), list)
+                          and payload["choices"]
+                          and isinstance(payload["choices"][0], dict)
+                          and isinstance(payload["choices"][0].get("message"), dict)
+                          and isinstance(payload["choices"][0]["message"].get("content"), str)
+                      )
+              except urllib.error.HTTPError as error:
+                  status = error.code
+              except Exception:
+                  status = -1
+              return status, valid_shape
+
+          header_profiles = {
+              "default": {},
+              "accept_only": {"Accept": "application/json"},
+              "production_ua": {"User-Agent": "Mozilla/5.0 wechatagent-llm/1.0"},
+              "probe_ua": {"User-Agent": "Mozilla/5.0 MaycranModelProbe/1.0"},
+              "minimal_mozilla": {"User-Agent": "Mozilla/5.0"},
+              "chrome_ua": {
+                  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/131.0.0.0 Safari/537.36"
+              },
+          }
+          for profile, headers in header_profiles.items():
+              status, valid_shape = probe("claude-sonnet-4-6", headers)
+              print(
+                  f"HEADER_PROBE profile={profile} status={status} "
+                  f"valid_shape={str(valid_shape).lower()}"
+              )
+
+          request_profiles = {
+              "max_tokens_default_network": (True, False),
+              "no_max_tokens_default_network": (False, False),
+              "max_tokens_direct": (True, True),
+              "no_max_tokens_direct": (False, True),
+          }
+          for profile, (include_max_tokens, direct) in request_profiles.items():
+              status, valid_shape = probe(
+                  "claude-sonnet-4-6",
+                  header_profiles["production_ua"],
+                  include_max_tokens=include_max_tokens,
+                  direct=direct,
+              )
+              print(
+                  f"REQUEST_PROBE profile={profile} status={status} "
+                  f"valid_shape={str(valid_shape).lower()}"
+              )
+
+          successes = []
+          for model in candidates:
+              status, valid_shape = probe(model, header_profiles["chrome_ua"])
+              print(f"MODEL_PROBE model={model} status={status} valid_shape={str(valid_shape).lower()}")
+              if 200 <= status < 300 and valid_shape:
+                  successes.append(model)
+          if not successes:
+              raise SystemExit("No candidate model produced a valid chat-completions response")
+          print("USABLE_MODELS " + " ".join(successes))
+
+          nvidia_model = "meta/llama-3.3-70b-instruct"
+          nvidia_payload = json.dumps({
+              "model": nvidia_model,
+              "temperature": 0,
+              "max_tokens": 16,
+              "messages": [
+                  {"role": "system", "content": "Return strict JSON only."},
+                  {"role": "user", "content": "Return {\"ok\":true}."},
+              ],
+          }).encode()
+          nvidia_request = urllib.request.Request(
+              "https://integrate.api.nvidia.com/v1/chat/completions",
+              data=nvidia_payload,
+              headers={
+                  "Authorization": f"Bearer {os.environ['NVIDIA_API_KEY']}",
+                  "Content-Type": "application/json",
+              },
+          )
+          try:
+              with urllib.request.urlopen(nvidia_request, timeout=60) as response:
+                  nvidia_response = json.load(response)
+          except Exception as error:
+              raise SystemExit(f"NVIDIA failover probe failed: {type(error).__name__}") from error
+          nvidia_valid = bool(
+              isinstance(nvidia_response, dict)
+              and isinstance(nvidia_response.get("choices"), list)
+              and nvidia_response["choices"]
+              and isinstance(nvidia_response["choices"][0], dict)
+              and isinstance(nvidia_response["choices"][0].get("message"), dict)
+              and isinstance(nvidia_response["choices"][0]["message"].get("content"), str)
+          )
+          if not nvidia_valid:
+              raise SystemExit("NVIDIA failover probe returned an invalid response shape")
+          print(f"NVIDIA_FAILOVER_PROBE model={nvidia_model} valid_shape=true")
+          PY
+
+  rust-client:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      MAYCRAN_API_KEY: ${{ secrets.MAYCRAN_KEY }}
+      MAYCRAN_BASE_URL: https://api.maycran.com/v1
+    steps:
+      - name: Require temporary credential
+        shell: bash
+        run: test -n "$MAYCRAN_API_KEY" || { echo "::error::MAYCRAN_KEY is missing"; exit 1; }
+
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: maycran-fix-validation
+
+      - name: Probe through production LlmClient
+        run: |
+          cargo test --locked --test maycran_transport_probe \
+            production_client_reaches_candidate_models -- --ignored --nocapture
+          cargo test --locked --test maycran_transport_probe \
+            production_client_handles_business_prompt_sizes -- --ignored --nocapture

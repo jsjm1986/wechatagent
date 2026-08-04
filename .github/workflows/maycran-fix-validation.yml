@@ -1,0 +1,62 @@
+name: Maycran fix validation (temporary)
+
+on:
+  push:
+    branches:
+      - test/maycran-llm-backfill-20260802
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: maycran-fix-validation
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run action-policy regression tests
+        run: |
+          cargo test --locked --lib action_policy_
+          cargo test --locked --lib client_sends_gateway_compatible_default_headers
+          cargo test --locked --lib dynamic_model_group_404_is_retryable_but_plain_404_is_not
+          cargo test --locked --lib import_content_contract_requires_content_or_explicit_reason
+          cargo test --locked --lib import_contract_retry_prompt_names_required_outputs
+          cargo test --locked --lib all_failed_import_segments_preserve_structured_llm_error
+          cargo test --locked --lib chat_draft_contract_repair_only_targets_contradictory_empty_proposals
+          cargo test --locked --lib chat_draft_contract_repair_prompts_are_distinct_and_require_a_patch_or_questions
+          cargo test --locked --lib exhausted_chat_draft_contract_is_explicitly_not_applyable
+          cargo test --locked --lib chat_update_contract_repair_prompts_are_scoped_and_distinct
+          cargo test --locked --lib chat_tool_loop_limits_preserve_the_four_call_turn_budget
+          cargo test --locked --lib requested_tool_loop_limit_is_enforced
+
+      - name: Run failover classification regression test
+        run: |
+          cargo test --locked --test real_llm_ops_smoke \
+            failover_uses_shared_transient_error_classification
+
+      - name: Compile affected integration targets
+        run: |
+          cargo test --locked --no-run \
+            --test real_llm_smoke \
+            --test real_llm_knowledge \
+            --test real_llm_recall_benchmark \
+            --test real_llm_ops_smoke \
+            --test real_llm_knowledge_quality \
+            --test real_llm_adversarial \
+            --test real_llm_cross_domain_arc \
+            --test real_llm_principal_channel \
+            --test real_llm_principal_relay \
+            --test real_llm_progressive_tier \
+            --test roleplay_emotional_companion_e2e \
+            --test roleplay_reviewer_pressure_calibration \
+            --test domain_profile_e2e

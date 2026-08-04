@@ -115,10 +115,8 @@ fn build_real_client(
 fn is_failover_worthy(e: &AppError) -> bool {
     match e {
         AppError::LlmUnavailable { kind, detail, .. } => match kind.as_str() {
-            "rate_limited" | "http_5xx" | "timeout" | "connect_failed" | "body_decode_error"
-            | "network_error" => true,
             "http_4xx" => detail.contains("HTTP 402") || detail.contains("HTTP 401"),
-            _ => false,
+            _ => wechatagent::llm::is_transient_llm_unavailable_kind(kind),
         },
         AppError::Http(h) => h.is_timeout() || h.is_connect(),
         _ => false,

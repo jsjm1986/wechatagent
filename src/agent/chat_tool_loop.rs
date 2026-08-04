@@ -93,6 +93,7 @@ pub(crate) async fn chat_reply_with_tools_loop<'a>(
     budget: Arc<RunBudget>,
     anchor_match: Option<AnchorMatchFn>,
     reply_fn: ChatReplyFn<'a>,
+    requested_max_loops: i32,
 ) -> Result<ChatToolLoopOutcome, ChatToolLoopError> {
     chat_reply_with_tools_loop_with_timeout(
         runtime,
@@ -104,6 +105,7 @@ pub(crate) async fn chat_reply_with_tools_loop<'a>(
         anchor_match,
         reply_fn,
         CHAT_TOOL_LOOP_TOTAL_TIMEOUT,
+        requested_max_loops,
     )
     .await
 }
@@ -118,10 +120,11 @@ async fn chat_reply_with_tools_loop_with_timeout<'a>(
     anchor_match: Option<AnchorMatchFn>,
     reply_fn: ChatReplyFn<'a>,
     total_timeout: Duration,
+    requested_max_loops: i32,
 ) -> Result<ChatToolLoopOutcome, ChatToolLoopError> {
     let loop_started = std::time::Instant::now();
     let deadline = tokio::time::Instant::now() + total_timeout;
-    let max_loops = CHAT_TOOL_LOOP_MAX_LOOPS;
+    let max_loops = requested_max_loops.clamp(1, CHAT_TOOL_LOOP_MAX_LOOPS);
     let mut accumulated_results = String::new();
     let mut tool_trace: Vec<Document> = Vec::new();
     let mut risks: Vec<String> = Vec::new();
@@ -528,6 +531,7 @@ mod tests {
             budget.clone(),
             None,
             reply_fn,
+            CHAT_TOOL_LOOP_MAX_LOOPS,
         )
         .await
         .expect("final-only loop must succeed without touching db");
@@ -575,6 +579,7 @@ mod tests {
             None,
             reply_fn,
             Duration::from_millis(20),
+            CHAT_TOOL_LOOP_MAX_LOOPS,
         )
         .await;
 
@@ -609,6 +614,7 @@ mod tests {
             budget(8),
             None,
             scripted_reply_fn(decisions, call_count.clone()),
+            CHAT_TOOL_LOOP_MAX_LOOPS,
         )
         .await
         .expect("loop exhaustion should return a normalized outcome");
@@ -616,6 +622,40 @@ mod tests {
         assert_eq!(call_count.load(Ordering::SeqCst), CHAT_TOOL_LOOP_MAX_LOOPS);
         assert_eq!(outcome.decision.decision_phase, "final");
         assert!(outcome.decision.tool_calls.is_empty());
+        assert!(outcome
+            .risks
+            .iter()
+            .any(|risk| risk == "chat_tool_loop_exhausted"));
+    }
+
+    #[tokio::test]
+    async fn requested_tool_loop_limit_is_enforced() {
+        let db = crate::db::Database::connect("mongodb://127.0.0.1:1/test", "wechatagent_test")
+            .await
+            .expect("lazy connect should not fail on URI parse");
+        let decisions = Arc::new(parking_lot::Mutex::new(vec![
+            intermediate(Vec::new()),
+            intermediate(Vec::new()),
+            intermediate(Vec::new()),
+        ]));
+        let call_count = Arc::new(AtomicI32::new(0));
+
+        let outcome = chat_reply_with_tools_loop(
+            &runtime(),
+            &empty_knowledge(),
+            &db,
+            "ws_test",
+            "account_test",
+            budget(8),
+            None,
+            scripted_reply_fn(decisions, call_count.clone()),
+            2,
+        )
+        .await
+        .expect("bounded loop exhaustion should return a normalized outcome");
+
+        assert_eq!(call_count.load(Ordering::SeqCst), 2);
+        assert_eq!(outcome.decision.decision_phase, "final");
         assert!(outcome
             .risks
             .iter()

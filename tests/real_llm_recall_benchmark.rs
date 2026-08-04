@@ -1289,17 +1289,20 @@ async fn recall_all(
 /// （运营在前端「应用为草稿」按钮触发）。本 helper 照搬该两步设计：
 ///   chat_turn（拿 sessionId + 确认 canApply）→ chat_apply（落库拿 createdChunkId）
 ///   → verify_operation_knowledge_chunk（审定）。
-/// 任一步失败/未命中 create 意图 → 返回 None（调用方自我跳过，不算硬失败）。
+/// 任一步失败/未命中 create 意图都返回带上下文的错误，由调用方硬失败，避免闭环未执行却假绿。
 async fn chat_create_and_verify(
     state: &AppState,
-    _ws: &str,
+    ws: &str,
     admin: &AuthenticatedAdmin,
     content: &str,
-) -> Option<String> {
+) -> Result<String, String> {
+    let account_id = state.config.default_account_id.clone();
+    common::ensure_test_account(state, ws, &account_id).await;
+
     // 构造 ChatTurnRequest（照搬 K10 方式：serde_json::from_value）
     let req: ChatTurnRequest = serde_json::from_value(json!({
         "sessionId": null,
-        "accountId": null,
+        "accountId": account_id,
         "operatorId": "recall_maint_operator",
         "content": content,
         "attachments": [],
@@ -1307,25 +1310,32 @@ async fn chat_create_and_verify(
     .expect("构造 ChatTurnRequest");
 
     // 调用 chat_turn —— 只产 pending 草稿预览，拿 sessionId
-    let resp = match chat_turn(State(state.clone()), Extension(admin.clone()), Json(req)).await {
-        Ok(resp) => resp,
-        Err(e) => {
-            eprintln!("[RECALL-MAINT] chat_turn failed: {}, return None", e);
-            return None;
-        }
-    };
+    let resp = chat_turn(State(state.clone()), Extension(admin.clone()), Json(req))
+        .await
+        .map_err(|error| format!("chat_turn failed: {error}"))?;
 
     let body = resp.0;
+    if body.get("intent").and_then(|value| value.as_str()) != Some("create_chunk")
+        || body.get("canApply").and_then(|value| value.as_bool()) != Some(true)
+    {
+        return Err(format!(
+            "create proposal not applicable: intent={:?} canApply={:?} missingFields={:?} budget={:?}",
+            body.get("intent"),
+            body.get("canApply"),
+            body.get("missingFields"),
+            body.get("budget")
+        ));
+    }
 
     // chat_turn 不落库，必须拿到 sessionId 去 chat_apply。intent 非 create_chunk
-    // 或 canApply=false（缺字段/无 patch）时，apply 会 400 —— 视为本轮未命中创建，跳过。
-    let session_id = match body.get("sessionId").and_then(|v| v.as_str()) {
-        Some(s) if !s.is_empty() => s.to_string(),
-        _ => {
-            eprintln!("[RECALL-MAINT] chat_turn 未返回 sessionId，return None");
-            return None;
-        }
-    };
+    // 或 canApply=false（缺字段/无 patch）时，必须在上面的合约断言处失败。
+    let session_id = body
+        .get("sessionId")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| "chat_turn did not return a non-empty sessionId".to_string())?;
 
     // 调用 chat_apply —— 真正落库 draft chunk + 回填 createdChunkId
     let apply_req: ChatApplyRequest = serde_json::from_value(json!({
@@ -1333,36 +1343,25 @@ async fn chat_create_and_verify(
     }))
     .expect("构造 ChatApplyRequest");
 
-    let apply_resp = match chat_apply(
+    let apply_resp = chat_apply(
         State(state.clone()),
         Extension(admin.clone()),
         Path(session_id.clone()),
         Json(apply_req),
     )
     .await
-    {
-        Ok(resp) => resp,
-        Err(e) => {
-            // 最常见：本轮 AI 未命中 create_chunk 意图 / 草稿缺字段不可应用 → 400。
-            eprintln!("[RECALL-MAINT] chat_apply failed: {}, return None", e);
-            return None;
-        }
-    };
+    .map_err(|error| format!("chat_apply failed: {error}"))?;
 
     // chat_apply 返回 { ok, sessionId, intent, result: { createdChunkId, ... } }
-    let chunk_id = match apply_resp
+    let chunk_id = apply_resp
         .0
         .get("result")
         .and_then(|r| r.get("createdChunkId"))
         .and_then(|v| v.as_str())
-    {
-        Some(id) if !id.is_empty() => id.to_string(),
-        _ => {
-            // intent=update_chunk 等不产 createdChunkId；本 helper 只服务「新增」语义。
-            eprintln!("[RECALL-MAINT] chat_apply 未回填 createdChunkId（intent 非 create_chunk？），return None");
-            return None;
-        }
-    };
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| "chat_apply did not return createdChunkId".to_string())?;
 
     // 调用 verify_operation_knowledge_chunk
     let verify_req: KnowledgeVerifyRequest = serde_json::from_value(json!({
@@ -1370,20 +1369,15 @@ async fn chat_create_and_verify(
     }))
     .expect("构造 KnowledgeVerifyRequest");
 
-    match verify_operation_knowledge_chunk(
+    let _ = verify_operation_knowledge_chunk(
         State(state.clone()),
         Extension(admin.clone()),
         Path(chunk_id.clone()),
         Json(verify_req),
     )
     .await
-    {
-        Ok(_) => Some(chunk_id),
-        Err(e) => {
-            eprintln!("[RECALL-MAINT] verify failed: {}, return None", e);
-            None
-        }
-    }
+    .map_err(|error| format!("verify failed: {error}"))?;
+    Ok(chunk_id)
 }
 
 /// Run the real update branch against an explicitly attached chunk, apply the AI patch as a
@@ -1394,86 +1388,79 @@ async fn chat_update_and_verify(
     admin: &AuthenticatedAdmin,
     chunk_id: &str,
     content: &str,
-) -> Option<usize> {
+) -> Result<usize, String> {
+    let account_id = state.config.default_account_id.clone();
+    common::ensure_test_account(state, &admin.current_workspace, &account_id).await;
     let req: ChatTurnRequest = serde_json::from_value(json!({
         "sessionId": null,
-        "accountId": null,
+        "accountId": account_id,
         "operatorId": "recall_maint_operator",
         "content": content,
         "attachments": [{ "chunkId": chunk_id, "itemId": null }],
     }))
     .expect("construct update ChatTurnRequest");
 
-    let body = match chat_turn(State(state.clone()), Extension(admin.clone()), Json(req)).await {
-        Ok(resp) => resp.0,
-        Err(err) => {
-            eprintln!("[RECALL-MAINT] update chat_turn failed: {err}");
-            return None;
-        }
-    };
+    let body = chat_turn(State(state.clone()), Extension(admin.clone()), Json(req))
+        .await
+        .map_err(|error| format!("update chat_turn failed: {error}"))?
+        .0;
     if body.get("intent").and_then(|v| v.as_str()) != Some("update_chunk")
         || body.get("canApply").and_then(|v| v.as_bool()) != Some(true)
     {
-        eprintln!(
-            "[RECALL-MAINT] update branch not applicable: intent={:?} canApply={:?}",
+        return Err(format!(
+            "update branch not applicable: intent={:?} canApply={:?} missingFields={:?} budget={:?}",
             body.get("intent"),
-            body.get("canApply")
-        );
-        return None;
+            body.get("canApply"),
+            body.get("missingFields"),
+            body.get("budget")
+        ));
     }
-    let session_id = body.get("sessionId")?.as_str()?.trim().to_string();
-    if session_id.is_empty() {
-        return None;
-    }
+    let session_id = body
+        .get("sessionId")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| "update chat_turn did not return a non-empty sessionId".to_string())?;
 
     let apply_req: ChatApplyRequest = serde_json::from_value(json!({ "accountId": null }))
         .expect("construct update ChatApplyRequest");
-    let applied = match chat_apply(
+    let applied = chat_apply(
         State(state.clone()),
         Extension(admin.clone()),
         Path(session_id),
         Json(apply_req),
     )
     .await
-    {
-        Ok(resp) => resp.0,
-        Err(err) => {
-            eprintln!("[RECALL-MAINT] update chat_apply failed: {err}");
-            return None;
-        }
-    };
-    let result = applied.get("result")?;
+    .map_err(|error| format!("update chat_apply failed: {error}"))?
+    .0;
+    let result = applied
+        .get("result")
+        .ok_or_else(|| "update chat_apply did not return result".to_string())?;
     if result.get("updatedChunkId").and_then(|v| v.as_str()) != Some(chunk_id) {
-        eprintln!("[RECALL-MAINT] update applied to unexpected target: {result:?}");
-        return None;
+        return Err(format!("update applied to unexpected target: {result:?}"));
     }
     let fields_touched = result
         .get("fieldsTouched")
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as usize;
     if fields_touched == 0 {
-        eprintln!("[RECALL-MAINT] update patch touched zero recognized fields");
-        return None;
+        return Err("update patch touched zero recognized fields".to_string());
     }
 
     let verify_req: KnowledgeVerifyRequest = serde_json::from_value(json!({
         "verifiedClaims": null
     }))
     .expect("construct update KnowledgeVerifyRequest");
-    match verify_operation_knowledge_chunk(
+    let _ = verify_operation_knowledge_chunk(
         State(state.clone()),
         Extension(admin.clone()),
         Path(chunk_id.to_string()),
         Json(verify_req),
     )
     .await
-    {
-        Ok(_) => Some(fields_touched),
-        Err(err) => {
-            eprintln!("[RECALL-MAINT] update verify failed: {err}");
-            None
-        }
-    }
+    .map_err(|error| format!("update verify failed: {error}"))?;
+    Ok(fields_touched)
 }
 
 /// Step 3 — 主测：真实 agent chat 改库全链路后召回保持
@@ -1544,18 +1531,20 @@ async fn recall_benchmark_maintenance_stability() {
     );
 
     // 变更A·新增：补一条缺知识
-    let create_content = "帮我新建一条知识切片：我们的高级版支持API集成对接，可以与客户现有CRM系统无缝连接。知识类型是产品能力，请起草标题、摘要和正文。";
+    let create_content = "帮我新建一条独立知识切片，不挂到任何 pack。以下内容均由运营核实，\
+        可直接作为事实原文：‘高级版支持 API 集成对接，可以与客户现有 CRM 系统连接。’\
+        标题写‘高级版 API 与 CRM 集成’，知识类型是产品能力，业务上下文是企业客户系统集成咨询；\
+        摘要和正文都准确保留上述事实。适用场景是客户咨询高级版 API 或 CRM 对接；\
+        不适用场景是客户咨询基础版价格。可安全表述‘高级版支持 API 集成’和‘可与现有 CRM 系统连接’；\
+        禁止表述‘无需客户提供接口资料’。证据项和 sourceQuote 都原样使用引号中的事实原文；\
+        产品标签是高级版、API、CRM，业务主题是系统集成、接口对接；\
+        routingCard 写客户咨询高级版 API 或 CRM 对接时打开。以上信息已完整，其他细节不属于本切片范围，\
+        不应列为缺失字段；请返回非空 patch、空 missingFields，并起草可供运营确认的 proposal。";
 
-    let created_chunk_id = match chat_create_and_verify(&state, ws, &admin, create_content).await {
-        Some(id) => {
-            eprintln!("[RECALL-MAINT] 变更A新增成功，chunk_id={}", id);
-            id
-        }
-        None => {
-            eprintln!("[RECALL-MAINT] 变更A新增失败，跳过后续测试");
-            return;
-        }
-    };
+    let created_chunk_id = chat_create_and_verify(&state, ws, &admin, create_content)
+        .await
+        .expect("变更A必须走通 create→apply→verify，不得静默跳过");
+    eprintln!("[RECALL-MAINT] 变更A新增成功，chunk_id={created_chunk_id}");
 
     // 重新查 DB 取全集（包含新增的）
     let all_ids_r1 = get_all_chunk_ids().await;
@@ -1605,17 +1594,10 @@ async fn recall_benchmark_maintenance_stability() {
 
     // 变更B·改写：chat_turn 发"更新/补充某切片同义表述"
     let update_content = "请更新我附上的知识切片：保留原事实，并在摘要和产品标签中补充同义表达：企业级解决方案、商业版本、专业版服务。";
-    let fields_touched =
-        match chat_update_and_verify(&state, &admin, &created_chunk_id, update_content).await {
-            Some(count) => {
-                eprintln!("[RECALL-MAINT] 变更B真实改写成功，fields_touched={count}");
-                count
-            }
-            None => {
-                evidence.inconclusive("real update_chunk branch did not apply and verify");
-                return;
-            }
-        };
+    let fields_touched = chat_update_and_verify(&state, &admin, &created_chunk_id, update_content)
+        .await
+        .expect("变更B必须走通 update→apply→verify，不得静默跳过");
+    eprintln!("[RECALL-MAINT] 变更B真实改写成功，fields_touched={fields_touched}");
 
     let all_ids_r2 = get_all_chunk_ids().await;
     let (r2, ok2, calls2) = recall_all(&state, ws, &cases).await;
@@ -2013,21 +1995,22 @@ async fn recall_benchmark_gap_closed_loop_trajectory() {
         current_workspace: ws.to_string(),
     };
     let create_content = format!(
-        "帮我新建一条知识切片回应这个反复被问到的缺口：{gap_query} \
-         事实依据：我们支持美元(USD)、欧元(EUR)、港币(HKD)三种海外货币结算，\
-         跨境结算手续费为交易金额的 1.5%。知识类型是产品政策，请起草标题、摘要和正文。"
+        "帮我新建一条独立知识切片回应这个反复被问到的缺口：{gap_query}，不挂到任何 pack。\
+         以下内容均由运营核实，可直接作为事实原文：\
+         ‘海外结算支持美元(USD)、欧元(EUR)、港币(HKD)；跨境结算手续费固定为交易金额的 1.5%，\
+         不另设最低或最高手续费；币种换算按结算发起时支付通道展示的实时汇率执行。’\
+         标题写‘海外结算币种与手续费’，知识类型是产品政策，业务上下文是客户咨询跨境支付结算；\
+         摘要和正文都准确保留上述事实。适用场景是客户询问支持币种、手续费或换算汇率；\
+         不适用场景是客户询问境内支付价格。可安全表述上述三种币种、1.5% 固定费率和实时汇率口径；\
+         禁止表述‘支持所有币种’或‘跨境结算免手续费’。证据项和 sourceQuote 都原样使用引号中的事实原文；\
+         产品标签是跨境结算、海外支付，业务主题是支持币种、手续费、汇率；\
+         routingCard 写客户咨询海外结算币种、费率或汇率时打开。以上政策边界已完整，其他细节不属于本切片范围，\
+         不应列为缺失字段；请返回非空 patch、空 missingFields，并起草可供运营确认的 proposal。"
     );
-    let created_chunk_id = match chat_create_and_verify(&state, ws, &admin, &create_content).await {
-        Some(id) => {
-            eprintln!("[RECALL-CLOSED] ④ 对话补库成功 created_chunk_id={}", id);
-            id
-        }
-        None => {
-            eprintln!("[RECALL-CLOSED] 跳过：对话补库未命中 create 意图 / 未落库");
-            evidence.inconclusive("chat create/apply/verify did not produce a chunk");
-            return;
-        }
-    };
+    let created_chunk_id = chat_create_and_verify(&state, ws, &admin, &create_content)
+        .await
+        .expect("缺口闭环必须走通 create→apply→verify，不得静默跳过");
+    eprintln!("[RECALL-CLOSED] ④ 对话补库成功 created_chunk_id={created_chunk_id}");
 
     // 红线：补库产物必须真实存在于本 ws，且经显式 verify 后达到"可召回"双维状态
     //（chat_apply 落 draft+needs_review，verify 是人工审定动作；AI 永不自动 verify）。

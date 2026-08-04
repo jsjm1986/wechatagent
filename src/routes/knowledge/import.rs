@@ -198,6 +198,105 @@ const IMPORT_SEGMENT_TARGET_CHARS: usize = 3000;
 const IMPORT_SEGMENT_HARD_MAX_CHARS: usize = 5000;
 /// 每段抽取并发度：匹配生产端点真实 ~2 线程，避免 tool_use 争用。
 const IMPORT_EXTRACT_CONCURRENCY: usize = 2;
+const IMPORT_CONTENT_CONTRACT_MAX_ATTEMPTS: usize = 3;
+
+fn import_extraction_has_content_or_reason(value: &Value) -> bool {
+    let has_content = ["items", "chunks"].iter().any(|key| {
+        value
+            .get(*key)
+            .and_then(Value::as_array)
+            .is_some_and(|items| !items.is_empty())
+    });
+    let has_reason = value
+        .get("noKnowledgeReason")
+        .or_else(|| value.get("no_knowledge_reason"))
+        .and_then(Value::as_str)
+        .is_some_and(|reason| !reason.trim().is_empty());
+    has_content || has_reason
+}
+
+fn import_user_prompt_for_attempt(
+    base: &str,
+    source_name: &str,
+    content: &str,
+    attempt: usize,
+) -> String {
+    if attempt == 0 {
+        return base.to_string();
+    }
+    let retry_instruction = if attempt == 1 {
+        "原文含有产品、退款、SLA、实施或对接等运营事实时，chunks 必须至少包含一项。每个 chunk 只整理原文明确陈述的事实。"
+    } else {
+        "请按原文标题拆分；至少返回一个 chunk。若无法细分，可将一段完整原文作为一个 draft chunk，禁止只返回 document。"
+    };
+    format!(
+        r#"这是第 {attempt} 次内容合约修复。上一次响应只有文档元数据，没有任何可复查知识。
+只输出严格 JSON 对象，使用以下最小结构：
+{{
+  "document": {{"title": "来源标题"}},
+  "items": [],
+  "chunks": [
+    {{
+      "title": "原文中的知识主题",
+      "summary": "忠于原文的简短摘要",
+      "body": "可独立复查的原文事实及其限定条件",
+      "sourceQuote": "支撑该事实的原文短句",
+      "wikiType": "finding",
+      "chunkType": "product_fact",
+      "status": "draft"
+    }}
+  ],
+  "noKnowledgeReason": null
+}}
+{retry_instruction}
+只有原文确实完全不含可提取的运营知识时，才允许 items/chunks 同时为空；此时 noKnowledgeReason 必须是非空字符串。
+
+来源名称：{source_name}
+原文：
+{content}"#
+    )
+}
+
+async fn generate_import_segment(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: Option<&str>,
+    system: &str,
+    base_user_prompt: &str,
+    source_name: &str,
+    content: &str,
+) -> AppResult<Value> {
+    let mut last_contract_error = None;
+    for attempt in 0..IMPORT_CONTENT_CONTRACT_MAX_ATTEMPTS {
+        let user = import_user_prompt_for_attempt(base_user_prompt, source_name, content, attempt);
+        let value = agent::generate_agent_json(
+            state,
+            workspace_id,
+            account_id,
+            None,
+            None,
+            "knowledge.import.preview",
+            system,
+            &user,
+        )
+        .await?;
+        if import_extraction_has_content_or_reason(&value) {
+            return Ok(value);
+        }
+        last_contract_error = Some(AppError::External(
+            "knowledge import response omitted items/chunks and noKnowledgeReason".to_string(),
+        ));
+        if attempt + 1 < IMPORT_CONTENT_CONTRACT_MAX_ATTEMPTS {
+            tracing::warn!(
+                attempt = attempt + 1,
+                "knowledge import response omitted reviewable content; retrying contract"
+            );
+        }
+    }
+    Err(last_contract_error.unwrap_or_else(|| {
+        AppError::External("knowledge import content contract failed".to_string())
+    }))
+}
 
 /// 把长文档确定性切分为多段，每段随后独立调 LLM 抽取（输出小、不截断）。
 ///
@@ -276,6 +375,17 @@ fn split_oversized_by_paragraph(block: &str) -> Vec<String> {
         return vec![block.to_string()];
     }
     windows
+}
+
+fn all_import_segments_failed_error(
+    total_segments: usize,
+    first_error: Option<AppError>,
+) -> AppError {
+    first_error.unwrap_or_else(|| {
+        AppError::External(format!(
+            "import preview: all {total_segments} segment extractions failed"
+        ))
+    })
 }
 
 /// 合并多段 LLM 抽取出的 document 原始值（标量取首个非空；数组字段取并集去重）。
@@ -569,15 +679,14 @@ async fn run_import_extraction_controlled(
                     let user = LONG_IMPORT_PROMPT_TEMPLATE
                         .replace("{SOURCE_NAME}", &source_name)
                         .replace("{CONTENT}", &segment);
-                    let result = agent::generate_agent_json(
+                    let result = generate_import_segment(
                         state,
                         &workspace_id,
                         account_id.as_deref(),
-                        None,
-                        None,
-                        "knowledge.import.preview",
                         system,
                         &user,
+                        &source_name,
+                        &segment,
                     )
                     .await;
                     if result.is_ok() {
@@ -610,6 +719,7 @@ async fn run_import_extraction_controlled(
     let mut values: Vec<Value> = Vec::new();
     let mut succeeded = 0usize;
     let mut failed = 0usize;
+    let mut first_error: Option<AppError> = None;
     for (idx, result) in ordered {
         match result {
             Ok(value) => {
@@ -624,13 +734,17 @@ async fn run_import_extraction_controlled(
                     error = %err,
                     "import preview: segment extraction failed (skipped)"
                 );
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
             }
         }
     }
     if values.is_empty() {
-        return Err(AppError::External(format!(
-            "import preview: 全部 {total_segments} 段抽取均失败"
-        )));
+        return Err(all_import_segments_failed_error(
+            total_segments,
+            first_error,
+        ));
     }
 
     // 合并 document（确定性，不额外调 LLM）。
@@ -655,6 +769,19 @@ async fn run_import_extraction_controlled(
         .flatten()
         .map(|item| normalize_operation_knowledge_preview_chunk(item, &payload))
         .collect::<Vec<_>>();
+    let no_knowledge_reason = if items.is_empty() && chunks.is_empty() {
+        values.iter().find_map(|value| {
+            value
+                .get("noKnowledgeReason")
+                .or_else(|| value.get("no_knowledge_reason"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|reason| !reason.is_empty())
+                .map(ToString::to_string)
+        })
+    } else {
+        None
+    };
 
     // D2 锚定：仍对完整原文跑一次，每 chunk 的 sourceQuote 在全文锚定（红线不动）。
     let integrity_report = integrity_report_for_preview(&payload.content, &mut chunks);
@@ -662,6 +789,7 @@ async fn run_import_extraction_controlled(
         "document": document,
         "items": items,
         "chunks": chunks,
+        "noKnowledgeReason": no_knowledge_reason,
         "integrityReport": integrity_report,
         "importReport": {
             "totalSegments": total_segments,
@@ -1339,6 +1467,17 @@ fn require_non_empty_vision_text(value: Value, field: &str) -> AppResult<Value> 
     }
 }
 
+const VISION_REQUIRED_FIELD_MAX_ATTEMPTS: usize = 3;
+
+fn vision_user_prompt_for_attempt(base: &str, field: &str, attempt: usize) -> String {
+    if attempt == 0 {
+        return base.to_string();
+    }
+    format!(
+        "{base}\n\n上一次响应缺少必需字段。请严格返回一个 JSON 对象，其中 `{field}` 必须是非空字符串；不要改用其它字段名，也不要返回解释文字。"
+    )
+}
+
 /// 解析本 workspace 的视觉模型 provider（供知识库导入与运营 Agent 入站图片理解
 /// 复用，避免两处各写一套选择逻辑）：
 /// a. active 文字主模型本身 supports_vision → 固定当前 workspace registry snapshot；
@@ -1438,80 +1577,136 @@ pub(crate) async fn vision_generate_json(
 ) -> AppResult<Value> {
     match provider {
         VisionProvider::Runtime(snapshot) => {
-            let generated = match snapshot {
-                Some(snapshot) => {
-                    snapshot
-                        .generate_json_with_image(system_prompt, user_prompt, image_base64, mime)
-                        .await
+            let mut last_contract_error = None;
+            for attempt in 0..VISION_REQUIRED_FIELD_MAX_ATTEMPTS {
+                let attempt_prompt =
+                    vision_user_prompt_for_attempt(user_prompt, required_text_field, attempt);
+                let generated = match snapshot {
+                    Some(snapshot) => {
+                        snapshot
+                            .generate_json_with_image(
+                                system_prompt,
+                                &attempt_prompt,
+                                image_base64,
+                                mime,
+                            )
+                            .await
+                    }
+                    None => {
+                        state
+                            .llm
+                            .generate_json_with_image(
+                                system_prompt,
+                                &attempt_prompt,
+                                image_base64,
+                                mime,
+                            )
+                            .await
+                    }
+                };
+                let value = generated.map_err(|e| match e {
+                    // 瞬时不可达（429/限流/配额耗尽/网关超时）原样透传结构化变体，
+                    // 让上游（测试 skip 宏、网关回退逻辑）按瞬时态处理而非当成内容失败。
+                    AppError::LlmUnavailable { .. } => e,
+                    other => AppError::External(format!("LLM vision 抽取失败: {other}")),
+                })?;
+                match require_non_empty_vision_text(value, required_text_field) {
+                    Ok(value) => return Ok(value),
+                    Err(error) => {
+                        last_contract_error = Some(error);
+                        if attempt + 1 < VISION_REQUIRED_FIELD_MAX_ATTEMPTS {
+                            tracing::warn!(
+                                field = required_text_field,
+                                attempt = attempt + 1,
+                                "runtime vision model omitted required content; retrying contract"
+                            );
+                        }
+                    }
                 }
-                None => {
-                    state
-                        .llm
-                        .generate_json_with_image(system_prompt, user_prompt, image_base64, mime)
-                        .await
-                }
-            };
-            let value = generated.map_err(|e| match e {
-                // 瞬时不可达（429/限流/配额耗尽/网关超时）原样透传结构化变体，
-                // 让上游（测试 skip 宏、网关回退逻辑）按瞬时态处理而非当成内容失败。
-                AppError::LlmUnavailable { .. } => e,
-                other => AppError::External(format!("LLM vision 抽取失败: {other}")),
-            })?;
-            require_non_empty_vision_text(value, required_text_field)
+            }
+            Err(last_contract_error.unwrap_or_else(|| {
+                AppError::External("LLM vision response contract failed".to_string())
+            }))
         }
         VisionProvider::Dedicated(candidates) => {
             let mut last_failure: Option<AppError> = None;
             let mut result: Option<AppResult<Value>> = None;
             for (idx, (model, client)) in candidates.iter().enumerate() {
-                match client
-                    .generate_json_with_image(system_prompt, user_prompt, image_base64, mime)
-                    .await
-                {
-                    Ok(v) => match require_non_empty_vision_text(v, required_text_field) {
-                        Ok(v) => {
-                            result = Some(Ok(v));
-                            break;
-                        }
-                        Err(error) => {
+                let mut candidate_contract_failed = false;
+                for attempt in 0..VISION_REQUIRED_FIELD_MAX_ATTEMPTS {
+                    let attempt_prompt =
+                        vision_user_prompt_for_attempt(user_prompt, required_text_field, attempt);
+                    match client
+                        .generate_json_with_image(
+                            system_prompt,
+                            &attempt_prompt,
+                            image_base64,
+                            mime,
+                        )
+                        .await
+                    {
+                        Ok(v) => match require_non_empty_vision_text(v, required_text_field) {
+                            Ok(v) => {
+                                result = Some(Ok(v));
+                                break;
+                            }
+                            Err(error) => {
+                                last_failure = Some(error);
+                                if attempt + 1 < VISION_REQUIRED_FIELD_MAX_ATTEMPTS {
+                                    tracing::warn!(
+                                        model = %model,
+                                        field = required_text_field,
+                                        attempt = attempt + 1,
+                                        "vision model omitted required content; retrying contract"
+                                    );
+                                } else {
+                                    candidate_contract_failed = true;
+                                }
+                            }
+                        },
+                        Err(e @ AppError::LlmUnavailable { .. }) => {
                             if idx + 1 < candidates.len() {
                                 tracing::warn!(
                                     model = %model,
                                     next = %candidates[idx + 1].0,
-                                    field = required_text_field,
-                                    "vision model returned empty required content; trying backup"
+                                    error = %e,
+                                    "视觉模型瞬时不可达，自动切换到下一备用模型"
                                 );
                             } else {
                                 tracing::warn!(
                                     model = %model,
-                                    field = required_text_field,
-                                    "vision model returned empty required content; no backup remains"
+                                    error = %e,
+                                    "视觉模型瞬时不可达，已无更多备用模型可切换"
                                 );
                             }
-                            last_failure = Some(error);
+                            last_failure = Some(e);
+                            break;
                         }
-                    },
-                    Err(e @ AppError::LlmUnavailable { .. }) => {
-                        if idx + 1 < candidates.len() {
-                            tracing::warn!(
-                                model = %model,
-                                next = %candidates[idx + 1].0,
-                                error = %e,
-                                "视觉模型瞬时不可达，自动切换到下一备用模型"
-                            );
-                        } else {
-                            tracing::warn!(
-                                model = %model,
-                                error = %e,
-                                "视觉模型瞬时不可达，已无更多备用模型可切换"
-                            );
+                        Err(other) => {
+                            result = Some(Err(AppError::External(format!(
+                                "LLM vision 抽取失败: {other}"
+                            ))));
+                            break;
                         }
-                        last_failure = Some(e);
                     }
-                    Err(other) => {
-                        result = Some(Err(AppError::External(format!(
-                            "LLM vision 抽取失败: {other}"
-                        ))));
-                        break;
+                }
+                if result.is_some() {
+                    break;
+                }
+                if candidate_contract_failed {
+                    if idx + 1 < candidates.len() {
+                        tracing::warn!(
+                            model = %model,
+                            next = %candidates[idx + 1].0,
+                            field = required_text_field,
+                            "vision model exhausted required-content retries; trying backup"
+                        );
+                    } else {
+                        tracing::warn!(
+                            model = %model,
+                            field = required_text_field,
+                            "vision model exhausted required-content retries; no backup remains"
+                        );
                     }
                 }
             }
@@ -2073,6 +2268,74 @@ mod tests {
     use super::*;
 
     #[test]
+    fn import_content_contract_requires_content_or_explicit_reason() {
+        assert!(import_extraction_has_content_or_reason(&json!({
+            "items": [{"title": "item"}],
+            "chunks": []
+        })));
+        assert!(import_extraction_has_content_or_reason(&json!({
+            "items": [],
+            "chunks": [{"title": "chunk"}]
+        })));
+        assert!(import_extraction_has_content_or_reason(&json!({
+            "items": [],
+            "chunks": [],
+            "noKnowledgeReason": "source contains no operational knowledge"
+        })));
+        assert!(!import_extraction_has_content_or_reason(&json!({
+            "document": {"title": "title only"},
+            "items": [],
+            "chunks": []
+        })));
+        assert!(!import_extraction_has_content_or_reason(&json!({
+            "items": [],
+            "chunks": [],
+            "no_knowledge_reason": "   "
+        })));
+    }
+
+    #[test]
+    fn import_contract_retry_prompt_names_required_outputs() {
+        assert_eq!(
+            import_user_prompt_for_attempt("base", "source", "content", 0),
+            "base"
+        );
+        let retry = import_user_prompt_for_attempt("base", "source", "content", 1);
+        assert!(retry.contains("\"items\""));
+        assert!(retry.contains("\"chunks\""));
+        assert!(retry.contains("\"noKnowledgeReason\""));
+        assert!(retry.contains("content"));
+        assert!(retry.contains("第 1 次"));
+        assert!(!retry.contains("base"));
+
+        let final_retry = import_user_prompt_for_attempt("base", "source", "content", 2);
+        assert!(final_retry.contains("按原文标题拆分"));
+        assert!(final_retry.contains("第 2 次"));
+        assert_ne!(retry, final_retry);
+    }
+
+    #[test]
+    fn all_failed_import_segments_preserve_structured_llm_error() {
+        let error = all_import_segments_failed_error(
+            2,
+            Some(AppError::LlmUnavailable {
+                kind: "model_routing_unavailable".to_string(),
+                retry_count: 9,
+                detail: "no route".to_string(),
+                hint: "retry".to_string(),
+            }),
+        );
+        assert!(matches!(
+            error,
+            AppError::LlmUnavailable {
+                kind,
+                retry_count: 9,
+                ..
+            } if kind == "model_routing_unavailable"
+        ));
+    }
+
+    #[test]
     fn shared_ingest_identity_is_stable_and_scope_sensitive() {
         let first = ingest_identity_hash("ws-a", Some("account-a"), "source", "body")
             .expect("first identity");
@@ -2142,6 +2405,14 @@ mod tests {
             "description"
         )
         .is_ok());
+    }
+
+    #[test]
+    fn vision_contract_retry_prompt_names_the_required_field() {
+        assert_eq!(vision_user_prompt_for_attempt("base", "fence", 0), "base");
+        let retry = vision_user_prompt_for_attempt("base", "fence", 1);
+        assert!(retry.contains("`fence`"));
+        assert!(retry.contains("非空字符串"));
     }
 
     #[test]

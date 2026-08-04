@@ -285,7 +285,7 @@ pub async fn chat_turn(
         .and_then(|v| v.as_str())
         .unwrap_or("（AI 未给出回复）")
         .to_string();
-    let patch = result.get("patch").cloned();
+    let patch = usable_chat_patch(&result);
     let missing_fields: Vec<String> = result
         .get("missingFields")
         .and_then(|v| v.as_array())
@@ -1328,6 +1328,115 @@ fn synthesize_natural_reply_from_patch(out: &Value) -> Option<String> {
     Some(reply)
 }
 
+const CHAT_DRAFT_CONTRACT_MAX_REPAIRS: usize = 2;
+
+fn chat_draft_requires_contract_repair(value: &Value) -> bool {
+    let has_usable_patch = usable_chat_patch(value).is_some();
+    let has_declared_missing_fields = value
+        .get("missingFields")
+        .and_then(Value::as_array)
+        .is_some_and(|fields| !fields.is_empty());
+    !has_usable_patch && !has_declared_missing_fields
+}
+
+fn usable_chat_patch(value: &Value) -> Option<Value> {
+    value
+        .get("patch")
+        .filter(|patch| patch.as_object().is_some_and(|object| !object.is_empty()))
+        .cloned()
+}
+
+fn chat_draft_contract_repair_prompt(
+    user_content: &str,
+    previous: &Value,
+    attempt: usize,
+) -> String {
+    let previous = serde_json::to_string(previous).unwrap_or_default();
+    format!(
+        r#"Draft contract repair attempt {attempt}.
+The previous final response declared no missing fields but omitted a usable `patch` object.
+Return one strict JSON object with `decisionPhase="final"`.
+
+If the operator supplied enough facts, return:
+{{
+  "decisionPhase": "final",
+  "patch": {{
+    "title": "non-empty title",
+    "summary": "non-empty summary",
+    "body": "non-empty factual body"
+  }},
+  "missingFields": [],
+  "followupQuestions": [],
+  "naturalReply": "non-empty operator-facing summary"
+}}
+
+If facts are genuinely insufficient, omit `patch`, put every missing field in a non-empty
+`missingFields` array, and ask matching questions. Never return both no patch and an empty
+`missingFields` array. Do not call tools.
+
+Original operator request:
+{user_content}
+
+Previous invalid response:
+{}"#,
+        truncate_for_prompt(&previous, 4000)
+    )
+}
+
+fn mark_chat_draft_contract_incomplete(mut value: Value) -> Value {
+    if !value.is_object() {
+        value = json!({});
+    }
+    value["missingFields"] = json!(["patch"]);
+    value["followupQuestions"] = json!([{
+        "id": "q_patch",
+        "field": "patch",
+        "question": "The draft response was incomplete. Please ask me to draft it again."
+    }]);
+    let reply_blank = value
+        .get("naturalReply")
+        .and_then(Value::as_str)
+        .is_none_or(|reply| reply.trim().is_empty());
+    if reply_blank {
+        value["naturalReply"] =
+            json!("The draft response was incomplete and cannot be applied. Please try again.");
+    }
+    value
+}
+
+fn chat_update_contract_repair_prompt(
+    user_content: &str,
+    current_chunk: &str,
+    previous: &Value,
+    attempt: usize,
+) -> String {
+    let previous = serde_json::to_string(previous).unwrap_or_default();
+    format!(
+        r#"Update contract repair attempt {attempt}.
+The previous final response declared no missing fields but omitted a usable `patch` object.
+Return one strict JSON object with `decisionPhase="final"`.
+
+If the operator supplied enough facts, return a non-empty `patch` containing only the fields
+the operator explicitly requested to change. Preserve all other fields by omitting them. Do not
+invent facts or rewrite fields that were not requested. Also return empty `missingFields` and
+`followupQuestions` arrays, plus a non-empty `naturalReply`.
+
+If the requested update is genuinely unsupported by the operator request or current chunk,
+omit `patch`, put every missing field in a non-empty `missingFields` array, and ask matching
+questions. Never return both no patch and an empty `missingFields` array. Do not call tools.
+
+Original operator request:
+{user_content}
+
+Current chunk snapshot:
+{current_chunk}
+
+Previous invalid response:
+{}"#,
+        truncate_for_prompt(&previous, 4000)
+    )
+}
+
 /// chat_turn 的核心 LLM 编排：先识别 intent，再分流到对应子 prompt。
 /// 返回的 Value 至少包含 intent / naturalReply；可选 patch / missingFields /
 /// followupQuestions / draftKind / targetChunkId / targetPackId / promptKey。
@@ -1583,7 +1692,10 @@ fn render_operator_memory_for_prompt(
 /// - 限制 toolCalls 数量与 final 字段约束。
 ///
 /// 注意：本函数只追加协议提示，不删除/改写原 prompt 内容。
-fn augment_chat_system_with_tools(base: &str) -> String {
+const CHAT_MUTATION_TOOL_LOOP_MAX_LOOPS: i32 = 1;
+const CHAT_CLARIFY_TOOL_LOOP_MAX_LOOPS: i32 = 3;
+
+fn augment_chat_system_with_tools(base: &str, max_loops: i32) -> String {
     let tool_list = agent::ALLOWED_CHAT_TOOL_NAMES.join(" / ");
     format!(
         r#"{base}
@@ -1595,7 +1707,7 @@ fn augment_chat_system_with_tools(base: &str) -> String {
   工具的入参字段名遵循 camelCase（如 chunkId / documentId / itemId / sourceQuote / topK / onlyVerified / hours）。
 - `tool_calling` 中间轮 **不要** 输出 `naturalReply / patch / missingFields / followupQuestions`；这些字段只在 `final` 轮给。
 - 当不再需要更多工具结果、可以给运营回复时，输出 `decisionPhase=final` + 业务字段（naturalReply / patch? / missingFields? / followupQuestions?）；不要再带 toolCalls。
-- 单 turn 最多 4 轮工具循环、6 次 LLM call；超过会被 budget 截断。
+- 本路径最多 {max_loops} 轮工具循环；超过会被截断并转入最终业务合约处理。
 - 每轮工具结果会以 `[system tool result]` 段附加到 user prompt 末尾，下一轮直接读。
 - 不要伪造工具结果；只能使用实际返回的内容。
 "#
@@ -1622,6 +1734,7 @@ async fn run_chat_with_tools(
     session_id: &str,
     run_key: &str,
     prompt_key: &str,
+    max_loops: i32,
     system: String,
     user: String,
 ) -> AppResult<Value> {
@@ -1765,6 +1878,7 @@ async fn run_chat_with_tools(
         budget,
         Some(source_anchor_for_quote_ffi as agent::AnchorMatchFn),
         reply_fn,
+        max_loops,
     )
     .await;
     let final_value = match outcome {
@@ -2104,18 +2218,52 @@ async fn draft_chunk_for_chat(
         serde_json::to_string_pretty(&pack_payload).unwrap_or_default(),
         render_chat_history_for_prompt(history),
     );
-    let augmented_system = augment_chat_system_with_tools(&system);
-    run_chat_with_tools(
+    let augmented_system =
+        augment_chat_system_with_tools(&system, CHAT_MUTATION_TOOL_LOOP_MAX_LOOPS);
+    let mut result = run_chat_with_tools(
         state,
         workspace_id,
         account_id,
         session_id,
         "draft",
         "knowledge.chat.draft_chunk",
+        CHAT_MUTATION_TOOL_LOOP_MAX_LOOPS,
         augmented_system,
         user,
     )
-    .await
+    .await?;
+
+    for attempt in 1..=CHAT_DRAFT_CONTRACT_MAX_REPAIRS {
+        if !chat_draft_requires_contract_repair(&result) {
+            break;
+        }
+        let Some(budget) = agent::current_run_budget() else {
+            break;
+        };
+        let snapshot = budget.snapshot();
+        if budget.is_exceeded() || snapshot.llm_calls_used >= snapshot.max_llm_calls {
+            budget.mark_degraded("knowledge_chat_draft_contract_repair_budget_exhausted");
+            break;
+        }
+        let repair_user = chat_draft_contract_repair_prompt(user_content, &result, attempt);
+        let run_id = format!("chat-{session_id}-draft-contract-{attempt}");
+        result = agent::generate_agent_json(
+            state,
+            workspace_id,
+            Some(account_id),
+            None,
+            Some(&run_id),
+            "knowledge.chat.draft_chunk",
+            &system,
+            &repair_user,
+        )
+        .await?;
+    }
+
+    if chat_draft_requires_contract_repair(&result) {
+        result = mark_chat_draft_contract_incomplete(result);
+    }
+    Ok(result)
 }
 
 async fn update_chunk_for_chat(
@@ -2150,6 +2298,9 @@ async fn update_chunk_for_chat(
     let frozen_updated_at = chunk.updated_at.try_to_rfc3339_string().map_err(|error| {
         AppError::External(format!("serialize chunk updated_at failed: {error}"))
     })?;
+    let current_chunk =
+        serde_json::to_string_pretty(&operation_knowledge_chunk_json(chunk.clone()))
+            .unwrap_or_default();
     let document_payload = if let Some(document_id) = chunk.document_id {
         state
             .db
@@ -2200,12 +2351,12 @@ async fn update_chunk_for_chat(
 {}
 
 请仅对运营提到的字段做改动；其它字段省略。"#,
-        serde_json::to_string_pretty(&operation_knowledge_chunk_json(chunk.clone()))
-            .unwrap_or_default(),
+        &current_chunk,
         serde_json::to_string_pretty(&document_payload).unwrap_or_default(),
         render_chat_history_for_prompt(history),
     );
-    let augmented_system = augment_chat_system_with_tools(&system);
+    let augmented_system =
+        augment_chat_system_with_tools(&system, CHAT_MUTATION_TOOL_LOOP_MAX_LOOPS);
     let mut result = run_chat_with_tools(
         state,
         workspace_id,
@@ -2213,10 +2364,43 @@ async fn update_chunk_for_chat(
         session_id,
         "update",
         "knowledge.chat.update_chunk",
+        CHAT_MUTATION_TOOL_LOOP_MAX_LOOPS,
         augmented_system,
         user,
     )
     .await?;
+
+    for attempt in 1..=CHAT_DRAFT_CONTRACT_MAX_REPAIRS {
+        if !chat_draft_requires_contract_repair(&result) {
+            break;
+        }
+        let Some(budget) = agent::current_run_budget() else {
+            break;
+        };
+        let snapshot = budget.snapshot();
+        if budget.is_exceeded() || snapshot.llm_calls_used >= snapshot.max_llm_calls {
+            budget.mark_degraded("knowledge_chat_update_contract_repair_budget_exhausted");
+            break;
+        }
+        let repair_user =
+            chat_update_contract_repair_prompt(user_content, &current_chunk, &result, attempt);
+        let run_id = format!("chat-{session_id}-update-contract-{attempt}");
+        result = agent::generate_agent_json(
+            state,
+            workspace_id,
+            Some(account_id),
+            None,
+            Some(&run_id),
+            "knowledge.chat.update_chunk",
+            &system,
+            &repair_user,
+        )
+        .await?;
+    }
+
+    if chat_draft_requires_contract_repair(&result) {
+        result = mark_chat_draft_contract_incomplete(result);
+    }
     result["expectedUpdatedAt"] = json!(frozen_updated_at);
     Ok(result)
 }
@@ -2248,7 +2432,8 @@ async fn clarify_for_chat(
 请按 system 中 schema 输出 JSON。"#,
         render_chat_history_for_prompt(history),
     );
-    let augmented_system = augment_chat_system_with_tools(&system);
+    let augmented_system =
+        augment_chat_system_with_tools(&system, CHAT_CLARIFY_TOOL_LOOP_MAX_LOOPS);
     run_chat_with_tools(
         state,
         workspace_id,
@@ -2256,6 +2441,7 @@ async fn clarify_for_chat(
         session_id,
         "clarify",
         "knowledge.chat.clarify",
+        CHAT_CLARIFY_TOOL_LOOP_MAX_LOOPS,
         augmented_system,
         user,
     )
@@ -3393,6 +3579,103 @@ pub(in crate::routes) async fn chat_session_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_draft_contract_repair_only_targets_contradictory_empty_proposals() {
+        assert!(chat_draft_requires_contract_repair(&json!({
+            "decisionPhase": "final",
+            "missingFields": []
+        })));
+        assert!(chat_draft_requires_contract_repair(&json!({
+            "patch": null,
+            "missingFields": []
+        })));
+        assert!(chat_draft_requires_contract_repair(&json!({
+            "patch": {},
+            "missingFields": []
+        })));
+        assert!(!chat_draft_requires_contract_repair(&json!({
+            "patch": { "title": "draft" },
+            "missingFields": []
+        })));
+        assert!(!chat_draft_requires_contract_repair(&json!({
+            "missingFields": ["body"]
+        })));
+        assert!(usable_chat_patch(&json!({ "patch": null })).is_none());
+        assert!(usable_chat_patch(&json!({ "patch": {} })).is_none());
+        assert_eq!(
+            usable_chat_patch(&json!({ "patch": { "title": "draft" } })),
+            Some(json!({ "title": "draft" }))
+        );
+    }
+
+    #[test]
+    fn chat_draft_contract_repair_prompts_are_distinct_and_require_a_patch_or_questions() {
+        let previous = json!({ "missingFields": [], "naturalReply": "done" });
+        let first = chat_draft_contract_repair_prompt("operator facts", &previous, 1);
+        let second = chat_draft_contract_repair_prompt("operator facts", &previous, 2);
+        assert_ne!(first, second);
+        for prompt in [&first, &second] {
+            assert!(prompt.contains("operator facts"));
+            assert!(prompt.contains("\"patch\""));
+            assert!(prompt.contains("missingFields"));
+            assert!(prompt.contains("Never return both no patch"));
+        }
+    }
+
+    #[test]
+    fn exhausted_chat_draft_contract_is_explicitly_not_applyable() {
+        let marked = mark_chat_draft_contract_incomplete(json!({
+            "decisionPhase": "final",
+            "missingFields": [],
+            "naturalReply": "incomplete"
+        }));
+        assert_eq!(marked["missingFields"], json!(["patch"]));
+        assert_eq!(marked["followupQuestions"][0]["field"], "patch");
+        assert_eq!(marked["naturalReply"], "incomplete");
+    }
+
+    #[test]
+    fn chat_update_contract_repair_prompts_are_scoped_and_distinct() {
+        let previous = json!({ "missingFields": [], "naturalReply": "done" });
+        let current = r#"{"title":"existing","summary":"old"}"#;
+        let first = chat_update_contract_repair_prompt(
+            "only update summary and productTags",
+            current,
+            &previous,
+            1,
+        );
+        let second = chat_update_contract_repair_prompt(
+            "only update summary and productTags",
+            current,
+            &previous,
+            2,
+        );
+        assert_ne!(first, second);
+        for prompt in [&first, &second] {
+            assert!(prompt.contains("only update summary and productTags"));
+            assert!(prompt.contains(current));
+            assert!(prompt.contains("only the fields"));
+            assert!(prompt.contains("Preserve all other fields by omitting them"));
+            assert!(prompt.contains("Never return both no patch"));
+        }
+    }
+
+    #[test]
+    fn chat_tool_loop_limits_preserve_the_four_call_turn_budget() {
+        assert_eq!(CHAT_MAX_LLM_CALLS_PER_TURN, 4);
+        assert_eq!(CHAT_TOKEN_BUDGET_PER_LLM_CALL, 6_000);
+        assert_eq!(CHAT_TOKEN_BUDGET_PER_TURN, 24_000);
+        assert_eq!(
+            CHAT_TOKEN_BUDGET_PER_TURN,
+            CHAT_TOKEN_BUDGET_PER_LLM_CALL * CHAT_MAX_LLM_CALLS_PER_TURN as i64
+        );
+        assert_eq!(
+            1 + CHAT_MUTATION_TOOL_LOOP_MAX_LOOPS + CHAT_DRAFT_CONTRACT_MAX_REPAIRS as i32,
+            4
+        );
+        assert_eq!(1 + CHAT_CLARIFY_TOOL_LOOP_MAX_LOOPS, 4);
+    }
 
     #[test]
     fn chat_attachment_accepts_frozen_camel_case_contract_only() {
