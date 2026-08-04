@@ -1390,7 +1390,7 @@ pub struct KnowledgeRouteResult {
     /// （喂 prompt 当参考材料）与「可授权证据」（喂 `used_knowledge_ids` → 产品背书硬闸
     /// `compute_verified_chunks`）。回填候选只满足前者：它由静态排序取 top-N 得来，
     /// **无最低相关度门槛**、未经 citation/quote/anchor 校验，与本轮候选回复里的产品
-    /// claim 没有任何绑定关系。`verified` 只证明该 chunk 自身经过人工审核，不证明它与
+    /// claim 没有任何绑定关系。`verified` 只证明该 chunk 自身经过管理员审核，不证明它与
     /// 当前 query 相关。若让它进入 `used_knowledge_ids`，`used ∩ verified` 非空即放行，
     /// 会从结构上架空 `blocked_unverified_product_claim`。
     ///
