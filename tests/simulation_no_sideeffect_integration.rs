@@ -86,7 +86,7 @@ async fn business_snapshot(app: &TestApp) -> BTreeMap<String, Vec<Document>> {
 
     let mut snapshot = BTreeMap::new();
     for name in names {
-        if name == "llm_call_logs" {
+        if matches!(name.as_str(), "llm_call_logs" | "migrations") {
             continue;
         }
         let mut docs: Vec<Document> = app

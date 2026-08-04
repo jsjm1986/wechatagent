@@ -297,7 +297,7 @@ async fn concurrent_chunk_patches_conflict_without_lost_update_or_orphan_revisio
         let ws = ws.clone();
         let barrier = barrier.clone();
         handles.push(tokio::spawn(async move {
-            let summary = format!("contender-{index}");
+            let summary = format!("contender-{index}-summary");
             barrier.wait().await;
             let result = apply_chunk_revision(
                 &db,
