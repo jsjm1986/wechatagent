@@ -2729,12 +2729,28 @@ pub(crate) async fn apply_create_chunk_with_session(
         session,
     )
     .await?;
+    let updated_at = state
+        .db
+        .operation_knowledge_chunks()
+        .find_one_with_session(
+            doc! { "_id": chunk_id, "workspace_id": workspace_id },
+            None,
+            session,
+        )
+        .await?
+        .ok_or_else(|| AppError::Conflict("chat_created_chunk_missing".to_string()))?
+        .updated_at
+        .try_to_rfc3339_string()
+        .map_err(|error| {
+            AppError::External(format!("serialize chunk updated_at failed: {error}"))
+        })?;
     Ok(json!({
         "createdChunkId": chunk_id.to_hex(),
         "revisionId": applied.revision_id,
         "sessionId": session_id,
         "status": "draft",
         "integrityStatus": "needs_review",
+        "updatedAt": updated_at,
     }))
 }
 
@@ -2873,12 +2889,28 @@ pub(crate) async fn apply_update_chunk_with_session(
         session,
     )
     .await?;
+    let updated_at = state
+        .db
+        .operation_knowledge_chunks()
+        .find_one_with_session(
+            doc! { "_id": oid, "workspace_id": workspace_id },
+            None,
+            session,
+        )
+        .await?
+        .ok_or_else(|| AppError::Conflict("chat_updated_chunk_missing".to_string()))?
+        .updated_at
+        .try_to_rfc3339_string()
+        .map_err(|error| {
+            AppError::External(format!("serialize chunk updated_at failed: {error}"))
+        })?;
     Ok(json!({
         "updatedChunkId": chunk_id,
         "revisionId": applied.revision_id,
         "fieldsTouched": fields_touched,
         "status": "draft",
         "integrityStatus": "needs_review",
+        "updatedAt": updated_at,
     }))
 }
 

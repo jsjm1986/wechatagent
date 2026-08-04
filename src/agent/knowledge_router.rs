@@ -603,7 +603,13 @@ async fn route_operation_knowledge_inner(
     // 本阶段只记录 propensity 不消费（为路线图的 IPS/DR 留数据）。
     const FALLBACK_TOP_N: usize = 5;
     let mut fallback_probs: Option<std::collections::HashMap<String, f64>> = None;
-    let (selected_chunk_ids, knowledge_coverage, risk_level) = if cited_in_corpus.is_empty() {
+    // B2：第四元 `navigation_only` 区分「导航候选」与「可授权证据」。fallback 回填的
+    // chunk 只证明「它自身通过过审核」，**不**证明它与本轮 query 或候选回复里的产品
+    // claim 有关（回填无相关度下限：零重叠也会取 top-N）。它可以进 prompt 当弱导航，
+    // 但绝不能充当 `blocked_unverified_product_claim` 的结构化背书证据。
+    let (selected_chunk_ids, knowledge_coverage, risk_level, navigation_only) = if cited_in_corpus
+        .is_empty()
+    {
         // 闭降格漏点：fallback 弱证据回填必须消费与 list_catalog 同一 `rank_key`，
         // 否则 superseded / 过期 chunk 会绕过 trust/recency 降格从这条弱路径泄漏到
         // 选中集。rank_key 把 superseded 乘 0.1、过期乘 0.5 并令 live=false 排底。
@@ -651,21 +657,41 @@ async fn route_operation_knowledge_inner(
                 .collect()
         };
         if fallback_ids.is_empty() {
-            // corpus 也空 — 维持 missing。
-            (Vec::new(), "missing".to_string(), "medium".to_string())
+            // corpus 也空 — 维持 missing。空集不构成任何背书，navigation_only 取 false
+            // （无 id 可授权，标记无意义；保持与既有 missing 语义字节等价）。
+            (
+                Vec::new(),
+                "missing".to_string(),
+                "medium".to_string(),
+                false,
+            )
         } else {
             tool_trace.push(doc! {
                 "tool": "fallback_rank",
                 "reason": "agent_returned_zero_cited",
                 "selected": fallback_ids.len() as i32,
                 "explored": explore,
+                // 审计可见：这批 id 不参与产品背书硬闸。
+                "navigation_only": true,
             });
-            (fallback_ids, "weak".to_string(), "medium".to_string())
+            (fallback_ids, "weak".to_string(), "medium".to_string(), true)
         }
     } else if evidence_excerpts.is_empty() {
-        (cited_in_corpus, "weak".to_string(), "low".to_string())
+        // agent 有 cited 但无 sourceQuote：仍是 agent 自己选的 chunk（过 cite⊆opened
+        // 校验），属真实证据链，可授权。
+        (
+            cited_in_corpus,
+            "weak".to_string(),
+            "low".to_string(),
+            false,
+        )
     } else {
-        (cited_in_corpus, "enough".to_string(), "low".to_string())
+        (
+            cited_in_corpus,
+            "enough".to_string(),
+            "low".to_string(),
+            false,
+        )
     };
     let route = KnowledgeRouteResult {
         needed_categories: Vec::new(),
@@ -680,6 +706,9 @@ async fn route_operation_knowledge_inner(
         reason: answer.answer.clone(),
         tool_trace,
         evidence_excerpts,
+        // B2：本批 selected_chunk_ids 是否只是导航候选（fallback 静态回填）。
+        // true 时 route_used_knowledge_ids 不返回它们，产品背书硬闸拿不到 used id。
+        selected_chunks_are_fallback: navigation_only,
         // S4：召回倾向占位。rank = 选中顺序，score = wiki_type_priority ×
         // dynamic_confidence，pool_size = 已加载候选 chunk 数。
         // P4：探索抽样时 selection_prob 记录每个被选 chunk 的 softmax 概率（propensity）。
@@ -810,7 +839,23 @@ pub(crate) fn empty_knowledge_route(planner: &RunPlannerResult) -> KnowledgeRout
     }
 }
 
+/// 把 route 的选中集折成 `decision.used_knowledge_ids`——即**可用于产品事实背书**
+/// 的知识 id 集合。
+///
+/// B2 红线：`selected_chunks_are_fallback=true`（fallback 静态回填）时
+/// **不返回** chunk id。fallback 只证明"这些 chunk 自身通过过审核"，不证明它们与
+/// 本轮 query 或候选回复里的产品 claim 有关；而下游 `compute_verified_chunks` 只做
+/// `used ∩ verified ∩ 未过期` 的集合交集，不校验相关度、不校验 citation/anchor。
+/// 若把回填 id 当 used，一批与客户问题完全无关的 verified chunk 就能从结构上满足
+/// `blocked_unverified_product_claim` 硬闸——把"导航候选"错当成"授权证据"。
+///
+/// 导航用途（prompt 注入、审计、usage log）继续读 `selected_chunk_ids` 本身，不受影响。
 pub(crate) fn route_used_knowledge_ids(route: &KnowledgeRouteResult) -> Vec<String> {
+    if route.selected_chunks_are_fallback {
+        // 弱回填不构成授权证据。`selected_knowledge_ids` 仍返回：它来自另一条
+        // （非 fallback）选择路径，不受本红线影响。
+        return route.selected_knowledge_ids.clone();
+    }
     route
         .selected_knowledge_ids
         .iter()
@@ -1308,5 +1353,71 @@ mod tests {
             let or = f.get_array("$or").expect("filter 须带 $or 账号子句");
             assert_eq!(or.len(), 2, "$or 应含 null + 本账号两支");
         }
+    }
+
+    /// B2 回归守卫：`fallback_rank` 静态回填的 chunk 是导航候选，**绝不**能成为
+    /// `used_knowledge_ids`。
+    ///
+    /// 为什么必须有这条测试：回填候选由静态排序取 top-N 得来，无最低相关度门槛、
+    /// 未过 citation/quote/anchor 校验，与本轮产品 claim 无绑定关系。而产品背书硬闸
+    /// `compute_verified_chunks` 只求 `used ∩ verified ∩ 未过期`——不校验相关度、
+    /// 不校验 citation。所以一旦回填 ID 进入 `used_knowledge_ids`，一条与客户问题
+    /// 完全无关的 verified chunk 即可从结构上放行 `blocked_unverified_product_claim`。
+    ///
+    /// 此前 `route_used_knowledge_ids` 无条件透传 `selected_chunk_ids`，且
+    /// `gateway.rs` 的改写路径与 Full rewrite 路径绕过了 tier 守卫直接调用它。
+    #[test]
+    fn fallback_navigation_ids_never_become_authorizing_evidence() {
+        let fallback_route = KnowledgeRouteResult {
+            selected_chunk_ids: vec!["c_irrelevant_1".to_string(), "c_irrelevant_2".to_string()],
+            selected_knowledge_ids: vec!["k_legacy".to_string()],
+            knowledge_coverage: "weak".to_string(),
+            selected_chunks_are_fallback: true,
+            ..Default::default()
+        };
+        let used = route_used_knowledge_ids(&fallback_route);
+        assert!(
+            !used.iter().any(|id| id.starts_with("c_irrelevant")),
+            "fallback 回填的 chunk id 绝不能进入 used_knowledge_ids，否则架空产品背书硬闸；got {used:?}"
+        );
+        assert_eq!(
+            used,
+            vec!["k_legacy".to_string()],
+            "非 chunk 来源的 selected_knowledge_ids 不受本闸影响，须原样透传"
+        );
+    }
+
+    /// 对偶：Knowledge Agent 真实 citation（非回填）必须照常成为可授权证据，
+    /// 否则本修复会把合法的产品背书一并掐死（过度拦截）。
+    #[test]
+    fn agent_cited_ids_remain_authorizing_evidence() {
+        let cited_route = KnowledgeRouteResult {
+            selected_chunk_ids: vec!["c_cited_1".to_string()],
+            selected_knowledge_ids: vec!["k1".to_string()],
+            knowledge_coverage: "enough".to_string(),
+            selected_chunks_are_fallback: false,
+            ..Default::default()
+        };
+        let used = route_used_knowledge_ids(&cited_route);
+        assert!(
+            used.contains(&"c_cited_1".to_string()),
+            "agent 真实 cited 的 chunk 必须仍可背书产品声明；got {used:?}"
+        );
+        assert!(used.contains(&"k1".to_string()));
+    }
+
+    /// 缺字段的历史 route 文档（R11 反序列化安全）按「非回填」处理，行为与本改动前一致。
+    #[test]
+    fn legacy_route_without_fallback_flag_defaults_to_authorizing() {
+        let legacy: KnowledgeRouteResult =
+            serde_json::from_str(r#"{"selectedChunkIds":["c_legacy"]}"#).expect("legacy route");
+        assert!(
+            !legacy.selected_chunks_are_fallback,
+            "缺字段必须默认 false（非回填），避免历史数据被静默降级"
+        );
+        assert_eq!(
+            route_used_knowledge_ids(&legacy),
+            vec!["c_legacy".to_string()]
+        );
     }
 }

@@ -849,9 +849,16 @@ function ChunkActionsBar({
           type="button"
           className="wikiBtn wikiActionBtn--verify"
           disabled={writeDisabled || isVerified}
-          onClick={() =>
-            void call("确认放行", "POST", `/api/operation-knowledge/chunks/${id}/verify`, {})
-          }
+          onClick={() => {
+            const expectedUpdatedAt = chunk.updatedAt?.trim();
+            if (!expectedUpdatedAt) {
+              setState({ busy: null, error: "缺少版本信息，请刷新后重试", info: null });
+              return;
+            }
+            void call("确认放行", "POST", `/api/operation-knowledge/chunks/${id}/verify`, {
+              expectedUpdatedAt,
+            });
+          }}
           title="确认这条知识可被 AI 用于回复客户（AI 永不自动调用）"
         >
           <CheckCircle2 size={13} /> 确认放行

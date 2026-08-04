@@ -13,6 +13,7 @@ interface ResolvedDecision {
   substance?: string;
   constraints?: string[];
   authorization_window_hours?: number | null;
+  exemption_type?: string | null;
 }
 interface ResolvedItem {
   shortCode: string;
@@ -26,7 +27,7 @@ interface ResolvedItem {
 }
 
 function formatExpiry(value: string | null | undefined): string {
-  if (!value) return "长期有效";
+  if (!value) return "本次转述不设期限";
   const t = new Date(value);
   if (Number.isNaN(t.getTime())) return value;
   // 本地化到分钟即可，秒级精度对回顾历史无意义。
@@ -104,8 +105,14 @@ export function ResolvedEscalations() {
                   <dd>{it.decision.constraints.join("；")}</dd>
                 </>
               )}
-              <dt>授权到期</dt>
+              <dt>本次转述到期</dt>
               <dd>{formatExpiry(it.authorizationExpiresAt)}</dd>
+              {it.decision?.exemption_type && it.decision.exemption_type !== "none" && (
+                <>
+                  <dt>长期豁免</dt>
+                  <dd>{it.decision.exemption_type === "knowledge" ? "该客户 + 通用知识" : "仅该客户"}</dd>
+                </>
+              )}
               <dt>裁决渠道</dt>
               <dd>{viaLabel}</dd>
             </dl>

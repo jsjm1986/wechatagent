@@ -86,7 +86,7 @@ const SNAKE_CASE_COLLECTIONS: &[&str] = &[
 /// workspaceId(auth/mod.rs:28-39),不符合单值回填契约。
 const CAMEL_CASE_COLLECTIONS: &[&str] = &["llm_provider_configs", "campaigns", "campaign_sends"];
 
-pub(super) async fn run_step(db: &Database) -> AppResult<()> {
+pub async fn run_step(db: &Database) -> AppResult<()> {
     let default_ws = std::env::var("DEFAULT_WORKSPACE_ID").unwrap_or_else(|_| "default".into());
     let raw = db.raw();
 

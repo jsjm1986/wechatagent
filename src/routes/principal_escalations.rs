@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use super::AppState;
 use crate::agent::escalation::{
     list_escalations_by_workspace, materialize_principal_card_delivery, reassign_escalation,
-    resolve_escalation, sanitize_verdict,
+    resolve_escalation,
 };
 use crate::auth::AuthenticatedAdmin;
 use crate::error::{AppError, AppResult};
@@ -63,8 +63,10 @@ fn default_resolve_exemption_type() -> String {
     crate::models::EXEMPTION_TYPE_NONE.to_string()
 }
 
+const MAX_AUTHORIZATION_WINDOW_HOURS: f64 = 24.0 * 365.0;
+
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ResolveBody {
     pub verdict: String,
     #[serde(default)]
@@ -76,6 +78,84 @@ pub struct ResolveBody {
     /// 领导授权豁免类型（none/customer_only/knowledge）；admin 后台裁决由请求体决定，缺省 none。
     #[serde(default = "default_resolve_exemption_type")]
     pub exemption_type: String,
+}
+
+fn validate_admin_decision(body: ResolveBody) -> AppResult<PrincipalDecision> {
+    let verdict = body.verdict.trim().to_string();
+    if !crate::models::ALLOWED_PRINCIPAL_VERDICT.contains(&verdict.as_str()) {
+        return Err(AppError::BadRequest(
+            "verdict must be approved|rejected|conditional|deferred|delegated_back".to_string(),
+        ));
+    }
+    let exemption_type = body.exemption_type.trim().to_string();
+    if !matches!(
+        exemption_type.as_str(),
+        crate::models::EXEMPTION_TYPE_NONE
+            | crate::models::EXEMPTION_TYPE_CUSTOMER_ONLY
+            | crate::models::EXEMPTION_TYPE_KNOWLEDGE
+    ) {
+        return Err(AppError::BadRequest(
+            "exemptionType must be none|customer_only|knowledge".to_string(),
+        ));
+    }
+    let substance = body.substance.trim().to_string();
+    if matches!(
+        verdict.as_str(),
+        crate::models::PRINCIPAL_VERDICT_APPROVED | crate::models::PRINCIPAL_VERDICT_CONDITIONAL
+    ) && substance.is_empty()
+    {
+        return Err(AppError::BadRequest(
+            "approved or conditional decision requires non-empty substance".to_string(),
+        ));
+    }
+    if exemption_type != crate::models::EXEMPTION_TYPE_NONE
+        && !matches!(
+            verdict.as_str(),
+            crate::models::PRINCIPAL_VERDICT_APPROVED
+                | crate::models::PRINCIPAL_VERDICT_CONDITIONAL
+        )
+    {
+        return Err(AppError::BadRequest(
+            "exemptionType requires approved or conditional verdict".to_string(),
+        ));
+    }
+    if body.authorization_window_hours.is_some()
+        && !matches!(
+            verdict.as_str(),
+            crate::models::PRINCIPAL_VERDICT_APPROVED
+                | crate::models::PRINCIPAL_VERDICT_CONDITIONAL
+        )
+    {
+        return Err(AppError::BadRequest(
+            "authorizationWindowHours requires approved or conditional verdict".to_string(),
+        ));
+    }
+    let authorization_window_hours = match body.authorization_window_hours {
+        Some(hours)
+            if hours.is_finite() && hours > 0.0 && hours <= MAX_AUTHORIZATION_WINDOW_HOURS =>
+        {
+            Some(hours)
+        }
+        Some(_) => {
+            return Err(AppError::BadRequest(format!(
+            "authorizationWindowHours must be finite and in (0, {MAX_AUTHORIZATION_WINDOW_HOURS}]"
+        )))
+        }
+        None => None,
+    };
+    let constraints = body
+        .constraints
+        .into_iter()
+        .map(|constraint| constraint.trim().to_string())
+        .filter(|constraint| !constraint.is_empty())
+        .collect();
+    Ok(PrincipalDecision {
+        verdict,
+        substance,
+        constraints,
+        authorization_window_hours,
+        exemption_type,
+    })
 }
 
 /// POST /api/admin/principal-escalations/:short_code/resolve
@@ -93,31 +173,80 @@ pub async fn resolve_principal_escalation(
         // 不在本 workspace pending 列表：可能已 resolved（幂等）或越权 → 幂等成功避免泄漏存在性。
         return Ok(Json(json!({ "ok": true, "alreadyResolved": true })));
     };
-    let decision = sanitize_verdict(PrincipalDecision {
-        verdict: body.verdict,
-        substance: body.substance,
-        constraints: body.constraints,
-        authorization_window_hours: body.authorization_window_hours,
-        exemption_type: body.exemption_type,
-    });
+    let decision = validate_admin_decision(body)?;
     // deferred：领导/admin 暂缓 → 保持 pending 继续等待（与 wechat 路径 mod.rs 一致），不 resolve、不 relay。
     if decision.verdict == crate::models::PRINCIPAL_VERDICT_DEFERRED {
         return Ok(Json(json!({ "ok": true, "deferred": true })));
     }
-    let expires = decision.authorization_window_hours.and_then(|hours| {
-        if hours > 0.0 {
-            Some(DateTime::from_millis(
-                DateTime::now().timestamp_millis() + (hours * 3600.0 * 1000.0) as i64,
-            ))
-        } else {
-            None
-        }
+    // 仅约束本次裁决转述的可用期；customer_only / knowledge 产生的客户豁免
+    // 按专项设计长期常驻，直到管理员显式撤销，二者是独立维度。
+    let expires = decision.authorization_window_hours.map(|hours| {
+        DateTime::from_millis(DateTime::now().timestamp_millis() + (hours * 3600.0 * 1000.0) as i64)
     });
     let resolved = resolve_escalation(&state, &entry, &decision, expires, "admin").await?;
     if resolved.is_none() {
         return Ok(Json(json!({ "ok": true, "alreadyResolved": true })));
     }
     Ok(Json(json!({ "ok": true })))
+}
+
+#[cfg(test)]
+mod resolve_validation_tests {
+    use super::*;
+
+    fn body(verdict: &str) -> ResolveBody {
+        ResolveBody {
+            verdict: verdict.to_string(),
+            substance: "同意按该口径处理".to_string(),
+            constraints: vec![],
+            authorization_window_hours: None,
+            exemption_type: crate::models::EXEMPTION_TYPE_NONE.to_string(),
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_verdict_instead_of_silent_defer() {
+        assert!(validate_admin_decision(body("maybe")).is_err());
+    }
+
+    #[test]
+    fn approved_requires_substance() {
+        let mut value = body(crate::models::PRINCIPAL_VERDICT_APPROVED);
+        value.substance = "  ".to_string();
+        assert!(validate_admin_decision(value).is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_exemption_and_window() {
+        let mut exemption = body(crate::models::PRINCIPAL_VERDICT_APPROVED);
+        exemption.exemption_type = "global_forever".to_string();
+        assert!(validate_admin_decision(exemption).is_err());
+
+        let mut rejected = body(crate::models::PRINCIPAL_VERDICT_REJECTED);
+        rejected.authorization_window_hours = Some(24.0);
+        assert!(validate_admin_decision(rejected).is_err());
+
+        for hours in [
+            0.0,
+            -1.0,
+            f64::INFINITY,
+            MAX_AUTHORIZATION_WINDOW_HOURS + 1.0,
+        ] {
+            let mut value = body(crate::models::PRINCIPAL_VERDICT_CONDITIONAL);
+            value.authorization_window_hours = Some(hours);
+            assert!(validate_admin_decision(value).is_err(), "hours={hours}");
+        }
+    }
+
+    #[test]
+    fn accepts_explicit_long_lived_customer_exemption_with_bounded_relay_window() {
+        let mut value = body(crate::models::PRINCIPAL_VERDICT_CONDITIONAL);
+        value.exemption_type = crate::models::EXEMPTION_TYPE_CUSTOMER_ONLY.to_string();
+        value.authorization_window_hours = Some(24.0);
+        let decision = validate_admin_decision(value).expect("valid decision");
+        assert_eq!(decision.authorization_window_hours, Some(24.0));
+        assert_eq!(decision.exemption_type, "customer_only");
+    }
 }
 
 #[derive(Debug, Deserialize)]

@@ -1353,19 +1353,26 @@ async fn chat_create_and_verify(
     .map_err(|error| format!("chat_apply failed: {error}"))?;
 
     // chat_apply 返回 { ok, sessionId, intent, result: { createdChunkId, ... } }
-    let chunk_id = apply_resp
+    let apply_result = apply_resp
         .0
         .get("result")
-        .and_then(|r| r.get("createdChunkId"))
+        .ok_or_else(|| "chat_apply did not return result".to_string())?;
+    let chunk_id = apply_result
+        .get("createdChunkId")
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
         .ok_or_else(|| "chat_apply did not return createdChunkId".to_string())?;
+    let expected_updated_at = apply_result
+        .get("updatedAt")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "chat_apply did not return updatedAt".to_string())?;
 
     // 调用 verify_operation_knowledge_chunk
     let verify_req: KnowledgeVerifyRequest = serde_json::from_value(json!({
-        "verifiedClaims": null
+        "verifiedClaims": null,
+        "expectedUpdatedAt": expected_updated_at,
     }))
     .expect("构造 KnowledgeVerifyRequest");
 
@@ -1448,8 +1455,13 @@ async fn chat_update_and_verify(
         return Err("update patch touched zero recognized fields".to_string());
     }
 
+    let expected_updated_at = result
+        .get("updatedAt")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "update chat_apply did not return updatedAt".to_string())?;
     let verify_req: KnowledgeVerifyRequest = serde_json::from_value(json!({
-        "verifiedClaims": null
+        "verifiedClaims": null,
+        "expectedUpdatedAt": expected_updated_at,
     }))
     .expect("construct update KnowledgeVerifyRequest");
     let _ = verify_operation_knowledge_chunk(

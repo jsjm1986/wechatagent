@@ -1,6 +1,18 @@
-import { describe, it, expect } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { ChunkReviewCard } from "../../../components/review/ChunkReviewCard";
+import { api } from "../../../lib/api";
+
+vi.mock("../../../lib/api", () => ({
+  api: {
+    get: vi.fn(),
+    post: vi.fn().mockResolvedValue({ ok: true }),
+  },
+}));
+
+beforeEach(() => {
+  vi.mocked(api.post).mockClear();
+});
 
 // verify-gate 红线真值表（ChunkReviewCard.tsx:96-100）：
 //   canVerify = hasQuote && hasAnchor
@@ -70,6 +82,28 @@ describe("ChunkReviewCard verify-gate 真值表（红线：hasQuote && hasAnchor
       />,
     );
     expect(verifyButton().disabled).toBe(false);
+  });
+
+
+  it("verify 提交管理员所见版本令牌", async () => {
+    render(
+      <ChunkReviewCard
+        chunkId="c8"
+        chunk={{
+          title: "t",
+          sourceQuote: "依据原文",
+          sourceAnchors: [{ start: 0 }],
+          updatedAt: "2026-08-05T01:02:03Z",
+        }}
+      />,
+    );
+    fireEvent.click(verifyButton());
+    await waitFor(() =>
+      expect(api.post).toHaveBeenCalledWith(
+        "/api/operation-knowledge/chunks/c8/verify",
+        { expectedUpdatedAt: "2026-08-05T01:02:03Z" },
+      ),
+    );
   });
 
   it("reject 永远可点（不受 verify-gate 约束）", () => {

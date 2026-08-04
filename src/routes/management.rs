@@ -1433,7 +1433,7 @@ pub(super) fn merge_product_tools(mut tools: Value) -> Value {
         }),
         json!({
             "name": "wechatagent.resolve_principal_escalation",
-            "description": "对指定 AI 决策请示条目登记结构化裁决（跳过 LLM 解读直走转述）。参数：shortCode（请示短码），verdict，可选 substance、constraints、authorizationWindowHours。"
+            "description": "对指定 AI 决策请示条目登记结构化裁决（跳过 LLM 解读直走转述）。参数：shortCode（请示短码），verdict；approved/conditional 必填 substance；可选 constraints、authorizationWindowHours（仅本次转述有效期，0-8760 小时）、exemptionType（none|customer_only|knowledge，客户豁免长期有效直至显式撤销）。"
         }),
         // ── 批 2：运行时调参（update_operation_domain=low；update_ask_human_policy=dangerous 立即改全量在跑 agent 行为）──
         json!({
@@ -1480,7 +1480,7 @@ pub(super) fn merge_product_tools(mut tools: Value) -> Value {
         // ── 批 3：知识维护类 ──
         json!({
             "name": "wechatagent.verify_knowledge_chunk",
-            "description": "把指定知识切片核验为 verified（写 source=Human，恒需人确认）。参数：chunkId，可选 verifiedClaims（字符串数组）。核验前须有 sourceQuote 且能锚定父文档。"
+            "description": "把指定知识切片核验为 verified（写 source=Human，恒需人确认）。参数：chunkId、expectedUpdatedAt（管理员看到的 RFC3339 版本令牌），可选 verifiedClaims（字符串数组）。核验前须有 sourceQuote 且能锚定父文档。"
         }),
         json!({
             "name": "wechatagent.reject_knowledge_chunk",
@@ -1508,7 +1508,7 @@ pub(super) fn merge_product_tools(mut tools: Value) -> Value {
         }),
         json!({
             "name": "wechatagent.batch_verify_chunks",
-            "description": "批量核验多条知识切片（写 source=Human，恒需人确认）。参数：body（ChunkBatchVerifyRequest：ids 等）。"
+            "description": "批量核验多条知识切片（写 source=Human，恒需人确认）。参数：items（每项含 id、expectedUpdatedAt），可选 note。"
         }),
         json!({
             "name": "wechatagent.apply_gap_signal",
@@ -2796,9 +2796,13 @@ pub(super) async fn execute_management_tool(
             Ok(resp.0)
         }
         "wechatagent.resolve_principal_escalation" => {
-            // Path 是 short_code（请示短码），不是 ObjectId。
+            // shortCode 只用于 Path；严格 DTO 启用 deny_unknown_fields，不能把路由参数混进 body。
             let short_code = string_arg(&planned.arguments, "shortCode")?;
-            let body = serde_json::from_value(planned.arguments.clone())
+            let mut body_value = planned.arguments.clone();
+            if let Some(object) = body_value.as_object_mut() {
+                object.remove("shortCode");
+            }
+            let body = serde_json::from_value(body_value)
                 .map_err(|e| AppError::BadRequest(format!("参数解析失败: {e}")))?;
             let resp = crate::routes::principal_escalations::resolve_principal_escalation(
                 State(state.clone()),
@@ -2950,7 +2954,11 @@ pub(super) async fn execute_management_tool(
         // ── 批 3：知识维护类 ──
         "wechatagent.verify_knowledge_chunk" => {
             let id = string_arg(&planned.arguments, "chunkId")?;
-            let body = serde_json::from_value(planned.arguments.clone())
+            let mut body_value = planned.arguments.clone();
+            if let Some(object) = body_value.as_object_mut() {
+                object.remove("chunkId");
+            }
+            let body = serde_json::from_value(body_value)
                 .map_err(|e| AppError::BadRequest(format!("参数解析失败: {e}")))?;
             let resp = crate::routes::knowledge::verify_operation_knowledge_chunk(
                 State(state.clone()),

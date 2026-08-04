@@ -4461,9 +4461,9 @@ pub struct PrincipalDecision {
     /// 附带约束（如"本周内付款"）。
     #[serde(default)]
     pub constraints: Vec<String>,
-    /// 授权有效时长（小时）。**领导说了算**：领导明确说了期限（"这个价就今天有效"="约 24"、
-    /// "这周内都行"=本周剩余小时数）才填；领导没提期限 → None（= 授权不设过期窗，长期有效）。
-    /// 由 interpret LLM 自判填充；Task 19 据此算 authorization_expires_at。
+    /// 本次裁决转述的有效时长（小时）。领导明确说了期限才填；未提期限则为 None。
+    /// 它只决定 relay 是否仍可使用该次裁决，不控制 customer_only / knowledge 产生的
+    /// 客户级长期豁免；长期豁免由管理员显式撤销。
     #[serde(default)]
     pub authorization_window_hours: Option<f64>,
     /// 领导授权豁免类型（none/customer_only/knowledge）。snake_case 持久化台账；

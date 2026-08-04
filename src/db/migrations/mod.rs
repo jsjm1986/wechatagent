@@ -51,7 +51,9 @@ mod m012_drop_legacy_taxonomy_seed;
 pub(crate) mod m013_seed_user_operation_state_policies;
 mod m014_drop_trigger_keywords;
 mod m015_ops_tables_active_versions;
-mod m016_backfill_workspace_id_on_legacy_rows;
+/// `pub`: workspace isolation integration test inserts a legacy unscoped row after startup
+/// and directly exercises this idempotent step without bypassing the production approval gate.
+pub mod m016_backfill_workspace_id_on_legacy_rows;
 mod m017_dedupe_outcome_aggregation;
 /// `pub`:集成测试需直接调用 `m018::run_step` 对预置顶层残留验证回填语义(详见模块内注释)。
 pub mod m018_backfill_domain_stage_from_legacy_top;

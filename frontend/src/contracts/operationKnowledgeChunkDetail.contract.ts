@@ -1,9 +1,8 @@
-// 契约对账声明 —— chunk 详情端点 get_operation_knowledge_chunk(crud.rs:357) 的线上键集。
-// 详情端点 json!({"item": item}) 裸序列化 model:顶层只有 item 包裹,item 内部是 snake_case +
-// {$oid}/{$date} BSON ExtJSON 包装 —— 与列表投影 operation_knowledge_chunk_json 的 camelCase
-// 形状**冲突**(spec §9 刻意暴露,非缺陷)。本声明只锁顶层 item 包裹键;item 内部裸 struct 形状
-// 由后端快照固定,前端若直接消费详情端点须自行处理 snake_case+ExtJSON(当前前端走列表端点)。
-// 后端改详情端点形状→re-bless fixture→此处对账测红。
+// 契约对账声明 —— chunk 详情端点 get_operation_knowledge_chunk 的顶层线上键集。
+// 详情与列表共用 operation_knowledge_chunk_json：item 内字段统一为 camelCase，
+// ObjectId 为 hex 字符串，updatedAt 为 RFC3339。deep-link 审核因此可直接携带
+// expectedUpdatedAt，不再解析 snake_case/BSON Extended JSON。内部字段由后端 fixture 固定；
+// 本声明只锁顶层 item 包裹键。后端改形状后须 re-bless fixture 并跑契约测试。
 export const CANONICAL_KEYS = ["item"] as const;
 
 export type CanonicalKey = (typeof CANONICAL_KEYS)[number];

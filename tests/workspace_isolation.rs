@@ -179,22 +179,12 @@ async fn legacy_row_without_workspace_id_is_invisible_after_backfill() {
         "backfill 之前 default ws 应看不到 legacy 行（残留无 workspace_id）"
     );
 
-    // 重跑 backfill migration 把该行回填到 default_workspace_id。
-    // migration 框架按 `_id` 跳过已应用项（TestApp::start 已跑过 m016），
-    // 故先抹掉它的入账记录，再 run 一次——这会让 m016 的幂等 backfill 步骤
-    // 真正重新执行（走的是生产 migration 代码路径，而非测试旁路）。
-    app.state
-        .db
-        .migrations()
-        .delete_one(
-            doc! { "_id": "2026_05_X1_001_backfill_workspace_id_on_legacy_rows" },
-            None,
-        )
+    // 直接重跑幂等 backfill step。不要删除 migration marker 后调用完整 runner：
+    // production-like 环境会正确要求 APPROVED_MIGRATIONS，测试不应绕过该审批闸。
+    // 直接调用 step 仍复用生产迁移实现，只隔离验证其幂等回填语义。
+    wechatagent::db::migrations::m016_backfill_workspace_id_on_legacy_rows::run_step(&app.state.db)
         .await
-        .expect("clear m016 record for rerun");
-    wechatagent::db::migrations::run(&app.state.db)
-        .await
-        .expect("rerun migrations idempotent");
+        .expect("rerun workspace backfill step idempotently");
 
     let cnt_after = coll
         .count_documents(doc! { "workspace_id": "default" }, None)

@@ -944,7 +944,9 @@ pub async fn get_operation_knowledge_chunk(
         )
         .await?
         .ok_or_else(|| AppError::NotFound("无此 chunk 或不属于当前 workspace".into()))?;
-    Ok(Json(serde_json::json!({ "item": item })))
+    Ok(Json(serde_json::json!({
+        "item": operation_knowledge_chunk_json(item)
+    })))
 }
 
 pub(in crate::routes) async fn create_operation_knowledge(
@@ -984,11 +986,10 @@ mod contract_tests {
     use crate::models::OperationKnowledgeChunk;
     use mongodb::bson::{oid::ObjectId, DateTime};
 
-    /// 详情端点 `get_operation_knowledge_chunk`(crud.rs:357) 直接 `json!({"item": item})`
-    /// 裸序列化 model——snake_case + `{$oid}`，与列表投影 camelCase **形状冲突**。
-    /// 本快照刻意暴露该冲突(spec §9):快照它,让"统一与否"成为可见的产品决策,而非静默漂移。
+    /// 详情端点与列表共用 `operation_knowledge_chunk_json`，确保 deep-link 审核卡
+    /// 也能获得 RFC3339 `updatedAt` 版本令牌，而不是 BSON Extended JSON。
     #[test]
-    fn chunk_detail_raw_struct_matches_contract_fixture() {
+    fn chunk_detail_projection_matches_contract_fixture() {
         let chunk = OperationKnowledgeChunk {
             id: Some(ObjectId::parse_str("64a1f2c3e4b5a6978899aabb").unwrap()),
             workspace_id: "ws-1".to_string(),
@@ -999,7 +1000,9 @@ mod contract_tests {
             updated_at: DateTime::from_millis(1_700_000_100_000),
             ..Default::default()
         };
-        let projected = serde_json::json!({ "item": chunk });
+        let projected = serde_json::json!({
+            "item": super::super::operation_knowledge_chunk_json(chunk)
+        });
         crate::routes::contract_snapshot::assert_contract_fixture(
             "operation_knowledge_chunk_detail",
             projected,

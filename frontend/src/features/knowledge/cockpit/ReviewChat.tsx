@@ -111,7 +111,12 @@ export function ReviewChat({ chunk, onResolved }: ReviewChatProps) {
 
   const handleGoLive = async () => {
     setGoLiveError(null);
-    const r = await goLive({ sessionId, chunkId: chunk.id, accountId });
+    const expectedUpdatedAt = chunk.updatedAt?.trim();
+    if (!expectedUpdatedAt) {
+      setGoLiveError("这条知识缺少版本信息，请刷新评审列表后重试。");
+      return;
+    }
+    const r = await goLive({ sessionId, chunkId: chunk.id, expectedUpdatedAt, accountId });
     if (r.ok) {
       onResolved();
       return;

@@ -574,7 +574,7 @@ pub(crate) async fn commit_chunk_transaction(session: &mut ClientSession) -> App
     }
 }
 
-fn map_chunk_transaction_error(error: AppError) -> AppError {
+pub(crate) fn map_chunk_transaction_error(error: AppError) -> AppError {
     match error {
         AppError::Db(db_error) if db_error.contains_label("TransientTransactionError") => {
             AppError::Conflict("chunk_revision_conflict".to_string())
