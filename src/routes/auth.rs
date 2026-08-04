@@ -1,7 +1,7 @@
 //! P0 鉴权 admin REST：login / logout / me / switch_workspace。
 //!
 //! - `POST /api/auth/login` 接 username + password JSON，验密码 → 写
-//!   `admin_sessions` → Set-Cookie `wa_session=<session_id>; HttpOnly; SameSite=Strict
+//!   `admin_sessions` 保存 token 摘要 → Set-Cookie `wa_session=<raw_token>; HttpOnly; SameSite=Strict
 //!   [; Secure]; Path=/; Max-Age=...`。
 //! - `POST /api/auth/logout` 删 session 行 + 清 cookie（设 Max-Age=0）。
 //! - `GET /api/auth/me` 经过 middleware 后必有 [`AuthenticatedAdmin`]，返回

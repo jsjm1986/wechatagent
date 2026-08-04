@@ -105,14 +105,25 @@ async fn scan_cold_outbound(
 
     let mut scanned = 0i64;
     let mut emitted = 0i64;
+    let mut failed = 0i64;
 
     while let Some(contact) = cursor.try_next().await? {
         scanned += 1;
         if !cold_candidate_passes_in_memory(&contact, now_ms) {
             continue;
         }
-        if has_pending_follow_up(state, &contact).await? {
-            continue;
+        match has_pending_follow_up(state, &contact).await {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(error) => {
+                failed += 1;
+                tracing::warn!(
+                    error = %error,
+                    wxid = %contact.wxid,
+                    "cold contact pending-task check failed; continuing scan"
+                );
+                continue;
+            }
         }
         // S4 (Phase 0)：写一条 account_scheduler_assignment 审计——contact 已经
         // 绑定 account，scheduler 结果只用作"哪个时间被路由到哪个账号"的统一
@@ -173,11 +184,19 @@ async fn scan_cold_outbound(
                 },
             },
         )
-        .await?;
+        .await;
         match outcome {
-            CommitOutcome::Emitted => emitted += 1,
-            CommitOutcome::Duplicate => continue,
-            CommitOutcome::Capped => break,
+            Ok(CommitOutcome::Emitted) => emitted += 1,
+            Ok(CommitOutcome::Duplicate) => continue,
+            Ok(CommitOutcome::Capped) => break,
+            Err(error) => {
+                failed += 1;
+                tracing::warn!(
+                    error = %error,
+                    wxid = %contact.wxid,
+                    "cold contact follow-up commit failed; continuing scan"
+                );
+            }
         }
     }
 
@@ -188,17 +207,36 @@ async fn scan_cold_outbound(
         None,
         "cold_contact_tick",
         "ok",
-        &format!("cold_contact_worker tick: scanned {scanned}, emitted {emitted}"),
-        Some(doc! {
-            "scanned": scanned,
-            "emitted": emitted,
-            "dailyEmitCap": daily_cap,
-            "alreadyEmittedToday": already_emitted_today,
-            "thresholdHours": state.config.cold_contact_threshold_hours,
-        }),
+        &format!("cold_contact_worker tick: scanned {scanned}, emitted {emitted}, failed {failed}"),
+        Some(cold_tick_details(
+            scanned,
+            emitted,
+            failed,
+            daily_cap,
+            already_emitted_today,
+            state.config.cold_contact_threshold_hours,
+        )),
     )
     .await?;
     Ok(())
+}
+
+fn cold_tick_details(
+    scanned: i64,
+    emitted: i64,
+    failed: i64,
+    daily_cap: i64,
+    already_emitted_today: i64,
+    threshold_hours: i64,
+) -> Document {
+    doc! {
+        "scanned": scanned,
+        "emitted": emitted,
+        "failed": failed,
+        "dailyEmitCap": daily_cap,
+        "alreadyEmittedToday": already_emitted_today,
+        "thresholdHours": threshold_hours,
+    }
 }
 
 /// S4 (Phase 0)：workspace 级 cold filter。多账号 workspace 的所有 managed
@@ -591,5 +629,12 @@ mod tests {
     fn cap_reached_negative_inputs_are_clamped_to_zero() {
         assert!(!cap_reached(-1, 5));
         assert!(cap_reached(0, -3));
+    }
+
+    #[test]
+    fn tick_details_expose_per_contact_failures() {
+        let details = cold_tick_details(7, 2, 3, 10, 1, 72);
+        assert_eq!(details.get_i64("failed").unwrap(), 3);
+        assert_eq!(details.get_i64("scanned").unwrap(), 7);
     }
 }

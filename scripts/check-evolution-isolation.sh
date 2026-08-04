@@ -11,7 +11,7 @@
 # - 全量扫描 `src/evolution/**/*.rs`（不只 git diff）。这种隔离一旦破坏后果严重，
 #   不依赖 review 注意力，每次 CI 都重新校验全量。
 # - 命中点带行号输出，便于 PR 上直接定位。
-# - 排除注释行（开头 `//` 或 `///`）：注释里写禁词只是文档说明，不会真调。
+# - 只扫描首个 `#[cfg(test)]` 之前的生产代码，并排除注释行；测试契约可安全引用禁词字面量。
 #
 # 使用：
 #   scripts/check-evolution-isolation.sh
@@ -47,7 +47,7 @@ while IFS= read -r -d '' f; do
     # 跳过注释纯净的扫描：先去掉以 // 或 /// 开头的行（保留代码行）。
     # 用 awk 双管道：1) 排除注释行；2) grep 匹配禁词。
     for pat in "${FORBIDDEN_PATTERNS[@]}"; do
-        hits=$(awk '!/^[[:space:]]*\/\//' "$f" | grep -n -E "$pat" || true)
+        hits=$(awk '/^[[:space:]]*#\[cfg\(test\)\]/{exit} !/^[[:space:]]*\/\//' "$f" | grep -n -E "$pat" || true)
         if [ -n "$hits" ]; then
             rel="${f#$ROOT/}"
             echo "[evolution-isolation] FAIL: $rel 引用了禁用符号 \"$pat\"："

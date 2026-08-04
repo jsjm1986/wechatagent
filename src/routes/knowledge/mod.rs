@@ -729,10 +729,9 @@ pub(super) fn operation_knowledge_chunk_from_request(
 /// `created_at` 同样回填原值——转换函数把它设成 `now`，PUT 时若不回填会把创建时间
 /// 篡改成更新时间；`updated_at` 跟随 `now` 是正确的，不回填。
 ///
-/// 注意：本函数不碰 `integrity_status` / `source_anchors` / `confidence_score` /
-/// `distortion_risks` 等请求体**能表达**的字段——它们的 integrity 判定由 handler 里的
-/// `apply_chunk_integrity` / `coerce_integrity_against_d2_gate` 负责，本函数不引入任何
-/// 自动 verify。
+/// 注意：这是 `#[cfg(test)]` 的旧 PUT 形态兼容 helper，不参与生产写入。
+/// 生产 CRUD 会把直接 create/PUT 强制收敛到 `draft + needs_review`，只有专用
+/// `/verify` 路由可以进入 `active + verified`；本函数仅验证未建模字段回填语义。
 #[cfg(test)]
 pub(super) fn preserve_unmodeled_chunk_fields(
     mut next: OperationKnowledgeChunk,
@@ -1116,7 +1115,7 @@ pub(super) fn apply_chunk_integrity(
     chunk: &mut OperationKnowledgeChunkRequest,
     raw_content: &str,
     document_id: Option<ObjectId>,
-) {
+) -> bool {
     let source_quote = chunk.source_quote.clone().unwrap_or_default();
     if chunk.source_anchors.is_empty() {
         if let Some(anchor) = source_anchor_for_quote(raw_content, document_id, &source_quote) {
@@ -1125,33 +1124,18 @@ pub(super) fn apply_chunk_integrity(
     }
     let has_anchor = !chunk.source_anchors.is_empty();
     let has_quote = !source_quote.trim().is_empty();
-    if has_anchor {
-        chunk.integrity_status = Some("verified".to_string());
-        chunk.confidence_score = Some(chunk.confidence_score.unwrap_or(90));
-        return;
+    // Anchoring establishes provenance location only. Ingest/AI paths never
+    // promote lifecycle state; human verification remains a separate revision.
+    if !has_anchor && chunk.distortion_risks.is_empty() {
+        chunk.distortion_risks.push(if has_quote {
+            "sourceQuote 未在原文中精确匹配，建议触发 AI 自主修复以纠正引用".to_string()
+        } else {
+            "缺 sourceQuote 与原文锚点，建议触发 AI 自主修复".to_string()
+        });
     }
-    // 无 anchor：一律 needs_review（有 quote 但没锚定 = 引用待纠正；无 quote = 缺出处）。
-    // 由下游 AI 自主修复流程重新锚定。红线「AI 永不自动 verify」：绝不在此直接 verified。
-    if !has_quote && chunk.distortion_risks.is_empty() {
-        chunk
-            .distortion_risks
-            .push("缺 sourceQuote 与原文锚点，建议触发 AI 自主修复".to_string());
-    } else if has_quote && chunk.distortion_risks.is_empty() {
-        chunk
-            .distortion_risks
-            .push("sourceQuote 未在原文中精确匹配，建议触发 AI 自主修复以纠正引用".to_string());
-    }
-    chunk.integrity_status = Some(
-        chunk
-            .integrity_status
-            .clone()
-            .filter(|s| matches!(s.as_str(), "needs_review" | "verified" | "rejected"))
-            .unwrap_or_else(|| "needs_review".to_string()),
-    );
-    if matches!(chunk.integrity_status.as_deref(), Some("verified")) {
-        chunk.integrity_status = Some("needs_review".to_string());
-    }
-    chunk.confidence_score = Some(chunk.confidence_score.unwrap_or(45));
+    chunk.integrity_status = Some("needs_review".to_string());
+    chunk.confidence_score = Some(if has_anchor { 90 } else { 45 });
+    has_anchor
 }
 
 pub(super) async fn load_operation_knowledge_chunks_for_query(
@@ -1199,7 +1183,7 @@ pub(super) async fn load_operation_knowledge_chunks_for_query(
     Ok(items)
 }
 
-pub(super) fn default_user_operations_domain() -> String {
+pub(crate) fn default_user_operations_domain() -> String {
     crate::agent::domain::USER_OPS_DOMAIN_ID.to_string()
 }
 
@@ -1260,9 +1244,10 @@ fn chunk_verify_gate_reason(has_source_quote: bool, has_source_anchor: bool) -> 
     ))
 }
 
-/// 调用方后门 D2 收口：create/PUT chunk 落库前，若调用方提交 `integrity_status="verified"`
-/// 但缺 sourceQuote 或 source_anchors（未过 D2 闸），降级为 needs_review 并留审计痕迹。
-/// 与 import 路径「锚点只作审核线索、最终 needs_review」语义一致；正路仍是走 /verify。
+/// `#[cfg(test)]` 的旧请求形态回归 helper：模拟调用方提交 `verified` 但缺
+/// sourceQuote/source_anchors 时的保守降级。生产 create/PUT 不调用本函数，而是在
+/// CRUD 路由无条件强制 `draft + needs_review`；只有专用 `/verify` 路由可以进入
+/// `active + verified`。
 #[cfg(test)]
 pub(in crate::routes) fn coerce_integrity_against_d2_gate(
     payload: &mut OperationKnowledgeChunkRequest,

@@ -549,5 +549,16 @@ describe("userOpsStore.enableAgent playbook binding", () => {
       humanProfileNote: "known customer",
       playbookId: "playbook-enable",
     });
+    expect(useUserOpsStore.getState().guideBusy).toBe(false);
+  });
+
+  it("resets guideBusy when enabling fails", async () => {
+    const selected = { ...contact("c-enable-fail", "A1"), agentStatus: "normal" as const };
+    bindContact(selected);
+    (api.post as any).mockRejectedValueOnce(new Error("enable failed"));
+
+    await useUserOpsStore.getState().enableAgent();
+
+    expect(useUserOpsStore.getState().guideBusy).toBe(false);
   });
 });

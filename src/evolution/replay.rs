@@ -340,7 +340,7 @@ fn evaluate_threshold(proposal: &Proposal, original: &AgentRunLog) -> ReplayOutc
         new_token_cost: Some(0),
         new_self_critique_addressed: Some(matches!(
             new_final,
-            "approved" | "approved_after_revision"
+            "approved" | "revision_applied_approved"
         )),
         new_5gate_hit,
     }
@@ -440,7 +440,7 @@ fn scores_to_5gate_hit(scores: &Document) -> Document {
 }
 
 /// 从 5 闸命中向量推 final_review_status：block 类（fact > pressure > product
-/// 取最严）→ 拦截态；否则 rewrite 类命中 → `approved_after_revision`；全不命中
+/// 取最严）→ 拦截态；否则 rewrite 类命中 → `revision_applied_approved`；全不命中
 /// → `approved`。threshold / prompt 两条 shadow 路径共用同一口径。
 fn final_status_from_5gate(hit: &Document) -> &'static str {
     let any_block_hit = hit.get_bool("fact_risk_block").unwrap_or(false)
@@ -459,7 +459,7 @@ fn final_status_from_5gate(hit: &Document) -> &'static str {
             "blocked_unverified_product_claim"
         }
     } else if any_rewrite_hit {
-        "approved_after_revision"
+        "revision_applied_approved"
     } else {
         "approved"
     }
@@ -824,7 +824,7 @@ mod tests {
             "emotionalValue": 4_i32,
             "productAccuracy": 9_i32,
         };
-        let run = mk_run_log(scores, "approved_after_revision");
+        let run = mk_run_log(scores, "revision_applied_approved");
         let proposal = mk_threshold_proposal("emotional_value_rewrite", 5.0, 6.0);
         let outcome = evaluate_threshold(&proposal, &run);
         assert!(outcome.completed);
@@ -837,7 +837,7 @@ mod tests {
         );
         assert_eq!(
             outcome.new_final_review_status.as_deref(),
-            Some("approved_after_revision")
+            Some("revision_applied_approved")
         );
     }
 

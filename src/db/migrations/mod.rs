@@ -466,13 +466,25 @@ fn approved_migrations_from_env() -> HashSet<String> {
         .collect()
 }
 
+/// Returns whether destructive migrations must require explicit approval.
+/// Only an explicit local/development/test environment opts out. Missing,
+/// blank, staging, and unknown values all fail closed as production-like.
+fn destructive_migrations_require_approval(app_env: Option<&str>) -> bool {
+    !matches!(
+        app_env
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("development" | "dev" | "test" | "local")
+    )
+}
+
 /// 入口函数：扫描 `migrations` 集合，按顺序执行未应用的迁移。
 pub async fn run(db: &Database) -> AppResult<()> {
-    let production = std::env::var("APP_ENV")
-        .map(|value| value.eq_ignore_ascii_case("production"))
-        .unwrap_or(false);
+    let app_env = std::env::var("APP_ENV").ok();
+    let protected = destructive_migrations_require_approval(app_env.as_deref());
     let approvals = approved_migrations_from_env();
-    run_with_policy(db, MIGRATIONS, production, &approvals).await
+    run_with_policy(db, MIGRATIONS, protected, &approvals).await
 }
 
 /// 测试友好的内部入口：允许传入自定义迁移列表，用于单元测试和快照重放。
@@ -558,6 +570,29 @@ pub async fn run_with_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn destructive_migrations_fail_closed_when_environment_is_missing_or_unknown() {
+        for value in [
+            None,
+            Some(""),
+            Some("production"),
+            Some("staging"),
+            Some("qa"),
+        ] {
+            assert!(destructive_migrations_require_approval(value), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn destructive_migrations_only_open_for_explicit_local_environments() {
+        for value in ["development", "DEV", "test", " local "] {
+            assert!(
+                !destructive_migrations_require_approval(Some(value)),
+                "{value}"
+            );
+        }
+    }
 
     #[test]
     fn migration_ids_are_unique() {

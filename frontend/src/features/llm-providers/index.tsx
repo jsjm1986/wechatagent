@@ -13,6 +13,7 @@ import {
 import { EmptyState } from "../../components/ui/EmptyState";
 import { StatusBadge } from "../../components/ui/StatusBadge";
 import { api } from "../../lib/api";
+import { LlmErrorBanner } from "../../components/LlmErrorBanner";
 import styles from "./LlmProviders.module.css";
 
 // —— 内部类型（从原 App.tsx 巨壳 inline 迁移，不从 App 导入）——
@@ -794,21 +795,13 @@ export default function LlmProvidersFeature() {
                       : JSON.stringify(testResult.preview, null, 2)}
                   </pre>
                 </div>
-              ) : (
-                <div className={styles.testBody}>
-                  <div>
-                    <em>错误类型：</em>
-                    {testResult.error?.kind || "unknown"}
-                    {testResult.error?.retryCount != null && (
-                      <span> · 重试 {testResult.error.retryCount} 次</span>
-                    )}
-                  </div>
-                  {testResult.error?.detail && <pre>{testResult.error.detail}</pre>}
-                  {testResult.error?.hint && (
-                    <div className={styles.testHintLine}>建议：{testResult.error.hint}</div>
-                  )}
-                </div>
-              )}
+              ) : testResult.error ? (
+                <LlmErrorBanner
+                  error={testResult.error}
+                  onRetry={() => void runTest()}
+                  retrying={testing}
+                />
+              ) : null}
             </div>
           )}
         </section>

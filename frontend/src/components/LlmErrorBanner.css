@@ -1,0 +1,34 @@
+.llmErrorBanner {
+  border: 1px solid rgba(255, 69, 58, 0.3);
+  background: var(--fill-blocked);
+  border-left: 3px solid var(--color-blocked);
+  border-radius: 8px;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--color-blocked);
+}
+.llmErrorBanner__head { display: flex; align-items: center; gap: 10px; }
+.llmErrorBanner__kind {
+  font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 999px;
+  background: var(--fill-blocked); color: var(--color-blocked); letter-spacing: 0.04em;
+}
+.llmErrorBanner__retries { font-size: 11px; color: var(--color-held); }
+.llmErrorBanner__hint { line-height: 1.6; color: var(--ink-1); }
+.llmErrorBanner__detail { font-size: 12px; color: var(--ink-3); }
+.llmErrorBanner__detail summary { cursor: pointer; user-select: none; }
+.llmErrorBanner__detail code {
+  display: block; margin-top: 6px; padding: 8px 10px; background: var(--surface-card);
+  border: 1px solid var(--hairline); border-radius: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px; color: var(--ink-2); white-space: pre-wrap; word-break: break-all;
+}
+.llmErrorBanner__actions { display: flex; gap: 8px; align-items: center; }
+.llmErrorBanner__actions .primary {
+  background: var(--color-scheduled); color: #fff; border: 1px solid var(--color-scheduled);
+  padding: 6px 14px; border-radius: 6px; font-size: 12px; cursor: pointer;
+}
+.llmErrorBanner__actions .primary:hover:not(:disabled) { filter: brightness(0.92); }
+.llmErrorBanner__actions .primary:disabled { opacity: 0.6; cursor: not-allowed; }

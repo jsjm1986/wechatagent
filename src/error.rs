@@ -19,6 +19,9 @@ pub enum AppError {
     /// P0 鉴权：未登录 / session 失效 / cookie 缺失。前端按 401 跳回 LoginScreen。
     #[error("{0}")]
     Unauthorized(String),
+    /// Authenticated principal lacks the role required for a system-global operation.
+    #[error("{0}")]
+    Forbidden(String),
     #[error("database error: {0}")]
     Db(#[from] mongodb::error::Error),
     #[error("http error: {0}")]
@@ -78,6 +81,9 @@ impl IntoResponse for AppError {
             }
             AppError::Unauthorized(msg) => {
                 (StatusCode::UNAUTHORIZED, Json(json!({ "error": msg }))).into_response()
+            }
+            AppError::Forbidden(msg) => {
+                (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response()
             }
             AppError::BudgetExceeded { run_id, reason } => (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -174,6 +180,15 @@ mod tests {
         let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v, json!({ "error": "internal_error" }));
+    }
+
+    #[tokio::test]
+    async fn forbidden_maps_to_403_without_changing_authentication_semantics() {
+        let resp = AppError::Forbidden("system_operator_required".into()).into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v, json!({ "error": "system_operator_required" }));
     }
 
     #[tokio::test]

@@ -224,8 +224,6 @@ pub struct AppConfig {
     pub evolution_min_replays: usize,
     /// M4：threshold 候选释放门槛——shadow eval 后 send_success_rate 提升必须 ≥ 此值。
     pub evolution_min_send_success_delta: f64,
-    /// M4：prompt 候选释放门槛——self_critique_addressed_rate 提升必须 ≥ 此值。
-    pub evolution_min_self_critique_delta: f64,
     /// M4：5 闸命中率任一上升不得超过此值（防止 prompt 修订引入新风险）。
     pub evolution_max_5gate_hit_increase: f64,
     /// #152：安全闸（fact_risk_block / pressure_risk_block / product_accuracy_score_block）
@@ -331,6 +329,9 @@ pub struct AppConfig {
     /// 留空则不 bootstrap（首次部署后建议清空 env）。
     pub bootstrap_admin_username: Option<String>,
     pub bootstrap_admin_password: Option<String>,
+    /// Comma-separated usernames allowed to operate process-global worker circuits.
+    /// Empty by default so tenant-scoped admins cannot reach the global control plane.
+    pub system_operator_usernames: Vec<String>,
     /// Shared `/auth/login` + `/auth/token` failure window in seconds.
     pub auth_rate_limit_window_seconds: u64,
     /// Maximum pending/failed attempts from one direct client in the window.
@@ -629,8 +630,6 @@ impl AppConfig {
             evolution_min_replays: env_or("EVOLUTION_MIN_REPLAYS", "30").parse()?,
             evolution_min_send_success_delta: env_or("EVOLUTION_MIN_SEND_SUCCESS_DELTA", "0.05")
                 .parse()?,
-            evolution_min_self_critique_delta: env_or("EVOLUTION_MIN_SELF_CRITIQUE_DELTA", "0.10")
-                .parse()?,
             evolution_max_5gate_hit_increase: env_or("EVOLUTION_MAX_5GATE_HIT_INCREASE", "0.10")
                 .parse()?,
             evolution_max_safety_regression_rate: env_or(
@@ -725,6 +724,10 @@ impl AppConfig {
             bootstrap_admin_password: env::var("BOOTSTRAP_ADMIN_PASSWORD")
                 .ok()
                 .filter(|s| !s.trim().is_empty()),
+            system_operator_usernames: parse_csv_identities(&env_or(
+                "SYSTEM_OPERATOR_USERNAMES",
+                "",
+            )),
             auth_rate_limit_window_seconds: env_or("AUTH_RATE_LIMIT_WINDOW_SECONDS", "300")
                 .parse()?,
             auth_rate_limit_client_capacity: env_or("AUTH_RATE_LIMIT_CLIENT_CAPACITY", "20")
@@ -765,6 +768,18 @@ fn parse_bool(value: &str) -> bool {
         value.trim().to_ascii_lowercase().as_str(),
         "1" | "true" | "yes" | "on"
     )
+}
+
+fn parse_csv_identities(value: &str) -> Vec<String> {
+    let mut identities = value
+        .split(',')
+        .map(str::trim)
+        .filter(|identity| !identity.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    identities.sort();
+    identities.dedup();
+    identities
 }
 
 fn parse_bounded_i64(key: &str, value: &str, min: i64, max: i64) -> anyhow::Result<i64> {
@@ -818,6 +833,15 @@ mod tests {
     }
 
     #[test]
+    fn system_operator_csv_is_trimmed_deduplicated_and_empty_by_default() {
+        assert!(parse_csv_identities("").is_empty());
+        assert_eq!(
+            parse_csv_identities(" ops-b,ops-a, ops-b ,,"),
+            vec!["ops-a".to_string(), "ops-b".to_string()]
+        );
+    }
+
+    #[test]
     fn digest_budget_config_requires_bounded_positive_values() {
         assert_eq!(
             parse_bounded_i64("TOKEN", "12345", 1, 1_000_000).unwrap(),
@@ -828,5 +852,14 @@ mod tests {
         assert!(parse_bounded_i64("TOKEN", "1000001", 1, 1_000_000).is_err());
         assert!(parse_bounded_i32("CALLS", "0", 1, 100).is_err());
         assert!(parse_bounded_i32("CALLS", "101", 1, 100).is_err());
+    }
+
+    #[test]
+    fn system_operator_identities_are_trimmed_deduplicated_and_fail_closed() {
+        assert!(parse_csv_identities("").is_empty());
+        assert_eq!(
+            parse_csv_identities(" ops-b,ops-a, ops-b ,,"),
+            vec!["ops-a".to_string(), "ops-b".to_string()]
+        );
     }
 }

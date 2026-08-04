@@ -53,6 +53,8 @@ beforeEach(() => {
     loading: false,
     fatalError: null,
     activeSource: null,
+    requestGeneration: 0,
+    summaryRequestGeneration: 0,
   });
 });
 

@@ -5,8 +5,8 @@
 //!
 //! 1. **数组字段 union（应用层）** — 永远是 `existing ∪ patch`，不让 LLM 决定
 //!    "丢哪几个 tag"；
-//! 2. **锁定字段守门** — `chunk_id / wiki_type / created_at / source_anchor /
-//!    verified_at / verified_by / approved_at` 这 7 个字段不允许 patch 携带，
+//! 2. **锁定字段守门** — `_id / workspace_id / account_id / document_id / item_id /
+//!    wiki_type / chunk_type / created_at` 等真实身份字段不允许 patch 携带，
 //!    携带即拒收；
 //! 3. **70% body 长度阈值** — patch 后 body 长度低于既有 70% → 大概率 LLM
 //!    截断/偷懒，拒收；
@@ -28,19 +28,19 @@ use thiserror::Error;
 /// 默认锁定字段集合 —— `apply_chunk_revision` 的 patch 入参不允许命中其中任一。
 ///
 /// 列表语义：
-/// - `chunk_id` / `wiki_type` / `chunk_type` / `created_at`：身份/类型/创建时间永不变；
-/// - `source_anchor`：原文锚点是 verify gate 的事实依据，重写会破坏可追溯；
-/// - `verified_at` / `verified_by` / `approved_at`：核验/审批时间戳，
-///   AI 永不自动 verify（见 CLAUDE.md / docs/agent-policy.md）。
+/// - `_id` / workspace/account/document/item scope：实体身份与租户归属永不由 patch 改写；
+/// - `wiki_type` / `chunk_type` / `created_at`：类型与创建时间保持不可变；
+/// - `source_anchors` **不在默认锁中**：它由可信正文/quote 变更路径重算，并由 verify gate
+///   校验。历史单数字段 `source_anchor` 不是模型字段，不能充当安全策略。
 pub const DEFAULT_LOCKED_FIELDS: &[&str] = &[
-    "chunk_id",
+    "_id",
+    "workspace_id",
+    "account_id",
+    "document_id",
+    "item_id",
     "wiki_type",
     "chunk_type",
     "created_at",
-    "source_anchor",
-    "verified_at",
-    "verified_by",
-    "approved_at",
 ];
 
 /// 默认走 union 合并的数组字段集合 —— LLM 给出的 patch 数组**不替换**既有数组，
@@ -399,10 +399,10 @@ mod tests {
 
     #[test]
     fn enforce_locked_overrides_when_merged_diverges() {
-        let existing = doc! { "chunk_id": "c1", "wiki_type": "entity", "title": "T" };
-        let merged = doc! { "chunk_id": "c1-evil", "wiki_type": "evil", "title": "T2" };
-        let out = enforce_locked_fields(&merged, &existing, &["chunk_id", "wiki_type"]);
-        assert_eq!(out.get_str("chunk_id").unwrap(), "c1");
+        let existing = doc! { "workspace_id": "ws1", "wiki_type": "entity", "title": "T" };
+        let merged = doc! { "workspace_id": "evil", "wiki_type": "evil", "title": "T2" };
+        let out = enforce_locked_fields(&merged, &existing, &["workspace_id", "wiki_type"]);
+        assert_eq!(out.get_str("workspace_id").unwrap(), "ws1");
         assert_eq!(out.get_str("wiki_type").unwrap(), "entity");
         assert_eq!(out.get_str("title").unwrap(), "T2"); // 非锁定字段保留 merged 形态
     }
@@ -421,25 +421,25 @@ mod tests {
 
     #[test]
     fn apply_patch_rejects_locked_field() {
-        let existing = doc! { "chunk_id": "c1", "title": "T" };
-        let patch = doc! { "chunk_id": "EVIL" };
+        let existing = doc! { "workspace_id": "ws1", "title": "T" };
+        let patch = doc! { "workspace_id": "EVIL" };
         let err = apply_field_patch(&existing, &patch, DEFAULT_LOCKED_FIELDS).unwrap_err();
         assert_eq!(
             err,
             RevisionError::LockedFieldInPatch {
-                field: "chunk_id".into()
+                field: "workspace_id".into()
             }
         );
     }
 
     #[test]
     fn apply_patch_overrides_non_locked_fields() {
-        let existing = doc! { "chunk_id": "c1", "title": "old", "summary": "s" };
+        let existing = doc! { "workspace_id": "ws1", "title": "old", "summary": "s" };
         let patch = doc! { "title": "new" };
         let out = apply_field_patch(&existing, &patch, DEFAULT_LOCKED_FIELDS).unwrap();
         assert_eq!(out.get_str("title").unwrap(), "new");
         assert_eq!(out.get_str("summary").unwrap(), "s");
-        assert_eq!(out.get_str("chunk_id").unwrap(), "c1");
+        assert_eq!(out.get_str("workspace_id").unwrap(), "ws1");
     }
 
     #[test]
@@ -483,12 +483,15 @@ mod tests {
             effective_locked_fields(&bare).len(),
             DEFAULT_LOCKED_FIELDS.len()
         );
-        // 运营锁定 "title"（非 DEFAULT）+ 重复一个 DEFAULT 项 "chunk_id"（应去重）。
-        let with_lock = doc! { "locked_fields": ["title", "chunk_id"] };
+        // 运营锁定 "title"（非 DEFAULT）+ 重复一个 DEFAULT 项 "workspace_id"（应去重）。
+        let with_lock = doc! { "locked_fields": ["title", "workspace_id"] };
         let eff = effective_locked_fields(&with_lock);
         assert!(eff.contains(&"title".to_string()), "运营锁定字段须并入");
-        assert!(eff.contains(&"chunk_id".to_string()), "DEFAULT 字段须保留");
-        // "chunk_id" 已在 DEFAULT，不应重复计数：len == DEFAULT + 1（仅新增 title）。
+        assert!(
+            eff.contains(&"workspace_id".to_string()),
+            "DEFAULT 字段须保留"
+        );
+        // "workspace_id" 已在 DEFAULT，不应重复计数：len == DEFAULT + 1（仅新增 title）。
         assert_eq!(eff.len(), DEFAULT_LOCKED_FIELDS.len() + 1, "重复项须去重");
     }
 

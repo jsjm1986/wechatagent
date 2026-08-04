@@ -1,12 +1,11 @@
 # Agent Policy
 
-> **2026-05-25 重要变更**：knowledge-cleanup 已把销售域 5 闸（`fact_risk` / `pressure_risk`
-> / `product_accuracy` / `human_like` / `emotional_value`）收敛到 3 闸：
-> `enforce_knowledge_grounding` / `enforce_hallucination` / `enforce_run_budget`，
-> 实际实现见 `src/agent/guards.rs`。本文档 §自我演化 部分仍引用旧 5 闸名（gate_key 字符串），
-> 是因为 evolution layer 的 `threshold_overrides` 集合按字符串 key 工作，与运行时 guard 解耦；
-> 真实在线 guard 行为以代码为准，不再扩散销售域字段。`Contact` / `OperationKnowledgeChunk`
-> 的业务字段已统一下沉到 `domain_attributes: bson::Document`，由 `DomainSchema` 定义。
+> **当前实现说明**：历史演进曾把销售域 5 闸收敛为 3 类硬约束，但旧 `enforce_*`
+> 函数已经移除。在线 Review 入口是 `review::review_passed`、
+> `review::classify_dual_gate` / `review::route_dual_gate` 与
+> `review::finalize_review_for_send`；§自我演化中的旧 gate_key 仍是持久化协议字符串，
+> 不代表存在同名运行时函数。`Contact` / `OperationKnowledgeChunk` 的业务可变字段位于
+> `domain_attributes: bson::Document`，由领域配置与 schema 约束。
 
 Agent 策略定义哪些对象可以自动化、自动化到什么程度、何时停止、如何记录。
 
@@ -40,7 +39,7 @@ managed 好友允许 Agent 执行：
 - 读取产品知识
 - 生成回复
 - 独立评审候选回复
-- 调用 `message_send_text`
+- 通过统一 Gateway/Review/Outbox 提交发送意图（不得直接调用原始 MCP 发送工具）
 - 更新画像
 - 更新记忆
 - 创建跟进任务
@@ -82,20 +81,15 @@ HumanLikeScore = ContextRecall + Specificity + Naturalness + Brevity + Emotional
 NextBestActionScore = RelationshipGain + UserValue + ConversionProgress + ProductFit + Timing - DisturbanceCost - HallucinationRisk - GroundingRisk
 ```
 
-自动发送约束（2026-05-25 收敛后的 3 闸 / 详见 `src/agent/guards.rs`）：
+自动发送约束（现行入口见 `src/agent/review/` 与 `src/agent/run_envelope.rs`）：
 
 ```text
-HallucinationScore >= block 阈值     禁止发送 (enforce_hallucination)
-KnowledgeGroundingScore < 阈值       涉及产品 / 价格 / 数据 / 政策 / 合同等关键词时禁止发送 (enforce_knowledge_grounding)
-RunBudget 超限                        终止本 run，落 fallback (enforce_run_budget)
+HallucinationScore >= block 阈值     由 review_passed / finalize_review_for_send 阻断
+KnowledgeGroundingScore < 阈值       涉及产品声明时由 Review 与 verified-claim 兜底阻断
+RunBudget 超限                        终止本 run，写入闭集终态，不进入 Outbox
 ```
 
-> 符号对照（#155 文档收口）：上面括号里的 `enforce_hallucination` /
-> `enforce_knowledge_grounding` / `enforce_run_budget` / `enforce_decision_guards`
-> 是 2026-05-25 知识库清理前的旧函数名，现已不存在。真实入口是
-> `src/agent/review.rs::review_passed`（评分硬门）、`review::classify_dual_gate` /
-> `review::route_dual_gate`（双闸分类 / 改写路由）、`review::finalize_review_for_send`
-> （verified 产品声明结构化兜底）。**2026-06-14 修订**：R5.4 reviewer 自报
+> **2026-06-14 修订**：R5.4 reviewer 自报
 > `requiresProductKnowledge=true` 路径仍写 `blocked_unverified_product_claim`（强约束不变）；
 > finalize 漏判探针（ProductEffect 分支，reviewer 未自报 ∧ 含硬承诺 ∧ 无 verified 背书）
 > 从强制 block 改为**仅观测**（落 `grounding_probe_reviewer_missed` 事件，不改发送判定），
@@ -105,7 +99,9 @@ RunBudget 超限                        终止本 run，落 fallback (enforce_ru
 > `product_accuracy_block_below` 实际承载 **knowledge_grounding** 阈值（由
 > `knowledge_grounding_block_below` 映射）。阅读 `review.rs` 时按此别名对齐。
 
-`HumanLikeScore` / `EmotionalValue` / `PressureRisk` 在 Phase B 补回为 review 评分阈值通道的软闸（详见 `src/agent/review.rs::route_dual_gate`）：低于 / 高于阈值时触发一次 `single-shot revision`，二次仍未通过写 `blocked_review`，不进入 `enforce_decision_guards` 三硬闸。
+`HumanLikeScore` / `EmotionalValue` / `PressureRisk` 作为 Review 评分软闸（见
+`review::route_dual_gate`）：低于 / 高于阈值时触发一次 `single-shot revision`；二次仍未通过
+则写闭集阻断终态，不进入 Outbox。
 
 当前实现使用统一发送网关。任何自动发送，包括私聊自动回复和 follow-up 定时任务，都必须重新加载上下文，检查 managed、冷却期、最小间隔和任务是否过期，再进入独立 Review Agent。候选回复先生成，再评审；评审未通过时改写一次；二次仍未通过则写入 `blocked_review`，不调用微信发送工具。
 
@@ -218,11 +214,14 @@ schedule_list
 中风险，可按策略自动：
 
 ```text
-message_send_text
 media_get
 schedule_create
 schedule_cancel
 ```
+
+发送文本不是可直接执行的原始 MCP 工具。Management Agent 只能规划产品工具
+`wechatagent.send_contact_message`，且该动作仍需确认并进入统一 Gateway → Review → Outbox；
+原始发送工具即使出现在 `tools/list` 也会被目录过滤和执行端硬拒。
 
 高风险，默认不自动：
 
@@ -362,8 +361,8 @@ WechatAgent 自第二阶段起内置可选的"自我演化"后台 worker（`src/
 ### Shadow eval + 显著性
 
 - Shadow replay（`src/evolution/replay.rs`）只读 `agent_run_logs` 的快照，对同一 source run 在新阈值 / 新 prompt 下重判，**不**写 `agent_send_outbox`、不调 MCP、不写 `conversation_messages.outbound`。
-- 显著性门槛：`EVOLUTION_MIN_SEND_SUCCESS_DELTA`（默认 0.05）+ `EVOLUTION_MIN_SELF_CRITIQUE_DELTA`（默认 0.10）+ `EVOLUTION_MAX_5GATE_HIT_INCREASE`（默认 0.10，即新版本不得让任何闸命中率上升超过 10%）。
-- **安全回归门**（#152）：放松安全闸（`fact_risk_block` / `pressure_risk_block` / `product_accuracy_score_block`）的 threshold 候选，额外计算「安全回归率」= shadow 中"原配置被该安全闸拦下（`held_by_ai_policy` / `blocked_by_safety_guard` / `blocked_unverified_product_claim`）、新配置却放行（`approved` / `approved_after_revision`）"的 run 占全部 completed replay 的比例。超过 `EVOLUTION_MAX_SAFETY_REGRESSION_RATE`（默认 `0.0`，零容忍）即判 `safety_gate_regression_above_threshold`、转 `rejected_below_threshold`。这条门是"放松必须用数据证明不漏风险"的硬约束，凌驾于 send_success 提升之上。
+- 显著性门槛：`EVOLUTION_MIN_SEND_SUCCESS_DELTA`（默认 0.05）+ `EVOLUTION_MAX_5GATE_HIT_INCREASE`（默认 0.10，即新版本不得让任何闸命中率上升超过 10%）。
+- **安全回归门**（#152）：放松安全闸（`fact_risk_block` / `pressure_risk_block` / `product_accuracy_score_block`）的 threshold 候选，额外计算「安全回归率」= shadow 中"原配置被该安全闸拦下（`held_by_ai_policy` / `blocked_by_safety_guard` / `blocked_unverified_product_claim`）、新配置却放行（`approved` / `revision_applied_approved`）"的 run 占全部 completed replay 的比例。超过 `EVOLUTION_MAX_SAFETY_REGRESSION_RATE`（默认 `0.0`，零容忍）即判 `safety_gate_regression_above_threshold`、转 `rejected_below_threshold`。这条门是"放松必须用数据证明不漏风险"的硬约束，凌驾于 send_success 提升之上。
 - 三项任一不达标（含安全回归门）→ 候选直接转 `rejected_below_threshold`，不进入 `eligible_for_release`。
 - **注（2026-06-14）**：`blocked_unverified_product_claim` 作为安全回归门的被拦状态之一，其来源是 R5.4 reviewer 自报路径（强约束不变）；finalize 漏判探针（ProductEffect 分支）现已转为观测期，不再产生该 block 状态，故演化器统计窗口内该状态的样本量会下降。观测期结束后若抬回硬闸，本统计语义无需改动。
 
@@ -638,14 +637,14 @@ WechatAgent 把"销售话术 RAG"升级为"运营知识 Wiki + 检索面"：知�
 
 所有写入（import / patch / split / merge / archive / restore / rollback / verify / reject / auto-verify / batch-verify）走同一个函数 [`crate::knowledge_wiki::chunk_revisions::apply_chunk_revision`]，三层保护一律生效：
 
-1. **锁定字段守门**：patch 试图改 `chunk_id / wiki_type / created_at / source_anchor / verified_at / verified_by / approved_at` 任意一项 → 4xx；
-2. **数组字段 union**：`tags / related_chunks / sources / search_terms / applicable_scenes` 永远应用层 `existing ∪ patch`，0 风险 0 LLM 成本；
-3. **70% body 长度阈值**：patch 改 `answer / explanation` 后正文短于既有 70% → 4xx，识别 LLM 截断 / 偷懒 / 误重写。
+1. **锁定字段守门**：patch 试图改 `_id / workspace_id / account_id / document_id / item_id / wiki_type / chunk_type / created_at` 任一真实身份字段 → 4xx；`source_anchors` 是可受控重算的证据字段，不在默认锁中；
+2. **数组字段 union**：`tags / search_terms / sources / applicable_scenes / not_applicable_scenes / business_topics / product_tags` 永远应用层 `existing ∪ patch`；`related_chunks` 按 `chunk_id` 在 revision 层单独合并；
+3. **字段级 70% 阈值**：patch 触碰 `body / summary / answer` 时分别检查，任一新值短于对应旧值的 70% 即 4xx。
 
 写入侧附加规则：
 
 - **AI 写入永不自动 verify**：source=ai 强制 `status="draft" + integrity_status="needs_review"`，verify 仍走现有 `/chunks/:id/verify` + sourceQuote→anchor gate；后者也经 `apply_chunk_revision`（op=verify, source=human）落审计历史——「needs_review→verified」这一最关键状态转移可追溯谁在何时审定；`auto_verify` 批处理（admin 触发、LLM 自评+规则闸门裁决）同样落审计，但 source=rule（非 human）——如实标注"规则化批处理"，避免审计误判有人逐条签字；
-- **双写**：先写 `chunk_revisions`（不可变历史，sha256 before/after hash），后写 `operation_knowledge_chunks`（可变最新版）；万一 chunks 写失败 revisions 仍留下"试图但未成功"的痕迹；
+- **原子提交**：`chunk_revisions`、最新版 chunk 替换和 catalog rebuild intent 在同一 Mongo 事务中提交；任一失败整体回滚，不保留未提交的“尝试”修订；
 - **enqueue catalog rebuild**：写完即推 `catalog_rebuild_jobs` 队列，worker 异步落库，写入路径不阻塞。
 
 ### 3. patch-only 协议
@@ -689,7 +688,10 @@ stage 2（LLM 批裁决：contradiction / suggestion / 残留信号是否仍适�
 | `POST /knowledge/gap-signals/:id/dismiss` / `apply` | 运营手动消解 |
 | `POST /knowledge/gap-signals/sweep` | 手动触发一次 lint + stage 1 sweep |
 
-## 演进路线 changelog（Phase 0 → Phase E5-T1）
+## 演进路线 changelog（Phase 0 → Phase E5-T1，历史记录）
+
+> 本节记录各阶段当时的交付，不是当前运行时契约。后续已将 Prompt 与 ops 配置收敛为
+> 唯一 current 指针，并移除旧 `enforce_*` 函数；现行行为以上文和源码为准。
 
 本轮演进按计划 `Phase 0 → A → B → C → D → E` 分阶段交付，每阶段守住 R11.6 基线门（`cargo test --lib ≥ 350` / 4 PBT 累计 ≥ 33，PBT 集合：`state_transition_pbt / memory_card_invariants / wiki_chunk_revision_pbt / llm_retry_jitter`，与 `scripts/check-baseline.{sh:25,ps1:17}` 实际门槛同步）+ R11 `coreFacts: Vec<String>` 兼容 + AI-autonomous 字面量禁词。
 
@@ -697,13 +699,13 @@ stage 2（LLM 批裁决：contradiction / suggestion / 残留信号是否仍适�
 
 - `gateway::write_agent_run_log_with_finalize` 改走 `update_run_envelope_terminal`，删除裸 `lifecycle: String::new()`，强制 `assert_final_review_status_valid` / `assert_gateway_status_valid`。
 - `guards::check_state_transition` 改 fail-closed：`states.is_empty()` → `Some(GuardBlock::StateMachineEmpty)`；启动序列加 closed-set sanity check。
-- `simulations.rs` 5 闸硬编码删除，改调 `enforce_decision_guards`，与 prod 同源；frontend `App.tsx` 5 老评分键收为 `["grounding","hallucination","runBudget"]`。
+- 当时将 simulations 的 5 闸硬编码收敛到生产 Review 规则；后续旧 `enforce_decision_guards` 符号已移除。
 
 ### Phase A：兑现已有能力
 
 - `decision::decide_reply_with_promote` 装 prompt 阶段读 `decision_reviews.reaction_analysis` 近 3 轮，注入 `format_reaction_hint` 段。
 - `load_operator_memory` 在 build_context 阶段调用一次（contact_id + domain_id 双键），结果作为新 prompt 段注入。
-- `taxonomy::init_global_taxonomy_cache` 启动期初始化；`enforce_decision_guards` 三闸通过后追加 `check_value` 校验，`customer_stage / intent_level / objection_type` 未命中走 `upsert_candidate`，不阻塞 run（CLAUDE.md 硬规则）。
+- taxonomy cache 启动预热；Review 通过后追加 `check_value` 校验，未知值走 candidate 流程，不阻塞 run。
 - `agent::knowledge_tools` / `agent::tool_loop` 仅作为常量与工具分发的支持模块保留（被 `chat_tool_loop` 引用：`dispatch_chat_tool_call` / `AnchorMatchFn` / `ALLOWED_CHAT_TOOL_NAMES` / `TOOL_FAILURE_STREAK_LIMIT` / `TOOL_RESULT_CONTEXT_MAX_CHARS`），user-ops 入口本身仍走 `decide_reply_with_promote → review`，不再 user-side tool-calling。
 
 ### Phase B：方法论补完（恢复 5 → 3 闸缺口）
@@ -711,7 +713,7 @@ stage 2（LLM 批裁决：contradiction / suggestion / 残留信号是否仍适�
 - `guards::human_like_gate` / `pressure_risk_gate` 补回为软闸，走 review 评分阈值通道；`human_like < 阈值` 或 `pressure_risk ≥ 阈值` 触发 `single-shot revision`。阈值默认值进 `models::ThresholdDefaults`，可被 `threshold_overrides` 覆盖。
 - `review::review_decision` 拼 reviewer 输入时只暴露 `user_message + draft_reply + selected_chunk_ids`，遮罩 `draft.reasoning` 防自洽幻觉。
 - `OperationKnowledgeChunk::chunk_type` 升级为 4 类 enum（`product_fact / style_template / negative_example / peer_case`），R11 兼容：缺省值 `product_fact`。
-- `operation_state_policies` collection：每状态挂 `allowed / forbidden / recommended_pace`，`enforce_decision_guards` 读取并拦截违反 forbidden 的 reply。
+- `operation_state_policies` collection：每状态挂 `allowed / forbidden / recommended_pace`，Gateway/Review 状态策略门拦截违反 forbidden 的 reply。
 - 新增 PBT：`human_like_threshold_pbt` / `pressure_risk_threshold_pbt` / `chunk_type_routing_pbt`。
 
 ### Phase C：学习闭环
@@ -719,7 +721,7 @@ stage 2（LLM 批裁决：contradiction / suggestion / 残留信号是否仍适�
 - `reaction::reviewer_misjudge_signal`：reviewer 通过但用户负反应、reviewer 拦截但用户后续正反应；`feedback_worker` 周期把信号汇总到 `reviewer_stats`。
 - `negative_example chunk` 自动入 review queue（reviewer 通过但用户负反应时）：integrity_status="pending_review" 由 admin 审核入库。
 - `evolution_runtime_flags`：`EVOLUTION_ENABLED` 由 env 切到 mongo flag；按 `contact_id` 哈希分桶 5% → 20% → 50% 三档；`post_release / significance / budget` 全程监控。
-- `prompts::load_prompt_for_contact`：`prompt_templates` 多版本同时 active 时按 `hash(contact_id) % active_count` 选；`evolution::release_prompt` 旧版本改为 soft-retire（`current_version=false`），不再物理删历史。
+- 当时引入 Prompt 多版本与 soft-retire；后续已收敛为每 `(workspace_id, prompt_key)` 唯一 `current_version=true`，contact/locale 不参与运行时选择。
 - `evolution::threshold` close-loop：近 14d `hold_rate` 跌破阈值时自动写 `threshold_overrides.gate_key`，经 `post_release` 评估通过才生效；`reset-system-pack` 仍人工。
 
 ### Phase D：长程节奏
@@ -734,12 +736,12 @@ stage 2（LLM 批裁决：contradiction / suggestion / 残留信号是否仍适�
 
 **已落地：**
 
-- **多 locale**：`Contact::locale: Option<String>` + `PromptTemplate::locale: Option<String>`（BCP-47 短形式）；`load_prompt_for_contact` 优先选同 locale 的 active 模板，未命中 fallback 到 `DEFAULT_LOCALE`（`zh-CN`），再未命中 fallback 到 `default_prompt_content`。R11 兼容：旧 contact / 旧模板缺字段反序列化为 None，由 `contact_locale_or_default` / `template_locale_or_default` 透明回退。
+- **locale 元数据**：`Contact::locale` 与 `PromptTemplate::locale` 字段保留并有规范化 helper；当前运行时 Prompt 按 `(workspace_id, prompt_key)` 唯一 current 读取，不按 locale 分叉。
 - **E2-T1：LlmProvider trait**：`src/llm.rs::LlmProvider`（`generate_json` / `generate_json_with_usage`）作为 LLM 客户端抽象，现有 OpenAI / DeepSeek 协议客户端 `LlmClient` 为第一实现；`generate_agent_json` 的 LRU 缓存与 `RunBudget` 计费路径不变，未来扩第二/第三 provider 不动主干。
 - **E2-T2：reviewer 双模并行 + 分歧触发 single-shot revision**：`review::review_decision` 在 `REVIEWER_DUAL_ENABLED=true` 时把 reviewer 输入并行喂两路 LlmProvider（默认 primary + cross_provider），分歧（评分差 ≥ 阈值或 grounding/hallucination 决策不一致）时触发一次 revision，达成 epistemic diversity；同模无分歧时只走 primary，不增预算。
-- **E5-T1：ops 三表 active_versions 灰度**：`operation_domain_configs` / `operation_state_policies` / `system_taxonomies` 三表统一加 4 字段 `version: i32 / current_version: bool / previous_version: Option<i32> / seeded_by: Option<String>`，m015 migration backfill 全量旧 row。读路径按 `current_version=true` 过滤，老库无该字段时 `$ne:false` / `$exists=false` 兜底；运行时按 `hash(contact_id) % active_count` 分桶，同 contact 同桶稳定。`admin_ops_versions` 暴露 publish / rollout / rollback 三动作，publish 写新 row 后 `update_many` 旧版本 `current_version=false`（soft demote，非物理删）。`seeded_by` 三色徽章：`legacy_migration`（m015 回填）/ `system`（默认 seed）/ `manual`（admin REST）。前端 `ActiveVersionsBar + StatePolicyAdmin + TaxonomiesAdmin` 渲染版本流水 + 回滚链 "← v{previous_version}"。
+- **E5-T1：ops 三表版本历史**：三表保留 `version/current_version/previous_version/seeded_by`；后续运行时已收敛为只读唯一 current，缺失或多 current 时 fail closed，不再按 contact hash 分桶。`admin_ops_versions` 保留 publish / rollout / rollback。
 
-- **E1：trait OpsDomain 形式收口**：`src/agent/domain.rs::OpsDomain` 定义 domain 边界（`id` / `state_machine` / `enforce_decision_guards` / `knowledge_router`），`UserOpsDomain` 为第一实现；CLAUDE.md "Group / Moments 不要折叠到 user-ops" 红线由 trait 边界声明承载。本阶段 user-ops 仍走既有入口，`decision / gateway / knowledge_router` 不强制走 trait 分发；当 group / moments 真实落地、产生第二个 domain 调用方时，再按真实需求把分发点接到 trait 上（避免单实现期签名失真）。
+- **E1：trait OpsDomain 形式收口**：`src/agent/domain.rs::OpsDomain` 定义 domain id 与 state-machine key 边界，`UserOpsDomain` 为第一实现；CLAUDE.md "Group / Moments 不要折叠到 user-ops" 红线由 trait 边界声明承载。本阶段 user-ops 仍走既有入口，`decision / gateway / knowledge_router` 不强制走 trait 分发；当 group / moments 真实落地、产生第二个 domain 调用方时，再按真实需求把分发点接到 trait 上（避免单实现期签名失真）。
 
 - **E4：MCP 工具动态注册 + 白名单审计**：管理 Agent 每轮实时 `mcp::list_tools_for_account`（`tools/list`）+ `merge_product_tools` 拿到当前账号可用工具目录喂给 LLM 规划；`execute_management_tool` 的兜底透传分支用 `advertised_tool_names` 从该目录抽白名单，拒绝 `tools/list` 未公布、且非已注册 `wechatagent.*` 产品工具的工具名（LLM 幻觉 / 提示注入兜底），未命中返回 `AppError::BadRequest` 记 `agent_tool_calls.status=failed`，不裸调生产 MCP。**留待第二个 domain 真实落地驱动**：per-tool sandbox 审核位（高危工具执行前的二次沙箱确认）。
 

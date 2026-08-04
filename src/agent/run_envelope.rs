@@ -1151,6 +1151,22 @@ mod tests {
     /// 这条测试是回归门——任何 PR 把它们从 `GATEWAY_STATUS_VALUES` 删掉，会
     /// 导致 prod 路径写库时 fail-closed 不写库。
     #[test]
+    fn gateway_status_values_match_frontend_contract_fixture() {
+        crate::routes::contract_snapshot::assert_contract_fixture(
+            "gateway_status_values",
+            serde_json::json!(GATEWAY_STATUS_VALUES),
+        );
+    }
+
+    #[test]
+    fn delivery_finalizing_is_internal_review_reconciliation_state() {
+        assert!(
+            !GATEWAY_STATUS_VALUES.contains(&"delivery_finalizing"),
+            "delivery_finalizing belongs to decision-review delivery reconciliation, not agent_run gateway status"
+        );
+    }
+
+    #[test]
     fn audit_phase0_s5_added_gateway_statuses_are_in_closed_set() {
         for value in &["no_reply", "gateway_blocked", "precheck_blocked"] {
             assert!(

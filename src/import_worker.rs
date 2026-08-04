@@ -21,7 +21,7 @@ use mongodb::{
 };
 use tokio::time::sleep;
 
-use crate::models::{assert_import_job_status_valid, ImportJob};
+use crate::models::{assert_import_job_status_valid, validate_import_job_status, ImportJob};
 use crate::routes::AppState;
 
 /// Frozen ownership identity returned by a successful import-job claim.
@@ -306,6 +306,7 @@ async fn run_job(state: &AppState, job: ImportJob) {
     let result = crate::routes::knowledge::run_import_extraction_for_job(
         state,
         &job.workspace_id,
+        &claim,
         job.account_id.clone(),
         Some(job.source_name.clone()),
         job.content.clone(),
@@ -398,7 +399,10 @@ async fn finish_owned_import_job(
     status: &str,
     mut fields: Document,
 ) {
-    assert_import_job_status_valid(status);
+    if let Err(error) = validate_import_job_status(status) {
+        tracing::error!(status, error, "refusing invalid import job terminal status");
+        return;
+    }
     fields.insert("status", status);
     fields.insert("updated_at", DateTime::now());
     match update_owned_import_job(
@@ -411,7 +415,17 @@ async fn finish_owned_import_job(
     )
     .await
     {
-        Ok(true) => {}
+        Ok(true) => {
+            if let Err(error) = state
+                .db
+                .raw()
+                .collection::<Document>("import_job_segments")
+                .delete_many(doc! { "job_id": claim.job_id }, None)
+                .await
+            {
+                tracing::warn!(job_id = %claim.job_id.to_hex(), error = %error, "import checkpoint cleanup failed");
+            }
+        }
         Ok(false) => tracing::info!(
             job_id = %claim.job_id.to_hex(),
             claim_generation = claim.generation,

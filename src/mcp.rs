@@ -1027,6 +1027,17 @@ pub(crate) fn chat_search_hit(items: &serde_json::Value, content: &str, since_mi
     })
 }
 
+const CHAT_SEARCH_CLOCK_SKEW_TOLERANCE_MILLIS: i64 = 5 * 60 * 1_000;
+const CHAT_SEARCH_DELIVERY_VERIFY_LIMIT: i64 = 100;
+
+fn chat_search_since_with_tolerance(since: DateTime) -> DateTime {
+    DateTime::from_millis(
+        since
+            .timestamp_millis()
+            .saturating_sub(CHAT_SEARCH_CLOCK_SKEW_TOLERANCE_MILLIS),
+    )
+}
+
 /// 查 MCP chat_search 确认某条 outbound 文本是否已提交给微信(server 侧真实已发记录，
 /// 同步落库、失败不写)。命中判据见 [`chat_search_hit`]。调用失败向上抛(由调用方回落本地日志)。
 pub async fn chat_search_outbound(
@@ -1037,7 +1048,8 @@ pub async fn chat_search_outbound(
     content: &str,
     since: DateTime,
 ) -> AppResult<bool> {
-    let since_iso = since.try_to_rfc3339_string().unwrap_or_default();
+    let tolerant_since = chat_search_since_with_tolerance(since);
+    let since_iso = tolerant_since.try_to_rfc3339_string().unwrap_or_default();
     let resp = logged_call_for_account(
         state,
         workspace_id,
@@ -1048,7 +1060,7 @@ pub async fn chat_search_outbound(
             "peer": peer,
             "content_contains": content,
             "since": since_iso,
-            "limit": 20,
+            "limit": CHAT_SEARCH_DELIVERY_VERIFY_LIMIT,
         }),
     )
     .await?;
@@ -1060,7 +1072,11 @@ pub async fn chat_search_outbound(
         .cloned()
         .or_else(|| resp.pointer("/structuredContent/items").cloned())
         .unwrap_or(serde_json::Value::Null);
-    Ok(chat_search_hit(&items, content, since.timestamp_millis()))
+    Ok(chat_search_hit(
+        &items,
+        content,
+        tolerant_since.timestamp_millis(),
+    ))
 }
 
 /// 后台静默自刷某账号的 roster 快照：fire-and-forget，不阻塞请求。最多
@@ -1799,6 +1815,16 @@ mod chat_search_hit_tests {
     const AFTER: &str = "2023-11-14T22:14:20.000Z"; // = 1_700_000_060_000ms 附近，> SINCE
                                                     // SINCE 之前。
     const BEFORE: &str = "2023-11-14T00:00:00.000Z"; // < SINCE
+
+    #[test]
+    fn authoritative_search_since_allows_five_minutes_of_clock_skew() {
+        let since = mongodb::bson::DateTime::from_millis(SINCE);
+        assert_eq!(
+            super::chat_search_since_with_tolerance(since).timestamp_millis(),
+            SINCE - super::CHAT_SEARCH_CLOCK_SKEW_TOLERANCE_MILLIS
+        );
+        assert!(super::CHAT_SEARCH_DELIVERY_VERIFY_LIMIT > 20);
+    }
 
     #[test]
     fn exact_content_after_since_hits() {

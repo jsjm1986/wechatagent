@@ -1078,7 +1078,8 @@ pub(crate) async fn decide_reply_with_promote(
         &dimension_kinds,
         &contact.workspace_id,
         &contact.account_id,
-    );
+    )
+    .await?;
     promote_risks.extend(taxonomy_risks);
     // universal-domain-adaptation H1 / 1D：taxonomy 已把 typed 维度改写为 canonical
     // id，此处把 typed 维度镜像进 domain_signals 容器（反之容器有值而 typed 缺失时回填

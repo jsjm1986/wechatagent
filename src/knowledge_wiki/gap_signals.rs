@@ -33,7 +33,7 @@
 use std::collections::{HashMap, HashSet};
 
 use futures::TryStreamExt;
-use mongodb::bson::{doc, DateTime, Document};
+use mongodb::bson::{doc, Bson, DateTime, Document};
 use mongodb::options::UpdateOptions;
 use uuid::Uuid;
 
@@ -821,6 +821,60 @@ pub enum OutcomeLabel {
     Censored,
 }
 
+/// Build an aggregation update that installs the recomputed 30d snapshot while preserving
+/// hot-path increments that happened after this worker read the chunk. `observed_*` are the
+/// counters seen in that read; only the positive delta from the current stored value is carried
+/// forward, so old-window counts can still age out.
+fn usage_refresh_pipeline(
+    recomputed_hit: i64,
+    recomputed_blocked: i64,
+    observed_hit: i64,
+    observed_blocked: i64,
+    recomputed_last_used: Option<DateTime>,
+    recomputed_block_reason: Option<&str>,
+    dynamic_confidence: f64,
+) -> Vec<Document> {
+    let current_hit = doc! { "$ifNull": ["$usage_stats.hit_count_30d", 0_i64] };
+    let current_blocked = doc! { "$ifNull": ["$usage_stats.blocked_count_30d", 0_i64] };
+    let hot_hit_delta = doc! {
+        "$max": [0_i64, { "$subtract": [current_hit.clone(), observed_hit] }]
+    };
+    let hot_blocked_delta = doc! {
+        "$max": [0_i64, { "$subtract": [current_blocked.clone(), observed_blocked] }]
+    };
+    let last_used_value = match recomputed_last_used {
+        Some(value) => Bson::Document(doc! {
+            "$max": [
+                { "$ifNull": ["$usage_stats.last_used_at", value] },
+                value,
+            ]
+        }),
+        None => Bson::Document(doc! { "$ifNull": ["$usage_stats.last_used_at", Bson::Null] }),
+    };
+    let recomputed_reason = recomputed_block_reason
+        .map(|value| Bson::String(value.to_string()))
+        .unwrap_or(Bson::Null);
+    vec![doc! {
+        "$set": {
+            "usage_stats.hit_count_30d": {
+                "$add": [recomputed_hit, hot_hit_delta]
+            },
+            "usage_stats.blocked_count_30d": {
+                "$add": [recomputed_blocked, hot_blocked_delta]
+            },
+            "usage_stats.last_used_at": last_used_value,
+            "usage_stats.last_blocked_reason": {
+                "$cond": [
+                    { "$gt": [current_blocked, observed_blocked] },
+                    { "$ifNull": ["$usage_stats.last_blocked_reason", recomputed_reason.clone()] },
+                    recomputed_reason,
+                ]
+            },
+            "dynamic_confidence": dynamic_confidence,
+        }
+    }]
+}
+
 /// H11-linkage（spec §9 #9）：成交追认的归因窗口——一笔已核实成交，往前追认其
 /// 发生时刻**之前**最近 N 条 `knowledge_usage_log`（即"成交前最近 N 轮对话用过的
 /// 知识"）。N=3 与项目既有 `take(5)` / `take(3)`（reaction_hint / deprecated_facts）
@@ -926,7 +980,23 @@ pub async fn refresh_usage_stats_and_confidence(
     min_samples: u64,
     real_outcome_enabled: bool,
 ) -> Result<UsageStatsReport, AppError> {
-    use mongodb::bson::Bson;
+    refresh_usage_stats_and_confidence_controlled(
+        db,
+        workspace_id,
+        min_samples,
+        real_outcome_enabled,
+        None,
+    )
+    .await
+}
+
+pub async fn refresh_usage_stats_and_confidence_controlled(
+    db: &Database,
+    workspace_id: &str,
+    min_samples: u64,
+    real_outcome_enabled: bool,
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<UsageStatsReport, AppError> {
     let now = DateTime::now();
     let window_start_ms = now.timestamp_millis() - 30 * 24 * 60 * 60 * 1000;
     let window_start = DateTime::from_millis(window_start_ms);
@@ -1077,6 +1147,11 @@ pub async fn refresh_usage_stats_and_confidence(
     let mut report = UsageStatsReport::default();
 
     for c in &chunks {
+        if cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst)) {
+            return Err(AppError::Conflict(
+                "knowledge_feedback_lease_lost".to_string(),
+            ));
+        }
         let Some(oid) = c.id.as_ref() else { continue };
         let key = oid.to_hex();
         let h = *hit.get(&key).unwrap_or(&0);
@@ -1106,21 +1181,31 @@ pub async fn refresh_usage_stats_and_confidence(
             min_samples,
         );
 
-        let set: Document = doc! {
-            "usage_stats": {
-                "hit_count_30d": h as i64,
-                "blocked_count_30d": b as i64,
-                "last_used_at": last_used_at.map(Bson::DateTime).unwrap_or(Bson::Null),
-                "last_blocked_reason": last_blocked_reason.map(Bson::String).unwrap_or(Bson::Null),
-            },
-            "dynamic_confidence": dyn_conf,
-            "updated_at": now,
-        };
-        // last_used_at 已在上面的 usage_stats 对象里写好（None → Bson::Null）；
-        // 不能再往同一 $set 里插子路径 usage_stats.last_used_at——MongoDB 禁止同一
-        // $set 中父路径(usage_stats)与子路径(usage_stats.last_used_at)并存(code 40)。
+        let observed_hit = c
+            .usage_stats
+            .as_ref()
+            .map(|stats| stats.hit_count_30d as i64)
+            .unwrap_or(0);
+        let observed_blocked = c
+            .usage_stats
+            .as_ref()
+            .map(|stats| stats.blocked_count_30d as i64)
+            .unwrap_or(0);
+        let pipeline = usage_refresh_pipeline(
+            h as i64,
+            b as i64,
+            observed_hit,
+            observed_blocked,
+            last_used_at,
+            last_blocked_reason.as_deref(),
+            dyn_conf,
+        );
         db.operation_knowledge_chunks()
-            .update_one(doc! { "_id": oid }, doc! { "$set": &set }, None)
+            .update_one(
+                doc! { "_id": oid, "workspace_id": workspace_id },
+                pipeline,
+                None,
+            )
             .await
             .map_err(AppError::from)?;
         report.updated += 1;
@@ -1265,6 +1350,7 @@ pub struct UsageStatsReport {
 ///   避免热路径上做浮点运算）。
 pub async fn record_chunk_hit(
     db: &Database,
+    workspace_id: &str,
     chunk_id_hex: &str,
     blocked: bool,
     reason: Option<&str>,
@@ -1287,7 +1373,7 @@ pub async fn record_chunk_hit(
     }
     db.operation_knowledge_chunks()
         .update_one(
-            doc! { "_id": oid },
+            doc! { "_id": oid, "workspace_id": workspace_id },
             doc! { "$inc": { inc_field: 1i64 }, "$set": set_doc },
             None,
         )
@@ -1609,6 +1695,26 @@ fn id_str(c: &OperationKnowledgeChunk) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usage_refresh_pipeline_preserves_only_post_snapshot_increments() {
+        let pipeline = usage_refresh_pipeline(10, 4, 7, 2, None, None, 0.75);
+        let rendered = format!("{:?}", pipeline);
+        assert!(rendered.contains("$subtract"));
+        assert!(rendered.contains("hit_count_30d"));
+        assert!(rendered.contains("blocked_count_30d"));
+        assert!(rendered.contains("dynamic_confidence"));
+        assert!(rendered.contains("Int64(7)"));
+        assert!(rendered.contains("Int64(2)"));
+    }
+
+    #[test]
+    fn usage_refresh_pipeline_never_carries_negative_delta() {
+        let pipeline = usage_refresh_pipeline(1, 1, 99, 99, None, None, 0.1);
+        let rendered = format!("{:?}", pipeline);
+        assert!(rendered.contains("$max"));
+        assert!(rendered.contains("Int64(0)"));
+    }
     use mongodb::bson::oid::ObjectId;
 
     /// S7：样本不足（h+b < min_samples）→ 只用 base，不被少量 hit 甩飞。

@@ -463,3 +463,165 @@ fn truncate(s: &str, max: usize) -> String {
         s.chars().take(max).collect()
     }
 }
+
+#[cfg(test)]
+mod isolation_contract_tests {
+    use std::collections::{BTreeSet, HashSet};
+    use std::fs;
+    use std::path::PathBuf;
+
+    const EXPECTED_MODULES: &[&str] = &[
+        "auto_release.rs",
+        "budget.rs",
+        "cohort.rs",
+        "envelope.rs",
+        "error.rs",
+        "lint.rs",
+        "mod.rs",
+        "post_release.rs",
+        "prompt_critic.rs",
+        "release.rs",
+        "replay.rs",
+        "revision.rs",
+        "runtime_flag.rs",
+        "significance.rs",
+        "threshold.rs",
+    ];
+
+    fn source_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/evolution")
+    }
+
+    fn production_lines(source: &str) -> String {
+        let source = source.split("\n#[cfg(test)]").next().unwrap_or(source);
+        source
+            .lines()
+            .filter(|line| {
+                let line = line.trim_start();
+                !line.starts_with("//") && !line.starts_with("#")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn every_evolution_module_is_explicitly_reviewed() {
+        let actual: BTreeSet<String> = fs::read_dir(source_dir())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let path = entry.path();
+                (path.extension().and_then(|value| value.to_str()) == Some("rs"))
+                    .then(|| path.file_name().unwrap().to_string_lossy().into_owned())
+            })
+            .collect();
+        let expected: BTreeSet<String> =
+            EXPECTED_MODULES.iter().map(|v| (*v).to_string()).collect();
+        assert_eq!(
+            actual, expected,
+            "new evolution modules require an isolation review"
+        );
+    }
+
+    #[test]
+    fn production_dependencies_exclude_side_effect_entrypoints() {
+        let forbidden = [
+            "crate::agent::gateway",
+            "crate::agent::outbox",
+            "crate::mcp",
+            "crate::tasks",
+            "crate::webhooks",
+            "run_user_operation_gateway",
+            "handle_managed_message",
+            "handle_follow_up_task",
+            "agent_send_outbox",
+        ];
+        for file in EXPECTED_MODULES {
+            let source = fs::read_to_string(source_dir().join(file)).unwrap();
+            let source = production_lines(&source);
+            for symbol in forbidden {
+                assert!(
+                    !source.contains(symbol),
+                    "{file} references forbidden {symbol}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn agent_bridge_dependencies_are_closed_and_reviewed() {
+        let allowed: HashSet<&str> = [
+            "crate::agent::domain_profile",
+            "crate::agent::prompt_shadow",
+            "crate::agent::run_envelope",
+            "crate::agent::runtime",
+        ]
+        .into_iter()
+        .collect();
+        for file in EXPECTED_MODULES {
+            let source = production_lines(&fs::read_to_string(source_dir().join(file)).unwrap());
+            for line in source
+                .lines()
+                .filter(|line| line.contains("crate::agent::"))
+            {
+                let start = line.find("crate::agent::").unwrap();
+                let suffix = &line[start..];
+                let dependency = suffix
+                    .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == ':'))
+                    .next()
+                    .unwrap();
+                let module = dependency
+                    .rsplit_once("::")
+                    .map(|(prefix, _)| prefix)
+                    .unwrap_or(dependency);
+                assert!(
+                    allowed.contains(dependency) || allowed.contains(module),
+                    "{file} has unreviewed agent dependency {dependency}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn replay_persists_only_shadow_replay_rows() {
+        let source = production_lines(&fs::read_to_string(source_dir().join("replay.rs")).unwrap());
+        let mut last_accessor = "";
+        for line in source.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('.') && trimmed.ends_with("()") {
+                last_accessor = trimmed.trim_start_matches('.').trim_end_matches("()");
+            }
+            if trimmed.contains(".insert_one(") || trimmed.starts_with(".insert_one(") {
+                assert_eq!(
+                    last_accessor, "shadow_replays",
+                    "replay write escaped shadow_replays"
+                );
+            }
+            assert!(
+                !trimmed.contains(".update_one("),
+                "replay must not mutate source/business rows"
+            );
+            assert!(!trimmed.contains(".delete_"), "replay must not delete rows");
+        }
+    }
+
+    #[test]
+    fn prompt_shadow_bridge_has_no_send_or_write_dependency() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/agent/prompt_shadow.rs");
+        let source = production_lines(&fs::read_to_string(path).unwrap());
+        for forbidden in [
+            "super::outbox",
+            "crate::agent::outbox",
+            "crate::mcp",
+            "insert_one(",
+            "update_one(",
+            "delete_one(",
+            "replace_one(",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "prompt shadow bridge references {forbidden}"
+            );
+        }
+    }
+}

@@ -34,6 +34,9 @@ use serde_json::{json, Value};
 use crate::{
     auth::AuthenticatedAdmin,
     error::{AppError, AppResult},
+    knowledge_wiki::chunk_revisions::{
+        apply_chunk_revision_with_session, ProvenanceSource, RevisionOp, RevisionRequest,
+    },
     models::{dt_to_string, ChunkProvenance, OperationKnowledgeChunk},
 };
 
@@ -321,6 +324,20 @@ async fn promote_lesson_once(
         chunks
             .insert_one_with_session(chunk, None, &mut session)
             .await?;
+        apply_chunk_revision_with_session(
+            &state.db,
+            &admin.current_workspace,
+            lesson_oid,
+            RevisionRequest {
+                op: RevisionOp::Create,
+                source: ProvenanceSource::Human,
+                patch: Document::new(),
+                reason: Some(format!("lesson {lesson_id} promoted to peer_case")),
+                actor: Some(admin.username.clone()),
+            },
+            &mut session,
+        )
+        .await?;
 
         let promoted = lessons
             .update_one_with_session(

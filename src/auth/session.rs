@@ -2,7 +2,7 @@
 //!
 //! 集合：
 //! - `admin_users`：username 唯一索引
-//! - `admin_sessions`：session_id 唯一 + expires_at TTL（mongo 自动过期清理）
+//! - `admin_sessions`：SHA-256 session token 摘要唯一 + expires_at TTL（mongo 自动过期清理）
 //!
 //! bootstrap：每次启动检查 env `BOOTSTRAP_ADMIN_USERNAME` + `BOOTSTRAP_ADMIN_PASSWORD`；
 //! admin_users 集合空时创建第一个 admin。env 留着也幂等（admin 已存在就跳过）。
@@ -10,12 +10,41 @@
 use chrono::{Duration, Utc};
 use mongodb::bson::doc;
 use mongodb::Collection;
+use sha2::{Digest, Sha256};
 
 use super::{password, AdminSession, AdminUser};
 use crate::db::Database;
 
 const ADMIN_USERS: &str = "admin_users";
 const ADMIN_SESSIONS: &str = "admin_sessions";
+const SESSION_DIGEST_PREFIX: &str = "sha256-v1:";
+
+fn session_token_digest(session_token: &str) -> String {
+    let digest = Sha256::digest(session_token.as_bytes());
+    format!("{SESSION_DIGEST_PREFIX}{}", hex::encode(digest))
+}
+
+fn session_lookup_filter(session_token: &str) -> mongodb::bson::Document {
+    let digest = session_token_digest(session_token);
+    doc! { "session_id": { "$in": [digest, session_token] } }
+}
+
+async fn find_session_by_token(
+    collection: &Collection<AdminSession>,
+    session_token: &str,
+) -> Result<Option<(AdminSession, bool)>, mongodb::error::Error> {
+    let digest = session_token_digest(session_token);
+    if let Some(session) = collection
+        .find_one(doc! { "session_id": &digest }, None)
+        .await?
+    {
+        return Ok(Some((session, false)));
+    }
+    Ok(collection
+        .find_one(doc! { "session_id": session_token }, None)
+        .await?
+        .map(|session| (session, true)))
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
@@ -106,7 +135,7 @@ pub async fn authenticate(
     Ok(user)
 }
 
-/// 创建一条 session（写 mongo + 返结构）。session_id 用 uuid v4。
+/// 创建一条 session：返回给 cookie 的 token 使用 UUIDv4，Mongo 仅写其 SHA-256 摘要。
 /// `current_workspace` 在登录时初始为 user.default_workspace（或 fallback 到
 /// `config.default_workspace_id`）；后续可由 [`update_session_workspace`] 切换。
 pub async fn create_session(
@@ -118,15 +147,18 @@ pub async fn create_session(
     let now = Utc::now();
     let initial_ws = initial_authorized_workspace(user, fallback_workspace)
         .ok_or(AuthError::NoAuthorizedWorkspace)?;
+    let session_token = uuid::Uuid::new_v4().to_string();
     let session = AdminSession {
-        session_id: uuid::Uuid::new_v4().to_string(),
+        session_id: session_token.clone(),
         admin_user_id: user.user_id.clone(),
         username: user.username.clone(),
         created_at: now,
         expires_at: now + Duration::hours(ttl_hours.max(1)),
         current_workspace: Some(initial_ws),
     };
-    admin_sessions(db).insert_one(&session, None).await?;
+    let mut stored = session.clone();
+    stored.session_id = session_token_digest(&session_token);
+    admin_sessions(db).insert_one(&stored, None).await?;
     Ok(session)
 }
 
@@ -145,21 +177,35 @@ pub fn initial_authorized_workspace(user: &AdminUser, _fallback_workspace: &str)
 
 /// 拿 session_id 查 session；未找到 / 已过期都返错。不更新 expires_at（不滚动续期，
 /// 若需要可以在后续加 sliding window；当前 7 天 TTL 够用）。
-pub async fn lookup_session(db: &Database, session_id: &str) -> Result<AdminSession, AuthError> {
-    let session = admin_sessions(db)
-        .find_one(doc! { "session_id": session_id }, None)
+pub async fn lookup_session(db: &Database, session_token: &str) -> Result<AdminSession, AuthError> {
+    let collection = admin_sessions(db);
+    let (mut session, legacy_plaintext) = find_session_by_token(&collection, session_token)
         .await?
         .ok_or(AuthError::SessionNotFound)?;
     if session.expires_at <= Utc::now() {
         return Err(AuthError::SessionExpired);
     }
+    if legacy_plaintext {
+        let digest = session_token_digest(session_token);
+        // Transparently migrate a pre-hash session after a successful lookup. Digest lookup
+        // happens first, so an upgrade transition cannot ambiguously select a plaintext row.
+        collection
+            .update_one(
+                doc! { "session_id": session_token },
+                doc! { "$set": { "session_id": &digest } },
+                None,
+            )
+            .await?;
+    }
+    // Never expose the stored digest as a bearer token to callers.
+    session.session_id = session_token.to_string();
     Ok(session)
 }
 
 /// 删 session（登出）。session 不存在不报错——登出幂等。
-pub async fn delete_session(db: &Database, session_id: &str) -> Result<(), AuthError> {
+pub async fn delete_session(db: &Database, session_token: &str) -> Result<(), AuthError> {
     admin_sessions(db)
-        .delete_one(doc! { "session_id": session_id }, None)
+        .delete_many(session_lookup_filter(session_token), None)
         .await?;
     Ok(())
 }
@@ -168,16 +214,20 @@ pub async fn delete_session(db: &Database, session_id: &str) -> Result<(), AuthE
 /// `admin_user.workspaces` 列表内（中间层做权限校验，本函数只写 DB）。
 pub async fn update_session_workspace(
     db: &Database,
-    session_id: &str,
+    session_token: &str,
     new_workspace: &str,
 ) -> Result<(), AuthError> {
-    admin_sessions(db)
-        .update_one(
-            doc! { "session_id": session_id },
-            doc! { "$set": { "current_workspace": new_workspace } },
-            None,
-        )
+    let collection = admin_sessions(db);
+    let digest = session_token_digest(session_token);
+    let update = doc! { "$set": { "current_workspace": new_workspace } };
+    let result = collection
+        .update_one(doc! { "session_id": &digest }, update.clone(), None)
         .await?;
+    if result.matched_count == 0 {
+        collection
+            .update_one(doc! { "session_id": session_token }, update, None)
+            .await?;
+    }
     Ok(())
 }
 
@@ -187,4 +237,32 @@ pub async fn get_admin_user(db: &Database, user_id: &str) -> Result<Option<Admin
         .find_one(doc! { "user_id": user_id }, None)
         .await?;
     Ok(user)
+}
+
+#[cfg(test)]
+mod session_token_tests {
+    use super::*;
+
+    #[test]
+    fn session_digest_is_stable_prefixed_and_does_not_contain_token() {
+        let token = "550e8400-e29b-41d4-a716-446655440000";
+        let digest = session_token_digest(token);
+        assert!(digest.starts_with(SESSION_DIGEST_PREFIX));
+        assert_eq!(digest, session_token_digest(token));
+        assert!(!digest.contains(token));
+    }
+
+    #[test]
+    fn lookup_filter_accepts_digest_and_legacy_plaintext() {
+        let token = "legacy-token";
+        let filter = session_lookup_filter(token);
+        let values = filter
+            .get_document("session_id")
+            .unwrap()
+            .get_array("$in")
+            .unwrap();
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[1].as_str(), Some(token));
+        assert_ne!(values[0].as_str(), Some(token));
+    }
 }

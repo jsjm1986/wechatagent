@@ -1080,6 +1080,14 @@ fn bump(map: &mut serde_json::Map<String, Value>, reason: &str) {
 /// GET /campaigns/:id/sends —— 活动推送结果聚合（只读）。
 /// 把 campaign_sends 台账与 agent_run_logs（关联键 source_event_id=taskId.hex）
 /// 聚合成 7 桶分布 + 每人明细。零写入。IDOR：filter 含 workspaceId。
+fn campaign_run_logs_filter(workspace_id: &str, task_hexes: &[String]) -> Document {
+    doc! {
+        "workspace_id": workspace_id,
+        "source_event_id": { "$in": task_hexes },
+        "source_kind": SOURCE_KIND_FOLLOW_UP_TASK,
+    }
+}
+
 pub async fn campaign_sends_report(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
@@ -1122,10 +1130,7 @@ pub async fn campaign_sends_report(
             .db
             .agent_run_logs()
             .find(
-                doc! {
-                    "source_event_id": { "$in": &task_hexes },
-                    "source_kind": SOURCE_KIND_FOLLOW_UP_TASK,
-                },
+                campaign_run_logs_filter(&admin.current_workspace, &task_hexes),
                 None,
             )
             .await?
@@ -1257,6 +1262,26 @@ pub async fn list_campaigns(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn campaign_run_log_filter_is_tenant_scoped() {
+        let tasks = vec!["task-a".to_string(), "task-b".to_string()];
+        let filter = super::campaign_run_logs_filter("workspace-a", &tasks);
+        assert_eq!(filter.get_str("workspace_id").unwrap(), "workspace-a");
+        assert_eq!(
+            filter.get_str("source_kind").unwrap(),
+            super::SOURCE_KIND_FOLLOW_UP_TASK
+        );
+        assert_eq!(
+            filter
+                .get_document("source_event_id")
+                .unwrap()
+                .get_array("$in")
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
     use super::*;
     use crate::models::{OutcomeEvent, OutcomeProductRef};
 

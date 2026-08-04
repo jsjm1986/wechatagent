@@ -2,8 +2,8 @@
 //!
 //! 设计契约（沿用 `nashsu/llm_wiki` 的 page-merge 三层保护）：
 //!
-//! 1. **锁定字段守门**：patch 携带 `chunk_id / wiki_type / created_at /
-//!    source_anchor / verified_at / verified_by / approved_at` 任一 → 4xx 拒收。
+//! 1. **锁定字段守门**：patch 携带 `_id / workspace_id / account_id / document_id /
+//!    item_id / wiki_type / chunk_type / created_at` 任一 → 4xx 拒收。
 //!    LLM 永远没机会改这些字段。
 //! 2. **数组字段 union**：`tags / search_terms / applicable_scenes / ...`
 //!    永远 existing ∪ patch，应用层完成，LLM 输出空数组 ≠ 清空。
@@ -273,7 +273,9 @@ fn build_chunk_provenance(
 
 struct PreparedChunkRevision {
     revision: ChunkRevision,
-    replacement: Option<OperationKnowledgeChunk>,
+    /// Exact BSON that was hashed. Keeping the replacement as BSON preserves
+    /// forward-compatible review fields that are not yet projected by the typed model.
+    replacement: Option<Document>,
     replace_filter: Document,
     catalog_job: Option<CatalogRebuildJob>,
     applied: RevisionApplied,
@@ -299,11 +301,10 @@ fn prepare_chunk_revision(
     workspace_id: &str,
     chunk_object_id: ObjectId,
     existing_doc: &OperationKnowledgeChunk,
+    existing_bson: Document,
     schema: Option<&DomainSchema>,
     req: RevisionRequest,
 ) -> AppResult<PreparedChunkRevision> {
-    let existing_bson = mongodb::bson::to_document(existing_doc)
-        .map_err(|e| AppError::External(format!("serialize existing chunk to bson failed: {e}")))?;
     let chunk_id_hex = chunk_object_id.to_hex();
     let before_hash = compute_chunk_hash(&existing_bson);
     let after_patch = apply_field_patch(&existing_bson, &req.patch, DEFAULT_LOCKED_FIELDS)
@@ -315,16 +316,18 @@ fn prepare_chunk_revision(
         DEFAULT_UNION_ARRAY_KEYS,
     );
 
-    let touched_text_field = req.patch.contains_key("body")
-        || req.patch.contains_key("summary")
-        || req.patch.contains_key("answer");
-    if touched_text_field {
-        let old_len = text_payload_len(&existing_bson);
-        let new_len = text_payload_len(&merged);
-        let incoming_len = text_payload_len(&req.patch);
+    // Protect every patched text field independently. A long summary must not
+    // hide an accidentally truncated body (or vice versa).
+    for field in ["body", "summary", "answer"] {
+        if !req.patch.contains_key(field) {
+            continue;
+        }
+        let old_len = text_field_len(&existing_bson, field);
+        let new_len = text_field_len(&merged, field);
+        let incoming_len = text_field_len(&req.patch, field);
         if is_body_truncated(old_len, incoming_len, new_len, BODY_TRUNCATION_THRESHOLD) {
             return Err(AppError::BadRequest(format!(
-                "新 body 长度 {new_len} 低于既有 {old_len} 的 70% 阈值；疑似 LLM 截断/偷懒，已拒收。如确需缩短请人工调整后再写入",
+                "新 {field} 长度 {new_len} 低于既有 {old_len} 的 70% 阈值；疑似截断，已拒收。如确需缩短请通过明确的人工编辑流程",
             )));
         }
     }
@@ -387,10 +390,11 @@ fn prepare_chunk_revision(
     let replacement = if unchanged && !force_create_write {
         None
     } else {
-        Some(
-            mongodb::bson::from_document(merged)
-                .map_err(|e| AppError::External(format!("deserialize merged chunk failed: {e}")))?,
-        )
+        // Validate every modeled field before persisting, but retain the exact BSON
+        // used for after_hash so forward-compatible review fields are not discarded.
+        let _: OperationKnowledgeChunk = mongodb::bson::from_document(merged.clone())
+            .map_err(|e| AppError::External(format!("deserialize merged chunk failed: {e}")))?;
+        Some(merged)
     };
     let catalog_job = if unchanged && !force_create_write {
         None
@@ -457,7 +461,8 @@ async fn persist_prepared_chunk_revision_with_session(
         .await?;
     if let Some(replacement) = replacement {
         let replace_result = db
-            .operation_knowledge_chunks()
+            .raw()
+            .collection::<Document>("operation_knowledge_chunks")
             .replace_one_with_session(replace_filter, replacement, None, session)
             .await?;
         if replace_result.matched_count != 1 {
@@ -587,8 +592,9 @@ pub(crate) async fn apply_chunk_revision_with_session(
     req: RevisionRequest,
     session: &mut ClientSession,
 ) -> AppResult<RevisionApplied> {
-    let existing_doc = db
-        .operation_knowledge_chunks()
+    let existing_bson = db
+        .raw()
+        .collection::<Document>("operation_knowledge_chunks")
         .find_one_with_session(
             doc! { "_id": chunk_object_id, "workspace_id": workspace_id },
             None,
@@ -596,11 +602,16 @@ pub(crate) async fn apply_chunk_revision_with_session(
         )
         .await?
         .ok_or_else(|| AppError::NotFound("operation knowledge chunk not found".to_string()))?;
+    let existing_doc: OperationKnowledgeChunk = mongodb::bson::from_document(existing_bson.clone())
+        .map_err(|error| {
+            AppError::External(format!("deserialize existing chunk failed: {error}"))
+        })?;
     let schema = unique_active_schema_with_session(db, workspace_id, session).await?;
     let prepared = prepare_chunk_revision(
         workspace_id,
         chunk_object_id,
         &existing_doc,
+        existing_bson,
         schema.as_ref(),
         req,
     )?;
@@ -717,8 +728,9 @@ pub(crate) async fn rollback_chunk_revision_with_session(
     let target_snapshot = target
         .before_snapshot
         .ok_or_else(|| AppError::Conflict("chunk_revision_snapshot_unavailable".to_string()))?;
-    let current = db
-        .operation_knowledge_chunks()
+    let current_bson = db
+        .raw()
+        .collection::<Document>("operation_knowledge_chunks")
         .find_one_with_session(
             doc! { "_id": chunk_object_id, "workspace_id": workspace_id },
             None,
@@ -726,14 +738,15 @@ pub(crate) async fn rollback_chunk_revision_with_session(
         )
         .await?
         .ok_or_else(|| AppError::NotFound("operation knowledge chunk not found".to_string()))?;
-    let current_bson = mongodb::bson::to_document(&current)
-        .map_err(|error| AppError::External(format!("serialize current chunk failed: {error}")))?;
+    let current: OperationKnowledgeChunk = mongodb::bson::from_document(current_bson.clone())
+        .map_err(|error| AppError::Conflict(format!("chunk_revision_snapshot_invalid: {error}")))?;
     let mut restored = build_snapshot_rollback(&current_bson, &target_snapshot, actor);
     if let Some(schema) = unique_active_schema_with_session(db, workspace_id, session).await? {
         enforce_snapshot_domain_attributes(&mut restored, &schema)?;
     }
-    let replacement: OperationKnowledgeChunk = mongodb::bson::from_document(restored.clone())
+    let _: OperationKnowledgeChunk = mongodb::bson::from_document(restored.clone())
         .map_err(|error| AppError::Conflict(format!("chunk_revision_snapshot_invalid: {error}")))?;
+    let replacement = restored.clone();
     let before_hash = compute_chunk_hash(&current_bson);
     let after_hash = compute_chunk_hash(&restored);
     let revision_id = format!("rev_{}_{}", chunk_id, uuid::Uuid::new_v4().simple());
@@ -834,21 +847,14 @@ pub async fn apply_chunk_revision(
     Ok(applied)
 }
 
-// ── 帮手：text payload 长度（取 body / summary 中较长者）─────────────
+// ── 帮手：字段级 text payload 长度 ────────────────────────────────
 
-/// 取 chunk 中"主体文本"长度。优先 body，其次 summary。
-fn text_payload_len(d: &Document) -> usize {
-    let body_len = d
-        .get_str("body")
+fn text_field_len(document: &Document, field: &str) -> usize {
+    document
+        .get_str(field)
         .ok()
-        .map(|s| s.chars().count())
-        .unwrap_or(0);
-    let summary_len = d
-        .get_str("summary")
-        .ok()
-        .map(|s| s.chars().count())
-        .unwrap_or(0);
-    body_len.max(summary_len)
+        .map(|value| value.chars().count())
+        .unwrap_or(0)
 }
 
 // ── 删除级联：normalize_ref_key / cleanup_dangling_refs ───────────────
@@ -1066,6 +1072,56 @@ mod tests {
         assert_eq!(provenance.get_str("llm_model_alias").unwrap(), "provider-a");
         assert_eq!(provenance.get_datetime("edited_at").unwrap(), &edit_time);
         assert_eq!(provenance.get_str("edited_by").unwrap(), "operator");
+    }
+
+    #[test]
+    fn revision_preserves_unmodeled_review_fields_in_hashed_replacement() {
+        let chunk_id = ObjectId::new();
+        let existing = OperationKnowledgeChunk {
+            id: Some(chunk_id),
+            workspace_id: "ws-review".to_string(),
+            domain: "user_operations".to_string(),
+            title: "reviewed fact".to_string(),
+            status: "draft".to_string(),
+            integrity_status: Some("needs_review".to_string()),
+            ..OperationKnowledgeChunk::default()
+        };
+        let existing_bson = mongodb::bson::to_document(&existing).unwrap();
+        let prepared = prepare_chunk_revision(
+            "ws-review",
+            chunk_id,
+            &existing,
+            existing_bson,
+            None,
+            RevisionRequest {
+                op: RevisionOp::Verify,
+                source: ProvenanceSource::Human,
+                patch: doc! {
+                    "integrity_status": "verified",
+                    "status": "active",
+                    "verified_claims": ["claim-a"],
+                    "unsupported_claims": [],
+                },
+                reason: None,
+                actor: Some("operator".to_string()),
+            },
+        )
+        .unwrap();
+
+        let replacement = prepared.replacement.expect("replacement");
+        assert_eq!(
+            replacement.get_array("verified_claims").unwrap(),
+            &vec![Bson::String("claim-a".to_string())]
+        );
+        assert_eq!(
+            prepared.applied.after_hash,
+            compute_chunk_hash(&replacement)
+        );
+        assert_eq!(
+            prepared.revision.after_snapshot.as_ref().unwrap(),
+            &replacement,
+            "审计快照、哈希输入和实际 replacement 必须是同一 BSON"
+        );
     }
 
     #[test]
