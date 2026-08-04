@@ -18,7 +18,7 @@ import type {
   SimulationTurn
 } from "../../../types";
 import { useProfileStore } from "../../../stores/profileStore";
-import { useUserOpsStore } from "../../../stores/userOpsStore";
+import { principalEscalationCount, useInboxStore } from "../../../stores/inboxStore";
 import { useNavigationStore } from "../../../stores/navigationStore";
 import { JudgmentBar } from "./JudgmentBar";
 import { ObserveView } from "./ObserveView";
@@ -88,7 +88,7 @@ export function CockpitPanel(props: CockpitPanelProps) {
   const [viewMode, setViewMode] = useState<ViewMode>("observe");
   const [drilldown, setDrilldown] = useState<Drilldown>(null);
   const taxonomies = useProfileStore((s) => s.taxonomies);
-  const escalationPendingCount = useUserOpsStore((s) => s.escalationPendingCount);
+  const escalationPendingCount = useInboxStore((s) => principalEscalationCount(s.summary));
   const setChannel = useNavigationStore((s) => s.setChannel);
 
   // 空态：搬自原 UserOperationCockpit（legacy.tsx:282-292）。

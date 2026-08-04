@@ -1,0 +1,12 @@
+{
+  "circuitGeneration": 2,
+  "hasPanicDiagnostic": true,
+  "openedAtMs": 1700000000000,
+  "rapidPanicCount": 5,
+  "recoveredAtMs": 1700000000200,
+  "resumeRequestedAtMs": 1700000000300,
+  "resumeRequestedBy": "system-operator",
+  "status": "open",
+  "updatedAtMs": 1700000000100,
+  "workerName": "task_worker"
+}

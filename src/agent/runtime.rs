@@ -11,7 +11,7 @@ use futures::TryStreamExt;
 use mongodb::bson::{doc, Bson, Document};
 use mongodb::options::FindOptions;
 
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 use crate::models::{Contact, OperationDomainConfig};
 use crate::routes::AppState;
 
@@ -675,8 +675,21 @@ impl ResolvedThresholds {
     }
 
     /// 把 `threshold_overrides` 中某个 gate 的 `value` 应用到本 struct。
-    /// 5 闸值整数化（向下取整），PlannerBlockRate 保持 f64。未识别 gate_key 静默忽略。
-    fn apply_override(&mut self, gate_key: &str, value: f64) {
+    /// 5 闸只接受 [1,10] 整数，PlannerBlockRate 接受 [0.05,0.95] 有限小数。
+    /// 历史非法值 fail closed，避免 shadow 评估值与生产实际值不一致。
+    fn apply_override(&mut self, gate_key: &str, value: f64) -> AppResult<()> {
+        if is_review_gate(gate_key) && !is_integer_review_threshold(value) {
+            return Err(AppError::BadRequest(format!(
+                "invalid integer threshold override: {gate_key}={value}"
+            )));
+        }
+        if gate_key == "planner_block_rate_threshold"
+            && (!value.is_finite() || !(0.05..=0.95).contains(&value))
+        {
+            return Err(AppError::BadRequest(format!(
+                "invalid planner threshold override: {value}"
+            )));
+        }
         match gate_key {
             "fact_risk_block" => self.fact_risk_block = value as i32,
             "pressure_risk_block" => self.pressure_risk_block = value as i32,
@@ -686,6 +699,7 @@ impl ResolvedThresholds {
             "planner_block_rate_threshold" => self.planner_block_rate_threshold = value,
             _ => {}
         }
+        Ok(())
     }
 
     /// 把 5 闸值写回 [`UserRuntimeParameters`]，让既有 `review_passed` /
@@ -752,10 +766,28 @@ pub async fn resolve_thresholds(
         .map_err(crate::error::AppError::from)?
     {
         if seen.insert(o.gate_key.clone()) {
-            resolved.apply_override(&o.gate_key, o.value);
+            resolved.apply_override(&o.gate_key, o.value)?;
         }
     }
     Ok(resolved)
+}
+
+pub(crate) fn threshold_value_is_representable(gate_key: &str, value: f64) -> bool {
+    if is_review_gate(gate_key) {
+        is_integer_review_threshold(value)
+    } else if gate_key == "planner_block_rate_threshold" {
+        value.is_finite() && (0.05..=0.95).contains(&value)
+    } else {
+        false
+    }
+}
+
+fn is_review_gate(gate_key: &str) -> bool {
+    RESOLVED_GATE_KEYS[..5].contains(&gate_key)
+}
+
+fn is_integer_review_threshold(value: f64) -> bool {
+    value.is_finite() && (1.0..=10.0).contains(&value) && value.fract() == 0.0
 }
 
 /// 内部 helper：避免与 `agent::decision::load_user_operation_domain_config_for_contact`
@@ -1107,15 +1139,23 @@ mod tests {
     fn resolved_thresholds_apply_override_per_gate_key() {
         let runtime = baseline_runtime();
         let mut resolved = ResolvedThresholds::baseline(&runtime, 0.6);
-        resolved.apply_override("fact_risk_block", 8.0);
-        resolved.apply_override("pressure_risk_block", 9.0);
-        resolved.apply_override("human_like_score_rewrite", 4.0);
-        resolved.apply_override("emotional_value_rewrite", 3.0);
-        resolved.apply_override("product_accuracy_score_block", 5.0);
-        resolved.apply_override("planner_block_rate_threshold", 0.42);
+        resolved.apply_override("fact_risk_block", 8.0).unwrap();
+        resolved.apply_override("pressure_risk_block", 9.0).unwrap();
+        resolved
+            .apply_override("human_like_score_rewrite", 4.0)
+            .unwrap();
+        resolved
+            .apply_override("emotional_value_rewrite", 3.0)
+            .unwrap();
+        resolved
+            .apply_override("product_accuracy_score_block", 5.0)
+            .unwrap();
+        resolved
+            .apply_override("planner_block_rate_threshold", 0.42)
+            .unwrap();
         // 未识别 gate_key —— 静默忽略，不影响已有字段。
         let snapshot = resolved.clone();
-        resolved.apply_override("unknown_gate_key", 99.0);
+        resolved.apply_override("unknown_gate_key", 99.0).unwrap();
         assert_eq!(resolved, snapshot);
         assert_eq!(resolved.fact_risk_block, 8);
         assert_eq!(resolved.pressure_risk_block, 9);
@@ -1123,6 +1163,21 @@ mod tests {
         assert_eq!(resolved.emotional_value_rewrite, 3);
         assert_eq!(resolved.product_accuracy_score_block, 5);
         assert!((resolved.planner_block_rate_threshold - 0.42).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn resolved_thresholds_rejects_fractional_review_override() {
+        let runtime = baseline_runtime();
+        let mut resolved = ResolvedThresholds::baseline(&runtime, 0.6);
+        assert!(resolved
+            .apply_override("emotional_value_rewrite", 5.5)
+            .is_err());
+        assert_eq!(
+            resolved.emotional_value_rewrite,
+            runtime.emotional_value_rewrite_below
+        );
+        assert!(threshold_value_is_representable("fact_risk_block", 6.0));
+        assert!(!threshold_value_is_representable("fact_risk_block", 6.5));
     }
 
     /// W4 Task 5.1：apply_to_runtime 把 5 闸值写回 `UserRuntimeParameters`，

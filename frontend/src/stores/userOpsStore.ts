@@ -20,7 +20,7 @@ import type {
   DomainKey
 } from "../types";
 import { api } from "../lib/api";
-import { fetchSummary } from "../lib/inboxApi";
+import { useInboxStore } from "./inboxStore";
 import { useUiStore } from "./uiStore";
 import { useContactStore } from "./contactStore";
 import { useAccountStore } from "./accountStore";
@@ -41,9 +41,6 @@ interface UserOpsState {
   detailAccountId: string;
   detailContactId: string;
   detailGeneration: number;
-  // 判断条请示灯（Task 3）：统一收件箱里待本人裁决的请示数量（principalEscalation）。
-  escalationPendingCount: number | null;
-
   // 表单/草稿
   searchQuery: string;
   profileNote: string;
@@ -118,7 +115,6 @@ interface UserOpsActions {
   hydrateSelected: (contact: Contact) => void;
   clearContactDetail: (accountId: string) => void;
   loadMessages: (contact: Contact) => Promise<void>;
-  loadEscalationCount: () => Promise<void>;
   loadPlaybooks: (accountId: string) => Promise<void>;
   loadContacts: (accountId: string) => Promise<void>;
   loadContactCounts: (accountId: string) => Promise<void>;
@@ -327,7 +323,6 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
   detailAccountId: "",
   detailContactId: "",
   detailGeneration: 0,
-  escalationPendingCount: null,
 
   profileNote: "",
   customAgentInstructions: "",
@@ -500,21 +495,8 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
         firstErr.reason instanceof Error ? firstErr.reason.message : String(firstErr.reason),
       );
     }
-  // 判断条请示灯：与选中联系人数据并行加载；失败保留 unknown，不能伪装成 0。
-    void get().loadEscalationCount();
-  },
-
-  // 判断条请示灯：拉统一收件箱 summary，取待本人裁决的请示数（principalEscalation）。
-  // 失败/字段缺失为 null（不可用），与真实 0 明确区分。
-  loadEscalationCount: async () => {
-    try {
-      const summary = await fetchSummary();
-      const value = summary.counts.principalEscalation;
-      const count = typeof value === "number" ? value : null;
-      set({ escalationPendingCount: count });
-    } catch {
-      set({ escalationPendingCount: null });
-    }
+    // 判断条请示灯与请示频道共用 Inbox summary；失败保留最后成功快照，不能伪装成 0。
+    void useInboxStore.getState().refreshSummary();
   },
 
   // 加载剧本列表
@@ -654,6 +636,7 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
     } catch (error) {
       useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
     } finally {
+      set({ guideBusy: false });
       useUiStore.getState().setBusy(false);
     }
   },

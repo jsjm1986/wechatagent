@@ -80,18 +80,21 @@ pub(crate) fn classify_decision_tags(
 ///
 /// `dimension_kinds` 由调用方从 active DomainProfile 取（`decision_dimension_kinds`）。
 /// 返回 risks 由调用方 append 到 `promote_risks`。
-pub(crate) fn validate_and_normalize_decision(
+pub(crate) async fn validate_and_normalize_decision(
     db: &Database,
     decision: &mut AgentDecision,
     dimension_kinds: &[String],
     workspace_id: &str,
     scope_account_id: &str,
-) -> Vec<String> {
+) -> crate::error::AppResult<Vec<String>> {
     let shadow_snapshot = super::budget::current_shadow_evaluation_snapshot();
     let cache = match shadow_snapshot.as_ref() {
         Some(snapshot) => snapshot.taxonomy_cache.clone(),
         None => global_taxonomy_cache(db),
     };
+    if shadow_snapshot.is_none() {
+        cache.find_or_load(db, workspace_id).await?;
+    }
     let (risks, _candidates) = classify_decision_tags(
         decision,
         dimension_kinds,
@@ -99,7 +102,7 @@ pub(crate) fn validate_and_normalize_decision(
         scope_account_id,
         &cache,
     );
-    risks
+    Ok(risks)
 }
 
 /// 测试入口：手动注入 cache（绕过全局单例 + db），便于 PBT。

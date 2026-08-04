@@ -2,23 +2,16 @@
 
 ## Current Collections
 
-当前 MongoDB collections：
+Mongo collection 数量会随迁移与功能演进变化，本文不再维护易漂移的手抄全集。当前权威来源是：
 
-```text
-wechat_accounts
-contacts
-conversation_messages
-agent_tasks
-agent_events
-mcp_call_logs
-operation_playbooks
-operating_memories
-operation_knowledge_documents
-operation_knowledge_items
-operation_knowledge_chunks
-knowledge_usage_logs
-agent_decision_reviews
-```
+- `src/db/mod.rs` 的 typed collection accessors（当前 61 个）；
+- `src/db/indexes.rs` 的索引契约；
+- `src/db/migrations/` 的历史建表、回填与收敛步骤。
+
+核心业务集合包括 `wechat_accounts`、`contacts`、`conversation_messages`、`agent_tasks`、
+`agent_events`、`mcp_call_logs`、`operation_playbooks`、`operating_memories`、
+`operation_knowledge_documents/items/chunks`、`chunk_revisions`、`catalog_rebuild_jobs`、
+`knowledge_usage_logs`、`knowledge_gap_signals`、`agent_run_logs` 与 `agent_decision_reviews`。
 
 ## Core Identity
 
@@ -531,18 +524,18 @@ catalog_version            Option<i64>        每次 rebuild 自增
 chunk_revisions
     { _id, chunk_id, revision_id, op, patch: Document,
       before_hash: sha256, after_hash: sha256,
-      source: ai|human|rule|imported, reason?, created_at, created_by? }
-    op ∈ create | patch | split | merge | rollback | archive | restore | verify | unverify
+      source: ai|human|rule|imported|principal_authorized, reason?, created_at, created_by? }
+    op ∈ create | patch | split | merge | rollback | archive | restore | verify | unverify | reject
     索引：(chunk_id, revision_id desc)、(created_at desc)
 
 knowledge_gap_signals
     { _id, signal_id, kind, title, description,
       affected_chunk_ids: [String], search_queries: [String],
-      severity: warning|info, source: rule|llm,
+      severity: info|warning|error|high, source: rule|llm,
       status: pending|auto_resolved|llm_resolved|applied|dismissed,
       resolution_note?, created_at, resolved_at? }
-    kind ∈ orphan | broken_link | no_outlinks | low_confidence | stale
-           | contradiction | missing_chunk | suggestion
+    kind ∈ orphan | broken_link | missing_chunk | no_outlinks | low_confidence | stale
+           | suggestion | dangling_anchor | contradiction | recall_miss
     索引：(workspace_id, status, kind)、(workspace_id, created_at desc)
 
 domain_schemas
@@ -561,7 +554,7 @@ catalog_rebuild_jobs
 
 ### 新增 chunk 编辑路由（7 个）
 
-走同一函数 `apply_chunk_revision`：read-existing → 锁定字段守门 → 数组字段 union → 70% body 长度阈值 → AI 写入强制 draft+needs_review → chunk_revisions + chunks 双写（先 revisions 后 chunks）→ enqueue catalog_rebuild_job。
+走同一函数 `apply_chunk_revision`：read-existing → 锁定字段守门 → 数组字段 union → `body / summary / answer` 逐字段 70% 阈值 → AI 写入强制 draft+needs_review → 在同一 Mongo 事务内写 revision、以 `updated_at` CAS 替换 chunk、推进父文档 catalog generation 并写 durable rebuild intent；任一步失败整体回滚。
 
 > verify / reject / auto-verify / batch-verify 这四个核验路由同样经 `apply_chunk_revision` 落 chunk_revisions 审计历史——「needs_review→verified」这一最关键状态转移此前直接 update_one 绕过审计，现已补全。source 标注：单条 verify/reject、batch-verify = `human`（运营手工点击）；auto-verify = `rule`（裁决由 LLM 自评+规则闸门做出、admin 仅触发批处理，标 rule 才如实反映"规则化批处理写入"，避免审计误判"有人逐条审定"）。
 

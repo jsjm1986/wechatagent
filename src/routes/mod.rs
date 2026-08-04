@@ -46,7 +46,7 @@ pub mod chunk_locks;
 // domain_profiles / ask_human_inbox 先例。生产路由注册仍走下方 use。
 pub mod contacts;
 #[cfg(test)]
-mod contract_snapshot;
+pub(crate) mod contract_snapshot;
 mod conversations;
 // pub（非 pub(crate)）：domain_profile_e2e.rs 集成测试需从 tests/ crate 直调
 // publish/update/rollout/rollback handler 真函数（覆盖 realign + $set 部分更新），仿
@@ -91,6 +91,7 @@ mod shared;
 mod simulations;
 mod souls;
 pub mod tasks;
+mod worker_controls;
 
 pub use knowledge::{ChunkBatchArchiveRequest, ChunkBatchVerifyRequest, ChunkReferrersQuery};
 pub use outcomes_autonomy::{
@@ -265,6 +266,7 @@ use reviews::{get_decision_review, list_decision_reviews};
 use simulations::{run_user_operation_evaluation, simulate_user_operation_dialogue};
 use souls::{create_agent_soul, list_agent_souls, publish_agent_soul, update_agent_soul};
 use tasks::{cancel_agent_task, list_agent_runs, list_llm_usage, list_tasks, review_task_now};
+use worker_controls::{list_worker_controls, resume_worker_control};
 
 /// F-013：operation-knowledge completeness 的进程内 TTL 缓存。
 /// key = (workspace_id, account_id)；value = (计算完成的 Unix 毫秒, 结果 JSON)。
@@ -819,6 +821,11 @@ pub fn api_router(state: AppState) -> Router<AppState> {
             post(reject_management_command),
         )
         .route("/management-agent/tool-catalog", get(get_tool_catalog))
+        .route("/admin/worker-controls", get(list_worker_controls))
+        .route(
+            "/admin/worker-controls/:worker/resume",
+            post(resume_worker_control),
+        )
         // ── agent-autonomy-loop W3 / Task 4.8：双层标签 admin 路由 ─────────────
         .route(
             "/admin/taxonomies",

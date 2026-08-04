@@ -213,22 +213,26 @@ pub(crate) fn memory_card_from_contact(
     let business_context = doc_string(&contact.profile_attributes, "businessContext")
         .or_else(|| doc_string(&memory.user_understanding, "businessContext"))
         .unwrap_or_default();
-    let mut core_facts: Vec<String> = Vec::new();
-    // ⑨真因修正:memory_summary 是短期滚动上下文(gateway append 累积),不当权威 core_fact;
-    // 归位到下方 extra.recentEpisodeSummary。human_profile_note(运营手写)仍是权威事实。
-    push_unique_text(&mut core_facts, contact.human_profile_note.as_deref());
-    // 标签可信度改造：manual_tags（运营权威）优先，confirmed_tags 补充
+    let mut core_facts: Vec<MemoryFactRepr> = Vec::new();
+    // memory_summary is rolling context, not an authoritative core fact. Operator-authored
+    // notes/tags are represented structurally so capacity ranking cannot place them below LLM
+    // facts merely because legacy Plain values carry no evidence ids.
+    push_seed_fact(
+        &mut core_facts,
+        contact.human_profile_note.as_deref(),
+        "operator_manual",
+    );
     for tag in &contact.manual_tags {
         if core_facts.len() >= 6 {
             break;
         }
-        push_unique_text(&mut core_facts, Some(tag));
+        push_seed_fact(&mut core_facts, Some(tag), "operator_manual");
     }
     for confirmed in &contact.confirmed_tags {
         if core_facts.len() >= 6 {
             break;
         }
-        push_unique_text(&mut core_facts, Some(&confirmed.value));
+        push_seed_fact(&mut core_facts, Some(&confirmed.value), "confirmed_tag");
     }
     let mut preferences = Vec::new();
     push_unique_text(&mut preferences, Some(&communication_style));
@@ -287,11 +291,23 @@ pub(crate) fn memory_card_from_contact(
     extra.insert("source", "contact_seed");
 
     MemoryCardTyped {
-        core_facts: core_facts.into_iter().map(MemoryFactRepr::Plain).collect(),
+        core_facts,
         recent_facts: Vec::new(),
         deprecated_facts: Vec::new(),
         extra,
     }
+}
+
+fn push_seed_fact(items: &mut Vec<MemoryFactRepr>, value: Option<&str>, source: &str) {
+    let Some(text) = value.map(str::trim).filter(|item| !item.is_empty()) else {
+        return;
+    };
+    if items.iter().any(|item| item.as_text() == text) {
+        return;
+    }
+    let mut fact = crate::models::MemoryFact::from_plain_text(text.to_string());
+    fact.extra.insert("source", source);
+    items.push(MemoryFactRepr::Structured(fact));
 }
 
 fn push_unique_text(items: &mut Vec<String>, value: Option<&str>) {
@@ -574,6 +590,11 @@ fn core_fact_source_authority(fact: &MemoryFactRepr) -> i32 {
     let MemoryFactRepr::Structured(fact) = fact else {
         return 0;
     };
+    match fact.extra.get_str("source").ok() {
+        Some("operator_manual") => return 100,
+        Some("confirmed_tag") => return 20,
+        _ => {}
+    }
     let mut score = 1;
     if !fact.source_message_ids.is_empty() {
         score += 8;
@@ -703,10 +724,11 @@ pub(crate) fn value_has_non_atomic_fact(value: &serde_json::Value) -> bool {
     for key in ["coreFacts", "recentFacts"] {
         if let Some(arr) = card.get(key).and_then(|v| v.as_array()) {
             for item in arr {
-                if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-                    if fact_is_non_atomic(text) {
-                        return true;
-                    }
+                let text = item
+                    .as_str()
+                    .or_else(|| item.get("text").and_then(|value| value.as_str()));
+                if text.is_some_and(fact_is_non_atomic) {
+                    return true;
                 }
             }
         }
@@ -3806,6 +3828,49 @@ mod r7_deprecation_tests {
             }
         });
         assert!(value_has_non_atomic_fact(&v));
+    }
+
+    #[test]
+    fn value_scan_detects_blob_in_legacy_string_array() {
+        let value = serde_json::json!({
+            "memoryCard": {
+                "coreFacts": ["孩子8岁\n更新为10岁\n最终确认8岁"],
+                "recentFacts": ["预算5000"]
+            }
+        });
+        assert!(super::value_has_non_atomic_fact(&value));
+    }
+
+    #[test]
+    fn operator_seed_fact_survives_real_capacity_eviction() {
+        let mut manual = crate::models::MemoryFact::from_plain_text("运营确认".to_string());
+        manual.extra.insert("source", "operator_manual");
+        let mut facts = vec![MemoryFactRepr::Structured(manual)];
+        for index in 0..6 {
+            let mut llm = crate::models::MemoryFact::from_plain_text(format!("模型事实{index}"));
+            llm.source_run_id = Some(format!("run-{index}"));
+            llm.evidence = Some(format!("evidence-{index}"));
+            llm.source_message_ids
+                .push(mongodb::bson::oid::ObjectId::new());
+            facts.push(MemoryFactRepr::Structured(llm));
+        }
+        let compact = super::compact_memory_card_with_previous(
+            &crate::models::MemoryCardTyped {
+                core_facts: facts,
+                ..Default::default()
+            },
+            None,
+            &[],
+        );
+        assert_eq!(compact.core_facts.len(), 6);
+        assert!(compact
+            .core_facts
+            .iter()
+            .any(|fact| fact.as_text() == "运营确认"));
+        assert!(compact
+            .recent_facts
+            .iter()
+            .any(|fact| fact.as_text().starts_with("模型事实")));
     }
 
     #[test]

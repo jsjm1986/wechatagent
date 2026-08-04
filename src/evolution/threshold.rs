@@ -1,12 +1,12 @@
 //! threshold 候选生成（M4 W2 Task 3.1）。
 //!
-//! 纯统计路径：在 cohort 窗口内统计 6 个 gate 的命中率（fact_risk_block /
+//! 纯统计路径：在 cohort 窗口内统计 5 个 review gate 的命中率（fact_risk_block /
 //! pressure_risk_block / human_like_score_rewrite / emotional_value_rewrite /
-//! product_accuracy_score_block / planner_block_rate_threshold），与
+//! product_accuracy_score_block），与
 //! [`THRESHOLD_REASONABLE_BANDS`] 对比：
 //!
-//! - 命中率 < 下限 → 候选 +step（表示阈值过严，需放松）
-//! - 命中率 > 上限 → 候选 -step（表示阈值过松，需收紧）
+//! - `score >= threshold` 命中：命中率低则减阈值，高则加阈值；
+//! - `score < threshold` 命中：方向相反。
 //!
 //! 候选 `proposed_value` clamp 到硬上下限（5 闸 [1,10]、PlannerBlockRate
 //! [0.05, 0.95]）；同 gate 在 cooldown 内已 release 过则跳过。
@@ -55,20 +55,20 @@ const FIVE_GATE_HARD_MAX: f64 = 10.0;
 const PLANNER_BLOCK_RATE_HARD_MIN: f64 = 0.05;
 const PLANNER_BLOCK_RATE_HARD_MAX: f64 = 0.95;
 
-/// 5 闸阈值步长（命中率失衡时单次调整幅度）。
-const FIVE_GATE_STEP: f64 = 0.5;
+/// 5 闸运行时使用整数阈值，候选也必须使用整数步长。
+const FIVE_GATE_STEP: f64 = 1.0;
 /// PlannerBlockRate 步长（小数比例，按 5% 一步走）。
 const PLANNER_BLOCK_RATE_STEP: f64 = 0.05;
 
 /// 把 final_review_status 映射到 5 闸命中分类。返回 `Some(gate_key)` 表示这条
-/// run 命中某 gate；返回 `None` 表示不算任何 gate（如 approved / approved_after_revision）。
+/// run 命中某 gate；返回 `None` 表示不算任何 gate（如 approved / revision_applied_approved）。
 fn classify_gate_hit(final_review_status: &str) -> Option<&'static str> {
     match final_review_status {
         "blocked_unverified_product_claim" => Some("product_accuracy_score_block"),
         "held_by_ai_policy" => Some("fact_risk_block"),
         "blocked_by_safety_guard" => Some("pressure_risk_block"),
         // human_like / emotional_value 是 rewrite 类，rewrite 后通常 final 走
-        // approved_after_revision；这里通过 revision_applied 字段补判（在 generate 内）。
+        // revision_applied_approved；这里通过 revision_applied 字段补判（在 generate 内）。
         _ => None,
     }
 }
@@ -89,10 +89,8 @@ pub async fn generate(
     }
     // 1. 把 cohort 内每条 run 拉出来，按 gate 累加命中数。
     let mut total_runs = 0_u64;
-    let mut hit_counts: HashMap<&'static str, u64> = THRESHOLD_REASONABLE_BANDS
-        .iter()
-        .map(|(k, _, _)| (*k, 0))
-        .collect();
+    let mut hit_counts: HashMap<&'static str, f64> =
+        review_gate_keys().iter().map(|gate| (*gate, 0.0)).collect();
     let mut cursor = state
         .db
         .agent_run_logs()
@@ -110,18 +108,17 @@ pub async fn generate(
         total_runs += 1;
         if let Some(gate) = classify_gate_hit(&run.final_review_status) {
             if let Some(c) = hit_counts.get_mut(gate) {
-                *c += 1;
+                *c += 1.0;
             }
         }
         if run.revision_applied {
             // revision 触发意味着 human_like / emotional_value 至少有一个rewrite。
-            // 这里粗略地把每次 revision 算 0.5 命中给 human_like + 0.5 给 emotional_value，
-            // 让两侧阈值都能感知到信号。整数计数用 ceil。
+            // 当前 run log 未记录究竟是哪一个 rewrite 闸触发，暂按两侧各 0.5 分摊。
             if let Some(c) = hit_counts.get_mut("human_like_score_rewrite") {
-                *c += 1;
+                *c += 0.5;
             }
             if let Some(c) = hit_counts.get_mut("emotional_value_rewrite") {
-                *c += 1;
+                *c += 0.5;
             }
         }
     }
@@ -151,7 +148,11 @@ pub async fn generate(
     }
     let mut candidates: Vec<Candidate> = Vec::new();
     for (gate, lower, upper) in THRESHOLD_REASONABLE_BANDS {
-        let hits = *hit_counts.get(gate).unwrap_or(&0) as f64;
+        // Planner block rate 没有 agent_run_logs 同源样本。缺样本不是 0 命中，
+        // 因此在接入真实观测源前不生成 planner 候选。
+        let Some(hits) = hit_counts.get(gate).copied() else {
+            continue;
+        };
         let hit_rate = hits / total_runs_f;
         if hit_rate >= *lower && hit_rate <= *upper {
             // 已在目标区间，不产候选。
@@ -161,29 +162,9 @@ pub async fn generate(
         let current_value = active
             .map(|override_row| override_row.value)
             .unwrap_or_else(|| default_threshold_value(state, gate));
-        let step = if *gate == "planner_block_rate_threshold" {
-            PLANNER_BLOCK_RATE_STEP
-        } else {
-            FIVE_GATE_STEP
-        };
-        // hit_rate 偏低 → 阈值过严 → +step（让阈值更高，更难触发，命中率下降——
-        // 等等，这里语义反了：阈值越高越难触发命中率上升）。
-        // 业务上：5 闸都是"分数 ≥ 阈值"才命中（block / rewrite），阈值越低 → 越多 run 命中。
-        //   hit_rate 过低 → 阈值过高 → 应当 -step 让阈值降低，命中更多。
-        //   hit_rate 过高 → 阈值过低 → 应当 +step 让阈值升高，命中更少。
-        // PlannerBlockRate 同款方向：rate 越低越严格（更早 backoff），rate 过低 → +step。
-        let proposed_raw = if hit_rate < *lower {
-            current_value - step
-        } else {
-            current_value + step
-        };
-        let (hard_min, hard_max) = if *gate == "planner_block_rate_threshold" {
-            (PLANNER_BLOCK_RATE_HARD_MIN, PLANNER_BLOCK_RATE_HARD_MAX)
-        } else {
-            (FIVE_GATE_HARD_MIN, FIVE_GATE_HARD_MAX)
-        };
-        let proposed_clamped = proposed_raw.clamp(hard_min, hard_max);
-        let clamped = (proposed_clamped - proposed_raw).abs() > f64::EPSILON;
+        let (proposed_value, clamped) =
+            decide_candidate(gate, current_value, hit_rate, *lower, *upper)
+                .expect("out-of-band hit rate must produce a threshold candidate");
         let distance = if hit_rate < *lower {
             *lower - hit_rate
         } else {
@@ -195,7 +176,7 @@ pub async fn generate(
             target_lower: *lower,
             target_upper: *upper,
             current_value,
-            proposed_raw: proposed_clamped,
+            proposed_raw: proposed_value,
             clamped,
             cooldown_active: cooldown_skipped.contains(&gate.to_string()),
             distance_from_band: distance,
@@ -315,7 +296,7 @@ fn default_threshold_value(state: &AppState, gate: &str) -> f64 {
         "fact_risk_block" => 6.0,
         "pressure_risk_block" => 7.0,
         "human_like_score_rewrite" => 6.0,
-        "emotional_value_rewrite" => 5.0,
+        "emotional_value_rewrite" => 6.0,
         "product_accuracy_score_block" => 7.0,
         "planner_block_rate_threshold" => state.config.strategic_planner_block_rate_threshold,
         _ => 0.0,
@@ -371,12 +352,8 @@ struct ActiveThresholdOverride {
 /// 纯函数版本：给定 gate 名 / 当前阈值 / 命中率 / 区间，返回（建议值, 是否被 clamp）。
 /// 与 [`generate`] 的内部逻辑保持一致；抽出独立函数仅为单测可达。
 ///
-/// 语义：业务上 5 闸都是"分数 ≥ 阈值"才命中（block / rewrite），阈值越低 → 越多
-/// run 命中。所以：
-/// - hit_rate 过低 → 阈值过高 → -step（让阈值降低，命中更多）
-/// - hit_rate 过高 → 阈值过低 → +step（让阈值升高，命中更少）
-///
-/// PlannerBlockRate 同款方向：rate 越低越严格，rate 过低 → +step。
+/// 比较方向由 gate 决定：hallucination / pressure / planner 是 `>=` 命中，
+/// human-like / emotional-value / grounding 是 `<` 命中。
 pub fn decide_candidate(
     gate: &str,
     current_value: f64,
@@ -392,10 +369,15 @@ pub fn decide_candidate(
     } else {
         FIVE_GATE_STEP
     };
-    let proposed_raw = if hit_rate < target_lower {
-        current_value - step
+    let low_hit_adjustment = if gate_hits_below_threshold(gate) {
+        step
     } else {
-        current_value + step
+        -step
+    };
+    let proposed_raw = if hit_rate < target_lower {
+        current_value + low_hit_adjustment
+    } else {
+        current_value - low_hit_adjustment
     };
     let (hard_min, hard_max) = if gate == "planner_block_rate_threshold" {
         (PLANNER_BLOCK_RATE_HARD_MIN, PLANNER_BLOCK_RATE_HARD_MAX)
@@ -405,6 +387,23 @@ pub fn decide_candidate(
     let proposed_clamped = proposed_raw.clamp(hard_min, hard_max);
     let clamped = (proposed_clamped - proposed_raw).abs() > f64::EPSILON;
     Some((proposed_clamped, clamped))
+}
+
+fn review_gate_keys() -> &'static [&'static str] {
+    &[
+        "fact_risk_block",
+        "pressure_risk_block",
+        "human_like_score_rewrite",
+        "emotional_value_rewrite",
+        "product_accuracy_score_block",
+    ]
+}
+
+fn gate_hits_below_threshold(gate: &str) -> bool {
+    matches!(
+        gate,
+        "human_like_score_rewrite" | "emotional_value_rewrite" | "product_accuracy_score_block"
+    )
 }
 
 #[cfg(test)]
@@ -426,7 +425,7 @@ mod tests {
             Some("pressure_risk_block")
         );
         assert_eq!(classify_gate_hit("approved"), None);
-        assert_eq!(classify_gate_hit("approved_after_revision"), None);
+        assert_eq!(classify_gate_hit("revision_applied_approved"), None);
     }
 
     #[test]
@@ -440,7 +439,7 @@ mod tests {
 
     #[test]
     fn five_gate_clamp_keeps_proposal_in_range() {
-        // hit_rate 极低，candidate 会 -step；但 clamp 限制 ≥ 1.0。
+        // >= 命中闸在 hit_rate 极低时会 -step；clamp 限制 ≥ 1.0。
         let proposed = (1.0_f64 - FIVE_GATE_STEP).clamp(FIVE_GATE_HARD_MIN, FIVE_GATE_HARD_MAX);
         assert_eq!(proposed, FIVE_GATE_HARD_MIN);
         let proposed_high =
@@ -455,21 +454,21 @@ mod tests {
         assert_eq!(proposed, PLANNER_BLOCK_RATE_HARD_MIN);
     }
 
-    /// hit_rate 显著低于下限 → 阈值需 -step（让命中更容易，命中率回升）。
+    /// >= 命中闸：hit_rate 低于下限时减阈值，让命中率回升。
     #[test]
     fn decide_candidate_hit_rate_below_lower_decreases_threshold() {
         let (proposed, clamped) =
             decide_candidate("fact_risk_block", 6.0, 0.01, 0.05, 0.15).unwrap();
-        assert_eq!(proposed, 5.5);
+        assert_eq!(proposed, 5.0);
         assert!(!clamped);
     }
 
-    /// hit_rate 显著高于上限 → 阈值需 +step（让命中更难，命中率回落）。
+    /// >= 命中闸：hit_rate 高于上限时加阈值，让命中率回落。
     #[test]
     fn decide_candidate_hit_rate_above_upper_increases_threshold() {
         let (proposed, clamped) =
             decide_candidate("pressure_risk_block", 7.0, 0.30, 0.05, 0.15).unwrap();
-        assert_eq!(proposed, 7.5);
+        assert_eq!(proposed, 8.0);
         assert!(!clamped);
     }
 
@@ -488,12 +487,22 @@ mod tests {
         assert!(clamped);
     }
 
+    #[test]
+    fn decide_candidate_low_score_gate_uses_reverse_direction() {
+        let (low_rate, _) =
+            decide_candidate("emotional_value_rewrite", 6.0, 0.01, 0.08, 0.18).unwrap();
+        let (high_rate, _) =
+            decide_candidate("product_accuracy_score_block", 7.0, 0.30, 0.05, 0.15).unwrap();
+        assert_eq!(low_rate, 7.0, "低于阈值命中：命中率低应提高阈值");
+        assert_eq!(high_rate, 6.0, "低于阈值命中：命中率高应降低阈值");
+    }
+
     /// PlannerBlockRate 用更小的步长（5%）。
     #[test]
     fn decide_candidate_uses_planner_step_for_block_rate() {
         let (proposed, _) =
             decide_candidate("planner_block_rate_threshold", 0.5, 0.05, 0.10, 0.30).unwrap();
-        // hit_rate < lower → -step
+        // planner >= 命中：hit_rate < lower → -step
         assert!((proposed - 0.45).abs() < 1e-9);
     }
 }

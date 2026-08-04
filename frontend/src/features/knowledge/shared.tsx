@@ -13,7 +13,8 @@ import {
   Undo2,
   X,
 } from "lucide-react";
-import { api, parseApiError, LlmUnavailableError } from "../../lib/api";
+import { api, parseApiError } from "../../lib/api";
+export { LlmErrorBanner } from "../../components/LlmErrorBanner";
 import { useConfirm } from "../../components/ui/ConfirmDialog";
 import { useFormDialog } from "../../components/ui/FormDialog";
 import { useToast } from "../../components/ui/Toast";
@@ -53,75 +54,6 @@ export async function loadChunkOptions(): Promise<PickerChunk[]> {
   } catch {
     return chunkOptionsCache?.items ?? [];
   }
-}
-
-const LLM_KIND_LABELS: Record<string, string> = {
-  timeout: "上游超时",
-  connect_failed: "无法连接",
-  body_decode_error: "响应体损坏",
-  network_error: "网络异常",
-  rate_limited: "上游限流",
-  http_5xx: "上游 5xx",
-  http_4xx: "上游 4xx",
-  endpoint_not_found: "地址路径错(404)",
-  empty_response: "空响应",
-  external_error: "上游错误",
-  json_decode_error: "JSON 解析失败",
-  unknown: "未知错误"
-};
-
-function llmKindLabel(kind: string): string {
-  return LLM_KIND_LABELS[kind] ?? kind;
-}
-
-/**
- * 统一渲染 LLM 调用失败的提示横幅，给所有调 LLM 的面板复用。
- *
- * - `error` 是 `LlmUnavailableError` → 显示 kind 标签 + hint + 重试次数 + 「AI 重试」
- * - `error` 是普通 `Error` → 显示 message + 「AI 重试」（走通用错误路径）
- */
-export function LlmErrorBanner(props: {
-  error: Error;
-  onRetry?: () => void;
-  retrying?: boolean;
-}) {
-  const { error, onRetry, retrying } = props;
-  const isLlm = error instanceof LlmUnavailableError;
-  const kind = isLlm ? (error as LlmUnavailableError).kind : "unknown";
-  const hint = isLlm
-    ? (error as LlmUnavailableError).hint
-    : error.message || "调用 LLM 失败，请稍后再试。";
-  const retryCount = isLlm ? (error as LlmUnavailableError).retryCount : 0;
-  const detail = isLlm ? (error as LlmUnavailableError).detail : "";
-  return (
-    <div className="llmErrorBanner" role="alert">
-      <div className="llmErrorBanner__head">
-        <span className="llmErrorBanner__kind">{llmKindLabel(kind)}</span>
-        {retryCount > 0 ? (
-          <span className="llmErrorBanner__retries">已自动重试 {retryCount} 次</span>
-        ) : null}
-      </div>
-      <div className="llmErrorBanner__hint">{hint}</div>
-      {detail && detail !== hint ? (
-        <details className="llmErrorBanner__detail">
-          <summary>查看技术细节</summary>
-          <code>{detail}</code>
-        </details>
-      ) : null}
-      {onRetry ? (
-        <div className="llmErrorBanner__actions">
-          <button
-            type="button"
-            className="primary"
-            onClick={onRetry}
-            disabled={retrying}
-          >
-            {retrying ? "AI 重试中…" : "AI 重试"}
-          </button>
-        </div>
-      ) : null}
-    </div>
-  );
 }
 
 export type ReviewCategory =

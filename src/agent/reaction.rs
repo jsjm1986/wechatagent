@@ -12,6 +12,7 @@
 use std::sync::Arc;
 
 use mongodb::bson::{doc, oid::ObjectId, to_document, DateTime, Document};
+use sha2::{Digest, Sha256};
 
 use crate::error::{AppError, AppResult};
 use crate::models::{Contact, ConversationMessage, OperationKnowledgeChunk};
@@ -587,19 +588,8 @@ pub(crate) async fn enqueue_negative_example_chunk(
 ) -> AppResult<()> {
     let coll = state.db.operation_knowledge_chunks();
     let source_review_id_str = source_review_id.to_hex();
-
-    // 幂等：同一 source_review_id 已经入过队就跳过。
-    let existed = coll
-        .count_documents(
-            doc! {
-                "domain_attributes.source_review_id": &source_review_id_str,
-            },
-            None,
-        )
-        .await?;
-    if existed > 0 {
-        return Ok(());
-    }
+    let chunk_id =
+        negative_example_chunk_id(&contact.workspace_id, &contact.account_id, source_review_id);
 
     let now = DateTime::now();
     let title = format!(
@@ -618,7 +608,7 @@ pub(crate) async fn enqueue_negative_example_chunk(
     domain_attributes.insert("contact_wxid", contact.wxid.clone());
 
     let chunk = OperationKnowledgeChunk {
-        id: None,
+        id: Some(chunk_id),
         workspace_id: contact.workspace_id.clone(),
         account_id: Some(contact.account_id.clone()),
         document_id: None,
@@ -645,8 +635,85 @@ pub(crate) async fn enqueue_negative_example_chunk(
         chunk_type: "negative_example".to_string(),
         ..OperationKnowledgeChunk::default()
     };
-    coll.insert_one(chunk, None).await?;
-    Ok(())
+
+    // Chunk 与 create revision 原子落地。确定性 `_id` 把并发重试收敛到同一实体；
+    // 若另一个事务已先提交，校验完整业务身份后按幂等成功返回。
+    let mut session = state.db.client().start_session(None).await?;
+    session.start_transaction(None).await?;
+    let result: AppResult<()> = async {
+        coll.insert_one_with_session(chunk, None, &mut session)
+            .await?;
+        crate::knowledge_wiki::chunk_revisions::apply_chunk_revision_with_session(
+            &state.db,
+            &contact.workspace_id,
+            chunk_id,
+            crate::knowledge_wiki::chunk_revisions::RevisionRequest {
+                op: crate::knowledge_wiki::chunk_revisions::RevisionOp::Create,
+                source: crate::knowledge_wiki::chunk_revisions::ProvenanceSource::Rule,
+                patch: Document::new(),
+                reason: Some(format!(
+                    "reviewer misjudge negative example from review {source_review_id_str}"
+                )),
+                actor: Some("reaction_feedback_worker".to_string()),
+            },
+            &mut session,
+        )
+        .await?;
+        Ok(())
+    }
+    .await;
+    match result {
+        Ok(()) => {
+            crate::knowledge_wiki::chunk_revisions::commit_chunk_transaction(&mut session).await
+        }
+        Err(AppError::Db(error)) if crate::agent::escalation::is_duplicate_key_error(&error) => {
+            let _ = session.abort_transaction().await;
+            let existing = coll
+                .find_one(
+                    doc! {
+                        "_id": chunk_id,
+                        "workspace_id": &contact.workspace_id,
+                        "account_id": &contact.account_id,
+                        "domain_attributes.source_review_id": &source_review_id_str,
+                        "chunk_type": "negative_example",
+                    },
+                    None,
+                )
+                .await?;
+            if existing.is_some() {
+                Ok(())
+            } else {
+                Err(AppError::Conflict(
+                    "negative_example_identity_conflict".to_string(),
+                ))
+            }
+        }
+        Err(error) => {
+            let _ = session.abort_transaction().await;
+            Err(error)
+        }
+    }
+}
+
+fn negative_example_chunk_id(
+    workspace_id: &str,
+    account_id: &str,
+    source_review_id: ObjectId,
+) -> ObjectId {
+    let mut hasher = Sha256::new();
+    for value in [
+        "reviewer-misjudge-negative-example-v1",
+        workspace_id,
+        account_id,
+        &source_review_id.to_hex(),
+    ] {
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 12];
+    bytes.copy_from_slice(&digest[..12]);
+    ObjectId::from_bytes(bytes)
 }
 
 fn truncate_for_title(text: &str, max_chars: usize) -> String {

@@ -221,26 +221,26 @@ proptest! {
 proptest! {
     #[test]
     fn prop_enforce_locked_pins_to_existing(
-        chunk_id_existing in arb_label(),
+        workspace_id_existing in arb_label(),
         wiki_type_existing in prop_oneof![
             Just("entity"), Just("concept"), Just("methodology"), Just("finding")
         ],
-        chunk_id_evil in arb_label(),
+        workspace_id_evil in arb_label(),
         wiki_type_evil in arb_label(),
         title in arb_label(),
     ) {
         let existing = doc! {
-            "chunk_id": chunk_id_existing.clone(),
+            "workspace_id": workspace_id_existing.clone(),
             "wiki_type": wiki_type_existing,
             "title": "T",
         };
         let merged = doc! {
-            "chunk_id": chunk_id_evil,
+            "workspace_id": workspace_id_evil,
             "wiki_type": wiki_type_evil,
             "title": title.clone(),
         };
-        let pinned = enforce_locked_fields(&merged, &existing, &["chunk_id", "wiki_type"]);
-        prop_assert_eq!(pinned.get_str("chunk_id").unwrap(), &chunk_id_existing);
+        let pinned = enforce_locked_fields(&merged, &existing, &["workspace_id", "wiki_type"]);
+        prop_assert_eq!(pinned.get_str("workspace_id").unwrap(), &workspace_id_existing);
         prop_assert_eq!(pinned.get_str("wiki_type").unwrap(), wiki_type_existing);
         // 非锁定字段保留 merged 形态
         prop_assert_eq!(pinned.get_str("title").unwrap(), &title);

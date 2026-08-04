@@ -17,6 +17,8 @@ type ResultTone = "good" | "error" | "warn" | "neutral";
 
 function resultTone(status?: string): ResultTone {
   const s = (status || "").toLowerCase();
+  // accepted 先判：它是「已入队待送达」，既不是成功也不是失败，按 warn 提示待确认。
+  if (s.includes("accepted")) return "warn";
   if (s.includes("succeeded") || s.includes("success") || s === "ok") return "good";
   if (s.includes("fail") || s.includes("error") || s.includes("blocked") || s.includes("unknown")) return "error";
   if (s.includes("dry") || s.includes("warn") || s.includes("pending")) return "warn";
@@ -29,10 +31,13 @@ function planStepStatus(call: CommandToolCall): PlanStepStatus {
 
 // tool call 终态标签：闭集见 src/routes/management.rs CommandToolCall.status。
 // executed_unverified = 工具 Ok 但业务结果未核实，必须显「待核实」不当成功展示（诚实优于好看）。
+// accepted = 发送意图已持久入队、尚未拿到送达回执，同理不当「成功」展示。
 function callStatusLabel(status: string): string {
   switch (status) {
     case "succeeded":
       return "✅ 成功";
+    case "accepted":
+      return "📨 已受理，待送达";
     case "failed":
       return "❌ 失败";
     case "executed_unverified":
@@ -50,7 +55,7 @@ function callStatusLabel(status: string): string {
   }
 }
 
-// gateway 终态闭集（src/agent/run_envelope.rs GATEWAY_STATUS_VALUES，32 值）→ 中文业务语义标签。
+// gateway 终态闭集（src/agent/run_envelope.rs GATEWAY_STATUS_VALUES，fixture 对账）→ 中文业务语义标签。
 // 单一真相源统一到 lib/reviewLabels.ts 的 GATEWAY_STATUS_LABELS（与 finalReviewStatus 交集键复用同措辞）。
 function gatewayStatusLabel(status: string): string {
   return labelOf(GATEWAY_STATUS_LABELS, status);

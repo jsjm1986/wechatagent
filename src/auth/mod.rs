@@ -39,7 +39,8 @@ pub struct AdminUser {
     pub default_workspace: Option<String>,
 }
 
-/// admin session：cookie 里只存 session_id；admin_user_id 反向关联。
+/// admin session：cookie 持有随机 session token；Mongo 的 `session_id` 只保存
+/// `sha256-v1:<digest>`（旧明文行在首次成功查询时透明迁移）。admin_user_id 反向关联。
 /// `expires_at` 同时是 mongo TTL index 的字段（过期自动清理）。
 /// `current_workspace` 表示该 session 当前选中的 workspace；切换 workspace
 /// 时由 `routes/auth::switch_workspace` 原地更新这一字段。

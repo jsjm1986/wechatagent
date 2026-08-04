@@ -14,14 +14,14 @@
 | --- | --- | --- |
 | 9 类 wiki page type | `wiki-page-types.ts:1-23` | `OperationKnowledgeChunk.wiki_type` 9 枚举 |
 | frontmatter 锁定字段 | `page-merge.ts:43-44, 162-176` | `apply_chunk_revision` 拒收带锁定字段的 patch |
-| 数组字段 union 合并 | `page-merge.ts:30-31, 175` | `tags / related_chunks / sources / search_terms / applicable_scenes` 应用层 union |
-| 70% body 长度阈值反 truncate | `page-merge.ts:53, 148-158` | patch 改 `answer / explanation` 时 `is_body_truncated` 拒收 |
+| 数组字段 union 合并 | `page-merge.ts:30-31, 175` | 普通标签/场景数组应用层 union；`related_chunks` 按 `chunk_id` 在 revision 层单独合并 |
+| 70% body 长度阈值反 truncate | `page-merge.ts:53, 148-158` | patch 触碰 `body / summary / answer` 时逐字段执行 `is_body_truncated` 拒收 |
 | chunked structured output | `ingest.ts:65-274` | `import_operation_knowledge_apply` `---CHUNK: id---...---END CHUNK---` 流式块 |
 | enrich-wikilinks 只返 patch | `enrich-wikilinks.ts:7-22` | LLM 永远只返字段级 patch JSON，后端调 `apply_chunk_revision` |
 | 结构 lint + 语义 lint 两层 | `lint.ts:69-156, 164-299` | `gap_signals.rs::run_structural_lint`（必跑）+ stage 2 LLM lint（接口预留） |
 | 两阶段 sweep stale reviews | `sweep-reviews.ts:340-460` | `sweep_stale_signals` stage 1 规则消解；stage 2 LLM 留接口 |
 | 删除级联（normalize key） | `wiki-cleanup.ts:49-130` | `archive` 后清 `related_chunks` 中指向已归档 chunk 的引用 |
-| structural lint: orphan / broken-link | `lint.ts:69-156` | `compute_structural_candidates` 5 规则 kind |
+| structural lint: orphan / broken-link | `lint.ts:69-156` | `compute_structural_candidates` 9 规则 kind（见下方第 8 节表格） |
 
 LLW 的 community detection (Louvain) / `graph-relevance` / `embedding` / `search-rrf` 不在本轮范围（用户重置过：召回算法零改动）。先把 schema / 写入 / 版本 / 反馈 / lint 五件事做扎实，召回升级留后续。
 
@@ -52,7 +52,8 @@ LLW 的 community detection (Louvain) / `graph-relevance` / `embedding` / `searc
 | `imported` | 从 markdown / PDF / 表格批量导入 | `/operation-knowledge/import-apply` | `draft` | `needs_review` | 运营手动 |
 | `ai` | AI chat / 编辑器自主写入 | `chat_apply` / `chunks/:id/patch` | **强制** `draft` | **强制** `needs_review` | 运营手动（AI 永不自动 verify） |
 | `human` | 运营在 UI 直接新建/编辑 | `chunks` POST/PUT | 由 UI 决定（默认 draft） | 由 UI 决定 | 运营手动 |
-| `rule` | 系统级清理（删除级联、scheduled archive） | `cleanup_dangling_refs` 等 | 沿用既有 | 沿用既有 | 不需要（系统操作） |
+| `rule` | 系统规则/批处理写入 | auto-verify、cleanup/sweep 等 | 由规则决定；auto-verify 最多到 `needs_human_audit` | 由规则决定 | verified 仍需真人复核 |
+| `principal_authorized` | 真人领导经请示通道明确授权 | principal escalation 裁决沉淀 | 可直接 active | `verified` | 授权者本人已完成前置核验 |
 
 `provenance.llm_model_alias` 字段：仅当 `source=ai`，写 LLM provider 的 `provider_id`（如 `"default"`），不写品牌名/模型名。`provenance.source_quote` 字段在 source=imported 时记录原文片段，便于事后核对。
 
@@ -64,8 +65,9 @@ LLW 的 community detection (Louvain) / `graph-relevance` / `embedding` / `searc
 [creating]
    ↓ apply_chunk_revision (op=create)
 [draft, needs_review]
-   ↓ /chunks/:id/verify (sourceQuote → anchor gate)
-[verified, integrity_ok]
+   ↓ /chunks/:id/verify (sourceQuote → anchor gate；真人签字)
+[active, verified]
+   ↑ auto-verify 只可到 [draft/active, needs_human_audit]，不得直接进入 verified
    ↓ tool-loop 命中 → record_chunk_hit → usage_stats++ → dynamic_confidence ↑
    |
    ↓ patch / split / merge → apply_chunk_revision → 新 revision_id 累积
@@ -85,11 +87,11 @@ LLW 的 community detection (Louvain) / `graph-relevance` / `embedding` / `searc
 
 详见 [`src/knowledge_wiki/chunk_revisions.rs`](../src/knowledge_wiki/chunk_revisions.rs) + [`src/knowledge_wiki/page_merge.rs`](../src/knowledge_wiki/page_merge.rs)。所有写入（import / patch / split / merge / archive / restore / rollback / verify / reject / auto-verify / batch-verify）走同一函数，三层保护一律生效：
 
-1. **锁定字段守门** — patch 试图改 `chunk_id / wiki_type / created_at / source_anchor / verified_at / verified_by / approved_at` 任意一项 → `400 BadRequest`，错误信息明确指出受锁定字段。
-2. **数组字段 union** — `tags / related_chunks / sources / search_terms / applicable_scenes` 永远 `existing ∪ patch`；即使 LLM 返 `tags: ["仅这一项"]`，应用层 union 后真实落地是并集。0 风险 0 LLM 成本。
-3. **70% body 长度阈值** — 当 patch 改 `answer / explanation` 字段时，`new_len < old_len × 0.7` → `400 BadRequest`，识别 LLM 截断 / 偷懒 / 误重写。
+1. **锁定字段守门** — patch 试图改 `_id / workspace_id / account_id / document_id / item_id / wiki_type / chunk_type / created_at` 任一真实身份字段 → `400 BadRequest`。`source_anchors` 可由可信 quote/正文变更路径重算，并由 verify gate 校验，因此不在默认锁中。
+2. **数组字段 union** — `tags / search_terms / sources / applicable_scenes / not_applicable_scenes / business_topics / product_tags` 永远 `existing ∪ patch`；`related_chunks` 是结构数组，按 `chunk_id` 在 revision 层单独合并。
+3. **字段级 70% 阈值** — patch 触碰 `body / summary / answer` 时逐字段检查；任一 `new_len < old_len × 0.7` → `400 BadRequest`。
 
-附加：`source=ai` 强制 `status="draft" + integrity_status="needs_review"`；写入侧双写"先 revisions 后 chunks"（保留"试图但未成功"的痕迹）；写完即 enqueue `catalog_rebuild_jobs`，写入路径不阻塞。
+附加：`source=ai` 强制 `status="draft" + integrity_status="needs_review"`；revision、最新版 chunk 与 catalog rebuild intent 在同一 Mongo 事务内原子提交，任一失败整体回滚。
 
 ## 7. patch-only 协议
 
@@ -101,28 +103,36 @@ LLM 编辑 chunk 不返完整页，只返 `patch: { ...field-level diff... }` JS
 
 ## 8. 反馈闭环（feedback_worker）
 
-详见 [`src/knowledge_wiki/feedback_worker.rs`](../src/knowledge_wiki/feedback_worker.rs) + [`src/knowledge_wiki/gap_signals.rs`](../src/knowledge_wiki/gap_signals.rs)。每 `KNOWLEDGE_FEEDBACK_INTERVAL_SECONDS`（默认 600，0 = 关停）一轮：
+详见 [`src/knowledge_wiki/feedback_worker.rs`](../src/knowledge_wiki/feedback_worker.rs) + [`src/knowledge_wiki/gap_signals.rs`](../src/knowledge_wiki/gap_signals.rs)。每 `KNOWLEDGE_FEEDBACK_INTERVAL_SECONDS`（默认 600，0 = 关停）一轮；每个 workspace 先领取 300 秒 Mongo lease，并以 60 秒 heartbeat 续约，失去 token 后停止后续阶段：
 
 | 步骤 | 动作 | 输出 |
 | --- | --- | --- |
 | 1 | 30d 滑窗聚合 `knowledge_usage_logs` | 每 chunk 的 `usage_stats.hit_count_30d / blocked_count_30d / last_used_at / last_blocked_reason` |
-| 2 | 朴素公式 | `dynamic_confidence = clamp(integrity_score × 0.6 + hit_rate × 0.4 - stale_penalty, 0, 1)` |
-| 3 | structural lint | `knowledge_gap_signals` 5 类规则信号（见下表） |
+| 2 | 离线置信度重算 | 样本达到 `DYNAMIC_CONFIDENCE_MIN_SAMPLES` 后使用 `base×0.6 + hit_rate×0.4 - penalties`；不足时只用 `base - penalties` |
+| 3 | structural lint | `knowledge_gap_signals` 9 类结构规则信号（见下表；`recall_miss` 由在线缺口路径另产） |
 | 4 | stage 1 sweep | candidate 不再被规则生成的 pending signal → `auto_resolved`；broken_link 的 target 已恢复 → `auto_resolved`；stale 的 valid_to 被推到未来 → `auto_resolved` |
 
-**5 类 structural lint 规则**：
+**9 类 structural lint 规则**：
 
 | kind | 触发条件 | severity | 备注 |
 | --- | --- | --- | --- |
 | `orphan` | chunk 无入链（其它 chunk 的 `related_chunks` 都不指它）且 30d `hit_count == 0` | `info` | 提示运营考虑归档或补关系 |
-| `broken_link` | `related_chunks.chunk_id` 指向不存在 / 已 archived 的 chunk | `warning` | target 恢复后 stage 1 自动 resolve |
+| `broken_link` | `related_chunks.chunk_id` 指向从未存在的 chunk | `warning` | target 出现后 stage 1 自动 resolve |
+| `missing_chunk` | `related_chunks.chunk_id` 指向已 archived 的 chunk | `error` | 依赖被回收，需要恢复或换引用 |
 | `no_outlinks` | `wiki_type ∈ {synthesis, comparison, methodology}` 但 `related_chunks` 为空 | `info` | 这三类按方法论应交叉引用 |
 | `low_confidence` | `dynamic_confidence < 0.3` 且 30d `hit_count > 0` | `warning` | 召回但被频繁 block，疑似过期/低质 |
-| `stale` | `valid_to < now` 且 `status != "archived"` | `warning` | valid_to 推到未来后 stage 1 自动 resolve |
+| `stale` | `valid_to < now` | `warning` | valid_to 推到未来后 stage 1 自动 resolve |
+| `suggestion` | 未 verified 且 30d blocked > 3 | `info` | 建议补证据后人工 verify |
+| `dangling_anchor` | `source_quote` 无法在父文档原文定位 | `warning` | 重锚或更新引用，同时参与置信度罚项 |
+| `contradiction` | 同规范化标题的多个 chunk 首段 hash 不一致 | `error` | 需确认权威说法或合并 |
 
 stage 2（LLM 批裁决：contradiction / suggestion / 残留信号是否仍适用）接口预留在 `sweep_stale_signals`，本轮**不进入热路径**（避免在召回算法零改动的同一个 PR 里引入 LLM 成本不确定性）。
 
-`record_chunk_hit` 在 `agent::knowledge_router::write_knowledge_usage_log` 写 log 后 fire-and-forget 调用，命中即 `$inc usage_stats.hit_count_30d`，被 block 即 `$inc usage_stats.blocked_count_30d` + `$set last_blocked_reason`。**不阻塞召回路径**。
+`record_chunk_hit` 在 `agent::knowledge_router::write_knowledge_usage_log` 写 log 后 fire-and-forget 调用，
+只做热路径计数与原因记录，**不阻塞召回，也不立即重算 `dynamic_confidence`**。置信度由
+feedback worker 周期离线刷新：默认使用按 `run_id` 关联的真实用户 outcome，正向计 hit、负向计
+block，沉默/pending 作为删失不进分母；显式关闭 `DYNAMIC_CONFIDENCE_REAL_OUTCOME_ENABLED`
+才回退 reviewer 自评。罚项包含 stale 与 dangling source quote。
 
 ## 9. 行业可配 schema（domain_schemas）
 

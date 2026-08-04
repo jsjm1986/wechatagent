@@ -22,7 +22,7 @@ export const HOLD_CATEGORY_LABELS: Record<string, string> = {
   ai_waiting_for_more_context: "AI 等待更多上下文",
 };
 
-// gateway 过程态闭集(src/agent/run_envelope.rs GATEWAY_STATUS_VALUES,32 值)→ 中文。
+// gateway 过程态闭集由 gateway_status_values.fixture.json 对账，当前 38 值→中文。
 // 单一真相源:先展开 FINAL_REVIEW_STATUS_LABELS(两闭集交集键复用同一措辞,消除口径漂移),
 // 再补 gateway 独有的过程态键。default 回落原值(labelOf),未来新值不崩。
 export const GATEWAY_STATUS_LABELS: Record<string, string> = {
@@ -46,15 +46,21 @@ export const GATEWAY_STATUS_LABELS: Record<string, string> = {
   policy_wait_user_reply: "等待客户回复",
   gateway_blocked: "网关拦截",
   precheck_blocked: "预检拦截",
+  outbox_enqueuing: "发件队列提交中",
   outbox_enqueued: "已入发件队列",
+  outbox_enqueue_failed: "发件队列提交失败",
+  outbox_enqueue_partial_failure: "发件队列部分提交失败",
+  stale_task_claim: "任务执行权已失效",
+  skipped_duplicate: "重复任务已跳过",
   admin_cancelled: "管理员已取消",
   superseded_by_new_inbound: "被更新消息取代",
   quiet_hours_deferred: "作息时段顺延",
+  internal_error: "系统内部错误",
 };
 
 // campaign 每人推送归桶原因(src/routes/campaigns.rs classify_send_outcome:388-440)。
 // 主体是 GATEWAY_STATUS_VALUES 子集,复用 GATEWAY_STATUS_LABELS;另补 4 个 campaign 专有值:
-// not_yet_run(task 未跑)/outbox 终态 failed_terminal、canceled/policy_consecutive_limit(不在 32 值闭集)。
+// not_yet_run(task 未跑)/outbox 终态 failed_terminal、canceled/policy_consecutive_limit(不在 gateway 闭集)。
 export const SEND_OUTCOME_REASON_LABELS: Record<string, string> = {
   ...GATEWAY_STATUS_LABELS,
   not_yet_run: "尚未执行",

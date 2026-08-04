@@ -219,6 +219,11 @@ pub async fn release_threshold(
             "threshold proposal missing proposed_value: {proposal_id}"
         ))
     })?;
+    if !crate::agent::runtime::threshold_value_is_representable(&gate_key, proposed_value) {
+        return Err(EvolutionError::InvalidStatus(format!(
+            "threshold proposal value is not representable: {gate_key}={proposed_value}"
+        )));
+    }
     let base_revision = proposal.base_revision.clone().ok_or_else(|| {
         EvolutionError::InvalidStatus(format!(
             "threshold proposal missing base_revision: {proposal_id}"
@@ -232,6 +237,12 @@ pub async fn release_threshold(
     if proposal.current_value.map(|value| value.to_bits()) != Some(parsed_base.value.to_bits()) {
         return Err(EvolutionError::InvalidStatus(format!(
             "threshold proposal current_value does not match base_revision: {proposal_id}"
+        )));
+    }
+    if !crate::agent::runtime::threshold_value_is_representable(&gate_key, parsed_base.value) {
+        return Err(EvolutionError::InvalidStatus(format!(
+            "threshold base value is not representable: {gate_key}={} ",
+            parsed_base.value
         )));
     }
 
@@ -250,6 +261,33 @@ pub async fn release_threshold(
         .map_err(EvolutionError::from)?;
 
     let overrides = state.db.raw().collection::<Document>("threshold_overrides");
+
+    let cooldown_hours = state
+        .config
+        .evolution_threshold_release_cooldown_hours
+        .max(1) as i64;
+    let cooldown_since = DateTime::from_millis(
+        now.timestamp_millis()
+            .saturating_sub(cooldown_hours * 60 * 60 * 1000),
+    );
+    let recent_release_count = overrides
+        .count_documents_with_session(
+            doc! {
+                "workspace_id": workspace_id,
+                "account_id": account_id,
+                "gate_key": &gate_key,
+                "released_at": { "$gte": cooldown_since },
+            },
+            None,
+            &mut session,
+        )
+        .await
+        .map_err(EvolutionError::from)?;
+    if recent_release_count != 0 {
+        return Err(EvolutionError::InvalidStatus(format!(
+            "threshold release cooldown active: {workspace_id}/{account_id}/{gate_key}"
+        )));
+    }
 
     match parsed_base.source_id {
         Some(base_id) => {

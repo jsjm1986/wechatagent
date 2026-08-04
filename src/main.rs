@@ -220,6 +220,16 @@ async fn async_main() -> anyhow::Result<()> {
         wechatagent::import_worker::run_import_worker(s).await;
     });
 
+    // Management side effects are never replayed after an uncertain crash. This sweeper
+    // converges expired execution leases to execution_unknown.
+    spawn_supervised(
+        state.clone(),
+        "management_command_sweeper",
+        |s| async move {
+            wechatagent::management_worker::management_command_sweeper_loop(s).await;
+        },
+    );
+
     spawn_supervised(state.clone(), "outbox_dispatcher", |s| async move {
         if let Err(err) = run_outbox_dispatcher(s).await {
             tracing::error!(?err, "outbox dispatcher exited");

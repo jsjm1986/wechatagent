@@ -107,9 +107,10 @@ src/services/task_service.rs
 POST /webhooks/wechat
 → 解析 appId/fromWxid/content/messageId
 → 定位微信账号和联系人
-→ 在 ACK 前持久化 inbound message / pending handoff
-→ 如果 contact.agent_status != managed，停止
-→ 去抖 runner 领取 generation，进入 run_user_operation_gateway
+→ 在 ACK 前持久化 inbound message + pending handoff marker
+→ 如果 contact.agent_status != managed，标记 ignored 后停止
+→ materialize/refresh 每联系人唯一 durable inbound_reply AgentTask，并立即 ACK
+→ task worker 以 claim token + generation + lease 执行；崩溃窗口由 pending handoff reconciler 恢复
 → reload scope context → knowledge route → Reply → independent Review
 → precheck/finalize/state-action safety gates
 → 写 durable agent_send_outbox（先于任何 MCP 发送）
@@ -268,15 +269,12 @@ chat 流追加 progress / summary turn
 [POST /chunks/:id/patch | split | merge | archive | restore | rollback | verify | reject | auto-verify | batch-verify | import-apply ...]
   ↓
 apply_chunk_revision (src/knowledge_wiki/chunk_revisions.rs)
-  ├─ 1. 锁定字段守门：patch 含 chunk_id / wiki_type / created_at / source_anchor /
-  │     verified_at / verified_by / approved_at 任意一项 → 400 BadRequest
-  ├─ 2. 数组字段 union（src/knowledge_wiki/page_merge.rs）：tags / related_chunks /
-  │     sources / search_terms / applicable_scenes 永远 existing ∪ patch（应用层，0 LLM）
-  ├─ 3. 70% body 长度阈值：patch 改 answer/explanation 后 new_len < old_len × 0.7 → 400
+  ├─ 1. 锁定真实身份字段：_id / workspace_id / account_id / document_id / item_id /
+  │     wiki_type / chunk_type / created_at；source_anchors 由证据路径受控重算
+  ├─ 2. 普通数组字段 existing ∪ patch；related_chunks 按 chunk_id 单独合并
+  ├─ 3. body / summary / answer 分别执行 70% 异常缩短保护
   ├─ 4. AI 写入强制 status=draft + integrity_status=needs_review
-  ├─ 5. 双写：先写 chunk_revisions（不可变历史，sha256 before/after hash），
-  │           再写 operation_knowledge_chunks（可变最新版）
-  └─ 6. enqueue catalog_rebuild_jobs（异步，写入路径不阻塞）
+  └─ 5. revision + 最新 chunk + catalog rebuild intent 同一 Mongo 事务原子提交
 ```
 
 ### 异步 worker（两条独立 loop）
@@ -294,8 +292,10 @@ apply_chunk_revision (src/knowledge_wiki/chunk_revisions.rs)
   │     （buying_signal→hit，负向集→block，沉默/pending/unclassified→删失排除，不进分母）。
   │     DYNAMIC_CONFIDENCE_REAL_OUTCOME_ENABLED=false 时退回 review_approved 旧统计。
   ├─ 2. dynamic_confidence = clamp(integrity × 0.6 + hit_rate × 0.4 - stale_penalty, 0, 1)
-  ├─ 3. structural lint（纯查询，无 LLM）：5 类规则信号
-  │     orphan / broken_link / no_outlinks / low_confidence / stale
+  ├─ 3. structural lint（纯查询，无 LLM）：9 类离线规则信号
+  │     orphan / broken_link / missing_chunk / no_outlinks / low_confidence
+  │     stale / suggestion / dangling_anchor / contradiction
+  │     （在线 recall_miss 由 persist_recall_signal 另产，不在本函数内）
   │     → 写入 / 合并 knowledge_gap_signals（按 normalized_title 去重）
   └─ 4. stage 1 sweep：candidate 不再被规则生成 / target 已恢复 / valid_to 已推到未来
         → status=auto_resolved
@@ -353,18 +353,18 @@ POST /webhooks/wechat
 → 解析 appId / fromWxid / content / msgId（参考 webhooks.rs:45-295）
 → account_scheduler::resolve_account_context 选 persona/capacity/off_hours 命中的账号
 → 持久化 inbound message
-→ 若 contact.agent_status != managed → 停止（只持久化）
+→ 若 contact.agent_status != managed → 标记 handoff ignored 后停止
+→ 非 quiet-hours：materialize/refresh 每联系人唯一 durable inbound_reply AgentTask，ACK 后由
+  task worker 以 claim token + generation + lease 执行；pending handoff reconciler 恢复落消息后未建 task 的崩溃窗
 → run_user_operation_gateway:
-  1. reload 联系人 + 历史 + 三类 prompt（locale-aware：load_prompt_for_contact 按
-     contact.locale 选 prompt_template 版本，未命中 fallback 到 zh-CN）
-     +（Phase E5-T1）operation_domain_configs / operation_state_policies / system_taxonomies
-       三表 active_versions 桶选：hash(contact_id) % active_count，同 contact 同桶稳定，
-       老库无 current_version 字段时 `$ne:false` / `$exists=false` 兜底
-  2. 三闸（grounding / hallucination / run_budget）— 实际入口是
-     review::classify_dual_gate / review::review_passed（评分门）+
-     review::finalize_review_for_send（verified 产品声明结构化兜底）；
-     历史文档里的 `enforce_decision_guards` 是 2026-05-25 知识库清理前的旧符号，
-     现已不存在，遇到请按上述真实符号阅读
+  1. reload 联系人 + 历史 + 三类 prompt；PromptTemplate 运行时按
+     `(workspace_id, prompt_key)` 读取唯一 `current_version=true`，contact/locale 不参与选择，
+     缺失时回落代码默认模板
+     + operation_domain_configs / operation_state_policies / system_taxonomies 读取唯一 current；
+       指针缺失或多 current 时 fail closed，不做 contact hash 分桶
+  2. Review 门：`review::review_passed`（评分硬门）+
+     `review::classify_dual_gate` / `review::route_dual_gate`（软闸分类与改写）+
+     `review::finalize_review_for_send`（verified 产品声明结构化兜底）
      +（Phase B）双软闸：human_like / pressure_risk → 触发 single-shot revision
      +（Phase A）taxonomy::check_value 校验 customer_stage / intent_level / objection_type，
        未命中走 taxonomy::upsert_candidate（不阻塞 run）
@@ -379,7 +379,7 @@ POST /webhooks/wechat
        分歧（评分差≥阈值或 grounding/hallucination 决策不一致）触发 single-shot revision
   5. （Phase D）style_consistency_check：与 contact.last_outbound_style 比对，差异≥3/5 axes
      时强制 single-shot revision
-  6. approved → agent_send_outbox enqueue（idempotency key）→ 二次安全门 → MCP message_send_text
+  6. approved → agent_send_outbox enqueue（idempotency key）→ 二次安全门 → MCP 发送适配器
 → 写 agent_run_logs（lifecycle 走 update_run_envelope_terminal，闭集校验）
 → reaction_phase 异步：record_user_reaction 写 reaction_analysis +
   reviewer_misjudge_signal + intent_trajectory.push（cap 50） + last_outbound_style 回写
@@ -388,7 +388,7 @@ POST /webhooks/wechat
 ### Worker Flow（多 worker 并行）
 
 ```text
-`spawn_supervised` 在主进程最多注册 13 条 loop（部分由 env/interval/Mongo flag 立即关闭）：
+`spawn_supervised` 在主进程最多注册 14 条 loop（部分由 env/interval/Mongo flag 立即关闭）：
 
 1. task_worker                          follow-up/durable inbound task，走同一 gateway
 2. import_worker                        异步知识导入 job
@@ -408,7 +408,10 @@ POST /webhooks/wechat
                                          decision_reviews，沉默删失排除——DYNAMIC_CONFIDENCE_REAL_OUTCOME_ENABLED
                                          默认 true，置 false 退回 reviewer 自评 review_approved 旧统计）
 13. ingest_worker                       active ingest source 条件抓取（默认关）
+14. management_command_sweeper           陈旧 Management 执行租约收敛为 execution_unknown
 ```
+
+所有长寿 worker 由持久 supervisor 控制：60 秒内连续 5 次快速 panic 后进入 `open` 熔断；管理员请求恢复后，多副本仅一个副本领取 probe，稳定 60 秒才闭合，probe panic 立即重开。
 
 ### Phase 0 → E5-T1 新增 collection / 字段速查
 
@@ -424,14 +427,14 @@ POST /webhooks/wechat
 | 误判信号 | `decision_reviews.reviewer_misjudge_signal` + `reviewer_stats` | Phase C |
 | 演化 flag | `evolution_runtime_flags` collection | Phase C |
 | 阈值历史 | `threshold_overrides` + `threshold_overrides_audit` | Phase C |
-| 多版本 prompt | `prompt_templates` 多 active + soft-retire `current_version` | Phase C |
+| Prompt 版本指针 | `prompt_templates` 保留历史，但每 `(workspace_id, prompt_key)` 仅一个 `current_version=true` | Phase C（后续已收敛） |
 | 意图轨迹 | `Contact.intent_trajectory: Vec<IntentTrajectoryEntry>` cap 50 | Phase D |
 | 风格指纹 | `Contact.last_outbound_style: Option<String>` | Phase D |
 | 多账号 | `WechatAccount.{capacity, persona_tag, off_hours}` | Phase D |
 | 跨用户教训 | `lessons_learned` collection（pending_review → peer_case chunk 候选池） | Phase D |
-| 多 locale | `Contact.locale` + `PromptTemplate.locale`（BCP-47，默认 zh-CN） | Phase E3 |
+| locale 元数据 | `Contact.locale` + `PromptTemplate.locale` 保留为数据字段；当前运行时 Prompt 选择不按 locale 分叉 | Phase E3（后续已收敛） |
 | LLM provider 抽象 | `trait LlmProvider` (`src/llm.rs::LlmProvider`，方法 `generate_json` / `generate_json_with_usage`) + reviewer 双模并行（`REVIEWER_DUAL_ENABLED`） | Phase E2 |
-| ops 三表灰度 | `operation_domain_configs / operation_state_policies / system_taxonomies` 加 `version / current_version / previous_version / seeded_by`；`hash(contact_id) % active_count` 桶；`admin_ops_versions` 三动作 publish/rollout/rollback | Phase E5-T1 |
+| ops 三表版本指针 | 三表保留版本历史；运行时只读唯一 current，异常指针 fail closed；`admin_ops_versions` 提供 publish/rollout/rollback | Phase E5-T1（后续已收敛） |
 
 ### 模块隔离红线（不变）
 

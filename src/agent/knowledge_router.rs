@@ -909,6 +909,7 @@ pub(crate) async fn write_knowledge_usage_log(
     {
         let _ = crate::knowledge_wiki::gap_signals::record_chunk_hit(
             &state.db,
+            &contact.workspace_id,
             hex_id,
             !approved,
             block_reason.as_deref(),

@@ -13,6 +13,41 @@ use std::collections::HashSet;
 
 use super::Database;
 
+fn import_job_segment_unique_index() -> IndexModel {
+    IndexModel::builder()
+        .keys(doc! { "job_id": 1, "segment_index": 1 })
+        .options(
+            IndexOptions::builder()
+                .name("uniq_import_job_segment".to_string())
+                .unique(true)
+                .build(),
+        )
+        .build()
+}
+
+fn import_job_segment_ttl_index() -> IndexModel {
+    IndexModel::builder()
+        .keys(doc! { "expires_at": 1 })
+        .options(
+            IndexOptions::builder()
+                .name("import_job_segments_expires_ttl".to_string())
+                .expire_after(std::time::Duration::from_secs(0))
+                .build(),
+        )
+        .build()
+}
+
+fn management_stale_execution_index() -> IndexModel {
+    IndexModel::builder()
+        .keys(doc! { "status": 1, "execution_started_at": 1 })
+        .options(
+            IndexOptions::builder()
+                .name("management_stale_execution".to_string())
+                .build(),
+        )
+        .build()
+}
+
 fn llm_vision_active_unique_index() -> IndexModel {
     IndexModel::builder()
         .keys(doc! { "workspaceId": 1 })
@@ -824,6 +859,14 @@ pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
             None,
         )
         .await?;
+    let import_segments = db.raw().collection::<Document>("import_job_segments");
+    import_segments
+        .create_index(import_job_segment_unique_index(), None)
+        .await?;
+    import_segments
+        .create_index(import_job_segment_ttl_index(), None)
+        .await?;
+
     db.events()
         .create_index(
             IndexModel::builder()
@@ -1235,6 +1278,9 @@ pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
             None,
         )
         .await?;
+    db.command_runs()
+        .create_index(management_stale_execution_index(), None)
+        .await?;
     db.tool_calls()
         .create_index(
             IndexModel::builder()
@@ -1504,6 +1550,25 @@ mod tests {
                 "provenance.source_doc_id": { "$type": "string" },
             })
         );
+    }
+
+    #[test]
+    fn import_segment_indexes_are_unique_and_ttl() {
+        let unique = import_job_segment_unique_index();
+        assert_eq!(unique.keys, doc! { "job_id": 1, "segment_index": 1 });
+        assert_eq!(unique.options.as_ref().and_then(|o| o.unique), Some(true));
+        let ttl = import_job_segment_ttl_index();
+        assert_eq!(ttl.keys, doc! { "expires_at": 1 });
+        assert_eq!(
+            ttl.options.and_then(|o| o.expire_after),
+            Some(std::time::Duration::from_secs(0))
+        );
+    }
+
+    #[test]
+    fn management_stale_index_matches_sweeper_filter() {
+        let index = management_stale_execution_index();
+        assert_eq!(index.keys, doc! { "status": 1, "execution_started_at": 1 });
     }
 
     #[test]
@@ -2835,7 +2900,7 @@ async fn ensure_evolution_indexes(db: &Database) -> anyhow::Result<()> {
             None,
         )
         .await?;
-    // admin_sessions.session_id unique：cookie 唯一定位 session。
+    // admin_sessions.session_id unique：SHA-256 token 摘要唯一定位 session。
     db.raw()
         .collection::<mongodb::bson::Document>("admin_sessions")
         .create_index(

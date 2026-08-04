@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import gatewayStatusValues from "../../contracts/gateway_status_values.fixture.json";
 import {
   FINAL_REVIEW_STATUS_LABELS,
   HOLD_CATEGORY_LABELS,
@@ -60,30 +61,23 @@ describe("reviewLabels 扩展字典", () => {
 });
 
 describe("GATEWAY_STATUS_LABELS 单一真相源", () => {
-  // 与 src/agent/run_envelope.rs GATEWAY_STATUS_VALUES 闭集(32 值)对齐。
-  const GATEWAY_STATUS_VALUES = [
-    "pending", "approved", "allowed", "sent", "no_reply", "review_blocked",
-    "revision_failed", "revision_skipped_invalid_direction", "revision_skipped_budget_exceeded",
-    "revision_llm_failure", "held_by_ai_policy", "blocked_by_safety_guard",
-    "ai_waiting_for_more_context", "blocked_by_required_field", "blocked_by_budget",
-    "blocked_unverified_product_claim", "tool_loop_timeout", "legacy_mode_unchecked",
-    "not_managed", "cooldown", "rate_limited", "daily_limit", "expired", "context_changed",
-    "policy_cooldown", "policy_wait_user_reply", "gateway_blocked", "precheck_blocked",
-    "outbox_enqueued", "admin_cancelled", "superseded_by_new_inbound", "quiet_hours_deferred",
-  ];
-
-  it("覆盖全部 32 个 gateway 闭集值且为中文", () => {
-    for (const k of GATEWAY_STATUS_VALUES) {
-      expect(GATEWAY_STATUS_LABELS[k], `缺 ${k}`).toBeTruthy();
-      expect(GATEWAY_STATUS_LABELS[k], `${k} 未翻译`).not.toBe(k);
+  it("覆盖后端 gateway 闭集 fixture 的全部值且为中文", () => {
+    expect(gatewayStatusValues.length).toBeGreaterThan(0);
+    for (const key of gatewayStatusValues) {
+      expect(GATEWAY_STATUS_LABELS[key], `缺 ${key}`).toBeTruthy();
+      expect(GATEWAY_STATUS_LABELS[key], `${key} 未翻译`).not.toBe(key);
     }
   });
 
   it("与 finalReviewStatus 交集键复用同一措辞(消除口径漂移)", () => {
-    for (const k of Object.keys(FINAL_REVIEW_STATUS_LABELS)) {
-      if (k in GATEWAY_STATUS_LABELS) {
-        expect(GATEWAY_STATUS_LABELS[k], `${k} 两字典措辞不一致`).toBe(FINAL_REVIEW_STATUS_LABELS[k]);
+    for (const key of Object.keys(FINAL_REVIEW_STATUS_LABELS)) {
+      if (key in GATEWAY_STATUS_LABELS) {
+        expect(GATEWAY_STATUS_LABELS[key], `${key} 两字典措辞不一致`).toBe(FINAL_REVIEW_STATUS_LABELS[key]);
       }
     }
+  });
+
+  it("delivery_finalizing 是发送对账内部状态，不伪装成 agent gateway 状态", () => {
+    expect(gatewayStatusValues).not.toContain("delivery_finalizing");
   });
 });

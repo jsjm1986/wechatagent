@@ -49,7 +49,10 @@ echo "[test-ci-lints] 动态取到 shell 正则: $FORBIDDEN_PATTERN"
 # 截取 const 声明到首个 `];` 之间的块，抽出每个双引号字面量、去引号。
 # 该块内除词条外无其它双引号字符串（注释行为中文无引号），提取干净。
 # ---------------------------------------------------------------------------
-mapfile -t LINT_WORDS < <(
+LINT_WORDS=()
+while IFS= read -r word; do
+    [ -n "$word" ] && LINT_WORDS+=("$word")
+done < <(
     sed -n '/const FORBIDDEN_LITERALS_LOWER/,/\];/p' "$LINT" \
         | grep -oE '"[^"]+"' \
         | sed 's/"//g'

@@ -123,13 +123,21 @@ impl AuthRateLimiter {
             .count();
         let client_full = client_count >= self.client_capacity;
         let target_full = target_count >= self.target_capacity;
-        let global_full = inner.attempts.len() >= self.global_capacity;
+        // The global cap protects Argon2 concurrency only. Retained failures continue to
+        // enforce per-client/per-target limits, but random failed identities must not fill a
+        // process-wide denial slot and lock every administrator out.
+        let global_full = inner
+            .attempts
+            .values()
+            .filter(|attempt| attempt.state == AttemptState::Pending)
+            .count()
+            >= self.global_capacity;
         if client_full || target_full || global_full {
             let earliest = inner
                 .attempts
                 .values()
                 .filter(|attempt| {
-                    global_full
+                    (global_full && attempt.state == AttemptState::Pending)
                         || (client_full
                             && attempt.subject.client_fingerprint == subject.client_fingerprint)
                         || (target_full
@@ -378,10 +386,18 @@ mod tests {
     }
 
     #[test]
-    fn global_limit_blocks_random_clients_and_targets() {
+    fn historical_failures_do_not_fill_the_global_concurrency_cap() {
         let limiter = Arc::new(AuthRateLimiter::new(300, 10, 10, 2));
         limiter.begin("10.0.0.1", "alice").unwrap().mark_invalid();
         limiter.begin("10.0.0.2", "bob").unwrap().mark_invalid();
+        assert!(limiter.begin("10.0.0.3", "carol").is_ok());
+    }
+
+    #[test]
+    fn global_limit_still_caps_concurrent_pending_hashes() {
+        let limiter = Arc::new(AuthRateLimiter::new(300, 10, 10, 2));
+        let _first = limiter.begin("10.0.0.1", "alice").unwrap();
+        let _second = limiter.begin("10.0.0.2", "bob").unwrap();
         let denied = limiter.begin("10.0.0.3", "carol").unwrap_err();
         assert_eq!(denied.dimension, "global");
         assert!(denied.should_audit);

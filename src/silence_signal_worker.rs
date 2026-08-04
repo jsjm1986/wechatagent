@@ -94,6 +94,7 @@ async fn scan_silence(
     let already_emitted_today = count_today_silence_signals(state, workspace_id, now).await?;
     let mut scanned = 0i64;
     let mut emitted = 0i64;
+    let mut failed = 0i64;
 
     while let Some(contact) = cursor.try_next().await? {
         scanned += 1;
@@ -141,6 +142,7 @@ async fn scan_silence(
             }
             Ok(CommitOutcome::Capped) => break,
             Err(error) => {
+                failed += 1;
                 let metric_result = Err(anyhow::anyhow!(error.to_string()));
                 behavior_signals::record_signal_metric(state, &signal_workspace_id, &metric_result)
                     .await;
@@ -159,17 +161,38 @@ async fn scan_silence(
         audit_account_id,
         "silence_signal_tick",
         "ok",
-        &format!("silence_signal_worker tick: scanned {scanned}, emitted {emitted}"),
-        Some(doc! {
-            "scanned": scanned,
-            "emitted": emitted,
-            "dailyCap": daily_cap,
-            "alreadyEmittedToday": already_emitted_today,
-            "thresholdSeconds": state.config.silence_threshold_seconds,
-        }),
+        &format!(
+            "silence_signal_worker tick: scanned {scanned}, emitted {emitted}, failed {failed}"
+        ),
+        Some(silence_tick_details(
+            scanned,
+            emitted,
+            failed,
+            daily_cap,
+            already_emitted_today,
+            state.config.silence_threshold_seconds,
+        )),
     )
     .await?;
     Ok(())
+}
+
+fn silence_tick_details(
+    scanned: i64,
+    emitted: i64,
+    failed: i64,
+    daily_cap: i64,
+    already_emitted_today: i64,
+    threshold_seconds: i64,
+) -> Document {
+    doc! {
+        "scanned": scanned,
+        "emitted": emitted,
+        "failed": failed,
+        "dailyCap": daily_cap,
+        "alreadyEmittedToday": already_emitted_today,
+        "thresholdSeconds": threshold_seconds,
+    }
 }
 
 async fn count_today_silence_signals(
@@ -393,5 +416,12 @@ mod tests {
     fn cap_zero_disables() {
         assert!(cap_reached(0, 0));
         assert!(cap_reached(3, -1));
+    }
+
+    #[test]
+    fn tick_details_expose_persist_failures() {
+        let details = silence_tick_details(8, 4, 2, 20, 3, 3600);
+        assert_eq!(details.get_i64("failed").unwrap(), 2);
+        assert_eq!(details.get_i64("emitted").unwrap(), 4);
     }
 }

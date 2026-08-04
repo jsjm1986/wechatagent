@@ -12,7 +12,14 @@ use mongodb::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::{
+    collections::HashSet,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use crate::{
     agent,
@@ -92,6 +99,115 @@ pub(super) struct PlanExecution {
 }
 
 const MANAGEMENT_EXECUTION_LEASE_MILLIS: i64 = 5 * 60 * 1000;
+const MANAGEMENT_EXECUTION_HEARTBEAT_SECONDS: u64 = 60;
+const MAX_MANAGEMENT_TOOL_CALLS: usize = 12;
+
+#[derive(Debug, Clone)]
+struct ManagementExecutionLease {
+    run_id: mongodb::bson::oid::ObjectId,
+    workspace_id: String,
+    account_id: String,
+    token: String,
+}
+
+impl ManagementExecutionLease {
+    fn owner_filter(&self) -> Document {
+        doc! {
+            "_id": self.run_id,
+            "workspace_id": &self.workspace_id,
+            "account_id": &self.account_id,
+            "status": "running",
+            "execution_token": &self.token,
+        }
+    }
+}
+
+async fn renew_management_execution_lease(
+    state: &AppState,
+    lease: &ManagementExecutionLease,
+) -> mongodb::error::Result<bool> {
+    let now = DateTime::now();
+    let result = state
+        .db
+        .command_runs()
+        .update_one(
+            lease.owner_filter(),
+            doc! { "$set": { "execution_started_at": now, "updated_at": now } },
+            None,
+        )
+        .await?;
+    Ok(result.matched_count == 1)
+}
+
+fn spawn_management_execution_heartbeat(
+    state: AppState,
+    lease: ManagementExecutionLease,
+    cancelled: Arc<AtomicBool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker =
+            tokio::time::interval(Duration::from_secs(MANAGEMENT_EXECUTION_HEARTBEAT_SECONDS));
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            match renew_management_execution_lease(&state, &lease).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    cancelled.store(true, Ordering::SeqCst);
+                    return;
+                }
+                Err(error) => {
+                    cancelled.store(true, Ordering::SeqCst);
+                    tracing::warn!(
+                        command_run_id = %lease.run_id.to_hex(),
+                        error = %error,
+                        "management execution heartbeat failed; ownership is unproven"
+                    );
+                    return;
+                }
+            }
+        }
+    })
+}
+
+async fn ensure_management_execution_owned(
+    state: &AppState,
+    lease: &ManagementExecutionLease,
+    cancelled: &AtomicBool,
+) -> AppResult<()> {
+    if cancelled.load(Ordering::SeqCst) {
+        return Err(AppError::Conflict(
+            "management_command_lease_lost".to_string(),
+        ));
+    }
+    match renew_management_execution_lease(state, lease).await {
+        Ok(true) => Ok(()),
+        Ok(false) => {
+            cancelled.store(true, Ordering::SeqCst);
+            Err(AppError::Conflict(
+                "management_command_lease_lost".to_string(),
+            ))
+        }
+        Err(error) => {
+            cancelled.store(true, Ordering::SeqCst);
+            Err(error.into())
+        }
+    }
+}
+
+fn validate_command_status(status: &str) -> AppResult<()> {
+    crate::models::validate_agent_command_run_status(status).map_err(AppError::External)
+}
+
+fn validate_management_plan(plan: &ManagementPlan) -> AppResult<()> {
+    if plan.tool_calls.len() > MAX_MANAGEMENT_TOOL_CALLS {
+        return Err(AppError::BadRequest(format!(
+            "management plan has {} tool calls; maximum is {MAX_MANAGEMENT_TOOL_CALLS}",
+            plan.tool_calls.len()
+        )));
+    }
+    Ok(())
+}
 
 fn management_plan_hash(plan: &ManagementPlan) -> AppResult<String> {
     let bytes = serde_json::to_vec(plan)?;
@@ -148,7 +264,31 @@ async fn load_management_command_calls(
 
 fn persisted_tool_outcome(call: &AgentToolCall) -> Option<ToolOutcome> {
     match call.status.as_str() {
-        "succeeded" | "dry_run" => Some(ToolOutcome::Succeeded),
+        "succeeded" | "dry_run" => {
+            if call.tool_name == "wechatagent.send_contact_message" {
+                call.response
+                    .as_ref()
+                    .and_then(|response| {
+                        mongodb::bson::from_document::<Value>(response.clone()).ok()
+                    })
+                    .map(|response| assert_tool_outcome(&call.tool_name, &response))
+                    .or(Some(ToolOutcome::Succeeded))
+            } else {
+                Some(ToolOutcome::Succeeded)
+            }
+        }
+        // 恢复既有 `accepted`：重放 response 拿回原始受理原因；response 缺失/不可解析
+        // 时保持 Accepted 语义，绝不降级成 Succeeded（会把「已受理」读成「已送达」）。
+        "accepted" => call
+            .response
+            .as_ref()
+            .and_then(|response| mongodb::bson::from_document::<Value>(response.clone()).ok())
+            .map(|response| assert_tool_outcome(&call.tool_name, &response))
+            .or_else(|| {
+                Some(ToolOutcome::Accepted(
+                    "发送意图已持久受理，等待异步送达回执".to_string(),
+                ))
+            }),
         "failed" => Some(ToolOutcome::Failed(
             call.error
                 .clone()
@@ -203,12 +343,70 @@ pub(super) async fn execute_plan_tool_calls(
     dry_run: bool,
     advertised: &HashSet<String>,
     confirmed_admin: Option<&AuthenticatedAdmin>,
+    execution_token: Option<&str>,
 ) -> AppResult<PlanExecution> {
+    if !tool_calls.is_empty() && execution_token.is_none() {
+        return Err(AppError::Conflict(
+            "management_command_execution_token_missing".to_string(),
+        ));
+    }
+    let lease = execution_token.map(|token| ManagementExecutionLease {
+        run_id: command_run_id,
+        workspace_id: workspace_id.to_string(),
+        account_id: account_id.to_string(),
+        token: token.to_string(),
+    });
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let heartbeat = lease.as_ref().map(|lease| {
+        spawn_management_execution_heartbeat(state.clone(), lease.clone(), cancelled.clone())
+    });
+    let result = execute_plan_tool_calls_owned(
+        state,
+        workspace_id,
+        account_id,
+        tool_calls,
+        command_run_id,
+        plan_hash,
+        dry_run,
+        advertised,
+        confirmed_admin,
+        lease.as_ref(),
+        cancelled.as_ref(),
+    )
+    .await;
+    if let Some(handle) = heartbeat {
+        handle.abort();
+    }
+    result
+}
+
+async fn execute_plan_tool_calls_owned(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+    tool_calls: &[PlannedToolCall],
+    command_run_id: mongodb::bson::oid::ObjectId,
+    plan_hash: &str,
+    dry_run: bool,
+    advertised: &HashSet<String>,
+    confirmed_admin: Option<&AuthenticatedAdmin>,
+    lease: Option<&ManagementExecutionLease>,
+    cancelled: &AtomicBool,
+) -> AppResult<PlanExecution> {
+    if tool_calls.len() > MAX_MANAGEMENT_TOOL_CALLS {
+        return Err(AppError::BadRequest(format!(
+            "management plan has {} tool calls; maximum is {MAX_MANAGEMENT_TOOL_CALLS}",
+            tool_calls.len()
+        )));
+    }
     let mut calls = Vec::new();
     let mut outcomes: Vec<(String, ToolOutcome)> = Vec::new();
     let mut failed = None;
     let mut execution_unknown = false;
-    for (call_index, planned) in tool_calls.iter().take(12).enumerate() {
+    for (call_index, planned) in tool_calls.iter().enumerate() {
+        if let Some(lease) = lease {
+            ensure_management_execution_owned(state, lease, cancelled).await?;
+        }
         let intent_key = management_tool_intent_key(command_run_id, plan_hash, call_index);
         let arguments_doc = to_document(&planned.arguments).unwrap_or_else(|_| Document::new());
         let now = DateTime::now();
@@ -251,7 +449,9 @@ pub(super) async fn execute_plan_tool_calls(
                     execution_unknown = true;
                     break;
                 }
-                ToolOutcome::Succeeded | ToolOutcome::Unverified(_) => continue,
+                ToolOutcome::Succeeded | ToolOutcome::Accepted(_) | ToolOutcome::Unverified(_) => {
+                    continue
+                }
             }
         }
 
@@ -335,6 +535,11 @@ pub(super) async fn execute_plan_tool_calls(
             confirmed_admin,
         )
         .await;
+        if let Some(lease) = lease {
+            // Do not finalize the per-tool intent or continue the plan unless this
+            // process still owns the parent command after the external call.
+            ensure_management_execution_owned(state, lease, cancelled).await?;
+        }
         let is_dry_run = should_dry_run_tool(&planned.tool_name, dry_run);
         match result {
             Ok(response) => {
@@ -344,13 +549,7 @@ pub(super) async fn execute_plan_tool_calls(
                 } else {
                     assert_tool_outcome(&planned.tool_name, &response)
                 };
-                let status_str = match (&outcome, is_dry_run) {
-                    (_, true) => "dry_run",
-                    (ToolOutcome::Succeeded, _) => "succeeded",
-                    (ToolOutcome::Failed(_), _) => "failed",
-                    (ToolOutcome::Unverified(_), _) => "executed_unverified",
-                    (ToolOutcome::ExecutionUnknown(_), _) => "execution_unknown",
-                };
+                let status_str = tool_call_status_for_outcome(&outcome, is_dry_run);
                 let response_doc = to_document(&response).ok();
                 crate::models::assert_tool_call_status_valid(status_str);
                 let finalized = state
@@ -546,7 +745,7 @@ pub(super) async fn post_management_message(
     let requires_confirmation = !effective_dry_run
         && (plan.requires_confirmation
             || plan.risk_level.eq_ignore_ascii_case("dangerous")
-            || plan_requires_confirmation(&tool_names, true));
+            || plan_requires_confirmation(&tool_names));
     let execution_token = (!requires_confirmation).then(|| uuid::Uuid::new_v4().to_string());
     let execution_started_at = execution_token.as_ref().map(|_| DateTime::now());
     let initial_status = if requires_confirmation {
@@ -554,6 +753,7 @@ pub(super) async fn post_management_message(
     } else {
         "running"
     };
+    validate_command_status(initial_status)?;
     let prompt_versions = prompts::prompt_versions(
         &state.db,
         &admin.current_workspace,
@@ -600,6 +800,7 @@ pub(super) async fn post_management_message(
         effective_dry_run,
         &advertised_tools,
         None,
+        execution_token.as_deref(),
     )
     .await?;
     let calls = exec.calls;
@@ -620,6 +821,7 @@ pub(super) async fn post_management_message(
     } else {
         "succeeded"
     };
+    validate_command_status(final_status)?;
     let finalized = if requires_confirmation {
         state
             .db
@@ -770,6 +972,7 @@ pub(super) async fn confirm_management_command(
             "management_plan_hash_mismatch".to_string(),
         ));
     }
+    validate_management_plan(&plan)?;
 
     if !matches!(
         candidate.status.as_str(),
@@ -862,6 +1065,7 @@ pub(super) async fn confirm_management_command(
         false,
         &advertised,
         Some(&admin),
+        Some(&execution_token),
     )
     .await?;
     let summary = build_execution_summary(&exec.outcomes);
@@ -872,6 +1076,7 @@ pub(super) async fn confirm_management_command(
     } else {
         "succeeded"
     };
+    validate_command_status(final_status)?;
     let finalized = state
         .db
         .command_runs()
@@ -944,6 +1149,7 @@ pub(super) async fn reject_management_command(
     }
     validate_account(&state, &admin.current_workspace, account_id).await?;
     let run_id = parse_object_id(&id)?;
+    validate_command_status("canceled")?;
     let run = state
         .db
         .command_runs()
@@ -994,7 +1200,11 @@ pub(super) async fn get_management_command(
         .db
         .tool_calls()
         .find(
-            doc! { "command_run_id": run_id, "workspace_id": &admin.current_workspace },
+            doc! {
+                "command_run_id": run_id,
+                "workspace_id": &admin.current_workspace,
+                "account_id": &run.account_id,
+            },
             FindOptions::builder()
                 .sort(doc! { "created_at": 1 })
                 .build(),
@@ -1435,7 +1645,7 @@ pub(super) fn apply_locked_send_content(
     instruction: &str,
     dry_run: bool,
 ) -> AppResult<()> {
-    let locked = extract_locked_send_content(instruction);
+    let locked = extract_locked_send_content(instruction)?;
     for call in plan
         .tool_calls
         .iter_mut()
@@ -1462,7 +1672,7 @@ pub(super) fn apply_locked_send_content(
     Ok(())
 }
 
-pub(super) fn extract_locked_send_content(instruction: &str) -> Option<String> {
+pub(super) fn extract_locked_send_content(instruction: &str) -> AppResult<Option<String>> {
     let markers = [
         "内容必须完全等于：",
         "内容必须完全等于:",
@@ -1477,37 +1687,53 @@ pub(super) fn extract_locked_send_content(instruction: &str) -> Option<String> {
         "发送：",
         "发送:",
     ];
-    let (_, marker) = markers
+    let Some((index, marker)) = markers
         .iter()
         .filter_map(|marker| instruction.find(marker).map(|index| (index, *marker)))
-        .min_by_key(|(index, _)| *index)?;
-    let start = instruction.find(marker)? + marker.len();
-    let mut text = instruction[start..].trim().to_string();
+        .min_by_key(|(index, _)| *index)
+    else {
+        return Ok(None);
+    };
+    let text = instruction[index + marker.len()..].trim();
     if text.is_empty() {
-        return None;
+        return Err(AppError::BadRequest(
+            "locked send content is empty".to_string(),
+        ));
     }
-    if let Some(quoted) = extract_quoted_text(&text) {
-        text = quoted;
-    } else {
-        let stops = [
-            "。这是",
-            "。不需要",
-            "。不要",
-            "。请不要",
-            "；这是",
-            "；不需要",
-            "；不要",
-            "\n",
-        ];
-        if let Some(stop_index) = stops.iter().filter_map(|stop| text.find(stop)).min() {
-            text.truncate(stop_index);
-        }
+    if matches!(text.chars().next(), Some('“' | '"' | '「' | '『' | '\'')) {
+        return extract_quoted_text(text)
+            .map(|value| Some(value.trim().to_string()))
+            .ok_or_else(|| {
+                AppError::BadRequest("locked send content has an unclosed quote".to_string())
+            });
     }
-    let text = trim_wrapping_quotes(text.trim()).trim().to_string();
-    if text.is_empty() {
-        None
+    // Unquoted text is accepted only when no operator-instruction separator is
+    // present. Never truncate a user's message based on words that may belong
+    // to the message itself; ambiguous requests must use explicit quotes.
+    let ambiguous = [
+        "。这是",
+        "。不需要",
+        "。不要",
+        "。请不要",
+        "；这是",
+        "；不需要",
+        "；不要",
+        "\n",
+    ]
+    .iter()
+    .any(|separator| text.contains(separator));
+    if ambiguous {
+        return Err(AppError::BadRequest(
+            "ambiguous locked send content; wrap the exact message in quotes".to_string(),
+        ));
+    }
+    let value = trim_wrapping_quotes(text).trim();
+    if value.is_empty() {
+        Err(AppError::BadRequest(
+            "locked send content is empty".to_string(),
+        ))
     } else {
-        Some(text)
+        Ok(Some(value.to_string()))
     }
 }
 
@@ -1678,6 +1904,8 @@ pub(super) fn tool_effect(tool_name: &str) -> ToolEffect {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum ToolOutcome {
     Succeeded,
+    /// Durable gateway accepted the intent; delivery is asynchronous.
+    Accepted(String),
     Failed(String),
     Unverified(String),
     ExecutionUnknown(String),
@@ -1687,24 +1915,28 @@ pub(super) enum ToolOutcome {
 /// （如 MCP send 返 Ok 但 success=false=账号离线）。无法判定的诚实标 Unverified，
 /// 绝不假报成功（spec §3）。
 pub(super) fn assert_tool_outcome(tool_name: &str, response: &Value) -> ToolOutcome {
-    // MCP 发送类：核实 success + msgId
+    // Product gateway returns ContactSendResult, not a direct MCP receipt.
+    // outbox_enqueued/skipped_duplicate mean durable acceptance, never delivery.
     if tool_name == "wechatagent.send_contact_message" {
-        let success = response.get("success").and_then(Value::as_bool);
-        match success {
-            Some(true) => return ToolOutcome::Succeeded,
-            Some(false) => {
-                let err = response
-                    .get("error")
-                    .and_then(Value::as_str)
-                    .unwrap_or("MCP 返回 success=false");
-                return ToolOutcome::Failed(err.to_string());
+        let gateway_status = response
+            .get("gatewayStatus")
+            .or_else(|| response.get("gateway_status"))
+            .and_then(Value::as_str);
+        let reason = response
+            .get("gatewayReason")
+            .or_else(|| response.get("gateway_reason"))
+            .and_then(Value::as_str)
+            .unwrap_or("发送网关未提供原因");
+        return match gateway_status {
+            Some("outbox_enqueued" | "skipped_duplicate") => {
+                ToolOutcome::Accepted("发送意图已持久受理，等待异步送达回执".to_string())
             }
-            None => {
-                return ToolOutcome::Unverified(
-                    "MCP 响应无 success 字段，无法确认是否送达".to_string(),
-                )
-            }
-        }
+            Some("sent") => ToolOutcome::Succeeded,
+            Some(_) => ToolOutcome::Failed(reason.to_string()),
+            None => ToolOutcome::Unverified(
+                "发送网关响应无 gatewayStatus，无法确认是否已受理".to_string(),
+            ),
+        };
     }
     // 写库类：核实 matched/modified
     if let Some(matched) = response.get("matched").and_then(Value::as_i64) {
@@ -1727,6 +1959,30 @@ pub(super) fn assert_tool_outcome(tool_name: &str, response: &Value) -> ToolOutc
     ))
 }
 
+/// `ToolOutcome` → `agent_tool_calls.status` 的落库映射（纯函数便于单测）。
+///
+/// 返回值必须全部落在 [`crate::models::ALLOWED_TOOL_CALL_STATUS`] 闭集内。
+///
+/// 关键纪律：`Accepted`（网关持久受理、异步送达）**绝不**映射成 `succeeded`。
+/// 否则 status 字段说「成功」而同一次执行的 summary 说「已受理」，管理端同屏
+/// 自相矛盾，且把「已入队」误报成「已送达」——与 `executed_unverified` 必须显
+/// 「待核实」是同一条「诚实优于好看」纪律（spec §3.3）。
+pub(super) fn tool_call_status_for_outcome(
+    outcome: &ToolOutcome,
+    is_dry_run: bool,
+) -> &'static str {
+    if is_dry_run {
+        return "dry_run";
+    }
+    match outcome {
+        ToolOutcome::Succeeded => "succeeded",
+        ToolOutcome::Accepted(_) => "accepted",
+        ToolOutcome::Failed(_) => "failed",
+        ToolOutcome::Unverified(_) => "executed_unverified",
+        ToolOutcome::ExecutionUnknown(_) => "execution_unknown",
+    }
+}
+
 /// 基于真实执行结果生成汇报（spec §3.2：不回放 plan.summary，区分打算做与做成了什么）。
 pub(super) fn build_execution_summary(results: &[(String, ToolOutcome)]) -> String {
     if results.is_empty() {
@@ -1736,6 +1992,7 @@ pub(super) fn build_execution_summary(results: &[(String, ToolOutcome)]) -> Stri
     for (tool, outcome) in results {
         match outcome {
             ToolOutcome::Succeeded => lines.push(format!("✅ {tool}：已完成")),
+            ToolOutcome::Accepted(why) => lines.push(format!("📨 {tool}：已受理——{why}")),
             ToolOutcome::Failed(why) => lines.push(format!("❌ {tool}：失败——{why}")),
             ToolOutcome::Unverified(why) => lines.push(format!("⚠️ {tool}：已执行待核实——{why}")),
             ToolOutcome::ExecutionUnknown(why) => {
@@ -1752,10 +2009,7 @@ pub(super) fn build_execution_summary(results: &[(String, ToolOutcome)]) -> Stri
 /// fail closed，避免 `tools/list` 新增能力在第一阶段 dangerous 总闸关闭时自动执行。
 /// 所有真实副作用默认要求确认。仅只读工具以及经明确审查、无持久副作用的
 /// `media_get` / provider 连通性探测可直接执行。未分类工具始终 fail closed。
-pub(super) fn plan_requires_confirmation(
-    tool_names: &[&str],
-    _dangerous_confirm_enabled: bool,
-) -> bool {
+pub(super) fn plan_requires_confirmation(tool_names: &[&str]) -> bool {
     tool_names.iter().any(|name| {
         let effect = tool_effect(name);
         !effect.explicitly_classified
@@ -3238,6 +3492,7 @@ pub(super) async fn build_management_plan(
     let mut plan: ManagementPlan = serde_json::from_value(value)?;
     plan.tool_calls
         .retain(|call| !call.tool_name.trim().is_empty());
+    validate_management_plan(&plan)?;
     Ok(plan)
 }
 
@@ -3306,12 +3561,11 @@ mod tests {
             ToolRisk::Low
         );
         assert!(!tool_effect("wechatagent.preview_campaign").read_only);
-        assert!(plan_requires_confirmation(
-            &["wechatagent.preview_campaign"],
-            false
-        ));
+        assert!(plan_requires_confirmation(&[
+            "wechatagent.preview_campaign"
+        ]));
         assert!(
-            plan_requires_confirmation(&["wechatagent.dispatch_campaign"], false),
+            plan_requires_confirmation(&["wechatagent.dispatch_campaign"]),
             "dispatch 必须恒走确认门"
         );
     }
@@ -3512,39 +3766,28 @@ mod tests {
     fn batch_verify_always_requires_confirmation() {
         // batch_verify 与单条 verify 同属 verify 类，恒强制确认无视第一期 dangerous 开关
         // （spec §4.3：守"AI 永不自动 verify"，AI 调 verify 会落 source=Human）。
-        assert!(plan_requires_confirmation(
-            &["wechatagent.batch_verify_chunks"],
-            false
-        ));
+        assert!(plan_requires_confirmation(&[
+            "wechatagent.batch_verify_chunks"
+        ]));
     }
 
     #[test]
     fn all_real_side_effects_require_confirmation() {
-        assert!(plan_requires_confirmation(
-            &["wechatagent.send_contact_message"],
-            false
-        ));
-        assert!(plan_requires_confirmation(
-            &["wechatagent.update_contact_profile"],
-            false
-        ));
-        assert!(!plan_requires_confirmation(
-            &["wechatagent.search_contacts"],
-            false
-        ));
-        assert!(!plan_requires_confirmation(&["media_get"], false));
-        assert!(!plan_requires_confirmation(
-            &["wechatagent.provider_test"],
-            false
-        ));
-        assert!(plan_requires_confirmation(
-            &["wechatagent.reset_domain"],
-            false
-        ));
-        assert!(plan_requires_confirmation(
-            &["wechatagent.verify_knowledge_chunk"],
-            false
-        ));
+        assert!(plan_requires_confirmation(&[
+            "wechatagent.send_contact_message"
+        ]));
+        assert!(plan_requires_confirmation(&[
+            "wechatagent.update_contact_profile"
+        ]));
+        assert!(!plan_requires_confirmation(&[
+            "wechatagent.search_contacts"
+        ]));
+        assert!(!plan_requires_confirmation(&["media_get"]));
+        assert!(!plan_requires_confirmation(&["wechatagent.provider_test"]));
+        assert!(plan_requires_confirmation(&["wechatagent.reset_domain"]));
+        assert!(plan_requires_confirmation(&[
+            "wechatagent.verify_knowledge_chunk"
+        ]));
     }
 
     #[test]
@@ -3558,20 +3801,20 @@ mod tests {
             "schedule_list",
         ] {
             assert!(tool_effect(tool).read_only, "{tool} should be readonly");
-            assert!(!plan_requires_confirmation(&[tool], false));
+            assert!(!plan_requires_confirmation(&[tool]));
         }
     }
 
     #[test]
     fn reviewed_raw_mcp_tools_follow_side_effect_policy() {
-        assert!(!plan_requires_confirmation(&["media_get"], false));
+        assert!(!plan_requires_confirmation(&["media_get"]));
         for tool in ["schedule_create", "schedule_cancel"] {
             assert_eq!(tool_effect(tool).risk, ToolRisk::Low);
             assert!(tool_effect(tool).explicitly_classified);
-            assert!(plan_requires_confirmation(&[tool], false));
+            assert!(plan_requires_confirmation(&[tool]));
         }
         assert!(!tool_effect("message_send_text").explicitly_classified);
-        assert!(plan_requires_confirmation(&["message_send_text"], false));
+        assert!(plan_requires_confirmation(&["message_send_text"]));
     }
 
     #[test]
@@ -3589,7 +3832,7 @@ mod tests {
         ] {
             assert_eq!(tool_effect(tool).risk, ToolRisk::Dangerous);
             assert!(
-                plan_requires_confirmation(&[tool], false),
+                plan_requires_confirmation(&[tool]),
                 "{tool} should always require confirmation"
             );
         }
@@ -3619,17 +3862,23 @@ mod tests {
     #[test]
     fn outcome_assertion_detects_business_failure() {
         use serde_json::json;
-        // send: MCP RPC 返 Ok 但 success=false（账号离线）→ Failed
-        let r = json!({"success": false, "error": "account offline"});
+        // Product gateway acceptance is queued, not a delivery receipt.
+        let r = json!({
+            "gatewayStatus": "outbox_enqueued",
+            "gatewayReason": "queued",
+            "messageId": null
+        });
+        assert!(matches!(
+            assert_tool_outcome("wechatagent.send_contact_message", &r),
+            ToolOutcome::Accepted(_)
+        ));
+        let r = json!({
+            "gatewayStatus": "blocked_by_safety_guard",
+            "gatewayReason": "review rejected"
+        });
         assert!(matches!(
             assert_tool_outcome("wechatagent.send_contact_message", &r),
             ToolOutcome::Failed(_)
-        ));
-        // send: success=true 且有 msgId → Succeeded
-        let r = json!({"success": true, "msgId": "m123"});
-        assert!(matches!(
-            assert_tool_outcome("wechatagent.send_contact_message", &r),
-            ToolOutcome::Succeeded
         ));
         // update: matched=0 → Failed（未命中、实际没改）
         let r = json!({"matched": 0, "modified": 0});
@@ -3655,6 +3904,82 @@ mod tests {
             assert_tool_outcome("wechatagent.query_runs", &r),
             ToolOutcome::Succeeded
         ));
+    }
+
+    /// 回归守卫：`Accepted`（持久受理、异步送达）绝不落 `succeeded`。
+    ///
+    /// 此前该映射内联在 match 里且无任何测试，导致 `Accepted` 被写成 `succeeded`：
+    /// 管理端徽章显示「✅ 成功」而同屏 summary 显示「📨 已受理」，把「已入发件队列」
+    /// 误报为「已送达」。同时锁住每个返回值都在闭集内。
+    #[test]
+    fn accepted_outcome_never_persists_as_succeeded() {
+        use crate::models::ALLOWED_TOOL_CALL_STATUS;
+
+        let accepted = ToolOutcome::Accepted("queued".to_string());
+        let status = tool_call_status_for_outcome(&accepted, false);
+        assert_eq!(
+            status, "accepted",
+            "Accepted 必须落 `accepted`；落 `succeeded` 会把已受理误报成已送达"
+        );
+        assert_ne!(status, "succeeded");
+
+        // 真正成功仍是 succeeded，未被这次修正带偏。
+        assert_eq!(
+            tool_call_status_for_outcome(&ToolOutcome::Succeeded, false),
+            "succeeded"
+        );
+        // dry_run 优先级最高：演练不核实业务结果。
+        assert_eq!(tool_call_status_for_outcome(&accepted, true), "dry_run");
+
+        // 每个映射结果都必须在闭集内，否则 assert_tool_call_status_valid 会告警。
+        for outcome in [
+            ToolOutcome::Succeeded,
+            ToolOutcome::Accepted("why".to_string()),
+            ToolOutcome::Failed("why".to_string()),
+            ToolOutcome::Unverified("why".to_string()),
+            ToolOutcome::ExecutionUnknown("why".to_string()),
+        ] {
+            for dry in [false, true] {
+                let mapped = tool_call_status_for_outcome(&outcome, dry);
+                assert!(
+                    ALLOWED_TOOL_CALL_STATUS.contains(&mapped),
+                    "映射结果 {mapped} 不在 ALLOWED_TOOL_CALL_STATUS 闭集内"
+                );
+            }
+        }
+    }
+
+    /// `accepted` 落库后重放（进程重启 / plan 续跑）必须仍是 `Accepted`，
+    /// 不得降级成 `Succeeded`——否则恢复路径会把「已受理」读成「已送达」。
+    #[test]
+    fn persisted_accepted_status_round_trips_without_downgrade() {
+        use crate::models::AgentToolCall;
+        use mongodb::bson::DateTime;
+
+        let call = AgentToolCall {
+            id: None,
+            workspace_id: "ws".to_string(),
+            account_id: "acc".to_string(),
+            command_run_id: mongodb::bson::oid::ObjectId::new(),
+            intent_key: Some("k".to_string()),
+            call_index: 0,
+            tool_name: "wechatagent.send_contact_message".to_string(),
+            arguments: mongodb::bson::Document::new(),
+            status: "accepted".to_string(),
+            response: None,
+            error: None,
+            execution_started_at: None,
+            finalized_at: None,
+            created_at: DateTime::now(),
+            updated_at: DateTime::now(),
+        };
+        assert!(
+            matches!(
+                persisted_tool_outcome(&call),
+                Some(ToolOutcome::Accepted(_))
+            ),
+            "response 缺失时也必须保持 Accepted，绝不降级为 Succeeded"
+        );
     }
 
     #[test]
@@ -3718,19 +4043,19 @@ mod tests {
     }
 
     #[test]
-    fn locked_send_content_stops_before_operator_instruction() {
-        let instruction = "请给 Jsjm 发送一条真实微信文本消息，内容必须完全等于：Jsjm，测试一下 kefu-b 的用户运营 Agent 真实发送链路。收到不用回复。。这是 kefu-b 的发送链路验收，不需要二次确认。";
-        assert_eq!(
-            extract_locked_send_content(instruction).as_deref(),
-            Some("Jsjm，测试一下 kefu-b 的用户运营 Agent 真实发送链路。收到不用回复。")
-        );
+    fn locked_send_content_rejects_ambiguous_unquoted_instruction() {
+        let instruction = "请给 Jsjm 发送一条真实微信文本消息，内容必须完全等于：Jsjm，测试一下发送链路。收到不用回复。。这是链路验收，不需要二次确认。";
+        assert!(matches!(
+            extract_locked_send_content(instruction),
+            Err(AppError::BadRequest(message)) if message.contains("ambiguous locked send content")
+        ));
     }
 
     #[test]
     fn locked_send_content_prefers_quoted_body() {
         let instruction = "发送内容：\"只发送这一句。\" 不要创建跟进任务。";
         assert_eq!(
-            extract_locked_send_content(instruction).as_deref(),
+            extract_locked_send_content(instruction).unwrap().as_deref(),
             Some("只发送这一句。")
         );
     }
@@ -3747,12 +4072,16 @@ mod tests {
             }],
             ..Default::default()
         };
-        apply_locked_send_content(&mut plan, "内容必须完全等于：原文消息。不要追加说明", false)
-            .unwrap();
+        apply_locked_send_content(
+            &mut plan,
+            "内容必须完全等于：“原文消息。不要追加说明”",
+            false,
+        )
+        .unwrap();
         let args = plan.tool_calls[0].arguments.as_object().unwrap();
         assert_eq!(
             args.get("content").and_then(Value::as_str),
-            Some("原文消息")
+            Some("原文消息。不要追加说明")
         );
         assert_eq!(
             args.get("originalContentLocked").and_then(Value::as_bool),
@@ -3883,6 +4212,7 @@ mod tests {
             "executing",
             "dry_run",
             "succeeded",
+            "accepted",
             "failed",
             "executed_unverified",
             "execution_unknown",
@@ -3890,7 +4220,7 @@ mod tests {
         for s in EXPECTED {
             assert!(ALLOWED_TOOL_CALL_STATUS.contains(s), "缺少状态 {s}");
         }
-        assert_eq!(ALLOWED_TOOL_CALL_STATUS.len(), 7);
+        assert_eq!(ALLOWED_TOOL_CALL_STATUS.len(), 8);
     }
 
     #[test]
@@ -3900,6 +4230,7 @@ mod tests {
             "executing",
             "dry_run",
             "succeeded",
+            "accepted",
             "failed",
             "executed_unverified",
             "execution_unknown",

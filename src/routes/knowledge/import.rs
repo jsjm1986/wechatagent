@@ -20,7 +20,7 @@ use crate::knowledge_wiki::chunk_revisions::{
     apply_chunk_revision_with_session, commit_chunk_transaction, ProvenanceSource, RevisionOp,
     RevisionRequest,
 };
-use crate::models::{assert_import_job_status_valid, ImportJob};
+use crate::models::{assert_import_job_status_valid, validate_import_job_status, ImportJob};
 
 use super::super::AppState;
 use super::*;
@@ -199,6 +199,13 @@ const IMPORT_SEGMENT_HARD_MAX_CHARS: usize = 5000;
 /// 每段抽取并发度：匹配生产端点真实 ~2 线程，避免 tool_use 争用。
 const IMPORT_EXTRACT_CONCURRENCY: usize = 2;
 const IMPORT_CONTENT_CONTRACT_MAX_ATTEMPTS: usize = 3;
+/// One import must remain a bounded business operation, independent of HTTP limits.
+const IMPORT_MAX_TOTAL_CHARS: usize = 200_000;
+const IMPORT_MAX_SEGMENTS: usize = 64;
+const IMPORT_RUN_TOKEN_BUDGET: i64 = 600_000;
+const IMPORT_CHECKPOINT_COLLECTION: &str = "import_job_segments";
+const IMPORT_CHECKPOINT_TTL_MILLIS: i64 = 48 * 60 * 60 * 1000;
+const IMPORT_CHECKPOINT_SCHEMA_VERSION: &str = "v1";
 
 fn import_extraction_has_content_or_reason(value: &Value) -> bool {
     let has_content = ["items", "chunks"].iter().any(|key| {
@@ -268,6 +275,14 @@ async fn generate_import_segment(
 ) -> AppResult<Value> {
     let mut last_contract_error = None;
     for attempt in 0..IMPORT_CONTENT_CONTRACT_MAX_ATTEMPTS {
+        if let Some(budget) = agent::current_run_budget() {
+            if budget.should_stop_optional_llm_calls() {
+                return Err(AppError::BudgetExceeded {
+                    run_id: budget.run_id.clone(),
+                    reason: "knowledge_import_llm_budget_exhausted".to_string(),
+                });
+            }
+        }
         let user = import_user_prompt_for_attempt(base_user_prompt, source_name, content, attempt);
         let value = agent::generate_agent_json(
             state,
@@ -328,10 +343,8 @@ pub(super) fn split_import_content(content: &str) -> Vec<String> {
     for atom in atoms {
         if atom.chars().count() > IMPORT_SEGMENT_HARD_MAX_CHARS {
             // 先 flush 已累积段，再把这个超大块按段落窗口切开。
-            if !acc.trim().is_empty() {
+            if !acc.is_empty() {
                 segments.push(std::mem::take(&mut acc));
-            } else {
-                acc.clear();
             }
             segments.extend(split_oversized_by_paragraph(&atom));
             continue;
@@ -343,10 +356,9 @@ pub(super) fn split_import_content(content: &str) -> Vec<String> {
         }
         acc.push_str(&atom);
     }
-    if !acc.trim().is_empty() {
+    if !acc.is_empty() {
         segments.push(acc);
     }
-    segments.retain(|s| !s.trim().is_empty());
     if segments.is_empty() {
         return vec![content.to_string()];
     }
@@ -360,6 +372,13 @@ fn split_oversized_by_paragraph(block: &str) -> Vec<String> {
     let mut windows: Vec<String> = Vec::new();
     let mut acc = String::new();
     for para in block.split_inclusive("\n\n") {
+        if para.chars().count() > IMPORT_SEGMENT_HARD_MAX_CHARS {
+            if !acc.is_empty() {
+                windows.push(std::mem::take(&mut acc));
+            }
+            windows.extend(split_by_char_limit(para, IMPORT_SEGMENT_HARD_MAX_CHARS));
+            continue;
+        }
         if !acc.is_empty()
             && acc.chars().count() + para.chars().count() > IMPORT_SEGMENT_TARGET_CHARS
         {
@@ -367,14 +386,58 @@ fn split_oversized_by_paragraph(block: &str) -> Vec<String> {
         }
         acc.push_str(para);
     }
-    if !acc.trim().is_empty() {
+    if !acc.is_empty() {
         windows.push(acc);
     }
-    windows.retain(|s| !s.trim().is_empty());
-    if windows.is_empty() {
-        return vec![block.to_string()];
+    if windows.is_empty() && !block.is_empty() {
+        windows.push(block.to_string());
     }
     windows
+}
+
+fn split_by_char_limit(value: &str, limit: usize) -> Vec<String> {
+    debug_assert!(limit > 0);
+    if value.chars().count() <= limit {
+        return vec![value.to_string()];
+    }
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut count = 0usize;
+    for (index, _) in value.char_indices() {
+        if count == limit {
+            out.push(value[start..index].to_string());
+            start = index;
+            count = 0;
+        }
+        count += 1;
+    }
+    if start < value.len() {
+        out.push(value[start..].to_string());
+    }
+    out
+}
+
+fn validate_import_content(content: &str) -> AppResult<usize> {
+    let total_chars = content.chars().count();
+    if total_chars == 0 || content.trim().is_empty() {
+        return Err(AppError::BadRequest("content is required".to_string()));
+    }
+    if total_chars > IMPORT_MAX_TOTAL_CHARS {
+        return Err(AppError::BadRequest(format!(
+            "import content exceeds {IMPORT_MAX_TOTAL_CHARS} characters"
+        )));
+    }
+    let segments = split_import_content(content);
+    if segments.len() > IMPORT_MAX_SEGMENTS {
+        return Err(AppError::BadRequest(format!(
+            "import content exceeds {IMPORT_MAX_SEGMENTS} segments"
+        )));
+    }
+    debug_assert_eq!(segments.concat(), content);
+    debug_assert!(segments
+        .iter()
+        .all(|segment| segment.chars().count() <= IMPORT_SEGMENT_HARD_MAX_CHARS));
+    Ok(segments.len())
 }
 
 fn all_import_segments_failed_error(
@@ -445,9 +508,7 @@ pub async fn import_operation_knowledge_preview(
     Extension(admin): Extension<AuthenticatedAdmin>,
     Json(payload): Json<OperationKnowledgeImportRequest>,
 ) -> AppResult<Json<Value>> {
-    if payload.content.trim().is_empty() {
-        return Err(AppError::BadRequest("content is required".to_string()));
-    }
+    let validated_segments = validate_import_content(&payload.content)?;
     if let Some(account_id) = payload.account_id.as_deref() {
         validate_account(&state, &admin.current_workspace, account_id).await?;
     }
@@ -500,7 +561,7 @@ pub async fn import_operation_knowledge_preview(
         return Ok(Json(result));
     }
     // 大文档 → 建 import_jobs（pending），返回 jobId 交由 import_worker 异步跑，前端轮询。
-    let segments_total = count_import_segments(&payload.content) as i32;
+    let segments_total = validated_segments as i32;
     let now = DateTime::now();
     assert_import_job_status_valid("pending");
     let job = ImportJob {
@@ -579,7 +640,7 @@ pub async fn list_import_preview_jobs(
     Query(query): Query<ImportJobListQuery>,
 ) -> AppResult<Json<Value>> {
     let status = query.status.unwrap_or_else(|| "running".to_string());
-    assert_import_job_status_valid(&status);
+    validate_import_job_status(&status).map_err(AppError::BadRequest)?;
     let filter = doc! {
         "workspace_id": &admin.current_workspace,
         "owner_admin_id": &admin.user_id,
@@ -632,7 +693,187 @@ pub async fn run_import_extraction(
     payload: &OperationKnowledgeImportRequest,
     progress: Option<&(dyn Fn(usize, usize, usize) + Send + Sync)>,
 ) -> AppResult<Value> {
-    run_import_extraction_controlled(state, workspace_id, payload, progress, None).await
+    run_import_extraction_with_budget(state, workspace_id, payload, progress, None).await
+}
+
+async fn run_import_extraction_with_budget(
+    state: &AppState,
+    workspace_id: &str,
+    payload: &OperationKnowledgeImportRequest,
+    progress: Option<&(dyn Fn(usize, usize, usize) + Send + Sync)>,
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
+) -> AppResult<Value> {
+    let segments = validate_import_content(&payload.content)?;
+    let max_calls = segments
+        .saturating_mul(IMPORT_CONTENT_CONTRACT_MAX_ATTEMPTS)
+        .min(i32::MAX as usize) as i32;
+    let budget = std::sync::Arc::new(agent::RunBudget::new(
+        format!("knowledge-import-{}", uuid::Uuid::new_v4()),
+        IMPORT_RUN_TOKEN_BUDGET,
+        max_calls.max(1),
+        i32::MAX,
+    ));
+    agent::RUN_BUDGET
+        .scope(
+            budget,
+            run_import_extraction_controlled(
+                state,
+                workspace_id,
+                payload,
+                progress,
+                cancelled,
+                None,
+            ),
+        )
+        .await
+}
+
+fn import_segment_content_hash(source_name: &str, index: usize, content: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(IMPORT_CHECKPOINT_SCHEMA_VERSION.as_bytes());
+    hasher.update([0]);
+    hasher.update(source_name.as_bytes());
+    hasher.update([0]);
+    hasher.update(index.to_be_bytes());
+    hasher.update([0]);
+    hasher.update(content.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+async fn load_import_segment_checkpoints(
+    state: &AppState,
+    workspace_id: &str,
+    job_id: ObjectId,
+    segments: &[String],
+    source_name: &str,
+) -> AppResult<std::collections::HashMap<usize, Value>> {
+    let hashes: Vec<String> = segments
+        .iter()
+        .enumerate()
+        .map(|(index, segment)| import_segment_content_hash(source_name, index, segment))
+        .collect();
+    let mut cursor = state
+        .db
+        .raw()
+        .collection::<Document>(IMPORT_CHECKPOINT_COLLECTION)
+        .find(
+            doc! {
+                "workspace_id": workspace_id,
+                "job_id": job_id,
+                "segment_index": { "$gte": 0_i32, "$lt": segments.len() as i32 },
+            },
+            None,
+        )
+        .await?;
+    let mut out = std::collections::HashMap::new();
+    while let Some(row) = cursor.try_next().await? {
+        let Ok(index) = row.get_i32("segment_index") else {
+            continue;
+        };
+        let Ok(content_hash) = row.get_str("content_hash") else {
+            continue;
+        };
+        let Some(expected_hash) = hashes.get(index as usize) else {
+            continue;
+        };
+        if content_hash != expected_hash {
+            continue;
+        }
+        let Some(value_bson) = row.get("value") else {
+            continue;
+        };
+        if let Ok(value) = mongodb::bson::from_bson::<Value>(value_bson.clone()) {
+            out.insert(index as usize, value);
+        }
+    }
+    Ok(out)
+}
+
+async fn persist_import_segment_checkpoint(
+    state: &AppState,
+    workspace_id: &str,
+    claim: &crate::import_worker::ImportJobClaim,
+    source_name: &str,
+    index: usize,
+    content: &str,
+    value: &Value,
+) -> AppResult<()> {
+    const MAX_TRANSACTION_ATTEMPTS: usize = 5;
+
+    let content_hash = import_segment_content_hash(source_name, index, content);
+    let value_bson = mongodb::bson::to_bson(value)?;
+    for attempt in 0..MAX_TRANSACTION_ATTEMPTS {
+        let now = DateTime::now();
+        let expires_at =
+            DateTime::from_millis(now.timestamp_millis() + IMPORT_CHECKPOINT_TTL_MILLIS);
+        let mut session = state.db.client().start_session(None).await?;
+        session.start_transaction(None).await?;
+        let result: AppResult<()> = async {
+            // Touch the owner row in the same transaction as the checkpoint write.
+            // A reclaim/heartbeat racing this commit creates a write conflict, while
+            // an already-lost claim matches no row. Either case prevents stale data.
+            let owned = state
+                .db
+                .import_jobs()
+                .update_one_with_session(
+                    claim.filter(),
+                    doc! { "$set": { "claimed_at": now, "updated_at": now } },
+                    None,
+                    &mut session,
+                )
+                .await?;
+            if owned.matched_count != 1 {
+                return Err(AppError::Conflict("import_job_claim_lost".to_string()));
+            }
+            state
+                .db
+                .raw()
+                .collection::<Document>(IMPORT_CHECKPOINT_COLLECTION)
+                .update_one_with_session(
+                    doc! { "job_id": claim.job_id, "segment_index": index as i32 },
+                    doc! {
+                        "$setOnInsert": { "created_at": now },
+                        "$set": {
+                            "workspace_id": workspace_id,
+                            "job_id": claim.job_id,
+                            "segment_index": index as i32,
+                            "content_hash": &content_hash,
+                            "value": value_bson.clone(),
+                            "claim_generation": claim.generation,
+                            "claim_token": &claim.token,
+                            "expires_at": expires_at,
+                            "updated_at": now,
+                        },
+                    },
+                    mongodb::options::UpdateOptions::builder()
+                        .upsert(true)
+                        .build(),
+                    &mut session,
+                )
+                .await?;
+            Ok(())
+        }
+        .await;
+        let result = match result {
+            Ok(()) => commit_chunk_transaction(&mut session).await,
+            Err(error) => {
+                let _ = session.abort_transaction().await;
+                Err(error)
+            }
+        };
+        match result {
+            Ok(()) => return Ok(()),
+            Err(AppError::Db(error))
+                if error.contains_label("TransientTransactionError")
+                    && attempt + 1 < MAX_TRANSACTION_ATTEMPTS =>
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10_u64 << attempt.min(5)))
+                    .await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("checkpoint transaction loop always returns on its last attempt")
 }
 
 async fn run_import_extraction_controlled(
@@ -641,6 +882,7 @@ async fn run_import_extraction_controlled(
     payload: &OperationKnowledgeImportRequest,
     progress: Option<&(dyn Fn(usize, usize, usize) + Send + Sync)>,
     cancelled: Option<&std::sync::atomic::AtomicBool>,
+    checkpoint_claim: Option<&crate::import_worker::ImportJobClaim>,
 ) -> AppResult<Value> {
     let system = "你是企业微信运营知识库导入 Agent。你把长文本拆成 Agent 可渐进查询的文档目录、知识包、知识切片和证据块。只输出严格 JSON。";
     let source_name = payload
@@ -652,62 +894,103 @@ async fn run_import_extraction_controlled(
     // 小文档（≤ SINGLE_MAX）切分返回单段 → 与分块前字节等价，零回归。
     let segments = split_import_content(&payload.content);
     let total_segments = segments.len();
-    // 段完成计数：`buffered` 下并发段完成顺序不定，用原子计数给进度回调喂
-    // 单调的 done/succeeded/failed 快照（worker 侧回写 job 进度，同步路径传 None）。
-    let done_counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let succeeded_counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let cached = match checkpoint_claim {
+        Some(claim) => {
+            load_import_segment_checkpoints(
+                state,
+                workspace_id,
+                claim.job_id,
+                &segments,
+                &source_name,
+            )
+            .await?
+        }
+        None => std::collections::HashMap::new(),
+    };
+    let cached_count = cached.len();
+    let done_counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(cached_count));
+    let succeeded_counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(cached_count));
     let failed_counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let extractions: Vec<(usize, AppResult<Value>)> =
-        stream::iter(segments.into_iter().enumerate())
-            .map(|(idx, segment)| {
-                let state = &state;
-                let workspace_id = workspace_id.to_string();
-                let system = system;
-                let source_name = source_name.clone();
-                let account_id = payload.account_id.clone();
-                let done_counter = done_counter.clone();
-                let succeeded_counter = succeeded_counter.clone();
-                let failed_counter = failed_counter.clone();
-                async move {
-                    use std::sync::atomic::Ordering::SeqCst;
-                    if cancelled.is_some_and(|flag| flag.load(SeqCst)) {
-                        return (
-                            idx,
-                            Err(AppError::Conflict("import_job_claim_lost".to_string())),
-                        );
-                    }
-                    let user = LONG_IMPORT_PROMPT_TEMPLATE
-                        .replace("{SOURCE_NAME}", &source_name)
-                        .replace("{CONTENT}", &segment);
-                    let result = generate_import_segment(
+    if cached_count > 0 {
+        if let Some(cb) = progress {
+            cb(cached_count, cached_count, 0);
+        }
+    }
+
+    let pending: Vec<(usize, String)> = segments
+        .iter()
+        .cloned()
+        .enumerate()
+        .filter(|(index, _)| !cached.contains_key(index))
+        .collect();
+    let mut extractions: Vec<(usize, AppResult<Value>)> = cached
+        .into_iter()
+        .map(|(index, value)| (index, Ok(value)))
+        .collect();
+    let generated: Vec<(usize, AppResult<Value>)> = stream::iter(pending)
+        .map(|(idx, segment)| {
+            let workspace_id = workspace_id.to_string();
+            let source_name = source_name.clone();
+            let account_id = payload.account_id.clone();
+            let done_counter = done_counter.clone();
+            let succeeded_counter = succeeded_counter.clone();
+            let failed_counter = failed_counter.clone();
+            async move {
+                use std::sync::atomic::Ordering::SeqCst;
+                if cancelled.is_some_and(|flag| flag.load(SeqCst)) {
+                    return (
+                        idx,
+                        Err(AppError::Conflict("import_job_claim_lost".to_string())),
+                    );
+                }
+                let user = LONG_IMPORT_PROMPT_TEMPLATE
+                    .replace("{SOURCE_NAME}", &source_name)
+                    .replace("{CONTENT}", &segment);
+                let mut result = generate_import_segment(
+                    state,
+                    &workspace_id,
+                    account_id.as_deref(),
+                    system,
+                    &user,
+                    &source_name,
+                    &segment,
+                )
+                .await;
+                if let (Some(claim), Ok(value)) = (checkpoint_claim, result.as_ref()) {
+                    if let Err(error) = persist_import_segment_checkpoint(
                         state,
                         &workspace_id,
-                        account_id.as_deref(),
-                        system,
-                        &user,
+                        claim,
                         &source_name,
+                        idx,
                         &segment,
+                        value,
                     )
-                    .await;
-                    if result.is_ok() {
-                        succeeded_counter.fetch_add(1, SeqCst);
-                    } else {
-                        failed_counter.fetch_add(1, SeqCst);
+                    .await
+                    {
+                        result = Err(error);
                     }
-                    let done = done_counter.fetch_add(1, SeqCst) + 1;
-                    if let Some(cb) = progress {
-                        cb(
-                            done,
-                            succeeded_counter.load(SeqCst),
-                            failed_counter.load(SeqCst),
-                        );
-                    }
-                    (idx, result)
                 }
-            })
-            .buffered(IMPORT_EXTRACT_CONCURRENCY)
-            .collect()
-            .await;
+                if result.is_ok() {
+                    succeeded_counter.fetch_add(1, SeqCst);
+                } else {
+                    failed_counter.fetch_add(1, SeqCst);
+                }
+                let done = done_counter.fetch_add(1, SeqCst) + 1;
+                if let Some(cb) = progress {
+                    cb(
+                        done,
+                        succeeded_counter.load(SeqCst),
+                        failed_counter.load(SeqCst),
+                    );
+                }
+                (idx, result)
+            }
+        })
+        .buffered(IMPORT_EXTRACT_CONCURRENCY)
+        .collect()
+        .await;
+    extractions.extend(generated);
 
     if cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst)) {
         return Err(AppError::Conflict("import_job_claim_lost".to_string()));
@@ -808,6 +1091,7 @@ async fn run_import_extraction_controlled(
 pub(crate) async fn run_import_extraction_for_job(
     state: &AppState,
     workspace_id: &str,
+    claim: &crate::import_worker::ImportJobClaim,
     account_id: Option<String>,
     source_name: Option<String>,
     content: String,
@@ -819,13 +1103,29 @@ pub(crate) async fn run_import_extraction_for_job(
         source_name,
         content,
     };
-    run_import_extraction_controlled(state, workspace_id, &payload, progress, Some(cancelled)).await
-}
-
-/// `import_worker` 建 job 前预算段数（`segments_total`）。与
-/// [`run_import_extraction`] 内的 `split_import_content` 同源，保证一致。
-pub(crate) fn count_import_segments(content: &str) -> usize {
-    split_import_content(content).len()
+    let segment_count = validate_import_content(&payload.content)?;
+    let max_calls = segment_count
+        .saturating_mul(IMPORT_CONTENT_CONTRACT_MAX_ATTEMPTS)
+        .min(i32::MAX as usize) as i32;
+    let budget = std::sync::Arc::new(agent::RunBudget::new(
+        format!("knowledge-import-{}", claim.job_id),
+        IMPORT_RUN_TOKEN_BUDGET,
+        max_calls.max(1),
+        i32::MAX,
+    ));
+    agent::RUN_BUDGET
+        .scope(
+            budget,
+            run_import_extraction_controlled(
+                state,
+                workspace_id,
+                &payload,
+                progress,
+                Some(cancelled),
+                Some(claim),
+            ),
+        )
+        .await
 }
 
 #[derive(Debug, Deserialize)]
@@ -2390,6 +2690,26 @@ mod tests {
     }
 
     #[test]
+    fn successful_anchor_never_auto_verifies_imported_chunk() {
+        let document_id = ObjectId::new();
+        let mut request: OperationKnowledgeChunkRequest = serde_json::from_value(json!({
+            "title": "Anchored",
+            "body": "body",
+            "sourceQuote": "body",
+            "integrityStatus": "verified",
+            "confidenceScore": 100
+        }))
+        .unwrap();
+
+        let anchored = apply_chunk_integrity(&mut request, "prefix body suffix", Some(document_id));
+
+        assert!(anchored);
+        assert!(!request.source_anchors.is_empty());
+        assert_eq!(request.integrity_status.as_deref(), Some("needs_review"));
+        assert_eq!(request.confidence_score, Some(90));
+    }
+
+    #[test]
     fn vision_payload_requires_the_callers_non_empty_text_field() {
         assert!(require_non_empty_vision_text(json!({"fence": "content"}), "fence").is_ok());
         for value in [
@@ -2577,6 +2897,53 @@ mod tests {
         // 空 / 纯空白：走单段（≤ SINGLE_MAX），不 panic。
         assert_eq!(split_import_content("").len(), 1);
         assert_eq!(split_import_content("   \n  ").len(), 1);
+    }
+
+    #[test]
+    fn split_single_oversized_paragraph_is_lossless_and_hard_bounded() {
+        let content = "甲乙丙🙂".repeat(2_000);
+        let segments = split_import_content(&content);
+        assert!(segments.len() >= 2);
+        assert_eq!(segments.concat(), content);
+        assert!(segments
+            .iter()
+            .all(|segment| segment.chars().count() <= IMPORT_SEGMENT_HARD_MAX_CHARS));
+    }
+
+    #[test]
+    fn split_preserves_leading_whitespace_before_oversized_atom() {
+        let content = format!("   \n{}", "正文".repeat(3_000));
+        let segments = split_import_content(&content);
+        assert_eq!(segments.concat(), content);
+        assert!(segments
+            .iter()
+            .all(|segment| segment.chars().count() <= IMPORT_SEGMENT_HARD_MAX_CHARS));
+    }
+
+    #[test]
+    fn import_content_rejects_total_limit_and_excessive_segments() {
+        let too_large = "甲".repeat(IMPORT_MAX_TOTAL_CHARS + 1);
+        assert!(matches!(
+            validate_import_content(&too_large),
+            Err(AppError::BadRequest(_))
+        ));
+
+        let many_atoms = (0..=IMPORT_MAX_SEGMENTS)
+            .map(|i| format!("## {i}\n{}\n", "内容".repeat(1_600)))
+            .collect::<String>();
+        assert!(matches!(
+            validate_import_content(&many_atoms),
+            Err(AppError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn import_checkpoint_hash_is_stable_and_scope_sensitive() {
+        let first = import_segment_content_hash("source", 0, "body");
+        assert_eq!(first, import_segment_content_hash("source", 0, "body"));
+        assert_ne!(first, import_segment_content_hash("source", 1, "body"));
+        assert_ne!(first, import_segment_content_hash("other", 0, "body"));
+        assert_ne!(first, import_segment_content_hash("source", 0, "other"));
     }
 
     #[test]

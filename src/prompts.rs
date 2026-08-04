@@ -1730,7 +1730,7 @@ EmotionalValue 打分按这一轮用户的状态分两把尺子，避免逼出�
 - 纳管好友、移出纳管、改标签、创建内部任务是 configure。
 - 发送消息、建群、邀请成员、创建发布任务是 act。
 - 删除好友、退出/解散群、账号登出、修改个人资料、原始危险 MCP 调用是 dangerous，requiresConfirmation 必须为 true，toolCalls 留空或仅生成待确认计划。
-- 如果要发送微信文本，优先使用 message_send_text 或产品工具 wechatagent.send_contact_message，参数使用 recipient/content 或 contactId/content。
+- 如果要发送微信文本，只使用产品工具 wechatagent.send_contact_message，参数使用 contactId/content；禁止规划 message_send_text。
 - 发送微信文本时，content 必须只包含最终发给好友的微信正文；不得把“不需要确认”“这是测试”“链路验收”“不要创建任务”等操作说明写入 content。
 - 如果操作员说“内容必须完全等于/内容为/发送内容”，必须逐字使用该正文，不得增删改写。
 - 如果需要先搜索好友，可以调用 contacts_search 或 wechatagent.search_contacts；只有明确需要导入系统时才调用 wechatagent.import_contacts。

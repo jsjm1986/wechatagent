@@ -39,7 +39,7 @@ pub const FIVE_GATE_KEYS: &[&str] = &[
 ];
 
 /// 把 final_review_status 视为"成功送出"的状态集。与 design.md §4.6 一致。
-pub const SEND_SUCCESS_STATUSES: &[&str] = &["approved", "approved_after_revision"];
+pub const SEND_SUCCESS_STATUSES: &[&str] = &["approved", "revision_applied_approved"];
 
 /// 三个**安全闸**（block 类）与其 `final_review_status` 拦截态的映射。
 ///
@@ -724,8 +724,8 @@ mod tests {
             }
             replays.push(rep(
                 "completed",
-                Some("approved_after_revision"),
-                Some("approved_after_revision"),
+                Some("revision_applied_approved"),
+                Some("revision_applied_approved"),
                 gate,
                 Some(true),
                 Some(1000),
@@ -829,13 +829,13 @@ mod tests {
         assert_eq!(metrics.get_str("reason").unwrap(), "no_completed_replays");
     }
 
-    /// 阈值候选 send_success_rate 计算路径：仅 approved / approved_after_revision 计为成功
+    /// 阈值候选 send_success_rate 计算路径：仅 approved / revision_applied_approved 计为成功
     #[test]
     fn success_rate_only_counts_send_statuses() {
         let mut replays = Vec::new();
         for i in 0..30 {
             let new = if i < 24 {
-                Some("approved_after_revision")
+                Some("revision_applied_approved")
             } else {
                 Some("held_by_ai_policy")
             };

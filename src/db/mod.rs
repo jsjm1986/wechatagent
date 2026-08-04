@@ -430,4 +430,22 @@ impl Database {
     pub fn roster_snapshots(&self) -> Collection<crate::models::RosterSnapshot> {
         self.db.collection("roster_snapshots")
     }
+
+    /// Supervisor 熔断控制行（`_id` = worker 名，进程级基础设施、无租户维度）。
+    ///
+    /// 保持 `Document` 而非 typed struct：行内字段随熔断状态机演进
+    /// （`status` / `probe_token` / `probe_locked_until` / `circuit_generation` …），
+    /// 且全部按 `_id` 精确读写（`_id` 自带索引，无需额外索引条目）。本 accessor
+    /// 的价值是收敛集合名字面量，避免各调用点各写一份字符串。
+    pub fn background_worker_controls(&self) -> Collection<mongodb::bson::Document> {
+        self.db.collection("background_worker_controls")
+    }
+
+    /// 后台 worker 的 workspace 级租约行（`_id` = `"<worker_kind>::<workspace_id>"`）。
+    ///
+    /// 同上保持 `Document`：租约字段（`token` / `locked_until`）由各 worker 自持，
+    /// 且只按 `_id` + token 精确 CAS，故不需要额外索引。
+    pub fn background_worker_leases(&self) -> Collection<mongodb::bson::Document> {
+        self.db.collection("background_worker_leases")
+    }
 }

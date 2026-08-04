@@ -14,8 +14,8 @@ use crate::models::{
     PRINCIPAL_RELAY_STATE_PENDING, PRINCIPAL_RELAY_STATE_TERMINAL,
 };
 use crate::routes::AppState;
-use mongodb::bson::{doc, DateTime, Document};
-use mongodb::options::UpdateOptions;
+use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
+use mongodb::options::{TransactionOptions, UpdateOptions};
 
 /// 插入一条 pending 台账。短码碰撞（短码唯一索引报错）时换种子重试至多 5 次。
 ///
@@ -698,21 +698,62 @@ pub(crate) async fn emit_knowledge_gap_proposal(
             decision.constraints.join("；")
         }
     );
+    let chunk_id = ObjectId::new();
     let chunk = OperationKnowledgeChunk {
+        id: Some(chunk_id),
         workspace_id: escalation.workspace_id.clone(),
         account_id: None, // workspace 共享域（与既有 chat 补库共享域一致）
+        domain: crate::routes::knowledge::default_user_operations_domain(),
         status: "draft".to_string(),
         integrity_status: Some("needs_review".to_string()),
         title,
         body: Some(body),
         ..OperationKnowledgeChunk::default()
     };
-    state
-        .db
-        .operation_knowledge_chunks()
-        .insert_one(&chunk, None)
+
+    // Chunk 与 create revision 必须原子落地。PrincipalAuthorized 只描述来源，
+    // 生命周期仍由 revision funnel 保持 draft + needs_review，绝不自动 verify。
+    let mut session = state.db.client().start_session(None).await?;
+    session
+        .start_transaction(TransactionOptions::builder().build())
         .await?;
-    Ok(())
+    let result: AppResult<()> = async {
+        state
+            .db
+            .operation_knowledge_chunks()
+            .insert_one_with_session(chunk, None, &mut session)
+            .await?;
+        crate::knowledge_wiki::chunk_revisions::apply_chunk_revision_with_session(
+            &state.db,
+            &escalation.workspace_id,
+            chunk_id,
+            crate::knowledge_wiki::chunk_revisions::RevisionRequest {
+                op: crate::knowledge_wiki::chunk_revisions::RevisionOp::Create,
+                source:
+                    crate::knowledge_wiki::chunk_revisions::ProvenanceSource::PrincipalAuthorized,
+                patch: Document::new(),
+                reason: Some(format!(
+                    "principal escalation {} authorized sediment",
+                    escalation.short_code
+                )),
+                actor: Some(escalation.principal_wxid.clone()),
+            },
+            &mut session,
+        )
+        .await?;
+        Ok(())
+    }
+    .await;
+    match result {
+        Ok(()) => {
+            crate::knowledge_wiki::chunk_revisions::commit_chunk_transaction(&mut session).await?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = session.abort_transaction().await;
+            Err(error)
+        }
+    }
 }
 
 /// 从领导裁决 substance 提炼一个确定性的知识标题兜底：

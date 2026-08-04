@@ -35,7 +35,10 @@ SCAN_DIRS=(
 FORBIDDEN_PATTERN='(human[_ -]?takeover|takeover|hand[_ -]?off|人工接管|人工介入|人工托管|接管|人工)'
 
 # 列出 base..HEAD 之间在 SCAN_DIRS 下变更的文件（仅文本文件，排除删除）。
-mapfile -t CHANGED < <(
+CHANGED=()
+while IFS= read -r file; do
+    [ -n "$file" ] && CHANGED+=("$file")
+done < <(
     git diff --name-only --diff-filter=ACMR "$BASE..$HEAD_REF" -- \
         "${SCAN_DIRS[@]}" 2>/dev/null || true
 )

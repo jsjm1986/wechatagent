@@ -59,7 +59,10 @@ SKIP_PATHS_REGEX='(^|/)((\.env\.example)|(config\.rs)|(llm\.rs)|(error\.rs)|test
 # - 仅匹配 model 暗示语境（如 "GPT-4" / "Claude 3" / "推荐使用 GPT" 等）。
 FORBIDDEN_PATTERN='(\bgpt[- ]?[0-9]|\bclaude[- ]?[0-9]|\bgemini[- ]?[0-9]?|\banthropic\b|\bdeepseek[- ]?[a-z0-9]|\bqwen[- ]?[a-z0-9]?|\bkimi[- ]?[a-z0-9]?|\bchatgpt\b|千问|豆包|文心一言|ChatGLM|模型推荐|模型建议|默认模型|推荐使用 ?GPT|推荐使用 ?Claude|默认 ?GPT|默认 ?Claude)'
 
-mapfile -t CHANGED < <(
+CHANGED=()
+while IFS= read -r file; do
+    [ -n "$file" ] && CHANGED+=("$file")
+done < <(
     git diff --name-only --diff-filter=ACMR "$BASE..$HEAD_REF" -- \
         "${SCAN_DIRS[@]}" 2>/dev/null || true
 )

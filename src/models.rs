@@ -1051,16 +1051,22 @@ pub struct ImportJob {
 /// 对齐 gateway/finalReview status 闭集红线（R9.10.e），避免脏值写进 DB。
 pub const ALLOWED_IMPORT_JOB_STATUS: &[&str] = &["pending", "running", "completed", "failed"];
 
-/// 任意 `import_jobs.status` 写入站点的闭集断言。命中闭集外值时 panic（debug）
-/// 或 `tracing::error!` + 拒绝写入（release）。
+pub fn validate_import_job_status(status: &str) -> Result<(), String> {
+    if ALLOWED_IMPORT_JOB_STATUS.contains(&status) {
+        Ok(())
+    } else {
+        Err(format!(
+            "import_jobs.status='{status}' is not in {ALLOWED_IMPORT_JOB_STATUS:?}"
+        ))
+    }
+}
+
+/// Development assertion for literal/internal write sites. Dynamic inputs must
+/// call [`validate_import_job_status`] and propagate the error before writing.
 #[track_caller]
 pub fn assert_import_job_status_valid(status: &str) {
-    if !ALLOWED_IMPORT_JOB_STATUS.contains(&status) {
-        let msg = format!(
-            "import_jobs.status='{status}' 不在 ALLOWED_IMPORT_JOB_STATUS 闭集 {ALLOWED_IMPORT_JOB_STATUS:?}"
-        );
-        debug_assert!(false, "{msg}");
-        tracing::error!(target: "agent_protocol_violation", "{msg}");
+    if let Err(message) = validate_import_job_status(status) {
+        panic!("{message}");
     }
 }
 
@@ -1077,7 +1083,7 @@ mod import_job_status_tests {
     }
 
     #[test]
-    #[should_panic(expected = "ALLOWED_IMPORT_JOB_STATUS")]
+    #[should_panic(expected = "import_jobs.status='queued' is not in")]
     fn unknown_status_panics_in_debug() {
         assert_import_job_status_valid("queued");
     }
@@ -3899,6 +3905,26 @@ pub struct AgentCommandRun {
     pub updated_at: DateTime,
 }
 
+pub const ALLOWED_AGENT_COMMAND_RUN_STATUS: &[&str] = &[
+    "pending_confirmation",
+    "running",
+    "dry_run",
+    "succeeded",
+    "failed",
+    "execution_unknown",
+    "canceled",
+];
+
+pub fn validate_agent_command_run_status(status: &str) -> Result<(), String> {
+    if ALLOWED_AGENT_COMMAND_RUN_STATUS.contains(&status) {
+        Ok(())
+    } else {
+        Err(format!(
+            "agent_command_runs.status='{status}' is not in {ALLOWED_AGENT_COMMAND_RUN_STATUS:?}"
+        ))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentToolCall {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
@@ -3927,11 +3953,14 @@ pub struct AgentToolCall {
 
 /// `AgentToolCall.status` 合法闭集（管理 agent 工具调用终态）。
 /// executed_unverified：已执行但业务结果无法核实（spec §3.3，诚实优于好看）。
+/// accepted：持久受理但送达是异步的（发送网关入队成功 ≠ 客户已收到）。同一条
+/// 「诚实优于好看」纪律——绝不把「已入队」显示成「已送达」。
 pub const ALLOWED_TOOL_CALL_STATUS: &[&str] = &[
     "prepared",
     "executing",
     "dry_run",
     "succeeded",
+    "accepted",
     "failed",
     "executed_unverified",
     "execution_unknown",
