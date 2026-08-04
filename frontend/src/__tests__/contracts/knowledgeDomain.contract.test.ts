@@ -37,7 +37,7 @@ describe("契约: 知识域投影键集对账", () => {
     assertKeysMatch("usage", usageFixture, USAGE_KEYS));
   it("revision_applied 投影", () =>
     assertKeysMatch("revision", revisionFixture, REVISION_KEYS));
-  it("operation_knowledge_chunk_detail 详情裸 struct 投影(顶层 item 包裹)", () =>
+  it("operation_knowledge_chunk_detail 统一 camelCase 投影(顶层 item 包裹)", () =>
     assertKeysMatch("detail", detailFixture, DETAIL_KEYS));
   it("import_job_progress 异步导入进度投影(get/list 端点)", () =>
     assertKeysMatch("importJob", importJobProgressFixture, IMPORT_JOB_KEYS));

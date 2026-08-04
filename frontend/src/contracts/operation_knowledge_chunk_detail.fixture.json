@@ -1,38 +1,37 @@
 {
   "item": {
-    "_id": {
-      "$oid": "64a1f2c3e4b5a6978899aabb"
-    },
-    "account_id": null,
-    "applicable_scenes": [],
+    "accountId": null,
+    "applicableScenes": [],
     "body": null,
-    "business_context": null,
-    "business_topics": [],
-    "chunk_type": "product_fact",
-    "confidence_score": null,
-    "created_at": {
-      "$date": {
-        "$numberLong": "1700000000000"
-      }
-    },
-    "document_id": null,
+    "businessContext": null,
+    "businessTopics": [],
+    "chunkType": "product_fact",
+    "confidenceScore": null,
+    "documentId": null,
     "domain": "user_operations",
-    "integrity_status": null,
-    "item_id": null,
-    "knowledge_type": null,
-    "not_applicable_scenes": [],
+    "dynamicConfidence": null,
+    "id": "64a1f2c3e4b5a6978899aabb",
+    "integrityStatus": null,
+    "itemId": null,
+    "knowledgeType": null,
+    "lockedFields": null,
+    "notApplicableScenes": [],
+    "previousVersionId": null,
     "priority": 0,
-    "product_tags": [],
-    "source_anchors": [],
-    "source_quote": null,
+    "productTags": [],
+    "provenance": null,
+    "relatedChunks": null,
+    "sourceAnchors": [],
+    "sourceQuote": null,
     "status": "draft",
     "summary": null,
+    "supersededBy": null,
     "title": "7x24 自动应答",
-    "updated_at": {
-      "$date": {
-        "$numberLong": "1700000100000"
-      }
-    },
-    "workspace_id": "ws-1"
+    "updatedAt": "2023-11-14T22:15:00Z",
+    "usageStats": null,
+    "validFrom": null,
+    "validTo": null,
+    "wikiType": null,
+    "workspaceId": "ws-1"
   }
 }

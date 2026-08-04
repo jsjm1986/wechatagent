@@ -41,6 +41,8 @@ interface ChunkItem {
   sourceAnchors?: unknown[] | null;
   integrity_status?: string | null;
   integrityStatus?: string | null;
+  updated_at?: string | null;
+  updatedAt?: string | null;
 }
 
 export function ChunkReviewCard({
@@ -78,7 +80,14 @@ export function ChunkReviewCard({
     setBusy(true);
     setError(null);
     try {
-      await api.post(`/api/operation-knowledge/chunks/${encodeURIComponent(chunkId)}/${verb}`, {});
+      const expectedUpdatedAt = chunk?.updated_at ?? chunk?.updatedAt;
+      if (verb === "verify" && !expectedUpdatedAt?.trim()) {
+        throw new Error("缺少版本信息，请刷新后重试");
+      }
+      await api.post(
+        `/api/operation-knowledge/chunks/${encodeURIComponent(chunkId)}/${verb}`,
+        verb === "verify" ? { expectedUpdatedAt } : {},
+      );
       onDone?.();
       // pre-fetched 模式靠父 onDone→load() 重渲染本行；仅 deep-link 模式自刷新。
       if (!prefetched) await load();

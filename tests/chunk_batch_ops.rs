@@ -28,7 +28,9 @@ use wechatagent::routes::ext_knowledge::{
     list_chunk_referrers, reject_operation_knowledge_chunk, verify_operation_knowledge_chunk,
     KnowledgeAutoVerifyRequest, KnowledgeVerifyRequest,
 };
-use wechatagent::routes::{ChunkBatchArchiveRequest, ChunkBatchVerifyRequest, ChunkReferrersQuery};
+use wechatagent::routes::{
+    ChunkBatchArchiveRequest, ChunkBatchVerifyItem, ChunkBatchVerifyRequest, ChunkReferrersQuery,
+};
 
 use crate::common::TestApp;
 
@@ -79,6 +81,27 @@ async fn insert(app: &TestApp, chunks: &[OperationKnowledgeChunk]) {
     }
 }
 
+fn verify_item(chunk: &OperationKnowledgeChunk) -> ChunkBatchVerifyItem {
+    ChunkBatchVerifyItem {
+        id: chunk.id.expect("chunk id").to_hex(),
+        expected_updated_at: chunk
+            .updated_at
+            .try_to_rfc3339_string()
+            .expect("serialize updated_at"),
+    }
+}
+
+fn verify_request(
+    chunk: &OperationKnowledgeChunk,
+    claims: serde_json::Value,
+) -> KnowledgeVerifyRequest {
+    serde_json::from_value(json!({
+        "verifiedClaims": claims,
+        "expectedUpdatedAt": chunk.updated_at.try_to_rfc3339_string().expect("serialize updated_at"),
+    }))
+    .expect("build verify request")
+}
+
 #[tokio::test]
 #[ignore]
 async fn batch_verify_marks_three_chunks_verified() {
@@ -91,13 +114,14 @@ async fn batch_verify_marks_three_chunks_verified() {
     let id1 = c1.id.unwrap().to_hex();
     let id2 = c2.id.unwrap().to_hex();
     let id3 = c3.id.unwrap().to_hex();
+    let verify_items = vec![verify_item(&c1), verify_item(&c2), verify_item(&c3)];
     insert(&app, &[c1, c2, c3]).await;
 
     let resp = batch_verify_chunks(
         State(app.state.clone()),
         admin(&app),
         Json(ChunkBatchVerifyRequest {
-            ids: vec![id1.clone(), id2.clone(), id3.clone()],
+            items: verify_items,
             note: Some("admin batch verify".to_string()),
         }),
     )
@@ -256,7 +280,7 @@ async fn batch_verify_rejects_empty_ids() {
         State(app.state.clone()),
         admin(&app),
         Json(ChunkBatchVerifyRequest {
-            ids: vec![],
+            items: vec![],
             note: None,
         }),
     )
@@ -267,19 +291,19 @@ async fn batch_verify_rejects_empty_ids() {
 #[tokio::test]
 #[ignore]
 async fn batch_verify_skips_chunk_without_quote() {
-    let app = TestApp::start().await;
+    let app = TestApp::start_repl_set().await;
     let ws = app.state.config.default_workspace_id.clone();
 
     let mut c = verifiable_chunk(&ws, "无 source_quote");
     c.source_quote = None;
-    let id = c.id.unwrap().to_hex();
+    let verify_item = verify_item(&c);
     insert(&app, &[c]).await;
 
     let resp = batch_verify_chunks(
         State(app.state.clone()),
         admin(&app),
         Json(ChunkBatchVerifyRequest {
-            ids: vec![id.clone()],
+            items: vec![verify_item],
             note: None,
         }),
     )
@@ -335,6 +359,7 @@ async fn verify_writes_chunk_revision_audit_entry() {
 
     let chunk = verifiable_chunk(&ws, "单条 verify 审计链");
     let id = chunk.id.unwrap().to_hex();
+    let payload = verify_request(&chunk, json!(["先共情再说明价值"]));
     insert(&app, &[chunk]).await;
 
     // verify 前：零 revision。
@@ -343,10 +368,6 @@ async fn verify_writes_chunk_revision_audit_entry() {
         "verify 前不应有任何 chunk_revisions"
     );
 
-    let payload: KnowledgeVerifyRequest = serde_json::from_value(json!({
-        "verifiedClaims": ["先共情再说明价值"],
-    }))
-    .expect("build verify request");
     let _ = verify_operation_knowledge_chunk(
         State(app.state.clone()),
         admin(&app),
@@ -433,13 +454,14 @@ async fn batch_verify_writes_one_revision_per_chunk() {
     let id1 = c1.id.unwrap().to_hex();
     let id2 = c2.id.unwrap().to_hex();
     let id3 = c3.id.unwrap().to_hex();
+    let verify_items = vec![verify_item(&c1), verify_item(&c2), verify_item(&c3)];
     insert(&app, &[c1, c2, c3]).await;
 
     let _ = batch_verify_chunks(
         State(app.state.clone()),
         admin(&app),
         Json(ChunkBatchVerifyRequest {
-            ids: vec![id1.clone(), id2.clone(), id3.clone()],
+            items: verify_items,
             note: Some("批量审计链".to_string()),
         }),
     )
@@ -463,18 +485,75 @@ async fn batch_verify_writes_one_revision_per_chunk() {
 
 #[tokio::test]
 #[ignore]
+async fn verify_rejects_stale_review_snapshot_without_writing_revision() {
+    let app = TestApp::start_repl_set().await;
+    let ws = app.state.config.default_workspace_id.clone();
+
+    let chunk = verifiable_chunk(&ws, "旧快照不可核验");
+    let id = chunk.id.unwrap().to_hex();
+    let stale_payload = verify_request(&chunk, json!([]));
+    insert(&app, &[chunk]).await;
+
+    // 模拟管理员看到版本 A 后，另一写入把当前行推进到版本 B。
+    let oid = ObjectId::parse_str(&id).unwrap();
+    let newer = BsonDt::from_millis(BsonDt::now().timestamp_millis() + 1_000);
+    app.state
+        .db
+        .operation_knowledge_chunks()
+        .update_one(
+            mongodb::bson::doc! { "_id": oid, "workspace_id": &ws },
+            mongodb::bson::doc! { "$set": {
+                "summary": "并发写入后的版本 B",
+                "updated_at": newer,
+            } },
+            None,
+        )
+        .await
+        .expect("advance chunk version");
+
+    let error = verify_operation_knowledge_chunk(
+        State(app.state.clone()),
+        admin(&app),
+        Path(id.clone()),
+        Json(stale_payload),
+    )
+    .await
+    .expect_err("stale review snapshot must fail closed");
+    assert!(
+        matches!(error, wechatagent::error::AppError::Conflict(ref code) if code == "chunk_revision_conflict"),
+        "unexpected error: {error:?}"
+    );
+    assert!(
+        revisions_for(&app, &id).await.is_empty(),
+        "stale verify must not leave an audit revision for an unapplied approval"
+    );
+
+    let stored = app
+        .state
+        .db
+        .operation_knowledge_chunks()
+        .find_one(
+            mongodb::bson::doc! { "_id": oid, "workspace_id": &ws },
+            None,
+        )
+        .await
+        .expect("load chunk")
+        .expect("chunk exists");
+    assert_eq!(stored.integrity_status.as_deref(), Some("needs_review"));
+}
+
+#[tokio::test]
+#[ignore]
 async fn verify_gate_blocks_and_writes_no_revision_without_anchor() {
-    let app = TestApp::start().await;
+    let app = TestApp::start_repl_set().await;
     let ws = app.state.config.default_workspace_id.clone();
 
     // 缺 source_anchors（仅有 quote）→ D2 gate 在 apply_chunk_revision 之前先挡住。
     let mut chunk = verifiable_chunk(&ws, "无 anchor 不可 verify");
     chunk.source_anchors = vec![];
     let id = chunk.id.unwrap().to_hex();
+    let payload = verify_request(&chunk, json!([]));
     insert(&app, &[chunk]).await;
-
-    let payload: KnowledgeVerifyRequest =
-        serde_json::from_value(json!({ "verifiedClaims": [] })).unwrap();
     let resp = verify_operation_knowledge_chunk(
         State(app.state.clone()),
         admin(&app),

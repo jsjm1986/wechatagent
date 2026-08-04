@@ -6,13 +6,21 @@ export interface GoLiveResult {
   message?: string;
 }
 
+interface ChatApplyResponse {
+  result?: { updatedAt?: string };
+}
+
 export async function runGoLive(input: {
   sessionId?: string;
   chunkId: string;
+  expectedUpdatedAt: string;
   accountId?: string;
 }): Promise<GoLiveResult> {
   try {
-    // 1. 有 sessionId 才先 apply(对话改过草稿);无则跳过直接 verify
+    // 无对话修改时核验用户实际看到的版本；有 session 时 apply 会产生新版本，必须
+    // 改用 apply 回执里的 updatedAt，不能拿 apply 前快照去核验。
+    let expectedUpdatedAt = input.expectedUpdatedAt.trim();
+    if (!expectedUpdatedAt) return { ok: false, reason: "gate_blocked" };
     if (input.sessionId) {
       const applyResp = await fetch(
         `/api/operation-knowledge/chat/${encodeURIComponent(input.sessionId)}/apply`,
@@ -20,27 +28,28 @@ export async function runGoLive(input: {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ accountId: input.accountId || null }),
-        }
+        },
       );
-      if (!applyResp.ok) {
-        return { ok: false, reason: "apply_failed" };
-      }
+      if (!applyResp.ok) return { ok: false, reason: "apply_failed" };
+      const applied = (await applyResp.json()) as ChatApplyResponse;
+      const appliedVersion = applied.result?.updatedAt?.trim();
+      if (!appliedVersion) return { ok: false, reason: "apply_failed" };
+      expectedUpdatedAt = appliedVersion;
     }
-    // 2. verify(过 D2 闸)
     const verifyResp = await fetch(
       `/api/operation-knowledge/chunks/${encodeURIComponent(input.chunkId)}/verify`,
-      { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" }
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ expectedUpdatedAt }),
+      },
     );
-    if (verifyResp.ok) {
-      return { ok: true };
-    }
-    // 4xx = D2 闸拒绝(缺锚点等),可恢复;5xx = 服务端错误
+    if (verifyResp.ok) return { ok: true };
     if (verifyResp.status >= 400 && verifyResp.status < 500) {
       return { ok: false, reason: "gate_blocked" };
     }
     return { ok: false, reason: "server_error" };
   } catch {
-    // 网络断开/DNS/CORS:fetch reject,归一为服务端错误,不让异常冒泡成 unhandled rejection
     return { ok: false, reason: "server_error" };
   }
 }
@@ -51,6 +60,7 @@ export function useGoLive() {
   const goLive = useCallback(async (input: {
     sessionId?: string;
     chunkId: string;
+    expectedUpdatedAt: string;
     accountId?: string;
   }) => {
     setPending(true);

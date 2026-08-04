@@ -1383,6 +1383,22 @@ pub struct KnowledgeRouteResult {
     /// 到 `knowledge_usage_logs.route_result`。缺字段时反序列化为空 Vec（R11 安全）。
     #[serde(default)]
     pub selected_chunk_rankings: Vec<SelectedChunkRanking>,
+    /// B2：本轮 `selected_chunk_ids` 是否来自 `fallback_rank` 弱回填，而非 Knowledge
+    /// Agent 的 citation。
+    ///
+    /// **为什么必须单独一个字段**：`selected_chunk_ids` 同时承担两种语义——「导航候选」
+    /// （喂 prompt 当参考材料）与「可授权证据」（喂 `used_knowledge_ids` → 产品背书硬闸
+    /// `compute_verified_chunks`）。回填候选只满足前者：它由静态排序取 top-N 得来，
+    /// **无最低相关度门槛**、未经 citation/quote/anchor 校验，与本轮候选回复里的产品
+    /// claim 没有任何绑定关系。`verified` 只证明该 chunk 自身经过人工审核，不证明它与
+    /// 当前 query 相关。若让它进入 `used_knowledge_ids`，`used ∩ verified` 非空即放行，
+    /// 会从结构上架空 `blocked_unverified_product_claim`。
+    ///
+    /// 该字段只由服务端在 `route_operation_knowledge_inner` 内赋值（`KnowledgeRouteResult`
+    /// 无 LLM 反序列化路径），LLM 无法伪造。缺字段反序列化为 `false`——历史 route 文档
+    /// 按「非回填」处理，与本改动前的行为一致。
+    #[serde(default)]
+    pub selected_chunks_are_fallback: bool,
 }
 
 /// 自学习采集管道 S4：单条被选 chunk 的召回倾向快照。

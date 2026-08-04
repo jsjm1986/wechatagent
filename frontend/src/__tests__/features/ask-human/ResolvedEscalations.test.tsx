@@ -49,7 +49,7 @@ describe("ResolvedEscalations 已裁决历史", () => {
     expect(screen.getByText(/裁决渠道/)).toBeTruthy();
   });
 
-  it("authorizationExpiresAt 为 null 时显示长期有效", async () => {
+  it("authorizationExpiresAt 为 null 时显示本次转述不设期限", async () => {
     get.mockResolvedValue({
       items: [
         {
@@ -63,7 +63,7 @@ describe("ResolvedEscalations 已裁决历史", () => {
 
     render(<ResolvedEscalations />);
     await screen.findByText("E2");
-    expect(screen.getByText(/长期有效/)).toBeTruthy();
+    expect(screen.getByText(/本次转述不设期限/)).toBeTruthy();
   });
 
   it("空列表显示占位文案", async () => {

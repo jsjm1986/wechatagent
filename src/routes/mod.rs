@@ -93,7 +93,9 @@ mod souls;
 pub mod tasks;
 mod worker_controls;
 
-pub use knowledge::{ChunkBatchArchiveRequest, ChunkBatchVerifyRequest, ChunkReferrersQuery};
+pub use knowledge::{
+    ChunkBatchArchiveRequest, ChunkBatchVerifyItem, ChunkBatchVerifyRequest, ChunkReferrersQuery,
+};
 pub use outcomes_autonomy::{
     get_autonomy_outcomes, list_autonomy_revisions, AutonomyMetricsQuery, AutonomyRevisionsQuery,
 };

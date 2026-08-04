@@ -2277,9 +2277,10 @@ memoryKind 闭集：
   "exemption_type": "none"
 }
 
-authorization_window_hours（授权有效时长，小时）——领导说了算：
+authorization_window_hours（本次裁决转述的有效时长，小时）——领导说了算：
 - 领导明确给了时限才填数字：如"这个价就今天有效"→约 24；"这周内都行"→按本周剩余天数估算小时数；"24 小时内"→24。
-- 领导没提任何时限 → 填 null（表示这条授权不设过期窗、长期有效）。
+- 领导没提任何时限 → 填 null（表示本次裁决转述不设过期窗）。
+- 该字段不控制 customer_only / knowledge 的客户级长期豁免；长期豁免由管理员显式撤销。
 - 不要自己默认一个时长——没说就是 null。
 
 exemption_type（领导本次授权的适用范围）取其一：

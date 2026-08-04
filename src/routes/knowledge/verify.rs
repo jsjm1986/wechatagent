@@ -17,7 +17,8 @@ use std::sync::Arc;
 use crate::auth::AuthenticatedAdmin;
 use crate::error::{AppError, AppResult};
 use crate::knowledge_wiki::chunk_revisions::{
-    apply_chunk_revision, ProvenanceSource, RevisionOp, RevisionRequest,
+    apply_chunk_revision, apply_chunk_revision_with_session, commit_chunk_transaction,
+    map_chunk_transaction_error, ProvenanceSource, RevisionApplied, RevisionOp, RevisionRequest,
 };
 use crate::{agent, models::KnowledgeUsageLog, prompts};
 
@@ -42,9 +43,90 @@ fn clamp_sample_rate(requested: Option<f64>) -> f64 {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct KnowledgeVerifyRequest {
     verified_claims: Option<Vec<String>>,
+    /// 管理员实际看到的 chunk 版本。必须与事务快照中的 `updated_at` 精确一致。
+    expected_updated_at: String,
+}
+
+pub(super) fn parse_verify_expected_updated_at(value: &str) -> AppResult<DateTime> {
+    DateTime::parse_rfc3339_str(value.trim())
+        .map_err(|_| AppError::BadRequest("expectedUpdatedAt must be RFC3339".to_string()))
+}
+
+/// 在同一 Mongo 事务快照内完成版本绑定、D2 证据检查和 verify revision 写入。
+/// 这同时阻止“管理员看 A、实际批准 B”和“闸门检查后证据被并发清空”两类竞态。
+pub(super) async fn verify_chunk_at_version(
+    state: &AppState,
+    workspace_id: &str,
+    object_id: mongodb::bson::oid::ObjectId,
+    expected_updated_at: DateTime,
+    verified_claims: &[String],
+    reason: Option<String>,
+    actor: &str,
+) -> AppResult<RevisionApplied> {
+    let mut session = state.db.client().start_session(None).await?;
+    session.start_transaction(None).await?;
+
+    let result: AppResult<RevisionApplied> = async {
+        let chunk = state
+            .db
+            .operation_knowledge_chunks()
+            .find_one_with_session(
+                doc! { "_id": object_id, "workspace_id": workspace_id },
+                None,
+                &mut session,
+            )
+            .await?
+            .ok_or_else(|| AppError::NotFound("operation knowledge chunk not found".to_string()))?;
+        if chunk.updated_at.timestamp_millis() != expected_updated_at.timestamp_millis() {
+            return Err(AppError::Conflict("chunk_revision_conflict".to_string()));
+        }
+
+        let has_quote = chunk
+            .source_quote
+            .as_deref()
+            .is_some_and(|quote| !quote.trim().is_empty());
+        let has_anchor = !chunk.source_anchors.is_empty();
+        if let Some(reason) = chunk_verify_gate_reason(has_quote, has_anchor) {
+            return Err(AppError::BadRequest(reason));
+        }
+
+        apply_chunk_revision_with_session(
+            &state.db,
+            workspace_id,
+            object_id,
+            RevisionRequest {
+                op: RevisionOp::Verify,
+                source: ProvenanceSource::Human,
+                patch: doc! {
+                    "integrity_status": "verified",
+                    "confidence_score": 100,
+                    "verified_claims": string_bson_array(verified_claims),
+                    "unsupported_claims": Bson::Array(Vec::new()),
+                    "status": "active",
+                },
+                reason,
+                actor: Some(actor.to_string()),
+            },
+            &mut session,
+        )
+        .await
+    }
+    .await;
+
+    let applied = match result {
+        Ok(applied) => applied,
+        Err(error) => {
+            let _ = session.abort_transaction().await;
+            return Err(map_chunk_transaction_error(error));
+        }
+    };
+    commit_chunk_transaction(&mut session)
+        .await
+        .map_err(map_chunk_transaction_error)?;
+    Ok(applied)
 }
 
 #[derive(Debug, Deserialize)]
@@ -70,57 +152,21 @@ pub async fn verify_operation_knowledge_chunk(
     Json(payload): Json<KnowledgeVerifyRequest>,
 ) -> AppResult<Json<Value>> {
     let object_id = parse_object_id(&id)?;
-    let chunk = state
-        .db
-        .operation_knowledge_chunks()
-        .find_one(
-            doc! {
-                "_id": object_id,
-                "workspace_id": &admin.current_workspace
-            },
-            None,
-        )
-        .await?
-        .ok_or_else(|| AppError::NotFound("operation knowledge chunk not found".to_string()))?;
-
-    // D2 不变量：verify 之前必须有 sourceQuote 且能锚定到父文档（source_anchors 非空）。
-    // 否则任何路径（运营 verify / AI 修复后 apply-and-verify / 老 UI verify）都不可越过。
-    let has_quote = chunk
-        .source_quote
-        .as_deref()
-        .map(|s| !s.trim().is_empty())
-        .unwrap_or(false);
-    let has_anchor = !chunk.source_anchors.is_empty();
-    if let Some(reason) = chunk_verify_gate_reason(has_quote, has_anchor) {
-        return Err(AppError::BadRequest(reason));
-    }
-
+    let expected_updated_at = parse_verify_expected_updated_at(&payload.expected_updated_at)?;
     let verified_claims = payload.verified_claims.unwrap_or_default();
-    // D2：verify 写入接回 apply_chunk_revision，留 chunk_revisions(op=verify, source=human)
-    // 不可变历史 + provenance（此前直接 update_one 绕过审计链，"needs_review→verified"
-    // 这个最关键状态转移查不到谁在何时审定）。前置 D2 gate（上方 has_quote+has_anchor）
-    // 已校验，apply_chunk_revision 不重复该语义；source=Human 不触发 AI-draft 降级；
-    // 这些字段均不在 DEFAULT_LOCKED_FIELDS，patch 不被锁字段守门拒收。
-    apply_chunk_revision(
-        &state.db,
+    let applied = verify_chunk_at_version(
+        &state,
         &admin.current_workspace,
         object_id,
-        RevisionRequest {
-            op: RevisionOp::Verify,
-            source: ProvenanceSource::Human,
-            patch: doc! {
-                "integrity_status": "verified",
-                "confidence_score": 100,
-                "verified_claims": string_bson_array(&verified_claims),
-                "unsupported_claims": Bson::Array(Vec::new()),
-                "status": "active",
-            },
-            reason: None,
-            actor: Some(admin.username.clone()),
-        },
+        expected_updated_at,
+        &verified_claims,
+        None,
+        &admin.username,
     )
     .await?;
-    Ok(Json(json!({ "ok": true })))
+    Ok(Json(
+        json!({ "ok": true, "revisionId": applied.revision_id }),
+    ))
 }
 
 pub async fn reject_operation_knowledge_chunk(

@@ -188,8 +188,11 @@ async fn chat_apply_verify_then_answer_is_auditable_closed_loop() {
             "unverified chat draft must stay out of production catalog"
         );
 
-        let verify_req: KnowledgeVerifyRequest =
-            serde_json::from_value(json!({ "verifiedClaims": [] })).expect("verify request");
+        let verify_req: KnowledgeVerifyRequest = serde_json::from_value(json!({
+            "verifiedClaims": [],
+            "expectedUpdatedAt": applied["result"]["updatedAt"],
+        }))
+        .expect("verify request");
         let verify_response = verify_operation_knowledge_chunk(
             State(app.state.clone()),
             Extension(admin),
@@ -429,8 +432,11 @@ async fn unverified_draft_not_recallable_until_approved() {
         username: "closed_loop_admin".into(),
         current_workspace: WS.to_string(),
     });
-    let req: KnowledgeVerifyRequest =
-        serde_json::from_value(serde_json::json!({ "verifiedClaims": [] })).expect("verify req");
+    let req: KnowledgeVerifyRequest = serde_json::from_value(serde_json::json!({
+        "verifiedClaims": [],
+        "expectedUpdatedAt": draft.updated_at.try_to_rfc3339_string().expect("serialize updated_at"),
+    }))
+    .expect("verify req");
     let resp = verify_operation_knowledge_chunk(
         State(app.state.clone()),
         admin,

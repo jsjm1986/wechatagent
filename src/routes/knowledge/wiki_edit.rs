@@ -17,6 +17,7 @@ use crate::error::{AppError, AppResult};
 
 use super::super::shared::*;
 use super::super::AppState;
+use super::verify::{parse_verify_expected_updated_at, verify_chunk_at_version};
 use super::*;
 
 // ──────────────────────────────────────────────────────────────────────
@@ -894,9 +895,16 @@ pub async fn list_chunk_referrers(
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChunkBatchVerifyItem {
+    pub id: String,
+    pub expected_updated_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ChunkBatchVerifyRequest {
-    pub ids: Vec<String>,
+    pub items: Vec<ChunkBatchVerifyItem>,
     #[serde(default)]
     pub note: Option<String>,
 }
@@ -910,74 +918,43 @@ pub async fn batch_verify_chunks(
     Extension(admin): Extension<AuthenticatedAdmin>,
     Json(payload): Json<ChunkBatchVerifyRequest>,
 ) -> AppResult<Json<Value>> {
-    if payload.ids.is_empty() {
-        return Err(AppError::BadRequest("ids is required".to_string()));
+    if payload.items.is_empty() {
+        return Err(AppError::BadRequest("items is required".to_string()));
     }
-    if payload.ids.len() > 100 {
-        return Err(AppError::BadRequest("max 100 ids per batch".to_string()));
+    if payload.items.len() > 100 {
+        return Err(AppError::BadRequest("max 100 items per batch".to_string()));
     }
     let mut verified: Vec<String> = Vec::new();
     let mut skipped: Vec<Value> = Vec::new();
-    for id in payload.ids.iter() {
-        let object_id = match parse_object_id(id) {
-            Ok(v) => v,
+    for item in &payload.items {
+        let object_id = match parse_object_id(&item.id) {
+            Ok(value) => value,
             Err(_) => {
-                skipped.push(json!({ "id": id, "reason": "invalid_object_id" }));
+                skipped.push(json!({ "id": item.id, "reason": "invalid_object_id" }));
                 continue;
             }
         };
-        let chunk = match state
-            .db
-            .operation_knowledge_chunks()
-            .find_one(
-                doc! { "_id": object_id, "workspace_id": &admin.current_workspace },
-                None,
-            )
-            .await
+        let expected_updated_at = match parse_verify_expected_updated_at(&item.expected_updated_at)
         {
-            Ok(Some(c)) => c,
-            Ok(None) => {
-                skipped.push(json!({ "id": id, "reason": "not_found" }));
-                continue;
-            }
-            Err(e) => {
-                skipped.push(json!({ "id": id, "reason": format!("db_error: {}", e) }));
+            Ok(value) => value,
+            Err(error) => {
+                skipped.push(json!({ "id": item.id, "reason": error.to_string() }));
                 continue;
             }
         };
-        let has_quote = chunk
-            .source_quote
-            .as_deref()
-            .map(|s| !s.trim().is_empty())
-            .unwrap_or(false);
-        let has_anchor = !chunk.source_anchors.is_empty();
-        if let Some(reason) = chunk_verify_gate_reason(has_quote, has_anchor) {
-            skipped.push(json!({ "id": id, "reason": reason }));
-            continue;
-        }
-        // D2：批量 verify 接回 apply_chunk_revision（op=verify, source=human），与
-        // batch_archive_chunks 同款留痕；部分成功语义保留（单条失败进 skipped）。
-        match apply_chunk_revision(
-            &state.db,
+        match verify_chunk_at_version(
+            &state,
             &admin.current_workspace,
             object_id,
-            RevisionRequest {
-                op: RevisionOp::Verify,
-                source: ProvenanceSource::Human,
-                patch: doc! {
-                    "integrity_status": "verified",
-                    "confidence_score": 100,
-                    "unsupported_claims": Bson::Array(Vec::new()),
-                    "status": "active",
-                },
-                reason: payload.note.clone(),
-                actor: Some(admin.username.clone()),
-            },
+            expected_updated_at,
+            &[],
+            payload.note.clone(),
+            &admin.username,
         )
         .await
         {
-            Ok(_) => verified.push(id.clone()),
-            Err(e) => skipped.push(json!({ "id": id, "reason": format!("update_failed: {}", e) })),
+            Ok(_) => verified.push(item.id.clone()),
+            Err(error) => skipped.push(json!({ "id": item.id, "reason": error.to_string() })),
         }
     }
     Ok(Json(json!({

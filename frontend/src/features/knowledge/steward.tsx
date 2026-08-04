@@ -1683,7 +1683,13 @@ export function ReviewView({ initialDimFilter }: { initialDimFilter?: string | n
         : "/api/operation-knowledge/chunks/batch-archive";
     const body =
       action === "verify"
-        ? { ids, note: "batch verify (admin)" }
+        ? {
+            items: ids.map((id) => {
+              const item = items.find((candidate) => candidate.id === id);
+              return { id, expectedUpdatedAt: item?.updatedAt ?? "" };
+            }),
+            note: "batch verify (admin)",
+          }
         : { ids, reason: "batch archive (admin)" };
     try {
       const r = await fetch(path, {

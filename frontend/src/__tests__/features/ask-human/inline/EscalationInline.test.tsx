@@ -41,9 +41,10 @@ describe("EscalationInline", () => {
     // 选择 conditional 裁决
     fireEvent.change(screen.getByLabelText(/裁决类型/), { target: { value: "conditional" } });
     // 授权窗输入出现
-    const win = screen.getByLabelText(/授权窗/);
+    const win = screen.getByLabelText(/本次转述有效期/);
     fireEvent.change(win, { target: { value: "48" } });
     fireEvent.change(screen.getByPlaceholderText(/约束条款/), { target: { value: "仅限本月" } });
+    fireEvent.change(screen.getByLabelText(/后续产品豁免范围/), { target: { value: "customer_only" } });
     fireEvent.change(screen.getByPlaceholderText(/裁决意见/), { target: { value: "有条件同意" } });
     fireEvent.click(screen.getByText("提交裁决"));
     await waitFor(() =>
@@ -52,6 +53,7 @@ describe("EscalationInline", () => {
         expect.objectContaining({
           verdict: "conditional",
           authorizationWindowHours: 48,
+          exemptionType: "customer_only",
           constraints: ["仅限本月"],
         }),
       ),
