@@ -11,7 +11,9 @@ interface ReviewQueueProps<T> {
   fetchItems: () => Promise<T[]>;
   getId: (item: T) => string;
   renderItem: (item: T, ctx: RowCtx) => ReactNode;
-  emptyText?: string;
+  // ReactNode 而非 string：ask-human 传入共享 <EmptyState> 组件。
+  // 拓宽是向后兼容的——原先传字符串的调用方不受影响，默认值仍是纯文本。
+  emptyText?: ReactNode;
   refreshToken?: number;
 }
 
@@ -90,7 +92,13 @@ export function ReviewQueue<T>({
 
   if (loading && items.length === 0) return <div className="reviewQueueLoading">加载中…</div>;
   if (error) return <div className="reviewQueueError">加载失败：{error}</div>;
-  if (items.length === 0) return <div className="reviewQueueEmpty">{emptyText ?? "暂无待处理项"}</div>;
+  if (items.length === 0) {
+    // 传入的是自带容器与样式的组件节点（如共享 <EmptyState/>）时直接渲染，
+    // 不再套一层零样式的 .reviewQueueEmpty——多余包裹会破坏其居中与虚线框布局。
+    // 字符串（含默认值「暂无待处理项」）仍走原包裹，对既有调用方零影响。
+    if (emptyText != null && typeof emptyText !== "string") return <>{emptyText}</>;
+    return <div className="reviewQueueEmpty">{emptyText ?? "暂无待处理项"}</div>;
+  }
   return (
     <div className="reviewQueueList">
       {items.map((item) => {

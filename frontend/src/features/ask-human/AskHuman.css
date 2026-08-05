@@ -521,3 +521,27 @@
 }
 .lessonPromoteLoading,
 .lessonPromoteDone { font-size: 12.5px; color: var(--ink-3, var(--ink-2)); padding: 8px 0; }
+
+/* ReviewQueue 的容器 class 原先在全库无任何 CSS 定义（裸文字/无间距）。
+   此处补最小样式。ReviewQueue 全库只有本频道一个真实消费者
+   （knowledge/steward.tsx 中的 ReviewQueueItem 只是同名类型，未 import 组件），
+   故这些规则不外溢。空态本身改由共享 EmptyState 组件渲染，不在此定义。 */
+.reviewQueueList {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.reviewQueueLoading {
+  padding: 24px 14px;
+  font-size: 12.5px;
+  color: var(--ink-3);
+  text-align: center;
+}
+.reviewQueueError {
+  padding: 11px 14px;
+  border-radius: var(--r-sm);
+  font-size: 12.5px;
+  color: var(--color-blocked);
+  background: var(--fill-blocked);
+  border: 1px solid rgba(255, 69, 58, 0.3);
+}

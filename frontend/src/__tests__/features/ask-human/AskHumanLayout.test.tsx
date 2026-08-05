@@ -137,3 +137,29 @@ describe("来源筛选 chip 布局", () => {
     expect(screen.getByText("标签候选: 不可用")).toBeTruthy();
   });
 });
+
+describe("空态渲染", () => {
+  it("无待办时渲染共享 EmptyState 结构，而非裸 div", async () => {
+    mockInbox([], 0);
+    const { container } = renderInbox();
+
+    // EmptyState 的标题文案。
+    await screen.findByText("暂无待处理项");
+
+    // 裸 div 分支不应再出现。
+    expect(container.querySelector(".reviewQueueEmpty")).toBeNull();
+    // EmptyState 自带 lucide Inbox 图标（CSS Module 类名经哈希，故按 svg 判定）。
+    const empty = screen.getByText("暂无待处理项").closest("div");
+    expect(empty).not.toBeNull();
+    expect(empty!.querySelector("svg")).not.toBeNull();
+    // 空态仍在白卡内。
+    expect(container.querySelector(".askHumanPanel")!.textContent).toContain("暂无待处理项");
+  });
+
+  it("空态带提示文案，说明这是正常状态而非故障", async () => {
+    mockInbox([], 0);
+    renderInbox();
+    await screen.findByText("暂无待处理项");
+    expect(screen.getByText(/AI 自主运行中/)).toBeTruthy();
+  });
+});

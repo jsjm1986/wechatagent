@@ -3,6 +3,7 @@ import { ConfirmProvider } from "../../components/ui/ConfirmDialog";
 import { ToastProvider } from "../../components/ui/Toast";
 import { useInboxStore } from "../../stores/inboxStore";
 import { ReviewQueue, type RowCtx } from "../../components/review/ReviewQueue";
+import { EmptyState } from "../../components/ui/EmptyState";
 import { type InboxItem } from "../../lib/inboxApi";
 import { EscalationInline } from "./inline/EscalationInline";
 import { SimpleApproveReject } from "./inline/SimpleApproveReject";
@@ -274,7 +275,12 @@ function AskHumanView() {
                 </InboxRow>
               );
             }}
-            emptyText="暂无待处理项"
+            emptyText={
+              <EmptyState
+                title="暂无待处理项"
+                hint="AI 自主运行中，需要决策或审核的事项会自动出现在这里。"
+              />
+            }
           />
         </>
       )}
