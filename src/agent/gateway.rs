@@ -6676,7 +6676,7 @@ mod tests {
         for passive in ["inbound", "inbound_message", "manual_send"] {
             assert!(
                 !kinds.contains(&passive),
-                "{passive} 是被动/人工来源，绝不能占用主动触达配额：{kinds:?}"
+                "{passive} 是被动应答 / 运营手动来源，绝不能占用主动触达配额：{kinds:?}"
             );
         }
 
