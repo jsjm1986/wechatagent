@@ -6,6 +6,7 @@ import { useAccountStore } from "../../stores/accountStore";
 import type {
   Account,
   Contact,
+  OperationDomainDraft,
   OperationPlaybook,
   UserOperationGuidePreview,
 } from "../../types";
@@ -560,5 +561,61 @@ describe("userOpsStore.enableAgent playbook binding", () => {
     await useUserOpsStore.getState().enableAgent();
 
     expect(useUserOpsStore.getState().guideBusy).toBe(false);
+  });
+});
+
+describe("userOpsStore.saveOperationDomain", () => {
+  const domainDraft: OperationDomainDraft = {
+    name: "用户运营",
+    goal: "goal",
+    methodology: "method",
+    workflow: "workflow",
+    toolPolicy: "tools",
+    automationPolicy: "automation",
+    reviewPolicy: "review",
+    runtimeParameters: [
+      "maxDailyTouches = 3",
+      "quietHoursEnabled = false",
+      "quietHoursStart = 23",
+      "quietHoursEnd = 7",
+      "quietHoursTzOffsetHours = 8"
+    ].join("\n"),
+    stateMachine: "",
+    assistModeEnabled: false
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    useUserOpsStore.setState({
+      operationDomains: [],
+      domainDrafts: { user_operations: domainDraft }
+    });
+    (api.get as any).mockResolvedValue({ items: [] });
+  });
+
+  it("提交完整作息参数并返回成功状态", async () => {
+    const saved = await useUserOpsStore.getState().saveOperationDomain("user_operations");
+
+    expect(saved).toBe(true);
+    expect(api.put).toHaveBeenCalledWith(
+      "/api/operation-domains/user_operations",
+      expect.objectContaining({
+        runtimeParameters: expect.objectContaining({
+          maxDailyTouches: 3,
+          quietHoursEnabled: false,
+          quietHoursStart: 23,
+          quietHoursEnd: 7,
+          quietHoursTzOffsetHours: 8
+        })
+      })
+    );
+  });
+
+  it("写入失败时返回 false", async () => {
+    (api.put as any).mockRejectedValueOnce(new Error("save failed"));
+
+    await expect(
+      useUserOpsStore.getState().saveOperationDomain("user_operations")
+    ).resolves.toBe(false);
   });
 });
