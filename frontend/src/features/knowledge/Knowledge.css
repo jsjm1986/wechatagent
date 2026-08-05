@@ -3151,6 +3151,31 @@
     align-items: center;
     gap: 4px;
   }
+  /* 治理工坊工具栏/表头的「刷新」按钮：全局 button 基线（styles.css:71）是
+     38px 高的纯蓝实心款，压在 11px 的 PublishBar 按钮和表格行上尺度失调。
+     此处对齐同面板 .wikiPublishBar button 的规格，并显式压掉 min-height
+     与 background/color。MetadataDashboard 的刷新按钮在 .wikiArchiveHeaderActions
+     内，而该 class 亦被 today.tsx / steward.tsx 使用，故用唯一的
+     .wikiMetadataDashboard 精确限定，避免溢出到本次范围外的面板。 */
+  .knowledgeWiki .wikiAdminToolbar button,
+  .knowledgeWiki .wikiMetadataDashboard .wikiArchiveHeaderActions button {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 500;
+    min-height: auto;
+    border: 1px solid var(--surface-page);
+    background: var(--surface-card);
+    color: var(--ink-2);
+    padding: 4px 8px;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+  }
+  .knowledgeWiki .wikiAdminToolbar button:hover:not(:disabled),
+  .knowledgeWiki .wikiMetadataDashboard .wikiArchiveHeaderActions button:hover:not(:disabled) {
+    background: var(--surface-page);
+  }
   .knowledgeWiki .wikiAdminTable {
     width: 100%;
     border-collapse: collapse;
