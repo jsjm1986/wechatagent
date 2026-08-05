@@ -35,13 +35,14 @@ pub use gates::{
 // 风格指纹：gateway 出站后写 last_outbound_style、reviewer 比对风格漂移。
 pub(crate) use style::{extract_outbound_style_fingerprint, style_diverged};
 
+use futures::{future::BoxFuture, FutureExt};
 use mongodb::bson::Document;
 use serde_json::Value;
 
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    Contact, ConversationMessage, OperatingMemory, OperationDomainConfig, OperationKnowledgeChunk,
-    OperationPlaybook, Product,
+    Contact, ConversationMessage, DomainProfile, OperatingMemory, OperationDomainConfig,
+    OperationKnowledgeChunk, OperationPlaybook, Product,
 };
 use crate::prompts;
 use crate::routes::AppState;
@@ -613,23 +614,52 @@ fn hold_for_claim_gate_failure(review: &mut DecisionReviewResult, error: &AppErr
     );
 }
 
-pub(crate) async fn ensure_independent_claim_gate(
+/// Independent Claim Gate 的异步评估结果。
+///
+/// 评估与 review 合并刻意分离：gateway 可以把 Claim Gate 与最终 Reviewer 并行执行，
+/// 但只有两者都结束后才调用 [`apply_independent_claim_gate`] 汇总硬门。内部 verdict
+/// 不对模块外暴露，避免调用方绕过服务端 catalog/quote 完整性校验。
+pub(crate) struct IndependentClaimGateEvaluation {
+    outcome: Option<AppResult<IndependentClaimVerdict>>,
+}
+
+/// 只执行独立语义评估，不修改 Review 结果、不产生发送授权。
+pub(crate) async fn evaluate_independent_claim_gate(
     state: &AppState,
     contact: &Contact,
     inbound: &ConversationMessage,
     decision: &AgentDecision,
-    review: &mut DecisionReviewResult,
     active_products: &[Product],
     run_id: Option<&str>,
-) -> bool {
+) -> IndependentClaimGateEvaluation {
+    let _stage_timer = super::run_audit::stage_timer("claim_gate");
     // Invocation ownership stays in the gateway. Never trust a marker inside
     // `claim_analysis`: that document originates from the reviewed model and could forge it.
-    if !decision.should_reply {
+    let outcome = if decision.should_reply {
+        Some(
+            run_independent_claim_gate(state, contact, inbound, decision, active_products, run_id)
+                .await,
+        )
+    } else {
+        None
+    };
+    IndependentClaimGateEvaluation { outcome }
+}
+
+/// 把独立 Claim Gate 结果确定性合并进 Reviewer 结果。
+///
+/// LLM/解析失败继续 fail closed；catalog 背书仍须通过服务端逐字段与 sourceQuote
+/// 完整性核验。返回值仅表示最终正文是否获得 catalog 背书。
+pub(crate) fn apply_independent_claim_gate(
+    evaluation: IndependentClaimGateEvaluation,
+    decision: &AgentDecision,
+    review: &mut DecisionReviewResult,
+    active_products: &[Product],
+) -> bool {
+    let Some(outcome) = evaluation.outcome else {
         return false;
-    }
-    match run_independent_claim_gate(state, contact, inbound, decision, active_products, run_id)
-        .await
-    {
+    };
+    match outcome {
         Ok(verdict) => {
             let catalog_backed =
                 catalog_claims_are_backed(&verdict, active_products, &decision.reply_text);
@@ -647,6 +677,21 @@ pub(crate) async fn ensure_independent_claim_gate(
             false
         }
     }
+}
+
+pub(crate) async fn ensure_independent_claim_gate(
+    state: &AppState,
+    contact: &Contact,
+    inbound: &ConversationMessage,
+    decision: &AgentDecision,
+    review: &mut DecisionReviewResult,
+    active_products: &[Product],
+    run_id: Option<&str>,
+) -> bool {
+    let evaluation =
+        evaluate_independent_claim_gate(state, contact, inbound, decision, active_products, run_id)
+            .await;
+    apply_independent_claim_gate(evaluation, decision, review, active_products)
 }
 
 #[cfg(test)]
@@ -1442,6 +1487,8 @@ pub async fn review_fixed_candidate_for_test(
         review_mode,
         None,
         None,
+        None,
+        None,
     )
     .await
 }
@@ -1479,6 +1526,43 @@ mod assist_yield_tests {
     }
 }
 
+/// Gateway-only lazy cache for the two Reviewer system prompts. Production
+/// review/rewrite/revision calls share one instance; Shadow and Simulation pass
+/// `None` so frozen-candidate isolation and independent loading stay intact.
+#[derive(Default)]
+pub(crate) struct ReviewerPromptCache {
+    light: parking_lot::Mutex<Option<String>>,
+    full: parking_lot::Mutex<Option<String>>,
+}
+
+impl ReviewerPromptCache {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    fn system<'a>(
+        &'a self,
+        state: &'a AppState,
+        workspace_id: &'a str,
+        review_mode: &'a str,
+    ) -> BoxFuture<'a, AppResult<String>> {
+        async move {
+            let (cell, prompt_key) = if review_mode == "light" {
+                (&self.light, "user.review.light.system")
+            } else {
+                (&self.full, "user.review.system")
+            };
+            if let Some(cached) = cell.lock().clone() {
+                return Ok(cached);
+            }
+            let loaded = prompts::load_prompt(&state.db, workspace_id, prompt_key).await?;
+            *cell.lock() = Some(loaded.clone());
+            Ok(loaded)
+        }
+        .boxed()
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn review_decision(
     state: &AppState,
@@ -1495,7 +1579,10 @@ pub(crate) async fn review_decision(
     review_mode: &str,
     run_id: Option<&str>,
     prompt_override: Option<&PromptOverride>,
+    active_profile_override: Option<&DomainProfile>,
+    reviewer_prompt_cache: Option<&ReviewerPromptCache>,
 ) -> AppResult<DecisionReviewResult> {
+    let _stage_timer = super::run_audit::stage_timer("reviewer");
     if !decision.should_reply {
         return Ok(DecisionReviewResult {
             approved: true,
@@ -1515,7 +1602,14 @@ pub(crate) async fn review_decision(
     } else {
         "user.review.system"
     };
-    let system = prompts::load_prompt(&state.db, &contact.workspace_id, prompt_key).await?;
+    let system = match reviewer_prompt_cache {
+        Some(cache) => {
+            cache
+                .system(state, &contact.workspace_id, review_mode)
+                .await?
+        }
+        None => prompts::load_prompt(&state.db, &contact.workspace_id, prompt_key).await?,
+    };
     // shadow replay：critic 候选若命中本 prompt_key（user.review.system /
     // user.review.light.system）则末尾追加片段，跑「原 prompt + 追加」真模型对照。
     // 现有调用点全传 None → 不触发 → review prompt 逐字不变（字节等价护栏）。
@@ -1524,15 +1618,18 @@ pub(crate) async fn review_decision(
         .unwrap_or(system);
     // universal-domain-adaptation H16-b：reviewer 的产品知识段也按 active profile 的
     // chunk_roles 渲染（与 Reply Agent 同源）。缓存命中即廉价；DEFAULT 销售四态字节等价。
-    let active_profile = match super::budget::current_shadow_evaluation_snapshot() {
-        Some(snapshot) => snapshot.active_profile.clone(),
-        None => {
-            crate::agent::domain_profile::load_active_domain_profile(
-                &state.db,
-                &contact.workspace_id,
-            )
-            .await?
-        }
+    let active_profile = match active_profile_override {
+        Some(profile) => profile.clone(),
+        None => match super::budget::current_shadow_evaluation_snapshot() {
+            Some(snapshot) => snapshot.active_profile.clone(),
+            None => {
+                crate::agent::domain_profile::load_active_domain_profile(
+                    &state.db,
+                    &contact.workspace_id,
+                )
+                .await?
+            }
+        },
     };
     // universal-domain-adaptation：review.system 链的全部 **prompt 类 profile override**
     // 收敛到 domain_profile.rs 的单一注入点 `apply_review_system_prompt_overrides`（C3 轻量

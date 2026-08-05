@@ -250,7 +250,7 @@ use management::{
     confirm_management_command, create_management_session, get_management_command,
     get_tool_catalog, post_management_message, reject_management_command,
 };
-use observability::{phase_rollup, worker_health};
+use observability::{performance_summary, phase_rollup, worker_health};
 use outcome_metrics::list_agent_outcome_metrics;
 use playbooks::{
     create_operation_playbook, generate_operation_playbook, list_operation_playbooks,
@@ -952,6 +952,7 @@ pub fn api_router(state: AppState) -> Router<AppState> {
         // ── Phase 0-D 自治信号 admin 聚合（lifecycle / revision_reason /
         //    reviewer_misjudge_signal / negative_example pending）只读 ────────
         .route("/admin/observability/phase-rollup", get(phase_rollup))
+        .route("/admin/observability/performance", get(performance_summary))
         // ── G-后续Ⅱ/2：worker 健康聚合（chat_tasks 状态 / gap_signals sweep 命中率 /
         //    lessons_learned 14d pattern × review_status）一次 RTT 拉齐 ──────
         .route("/admin/observability/worker-health", get(worker_health))

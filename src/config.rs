@@ -201,6 +201,10 @@ pub struct AppConfig {
     /// 关时第一程直接传 Full、跳过强升、退回 ptier 前单程行为，等于 kill switch
     /// （上线初期止损 / 账号灰度 / A-B 对照）。
     pub progressive_tier_enabled: bool,
+    /// Experimental: run durable-inbound Reaction analysis concurrently with
+    /// the Gateway. Default false preserves the established ordering where the
+    /// current reply can observe the freshly persisted reaction hint.
+    pub reaction_gateway_parallel_enabled: bool,
     /// P4：探索 softmax 温度。越大越接近均匀抽样、越小越接近确定性 argmax。默认 1.0。
     /// 仅在 `knowledge_exploration_enabled=true` 时生效。
     pub knowledge_exploration_temperature: f64,
@@ -619,6 +623,10 @@ impl AppConfig {
                 "false",
             )),
             progressive_tier_enabled: parse_bool(&env_or("PROGRESSIVE_TIER_ENABLED", "true")),
+            reaction_gateway_parallel_enabled: parse_bool(&env_or(
+                "REACTION_GATEWAY_PARALLEL_ENABLED",
+                "false",
+            )),
             knowledge_exploration_temperature: env_or("KNOWLEDGE_EXPLORATION_TEMPERATURE", "1.0")
                 .parse()?,
             // ── agent-self-evolution M4 ──

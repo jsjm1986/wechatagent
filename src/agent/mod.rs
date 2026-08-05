@@ -52,6 +52,7 @@ pub(crate) mod quiet_hours;
 mod reaction;
 mod referral;
 mod review;
+mod run_audit;
 pub mod run_envelope;
 pub(crate) mod runtime;
 pub(crate) mod send_ledger;
@@ -282,36 +283,32 @@ pub(crate) async fn generate_agent_json(
             cache.get(key).cloned()
         };
         if let Some(value) = cached {
-            let _ = state
-                .db
-                .llm_call_logs()
-                .insert_one(
-                    LlmCallLog {
-                        id: None,
-                        workspace_id: workspace_id.to_string(),
-                        account_id: account_id.map(ToString::to_string),
-                        contact_wxid: contact_wxid.map(ToString::to_string),
-                        run_id: run_id.map(ToString::to_string),
-                        run_mode: run_mode.clone(),
-                        prompt_key: prompt_key.to_string(),
-                        model: provider_model.to_string(),
-                        status: "cache_hit".to_string(),
-                        latency_ms: DateTime::now().timestamp_millis()
-                            - started_at.timestamp_millis(),
-                        prompt_tokens: 0,
-                        completion_tokens: 0,
-                        total_tokens: 0,
-                        prompt_cache_hit_tokens: 0,
-                        prompt_cache_miss_tokens: 0,
-                        usage_known: true,
-                        error: None,
-                        retry_count: 0,
-                        final_status: Some("cache_hit".to_string()),
-                        created_at: started_at,
-                    },
-                    None,
-                )
-                .await;
+            persist_llm_call_log(
+                state,
+                LlmCallLog {
+                    id: None,
+                    workspace_id: workspace_id.to_string(),
+                    account_id: account_id.map(ToString::to_string),
+                    contact_wxid: contact_wxid.map(ToString::to_string),
+                    run_id: run_id.map(ToString::to_string),
+                    run_mode: run_mode.clone(),
+                    prompt_key: prompt_key.to_string(),
+                    model: provider_model.to_string(),
+                    status: "cache_hit".to_string(),
+                    latency_ms: DateTime::now().timestamp_millis() - started_at.timestamp_millis(),
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    total_tokens: 0,
+                    prompt_cache_hit_tokens: 0,
+                    prompt_cache_miss_tokens: 0,
+                    usage_known: true,
+                    error: None,
+                    retry_count: 0,
+                    final_status: Some("cache_hit".to_string()),
+                    created_at: started_at,
+                },
+            )
+            .await;
             return Ok(value);
         }
     }
@@ -462,6 +459,18 @@ fn record_current_run_llm_attempt(usage: Option<&ChatUsage>) {
     }
 }
 
+/// Buffer complete LLM audit rows inside a Gateway run; all other callers
+/// preserve the historical immediate-write behavior.
+async fn persist_llm_call_log(state: &AppState, log: LlmCallLog) {
+    let log = match run_audit::try_buffer_llm_log(log) {
+        Ok(()) => return,
+        Err(log) => log,
+    };
+    if let Err(error) = state.db.llm_call_logs().insert_one(log, None).await {
+        tracing::warn!(%error, "failed to persist LLM call audit log");
+    }
+}
+
 /// 写一条 `success` 的 `llm_call_logs` 行。供 [`generate_agent_json`] 与
 /// [`generate_agent_json_streaming`] 共用，`model` 取上游实际返回的模型名。
 #[allow(clippy::too_many_arguments)]
@@ -478,35 +487,32 @@ async fn log_llm_call_success(
     retry_count_i32: i32,
     started_at: DateTime,
 ) {
-    let _ = state
-        .db
-        .llm_call_logs()
-        .insert_one(
-            LlmCallLog {
-                id: None,
-                workspace_id: workspace_id.to_string(),
-                account_id: account_id.map(ToString::to_string),
-                contact_wxid: contact_wxid.map(ToString::to_string),
-                run_id: run_id.map(ToString::to_string),
-                run_mode: current_run_mode(),
-                prompt_key: prompt_key.to_string(),
-                model,
-                status: "success".to_string(),
-                latency_ms,
-                prompt_tokens: usage.prompt_tokens,
-                completion_tokens: usage.completion_tokens,
-                total_tokens: usage.total_tokens,
-                prompt_cache_hit_tokens: usage.prompt_cache_hit_tokens,
-                prompt_cache_miss_tokens: usage.prompt_cache_miss_tokens,
-                usage_known: usage.is_known(),
-                error: None,
-                retry_count: retry_count_i32,
-                final_status: Some("success".to_string()),
-                created_at: started_at,
-            },
-            None,
-        )
-        .await;
+    persist_llm_call_log(
+        state,
+        LlmCallLog {
+            id: None,
+            workspace_id: workspace_id.to_string(),
+            account_id: account_id.map(ToString::to_string),
+            contact_wxid: contact_wxid.map(ToString::to_string),
+            run_id: run_id.map(ToString::to_string),
+            run_mode: current_run_mode(),
+            prompt_key: prompt_key.to_string(),
+            model,
+            status: "success".to_string(),
+            latency_ms,
+            prompt_tokens: usage.prompt_tokens,
+            completion_tokens: usage.completion_tokens,
+            total_tokens: usage.total_tokens,
+            prompt_cache_hit_tokens: usage.prompt_cache_hit_tokens,
+            prompt_cache_miss_tokens: usage.prompt_cache_miss_tokens,
+            usage_known: usage.is_known(),
+            error: None,
+            retry_count: retry_count_i32,
+            final_status: Some("success".to_string()),
+            created_at: started_at,
+        },
+    )
+    .await;
 }
 
 /// 写一条 `failed` 的 `llm_call_logs` 行。HP-4：按错误类型把 `final_status`
@@ -526,35 +532,32 @@ async fn log_llm_call_failure(
         AppError::Json(_) => "json_error",
         _ => "failed",
     };
-    let _ = state
-        .db
-        .llm_call_logs()
-        .insert_one(
-            LlmCallLog {
-                id: None,
-                workspace_id: workspace_id.to_string(),
-                account_id: account_id.map(ToString::to_string),
-                contact_wxid: contact_wxid.map(ToString::to_string),
-                run_id: run_id.map(ToString::to_string),
-                run_mode: current_run_mode(),
-                prompt_key: prompt_key.to_string(),
-                model: model.to_string(),
-                status: "failed".to_string(),
-                latency_ms: DateTime::now().timestamp_millis() - started_at.timestamp_millis(),
-                prompt_tokens: 0,
-                completion_tokens: 0,
-                total_tokens: 0,
-                prompt_cache_hit_tokens: 0,
-                prompt_cache_miss_tokens: 0,
-                usage_known: false,
-                error: Some(error.to_string()),
-                retry_count: retry_count_from_error(&error.to_string()),
-                final_status: Some(final_status.to_string()),
-                created_at: started_at,
-            },
-            None,
-        )
-        .await;
+    persist_llm_call_log(
+        state,
+        LlmCallLog {
+            id: None,
+            workspace_id: workspace_id.to_string(),
+            account_id: account_id.map(ToString::to_string),
+            contact_wxid: contact_wxid.map(ToString::to_string),
+            run_id: run_id.map(ToString::to_string),
+            run_mode: current_run_mode(),
+            prompt_key: prompt_key.to_string(),
+            model: model.to_string(),
+            status: "failed".to_string(),
+            latency_ms: DateTime::now().timestamp_millis() - started_at.timestamp_millis(),
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+            prompt_cache_hit_tokens: 0,
+            prompt_cache_miss_tokens: 0,
+            usage_known: false,
+            error: Some(error.to_string()),
+            retry_count: retry_count_from_error(&error.to_string()),
+            final_status: Some(final_status.to_string()),
+            created_at: started_at,
+        },
+    )
+    .await;
 }
 
 fn retry_count_from_error(error: &str) -> i32 {

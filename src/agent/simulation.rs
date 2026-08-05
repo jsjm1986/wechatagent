@@ -197,6 +197,7 @@ async fn simulate_user_dialogue_inner(
             Some(&run_id),
             None,
             PromptTier::Full,
+            None,
         )
         .await?;
         normalize_decision_state(&mut decision, domain_config.as_ref());
@@ -231,6 +232,8 @@ async fn simulate_user_dialogue_inner(
                 &knowledge_route,
                 effective_review_mode(&planner, &decision, &runtime, false),
                 Some(&run_id),
+                None,
+                None,
                 None,
             )
             .await?

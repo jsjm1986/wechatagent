@@ -607,6 +607,7 @@ async fn run_prompt_shadow_branch(
         Some(run_id),
         Some(prompt_override),
         PromptTier::Full,
+        None,
     )
     .await?;
     normalize_decision_state(&mut decision, domain_config);
@@ -641,6 +642,8 @@ async fn run_prompt_shadow_branch(
         effective_review_mode(&planner, &decision, runtime, false),
         Some(run_id),
         Some(prompt_override),
+        None,
+        None,
     )
     .await?;
     if !prompt_override.was_applied() {
