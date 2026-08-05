@@ -104,7 +104,7 @@
   padding: 6px 10px;
   border-radius: 999px;
   cursor: pointer;
-  background: var(--surface-1, #fff);
+  background: var(--surface-card);
   border: 1px solid var(--hairline);
   color: var(--ink-2);
   transition: background 0.18s, color 0.18s, border-color 0.18s;
@@ -171,7 +171,7 @@
   border: 1px solid var(--hairline);
   border-radius: var(--r-md, 12px);
   padding: 16px;
-  background: var(--surface-1, #fff);
+  background: var(--surface-card);
 }
 .resolvedEscHead {
   display: flex;
@@ -218,7 +218,7 @@
 .inboxRow {
   border: 1px solid var(--hairline);
   border-radius: var(--r-md, 12px);
-  background: var(--surface-1, #fff);
+  background: var(--surface-card);
   margin-bottom: 10px;
 }
 .inboxRowHead {
