@@ -1,23 +1,15 @@
-//! 作息门控（quiet hours，#69）入站延迟排程集成测试。
+//! Quiet-hours scheduling integration contract.
 //!
-//! 默认 `#[ignore]`，依赖 Docker（testcontainers MongoDB）；CI 通过
-//! `cargo test --test quiet_hours_deferral -- --ignored` 触发。
-//!
-//! 时区判定本身是纯函数（`quiet_hours::hour_in_offset` / `next_wake_utc_ms`，由
-//! `src/agent/quiet_hours.rs` 的单测覆盖跨偏移 / 跨午夜 / 负偏移），`Utc::now()` 不可
-//! 注入，故集成测试不验"现在是否静默"，只直接驱动 [`ensure_wake_followup_task`]
-//! 验证 DB 侧契约：
-//! - 排出 1 条 `deferred_inbound_reply` 跟进任务（pending、review_required、run_at 在未来）；
-//! - 写 1 条 `quiet_hours_deferred_inbound` 观测事件（status=deferred）；
-//! - 静默时段连发（重复调用）幂等：任务仍 1 条、事件仍 1 条。
+//! Quiet hours and normal debounce must share one durable `inbound_reply`
+//! obligation. The legacy `deferred_inbound_reply` task must not be produced.
 
 mod common;
 
 use mongodb::bson::{doc, DateTime, Document};
-use wechatagent::models::{AgentStatus, Contact};
+use wechatagent::models::{AgentStatus, Contact, ConversationMessage, MessageDirection};
 use wechatagent::webhooks::ensure_wake_followup_task;
 
-const DEFERRED_KIND: &str = "deferred_inbound_reply";
+const REPLY_KIND: &str = "inbound_reply";
 
 fn managed_contact(wxid: &str) -> Contact {
     let now = DateTime::now();
@@ -73,7 +65,7 @@ fn managed_contact(wxid: &str) -> Contact {
 
 #[tokio::test]
 #[ignore]
-async fn quiet_hours_defers_inbound_and_is_idempotent() {
+async fn quiet_hours_reuses_single_reply_obligation() {
     let app = common::TestApp::start().await;
     let contact = managed_contact("user_quiet_1");
     app.state
@@ -82,93 +74,80 @@ async fn quiet_hours_defers_inbound_and_is_idempotent() {
         .insert_one(&contact, None)
         .await
         .expect("insert seed contact");
+    app.state
+        .db
+        .messages()
+        .insert_one(
+            ConversationMessage {
+                id: None,
+                workspace_id: contact.workspace_id.clone(),
+                account_id: contact.account_id.clone(),
+                contact_wxid: contact.wxid.clone(),
+                message_id: Some("quiet-inbound-1".to_string()),
+                dedupe_key: None,
+                direction: MessageDirection::Inbound,
+                content: "quiet-hours question".to_string(),
+                msg_type: Some("text".to_string()),
+                media_ref: None,
+                raw: None,
+                is_synthetic_relay: false,
+                created_at: DateTime::now(),
+            },
+            None,
+        )
+        .await
+        .expect("insert inbound");
 
-    // 醒来小时 8、时区偏移 +8（中国）——run_at 落在未来某个本地 08:00。
     ensure_wake_followup_task(&app.state, &contact, 8, 8)
         .await
-        .expect("first ensure_wake_followup_task");
+        .expect("first wake schedule");
 
-    let task_filter = doc! { "kind": DEFERRED_KIND, "contact_wxid": &contact.wxid };
-    let task_count = app
-        .state
-        .db
-        .tasks()
-        .count_documents(task_filter.clone(), None)
-        .await
-        .expect("count deferred tasks");
-    assert_eq!(task_count, 1, "应排出 1 条 deferred_inbound_reply 任务");
-
+    let task_filter = doc! { "kind": REPLY_KIND, "contact_wxid": &contact.wxid };
+    assert_eq!(
+        app.state
+            .db
+            .tasks()
+            .count_documents(task_filter.clone(), None)
+            .await
+            .expect("count reply obligations"),
+        1
+    );
     let task = app
         .state
         .db
         .tasks()
         .find_one(task_filter.clone(), None)
         .await
-        .expect("query deferred task")
-        .expect("deferred task should exist");
-    assert_eq!(task.status, "pending", "新排任务应为 pending");
-    assert!(task.review_required, "延迟回复任务必须保留 review_required");
-    assert!(
-        task.run_at.timestamp_millis() > DateTime::now().timestamp_millis(),
-        "run_at 必须落在未来（下一次醒来时刻）"
-    );
-    assert!(
-        task.expires_at.is_some(),
-        "应设置 expires_at，过期未跑则作废"
-    );
-
-    let event_filter = doc! {
-        "kind": "quiet_hours_deferred_inbound",
-        "contact_wxid": &contact.wxid,
-    };
-    let event_count = app
-        .state
-        .db
-        .events()
-        .count_documents(event_filter.clone(), None)
-        .await
-        .expect("count deferral events");
+        .expect("query reply obligation")
+        .expect("reply obligation should exist");
+    assert_eq!(task.status, "pending");
+    assert!(task.review_required);
+    assert!(task.run_at.timestamp_millis() > DateTime::now().timestamp_millis());
+    assert!(task.expires_at.is_none(), "passive replies must not expire");
+    assert_eq!(task.gateway_status.as_deref(), Some("quiet_hours_waiting"));
     assert_eq!(
-        event_count, 1,
-        "应写 1 条 quiet_hours_deferred_inbound 观测事件"
+        app.state
+            .db
+            .tasks()
+            .count_documents(
+                doc! { "kind": "deferred_inbound_reply", "contact_wxid": &contact.wxid },
+                None,
+            )
+            .await
+            .expect("count legacy wake tasks"),
+        0
     );
 
-    let event = app
-        .state
-        .db
-        .events()
-        .find_one(event_filter.clone(), None)
-        .await
-        .expect("query deferral event")
-        .expect("deferral event should exist");
-    assert_eq!(event.status, "deferred", "事件 status 应为 deferred");
-
-    // 静默时段连发：再次调用应命中去重，task / event 都不增加。
     ensure_wake_followup_task(&app.state, &contact, 8, 8)
         .await
-        .expect("second ensure_wake_followup_task (idempotent)");
-
-    let task_count_after = app
-        .state
-        .db
-        .tasks()
-        .count_documents(task_filter, None)
-        .await
-        .expect("count deferred tasks after second call");
+        .expect("second wake schedule");
     assert_eq!(
-        task_count_after, 1,
-        "已存在 pending wake 任务时应幂等跳过，不重复排"
-    );
-
-    let event_count_after = app
-        .state
-        .db
-        .events()
-        .count_documents(event_filter, None)
-        .await
-        .expect("count deferral events after second call");
-    assert_eq!(
-        event_count_after, 1,
-        "去重命中（未真正新建任务）不应再写观测事件，避免连发刷屏"
+        app.state
+            .db
+            .tasks()
+            .count_documents(task_filter, None)
+            .await
+            .expect("count reply obligations after retry"),
+        1
     );
 }

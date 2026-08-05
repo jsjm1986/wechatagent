@@ -967,6 +967,43 @@ async fn send_contact_message_gateway_inner(
     )
     .await?;
 
+    // A manual reply fulfils the passive reply obligation only after confirmed delivery.
+    // Freeze the current inbound watermark and fence any older AI owner before enqueueing.
+    let manual_coverage =
+        crate::webhooks::pause_reply_obligation_for_manual(state, &contact, &run_id).await?;
+    if let Some(coverage) = manual_coverage {
+        if let Err(error) = state
+            .db
+            .decision_reviews()
+            .clone_with_type::<Document>()
+            .update_one(
+                doc! { "_id": review_id },
+                doc! { "$set": {
+                    "reply_coverage_kind": "manual_reply",
+                    "covers_through_inbound_id": coverage.inbound_id,
+                    "covers_through_inbound_created_at": coverage.inbound_created_at,
+                    "reply_obligation_task_id": coverage.task_id,
+                } },
+                None,
+            )
+            .await
+        {
+            if let Err(release_error) = crate::webhooks::settle_manual_reply_obligation(
+                state,
+                &contact.workspace_id,
+                &contact.account_id,
+                &contact.wxid,
+                &run_id,
+                false,
+            )
+            .await
+            {
+                tracing::error!(%release_error, %run_id, "failed to release manual reply pause after review coverage write failure");
+            }
+            return Err(error.into());
+        }
+    }
+
     let enqueue_req = EnqueueRequest {
         workspace_id: contact.workspace_id.clone(),
         account_id: contact.account_id.clone(),
@@ -1009,6 +1046,17 @@ async fn send_contact_message_gateway_inner(
                 contact_wxid = %contact.wxid,
                 "management send outbox idempotent skip"
             );
+            // This run did not create a delivery. The pre-existing outbox cannot cover
+            // messages that arrived after its own frozen snapshot, so release this run's pause.
+            crate::webhooks::settle_manual_reply_obligation(
+                state,
+                &contact.workspace_id,
+                &contact.account_id,
+                &contact.wxid,
+                &run_id,
+                false,
+            )
+            .await?;
             if existing_outbox_covers_decision(existing_decision_id, review_id, &existing_status) {
                 "outbox_enqueued"
             } else {
@@ -1017,6 +1065,16 @@ async fn send_contact_message_gateway_inner(
         }
         Err(err) => {
             tracing::error!(?err, %run_id, "management send outbox enqueue failed");
+            // Release first: subsequent audit writes may fail, but must never strand the contact.
+            crate::webhooks::settle_manual_reply_obligation(
+                state,
+                &contact.workspace_id,
+                &contact.account_id,
+                &contact.wxid,
+                &run_id,
+                false,
+            )
+            .await?;
             let now = DateTime::now();
             state
                 .db
@@ -3180,8 +3238,8 @@ fn run_user_operation_gateway_inner<'a>(
     // / write_event 落库时显式标记 context_changed。
     let context_changed_followup_hit = match &trigger {
         AgentTrigger::FollowUp(task) => {
-            // #69：醒来任务（deferred_inbound_reply）豁免 context_changed——它存在的意义
-            // 就是回 task 创建后客户在静默时段攒下的新消息，绝不能被这些消息触发自取消。
+            // Legacy wake tasks remain readable during rolling upgrades. They reply to accumulated
+            // inbound messages and therefore must not cancel themselves on context_changed.
             if task.kind == crate::agent::quiet_hours::DEFERRED_INBOUND_REPLY_KIND {
                 false
             } else {
@@ -4630,10 +4688,8 @@ pub(crate) fn trigger_message(
             message_id: None,
             dedupe_key: None,
             direction: MessageDirection::Inbound,
-            // #69 作息门控：醒来任务（deferred_inbound_reply）语义是"回客户在休息时段
-            // 攒下的消息"，不是主动催进——若沿用"主动触达"措辞会把 Reply Agent 带偏成
-            // 没话找话。客户的真实消息已在 load_recent_messages 里，这里只需把"现在醒来、
-            // 基于完整对话回复"的语境交给它。普通 follow_up 仍是"主动触达"判断。
+            // Legacy wake-task compatibility only. New quiet-hours obligations execute as a real
+            // persisted inbound trigger; ordinary follow_up tasks retain proactive wording.
             content: follow_up_trigger_message_text(&task.kind, &task.content),
             msg_type: None,
             media_ref: None,
@@ -6592,30 +6648,105 @@ pub(crate) fn apply_confidence_override(
     }
 }
 
+fn uncovered_inbound_watermark_filter(
+    created_at: DateTime,
+    id: ObjectId,
+    inclusive: bool,
+) -> Document {
+    doc! { "$or": [
+        { "created_at": { "$gt": created_at } },
+        {
+            "created_at": created_at,
+            "_id": { if inclusive { "$gte" } else { "$gt" }: id },
+        },
+    ] }
+}
+
 pub(crate) async fn load_recent_messages(
     state: &AppState,
     contact: &Contact,
     limit: i64,
 ) -> AppResult<Vec<ConversationMessage>> {
+    let base_filter = doc! {
+        "workspace_id": &contact.workspace_id,
+        "account_id": &contact.account_id,
+        "contact_wxid": &contact.wxid,
+    };
     let options = FindOptions::builder()
-        .sort(doc! { "created_at": -1 })
+        .sort(doc! { "created_at": -1, "_id": -1 })
         .limit(limit)
         .build();
     let mut cursor = state
         .db
         .messages()
-        .find(
-            doc! {
-                "workspace_id": &contact.workspace_id,
-                "account_id": &contact.account_id,
-                "contact_wxid": &contact.wxid
-            },
-            options,
-        )
+        .find(base_filter.clone(), options)
         .await?;
     let mut messages = Vec::new();
     while let Some(message) = cursor.try_next().await? {
         messages.push(message);
+    }
+
+    // A long quiet-hours window may contain more inbound messages than recent_message_limit.
+    // Merge every message belonging to the still-unfulfilled obligation so the eventual reply
+    // cannot silently omit an older question. Historical conversations remain bounded.
+    let task_id = crate::webhooks::durable_inbound_task_id(
+        &contact.workspace_id,
+        &contact.account_id,
+        &contact.wxid,
+    );
+    if let Some(task) = state
+        .db
+        .tasks()
+        .clone_with_type::<Document>()
+        .find_one(doc! { "_id": task_id }, None)
+        .await?
+    {
+        let covered_watermark = task
+            .get_datetime("covered_through_inbound_created_at")
+            .copied()
+            .ok()
+            .zip(task.get_object_id("covered_through_inbound_id").ok());
+        let obligation_start = task
+            .get_datetime("obligation_started_inbound_created_at")
+            .copied()
+            .ok()
+            .zip(task.get_object_id("obligation_started_inbound_id").ok());
+        let lower_bound = covered_watermark
+            .map(|(created_at, id)| uncovered_inbound_watermark_filter(created_at, id, false))
+            .or_else(|| {
+                obligation_start.map(|(created_at, id)| {
+                    uncovered_inbound_watermark_filter(created_at, id, true)
+                })
+            });
+        if let Some(watermark_filter) = lower_bound {
+            let mut uncovered_filter = base_filter;
+            uncovered_filter.insert("direction", "inbound");
+            uncovered_filter.insert("$and", vec![watermark_filter]);
+            let mut uncovered = state
+                .db
+                .messages()
+                .find(
+                    uncovered_filter,
+                    FindOptions::builder()
+                        .sort(doc! { "created_at": -1, "_id": -1 })
+                        .build(),
+                )
+                .await?;
+            let mut seen: std::collections::HashSet<ObjectId> =
+                messages.iter().filter_map(|message| message.id).collect();
+            while let Some(message) = uncovered.try_next().await? {
+                if message.id.map(|id| seen.insert(id)).unwrap_or(true) {
+                    messages.push(message);
+                }
+            }
+            messages.sort_by(|left, right| {
+                right
+                    .created_at
+                    .timestamp_millis()
+                    .cmp(&left.created_at.timestamp_millis())
+                    .then_with(|| right.id.cmp(&left.id))
+            });
+        }
     }
     Ok(messages)
 }
@@ -6748,9 +6879,8 @@ pub(crate) fn check_context_changed_followup_pure(
 
 /// #69 作息门控：根据跟进任务 kind 选择注入 Reply Agent 的"当前消息"措辞。
 ///
-/// 醒来任务（deferred_inbound_reply）是**被动应答**客户在静默时段攒下的消息——
-/// 用"回应客户最近消息"的语境，避免被动场景被"主动触达"措辞带偏成没话找话；
-/// 普通 follow_up 仍是"主动触达"判断，沿用原措辞 + 任务内容。纯函数便于本地锁定。
+/// Legacy `deferred_inbound_reply` compatibility: render it as a passive response rather than
+/// proactive outreach. New quiet-hours work uses `inbound_reply` and a persisted inbound trigger.
 pub(crate) fn follow_up_trigger_message_text(kind: &str, task_content: &str) -> String {
     if kind == crate::agent::quiet_hours::DEFERRED_INBOUND_REPLY_KIND {
         "你在作息时段暂未回复，客户在此期间发来了消息。现在请基于完整对话历史，自然地回应客户最近的消息。".to_string()
@@ -6874,6 +7004,27 @@ mod send_receipt_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uncovered_inbound_watermark_filter_uses_timestamp_and_object_id() {
+        let at = DateTime::from_millis(1_700_000_000_000);
+        let id = ObjectId::parse_str("64a1f2c3e4b5a697889a0002").unwrap();
+
+        assert_eq!(
+            uncovered_inbound_watermark_filter(at, id, false),
+            doc! { "$or": [
+                { "created_at": { "$gt": at } },
+                { "created_at": at, "_id": { "$gt": id } },
+            ] }
+        );
+        assert_eq!(
+            uncovered_inbound_watermark_filter(at, id, true),
+            doc! { "$or": [
+                { "created_at": { "$gt": at } },
+                { "created_at": at, "_id": { "$gte": id } },
+            ] }
+        );
+    }
 
     #[test]
     fn existing_outbox_only_covers_same_decision_in_deliverable_states() {

@@ -181,7 +181,15 @@ const MODE_COPY: Record<UserOpsMode, { title: string; desc: string }> = {
   }
 };
 
-export function UserOpsModeHeader({ mode, onMode }: { mode: UserOpsMode; onMode: (mode: UserOpsMode) => void }) {
+export function UserOpsModeHeader({
+  mode,
+  onMode,
+  action
+}: {
+  mode: UserOpsMode;
+  onMode: (mode: UserOpsMode) => void;
+  action?: React.ReactNode;
+}) {
   return (
     <section className="userModeHeader">
       <div>
@@ -189,10 +197,13 @@ export function UserOpsModeHeader({ mode, onMode }: { mode: UserOpsMode; onMode:
         <h2>{MODE_COPY[mode].title}</h2>
         <p>{MODE_COPY[mode].desc}</p>
       </div>
-      <div className="modeSwitch" role="tablist" aria-label="用户运营模式">
-        <button className={mode === "smart" ? "active" : ""} onClick={() => onMode("smart")}>智能模式</button>
-        <button className={mode === "roster" ? "active" : ""} onClick={() => onMode("roster")}>通讯录</button>
-        <button className={mode === "traditional" ? "active" : ""} onClick={() => onMode("traditional")}>传统模式</button>
+      <div className="userModeActions">
+        {action}
+        <div className="modeSwitch" role="tablist" aria-label="用户运营模式">
+          <button className={mode === "smart" ? "active" : ""} onClick={() => onMode("smart")}>智能模式</button>
+          <button className={mode === "roster" ? "active" : ""} onClick={() => onMode("roster")}>通讯录</button>
+          <button className={mode === "traditional" ? "active" : ""} onClick={() => onMode("traditional")}>传统模式</button>
+        </div>
       </div>
     </section>
   );
@@ -2077,5 +2088,4 @@ function formatStageTimestamp(iso: string): string {
   const pad = (n: number) => n.toString().padStart(2, "0");
   return `${dt.getFullYear()}-${pad(dt.getMonth() + 1)}-${pad(dt.getDate())} ${pad(dt.getHours())}:${pad(dt.getMinutes())}`;
 }
-
 

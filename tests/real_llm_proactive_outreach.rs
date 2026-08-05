@@ -7,7 +7,7 @@
 //! 两个维度的**真模型增值点是同一个**：planner / quiet-hours 的「排程层」本身**不调
 //! LLM**——`planner::tick`(planner_silent_followup.rs:129 验) emit 的 follow_up task 内容
 //! 是固定占位 `"Planner: silent_follow_up"`，`ensure_wake_followup_task`
-//! (quiet_hours_deferral.rs:79 验) 只排 `deferred_inbound_reply` 任务。**真正的触达/醒来
+//! (quiet_hours_deferral.rs:79 验) 只排 `inbound_reply` 任务。**真正的触达/醒来
 //! 文案由 task worker 后续消费 task 时走 `handle_follow_up_task`(gateway.rs:110) → gateway
 //! 真模型全链生成**。mock 集成测已覆盖「排程层 DB 契约」（任务/事件计数、幂等、过滤），
 //! 真模型版的唯一增量 = 验证**被消费时真模型生成的主动触达内容是否合理、守红线**。
@@ -360,7 +360,7 @@ async fn r2_5_2_planner_silent_followup_real_outreach() {
     evidence.pass(2, 4);
 }
 
-/// R2.5.1 作息门控醒来回复真模型：排 deferred_inbound_reply → 真模型消费生成醒来回复。
+/// R2.5.1 作息门控醒来回复真模型：排 inbound_reply → 真模型消费生成醒来回复。
 ///
 /// 时区/「现在是否静默」是纯函数（quiet_hours.rs 单测覆盖、Utc::now 不可注入），故本测试
 /// 不验"静默窗拦截"（那半段 mock 已覆盖 DB 契约），只验**醒来 task 被消费时真模型生成的
@@ -421,9 +421,9 @@ async fn r2_5_1_quiet_hours_wake_reply_real() {
     ensure_wake_followup_task(&state, &contact, 8, 8)
         .await
         .expect("ensure wake task");
-    let Some(task) = fetch_task(&app, &contact.wxid, "deferred_inbound_reply").await else {
-        eprintln!("skip: 未排出 deferred_inbound_reply 任务，跳过");
-        evidence.inconclusive("wake scheduler emitted no deferred_inbound_reply task");
+    let Some(task) = fetch_task(&app, &contact.wxid, "inbound_reply").await else {
+        eprintln!("skip: 未排出 inbound_reply 任务，跳过");
+        evidence.inconclusive("wake scheduler emitted no inbound_reply task");
         return;
     };
 
@@ -444,7 +444,7 @@ async fn r2_5_1_quiet_hours_wake_reply_real() {
     .await;
     evidence.observe_llm_calls(llm_calls);
     evidence.branch("wake_task_consumed_nonempty_reply_redline_scan");
-    evidence.detail("task_kind", "deferred_inbound_reply");
+    evidence.detail("task_kind", "inbound_reply");
     evidence.detail("reply_chars", reply_chars);
     evidence.pass(2, 4);
 }

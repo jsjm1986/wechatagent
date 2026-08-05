@@ -26,7 +26,9 @@ vi.mock("../../../stores/strategyStore", () => ({
 // Mock所有从 legacy 模块导入的组件（user-ops 频道私有视图，已从 App.tsx 迁出）
 vi.mock("../../../features/user-ops/legacy", () => ({
   ContactsView: vi.fn(() => <div data-testid="contacts-view">ContactsView</div>),
-  UserOpsModeHeader: vi.fn(() => <div data-testid="user-ops-mode-header">UserOpsModeHeader</div>),
+  UserOpsModeHeader: vi.fn(({ action }: { action?: React.ReactNode }) => (
+    <div data-testid="user-ops-mode-header">UserOpsModeHeader{action}</div>
+  )),
   UserPlaybookPanel: vi.fn(() => <div data-testid="user-playbook-panel">UserPlaybookPanel</div>),
   DomainPromptPanel: vi.fn(() => <div data-testid="domain-prompt-panel">DomainPromptPanel</div>),
   DomainConfigEditor: vi.fn(() => <div data-testid="domain-config-editor">DomainConfigEditor</div>),
@@ -243,7 +245,7 @@ describe("UserOpsFeature", () => {
     expect(screen.getByTestId("user-ops-mode-header")).toBeInTheDocument();
     expect(screen.getByTestId("contacts-view")).toBeInTheDocument();
     expect(screen.getByTestId("cockpit-panel")).toBeInTheDocument();
-    expect(screen.getByRole("region", { name: "作息时间" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "重新加载作息" })).toBeInTheDocument();
   });
 
   it("shows workspace quiet hours without requiring a selected contact", () => {
@@ -258,7 +260,7 @@ describe("UserOpsFeature", () => {
 
     render(<UserOpsFeature />);
 
-    expect(screen.getByRole("region", { name: "作息时间" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "重新加载作息" })).toBeInTheDocument();
   });
 
   it("should render traditional mode when userOpsMode is traditional", () => {

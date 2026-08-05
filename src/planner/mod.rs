@@ -3839,31 +3839,11 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────────
-    // universal-domain-adaptation H19：作息门控纳入 operation_mode override 链。
-    // 锁死：① DEFAULT(无 override) → 沿用全局 enabled（金标零变化）；② Some(false)
-    // 关闭静默（情感陪伴夜间黄金时段）；③ Some(true) 强制开启。
+    // Workspace 作息是强制策略；历史 operation_mode override 不再参与调度。
     // ─────────────────────────────────────────────────────────────────────
 
-    /// H19：无 override → effective == 全局 enabled（两种全局取值都验证）。
-    /// G04：现经 resolve_operation_mode 三级链，传 DEFAULT profile（quiet_hours
-    /// enabled_override=None）→ contact override=None → 回落 global，语义不变。
     #[test]
-    fn h19_no_override_follows_global() {
-        let contact = template();
-        assert!(contact.operation_mode_override.is_none());
-        let profile = crate::agent::domain_profile::default_domain_profile("default");
-        assert!(crate::agent::quiet_hours::effective_quiet_hours_enabled(
-            &contact, &profile, true
-        ));
-        assert!(!crate::agent::quiet_hours::effective_quiet_hours_enabled(
-            &contact, &profile, false
-        ));
-    }
-
-    /// H19：override Some(false) → 关闭静默（即便全局开），夜间不被压制。
-    /// G04：contact override 在 resolve 第一级优先，profile 传 DEFAULT 不影响结论。
-    #[test]
-    fn h19_override_false_disables_quiet_hours() {
+    fn quiet_hours_contact_override_cannot_disable_workspace_policy() {
         let mut contact = template();
         contact.operation_mode_override = Some(crate::models::OperationMode {
             quiet_hours: crate::models::QuietHoursMode {
@@ -3872,15 +3852,13 @@ mod tests {
             ..crate::models::OperationMode::default()
         });
         let profile = crate::agent::domain_profile::default_domain_profile("default");
-        // 全局开，但 contact 范式关 → 有效为关。
-        assert!(!crate::agent::quiet_hours::effective_quiet_hours_enabled(
+        assert!(crate::agent::quiet_hours::effective_quiet_hours_enabled(
             &contact, &profile, true
         ));
     }
 
-    /// H19：override Some(true) → 强制开启（即便全局关）。
     #[test]
-    fn h19_override_true_forces_quiet_hours() {
+    fn quiet_hours_contact_override_cannot_enable_disabled_workspace_policy() {
         let mut contact = template();
         contact.operation_mode_override = Some(crate::models::OperationMode {
             quiet_hours: crate::models::QuietHoursMode {
@@ -3889,7 +3867,7 @@ mod tests {
             ..crate::models::OperationMode::default()
         });
         let profile = crate::agent::domain_profile::default_domain_profile("default");
-        assert!(crate::agent::quiet_hours::effective_quiet_hours_enabled(
+        assert!(!crate::agent::quiet_hours::effective_quiet_hours_enabled(
             &contact, &profile, false
         ));
     }

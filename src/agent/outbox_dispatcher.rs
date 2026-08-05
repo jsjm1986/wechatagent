@@ -1351,6 +1351,23 @@ async fn finalize_delivered_text_decision(
         }
     };
 
+    // Dynamic coverage fields intentionally stay outside AgentDecisionReview so historical
+    // constructors remain source-compatible. Read them under the same finalizer lease.
+    let coverage_snapshot = match state
+        .db
+        .decision_reviews()
+        .clone_with_type::<Document>()
+        .find_one(doc! { "_id": decision_id }, None)
+        .await
+    {
+        Ok(Some(document)) => document,
+        Ok(None) => return,
+        Err(err) => {
+            tracing::warn!(?err, %decision_id, "load reply coverage snapshot failed");
+            return;
+        }
+    };
+
     // 发送已成事实。附属写入失败时保留 finalizing + outbox marker，由后续 tick 重试；
     // 绝不把 outbox 改回 pending，因而不会触发重复发送。
     let side_effect_result: AppResult<()> = async {
@@ -1456,6 +1473,38 @@ async fn finalize_delivered_text_decision(
                         .await?;
                 }
             }
+        }
+
+        // A passive reply is fulfilled only here, after every text segment is confirmed sent.
+        // The frozen decision watermark prevents a later inbound from being accidentally covered.
+        match coverage_snapshot.get_str("reply_coverage_kind").ok() {
+            Some("manual_reply") => {
+                crate::webhooks::settle_manual_reply_obligation(
+                    state,
+                    &entry.workspace_id,
+                    &entry.account_id,
+                    &entry.contact_wxid,
+                    &entry.run_id,
+                    true,
+                )
+                .await?;
+            }
+            Some("passive_reply") => {
+                if let (Some(task_id), Ok(inbound_id), Ok(inbound_created_at)) = (
+                    review.source_task_id,
+                    coverage_snapshot.get_object_id("covers_through_inbound_id"),
+                    coverage_snapshot.get_datetime("covers_through_inbound_created_at"),
+                ) {
+                    crate::webhooks::settle_ai_reply_obligation(
+                        state,
+                        task_id,
+                        inbound_id,
+                        *inbound_created_at,
+                    )
+                    .await?;
+                }
+            }
+            _ => {}
         }
 
         let relay_task = if let Some(source_task_id) = review.source_task_id {
@@ -3039,6 +3088,9 @@ async fn tick(state: &AppState, worker: &str, lease_seconds: i32) -> AppResult<(
     reclaim_expired_leases(state).await?;
     reconcile_stale_outbox_enqueues(state).await?;
     reconcile_delivered_decision_finalizations(state).await?;
+    // Manual sends can be canceled/terminalized outside this worker. Release their pause once
+    // durable Outbox truth is known; delivery_unknown deliberately remains paused.
+    let _ = crate::webhooks::reconcile_manual_reply_obligations(state).await?;
     for _ in 0..PER_TICK_PROCESS_CAP {
         let claimed = atomic_claim_pending(state, worker, lease_seconds).await?;
         let entry = match claimed {

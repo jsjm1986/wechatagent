@@ -1,7 +1,7 @@
 //! 作息门控（quiet hours，#69）：运营方时区内的"静默时段"判定与"醒来时刻"计算。
 //!
 //! 产品语义：客户在运营方休息时段（默认 22:00–08:00）发来的消息**不立即回**，
-//! 而是排一条 `deferred_inbound_reply` 跟进任务，等运营方醒来时段一次性基于累积
+//! 而是把唯一的 `inbound_reply` 被动回复义务排到运营方醒来时段，届时一次性基于累积
 //! 消息回复——最像真人（睡觉时不回、醒来看完所有消息再答）。主动发送（planner
 //! 催进 / 承诺跟进）若在静默时段到点，则**重排**到醒来时刻而非取消（避免丢承诺）。
 //!
@@ -15,9 +15,8 @@
 
 use chrono::Utc;
 
-/// 静默时段入站延迟回复的跟进任务 kind。区别于 planner 主动催进的 `follow_up`，
-/// 用于在 precheck 中豁免 `context_changed`（它存在就是为了回 task 创建后累积的
-/// 客户消息），并标记"这是延迟的被动应答、不是主动打扰"。
+/// 旧版静默时段入站任务 kind，仅用于滚动升级时读取、迁移和兼容历史测试。
+/// 新写入统一使用 `webhooks::DURABLE_INBOUND_REPLY_KIND` (`inbound_reply`)。
 pub(crate) const DEFERRED_INBOUND_REPLY_KIND: &str = "deferred_inbound_reply";
 
 /// 判定 `now_hour`（0..=23）是否落在静默时段 `[start, end)` 内。
@@ -131,14 +130,13 @@ pub(crate) fn next_wake_at(
 /// 返回 `global_enabled`，与改造前逐字一致；情感陪伴 profile/contact 设 `Some(false)`
 /// → 夜间不被静默门压制。
 pub(crate) fn effective_quiet_hours_enabled(
-    contact: &crate::models::Contact,
-    profile: &crate::models::DomainProfile,
-    global_enabled: bool,
+    _contact: &crate::models::Contact,
+    _profile: &crate::models::DomainProfile,
+    workspace_enabled: bool,
 ) -> bool {
-    crate::planner::resolve_operation_mode(contact, profile)
-        .quiet_hours
-        .enabled_override
-        .unwrap_or(global_enabled)
+    // Workspace policy is authoritative. Contact/profile overrides remain readable only for
+    // rolling-upgrade compatibility and no longer alter scheduling behavior.
+    workspace_enabled
 }
 
 #[cfg(test)]
@@ -327,36 +325,17 @@ mod tests {
         }
     }
 
-    /// G04：profile 级 `quiet_hours.enabled_override=Some(false)`（contact override=None）
-    /// → 经 resolve_operation_mode 回落 profile 默认范式 → 关静默门，即便 global=true。
+    /// Workspace 作息开关是唯一权威来源；历史 profile/contact override 仅保留读取兼容，
+    /// 不得改变调度结果。
     #[test]
-    fn quiet_hours_honors_profile_level_override() {
+    fn quiet_hours_uses_workspace_policy_only() {
         let contact = contact_no_override();
-
-        // profile 级显式关静默门：把 operation_mode.quiet_hours.enabled_override 设 Some(false)。
         let mut profile = crate::agent::domain_profile::default_domain_profile("default");
-        let mut om = crate::models::OperationMode::default();
-        om.quiet_hours.enabled_override = Some(false);
-        profile.operation_mode = om;
-        assert!(
-            !effective_quiet_hours_enabled(&contact, &profile, true),
-            "profile 级 Some(false) 应关静默门（即便 global=true）"
-        );
+        let mut mode = crate::models::OperationMode::default();
+        mode.quiet_hours.enabled_override = Some(false);
+        profile.operation_mode = mode;
 
-        // 对照：DEFAULT profile（quiet_hours.enabled_override=None）+ contact override=None
-        // → 回落 global(true)，与改造前逐字等价（字节等价红线）。
-        let default_profile = crate::agent::domain_profile::default_domain_profile("default");
-        assert_eq!(
-            default_profile.operation_mode.quiet_hours.enabled_override, None,
-            "DEFAULT profile quiet_hours.enabled_override 必须是 None（字节等价铰链）"
-        );
-        assert!(
-            effective_quiet_hours_enabled(&contact, &default_profile, true),
-            "DEFAULT 全 None → 回落 global=true（字节等价）"
-        );
-        assert!(
-            !effective_quiet_hours_enabled(&contact, &default_profile, false),
-            "DEFAULT 全 None → 回落 global=false（字节等价）"
-        );
+        assert!(effective_quiet_hours_enabled(&contact, &profile, true));
+        assert!(!effective_quiet_hours_enabled(&contact, &profile, false));
     }
 }

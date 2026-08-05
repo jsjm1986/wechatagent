@@ -291,32 +291,46 @@ pub async fn bind_task_decision_if_owned(
     claim: &TaskClaim,
     decision_id: ObjectId,
 ) -> AppResult<bool> {
-    let result = state
+    // `find_one_and_update` is the coverage-snapshot linearization point. If a newer inbound
+    // refreshes the reusable task first, this exact claim no longer matches. If it arrives later,
+    // it fences this decision before authorization and remains beyond the frozen watermark.
+    let task = state
         .db
         .tasks()
-        .update_one(
+        .clone_with_type::<Document>()
+        .find_one_and_update(
             claim.owned_running_filter(),
             doc! { "$set": {
                 "outbox_decision_id": decision_id,
                 "updated_at": DateTime::now(),
             } },
-            None,
+            FindOneAndUpdateOptions::builder()
+                .return_document(ReturnDocument::After)
+                .build(),
         )
         .await?;
-    if result.matched_count == 0 {
+    let Some(task) = task else {
         return Ok(false);
+    };
+
+    let mut set = doc! {
+        "source_task_id": claim.task_id,
+        "source_task_claim_token": &claim.claim_token,
+    };
+    if task.get_str("kind").ok() == Some(crate::webhooks::DURABLE_INBOUND_REPLY_KIND) {
+        set.insert("reply_coverage_kind", "passive_reply");
+        if let Ok(id) = task.get_object_id("latest_inbound_id") {
+            set.insert("covers_through_inbound_id", id);
+        }
+        if let Ok(created_at) = task.get_datetime("latest_inbound_created_at") {
+            set.insert("covers_through_inbound_created_at", *created_at);
+        }
     }
     state
         .db
         .decision_reviews()
-        .update_one(
-            doc! { "_id": decision_id },
-            doc! { "$set": {
-                "source_task_id": claim.task_id,
-                "source_task_claim_token": &claim.claim_token,
-            } },
-            None,
-        )
+        .clone_with_type::<Document>()
+        .update_one(doc! { "_id": decision_id }, doc! { "$set": set }, None)
         .await?;
     Ok(true)
 }
@@ -563,6 +577,7 @@ pub async fn run_due_task_by_id(state: &AppState, task_id: ObjectId) -> AppResul
         state,
         doc! {
             "_id": task_id,
+            "manual_reply_run_id": { "$exists": false },
             "$or": [
                 { "status": "pending", "run_at": { "$lte": now } },
                 { "status": "retry", "next_retry_at": { "$lte": now } },
