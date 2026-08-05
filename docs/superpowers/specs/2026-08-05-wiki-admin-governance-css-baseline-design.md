@@ -55,13 +55,43 @@
 
 这一处优先级最高：它是不可逆高危操作。`atlas.tsx:1010` 的确认文案为「将把新版本推送给全部会话，立即对所有客户生效，且不可逆」。该按钮当前渲染为一个不可见的空白框。它有 `requireText: "确认发布"` 二次输入兜底，不至于误触即生效，但按钮本身不应隐形。
 
-改法：在 `.wikiPublishBar button` 规则内补 `color: var(--ink-2)`。带 class 的两个按钮各自的 color 优先级更高，不受影响。
+**不能**在 `.wikiPublishBar button` 规则内直接补 `color`。特异性算过了：
+
+| 选择器 | 特异性 | 说明 |
+| --- | --- | --- |
+| `.knowledgeWiki .wikiPublishBar button` | (0,2,1) | 2 类 + 1 元素 |
+| `.knowledgeWiki .wikiActionBtn--verify` | (0,2,0) | 2 类 |
+
+类计数打平在 2，元素选择器让 `.wikiPublishBar button` **胜出**。在该规则里加 `color` 会把蓝色的「发布新版」和红色的「回退上版」一起刷成灰色——修一个缺陷换来两个回归。
+
+改法：给「发布给全部」按钮补一个语义 class `wikiActionBtn--neutral`（全库未占用，已核验），规则与 `--verify` / `--reject` 同级：
+
+```css
+  .knowledgeWiki .wikiActionBtn--neutral {
+    color: var(--ink-2);
+  }
+```
+
+`border` 无需声明——`.wikiPublishBar button` 已给出 `1px solid var(--surface-page)`。
+
+不用 `.wikiPublishBar button:not([class])`：它虽然能只命中这一个按钮，但语义是「没有任何 class 的按钮」，将来任何人给该按钮加一个无关 class（如埋点标记）就会让颜色再次消失，是个潜伏陷阱。走 class 方案后，PublishBar 三个按钮各自有显式 color，形态一致。
 
 ### 3. 工具栏按钮尺度
 
 `.wikiAdminToolbar`（`Knowledge.css:3132`）内的「刷新」按钮无 class，完整继承 `styles.css:71`：`min-height: 38px`、`background: #175cd3`、`padding: 8px 13px`、`font-size: 13px`、`font-weight: 680`。同屏 PublishBar 按钮是 11px / `padding: 4px 8px` 的白底描边款，尺度冲突明显。
 
 改法：新增 `.knowledgeWiki .wikiAdminToolbar button` 规则，对齐同面板 `.wikiPublishBar button` 的视觉规格，并显式声明 `color` 与 `min-height: auto` 压掉全局值。
+
+但单条 `.wikiAdminToolbar button` 只覆盖三个面板——四个「刷新」按钮的容器并不相同：
+
+| 面板 | 按钮位置 | 容器 class |
+| --- | --- | --- |
+| `TaxonomiesGovernance` | `atlas.tsx:1167` | `.wikiAdminToolbar` |
+| `StatePoliciesGovernance` | `atlas.tsx:1257` | `.wikiAdminToolbar` |
+| `DomainGovernance` | `atlas.tsx:1338` | `.wikiAdminToolbar` |
+| `MetadataDashboard` | `atlas.tsx:865` | `.wikiArchiveHeaderActions` |
+
+第四个不能用 `.wikiArchiveHeaderActions button` 兜——该 class 另在 `today.tsx:376`、`today.tsx:581`、`steward.tsx:1732`、`steward.tsx:2419` 使用，规则会溢出到本次范围外的面板（其中 `steward.tsx:1758` 那个按钮已有 `.ghost wikiBtn` 款式）。改用 `.wikiMetadataDashboard`（`atlas.tsx:859`，全库唯一使用处）精确限定。
 
 不复用全局 `button.secondary`（`styles.css:108`）：它只改 `border-color` / `background` / `color`，不改 `min-height`，38px 仍会压着 11px 的表格行。
 
@@ -101,7 +131,7 @@
 可自动化验证：
 - 三个面板的 `updatedAt` 渲染为本地化时间，且 `undefined` 回退为 `"—"`
 - 三张表的 `<colgroup>` 列数与 `<th>` 列数一致（9 / 6 / 5），防止将来加列漏改
-- 「发布给全部」按钮可通过无障碍名称取到，并带有兜色 class
+- 「发布给全部」按钮带有 `wikiActionBtn--neutral` class（走 class 方案的附带收益：这一处从"只能目视"变成可自动化断言）
 
 **无法自动化验证的部分**：jsdom 没有布局引擎，`table-layout`、`width`、`color` 的实际视觉结果取不到。`Knowledge.css` 是 plain CSS（非 CSS module，见该文件头注释：改为 `.module.css` 会被 Rollup tree-shake 掉整份样式导致频道裸奔），类名是字面量，因此结构与类名断言有效，但渲染效果必须目视确认。这与 #238 的情况相同，不在文档里假装覆盖。
 
