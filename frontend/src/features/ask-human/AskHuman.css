@@ -23,11 +23,12 @@
     inset 0 1px 1px rgba(255, 255, 255, 0.9);
 }
 
-/* 卡头：左侧待处理总数，右侧按钮组。Shell 已有大页头，此处不重复写标题。 */
+/* 卡头：左侧待处理总数，右侧按钮组。Shell 已有大页头，此处不重复写标题。
+   按钮组靠 margin-left:auto 推到右端，而非 space-between——后者在计数不可用
+   （total 为 null，左侧不渲染）时会把按钮组当唯一子元素推到左边，位置随数据跳动。 */
 .askHumanPanelHead {
   display: flex;
   align-items: center;
-  justify-content: space-between;
   gap: 14px;
   margin-bottom: 16px;
 }
@@ -45,6 +46,7 @@
   display: flex;
   align-items: center;
   gap: 8px;
+  margin-left: auto;
 }
 .askHumanHeader button {
   font: inherit;
@@ -214,12 +216,13 @@
   color: var(--ink-1);
 }
 
-/* 折叠式收件箱行 */
+/* 折叠式收件箱行。行间距由父容器 .reviewQueueList 的 gap 统一提供，
+   此处不再自带 margin-bottom——两者叠加会让行距变成 20px，且末行下方多出空白。
+   （本文件 .resolvedEscList / .resolvedEscRow 就是仅靠 gap 的正确范例。） */
 .inboxRow {
   border: 1px solid var(--hairline);
   border-radius: var(--r-md, 12px);
   background: var(--surface-card);
-  margin-bottom: 10px;
 }
 .inboxRowHead {
   display: flex;
