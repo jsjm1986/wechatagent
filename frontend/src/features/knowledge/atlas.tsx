@@ -1218,7 +1218,9 @@ function TaxonomiesGovernance() {
               </td>
               <td className="wikiArchiveTimelineTime">v{it.version ?? 0}</td>
               <td>{it.currentVersion ? "✓" : ""}</td>
-              <td className="wikiArchiveTimelineTime">{it.updatedAt ?? ""}</td>
+              <td className="wikiArchiveTimelineTime">
+                {it.updatedAt ? new Date(it.updatedAt).toLocaleString() : "—"}
+              </td>
               <td>
                 <PublishBar
                   resourceKind="taxonomies"
@@ -1308,7 +1310,9 @@ function StatePoliciesGovernance() {
               <td className="wikiArchiveTimelineTime">v{it.version ?? 0}</td>
               <td>{it.currentVersion ? "✓" : ""}</td>
               <td className="wikiArchiveTimelineTime">{(it.states ?? []).length} 状态</td>
-              <td className="wikiArchiveTimelineTime">{it.updatedAt ?? ""}</td>
+              <td className="wikiArchiveTimelineTime">
+                {it.updatedAt ? new Date(it.updatedAt).toLocaleString() : "—"}
+              </td>
               <td>
                 <PublishBar
                   resourceKind="operation-state-policies"
@@ -1394,7 +1398,9 @@ function DomainGovernance() {
               <td>{it.domain}</td>
               <td className="wikiArchiveTimelineTime">v{it.version ?? 0}</td>
               <td>{it.currentVersion ? "✓" : ""}</td>
-              <td className="wikiArchiveTimelineTime">{it.updatedAt ?? ""}</td>
+              <td className="wikiArchiveTimelineTime">
+                {it.updatedAt ? new Date(it.updatedAt).toLocaleString() : "—"}
+              </td>
               <td>
                 <PublishBar
                   resourceKind="operation-domains"

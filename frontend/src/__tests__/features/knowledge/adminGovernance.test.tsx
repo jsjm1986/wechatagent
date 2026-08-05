@@ -146,3 +146,41 @@ describe("治理工坊表格列宽约束", () => {
     });
   });
 });
+
+describe("治理工坊更新时间渲染", () => {
+  // 后端返回 ISO 串，直接渲染会在固定列宽下于连字符处断行，且不是运营可读格式。
+  // 与同频道 steward.tsx 惯例一致：new Date(x).toLocaleString()。
+  // 断言用 toLocaleString() 现算而非硬编码字符串：CI 与开发机的时区/locale
+  // 不同，硬编码会在其中一边失败。
+  it.each([
+    ["分类系统"],
+    ["状态策略"],
+    ["域配置"],
+  ])("%s 表把 ISO 时间渲染为本地化格式", async (tabName) => {
+    mockGovernanceApi();
+    renderGovernance();
+    const table = await openTab(tabName as string);
+
+    const expected = new Date(ISO_FIXTURE).toLocaleString();
+    expect(table.textContent).toContain(expected);
+    // 原始 ISO 串不应再出现
+    expect(table.textContent).not.toContain(ISO_FIXTURE);
+  });
+
+  it("updatedAt 缺失时回退为破折号", async () => {
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input).startsWith("/api/operation-domains")) {
+        return response({
+          items: [{ id: "domain-a", domain: "DEFAULT", version: 3, currentVersion: true }],
+        });
+      }
+      return response({ items: [] });
+    }) as typeof fetch;
+
+    renderGovernance();
+    const table = await openTab("域配置");
+    const cells = table.querySelectorAll("tbody td");
+    // 域配置表第 4 列（索引 3）是更新时间
+    expect(cells[3]?.textContent).toBe("—");
+  });
+});
