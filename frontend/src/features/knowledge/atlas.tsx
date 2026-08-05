@@ -1048,7 +1048,12 @@ function PublishBar({ resourceKind, id, onChange }: PublishBarProps) {
       >
         <CheckCircle2 size={12} /> {busy === "publish" ? "发布中…" : "发布新版"}
       </button>
-      <button type="button" onClick={() => void call("rollout")} disabled={busy !== ""}>
+      <button
+        type="button"
+        onClick={() => void call("rollout")}
+        disabled={busy !== ""}
+        className="wikiActionBtn--neutral"
+      >
         <ArrowRight size={12} /> {busy === "rollout" ? "发布中…" : "发布给全部"}
       </button>
       <button

@@ -2632,6 +2632,14 @@
     background: #b34134;
     color: #fff;
   }
+  /* 中性款操作按钮。必须与 --verify / --reject 同级（2 类）而不是写进
+     .wikiPublishBar button（2 类 + 1 元素，特异性更高）——写在那里会把
+     蓝色的「发布新版」和红色的「回退上版」一起刷成灰。
+     没有这条兜色，按钮就继承全局 button 基线的 color:#fff，
+     在 .wikiPublishBar button 的白底上完全不可见。 */
+  .knowledgeWiki .wikiActionBtn--neutral {
+    color: var(--ink-2);
+  }
   .knowledgeWiki .wikiCollapseHead {
     display: flex;
     align-items: center;
