@@ -75,4 +75,27 @@ describe("FriendPickerModal", () => {
     render(<FriendPickerModal {...baseProps} />);
     expect(screen.queryByText(/手动输入/)).toBeNull();
   });
+
+  it("面板加宽到 720px：双列网格放得下完整昵称", () => {
+    render(<FriendPickerModal {...baseProps} />);
+    // Overlay 的 maxWidth 走 inline style（CSS 默认 480 只够一列半，昵称会大面积截断）。
+    expect(screen.getByRole("dialog").style.maxWidth).toBe("720px");
+  });
+
+  it("常驻显示总数——4800 人通讯录里这是判断搜索是否生效的关键反馈", () => {
+    render(<FriendPickerModal {...baseProps} />);
+    expect(screen.getByText("共 3 位")).toBeInTheDocument();
+  });
+
+  it("搜索后计数改说「匹配 N 位」，与未搜索态区分", () => {
+    render(<FriendPickerModal {...baseProps} />);
+    fireEvent.change(screen.getByPlaceholderText(/搜索/), { target: { value: "李四" } });
+    expect(screen.getByText("匹配 1 位")).toBeInTheDocument();
+    expect(screen.queryByText("共 3 位")).toBeNull();
+  });
+
+  it("列表为空时不显示计数（空态已自带说明，再报「共 0 位」是噪音）", () => {
+    render(<FriendPickerModal {...baseProps} items={[]} />);
+    expect(screen.queryByText(/共 0 位|匹配 0 位/)).toBeNull();
+  });
 });
