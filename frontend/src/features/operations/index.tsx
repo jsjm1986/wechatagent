@@ -374,6 +374,7 @@ function OperationsWorkbench({ currentAccountId }: { currentAccountId: string })
                   <th>触发</th>
                   <th>档位遥测</th>
                   <th>时间</th>
+                  <th>操作</th>
                 </tr>
               </thead>
               <tbody>
@@ -519,9 +520,9 @@ function RunEnvelopeRows({
                 const entries = Object.entries(stage as Record<string, unknown>);
                 if (entries.length === 0) return null;
                 return (
-                  <div key={key as string} className={styles.tHead}>
+                  <div key={key as string} className={styles.stageBlock}>
                     <strong>{label}</strong>
-                    <table className={styles.table}>
+                    <table className={styles.stageTable}>
                       <tbody>
                         {entries.map(([k, v]) => (
                           <tr key={k}>
