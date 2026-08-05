@@ -202,11 +202,13 @@ Expected: 3 个用例 FAIL。前两个报 `expected null not to be null`（`.ask
     inset 0 1px 1px rgba(255, 255, 255, 0.9);
 }
 
-/* 卡头：左侧待处理总数，右侧按钮组。Shell 已有大页头，此处不重复写标题。 */
+/* 卡头：左侧待处理总数，右侧按钮组。Shell 已有大页头，此处不重复写标题。
+   按钮组靠 margin-left:auto 推到右端（见下方 .askHumanHeader），不要用
+   justify-content: space-between——计数不可用（total 为 null，左侧不渲染）时
+   按钮组会成为唯一子元素而被推到左边，按钮位置随数据跳动。 */
 .askHumanPanelHead {
   display: flex;
   align-items: center;
-  justify-content: space-between;
   gap: 14px;
   margin-bottom: 16px;
 }
@@ -224,6 +226,8 @@ Expected: 3 个用例 FAIL。前两个报 `expected null not to be null`（`.ask
   display: flex;
   align-items: center;
   gap: 8px;
+  /* 恒定靠右：不依赖父级 space-between，故计数节点不渲染时按钮位置不变。 */
+  margin-left: auto;
 }
 ```
 
@@ -251,10 +255,8 @@ Expected: 3 个用例 FAIL。前两个报 `expected null not to be null`（`.ask
       <div className="askHumanPanel">
         <div className="askHumanPanelHead">
           {/* total 为 null 表示计数不可用，此时不渲染——显示「待处理 0 项」是错误信息。 */}
-          {summary?.total != null ? (
+          {summary?.total != null && (
             <span className="askHumanPanelHeadCount">待处理 {summary.total} 项</span>
-          ) : (
-            <span />
           )}
           <div className="askHumanHeaderActions askHumanHeader">
             <button
@@ -278,7 +280,7 @@ Expected: 3 个用例 FAIL。前两个报 `expected null not to be null`（`.ask
 注意三点：
 
 1. 按钮组同时挂 `askHumanHeaderActions` 与 `askHumanHeader` 两个 class——前者是原有的 flex 布局，后者让 `.askHumanHeader button` 规则继续命中无 class 的「刷新」按钮。
-2. `total` 为 null 时渲染空 `<span />` 占位，保持 `justify-content: space-between` 把按钮推到右侧。
+2. `total` 为 null 时整个计数节点不渲染，无需空占位——按钮组由 `.askHumanHeader { margin-left: auto }` 恒定推到右端，位置不随数据有无而跳动。
 3. 这里只**新开**了 `<div className="askHumanPanel">`，闭合标签在下一步补。
 
 - [ ] **Step 5: 补白卡闭合标签**
@@ -633,6 +635,18 @@ Expected: 2 个用例 FAIL。第一个报 `.reviewQueueEmpty` 仍存在（`expec
 ```
 
 `.reviewQueueError` 的配色照抄同文件既有的 `.askHumanFatal` 规则（红底警示条），保持频道内错误呈现一致。
+
+**同时必须移除 `.inboxRow` 的 `margin-bottom`**（按字符串定位该规则）：
+
+```css
+.inboxRow {
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-md, 12px);
+  background: var(--surface-card);
+}
+```
+
+原先 `.reviewQueueList` 在全库无任何 CSS，行间距全靠 `.inboxRow` 自带的 `margin-bottom: 10px`。上面新增的 `gap: 10px` 会与它**叠加成 20px**，且末行下方多出 10px 空白。间距只应由父容器的 `gap` 负责——同文件的 `.resolvedEscList` / `.resolvedEscRow` 就是这个正确范例（父有 `gap: 12px`，子无 `margin-bottom`）。
 
 - [ ] **Step 5: 改 JSX——传入 EmptyState**
 
