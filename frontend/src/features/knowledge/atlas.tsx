@@ -1175,6 +1175,17 @@ function TaxonomiesGovernance() {
       </div>
       {error ? <div className="wikiBannerError">{error}</div> : null}
       <table className="wikiAdminTable">
+        <colgroup>
+          <col style={{ width: "8%" }} />
+          <col style={{ width: "12%" }} />
+          <col style={{ width: "14%" }} />
+          <col style={{ width: "12%" }} />
+          <col style={{ width: "8%" }} />
+          <col style={{ width: "6%" }} />
+          <col style={{ width: "7%" }} />
+          <col style={{ width: "15%" }} />
+          <col style={{ width: "18%" }} />
+        </colgroup>
         <thead>
           <tr>
             <th>范围</th>
@@ -1265,6 +1276,14 @@ function StatePoliciesGovernance() {
       </div>
       {error ? <div className="wikiBannerError">{error}</div> : null}
       <table className="wikiAdminTable">
+        <colgroup>
+          <col style={{ width: "20%" }} />
+          <col style={{ width: "8%" }} />
+          <col style={{ width: "9%" }} />
+          <col style={{ width: "12%" }} />
+          <col style={{ width: "23%" }} />
+          <col style={{ width: "28%" }} />
+        </colgroup>
         <thead>
           <tr>
             <th>业务域</th>
@@ -1346,6 +1365,13 @@ function DomainGovernance() {
       </div>
       {error ? <div className="wikiBannerError">{error}</div> : null}
       <table className="wikiAdminTable">
+        <colgroup>
+          <col style={{ width: "24%" }} />
+          <col style={{ width: "9%" }} />
+          <col style={{ width: "10%" }} />
+          <col style={{ width: "25%" }} />
+          <col style={{ width: "32%" }} />
+        </colgroup>
         <thead>
           <tr>
             <th>业务域</th>

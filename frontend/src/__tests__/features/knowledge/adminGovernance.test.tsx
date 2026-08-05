@@ -120,3 +120,29 @@ describe("治理工坊 PublishBar 按钮兜色", () => {
     ).toContain("wikiActionBtn--reject");
   });
 });
+
+describe("治理工坊表格列宽约束", () => {
+  // table-layout:fixed 下无显式列宽会均分，9 列均分会让 ✓ 窄列与更新时间同宽。
+  // 故每张表都必须有 colgroup，且列数与表头严格一致——将来加列漏改 colgroup
+  // 会被此测试拦下。jsdom 无布局引擎，只能断言结构，实际列宽需目视确认。
+  it.each([
+    ["分类系统", 9],
+    ["状态策略", 6],
+    ["域配置", 5],
+  ])("%s 表的 colgroup 列数与表头一致（%i 列）", async (tabName, expectedColumns) => {
+    mockGovernanceApi();
+    renderGovernance();
+    const table = await openTab(tabName as string);
+
+    const headerCells = table.querySelectorAll("thead th");
+    expect(headerCells).toHaveLength(expectedColumns as number);
+
+    const cols = table.querySelectorAll("colgroup col");
+    expect(cols).toHaveLength(expectedColumns as number);
+
+    // 每个 col 都必须声明宽度，否则退化为均分。
+    cols.forEach((col) => {
+      expect((col as HTMLTableColElement).style.width).not.toBe("");
+    });
+  });
+});

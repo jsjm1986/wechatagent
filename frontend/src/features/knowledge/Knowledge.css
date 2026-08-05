@@ -3178,6 +3178,9 @@
   }
   .knowledgeWiki .wikiAdminTable {
     width: 100%;
+    /* fixed 让列宽只由 colgroup 决定：auto 布局下 9 列会按内容抢宽度，
+       把「版本」「当前生效」表头竖排、行高撑到约 93px。 */
+    table-layout: fixed;
     border-collapse: collapse;
     font-size: 12.5px;
   }
@@ -3197,6 +3200,8 @@
     padding: 6px 8px;
     border-bottom: 1px solid var(--surface-page);
     vertical-align: middle;
+    word-break: break-word;
+    overflow-wrap: anywhere;
   }
   .knowledgeWiki .wikiAdminTable tbody tr.is-active {
     background: rgba(180, 130, 50, 0.05);
