@@ -598,6 +598,7 @@ pub fn finalize_review_for_send(
     priced_from_catalog: bool,
     principal_product_exempted: bool,
 ) -> FinalizeOutcome {
+    let _stage_timer = crate::agent::run_audit::stage_timer("finalize");
     finalize_review_for_send_at(
         review,
         decision,

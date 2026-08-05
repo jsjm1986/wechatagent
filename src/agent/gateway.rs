@@ -26,7 +26,7 @@ use std::{
     },
 };
 
-use futures::{FutureExt, TryStreamExt};
+use futures::{future::BoxFuture, FutureExt, TryStreamExt};
 use mongodb::bson::{doc, oid::ObjectId, to_document, Bson, DateTime, Document};
 use mongodb::options::FindOptions;
 use serde_json::json;
@@ -44,7 +44,8 @@ use super::budget::{current_run_budget, RunBudget, RUN_BUDGET};
 use super::decision::{
     decide_reply_with_promote, initial_operation_state_for_contact,
     load_operation_playbook_for_contact, load_operation_state_policy_for_contact,
-    load_user_operation_domain_config_for_contact,
+    load_reply_prompt_snapshot, load_user_operation_domain_config_for_contact, DecisionRunSnapshot,
+    ReplyContextCache,
 };
 use super::escalation;
 use super::guards::{
@@ -67,10 +68,11 @@ use super::outbox::{
     enqueue as outbox_enqueue, EnqueueOutcome, EnqueueRequest, OutboxStatus as OutboxSendStatus,
 };
 use super::review::{
-    apply_revision_fallback, contact_has_principal_product_exemption, decide_revision,
-    derive_revision_failure, effective_review_mode, ensure_independent_claim_gate,
-    finalize_review_for_send, local_decision_review, review_decision, review_passed,
-    should_run_review, FinalizeOutcome, GatewayStatusFinal, PendingFinalizeEvent, RevisionDecision,
+    apply_independent_claim_gate, apply_revision_fallback, contact_has_principal_product_exemption,
+    decide_revision, derive_revision_failure, effective_review_mode, ensure_independent_claim_gate,
+    evaluate_independent_claim_gate, finalize_review_for_send, local_decision_review,
+    review_decision, review_passed, should_run_review, FinalizeOutcome, GatewayStatusFinal,
+    PendingFinalizeEvent, ReviewerPromptCache, RevisionDecision,
 };
 use super::run_envelope::{
     assert_final_review_status_valid, assert_gateway_status_valid, assert_lifecycle_valid,
@@ -288,27 +290,51 @@ async fn handle_durable_inbound_reply_task(
         }
     });
 
-    // Reaction analysis remains a best-effort side channel, matching the
-    // previous in-process debounce runner. It must never suppress the reply.
-    if let Err(error) = super::reaction::record_user_reaction(state, &contact, &inbound).await {
-        tracing::warn!(
-            task_id = %task_id,
-            contact_wxid = %contact.wxid,
-            %error,
-            "durable inbound reaction analysis failed"
-        );
-    }
+    // Default remains strictly serial so this reply can observe the freshly
+    // persisted reaction hint. The experimental branch spawns Reaction before
+    // entering the Gateway audit scope; Tokio task-locals are therefore not
+    // shared and Reaction keeps its own budget/audit ownership.
+    let parallel_reaction = if state.config.reaction_gateway_parallel_enabled {
+        let reaction_state = state.clone();
+        let reaction_contact = contact.clone();
+        let reaction_inbound = inbound.clone();
+        let started_at = std::time::Instant::now();
+        Some(ParallelReactionTask {
+            started_at,
+            handle: tokio::spawn(async move {
+                let reaction_started = std::time::Instant::now();
+                let result = super::reaction::record_user_reaction(
+                    &reaction_state,
+                    &reaction_contact,
+                    &reaction_inbound,
+                )
+                .await;
+                (reaction_started.elapsed(), result)
+            }),
+        })
+    } else {
+        if let Err(error) = super::reaction::record_user_reaction(state, &contact, &inbound).await {
+            tracing::warn!(
+                task_id = %task_id,
+                contact_wxid = %contact.wxid,
+                %error,
+                "durable inbound reaction analysis failed"
+            );
+        }
+        None
+    };
 
     let guard_flag = claim_lost.clone();
     let guard: Arc<dyn Fn() -> bool + Send + Sync> =
         Arc::new(move || guard_flag.load(Ordering::Acquire));
     let task_context = crate::tasks::TaskRunContext::new(task_id, Some(claim));
-    let result = run_user_operation_gateway(
+    let result = run_user_operation_gateway_with_parallel_reaction(
         state,
         contact,
         AgentTrigger::Inbound(&inbound),
         Some(task_context),
         Some(guard),
+        parallel_reaction,
     )
     .await;
     monitor.abort();
@@ -338,7 +364,226 @@ pub async fn send_contact_message_gateway(
     .await?;
 
     let execution = send_contact_message_gateway_inner(state, contact, request, run_id.clone());
-    settle_gateway_execution(state, &run_id, execution).await
+    settle_gateway_execution(state, &run_id, execution, None).await
+}
+
+type GatewayRunInputs = (
+    Vec<ConversationMessage>,
+    crate::models::DomainProfile,
+    Vec<AgentTask>,
+    Option<OperationPlaybook>,
+    crate::models::OperatingMemory,
+    super::types::KnowledgeRuntime,
+);
+
+type ManualRunInputs = (
+    Option<OperationPlaybook>,
+    crate::models::OperatingMemory,
+    super::types::KnowledgeRuntime,
+    Vec<ConversationMessage>,
+    crate::models::DomainProfile,
+);
+
+/// 在独立堆分配状态机中并行加载主链 run 快照。
+///
+/// 返回 `BoxFuture` 而非 `async fn`，确保巨型 gateway future 从类型层面只持有一个
+/// 指针；若把 `try_join!` 内联在 gateway 中，debug/test 默认线程栈会因 future 枚举
+/// 尺寸膨胀而溢出。
+fn load_gateway_run_inputs<'a>(
+    state: &'a AppState,
+    contact: &'a Contact,
+    recent_message_limit: i64,
+) -> BoxFuture<'a, AppResult<GatewayRunInputs>> {
+    async move {
+        let _stage_timer = super::run_audit::stage_timer("run_snapshot");
+        tokio::try_join!(
+            load_recent_messages(state, contact, recent_message_limit),
+            crate::agent::domain_profile::load_active_domain_profile(
+                &state.db,
+                &contact.workspace_id,
+            ),
+            load_pending_tasks(state, contact),
+            load_operation_playbook_for_contact(state, contact),
+            load_or_create_operating_memory(state, contact),
+            load_operation_knowledge(state, contact),
+        )
+    }
+    .boxed()
+}
+
+/// 管理发送专用的独立堆分配 run 快照加载器。
+fn load_manual_run_inputs<'a>(
+    state: &'a AppState,
+    contact: &'a Contact,
+    runtime: &'a UserRuntimeParameters,
+) -> BoxFuture<'a, AppResult<ManualRunInputs>> {
+    async move {
+        let _stage_timer = super::run_audit::stage_timer("manual_run_snapshot");
+        tokio::try_join!(
+            load_operation_playbook_for_contact(state, contact),
+            load_or_create_operating_memory(state, contact),
+            load_operation_knowledge(state, contact),
+            load_context_messages(state, contact, runtime),
+            crate::agent::domain_profile::load_active_domain_profile(
+                &state.db,
+                &contact.workspace_id,
+            ),
+        )
+    }
+    .boxed()
+}
+
+struct GatewayBusinessInputs {
+    knowledge_route: KnowledgeRouteResult,
+    active_products: Vec<crate::models::Product>,
+    published_soul: Option<String>,
+    sendable_assets: Vec<crate::models::ContentAsset>,
+    reply_prompts: super::decision::ReplyPromptSnapshot,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_gateway_business_inputs<'a>(
+    state: &'a AppState,
+    contact: &'a Contact,
+    inbound: &'a ConversationMessage,
+    recent_messages: &'a [ConversationMessage],
+    memory: &'a crate::models::OperatingMemory,
+    context_pack: &'a Document,
+    operation_knowledge: &'a super::types::KnowledgeRuntime,
+    initial_planner: &'a RunPlannerResult,
+    run_id: &'a str,
+    active_profile: &'a crate::models::DomainProfile,
+) -> BoxFuture<'a, AppResult<GatewayBusinessInputs>> {
+    async move {
+        let _stage_timer = super::run_audit::stage_timer("business_preload");
+        let route_future = async {
+            let _route_timer = super::run_audit::stage_timer("knowledge_route");
+            if current_run_budget()
+                .map(|budget| budget.is_exceeded())
+                .unwrap_or(false)
+            {
+                if let Some(budget) = current_run_budget() {
+                    budget.mark_degraded("knowledge_route_skipped_budget_exceeded");
+                }
+                let mut route = empty_knowledge_route(initial_planner);
+                route.reason = "预算超额：跳过知识路由，沿用空知识做保守决策".to_string();
+                Ok(route)
+            } else {
+                route_operation_knowledge(
+                    state,
+                    contact,
+                    inbound,
+                    recent_messages,
+                    memory,
+                    context_pack,
+                    operation_knowledge,
+                    Some(run_id),
+                )
+                .await
+            }
+        };
+        let products_future = async {
+            if active_profile.transaction_facts_enabled {
+                super::entitlements::load_active_products(&state.db, &contact.workspace_id).await
+            } else {
+                Vec::new()
+            }
+        };
+        let soul_future = async {
+            let has_override = active_profile
+                .soul_override
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|value| !value.is_empty());
+            if has_override {
+                Ok(None)
+            } else {
+                super::decision::load_published_soul(state, &contact.workspace_id, "user")
+                    .await
+                    .map(Some)
+            }
+        };
+        let sendable_assets_future = async {
+            super::decision::load_sendable_assets(state, &contact.workspace_id, &contact.account_id)
+                .await
+                .unwrap_or_default()
+        };
+        let prompt_future = load_reply_prompt_snapshot(state, contact);
+        let (route, products, published_soul, sendable_assets, reply_prompts) = tokio::join!(
+            route_future,
+            products_future,
+            soul_future,
+            sendable_assets_future,
+            prompt_future,
+        );
+        Ok(GatewayBusinessInputs {
+            knowledge_route: route?,
+            active_products: products,
+            published_soul: published_soul?,
+            sendable_assets,
+            reply_prompts: reply_prompts?,
+        })
+    }
+    .boxed()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn review_and_evaluate_claim_gate<'a>(
+    state: &'a AppState,
+    contact: &'a Contact,
+    inbound: &'a ConversationMessage,
+    decision: &'a AgentDecision,
+    playbook: Option<&'a OperationPlaybook>,
+    domain_config: Option<&'a OperationDomainConfig>,
+    runtime: &'a UserRuntimeParameters,
+    memory: &'a crate::models::OperatingMemory,
+    context_pack: &'a Document,
+    knowledge_chunks: &'a [crate::models::OperationKnowledgeChunk],
+    knowledge_route: &'a KnowledgeRouteResult,
+    review_mode: &'a str,
+    run_id: &'a str,
+    active_profile: &'a crate::models::DomainProfile,
+    active_products: &'a [crate::models::Product],
+    reviewer_prompts: &'a ReviewerPromptCache,
+) -> BoxFuture<
+    'a,
+    AppResult<(
+        DecisionReviewResult,
+        super::review::IndependentClaimGateEvaluation,
+    )>,
+> {
+    async move {
+        let (review, claim_gate) = tokio::join!(
+            review_decision(
+                state,
+                contact,
+                inbound,
+                decision,
+                playbook,
+                domain_config,
+                runtime,
+                memory,
+                context_pack,
+                knowledge_chunks,
+                knowledge_route,
+                review_mode,
+                Some(run_id),
+                None,
+                Some(active_profile),
+                Some(reviewer_prompts),
+            ),
+            evaluate_independent_claim_gate(
+                state,
+                contact,
+                inbound,
+                decision,
+                active_products,
+                Some(run_id),
+            ),
+        );
+        Ok((review?, claim_gate))
+    }
+    .boxed()
 }
 
 async fn send_contact_message_gateway_inner(
@@ -347,6 +592,7 @@ async fn send_contact_message_gateway_inner(
     request: ManualContactSend,
     run_id: String,
 ) -> AppResult<ContactSendResult> {
+    super::run_audit::mark_manual();
     let content = request.content.trim().to_string();
     let source_event_id = format!("manual:{run_id}");
     let domain_config =
@@ -417,10 +663,9 @@ async fn send_contact_message_gateway_inner(
         return Err(AppError::BadRequest(precheck.reason));
     }
 
-    let playbook = load_operation_playbook_for_contact(state, &contact).await?;
-    let memory = load_or_create_operating_memory(state, &contact).await?;
-    let operation_knowledge = load_operation_knowledge(state, &contact).await?;
-    let context_messages = load_context_messages(state, &contact, &runtime).await?;
+    // 管理发送的 run 级输入彼此独立；helper 在堆分配状态机中并行读取并固定快照。
+    let (playbook, memory, operation_knowledge, context_messages, active_profile) =
+        load_manual_run_inputs(state, &contact, &runtime).await?;
     // task 6.3：边界处把 typed 转为 Document wire shape，下游 prompt 注入
     // 路径不变。
     let context_pack = effective_memory_card_for_contact(
@@ -429,7 +674,8 @@ async fn send_contact_message_gateway_inner(
         &initial_operation_state_key(domain_config.as_ref()),
     )
     .to_document();
-    let knowledge_route = route_operation_knowledge(
+    // 产品目录与知识 Agent 路由互不依赖；在堆分配 helper 中并行执行并复用快照。
+    let route_future = route_operation_knowledge(
         state,
         &contact,
         &synthetic_inbound,
@@ -438,8 +684,16 @@ async fn send_contact_message_gateway_inner(
         &context_pack,
         &operation_knowledge,
         Some(&run_id),
-    )
-    .await?;
+    );
+    let products_future = async {
+        if active_profile.transaction_facts_enabled {
+            super::entitlements::load_active_products(&state.db, &contact.workspace_id).await
+        } else {
+            Vec::new()
+        }
+    };
+    let (knowledge_route, active_products) = tokio::join!(route_future, products_future);
+    let knowledge_route = knowledge_route?;
     let selected_chunks =
         select_operation_knowledge_chunks(&operation_knowledge.chunks, &knowledge_route);
     let mut decision = AgentDecision {
@@ -459,7 +713,10 @@ async fn send_contact_message_gateway_inner(
         to_document(&decision).unwrap_or_default(),
     )
     .await?;
-    let mut review = review_decision(
+    // 管理发送没有 revision 通道，当前 decision 已是唯一终稿；Reviewer 与 Claim Gate
+    // 在独立堆分配 helper 中并行执行，不增加调用次数或改变授权语义。
+    let reviewer_prompts = ReviewerPromptCache::new();
+    let (mut review, claim_gate_evaluation) = review_and_evaluate_claim_gate(
         state,
         &contact,
         &synthetic_inbound,
@@ -472,28 +729,18 @@ async fn send_contact_message_gateway_inner(
         &selected_chunks,
         &knowledge_route,
         "full",
-        Some(&run_id),
-        None,
+        &run_id,
+        &active_profile,
+        &active_products,
+        &reviewer_prompts,
     )
     .await?;
-    let active_profile =
-        crate::agent::domain_profile::load_active_domain_profile(&state.db, &contact.workspace_id)
-            .await?;
-    let active_products = if active_profile.transaction_facts_enabled {
-        super::entitlements::load_active_products(&state.db, &contact.workspace_id).await
-    } else {
-        Vec::new()
-    };
-    let priced_from_catalog = ensure_independent_claim_gate(
-        state,
-        &contact,
-        &synthetic_inbound,
+    let priced_from_catalog = apply_independent_claim_gate(
+        claim_gate_evaluation,
         &decision,
         &mut review,
         &active_products,
-        Some(&run_id),
-    )
-    .await;
+    );
     // M1：与客户主链路对齐——管理发送也走 finalize_review_for_send 汇总所有硬门
     // （R5.4 verified-knowledge / R3.5-R3.6 协议 / R3.7 预算 / R2.6 should_hold），
     // 不再仅凭 review_passed 的软闸折叠 bool 放行。放行条件带 `&& review_passed`
@@ -1133,12 +1380,36 @@ async fn maybe_handle_non_text_transition(
     Ok(true)
 }
 
+struct ParallelReactionTask {
+    started_at: std::time::Instant,
+    handle: tokio::task::JoinHandle<(std::time::Duration, AppResult<()>)>,
+}
+
 pub(crate) async fn run_user_operation_gateway(
     state: &AppState,
     contact: Contact,
     trigger: AgentTrigger<'_>,
     task_context: Option<crate::tasks::TaskRunContext>,
     should_abort_send: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+) -> AppResult<()> {
+    run_user_operation_gateway_with_parallel_reaction(
+        state,
+        contact,
+        trigger,
+        task_context,
+        should_abort_send,
+        None,
+    )
+    .await
+}
+
+async fn run_user_operation_gateway_with_parallel_reaction(
+    state: &AppState,
+    contact: Contact,
+    trigger: AgentTrigger<'_>,
+    task_context: Option<crate::tasks::TaskRunContext>,
+    should_abort_send: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    parallel_reaction: Option<ParallelReactionTask>,
 ) -> AppResult<()> {
     let run_id = uuid::Uuid::new_v4().to_string();
     let (source_event_id, source_kind) = trigger_envelope_source(&trigger);
@@ -1194,25 +1465,52 @@ pub(crate) async fn run_user_operation_gateway(
             )
             .await
     };
-    settle_gateway_execution(state, &run_id, execution).await
+    settle_gateway_execution(state, &run_id, execution, parallel_reaction).await
 }
 
 async fn settle_gateway_execution<T, F>(
     state: &AppState,
     run_id: &str,
     execution: F,
+    parallel_reaction: Option<ParallelReactionTask>,
 ) -> AppResult<T>
 where
     F: std::future::Future<Output = AppResult<T>>,
 {
-    match AssertUnwindSafe(execution).catch_unwind().await {
-        Ok(Ok(value)) => Ok(value),
+    // The scope covers every child future polled by this Gateway. LLM audit
+    // rows are buffered in memory and stage timers aggregate into this object.
+    let audit = Arc::new(super::run_audit::RunAuditBuffer::new());
+    let outcome = super::run_audit::RUN_AUDIT_BUFFER
+        .scope(audit.clone(), AssertUnwindSafe(execution).catch_unwind())
+        .await;
+
+    if let Some(parallel_reaction) = parallel_reaction {
+        let parallel_started = parallel_reaction.started_at;
+        match parallel_reaction.handle.await {
+            Ok((reaction_elapsed, Ok(()))) => {
+                audit.record_stage("reaction_analysis", reaction_elapsed);
+            }
+            Ok((reaction_elapsed, Err(error))) => {
+                audit.record_stage("reaction_analysis", reaction_elapsed);
+                tracing::warn!(%run_id, %error, "parallel reaction analysis failed");
+            }
+            Err(error) => {
+                tracing::warn!(%run_id, %error, "parallel reaction task join failed");
+            }
+        }
+        audit.record_stage("reaction_gateway_parallel", parallel_started.elapsed());
+    }
+
+    // Close an errored envelope before writing performance metadata, preserving
+    // the existing lifecycle transition. Panic payloads are retained until all
+    // audit work has completed and are then resumed unchanged.
+    match &outcome {
+        Ok(Ok(_)) => {}
         Ok(Err(error)) => {
             let summary = format!("gateway_error: {error}");
             if let Err(audit_error) = fail_run_envelope_if_open(&state.db, run_id, &summary).await {
                 tracing::error!(%run_id, error = %audit_error, "failed to close errored run envelope");
             }
-            Err(error)
         }
         Err(payload) => {
             let panic_message = panic_payload_message(payload.as_ref());
@@ -1220,8 +1518,67 @@ where
             if let Err(audit_error) = fail_run_envelope_if_open(&state.db, run_id, &summary).await {
                 tracing::error!(%run_id, error = %audit_error, "failed to close panicked run envelope");
             }
-            std::panic::resume_unwind(payload)
         }
+    }
+
+    // Reliable audit flush: insert_many fast path, stable-id upsert fallback.
+    // An audit outage is observable but must not turn an already-authorized
+    // send into a Gateway error and trigger duplicate delivery retries.
+    let flush_started = std::time::Instant::now();
+    let (llm_timed, event_timed) = tokio::join!(
+        async {
+            let started = std::time::Instant::now();
+            let report = audit.flush_llm_logs(state).await;
+            (report, started.elapsed())
+        },
+        async {
+            let started = std::time::Instant::now();
+            let report = audit.flush_observability_events(state).await;
+            (report, started.elapsed())
+        },
+    );
+    let (flush, llm_flush_elapsed) = llm_timed;
+    let (event_flush, event_flush_elapsed) = event_timed;
+    audit.record_stage("llm_audit_flush", llm_flush_elapsed);
+    audit.record_stage("event_audit_flush", event_flush_elapsed);
+    audit.record_stage("audit_flush", flush_started.elapsed());
+    let performance = audit.performance_document(&flush, &event_flush);
+    if let Err(error) = state
+        .db
+        .agent_run_logs()
+        .update_one(
+            doc! { "run_id": run_id },
+            doc! { "$set": { "gateway_result.performance": performance } },
+            None,
+        )
+        .await
+    {
+        tracing::error!(%run_id, %error, "failed to persist Gateway performance audit");
+    }
+    if flush.failed > 0 {
+        tracing::error!(
+            %run_id,
+            queued = flush.queued,
+            persisted = flush.persisted,
+            failed = flush.failed,
+            error = ?flush.error,
+            "LLM audit flush incomplete after idempotent fallback"
+        );
+    }
+    if event_flush.failed > 0 {
+        tracing::error!(
+            %run_id,
+            queued = event_flush.queued,
+            persisted = event_flush.persisted,
+            failed = event_flush.failed,
+            error = ?event_flush.error,
+            "observability event flush incomplete after idempotent fallback"
+        );
+    }
+
+    match outcome {
+        Ok(result) => result,
+        Err(payload) => std::panic::resume_unwind(payload),
     }
 }
 
@@ -1670,17 +2027,18 @@ fn text_send_eligible(should_reply: bool, reply_text: &str) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_user_operation_gateway_inner(
-    state: &AppState,
+fn run_user_operation_gateway_inner<'a>(
+    state: &'a AppState,
     contact: Contact,
-    trigger: AgentTrigger<'_>,
+    trigger: AgentTrigger<'a>,
     task_context: Option<crate::tasks::TaskRunContext>,
     run_id: String,
     inbound: ConversationMessage,
     domain_config: Option<OperationDomainConfig>,
     mut runtime: UserRuntimeParameters,
     should_abort_send: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
-) -> AppResult<()> {
+) -> BoxFuture<'a, AppResult<()>> {
+    async move {
     // S1.1 (Phase 0)：派生 R0.1 envelope 的 (source_event_id, source_kind)，
     // 在所有终态写入点透传，确保 agent_run_logs 闭集字段非空。
     let (envelope_source_event_id, envelope_source_kind) = trigger_envelope_source(&trigger);
@@ -1762,25 +2120,14 @@ async fn run_user_operation_gateway_inner(
         return Ok(());
     }
 
-    let recent_messages =
-        load_recent_messages(state, &contact, runtime.recent_message_limit).await?;
-    // universal-domain-adaptation H4/H14：本 run 的 active DomainProfile 提前加载
-    // 一次（30s TTL 进程缓存，命中即廉价），供 finalize 阶段的承诺词表
-    // commitment_markers（H4）+ runtime grounding 闸开关（H14）消费。DEFAULT 销售域
-    // 词表逐字复刻 guards const、bypass=false → 行为字节等价。
-    let active_profile =
-        crate::agent::domain_profile::load_active_domain_profile(&state.db, &contact.workspace_id)
-            .await?;
+    // 这些 run 级输入彼此独立；在堆分配 helper 中并行读取，避免放大 Gateway future。
+    let (recent_messages, active_profile, pending_tasks, playbook, memory, operation_knowledge) =
+        load_gateway_run_inputs(state, &contact, runtime.recent_message_limit).await?;
     // universal-domain-adaptation 第 78 点：用单一入口 apply_active_profile 把 active
     // profile 的运行期价值开关（H14 grounding bypass + reviewer distrust + M2 五闸阈值
     // 覆盖）一次性派生进 runtime，替代此处散落的手工赋值。DEFAULT 销售 profile →
     // 三项均无扰动、字节等价；情感陪伴等非销售域 → runtime 带上本域非销售行为。
-    // 该派生链由 lib 单测 runtime::tests::emotional_companion_profile_* 纯内存端到端断言。
     runtime.apply_active_profile(&active_profile);
-    let pending_tasks = load_pending_tasks(state, &contact).await?;
-    let playbook = load_operation_playbook_for_contact(state, &contact).await?;
-    let memory = load_or_create_operating_memory(state, &contact).await?;
-    let operation_knowledge = load_operation_knowledge(state, &contact).await?;
     // MP-9 / Task 16：知识库切片全部未验证时给出可见告警，避免运营人员困惑。
     let _ = maybe_emit_unverified_warning(state, &contact).await;
     // task 6.3：边界处把 typed 转为 Document wire shape，下游 prompt 注入
@@ -1809,29 +2156,27 @@ async fn run_user_operation_gateway_inner(
     // Reply Agent 直接拿着真实知识做 single-pass 决策。预算超额时退化成
     // empty_knowledge_route 但不再回退到旧的两段式。成本：每轮 +1 LLM call
     // ≈ +800 tokens / inbound，已经预留在 RunBudget。
-    let knowledge_route = if current_run_budget()
-        .map(|b| b.is_exceeded())
-        .unwrap_or(false)
-    {
-        if let Some(budget) = current_run_budget() {
-            budget.mark_degraded("knowledge_route_skipped_budget_exceeded");
-        }
-        let mut route = empty_knowledge_route(&initial_planner);
-        route.reason = "预算超额：跳过知识路由，沿用空知识做保守决策".to_string();
-        route
-    } else {
-        route_operation_knowledge(
-            state,
-            &contact,
-            &inbound,
-            &recent_messages,
-            &memory,
-            &context_pack,
-            &operation_knowledge,
-            Some(&run_id),
-        )
-        .await?
-    };
+    // 产品目录与最长可达 4 轮的知识路由在堆分配 helper 中并行预取。
+    let business_inputs = load_gateway_business_inputs(
+        state,
+        &contact,
+        &inbound,
+        &recent_messages,
+        &memory,
+        &context_pack,
+        &operation_knowledge,
+        &initial_planner,
+        &run_id,
+        &active_profile,
+    )
+    .await?;
+    let knowledge_route = business_inputs.knowledge_route;
+    let active_products = business_inputs.active_products;
+    let published_soul = business_inputs.published_soul;
+    let sendable_assets = business_inputs.sendable_assets;
+    let reply_prompts = business_inputs.reply_prompts;
+    let reply_context = ReplyContextCache::new();
+    let reviewer_prompts = ReviewerPromptCache::new();
     let selected_chunks =
         select_operation_knowledge_chunks(&operation_knowledge.chunks, &knowledge_route);
     // agent-autonomy-loop W2 / Task 3.4：把 RawAgentDecision::validate_and_promote
@@ -1862,6 +2207,14 @@ async fn run_user_operation_gateway_inner(
         Some(&run_id),
         None,
         first_pass_tier,
+        Some(DecisionRunSnapshot {
+            active_profile: &active_profile,
+            active_products: &active_products,
+            published_soul: published_soul.as_deref(),
+            sendable_assets: &sendable_assets,
+            reply_prompts: &reply_prompts,
+            reply_context: &reply_context,
+        }),
     )
     .await?;
     mark_run_envelope_running(
@@ -1958,6 +2311,14 @@ async fn run_user_operation_gateway_inner(
                     Some(&run_id),
                     None,
                     crate::agent::sufficiency::PromptTier::Full,
+                    Some(DecisionRunSnapshot {
+                        active_profile: &active_profile,
+                        active_products: &active_products,
+                        published_soul: published_soul.as_deref(),
+                        sendable_assets: &sendable_assets,
+                        reply_prompts: &reply_prompts,
+                        reply_context: &reply_context,
+                    }),
                 )
                 .await?
             } else {
@@ -2043,6 +2404,14 @@ async fn run_user_operation_gateway_inner(
                 Some(&run_id),
                 None,
                 target_tier,
+                Some(DecisionRunSnapshot {
+                    active_profile: &active_profile,
+                    active_products: &active_products,
+                    published_soul: published_soul.as_deref(),
+                    sendable_assets: &sendable_assets,
+                    reply_prompts: &reply_prompts,
+                    reply_context: &reply_context,
+                }),
             )
             .await?
         }
@@ -2085,6 +2454,8 @@ async fn run_user_operation_gateway_inner(
     } else {
         "lean"
     };
+    super::run_audit::mark_tier(tier_used);
+    super::run_audit::mark_tier(tier_used);
     write_event_for_account(
         state,
         &contact.workspace_id,
@@ -2204,12 +2575,18 @@ async fn run_user_operation_gateway_inner(
             effective_review_mode(&planner, &decision, &runtime, false),
             Some(&run_id),
             None,
+            Some(&active_profile),
+            None,
         )
         .await?
     } else {
         local_decision_review(&decision, local_budget_ref, &runtime)
     };
     let mut final_decision = decision;
+    // 仅 rewrite 分支会在此提前得到“最终候选”。该分支把 Reviewer 与 Claim Gate
+    // 并行执行，并把结果留到统一 finalize 点消费；普通首稿不投机启动 Claim Gate，
+    // 避免 Reviewer 要求改写时产生一次无用 LLM 调用。
+    let mut precomputed_claim_gate = None;
 
     if final_decision.should_reply && !review_passed(&review, &runtime) && !review.needs_revision {
         // Phase B / B1：`needs_revision=true` 表示 [`route_dual_gate`] 已经
@@ -2238,6 +2615,7 @@ async fn run_user_operation_gateway_inner(
             )
             .await?;
         } else {
+            super::run_audit::mark_rewrite();
             write_decision_review(
                 state,
                 &contact,
@@ -2272,6 +2650,14 @@ async fn run_user_operation_gateway_inner(
                 Some(&run_id),
                 None,
                 crate::agent::sufficiency::PromptTier::Full,
+                Some(DecisionRunSnapshot {
+                    active_profile: &active_profile,
+                    active_products: &active_products,
+                    published_soul: published_soul.as_deref(),
+                    sendable_assets: &sendable_assets,
+                    reply_prompts: &reply_prompts,
+                    reply_context: &reply_context,
+                }),
             )
             .await?;
             let prior_namecard = final_decision.namecard_to_send.clone();
@@ -2285,7 +2671,7 @@ async fn run_user_operation_gateway_inner(
             normalize_decision_runtime(&mut final_decision, &planner);
             final_decision.context_pack_version = Some(next_memory_card_version(&memory));
             final_decision.used_knowledge_ids = route_used_knowledge_ids(&knowledge_route);
-            review = review_decision(
+            let (next_review, claim_gate_evaluation) = review_and_evaluate_claim_gate(
                 state,
                 &contact,
                 &inbound,
@@ -2298,10 +2684,14 @@ async fn run_user_operation_gateway_inner(
                 &selected_chunks,
                 &knowledge_route,
                 "full",
-                Some(&run_id),
-                None,
+                &run_id,
+                &active_profile,
+                &active_products,
+                &reviewer_prompts,
             )
             .await?;
+            review = next_review;
+            precomputed_claim_gate = Some(claim_gate_evaluation);
         }
     }
 
@@ -2318,23 +2708,26 @@ async fn run_user_operation_gateway_inner(
     // Reply 自报 quoted_product_ids 不参与授权。产品表空 → 恒假。
     // G4 #5 收口：报价背书是交易事实的一种消费，统一受 transaction_facts_enabled 闸。
     // 非交易域（情感陪伴）即便误配产品表也不启用目录背书（方向更严格、安全）。
-    let active_products = if active_profile.transaction_facts_enabled {
-        super::entitlements::load_active_products(&state.db, &contact.workspace_id).await
-    } else {
-        Vec::new()
-    };
+    // active_products 已与知识路由并行加载，本 run 后续复用同一目录快照。
     // R5.4 第三条并联背书：该客户是否有生效的 A 类领导授权产品豁免。
     let principal_product_exempted = contact_has_principal_product_exemption(&contact);
-    let priced_from_catalog = ensure_independent_claim_gate(
-        state,
-        &contact,
-        &inbound,
-        &final_decision,
-        &mut review,
-        &active_products,
-        Some(&run_id),
-    )
-    .await;
+    let priced_from_catalog = match precomputed_claim_gate.take() {
+        Some(evaluation) => {
+            apply_independent_claim_gate(evaluation, &final_decision, &mut review, &active_products)
+        }
+        None => {
+            ensure_independent_claim_gate(
+                state,
+                &contact,
+                &inbound,
+                &final_decision,
+                &mut review,
+                &active_products,
+                Some(&run_id),
+            )
+            .await
+        }
+    };
     let outcome = finalize_review_for_send(
         review,
         &mut final_decision,
@@ -2469,8 +2862,8 @@ async fn run_user_operation_gateway_inner(
             if super::review::style_diverged(&prev_style, &new_style) {
                 let direction = format!(
                     "上一轮出站风格指纹为 [{}]，本轮草稿为 [{}]，二者结构差异较大；\
-                     请保留本轮内容要点的同时，向上一轮风格靠拢（长度桶 / emoji / \
-                     问句感叹密度 / 句末符号 / 段落数 至少 3 个轴对齐）。",
+                 请保留本轮内容要点的同时，向上一轮风格靠拢（长度桶 / emoji / \
+                 问句感叹密度 / 句末符号 / 段落数 至少 3 个轴对齐）。",
                     prev_style, new_style
                 );
                 review.needs_revision = true;
@@ -2530,6 +2923,7 @@ async fn run_user_operation_gateway_inner(
             .await?;
         }
         RevisionDecision::Proceed => {
+            super::run_audit::mark_revision();
             let revision_direction = review.revision_direction.trim().to_string();
             // 改写失败/超时回退用：此刻 final_decision 仍是改写前那份已 Approved 的原稿。
             // decide_revision 只在首轮 finalize=Approved 时才返回 Proceed（gates.rs:981），
@@ -2564,6 +2958,14 @@ async fn run_user_operation_gateway_inner(
                 Some(&run_id),
                 None,
                 crate::agent::sufficiency::PromptTier::Full,
+                Some(DecisionRunSnapshot {
+                    active_profile: &active_profile,
+                    active_products: &active_products,
+                    published_soul: published_soul.as_deref(),
+                    sendable_assets: &sendable_assets,
+                    reply_prompts: &reply_prompts,
+                    reply_context: &reply_context,
+                }),
             );
             match tokio::time::timeout(std::time::Duration::from_secs(30), revision_future).await {
                 Ok(Ok((mut revised_decision, revised_promote_risks))) => {
@@ -2573,7 +2975,7 @@ async fn run_user_operation_gateway_inner(
                     revised_decision.used_knowledge_ids =
                         route_used_knowledge_ids(&knowledge_route);
 
-                    let mut second_review = review_decision(
+                    let (mut second_review, second_claim_gate) = review_and_evaluate_claim_gate(
                         state,
                         &contact,
                         &inbound,
@@ -2586,8 +2988,10 @@ async fn run_user_operation_gateway_inner(
                         &selected_chunks,
                         &knowledge_route,
                         "full",
-                        Some(&run_id),
-                        None,
+                        &run_id,
+                        &active_profile,
+                        &active_products,
+                        &reviewer_prompts,
                     )
                     .await?;
 
@@ -2598,16 +3002,12 @@ async fn run_user_operation_gateway_inner(
                     if final_decision.namecard_to_send.is_none() {
                         final_decision.namecard_to_send = prior_namecard;
                     }
-                    let second_priced_from_catalog = ensure_independent_claim_gate(
-                        state,
-                        &contact,
-                        &inbound,
+                    let second_priced_from_catalog = apply_independent_claim_gate(
+                        second_claim_gate,
                         &final_decision,
                         &mut second_review,
                         &active_products,
-                        Some(&run_id),
-                    )
-                    .await;
+                    );
                     // R5.4 第三条并联背书：contact 未变，豁免记录同 contact，重算取同值。
                     let second_principal_product_exempted =
                         contact_has_principal_product_exemption(&contact);
@@ -2681,10 +3081,10 @@ async fn run_user_operation_gateway_inner(
                             final_decision.should_reply = false;
                         }
                         post_revision_summary = Some(format!(
-                            "revision_post_review_failed restored_pre_revision={} reply_text_len={}",
-                            restored,
-                            final_decision.reply_text.chars().count(),
-                        ));
+                        "revision_post_review_failed restored_pre_revision={} reply_text_len={}",
+                        restored,
+                        final_decision.reply_text.chars().count(),
+                    ));
                     }
                 }
                 Ok(Err(err)) => {
@@ -2854,33 +3254,33 @@ async fn run_user_operation_gateway_inner(
         )
         .await?;
         write_agent_run_log_with_finalize(
-            state,
-            &contact,
-            &run_id,
-            trigger.kind(),
-            &blocked_status,
-            &planner,
-            doc! { "refreshed": should_refresh_context, "version": context_pack.get_i32("version").unwrap_or_default() },
-            &knowledge_route,
-            to_document(&final_decision).unwrap_or_default(),
-            to_document(&review).unwrap_or_default(),
-            to_document(&precheck).unwrap_or_default(),
-            None,
-            FinalizeRunLogFields {
-                final_review_status: review.final_review_status.clone(),
-                autonomy_mode: final_decision.autonomy_mode.clone(),
-                conversation_mode: final_decision.conversation_mode.clone(),
-                conversation_mode_reason: final_decision.conversation_mode_reason.clone(),
-                revision_applied,
-                revision_reason: revision_reason.clone(),
-                pre_revision_summary: pre_revision_summary.clone(),
-                post_revision_summary: post_revision_summary.clone(),
-                self_critique: non_empty_option(&Some(final_decision.self_critique.clone())),
-                source_event_id: envelope_source_event_id.clone(),
-                source_kind: envelope_source_kind.clone(),
-            },
-        )
-        .await?;
+        state,
+        &contact,
+        &run_id,
+        trigger.kind(),
+        &blocked_status,
+        &planner,
+        doc! { "refreshed": should_refresh_context, "version": context_pack.get_i32("version").unwrap_or_default() },
+        &knowledge_route,
+        to_document(&final_decision).unwrap_or_default(),
+        to_document(&review).unwrap_or_default(),
+        to_document(&precheck).unwrap_or_default(),
+        None,
+        FinalizeRunLogFields {
+            final_review_status: review.final_review_status.clone(),
+            autonomy_mode: final_decision.autonomy_mode.clone(),
+            conversation_mode: final_decision.conversation_mode.clone(),
+            conversation_mode_reason: final_decision.conversation_mode_reason.clone(),
+            revision_applied,
+            revision_reason: revision_reason.clone(),
+            pre_revision_summary: pre_revision_summary.clone(),
+            post_revision_summary: post_revision_summary.clone(),
+            self_critique: non_empty_option(&Some(final_decision.self_critique.clone())),
+            source_event_id: envelope_source_event_id.clone(),
+            source_kind: envelope_source_kind.clone(),
+        },
+    )
+    .await?;
         // hold→升级请示：被风险闸门拦下的高风险件，按 workspace 升级模式请示领导（只推卡+落台账+写
         // awaiting）。客户安抚占位不在这里——由下方 ensure_customer_acknowledged 守卫统一负责（方案 B 解耦）。
         // 错误只记 warn、不阻断 run、不改终态（与 approved 末尾 trigger_principal_escalation 同纪律）。
@@ -2913,9 +3313,9 @@ async fn run_user_operation_gateway_inner(
             GatewayStatusFinal::BlockedUnverifiedProductClaim
         ) {
             let candidate =
-                crate::knowledge_wiki::gap_signals::GapSignalCandidate::recall_miss_from_product_block(
-                    inbound.content.clone(),
-                );
+            crate::knowledge_wiki::gap_signals::GapSignalCandidate::recall_miss_from_product_block(
+                inbound.content.clone(),
+            );
             if let Err(e) = crate::knowledge_wiki::gap_signals::persist_recall_signal(
                 &state.db,
                 &contact.workspace_id,
@@ -2997,33 +3397,33 @@ async fn run_user_operation_gateway_inner(
         )
         .await?;
         write_agent_run_log_with_finalize(
-            state,
-            &contact,
-            &run_id,
-            trigger.kind(),
-            "gateway_blocked",
-            &planner,
-            doc! { "refreshed": should_refresh_context, "version": context_pack.get_i32("version").unwrap_or_default() },
-            &knowledge_route,
-            to_document(&final_decision).unwrap_or_default(),
-            to_document(&review).unwrap_or_default(),
-            to_document(&final_precheck).unwrap_or_default(),
-            None,
-            FinalizeRunLogFields {
-                final_review_status: review.final_review_status.clone(),
-                autonomy_mode: final_decision.autonomy_mode.clone(),
-                conversation_mode: final_decision.conversation_mode.clone(),
-                conversation_mode_reason: final_decision.conversation_mode_reason.clone(),
-                revision_applied,
-                revision_reason: revision_reason.clone(),
-                pre_revision_summary: pre_revision_summary.clone(),
-                post_revision_summary: post_revision_summary.clone(),
-                self_critique: non_empty_option(&Some(final_decision.self_critique.clone())),
-                source_event_id: envelope_source_event_id.clone(),
-                source_kind: envelope_source_kind.clone(),
-            },
-        )
-        .await?;
+        state,
+        &contact,
+        &run_id,
+        trigger.kind(),
+        "gateway_blocked",
+        &planner,
+        doc! { "refreshed": should_refresh_context, "version": context_pack.get_i32("version").unwrap_or_default() },
+        &knowledge_route,
+        to_document(&final_decision).unwrap_or_default(),
+        to_document(&review).unwrap_or_default(),
+        to_document(&final_precheck).unwrap_or_default(),
+        None,
+        FinalizeRunLogFields {
+            final_review_status: review.final_review_status.clone(),
+            autonomy_mode: final_decision.autonomy_mode.clone(),
+            conversation_mode: final_decision.conversation_mode.clone(),
+            conversation_mode_reason: final_decision.conversation_mode_reason.clone(),
+            revision_applied,
+            revision_reason: revision_reason.clone(),
+            pre_revision_summary: pre_revision_summary.clone(),
+            post_revision_summary: post_revision_summary.clone(),
+            self_critique: non_empty_option(&Some(final_decision.self_critique.clone())),
+            source_event_id: envelope_source_event_id.clone(),
+            source_kind: envelope_source_kind.clone(),
+        },
+    )
+    .await?;
         ensure_customer_acknowledged(
             state,
             &contact,
@@ -3051,22 +3451,22 @@ async fn run_user_operation_gateway_inner(
     if let Some(guard) = &should_abort_send {
         if guard() {
             write_agent_run_log(
-                state,
-                &contact,
-                &run_id,
-                trigger.kind(),
-                "superseded_by_new_inbound",
-                &planner,
-                doc! { "refreshed": should_refresh_context, "version": context_pack.get_i32("version").unwrap_or_default() },
-                &knowledge_route,
-                to_document(&final_decision).unwrap_or_default(),
-                to_document(&review).unwrap_or_default(),
-                to_document(&final_precheck).unwrap_or_default(),
-                None,
-                &envelope_source_event_id,
-                &envelope_source_kind,
-            )
-            .await?;
+            state,
+            &contact,
+            &run_id,
+            trigger.kind(),
+            "superseded_by_new_inbound",
+            &planner,
+            doc! { "refreshed": should_refresh_context, "version": context_pack.get_i32("version").unwrap_or_default() },
+            &knowledge_route,
+            to_document(&final_decision).unwrap_or_default(),
+            to_document(&review).unwrap_or_default(),
+            to_document(&final_precheck).unwrap_or_default(),
+            None,
+            &envelope_source_event_id,
+            &envelope_source_kind,
+        )
+        .await?;
             return Ok(());
         }
     }
@@ -3081,22 +3481,22 @@ async fn run_user_operation_gateway_inner(
     {
         if !crate::tasks::task_claim_is_current(state, claim).await? {
             write_agent_run_log(
-                state,
-                &contact,
-                &run_id,
-                trigger.kind(),
-                "stale_task_claim",
-                &planner,
-                doc! { "refreshed": should_refresh_context, "version": context_pack.get_i32("version").unwrap_or_default() },
-                &knowledge_route,
-                to_document(&final_decision).unwrap_or_default(),
-                to_document(&review).unwrap_or_default(),
-                to_document(&final_precheck).unwrap_or_default(),
-                None,
-                &envelope_source_event_id,
-                &envelope_source_kind,
-            )
-            .await?;
+            state,
+            &contact,
+            &run_id,
+            trigger.kind(),
+            "stale_task_claim",
+            &planner,
+            doc! { "refreshed": should_refresh_context, "version": context_pack.get_i32("version").unwrap_or_default() },
+            &knowledge_route,
+            to_document(&final_decision).unwrap_or_default(),
+            to_document(&review).unwrap_or_default(),
+            to_document(&final_precheck).unwrap_or_default(),
+            None,
+            &envelope_source_event_id,
+            &envelope_source_kind,
+        )
+        .await?;
             return Ok(());
         }
     }
@@ -3114,6 +3514,8 @@ async fn run_user_operation_gateway_inner(
         &final_decision,
         &runtime,
         domain_config.as_ref(),
+        &active_profile,
+        &active_products,
         &ascending_window,
         &run_id,
     )
@@ -3129,6 +3531,9 @@ async fn run_user_operation_gateway_inner(
         &run_id,
     )
     .await?;
+    if !final_decision.should_reply {
+        super::run_audit::mark_no_reply();
+    }
     let decision_review_id = write_decision_review(
         state,
         &contact,
@@ -3236,33 +3641,33 @@ async fn run_user_operation_gateway_inner(
     )
     .await?;
     write_agent_run_log_with_finalize(
-        state,
-        &contact,
-        &run_id,
-        trigger.kind(),
-        if final_decision.should_reply { "outbox_enqueuing" } else { "no_reply" },
-        &planner,
-        doc! { "refreshed": should_refresh_context, "version": context_pack.get_i32("version").unwrap_or_default() },
-        &knowledge_route,
-        to_document(&final_decision).unwrap_or_default(),
-        to_document(&review).unwrap_or_default(),
-        to_document(&final_precheck).unwrap_or_default(),
-        None,
-        FinalizeRunLogFields {
-            final_review_status: review.final_review_status.clone(),
-            autonomy_mode: final_decision.autonomy_mode.clone(),
-            conversation_mode: final_decision.conversation_mode.clone(),
-            conversation_mode_reason: final_decision.conversation_mode_reason.clone(),
-            revision_applied,
-            revision_reason: revision_reason.clone(),
-            pre_revision_summary: pre_revision_summary.clone(),
-            post_revision_summary: post_revision_summary.clone(),
-            self_critique: non_empty_option(&Some(final_decision.self_critique.clone())),
-            source_event_id: envelope_source_event_id.clone(),
-            source_kind: envelope_source_kind.clone(),
-        },
-    )
-    .await?;
+    state,
+    &contact,
+    &run_id,
+    trigger.kind(),
+    if final_decision.should_reply { "outbox_enqueuing" } else { "no_reply" },
+    &planner,
+    doc! { "refreshed": should_refresh_context, "version": context_pack.get_i32("version").unwrap_or_default() },
+    &knowledge_route,
+    to_document(&final_decision).unwrap_or_default(),
+    to_document(&review).unwrap_or_default(),
+    to_document(&final_precheck).unwrap_or_default(),
+    None,
+    FinalizeRunLogFields {
+        final_review_status: review.final_review_status.clone(),
+        autonomy_mode: final_decision.autonomy_mode.clone(),
+        conversation_mode: final_decision.conversation_mode.clone(),
+        conversation_mode_reason: final_decision.conversation_mode_reason.clone(),
+        revision_applied,
+        revision_reason: revision_reason.clone(),
+        pre_revision_summary: pre_revision_summary.clone(),
+        post_revision_summary: post_revision_summary.clone(),
+        self_critique: non_empty_option(&Some(final_decision.self_critique.clone())),
+        source_event_id: envelope_source_event_id.clone(),
+        source_kind: envelope_source_kind.clone(),
+    },
+)
+.await?;
 
     // W4 / Task 5.5：决策落地 = outbox 写入。仅在 finalReviewStatus ∈
     // {approved, revision_applied_approved} 且 should_reply=true 时入队；
@@ -3341,19 +3746,19 @@ async fn run_user_operation_gateway_inner(
                     )
                     .await?;
                 state
-                    .db
-                    .agent_run_logs()
-                    .update_one(
-                        doc! { "run_id": &run_id, "status": "outbox_enqueuing" },
-                        doc! { "$set": {
-                            "status": "superseded_by_new_inbound",
-                            "lifecycle": crate::agent::run_envelope::LIFECYCLE_ABORTED_BY_EXTERNAL_SIGNAL,
-                            "abort_reason": "superseded_by_new_inbound",
-                            "updated_at": DateTime::now(),
-                        } },
-                        None,
-                    )
-                    .await?;
+                .db
+                .agent_run_logs()
+                .update_one(
+                    doc! { "run_id": &run_id, "status": "outbox_enqueuing" },
+                    doc! { "$set": {
+                        "status": "superseded_by_new_inbound",
+                        "lifecycle": crate::agent::run_envelope::LIFECYCLE_ABORTED_BY_EXTERNAL_SIGNAL,
+                        "abort_reason": "superseded_by_new_inbound",
+                        "updated_at": DateTime::now(),
+                    } },
+                    None,
+                )
+                .await?;
                 if let Some(task_context) = task_context.as_ref() {
                     cancel_task(
                         state,
@@ -3957,19 +4362,19 @@ async fn run_user_operation_gateway_inner(
                 )
                 .await?;
             state
-                .db
-                .agent_run_logs()
-                .update_one(
-                    doc! { "run_id": &run_id, "status": "outbox_enqueuing" },
-                    doc! { "$set": {
-                        "status": "stale_task_claim",
-                        "lifecycle": crate::agent::run_envelope::LIFECYCLE_ABORTED_BY_EXTERNAL_SIGNAL,
-                        "abort_reason": "stale_task_claim",
-                        "updated_at": DateTime::now(),
-                    } },
-                    None,
-                )
-                .await?;
+            .db
+            .agent_run_logs()
+            .update_one(
+                doc! { "run_id": &run_id, "status": "outbox_enqueuing" },
+                doc! { "$set": {
+                    "status": "stale_task_claim",
+                    "lifecycle": crate::agent::run_envelope::LIFECYCLE_ABORTED_BY_EXTERNAL_SIGNAL,
+                    "abort_reason": "stale_task_claim",
+                    "updated_at": DateTime::now(),
+                } },
+                None,
+            )
+            .await?;
             write_event_for_account(
                 state,
                 &contact.workspace_id,
@@ -4023,6 +4428,8 @@ async fn run_user_operation_gateway_inner(
         }
     }
     Ok(())
+    }
+    .boxed()
 }
 
 /// 客户发送回执的三态分类。
@@ -5040,15 +5447,19 @@ fn build_observed_dimensions(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn apply_agent_updates(
     state: &AppState,
     contact: &Contact,
     decision: &AgentDecision,
     runtime: &UserRuntimeParameters,
     domain_config: Option<&OperationDomainConfig>,
+    active_profile: &crate::models::DomainProfile,
+    active_products: &[crate::models::Product],
     window: &[ConversationMessage],
     run_id: &str,
 ) -> AppResult<()> {
+    let _stage_timer = super::run_audit::stage_timer("profile_updates");
     let mut set_doc = doc! {
         "updated_at": DateTime::now(),
         "last_agent_run_at": DateTime::now(),
@@ -5073,9 +5484,8 @@ async fn apply_agent_updates(
     // 追加 transaction_facts_enabled 守门，避免"非交易域关了注入、却仍用持有事实改写
     // 客户阶段标签"的行为分裂（此前靠情感域默认不声明该维度间接挡住，非不变量；且
     // project_entitlements 还看 outcome_events，产品表空也可能投影非空，巧合不可依赖）。
-    let active_profile =
-        crate::agent::domain_profile::load_active_domain_profile(&state.db, &contact.workspace_id)
-            .await?;
+    // 复用本 run 在决策前固定的 profile / 产品目录快照，避免画像写侧重复查询，
+    // 并保证 Claim Gate、G1 客观纠偏和维度白名单观察同一版本。
     let mut g1_correction: Option<(String, String)> = None;
     {
         let g1_participates = active_profile.transaction_facts_enabled
@@ -5084,12 +5494,9 @@ async fn apply_agent_updates(
                     && d.kind == crate::agent::entitlements::G1_DIMENSION_KIND
             });
         if g1_participates {
-            let active_products =
-                crate::agent::entitlements::load_active_products(&state.db, &contact.workspace_id)
-                    .await;
             let (entitlements, _total) = crate::agent::entitlements::project_entitlements(
                 &contact.outcome_events,
-                &active_products,
+                active_products,
                 DateTime::now(),
                 crate::agent::entitlements::ENTITLEMENTS_PROMPT_CAP,
             );
@@ -5761,6 +6168,7 @@ async fn apply_operating_memory_update(
     window: &[ConversationMessage],
     run_id: &str,
 ) -> AppResult<()> {
+    let _stage_timer = super::run_audit::stage_timer("memory_updates");
     write_memory_candidates(state, contact, decision, run_id).await?;
     // 子计划2 Task3：逐轮标签判断写 tag_observation 暂定层（不写 confirmed_tags）。
     // 窗口序位约定：`window` 已由调用方反转为 created_at 升序（最早在前，0-based），
@@ -6300,25 +6708,23 @@ pub async fn write_event_for_account(
     summary: &str,
     details: Option<Document>,
 ) -> AppResult<()> {
-    state
-        .db
-        .events()
-        .insert_one(
-            AgentEvent {
-                id: None,
-                workspace_id: workspace_id.to_string(),
-                account_id: account_id.to_string(),
-                contact_wxid: contact_wxid.map(ToString::to_string),
-                kind: kind.to_string(),
-                status: status.to_string(),
-                summary: summary.to_string(),
-                details,
-                created_at: DateTime::now(),
-                dedupe_key: None,
-            },
-            None,
-        )
-        .await?;
+    let event = AgentEvent {
+        id: None,
+        workspace_id: workspace_id.to_string(),
+        account_id: account_id.to_string(),
+        contact_wxid: contact_wxid.map(ToString::to_string),
+        kind: kind.to_string(),
+        status: status.to_string(),
+        summary: summary.to_string(),
+        details,
+        created_at: DateTime::now(),
+        dedupe_key: None,
+    };
+    let event = match super::run_audit::try_buffer_observability_event(event) {
+        Ok(()) => return Ok(()),
+        Err(event) => event,
+    };
+    state.db.events().insert_one(event, None).await?;
     Ok(())
 }
 

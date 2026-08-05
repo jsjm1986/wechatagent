@@ -10,12 +10,13 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use futures::{future::BoxFuture, FutureExt};
 use mongodb::bson::{doc, to_document, DateTime, Document};
 
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    AgentProfile, Contact, ConversationMessage, MessageDirection, OperatingMemory,
-    OperationDomainConfig, OperationKnowledgeChunk, OperationPlaybook,
+    AgentProfile, Contact, ConversationMessage, DomainProfile, MessageDirection, OperatingMemory,
+    OperationDomainConfig, OperationKnowledgeChunk, OperationPlaybook, Product,
 };
 use crate::prompts;
 use crate::routes::AppState;
@@ -290,6 +291,235 @@ pub(crate) fn extract_reaction_analyses(docs: Vec<Document>) -> Vec<Document> {
         .collect()
 }
 
+/// 本次 Gateway run 已固定的业务配置快照。Reply 的 Lean→Full→rewrite/revision
+/// 全程复用它，避免重复读取 Profile/产品目录，也保证同一 run 不混用不同配置版本。
+/// Shadow/Simulation 等非 Gateway 路径传 `None`，继续使用各自的隔离快照或原加载逻辑。
+#[derive(Debug, Clone, Default)]
+struct RelationalReplyContext {
+    reaction_hint_text: String,
+    operator_memory_text: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct FullReplyContext {
+    recent_media_text: String,
+    referral_block: String,
+}
+
+/// Gateway-only lazy context cache. Lean runs only populate the Lean content
+/// asset cell. Relational/Full-only Mongo reads are deferred until the first
+/// matching tier and then reused by rewrite/revision calls in the same run.
+#[derive(Default)]
+pub(crate) struct ReplyContextCache {
+    lean_assets: parking_lot::Mutex<Option<(String, String)>>,
+    relational_assets: parking_lot::Mutex<Option<(String, String)>>,
+    full_assets: parking_lot::Mutex<Option<(String, String)>>,
+    relational: parking_lot::Mutex<Option<RelationalReplyContext>>,
+    full: parking_lot::Mutex<Option<FullReplyContext>>,
+}
+
+impl ReplyContextCache {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    fn context_assets<'a>(
+        &'a self,
+        state: &'a AppState,
+        contact: &'a Contact,
+        tier: crate::agent::sufficiency::PromptTier,
+    ) -> BoxFuture<'a, (String, String)> {
+        async move {
+            let cell = match tier {
+                crate::agent::sufficiency::PromptTier::Lean => &self.lean_assets,
+                crate::agent::sufficiency::PromptTier::Relational => &self.relational_assets,
+                crate::agent::sufficiency::PromptTier::Full => &self.full_assets,
+            };
+            if let Some(cached) = cell.lock().clone() {
+                return cached;
+            }
+            let loaded =
+                load_context_assets(state, &contact.workspace_id, &contact.account_id, tier)
+                    .await
+                    .unwrap_or_default();
+            *cell.lock() = Some(loaded.clone());
+            loaded
+        }
+        .boxed()
+    }
+
+    fn relational<'a>(
+        &'a self,
+        state: &'a AppState,
+        contact: &'a Contact,
+    ) -> BoxFuture<'a, RelationalReplyContext> {
+        async move {
+            if let Some(cached) = self.relational.lock().clone() {
+                return cached;
+            }
+            let reaction_future = load_recent_reaction_hint(state, contact);
+            let operator_future = async {
+                let loaded = if super::budget::current_run_mode() == "shadow" {
+                    load_operator_memory_read_only(
+                        &state.db,
+                        &contact.workspace_id,
+                        &contact.account_id,
+                        &contact.account_id,
+                        5,
+                    )
+                    .await
+                } else {
+                    load_operator_memory(
+                        &state.db,
+                        &contact.workspace_id,
+                        &contact.account_id,
+                        &contact.account_id,
+                        5,
+                    )
+                    .await
+                };
+                loaded
+                    .map(|items| format_operator_memory_for_reply_prompt(&items))
+                    .unwrap_or_default()
+            };
+            let (reaction_hint_text, operator_memory_text) =
+                tokio::join!(reaction_future, operator_future);
+            let loaded = RelationalReplyContext {
+                reaction_hint_text,
+                operator_memory_text,
+            };
+            *self.relational.lock() = Some(loaded.clone());
+            loaded
+        }
+        .boxed()
+    }
+
+    fn full<'a>(
+        &'a self,
+        state: &'a AppState,
+        contact: &'a Contact,
+        assist_on: bool,
+        customer_stage: Option<&'a str>,
+    ) -> BoxFuture<'a, FullReplyContext> {
+        async move {
+            if let Some(cached) = self.full.lock().clone() {
+                return cached;
+            }
+            let media_future = async {
+                let rows = super::send_ledger::recent_sends_for_contact(
+                    state,
+                    &contact.workspace_id,
+                    &contact.account_id,
+                    &contact.wxid,
+                    "media",
+                    10,
+                )
+                .await;
+                super::send_ledger::render_recent_media_lines(&rows)
+            };
+            let referral_future = async {
+                if !assist_on {
+                    return String::new();
+                }
+                let cards = load_referral_cards(state, &contact.workspace_id, &contact.account_id)
+                    .await
+                    .unwrap_or_default();
+                let candidates = super::referral::filter_referral_candidates(
+                    &cards,
+                    customer_stage,
+                    &contact.account_id,
+                );
+                let already = contact
+                    .domain_attributes
+                    .as_ref()
+                    .and_then(|d| d.get_str(crate::models::REFERRED_CARD_ID_ATTR).ok())
+                    .and_then(|cid| {
+                        cards
+                            .iter()
+                            .find(|c| c.id.map(|i| i.to_hex()).as_deref() == Some(cid))
+                            .map(|c| super::referral::AlreadyReferred {
+                                display_name: c.display_name.clone(),
+                                card_id: cid.to_string(),
+                            })
+                    });
+                super::referral::render_referral_lines(&candidates, already.as_ref())
+            };
+            let (recent_media_text, referral_block) = tokio::join!(media_future, referral_future);
+            let loaded = FullReplyContext {
+                recent_media_text,
+                referral_block,
+            };
+            *self.full.lock() = Some(loaded.clone());
+            loaded
+        }
+        .boxed()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ReplyPromptSnapshot {
+    pub system: String,
+    pub system_version: Option<i32>,
+    pub policy: String,
+    pub policy_version: Option<i32>,
+    pub task: String,
+    pub task_version: Option<i32>,
+}
+
+/// 并行加载 Reply 的三层 current PromptTemplate。调用方可把结果固定为 run 快照；
+/// Prompt Shadow 不使用该快照，继续在候选分支中读取并应用 frozen override。
+pub(crate) async fn load_reply_prompt_snapshot(
+    state: &AppState,
+    contact: &Contact,
+) -> AppResult<ReplyPromptSnapshot> {
+    let (system, policy, task) = tokio::join!(
+        prompts::load_prompt_for_contact(
+            &state.db,
+            &contact.workspace_id,
+            "user.reply.system",
+            &contact.wxid,
+            contact.locale.as_deref(),
+        ),
+        prompts::load_prompt_for_contact(
+            &state.db,
+            &contact.workspace_id,
+            "user.reply.policy",
+            &contact.wxid,
+            contact.locale.as_deref(),
+        ),
+        prompts::load_prompt_for_contact(
+            &state.db,
+            &contact.workspace_id,
+            "user.reply.task",
+            &contact.wxid,
+            contact.locale.as_deref(),
+        ),
+    );
+    // 保持原 system → policy → task 的错误优先级。
+    let (system, system_version) = system?;
+    let (policy, policy_version) = policy?;
+    let (task, task_version) = task?;
+    Ok(ReplyPromptSnapshot {
+        system,
+        system_version,
+        policy,
+        policy_version,
+        task,
+        task_version,
+    })
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct DecisionRunSnapshot<'a> {
+    pub active_profile: &'a DomainProfile,
+    pub active_products: &'a [Product],
+    /// `None` only when the profile supplies a non-empty soul override.
+    pub published_soul: Option<&'a str>,
+    pub sendable_assets: &'a [crate::models::ContentAsset],
+    pub reply_prompts: &'a ReplyPromptSnapshot,
+    pub reply_context: &'a ReplyContextCache,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn decide_reply_with_promote(
     state: &AppState,
@@ -308,7 +538,9 @@ pub(crate) async fn decide_reply_with_promote(
     run_id: Option<&str>,
     prompt_override: Option<&PromptOverride>,
     tier: crate::agent::sufficiency::PromptTier,
+    run_snapshot: Option<DecisionRunSnapshot<'_>>,
 ) -> AppResult<(AgentDecision, Vec<String>)> {
+    let _stage_timer = super::run_audit::stage_timer("reply_agent");
     // 渐进式三档（2026-06-23）：按 tier 真实裁剪槽位三组。
     // 恒注入组（soul / 各 prompt 层 / task 契约及其 append / history / deprecated_facts /
     //   请示通道信号 / 客户最新消息 / 客户基础身份字段）——任何档都注入，安全/身份铁律。
@@ -331,25 +563,38 @@ pub(crate) async fn decide_reply_with_promote(
     // conversationMode 允许集合覆盖 runtime；③ H2 维度校验 decision_dimension_kinds；
     // ④ H12 soul_override / methodology_override 替换出厂人格 / 方法论本体。
     let shadow_snapshot = super::budget::current_shadow_evaluation_snapshot();
-    let active_profile = match shadow_snapshot.as_ref() {
+    let active_profile = match run_snapshot {
         Some(snapshot) => snapshot.active_profile.clone(),
-        None => {
-            super::domain_profile::load_active_domain_profile(&state.db, &contact.workspace_id)
-                .await?
-        }
+        None => match shadow_snapshot.as_ref() {
+            Some(snapshot) => snapshot.active_profile.clone(),
+            None => {
+                super::domain_profile::load_active_domain_profile(&state.db, &contact.workspace_id)
+                    .await?
+            }
+        },
     };
     // H12：显式 profile override 优先；否则必须读取该 workspace 唯一 published Soul。
     // 缺失或多指针均 fail-closed，避免静默换成人格不同的内置短句继续执行真实任务。
     let soul = match non_empty_override(active_profile.soul_override.as_deref()) {
         Some(s) => s,
-        None => load_published_soul(state, &contact.workspace_id, "user").await?,
+        None => match run_snapshot.and_then(|snapshot| snapshot.published_soul) {
+            Some(soul) => soul.to_string(),
+            None => load_published_soul(state, &contact.workspace_id, "user").await?,
+        },
     };
     // 文本资产分档注入（2026-06-29）：不再绑死 Full，按当前轮 tier 过滤每条 min_inject_tier。
     // best-effort：DB 故障 → 空串（不阻塞决策，同 reaction_hint / sendable 路径）。
-    let (referable_assets, forbidden_assets) =
-        load_context_assets(state, &contact.workspace_id, &contact.account_id, tier)
+    let (referable_assets, forbidden_assets) = match run_snapshot {
+        Some(snapshot) => {
+            snapshot
+                .reply_context
+                .context_assets(state, contact, tier)
+                .await
+        }
+        None => load_context_assets(state, &contact.workspace_id, &contact.account_id, tier)
             .await
-            .unwrap_or_default();
+            .unwrap_or_default(),
+    };
     // media-asset Task 8 + ③升档盲区修复（2026-06-27）：加载可发送素材（sendable+approved）。
     // **恒加载**（任何档，只需 account_id）：让 Lean 档也能注入「素材线索概览」，使 Reply Agent
     // 在第一程就知道库里有哪些可发素材 + 运营标注的 send_trigger_hint，据此自评本轮客户消息
@@ -357,9 +602,12 @@ pub(crate) async fn decide_reply_with_promote(
     // best-effort：DB 故障 → 空清单（不发素材、不阻塞决策，同 reaction_hint / operator_memory）。
     // customer_stage 取 contact.domain_attributes（与下方画像段同源），缺失 = None →
     // 只命中 target_stages 为空/全阶段的素材。
-    let sendable_assets = load_sendable_assets(state, &contact.workspace_id, &contact.account_id)
-        .await
-        .unwrap_or_default();
+    let sendable_assets = match run_snapshot {
+        Some(snapshot) => snapshot.sendable_assets.to_vec(),
+        None => load_sendable_assets(state, &contact.workspace_id, &contact.account_id)
+            .await
+            .unwrap_or_default(),
+    };
     let current_customer_stage = contact
         .domain_attributes
         .as_ref()
@@ -382,27 +630,9 @@ pub(crate) async fn decide_reply_with_promote(
     } else {
         super::media_send::render_candidate_overview(&sendable_candidates)
     };
-    // 已发素材历史注入（防重发软约束，缺口 5）：查该客户近期已发素材，
-    // 渲染成提示段供 Reply Agent 判重。best-effort，空 = 不加段。
-    // 业务组：仅 Full 档查询；非 Full 跳过 DB、空段。
-    let recent_media_sent = if include_business {
-        super::send_ledger::recent_sends_for_contact(
-            state,
-            &contact.workspace_id,
-            &contact.account_id,
-            &contact.wxid,
-            "media",
-            10,
-        )
-        .await
-    } else {
-        Vec::new()
-    };
-    let recent_media_text = super::send_ledger::render_recent_media_lines(&recent_media_sent);
-    // referral-card Task 8：名片引荐——仅辅助模式开启才加载/过滤/渲染候选名片注入
-    // prompt（默认关 = 空串，对现有全自治账号 prompt 仅多一个空段，字节近等价）。
-    // 辅助模式判定：客户级 override（domain_attributes）> 账号级 assist_mode_enabled。
-    // best-effort：DB 故障 → 空清单 → 不引荐、不阻塞决策（同 sendable 路径）。
+    // Full-only context is lazy in Gateway runs: the first Full pass loads
+    // recent media and optional referral cards in parallel; rewrite/revision
+    // reuse the rendered snapshot. Non-Gateway paths preserve direct loading.
     let assist_override = contact
         .domain_attributes
         .as_ref()
@@ -411,34 +641,63 @@ pub(crate) async fn decide_reply_with_promote(
         domain_config.and_then(|c| c.assist_mode_enabled),
         assist_override,
     );
-    let referral_block = if include_business && assist_on {
-        let cards = load_referral_cards(state, &contact.workspace_id, &contact.account_id)
-            .await
-            .unwrap_or_default();
-        let candidates = super::referral::filter_referral_candidates(
-            &cards,
-            current_customer_stage.as_deref(),
-            &contact.account_id,
-        );
-        // 「已引荐」上下文：从已加载名片中按 referred_card_id 反查 display_name，
-        // 给 Reply Agent 防重推依据（找不到对应名片则不展示历史）。
-        let already = contact
-            .domain_attributes
-            .as_ref()
-            .and_then(|d| d.get_str(crate::models::REFERRED_CARD_ID_ATTR).ok())
-            .and_then(|cid| {
-                cards
-                    .iter()
-                    .find(|c| c.id.map(|i| i.to_hex()).as_deref() == Some(cid))
-                    .map(|c| super::referral::AlreadyReferred {
-                        display_name: c.display_name.clone(),
-                        card_id: cid.to_string(),
-                    })
-            });
-        super::referral::render_referral_lines(&candidates, already.as_ref())
+    let full_context = if include_business {
+        match run_snapshot {
+            Some(snapshot) => {
+                snapshot
+                    .reply_context
+                    .full(state, contact, assist_on, current_customer_stage.as_deref())
+                    .await
+            }
+            None => {
+                let rows = super::send_ledger::recent_sends_for_contact(
+                    state,
+                    &contact.workspace_id,
+                    &contact.account_id,
+                    &contact.wxid,
+                    "media",
+                    10,
+                )
+                .await;
+                let recent_media_text = super::send_ledger::render_recent_media_lines(&rows);
+                let referral_block = if assist_on {
+                    let cards =
+                        load_referral_cards(state, &contact.workspace_id, &contact.account_id)
+                            .await
+                            .unwrap_or_default();
+                    let candidates = super::referral::filter_referral_candidates(
+                        &cards,
+                        current_customer_stage.as_deref(),
+                        &contact.account_id,
+                    );
+                    let already = contact
+                        .domain_attributes
+                        .as_ref()
+                        .and_then(|d| d.get_str(crate::models::REFERRED_CARD_ID_ATTR).ok())
+                        .and_then(|cid| {
+                            cards
+                                .iter()
+                                .find(|c| c.id.map(|i| i.to_hex()).as_deref() == Some(cid))
+                                .map(|c| super::referral::AlreadyReferred {
+                                    display_name: c.display_name.clone(),
+                                    card_id: cid.to_string(),
+                                })
+                        });
+                    super::referral::render_referral_lines(&candidates, already.as_ref())
+                } else {
+                    String::new()
+                };
+                FullReplyContext {
+                    recent_media_text,
+                    referral_block,
+                }
+            }
+        }
     } else {
-        String::new()
+        FullReplyContext::default()
     };
+    let recent_media_text = full_context.recent_media_text;
+    let referral_block = full_context.referral_block;
     // ④升档盲区 + 红线让位修复（2026-06-27）：原单段 assist_hint_text 只在 Lean/Relational
     // 催升档，但实测 AI 升 Full 拿到名片清单的那一刻，被两句恒注入的反向承接强红线碾压、主动
     // 拒绝引荐。这两句强红线（反向承接语义）分别是：
@@ -579,11 +838,15 @@ pub(crate) async fn decide_reply_with_promote(
     // entitlements::render_transaction_facts_sections 纯函数（可单测、双重保险）。
     // 业务组：仅 Full 档加载产品目录/持有投影/疑似成交。非 Full 跳过 DB、三段空串。
     let active_products = if include_business && active_profile.transaction_facts_enabled {
-        match shadow_snapshot.as_ref() {
-            Some(snapshot) => snapshot.active_products.clone(),
-            None => {
-                super::entitlements::load_active_products(&state.db, &contact.workspace_id).await
-            }
+        match run_snapshot {
+            Some(snapshot) => snapshot.active_products.to_vec(),
+            None => match shadow_snapshot.as_ref() {
+                Some(snapshot) => snapshot.active_products.clone(),
+                None => {
+                    super::entitlements::load_active_products(&state.db, &contact.workspace_id)
+                        .await
+                }
+            },
         }
     } else {
         Vec::new()
@@ -601,58 +864,65 @@ pub(crate) async fn decide_reply_with_promote(
     } else {
         (String::new(), String::new(), String::new())
     };
-    // Phase A / A1：reaction_hint 段（最近 3 轮 reaction_analysis）。
-    // 查 decision_reviews 同 (workspace, account, contact_wxid) 下 created_at 倒序
-    // 前 3 条；任意 IO 错误回落空串（best-effort，不阻塞决策）。
-    // 关系组：Lean 跳过 DB、空串占位。
-    let reaction_hint_text = if include_relational {
-        load_recent_reaction_hint(state, contact).await
+    // Relational context is loaded only when a Relational/Full pass first
+    // needs it, then reused by all later passes in this Gateway run.
+    let relational_context = if include_relational {
+        match run_snapshot {
+            Some(snapshot) => snapshot.reply_context.relational(state, contact).await,
+            None => {
+                let reaction_hint_text = load_recent_reaction_hint(state, contact).await;
+                let loaded = if super::budget::current_run_mode() == "shadow" {
+                    load_operator_memory_read_only(
+                        &state.db,
+                        &contact.workspace_id,
+                        &contact.account_id,
+                        &contact.account_id,
+                        5,
+                    )
+                    .await
+                } else {
+                    load_operator_memory(
+                        &state.db,
+                        &contact.workspace_id,
+                        &contact.account_id,
+                        &contact.account_id,
+                        5,
+                    )
+                    .await
+                };
+                RelationalReplyContext {
+                    reaction_hint_text,
+                    operator_memory_text: loaded
+                        .map(|items| format_operator_memory_for_reply_prompt(&items))
+                        .unwrap_or_default(),
+                }
+            }
+        }
     } else {
-        String::new()
+        RelationalReplyContext::default()
     };
-    // Phase A / A2：operator_memory 段。
-    // operator_id 取 account_id —— 在 user-ops 路径下，每个微信号背后是同一个
-    // 人格（运营人员）；admin chat 路径走 KnowledgeChatTask.operator_id 不冲突。
-    // best-effort：DB 故障 → 空串。
-    // 关系组：Lean 跳过 DB、空串占位。
-    let operator_memory_text = if include_relational {
-        let loaded = if super::budget::current_run_mode() == "shadow" {
-            load_operator_memory_read_only(
-                &state.db,
-                &contact.workspace_id,
-                &contact.account_id,
-                &contact.account_id,
-                5,
-            )
-            .await
-        } else {
-            load_operator_memory(
-                &state.db,
-                &contact.workspace_id,
-                &contact.account_id,
-                &contact.account_id,
-                5,
-            )
-            .await
-        };
-        loaded
-            .map(|items| format_operator_memory_for_reply_prompt(&items))
-            .unwrap_or_default()
-    } else {
-        String::new()
+    let reaction_hint_text = relational_context.reaction_hint_text;
+    let operator_memory_text = relational_context.operator_memory_text;
+    // Gateway 在 run 开始时固定三层 Prompt；非 Gateway 路径仍在此并行读取。
+    // Prompt override 始终作用于该分支拿到的原始正文，拼装顺序不变。
+    let loaded_prompts;
+    let reply_prompts = match run_snapshot {
+        Some(snapshot) => snapshot.reply_prompts,
+        None => {
+            loaded_prompts = load_reply_prompt_snapshot(state, contact).await?;
+            &loaded_prompts
+        }
     };
-    // PromptTemplate 只认唯一 current 指针；contact/locale 参数仅保留调用兼容性，
-    // 不再从多条 active 历史版本中隐式分桶。
-    let (system_contract, system_version) = prompts::load_prompt_for_contact(
-        &state.db,
-        &contact.workspace_id,
-        "user.reply.system",
-        &contact.wxid,
-        contact.locale.as_deref(),
-    )
-    .await?;
+    let system_contract = reply_prompts.system.clone();
+    let system_version = reply_prompts.system_version;
+    let policy = reply_prompts.policy.clone();
+    let policy_version = reply_prompts.policy_version;
+    let task_template = reply_prompts.task.clone();
+    let task_version = reply_prompts.task_version;
     if let Some(budget) = super::budget::current_run_budget() {
         budget.record_prompt_version("user.reply.system", system_version);
+        budget.record_prompt_version("user.reply.policy", policy_version);
+        budget.record_prompt_version("user.reply.task", task_version);
     }
     let system_contract = prompt_override
         .map(|o| o.use_frozen_base_if_matches("user.reply.system", system_contract.clone()))
@@ -660,17 +930,6 @@ pub(crate) async fn decide_reply_with_promote(
     let system_contract = prompt_override
         .map(|o| o.append_if_matches("user.reply.system", system_contract.clone()))
         .unwrap_or(system_contract);
-    let (policy, policy_version) = prompts::load_prompt_for_contact(
-        &state.db,
-        &contact.workspace_id,
-        "user.reply.policy",
-        &contact.wxid,
-        contact.locale.as_deref(),
-    )
-    .await?;
-    if let Some(budget) = super::budget::current_run_budget() {
-        budget.record_prompt_version("user.reply.policy", policy_version);
-    }
     // universal-domain-adaptation：reply.policy 链的全部 **prompt 类 profile override**
     // 收敛到 domain_profile.rs 的单一注入点 `apply_reply_policy_prompt_overrides`（C3 轻量
     // 约定）。它按固定顺序串起：①经营公式段单一真相源（H15，剥离遗留内联段→注入 active
@@ -688,17 +947,6 @@ pub(crate) async fn decide_reply_with_promote(
     let policy = prompt_override
         .map(|o| o.append_if_matches("user.reply.policy", policy.clone()))
         .unwrap_or(policy);
-    let (task_template, task_version) = prompts::load_prompt_for_contact(
-        &state.db,
-        &contact.workspace_id,
-        "user.reply.task",
-        &contact.wxid,
-        contact.locale.as_deref(),
-    )
-    .await?;
-    if let Some(budget) = super::budget::current_run_budget() {
-        budget.record_prompt_version("user.reply.task", task_version);
-    }
     let task_template = prompt_override
         .map(|o| o.use_frozen_base_if_matches("user.reply.task", task_template.clone()))
         .unwrap_or(task_template);
@@ -1665,37 +1913,36 @@ pub(crate) async fn load_context_assets(
 ) -> AppResult<(String, String)> {
     use futures::TryStreamExt;
     use mongodb::options::FindOptions;
-    // 可引用 4 类：tier 下推 + limit(16)（与改造前一致）。
-    let mut ref_cursor = state
-        .db
-        .content_assets()
-        .find(
-            build_referable_assets_filter(workspace_id, account_id, tier),
-            FindOptions::builder()
-                .sort(mongodb::bson::doc! { "updated_at": -1 })
-                .limit(16)
-                .build(),
-        )
-        .await?;
-    let mut ref_assets = Vec::new();
-    while let Some(a) = ref_cursor.try_next().await? {
-        ref_assets.push(a);
-    }
-    // 禁语：无 tier、无 limit（安全红线恒全量注入，绝不与可引用争 limit 名额）。
-    let mut forb_cursor = state
-        .db
-        .content_assets()
-        .find(
-            build_forbidden_assets_filter(workspace_id, account_id),
-            FindOptions::builder()
-                .sort(mongodb::bson::doc! { "updated_at": -1 })
-                .build(),
-        )
-        .await?;
-    let mut forb_assets = Vec::new();
-    while let Some(a) = forb_cursor.try_next().await? {
-        forb_assets.push(a);
-    }
+    // 两类查询互不依赖，并行执行。可引用资产保持 tier 下推 + limit(16)；
+    // 禁语保持无 tier、无 limit，安全红线仍全量注入。
+    let referable_future = async {
+        let cursor = state
+            .db
+            .content_assets()
+            .find(
+                build_referable_assets_filter(workspace_id, account_id, tier),
+                FindOptions::builder()
+                    .sort(mongodb::bson::doc! { "updated_at": -1 })
+                    .limit(16)
+                    .build(),
+            )
+            .await?;
+        cursor.try_collect::<Vec<_>>().await
+    };
+    let forbidden_future = async {
+        let cursor = state
+            .db
+            .content_assets()
+            .find(
+                build_forbidden_assets_filter(workspace_id, account_id),
+                FindOptions::builder()
+                    .sort(mongodb::bson::doc! { "updated_at": -1 })
+                    .build(),
+            )
+            .await?;
+        cursor.try_collect::<Vec<_>>().await
+    };
+    let (ref_assets, forb_assets) = tokio::try_join!(referable_future, forbidden_future)?;
     Ok((
         render_referable_assets(ref_assets),
         render_forbidden_assets(forb_assets),

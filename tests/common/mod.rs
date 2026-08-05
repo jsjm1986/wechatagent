@@ -132,7 +132,7 @@ impl TestLlmGenerator {
         self.call_count.load(Ordering::SeqCst)
     }
 
-    fn pop_or_error(&self) -> AppResult<LlmJsonResult> {
+    fn pop_or_error(&self, system: &str) -> AppResult<LlmJsonResult> {
         self.call_count.fetch_add(1, Ordering::SeqCst);
         let mut queue = self.responses.lock().expect("test llm queue");
         if queue.is_empty() {
@@ -140,7 +140,32 @@ impl TestLlmGenerator {
                 "TestLlmGenerator: 没有预排队的响应".to_string(),
             ));
         }
-        Ok(queue.remove(0))
+
+        // Reviewer 与 Independent ClaimGate 在生产路径并行执行，测试响应不能再依赖
+        // tokio 调度恰好让 Reviewer 先取得 FIFO 首项。仅对 ClaimGate 做 schema 定向：
+        // ClaimGate 请求取首个严格 verdict；其它请求若队首是 verdict，则跳到首个非
+        // ClaimGate 响应。其余所有调用仍保持原 FIFO 语义。
+        let is_claim_gate_request = system.contains("independent semantic claim reviewer");
+        let is_claim_gate_response = |result: &LlmJsonResult| {
+            result.value.get("requiresEvidence").is_some()
+                && result.value.get("catalogClaims").is_some()
+                && result.value.get("catalogCoverageComplete").is_some()
+        };
+        let position = if is_claim_gate_request {
+            queue.iter().position(is_claim_gate_response)
+        } else if is_claim_gate_response(&queue[0]) {
+            queue
+                .iter()
+                .position(|result| !is_claim_gate_response(result))
+        } else {
+            Some(0)
+        };
+        let Some(position) = position else {
+            return Err(AppError::External(
+                "TestLlmGenerator: 没有与并发调用 schema 匹配的响应".to_string(),
+            ));
+        };
+        Ok(queue.remove(position))
     }
 }
 
@@ -177,16 +202,16 @@ pub fn independent_claim_gate_verified_knowledge_json() -> Value {
 
 #[async_trait]
 impl LlmProvider for TestLlmGenerator {
-    async fn generate_json(&self, _system: &str, _user: &str) -> AppResult<Value> {
-        Ok(self.pop_or_error()?.value)
+    async fn generate_json(&self, system: &str, _user: &str) -> AppResult<Value> {
+        Ok(self.pop_or_error(system)?.value)
     }
 
     async fn generate_json_with_usage(
         &self,
-        _system: &str,
+        system: &str,
         _user: &str,
     ) -> AppResult<LlmJsonResult> {
-        self.pop_or_error()
+        self.pop_or_error(system)
     }
 
     /// 模拟一个 supports_vision 的 provider：忽略图片字节，从同一队列取下一条
@@ -194,12 +219,12 @@ impl LlmProvider for TestLlmGenerator {
     /// generate_json_with_image 路径（默认实现会报 vision_not_supported）。
     async fn generate_json_with_image(
         &self,
-        _system: &str,
+        system: &str,
         _user: &str,
         _image_base64: &str,
         _mime: &str,
     ) -> AppResult<Value> {
-        Ok(self.pop_or_error()?.value)
+        Ok(self.pop_or_error(system)?.value)
     }
 }
 
@@ -406,6 +431,7 @@ fn test_config(mongodb_uri: String, mongodb_database: String) -> AppConfig {
         agent_reply_max_segments: 4,
         // 渐进式三档开关：测试默认 true（与 PROGRESSIVE_TIER_ENABLED 默认一致，走两程循环）。
         progressive_tier_enabled: true,
+        reaction_gateway_parallel_enabled: false,
         message_debounce_window_ms: 4000,
         task_worker_interval_seconds: 30,
         completeness_cache_ttl_seconds: 300,

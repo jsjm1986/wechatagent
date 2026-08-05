@@ -180,6 +180,7 @@ pub struct EnqueueRequest {
 /// 关键不变量：**永远不发送两次**。即使上层在 retry 路径上再次调用 enqueue，
 /// 由唯一索引兜底；本函数只关心"入队成功 vs 已存在 vs 真错"。
 pub async fn enqueue(state: &AppState, req: EnqueueRequest) -> Result<EnqueueOutcome, OutboxError> {
+    let _stage_timer = super::run_audit::stage_timer("outbox_enqueue");
     // ── 入参校验 ────────────────────────────────────────────────────
     if req.workspace_id.trim().is_empty() {
         return Err(OutboxError::Invalid("workspace_id is empty".to_string()));

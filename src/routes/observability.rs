@@ -19,9 +19,16 @@
 //! - lessons_learned pattern × status 矩阵：已在 [`super::lessons_learned`]
 //!   面板单独出现，不在本接口重复。
 
-use axum::{extract::State, Extension, Json};
+use axum::{
+    extract::{Query, State},
+    Extension, Json,
+};
 use futures::TryStreamExt;
-use mongodb::bson::{doc, DateTime, Document};
+use mongodb::{
+    bson::{doc, Bson, DateTime, Document},
+    options::FindOptions,
+};
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::{
@@ -31,7 +38,7 @@ use crate::{
         LIFECYCLE_STARTED,
     },
     auth::AuthenticatedAdmin,
-    error::AppResult,
+    error::{AppError, AppResult},
     models::{
         ALLOWED_PRINCIPAL_ESCALATION_STATUS, ALLOWED_TASK_STATUS,
         PRINCIPAL_ESCALATION_STATUS_PENDING,
@@ -39,6 +46,227 @@ use crate::{
 };
 
 use super::AppState;
+
+const PERFORMANCE_MAX_ROWS: i64 = 20_000;
+const PERFORMANCE_PATHS: [&str; 6] = [
+    "direct",
+    "escalated",
+    "rewrite",
+    "revision",
+    "no_reply",
+    "manual",
+];
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct PerformanceSummaryQuery {
+    hours: Option<i64>,
+    account_id: Option<String>,
+    path: Option<String>,
+}
+
+#[derive(Default)]
+struct PerformanceBucket {
+    total_ms: Vec<i64>,
+    llm_calls: Vec<i64>,
+    tokens: Vec<i64>,
+    stages: std::collections::BTreeMap<String, Vec<i64>>,
+}
+
+impl PerformanceBucket {
+    fn push(&mut self, row: &Document) {
+        if let Some(total) = nested_i64(row, &["gateway_result", "performance", "totalMs"]) {
+            self.total_ms.push(total.max(0));
+        }
+        if let Some(calls) = document_i64(row, "llm_calls_used") {
+            self.llm_calls.push(calls.max(0));
+        }
+        if let Some(tokens) = document_i64(row, "tokens_used") {
+            self.tokens.push(tokens.max(0));
+        }
+        if let Some(stages) = nested_document(row, &["gateway_result", "performance", "stages"]) {
+            for (name, value) in stages {
+                let Some(stage) = value.as_document() else {
+                    continue;
+                };
+                if let Some(ms) = document_i64(stage, "totalMs") {
+                    self.stages.entry(name.clone()).or_default().push(ms.max(0));
+                }
+            }
+        }
+    }
+
+    fn into_summary_value(mut self) -> Value {
+        let stages = self
+            .stages
+            .iter_mut()
+            .map(|(name, values)| (name.clone(), summarize_values(values)))
+            .collect::<serde_json::Map<String, Value>>();
+        json!({
+            "count": self.total_ms.len(),
+            "totalMs": summarize_values(&mut self.total_ms),
+            "llmCalls": summarize_values(&mut self.llm_calls),
+            "tokens": summarize_values(&mut self.tokens),
+            "stages": stages,
+        })
+    }
+}
+
+/// Read-only Gateway performance baseline. Workspace scope always comes from
+/// the authenticated admin session; callers cannot supply it in the query.
+pub(super) async fn performance_summary(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
+    Query(query): Query<PerformanceSummaryQuery>,
+) -> AppResult<Json<Value>> {
+    let hours = query.hours.unwrap_or(24);
+    if !(1..=168).contains(&hours) {
+        return Err(AppError::BadRequest(
+            "hours must be between 1 and 168".to_string(),
+        ));
+    }
+    let account_id = query
+        .account_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let path_filter = query
+        .path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(path) = path_filter {
+        if !PERFORMANCE_PATHS.contains(&path) {
+            return Err(AppError::BadRequest(format!(
+                "path must be one of: {}",
+                PERFORMANCE_PATHS.join(", ")
+            )));
+        }
+    }
+
+    let as_of_ms = now_ms();
+    let since_ms = as_of_ms.saturating_sub(hours.saturating_mul(60 * 60 * 1000));
+    let mut filter = doc! {
+        "workspace_id": &admin.current_workspace,
+        "created_at": {
+            "$gte": DateTime::from_millis(since_ms),
+            "$lte": DateTime::from_millis(as_of_ms),
+        },
+        "gateway_result.performance.totalMs": { "$exists": true },
+    };
+    if let Some(account_id) = account_id {
+        filter.insert("account_id", account_id);
+    }
+    if let Some(path) = path_filter {
+        filter.insert("gateway_result.performance.path.kind", path);
+    }
+
+    let options = FindOptions::builder()
+        .projection(doc! {
+            "gateway_result.performance": 1,
+            "llm_calls_used": 1,
+            "tokens_used": 1,
+        })
+        .sort(doc! { "created_at": -1 })
+        .limit(PERFORMANCE_MAX_ROWS)
+        .build();
+    let coll = state.db.raw().collection::<Document>("agent_run_logs");
+    let mut cursor = coll.find(filter, options).await?;
+    let mut rows = Vec::new();
+    while let Some(row) = cursor.try_next().await? {
+        rows.push(row);
+    }
+    let truncated = rows.len() as i64 == PERFORMANCE_MAX_ROWS;
+    let summary = aggregate_performance_rows(&rows);
+
+    Ok(Json(json!({
+        "asOf": datetime_string(as_of_ms),
+        "windowStart": datetime_string(since_ms),
+        "windowHours": hours,
+        "workspaceId": admin.current_workspace,
+        "filters": { "accountId": account_id, "path": path_filter },
+        "sampleLimit": PERFORMANCE_MAX_ROWS,
+        "truncated": truncated,
+        "overall": summary.0,
+        "byPath": summary.1,
+    })))
+}
+
+fn aggregate_performance_rows(rows: &[Document]) -> (Value, Value) {
+    let mut overall = PerformanceBucket::default();
+    let mut by_path: std::collections::BTreeMap<String, PerformanceBucket> =
+        std::collections::BTreeMap::new();
+    for row in rows {
+        overall.push(row);
+        let path = nested_str(row, &["gateway_result", "performance", "path", "kind"])
+            .unwrap_or("unknown");
+        by_path.entry(path.to_string()).or_default().push(row);
+    }
+    let by_path = by_path
+        .into_iter()
+        .map(|(path, bucket)| (path, bucket.into_summary_value()))
+        .collect::<serde_json::Map<String, Value>>();
+    (overall.into_summary_value(), Value::Object(by_path))
+}
+
+fn summarize_values(values: &mut [i64]) -> Value {
+    if values.is_empty() {
+        return json!({ "count": 0, "mean": null, "p50": null, "p95": null, "p99": null, "max": null });
+    }
+    values.sort_unstable();
+    let sum = values
+        .iter()
+        .fold(0_i128, |acc, value| acc + *value as i128);
+    json!({
+        "count": values.len(),
+        "mean": sum as f64 / values.len() as f64,
+        "p50": nearest_rank(values, 50),
+        "p95": nearest_rank(values, 95),
+        "p99": nearest_rank(values, 99),
+        "max": values.last().copied(),
+    })
+}
+
+fn nearest_rank(sorted: &[i64], percentile: usize) -> i64 {
+    let rank = (percentile.saturating_mul(sorted.len()) + 99) / 100;
+    sorted[rank.saturating_sub(1).min(sorted.len() - 1)]
+}
+
+fn document_i64(doc: &Document, key: &str) -> Option<i64> {
+    match doc.get(key)? {
+        Bson::Int32(value) => Some(*value as i64),
+        Bson::Int64(value) => Some(*value),
+        Bson::Double(value) => Some(*value as i64),
+        _ => None,
+    }
+}
+
+fn nested_document<'a>(doc: &'a Document, path: &[&str]) -> Option<&'a Document> {
+    let (last, parents) = path.split_last()?;
+    let mut current = doc;
+    for key in parents {
+        current = current.get_document(key).ok()?;
+    }
+    current.get_document(last).ok()
+}
+
+fn nested_i64(doc: &Document, path: &[&str]) -> Option<i64> {
+    let (last, parents) = path.split_last()?;
+    let mut current = doc;
+    for key in parents {
+        current = current.get_document(key).ok()?;
+    }
+    document_i64(current, last)
+}
+
+fn nested_str<'a>(doc: &'a Document, path: &[&str]) -> Option<&'a str> {
+    let (last, parents) = path.split_last()?;
+    let mut current = doc;
+    for key in parents {
+        current = current.get_document(key).ok()?;
+    }
+    current.get_str(last).ok()
+}
 
 /// 24h 滑窗（毫秒）。固定值；admin 只读面板，没必要做参数化。
 const WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
@@ -919,6 +1147,55 @@ async fn aggregate_lessons_learned(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nearest_rank_and_summary_use_stable_percentiles() {
+        let mut values = (1_i64..=100).rev().collect::<Vec<_>>();
+        let summary = summarize_values(&mut values);
+        assert_eq!(summary["count"], 100);
+        assert_eq!(summary["mean"], 50.5);
+        assert_eq!(summary["p50"], 50);
+        assert_eq!(summary["p95"], 95);
+        assert_eq!(summary["p99"], 99);
+        assert_eq!(summary["max"], 100);
+
+        let mut empty = Vec::new();
+        let empty_summary = summarize_values(&mut empty);
+        assert_eq!(empty_summary["count"], 0);
+        assert!(empty_summary["p50"].is_null());
+    }
+
+    #[test]
+    fn performance_rows_group_by_path_and_keep_stage_samples() {
+        let rows = vec![
+            doc! {
+                "llm_calls_used": 3_i32,
+                "tokens_used": 120_i64,
+                "gateway_result": { "performance": {
+                    "totalMs": 900_i64,
+                    "path": { "kind": "direct" },
+                    "stages": { "reply_agent": { "totalMs": 600_i64 } },
+                } },
+            },
+            doc! {
+                "llm_calls_used": 6_i32,
+                "tokens_used": 240_i64,
+                "gateway_result": { "performance": {
+                    "totalMs": 1800_i64,
+                    "path": { "kind": "revision" },
+                    "stages": { "reply_agent": { "totalMs": 1200_i64 } },
+                } },
+            },
+        ];
+        let (overall, by_path) = aggregate_performance_rows(&rows);
+        assert_eq!(overall["count"], 2);
+        assert_eq!(overall["totalMs"]["p50"], 900);
+        assert_eq!(overall["totalMs"]["p95"], 1800);
+        assert_eq!(overall["llmCalls"]["max"], 6);
+        assert_eq!(by_path["direct"]["count"], 1);
+        assert_eq!(by_path["revision"]["tokens"]["p50"], 240);
+        assert_eq!(by_path["revision"]["stages"]["reply_agent"]["p50"], 1200);
+    }
 
     #[test]
     fn window_ms_is_exactly_24_hours() {

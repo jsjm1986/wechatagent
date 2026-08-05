@@ -367,6 +367,71 @@ async fn full_flow_a1_direct_approved_enqueues_outbox() {
         log.revision_applied
     );
 
+    assert_eq!(
+        log.gateway_result.get_bool("allowed").ok(),
+        Some(true),
+        "写入 performance 子文档不得覆盖既有 precheck.allowed"
+    );
+    assert_eq!(
+        log.gateway_result.get_str("status").ok(),
+        Some("allowed"),
+        "写入 performance 子文档不得覆盖既有 precheck.status"
+    );
+    let performance = log
+        .gateway_result
+        .get_document("performance")
+        .expect("Gateway 返回前必须持久化 performance 摘要");
+    assert_eq!(
+        performance
+            .get_document("path")
+            .and_then(|path| path.get_str("kind"))
+            .ok(),
+        Some("direct"),
+        "直发路径必须被稳定分类为 direct"
+    );
+    let flush = performance
+        .get_document("llmLogFlush")
+        .expect("performance 必须包含 LLM audit flush 结果");
+    assert_eq!(flush.get_i64("queued").unwrap(), 3);
+    assert_eq!(flush.get_i64("persisted").unwrap(), 3);
+    assert_eq!(flush.get_i64("failed").unwrap(), 0);
+    assert!(flush.get_bool("batchSucceeded").unwrap());
+    let event_flush = performance
+        .get_document("eventLogFlush")
+        .expect("performance 必须包含 observability event flush 结果");
+    assert!(event_flush.get_i64("queued").unwrap() >= 1);
+    assert_eq!(
+        event_flush.get_i64("persisted").unwrap(),
+        event_flush.get_i64("queued").unwrap()
+    );
+    assert_eq!(event_flush.get_i64("failed").unwrap(), 0);
+    let stages = performance
+        .get_document("stages")
+        .expect("performance 必须包含阶段耗时");
+    for stage in [
+        "run_snapshot",
+        "business_preload",
+        "reply_agent",
+        "reviewer",
+        "claim_gate",
+        "finalize",
+        "outbox_enqueue",
+        "llm_audit_flush",
+    ] {
+        assert!(stages.contains_key(stage), "缺少关键阶段耗时: {stage}");
+    }
+    let persisted_llm_logs = app
+        .state
+        .db
+        .llm_call_logs()
+        .count_documents(doc! { "run_id": &log.run_id }, None)
+        .await
+        .expect("count flushed llm_call_logs");
+    assert_eq!(
+        persisted_llm_logs, 3,
+        "Gateway 返回前必须完成 LLM 审计 flush"
+    );
+
     let outbox = app
         .state
         .db
@@ -464,6 +529,35 @@ async fn full_flow_a2_single_shot_revision() {
             .unwrap_or(false),
         "post_revision_summary 必须非空，实际 {:?}",
         log.post_revision_summary
+    );
+    let performance = log
+        .gateway_result
+        .get_document("performance")
+        .expect("revision Gateway 返回前必须持久化 performance 摘要");
+    assert_eq!(
+        performance
+            .get_document("path")
+            .and_then(|path| path.get_str("kind"))
+            .ok(),
+        Some("revision"),
+        "revision 路径必须被稳定分类为 revision"
+    );
+    let flush = performance
+        .get_document("llmLogFlush")
+        .expect("revision performance 必须包含 LLM flush");
+    assert_eq!(flush.get_i64("queued").unwrap(), 6);
+    assert_eq!(flush.get_i64("persisted").unwrap(), 6);
+    assert_eq!(flush.get_i64("failed").unwrap(), 0);
+    let persisted_llm_logs = app
+        .state
+        .db
+        .llm_call_logs()
+        .count_documents(doc! { "run_id": &log.run_id }, None)
+        .await
+        .expect("count revision flushed llm_call_logs");
+    assert_eq!(
+        persisted_llm_logs, 6,
+        "revision Gateway 返回前必须完成 6 条 LLM 审计 flush"
     );
 
     let outbox = app
