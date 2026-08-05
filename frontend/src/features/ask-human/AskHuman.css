@@ -2,26 +2,51 @@
    绝不命名为 .module.css 做副作用导入——Rollup tree-shake 会删光，整频道白板。
    色值/圆角/描边统一走 tokens.css 变量，禁止硬编码主色。基础可用即可，精细视觉留 Task 12。 */
 
+/* 外壳：与其余频道一致的 .page 语义（grid + 18px 间距）。
+   padding 与宽度交给 Shell 的 .main（Shell.module.css:199 已有 32px 44px），
+   此处不再自设 padding / max-width——原先两者叠加使内容区偏窄，
+   920px 也是全项目唯一自设 max-width 的频道，正是 9 个 chip 折行的直接原因。 */
 .askHumanChannel {
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-  padding: 24px 28px 40px;
-  max-width: 920px;
+  display: grid;
+  gap: 18px;
 }
 
+/* 白卡：视觉规格对齐 Quality/Autonomy/Campaign 等六个频道的 .panel，
+   但类名必须带 askHuman 前缀——本文件是 plain CSS 全局作用域，
+   而全局 .panel（styles.css:423）正被 user-ops 频道使用，占名会相互污染。 */
+.askHumanPanel {
+  border-radius: var(--r-lg);
+  padding: 22px 26px 20px;
+  background: var(--surface-card);
+  border: 1px solid var(--hairline);
+  box-shadow: 0 14px 34px -24px rgba(20, 30, 60, 0.3),
+    inset 0 1px 1px rgba(255, 255, 255, 0.9);
+}
+
+/* 卡头：左侧待处理总数，右侧按钮组。Shell 已有大页头，此处不重复写标题。
+   按钮组靠 margin-left:auto 推到右端，而非 space-between——后者在计数不可用
+   （total 为 null，左侧不渲染）时会把按钮组当唯一子元素推到左边，位置随数据跳动。 */
+.askHumanPanelHead {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-bottom: 16px;
+}
+.askHumanPanelHeadCount {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink-2);
+  letter-spacing: -0.2px;
+}
+
+/* 按钮组容器：保留 askHumanHeader 类名不改。
+   「刷新」按钮无 className，全靠下方 `.askHumanHeader button` 规则兜样式；
+   改名会让它掉回 styles.css:71 的全局 38px 纯蓝基线。 */
 .askHumanHeader {
   display: flex;
   align-items: center;
-  justify-content: flex-end;
-  gap: 16px;
-}
-.askHumanHeader h1 {
-  margin: 0;
-  font-size: 19px;
-  font-weight: 650;
-  letter-spacing: -0.2px;
-  color: var(--ink-1);
+  gap: 8px;
+  margin-left: auto;
 }
 .askHumanHeader button {
   font: inherit;
@@ -64,9 +89,13 @@
   border: 1px solid rgba(255, 204, 0, 0.4);
 }
 
-/* summary：来源计数 chip 行，点击切源 */
+/* 工具栏：来源计数 chip 行，点击切源。命名对齐 Quality/Autonomy 的 .toolbar 惯例。
+   9 个 chip 在收紧 padding 后实测约 875px，1280px 视口可用 910px 可单排。
+   flex-wrap 保留但只作更窄视口的溢出兜底，不再是常态（原先 920px 容器下必然折行）。 */
+.askHumanToolbar,
 .askHumanSummary {
   display: flex;
+  align-items: center;
   flex-wrap: wrap;
   gap: 8px;
 }
@@ -74,10 +103,10 @@
   font: inherit;
   font-size: 12px;
   font-weight: 600;
-  padding: 6px 12px;
+  padding: 6px 10px;
   border-radius: 999px;
   cursor: pointer;
-  background: var(--surface-1, #fff);
+  background: var(--surface-card);
   border: 1px solid var(--hairline);
   color: var(--ink-2);
   transition: background 0.18s, color 0.18s, border-color 0.18s;
@@ -144,7 +173,7 @@
   border: 1px solid var(--hairline);
   border-radius: var(--r-md, 12px);
   padding: 16px;
-  background: var(--surface-1, #fff);
+  background: var(--surface-card);
 }
 .resolvedEscHead {
   display: flex;
@@ -187,12 +216,13 @@
   color: var(--ink-1);
 }
 
-/* 折叠式收件箱行 */
+/* 折叠式收件箱行。行间距由父容器 .reviewQueueList 的 gap 统一提供，
+   此处不再自带 margin-bottom——两者叠加会让行距变成 20px，且末行下方多出空白。
+   （本文件 .resolvedEscList / .resolvedEscRow 就是仅靠 gap 的正确范例。） */
 .inboxRow {
   border: 1px solid var(--hairline);
   border-radius: var(--r-md, 12px);
-  background: var(--surface-1, #fff);
-  margin-bottom: 10px;
+  background: var(--surface-card);
 }
 .inboxRowHead {
   display: flex;
@@ -494,3 +524,27 @@
 }
 .lessonPromoteLoading,
 .lessonPromoteDone { font-size: 12.5px; color: var(--ink-3, var(--ink-2)); padding: 8px 0; }
+
+/* ReviewQueue 的容器 class 原先在全库无任何 CSS 定义（裸文字/无间距）。
+   此处补最小样式。ReviewQueue 全库只有本频道一个真实消费者
+   （knowledge/steward.tsx 中的 ReviewQueueItem 只是同名类型，未 import 组件），
+   故这些规则不外溢。空态本身改由共享 EmptyState 组件渲染，不在此定义。 */
+.reviewQueueList {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.reviewQueueLoading {
+  padding: 24px 14px;
+  font-size: 12.5px;
+  color: var(--ink-3);
+  text-align: center;
+}
+.reviewQueueError {
+  padding: 11px 14px;
+  border-radius: var(--r-sm);
+  font-size: 12.5px;
+  color: var(--color-blocked);
+  background: var(--fill-blocked);
+  border: 1px solid rgba(255, 69, 58, 0.3);
+}

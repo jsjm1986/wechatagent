@@ -3,6 +3,7 @@ import { ConfirmProvider } from "../../components/ui/ConfirmDialog";
 import { ToastProvider } from "../../components/ui/Toast";
 import { useInboxStore } from "../../stores/inboxStore";
 import { ReviewQueue, type RowCtx } from "../../components/review/ReviewQueue";
+import { EmptyState } from "../../components/ui/EmptyState";
 import { type InboxItem } from "../../lib/inboxApi";
 import { EscalationInline } from "./inline/EscalationInline";
 import { SimpleApproveReject } from "./inline/SimpleApproveReject";
@@ -177,100 +178,112 @@ function AskHumanView() {
 
   return (
     <div className="askHumanChannel">
-      <header className="askHumanHeader">
-        <div className="askHumanHeaderActions">
-          <button
-            type="button"
-            className={
-              showResolved ? "askHumanViewToggle askHumanViewToggle--active" : "askHumanViewToggle"
-            }
-            onClick={() => setShowResolved((v) => !v)}
-          >
-            {showResolved ? "待处理" : "已裁决历史"}
-          </button>
-          {!showResolved && (
-            <button type="button" onClick={() => refreshAll()} disabled={loading}>
-              刷新
+      <div className="askHumanPanel">
+        <div className="askHumanPanelHead">
+          {/* total 为 null 表示计数不可用，此时不渲染——显示「待处理 0 项」是错误信息。
+              按钮组靠 margin-left:auto 恒定贴右，故这里无需空元素占位。 */}
+          {summary?.total != null && (
+            <span className="askHumanPanelHeadCount">待处理 {summary.total} 项</span>
+          )}
+          <div className="askHumanHeaderActions askHumanHeader">
+            <button
+              type="button"
+              className={
+                showResolved ? "askHumanViewToggle askHumanViewToggle--active" : "askHumanViewToggle"
+              }
+              onClick={() => setShowResolved((v) => !v)}
+            >
+              {showResolved ? "待处理" : "已裁决历史"}
             </button>
-          )}
-        </div>
-      </header>
-
-      {showResolved ? (
-        <ResolvedEscalations />
-      ) : (
-        <>
-          {fatalError && (
-            <div className="askHumanFatal">加载失败（显示上次数据）：{fatalError}</div>
-          )}
-          {errors.length > 0 && (
-            <div className="askHumanSourceErrors">
-              {errors.length} 个来源暂时不可用：{errors.map((e) => SOURCE_META.find((m) => m.source === e.source)?.label ?? e.source).join("、")}
-            </div>
-          )}
-          {summary && summary.status !== "complete" && (
-            <div className="askHumanSourceErrors">
-              待办计数部分不可用：
-              {summaryErrors
-                .map((e) => SOURCE_META.find((m) => m.source === e.source)?.label ?? e.source)
-                .join("、") || "全部来源"}
-            </div>
-          )}
-
-          <div className="askHumanSummary">
-            {summary &&
-              SOURCE_META.map(({ summaryKey, source, label }) => {
-                const count = summary.counts[summaryKey];
-                const unavailable = count == null || unavailableSources.has(source);
-                return (
-                <button
-                  key={source}
-                  type="button"
-                  className={
-                    activeSource === source
-                      ? "askHumanSummaryChip askHumanSummaryChip--active"
-                      : "askHumanSummaryChip"
-                  }
-                  onClick={() => {
-                    const next = activeSource === source ? null : source;
-                    setActiveSource(next); // 同步改 store.activeSource，load() 不传参时读它
-                    setRefreshNonce((n) => n + 1); // 触发 ReviewQueue 重 fetch（经 load 读新 activeSource）
-                  }}
-                >
-                  {label}: {unavailable ? "不可用" : count}
-                </button>
-                );
-              })}
+            {!showResolved && (
+              <button type="button" onClick={() => refreshAll()} disabled={loading}>
+                刷新
+              </button>
+            )}
           </div>
+        </div>
 
-          <ReviewQueue<InboxItem>
-            key={activeSource ?? "all"}
-            refreshToken={refreshNonce}
-            fetchItems={fetchItems}
-            getId={(i) => `${i.source}:${i.id}`}
-            renderItem={(item, ctx) => {
-              const meta = SOURCE_META.find((m) => m.source === item.source);
-              return (
-                <InboxRow
-                  badge={{ label: meta?.label ?? item.source, tone: SOURCE_TONE[item.source] ?? "neutral" }}
-                  title={item.title}
-                  preview={item.summary ?? ""}
-                  tag={
-                    item.source === "knowledge_review" && item.integrityStatus === "needs_human_audit"
-                      ? { label: "AI预审通过·待复核", tone: "held" }
-                      : undefined
-                  }
-                >
-                  {item.actionKind === "rich"
-                    ? renderRich(item, () => refreshAll())
-                    : renderInline(item, ctx)}
-                </InboxRow>
-              );
-            }}
-            emptyText="暂无待处理项"
-          />
-        </>
-      )}
+        {showResolved ? (
+          <ResolvedEscalations />
+        ) : (
+          <>
+            {fatalError && (
+              <div className="askHumanFatal">加载失败（显示上次数据）：{fatalError}</div>
+            )}
+            {errors.length > 0 && (
+              <div className="askHumanSourceErrors">
+                {errors.length} 个来源暂时不可用：{errors.map((e) => SOURCE_META.find((m) => m.source === e.source)?.label ?? e.source).join("、")}
+              </div>
+            )}
+            {summary && summary.status !== "complete" && (
+              <div className="askHumanSourceErrors">
+                待办计数部分不可用：
+                {summaryErrors
+                  .map((e) => SOURCE_META.find((m) => m.source === e.source)?.label ?? e.source)
+                  .join("、") || "全部来源"}
+              </div>
+            )}
+
+            <div className="askHumanToolbar askHumanSummary">
+              {summary &&
+                SOURCE_META.map(({ summaryKey, source, label }) => {
+                  const count = summary.counts[summaryKey];
+                  const unavailable = count == null || unavailableSources.has(source);
+                  return (
+                    <button
+                      key={source}
+                      type="button"
+                      className={
+                        activeSource === source
+                          ? "askHumanSummaryChip askHumanSummaryChip--active"
+                          : "askHumanSummaryChip"
+                      }
+                      onClick={() => {
+                        const next = activeSource === source ? null : source;
+                        setActiveSource(next); // 同步改 store.activeSource，load() 不传参时读它
+                        setRefreshNonce((n) => n + 1); // 触发 ReviewQueue 重 fetch（经 load 读新 activeSource）
+                      }}
+                    >
+                      {label}: {unavailable ? "不可用" : count}
+                    </button>
+                  );
+                })}
+            </div>
+
+            <ReviewQueue<InboxItem>
+              key={activeSource ?? "all"}
+              refreshToken={refreshNonce}
+              fetchItems={fetchItems}
+              getId={(i) => `${i.source}:${i.id}`}
+              renderItem={(item, ctx) => {
+                const meta = SOURCE_META.find((m) => m.source === item.source);
+                return (
+                  <InboxRow
+                    badge={{ label: meta?.label ?? item.source, tone: SOURCE_TONE[item.source] ?? "neutral" }}
+                    title={item.title}
+                    preview={item.summary ?? ""}
+                    tag={
+                      item.source === "knowledge_review" && item.integrityStatus === "needs_human_audit"
+                        ? { label: "AI预审通过·待复核", tone: "held" }
+                        : undefined
+                    }
+                  >
+                    {item.actionKind === "rich"
+                      ? renderRich(item, () => refreshAll())
+                      : renderInline(item, ctx)}
+                  </InboxRow>
+                );
+              }}
+              emptyText={
+                <EmptyState
+                  title="暂无待处理项"
+                  hint="AI 自主运行中，需要决策或审核的事项会自动出现在这里。"
+                />
+              }
+            />
+          </>
+        )}
+      </div>
     </div>
   );
 }
