@@ -25,7 +25,19 @@
 本轮确认 **5 条需处理**：2 个 S2 确认缺陷（B1、B2）、1 个 S2 确认风险（B3）、
 2 个 S3 确认风险（B4、B5）；另有 1 条待产品确认的设计选择（B6）。
 
-最高优先级是 `B2`：知识 Agent 已明确弃答或 citation 校验失败后，路由仍会从整个
+**当前状态（2026-08-05 修复轮）**：`B1`、`B2`、`B3`、`B5` 已修复并逐条反证；
+`B4` 与 `B6` 保留待产品定参，未改代码。
+
+| 条目 | 定性 | 状态 |
+| --- | --- | --- |
+| B1 · 被动分段消耗主动触达配额 | ✅ S2 | 🧹 已修复 |
+| B2 · 无关 fallback 满足产品背书硬闸 | ✅ S2 | 🧹 已修复 |
+| B3 · 畸形 anchor 使知识永久不可引用 | 🟡 S2 | 🧹 已修复 |
+| B4 · 发送节奏不随文本长度变化 | 🟡 S3 | ⏸ 待产品定参 |
+| B5 · `recall_miss` 混合三种真因 | 🟡 S3 | 🧹 已修复 |
+| B6 · 静默时段零回应约 10h15m | 🧭 | ⏸ 待产品决策 |
+
+`B2` 原为最高优先：知识 Agent 已明确弃答或 citation 校验失败后，路由仍会从整个
 verified corpus 无相关度下限地回填 top-5。进入 Full 档或 Full 改写后，这些回填 ID
 会成为 `used_knowledge_ids`；确定性产品背书闸只检查它们是否 verified/未过期，
 不检查与 query 或回复 claim 的相关性。因此无关知识可能满足原本用于防止无依据产品声明的硬闸。
@@ -42,7 +54,7 @@ segment cap，但同时共享一个总 daily cap。
 
 ---
 
-## B1 · 被动分段回复消耗主动触达配额，后续跟进被拦 ✅ 确认缺陷（S2）
+## B1 · 被动分段回复消耗主动触达配额，后续跟进被拦 🧹 已修复（原 ✅ 确认缺陷 S2）
 
 **位置**：`src/agent/gateway.rs:4136-4152,4294-4300,4623-4647`、
 `src/models.rs:4729-4731`、`src/config.rs:459-464`
@@ -77,9 +89,36 @@ segment cap，但同时共享一个总 daily cap。
 - 一次主动 FollowUp 即使拆成多段，也只消耗一次逻辑触达；
 - 多次主动 FollowUp 达到上限后正确拦截。
 
+### 🧹 修复实现（2026-08-05）
+
+计数事实源从 `conversation_messages` 换成 `agent_send_outbox`，并按 `run_id` 去重：
+
+- 新增 `PROACTIVE_TOUCH_SOURCE_KINDS`（`gateway.rs:4637`）——只含 `follow_up` / `follow_up_task`；
+  `inbound` / `inbound_message` / `manual_send` 全部排除，恢复闸门自己声明的 Inbound 豁免。
+- 新增 `proactive_touch_filter`（`gateway.rs:4670`），`daily_touch_count`（`:4692`）改用
+  `distinct("run_id", ...)` → 一次逻辑触达恒计 1 次，分段不再放大配额。
+- 口径按保守方向定：只数已跨远端边界的 `sent` + `delivery_unknown`（后者可能已送达，
+  宁可少发一次主动触达）；时间窗对 `sent_at` 与 `send_started_at` 取 `$or`，因为
+  `delivery_unknown` 可能无 `sent_at` 但必有 `send_started_at`。
+- 补索引 `outbox_contact_proactive_touch_idx`（`db/indexes.rs:229`）——新查询形状原先无索引支撑。
+
+**为何按 outbox 统计不漏数**：已验证它是唯一发送路径——文本走 `send_outbound_message`、
+媒体走 `send_outbound_media`、名片走 `referral`，三者都只由 dispatcher 调用。
+
+**已知残余不精确**（比修复前小得多，未在本次收窄）：relay 转述与静默时段「醒来任务」
+（`deferred_inbound_reply`）的 `source_kind` 也是 follow_up 类，语义上却是被动应答，会各占
+1 次额度。二者都不常见，且现在**只计 1 次**（不再被分段放大）。彻底区分需在 outbox 上
+持久化更细来源标记，属独立改动。
+
+**验证**：`proactive_touch_filter_excludes_passive_and_manual_sources`（`gateway.rs:6654`）、
+`proactive_touch_filter_has_no_segment_dimension`（`:6714`）、
+`outbox_proactive_touch_index_matches_daily_limit_filter`（`db/indexes.rs:1709`，把索引键顺序
+与 filter 等值字段绑死，防两侧漂移）。反向验证：临时把 `"inbound"` 加回闭集 → 第一条立即
+FAILED，恢复后通过。
+
 ---
 
-## B2 · 无关 fallback 知识可在 Full 档满足产品背书硬闸 ✅ 确认缺陷（S2，最高优先）
+## B2 · 无关 fallback 知识可在 Full 档满足产品背书硬闸 🧹 已修复（原 ✅ 确认缺陷 S2，最高优先）
 
 **位置**：`src/agent/knowledge_router.rs:568-668,813-819`、
 `src/agent/knowledge_agent.rs:1054-1080`、`src/agent/gateway.rs:1800-1834,1907-1960,2146-2153,2285,2571-2572`、
@@ -120,9 +159,48 @@ segment cap，但同时共享一个总 daily cap。
 **建议测试**：构造一个与 query 完全无关的 verified corpus，强制进入 Full，断言 fallback IDs
 不能使产品声明通过 `blocked_unverified_product_claim`；再用真实相关且 citation/anchor 有效的知识作正例。
 
+### 🧹 修复记录（2026-08-05）
+
+**采纳了建议 1、2，未采纳建议 3、4** —— 只切断「回填 → 授权证据」这一条路径，不动 coverage
+语义与导航行为。
+
+**改动**：
+
+- `src/agent/types.rs:1401` 新增 `KnowledgeRouteResult.selected_chunks_are_fallback`，把
+  `selected_chunk_ids` 原先混在一起的两种语义拆开：**导航候选**（喂 prompt 当参考材料，
+  回填可以承担）与**可授权证据**（喂 `used_knowledge_ids` → 产品背书硬闸，回填不能承担）。
+  该字段只由服务端在 `route_operation_knowledge_inner` 内赋值（该结构体无 LLM 反序列化路径，
+  已 `rg` 确认），LLM 无法伪造；缺字段反序列化为 `false`，历史 route 文档按「非回填」处理。
+- `src/agent/knowledge_router.rs:610-711` 把三元组扩成四元，在 fallback 分支置 `true`。
+- `src/agent/knowledge_router.rs:845-861` 在 `route_used_knowledge_ids` 加守卫：
+  `selected_chunks_are_fallback = true` 时直接返回空。
+
+**为何守卫放在 `route_used_knowledge_ids`**：三处调用点（`gateway.rs:2152` 有 tier 守卫、
+`:2285` 与 `:2572` 无守卫）**全部**经过这一个漏斗函数，在此拦一次即覆盖两条无守卫路径，
+无需分别打补丁，也不会遗漏未来新增的调用点。
+
+**为何未采纳建议 3（相关度下限）**：`tests/knowledge_router_fallback_e2e.rs` 两个金标测试的
+query（「随便问个问题」「查个东西」）与 corpus 标题零词面重叠，却断言 `coverage=weak` + 回填
+top-5 —— 它们锁的正是「非空 corpus 下必须回填、必须标 weak」这个产品语义。加下限会直接
+打破这两条金标，属于改产品行为（运营看到的 coverage 分档会变），超出「修安全漏洞」范围，
+留待产品决策。故 B2 已消除的是**结构性架空硬闸**这一项；`missing`/`weak` 语义失真仍在，
+见下方「残留」。
+
+**残留（未修，已知）**：真正零相关时 coverage 仍标 `weak` 而非 `missing`，
+`should_force_full_on_missing` 因此不会强升 Full 档，运营也仍看不到准确的缺失状态。
+这一项与建议 3 绑定，需产品先定 coverage 分档语义。
+
+**验证**：`cargo test --lib` 2366→2379 passed；新增 3 条测试
+（`knowledge_router.rs`：`fallback_navigation_ids_never_become_authorizing_evidence`、
+`agent_cited_ids_remain_authorizing_evidence`、
+`legacy_route_without_fallback_flag_defaults_to_authorizing`）。
+**反向验证有效**：临时移除 `:854` 守卫 → 第一条立即 FAILED；恢复后通过。
+金标未打破：`DOCKER_AVAILABLE=1 cargo test --test knowledge_router_fallback_e2e -- --ignored`
+→ 3 passed。
+
 ---
 
-## B3 · 畸形 anchor 可通过 verify，并使 verified 知识持续无法引用 🟡 确认风险（S2）
+## B3 · 畸形 anchor 可通过 verify，并使 verified 知识持续无法引用 🧹 已修复（原 🟡 确认风险 S2）
 
 **位置**：`src/routes/knowledge/mod.rs:669-717,963-1000,1114-1138,1228-1245`、
 `src/routes/knowledge/verify.rs:66-123`、`src/agent/knowledge_agent.rs:1592-1682`
@@ -147,6 +225,47 @@ segment cap，但同时共享一个总 daily cap。
 **建议修复**：Verify 事务内验证 anchor schema 和父文档一致性，至少包括非空 `sourceQuote`、
 合法 offset、quote hash、document identity，并为历史 `quote`/`sourceQuote` 形态提供迁移或兼容。
 可复用写入侧 `fuzzy_locate_quote` 的归一化能力，但不能把模糊匹配放宽到无法证明原文出处。
+
+### 🧹 修复记录（2026-08-05）
+
+**已做**：让写入侧 D2 闸与读取侧引用契约收敛到同一个谓词。
+
+1. `models.rs:1915` `anchor_is_citable` + `:1926` `chunk_has_citable_anchor` —— 两侧共享的单一
+   真相源（放 `models` 是因为写入侧 `routes::knowledge` 与读取侧 `agent::knowledge_agent`
+   彼此不可见）。判据与 `quote_is_chunk_evidence` 一致：anchor 自身含非空 `sourceQuote`。
+2. `routes/knowledge/mod.rs:1262` 新增 `chunk_verify_gate_reason_for(source_quote, source_anchors)`
+   —— **收数据本身而非两个 `bool`**，谓词在函数内部算，调用方无法再传错口径。
+   `verify.rs:33` 的事务内闸改走这个入口。
+3. `routes/knowledge/mod.rs:1123` 修根因：`apply_chunk_integrity` 触发重建的条件从
+   「数组为空」改为「没有**可引用**的 anchor」。旧条件下调用方提交的畸形 anchor（只带
+   `startOffset` 之类）永不被重算，现在会照常调 `source_anchor_for_quote` 补齐。
+   `:1130` 的 `has_anchor` 同步改用新谓词，不再给出「有锚点」的乐观 `confidence=90`。
+
+**未做**：anchor 的 offset / quoteHash / documentId 一致性校验，以及 CJK 模糊匹配放宽。
+前者属独立的 schema 校验工程，后者需要真实 LLM 样本先量化误拒率——都不在本次收窄范围。
+
+**测试**：`models.rs` 3 条（谓词语义）+ `routes/knowledge/mod.rs` 3 条（闸的用法）。
+反向验证：把 `verify.rs` 的闸退回 `!source_anchors.is_empty()` →
+`verify_gate_rejects_anchor_without_source_quote` 与
+`verify_gate_treats_empty_and_all_malformed_anchors_alike` FAILED；恢复后通过。
+
+> **过程中的一个设计教训**（值得留档）：第一次反向验证时，退回旧口径后 **2372 个测试全绿**，
+> 没有任何一条抓住它。原因是闸的签名收两个 `bool` —— 调用方算错谓词，测试无从捕获。
+> 这才加了 `chunk_verify_gate_reason_for` 这个收数据的入口，让错误口径**无法表达**。
+> 结论：把「谓词计算」和「谓词消费」放在同一个函数内，比补测试更能防止这类漂移。
+
+**顺带修正的测试 fixture**：`tests/chunk_batch_ops.rs::verifiable_chunk` 构造的 anchor 带
+`documentId`/`startLine`/`endLine`/`quoteHash` 但**无** `sourceQuote` —— 正是本条描述的畸形形态。
+修复后被正确拒绝，导致 3 条测试失败。已核实生产 `source_anchor_for_quote`（`mod.rs:992`）
+**恒写** `sourceQuote`，故该 fixture 不代表生产形态，是测试数据本身不合规；补齐后 11 条全通过。
+
+**复现**：
+```bash
+cargo test --lib anchor_citability_tests -- --nocapture
+cargo test --lib verify_gate_ -- --nocapture
+DOCKER_AVAILABLE=1 cargo test --test chunk_batch_ops -- --ignored   # 11 passed
+DOCKER_AVAILABLE=1 cargo test --test integrity_report_d2_e2e -- --ignored
+```
 
 ---
 
@@ -173,7 +292,7 @@ segment cap，但同时共享一个总 daily cap。
 
 ---
 
-## B5 · `recall_miss` 混合知识缺失与引用格式失败 🟡 确认风险（S3）
+## B5 · `recall_miss` 混合知识缺失与引用格式失败 🧹 已修复（原 🟡 确认风险 S3）
 
 **位置**：`src/agent/knowledge_agent.rs:285-350,1837-1924`、
 `src/knowledge_wiki/gap_signals.rs:400-477,650-752,1385-1571`
@@ -196,6 +315,45 @@ segment cap，但同时共享一个总 daily cap。
 **建议修复**：在过滤 citation 时保留结构化拒绝原因，至少区分 `knowledge_missing`、
 `citation_format_rejected`、`exploration_exhausted`。只有第一类指导补录知识；格式类应引导修复 anchor，
 并在对应 chunk 重新锚定后具备自动消解条件。
+
+### 🧹 修复记录（2026-08-05）
+
+**改动**：在 answer trace 记录模型**尝试过**的引用数，据此把 `cited==0` 拆成三类真因。
+
+- `knowledge_agent.rs:1016-1035`：filter 之前先取 `cited_chunk_ids.len()` / `source_quotes.len()`
+  （filter 会 move 掉这两个 Vec），写入 answer trace 的 `attemptedCitedCount` /
+  `attemptedQuoteCount`。
+- `knowledge_agent.rs:1880-1891` 新增 `attempted_citation_count(tool_trace)`：取两个计数的较大值。
+  **缺字段时返回 0** —— 历史 trace 与兜底路径退化成旧行为（判 `recall_miss`），不会误报成格式问题。
+- `knowledge_agent.rs:1926-1973` 分三支：
+  1. `attempted > 0` → **新 kind `citation_format_rejected`**，描述指向「重锚定，而不是补录新知识」；
+  2. `attempted == 0 && truncated` → `recall_miss` + 「召回未收敛」标题，指向探索预算/议题拆分；
+  3. `attempted == 0 && !truncated` → `recall_miss` + 原「召回偽阴性」标题，才指向补录。
+
+**为何后两支共用 `recall_miss` kind**：收件箱分类与前端闭集保持稳定，但**标题不同 →
+`dedup_key`（`kind + normalized title + affected`）不同 → 分列两行**，运营不再把两类混在一条
+pending 里。这是在「区分真因」与「不扰动既有产品分类」之间的取舍。
+
+**追问增强门无需改动**（已验证）：`knowledge_agent.rs:310` 只对 `recall_miss` 写
+`search_queries`。新 kind 恰好不该带补录线索——格式问题的修复对象是 `affected_chunk_ids`
+指向的那批 chunk，不是新知识。
+
+**前端同步**：`reviewLabels.ts` 加 `citation_format_rejected: "引用格式被拒（需重锚定）"`
+（顺带补了既有遗漏的 `recall_low_yield`）、`steward.tsx` 过滤树闭集与注释同步、
+`reviewLabels.test.ts` 断言从 10 类改 12 类。
+
+**验证**：
+- 新增 3 条测试：`classify_attempted_but_rejected_citations_is_format_rejected`、
+  `classify_attempted_quotes_only_still_counts_as_attempt`、
+  `classify_zero_attempt_remains_recall_miss`。
+- **反向验证有效**：临时把签名 1a 短路（`if false && ...`）后，前两条立即 FAILED。
+- 既有 `classify_*` 测试全部保持通过（helper 不带 `attempted*` 键 → 走兼容分支）。
+- 前端 618 tests passed、`tsc --noEmit`、production build 均通过。
+
+**未做**：`sweep_stale_signals` 仍无 `citation_format_rejected` 的自动消解分支。文档建议的
+「重新锚定后自动消解」需要 sweep 侧按 `affected_chunk_ids` 回查 anchor 是否已可引用，
+属独立改动；`persist_recall_signal` 的「只增不消解」是有文档论证的刻意设计（防在线钩子
+冲掉离线 lint 攒的 pending），改动它需要单独评估。
 
 ---
 
@@ -295,12 +453,57 @@ cargo test --lib daily_limit_applies_only_to_follow_up
 
 ## 建议处理顺序
 
-1. **B2**：拆分导航候选和授权证据，阻止无关 fallback ID 满足产品硬闸，并恢复 missing/weak 真实性。
-2. **B1**：改为统计主动逻辑触达，不让 Inbound 分段占用 FollowUp 配额。
-3. **B3**：统一写入/Verify/读取三侧 anchor 契约，并迁移历史畸形数据。
-4. **B5**：按 citation 拒绝原因分裂 gap signal，恢复运营队列信噪比和自动消解能力。
+已完成（2026-08-05，见各条目「修复」段）：
+
+1. ~~**B2**：拆分导航候选和授权证据~~ → 🧹 已修复（`selected_chunks_are_fallback` + `route_used_knowledge_ids` 守卫）
+2. ~~**B1**：改为统计主动逻辑触达~~ → 🧹 已修复（事实源换 outbox + `run_id` 去重 + 来源闭集）
+3. ~~**B3**：统一写入/Verify/读取三侧 anchor 契约~~ → 🧹 已修复（`chunk_has_citable_anchor` 共享谓词 + 收数据的闸入口）
+4. ~~**B5**：按 citation 拒绝原因分裂 gap signal~~ → 🧹 已修复（`citation_format_rejected` + 未收敛/查无内容分列）
+
+待产品决策（不按缺陷直接改）：
+
 5. **B4**：先测量真实时延，再由产品确定长度相关节奏参数。
 6. **B6**：结合目标客群夜间活跃度做产品决策。
+
+未纳入本轮的两处残余（各条目内已记录，均不改变已修红线）：
+
+- B1 的 relay 转述与静默「醒来任务」`source_kind` 属 follow_up 类，仍各占 1 次逻辑触达；
+  彻底区分需在 outbox 持久化更细来源标记。
+- B2 的相关度下限（原建议第 3 条）**刻意未做**：两个 e2e 金标测试
+  （`router_falls_back_to_top_n_when_agent_cites_nothing` / `..._cites_chunks_outside_corpus`）
+  的 query 与 corpus 零词面重叠却断言 `weak` + 回填，加下限会打破它们所锁的产品语义。
+  该项属 coverage 分档口径变更，需产品确认后单独处理；本轮只切断「回填 → 授权证据」通路。
+- B3 的 CJK 严格子串匹配（`normalize_evidence_text` 只折叠空白）风险仍在，真实误拒率
+  需实际 LLM 样本衡量后再决定是否放宽。
+
+## 本轮修复的统一验证（2026-08-05）
+
+四条修复共享同一套闸门，命令可照抄复现：
+
+```bash
+cargo test --lib                      # 2379 passed / 0 failed
+RUSTFLAGS="-D warnings" cargo check --all-targets
+cargo fmt --check
+cd frontend && npx vitest run         # 125 files / 618 tests passed
+cd frontend && npx tsc --noEmit && npx vite build
+
+# 需 Docker 的集成测试（#[ignore]，必须显式开启）
+DOCKER_AVAILABLE=1 cargo test --test knowledge_router_fallback_e2e -- --ignored   # 3 passed（B2 金标未破）
+DOCKER_AVAILABLE=1 cargo test --test chunk_batch_ops -- --ignored                 # 11 passed（B3 相关）
+DOCKER_AVAILABLE=1 cargo test --test integrity_report_d2_e2e -- --ignored         # 1 passed
+DOCKER_AVAILABLE=1 cargo test --test sr135_proactive_outreach -- --ignored        # 7 passed（B1 相关）
+```
+
+每条修复都做过**反向验证**（临时退回旧实现 → 对应测试 FAILED → 恢复后通过），
+确保新增测试真的能捕获该缺陷而不是恒真断言。B3 的第一次反向验证暴露出
+「闸收两个 `bool`、调用方算错谓词无法被测试捕获」这一设计问题，因此追加了
+`chunk_verify_gate_reason_for(source_quote, source_anchors)` 收数据本身的入口，
+使错误口径无法表达；第二次反向验证确认两条测试立即失败。
+
+已知环境问题（**非本轮引入**，`git stash` 移除全部改动后仍复现）：
+`outbox_integration::account_pacing_gate_end_to_end_via_gateway` 在默认 8MB 栈下
+栈溢出（SIGABRT），需 `RUST_MIN_STACK=16777216` 才能通过；根因是巨型 async 函数
+的 future 体积，与 `daily_touch_count` 改动无关。
 
 ## 维护约定
 

@@ -1125,6 +1125,62 @@ mod chunk_classification_tests {
     }
 }
 
+#[cfg(test)]
+mod anchor_citability_tests {
+    use super::{anchor_is_citable, chunk_has_citable_anchor};
+    use mongodb::bson::doc;
+
+    /// B3 核心：只带位置字段、缺 `sourceQuote` 的 anchor 不可引用。
+    ///
+    /// 这类 anchor 旧口径下能通过 D2 verify 闸（只查数组非空）进入 active+verified，
+    /// 但读取侧 `quote_is_chunk_evidence` 取不到 `sourceQuote` 恒判否 → 该 chunk 的
+    /// 引用永远无效 → 每次召回都掉 fallback 并产生 recall_miss。
+    #[test]
+    fn anchor_without_source_quote_is_not_citable() {
+        assert!(!anchor_is_citable(&doc! { "startOffset": 0i32 }));
+        assert!(!anchor_is_citable(&doc! {
+            "startOffset": 0i32,
+            "endOffset": 12i32,
+            "startLine": 1i32,
+        }));
+        // 空 / 纯空白 sourceQuote 同样不可引用（读取侧要求 normalize 后非空）。
+        assert!(!anchor_is_citable(&doc! { "sourceQuote": "" }));
+        assert!(!anchor_is_citable(&doc! { "sourceQuote": "   \n " }));
+        // 键存在但类型不是字符串 → get_str 失败 → 不可引用（不 panic）。
+        assert!(!anchor_is_citable(&doc! { "sourceQuote": 42i32 }));
+        assert!(!anchor_is_citable(&doc! {}));
+    }
+
+    /// 生产 `source_anchor_for_quote` 构造的 anchor 恒含非空 sourceQuote，必须可引用——
+    /// 否则本次收窄会把合法写入路径一并挡掉。
+    #[test]
+    fn anchor_with_source_quote_is_citable() {
+        assert!(anchor_is_citable(&doc! {
+            "startOffset": 0i32,
+            "endOffset": 6i32,
+            "startLine": 1i32,
+            "endLine": 1i32,
+            "sourceQuote": "这是引文段落",
+            "quoteHash": "abc123",
+        }));
+        // 最小形态：只要有非空 sourceQuote 即可（位置字段不参与可引用性判断）。
+        assert!(anchor_is_citable(&doc! { "sourceQuote": "片段" }));
+    }
+
+    /// 数组级判定：非空 ≠ 有可引用锚点。这正是 B3 两侧口径不一致的根源。
+    #[test]
+    fn chunk_citability_requires_at_least_one_citable_anchor() {
+        // 空数组：无可引用锚点。
+        assert!(!chunk_has_citable_anchor(&[]));
+        // 非空但全部畸形：旧口径放行，新口径拒绝。
+        let malformed = vec![doc! { "startOffset": 0i32 }, doc! { "endOffset": 9i32 }];
+        assert!(!chunk_has_citable_anchor(&malformed));
+        // 混合：只要有一条可引用即放行（读取侧按 index 命中任意一条即可成立）。
+        let mixed = vec![doc! { "startOffset": 0i32 }, doc! { "sourceQuote": "命中" }];
+        assert!(chunk_has_citable_anchor(&mixed));
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentEvent {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
@@ -1842,6 +1898,33 @@ pub fn coerce_wiki_type(raw: Option<String>) -> Option<String> {
         );
         None
     }
+}
+
+/// B3：单条 `source_anchors` 元素是否**可被引用**——即含非空 `sourceQuote` 字符串键。
+///
+/// 读取侧（`knowledge_agent::quote_is_chunk_evidence`）接受一条 citation 时，要求
+/// `source_anchors[index].sourceQuote` 存在且非空，再与模型给的 quote 做双向包含比对。
+/// 而写入侧的 D2 verify 闸历史上只检查 `!source_anchors.is_empty()`——只要数组非空就
+/// 放行。两侧口径不一致的后果是：一条只带 `startOffset` 之类字段、没有 `sourceQuote`
+/// 的畸形 anchor 能通过 verify 进入 `active + verified`，但**永远无法被引用**，每次召回
+/// 都掉进 fallback 回填并产生一条 `recall_miss`——运营被指向「补录知识」，而真因是锚点
+/// 结构不合规，补录再多也修不好。
+///
+/// 本谓词是两侧共享的单一真相源，放在 `models` 是因为写入侧（`routes::knowledge`）与
+/// 读取侧（`agent::knowledge_agent`）都依赖它、彼此不可见。
+pub fn anchor_is_citable(anchor: &Document) -> bool {
+    anchor
+        .get_str("sourceQuote")
+        .map(|quote| !quote.trim().is_empty())
+        .unwrap_or(false)
+}
+
+/// B3：该 chunk 是否**至少有一条可引用的** anchor（见 [`anchor_is_citable`]）。
+///
+/// D2 verify 闸应当用本谓词替代裸 `!source_anchors.is_empty()`，使「能通过 verify」与
+/// 「能被引用」这两个判断收敛到同一条件。
+pub fn chunk_has_citable_anchor(chunk_anchors: &[Document]) -> bool {
+    chunk_anchors.iter().any(anchor_is_citable)
 }
 
 /// 落库前归一 `chunk_type`：合法值透传；空/闭集外 → `product_fact`（最保守、走 verified-only）。

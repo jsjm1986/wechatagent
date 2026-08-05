@@ -1325,10 +1325,13 @@ interface GapSignalItem {
 }
 
 // gap_signal kind 顺序(过滤树用);标签/严重度统一取共享字典 lib/reviewLabels.ts
-// (含 recall_miss/dangling_anchor 共 10 类,与 src/knowledge_wiki/gap_signals.rs 对齐)。
+// (共 12 类,与 src/knowledge_wiki/gap_signals.rs + knowledge_agent.rs 各判定点对齐)。
+// B5: citation_format_rejected 与 recall_miss 刻意分列——前者真因是锚点不合规(修复
+// 方向=重锚定),后者才是知识缺失(修复方向=补录);混成一类会把运营指向错误动作。
 const GAP_SIGNAL_KIND_ORDER = [
   "orphan", "broken_link", "no_outlinks", "low_confidence", "stale",
   "contradiction", "missing_chunk", "suggestion", "dangling_anchor", "recall_miss",
+  "citation_format_rejected", "recall_low_yield",
 ];
 
 function gapKindLabel(v?: string | null): string {

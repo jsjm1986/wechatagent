@@ -1117,12 +1117,17 @@ pub(super) fn apply_chunk_integrity(
     document_id: Option<ObjectId>,
 ) -> bool {
     let source_quote = chunk.source_quote.clone().unwrap_or_default();
-    if chunk.source_anchors.is_empty() {
+    // B3：触发重建的条件是「没有**可引用**的 anchor」，不是「数组为空」。调用方提交的
+    // anchor 若缺 `sourceQuote` 键（如只带 startOffset），数组非空但读取侧永远拒绝它，
+    // 旧条件下这类畸形 anchor 永不被修复；改用 `chunk_has_citable_anchor` 后会照常重算。
+    if !crate::models::chunk_has_citable_anchor(&chunk.source_anchors) {
         if let Some(anchor) = source_anchor_for_quote(raw_content, document_id, &source_quote) {
             chunk.source_anchors.push(anchor);
         }
     }
-    let has_anchor = !chunk.source_anchors.is_empty();
+    // 与读取侧同源：数组非空但无可引用元素时，仍按「无锚点」处理（走 distortion_risks
+    // 提示 + confidence 45），不再给出「有锚点」的乐观信号。
+    let has_anchor = crate::models::chunk_has_citable_anchor(&chunk.source_anchors);
     let has_quote = !source_quote.trim().is_empty();
     // Anchoring establishes provenance location only. Ingest/AI paths never
     // promote lifecycle state; human verification remains a separate revision.
@@ -1242,6 +1247,25 @@ fn chunk_verify_gate_reason(has_source_quote: bool, has_source_anchor: bool) -> 
         "拒绝运营确认：切片缺少 {}，请补完后再确认。",
         missing.join(" 与 ")
     ))
+}
+
+/// B3：D2 verify 闸的**唯一生产入口**——直接收原始数据，两个谓词都在函数内部算。
+///
+/// 为什么不让调用方传 `bool`：`chunk_verify_gate_reason(has_quote, has_anchor)` 的
+/// 正确性完全取决于调用方怎么算 `has_anchor`，而算错（用裸
+/// `!source_anchors.is_empty()` 而非 [`crate::models::chunk_has_citable_anchor`]）
+/// 不会被任何针对闸函数的单测发现——闸收到的只是一个已经错了的 `true`。这正是 B3
+/// 能长期潜伏的结构原因。把谓词收进函数后，「能通过 verify」与「能被引用」这两个判断
+/// 在类型层面就无法再分叉。
+///
+/// 生产调用方 SHALL 用本函数，不要直接调 [`chunk_verify_gate_reason`]。
+pub(in crate::routes) fn chunk_verify_gate_reason_for(
+    source_quote: Option<&str>,
+    source_anchors: &[Document],
+) -> Option<String> {
+    let has_quote = source_quote.is_some_and(|quote| !quote.trim().is_empty());
+    let has_anchor = crate::models::chunk_has_citable_anchor(source_anchors);
+    chunk_verify_gate_reason(has_quote, has_anchor)
 }
 
 /// `#[cfg(test)]` 的旧请求形态回归 helper：模拟调用方提交 `verified` 但缺
@@ -2088,6 +2112,45 @@ mod tests {
         let r = chunk_verify_gate_reason(true, false).unwrap();
         assert!(r.contains("source_anchors"));
         assert!(!r.contains("sourceQuote"));
+    }
+
+    /// B3 红线：非空但**缺 `sourceQuote` 键**的 anchor 必须被 verify 闸拒绝。
+    ///
+    /// 这类畸形 anchor 在旧口径（`!source_anchors.is_empty()`）下能通过 verify 进入
+    /// `active + verified`，而读取侧 `quote_is_chunk_evidence` 要求命中的 anchor 自身
+    /// 含非空 `sourceQuote`，故它的引用恒被拒 → 该 chunk 永久无法被 cite，每次召回都
+    /// 掉 fallback 并产生一条 `recall_miss`，把运营指向「补录知识」这个错误方向。
+    #[test]
+    fn verify_gate_rejects_anchor_without_source_quote() {
+        let malformed = vec![mongodb::bson::doc! { "startOffset": 0i64 }];
+        let reason = chunk_verify_gate_reason_for(Some("原文片段"), &malformed)
+            .expect("缺 sourceQuote 的 anchor 必须被拒绝，否则该 chunk 永久不可引用");
+        assert!(
+            reason.contains("source_anchors"),
+            "拒绝原因应指向锚点: {reason}"
+        );
+    }
+
+    /// 对偶正例：带非空 `sourceQuote` 的 anchor 放行，确保修复没有过度收紧。
+    #[test]
+    fn verify_gate_accepts_anchor_with_source_quote() {
+        let good = vec![mongodb::bson::doc! {
+            "startOffset": 0i64,
+            "sourceQuote": "原文片段",
+        }];
+        assert!(chunk_verify_gate_reason_for(Some("原文片段"), &good).is_none());
+    }
+
+    /// 空数组与「全部元素都不可引用」在闸上必须同一结论——两者读取侧行为一致。
+    #[test]
+    fn verify_gate_treats_empty_and_all_malformed_anchors_alike() {
+        let empty: Vec<mongodb::bson::Document> = Vec::new();
+        let all_blank = vec![
+            mongodb::bson::doc! { "sourceQuote": "   " },
+            mongodb::bson::doc! { "endOffset": 9i64 },
+        ];
+        assert!(chunk_verify_gate_reason_for(Some("q"), &empty).is_some());
+        assert!(chunk_verify_gate_reason_for(Some("q"), &all_blank).is_some());
     }
 
     #[test]

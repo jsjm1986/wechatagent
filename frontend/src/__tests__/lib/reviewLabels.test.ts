@@ -35,9 +35,12 @@ describe("reviewLabels 闭集标签(C7/C8 共用)", () => {
 });
 
 describe("reviewLabels 扩展字典", () => {
-  it("gap_signal kind 覆盖 10 类且中文", () => {
+  it("gap_signal kind 覆盖 12 类且中文", () => {
+    // B5: citation_format_rejected / recall_low_yield 也必须有中文标签,否则收件箱
+    // 直接显示英文 kind 串,运营看不懂该做什么。
     ["orphan","broken_link","missing_chunk","no_outlinks","low_confidence",
-     "stale","contradiction","suggestion","dangling_anchor","recall_miss"
+     "stale","contradiction","suggestion","dangling_anchor","recall_miss",
+     "citation_format_rejected","recall_low_yield"
     ].forEach((k) => {
       expect(GAP_SIGNAL_KIND_LABELS[k]).toBeTruthy();
       expect(GAP_SIGNAL_KIND_LABELS[k]).not.toBe(k);
