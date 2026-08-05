@@ -432,4 +432,65 @@ describe("运行日志 runs tab + tier 遥测(C6+C9)", () => {
     // decision 阶段通用 key-value 渲染暴露原始键
     expect(screen.getByText("missingTier")).toBeInTheDocument();
   });
+
+  // ── 运行日志表格布局回归（阶段明细溢出修复）────────────────────────
+  // 缺陷：thead 只有 5 个 th，而摘要行有 6 个 td（缺「操作」列表头），
+  // 导致列宽分配错位、末列失去表头约束。
+  it("runs 表头列数与摘要行单元格数一致", () => {
+    mountRunsTab([
+      { id: "r3", runId: "run-3", status: "sent", triggerKind: "inbound" },
+    ]);
+    const table = document.querySelector("table");
+    expect(table).not.toBeNull();
+    const thCount = table!.querySelectorAll("thead th").length;
+    const tdCount = table!.querySelectorAll("tbody tr:first-child > td").length;
+    expect(thCount).toBe(tdCount);
+  });
+
+  // 缺陷：阶段区块误用 .tHead（display:flex 横向容器，为事件时间线的
+  // <strong>+<span> 设计），内含 width:100% 的嵌套表格 → flex 项
+  // min-width:auto 使表格按内容撑开、标签被挤成逐字竖排、整体横向溢出。
+  it("展开后的阶段区块不使用事件时间线的 flex 容器类", async () => {
+    mountRunsTab([
+      {
+        id: "r4",
+        runId: "run-4",
+        status: "sent",
+        triggerKind: "inbound",
+        planner: { riskLevel: "medium", reason: "测试" },
+      },
+    ]);
+    const { fireEvent } = await import("@testing-library/react");
+    fireEvent.click(screen.getByText("展开"));
+    // 找到包含嵌套 table 的阶段区块容器
+    const stageBlock = screen.getByText("规划").closest("div");
+    expect(stageBlock).not.toBeNull();
+    expect(stageBlock!.querySelector("table")).not.toBeNull();
+    // 不得复用 tHead（那是 flex 横向容器，会撑破布局）
+    expect(stageBlock!.className).not.toMatch(/tHead/);
+    // 必须挂上专用的阶段区块类
+    expect(stageBlock!.className).toMatch(/stageBlock/);
+  });
+
+  // 缺陷：嵌套表格无固定布局与断词，长 JSON 值（toolTrace / chunkId 数组）
+  // 会撑破列宽。修复后表格须挂 .stageTable（table-layout:fixed + word-break）。
+  it("阶段明细表格挂 stageTable 类（固定布局 + 断词）", async () => {
+    mountRunsTab([
+      {
+        id: "r5",
+        runId: "run-5",
+        status: "sent",
+        triggerKind: "inbound",
+        knowledgeRoute: {
+          selectedChunkIds: ["68a1f2c4d5e6a7b8c9d0e1f2", "68a1f2c4d5e6a7b8c9d0e1f3"],
+        },
+      },
+    ]);
+    const { fireEvent } = await import("@testing-library/react");
+    fireEvent.click(screen.getByText("展开"));
+    const stageBlock = screen.getByText("知识路由").closest("div");
+    const nested = stageBlock!.querySelector("table");
+    expect(nested).not.toBeNull();
+    expect(nested!.className).toMatch(/stageTable/);
+  });
 });

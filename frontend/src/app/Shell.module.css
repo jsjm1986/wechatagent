@@ -192,7 +192,11 @@
 .logout svg { flex-shrink: 0; }
 
 /* 主区 */
-.main { flex: 1; padding: 32px 44px; overflow-y: auto; height: 100vh; }
+/* min-width: 0 —— flex 项默认 min-width:auto，不肯收缩到内容固有宽度以下，
+   于是任何宽内容（如运行日志展开行里的 key-value 表格）的固有宽度会一路顶穿
+   主区、把整页撑出横向滚动，连侧边栏都被推走。min-width:0 解除该下限，让宽内容
+   被约束在主区内部自行处理（换行/滚动），溢出不再逃逸到页面级。 */
+.main { flex: 1; min-width: 0; padding: 32px 44px; overflow-y: auto; height: 100vh; }
 .header { margin-bottom: 28px; }
 .eyebrow { font-size: 11px; color: var(--color-brand); font-weight: 600; letter-spacing: .9px; text-transform: uppercase; }
 .title { font-size: 34px; color: var(--ink-1); font-weight: 700; letter-spacing: -1.3px; margin: 9px 0 6px; line-height: 1.05; }

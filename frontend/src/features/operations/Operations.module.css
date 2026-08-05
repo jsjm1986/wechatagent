@@ -89,6 +89,29 @@
   font-size: 10.5px; font-weight: 500; color: var(--ink-3); padding: 2px 9px; border-radius: 20px;
   background: var(--fill-inactive); border: 1px solid var(--hairline);
 }
+/* 运行日志展开行：阶段明细区块。
+   刻意不复用 .tHead —— 那是事件时间线的横向 flex 头（<strong> + <span> 左右分列）。
+   这里的内容是「标签 + 一张 width:100% 的表」，放进 flex 会让表格按内容宽度撑开
+   （flex 项 min-width:auto 不肯收缩），把标签挤成逐字竖排并横向溢出整页。
+   故独立成纵向堆叠容器。 */
+.stageBlock { margin-top: 14px; }
+.stageBlock:first-child { margin-top: 0; }
+.stageBlock > strong {
+  display: block; margin-bottom: 6px;
+  font-size: 13px; color: var(--ink-1); font-weight: 600; letter-spacing: -.2px;
+}
+
+/* table-layout:fixed 让列宽由声明决定而非内容，长值折行而不撑破容器。
+   key 列 38%：够放 confidenceOverrideTriggered 这类长驼峰键，又给值列留足空间。 */
+.stageTable { width: 100%; table-layout: fixed; border-collapse: collapse; font-size: 12.5px; }
+.stageTable td {
+  padding: 9px 12px; border-bottom: 1px solid var(--hairline);
+  color: var(--ink-1); letter-spacing: -.1px; vertical-align: top;
+  word-break: break-word; overflow-wrap: anywhere;
+}
+.stageTable td:first-child { width: 38%; color: var(--ink-3); }
+.stageTable tbody tr:last-child td { border-bottom: none; }
+
 .eventDetail { margin-top: 8px; }
 .eventDetail summary {
   font-size: 11px; color: var(--ink-3); font-weight: 500; cursor: pointer; letter-spacing: -.1px;
