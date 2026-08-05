@@ -1,47 +1,224 @@
+/* 好友选择器。三处共用：决策人链 / 专属顾问名片库 / 产品成交。
+   Overlay 的 .panel 自身没有 padding（ConfirmDialog 是自己包 .box 加的），
+   故此处由 .shell 提供内边距，否则内容顶到面板边缘。 */
+.shell {
+  display: grid;
+  /* 头 / 搜索 / 列表 / 页脚：列表吃掉剩余高度（1fr），其余按内容。
+     列表用 minmax(0,1fr) 而非 auto——grid 项目默认 min-height:auto 会被内容
+     顶高、突破面板 max-height，滚动条就落不到列表上。 */
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  gap: 14px;
+  padding: 20px 22px 18px;
+  /* 面板 max-height 是 calc(100vh-48px)；这里占满它，列表才能吃到全部剩余高度。 */
+  max-height: calc(100vh - 48px);
+  box-sizing: border-box;
+}
+
 .head {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  margin-bottom: 12px;
+  gap: 12px;
 }
-.title { font-size: 15px; font-weight: 600; color: var(--ink-1); }
+.title {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--ink-1);
+  letter-spacing: -0.2px;
+}
+/* 计数：让「共 N 位」紧跟标题，用户一眼知道通讯录规模。 */
+.count {
+  font-size: 12px;
+  color: var(--ink-3);
+  font-weight: 400;
+}
 .closeBtn {
-  border: 0; background: transparent; color: var(--ink-3);
-  font-size: 18px; line-height: 1; cursor: pointer; padding: 4px;
+  margin-left: auto;
+  /* 摆脱全局裸 button 基线（styles.css 的 min-height:38px + 蓝底白字）。 */
+  min-height: 0;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--ink-3);
+  font-size: 17px;
+  line-height: 1;
+  cursor: pointer;
 }
-.search { width: 100%; margin-bottom: 12px; }
+.closeBtn:hover {
+  background: var(--surface-page);
+  color: var(--ink-1);
+}
+
 .searchInput {
-  width: 100%; box-sizing: border-box;
-  border: 1px solid var(--hairline); border-radius: 8px;
-  padding: 8px 12px; font-size: 13px;
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 0;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-sm);
+  background: var(--surface-page);
+  color: var(--ink-1);
+  padding: 9px 13px;
+  font-size: 13px;
 }
+.searchInput::placeholder { color: var(--ink-4); }
+.searchInput:focus {
+  outline: none;
+  background: var(--surface-card);
+  box-shadow: var(--focus-ring);
+}
+
+/* 双列网格。原先 minmax(180px,1fr) 在 480px 面板里只放得下两列窄卡，
+   昵称大面积截断；面板加宽到 720px 后 minmax(300px,1fr) 稳定两列且放得下完整昵称。
+   高度不再写死 420px——由 .shell 的 1fr 吃掉面板剩余高度，窗口高则看得更多。 */
 .grid {
-  display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
-  gap: 8px; max-height: 420px; overflow-y: auto;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 2px;
+  overflow-y: auto;
+  /* 滚动区左右留一点，避免卡片 hover 背景紧贴滚动条。 */
+  margin: 0 -6px;
+  padding: 0 6px;
 }
+
+/* 卡片无常驻边框——三十个小方框套在大方框里是本次要消除的视觉噪音。
+   边界靠 hover 背景表达，静态时只有留白分隔。 */
 .card {
-  display: flex; align-items: center; gap: 10px;
-  border: 1px solid var(--hairline); border-radius: 10px;
-  padding: 8px 10px; background: var(--surface-card);
-  cursor: pointer; text-align: left; width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  min-height: 0;
+  border: 0;
+  border-radius: var(--r-sm);
+  padding: 9px 10px;
+  background: transparent;
+  color: var(--ink-1);
+  cursor: pointer;
+  text-align: left;
+  width: 100%;
+  transition: background 0.12s ease;
 }
 .card:hover { background: var(--surface-page); }
-.avatar { width: 36px; height: 36px; border-radius: 8px; object-fit: cover; flex: none; }
-.avatarFallback {
-  width: 36px; height: 36px; border-radius: 8px; flex: none;
-  display: flex; align-items: center; justify-content: center;
-  background: var(--surface-page); color: var(--ink-3); font-weight: 600;
+.card:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
 }
-.cardBody { display: flex; flex-direction: column; min-width: 0; }
-.name { font-size: 13px; color: var(--ink-1); font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.sub { font-size: 11px; color: var(--ink-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.badge { margin-left: auto; font-size: 11px; color: var(--ink-3); flex: none; }
-.state { padding: 32px 12px; text-align: center; color: var(--ink-3); font-size: 13px; }
-.pager { display: flex; align-items: center; justify-content: center; gap: 12px; margin-top: 12px; }
-.pagerBtn { border: 1px solid var(--hairline); background: transparent; border-radius: 6px; padding: 4px 10px; font-size: 12px; cursor: pointer; }
-.pagerBtn:disabled { opacity: 0.5; cursor: default; }
-.manual { margin-top: 12px; border-top: 1px solid var(--hairline); padding-top: 10px; }
-.manualToggle { border: 0; background: transparent; color: var(--ink-3); font-size: 12px; cursor: pointer; padding: 0; }
-.manualRow { display: flex; gap: 8px; margin-top: 8px; }
-.manualInput { flex: 1; border: 1px solid var(--hairline); border-radius: 8px; padding: 6px 10px; font-size: 13px; }
-.manualBtn { border: 1px solid var(--hairline); background: var(--surface-page); border-radius: 8px; padding: 6px 12px; font-size: 12px; cursor: pointer; }
+
+.avatar {
+  width: 34px; height: 34px;
+  border-radius: 9px;
+  object-fit: cover;
+  flex: none;
+  background: var(--surface-page);
+}
+.avatarFallback {
+  width: 34px; height: 34px;
+  border-radius: 9px;
+  flex: none;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--surface-page);
+  color: var(--ink-3);
+  font-size: 13px;
+  font-weight: 600;
+}
+/* min-width:0 必须留：flex 子项默认 min-width:auto，长 wxid 会顶宽卡片
+   使 text-overflow:ellipsis 失效。 */
+.cardBody { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.name {
+  font-size: 13px; color: var(--ink-1); font-weight: 600;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.sub {
+  font-size: 11px; color: var(--ink-3);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* 「未导入」等标记做成 pill，与昵称区分开；flex:none 防被压缩。 */
+.badge {
+  margin-left: auto;
+  flex: none;
+  font-size: 10.5px;
+  font-weight: 500;
+  color: var(--ink-3);
+  background: var(--surface-page);
+  border-radius: 999px;
+  padding: 3px 8px;
+}
+/* 卡片 hover 时 pill 底色与卡片底色同源会糊在一起，故翻成白底。 */
+.card:hover .badge { background: var(--surface-card); }
+
+.state {
+  display: flex; align-items: center; justify-content: center;
+  padding: 40px 12px;
+  text-align: center;
+  color: var(--ink-3);
+  font-size: 13px;
+}
+
+.footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-top: 1px solid var(--hairline);
+  padding-top: 12px;
+}
+/* 无分页时也保留页脚（放手动输入入口），故 footer 可能只有一侧有内容。 */
+.pager { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+.pageInfo { font-size: 12px; color: var(--ink-3); min-width: 52px; text-align: center; }
+.pagerBtn {
+  /* color 必须显式声明：全局裸 button 是 color:#fff + 蓝底，这里覆盖了
+     background 却漏 color 就成了白字透明底——上线后按钮看着是空方框。 */
+  min-height: 0;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-sm);
+  background: var(--surface-card);
+  color: var(--ink-2);
+  padding: 5px 11px;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+}
+.pagerBtn:hover:not(:disabled) {
+  background: var(--surface-page);
+  border-color: var(--hairline);
+  box-shadow: none;
+}
+.pagerBtn:disabled { opacity: 0.4; cursor: default; }
+
+.manualToggle {
+  min-height: 0;
+  border: 0;
+  background: transparent;
+  color: var(--ink-3);
+  font-size: 12px;
+  cursor: pointer;
+  padding: 0;
+}
+.manualToggle:hover { color: var(--ink-1); background: transparent; box-shadow: none; }
+.manualRow { display: flex; gap: 8px; align-items: center; }
+.manualInput {
+  flex: 1;
+  min-height: 0;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-sm);
+  background: var(--surface-card);
+  color: var(--ink-1);
+  padding: 7px 11px;
+  font-size: 12.5px;
+}
+.manualInput:focus { outline: none; box-shadow: var(--focus-ring); }
+.manualBtn {
+  /* 同 .pagerBtn：显式 color，否则白字配浅灰底不可见。 */
+  min-height: 0;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-sm);
+  background: var(--surface-card);
+  color: var(--ink-2);
+  padding: 7px 13px;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+}
+.manualBtn:hover:not(:disabled) { background: var(--surface-page); box-shadow: none; }
+.manualBtn:disabled { opacity: 0.4; cursor: default; }

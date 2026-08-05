@@ -14,6 +14,7 @@ export function Overlay({
   describedBy,
   children,
   closeOnScrim = true,
+  maxWidth,
 }: {
   open: boolean;
   onClose: () => void;
@@ -21,6 +22,9 @@ export function Overlay({
   describedBy?: string;
   children: ReactNode;
   closeOnScrim?: boolean;
+  /** 面板最大宽度（px）。省略时用 CSS 默认 480——现有调用方行为不变。
+      列表型弹窗（如好友选择器双列网格）需要更宽才放得下完整昵称。 */
+  maxWidth?: number;
 }) {
   const panelRef = useRef<HTMLDivElement>(null);
   const restoreFocusRef = useRef<HTMLElement | null>(null);
@@ -84,6 +88,7 @@ export function Overlay({
       <div
         ref={panelRef}
         className={styles.panel}
+        style={maxWidth ? { maxWidth } : undefined}
         role="dialog"
         aria-modal="true"
         aria-labelledby={labelledBy}
