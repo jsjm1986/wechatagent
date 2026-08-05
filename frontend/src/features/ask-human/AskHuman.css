@@ -2,26 +2,49 @@
    绝不命名为 .module.css 做副作用导入——Rollup tree-shake 会删光，整频道白板。
    色值/圆角/描边统一走 tokens.css 变量，禁止硬编码主色。基础可用即可，精细视觉留 Task 12。 */
 
+/* 外壳：与其余频道一致的 .page 语义（grid + 18px 间距）。
+   padding 与宽度交给 Shell 的 .main（Shell.module.css:199 已有 32px 44px），
+   此处不再自设 padding / max-width——原先两者叠加使内容区偏窄，
+   920px 也是全项目唯一自设 max-width 的频道，正是 9 个 chip 折行的直接原因。 */
 .askHumanChannel {
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-  padding: 24px 28px 40px;
-  max-width: 920px;
+  display: grid;
+  gap: 18px;
 }
 
+/* 白卡：视觉规格对齐 Quality/Autonomy/Campaign 等六个频道的 .panel，
+   但类名必须带 askHuman 前缀——本文件是 plain CSS 全局作用域，
+   而全局 .panel（styles.css:423）正被 user-ops 频道使用，占名会相互污染。 */
+.askHumanPanel {
+  border-radius: var(--r-lg);
+  padding: 22px 26px 20px;
+  background: var(--surface-card);
+  border: 1px solid var(--hairline);
+  box-shadow: 0 14px 34px -24px rgba(20, 30, 60, 0.3),
+    inset 0 1px 1px rgba(255, 255, 255, 0.9);
+}
+
+/* 卡头：左侧待处理总数，右侧按钮组。Shell 已有大页头，此处不重复写标题。 */
+.askHumanPanelHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin-bottom: 16px;
+}
+.askHumanPanelHeadCount {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink-2);
+  letter-spacing: -0.2px;
+}
+
+/* 按钮组容器：保留 askHumanHeader 类名不改。
+   「刷新」按钮无 className，全靠下方 `.askHumanHeader button` 规则兜样式；
+   改名会让它掉回 styles.css:71 的全局 38px 纯蓝基线。 */
 .askHumanHeader {
   display: flex;
   align-items: center;
-  justify-content: flex-end;
-  gap: 16px;
-}
-.askHumanHeader h1 {
-  margin: 0;
-  font-size: 19px;
-  font-weight: 650;
-  letter-spacing: -0.2px;
-  color: var(--ink-1);
+  gap: 8px;
 }
 .askHumanHeader button {
   font: inherit;

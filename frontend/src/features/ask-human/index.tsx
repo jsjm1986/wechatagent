@@ -177,24 +177,31 @@ function AskHumanView() {
 
   return (
     <div className="askHumanChannel">
-      <header className="askHumanHeader">
-        <div className="askHumanHeaderActions">
-          <button
-            type="button"
-            className={
-              showResolved ? "askHumanViewToggle askHumanViewToggle--active" : "askHumanViewToggle"
-            }
-            onClick={() => setShowResolved((v) => !v)}
-          >
-            {showResolved ? "待处理" : "已裁决历史"}
-          </button>
-          {!showResolved && (
-            <button type="button" onClick={() => refreshAll()} disabled={loading}>
-              刷新
-            </button>
+      <div className="askHumanPanel">
+        <div className="askHumanPanelHead">
+          {/* total 为 null 表示计数不可用，此时不渲染——显示「待处理 0 项」是错误信息。 */}
+          {summary?.total != null ? (
+            <span className="askHumanPanelHeadCount">待处理 {summary.total} 项</span>
+          ) : (
+            <span />
           )}
+          <div className="askHumanHeaderActions askHumanHeader">
+            <button
+              type="button"
+              className={
+                showResolved ? "askHumanViewToggle askHumanViewToggle--active" : "askHumanViewToggle"
+              }
+              onClick={() => setShowResolved((v) => !v)}
+            >
+              {showResolved ? "待处理" : "已裁决历史"}
+            </button>
+            {!showResolved && (
+              <button type="button" onClick={() => refreshAll()} disabled={loading}>
+                刷新
+              </button>
+            )}
+          </div>
         </div>
-      </header>
 
       {showResolved ? (
         <ResolvedEscalations />
@@ -271,6 +278,7 @@ function AskHumanView() {
           />
         </>
       )}
+      </div>
     </div>
   );
 }
