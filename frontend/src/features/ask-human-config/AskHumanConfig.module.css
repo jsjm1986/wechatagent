@@ -19,20 +19,7 @@
   align-self: flex-start; padding: 6px 12px; border: 1px solid var(--hairline);
   border-radius: var(--r-sm); background: var(--surface-card); color: var(--color-scheduled); cursor: pointer; font-size: 12px;
 }
-.pickerPanel { display: flex; flex-direction: column; gap: 8px; padding: 12px; border: 1px solid var(--hairline); border-radius: var(--r-md); background: var(--surface-card); }
-.pickerList { display: flex; flex-direction: column; gap: 4px; max-height: 220px; overflow-y: auto; }
-.pickerItem {
-  display: flex; align-items: center; justify-content: space-between; gap: 8px;
-  padding: 8px 10px; border: 1px solid var(--hairline); border-radius: var(--r-sm);
-  background: var(--surface-card); color: var(--ink-1); cursor: pointer; font-size: 13px; text-align: left;
-}
-.pickerItem:hover { background: var(--fill-scheduled); }
-.input {
-  width: 100%; height: var(--control-h, 38px); padding: 0 12px;
-  border: 1px solid var(--hairline); border-radius: var(--r-sm); background: var(--surface-card);
-  color: var(--ink-1); font-size: 13px;
-}
-.input:focus { outline: none; box-shadow: var(--focus-ring); }
+.linkBtn:disabled { opacity: .5; cursor: not-allowed; }
 .page { padding: var(--page-y, 24px) var(--page-x, 32px); display: flex; flex-direction: column; gap: var(--section-gap, 18px); }
 .header { display: flex; align-items: center; justify-content: space-between; }
 .title { font-size: 28px; font-weight: 600; color: var(--ink-1); letter-spacing: 0; margin: 0; }
