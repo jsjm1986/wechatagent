@@ -162,7 +162,7 @@ describe("UserOpsFeature", () => {
     editPlaybook: vi.fn(),
     newPlaybookDraft: vi.fn(),
     // Domain 配置业务方法
-    saveOperationDomain: vi.fn().mockResolvedValue(undefined),
+    saveOperationDomain: vi.fn().mockResolvedValue(true),
     resetOperationDomain: vi.fn().mockResolvedValue(undefined),
     ...overrides
   });
@@ -243,6 +243,22 @@ describe("UserOpsFeature", () => {
     expect(screen.getByTestId("user-ops-mode-header")).toBeInTheDocument();
     expect(screen.getByTestId("contacts-view")).toBeInTheDocument();
     expect(screen.getByTestId("cockpit-panel")).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "作息时间" })).toBeInTheDocument();
+  });
+
+  it("shows workspace quiet hours without requiring a selected contact", () => {
+    (useContactStore as any).mockReturnValue({
+      contacts: [mockContact],
+      selected: null,
+      dataAccountId: "test-account-1",
+      contactTab: "all",
+      setSelected: vi.fn(),
+      setContactTab: vi.fn()
+    });
+
+    render(<UserOpsFeature />);
+
+    expect(screen.getByRole("region", { name: "作息时间" })).toBeInTheDocument();
   });
 
   it("should render traditional mode when userOpsMode is traditional", () => {

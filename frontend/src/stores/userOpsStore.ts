@@ -153,7 +153,7 @@ interface UserOpsActions {
   newPlaybookDraft: () => void;
 
   // Domain 配置相关业务方法
-  saveOperationDomain: (domain: string) => Promise<void>;
+  saveOperationDomain: (domain: string) => Promise<boolean>;
   resetOperationDomain: (domain: string) => Promise<void>;
 }
 
@@ -1292,7 +1292,7 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
   saveOperationDomain: async (domain) => {
     const { domainDrafts } = get();
     const draft = domainDrafts[domain];
-    if (!draft?.name.trim()) return;
+    if (!draft?.name.trim()) return false;
 
     useUiStore.getState().setBusy(true);
     useUiStore.getState().setError("");
@@ -1300,8 +1300,10 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
     try {
       await api.put(`/api/operation-domains/${domain}`, domainPayload(draft));
       await get().loadDomains();
+      return true;
     } catch (error) {
       useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
+      return false;
     } finally {
       useUiStore.getState().setBusy(false);
     }

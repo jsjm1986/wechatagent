@@ -1,5 +1,21 @@
 import type { OperationDomainConfig, OperationDomainDraft } from "../types";
 
+export type QuietHoursSettingsValue = {
+  enabled: boolean;
+  startHour: number;
+  endHour: number;
+  tzOffsetHours: number;
+};
+
+// 老配置可能尚未持久化作息字段。这里与后端兼容默认保持一致；表单保存时会
+// 将四个字段全部写入数据库，之后运行时不再依赖这组兼容回落值。
+export const QUIET_HOURS_COMPATIBILITY_DEFAULTS: QuietHoursSettingsValue = {
+  enabled: true,
+  startHour: 22,
+  endHour: 8,
+  tzOffsetHours: 8
+};
+
 // USER_RUNTIME_PARAMETER_FIELDS 常量定义
 const USER_RUNTIME_PARAMETER_FIELDS: Array<{
   key: string;
@@ -79,6 +95,51 @@ function runtimeParametersFromText(text: string) {
       })
       .filter(([key]) => key)
   );
+}
+
+function integerParameter(value: unknown, fallback: number, min: number, max: number) {
+  return typeof value === "number" && Number.isInteger(value) && value >= min && value <= max
+    ? value
+    : fallback;
+}
+
+export function quietHoursSettingsFromDraft(draft: OperationDomainDraft): QuietHoursSettingsValue {
+  const parameters = runtimeParametersFromText(draft.runtimeParameters);
+  return {
+    enabled: typeof parameters.quietHoursEnabled === "boolean"
+      ? parameters.quietHoursEnabled
+      : QUIET_HOURS_COMPATIBILITY_DEFAULTS.enabled,
+    startHour: integerParameter(
+      parameters.quietHoursStart,
+      QUIET_HOURS_COMPATIBILITY_DEFAULTS.startHour,
+      0,
+      23
+    ),
+    endHour: integerParameter(
+      parameters.quietHoursEnd,
+      QUIET_HOURS_COMPATIBILITY_DEFAULTS.endHour,
+      0,
+      23
+    ),
+    tzOffsetHours: integerParameter(
+      parameters.quietHoursTzOffsetHours,
+      QUIET_HOURS_COMPATIBILITY_DEFAULTS.tzOffsetHours,
+      -12,
+      14
+    )
+  };
+}
+
+export function runtimeParametersWithQuietHours(
+  text: string,
+  settings: QuietHoursSettingsValue
+) {
+  const parameters = runtimeParametersFromText(text);
+  parameters.quietHoursEnabled = settings.enabled;
+  parameters.quietHoursStart = settings.startHour;
+  parameters.quietHoursEnd = settings.endHour;
+  parameters.quietHoursTzOffsetHours = settings.tzOffsetHours;
+  return runtimeParametersText(parameters);
 }
 
 export function domainPayload(draft: OperationDomainDraft) {

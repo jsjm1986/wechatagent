@@ -1,0 +1,155 @@
+.panel {
+  display: grid;
+  grid-template-columns: minmax(220px, .7fr) minmax(0, 1.5fr);
+  align-items: center;
+  gap: 12px 22px;
+  box-shadow: var(--shadow);
+}
+
+.heading,
+.loadingCopy,
+.titleBlock,
+.toggleRow {
+  display: flex;
+  align-items: center;
+}
+
+.heading {
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.titleBlock,
+.loadingCopy {
+  gap: 10px;
+  min-width: 0;
+}
+
+.titleBlock > svg,
+.loadingCopy > svg {
+  flex: 0 0 auto;
+  color: var(--color-scheduled);
+}
+
+.titleBlock span {
+  display: block;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 720;
+}
+
+.titleBlock h2 {
+  margin: 3px 0 0;
+  font-size: 17px;
+  letter-spacing: 0;
+}
+
+.toggleRow {
+  flex: 0 0 auto;
+  gap: 7px;
+  color: var(--ink-soft);
+  font-size: 12px;
+  font-weight: 680;
+  cursor: pointer;
+}
+
+.toggleRow input {
+  width: 17px;
+  height: 17px;
+  margin: 0;
+  accent-color: var(--color-scheduled);
+}
+
+.controls {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(112px, 1fr)) auto;
+  align-items: end;
+  gap: 10px;
+}
+
+.controls label {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+.controls label > span {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 680;
+}
+
+.controls select {
+  width: 100%;
+  min-width: 0;
+}
+
+.controls button {
+  white-space: nowrap;
+}
+
+.effect,
+.effectError,
+.notice {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.effect,
+.effectError {
+  grid-column: 2;
+  border-left: 3px solid var(--color-scheduled);
+  background: var(--fill-scheduled);
+  color: var(--ink-soft);
+  padding: 7px 10px;
+}
+
+.effectError {
+  border-left-color: var(--color-blocked);
+  background: var(--fill-blocked);
+  color: var(--danger);
+}
+
+.notice {
+  grid-column: 2;
+  color: var(--muted);
+}
+
+.loadingCopy strong,
+.loadingCopy span {
+  display: block;
+}
+
+.loadingCopy span {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+@media (max-width: 1180px) {
+  .panel {
+    grid-template-columns: 1fr;
+  }
+
+  .effect,
+  .effectError,
+  .notice {
+    grid-column: 1;
+  }
+}
+
+@media (max-width: 760px) {
+  .heading {
+    align-items: flex-start;
+  }
+
+  .controls {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .controls label:nth-child(3),
+  .controls button {
+    grid-column: 1 / -1;
+  }
+}

@@ -9,6 +9,7 @@ import {
 } from "./legacy";
 import { CockpitPanel } from "./cockpit/CockpitPanel";
 import { RosterView } from "./RosterView";
+import { QuietHoursSettings } from "./QuietHoursSettings";
 import OperationsFeature from "../operations";
 import { useUserOpsStore } from "../../stores/userOpsStore";
 import { useStrategyStore } from "../../stores/strategyStore";
@@ -251,13 +252,17 @@ function UserOpsFeatureInner() {
     }
   }, [effectiveAccountId, clearContactDetail, loadContacts, loadContactCounts, loadPlaybooks, setSelected]);
 
-  // 切到 traditional 模式时加载 souls/promptTemplates（prompts tab 复用 strategyStore）和 domains
+  // 作息配置在智能模式也直接可编辑，因此频道挂载即加载领域运行策略。
+  useEffect(() => {
+    void loadDomains();
+  }, [loadDomains]);
+
+  // 切到 traditional 模式时加载 souls/promptTemplates（prompts tab 复用 strategyStore）。
   useEffect(() => {
     if (userOpsMode === "traditional") {
       void loadStrategyData();
-      void loadDomains();
     }
-  }, [userOpsMode, loadStrategyData, loadDomains]);
+  }, [userOpsMode, loadStrategyData]);
 
   // 选中联系人变化时的处理
   useEffect(() => {
@@ -272,93 +277,107 @@ function UserOpsFeatureInner() {
       <UserOpsModeHeader mode={userOpsMode} onMode={setUserOpsMode} />
 
       {userOpsMode === "smart" && (
-        <section className="userCockpitGrid">
-          <ContactsView
-            contactTab={contactTab}
-            contacts={filteredContacts}
-            query={searchQuery}
-            totalCount={contactCounts.all}
-            managedCount={managedCount}
-            normalCount={normalCount}
-            selected={scopedSelected}
-            onContactTab={setContactTab}
-            onLoadAll={reloadFiltered}
-            onOpenContact={openContact}
-            onQuery={setSearchQuery}
-            selectionScope={effectiveAccountId}
-            onBatchEnable={async (candidates) => {
-              if (!effectiveAccountId || candidates.length === 0) return;
-              try {
-                const res = await batchEnable({
-                  accountId: effectiveAccountId,
-                  source: "pool",
-                  candidates,
-                  sharedNote: "从运营池批量启用"
-                });
-                toast.success(`已启用 ${res.enabled} 人，画像后台生成中`);
-                void loadContacts(effectiveAccountId);
-                void loadContactCounts(effectiveAccountId);
-              } catch (e) {
-                toast.error(e instanceof Error ? e.message : "批量启用失败");
-              }
-            }}
-            onHideFromPool={async (contact) => {
-              if (!effectiveAccountId) return;
-              try {
-                await hideFromPool(effectiveAccountId, contact.id);
-                toast.success("已从运营池移除");
-              } catch (e) {
-                toast.error(e instanceof Error ? e.message : "移除失败");
-              }
-            }}
-          />
-          <CockpitPanel
+        <>
+          <QuietHoursSettings
             busy={busy}
-            decisionReviews={decisionReviews}
-            guideBusy={guideBusy}
-            guideInstruction={guideInstruction}
-            guidePreview={guidePreview}
-            health={operationHealth}
-            memoryCandidates={memoryCandidates}
-            memoryDraft={memoryDraft}
-            messages={messages}
-            operatingMemory={operatingMemory}
-            playbooks={playbooks}
-            profileNote={profileNote}
-            customAgentInstructions={customAgentInstructions}
-            assistOverride={assistOverride}
-            relationshipType={relationshipType}
-            referredSpecialistAt={referredSpecialistAt}
-            profileEditDraft={profileEditDraft}
-            selected={scopedSelected}
-            selectedPlaybookId={selectedPlaybookId}
-            simulationBusy={simulationBusy}
-            simulationInput={simulationInput}
-            simulationTurns={simulationTurns}
-            onAnalyzeProfile={analyzeProfile}
-            onApplyGuidePreview={onApplyGuide}
-            onDisableAgent={async () => { await disableAgent(); void loadContactCounts(effectiveAccountId); }}
-            onEnableAgent={async () => { await enableAgent(); void loadContactCounts(effectiveAccountId); }}
-            onGuideInstruction={setGuideInstruction}
-            onPreviewGuide={previewGuideInstruction}
-            onProfileNote={setProfileNote}
-            onCustomAgentInstructions={setCustomAgentInstructions}
-            onAssistOverride={setAssistOverride}
-            onRelationshipType={setRelationshipType}
-            onProfileEditDraftChange={setProfileEditDraft}
-            onRunMemoryConsolidation={runMemoryConsolidation}
-            onRunSimulation={runDialogueSimulation}
-            onSaveProfileNote={saveProfileNote}
-            onSaveCustomAgentInstructions={saveCustomAgentInstructions}
-            onSaveAssistOverride={saveAssistOverride}
-            onSaveRelationshipType={saveOperationProfile}
-            onSaveManualTags={saveManualTags}
-            onMemoryDraftChange={setMemoryDraft}
-            onSaveOperatingMemory={saveOperatingMemory}
-            onSelectedPlaybook={setSelectedPlaybookId}
-            onSimulationInput={setSimulationInput}
+            draft={domainDrafts?.user_operations}
+            onChange={(draft) => setDomainDrafts({ ...(domainDrafts || {}), user_operations: draft })}
+            onReload={() => void loadDomains()}
+            onSave={(draft) => {
+              setDomainDrafts({ ...(domainDrafts || {}), user_operations: draft });
+              void saveOperationDomain("user_operations").then((saved) => {
+                if (saved) toast.success("作息时间已保存，将应用于后续任务");
+              });
+            }}
           />
-        </section>
+          <section className="userCockpitGrid">
+            <ContactsView
+              contactTab={contactTab}
+              contacts={filteredContacts}
+              query={searchQuery}
+              totalCount={contactCounts.all}
+              managedCount={managedCount}
+              normalCount={normalCount}
+              selected={scopedSelected}
+              onContactTab={setContactTab}
+              onLoadAll={reloadFiltered}
+              onOpenContact={openContact}
+              onQuery={setSearchQuery}
+              selectionScope={effectiveAccountId}
+              onBatchEnable={async (candidates) => {
+                if (!effectiveAccountId || candidates.length === 0) return;
+                try {
+                  const res = await batchEnable({
+                    accountId: effectiveAccountId,
+                    source: "pool",
+                    candidates,
+                    sharedNote: "从运营池批量启用"
+                  });
+                  toast.success(`已启用 ${res.enabled} 人，画像后台生成中`);
+                  void loadContacts(effectiveAccountId);
+                  void loadContactCounts(effectiveAccountId);
+                } catch (e) {
+                  toast.error(e instanceof Error ? e.message : "批量启用失败");
+                }
+              }}
+              onHideFromPool={async (contact) => {
+                if (!effectiveAccountId) return;
+                try {
+                  await hideFromPool(effectiveAccountId, contact.id);
+                  toast.success("已从运营池移除");
+                } catch (e) {
+                  toast.error(e instanceof Error ? e.message : "移除失败");
+                }
+              }}
+            />
+            <CockpitPanel
+              busy={busy}
+              decisionReviews={decisionReviews}
+              guideBusy={guideBusy}
+              guideInstruction={guideInstruction}
+              guidePreview={guidePreview}
+              health={operationHealth}
+              memoryCandidates={memoryCandidates}
+              memoryDraft={memoryDraft}
+              messages={messages}
+              operatingMemory={operatingMemory}
+              playbooks={playbooks}
+              profileNote={profileNote}
+              customAgentInstructions={customAgentInstructions}
+              assistOverride={assistOverride}
+              relationshipType={relationshipType}
+              referredSpecialistAt={referredSpecialistAt}
+              profileEditDraft={profileEditDraft}
+              selected={scopedSelected}
+              selectedPlaybookId={selectedPlaybookId}
+              simulationBusy={simulationBusy}
+              simulationInput={simulationInput}
+              simulationTurns={simulationTurns}
+              onAnalyzeProfile={analyzeProfile}
+              onApplyGuidePreview={onApplyGuide}
+              onDisableAgent={async () => { await disableAgent(); void loadContactCounts(effectiveAccountId); }}
+              onEnableAgent={async () => { await enableAgent(); void loadContactCounts(effectiveAccountId); }}
+              onGuideInstruction={setGuideInstruction}
+              onPreviewGuide={previewGuideInstruction}
+              onProfileNote={setProfileNote}
+              onCustomAgentInstructions={setCustomAgentInstructions}
+              onAssistOverride={setAssistOverride}
+              onRelationshipType={setRelationshipType}
+              onProfileEditDraftChange={setProfileEditDraft}
+              onRunMemoryConsolidation={runMemoryConsolidation}
+              onRunSimulation={runDialogueSimulation}
+              onSaveProfileNote={saveProfileNote}
+              onSaveCustomAgentInstructions={saveCustomAgentInstructions}
+              onSaveAssistOverride={saveAssistOverride}
+              onSaveRelationshipType={saveOperationProfile}
+              onSaveManualTags={saveManualTags}
+              onMemoryDraftChange={setMemoryDraft}
+              onSaveOperatingMemory={saveOperatingMemory}
+              onSelectedPlaybook={setSelectedPlaybookId}
+              onSimulationInput={setSimulationInput}
+            />
+          </section>
+        </>
       )}
 
       {userOpsMode === "roster" && <RosterView />}
