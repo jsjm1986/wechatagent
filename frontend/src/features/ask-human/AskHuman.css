@@ -87,9 +87,13 @@
   border: 1px solid rgba(255, 204, 0, 0.4);
 }
 
-/* summary：来源计数 chip 行，点击切源 */
+/* 工具栏：来源计数 chip 行，点击切源。命名对齐 Quality/Autonomy 的 .toolbar 惯例。
+   9 个 chip 在收紧 padding 后实测约 875px，1280px 视口可用 910px 可单排。
+   flex-wrap 保留但只作更窄视口的溢出兜底，不再是常态（原先 920px 容器下必然折行）。 */
+.askHumanToolbar,
 .askHumanSummary {
   display: flex;
+  align-items: center;
   flex-wrap: wrap;
   gap: 8px;
 }
@@ -97,7 +101,7 @@
   font: inherit;
   font-size: 12px;
   font-weight: 600;
-  padding: 6px 12px;
+  padding: 6px 10px;
   border-radius: 999px;
   cursor: pointer;
   background: var(--surface-1, #fff);

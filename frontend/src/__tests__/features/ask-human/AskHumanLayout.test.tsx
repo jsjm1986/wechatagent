@@ -103,3 +103,37 @@ describe("统一收件箱外壳结构", () => {
     expect(screen.getByText("刷新")).toBeTruthy();
   });
 });
+
+describe("来源筛选 chip 布局", () => {
+  // jsdom 无布局引擎，量不到实际宽度，也判断不出是否折行。
+  // 这里只锁结构：9 个 chip 必须同属一个 toolbar 容器，且该容器在白卡内、
+  // 与 panelHead 平级（而非塞进 panelHead 与按钮挤同一排——实测放不下）。
+  // 真实单排效果需目视确认。
+  it("9 个来源 chip 同属一个 toolbar 容器，位于白卡内且不在 panelHead 内", async () => {
+    mockInbox([item("a")]);
+    const { container } = renderInbox();
+    await screen.findByText("t-a");
+
+    const toolbar = container.querySelector(".askHumanToolbar");
+    expect(toolbar).not.toBeNull();
+
+    const chips = toolbar!.querySelectorAll(".askHumanSummaryChip");
+    expect(chips).toHaveLength(9);
+
+    // toolbar 在白卡内。
+    expect(container.querySelector(".askHumanPanel")!.contains(toolbar!)).toBe(true);
+    // 但不在 panelHead 内——chip 与按钮同排需 1111px，超出 1440px 视口的可用 1070px。
+    expect(container.querySelector(".askHumanPanelHead")!.contains(toolbar!)).toBe(false);
+  });
+
+  it("chip 文案与切源可用性不受布局改动影响", async () => {
+    mockInbox([item("a")]);
+    renderInbox();
+    await screen.findByText("t-a");
+
+    // counts 里给了 principalEscalation:1 / knowledgeReview:2，其余源无值 → 不可用。
+    expect(screen.getByText("请示裁决: 1")).toBeTruthy();
+    expect(screen.getByText("知识核验: 2")).toBeTruthy();
+    expect(screen.getByText("标签候选: 不可用")).toBeTruthy();
+  });
+});

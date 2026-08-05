@@ -224,7 +224,7 @@ function AskHumanView() {
             </div>
           )}
 
-          <div className="askHumanSummary">
+          <div className="askHumanToolbar askHumanSummary">
             {summary &&
               SOURCE_META.map(({ summaryKey, source, label }) => {
                 const count = summary.counts[summaryKey];
