@@ -78,7 +78,7 @@ pub(super) async fn list_tasks(
             doc! {
                 "workspace_id": &admin.current_workspace,
                 "account_id": &account_id,
-                "kind": { "$in": ["follow_up", "deferred_inbound_reply", "principal_decision_relay"] }
+                "kind": { "$in": ["follow_up", "inbound_reply", "deferred_inbound_reply", "principal_decision_relay"] }
             },
             FindOptions::builder()
                 .sort(doc! { "run_at": -1 })

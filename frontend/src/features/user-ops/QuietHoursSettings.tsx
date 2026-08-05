@@ -1,6 +1,9 @@
-import { Clock3, RefreshCw, Save } from "lucide-react";
+import { useState } from "react";
+import { Clock3, RefreshCw, Save, X } from "lucide-react";
+import { Overlay } from "../../components/ui/Overlay";
 import type { OperationDomainDraft } from "../../types";
 import {
+  QUIET_HOURS_COMPATIBILITY_DEFAULTS,
   quietHoursSettingsFromDraft,
   runtimeParametersWithQuietHours,
   type QuietHoursSettingsValue
@@ -19,6 +22,12 @@ function timezoneLabel(offset: number) {
   return offset === 8 ? `${utc} 中国标准时间` : utc;
 }
 
+function triggerSummary(settings: QuietHoursSettingsValue) {
+  return settings.enabled
+    ? `${hourLabel(settings.startHour)}–${hourLabel(settings.endHour)}`
+    : "已关闭";
+}
+
 export function quietHoursEffectText(settings: QuietHoursSettingsValue) {
   if (!settings.enabled) return "作息门控已关闭，Agent 全天正常处理新消息和主动跟进。";
   if (settings.startHour === settings.endHour) return "休息开始时间不能与醒来时间相同。";
@@ -31,120 +40,151 @@ export function quietHoursEffectText(settings: QuietHoursSettingsValue) {
 export function QuietHoursSettings({
   busy,
   draft,
-  onChange,
   onReload,
   onSave
 }: {
   busy: boolean;
   draft?: OperationDomainDraft;
-  onChange: (draft: OperationDomainDraft) => void;
   onReload: () => void;
-  onSave: (draft: OperationDomainDraft) => void;
+  onSave: (draft: OperationDomainDraft) => Promise<boolean>;
 }) {
-  if (!draft) {
+  const [open, setOpen] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [form, setForm] = useState<QuietHoursSettingsValue>(QUIET_HOURS_COMPATIBILITY_DEFAULTS);
+  const persisted = draft ? quietHoursSettingsFromDraft(draft) : null;
+
+  const openDialog = () => {
+    if (!draft || !persisted) return;
+    setForm(persisted);
+    setOpen(true);
+  };
+  const closeDialog = () => {
+    if (!saving) setOpen(false);
+  };
+  const validationError = form.enabled && form.startHour === form.endHour;
+  const save = async () => {
+    if (!draft || validationError || saving) return;
+    setSaving(true);
+    try {
+      const saved = await onSave({
+        ...draft,
+        runtimeParameters: runtimeParametersWithQuietHours(draft.runtimeParameters, form)
+      });
+      if (saved) setOpen(false);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (!persisted) {
     return (
-      <section className={`panel ${styles.panel}`} aria-label="作息时间">
-        <div className={styles.loadingCopy}>
-          <Clock3 size={18} />
-          <div>
-            <strong>作息时间</strong>
-            <span>正在读取当前 workspace 的运行策略。</span>
-          </div>
-        </div>
-        <button type="button" className="secondary" onClick={onReload} disabled={busy}>
-          <RefreshCw size={16} />
-          重新加载
-        </button>
-      </section>
+      <button type="button" className={styles.trigger} onClick={onReload} disabled={busy}>
+        <RefreshCw size={15} />
+        重新加载作息
+      </button>
     );
   }
 
-  const settings = quietHoursSettingsFromDraft(draft);
-  const validationError = settings.enabled && settings.startHour === settings.endHour;
-  const update = (patch: Partial<QuietHoursSettingsValue>) => {
-    const next = { ...settings, ...patch };
-    onChange({
-      ...draft,
-      runtimeParameters: runtimeParametersWithQuietHours(draft.runtimeParameters, next)
-    });
-  };
-  const save = () => {
-    // Save all four fields even when an older config only displayed compatibility defaults.
-    onSave({
-      ...draft,
-      runtimeParameters: runtimeParametersWithQuietHours(draft.runtimeParameters, settings)
-    });
-  };
-
   return (
-    <section className={`panel ${styles.panel}`} aria-labelledby="quiet-hours-title">
-      <div className={styles.heading}>
-        <div className={styles.titleBlock}>
-          <Clock3 size={19} />
-          <div>
-            <span>Workspace 全局策略</span>
-            <h2 id="quiet-hours-title">作息时间</h2>
+    <>
+      <button
+        type="button"
+        className={styles.trigger}
+        onClick={openDialog}
+        disabled={busy}
+        aria-haspopup="dialog"
+      >
+        <Clock3 size={15} />
+        <span>作息</span>
+        <strong>{triggerSummary(persisted)}</strong>
+      </button>
+
+      <Overlay open={open} onClose={closeDialog} labelledBy="quiet-hours-title" describedBy="quiet-hours-effect">
+        <div className={styles.dialog}>
+          <header className={styles.dialogHead}>
+            <div>
+              <span>Workspace 全局策略</span>
+              <h3 id="quiet-hours-title">作息时间</h3>
+            </div>
+            <button type="button" className={styles.iconButton} onClick={closeDialog} disabled={saving} aria-label="关闭">
+              <X size={17} />
+            </button>
+          </header>
+
+          <label className={styles.toggleRow}>
+            <input
+              type="checkbox"
+              checked={form.enabled}
+              onChange={(event) => setForm((current) => ({ ...current, enabled: event.target.checked }))}
+              disabled={saving}
+            />
+            <span>
+              <strong>启用作息门控</strong>
+              <small>休息时段暂停自动回复与主动跟进</small>
+            </span>
+          </label>
+
+          <div className={styles.controls}>
+            <label>
+              <span>休息开始</span>
+              <select
+                aria-label="休息开始"
+                value={form.startHour}
+                onChange={(event) => setForm((current) => ({ ...current, startHour: Number(event.target.value) }))}
+                disabled={saving || !form.enabled}
+              >
+                {HOURS.map((hour) => <option key={hour} value={hour}>{hourLabel(hour)}</option>)}
+              </select>
+            </label>
+            <label>
+              <span>醒来时间</span>
+              <select
+                aria-label="醒来时间"
+                value={form.endHour}
+                onChange={(event) => setForm((current) => ({ ...current, endHour: Number(event.target.value) }))}
+                disabled={saving || !form.enabled}
+              >
+                {HOURS.map((hour) => <option key={hour} value={hour}>{hourLabel(hour)}</option>)}
+              </select>
+            </label>
+            <label className={styles.timezoneField}>
+              <span>时区</span>
+              <select
+                aria-label="时区"
+                value={form.tzOffsetHours}
+                onChange={(event) => setForm((current) => ({ ...current, tzOffsetHours: Number(event.target.value) }))}
+                disabled={saving || !form.enabled}
+              >
+                {TIMEZONE_OFFSETS.map((offset) => (
+                  <option key={offset} value={offset}>{timezoneLabel(offset)}</option>
+                ))}
+              </select>
+            </label>
           </div>
+
+          <div
+            id="quiet-hours-effect"
+            className={validationError ? styles.effectError : styles.effect}
+            role={validationError ? "alert" : undefined}
+          >
+            {quietHoursEffectText(form)} 时区：{timezoneLabel(form.tzOffsetHours)}。
+          </div>
+
+          <section className={styles.behaviorNote} aria-label="生效说明">
+            <strong>保存成功后立即生效，无需重启</strong>
+            <p>后续新消息与任务下一次处理时使用新设置。</p>
+            <p>已排队的醒来回复保留原执行时间；普通主动跟进若命中新休息时段，会顺延到新的醒来时间。</p>
+          </section>
+
+          <footer className={styles.actions}>
+            <button type="button" className={styles.cancel} onClick={closeDialog} disabled={saving}>取消</button>
+            <button type="button" className={styles.save} onClick={() => void save()} disabled={saving || validationError}>
+              <Save size={16} />
+              {saving ? "保存中" : "保存作息"}
+            </button>
+          </footer>
         </div>
-        <label className={styles.toggleRow}>
-          <input
-            type="checkbox"
-            checked={settings.enabled}
-            onChange={(event) => update({ enabled: event.target.checked })}
-            disabled={busy}
-          />
-          <span>{settings.enabled ? "已启用" : "已关闭"}</span>
-        </label>
-      </div>
-
-      <div className={styles.controls}>
-        <label>
-          <span>休息开始</span>
-          <select
-            aria-label="休息开始"
-            value={settings.startHour}
-            onChange={(event) => update({ startHour: Number(event.target.value) })}
-            disabled={busy || !settings.enabled}
-          >
-            {HOURS.map((hour) => <option key={hour} value={hour}>{hourLabel(hour)}</option>)}
-          </select>
-        </label>
-        <label>
-          <span>醒来时间</span>
-          <select
-            aria-label="醒来时间"
-            value={settings.endHour}
-            onChange={(event) => update({ endHour: Number(event.target.value) })}
-            disabled={busy || !settings.enabled}
-          >
-            {HOURS.map((hour) => <option key={hour} value={hour}>{hourLabel(hour)}</option>)}
-          </select>
-        </label>
-        <label>
-          <span>时区</span>
-          <select
-            aria-label="时区"
-            value={settings.tzOffsetHours}
-            onChange={(event) => update({ tzOffsetHours: Number(event.target.value) })}
-            disabled={busy || !settings.enabled}
-          >
-            {TIMEZONE_OFFSETS.map((offset) => (
-              <option key={offset} value={offset}>{timezoneLabel(offset)}</option>
-            ))}
-          </select>
-        </label>
-        <button type="button" onClick={save} disabled={busy || validationError}>
-          <Save size={16} />
-          保存作息
-        </button>
-      </div>
-
-      <div className={validationError ? styles.effectError : styles.effect} role={validationError ? "alert" : undefined}>
-        {quietHoursEffectText(settings)} 时区：{timezoneLabel(settings.tzOffsetHours)}。
-      </div>
-      <p className={styles.notice}>
-        保存只影响后续新消息和后续主动跟进；已经排队的延迟回复仍按原计划执行。
-      </p>
-    </section>
+      </Overlay>
+    </>
   );
 }

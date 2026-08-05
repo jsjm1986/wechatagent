@@ -618,4 +618,27 @@ describe("userOpsStore.saveOperationDomain", () => {
       useUserOpsStore.getState().saveOperationDomain("user_operations")
     ).resolves.toBe(false);
   });
+
+  it("可直接提交弹窗草稿，不依赖先写入全局 domainDrafts", async () => {
+    const override = {
+      ...domainDraft,
+      runtimeParameters: domainDraft.runtimeParameters.replace(
+        "quietHoursEnd = 7",
+        "quietHoursEnd = 9"
+      )
+    };
+
+    const saved = await useUserOpsStore.getState().saveOperationDomain(
+      "user_operations",
+      override
+    );
+
+    expect(saved).toBe(true);
+    expect(api.put).toHaveBeenCalledWith(
+      "/api/operation-domains/user_operations",
+      expect.objectContaining({
+        runtimeParameters: expect.objectContaining({ quietHoursEnd: 9 })
+      })
+    );
+  });
 });

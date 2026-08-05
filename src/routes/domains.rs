@@ -151,7 +151,19 @@ pub(super) async fn update_operation_domain(
         DateTime::now(),
     )
     .await;
-    Ok(Json(json!({ "ok": true })))
+
+    // Workspace 作息是强制全局策略。保存 user_operations 后立即重新协调全部尚未
+    // 跨过远端发送边界的被动回复义务；关闭/缩短作息会释放，延长/换时区会重排。
+    let reconciled_reply_obligations = if domain == crate::agent::domain::USER_OPS_DOMAIN_ID {
+        crate::webhooks::reconcile_workspace_reply_obligations(&state, &admin.current_workspace)
+            .await?
+    } else {
+        0
+    };
+    Ok(Json(json!({
+        "ok": true,
+        "reconciledReplyObligations": reconciled_reply_obligations,
+    })))
 }
 
 pub(super) async fn get_operation_domain_state_machine(
@@ -205,7 +217,19 @@ pub async fn update_operation_domain_state_machine(
         DateTime::now(),
     )
     .await;
-    Ok(Json(json!({ "ok": true })))
+
+    // Workspace 作息是强制全局策略。保存 user_operations 后立即重新协调全部尚未
+    // 跨过远端发送边界的被动回复义务；关闭/缩短作息会释放，延长/换时区会重排。
+    let reconciled_reply_obligations = if domain == crate::agent::domain::USER_OPS_DOMAIN_ID {
+        crate::webhooks::reconcile_workspace_reply_obligations(&state, &admin.current_workspace)
+            .await?
+    } else {
+        0
+    };
+    Ok(Json(json!({
+        "ok": true,
+        "reconciledReplyObligations": reconciled_reply_obligations,
+    })))
 }
 
 /// PUT /api/admin/operation-domains/:domain/ask-human-policy

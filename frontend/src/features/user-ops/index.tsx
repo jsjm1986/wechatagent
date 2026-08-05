@@ -274,23 +274,25 @@ function UserOpsFeatureInner() {
 
   return (
     <section className="userOpsWorkspace">
-      <UserOpsModeHeader mode={userOpsMode} onMode={setUserOpsMode} />
-
-      {userOpsMode === "smart" && (
-        <>
+      <UserOpsModeHeader
+        mode={userOpsMode}
+        onMode={setUserOpsMode}
+        action={userOpsMode === "smart" ? (
           <QuietHoursSettings
             busy={busy}
             draft={domainDrafts?.user_operations}
-            onChange={(draft) => setDomainDrafts({ ...(domainDrafts || {}), user_operations: draft })}
             onReload={() => void loadDomains()}
-            onSave={(draft) => {
-              setDomainDrafts({ ...(domainDrafts || {}), user_operations: draft });
-              void saveOperationDomain("user_operations").then((saved) => {
-                if (saved) toast.success("作息时间已保存，将应用于后续任务");
-              });
+            onSave={async (draft) => {
+              const saved = await saveOperationDomain("user_operations", draft);
+              if (saved) toast.success("作息时间已保存，后续处理立即使用新设置");
+              return saved;
             }}
           />
-          <section className="userCockpitGrid">
+        ) : undefined}
+      />
+
+      {userOpsMode === "smart" && (
+        <section className="userCockpitGrid">
             <ContactsView
               contactTab={contactTab}
               contacts={filteredContacts}
@@ -376,8 +378,7 @@ function UserOpsFeatureInner() {
               onSelectedPlaybook={setSelectedPlaybookId}
               onSimulationInput={setSimulationInput}
             />
-          </section>
-        </>
+        </section>
       )}
 
       {userOpsMode === "roster" && <RosterView />}

@@ -13,7 +13,7 @@ use hmac::{Hmac, Mac};
 use mongodb::{
     bson::{doc, oid::ObjectId, to_document, DateTime, Document},
     error::{ErrorKind, WriteFailure},
-    options::{FindOptions, UpdateOptions},
+    options::{FindOneAndUpdateOptions, FindOptions, UpdateOptions},
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -37,7 +37,7 @@ pub const DURABLE_INBOUND_REPLY_KIND: &str = "inbound_reply";
 const DURABLE_INBOUND_ACTIVE_KEY: &str = "inbound_reply";
 const HANDOFF_PENDING: &str = "pending";
 const HANDOFF_MATERIALIZED: &str = "materialized";
-const HANDOFF_DEFERRED: &str = "deferred";
+const HANDOFF_DEFERRED: &str = "deferred"; // legacy read compatibility only
 const HANDOFF_IGNORED: &str = "ignored_not_managed";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,7 +46,11 @@ pub struct DurableInboundTask {
     pub run_at_ms: i64,
 }
 
-fn durable_inbound_task_id(workspace_id: &str, account_id: &str, wxid: &str) -> ObjectId {
+pub(crate) fn durable_inbound_task_id(
+    workspace_id: &str,
+    account_id: &str,
+    wxid: &str,
+) -> ObjectId {
     let mut hasher = Sha256::new();
     for value in [workspace_id, account_id, wxid, DURABLE_INBOUND_REPLY_KIND] {
         hasher.update(value.as_bytes());
@@ -68,7 +72,7 @@ pub async fn mark_inbound_handoff(
         .messages()
         .clone_with_type::<Document>()
         .update_one(
-            doc! { "_id": message_id, "handoff_status": HANDOFF_PENDING },
+            doc! { "_id": message_id, "handoff_status": { "$in": [HANDOFF_PENDING, HANDOFF_DEFERRED] } },
             doc! { "$set": {
                 "handoff_status": status,
                 "handoff_updated_at": DateTime::now(),
@@ -90,17 +94,30 @@ pub async fn materialize_durable_inbound_task(
     inbound: &ConversationMessage,
     debounce_window_ms: u64,
 ) -> AppResult<DurableInboundTask> {
-    let message_id = inbound.id.ok_or_else(|| {
-        AppError::External("durable inbound handoff requires persisted message _id".to_string())
-    })?;
-    let task_id =
-        durable_inbound_task_id(&contact.workspace_id, &contact.account_id, &contact.wxid);
     let run_at = DateTime::from_millis(
         inbound
             .created_at
             .timestamp_millis()
             .saturating_add(debounce_window_ms.min(i64::MAX as u64) as i64),
     );
+    materialize_durable_inbound_task_at(state, contact, inbound, run_at, "debouncing").await
+}
+
+/// Materialize the contact's single passive-reply obligation at an explicit policy time.
+/// Quiet hours and ordinary debounce both use this row; `kind` never changes, so a newer
+/// inbound always fences an older generator/outbox regardless of the policy transition.
+pub async fn materialize_durable_inbound_task_at(
+    state: &AppState,
+    contact: &Contact,
+    inbound: &ConversationMessage,
+    run_at: DateTime,
+    schedule_reason: &str,
+) -> AppResult<DurableInboundTask> {
+    let message_id = inbound.id.ok_or_else(|| {
+        AppError::External("durable inbound handoff requires persisted message _id".to_string())
+    })?;
+    let task_id =
+        durable_inbound_task_id(&contact.workspace_id, &contact.account_id, &contact.wxid);
     let now = DateTime::now();
     let task = AgentTask {
         id: Some(task_id),
@@ -117,7 +134,7 @@ pub async fn materialize_durable_inbound_task(
         attempt_count: 0,
         max_attempts: 3,
         next_retry_at: None,
-        gateway_status: None,
+        gateway_status: Some(schedule_reason.to_string()),
         cancel_reason: None,
         error: None,
         claimed_at: None,
@@ -129,64 +146,73 @@ pub async fn materialize_durable_inbound_task(
     insert_doc.insert("active_task_key", DURABLE_INBOUND_ACTIVE_KEY);
     insert_doc.insert("latest_inbound_id", message_id);
     insert_doc.insert("latest_inbound_created_at", inbound.created_at);
+    // Stable lower bound for context expansion before the first successful delivery.
+    insert_doc.insert("obligation_started_inbound_id", message_id);
+    insert_doc.insert("obligation_started_inbound_created_at", inbound.created_at);
 
+    let newer = doc! { "$or": [
+        { "latest_inbound_created_at": { "$exists": false } },
+        { "latest_inbound_created_at": null },
+        { "latest_inbound_created_at": { "$lt": inbound.created_at } },
+        { "latest_inbound_created_at": inbound.created_at, "$or": [
+            { "latest_inbound_id": { "$exists": false } },
+            { "latest_inbound_id": null },
+            { "latest_inbound_id": { "$lt": message_id } },
+        ]},
+    ]};
     let tasks = state.db.tasks().clone_with_type::<Document>();
     match tasks.insert_one(insert_doc, None).await {
         Ok(_) => {}
         Err(error) if is_duplicate_key_error(&error) => {
-            tasks
+            // A manual reply pauses the obligation. New inbound extends its upper watermark but
+            // must not start an AI reply before that manual delivery settles.
+            let mut manual_filter = doc! {
+                "_id": task_id,
+                "manual_reply_run_id": { "$exists": true },
+            };
+            manual_filter.extend(newer.clone());
+            let manual = tasks
                 .update_one(
-                    doc! {
-                        "_id": task_id,
-                        "$or": [
-                            { "latest_inbound_created_at": { "$exists": false } },
-                            { "latest_inbound_created_at": null },
-                            { "latest_inbound_created_at": { "$lt": inbound.created_at } },
-                            {
-                                "latest_inbound_created_at": inbound.created_at,
-                                "$or": [
-                                    { "latest_inbound_id": { "$exists": false } },
-                                    { "latest_inbound_id": null },
-                                    { "latest_inbound_id": { "$lt": message_id } },
-                                ],
-                            },
-                        ],
-                    },
-                    doc! {
-                        "$set": {
-                            "workspace_id": &contact.workspace_id,
-                            "account_id": &contact.account_id,
-                            "contact_wxid": &contact.wxid,
-                            "kind": DURABLE_INBOUND_REPLY_KIND,
-                            "active_task_key": DURABLE_INBOUND_ACTIVE_KEY,
-                            "latest_inbound_id": message_id,
-                            "latest_inbound_created_at": inbound.created_at,
-                            "run_at": run_at,
-                            "content": message_id.to_hex(),
-                            "status": "pending",
-                            "review_required": true,
-                            "attempt_count": 0,
-                            "max_attempts": 3,
-                            "claim_recovery_count": 0,
-                            "updated_at": now,
-                        },
-                        "$unset": {
-                            "expires_at": "",
-                            "source_decision_id": "",
-                            "next_retry_at": "",
-                            "gateway_status": "",
-                            "cancel_reason": "",
-                            "error": "",
-                            "claimed_at": "",
-                            "claim_token": "",
-                            "outbox_decision_id": "",
-                            "prepared_commit_kind": "",
-                            "prepared_commit": "",
-                        },
-                    },
+                    manual_filter,
+                    doc! { "$set": {
+                        "latest_inbound_id": message_id,
+                        "latest_inbound_created_at": inbound.created_at,
+                        "run_at": run_at,
+                        "content": message_id.to_hex(),
+                        "updated_at": now,
+                    }},
                     None,
                 )
                 .await?;
+            if manual.matched_count == 0 {
+                let mut refresh_filter = doc! {
+                    "_id": task_id,
+                    "manual_reply_run_id": { "$exists": false },
+                };
+                refresh_filter.extend(newer);
+                tasks.update_one(
+                    refresh_filter,
+                    doc! {
+                        "$set": {
+                            "workspace_id": &contact.workspace_id, "account_id": &contact.account_id,
+                            "contact_wxid": &contact.wxid, "kind": DURABLE_INBOUND_REPLY_KIND,
+                            "active_task_key": DURABLE_INBOUND_ACTIVE_KEY,
+                            "latest_inbound_id": message_id, "latest_inbound_created_at": inbound.created_at,
+                            "run_at": run_at, "content": message_id.to_hex(), "status": "pending",
+                            "gateway_status": schedule_reason, "review_required": true,
+                            "attempt_count": 0, "max_attempts": 3, "claim_recovery_count": 0,
+                            "updated_at": now,
+                        },
+                        "$unset": {
+                            "expires_at": "", "source_decision_id": "", "next_retry_at": "",
+                            "cancel_reason": "", "error": "", "claimed_at": "", "claim_token": "",
+                            "outbox_decision_id": "", "prepared_commit_kind": "", "prepared_commit": "",
+                            "manual_reply_run_id": "",
+                        },
+                    },
+                    None,
+                ).await?;
+            }
         }
         Err(error) => return Err(error.into()),
     }
@@ -196,15 +222,590 @@ pub async fn materialize_durable_inbound_task(
         .find_one(doc! { "_id": task_id }, None)
         .await?
         .ok_or_else(|| AppError::External("durable inbound task disappeared".to_string()))?;
-    let stored_run_at = stored
-        .get_datetime("run_at")
-        .copied()
-        .unwrap_or(run_at)
-        .timestamp_millis();
     Ok(DurableInboundTask {
         task_id,
-        run_at_ms: stored_run_at,
+        run_at_ms: stored
+            .get_datetime("run_at")
+            .copied()
+            .unwrap_or(run_at)
+            .timestamp_millis(),
     })
+}
+
+pub(crate) fn policy_run_at(
+    runtime: &crate::agent::UserRuntimeParameters,
+    contact: &Contact,
+    state: &AppState,
+) -> DateTime {
+    if runtime.quiet_hours_enabled
+        && agent::quiet_hours::is_quiet_now(
+            runtime.quiet_hours_start,
+            runtime.quiet_hours_end,
+            runtime.quiet_hours_tz_offset_hours,
+        )
+    {
+        agent::quiet_hours::next_wake_at(
+            runtime.quiet_hours_end,
+            runtime.quiet_hours_tz_offset_hours,
+            &contact.wxid,
+            state.config.wake_jitter_max_seconds,
+        )
+    } else {
+        DateTime::now()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ManualReplyCoverage {
+    pub task_id: ObjectId,
+    pub inbound_id: ObjectId,
+    pub inbound_created_at: DateTime,
+}
+
+/// Freeze the inbound watermark covered by a manual reply and pause the reusable passive-reply
+/// obligation. The task transition fences any older AI owner before its Outbox is canceled.
+pub(crate) async fn pause_reply_obligation_for_manual(
+    state: &AppState,
+    contact: &Contact,
+    run_id: &str,
+) -> AppResult<Option<ManualReplyCoverage>> {
+    let latest = state
+        .db
+        .messages()
+        .find_one(
+            doc! {
+                "workspace_id": &contact.workspace_id,
+                "account_id": &contact.account_id,
+                "contact_wxid": &contact.wxid,
+                "direction": "inbound",
+            },
+            mongodb::options::FindOneOptions::builder()
+                .sort(doc! { "created_at": -1, "_id": -1 })
+                .build(),
+        )
+        .await?;
+    let Some(latest) = latest else {
+        return Ok(None);
+    };
+    let Some(inbound_id) = latest.id else {
+        return Ok(None);
+    };
+
+    // Repair a historical/crash gap before pausing so every covered inbound has one stable row.
+    let task_id =
+        durable_inbound_task_id(&contact.workspace_id, &contact.account_id, &contact.wxid);
+    if state
+        .db
+        .tasks()
+        .count_documents(doc! { "_id": task_id }, None)
+        .await?
+        == 0
+    {
+        materialize_durable_inbound_task_at(
+            state,
+            contact,
+            &latest,
+            DateTime::now(),
+            "manual_reply_preparing",
+        )
+        .await?;
+    }
+
+    let previous = state
+        .db
+        .tasks()
+        .clone_with_type::<Document>()
+        .find_one_and_update(
+            doc! {
+                "_id": task_id,
+                "kind": DURABLE_INBOUND_REPLY_KIND,
+                "$or": [
+                    { "manual_reply_run_id": { "$exists": false } },
+                    { "manual_reply_run_id": run_id },
+                ],
+            },
+            doc! {
+                "$set": {
+                    "status": "pending",
+                    "gateway_status": "manual_reply_pending",
+                    "manual_reply_run_id": run_id,
+                    "manual_reply_started_at": DateTime::now(),
+                    "manual_covers_through_inbound_id": inbound_id,
+                    "manual_covers_through_inbound_created_at": latest.created_at,
+                    "updated_at": DateTime::now(),
+                },
+                "$unset": {
+                    "claim_token": "", "claimed_at": "", "outbox_decision_id": "",
+                    "next_retry_at": "", "error": "",
+                },
+            },
+            FindOneAndUpdateOptions::builder()
+                .return_document(mongodb::options::ReturnDocument::Before)
+                .build(),
+        )
+        .await?;
+    let Some(previous) = previous else {
+        return Err(AppError::Conflict(
+            "another_manual_reply_is_pending".to_string(),
+        ));
+    };
+    if let Ok(decision_id) = previous.get_object_id("outbox_decision_id") {
+        if let Err(error) = agent::cancel_for_decision(
+            state,
+            &contact.workspace_id,
+            decision_id,
+            "superseded_by_manual_reply",
+        )
+        .await
+        {
+            if let Err(release_error) = settle_manual_reply_obligation(
+                state,
+                &contact.workspace_id,
+                &contact.account_id,
+                &contact.wxid,
+                run_id,
+                false,
+            )
+            .await
+            {
+                tracing::error!(%release_error, %run_id, "failed to release manual reply pause after old outbox cancellation failure");
+            }
+            return Err(error.into());
+        }
+    }
+    Ok(Some(ManualReplyCoverage {
+        task_id,
+        inbound_id,
+        inbound_created_at: latest.created_at,
+    }))
+}
+
+/// Advance a passive-reply watermark without ever regressing a newer delivery.
+async fn advance_covered_watermark(
+    state: &AppState,
+    task_id: ObjectId,
+    inbound_id: ObjectId,
+    inbound_created_at: DateTime,
+) -> AppResult<()> {
+    state
+        .db
+        .tasks()
+        .clone_with_type::<Document>()
+        .update_one(
+            doc! {
+                "_id": task_id,
+                "kind": DURABLE_INBOUND_REPLY_KIND,
+                "$or": [
+                    { "covered_through_inbound_created_at": { "$exists": false } },
+                    { "covered_through_inbound_created_at": null },
+                    { "covered_through_inbound_created_at": { "$lt": inbound_created_at } },
+                    {
+                        "covered_through_inbound_created_at": inbound_created_at,
+                        "$or": [
+                            { "covered_through_inbound_id": { "$exists": false } },
+                            { "covered_through_inbound_id": null },
+                            { "covered_through_inbound_id": { "$lt": inbound_id } },
+                        ],
+                    },
+                ],
+            },
+            doc! { "$set": {
+                "covered_through_inbound_id": inbound_id,
+                "covered_through_inbound_created_at": inbound_created_at,
+                "updated_at": DateTime::now(),
+            } },
+            None,
+        )
+        .await?;
+    Ok(())
+}
+
+/// Settle an AI passive reply after all of its text segments are confirmed delivered. A policy
+/// edit may already have invalidated the old claim, and a newer inbound may already have refreshed
+/// the reusable task. The frozen watermark is still advanced, but the obligation is completed only
+/// when that watermark remains the latest inbound and no manual reply owns the contact.
+pub(crate) async fn settle_ai_reply_obligation(
+    state: &AppState,
+    task_id: ObjectId,
+    inbound_id: ObjectId,
+    inbound_created_at: DateTime,
+) -> AppResult<bool> {
+    advance_covered_watermark(state, task_id, inbound_id, inbound_created_at).await?;
+    let result = state
+        .db
+        .tasks()
+        .clone_with_type::<Document>()
+        .update_one(
+            doc! {
+                "_id": task_id,
+                "kind": DURABLE_INBOUND_REPLY_KIND,
+                "latest_inbound_id": inbound_id,
+                "latest_inbound_created_at": inbound_created_at,
+                "manual_reply_run_id": { "$exists": false },
+            },
+            doc! {
+                "$set": {
+                    "status": "sent",
+                    "gateway_status": "agent_reply_delivered",
+                    "covered_through_inbound_id": inbound_id,
+                    "covered_through_inbound_created_at": inbound_created_at,
+                    "updated_at": DateTime::now(),
+                },
+                "$unset": {
+                    "claim_token": "", "claimed_at": "", "outbox_decision_id": "",
+                    "next_retry_at": "", "error": "",
+                },
+            },
+            None,
+        )
+        .await?;
+    Ok(result.matched_count == 1)
+}
+
+/// Resolve a manual reply pause. Delivery covers only the frozen watermark; inbound messages that
+/// arrived while MCP was sending remain on the same obligation and are rescheduled by current
+/// Workspace policy. A failed enqueue/terminal send never advances coverage.
+pub(crate) async fn settle_manual_reply_obligation(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+    contact_wxid: &str,
+    run_id: &str,
+    delivered: bool,
+) -> AppResult<bool> {
+    let task_id = durable_inbound_task_id(workspace_id, account_id, contact_wxid);
+    let Some(task) = state
+        .db
+        .tasks()
+        .clone_with_type::<Document>()
+        .find_one(doc! { "_id": task_id, "manual_reply_run_id": run_id }, None)
+        .await?
+    else {
+        return Ok(false);
+    };
+    let Some(contact) = state
+        .db
+        .contacts()
+        .find_one(
+            doc! { "workspace_id": workspace_id, "account_id": account_id, "wxid": contact_wxid },
+            None,
+        )
+        .await?
+    else {
+        return Ok(false);
+    };
+    let config = agent::load_user_operation_domain_config(state, workspace_id).await?;
+    let runtime = crate::agent::UserRuntimeParameters::from_config(config.as_ref(), state);
+    let run_at = policy_run_at(&runtime, &contact, state);
+    let covers_id = task.get_object_id("manual_covers_through_inbound_id").ok();
+    let covers_at = task
+        .get_datetime("manual_covers_through_inbound_created_at")
+        .copied()
+        .ok();
+
+    if delivered {
+        if let (Some(id), Some(at)) = (covers_id, covers_at) {
+            advance_covered_watermark(state, task_id, id, at).await?;
+            // Exact latest-watermark CAS: an inbound racing this update prevents false completion.
+            let completed = state
+                .db
+                .tasks()
+                .clone_with_type::<Document>()
+                .update_one(
+                    doc! {
+                        "_id": task_id,
+                        "manual_reply_run_id": run_id,
+                        "latest_inbound_id": id,
+                        "latest_inbound_created_at": at,
+                    },
+                    doc! {
+                        "$set": {
+                            "status": "sent",
+                            "gateway_status": "manual_reply_delivered",
+                            "covered_through_inbound_id": id,
+                            "covered_through_inbound_created_at": at,
+                            "updated_at": DateTime::now(),
+                        },
+                        "$unset": {
+                            "manual_reply_run_id": "", "manual_reply_started_at": "",
+                            "manual_covers_through_inbound_id": "",
+                            "manual_covers_through_inbound_created_at": "", "claim_token": "",
+                            "claimed_at": "", "outbox_decision_id": "", "next_retry_at": "",
+                        },
+                    },
+                    None,
+                )
+                .await?;
+            if completed.matched_count == 1 {
+                return Ok(true);
+            }
+        }
+    }
+
+    // Failed delivery, or a successful delivery with a later inbound: release only this manual
+    // owner's pause and keep the single obligation runnable under the current Workspace policy.
+    let result = state
+        .db
+        .tasks()
+        .clone_with_type::<Document>()
+        .update_one(
+            doc! { "_id": task_id, "manual_reply_run_id": run_id },
+            doc! {
+                "$set": {
+                    "status": "pending",
+                    "run_at": run_at,
+                    "gateway_status": if delivered {
+                        "manual_reply_delivered_newer_inbound_pending"
+                    } else {
+                        "manual_reply_failed_rescheduled"
+                    },
+                    "updated_at": DateTime::now(),
+                },
+                "$unset": {
+                    "manual_reply_run_id": "", "manual_reply_started_at": "",
+                    "manual_covers_through_inbound_id": "",
+                    "manual_covers_through_inbound_created_at": "", "claim_token": "",
+                    "claimed_at": "", "outbox_decision_id": "", "next_retry_at": "",
+                },
+            },
+            None,
+        )
+        .await?;
+    Ok(result.matched_count == 1)
+}
+
+fn manual_outbox_settlement(statuses: &[String]) -> Option<bool> {
+    if statuses.is_empty() {
+        return None;
+    }
+    if statuses.iter().all(|status| status == "sent") {
+        return Some(true);
+    }
+    // Any sent segment makes delivery partial and irreversible. Keep the pause until an operator
+    // resolves it; never let an AI reply duplicate or contradict the already delivered prefix.
+    if statuses.iter().any(|status| {
+        matches!(
+            status.as_str(),
+            "sent" | "pending" | "in_flight" | "delivery_unknown"
+        )
+    }) {
+        return None;
+    }
+    Some(false)
+}
+
+/// Recover manual pauses after external cancellation, terminal failure, or a crash between pause
+/// and Outbox creation. `delivery_unknown` deliberately remains paused to avoid a duplicate reply.
+pub(crate) async fn reconcile_manual_reply_obligations(state: &AppState) -> AppResult<u64> {
+    use futures::TryStreamExt;
+    const ORPHAN_GRACE_MS: i64 = 5 * 60 * 1000;
+
+    let mut cursor = state
+        .db
+        .tasks()
+        .clone_with_type::<Document>()
+        .find(
+            doc! { "kind": DURABLE_INBOUND_REPLY_KIND, "manual_reply_run_id": { "$type": "string" } },
+            FindOptions::builder().limit(100).build(),
+        )
+        .await?;
+    let mut settled = 0u64;
+    while let Some(task) = cursor.try_next().await? {
+        let Ok(run_id) = task.get_str("manual_reply_run_id") else {
+            continue;
+        };
+        let Ok(workspace_id) = task.get_str("workspace_id") else {
+            continue;
+        };
+        let Ok(account_id) = task.get_str("account_id") else {
+            continue;
+        };
+        let Ok(wxid) = task.get_str("contact_wxid") else {
+            continue;
+        };
+        let mut outboxes = state
+            .db
+            .collection_agent_send_outbox()
+            .find(
+                doc! { "run_id": run_id, "source_kind": "manual_send" },
+                None,
+            )
+            .await?;
+        let mut statuses = Vec::new();
+        while let Some(entry) = outboxes.try_next().await? {
+            statuses.push(entry.status);
+        }
+        let action = if statuses.is_empty() {
+            let started = task
+                .get_datetime("manual_reply_started_at")
+                .or_else(|_| task.get_datetime("updated_at"))
+                .map(|v| v.timestamp_millis())
+                .unwrap_or_else(|_| DateTime::now().timestamp_millis());
+            (DateTime::now().timestamp_millis() - started >= ORPHAN_GRACE_MS).then_some(false)
+        } else {
+            manual_outbox_settlement(&statuses)
+        };
+        if let Some(delivered) = action {
+            if settle_manual_reply_obligation(
+                state,
+                workspace_id,
+                account_id,
+                wxid,
+                run_id,
+                delivered,
+            )
+            .await?
+            {
+                settled = settled.saturating_add(1);
+            }
+        }
+    }
+    Ok(settled)
+}
+
+/// Recompute every unfinished passive-reply obligation after a workspace policy edit.
+///
+/// The task transition is the authorization fence: it clears the old claim before asking the
+/// Outbox to cancel that decision. A worker already beyond the remote boundary is allowed to
+/// settle truthfully; every earlier stage is stopped and the same obligation is rescheduled.
+pub async fn reconcile_workspace_reply_obligations(
+    state: &AppState,
+    workspace_id: &str,
+) -> AppResult<u64> {
+    use futures::TryStreamExt;
+
+    let config = agent::load_user_operation_domain_config(state, workspace_id).await?;
+    let runtime = crate::agent::UserRuntimeParameters::from_config(config.as_ref(), state);
+    let tasks = state.db.tasks().clone_with_type::<Document>();
+    let mut cursor = tasks
+        .find(
+            doc! {
+                "workspace_id": workspace_id,
+                "kind": { "$in": [
+                    DURABLE_INBOUND_REPLY_KIND,
+                    agent::quiet_hours::DEFERRED_INBOUND_REPLY_KIND,
+                ] },
+                "status": { "$in": ["pending", "retry", "failed", "running", "outbox_enqueued"] },
+            },
+            None,
+        )
+        .await?;
+    let mut snapshots = Vec::new();
+    while let Some(task) = cursor.try_next().await? {
+        snapshots.push(task);
+    }
+
+    let mut changed = 0u64;
+    for task in snapshots {
+        let Ok(task_id) = task.get_object_id("_id") else {
+            continue;
+        };
+        let Ok(account_id) = task.get_str("account_id") else {
+            continue;
+        };
+        let Ok(contact_wxid) = task.get_str("contact_wxid") else {
+            continue;
+        };
+        let Some(contact) = state
+            .db
+            .contacts()
+            .find_one(
+                doc! {
+                    "workspace_id": workspace_id,
+                    "account_id": account_id,
+                    "wxid": contact_wxid,
+                },
+                None,
+            )
+            .await?
+        else {
+            continue;
+        };
+        let run_at = policy_run_at(&runtime, &contact, state);
+        let old_decision = task.get_object_id("outbox_decision_id").ok();
+        let is_legacy =
+            task.get_str("kind").ok() == Some(agent::quiet_hours::DEFERRED_INBOUND_REPLY_KIND);
+
+        // Invalidate ownership first. Dispatcher authorization always joins back to this task.
+        let result = tasks
+            .update_one(
+                doc! {
+                    "_id": task_id,
+                    "status": { "$in": ["pending", "retry", "failed", "running", "outbox_enqueued"] },
+                },
+                if is_legacy {
+                    doc! {
+                        "$set": {
+                            "status": "cancelled",
+                            "gateway_status": "merged_into_reply_obligation",
+                            "updated_at": DateTime::now(),
+                        },
+                        "$unset": {
+                            "claim_token": "", "claimed_at": "", "active_task_key": "",
+                            "outbox_decision_id": "", "next_retry_at": "",
+                        },
+                    }
+                } else {
+                    doc! {
+                        "$set": {
+                            "status": "pending",
+                            "run_at": run_at,
+                            "gateway_status": "policy_reconciled",
+                            "attempt_count": 0,
+                            "updated_at": DateTime::now(),
+                        },
+                        "$unset": {
+                            "claim_token": "", "claimed_at": "", "next_retry_at": "",
+                            "outbox_decision_id": "", "error": "",
+                        },
+                    }
+                },
+                None,
+            )
+            .await?;
+        if result.matched_count == 0 {
+            continue;
+        }
+        changed = changed.saturating_add(1);
+        if let Some(decision_id) = old_decision {
+            agent::cancel_for_decision(
+                state,
+                workspace_id,
+                decision_id,
+                "quiet_hours_policy_changed",
+            )
+            .await?;
+        }
+
+        if is_legacy {
+            if let Some(inbound) = state
+                .db
+                .messages()
+                .find_one(
+                    doc! {
+                        "workspace_id": workspace_id,
+                        "account_id": account_id,
+                        "contact_wxid": contact_wxid,
+                        "direction": "inbound",
+                    },
+                    mongodb::options::FindOneOptions::builder()
+                        .sort(doc! { "created_at": -1, "_id": -1 })
+                        .build(),
+                )
+                .await?
+            {
+                materialize_durable_inbound_task_at(
+                    state,
+                    &contact,
+                    &inbound,
+                    run_at,
+                    "policy_reconciled",
+                )
+                .await?;
+            }
+        }
+    }
+    Ok(changed)
 }
 
 /// Recover messages persisted before their task handoff completed. This runs at
@@ -217,7 +818,7 @@ pub async fn reconcile_pending_inbound_handoffs(state: &AppState) -> AppResult<u
         .messages()
         .clone_with_type::<Document>()
         .find(
-            doc! { "direction": "inbound", "handoff_status": HANDOFF_PENDING },
+            doc! { "direction": "inbound", "handoff_status": { "$in": [HANDOFF_PENDING, HANDOFF_DEFERRED] } },
             FindOptions::builder()
                 .sort(doc! { "created_at": 1, "_id": 1 })
                 .limit(100)
@@ -283,24 +884,27 @@ pub async fn reconcile_pending_inbound_handoffs(state: &AppState) -> AppResult<u
         let active_profile =
             agent::domain_profile::load_active_domain_profile(&state.db, &contact.workspace_id)
                 .await?;
-        let quiet = agent::quiet_hours::effective_quiet_hours_enabled(
-            &contact,
-            &active_profile,
-            runtime.quiet_hours_enabled,
-        ) && agent::quiet_hours::is_quiet_now(
-            runtime.quiet_hours_start,
-            runtime.quiet_hours_end,
-            runtime.quiet_hours_tz_offset_hours,
-        );
-        if quiet {
-            ensure_wake_followup_task(
-                state,
-                &contact,
+        let quiet = runtime.quiet_hours_enabled
+            && agent::quiet_hours::is_quiet_now(
+                runtime.quiet_hours_start,
                 runtime.quiet_hours_end,
                 runtime.quiet_hours_tz_offset_hours,
+            );
+        if quiet {
+            let run_at = agent::quiet_hours::next_wake_at(
+                runtime.quiet_hours_end,
+                runtime.quiet_hours_tz_offset_hours,
+                &contact.wxid,
+                state.config.wake_jitter_max_seconds,
+            );
+            materialize_durable_inbound_task_at(
+                state,
+                &contact,
+                &inbound,
+                run_at,
+                "quiet_hours_waiting",
             )
             .await?;
-            mark_inbound_handoff(state, message_id, HANDOFF_DEFERRED).await?;
         } else {
             let window_ms = crate::agent::domain_profile::resolve_debounce_window_ms(
                 &active_profile,
@@ -929,7 +1533,7 @@ pub async fn wechat_webhook(
     let mut deferred = false;
     if managed {
         // #69 作息门控：静默时段（运营方进程本地时区）客户来消息时**不立即回**，
-        // 排一条 deferred_inbound_reply 跟进任务到醒来时刻。inbound 已在上面落库，
+        // Schedule the contact's single inbound_reply obligation at the wake time. The inbound is persisted above,
         // 醒来时 gateway 的 load_recent_messages 会天然聚合这段时间的全部消息一次性回。
         // 开关/时段来自运营域配置（RuntimeParametersTyped，前端可改），默认启用。
         let domain_config = agent::load_user_operation_domain_config_for_contact(
@@ -942,31 +1546,29 @@ pub async fn wechat_webhook(
             crate::agent::UserRuntimeParameters::from_config(domain_config.as_ref(), &state);
         let active_profile =
             agent::domain_profile::load_active_domain_profile(&state.db, &workspace_id).await?;
-        let quiet = agent::quiet_hours::effective_quiet_hours_enabled(
-            &contact,
-            &active_profile,
-            runtime.quiet_hours_enabled,
-        ) && agent::quiet_hours::is_quiet_now(
-            runtime.quiet_hours_start,
-            runtime.quiet_hours_end,
-            runtime.quiet_hours_tz_offset_hours,
-        );
-        if quiet {
-            ensure_wake_followup_task(
-                &state,
-                &contact,
+        let quiet = runtime.quiet_hours_enabled
+            && agent::quiet_hours::is_quiet_now(
+                runtime.quiet_hours_start,
                 runtime.quiet_hours_end,
                 runtime.quiet_hours_tz_offset_hours,
+            );
+        if quiet {
+            let run_at = agent::quiet_hours::next_wake_at(
+                runtime.quiet_hours_end,
+                runtime.quiet_hours_tz_offset_hours,
+                &contact.wxid,
+                state.config.wake_jitter_max_seconds,
+            );
+            materialize_durable_inbound_task_at(
+                &state,
+                &contact,
+                &inbound,
+                run_at,
+                "quiet_hours_waiting",
             )
             .await?;
-            if let Some(message_oid) = inbound.id {
-                mark_inbound_handoff(&state, message_oid, HANDOFF_DEFERRED).await?;
-            }
             deferred = true;
         } else {
-            let active_profile =
-                crate::agent::domain_profile::load_active_domain_profile(&state.db, &workspace_id)
-                    .await?;
             let window_ms = crate::agent::domain_profile::resolve_debounce_window_ms(
                 &active_profile,
                 state.config.message_debounce_window_ms,
@@ -1016,74 +1618,34 @@ pub async fn ensure_wake_followup_task(
     wake_hour: u32,
     tz_offset_hours: i32,
 ) -> AppResult<()> {
-    let existing = state
+    // Compatibility entry point for tests/tools. Production webhook ingestion calls
+    // `materialize_durable_inbound_task_at` with the exact persisted inbound.
+    let Some(inbound) = state
         .db
-        .tasks()
-        .count_documents(
+        .messages()
+        .find_one(
             doc! {
                 "workspace_id": &contact.workspace_id,
                 "account_id": &contact.account_id,
                 "contact_wxid": &contact.wxid,
-                "kind": agent::quiet_hours::DEFERRED_INBOUND_REPLY_KIND,
-                "status": { "$in": ["pending", "retry", "running"] },
+                "direction": "inbound",
             },
-            None,
+            mongodb::options::FindOneOptions::builder()
+                .sort(doc! { "created_at": -1, "_id": -1 })
+                .build(),
         )
-        .await?;
-    if existing > 0 {
+        .await?
+    else {
         return Ok(());
-    }
-    let now = DateTime::now();
+    };
     let run_at = agent::quiet_hours::next_wake_at(
         wake_hour,
         tz_offset_hours,
         &contact.wxid,
         state.config.wake_jitter_max_seconds,
     );
-    // expiry 给 24h 余量（覆盖最长跨午夜窗口 + 醒来后 worker tick 间隔），过期未跑则作废。
-    let expires_at = DateTime::from_millis(run_at.timestamp_millis() + 24 * 60 * 60 * 1000);
-    let task = AgentTask {
-        id: None,
-        workspace_id: contact.workspace_id.clone(),
-        account_id: contact.account_id.clone(),
-        contact_wxid: contact.wxid.clone(),
-        kind: agent::quiet_hours::DEFERRED_INBOUND_REPLY_KIND.to_string(),
-        run_at,
-        expires_at: Some(expires_at),
-        content: "作息时段累积消息，醒来后基于完整上下文回复".to_string(),
-        status: "pending".to_string(),
-        source_decision_id: None,
-        review_required: true,
-        attempt_count: 0,
-        max_attempts: 3,
-        next_retry_at: None,
-        gateway_status: None,
-        cancel_reason: None,
-        error: None,
-        claimed_at: None,
-        claim_recovery_count: 0,
-        created_at: now,
-        updated_at: now,
-    };
-    state.db.tasks().insert_one(task, None).await?;
-    // 观测埋点：仅真正新建 wake task 时写一条 deferred 事件，运营后台据此看到
-    // "这条为何没秒回"。dedup 命中（上面 early-return）不写，避免静默连发刷屏。
-    // best-effort：失败只吞掉，绝不阻断 webhook ack。
-    let _ = agent::write_event_for_account(
-        state,
-        &contact.workspace_id,
-        &contact.account_id,
-        Some(&contact.wxid),
-        "quiet_hours_deferred_inbound",
-        "deferred",
-        "作息时段，客户消息延迟到醒来时刻回复",
-        Some(doc! {
-            "wakeAt": run_at,
-            "kind": agent::quiet_hours::DEFERRED_INBOUND_REPLY_KIND,
-            "tzOffsetHours": tz_offset_hours,
-        }),
-    )
-    .await;
+    materialize_durable_inbound_task_at(state, contact, &inbound, run_at, "quiet_hours_waiting")
+        .await?;
     Ok(())
 }
 
@@ -2426,6 +2988,44 @@ mod webhook_sig_tests {
         assert_eq!(
             verify_webhook_signature(Some("  "), Some(TS), Some(&header()), BODY, NOW_MS, SKEW),
             Err(WebhookSigError::SecretNotConfigured)
+        );
+    }
+}
+
+#[cfg(test)]
+mod reply_obligation_tests {
+    use super::manual_outbox_settlement;
+
+    fn statuses(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn manual_outbox_settlement_requires_every_segment_sent() {
+        assert_eq!(manual_outbox_settlement(&statuses(&["sent"])), Some(true));
+        assert_eq!(
+            manual_outbox_settlement(&statuses(&["sent", "sent"])),
+            Some(true)
+        );
+        assert_eq!(
+            manual_outbox_settlement(&statuses(&["sent", "pending"])),
+            None
+        );
+        assert_eq!(
+            manual_outbox_settlement(&statuses(&["sent", "failed_terminal"])),
+            None
+        );
+    }
+
+    #[test]
+    fn manual_outbox_settlement_only_releases_confirmed_non_delivery() {
+        assert_eq!(manual_outbox_settlement(&[]), None);
+        for active in ["pending", "in_flight", "delivery_unknown"] {
+            assert_eq!(manual_outbox_settlement(&statuses(&[active])), None);
+        }
+        assert_eq!(
+            manual_outbox_settlement(&statuses(&["canceled", "failed_terminal"])),
+            Some(false)
         );
     }
 }

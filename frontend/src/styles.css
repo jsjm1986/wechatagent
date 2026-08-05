@@ -758,6 +758,14 @@ textarea::placeholder {
   line-height: 1.6;
 }
 
+.userModeActions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-shrink: 0;
+  gap: 10px;
+}
+
 .modeSwitch {
   display: inline-flex;
   flex-shrink: 0;
@@ -2751,6 +2759,12 @@ td:nth-child(3) {
     flex-direction: column;
   }
 
+  .userModeActions {
+    width: 100%;
+    justify-content: space-between;
+    flex-wrap: wrap;
+  }
+
   .userOpsTabs {
     display: flex;
     overflow-x: auto;
@@ -4009,4 +4023,3 @@ td:nth-child(3) {
   font-size: 10px;
   letter-spacing: 0.04em;
 }
-

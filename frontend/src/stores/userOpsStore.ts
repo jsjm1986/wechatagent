@@ -153,7 +153,7 @@ interface UserOpsActions {
   newPlaybookDraft: () => void;
 
   // Domain 配置相关业务方法
-  saveOperationDomain: (domain: string) => Promise<boolean>;
+  saveOperationDomain: (domain: string, draftOverride?: OperationDomainDraft) => Promise<boolean>;
   resetOperationDomain: (domain: string) => Promise<void>;
 }
 
@@ -1289,9 +1289,9 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
   },
 
   // Domain 配置相关业务方法
-  saveOperationDomain: async (domain) => {
+  saveOperationDomain: async (domain, draftOverride) => {
     const { domainDrafts } = get();
-    const draft = domainDrafts[domain];
+    const draft = draftOverride ?? domainDrafts[domain];
     if (!draft?.name.trim()) return false;
 
     useUiStore.getState().setBusy(true);
