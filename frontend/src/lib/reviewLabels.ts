@@ -81,6 +81,10 @@ export const GAP_SIGNAL_KIND_LABELS: Record<string, string> = {
   suggestion: "建议补完核实",
   dangling_anchor: "出处对不上",
   recall_miss: "知识缺口（答不上）",
+  // B5：与 recall_miss 区分——模型给了引用但没过锚点校验，修复方向是重锚定
+  // （触发 AI 自主修复），不是补录新知识。
+  citation_format_rejected: "引用锚点不合规",
+  recall_low_yield: "召回低产出（粒度过粗）",
 };
 
 export const GAP_SIGNAL_SEVERITY_LABELS: Record<string, string> = {

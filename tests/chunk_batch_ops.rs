@@ -43,12 +43,21 @@ fn admin(app: &TestApp) -> Extension<AuthenticatedAdmin> {
     })
 }
 
+/// 本 fixture 的 anchor **必须**带非空 `sourceQuote`，与生产
+/// `source_anchor_for_quote`（routes/knowledge/mod.rs）恒写该键的形态一致。
+///
+/// B3：D2 verify 闸判「可定位」用的是 `chunk_has_citable_anchor`（要求 anchor 自身含
+/// 非空 `sourceQuote`），而不是旧口径的 `!source_anchors.is_empty()`。二者收敛后，
+/// 只带 offset/hash 而无 `sourceQuote` 的 anchor 会被 verify 拒绝——那种 chunk 即便
+/// 放行也永远无法被 `quote_is_chunk_evidence` 引用，故拒绝才是正确行为。
 fn verifiable_chunk(workspace_id: &str, title: &str) -> OperationKnowledgeChunk {
+    let quote = "引文文本：客户提出价格异议时，先共情、再说明价值、最后给方案。";
     let mut anchor = Document::new();
     anchor.insert("documentId", "doc_test");
     anchor.insert("startLine", 10i32);
     anchor.insert("endLine", 20i32);
     anchor.insert("quoteHash", "hash_abc123");
+    anchor.insert("sourceQuote", quote);
     OperationKnowledgeChunk {
         id: Some(ObjectId::new()),
         workspace_id: workspace_id.to_string(),

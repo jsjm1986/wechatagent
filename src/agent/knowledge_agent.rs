@@ -1012,6 +1012,12 @@ async fn answer_inner(
                     );
                     continue;
                 }
+                // B5：留下「模型尝试过引用」这个事实，供 `classify_recall_outcome`
+                // 区分 `citation_format_rejected`（试了但 anchor/quote 校验没过）与
+                // `knowledge_missing`（压根没试）。filter 会 move 掉这两个 Vec，
+                // 故在调用前先取长度。
+                let attempted_cited = cited_chunk_ids.len() as i32;
+                let attempted_quotes = source_quotes.len() as i32;
                 let (cited, quotes) =
                     filter_answer_against_opened_chunks(&opened, cited_chunk_ids, source_quotes);
                 push_trace(
@@ -1022,6 +1028,10 @@ async fn answer_inner(
                         "round": round,
                         "citedCount": cited.len() as i32,
                         "quoteCount": quotes.len() as i32,
+                        // 被 filter 静默丢弃的数量 = attempted - kept。>0 且 citedCount==0
+                        // 时，真因是引用格式不合规，不是知识缺失。
+                        "attemptedCitedCount": attempted_cited,
+                        "attemptedQuoteCount": attempted_quotes,
                     },
                 );
                 let result = AnswerResult {
@@ -1858,6 +1868,28 @@ pub fn rank_key(query: &str, chunk: &OperationKnowledgeChunk, now: DateTime) -> 
 const LOW_YIELD_OPENED_MIN: usize = 3;
 const LOW_YIELD_CITED_MAX: usize = 1;
 
+/// B5：从 answer trace 读回「模型本轮**尝试**了多少条引用」。
+///
+/// `AnswerResult.cited_chunk_ids` 是 `filter_answer_against_opened_chunks` **过滤后**
+/// 的结果，看不出模型原本给没给引用。生产路径在 filter 之前把原始条数写进 answer
+/// trace 的 `attemptedCitedCount` / `attemptedQuoteCount`，本函数取两者较大值作为
+/// 「尝试过引用」的证据。
+///
+/// 缺字段（历史 trace / 兜底路径的 answer trace 不带这两个键）时返回 0 —— 退化成旧
+/// 行为（判为 `recall_miss`），不会误报成格式问题。
+fn attempted_citation_count(tool_trace: &[Document]) -> i64 {
+    tool_trace
+        .iter()
+        .filter(|entry| entry.get_str("tool").unwrap_or("") == "answer")
+        .map(|entry| {
+            let cited = entry.get_i32("attemptedCitedCount").unwrap_or(0) as i64;
+            let quotes = entry.get_i32("attemptedQuoteCount").unwrap_or(0) as i64;
+            cited.max(quotes)
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 pub fn classify_recall_outcome(result: &AnswerResult) -> Option<GapSignalCandidate> {
     // 用户主动取消不算召回缺陷：提前退出循环是预期行为。
     if result.cancelled {
@@ -1885,22 +1917,58 @@ pub fn classify_recall_outcome(result: &AnswerResult) -> Option<GapSignalCandida
     }
     let cited_count = result.cited_chunk_ids.len();
 
-    // 签名 1：recall_miss（最高优先，短路）。
-    // 条件放宽为「本次没产出任何可引用知识 = cited==0」即视为召回偽阴性/诚实弃答：
-    // 不再要求 truncated || opened.is_empty()。诚实弃答的中间态（open 了几条却都
-    // 不相关、未 truncated）此前落空，人类永远收不到补全 TODO；放宽后这类也留 gap
-    // 信号。所有 cited≥1 的用例仍走下方 low_yield/None 分支，cancelled 已在上方短路。
-    if cited_count == 0 {
+    // B5：`cited==0` 至少有三种真因，旧实现把它们压成同一条 kind + 同一句
+    // description（「疑似目标知识缺失…待补录」），于是引用格式不合规的场景会把运营
+    // 指向「补录知识」这个错误方向——补录再多也不会让 cited 变非零。这里按 answer
+    // trace 里的 `attemptedCitedCount` / `attemptedQuoteCount` 把真因分开。
+    let attempted = attempted_citation_count(&result.tool_trace);
+
+    // 签名 1a：citation_format_rejected —— 模型**试过**引用，但全部被
+    // `filter_answer_against_opened_chunks` 拒掉（anchor 缺 sourceQuote / quote 与
+    // anchor 不匹配 / 引用了未 open 的 id）。修复方向是重锚定，不是补录。
+    if cited_count == 0 && attempted > 0 {
         let affected: Vec<String> = opened.into_iter().collect();
         return Some(GapSignalCandidate {
-            kind: "recall_miss".into(),
-            title: "召回偽阴性：查询未命中可引用知识".into(),
+            kind: "citation_format_rejected".into(),
+            title: "引用被拒：模型给出引用但未通过锚点校验".into(),
             severity: "high".into(),
             affected_chunk_ids: affected,
             search_queries: Vec::new(),
-            description: "本次没检索到可引用的知识。疑似目标知识缺失、粒度过粗或放置\
-                 错位，待运营质检定位后补录、拆分或重新归类。"
+            description: "模型本次**给出了引用**，但全部未通过 sourceQuote/锚点校验，\
+                 因此没有可用证据。真因通常是这些切片的 source_anchors 缺 sourceQuote、\
+                 或 source_quote 与正文不再逐字一致——请重锚定（可触发 AI 自主修复），\
+                 而不是补录新知识。"
                 .to_string(),
+        });
+    }
+
+    // 签名 1b：recall_miss —— 模型压根没给引用。区分「跑完轮数没收敛」与「查无内容」：
+    // 前者是探索预算问题，后者才是真的知识缺失。两者共用 kind（保持既有收件箱分类与
+    // 前端闭集稳定），但 title / description 不同 → dedup_key 不同 → 分列两行，运营
+    // 不会再把两类混在一条 pending 里。
+    if cited_count == 0 {
+        let affected: Vec<String> = opened.into_iter().collect();
+        let (title, description) = if result.truncated {
+            (
+                "召回未收敛：限定轮数内未得出可引用结论",
+                "模型在限定轮数内没能收敛到可引用的知识（未给出任何引用）。可能是\
+                 议题过宽、需要拆分提问，或知识分布过散导致探索预算不足；请先核对该\
+                 议题是否确有对应知识，再决定补录或拆分。",
+            )
+        } else {
+            (
+                "召回偽阴性：查询未命中可引用知识",
+                "本次没检索到可引用的知识，且模型未尝试任何引用。疑似目标知识缺失、\
+                 粒度过粗或放置错位，待运营质检定位后补录、拆分或重新归类。",
+            )
+        };
+        return Some(GapSignalCandidate {
+            kind: "recall_miss".into(),
+            title: title.into(),
+            severity: "high".into(),
+            affected_chunk_ids: affected,
+            search_queries: Vec::new(),
+            description: description.to_string(),
         });
     }
 
@@ -2747,6 +2815,79 @@ mod tests {
         for id in &c.affected_chunk_ids {
             assert!(["a", "b"].contains(&id.as_str()));
         }
+    }
+
+    /// B5 用：在 `ar` 的基础上补一条带 `attempted*` 计数的 answer trace，
+    /// 模拟「模型给出了引用，但被 filter 全部拒掉」。
+    fn ar_with_attempted(
+        cited: Vec<&str>,
+        truncated: bool,
+        opened_chunks: Vec<&str>,
+        attempted_cited: i32,
+        attempted_quotes: i32,
+    ) -> AnswerResult {
+        let mut result = ar(cited, truncated, false, opened_chunks, vec![]);
+        result.tool_trace.push(doc! {
+            "tool": "answer",
+            "round": 1i32,
+            "citedCount": result.cited_chunk_ids.len() as i32,
+            "attemptedCitedCount": attempted_cited,
+            "attemptedQuoteCount": attempted_quotes,
+        });
+        result
+    }
+
+    /// B5 红线：模型**试过**引用但全被锚点校验拒掉时，必须报
+    /// `citation_format_rejected` 而不是 `recall_miss`——后者会把运营指向「补录知识」，
+    /// 而真因是锚点不合规，补录再多也不会让 cited 变非零。
+    #[test]
+    fn classify_attempted_but_rejected_citations_is_format_rejected() {
+        let r = ar_with_attempted(vec![], false, vec!["a", "b"], 2, 2);
+        let c = classify_recall_outcome(&r).expect("should flag a signal");
+        assert_eq!(
+            c.kind, "citation_format_rejected",
+            "试过引用却全被拒 → 必须是格式问题，不能报成知识缺失"
+        );
+        assert_ne!(c.kind, "recall_miss");
+        assert!(
+            c.description.contains("重锚定"),
+            "修复指引应指向重锚定: {}",
+            c.description
+        );
+        // affected 给出待重锚定的候选，运营据此定位。
+        assert_eq!(c.affected_chunk_ids.len(), 2);
+    }
+
+    /// 对偶：只给了 quote 没给 citedIds（或反之）也算「试过」。
+    #[test]
+    fn classify_attempted_quotes_only_still_counts_as_attempt() {
+        let r = ar_with_attempted(vec![], false, vec!["a"], 0, 3);
+        let c = classify_recall_outcome(&r).expect("should flag a signal");
+        assert_eq!(c.kind, "citation_format_rejected");
+    }
+
+    /// 未尝试引用时仍是 `recall_miss`——本次修复不得把「真的没知识」也改判成格式问题。
+    #[test]
+    fn classify_zero_attempt_remains_recall_miss() {
+        let r = ar_with_attempted(vec![], false, vec!["a"], 0, 0);
+        let c = classify_recall_outcome(&r).expect("should flag a signal");
+        assert_eq!(c.kind, "recall_miss");
+    }
+
+    /// `truncated` 与「查无内容」共用 kind 但 title/description 不同 → dedup_key 不同
+    /// → 收件箱分列两行，运营不会再把「探索没收敛」和「真缺知识」混成一条 pending。
+    #[test]
+    fn truncated_and_empty_recall_miss_have_distinct_dedup_keys() {
+        let truncated = classify_recall_outcome(&ar(vec![], true, false, vec!["a"], vec![]))
+            .expect("truncated signal");
+        let empty = classify_recall_outcome(&ar(vec![], false, false, vec![], vec![]))
+            .expect("empty signal");
+        assert_eq!(truncated.kind, empty.kind, "共用 kind 保持前端闭集稳定");
+        assert_ne!(
+            truncated.title, empty.title,
+            "两种真因的 title 必须不同，否则 dedup_key 相同会合并成一条"
+        );
+        assert_ne!(truncated.dedup_key(), empty.dedup_key());
     }
 
     #[test]

@@ -213,6 +213,36 @@ fn outbox_delivery_finalize_pending_index() -> IndexModel {
         .build()
 }
 
+/// B1：per-contact 主动触达配额闸的支撑索引。
+///
+/// `daily_touch_count` 从 `conversation_messages` 计数改为在本集合上按
+/// `(workspace, account, contact, source_kind, status)` 过滤 + `distinct run_id`
+/// 数逻辑触达次数。现有 `(account_id, status, next_retry_at)` 与
+/// `(source_event_id, contact_wxid)` 都不能支撑这个前缀：前者缺 contact 维度，
+/// 后者以 source_event_id 领头。缺此索引该闸会随历史发送量线性恶化，且它在
+/// **每次主动发送的 precheck 热路径**上。
+///
+/// 键序按选择性排列：workspace/account/contact 定位到单个会话，再按 source_kind
+/// 过滤主动类，最后 status 收敛到已跨远端边界的条目。时间窗对 `sent_at` /
+/// `send_started_at` 取 `$or`，无法进同一个 B-tree 前缀，留给候选集内过滤——
+/// 单会话单日候选量极小。
+fn outbox_contact_proactive_touch_index() -> IndexModel {
+    IndexModel::builder()
+        .keys(doc! {
+            "workspace_id": 1,
+            "account_id": 1,
+            "contact_wxid": 1,
+            "source_kind": 1,
+            "status": 1,
+        })
+        .options(
+            IndexOptions::builder()
+                .name("outbox_contact_proactive_touch_idx".to_string())
+                .build(),
+        )
+        .build()
+}
+
 fn outbox_idempotency_unique_index() -> IndexModel {
     IndexModel::builder()
         .keys(doc! {
@@ -1669,6 +1699,39 @@ mod tests {
         );
     }
 
+    /// B1：主动触达计数索引必须覆盖 `daily_touch_count` 的 filter 前缀。
+    ///
+    /// 该 filter 是 `precheck_send_gateway` 的每轮热路径（每条主动 FollowUp 都查一次）。
+    /// 键顺序必须与 `gateway::proactive_touch_filter` 的等值字段一致，否则退化成
+    /// COLLSCAN，随发送历史线性恶化。`sent_at` / `send_started_at` 是 `$or` 范围条件，
+    /// 不进复合键（$or 各支独立走前缀 + 过滤）。
+    #[test]
+    fn outbox_proactive_touch_index_matches_daily_limit_filter() {
+        let index = outbox_contact_proactive_touch_index();
+        assert_eq!(
+            index.keys,
+            doc! {
+                "workspace_id": 1,
+                "account_id": 1,
+                "contact_wxid": 1,
+                "source_kind": 1,
+                "status": 1,
+            },
+            "键顺序须与 gateway::proactive_touch_filter 的等值字段一致"
+        );
+        let options = index
+            .options
+            .expect("proactive touch index must be explicitly named");
+        assert_eq!(
+            options.name.as_deref(),
+            Some("outbox_contact_proactive_touch_idx")
+        );
+        assert_eq!(
+            options.partial_filter_expression, None,
+            "不得加 partial filter：source_kind/status 闭集将来扩展时会静默漏索引"
+        );
+    }
+
     #[test]
     fn agent_run_log_outbox_enqueuing_index_matches_reconcile_scan() {
         let index = agent_run_log_outbox_enqueuing_index();
@@ -2004,6 +2067,10 @@ async fn ensure_agent_send_outbox_indexes(db: &Database) -> anyhow::Result<()> {
         .await?;
     db.collection_agent_send_outbox()
         .create_index(outbox_delivery_finalize_pending_index(), None)
+        .await?;
+    // B1：per-contact 主动触达配额闸（precheck 热路径）。
+    db.collection_agent_send_outbox()
+        .create_index(outbox_contact_proactive_touch_index(), None)
         .await?;
     Ok(())
 }

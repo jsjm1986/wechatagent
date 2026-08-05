@@ -63,7 +63,9 @@ use super::memory::{
     write_memory_candidates, write_stage_observation, write_tag_observations,
 };
 use super::multimodal;
-use super::outbox::{enqueue as outbox_enqueue, EnqueueOutcome, EnqueueRequest};
+use super::outbox::{
+    enqueue as outbox_enqueue, EnqueueOutcome, EnqueueRequest, OutboxStatus as OutboxSendStatus,
+};
 use super::review::{
     apply_revision_fallback, contact_has_principal_product_exemption, decide_revision,
     derive_revision_failure, effective_review_mode, ensure_independent_claim_gate,
@@ -4627,24 +4629,85 @@ pub(crate) fn daily_limit_applies_to(trigger: &AgentTrigger<'_>) -> bool {
     matches!(trigger, AgentTrigger::FollowUp(_))
 }
 
+/// B1：算作「AI 主动触达」的 outbox `source_kind` 闭集。
+///
+/// `inbound` / `inbound_message`（客户主动发消息的被动应答）与 `manual_send`
+/// （运营手工发）都**不在**内——前者是 `daily_limit` 闸门自己声明豁免的类别，
+/// 后者不是 AI 行为。
+pub(crate) const PROACTIVE_TOUCH_SOURCE_KINDS: &[&str] = &[
+    // `AgentTrigger::kind()` 对 FollowUp 的取值（planner 各段 / 跟进任务回复）。
+    "follow_up",
+    // 主动任务直接入队时的取值（`SOURCE_KIND_FOLLOW_UP_TASK`）。
+    "follow_up_task",
+];
+
+/// B1：统计某 contact 在滚动 24h 内的**主动触达次数**（逻辑次数，不是消息条数）。
+///
+/// 事实源从 `conversation_messages` 换成 `agent_send_outbox`，并按 `run_id` 去重，
+/// 修掉两个与闸门自身契约相反的口径错误：
+///
+/// 1. **被动回复不再占额度**。旧口径数该 contact 全部 `direction=outbound` 文档，
+///    而 `daily_limit_applies_to` 明确只让 FollowUp 受闸、注释写着「客户主动发消息
+///    的应答永不因每日触达上限被拦」。旧计数把被动应答也算进去，等于自己推翻豁免。
+/// 2. **分段不再放大额度**。一条回复按 `AGENT_REPLY_MAX_SEGMENTS`（默认 4）拆段后
+///    每段各写一条 outbound message，默认 `max_daily_touches=3` 下，**一次**正常
+///    多段对话即可耗尽当天全部主动触达额度，导致承诺跟进 / 续费提醒 / 纪念日关怀
+///    / 停滞催进全部静默失效（无报错、无事件）。按 `run_id` 去重后，一次逻辑触达
+///    恒计 1 次，与运营语义一致。
+///
+/// 口径细节：
+/// * 只数**已跨过远端发送边界**的条目（`sent` + `delivery_unknown`）。
+///   `delivery_unknown` 计入是保守方向——可能已送达客户，宁可少发一次主动触达。
+///   `pending` / `in_flight` / `canceled` / `failed_terminal` 不计（未打扰到客户）。
+/// * 时间窗对 `sent_at` 与 `send_started_at` 取 `$or`：`delivery_unknown` 可能没有
+///   `sent_at`，但 `begin_remote_send` 必定已写 `send_started_at`。
+/// * outbox 是唯一发送路径（文本 / 媒体 / 名片都经 dispatcher），故不漏数。
+///
+/// 已知残余不精确（**比修复前小得多，故不在本次收窄**）：relay 转述与静默时段
+/// 「醒来任务」的 `source_kind` 也是 follow_up 类，语义上却是被动应答，会各占 1 次
+/// 额度。二者都不常见、且都只计 1 次（不再被分段放大）。彻底区分需要在 outbox 上
+/// 持久化更细的来源标记，属独立改动。
+pub(crate) fn proactive_touch_filter(
+    workspace_id: &str,
+    account_id: &str,
+    contact_wxid: &str,
+    since: DateTime,
+) -> Document {
+    doc! {
+        "workspace_id": workspace_id,
+        "account_id": account_id,
+        "contact_wxid": contact_wxid,
+        "source_kind": { "$in": PROACTIVE_TOUCH_SOURCE_KINDS },
+        "status": { "$in": [
+            OutboxSendStatus::Sent.as_str(),
+            OutboxSendStatus::DeliveryUnknown.as_str(),
+        ] },
+        "$or": [
+            { "sent_at": { "$gte": since } },
+            { "send_started_at": { "$gte": since } },
+        ],
+    }
+}
+
 async fn daily_touch_count(state: &AppState, contact: &Contact) -> AppResult<i64> {
     let since = DateTime::from_millis(DateTime::now().timestamp_millis() - 24 * 60 * 60 * 1000);
-    state
+    // distinct run_id = 逻辑触达次数。单 contact 单日的 run 数极小，无 16MB 风险。
+    let runs = state
         .db
-        .messages()
-        .count_documents(
-            doc! {
-                "workspace_id": &contact.workspace_id,
-                "account_id": &contact.account_id,
-                "contact_wxid": &contact.wxid,
-                "direction": "outbound",
-                "created_at": { "$gte": since }
-            },
+        .collection_agent_send_outbox()
+        .distinct(
+            "run_id",
+            proactive_touch_filter(
+                &contact.workspace_id,
+                &contact.account_id,
+                &contact.wxid,
+                since,
+            ),
             None,
         )
         .await
-        .map(|count| count as i64)
-        .map_err(AppError::from)
+        .map_err(AppError::from)?;
+    Ok(runs.len() as i64)
 }
 
 /// ④ 账号当日已发送总量：`agent_send_outbox` 里该账号 `status=sent`、
@@ -6581,6 +6644,83 @@ mod tests {
         assert!(daily_limit_applies_to(&AgentTrigger::FollowUp(&task)));
         // 被动回复：豁免 daily_limit
         assert!(!daily_limit_applies_to(&AgentTrigger::Inbound(&msg)));
+    }
+
+    /// B1 回归守卫：主动触达计数的 filter 必须只圈「AI 主动」来源。
+    ///
+    /// 旧口径数 `conversation_messages` 全部 `direction=outbound`，与 `daily_limit`
+    /// 闸门自己声明的 Inbound 豁免相反，且被分段放大（默认 4 段 vs 上限 3 次）。
+    #[test]
+    fn proactive_touch_filter_excludes_passive_and_manual_sources() {
+        let since = DateTime::from_millis(1_700_000_000_000);
+        let filter = proactive_touch_filter("ws1", "acc1", "wx1", since);
+
+        // 租户 / 账号 / 客户三维隔离（防跨租户误计）。
+        assert_eq!(filter.get_str("workspace_id").ok(), Some("ws1"));
+        assert_eq!(filter.get_str("account_id").ok(), Some("acc1"));
+        assert_eq!(filter.get_str("contact_wxid").ok(), Some("wx1"));
+
+        // 来源闭集必须排除被动应答与运营手工发。
+        let kinds: Vec<&str> = filter
+            .get_document("source_kind")
+            .expect("source_kind $in")
+            .get_array("$in")
+            .expect("$in array")
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect();
+        assert!(
+            kinds.contains(&"follow_up") && kinds.contains(&"follow_up_task"),
+            "主动触达两种来源都必须计入：{kinds:?}"
+        );
+        for passive in ["inbound", "inbound_message", "manual_send"] {
+            assert!(
+                !kinds.contains(&passive),
+                "{passive} 是被动/人工来源，绝不能占用主动触达配额：{kinds:?}"
+            );
+        }
+
+        // 只数已跨过远端边界的条目；未打扰到客户的状态不计。
+        let statuses: Vec<&str> = filter
+            .get_document("status")
+            .expect("status $in")
+            .get_array("$in")
+            .expect("$in array")
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect();
+        assert!(statuses.contains(&"sent"));
+        assert!(
+            statuses.contains(&"delivery_unknown"),
+            "delivery_unknown 可能已送达，保守计入"
+        );
+        for not_yet in ["pending", "in_flight", "canceled", "failed_terminal"] {
+            assert!(
+                !statuses.contains(&not_yet),
+                "{not_yet} 未打扰到客户，不应计入：{statuses:?}"
+            );
+        }
+
+        // 时间窗对两个时间戳取 $or：delivery_unknown 可能无 sent_at。
+        let time_or = filter.get_array("$or").expect("time window $or");
+        assert_eq!(time_or.len(), 2, "须同时覆盖 sent_at 与 send_started_at");
+    }
+
+    /// B1 回归守卫：计数单位是「逻辑触达」（distinct run_id），不是消息条数。
+    ///
+    /// 这条锁的是 filter 不含任何分段维度——若未来有人把 `source_event_id`
+    /// （带 `#seg{idx}` 后缀）加进 filter，分段放大就会复发。
+    #[test]
+    fn proactive_touch_filter_has_no_segment_dimension() {
+        let filter = proactive_touch_filter("ws", "acc", "wx", DateTime::now());
+        assert!(
+            !filter.contains_key("source_event_id"),
+            "source_event_id 带 #seg 后缀，按它过滤/计数会让分段重新放大配额"
+        );
+        assert!(
+            !filter.contains_key("content_hash"),
+            "content_hash 是逐段值，不属于逻辑触达维度"
+        );
     }
 
     #[test]

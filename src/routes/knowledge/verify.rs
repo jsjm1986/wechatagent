@@ -84,12 +84,15 @@ pub(super) async fn verify_chunk_at_version(
             return Err(AppError::Conflict("chunk_revision_conflict".to_string()));
         }
 
-        let has_quote = chunk
-            .source_quote
-            .as_deref()
-            .is_some_and(|quote| !quote.trim().is_empty());
-        let has_anchor = !chunk.source_anchors.is_empty();
-        if let Some(reason) = chunk_verify_gate_reason(has_quote, has_anchor) {
+        // B3：读取侧（`quote_is_chunk_evidence`）要求命中的 anchor 自身含非空
+        // `sourceQuote`，故本闸也必须按同一契约判定「可定位」。旧口径只查数组非空，
+        // 让缺该键的畸形 anchor 通过 verify 进入 active+verified，而那类 chunk 的
+        // 引用在读取侧恒被拒 → 永久无法被 cite（表现为"知识库有答案却答不出来"）。
+        // 谓词由 `chunk_verify_gate_reason_for` 内部算，调用方无法再传错。
+        if let Some(reason) = super::chunk_verify_gate_reason_for(
+            chunk.source_quote.as_deref(),
+            &chunk.source_anchors,
+        ) {
             return Err(AppError::BadRequest(reason));
         }
 
