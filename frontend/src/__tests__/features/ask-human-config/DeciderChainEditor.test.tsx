@@ -208,4 +208,49 @@ describe("DeciderChainEditor 通讯录选择器", () => {
     fireEvent.click(screen.getByText(/从通讯录添加/));
     expect(await screen.findByText(/boom/)).toBeTruthy();
   });
+  it("导入进行中重复点击同一好友，只发一次 import 请求", async () => {
+    seedRoster([entry("wxid_new", "新朋友", "not_imported")]);
+    // 可控 promise：在连点期间保持 pending，模拟慢速网络往返。
+    let release: (v: unknown) => void = () => {};
+    post.mockReturnValue(new Promise((res) => { release = res; }));
+    const onChange = vi.fn();
+    renderEditor([], onChange);
+    fireEvent.click(screen.getByText(/从通讯录添加/));
+
+    const card = await screen.findByText("新朋友");
+    fireEvent.click(card);
+    await waitFor(() => expect(post).toHaveBeenCalledTimes(1));
+    // import 仍 pending 时再点两次——重入守卫必须挡住。
+    fireEvent.click(card);
+    fireEvent.click(card);
+    expect(post).toHaveBeenCalledTimes(1);
+
+    release({ items: [{ wxid: "wxid_new" }] });
+    await waitFor(() => expect(onChange).toHaveBeenCalledTimes(1));
+  });
+
+  it("import 期间父级改了 chain，入链基于最新值而非 stale 闭包快照", async () => {
+    seedRoster([entry("wxid_new", "新朋友", "not_imported")]);
+    let release: (v: unknown) => void = () => {};
+    post.mockReturnValue(new Promise((res) => { release = res; }));
+    const onChange = vi.fn();
+    // 初始空链渲染 → pick 的闭包捕获 []。
+    const { rerender } = renderEditor([], onChange);
+    fireEvent.click(screen.getByText(/从通讯录添加/));
+    fireEvent.click(await screen.findByText("新朋友"));
+    await waitFor(() => expect(post).toHaveBeenCalledTimes(1));
+
+    // import 未完成时父级塞进一位（模拟并发/外部更新）。
+    rerender(
+      <ToastProvider>
+        <DeciderChainEditor chain={[{ wxid: "wxid_prior", displayName: "先前一位" }]} onChange={onChange} />
+      </ToastProvider>,
+    );
+    release({ items: [{ wxid: "wxid_new" }] });
+
+    // 若读 stale 闭包的 []，结果只有 wxid_new，先前一位被静默丢弃。
+    await waitFor(() => expect(onChange).toHaveBeenCalled());
+    const last = onChange.mock.calls[onChange.mock.calls.length - 1][0] as DeciderRef[];
+    expect(last.map((d) => d.wxid)).toEqual(["wxid_prior", "wxid_new"]);
+  });
 });

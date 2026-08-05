@@ -31,6 +31,13 @@ export function DeciderChainEditor({
   const rosterCache = useUserOpsStore((s) => s.rosterCache);
   const roster = rosterCache[accountId]?.items ?? [];
 
+  // chain 的最新值。pick() 里 await import 有网络往返，若从渲染闭包读 chain，
+  // 期间父级把 chain 改了（或本组件又加了一位），onChange([...chain, x]) 会基于
+  // stale 快照回写，把这期间新增的项静默丢掉。onChange 的签名是 (next: DeciderRef[]) => void
+  // 不收 updater，故用 ref 兜住最新值。
+  const chainRef = useRef(chain);
+  chainRef.current = chain;
+
   // 请求序号守卫：快速切账号时并发多次 loadRoster，只有最新一次允许落地，
   // 否则先发的（账号 A）若晚于后发的（账号 B）返回，会用 A 的好友覆盖 B 的列表。
   // 抄 RosterView.tsx 的 reqSeqRef 做法。
@@ -94,6 +101,10 @@ export function DeciderChainEditor({
   );
 
   async function pick(item: FriendPickerItem) {
+    // 重入守卫：import 有网络往返，期间弹窗仍开着、卡片也无法禁用
+    // （FriendPickerModal 的卡片不接受 disabled），用户能连点。无守卫时
+    // 连点三次会发三次 import 请求。
+    if (importing) return;
     const entry = roster.find((r) => r.wxid === item.wxid);
     const displayName = entry ? rosterLabel(entry) : item.wxid;
     if (!accountId) {
@@ -142,7 +153,15 @@ export function DeciderChainEditor({
       }
     }
 
-    onChange([...chain, { wxid: item.wxid, displayName, accountId }]);
+    // 读 chainRef 而非闭包里的 chain：上面 await 过 import，闭包快照可能已过期。
+    const latest = chainRef.current;
+    // 幂等：await 期间该 wxid 可能已被别处加入，重复 push 会让链里出现两条同 wxid
+    // （React key 也会撞）。
+    if (latest.some((d) => d.wxid === item.wxid)) {
+      setPicking(false);
+      return;
+    }
+    onChange([...latest, { wxid: item.wxid, displayName, accountId }]);
     setPicking(false);
   }
 
