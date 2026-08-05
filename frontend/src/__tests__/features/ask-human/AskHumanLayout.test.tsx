@@ -163,3 +163,25 @@ describe("空态渲染", () => {
     expect(screen.getByText(/AI 自主运行中/)).toBeTruthy();
   });
 });
+
+describe("卡内纵向节奏的结构前提", () => {
+  // 白卡用 grid + gap 提供卡内纵向间距，而 grid gap 只作用于**直接**子元素。
+  // JSX 里 chip 行与列表包在 Fragment 内，Fragment 不产生 DOM 节点，所以它们
+  // 仍是白卡的直接子元素——间距才成立。若将来有人为分组套一层 <div>，gap 会
+  // 退化成只作用于那层 wrapper，卡内间距静默失效且无报错。此测试锁住该前提。
+  // 间距数值本身（gap:14px）jsdom 取不到，需目视确认。
+  it("chip 行与列表都是白卡的直接子元素（grid gap 生效的前提）", async () => {
+    mockInbox([item("a")]);
+    const { container } = renderInbox();
+    await screen.findByText("t-a");
+
+    const panel = container.querySelector(".askHumanPanel")!;
+    const toolbar = container.querySelector(".askHumanToolbar")!;
+    const list = container.querySelector(".reviewQueueList")!;
+
+    expect(toolbar.parentElement).toBe(panel);
+    expect(list.parentElement).toBe(panel);
+    // 卡头同理，且它不再自带 margin-bottom（与 gap 并存会叠加）。
+    expect(container.querySelector(".askHumanPanelHead")!.parentElement).toBe(panel);
+  });
+});

@@ -21,6 +21,14 @@
   border: 1px solid var(--hairline);
   box-shadow: 0 14px 34px -24px rgba(20, 30, 60, 0.3),
     inset 0 1px 1px rgba(255, 255, 255, 0.9);
+  /* 卡内纵向节奏统一由 gap 提供，子元素不再各自写 margin-bottom（会叠加）。
+     这些子元素（卡头 / 降级横幅 / chip 行 / 列表）原先是 .askHumanChannel
+     flex column gap:16px 的直接子元素，包进本白卡后若不补 gap 就全部零间距。
+     minmax(0,1fr) 而非默认 auto：grid 项目 min-width:auto 会被长 wxid、长标题
+     顶宽而横向溢出白卡，设计规范要求这类内容在区域内换行或截断。 */
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 14px;
 }
 
 /* 卡头：左侧待处理总数，右侧按钮组。Shell 已有大页头，此处不重复写标题。
@@ -30,7 +38,8 @@
   display: flex;
   align-items: center;
   gap: 14px;
-  margin-bottom: 16px;
+  /* 不写 margin-bottom：纵向间距由父级 .askHumanPanel 的 gap 统一提供，
+     两者并存会叠加成 30px，让卡头与 chip 行之间明显偏松。 */
 }
 .askHumanPanelHeadCount {
   font-size: 13px;
@@ -103,6 +112,10 @@
   font: inherit;
   font-size: 12px;
   font-weight: 600;
+  /* 摆脱全局裸 button 基线的 min-height:38px（styles.css:76，--control-h）。
+     chip 自身 padding 只有 6px，被撑到 38px 后胶囊比例失调、与同排文字不协调。
+     同 Campaign.module.css:41 的 .chip 写法（那里也显式写 min-height:0）。 */
+  min-height: 0;
   padding: 6px 10px;
   border-radius: 999px;
   cursor: pointer;
