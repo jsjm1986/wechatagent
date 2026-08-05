@@ -1048,7 +1048,12 @@ function PublishBar({ resourceKind, id, onChange }: PublishBarProps) {
       >
         <CheckCircle2 size={12} /> {busy === "publish" ? "发布中…" : "发布新版"}
       </button>
-      <button type="button" onClick={() => void call("rollout")} disabled={busy !== ""}>
+      <button
+        type="button"
+        onClick={() => void call("rollout")}
+        disabled={busy !== ""}
+        className="wikiActionBtn--neutral"
+      >
         <ArrowRight size={12} /> {busy === "rollout" ? "发布中…" : "发布给全部"}
       </button>
       <button
@@ -1170,6 +1175,17 @@ function TaxonomiesGovernance() {
       </div>
       {error ? <div className="wikiBannerError">{error}</div> : null}
       <table className="wikiAdminTable">
+        <colgroup>
+          <col style={{ width: "8%" }} />
+          <col style={{ width: "12%" }} />
+          <col style={{ width: "14%" }} />
+          <col style={{ width: "12%" }} />
+          <col style={{ width: "8%" }} />
+          <col style={{ width: "6%" }} />
+          <col style={{ width: "7%" }} />
+          <col style={{ width: "15%" }} />
+          <col style={{ width: "18%" }} />
+        </colgroup>
         <thead>
           <tr>
             <th>范围</th>
@@ -1202,7 +1218,9 @@ function TaxonomiesGovernance() {
               </td>
               <td className="wikiArchiveTimelineTime">v{it.version ?? 0}</td>
               <td>{it.currentVersion ? "✓" : ""}</td>
-              <td className="wikiArchiveTimelineTime">{it.updatedAt ?? ""}</td>
+              <td className="wikiArchiveTimelineTime">
+                {it.updatedAt ? new Date(it.updatedAt).toLocaleString() : "—"}
+              </td>
               <td>
                 <PublishBar
                   resourceKind="taxonomies"
@@ -1260,6 +1278,14 @@ function StatePoliciesGovernance() {
       </div>
       {error ? <div className="wikiBannerError">{error}</div> : null}
       <table className="wikiAdminTable">
+        <colgroup>
+          <col style={{ width: "20%" }} />
+          <col style={{ width: "8%" }} />
+          <col style={{ width: "9%" }} />
+          <col style={{ width: "12%" }} />
+          <col style={{ width: "23%" }} />
+          <col style={{ width: "28%" }} />
+        </colgroup>
         <thead>
           <tr>
             <th>业务域</th>
@@ -1284,7 +1310,9 @@ function StatePoliciesGovernance() {
               <td className="wikiArchiveTimelineTime">v{it.version ?? 0}</td>
               <td>{it.currentVersion ? "✓" : ""}</td>
               <td className="wikiArchiveTimelineTime">{(it.states ?? []).length} 状态</td>
-              <td className="wikiArchiveTimelineTime">{it.updatedAt ?? ""}</td>
+              <td className="wikiArchiveTimelineTime">
+                {it.updatedAt ? new Date(it.updatedAt).toLocaleString() : "—"}
+              </td>
               <td>
                 <PublishBar
                   resourceKind="operation-state-policies"
@@ -1341,6 +1369,13 @@ function DomainGovernance() {
       </div>
       {error ? <div className="wikiBannerError">{error}</div> : null}
       <table className="wikiAdminTable">
+        <colgroup>
+          <col style={{ width: "24%" }} />
+          <col style={{ width: "9%" }} />
+          <col style={{ width: "10%" }} />
+          <col style={{ width: "25%" }} />
+          <col style={{ width: "32%" }} />
+        </colgroup>
         <thead>
           <tr>
             <th>业务域</th>
@@ -1363,7 +1398,9 @@ function DomainGovernance() {
               <td>{it.domain}</td>
               <td className="wikiArchiveTimelineTime">v{it.version ?? 0}</td>
               <td>{it.currentVersion ? "✓" : ""}</td>
-              <td className="wikiArchiveTimelineTime">{it.updatedAt ?? ""}</td>
+              <td className="wikiArchiveTimelineTime">
+                {it.updatedAt ? new Date(it.updatedAt).toLocaleString() : "—"}
+              </td>
               <td>
                 <PublishBar
                   resourceKind="operation-domains"

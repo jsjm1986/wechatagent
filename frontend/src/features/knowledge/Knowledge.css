@@ -2632,6 +2632,14 @@
     background: #b34134;
     color: #fff;
   }
+  /* 中性款操作按钮。必须与 --verify / --reject 同级（2 类）而不是写进
+     .wikiPublishBar button（2 类 + 1 元素，特异性更高）——写在那里会把
+     蓝色的「发布新版」和红色的「回退上版」一起刷成灰。
+     没有这条兜色，按钮就继承全局 button 基线的 color:#fff，
+     在 .wikiPublishBar button 的白底上完全不可见。 */
+  .knowledgeWiki .wikiActionBtn--neutral {
+    color: var(--ink-2);
+  }
   .knowledgeWiki .wikiCollapseHead {
     display: flex;
     align-items: center;
@@ -3143,8 +3151,36 @@
     align-items: center;
     gap: 4px;
   }
+  /* 治理工坊工具栏/表头的「刷新」按钮：全局 button 基线（styles.css:71）是
+     38px 高的纯蓝实心款，压在 11px 的 PublishBar 按钮和表格行上尺度失调。
+     此处对齐同面板 .wikiPublishBar button 的规格，并显式压掉 min-height
+     与 background/color。MetadataDashboard 的刷新按钮在 .wikiArchiveHeaderActions
+     内，而该 class 亦被 today.tsx / steward.tsx 使用，故用唯一的
+     .wikiMetadataDashboard 精确限定，避免溢出到本次范围外的面板。 */
+  .knowledgeWiki .wikiAdminToolbar button,
+  .knowledgeWiki .wikiMetadataDashboard .wikiArchiveHeaderActions button {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 500;
+    min-height: auto;
+    border: 1px solid var(--surface-page);
+    background: var(--surface-card);
+    color: var(--ink-2);
+    padding: 4px 8px;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+  }
+  .knowledgeWiki .wikiAdminToolbar button:hover:not(:disabled),
+  .knowledgeWiki .wikiMetadataDashboard .wikiArchiveHeaderActions button:hover:not(:disabled) {
+    background: var(--surface-page);
+  }
   .knowledgeWiki .wikiAdminTable {
     width: 100%;
+    /* fixed 让列宽只由 colgroup 决定：auto 布局下 9 列会按内容抢宽度，
+       把「版本」「当前生效」表头竖排、行高撑到约 93px。 */
+    table-layout: fixed;
     border-collapse: collapse;
     font-size: 12.5px;
   }
@@ -3164,6 +3200,8 @@
     padding: 6px 8px;
     border-bottom: 1px solid var(--surface-page);
     vertical-align: middle;
+    word-break: break-word;
+    overflow-wrap: anywhere;
   }
   .knowledgeWiki .wikiAdminTable tbody tr.is-active {
     background: rgba(180, 130, 50, 0.05);

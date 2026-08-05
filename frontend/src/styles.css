@@ -562,11 +562,18 @@ h2 {
 
 input,
 textarea {
-  width: 100%;
   border: 0;
   outline: 0;
   background: transparent;
   color: var(--ink);
+}
+
+/* width 与紧随的 height 规则同口径排除 checkbox/radio：设计规范
+   docs/frontend-design-system.md:162「Inputs are full width」指文本输入框，
+   勾选框被撑满会挤压同行 label 文本，导致中文逐字换行。 */
+input:not([type="checkbox"]):not([type="radio"]),
+textarea {
+  width: 100%;
 }
 
 input:not([type="checkbox"]):not([type="radio"]) {
