@@ -49,7 +49,14 @@ fn seed_chunk(title: &str, body_terms: &str) -> OperationKnowledgeChunk {
         status: "active".to_string(),
         integrity_status: Some("verified".to_string()),
         source_quote: Some(format!("原文引用：{title}")),
-        source_anchors: vec![doc! { "documentId": "seed_doc", "quote": title }],
+        // anchor 的引文键必须是 `sourceQuote`（生产 `source_anchor_for_quote` 恒写该键）。
+        // B3：D2 verify 闸改用 `chunk_has_citable_anchor` 判「可定位」，要求 anchor 自身含
+        // 非空 `sourceQuote`；裸 `quote` 键在读取侧 `quote_is_chunk_evidence` 恒被忽略，
+        // 那种 anchor 即便放行也永远无法被引用，故 fixture 必须与生产形态一致。
+        source_anchors: vec![doc! {
+            "documentId": "seed_doc",
+            "sourceQuote": format!("原文引用：{title}"),
+        }],
         dynamic_confidence: Some(0.9),
         priority: 0,
         created_at: BsonDt::now(),
