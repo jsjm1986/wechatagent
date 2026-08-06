@@ -1,16 +1,46 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Shell } from "../../app/Shell";
-import { useNavigationStore } from "../../stores/navigationStore";
+import { useNavigationStore, DEFAULT_COLLAPSED } from "../../stores/navigationStore";
 import { useAuthStore } from "../../stores/authStore";
 
 describe("Shell", () => {
-  it("默认渲染侧栏所有 channel 标签", async () => {
-    useNavigationStore.setState({ activeChannel: "overview" });
+  it("默认渲染展开组（日常/运营）的 channel 标签", async () => {
+    useNavigationStore.setState({ activeChannel: "overview", collapsedGroups: DEFAULT_COLLAPSED });
     render(<Shell />);
     expect(await screen.findByText("工作台")).toBeInTheDocument();
     expect(screen.getByText("用户运营")).toBeInTheDocument();
-    expect(screen.getByText("系统策略")).toBeInTheDocument();
+    // 「设置」默认收起 → 组内频道不渲染（分级导航的核心行为）。
+    expect(screen.queryByText("系统策略")).not.toBeInTheDocument();
+  });
+
+  it("点击组标题展开收起的组，其频道随之出现", async () => {
+    useNavigationStore.setState({ activeChannel: "overview", collapsedGroups: DEFAULT_COLLAPSED });
+    render(<Shell />);
+    expect(screen.queryByText("系统策略")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("nav-group-设置"));
+    expect(await screen.findByText("系统策略")).toBeInTheDocument();
+  });
+
+  it("当前频道所在组即使被折叠也强制展开（不丢定位）", () => {
+    // systemStrategy 属「设置」，且「设置」在 collapsedGroups 里 → 仍须可见。
+    useNavigationStore.setState({
+      activeChannel: "systemStrategy",
+      collapsedGroups: ["日常", "运营", "知识与内容", "成效", "设置"],
+    });
+    render(<Shell />);
+    // 「系统策略」同时是侧栏频道名与页头 h1，故把查询限定在侧栏 nav 内。
+    const nav = screen.getByRole("navigation", { name: "Product channels" });
+    expect(within(nav).getByText("系统策略")).toBeInTheDocument();
+  });
+
+  it("未上线占位频道渲染成不可点的灰显项", () => {
+    useNavigationStore.setState({ activeChannel: "overview", collapsedGroups: [] });
+    render(<Shell />);
+    // 「微信群运营」标 comingSoon → 不是 button，且带「未上线」角标。
+    expect(screen.queryByRole("button", { name: /微信群运营/ })).not.toBeInTheDocument();
+    expect(screen.getByText("微信群运营")).toBeInTheDocument();
+    expect(screen.getAllByText("未上线").length).toBeGreaterThan(0);
   });
 
   it("渲染当前 channel 的页头标题", () => {
