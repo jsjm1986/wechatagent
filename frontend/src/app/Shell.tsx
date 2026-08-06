@@ -242,7 +242,7 @@ export function Shell() {
                   data-testid={`nav-group-${group}`}
                 >
                   <ChevronRight
-                    size={12}
+                    size={14}
                     className={`${styles.groupChevron} ${collapsed ? "" : styles.groupChevronOpen}`}
                   />
                   <span>{group}</span>

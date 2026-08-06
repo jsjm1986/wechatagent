@@ -99,28 +99,36 @@
    文字居中的蓝按钮外观。**justify-content 是必需的**：styles.css 给裸 button
    写了 `justify-content: center`，漏掉它组标题就会被居中（.channel 显式写了
    flex-start 正是同一原因）。
-   颜色用 --ink-2 而非 --ink-4：--ink-4(#b0b0b5) 在近白侧栏上只有 2.05:1，
-   远低于 WCAG AA 小字 4.5:1。它原先是静态说明文字尚可，现在既是可点开关、
-   又是折叠组唯一可见的一行，必须可读。 */
+   颜色 #68686e（4.89:1，过 AA）而非 --ink-4(#b0b0b5，2.05:1 不可读)，也不用
+   --ink-2：标题是分类说明、不是内容，视觉重量必须**低于**频道名。此前一路提到
+   --ink-2 与频道名(13.5px/--ink-2)同色、字重反而更粗(600 vs 500)，两者重量打平
+   互相抢，正是"别扭不协调"的来源。参照品牌区的正确层级（16px 深 + 10.5px 浅）：
+   字号与颜色要同时拉开，不能只做字号。 */
 .groupLabel { display: flex; align-items: center; justify-content: flex-start;
   gap: 6px; width: 100%;
-  font-size: 10.5px; color: var(--ink-2); font-weight: 600; letter-spacing: .6px;
+  font-size: 10.5px; color: #68686e; font-weight: 500; letter-spacing: 1px;
   padding: 10px 12px 5px;
   background: none; border: none; box-shadow: none; min-height: 0;
   font-family: inherit; text-align: left; cursor: pointer;
   transition: color .18s ease; }
 /* 全局 button:hover 会刷深蓝底 + 投影、:active 会下沉 1px。组标题是导航标签、
    不是操作按钮，必须逐条压掉，否则鼠标掠过侧栏会闪出一条深蓝条。 */
-.groupLabel:hover { color: var(--ink-1); background: none; border-color: transparent;
+/* hover 只提一档到 --ink-2（不到 --ink-1）：给出可点反馈，但不让标题在 hover 时
+   反超频道名的重量。 */
+.groupLabel:hover { color: var(--ink-2); background: none; border-color: transparent;
   box-shadow: none; }
 .groupLabel:active { transform: none; }
-/* 收起时朝右、展开时转 90° 朝下。transform 过渡比切换图标更稳（不闪）。 */
-.groupChevron { flex-shrink: 0; opacity: .75;
+/* 收起时朝右、展开时转 90° 朝下。transform 过渡比切换图标更稳（不闪）。
+   14px 而非 12px：频道图标是 17px，12px 的 chevron 和它并置显得两套尺寸打架。 */
+.groupChevron { flex-shrink: 0; opacity: .6;
   transition: transform .18s cubic-bezier(.2,.7,.3,1); }
 .groupChevronOpen { transform: rotate(90deg); }
-/* 收起时在标题右侧显示组内频道数，让用户知道里面有东西没丢。 */
+/* 收起时在标题右侧显示组内频道数，让用户知道里面有东西没丢。
+   色值比标题(#68686e)再深一档、pill 底再淡一档：角标文字压在 pill 上，可用底色
+   比侧栏更深，同色会掉到 4.35 不过 AA。注意侧栏是渐变(#fbfcfe→#f4f6fa)，
+   「成效/设置」位置偏下、底色更深，所以必须按**底部**色算而非顶部。 */
 .groupCount { margin-left: auto; font-size: 9.5px; font-weight: 600; letter-spacing: 0;
-  color: var(--ink-2); background: rgba(20,30,60,.06);
+  color: #626268; background: rgba(20,30,60,.05);
   border-radius: 999px; padding: 1px 6px; }
 .channel {
   display: flex; align-items: center; justify-content: flex-start; gap: 11px;
