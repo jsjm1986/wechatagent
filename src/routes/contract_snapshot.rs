@@ -129,12 +129,24 @@ mod tests {
             }
         }
 
+        // 投影函数的命名后缀。**历史教训**：本守卫原先只认 `_json`，于是
+        // `domain_profiles.rs::profile_view` 这个 `-> Value` 的实体投影从未进过扫描集，
+        // 它用 `serde_json::to_value(p)` 整体序列化 `DomainProfile`，把裸
+        // `bson::DateTime` 漏成 `{"$date":{"$numberLong":"…"}}` 下发前端，
+        // 「行业配置」tab 直接白屏（React "Objects are not valid as a React child"）。
+        // 判定投影只看「返回 Value 的 model→Value 函数」，故后缀集合须含 `_view`。
+        const PROJECTION_SUFFIXES: &[&str] = &["_json", "_view"];
+
+        fn has_projection_suffix(name: &str) -> bool {
+            PROJECTION_SUFFIXES.iter().any(|s| name.ends_with(s))
+        }
+
         // 从一行形如 `... fn operation_knowledge_chunk_json(item: ...` 抽出投影名。
         fn extract_projection_name(line: &str) -> Option<String> {
             let after_fn = line.split("fn ").nth(1)?;
             let name_end = after_fn.find(|c| c == '(' || c == '<')?;
             let name = after_fn[..name_end].trim();
-            if name.ends_with("_json") && !name.is_empty() {
+            if has_projection_suffix(name) && !name.is_empty() {
                 Some(name.to_string())
             } else {
                 None
@@ -178,7 +190,7 @@ mod tests {
                 }
                 let window = &src[s..e];
                 for tok in window.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
-                    if tok.ends_with("_json") && tok.len() > 5 {
+                    if has_projection_suffix(tok) && tok.len() > 5 {
                         covered.insert(tok.to_string());
                     }
                 }
@@ -194,7 +206,9 @@ mod tests {
         for (_path, src) in &all_src {
             let lines: Vec<&str> = src.lines().collect();
             for (i, line) in lines.iter().enumerate() {
-                if !line.contains("fn ") || !line.contains("_json") {
+                if !line.contains("fn ")
+                    || !PROJECTION_SUFFIXES.iter().any(|s| line.contains(s))
+                {
                     continue;
                 }
                 let Some(name) = extract_projection_name(line) else {

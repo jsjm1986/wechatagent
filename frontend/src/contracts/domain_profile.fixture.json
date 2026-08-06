@@ -1,0 +1,273 @@
+{
+  "business_formulas": [
+    {
+      "displayName": "信任",
+      "evalScoreKey": "humanLike",
+      "expression": "Credibility + Reliability + Intimacy − SelfOrientation",
+      "key": "trust"
+    },
+    {
+      "displayName": "成交准备度",
+      "evalScoreKey": "conversionReadiness",
+      "expression": "Motivation × ProductFit × Timing × Trust ÷ Friction",
+      "key": "conversionReadiness"
+    },
+    {
+      "displayName": "情绪价值",
+      "evalScoreKey": "emotionalValue",
+      "expression": "Empathy + Validation + Specificity + AutonomySupport − Pressure",
+      "key": "emotionalValue"
+    },
+    {
+      "displayName": "下一步动作评分",
+      "evalScoreKey": "relationshipProgress",
+      "expression": "RelationshipGain + ConversionProgress + EmotionalValue + ProductFit − PressureRisk − FactRisk",
+      "key": "nextBestActionScore"
+    }
+  ],
+  "chunk_roles": [
+    {
+      "header": "【产品事实 product_fact】仅 verified 切片可用作产品声明背书；needs_review/rejected 不作背书。",
+      "is_fallback": true,
+      "key": "product_fact",
+      "order": 0
+    },
+    {
+      "header": "【语气模板 style_template】作为 few-shot 参考；不直接复制内容，仅借鉴节奏与措辞。",
+      "is_fallback": false,
+      "key": "style_template",
+      "order": 1
+    },
+    {
+      "header": "【同行案例 peer_case】仅作 reference，不作我方产品承诺；引用必须显式标注「行业经验/同行案例」。",
+      "is_fallback": false,
+      "key": "peer_case",
+      "order": 2
+    },
+    {
+      "header": "【反例 negative_example】don't-do 列表；候选回复语气/结构若与本段相似，必须改写。",
+      "is_fallback": false,
+      "key": "negative_example",
+      "order": 3
+    }
+  ],
+  "commitment_markers": {
+    "product_effect": [
+      "成功率",
+      "见效",
+      "回款",
+      "百分之",
+      "百分百"
+    ],
+    "tone_only": [
+      "保证",
+      "一定能",
+      "绝对"
+    ]
+  },
+  "conversation_modes": [
+    "casual_relationship",
+    "value_exchange",
+    "consultative",
+    "boundary_protection"
+  ],
+  "coverage_dimensions": [
+    {
+      "anchor_hint": "有 verified 切片陈述产品/服务\"能做什么\"的具体能力或功能事实。",
+      "display_name": "能力",
+      "initial_signal": "verified",
+      "key": "capability",
+      "required": false,
+      "review_topic_aliases": [
+        "功能",
+        "产品能力",
+        "服务能力"
+      ]
+    },
+    {
+      "anchor_hint": "有 verified 切片含具体报价/计费/套餐金额（注意：仅 needs_review 草稿里的报价不计入 verifiedFact，而应置 pendingDraft=true 并入 gap）。",
+      "display_name": "报价",
+      "key": "pricing",
+      "required": false,
+      "review_topic_aliases": [
+        "定价",
+        "价格",
+        "计费",
+        "套餐"
+      ]
+    },
+    {
+      "anchor_hint": "有 verified 切片描述**具体客户案例/实施成效**（含可核验的主体、场景或落地结果），即判 true。",
+      "display_name": "案例证据",
+      "initial_signal": "evidence",
+      "key": "caseEvidence",
+      "required": false,
+      "review_topic_aliases": [
+        "案例",
+        "客户案例",
+        "实施成效"
+      ]
+    },
+    {
+      "anchor_hint": "有 verified 切片含**可核验的效果数据/量化成果**（如转化率提升、响应时长变化等具体数字），即判 true。",
+      "display_name": "效果声明",
+      "initial_signal": "evidence",
+      "key": "effectClaims",
+      "required": false,
+      "review_topic_aliases": [
+        "效果数据",
+        "量化成果",
+        "效果"
+      ]
+    },
+    {
+      "anchor_hint": "有 verified 切片陈述交付方式/SLA/可用性/部署边界等具体条款。",
+      "display_name": "交付边界",
+      "initial_signal": "verified",
+      "key": "deliveryBoundary",
+      "required": false,
+      "review_topic_aliases": [
+        "交付",
+        "部署边界",
+        "SLA",
+        "可用性"
+      ]
+    }
+  ],
+  "created_at": "2023-11-14T22:13:20Z",
+  "current_version": true,
+  "description": "系统内置兜底配置：未配置行业 profile 时使用，行为等价历史默认。通过「行业配置向导」与 AI 对话生成专属 profile 后，此兜底不再生效。",
+  "display_name": "默认运营画像（通用兜底）",
+  "distrust_self_reported_low_risk": false,
+  "grounding_gate_bypass_without_claim": false,
+  "id": "64a1f2c3e4b5a697889d0001",
+  "is_active": true,
+  "memory_dimensions": [
+    {
+      "candidate_type": true,
+      "cap": 8,
+      "date_dimension": false,
+      "display_name": "偏好",
+      "is_core": false,
+      "key": "preferences"
+    },
+    {
+      "candidate_type": true,
+      "cap": 10,
+      "date_dimension": false,
+      "display_name": "禁忌/不要做",
+      "is_core": false,
+      "key": "doNotDo"
+    },
+    {
+      "candidate_type": true,
+      "cap": 8,
+      "date_dimension": false,
+      "display_name": "承诺",
+      "is_core": false,
+      "key": "commitments"
+    },
+    {
+      "candidate_type": true,
+      "cap": 8,
+      "date_dimension": false,
+      "display_name": "异议",
+      "is_core": false,
+      "key": "objections"
+    },
+    {
+      "candidate_type": true,
+      "cap": 8,
+      "date_dimension": false,
+      "display_name": "未闭合事项",
+      "is_core": false,
+      "key": "openLoops"
+    },
+    {
+      "candidate_type": false,
+      "cap": 8,
+      "date_dimension": false,
+      "display_name": "待解答问题",
+      "is_core": false,
+      "key": "openQuestions"
+    },
+    {
+      "candidate_type": false,
+      "cap": 12,
+      "date_dimension": false,
+      "display_name": "已确认事实",
+      "is_core": false,
+      "key": "confirmedFacts"
+    },
+    {
+      "candidate_type": false,
+      "cap": 6,
+      "date_dimension": false,
+      "display_name": "冲突",
+      "is_core": false,
+      "key": "conflicts"
+    }
+  ],
+  "operation_mode": {
+    "calendar": {
+      "enabled": false
+    },
+    "commitment": {
+      "enabled": true
+    },
+    "funnel": {
+      "enabled": true
+    },
+    "quiet_hours": {},
+    "reactivation": {
+      "enabled": false
+    },
+    "renewal": {
+      "enabled": false
+    },
+    "silence": {
+      "enabled": true
+    }
+  },
+  "outcome_polarity": {
+    "negative": [
+      "user_replied_objection",
+      "user_replied_stop_requested",
+      "user_replied_unsubscribed",
+      "user_replied_negative",
+      "user_replied_complaint"
+    ],
+    "positive": [
+      "user_replied_buying_signal"
+    ]
+  },
+  "previous_version": null,
+  "profile_dimensions": [
+    {
+      "description": "客户在运营关系中所处阶段。",
+      "display_name": "客户阶段",
+      "kind": "customer_stage",
+      "participates_in_decision": true
+    },
+    {
+      "description": "客户当前的意向高低。",
+      "display_name": "意向程度",
+      "kind": "intent_level",
+      "participates_in_decision": true
+    }
+  ],
+  "profile_id": "__default__",
+  "release_status": "published",
+  "seeded_by": "default",
+  "stagnation_dimension": "customer_stage",
+  "trajectory_dimensions": [
+    {
+      "display_name": "异议类型",
+      "kind": "objection_type"
+    }
+  ],
+  "transaction_facts_enabled": true,
+  "updated_at": "2023-11-14T22:15:00Z",
+  "version": 1,
+  "workspace_id": "ws-1"
+}

@@ -12,6 +12,7 @@ import { ConfirmProvider, useConfirm } from "../../components/ui/ConfirmDialog";
 import { usePromptSaveConfirm, usePromptPublishConfirm } from "../../components/prompt/usePromptSaveConfirm";
 import { ToastProvider } from "../../components/ui/Toast";
 import { VERSION_STATUS_LABELS, seededByLabel, promptLayerLabel, labelOf } from "../../lib/reviewLabels";
+import { formatTimestamp } from "../../lib/format";
 import styles from "./SystemStrategy.module.css";
 
 // 系统策略频道：全局总控 Prompt（人格/任务）+ 状态机灰度 + 双层标签字典 + 跨用户教训。
@@ -235,7 +236,7 @@ function ActiveVersionsBar({
         )}
         {meta.updatedAt && (
           <span className={styles.activeVersionsTimestamp} title="updated_at">
-            {meta.updatedAt}
+            {formatTimestamp(meta.updatedAt)}
           </span>
         )}
       </div>
@@ -2442,7 +2443,7 @@ function DomainProfilePanel({ busy }: { busy: boolean }) {
                       <span className={styles.activeVersionsSeeded}>{seededByLabel(profile.seeded_by)}</span>
                     )}
                     {profile.updated_at && (
-                      <span className={styles.activeVersionsTimestamp}>{profile.updated_at}</span>
+                      <span className={styles.activeVersionsTimestamp}>{formatTimestamp(profile.updated_at)}</span>
                     )}
                   </div>
                 </button>

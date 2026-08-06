@@ -36,7 +36,7 @@ use crate::{
     auth::AuthenticatedAdmin,
     db::Database,
     error::{AppError, AppResult},
-    models::DomainProfile,
+    models::{dt_to_string, DomainProfile},
 };
 
 use super::shared::{parse_object_id, resolve_authorized_workspace};
@@ -432,7 +432,16 @@ pub(super) async fn list_domain_profiles(
     Ok(Json(json!({ "items": items })))
 }
 
-/// 把 DomainProfile 序列化成前端视图：整体 serde + `id` 转 hex。
+/// 把 DomainProfile 序列化成前端视图：整体 serde + `id` 转 hex + 时间字段转 RFC3339。
+///
+/// `created_at` / `updated_at` 在 [`DomainProfile`] 上是裸 `bson::DateTime`，整体
+/// `serde_json::to_value` 会把它们序列化成扩展 JSON 对象
+/// `{"$date":{"$numberLong":"…"}}`（见 bson 的 `impl Serialize for DateTime`），
+/// 而前端 TS 契约声明的是 `created_at?: string`，并直接把该值当 React child 渲染
+/// （`{profile.updated_at}`）。对象作为 child 会让 React 抛
+/// "Objects are not valid as a React child (found: object with keys {$date})"，
+/// 整个「行业配置」tab 白屏。故此处统一经 `dt_to_string` 脱壳成 RFC3339 字符串，
+/// 与 `ApiConfirmedTag`（D4-F1）/ 其余 routes 的 wire 形态一致。
 fn profile_view(p: &DomainProfile) -> Value {
     let mut v = serde_json::to_value(p).unwrap_or_else(|_| json!({}));
     if let Some(obj) = v.as_object_mut() {
@@ -440,6 +449,8 @@ fn profile_view(p: &DomainProfile) -> Value {
         obj.insert("id".to_string(), json!(hex));
         // _id 是 BSON ObjectId 序列化形态,前端用上面的 hex `id` 即可。
         obj.remove("_id");
+        obj.insert("created_at".to_string(), json!(dt_to_string(p.created_at)));
+        obj.insert("updated_at".to_string(), json!(dt_to_string(p.updated_at)));
     }
     v
 }
@@ -1465,5 +1476,69 @@ mod tests {
         assert!(rows[0].2 && !rows[1].2, "rollout 不改变 active");
         activate_single(&mut rows, 2);
         assert!(!rows[0].2 && rows[1].2, "显式 activate 才切换运行时");
+    }
+
+    /// wire 契约护栏：`profile_view` 的 `created_at` / `updated_at` 必须是 RFC3339
+    /// **字符串**，不能是 bson 扩展 JSON 对象 `{"$date":{"$numberLong":"…"}}`。
+    ///
+    /// 回归背景：`profile_view` 用 `serde_json::to_value(p)` 整体序列化，而
+    /// `DomainProfile::{created_at,updated_at}` 是裸 `bson::DateTime`——bson 的
+    /// `impl Serialize for DateTime` 无条件写 `serialize_struct("$date")`，于是
+    /// wire 上变成对象。前端 TS 声明 `updated_at?: string` 且直接
+    /// `{profile.updated_at}` 当 React child 渲染，对象会让 React 抛
+    /// "Objects are not valid as a React child (found: object with keys {$date})"，
+    /// 「行业配置」tab 整页白屏（无 ErrorBoundary 兜底 → root 卸载）。
+    #[test]
+    fn profile_view_serializes_timestamps_as_rfc3339_strings() {
+        use crate::agent::domain_profile::default_domain_profile;
+
+        let profile = default_domain_profile("default");
+        let v = super::profile_view(&profile);
+
+        for key in ["created_at", "updated_at"] {
+            let field = v.get(key).unwrap_or_else(|| panic!("{key} 应存在于 wire"));
+            assert!(
+                field.is_string(),
+                "{key} 必须是 RFC3339 字符串（前端直接渲染），实际={field}"
+            );
+            let s = field.as_str().unwrap();
+            assert!(
+                s.contains('T') && (s.ends_with('Z') || s.contains('+')),
+                "{key} 应形如 RFC3339，实际={s}"
+            );
+            assert!(
+                field.get("$date").is_none(),
+                "{key} 不得是 bson 扩展 JSON 对象"
+            );
+        }
+
+        // 整个 wire 里不得残留任何 $date / _id 键（嵌套字段一并守）。
+        let dumped = serde_json::to_string(&v).expect("serialize wire");
+        assert!(
+            !dumped.contains("$date"),
+            "wire 不得含 $date 扩展 JSON：{dumped}"
+        );
+        assert!(v.get("_id").is_none(), "_id 应被移除，前端用 hex id");
+        assert!(v.get("id").is_some(), "id（hex）应存在");
+    }
+
+    /// 契约快照：`profile_view`。此投影此前完全在 `every_projection_has_contract_test`
+    /// 扫描集之外（守卫只认 `_json` 后缀），是 `$date` 漏成对象、前端白屏的直接原因。
+    /// 守卫已扩到 `_view`，这里补上真正的键集/形状对账。
+    ///
+    /// 时间戳必须钉死：`default_domain_profile` 内部用 `DateTime::now()`，
+    /// 不覆盖会让 fixture 每次运行都漂移。
+    #[test]
+    fn profile_view_matches_contract_fixture() {
+        use crate::agent::domain_profile::default_domain_profile;
+        use mongodb::bson::{oid::ObjectId, DateTime};
+
+        let mut profile = default_domain_profile("ws-1");
+        profile.id = Some(ObjectId::parse_str("64a1f2c3e4b5a697889d0001").unwrap());
+        profile.created_at = DateTime::from_millis(1_700_000_000_000);
+        profile.updated_at = DateTime::from_millis(1_700_000_100_000);
+
+        let projected = super::profile_view(&profile);
+        crate::routes::contract_snapshot::assert_contract_fixture("domain_profile", projected);
     }
 }

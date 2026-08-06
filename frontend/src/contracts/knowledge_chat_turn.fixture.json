@@ -1,0 +1,35 @@
+{
+  "attachments": [
+    {
+      "chunkId": "chunk-1"
+    }
+  ],
+  "content": "已按你的描述起草一条知识切片。",
+  "createdAt": "2023-11-14T22:13:20Z",
+  "followupQuestions": [
+    {
+      "question": "适用哪些渠道？"
+    }
+  ],
+  "id": "64a1f2c3e4b5a697889d0001",
+  "intent": "draft_chunk",
+  "kind": "task_progress",
+  "missingFields": [
+    "body"
+  ],
+  "patch": {
+    "title": "退款政策"
+  },
+  "promptKey": "knowledge.chat.draft",
+  "role": "assistant",
+  "sessionId": "sess-1",
+  "status": "pending",
+  "tokensUsed": 1234,
+  "toolCalls": [
+    {
+      "latency_ms": 42,
+      "name": "search_chunks"
+    }
+  ],
+  "turnIndex": 2
+}

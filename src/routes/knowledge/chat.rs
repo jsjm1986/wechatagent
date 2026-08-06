@@ -3612,6 +3612,57 @@ pub(in crate::routes) async fn chat_session_stream(
 mod tests {
     use super::*;
 
+    /// 契约快照：`chat_turn_to_view`（知识工作台会话 turn 投影）。
+    ///
+    /// 本测试是补 `every_projection_has_contract_test` 守卫历史漏洞时补上的：守卫原先只扫
+    /// `*_json` 后缀，`*_view` 结尾的实体投影从未进过扫描集（同批漏掉的
+    /// `domain_profiles.rs::profile_view` 就因此把裸 `bson::DateTime` 漏成
+    /// `{"$date":{"$numberLong":"…"}}` 下发前端，「行业配置」tab 白屏）。
+    ///
+    /// 本投影自身是安全的——`created_at` 显式走 `try_to_rfc3339_string()`，`applied_at`
+    /// 根本不下发。fixture 把这个形状钉死，防止有人日后改成整体 `serde_json::to_value`。
+    /// 时间戳用 `from_millis` 固定值（不可用 `DateTime::now()`，否则快照不可重复）。
+    #[test]
+    fn chat_turn_to_view_matches_contract_fixture() {
+        use crate::models::KnowledgeChatTurn;
+
+        let turn = KnowledgeChatTurn {
+            id: Some(ObjectId::parse_str("64a1f2c3e4b5a697889d0001").unwrap()),
+            workspace_id: "ws-1".to_string(),
+            account_id: "acc-1".to_string(),
+            session_id: "sess-1".to_string(),
+            turn_index: 2,
+            role: "assistant".to_string(),
+            intent: Some("draft_chunk".to_string()),
+            content: "已按你的描述起草一条知识切片。".to_string(),
+            attachments: vec![doc! { "chunkId": "chunk-1" }],
+            patch: Some(doc! { "title": "退款政策" }),
+            missing_fields: vec!["body".to_string()],
+            followup_questions: vec![doc! { "question": "适用哪些渠道？" }],
+            status: "pending".to_string(),
+            apply_result: None,
+            applied_at: None,
+            tokens_used: 1234,
+            prompt_key: Some("knowledge.chat.draft".to_string()),
+            kind: Some("task_progress".to_string()),
+            tool_calls: vec![doc! { "name": "search_chunks", "latency_ms": 42_i32 }],
+            created_at: DateTime::from_millis(1_700_000_000_000),
+        };
+        let projected = chat_turn_to_view(&turn);
+        // createdAt 必须是 RFC3339 字符串而非 bson 扩展 JSON 对象。
+        assert!(
+            projected.get("createdAt").map(|v| v.is_string()) == Some(true),
+            "createdAt 必须是字符串，实际={:?}",
+            projected.get("createdAt")
+        );
+        let dumped = serde_json::to_string(&projected).expect("serialize wire");
+        assert!(
+            !dumped.contains("$date"),
+            "wire 不得含 $date 扩展 JSON：{dumped}"
+        );
+        crate::routes::contract_snapshot::assert_contract_fixture("knowledge_chat_turn", projected);
+    }
+
     #[test]
     fn chat_draft_contract_repair_only_targets_contradictory_empty_proposals() {
         assert!(chat_draft_requires_contract_repair(&json!({
