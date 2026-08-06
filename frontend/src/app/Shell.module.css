@@ -130,6 +130,15 @@
 .groupCount { margin-left: auto; font-size: 9.5px; font-weight: 600; letter-spacing: 0;
   color: #626268; background: rgba(20,30,60,.05);
   border-radius: 999px; padding: 1px 6px; }
+/* 手风琴下「当前频道所在组」不再强制展开（那会让同时展开变 2 组、滚动条回来），
+   定位感改由这个蓝点承担：组收起时若活跃频道在组内，标题旁点亮一颗。 */
+.groupActiveDot { width: 5px; height: 5px; border-radius: 50%; flex-shrink: 0;
+  background: var(--color-scheduled);
+  box-shadow: 0 0 5px 1px rgba(10,132,255,.45); }
+/* 矮视口兜底：手风琴把同时展开压到 1 组（最坏 5 行 = 389px），但 nav 可用高约等于
+   视口高 − 197px（品牌区 58 + 页脚 100 + 内边距 40），所以视口低于约 586px 时 389px
+   仍放不下。按视口高分两档收紧行高/标题高/组间距，让最坏情况也不出滚动条。
+   数值是按 5 标题 + 4 组间距 + 5 行 反推的，别随手改。 */
 .channel {
   display: flex; align-items: center; justify-content: flex-start; gap: 11px;
   position: relative;
@@ -174,6 +183,37 @@
   animation: chRail 3.6s ease-in-out infinite;
 }
 @keyframes chRail { 0%,100% { opacity: .45; transform: scaleY(.65); } 50% { opacity: 1; transform: scaleY(1); } }
+
+/* 矮视口紧凑档：手风琴把同时展开压到 1 组（最坏 5 行 = 389px），但 nav 可用高
+   约等于「视口高 − 197px」（品牌区/页脚/内边距），所以视口低于约 586px 时
+   389px 仍放不下。这两档按视口高逐步收紧行距，让最坏情况也不出滚动条。
+   **必须写在所有 .channel/.groupLabel 基础规则之后**：媒体查询不提升特异性，
+   写在前面会被后面的同特异性基础规则整条覆盖（这坑本次踩过一次）。 */
+@media (max-height: 760px) {
+  .groupLabel { padding: 7px 12px 4px; }
+  .group + .group { margin-top: 6px; }
+  .channel { padding: 7px 12px; margin: 1px 0; }
+}
+@media (max-height: 660px) {
+  .groupLabel { padding: 5px 12px 3px; }
+  .group + .group { margin-top: 4px; }
+  .channel { padding: 5px 12px; margin: 0; font-size: 13px; }
+  .channel svg { width: 16px; height: 16px; }
+}
+@media (max-height: 620px) {
+  .groupLabel { padding: 4px 12px 2px; font-size: 10px; }
+  .group + .group { margin-top: 2px; }
+  .channel { padding: 3px 12px; margin: 0; font-size: 12.5px; }
+  .channel svg { width: 15px; height: 15px; }
+}
+/* 最矮一档（约 13 寸笔记本再缩窗口）：只保证不滚动，密度已接近可点下限，
+   不再继续压——低于此高度让它滚动比让行高小到点不准更合理。 */
+@media (max-height: 560px) {
+  .groupLabel { padding: 2px 12px 1px; }
+  .group + .group { margin-top: 1px; }
+  .channel { padding: 1px 12px; font-size: 12.5px; }
+  .channel svg { width: 14px; height: 14px; }
+}
 
 /* 底部区：与侧栏一体（不是独立卡），顶部一条分隔线划分导航/账号用户区 */
 .foot {

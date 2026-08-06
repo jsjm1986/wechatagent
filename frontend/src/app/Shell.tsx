@@ -199,7 +199,7 @@ function WorkspaceSwitcher({
 export function Shell() {
   const activeChannel = useNavigationStore((s) => s.activeChannel);
   const setChannel = useNavigationStore((s) => s.setChannel);
-  const collapsedGroups = useNavigationStore((s) => s.collapsedGroups);
+  const expandedGroup = useNavigationStore((s) => s.expandedGroup);
   const toggleGroup = useNavigationStore((s) => s.toggleGroup);
   const activeProfile = useProfileStore((s) => s.activeProfile);
   const user = useAuthStore((s) => s.user);
@@ -228,10 +228,12 @@ export function Shell() {
               c.visibleWhen ? c.visibleWhen(activeProfile) : true
             );
             if (items.length === 0) return null;
-            // 当前频道所在组强制展开：否则用户看不到自己在哪，
-            // 且折叠态是持久化的，会一直「丢失定位」。
+            // 手风琴：只有唯一展开的那组画出频道，其余一律收起。
+            // **不能**再像以前那样「当前频道所在组强制展开」——那会让同时展开
+            // 变成 2 组（最坏 5+5 行 = 612px > 可用 550px），滚动条又回来。
+            // 定位感改由收起态标题上的活跃圆点承担，不靠展开来表达。
             const holdsActive = items.some((c) => c.id === activeChannel);
-            const collapsed = collapsedGroups.includes(group) && !holdsActive;
+            const collapsed = expandedGroup !== group;
             return (
               <div key={group} className={styles.group}>
                 <button
@@ -246,6 +248,10 @@ export function Shell() {
                     className={`${styles.groupChevron} ${collapsed ? "" : styles.groupChevronOpen}`}
                   />
                   <span>{group}</span>
+                  {/* 收起且当前频道在组内 → 标题上打蓝点，替代「强制展开」表达定位。 */}
+                  {collapsed && holdsActive && (
+                    <span className={styles.groupActiveDot} aria-label="当前频道在此组" />
+                  )}
                   {collapsed && <span className={styles.groupCount}>{items.length}</span>}
                 </button>
                 {!collapsed &&
