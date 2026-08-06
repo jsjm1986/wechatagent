@@ -95,28 +95,33 @@
 .nav { display: flex; flex-direction: column; gap: 0; flex: 1; overflow-y: auto; overflow-x: hidden; }
 .group + .group { margin-top: 8px; }
 /* 组标题现在是可点的折叠开关（button）。必须显式重置全局裸 button 基线
-   （background/border/min-height/font），否则会继承出 38px 高的按钮外观。 */
-.groupLabel { display: flex; align-items: center; gap: 6px; width: 100%;
-  font-size: 10.5px; color: var(--ink-4); font-weight: 600; letter-spacing: .8px;
-  text-transform: uppercase; padding: 10px 12px 5px;
+   （background/border/min-height/font/justify-content），否则会继承出 38px 高、
+   文字居中的蓝按钮外观。**justify-content 是必需的**：styles.css 给裸 button
+   写了 `justify-content: center`，漏掉它组标题就会被居中（.channel 显式写了
+   flex-start 正是同一原因）。
+   颜色用 --ink-2 而非 --ink-4：--ink-4(#b0b0b5) 在近白侧栏上只有 2.05:1，
+   远低于 WCAG AA 小字 4.5:1。它原先是静态说明文字尚可，现在既是可点开关、
+   又是折叠组唯一可见的一行，必须可读。 */
+.groupLabel { display: flex; align-items: center; justify-content: flex-start;
+  gap: 6px; width: 100%;
+  font-size: 10.5px; color: var(--ink-2); font-weight: 600; letter-spacing: .6px;
+  padding: 10px 12px 5px;
   background: none; border: none; box-shadow: none; min-height: 0;
   font-family: inherit; text-align: left; cursor: pointer;
   transition: color .18s ease; }
-.groupLabel:hover { color: var(--ink-2); }
+/* 全局 button:hover 会刷深蓝底 + 投影、:active 会下沉 1px。组标题是导航标签、
+   不是操作按钮，必须逐条压掉，否则鼠标掠过侧栏会闪出一条深蓝条。 */
+.groupLabel:hover { color: var(--ink-1); background: none; border-color: transparent;
+  box-shadow: none; }
+.groupLabel:active { transform: none; }
 /* 收起时朝右、展开时转 90° 朝下。transform 过渡比切换图标更稳（不闪）。 */
-.groupChevron { flex-shrink: 0; opacity: .55;
+.groupChevron { flex-shrink: 0; opacity: .75;
   transition: transform .18s cubic-bezier(.2,.7,.3,1); }
 .groupChevronOpen { transform: rotate(90deg); }
 /* 收起时在标题右侧显示组内频道数，让用户知道里面有东西没丢。 */
 .groupCount { margin-left: auto; font-size: 9.5px; font-weight: 600; letter-spacing: 0;
-  color: var(--ink-4); background: rgba(20,30,60,.06);
+  color: var(--ink-2); background: rgba(20,30,60,.06);
   border-radius: 999px; padding: 1px 6px; }
-/* 未上线占位频道：灰显 + 不可点（div 而非 button，无 hover 位移）。 */
-.channelSoon { opacity: .45; cursor: default; }
-.channelSoon:hover { background: none; transform: none; box-shadow: none; color: var(--ink-2); }
-.soonBadge { margin-left: auto; font-size: 9px; font-weight: 600; letter-spacing: 0;
-  color: var(--ink-4); border: 1px solid var(--hairline);
-  border-radius: 999px; padding: 1px 5px; white-space: nowrap; }
 .channel {
   display: flex; align-items: center; justify-content: flex-start; gap: 11px;
   position: relative;
@@ -136,6 +141,23 @@
   box-shadow: 0 4px 14px -5px rgba(20,30,60,.18), inset 0 1.5px 1px rgba(255,255,255,.95), inset 0 0 0 1px rgba(255,255,255,.55);
 }
 .active svg { color: var(--color-scheduled); opacity: 1; }
+/* 未上线占位频道：弱化但可读，不可点（div 而非 button，无 hover 位移）。
+   **必须定义在 .channel 之后**：两者同为单类选择器、特异性相同，靠源码顺序
+   决胜。写在前面会被 .channel 的 color 覆盖，占位项和正常频道一模一样
+   （真实浏览器实测抓到过：渲染出来是 ink-2，弱化完全失效）。
+   **不用 opacity 压整行**：父级 opacity 会与子元素自身的 opacity 相乘，
+   原先 .45 × 角标 .75 = 0.34，角标只剩 1.25:1 基本隐形。改成显式给色，
+   弱化靠色阶而非透明度叠乘。
+   色值取 #68686e 而非 --ink-3(#76767b)：ink-3 在近白侧栏上 4.28:1、在角标
+   底色上 3.81:1，都差一点到 AA 的 4.5。#68686e 落在 ink-2 与 ink-3 之间
+   （侧栏 5.25:1 / 角标底 4.67:1 均达标），又明显弱于正常频道的 7.48:1，
+   保住「未上线」该有的次要感。色阶里没有这一档，故就地写死并注明。 */
+.channelSoon { cursor: default; color: #68686e; }
+.channelSoon svg { opacity: .45; }
+.channelSoon:hover { background: none; transform: none; box-shadow: none; color: #68686e; }
+.soonBadge { margin-left: auto; font-size: 9px; font-weight: 600; letter-spacing: 0;
+  color: #68686e; border: 1px solid var(--hairline);
+  border-radius: 999px; padding: 1px 5px; white-space: nowrap; }
 /* 标志性的左侧呼吸蓝光条——只在激活频道，慢节奏吸气 */
 .active::before {
   content: ''; position: absolute; left: 1px; top: 50%; margin-top: -9px;
