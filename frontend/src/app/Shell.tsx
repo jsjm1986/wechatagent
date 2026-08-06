@@ -1,6 +1,6 @@
 import { Suspense, useEffect, useRef, useState } from "react";
-import { LogOut, Check, ChevronsUpDown, RefreshCw } from "lucide-react";
-import { CHANNELS } from "./channels";
+import { LogOut, Check, ChevronsUpDown, RefreshCw, ChevronRight } from "lucide-react";
+import { CHANNELS, type ChannelGroup } from "./channels";
 import { useNavigationStore } from "../stores/navigationStore";
 import { useAuthStore } from "../stores/authStore";
 import { useAccountStore } from "../stores/accountStore";
@@ -18,7 +18,10 @@ async function syncAccounts(): Promise<number> {
   return res.synced;
 }
 
-const GROUP_ORDER: ReadonlyArray<"运营" | "知识" | "系统"> = ["运营", "知识", "系统"];
+// 侧栏分组顺序（一级）。「日常」与「运营」默认展开，其余默认收起——
+// 20 个频道全平铺时侧栏必然滚动，收起后常驻可见约 11 行。
+// 折叠态由 navigationStore 持有并落 localStorage。
+const GROUP_ORDER: ReadonlyArray<ChannelGroup> = ["日常", "运营", "知识与内容", "成效", "设置"];
 
 function AccountSwitcher() {
   const accounts = useAccountStore((s) => s.accounts);
@@ -196,6 +199,8 @@ function WorkspaceSwitcher({
 export function Shell() {
   const activeChannel = useNavigationStore((s) => s.activeChannel);
   const setChannel = useNavigationStore((s) => s.setChannel);
+  const collapsedGroups = useNavigationStore((s) => s.collapsedGroups);
+  const toggleGroup = useNavigationStore((s) => s.toggleGroup);
   const activeProfile = useProfileStore((s) => s.activeProfile);
   const user = useAuthStore((s) => s.user);
   const onLogout = useAuthStore((s) => s.onLogout);
@@ -218,26 +223,63 @@ export function Shell() {
         </div>
 
         <nav className={styles.nav} aria-label="Product channels">
-          {GROUP_ORDER.map((group) => (
-            <div key={group} className={styles.group}>
-              <div className={styles.groupLabel}>{group}</div>
-              {CHANNELS.filter((c) => c.group === group)
-                .filter((c) => (c.visibleWhen ? c.visibleWhen(activeProfile) : true))
-                .map((c) => {
-                const Icon = c.icon;
-                return (
-                  <button
-                    key={c.id}
-                    className={`${styles.channel} ${c.id === activeChannel ? styles.active : ""}`}
-                    onClick={() => setChannel(c.id)}
-                  >
-                    <Icon size={17} />
-                    <span>{c.label}</span>
-                  </button>
-                );
-              })}
-            </div>
-          ))}
+          {GROUP_ORDER.map((group) => {
+            const items = CHANNELS.filter((c) => c.group === group).filter((c) =>
+              c.visibleWhen ? c.visibleWhen(activeProfile) : true
+            );
+            if (items.length === 0) return null;
+            // 当前频道所在组强制展开：否则用户看不到自己在哪，
+            // 且折叠态是持久化的，会一直「丢失定位」。
+            const holdsActive = items.some((c) => c.id === activeChannel);
+            const collapsed = collapsedGroups.includes(group) && !holdsActive;
+            return (
+              <div key={group} className={styles.group}>
+                <button
+                  type="button"
+                  className={styles.groupLabel}
+                  onClick={() => toggleGroup(group)}
+                  aria-expanded={!collapsed}
+                  data-testid={`nav-group-${group}`}
+                >
+                  <ChevronRight
+                    size={12}
+                    className={`${styles.groupChevron} ${collapsed ? "" : styles.groupChevronOpen}`}
+                  />
+                  <span>{group}</span>
+                  {collapsed && <span className={styles.groupCount}>{items.length}</span>}
+                </button>
+                {!collapsed &&
+                  items.map((c) => {
+                    const Icon = c.icon;
+                    // 占位频道（Component 仍是工作台）不可点，免得点进去看到别的页面。
+                    if (c.comingSoon) {
+                      return (
+                        <div
+                          key={c.id}
+                          className={`${styles.channel} ${styles.channelSoon}`}
+                          aria-disabled="true"
+                          title="下一阶段建设，暂未上线"
+                        >
+                          <Icon size={17} />
+                          <span>{c.label}</span>
+                          <span className={styles.soonBadge}>未上线</span>
+                        </div>
+                      );
+                    }
+                    return (
+                      <button
+                        key={c.id}
+                        className={`${styles.channel} ${c.id === activeChannel ? styles.active : ""}`}
+                        onClick={() => setChannel(c.id)}
+                      >
+                        <Icon size={17} />
+                        <span>{c.label}</span>
+                      </button>
+                    );
+                  })}
+              </div>
+            );
+          })}
         </nav>
 
         {user && (

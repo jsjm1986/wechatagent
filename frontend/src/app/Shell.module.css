@@ -94,8 +94,29 @@
 /* 导航 */
 .nav { display: flex; flex-direction: column; gap: 0; flex: 1; overflow-y: auto; overflow-x: hidden; }
 .group + .group { margin-top: 8px; }
-.groupLabel { font-size: 10.5px; color: var(--ink-4); font-weight: 600; letter-spacing: .8px;
-  text-transform: uppercase; padding: 10px 12px 5px; }
+/* 组标题现在是可点的折叠开关（button）。必须显式重置全局裸 button 基线
+   （background/border/min-height/font），否则会继承出 38px 高的按钮外观。 */
+.groupLabel { display: flex; align-items: center; gap: 6px; width: 100%;
+  font-size: 10.5px; color: var(--ink-4); font-weight: 600; letter-spacing: .8px;
+  text-transform: uppercase; padding: 10px 12px 5px;
+  background: none; border: none; box-shadow: none; min-height: 0;
+  font-family: inherit; text-align: left; cursor: pointer;
+  transition: color .18s ease; }
+.groupLabel:hover { color: var(--ink-2); }
+/* 收起时朝右、展开时转 90° 朝下。transform 过渡比切换图标更稳（不闪）。 */
+.groupChevron { flex-shrink: 0; opacity: .55;
+  transition: transform .18s cubic-bezier(.2,.7,.3,1); }
+.groupChevronOpen { transform: rotate(90deg); }
+/* 收起时在标题右侧显示组内频道数，让用户知道里面有东西没丢。 */
+.groupCount { margin-left: auto; font-size: 9.5px; font-weight: 600; letter-spacing: 0;
+  color: var(--ink-4); background: rgba(20,30,60,.06);
+  border-radius: 999px; padding: 1px 6px; }
+/* 未上线占位频道：灰显 + 不可点（div 而非 button，无 hover 位移）。 */
+.channelSoon { opacity: .45; cursor: default; }
+.channelSoon:hover { background: none; transform: none; box-shadow: none; color: var(--ink-2); }
+.soonBadge { margin-left: auto; font-size: 9px; font-weight: 600; letter-spacing: 0;
+  color: var(--ink-4); border: 1px solid var(--hairline);
+  border-radius: 999px; padding: 1px 5px; white-space: nowrap; }
 .channel {
   display: flex; align-items: center; justify-content: flex-start; gap: 11px;
   position: relative;
