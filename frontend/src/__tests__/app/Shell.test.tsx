@@ -1,41 +1,57 @@
 import { fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Shell } from "../../app/Shell";
-import { useNavigationStore, DEFAULT_COLLAPSED } from "../../stores/navigationStore";
+import { useNavigationStore, DEFAULT_EXPANDED } from "../../stores/navigationStore";
 import { useAuthStore } from "../../stores/authStore";
 
 describe("Shell", () => {
-  it("默认渲染展开组（日常/运营）的 channel 标签", async () => {
-    useNavigationStore.setState({ activeChannel: "overview", collapsedGroups: DEFAULT_COLLAPSED });
+  it("默认只展开「日常」组，其余组的频道不渲染", async () => {
+    useNavigationStore.setState({ activeChannel: "overview", expandedGroup: DEFAULT_EXPANDED });
     render(<Shell />);
     expect(await screen.findByText("工作台")).toBeInTheDocument();
-    expect(screen.getByText("用户运营")).toBeInTheDocument();
-    // 「设置」默认收起 → 组内频道不渲染（分级导航的核心行为）。
+    // 手风琴：同时只展开一组，所以「运营」「设置」的频道都不渲染。
+    expect(screen.queryByText("用户运营")).not.toBeInTheDocument();
     expect(screen.queryByText("系统策略")).not.toBeInTheDocument();
   });
 
-  it("点击组标题展开收起的组，其频道随之出现", async () => {
-    useNavigationStore.setState({ activeChannel: "overview", collapsedGroups: DEFAULT_COLLAPSED });
+  it("点击组标题展开该组，同时自动收起原先展开的组", async () => {
+    useNavigationStore.setState({ activeChannel: "overview", expandedGroup: "日常" });
     render(<Shell />);
-    expect(screen.queryByText("系统策略")).not.toBeInTheDocument();
+    expect(screen.getByText("工作台")).toBeInTheDocument();
     fireEvent.click(screen.getByTestId("nav-group-设置"));
     expect(await screen.findByText("系统策略")).toBeInTheDocument();
+    // 这是手风琴的关键保证：展开新组必须收起旧组，否则行数无上限、滚动条回来。
+    expect(screen.queryByText("工作台")).not.toBeInTheDocument();
   });
 
-  it("当前频道所在组即使被折叠也强制展开（不丢定位）", () => {
-    // systemStrategy 属「设置」，且「设置」在 collapsedGroups 里 → 仍须可见。
+  it("再次点击已展开的组标题会收起它", () => {
+    useNavigationStore.setState({ activeChannel: "overview", expandedGroup: "日常" });
+    render(<Shell />);
+    expect(screen.getByText("工作台")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("nav-group-日常"));
+    expect(screen.queryByText("工作台")).not.toBeInTheDocument();
+  });
+
+  it("当前频道所在组被收起时，标题上打活跃圆点表达定位", () => {
+    // 手风琴下不再「强制展开」活跃组（那会让同时展开变 2 组、滚动条回来），
+    // 定位感由圆点承担。systemStrategy 属「设置」，而展开的是「日常」。
     useNavigationStore.setState({
       activeChannel: "systemStrategy",
-      collapsedGroups: ["日常", "运营", "知识与内容", "成效", "设置"],
+      expandedGroup: "日常",
     });
     render(<Shell />);
-    // 「系统策略」同时是侧栏频道名与页头 h1，故把查询限定在侧栏 nav 内。
     const nav = screen.getByRole("navigation", { name: "Product channels" });
-    expect(within(nav).getByText("系统策略")).toBeInTheDocument();
+    // 组内频道确实没渲染（未被强制展开）
+    expect(within(nav).queryByText("系统策略")).not.toBeInTheDocument();
+    // 但「设置」标题上有活跃圆点，且只有它有
+    expect(within(nav).getByLabelText("当前频道在此组")).toBeInTheDocument();
+    const settings = screen.getByTestId("nav-group-设置");
+    expect(within(settings).getByLabelText("当前频道在此组")).toBeInTheDocument();
   });
 
   it("未上线占位频道渲染成不可点的灰显项", () => {
-    useNavigationStore.setState({ activeChannel: "overview", collapsedGroups: [] });
+    // 「微信群运营」属「运营」组，故须展开该组。
+    useNavigationStore.setState({ activeChannel: "overview", expandedGroup: "运营" });
     render(<Shell />);
     // 「微信群运营」标 comingSoon → 不是 button，且带「未上线」角标。
     expect(screen.queryByRole("button", { name: /微信群运营/ })).not.toBeInTheDocument();
@@ -47,6 +63,29 @@ describe("Shell", () => {
     useNavigationStore.setState({ activeChannel: "userOps" });
     render(<Shell />);
     expect(screen.getByRole("heading", { name: "用户运营" })).toBeInTheDocument();
+  });
+
+  // 不变量测试：这是「侧栏不出滚动条」的根本依据。逐组点一遍，
+  // 每次点完都断言 aria-expanded=true 的组不超过 1 个。若哪天有人
+  // 加回「强制展开活跃组」之类的逻辑，这条会先红，而不是等用户看到滚动条。
+  it("任何时刻展开的组不超过一个（手风琴不变量）", () => {
+    useNavigationStore.setState({ activeChannel: "overview", expandedGroup: "日常" });
+    render(<Shell />);
+    const nav = screen.getByRole("navigation", { name: "Product channels" });
+    const groups = ["日常", "运营", "知识与内容", "成效", "设置"];
+    const openCount = () =>
+      groups.filter(
+        (g) => screen.getByTestId(`nav-group-${g}`).getAttribute("aria-expanded") === "true"
+      ).length;
+
+    expect(openCount()).toBeLessThanOrEqual(1);
+    for (const g of groups) {
+      fireEvent.click(screen.getByTestId(`nav-group-${g}`));
+      expect(openCount()).toBeLessThanOrEqual(1);
+    }
+    // 同时：渲染出的频道行数不超过最大单组的容量（5），否则高度账不成立。
+    const rows = within(nav).getAllByRole("button").length - groups.length;
+    expect(rows).toBeLessThanOrEqual(5);
   });
 });
 
