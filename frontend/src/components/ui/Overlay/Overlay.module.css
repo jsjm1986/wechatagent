@@ -7,8 +7,14 @@
 }
 @keyframes overlayScrimIn { from { opacity: 0; } to { opacity: 1; } }
 
+/* flex 列容器：让「面板限高」这件事只由 .panel 说一次。
+   子组件（如好友选择器的 .shell）不再自己写 max-height:calc(100vh-48px)——
+   那样会漏算 panel 自身上下各 1px 边框，子元素比内容盒高 2px，
+   于是 panel 长出一条 15px 滚动条，其笔直的轨道横切 18px 圆角，
+   顶部看起来就像被削平，且把关闭按钮往里挤了 15px。 */
 .panel {
   width: 100%; max-width: 480px; max-height: calc(100vh - 48px);
+  display: flex; flex-direction: column;
   overflow-y: auto; outline: none;
   background: var(--surface-card); border-radius: var(--r-md);
   border: 1px solid var(--hairline);

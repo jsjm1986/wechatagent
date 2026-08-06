@@ -9,8 +9,12 @@
   grid-template-rows: auto auto minmax(0, 1fr) auto;
   gap: 14px;
   padding: 20px 22px 18px;
-  /* 面板 max-height 是 calc(100vh-48px)；这里占满它，列表才能吃到全部剩余高度。 */
-  max-height: calc(100vh - 48px);
+  /* 高度不在这里声明。Overlay 的 .panel 已是 flex 列并限高 calc(100vh-48px)，
+     这里只需填满它剩余空间即可；自己再写一遍 max-height 会漏算 panel 的
+     上下边框，凭空多出 2px、逼出一条切穿圆角的滚动条。
+     min-height:0 让本项可被压缩，否则内容会把 flex 项顶高、限高失效。 */
+  flex: 1 1 auto;
+  min-height: 0;
   box-sizing: border-box;
 }
 
@@ -77,6 +81,9 @@
   grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
   gap: 2px;
   overflow-y: auto;
+  /* 列表高度是定尺寸（.shell 的 1fr）。默认 align-content:stretch 会把 auto 行拉/压
+     到刚好填满这个高度；start 让行只按内容排，不足处留白、超出则滚动。 */
+  align-content: start;
   /* 滚动区左右留一点，避免卡片 hover 背景紧贴滚动条。 */
   margin: 0 -6px;
   padding: 0 6px;
@@ -88,7 +95,11 @@
   display: flex;
   align-items: center;
   gap: 11px;
-  min-height: 0;
+  /* 不能写 min-height:0。.shell 的 max-height 让列表行成为定尺寸，.grid 的 auto 行
+     会被压到容器高度以内；此时 min-height:0 等于允许卡片压成只剩 padding（实测
+     18px），34px 头像与两行文字直接溢出卡片上下边界，视觉上和下一行叠字。
+     auto 让底线由内容决定（实测 ~53px），同时照样盖住全局裸 button 的 38px 基线。 */
+  min-height: auto;
   border: 0;
   border-radius: var(--r-sm);
   padding: 9px 10px;
