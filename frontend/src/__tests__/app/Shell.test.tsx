@@ -10,12 +10,12 @@ import { CHANNELS, GROUP_ORDER } from "../../app/channels";
  *  三轴混在一列里，找东西时脑子要切标准。典型症状：请示被劈成两半（收件箱在最上、
  *  通道配置在最下）、自治回路/演化被归进「成效」（它们是系统自我调节，不是业务成效）。 */
 const GROUPS = [
-  "运营对象",
-  "AI 的资料",
-  "需要你决策",
-  "运行与结果",
-  "系统",
-  "即将上线",
+  "客户运营",
+  "知识资产",
+  "决策审批",
+  "运行监控",
+  "平台配置",
+  "建设规划",
 ];
 
 /** 每个用例都从「全部展开」起步，除非它自己要测折叠——store 是模块级单例，
@@ -31,7 +31,7 @@ describe("Shell 导航（单列 + 独立折叠）", () => {
   it("展开态下，所有分组的频道同时渲染", async () => {
     seedExpanded();
     render(<Shell />);
-    // 跨 4 个不同分组各取一个：运行与结果 / 运营对象 / AI 的资料 / 系统。
+    // 跨 4 个不同分组各取一个：运行监控 / 客户运营 / 知识资产 / 平台配置。
     expect(await screen.findByText("工作台")).toBeInTheDocument();
     expect(screen.getByText("用户运营")).toBeInTheDocument();
     expect(screen.getByText("知识库 Wiki")).toBeInTheDocument();
@@ -55,14 +55,14 @@ describe("Shell 导航（单列 + 独立折叠）", () => {
   it("折叠是各组独立的，不互斥（收起一组不影响其它组）", () => {
     seedExpanded();
     render(<Shell />);
-    // 收起「运行与结果」（含工作台）
-    fireEvent.click(screen.getByTestId("nav-group-运行与结果"));
+    // 收起「运行监控」（含工作台）
+    fireEvent.click(screen.getByTestId("nav-group-运行监控"));
     expect(screen.queryByText("工作台")).not.toBeInTheDocument();
     // 其它组**仍然展开**——手风琴在这里会把它们全关掉。
     expect(screen.getByText("用户运营")).toBeInTheDocument();
     expect(screen.getByText("系统策略")).toBeInTheDocument();
-    // 再收起「运营对象」，「系统」依旧不受影响。
-    fireEvent.click(screen.getByTestId("nav-group-运营对象"));
+    // 再收起「客户运营」，「平台配置」依旧不受影响。
+    fireEvent.click(screen.getByTestId("nav-group-客户运营"));
     expect(screen.queryByText("用户运营")).not.toBeInTheDocument();
     expect(screen.getByText("系统策略")).toBeInTheDocument();
   });
@@ -70,7 +70,7 @@ describe("Shell 导航（单列 + 独立折叠）", () => {
   it("同一标签再点一次即展开回来（幂等开合）", () => {
     seedExpanded();
     render(<Shell />);
-    const label = screen.getByTestId("nav-group-运行与结果");
+    const label = screen.getByTestId("nav-group-运行监控");
     fireEvent.click(label);
     expect(screen.queryByText("工作台")).not.toBeInTheDocument();
     expect(label).toHaveAttribute("aria-expanded", "false");
@@ -82,13 +82,13 @@ describe("Shell 导航（单列 + 独立折叠）", () => {
   // 折叠后若活跃频道被藏起来，必须有替代信号，否则用户丢失「我在哪」。
   it("收起的组含活跃频道时，标签上打点表达定位", () => {
     useNavigationStore.setState({
-      activeChannel: "systemStrategy", // 属「系统」
-      collapsedGroups: new Set(["系统"] as const),
+      activeChannel: "systemStrategy", // 属「平台配置」
+      collapsedGroups: new Set(["平台配置"] as const),
     });
     render(<Shell />);
-    const settings = screen.getByTestId("nav-group-系统");
+    const settings = screen.getByTestId("nav-group-平台配置");
     expect(within(settings).getByLabelText("当前频道在此组")).toBeInTheDocument();
-    // 只有「系统」有点：展开的组里活跃频道自己已高亮，不需要重复表达。
+    // 只有「平台配置」有点：展开的组里活跃频道自己已高亮，不需要重复表达。
     expect(screen.getAllByLabelText("当前频道在此组")).toHaveLength(1);
   });
 
@@ -104,24 +104,24 @@ describe("Shell 导航（单列 + 独立折叠）", () => {
   it("收起时显示组内频道数，让用户知道里面有东西没丢", () => {
     useNavigationStore.setState({
       activeChannel: "overview",
-      collapsedGroups: new Set(["运营对象"] as const),
+      collapsedGroups: new Set(["客户运营"] as const),
     });
     render(<Shell />);
-    const ops = screen.getByTestId("nav-group-运营对象");
-    // 「运营对象」组有 3 个频道（用户运营 / 活动 / 产品与成交）。
+    const ops = screen.getByTestId("nav-group-客户运营");
+    // 「客户运营」组有 3 个频道（用户运营 / 活动 / 产品与成交）。
     expect(ops).toHaveTextContent("3");
   });
 
-  // 默认收起 3 组而非 2 组：分组从 5 个变 6 个后，标签+组间距的固定开销从 179px
-  // 涨到 218px，可用高只剩约 10 行的余量。实测收起「AI 的资料 / 系统 / 即将上线」
-  // 后展开 10 行 = 578px，在 900 高视口下不滚动（余 33px）。
-  it("默认收起「AI 的资料」「系统」「即将上线」——日常动线三组保持展开", () => {
+  // 默认收起 3 组而非 2 组：分组从 5 个变 6 个后，标签+组间距的固定开销涨了约 39px
+  // （多一个 23px 标签 + 一个组间距），可用高只剩约 10 行的余量。实测收起
+  // 「知识资产 / 平台配置 / 建设规划」后展开 10 行，在 900 高视口下不滚动。
+  it("默认收起「知识资产」「平台配置」「建设规划」——日常动线三组保持展开", () => {
     useNavigationStore.setState({
       activeChannel: "overview",
       collapsedGroups: new Set(DEFAULT_COLLAPSED),
     });
     render(<Shell />);
-    // 日常动线可见：运营对象 / 需要你决策 / 运行与结果
+    // 日常动线可见：客户运营 / 决策审批 / 运行监控
     expect(screen.getByText("用户运营")).toBeInTheDocument();
     expect(screen.getByText("统一收件箱")).toBeInTheDocument();
     expect(screen.getByText("工作台")).toBeInTheDocument();
