@@ -3,17 +3,20 @@
 /* 侧栏：从顶（品牌）到底（用户）贯通的 flex 列。
    易读基调=白卡基底，但底色微调冷（near-white 渐变）让激活白卡能浮起；
    右缘 + 内嵌高光是玻璃"点缀"，给一张平白侧栏立体感。 */
+/* 纯色表面 + 单条 hairline：原先是 176deg 近白渐变加内嵌高光，
+   那是拟物残留，且渐变会让激活项的淡色底在不同高度看起来深浅不一。
+   左右内边距 12px = 与频道行内缩同源，整列左基线才对齐。 */
 .side {
-  width: 252px; flex-shrink: 0; padding: 22px 16px 18px;
-  background: linear-gradient(176deg, #fbfcfe 0%, #f4f6fa 100%);
+  width: 252px; flex-shrink: 0; padding: var(--sp-5) var(--sp-3) var(--sp-4);
+  background: var(--surface-nav);
   border-right: 1px solid var(--hairline);
-  box-shadow: inset -1px 0 1px rgba(255,255,255,.7), 1px 0 0 rgba(0,0,0,.012);
   display: flex; flex-direction: column;
   position: sticky; top: 0; height: 100vh;
 }
 
-/* 品牌区（顶部） */
-.brand { display: flex; align-items: center; gap: 11px; padding: 4px 10px 0; margin-bottom: 22px; }
+/* 品牌区：左内缩与频道行一致（都是 12px），此前是 10px，整列左边缘是毛的。 */
+.brand { display: flex; align-items: center; gap: var(--nav-gap);
+  padding: 0 var(--sp-3); margin-bottom: var(--sp-6); }
 .brandMark {
   width: 32px; height: 32px; border-radius: 10px; flex-shrink: 0; position: relative;
   background: linear-gradient(135deg, var(--color-brand), var(--color-scheduled));
@@ -107,10 +110,16 @@
      字号小(11px) + 字重重(700) + 字距宽(1.2px) + 颜色浅(#636369)
    小而粗的宽字距是侧栏分类标签的标准写法——结构感来自字重与字距，次要感来自
    字号与颜色，两者不冲突，所以既读得出是标题、又不会盖过 13.5px/--ink-2 的频道名。 */
-.groupLabel { display: flex; align-items: center; justify-content: flex-start;
-  gap: 6px; width: 100%;
-  font-size: 11px; color: #636369; font-weight: 700; letter-spacing: 1.2px;
-  padding: 10px 12px 5px;
+/* 中文字距修正：1.2px 是照英文小标签的做法，中文加宽字距会「散」，
+   收到 .2px——标签感靠字重(700)与留白建立，不靠拉开汉字。
+   grid 而非 flex：chevron 占与频道图标同一条 20px 轨道，
+   所以组标题文字与频道名严格对齐在同一竖线上（整齐与凑合的分界）。
+   四列 = 轨道 / 标题 / 活跃点 / 计数；无活跃点时计数落到第 3 列，仍贴右。 */
+.groupLabel { display: grid; align-items: center;
+  grid-template-columns: var(--nav-rail) 1fr auto auto;
+  gap: var(--nav-gap); width: 100%;
+  font-size: var(--fs-label); color: #636369; font-weight: 700; letter-spacing: .2px;
+  padding: var(--sp-3) var(--sp-3) var(--sp-1);
   background: none; border: none; box-shadow: none; min-height: 0;
   font-family: inherit; text-align: left; cursor: pointer;
   transition: color .18s ease; }
@@ -126,7 +135,8 @@
 .groupLabel:active { transform: none; }
 /* 收起时朝右、展开时转 90° 朝下。transform 过渡比切换图标更稳（不闪）。
    14px 而非 12px：频道图标是 17px，12px 的 chevron 和它并置显得两套尺寸打架。 */
-.groupChevron { flex-shrink: 0; opacity: .6;
+/* justify-self: center —— chevron 在 20px 轨道内居中，与频道图标同轴。 */
+.groupChevron { flex-shrink: 0; opacity: .55; justify-self: center;
   transition: transform .18s cubic-bezier(.2,.7,.3,1); }
 .groupChevronOpen { transform: rotate(90deg); }
 /* 收起时在标题右侧显示组内频道数，让用户知道里面有东西没丢。
@@ -145,25 +155,36 @@
    视口高 − 197px（品牌区 58 + 页脚 100 + 内边距 40），所以视口低于约 586px 时 389px
    仍放不下。按视口高分两档收紧行高/标题高/组间距，让最坏情况也不出滚动条。
    数值是按 5 标题 + 4 组间距 + 5 行 反推的，别随手改。 */
+/* grid 而非 flex：图标占固定 20px 轨道，所有频道名严格对齐在同一条竖线上
+   （与组标题的 chevron 同轨）。此前是 flex + gap，图标宽度只要有 1px 差异
+   文字起点就跟着漂——这是「整齐」与「凑合」的分界。
+   行高走 --nav-row(36px)，不再用 padding 撑，密度可预测。 */
 .channel {
-  display: flex; align-items: center; justify-content: flex-start; gap: 11px;
-  position: relative;
-  padding: 9px 12px; border-radius: var(--r-sm); margin: 2px 0;
-  font-size: 13.5px; color: var(--ink-2); font-weight: 500; cursor: pointer;
-  background: none; border: 1px solid transparent; text-align: left; width: 100%;
-  font-family: inherit; letter-spacing: -.2px; min-height: 0; box-shadow: none;
-  transition: background .2s ease, color .2s ease, transform .12s ease, box-shadow .25s ease;
+  display: grid; align-items: center;
+  grid-template-columns: var(--nav-rail) 1fr auto;
+  gap: var(--nav-gap);
+  position: relative; min-height: var(--nav-row);
+  padding: 0 var(--sp-3); border-radius: var(--r-nav); margin: 1px 0;
+  font-size: var(--fs-body); color: var(--ink-2); font-weight: 500; cursor: pointer;
+  background: none; border: none; text-align: left; width: 100%;
+  font-family: inherit; letter-spacing: -.2px; box-shadow: none;
+  transition: background .15s ease, color .15s ease;
 }
-.channel:hover { color: var(--ink-1); background: rgba(255,255,255,.62); border-color: transparent; box-shadow: none; transform: translateX(2px); }
-.channel svg { flex-shrink: 0; opacity: .5; transition: opacity .2s ease, color .2s ease; }
-/* 激活态：白玻璃浮起卡片（玻璃点缀），不是扁平填充 */
+/* hover 不再位移（translateX 会让整列在鼠标掠过时抖动），只换底色。 */
+.channel:hover { color: var(--ink-1); background: var(--fill-nav-hover); box-shadow: none; }
+/* 图标改实色 + 轨道内居中：原先统一 opacity:.5 形成一整列灰 glyph，与文字并行
+   竞争，是「通用后台模板」最典型的观感。实色但比文字浅一档，让图标成为文字的
+   一部分而非独立灰列。 */
+.channel svg { justify-self: center; color: var(--ink-nav-icon);
+  transition: color .15s ease; }
+/* 激活态：从五个信号（白卡渐变 + 三层阴影 + 呼吸光条 + 蓝图标 + 加粗）减到两个
+   （淡底 + 加粗）。克制是高级感的主要来源；五种手段叠加只显得用力。
+   图标在激活行跟随文字转深，不单独染蓝——少一种颜色即少一个噪声源。 */
 .active, .active:hover {
-  color: var(--ink-1); font-weight: 600; transform: none;
-  background: linear-gradient(135deg, rgba(255,255,255,.98), rgba(255,255,255,.78));
-  border-color: transparent;
-  box-shadow: 0 4px 14px -5px rgba(20,30,60,.18), inset 0 1.5px 1px rgba(255,255,255,.95), inset 0 0 0 1px rgba(255,255,255,.55);
+  color: var(--ink-1); font-weight: 600;
+  background: var(--fill-nav-active); box-shadow: none;
 }
-.active svg { color: var(--color-scheduled); opacity: 1; }
+.active svg { color: var(--ink-1); }
 /* 未上线占位频道：弱化但可读，不可点（div 而非 button，无 hover 位移）。
    **必须定义在 .channel 之后**：两者同为单类选择器、特异性相同，靠源码顺序
    决胜。写在前面会被 .channel 的 color 覆盖，占位项和正常频道一模一样
@@ -178,47 +199,42 @@
 .channelSoon { cursor: default; color: #68686e; }
 .channelSoon svg { opacity: .45; }
 .channelSoon:hover { background: none; transform: none; box-shadow: none; color: #68686e; }
-.soonBadge { margin-left: auto; font-size: 9px; font-weight: 600; letter-spacing: 0;
+.soonBadge { font-size: var(--fs-micro); font-weight: 600; letter-spacing: 0;
   color: #68686e; border: 1px solid var(--hairline);
-  border-radius: 999px; padding: 1px 5px; white-space: nowrap; }
-/* 标志性的左侧呼吸蓝光条——只在激活频道，慢节奏吸气 */
-.active::before {
-  content: ''; position: absolute; left: 1px; top: 50%; margin-top: -9px;
-  width: 3px; height: 18px; border-radius: 3px;
-  background: var(--color-scheduled); box-shadow: 0 0 8px 1px rgba(10,132,255,.5);
-  animation: chRail 3.6s ease-in-out infinite;
-}
-@keyframes chRail { 0%,100% { opacity: .45; transform: scaleY(.65); } 50% { opacity: 1; transform: scaleY(1); } }
+  border-radius: 999px; padding: 1px 6px; white-space: nowrap; }
+/* 原先激活行还有一条 3px 蓝光条 + 3.6s 无限呼吸动画。已删除：
+   常驻动画在静态界面里是持续的注意力税，且它是激活态的第五个信号
+   （白卡 + 三层阴影 + 光条 + 蓝图标 + 加粗）。淡底 + 加粗两个信号已经够表达选中。 */
 
 /* 矮视口紧凑档：手风琴把同时展开压到 1 组（最坏 5 行 = 389px），但 nav 可用高
    约等于「视口高 − 197px」（品牌区/页脚/内边距），所以视口低于约 586px 时
    389px 仍放不下。这两档按视口高逐步收紧行距，让最坏情况也不出滚动条。
    **必须写在所有 .channel/.groupLabel 基础规则之后**：媒体查询不提升特异性，
    写在前面会被后面的同特异性基础规则整条覆盖（这坑本次踩过一次）。 */
+/* 行高现在由 --nav-row 单点决定，所以紧凑档只需覆盖变量，不必逐条改 padding。
+   这也是刻度化的直接好处：密度是一个旋钮，而不是散落各处的数值。 */
 @media (max-height: 760px) {
-  .groupLabel { padding: 7px 12px 4px; }
-  .group + .group { margin-top: 6px; }
-  .channel { padding: 7px 12px; margin: 1px 0; }
+  .side { --nav-row: 34px; }
+  .group + .group { margin-top: var(--sp-3); }
+  .groupLabel { padding-top: var(--sp-2); }
 }
 @media (max-height: 660px) {
-  .groupLabel { padding: 5px 12px 3px; }
-  .group + .group { margin-top: 4px; }
-  .channel { padding: 5px 12px; margin: 0; font-size: 13px; }
-  .channel svg { width: 16px; height: 16px; }
+  .side { --nav-row: 32px; }
+  .group + .group { margin-top: var(--sp-2); }
+  .groupLabel { padding-top: var(--sp-1); padding-bottom: 2px; }
 }
 @media (max-height: 620px) {
-  .groupLabel { padding: 4px 12px 2px; font-size: 10px; }
-  .group + .group { margin-top: 2px; }
-  .channel { padding: 3px 12px; margin: 0; font-size: 12.5px; }
-  .channel svg { width: 15px; height: 15px; }
+  .side { --nav-row: 30px; --nav-icon: 16px; }
+  .group + .group { margin-top: var(--sp-1); }
+  .groupLabel { padding-top: 2px; padding-bottom: 0; }
 }
 /* 最矮一档（约 13 寸笔记本再缩窗口）：只保证不滚动，密度已接近可点下限，
    不再继续压——低于此高度让它滚动比让行高小到点不准更合理。 */
 @media (max-height: 560px) {
-  .groupLabel { padding: 2px 12px 1px; }
+  .side { --nav-row: 25px; --nav-icon: 15px; }
   .group + .group { margin-top: 1px; }
-  .channel { padding: 1px 12px; font-size: 12.5px; }
-  .channel svg { width: 14px; height: 14px; }
+  .groupLabel { padding-top: 0; padding-bottom: 0; font-size: var(--fs-micro); }
+  .channel { margin: 0; }
 }
 
 /* 底部区：与侧栏一体（不是独立卡），顶部一条分隔线划分导航/账号用户区 */
