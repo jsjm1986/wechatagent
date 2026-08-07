@@ -354,6 +354,7 @@ export type DecisionReview = {
   sendGatewayResult?: Record<string, unknown>;
   outcomeStatus?: string;
   finalReviewStatus?: string;
+  reviewPhase?: string;
   holdCategory?: string;
   status: string;
   autonomyProtocol?: AutonomyProtocol | null;

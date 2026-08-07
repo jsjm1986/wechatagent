@@ -164,6 +164,45 @@ pub struct EnqueueRequest {
     pub max_attempts: i32,
 }
 
+/// Derive delivery scheduling without trusting callers. Higher values are claimed first.
+/// Safety/authorization remains enforced by the dispatcher immediately before MCP.
+pub(crate) fn delivery_priority_for(
+    source_kind: &str,
+    media_asset_id: Option<&str>,
+    referral_card_id: Option<&str>,
+) -> i32 {
+    if media_asset_id.is_some() || referral_card_id.is_some() {
+        return 20;
+    }
+    match source_kind {
+        "manual_send" => 100,
+        "inbound" | "inbound_message" => 90,
+        "principal_escalation" => 80,
+        "follow_up" | "follow_up_task" => 60,
+        "system_incident" => 40,
+        _ => 50,
+    }
+}
+
+/// Stable sequence within one decision. Text `#segN` rows precede media and namecards.
+pub(crate) fn run_sequence_for(
+    source_event_id: &str,
+    media_asset_id: Option<&str>,
+    referral_card_id: Option<&str>,
+) -> i32 {
+    if referral_card_id.is_some() {
+        return 20_000;
+    }
+    if media_asset_id.is_some() {
+        return 10_000;
+    }
+    source_event_id
+        .rsplit_once("#seg")
+        .and_then(|(_, suffix)| suffix.parse::<i32>().ok())
+        .filter(|value| *value >= 0)
+        .unwrap_or(0)
+}
+
 // ── 主入口 ──────────────────────────────────────────────────────────────
 
 /// 把决策结果入队到 `agent_send_outbox`（design.md §3.2 R13.2）。
@@ -287,6 +326,16 @@ pub async fn enqueue(state: &AppState, req: EnqueueRequest) -> Result<EnqueueOut
         content: req.content.clone(),
         content_hash: content_hash.clone(),
         idempotency_key: idempotency_key.clone(),
+        delivery_priority: delivery_priority_for(
+            &req.source_kind,
+            req.media_asset_id.as_deref(),
+            req.referral_card_id.as_deref(),
+        ),
+        run_sequence: run_sequence_for(
+            &req.source_event_id,
+            req.media_asset_id.as_deref(),
+            req.referral_card_id.as_deref(),
+        ),
         media_asset_id: req.media_asset_id.clone(),
         referral_card_id: req.referral_card_id.clone(),
         attempt: 0,

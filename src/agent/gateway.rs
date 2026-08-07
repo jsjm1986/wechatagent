@@ -51,7 +51,7 @@ use super::escalation;
 use super::guards::{
     action_policy_state_key, check_state_transition, classify_decision_action,
     enforce_state_action_policy, initial_operation_state_key, normalize_decision_runtime,
-    normalize_decision_state, planner_from_decision,
+    normalize_decision_state, operation_states, planner_from_decision,
 };
 use super::knowledge_router::{
     empty_knowledge_route, load_operation_knowledge, maybe_emit_unverified_warning,
@@ -59,9 +59,10 @@ use super::knowledge_router::{
     write_knowledge_usage_log,
 };
 use super::memory::{
-    effective_memory_card, effective_memory_card_for_contact, load_or_create_operating_memory,
-    memory_card_has_signal, next_memory_card_version, schedule_memory_consolidation_task,
-    write_memory_candidates, write_stage_observation, write_tag_observations,
+    contact_memory_consolidation_due, effective_memory_card, effective_memory_card_for_contact,
+    load_or_create_operating_memory, memory_card_has_signal, next_memory_card_version,
+    schedule_memory_consolidation_task, write_memory_candidates, write_stage_observation,
+    write_tag_observations,
 };
 use super::multimodal;
 use super::outbox::{
@@ -532,6 +533,7 @@ fn review_and_evaluate_claim_gate<'a>(
     state: &'a AppState,
     contact: &'a Contact,
     inbound: &'a ConversationMessage,
+    recent_messages: &'a [ConversationMessage],
     decision: &'a AgentDecision,
     playbook: Option<&'a OperationPlaybook>,
     domain_config: Option<&'a OperationDomainConfig>,
@@ -558,6 +560,7 @@ fn review_and_evaluate_claim_gate<'a>(
                 state,
                 contact,
                 inbound,
+                recent_messages,
                 decision,
                 playbook,
                 domain_config,
@@ -720,6 +723,7 @@ async fn send_contact_message_gateway_inner(
         state,
         &contact,
         &synthetic_inbound,
+        &context_messages,
         &decision,
         playbook.as_ref(),
         domain_config.as_ref(),
@@ -2622,6 +2626,7 @@ fn run_user_operation_gateway_inner<'a>(
             state,
             &contact,
             &inbound,
+            &recent_messages,
             &decision,
             playbook.as_ref(),
             domain_config.as_ref(),
@@ -2733,6 +2738,7 @@ fn run_user_operation_gateway_inner<'a>(
                 state,
                 &contact,
                 &inbound,
+                &recent_messages,
                 &final_decision,
                 playbook.as_ref(),
                 domain_config.as_ref(),
@@ -2827,60 +2833,6 @@ fn run_user_operation_gateway_inner<'a>(
         )
         .await?;
 
-        // ── Phase A / A3：taxonomy 软闸 ──
-        //
-        // 校验 final_decision 上 LLM 给出的 customer_stage / intent_level 是否在
-        // system_taxonomies 字典里：命中 active → 通过；命中 alias → 改写为
-        // canonical id；deprecated → 仅 risks 追加；CandidateNew → upsert 候选
-        // 队列供 admin review。任何 IO 故障静默跳过（best-effort），不阻塞 run。
-        // 这是 CLAUDE.md 硬规则"unreviewed candidates must not block runs"的实现位。
-        let cache = global_taxonomy_cache(&state.db);
-        // TTL 自愈：启动 warm_up 后若长期无 admin 写操作触发 invalidate，
-        // 30s 后 find_or_load 自动 reload。版本指针损坏或 DB 错误必须阻止本轮，
-        // 不能用旧/空字典继续写画像。
-        cache.find_or_load(&state.db, &contact.workspace_id).await?;
-        // universal-domain-adaptation H7：校验维度集合改读 active DomainProfile。
-        // DEFAULT 销售域返回 ["customer_stage","intent_level"] 逐字等价。
-        // （复用本 run 顶部已加载的 active_profile，避免重复 load。）
-        let dimension_kinds =
-            crate::agent::domain_profile::decision_dimension_kinds(&active_profile);
-        let outcome = compute_taxonomy_guard_outcome(
-            &final_decision,
-            &dimension_kinds,
-            &contact.workspace_id,
-            &contact.account_id,
-            &cache,
-        );
-        for (kind, canonical) in &outcome.rewrites {
-            crate::agent::domain_signals::set_dimension(
-                &mut final_decision,
-                kind,
-                canonical.clone(),
-            );
-        }
-        for risk in &outcome.risks {
-            if !review.risks.iter().any(|r| r == risk) {
-                review.risks.push(risk.clone());
-            }
-        }
-        for (kind, raw) in &outcome.candidate_writes {
-            let display_name =
-                pick_dimension_display_name(&final_decision.dimension_display_names, kind);
-            if let Err(error) = taxonomy_upsert_candidate(
-                &state.db,
-                &contact.workspace_id,
-                &contact.account_id,
-                kind,
-                raw,
-                Some("user-ops decision path"),
-                50,
-                display_name,
-            )
-            .await
-            {
-                tracing::warn!(?error, kind = kind.as_str(), raw = %raw, "taxonomy upsert_candidate failed");
-            }
-        }
     }
 
     // ── R2 single-shot revision 控制流 ──
@@ -3037,6 +2989,7 @@ fn run_user_operation_gateway_inner<'a>(
                         state,
                         &contact,
                         &inbound,
+                        &recent_messages,
                         &revised_decision,
                         playbook.as_ref(),
                         domain_config.as_ref(),
@@ -3221,6 +3174,59 @@ fn run_user_operation_gateway_inner<'a>(
         }
     }
     let _ = promote_risks; // 后续如需进一步审计可再消费
+
+    // ── Phase A / A3：最终稿 taxonomy 软闸 ──
+    //
+    // 必须放在所有 rewrite/revision 结束之后，只对真正可发送的最终稿执行一次：否则
+    // revision 可引入一个未审核维度并绕过首稿检查，或同一 run 重复累计 candidate。
+    // CandidateNew 仍进入候选审核队列且不阻塞回复，但从画像字段及同源 FSM 提案中隔离。
+    if matches!(finalize_status, GatewayStatusFinal::Approved) {
+        let cache = global_taxonomy_cache(&state.db);
+        cache.find_or_load(&state.db, &contact.workspace_id).await?;
+        let dimension_kinds =
+            crate::agent::domain_profile::decision_dimension_kinds(&active_profile);
+        let fsm_customer_stage_keys = operation_states(domain_config.as_ref())
+            .into_iter()
+            .filter_map(|state| state.get_str("key").ok().map(ToString::to_string))
+            .collect::<Vec<_>>();
+        let outcome = compute_taxonomy_guard_outcome(
+            &final_decision,
+            &dimension_kinds,
+            &fsm_customer_stage_keys,
+            &contact.workspace_id,
+            &contact.account_id,
+            &cache,
+        );
+        let candidate_display_names = outcome
+            .candidate_writes
+            .iter()
+            .map(|(kind, raw)| {
+                (
+                    kind.clone(),
+                    raw.clone(),
+                    pick_dimension_display_name(&final_decision.dimension_display_names, kind)
+                        .map(ToString::to_string),
+                )
+            })
+            .collect::<Vec<_>>();
+        apply_taxonomy_guard_outcome(&mut final_decision, &mut review, &outcome);
+        for (kind, raw, display_name) in candidate_display_names {
+            if let Err(error) = taxonomy_upsert_candidate(
+                &state.db,
+                &contact.workspace_id,
+                &contact.account_id,
+                &kind,
+                &raw,
+                Some("user-ops final decision path"),
+                50,
+                display_name.as_deref(),
+            )
+            .await
+            {
+                tracing::warn!(?error, kind, raw, "taxonomy upsert_candidate failed");
+            }
+        }
+    }
 
     // 同步把 finalize 阶段计算好的 final_review_status / revision_applied 字段
     // 写回 review struct，便于审计 / 落库（write_decision_review / write_agent_run_log
@@ -3566,29 +3572,6 @@ fn run_user_operation_gateway_inner<'a>(
     // （Task3），只构造一次。
     let ascending_window: Vec<ConversationMessage> =
         recent_messages.iter().rev().cloned().collect();
-    apply_agent_updates(
-        state,
-        &contact,
-        &final_decision,
-        &runtime,
-        domain_config.as_ref(),
-        &active_profile,
-        &active_products,
-        &ascending_window,
-        &run_id,
-    )
-    .await?;
-    apply_operating_memory_update(
-        state,
-        &contact,
-        &memory,
-        &final_decision,
-        &context_pack,
-        should_refresh_context,
-        &ascending_window,
-        &run_id,
-    )
-    .await?;
     if !final_decision.should_reply {
         super::run_audit::mark_no_reply();
     }
@@ -3656,9 +3639,23 @@ fn run_user_operation_gateway_inner<'a>(
                 Some(doc! { "run_id": &run_id, "decision_id": decision_review_id }),
             )
             .await?;
+            super::post_decision::discard_projection(state, decision_review_id, "stale_task_claim").await;
             return Ok(());
         }
     }
+    super::post_decision::persist_projection_snapshot(
+        state,
+        decision_review_id,
+        &final_decision,
+        &memory,
+        &context_pack,
+        domain_config.as_ref(),
+        &active_profile,
+        &active_products,
+        &ascending_window,
+        &run_id,
+    )
+    .await?;
     write_knowledge_usage_log(
         state,
         &contact,
@@ -3680,6 +3677,16 @@ fn run_user_operation_gateway_inner<'a>(
                 "Agent 判断无需触达"
             };
             cancel_task(state, task_context, "no_reply", reason).await?;
+        }
+        if final_decision.should_reply {
+            super::post_decision::discard_projection(
+                state,
+                decision_review_id,
+                "empty_reply_text",
+            )
+            .await;
+        } else {
+            super::post_decision::activate_projection(state, decision_review_id).await?;
         }
     }
     let details = build_decision_event_details(&final_decision, playbook.as_ref(), &review);
@@ -3826,6 +3833,12 @@ fn run_user_operation_gateway_inner<'a>(
                     )
                     .await?;
                 }
+                super::post_decision::discard_projection(
+                    state,
+                    decision_review_id,
+                    "superseded_by_new_inbound",
+                )
+                .await;
                 return Ok(());
             }
         }
@@ -3994,6 +4007,12 @@ fn run_user_operation_gateway_inner<'a>(
             )
             .await
             .ok();
+            super::post_decision::discard_projection(
+                state,
+                decision_review_id,
+                "skipped_duplicate",
+            )
+            .await;
             return Ok(());
         }
         if !enqueue_errors.is_empty() || !cross_decision_duplicates.is_empty() {
@@ -4057,6 +4076,12 @@ fn run_user_operation_gateway_inner<'a>(
                 )
                 .await?;
             }
+            super::post_decision::discard_projection(
+                state,
+                decision_review_id,
+                "outbox_enqueue_partial_failure",
+            )
+            .await;
             super::outbox_dispatcher::refresh_run_log_outbox_status(state, &run_id).await;
             if let Some((_, err)) = enqueue_errors.into_iter().next() {
                 return Err(err);
@@ -4102,6 +4127,108 @@ fn run_user_operation_gateway_inner<'a>(
                 None,
             )
             .await?;
+        super::post_decision::discard_projection(
+            state,
+            decision_review_id,
+            delivery_block_status.unwrap_or("blocked_by_safety_guard"),
+        )
+        .await;
+    }
+    // 全部文本分段完成 enqueue 后立即提交 task 授权。可选素材/名片不再阻塞客户文本。Dispatcher 在此之前
+    // 即使抢到首段，也只会识别为 Building 并无损 defer；同 token CAS 成功后才允许 MCP。
+    if text_outbox_enqueued {
+        let task_authorized = if let Some(task_context) = task_context.as_ref() {
+            if let Some(claim) = task_context.claim.as_ref() {
+                crate::tasks::authorize_task_outbox_if_owned(state, claim, decision_review_id)
+                    .await?
+            } else {
+                crate::models::assert_agent_task_status_valid("outbox_enqueued");
+                state
+                    .db
+                    .tasks()
+                    .update_one(
+                        task_context.write_filter(),
+                        doc! { "$set": {
+                            "status": "outbox_enqueued",
+                            "gateway_status": "outbox_enqueued",
+                            "outbox_decision_id": decision_review_id,
+                            "updated_at": DateTime::now(),
+                        } },
+                        None,
+                    )
+                    .await?
+                    .matched_count
+                    == 1
+            }
+        } else {
+            true
+        };
+        if !task_authorized {
+            state
+                .db
+                .decision_reviews()
+                .update_one(
+                    doc! { "_id": decision_review_id, "status": "outbox_enqueuing" },
+                    doc! { "$set": { "status": "stale_task_claim" } },
+                    None,
+                )
+                .await?;
+            state
+            .db
+            .agent_run_logs()
+            .update_one(
+                doc! { "run_id": &run_id, "status": "outbox_enqueuing" },
+                doc! { "$set": {
+                    "status": "stale_task_claim",
+                    "lifecycle": crate::agent::run_envelope::LIFECYCLE_ABORTED_BY_EXTERNAL_SIGNAL,
+                    "abort_reason": "stale_task_claim",
+                    "updated_at": DateTime::now(),
+                } },
+                None,
+            )
+            .await?;
+            write_event_for_account(
+                state,
+                &contact.workspace_id,
+                &contact.account_id,
+                Some(&contact.wxid),
+                "task_claim_fenced",
+                "stale_task_claim",
+                "文本 Outbox 已构建但任务授权 CAS 失败，Dispatcher 将取消旧 owner 条目",
+                Some(doc! { "run_id": &run_id, "decision_id": decision_review_id }),
+            )
+            .await?;
+            super::post_decision::discard_projection(
+                state,
+                decision_review_id,
+                "stale_task_claim",
+            )
+            .await;
+            super::outbox_dispatcher::refresh_run_log_outbox_status(state, &run_id).await;
+            return Ok(());
+        }
+        state
+            .db
+            .decision_reviews()
+            .update_one(
+                doc! { "_id": decision_review_id, "status": "outbox_enqueuing" },
+                doc! { "$set": { "status": "outbox_enqueued" } },
+                None,
+            )
+            .await?;
+        state
+            .db
+            .agent_run_logs()
+            .update_one(
+                doc! { "run_id": &run_id, "status": "outbox_enqueuing" },
+                doc! { "$set": {
+                    "status": "outbox_enqueued",
+                    "lifecycle": crate::agent::run_envelope::LIFECYCLE_COMPLETED,
+                } },
+                None,
+            )
+            .await?;
+        super::post_decision::activate_projection(state, decision_review_id).await?;
     }
     // media-asset Task 8：素材文件发送。文本回复已在上方先入 outbox（先文字后文件），
     // 这里把 final_decision.assets_to_send 逐个转成独立媒体 outbox 条目。
@@ -4379,95 +4506,6 @@ fn run_user_operation_gateway_inner<'a>(
                 }
             }
         }
-    }
-    // 所有文本/素材/名片条目都完成 enqueue 后才提交 task 授权。Dispatcher 在此之前
-    // 即使抢到首段，也只会识别为 Building 并无损 defer；同 token CAS 成功后才允许 MCP。
-    if text_outbox_enqueued {
-        let task_authorized = if let Some(task_context) = task_context.as_ref() {
-            if let Some(claim) = task_context.claim.as_ref() {
-                crate::tasks::authorize_task_outbox_if_owned(state, claim, decision_review_id)
-                    .await?
-            } else {
-                crate::models::assert_agent_task_status_valid("outbox_enqueued");
-                state
-                    .db
-                    .tasks()
-                    .update_one(
-                        task_context.write_filter(),
-                        doc! { "$set": {
-                            "status": "outbox_enqueued",
-                            "gateway_status": "outbox_enqueued",
-                            "outbox_decision_id": decision_review_id,
-                            "updated_at": DateTime::now(),
-                        } },
-                        None,
-                    )
-                    .await?
-                    .matched_count
-                    == 1
-            }
-        } else {
-            true
-        };
-        if !task_authorized {
-            state
-                .db
-                .decision_reviews()
-                .update_one(
-                    doc! { "_id": decision_review_id, "status": "outbox_enqueuing" },
-                    doc! { "$set": { "status": "stale_task_claim" } },
-                    None,
-                )
-                .await?;
-            state
-            .db
-            .agent_run_logs()
-            .update_one(
-                doc! { "run_id": &run_id, "status": "outbox_enqueuing" },
-                doc! { "$set": {
-                    "status": "stale_task_claim",
-                    "lifecycle": crate::agent::run_envelope::LIFECYCLE_ABORTED_BY_EXTERNAL_SIGNAL,
-                    "abort_reason": "stale_task_claim",
-                    "updated_at": DateTime::now(),
-                } },
-                None,
-            )
-            .await?;
-            write_event_for_account(
-                state,
-                &contact.workspace_id,
-                &contact.account_id,
-                Some(&contact.wxid),
-                "task_claim_fenced",
-                "stale_task_claim",
-                "Outbox 已构建但任务授权 CAS 失败，Dispatcher 将取消旧 owner 条目",
-                Some(doc! { "run_id": &run_id, "decision_id": decision_review_id }),
-            )
-            .await?;
-            super::outbox_dispatcher::refresh_run_log_outbox_status(state, &run_id).await;
-            return Ok(());
-        }
-        state
-            .db
-            .decision_reviews()
-            .update_one(
-                doc! { "_id": decision_review_id, "status": "outbox_enqueuing" },
-                doc! { "$set": { "status": "outbox_enqueued" } },
-                None,
-            )
-            .await?;
-        state
-            .db
-            .agent_run_logs()
-            .update_one(
-                doc! { "run_id": &run_id, "status": "outbox_enqueuing" },
-                doc! { "$set": {
-                    "status": "outbox_enqueued",
-                    "lifecycle": crate::agent::run_envelope::LIFECYCLE_COMPLETED,
-                } },
-                None,
-            )
-            .await?;
     }
     super::outbox_dispatcher::refresh_run_log_outbox_status(state, &run_id).await;
     // 决策请示触发（统一占位模型）：占位 reply 已入 outbox 正常发给客户，
@@ -5504,7 +5542,7 @@ fn build_observed_dimensions(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn apply_agent_updates(
+pub(crate) async fn apply_agent_updates(
     state: &AppState,
     contact: &Contact,
     decision: &AgentDecision,
@@ -5986,17 +6024,25 @@ async fn apply_agent_updates(
                 "contact_id": &contact_id,
                 "status": "pending",
             };
-            let update = doc! {
-                "$set": set_fields,
-                "$setOnInsert": {
-                    "workspace_id": &contact.workspace_id,
-                    "account_id": &contact.account_id,
-                    "contact_id": &contact_id,
-                    "status": "pending",
-                    "first_seen_at": now,
-                },
-                "$inc": { "occurrences": 1 },
-            };
+            let seen_runs = doc! { "$ifNull": ["$source_run_ids", Vec::<String>::new()] };
+            set_fields.insert("workspace_id", &contact.workspace_id);
+            set_fields.insert("account_id", &contact.account_id);
+            set_fields.insert("contact_id", &contact_id);
+            set_fields.insert("status", doc! { "$ifNull": ["$status", "pending"] });
+            set_fields.insert("first_seen_at", doc! { "$ifNull": ["$first_seen_at", now] });
+            set_fields.insert(
+                "occurrences",
+                doc! { "$cond": [
+                    { "$in": [&run_id, seen_runs.clone()] },
+                    { "$ifNull": ["$occurrences", 0] },
+                    { "$add": [{ "$ifNull": ["$occurrences", 0] }, 1] },
+                ] },
+            );
+            set_fields.insert(
+                "source_run_ids",
+                doc! { "$setUnion": [seen_runs, [&run_id]] },
+            );
+            let update = vec![doc! { "$set": set_fields }];
             let opts = mongodb::options::UpdateOptions::builder()
                 .upsert(true)
                 .build();
@@ -6038,17 +6084,25 @@ async fn apply_agent_updates(
             "contact_id": &contact_id,
             "status": "pending",
         };
-        let update = doc! {
-            "$set": set_fields,
-            "$setOnInsert": {
-                "workspace_id": &contact.workspace_id,
-                "account_id": &contact.account_id,
-                "contact_id": &contact_id,
-                "status": "pending",
-                "first_seen_at": now,
-            },
-            "$inc": { "occurrences": 1 },
-        };
+        let seen_runs = doc! { "$ifNull": ["$source_run_ids", Vec::<String>::new()] };
+        set_fields.insert("workspace_id", &contact.workspace_id);
+        set_fields.insert("account_id", &contact.account_id);
+        set_fields.insert("contact_id", &contact_id);
+        set_fields.insert("status", doc! { "$ifNull": ["$status", "pending"] });
+        set_fields.insert("first_seen_at", doc! { "$ifNull": ["$first_seen_at", now] });
+        set_fields.insert(
+            "occurrences",
+            doc! { "$cond": [
+                { "$in": [&run_id, seen_runs.clone()] },
+                { "$ifNull": ["$occurrences", 0] },
+                { "$add": [{ "$ifNull": ["$occurrences", 0] }, 1] },
+            ] },
+        );
+        set_fields.insert(
+            "source_run_ids",
+            doc! { "$setUnion": [seen_runs, [&run_id]] },
+        );
+        let update = vec![doc! { "$set": set_fields }];
         let opts = mongodb::options::UpdateOptions::builder()
             .upsert(true)
             .build();
@@ -6214,7 +6268,7 @@ async fn apply_agent_updates(
     Ok(())
 }
 
-async fn apply_operating_memory_update(
+pub(crate) async fn apply_operating_memory_update(
     state: &AppState,
     contact: &Contact,
     memory: &crate::models::OperatingMemory,
@@ -6238,11 +6292,27 @@ async fn apply_operating_memory_update(
             "write_tag_observations failed; reply already sent, skipping tag observation write"
         );
     }
+    match contact_memory_consolidation_due(state, contact, decision).await {
+        Ok(true) => {
+            if let Err(error) = schedule_memory_consolidation_task(state, contact, run_id).await {
+                tracing::warn!(
+                    %error,
+                    contact_wxid = %contact.wxid,
+                    "memory consolidation scheduling failed; reply already sent"
+                );
+            }
+        }
+        Ok(false) => {}
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                contact_wxid = %contact.wxid,
+                "memory consolidation due-check failed; reply already sent"
+            );
+        }
+    }
     if decision.operating_memory_update.is_empty() && context_pack.is_empty() {
         return Ok(());
-    }
-    if decision.consolidation_needed || decision.memory_write_score >= 6 {
-        schedule_memory_consolidation_task(state, contact, run_id).await?;
     }
     // CONC-1：memory_card(+version) 走 OCC 单独写，镜像 memory.rs 的 occ_memory_filter
     // 模板（filter 含 memory_card_version 谓词，并发只有看到 prev_version 的 writer 命中）。
@@ -6906,6 +6976,9 @@ pub(crate) struct TaxonomyGuardOutcome {
     pub risks: Vec<String>,
     /// 待写入 `taxonomy_candidates` 的 `(kind, raw_value)` 对。空 / 仅空格的 raw 已被过滤。
     pub candidate_writes: Vec<(String, String)>,
+    /// 未经审核的候选值不得进入画像或 FSM。这里保留 `(kind, raw_value)`，供终态应用
+    /// 时同时清除 typed/container 双表示，并在 customer_stage 同源时清除 operation_state。
+    pub quarantines: Vec<(String, String)>,
 }
 
 /// 从维度中文名映射（`AgentDecision.dimension_display_names`）里按 `kind` 取中文名。
@@ -6928,6 +7001,7 @@ pub(crate) fn pick_dimension_display_name<'a>(names: &'a Document, kind: &str) -
 pub(crate) fn compute_taxonomy_guard_outcome(
     decision: &AgentDecision,
     dimension_kinds: &[String],
+    fsm_customer_stage_keys: &[String],
     workspace_id: &str,
     scope_account_id: &str,
     cache: &super::taxonomy::TaxonomyCache,
@@ -6954,14 +7028,49 @@ pub(crate) fn compute_taxonomy_guard_outcome(
                     .push(format!("taxonomy_deprecated_value:{kind}"));
             }
             TaxonomyMatch::CandidateNew => {
+                // customer_stage and operation_state intentionally share one canonical key
+                // space. During rolling configuration upgrades the FSM may already contain the
+                // canonical keys while system_taxonomies has not been seeded yet. Such keys are
+                // authoritative and must not be quarantined as new free-form values.
+                if kind == "customer_stage" && fsm_customer_stage_keys.iter().any(|key| key == raw)
+                {
+                    continue;
+                }
                 outcome.risks.push(format!("taxonomy_candidate_new:{kind}"));
                 outcome
                     .candidate_writes
                     .push((kind.clone(), raw.to_string()));
+                outcome.quarantines.push((kind.clone(), raw.to_string()));
             }
         }
     }
     outcome
+}
+
+/// Apply the pure taxonomy verdict to the final decision. Candidate values remain available
+/// in `candidate_writes` for operator review, but cannot leak into profile persistence or FSM
+/// synchronization. Alias rewrites and risk projection stay unchanged.
+pub(crate) fn apply_taxonomy_guard_outcome(
+    decision: &mut AgentDecision,
+    review: &mut DecisionReviewResult,
+    outcome: &TaxonomyGuardOutcome,
+) {
+    for (kind, canonical) in &outcome.rewrites {
+        crate::agent::domain_signals::set_dimension(decision, kind, canonical.clone());
+    }
+    for risk in &outcome.risks {
+        if !review.risks.iter().any(|existing| existing == risk) {
+            review.risks.push(risk.clone());
+        }
+    }
+    for (kind, raw) in &outcome.quarantines {
+        crate::agent::domain_signals::remove_dimension(decision, kind);
+        if kind == "customer_stage"
+            && decision.operation_state.as_deref().map(str::trim) == Some(raw.trim())
+        {
+            decision.operation_state = None;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -7830,7 +7939,7 @@ mod tests {
             decision.intent_level = Some(i.to_string());
         }
         let dims = vec!["customer_stage".to_string(), "intent_level".to_string()];
-        compute_taxonomy_guard_outcome(&decision, &dims, "default", scope, cache)
+        compute_taxonomy_guard_outcome(&decision, &dims, &[], "default", scope, cache)
     }
 
     /// 取某维度的 rewrite canonical（替代旧的 customer_stage_rewrite/intent_level_rewrite 字段）。
@@ -7954,6 +8063,72 @@ mod tests {
             "未知值必须进 candidate_writes，admin 才能在后台审核"
         );
         assert!(rewrite_of(&out, "customer_stage").is_none());
+        assert_eq!(
+            out.quarantines,
+            vec![("customer_stage".to_string(), "完全没听过的阶段".to_string())]
+        );
+    }
+
+    #[test]
+    fn taxonomy_empty_but_fsm_canonical_customer_stage_is_not_quarantined() {
+        let cache = cache_with(vec![]);
+        let mut decision = AgentDecision::default();
+        decision.customer_stage = Some("new_contact".to_string());
+        decision
+            .domain_signals
+            .insert("customer_stage", "new_contact");
+        decision.operation_state = Some("new_contact".to_string());
+        let dims = vec!["customer_stage".to_string()];
+        let fsm_keys = vec!["new_contact".to_string(), "need_discovery".to_string()];
+
+        let out = compute_taxonomy_guard_outcome(
+            &decision, &dims, &fsm_keys, "default", "acct-1", &cache,
+        );
+
+        assert!(out.risks.is_empty());
+        assert!(out.candidate_writes.is_empty());
+        assert!(out.quarantines.is_empty());
+    }
+
+    #[test]
+    fn applying_candidate_quarantine_clears_both_stage_representations_and_same_fsm_proposal() {
+        let cache = cache_with(vec![entry(
+            "global",
+            "customer_stage",
+            "new_contact",
+            &[],
+            "active",
+        )]);
+        let raw = "陌生接触";
+        let mut decision = AgentDecision::default();
+        decision.customer_stage = Some(raw.to_string());
+        decision.domain_signals.insert("customer_stage", raw);
+        decision.operation_state = Some(raw.to_string());
+        let dims = vec!["customer_stage".to_string()];
+        let outcome = compute_taxonomy_guard_outcome(
+            &decision,
+            &dims,
+            &["new_contact".to_string()],
+            "default",
+            "acct-1",
+            &cache,
+        );
+        let mut review = DecisionReviewResult::default();
+
+        apply_taxonomy_guard_outcome(&mut decision, &mut review, &outcome);
+        crate::agent::domain_signals::normalize_domain_signals(&mut decision);
+
+        assert!(decision.customer_stage.is_none());
+        assert!(decision.domain_signals.get("customer_stage").is_none());
+        assert!(decision.operation_state.is_none());
+        assert!(review
+            .risks
+            .iter()
+            .any(|risk| risk == "taxonomy_candidate_new:customer_stage"));
+        assert_eq!(
+            outcome.candidate_writes,
+            vec![("customer_stage".to_string(), raw.to_string())]
+        );
     }
 
     #[test]

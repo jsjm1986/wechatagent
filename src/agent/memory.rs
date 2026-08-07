@@ -21,7 +21,7 @@
 
 use futures::TryStreamExt;
 use mongodb::bson::{doc, oid::ObjectId, to_bson, to_document, Bson, DateTime, Document};
-use mongodb::options::FindOptions;
+use mongodb::options::{FindOptions, UpdateOptions};
 use serde_json::json;
 
 use crate::error::{AppError, AppResult};
@@ -2559,6 +2559,34 @@ pub async fn reconcile_memory_consolidation_commit(
     Ok(())
 }
 
+async fn upsert_projected_memory_candidate(
+    state: &AppState,
+    candidate: MemoryCandidate,
+    projection_key: String,
+) -> AppResult<()> {
+    let workspace_id = candidate.workspace_id.clone();
+    let account_id = candidate.account_id.clone();
+    let contact_wxid = candidate.contact_wxid.clone();
+    let mut insert = to_document(&candidate)?;
+    insert.insert("projection_key", &projection_key);
+    state
+        .db
+        .memory_candidates()
+        .clone_with_type::<Document>()
+        .update_one(
+            doc! {
+                "workspace_id": workspace_id,
+                "account_id": account_id,
+                "contact_wxid": contact_wxid,
+                "projection_key": &projection_key,
+            },
+            doc! { "$setOnInsert": insert },
+            UpdateOptions::builder().upsert(true).build(),
+        )
+        .await?;
+    Ok(())
+}
+
 pub(crate) async fn write_memory_candidates(
     state: &AppState,
     contact: &Contact,
@@ -2590,28 +2618,25 @@ pub(crate) async fn write_memory_candidates(
         .max()
         .unwrap_or(0);
     let status = decide_candidate_status(decision.memory_write_score, max_importance);
-    state
-        .db
-        .memory_candidates()
-        .insert_one(
-            MemoryCandidate {
-                id: None,
-                workspace_id: contact.workspace_id.clone(),
-                account_id: contact.account_id.clone(),
-                contact_wxid: contact.wxid.clone(),
-                run_id: Some(run_id.to_string()),
-                source: decision.run_mode.clone(),
-                candidates,
-                memory_write_score: decision.memory_write_score,
-                status: status.to_string(),
-                reason: Some(decision.memory_update.clone()),
-                created_at: DateTime::now(),
-                updated_at: DateTime::now(),
-            },
-            None,
-        )
-        .await?;
-    Ok(())
+    upsert_projected_memory_candidate(
+        state,
+        MemoryCandidate {
+            id: None,
+            workspace_id: contact.workspace_id.clone(),
+            account_id: contact.account_id.clone(),
+            contact_wxid: contact.wxid.clone(),
+            run_id: Some(run_id.to_string()),
+            source: decision.run_mode.clone(),
+            candidates,
+            memory_write_score: decision.memory_write_score,
+            status: status.to_string(),
+            reason: Some(decision.memory_update.clone()),
+            created_at: DateTime::now(),
+            updated_at: DateTime::now(),
+        },
+        format!("{run_id}:decision_memory"),
+    )
+    .await
 }
 
 /// 把一轮维度判断转成 observation 候选 docs（纯函数，便于单测）。
@@ -2675,12 +2700,7 @@ pub(crate) async fn write_tag_observations(
         created_at: DateTime::now(),
         updated_at: DateTime::now(),
     };
-    state
-        .db
-        .memory_candidates()
-        .insert_one(&candidate, None)
-        .await?;
-    Ok(())
+    upsert_projected_memory_candidate(state, candidate, format!("{run_id}:tag_observation")).await
 }
 
 /// 子计划2 Task4：把一条弱证据的 customer_stage 判断写进 memory_candidates 暂定层
@@ -2713,12 +2733,12 @@ pub(crate) async fn write_stage_observation(
         created_at: DateTime::now(),
         updated_at: DateTime::now(),
     };
-    state
-        .db
-        .memory_candidates()
-        .insert_one(&candidate, None)
-        .await?;
-    Ok(())
+    upsert_projected_memory_candidate(
+        state,
+        candidate,
+        format!("{run_id}:stage_observation:{stage}"),
+    )
+    .await
 }
 /// 否则 ignored_low_score。importance 救援阈值取 8——只有高重要度记忆(承诺/强偏好等)
 /// 才在整体分偏低时被救回,避免噪声涌入待审池。纯函数便于单测。
@@ -2730,6 +2750,77 @@ pub(crate) fn decide_candidate_status(write_score: i32, max_importance: i32) -> 
     } else {
         "ignored_low_score"
     }
+}
+
+const CONSOLIDATION_PENDING_COUNT_THRESHOLD: usize = 4;
+const CONSOLIDATION_MAX_PENDING_AGE_MS: i64 = 6 * 60 * 60 * 1000;
+
+/// Decide whether pending memory has accumulated enough to justify an LLM consolidation.
+/// `oldest_pending_ms` and `now_ms` are explicit so the policy remains deterministic in tests.
+pub(crate) fn memory_consolidation_due(
+    consolidation_requested: bool,
+    memory_write_score: i32,
+    pending_count: usize,
+    oldest_pending_ms: Option<i64>,
+    now_ms: i64,
+) -> bool {
+    if consolidation_requested || memory_write_score >= 6 {
+        return true;
+    }
+    if pending_count >= CONSOLIDATION_PENDING_COUNT_THRESHOLD {
+        return true;
+    }
+    oldest_pending_ms
+        .map(|oldest| now_ms.saturating_sub(oldest) >= CONSOLIDATION_MAX_PENDING_AGE_MS)
+        .unwrap_or(false)
+}
+
+/// Inspect at most the threshold number of pending rows using the existing scoped compound index.
+/// This prevents low-scoring candidates from starving without introducing an unbounded count.
+pub(crate) async fn contact_memory_consolidation_due(
+    state: &AppState,
+    contact: &Contact,
+    decision: &AgentDecision,
+) -> AppResult<bool> {
+    if memory_consolidation_due(
+        decision.consolidation_needed,
+        decision.memory_write_score,
+        0,
+        None,
+        DateTime::now().timestamp_millis(),
+    ) {
+        return Ok(true);
+    }
+
+    let mut cursor = state
+        .db
+        .memory_candidates()
+        .find(
+            doc! {
+                "workspace_id": &contact.workspace_id,
+                "account_id": &contact.account_id,
+                "contact_wxid": &contact.wxid,
+                "status": "pending",
+            },
+            FindOptions::builder()
+                .sort(doc! { "created_at": 1 })
+                .limit(CONSOLIDATION_PENDING_COUNT_THRESHOLD as i64)
+                .build(),
+        )
+        .await?;
+    let mut pending_count = 0_usize;
+    let mut oldest_pending_ms = None;
+    while let Some(candidate) = cursor.try_next().await? {
+        pending_count += 1;
+        oldest_pending_ms.get_or_insert(candidate.created_at.timestamp_millis());
+    }
+    Ok(memory_consolidation_due(
+        false,
+        decision.memory_write_score,
+        pending_count,
+        oldest_pending_ms,
+        DateTime::now().timestamp_millis(),
+    ))
 }
 
 /// A-01：弱证据候选的 importance 天花板。core_facts 建立仅凭 LLM 自评（候选 evidence
@@ -3317,7 +3408,7 @@ pub async fn revoke_operator_memory(
 
 #[cfg(test)]
 mod candidate_status_tests {
-    use super::decide_candidate_status;
+    use super::{decide_candidate_status, memory_consolidation_due};
 
     #[test]
     fn high_write_score_pending() {
@@ -3336,6 +3427,32 @@ mod candidate_status_tests {
     fn low_score_low_importance_ignored() {
         assert_eq!(decide_candidate_status(5, 7), "ignored_low_score");
         assert_eq!(decide_candidate_status(0, 0), "ignored_low_score");
+    }
+
+    #[test]
+    fn consolidation_policy_preserves_immediate_triggers() {
+        assert!(memory_consolidation_due(true, 0, 0, None, 100));
+        assert!(memory_consolidation_due(false, 6, 0, None, 100));
+    }
+
+    #[test]
+    fn consolidation_policy_breaks_count_and_age_starvation() {
+        let six_hours_ms = 6 * 60 * 60 * 1000;
+        assert!(memory_consolidation_due(false, 2, 4, Some(99), 100));
+        assert!(memory_consolidation_due(
+            false,
+            2,
+            1,
+            Some(100),
+            100 + six_hours_ms
+        ));
+        assert!(!memory_consolidation_due(
+            false,
+            2,
+            3,
+            Some(100),
+            100 + six_hours_ms - 1
+        ));
     }
 }
 

@@ -3,6 +3,7 @@ import gatewayStatusValues from "../../contracts/gateway_status_values.fixture.j
 import {
   FINAL_REVIEW_STATUS_LABELS,
   HOLD_CATEGORY_LABELS,
+  REVIEW_PHASE_LABELS,
   GATEWAY_STATUS_LABELS,
   GAP_SIGNAL_KIND_LABELS,
   ESCALATION_CATEGORY_LABELS,
@@ -27,6 +28,19 @@ describe("reviewLabels 闭集标签(C7/C8 共用)", () => {
       expect(HOLD_CATEGORY_LABELS[k], `缺 ${k}`).toBeTruthy();
     }
   });
+
+  it("REVIEW_PHASE_LABELS 覆盖自动改写与送达派生态", () => {
+    for (const key of [
+      "auto_rewrite_in_progress", "auto_rewrite_approved", "auto_rewrite_queued",
+      "auto_rewrite_sent", "auto_rewrite_failed", "approved", "queued", "sent",
+      "partially_sent", "final_blocked", "gateway_blocked", "delivery_failed",
+      "delivery_canceled", "delivery_unknown", "review_recorded",
+    ]) {
+      expect(REVIEW_PHASE_LABELS[key], `缺 ${key}`).toBeTruthy();
+      expect(REVIEW_PHASE_LABELS[key], `${key} 未翻译`).not.toBe(key);
+    }
+  });
+
   it("labelOf 已知值翻译、未知值回落原始、空值回落 —", () => {
     expect(labelOf(FINAL_REVIEW_STATUS_LABELS, "approved")).toBe("已通过");
     expect(labelOf(FINAL_REVIEW_STATUS_LABELS, "weird_value")).toBe("weird_value");

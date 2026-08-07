@@ -1331,7 +1331,13 @@ pub(super) fn decision_review_json(
     final_review_status: Option<String>,
     hold_category: Option<String>,
     autonomy_protocol: Option<Value>,
+    outbox_status: Option<String>,
 ) -> Value {
+    let review_phase = decision_review_phase(
+        &review.status,
+        final_review_status.as_deref(),
+        outbox_status.as_deref(),
+    );
     json!({
         "id": review.id.map(|id| id.to_hex()).unwrap_or_default(),
         "runId": review.run_id,
@@ -1359,11 +1365,70 @@ pub(super) fn decision_review_json(
         "outcomeStatus": review.outcome_status,
         "reactionAnalysis": review.reaction_analysis,
         "status": review.status,
+        "reviewPhase": review_phase,
         "finalReviewStatus": final_review_status,
         "holdCategory": hold_category,
         "autonomyProtocol": autonomy_protocol,
         "createdAt": crate::models::dt_to_string(review.created_at)
     })
+}
+
+/// Project a review row and its run-level terminal/delivery state into one UI-safe phase.
+/// `rewrite_requested` is an intermediate draft verdict, never a final delivery outcome.
+pub(super) fn decision_review_phase(
+    review_status: &str,
+    final_review_status: Option<&str>,
+    outbox_status: Option<&str>,
+) -> &'static str {
+    let rewrite = review_status == "rewrite_requested";
+    match outbox_status {
+        Some("sent") => return if rewrite { "auto_rewrite_sent" } else { "sent" },
+        Some("pending" | "in_flight") => {
+            return if rewrite {
+                "auto_rewrite_queued"
+            } else {
+                "queued"
+            };
+        }
+        Some("partially_sent") => return "partially_sent",
+        Some("failed_terminal") => return "delivery_failed",
+        Some("canceled") => return "delivery_canceled",
+        Some("delivery_unknown") => return "delivery_unknown",
+        _ => {}
+    }
+    if matches!(
+        review_status,
+        "gateway_blocked" | "precheck_blocked" | "outbox_enqueue_failed"
+    ) {
+        return "gateway_blocked";
+    }
+    match final_review_status {
+        Some("approved" | "approved_sent" | "revision_applied_approved") => {
+            if rewrite {
+                "auto_rewrite_approved"
+            } else {
+                "approved"
+            }
+        }
+        Some(
+            "revision_failed"
+            | "held_by_ai_policy"
+            | "blocked_by_safety_guard"
+            | "ai_waiting_for_more_context"
+            | "blocked_by_required_field"
+            | "blocked_by_budget"
+            | "blocked_unverified_product_claim",
+        ) => {
+            if rewrite {
+                "auto_rewrite_failed"
+            } else {
+                "final_blocked"
+            }
+        }
+        _ if rewrite => "auto_rewrite_in_progress",
+        _ if review_status == "outbox_enqueuing" || review_status == "outbox_enqueued" => "queued",
+        _ => "review_recorded",
+    }
 }
 
 pub(super) fn agent_run_json(item: AgentRunLog) -> Value {
@@ -2277,7 +2342,67 @@ mod tests {
         crate::routes::contract_snapshot::assert_contract_fixture("agent_run", projected);
     }
 
-    /// 契约快照：decision_review_json（30 键，含 autonomyProtocol 嵌套对象）。AgentDecisionReview 29 字段全量构造;
+    #[test]
+    fn decision_review_phase_distinguishes_rewrite_delivery_and_blocking() {
+        assert_eq!(
+            super::decision_review_phase("rewrite_requested", None, None),
+            "auto_rewrite_in_progress"
+        );
+        assert_eq!(
+            super::decision_review_phase(
+                "rewrite_requested",
+                Some("revision_applied_approved"),
+                Some("pending")
+            ),
+            "auto_rewrite_queued"
+        );
+        assert_eq!(
+            super::decision_review_phase(
+                "rewrite_requested",
+                Some("revision_applied_approved"),
+                Some("sent")
+            ),
+            "auto_rewrite_sent"
+        );
+        assert_eq!(
+            super::decision_review_phase("rewrite_requested", Some("revision_failed"), None),
+            "auto_rewrite_failed"
+        );
+        assert_eq!(
+            super::decision_review_phase(
+                "blocked_by_safety_guard",
+                Some("blocked_by_safety_guard"),
+                None
+            ),
+            "final_blocked"
+        );
+    }
+
+    #[test]
+    fn decision_review_phase_never_conflates_queue_acceptance_with_delivery() {
+        assert_eq!(
+            super::decision_review_phase("outbox_enqueued", Some("approved"), Some("pending")),
+            "queued"
+        );
+        assert_eq!(
+            super::decision_review_phase("outbox_enqueued", Some("approved"), Some("in_flight")),
+            "queued"
+        );
+        assert_eq!(
+            super::decision_review_phase("sent", Some("approved"), Some("sent")),
+            "sent"
+        );
+        assert_eq!(
+            super::decision_review_phase("sent", Some("approved"), Some("delivery_unknown")),
+            "delivery_unknown"
+        );
+        assert_eq!(
+            super::decision_review_phase("sent", Some("approved"), Some("partially_sent")),
+            "partially_sent"
+        );
+    }
+
+    /// 契约快照：decision_review_json（31 键，含 reviewPhase / autonomyProtocol）。AgentDecisionReview 29 字段全量构造;
     /// 9 个下发 Document 放纯标量;used_knowledge_ids:Vec<ObjectId>→hex 字符串数组（不泄漏）;
     /// final_review_status/hold_category 是函数参数,给 Some;reaction_claimed_at/
     /// reviewer_misjudge_signal 赋值但投影不下发。
@@ -2338,6 +2463,7 @@ mod tests {
                 "whyShouldReply": "用户主动询问差异，及时回应推进决策",
                 "whySkipReply": ""
             })),
+            Some("sent".to_string()),
         );
         crate::routes::contract_snapshot::assert_contract_fixture("decision_review", projected);
     }

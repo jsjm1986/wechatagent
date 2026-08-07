@@ -1282,6 +1282,27 @@ pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
             None,
         )
         .await?;
+    // Crash-replayed post-decision projections are single-write per run/category.
+    db.memory_candidates()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! {
+                    "workspace_id": 1,
+                    "account_id": 1,
+                    "contact_wxid": 1,
+                    "projection_key": 1,
+                })
+                .options(
+                    IndexOptions::builder()
+                        .name("uniq_memory_projection_key".to_string())
+                        .unique(true)
+                        .partial_filter_expression(doc! { "projection_key": { "$type": "string" } })
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
     db.user_operation_guide_previews()
         .create_index(
             IndexModel::builder()
@@ -1403,6 +1424,7 @@ pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
     // 同时方便 W3 / W4 在落地业务字段时按需新增索引（如 outbox 的 ttl / 字典的
     // alias 命中索引）。
     ensure_agent_send_outbox_indexes(db).await?;
+    ensure_system_incident_indexes(db).await?;
     ensure_system_taxonomies_indexes(db).await?;
     ensure_taxonomy_candidates_indexes(db).await?;
     ensure_relationship_type_suggestions_indexes(db).await?;
@@ -2068,9 +2090,81 @@ async fn ensure_agent_send_outbox_indexes(db: &Database) -> anyhow::Result<()> {
     db.collection_agent_send_outbox()
         .create_index(outbox_delivery_finalize_pending_index(), None)
         .await?;
+    // Priority claim hot path. Old rows deserialize with priority=0 and remain eligible.
+    db.collection_agent_send_outbox()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! {
+                    "status": 1,
+                    "next_retry_at": 1,
+                    "delivery_priority": -1,
+                    "created_at": 1,
+                    "run_sequence": 1,
+                    "_id": 1,
+                })
+                .options(
+                    IndexOptions::builder()
+                        .name("outbox_priority_claim_idx".to_string())
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
+    // Durable post-decision projection lease/retry scan.
+    db.decision_reviews()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! {
+                    "post_decision_status": 1,
+                    "post_decision_next_retry_at": 1,
+                    "post_decision_locked_until": 1,
+                    "created_at": 1,
+                    "_id": 1,
+                })
+                .options(
+                    IndexOptions::builder()
+                        .name("decision_post_projection_idx".to_string())
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
     // B1：per-contact 主动触达配额闸（precheck 热路径）。
     db.collection_agent_send_outbox()
         .create_index(outbox_contact_proactive_touch_index(), None)
+        .await?;
+    Ok(())
+}
+
+async fn ensure_system_incident_indexes(db: &Database) -> anyhow::Result<()> {
+    db.system_incidents()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "workspace_id": 1, "incident_key": 1 })
+                .options(
+                    IndexOptions::builder()
+                        .name("uniq_system_incident_identity".to_string())
+                        .unique(true)
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
+    db.system_incidents()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "status": 1, "updated_at": 1 })
+                .options(
+                    IndexOptions::builder()
+                        .name("system_incident_reconcile".to_string())
+                        .build(),
+                )
+                .build(),
+            None,
+        )
         .await?;
     Ok(())
 }

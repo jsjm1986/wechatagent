@@ -29,9 +29,9 @@ use crate::models::{
     ManagementAgentMessage, ManagementAgentSession, McpCallLog, MemoryCandidate, MigrationRecord,
     OperatingMemory, OperationDomainConfig, OperationKnowledgeChunk, OperationKnowledgeDocument,
     OperationPlaybook, OutboxEntry, PostReleaseReview, Product, PromptTemplate, Proposal,
-    ReferralCard, RelationshipTypeSuggestion, ShadowReplay, SuspectedDealSignal, TaxonomyCandidate,
-    TaxonomyEntry, ThresholdOverride, ThresholdOverrideAudit, UserOperationGuidePreview,
-    WechatAccount,
+    ReferralCard, RelationshipTypeSuggestion, ShadowReplay, SuspectedDealSignal, SystemIncident,
+    TaxonomyCandidate, TaxonomyEntry, ThresholdOverride, ThresholdOverrideAudit,
+    UserOperationGuidePreview, WechatAccount,
 };
 
 #[derive(Clone)]
@@ -119,6 +119,10 @@ impl Database {
 
     pub fn events(&self) -> Collection<AgentEvent> {
         self.db.collection("agent_events")
+    }
+
+    pub fn system_incidents(&self) -> Collection<SystemIncident> {
+        self.db.collection("system_incidents")
     }
 
     /// 自学习采集管道 S1–S3：`behavior_signals` append-only 事件日志 typed

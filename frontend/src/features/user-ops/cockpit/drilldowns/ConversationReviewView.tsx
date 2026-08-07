@@ -8,7 +8,7 @@ import { useState } from "react";
 import { ArrowLeft } from "lucide-react";
 import type { AutonomyProtocol, DecisionReview, Message } from "../../../../types";
 import { ConversationStream, EmptyInline, formatTime, nextBestActionLabel } from "../../legacy";
-import { FINAL_REVIEW_STATUS_LABELS, HOLD_CATEGORY_LABELS, REVIEW_SCORE_LABELS, labelOf } from "../../../../lib/reviewLabels";
+import { FINAL_REVIEW_STATUS_LABELS, HOLD_CATEGORY_LABELS, REVIEW_PHASE_LABELS, REVIEW_SCORE_LABELS, labelOf } from "../../../../lib/reviewLabels";
 import { useProfileStore, labelFor } from "../../../../stores/profileStore";
 import styles from "../cockpit.module.css";
 
@@ -59,13 +59,16 @@ function ReviewItem({ review }: { review: DecisionReview }) {
     scores.length > 0 ||
     risks.length > 0 ||
     Boolean(nextAction && nextAction !== "-") ||
+    Boolean(review.reviewPhase) ||
     Boolean(review.finalReviewStatus) ||
     Boolean(review.holdCategory);
 
   return (
     <div className="reviewItem">
       <strong>
-        {review.approved ? "通过" : "拦截"} / {review.operationState ? labelFor(taxonomies, "customer_stage", review.operationState).text : "未记录状态"}
+        {review.reviewPhase
+          ? labelOf(REVIEW_PHASE_LABELS, review.reviewPhase)
+          : review.approved ? "通过" : "拦截"} / {review.operationState ? labelFor(taxonomies, "customer_stage", review.operationState).text : "未记录状态"}
       </strong>
       <p>{review.reviewSummary || review.replyText || "-"}</p>
       <span>{formatTime(review.createdAt)}</span>
@@ -80,8 +83,11 @@ function ReviewItem({ review }: { review: DecisionReview }) {
       )}
       {expanded && (hasDetail || hasProtocol) && (
         <div className={styles.reviewDetail}>
-          {(review.finalReviewStatus || review.holdCategory) && (
+          {(review.reviewPhase || review.finalReviewStatus || review.holdCategory) && (
             <div className={styles.reviewMetaRow}>
+              {review.reviewPhase && (
+                <span className={styles.reviewChip}>流程 {labelOf(REVIEW_PHASE_LABELS, review.reviewPhase)}</span>
+              )}
               {review.finalReviewStatus && (
                 <span className={styles.reviewChip}>终审 {labelOf(FINAL_REVIEW_STATUS_LABELS, review.finalReviewStatus)}</span>
               )}

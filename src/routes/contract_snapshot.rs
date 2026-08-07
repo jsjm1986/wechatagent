@@ -168,8 +168,8 @@ mod tests {
         // 契约测试块 = 含 `assert_contract_fixture` 调用的代码区。production handler 里
         // 调用投影(document=4/chunk=14 次)不算覆盖——必须是测试块里调用,才挡得住
         // "有 production 调用方但零测试"的投影。
-        // 纯 std 近似:在每次 `assert_contract_fixture` 出现处切前 600 / 后 200 字符窗口
-        // (覆盖一个测试函数体),窗口里出现的 `_json` 名即记为已覆盖。
+        // 对每个断言定位最近的 `#[test]`，并扫描到下一个测试起点；不能使用固定字符
+        // 窗口，也不能用朴素花括号计数（字符串 / 宏内可含花括号），否则会误报。
         // **排除 contract_snapshot.rs 自身**:它是 helper 定义处,满篇 `assert_contract_fixture`
         // 字面量与文档/ALLOWLIST 注释里的投影名,纳入会把任意投影名误判为已覆盖。
         let mut covered: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -180,16 +180,17 @@ mod tests {
             let mut from = 0usize;
             while let Some(rel) = src[from..].find("assert_contract_fixture") {
                 let pos = from + rel;
-                let mut s = pos.saturating_sub(600);
-                while s < src.len() && !src.is_char_boundary(s) {
-                    s += 1;
-                }
-                let mut e = (pos + 200).min(src.len());
-                while e < src.len() && !src.is_char_boundary(e) {
-                    e += 1;
-                }
-                let window = &src[s..e];
-                for tok in window.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+                let Some(test_start) = src[..pos].rfind("#[test]") else {
+                    from = pos + "assert_contract_fixture".len();
+                    continue;
+                };
+                let test_end = src[pos..]
+                    .find("#[test]")
+                    .map(|offset| pos + offset)
+                    .unwrap_or(src.len());
+                for tok in
+                    src[test_start..test_end].split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                {
                     if has_projection_suffix(tok) && tok.len() > 5 {
                         covered.insert(tok.to_string());
                     }
@@ -206,9 +207,7 @@ mod tests {
         for (_path, src) in &all_src {
             let lines: Vec<&str> = src.lines().collect();
             for (i, line) in lines.iter().enumerate() {
-                if !line.contains("fn ")
-                    || !PROJECTION_SUFFIXES.iter().any(|s| line.contains(s))
-                {
+                if !line.contains("fn ") || !PROJECTION_SUFFIXES.iter().any(|s| line.contains(s)) {
                     continue;
                 }
                 let Some(name) = extract_projection_name(line) else {

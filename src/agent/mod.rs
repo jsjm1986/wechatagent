@@ -46,6 +46,7 @@ pub(crate) mod multimodal;
 pub(crate) mod outbox;
 pub(crate) mod outbox_dispatcher;
 pub(crate) mod pacing;
+pub(crate) mod post_decision;
 pub(crate) mod prompt_isolation;
 pub(crate) mod prompt_shadow;
 pub(crate) mod quiet_hours;
@@ -59,6 +60,7 @@ pub(crate) mod send_ledger;
 mod shadow_finalize;
 mod simulation;
 pub mod sufficiency;
+pub(crate) mod system_incident;
 pub(crate) mod tag_evidence;
 pub(crate) mod taxonomy;
 pub(crate) mod types;
@@ -119,6 +121,7 @@ pub use memory::{
 // 复用 memory 模块的纯解析入口（mod memory 私有，故在此 re-export 给 planner）。
 pub(crate) use memory::effective_memory_card;
 pub use outbox_dispatcher::run_outbox_dispatcher;
+pub use post_decision::run_worker as run_post_decision_worker;
 
 // W4 / Task 5.8（R13.10）：暴露 dispatcher 内部 helper 给
 // `tests/outbox_integration.rs` 集成测试驱动；不应在生产代码中绕过 `tick`
@@ -340,6 +343,16 @@ pub(crate) async fn generate_agent_json(
                 started_at,
             )
             .await;
+            if let Err(err) =
+                system_incident::observe_llm_recovery(state, workspace_id, started_at).await
+            {
+                tracing::error!(
+                    ?err,
+                    workspace_id,
+                    provider_id,
+                    "recording LLM recovery failed"
+                );
+            }
             Ok(value)
         }
         Err(error) => {
@@ -360,6 +373,26 @@ pub(crate) async fn generate_agent_json(
                 started_at,
             )
             .await;
+            if let Some(reason) = crate::llm::llm_account_unavailable_reason(&error) {
+                if let Err(incident_error) = system_incident::observe_llm_account_unavailable(
+                    state,
+                    workspace_id,
+                    account_id,
+                    provider_id,
+                    provider_model,
+                    reason,
+                    started_at,
+                )
+                .await
+                {
+                    tracing::error!(
+                        ?incident_error,
+                        workspace_id,
+                        provider_id,
+                        "recording LLM account incident failed"
+                    );
+                }
+            }
             Err(error)
         }
     }
@@ -388,10 +421,15 @@ pub(crate) async fn generate_agent_json_streaming(
         Some(registry) => Some(registry.snapshot(workspace_id).await?),
         None => None,
     };
-    let provider_model = registry_snapshot
+    let (provider_id, provider_model) = registry_snapshot
         .as_ref()
-        .map(|snapshot| snapshot.meta.model.as_str())
-        .unwrap_or(state.config.openai_model.as_str());
+        .map(|snapshot| {
+            (
+                snapshot.meta.provider_id.as_str(),
+                snapshot.meta.model.as_str(),
+            )
+        })
+        .unwrap_or(("injected", state.config.openai_model.as_str()));
     let generated = match &registry_snapshot {
         Some(snapshot) => {
             snapshot
@@ -425,6 +463,16 @@ pub(crate) async fn generate_agent_json_streaming(
                 started_at,
             )
             .await;
+            if let Err(err) =
+                system_incident::observe_llm_recovery(state, workspace_id, started_at).await
+            {
+                tracing::error!(
+                    ?err,
+                    workspace_id,
+                    provider_id,
+                    "recording LLM recovery failed"
+                );
+            }
             Ok(value)
         }
         Err(error) => {
@@ -441,6 +489,26 @@ pub(crate) async fn generate_agent_json_streaming(
                 started_at,
             )
             .await;
+            if let Some(reason) = crate::llm::llm_account_unavailable_reason(&error) {
+                if let Err(incident_error) = system_incident::observe_llm_account_unavailable(
+                    state,
+                    workspace_id,
+                    account_id,
+                    provider_id,
+                    provider_model,
+                    reason,
+                    started_at,
+                )
+                .await
+                {
+                    tracing::error!(
+                        ?incident_error,
+                        workspace_id,
+                        provider_id,
+                        "recording LLM account incident failed"
+                    );
+                }
+            }
             Err(error)
         }
     }

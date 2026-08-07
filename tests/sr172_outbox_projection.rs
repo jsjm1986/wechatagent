@@ -115,6 +115,8 @@ fn outbox_entry(
         content: content.into(),
         content_hash: format!("hash-{run_id}"),
         idempotency_key: format!("idem-{run_id}"),
+        delivery_priority: 0,
+        run_sequence: 0,
         media_asset_id: media_asset_id.map(|id| id.to_hex()),
         referral_card_id: referral_card_id.map(|id| id.to_hex()),
         attempt: 0,

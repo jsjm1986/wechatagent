@@ -22,6 +22,24 @@ export const HOLD_CATEGORY_LABELS: Record<string, string> = {
   ai_waiting_for_more_context: "AI 等待更多上下文",
 };
 
+export const REVIEW_PHASE_LABELS: Record<string, string> = {
+  auto_rewrite_in_progress: "首稿未通过，正在自动改写",
+  auto_rewrite_approved: "自动改写已通过",
+  auto_rewrite_queued: "自动改写已通过，已进入发送队列",
+  auto_rewrite_sent: "自动改写已通过并已发送",
+  auto_rewrite_failed: "自动改写后仍未通过",
+  approved: "终审已通过",
+  queued: "已进入发送队列",
+  sent: "已发送",
+  partially_sent: "部分内容已发送",
+  final_blocked: "终审拦截，未发送",
+  gateway_blocked: "发送网关拦截，未发送",
+  delivery_failed: "发送失败",
+  delivery_canceled: "发送已取消",
+  delivery_unknown: "送达状态未知",
+  review_recorded: "复核已记录",
+};
+
 // gateway 过程态闭集由 gateway_status_values.fixture.json 对账，当前 38 值→中文。
 // 单一真相源:先展开 FINAL_REVIEW_STATUS_LABELS(两闭集交集键复用同一措辞,消除口径漂移),
 // 再补 gateway 独有的过程态键。default 回落原值(labelOf),未来新值不崩。

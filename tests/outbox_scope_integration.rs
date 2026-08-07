@@ -35,6 +35,8 @@ fn entry(workspace_id: &str, account_id: &str, status: &str, run_id: &str) -> Ou
         content: "do not cancel".into(),
         content_hash: format!("hash-{run_id}"),
         idempotency_key: format!("idem-{run_id}"),
+        delivery_priority: 0,
+        run_sequence: 0,
         media_asset_id: None,
         referral_card_id: None,
         attempt: 0,

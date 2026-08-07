@@ -214,6 +214,10 @@ async fn async_main() -> anyhow::Result<()> {
         tasks::run_task_worker(s).await;
     });
 
+    spawn_supervised(state.clone(), "inbound_reply_worker", |s| async move {
+        tasks::run_inbound_reply_worker(s).await;
+    });
+
     // 异步知识导入 worker。常开（异步导入的必需件，非可选部署行为，故不 gate）；
     // inert 时只是空轮询。认领 import_jobs pending → 跑分块抽取 → 回写进度/终态。
     spawn_supervised(state.clone(), "import_worker", |s| async move {
@@ -234,6 +238,11 @@ async fn async_main() -> anyhow::Result<()> {
         if let Err(err) = run_outbox_dispatcher(s).await {
             tracing::error!(?err, "outbox dispatcher exited");
         }
+    });
+
+    // Profile/memory projections are durable but intentionally off the customer-delivery path.
+    spawn_supervised(state.clone(), "post_decision_worker", |s| async move {
+        wechatagent::agent::run_post_decision_worker(s).await;
     });
 
     // HC-006 / SR-017: reconcile local content-addressed media immediately at
