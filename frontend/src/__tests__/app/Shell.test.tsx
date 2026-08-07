@@ -5,14 +5,13 @@ import { useNavigationStore, DEFAULT_COLLAPSED } from "../../stores/navigationSt
 import { useAuthStore } from "../../stores/authStore";
 import { CHANNELS, GROUP_ORDER } from "../../app/channels";
 
-/** 新分类（按「你在管什么对象」单一轴切分）。旧的五组混了三个轴：
- *  「日常/运营/知识与内容」是任务轴、「成效」是页面类型轴、「设置」是变更频率轴，
- *  三轴混在一列里，找东西时脑子要切标准。典型症状：请示被劈成两半（收件箱在最上、
- *  通道配置在最下）、自治回路/演化被归进「成效」（它们是系统自我调节，不是业务成效）。 */
+/** 分组按「每天是否必开」先切出「日常处置」，余下按「对谁做事 / 看什么 / 配什么」切。
+ *  这里硬编码一份是**故意的**：它与 GROUP_ORDER 对账（见末尾用例），
+ *  两边不一致时测试失败，防止改了 channels.ts 却漏改导航契约。 */
 const GROUPS = [
+  "日常处置",
   "客户运营",
   "知识资产",
-  "决策审批",
   "运行监控",
   "平台配置",
   "建设规划",
@@ -31,7 +30,7 @@ describe("Shell 导航（单列 + 独立折叠）", () => {
   it("展开态下，所有分组的频道同时渲染", async () => {
     seedExpanded();
     render(<Shell />);
-    // 跨 4 个不同分组各取一个：运行监控 / 客户运营 / 知识资产 / 平台配置。
+    // 跨 4 个不同分组各取一个：日常处置 / 客户运营 / 知识资产 / 平台配置。
     expect(await screen.findByText("工作台")).toBeInTheDocument();
     expect(screen.getByText("用户运营")).toBeInTheDocument();
     expect(screen.getByText("知识库 Wiki")).toBeInTheDocument();
@@ -55,8 +54,8 @@ describe("Shell 导航（单列 + 独立折叠）", () => {
   it("折叠是各组独立的，不互斥（收起一组不影响其它组）", () => {
     seedExpanded();
     render(<Shell />);
-    // 收起「运行监控」（含工作台）
-    fireEvent.click(screen.getByTestId("nav-group-运行监控"));
+    // 收起「日常处置」（含工作台）
+    fireEvent.click(screen.getByTestId("nav-group-日常处置"));
     expect(screen.queryByText("工作台")).not.toBeInTheDocument();
     // 其它组**仍然展开**——手风琴在这里会把它们全关掉。
     expect(screen.getByText("用户运营")).toBeInTheDocument();
@@ -70,7 +69,7 @@ describe("Shell 导航（单列 + 独立折叠）", () => {
   it("同一标签再点一次即展开回来（幂等开合）", () => {
     seedExpanded();
     render(<Shell />);
-    const label = screen.getByTestId("nav-group-运行监控");
+    const label = screen.getByTestId("nav-group-日常处置");
     fireEvent.click(label);
     expect(screen.queryByText("工作台")).not.toBeInTheDocument();
     expect(label).toHaveAttribute("aria-expanded", "false");
@@ -121,7 +120,7 @@ describe("Shell 导航（单列 + 独立折叠）", () => {
       collapsedGroups: new Set(DEFAULT_COLLAPSED),
     });
     render(<Shell />);
-    // 日常动线可见：客户运营 / 决策审批 / 运行监控
+    // 日常动线可见：日常处置 / 客户运营 / 运行监控
     expect(screen.getByText("用户运营")).toBeInTheDocument();
     expect(screen.getByText("统一收件箱")).toBeInTheDocument();
     expect(screen.getByText("工作台")).toBeInTheDocument();
@@ -134,7 +133,7 @@ describe("Shell 导航（单列 + 独立折叠）", () => {
   it("点频道即切换，展开态下跨组一步直达", () => {
     seedExpanded();
     render(<Shell />);
-    // 「系统策略」属「设置」组，与当前频道「工作台」（日常）不同组。
+    // 「系统策略」属「平台配置」，与当前频道「工作台」（日常处置）不同组。
     // 展开态下它本来就可见，一次点击直达——这正是手风琴要两步的那个场景。
     fireEvent.click(screen.getByText("系统策略").closest("button")!);
     expect(useNavigationStore.getState().activeChannel).toBe("systemStrategy");
