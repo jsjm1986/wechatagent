@@ -98,7 +98,10 @@
 
 /* 导航 */
 .nav { display: flex; flex-direction: column; gap: 0; flex: 1; overflow-y: auto; overflow-x: hidden; }
-.group + .group { margin-top: 8px; }
+/* 组间留白是分组感的主要来源——比任何分隔线都干净。此前 8px 只比行间距(1px)
+   大一点，五个组挤成一片，标题再怎么调也读不出「块」。实测 757px 视口下 nav
+   有 224px 余量，加到 20px 仍不滚动（矮视口由下方紧凑档逐级收回）。 */
+.group + .group { margin-top: var(--sp-5); }
 /* 组标题现在是可点的折叠开关（button）。必须显式重置全局裸 button 基线
    （background/border/min-height/font/justify-content），否则会继承出 38px 高、
    文字居中的蓝按钮外观。**justify-content 是必需的**：styles.css 给裸 button
@@ -146,17 +149,25 @@
 .groupLabel:active { transform: none; }
 /* 收起时朝右、展开时转 90° 朝下。transform 过渡比切换图标更稳（不闪）。
    14px 而非 12px：频道图标是 17px，12px 的 chevron 和它并置显得两套尺寸打架。 */
-/* justify-self: center —— chevron 在 20px 轨道内居中，与频道图标同轴。 */
-.groupChevron { flex-shrink: 0; opacity: .55; justify-self: center;
-  transition: transform .18s cubic-bezier(.2,.7,.3,1); }
+/* justify-self: center —— chevron 在 20px 轨道内居中，与频道图标同轴。
+   实色 #9a9aa1 而非 opacity:.55：opacity 会把描边压成灰雾，与 600 字重的标题
+   不是同一套语汇；实色能保持描边锐利，且色阶可控（明确弱于标题、强于计数）。
+   随标题一起 hover 转深——反馈落在整行而非只有文字。 */
+.groupChevron { flex-shrink: 0; justify-self: center; color: #9a9aa1;
+  transition: transform .18s cubic-bezier(.2,.7,.3,1), color .18s ease; }
+.groupLabel:hover .groupChevron { color: #6a6a72; }
 .groupChevronOpen { transform: rotate(90deg); }
 /* 收起时在标题右侧显示组内频道数，让用户知道里面有东西没丢。
-   色值比标题(#68686e)再深一档、pill 底再淡一档：角标文字压在 pill 上，可用底色
-   比侧栏更深，同色会掉到 4.35 不过 AA。注意侧栏是渐变(#fbfcfe→#f4f6fa)，
-   「成效/设置」位置偏下、底色更深，所以必须按**底部**色算而非顶部。 */
-.groupCount { margin-left: auto; font-size: 9.5px; font-weight: 600; letter-spacing: 0;
-  color: #626268; background: rgba(20,30,60,.05);
-  border-radius: 999px; padding: 1px 6px; }
+   改成**裸数字**（去掉灰底 pill）：pill 是通用后台的徽章语汇，在一条只有
+   文字与描边的标题行里凭空多出一个填充块，是这行最"廉价"的元素。数字本身
+   已经够表达数量，靠字号(10px，落在 --fs-micro 刻度上)与浅墨色区分即可。
+   #6e6e76 直接压在侧栏渐变上 4.67:1 过 AA（此前 9.5px 脱离刻度，且压在 pill
+   底上算对比度要按合成色，容易掉到门槛下——去掉 pill 顺带消掉这个陷阱）。
+   tabular-nums：数字等宽，多组并列时右缘不会因 1/5 字形宽度不同而参差。 */
+.groupCount { justify-self: end; font-size: var(--fs-micro); font-weight: 600;
+  letter-spacing: 0; color: #66666d; font-variant-numeric: tabular-nums;
+  transition: color .18s ease; }
+.groupLabel:hover .groupCount { color: #55555b; }
 /* 手风琴下「当前频道所在组」不再强制展开（那会让同时展开变 2 组、滚动条回来），
    定位感改由这个蓝点承担：组收起时若活跃频道在组内，标题旁点亮一颗。 */
 .groupActiveDot { width: 5px; height: 5px; border-radius: 50%; flex-shrink: 0;
@@ -260,8 +271,15 @@
 @media (max-height: 560px) {
   .side { --nav-row: 25px; --nav-icon: 15px; }
   .group + .group { margin-top: 1px; }
-  .groupLabel { padding-top: 0; padding-bottom: 0; font-size: var(--fs-micro); }
+  /* **不压标题字号**：压到 --fs-micro(10px) 会让父级又小于子级(13px)，
+     把本轮刚建立的父子层级倒挂回去。矮视口靠行高/留白省空间，不动字号。 */
+  .groupLabel { padding-top: 0; padding-bottom: 0; }
   .channel { margin: 0; }
+}
+/* 极端档（把窗口拖到很扁）：单独加一档而不是把 560 档改得更挤——
+   560 档在 417px 内高下是合适的，不该为更罕见的 397px 牺牲它的可点性。 */
+@media (max-height: 410px) {
+  .side { --nav-row: 21px; --nav-icon: 14px; }
 }
 
 /* 底部区：与侧栏一体（不是独立卡），顶部一条分隔线划分导航/账号用户区 */
