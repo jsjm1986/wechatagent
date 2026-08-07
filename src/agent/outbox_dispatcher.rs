@@ -744,6 +744,7 @@ async fn commit_sent_if_owned(
     if let Some(note) = note {
         set.insert("last_error", note);
     }
+    let unset = sent_unset_fields(note.is_some());
     let result = state
         .db
         .collection_agent_send_outbox()
@@ -751,17 +752,25 @@ async fn commit_sent_if_owned(
             filter,
             doc! {
                 "$set": set,
-                "$unset": {
-                    "worker_id": "",
-                    "locked_until": "",
-                    "claim_token": "",
-                    "reclaimed_in_flight": "",
-                },
+                "$unset": unset,
             },
             None,
         )
         .await?;
     Ok(result.matched_count == 1)
+}
+
+fn sent_unset_fields(preserve_diagnostic_note: bool) -> Document {
+    let mut unset = doc! {
+        "worker_id": "",
+        "locked_until": "",
+        "claim_token": "",
+        "reclaimed_in_flight": "",
+    };
+    if !preserve_diagnostic_note {
+        unset.insert("last_error", "");
+    }
+    unset
 }
 
 async fn mark_delivery_unknown_if_owned(
@@ -1457,76 +1466,76 @@ async fn finalize_delivered_text_decision(
                 .as_ref()
                 .filter(|follow_up| follow_up.needed && !follow_up.content.trim().is_empty())
             {
-                let defaults = crate::models::RuntimeParametersTyped::default();
-                let max_pending = review
-                    .runtime_parameters_snapshot
-                    .get_i64("maxPendingFollowUps")
-                    .unwrap_or(defaults.max_pending_follow_ups);
-                let expires_hours = review
-                    .runtime_parameters_snapshot
-                    .get_i64("followUpExpiresHours")
-                    .unwrap_or(defaults.follow_up_expires_hours);
-                let pending_count = state
-                    .db
-                    .tasks()
-                    .count_documents(
-                        doc! {
-                            "workspace_id": &entry.workspace_id,
-                            "account_id": &entry.account_id,
-                            "contact_wxid": &entry.contact_wxid,
-                            "kind": "follow_up",
-                            "status": "pending",
-                        },
-                        None,
-                    )
-                    .await?;
-                if pending_count < max_pending.max(0) as u64 {
-                    let (run_at, degraded) = super::types::resolve_run_at_or_degrade(
-                        &follow_up.run_at,
-                        DateTime::now().timestamp_millis(),
-                        0,
-                    );
-                    let expires_at = DateTime::from_millis(
-                        run_at.timestamp_millis() + expires_hours.max(0) * 60 * 60 * 1000,
-                    );
-                    let now = DateTime::now();
-                    let task = AgentTask {
-                        id: None,
-                        workspace_id: entry.workspace_id.clone(),
-                        account_id: entry.account_id.clone(),
-                        contact_wxid: entry.contact_wxid.clone(),
-                        kind: "follow_up".to_string(),
-                        run_at,
-                        expires_at: Some(expires_at),
-                        content: follow_up.content.clone(),
-                        status: "pending".to_string(),
-                        source_decision_id: Some(decision_id),
-                        review_required: true,
-                        attempt_count: 0,
-                        max_attempts: 3,
-                        next_retry_at: None,
-                        gateway_status: Some(if degraded {
-                            "run_at_degraded_after_delivery".to_string()
-                        } else {
-                            "scheduled_after_delivery".to_string()
-                        }),
-                        cancel_reason: None,
-                        error: None,
-                        claimed_at: None,
-                        claim_recovery_count: 0,
-                        created_at: now,
-                        updated_at: now,
-                    };
-                    let task_doc = mongodb::bson::to_document(&task)?;
-                    state
+                if let Some(run_at) = super::types::parse_follow_up_run_at(&follow_up.run_at) {
+                    let defaults = crate::models::RuntimeParametersTyped::default();
+                    let max_pending = review
+                        .runtime_parameters_snapshot
+                        .get_i64("maxPendingFollowUps")
+                        .unwrap_or(defaults.max_pending_follow_ups);
+                    let expires_hours = review
+                        .runtime_parameters_snapshot
+                        .get_i64("followUpExpiresHours")
+                        .unwrap_or(defaults.follow_up_expires_hours);
+                    let pending_count = state
                         .db
                         .tasks()
-                        .update_one(
-                            doc! { "_id": decision_id },
-                            doc! { "$setOnInsert": task_doc },
-                            UpdateOptions::builder().upsert(true).build(),
+                        .count_documents(
+                            doc! {
+                                "workspace_id": &entry.workspace_id,
+                                "account_id": &entry.account_id,
+                                "contact_wxid": &entry.contact_wxid,
+                                "kind": "follow_up",
+                                "status": "pending",
+                            },
+                            None,
                         )
                         .await?;
+                    if pending_count < max_pending.max(0) as u64 {
+                        let expires_at = DateTime::from_millis(
+                            run_at.timestamp_millis() + expires_hours.max(0) * 60 * 60 * 1000,
+                        );
+                        let now = DateTime::now();
+                        let task = AgentTask {
+                            id: None,
+                            workspace_id: entry.workspace_id.clone(),
+                            account_id: entry.account_id.clone(),
+                            contact_wxid: entry.contact_wxid.clone(),
+                            kind: "follow_up".to_string(),
+                            run_at,
+                            expires_at: Some(expires_at),
+                            content: follow_up.content.clone(),
+                            status: "pending".to_string(),
+                            source_decision_id: Some(decision_id),
+                            review_required: true,
+                            attempt_count: 0,
+                            max_attempts: 3,
+                            next_retry_at: None,
+                            gateway_status: Some("scheduled_after_delivery".to_string()),
+                            cancel_reason: None,
+                            error: None,
+                            claimed_at: None,
+                            claim_recovery_count: 0,
+                            created_at: now,
+                            updated_at: now,
+                        };
+                        let task_doc = mongodb::bson::to_document(&task)?;
+                        state
+                            .db
+                            .tasks()
+                            .update_one(
+                                doc! { "_id": decision_id },
+                                doc! { "$setOnInsert": task_doc },
+                                UpdateOptions::builder().upsert(true).build(),
+                            )
+                            .await?;
+                    }
+                } else {
+                    tracing::warn!(
+                        decision_id = %decision_id,
+                        run_id = %entry.run_id,
+                        raw_run_at = %follow_up.run_at,
+                        "skipping follow-up with missing or invalid run_at"
+                    );
                 }
             }
         }
@@ -3207,6 +3216,15 @@ async fn tick(state: &AppState, worker: &str, lease_seconds: i32) -> AppResult<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordinary_success_clears_stale_error_but_post_hoc_note_is_preserved() {
+        let ordinary = sent_unset_fields(false);
+        assert!(ordinary.contains_key("last_error"));
+
+        let post_hoc = sent_unset_fields(true);
+        assert!(!post_hoc.contains_key("last_error"));
+    }
 
     #[test]
     fn task_send_authorization_requires_same_claim_decision_and_marker() {

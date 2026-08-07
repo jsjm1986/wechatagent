@@ -870,12 +870,16 @@ impl LlmProvider for LlmClient {
     }
 
     async fn generate_json_with_usage(&self, system: &str, user: &str) -> AppResult<LlmJsonResult> {
+        let call_started_at = Instant::now();
         let mut last_error: Option<AppError> = None;
         let mut retry_count: u32 = 0;
         for attempt in 1..=self.max_retries {
             match self.generate_json_once(system, user).await {
                 Ok((mut value, _)) => {
                     value.retry_count = retry_count;
+                    // Report the complete caller-visible latency, including failed attempts and
+                    // retry backoff, rather than only the final successful HTTP request.
+                    value.latency_ms = call_started_at.elapsed().as_millis() as i64;
                     return Ok(value);
                 }
                 Err(error) if attempt < self.max_retries && is_retryable_llm_error(&error) => {
@@ -2516,5 +2520,68 @@ mod tests {
             .await
             .expect("matching request headers must reach the mock");
         assert_eq!(response.get("ok").and_then(Value::as_bool), Some(true));
+    }
+
+    #[tokio::test]
+    async fn retry_latency_includes_failed_attempt_and_backoff() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+        #[derive(Clone)]
+        struct FailOnce {
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl Respond for FailOnce {
+            fn respond(&self, _request: &Request) -> ResponseTemplate {
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(503)
+                } else {
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "choices": [{ "message": { "content": "{\"ok\":true}" } }],
+                        "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+                    }))
+                }
+            }
+        }
+
+        let server = MockServer::start().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(FailOnce {
+                calls: Arc::clone(&calls),
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let client = LlmClient::new(
+            format!("{}/v1", server.uri()),
+            "test-key".into(),
+            "test-model".into(),
+            10,
+            2,
+            100,
+        )
+        .expect("build client");
+        let wall_started = Instant::now();
+        let result = client
+            .generate_json_with_usage("Return JSON.", "Return {\"ok\":true}.")
+            .await
+            .expect("second attempt succeeds");
+        let wall_ms = wall_started.elapsed().as_millis() as i64;
+
+        assert_eq!(result.retry_count, 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(
+            result.latency_ms >= 100,
+            "latency must include retry backoff"
+        );
+        assert!((wall_ms - result.latency_ms).abs() < 50);
     }
 }

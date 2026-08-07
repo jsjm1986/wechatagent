@@ -1680,38 +1680,20 @@ pub(crate) fn parse_rfc3339_to_bson(value: &str) -> Option<mongodb::bson::DateTi
     mongodb::bson::DateTime::parse_rfc3339_str(value).ok()
 }
 
-/// 解析 LLM 给出的 follow_up.run_at（RFC3339）；解析失败时**降级**到
-/// `now + degrade_offset_ms` 而非静默丢弃整条跟进任务。
-///
-/// #66：此前 gateway 用 `if let Some(run_at) = parse_rfc3339_to_bson(..)` 无 else
-/// 分支——LLM 给空串 / 非法格式（prompt 模板 runAt 默认空串、无格式约束）时整条
-/// follow_up 无声蒸发、无日志无事件。降级到"现在 + 偏移"后任务仍会入队，由
-/// precheck 的 context_changed / expired 正常守门；返回的 bool 标记是否走了降级，
-/// 供调用方写审计事件。
-pub(crate) fn resolve_run_at_or_degrade(
-    raw: &str,
-    now_ms: i64,
-    degrade_offset_ms: i64,
-) -> (mongodb::bson::DateTime, bool) {
-    match parse_rfc3339_to_bson(raw) {
-        Some(dt) => (dt, false),
-        None => (
-            mongodb::bson::DateTime::from_millis(now_ms.saturating_add(degrade_offset_ms)),
-            true,
-        ),
-    }
+/// Parse an LLM-proposed follow-up time. Invalid or missing times are rejected:
+/// guessing a fallback can turn a future reminder into an immediate duplicate.
+pub(crate) fn parse_follow_up_run_at(raw: &str) -> Option<mongodb::bson::DateTime> {
+    parse_rfc3339_to_bson(raw.trim())
 }
 
 #[cfg(test)]
-mod run_at_degrade_tests {
-    use super::resolve_run_at_or_degrade;
+mod follow_up_run_at_tests {
+    use super::parse_follow_up_run_at;
 
     #[test]
-    fn valid_rfc3339_parses_without_degrade() {
-        // 用 UTC 整点避免时区换算的魔数；与 bson 自身解析对照，不硬编码毫秒。
+    fn valid_rfc3339_is_accepted() {
         let raw = "2026-06-12T00:00:00Z";
-        let (dt, degraded) = resolve_run_at_or_degrade(raw, 0, 999);
-        assert!(!degraded, "合法 RFC3339 不应降级");
+        let dt = parse_follow_up_run_at(raw).expect("valid RFC3339");
         assert_eq!(
             dt.timestamp_millis(),
             mongodb::bson::DateTime::parse_rfc3339_str(raw)
@@ -1721,19 +1703,14 @@ mod run_at_degrade_tests {
     }
 
     #[test]
-    fn empty_string_degrades_to_now_plus_offset() {
-        let now_ms = 1_000_000;
-        let (dt, degraded) = resolve_run_at_or_degrade("", now_ms, 3_600_000);
-        assert!(degraded, "空串应降级");
-        assert_eq!(dt.timestamp_millis(), now_ms + 3_600_000);
+    fn empty_string_is_rejected_instead_of_becoming_immediate() {
+        assert!(parse_follow_up_run_at("").is_none());
+        assert!(parse_follow_up_run_at("   ").is_none());
     }
 
     #[test]
-    fn garbage_degrades_to_now_when_offset_zero() {
-        let now_ms = 5_000;
-        let (dt, degraded) = resolve_run_at_or_degrade("明天下午", now_ms, 0);
-        assert!(degraded, "非法格式应降级");
-        assert_eq!(dt.timestamp_millis(), now_ms, "offset=0 时降级到 now");
+    fn natural_language_time_is_rejected_instead_of_becoming_immediate() {
+        assert!(parse_follow_up_run_at("明天下午").is_none());
     }
 }
 
