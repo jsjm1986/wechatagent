@@ -3,13 +3,15 @@
 /* 侧栏：从顶（品牌）到底（用户）贯通的 flex 列。
    易读基调=白卡基底，但底色微调冷（near-white 渐变）让激活白卡能浮起；
    右缘 + 内嵌高光是玻璃"点缀"，给一张平白侧栏立体感。 */
-/* 纯色表面 + 单条 hairline：原先是 176deg 近白渐变加内嵌高光，
-   那是拟物残留，且渐变会让激活项的淡色底在不同高度看起来深浅不一。
-   左右内边距 12px = 与频道行内缩同源，整列左基线才对齐。 */
+/* 渐变底 + 右缘内嵌高光：这是这个产品的既有观感，不是可有可无的装饰——
+   近白渐变让激活项的白卡能"浮"起来（纯色底上白卡浮不出来）。曾一度改成纯色
+   #f7f8fa，视觉上确实更"干净"，但也把立体感一起抹掉了，观感变平。
+   内边距仍走刻度（20/12/16），左右 12px 与频道行内缩同源，整列左基线才对齐。 */
 .side {
   width: 252px; flex-shrink: 0; padding: var(--sp-5) var(--sp-3) var(--sp-4);
-  background: var(--surface-nav);
+  background: linear-gradient(176deg, #fbfcfe 0%, #f4f6fa 100%);
   border-right: 1px solid var(--hairline);
+  box-shadow: inset -1px 0 1px rgba(255,255,255,.7), 1px 0 0 rgba(0,0,0,.012);
   display: flex; flex-direction: column;
   position: sticky; top: 0; height: 100vh;
 }
@@ -170,21 +172,24 @@
   font-family: inherit; letter-spacing: -.2px; box-shadow: none;
   transition: background .15s ease, color .15s ease;
 }
-/* hover 不再位移（translateX 会让整列在鼠标掠过时抖动），只换底色。 */
-.channel:hover { color: var(--ink-1); background: var(--fill-nav-hover); box-shadow: none; }
-/* 图标改实色 + 轨道内居中：原先统一 opacity:.5 形成一整列灰 glyph，与文字并行
-   竞争，是「通用后台模板」最典型的观感。实色但比文字浅一档，让图标成为文字的
-   一部分而非独立灰列。 */
-.channel svg { justify-self: center; color: var(--ink-nav-icon);
-  transition: color .15s ease; }
-/* 激活态：从五个信号（白卡渐变 + 三层阴影 + 呼吸光条 + 蓝图标 + 加粗）减到两个
-   （淡底 + 加粗）。克制是高级感的主要来源；五种手段叠加只显得用力。
-   图标在激活行跟随文字转深，不单独染蓝——少一种颜色即少一个噪声源。 */
+/* hover 白玻璃底 + 轻微右移，与激活白卡同族。 */
+.channel:hover { color: var(--ink-1); background: rgba(255,255,255,.62);
+  box-shadow: none; transform: translateX(2px); }
+/* 图标半透明压暗（opacity 而非实色）：与白卡激活态是同一套玻璃语汇，
+   激活行再把 opacity 提到 1 并染蓝，弱→强的过渡才连贯。
+   justify-self:center —— 在 20px 轨道内居中，与组标题 chevron 同轴，
+   所以所有文字严格对齐同一竖线（这条对齐是上一轮的成果，保留）。 */
+.channel svg { justify-self: center; opacity: .5;
+  transition: opacity .2s ease, color .2s ease; }
+/* 激活态：白玻璃浮起卡片（渐变 + 三层阴影）+ 蓝图标 + 加粗 + 左侧呼吸光条。
+   注：曾一度精简到「淡底 + 加粗」两个信号，但玻璃质感是本产品的基调，
+   去掉后整条侧栏失去立体感，故恢复。 */
 .active, .active:hover {
-  color: var(--ink-1); font-weight: 600;
-  background: var(--fill-nav-active); box-shadow: none;
+  color: var(--ink-1); font-weight: 600; transform: none;
+  background: linear-gradient(135deg, rgba(255,255,255,.98), rgba(255,255,255,.78));
+  box-shadow: 0 4px 14px -5px rgba(20,30,60,.18), inset 0 1.5px 1px rgba(255,255,255,.95), inset 0 0 0 1px rgba(255,255,255,.55);
 }
-.active svg { color: var(--ink-1); }
+.active svg { color: var(--color-scheduled); opacity: 1; }
 /* 未上线占位频道：弱化但可读，不可点（div 而非 button，无 hover 位移）。
    **必须定义在 .channel 之后**：两者同为单类选择器、特异性相同，靠源码顺序
    决胜。写在前面会被 .channel 的 color 覆盖，占位项和正常频道一模一样
@@ -202,9 +207,16 @@
 .soonBadge { font-size: var(--fs-micro); font-weight: 600; letter-spacing: 0;
   color: #68686e; border: 1px solid var(--hairline);
   border-radius: 999px; padding: 1px 6px; white-space: nowrap; }
-/* 原先激活行还有一条 3px 蓝光条 + 3.6s 无限呼吸动画。已删除：
-   常驻动画在静态界面里是持续的注意力税，且它是激活态的第五个信号
-   （白卡 + 三层阴影 + 光条 + 蓝图标 + 加粗）。淡底 + 加粗两个信号已经够表达选中。 */
+/* 标志性的左侧呼吸蓝光条——只在激活频道，慢节奏吸气。
+   高度用 em 而非固定 px：行高现在由 --nav-row 驱动、矮视口会变，
+   写死 18px 在紧凑档会顶出行外。1.35em ≈ 18px @13.5px 字号。 */
+.active::before {
+  content: ''; position: absolute; left: 1px; top: 50%;
+  width: 3px; height: 1.35em; margin-top: -.675em; border-radius: 3px;
+  background: var(--color-scheduled); box-shadow: 0 0 8px 1px rgba(10,132,255,.5);
+  animation: chRail 3.6s ease-in-out infinite;
+}
+@keyframes chRail { 0%,100% { opacity: .45; transform: scaleY(.65); } 50% { opacity: 1; transform: scaleY(1); } }
 
 /* 矮视口紧凑档：手风琴把同时展开压到 1 组（最坏 5 行 = 389px），但 nav 可用高
    约等于「视口高 − 197px」（品牌区/页脚/内边距），所以视口低于约 586px 时
