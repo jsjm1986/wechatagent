@@ -96,65 +96,40 @@
   color: #d6342a; background: var(--fill-blocked); border-radius: var(--r-sm);
 }
 
-/* 导航 = 图标轨（分组）+ 二级面板（该组频道）。
-   替代了此前的手风琴。手风琴不是设计选择、是高度妥协：nav 可用高约 550px，
-   20 频道全展开需 1042px、两组同展 612px，只能锁成「同时一组」，代价是跨组
-   切频道要两步且内容跳动。现在一次只渲染一组（最坏 5 行 ≈ 220px），任何视口
-   都放得下——原来 6 档把行高压到 21px 的紧凑响应因此全部删除。
-   轨 56 + 面板 196 = 252，与改造前侧栏总宽一致，主区不位移。 */
-.navWrap { display: grid; grid-template-columns: 56px 1fr; flex: 1; min-height: 0; gap: 0; }
-/* 轨与面板之间一条极淡竖线：不分隔的话两块近白区域会糊成一片、读不出「轨」。
-   用 box-shadow 而非 border——border 会吃掉 1px 布局宽度，让 56+196 的账不平。 */
-.rail {
-  display: flex; flex-direction: column; align-items: center; gap: 2px;
-  padding-top: 2px; box-shadow: inset -1px 0 0 rgba(20,30,60,.055);
-}
-/* 轨按钮：40×40 命中区（>= 40px 是指针目标的通行下限，WCAG 2.5.8 要求 24px，
-   这里给足）。必须显式重置全局裸 button 基线，否则继承出蓝底 38px 高的按钮。 */
-.railBtn {
-  display: flex; align-items: center; justify-content: center;
-  width: 40px; height: 40px; flex-shrink: 0; padding: 0;
-  border-radius: var(--r-nav); cursor: pointer;
-  background: none; border: none; box-shadow: none; min-height: 0;
-  color: #6e6e76; position: relative;
-  transition: background .15s ease, color .15s ease;
-}
-.railBtn:hover { background: rgba(255,255,255,.72); color: var(--ink-1);
-  border-color: transparent; box-shadow: none; transform: none; }
-.railBtn:active { transform: none; }
-/* 选中态：白玻璃卡片 + 深墨图标。与频道激活态同族语汇（都是"白卡浮起"），
-   但不染蓝——蓝留给唯一的激活频道，轨上选中只表示"面板在看这组"。 */
-.railBtnOn, .railBtnOn:hover {
-  color: var(--ink-1);
-  background: linear-gradient(135deg, rgba(255,255,255,.98), rgba(255,255,255,.8));
-  box-shadow: 0 3px 10px -4px rgba(20,30,60,.16), inset 0 0 0 1px rgba(255,255,255,.6);
-}
-/* 活跃频道在本组、但轨上正看着别的组 → 右上角打点，保住定位感。
-   （选中态自己已有高亮，不叠点。） */
-.railDot {
-  position: absolute; top: 7px; right: 7px;
-  width: 5px; height: 5px; border-radius: 50%;
-  background: var(--color-scheduled);
-  box-shadow: 0 0 0 1.5px rgba(255,255,255,.9);
-}
-/* 二级面板：只渲染当前组的频道。overflow-y 是纯兜底——最大组 5 行远放得下，
-   留着是防以后某组长到 10 项时不至于溢出到页脚。 */
-.panel { display: flex; flex-direction: column; gap: 0;
-  padding-left: var(--sp-3); min-height: 0; overflow-y: auto; overflow-x: hidden; }
-/* 面板标题 = 当前分组名。它现在是纯标签（不可点、没有 chevron/计数），
-   因为"切换"这件事已经完全交给轨了——标题只需回答"我在看哪组"。
-   13.5px/600/#33333a（11.58:1）比频道行的 13px/#5d5d63（6.04:1）更大更深，
-   父子层级靠字号+墨色，不靠缩进（缩进现在由轨本身提供）。 */
-.panelTitle {
-  margin: 0 0 var(--sp-2); padding: 0 var(--sp-3);
+/* 导航 = 单列 + 常显分组标签。全部 20 个频道恒可见，超出则整列滚动。
+   这是撤掉两轮妥协后的形态。两轮都错在把「侧栏不能出滚动条」当成硬约束：
+     1) 手风琴（同时只展开一组）——跨组切频道要两步、内容跳动；
+     2) 图标轨 + 二级面板——拿宽度换高度。实测账：侧栏 252 减左右内边距只剩
+        228 内容区，轨吃 56，面板 172，再减面板内边距 12 / 行内边距 24 /
+        图标轨道 20 / 间距 12 后文字列仅 104px；带「未上线」角标的行只剩 48px，
+        而「微信群运营」需 65px → 换行。中文标签比英文更缺宽度，这笔交换方向就错了。
+   导航滚动本身是完全正常的（VS Code / Linear / Notion 侧栏都滚）。单列把整个
+   172px 文字列还给频道名，无换行、零学习成本，代价只是需要滚动。
+   overflow-y:auto 现在是**预期行为**而非兜底，所以不再需要任何按视口高压行距的
+   紧凑档（那 6 档已随手风琴一起删除，不要再加回来）。 */
+.nav { display: flex; flex-direction: column; gap: 0; flex: 1;
+  min-height: 0; overflow-y: auto; overflow-x: hidden; }
+/* 组间留白是分组感的唯一来源——比分隔线干净。组内行距是 1px，组间 20px，
+   两者差一个量级，才读得出「块」。 */
+.group + .group { margin-top: var(--sp-5); }
+/* 分组标签：静态文字，不是 button。
+   它不再承担任何交互（展开/收起/切面板全部取消），只回答「这是哪一类」，
+   所以既不给 cursor:pointer 也不给 hover 反馈——否则是可点的错误暗示。
+   13.5px/600/#33333a（11.58:1）对 频道行 13px/#5d5d63（6.04:1）：
+   父级必须更大更深。曾经试过把标签压成 11px 小字（照英文小标签的做法），
+   结果中文没有大小写差异、缩小就只是变弱，撑不起父级，读起来像频道的附属物。 */
+.groupLabel {
+  margin: 0 0 var(--sp-1); padding: 0 var(--sp-3);
   font-size: var(--fs-group); font-weight: 600; color: #33333a; letter-spacing: -.2px;
 }
 /* 频道行（面板内的二级项）。
    grid 而非 flex：图标占固定 20px 轨道，所有频道名严格对齐在同一条竖线上。
    此前是 flex + gap，图标宽度只要有 1px 差异文字起点就跟着漂。
    行高走 --nav-row(36px)，不再用 padding 撑，密度可预测。
-   不再需要 --nav-indent 右缩：父子层级现在由「轨 vs 面板」的空间分区表达，
-   比缩进更强，缩进反而让面板左缘参差。 */
+   不做 --nav-indent 右缩：父子层级由分组标签的字号(13.5 vs 13)+墨色
+   (#33333a 11.58:1 vs #5d5d63 6.04:1)承担，已经够读。再叠一层缩进会白白吃掉
+   本轮好不容易要回来的文字宽度——「微信群运营 + 未上线角标」正是差这几个 px
+   才换行的，不能再让缩进拿走。 */
 .channel {
   display: grid; align-items: center;
   grid-template-columns: var(--nav-rail) 1fr auto;
@@ -215,24 +190,22 @@
   background: var(--color-scheduled);
 }
 
-/* 矮视口：原来这里有 6 档紧凑响应，把行高从 36px 一路压到 21px、图标压到 14px。
+/* 矮视口：这里曾有 6 档紧凑响应，把行高从 36px 一路压到 21px、图标压到 14px。
    它们存在的唯一理由是手风琴的高度账不够用——20 个频道分 5 组，两组同展就要
    612px > 可用 550px，于是只能靠不断压密度硬塞。副作用是密度不可预测：
-   同一个侧栏在不同窗口高度下有 7 种行高，21px 的行早已低于可点下限（44px 是
-   触控推荐值，桌面也不该低于 28px）。
+   同一条侧栏在不同窗口高度下有 7 种行高，21px 早已低于可点下限。
 
-   图标轨把这笔账彻底改写：一次只渲染一组，最坏 5 行 × 36px + 标题 ≈ 220px，
-   任何视口都放得下，所以 6 档全部删除、行高恒定 36px。
-   真的不够高时（把窗口拖到极扁）由 .panel 的 overflow-y:auto 兜住——
-   让它滚动比把行高压到点不准更合理。 */
+   单列 + 允许滚动之后这笔账根本不需要算：行高恒定 36px，高度不够就滚。
+   **不要再加回任何 max-height 紧凑档**——压密度换"不滚动"是笔坏交易，
+   本项目已经在这上面走过两轮弯路（手风琴、图标轨）。 */
 
-/* 窄屏：图标轨保留（56px 已经很省），面板收窄，不做浮层化。
-   浮层化（点图标弹出、选完收起）在桌面端是负优化——鼠标用户会失去"当前组有哪些
-   频道"的常驻可见性，每次切频道都要多一次点击。真正的窄屏（平板竖屏及以下）
-   应该整条侧栏变抽屉，那是独立一轮的改造，不在本轮范围。 */
+/* 窄屏：整条侧栏收窄，导航仍是单列。
+   算过账：216px 减左右内边距 24 = 192 内容区，减行内边距 24 = 168，
+   减图标轨 20 + 两个 gap 24 = 124 给「文字 + 角标」，角标约 48px，
+   文字列仍有 76px > 「微信群运营」需要的 65px，不换行。
+   真正的窄屏（平板竖屏及以下）应整条侧栏变抽屉，那是独立一轮，不在本轮范围。 */
 @media (max-width: 1100px) {
   .side { width: 216px; }
-  .panel { width: 160px; }
 }
 
 /* 底部区：与侧栏一体（不是独立卡），顶部一条分隔线划分导航/账号用户区 */
