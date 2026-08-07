@@ -18,9 +18,14 @@ import type { ChannelGroup } from "../app/channels";
  *  现在滚动是被允许的（VS Code / Linear / Notion 侧栏都滚），所以**互斥这个约束
  *  根本不必要**。各组独立折叠：想全开就全开（滚动兜住），想全收就全收，
  *  跨组切频道一步到位、无跳动。折叠在这里只是"减少滚动距离"的便利，不是高度妥协。 */
-const STORAGE_KEY = "wa.nav.collapsed";
-/** 历史 key 全部清理：语义都与现在不兼容（前两个见上方注释，第三个存的是旧数组格式）。 */
+/** key 带 v2 后缀：分组重命名（日常/运营/知识与内容/成效/设置 → 运营对象/AI 的资料/
+ *  需要你决策/运行与结果/系统/即将上线）后，旧值里的组名在新白名单下全部非法。
+ *  若沿用同一个 key，过滤后会得到**空集合** = 全部展开 = 立刻滚动，而不是回落到
+ *  新的默认折叠。换 key 让老用户走 `raw === null` 分支拿到 DEFAULT_COLLAPSED。 */
+const STORAGE_KEY = "wa.nav.collapsed.v2";
+/** 历史 key 全部清理：语义都与现在不兼容（见上方注释与 v2 说明）。 */
 const LEGACY_KEYS = [
+  "wa.nav.collapsed",
   "wa.nav.activeGroup",
   "wa.nav.expandedGroup",
   "wa.nav.collapsedGroups",
@@ -29,21 +34,30 @@ const LEGACY_KEYS = [
 /** 合法分组白名单：localStorage 里可能是旧格式或用户手改的脏值。
  *  不校验就会让某个不存在的组名一直留在集合里（无害但会累积）。 */
 const VALID_GROUPS: ReadonlyArray<ChannelGroup> = [
-  "日常",
-  "运营",
-  "知识与内容",
-  "成效",
-  "设置",
+  "运营对象",
+  "AI 的资料",
+  "需要你决策",
+  "运行与结果",
+  "系统",
+  "即将上线",
 ];
 
 /** 首次进入时默认收起的组。
  *
- *  按"是否每天要用"切：「成效」是看结果与审计、「设置」配好就不常动，
- *  都不是日常动线上的东西，收起它们最省滚动且几乎不影响常用路径。
- *  日常/运营/知识与内容保持展开 = 12 行 ≈ 596px，实测在 900 与 800 高的视口都不滚动。
+ *  分组从 5 组变 6 组后，标签 + 组间距的固定开销从 179px 涨到 218px（6 个标签 ×
+ *  23px + 5 个间距 × 16px），可放行数上限降到 10。所以默认必须收起 3 组才不滚：
+ *    - 「系统」        —— 账号/模型/策略/自治回路/演化，配好就不动
+ *    - 「即将上线」     —— 两个占位频道，点不了
+ *    - 「AI 的资料」    —— 知识库/话术/名片，配一次用很久，不是每天改
+ *  余下「运营对象」「需要你决策」「运行与结果」展开 = 10 行 ≈ 578px，
+ *  实测 1440×900 下可用 611px，余 33px 不滚动。
  *
  *  导出供测试复用，避免测试里硬编码一份漂移的默认值。 */
-export const DEFAULT_COLLAPSED: ReadonlyArray<ChannelGroup> = ["成效", "设置"];
+export const DEFAULT_COLLAPSED: ReadonlyArray<ChannelGroup> = [
+  "AI 的资料",
+  "系统",
+  "即将上线",
+];
 
 /** localStorage 可能不可用（隐私模式抛异常）或存着脏数据，故读写都兜住。 */
 function loadCollapsed(): Set<ChannelGroup> {
