@@ -113,27 +113,36 @@
    小而粗的宽字距是侧栏分类标签的标准写法——结构感来自字重与字距，次要感来自
    字号与颜色，两者不冲突，所以既读得出是标题、又不会盖过 13.5px/--ink-2 的频道名。 */
 /* 中文字距修正：1.2px 是照英文小标签的做法，中文加宽字距会「散」，
-   收到 .2px——标签感靠字重(700)与留白建立，不靠拉开汉字。
+   收到 0——标签感靠字号与字重建立，不靠拉开汉字。
    grid 而非 flex：chevron 占与频道图标同一条 20px 轨道，
    所以组标题文字与频道名严格对齐在同一竖线上（整齐与凑合的分界）。
-   四列 = 轨道 / 标题 / 活跃点 / 计数；无活跃点时计数落到第 3 列，仍贴右。 */
+   四列 = 轨道 / 标题 / 活跃点 / 计数；无活跃点时计数落到第 3 列，仍贴右。
+
+   **父级必须比子级更大更深**（本轮修正）：此前标题 11px/#636369 比频道
+   13.5px/#515156 更小更浅，读起来像频道的附属物而非父级——「分类等级比频道低」。
+   小而粗的宽字距那套写法（Linear 等）成立的前提是英文全大写小标签，中文没有
+   大小写差异，缩小就只是变弱，撑不起父级。改为父级 13.5px/600/#33333a(11.58:1)，
+   子级降到 13px/#5d5d63(6.04:1) 并整行右缩，靠**字号+墨色+缩进**三者同向表达
+   父子，而不是让两者在同一坐标轴上比大小。 */
 .groupLabel { display: grid; align-items: center;
   grid-template-columns: var(--nav-rail) 1fr auto auto;
   gap: var(--nav-gap); width: 100%;
-  font-size: var(--fs-label); color: #636369; font-weight: 700; letter-spacing: .2px;
+  font-size: var(--fs-group); color: #33333a; font-weight: 600; letter-spacing: -.2px;
   padding: var(--sp-3) var(--sp-3) var(--sp-1);
   background: none; border: none; box-shadow: none; min-height: 0;
   font-family: inherit; text-align: left; cursor: pointer;
   transition: color .18s ease; }
 /* 全局 button:hover 会刷深蓝底 + 投影、:active 会下沉 1px。组标题是导航标签、
    不是操作按钮，必须逐条压掉，否则鼠标掠过侧栏会闪出一条深蓝条。 */
-/* hover 只提一档到 --ink-2（不到 --ink-1）：给出可点反馈，但不让标题在 hover 时
-   反超频道名的重量。 */
-.groupLabel:hover { color: var(--ink-2); background: none; border-color: transparent;
+/* hover 提到最深一档。标题现在是父级，hover 变深是正确方向——
+   此前 hover 是提到 --ink-2(#515156)，那在新层级下反而比标题基础色更浅，会倒挂。 */
+.groupLabel:hover { color: var(--ink-1); background: none; border-color: transparent;
   box-shadow: none; }
-/* 展开态的标题略深一档：当前所在分组是用户的位置锚点，比收起的组更该被看到。
-   仍浅于频道名，不抢重量。 */
-.groupLabelOpen { color: #5d5d63; }
+/* 展开态即用户当前所在分组，是位置锚点，用最深一档。收起的组保持 #33333a。 */
+/* 展开态略深一档，但**不到 --ink-1**：激活频道用的就是 ink-1，
+   若标题也用 ink-1，侧栏就有两个「最深」元素，激活项的唯一性被稀释。
+   #2b2b30(13.02:1) 深于收起态 #33333a，仍浅于激活项。 */
+.groupLabelOpen { color: #2b2b30; }
 .groupLabel:active { transform: none; }
 /* 收起时朝右、展开时转 90° 朝下。transform 过渡比切换图标更稳（不闪）。
    14px 而非 12px：频道图标是 17px，12px 的 chevron 和它并置显得两套尺寸打架。 */
@@ -161,14 +170,20 @@
    （与组标题的 chevron 同轨）。此前是 flex + gap，图标宽度只要有 1px 差异
    文字起点就跟着漂——这是「整齐」与「凑合」的分界。
    行高走 --nav-row(36px)，不再用 padding 撑，密度可预测。 */
+/* 子级缩进 + 略浅墨色：父子关系必须靠**缩进**建立，不能只靠字号。
+   此前标题与频道文字都落在同一条竖线（textLeft 都是 56），完全平级，
+   于是层级只能由字号承担——而标题字号又更小，读起来就成了「分类比频道低一级」。
+   现在整行右缩 --nav-indent(8px)，频道退到 #5d5d63(6.04:1)，
+   与标题 13.5px/600/#33333a(11.58:1) 形成 父深子浅 + 父外子内 的双重层级。 */
 .channel {
   display: grid; align-items: center;
   grid-template-columns: var(--nav-rail) 1fr auto;
   gap: var(--nav-gap);
   position: relative; min-height: var(--nav-row);
   padding: 0 var(--sp-3); border-radius: var(--r-nav); margin: 1px 0;
-  font-size: var(--fs-body); color: var(--ink-2); font-weight: 500; cursor: pointer;
-  background: none; border: none; text-align: left; width: 100%;
+  margin-left: var(--nav-indent); width: calc(100% - var(--nav-indent));
+  font-size: var(--fs-body); color: #5d5d63; font-weight: 500; cursor: pointer;
+  background: none; border: none; text-align: left;
   font-family: inherit; letter-spacing: -.2px; box-shadow: none;
   transition: background .15s ease, color .15s ease;
 }
