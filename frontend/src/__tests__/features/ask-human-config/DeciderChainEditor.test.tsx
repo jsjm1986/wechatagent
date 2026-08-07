@@ -25,7 +25,7 @@ function entry(
 function seedRoster(items: ReturnType<typeof entry>[], syncing = false) {
   useAccountStore.setState({ accounts: [{ accountId: "acc1", wxid: "self_wx", online: true } as never], selectedAccountId: "acc1" });
   useUserOpsStore.setState({
-    rosterCache: { acc1: { items: items as never, syncing, fetchedAt: Date.now() } },
+    rosterCache: { acc1: { items: items as never, syncing, fetchedAt: Date.now(), serverFetchedAt: null } },
     loadRoster: vi.fn().mockResolvedValue({ items: items as never, syncing }),
   });
 }

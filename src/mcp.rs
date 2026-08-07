@@ -772,16 +772,33 @@ fn parse_roster_items(result: &serde_json::Value) -> Vec<RosterFriend> {
     // /result/friends。call_tool_with_key 已剥掉 JSON-RPC 外壳与 content[0].text，
     // 生产态本函数收到的就是 structuredContent 本体。顶层 /contacts 等 + /content
     // 兜底仅作防御（万一 server 换形态或某调用方传入完整外壳）。
+    // 候选选取策略：**优先「元素是对象」的数组**，其次才回落到「元素是裸字符串」的数组。
+    //
+    // 为什么不能单纯按 keys 顺序取第一个命中：`/result/friends` 是旧工具
+    // contacts_fetch_cache 的裸 wxid 字符串数组，`/items` 是现工具 contacts_fetch_full
+    // 的富化对象数组（含 nickName/头像/sex）。若某次返回体**同时**含这两个键（server
+    // 兼容期同时回两种形态完全可能），按顺序取就会选中裸字符串数组，于是全部好友
+    // 的昵称/头像/性别一次性丢光、整表退化成只有 wxid。对象数组信息严格是字符串
+    // 数组的超集，所以「有对象就用对象」永远不会更差。
+    let has_object_element = |arr: &[serde_json::Value]| arr.iter().any(|x| x.is_object());
     let first_array = |v: &serde_json::Value, keys: &[&str]| -> Option<Vec<serde_json::Value>> {
+        let mut fallback: Option<Vec<serde_json::Value>> = None;
         for k in keys {
             if let Some(arr) = v.pointer(k).and_then(|x| x.as_array()) {
-                return Some(arr.clone());
+                if has_object_element(arr) {
+                    return Some(arr.clone()); // 富化形态，直接采用。
+                }
+                if fallback.is_none() {
+                    fallback = Some(arr.clone()); // 裸字符串/空数组：暂存，继续找富化的。
+                }
             }
         }
-        None
+        fallback
     };
     let named = [
-        // 生产态：contacts_fetch_cache 的嵌套 result.friends。
+        // 现生产态：contacts_fetch_full 的顶层 items（富化对象数组）。
+        "/items",
+        // 旧生产态：contacts_fetch_cache 的嵌套 result.friends（裸 wxid 字符串数组）。
         "/result/friends",
         "/result/contacts",
         "/result/list",
@@ -789,7 +806,6 @@ fn parse_roster_items(result: &serde_json::Value) -> Vec<RosterFriend> {
         "/contacts",
         "/friends",
         "/list",
-        "/items",
         "/data",
         // 防御：完整外壳形态（未剥壳的调用方）。
         "/structuredContent/result/friends",
@@ -1417,6 +1433,41 @@ mod roster_parse_tests {
         assert_eq!(out[0].wxid, "wxid_a");
         assert_eq!(out[0].nickname.as_deref(), Some("小明"));
         assert_eq!(out[0].avatar_url.as_deref(), Some("http://img/a"));
+    }
+
+    #[test]
+    fn mixed_shape_prefers_rich_object_array_over_bare_string_array() {
+        // 定时炸弹回归守卫：若返回体**同时**含旧形态 /result/friends（裸 wxid 字符串）
+        // 与现形态 /items（富化对象），必须选富化的那个。
+        // 按 keys 顺序取第一个命中的旧实现会选中裸字符串数组 → 全表昵称/头像/性别丢光。
+        let v = serde_json::json!({
+            "status": "ready",
+            "result": { "friends": ["wxid_bare1", "wxid_bare2"] },
+            "items": [
+                { "userName": "wxid_rich1", "nickName": "有昵称", "bigHeadImgUrl": "http://img/1", "sex": 1 }
+            ]
+        });
+        let out = parse_roster_items(&v);
+        assert_eq!(out.len(), 1, "必须采用 /items 的富化数组，而非 /result/friends");
+        assert_eq!(out[0].wxid, "wxid_rich1");
+        assert_eq!(
+            out[0].nickname.as_deref(),
+            Some("有昵称"),
+            "富化字段不得因候选顺序丢失"
+        );
+        assert_eq!(out[0].avatar_url.as_deref(), Some("http://img/1"));
+        assert_eq!(out[0].sex, Some(1));
+    }
+
+    #[test]
+    fn bare_string_array_still_used_when_no_object_array_present() {
+        // 只有裸字符串数组时（旧工具形态）仍须正常解析——防止「优先对象」改动
+        // 把旧形态回落路径搞坏。
+        let v = serde_json::json!({ "result": { "friends": ["wxid_only1", "wxid_only2"] } });
+        let out = parse_roster_items(&v);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].wxid, "wxid_only1");
+        assert_eq!(out[0].nickname, None);
     }
 
     #[test]

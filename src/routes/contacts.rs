@@ -620,6 +620,19 @@ pub(super) struct RosterQuery {
     pub force: bool,
 }
 
+/// 通讯录排序键：身份完整度。返回 `(无显示名, 无头像)`，`false(0)` 排前。
+///
+/// 「显示名」与前端卡片的显示规则同源（`备注 || 昵称 || wxid`）：只要备注或昵称
+/// 任一非空白，卡片就能显示可读名字，故视为有名。空白字符串按空处理——上游对
+/// 部分好友返回 `nickName: ""` 而非 `null`，若只判 `is_none()` 会漏掉。
+fn roster_identity_rank(f: &mcp::RosterFriend) -> (bool, bool) {
+    let non_blank = |s: &Option<String>| s.as_deref().map(|v| !v.trim().is_empty()).unwrap_or(false);
+    let has_name = non_blank(&f.remark) || non_blank(&f.nickname);
+    let has_avatar = non_blank(&f.avatar_url);
+    // false(0) 排在 true(1) 前，故取反：有名/有头像得 0，靠前。
+    (!has_name, !has_avatar)
+}
+
 pub(super) async fn roster_endpoint(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
@@ -630,31 +643,45 @@ pub(super) async fn roster_endpoint(
     let ws = &admin.current_workspace;
     let acc = &query.account_id;
 
-    // 决定本次返回的 friends + syncing（快照优先 / force 强拉 / 失败兜底旧快照）。
-    let (friends, syncing): (Vec<mcp::RosterFriend>, bool) = if query.force {
+    // 决定本次返回的 friends + syncing + 快照龄（快照优先 / force 强拉 / 失败兜底旧快照）。
+    // refreshing=true 表示"后台正在拉新快照"，与 syncing（完全没数据可显示）区分：
+    // force 刷新时有旧快照可看，不该让前端显示空态，但要让它知道后台在跑。
+    let (friends, syncing, refreshing, snapshot_fetched_at): (
+        Vec<mcp::RosterFriend>,
+        bool,
+        bool,
+        Option<String>,
+    ) = if query.force {
         // 强制刷新(仅用户手动点「刷新」触发,前端自动轮询不带force):
         // 不再同步阻塞拉全量(异步工具首返pending、大body易TimedOut、占连接名额)。
         // 触发后台单飞刷新;有旧快照先返回旧快照(后台写好下次秒回),无则syncing:true。
         mcp::spawn_roster_refresh(state.clone(), ws.clone(), acc.clone());
         match mcp::read_roster_snapshot(&state, ws, acc).await? {
-            Some(snap) => (snap.friends, false),
-            None => (Vec::new(), true),
+            Some(snap) => (
+                snap.friends,
+                false,
+                true,
+                snap.fetched_at.try_to_rfc3339_string().ok(),
+            ),
+            None => (Vec::new(), true, true, None),
         }
     } else {
         // 非 force：快照优先。有快照秒回；stale 则后台自刷。无快照走同步拉一次。
         match mcp::read_roster_snapshot(&state, ws, acc).await? {
             Some(snap) => {
-                if mcp::snapshot_is_stale(snap.fetched_at, mongodb::bson::DateTime::now()) {
+                let stale = mcp::snapshot_is_stale(snap.fetched_at, mongodb::bson::DateTime::now());
+                if stale {
                     mcp::spawn_roster_refresh(state.clone(), ws.clone(), acc.clone());
                 }
-                (snap.friends, false)
+                let at = snap.fetched_at.try_to_rfc3339_string().ok();
+                (snap.friends, false, stale, at)
             }
             None => {
                 // 首次无快照:不再同步阻塞 fetch_roster_for_account(6s窗口常拿pending、
                 // 占连接名额)。立即返回syncing:true,后台单飞拉取,前端进只读轮询,
                 // 后台写好快照后下一轮普通读秒出。
                 mcp::spawn_roster_refresh(state.clone(), ws.clone(), acc.clone());
-                (Vec::new(), true)
+                (Vec::new(), true, true, None)
             }
         }
     };
@@ -675,6 +702,19 @@ pub(super) async fn roster_endpoint(
         status_by_wxid.insert(c.wxid, status.to_string());
     }
 
+    // 身份完整度排序：有显示名（备注或昵称）的排前，其次有头像的排前。
+    //
+    // 为什么需要：微信上游对少数好友确实没有昵称/头像（对方没设昵称、我方没加备注，
+    // 线上 4834 条里 12 条如此，经 contact_get_detail 逐条确认上游返回 nickName:""，
+    // 不是我们解析丢的、也补不出来）。这些条目**恰好集中在列表最前面**（索引
+    // 0/4/6/11/14…），于是第一页 60 条里就有 5 条无名、13 条无头像，用户看到的
+    // 第一屏全是 wxid_xxx 灰圈，观感像"大量没同步到"，实际占比 0.25%。
+    // 把身份不全的沉到末尾，第一屏即全是可读条目，观感问题消失，且不丢任何数据。
+    //
+    // sort_by_key 是稳定排序，故同组内保持上游原始顺序（不引入新的随机感）。
+    let mut friends = friends;
+    friends.sort_by_key(roster_identity_rank);
+
     let items: Vec<Value> = friends
         .into_iter()
         .map(|f| {
@@ -694,9 +734,16 @@ pub(super) async fn roster_endpoint(
         })
         .collect();
     let total = items.len();
-    Ok(Json(
-        json!({ "items": items, "total": total, "syncing": syncing }),
-    ))
+    // fetchedAt 暴露给前端：force 刷新是"触发后台单飞 + 立即返回旧快照"，若不告诉
+    // 前端快照龄，界面点了刷新看起来毫无变化（旧数据原样返回），像坏了。前端据此
+    // 轮询到 fetchedAt 变化再提示"已更新"。无快照时为 null。
+    Ok(Json(json!({
+        "items": items,
+        "total": total,
+        "syncing": syncing,
+        "refreshing": refreshing,
+        "fetchedAt": snapshot_fetched_at,
+    })))
 }
 
 /// 把 AI 生成的初始运营画像落库到指定联系人（切 managed + 画像 + 备注 + playbook）。
@@ -2980,6 +3027,65 @@ pub(super) async fn get_operation_health(
         next_wake_at,
         quiet_hours_enabled,
     )))
+}
+
+#[cfg(test)]
+mod roster_sort_tests {
+    use super::roster_identity_rank;
+    use crate::mcp::RosterFriend;
+
+    fn friend(wxid: &str, nick: Option<&str>, remark: Option<&str>, avatar: Option<&str>) -> RosterFriend {
+        RosterFriend {
+            wxid: wxid.to_string(),
+            nickname: nick.map(ToString::to_string),
+            remark: remark.map(ToString::to_string),
+            avatar_url: avatar.map(ToString::to_string),
+            sex: None,
+            is_non_human: false,
+        }
+    }
+
+    #[test]
+    fn identity_complete_ranks_before_nameless() {
+        // 有名有头像 < 有名无头像 < 无名（rank 元组字典序）。
+        let full = roster_identity_rank(&friend("a", Some("小明"), None, Some("http://img")));
+        let name_only = roster_identity_rank(&friend("b", Some("小红"), None, None));
+        let nameless = roster_identity_rank(&friend("c", None, None, None));
+        assert!(full < name_only, "有头像应排在无头像之前");
+        assert!(name_only < nameless, "有名应排在无名之前");
+    }
+
+    #[test]
+    fn remark_alone_counts_as_named() {
+        // 卡片显示名是 remark || nickname || wxid，故只有备注也算「有名」，
+        // 不该被沉到末尾（线上 839 条属此类）。
+        let remark_only = roster_identity_rank(&friend("a", None, Some("3.27"), None));
+        let nameless = roster_identity_rank(&friend("b", None, None, None));
+        assert!(remark_only < nameless);
+    }
+
+    #[test]
+    fn whitespace_only_name_is_treated_as_nameless() {
+        // 空串/纯空白不是有效显示名——卡片会退回显示 wxid，故必须同样沉底，
+        // 否则「看起来有名字实际是空白」的条目仍占据第一屏。
+        let blank = roster_identity_rank(&friend("a", Some("   "), Some(""), None));
+        let nameless = roster_identity_rank(&friend("b", None, None, None));
+        assert_eq!(blank, nameless, "纯空白名等同无名");
+    }
+
+    #[test]
+    fn sort_is_stable_within_same_rank() {
+        // 稳定排序：同组内保持上游原始顺序，避免每次刷新顺序乱跳。
+        let mut list = vec![
+            friend("z", Some("A"), None, Some("i")),
+            friend("y", Some("B"), None, Some("i")),
+            friend("x", None, None, None),
+            friend("w", Some("C"), None, Some("i")),
+        ];
+        list.sort_by_key(roster_identity_rank);
+        let order: Vec<&str> = list.iter().map(|f| f.wxid.as_str()).collect();
+        assert_eq!(order, vec!["z", "y", "w", "x"], "同 rank 保序，无名沉底");
+    }
 }
 
 #[cfg(test)]
