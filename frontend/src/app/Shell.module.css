@@ -99,14 +99,17 @@
    文字居中的蓝按钮外观。**justify-content 是必需的**：styles.css 给裸 button
    写了 `justify-content: center`，漏掉它组标题就会被居中（.channel 显式写了
    flex-start 正是同一原因）。
-   颜色 #68686e（4.89:1，过 AA）而非 --ink-4(#b0b0b5，2.05:1 不可读)，也不用
-   --ink-2：标题是分类说明、不是内容，视觉重量必须**低于**频道名。此前一路提到
-   --ink-2 与频道名(13.5px/--ink-2)同色、字重反而更粗(600 vs 500)，两者重量打平
-   互相抢，正是"别扭不协调"的来源。参照品牌区的正确层级（16px 深 + 10.5px 浅）：
-   字号与颜色要同时拉开，不能只做字号。 */
+   颜色 #636369（5.52:1，过 AA）而非 --ink-4(#b0b0b5，2.05:1 不可读)，也不用
+   --ink-2(#515156)——那是频道名的颜色，标题用同色会两者重量打平互相抢。
+   但只压弱也不行：曾把标题压到 10.5px/字重500/浅色（字号、颜色、字重三个维度
+   同时弱于频道），结果它不像标题、只像一行灰字，分组结构读不出来，反而"主次不分"。
+   正确解法是给它**标签**该有的语汇，而不是在同一坐标轴上和频道名比大小：
+     字号小(11px) + 字重重(700) + 字距宽(1.2px) + 颜色浅(#636369)
+   小而粗的宽字距是侧栏分类标签的标准写法——结构感来自字重与字距，次要感来自
+   字号与颜色，两者不冲突，所以既读得出是标题、又不会盖过 13.5px/--ink-2 的频道名。 */
 .groupLabel { display: flex; align-items: center; justify-content: flex-start;
   gap: 6px; width: 100%;
-  font-size: 10.5px; color: #68686e; font-weight: 500; letter-spacing: 1px;
+  font-size: 11px; color: #636369; font-weight: 700; letter-spacing: 1.2px;
   padding: 10px 12px 5px;
   background: none; border: none; box-shadow: none; min-height: 0;
   font-family: inherit; text-align: left; cursor: pointer;
@@ -117,6 +120,9 @@
    反超频道名的重量。 */
 .groupLabel:hover { color: var(--ink-2); background: none; border-color: transparent;
   box-shadow: none; }
+/* 展开态的标题略深一档：当前所在分组是用户的位置锚点，比收起的组更该被看到。
+   仍浅于频道名，不抢重量。 */
+.groupLabelOpen { color: #5d5d63; }
 .groupLabel:active { transform: none; }
 /* 收起时朝右、展开时转 90° 朝下。transform 过渡比切换图标更稳（不闪）。
    14px 而非 12px：频道图标是 17px，12px 的 chevron 和它并置显得两套尺寸打架。 */

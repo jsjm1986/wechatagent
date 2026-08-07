@@ -238,7 +238,7 @@ export function Shell() {
               <div key={group} className={styles.group}>
                 <button
                   type="button"
-                  className={styles.groupLabel}
+                  className={`${styles.groupLabel} ${collapsed ? "" : styles.groupLabelOpen}`}
                   onClick={() => toggleGroup(group)}
                   aria-expanded={!collapsed}
                   data-testid={`nav-group-${group}`}
