@@ -1,5 +1,5 @@
 import { Suspense, useEffect, useRef, useState } from "react";
-import { LogOut, Check, ChevronsUpDown, RefreshCw } from "lucide-react";
+import { LogOut, Check, ChevronsUpDown, RefreshCw, ChevronRight } from "lucide-react";
 import { CHANNELS, GROUP_ORDER, type ChannelGroup } from "./channels";
 import { useNavigationStore } from "../stores/navigationStore";
 import { useAuthStore } from "../stores/authStore";
@@ -197,14 +197,16 @@ function WorkspaceSwitcher({
 export function Shell() {
   const activeChannel = useNavigationStore((s) => s.activeChannel);
   const setChannel = useNavigationStore((s) => s.setChannel);
+  const collapsedGroups = useNavigationStore((s) => s.collapsedGroups);
+  const toggleGroup = useNavigationStore((s) => s.toggleGroup);
   const activeProfile = useProfileStore((s) => s.activeProfile);
   const user = useAuthStore((s) => s.user);
   const onLogout = useAuthStore((s) => s.onLogout);
   const def = CHANNELS.find((c) => c.id === activeChannel) ?? CHANNELS[0];
   const { Component } = def;
 
-  // 轨与面板都要按 profile 过滤同一份频道，抽出来避免两处写法漂移
-  // （漂移会导致轨上显示某组、点进去面板却是空的）。
+  // 按 profile 过滤频道。抽成函数是因为「渲染行」与「判断组内是否含活跃频道」
+  // 两处都要用同一份结果，各写一遍必然漂移。
   const groupItems = (group: ChannelGroup) =>
     CHANNELS.filter((c) => c.group === group).filter((c) =>
       c.visibleWhen ? c.visibleWhen(activeProfile) : true
@@ -225,29 +227,43 @@ export function Shell() {
           </div>
         </div>
 
-        {/* 导航 = 单列 + 常显分组标签，全部频道直接可见，超出则滚动。
-            这是撤掉两轮妥协后的形态，两轮都错在把「侧栏不能出滚动条」当硬约束：
-              1) 手风琴（同时只展开一组）：跨组切频道要两步、内容跳动；
-              2) 图标轨 + 二级面板：拿宽度换高度——侧栏 252 减内边距只剩 228 内容区，
-                 轨吃掉 56，面板 172，层层减到文字列只有 104px，带「未上线」角标的
-                 行只剩 48px，而「微信群运营」需要 65px，于是换行。中文标签比英文
-                 更缺宽度，这笔交换方向就错了。加上纯图标分组（「日常」用仪表盘、
-                 「成效」用上升箭头）本身有歧义，必须 hover 才知道是什么。
-            实际上导航滚动是完全正常的（VS Code / Linear / Notion 侧栏都滚）。
-            单列把 172px 文字列还给频道名，零学习成本，代价只是需要滚动。 */}
+        {/* 导航 = 单列 + 可独立折叠的分组。
+            与最初的手风琴的关键区别是**没有互斥**：手风琴强制「同时只展开一组」，
+            所以展开 B 必然收起 A，跨组切频道要两步、内容还会跳动。那个约束是为了
+            「侧栏绝不出滚动条」而设的，而滚动本身完全正常（VS Code / Linear 都滚），
+            约束本身就是错的。现在允许滚动，互斥就没有必要了：每组自己记住开合，
+            用户想同时开三组就开三组。
+            默认收起「成效」「设置」（看结果的 + 配好不常动的），常用三组展开，
+            高度 596px，在 900/800 高的屏上都不滚动。 */}
         <nav className={styles.nav} aria-label="Product channels">
           {GROUP_ORDER.map((group) => {
             const items = groupItems(group);
             if (items.length === 0) return null;
+            const collapsed = collapsedGroups.has(group);
+            // 收起时若活跃频道在组内，标签上打点——否则用户折叠后就丢失了「我在哪」。
+            const holdsActive = collapsed && items.some((c) => c.id === activeChannel);
             return (
               <div key={group} className={styles.group}>
-                {/* 分组标签是静态文字（不是 button）：它不再承担任何交互——
-                    展开/收起/切面板都已取消，所有频道恒可见，标签只回答「这是哪一类」。
-                    用 button 会给出可点的错误暗示。 */}
-                <p className={styles.groupLabel} data-testid={`nav-group-${group}`}>
-                  {group}
-                </p>
-                {items.map((c) => {
+                {/* 分组标签是折叠开关。必须是 button（不是 p + onClick）：
+                    键盘可达 + 读屏报「按钮，已展开」，aria-expanded 表达开合状态。 */}
+                <button
+                  type="button"
+                  className={styles.groupLabel}
+                  onClick={() => toggleGroup(group)}
+                  aria-expanded={!collapsed}
+                  data-testid={`nav-group-${group}`}
+                >
+                  <ChevronRight
+                    size={13}
+                    className={`${styles.groupChevron} ${collapsed ? "" : styles.groupChevronOpen}`}
+                  />
+                  <span className={styles.groupName}>{group}</span>
+                  {holdsActive && (
+                    <span className={styles.groupActiveDot} aria-label="当前频道在此组" />
+                  )}
+                  {collapsed && <span className={styles.groupCount}>{items.length}</span>}
+                </button>
+                {!collapsed && items.map((c) => {
                   const Icon = c.icon;
                   // 占位频道（Component 仍是工作台）不可点，免得点进去看到别的页面。
                   if (c.comingSoon) {
