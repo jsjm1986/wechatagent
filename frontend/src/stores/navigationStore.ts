@@ -1,49 +1,97 @@
 import { create } from "zustand";
 import type { Channel } from "../types";
+// 仅类型导入：编译期擦除，不会在运行时把 channels.ts（及其 lucide 图标）拖进本 store。
+import type { ChannelGroup } from "../app/channels";
 
-/** 历史遗留的导航持久化 key，现已全部无用，进程启动时清一次。
+/** 折叠态持久化 key（存**被收起**的组名数组）。
  *
- *  这三个 key 是导航形态两次反复的化石：
- *  - `wa.nav.collapsedGroups`（手风琴早期）：存「被折叠的组」数组。
- *  - `wa.nav.expandedGroup`（手风琴后期）：存「唯一展开的组」，空串表示全部收起。
- *  - `wa.nav.activeGroup`（图标轨）：存「轨上选中、面板正在显示的组」。
+ *  为什么存"收起的"而不是"展开的"：新增分组时默认展开（数组里没有它），
+ *  这是更安全的默认——新频道不会因为存量用户的旧持久化值而被藏起来。
  *
- *  单列形态下**所有频道恒可见**，不存在「哪一组被展开 / 被选中」这个状态，
- *  所以三者都没有对应概念了。留在 localStorage 里只是垃圾，且下次有人想加
- *  分组状态时容易误读旧值，故显式清掉。 */
+ *  与历史上两次尝试的区别（都失败了，别再走回去）：
+ *  1) 手风琴（wa.nav.expandedGroup，存"唯一展开的组"）：强制互斥——展开一组必须
+ *     收起另一组。病根是当时把"侧栏不能出滚动条"当硬约束，于是用互斥硬压高度。
+ *     代价是跨组切频道要两步（先折叠再展开）、内容跳动。
+ *  2) 图标轨（wa.nav.activeGroup，存"当前选中组"）：拿宽度换高度，中文标签直接
+ *     换行（带角标的行文字列只剩 48px，「微信群运营」需 65px）。
+ *
+ *  现在滚动是被允许的（VS Code / Linear / Notion 侧栏都滚），所以**互斥这个约束
+ *  根本不必要**。各组独立折叠：想全开就全开（滚动兜住），想全收就全收，
+ *  跨组切频道一步到位、无跳动。折叠在这里只是"减少滚动距离"的便利，不是高度妥协。 */
+const STORAGE_KEY = "wa.nav.collapsed";
+/** 历史 key 全部清理：语义都与现在不兼容（前两个见上方注释，第三个存的是旧数组格式）。 */
 const LEGACY_KEYS = [
   "wa.nav.activeGroup",
   "wa.nav.expandedGroup",
   "wa.nav.collapsedGroups",
 ];
 
-/** localStorage 在隐私模式下会抛异常，清理失败无所谓（本来就是清垃圾），故整体兜住。 */
-function clearLegacyKeys(): void {
+/** 合法分组白名单：localStorage 里可能是旧格式或用户手改的脏值。
+ *  不校验就会让某个不存在的组名一直留在集合里（无害但会累积）。 */
+const VALID_GROUPS: ReadonlyArray<ChannelGroup> = [
+  "日常",
+  "运营",
+  "知识与内容",
+  "成效",
+  "设置",
+];
+
+/** 首次进入时默认收起的组。
+ *
+ *  按"是否每天要用"切：「成效」是看结果与审计、「设置」配好就不常动，
+ *  都不是日常动线上的东西，收起它们最省滚动且几乎不影响常用路径。
+ *  日常/运营/知识与内容保持展开 = 12 行 ≈ 596px，实测在 900 与 800 高的视口都不滚动。
+ *
+ *  导出供测试复用，避免测试里硬编码一份漂移的默认值。 */
+export const DEFAULT_COLLAPSED: ReadonlyArray<ChannelGroup> = ["成效", "设置"];
+
+/** localStorage 可能不可用（隐私模式抛异常）或存着脏数据，故读写都兜住。 */
+function loadCollapsed(): Set<ChannelGroup> {
   try {
-    for (const key of LEGACY_KEYS) localStorage.removeItem(key);
+    for (const k of LEGACY_KEYS) localStorage.removeItem(k);
+    const raw = localStorage.getItem(STORAGE_KEY);
+    // 没存过 → 用默认值。存过空数组（"[]"）是"全部展开"的合法表示，
+    // 必须与"没存过"区分，否则用户手动全展开后一刷新又被收回默认态。
+    if (raw === null) return new Set(DEFAULT_COLLAPSED);
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return new Set(DEFAULT_COLLAPSED);
+    return new Set(
+      parsed.filter((g): g is ChannelGroup =>
+        VALID_GROUPS.includes(g as ChannelGroup)
+      )
+    );
   } catch {
-    /* 清不掉就算了，旧 key 只是占空间，不参与任何逻辑。 */
+    return new Set(DEFAULT_COLLAPSED);
   }
 }
 
-clearLegacyKeys();
+function saveCollapsed(groups: Set<ChannelGroup>): void {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify([...groups]));
+  } catch {
+    /* 存不进就算了，折叠态退化为「本次会话内有效」，不影响导航本身。 */
+  }
+}
 
-/** 导航状态：只有「当前频道」一件事。
- *
- *  为什么不再有分组状态：导航经历了两轮形态反复，两轮都错在把「侧栏不能出滚动条」
- *  当成硬约束，于是引入了本不该存在的状态：
- *    1) 手风琴 → 需要记「哪一组展开」，跨组切频道要两步、内容跳动；
- *    2) 图标轨 + 二级面板 → 需要记「轨上选中哪组」，且拿宽度换高度，把中文频道名
- *       挤到换行（侧栏 252 减内边距只剩 228，轨吃 56，层层减到文字列仅 104px，
- *       带「未上线」角标的行只剩 48px，而「微信群运营」需要 65px）。
- *  单列 + 常显分组标签把全部频道一次画出，分组只是视觉分隔，没有任何可变状态——
- *  导航状态因此回落到最小：activeChannel。 */
 interface NavigationState {
   activeChannel: Channel;
   setChannel: (channel: Channel) => void;
+  /** 被收起的分组集合。不在集合里 = 展开。可以为空（全部展开）。 */
+  collapsedGroups: Set<ChannelGroup>;
+  /** 独立折叠某组，不影响其他组——这是与手风琴的根本区别。 */
+  toggleGroup: (group: ChannelGroup) => void;
 }
 
-export const useNavigationStore = create<NavigationState>((set) => ({
+export const useNavigationStore = create<NavigationState>((set, get) => ({
   activeChannel: "command",
   setChannel: (channel) => set({ activeChannel: channel }),
+  collapsedGroups: loadCollapsed(),
+  toggleGroup: (group) => {
+    // 必须造新 Set：zustand 靠引用比较决定重渲染，原地 add/delete 组件不会更新。
+    const next = new Set(get().collapsedGroups);
+    if (next.has(group)) next.delete(group);
+    else next.add(group);
+    saveCollapsed(next);
+    set({ collapsedGroups: next });
+  },
 }));

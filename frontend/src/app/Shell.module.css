@@ -109,18 +109,84 @@
    紧凑档（那 6 档已随手风琴一起删除，不要再加回来）。 */
 .nav { display: flex; flex-direction: column; gap: 0; flex: 1;
   min-height: 0; overflow-y: auto; overflow-x: hidden; }
-/* 组间留白是分组感的唯一来源——比分隔线干净。组内行距是 1px，组间 20px，
-   两者差一个量级，才读得出「块」。 */
-.group + .group { margin-top: var(--sp-5); }
-/* 分组标签：静态文字，不是 button。
-   它不再承担任何交互（展开/收起/切面板全部取消），只回答「这是哪一类」，
-   所以既不给 cursor:pointer 也不给 hover 反馈——否则是可点的错误暗示。
-   13.5px/600/#33333a（11.58:1）对 频道行 13px/#5d5d63（6.04:1）：
-   父级必须更大更深。曾经试过把标签压成 11px 小字（照英文小标签的做法），
-   结果中文没有大小写差异、缩小就只是变弱，撑不起父级，读起来像频道的附属物。 */
+/* 细滚动条。默认的 macOS 滚动条在侧栏这种窄容器里又粗又抢眼（常显模式下约 15px，
+   几乎占掉频道名一个字的宽度），是这条侧栏最不精致的元素。
+   做法：6px 宽 + 透明轨道 + 低对比滑块，hover 时略深。
+   不用「hover 才显示」——那会让「这里还有内容」这个唯一线索消失，
+   用户不知道下面还有频道。可见但克制才是对的。
+   scrollbar-width/color 覆盖 Firefox 与新版 Chrome；::-webkit-* 覆盖 Safari。 */
+/* **两套属性必须互斥地给**，不能都写在 .nav 上：Chrome 121+ 同时支持
+   `scrollbar-width` 与 `::-webkit-scrollbar`，而只要标准属性存在，webkit 伪元素
+   规则就整块被忽略。都写的结果是 Chrome 用标准属性的 thin（实测 11px），
+   6px 那条完全没生效——本轮实测抓到过一次。
+   用 @supports selector() 分流：支持 webkit 伪元素的（Chrome/Safari）走 6px 精调，
+   不支持的（Firefox）才吃标准属性。 */
+@supports not selector(::-webkit-scrollbar) {
+  .nav { scrollbar-width: thin; scrollbar-color: rgba(20,30,60,.16) transparent; }
+}
+.nav::-webkit-scrollbar { width: 6px; }
+.nav::-webkit-scrollbar-track { background: transparent; }
+.nav::-webkit-scrollbar-thumb {
+  background: rgba(20,30,60,.16); border-radius: 3px;
+}
+.nav::-webkit-scrollbar-thumb:hover { background: rgba(20,30,60,.28); }
+
+/* 组间留白是分组感的唯一来源——比分隔线干净。组内行距是 1px，组间 16px，
+   两者差一个量级，才读得出「块」。
+   20px → 16px：实测 1440×900（最常见的桌面尺寸）默认折叠后内容 622px、可用
+   611px，只差 11px 就要出滚动条。4 个组间距各省 4px 正好省下 16px，让最常见
+   的屏刚好不滚。16px 仍是行距(1px)的 16 倍，分组感没有损失。
+   这是本轮唯一的密度调整——不重开那 6 档按视口压行高的紧凑档（行高恒 36px）。 */
+.group + .group { margin-top: var(--sp-4); }
+/* 分组标签 = 折叠开关（button）。
+   **必须显式重置全局裸 button 基线**（background/border/min-height/font/
+   justify-content/text-align），否则继承出 38px 高、文字居中的蓝按钮。
+   styles.css 给裸 button 写了 justify-content:center，漏掉它标签会被居中。
+
+   为什么这轮敢加回折叠：手风琴的病根不是「折叠」，是**强制互斥**（开一组必关
+   另一组）——那让跨组切频道要两步、且内容跳动。现在滚动被允许了，互斥这个约束
+   根本没必要，所以改成各组独立折叠：想全开就全开、想全收就全收，状态记住。
+
+   chevron 用 flex 内联而非占满 20px 轨道：占轨道会把标签文字推到 left=56，
+   与频道文字同一竖线，父子层级里「父外子内」的缩进关系就没了。
+   内联后标签文字约 left=31，仍明显外于频道的 56。
+   13.5px/600/#33333a（11.98:1）对频道 13px/#5d5d63（6.25:1）：父级更大更深。 */
 .groupLabel {
-  margin: 0 0 var(--sp-1); padding: 0 var(--sp-3);
+  display: flex; align-items: center; gap: 6px; width: 100%;
+  margin: 0 0 var(--sp-1); padding: 2px var(--sp-3);
   font-size: var(--fs-group); font-weight: 600; color: #33333a; letter-spacing: -.2px;
+  background: none; border: none; box-shadow: none; min-height: 0;
+  font-family: inherit; text-align: left; justify-content: flex-start; cursor: pointer;
+  transition: color .15s ease;
+}
+/* 全局 button:hover 会刷深蓝底 + 投影、:active 会下沉 1px。分组标签是导航标签、
+   不是操作按钮，必须逐条压掉，否则鼠标掠过侧栏会闪出一条深蓝条。 */
+.groupLabel:hover { color: var(--ink-1); background: none;
+  border-color: transparent; box-shadow: none; transform: none; }
+.groupLabel:active { transform: none; }
+.groupName { flex: 1; min-width: 0; }
+/* 收起朝右、展开转 90° 朝下。transform 过渡比换图标稳（不闪）。
+   实色 #9a9aa1 而非 opacity——opacity 会把描边压成灰雾，与 600 字重的标签
+   不是同一套语汇。 */
+/* #86868b(3.46:1) 而非 #9a9aa1(2.67:1)：chevron 是**图形**，门槛是 3:1
+   （WCAG 1.4.11 非文本对比度），不是文字的 4.5。实测 #9a9aa1 只有 2.67 不达标。
+   仍明显浅于标签的 11.98，主次不乱。 */
+.groupChevron { flex-shrink: 0; color: #86868b;
+  transition: transform .18s cubic-bezier(.2,.7,.3,1), color .18s ease; }
+.groupLabel:hover .groupChevron { color: #6a6a72; }
+.groupChevronOpen { transform: rotate(90deg); }
+/* 收起时显示组内频道数，让用户知道里面有东西没丢。裸数字不做 pill——
+   pill 是通用后台的徽章语汇，在一行只有文字的标签里凭空多个填充块最显廉价。
+   tabular-nums：数字等宽，多组并列时右缘不参差。 */
+.groupCount {
+  flex-shrink: 0; font-size: var(--fs-micro); font-weight: 600;
+  color: #66666d; font-variant-numeric: tabular-nums; letter-spacing: 0;
+}
+/* 收起且活跃频道在组内 → 打一颗蓝点。否则折叠后用户就丢失了「我在哪」。 */
+.groupActiveDot {
+  width: 5px; height: 5px; border-radius: 50%; flex-shrink: 0;
+  background: var(--color-scheduled);
+  box-shadow: 0 0 4px 1px rgba(10,132,255,.4);
 }
 /* 频道行（面板内的二级项）。
    grid 而非 flex：图标占固定 20px 轨道，所有频道名严格对齐在同一条竖线上。

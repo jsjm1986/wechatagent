@@ -1,18 +1,24 @@
 import { fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Shell } from "../../app/Shell";
-import { useNavigationStore } from "../../stores/navigationStore";
+import { useNavigationStore, DEFAULT_COLLAPSED } from "../../stores/navigationStore";
 import { useAuthStore } from "../../stores/authStore";
 import { CHANNELS, GROUP_ORDER } from "../../app/channels";
 
 const GROUPS = ["日常", "运营", "知识与内容", "成效", "设置"];
 
-describe("Shell 导航（单列 + 常显分组标签）", () => {
-  // 核心不变量，也是放弃手风琴与图标轨的理由：所有频道恒可见。
-  // 手风琴同时只展开一组（跨组切换要两步）；图标轨同时只渲染一组（拿宽度换高度，
-  // 导致中文标签换行）。单列全部渲染，超出交给滚动。
-  it("所有分组的所有频道同时渲染，不需要任何展开动作", async () => {
-    useNavigationStore.setState({ activeChannel: "overview" });
+/** 每个用例都从「全部展开」起步，除非它自己要测折叠——store 是模块级单例，
+ *  不重置会串上一个用例的折叠态。 */
+function seedExpanded() {
+  useNavigationStore.setState({
+    activeChannel: "overview",
+    collapsedGroups: new Set(),
+  });
+}
+
+describe("Shell 导航（单列 + 独立折叠）", () => {
+  it("展开态下，所有分组的频道同时渲染", async () => {
+    seedExpanded();
     render(<Shell />);
     // 跨 4 个不同分组各取一个频道：日常 / 运营 / 知识与内容 / 设置。
     expect(await screen.findByText("工作台")).toBeInTheDocument();
@@ -21,22 +27,101 @@ describe("Shell 导航（单列 + 常显分组标签）", () => {
     expect(screen.getByText("系统策略")).toBeInTheDocument();
   });
 
-  it("五个分组标签全部常显，且是静态文字而非按钮", () => {
-    useNavigationStore.setState({ activeChannel: "overview" });
+  it("五个分组标签全部常显，且是可折叠的按钮", () => {
+    seedExpanded();
     render(<Shell />);
     for (const g of GROUPS) {
       const label = screen.getByTestId(`nav-group-${g}`);
-      expect(label).toBeInTheDocument();
-      // 标签不再承担交互（不切面板、不折叠），用 button 会给出可点的错误暗示。
-      expect(label.tagName).not.toBe("BUTTON");
+      // 标签承担折叠交互，必须是 button：键盘可达 + 读屏报「按钮，已展开」。
+      expect(label.tagName).toBe("BUTTON");
+      expect(label).toHaveAttribute("aria-expanded", "true");
     }
   });
 
-  it("点频道即切换，无需先操作分组", () => {
-    useNavigationStore.setState({ activeChannel: "overview" });
+  // 这是本轮相对手风琴的**关键差异**。手风琴强制互斥（开一组必关另一组），
+  // 导致跨组切频道要两步、内容跳动。互斥的唯一理由是「侧栏不能滚」，而滚动
+  // 现在被允许了，所以约束没必要。这条守着：折叠一组不影响其它组。
+  it("折叠是各组独立的，不互斥（收起一组不影响其它组）", () => {
+    seedExpanded();
+    render(<Shell />);
+    // 收起「日常」
+    fireEvent.click(screen.getByTestId("nav-group-日常"));
+    expect(screen.queryByText("工作台")).not.toBeInTheDocument();
+    // 其它组**仍然展开**——手风琴在这里会把它们全关掉。
+    expect(screen.getByText("用户运营")).toBeInTheDocument();
+    expect(screen.getByText("系统策略")).toBeInTheDocument();
+    // 再收起「运营」，「设置」依旧不受影响。
+    fireEvent.click(screen.getByTestId("nav-group-运营"));
+    expect(screen.queryByText("用户运营")).not.toBeInTheDocument();
+    expect(screen.getByText("系统策略")).toBeInTheDocument();
+  });
+
+  it("同一标签再点一次即展开回来（幂等开合）", () => {
+    seedExpanded();
+    render(<Shell />);
+    const label = screen.getByTestId("nav-group-日常");
+    fireEvent.click(label);
+    expect(screen.queryByText("工作台")).not.toBeInTheDocument();
+    expect(label).toHaveAttribute("aria-expanded", "false");
+    fireEvent.click(label);
+    expect(screen.getByText("工作台")).toBeInTheDocument();
+    expect(label).toHaveAttribute("aria-expanded", "true");
+  });
+
+  // 折叠后若活跃频道被藏起来，必须有替代信号，否则用户丢失「我在哪」。
+  it("收起的组含活跃频道时，标签上打点表达定位", () => {
+    useNavigationStore.setState({
+      activeChannel: "systemStrategy", // 属「设置」
+      collapsedGroups: new Set(["设置"] as const),
+    });
+    render(<Shell />);
+    const settings = screen.getByTestId("nav-group-设置");
+    expect(within(settings).getByLabelText("当前频道在此组")).toBeInTheDocument();
+    // 只有「设置」有点：展开的组里活跃频道自己已高亮，不需要重复表达。
+    expect(screen.getAllByLabelText("当前频道在此组")).toHaveLength(1);
+  });
+
+  it("展开的组不打点（活跃频道自身已高亮，不重复表达）", () => {
+    useNavigationStore.setState({
+      activeChannel: "systemStrategy",
+      collapsedGroups: new Set(),
+    });
+    render(<Shell />);
+    expect(screen.queryByLabelText("当前频道在此组")).not.toBeInTheDocument();
+  });
+
+  it("收起时显示组内频道数，让用户知道里面有东西没丢", () => {
+    useNavigationStore.setState({
+      activeChannel: "overview",
+      collapsedGroups: new Set(["运营"] as const),
+    });
+    render(<Shell />);
+    const ops = screen.getByTestId("nav-group-运营");
+    // 「运营」组有 5 个频道。
+    expect(ops).toHaveTextContent("5");
+  });
+
+  it("默认收起「成效」「设置」——常用三组保持展开", () => {
+    // 不设 collapsedGroups，让它走 store 的默认值。
+    useNavigationStore.setState({
+      activeChannel: "overview",
+      collapsedGroups: new Set(DEFAULT_COLLAPSED),
+    });
+    render(<Shell />);
+    // 常用三组的频道可见
+    expect(screen.getByText("工作台")).toBeInTheDocument();
+    expect(screen.getByText("用户运营")).toBeInTheDocument();
+    expect(screen.getByText("知识库 Wiki")).toBeInTheDocument();
+    // 默认收起的两组不渲染
+    expect(screen.queryByText("系统策略")).not.toBeInTheDocument();
+    expect(screen.queryByText("发送成效")).not.toBeInTheDocument();
+  });
+
+  it("点频道即切换，展开态下跨组一步直达", () => {
+    seedExpanded();
     render(<Shell />);
     // 「系统策略」属「设置」组，与当前频道「工作台」（日常）不同组。
-    // 单列下它本来就可见，一次点击直达——这正是手风琴要两步的那个场景。
+    // 展开态下它本来就可见，一次点击直达——这正是手风琴要两步的那个场景。
     fireEvent.click(screen.getByText("系统策略").closest("button")!);
     expect(useNavigationStore.getState().activeChannel).toBe("systemStrategy");
   });
