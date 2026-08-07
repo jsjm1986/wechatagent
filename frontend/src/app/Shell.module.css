@@ -189,10 +189,32 @@
   color: #66666d; font-variant-numeric: tabular-nums; letter-spacing: 0;
 }
 /* 收起且活跃频道在组内 → 打一颗蓝点。否则折叠后用户就丢失了「我在哪」。 */
+/* 只有**这一处**做呼吸，因为只有它在传达信息：组被收起时，活跃频道被藏起来了，
+   这颗点是「你当前在这个折叠组里」的唯一信号，动起来是在提示位置。
+   分类标签本身**不加**呼吸——六个标签同时呼吸就是六个动点抢注意力，比此前那条
+   激活光条更糟。此前删掉的正是「给激活频道无限呼吸」：那个位置本身已有白卡 +
+   蓝图标 + 加粗三重高亮，动画不增加信息，只是余光里一直有东西在动。
+
+   照产品既有呼吸规范写（tokens.css 的 breathe-running / 知识库的 breathe-dot）：
+   **只动 box-shadow 光晕**，不动 opacity 也不动 transform:scale。动 opacity 会
+   让点忽明忽暗像故障指示灯；动 scale 会让它在 grid 行里挤动邻居。周期走
+   --breathe-mid(3.2s)，与全站其它呼吸同频——不同频的多个动画同屏会显得杂乱。 */
 .groupActiveDot {
   width: 5px; height: 5px; border-radius: 50%; flex-shrink: 0;
   background: var(--color-scheduled);
   box-shadow: 0 0 4px 1px rgba(10,132,255,.4);
+  animation: navDotBreathe var(--breathe-mid) ease-in-out infinite;
+}
+@keyframes navDotBreathe {
+  0%,100% { box-shadow: 0 0 4px 1px rgba(10,132,255,.4); }
+  50%     { box-shadow: 0 0 7px 2px rgba(10,132,255,.62); }
+}
+/* 无障碍兜底：系统开启「减少动态效果」时停掉呼吸，保留静态光晕。
+   WCAG 2.2 要求无限循环动画可被停止——此前那条 3.6s 呼吸光条没有这层兜底，
+   是它该被删掉的理由之一。全站此前没有任何 prefers-reduced-motion 支持，
+   这是第一处；其它呼吸（状态徽章、在线点）后续应同样补上。 */
+@media (prefers-reduced-motion: reduce) {
+  .groupActiveDot { animation: none; }
 }
 /* 频道行（面板内的二级项）。
    grid 而非 flex：图标占固定 20px 轨道，所有频道名严格对齐在同一条竖线上。
