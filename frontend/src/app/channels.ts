@@ -19,17 +19,6 @@ import {
   SlidersHorizontal,
   BarChart3,
   Megaphone,
-  // 一级分组自己的图标（图标轨用）。分组此前没有图标——只有 20 个频道各有一个，
-  // 分组靠文字标题表达。改成图标轨后分组必须能被一个图标代表，故按组内频道的
-  // 共同语义各选一个：Gauge=仪表盘(总控/工作台)、Users=对人做事、BookOpen=知识素材、
-  // TrendingUp=看结果、Settings=配置。刻意避开与组内频道重复的图标（如运营组已有
-  // UserRoundCheck/UsersRound，故分组用 Users 而非它们），否则轨上图标与面板内
-  // 某一行长得一样，会读成「这个图标就是那个频道」。
-  Gauge,
-  Users,
-  BookOpen,
-  TrendingUp,
-  Settings,
   type LucideIcon,
 } from "lucide-react";
 import type { Channel, DomainProfile } from "../types";
@@ -67,30 +56,22 @@ const CampaignFeature = lazy(() => import("../features/campaign"));
  *  也不好按系统层找。 */
 export type ChannelGroup = "日常" | "运营" | "知识与内容" | "成效" | "设置";
 
-/** 侧栏一级分组顺序 + 图标 + 无障碍标签。
+/** 侧栏一级分组的显示顺序。单一事实来源——Shell.tsx 不再维护第二份顺序数组
+ *  （两份必然漂移）。
  *
- *  导航从「手风琴」改为「图标轨 + 二级面板」后，分组本身需要一枚图标作为轨上的
- *  可点目标，所以分组元信息从 Shell.tsx 的裸数组升级成这张表，与 CHANNELS 同源。
- *
- *  图标按**组内频道的共同语义**挑，不硬凑：
- *  - 日常 = AI 总控 / 工作台 / 统一收件箱 → Gauge（每天要看的仪表盘）
- *  - 运营 = 用户 / 微信群 / 朋友圈 / 活动 / 产品成交 → Users（对人做事）
- *  - 知识与内容 = 内容资产 / 专属顾问 / 知识库 → BookOpen（喂给 AI 的素材）
- *  - 成效 = 任务日志 / 自治回路 / 演化 / 运营成效 / 发送成效 → TrendingUp（看结果）
- *  - 设置 = 账号 / 请示通道 / 系统策略 / 模型 → Settings（配好不常动）
- *
- *  `hint` 供图标轨的 tooltip 与 aria-label 使用：轨上只有图标，必须有可读名称，
- *  否则屏幕阅读器只报「按钮」。 */
-export const GROUP_META: ReadonlyArray<{
-  group: ChannelGroup;
-  icon: LucideIcon;
-  hint: string;
-}> = [
-  { group: "日常", icon: Gauge, hint: "日常：总控、工作台、收件箱" },
-  { group: "运营", icon: Users, hint: "运营：对客户做事的业务频道" },
-  { group: "知识与内容", icon: BookOpen, hint: "知识与内容：素材与知识库" },
-  { group: "成效", icon: TrendingUp, hint: "成效：结果与审计" },
-  { group: "设置", icon: Settings, hint: "设置：账号、策略、模型" },
+ *  曾短暂带过 `icon` 与 `hint` 两个字段，那是「图标轨 + 二级面板」形态的需要：
+ *  轨上只有图标，分组必须能被一枚图标代表、且需要 tooltip/aria-label 才可读。
+ *  该形态已撤销——它拿宽度换高度，而中文标签更缺宽度（侧栏 252 减内边距只剩 228，
+ *  轨吃 56 后文字列只有 104px，带「未上线」角标的行仅 48px，「微信群运营」需 65px
+ *  故换行）；且纯图标分组（「日常」用仪表盘、「成效」用上升箭头）语义有歧义，
+ *  必须 hover 才知道是什么。单列形态下分组标签是文字，两个字段都没有消费者，
+ *  故连同那 5 个 lucide 图标 import 一起删掉，不留死代码。 */
+export const GROUP_ORDER: ReadonlyArray<ChannelGroup> = [
+  "日常",
+  "运营",
+  "知识与内容",
+  "成效",
+  "设置",
 ];
 
 export interface ChannelDef {
