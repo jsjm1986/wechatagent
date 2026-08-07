@@ -79,6 +79,7 @@ pub(super) async fn list_decision_reviews(
             status.final_review_status,
             status.hold_category,
             status.autonomy_protocol,
+            status.outbox_status,
         ));
     }
     Ok(Json(json!({ "items": items })))
@@ -121,6 +122,7 @@ pub(super) async fn get_decision_review(
         status.final_review_status,
         status.hold_category,
         status.autonomy_protocol,
+        status.outbox_status,
     ) })))
 }
 
@@ -157,6 +159,7 @@ struct RunStatusView {
     final_review_status: Option<String>,
     hold_category: Option<String>,
     autonomy_protocol: Option<Value>,
+    outbox_status: Option<String>,
 }
 
 /// 关联同 run_id 的 AgentRunLog，取 final_review_status（顶层 snake 字段）、
@@ -173,6 +176,7 @@ async fn fetch_run_status(
             final_review_status: None,
             hold_category: None,
             autonomy_protocol: None,
+            outbox_status: None,
         };
     };
     match state
@@ -205,12 +209,14 @@ async fn fetch_run_status(
                 final_review_status: frs,
                 hold_category: hc,
                 autonomy_protocol: ap,
+                outbox_status: log.outbox_status.clone(),
             }
         }
         _ => RunStatusView {
             final_review_status: None,
             hold_category: None,
             autonomy_protocol: None,
+            outbox_status: None,
         },
     }
 }

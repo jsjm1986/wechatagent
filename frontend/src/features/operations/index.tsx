@@ -4,7 +4,7 @@ import { EmptyState } from "../../components/ui/EmptyState";
 import { StatusBadge, type StatusTone } from "../../components/ui/StatusBadge";
 import { useOperationsStore } from "../../stores/operationsStore";
 import { useAccountStore } from "../../stores/accountStore";
-import { FINAL_REVIEW_STATUS_LABELS, GATEWAY_STATUS_LABELS, HOLD_CATEGORY_LABELS, NEXT_BEST_ACTION_TYPE_LABELS, REVIEW_SCORE_LABELS, EVENT_KIND_LABELS, EVENT_STATUS_LABELS, labelOf } from "../../lib/reviewLabels";
+import { FINAL_REVIEW_STATUS_LABELS, GATEWAY_STATUS_LABELS, HOLD_CATEGORY_LABELS, NEXT_BEST_ACTION_TYPE_LABELS, REVIEW_PHASE_LABELS, REVIEW_SCORE_LABELS, EVENT_KIND_LABELS, EVENT_STATUS_LABELS, labelOf } from "../../lib/reviewLabels";
 import type { DecisionReview, AgentRunItem } from "../../types";
 import styles from "./Operations.module.css";
 
@@ -65,7 +65,33 @@ function nextBestActionLabel(action?: Record<string, unknown>) {
 }
 
 function reviewTone(review: DecisionReview): StatusTone {
-  return review.approved ? "running" : "blocked";
+  switch (review.reviewPhase) {
+    case "approved":
+    case "sent":
+    case "auto_rewrite_approved":
+    case "auto_rewrite_sent":
+      return "running";
+    case "queued":
+    case "auto_rewrite_in_progress":
+    case "auto_rewrite_queued":
+      return "scheduled";
+    case "partially_sent":
+    case "delivery_unknown":
+      return "held";
+    case "auto_rewrite_failed":
+    case "final_blocked":
+    case "gateway_blocked":
+    case "delivery_failed":
+    case "delivery_canceled":
+      return "blocked";
+    default:
+      return review.approved ? "running" : "blocked";
+  }
+}
+
+function reviewConclusion(review: DecisionReview): string {
+  if (review.reviewPhase) return labelOf(REVIEW_PHASE_LABELS, review.reviewPhase);
+  return review.approved ? "通过" : blockedLabel(review);
 }
 
 // run envelope 终态 → StatusBadge tone（gateway_status 闭集，未知值回落 inactive）。
@@ -348,7 +374,7 @@ function OperationsWorkbench({ currentAccountId }: { currentAccountId: string })
               <tbody>
                 {scopedDecisionReviews.map((review) => (
                   <tr key={review.id}>
-                    <td><StatusBadge tone={reviewTone(review)}>{review.approved ? "通过" : blockedLabel(review)}</StatusBadge></td>
+                    <td><StatusBadge tone={reviewTone(review)}>{reviewConclusion(review)}</StatusBadge></td>
                     <td>{nextBestActionLabel(review.nextBestAction)}</td>
                     <td className={styles.cellMuted}>{labelOf(OUTCOME_STATUS_LABELS, review.outcomeStatus || "pending")}</td>
                     <td className={styles.cellNum}>{formatScores(review.scores)}</td>

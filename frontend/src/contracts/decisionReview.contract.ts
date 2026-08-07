@@ -21,6 +21,7 @@ export const CANONICAL_KEYS = [
   "reactionAnalysis",
   "replyText",
   "reviewSummary",
+  "reviewPhase",
   "rewriteInstruction",
   "risks",
   "runId",

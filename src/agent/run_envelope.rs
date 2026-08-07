@@ -37,6 +37,9 @@ pub const SOURCE_KIND_MANUAL_SEND: &str = "manual_send";
 /// Durable internal cards sent to a configured principal. This source is not
 /// a customer reply and must not inherit customer conversation side effects.
 pub const SOURCE_KIND_PRINCIPAL_ESCALATION: &str = "principal_escalation";
+/// Deterministic operational alert sent to the configured Ask-Human audience.
+/// It has its own incident lifecycle and never creates a principal decision.
+pub const SOURCE_KIND_SYSTEM_INCIDENT: &str = "system_incident";
 
 /// lifecycle 枚举（R0.3）。统一用 `&'static str` 暴露常量，避免散落字面量。
 pub const LIFECYCLE_STARTED: &str = "started";

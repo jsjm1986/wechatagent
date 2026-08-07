@@ -631,6 +631,7 @@ async fn run_prompt_shadow_branch(
         state,
         contact,
         inbound,
+        &prepared.recent,
         &decision,
         prepared.playbook.as_ref(),
         domain_config,

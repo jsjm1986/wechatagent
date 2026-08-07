@@ -1012,7 +1012,9 @@ fn classify_llm_error_for_user(error: &AppError, retry_count: u32) -> AppError {
             }
         }
         AppError::External(msg) => {
-            if msg.contains("llm_account_unavailable") {
+            if http_account_unavailable_reason(msg).is_some()
+                || msg.contains("llm_account_unavailable")
+            {
                 (
                     "account_unavailable",
                     "上游 LLM 账户不可用（余额不足、欠费或凭据已过期）。请恢复额度或更新凭据后重试。",
@@ -1084,6 +1086,82 @@ pub fn is_transient_llm_unavailable_kind(kind: &str) -> bool {
             | "network_error"
             | "body_decode_error"
     )
+}
+
+/// Whether an error means the configured upstream account cannot currently be
+/// used. Prefer the canonical structured kind, while recognizing 4xx status
+/// and body semantics produced before account-unavailable normalization.
+pub fn is_llm_account_unavailable(error: &AppError) -> bool {
+    llm_account_unavailable_reason(error).is_some()
+}
+
+/// Stable reason suitable for persistence and notifications. Raw upstream
+/// response bodies are deliberately not returned from this boundary.
+pub fn llm_account_unavailable_reason(error: &AppError) -> Option<&'static str> {
+    match error {
+        AppError::LlmUnavailable { kind, detail, .. } => {
+            if kind == "account_unavailable" {
+                http_account_unavailable_reason(detail).or_else(|| {
+                    if detail.contains("insufficient_balance") {
+                        Some("insufficient_balance")
+                    } else if detail.contains("credential_expired") {
+                        Some("invalid_credential")
+                    } else {
+                        Some("account_unavailable")
+                    }
+                })
+            } else if kind == "http_4xx" {
+                http_account_unavailable_reason(detail)
+            } else {
+                None
+            }
+        }
+        AppError::External(message) => {
+            if message.contains("insufficient_balance") {
+                Some("insufficient_balance")
+            } else if message.contains("credential_expired") {
+                Some("invalid_credential")
+            } else if message.contains("llm_account_unavailable") {
+                Some("account_unavailable")
+            } else {
+                http_account_unavailable_reason(message)
+            }
+        }
+        _ => None,
+    }
+}
+
+fn http_account_unavailable_reason(message: &str) -> Option<&'static str> {
+    let normalized = message.to_ascii_lowercase();
+    // Body-semantic matching is intentionally restricted to HTTP errors. The
+    // narrower `account_unavailable_reason` is also used on successful model
+    // content and must not turn ordinary business prose about API keys into an
+    // infrastructure incident.
+    if !normalized.contains("llm http 4") {
+        return None;
+    }
+    if normalized.contains("llm http 402")
+        || normalized.contains("insufficient balance")
+        || normalized.contains("insufficient credit")
+        || normalized.contains("payment required")
+        || normalized.contains("arrearage")
+        || message.contains("余额不足")
+        || message.contains("欠费")
+    {
+        Some("insufficient_balance")
+    } else if normalized.contains("llm http 401")
+        || normalized.contains("invalid api key")
+        || normalized.contains("invalid_api_key")
+        || normalized.contains("api key has expired")
+        || normalized.contains("expired api key")
+        || normalized.contains("credential_expired")
+        || message.contains("密钥已过期")
+        || message.contains("密钥过期")
+    {
+        Some("invalid_credential")
+    } else {
+        None
+    }
 }
 
 fn account_unavailable_reason(content: &str) -> Option<&'static str> {
@@ -2301,6 +2379,62 @@ mod tests {
             }
             other => panic!("expected LlmUnavailable, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn account_unavailable_classification_covers_canonical_and_legacy_statuses() {
+        let canonical = AppError::LlmUnavailable {
+            kind: "account_unavailable".to_string(),
+            retry_count: 0,
+            detail: "llm_account_unavailable: insufficient_balance".to_string(),
+            hint: String::new(),
+        };
+        assert_eq!(
+            llm_account_unavailable_reason(&canonical),
+            Some("insufficient_balance")
+        );
+
+        for (raw, reason) in [
+            ("LLM HTTP 401: redacted", "invalid_credential"),
+            ("LLM HTTP 402: redacted", "insufficient_balance"),
+            (
+                "LLM HTTP 400: Arrearage / Access denied because the account is not in good standing",
+                "insufficient_balance",
+            ),
+            ("LLM HTTP 403: invalid_api_key", "invalid_credential"),
+        ] {
+            let legacy = AppError::LlmUnavailable {
+                kind: "http_4xx".to_string(),
+                retry_count: 0,
+                detail: raw.to_string(),
+                hint: String::new(),
+            };
+            assert_eq!(llm_account_unavailable_reason(&legacy), Some(reason));
+            assert!(is_llm_account_unavailable(&legacy));
+
+            let classified =
+                classify_llm_error_for_user(&AppError::External(raw.to_string()), 0);
+            assert!(matches!(
+                classified,
+                AppError::LlmUnavailable { ref kind, .. } if kind == "account_unavailable"
+            ));
+            assert_eq!(llm_account_unavailable_reason(&classified), Some(reason));
+        }
+
+        let unrelated = AppError::LlmUnavailable {
+            kind: "http_4xx".to_string(),
+            retry_count: 0,
+            detail: "LLM HTTP 400: bad request".to_string(),
+            hint: String::new(),
+        };
+        assert_eq!(llm_account_unavailable_reason(&unrelated), None);
+        assert_eq!(
+            llm_account_unavailable_reason(&AppError::External(
+                "LLM HTTP 500: invalid_api_key".to_string()
+            )),
+            None,
+            "5xx remains an infrastructure failure even if its body echoes credential wording"
+        );
     }
 
     // 长任务防御：claude 偶发 tool_use 劫持（真内容跑进 tool_use block，text 只剩开场白）。

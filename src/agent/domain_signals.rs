@@ -108,6 +108,18 @@ pub(crate) fn set_dimension(decision: &mut AgentDecision, kind: &str, value: Str
     }
 }
 
+/// Remove a dimension from both the legacy typed field and the open signal container.
+/// This is used when a machine-generated taxonomy value is quarantined: clearing only
+/// one representation would let [`normalize_domain_signals`] restore it from the other.
+pub(crate) fn remove_dimension(decision: &mut AgentDecision, kind: &str) {
+    match kind {
+        "customer_stage" => decision.customer_stage = None,
+        "intent_level" => decision.intent_level = None,
+        _ => {}
+    }
+    decision.domain_signals.remove(kind);
+}
+
 /// 统一的画像维度写入内核：把 `signals` 中**每个非空字符串维度**以
 /// `domain_attributes.<key>` dotted-key 写进 `set_doc`。
 ///

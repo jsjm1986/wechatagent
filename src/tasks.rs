@@ -540,6 +540,18 @@ pub async fn run_task_worker(state: AppState) {
     }
 }
 
+/// Dedicated recovery lane for customer inbound replies. Webhooks still perform an immediate
+/// wake-up, while this worker guarantees that restart/backlog recovery never queues behind
+/// profiling, consolidation, campaigns, or proactive follow-ups.
+pub async fn run_inbound_reply_worker(state: AppState) {
+    loop {
+        if let Err(error) = tick_inbound_replies(&state).await {
+            tracing::error!(error = %error, "inbound reply worker tick failed");
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+}
+
 /// 执行一条已经由调用方以 [`TaskClaim`] 原子认领的任务，并在执行期间续约 lease。
 /// worker 与 Admin“立即复核”共用此入口，避免后者绕过 token/heartbeat 协议。
 pub async fn execute_claimed_task(
@@ -638,6 +650,33 @@ async fn process_claimed_task(
             }
         }
         Err(error) => {
+            if crate::llm::is_llm_account_unavailable(&error) {
+                assert_agent_task_status_valid("retry");
+                let now = DateTime::now();
+                let updated = state
+                    .db
+                    .tasks()
+                    .update_one(
+                        claim.owned_running_filter(),
+                        provider_unavailable_settlement_update(now),
+                        None,
+                    )
+                    .await?;
+                if updated.matched_count == 1 {
+                    agent::write_event_for_account(
+                        state,
+                        &task_workspace_id,
+                        &task_account_id,
+                        Some(&task_contact_wxid),
+                        "follow_up_blocked_provider_unavailable",
+                        "retry",
+                        "大模型账户不可用，任务已保留并等待服务恢复",
+                        None,
+                    )
+                    .await?;
+                }
+                return Ok(());
+            }
             if attempt_count < max_attempts {
                 let delay_seconds = retry_delay_seconds(attempt_count);
                 assert_agent_task_status_valid("retry");
@@ -1006,6 +1045,36 @@ async fn revive_failed_memory_tasks_with_rerun(state: &AppState) -> anyhow::Resu
     Ok(result.modified_count)
 }
 
+async fn tick_inbound_replies(state: &AppState) -> anyhow::Result<()> {
+    // Materialize any webhook->task handoff interrupted by a process crash before scanning.
+    let _ = crate::webhooks::reconcile_pending_inbound_handoffs(state).await?;
+    let now = DateTime::now();
+    let mut cursor = state
+        .db
+        .tasks()
+        .find(
+            doc! {
+                "kind": crate::webhooks::DURABLE_INBOUND_REPLY_KIND,
+                "status": { "$in": ["pending", "retry"] },
+                "$or": [
+                    { "run_at": { "$lte": now } },
+                    { "next_retry_at": { "$lte": now } },
+                ],
+            },
+            FindOptions::builder()
+                .limit(20)
+                .sort(doc! { "next_retry_at": 1, "run_at": 1, "_id": 1 })
+                .build(),
+        )
+        .await?;
+    while let Some(task) = cursor.try_next().await? {
+        if let Some(task_id) = task.id {
+            let _ = run_due_task_by_id(state, task_id).await?;
+        }
+    }
+    Ok(())
+}
+
 async fn tick(state: &AppState) -> anyhow::Result<()> {
     reconcile_committing_tasks(state).await?;
     // SR-177: an inbound message and its pending handoff marker are persisted in
@@ -1015,6 +1084,7 @@ async fn tick(state: &AppState) -> anyhow::Result<()> {
     // materialization. Recover any crash/interruption before claiming work.
     let _ = crate::agent::escalation::reconcile_pending_relay_intents(state).await?;
     let _ = crate::agent::escalation::reconcile_principal_card_deliveries(state).await?;
+    let _ = crate::agent::system_incident::reconcile_notifications(state).await?;
     // HC-021: the first dispatch freezes one audience snapshot before materializing
     // deterministic tasks. Resume any process crash between those durable steps.
     let _ = crate::routes::campaigns::reconcile_campaign_dispatches(state).await?;
@@ -1035,6 +1105,7 @@ async fn tick(state: &AppState) -> anyhow::Result<()> {
         .find(
             doc! {
                 "status": { "$in": ["pending", "retry"] },
+                "kind": { "$ne": crate::webhooks::DURABLE_INBOUND_REPLY_KIND },
                 "$or": [
                     { "run_at": { "$lte": DateTime::now() } },
                     { "next_retry_at": { "$lte": DateTime::now() } }
@@ -1068,6 +1139,30 @@ async fn tick(state: &AppState) -> anyhow::Result<()> {
 /// jitter01=0.5 即 0 jitter（基线），便于单测。
 fn retry_delay_seconds(attempt_count: i32) -> i64 {
     retry_delay_seconds_seeded(attempt_count, fastrand::f64())
+}
+
+fn provider_unavailable_retry_delay_seconds() -> i64 {
+    5 * 60
+}
+
+fn provider_unavailable_settlement_update(now: DateTime) -> Document {
+    doc! {
+        "$set": {
+            "status": "retry",
+            "gateway_status": "blocked_provider_unavailable",
+            "error": "llm account unavailable",
+            "next_retry_at": DateTime::from_millis(
+                now.timestamp_millis() + provider_unavailable_retry_delay_seconds() * 1000
+            ),
+            "updated_at": now,
+        },
+        "$inc": { "attempt_count": -1i32 },
+        "$unset": {
+            "claimed_at": "",
+            "claim_token": "",
+            "outbox_decision_id": "",
+        },
+    }
 }
 
 fn retry_delay_seconds_seeded(attempt_count: i32, jitter01: f64) -> i64 {
@@ -1734,6 +1829,33 @@ mod tests {
         assert_eq!(retry_delay_seconds_seeded(6, 0.5), 900);
         // 越界 attempt 也封顶。
         assert_eq!(retry_delay_seconds_seeded(99, 0.5), 900);
+    }
+
+    #[test]
+    fn provider_unavailable_settlement_preserves_retry_budget() {
+        let now = DateTime::from_millis(1_000);
+        let update = super::provider_unavailable_settlement_update(now);
+        let set = update.get_document("$set").unwrap();
+        assert_eq!(set.get_str("status").unwrap(), "retry");
+        assert_eq!(
+            set.get_str("gateway_status").unwrap(),
+            "blocked_provider_unavailable"
+        );
+        assert_eq!(set.get_str("error").unwrap(), "llm account unavailable");
+        assert_eq!(
+            set.get_datetime("next_retry_at")
+                .unwrap()
+                .timestamp_millis(),
+            301_000
+        );
+        assert_eq!(
+            update
+                .get_document("$inc")
+                .unwrap()
+                .get_i32("attempt_count")
+                .unwrap(),
+            -1
+        );
     }
 
     /// P1-8：jitter ∈ ±20% → attempt=2 base=120s 实际落在 [96, 144]。

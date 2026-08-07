@@ -42,6 +42,7 @@
   },
   "replyText": "您好，已收到",
   "reviewSummary": "通过",
+  "reviewPhase": "sent",
   "rewriteInstruction": "无需改写",
   "risks": [
     "low"

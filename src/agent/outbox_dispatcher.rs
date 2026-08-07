@@ -33,7 +33,9 @@ use crate::routes::AppState;
 use super::outbox::{
     backoff_with_jitter_seeded, check_second_safety_gate_pure, write_outbox_event, OutboxStatus,
 };
-use super::run_envelope::{SOURCE_KIND_MANUAL_SEND, SOURCE_KIND_PRINCIPAL_ESCALATION};
+use super::run_envelope::{
+    SOURCE_KIND_MANUAL_SEND, SOURCE_KIND_PRINCIPAL_ESCALATION, SOURCE_KIND_SYSTEM_INCIDENT,
+};
 
 fn principal_card_source_identity(source_event_id: &str) -> Option<(ObjectId, i64)> {
     let mut parts = source_event_id.split(':');
@@ -324,6 +326,17 @@ pub async fn atomic_claim_pending(
     worker: &str,
     lease_seconds: i32,
 ) -> AppResult<Option<OutboxEntry>> {
+    atomic_claim_pending_with_policy(state, worker, lease_seconds, false).await
+}
+
+/// Priority is the normal policy. Every fixed number of dispatcher claims, the caller requests
+/// oldest-first ordering so low-priority operational/media rows cannot starve indefinitely.
+async fn atomic_claim_pending_with_policy(
+    state: &AppState,
+    worker: &str,
+    lease_seconds: i32,
+    prefer_oldest: bool,
+) -> AppResult<Option<OutboxEntry>> {
     let collection = state.db.collection_agent_send_outbox();
     let now = DateTime::now();
     let lease_ms = (lease_seconds.max(1) as i64) * 1000;
@@ -357,13 +370,16 @@ pub async fn atomic_claim_pending(
             "send_started_at": "",
         },
     };
-    // finding ②：按 created_at 升序领取（FIFO），保证同一 run 的多段回复（文本
-    // seg0/seg1…后接媒体，各段独立 enqueue、created_at 单调递增）按入队顺序发出，
-    // 不被 MongoDB 自然序打乱成「媒体先于后续文本段」。_id 作同毫秒并列的稳定兜底
-    // （ObjectId 内含进程内递增计数器，等价入队顺序）。
+    let sort = if prefer_oldest {
+        // Aging pass: bounded FIFO service prevents starvation under a sustained inbound load.
+        doc! { "created_at": 1, "run_sequence": 1, "_id": 1 }
+    } else {
+        // Customer/manual text wins globally; sequence remains stable inside equal-priority runs.
+        doc! { "delivery_priority": -1, "created_at": 1, "run_sequence": 1, "_id": 1 }
+    };
     let options = FindOneAndUpdateOptions::builder()
         .return_document(ReturnDocument::After)
-        .sort(doc! { "created_at": 1, "_id": 1 })
+        .sort(sort)
         .build();
     Ok(collection
         .find_one_and_update(filter, update, options)
@@ -473,12 +489,49 @@ async fn task_send_authorization(
             "source task no longer exists".to_string(),
         ));
     };
+    let status = task.get_str("status").unwrap_or_default();
+    let task_token = task.get_str("claim_token").ok();
+    let decision_matches = task.get_object_id("outbox_decision_id").ok() == Some(decision_id);
+    let mut marker = entry.task_send_authorization_token.as_deref();
+    // Text authorization may commit before optional media/namecard rows are materialized. A row
+    // missing its marker may inherit it only from the same already-committed task/token/decision.
+    if marker.is_none()
+        && matches!(status, "outbox_enqueued" | "sent")
+        && task_token == Some(binding.1.as_str())
+        && decision_matches
+    {
+        if let Some(entry_id) = entry.id {
+            let repaired = state
+                .db
+                .collection_agent_send_outbox()
+                .update_one(
+                    doc! {
+                        "_id": entry_id,
+                        "decision_id": decision_id,
+                        "status": OutboxStatus::InFlight.as_str(),
+                        "$or": [
+                            { "task_send_authorization_token": { "$exists": false } },
+                            { "task_send_authorization_token": null },
+                        ],
+                    },
+                    doc! { "$set": {
+                        "task_send_authorization_token": &binding.1,
+                        "updated_at": DateTime::now(),
+                    } },
+                    None,
+                )
+                .await?;
+            if repaired.matched_count == 1 {
+                marker = Some(binding.1.as_str());
+            }
+        }
+    }
     Ok(classify_task_send_authorization(
-        task.get_str("status").unwrap_or_default(),
+        status,
         &binding.1,
-        task.get_str("claim_token").ok(),
-        task.get_object_id("outbox_decision_id").ok() == Some(decision_id),
-        entry.task_send_authorization_token.as_deref(),
+        task_token,
+        decision_matches,
+        marker,
     ))
 }
 
@@ -834,7 +887,10 @@ pub async fn second_safety_gate(
     state: &AppState,
     entry: &OutboxEntry,
 ) -> AppResult<Option<String>> {
-    if entry.source_kind == SOURCE_KIND_PRINCIPAL_ESCALATION {
+    if matches!(
+        entry.source_kind.as_str(),
+        SOURCE_KIND_PRINCIPAL_ESCALATION | SOURCE_KIND_SYSTEM_INCIDENT
+    ) {
         return Ok(None);
     }
     let now = DateTime::now();
@@ -2562,7 +2618,7 @@ async fn commit_verified_delivery(
     state: &AppState,
     entry_id: ObjectId,
     entry: &OutboxEntry,
-    contact: &crate::models::Contact,
+    contact: Option<&crate::models::Contact>,
     note: &str,
     reason: &str,
 ) -> AppResult<bool> {
@@ -2588,8 +2644,10 @@ async fn commit_verified_delivery(
     )
     .await;
     refresh_run_log_outbox_status(state, &entry.run_id).await;
-    finalize_delivered_text_decision(state, entry, contact).await;
-    super::send_ledger::record_send_for_entry(state, entry, contact, delivered_at).await;
+    if let Some(contact) = contact {
+        finalize_delivered_text_decision(state, entry, contact).await;
+        super::send_ledger::record_send_for_entry(state, entry, contact, delivered_at).await;
+    }
     Ok(true)
 }
 
@@ -2597,7 +2655,7 @@ async fn settle_ambiguous_send(
     state: &AppState,
     entry_id: ObjectId,
     entry: &OutboxEntry,
-    contact: &crate::models::Contact,
+    contact: Option<&crate::models::Contact>,
     failure_reason: &str,
 ) -> AppResult<()> {
     use super::types::DeliveryVerification;
@@ -2648,7 +2706,7 @@ pub(crate) fn check_contact_status_pure(
 ) -> Option<&'static str> {
     if matches!(
         source_kind,
-        SOURCE_KIND_MANUAL_SEND | SOURCE_KIND_PRINCIPAL_ESCALATION
+        SOURCE_KIND_MANUAL_SEND | SOURCE_KIND_PRINCIPAL_ESCALATION | SOURCE_KIND_SYSTEM_INCIDENT
     ) {
         return None;
     }
@@ -2681,6 +2739,16 @@ pub async fn process_entry(state: &AppState, entry: &OutboxEntry) -> AppResult<(
         .await?;
         return Ok(());
     }
+    if !super::system_incident::send_is_authorized(state, entry).await? {
+        cancel_entry(
+            state,
+            entry_id,
+            entry,
+            "system_incident_generation_no_longer_authorized",
+        )
+        .await?;
+        return Ok(());
+    }
 
     // SR-034 第一检查点：正常 Gateway 可能刚写入首段、尚未提交 task 授权；此时无损
     // defer。若 token/decision 已被新 owner 替换，则在任何业务查询和 MCP 前取消。
@@ -2708,23 +2776,17 @@ pub async fn process_entry(state: &AppState, entry: &OutboxEntry) -> AppResult<(
             None,
         )
         .await?;
-    let contact = match contact {
-        Some(c) => c,
-        None => {
-            schedule_retry_or_terminal(
-                state,
-                entry_id,
-                entry,
-                "contact not found at dispatch time",
-            )
+    if contact.is_none() && entry.source_kind != SOURCE_KIND_SYSTEM_INCIDENT {
+        schedule_retry_or_terminal(state, entry_id, entry, "contact not found at dispatch time")
             .await?;
+        return Ok(());
+    }
+
+    if let Some(contact) = contact.as_ref() {
+        if let Some(reason) = check_contact_status_pure(&entry.source_kind, &contact.agent_status) {
+            cancel_entry(state, entry_id, entry, reason).await?;
             return Ok(());
         }
-    };
-
-    if let Some(reason) = check_contact_status_pure(&entry.source_kind, &contact.agent_status) {
-        cancel_entry(state, entry_id, entry, reason).await?;
-        return Ok(());
     }
 
     // ⑪：账号掉线时不盲发。webhook 收到 Offline 事件落库 online=false（见 webhooks.rs），
@@ -2759,7 +2821,7 @@ pub async fn process_entry(state: &AppState, entry: &OutboxEntry) -> AppResult<(
                     state,
                     entry_id,
                     entry,
-                    &contact,
+                    contact.as_ref(),
                     note,
                     "crash_reclaim",
                 )
@@ -2837,6 +2899,16 @@ pub async fn process_entry(state: &AppState, entry: &OutboxEntry) -> AppResult<(
         .await?;
         return Ok(());
     }
+    if !super::system_incident::send_is_authorized(state, entry).await? {
+        cancel_entry(
+            state,
+            entry_id,
+            entry,
+            "system_incident_generation_no_longer_authorized",
+        )
+        .await?;
+        return Ok(());
+    }
 
     // Last cancellable point. The CAS fails when an admin/user cancellation request won, the
     // lease was reclaimed, or another owner replaced this claim. In every case this worker must
@@ -2846,7 +2918,10 @@ pub async fn process_entry(state: &AppState, entry: &OutboxEntry) -> AppResult<(
     }
 
     let send_fut = async {
-        if entry.source_kind == SOURCE_KIND_PRINCIPAL_ESCALATION {
+        if matches!(
+            entry.source_kind.as_str(),
+            SOURCE_KIND_PRINCIPAL_ESCALATION | SOURCE_KIND_SYSTEM_INCIDENT
+        ) {
             let response = crate::mcp::logged_send_call_for_account(
                 state,
                 &entry.workspace_id,
@@ -2863,23 +2938,39 @@ pub async fn process_entry(state: &AppState, entry: &OutboxEntry) -> AppResult<(
                 super::gateway::SendReceiptStatus::Succeeded => Ok(response),
                 super::gateway::SendReceiptStatus::ExplicitlyFailed => {
                     Err(super::types::OutboundSendError::SafeToRetry(
-                        "principal escalation card returned an explicit negative delivery receipt"
+                        "internal notification returned an explicit negative delivery receipt"
                             .to_string(),
                     ))
                 }
                 super::gateway::SendReceiptStatus::Inconclusive => {
                     Err(super::types::OutboundSendError::DeliveryUncertain(
-                        "principal escalation card returned an unverifiable delivery receipt"
+                        "internal notification returned an unverifiable delivery receipt"
                             .to_string(),
                     ))
                 }
             }
         } else if let Some(card_id) = entry.referral_card_id.as_deref() {
-            super::referral::send_outbound_namecard(state, &contact, card_id).await
+            super::referral::send_outbound_namecard(
+                state,
+                contact.as_ref().expect("non-system send requires contact"),
+                card_id,
+            )
+            .await
         } else if let Some(asset_id) = entry.media_asset_id.as_deref() {
-            super::media_send::send_outbound_media(state, &contact, asset_id).await
+            super::media_send::send_outbound_media(
+                state,
+                contact.as_ref().expect("non-system send requires contact"),
+                asset_id,
+            )
+            .await
         } else {
-            super::gateway::send_outbound_message(state, &contact, &entry.content, extra_raw).await
+            super::gateway::send_outbound_message(
+                state,
+                contact.as_ref().expect("non-system send requires contact"),
+                &entry.content,
+                extra_raw,
+            )
+            .await
         }
     };
     let send_result =
@@ -2913,23 +3004,26 @@ pub async fn process_entry(state: &AppState, entry: &OutboxEntry) -> AppResult<(
             )
             .await;
             refresh_run_log_outbox_status(state, &entry.run_id).await;
-            finalize_delivered_text_decision(state, entry, &contact).await;
+            if let Some(contact) = contact.as_ref() {
+                finalize_delivered_text_decision(state, entry, contact).await;
 
-            // 主动发送台账：素材/名片条目记一条（纯文本不记）。fail-soft，不影响已成发送。
-            super::send_ledger::record_send_for_entry(state, entry, &contact, delivered_at).await;
+                // 主动发送台账：素材/名片条目记一条（纯文本不记）。fail-soft，不影响已成发送。
+                super::send_ledger::record_send_for_entry(state, entry, contact, delivered_at)
+                    .await;
+            }
         }
         Ok(Err(super::types::OutboundSendError::SafeToRetry(reason))) => {
             schedule_retry_or_terminal(state, entry_id, entry, &reason).await?;
         }
         Ok(Err(super::types::OutboundSendError::DeliveryUncertain(reason))) => {
-            settle_ambiguous_send(state, entry_id, entry, &contact, &reason).await?;
+            settle_ambiguous_send(state, entry_id, entry, contact.as_ref(), &reason).await?;
         }
         Err(_) => {
             settle_ambiguous_send(
                 state,
                 entry_id,
                 entry,
-                &contact,
+                contact.as_ref(),
                 "send timed out after the remote boundary",
             )
             .await?;
@@ -3053,6 +3147,8 @@ pub(crate) async fn write_event_with_cap(
 /// 默认 poll 间隔（秒）。worker 是单例后台任务，与 per-account
 /// `UserRuntimeParameters.outbox_poll_interval_seconds` 区分；后者是 agent 决策
 /// 路径的偏好，本 worker 用全局默认即可。
+static OUTBOX_CLAIM_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 const DEFAULT_POLL_INTERVAL_SECONDS: u64 = 5;
 
 /// 默认 lease 时长（秒）。必须 **严格大于** `MCP_SEND_TIMEOUT_SECONDS`（见其
@@ -3091,8 +3187,12 @@ async fn tick(state: &AppState, worker: &str, lease_seconds: i32) -> AppResult<(
     // Manual sends can be canceled/terminalized outside this worker. Release their pause once
     // durable Outbox truth is known; delivery_unknown deliberately remains paused.
     let _ = crate::webhooks::reconcile_manual_reply_obligations(state).await?;
+    const AGING_CLAIM_EVERY: u64 = 10;
     for _ in 0..PER_TICK_PROCESS_CAP {
-        let claimed = atomic_claim_pending(state, worker, lease_seconds).await?;
+        let sequence = OUTBOX_CLAIM_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let prefer_oldest = sequence % AGING_CLAIM_EVERY == AGING_CLAIM_EVERY - 1;
+        let claimed =
+            atomic_claim_pending_with_policy(state, worker, lease_seconds, prefer_oldest).await?;
         let entry = match claimed {
             Some(e) => e,
             None => break,
@@ -3368,6 +3468,13 @@ mod tests {
         );
         assert!(
             check_contact_status_pure(SOURCE_KIND_MANUAL_SEND, &AgentStatus::Managed).is_none()
+        );
+    }
+
+    #[test]
+    fn contact_status_gate_passthrough_for_system_incident() {
+        assert!(
+            check_contact_status_pure(SOURCE_KIND_SYSTEM_INCIDENT, &AgentStatus::Normal).is_none()
         );
     }
 

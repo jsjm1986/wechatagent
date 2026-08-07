@@ -33,8 +33,10 @@ const CIRCUIT_POLL_SECONDS: u64 = 30;
 
 pub const SUPERVISED_WORKERS: &[&str] = &[
     "task_worker",
+    "inbound_reply_worker",
     "import_worker",
     "outbox_dispatcher",
+    "post_decision_worker",
     "media_storage_reconciler",
     "strategic_planner",
     "cold_contact_worker",

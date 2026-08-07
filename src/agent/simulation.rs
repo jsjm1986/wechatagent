@@ -222,6 +222,7 @@ async fn simulate_user_dialogue_inner(
                 state,
                 &contact,
                 &inbound,
+                &recent,
                 &decision,
                 playbook.as_ref(),
                 domain_config.as_ref(),

@@ -614,16 +614,18 @@ describe("EvolutionCenterTab", () => {
   });
 
   it("总开关 PUT 失败时保持服务端原值并显示错误", async () => {
-    fetchMock.mockResolvedValueOnce(
-      mockRuntimeFlag({ envEvolutionEnabled: true, enabled: false, rolloutPercent: 0 }),
-    );
-    fetchMock.mockResolvedValueOnce({
-      ok: true,
-      json: async () => makeExperimentsResponse([]),
-    });
-    fetchMock.mockResolvedValueOnce({
-      ok: false,
-      text: async () => "save failed",
+    fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === "/api/evolution/runtime-flag" && init?.method === "PUT") {
+        return { ok: false, text: async () => "save failed" };
+      }
+      if (url === "/api/evolution/runtime-flag") {
+        return mockRuntimeFlag({ envEvolutionEnabled: true, enabled: false, rolloutPercent: 0 });
+      }
+      if (url.startsWith("/api/evolution/experiments")) {
+        return { ok: true, json: async () => makeExperimentsResponse([]) };
+      }
+      throw new Error(`unexpected fetch in test: ${url}`);
     });
 
     render(<EvolutionCenterTab enabled={true} />);

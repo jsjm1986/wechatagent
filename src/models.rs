@@ -3517,6 +3517,14 @@ pub struct OutboxEntry {
     pub content: String,
     pub content_hash: String,
     pub idempotency_key: String,
+    /// 发送调度优先级；数值越大越先领取。缺失字段兼容历史文档为 0。
+    /// 该字段只影响领取顺序，不参与幂等键或发送授权。
+    #[serde(default)]
+    pub delivery_priority: i32,
+    /// 同一 run 内的稳定顺序号：文本分段从 0 递增，媒体/名片排在文本之后。
+    /// Dispatcher 仍以 created_at 作为跨 run 公平顺序，本字段用于同毫秒稳定排序与审计。
+    #[serde(default)]
+    pub run_sequence: i32,
     /// 销售素材发送条目：非空表示这条 outbox 发的是 ContentAsset 文件而非文本。
     /// dispatcher 据此走 send_outbound_media。`#[serde(default)]` 兼容旧文档。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3571,6 +3579,56 @@ pub struct OutboxEntry {
     pub created_at: DateTime,
     pub updated_at: DateTime,
     pub sent_at: Option<DateTime>,
+}
+
+/// Operational incident notification recipient frozen when an incident
+/// generation is opened. The account is part of the authorization identity:
+/// dispatchers may not substitute another WeChat account later.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SystemIncidentRecipient {
+    pub account_id: String,
+    pub wxid: String,
+}
+
+/// Durable operational incident lifecycle. This collection is deliberately
+/// separate from principal business escalations: an LLM account outage is an
+/// infrastructure condition, not a customer decision requiring approval.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SystemIncident {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub workspace_id: String,
+    pub incident_key: String,
+    pub kind: String,
+    pub status: String,
+    pub generation: i64,
+    pub provider_id: String,
+    pub model: String,
+    pub reason: String,
+    pub recipients: Vec<SystemIncidentRecipient>,
+    pub occurrence_count: i64,
+    /// Start time of the first upstream request that failed in this generation.
+    /// Request time, rather than response arrival time, provides the causal
+    /// ordering used to reject late success/failure observations.
+    pub first_failure_started_at: DateTime,
+    /// Greatest request start time among failures observed in this generation.
+    pub last_failure_started_at: DateTime,
+    /// Generation whose outage notifications have all been durably enqueued.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outage_enqueued_generation: Option<i64>,
+    /// Generation whose recovery notifications have all been durably enqueued.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_enqueued_generation: Option<i64>,
+    pub first_observed_at: DateTime,
+    pub last_observed_at: DateTime,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovered_at: Option<DateTime>,
+    /// Request start time of the successful uncached probe that recovered this
+    /// generation. A later-arriving failure from an older request cannot reopen it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_probe_started_at: Option<DateTime>,
+    pub created_at: DateTime,
+    pub updated_at: DateTime,
 }
 
 /// agent-autonomy-loop W0：`system_taxonomies` 集合占位结构。
@@ -6588,6 +6646,8 @@ mod typed_tests {
             content: "你好，欢迎咨询".to_string(),
             content_hash: "sha256:abcdef".to_string(),
             idempotency_key: "evt-source-001:wxid_test_001:sha256:abcdef".to_string(),
+            delivery_priority: 0,
+            run_sequence: 0,
             media_asset_id: None,
             referral_card_id: None,
             attempt: 0,
