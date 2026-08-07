@@ -361,4 +361,44 @@ describe("RosterView — 通讯录批量托管视图（Task 8）", () => {
       vi.useRealTimers();
     }
   });
+
+  // 列表里每张卡显示的是**好友**的 wxid，和自己的账号 ID 混在一起看不出区别，
+  // 所以头部要标明「本账号微信 ID」。
+  it("头部显示当前账号自己的微信 ID 与昵称", async () => {
+    useAccountStore.setState({
+      accounts: [
+        {
+          accountId: "acc1",
+          alias: "测试账号",
+          displayName: "测试账号",
+          wxid: "wxid_self_me",
+          nickName: "我的昵称",
+          online: true,
+        } as never,
+      ],
+      selectedAccountId: "acc1",
+    });
+    render(
+      <ToastProvider>
+        <RosterView />
+      </ToastProvider>
+    );
+    expect(await screen.findByText("本账号微信 ID")).toBeInTheDocument();
+    expect(screen.getByText("wxid_self_me")).toBeInTheDocument();
+    expect(screen.getByText("我的昵称")).toBeInTheDocument();
+  });
+
+  // wxid 可能为空（账号刚建、MCP 未回传身份）。此时整行不渲染，
+  // 而不是显示「本账号微信 ID:（空）」。
+  it("账号无 wxid 时不渲染身份行", async () => {
+    // seedAccount() 的账号本身不带 wxid。
+    render(
+      <ToastProvider>
+        <RosterView />
+      </ToastProvider>
+    );
+    // 等列表落地，确认组件已渲染完毕再断言缺失。
+    expect(await screen.findByText("老客户")).toBeInTheDocument();
+    expect(screen.queryByText("本账号微信 ID")).not.toBeInTheDocument();
+  });
 });

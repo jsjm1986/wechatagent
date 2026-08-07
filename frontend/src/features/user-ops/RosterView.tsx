@@ -33,6 +33,10 @@ export function RosterView() {
       ? s.selectedAccountId
       : s.accounts[0]?.accountId ?? ""
   );
+  // 当前账号对象：用于在头部显示「本账号的微信 ID」。
+  // 不用 store 的 currentAccount() 作为 selector——它每次返回新引用会导致重复渲染；
+  // 从已订阅的 accounts + effectiveAccountId 推导，引用稳定。
+  const currentAccount = accounts.find((a) => a.accountId === effectiveAccountId);
   const loadRoster = useUserOpsStore((s) => s.loadRoster);
   const batchEnable = useUserOpsStore((s) => s.batchEnable);
   const playbooks = useUserOpsStore((s) => s.playbooks);
@@ -170,6 +174,19 @@ export function RosterView() {
           <span className={styles.eyebrow}>通讯录</span>
           <h2 className={styles.title}>微信好友总览</h2>
           <p className={styles.subtitle}>选择账号拉取全部好友，勾选后批量进入 Agent 运营。</p>
+          {/* 本账号身份行：列表里每张卡显示的是**好友**的 wxid，容易和自己的搞混，
+              所以在头部明确标出当前账号自己的微信 ID。
+              wxid 可能为空（MCP 未回传身份，如刚建账号未登录），此时整行不渲染，
+              而不是显示「微信 ID: 空」。 */}
+          {currentAccount?.wxid && (
+            <p className={styles.selfIdentity}>
+              <span className={styles.selfIdentityLabel}>本账号微信 ID</span>
+              <code className={styles.selfIdentityValue}>{currentAccount.wxid}</code>
+              {currentAccount.nickName && (
+                <span className={styles.selfIdentityNick}>{currentAccount.nickName}</span>
+              )}
+            </p>
+          )}
         </div>
         <div className={styles.headerActions}>
           {accounts.length > 1 && (
