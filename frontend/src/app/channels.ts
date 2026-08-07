@@ -54,7 +54,13 @@ const CampaignFeature = lazy(() => import("../features/campaign"));
  *  历史分组混了两个维度（`账号管理`/`请示通道配置` 是配置却在「运营」，
  *  `运营成效`/`发送成效` 是业务指标却在「系统」），导致既不好按业务找、
  *  也不好按系统层找。 */
-export type ChannelGroup = "日常" | "运营" | "知识与内容" | "成效" | "设置";
+export type ChannelGroup =
+  | "运营对象"
+  | "AI 的资料"
+  | "需要你决策"
+  | "运行与结果"
+  | "系统"
+  | "即将上线";
 
 /** 侧栏一级分组的显示顺序。单一事实来源——Shell.tsx 不再维护第二份顺序数组
  *  （两份必然漂移）。
@@ -67,11 +73,12 @@ export type ChannelGroup = "日常" | "运营" | "知识与内容" | "成效" | 
  *  必须 hover 才知道是什么。单列形态下分组标签是文字，两个字段都没有消费者，
  *  故连同那 5 个 lucide 图标 import 一起删掉，不留死代码。 */
 export const GROUP_ORDER: ReadonlyArray<ChannelGroup> = [
-  "日常",
-  "运营",
-  "知识与内容",
-  "成效",
-  "设置",
+  "运营对象",
+  "AI 的资料",
+  "需要你决策",
+  "运行与结果",
+  "系统",
+  "即将上线",
 ];
 
 export interface ChannelDef {
@@ -98,7 +105,7 @@ export interface ChannelDef {
 export const CHANNELS: ChannelDef[] = [
   {
     id: "command",
-    group: "日常",
+    group: "运行与结果",
     label: "AI 总控",
     caption: "Command Center",
     icon: BrainCircuit,
@@ -109,7 +116,7 @@ export const CHANNELS: ChannelDef[] = [
   },
   {
     id: "accountManagement",
-    group: "设置",
+    group: "系统",
     label: "账号管理",
     caption: "微信账号",
     icon: Contact,
@@ -120,7 +127,7 @@ export const CHANNELS: ChannelDef[] = [
   },
   {
     id: "overview",
-    group: "日常",
+    group: "运行与结果",
     label: "工作台",
     caption: "运行态势",
     icon: LayoutDashboard,
@@ -131,7 +138,7 @@ export const CHANNELS: ChannelDef[] = [
   },
   {
     id: "userOps",
-    group: "运营",
+    group: "运营对象",
     label: "用户运营",
     caption: "私聊关系运营",
     icon: UserRoundCheck,
@@ -142,7 +149,7 @@ export const CHANNELS: ChannelDef[] = [
   },
   {
     id: "groupOps",
-    group: "运营",
+    group: "即将上线",
     label: "微信群运营",
     caption: "群分析与线索",
     icon: UsersRound,
@@ -154,7 +161,7 @@ export const CHANNELS: ChannelDef[] = [
   },
   {
     id: "momentOps",
-    group: "运营",
+    group: "即将上线",
     label: "朋友圈运营",
     caption: "内容计划",
     icon: Sparkles,
@@ -166,7 +173,7 @@ export const CHANNELS: ChannelDef[] = [
   },
   {
     id: "content",
-    group: "知识与内容",
+    group: "AI 的资料",
     label: "内容资产",
     caption: "话术 / 素材",
     icon: FileText,
@@ -177,7 +184,7 @@ export const CHANNELS: ChannelDef[] = [
   },
   {
     id: "referralCards",
-    group: "知识与内容",
+    group: "AI 的资料",
     label: "专属顾问",
     caption: "名片引荐库",
     icon: Contact,
@@ -188,7 +195,7 @@ export const CHANNELS: ChannelDef[] = [
   },
   {
     id: "askHuman",
-    group: "日常",
+    group: "需要你决策",
     label: "统一收件箱",
     caption: "Ask-Human Inbox",
     icon: Inbox,
@@ -199,7 +206,7 @@ export const CHANNELS: ChannelDef[] = [
   },
   {
     id: "askHumanConfig",
-    group: "设置",
+    group: "需要你决策",
     label: "请示通道配置",
     caption: "Ask-Human Policy",
     icon: SlidersHorizontal,
@@ -210,7 +217,7 @@ export const CHANNELS: ChannelDef[] = [
   },
   {
     id: "campaign",
-    group: "运营",
+    group: "运营对象",
     label: "活动",
     caption: "Campaign",
     icon: Megaphone,
@@ -221,7 +228,7 @@ export const CHANNELS: ChannelDef[] = [
   },
   {
     id: "productsDeals",
-    group: "运营",
+    group: "运营对象",
     label: "产品与成交",
     caption: "Products & Deals",
     icon: PackageSearch,
@@ -232,7 +239,7 @@ export const CHANNELS: ChannelDef[] = [
   },
   {
     id: "knowledgeWiki",
-    group: "知识与内容",
+    group: "AI 的资料",
     label: "知识库 Wiki",
     caption: "录入 / 审核 / 问答",
     icon: FileBox,
@@ -243,7 +250,7 @@ export const CHANNELS: ChannelDef[] = [
   },
   {
     id: "systemStrategy",
-    group: "设置",
+    group: "系统",
     label: "系统策略",
     caption: "全局与总控",
     icon: Settings2,
@@ -254,7 +261,7 @@ export const CHANNELS: ChannelDef[] = [
   },
   {
     id: "llmProviders",
-    group: "设置",
+    group: "系统",
     label: "AI 模型配置",
     caption: "LLM Providers",
     icon: Bot,
@@ -265,7 +272,7 @@ export const CHANNELS: ChannelDef[] = [
   },
   {
     id: "operations",
-    group: "成效",
+    group: "运行与结果",
     label: "任务日志",
     caption: "执行审计",
     icon: Activity,
@@ -276,7 +283,7 @@ export const CHANNELS: ChannelDef[] = [
   },
   {
     id: "autonomy",
-    group: "成效",
+    group: "系统",
     label: "自治回路监控",
     caption: "Autonomy Loop",
     icon: ShieldCheck,
@@ -287,7 +294,7 @@ export const CHANNELS: ChannelDef[] = [
   },
   {
     id: "evolution",
-    group: "成效",
+    group: "系统",
     label: "演化中心",
     caption: "Self Evolution",
     icon: ShieldCheck,
@@ -298,7 +305,7 @@ export const CHANNELS: ChannelDef[] = [
   },
   {
     id: "quality",
-    group: "成效",
+    group: "运行与结果",
     label: "运营成效",
     caption: "指标与质量",
     icon: Workflow,
@@ -309,7 +316,7 @@ export const CHANNELS: ChannelDef[] = [
   },
   {
     id: "sendAnalytics",
-    group: "成效",
+    group: "运行与结果",
     label: "发送成效",
     caption: "Send Analytics",
     icon: BarChart3,
