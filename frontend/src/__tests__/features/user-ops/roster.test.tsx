@@ -3,7 +3,7 @@
 //       (2) 勾选 2 条 not_imported + 填共享运营备注 + 点「加入 Agent 运营」→ POST /contacts/batch-enable，
 //           body 含 accountId / candidates(len 2) / sharedNote（camelCase wire 键）。
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, waitFor, act } from "@testing-library/react";
+import { render, screen, waitFor, act, fireEvent } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { RosterView } from "../../../features/user-ops/RosterView";
 import { ToastProvider } from "../../../components/ui/Toast";
@@ -400,5 +400,73 @@ describe("RosterView — 通讯录批量托管视图（Task 8）", () => {
     // 等列表落地，确认组件已渲染完毕再断言缺失。
     expect(await screen.findByText("老客户")).toBeInTheDocument();
     expect(screen.queryByText("本账号微信 ID")).not.toBeInTheDocument();
+  });
+
+  // 后端 force 是「触发后台单飞 + 立即返回旧快照」，点刷新时列表内容一模一样。
+  // 前端据 fetchedAt 基线轮询，直到快照真的换了才提示「已更新」——否则用户以为按钮坏了。
+  it("点刷新后轮询到 fetchedAt 变化 → 提示已更新", async () => {
+    vi.useFakeTimers();
+    try {
+      getMock.mockResolvedValue({ items: ROSTER, fetchedAt: "2026-08-07T01:00:00Z" });
+      render(
+        <ToastProvider>
+          <RosterView />
+        </ToastProvider>
+      );
+      await vi.waitFor(() => expect(screen.getByText("老客户")).toBeInTheDocument());
+
+      // 点刷新进入等待轮询态。用 fireEvent 而非 userEvent：后者内部有自己的
+      // 延时链，在假定时器下会挂住。
+      fireEvent.click(screen.getByRole("button", { name: /刷新/ }));
+      // 此刻后端仍返回旧快照（force 是「触发后台单飞 + 立即返回旧快照」），
+      // 所以缓存里的快照龄还是基线值——这正是「点了看起来没反应」的由来。
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(4000);
+      });
+      expect(
+        useUserOpsStore.getState().rosterCache.acc1?.serverFetchedAt
+      ).toBe("2026-08-07T01:00:00Z");
+
+      // 后台写入新快照 → 轮询下一轮观测到 fetchedAt 变化 → 落缓存、停轮询、提示已更新。
+      // 断言落在缓存收敛而非 toast DOM：toast 只活 3s（DURATION.success），
+      // 假定时器下推进时间必然把它推到消失，断 DOM 会脆。
+      getMock.mockResolvedValue({ items: ROSTER, fetchedAt: "2026-08-07T02:00:00Z" });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(4000);
+      });
+      expect(
+        useUserOpsStore.getState().rosterCache.acc1?.serverFetchedAt
+      ).toBe("2026-08-07T02:00:00Z");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // 回归：轮询若走 refresh() 会清空勾选/备注草稿（那是切账号语义），
+  // 用户点完刷新继续勾人时勾到一半被清空 —— 比原本「刷新没反应」更糟。
+  it("刷新等待轮询不清空已勾选的好友", async () => {
+    vi.useFakeTimers();
+    try {
+      getMock.mockResolvedValue({ items: ROSTER, fetchedAt: "2026-08-07T01:00:00Z" });
+      render(
+        <ToastProvider>
+          <RosterView />
+        </ToastProvider>
+      );
+      await vi.waitFor(() => expect(screen.getByText("新好友一")).toBeInTheDocument());
+
+      // 先点刷新进入等待轮询态。点击瞬间 loading=true、列表被「加载中…」替换，
+      // 所以要等它落地、卡片回到 DOM 才能勾人（模拟用户边等边操作）。
+      fireEvent.click(screen.getByRole("button", { name: /刷新/ }));
+      await vi.waitFor(() => expect(screen.getByText("新好友一")).toBeInTheDocument());
+      fireEvent.click(screen.getByText("新好友一").closest("button")!);
+      expect(screen.getByText(/已选 1 人/)).toBeInTheDocument();
+
+      // 轮询跑两轮，勾选必须还在。
+      await vi.advanceTimersByTimeAsync(7000);
+      expect(screen.getByText(/已选 1 人/)).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

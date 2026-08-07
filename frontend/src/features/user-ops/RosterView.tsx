@@ -42,6 +42,11 @@ export function RosterView() {
   const playbooks = useUserOpsStore((s) => s.playbooks);
   const publishedPlaybooks = playbooks.filter((playbook) => playbook.releaseStatus === "published");
   const toast = useToast();
+  // ToastProvider 每次渲染都重建 api 对象字面量，引用不稳定。若把 toast 放进
+  // 轮询 effect 的依赖，每次渲染都会重建 interval、3s 定时器永远走不到头，轮询
+  // 形同不存在（实测就是这样：新快照落地也不提示）。用 ref 拿最新引用、不进依赖。
+  const toastRef = useRef(toast);
+  toastRef.current = toast;
 
   const rosterCache = useUserOpsStore((s) => s.rosterCache);
   const cached = rosterCache[effectiveAccountId];
@@ -60,6 +65,10 @@ export function RosterView() {
   // 丢弃过时响应——否则先发的（账号 A）若晚于后发的（账号 B）返回，会用 A 的好友覆盖
   // B 的列表，而选中账号已是 B，导致列表与账号错配、勾选提交用 B 的 accountId 配 A 的 wxid。
   const reqSeqRef = useRef(0);
+  // 点「刷新」时记下当时的快照时间戳作为基线：后端 force 是「触发后台单飞 + 立即返回
+  // 旧快照」，所以点完列表内容一模一样，看起来像坏了。记下基线后轮询，直到 fetchedAt
+  // 变化才提示「已更新」，用户才知道刷新真的完成了。null = 当前没有等待中的刷新。
+  const [awaitingSince, setAwaitingSince] = useState<string | null | undefined>(undefined);
 
   const refresh = useCallback(
     async (accountId: string, opts?: { force?: boolean }) => {
@@ -72,14 +81,21 @@ export function RosterView() {
       setSelectedWxids(new Set());
       setSharedNote("");
       setPlaybookId("");
+      // force 前先取基线（此刻缓存里的快照龄）。从 getState() 直读而非闭包捕获，
+      // 避免拿到上一次渲染的过时值。
+      const baseline = opts?.force
+        ? useUserOpsStore.getState().rosterCache[accountId]?.serverFetchedAt ?? null
+        : undefined;
       try {
         const { syncing: isSyncing } = await loadRoster(accountId, opts);
         if (isStale()) return; // 已有更新的请求发出，丢弃本次过时结果。
         // roster 现从 store 缓存派生（跨挂载存活）；syncing 瞬态不入缓存，仍在此驱动自动重拉 effect。
         setSyncing(isSyncing);
+        if (opts?.force) setAwaitingSince(baseline);
       } catch (e) {
         if (isStale()) return;
         setError(e instanceof Error ? e.message : "加载好友列表失败");
+        setAwaitingSince(undefined); // 失败就不再等待，否则会一直转圈。
       } finally {
         // 仅最新请求负责收起 loading——过时请求提前收起会让进行中的最新请求看起来已完成。
         if (!isStale()) setLoading(false);
@@ -101,6 +117,48 @@ export function RosterView() {
     }, 10000);
     return () => clearInterval(timer);
   }, [syncing, effectiveAccountId, refresh]);
+
+  // 刷新等待轮询：点「刷新」后每 3s 静默重读，直到快照的 serverFetchedAt 与基线不同
+  // → 后台已写入新快照 → 提示「已更新」并停。兜底 60s 超时：后台可能仍在退避重试
+  // （最多 5 次、3/6/12/24/48s），超时就告诉用户稍后再看，而不是无限转圈。
+  //
+  // **直调 loadRoster 而非 refresh**：refresh 会清空勾选/备注/剧本草稿（切账号语义）。
+  // 用户点刷新后往往继续勾人，若每 3s 走一次 refresh，勾到一半会被清空——这比原本
+  // 「刷新没反应」更糟。loadRoster 只更新缓存里的列表，不碰任何草稿 state。
+  // 同理不设 loading（不带 force 的静默重读，不该让按钮一直转）。
+  useEffect(() => {
+    if (awaitingSince === undefined || !effectiveAccountId) return;
+    const startedAt = Date.now();
+    const timer = setInterval(() => {
+      void (async () => {
+        try {
+          // revalidate（不是 force:false）：force:false 会命中 store 缓存直接返回，
+          // 根本不发请求，于是永远观测不到新快照、轮询必然走到 60s 超时。
+          // revalidate 绕过缓存重读一次，但不触发后端再起一个后台拉取任务。
+          await loadRoster(effectiveAccountId, { revalidate: true });
+        } catch {
+          // 静默重读失败不打扰用户（主列表仍可用），下一轮再试；超时分支兜底收尾。
+          return;
+        }
+        const now =
+          useUserOpsStore.getState().rosterCache[effectiveAccountId]?.serverFetchedAt ?? null;
+        if (now !== awaitingSince) {
+          setAwaitingSince(undefined);
+          toast.success("好友列表已更新");
+          return;
+        }
+        if (Date.now() - startedAt > 60000) {
+          setAwaitingSince(undefined);
+          toast.info("微信侧仍在同步，稍后回来看");
+        }
+      })();
+    }, 3000);
+    return () => clearInterval(timer);
+    // **toast 不进依赖**：ToastProvider 的 api 是对象字面量，每次渲染都是新引用。
+    // 把它列进依赖会让本 effect 每渲染都重建 → 3s 定时器被无限重置 → 轮询永远
+    // 不触发一次（实测抓到：点刷新后永远等不到「已更新」）。改走 toastRef。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [awaitingSince, effectiveAccountId, loadRoster]);
 
   const filtered = useMemo(() => {
     const q = filter.trim().toLowerCase();

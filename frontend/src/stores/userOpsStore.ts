@@ -79,7 +79,13 @@ interface UserOpsState {
 
   // 通讯录 roster 缓存（按 accountId 键控）：首次拉后缓存，进频道复用不重打 API；
   // 仅就绪结果落缓存（syncing 中不缓存，允许自动重拉覆盖）。force 才重拉。
-  rosterCache: Record<string, { items: RosterEntry[]; syncing: boolean; fetchedAt: number }>;
+  // serverFetchedAt 是**服务端快照的生成时刻**（ISO 串），与本地 fetchedAt（本机
+  // 拉取时刻）不同。force 刷新是"触发后台单飞 + 立即返回旧快照"，判断"新快照有没有
+  // 落地"只能靠服务端快照龄变化——本地时间戳每次请求都变，无法用来判断。
+  rosterCache: Record<
+    string,
+    { items: RosterEntry[]; syncing: boolean; fetchedAt: number; serverFetchedAt: string | null }
+  >;
 
   // 运营池三 tab 的后端真实计数（不受 list_contacts 的 limit 截断影响）。
   contactCounts: { all: number; managed: number; normal: number };
@@ -119,7 +125,15 @@ interface UserOpsActions {
   loadContacts: (accountId: string) => Promise<void>;
   loadContactCounts: (accountId: string) => Promise<void>;
   hideFromPool: (accountId: string, contactId: string) => Promise<void>;
-  loadRoster: (accountId: string, opts?: { force?: boolean }) => Promise<{ items: RosterEntry[]; syncing: boolean }>;
+  loadRoster: (
+    accountId: string,
+    opts?: { force?: boolean; revalidate?: boolean }
+  ) => Promise<{
+    items: RosterEntry[];
+    syncing: boolean;
+    refreshing: boolean;
+    serverFetchedAt: string | null;
+  }>;
   batchEnable: (payload: {
     accountId: string;
     source: "pool" | "roster";
@@ -567,20 +581,50 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
   },
 
   // 通讯录：拉指定账号的全量好友（MCP）+ 本地 contacts 左连接标注 agentStatus。纯浏览，不写库。
+  //
+  // 返回里 serverFetchedAt 是**后端快照的生成时刻**（非本地取数时刻）。必须透出：
+  // force 刷新在后端是「触发后台单飞 + 立即返回旧快照」，若前端拿不到快照龄，
+  // 点刷新后界面数据原样不变，看起来像按钮坏了。RosterView 据此判断新快照是否落地。
   loadRoster: async (accountId, opts) => {
     const cached = get().rosterCache[accountId];
-    if (!opts?.force && cached) {
-      return { items: cached.items, syncing: cached.syncing };
+    // revalidate：绕过缓存重读，但**不带 force**——force 会在后端再触发一次后台单飞拉取，
+    // 用于「刷新等待轮询」时会反复叠加请求。revalidate 只是重新读一次快照，
+    // 用来观测后台任务是否已写入新快照（serverFetchedAt 变化）。
+    if (!opts?.force && !opts?.revalidate && cached) {
+      return {
+        items: cached.items,
+        syncing: cached.syncing,
+        refreshing: false,
+        serverFetchedAt: cached.serverFetchedAt,
+      };
     }
     const url = `/api/contacts/roster?accountId=${encodeURIComponent(accountId)}${
       opts?.force ? "&force=true" : ""
     }`;
-    const data = await api.get<{ items: RosterEntry[]; syncing?: boolean }>(url);
-    const result = { items: data.items, syncing: data.syncing ?? false };
+    const data = await api.get<{
+      items: RosterEntry[];
+      syncing?: boolean;
+      refreshing?: boolean;
+      fetchedAt?: string | null;
+    }>(url);
+    const result = {
+      items: data.items,
+      syncing: data.syncing ?? false,
+      refreshing: data.refreshing ?? false,
+      serverFetchedAt: data.fetchedAt ?? null,
+    };
     // 仅就绪结果落缓存；同步中(syncing)不缓存，避免卡在同步中态、允许自动重拉覆盖。
     if (!result.syncing) {
       set((s) => ({
-        rosterCache: { ...s.rosterCache, [accountId]: { ...result, fetchedAt: Date.now() } },
+        rosterCache: {
+          ...s.rosterCache,
+          [accountId]: {
+            items: result.items,
+            syncing: result.syncing,
+            serverFetchedAt: result.serverFetchedAt,
+            fetchedAt: Date.now(),
+          },
+        },
       }));
     }
     return result;
