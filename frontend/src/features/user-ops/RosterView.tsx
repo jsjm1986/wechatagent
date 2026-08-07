@@ -228,23 +228,32 @@ export function RosterView() {
   return (
     <section className={styles.page}>
       <div className={styles.header}>
+        {/* 外层 UserOpsModeHeader 已经渲染「用户运营驾驶舱 / 通讯录 / 拉取该账号的全部
+            微信好友，勾选后批量进入 Agent 运营。」。此处曾再写一遍 eyebrow「通讯录」
+            （与外层标题字字相同）+ subtitle「选择账号拉取全部好友，勾选后批量进入
+            Agent 运营。」（与外层描述几乎同义），于是同一屏出现两遍标题、两遍同义
+            说明，再加一枚孤立的灰底 pill 吊在第三行——四行文字里只有一行带新信息。
+            现在只留一个标题 + 一行元信息（本账号身份 + 好友总数）：身份回答「这是谁
+            的通讯录」（列表里每张卡显示的是**好友**的 wxid，不标明就会和自己的搞混），
+            总数回答「有多少人」，都是外层给不了的。 */}
         <div className={styles.headerText}>
-          <span className={styles.eyebrow}>通讯录</span>
           <h2 className={styles.title}>微信好友总览</h2>
-          <p className={styles.subtitle}>选择账号拉取全部好友，勾选后批量进入 Agent 运营。</p>
-          {/* 本账号身份行：列表里每张卡显示的是**好友**的 wxid，容易和自己的搞混，
-              所以在头部明确标出当前账号自己的微信 ID。
-              wxid 可能为空（MCP 未回传身份，如刚建账号未登录），此时整行不渲染，
-              而不是显示「微信 ID: 空」。 */}
-          {currentAccount?.wxid && (
-            <p className={styles.selfIdentity}>
-              <span className={styles.selfIdentityLabel}>本账号微信 ID</span>
-              <code className={styles.selfIdentityValue}>{currentAccount.wxid}</code>
-              {currentAccount.nickName && (
-                <span className={styles.selfIdentityNick}>{currentAccount.nickName}</span>
-              )}
-            </p>
-          )}
+          <p className={styles.meta}>
+            {/* wxid 可能为空（MCP 未回传身份，如刚建账号未登录），此时不渲染身份段，
+                而不是显示「本账号（空）」。总数段不依赖账号身份，照常显示。 */}
+            {currentAccount?.wxid && (
+              <>
+                <span className={styles.metaLabel}>本账号</span>
+                {currentAccount.nickName && (
+                  <span className={styles.metaName}>{currentAccount.nickName}</span>
+                )}
+                <code className={styles.metaWxid}>{currentAccount.wxid}</code>
+              </>
+            )}
+            {roster.length > 0 && (
+              <span className={styles.metaCount}>共 {roster.length} 位好友</span>
+            )}
+          </p>
         </div>
         <div className={styles.headerActions}>
           {accounts.length > 1 && (

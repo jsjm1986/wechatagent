@@ -383,14 +383,14 @@ describe("RosterView — 通讯录批量托管视图（Task 8）", () => {
         <RosterView />
       </ToastProvider>
     );
-    expect(await screen.findByText("本账号微信 ID")).toBeInTheDocument();
+    expect(await screen.findByText("本账号")).toBeInTheDocument();
     expect(screen.getByText("wxid_self_me")).toBeInTheDocument();
     expect(screen.getByText("我的昵称")).toBeInTheDocument();
   });
 
-  // wxid 可能为空（账号刚建、MCP 未回传身份）。此时整行不渲染，
-  // 而不是显示「本账号微信 ID:（空）」。
-  it("账号无 wxid 时不渲染身份行", async () => {
+  // wxid 可能为空（账号刚建、MCP 未回传身份）。此时不渲染身份段，
+  // 而不是显示「本账号（空）」。
+  it("账号无 wxid 时不渲染身份段", async () => {
     // seedAccount() 的账号本身不带 wxid。
     render(
       <ToastProvider>
@@ -399,7 +399,36 @@ describe("RosterView — 通讯录批量托管视图（Task 8）", () => {
     );
     // 等列表落地，确认组件已渲染完毕再断言缺失。
     expect(await screen.findByText("老客户")).toBeInTheDocument();
-    expect(screen.queryByText("本账号微信 ID")).not.toBeInTheDocument();
+    expect(screen.queryByText("本账号")).not.toBeInTheDocument();
+  });
+
+  // 回归：外层 UserOpsModeHeader 已渲染「通讯录」标题 + 「拉取该账号的全部微信好友，
+  // 勾选后批量进入 Agent 运营。」描述。本视图曾重复渲染同名 eyebrow + 同义 subtitle，
+  // 同一屏出现两遍标题两遍说明。此处钉住不再重复。
+  it("不重复外层已有的标题与说明", async () => {
+    render(
+      <ToastProvider>
+        <RosterView />
+      </ToastProvider>
+    );
+    expect(await screen.findByText("微信好友总览")).toBeInTheDocument();
+    // eyebrow「通讯录」与外层标题字字相同 → 不再渲染。
+    expect(screen.queryByText("通讯录")).not.toBeInTheDocument();
+    // subtitle 与外层描述同义 → 不再渲染。
+    expect(
+      screen.queryByText("选择账号拉取全部好友，勾选后批量进入 Agent 运营。")
+    ).not.toBeInTheDocument();
+  });
+
+  // 元信息行的总数段：回答「有多少人」，是外层标题给不了的信息。
+  it("元信息行显示好友总数", async () => {
+    render(
+      <ToastProvider>
+        <RosterView />
+      </ToastProvider>
+    );
+    // ROSTER 有 3 条。
+    expect(await screen.findByText(/共 3 位好友/)).toBeInTheDocument();
   });
 
   // 后端 force 是「触发后台单飞 + 立即返回旧快照」，点刷新时列表内容一模一样。

@@ -4,24 +4,28 @@
 
 .header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
 .headerText { display: grid; gap: 4px; }
-.eyebrow { font-size: 11px; font-weight: 600; letter-spacing: .4px; text-transform: uppercase; color: var(--ink-3); }
 .title { font-size: 18px; font-weight: 600; color: var(--ink-1); letter-spacing: -.3px; margin: 0; }
-.subtitle { font-size: 13px; color: var(--ink-3); margin: 0; }
-/* 本账号身份行：区别于列表里好友的 wxid。做成一枚浅底 pill，
-   与「说明文字」拉开——它是可复制的标识数据，不是叙述。
-   margin-top 2px：headerText 的 grid gap 已给 4px，再加一点把它与副标题分组。 */
-.selfIdentity {
-  display: inline-flex; align-items: center; gap: 8px; margin: 2px 0 0;
-  align-self: start; padding: 4px 10px;
-  background: rgba(20,30,60,.045); border-radius: 999px;
+/* 标题下的元信息行：本账号身份 + 好友总数，一行说完。
+   此前这里是一枚浅底 pill，问题是它自成一块视觉区域，在已经有 eyebrow + 标题 +
+   副标题的头部里变成第四行、且是唯一带底色的一行，注意力全被它吸走——而它承载的
+   只是一条参考信息。改为无底色的一行，靠字号/墨色分层次，与标题成组而非争抢。
+   flex-wrap：窄屏时总数段折到第二行，不会把 wxid 挤断。 */
+.meta {
+  display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 8px;
+  margin: 0; font-size: 12px; color: var(--ink-3);
 }
-.selfIdentityLabel { font-size: 11px; font-weight: 600; color: #62626a; letter-spacing: .1px; }
-/* monospace + user-select:all —— wxid 是要拿去核对/粘贴的，点一下即可全选。 */
-.selfIdentityValue {
+/* 用 --ink-3（4.52:1）而非 --ink-4：后者 #b0b0b5 在白卡上只有 2.16:1，
+   远低于 AA 4.5 门槛。层级差改由字重承担（昵称 600 + --ink-2），不靠压对比度。 */
+.metaLabel { color: var(--ink-3); }
+.metaName { font-weight: 600; color: var(--ink-2); }
+/* monospace + user-select:all —— wxid 是要拿去核对/粘贴的，点一下即可全选。
+   比昵称浅一档：昵称是人读的、wxid 是机器读的，前者该先被看到。 */
+.metaWxid {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 11.5px; color: var(--ink-1); user-select: all;
+  font-size: 11.5px; color: var(--ink-3); user-select: all;
 }
-.selfIdentityNick { font-size: 11.5px; color: #62626a; }
+/* 竖线分隔而非圆点：与 wxid 的等宽字形并置时，细竖线更利落、不会被误读成字符。 */
+.metaCount { padding-left: 9px; border-left: 1px solid var(--hairline); }
 .headerActions { display: flex; gap: 10px; flex-shrink: 0; align-items: center; }
 
 .accountSelect, .playbookSelect {
