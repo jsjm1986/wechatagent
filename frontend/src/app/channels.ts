@@ -44,20 +44,31 @@ const CampaignFeature = lazy(() => import("../features/campaign"));
 
 /** 侧栏一级分组。二级即频道本身，不再往下分层（最多两级）。
  *
- *  分组按「使用频次 + 动作性质」切，不按实现模块切：
- *  - 日常：每天都要开的（总控、工作台、收件箱）
- *  - 运营：对客户做事的业务频道
- *  - 知识与内容：喂给 AI 的素材与知识
- *  - 成效：看结果与审计，不做操作
- *  - 设置：配好就不常动的
+ *  分组维度：**一个组只用一个维度**，先按「每天是否必开」切出「日常处置」，
+ *  余下按「对谁做事 / 看什么 / 配什么」切：
+ *  - 日常处置：每天必开的三件事——下指令（AI 总控）、看态势（工作台）、处理待决（统一收件箱）
+ *  - 客户运营：对客户做事的业务频道
+ *  - 知识资产：喂给 AI 的素材与知识
+ *  - 运行监控：只读地看运行结果与指标，不改配置
+ *  - 平台配置：配好就不常动的
+ *  - 建设规划：未上线占位
  *
- *  历史分组混了两个维度（`账号管理`/`请示通道配置` 是配置却在「运营」，
- *  `运营成效`/`发送成效` 是业务指标却在「系统」），导致既不好按业务找、
- *  也不好按系统层找。 */
+ *  三次归组修正的实证依据（都是读代码测出来的，不是分类直觉）：
+ *  1) `command`（AI 总控）曾在「运行监控」，但它是**写操作执行台**：自然语言转微信
+ *     工具调用，还内嵌 `McpKeyForm` 配 MCP 凭证。放在只读监控组名不副实。
+ *  2) `autonomy`（自治回路监控）曾在「平台配置」，理由是「系统自我调节」。但实测它
+ *     `GET /api/outcomes/autonomy` 读指标 + `POST /api/admin/outbox/:id/cancel`
+ *     取消发送队列（`autonomy/OutboxPanel.tsx:203`），与 运营成效/发送成效 同类，
+ *     名字里本就写着「监控」。归「运行监控」。
+ *  3) 「决策审批」组已撤销：组内两个频道使用频次差一个数量级——`askHuman` 收口
+ *     全站 9 类待决事项（请示裁决/知识核验/标签候选/关系建议/疑似成交/知识缺口/
+ *     画像发布/进化发布/经验晋升，见 `ask-human/index.tsx` SOURCE_META），是唯一
+ *     每天必开的；`askHumanConfig` 是配好不动的策略。把它们捆在一起，等于让高频
+ *     频道跟着低频频道一起被折叠。现拆开：前者进「日常处置」，后者进「平台配置」。 */
 export type ChannelGroup =
+  | "日常处置"
   | "客户运营"
   | "知识资产"
-  | "决策审批"
   | "运行监控"
   | "平台配置"
   | "建设规划";
@@ -73,9 +84,9 @@ export type ChannelGroup =
  *  必须 hover 才知道是什么。单列形态下分组标签是文字，两个字段都没有消费者，
  *  故连同那 5 个 lucide 图标 import 一起删掉，不留死代码。 */
 export const GROUP_ORDER: ReadonlyArray<ChannelGroup> = [
+  "日常处置",
   "客户运营",
   "知识资产",
-  "决策审批",
   "运行监控",
   "平台配置",
   "建设规划",
@@ -105,7 +116,7 @@ export interface ChannelDef {
 export const CHANNELS: ChannelDef[] = [
   {
     id: "command",
-    group: "运行监控",
+    group: "日常处置",
     label: "AI 总控",
     caption: "Command Center",
     icon: BrainCircuit,
@@ -127,7 +138,7 @@ export const CHANNELS: ChannelDef[] = [
   },
   {
     id: "overview",
-    group: "运行监控",
+    group: "日常处置",
     label: "工作台",
     caption: "运行态势",
     icon: LayoutDashboard,
@@ -195,7 +206,7 @@ export const CHANNELS: ChannelDef[] = [
   },
   {
     id: "askHuman",
-    group: "决策审批",
+    group: "日常处置",
     label: "统一收件箱",
     caption: "Ask-Human Inbox",
     icon: Inbox,
@@ -206,7 +217,7 @@ export const CHANNELS: ChannelDef[] = [
   },
   {
     id: "askHumanConfig",
-    group: "决策审批",
+    group: "平台配置",
     label: "请示通道配置",
     caption: "Ask-Human Policy",
     icon: SlidersHorizontal,
@@ -282,17 +293,6 @@ export const CHANNELS: ChannelDef[] = [
     Component: OperationsFeature,
   },
   {
-    id: "autonomy",
-    group: "平台配置",
-    label: "自治回路监控",
-    caption: "Autonomy Loop",
-    icon: ShieldCheck,
-    eyebrow: "Autonomy Loop",
-    title: "自治回路监控",
-    subtitle: "实时监控自治回路：修订触发率、AI 暂缓三类细分、未验证产品声明拦截、发送链路状态与最近修订记录。",
-    Component: AutonomyFeature,
-  },
-  {
     id: "evolution",
     group: "平台配置",
     label: "演化中心",
@@ -324,5 +324,21 @@ export const CHANNELS: ChannelDef[] = [
     title: "发送成效",
     subtitle: "查看 AI 主动发送的素材与专属顾问名片的使用次数、覆盖客户数、响应率与阶段推进率。",
     Component: SendAnalyticsFeature,
+  },
+  {
+    // 归「运行监控」而非「平台配置」：实测它只读 `GET /api/outcomes/autonomy` 指标，
+    // 唯一写操作是 `POST /api/admin/outbox/:id/cancel`（取消在途发送，
+    // `autonomy/OutboxPanel.tsx:203`）——属于运行期干预，不是策略配置。
+    // 位置放在组末：`groupItems` 不排序，组内顺序即本数组顺序，
+    // 三个「成效/日志」类先出，运行链路细节垫底。
+    id: "autonomy",
+    group: "运行监控",
+    label: "自治回路监控",
+    caption: "Autonomy Loop",
+    icon: ShieldCheck,
+    eyebrow: "Autonomy Loop",
+    title: "自治回路监控",
+    subtitle: "实时监控自治回路：修订触发率、AI 暂缓三类细分、未验证产品声明拦截、发送链路状态与最近修订记录。",
+    Component: AutonomyFeature,
   },
 ];
