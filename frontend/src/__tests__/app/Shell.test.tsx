@@ -1,57 +1,70 @@
 import { fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Shell } from "../../app/Shell";
-import { useNavigationStore, DEFAULT_EXPANDED } from "../../stores/navigationStore";
+import { useNavigationStore, DEFAULT_GROUP } from "../../stores/navigationStore";
 import { useAuthStore } from "../../stores/authStore";
 
-describe("Shell", () => {
-  it("默认只展开「日常」组，其余组的频道不渲染", async () => {
-    useNavigationStore.setState({ activeChannel: "overview", expandedGroup: DEFAULT_EXPANDED });
+describe("Shell 导航（图标轨 + 二级面板）", () => {
+  it("默认选中「日常」组，面板只渲染该组频道", async () => {
+    useNavigationStore.setState({ activeChannel: "overview", activeGroup: DEFAULT_GROUP });
     render(<Shell />);
     expect(await screen.findByText("工作台")).toBeInTheDocument();
-    // 手风琴：同时只展开一组，所以「运营」「设置」的频道都不渲染。
+    // 一次只渲染一组——这是「侧栏永不滚动」的结构依据（最坏 5 行 ≈ 220px）。
     expect(screen.queryByText("用户运营")).not.toBeInTheDocument();
     expect(screen.queryByText("系统策略")).not.toBeInTheDocument();
   });
 
-  it("点击组标题展开该组，同时自动收起原先展开的组", async () => {
-    useNavigationStore.setState({ activeChannel: "overview", expandedGroup: "日常" });
+  it("点轨上的分组图标即换面板，一步完成（不需要先折叠）", async () => {
+    useNavigationStore.setState({ activeChannel: "overview", activeGroup: "日常" });
     render(<Shell />);
     expect(screen.getByText("工作台")).toBeInTheDocument();
     fireEvent.click(screen.getByTestId("nav-group-设置"));
     expect(await screen.findByText("系统策略")).toBeInTheDocument();
-    // 这是手风琴的关键保证：展开新组必须收起旧组，否则行数无上限、滚动条回来。
+    // 换组即换面板内容，旧组频道不再渲染。
     expect(screen.queryByText("工作台")).not.toBeInTheDocument();
   });
 
-  it("再次点击已展开的组标题会收起它", () => {
-    useNavigationStore.setState({ activeChannel: "overview", expandedGroup: "日常" });
+  it("点已选中的分组是幂等的——不会像手风琴那样把面板收起变空", () => {
+    // 这是相对手风琴的关键行为差异：轨上永远有一组被选中，面板永不空白。
+    useNavigationStore.setState({ activeChannel: "overview", activeGroup: "日常" });
     render(<Shell />);
     expect(screen.getByText("工作台")).toBeInTheDocument();
     fireEvent.click(screen.getByTestId("nav-group-日常"));
-    expect(screen.queryByText("工作台")).not.toBeInTheDocument();
+    expect(screen.getByText("工作台")).toBeInTheDocument();
   });
 
-  it("当前频道所在组被收起时，标题上打活跃圆点表达定位", () => {
-    // 手风琴下不再「强制展开」活跃组（那会让同时展开变 2 组、滚动条回来），
-    // 定位感由圆点承担。systemStrategy 属「设置」，而展开的是「日常」。
+  it("轨上选中态用 aria-selected 表达，且同时只有一个", () => {
+    useNavigationStore.setState({ activeChannel: "overview", activeGroup: "成效" });
+    render(<Shell />);
+    const groups = ["日常", "运营", "知识与内容", "成效", "设置"];
+    const on = groups.filter(
+      (g) => screen.getByTestId(`nav-group-${g}`).getAttribute("aria-selected") === "true"
+    );
+    expect(on).toEqual(["成效"]);
+  });
+
+  it("活跃频道在别的组时，轨上该组图标打点表达定位", () => {
+    // systemStrategy 属「设置」，而轨上看的是「日常」——定位感靠圆点承担。
     useNavigationStore.setState({
       activeChannel: "systemStrategy",
-      expandedGroup: "日常",
+      activeGroup: "日常",
     });
     render(<Shell />);
-    const nav = screen.getByRole("navigation", { name: "Product channels" });
-    // 组内频道确实没渲染（未被强制展开）
-    expect(within(nav).queryByText("系统策略")).not.toBeInTheDocument();
-    // 但「设置」标题上有活跃圆点，且只有它有
-    expect(within(nav).getByLabelText("当前频道在此组")).toBeInTheDocument();
     const settings = screen.getByTestId("nav-group-设置");
     expect(within(settings).getByLabelText("当前频道在此组")).toBeInTheDocument();
+    // 且只有「设置」有点（选中态自身已高亮，不叠点）。
+    expect(screen.getAllByLabelText("当前频道在此组")).toHaveLength(1);
+  });
+
+  it("轨上选中的就是活跃频道所在组时，不叠加圆点", () => {
+    useNavigationStore.setState({ activeChannel: "systemStrategy", activeGroup: "设置" });
+    render(<Shell />);
+    expect(screen.queryByLabelText("当前频道在此组")).not.toBeInTheDocument();
   });
 
   it("未上线占位频道渲染成不可点的灰显项", () => {
-    // 「微信群运营」属「运营」组，故须展开该组。
-    useNavigationStore.setState({ activeChannel: "overview", expandedGroup: "运营" });
+    // 「微信群运营」属「运营」组，故须选中该组。
+    useNavigationStore.setState({ activeChannel: "overview", activeGroup: "运营" });
     render(<Shell />);
     // 「微信群运营」标 comingSoon → 不是 button，且带「未上线」角标。
     expect(screen.queryByRole("button", { name: /微信群运营/ })).not.toBeInTheDocument();
@@ -65,27 +78,43 @@ describe("Shell", () => {
     expect(screen.getByRole("heading", { name: "用户运营" })).toBeInTheDocument();
   });
 
-  // 不变量测试：这是「侧栏不出滚动条」的根本依据。逐组点一遍，
-  // 每次点完都断言 aria-expanded=true 的组不超过 1 个。若哪天有人
-  // 加回「强制展开活跃组」之类的逻辑，这条会先红，而不是等用户看到滚动条。
-  it("任何时刻展开的组不超过一个（手风琴不变量）", () => {
-    useNavigationStore.setState({ activeChannel: "overview", expandedGroup: "日常" });
+  // 高度不变量：这是「侧栏不出滚动条」的根本依据，也是本次放弃手风琴的理由。
+  // 逐组点一遍，每次都断言 (a) 轨上恰好一个组被选中，(b) 面板里渲染的频道行
+  // 不超过最大单组容量。若哪天有人让面板同时渲染两组（或加回「活跃组也展开」），
+  // 这条会先红，而不是等用户在矮屏上看到滚动条。
+  it("任何时刻只渲染一个组的频道（高度不变量）", () => {
+    useNavigationStore.setState({ activeChannel: "overview", activeGroup: "日常" });
     render(<Shell />);
-    const nav = screen.getByRole("navigation", { name: "Product channels" });
+    const panel = screen.getByRole("navigation", { name: "Product channels" });
     const groups = ["日常", "运营", "知识与内容", "成效", "设置"];
-    const openCount = () =>
+    const selectedCount = () =>
       groups.filter(
-        (g) => screen.getByTestId(`nav-group-${g}`).getAttribute("aria-expanded") === "true"
+        (g) => screen.getByTestId(`nav-group-${g}`).getAttribute("aria-selected") === "true"
       ).length;
 
-    expect(openCount()).toBeLessThanOrEqual(1);
+    // 面板恒显示某一组 → 恒有且仅有一个选中，不存在「全部收起」态。
+    expect(selectedCount()).toBe(1);
     for (const g of groups) {
       fireEvent.click(screen.getByTestId(`nav-group-${g}`));
-      expect(openCount()).toBeLessThanOrEqual(1);
+      expect(selectedCount()).toBe(1);
+      // 轨按钮在 tablist 里、频道行在 nav 里，所以这里数到的只有频道行。
+      // 最大单组是 5（运营/成效），超过就说明渲染了不止一组。
+      expect(within(panel).getAllByRole("button").length).toBeLessThanOrEqual(5);
     }
-    // 同时：渲染出的频道行数不超过最大单组的容量（5），否则高度账不成立。
-    const rows = within(nav).getAllByRole("button").length - groups.length;
-    expect(rows).toBeLessThanOrEqual(5);
+  });
+
+  // 无障碍：轨是 tab 列表、面板是它控制的内容。角色标错的话读屏用户
+  // 会把 5 个分组图标读成 5 个普通按钮，完全丢失「这是一组互斥选项」的信息。
+  it("图标轨用 tablist/tab 语义，激活频道标 aria-current", () => {
+    useNavigationStore.setState({ activeChannel: "overview", activeGroup: "日常" });
+    render(<Shell />);
+    const rail = screen.getByRole("tablist", { name: "频道分组" });
+    expect(within(rail).getAllByRole("tab")).toHaveLength(5);
+    // 激活频道除了视觉高亮，还要有程序可读的当前项标记。
+    expect(screen.getByText("工作台").closest("button")).toHaveAttribute(
+      "aria-current",
+      "page"
+    );
   });
 });
 

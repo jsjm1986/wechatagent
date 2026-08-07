@@ -96,103 +96,72 @@
   color: #d6342a; background: var(--fill-blocked); border-radius: var(--r-sm);
 }
 
-/* 导航 */
-.nav { display: flex; flex-direction: column; gap: 0; flex: 1; overflow-y: auto; overflow-x: hidden; }
-/* 组间留白是分组感的主要来源——比任何分隔线都干净。此前 8px 只比行间距(1px)
-   大一点，五个组挤成一片，标题再怎么调也读不出「块」。实测 757px 视口下 nav
-   有 224px 余量，加到 20px 仍不滚动（矮视口由下方紧凑档逐级收回）。 */
-.group + .group { margin-top: var(--sp-5); }
-/* 组标题现在是可点的折叠开关（button）。必须显式重置全局裸 button 基线
-   （background/border/min-height/font/justify-content），否则会继承出 38px 高、
-   文字居中的蓝按钮外观。**justify-content 是必需的**：styles.css 给裸 button
-   写了 `justify-content: center`，漏掉它组标题就会被居中（.channel 显式写了
-   flex-start 正是同一原因）。
-   颜色 #636369（5.52:1，过 AA）而非 --ink-4(#b0b0b5，2.05:1 不可读)，也不用
-   --ink-2(#515156)——那是频道名的颜色，标题用同色会两者重量打平互相抢。
-   但只压弱也不行：曾把标题压到 10.5px/字重500/浅色（字号、颜色、字重三个维度
-   同时弱于频道），结果它不像标题、只像一行灰字，分组结构读不出来，反而"主次不分"。
-   正确解法是给它**标签**该有的语汇，而不是在同一坐标轴上和频道名比大小：
-     字号小(11px) + 字重重(700) + 字距宽(1.2px) + 颜色浅(#636369)
-   小而粗的宽字距是侧栏分类标签的标准写法——结构感来自字重与字距，次要感来自
-   字号与颜色，两者不冲突，所以既读得出是标题、又不会盖过 13.5px/--ink-2 的频道名。 */
-/* 中文字距修正：1.2px 是照英文小标签的做法，中文加宽字距会「散」，
-   收到 0——标签感靠字号与字重建立，不靠拉开汉字。
-   grid 而非 flex：chevron 占与频道图标同一条 20px 轨道，
-   所以组标题文字与频道名严格对齐在同一竖线上（整齐与凑合的分界）。
-   四列 = 轨道 / 标题 / 活跃点 / 计数；无活跃点时计数落到第 3 列，仍贴右。
-
-   **父级必须比子级更大更深**（本轮修正）：此前标题 11px/#636369 比频道
-   13.5px/#515156 更小更浅，读起来像频道的附属物而非父级——「分类等级比频道低」。
-   小而粗的宽字距那套写法（Linear 等）成立的前提是英文全大写小标签，中文没有
-   大小写差异，缩小就只是变弱，撑不起父级。改为父级 13.5px/600/#33333a(11.58:1)，
-   子级降到 13px/#5d5d63(6.04:1) 并整行右缩，靠**字号+墨色+缩进**三者同向表达
-   父子，而不是让两者在同一坐标轴上比大小。 */
-.groupLabel { display: grid; align-items: center;
-  grid-template-columns: var(--nav-rail) 1fr auto auto;
-  gap: var(--nav-gap); width: 100%;
-  font-size: var(--fs-group); color: #33333a; font-weight: 600; letter-spacing: -.2px;
-  padding: var(--sp-3) var(--sp-3) var(--sp-1);
+/* 导航 = 图标轨（分组）+ 二级面板（该组频道）。
+   替代了此前的手风琴。手风琴不是设计选择、是高度妥协：nav 可用高约 550px，
+   20 频道全展开需 1042px、两组同展 612px，只能锁成「同时一组」，代价是跨组
+   切频道要两步且内容跳动。现在一次只渲染一组（最坏 5 行 ≈ 220px），任何视口
+   都放得下——原来 6 档把行高压到 21px 的紧凑响应因此全部删除。
+   轨 56 + 面板 196 = 252，与改造前侧栏总宽一致，主区不位移。 */
+.navWrap { display: grid; grid-template-columns: 56px 1fr; flex: 1; min-height: 0; gap: 0; }
+/* 轨与面板之间一条极淡竖线：不分隔的话两块近白区域会糊成一片、读不出「轨」。
+   用 box-shadow 而非 border——border 会吃掉 1px 布局宽度，让 56+196 的账不平。 */
+.rail {
+  display: flex; flex-direction: column; align-items: center; gap: 2px;
+  padding-top: 2px; box-shadow: inset -1px 0 0 rgba(20,30,60,.055);
+}
+/* 轨按钮：40×40 命中区（>= 40px 是指针目标的通行下限，WCAG 2.5.8 要求 24px，
+   这里给足）。必须显式重置全局裸 button 基线，否则继承出蓝底 38px 高的按钮。 */
+.railBtn {
+  display: flex; align-items: center; justify-content: center;
+  width: 40px; height: 40px; flex-shrink: 0; padding: 0;
+  border-radius: var(--r-nav); cursor: pointer;
   background: none; border: none; box-shadow: none; min-height: 0;
-  font-family: inherit; text-align: left; cursor: pointer;
-  transition: color .18s ease; }
-/* 全局 button:hover 会刷深蓝底 + 投影、:active 会下沉 1px。组标题是导航标签、
-   不是操作按钮，必须逐条压掉，否则鼠标掠过侧栏会闪出一条深蓝条。 */
-/* hover 提到最深一档。标题现在是父级，hover 变深是正确方向——
-   此前 hover 是提到 --ink-2(#515156)，那在新层级下反而比标题基础色更浅，会倒挂。 */
-.groupLabel:hover { color: var(--ink-1); background: none; border-color: transparent;
-  box-shadow: none; }
-/* 展开态即用户当前所在分组，是位置锚点，用最深一档。收起的组保持 #33333a。 */
-/* 展开态略深一档，但**不到 --ink-1**：激活频道用的就是 ink-1，
-   若标题也用 ink-1，侧栏就有两个「最深」元素，激活项的唯一性被稀释。
-   #2b2b30(13.02:1) 深于收起态 #33333a，仍浅于激活项。 */
-.groupLabelOpen { color: #2b2b30; }
-.groupLabel:active { transform: none; }
-/* 收起时朝右、展开时转 90° 朝下。transform 过渡比切换图标更稳（不闪）。
-   14px 而非 12px：频道图标是 17px，12px 的 chevron 和它并置显得两套尺寸打架。 */
-/* justify-self: center —— chevron 在 20px 轨道内居中，与频道图标同轴。
-   实色 #9a9aa1 而非 opacity:.55：opacity 会把描边压成灰雾，与 600 字重的标题
-   不是同一套语汇；实色能保持描边锐利，且色阶可控（明确弱于标题、强于计数）。
-   随标题一起 hover 转深——反馈落在整行而非只有文字。 */
-.groupChevron { flex-shrink: 0; justify-self: center; color: #9a9aa1;
-  transition: transform .18s cubic-bezier(.2,.7,.3,1), color .18s ease; }
-.groupLabel:hover .groupChevron { color: #6a6a72; }
-.groupChevronOpen { transform: rotate(90deg); }
-/* 收起时在标题右侧显示组内频道数，让用户知道里面有东西没丢。
-   改成**裸数字**（去掉灰底 pill）：pill 是通用后台的徽章语汇，在一条只有
-   文字与描边的标题行里凭空多出一个填充块，是这行最"廉价"的元素。数字本身
-   已经够表达数量，靠字号(10px，落在 --fs-micro 刻度上)与浅墨色区分即可。
-   #6e6e76 直接压在侧栏渐变上 4.67:1 过 AA（此前 9.5px 脱离刻度，且压在 pill
-   底上算对比度要按合成色，容易掉到门槛下——去掉 pill 顺带消掉这个陷阱）。
-   tabular-nums：数字等宽，多组并列时右缘不会因 1/5 字形宽度不同而参差。 */
-.groupCount { justify-self: end; font-size: var(--fs-micro); font-weight: 600;
-  letter-spacing: 0; color: #66666d; font-variant-numeric: tabular-nums;
-  transition: color .18s ease; }
-.groupLabel:hover .groupCount { color: #55555b; }
-/* 手风琴下「当前频道所在组」不再强制展开（那会让同时展开变 2 组、滚动条回来），
-   定位感改由这个蓝点承担：组收起时若活跃频道在组内，标题旁点亮一颗。 */
-.groupActiveDot { width: 5px; height: 5px; border-radius: 50%; flex-shrink: 0;
+  color: #6e6e76; position: relative;
+  transition: background .15s ease, color .15s ease;
+}
+.railBtn:hover { background: rgba(255,255,255,.72); color: var(--ink-1);
+  border-color: transparent; box-shadow: none; transform: none; }
+.railBtn:active { transform: none; }
+/* 选中态：白玻璃卡片 + 深墨图标。与频道激活态同族语汇（都是"白卡浮起"），
+   但不染蓝——蓝留给唯一的激活频道，轨上选中只表示"面板在看这组"。 */
+.railBtnOn, .railBtnOn:hover {
+  color: var(--ink-1);
+  background: linear-gradient(135deg, rgba(255,255,255,.98), rgba(255,255,255,.8));
+  box-shadow: 0 3px 10px -4px rgba(20,30,60,.16), inset 0 0 0 1px rgba(255,255,255,.6);
+}
+/* 活跃频道在本组、但轨上正看着别的组 → 右上角打点，保住定位感。
+   （选中态自己已有高亮，不叠点。） */
+.railDot {
+  position: absolute; top: 7px; right: 7px;
+  width: 5px; height: 5px; border-radius: 50%;
   background: var(--color-scheduled);
-  box-shadow: 0 0 5px 1px rgba(10,132,255,.45); }
-/* 矮视口兜底：手风琴把同时展开压到 1 组（最坏 5 行 = 389px），但 nav 可用高约等于
-   视口高 − 197px（品牌区 58 + 页脚 100 + 内边距 40），所以视口低于约 586px 时 389px
-   仍放不下。按视口高分两档收紧行高/标题高/组间距，让最坏情况也不出滚动条。
-   数值是按 5 标题 + 4 组间距 + 5 行 反推的，别随手改。 */
-/* grid 而非 flex：图标占固定 20px 轨道，所有频道名严格对齐在同一条竖线上
-   （与组标题的 chevron 同轨）。此前是 flex + gap，图标宽度只要有 1px 差异
-   文字起点就跟着漂——这是「整齐」与「凑合」的分界。
-   行高走 --nav-row(36px)，不再用 padding 撑，密度可预测。 */
-/* 子级缩进 + 略浅墨色：父子关系必须靠**缩进**建立，不能只靠字号。
-   此前标题与频道文字都落在同一条竖线（textLeft 都是 56），完全平级，
-   于是层级只能由字号承担——而标题字号又更小，读起来就成了「分类比频道低一级」。
-   现在整行右缩 --nav-indent(8px)，频道退到 #5d5d63(6.04:1)，
-   与标题 13.5px/600/#33333a(11.58:1) 形成 父深子浅 + 父外子内 的双重层级。 */
+  box-shadow: 0 0 0 1.5px rgba(255,255,255,.9);
+}
+/* 二级面板：只渲染当前组的频道。overflow-y 是纯兜底——最大组 5 行远放得下，
+   留着是防以后某组长到 10 项时不至于溢出到页脚。 */
+.panel { display: flex; flex-direction: column; gap: 0;
+  padding-left: var(--sp-3); min-height: 0; overflow-y: auto; overflow-x: hidden; }
+/* 面板标题 = 当前分组名。它现在是纯标签（不可点、没有 chevron/计数），
+   因为"切换"这件事已经完全交给轨了——标题只需回答"我在看哪组"。
+   13.5px/600/#33333a（11.58:1）比频道行的 13px/#5d5d63（6.04:1）更大更深，
+   父子层级靠字号+墨色，不靠缩进（缩进现在由轨本身提供）。 */
+.panelTitle {
+  margin: 0 0 var(--sp-2); padding: 0 var(--sp-3);
+  font-size: var(--fs-group); font-weight: 600; color: #33333a; letter-spacing: -.2px;
+}
+/* 频道行（面板内的二级项）。
+   grid 而非 flex：图标占固定 20px 轨道，所有频道名严格对齐在同一条竖线上。
+   此前是 flex + gap，图标宽度只要有 1px 差异文字起点就跟着漂。
+   行高走 --nav-row(36px)，不再用 padding 撑，密度可预测。
+   不再需要 --nav-indent 右缩：父子层级现在由「轨 vs 面板」的空间分区表达，
+   比缩进更强，缩进反而让面板左缘参差。 */
 .channel {
   display: grid; align-items: center;
   grid-template-columns: var(--nav-rail) 1fr auto;
   gap: var(--nav-gap);
   position: relative; min-height: var(--nav-row);
   padding: 0 var(--sp-3); border-radius: var(--r-nav); margin: 1px 0;
-  margin-left: var(--nav-indent); width: calc(100% - var(--nav-indent));
+  width: 100%;
   font-size: var(--fs-body); color: #5d5d63; font-weight: 500; cursor: pointer;
   background: none; border: none; text-align: left;
   font-family: inherit; letter-spacing: -.2px; box-shadow: none;
@@ -207,13 +176,14 @@
    所以所有文字严格对齐同一竖线（这条对齐是上一轮的成果，保留）。 */
 .channel svg { justify-self: center; opacity: .5;
   transition: opacity .2s ease, color .2s ease; }
-/* 激活态：白玻璃浮起卡片（渐变 + 三层阴影）+ 蓝图标 + 加粗 + 左侧呼吸光条。
-   注：曾一度精简到「淡底 + 加粗」两个信号，但玻璃质感是本产品的基调，
-   去掉后整条侧栏失去立体感，故恢复。 */
+/* 激活态：从六个信号收到三个——白卡 + 蓝图标 + 加粗（另有左侧静态细线做锚点）。
+   删掉的是三层阴影里的两层内高光与那条 3.6s 无限呼吸动画：叠加不等于高级，
+   余光里持续运动的元素是「不高级」的主要来源，且无限动画违反 WCAG 2.2
+   「动态内容应可停止」。玻璃基调保留（白卡 + 一层柔投影），侧栏立体感不丢。 */
 .active, .active:hover {
   color: var(--ink-1); font-weight: 600; transform: none;
-  background: linear-gradient(135deg, rgba(255,255,255,.98), rgba(255,255,255,.78));
-  box-shadow: 0 4px 14px -5px rgba(20,30,60,.18), inset 0 1.5px 1px rgba(255,255,255,.95), inset 0 0 0 1px rgba(255,255,255,.55);
+  background: rgba(255,255,255,.92);
+  box-shadow: 0 1px 3px -1px rgba(20,30,60,.10), inset 0 0 0 1px rgba(255,255,255,.6);
 }
 .active svg { color: var(--color-scheduled); opacity: 1; }
 /* 未上线占位频道：弱化但可读，不可点（div 而非 button，无 hover 位移）。
@@ -233,53 +203,36 @@
 .soonBadge { font-size: var(--fs-micro); font-weight: 600; letter-spacing: 0;
   color: #68686e; border: 1px solid var(--hairline);
   border-radius: 999px; padding: 1px 6px; white-space: nowrap; }
-/* 标志性的左侧呼吸蓝光条——只在激活频道，慢节奏吸气。
-   高度用 em 而非固定 px：行高现在由 --nav-row 驱动、矮视口会变，
-   写死 18px 在紧凑档会顶出行外。1.35em ≈ 18px @13.5px 字号。 */
+/* 激活锚点：左侧静态细线。
+   **不再做呼吸动画**（原 chRail：3.6s 无限循环缩放 + 明暗）。两个理由：
+   1) 观感——余光里一直在动的元素让界面显得廉价，专业工具的高级感来自克制；
+   2) 无障碍——WCAG 2.2 要求超过 5s 的自动动效可暂停，无限循环无法满足。
+   静态细线同样能锚定位置，且不与右侧内容争夺注意力。
+   高度用 em：行高由 --nav-row 驱动，写死 px 在别的字号档会顶出行外。 */
 .active::before {
   content: ''; position: absolute; left: 1px; top: 50%;
   width: 3px; height: 1.35em; margin-top: -.675em; border-radius: 3px;
-  background: var(--color-scheduled); box-shadow: 0 0 8px 1px rgba(10,132,255,.5);
-  animation: chRail 3.6s ease-in-out infinite;
+  background: var(--color-scheduled);
 }
-@keyframes chRail { 0%,100% { opacity: .45; transform: scaleY(.65); } 50% { opacity: 1; transform: scaleY(1); } }
 
-/* 矮视口紧凑档：手风琴把同时展开压到 1 组（最坏 5 行 = 389px），但 nav 可用高
-   约等于「视口高 − 197px」（品牌区/页脚/内边距），所以视口低于约 586px 时
-   389px 仍放不下。这两档按视口高逐步收紧行距，让最坏情况也不出滚动条。
-   **必须写在所有 .channel/.groupLabel 基础规则之后**：媒体查询不提升特异性，
-   写在前面会被后面的同特异性基础规则整条覆盖（这坑本次踩过一次）。 */
-/* 行高现在由 --nav-row 单点决定，所以紧凑档只需覆盖变量，不必逐条改 padding。
-   这也是刻度化的直接好处：密度是一个旋钮，而不是散落各处的数值。 */
-@media (max-height: 760px) {
-  .side { --nav-row: 34px; }
-  .group + .group { margin-top: var(--sp-3); }
-  .groupLabel { padding-top: var(--sp-2); }
-}
-@media (max-height: 660px) {
-  .side { --nav-row: 32px; }
-  .group + .group { margin-top: var(--sp-2); }
-  .groupLabel { padding-top: var(--sp-1); padding-bottom: 2px; }
-}
-@media (max-height: 620px) {
-  .side { --nav-row: 30px; --nav-icon: 16px; }
-  .group + .group { margin-top: var(--sp-1); }
-  .groupLabel { padding-top: 2px; padding-bottom: 0; }
-}
-/* 最矮一档（约 13 寸笔记本再缩窗口）：只保证不滚动，密度已接近可点下限，
-   不再继续压——低于此高度让它滚动比让行高小到点不准更合理。 */
-@media (max-height: 560px) {
-  .side { --nav-row: 25px; --nav-icon: 15px; }
-  .group + .group { margin-top: 1px; }
-  /* **不压标题字号**：压到 --fs-micro(10px) 会让父级又小于子级(13px)，
-     把本轮刚建立的父子层级倒挂回去。矮视口靠行高/留白省空间，不动字号。 */
-  .groupLabel { padding-top: 0; padding-bottom: 0; }
-  .channel { margin: 0; }
-}
-/* 极端档（把窗口拖到很扁）：单独加一档而不是把 560 档改得更挤——
-   560 档在 417px 内高下是合适的，不该为更罕见的 397px 牺牲它的可点性。 */
-@media (max-height: 410px) {
-  .side { --nav-row: 21px; --nav-icon: 14px; }
+/* 矮视口：原来这里有 6 档紧凑响应，把行高从 36px 一路压到 21px、图标压到 14px。
+   它们存在的唯一理由是手风琴的高度账不够用——20 个频道分 5 组，两组同展就要
+   612px > 可用 550px，于是只能靠不断压密度硬塞。副作用是密度不可预测：
+   同一个侧栏在不同窗口高度下有 7 种行高，21px 的行早已低于可点下限（44px 是
+   触控推荐值，桌面也不该低于 28px）。
+
+   图标轨把这笔账彻底改写：一次只渲染一组，最坏 5 行 × 36px + 标题 ≈ 220px，
+   任何视口都放得下，所以 6 档全部删除、行高恒定 36px。
+   真的不够高时（把窗口拖到极扁）由 .panel 的 overflow-y:auto 兜住——
+   让它滚动比把行高压到点不准更合理。 */
+
+/* 窄屏：图标轨保留（56px 已经很省），面板收窄，不做浮层化。
+   浮层化（点图标弹出、选完收起）在桌面端是负优化——鼠标用户会失去"当前组有哪些
+   频道"的常驻可见性，每次切频道都要多一次点击。真正的窄屏（平板竖屏及以下）
+   应该整条侧栏变抽屉，那是独立一轮的改造，不在本轮范围。 */
+@media (max-width: 1100px) {
+  .side { width: 216px; }
+  .panel { width: 160px; }
 }
 
 /* 底部区：与侧栏一体（不是独立卡），顶部一条分隔线划分导航/账号用户区 */

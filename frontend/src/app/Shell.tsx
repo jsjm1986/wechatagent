@@ -1,6 +1,6 @@
 import { Suspense, useEffect, useRef, useState } from "react";
-import { LogOut, Check, ChevronsUpDown, RefreshCw, ChevronRight } from "lucide-react";
-import { CHANNELS, type ChannelGroup } from "./channels";
+import { LogOut, Check, ChevronsUpDown, RefreshCw } from "lucide-react";
+import { CHANNELS, GROUP_META, type ChannelGroup } from "./channels";
 import { useNavigationStore } from "../stores/navigationStore";
 import { useAuthStore } from "../stores/authStore";
 import { useAccountStore } from "../stores/accountStore";
@@ -18,10 +18,8 @@ async function syncAccounts(): Promise<number> {
   return res.synced;
 }
 
-// 侧栏分组顺序（一级）。「日常」与「运营」默认展开，其余默认收起——
-// 20 个频道全平铺时侧栏必然滚动，收起后常驻可见约 11 行。
-// 折叠态由 navigationStore 持有并落 localStorage。
-const GROUP_ORDER: ReadonlyArray<ChannelGroup> = ["日常", "运营", "知识与内容", "成效", "设置"];
+// 分组顺序与图标现在是 channels.ts 的 GROUP_META 单点定义（轨上的图标、
+// 顺序、tooltip 文案都从那里来），此处不再维护第二份顺序数组——两份必然漂移。
 
 function AccountSwitcher() {
   const accounts = useAccountStore((s) => s.accounts);
@@ -199,13 +197,20 @@ function WorkspaceSwitcher({
 export function Shell() {
   const activeChannel = useNavigationStore((s) => s.activeChannel);
   const setChannel = useNavigationStore((s) => s.setChannel);
-  const expandedGroup = useNavigationStore((s) => s.expandedGroup);
-  const toggleGroup = useNavigationStore((s) => s.toggleGroup);
+  const activeGroup = useNavigationStore((s) => s.activeGroup);
+  const selectGroup = useNavigationStore((s) => s.selectGroup);
   const activeProfile = useProfileStore((s) => s.activeProfile);
   const user = useAuthStore((s) => s.user);
   const onLogout = useAuthStore((s) => s.onLogout);
   const def = CHANNELS.find((c) => c.id === activeChannel) ?? CHANNELS[0];
   const { Component } = def;
+
+  // 轨与面板都要按 profile 过滤同一份频道，抽出来避免两处写法漂移
+  // （漂移会导致轨上显示某组、点进去面板却是空的）。
+  const groupItems = (group: ChannelGroup) =>
+    CHANNELS.filter((c) => c.group === group).filter((c) =>
+      c.visibleWhen ? c.visibleWhen(activeProfile) : true
+    );
 
   const workspaces = user?.workspaces ?? [];
   const workspace = user?.currentWorkspace ?? workspaces[0] ?? "";
@@ -222,71 +227,83 @@ export function Shell() {
           </div>
         </div>
 
-        <nav className={styles.nav} aria-label="Product channels">
-          {GROUP_ORDER.map((group) => {
-            const items = CHANNELS.filter((c) => c.group === group).filter((c) =>
-              c.visibleWhen ? c.visibleWhen(activeProfile) : true
-            );
-            if (items.length === 0) return null;
-            // 手风琴：只有唯一展开的那组画出频道，其余一律收起。
-            // **不能**再像以前那样「当前频道所在组强制展开」——那会让同时展开
-            // 变成 2 组（最坏 5+5 行 = 612px > 可用 550px），滚动条又回来。
-            // 定位感改由收起态标题上的活跃圆点承担，不靠展开来表达。
-            const holdsActive = items.some((c) => c.id === activeChannel);
-            const collapsed = expandedGroup !== group;
-            return (
-              <div key={group} className={styles.group}>
+        {/* 导航 = 图标轨（分组）+ 二级面板（该组频道）。
+            为什么不再用手风琴：那不是设计选择、是高度妥协。侧栏 nav 可用高约 550px，
+            20 个频道全展开需 1042px，两组同展也要 612px，于是被迫锁成「同时只开一组」，
+            代价是跨组切频道要两步（先折叠再展开）且内容跳动。
+            图标轨一次只渲染一组（最坏 5 行 ≈ 220px），任何视口都放得下，
+            高度问题从结构上消失——原来那 6 档把行高压到 21px 的紧凑响应随之全删。 */}
+        <div className={styles.navWrap}>
+          {/* 轨上每个图标 = 一个分组。role=tablist 是准确语义：它切换的正是右侧面板。 */}
+          <div
+            className={styles.rail}
+            role="tablist"
+            aria-orientation="vertical"
+            aria-label="频道分组"
+          >
+            {GROUP_META.map(({ group, icon: GroupIcon, hint }) => {
+              const items = groupItems(group);
+              if (items.length === 0) return null;
+              const selected = activeGroup === group;
+              // 当前频道在本组、但轨上选中的是别的组 → 打点，保住定位感。
+              // 选中态自身已有高亮，不必再叠一个点。
+              const holdsActive = !selected && items.some((c) => c.id === activeChannel);
+              return (
                 <button
+                  key={group}
                   type="button"
-                  className={`${styles.groupLabel} ${collapsed ? "" : styles.groupLabelOpen}`}
-                  onClick={() => toggleGroup(group)}
-                  aria-expanded={!collapsed}
+                  role="tab"
+                  aria-selected={selected}
+                  aria-label={group}
+                  title={hint}
+                  className={`${styles.railBtn} ${selected ? styles.railBtnOn : ""}`}
+                  onClick={() => selectGroup(group)}
                   data-testid={`nav-group-${group}`}
                 >
-                  <ChevronRight
-                    size={14}
-                    className={`${styles.groupChevron} ${collapsed ? "" : styles.groupChevronOpen}`}
-                  />
-                  <span>{group}</span>
-                  {/* 收起且当前频道在组内 → 标题上打蓝点，替代「强制展开」表达定位。 */}
-                  {collapsed && holdsActive && (
-                    <span className={styles.groupActiveDot} aria-label="当前频道在此组" />
+                  <GroupIcon size={18} />
+                  {holdsActive && (
+                    <span className={styles.railDot} aria-label="当前频道在此组" />
                   )}
-                  {collapsed && <span className={styles.groupCount}>{items.length}</span>}
                 </button>
-                {!collapsed &&
-                  items.map((c) => {
-                    const Icon = c.icon;
-                    // 占位频道（Component 仍是工作台）不可点，免得点进去看到别的页面。
-                    if (c.comingSoon) {
-                      return (
-                        <div
-                          key={c.id}
-                          className={`${styles.channel} ${styles.channelSoon}`}
-                          aria-disabled="true"
-                          title="下一阶段建设，暂未上线"
-                        >
-                          <Icon size={17} />
-                          <span>{c.label}</span>
-                          <span className={styles.soonBadge}>未上线</span>
-                        </div>
-                      );
-                    }
-                    return (
-                      <button
-                        key={c.id}
-                        className={`${styles.channel} ${c.id === activeChannel ? styles.active : ""}`}
-                        onClick={() => setChannel(c.id)}
-                      >
-                        <Icon size={17} />
-                        <span>{c.label}</span>
-                      </button>
-                    );
-                  })}
-              </div>
-            );
-          })}
-        </nav>
+              );
+            })}
+          </div>
+
+          {/* 二级面板：只画选中组的频道。组名在这里当面板标题，
+              所以轨上的图标不需要再配文字标签（hover 有 title 兜底）。 */}
+          <nav className={styles.panel} aria-label="Product channels">
+            <p className={styles.panelTitle}>{activeGroup}</p>
+            {groupItems(activeGroup).map((c) => {
+              const Icon = c.icon;
+              // 占位频道（Component 仍是工作台）不可点，免得点进去看到别的页面。
+              if (c.comingSoon) {
+                return (
+                  <div
+                    key={c.id}
+                    className={`${styles.channel} ${styles.channelSoon}`}
+                    aria-disabled="true"
+                    title="下一阶段建设，暂未上线"
+                  >
+                    <Icon size={17} />
+                    <span>{c.label}</span>
+                    <span className={styles.soonBadge}>未上线</span>
+                  </div>
+                );
+              }
+              return (
+                <button
+                  key={c.id}
+                  className={`${styles.channel} ${c.id === activeChannel ? styles.active : ""}`}
+                  onClick={() => setChannel(c.id)}
+                  aria-current={c.id === activeChannel ? "page" : undefined}
+                >
+                  <Icon size={17} />
+                  <span>{c.label}</span>
+                </button>
+              );
+            })}
+          </nav>
+        </div>
 
         {user && (
           <div className={styles.foot}>
