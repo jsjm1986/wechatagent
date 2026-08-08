@@ -55,7 +55,7 @@ const CRITIC_PROMPT_KEY: &str = "evolution_critic_v1";
 pub const EVOLVABLE_PROMPT_TARGETS: &[&str] = &[
     "user.reply.system",
     "user.reply.policy",
-    "user.reply.task",
+    "user.reply.fast.task",
     "user.review.system",
     "user.review.light.system",
 ];

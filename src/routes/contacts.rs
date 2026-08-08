@@ -626,7 +626,8 @@ pub(super) struct RosterQuery {
 /// 任一非空白，卡片就能显示可读名字，故视为有名。空白字符串按空处理——上游对
 /// 部分好友返回 `nickName: ""` 而非 `null`，若只判 `is_none()` 会漏掉。
 fn roster_identity_rank(f: &mcp::RosterFriend) -> (bool, bool) {
-    let non_blank = |s: &Option<String>| s.as_deref().map(|v| !v.trim().is_empty()).unwrap_or(false);
+    let non_blank =
+        |s: &Option<String>| s.as_deref().map(|v| !v.trim().is_empty()).unwrap_or(false);
     let has_name = non_blank(&f.remark) || non_blank(&f.nickname);
     let has_avatar = non_blank(&f.avatar_url);
     // false(0) 排在 true(1) 前，故取反：有名/有头像得 0，靠前。
@@ -829,6 +830,9 @@ pub(super) async fn apply_generated_profile_to_contact(
         unset_doc.insert("last_commitment", "");
     }
     let mut update_doc = doc! { "$set": set_doc };
+    if task_claim.is_none() {
+        update_doc.insert("$inc", doc! { "profile_revision": 1i64 });
+    }
     if !unset_doc.is_empty() {
         update_doc.insert("$unset", unset_doc);
     }
@@ -2288,6 +2292,7 @@ pub(super) async fn update_profile_note(
         unset_doc.insert("last_commitment", "");
     }
     let mut update_doc = doc! { "$set": set_doc };
+    update_doc.insert("$inc", doc! { "profile_revision": 1i64 });
     if !unset_doc.is_empty() {
         update_doc.insert("$unset", unset_doc);
     }
@@ -2729,7 +2734,8 @@ pub async fn update_operation_profile(
             },
             doc! {
                 "$set": set_doc,
-                "$unset": { "last_commitment": "" }
+                "$unset": { "last_commitment": "" },
+                "$inc": { "profile_revision": 1i64 }
             },
             None,
         )
@@ -2864,6 +2870,7 @@ pub(super) async fn analyze_contact_profile(
         unset_doc.insert("last_commitment", "");
     }
     let mut update_doc = doc! { "$set": set_doc };
+    update_doc.insert("$inc", doc! { "profile_revision": 1i64 });
     if !unset_doc.is_empty() {
         update_doc.insert("$unset", unset_doc);
     }
@@ -3034,7 +3041,12 @@ mod roster_sort_tests {
     use super::roster_identity_rank;
     use crate::mcp::RosterFriend;
 
-    fn friend(wxid: &str, nick: Option<&str>, remark: Option<&str>, avatar: Option<&str>) -> RosterFriend {
+    fn friend(
+        wxid: &str,
+        nick: Option<&str>,
+        remark: Option<&str>,
+        avatar: Option<&str>,
+    ) -> RosterFriend {
         RosterFriend {
             wxid: wxid.to_string(),
             nickname: nick.map(ToString::to_string),

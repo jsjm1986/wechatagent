@@ -85,6 +85,18 @@ pub const DEFAULT_REPLY_TASK_REDLINE_ANCHORS: &[&str] = &[
     "\"shouldReply\": true,",
 ];
 
+/// Compact reply contract anchors. These are intentionally separate from the legacy full-task
+/// anchors so prompt management can evolve the fast schema without reintroducing projection
+/// fields, while preserving send authorization and safety-critical side effects.
+pub const DEFAULT_REPLY_FAST_TASK_REDLINE_ANCHORS: &[&str] = &[
+    "\"decisionPhase\": \"final\",",
+    "\"shouldReply\": true,",
+    "\"replyText\": \"要发送给客户的微信文本\"",
+    "产品事实只能使用已注入的 verified 知识或产品目录",
+    "正式承诺和 followUp 只会在文本确认送达后生效",
+    "不要输出 profileUpdate、tags、customerStage、intentLevel、domainSignals",
+];
+
 /// 取 contact.locale，缺字段（旧文档）回落到 [`DEFAULT_LOCALE`]。
 pub fn contact_locale_or_default(locale: Option<&str>) -> &str {
     match locale {
@@ -1236,6 +1248,56 @@ fn prompt_specs() -> Vec<PromptSpec> {
 - 标签是只增的谨慎累积，不是每轮整体重写：本轮没有新的、可观察的持久事实时，tags 就留空（不输出），让既有累积画像原样保留；不要因为一句弱信号就把之前积累的标签整组替换掉。确实有过期 / 被新事实推翻的标签，才显式合并或删除。"#,
         },
         PromptSpec {
+            key: "user.reply.fast.task",
+            agent_kind: "user",
+            layer: "task_template",
+            title: "用户运营快速回复任务模板",
+            description: "只生成发送、审核和送达后副作用所需的紧凑决策。",
+            status: "active",
+            content: r#"请基于系统注入的上下文生成本轮发送决策。你只负责当前回复，不生成画像、标签、记忆、分析报告或下一步运营建议。
+
+只输出严格 JSON：
+{
+  "decisionPhase": "final",
+  "riskLevel": "low | medium | high",
+  "knowledgeNeed": "not_required | required | insufficient",
+  "runMode": "fast_chat | memory_candidate | knowledge_grounded | high_risk",
+  "autonomyMode": "auto | assisted | blocked",
+  "needsReview": true,
+  "conversationMode": "casual_relationship | value_exchange | consultative | boundary_protection",
+  "conversationModeReason": "一句话说明模式依据",
+  "shouldReply": true,
+  "replyText": "要发送给客户的微信文本",
+  "operationState": "当前运营状态机 key",
+  "operationStateReason": "一句话说明状态依据",
+  "operationStateConfidence": 8,
+  "riskSelfCheck": "一句话检查事实、产品声明、压力和边界风险",
+  "whyShouldReply": "可选的一句话回复理由",
+  "whySkipReply": "shouldReply=false 时的一句话理由",
+  "sufficiency": "enough | need_more_context | need_clarification",
+  "missingTier": "none | relational | full",
+  "clarificationIntent": "需要澄清时说明方向，否则为空",
+  "usedKnowledgeIds": [],
+  "matchedKnowledgeIds": [],
+  "safeClaimsUsed": [],
+  "lastCommitment": "仅记录 replyText 本轮新作出的时间承诺，没有则省略",
+  "commitment": { "text": "承诺内容", "dueAt": "RFC3339 时间或空串" },
+  "followUp": { "needed": false, "runAt": "RFC3339 时间或空串", "content": "送达后才可建立的跟进内容" },
+  "assetsToSend": [{ "assetId": "只能使用候选清单中的 id", "reason": "发送理由" }],
+  "namecardToSend": { "cardId": "只能使用候选清单中的 id", "reason": "引荐理由" },
+  "escalationRequest": { "needed": false, "category": "", "reason": "", "questionForPrincipal": "", "selfServiceablePart": "", "isGeneralizable": false }
+}
+
+硬规则：
+- 所有枚举必须使用列出的值；operationState 必须来自注入的状态机。
+- shouldReply=true 时 replyText 不得为空。信息不足时先给能确定的部分，必要时只问一个关键问题。
+- 产品事实只能使用已注入的 verified 知识或产品目录；没有依据就保守澄清，不得编造。
+- replyText 作出时间承诺时必须同步填写 lastCommitment/commitment；正式承诺和 followUp 只会在文本确认送达后生效。
+- 素材、名片和请示仅在确有需要时输出，禁止编造候选 id。
+- 不要输出 profileUpdate、tags、customerStage、intentLevel、domainSignals、profileAttributes、nextBestAction、operatingMemoryUpdate、memoryCandidates、memoryUpdate、bayesianObservations 或 agentGeneratedSignals；这些由发送后的独立投影任务处理。
+- 只输出 JSON，不要注释、markdown 或额外说明。"#,
+        },
+        PromptSpec {
             key: "user.reply.task",
             agent_kind: "user",
             layer: "task_template",
@@ -1437,6 +1499,59 @@ fn prompt_specs() -> Vec<PromptSpec> {
   - 只能选清单里列出的 cardId，禁止编造；清单外的 id 会被系统丢弃。
   - 看到「已引荐」信号时：客户已引荐过，你退为辅助答疑，正常回答客户问题即可，不再主动推进成交、不重复引荐（除非客户出现与上次完全不同的新需求场景）。
 上下文由系统在本模板后注入。你必须只输出上述 JSON。"#,
+        },
+        PromptSpec {
+            key: "user.projection.system",
+            agent_kind: "user",
+            layer: "post_decision_projection",
+            title: "用户运营异步投影 System",
+            description: "在客户回复授权后异步提取画像、标签和记忆候选。",
+            status: "active",
+            content: r#"你是发送后的用户运营投影 Agent。你不回复客户，也不能修改已经授权的回复、审核结论、素材、名片、请示、承诺或跟进任务。
+只从冻结的客户资料、对话窗口、记忆卡片和本轮已授权回复中提取有证据的增量信息。没有新信息时返回空字段；不要复述对话，不要为了填满 schema 而猜测。只输出严格 JSON。"#,
+        },
+        PromptSpec {
+            key: "user.projection.task",
+            agent_kind: "user",
+            layer: "post_decision_projection",
+            title: "用户运营异步投影 Task",
+            description: "输出受限的画像和记忆增量，不含任何发送控制字段。",
+            status: "active",
+            content: r#"根据后续注入的冻结快照输出稀疏增量 JSON：
+{
+  "profileUpdate": null,
+  "tags": [],
+  "tagEvidenceTurns": [],
+  "stageEvidenceTurns": [],
+  "stageExplicitIntent": false,
+  "bayesianObservations": [],
+  "customerStage": null,
+  "intentLevel": null,
+  "domainSignals": {},
+  "dimensionDisplayNames": {},
+  "followUpPolicy": null,
+  "profileAttributes": {},
+  "nextBestAction": {},
+  "objectionsDetected": [],
+  "operatingMemoryUpdate": {},
+  "memoryCandidates": [],
+  "memoryWriteScore": 0,
+  "consolidationNeeded": false,
+  "memoryUpdate": "",
+  "agentGeneratedSignals": []
+}
+
+规则：
+- 只写本轮新出现或被新证据修正的信息；不变字段保持空值。
+- 标签只表示长期稳定属性，临时情绪、施压、投诉、要求真人或对抗行为不得固化为标签。
+- tagEvidenceTurns/stageEvidenceTurns 使用冻结对话窗口中从 0 开始的升序编号。
+- 阶段只有客户明确表达时才设置 stageExplicitIntent=true；弱推断必须保持 false。
+- memoryCandidates 最多 6 条，必须包含用户原话或行为证据；普通寒暄不写记忆。
+- bayesianObservations 最多 6 条；禁止无证据猜测。
+- 若客户明确暗示可能已下单/付款，可在 agentGeneratedSignals 输出 kind=suspected_deal 的待核实弱信号；绝不直接认定成交。
+- 仅当出现关系性质的明确新证据时，可输出 kind=relationship_type 的建议；这是待审核信号，不直接生效。
+- 不得输出 schema 之外的键，尤其不得输出 replyText、shouldReply、review、assetsToSend、namecardToSend、escalationRequest、lastCommitment、commitment 或 followUp。
+- 只输出 JSON，不要注释、markdown 或额外说明。"#,
         },
         PromptSpec {
             key: "user.memory_consolidator.system",
@@ -2735,6 +2850,64 @@ mod reply_task_single_shot_tests {
     /// 批次1 瘦身护栏:4 个死字段(全库无任何 guard/阈值/发送逻辑消费,仅 types.rs
     /// carry_through 透传 None)已从 reply.task 契约删除 → LM 不再输出、不再占 token。
     /// struct 字段保留(Option 透传无害),故这里只断模板 schema 不含这些 wire key。
+    #[test]
+    fn fast_reply_and_projection_prompts_have_disjoint_authority() {
+        let specs = prompt_specs();
+        let fast = specs
+            .iter()
+            .find(|spec| spec.key == "user.reply.fast.task")
+            .expect("fast reply prompt exists");
+        let projection = specs
+            .iter()
+            .find(|spec| spec.key == "user.projection.task")
+            .expect("projection prompt exists");
+
+        for required in [
+            "replyText",
+            "shouldReply",
+            "assetsToSend",
+            "escalationRequest",
+        ] {
+            assert!(
+                fast.content.contains(required),
+                "fast prompt lost {required}"
+            );
+        }
+        for deferred in [
+            "profileUpdate",
+            "customerStage",
+            "memoryCandidates",
+            "agentGeneratedSignals",
+        ] {
+            assert!(
+                !fast
+                    .content
+                    .lines()
+                    .any(|line| line.trim_start().starts_with(&format!("\"{deferred}\""))),
+                "fast JSON schema must not declare {deferred}"
+            );
+            assert!(
+                projection.content.contains(deferred),
+                "projection prompt lost {deferred}"
+            );
+        }
+        for forbidden in [
+            "replyText",
+            "shouldReply",
+            "assetsToSend",
+            "escalationRequest",
+            "followUp",
+        ] {
+            assert!(
+                !projection
+                    .content
+                    .lines()
+                    .any(|line| line.trim_start().starts_with(&format!("\"{forbidden}\""))),
+                "projection JSON schema must not declare {forbidden}"
+            );
+        }
+    }
+
     #[test]
     fn reply_task_prompt_drops_dead_fields() {
         let specs = prompt_specs();

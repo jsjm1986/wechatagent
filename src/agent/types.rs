@@ -553,6 +553,130 @@ pub struct RawAgentDecision {
     pub clarification_intent: Option<String>,
 }
 
+/// Post-send projection output. This contract deliberately cannot represent reply text,
+/// authorization, escalation, media, commitments, or follow-up scheduling.
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct DeferredProjectionDecision {
+    pub profile_update: Option<AgentProfile>,
+    #[serde(deserialize_with = "string_or_vec")]
+    pub tags: Vec<String>,
+    pub tag_evidence_turns: Vec<i32>,
+    pub stage_evidence_turns: Vec<i32>,
+    pub stage_explicit_intent: bool,
+    pub bayesian_observations: Vec<BayesianObservationRaw>,
+    pub customer_stage: Option<String>,
+    pub intent_level: Option<String>,
+    pub domain_signals: Document,
+    pub dimension_display_names: Document,
+    pub follow_up_policy: Option<String>,
+    pub profile_attributes: Document,
+    pub next_best_action: Document,
+    #[serde(deserialize_with = "string_or_vec")]
+    pub objections_detected: Vec<String>,
+    pub operating_memory_update: Document,
+    #[serde(deserialize_with = "document_vec")]
+    pub memory_candidates: Vec<Document>,
+    #[serde(deserialize_with = "number_i32")]
+    pub memory_write_score: i32,
+    pub consolidation_needed: bool,
+    pub memory_update: String,
+    pub agent_generated_signals: Vec<AgentSignal>,
+}
+
+impl DeferredProjectionDecision {
+    /// Parse a projection while fail-closing only fields that could affect customer delivery.
+    /// Unknown analytical fields are ignored for forward compatibility and counted by callers.
+    pub fn from_value(value: serde_json::Value) -> Result<Self, String> {
+        const FORBIDDEN: &[&str] = &[
+            "replyText",
+            "shouldReply",
+            "needsReview",
+            "review",
+            "assetsToSend",
+            "namecardToSend",
+            "escalationRequest",
+            "lastCommitment",
+            "commitment",
+            "followUp",
+            "toolCalls",
+        ];
+        let object = value
+            .as_object()
+            .ok_or_else(|| "projection output must be a JSON object".to_string())?;
+        if let Some(field) = FORBIDDEN.iter().find(|field| object.contains_key(**field)) {
+            return Err(format!(
+                "projection output contains forbidden send-control field: {field}"
+            ));
+        }
+        serde_json::from_value(value).map_err(|error| error.to_string())
+    }
+
+    /// Return unknown top-level analytical keys for observability. They do not fail parsing.
+    pub fn unknown_fields(value: &serde_json::Value) -> Vec<String> {
+        const KNOWN: &[&str] = &[
+            "profileUpdate",
+            "tags",
+            "tagEvidenceTurns",
+            "stageEvidenceTurns",
+            "stageExplicitIntent",
+            "bayesianObservations",
+            "customerStage",
+            "intentLevel",
+            "domainSignals",
+            "dimensionDisplayNames",
+            "followUpPolicy",
+            "profileAttributes",
+            "nextBestAction",
+            "objectionsDetected",
+            "operatingMemoryUpdate",
+            "memoryCandidates",
+            "memoryWriteScore",
+            "consolidationNeeded",
+            "memoryUpdate",
+            "agentGeneratedSignals",
+        ];
+        value.as_object().map_or_else(Vec::new, |object| {
+            object
+                .keys()
+                .filter(|key| !KNOWN.contains(&key.as_str()))
+                .cloned()
+                .collect()
+        })
+    }
+
+    /// Convert only projection-owned fields into the legacy persistence shape.
+    pub fn into_agent_decision(mut self) -> AgentDecision {
+        self.tags.truncate(24);
+        self.bayesian_observations.truncate(6);
+        self.memory_candidates.truncate(6);
+        self.agent_generated_signals.truncate(12);
+        AgentDecision {
+            profile_update: self.profile_update,
+            tags: self.tags,
+            tag_evidence_turns: self.tag_evidence_turns,
+            stage_evidence_turns: self.stage_evidence_turns,
+            stage_explicit_intent: self.stage_explicit_intent,
+            bayesian_observations: self.bayesian_observations,
+            customer_stage: self.customer_stage,
+            intent_level: self.intent_level,
+            domain_signals: self.domain_signals,
+            dimension_display_names: self.dimension_display_names,
+            follow_up_policy: self.follow_up_policy,
+            profile_attributes: self.profile_attributes,
+            next_best_action: self.next_best_action,
+            objections_detected: self.objections_detected,
+            operating_memory_update: self.operating_memory_update,
+            memory_candidates: self.memory_candidates,
+            memory_write_score: self.memory_write_score.clamp(0, 10),
+            consolidation_needed: self.consolidation_needed,
+            memory_update: self.memory_update,
+            agent_generated_signals: self.agent_generated_signals,
+            ..AgentDecision::default()
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // agent-autonomy-loop W1 / Task 2.3：`validate_and_promote`
 //
@@ -670,6 +794,100 @@ fn check_required_bool(field: Option<bool>, name: &str, risks: &mut Vec<String>)
 }
 
 impl RawAgentDecision {
+    /// Validate the compact send-critical contract. Projection and diagnostic fields are
+    /// explicitly discarded even if an old/custom prompt still emits them.
+    pub fn validate_reply_critical(
+        self,
+        runtime: &super::runtime::UserRuntimeParameters,
+    ) -> (AgentDecision, Vec<String>) {
+        let mut risks = Vec::new();
+        let phase = match self.decision_phase.as_deref().map(str::trim) {
+            Some(RAW_FINAL) | None | Some("") => RAW_FINAL.to_string(),
+            Some(other) => {
+                risks.push(format!("decision_phase_invalid:{other}"));
+                RAW_FINAL.to_string()
+            }
+        };
+        let allowed_modes: Vec<&str> = if runtime.allowed_conversation_modes.is_empty() {
+            CONVERSATION_MODE_VALUES.to_vec()
+        } else {
+            runtime
+                .allowed_conversation_modes
+                .iter()
+                .map(String::as_str)
+                .collect()
+        };
+        let risk_level = check_required_enum(
+            self.risk_level.clone(),
+            "risk_level",
+            RISK_LEVEL_VALUES,
+            &mut risks,
+        );
+        let knowledge_need = check_required_enum(
+            self.knowledge_need.clone(),
+            "knowledge_need",
+            KNOWLEDGE_NEED_VALUES,
+            &mut risks,
+        );
+        let run_mode = check_required_enum(
+            self.run_mode.clone(),
+            "run_mode",
+            RUN_MODE_VALUES,
+            &mut risks,
+        );
+        let autonomy_mode = check_required_enum(
+            self.autonomy_mode.clone(),
+            "autonomy_mode",
+            AUTONOMY_MODE_VALUES,
+            &mut risks,
+        );
+        let conversation_mode = check_required_enum(
+            self.conversation_mode.clone(),
+            "conversation_mode",
+            &allowed_modes,
+            &mut risks,
+        );
+        let operation_state =
+            check_required_string(self.operation_state.clone(), "operation_state", &mut risks);
+        let needs_review = check_required_bool(self.needs_review, "needs_review", &mut risks);
+        let should_reply = check_required_bool(self.should_reply, "should_reply", &mut risks);
+        let risk_self_check =
+            check_required_string(self.risk_self_check.clone(), "risk_self_check", &mut risks);
+        let reply_text = self.reply_text.clone().unwrap_or_default();
+        if should_reply && reply_text.trim().is_empty() {
+            risks.push("missing_required_field:reply_text".to_string());
+        }
+        if !should_reply
+            && self
+                .why_skip_reply
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or_default()
+                .is_empty()
+        {
+            risks.push("missing_required_field:why_skip_reply".to_string());
+        }
+
+        let mut decision = build_minimal_decision(self);
+        decision.decision_phase = phase;
+        decision.risk_level = risk_level;
+        decision.knowledge_need = knowledge_need;
+        decision.run_mode = run_mode;
+        decision.autonomy_mode = autonomy_mode;
+        decision.conversation_mode = if conversation_mode.is_empty() {
+            default_conversation_mode()
+        } else {
+            conversation_mode
+        };
+        decision.operation_state = (!operation_state.is_empty()).then_some(operation_state);
+        decision.needs_review = needs_review;
+        decision.should_reply = should_reply;
+        decision.reply_text = reply_text;
+        decision.risk_self_check = risk_self_check;
+        clear_deferred_fields(&mut decision);
+        (decision, risks)
+    }
+
     /// 把 `RawAgentDecision`（Reply Agent JSON 边界结构）映射到业务结构
     /// [`AgentDecision`]，同时聚合协议违规标签到 `Vec<String>`。详见模块顶部
     /// 长 doc-comment（W1 task 2.3 / N2 / R1 / R3 / R4）。
@@ -908,6 +1126,39 @@ impl RawAgentDecision {
 
         (decision, risks)
     }
+}
+
+fn clear_deferred_fields(decision: &mut AgentDecision) {
+    decision.profile_update = None;
+    decision.tags.clear();
+    decision.tag_evidence_turns.clear();
+    decision.stage_evidence_turns.clear();
+    decision.stage_explicit_intent = false;
+    decision.bayesian_observations.clear();
+    decision.customer_stage = None;
+    decision.intent_level = None;
+    decision.domain_signals.clear();
+    decision.dimension_display_names.clear();
+    decision.follow_up_policy = None;
+    decision.profile_attributes.clear();
+    decision.intent_analysis.clear();
+    decision.next_best_action.clear();
+    decision.cooldown_until = None;
+    decision.product_fit_score = None;
+    decision.objections_detected.clear();
+    decision.recommended_resource_ids.clear();
+    decision.operating_memory_update.clear();
+    decision.memory_candidates.clear();
+    decision.memory_write_score = 0;
+    decision.consolidation_needed = false;
+    decision.memory_update.clear();
+    decision.agent_generated_signals.clear();
+    decision.user_understanding.clear();
+    decision.relationship_read.clear();
+    decision.operation_goal.clear();
+    decision.knowledge_need_reason.clear();
+    decision.memory_update_reason.clear();
+    decision.self_critique.clear();
 }
 
 /// 检查"该回复 / 不回复理由"长度与汉字数量是否达标（R1.4 / R1.6）。
@@ -2223,6 +2474,75 @@ mod validate_and_promote_tests {
         let runtime = runtime_default(true);
         let (decision, _risks) = raw.validate_and_promote(&runtime);
         assert!(decision.assets_to_send.is_empty());
+    }
+
+    #[test]
+    fn compact_reply_validation_discards_projection_fields_but_keeps_send_directives() {
+        let mut raw = make_valid_low_routine_raw();
+        raw.conversation_mode = Some("casual_relationship".to_string());
+        raw.profile_update = Some(AgentProfile {
+            summary: "must not enter the send decision".to_string(),
+            ..AgentProfile::default()
+        });
+        raw.tags = Some(vec!["projection-only".to_string()]);
+        raw.customer_stage = Some("invented-stage".to_string());
+        raw.memory_update = Some("projection-only memory".to_string());
+        raw.agent_generated_signals = Some(vec![AgentSignal {
+            kind: "relationship_type".to_string(),
+            value: "peer".to_string(),
+            ..AgentSignal::default()
+        }]);
+        raw.assets_to_send = Some(vec![AssetSendDirective {
+            asset_id: "asset-1".to_string(),
+            reason: Some("send-critical".to_string()),
+        }]);
+        raw.commitment = Some(CommitmentDecision {
+            text: "明天给答复".to_string(),
+            due_at: "2026-06-12T09:00:00+08:00".to_string(),
+        });
+
+        let (decision, risks) = raw.validate_reply_critical(&runtime_default(true));
+
+        assert!(
+            risks.is_empty(),
+            "unexpected compact-contract risks: {risks:?}"
+        );
+        assert!(decision.profile_update.is_none());
+        assert!(decision.tags.is_empty());
+        assert!(decision.customer_stage.is_none());
+        assert!(decision.memory_update.is_empty());
+        assert!(decision.agent_generated_signals.is_empty());
+        assert_eq!(decision.assets_to_send.len(), 1);
+        assert_eq!(decision.last_commitment.as_deref(), Some("明天给答复"));
+    }
+
+    #[test]
+    fn deferred_projection_schema_rejects_send_control_fields() {
+        let error = DeferredProjectionDecision::from_value(serde_json::json!({
+            "tags": [],
+            "replyText": "must never be accepted"
+        }))
+        .expect_err("projection schema must deny reply fields");
+        assert!(error.contains("forbidden send-control field"));
+    }
+
+    #[test]
+    fn deferred_projection_conversion_cannot_authorize_delivery() {
+        let projected: DeferredProjectionDecision = serde_json::from_value(serde_json::json!({
+            "tags": ["stable"],
+            "memoryWriteScore": 99
+        }))
+        .expect("valid sparse projection");
+        let decision = projected.into_agent_decision();
+        assert_eq!(decision.tags, vec!["stable"]);
+        assert_eq!(decision.memory_write_score, 10);
+        assert!(!decision.should_reply);
+        assert!(decision.reply_text.is_empty());
+        assert!(decision.assets_to_send.is_empty());
+        assert!(decision.namecard_to_send.is_none());
+        assert!(decision.escalation_request.is_none());
+        assert!(decision.follow_up.is_none());
+        assert!(decision.commitment.is_none());
     }
 
     /// 子计划2 Task2：carry_through_fields 须把 LLM 指认的标签/stage 证据序位

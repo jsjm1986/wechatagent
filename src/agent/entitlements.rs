@@ -325,6 +325,15 @@ pub(crate) fn render_suspected_deal_guidance(active_products: &[Product]) -> Str
 /// **零扰动**：本段常驻（对所有 profile 一致追加），但它只是「有新证据才产出」的可选
 /// 指引——不强制 LLM 每轮输出，故 DEFAULT 销售域追加本段不改变既有行为（无新证据 →
 /// 不产信号 → 决策与改造前等价）。无参纯函数，供 decision.rs 调用 + lib 单测共用。
+/// Fast-reply-only guidance for a possible purchase. Signal extraction is deferred to the
+/// projection worker; the current reply retains only the customer-facing clarification duty.
+pub(crate) fn render_suspected_deal_reply_guidance(active_products: &[Product]) -> String {
+    if active_products.is_empty() {
+        return String::new();
+    }
+    "\n\n# 疑似成交澄清\n若客户本轮明确暗示可能已下单或付款，不要自行认定成交；在回复里用自然、低压的一句话向客户确认。没有这类迹象时忽略本段。".to_string()
+}
+
 pub(crate) fn render_relationship_type_suggestion_guidance() -> String {
     "\n\n# 关系性质识别（数字分身，仅在本轮出现关系性质的明确新证据时）\n\
      关系性质指对方相对本账号机主的关系定位（按本账号 relationship_type 字典的取值，\

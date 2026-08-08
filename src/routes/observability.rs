@@ -830,6 +830,8 @@ pub(super) async fn worker_health(
     let gap_signals = aggregate_gap_signals(&state, &workspace, as_of_ms).await?;
     let lessons_learned =
         aggregate_lessons_learned(&state, &workspace, lessons_start_ms, as_of_ms).await?;
+    let post_decision_projection =
+        aggregate_post_decision_projection(&state, &workspace, as_of_ms).await?;
     let retained_scope = metric_scope(
         "retained_history",
         "non_snapshot",
@@ -855,11 +857,181 @@ pub(super) async fn worker_health(
             "chatTasks": retained_scope.clone(),
             "gapSignals": retained_scope,
             "lessonsLearned": lessons_scope,
+            "postDecisionProjection": metric_scope(
+                "mixed_current_and_retained_history",
+                "non_snapshot",
+                Some(as_of_ms),
+                None,
+                None,
+                None,
+                None,
+            ),
         },
         "chatTasks": chat_tasks,
         "gapSignals": gap_signals,
         "lessonsLearned": lessons_learned,
+        "postDecisionProjection": post_decision_projection,
     })))
+}
+
+async fn aggregate_post_decision_projection(
+    state: &AppState,
+    workspace: &str,
+    as_of_ms: i64,
+) -> AppResult<Value> {
+    const STATUSES: &[&str] = &[
+        "prepared",
+        "pending",
+        "retry",
+        "processing",
+        "completed",
+        "failed_terminal",
+        "discarded",
+    ];
+    const ACTIVE: &[&str] = &["prepared", "pending", "retry", "processing"];
+    const SAMPLE_LIMIT: i64 = 2_000;
+
+    let coll = state
+        .db
+        .raw()
+        .collection::<Document>("agent_decision_reviews");
+    let as_of = DateTime::from_millis(as_of_ms);
+    let mut cursor = coll
+        .aggregate(
+            vec![
+                doc! { "$match": {
+                    "workspace_id": workspace,
+                    "post_decision_status": { "$exists": true },
+                    "created_at": { "$lte": as_of },
+                } },
+                doc! { "$group": { "_id": "$post_decision_status", "count": { "$sum": 1 } } },
+            ],
+            None,
+        )
+        .await?;
+    let mut buckets = std::collections::HashMap::<String, i64>::new();
+    while let Some(row) = cursor.try_next().await? {
+        if let Some(status) = row.get("_id").and_then(Bson::as_str) {
+            buckets.insert(status.to_string(), document_i64(&row, "count").unwrap_or(0));
+        }
+    }
+    let mut by_status = STATUSES
+        .iter()
+        .map(|status| {
+            json!({
+                "status": status,
+                "count": buckets.remove(*status).unwrap_or(0),
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut leftovers = buckets.into_iter().collect::<Vec<_>>();
+    leftovers.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    by_status.extend(leftovers.into_iter().map(
+        |(status, count)| json!({ "status": status, "count": count, "outOfClosedSet": true }),
+    ));
+
+    let oldest = coll
+        .find_one(
+            doc! {
+                "workspace_id": workspace,
+                "post_decision_status": { "$in": ACTIVE },
+                "created_at": { "$lte": as_of },
+            },
+            mongodb::options::FindOneOptions::builder()
+                .projection(doc! { "created_at": 1 })
+                .sort(doc! { "created_at": 1, "_id": 1 })
+                .build(),
+        )
+        .await?;
+    let oldest_pending_age_ms = oldest
+        .as_ref()
+        .and_then(|row| row.get_datetime("created_at").ok())
+        .map(|created| as_of_ms.saturating_sub(created.timestamp_millis()));
+
+    let mut error_cursor = coll
+        .aggregate(
+            vec![
+                doc! { "$match": {
+                    "workspace_id": workspace,
+                    "post_decision_error_kind": { "$exists": true, "$nin": [null, ""] },
+                } },
+                doc! { "$group": { "_id": "$post_decision_error_kind", "count": { "$sum": 1 } } },
+                doc! { "$sort": { "count": -1 } },
+                doc! { "$limit": 10 },
+            ],
+            None,
+        )
+        .await?;
+    let mut error_kinds_top = Vec::new();
+    while let Some(row) = error_cursor.try_next().await? {
+        if let Some(kind) = row.get("_id").and_then(Bson::as_str) {
+            error_kinds_top.push(json!({
+                "errorKind": kind,
+                "count": document_i64(&row, "count").unwrap_or(0),
+            }));
+        }
+    }
+
+    let options = FindOptions::builder()
+        .projection(doc! {
+            "post_decision_attempts": 1,
+            "post_decision_payload_bytes": 1,
+            "post_decision_prepared_at": 1,
+            "post_decision_completed_at": 1,
+            "post_decision_profile_skipped_stale": 1,
+        })
+        .sort(doc! { "created_at": -1 })
+        .limit(SAMPLE_LIMIT)
+        .build();
+    let mut sample_cursor = coll
+        .find(
+            doc! {
+                "workspace_id": workspace,
+                "post_decision_status": { "$exists": true },
+            },
+            options,
+        )
+        .await?;
+    let mut attempts = Vec::new();
+    let mut snapshot_bytes = Vec::new();
+    let mut completion_latency_ms = Vec::new();
+    let mut stale_profile_skips = 0_i64;
+    let mut sample_count = 0_i64;
+    while let Some(row) = sample_cursor.try_next().await? {
+        sample_count += 1;
+        if let Some(value) = document_i64(&row, "post_decision_attempts") {
+            attempts.push(value);
+        }
+        if let Some(value) = document_i64(&row, "post_decision_payload_bytes") {
+            snapshot_bytes.push(value);
+        }
+        if let (Ok(prepared), Ok(completed)) = (
+            row.get_datetime("post_decision_prepared_at"),
+            row.get_datetime("post_decision_completed_at"),
+        ) {
+            completion_latency_ms.push(
+                completed
+                    .timestamp_millis()
+                    .saturating_sub(prepared.timestamp_millis()),
+            );
+        }
+        stale_profile_skips += i64::from(
+            row.get_bool("post_decision_profile_skipped_stale")
+                .unwrap_or(false),
+        );
+    }
+
+    Ok(json!({
+        "byStatus": by_status,
+        "oldestPendingAgeMs": oldest_pending_age_ms,
+        "errorKindsTop": error_kinds_top,
+        "recentSampleCount": sample_count,
+        "sampleLimit": SAMPLE_LIMIT,
+        "attempts": summarize_values(&mut attempts),
+        "snapshotBytes": summarize_values(&mut snapshot_bytes),
+        "completionLatencyMs": summarize_values(&mut completion_latency_ms),
+        "staleProfileSkips": stale_profile_skips,
+    }))
 }
 
 async fn aggregate_chat_tasks(

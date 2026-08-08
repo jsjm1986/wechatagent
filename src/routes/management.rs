@@ -2208,6 +2208,7 @@ pub(super) async fn execute_management_tool(
                 unset_doc.insert("last_commitment", "");
             }
             let mut update_doc = doc! { "$set": set_doc };
+            update_doc.insert("$inc", doc! { "profile_revision": 1i64 });
             if !unset_doc.is_empty() {
                 update_doc.insert("$unset", unset_doc);
             }
@@ -2404,7 +2405,8 @@ pub(super) async fn execute_management_tool(
                     doc! { "_id": contact.id },
                     doc! {
                         "$set": set_doc,
-                        "$unset": { "last_commitment": "" }
+                        "$unset": { "last_commitment": "" },
+                        "$inc": { "profile_revision": 1i64 }
                     },
                     None,
                 )

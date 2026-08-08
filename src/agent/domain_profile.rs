@@ -294,6 +294,17 @@ pub fn build_policy_formula_section(formulas: &[BusinessFormula]) -> String {
 
 /// universal-domain-adaptation H9（第 20 点）：policy 里「## 对话模式判定」段的固定标题。
 /// 运行时注入 `conversation_mode_policy` 覆盖时以它为锚剥离原销售判定段。
+pub const POLICY_PROJECTION_SECTION_HEADING: &str = "## 标签与画像";
+
+/// Remove the projection-only tail from the policy rendered for the fast reply agent.
+/// The full policy row remains immutable for history/rollback; only the runtime view is slimmed.
+pub fn strip_projection_only_policy_section(policy: &str) -> String {
+    match policy.find(POLICY_PROJECTION_SECTION_HEADING) {
+        Some(start) => policy[..start].trim_end().to_string(),
+        None => policy.to_string(),
+    }
+}
+
 pub const POLICY_CONVERSATION_MODE_SECTION_HEADING: &str = "## 对话模式判定";
 
 /// universal-domain-adaptation H9（第 20 点）：剥离 policy 里「## 对话模式判定」整段
@@ -2342,6 +2353,19 @@ mod tests {
 
     /// reply.policy 收敛 helper 的输出 == 收敛前 decision.rs 里逐行串行调用，对**任意** profile
     /// 字节等价（守恒：收敛不改行为）。这里用 DEFAULT_PROFILE，对齐「销售域零变化」红线。
+    #[test]
+    fn fast_reply_policy_strips_projection_tail_only() {
+        let policy = "## 表达红线\nkeep\n\n## 标签与画像\ndefer this";
+        assert_eq!(
+            strip_projection_only_policy_section(policy),
+            "## 表达红线\nkeep"
+        );
+        assert_eq!(
+            strip_projection_only_policy_section("## 表达红线\nkeep"),
+            "## 表达红线\nkeep"
+        );
+    }
+
     #[test]
     fn apply_reply_policy_prompt_overrides_default_is_byte_identical_to_serial() {
         let profile = default_domain_profile("ws-1");

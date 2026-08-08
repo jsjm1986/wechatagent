@@ -41,6 +41,18 @@ pub struct AppConfig {
     pub llm_timeout_seconds: u64,
     pub llm_max_retries: u32,
     pub llm_retry_base_ms: u64,
+    /// 发送后投影 worker 并发数。跨进程 contact lease 保证同联系人仍串行。
+    pub post_decision_worker_concurrency: usize,
+    /// 单条发送后投影最多认领次数；耗尽后进入 failed_terminal，避免永久热循环。
+    pub post_decision_max_attempts: i32,
+    /// 单条冻结投影快照 BSON 硬上限（字节），默认 2 MiB，远低于 Mongo 16 MiB 文档上限。
+    pub post_decision_snapshot_max_bytes: usize,
+    /// Projection 最终 user prompt 的字符硬上限；按低优先级 section 逐级裁剪。
+    pub post_decision_prompt_max_chars: usize,
+    /// Projection child run 的独立 token 预算（单次 LLM 调用）。
+    pub post_decision_token_budget: i64,
+    /// failed_terminal 完整快照保留天数；到期仅脱敏 payload/result，不删除审计记录。
+    pub post_decision_failed_snapshot_retention_days: i64,
     /// HP-1 / Task 9：Worker 进程崩溃后，状态卡在 `running` 的任务的回收阈值。
     /// `claimed_at` 早于 `now - 该秒数` 即视为 stale，由下一次 tick 重置回 `retry`。
     pub task_claim_timeout_seconds: u64,
@@ -475,6 +487,27 @@ impl AppConfig {
             llm_timeout_seconds: env_or("LLM_TIMEOUT_SECONDS", "45").parse()?,
             llm_max_retries: env_or("LLM_MAX_RETRIES", "5").parse()?,
             llm_retry_base_ms: env_or("LLM_RETRY_BASE_MS", "1500").parse()?,
+            post_decision_worker_concurrency: env_or("POST_DECISION_WORKER_CONCURRENCY", "4")
+                .parse::<usize>()?
+                .clamp(1, 32),
+            post_decision_max_attempts: env_or("POST_DECISION_MAX_ATTEMPTS", "8")
+                .parse::<i32>()?
+                .clamp(1, 100),
+            post_decision_snapshot_max_bytes: env_or("POST_DECISION_SNAPSHOT_MAX_BYTES", "2097152")
+                .parse::<usize>()?
+                .clamp(262_144, 8 * 1024 * 1024),
+            post_decision_prompt_max_chars: env_or("POST_DECISION_PROMPT_MAX_CHARS", "80000")
+                .parse::<usize>()?
+                .clamp(8_000, 500_000),
+            post_decision_token_budget: env_or("POST_DECISION_TOKEN_BUDGET", "32000")
+                .parse::<i64>()?
+                .clamp(1_000, 500_000),
+            post_decision_failed_snapshot_retention_days: env_or(
+                "POST_DECISION_FAILED_SNAPSHOT_RETENTION_DAYS",
+                "14",
+            )
+            .parse::<i64>()?
+            .clamp(1, 365),
             task_claim_timeout_seconds: env_or("TASK_CLAIM_TIMEOUT_SECONDS", "300").parse()?,
             import_worker_interval_seconds: env_or("IMPORT_WORKER_INTERVAL_SECONDS", "2")
                 .parse()?,

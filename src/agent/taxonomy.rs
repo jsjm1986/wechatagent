@@ -23,7 +23,7 @@
 //! - `CandidateNew`：追加 `taxonomy_candidate:<kind>:<value>` risk + 异步 upsert
 //!   候选；不强制 `review.approved=false`。
 
-use mongodb::bson::{doc, DateTime};
+use mongodb::bson::{doc, Bson, DateTime, Document};
 use parking_lot::Mutex as PlMutex;
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
@@ -542,6 +542,108 @@ pub(crate) async fn upsert_candidate(
             }
         }
     }
+}
+
+/// Projection-worker variant of [`upsert_candidate`] whose occurrence count is idempotent per
+/// run. Strict replay identity lives in `projection_observations`; `source_run_ids` is only a
+/// bounded recent-run display cache.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn upsert_candidate_once_per_run(
+    db: &Database,
+    workspace_id: &str,
+    scope_account_id: &str,
+    kind: &str,
+    raw_value: &str,
+    evidence: Option<&str>,
+    confidence: i32,
+    suggested_display_name: Option<&str>,
+    run_id: &str,
+) -> AppResult<()> {
+    let now = DateTime::now();
+    let collection = db
+        .collection_taxonomy_candidates()
+        .clone_with_type::<Document>();
+    let filter = doc! {
+        "workspace_id": workspace_id,
+        "scope": scope_account_id,
+        "kind": kind,
+        "raw_value": raw_value,
+    };
+
+    let mut existing = collection.find_one(filter.clone(), None).await?;
+    if existing.is_none() {
+        let mut insert = doc! {
+            "workspace_id": workspace_id,
+            "scope": scope_account_id,
+            "kind": kind,
+            "raw_value": raw_value,
+            "confidence": confidence.clamp(0, 10),
+            "first_seen_at": now,
+            "last_seen_at": now,
+            "occurrences": 0,
+            "status": "pending",
+            "reviewed_at": Bson::Null,
+            "reviewed_by": Bson::Null,
+            "source_run_ids": Vec::<String>::new(),
+        };
+        insert.insert("evidence", evidence.map(Bson::from).unwrap_or(Bson::Null));
+        insert.insert(
+            "suggested_display_name",
+            suggested_display_name.map(Bson::from).unwrap_or(Bson::Null),
+        );
+        match collection.insert_one(insert, None).await {
+            Ok(_) => {}
+            Err(error)
+                if error.to_string().contains("E11000")
+                    || error.to_string().contains("duplicate key") => {}
+            Err(error) => return Err(error.into()),
+        }
+        existing = collection.find_one(filter.clone(), None).await?;
+    }
+
+    let existing = existing.ok_or_else(|| {
+        AppError::External("taxonomy candidate disappeared after upsert".to_string())
+    })?;
+    let status = existing.get_str("status").unwrap_or("pending");
+    if status == "approved" {
+        tracing::warn!(
+            scope = scope_account_id,
+            kind,
+            raw_value,
+            "projection candidate hit approved row; cache may be stale"
+        );
+    }
+    if matches!(status, "approved" | "rejected") {
+        collection
+            .update_one(filter, doc! { "$set": { "last_seen_at": now } }, None)
+            .await?;
+        return Ok(());
+    }
+
+    let entity_id = format!(
+        "{}:{}:{}",
+        hex::encode(scope_account_id.as_bytes()),
+        hex::encode(kind.as_bytes()),
+        hex::encode(raw_value.as_bytes())
+    );
+    let legacy_run_ids = super::projection_observations::source_run_ids(&existing);
+    let ledger_count = super::projection_observations::record_and_count(
+        db,
+        workspace_id,
+        "taxonomy_candidate",
+        &entity_id,
+        &legacy_run_ids,
+        run_id,
+    )
+    .await?;
+    let mut stages = vec![doc! { "$set": { "last_seen_at": now } }];
+    stages.extend(super::projection_observations::reconcile_stages(
+        ledger_count,
+        run_id,
+        legacy_run_ids.len() as i64,
+    ));
+    collection.update_one(filter, stages, None).await?;
+    Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────

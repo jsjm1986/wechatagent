@@ -6,7 +6,7 @@ use axum::{
 };
 use futures::TryStreamExt;
 use mongodb::{
-    bson::{doc, Document},
+    bson::{doc, Bson, DateTime, Document},
     options::FindOptions,
 };
 use serde::Deserialize;
@@ -27,6 +27,80 @@ pub(super) struct DecisionReviewQuery {
     contact_id: Option<String>,
     contact_wxid: Option<String>,
     limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct PostDecisionRecoveryRequest {
+    account_id: String,
+    reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryAction {
+    Retry,
+    Regenerate,
+    Discard,
+}
+
+fn recovery_update(action: RecoveryAction, actor: &str, reason: &str, now: DateTime) -> Document {
+    let audit = doc! {
+        "action": match action { RecoveryAction::Retry => "retry", RecoveryAction::Regenerate => "regenerate", RecoveryAction::Discard => "discard" },
+        "actor": actor,
+        "reason": reason,
+        "at": now,
+    };
+    match action {
+        RecoveryAction::Retry => doc! {
+            "$set": {
+                "post_decision_status": "retry",
+                "post_decision_next_retry_at": now,
+                "post_decision_attempts": 0i32,
+                "post_decision_last_recovery": audit,
+            },
+            "$unset": {
+                "post_decision_terminal_at": "",
+                "post_decision_error_kind": "",
+                "post_decision_error": "",
+                "post_decision_claim_token": "",
+                "post_decision_locked_until": "",
+            },
+        },
+        RecoveryAction::Regenerate => doc! {
+            "$set": {
+                "post_decision_status": "retry",
+                "post_decision_next_retry_at": now,
+                "post_decision_attempts": 0i32,
+                "post_decision_last_recovery": audit,
+            },
+            "$unset": {
+                "post_decision_projection_result": "",
+                "post_decision_projection_generated_at": "",
+                "post_decision_safe_to_regenerate": "",
+                "post_decision_terminal_at": "",
+                "post_decision_error_kind": "",
+                "post_decision_error": "",
+                "post_decision_claim_token": "",
+                "post_decision_locked_until": "",
+            },
+        },
+        RecoveryAction::Discard => doc! {
+            "$set": {
+                "post_decision_status": "discarded",
+                "post_decision_discarded_at": now,
+                "post_decision_last_recovery": audit,
+            },
+            "$unset": {
+                "post_decision_payload": "",
+                "post_decision_projection_result": "",
+                "post_decision_claim_token": "",
+                "post_decision_locked_until": "",
+                "post_decision_next_retry_at": "",
+                "post_decision_error": "",
+                "post_decision_safe_to_regenerate": "",
+            },
+        },
+    }
 }
 
 pub(super) async fn list_decision_reviews(
@@ -124,6 +198,101 @@ pub(super) async fn get_decision_review(
         status.autonomy_protocol,
         status.outbox_status,
     ) })))
+}
+
+async fn recover_post_decision(
+    state: &AppState,
+    admin: &AuthenticatedAdmin,
+    id: &str,
+    payload: PostDecisionRecoveryRequest,
+    action: RecoveryAction,
+) -> AppResult<Json<Value>> {
+    let account_id = payload.account_id.trim();
+    let reason = payload.reason.trim();
+    if account_id.is_empty() {
+        return Err(AppError::BadRequest("accountId is required".to_string()));
+    }
+    if reason.is_empty() {
+        return Err(AppError::BadRequest("reason is required".to_string()));
+    }
+    validate_account(state, &admin.current_workspace, account_id).await?;
+    let review_id = parse_object_id(id)?;
+    let coll = state.db.decision_reviews().clone_with_type::<Document>();
+    let review = coll
+        .find_one(
+            doc! { "_id": review_id, "workspace_id": &admin.current_workspace, "account_id": account_id },
+            None,
+        )
+        .await?
+        .ok_or_else(|| AppError::NotFound("decision review not found".to_string()))?;
+    if review.get_str("post_decision_status").ok() != Some("failed_terminal") {
+        return Err(AppError::Conflict(
+            "post_decision_not_failed_terminal".to_string(),
+        ));
+    }
+    if action != RecoveryAction::Discard
+        && !matches!(review.get("post_decision_payload"), Some(Bson::Document(_)))
+    {
+        return Err(AppError::Conflict(
+            "post_decision_snapshot_unavailable".to_string(),
+        ));
+    }
+    if action == RecoveryAction::Regenerate
+        && review.get_bool("post_decision_safe_to_regenerate").ok() != Some(true)
+    {
+        return Err(AppError::Conflict(
+            "post_decision_regenerate_not_safe".to_string(),
+        ));
+    }
+    let result = coll
+        .update_one(
+            doc! {
+                "_id": review_id,
+                "workspace_id": &admin.current_workspace,
+                "account_id": account_id,
+                "post_decision_status": "failed_terminal",
+            },
+            recovery_update(action, &admin.username, reason, DateTime::now()),
+            None,
+        )
+        .await?;
+    if result.matched_count != 1 {
+        return Err(AppError::Conflict(
+            "post_decision_recovery_raced".to_string(),
+        ));
+    }
+    Ok(Json(json!({
+        "ok": true,
+        "id": review_id.to_hex(),
+        "action": match action { RecoveryAction::Retry => "retry", RecoveryAction::Regenerate => "regenerate", RecoveryAction::Discard => "discard" },
+    })))
+}
+
+pub(super) async fn retry_post_decision(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
+    Path(id): Path<String>,
+    Json(payload): Json<PostDecisionRecoveryRequest>,
+) -> AppResult<Json<Value>> {
+    recover_post_decision(&state, &admin, &id, payload, RecoveryAction::Retry).await
+}
+
+pub(super) async fn regenerate_post_decision(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
+    Path(id): Path<String>,
+    Json(payload): Json<PostDecisionRecoveryRequest>,
+) -> AppResult<Json<Value>> {
+    recover_post_decision(&state, &admin, &id, payload, RecoveryAction::Regenerate).await
+}
+
+pub(super) async fn discard_post_decision(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
+    Path(id): Path<String>,
+    Json(payload): Json<PostDecisionRecoveryRequest>,
+) -> AppResult<Json<Value>> {
+    recover_post_decision(&state, &admin, &id, payload, RecoveryAction::Discard).await
 }
 
 /// agent_run_logs.decision（camelCase Document）里的 9 个 R1.1 自治协议字段。
@@ -249,5 +418,34 @@ mod tests {
             Some("")
         );
         assert_eq!(obj.get("riskSelfCheck").and_then(|x| x.as_str()), Some(""));
+    }
+
+    #[test]
+    fn recovery_updates_preserve_or_clear_generation_as_requested() {
+        let now = DateTime::from_millis(123);
+        let retry = recovery_update(RecoveryAction::Retry, "admin", "again", now);
+        assert!(retry
+            .get_document("$unset")
+            .unwrap()
+            .get("post_decision_projection_result")
+            .is_none());
+        let regenerate = recovery_update(RecoveryAction::Regenerate, "admin", "new model", now);
+        assert!(regenerate
+            .get_document("$unset")
+            .unwrap()
+            .contains_key("post_decision_projection_result"));
+        let discard = recovery_update(RecoveryAction::Discard, "admin", "privacy", now);
+        assert_eq!(
+            discard
+                .get_document("$set")
+                .unwrap()
+                .get_str("post_decision_status")
+                .unwrap(),
+            "discarded"
+        );
+        assert!(discard
+            .get_document("$unset")
+            .unwrap()
+            .contains_key("post_decision_payload"));
     }
 }
