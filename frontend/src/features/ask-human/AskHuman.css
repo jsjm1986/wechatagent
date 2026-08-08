@@ -19,7 +19,8 @@
   padding: 22px 26px 20px;
   background: var(--surface-card);
   border: 1px solid var(--hairline);
-  box-shadow: 0 14px 34px -24px rgba(20, 30, 60, 0.3),
+  box-shadow:
+    0 14px 34px -24px rgba(20, 30, 60, 0.3),
     inset 0 1px 1px rgba(255, 255, 255, 0.9);
   /* 卡内纵向节奏统一由 gap 提供，子元素不再各自写 margin-bottom（会叠加）。
      这些子元素（卡头 / 降级横幅 / chip 行 / 列表）原先是 .askHumanChannel
@@ -67,7 +68,10 @@
   background: transparent;
   border: 1px solid var(--hairline);
   color: var(--ink-2);
-  transition: background 0.18s, color 0.18s, border-color 0.18s;
+  transition:
+    background 0.18s,
+    color 0.18s,
+    border-color 0.18s;
 }
 .askHumanHeader button:hover:not(:disabled) {
   background: rgba(0, 0, 0, 0.03);
@@ -122,7 +126,10 @@
   background: var(--surface-card);
   border: 1px solid var(--hairline);
   color: var(--ink-2);
-  transition: background 0.18s, color 0.18s, border-color 0.18s;
+  transition:
+    background 0.18s,
+    color 0.18s,
+    border-color 0.18s;
 }
 .askHumanSummaryChip:hover {
   background: rgba(0, 0, 0, 0.03);
@@ -132,6 +139,46 @@
   background: var(--ink-1);
   border-color: var(--ink-1);
   color: #fff;
+}
+
+.askHumanAccountFilter {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  font-size: 12px;
+  color: var(--ink-2);
+}
+.askHumanAccountFilter label {
+  font-weight: 600;
+  color: var(--ink-1);
+}
+.askHumanAccountFilter select {
+  min-height: 32px;
+  max-width: 260px;
+  padding: 0 30px 0 10px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-sm);
+  background: var(--surface-card);
+  color: var(--ink-1);
+  font: inherit;
+}
+.askHumanAccountFilter span {
+  color: var(--ink-3, var(--ink-2));
+}
+.inboxAccountTag {
+  display: inline-flex;
+  align-items: center;
+  max-width: 150px;
+  padding: 1px 8px;
+  border: 1px solid var(--hairline);
+  border-radius: 999px;
+  color: var(--ink-2);
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex-shrink: 0;
 }
 
 /* 兜底弱化文案 */
@@ -158,7 +205,10 @@
   background: transparent;
   border: 1px solid var(--hairline);
   color: var(--ink-2);
-  transition: background 0.18s, color 0.18s, border-color 0.18s;
+  transition:
+    background 0.18s,
+    color 0.18s,
+    border-color 0.18s;
 }
 .askHumanViewToggle:hover {
   background: rgba(0, 0, 0, 0.03);
@@ -236,30 +286,132 @@
   border: 1px solid var(--hairline);
   border-radius: var(--r-md, 12px);
   background: var(--surface-card);
+  transition: border-color 0.18s ease, box-shadow 0.18s ease;
 }
+.inboxRow:hover {
+  border-color: rgba(0, 0, 0, 0.14);
+}
+.inboxRow--open {
+  border-color: rgba(0, 0, 0, 0.14);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+}
+
+/* 头部由「toggle 按钮 + 常驻动作区」两块组成，故它自身是 div 而非 button
+   （button 内嵌 button 是非法 HTML，且点动作会冒泡触发展开）。 */
 .inboxRowHead {
   display: flex;
   align-items: center;
   gap: 10px;
-  width: 100%;
-  padding: 12px 14px;
+  padding: 11px 14px;
+}
+
+/* toggle 必须逐条推翻 styles.css:71 的全局裸 button 基线
+   （蓝底 / 白字 / min-height:38px / 居中 / font-weight:680）。
+   其中漏掉 color 正是原先「hover 整行刷蓝、预览文字看不清」的病根：
+   基线给了 color:#fff，白底下看不出，一 hover 换成深蓝底就暴露。 */
+.inboxRowToggle {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 3px;
+  min-height: 0;
+  padding: 0;
   border: none;
   background: transparent;
-  cursor: pointer;
+  color: var(--ink-1);
   font: inherit;
+  font-weight: 400;
   text-align: left;
+  cursor: pointer;
 }
-.inboxRowTitle { font-size: 13.5px; font-weight: 650; color: var(--ink-1); flex-shrink: 0; }
+.inboxRowToggle:hover {
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
+}
+.inboxRowToggle:active {
+  transform: none;
+}
+/* 不可展开的行把 toggle 置 disabled，但它不是「失效控件」，
+   不能继承全局 button:disabled 的 opacity:.55（会让整行发灰）。 */
+.inboxRowToggle:disabled {
+  opacity: 1;
+  cursor: default;
+}
+/* 第一行：徽章 + 标题 + 角标 + chevron。 */
+.inboxRowLine {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+/* 标题独占一行后允许收缩截断。原先它与摘要同排且 flex-shrink:0，
+   长标题（如「孤立 chunk：[reviewer-misjudge] …」）会把 flex:1 的摘要
+   挤成一小截，还与 margin-left:auto 的 chevron 争抢剩余宽度。 */
+.inboxRowTitle {
+  flex: 1;
+  min-width: 0;
+  font-size: 13.5px;
+  font-weight: 650;
+  line-height: 1.45;
+  color: var(--ink-1);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 第二行：摘要整行截断，不再与标题争宽度。 */
 .inboxRowPreview {
   font-size: 12.5px;
+  line-height: 1.5;
   color: var(--ink-3, var(--ink-2));
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  flex: 1;
 }
-.inboxRowChevron { margin-left: auto; color: var(--ink-3, var(--ink-2)); font-size: 12px; }
-.inboxRowBody { padding: 4px 14px 16px; border-top: 1px solid var(--hairline); }
+.inboxRowMeta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 1px;
+}
+.inboxRowChevron {
+  flex-shrink: 0;
+  color: var(--ink-4, var(--ink-3));
+  font-size: 11px;
+  line-height: 1;
+}
+/* 常驻动作区：一键处置型来源（通过/拒绝/忽略）的按钮直接可见，不必先展开。
+   与 toggle 同排贴右，顶端对齐第一行。 */
+.inboxRowActions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+  padding-top: 1px;
+}
+.inboxRowActions button {
+  min-height: 0;
+  padding: 5px 12px;
+  border-radius: var(--r-sm);
+  background: var(--surface-card);
+  border: 1px solid var(--hairline);
+  color: var(--ink-2);
+  font-size: 12px;
+  font-weight: 600;
+  transition: background 0.18s, color 0.18s, border-color 0.18s;
+}
+.inboxRowActions button:hover:not(:disabled) {
+  background: rgba(0, 0, 0, 0.03);
+  border-color: rgba(0, 0, 0, 0.14);
+  color: var(--ink-1);
+  box-shadow: none;
+}
+.inboxRowBody {
+  padding: 4px 14px 16px;
+  border-top: 1px solid var(--hairline);
+}
 .inboxBadge {
   font-size: 11.5px;
   font-weight: 600;
@@ -268,12 +420,24 @@
   color: var(--ink-1);
   flex-shrink: 0;
 }
-.inboxBadge--brand { background: var(--fill-brand); }
-.inboxBadge--scheduled { background: var(--fill-scheduled); }
-.inboxBadge--held { background: var(--fill-held); }
-.inboxBadge--blocked { background: var(--fill-blocked); }
-.inboxBadge--running { background: var(--fill-running); }
-.inboxBadge--neutral { background: var(--fill-inactive); }
+.inboxBadge--brand {
+  background: var(--fill-brand);
+}
+.inboxBadge--scheduled {
+  background: var(--fill-scheduled);
+}
+.inboxBadge--held {
+  background: var(--fill-held);
+}
+.inboxBadge--blocked {
+  background: var(--fill-blocked);
+}
+.inboxBadge--running {
+  background: var(--fill-running);
+}
+.inboxBadge--neutral {
+  background: var(--fill-inactive);
+}
 
 .inboxTag {
   display: inline-flex;
@@ -286,11 +450,23 @@
   white-space: nowrap;
   flex-shrink: 0;
 }
-.inboxTag--held { background: var(--fill-held); color: var(--ink-1); }
+.inboxTag--held {
+  background: var(--fill-held);
+  color: var(--ink-1);
+}
 
 /* 请示裁决卡内部 */
-.escalationInlineTitle { font-size: 14px; font-weight: 650; color: var(--ink-1); }
-.escalationInlineSummary { font-size: 13px; color: var(--ink-2); margin: 6px 0 10px; line-height: 1.5; }
+.escalationInlineTitle {
+  font-size: 14px;
+  font-weight: 650;
+  color: var(--ink-1);
+}
+.escalationInlineSummary {
+  font-size: 13px;
+  color: var(--ink-2);
+  margin: 6px 0 10px;
+  line-height: 1.5;
+}
 .escalationInlineMeta {
   display: grid;
   grid-template-columns: max-content 1fr;
@@ -298,9 +474,20 @@
   margin: 0 0 12px;
   font-size: 12.5px;
 }
-.escalationInlineMeta dt { color: var(--ink-3, var(--ink-2)); font-weight: 600; }
-.escalationInlineMeta dd { margin: 0; color: var(--ink-1); }
-.escalationInline label { display: block; font-size: 12.5px; color: var(--ink-2); margin: 8px 0 4px; }
+.escalationInlineMeta dt {
+  color: var(--ink-3, var(--ink-2));
+  font-weight: 600;
+}
+.escalationInlineMeta dd {
+  margin: 0;
+  color: var(--ink-1);
+}
+.escalationInline label {
+  display: block;
+  font-size: 12.5px;
+  color: var(--ink-2);
+  margin: 8px 0 4px;
+}
 .escalationInline select,
 .escalationInline textarea,
 .escalationInline input {
@@ -311,8 +498,13 @@
   font: inherit;
   box-sizing: border-box;
 }
-.escalationInline textarea { min-height: 88px; resize: vertical; }
-.escalationInlineActions { margin-top: 12px; }
+.escalationInline textarea {
+  min-height: 88px;
+  resize: vertical;
+}
+.escalationInlineActions {
+  margin-top: 12px;
+}
 .escalationInlineReassign {
   display: flex;
   gap: 8px;
@@ -320,20 +512,58 @@
   padding-top: 12px;
   border-top: 1px dashed var(--hairline);
 }
-.escalationInlineReassign input { flex: 1; }
+.escalationInlineReassign input {
+  flex: 1;
+}
 
 /* 简单通过/拒绝卡内部 */
-.simpleActionTitle { font-size: 14px; font-weight: 650; color: var(--ink-1); }
-.simpleActionSummary { font-size: 13px; color: var(--ink-2); margin: 6px 0; line-height: 1.5; }
-.simpleActionEvidence { display: grid; gap: 2px; }
-.simpleActionMeta { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 6px; font-size: 12px; color: var(--ink-2); }
-.simpleActionButtons { display: flex; gap: 8px; margin-top: 12px; }
+.simpleActionTitle {
+  font-size: 14px;
+  font-weight: 650;
+  color: var(--ink-1);
+}
+.simpleActionSummary {
+  font-size: 13px;
+  color: var(--ink-2);
+  margin: 6px 0;
+  line-height: 1.5;
+}
+.simpleActionEvidence {
+  display: grid;
+  gap: 2px;
+}
+.simpleActionMeta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--ink-2);
+}
+.simpleActionButtons {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+}
 
 /* 疑似成交专用审核卡：金额/币种与驳回原因是业务提交参数，不能降级成空 body 操作。 */
-.suspectedDealReviewCard { display: flex; flex-direction: column; gap: 10px; }
-.suspectedDealFields { display: grid; grid-template-columns: minmax(0, 2fr) minmax(90px, 1fr); gap: 10px; }
+.suspectedDealReviewCard {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.suspectedDealFields {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(90px, 1fr);
+  gap: 10px;
+}
 .suspectedDealFields label,
-.suspectedDealRejectReason { display: grid; gap: 5px; font-size: 12.5px; color: var(--ink-2); }
+.suspectedDealRejectReason {
+  display: grid;
+  gap: 5px;
+  font-size: 12.5px;
+  color: var(--ink-2);
+}
 .suspectedDealFields input,
 .suspectedDealRejectReason textarea {
   width: 100%;
@@ -345,11 +575,19 @@
   background: var(--surface, #fff);
   font: inherit;
 }
-.suspectedDealRejectReason textarea { min-height: 72px; resize: vertical; }
-.suspectedDealReviewError { font-size: 12.5px; color: var(--color-blocked); }
+.suspectedDealRejectReason textarea {
+  min-height: 72px;
+  resize: vertical;
+}
+.suspectedDealReviewError {
+  font-size: 12.5px;
+  color: var(--color-blocked);
+}
 
 @media (max-width: 640px) {
-  .suspectedDealFields { grid-template-columns: 1fr; }
+  .suspectedDealFields {
+    grid-template-columns: 1fr;
+  }
 }
 
 /* 卡内动作按钮（三张知识卡的按钮无 className，作用域到卡容器内，与 header 按钮同款描边规范） */
@@ -365,7 +603,10 @@
   background: transparent;
   border: 1px solid var(--hairline);
   color: var(--ink-2);
-  transition: background 0.18s, color 0.18s, border-color 0.18s;
+  transition:
+    background 0.18s,
+    color 0.18s,
+    border-color 0.18s;
 }
 .chunkReviewCard button:hover:not(:disabled),
 .profilePublishCard button:hover:not(:disabled),
@@ -381,9 +622,21 @@
 }
 
 /* 知识切片核验卡（ChunkReviewCard）——容器无边框，外层 InboxRow 折叠壳已描边 */
-.chunkReviewCard { display: flex; flex-direction: column; gap: 8px; }
-.chunkReviewTitle { font-size: 14px; font-weight: 650; color: var(--ink-1); }
-.chunkReviewBody { font-size: 13px; color: var(--ink-2); line-height: 1.5; }
+.chunkReviewCard {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.chunkReviewTitle {
+  font-size: 14px;
+  font-weight: 650;
+  color: var(--ink-1);
+}
+.chunkReviewBody {
+  font-size: 13px;
+  color: var(--ink-2);
+  line-height: 1.5;
+}
 .chunkReviewCitation {
   margin: 0;
   padding: 8px 12px;
@@ -416,7 +669,11 @@
   border-radius: var(--r-sm);
   padding: 8px 12px;
 }
-.chunkReviewActions { display: flex; gap: 8px; margin-top: 4px; }
+.chunkReviewActions {
+  display: flex;
+  gap: 8px;
+  margin-top: 4px;
+}
 .chunkReviewError {
   font-size: 12.5px;
   color: var(--color-blocked);
@@ -425,11 +682,23 @@
   border-radius: var(--r-sm);
   padding: 8px 12px;
 }
-.chunkReviewLoading { font-size: 12.5px; color: var(--ink-3, var(--ink-2)); padding: 8px 0; }
+.chunkReviewLoading {
+  font-size: 12.5px;
+  color: var(--ink-3, var(--ink-2));
+  padding: 8px 0;
+}
 
 /* 画像发布卡（ProfilePublishCard）*/
-.profilePublishCard { display: flex; flex-direction: column; gap: 8px; }
-.profilePublishName { font-size: 14px; font-weight: 650; color: var(--ink-1); }
+.profilePublishCard {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.profilePublishName {
+  font-size: 14px;
+  font-weight: 650;
+  color: var(--ink-1);
+}
 .profilePublishStatus {
   align-self: flex-start;
   font-size: 12px;
@@ -463,9 +732,21 @@
   border-top: 1px solid var(--hairline);
   padding-top: 8px;
 }
-.profilePublishState:first-child { border-top: none; padding-top: 0; }
-.profilePublishStateHead { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.profilePublishStateName { font-size: 13px; font-weight: 600; color: var(--ink-1); }
+.profilePublishState:first-child {
+  border-top: none;
+  padding-top: 0;
+}
+.profilePublishStateHead {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.profilePublishStateName {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink-1);
+}
 .profilePublishStateKey {
   font-size: 12px;
   color: var(--ink-2);
@@ -481,8 +762,15 @@
   background: var(--fill-scheduled);
   color: var(--color-scheduled);
 }
-.profilePublishStateGoal { font-size: 12.5px; color: var(--ink-2); margin-top: 4px; line-height: 1.5; }
-.profilePublishGoalText { color: var(--ink-1); }
+.profilePublishStateGoal {
+  font-size: 12.5px;
+  color: var(--ink-2);
+  margin-top: 4px;
+  line-height: 1.5;
+}
+.profilePublishGoalText {
+  color: var(--ink-1);
+}
 .profilePublishStateSignals,
 .profilePublishStateRisks {
   display: flex;
@@ -501,7 +789,11 @@
   background: var(--fill-brand);
   color: var(--ink-1);
 }
-.profilePublishActions { display: flex; gap: 8px; margin-top: 4px; }
+.profilePublishActions {
+  display: flex;
+  gap: 8px;
+  margin-top: 4px;
+}
 .profilePublishError {
   font-size: 12.5px;
   color: var(--color-blocked);
@@ -510,11 +802,24 @@
   border-radius: var(--r-sm);
   padding: 8px 12px;
 }
-.profilePublishLoading { font-size: 12.5px; color: var(--ink-3, var(--ink-2)); padding: 8px 0; }
+.profilePublishLoading {
+  font-size: 12.5px;
+  color: var(--ink-3, var(--ink-2));
+  padding: 8px 0;
+}
 
 /* 经验晋升卡（LessonPromoteCard）*/
-.lessonPromoteCard { display: flex; flex-direction: column; gap: 10px; }
-.lessonPromoteKind { font-size: 13px; font-weight: 600; color: var(--ink-1); line-height: 1.5; }
+.lessonPromoteCard {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.lessonPromoteKind {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink-1);
+  line-height: 1.5;
+}
 .lessonPromoteInput,
 .lessonPromoteTextarea {
   width: 100%;
@@ -525,8 +830,13 @@
   font-size: 12.5px;
   box-sizing: border-box;
 }
-.lessonPromoteTextarea { min-height: 88px; resize: vertical; }
-.lessonPromoteCard button { align-self: flex-start; }
+.lessonPromoteTextarea {
+  min-height: 88px;
+  resize: vertical;
+}
+.lessonPromoteCard button {
+  align-self: flex-start;
+}
 .lessonPromoteError {
   font-size: 12.5px;
   color: var(--color-blocked);
@@ -536,7 +846,11 @@
   padding: 8px 12px;
 }
 .lessonPromoteLoading,
-.lessonPromoteDone { font-size: 12.5px; color: var(--ink-3, var(--ink-2)); padding: 8px 0; }
+.lessonPromoteDone {
+  font-size: 12.5px;
+  color: var(--ink-3, var(--ink-2));
+  padding: 8px 0;
+}
 
 /* ReviewQueue 的容器 class 原先在全库无任何 CSS 定义（裸文字/无间距）。
    此处补最小样式。ReviewQueue 全库只有本频道一个真实消费者

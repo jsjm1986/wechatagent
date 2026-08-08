@@ -490,7 +490,7 @@ pub(crate) async fn load_reply_prompt_snapshot(
         prompts::load_prompt_for_contact(
             &state.db,
             &contact.workspace_id,
-            "user.reply.task",
+            "user.reply.fast.task",
             &contact.wxid,
             contact.locale.as_deref(),
         ),
@@ -851,7 +851,7 @@ pub(crate) async fn decide_reply_with_promote(
     } else {
         Vec::new()
     };
-    let (product_catalog_text, entitlements_text, suspected_deal_text) = if include_business {
+    let (product_catalog_text, entitlements_text, _suspected_deal_text) = if include_business {
         super::entitlements::render_transaction_facts_sections(
             active_profile.transaction_facts_enabled,
             &active_products,
@@ -922,7 +922,7 @@ pub(crate) async fn decide_reply_with_promote(
     if let Some(budget) = super::budget::current_run_budget() {
         budget.record_prompt_version("user.reply.system", system_version);
         budget.record_prompt_version("user.reply.policy", policy_version);
-        budget.record_prompt_version("user.reply.task", task_version);
+        budget.record_prompt_version("user.reply.fast.task", task_version);
     }
     let system_contract = prompt_override
         .map(|o| o.use_frozen_base_if_matches("user.reply.system", system_contract.clone()))
@@ -942,65 +942,22 @@ pub(crate) async fn decide_reply_with_promote(
     let policy = prompt_override
         .map(|o| o.use_frozen_base_if_matches("user.reply.policy", policy.clone()))
         .unwrap_or(policy);
+    let policy = super::domain_profile::strip_projection_only_policy_section(&policy);
     let policy =
         super::domain_profile::apply_reply_policy_prompt_overrides(&policy, &active_profile);
     let policy = prompt_override
         .map(|o| o.append_if_matches("user.reply.policy", policy.clone()))
         .unwrap_or(policy);
     let task_template = prompt_override
-        .map(|o| o.use_frozen_base_if_matches("user.reply.task", task_template.clone()))
+        .map(|o| o.use_frozen_base_if_matches("user.reply.fast.task", task_template.clone()))
         .unwrap_or(task_template);
-    // universal-domain-adaptation H17：在静态 task prompt 后追加本行业 memoryCandidates
-    // 合法 type 指引（DEFAULT 销售八维→空串、Reply Agent prompt 字节不变、销售零扰动；
-    // 情感等非销售 profile→告知 LLM 本行业候选类型，让情感记忆能作为 candidate 写出）。
     let task_template = format!(
         "{task_template}{}",
-        super::domain_profile::render_memory_candidate_types_guidance(
-            &active_profile.memory_dimensions
-        )
+        super::entitlements::render_suspected_deal_reply_guidance(&active_products),
     );
-    // 客观购买事实 §5.5：疑似成交线索的 agent 侧落点。仅交易域（transaction_facts_enabled）
-    // 且本 workspace 有 active 产品时非空（上方闸门已算好 suspected_deal_text）——非交易域
-    // （情感陪伴）空串、task prompt 字节等价。指引 LLM 走弱信号通道（agentGeneratedSignals
-    // kind=suspected_deal）+ 主动求证话术，绝不直写 outcome_events（§2.1 红线）。
-    let task_template = format!("{task_template}{suspected_deal_text}");
-    // 数字分身 T7：关系性质（relationship_type）建议指引。常驻追加——但它只是「有
-    // 明确新证据才产出」的可选指引，DEFAULT 销售域追加本段不改变既有行为（无新证据
-    // → 不产信号）。引导 LLM 走 agentGeneratedSignals 弱信号通道（kind=relationship_type，
-    // 与 gateway::extract_relationship_type_suggestion 提取契约逐字对齐），经字典校验后
-    // upsert 进建议 collection，须运营审核才回写 contact。
-    let task_template = format!(
-        "{task_template}{}",
-        super::entitlements::render_relationship_type_suggestion_guidance()
-    );
-    // universal-domain-adaptation G1：在 task prompt 末尾追加本行业「参与决策」的
-    // 非销售 typed 维度指引（告知 LLM 走 domainSignals 容器输出）。DEFAULT 销售域
-    // 只有 customer_stage/intent_level 两维（typed）→ 空串、prompt 字节等价；
-    // 换非销售行业（含本专题的 purchase_lifecycle）→ 注入维度语义 + domainSignals
-    // 输出位置，让维度值能真正从 LLM 流到 AgentDecision.domain_signals。
-    let taxonomy_cache = match shadow_snapshot.as_ref() {
-        Some(snapshot) => snapshot.taxonomy_cache.clone(),
-        None => crate::agent::taxonomy::global_taxonomy_cache(&state.db),
-    };
-    if shadow_snapshot.is_some() {
-        // The task-local cache is a deep copy and cannot be invalidated by a
-        // concurrent admin taxonomy write.
-    } else if super::current_run_mode() == "shadow" {
-        taxonomy_cache.find_or_load_read_only(&state.db).await?;
-    } else {
-        taxonomy_cache
-            .find_or_load(&state.db, &contact.workspace_id)
-            .await?;
-    }
-    let task_template = format!(
-        "{task_template}{}",
-        super::domain_profile::render_decision_dimensions_guidance(
-            &active_profile.profile_dimensions,
-            &contact.workspace_id,
-            &contact.account_id,
-            taxonomy_cache.as_ref(),
-        )
-    );
+    // Profile, taxonomy, memory and analytical instructions belong to the durable
+    // post-decision projection. Keeping them out of this prompt prevents the fast
+    // agent from spending tokens on output that cannot affect the current send.
     // universal-domain-adaptation H9 修复（问题 A）：task final 形态契约写死的
     // conversationMode 竖线枚举列表（`a | b | c | d`）同样替换为 active profile 模式集合，
     // 与 policy 侧（上方）+ runtime 校验集合三处对齐。DEFAULT/老库 → 字节等价。
@@ -1009,7 +966,7 @@ pub(crate) async fn decide_reply_with_promote(
         &active_profile.conversation_modes,
     );
     let task_template = prompt_override
-        .map(|o| o.append_if_matches("user.reply.task", task_template.clone()))
+        .map(|o| o.append_if_matches("user.reply.fast.task", task_template.clone()))
         .unwrap_or(task_template);
     // R-prompt-v3：Operator Instruction 层（最高优先级）。运营人员可在后台对
     // 单个联系人写一段 ≤ 1000 字的特别指令，覆盖 Soul + Policy 的默认人格判定
@@ -1285,7 +1242,7 @@ pub(crate) async fn decide_reply_with_promote(
         Some(&contact.account_id),
         Some(&contact.wxid),
         run_id,
-        "user.reply.task",
+        "user.reply.fast.task",
         &system,
         &user,
     )
@@ -1309,7 +1266,7 @@ pub(crate) async fn decide_reply_with_promote(
         r.allowed_conversation_modes = active_profile.conversation_modes.clone();
         r
     };
-    let (mut decision, mut promote_risks) = raw.validate_and_promote(&runtime_for_promote);
+    let (mut decision, mut promote_risks) = raw.validate_reply_critical(&runtime_for_promote);
     // Phase A / A3 收口：把 LLM 输出的维度取值与 `system_taxonomies` 严格字典对照
     // （4 路分支：Active 通过 / AliasActive 改写为 canonical / Deprecated 加 risk /
     // CandidateNew 加 risk + 异步 upsert candidate）。reviewer 在本函数 return 之后才

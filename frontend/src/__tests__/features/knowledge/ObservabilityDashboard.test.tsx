@@ -106,6 +106,7 @@ describe("ObservabilityDashboard catalog envelopes", () => {
             chatTasks: { kind: "retained_history" },
             gapSignals: { kind: "retained_history" },
             lessonsLearned: { kind: "flow_window", windowDays: 14 },
+            postDecisionProjection: { kind: "mixed_current_and_retained_history" },
           },
           chatTasks: { byStatus: [] },
           gapSignals: {
@@ -116,6 +117,19 @@ describe("ObservabilityDashboard catalog envelopes", () => {
             historicalResolvedShare: 0.75,
           },
           lessonsLearned: { windowDays: 14, patternTop: [] },
+          postDecisionProjection: {
+            byStatus: [
+              { status: "pending", count: 2 },
+              { status: "failed_terminal", count: 1 },
+              { status: "completed", count: 8 },
+            ],
+            oldestPendingAgeMs: 420000,
+            attempts: { p95: 2 },
+            snapshotBytes: { p95: 524288 },
+            completionLatencyMs: { p95: 12500 },
+            staleProfileSkips: 3,
+            errorKindsTop: [{ errorKind: "llm_unavailable", count: 1 }],
+          },
         });
       }
       return response(false, {});
@@ -129,9 +143,14 @@ describe("ObservabilityDashboard catalog envelopes", () => {
     expect(screen.getAllByText("保留历史").length).toBeGreaterThan(0);
     expect(screen.getByText("14 天滚动缓存")).toBeInTheDocument();
     expect(screen.getByText("30 天滚动缓存")).toBeInTheDocument();
-    expect(screen.getByText("当前积压 + 保留历史")).toBeInTheDocument();
+    expect(screen.getAllByText("当前积压 + 保留历史").length).toBeGreaterThan(0);
     expect(screen.getByText("历史已解决占比")).toBeInTheDocument();
     expect(screen.getByText("75.0%")).toBeInTheDocument();
+    expect(screen.getByText("发送后投影")).toBeInTheDocument();
+    expect(screen.getByText("7.0 分钟")).toBeInTheDocument();
+    expect(screen.getByText("12.5 秒")).toBeInTheDocument();
+    expect(screen.getByText("512.0 KiB")).toBeInTheDocument();
+    expect(screen.getByText("llm_unavailable")).toBeInTheDocument();
     expect(screen.queryByText("扫描命中率")).not.toBeInTheDocument();
   });
 });

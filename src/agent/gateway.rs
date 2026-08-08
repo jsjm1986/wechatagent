@@ -28,7 +28,7 @@ use std::{
 
 use futures::{future::BoxFuture, FutureExt, TryStreamExt};
 use mongodb::bson::{doc, oid::ObjectId, to_document, Bson, DateTime, Document};
-use mongodb::options::FindOptions;
+use mongodb::options::{FindOneAndUpdateOptions, FindOptions, ReturnDocument};
 use serde_json::json;
 
 use crate::error::{AppError, AppResult};
@@ -3643,7 +3643,7 @@ fn run_user_operation_gateway_inner<'a>(
             return Ok(());
         }
     }
-    super::post_decision::persist_projection_snapshot(
+    if let Err(error) = super::post_decision::persist_projection_snapshot(
         state,
         decision_review_id,
         &final_decision,
@@ -3653,9 +3653,24 @@ fn run_user_operation_gateway_inner<'a>(
         &active_profile,
         &active_products,
         &ascending_window,
+        &contact,
         &run_id,
     )
-    .await?;
+    .await
+    {
+        tracing::warn!(
+            %error,
+            review_id = %decision_review_id,
+            run_id,
+            "post-decision snapshot preparation failed; customer delivery continues"
+        );
+        super::post_decision::mark_preparation_failed(
+            state,
+            decision_review_id,
+            &error.to_string(),
+        )
+        .await;
+    }
     write_knowledge_usage_log(
         state,
         &contact,
@@ -5541,6 +5556,135 @@ fn build_observed_dimensions(
         .collect()
 }
 
+/// Optional fencing contract for a delayed post-decision projection.
+/// `profile_revision` is bumped only by authoritative/non-projection profile writers;
+/// `review_id` imposes a monotonic order among projection workers.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ProjectionWriteGuard {
+    pub baseline_profile_revision: i64,
+    pub review_id: ObjectId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AgentUpdateOutcome {
+    Applied,
+    /// The same projection review already committed the fenced Contact write. Continue replaying
+    /// idempotent downstream effects and the separately fenced memory stage.
+    AlreadyApplied,
+    /// An authoritative revision or a newer projection owns the Contact. Only append-only
+    /// evidence may be retained.
+    FencedConflict,
+}
+
+async fn write_agent_update_event(
+    state: &AppState,
+    contact: &Contact,
+    projection_guard: Option<ProjectionWriteGuard>,
+    effect: &str,
+    kind: &str,
+    status: &str,
+    summary: &str,
+    details: Option<Document>,
+) -> AppResult<()> {
+    let dedupe_key = projection_guard
+        .map(|guard| format!("post_projection:{}:{effect}", guard.review_id.to_hex()));
+    write_event_for_account_with_dedupe(
+        state,
+        &contact.workspace_id,
+        &contact.account_id,
+        Some(&contact.wxid),
+        kind,
+        status,
+        summary,
+        details,
+        dedupe_key,
+    )
+    .await
+}
+
+async fn upsert_pending_projection_observation(
+    state: &AppState,
+    collection_name: &str,
+    entity_type: &str,
+    workspace_id: &str,
+    account_id: &str,
+    contact_id: &str,
+    run_id: &str,
+    mut set_fields: Document,
+) -> AppResult<()> {
+    let now = DateTime::now();
+    set_fields.insert("last_seen_at", now);
+    let filter = doc! {
+        "workspace_id": workspace_id,
+        "contact_id": contact_id,
+        "status": "pending",
+    };
+    let collection = state.db.raw().collection::<Document>(collection_name);
+    let update = doc! {
+        "$set": set_fields,
+        "$setOnInsert": {
+            "workspace_id": workspace_id,
+            "account_id": account_id,
+            "contact_id": contact_id,
+            "status": "pending",
+            "first_seen_at": now,
+            "occurrences": 0i64,
+            "source_run_ids": Vec::<String>::new(),
+        },
+    };
+    let options = FindOneAndUpdateOptions::builder()
+        .upsert(true)
+        .return_document(ReturnDocument::After)
+        .build();
+    let current = match collection
+        .find_one_and_update(filter.clone(), update, options)
+        .await
+    {
+        Ok(Some(row)) => row,
+        Ok(None) => collection
+            .find_one(filter.clone(), None)
+            .await?
+            .ok_or_else(|| {
+                AppError::External(format!(
+                    "{entity_type} pending row disappeared after upsert"
+                ))
+            })?,
+        Err(error) if super::escalation::is_duplicate_key_error(&error) => collection
+            .find_one(filter.clone(), None)
+            .await?
+            .ok_or_else(|| {
+                AppError::External(format!("{entity_type} upsert race lost without winner"))
+            })?,
+        Err(error) => return Err(error.into()),
+    };
+    let entity_id = current
+        .get_object_id("_id")
+        .map_err(|error| AppError::External(format!("{entity_type} missing _id: {error}")))?
+        .to_hex();
+    let legacy_run_ids = super::projection_observations::source_run_ids(&current);
+    let ledger_count = super::projection_observations::record_and_count(
+        &state.db,
+        workspace_id,
+        entity_type,
+        &entity_id,
+        &legacy_run_ids,
+        run_id,
+    )
+    .await?;
+    collection
+        .update_one(
+            doc! { "_id": current.get_object_id("_id").expect("validated object id") },
+            super::projection_observations::reconcile_stages(
+                ledger_count,
+                run_id,
+                legacy_run_ids.len() as i64,
+            ),
+            None,
+        )
+        .await?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn apply_agent_updates(
     state: &AppState,
@@ -5552,7 +5696,8 @@ pub(crate) async fn apply_agent_updates(
     active_products: &[crate::models::Product],
     window: &[ConversationMessage],
     run_id: &str,
-) -> AppResult<()> {
+    projection_guard: Option<ProjectionWriteGuard>,
+) -> AppResult<AgentUpdateOutcome> {
     let _stage_timer = super::run_audit::stage_timer("profile_updates");
     let mut set_doc = doc! {
         "updated_at": DateTime::now(),
@@ -5666,11 +5811,12 @@ pub(crate) async fn apply_agent_updates(
         for (kind, raw) in &to_drop {
             signals_decision.domain_signals.remove(kind.as_str());
             // fail-soft：审计写失败不阻断主流程（回复已异步发出）。
-            let _ = write_event_for_account(
-                &state,
-                &contact.workspace_id,
-                &contact.account_id,
-                Some(&contact.wxid),
+            let effect = format!("dimension_dropped:{kind}");
+            let _ = write_agent_update_event(
+                state,
+                contact,
+                projection_guard,
+                &effect,
                 "agent.dimension_dropped",
                 "dropped",
                 &format!("维度 {} 取值 {:?} 不在字典内，已丢弃不落库", kind, raw),
@@ -5714,11 +5860,11 @@ pub(crate) async fn apply_agent_updates(
         };
         if let Some((from, to, reason)) = &stage_rejection {
             // fail-soft：审计写失败不阻断主流程（回复已异步发出），与 dimension_dropped 同风格。
-            let _ = write_event_for_account(
+            let _ = write_agent_update_event(
                 state,
-                &contact.workspace_id,
-                &contact.account_id,
-                Some(&contact.wxid),
+                contact,
+                projection_guard,
+                "stage_transition_rejected",
                 "agent.stage_transition_rejected",
                 "rejected",
                 &format!(
@@ -5829,11 +5975,11 @@ pub(crate) async fn apply_agent_updates(
     {
         // ⑥观测：reply 像做了时间承诺但 LLM 没填 commitment 字段 → 无 follow-up。
         // 仅观测 prompt 强化是否生效，不阻断、不改写、不进任何门。
-        let _ = write_event_for_account(
-            &state,
-            &contact.workspace_id,
-            &contact.account_id,
-            Some(&contact.wxid),
+        let _ = write_agent_update_event(
+            state,
+            contact,
+            projection_guard,
+            "commitment_field_missing",
             "agent.commitment_field_missing",
             "observed",
             "回复疑似含时间承诺但未填 commitment 字段（观测，未拦截）",
@@ -5925,11 +6071,65 @@ pub(crate) async fn apply_agent_updates(
         set_doc.insert("memory_summary", merged);
     }
 
-    state
+    let mut contact_filter = doc! { "_id": contact.id };
+    if let Some(guard) = projection_guard {
+        let revision_clause = if guard.baseline_profile_revision == 0 {
+            doc! { "$or": [
+                { "profile_revision": 0i64 },
+                { "profile_revision": { "$exists": false } },
+                { "profile_revision": null },
+            ] }
+        } else {
+            doc! { "profile_revision": guard.baseline_profile_revision }
+        };
+        contact_filter.insert(
+            "$and",
+            vec![
+                revision_clause,
+                doc! { "$or": [
+                    { "last_projection_review_id": { "$exists": false } },
+                    { "last_projection_review_id": null },
+                    { "last_projection_review_id": { "$lt": guard.review_id } },
+                ] },
+            ],
+        );
+        set_doc.insert("last_projection_review_id", guard.review_id);
+        set_doc.insert("last_projection_run_id", run_id);
+    }
+    let contact_update = state
         .db
         .contacts()
-        .update_one(doc! { "_id": contact.id }, doc! { "$set": set_doc }, None)
+        .update_one(contact_filter, doc! { "$set": set_doc }, None)
         .await?;
+    let mut update_outcome = AgentUpdateOutcome::Applied;
+    if contact_update.matched_count != 1 {
+        let Some(guard) = projection_guard else {
+            return Ok(AgentUpdateOutcome::FencedConflict);
+        };
+        let current = state
+            .db
+            .contacts()
+            .clone_with_type::<Document>()
+            .find_one(
+                doc! { "_id": contact.id },
+                mongodb::options::FindOneOptions::builder()
+                    .projection(doc! { "profile_revision": 1, "last_projection_review_id": 1 })
+                    .build(),
+            )
+            .await?;
+        let same_revision_and_review = current.as_ref().is_some_and(|row| {
+            let revision = row
+                .get_i64("profile_revision")
+                .or_else(|_| row.get_i32("profile_revision").map(i64::from))
+                .unwrap_or(0);
+            revision == guard.baseline_profile_revision
+                && row.get_object_id("last_projection_review_id").ok() == Some(guard.review_id)
+        });
+        if !same_revision_and_review {
+            return Ok(AgentUpdateOutcome::FencedConflict);
+        }
+        update_outcome = AgentUpdateOutcome::AlreadyApplied;
+    }
 
     // 贝叶斯评估旁路（子计划4 Task2）：纯观测侧路，**永不驱动**任何决策/筛选/状态机/
     // 发送选择。代码侧据消息方向算每个维度的强证据数（不信 LLM 自报置信），增量更新后
@@ -5937,7 +6137,7 @@ pub(crate) async fn apply_agent_updates(
     // customer_stage 解耦）。current_turn 口径 = 升序窗口长度（per-call 观察轮计数，与
     // apply_bayesian_update 内部 history turn 语义一致）。回复已异步发出，写回失败 fail-soft
     // 仅 warn 不 `?`（既成事实纪律）。
-    if !decision.bayesian_observations.is_empty() {
+    if update_outcome == AgentUpdateOutcome::Applied && !decision.bayesian_observations.is_empty() {
         let th = crate::agent::bayesian_slots::SlotPromotionThreshold {
             min_hits: runtime.bayesian_slot_min_hits,
             min_strong_evidence: runtime.bayesian_slot_min_strong,
@@ -6007,51 +6207,29 @@ pub(crate) async fn apply_agent_updates(
         .await;
         if let Some(canonical) = llm_signal_apply(verdict) {
             let contact_id = contact.id.map(|id| id.to_hex()).unwrap_or_default();
-            let now = DateTime::now();
             let mut set_fields = doc! {
                 "suggested_value": &canonical,
                 "confidence": confidence,
-                "last_seen_at": now,
             };
             if let Some(ev) = &evidence {
                 set_fields.insert("evidence", ev);
             }
-            // upsert 锚是仅 `status=pending` 生效的 (workspace_id, contact_id) 部分唯一索引。
-            // 同一审核周期重复观察刷新/累加现有 pending；approved/rejected 历史不复活也不
-            // 占槽，因此闭环后的新证据会插入下一周期 pending，并继续等待管理员审核。
-            let filter = doc! {
-                "workspace_id": &contact.workspace_id,
-                "contact_id": &contact_id,
-                "status": "pending",
-            };
-            let seen_runs = doc! { "$ifNull": ["$source_run_ids", Vec::<String>::new()] };
-            set_fields.insert("workspace_id", &contact.workspace_id);
-            set_fields.insert("account_id", &contact.account_id);
-            set_fields.insert("contact_id", &contact_id);
-            set_fields.insert("status", doc! { "$ifNull": ["$status", "pending"] });
-            set_fields.insert("first_seen_at", doc! { "$ifNull": ["$first_seen_at", now] });
-            set_fields.insert(
-                "occurrences",
-                doc! { "$cond": [
-                    { "$in": [&run_id, seen_runs.clone()] },
-                    { "$ifNull": ["$occurrences", 0] },
-                    { "$add": [{ "$ifNull": ["$occurrences", 0] }, 1] },
-                ] },
-            );
-            set_fields.insert(
-                "source_run_ids",
-                doc! { "$setUnion": [seen_runs, [&run_id]] },
-            );
-            let update = vec![doc! { "$set": set_fields }];
-            let opts = mongodb::options::UpdateOptions::builder()
-                .upsert(true)
-                .build();
-            // fail-soft：写建议失败（含已审记录与 unique 锚的 upsert 竞态 E11000）不阻断主流程。
-            let _ = state
-                .db
-                .collection_relationship_type_suggestions()
-                .update_one(filter, update, opts)
-                .await;
+            // Strict replay identity is owned by projection_observations. The pending row keeps
+            // only a bounded recent-run cache and starts a fresh ledger identity after review.
+            if let Err(error) = upsert_pending_projection_observation(
+                state,
+                "relationship_type_suggestions",
+                "relationship_type_suggestion",
+                &contact.workspace_id,
+                &contact.account_id,
+                &contact_id,
+                run_id,
+                set_fields,
+            )
+            .await
+            {
+                tracing::warn!(%error, contact_id, "relationship suggestion observation failed");
+            }
         }
     }
 
@@ -6064,54 +6242,27 @@ pub(crate) async fn apply_agent_updates(
         extract_suspected_deal_signal(&decision.agent_generated_signals)
     {
         let contact_id = contact.id.map(|id| id.to_hex()).unwrap_or_default();
-        let now = DateTime::now();
         let mut set_fields = doc! {
             "value": &value,
             "confidence": confidence,
-            "last_seen_at": now,
         };
         if let Some(ev) = &evidence {
             set_fields.insert("evidence", ev);
         }
-        // upsert 锚 (workspace_id, contact_id) 仅在 status="pending" 时唯一（F23 部分唯一
-        // 索引 uniq_suspected_deal_pending_ws_contact）。filter 加 status="pending" 约束：
-        // 仅命中或不存在 pending 时刷新累加 / 新建。已审（approved/rejected）终态记录不在
-        // 部分索引内、不占唯一槽 —— 同一 contact 经核实闭环后，真实二次成交产生的新信号会
-        // $setOnInsert 新建一条 pending 重新进待核实队列（复购场景不再被永久阻断）。value
-        // 只放 $set（upsert 插入也会写），避免与 $setOnInsert 键冲突。
-        let filter = doc! {
-            "workspace_id": &contact.workspace_id,
-            "contact_id": &contact_id,
-            "status": "pending",
-        };
-        let seen_runs = doc! { "$ifNull": ["$source_run_ids", Vec::<String>::new()] };
-        set_fields.insert("workspace_id", &contact.workspace_id);
-        set_fields.insert("account_id", &contact.account_id);
-        set_fields.insert("contact_id", &contact_id);
-        set_fields.insert("status", doc! { "$ifNull": ["$status", "pending"] });
-        set_fields.insert("first_seen_at", doc! { "$ifNull": ["$first_seen_at", now] });
-        set_fields.insert(
-            "occurrences",
-            doc! { "$cond": [
-                { "$in": [&run_id, seen_runs.clone()] },
-                { "$ifNull": ["$occurrences", 0] },
-                { "$add": [{ "$ifNull": ["$occurrences", 0] }, 1] },
-            ] },
-        );
-        set_fields.insert(
-            "source_run_ids",
-            doc! { "$setUnion": [seen_runs, [&run_id]] },
-        );
-        let update = vec![doc! { "$set": set_fields }];
-        let opts = mongodb::options::UpdateOptions::builder()
-            .upsert(true)
-            .build();
-        // fail-soft：写信号失败（含已审记录与 unique 锚的 upsert 竞态 E11000）不阻断主流程。
-        let _ = state
-            .db
-            .collection_suspected_deal_signals()
-            .update_one(filter, update, opts)
-            .await;
+        if let Err(error) = upsert_pending_projection_observation(
+            state,
+            "suspected_deal_signals",
+            "suspected_deal_signal",
+            &contact.workspace_id,
+            &contact.account_id,
+            &contact_id,
+            run_id,
+            set_fields,
+        )
+        .await
+        {
+            tracing::warn!(%error, contact_id, "suspected deal observation failed");
+        }
     }
 
     // 客观购买事实 spec §6：G4→G1 纠偏命中时记一条 fail-soft 审计事件（类比
@@ -6120,11 +6271,11 @@ pub(crate) async fn apply_agent_updates(
     // 非空表示 LLM 推断与客观态冲突被覆盖。
     if let Some((llm_original, corrected)) = &g1_correction {
         // fail-soft：纯审计写失败不阻断主流程（回复稍后异步入队），与 dimension_dropped 同风格。
-        let _ = write_event_for_account(
+        let _ = write_agent_update_event(
             state,
-            &contact.workspace_id,
-            &contact.account_id,
-            Some(&contact.wxid),
+            contact,
+            projection_guard,
+            "purchase_lifecycle_corrected_by_objective",
             "agent.purchase_lifecycle_corrected_by_objective",
             "observed",
             &format!(
@@ -6185,11 +6336,11 @@ pub(crate) async fn apply_agent_updates(
             .map(|(o, n)| format!("{o} → {n}"))
             .unwrap_or_default();
         // fail-soft：纯审计写失败不阻断主流程（回复稍后异步入队），与 dimension_dropped 同风格。
-        let _ = write_event_for_account(
+        let _ = write_agent_update_event(
             state,
-            &contact.workspace_id,
-            &contact.account_id,
-            Some(&contact.wxid),
+            contact,
+            projection_guard,
+            "profile_churn_observed",
             "agent.profile_churn_observed",
             "observed",
             &format!(
@@ -6223,11 +6374,11 @@ pub(crate) async fn apply_agent_updates(
     // 分支（fail-open），detect_state_transition 行为与改造前逐字一致。
     if let Some((prior, attempted, reason)) = &rejected_state_transition {
         // fail-soft：纯审计写失败不阻断主流程（回复稍后异步入队），与 dimension_dropped 同风格。
-        let _ = write_event_for_account(
+        let _ = write_agent_update_event(
             state,
-            &contact.workspace_id,
-            &contact.account_id,
-            Some(&contact.wxid),
+            contact,
+            projection_guard,
+            "operation_state_transition_rejected",
             "agent.operation_state_transition_rejected",
             "rejected",
             &format!("operation_state 拒绝迁移 {prior} → {attempted}：{reason}"),
@@ -6243,11 +6394,11 @@ pub(crate) async fn apply_agent_updates(
         applied_operation_state.as_deref(),
     ) {
         // fail-soft：纯审计写失败不阻断主流程（回复稍后异步入队），与 dimension_dropped 同风格。
-        let _ = write_event_for_account(
+        let _ = write_agent_update_event(
             state,
-            &contact.workspace_id,
-            &contact.account_id,
-            Some(&contact.wxid),
+            contact,
+            projection_guard,
+            "operation_state_transitioned",
             "agent.operation_state_transitioned",
             "transitioned",
             &format!("operation_state {prior} → {next}"),
@@ -6265,7 +6416,7 @@ pub(crate) async fn apply_agent_updates(
     }
 
     // follow_up 同样只在 dispatcher 确认本 decision 的全部文本段送达后创建。
-    Ok(())
+    Ok(update_outcome)
 }
 
 pub(crate) async fn apply_operating_memory_update(
@@ -6427,7 +6578,7 @@ pub(crate) async fn write_decision_review(
         &[
             "user.reply.system",
             "user.reply.policy",
-            "user.reply.task",
+            "user.reply.fast.task",
             "user.knowledge.router",
             "user.review.system",
             "user.review.light.system",
@@ -6909,6 +7060,32 @@ pub async fn write_event_for_account(
     summary: &str,
     details: Option<Document>,
 ) -> AppResult<()> {
+    write_event_for_account_with_dedupe(
+        state,
+        workspace_id,
+        account_id,
+        contact_wxid,
+        kind,
+        status,
+        summary,
+        details,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn write_event_for_account_with_dedupe(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+    contact_wxid: Option<&str>,
+    kind: &str,
+    status: &str,
+    summary: &str,
+    details: Option<Document>,
+    dedupe_key: Option<String>,
+) -> AppResult<()> {
     let event = AgentEvent {
         id: None,
         workspace_id: workspace_id.to_string(),
@@ -6919,14 +7096,17 @@ pub async fn write_event_for_account(
         summary: summary.to_string(),
         details,
         created_at: DateTime::now(),
-        dedupe_key: None,
+        dedupe_key,
     };
     let event = match super::run_audit::try_buffer_observability_event(event) {
         Ok(()) => return Ok(()),
         Err(event) => event,
     };
-    state.db.events().insert_one(event, None).await?;
-    Ok(())
+    match state.db.events().insert_one(event, None).await {
+        Ok(_) => Ok(()),
+        Err(error) if super::escalation::is_duplicate_key_error(&error) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// ISSUE-001 (R12)：FollowUp 路径下"用户中途插话"判定纯函数。

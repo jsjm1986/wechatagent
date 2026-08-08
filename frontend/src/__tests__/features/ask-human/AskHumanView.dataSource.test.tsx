@@ -1,5 +1,11 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, waitFor, fireEvent, within } from "@testing-library/react";
+import {
+  render,
+  screen,
+  waitFor,
+  fireEvent,
+  within,
+} from "@testing-library/react";
 
 // 只 mock 网络层（fetchInbox/fetchSummary），保留真实 sortItems —— 这样测试验证的是
 // "频道渲染的列表 = store.items（经真实 sortItems 排序）" 这条单数据源链路。
@@ -14,8 +20,13 @@ vi.mock("../../../lib/inboxApi", async () => {
   };
 });
 
-import { fetchInbox, fetchSummary, type InboxItem } from "../../../lib/inboxApi";
+import {
+  fetchInbox,
+  fetchSummary,
+  type InboxItem,
+} from "../../../lib/inboxApi";
 import { useInboxStore } from "../../../stores/inboxStore";
+import { useAccountStore } from "../../../stores/accountStore";
 import AskHumanFeature from "../../../features/ask-human/index";
 
 const fi = fetchInbox as unknown as ReturnType<typeof vi.fn>;
@@ -53,8 +64,28 @@ beforeEach(() => {
     loading: false,
     fatalError: null,
     activeSource: null,
+    activeAccountId: null,
     requestGeneration: 0,
     summaryRequestGeneration: 0,
+  });
+  useAccountStore.setState({
+    accounts: [
+      {
+        id: "1",
+        accountId: "acc-1",
+        alias: "一号业务",
+        displayName: "",
+        online: true,
+      },
+      {
+        id: "2",
+        accountId: "acc-2",
+        alias: "二号业务",
+        displayName: "",
+        online: true,
+      },
+    ],
+    selectedAccountId: "acc-1",
   });
 });
 
@@ -62,7 +93,11 @@ describe("AskHumanView 单数据源", () => {
   it("渲染的列表来自 store.items（经真实 sortItems 排序，high 冒泡到顶）", async () => {
     // 乱序：low 在首、high 在尾。若渲染的是未排序的原始 fetch 结果，high 不会在顶。
     fi.mockResolvedValue({
-      items: [item("low1", "low", 1), item("high1", "high", 2), item("med1", "medium", 3)],
+      items: [
+        item("low1", "low", 1),
+        item("high1", "high", 2),
+        item("med1", "medium", 3),
+      ],
       errors: [],
     });
     fs.mockResolvedValue({
@@ -79,12 +114,22 @@ describe("AskHumanView 单数据源", () => {
     const list = container.querySelector(".reviewQueueList")!;
     const rows = within(list as HTMLElement).getAllByText(/^t-/);
     // 排序后顺序应为 high → medium → low（severity 降序）。
-    expect(rows.map((r) => r.textContent)).toEqual(["t-high1", "t-med1", "t-low1"]);
+    expect(rows.map((r) => r.textContent)).toEqual([
+      "t-high1",
+      "t-med1",
+      "t-low1",
+    ]);
   });
 
   it("单次刷新只 fetch 一次 inbox（mount 1 次 + 刷新 1 次 = 2，非旧的双倍）", async () => {
     fi.mockResolvedValue({ items: [item("a", "high")], errors: [] });
-    fs.mockResolvedValue({ status: "complete", asOf: null, counts: {}, errors: [], total: 0 });
+    fs.mockResolvedValue({
+      status: "complete",
+      asOf: null,
+      counts: {},
+      errors: [],
+      total: 0,
+    });
 
     render(<AskHumanFeature />);
     await screen.findByText("t-a");
@@ -100,7 +145,13 @@ describe("AskHumanView 单数据源", () => {
 
   it("降级一致：刷新失败时 fatalError 横幅出现且列表仍显旧数据（不走 error 短路）", async () => {
     fi.mockResolvedValueOnce({ items: [item("keep", "high")], errors: [] });
-    fs.mockResolvedValue({ status: "complete", asOf: null, counts: {}, errors: [], total: 0 });
+    fs.mockResolvedValue({
+      status: "complete",
+      asOf: null,
+      counts: {},
+      errors: [],
+      total: 0,
+    });
 
     render(<AskHumanFeature />);
     await screen.findByText("t-keep");
@@ -143,15 +194,57 @@ describe("AskHumanView 单数据源", () => {
     await screen.findByText("t-kr");
     expect(screen.queryByText("t-all")).toBeNull();
     // 验证 fetchInbox 确实带上了该 source。
-    expect(fi).toHaveBeenCalledWith("knowledge_review");
+    expect(fi).toHaveBeenCalledWith("knowledge_review", undefined);
+  });
+
+  it("账号筛选同时刷新列表和计数，并为账号级/全局事项显示归属", async () => {
+    fi.mockImplementation((_source?: string, accountId?: string) =>
+      Promise.resolve({
+        items: accountId
+          ? [
+              item("owned", "high", 1, "src_default", { accountId }),
+              item("global", "low", 1, "src_default"),
+            ]
+          : [item("all", "high", 1, "src_default", { accountId: "acc-1" })],
+        errors: [],
+      }),
+    );
+    fs.mockResolvedValue({
+      status: "complete",
+      asOf: null,
+      counts: {},
+      errors: [],
+      total: 2,
+    });
+
+    render(<AskHumanFeature />);
+    await screen.findByText("t-all");
+    expect(document.querySelector(".inboxAccountTag")?.textContent).toBe(
+      "一号业务",
+    );
+
+    fireEvent.change(screen.getByLabelText("账号范围"), {
+      target: { value: "acc-2" },
+    });
+    await screen.findByText("t-owned");
+    const accountTags = Array.from(
+      document.querySelectorAll(".inboxAccountTag"),
+    ).map((node) => node.textContent);
+    expect(accountTags).toEqual(expect.arrayContaining(["二号业务", "全局"]));
+    expect(fi).toHaveBeenLastCalledWith(undefined, "acc-2");
+    expect(fs).toHaveBeenLastCalledWith("acc-2");
   });
 
   // 接线验证：renderItem 是内联闭包，只能经整棵视图渲染来验证 tag 是否被真实接线（而非只测 InboxRow 本身）。
   it("接线：knowledge_review + needs_human_audit 的 item 显 held 徽章;其它 integrityStatus 不显", async () => {
     fi.mockResolvedValue({
       items: [
-        item("audit", "high", 2, "knowledge_review", { integrityStatus: "needs_human_audit" }),
-        item("plain", "medium", 1, "knowledge_review", { integrityStatus: "verified" }),
+        item("audit", "high", 2, "knowledge_review", {
+          integrityStatus: "needs_human_audit",
+        }),
+        item("plain", "medium", 1, "knowledge_review", {
+          integrityStatus: "verified",
+        }),
       ],
       errors: [],
     });

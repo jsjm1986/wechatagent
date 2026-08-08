@@ -1429,6 +1429,7 @@ pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
     ensure_taxonomy_candidates_indexes(db).await?;
     ensure_relationship_type_suggestions_indexes(db).await?;
     ensure_suspected_deal_signals_indexes(db).await?;
+    ensure_projection_observation_indexes(db).await?;
     // ── agent-self-evolution W0 (Task 1.2) ──
     ensure_evolution_indexes(db).await?;
     // LLM 服务商配置：(workspace_id, provider_id) 唯一；is_active 部分索引便于
@@ -2131,6 +2132,68 @@ async fn ensure_agent_send_outbox_indexes(db: &Database) -> anyhow::Result<()> {
             None,
         )
         .await?;
+    // v2 claim index includes the top-level delivery authorization status used by
+    // runnable_filter; the old named index is retained for safe rolling upgrades.
+    db.decision_reviews()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! {
+                    "status": 1,
+                    "post_decision_status": 1,
+                    "post_decision_next_retry_at": 1,
+                    "post_decision_locked_until": 1,
+                    "created_at": 1,
+                    "_id": 1,
+                })
+                .options(
+                    IndexOptions::builder()
+                        .name("decision_post_projection_claim_v2_idx".to_string())
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
+    // Failed/discarded projection payloads are field-scrubbed after the audit retention window.
+    // This is deliberately not a TTL index: the decision review itself remains permanent audit.
+    db.decision_reviews()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! {
+                    "post_decision_status": 1,
+                    "post_decision_scrub_at": 1,
+                })
+                .options(
+                    IndexOptions::builder()
+                        .name("decision_post_projection_scrub_idx".to_string())
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
+    // Ordering fence: detect a newer profile-applied projection for one contact without
+    // scanning the workspace history.
+    db.decision_reviews()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! {
+                    "workspace_id": 1,
+                    "account_id": 1,
+                    "contact_wxid": 1,
+                    "post_decision_profile_done": 1,
+                    "created_at": -1,
+                    "_id": -1,
+                })
+                .options(
+                    IndexOptions::builder()
+                        .name("decision_post_projection_order_fence_idx".to_string())
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
     // B1：per-contact 主动触达配额闸（precheck 热路径）。
     db.collection_agent_send_outbox()
         .create_index(outbox_contact_proactive_touch_index(), None)
@@ -2441,6 +2504,31 @@ async fn ensure_relationship_type_suggestions_indexes(db: &Database) -> anyhow::
 ///
 /// 字段为 snake_case：`SuspectedDealSignal` 未加 `#[serde(rename_all)]`，
 /// BSON 层即 snake_case，须与此处索引字段逐字一致。
+
+async fn ensure_projection_observation_indexes(db: &Database) -> anyhow::Result<()> {
+    db.raw()
+        .collection::<Document>(crate::agent::projection_observations::COLLECTION)
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! {
+                    "workspace_id": 1,
+                    "entity_type": 1,
+                    "entity_id": 1,
+                    "run_id": 1,
+                })
+                .options(
+                    IndexOptions::builder()
+                        .name("uniq_projection_observation_entity_run".to_string())
+                        .unique(true)
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
+    Ok(())
+}
+
 async fn ensure_suspected_deal_signals_indexes(db: &Database) -> anyhow::Result<()> {
     // 旧全量 unique (workspace_id, contact_id) → 部分 unique(仅 status=pending)。
     // 同键不同 options 必须先 drop 旧索引否则 create 报 code 85 IndexOptionsConflict。

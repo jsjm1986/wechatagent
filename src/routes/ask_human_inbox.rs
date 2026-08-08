@@ -16,6 +16,9 @@ use mongodb::bson::{doc, DateTime, Document};
 pub struct InboxItem {
     pub source: String,
     pub id: String,
+    /// Owning business account. None means workspace-global governance work.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
     pub title: String,
     pub summary: String,
     pub severity: String,
@@ -77,6 +80,7 @@ fn escalation_to_inbox_item(e: &crate::models::AgentPrincipalEscalation, now_ms:
     InboxItem {
         source: "principal_escalation".into(),
         id: e.short_code.clone(),
+        account_id: non_empty(&e.account_id),
         title: format!("请示 #{}", e.short_code),
         summary: e.reason.clone(),
         severity: "high".into(),
@@ -99,12 +103,31 @@ fn escalation_to_inbox_item(e: &crate::models::AgentPrincipalEscalation, now_ms:
 }
 
 /// 请示通道 pending → InboxItem（inline）。
-async fn collect_escalations(state: &AppState, ws: &str, now_ms: i64) -> AppResult<Vec<InboxItem>> {
-    let items =
-        crate::agent::escalation::list_escalations_by_workspace(state, ws, "pending").await?;
-    Ok(items
+async fn collect_escalations(
+    state: &AppState,
+    ws: &str,
+    account_id: Option<&str>,
+    now_ms: i64,
+) -> AppResult<Vec<InboxItem>> {
+    use futures::TryStreamExt;
+    let mut filter = doc! { "workspace_id": ws, "status": "pending" };
+    if let Some(account_id) = account_id {
+        filter.insert("account_id", account_id);
+    }
+    let cursor = state
+        .db
+        .agent_principal_escalations()
+        .find(
+            filter,
+            mongodb::options::FindOptions::builder()
+                .sort(doc! { "created_at": 1 })
+                .build(),
+        )
+        .await?;
+    let rows: Vec<crate::models::AgentPrincipalEscalation> = cursor.try_collect().await?;
+    Ok(rows
         .into_iter()
-        .map(|e| escalation_to_inbox_item(&e, now_ms))
+        .map(|entry| escalation_to_inbox_item(&entry, now_ms))
         .collect())
 }
 
@@ -119,14 +142,20 @@ pub(crate) fn knowledge_review_statuses() -> [&'static str; 2] {
 async fn collect_knowledge_review(
     state: &AppState,
     ws: &str,
+    account_id: Option<&str>,
     _now_ms: i64,
 ) -> AppResult<Vec<InboxItem>> {
     use futures::TryStreamExt;
+    let filter = account_scoped_filter(
+        doc! { "workspace_id": ws, "integrity_status": { "$in": knowledge_review_statuses().to_vec() } },
+        account_id,
+        true,
+    );
     let cursor = state
         .db
         .operation_knowledge_chunks()
         .find(
-            doc! { "workspace_id": ws, "integrity_status": { "$in": knowledge_review_statuses().to_vec() } },
+            filter,
             mongodb::options::FindOptions::builder().limit(100).build(),
         )
         .await?;
@@ -138,6 +167,7 @@ async fn collect_knowledge_review(
             InboxItem {
                 source: "knowledge_review".into(),
                 id: id.clone(),
+                account_id: c.account_id.clone().filter(|value| !value.is_empty()),
                 title: c.title.clone(),
                 summary: c
                     .body
@@ -192,6 +222,7 @@ fn taxonomy_candidate_to_inbox_item(
     InboxItem {
         source: "taxonomy_candidate".into(),
         id,
+        account_id: None,
         // 人话标题：以 AI 新识别的取值为主语，不暴露裸维度键（维度中文名前端补）。
         title: format!("AI 新识别标签：{}", c.raw_value),
         // 折叠预览：优先 evidence，无则通用框定。
@@ -252,14 +283,20 @@ fn pending_global_taxonomy_filter(workspace_id: &str) -> Document {
 async fn collect_relationship_suggestions(
     state: &AppState,
     ws: &str,
+    account_id: Option<&str>,
     now_ms: i64,
 ) -> AppResult<Vec<InboxItem>> {
     use futures::TryStreamExt;
+    let filter = account_scoped_filter(
+        doc! { "workspace_id": ws, "status": "pending" },
+        account_id,
+        false,
+    );
     let cursor = state
         .db
         .collection_relationship_type_suggestions()
         .find(
-            doc! { "workspace_id": ws, "status": "pending" },
+            filter,
             mongodb::options::FindOptions::builder().limit(100).build(),
         )
         .await?;
@@ -271,6 +308,7 @@ async fn collect_relationship_suggestions(
             InboxItem {
                 source: "relationship_suggestion".into(),
                 id,
+                account_id: non_empty(&r.account_id),
                 title: format!("关系类型建议：{}", r.suggested_value),
                 summary: r
                     .evidence
@@ -318,6 +356,7 @@ fn suspected_deal_to_inbox_item(
     InboxItem {
         source: "suspected_deal".into(),
         id,
+        account_id: non_empty(&signal.account_id),
         title: signal.value.clone(),
         summary: signal
             .evidence
@@ -345,14 +384,20 @@ fn suspected_deal_to_inbox_item(
 async fn collect_suspected_deals(
     state: &AppState,
     ws: &str,
+    account_id: Option<&str>,
     now_ms: i64,
 ) -> AppResult<Vec<InboxItem>> {
     use futures::TryStreamExt;
+    let filter = account_scoped_filter(
+        doc! { "workspace_id": ws, "status": "pending" },
+        account_id,
+        false,
+    );
     let cursor = state
         .db
         .collection_suspected_deal_signals()
         .find(
-            doc! { "workspace_id": ws, "status": "pending" },
+            filter,
             mongodb::options::FindOptions::builder()
                 .sort(doc! { "last_seen_at": -1 })
                 .limit(100)
@@ -373,6 +418,7 @@ fn gap_to_inbox_item(g: &crate::models::KnowledgeGapSignal, now_ms: i64) -> Inbo
     InboxItem {
         source: "gap_signal".into(),
         id,
+        account_id: None,
         title: g.title.clone(),
         summary: g.description.clone(),
         severity: "medium".into(),
@@ -449,6 +495,7 @@ async fn collect_profile_drafts(
             InboxItem {
                 source: "profile_risky".into(),
                 id: id.clone(),
+                account_id: None,
                 title: format!(
                     "{}画像：{}",
                     if is_draft { "待发布" } else { "待激活" },
@@ -484,14 +531,20 @@ async fn collect_profile_drafts(
 async fn collect_evolution_proposals(
     state: &AppState,
     ws: &str,
+    account_id: Option<&str>,
     now_ms: i64,
 ) -> AppResult<Vec<InboxItem>> {
     use futures::TryStreamExt;
+    let filter = account_scoped_filter(
+        doc! { "workspace_id": ws, "status": "eligible_for_release" },
+        account_id,
+        false,
+    );
     let cursor = state
         .db
         .proposals()
         .find(
-            doc! { "workspace_id": ws, "status": "eligible_for_release" },
+            filter,
             mongodb::options::FindOptions::builder().limit(50).build(),
         )
         .await?;
@@ -503,6 +556,7 @@ async fn collect_evolution_proposals(
             InboxItem {
                 source: "evolution_proposal".into(),
                 id: id.clone(),
+                account_id: non_empty(&p.account_id),
                 title: format!("进化候选：{}", p.proposal_kind),
                 summary: p.diff_summary.clone().unwrap_or_default(),
                 severity: "medium".into(),
@@ -553,6 +607,7 @@ async fn collect_lessons_learned(
             InboxItem {
                 source: "lessons_learned".into(),
                 id: id.clone(),
+                account_id: None,
                 title: format!("经验晋升：{kind}"),
                 summary: "AI 总结的经验待人审晋升为案例".into(),
                 severity: "low".into(),
@@ -576,10 +631,44 @@ async fn collect_lessons_learned(
         .collect())
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct InboxQuery {
     #[serde(default)]
     pub source: Option<String>,
+    /// Optional account scope. Workspace-global governance items remain visible.
+    #[serde(default)]
+    pub account_id: Option<String>,
+}
+
+fn requested_account(query: &InboxQuery) -> Option<&str> {
+    query
+        .account_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn account_scoped_filter(
+    mut filter: Document,
+    account_id: Option<&str>,
+    include_global: bool,
+) -> Document {
+    if let Some(account_id) = account_id {
+        if include_global {
+            filter.insert(
+                "$or",
+                vec![
+                    doc! { "account_id": account_id },
+                    doc! { "account_id": null },
+                    doc! { "account_id": { "$exists": false } },
+                ],
+            );
+        } else {
+            filter.insert("account_id", account_id);
+        }
+    }
+    filter
 }
 
 /// GET /api/admin/ask-human/inbox?source=<filter>
@@ -592,14 +681,15 @@ pub async fn ask_human_inbox(
     let now_ms = DateTime::now().timestamp_millis();
     let mut items: Vec<InboxItem> = Vec::new();
     let mut errors: Vec<Value> = Vec::new();
+    let account_id = requested_account(&q);
 
     // 每 source 独立降级：Err 不整体崩，记进 errors 数组。
     macro_rules! collect_source {
         ($name:expr, $fut:expr) => {
             if q.source.as_deref().map(|s| s == $name).unwrap_or(true) {
                 match $fut.await {
-                    Ok(mut v) => items.append(&mut v),
-                    Err(e) => errors.push(json!({ "source": $name, "error": e.to_string() })),
+                    Ok(mut values) => items.append(&mut values),
+                    Err(error) => errors.push(json!({ "source": $name, "error": error.to_string() })),
                 }
             }
         };
@@ -607,11 +697,11 @@ pub async fn ask_human_inbox(
 
     collect_source!(
         "principal_escalation",
-        collect_escalations(&state, ws, now_ms)
+        collect_escalations(&state, ws, account_id, now_ms)
     );
     collect_source!(
         "knowledge_review",
-        collect_knowledge_review(&state, ws, now_ms)
+        collect_knowledge_review(&state, ws, account_id, now_ms)
     );
     collect_source!(
         "taxonomy_candidate",
@@ -619,17 +709,17 @@ pub async fn ask_human_inbox(
     );
     collect_source!(
         "relationship_suggestion",
-        collect_relationship_suggestions(&state, ws, now_ms)
+        collect_relationship_suggestions(&state, ws, account_id, now_ms)
     );
     collect_source!(
         "suspected_deal",
-        collect_suspected_deals(&state, ws, now_ms)
+        collect_suspected_deals(&state, ws, account_id, now_ms)
     );
     collect_source!("gap_signal", collect_gap_signals(&state, ws, now_ms));
     collect_source!("profile_risky", collect_profile_drafts(&state, ws, now_ms));
     collect_source!(
         "evolution_proposal",
-        collect_evolution_proposals(&state, ws, now_ms)
+        collect_evolution_proposals(&state, ws, account_id, now_ms)
     );
     collect_source!(
         "lessons_learned",
@@ -643,8 +733,10 @@ pub async fn ask_human_inbox(
 pub async fn ask_human_summary(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
+    Query(q): Query<InboxQuery>,
 ) -> AppResult<Json<Value>> {
     let ws = &admin.current_workspace;
+    let account_id = requested_account(&q);
     let escalations_collection = state.db.agent_principal_escalations();
     let knowledge_collection = state.db.operation_knowledge_chunks();
     let taxonomy_collection = state.db.collection_taxonomy_candidates();
@@ -666,29 +758,28 @@ pub async fn ask_human_summary(
         lessons_learned,
     ) = tokio::join!(
         escalations_collection
-            .count_documents(doc! { "workspace_id": ws, "status": "pending" }, None),
+            .count_documents(account_scoped_filter(doc! { "workspace_id": ws, "status": "pending" }, account_id, false), None),
         knowledge_collection.count_documents(
-            doc! { "workspace_id": ws, "integrity_status": { "$in": knowledge_review_statuses().to_vec() } },
+            account_scoped_filter(doc! { "workspace_id": ws, "integrity_status": { "$in": knowledge_review_statuses().to_vec() } }, account_id, true),
             None,
         ),
         taxonomy_collection
             .count_documents(pending_global_taxonomy_filter(ws), None),
         relationship_collection
-            .count_documents(doc! { "workspace_id": ws, "status": "pending" }, None),
+            .count_documents(account_scoped_filter(doc! { "workspace_id": ws, "status": "pending" }, account_id, false), None),
         suspected_deal_collection
-            .count_documents(doc! { "workspace_id": ws, "status": "pending" }, None),
+            .count_documents(account_scoped_filter(doc! { "workspace_id": ws, "status": "pending" }, account_id, false), None),
         gap_collection
             .count_documents(doc! { "workspace_id": ws, "status": "pending" }, None),
         profile_collection.count_documents(reviewable_profile_filter(ws), None),
         proposal_collection.count_documents(
-            doc! { "workspace_id": ws, "status": "eligible_for_release" },
+            account_scoped_filter(doc! { "workspace_id": ws, "status": "eligible_for_release" }, account_id, false),
             None,
         ),
-        lessons_collection
-            .count_documents(
-                doc! { "workspace_id": ws, "review_status": "pending_review" },
-                None,
-            ),
+        lessons_collection.count_documents(
+            doc! { "workspace_id": ws, "review_status": "pending_review" },
+            None,
+        ),
     );
 
     let mut counts = Vec::with_capacity(9);
@@ -805,6 +896,33 @@ mod tests {
     }
 
     #[test]
+    fn account_filter_scopes_account_rows_before_limit() {
+        assert_eq!(
+            account_scoped_filter(
+                doc! { "workspace_id": "ws-a", "status": "pending" },
+                Some("acc-2"),
+                false
+            ),
+            doc! { "workspace_id": "ws-a", "status": "pending", "account_id": "acc-2" },
+        );
+    }
+
+    #[test]
+    fn account_filter_keeps_workspace_global_rows() {
+        assert_eq!(
+            account_scoped_filter(doc! { "workspace_id": "ws-a" }, Some("acc-2"), true),
+            doc! {
+                "workspace_id": "ws-a",
+                "$or": [
+                    { "account_id": "acc-2" },
+                    { "account_id": null },
+                    { "account_id": { "$exists": false } },
+                ],
+            },
+        );
+    }
+
+    #[test]
     fn reviewable_profile_filter_includes_drafts_and_pending_activation_only() {
         assert_eq!(
             reviewable_profile_filter("ws-a"),
@@ -886,6 +1004,7 @@ mod tests {
         assert_eq!(v["contactWxid"], "wxid_cust");
         assert_eq!(v["principalWxid"], "wxid_boss");
         assert_eq!(v["category"], "discount_request");
+        assert_eq!(v["accountId"], "acc1");
     }
 
     fn test_gap_fixture() -> crate::models::KnowledgeGapSignal {

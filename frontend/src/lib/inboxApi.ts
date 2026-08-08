@@ -3,6 +3,8 @@ import { api } from "./api";
 export interface InboxItem {
   source: string;
   id: string;
+  /** Owning business account; absent means workspace-global governance work. */
+  accountId?: string;
   title: string;
   summary: string;
   severity: "high" | "medium" | "low" | string;
@@ -60,17 +62,33 @@ export function sortItems(items: InboxItem[]): InboxItem[] {
   });
 }
 
-export async function fetchInbox(source?: string): Promise<InboxResponse> {
-  const qs = source ? `?source=${encodeURIComponent(source)}` : "";
-  const raw = await api.get<Partial<InboxResponse>>(`/api/admin/ask-human/inbox${qs}`);
+function inboxQuery(source?: string, accountId?: string): string {
+  const params = new URLSearchParams();
+  if (source) params.set("source", source);
+  if (accountId) params.set("accountId", accountId);
+  const query = params.toString();
+  return query ? `?${query}` : "";
+}
+
+export async function fetchInbox(
+  source?: string,
+  accountId?: string,
+): Promise<InboxResponse> {
+  const raw = await api.get<Partial<InboxResponse>>(
+    `/api/admin/ask-human/inbox${inboxQuery(source, accountId)}`,
+  );
   return { items: raw.items ?? [], errors: raw.errors ?? [] };
 }
 
-export async function fetchSummary(): Promise<InboxSummary> {
-  const raw = await api.get<Record<string, unknown>>("/api/admin/ask-human/summary");
+export async function fetchSummary(accountId?: string): Promise<InboxSummary> {
+  const raw = await api.get<Record<string, unknown>>(
+    `/api/admin/ask-human/summary${inboxQuery(undefined, accountId)}`,
+  );
   const nestedCounts = raw.counts;
   const counts =
-    nestedCounts && typeof nestedCounts === "object" && !Array.isArray(nestedCounts)
+    nestedCounts &&
+    typeof nestedCounts === "object" &&
+    !Array.isArray(nestedCounts)
       ? Object.fromEntries(
           Object.entries(nestedCounts).map(([key, value]) => [
             key,
@@ -79,8 +97,13 @@ export async function fetchSummary(): Promise<InboxSummary> {
         )
       : Object.fromEntries(
           Object.entries(raw)
-            .filter(([key]) => !["status", "asOf", "errors", "total"].includes(key))
-            .map(([key, value]) => [key, typeof value === "number" ? value : null]),
+            .filter(
+              ([key]) => !["status", "asOf", "errors", "total"].includes(key),
+            )
+            .map(([key, value]) => [
+              key,
+              typeof value === "number" ? value : null,
+            ]),
         );
   const errors = Array.isArray(raw.errors)
     ? raw.errors.filter(
@@ -92,7 +115,9 @@ export async function fetchSummary(): Promise<InboxSummary> {
       )
     : [];
   const status =
-    raw.status === "partial" || raw.status === "error" || raw.status === "complete"
+    raw.status === "partial" ||
+    raw.status === "error" ||
+    raw.status === "complete"
       ? raw.status
       : errors.length > 0
         ? "partial"

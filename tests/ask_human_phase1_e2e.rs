@@ -616,6 +616,7 @@ async fn summary_counts_pending() {
     let resp = wechatagent::routes::ask_human_inbox::ask_human_summary(
         State(app.state.clone()),
         Extension(test_admin(&ws)),
+        Query(wechatagent::routes::ask_human_inbox::InboxQuery::default()),
     )
     .await
     .expect("summary ok");
@@ -1216,6 +1217,7 @@ async fn inbox_and_summary_include_only_workspace_pending_suspected_deals() {
     let summary = wechatagent::routes::ask_human_inbox::ask_human_summary(
         State(app.state.clone()),
         Extension(test_admin(&ws)),
+        Query(wechatagent::routes::ask_human_inbox::InboxQuery::default()),
     )
     .await
     .expect("suspected deal summary");

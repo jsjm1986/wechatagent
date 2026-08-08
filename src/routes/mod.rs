@@ -264,7 +264,10 @@ use prompt_templates::{
     create_prompt_template, list_prompt_templates, publish_prompt_template,
     reset_system_prompt_pack, update_prompt_template,
 };
-use reviews::{get_decision_review, list_decision_reviews};
+use reviews::{
+    discard_post_decision, get_decision_review, list_decision_reviews, regenerate_post_decision,
+    retry_post_decision,
+};
 use simulations::{run_user_operation_evaluation, simulate_user_operation_dialogue};
 use souls::{create_agent_soul, list_agent_souls, publish_agent_soul, update_agent_soul};
 use tasks::{cancel_agent_task, list_agent_runs, list_llm_usage, list_tasks, review_task_now};
@@ -720,6 +723,18 @@ pub fn api_router(state: AppState) -> Router<AppState> {
         )
         .route("/decision-reviews", get(list_decision_reviews))
         .route("/decision-reviews/:id", get(get_decision_review))
+        .route(
+            "/decision-reviews/:id/post-decision/retry",
+            post(retry_post_decision),
+        )
+        .route(
+            "/decision-reviews/:id/post-decision/regenerate",
+            post(regenerate_post_decision),
+        )
+        .route(
+            "/decision-reviews/:id/post-decision/discard",
+            post(discard_post_decision),
+        )
         .route("/agent-outcome-metrics", get(list_agent_outcome_metrics))
         .route(
             "/behavior-signal-metrics",

@@ -26,7 +26,7 @@ pub struct ThresholdRevision {
 pub const EVOLVABLE_PROMPT_KEYS: &[&str] = &[
     "user.reply.system",
     "user.reply.policy",
-    "user.reply.task",
+    "user.reply.fast.task",
     "user.review.system",
     "user.review.light.system",
 ];

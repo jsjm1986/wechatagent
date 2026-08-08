@@ -1448,7 +1448,11 @@ mod roster_parse_tests {
             ]
         });
         let out = parse_roster_items(&v);
-        assert_eq!(out.len(), 1, "必须采用 /items 的富化数组，而非 /result/friends");
+        assert_eq!(
+            out.len(),
+            1,
+            "必须采用 /items 的富化数组，而非 /result/friends"
+        );
         assert_eq!(out[0].wxid, "wxid_rich1");
         assert_eq!(
             out[0].nickname.as_deref(),

@@ -2017,6 +2017,7 @@ interface WorkerHealthResponse {
     chatTasks?: MetricScope;
     gapSignals?: MetricScope;
     lessonsLearned?: MetricScope;
+    postDecisionProjection?: MetricScope;
   };
   chatTasks?: {
     byStatus?: Array<{ status: string; count: number; outOfClosedSet?: boolean }>;
@@ -2034,6 +2035,15 @@ interface WorkerHealthResponse {
     windowDays?: number;
     patternTop?: Array<{ pattern: string; count: number; outOfClosedSet?: boolean }>;
     blockedTotal?: number;
+  };
+  postDecisionProjection?: {
+    byStatus?: Array<{ status: string; count: number; outOfClosedSet?: boolean }>;
+    oldestPendingAgeMs?: number | null;
+    errorKindsTop?: Array<{ errorKind: string; count: number }>;
+    attempts?: { p95?: number | null };
+    snapshotBytes?: { p95?: number | null };
+    completionLatencyMs?: { p95?: number | null };
+    staleProfileSkips?: number;
   };
 }
 
@@ -2795,6 +2805,28 @@ function PhaseRollupPanel({
 //   - knowledge_chat_tasks 状态分布 + 失败 error_kind top
 //   - knowledge_gap_signals 保留历史解决占比 + pending kind top
 //   - lessons_learned 14d pattern × review_status 矩阵 + blocked_total
+function formatProjectionDuration(value?: number | null): string {
+  if (typeof value !== "number") return "—";
+  if (value < 1_000) return `${value} ms`;
+  if (value < 60_000) return `${(value / 1_000).toFixed(1)} 秒`;
+  if (value < 3_600_000) return `${(value / 60_000).toFixed(1)} 分钟`;
+  return `${(value / 3_600_000).toFixed(1)} 小时`;
+}
+
+function formatProjectionBytes(value?: number | null): string {
+  if (typeof value !== "number") return "—";
+  if (value < 1_024) return `${value} B`;
+  if (value < 1_048_576) return `${(value / 1_024).toFixed(1)} KiB`;
+  return `${(value / 1_048_576).toFixed(2)} MiB`;
+}
+
+function projectionStatusLabel(status: string): string {
+  return ({
+    prepared: "已准备", pending: "待处理", retry: "待重试", processing: "处理中",
+    completed: "已完成", failed_terminal: "终态失败", discarded: "已丢弃"
+  } as Record<string, string>)[status] ?? status;
+}
+
 function WorkerHealthPanel({
   data
 }: {
@@ -2815,6 +2847,13 @@ function WorkerHealthPanel({
   const lessonsPatterns = data.lessonsLearned?.patternTop ?? [];
   const lessonsBlocked = data.lessonsLearned?.blockedTotal ?? 0;
   const lessonsWindow = data.lessonsLearned?.windowDays ?? 14;
+  const projection = data.postDecisionProjection;
+  const projectionStatuses = projection?.byStatus ?? [];
+  const projectionActive = projectionStatuses
+    .filter((row) => ["prepared", "pending", "retry", "processing"].includes(row.status))
+    .reduce((sum, row) => sum + (row.count ?? 0), 0);
+  const projectionFailed =
+    projectionStatuses.find((row) => row.status === "failed_terminal")?.count ?? 0;
 
   return (
     <section className="wikiObservabilityPhaseRollup">
@@ -2919,6 +2958,68 @@ function WorkerHealthPanel({
                 ))}
               </dl>
             </details>
+          ) : null}
+        </article>
+
+        <article className="wikiObservabilityCard">
+          <header className="wikiObservabilityCardHead">
+            <span className="wikiArchiveTag">post-decision</span>
+            <MetricScopeTag scope={data.metricScopes?.postDecisionProjection} />
+            <h4>发送后投影</h4>
+          </header>
+          <dl className="wikiArchiveMeta">
+            <dt>当前积压</dt>
+            <dd className={projectionActive > 0 ? "wikiObservabilityDrift" : undefined}>
+              {projectionActive}
+            </dd>
+            <dt>最老积压</dt>
+            <dd className={(projection?.oldestPendingAgeMs ?? 0) > 300_000 ? "wikiObservabilityDrift" : undefined}>
+              {formatProjectionDuration(projection?.oldestPendingAgeMs)}
+            </dd>
+            <dt>终态失败</dt>
+            <dd className={projectionFailed > 0 ? "wikiObservabilityDrift" : undefined}>
+              {projectionFailed}
+            </dd>
+            <dt>完成延迟 P95</dt>
+            <dd>{formatProjectionDuration(projection?.completionLatencyMs?.p95)}</dd>
+            <dt>尝试次数 P95</dt>
+            <dd>{projection?.attempts?.p95 ?? "—"}</dd>
+            <dt>快照大小 P95</dt>
+            <dd>{formatProjectionBytes(projection?.snapshotBytes?.p95)}</dd>
+            <dt>旧投影画像跳过</dt>
+            <dd>{projection?.staleProfileSkips ?? 0}</dd>
+          </dl>
+          {projectionStatuses.length > 0 ? (
+            <details>
+              <summary>状态明细</summary>
+              <dl className="wikiArchiveMeta">
+                {projectionStatuses.map((row, i) => (
+                  <Fragment key={i}>
+                    <dt>
+                      {projectionStatusLabel(row.status)}
+                      {row.outOfClosedSet ? (
+                        <span className="wikiObservabilityDrift"> · 超出合法集</span>
+                      ) : null}
+                    </dt>
+                    <dd className={row.status === "failed_terminal" && row.count > 0 ? "wikiObservabilityDrift" : undefined}>
+                      {row.count}
+                    </dd>
+                  </Fragment>
+                ))}
+              </dl>
+            </details>
+          ) : null}
+          {(projection?.errorKindsTop ?? []).length > 0 ? (
+            <div className="wikiArchiveCitation">
+              <strong>高频失败类型</strong>
+              <ul style={{ margin: 0, paddingLeft: "1.2em" }}>
+                {(projection?.errorKindsTop ?? []).map((row, i) => (
+                  <li key={i}>
+                    <span className="wikiArchiveTag">{row.errorKind}</span> {row.count}
+                  </li>
+                ))}
+              </ul>
+            </div>
           ) : null}
         </article>
 

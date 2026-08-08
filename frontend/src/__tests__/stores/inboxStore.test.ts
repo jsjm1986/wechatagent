@@ -6,14 +6,19 @@ vi.mock("../../lib/inboxApi", () => ({
   sortItems: (x: unknown[]) => x, // 测里不关心排序，原样返回
 }));
 import { fetchInbox, fetchSummary } from "../../lib/inboxApi";
-import { principalEscalationCount, useInboxStore } from "../../stores/inboxStore";
+import {
+  principalEscalationCount,
+  useInboxStore,
+} from "../../stores/inboxStore";
 
 const fi = fetchInbox as unknown as ReturnType<typeof vi.fn>;
 const fs = fetchSummary as unknown as ReturnType<typeof vi.fn>;
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((done) => { resolve = done; });
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
   return { promise, resolve };
 }
 
@@ -21,28 +26,42 @@ beforeEach(() => {
   fi.mockReset();
   fs.mockReset();
   useInboxStore.setState({
-    items: [], errors: [], summary: null, loading: false, fatalError: null,
-    activeSource: null, requestGeneration: 0, summaryRequestGeneration: 0,
+    items: [],
+    errors: [],
+    summary: null,
+    loading: false,
+    fatalError: null,
+    activeSource: null,
+    activeAccountId: null,
+    requestGeneration: 0,
+    summaryRequestGeneration: 0,
   });
 });
 
 describe("inboxStore.load", () => {
-
   it("keeps one summary truth and drops an older summary response", async () => {
     const oldRequest = deferred<any>();
     const newRequest = deferred<any>();
-    fs.mockReturnValueOnce(oldRequest.promise).mockReturnValueOnce(newRequest.promise);
+    fs.mockReturnValueOnce(oldRequest.promise).mockReturnValueOnce(
+      newRequest.promise,
+    );
 
     const oldRefresh = useInboxStore.getState().refreshSummary();
     const newRefresh = useInboxStore.getState().refreshSummary();
     newRequest.resolve({
-      status: "complete", asOf: null,
-      counts: { principalEscalation: 2 }, errors: [], total: 2,
+      status: "complete",
+      asOf: null,
+      counts: { principalEscalation: 2 },
+      errors: [],
+      total: 2,
     });
     await newRefresh;
     oldRequest.resolve({
-      status: "complete", asOf: null,
-      counts: { principalEscalation: 9 }, errors: [], total: 9,
+      status: "complete",
+      asOf: null,
+      counts: { principalEscalation: 9 },
+      errors: [],
+      total: 9,
     });
     await oldRefresh;
 
@@ -51,7 +70,18 @@ describe("inboxStore.load", () => {
   });
   it("populates items + per-source errors on success (bad source does not clear good items)", async () => {
     fi.mockResolvedValue({
-      items: [{ source: "principal_escalation", id: "a", title: "", summary: "", severity: "high", createdAt: null, ageHours: 0, actionKind: "inline" }],
+      items: [
+        {
+          source: "principal_escalation",
+          id: "a",
+          title: "",
+          summary: "",
+          severity: "high",
+          createdAt: null,
+          ageHours: 0,
+          actionKind: "inline",
+        },
+      ],
       errors: [{ source: "taxonomy_candidate", error: "boom" }],
     });
     fs.mockResolvedValue({
@@ -72,7 +102,7 @@ describe("inboxStore.load", () => {
     const oldRequest = deferred<any>();
     const newRequest = deferred<any>();
     fi.mockImplementation((source?: string) =>
-      source === "taxonomy_candidate" ? newRequest.promise : oldRequest.promise
+      source === "taxonomy_candidate" ? newRequest.promise : oldRequest.promise,
     );
     fs.mockResolvedValue(null);
 
@@ -87,9 +117,49 @@ describe("inboxStore.load", () => {
     expect(useInboxStore.getState().loading).toBe(false);
   });
 
+  it("drops an older account response after a fast account switch", async () => {
+    const oldRequest = deferred<any>();
+    const newRequest = deferred<any>();
+    fi.mockImplementation((_source?: string, accountId?: string) =>
+      accountId === "acc-new" ? newRequest.promise : oldRequest.promise,
+    );
+    fs.mockResolvedValue({
+      status: "complete",
+      asOf: null,
+      counts: {},
+      errors: [],
+      total: 0,
+    });
+
+    useInboxStore.getState().setActiveAccountId("acc-old");
+    const oldLoad = useInboxStore.getState().load();
+    useInboxStore.getState().setActiveAccountId("acc-new");
+    const newLoad = useInboxStore.getState().load();
+
+    newRequest.resolve({ items: [{ id: "new" }], errors: [] });
+    await newLoad;
+    oldRequest.resolve({ items: [{ id: "old" }], errors: [] });
+    await oldLoad;
+
+    expect(fi).toHaveBeenCalledWith(undefined, "acc-old");
+    expect(fi).toHaveBeenCalledWith(undefined, "acc-new");
+    expect(useInboxStore.getState().items).toEqual([{ id: "new" }]);
+  });
+
   it("request-level failure KEEPS previous items and sets fatalError (never clears)", async () => {
     useInboxStore.setState({
-      items: [{ source: "principal_escalation", id: "old", title: "", summary: "", severity: "high", createdAt: null, ageHours: 0, actionKind: "inline" }],
+      items: [
+        {
+          source: "principal_escalation",
+          id: "old",
+          title: "",
+          summary: "",
+          severity: "high",
+          createdAt: null,
+          ageHours: 0,
+          actionKind: "inline",
+        },
+      ],
     });
     fi.mockRejectedValue(new Error("network down"));
     fs.mockRejectedValue(new Error("network down"));

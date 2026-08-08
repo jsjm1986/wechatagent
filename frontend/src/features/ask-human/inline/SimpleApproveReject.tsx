@@ -7,24 +7,21 @@ import {
   labelOf,
 } from "../../../lib/reviewLabels";
 
-interface Endpoints {
+export interface Endpoints {
   approve?: (id: string) => string; // 返回 POST url
   reject?: (id: string) => string;
   dismiss?: (id: string) => string;
 }
 
-export function SimpleApproveReject({
-  item,
-  ctx,
-  endpoints,
-}: {
-  item: InboxItem;
-  ctx: RowCtx;
-  endpoints: Endpoints;
-}) {
+/** 卡体详情：只渲染行头容不下的字段（摘要、判断依据、类型/严重度）。
+ *  处置按钮已抽到 `SimpleActionButtons`，由 InboxRow 常驻在行内右侧，
+ *  故本组件不再需要 `ctx` / `endpoints`。 */
+export function SimpleApproveReject({ item }: { item: InboxItem }) {
   return (
     <div className="simpleActionRow">
-      <div className="simpleActionTitle">{item.title}</div>
+      {/* 标题不在此渲染：InboxRow 行头已显示同一个 item.title，体内再渲染一次
+          会整段重复（长标题如「孤立 chunk：[reviewer-misjudge] …」尤其刺眼）。
+          这里只放行头容不下的细节。 */}
       <div className="simpleActionSummary">{item.summary}</div>
       {(item.evidence || item.confidence !== undefined || item.occurrences !== undefined) && (
         <div className="simpleActionEvidence" style={{ fontSize: 12, color: "#666", marginTop: 4 }}>
@@ -42,35 +39,53 @@ export function SimpleApproveReject({
           )}
         </div>
       )}
-      <div className="simpleActionButtons">
-        {endpoints.approve && (
-          <button
-            type="button"
-            disabled={ctx.busy}
-            onClick={() => ctx.runAction(() => api.post(endpoints.approve!(item.id), {}), "已通过")}
-          >
-            通过
-          </button>
-        )}
-        {endpoints.reject && (
-          <button
-            type="button"
-            disabled={ctx.busy}
-            onClick={() => ctx.runAction(() => api.post(endpoints.reject!(item.id), {}), "已拒绝")}
-          >
-            拒绝
-          </button>
-        )}
-        {endpoints.dismiss && (
-          <button
-            type="button"
-            disabled={ctx.busy}
-            onClick={() => ctx.runAction(() => api.post(endpoints.dismiss!(item.id), {}), "已忽略")}
-          >
-            忽略
-          </button>
-        )}
-      </div>
     </div>
+  );
+}
+
+/** 处置按钮（通过 / 拒绝 / 忽略），从卡体中抽出以便同时用在 InboxRow 行内右侧。
+ *
+ *  这类来源点一下就完事，没有需要填写的参数，所以按钮常驻行内、不必先展开——
+ *  展开后卡体里那份是同一组按钮，两处共用本组件，避免端点与文案分叉。
+ *  （请示裁决不适用：它要选裁决类型、写转述意见，表单塞不进行头。） */
+export function SimpleActionButtons({
+  item,
+  ctx,
+  endpoints,
+}: {
+  item: InboxItem;
+  ctx: RowCtx;
+  endpoints: Endpoints;
+}) {
+  return (
+    <>
+      {endpoints.approve && (
+        <button
+          type="button"
+          disabled={ctx.busy}
+          onClick={() => ctx.runAction(() => api.post(endpoints.approve!(item.id), {}), "已通过")}
+        >
+          通过
+        </button>
+      )}
+      {endpoints.reject && (
+        <button
+          type="button"
+          disabled={ctx.busy}
+          onClick={() => ctx.runAction(() => api.post(endpoints.reject!(item.id), {}), "已拒绝")}
+        >
+          拒绝
+        </button>
+      )}
+      {endpoints.dismiss && (
+        <button
+          type="button"
+          disabled={ctx.busy}
+          onClick={() => ctx.runAction(() => api.post(endpoints.dismiss!(item.id), {}), "已忽略")}
+        >
+          忽略
+        </button>
+      )}
+    </>
   );
 }

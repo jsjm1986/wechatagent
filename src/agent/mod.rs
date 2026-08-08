@@ -47,6 +47,7 @@ pub(crate) mod outbox;
 pub(crate) mod outbox_dispatcher;
 pub(crate) mod pacing;
 pub(crate) mod post_decision;
+pub(crate) mod projection_observations;
 pub(crate) mod prompt_isolation;
 pub(crate) mod prompt_shadow;
 pub(crate) mod quiet_hours;
