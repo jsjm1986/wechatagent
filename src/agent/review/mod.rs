@@ -32,8 +32,11 @@ pub use gates::{
     contact_has_principal_product_exemption, finalize_review_for_send, review_passed,
     FinalizeOutcome, GatewayStatusFinal, PendingFinalizeEvent,
 };
-// 风格指纹：gateway 出站后写 last_outbound_style、reviewer 比对风格漂移。
-pub(crate) use style::{extract_outbound_style_fingerprint, style_diverged};
+// 风格指纹：生成前作弱参考，出站后更新；机械漂移只审计，不充当发送闸门。
+pub(crate) use style::{
+    extract_outbound_style_fingerprint, observe_style_continuity, render_style_continuity_hint,
+    StyleContinuityObservation,
+};
 
 use futures::{future::BoxFuture, FutureExt};
 use mongodb::bson::Document;
@@ -620,6 +623,9 @@ fn hold_for_claim_gate_failure(review: &mut DecisionReviewResult, error: &AppErr
 /// 但只有两者都结束后才调用 [`apply_independent_claim_gate`] 汇总硬门。内部 verdict
 /// 不对模块外暴露，避免调用方绕过服务端 catalog/quote 完整性校验。
 pub(crate) struct IndependentClaimGateEvaluation {
+    /// Exact candidate body evaluated by the independent gate. The result may only be applied
+    /// to this same body; rewrite/revision must execute a fresh gate.
+    candidate_reply: String,
     outcome: Option<AppResult<IndependentClaimVerdict>>,
 }
 
@@ -643,7 +649,10 @@ pub(crate) async fn evaluate_independent_claim_gate(
     } else {
         None
     };
-    IndependentClaimGateEvaluation { outcome }
+    IndependentClaimGateEvaluation {
+        candidate_reply: decision.reply_text.clone(),
+        outcome,
+    }
 }
 
 /// 把独立 Claim Gate 结果确定性合并进 Reviewer 结果。
@@ -656,6 +665,16 @@ pub(crate) fn apply_independent_claim_gate(
     review: &mut DecisionReviewResult,
     active_products: &[Product],
 ) -> bool {
+    if evaluation.candidate_reply != decision.reply_text {
+        let error = AppError::External("claim_gate_candidate_mismatch".to_string());
+        tracing::error!(
+            evaluated_len = evaluation.candidate_reply.chars().count(),
+            final_len = decision.reply_text.chars().count(),
+            "independent claim gate result does not belong to final candidate"
+        );
+        hold_for_claim_gate_failure(review, &error);
+        return false;
+    }
     let Some(outcome) = evaluation.outcome else {
         return false;
     };
@@ -697,9 +716,10 @@ pub(crate) async fn ensure_independent_claim_gate(
 #[cfg(test)]
 mod independent_claim_gate_contract_tests {
     use super::{
-        catalog_claims_are_backed, catalog_integrity_failed, hold_for_catalog_integrity_failure,
-        hold_for_claim_gate_failure, merge_independent_claim_verdict,
-        parse_independent_claim_verdict, CatalogClaim, IndependentClaimVerdict,
+        apply_independent_claim_gate, catalog_claims_are_backed, catalog_integrity_failed,
+        hold_for_catalog_integrity_failure, hold_for_claim_gate_failure,
+        merge_independent_claim_verdict, parse_independent_claim_verdict, CatalogClaim,
+        IndependentClaimGateEvaluation, IndependentClaimVerdict,
     };
     use crate::agent::types::{DecisionReviewResult, HOLD_CATEGORY_BLOCKED_BY_SAFETY_GUARD};
     use crate::error::AppError;
@@ -900,6 +920,42 @@ mod independent_claim_gate_contract_tests {
             .risks
             .iter()
             .any(|risk| risk == "independent_claim_gate_unavailable"));
+    }
+
+    #[test]
+    fn claim_gate_result_cannot_be_reused_for_a_different_candidate() {
+        let evaluation = IndependentClaimGateEvaluation {
+            candidate_reply: "晚安，早点休息。".to_string(),
+            outcome: Some(Ok(no_catalog_verdict(false))),
+        };
+        let decision = crate::agent::types::AgentDecision {
+            should_reply: true,
+            reply_text: "年度会员保证三天见效。".to_string(),
+            ..Default::default()
+        };
+        let mut review = DecisionReviewResult {
+            approved: true,
+            ..Default::default()
+        };
+
+        assert!(!apply_independent_claim_gate(
+            evaluation,
+            &decision,
+            &mut review,
+            &[],
+        ));
+        assert!(!review.approved);
+        assert!(review.should_hold);
+        assert_eq!(review.hold_category, HOLD_CATEGORY_BLOCKED_BY_SAFETY_GUARD);
+        assert!(review
+            .risks
+            .iter()
+            .any(|risk| risk == "independent_claim_gate_unavailable"));
+        assert!(review
+            .claim_analysis
+            .get_str("independentClaimGateError")
+            .unwrap_or_default()
+            .contains("claim_gate_candidate_mismatch"));
     }
 
     #[test]
@@ -1534,6 +1590,27 @@ fn render_reviewer_recent_history(recent_messages: &[ConversationMessage]) -> St
         .join("\n")
 }
 
+fn reviewer_memory_card_text(context_pack: &Document) -> String {
+    serde_json::to_string(context_pack).unwrap_or_default()
+}
+
+fn reviewer_operating_memory_text(memory: &OperatingMemory) -> String {
+    serde_json::to_string(&mongodb::bson::doc! {
+        "relationshipState": memory.relationship_state.clone(),
+        "productFit": memory.product_fit.clone(),
+        "nextAction": memory.next_action.clone()
+    })
+    .unwrap_or_default()
+}
+
+fn reviewer_operator_instruction_text(instruction: Option<&str>) -> String {
+    instruction
+        .map(str::trim)
+        .filter(|instruction| !instruction.is_empty())
+        .unwrap_or("（无）")
+        .to_string()
+}
+
 fn reviewer_recent_history_section(recent_messages: &[ConversationMessage]) -> String {
     let history = render_reviewer_recent_history(recent_messages);
     format!(
@@ -1556,8 +1633,11 @@ fn reviewer_recent_history_section(recent_messages: &[ConversationMessage]) -> S
 
 #[cfg(test)]
 mod reviewer_recent_history_tests {
-    use super::{render_reviewer_recent_history, reviewer_recent_history_section};
-    use crate::models::{ConversationMessage, MessageDirection};
+    use super::{
+        render_reviewer_recent_history, reviewer_memory_card_text, reviewer_operating_memory_text,
+        reviewer_operator_instruction_text, reviewer_recent_history_section,
+    };
+    use crate::models::{ConversationMessage, MessageDirection, OperatingMemory};
     use mongodb::bson::{DateTime, Document};
 
     fn message(at_ms: i64, direction: MessageDirection, content: &str) -> ConversationMessage {
@@ -1576,6 +1656,70 @@ mod reviewer_recent_history_tests {
             is_synthetic_relay: false,
             created_at: DateTime::from_millis(at_ms),
         }
+    }
+
+    #[test]
+    fn reviewer_context_dedup_preserves_complete_memory_fields() {
+        let card = mongodb::bson::doc! {
+            "coreFacts": ["用户在上海"],
+            "recentFacts": ["今晚准备休息"],
+            "doNotDo": ["不要连续追问"],
+            "commitments": ["明天补充准确资料"],
+            "objections": ["担心被频繁打扰"],
+            "deprecatedFacts": ["旧称呼"],
+        };
+        let now = DateTime::now();
+        let memory = OperatingMemory {
+            id: None,
+            workspace_id: "workspace-a".to_string(),
+            account_id: "account-a".to_string(),
+            contact_wxid: "contact-a".to_string(),
+            user_understanding: mongodb::bson::doc! { "privateReasoning": "不应复制到评审事实面" },
+            relationship_state: mongodb::bson::doc! { "trust": "growing" },
+            product_fit: mongodb::bson::doc! { "fit": "unknown" },
+            next_action: mongodb::bson::doc! { "action": "wait" },
+            context_pack: Document::new(),
+            context_pack_version: 0,
+            context_pack_updated_at: None,
+            memory_card: Default::default(),
+            memory_card_version: 0,
+            memory_card_updated_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        let card_text = reviewer_memory_card_text(&card);
+        let parsed_card: serde_json::Value = serde_json::from_str(&card_text).unwrap();
+        let expected_card: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&card).unwrap()).unwrap();
+        assert_eq!(parsed_card, expected_card, "MemoryCard 必须逐字段完整保留");
+
+        let operating_text = reviewer_operating_memory_text(&memory);
+        let parsed: serde_json::Value = serde_json::from_str(&operating_text).unwrap();
+        assert_eq!(parsed["relationshipState"]["trust"], "growing");
+        assert_eq!(parsed["productFit"]["fit"], "unknown");
+        assert_eq!(parsed["nextAction"]["action"], "wait");
+        assert!(
+            parsed.get("memoryCard").is_none(),
+            "同一 MemoryCard 不应重复注入"
+        );
+        assert!(
+            parsed.get("userUnderstanding").is_none(),
+            "Reply 自我推理不回流 Reviewer"
+        );
+    }
+
+    #[test]
+    fn reviewer_operator_instruction_is_visible_without_weakening_hard_gates() {
+        assert_eq!(
+            reviewer_operator_instruction_text(Some("  老客户，避免主动推销  ")),
+            "老客户，避免主动推销"
+        );
+        assert_eq!(reviewer_operator_instruction_text(None), "（无）");
+        assert_eq!(reviewer_operator_instruction_text(Some("   ")), "（无）");
+        // 硬门优先级由实际 prompt 标题固定声明，运营指令只是待核对事实，不是系统覆盖层。
+        let source = include_str!("mod.rs");
+        assert!(source.contains("不得覆盖事实准确、安全、隐私或产品证据硬门"));
     }
 
     #[test]
@@ -1801,14 +1945,14 @@ pub(crate) async fn review_decision(
         .map(|o| o.append_if_matches(prompt_key, system.clone()))
         .unwrap_or(system);
     let runtime_text = serde_json::to_string(&runtime.as_document()).unwrap_or_default();
-    let memory_card_text = serde_json::to_string(context_pack).unwrap_or_default();
-    let memory_text = serde_json::to_string(&mongodb::bson::doc! {
-        "memoryCard": context_pack.clone(),
-        "relationshipState": memory.relationship_state.clone(),
-        "productFit": memory.product_fit.clone(),
-        "nextAction": memory.next_action.clone()
-    })
-    .unwrap_or_default();
+    // MemoryCard 在下方“长期记忆卡片”槽位完整注入一次。长期运营记忆槽只保留
+    // relationshipState / productFit / nextAction，消除同一张卡的重复序列化；信息不裁剪。
+    let memory_card_text = reviewer_memory_card_text(context_pack);
+    let memory_text = reviewer_operating_memory_text(memory);
+    // Reply Agent 会执行联系人级运营特别指令；Reviewer 也必须看到同一指令，才能检查
+    // 候选是否遵守。它是质量/经营约束，不能覆盖事实、安全、隐私及产品证据硬门。
+    let operator_instruction_text =
+        reviewer_operator_instruction_text(contact.custom_agent_instructions.as_deref());
     // 全 AI 自治治本(Layer2)：复用 reply 侧同一净化函数,剔除 reason(防知识 Agent 越权承接
     // 措辞经 reviewer 上下文回流)+ 3 个调试字段,两处口径单一真相源(替代裸 to_string)。
     let knowledge_route_text = super::decision::format_knowledge_route_for_prompt(knowledge_route);
@@ -1904,6 +2048,9 @@ Review 模式: {}
 长期记忆卡片:
 {}
 
+联系人级运营特别指令（用于核对候选是否遵守；不得覆盖事实准确、安全、隐私或产品证据硬门）:
+{}
+
 运营方法:
 {}
 
@@ -1931,6 +2078,7 @@ Review 模式: {}
         decision_view_text,
         memory_text,
         memory_card_text,
+        operator_instruction_text,
         playbook.map(format_playbook_for_prompt).unwrap_or_default(),
         domain_config
             .map(format_operation_domain_config_for_prompt)

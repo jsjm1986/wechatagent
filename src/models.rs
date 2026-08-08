@@ -232,8 +232,8 @@ pub struct Contact {
     pub last_outbound_at: Option<DateTime>,
     pub last_agent_run_at: Option<DateTime>,
     /// Phase D / D2：上次出站回复的风格指纹（长度桶 / emoji / 标点 / 句式特征
-    /// 拼接而成的短串）。reviewer 在新 draft 通过审批前与本字段比对，差异过大时
-    /// 触发 single-shot revision，避免单 contact 不同回合风格漂移。
+    /// 拼接而成的短串）。Reply Agent 在生成前把它作为不覆盖当前语义的弱参考；
+    /// 新 draft 通过审批后仅记录机械漂移审计，不单独触发 revision。
     /// 缺字段时反序列化为 None，向前兼容历史 contact 文档。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_outbound_style: Option<String>,

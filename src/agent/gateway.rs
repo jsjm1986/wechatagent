@@ -2605,6 +2605,10 @@ fn run_user_operation_gateway_inner<'a>(
             &local_budget_fallback
         }
     };
+    // 首稿 Reviewer 与独立 ClaimGate 输入相同且判定相互独立，正常路径并行执行可把
+    // 墙钟从二者之和降为较慢者耗时。两道闸的输入、失败策略和 finalize 汇总均不变；
+    // 若 Reviewer 要求重写，下面会丢弃首稿 ClaimGate，并对改写后的最终正文重新执行。
+    let mut precomputed_claim_gate = None;
     let mut review = if budget_exceeded_for_review {
         if let Some(b) = run_budget.as_ref() {
             b.mark_degraded("review_skipped_budget_exceeded".to_string());
@@ -2622,7 +2626,8 @@ fn run_user_operation_gateway_inner<'a>(
         .await?;
         local_decision_review(&decision, local_budget_ref, &runtime)
     } else if should_run_review(&decision, &planner, &runtime) {
-        review_decision(
+        let review_mode = effective_review_mode(&planner, &decision, &runtime, false);
+        let (review, claim_gate_evaluation) = review_and_evaluate_claim_gate(
             state,
             &contact,
             &inbound,
@@ -2635,21 +2640,19 @@ fn run_user_operation_gateway_inner<'a>(
             &context_pack,
             &selected_chunks,
             &knowledge_route,
-            effective_review_mode(&planner, &decision, &runtime, false),
-            Some(&run_id),
-            None,
-            Some(&active_profile),
-            None,
+            review_mode,
+            &run_id,
+            &active_profile,
+            &active_products,
+            &reviewer_prompts,
         )
-        .await?
+        .await?;
+        precomputed_claim_gate = Some(claim_gate_evaluation);
+        review
     } else {
         local_decision_review(&decision, local_budget_ref, &runtime)
     };
     let mut final_decision = decision;
-    // 仅 rewrite 分支会在此提前得到“最终候选”。该分支把 Reviewer 与 Claim Gate
-    // 并行执行，并把结果留到统一 finalize 点消费；普通首稿不投机启动 Claim Gate，
-    // 避免 Reviewer 要求改写时产生一次无用 LLM 调用。
-    let mut precomputed_claim_gate = None;
 
     if final_decision.should_reply && !review_passed(&review, &runtime) && !review.needs_revision {
         // Phase B / B1：`needs_revision=true` 表示 [`route_dual_gate`] 已经
@@ -2857,9 +2860,12 @@ fn run_user_operation_gateway_inner<'a>(
         .map(|b| b.is_exceeded())
         .unwrap_or(false);
 
-    // Phase D / D2：如果 finalize Approved 且 reviewer 没要求 revision，再用结构性
-    // 风格指纹和 contact.last_outbound_style 比对一次。3/5 轴漂移 → 强制 single-shot
-    // revision，向 last_outbound_style 风格靠拢。empty prev 视为首轮，跳过。
+    // Phase D / D2：首轮完整 Reviewer / ClaimGate 已通过后，仅观测结构风格漂移。
+    // 长度、问号和句末符号高度依赖本轮语义（例如上一轮提问、本轮道晚安会天然
+    // 同时变化 3 个轴），不能把机械差异提升为安全修订闸门。生成前已经注入弱风格
+    // 参考；这里仅写审计，不修改 review.needs_revision / risks / revision_direction。
+    // Reviewer 自己识别的人味、情绪、压力、隐私、事实等问题仍走原 single-shot
+    // revision + 二次 ClaimGate/Reviewer，安全语义不变。
     if matches!(finalize_status, GatewayStatusFinal::Approved)
         && !review.needs_revision
         && !review.should_hold
@@ -2869,30 +2875,27 @@ fn run_user_operation_gateway_inner<'a>(
         if !prev_style.trim().is_empty() {
             let new_style =
                 super::review::extract_outbound_style_fingerprint(&final_decision.reply_text);
-            if super::review::style_diverged(&prev_style, &new_style) {
-                let direction = format!(
-                    "上一轮出站风格指纹为 [{}]，本轮草稿为 [{}]，二者结构差异较大；\
-                 请保留本轮内容要点的同时，向上一轮风格靠拢（长度桶 / emoji / \
-                 问句感叹密度 / 句末符号 / 段落数 至少 3 个轴对齐）。",
-                    prev_style, new_style
-                );
-                review.needs_revision = true;
-                review.revision_direction = direction.clone();
-                if !review.risks.iter().any(|r| r == "style_diverged") {
-                    review.risks.push("style_diverged".to_string());
-                }
+            if let super::review::StyleContinuityObservation::AuditOnly {
+                previous,
+                current,
+            } = super::review::observe_style_continuity(&prev_style, &new_style)
+            {
                 write_event_for_account(
                     state,
                     &contact.workspace_id,
                     &contact.account_id,
                     Some(&contact.wxid),
-                    "style_consistency_revision_trigger",
+                    "style_consistency_observed",
                     "info",
-                    &format!("style_diverged: prev={} new={}", prev_style, new_style),
+                    &format!(
+                        "style_diverged_observed_only: prev={} new={}",
+                        previous, current
+                    ),
                     Some(doc! {
                         "run_id": &run_id,
-                        "prev_style": &prev_style,
-                        "new_style": &new_style,
+                        "prev_style": previous,
+                        "new_style": current,
+                        "action": "audit_only",
                     }),
                 )
                 .await?;
@@ -4697,7 +4700,7 @@ pub(crate) async fn send_outbound_message(
     // 设为 now，并把 last_message_at 设成 max(last_inbound_at, now)，
     // 不改 last_inbound_at（出站不应推进"用户最后一次说话"的时间）。
     // Phase D / D2：同步把本次出站文本的风格指纹写入 last_outbound_style，
-    // 供下一轮 reviewer 做 style_diverged 判定。
+    // 供下一轮 Reply Agent 作弱风格参考，并用于后置漂移审计。
     let style_fingerprint = super::review::extract_outbound_style_fingerprint(content);
     let pipeline: Vec<Document> = vec![doc! {
         "$set": {

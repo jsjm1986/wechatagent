@@ -815,7 +815,13 @@ pub(crate) async fn decide_reply_with_promote(
     } else {
         String::new()
     };
-    let rewrite_text = rewrite_instruction.unwrap_or("");
+    // 上一条回复的结构指纹只作为生成前弱参考。长度、问号、句末符号受当前语义
+    // 影响很大，不能反过来强迫“晚安”之类陈述句复制上一轮提问结构。显式 Reviewer
+    // 改写要求仍排在前面并保持更高优先级。
+    let rewrite_text = super::review::render_style_continuity_hint(
+        rewrite_instruction,
+        contact.last_outbound_style.as_deref(),
+    );
     // Phase D / D1：intent_trajectory 段（最近 5 项）。空时为空串；
     // contact 老文档（无 intent_trajectory 字段）反序列化为 default 空 Vec，
     // 落入 `intent_trajectory_text == ""` 路径，向前兼容。
