@@ -88,6 +88,8 @@ struct ChatCompletionResponse {
 #[derive(Debug, Deserialize)]
 struct ChatChoice {
     message: ChatChoiceMessage,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -110,6 +112,8 @@ struct StreamChunkResponse {
 struct StreamChoice {
     #[serde(default)]
     delta: StreamDelta,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -220,13 +224,13 @@ pub trait LlmProvider: Send + Sync {
     async fn generate_json(&self, system: &str, user: &str) -> AppResult<Value>;
     async fn generate_json_with_usage(&self, system: &str, user: &str) -> AppResult<LlmJsonResult>;
 
-    /// Latency-sensitive strict-JSON call. Providers may suppress internal reasoning while
-    /// preserving the same prompts and parsed result contract. Unsupported providers retain the
-    /// ordinary behavior through this default implementation.
-    async fn generate_json_with_usage_fast(
+    /// Generate JSON with a caller-specific completion budget. Providers that do not support
+    /// output limits retain their existing behavior through this default implementation.
+    async fn generate_json_with_usage_limit(
         &self,
         system: &str,
         user: &str,
+        _max_output_tokens: u32,
     ) -> AppResult<LlmJsonResult> {
         self.generate_json_with_usage(system, user).await
     }
@@ -360,6 +364,23 @@ impl LlmClient {
         self
     }
 
+    /// DeepSeek reasoning models can spend most completion tokens on hidden reasoning even for
+    /// strict JSON contracts. Critical-path bounded calls opt into the provider's explicit JSON
+    /// mode and disable thinking; ordinary and streaming calls retain their existing behavior.
+    fn apply_fast_json_controls(&self, body: &mut Value, enabled: bool) {
+        if enabled
+            && self.format == LlmFormat::Openai
+            && self
+                .model
+                .trim()
+                .to_ascii_lowercase()
+                .starts_with("deepseek")
+        {
+            body["response_format"] = json!({ "type": "json_object" });
+            body["thinking"] = json!({ "type": "disabled" });
+        }
+    }
+
     /// 解析 `cleaned`（已聚合 SSE、已剥 reasoning 前缀的**干净模型文本**）为 JSON；
     /// 前两层（快路径 / `repair_loose_json` / `extract_embedded_json`）失败后进**第三层**：
     /// 把整段脏文本回喂 LLM 让其修成合法 JSON，最多 [`REPAIR_MAX_ATTEMPTS`] 次。
@@ -371,6 +392,14 @@ impl LlmClient {
     /// **红线**：回喂 N 次仍失败 → 抛 json_decode 错（测试该红就红 / 上游 skip），把原始脏文本
     /// 前缀与各次修复结果写进错误 detail，便于诊断"模型问题 vs 方法问题"。绝不把非 JSON 当数据吞下。
     async fn parse_or_repair(&self, cleaned: &str) -> AppResult<Value> {
+        self.parse_or_repair_bounded(cleaned, None).await
+    }
+
+    async fn parse_or_repair_bounded(
+        &self,
+        cleaned: &str,
+        max_output_tokens: Option<u32>,
+    ) -> AppResult<Value> {
         // 前三层（快路径 + repair_loose_json + extract_embedded_json）。
         if let Ok(value) = parse_json_content(cleaned) {
             return Ok(value);
@@ -386,9 +415,12 @@ impl LlmClient {
         // 第三层：回喂 LLM 修复。每次修复响应只走 parse_json_content（不再回喂，断递归）。
         let mut attempts_diag: Vec<String> = Vec::new();
         for attempt in 1..=REPAIR_MAX_ATTEMPTS {
-            match self.repair_via_llm(cleaned).await {
+            match self.repair_via_llm(cleaned, max_output_tokens).await {
                 Ok(value) => return Ok(value),
-                Err(e) => attempts_diag.push(format!("repair#{attempt}={e}")),
+                Err(error) if error.to_string().contains("llm_output_truncated") => {
+                    return Err(error);
+                }
+                Err(error) => attempts_diag.push(format!("repair#{attempt}={error}")),
             }
         }
         // 全部失败：抛严格错误，附原始脏文本前缀 + 各次修复诊断。
@@ -403,18 +435,29 @@ impl LlmClient {
 
     /// 第三层修复的单次实现：把脏文本作为 user，配固定「JSON 修复器」system 发一次请求，
     /// 响应只用 `parse_json_content`（**不**再调 `parse_or_repair`，避免无限递归）。
-    async fn repair_via_llm(&self, raw_dirty: &str) -> AppResult<Value> {
+    async fn repair_via_llm(
+        &self,
+        raw_dirty: &str,
+        max_output_tokens: Option<u32>,
+    ) -> AppResult<Value> {
         const REPAIR_SYSTEM: &str = "你是一个 JSON 修复器。用户会给你一段文本，其中**包含**一个 JSON 对象，但格式可能有误（多余的解释、围栏、全角标点、缺引号、尾逗号、截断等）。请理解其语义，只输出**修正后的、严格合法的单个 JSON 对象**。第一个字符必须是 `{`，最后一个字符必须是 `}`，禁止任何前导/收尾说明、禁止代码块围栏。保持原始内容的字段与取值不变，只修复格式。";
-        let cleaned = self.fetch_raw_text(REPAIR_SYSTEM, raw_dirty).await?;
+        let cleaned = self
+            .fetch_raw_text(REPAIR_SYSTEM, raw_dirty, max_output_tokens)
+            .await?;
         parse_json_content(&strip_reasoning_prefix(&cleaned))
     }
 
     /// 发一次请求、按当前 format 取出**纯文本 content**（聚合 SSE、解出信封），不做 JSON 解析。
     /// 专供 [`Self::repair_via_llm`] 复用 HTTP 链路，避免与 `generate_json_once_*` 的递归。
-    async fn fetch_raw_text(&self, system: &str, user: &str) -> AppResult<String> {
+    async fn fetch_raw_text(
+        &self,
+        system: &str,
+        user: &str,
+        max_output_tokens: Option<u32>,
+    ) -> AppResult<String> {
         match self.format {
             LlmFormat::Openai => {
-                let body = json!({
+                let mut body = json!({
                     "model": self.model,
                     "temperature": 0.0,
                     "messages": [
@@ -422,6 +465,10 @@ impl LlmClient {
                         ChatMessage { role: "user", content: user }
                     ]
                 });
+                if let Some(limit) = max_output_tokens {
+                    body["max_tokens"] = json!(limit.max(1));
+                }
+                self.apply_fast_json_controls(&mut body, max_output_tokens.is_some());
                 let response = self
                     .client
                     .post(format!("{}/chat/completions", self.base_url))
@@ -435,7 +482,8 @@ impl LlmClient {
                     return Err(AppError::External(format!("LLM HTTP {status}: {text}")));
                 }
                 if is_openai_sse_body(&text) {
-                    let (acc, _) = aggregate_openai_sse(&text);
+                    let (acc, _, finish_reason) = aggregate_openai_sse(&text);
+                    reject_truncated_output(finish_reason.as_deref(), max_output_tokens)?;
                     if acc.trim().is_empty() {
                         return Err(AppError::External(
                             "LLM SSE body 聚合后内容为空".to_string(),
@@ -444,17 +492,19 @@ impl LlmClient {
                     Ok(acc)
                 } else {
                     let parsed: ChatCompletionResponse = serde_json::from_str(&text)?;
-                    parsed
+                    let choice = parsed
                         .choices
                         .first()
-                        .map(|choice| choice.message.content.clone())
-                        .ok_or_else(|| AppError::External("LLM returned no choices".to_string()))
+                        .ok_or_else(|| AppError::External("LLM returned no choices".to_string()))?;
+                    reject_truncated_output(choice.finish_reason.as_deref(), max_output_tokens)?;
+                    Ok(choice.message.content.clone())
                 }
             }
             LlmFormat::Anthropic => {
+                let max_tokens = max_output_tokens.unwrap_or(8192).clamp(1, 8192);
                 let body = json!({
                     "model": self.model,
-                    "max_tokens": 8192,
+                    "max_tokens": max_tokens,
                     "temperature": 0.0,
                     "system": system,
                     "messages": [ {"role": "user", "content": user} ]
@@ -473,6 +523,11 @@ impl LlmClient {
                     return Err(AppError::External(format!("LLM HTTP {status}: {text}")));
                 }
                 let parsed: AnthropicMessageResponse = serde_json::from_str(&text)?;
+                if parsed.stop_reason.as_deref() == Some("max_tokens") {
+                    return Err(AppError::External(format!(
+                        "llm_output_truncated: stop_reason=max_tokens max_output_tokens={max_tokens}"
+                    )));
+                }
                 parsed
                     .content
                     .iter()
@@ -491,14 +546,17 @@ impl LlmClient {
         &self,
         system: &str,
         user: &str,
-        fast_json: bool,
+        max_output_tokens: Option<u32>,
     ) -> AppResult<(LlmJsonResult, Option<u64>)> {
         match self.format {
             LlmFormat::Openai => {
-                self.generate_json_once_openai(system, user, fast_json)
+                self.generate_json_once_openai(system, user, max_output_tokens)
                     .await
             }
-            LlmFormat::Anthropic => self.generate_json_once_anthropic(system, user).await,
+            LlmFormat::Anthropic => {
+                self.generate_json_once_anthropic(system, user, max_output_tokens)
+                    .await
+            }
         }
     }
 
@@ -506,7 +564,7 @@ impl LlmClient {
         &self,
         system: &str,
         user: &str,
-        fast_json: bool,
+        max_output_tokens: Option<u32>,
     ) -> AppResult<(LlmJsonResult, Option<u64>)> {
         let started_at = Instant::now();
         let mut body = json!({
@@ -517,16 +575,10 @@ impl LlmClient {
                 ChatMessage { role: "user", content: user }
             ]
         });
-        if fast_json
-            && self
-                .model
-                .trim()
-                .to_ascii_lowercase()
-                .starts_with("deepseek")
-        {
-            body["response_format"] = json!({ "type": "json_object" });
-            body["thinking"] = json!({ "type": "disabled" });
+        if let Some(limit) = max_output_tokens {
+            body["max_tokens"] = json!(limit.max(1));
         }
+        self.apply_fast_json_controls(&mut body, max_output_tokens.is_some());
 
         let response = self
             .client
@@ -568,27 +620,35 @@ impl LlmClient {
         // 流式 SSE（部分中转网关即使不传 stream 也只回 `data: {chunk}`）。
         // 检测到 SSE 帧则聚合 delta.content；否则按原 ChatCompletionResponse 解析。
         // 非 SSE 响应零行为变化。
-        let (content, usage) = if is_openai_sse_body(&text) {
-            let (acc, sse_usage) = aggregate_openai_sse(&text);
+        let (content, usage, finish_reason) = if is_openai_sse_body(&text) {
+            let (acc, sse_usage, finish_reason) = aggregate_openai_sse(&text);
             if acc.trim().is_empty() {
                 return Err(AppError::External(
                     "LLM SSE body 聚合后内容为空".to_string(),
                 ));
             }
-            (acc, sse_usage.map(ChatUsage::reported).unwrap_or_default())
+            (
+                acc,
+                sse_usage.map(ChatUsage::reported).unwrap_or_default(),
+                finish_reason,
+            )
         } else {
             let parsed: ChatCompletionResponse = serde_json::from_str(&text)?;
-            let c = parsed
+            let choice = parsed
                 .choices
                 .first()
-                .map(|choice| choice.message.content.clone())
                 .ok_or_else(|| AppError::External("LLM returned no choices".to_string()))?;
-            (c, parsed.usage.map(ChatUsage::reported).unwrap_or_default())
+            (
+                choice.message.content.clone(),
+                parsed.usage.map(ChatUsage::reported).unwrap_or_default(),
+                choice.finish_reason.clone(),
+            )
         };
+        reject_truncated_output(finish_reason.as_deref(), max_output_tokens)?;
         Ok((
             LlmJsonResult {
                 value: self
-                    .parse_or_repair(&strip_reasoning_prefix(&content))
+                    .parse_or_repair_bounded(&strip_reasoning_prefix(&content), max_output_tokens)
                     .await?,
                 usage,
                 latency_ms: started_at.elapsed().as_millis() as i64,
@@ -647,7 +707,7 @@ impl LlmClient {
         // gpt-5.4）。检测到 SSE 帧则聚合 delta.content；否则按原 ChatCompletionResponse
         // 解析。非 SSE 响应零行为变化。
         let (content, usage) = if is_openai_sse_body(&text) {
-            let (acc, sse_usage) = aggregate_openai_sse(&text);
+            let (acc, sse_usage, _) = aggregate_openai_sse(&text);
             if acc.trim().is_empty() {
                 return Err(AppError::External(
                     "LLM SSE body 聚合后内容为空".to_string(),
@@ -681,6 +741,7 @@ impl LlmClient {
         &self,
         system: &str,
         user: &str,
+        max_output_tokens: Option<u32>,
     ) -> AppResult<(LlmJsonResult, Option<u64>)> {
         let started_at = Instant::now();
         // claude（尤其 opus）对话遵从性强，遇到口语化/对话式 prompt（"你好，我需要你帮我…"）
@@ -695,9 +756,10 @@ impl LlmClient {
         // + 第三层回喂修复仍兜底防漏网。
         const ANTHROPIC_JSON_GUARD: &str = "\n\n[OUTPUT FORMAT — STRICT] 当前是**对话生成模式**，不是 agent / 工具调用模式。禁止调用任何工具（不要 WebFetch、不要联网搜索、不要任何 tool_use），直接基于你已有的知识一次性生成完整内容。你必须只输出一个 JSON 对象，不要任何前导说明、寒暄、共情、思考过程或代码块围栏。第一个字符必须是 `{`，最后一个字符必须是 `}`。禁止在 JSON 前后写任何自然语言（包括「好的」「我理解」「让我」「希望有帮助」之类）。";
         let guarded_system = format!("{system}{ANTHROPIC_JSON_GUARD}");
+        let max_tokens = max_output_tokens.unwrap_or(8192).clamp(1, 8192);
         let body = json!({
             "model": self.model,
-            "max_tokens": 8192,
+            "max_tokens": max_tokens,
             "temperature": self.temperature,
             "system": guarded_system,
             "messages": [
@@ -742,6 +804,12 @@ impl LlmClient {
         if let Some(diag) = detect_tool_use_hijack(&parsed) {
             return Err(AppError::External(diag));
         }
+        if parsed.stop_reason.as_deref() == Some("max_tokens") {
+            return Err(AppError::External(format!(
+                "llm_output_truncated: stop_reason=max_tokens max_output_tokens={}",
+                max_output_tokens.unwrap_or(8192)
+            )));
+        }
         let content = parsed
             .content
             .iter()
@@ -755,7 +823,9 @@ impl LlmClient {
             .ok_or_else(|| AppError::External("LLM returned no choices".to_string()))?;
         let usage = parsed.usage.map(ChatUsage::from).unwrap_or_default();
         let cleaned = strip_reasoning_prefix(content);
-        let value = self.parse_or_repair(&cleaned).await?;
+        let value = self
+            .parse_or_repair_bounded(&cleaned, max_output_tokens)
+            .await?;
         Ok((
             LlmJsonResult {
                 value,
@@ -766,6 +836,44 @@ impl LlmClient {
             },
             None,
         ))
+    }
+
+    async fn generate_json_with_usage_bounded(
+        &self,
+        system: &str,
+        user: &str,
+        max_output_tokens: Option<u32>,
+    ) -> AppResult<LlmJsonResult> {
+        let call_started_at = Instant::now();
+        let mut last_error: Option<AppError> = None;
+        let mut retry_count: u32 = 0;
+        for attempt in 1..=self.max_retries {
+            match self
+                .generate_json_once(system, user, max_output_tokens)
+                .await
+            {
+                Ok((mut value, _)) => {
+                    value.retry_count = retry_count;
+                    // Report the complete caller-visible latency, including failed attempts and
+                    // retry backoff, rather than only the final successful HTTP request.
+                    value.latency_ms = call_started_at.elapsed().as_millis() as i64;
+                    return Ok(value);
+                }
+                Err(error) if attempt < self.max_retries && is_retryable_llm_error(&error) => {
+                    let retry_after_secs = parse_retry_after_from_error(&error);
+                    let delay = compute_backoff(attempt, self.retry_base_ms, retry_after_secs);
+                    last_error = Some(error);
+                    sleep(delay).await;
+                    retry_count = retry_count.saturating_add(1);
+                }
+                Err(error) => {
+                    return Err(classify_llm_error_for_user(&error, retry_count));
+                }
+            }
+        }
+        let final_err = last_error
+            .unwrap_or_else(|| AppError::External("LLM request failed after retries".to_string()));
+        Err(classify_llm_error_for_user(&final_err, retry_count))
     }
 
     /// OpenAI 兼容 `stream: true` 的真流式实现：消费 `bytes_stream()`，按 SSE
@@ -896,16 +1004,18 @@ impl LlmProvider for LlmClient {
     }
 
     async fn generate_json_with_usage(&self, system: &str, user: &str) -> AppResult<LlmJsonResult> {
-        self.generate_json_with_usage_mode(system, user, false)
+        self.generate_json_with_usage_bounded(system, user, None)
             .await
     }
 
-    async fn generate_json_with_usage_fast(
+    async fn generate_json_with_usage_limit(
         &self,
         system: &str,
         user: &str,
+        max_output_tokens: u32,
     ) -> AppResult<LlmJsonResult> {
-        self.generate_json_with_usage_mode(system, user, true).await
+        self.generate_json_with_usage_bounded(system, user, Some(max_output_tokens))
+            .await
     }
 
     async fn generate_json_streaming(
@@ -980,49 +1090,6 @@ impl LlmProvider for LlmClient {
                 "vision_not_supported: Anthropic 格式的多模态输入尚未实现".to_string(),
             )),
         }
-    }
-}
-
-impl LlmClient {
-    async fn generate_json_with_usage_mode(
-        &self,
-        system: &str,
-        user: &str,
-        fast_json: bool,
-    ) -> AppResult<LlmJsonResult> {
-        let call_started_at = Instant::now();
-        let mut last_error: Option<AppError> = None;
-        let mut retry_count: u32 = 0;
-        for attempt in 1..=self.max_retries {
-            match self.generate_json_once(system, user, fast_json).await {
-                Ok((mut value, _)) => {
-                    value.retry_count = retry_count;
-                    // Report the complete caller-visible latency, including failed attempts and
-                    // retry backoff, rather than only the final successful HTTP request.
-                    value.latency_ms = call_started_at.elapsed().as_millis() as i64;
-                    return Ok(value);
-                }
-                Err(error) if attempt < self.max_retries && is_retryable_llm_error(&error) => {
-                    let retry_after_secs = parse_retry_after_from_error(&error);
-                    let delay = compute_backoff(attempt, self.retry_base_ms, retry_after_secs);
-                    last_error = Some(error);
-                    sleep(delay).await;
-                    retry_count = retry_count.saturating_add(1);
-                }
-                Err(error) => {
-                    // 重试耗尽（或不可重试的 LLM 错误）—— 把 raw 错误分类成
-                    // [`AppError::LlmUnavailable`]，让前端按 `kind` 渲染中文文案，
-                    // 而不是把 reqwest 原始 "error sending request for url ..."
-                    // 直接糊到面板上。
-                    return Err(classify_llm_error_for_user(&error, retry_count));
-                }
-            }
-        }
-        // for 循环正常退出（max_retries 用完且最后一次也走了可重试分支但 attempt
-        // == max_retries 没机会再 sleep 重试）—— last_error 必有值。
-        let final_err = last_error
-            .unwrap_or_else(|| AppError::External("LLM request failed after retries".to_string()));
-        Err(classify_llm_error_for_user(&final_err, retry_count))
     }
 }
 
@@ -1347,9 +1414,10 @@ fn is_openai_sse_body(text: &str) -> bool {
 
 /// 聚合 OpenAI SSE 帧的 `choices[0].delta.content`，返回拼接内容 + usage。
 /// 复用 [`StreamChunkResponse`]（与 token 级 streaming 同结构）。单帧解析失败跳过。
-fn aggregate_openai_sse(text: &str) -> (String, Option<ChatUsage>) {
+fn aggregate_openai_sse(text: &str) -> (String, Option<ChatUsage>, Option<String>) {
     let mut acc = String::new();
     let mut usage: Option<ChatUsage> = None;
+    let mut finish_reason: Option<String> = None;
     for line in text.lines() {
         let line = line.trim();
         let data = match line.strip_prefix("data:") {
@@ -1366,6 +1434,13 @@ fn aggregate_openai_sse(text: &str) -> (String, Option<ChatUsage>) {
         if let Some(u) = parsed.usage {
             usage = Some(u.reported());
         }
+        if let Some(reason) = parsed
+            .choices
+            .first()
+            .and_then(|choice| choice.finish_reason.clone())
+        {
+            finish_reason = Some(reason);
+        }
         if let Some(c) = parsed
             .choices
             .first()
@@ -1374,7 +1449,22 @@ fn aggregate_openai_sse(text: &str) -> (String, Option<ChatUsage>) {
             acc.push_str(c);
         }
     }
-    (acc, usage)
+    (acc, usage, finish_reason)
+}
+
+fn reject_truncated_output(
+    finish_reason: Option<&str>,
+    max_output_tokens: Option<u32>,
+) -> AppResult<()> {
+    if finish_reason == Some("length") {
+        return Err(AppError::External(format!(
+            "llm_output_truncated: finish_reason=length max_output_tokens={}",
+            max_output_tokens
+                .map(|limit| limit.to_string())
+                .unwrap_or_else(|| "provider_default".to_string())
+        )));
+    }
+    Ok(())
 }
 
 /// 剥离部分模型在 JSON 前输出的 `<think>...</think>` 推理前缀（如此端点的 gpt 系）。
@@ -1692,13 +1782,14 @@ impl LlmRegistrySnapshot {
         self.client.generate_json_with_usage(system, user).await
     }
 
-    pub async fn generate_json_with_usage_fast(
+    pub async fn generate_json_with_usage_limit(
         &self,
         system: &str,
         user: &str,
+        max_output_tokens: u32,
     ) -> AppResult<LlmJsonResult> {
         self.client
-            .generate_json_with_usage_fast(system, user)
+            .generate_json_with_usage_limit(system, user, max_output_tokens)
             .await
     }
 
@@ -1736,12 +1827,14 @@ impl LlmProvider for LlmRegistrySnapshot {
         LlmRegistrySnapshot::generate_json_with_usage(self, system, user).await
     }
 
-    async fn generate_json_with_usage_fast(
+    async fn generate_json_with_usage_limit(
         &self,
         system: &str,
         user: &str,
+        max_output_tokens: u32,
     ) -> AppResult<LlmJsonResult> {
-        LlmRegistrySnapshot::generate_json_with_usage_fast(self, system, user).await
+        LlmRegistrySnapshot::generate_json_with_usage_limit(self, system, user, max_output_tokens)
+            .await
     }
 
     async fn generate_json_streaming(
@@ -1859,13 +1952,16 @@ impl LlmProvider for LlmRegistry {
         client.generate_json_with_usage(system, user).await
     }
 
-    async fn generate_json_with_usage_fast(
+    async fn generate_json_with_usage_limit(
         &self,
         system: &str,
         user: &str,
+        max_output_tokens: u32,
     ) -> AppResult<LlmJsonResult> {
         let client = self.current().await;
-        client.generate_json_with_usage_fast(system, user).await
+        client
+            .generate_json_with_usage_limit(system, user, max_output_tokens)
+            .await
     }
 
     async fn generate_json_streaming(
@@ -2009,7 +2105,7 @@ mod tests {
         let body = "data: {\"choices\":[{\"delta\":{\"content\":\"{\\\"a\\\"\"}}]}\n\
                     data: {\"choices\":[{\"delta\":{\"content\":\":1}\"}}]}\n\
                     data: [DONE]";
-        let (acc, _usage) = aggregate_openai_sse(body);
+        let (acc, _usage, _finish_reason) = aggregate_openai_sse(body);
         assert_eq!(acc, "{\"a\":1}");
     }
 
@@ -2019,7 +2115,7 @@ mod tests {
         let body = ": keepalive\n\
                     data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\
                     data: garbage-not-json\n";
-        let (acc, _) = aggregate_openai_sse(body);
+        let (acc, _, _) = aggregate_openai_sse(body);
         assert_eq!(acc, "ok");
     }
 
@@ -2028,14 +2124,14 @@ mod tests {
         let reported_zero = "data: {\"choices\":[{\"delta\":{\"content\":\"{}\"}}]}\n\
                              data: {\"choices\":[],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0,\"total_tokens\":0}}\n\
                              data: [DONE]";
-        let (_, usage) = aggregate_openai_sse(reported_zero);
+        let (_, usage, _) = aggregate_openai_sse(reported_zero);
         let usage = usage.expect("explicit usage object must be retained");
         assert!(usage.is_known(), "reported zero is a measured value");
         assert_eq!(usage.total_tokens, 0);
 
         let omitted = "data: {\"choices\":[{\"delta\":{\"content\":\"{}\"}}]}\n\
                        data: [DONE]";
-        let (_, usage) = aggregate_openai_sse(omitted);
+        let (_, usage, _) = aggregate_openai_sse(omitted);
         assert!(usage.is_none(), "omitted usage must remain unknown");
     }
 
@@ -2077,9 +2173,20 @@ mod tests {
             "data: {\"choices\":[{\"delta\":{\"content\":\"<think>hmm</think>{\\\"ok\\\"\"}}]}\n\
                     data: {\"choices\":[{\"delta\":{\"content\":\":true}\"}}]}\n\
                     data: [DONE]";
-        let (acc, _) = aggregate_openai_sse(body);
+        let (acc, _, _) = aggregate_openai_sse(body);
         let value = parse_json_content(&strip_reasoning_prefix(&acc)).unwrap();
         assert_eq!(value["ok"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn sse_aggregation_preserves_length_finish_reason() {
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"{\\\"ok\\\"\"}}]}\n\
+                    data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\
+                    data: [DONE]";
+        let (content, _, finish_reason) = aggregate_openai_sse(body);
+        assert_eq!(content, "{\"ok\"");
+        assert_eq!(finish_reason.as_deref(), Some("length"));
+        assert!(reject_truncated_output(finish_reason.as_deref(), Some(512)).is_err());
     }
 
     #[test]
@@ -2596,7 +2703,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fast_json_controls_are_deepseek_and_call_scoped() {
+    async fn openai_output_limit_is_opt_in_and_reaches_repair_requests() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -2605,6 +2712,99 @@ mod tests {
             .and(path("/v1/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "choices": [{ "message": { "content": "{\"ok\":true}" } }],
+                "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+            })))
+            .expect(3)
+            .mount(&server)
+            .await;
+
+        let client = LlmClient::new(
+            format!("{}/v1", server.uri()),
+            "test-key".into(),
+            "test-model".into(),
+            10,
+            1,
+            100,
+        )
+        .expect("build client");
+
+        client
+            .generate_json_with_usage_limit("bounded-system", "bounded-user", 321)
+            .await
+            .expect("bounded request");
+        client
+            .generate_json_with_usage("unbounded-system", "unbounded-user")
+            .await
+            .expect("unbounded request");
+        client
+            .parse_or_repair_bounded("not-json", Some(321))
+            .await
+            .expect("bounded repair request");
+
+        let requests = server.received_requests().await.expect("received requests");
+        assert_eq!(requests.len(), 3);
+        let bodies = requests
+            .iter()
+            .map(|request| serde_json::from_slice::<Value>(&request.body).expect("request JSON"))
+            .collect::<Vec<_>>();
+        assert_eq!(bodies[0]["max_tokens"], json!(321));
+        assert!(bodies[1].get("max_tokens").is_none());
+        assert_eq!(bodies[2]["max_tokens"], json!(321));
+    }
+
+    #[tokio::test]
+    async fn truncated_repair_response_fails_after_one_request() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{
+                    "message": { "content": "{\"stillIncomplete\":" },
+                    "finish_reason": "length"
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = LlmClient::new(
+            format!("{}/v1", server.uri()),
+            "test-key".into(),
+            "test-model".into(),
+            10,
+            1,
+            100,
+        )
+        .expect("build client");
+        let error = client
+            .parse_or_repair_bounded("not-json", Some(321))
+            .await
+            .expect_err("truncated repair must fail closed");
+        assert!(error.to_string().contains("llm_output_truncated"));
+        assert_eq!(
+            server
+                .received_requests()
+                .await
+                .expect("received requests")
+                .len(),
+            1,
+            "a deterministic truncation must not trigger a second repair call"
+        );
+    }
+
+    #[tokio::test]
+    async fn deepseek_fast_json_controls_are_bounded_and_provider_scoped() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{ "message": { "content": "{\"ok\":true}" }, "finish_reason": "stop" }],
                 "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
             })))
             .expect(3)
@@ -2621,11 +2821,11 @@ mod tests {
         )
         .expect("build DeepSeek client");
         deepseek
-            .generate_json_with_usage_fast("system", "user")
+            .generate_json_with_usage_limit("bounded", "return JSON", 8192)
             .await
-            .expect("fast DeepSeek request");
+            .expect("bounded DeepSeek request");
         deepseek
-            .generate_json_with_usage("system", "user")
+            .generate_json_with_usage("ordinary", "return JSON")
             .await
             .expect("ordinary DeepSeek request");
 
@@ -2639,11 +2839,12 @@ mod tests {
         )
         .expect("build non-DeepSeek client");
         other
-            .generate_json_with_usage_fast("system", "user")
+            .generate_json_with_usage_limit("bounded", "return JSON", 8192)
             .await
-            .expect("fast non-DeepSeek request");
+            .expect("bounded non-DeepSeek request");
 
         let requests = server.received_requests().await.expect("received requests");
+        assert_eq!(requests.len(), 3);
         let bodies = requests
             .iter()
             .map(|request| serde_json::from_slice::<Value>(&request.body).expect("request JSON"))
@@ -2653,10 +2854,131 @@ mod tests {
             json!({ "type": "json_object" })
         );
         assert_eq!(bodies[0]["thinking"], json!({ "type": "disabled" }));
+        assert_eq!(bodies[0]["max_tokens"], json!(8192));
         assert!(bodies[1].get("response_format").is_none());
         assert!(bodies[1].get("thinking").is_none());
+        assert!(bodies[1].get("max_tokens").is_none());
         assert!(bodies[2].get("response_format").is_none());
         assert!(bodies[2].get("thinking").is_none());
+        assert_eq!(bodies[2]["max_tokens"], json!(8192));
+    }
+
+    #[tokio::test]
+    async fn anthropic_output_limit_overrides_only_the_bounded_request() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "content": [{ "type": "text", "text": "{\"ok\":true}" }],
+                "usage": { "input_tokens": 1, "output_tokens": 1 },
+                "stop_reason": "end_turn"
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let client = LlmClient::with_format(
+            server.uri(),
+            "test-key".into(),
+            "test-model".into(),
+            LlmFormat::Anthropic,
+            10,
+            1,
+            100,
+        )
+        .expect("build client");
+
+        client
+            .generate_json_with_usage_limit("bounded-system", "bounded-user", 777)
+            .await
+            .expect("bounded request");
+        client
+            .generate_json_with_usage("default-system", "default-user")
+            .await
+            .expect("default request");
+
+        let requests = server.received_requests().await.expect("received requests");
+        assert_eq!(requests.len(), 2);
+        let bodies = requests
+            .iter()
+            .map(|request| serde_json::from_slice::<Value>(&request.body).expect("request JSON"))
+            .collect::<Vec<_>>();
+        assert_eq!(bodies[0]["max_tokens"], json!(777));
+        assert_eq!(bodies[1]["max_tokens"], json!(8192));
+    }
+
+    #[tokio::test]
+    async fn openai_length_finish_reason_fails_without_json_repair() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{
+                    "message": { "content": "{\"incomplete\":" },
+                    "finish_reason": "length"
+                }],
+                "usage": { "prompt_tokens": 10, "completion_tokens": 512, "total_tokens": 522 }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = LlmClient::new(
+            format!("{}/v1", server.uri()),
+            "test-key".into(),
+            "test-model".into(),
+            10,
+            1,
+            100,
+        )
+        .expect("build client");
+        let error = client
+            .generate_json_with_usage_limit("system", "user", 512)
+            .await
+            .expect_err("length finish reason must fail closed");
+        assert!(error.to_string().contains("llm_output_truncated"));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn anthropic_max_tokens_stop_fails_without_json_repair() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "content": [{ "type": "text", "text": "{\"incomplete\":" }],
+                "usage": { "input_tokens": 10, "output_tokens": 512 },
+                "stop_reason": "max_tokens"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = LlmClient::with_format(
+            server.uri(),
+            "test-key".into(),
+            "test-model".into(),
+            LlmFormat::Anthropic,
+            10,
+            1,
+            100,
+        )
+        .expect("build client");
+        let error = client
+            .generate_json_with_usage_limit("system", "user", 512)
+            .await
+            .expect_err("max_tokens stop reason must fail closed");
+        assert!(error.to_string().contains("llm_output_truncated"));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
     #[tokio::test]

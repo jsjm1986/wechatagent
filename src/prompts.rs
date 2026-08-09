@@ -671,7 +671,7 @@ pub fn default_domain_configs(workspace_id: &str) -> Vec<OperationDomainConfig> 
                 "factRiskBlockAt": 6,
                 "pressureRiskBlockAt": 7,
                 "humanLikeRewriteBelow": 6,
-                "emotionalValueRewriteBelow": 5,
+                "emotionalValueRewriteBelow": 6,
                 "productAccuracyBlockBelow": 7,
                 "operationStateConfidenceFullReviewBelow": 4,
                 "runTokenBudget": 30000,
@@ -1263,7 +1263,7 @@ fn prompt_specs() -> Vec<PromptSpec> {
   "knowledgeNeed": "not_required | required | insufficient",
   "runMode": "fast_chat | memory_candidate | knowledge_grounded | high_risk",
   "autonomyMode": "auto | assisted | blocked",
-  "needsReview": true,
+  "needsReview": false,
   "conversationMode": "casual_relationship | value_exchange | consultative | boundary_protection",
   "conversationModeReason": "一句话说明模式依据",
   "shouldReply": true,
@@ -1290,6 +1290,7 @@ fn prompt_specs() -> Vec<PromptSpec> {
 
 硬规则：
 - 所有枚举必须使用列出的值；operationState 必须来自注入的状态机。
+- needsReview 只选择复盘深度，不决定是否审核：低风险常规轮填 false；高风险、知识不足或产品声明填 true。所有可发送正文仍会经过独立 Reviewer 和 ClaimGate。
 - shouldReply=true 时 replyText 不得为空。信息不足时先给能确定的部分，必要时只问一个关键问题。
 - 产品事实只能使用已注入的 verified 知识或产品目录；没有依据就保守澄清，不得编造。
 - replyText 作出时间承诺时必须同步填写 lastCommitment/commitment；正式承诺和 followUp 只会在文本确认送达后生效。
@@ -1308,6 +1309,7 @@ fn prompt_specs() -> Vec<PromptSpec> {
 
 ## 决策形态（本轮只输出一次完整决策，没有中间轮）
 本模板是**单发**决策：需要的知识检索已由系统在本轮之前完成并注入下方上下文，你不需要、也不能再请求任何工具或分多轮。请直接输出下面 final 形态的完整决策 JSON（`decisionPhase` 恒为 `"final"`）。
+`needsReview` 只选择复盘深度，不决定是否审核：低风险常规轮填 false；高风险、知识不足或产品声明填 true。所有可发送正文仍会经过独立 Reviewer 和 ClaimGate。
 
 ### final 形态契约（下面所有字段都必填，缺一即全局阻断）
 {
@@ -1318,7 +1320,7 @@ fn prompt_specs() -> Vec<PromptSpec> {
   "knowledgeNeed": "not_required | required | insufficient",
   "runMode": "fast_chat | memory_candidate | knowledge_grounded | high_risk",
   "autonomyMode": "auto | assisted | blocked",
-  "needsReview": true,
+  "needsReview": false,
   "consolidationNeeded": false,
 
   // ── 对话模式（v3 必填，严格枚举） ──

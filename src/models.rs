@@ -2327,7 +2327,7 @@ pub struct DomainProfile {
     /// reviewer 深度开关。所有 `should_reply=true` 的正文都必须经过独立 Reviewer；
     /// `false`（DEFAULT/老库 serde 默认）允许常规低风险回复使用 light Reviewer，
     /// `true` 让纯关系/情感等高敏域强制使用 full Reviewer。该字段不再授权模型以
-    /// `needs_review=false` 跳过审核。运行时经 `UserRuntimeParameters` 同名字段消费。
+    /// `needs_review=false` 跳过审核（该旧语义已禁用）。运行时经 `UserRuntimeParameters` 同名字段消费。
     #[serde(default)]
     pub distrust_self_reported_low_risk: bool,
     /// 客观购买事实增强 G4 #5：本域是否为**交易型域**、决策 prompt 注入产品目录段 +

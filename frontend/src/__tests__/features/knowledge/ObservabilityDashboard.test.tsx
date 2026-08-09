@@ -77,6 +77,66 @@ describe("ObservabilityDashboard catalog envelopes", () => {
     });
   });
 
+  it("展示运行效率真实比率、知识轮数和首要降级原因", async () => {
+    globalThis.fetch = vi.fn(async (url: unknown) => {
+      if (String(url).includes("/admin/observability/performance?hours=24")) {
+        return response(true, {
+          windowHours: 24,
+          operations: {
+            runCount: 10,
+            knowledge: {
+              observedRuns: 8,
+              zeroLocalRelevanceSkips: 3,
+              zeroLocalRelevanceSkipRate: 0.375,
+              agentRuns: 5,
+              rounds: { count: 5, mean: 2.4, p50: 2, p95: 4 },
+            },
+            usage: { unknownUsageRuns: 1, unknownUsageRunRate: 0.1, unknownUsageCalls: 2 },
+            degradation: {
+              degradedRuns: 2,
+              degradedRunRate: 0.2,
+              reasonsTop: [{ reason: "knowledge_agent_stopped_usage_unknown", count: 2 }],
+            },
+          },
+        });
+      }
+      return response(false, {});
+    }) as typeof fetch;
+
+    render(<ObservabilityDashboard />);
+    const card = (await screen.findByText("运行效率（24h）")).closest("article") as HTMLElement;
+    const view = within(card);
+    expect(view.getByText("10")).toBeInTheDocument();
+    expect(view.getByText("8")).toBeInTheDocument();
+    expect(view.getByText("37.5%")).toBeInTheDocument();
+    expect(view.getByText("2.4")).toBeInTheDocument();
+    expect(view.getByText("10.0%")).toBeInTheDocument();
+    expect(view.getByText("运行降级率")).toBeInTheDocument();
+    expect(view.getByText("20.0%")).toBeInTheDocument();
+    expect(view.getByText("knowledge_agent_stopped_usage_unknown (2)")).toBeInTheDocument();
+  });
+
+  it("运行效率无样本时比率显示缺省而不是伪装为零", async () => {
+    globalThis.fetch = vi.fn(async (url: unknown) => {
+      if (String(url).includes("/admin/observability/performance?hours=24")) {
+        return response(true, {
+          operations: {
+            runCount: 0,
+            knowledge: { observedRuns: 0, zeroLocalRelevanceSkipRate: null, rounds: { count: 0, mean: null } },
+            usage: { unknownUsageRuns: 0, unknownUsageRunRate: null },
+            degradation: { degradedRuns: 0, degradedRunRate: null, reasonsTop: [] },
+          },
+        });
+      }
+      return response(false, {});
+    }) as typeof fetch;
+
+    render(<ObservabilityDashboard />);
+    const card = (await screen.findByText("运行效率（24h）")).closest("article") as HTMLElement;
+    expect(within(card).getAllByText("—")).toHaveLength(5);
+    expect(within(card).queryByText("0.0%")).not.toBeInTheDocument();
+  });
+
   it("逐指标展示真实口径并将缺口比率标为历史已解决占比", async () => {
     globalThis.fetch = vi.fn(async (url: unknown) => {
       const path = String(url);

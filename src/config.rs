@@ -33,7 +33,7 @@ pub struct AppConfig {
     pub agent_reply_max_segments: usize,
     /// 并发多消息去抖窗口（毫秒）。用户连发多条时，调度器在收到最后一条后
     /// 等待此窗口再跑一次聚合流水线，把整串消息塌成一次回复（去抖 + 单联系人串行）。
-    /// 默认 4000ms（3-5s 区间中点），clamp 到 [1000, 10000] 防退化忙等 / 误填。
+    /// 默认 2000ms，在连续输入合并与首响速度间取平衡；clamp 到 [1000, 10000]。
     pub message_debounce_window_ms: u64,
     pub task_worker_interval_seconds: u64,
     /// F-013：completeness 缓存 TTL（秒）。默认 300。
@@ -478,7 +478,7 @@ impl AppConfig {
             agent_reply_max_segments: env_or("AGENT_REPLY_MAX_SEGMENTS", "4")
                 .parse::<usize>()?
                 .max(1),
-            message_debounce_window_ms: env_or("MESSAGE_DEBOUNCE_WINDOW_MS", "4000")
+            message_debounce_window_ms: env_or("MESSAGE_DEBOUNCE_WINDOW_MS", "2000")
                 .parse::<u64>()?
                 .clamp(1000, 10_000),
             task_worker_interval_seconds: env_or("TASK_WORKER_INTERVAL_SECONDS", "30").parse()?,
