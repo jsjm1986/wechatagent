@@ -42,7 +42,7 @@ pub use cache::{cache_stats, AnswerCacheStats};
 /// → answer` 正好 4 轮；旧的 `list_catalog → open_chunk → follow_relations → answer`
 /// 链路同样 4 轮。第 5 轮直接强制 answer；与 [`super::RunBudget::max_llm_calls`]
 /// 互不替代——budget 用尽更早跳出循环。
-const MAX_ROUNDS: i32 = 4;
+pub(crate) const MAX_ROUNDS: i32 = 4;
 
 /// `list_catalog` 一次返回 chunk 摘要的硬上限，控制 prompt size。
 const CATALOG_PAGE_SIZE: usize = 30;

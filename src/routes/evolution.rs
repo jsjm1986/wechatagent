@@ -516,7 +516,7 @@ fn baseline_threshold_value(config: &crate::config::AppConfig, gate: &str) -> f6
         "fact_risk_block" => 6.0,
         "pressure_risk_block" => 7.0,
         "human_like_score_rewrite" => 6.0,
-        "emotional_value_rewrite" => 5.0,
+        "emotional_value_rewrite" => 6.0,
         "product_accuracy_score_block" => 7.0,
         "planner_block_rate_threshold" => config.strategic_planner_block_rate_threshold,
         _ => 0.0,
@@ -880,7 +880,7 @@ mod tests {
         );
         assert_eq!(
             baseline_threshold_value(&cfg, "emotional_value_rewrite"),
-            5.0
+            6.0
         );
         assert_eq!(
             baseline_threshold_value(&cfg, "product_accuracy_score_block"),

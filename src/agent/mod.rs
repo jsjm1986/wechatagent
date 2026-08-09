@@ -224,14 +224,22 @@ static LLM_EXACT_CACHE: LazyLock<PlMutex<LruCache<String, Value>>> = LazyLock::n
     ))
 });
 
-fn uses_fast_json(prompt_key: &str) -> bool {
-    matches!(
-        prompt_key,
-        "user.reply.fast.task"
-            | "user.review.system"
-            | "user.review.light.system"
-            | "user.review.claim_gate"
-    )
+// Conservative first limits based on successful production distributions. Fast Reply has a
+// smaller schema than the retired full task, while Reviewer and ClaimGate limits remain above
+// every historical successful response observed before rollout.
+const FAST_REPLY_MAX_OUTPUT_TOKENS: u32 = 8192;
+pub(crate) const LIGHT_REVIEWER_MAX_OUTPUT_TOKENS: u32 = 3072;
+pub(crate) const REVIEWER_MAX_OUTPUT_TOKENS: u32 = 8192;
+const CLAIM_GATE_MAX_OUTPUT_TOKENS: u32 = 1536;
+
+fn critical_path_output_token_limit(prompt_key: &str) -> Option<u32> {
+    match prompt_key {
+        "user.reply.fast.task" => Some(FAST_REPLY_MAX_OUTPUT_TOKENS),
+        "user.review.light.system" => Some(LIGHT_REVIEWER_MAX_OUTPUT_TOKENS),
+        "user.review.system" => Some(REVIEWER_MAX_OUTPUT_TOKENS),
+        "user.review.claim_gate" => Some(CLAIM_GATE_MAX_OUTPUT_TOKENS),
+        _ => None,
+    }
 }
 
 /// Agent 公共 LLM JSON 调用入口。所有子模块（decision / review /
@@ -326,11 +334,22 @@ pub(crate) async fn generate_agent_json(
             return Ok(value);
         }
     }
-    let generated = match (&registry_snapshot, uses_fast_json(prompt_key)) {
-        (Some(snapshot), true) => snapshot.generate_json_with_usage_fast(system, user).await,
-        (Some(snapshot), false) => snapshot.generate_json_with_usage(system, user).await,
-        (None, true) => state.llm.generate_json_with_usage_fast(system, user).await,
-        (None, false) => state.llm.generate_json_with_usage(system, user).await,
+    reserve_current_run_llm_attempt()?;
+    let output_limit = critical_path_output_token_limit(prompt_key);
+    let generated = match (&registry_snapshot, output_limit) {
+        (Some(snapshot), Some(limit)) => {
+            snapshot
+                .generate_json_with_usage_limit(system, user, limit)
+                .await
+        }
+        (Some(snapshot), None) => snapshot.generate_json_with_usage(system, user).await,
+        (None, Some(limit)) => {
+            state
+                .llm
+                .generate_json_with_usage_limit(system, user, limit)
+                .await
+        }
+        (None, None) => state.llm.generate_json_with_usage(system, user).await,
     };
     match generated {
         Ok(result) => {
@@ -338,7 +357,7 @@ pub(crate) async fn generate_agent_json(
             let value = result.value;
             let retry_count_i32 = result.retry_count.min(i32::MAX as u32) as i32;
             // MP-5 / Task 15：累计到当前 run 的 budget。
-            record_current_run_llm_attempt(Some(&usage));
+            record_current_run_reserved_llm_usage(Some(&usage));
             if let Some(key) = cache_key {
                 LLM_EXACT_CACHE.lock().put(key, value.clone());
             }
@@ -373,7 +392,7 @@ pub(crate) async fn generate_agent_json(
             // available. Count the call and make token completeness explicit;
             // otherwise an evaluation could continue after an unmetered failed
             // call and incorrectly report that its budget was still known.
-            record_current_run_llm_attempt(None);
+            record_current_run_reserved_llm_usage(None);
             log_llm_call_failure(
                 state,
                 workspace_id,
@@ -443,6 +462,7 @@ pub(crate) async fn generate_agent_json_streaming(
             )
         })
         .unwrap_or(("injected", state.config.openai_model.as_str()));
+    reserve_current_run_llm_attempt()?;
     let generated = match &registry_snapshot {
         Some(snapshot) => {
             snapshot
@@ -461,7 +481,7 @@ pub(crate) async fn generate_agent_json_streaming(
             let usage = result.usage.clone();
             let value = result.value;
             let retry_count_i32 = result.retry_count.min(i32::MAX as u32) as i32;
-            record_current_run_llm_attempt(Some(&usage));
+            record_current_run_reserved_llm_usage(Some(&usage));
             log_llm_call_success(
                 state,
                 workspace_id,
@@ -489,7 +509,7 @@ pub(crate) async fn generate_agent_json_streaming(
             Ok(value)
         }
         Err(error) => {
-            record_current_run_llm_attempt(None);
+            record_current_run_reserved_llm_usage(None);
             log_llm_call_failure(
                 state,
                 workspace_id,
@@ -527,16 +547,89 @@ pub(crate) async fn generate_agent_json_streaming(
     }
 }
 
-/// Account for one actual upstream LLM attempt in the current task-local run.
-/// A failed attempt has no trustworthy token report, so it is represented as
-/// one call with unknown usage instead of being silently treated as zero.
-fn record_current_run_llm_attempt(usage: Option<&ChatUsage>) {
+/// Reserve one real upstream attempt before dispatch. Cache hits do not call this.
+fn reserve_current_run_llm_attempt() -> AppResult<()> {
+    let Some(budget) = current_run_budget() else {
+        return Ok(());
+    };
+    budget
+        .try_reserve_llm_call()
+        .map_err(|error| AppError::BudgetExceeded {
+            run_id: budget.run_id.clone(),
+            reason: error.to_string(),
+        })
+}
+
+/// Attach usage to a call already reserved before upstream dispatch.
+fn record_current_run_reserved_llm_usage(usage: Option<&ChatUsage>) {
     let Some(budget) = current_run_budget() else {
         return;
     };
     match usage {
-        Some(usage) => budget.record_call_with_usage(usage.total_tokens, usage.is_known()),
-        None => budget.record_call_with_usage(0, false),
+        Some(usage) => budget.record_reserved_call_usage(usage.total_tokens, usage.is_known()),
+        None => budget.record_reserved_call_usage(0, false),
+    }
+}
+
+/// A non-registry provider call (currently the optional second Reviewer) with the same
+/// budget and audit semantics as the primary provider. It intentionally bypasses the exact
+/// response cache because provider diversity is part of the review evidence.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn generate_agent_json_with_provider(
+    state: &AppState,
+    provider: &dyn crate::llm::LlmProvider,
+    provider_model: &str,
+    workspace_id: &str,
+    account_id: Option<&str>,
+    contact_wxid: Option<&str>,
+    run_id: Option<&str>,
+    prompt_key: &str,
+    system: &str,
+    user: &str,
+    max_output_tokens: u32,
+) -> AppResult<Value> {
+    let started_at = DateTime::now();
+    reserve_current_run_llm_attempt()?;
+    match provider
+        .generate_json_with_usage_limit(system, user, max_output_tokens)
+        .await
+    {
+        Ok(result) => {
+            let usage = result.usage.clone();
+            let value = result.value;
+            record_current_run_reserved_llm_usage(Some(&usage));
+            log_llm_call_success(
+                state,
+                workspace_id,
+                account_id,
+                contact_wxid,
+                run_id,
+                prompt_key,
+                result.model,
+                result.latency_ms,
+                &usage,
+                result.retry_count.min(i32::MAX as u32) as i32,
+                started_at,
+            )
+            .await;
+            Ok(value)
+        }
+        Err(error) => {
+            record_current_run_reserved_llm_usage(None);
+            log_llm_call_failure(
+                state,
+                workspace_id,
+                account_id,
+                contact_wxid,
+                run_id,
+                prompt_key,
+                provider_model,
+                &error,
+                started_at,
+            )
+            .await;
+            Err(error)
+        }
     }
 }
 
@@ -753,6 +846,34 @@ mod tests {
     }
 
     #[test]
+    fn critical_path_output_limits_are_prompt_scoped() {
+        assert_eq!(
+            super::critical_path_output_token_limit("user.reply.fast.task"),
+            Some(super::FAST_REPLY_MAX_OUTPUT_TOKENS)
+        );
+        assert_eq!(
+            super::critical_path_output_token_limit("user.review.light.system"),
+            Some(super::LIGHT_REVIEWER_MAX_OUTPUT_TOKENS)
+        );
+        assert_eq!(
+            super::critical_path_output_token_limit("user.review.system"),
+            Some(super::REVIEWER_MAX_OUTPUT_TOKENS)
+        );
+        assert_eq!(
+            super::critical_path_output_token_limit("user.review.claim_gate"),
+            Some(super::CLAIM_GATE_MAX_OUTPUT_TOKENS)
+        );
+        for key in [
+            "user.reply.task",
+            "user.projection.task",
+            "knowledge.import.preview",
+            "memory.consolidate",
+        ] {
+            assert_eq!(super::critical_path_output_token_limit(key), None, "{key}");
+        }
+    }
+
+    #[test]
     fn reaction_outcome_prefers_model_status() {
         let analysis = doc! {
             "outcomeStatus": "user_replied_continue_exploring",
@@ -778,26 +899,6 @@ mod tests {
         let doc = runtime().as_document();
         assert_eq!(doc.get_i32("factRiskBlockAt").unwrap(), 6);
         assert_eq!(doc.get_i64("maxDailyTouches").unwrap(), 3);
-    }
-
-    #[test]
-    fn fast_json_is_limited_to_reply_and_review_prompts() {
-        for prompt_key in [
-            "user.reply.fast.task",
-            "user.review.system",
-            "user.review.light.system",
-            "user.review.claim_gate",
-        ] {
-            assert!(super::uses_fast_json(prompt_key), "{prompt_key}");
-        }
-        for prompt_key in [
-            "user.reply.task",
-            "user.projection.task",
-            "memory.consolidate",
-            "knowledge.import.preview",
-        ] {
-            assert!(!super::uses_fast_json(prompt_key), "{prompt_key}");
-        }
     }
 
     #[test]
@@ -1201,7 +1302,8 @@ mod tests {
         let budget = std::sync::Arc::new(RunBudget::new("run_failed", 1000, 3, i32::MAX));
         RUN_BUDGET
             .scope(budget.clone(), async {
-                super::record_current_run_llm_attempt(None);
+                super::reserve_current_run_llm_attempt().unwrap();
+                super::record_current_run_reserved_llm_usage(None);
             })
             .await;
         let snap = budget.snapshot();
@@ -1220,7 +1322,8 @@ mod tests {
         };
         RUN_BUDGET
             .scope(budget.clone(), async {
-                super::record_current_run_llm_attempt(Some(&usage));
+                super::reserve_current_run_llm_attempt().unwrap();
+                super::record_current_run_reserved_llm_usage(Some(&usage));
             })
             .await;
         let snap = budget.snapshot();

@@ -145,14 +145,14 @@ pub(crate) async fn generate_holding_reply(
         run_id.clone(),
         state.config.holding_reply_token_budget,
         2,
-        0, // 不用工具
+        i32::MAX, // 本路径不调用工具；aggregate is_exceeded 不应把“禁用工具”误判为已耗尽
     ));
     let system = holding_reply_system_prompt(scene);
     let user = "请只输出 JSON。";
     let gen = async {
         // 预算已耗尽（理论上新预算不会，但保持与既有降级点一致的防御）→ 回落。
         if current_run_budget()
-            .map(|b| b.is_exceeded())
+            .map(|b| b.is_llm_or_token_exhausted())
             .unwrap_or(false)
         {
             return None;

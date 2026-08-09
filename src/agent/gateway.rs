@@ -55,8 +55,8 @@ use super::guards::{
 };
 use super::knowledge_router::{
     empty_knowledge_route, load_operation_knowledge, maybe_emit_unverified_warning,
-    route_operation_knowledge, route_used_knowledge_ids, select_operation_knowledge_chunks,
-    write_knowledge_usage_log,
+    route_operation_knowledge, route_operation_knowledge_for_existing_candidate,
+    route_used_knowledge_ids, select_operation_knowledge_chunks, write_knowledge_usage_log,
 };
 use super::memory::{
     contact_memory_consolidation_due, effective_memory_card, effective_memory_card_for_contact,
@@ -364,7 +364,37 @@ pub async fn send_contact_message_gateway(
     )
     .await?;
 
-    let execution = send_contact_message_gateway_inner(state, contact, request, run_id.clone());
+    let execution = async {
+        let domain_config = load_user_operation_domain_config_for_contact(
+            state,
+            &contact.workspace_id,
+            &contact.wxid,
+        )
+        .await?;
+        let mut runtime = UserRuntimeParameters::from_config(domain_config.as_ref(), state);
+        crate::agent::runtime::resolve_thresholds(state, &contact)
+            .await?
+            .apply_to_runtime(&mut runtime);
+        let budget = Arc::new(RunBudget::new(
+            run_id.clone(),
+            runtime.run_token_budget,
+            runtime.run_max_llm_calls,
+            runtime.knowledge_max_tool_calls,
+        ));
+        RUN_BUDGET
+            .scope(
+                budget,
+                send_contact_message_gateway_inner(
+                    state,
+                    contact,
+                    request,
+                    run_id.clone(),
+                    domain_config,
+                    runtime,
+                ),
+            )
+            .await
+    };
     settle_gateway_execution(state, &run_id, execution, None).await
 }
 
@@ -594,19 +624,12 @@ async fn send_contact_message_gateway_inner(
     contact: Contact,
     request: ManualContactSend,
     run_id: String,
+    domain_config: Option<crate::models::OperationDomainConfig>,
+    runtime: UserRuntimeParameters,
 ) -> AppResult<ContactSendResult> {
     super::run_audit::mark_manual();
     let content = request.content.trim().to_string();
     let source_event_id = format!("manual:{run_id}");
-    let domain_config =
-        load_user_operation_domain_config_for_contact(state, &contact.workspace_id, &contact.wxid)
-            .await?;
-    let mut runtime = UserRuntimeParameters::from_config(domain_config.as_ref(), state);
-    // M4 W4 Task 5.1：通过 resolve_thresholds 把 threshold_overrides 的最新生效值
-    // 写回 runtime，5 闸 block/rewrite 阈值即时反映 release。
-    crate::agent::runtime::resolve_thresholds(state, &contact)
-        .await?
-        .apply_to_runtime(&mut runtime);
     let synthetic_inbound = ConversationMessage {
         id: None,
         workspace_id: contact.workspace_id.clone(),
@@ -677,11 +700,16 @@ async fn send_contact_message_gateway_inner(
         &initial_operation_state_key(domain_config.as_ref()),
     )
     .to_document();
+    // Knowledge relevance must be computed from the proposed outbound body,
+    // not from the fixed administrative control sentence. Keep the latter for
+    // precheck/audit semantics and use this isolated copy only for retrieval.
+    let mut knowledge_inbound = synthetic_inbound.clone();
+    knowledge_inbound.content = content.clone();
     // 产品目录与知识 Agent 路由互不依赖；在堆分配 helper 中并行执行并复用快照。
-    let route_future = route_operation_knowledge(
+    let route_future = route_operation_knowledge_for_existing_candidate(
         state,
         &contact,
-        &synthetic_inbound,
+        &knowledge_inbound,
         &context_messages,
         &memory,
         &context_pack,
@@ -2208,16 +2236,15 @@ fn run_user_operation_gateway_inner<'a>(
         reason: "Reply Agent 内联判断运行链路，普通消息不再前置 Planner".to_string(),
         ..Default::default()
     };
-    // ── WB5：永远先跑知识路由（删除原 decision_requires_knowledge short-circuit）───
+    // ── WB5：Reply 前置知识路由；零本地相关度时走确定性轻量短路 ──
     //
     // ISSUE-012 根因：旧链路是先让 Reply Agent 在没知识的情况下盲跑一遍、
     // 再据 knowledgeNeed 决定是否打开知识库——第一遍的寒暄态本身就让
     // knowledgeNeed=not_required，知识库永远进不来。
     //
-    // 新链路：每轮都先跑 route_operation_knowledge（含硬关键词快路径），
-    // Reply Agent 直接拿着真实知识做 single-pass 决策。预算超额时退化成
-    // empty_knowledge_route 但不再回退到旧的两段式。成本：每轮 +1 LLM call
-    // ≈ +800 tokens / inbound，已经预留在 RunBudget。
+    // 新链路：先做 verified 语料本地相关度预筛；零相关的普通关系轮直接跳过
+    // 多轮 Knowledge Agent，有任何相关信号、手工验证或 synthetic relay 时仍走完整
+    // citation 路径。Reply Agent 单程消费结果；预算超额时仍保守退化为空知识。
     // 产品目录与最长可达 4 轮的知识路由在堆分配 helper 中并行预取。
     let business_inputs = load_gateway_business_inputs(
         state,
@@ -2355,6 +2382,9 @@ fn run_user_operation_gateway_inner<'a>(
                 // blocked_by_budget 拦回复。tokens_used 仍如实累计,只放宽判定上限。
                 if let Some(b) = current_run_budget() {
                     b.grant_escalated_ceiling(runtime.run_token_budget_escalated);
+                    // One additional Reply generation; the base tail already preserves
+                    // Reviewer + ClaimGate (and optional dual Reviewer).
+                    b.grant_additional_llm_calls(1);
                 }
                 decide_reply_with_promote(
                     state,
@@ -2517,7 +2547,6 @@ fn run_user_operation_gateway_inner<'a>(
         "lean"
     };
     super::run_audit::mark_tier(tier_used);
-    super::run_audit::mark_tier(tier_used);
     write_event_for_account(
         state,
         &contact.workspace_id,
@@ -2595,7 +2624,7 @@ fn run_user_operation_gateway_inner<'a>(
     let run_budget = current_run_budget();
     let budget_exceeded_for_review = run_budget
         .as_ref()
-        .map(|b| b.is_exceeded())
+        .map(|b| b.is_llm_or_token_exhausted())
         .unwrap_or(false);
     let local_budget_fallback;
     let local_budget_ref: &RunBudget = match run_budget.as_ref() {
@@ -2662,8 +2691,12 @@ fn run_user_operation_gateway_inner<'a>(
         // 让本分支只接住 hallucination / grounding 硬闸（reviewer 自己也会
         // 在硬闸失败时写非空 rewrite_instruction）。
         // MP-5 / Task 15：rewrite 之前再检查预算；超额时跳过 rewrite，直接走拦截路径。
+        if let Some(budget) = current_run_budget() {
+            let stage_bundle = 4 + i32::from(state.second_reviewer_llm.is_some());
+            budget.grant_additional_llm_calls(stage_bundle);
+        }
         let budget_exceeded_for_rewrite = current_run_budget()
-            .map(|b| b.is_exceeded())
+            .map(|b| b.is_llm_or_token_exhausted())
             .unwrap_or(false);
         if budget_exceeded_for_rewrite {
             if let Some(b) = current_run_budget() {
@@ -2856,8 +2889,18 @@ fn run_user_operation_gateway_inner<'a>(
     let mut revision_reason = String::new();
     let mut pre_revision_summary: Option<String> = None;
     let mut post_revision_summary: Option<String> = None;
+    if matches!(finalize_status, GatewayStatusFinal::Approved)
+        && review.needs_revision
+        && !review.should_hold
+        && !review.revision_direction.trim().is_empty()
+    {
+        if let Some(budget) = current_run_budget() {
+            let stage_bundle = 4 + i32::from(state.second_reviewer_llm.is_some());
+            budget.grant_additional_llm_calls(stage_bundle);
+        }
+    }
     let budget_exceeded_for_revision = current_run_budget()
-        .map(|b| b.is_exceeded())
+        .map(|b| b.is_llm_or_token_exhausted())
         .unwrap_or(false);
 
     // Phase D / D2：首轮完整 Reviewer / ClaimGate 已通过后，仅观测结构风格漂移。

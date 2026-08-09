@@ -1039,7 +1039,7 @@ pub(crate) enum RevisionDecision {
 /// 调用方典型用法（gateway.rs）：
 /// ```text
 /// let budget_exceeded = current_run_budget()
-///     .map(|b| b.is_exceeded())
+///     .map(|b| b.is_llm_or_token_exhausted())
 ///     .unwrap_or(false);
 /// match decide_revision(&finalize_status, &review, budget_exceeded) {
 ///     RevisionDecision::NotEligible => { /* 跳过 R2 块 */ }
@@ -1055,7 +1055,7 @@ pub(crate) enum RevisionDecision {
 /// * `finalize_status`：第一轮 finalize 终态；只有 `Approved` 才进入 R2；
 /// * `review`：finalize 后的 review，读 `needs_revision / should_hold /
 ///   revision_direction`；
-/// * `budget_exceeded`：调用方根据 `RunBudget::is_exceeded()` 计算的快照
+/// * `budget_exceeded`：调用方根据 `RunBudget::is_llm_or_token_exhausted()` 计算的快照
 ///   （task-local，不在纯函数内读取）。
 pub(crate) fn decide_revision(
     finalize_status: &GatewayStatusFinal,

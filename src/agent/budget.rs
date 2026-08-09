@@ -30,6 +30,8 @@ use parking_lot::Mutex as PlMutex;
 pub enum BudgetError {
     /// `tool_calls_used >= tool_call_budget`：任何后续 tool call SHALL
     /// 立即返回 `budget_exceeded` 而不实际执行（R4.3）。
+    #[error("llm call budget exceeded: llm_calls_used={used} >= max_llm_calls={budget}")]
+    LlmCallLimitReached { used: i32, budget: i32 },
     #[error("tool_call budget exceeded: tool_calls_used={used} >= tool_call_budget={budget}")]
     ToolCallsExceeded { used: i32, budget: i32 },
     /// `tokens_used + tokens_consumed > token_budget`：本次 tool call 想
@@ -76,6 +78,11 @@ pub struct RunBudget {
     /// 效果 = 抬高 is_exceeded/record_tool_call 判定用的 token 上限，**不**改
     /// tokens_used 真实累计。只在 gateway 升档分支经 grant_escalated_ceiling 授予。
     pub escalation_bonus: PlMutex<i64>,
+    /// Extra LLM slots granted only when the gateway intentionally enters an
+    /// additional generation/review stage (tier escalation, rewrite, revision).
+    /// Base policy remains visible through `max_llm_calls`; this bonus is bounded
+    /// by explicit stage grants and never hides actual usage.
+    pub llm_call_bonus: PlMutex<i32>,
     pub degraded_reasons: PlMutex<Vec<String>>,
     /// 本 run 实际装载的 prompt 版本。Shadow override 等运行期改写可能与随后查询到的
     /// canonical current 不同，因此审计仍沿调用链记录真实命中值。
@@ -100,6 +107,7 @@ impl RunBudget {
             unknown_usage_calls: PlMutex::new(0),
             tool_calls_used: PlMutex::new(0),
             escalation_bonus: PlMutex::new(0),
+            llm_call_bonus: PlMutex::new(0),
             degraded_reasons: PlMutex::new(Vec::new()),
             prompt_versions: PlMutex::new(Document::new()),
         }
@@ -117,16 +125,56 @@ impl RunBudget {
         self.record_call_with_usage(tokens, true);
     }
 
-    /// Record an LLM call while preserving whether token usage was reported.
-    /// Unknown usage never masquerades as zero and never fabricates an
-    /// estimate. It is tracked independently for audit and optional-call
-    /// gating; hard token-overrun semantics remain based on reported tokens.
+    /// Record a synthetic/already-completed call. Production upstream calls use
+    /// `try_reserve_llm_call` before dispatch and `record_reserved_call_usage`
+    /// after completion, so concurrent calls cannot overshoot the hard cap.
     pub fn record_call_with_usage(&self, tokens: i64, usage_known: bool) {
-        *self.tokens_used.lock() += tokens.max(0);
         *self.llm_calls_used.lock() += 1;
+        self.record_reserved_call_usage(tokens, usage_known);
+    }
+
+    /// Atomically reserve one upstream LLM attempt before network dispatch.
+    pub fn try_reserve_llm_call(&self) -> Result<(), BudgetError> {
+        let effective = self.effective_max_llm_calls();
+        let mut calls = self.llm_calls_used.lock();
+        if *calls >= effective {
+            return Err(BudgetError::LlmCallLimitReached {
+                used: *calls,
+                budget: effective,
+            });
+        }
+        *calls += 1;
+        Ok(())
+    }
+
+    /// Complete a previously reserved attempt without incrementing call count again.
+    pub fn record_reserved_call_usage(&self, tokens: i64, usage_known: bool) {
+        *self.tokens_used.lock() += tokens.max(0);
         if !usage_known {
             *self.unknown_usage_calls.lock() += 1;
         }
+    }
+
+    pub fn effective_max_llm_calls(&self) -> i32 {
+        self.max_llm_calls
+            .saturating_add(*self.llm_call_bonus.lock())
+            .max(0)
+    }
+
+    /// Grant exactly the additional stage capacity selected by gateway control flow.
+    pub fn grant_additional_llm_calls(&self, calls: i32) {
+        if calls > 0 {
+            let mut bonus = self.llm_call_bonus.lock();
+            *bonus = bonus.saturating_add(calls);
+        }
+    }
+
+    /// Calls available to optional work after preserving a required tail.
+    pub fn available_llm_calls_before_tail(&self, reserved_tail: i32) -> i32 {
+        self.effective_max_llm_calls()
+            .saturating_sub(*self.llm_calls_used.lock())
+            .saturating_sub(reserved_tail.max(0))
+            .max(0)
     }
 
     /// B-1 修复：把本 run 的有效 token gating 上限抬到 `max(token_budget, escalated_total)`。
@@ -174,16 +222,20 @@ impl RunBudget {
         Ok(())
     }
 
-    /// agent-autonomy-loop W3 / Task 4.1：在原 token / LLM 双维度的
-    /// "超额"判定基础上，叠加 tool_calls 维度——任一硬上限达到即视为
-    /// 超额，触发降级路径（跳过 review / rewrite / 二次知识路由）。
-    pub fn is_exceeded(&self) -> bool {
-        // escalation_bonus 在独立语句里取值并立即释放，再取 tokens_used 锁——
-        // 避免与 record_tool_call 的 tokens→tool_calls 锁顺序形成环。
+    /// Whether no further LLM stage may start because the token or LLM-call
+    /// ceiling has been reached. Tool quota is deliberately excluded: exhausting
+    /// knowledge tools must not suppress a mandatory Reviewer or ClaimGate that
+    /// already has reserved LLM capacity.
+    pub fn is_llm_or_token_exhausted(&self) -> bool {
         let effective_token_budget = self.token_budget + *self.escalation_bonus.lock();
         *self.tokens_used.lock() >= effective_token_budget
-            || *self.llm_calls_used.lock() >= self.max_llm_calls
-            || *self.tool_calls_used.lock() >= self.tool_call_budget
+            || *self.llm_calls_used.lock() >= self.effective_max_llm_calls()
+    }
+
+    /// Aggregate budget state for optional work that may consume either LLM or
+    /// knowledge-tool capacity. Any reached dimension stops that optional work.
+    pub fn is_exceeded(&self) -> bool {
+        self.is_llm_or_token_exhausted() || *self.tool_calls_used.lock() >= self.tool_call_budget
     }
 
     /// Stop additive LLM work when the hard budget is exhausted or token
@@ -222,6 +274,7 @@ impl RunBudget {
             unknown_usage_calls: *self.unknown_usage_calls.lock(),
             tool_calls_used: *self.tool_calls_used.lock(),
             escalation_bonus: *self.escalation_bonus.lock(),
+            llm_call_bonus: *self.llm_call_bonus.lock(),
             degraded_reasons: self.degraded_reasons.lock().clone(),
             prompt_versions: self.prompt_versions.lock().clone(),
         }
@@ -241,6 +294,7 @@ pub struct RunBudgetSnapshot {
     pub unknown_usage_calls: i32,
     pub tool_calls_used: i32,
     pub escalation_bonus: i64,
+    pub llm_call_bonus: i32,
     pub degraded_reasons: Vec<String>,
     pub prompt_versions: Document,
 }
@@ -295,6 +349,51 @@ mod tests {
     //! 的既有测试 + 这里的 tool_calls_used 上限测试共同覆盖。
 
     use super::{BudgetError, RunBudget};
+
+    #[test]
+    fn llm_reservation_is_atomic_and_never_overshoots_cap() {
+        let budget = std::sync::Arc::new(RunBudget::new("run_atomic", 10_000, 3, 16));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let mut workers = Vec::new();
+        for _ in 0..8 {
+            let budget = budget.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                budget.try_reserve_llm_call().is_ok()
+            }));
+        }
+        let accepted = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .filter(|accepted| *accepted)
+            .count();
+        assert_eq!(accepted, 3);
+        assert_eq!(budget.snapshot().llm_calls_used, 3);
+        assert!(budget.try_reserve_llm_call().is_err());
+    }
+
+    #[test]
+    fn optional_work_respects_required_tail_and_explicit_stage_grants() {
+        let budget = RunBudget::new("run_tail", 10_000, 6, 16);
+        assert_eq!(budget.available_llm_calls_before_tail(4), 2);
+        budget.try_reserve_llm_call().unwrap();
+        assert_eq!(budget.available_llm_calls_before_tail(4), 1);
+        budget.grant_additional_llm_calls(1);
+        assert_eq!(budget.effective_max_llm_calls(), 7);
+        assert_eq!(budget.available_llm_calls_before_tail(4), 2);
+        assert_eq!(budget.snapshot().llm_call_bonus, 1);
+    }
+
+    #[test]
+    fn reserved_usage_does_not_double_count_the_call() {
+        let budget = RunBudget::new("run_usage", 10_000, 2, 16);
+        budget.try_reserve_llm_call().unwrap();
+        budget.record_reserved_call_usage(123, true);
+        let snapshot = budget.snapshot();
+        assert_eq!(snapshot.llm_calls_used, 1);
+        assert_eq!(snapshot.tokens_used, 123);
+    }
 
     #[test]
     fn record_tool_call_increments_both_counters_on_success() {
@@ -363,6 +462,23 @@ mod tests {
             budget.is_exceeded(),
             "tool_calls_used 1 >= tool_call_budget 1 SHALL trigger is_exceeded"
         );
+    }
+
+    #[test]
+    fn tool_cap_stops_optional_work_but_preserves_required_llm_tail() {
+        let budget = RunBudget::new("run_required_tail", 1_000_000, 4, 1);
+        budget.record_tool_call(0).unwrap();
+        assert!(
+            budget.is_exceeded(),
+            "aggregate optional-work budget is exhausted"
+        );
+        assert!(
+            !budget.is_llm_or_token_exhausted(),
+            "tool quota alone must not suppress mandatory Reviewer/ClaimGate"
+        );
+        budget.try_reserve_llm_call().unwrap();
+        budget.try_reserve_llm_call().unwrap();
+        assert!(!budget.is_llm_or_token_exhausted());
     }
 
     #[test]

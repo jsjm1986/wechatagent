@@ -383,8 +383,9 @@ pub async fn enqueue(state: &AppState, req: EnqueueRequest) -> Result<EnqueueOut
                 }),
             )
             .await;
-            // The row is durable before this process-local signal. MongoDB and the periodic scan
-            // remain the source of truth and recovery path if the signal is lost.
+            // The Mongo row is already durable and its creation audit has been attempted. Wake
+            // the process-local dispatcher now; the periodic scan remains the fallback if this
+            // signal is lost or another process performed the insert.
             super::outbox_dispatcher::notify_outbox_work();
             Ok(EnqueueOutcome::Created {
                 outbox_id,

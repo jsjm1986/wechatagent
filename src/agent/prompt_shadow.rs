@@ -558,7 +558,7 @@ async fn prepare_prompt_shadow(
         Some(run_id),
     )
     .await?;
-    if budget.is_exceeded() {
+    if budget.is_llm_or_token_exhausted() {
         return Ok(None);
     }
     let selected_chunks =
@@ -587,7 +587,7 @@ async fn run_prompt_shadow_branch(
     budget: Arc<RunBudget>,
     prompt_override: &PromptOverride,
 ) -> AppResult<Result<PromptBranchEvidence, PromptBranchFailure>> {
-    if budget.is_exceeded() {
+    if budget.is_llm_or_token_exhausted() {
         return Ok(Err(PromptBranchFailure::BudgetExceeded));
     }
     let (mut decision, promote_risks) = decide_reply_with_promote(
@@ -624,7 +624,7 @@ async fn run_prompt_shadow_branch(
     normalize_decision_runtime(&mut decision, &planner);
     decision.context_pack_version = Some(next_memory_card_version(&prepared.memory));
     decision.used_knowledge_ids = route_used_knowledge_ids(&prepared.knowledge_route);
-    if budget.is_exceeded() {
+    if budget.is_llm_or_token_exhausted() {
         return Ok(Err(PromptBranchFailure::BudgetExceeded));
     }
     let review = review_decision(
@@ -649,9 +649,6 @@ async fn run_prompt_shadow_branch(
     .await?;
     if !prompt_override.was_applied() {
         return Ok(Err(PromptBranchFailure::TargetNotApplied));
-    }
-    if budget.is_exceeded() {
-        return Ok(Err(PromptBranchFailure::BudgetExceeded));
     }
     let finalized = finalize_shadow_decision(
         state,

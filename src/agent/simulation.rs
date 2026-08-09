@@ -214,7 +214,7 @@ async fn simulate_user_dialogue_inner(
         normalize_decision_runtime(&mut decision, &planner);
         decision.context_pack_version = Some(next_memory_card_version(&memory));
         decision.used_knowledge_ids = route_used_knowledge_ids(&knowledge_route);
-        let review = if budget.is_exceeded() {
+        let review = if budget.is_llm_or_token_exhausted() {
             budget.mark_degraded("simulation_review_skipped_budget_exceeded");
             local_decision_review(&decision, &budget, &runtime)
         } else {

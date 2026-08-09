@@ -1973,6 +1973,37 @@ interface MetricScope {
   updatedAt?: string | null;
 }
 
+interface PerformanceSummaryResponse {
+  windowHours?: number;
+  truncated?: boolean;
+  operations?: {
+    runCount?: number;
+    knowledge?: {
+      observedRuns?: number;
+      zeroLocalRelevanceSkips?: number;
+      zeroLocalRelevanceSkipRate?: number | null;
+      agentRuns?: number;
+      rounds?: { count?: number; mean?: number | null; p50?: number | null; p95?: number | null };
+    };
+    usage?: {
+      unknownUsageRuns?: number;
+      unknownUsageRunRate?: number | null;
+      unknownUsageCalls?: number;
+    };
+    degradation?: {
+      degradedRuns?: number;
+      degradedRunRate?: number | null;
+      reasonsTop?: Array<{ reason: string; count: number }>;
+    };
+    // Compatibility with servers deployed before the metric was accurately renamed.
+    budget?: {
+      degradedRuns?: number;
+      degradedRunRate?: number | null;
+      reasonsTop?: Array<{ reason: string; count: number }>;
+    };
+  };
+}
+
 interface PhaseRollupResponse {
   asOf?: string | null;
   metricScopes?: {
@@ -2322,6 +2353,7 @@ export function ObservabilityDashboard() {
   } | null>(null);
   const [phaseRollup, setPhaseRollup] = useState<PhaseRollupResponse | null>(null);
   const [workerHealth, setWorkerHealth] = useState<WorkerHealthResponse | null>(null);
+  const [performanceSummary, setPerformanceSummary] = useState<PerformanceSummaryResponse | null>(null);
   const [behaviorMetrics, setBehaviorMetrics] = useState<{
     items?: Array<{
       date?: string;
@@ -2342,6 +2374,7 @@ export function ObservabilityDashboard() {
     // A failed refresh must not leave the previous snapshot looking current.
     setCatalog(null);
     setCatalogLive(null);
+    setPerformanceSummary(null);
     // 逐端点隔离:任一失败只让对应卡片空缺,不再整页全黑(此前 Promise.all + 无 r.ok 检查,
     // 任一端点 500/返回 HTML 即 JSON 解析抛错,八张卡全没)。
     async function safe<T>(url: string): Promise<T | null> {
@@ -2354,7 +2387,7 @@ export function ObservabilityDashboard() {
       }
     }
     try {
-      const [aRaw, bRaw, c, d, e, f, g, h, i] = await Promise.allSettled([
+      const [aRaw, bRaw, c, d, e, f, g, h, i, j] = await Promise.allSettled([
         safe<unknown>("/api/operation-knowledge/catalog/persisted"),
         safe<unknown>("/api/operation-knowledge/catalog"),
         safe<unknown>("/api/operation-knowledge/completeness"),
@@ -2364,6 +2397,7 @@ export function ObservabilityDashboard() {
         safe<typeof phaseRollup>("/api/admin/observability/phase-rollup"),
         safe<typeof workerHealth>("/api/admin/observability/worker-health"),
         safe<typeof behaviorMetrics>("/api/behavior-signal-metrics?limit=14"),
+        safe<PerformanceSummaryResponse>("/api/admin/observability/performance?hours=24"),
       ]).then((rs) => rs.map((r) => (r.status === "fulfilled" ? r.value : null)));
       const a = parseCatalogPersistedView(aRaw);
       const b = parseCatalogLiveView(bRaw);
@@ -2376,7 +2410,8 @@ export function ObservabilityDashboard() {
       if (g) setPhaseRollup(g as typeof phaseRollup);
       if (h) setWorkerHealth(h as typeof workerHealth);
       if (i) setBehaviorMetrics(i as typeof behaviorMetrics);
-      const failed = [a, b, c, d, e, f, g, h, i].filter((x) => x === null).length;
+      if (j) setPerformanceSummary(j as PerformanceSummaryResponse);
+      const failed = [a, b, c, d, e, f, g, h, i, j].filter((x) => x === null).length;
       if (failed > 0) setError(`${failed} 项诊断数据加载失败，其余正常显示`);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -2524,6 +2559,46 @@ export function ObservabilityDashboard() {
                 : "—"}
             </dd>
           </dl>
+        </article>
+
+        <article className="wikiObservabilityCard">
+          <header className="wikiObservabilityCardHead">
+            <span className="wikiArchiveTag">run-efficiency</span>
+            <h4>运行效率（24h）</h4>
+          </header>
+          {performanceSummary ? (() => {
+            const operations = performanceSummary.operations;
+            const knowledge = operations?.knowledge;
+            const usage = operations?.usage;
+            const degradation = operations?.degradation ?? operations?.budget;
+            const topReason = degradation?.reasonsTop?.[0];
+            const percent = (value?: number | null) =>
+              typeof value === "number" ? `${(value * 100).toFixed(1)}%` : "—";
+            return (
+              <dl className="wikiArchiveMeta">
+                <dt>运行样本</dt>
+                <dd>{operations?.runCount ?? 0}</dd>
+                <dt>知识观测样本</dt>
+                <dd>{knowledge?.observedRuns ?? 0}</dd>
+                <dt>零相关短路率</dt>
+                <dd>{percent(knowledge?.zeroLocalRelevanceSkipRate)}</dd>
+                <dt>知识 Agent 平均轮数</dt>
+                <dd>{typeof knowledge?.rounds?.mean === "number" ? knowledge.rounds.mean.toFixed(1) : "—"}</dd>
+                <dt>未知 usage 运行率</dt>
+                <dd className={(usage?.unknownUsageRuns ?? 0) > 0 ? "wikiObservabilityDrift" : undefined}>
+                  {percent(usage?.unknownUsageRunRate)}
+                </dd>
+                <dt>运行降级率</dt>
+                <dd className={(degradation?.degradedRuns ?? 0) > 0 ? "wikiObservabilityDrift" : undefined}>
+                  {percent(degradation?.degradedRunRate)}
+                </dd>
+                <dt>首要降级原因</dt>
+                <dd title={topReason?.reason}>{topReason ? `${topReason.reason} (${topReason.count})` : "—"}</dd>
+              </dl>
+            );
+          })() : (
+            <div className="wikiEmpty">暂无运行效率数据</div>
+          )}
         </article>
 
         <article className="wikiObservabilityCard">

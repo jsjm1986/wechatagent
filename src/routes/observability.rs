@@ -166,6 +166,9 @@ pub(super) async fn performance_summary(
             "gateway_result.performance": 1,
             "llm_calls_used": 1,
             "tokens_used": 1,
+            "unknown_usage_calls": 1,
+            "degraded_reasons": 1,
+            "knowledge_route.toolTrace": 1,
         })
         .sort(doc! { "created_at": -1 })
         .limit(PERFORMANCE_MAX_ROWS)
@@ -178,6 +181,7 @@ pub(super) async fn performance_summary(
     }
     let truncated = rows.len() as i64 == PERFORMANCE_MAX_ROWS;
     let summary = aggregate_performance_rows(&rows);
+    let operations = aggregate_operation_rows(&rows);
 
     Ok(Json(json!({
         "asOf": datetime_string(as_of_ms),
@@ -189,6 +193,7 @@ pub(super) async fn performance_summary(
         "truncated": truncated,
         "overall": summary.0,
         "byPath": summary.1,
+        "operations": operations,
     })))
 }
 
@@ -207,6 +212,138 @@ fn aggregate_performance_rows(rows: &[Document]) -> (Value, Value) {
         .map(|(path, bucket)| (path, bucket.into_summary_value()))
         .collect::<serde_json::Map<String, Value>>();
     (overall.into_summary_value(), Value::Object(by_path))
+}
+
+#[derive(Default)]
+struct OperationMetrics {
+    run_count: i64,
+    knowledge_observed_runs: i64,
+    zero_local_relevance_skips: i64,
+    knowledge_agent_runs: i64,
+    knowledge_rounds: Vec<i64>,
+    unknown_usage_runs: i64,
+    unknown_usage_calls: i64,
+    degraded_runs: i64,
+    degraded_reason_counts: std::collections::BTreeMap<String, i64>,
+}
+
+impl OperationMetrics {
+    fn push(&mut self, row: &Document) {
+        self.run_count += 1;
+
+        let unknown = document_i64(row, "unknown_usage_calls")
+            .unwrap_or_default()
+            .max(0);
+        self.unknown_usage_calls = self.unknown_usage_calls.saturating_add(unknown);
+        if unknown > 0 {
+            self.unknown_usage_runs += 1;
+        }
+
+        let reasons = row
+            .get_array("degraded_reasons")
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(Bson::as_str)
+            .map(str::trim)
+            .filter(|reason| !reason.is_empty())
+            .collect::<std::collections::BTreeSet<_>>();
+        if !reasons.is_empty() {
+            self.degraded_runs += 1;
+        }
+        for reason in reasons {
+            *self
+                .degraded_reason_counts
+                .entry(reason.to_string())
+                .or_default() += 1;
+        }
+
+        let Some(route) = row.get_document("knowledge_route").ok() else {
+            return;
+        };
+        let Some(trace) = route.get_array("toolTrace").ok() else {
+            return;
+        };
+        if trace.is_empty() {
+            return;
+        }
+        self.knowledge_observed_runs += 1;
+        let mut max_round = 0_i64;
+        let mut zero_local_skip = false;
+        for entry in trace.iter().filter_map(Bson::as_document) {
+            max_round = max_round
+                .max(document_i64(entry, "round").unwrap_or_default())
+                .max(document_i64(entry, "rounds").unwrap_or_default());
+            if entry.get_str("tool").ok() == Some("knowledge.skip")
+                && entry.get_str("reason").ok() == Some("zero_local_relevance")
+            {
+                zero_local_skip = true;
+            }
+        }
+        if zero_local_skip {
+            self.zero_local_relevance_skips += 1;
+        }
+        if max_round > 0 {
+            self.knowledge_agent_runs += 1;
+            self.knowledge_rounds.push(max_round);
+        }
+    }
+
+    fn into_value(mut self) -> Value {
+        let knowledge_skip_rate = ratio_or_none(
+            self.zero_local_relevance_skips,
+            self.knowledge_observed_runs,
+        );
+        let unknown_usage_run_rate = ratio_or_none(self.unknown_usage_runs, self.run_count);
+        let degraded_run_rate = ratio_or_none(self.degraded_runs, self.run_count);
+        let mut reasons = self
+            .degraded_reason_counts
+            .into_iter()
+            .collect::<Vec<(String, i64)>>();
+        reasons.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
+        let reasons_top = reasons
+            .into_iter()
+            .take(10)
+            .map(|(reason, count)| json!({ "reason": reason, "count": count }))
+            .collect::<Vec<_>>();
+        let degradation = json!({
+            "degradedRuns": self.degraded_runs,
+            "degradedRunRate": degraded_run_rate,
+            "reasonsTop": reasons_top,
+        });
+        json!({
+            "runCount": self.run_count,
+            "knowledge": {
+                "observedRuns": self.knowledge_observed_runs,
+                "zeroLocalRelevanceSkips": self.zero_local_relevance_skips,
+                "zeroLocalRelevanceSkipRate": knowledge_skip_rate,
+                "agentRuns": self.knowledge_agent_runs,
+                "rounds": summarize_values(&mut self.knowledge_rounds),
+            },
+            "usage": {
+                "unknownUsageRuns": self.unknown_usage_runs,
+                "unknownUsageRunRate": unknown_usage_run_rate,
+                "unknownUsageCalls": self.unknown_usage_calls,
+            },
+            // `degradation` is the accurate name: reasons include budget pressure,
+            // provider usage gaps and other controlled fallbacks. Keep `budget` as
+            // a compatibility alias for clients deployed before this rename.
+            "degradation": degradation.clone(),
+            "budget": degradation,
+        })
+    }
+}
+
+fn aggregate_operation_rows(rows: &[Document]) -> Value {
+    let mut metrics = OperationMetrics::default();
+    for row in rows {
+        metrics.push(row);
+    }
+    metrics.into_value()
+}
+
+fn ratio_or_none(numerator: i64, denominator: i64) -> Option<f64> {
+    (denominator > 0).then_some(numerator as f64 / denominator as f64)
 }
 
 fn summarize_values(values: &mut [i64]) -> Value {
@@ -1367,6 +1504,74 @@ mod tests {
         assert_eq!(by_path["direct"]["count"], 1);
         assert_eq!(by_path["revision"]["tokens"]["p50"], 240);
         assert_eq!(by_path["revision"]["stages"]["reply_agent"]["p50"], 1200);
+    }
+
+    #[test]
+    fn operation_metrics_dedupe_reasons_and_separate_local_skips() {
+        let rows = vec![
+            doc! {
+                "unknown_usage_calls": 2_i32,
+                "degraded_reasons": [
+                    "knowledge_agent_stopped_usage_unknown",
+                    "knowledge_agent_stopped_usage_unknown",
+                ],
+                "knowledge_route": { "toolTrace": [{
+                    "tool": "knowledge.skip",
+                    "reason": "zero_local_relevance",
+                }] },
+            },
+            doc! {
+                "unknown_usage_calls": 0_i32,
+                "degraded_reasons": ["rewrite_skipped_budget_exceeded"],
+                "knowledge_route": { "toolTrace": [
+                    { "tool": "list_catalog", "round": 1_i32 },
+                    { "tool": "open_chunk", "round": 2_i32 },
+                    { "tool": "answer", "round": 3_i32 },
+                ] },
+            },
+            // Historical row: no toolTrace, so it is excluded from the knowledge-rate
+            // denominator but remains part of usage/degradation run rates.
+            doc! { "unknown_usage_calls": 0_i32 },
+        ];
+        let metrics = aggregate_operation_rows(&rows);
+        assert_eq!(metrics["runCount"], 3);
+        assert_eq!(metrics["knowledge"]["observedRuns"], 2);
+        assert_eq!(metrics["knowledge"]["zeroLocalRelevanceSkips"], 1);
+        assert_eq!(metrics["knowledge"]["zeroLocalRelevanceSkipRate"], 0.5);
+        assert_eq!(metrics["knowledge"]["agentRuns"], 1);
+        assert_eq!(metrics["knowledge"]["rounds"]["mean"], 3.0);
+        assert_eq!(metrics["knowledge"]["rounds"]["count"], 1);
+        assert_eq!(metrics["knowledge"]["rounds"]["p95"], 3);
+        assert_eq!(metrics["usage"]["unknownUsageRuns"], 1);
+        assert_eq!(metrics["usage"]["unknownUsageCalls"], 2);
+        assert_eq!(metrics["usage"]["unknownUsageRunRate"], 1.0 / 3.0);
+        assert_eq!(metrics["degradation"]["degradedRuns"], 2);
+        assert_eq!(metrics["degradation"]["degradedRunRate"], 2.0 / 3.0);
+        assert_eq!(
+            metrics["degradation"]["reasonsTop"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            metrics["budget"], metrics["degradation"],
+            "legacy alias must stay equivalent"
+        );
+        assert_eq!(
+            metrics["degradation"]["reasonsTop"][0]["count"], 1,
+            "duplicate marks in one run must count once",
+        );
+    }
+
+    #[test]
+    fn empty_operation_metrics_return_null_rates() {
+        let metrics = aggregate_operation_rows(&[]);
+        assert_eq!(metrics["runCount"], 0);
+        assert!(metrics["knowledge"]["zeroLocalRelevanceSkipRate"].is_null());
+        assert!(metrics["usage"]["unknownUsageRunRate"].is_null());
+        assert!(metrics["degradation"]["degradedRunRate"].is_null());
+        assert_eq!(metrics["budget"], metrics["degradation"]);
     }
 
     #[test]

@@ -24,8 +24,8 @@ use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
 use serde_json::json;
 use wechatagent::agent::{
     atomic_claim_pending, cancel_entry, cancel_for_contact_on_user_reaction, enqueue,
-    handle_managed_message, process_entry, reclaim_expired_leases, second_safety_gate,
-    EnqueueOutcome, EnqueueRequest, OutboxStatus,
+    handle_managed_message, process_entry, reclaim_expired_leases, run_outbox_dispatcher,
+    second_safety_gate, EnqueueOutcome, EnqueueRequest, OutboxStatus,
 };
 use wechatagent::models::{Contact, ConversationMessage, MessageDirection, ReferralCard};
 use wiremock::matchers::{method, path};
@@ -461,6 +461,72 @@ fn enqueue_request_with_content(
 }
 
 // ── Case 1: 入队 → claim → MCP 成功 → sent ──────────────────────────────
+
+/// Durable enqueue should wake the real dispatcher loop instead of waiting for its five-second
+/// recovery poll. This covers enqueue -> process-local Notify -> Mongo claim -> MCP -> sent.
+#[tokio::test]
+#[ignore]
+async fn durable_enqueue_wakes_dispatcher_without_poll_delay() {
+    let app = common::TestApp::start().await;
+    let mcp_server = start_mcp_mock_success().await;
+    let state = common::rebuild_app_state_with_mcp_url(&app, mcp_server.uri());
+    seed_default_mcp_account(&state).await;
+
+    let contact = make_contact("user_notify_fast_path");
+    state
+        .db
+        .contacts()
+        .insert_one(&contact, None)
+        .await
+        .expect("insert contact");
+
+    let dispatcher_state = state.clone();
+    let dispatcher = tokio::spawn(async move {
+        run_outbox_dispatcher(dispatcher_state)
+            .await
+            .expect("dispatcher loop should not exit");
+    });
+    // Let the initial empty tick finish so the worker is waiting on Notify / five-second fallback.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    let wall_started = std::time::Instant::now();
+    let outbox_id = match enqueue(
+        &state,
+        enqueue_request(
+            "run_notify_fast_path",
+            "evt_notify_fast_path",
+            &contact.wxid,
+        ),
+    )
+    .await
+    .expect("enqueue")
+    {
+        EnqueueOutcome::Created { outbox_id, .. } => outbox_id,
+        other => panic!("expected Created, got {other:?}"),
+    };
+
+    let entry = tokio::time::timeout(
+        Duration::from_secs(2),
+        common::wait_for_outbox_processed(&state, outbox_id, Duration::from_secs(2)),
+    )
+    .await
+    .expect("notify fast path must beat the five-second poll");
+    assert_eq!(entry.status, OutboxStatus::Sent.as_str());
+    let send_started_at = entry.send_started_at.expect("send_started_at");
+    let claim_delay_ms = send_started_at.timestamp_millis() - entry.created_at.timestamp_millis();
+    assert!(
+        claim_delay_ms < 1_000,
+        "dispatcher should claim within one second after enqueue, actual={claim_delay_ms}ms"
+    );
+    assert!(
+        wall_started.elapsed() < Duration::from_secs(2),
+        "end-to-end mock delivery should not wait for the five-second fallback"
+    );
+
+    dispatcher.abort();
+    let _ = dispatcher.await;
+    app.cleanup().await;
+}
 
 #[tokio::test]
 #[ignore]

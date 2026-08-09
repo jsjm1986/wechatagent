@@ -3158,15 +3158,19 @@ pub(crate) async fn write_event_with_cap(
 /// 路径的偏好，本 worker 用全局默认即可。
 static OUTBOX_CLAIM_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Process-local fast path. The durable MongoDB row and periodic poll remain authoritative.
+/// Process-local fast-path wakeup. MongoDB remains the durable source of truth and the periodic
+/// poll below remains the cross-process/crash fallback; a notification only removes avoidable
+/// sleep after a row has already been durably queued or task-authorized.
 static OUTBOX_WORK_NOTIFY: LazyLock<tokio::sync::Notify> = LazyLock::new(tokio::sync::Notify::new);
 
 pub(crate) fn notify_outbox_work() {
     OUTBOX_WORK_NOTIFY.notify_one();
 }
 
-/// A task-bound row may have been deferred for one second when enqueue raced its authorization
-/// CAS. Wake just after that durable guard expires without altering retry or pacing timestamps.
+/// Schedule one additional wake without changing durable retry/pacing timestamps. Task-bound
+/// rows may have been harmlessly deferred while their authorization CAS was still Building; this
+/// second signal picks them up when that one-second guard expires. The periodic poll remains the
+/// fallback if the process exits before the timer fires.
 pub(crate) fn notify_outbox_work_after(delay: Duration) {
     tokio::spawn(async move {
         tokio::time::sleep(delay).await;
@@ -3207,7 +3211,8 @@ pub async fn run_outbox_dispatcher(state: AppState) -> AppResult<()> {
         if let Err(err) = tick(&state, &worker, lease_seconds).await {
             tracing::error!(?err, "outbox dispatcher tick failed");
         }
-        // Notify retains a permit if enqueue races the transition from scan to wait.
+        // Notify retains one permit when no waiter is registered, so an enqueue racing between
+        // the empty scan and this wait is still observed. The timeout is the durable fallback.
         wait_for_outbox_work(
             &OUTBOX_WORK_NOTIFY,
             Duration::from_secs(poll_interval_seconds),
@@ -3246,26 +3251,28 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn enqueue_notification_survives_before_wait_race() {
+    async fn outbox_notify_wakes_production_wait_without_poll_delay() {
         let notify = tokio::sync::Notify::new();
+        // Exercise the race where enqueue happens after a scan but before the worker registers
+        // its waiter. Notify must retain the permit.
         notify.notify_one();
         tokio::time::timeout(
             Duration::from_millis(50),
             wait_for_outbox_work(&notify, Duration::from_secs(5)),
         )
         .await
-        .expect("notification permit should wake without poll delay");
+        .expect("durable enqueue notification should wake dispatcher immediately");
     }
 
     #[tokio::test]
-    async fn outbox_wait_keeps_periodic_recovery_fallback() {
+    async fn outbox_production_wait_retains_periodic_fallback() {
         let notify = tokio::sync::Notify::new();
         tokio::time::timeout(
             Duration::from_millis(50),
             wait_for_outbox_work(&notify, Duration::from_millis(5)),
         )
         .await
-        .expect("periodic fallback should wake without notification");
+        .expect("periodic fallback should wake dispatcher without a notification");
     }
 
     #[test]

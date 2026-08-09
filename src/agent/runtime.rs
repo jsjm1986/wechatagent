@@ -351,7 +351,7 @@ pub struct UserRuntimeParameters {
     /// reviewer 深度开关。所有 `should_reply=true` 的正文都必须经过独立 Reviewer；
     /// `false`（DEFAULT/`from_config`/`Default`）允许常规低风险回复使用 light Reviewer，
     /// `true` 则让高敏域强制使用 full Reviewer。它不再授权 Reply Agent 以自报
-    /// `needs_review=false` 跳过审核。由 active
+    /// `needs_review=false` 跳过审核（该旧语义已禁用）。由 active
     /// DomainProfile.distrust_self_reported_low_risk 派生，gateway 加载 profile 后覆盖。
     pub distrust_self_reported_low_risk: bool,
     /// tag-trust 子计划3 Task2：记忆归并宽窗口字符预算。`from_config` 把 typed
