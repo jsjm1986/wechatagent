@@ -224,6 +224,16 @@ static LLM_EXACT_CACHE: LazyLock<PlMutex<LruCache<String, Value>>> = LazyLock::n
     ))
 });
 
+fn uses_fast_json(prompt_key: &str) -> bool {
+    matches!(
+        prompt_key,
+        "user.reply.fast.task"
+            | "user.review.system"
+            | "user.review.light.system"
+            | "user.review.claim_gate"
+    )
+}
+
 /// Agent 公共 LLM JSON 调用入口。所有子模块（decision / review /
 /// knowledge_router / memory / reaction 等）都通过它进 LLM，统一处理：
 /// - LRU 精确缓存（限定 prompt key 列表）；
@@ -316,9 +326,11 @@ pub(crate) async fn generate_agent_json(
             return Ok(value);
         }
     }
-    let generated = match &registry_snapshot {
-        Some(snapshot) => snapshot.generate_json_with_usage(system, user).await,
-        None => state.llm.generate_json_with_usage(system, user).await,
+    let generated = match (&registry_snapshot, uses_fast_json(prompt_key)) {
+        (Some(snapshot), true) => snapshot.generate_json_with_usage_fast(system, user).await,
+        (Some(snapshot), false) => snapshot.generate_json_with_usage(system, user).await,
+        (None, true) => state.llm.generate_json_with_usage_fast(system, user).await,
+        (None, false) => state.llm.generate_json_with_usage(system, user).await,
     };
     match generated {
         Ok(result) => {
@@ -766,6 +778,26 @@ mod tests {
         let doc = runtime().as_document();
         assert_eq!(doc.get_i32("factRiskBlockAt").unwrap(), 6);
         assert_eq!(doc.get_i64("maxDailyTouches").unwrap(), 3);
+    }
+
+    #[test]
+    fn fast_json_is_limited_to_reply_and_review_prompts() {
+        for prompt_key in [
+            "user.reply.fast.task",
+            "user.review.system",
+            "user.review.light.system",
+            "user.review.claim_gate",
+        ] {
+            assert!(super::uses_fast_json(prompt_key), "{prompt_key}");
+        }
+        for prompt_key in [
+            "user.reply.task",
+            "user.projection.task",
+            "memory.consolidate",
+            "knowledge.import.preview",
+        ] {
+            assert!(!super::uses_fast_json(prompt_key), "{prompt_key}");
+        }
     }
 
     #[test]

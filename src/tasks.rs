@@ -525,6 +525,10 @@ pub async fn authorize_task_outbox_if_owned(
     if result.matched_count == 0 {
         return Ok(false);
     }
+    // This CAS is the authorization linearization point. Wake now, and once more after the
+    // dispatcher's one-second Building deferral in case enqueue won the race before this CAS.
+    crate::agent::outbox_dispatcher::notify_outbox_work();
+    crate::agent::outbox_dispatcher::notify_outbox_work_after(Duration::from_millis(1_050));
     Ok(true)
 }
 

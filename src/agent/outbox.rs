@@ -383,6 +383,9 @@ pub async fn enqueue(state: &AppState, req: EnqueueRequest) -> Result<EnqueueOut
                 }),
             )
             .await;
+            // The row is durable before this process-local signal. MongoDB and the periodic scan
+            // remain the source of truth and recovery path if the signal is lost.
+            super::outbox_dispatcher::notify_outbox_work();
             Ok(EnqueueOutcome::Created {
                 outbox_id,
                 idempotency_key,

@@ -220,6 +220,17 @@ pub trait LlmProvider: Send + Sync {
     async fn generate_json(&self, system: &str, user: &str) -> AppResult<Value>;
     async fn generate_json_with_usage(&self, system: &str, user: &str) -> AppResult<LlmJsonResult>;
 
+    /// Latency-sensitive strict-JSON call. Providers may suppress internal reasoning while
+    /// preserving the same prompts and parsed result contract. Unsupported providers retain the
+    /// ordinary behavior through this default implementation.
+    async fn generate_json_with_usage_fast(
+        &self,
+        system: &str,
+        user: &str,
+    ) -> AppResult<LlmJsonResult> {
+        self.generate_json_with_usage(system, user).await
+    }
+
     /// 流式生成：把**上游模型原始输出**（对本系统而言即模型逐 token 吐出的 JSON
     /// 文本片段）作为 delta 通过 `token_tx` 增量推出；函数返回时给出与
     /// [`generate_json_with_usage`] 同形的最终结果（含完整解析后的 `value` 与 usage）。
@@ -480,9 +491,13 @@ impl LlmClient {
         &self,
         system: &str,
         user: &str,
+        fast_json: bool,
     ) -> AppResult<(LlmJsonResult, Option<u64>)> {
         match self.format {
-            LlmFormat::Openai => self.generate_json_once_openai(system, user).await,
+            LlmFormat::Openai => {
+                self.generate_json_once_openai(system, user, fast_json)
+                    .await
+            }
             LlmFormat::Anthropic => self.generate_json_once_anthropic(system, user).await,
         }
     }
@@ -491,9 +506,10 @@ impl LlmClient {
         &self,
         system: &str,
         user: &str,
+        fast_json: bool,
     ) -> AppResult<(LlmJsonResult, Option<u64>)> {
         let started_at = Instant::now();
-        let body = json!({
+        let mut body = json!({
             "model": self.model,
             "temperature": self.temperature,
             "messages": [
@@ -501,6 +517,16 @@ impl LlmClient {
                 ChatMessage { role: "user", content: user }
             ]
         });
+        if fast_json
+            && self
+                .model
+                .trim()
+                .to_ascii_lowercase()
+                .starts_with("deepseek")
+        {
+            body["response_format"] = json!({ "type": "json_object" });
+            body["thinking"] = json!({ "type": "disabled" });
+        }
 
         let response = self
             .client
@@ -870,39 +896,16 @@ impl LlmProvider for LlmClient {
     }
 
     async fn generate_json_with_usage(&self, system: &str, user: &str) -> AppResult<LlmJsonResult> {
-        let call_started_at = Instant::now();
-        let mut last_error: Option<AppError> = None;
-        let mut retry_count: u32 = 0;
-        for attempt in 1..=self.max_retries {
-            match self.generate_json_once(system, user).await {
-                Ok((mut value, _)) => {
-                    value.retry_count = retry_count;
-                    // Report the complete caller-visible latency, including failed attempts and
-                    // retry backoff, rather than only the final successful HTTP request.
-                    value.latency_ms = call_started_at.elapsed().as_millis() as i64;
-                    return Ok(value);
-                }
-                Err(error) if attempt < self.max_retries && is_retryable_llm_error(&error) => {
-                    let retry_after_secs = parse_retry_after_from_error(&error);
-                    let delay = compute_backoff(attempt, self.retry_base_ms, retry_after_secs);
-                    last_error = Some(error);
-                    sleep(delay).await;
-                    retry_count = retry_count.saturating_add(1);
-                }
-                Err(error) => {
-                    // 重试耗尽（或不可重试的 LLM 错误）—— 把 raw 错误分类成
-                    // [`AppError::LlmUnavailable`]，让前端按 `kind` 渲染中文文案，
-                    // 而不是把 reqwest 原始 "error sending request for url ..."
-                    // 直接糊到面板上。
-                    return Err(classify_llm_error_for_user(&error, retry_count));
-                }
-            }
-        }
-        // for 循环正常退出（max_retries 用完且最后一次也走了可重试分支但 attempt
-        // == max_retries 没机会再 sleep 重试）—— last_error 必有值。
-        let final_err = last_error
-            .unwrap_or_else(|| AppError::External("LLM request failed after retries".to_string()));
-        Err(classify_llm_error_for_user(&final_err, retry_count))
+        self.generate_json_with_usage_mode(system, user, false)
+            .await
+    }
+
+    async fn generate_json_with_usage_fast(
+        &self,
+        system: &str,
+        user: &str,
+    ) -> AppResult<LlmJsonResult> {
+        self.generate_json_with_usage_mode(system, user, true).await
     }
 
     async fn generate_json_streaming(
@@ -977,6 +980,49 @@ impl LlmProvider for LlmClient {
                 "vision_not_supported: Anthropic 格式的多模态输入尚未实现".to_string(),
             )),
         }
+    }
+}
+
+impl LlmClient {
+    async fn generate_json_with_usage_mode(
+        &self,
+        system: &str,
+        user: &str,
+        fast_json: bool,
+    ) -> AppResult<LlmJsonResult> {
+        let call_started_at = Instant::now();
+        let mut last_error: Option<AppError> = None;
+        let mut retry_count: u32 = 0;
+        for attempt in 1..=self.max_retries {
+            match self.generate_json_once(system, user, fast_json).await {
+                Ok((mut value, _)) => {
+                    value.retry_count = retry_count;
+                    // Report the complete caller-visible latency, including failed attempts and
+                    // retry backoff, rather than only the final successful HTTP request.
+                    value.latency_ms = call_started_at.elapsed().as_millis() as i64;
+                    return Ok(value);
+                }
+                Err(error) if attempt < self.max_retries && is_retryable_llm_error(&error) => {
+                    let retry_after_secs = parse_retry_after_from_error(&error);
+                    let delay = compute_backoff(attempt, self.retry_base_ms, retry_after_secs);
+                    last_error = Some(error);
+                    sleep(delay).await;
+                    retry_count = retry_count.saturating_add(1);
+                }
+                Err(error) => {
+                    // 重试耗尽（或不可重试的 LLM 错误）—— 把 raw 错误分类成
+                    // [`AppError::LlmUnavailable`]，让前端按 `kind` 渲染中文文案，
+                    // 而不是把 reqwest 原始 "error sending request for url ..."
+                    // 直接糊到面板上。
+                    return Err(classify_llm_error_for_user(&error, retry_count));
+                }
+            }
+        }
+        // for 循环正常退出（max_retries 用完且最后一次也走了可重试分支但 attempt
+        // == max_retries 没机会再 sleep 重试）—— last_error 必有值。
+        let final_err = last_error
+            .unwrap_or_else(|| AppError::External("LLM request failed after retries".to_string()));
+        Err(classify_llm_error_for_user(&final_err, retry_count))
     }
 }
 
@@ -1646,6 +1692,16 @@ impl LlmRegistrySnapshot {
         self.client.generate_json_with_usage(system, user).await
     }
 
+    pub async fn generate_json_with_usage_fast(
+        &self,
+        system: &str,
+        user: &str,
+    ) -> AppResult<LlmJsonResult> {
+        self.client
+            .generate_json_with_usage_fast(system, user)
+            .await
+    }
+
     pub async fn generate_json_streaming(
         &self,
         system: &str,
@@ -1678,6 +1734,14 @@ impl LlmProvider for LlmRegistrySnapshot {
 
     async fn generate_json_with_usage(&self, system: &str, user: &str) -> AppResult<LlmJsonResult> {
         LlmRegistrySnapshot::generate_json_with_usage(self, system, user).await
+    }
+
+    async fn generate_json_with_usage_fast(
+        &self,
+        system: &str,
+        user: &str,
+    ) -> AppResult<LlmJsonResult> {
+        LlmRegistrySnapshot::generate_json_with_usage_fast(self, system, user).await
     }
 
     async fn generate_json_streaming(
@@ -1793,6 +1857,15 @@ impl LlmProvider for LlmRegistry {
     async fn generate_json_with_usage(&self, system: &str, user: &str) -> AppResult<LlmJsonResult> {
         let client = self.current().await;
         client.generate_json_with_usage(system, user).await
+    }
+
+    async fn generate_json_with_usage_fast(
+        &self,
+        system: &str,
+        user: &str,
+    ) -> AppResult<LlmJsonResult> {
+        let client = self.current().await;
+        client.generate_json_with_usage_fast(system, user).await
     }
 
     async fn generate_json_streaming(
@@ -2520,6 +2593,70 @@ mod tests {
             .await
             .expect("matching request headers must reach the mock");
         assert_eq!(response.get("ok").and_then(Value::as_bool), Some(true));
+    }
+
+    #[tokio::test]
+    async fn fast_json_controls_are_deepseek_and_call_scoped() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{ "message": { "content": "{\"ok\":true}" } }],
+                "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+            })))
+            .expect(3)
+            .mount(&server)
+            .await;
+
+        let deepseek = LlmClient::new(
+            format!("{}/v1", server.uri()),
+            "test-key".into(),
+            "deepseek-v4-flash".into(),
+            10,
+            1,
+            100,
+        )
+        .expect("build DeepSeek client");
+        deepseek
+            .generate_json_with_usage_fast("system", "user")
+            .await
+            .expect("fast DeepSeek request");
+        deepseek
+            .generate_json_with_usage("system", "user")
+            .await
+            .expect("ordinary DeepSeek request");
+
+        let other = LlmClient::new(
+            format!("{}/v1", server.uri()),
+            "test-key".into(),
+            "gpt-compatible".into(),
+            10,
+            1,
+            100,
+        )
+        .expect("build non-DeepSeek client");
+        other
+            .generate_json_with_usage_fast("system", "user")
+            .await
+            .expect("fast non-DeepSeek request");
+
+        let requests = server.received_requests().await.expect("received requests");
+        let bodies = requests
+            .iter()
+            .map(|request| serde_json::from_slice::<Value>(&request.body).expect("request JSON"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            bodies[0]["response_format"],
+            json!({ "type": "json_object" })
+        );
+        assert_eq!(bodies[0]["thinking"], json!({ "type": "disabled" }));
+        assert!(bodies[1].get("response_format").is_none());
+        assert!(bodies[1].get("thinking").is_none());
+        assert!(bodies[2].get("response_format").is_none());
+        assert!(bodies[2].get("thinking").is_none());
     }
 
     #[tokio::test]

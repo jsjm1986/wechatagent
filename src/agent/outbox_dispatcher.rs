@@ -20,7 +20,7 @@
 //!   `DEFAULT_LEASE_SECONDS` / `MCP_SEND_TIMEOUT_SECONDS`），正常路径一次 tick
 //!   内完成；worker 崩溃 → 下一轮 reclaim 自动恢复。
 
-use std::time::Duration;
+use std::{sync::LazyLock, time::Duration};
 
 use futures::TryStreamExt;
 use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
@@ -3158,6 +3158,29 @@ pub(crate) async fn write_event_with_cap(
 /// 路径的偏好，本 worker 用全局默认即可。
 static OUTBOX_CLAIM_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Process-local fast path. The durable MongoDB row and periodic poll remain authoritative.
+static OUTBOX_WORK_NOTIFY: LazyLock<tokio::sync::Notify> = LazyLock::new(tokio::sync::Notify::new);
+
+pub(crate) fn notify_outbox_work() {
+    OUTBOX_WORK_NOTIFY.notify_one();
+}
+
+/// A task-bound row may have been deferred for one second when enqueue raced its authorization
+/// CAS. Wake just after that durable guard expires without altering retry or pacing timestamps.
+pub(crate) fn notify_outbox_work_after(delay: Duration) {
+    tokio::spawn(async move {
+        tokio::time::sleep(delay).await;
+        OUTBOX_WORK_NOTIFY.notify_one();
+    });
+}
+
+async fn wait_for_outbox_work(notify: &tokio::sync::Notify, fallback: Duration) {
+    tokio::select! {
+        _ = notify.notified() => {}
+        _ = tokio::time::sleep(fallback) => {}
+    }
+}
+
 const DEFAULT_POLL_INTERVAL_SECONDS: u64 = 5;
 
 /// 默认 lease 时长（秒）。必须 **严格大于** `MCP_SEND_TIMEOUT_SECONDS`（见其
@@ -3184,7 +3207,12 @@ pub async fn run_outbox_dispatcher(state: AppState) -> AppResult<()> {
         if let Err(err) = tick(&state, &worker, lease_seconds).await {
             tracing::error!(?err, "outbox dispatcher tick failed");
         }
-        tokio::time::sleep(Duration::from_secs(poll_interval_seconds)).await;
+        // Notify retains a permit if enqueue races the transition from scan to wait.
+        wait_for_outbox_work(
+            &OUTBOX_WORK_NOTIFY,
+            Duration::from_secs(poll_interval_seconds),
+        )
+        .await;
     }
 }
 
@@ -3216,6 +3244,29 @@ async fn tick(state: &AppState, worker: &str, lease_seconds: i32) -> AppResult<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn enqueue_notification_survives_before_wait_race() {
+        let notify = tokio::sync::Notify::new();
+        notify.notify_one();
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            wait_for_outbox_work(&notify, Duration::from_secs(5)),
+        )
+        .await
+        .expect("notification permit should wake without poll delay");
+    }
+
+    #[tokio::test]
+    async fn outbox_wait_keeps_periodic_recovery_fallback() {
+        let notify = tokio::sync::Notify::new();
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            wait_for_outbox_work(&notify, Duration::from_millis(5)),
+        )
+        .await
+        .expect("periodic fallback should wake without notification");
+    }
 
     #[test]
     fn ordinary_success_clears_stale_error_but_post_hoc_note_is_preserved() {
