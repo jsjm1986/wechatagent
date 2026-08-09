@@ -179,10 +179,13 @@ impl TestLlmGenerator {
             || system.contains("Reviewer")
         {
             ResponseKind::Reviewer
-        } else {
-            // Reply prompts have changed names over time; when a queued strict Reply payload
-            // exists, non-specialized requests in gateway tests consume that payload.
+        } else if system.contains("shouldReply") && system.contains("conversationMode") {
+            // Reply system prompts carry both stable output-contract anchors. Unknown agents
+            // (for example knowledge.chat.intent) must stay FIFO; treating every unknown system
+            // as Reply skips their intent payload whenever a later decisionPhase response exists.
             ResponseKind::Reply
+        } else {
+            ResponseKind::Other
         };
         let position = match request_kind {
             ResponseKind::Other => Some(0),
