@@ -230,7 +230,7 @@ static LLM_EXACT_CACHE: LazyLock<PlMutex<LruCache<String, Value>>> = LazyLock::n
 const FAST_REPLY_MAX_OUTPUT_TOKENS: u32 = 8192;
 pub(crate) const LIGHT_REVIEWER_MAX_OUTPUT_TOKENS: u32 = 3072;
 pub(crate) const REVIEWER_MAX_OUTPUT_TOKENS: u32 = 8192;
-const CLAIM_GATE_MAX_OUTPUT_TOKENS: u32 = 1536;
+const CLAIM_GATE_MAX_OUTPUT_TOKENS: u32 = 3072;
 
 fn critical_path_output_token_limit(prompt_key: &str) -> Option<u32> {
     match prompt_key {

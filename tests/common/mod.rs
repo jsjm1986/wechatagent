@@ -141,29 +141,74 @@ impl TestLlmGenerator {
             ));
         }
 
-        // Reviewer 与 Independent ClaimGate 在生产路径并行执行，测试响应不能再依赖
-        // tokio 调度恰好让 Reviewer 先取得 FIFO 首项。仅对 ClaimGate 做 schema 定向：
-        // ClaimGate 请求取首个严格 verdict；其它请求若队首是 verdict，则跳到首个非
-        // ClaimGate 响应。其余所有调用仍保持原 FIFO 语义。
-        let is_claim_gate_request = system.contains("independent semantic claim reviewer");
-        let is_claim_gate_response = |result: &LlmJsonResult| {
-            result.value.get("requiresEvidence").is_some()
-                && result.value.get("catalogClaims").is_some()
-                && result.value.get("catalogCoverageComplete").is_some()
+        // Knowledge Router、首轮 Reply、Reviewer 与 ClaimGate 可并发执行。测试响应按
+        // 严格顶层 schema 定向，不能依赖 tokio 恰好按 push FIFO 调度；其它调用仍 FIFO。
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum ResponseKind {
+            Knowledge,
+            Reply,
+            Reviewer,
+            ClaimGate,
+            Other,
+        }
+        let response_kind = |result: &LlmJsonResult| {
+            let value = &result.value;
+            if value.get("requiresEvidence").is_some()
+                && value.get("claims").is_some()
+                && value.get("catalogClaims").is_some()
+            {
+                ResponseKind::ClaimGate
+            } else if value.get("decisionPhase").is_some() {
+                ResponseKind::Reply
+            } else if value.get("approved").is_some() && value.get("scores").is_some() {
+                ResponseKind::Reviewer
+            } else if value.get("action").is_some() {
+                ResponseKind::Knowledge
+            } else {
+                ResponseKind::Other
+            }
         };
-        let position = if is_claim_gate_request {
-            queue.iter().position(is_claim_gate_response)
-        } else if is_claim_gate_response(&queue[0]) {
-            queue
-                .iter()
-                .position(|result| !is_claim_gate_response(result))
+        let request_kind = if system.contains("independent semantic claim reviewer") {
+            ResponseKind::ClaimGate
+        } else if system.contains("运营知识库的 wiki 研究员") {
+            ResponseKind::Knowledge
+        } else if system.contains("请独立审核候选回复")
+            || system.contains("独立审核")
+            || system.contains("独立运营质量评审 Agent")
+            || system.contains("reviewer")
+            || system.contains("Reviewer")
+        {
+            ResponseKind::Reviewer
         } else {
-            Some(0)
+            // Reply prompts have changed names over time; when a queued strict Reply payload
+            // exists, non-specialized requests in gateway tests consume that payload.
+            ResponseKind::Reply
+        };
+        let position = match request_kind {
+            ResponseKind::Other => Some(0),
+            expected => queue
+                .iter()
+                .position(|result| response_kind(result) == expected)
+                .or_else(|| {
+                    // Preserve legacy FIFO for callers whose payload has no recognized schema.
+                    (response_kind(&queue[0]) == ResponseKind::Other).then_some(0)
+                }),
         };
         let Some(position) = position else {
-            return Err(AppError::External(
-                "TestLlmGenerator: 没有与并发调用 schema 匹配的响应".to_string(),
-            ));
+            let queued = queue
+                .iter()
+                .map(|result| match response_kind(result) {
+                    ResponseKind::Knowledge => "knowledge",
+                    ResponseKind::Reply => "reply",
+                    ResponseKind::Reviewer => "reviewer",
+                    ResponseKind::ClaimGate => "claim_gate",
+                    ResponseKind::Other => "other",
+                })
+                .collect::<Vec<_>>();
+            return Err(AppError::External(format!(
+                "TestLlmGenerator: 没有与并发调用 schema 匹配的响应; system={:?}; queued={queued:?}",
+                system.chars().take(120).collect::<String>()
+            )));
         };
         Ok(queue.remove(position))
     }
@@ -177,6 +222,8 @@ pub fn independent_claim_gate_pass_json() -> Value {
     serde_json::json!({
         "requiresEvidence": false,
         "claimKinds": [],
+        "claimsComplete": true,
+        "claims": [],
         "hasCatalogClaims": false,
         "catalogCoverageComplete": true,
         "hasNonCatalogEvidenceClaims": false,
@@ -185,13 +232,48 @@ pub fn independent_claim_gate_pass_json() -> Value {
     })
 }
 
+/// Independent ClaimGate verdict for an unsupported, non-product real-world business fact.
+pub fn independent_claim_gate_unsupported_business_json(source_quote: &str) -> Value {
+    serde_json::json!({
+        "requiresEvidence": true,
+        "claimKinds": ["open_world_business_fact"],
+        "claimsComplete": true,
+        "claims": [{
+            "sourceQuote": source_quote,
+            "claim": "The business asserts a real-world requirement without a trusted source.",
+            "scope": "open_world_business_fact",
+            "subject": "business",
+            "productClaim": false,
+            "requiresEvidence": true,
+            "evidenceRefs": [],
+            "reason": "No server-catalogued source directly supports this assertion."
+        }],
+        "hasCatalogClaims": false,
+        "catalogCoverageComplete": true,
+        "hasNonCatalogEvidenceClaims": true,
+        "catalogClaims": [],
+        "reason": "The candidate contains an unsupported non-product business fact."
+    })
+}
+
 /// Independent ClaimGate verdict for a capability statement that must be backed by verified
 /// operation knowledge. This fixture is used only where the test has seeded and cited a verified
 /// chunk; it must not be used to bypass evidence checks in generic gateway-flow tests.
-pub fn independent_claim_gate_verified_knowledge_json() -> Value {
+pub fn independent_claim_gate_verified_knowledge_json(chunk_id: &str, source_quote: &str) -> Value {
     serde_json::json!({
         "requiresEvidence": true,
         "claimKinds": ["product_capability"],
+        "claimsComplete": true,
+        "claims": [{
+            "sourceQuote": source_quote,
+            "claim": "The candidate asserts a verified product capability.",
+            "scope": "product_capability",
+            "subject": "business",
+            "productClaim": true,
+            "requiresEvidence": true,
+            "evidenceRefs": [format!("verified_knowledge:{chunk_id}")],
+            "reason": "Directly supported by the cited verified knowledge."
+        }],
         "hasCatalogClaims": false,
         "catalogCoverageComplete": true,
         "hasNonCatalogEvidenceClaims": true,

@@ -72,8 +72,9 @@ use super::review::{
     apply_independent_claim_gate, apply_revision_fallback, contact_has_principal_product_exemption,
     decide_revision, derive_revision_failure, effective_review_mode, ensure_independent_claim_gate,
     evaluate_independent_claim_gate, finalize_review_for_send, local_decision_review,
-    review_decision, review_passed, should_run_review, FinalizeOutcome, GatewayStatusFinal,
-    PendingFinalizeEvent, ReviewerPromptCache, RevisionDecision,
+    review_decision, review_passed, should_run_review, should_run_targeted_rewrite,
+    FinalizeOutcome, GatewayStatusFinal, PendingFinalizeEvent, ReviewerPromptCache,
+    RevisionDecision,
 };
 use super::run_envelope::{
     assert_final_review_status_valid, assert_gateway_status_valid, assert_lifecycle_valid,
@@ -628,8 +629,12 @@ fn review_and_evaluate_claim_gate<'a>(
                 state,
                 contact,
                 inbound,
+                recent_messages,
                 decision,
+                knowledge_chunks,
                 active_products,
+                active_profile,
+                mongodb::bson::DateTime::now(),
                 Some(run_id),
             ),
         );
@@ -2911,8 +2916,19 @@ fn run_user_operation_gateway_inner<'a>(
         local_decision_review(&decision, local_budget_ref, &runtime)
     };
     let mut final_decision = decision;
+    // Merge the independent manifest before the one-shot rewrite decision. This lets an
+    // unsupported open-world business fact take the existing targeted rewrite path instead of
+    // waiting until finalize, where the only safe option would be to block the entire reply.
+    let mut precomputed_catalog_backed = precomputed_claim_gate.take().map(|evaluation| {
+        apply_independent_claim_gate(
+            evaluation,
+            &final_decision,
+            &mut review,
+            &active_products,
+        )
+    });
 
-    if final_decision.should_reply && !review_passed(&review, &runtime) && !review.needs_revision {
+    if should_run_targeted_rewrite(&final_decision, &review, &runtime) {
         // Phase B / B1：`needs_revision=true` 表示 [`route_dual_gate`] 已经
         // 把当前 review 标为软闸-only 失败，应走 finalize 之后的 single-shot
         // revision 通道（decide_revision Proceed），而不是这里的 rewrite 路径
@@ -3021,6 +3037,7 @@ fn run_user_operation_gateway_inner<'a>(
             .await?;
             review = next_review;
             precomputed_claim_gate = Some(claim_gate_evaluation);
+            precomputed_catalog_backed = None;
         }
     }
 
@@ -3044,15 +3061,22 @@ fn run_user_operation_gateway_inner<'a>(
         Some(evaluation) => {
             apply_independent_claim_gate(evaluation, &final_decision, &mut review, &active_products)
         }
+        None if precomputed_catalog_backed.is_some() => {
+            precomputed_catalog_backed.unwrap_or(false)
+        }
         None => {
             ensure_independent_claim_gate(
                 state,
                 &contact,
                 &inbound,
+                &recent_messages,
                 &final_decision,
                 &mut review,
+                &selected_chunks,
                 &active_products,
-                Some(&run_id),
+                &active_profile,
+                mongodb::bson::DateTime::now(),
+                Some(run_id.as_str()),
             )
             .await
         }

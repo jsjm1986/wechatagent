@@ -443,6 +443,161 @@ async fn full_flow_a1_direct_approved_enqueues_outbox() {
     assert_eq!(outbox.contact_wxid, contact.wxid);
 }
 
+/// A1b 开放式事实修复：首稿给出无来源到店要求，ClaimGate 触发一次 targeted
+/// rewrite；改写只保留透明不确定表达，二次 ClaimGate 通过后正常入 outbox。
+#[tokio::test]
+#[ignore]
+async fn full_flow_a1b_unsupported_business_fact_is_locally_rewritten() {
+    let app = common::TestApp::start().await;
+    let contact = make_managed_contact("ff_a1b_claim_rewrite");
+    app.state
+        .db
+        .contacts()
+        .insert_one(&contact, None)
+        .await
+        .expect("insert managed contact");
+    let inbound = make_inbound(
+        &contact,
+        "ff_a1b_msg_001",
+        "到店前需要提前准备或携带什么材料？",
+    );
+    app.state
+        .db
+        .messages()
+        .insert_one(&inbound, None)
+        .await
+        .expect("insert inbound message");
+
+    let unsafe_reply = "到店前带身份证就行，我会提前帮你安排好。";
+    app.llm.push_response(reply_agent_decision_json(
+        unsafe_reply,
+        "客户明确询问到店准备事项，需要及时承接并给出清晰下一步，避免客户因信息不足产生焦虑。",
+        "not_required",
+    ));
+    app.llm.push_response(review_agent_pass_json(
+        false,
+        "",
+        "候选表达简洁，但事实授权交由独立 ClaimGate 核验。",
+    ));
+    app.llm
+        .push_response(common::independent_claim_gate_unsupported_business_json(
+            "到店前带身份证就行",
+        ));
+
+    let safe_reply = "需要带哪些材料我这里还没有确认口径，我先核对清楚再告诉你。";
+    app.llm.push_response(reply_agent_decision_json(
+        safe_reply,
+        "按事实修复要求删除无来源的证件要求，透明说明当前未确认并承诺先核对。",
+        "not_required",
+    ));
+    app.llm.push_response(review_agent_pass_json(
+        false,
+        "",
+        "改写后不再把未确认的到店要求作为事实，可放行。",
+    ));
+    app.llm
+        .push_response(common::independent_claim_gate_pass_json());
+
+    let before = app.llm.calls();
+    handle_managed_message(&app.state, contact.clone(), &inbound)
+        .await
+        .expect("handle_managed_message ok");
+    assert_eq!(
+        app.llm.calls() - before,
+        6,
+        "事实修复路径：Reply ×2 + Review ×2 + ClaimGate ×2 = 6 次 LLM 调用"
+    );
+
+    let log = fetch_run_log(&app, &contact).await;
+    assert_eq!(log.final_review_status, "approved");
+    let outbox = app
+        .state
+        .db
+        .collection_agent_send_outbox()
+        .find_one(doc! { "run_id": &log.run_id }, None)
+        .await
+        .expect("query outbox")
+        .expect("safe rewrite must enqueue");
+    assert_eq!(outbox.content, safe_reply);
+    assert!(!outbox.content.contains("身份证"));
+}
+
+/// A1c 二次仍违规：targeted rewrite 后仍坚持同一无来源业务事实，二次 ClaimGate
+/// 再次标记 unsupported；finalize 必须 blocked_by_safety_guard，且绝不入 outbox。
+#[tokio::test]
+#[ignore]
+async fn full_flow_a1c_persistent_unsupported_business_fact_is_blocked() {
+    let app = common::TestApp::start().await;
+    let contact = make_managed_contact("ff_a1c_claim_block");
+    app.state
+        .db
+        .contacts()
+        .insert_one(&contact, None)
+        .await
+        .expect("insert managed contact");
+    let inbound = make_inbound(
+        &contact,
+        "ff_a1c_msg_001",
+        "到店前需要提前准备或携带什么材料？",
+    );
+    app.state
+        .db
+        .messages()
+        .insert_one(&inbound, None)
+        .await
+        .expect("insert inbound message");
+
+    for _ in 0..2 {
+        app.llm.push_response(reply_agent_decision_json(
+            "到店前带身份证就行。",
+            "客户询问到店准备事项，本轮尝试直接回答，但该要求仍需独立事实核验。",
+            "not_required",
+        ));
+        app.llm.push_response(review_agent_pass_json(
+            false,
+            "",
+            "事实授权交由独立 ClaimGate 核验。",
+        ));
+        app.llm
+            .push_response(common::independent_claim_gate_unsupported_business_json(
+                "到店前带身份证就行",
+            ));
+    }
+
+    let before = app.llm.calls();
+    handle_managed_message(&app.state, contact.clone(), &inbound)
+        .await
+        .expect("blocked decision is an auditable terminal, not a pipeline error");
+    assert_eq!(
+        app.llm.calls() - before,
+        7,
+        "事实修复失败路径：Reply ×2 + Review ×2 + ClaimGate ×2 + 中性占位生成尝试 ×1"
+    );
+
+    let log = fetch_run_log(&app, &contact).await;
+    assert_eq!(log.final_review_status, "blocked_by_safety_guard");
+    // 客户回应保障会补一条中性占位；原始无依据业务回复绝不能进入 outbox。
+    assert_eq!(outbox_count_for(&app, &contact).await, 1);
+    let placeholder = app
+        .state
+        .db
+        .collection_agent_send_outbox()
+        .find_one(doc! { "run_id": &log.run_id }, None)
+        .await
+        .expect("query safety placeholder")
+        .expect("blocked inbound should receive one neutral placeholder");
+    assert!(!placeholder.content.contains("身份证"));
+    assert!(!placeholder.content.contains("带证件"));
+    assert_ne!(placeholder.content, "到店前带身份证就行。");
+    assert_eq!(
+        log.review
+            .get_document("claimAnalysis")
+            .and_then(|claim| claim.get_i64("unsupportedNonProductBusinessClaimCount"))
+            .ok(),
+        Some(1)
+    );
+}
+
 /// A2 单轮 revision：Reply→Review(needs_revision)→Reply(revised)→Review(pass)，
 /// final_review_status=revision_applied_approved + revision_applied=true。
 #[tokio::test]
@@ -681,7 +836,10 @@ async fn full_flow_a4_knowledge_tool_loop() {
         "知识路由已扫过 list_catalog/open_chunk/answer，回复未越界做产品承诺，整体可放行。",
     ));
     app.llm
-        .push_response(common::independent_claim_gate_verified_knowledge_json());
+        .push_response(common::independent_claim_gate_verified_knowledge_json(
+            &chunk_id,
+            "覆盖账号纳管、自动应答、手动指令三类",
+        ));
 
     let before = app.llm.calls();
     handle_managed_message(&app.state, contact.clone(), &inbound)
