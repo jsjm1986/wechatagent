@@ -145,7 +145,10 @@ pub async fn generate(
     if let Err(_) = budget.check_or_fail() {
         return Ok(Vec::new());
     }
-    let started_at = std::time::Instant::now();
+    let priority = crate::llm_concurrency::LlmPriority::Background;
+    let admission = state.llm_concurrency.acquire(priority).await;
+    let queue_wait_ms = admission.queue_wait().as_millis().min(i64::MAX as u128) as i64;
+    let provider_started = std::time::Instant::now();
     let (llm_result, provider_model) = match &state.llm_registry {
         Some(registry) => match registry.snapshot(workspace_id).await {
             Ok(snapshot) => {
@@ -167,6 +170,8 @@ pub async fn generate(
             state.config.openai_model.clone(),
         ),
     };
+    let provider_elapsed_ms = provider_started.elapsed().as_millis().min(i64::MAX as u128) as i64;
+    drop(admission);
     // 5. 写一条 llm_call_logs（无论成败），把消耗算入 EvolutionBudget。
     match &llm_result {
         Ok(r) => {
@@ -185,7 +190,10 @@ pub async fn generate(
                         prompt_key: CRITIC_PROMPT_KEY.to_string(),
                         model: r.model.clone(),
                         status: "success".to_string(),
-                        latency_ms: r.latency_ms,
+                        latency_ms: queue_wait_ms.saturating_add(r.latency_ms),
+                        queue_wait_ms,
+                        provider_latency_ms: r.latency_ms,
+                        priority: priority.as_str().to_string(),
                         prompt_tokens: r.usage.prompt_tokens,
                         completion_tokens: r.usage.completion_tokens,
                         total_tokens: r.usage.total_tokens,
@@ -217,7 +225,10 @@ pub async fn generate(
                         prompt_key: CRITIC_PROMPT_KEY.to_string(),
                         model: provider_model,
                         status: "failed".to_string(),
-                        latency_ms: started_at.elapsed().as_millis() as i64,
+                        latency_ms: queue_wait_ms.saturating_add(provider_elapsed_ms),
+                        queue_wait_ms,
+                        provider_latency_ms: provider_elapsed_ms,
+                        priority: priority.as_str().to_string(),
                         prompt_tokens: 0,
                         completion_tokens: 0,
                         total_tokens: 0,

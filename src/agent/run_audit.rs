@@ -398,6 +398,22 @@ pub(crate) fn stage_timer(name: &'static str) -> RunStageTimer {
     }
 }
 
+pub(crate) fn record_llm_queue_wait(
+    priority: crate::llm_concurrency::LlmPriority,
+    elapsed: Duration,
+) {
+    with_current_audit(|audit| {
+        audit.record_stage("llm_queue_wait", elapsed);
+        audit.record_stage(
+            match priority {
+                crate::llm_concurrency::LlmPriority::Foreground => "llm_queue_wait_foreground",
+                crate::llm_concurrency::LlmPriority::Background => "llm_queue_wait_background",
+            },
+            elapsed,
+        );
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -420,6 +436,9 @@ mod tests {
             model: "test".to_string(),
             status: "success".to_string(),
             latency_ms: 1,
+            queue_wait_ms: 0,
+            provider_latency_ms: 0,
+            priority: "foreground".to_string(),
             prompt_tokens: 1,
             completion_tokens: 1,
             total_tokens: 2,

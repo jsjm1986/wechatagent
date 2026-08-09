@@ -958,8 +958,14 @@ pub(crate) async fn decide_reply_with_promote(
         .map(|o| o.use_frozen_base_if_matches("user.reply.fast.task", task_template.clone()))
         .unwrap_or(task_template);
     let task_template = format!(
-        "{task_template}{}",
+        "{task_template}{}{}",
         super::entitlements::render_suspected_deal_reply_guidance(&active_products),
+        r#"
+
+# 通用事实来源边界（跨行业硬约束）
+- 凡是能被现实核验的陈述，只要是在代表我方、产品、服务、交易、预约、流程、政策、要求、资格、价格、时间地点、交付、结果或专业建议作确定说明，就只能使用本轮明确提供的可信来源：客户本人明确陈述（仅证明客户自身事实）、本轮实际引用的 verified 知识、结构化产品目录或已核实业务记录。
+- 客户的提问/请求不等于答案已被证实；历史我方/AI 回复、模型常识、画像、记忆推断、行业惯例都不能证明我方现实口径。
+- 没有直接依据时，保留有依据的部分；无依据部分应删除、透明说明需要先核对，或最多问一个必要澄清问题。不得为了“具体、有帮助”而补出事实。"#,
     );
     // Profile, taxonomy, memory and analytical instructions belong to the durable
     // post-decision projection. Keeping them out of this prompt prevents the fast

@@ -928,6 +928,10 @@ mod tests {
             mcp,
             llm: Arc::new(NeverLlm),
             llm_registry: None,
+            llm_concurrency: Arc::new(crate::llm_concurrency::LlmConcurrencyGovernor::new(
+                config.llm_max_concurrency,
+                config.llm_foreground_reserved,
+            )),
             config,
             prompt_pack_version: Arc::new(AtomicU64::new(0)),
             chat_progress_bus: Arc::new(crate::knowledge_task::ChatProgressBus::new()),

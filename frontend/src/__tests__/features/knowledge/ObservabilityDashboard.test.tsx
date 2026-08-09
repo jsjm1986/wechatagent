@@ -82,6 +82,10 @@ describe("ObservabilityDashboard catalog envelopes", () => {
       if (String(url).includes("/admin/observability/performance?hours=24")) {
         return response(true, {
           windowHours: 24,
+          llmAdmission: {
+            foreground: { queueWaitMs: { p95: 120 }, providerLatencyMs: { p95: 3400 } },
+            background: { queueWaitMs: { p95: 800 } },
+          },
           operations: {
             runCount: 10,
             knowledge: {
@@ -113,6 +117,9 @@ describe("ObservabilityDashboard catalog envelopes", () => {
     expect(view.getByText("10.0%")).toBeInTheDocument();
     expect(view.getByText("运行降级率")).toBeInTheDocument();
     expect(view.getByText("20.0%")).toBeInTheDocument();
+    expect(view.getByText("120ms")).toBeInTheDocument();
+    expect(view.getByText("3400ms")).toBeInTheDocument();
+    expect(view.getByText("800ms")).toBeInTheDocument();
     expect(view.getByText("knowledge_agent_stopped_usage_unknown (2)")).toBeInTheDocument();
   });
 
@@ -133,7 +140,7 @@ describe("ObservabilityDashboard catalog envelopes", () => {
 
     render(<ObservabilityDashboard />);
     const card = (await screen.findByText("运行效率（24h）")).closest("article") as HTMLElement;
-    expect(within(card).getAllByText("—")).toHaveLength(5);
+    expect(within(card).getAllByText("—")).toHaveLength(8);
     expect(within(card).queryByText("0.0%")).not.toBeInTheDocument();
   });
 

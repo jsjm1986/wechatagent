@@ -133,6 +133,8 @@ pub const GATEWAY_STATUS_VALUES: &[&str] = &[
     // 这次（已过时的）生成，交由调度器用更全的上下文重算。语义是"被更新的入站
     // 取代"（superseded by newer inbound），是外部信号触发的过程态，仍属 AI 自治闭环。
     "superseded_by_new_inbound",
+    // Reaction 与首轮生成并行时，明确停止/冷却信号在 Review/Outbox 前汇合。
+    "user_reaction_stop_requested",
     // #69 作息门控：主动发送（planner/follow_up）在运营方静默时段到点，gateway 把任务
     // **重排**到醒来时刻（status 回 pending + run_at=wake）而非取消——避免丢承诺跟进。
     // 是 AI 自治内的"挑时段送达"过程态，不是失败、更不是把对话交给真人。
@@ -266,9 +268,10 @@ pub fn derive_lifecycle_from_status(gateway_status: &str, error: Option<&str>) -
         // 并发去抖：被更新的入站取代 → 外部信号中止（终态已存在，吸收态）。
         // #69 作息门控：主动发送在静默时段被重排到醒来时刻——同属外部信号（时段）触发
         // 的"本次不送达、改时段重来"，任务仍 pending 等醒来，按吸收态记录而非失败。
-        "superseded_by_new_inbound" | "quiet_hours_deferred" | "stale_task_claim" => {
-            LIFECYCLE_ABORTED_BY_EXTERNAL_SIGNAL
-        }
+        "superseded_by_new_inbound"
+        | "user_reaction_stop_requested"
+        | "quiet_hours_deferred"
+        | "stale_task_claim" => LIFECYCLE_ABORTED_BY_EXTERNAL_SIGNAL,
         _ => LIFECYCLE_FAILED_AFTER_DECISION,
     }
 }
@@ -1153,6 +1156,15 @@ mod tests {
     ///
     /// 这条测试是回归门——任何 PR 把它们从 `GATEWAY_STATUS_VALUES` 删掉，会
     /// 导致 prod 路径写库时 fail-closed 不写库。
+    #[test]
+    fn reaction_stop_is_a_valid_external_abort_status() {
+        assert!(assert_gateway_status_valid("user_reaction_stop_requested").is_ok());
+        assert_eq!(
+            derive_lifecycle_from_status("user_reaction_stop_requested", None),
+            LIFECYCLE_ABORTED_BY_EXTERNAL_SIGNAL,
+        );
+    }
+
     #[test]
     fn gateway_status_values_match_frontend_contract_fixture() {
         crate::routes::contract_snapshot::assert_contract_fixture(

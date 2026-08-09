@@ -35,6 +35,7 @@
   "skipped_duplicate",
   "admin_cancelled",
   "superseded_by_new_inbound",
+  "user_reaction_stop_requested",
   "quiet_hours_deferred",
   "internal_error"
 ]

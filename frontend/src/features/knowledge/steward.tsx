@@ -1973,9 +1973,32 @@ interface MetricScope {
   updatedAt?: string | null;
 }
 
+interface LatencySummary {
+  count?: number;
+  mean?: number | null;
+  p50?: number | null;
+  p95?: number | null;
+  p99?: number | null;
+  max?: number | null;
+}
+
+interface LlmAdmissionSummary {
+  calls?: number;
+  endToEndMs?: LatencySummary;
+  queueWaitMs?: LatencySummary;
+  providerLatencyMs?: LatencySummary;
+}
+
 interface PerformanceSummaryResponse {
   windowHours?: number;
   truncated?: boolean;
+  llmTruncated?: boolean;
+  llmAdmission?: {
+    overall?: LlmAdmissionSummary;
+    foreground?: LlmAdmissionSummary;
+    background?: LlmAdmissionSummary;
+    legacyUnclassified?: LlmAdmissionSummary;
+  };
   operations?: {
     runCount?: number;
     knowledge?: {
@@ -2572,8 +2595,12 @@ export function ObservabilityDashboard() {
             const usage = operations?.usage;
             const degradation = operations?.degradation ?? operations?.budget;
             const topReason = degradation?.reasonsTop?.[0];
+            const foregroundLlm = performanceSummary.llmAdmission?.foreground;
+            const backgroundLlm = performanceSummary.llmAdmission?.background;
             const percent = (value?: number | null) =>
               typeof value === "number" ? `${(value * 100).toFixed(1)}%` : "—";
+            const millis = (value?: number | null) =>
+              typeof value === "number" ? `${Math.round(value)}ms` : "—";
             return (
               <dl className="wikiArchiveMeta">
                 <dt>运行样本</dt>
@@ -2591,6 +2618,16 @@ export function ObservabilityDashboard() {
                 <dt>运行降级率</dt>
                 <dd className={(degradation?.degradedRuns ?? 0) > 0 ? "wikiObservabilityDrift" : undefined}>
                   {percent(degradation?.degradedRunRate)}
+                </dd>
+                <dt>前台 LLM 排队 p95</dt>
+                <dd className={(foregroundLlm?.queueWaitMs?.p95 ?? 0) > 1000 ? "wikiObservabilityDrift" : undefined}>
+                  {millis(foregroundLlm?.queueWaitMs?.p95)}
+                </dd>
+                <dt>前台供应商 p95</dt>
+                <dd>{millis(foregroundLlm?.providerLatencyMs?.p95)}</dd>
+                <dt>后台 LLM 排队 p95</dt>
+                <dd className={(backgroundLlm?.queueWaitMs?.p95 ?? 0) > 5000 ? "wikiObservabilityDrift" : undefined}>
+                  {millis(backgroundLlm?.queueWaitMs?.p95)}
                 </dd>
                 <dt>首要降级原因</dt>
                 <dd title={topReason?.reason}>{topReason ? `${topReason.reason} (${topReason.count})` : "—"}</dd>

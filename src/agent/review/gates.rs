@@ -720,6 +720,109 @@ pub(crate) fn finalize_review_for_send_at(
         };
     }
 
+    // Revalidate verified evidence at the actual send boundary. ClaimGate and Reviewer may finish
+    // just before a chunk expires; a non-product claim must not retain authorization from a source
+    // that is no longer verified at finalize time. Product claims remain owned by R5.4 below so
+    // their established blocked_unverified_product_claim status and exemptions stay unchanged.
+    let verified_at_finalize = crate::agent::guards::compute_verified_chunks(
+        &decision.used_knowledge_ids,
+        knowledge_chunks,
+        evaluated_at,
+    )
+    .into_iter()
+    .filter_map(|chunk| {
+        chunk
+            .id
+            .map(|id| format!("verified_knowledge:{}", id.to_hex()))
+    })
+    .collect::<std::collections::HashSet<_>>();
+    let stale_non_product_evidence = review
+        .claim_analysis
+        .get_array("claimManifest")
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_document())
+        .filter(|claim| {
+            claim.get_bool("requiresEvidence").unwrap_or(false)
+                && !claim.get_bool("productClaim").unwrap_or(false)
+        })
+        .flat_map(|claim| {
+            claim
+                .get_array("evidenceRefs")
+                .ok()
+                .into_iter()
+                .flatten()
+                .filter_map(|value| value.as_str())
+        })
+        .any(|evidence_ref| {
+            evidence_ref.starts_with("verified_knowledge:")
+                && !verified_at_finalize.contains(evidence_ref)
+        });
+    if stale_non_product_evidence {
+        review.approved = false;
+        review.scores.hallucination_score = review.scores.hallucination_score.max(6);
+        extend_risks_unique(
+            &mut review.risks,
+            std::iter::once("business_claim_evidence_expired_before_send".to_string()),
+        );
+        decision.should_reply = false;
+        decision.autonomy_mode = "blocked".to_string();
+        pending_events.push(PendingFinalizeEvent {
+            kind: "business_claim_evidence_expired".to_string(),
+            status: "blocked".to_string(),
+            summary: "业务事实证据在发送前已失效，候选回复被安全拦截".to_string(),
+            details: mongodb::bson::doc! {
+                "used_knowledge_ids": decision.used_knowledge_ids.clone(),
+            },
+        });
+        review.final_review_status = "blocked_by_safety_guard".to_string();
+        return FinalizeOutcome {
+            review,
+            status: GatewayStatusFinal::BlockedBySafetyGuard,
+            pending_events,
+        };
+    }
+
+    // Open-world business evidence gate. The independent semantic ClaimGate extracts atomic
+    // assertions, while the service validates candidate quotes and evidence IDs. Product claims
+    // keep their established R5.4 authorization paths below (verified knowledge, catalog, or
+    // principal exemption); only unsupported non-product business facts are stopped here.
+    let unsupported_non_product = review
+        .claim_analysis
+        .get_i64("unsupportedNonProductBusinessClaimCount")
+        .unwrap_or(0);
+    if unsupported_non_product > 0 {
+        review.approved = false;
+        review.scores.hallucination_score = review.scores.hallucination_score.max(6);
+        extend_risks_unique(
+            &mut review.risks,
+            std::iter::once("unsupported_business_claim".to_string()),
+        );
+        decision.should_reply = false;
+        decision.autonomy_mode = "blocked".to_string();
+        let manifest = review
+            .claim_analysis
+            .get_array("claimManifest")
+            .cloned()
+            .unwrap_or_default();
+        pending_events.push(PendingFinalizeEvent {
+            kind: "unsupported_business_claim_blocked".to_string(),
+            status: "blocked".to_string(),
+            summary: "候选回复仍含没有可信来源支持的现实业务事实，发送前已拦截".to_string(),
+            details: mongodb::bson::doc! {
+                "unsupported_non_product_claim_count": unsupported_non_product,
+                "claim_manifest": manifest,
+            },
+        });
+        review.final_review_status = "blocked_by_safety_guard".to_string();
+        return FinalizeOutcome {
+            review,
+            status: GatewayStatusFinal::BlockedBySafetyGuard,
+            pending_events,
+        };
+    }
+
     // ── R5.4：verified knowledge 产品声明强约束 ──
     //
     // CLAUDE.md 硬规则：产品声明必须由 operation_knowledge_chunks 中 verified
@@ -1617,8 +1720,9 @@ mod dual_gate_classification_tests {
 
     use super::{
         classify_dual_gate, contact_has_principal_product_exemption, decide_revision,
-        finalize_review_for_send, reply_objective_features, review_passed, route_dual_gate,
-        DualGateClassification, FinalizeOutcome, GatewayStatusFinal, RevisionDecision,
+        finalize_review_for_send, finalize_review_for_send_at, reply_objective_features,
+        review_passed, route_dual_gate, DualGateClassification, FinalizeOutcome,
+        GatewayStatusFinal, RevisionDecision,
     };
     use crate::agent::runtime::UserRuntimeParameters;
     use crate::agent::types::{
@@ -2282,6 +2386,137 @@ mod dual_gate_classification_tests {
             locked_fields: None,
             chunk_type: "product_fact".to_string(),
         }
+    }
+
+    #[test]
+    fn finalize_blocks_unsupported_non_product_business_claim() {
+        let runtime = UserRuntimeParameters::default();
+        let mut review = full_pass_review();
+        review.claim_analysis = mongodb::bson::doc! {
+            "requiresProductKnowledge": false,
+            "requiresBusinessEvidence": true,
+            "unsupportedNonProductBusinessClaimCount": 1_i64,
+            "claimManifest": [{
+                "sourceQuote": "到店前带身份证",
+                "claim": "到店必须携带身份证",
+                "scope": "visit_requirement",
+                "productClaim": false,
+                "requiresEvidence": true,
+                "evidenceRefs": Vec::<String>::new(),
+                "supported": false,
+            }],
+        };
+        let mut decision = shouldreply_decision();
+        decision.reply_text = "到店前带身份证就行".to_string();
+        let contact = finalize_contact();
+        let outcome = finalize_review_for_send(
+            review,
+            &mut decision,
+            &runtime,
+            &contact,
+            &[],
+            Vec::new(),
+            "到店要带什么",
+            &crate::models::CommitmentMarkers::default(),
+            false,
+            false,
+        );
+        assert_eq!(outcome.status, GatewayStatusFinal::BlockedBySafetyGuard);
+        assert!(!decision.should_reply);
+        assert_eq!(decision.autonomy_mode, "blocked");
+        assert_eq!(
+            outcome.review.final_review_status,
+            "blocked_by_safety_guard"
+        );
+        assert!(outcome
+            .pending_events
+            .iter()
+            .any(|event| event.kind == "unsupported_business_claim_blocked"));
+    }
+
+    #[test]
+    fn finalize_allows_supported_non_product_business_claim() {
+        let runtime = UserRuntimeParameters::default();
+        let mut review = full_pass_review();
+        review.claim_analysis = mongodb::bson::doc! {
+            "requiresProductKnowledge": false,
+            "requiresBusinessEvidence": true,
+            "unsupportedNonProductBusinessClaimCount": 0_i64,
+            "claimManifest": [{
+                "sourceQuote": "明天下午三点见",
+                "claim": "客户已约明天下午三点",
+                "scope": "appointment",
+                "productClaim": false,
+                "requiresEvidence": true,
+                "evidenceRefs": ["current_user_message"],
+                "supported": true,
+            }],
+        };
+        let mut decision = shouldreply_decision();
+        decision.reply_text = "好的，明天下午三点见".to_string();
+        let contact = finalize_contact();
+        let outcome = finalize_review_for_send(
+            review,
+            &mut decision,
+            &runtime,
+            &contact,
+            &[],
+            Vec::new(),
+            "明天下午三点可以",
+            &crate::models::CommitmentMarkers::default(),
+            false,
+            false,
+        );
+        assert_eq!(outcome.status, GatewayStatusFinal::Approved);
+        assert!(decision.should_reply);
+    }
+
+    #[test]
+    fn finalize_blocks_non_product_claim_when_verified_evidence_expires_before_send() {
+        let runtime = UserRuntimeParameters::default();
+        let mut review = full_pass_review();
+        let mut chunk = mk_chunk("verified");
+        let chunk_id = chunk.id.expect("chunk id").to_hex();
+        let evaluated_at = DateTime::from_millis(2_000);
+        chunk.valid_to = Some(DateTime::from_millis(1_999));
+        review.claim_analysis = mongodb::bson::doc! {
+            "requiresProductKnowledge": false,
+            "unsupportedNonProductBusinessClaimCount": 0_i64,
+            "claimManifest": [{
+                "sourceQuote": "门店提供无障碍通道",
+                "claim": "门店提供无障碍通道",
+                "scope": "accessibility",
+                "subject": "business",
+                "productClaim": false,
+                "requiresEvidence": true,
+                "evidenceRefs": [format!("verified_knowledge:{chunk_id}")],
+                "supported": true,
+            }],
+        };
+        let mut decision = shouldreply_decision();
+        decision.reply_text = "门店提供无障碍通道".to_string();
+        decision.used_knowledge_ids = vec![chunk_id];
+        let contact = finalize_contact();
+        let outcome = finalize_review_for_send_at(
+            review,
+            &mut decision,
+            &runtime,
+            &contact,
+            std::slice::from_ref(&chunk),
+            Vec::new(),
+            "请问有无障碍通道吗",
+            &crate::models::CommitmentMarkers::default(),
+            false,
+            false,
+            evaluated_at,
+        );
+        assert_eq!(outcome.status, GatewayStatusFinal::BlockedBySafetyGuard);
+        assert!(!decision.should_reply);
+        assert!(outcome
+            .review
+            .risks
+            .iter()
+            .any(|risk| risk == "business_claim_evidence_expired_before_send"));
     }
 
     #[test]

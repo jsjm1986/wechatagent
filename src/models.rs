@@ -3861,7 +3861,17 @@ pub struct LlmCallLog {
     pub prompt_key: String,
     pub model: String,
     pub status: String,
+    /// End-to-end local latency: admission queue + upstream provider call.
     pub latency_ms: i64,
+    /// Time waiting for the process-local LLM concurrency governor.
+    #[serde(default)]
+    pub queue_wait_ms: i64,
+    /// Upstream provider/retry latency, excluding local admission wait.
+    #[serde(default)]
+    pub provider_latency_ms: i64,
+    /// `foreground` or `background`; legacy rows default to empty.
+    #[serde(default)]
+    pub priority: String,
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
     pub total_tokens: i64,

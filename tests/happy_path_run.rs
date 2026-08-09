@@ -540,7 +540,10 @@ async fn autonomy_tool_loop_happy_path() {
         "知识路由已扫过 list_catalog/open_chunk/answer，回复未越界做产品承诺，整体可放行。",
     ));
     app.llm
-        .push_response(common::independent_claim_gate_verified_knowledge_json());
+        .push_response(common::independent_claim_gate_verified_knowledge_json(
+            &chunk_id,
+            "覆盖账号纳管、自动应答、手动指令三类",
+        ));
 
     let before_calls = app.llm.calls();
     handle_managed_message(&app.state, contact.clone(), &inbound)

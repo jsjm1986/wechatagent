@@ -36,11 +36,20 @@ pub struct AppConfig {
     /// 默认 2000ms，在连续输入合并与首响速度间取平衡；clamp 到 [1000, 10000]。
     pub message_debounce_window_ms: u64,
     pub task_worker_interval_seconds: u64,
+    /// Durable inbound backlog recovery concurrency. Tasks for the same contact are
+    /// deduplicated per scan; task claim CAS remains the cross-process authority.
+    pub inbound_reply_worker_concurrency: usize,
     /// F-013：completeness 缓存 TTL（秒）。默认 300。
     pub completeness_cache_ttl_seconds: i64,
     pub llm_timeout_seconds: u64,
     pub llm_max_retries: u32,
     pub llm_retry_base_ms: u64,
+    /// Process-local shared-provider concurrency cap. Every public Agent LLM
+    /// entry point acquires this governor before crossing the HTTP boundary.
+    pub llm_max_concurrency: usize,
+    /// Permits unavailable to durable background work, but usable by foreground
+    /// Reply/Knowledge/Review/Reaction calls.
+    pub llm_foreground_reserved: usize,
     /// 发送后投影 worker 并发数。跨进程 contact lease 保证同联系人仍串行。
     pub post_decision_worker_concurrency: usize,
     /// 单条发送后投影最多认领次数；耗尽后进入 failed_terminal，避免永久热循环。
@@ -482,11 +491,20 @@ impl AppConfig {
                 .parse::<u64>()?
                 .clamp(1000, 10_000),
             task_worker_interval_seconds: env_or("TASK_WORKER_INTERVAL_SECONDS", "30").parse()?,
+            inbound_reply_worker_concurrency: env_or("INBOUND_REPLY_WORKER_CONCURRENCY", "4")
+                .parse::<usize>()?
+                .clamp(1, 32),
             completeness_cache_ttl_seconds: env_or("COMPLETENESS_CACHE_TTL_SECONDS", "300")
                 .parse()?,
             llm_timeout_seconds: env_or("LLM_TIMEOUT_SECONDS", "45").parse()?,
             llm_max_retries: env_or("LLM_MAX_RETRIES", "5").parse()?,
             llm_retry_base_ms: env_or("LLM_RETRY_BASE_MS", "1500").parse()?,
+            llm_max_concurrency: env_or("LLM_MAX_CONCURRENCY", "4")
+                .parse::<usize>()?
+                .clamp(1, 64),
+            llm_foreground_reserved: env_or("LLM_FOREGROUND_RESERVED", "2")
+                .parse::<usize>()?
+                .clamp(1, 64),
             post_decision_worker_concurrency: env_or("POST_DECISION_WORKER_CONCURRENCY", "4")
                 .parse::<usize>()?
                 .clamp(1, 32),
@@ -658,7 +676,7 @@ impl AppConfig {
             progressive_tier_enabled: parse_bool(&env_or("PROGRESSIVE_TIER_ENABLED", "true")),
             reaction_gateway_parallel_enabled: parse_bool(&env_or(
                 "REACTION_GATEWAY_PARALLEL_ENABLED",
-                "false",
+                "true",
             )),
             knowledge_exploration_temperature: env_or("KNOWLEDGE_EXPLORATION_TEMPERATURE", "1.0")
                 .parse()?,

@@ -230,7 +230,7 @@ static LLM_EXACT_CACHE: LazyLock<PlMutex<LruCache<String, Value>>> = LazyLock::n
 const FAST_REPLY_MAX_OUTPUT_TOKENS: u32 = 8192;
 pub(crate) const LIGHT_REVIEWER_MAX_OUTPUT_TOKENS: u32 = 3072;
 pub(crate) const REVIEWER_MAX_OUTPUT_TOKENS: u32 = 8192;
-const CLAIM_GATE_MAX_OUTPUT_TOKENS: u32 = 1536;
+const CLAIM_GATE_MAX_OUTPUT_TOKENS: u32 = 3072;
 
 fn critical_path_output_token_limit(prompt_key: &str) -> Option<u32> {
     match prompt_key {
@@ -318,6 +318,11 @@ pub(crate) async fn generate_agent_json(
                     model: provider_model.to_string(),
                     status: "cache_hit".to_string(),
                     latency_ms: DateTime::now().timestamp_millis() - started_at.timestamp_millis(),
+                    queue_wait_ms: 0,
+                    provider_latency_ms: 0,
+                    priority: crate::llm_concurrency::priority_for_prompt(prompt_key)
+                        .as_str()
+                        .to_string(),
                     prompt_tokens: 0,
                     completion_tokens: 0,
                     total_tokens: 0,
@@ -335,6 +340,11 @@ pub(crate) async fn generate_agent_json(
         }
     }
     reserve_current_run_llm_attempt()?;
+    let priority = crate::llm_concurrency::priority_for_prompt(prompt_key);
+    let admission = state.llm_concurrency.acquire(priority).await;
+    let queue_wait = admission.queue_wait();
+    run_audit::record_llm_queue_wait(priority, queue_wait);
+    let provider_started = std::time::Instant::now();
     let output_limit = critical_path_output_token_limit(prompt_key);
     let generated = match (&registry_snapshot, output_limit) {
         (Some(snapshot), Some(limit)) => {
@@ -351,6 +361,8 @@ pub(crate) async fn generate_agent_json(
         }
         (None, None) => state.llm.generate_json_with_usage(system, user).await,
     };
+    let provider_elapsed_ms = provider_started.elapsed().as_millis().min(i64::MAX as u128) as i64;
+    drop(admission);
     match generated {
         Ok(result) => {
             let usage = result.usage.clone();
@@ -372,6 +384,9 @@ pub(crate) async fn generate_agent_json(
                 result.latency_ms,
                 &usage,
                 retry_count_i32,
+                queue_wait.as_millis().min(i64::MAX as u128) as i64,
+                result.latency_ms,
+                priority,
                 started_at,
             )
             .await;
@@ -402,6 +417,9 @@ pub(crate) async fn generate_agent_json(
                 prompt_key,
                 provider_model,
                 &error,
+                queue_wait.as_millis().min(i64::MAX as u128) as i64,
+                provider_elapsed_ms,
+                priority,
                 started_at,
             )
             .await;
@@ -463,6 +481,11 @@ pub(crate) async fn generate_agent_json_streaming(
         })
         .unwrap_or(("injected", state.config.openai_model.as_str()));
     reserve_current_run_llm_attempt()?;
+    let priority = crate::llm_concurrency::priority_for_prompt(prompt_key);
+    let admission = state.llm_concurrency.acquire(priority).await;
+    let queue_wait = admission.queue_wait();
+    run_audit::record_llm_queue_wait(priority, queue_wait);
+    let provider_started = std::time::Instant::now();
     let generated = match &registry_snapshot {
         Some(snapshot) => {
             snapshot
@@ -476,6 +499,8 @@ pub(crate) async fn generate_agent_json_streaming(
                 .await
         }
     };
+    let provider_elapsed_ms = provider_started.elapsed().as_millis().min(i64::MAX as u128) as i64;
+    drop(admission);
     match generated {
         Ok(result) => {
             let usage = result.usage.clone();
@@ -493,6 +518,9 @@ pub(crate) async fn generate_agent_json_streaming(
                 result.latency_ms,
                 &usage,
                 retry_count_i32,
+                queue_wait.as_millis().min(i64::MAX as u128) as i64,
+                result.latency_ms,
+                priority,
                 started_at,
             )
             .await;
@@ -519,6 +547,9 @@ pub(crate) async fn generate_agent_json_streaming(
                 prompt_key,
                 provider_model,
                 &error,
+                queue_wait.as_millis().min(i64::MAX as u128) as i64,
+                provider_elapsed_ms,
+                priority,
                 started_at,
             )
             .await;
@@ -590,10 +621,17 @@ pub(crate) async fn generate_agent_json_with_provider(
 ) -> AppResult<Value> {
     let started_at = DateTime::now();
     reserve_current_run_llm_attempt()?;
-    match provider
+    let priority = crate::llm_concurrency::priority_for_prompt(prompt_key);
+    let admission = state.llm_concurrency.acquire(priority).await;
+    let queue_wait = admission.queue_wait();
+    run_audit::record_llm_queue_wait(priority, queue_wait);
+    let provider_started = std::time::Instant::now();
+    let generated = provider
         .generate_json_with_usage_limit(system, user, max_output_tokens)
-        .await
-    {
+        .await;
+    let provider_elapsed_ms = provider_started.elapsed().as_millis().min(i64::MAX as u128) as i64;
+    drop(admission);
+    match generated {
         Ok(result) => {
             let usage = result.usage.clone();
             let value = result.value;
@@ -609,6 +647,9 @@ pub(crate) async fn generate_agent_json_with_provider(
                 result.latency_ms,
                 &usage,
                 result.retry_count.min(i32::MAX as u32) as i32,
+                queue_wait.as_millis().min(i64::MAX as u128) as i64,
+                result.latency_ms,
+                priority,
                 started_at,
             )
             .await;
@@ -625,6 +666,9 @@ pub(crate) async fn generate_agent_json_with_provider(
                 prompt_key,
                 provider_model,
                 &error,
+                queue_wait.as_millis().min(i64::MAX as u128) as i64,
+                provider_elapsed_ms,
+                priority,
                 started_at,
             )
             .await;
@@ -659,6 +703,9 @@ async fn log_llm_call_success(
     latency_ms: i64,
     usage: &crate::llm::ChatUsage,
     retry_count_i32: i32,
+    queue_wait_ms: i64,
+    provider_latency_ms: i64,
+    priority: crate::llm_concurrency::LlmPriority,
     started_at: DateTime,
 ) {
     persist_llm_call_log(
@@ -673,7 +720,10 @@ async fn log_llm_call_success(
             prompt_key: prompt_key.to_string(),
             model,
             status: "success".to_string(),
-            latency_ms,
+            latency_ms: queue_wait_ms.saturating_add(latency_ms),
+            queue_wait_ms,
+            provider_latency_ms,
+            priority: priority.as_str().to_string(),
             prompt_tokens: usage.prompt_tokens,
             completion_tokens: usage.completion_tokens,
             total_tokens: usage.total_tokens,
@@ -700,6 +750,9 @@ async fn log_llm_call_failure(
     prompt_key: &str,
     model: &str,
     error: &AppError,
+    queue_wait_ms: i64,
+    provider_latency_ms: i64,
+    priority: crate::llm_concurrency::LlmPriority,
     started_at: DateTime,
 ) {
     let final_status = match error {
@@ -718,7 +771,10 @@ async fn log_llm_call_failure(
             prompt_key: prompt_key.to_string(),
             model: model.to_string(),
             status: "failed".to_string(),
-            latency_ms: DateTime::now().timestamp_millis() - started_at.timestamp_millis(),
+            latency_ms: queue_wait_ms.saturating_add(provider_latency_ms),
+            queue_wait_ms,
+            provider_latency_ms,
+            priority: priority.as_str().to_string(),
             prompt_tokens: 0,
             completion_tokens: 0,
             total_tokens: 0,

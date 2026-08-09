@@ -1866,21 +1866,35 @@ pub(crate) async fn select_vision_provider(
 /// 不可达时在候选链上自动切换到下一备用；非瞬时错误立即失败（换模型也救不了）；
 /// 全部候选都瞬时不可达才上抛最后一个瞬时变体，让上游按瞬时态处理而非当成内容失败。
 /// 供知识库导入与运营 Agent 入站图片理解复用同一条调用/容错逻辑。
+pub(crate) struct VisionGenerateRequest<'a> {
+    pub priority: crate::llm_concurrency::LlmPriority,
+    pub system_prompt: &'a str,
+    pub user_prompt: &'a str,
+    pub image_base64: &'a str,
+    pub mime: &'a str,
+    pub required_text_field: &'a str,
+}
+
 pub(crate) async fn vision_generate_json(
     provider: &VisionProvider,
     state: &AppState,
-    system_prompt: &str,
-    user_prompt: &str,
-    image_base64: &str,
-    mime: &str,
-    required_text_field: &str,
+    request: VisionGenerateRequest<'_>,
 ) -> AppResult<Value> {
+    let VisionGenerateRequest {
+        priority,
+        system_prompt,
+        user_prompt,
+        image_base64,
+        mime,
+        required_text_field,
+    } = request;
     match provider {
         VisionProvider::Runtime(snapshot) => {
             let mut last_contract_error = None;
             for attempt in 0..VISION_REQUIRED_FIELD_MAX_ATTEMPTS {
                 let attempt_prompt =
                     vision_user_prompt_for_attempt(user_prompt, required_text_field, attempt);
+                let admission = state.llm_concurrency.acquire(priority).await;
                 let generated = match snapshot {
                     Some(snapshot) => {
                         snapshot
@@ -1904,6 +1918,7 @@ pub(crate) async fn vision_generate_json(
                             .await
                     }
                 };
+                drop(admission);
                 let value = generated.map_err(|e| match e {
                     // 瞬时不可达（429/限流/配额耗尽/网关超时）原样透传结构化变体，
                     // 让上游（测试 skip 宏、网关回退逻辑）按瞬时态处理而非当成内容失败。
@@ -1936,15 +1951,17 @@ pub(crate) async fn vision_generate_json(
                 for attempt in 0..VISION_REQUIRED_FIELD_MAX_ATTEMPTS {
                     let attempt_prompt =
                         vision_user_prompt_for_attempt(user_prompt, required_text_field, attempt);
-                    match client
+                    let admission = state.llm_concurrency.acquire(priority).await;
+                    let generated = client
                         .generate_json_with_image(
                             system_prompt,
                             &attempt_prompt,
                             image_base64,
                             mime,
                         )
-                        .await
-                    {
+                        .await;
+                    drop(admission);
+                    match generated {
                         Ok(v) => match require_non_empty_vision_text(v, required_text_field) {
                             Ok(v) => {
                                 result = Some(Ok(v));
@@ -2050,11 +2067,14 @@ pub async fn import_operation_knowledge_apply_image(
     let value = vision_generate_json(
         &vision_provider,
         &state,
-        &system_prompt,
-        &user_prompt,
-        &req.image_base64,
-        mime,
-        "fence",
+        VisionGenerateRequest {
+            priority: crate::llm_concurrency::LlmPriority::Background,
+            system_prompt: &system_prompt,
+            user_prompt: &user_prompt,
+            image_base64: &req.image_base64,
+            mime,
+            required_text_field: "fence",
+        },
     )
     .await?;
     let raw = value

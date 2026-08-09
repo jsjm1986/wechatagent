@@ -290,6 +290,9 @@ pub struct AppState {
     /// resolve an immutable snapshot by request workspace; provider changes only
     /// replace that workspace slot. Tests may set this to `None` and use `llm`.
     pub llm_registry: Option<Arc<LlmRegistry>>,
+    /// Shared-provider admission control. Background projections/consolidation
+    /// cannot consume the permits reserved for customer-facing work.
+    pub llm_concurrency: Arc<crate::llm_concurrency::LlmConcurrencyGovernor>,
     pub config: AppConfig,
     /// agent-self-evolution M4 W4 Task 5.3：prompt 包版本号。
     ///

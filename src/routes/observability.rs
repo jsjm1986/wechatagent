@@ -174,14 +174,36 @@ pub(super) async fn performance_summary(
         .limit(PERFORMANCE_MAX_ROWS)
         .build();
     let coll = state.db.raw().collection::<Document>("agent_run_logs");
-    let mut cursor = coll.find(filter, options).await?;
-    let mut rows = Vec::new();
-    while let Some(row) = cursor.try_next().await? {
-        rows.push(row);
+    let mut llm_filter = doc! {
+        "workspace_id": &admin.current_workspace,
+        "created_at": {
+            "$gte": DateTime::from_millis(since_ms),
+            "$lte": DateTime::from_millis(as_of_ms),
+        },
+    };
+    if let Some(account_id) = account_id {
+        llm_filter.insert("account_id", account_id);
     }
+    let llm_options = FindOptions::builder()
+        .projection(doc! {
+            "priority": 1,
+            "latency_ms": 1,
+            "queue_wait_ms": 1,
+            "provider_latency_ms": 1,
+        })
+        .sort(doc! { "created_at": -1 })
+        .limit(PERFORMANCE_MAX_ROWS)
+        .build();
+    let llm_coll = state.db.raw().collection::<Document>("llm_call_logs");
+    let (rows, llm_rows) = tokio::try_join!(
+        collect_documents(coll.find(filter, options).await?),
+        collect_documents(llm_coll.find(llm_filter, llm_options).await?),
+    )?;
     let truncated = rows.len() as i64 == PERFORMANCE_MAX_ROWS;
+    let llm_truncated = llm_rows.len() as i64 == PERFORMANCE_MAX_ROWS;
     let summary = aggregate_performance_rows(&rows);
     let operations = aggregate_operation_rows(&rows);
+    let llm_admission = aggregate_llm_admission_rows(&llm_rows);
 
     Ok(Json(json!({
         "asOf": datetime_string(as_of_ms),
@@ -191,10 +213,71 @@ pub(super) async fn performance_summary(
         "filters": { "accountId": account_id, "path": path_filter },
         "sampleLimit": PERFORMANCE_MAX_ROWS,
         "truncated": truncated,
+        "llmTruncated": llm_truncated,
         "overall": summary.0,
         "byPath": summary.1,
         "operations": operations,
+        "llmAdmission": llm_admission,
     })))
+}
+
+async fn collect_documents(mut cursor: mongodb::Cursor<Document>) -> AppResult<Vec<Document>> {
+    let mut rows = Vec::new();
+    while let Some(row) = cursor.try_next().await? {
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
+#[derive(Default)]
+struct LlmLatencyBucket {
+    end_to_end_ms: Vec<i64>,
+    queue_wait_ms: Vec<i64>,
+    provider_latency_ms: Vec<i64>,
+}
+
+impl LlmLatencyBucket {
+    fn push(&mut self, row: &Document) {
+        if let Some(value) = document_i64(row, "latency_ms") {
+            self.end_to_end_ms.push(value.max(0));
+        }
+        if let Some(value) = document_i64(row, "queue_wait_ms") {
+            self.queue_wait_ms.push(value.max(0));
+        }
+        if let Some(value) = document_i64(row, "provider_latency_ms") {
+            self.provider_latency_ms.push(value.max(0));
+        }
+    }
+
+    fn into_value(mut self) -> Value {
+        json!({
+            "calls": self.end_to_end_ms.len(),
+            "endToEndMs": summarize_values(&mut self.end_to_end_ms),
+            "queueWaitMs": summarize_values(&mut self.queue_wait_ms),
+            "providerLatencyMs": summarize_values(&mut self.provider_latency_ms),
+        })
+    }
+}
+
+fn aggregate_llm_admission_rows(rows: &[Document]) -> Value {
+    let mut overall = LlmLatencyBucket::default();
+    let mut foreground = LlmLatencyBucket::default();
+    let mut background = LlmLatencyBucket::default();
+    let mut legacy = LlmLatencyBucket::default();
+    for row in rows {
+        overall.push(row);
+        match row.get_str("priority").unwrap_or_default() {
+            "foreground" => foreground.push(row),
+            "background" => background.push(row),
+            _ => legacy.push(row),
+        }
+    }
+    json!({
+        "overall": overall.into_value(),
+        "foreground": foreground.into_value(),
+        "background": background.into_value(),
+        "legacyUnclassified": legacy.into_value(),
+    })
 }
 
 fn aggregate_performance_rows(rows: &[Document]) -> (Value, Value) {
@@ -1472,6 +1555,36 @@ mod tests {
         let empty_summary = summarize_values(&mut empty);
         assert_eq!(empty_summary["count"], 0);
         assert!(empty_summary["p50"].is_null());
+    }
+
+    #[test]
+    fn llm_admission_rows_split_priorities_and_keep_latency_dimensions() {
+        let rows = vec![
+            doc! {
+                "priority": "foreground",
+                "latency_ms": 120_i64,
+                "queue_wait_ms": 20_i64,
+                "provider_latency_ms": 100_i64,
+            },
+            doc! {
+                "priority": "background",
+                "latency_ms": 450_i64,
+                "queue_wait_ms": 50_i64,
+                "provider_latency_ms": 400_i64,
+            },
+            doc! {
+                "latency_ms": 70_i64,
+                "queue_wait_ms": 0_i64,
+                "provider_latency_ms": 70_i64,
+            },
+        ];
+        let summary = aggregate_llm_admission_rows(&rows);
+        assert_eq!(summary["overall"]["calls"], 3);
+        assert_eq!(summary["foreground"]["calls"], 1);
+        assert_eq!(summary["foreground"]["queueWaitMs"]["p95"], 20);
+        assert_eq!(summary["foreground"]["providerLatencyMs"]["p95"], 100);
+        assert_eq!(summary["background"]["queueWaitMs"]["p95"], 50);
+        assert_eq!(summary["legacyUnclassified"]["calls"], 1);
     }
 
     #[test]

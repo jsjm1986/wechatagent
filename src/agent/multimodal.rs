@@ -80,11 +80,14 @@ pub async fn describe_inbound_image(
     let value = crate::routes::knowledge::vision_generate_json(
         &provider,
         state,
-        system_prompt,
-        user_prompt,
-        image_base64,
-        mime,
-        "description",
+        crate::routes::knowledge::VisionGenerateRequest {
+            priority: crate::llm_concurrency::LlmPriority::Foreground,
+            system_prompt,
+            user_prompt,
+            image_base64,
+            mime,
+            required_text_field: "description",
+        },
     )
     .await?;
     let description = value
