@@ -749,6 +749,12 @@ pub async fn build_operation_knowledge_completeness(
         serde_json::to_string(&summaries).unwrap_or_default(),
         serde_json::to_string(&pending).unwrap_or_default()
     );
+    // Completeness is also requested interactively by the admin UI. Keep it foreground so a
+    // dashboard refresh is not queued behind durable background work.
+    let admission = state
+        .llm_concurrency
+        .acquire(crate::llm_concurrency::LlmPriority::Foreground)
+        .await;
     let generated = match &state.llm_registry {
         Some(registry) => match registry.snapshot(workspace_id).await {
             Ok(snapshot) => snapshot.generate_json(system, &user).await,
@@ -756,6 +762,7 @@ pub async fn build_operation_knowledge_completeness(
         },
         None => state.llm.generate_json(system, &user).await,
     };
+    drop(admission);
     let audit = generated.unwrap_or(fallback);
     let resolved_mode =
         json_string(&audit, "answeringMode").unwrap_or_else(|| fallback_mode.to_string());

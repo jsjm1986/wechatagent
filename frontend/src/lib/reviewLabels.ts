@@ -40,7 +40,7 @@ export const REVIEW_PHASE_LABELS: Record<string, string> = {
   review_recorded: "复核已记录",
 };
 
-// gateway 过程态闭集由 gateway_status_values.fixture.json 对账，当前 38 值→中文。
+// gateway 过程态闭集由 gateway_status_values.fixture.json 对账，当前 39 值→中文。
 // 单一真相源:先展开 FINAL_REVIEW_STATUS_LABELS(两闭集交集键复用同一措辞,消除口径漂移),
 // 再补 gateway 独有的过程态键。default 回落原值(labelOf),未来新值不崩。
 export const GATEWAY_STATUS_LABELS: Record<string, string> = {
@@ -72,6 +72,7 @@ export const GATEWAY_STATUS_LABELS: Record<string, string> = {
   skipped_duplicate: "重复任务已跳过",
   admin_cancelled: "管理员已取消",
   superseded_by_new_inbound: "被更新消息取代",
+  user_reaction_stop_requested: "客户要求停止触达",
   quiet_hours_deferred: "作息时段顺延",
   internal_error: "系统内部错误",
 };

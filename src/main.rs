@@ -171,6 +171,10 @@ async fn async_main() -> anyhow::Result<()> {
         mcp: McpClient::new(config.mcp_base_url.clone(), config.mcp_api_key.clone())?,
         llm,
         llm_registry: Some(registry.clone()),
+        llm_concurrency: Arc::new(wechatagent::llm_concurrency::LlmConcurrencyGovernor::new(
+            config.llm_max_concurrency,
+            config.llm_foreground_reserved,
+        )),
         config: config.clone(),
         prompt_pack_version: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         chat_progress_bus: std::sync::Arc::new(wechatagent::knowledge_task::ChatProgressBus::new()),

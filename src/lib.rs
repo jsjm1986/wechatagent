@@ -21,6 +21,7 @@ pub mod knowledge_digest;
 pub mod knowledge_task;
 pub mod knowledge_wiki;
 pub mod llm;
+pub mod llm_concurrency;
 pub mod management_worker;
 pub mod mcp;
 pub mod media_storage;

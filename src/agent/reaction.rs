@@ -27,11 +27,28 @@ use super::outbox;
 use super::runtime::UserRuntimeParameters;
 use super::types::{doc_bool, doc_string};
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ReactionOutcome {
+    pub claimed: bool,
+    pub outcome_status: Option<String>,
+    pub stop_requested: bool,
+}
+
 pub async fn record_user_reaction(
     state: &AppState,
     contact: &Contact,
     inbound: &ConversationMessage,
 ) -> AppResult<()> {
+    record_user_reaction_with_outcome(state, contact, inbound)
+        .await
+        .map(|_| ())
+}
+
+pub(crate) async fn record_user_reaction_with_outcome(
+    state: &AppState,
+    contact: &Contact,
+    inbound: &ConversationMessage,
+) -> AppResult<ReactionOutcome> {
     // 波 A1：在最外层为 reaction 路径起一个 RunBudget。即便 stuck 重置阶段
     // 不调用 LLM，只要后续 analyze_user_reaction 命中就能记账并支持降级。
     let domain_config =
@@ -58,7 +75,7 @@ async fn record_user_reaction_inner(
     contact: &Contact,
     inbound: &ConversationMessage,
     fallback_run_id: String,
-) -> AppResult<()> {
+) -> AppResult<ReactionOutcome> {
     // 先做 stuck reaction 兜底：把 analyzing 卡死超过阈值的 review 重置为 pending，
     // 以便本次 webhook 能重新 claim。
     let stuck_threshold_ms =
@@ -118,7 +135,7 @@ async fn record_user_reaction_inner(
         .await?;
     let Some(claimed_review) = claimed else {
         // 没抢到锁（或没有 pending review），直接跳过；本次 webhook 不会调 LLM。
-        return Ok(());
+        return Ok(ReactionOutcome::default());
     };
 
     let run_id_owned: String = claimed_review
@@ -127,7 +144,7 @@ async fn record_user_reaction_inner(
         .unwrap_or_else(|| fallback_run_id.clone());
     let review_id: ObjectId = match claimed_review.id {
         Some(id) => id,
-        None => return Ok(()),
+        None => return Ok(ReactionOutcome::default()),
     };
 
     // 波 A1：进入 LLM 之前先做预算检查；超额则降级为 user_replied_unclassified
@@ -222,7 +239,7 @@ async fn record_user_reaction_inner(
             reaction_claim_token = %reaction_claim_token,
             "discarded stale reaction result after claim ownership changed"
         );
-        return Ok(());
+        return Ok(ReactionOutcome::default());
     }
 
     // Phase D / D1：把 reaction outcome 追加到 contact.intent_trajectory（滑窗 50）。
@@ -305,7 +322,11 @@ async fn record_user_reaction_inner(
             }
         }
     }
-    Ok(())
+    Ok(ReactionOutcome {
+        claimed: true,
+        outcome_status: Some(outcome_for_outbox.clone()),
+        stop_requested: outbox::outcome_signals_stop(&outcome_for_outbox),
+    })
 }
 
 async fn analyze_user_reaction(

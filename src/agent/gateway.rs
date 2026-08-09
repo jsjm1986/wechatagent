@@ -291,38 +291,53 @@ async fn handle_durable_inbound_reply_task(
         }
     });
 
-    // Default remains strictly serial so this reply can observe the freshly
-    // persisted reaction hint. The experimental branch spawns Reaction before
-    // entering the Gateway audit scope; Tokio task-locals are therefore not
-    // shared and Reaction keeps its own budget/audit ownership.
+    // Reaction owns a separate budget/task-local scope. In parallel mode it overlaps snapshot
+    // loading and the first Lean generation; the Gateway joins it before any escalation, review,
+    // mutation, or Outbox write. The kill switch preserves serial ordering through an already
+    // completed task, while both modes share the same stop-signal safety barrier.
     let parallel_reaction = if state.config.reaction_gateway_parallel_enabled {
         let reaction_state = state.clone();
         let reaction_contact = contact.clone();
         let reaction_inbound = inbound.clone();
-        let started_at = std::time::Instant::now();
-        Some(ParallelReactionTask {
-            started_at,
-            handle: tokio::spawn(async move {
-                let reaction_started = std::time::Instant::now();
-                let result = super::reaction::record_user_reaction(
-                    &reaction_state,
-                    &reaction_contact,
-                    &reaction_inbound,
-                )
-                .await;
-                (reaction_started.elapsed(), result)
-            }),
-        })
+        Arc::new(ParallelReactionTask::running(tokio::spawn(async move {
+            let reaction_started = std::time::Instant::now();
+            match super::reaction::record_user_reaction_with_outcome(
+                &reaction_state,
+                &reaction_contact,
+                &reaction_inbound,
+            )
+            .await
+            {
+                Ok(outcome) => ReactionCompletion {
+                    elapsed: reaction_started.elapsed(),
+                    outcome: Some(outcome),
+                    error: None,
+                },
+                Err(error) => ReactionCompletion {
+                    elapsed: reaction_started.elapsed(),
+                    outcome: None,
+                    error: Some(error.to_string()),
+                },
+            }
+        })))
     } else {
-        if let Err(error) = super::reaction::record_user_reaction(state, &contact, &inbound).await {
-            tracing::warn!(
-                task_id = %task_id,
-                contact_wxid = %contact.wxid,
-                %error,
-                "durable inbound reaction analysis failed"
-            );
-        }
-        None
+        let reaction_started = std::time::Instant::now();
+        let completion =
+            match super::reaction::record_user_reaction_with_outcome(state, &contact, &inbound)
+                .await
+            {
+                Ok(outcome) => ReactionCompletion {
+                    elapsed: reaction_started.elapsed(),
+                    outcome: Some(outcome),
+                    error: None,
+                },
+                Err(error) => ReactionCompletion {
+                    elapsed: reaction_started.elapsed(),
+                    outcome: None,
+                    error: Some(error.to_string()),
+                },
+            };
+        Arc::new(ParallelReactionTask::complete(completion))
     };
 
     let guard_flag = claim_lost.clone();
@@ -335,7 +350,7 @@ async fn handle_durable_inbound_reply_task(
         AgentTrigger::Inbound(&inbound),
         Some(task_context),
         Some(guard),
-        parallel_reaction,
+        Some(parallel_reaction),
     )
     .await;
     monitor.abort();
@@ -465,54 +480,19 @@ fn load_manual_run_inputs<'a>(
 }
 
 struct GatewayBusinessInputs {
-    knowledge_route: KnowledgeRouteResult,
     active_products: Vec<crate::models::Product>,
     published_soul: Option<String>,
     sendable_assets: Vec<crate::models::ContentAsset>,
     reply_prompts: super::decision::ReplyPromptSnapshot,
 }
 
-#[allow(clippy::too_many_arguments)]
 fn load_gateway_business_inputs<'a>(
     state: &'a AppState,
     contact: &'a Contact,
-    inbound: &'a ConversationMessage,
-    recent_messages: &'a [ConversationMessage],
-    memory: &'a crate::models::OperatingMemory,
-    context_pack: &'a Document,
-    operation_knowledge: &'a super::types::KnowledgeRuntime,
-    initial_planner: &'a RunPlannerResult,
-    run_id: &'a str,
     active_profile: &'a crate::models::DomainProfile,
 ) -> BoxFuture<'a, AppResult<GatewayBusinessInputs>> {
     async move {
         let _stage_timer = super::run_audit::stage_timer("business_preload");
-        let route_future = async {
-            let _route_timer = super::run_audit::stage_timer("knowledge_route");
-            if current_run_budget()
-                .map(|budget| budget.is_exceeded())
-                .unwrap_or(false)
-            {
-                if let Some(budget) = current_run_budget() {
-                    budget.mark_degraded("knowledge_route_skipped_budget_exceeded");
-                }
-                let mut route = empty_knowledge_route(initial_planner);
-                route.reason = "预算超额：跳过知识路由，沿用空知识做保守决策".to_string();
-                Ok(route)
-            } else {
-                route_operation_knowledge(
-                    state,
-                    contact,
-                    inbound,
-                    recent_messages,
-                    memory,
-                    context_pack,
-                    operation_knowledge,
-                    Some(run_id),
-                )
-                .await
-            }
-        };
         let products_future = async {
             if active_profile.transaction_facts_enabled {
                 super::entitlements::load_active_products(&state.db, &contact.workspace_id).await
@@ -540,20 +520,59 @@ fn load_gateway_business_inputs<'a>(
                 .unwrap_or_default()
         };
         let prompt_future = load_reply_prompt_snapshot(state, contact);
-        let (route, products, published_soul, sendable_assets, reply_prompts) = tokio::join!(
-            route_future,
+        let (products, published_soul, sendable_assets, reply_prompts) = tokio::join!(
             products_future,
             soul_future,
             sendable_assets_future,
             prompt_future,
         );
         Ok(GatewayBusinessInputs {
-            knowledge_route: route?,
             active_products: products,
             published_soul: published_soul?,
             sendable_assets,
             reply_prompts: reply_prompts?,
         })
+    }
+    .boxed()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn route_gateway_knowledge<'a>(
+    state: &'a AppState,
+    contact: &'a Contact,
+    inbound: &'a ConversationMessage,
+    recent_messages: &'a [ConversationMessage],
+    memory: &'a crate::models::OperatingMemory,
+    context_pack: &'a Document,
+    operation_knowledge: &'a super::types::KnowledgeRuntime,
+    initial_planner: &'a RunPlannerResult,
+    run_id: &'a str,
+) -> BoxFuture<'a, AppResult<KnowledgeRouteResult>> {
+    async move {
+        let _route_timer = super::run_audit::stage_timer("knowledge_route");
+        if current_run_budget()
+            .map(|budget| budget.is_exceeded())
+            .unwrap_or(false)
+        {
+            if let Some(budget) = current_run_budget() {
+                budget.mark_degraded("knowledge_route_skipped_budget_exceeded");
+            }
+            let mut route = empty_knowledge_route(initial_planner);
+            route.reason = "预算超额：跳过知识路由，沿用空知识做保守决策".to_string();
+            Ok(route)
+        } else {
+            route_operation_knowledge(
+                state,
+                contact,
+                inbound,
+                recent_messages,
+                memory,
+                context_pack,
+                operation_knowledge,
+                Some(run_id),
+            )
+            .await
+        }
     }
     .boxed()
 }
@@ -1231,6 +1250,18 @@ fn trigger_envelope_source(trigger: &AgentTrigger<'_>) -> (String, &'static str)
 ///
 /// 过渡话术经 outbox 发送（保留幂等键 + 出站记录），尊重 precheck（调用方已在本函数
 /// 前过完 precheck，managed/频控等门都已通过）。绝不硬答空串/原始 XML、绝不 panic。
+fn non_text_inbound_type(trigger: &AgentTrigger<'_>) -> Option<String> {
+    let AgentTrigger::Inbound(inbound) = trigger else {
+        return None;
+    };
+    match inbound.msg_type.as_deref() {
+        // msg_type 缺失（旧数据）视作文本，主链路照常；"text" 显式文本同理。
+        None | Some("text") => None,
+        Some(other) if other.trim().is_empty() => None,
+        Some(other) => Some(other.to_string()),
+    }
+}
+
 async fn maybe_handle_non_text_transition(
     state: &AppState,
     contact: &Contact,
@@ -1240,14 +1271,11 @@ async fn maybe_handle_non_text_transition(
     source_event_id: &str,
     source_kind: &str,
 ) -> AppResult<bool> {
-    let AgentTrigger::Inbound(inbound) = trigger else {
+    let Some(msg_type) = non_text_inbound_type(trigger) else {
         return Ok(false);
     };
-    let msg_type = match inbound.msg_type.as_deref() {
-        // msg_type 缺失（旧数据）视作文本，主链路照常；"text" 显式文本同理。
-        None | Some("text") => return Ok(false),
-        Some(other) if other.trim().is_empty() => return Ok(false),
-        Some(other) => other.to_string(),
+    let AgentTrigger::Inbound(inbound) = trigger else {
+        unreachable!("non_text_inbound_type only returns Some for inbound triggers")
     };
 
     // 媒体理解链路（下载 → 图片理解 / 语音 ASR）当前打桩未接通：拉取恒 None。
@@ -1470,9 +1498,151 @@ async fn maybe_handle_non_text_transition(
     Ok(true)
 }
 
+#[derive(Debug, Clone)]
+struct ReactionCompletion {
+    elapsed: std::time::Duration,
+    outcome: Option<super::reaction::ReactionOutcome>,
+    error: Option<String>,
+}
+
+enum ReactionTaskState {
+    Running(tokio::task::JoinHandle<ReactionCompletion>),
+    Complete(ReactionCompletion),
+}
+
 struct ParallelReactionTask {
-    started_at: std::time::Instant,
-    handle: tokio::task::JoinHandle<(std::time::Duration, AppResult<()>)>,
+    state: tokio::sync::Mutex<ReactionTaskState>,
+}
+
+impl ParallelReactionTask {
+    fn running(handle: tokio::task::JoinHandle<ReactionCompletion>) -> Self {
+        Self {
+            state: tokio::sync::Mutex::new(ReactionTaskState::Running(handle)),
+        }
+    }
+
+    fn complete(completion: ReactionCompletion) -> Self {
+        Self {
+            state: tokio::sync::Mutex::new(ReactionTaskState::Complete(completion)),
+        }
+    }
+
+    async fn wait(&self) -> ReactionCompletion {
+        let mut state = self.state.lock().await;
+        if let ReactionTaskState::Complete(completion) = &*state {
+            return completion.clone();
+        }
+        let ReactionTaskState::Running(handle) = std::mem::replace(
+            &mut *state,
+            ReactionTaskState::Complete(ReactionCompletion {
+                elapsed: std::time::Duration::ZERO,
+                outcome: None,
+                error: Some("reaction task state unavailable".to_string()),
+            }),
+        ) else {
+            unreachable!("complete state returned above")
+        };
+        let completion = match handle.await {
+            Ok(completion) => completion,
+            Err(error) => ReactionCompletion {
+                elapsed: std::time::Duration::ZERO,
+                outcome: None,
+                error: Some(format!("reaction task join failed: {error}")),
+            },
+        };
+        *state = ReactionTaskState::Complete(completion.clone());
+        completion
+    }
+}
+
+struct ReactionStopBarrier<'a> {
+    state: &'a AppState,
+    contact: &'a Contact,
+    trigger_kind: &'a str,
+    task_context: Option<&'a crate::tasks::TaskRunContext>,
+    run_id: &'a str,
+    source_event_id: &'a str,
+    source_kind: &'a str,
+    reaction_task: Option<&'a Arc<ParallelReactionTask>>,
+    planner: &'a RunPlannerResult,
+    knowledge_route: &'a KnowledgeRouteResult,
+    decision: Document,
+    barrier_stage: &'a str,
+}
+
+async fn abort_on_reaction_stop(barrier: ReactionStopBarrier<'_>) -> AppResult<bool> {
+    let ReactionStopBarrier {
+        state,
+        contact,
+        trigger_kind,
+        task_context,
+        run_id,
+        source_event_id,
+        source_kind,
+        reaction_task,
+        planner,
+        knowledge_route,
+        decision,
+        barrier_stage,
+    } = barrier;
+    let Some(reaction_task) = reaction_task else {
+        return Ok(false);
+    };
+    let completion = reaction_task.wait().await;
+    if let Some(error) = completion.error.as_deref() {
+        tracing::warn!(%run_id, %error, barrier_stage, "reaction analysis failed before safety barrier");
+    }
+    let Some(outcome) = completion
+        .outcome
+        .as_ref()
+        .filter(|outcome| outcome.stop_requested)
+    else {
+        return Ok(false);
+    };
+
+    const STATUS: &str = "user_reaction_stop_requested";
+    if let Some(task_context) = task_context {
+        cancel_task(
+            state,
+            task_context,
+            STATUS,
+            "用户最新反应要求停止或进入冷却，本轮回复已在发送前终止",
+        )
+        .await?;
+    }
+    write_event_for_account(
+        state,
+        &contact.workspace_id,
+        &contact.account_id,
+        Some(&contact.wxid),
+        "user_reaction_stop_requested",
+        STATUS,
+        "Reaction 安全汇合检测到停止信号，当前回复未进入后续发送阶段",
+        Some(doc! {
+            "run_id": run_id,
+            "outcome_status": outcome.outcome_status.clone(),
+            "barrier_stage": barrier_stage,
+        }),
+    )
+    .await?;
+    write_agent_run_log(
+        state,
+        contact,
+        run_id,
+        trigger_kind,
+        STATUS,
+        planner,
+        doc! { "refreshed": false, "reactionSafetyAbort": true, "barrierStage": barrier_stage },
+        knowledge_route,
+        decision,
+        Document::new(),
+        doc! { "gatewayStatus": STATUS, "barrierStage": barrier_stage },
+        None,
+        source_event_id,
+        source_kind,
+    )
+    .await?;
+    Ok(true)
 }
 
 pub(crate) async fn run_user_operation_gateway(
@@ -1499,7 +1669,7 @@ async fn run_user_operation_gateway_with_parallel_reaction(
     trigger: AgentTrigger<'_>,
     task_context: Option<crate::tasks::TaskRunContext>,
     should_abort_send: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
-    parallel_reaction: Option<ParallelReactionTask>,
+    parallel_reaction: Option<Arc<ParallelReactionTask>>,
 ) -> AppResult<()> {
     let run_id = uuid::Uuid::new_v4().to_string();
     let (source_event_id, source_kind) = trigger_envelope_source(&trigger);
@@ -1551,18 +1721,19 @@ async fn run_user_operation_gateway_with_parallel_reaction(
                     domain_config,
                     runtime,
                     should_abort_send,
+                    parallel_reaction.clone(),
                 ),
             )
             .await
     };
-    settle_gateway_execution(state, &run_id, execution, parallel_reaction).await
+    settle_gateway_execution(state, &run_id, execution, parallel_reaction.as_ref()).await
 }
 
 async fn settle_gateway_execution<T, F>(
     state: &AppState,
     run_id: &str,
     execution: F,
-    parallel_reaction: Option<ParallelReactionTask>,
+    parallel_reaction: Option<&Arc<ParallelReactionTask>>,
 ) -> AppResult<T>
 where
     F: std::future::Future<Output = AppResult<T>>,
@@ -1575,20 +1746,11 @@ where
         .await;
 
     if let Some(parallel_reaction) = parallel_reaction {
-        let parallel_started = parallel_reaction.started_at;
-        match parallel_reaction.handle.await {
-            Ok((reaction_elapsed, Ok(()))) => {
-                audit.record_stage("reaction_analysis", reaction_elapsed);
-            }
-            Ok((reaction_elapsed, Err(error))) => {
-                audit.record_stage("reaction_analysis", reaction_elapsed);
-                tracing::warn!(%run_id, %error, "parallel reaction analysis failed");
-            }
-            Err(error) => {
-                tracing::warn!(%run_id, %error, "parallel reaction task join failed");
-            }
+        let completion = parallel_reaction.wait().await;
+        audit.record_stage("reaction_analysis", completion.elapsed);
+        if let Some(error) = completion.error {
+            tracing::warn!(%run_id, %error, "reaction analysis failed");
         }
-        audit.record_stage("reaction_gateway_parallel", parallel_started.elapsed());
     }
 
     // Close an errored envelope before writing performance metadata, preserving
@@ -2127,6 +2289,7 @@ fn run_user_operation_gateway_inner<'a>(
     domain_config: Option<OperationDomainConfig>,
     mut runtime: UserRuntimeParameters,
     should_abort_send: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    parallel_reaction: Option<Arc<ParallelReactionTask>>,
 ) -> BoxFuture<'a, AppResult<()>> {
     async move {
     // S1.1 (Phase 0)：派生 R0.1 envelope 的 (source_event_id, source_kind)，
@@ -2191,6 +2354,28 @@ fn run_user_operation_gateway_inner<'a>(
         return Ok(());
     }
 
+    // 非文本过渡回复会直接创建 Outbox，因此不能等到文本首轮生成后的汇合点。
+    // 仅非文本在这里提前等待；文本仍与 Snapshot + Lean 并行，不损失正常首响收益。
+    if non_text_inbound_type(&trigger).is_some()
+        && abort_on_reaction_stop(ReactionStopBarrier {
+            state,
+            contact: &contact,
+            trigger_kind: trigger.kind(),
+            task_context: task_context.as_ref(),
+            run_id: &run_id,
+            source_event_id: &envelope_source_event_id,
+            source_kind: &envelope_source_kind,
+            reaction_task: parallel_reaction.as_ref(),
+            planner: &RunPlannerResult::default(),
+            knowledge_route: &KnowledgeRouteResult::default(),
+            decision: Document::new(),
+            barrier_stage: "before_non_text_outbox",
+        })
+        .await?
+    {
+        return Ok(());
+    }
+
     // F2（多模态入站地基）：非文本入站消息（image/voice/link/miniprogram/file/unknown）
     // 在进决策 Agent 之前先拦一道——决策链路只会把空串/原始 XML 当文本硬答。媒体
     // 理解链路当前未接通（fetch_inbound_media 打桩恒 None），故发一条 AI 自治口吻的
@@ -2236,17 +2421,20 @@ fn run_user_operation_gateway_inner<'a>(
         reason: "Reply Agent 内联判断运行链路，普通消息不再前置 Planner".to_string(),
         ..Default::default()
     };
-    // ── WB5：Reply 前置知识路由；零本地相关度时走确定性轻量短路 ──
-    //
-    // ISSUE-012 根因：旧链路是先让 Reply Agent 在没知识的情况下盲跑一遍、
-    // 再据 knowledgeNeed 决定是否打开知识库——第一遍的寒暄态本身就让
-    // knowledgeNeed=not_required，知识库永远进不来。
-    //
-    // 新链路：先做 verified 语料本地相关度预筛；零相关的普通关系轮直接跳过
-    // 多轮 Knowledge Agent，有任何相关信号、手工验证或 synthetic relay 时仍走完整
-    // citation 路径。Reply Agent 单程消费结果；预算超额时仍保守退化为空知识。
-    // 产品目录与最长可达 4 轮的知识路由在堆分配 helper 中并行预取。
-    let business_inputs = load_gateway_business_inputs(
+    // Business snapshots are required by every tier, but the real Knowledge Route is only
+    // consumed by Full. Load snapshots first, then overlap optional knowledge reasoning with the
+    // first Lean generation. The provider governor preserves foreground capacity, and RunBudget's
+    // atomic reservation prevents the concurrent branches from exceeding the per-run call cap.
+    let business_inputs =
+        load_gateway_business_inputs(state, &contact, &active_profile).await?;
+    let active_products = business_inputs.active_products;
+    let published_soul = business_inputs.published_soul;
+    let sendable_assets = business_inputs.sendable_assets;
+    let reply_prompts = business_inputs.reply_prompts;
+    let reply_context = ReplyContextCache::new();
+    let reviewer_prompts = ReviewerPromptCache::new();
+
+    let route_future = route_gateway_knowledge(
         state,
         &contact,
         &inbound,
@@ -2256,62 +2444,103 @@ fn run_user_operation_gateway_inner<'a>(
         &operation_knowledge,
         &initial_planner,
         &run_id,
-        &active_profile,
-    )
-    .await?;
-    let knowledge_route = business_inputs.knowledge_route;
-    let active_products = business_inputs.active_products;
-    let published_soul = business_inputs.published_soul;
-    let sendable_assets = business_inputs.sendable_assets;
-    let reply_prompts = business_inputs.reply_prompts;
-    let reply_context = ReplyContextCache::new();
-    let reviewer_prompts = ReviewerPromptCache::new();
+    );
+
+    let (knowledge_route, decision_first, promote_risks_first) =
+        if state.config.progressive_tier_enabled {
+            let lean_route = empty_knowledge_route(&initial_planner);
+            let lean_chunks: Vec<crate::models::OperationKnowledgeChunk> = Vec::new();
+            let lean_future = decide_reply_with_promote(
+                state,
+                &contact,
+                &inbound,
+                &recent_messages,
+                &pending_tasks,
+                playbook.as_ref(),
+                domain_config.as_ref(),
+                &runtime,
+                &memory,
+                &context_pack,
+                &lean_chunks,
+                &lean_route,
+                None,
+                Some(&run_id),
+                None,
+                crate::agent::sufficiency::PromptTier::Lean,
+                Some(DecisionRunSnapshot {
+                    active_profile: &active_profile,
+                    active_products: &active_products,
+                    published_soul: published_soul.as_deref(),
+                    sendable_assets: &sendable_assets,
+                    reply_prompts: &reply_prompts,
+                    reply_context: &reply_context,
+                }),
+            );
+            let (route, first) = tokio::try_join!(route_future, lean_future)?;
+            (route, first.0, first.1)
+        } else {
+            // Kill switch retains the established Knowledge -> Full serial ordering because Full
+            // prompt bytes consume the selected knowledge and route metadata.
+            let route = route_future.await?;
+            let chunks = select_operation_knowledge_chunks(&operation_knowledge.chunks, &route);
+            let first = decide_reply_with_promote(
+                state,
+                &contact,
+                &inbound,
+                &recent_messages,
+                &pending_tasks,
+                playbook.as_ref(),
+                domain_config.as_ref(),
+                &runtime,
+                &memory,
+                &context_pack,
+                &chunks,
+                &route,
+                None,
+                Some(&run_id),
+                None,
+                crate::agent::sufficiency::PromptTier::Full,
+                Some(DecisionRunSnapshot {
+                    active_profile: &active_profile,
+                    active_products: &active_products,
+                    published_soul: published_soul.as_deref(),
+                    sendable_assets: &sendable_assets,
+                    reply_prompts: &reply_prompts,
+                    reply_context: &reply_context,
+                }),
+            )
+            .await?;
+            (route, first.0, first.1)
+        };
     let selected_chunks =
         select_operation_knowledge_chunks(&operation_knowledge.chunks, &knowledge_route);
-    // agent-autonomy-loop W2 / Task 3.4：把 RawAgentDecision::validate_and_promote
-    // 的 promote_risks 从 reply 调用一路 thread 到 finalize_review_for_send，
-    // 由 finalize 阶段判定是否触发 R3.5/R3.6 blocked_by_required_field。
-    // ── 渐进式三档（2026-06-23）：第一程 Lean 小档 + 充分性自评两程循环 ──
-    // 第一程用 Lean 瘦档（恒注入安全集，不注入业务/产品知识，省 token）。
-    // PROGRESSIVE_TIER_ENABLED 关 → 第一程直接 Full,退回单程(kill switch)。
-    let first_pass_tier = if state.config.progressive_tier_enabled {
-        crate::agent::sufficiency::PromptTier::Lean
-    } else {
-        crate::agent::sufficiency::PromptTier::Full
-    };
-    let (decision_first, promote_risks_first) = decide_reply_with_promote(
-        state,
-        &contact,
-        &inbound,
-        &recent_messages,
-        &pending_tasks,
-        playbook.as_ref(),
-        domain_config.as_ref(),
-        &runtime,
-        &memory,
-        &context_pack,
-        &selected_chunks,
-        &knowledge_route,
-        None,
-        Some(&run_id),
-        None,
-        first_pass_tier,
-        Some(DecisionRunSnapshot {
-            active_profile: &active_profile,
-            active_products: &active_products,
-            published_soul: published_soul.as_deref(),
-            sendable_assets: &sendable_assets,
-            reply_prompts: &reply_prompts,
-            reply_context: &reply_context,
-        }),
-    )
-    .await?;
     mark_run_envelope_running(
         &state.db,
         &run_id,
         to_document(&decision_first).unwrap_or_default(),
     )
     .await?;
+
+    // Reaction overlaps snapshots and the first Lean call, then becomes a safety dependency before
+    // escalation/review/mutations. Stop/cooldown closes this run before any current reply can send.
+    if abort_on_reaction_stop(ReactionStopBarrier {
+        state,
+        contact: &contact,
+        trigger_kind: trigger.kind(),
+        task_context: task_context.as_ref(),
+        run_id: &run_id,
+        source_event_id: &envelope_source_event_id,
+        source_kind: &envelope_source_kind,
+        reaction_task: parallel_reaction.as_ref(),
+        planner: &initial_planner,
+        knowledge_route: &knowledge_route,
+        decision: to_document(&decision_first).unwrap_or_default(),
+        barrier_stage: "after_first_reply",
+    })
+    .await?
+    {
+        return Ok(());
+    }
 
     // 充分性自评判定：决定直接进闸 / 升档第二程 / 澄清。
     let tier_decision = crate::agent::sufficiency::decide_tier_escalation(&decision_first);
@@ -6833,7 +7062,7 @@ async fn write_agent_run_log_with_finalize(
             trigger_kind: Some(trigger_kind.to_string()),
             source_event_id: Some(finalize_fields.source_event_id),
             source_kind: Some(finalize_fields.source_kind),
-            lifecycle: Some(lifecycle),
+            lifecycle: Some(lifecycle.clone()),
             status: Some(status.to_string()),
             planner: Some(to_document(planner).unwrap_or_default()),
             context: Some(context),
@@ -6843,6 +7072,9 @@ async fn write_agent_run_log_with_finalize(
             gateway_result: Some(gateway_result),
             error: error.clone(),
             error_summary: error,
+            abort_reason: (lifecycle
+                == crate::agent::run_envelope::LIFECYCLE_ABORTED_BY_EXTERNAL_SIGNAL)
+                .then(|| status.to_string()),
             token_budget: Some(token_budget),
             tokens_used: Some(tokens_used),
             llm_calls_used: Some(llm_calls_used),

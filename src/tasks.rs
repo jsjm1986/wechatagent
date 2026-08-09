@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use futures::TryStreamExt;
+use futures::{stream, StreamExt, TryStreamExt};
 use mongodb::{
     bson::{doc, oid::ObjectId, DateTime, Document},
     options::{FindOneAndUpdateOptions, FindOptions, ReturnDocument},
@@ -1051,6 +1051,19 @@ async fn revive_failed_memory_tasks_with_rerun(state: &AppState) -> anyhow::Resu
     Ok(result.modified_count)
 }
 
+fn dedupe_inbound_candidates(
+    candidates: Vec<((String, String, String), ObjectId)>,
+) -> Vec<ObjectId> {
+    let mut seen = std::collections::HashSet::new();
+    let mut selected = Vec::new();
+    for (contact_key, task_id) in candidates {
+        if seen.insert(contact_key) {
+            selected.push(task_id);
+        }
+    }
+    selected
+}
+
 async fn tick_inbound_replies(state: &AppState) -> anyhow::Result<()> {
     // Materialize any webhook->task handoff interrupted by a process crash before scanning.
     let _ = crate::webhooks::reconcile_pending_inbound_handoffs(state).await?;
@@ -1073,9 +1086,29 @@ async fn tick_inbound_replies(state: &AppState) -> anyhow::Result<()> {
                 .build(),
         )
         .await?;
+    // One scan may contain multiple historical due rows for the same contact. Keep only the
+    // first (oldest, due to the cursor sort) candidate per contact so this process never spends
+    // two foreground slots competing on one conversation. Task claim CAS remains authoritative
+    // across processes.
+    let mut candidates = Vec::new();
     while let Some(task) = cursor.try_next().await? {
         if let Some(task_id) = task.id {
-            let _ = run_due_task_by_id(state, task_id).await?;
+            candidates.push((
+                (task.workspace_id, task.account_id, task.contact_wxid),
+                task_id,
+            ));
+        }
+    }
+    let task_ids = dedupe_inbound_candidates(candidates);
+    let concurrency = state.config.inbound_reply_worker_concurrency.max(1);
+    let results = stream::iter(task_ids)
+        .map(|task_id| async move { (task_id, run_due_task_by_id(state, task_id).await) })
+        .buffer_unordered(concurrency)
+        .collect::<Vec<_>>()
+        .await;
+    for (task_id, result) in results {
+        if let Err(error) = result {
+            tracing::error!(%task_id, %error, "inbound reply recovery task failed");
         }
     }
     Ok(())
@@ -1696,9 +1729,22 @@ mod tests {
     use mongodb::bson::{doc, oid::ObjectId, DateTime};
 
     use super::{
-        outcome_metric_write_filter, task_claim_send_terminal_filter, task_outbox_commit_filter,
-        task_outbox_marker_prepare_filter, TaskClaim,
+        dedupe_inbound_candidates, outcome_metric_write_filter, task_claim_send_terminal_filter,
+        task_outbox_commit_filter, task_outbox_marker_prepare_filter, TaskClaim,
     };
+
+    #[test]
+    fn inbound_candidate_dedupe_keeps_first_due_order_per_contact() {
+        let first_a = ObjectId::parse_str("64b64c000000000000000001").unwrap();
+        let first_b = ObjectId::parse_str("64b64c000000000000000002").unwrap();
+        let later_a = ObjectId::parse_str("64b64c000000000000000003").unwrap();
+        let selected = dedupe_inbound_candidates(vec![
+            (("w".into(), "a".into(), "wx-a".into()), first_a),
+            (("w".into(), "a".into(), "wx-b".into()), first_b),
+            (("w".into(), "a".into(), "wx-a".into()), later_a),
+        ]);
+        assert_eq!(selected, vec![first_a, first_b]);
+    }
 
     #[test]
     fn task_outbox_commit_filter_fences_owner_and_decision() {

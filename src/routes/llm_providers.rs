@@ -1003,9 +1003,14 @@ pub(super) async fn test_provider(
     .map_err(|e| AppError::External(format!("构造测试 client 失败: {e}")))?;
     let started = std::time::Instant::now();
     let user = "请回复一个 JSON：{\"ok\": true}";
+    let admission = state
+        .llm_concurrency
+        .acquire(crate::llm_concurrency::LlmPriority::Foreground)
+        .await;
     let result = client
         .generate_json("你是一个连通性测试助手。只输出严格 JSON。", user)
         .await;
+    drop(admission);
     let elapsed_ms = started.elapsed().as_millis() as i64;
     match result {
         Ok(value) => {
