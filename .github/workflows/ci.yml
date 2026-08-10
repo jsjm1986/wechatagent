@@ -262,8 +262,13 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo registry / target
+      # This job links 100+ standalone integration-test binaries. Restoring the shared target
+      # cache plus full test debuginfo exhausts the hosted runner even after SDK cleanup. Keep the
+      # dependency registry cache, but build a fresh compact target for this diagnostic suite.
+      - name: Cache cargo registry (no target artifacts)
         uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: "false"
 
       # ubuntu-latest runner 预装 Docker daemon；testcontainers
       # （tests/common/mod.rs:116 `Mongo::default().start()`）自动拉起
@@ -277,6 +282,11 @@ jobs:
       - name: cargo test --no-fail-fast -- --ignored (testcontainers MongoDB)
         env:
           RUSTFLAGS: ""
+          # Keep coverage unchanged while bounding artifacts on the hosted runner. Incremental
+          # state and debug symbols are unnecessary for a one-shot CI execution and previously
+          # drove the filesystem to 0 MB while linking the final test binaries.
+          CARGO_INCREMENTAL: "0"
+          CARGO_PROFILE_TEST_DEBUG: "0"
           # 与生产 systemd(RUST_MIN_STACK=8388608)对齐。集成测试在 2MB 默认子线程栈
           # 上跑,深 async 栈帧(如 gateway relay 路径)会栈溢出 SIGABRT(无 panic 文本);
           # 生产早已设 8MB,CI 此前缺失是配置缺口。
