@@ -49,7 +49,7 @@ use super::decision::{
 };
 use super::escalation;
 use super::guards::{
-    action_policy_state_key, check_state_transition, classify_decision_action,
+    action_policy_state_key, check_state_transition, classify_reviewed_decision_action,
     enforce_state_action_policy, initial_operation_state_key, normalize_decision_runtime,
     normalize_decision_state, operation_states, planner_from_decision,
 };
@@ -2139,7 +2139,7 @@ async fn apply_state_action_gate(
         &contact.wxid,
     )
     .await?;
-    let action = classify_decision_action(final_decision);
+    let action = classify_reviewed_decision_action(final_decision, review);
     if let Err(reason) = enforce_state_action_policy(policy_opt.as_ref(), action) {
         review.approved = false;
         review.final_review_status = "held_by_ai_policy".to_string();

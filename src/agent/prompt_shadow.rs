@@ -654,6 +654,7 @@ async fn run_prompt_shadow_branch(
         state,
         contact,
         inbound,
+        &prepared.recent,
         decision,
         review,
         runtime,

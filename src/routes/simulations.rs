@@ -213,19 +213,27 @@ pub(super) fn judge_user_operation_scenario(
     let hallucination = doc_i32_opt(scores, "hallucinationScore");
     let knowledge_grounding = doc_i32_opt(scores, "knowledgeGroundingScore");
     let pressure_risk = doc_i32_opt(scores, "pressureRisk");
-    let mut issues = Vec::new();
+    let mut issues: Vec<String> = Vec::new();
     // 硬闸判定复用生产同源信号:simulation.rs:207-216 已用生产 review_passed
     // 把每轮终态算进 turn.status(would_send/review_blocked/gateway_blocked/no_reply)。
     // 不再自算 hallucination/grounding 硬阈值——旧 50/60 阈值是 0-100 档,与 reviewer
     // 的 0-10 档错配(幻觉闸恒不触发=死闸、grounding 闸恒误判 failed);旧 finalReviewStatus
     // 匹配块读的字段 DecisionReviewResult 序列化根本不产生,恒为空=死门。
     match last_turn.status.as_str() {
-        "review_blocked" => issues.push("Review 闸拦截：候选回复未通过独立 Review"),
-        "gateway_blocked" => issues.push("发送网关拦截，需要检查频控或纳管状态"),
-        _ => {} // would_send / no_reply 视为本轮无风险项
+        "would_send" | "no_reply" => {}
+        "review_blocked" => issues.push("Review 闸拦截：候选回复未通过独立 Review".to_string()),
+        "gateway_blocked" => issues.push("发送网关拦截，需要检查频控或纳管状态".to_string()),
+        "blocked_by_safety_guard" => {
+            issues.push("安全门拦截：候选回复含未获支持的现实声明".to_string())
+        }
+        "blocked_unverified_product_claim" => {
+            issues.push("产品声明拦截：候选回复缺少可核实知识依据".to_string())
+        }
+        "held_by_ai_policy" => issues.push("AI 策略暂缓：候选动作未获发送授权".to_string()),
+        status => issues.push(format!("生产终态未获发送授权：{status}")),
     }
     // scores 仍读取并透传给前端展示(humanLike/hallucination 等),但不参与拦截判定。
-    let passed = issues.is_empty();
+    let passed = matches!(last_turn.status.as_str(), "would_send" | "no_reply");
     json!({
         "passed": passed,
         "runMode": "shadow",
@@ -302,6 +310,39 @@ mod judge_tests {
             serde_json::Value::Bool(false),
             "review_blocked(生产已拦)必须 judged failed"
         );
+    }
+
+    #[test]
+    fn every_non_send_terminal_is_failed_instead_of_false_green() {
+        for status in [
+            "blocked_by_safety_guard",
+            "blocked_unverified_product_claim",
+            "held_by_ai_policy",
+            "revision_required",
+            "blocked_by_budget",
+            "internal_error",
+        ] {
+            let mut turns = vec![would_send_turn()];
+            turns[0].status = status.to_string();
+            let result = judge_user_operation_scenario("regression", "must send safely", &turns);
+            assert_eq!(
+                result["passed"],
+                serde_json::Value::Bool(false),
+                "status={status}"
+            );
+            assert!(result["issues"]
+                .as_array()
+                .is_some_and(|issues| !issues.is_empty()));
+        }
+    }
+
+    #[test]
+    fn no_reply_is_an_explicit_passing_terminal() {
+        let mut turns = vec![would_send_turn()];
+        turns[0].status = "no_reply".to_string();
+        let result = judge_user_operation_scenario("silence", "safe silence", &turns);
+        assert_eq!(result["passed"], serde_json::Value::Bool(true));
+        assert_eq!(result["issues"].as_array().map(Vec::len), Some(0));
     }
 
     #[test]

@@ -12,7 +12,7 @@ use crate::models::{
     CommitmentMarkers, OperationDomainConfig, OperationKnowledgeChunk, OperationStatePolicy,
 };
 
-use super::types::{doc_bool, AgentDecision, RunPlannerResult};
+use super::types::{doc_bool, AgentDecision, DecisionReviewResult, RunPlannerResult};
 
 pub(crate) fn normalize_decision_state(
     decision: &mut AgentDecision,
@@ -287,6 +287,131 @@ pub fn classify_decision_action(decision: &AgentDecision) -> &'static str {
     "silent"
 }
 
+/// Classify a narrowly bounded acknowledgement after Reviewer + ClaimGate have completed.
+///
+/// This is intentionally stricter than text keyword matching: the body must be short, have no
+/// question/number, carry no durable side effect, and ClaimGate must report a complete manifest
+/// with no evidence-requiring assertion. It lets a user receive “好的，我知道了，不安排时间”
+/// even in a no-proactive-contact state without turning arbitrary replies into a policy bypass.
+pub(crate) fn classify_reviewed_decision_action(
+    decision: &AgentDecision,
+    review: &DecisionReviewResult,
+) -> &'static str {
+    if !decision.should_reply {
+        return classify_decision_action(decision);
+    }
+    let text = decision.reply_text.trim();
+    let acknowledgement_marker = [
+        "好的",
+        "好，",
+        "好。",
+        "收到",
+        "明白",
+        "知道了",
+        "了解",
+        "没问题",
+        "ok",
+        "okay",
+        "got it",
+        "understood",
+    ]
+    .iter()
+    .any(|marker| text.to_ascii_lowercase().contains(marker));
+    let no_side_effects = decision
+        .follow_up
+        .as_ref()
+        .is_none_or(|follow_up| !follow_up.needed)
+        && decision.commitment.is_none()
+        && decision
+            .last_commitment
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+        && decision
+            .cooldown_until
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+        && decision.assets_to_send.is_empty()
+        && decision.namecard_to_send.is_none()
+        && decision
+            .escalation_request
+            .as_ref()
+            .is_none_or(|request| !request.needed);
+    let manifest_is_safe = review
+        .claim_analysis
+        .get_bool("independentClaimGate")
+        .unwrap_or(false)
+        && review
+            .claim_analysis
+            .get_bool("claimsComplete")
+            .unwrap_or(false)
+        && review
+            .claim_analysis
+            .get_array("claimManifest")
+            .is_ok_and(|claims| {
+                claims.iter().all(|claim| {
+                    claim
+                        .as_document()
+                        .is_some_and(|claim| !claim.get_bool("requiresEvidence").unwrap_or(true))
+                })
+            });
+    // Remove only explicit negative-boundary phrases before looking for positive scheduling or
+    // fulfillment language. This preserves “不安排时间” acknowledgements without allowing
+    // “明天不安排，后天三点见” or any concrete service promise through the narrow action.
+    let semantic_remainder = [
+        "不安排任何时间",
+        "不安排时间",
+        "不替你安排",
+        "不帮你预约",
+        "不确认预约",
+        "不会安排时间",
+        "won't schedule",
+        "will not schedule",
+    ]
+    .iter()
+    .fold(text.to_ascii_lowercase(), |value, phrase| {
+        value.replace(phrase, "")
+    });
+    let contains_temporal_or_service_language = [
+        "今天",
+        "明天",
+        "后天",
+        "上午",
+        "下午",
+        "晚上",
+        "点到",
+        "点见",
+        "到店",
+        "预约",
+        "安排",
+        "接待",
+        "带你",
+        "帮你约",
+        "today",
+        "tomorrow",
+        "appointment",
+        "schedule",
+        "arrange",
+        "escort",
+    ]
+    .iter()
+    .any(|marker| semantic_remainder.contains(marker));
+    if review.approved
+        && !review.should_hold
+        && acknowledgement_marker
+        && text.chars().count() <= 60
+        && !text
+            .chars()
+            .any(|ch| ch.is_ascii_digit() || matches!(ch, '?' | '？'))
+        && !contains_temporal_or_service_language
+        && no_side_effects
+        && manifest_is_safe
+    {
+        "acknowledgement"
+    } else {
+        "reply"
+    }
+}
+
 /// Phase B / B4：用 `operation_state_policies` 行校验候选 action 是否被允许。
 ///
 /// 拦截规则：
@@ -313,7 +438,12 @@ pub fn enforce_state_action_policy(
             policy.state_key, action
         ));
     }
-    if !policy.allowed.is_empty() && !policy.allowed.iter().any(|a| a == action) {
+    // `acknowledgement` was introduced after existing policy rows were published. Treat it as
+    // safe by default for legacy allowlists, while an explicit forbidden entry always wins.
+    if action != "acknowledgement"
+        && !policy.allowed.is_empty()
+        && !policy.allowed.iter().any(|a| a == action)
+    {
         return Err(format!(
             "state_action_not_allowed: state={} action={}",
             policy.state_key, action
@@ -490,6 +620,87 @@ mod policy_tests {
         d.should_reply = true;
         d.reply_text = "test".to_string();
         d
+    }
+
+    fn safe_ack_review() -> DecisionReviewResult {
+        DecisionReviewResult {
+            approved: true,
+            claim_analysis: mongodb::bson::doc! {
+                "independentClaimGate": true,
+                "claimsComplete": true,
+                "claimManifest": [{
+                    "sourceQuote": "好的，我知道了",
+                    "requiresEvidence": false,
+                }],
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn reviewed_neutral_acknowledgement_has_narrow_action() {
+        let mut decision = AgentDecision::default();
+        decision.should_reply = true;
+        decision.reply_text = "好的，我知道了，不安排时间。".to_string();
+        assert_eq!(
+            classify_reviewed_decision_action(&decision, &safe_ack_review()),
+            "acknowledgement"
+        );
+        let legacy_no_proactive = mk_policy("cooldown", &["silent", "follow_up"], &["reply"]);
+        assert!(enforce_state_action_policy(
+            Some(&legacy_no_proactive),
+            classify_reviewed_decision_action(&decision, &safe_ack_review())
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn acknowledgement_never_bypasses_explicit_forbidden_or_business_content() {
+        let explicitly_forbidden = mk_policy("guarded", &[], &["acknowledgement"]);
+        assert!(
+            enforce_state_action_policy(Some(&explicitly_forbidden), "acknowledgement").is_err()
+        );
+
+        for text in [
+            "好的，明天下午三点见。",
+            "好的，我帮你安排。",
+            "好的，你到了我带你进去。",
+            "好的，可以吗？",
+        ] {
+            let mut decision = AgentDecision::default();
+            decision.should_reply = true;
+            decision.reply_text = text.to_string();
+            assert_eq!(
+                classify_reviewed_decision_action(&decision, &safe_ack_review()),
+                "reply",
+                "text={text}"
+            );
+        }
+    }
+
+    #[test]
+    fn acknowledgement_requires_claim_gate_and_zero_side_effects() {
+        let mut decision = AgentDecision::default();
+        decision.should_reply = true;
+        decision.reply_text = "收到。".to_string();
+        assert_eq!(
+            classify_reviewed_decision_action(
+                &decision,
+                &DecisionReviewResult {
+                    approved: true,
+                    ..Default::default()
+                }
+            ),
+            "reply"
+        );
+        decision.follow_up = Some(FollowUpDecision {
+            needed: true,
+            ..Default::default()
+        });
+        assert_eq!(
+            classify_reviewed_decision_action(&decision, &safe_ack_review()),
+            "reply"
+        );
     }
 
     #[test]

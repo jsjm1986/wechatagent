@@ -21,6 +21,44 @@
 const USER_OPEN: &str = "<<<USER_TURN>>>";
 const USER_CLOSE: &str = "<<<END_USER_TURN>>>";
 
+/// Relative conversation facts are not durable records. A historical customer statement older
+/// than this window cannot authorize a current appointment/schedule assertion; the assistant must
+/// ask for confirmation or use a verified business record instead.
+pub const TEMPORAL_CHAT_EVIDENCE_MAX_AGE_MS: i64 = 48 * 60 * 60 * 1_000;
+
+pub fn temporal_chat_evidence_is_fresh(
+    created_at: mongodb::bson::DateTime,
+    evaluated_at: mongodb::bson::DateTime,
+) -> bool {
+    evaluated_at
+        .timestamp_millis()
+        .saturating_sub(created_at.timestamp_millis())
+        .max(0)
+        <= TEMPORAL_CHAT_EVIDENCE_MAX_AGE_MS
+}
+
+/// Compact metadata prepended to every historical prompt line. It gives Reply and Reviewer the
+/// same time anchor used by ClaimGate, so words such as “tomorrow” cannot silently float to today.
+pub fn history_temporal_metadata(
+    created_at: mongodb::bson::DateTime,
+    evaluated_at: mongodb::bson::DateTime,
+) -> String {
+    let age_ms = evaluated_at
+        .timestamp_millis()
+        .saturating_sub(created_at.timestamp_millis())
+        .max(0);
+    let status = if temporal_chat_evidence_is_fresh(created_at, evaluated_at) {
+        "fresh"
+    } else {
+        "stale"
+    };
+    format!(
+        "createdAtMillis={} ageHours={} temporalStatus={status}",
+        created_at.timestamp_millis(),
+        age_ms / (60 * 60 * 1_000)
+    )
+}
+
 /// 把外部不可信文本（用户消息、群成员发言、运营自定义指令）包裹成隔离段。
 ///
 /// 单层包裹，调用方负责把"上下文标识符"写在 tag 前，比如：
@@ -164,6 +202,17 @@ mod tests {
         );
         // 与直接 isolate_untrusted 逐字等价（byte-equivalence 护栏）。
         assert_eq!(out, isolate_untrusted(content));
+    }
+
+    #[test]
+    fn temporal_metadata_marks_old_chat_stale() {
+        let now = mongodb::bson::DateTime::from_millis(200_000_000);
+        let recent = mongodb::bson::DateTime::from_millis(
+            now.timestamp_millis() - TEMPORAL_CHAT_EVIDENCE_MAX_AGE_MS,
+        );
+        let stale = mongodb::bson::DateTime::from_millis(recent.timestamp_millis() - 1);
+        assert!(history_temporal_metadata(recent, now).contains("temporalStatus=fresh"));
+        assert!(history_temporal_metadata(stale, now).contains("temporalStatus=stale"));
     }
 
     #[test]

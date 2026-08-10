@@ -243,6 +243,7 @@ async fn simulate_user_dialogue_inner(
             state,
             &contact,
             &inbound,
+            &recent,
             decision,
             review,
             &runtime,
