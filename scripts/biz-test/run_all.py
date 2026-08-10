@@ -35,18 +35,39 @@ def run(mod: str) -> int:
     return r.returncode
 
 
+def execute_suite(run_fn=run) -> int:
+    """Run all domains and always reconcile test data before returning."""
+    overall = 0
+    try:
+        cleanup_rc = run_fn("cleanup")
+        if cleanup_rc != 0:
+            overall = cleanup_rc
+        else:
+            preflight_rc = run_fn("step0_preflight")
+            if preflight_rc != 0:
+                print("step0 失败（端点/凭据/account/隔离边界问题），中止——不假绿。")
+                overall = preflight_rc
+            else:
+                for module in BATCH_A:
+                    rc = run_fn(module)
+                    if rc != 0 and overall == 0:
+                        overall = rc
+                rc = run_fn("batch_b_industry")
+                if rc != 0 and overall == 0:
+                    overall = rc
+    finally:
+        cleanup_rc = run_fn("cleanup")
+        if cleanup_rc != 0 and overall == 0:
+            overall = cleanup_rc
+    return overall
+
+
 def main() -> None:
-    run("cleanup")
-    if run("step0_preflight") != 0:
-        print("step0 失败（端点/凭据/account 问题），中止——不假绿。")
-        return
-    for m in BATCH_A:
-        run(m)                 # 单域失败不挡其它域
-    run("batch_b_industry")    # 批B：切换全局 active profile，最后跑，finally 恢复
-    run("cleanup")             # 收尾清测试数据
+    rc = execute_suite()
     print("\n全量完成。问题清单见 "
           "docs/superpowers/specs/2026-06-26-full-business-logic-test-findings.md")
     print("逐条复核证据、按 severity 排序、标注红线预期 vs 真 bug 后再下结论。")
+    raise SystemExit(rc)
 
 
 if __name__ == "__main__":
