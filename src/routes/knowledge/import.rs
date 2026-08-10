@@ -1796,7 +1796,9 @@ pub(crate) async fn select_vision_provider(
     if active.as_ref().map(|c| c.supports_vision).unwrap_or(false) {
         let snapshot = match &state.llm_registry {
             Some(registry) => {
-                let snapshot = registry.snapshot(workspace_id).await?;
+                let snapshot = registry
+                    .snapshot_synced(&state.db, &state.config, workspace_id)
+                    .await?;
                 let active_provider_id = &active.as_ref().expect("checked above").provider_id;
                 if &snapshot.meta.provider_id != active_provider_id {
                     return Err(AppError::LlmUnavailable {

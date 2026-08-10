@@ -402,6 +402,27 @@ impl TestApp {
         let llm: Arc<TestLlmGenerator> = Arc::new(TestLlmGenerator::default());
 
         let config = test_config(uri, db_name);
+        // The fixture has just installed the built-in template for the default workspace. Mirror
+        // the production durable marker so login/switch handlers do not attempt a lazy seed
+        // transaction against the faster standalone Mongo used by most integration tests.
+        db.raw()
+            .collection::<mongodb::bson::Document>("migrations")
+            .update_one(
+                mongodb::bson::doc! {
+                    "_id": format!(
+                        "workspace_taxonomy_template_v1:{}",
+                        config.default_workspace_id
+                    )
+                },
+                mongodb::bson::doc! {
+                    "$setOnInsert": { "applied_at": mongodb::bson::DateTime::now() }
+                },
+                mongodb::options::UpdateOptions::builder()
+                    .upsert(true)
+                    .build(),
+            )
+            .await
+            .expect("mark default workspace taxonomy template initialized");
 
         prompts::ensure_prompt_pack_v2(
             &db,

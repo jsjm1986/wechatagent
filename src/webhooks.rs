@@ -1,14 +1,9 @@
-use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 
-use axum::{body::Bytes, extract::State, http::HeaderMap, Json};
 use dashmap::DashMap;
-use governor::{
-    clock::{Clock, DefaultClock},
-    state::{InMemoryState, NotKeyed},
-    Quota, RateLimiter,
-};
+
+use axum::{body::Bytes, extract::State, http::HeaderMap, Json};
 use hmac::{Hmac, Mac};
 use mongodb::{
     bson::{doc, oid::ObjectId, to_document, DateTime, Document},
@@ -24,11 +19,6 @@ use crate::{
     models::{AgentStatus, AgentTask, Contact, ConversationMessage, MessageDirection},
     routes::AppState,
 };
-
-type WebhookLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
-
-static WEBHOOK_LIMITERS: LazyLock<DashMap<(String, String), Arc<WebhookLimiter>>> =
-    LazyLock::new(DashMap::new);
 
 /// Durable, single-flight handoff from webhook ingestion to the Agent task
 /// worker. The task keeps this stable key across terminal states so a later
@@ -917,31 +907,93 @@ pub async fn reconcile_pending_inbound_handoffs(state: &AppState) -> AppResult<u
     Ok(recovered)
 }
 
-/// LP-14 / Task 20: return the tenant-scoped token bucket, creating it lazily.
-fn limiter_for(
+/// Stable quota identity for one tenant/account/window.
+fn webhook_rate_limit_bucket_id(
+    workspace_id: &str,
+    account_id: &str,
+    window_start_ms: i64,
+) -> String {
+    let mut hasher = Sha256::new();
+    for value in [workspace_id, account_id] {
+        hasher.update(value.as_bytes());
+        hasher.update([0]);
+    }
+    hasher.update(window_start_ms.to_be_bytes());
+    format!("webhook:{}", hex::encode(hasher.finalize()))
+}
+
+/// Cross-replica fixed-window webhook quota. One deterministic Mongo document is the
+/// linearization point for `(workspace, account, window)`. The update pipeline increments even
+/// above capacity. Concurrent first upserts can race on `_id`; the loser retries the same atomic
+/// increment without upsert, so every accepted request is counted exactly once.
+async fn shared_webhook_rate_limit(
+    state: &AppState,
     workspace_id: &str,
     account_id: &str,
     capacity: u32,
     window_seconds: u32,
-) -> Arc<WebhookLimiter> {
-    let key = (workspace_id.to_string(), account_id.to_string());
-    if let Some(existing) = WEBHOOK_LIMITERS.get(&key) {
-        return existing.clone();
+) -> AppResult<Option<u64>> {
+    let window_ms = i64::from(window_seconds.max(1)).saturating_mul(1_000);
+    let now_ms = DateTime::now().timestamp_millis();
+    let window_start_ms = now_ms.div_euclid(window_ms).saturating_mul(window_ms);
+    let window_end_ms = window_start_ms.saturating_add(window_ms);
+    let bucket_id = webhook_rate_limit_bucket_id(workspace_id, account_id, window_start_ms);
+    let expires_at = DateTime::from_millis(window_end_ms.saturating_add(window_ms));
+    let collection = state
+        .db
+        .raw()
+        .collection::<Document>("webhook_rate_limit_windows");
+    let update = vec![doc! { "$set": {
+        "workspace_id": workspace_id,
+        "account_id": account_id,
+        "window_start_ms": window_start_ms,
+        "window_end_ms": window_end_ms,
+        "expires_at": expires_at,
+        "count": { "$add": [{ "$ifNull": ["$count", 0_i64] }, 1_i64] },
+        "updated_at": DateTime::now(),
+    }}];
+    let first = collection
+        .find_one_and_update(
+            doc! { "_id": &bucket_id },
+            update.clone(),
+            FindOneAndUpdateOptions::builder()
+                .upsert(true)
+                .return_document(mongodb::options::ReturnDocument::After)
+                .build(),
+        )
+        .await;
+    let bucket = match first {
+        Ok(bucket) => bucket,
+        Err(error) if is_duplicate_key_error(&error) => {
+            collection
+                .find_one_and_update(
+                    doc! { "_id": &bucket_id },
+                    update,
+                    FindOneAndUpdateOptions::builder()
+                        .return_document(mongodb::options::ReturnDocument::After)
+                        .build(),
+                )
+                .await?
+        }
+        Err(error) => return Err(error.into()),
     }
-    let cap = NonZeroU32::new(capacity.max(1)).unwrap();
-    let quota = Quota::with_period(std::time::Duration::from_secs(window_seconds.max(1) as u64))
-        .unwrap_or_else(|| Quota::per_minute(cap))
-        .allow_burst(cap);
-    let limiter = Arc::new(RateLimiter::direct(quota));
-    WEBHOOK_LIMITERS
-        .entry(key)
-        .or_insert_with(|| limiter.clone())
-        .clone()
+    .ok_or_else(|| AppError::External("webhook rate-limit bucket disappeared".to_string()))?;
+    let count = bucket.get_i64("count").unwrap_or(i64::MAX);
+    if count > i64::from(capacity.max(1)) {
+        let retry_ms = window_end_ms.saturating_sub(now_ms).max(1);
+        return Ok(Some(((retry_ms + 999) / 1_000) as u64));
+    }
+    Ok(None)
 }
 
-// ───────────────────────── 并发多消息去抖调度器 ─────────────────────────
+// ───────── Legacy in-process debounce compatibility (tests/tools only) ─────────
 //
-// 问题：用户连发多条消息时，旧逻辑每条 webhook 各 spawn 一条独立的
+// Production webhook ingestion no longer calls this scheduler: it materializes one durable
+// `inbound_reply` task and relies on the task lease/CAS protocol for cross-replica single-flight.
+// These public helpers remain temporarily for historical integration tests and external tools;
+// they MUST NOT be reintroduced into the production webhook path.
+//
+// Historical problem: user bursts previously spawned one independent pipeline per webhook.
 // decision→review→send 流水线（~10-15s），三条 → 三条并发流水线 → 发三条
 // 回复，且 min_reply_interval 存在 TOCTOU、画像/记忆并发写竞态。
 //
@@ -954,8 +1006,8 @@ fn limiter_for(
 //   "运行期间到新消息"协作式传给网关（should_abort_send），让已过时的生成在
 //   落盘/入队前主动放弃。
 //
-// caveat：PENDING 是进程内 DashMap——串行只在单副本下成立。若 webhook 摄入
-// 将来横向扩多副本，需改用 DB 原子 claim + 心跳（参 tasks.rs 的 lease 模式）。
+// `PENDING` is intentionally process-local and therefore unsuitable for production replicas.
+// The durable task path above is the sole production authority.
 
 pub fn contact_key(workspace_id: &str, account_id: &str, wxid: &str) -> String {
     format!("{workspace_id}:{account_id}:{wxid}")
@@ -1289,15 +1341,16 @@ pub async fn wechat_webhook(
         }
     }
 
-    // LP-14 / Task 20: rate limits are isolated by workspace + account.
-    let limiter = limiter_for(
+    // LP-14 / Task 20: the quota is shared by every replica for this workspace/account.
+    if let Some(retry_after) = shared_webhook_rate_limit(
+        &state,
         &workspace_id,
         &account_id,
         state.config.webhook_rate_limit_capacity,
         state.config.webhook_rate_limit_window_seconds,
-    );
-    if let Err(neg) = limiter.check() {
-        let retry_after = neg.wait_time_from(DefaultClock::default().now()).as_secs() + 1;
+    )
+    .await?
+    {
         let _ = maybe_emit_rate_limit_event(&state, &workspace_id, &account_id).await;
         return Err(AppError::RateLimited {
             retry_after,
@@ -2750,9 +2803,13 @@ mod rate_limit_dedupe_tests {
 
     #[test]
     fn limiter_segregates_same_account_id_by_workspace() {
-        let a = limiter_for("ws_a", "shared_account", 1, 60);
-        let b = limiter_for("ws_b", "shared_account", 1, 60);
-        assert!(!Arc::ptr_eq(&a, &b));
+        let a = webhook_rate_limit_bucket_id("ws_a", "shared_account", 60_000);
+        let b = webhook_rate_limit_bucket_id("ws_b", "shared_account", 60_000);
+        assert_ne!(a, b);
+        assert_eq!(
+            a,
+            webhook_rate_limit_bucket_id("ws_a", "shared_account", 60_000)
+        );
     }
 
     #[test]

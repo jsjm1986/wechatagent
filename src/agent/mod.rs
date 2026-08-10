@@ -96,6 +96,7 @@ pub use gateway::{
 pub(crate) use guards::initial_operation_state_key;
 pub(crate) use guards::initial_operation_state_key_in_machine;
 pub(crate) use guards::operation_states;
+pub(crate) use guards::OPERATION_STATE_ACTION_VALUES;
 pub use knowledge_router::test_knowledge_route_for_contact;
 // Agent-first 渐进式披露入口：`/api/knowledge/ask` 路由直接调用本 agent。
 pub use knowledge_agent::{
@@ -195,7 +196,9 @@ pub use types::{DecisionReviewResult, RawAgentDecision, ReviewScores};
 pub use taxonomy::{taxonomy_cache_for_tests, TaxonomyCache};
 
 // Phase A / A3：启动期预热入口；main.rs 在 ensure_indexes 后调用。
-pub use taxonomy::{ensure_workspace_taxonomies, init_global_taxonomy_cache};
+pub use taxonomy::{
+    ensure_workspace_taxonomies, init_global_taxonomy_cache, inspect_taxonomy_value,
+};
 
 // universal-domain-adaptation 1G-c：active DomainProfile 进程级缓存预热入口；
 // main.rs 在 taxonomy 预热之后调用。
@@ -264,7 +267,11 @@ pub(crate) async fn generate_agent_json(
     // hot swap between lookup and call could store a new provider's response
     // under the old provider generation (or vice versa).
     let registry_snapshot = match &state.llm_registry {
-        Some(registry) => Some(registry.snapshot(workspace_id).await?),
+        Some(registry) => Some(
+            registry
+                .snapshot_synced(&state.db, &state.config, workspace_id)
+                .await?,
+        ),
         None => None,
     };
     let (provider_id, provider_model, provider_generation) = registry_snapshot
@@ -468,7 +475,11 @@ pub(crate) async fn generate_agent_json_streaming(
 ) -> AppResult<Value> {
     let started_at = DateTime::now();
     let registry_snapshot = match &state.llm_registry {
-        Some(registry) => Some(registry.snapshot(workspace_id).await?),
+        Some(registry) => Some(
+            registry
+                .snapshot_synced(&state.db, &state.config, workspace_id)
+                .await?,
+        ),
         None => None,
     };
     let (provider_id, provider_model) = registry_snapshot

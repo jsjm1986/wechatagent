@@ -3970,7 +3970,9 @@ fn run_user_operation_gateway_inner<'a>(
         )
         .await;
     }
-    write_knowledge_usage_log(
+    // Usage telemetry is not a send-authorization fact. Keep it visible but fail-soft so an
+    // observability outage cannot suppress a reply that already passed all safety barriers.
+    if let Err(error) = write_knowledge_usage_log(
         state,
         &contact,
         &final_decision,
@@ -3979,7 +3981,10 @@ fn run_user_operation_gateway_inner<'a>(
         review_passed(&review, &runtime),
         &run_id,
     )
-    .await?;
+    .await
+    {
+        tracing::warn!(%error, %run_id, "knowledge usage telemetry failed before outbox");
+    }
     if !text_send_eligible(final_decision.should_reply, &final_decision.reply_text) {
         if let Some(task_context) = task_context.as_ref() {
             // should_reply=false → 无需触达；should_reply=true 但 reply_text 为空 → 退化
@@ -4004,22 +4009,27 @@ fn run_user_operation_gateway_inner<'a>(
         }
     }
     let details = build_decision_event_details(&final_decision, playbook.as_ref(), &review);
-    write_event_for_account(
+    // This event precedes durable enqueue. Describe only the fact that is true now; the
+    // `outbox_enqueued` event is emitted after the batch seal below. Audit writes are fail-soft.
+    if let Err(error) = write_event_for_account(
         state,
         &contact.workspace_id,
         &contact.account_id,
         Some(&contact.wxid),
-        "agent_reply",
-        "success",
+        "agent_reply_prepared",
+        "prepared",
         if final_decision.should_reply {
-            "Agent 已生成回复，已入队 outbox 等待发送"
+            "Agent 已生成并审查回复，准备建立 outbox"
         } else {
             "Agent 判断无需回复"
         },
         Some(details),
     )
-    .await?;
-    write_agent_run_log_with_finalize(
+    .await
+    {
+        tracing::warn!(%error, %run_id, "prepared reply audit event failed");
+    }
+    if let Err(error) = write_agent_run_log_with_finalize(
     state,
     &contact,
     &run_id,
@@ -4046,7 +4056,10 @@ fn run_user_operation_gateway_inner<'a>(
         source_kind: envelope_source_kind.clone(),
     },
 )
-.await?;
+.await
+    {
+        tracing::warn!(%error, %run_id, "pre-enqueue run telemetry failed");
+    }
 
     // W4 / Task 5.5：决策落地 = outbox 写入。仅在 finalReviewStatus ∈
     // {approved, revision_applied_approved} 且 should_reply=true 时入队；
@@ -4543,6 +4556,20 @@ fn run_user_operation_gateway_inner<'a>(
             )
             .await?;
         super::post_decision::activate_projection(state, decision_review_id).await?;
+        if let Err(error) = write_event_for_account(
+            state,
+            &contact.workspace_id,
+            &contact.account_id,
+            Some(&contact.wxid),
+            "outbox_enqueued",
+            "success",
+            "回复批次已完整建立并获得发送授权",
+            Some(doc! { "run_id": &run_id, "decision_id": decision_review_id }),
+        )
+        .await
+        {
+            tracing::warn!(%error, %run_id, "outbox authorization audit event failed");
+        }
     }
     // media-asset Task 8：素材文件发送。文本回复已在上方先入 outbox（先文字后文件），
     // 这里把 final_decision.assets_to_send 逐个转成独立媒体 outbox 条目。

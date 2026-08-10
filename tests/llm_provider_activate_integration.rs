@@ -129,6 +129,8 @@ fn test_registry(ws: &str, provider_id: &str, model: &str) -> Arc<LlmRegistry> {
             format: LlmFormat::Openai,
             model: model.to_string(),
             base_url: "http://127.0.0.1:1/v1".to_string(),
+            revision_ms: 0,
+            runtime_fingerprint: format!("fixture:{provider_id}:{model}"),
         },
     ))
 }
@@ -137,7 +139,7 @@ fn test_registry(ws: &str, provider_id: &str, model: &str) -> Arc<LlmRegistry> {
 #[tokio::test]
 #[ignore]
 async fn activate_yields_exactly_one_active_and_is_target() {
-    let app = TestApp::start().await;
+    let app = TestApp::start_repl_set().await;
     let ws = app.state.config.default_workspace_id.clone();
     // seed admin（user_id=llm_admin，workspaces=[ws]），让 H3 ACL 闸 get_admin_user 命中。
     seed_admin(&app, &ws).await;

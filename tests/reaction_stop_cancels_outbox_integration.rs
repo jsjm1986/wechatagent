@@ -203,7 +203,7 @@ async fn record_user_reaction_stop_cancels_pending_outbox() {
         message_id: Some("inbound_stop_1".to_string()),
         dedupe_key: None,
         direction: MessageDirection::Inbound,
-        content: "别再发了，不用联系我".to_string(),
+        content: "最近有点烦，先缓一缓".to_string(),
         msg_type: None,
         media_ref: None,
         raw: None,
@@ -242,4 +242,85 @@ async fn record_user_reaction_stop_cancels_pending_outbox() {
             entry.cancel_reason
         );
     }
+}
+
+#[tokio::test]
+#[ignore]
+async fn deterministic_stop_needs_no_review_or_llm_and_persists_dispatch_barrier() {
+    let app = common::TestApp::start().await;
+    let contact = make_contact("user_deterministic_stop");
+    app.state
+        .db
+        .contacts()
+        .insert_one(&contact, None)
+        .await
+        .expect("insert contact");
+
+    let outbox_id = enqueue_pending(
+        &app.state,
+        &contact,
+        "evt_deterministic_stop",
+        "这条消息绝不能越过远端边界",
+    )
+    .await;
+    let inbound = ConversationMessage {
+        id: Some(ObjectId::new()),
+        workspace_id: contact.workspace_id.clone(),
+        account_id: contact.account_id.clone(),
+        contact_wxid: contact.wxid.clone(),
+        message_id: Some("inbound_deterministic_stop".to_string()),
+        dedupe_key: None,
+        direction: MessageDirection::Inbound,
+        content: "请不要再联系我，停止给我发消息。".to_string(),
+        msg_type: None,
+        media_ref: None,
+        raw: None,
+        is_synthetic_relay: false,
+        created_at: DateTime::now(),
+    };
+
+    record_user_reaction(&app.state, &contact, &inbound)
+        .await
+        .expect("deterministic stop should succeed without a prior review");
+    assert_eq!(
+        app.llm.calls(),
+        0,
+        "explicit stop must never depend on LLM availability"
+    );
+
+    let stored_contact = app
+        .state
+        .db
+        .contacts()
+        .find_one(doc! { "_id": contact.id }, None)
+        .await
+        .expect("load contact")
+        .expect("contact exists");
+    assert!(
+        stored_contact
+            .cooldown_until
+            .is_some_and(|until| until.timestamp_millis() > DateTime::now().timestamp_millis()),
+        "explicit stop must persist a restart-safe cooldown"
+    );
+    assert_eq!(
+        stored_contact
+            .operation_policy
+            .get_bool("explicitStopRequested")
+            .ok(),
+        Some(true)
+    );
+
+    let entry = app
+        .state
+        .db
+        .collection_agent_send_outbox()
+        .find_one(doc! { "_id": outbox_id }, None)
+        .await
+        .expect("load outbox")
+        .expect("outbox exists");
+    assert_eq!(entry.status, "canceled");
+    assert_eq!(
+        entry.cancel_reason.as_deref(),
+        Some("user_reaction_stop_requested")
+    );
 }

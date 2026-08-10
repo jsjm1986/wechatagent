@@ -996,14 +996,13 @@ pub async fn load_active_domain_profile(
 // ─────────────────────────────────────────────────────────────────
 // 1G-c：进程级 active DomainProfile TTL 缓存。
 //
-// 镜像 `agent::taxonomy::TaxonomyCache`：内部 Mutex 保护 (entries, fetched_at)，
-// TTL 自愈 + 显式 invalidate。`reload_from_db` 一次性拉全部 workspace 的 active
-// profile 分组缓存；`get_or_load` TTL 过期则重载，按 workspace_id 命中返回 clone，
-// 未命中（DB 无该 workspace 的 active profile）回落 default。
+// 镜像 `agent::taxonomy::TaxonomyCache`：内部 Mutex 按 workspace 保存 active row、
+// 已观察 generation 与刷新时刻。每次读取只查轻量 generation 文档；generation 变化
+// 或 30 秒恢复 TTL 到期时，仅重载当前 workspace。无 active 行时回落 default。
 //
-// 启动期由 `init_global_domain_profile_cache(db)` 预热（main.rs 接入）；引导层
-// publish profile 后调 `invalidate_global_domain_profile_cache` 让下次 load 立即
-// 见最新（Phase 3 接线，故现暂无调用方，靠 module 级 allow(dead_code) 静默）。
+// 启动期由 `init_global_domain_profile_cache(db)` 全库审计并预热；生产激活在同一事务
+// 内推进 generation，使其它副本下一次读取即可观察变化。显式全局 invalidate 仅保留给
+// 测试夹具和批量维护工具。
 // ─────────────────────────────────────────────────────────────────
 
 /// profile 缓存有效期：30s（与 `TAXONOMY_CACHE_TTL` 同口径）。
@@ -1015,11 +1014,33 @@ pub struct DomainProfileCache {
 }
 
 struct DomainProfileCacheInner {
-    /// `workspace_id` → 该 workspace 当前 active profile（仅缓存 DB 命中的真实
-    /// profile；DB 无 active 行的 workspace **不**入表，`get_or_load` 对其回落
-    /// default，与接缓存前等价）。
     entries: HashMap<String, DomainProfile>,
+    /// Compatibility aggregate used by existing diagnostics/tests.
     fetched_at: Option<Instant>,
+    workspace_fetched_at: HashMap<String, Instant>,
+    source_generations: HashMap<String, i64>,
+}
+
+fn validate_active_profile(profile: &DomainProfile) -> AppResult<()> {
+    if profile.workspace_id.trim().is_empty()
+        || profile.workspace_id.trim() != profile.workspace_id
+        || profile.profile_id.trim().is_empty()
+        || profile.profile_id.trim() != profile.profile_id
+        || profile.version <= 0
+    {
+        return Err(AppError::Conflict(
+            "domain_profile_active_identity_invalid".to_string(),
+        ));
+    }
+    crate::models::validate_domain_profile_dimensions(profile).map_err(|error| {
+        tracing::error!(
+            workspace_id = %profile.workspace_id,
+            profile_id = %profile.profile_id,
+            %error,
+            "active domain profile has unsafe dimension keys"
+        );
+        AppError::Conflict("domain_profile_active_dimensions_invalid".to_string())
+    })
 }
 
 impl Default for DomainProfileCache {
@@ -1028,6 +1049,8 @@ impl Default for DomainProfileCache {
             inner: PlMutex::new(DomainProfileCacheInner {
                 entries: HashMap::new(),
                 fetched_at: None,
+                workspace_fetched_at: HashMap::new(),
+                source_generations: HashMap::new(),
             }),
         }
     }
@@ -1038,46 +1061,32 @@ impl DomainProfileCache {
         Self::default()
     }
 
-    /// 显式失效缓存。引导层 publish/激活 profile 后调用，让下一次 `get_or_load`
-    /// 重新拉取最新 active profile（否则换 profile 后最多 30s 才可见）。
     pub fn invalidate(&self) {
         let mut inner = self.inner.lock();
         inner.entries.clear();
         inner.fetched_at = None;
+        inner.workspace_fetched_at.clear();
+        inner.source_generations.clear();
     }
 
-    /// 启动期预热：拉全部 active profile 填充缓存。损坏指针或 DB 错误必须阻止启动。
+    pub fn invalidate_workspace(&self, workspace_id: &str) {
+        let mut inner = self.inner.lock();
+        inner.entries.remove(workspace_id);
+        inner.workspace_fetched_at.remove(workspace_id);
+        inner.source_generations.remove(workspace_id);
+        inner.fetched_at = None;
+    }
+
+    /// Startup performs the full invariant audit once. Runtime refreshes are workspace-scoped.
     pub async fn warm_up(&self, db: &Database) -> AppResult<()> {
-        self.reload_from_db(db).await
-    }
-
-    async fn reload_from_db(&self, db: &Database) -> AppResult<()> {
         use futures::TryStreamExt;
         let mut cursor = db
             .domain_profiles()
             .find(doc! { "is_active": true }, None)
             .await?;
-        let mut entries: HashMap<String, DomainProfile> = HashMap::new();
+        let mut entries = HashMap::new();
         while let Some(profile) = cursor.try_next().await? {
-            if profile.workspace_id.trim().is_empty()
-                || profile.workspace_id.trim() != profile.workspace_id
-                || profile.profile_id.trim().is_empty()
-                || profile.profile_id.trim() != profile.profile_id
-                || profile.version <= 0
-            {
-                return Err(AppError::Conflict(
-                    "domain_profile_active_identity_invalid".to_string(),
-                ));
-            }
-            crate::models::validate_domain_profile_dimensions(&profile).map_err(|error| {
-                tracing::error!(
-                    workspace_id = %profile.workspace_id,
-                    profile_id = %profile.profile_id,
-                    %error,
-                    "active domain profile has unsafe dimension keys"
-                );
-                AppError::Conflict("domain_profile_active_dimensions_invalid".to_string())
-            })?;
+            validate_active_profile(&profile)?;
             if entries
                 .insert(profile.workspace_id.clone(), profile)
                 .is_some()
@@ -1087,14 +1096,74 @@ impl DomainProfileCache {
                 ));
             }
         }
+        let mut source_generations = HashMap::new();
+        for workspace_id in entries.keys() {
+            let generation = crate::db::config_generation::read_generation(
+                db,
+                crate::db::config_generation::DOMAIN_PROFILE_NAMESPACE,
+                workspace_id,
+            )
+            .await?;
+            source_generations.insert(workspace_id.clone(), generation);
+        }
+        let now = Instant::now();
         let mut inner = self.inner.lock();
         inner.entries = entries;
-        inner.fetched_at = Some(Instant::now());
+        inner.fetched_at = Some(now);
+        inner.workspace_fetched_at = inner
+            .entries
+            .keys()
+            .map(|workspace| (workspace.clone(), now))
+            .collect();
+        inner.source_generations = source_generations;
         Ok(())
     }
 
-    /// TTL 自愈判定：fetched_at 缺失或距今 ≥ TTL → true。抽独立函数让 lib 单测
-    /// 无 Docker 也能断言 TTL 语义。
+    async fn reload_workspace(
+        &self,
+        db: &Database,
+        workspace_id: &str,
+        generation: i64,
+    ) -> AppResult<()> {
+        let profile = db
+            .domain_profiles()
+            .find_one(
+                doc! { "workspace_id": workspace_id, "is_active": true },
+                None,
+            )
+            .await?;
+        if let Some(profile) = profile.as_ref() {
+            validate_active_profile(profile)?;
+        }
+        let now = Instant::now();
+        let mut inner = self.inner.lock();
+        match profile {
+            Some(profile) => {
+                inner.entries.insert(workspace_id.to_string(), profile);
+            }
+            None => {
+                inner.entries.remove(workspace_id);
+            }
+        }
+        inner.fetched_at = Some(now);
+        inner
+            .workspace_fetched_at
+            .insert(workspace_id.to_string(), now);
+        inner
+            .source_generations
+            .insert(workspace_id.to_string(), generation);
+        Ok(())
+    }
+
+    fn workspace_is_stale(&self, workspace_id: &str) -> bool {
+        self.inner
+            .lock()
+            .workspace_fetched_at
+            .get(workspace_id)
+            .is_none_or(|fetched| fetched.elapsed() >= DOMAIN_PROFILE_CACHE_TTL)
+    }
+
+    #[cfg(test)]
     pub(crate) fn is_stale(&self) -> bool {
         let inner = self.inner.lock();
         match inner.fetched_at {
@@ -1103,21 +1172,30 @@ impl DomainProfileCache {
         }
     }
 
-    /// 查找或自动加载：TTL 过期 → 重载全表；按 `workspace_id` 命中返回真实 profile
-    /// 的 clone，未命中回落 [`default_domain_profile`]。重载失败不使用 stale/默认值。
     pub(crate) async fn get_or_load(
         &self,
         db: &Database,
         workspace_id: &str,
     ) -> AppResult<DomainProfile> {
-        if self.is_stale() {
-            self.reload_from_db(db).await?;
+        let authoritative = crate::db::config_generation::read_generation(
+            db,
+            crate::db::config_generation::DOMAIN_PROFILE_NAMESPACE,
+            workspace_id,
+        )
+        .await?;
+        let cached = self
+            .inner
+            .lock()
+            .source_generations
+            .get(workspace_id)
+            .copied();
+        if self.workspace_is_stale(workspace_id) || cached != Some(authoritative) {
+            self.reload_workspace(db, workspace_id, authoritative)
+                .await?;
         }
         Ok(self.lookup_or_default(workspace_id))
     }
 
-    /// 纯查表（无 IO）：命中返回真实 profile clone，未命中回落 default。抽出独立
-    /// 方法让 `get_or_load` 与 lib 单测共用同一回落口径（避免测试内联逻辑漂移）。
     fn lookup_or_default(&self, workspace_id: &str) -> DomainProfile {
         let inner = self.inner.lock();
         match inner.entries.get(workspace_id) {
@@ -1126,22 +1204,26 @@ impl DomainProfileCache {
         }
     }
 
-    /// test-only：把 `fetched_at` 强制回拨，模拟"距上次加载已过 N"，验证 TTL。
     #[cfg(test)]
     pub(crate) fn rewind_fetched_at_for_test(&self, dur: Duration) {
         let mut inner = self.inner.lock();
         if let Some(t) = inner.fetched_at {
             inner.fetched_at = Some(t.checked_sub(dur).unwrap_or(t));
         }
+        for fetched in inner.workspace_fetched_at.values_mut() {
+            *fetched = fetched.checked_sub(dur).unwrap_or(*fetched);
+        }
     }
 
-    /// test-only：直接灌入一个 workspace 的 profile 并标记已加载，免 Mongo 即可
-    /// 验证"命中返回真实 profile / 未命中回落 default"。
     #[cfg(test)]
     pub(crate) fn seed_for_test(&self, profile: DomainProfile) {
         let mut inner = self.inner.lock();
-        inner.entries.insert(profile.workspace_id.clone(), profile);
-        inner.fetched_at = Some(Instant::now());
+        let workspace_id = profile.workspace_id.clone();
+        let now = Instant::now();
+        inner.entries.insert(workspace_id.clone(), profile);
+        inner.fetched_at = Some(now);
+        inner.workspace_fetched_at.insert(workspace_id.clone(), now);
+        inner.source_generations.insert(workspace_id, 0);
     }
 }
 

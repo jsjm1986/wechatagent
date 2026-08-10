@@ -70,7 +70,12 @@ pub struct TaxonomyCache {
 struct TaxonomyCacheInner {
     /// `(workspace_id, scope, kind)` → entries（active + deprecated 都进缓存）。
     entries: HashMap<(String, String, String), Vec<CachedEntry>>,
+    /// Compatibility aggregate used by existing diagnostics/tests.
     fetched_at: Option<Instant>,
+    /// Per-workspace refresh time keeps manual DB writes eventually visible without global scans.
+    workspace_fetched_at: HashMap<String, Instant>,
+    /// Last database-authoritative lightweight generation observed per workspace.
+    source_generations: HashMap<String, i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -92,12 +97,72 @@ struct CachedEntry {
     display_name: String,
 }
 
+fn build_workspace_entries(
+    workspace_id: &str,
+    rows: Vec<TaxonomyEntry>,
+) -> AppResult<HashMap<(String, String, String), Vec<CachedEntry>>> {
+    let mut current_counts: HashMap<(String, String, String), usize> = HashMap::new();
+    let mut current_entries = Vec::new();
+    for entry in rows {
+        let logical_key = (
+            entry.scope.clone(),
+            entry.kind.clone(),
+            entry.value.id.clone(),
+        );
+        let count = current_counts.entry(logical_key).or_default();
+        if entry.current_version {
+            *count += 1;
+            current_entries.push(entry);
+        }
+    }
+    if let Some((key, count)) = current_counts.iter().find(|(_, count)| **count != 1) {
+        return Err(AppError::Conflict(format!(
+            "taxonomy current pointer invalid for workspace={workspace_id} scope={} kind={} value_id={}: count={count}",
+            key.0, key.1, key.2
+        )));
+    }
+    let mut entries = HashMap::new();
+    let mut active_claims: HashMap<(String, String, String), String> = HashMap::new();
+    for entry in current_entries {
+        if entry.value.status == "active" {
+            for claim in
+                crate::models::taxonomy_identity_claims(&entry.value.id, &entry.value.aliases)
+            {
+                let claim_key = (entry.scope.clone(), entry.kind.clone(), claim.clone());
+                if let Some(existing) = active_claims.insert(claim_key, entry.value.id.clone()) {
+                    if existing != entry.value.id {
+                        return Err(AppError::Conflict(format!(
+                            "taxonomy identity claim {claim:?} is ambiguous between {existing:?} and {:?}",
+                            entry.value.id
+                        )));
+                    }
+                }
+            }
+        }
+        entries
+            .entry((workspace_id.to_string(), entry.scope, entry.kind))
+            .or_insert_with(Vec::new)
+            .push(CachedEntry {
+                canonical_id: entry.value.id,
+                aliases: entry.value.aliases,
+                status: entry.value.status,
+                priority_weight: entry.value.priority_weight,
+                is_terminal: entry.value.is_terminal,
+                is_reactivation_target: entry.value.is_reactivation_target,
+                display_name: entry.value.display_name,
+            });
+    }
+    Ok(entries)
+}
+
 impl Default for TaxonomyCache {
     fn default() -> Self {
         Self {
             inner: PlMutex::new(TaxonomyCacheInner {
                 entries: HashMap::new(),
                 fetched_at: None,
+                workspace_fetched_at: HashMap::new(),
+                source_generations: HashMap::new(),
             }),
         }
     }
@@ -119,6 +184,8 @@ impl TaxonomyCache {
             inner: PlMutex::new(TaxonomyCacheInner {
                 entries: inner.entries.clone(),
                 fetched_at: inner.fetched_at,
+                workspace_fetched_at: inner.workspace_fetched_at.clone(),
+                source_generations: inner.source_generations.clone(),
             }),
         }
     }
@@ -129,91 +196,108 @@ impl TaxonomyCache {
         let mut inner = self.inner.lock();
         inner.entries.clear();
         inner.fetched_at = None;
+        inner.workspace_fetched_at.clear();
+        inner.source_generations.clear();
     }
 
-    /// 启动期预热：从 DB 加载 `system_taxonomies` 全表并填充缓存。
-    ///
-    /// 版本流存在但没有唯一 current 时必须阻止启动；不能把损坏指针伪装成空字典。
+    pub fn invalidate_workspace(&self, workspace_id: &str) {
+        let mut inner = self.inner.lock();
+        inner
+            .entries
+            .retain(|(workspace, _, _), _| workspace != workspace_id);
+        inner.workspace_fetched_at.remove(workspace_id);
+        inner.source_generations.remove(workspace_id);
+        inner.fetched_at = None;
+    }
+
+    /// 启动期预热：全库审计 current 指针并构建初始缓存。
     pub async fn warm_up(&self, db: &Database) -> AppResult<()> {
-        self.reload_from_db(db).await
+        self.reload_all_from_db(db).await
     }
 
-    async fn reload_from_db(&self, db: &Database) -> AppResult<()> {
+    async fn reload_all_from_db(&self, db: &Database) -> AppResult<()> {
         use futures::TryStreamExt;
-        // SR-008：历史版本可以驻留，但每个
-        // (workspace, scope, kind, value.id) 必须恰好一条 current。读取全版本后先
-        // 验证指针，再构建缓存；异常时保留旧 cache 且向调用方返回错误。
         let mut cursor = db
             .collection_system_taxonomies()
             .find(doc! {}, None)
             .await?;
-        let mut current_counts: HashMap<(String, String, String, String), usize> = HashMap::new();
-        let mut current_entries = Vec::new();
+        let mut rows = Vec::new();
         while let Some(entry) = cursor.try_next().await? {
-            let logical_key = (
-                entry.workspace_id.clone(),
-                entry.scope.clone(),
-                entry.kind.clone(),
-                entry.value.id.clone(),
-            );
-            let count = current_counts.entry(logical_key).or_default();
-            if entry.current_version {
-                *count += 1;
-                current_entries.push(entry);
-            }
+            rows.push(entry);
         }
-        if let Some((key, count)) = current_counts.iter().find(|(_, count)| **count != 1) {
-            return Err(AppError::Conflict(format!(
-                "taxonomy current pointer invalid for workspace={} scope={} kind={} value_id={}: count={count}",
-                key.0, key.1, key.2, key.3
-            )));
+        let workspaces = rows
+            .iter()
+            .map(|entry| entry.workspace_id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut rebuilt = HashMap::new();
+        for workspace_id in workspaces.iter() {
+            let workspace_rows = rows
+                .iter()
+                .filter(|entry| &entry.workspace_id == workspace_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            rebuilt.extend(build_workspace_entries(workspace_id, workspace_rows)?);
         }
-        let mut entries: HashMap<(String, String, String), Vec<CachedEntry>> = HashMap::new();
-        let mut active_claims: HashMap<(String, String, String, String), String> = HashMap::new();
-        for entry in current_entries {
-            if entry.value.status == "active" {
-                for claim in
-                    crate::models::taxonomy_identity_claims(&entry.value.id, &entry.value.aliases)
-                {
-                    let claim_key = (
-                        entry.workspace_id.clone(),
-                        entry.scope.clone(),
-                        entry.kind.clone(),
-                        claim.clone(),
-                    );
-                    if let Some(existing) = active_claims.insert(claim_key, entry.value.id.clone())
-                    {
-                        if existing != entry.value.id {
-                            return Err(AppError::Conflict(format!(
-                                "taxonomy identity claim {claim:?} is ambiguous between {existing:?} and {:?}",
-                                entry.value.id
-                            )));
-                        }
-                    }
-                }
-            }
-            let key = (
-                entry.workspace_id.clone(),
-                entry.scope.clone(),
-                entry.kind.clone(),
-            );
-            entries
-                .entry(key)
-                .or_insert_with(Vec::new)
-                .push(CachedEntry {
-                    canonical_id: entry.value.id,
-                    aliases: entry.value.aliases,
-                    status: entry.value.status,
-                    priority_weight: entry.value.priority_weight,
-                    is_terminal: entry.value.is_terminal,
-                    is_reactivation_target: entry.value.is_reactivation_target,
-                    display_name: entry.value.display_name,
-                });
+        let mut source_generations = HashMap::new();
+        for workspace_id in &workspaces {
+            let generation = crate::db::config_generation::read_generation(
+                db,
+                crate::db::config_generation::TAXONOMY_NAMESPACE,
+                workspace_id,
+            )
+            .await?;
+            source_generations.insert(workspace_id.clone(), generation);
         }
+        let now = Instant::now();
         let mut inner = self.inner.lock();
-        inner.entries = entries;
-        inner.fetched_at = Some(Instant::now());
+        inner.entries = rebuilt;
+        inner.fetched_at = Some(now);
+        inner.workspace_fetched_at = workspaces
+            .iter()
+            .map(|workspace| (workspace.clone(), now))
+            .collect();
+        inner.source_generations = source_generations;
         Ok(())
+    }
+
+    async fn reload_workspace_from_db(
+        &self,
+        db: &Database,
+        workspace_id: &str,
+        generation: i64,
+    ) -> AppResult<()> {
+        use futures::TryStreamExt;
+        let mut cursor = db
+            .collection_system_taxonomies()
+            .find(doc! { "workspace_id": workspace_id }, None)
+            .await?;
+        let mut rows = Vec::new();
+        while let Some(entry) = cursor.try_next().await? {
+            rows.push(entry);
+        }
+        let rebuilt = build_workspace_entries(workspace_id, rows)?;
+        let now = Instant::now();
+        let mut inner = self.inner.lock();
+        inner
+            .entries
+            .retain(|(workspace, _, _), _| workspace != workspace_id);
+        inner.entries.extend(rebuilt);
+        inner.fetched_at = Some(now);
+        inner
+            .workspace_fetched_at
+            .insert(workspace_id.to_string(), now);
+        inner
+            .source_generations
+            .insert(workspace_id.to_string(), generation);
+        Ok(())
+    }
+
+    fn workspace_is_stale(&self, workspace_id: &str) -> bool {
+        self.inner
+            .lock()
+            .workspace_fetched_at
+            .get(workspace_id)
+            .is_none_or(|fetched| fetched.elapsed() >= TAXONOMY_CACHE_TTL)
     }
 
     /// TTL 自愈判定：fetched_at 缺失（从未加载）或距今 ≥ TAXONOMY_CACHE_TTL → true。
@@ -221,6 +305,7 @@ impl TaxonomyCache {
     /// 抽出独立函数让 lib-level 单测（无 Docker 环境）能直接断言"warm_up 之后
     /// 30s 内 stale=false / 30s 后 stale=true"的 TTL 自愈语义；`find_or_load` 走
     /// 同一判定避免双份口径。
+    #[cfg(test)]
     pub(crate) fn is_stale(&self) -> bool {
         let inner = self.inner.lock();
         match inner.fetched_at {
@@ -229,24 +314,49 @@ impl TaxonomyCache {
         }
     }
 
-    /// 查找或自动加载（TTL 过期 → 异步加载）。
-    /// 注意：本方法保持调用方 `&self`，内部异步加载完成后写回 inner。
+    /// Production read: compare one small generation row, then reload only this workspace.
     pub(crate) async fn find_or_load(&self, db: &Database, workspace_id: &str) -> AppResult<()> {
         let seeded = ensure_workspace_taxonomies(db, workspace_id).await?;
-        if seeded || self.is_stale() {
-            self.reload_from_db(db).await?;
+        let authoritative = crate::db::config_generation::read_generation(
+            db,
+            crate::db::config_generation::TAXONOMY_NAMESPACE,
+            workspace_id,
+        )
+        .await?;
+        let cached = self
+            .inner
+            .lock()
+            .source_generations
+            .get(workspace_id)
+            .copied();
+        if seeded || self.workspace_is_stale(workspace_id) || cached != Some(authoritative) {
+            self.reload_workspace_from_db(db, workspace_id, authoritative)
+                .await?;
         }
         Ok(())
     }
 
-    /// Refresh the cache without materializing built-in taxonomy rows.
-    ///
-    /// Shadow/replay execution must observe the same existing dictionary as live
-    /// execution, but it must not create a workspace seed marker or taxonomy
-    /// entries merely because an evaluation touched a cold cache.
-    pub(crate) async fn find_or_load_read_only(&self, db: &Database) -> AppResult<()> {
-        if self.is_stale() {
-            self.reload_from_db(db).await?;
+    /// Shadow/replay refresh without materializing built-in rows.
+    pub(crate) async fn find_or_load_read_only(
+        &self,
+        db: &Database,
+        workspace_id: &str,
+    ) -> AppResult<()> {
+        let authoritative = crate::db::config_generation::read_generation(
+            db,
+            crate::db::config_generation::TAXONOMY_NAMESPACE,
+            workspace_id,
+        )
+        .await?;
+        let cached = self
+            .inner
+            .lock()
+            .source_generations
+            .get(workspace_id)
+            .copied();
+        if self.workspace_is_stale(workspace_id) || cached != Some(authoritative) {
+            self.reload_workspace_from_db(db, workspace_id, authoritative)
+                .await?;
         }
         Ok(())
     }
@@ -258,6 +368,9 @@ impl TaxonomyCache {
         let mut inner = self.inner.lock();
         if let Some(t) = inner.fetched_at {
             inner.fetched_at = Some(t.checked_sub(dur).unwrap_or(t));
+        }
+        for fetched in inner.workspace_fetched_at.values_mut() {
+            *fetched = fetched.checked_sub(dur).unwrap_or(*fetched);
         }
     }
 }
@@ -649,9 +762,9 @@ pub(crate) async fn upsert_candidate_once_per_run(
 // ─────────────────────────────────────────────────────────────────
 // 进程级、按 Database 连接身份隔离的 TaxonomyCache registry。
 //
-// `enforce_decision_taxonomy_guards` 在每次 run 都会查 cache；启动期
-// 由 `init_global_taxonomy_cache(db)` 预热（main.rs 接入），后台 API 写
-// 后调 [`invalidate_global_taxonomy_cache`] 失效。
+// `enforce_decision_taxonomy_guards` 在每次 run 都会查 cache；启动期全库审计预热，
+// 运行时按 workspace 比较轻量 generation，仅在变化或恢复 TTL 到期时重载该 shard。
+// 后台写在同一事务推进 generation，并在提交后失效本进程 workspace shard。
 // ─────────────────────────────────────────────────────────────────
 
 struct TaxonomyCacheRegistryEntry {
@@ -680,7 +793,9 @@ pub async fn ensure_workspace_taxonomies(db: &Database, workspace_id: &str) -> A
         crate::db::migrations::ensure_builtin_taxonomies_for_workspace(db, workspace_id).await?;
     INITIALIZED_TAXONOMY_WORKSPACES.insert(key, db.cache_lifetime());
     if inserted {
-        global_taxonomy_cache(db).invalidate();
+        // The durable seed transaction already advanced the shared generation atomically.
+        // This layer only drops the local workspace shard so the next lookup rebuilds it.
+        global_taxonomy_cache(db).invalidate_workspace(workspace_id);
     }
     Ok(inserted)
 }
@@ -710,10 +825,31 @@ pub async fn init_global_taxonomy_cache(db: &Database) -> AppResult<()> {
     global_taxonomy_cache(db).warm_up(db).await
 }
 
-/// 后台 API（admin_taxonomies / admin_taxonomy_candidates）在写后调用以让缓
-/// 存立即失效。
-pub(crate) fn invalidate_global_taxonomy_cache(db: &Database) {
-    global_taxonomy_cache(db).invalidate();
+/// Invalidate one workspace shard in this process after its durable mutation commits.
+pub(crate) fn invalidate_global_taxonomy_cache(db: &Database, workspace_id: &str) {
+    global_taxonomy_cache(db).invalidate_workspace(workspace_id);
+}
+
+/// Read-only runtime diagnostic used by cross-replica integration tests and health tooling.
+/// It traverses the exact production cache refresh path, then reports the classification without
+/// mutating candidates or decision state.
+pub async fn inspect_taxonomy_value(
+    db: &Database,
+    workspace_id: &str,
+    scope_account_id: &str,
+    kind: &str,
+    raw_value: &str,
+) -> AppResult<String> {
+    let cache = global_taxonomy_cache(db);
+    cache.find_or_load_read_only(db, workspace_id).await?;
+    Ok(
+        match check_value(workspace_id, kind, raw_value, scope_account_id, &cache) {
+            TaxonomyMatch::Active => "active".to_string(),
+            TaxonomyMatch::AliasActive(canonical) => format!("alias:{canonical}"),
+            TaxonomyMatch::Deprecated => "deprecated".to_string(),
+            TaxonomyMatch::CandidateNew => "candidate_new".to_string(),
+        },
+    )
 }
 
 /// 测试用 helper — 把已构造好的 [`TaxonomyEntry`] 集合直接灌入一个新 cache。
@@ -782,7 +918,12 @@ mod tests {
         {
             let mut inner = cache.inner.lock();
             inner.entries = grouped;
-            inner.fetched_at = Some(Instant::now());
+            let now = Instant::now();
+            inner.fetched_at = Some(now);
+            inner
+                .workspace_fetched_at
+                .insert("default".to_string(), now);
+            inner.source_generations.insert("default".to_string(), 0);
         }
         cache
     }

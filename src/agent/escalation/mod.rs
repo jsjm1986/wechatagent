@@ -32,7 +32,7 @@ pub async fn reconcile_principal_card_deliveries(state: &AppState) -> AppResult<
 
 use super::generate_agent_json;
 use super::outbox::{enqueue as outbox_enqueue, EnqueueOutcome, EnqueueRequest};
-use super::run_envelope::SOURCE_KIND_FOLLOW_UP_TASK;
+use super::run_envelope::{SOURCE_KIND_FOLLOW_UP_TASK, SOURCE_KIND_PRINCIPAL_CLARIFICATION};
 use super::types::{AgentDecision, DecisionReviewResult};
 use crate::error::{AppError, AppResult};
 use crate::models::{
@@ -486,14 +486,40 @@ pub(crate) async fn handle_principal_reply(
                 "您刚回复的是哪一条？目前挂着这几条：{list}，麻烦带上编号（如 #{}）再回我一次。",
                 codes.first().cloned().unwrap_or_default()
             );
-            crate::mcp::logged_call_for_account(
+            // Internal clarification is still a real outbound side effect. Route it through
+            // the same durable Outbox/Dispatcher boundary as principal cards so retries,
+            // cancellation, pacing, receipt classification, and delivery_unknown all apply.
+            let mut stable_codes = codes.clone();
+            stable_codes.sort();
+            stable_codes.dedup();
+            let source_event_id = format!(
+                "principal-clarification:{}:{}",
+                principal_wxid,
+                stable_codes.join("-")
+            );
+            let outcome = outbox_enqueue(
                 state,
-                workspace_id,
-                account_id,
-                "message_send_text",
-                serde_json::json!({ "recipient": principal_wxid, "content": ask }),
+                EnqueueRequest {
+                    workspace_id: workspace_id.to_string(),
+                    account_id: account_id.to_string(),
+                    contact_wxid: principal_wxid.to_string(),
+                    run_id: source_event_id.clone(),
+                    decision_id: None,
+                    source_event_id,
+                    source_kind: SOURCE_KIND_PRINCIPAL_CLARIFICATION.to_string(),
+                    content: ask,
+                    media_asset_id: None,
+                    referral_card_id: None,
+                    max_attempts: 3,
+                },
             )
             .await?;
+            tracing::info!(
+                principal_wxid,
+                pending_codes = ?stable_codes,
+                idempotent = matches!(outcome, EnqueueOutcome::IdempotentSkip { .. }),
+                "principal ambiguity clarification accepted by durable outbox"
+            );
             Ok(true)
         }
         ReplyMatch::Matched(short_code) => {

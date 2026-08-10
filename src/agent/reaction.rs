@@ -49,6 +49,14 @@ pub(crate) async fn record_user_reaction_with_outcome(
     contact: &Contact,
     inbound: &ConversationMessage,
 ) -> AppResult<ReactionOutcome> {
+    // Explicit opt-out is a deterministic safety signal, not a model-quality question. Apply it
+    // before loading prompts/config or claiming a review so a missing prior review, exhausted LLM
+    // budget, provider outage, or malformed model response can never turn an unambiguous stop into
+    // `unclassified` and allow the current reply to continue.
+    if explicit_stop_intent(&inbound.content) {
+        return Ok(apply_deterministic_stop(state, contact, inbound).await);
+    }
+
     // 波 A1：在最外层为 reaction 路径起一个 RunBudget。即便 stuck 重置阶段
     // 不调用 LLM，只要后续 analyze_user_reaction 命中就能记账并支持降级。
     let domain_config =
@@ -68,6 +76,157 @@ pub(crate) async fn record_user_reaction_with_outcome(
             record_user_reaction_inner(state, contact, inbound, run_id),
         )
         .await
+}
+
+/// High-precision, domain-independent opt-out recognizer. This intentionally accepts only direct
+/// imperatives about contact/messages or standard unsubscribe tokens. Objections, purchase
+/// rejection, polite conversation endings, and quoted/negated examples remain for the LLM path.
+pub(crate) fn explicit_stop_intent(content: &str) -> bool {
+    let normalized = content
+        .trim()
+        .to_lowercase()
+        .chars()
+        .filter(|ch| {
+            !ch.is_whitespace()
+                && !matches!(
+                    ch,
+                    '，' | ',' | '。' | '.' | '！' | '!' | '？' | '?' | '；' | ';' | ':' | '：'
+                )
+        })
+        .collect::<String>();
+    if normalized.is_empty() || normalized.chars().count() > 96 {
+        return false;
+    }
+    // Do not classify someone discussing or negating an opt-out phrase as an actual instruction.
+    if [
+        "没有说",
+        "没说",
+        "不是说",
+        "并不是",
+        "并非",
+        "别误会",
+        "举例",
+        "比如",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+    {
+        return false;
+    }
+    const DIRECT: &[&str] = &[
+        "别再联系我",
+        "不要再联系我",
+        "别联系我了",
+        "不要联系我了",
+        "停止联系我",
+        "别再给我发消息",
+        "不要再给我发消息",
+        "停止给我发消息",
+        "别再发消息",
+        "不要再发消息",
+        "停止发送消息",
+        "取消订阅",
+        "退订",
+        "unsubscribe",
+        "stopmessagingme",
+        "donotcontactme",
+        "don'tcontactme",
+        "dontcontactme",
+        "removemefromyourlist",
+    ];
+    DIRECT.iter().any(|phrase| normalized.contains(phrase))
+}
+
+async fn apply_deterministic_stop(
+    state: &AppState,
+    contact: &Contact,
+    inbound: &ConversationMessage,
+) -> ReactionOutcome {
+    const OUTCOME: &str = "user_replied_stop_requested";
+    let now = DateTime::now();
+    // A long-lived persisted cooldown is reversible by an administrator but survives process
+    // restarts and is consumed by Gateway, Planner, and the dispatch-time safety gate.
+    let cooldown_until = DateTime::from_millis(
+        now.timestamp_millis()
+            .saturating_add(100_i64 * 365 * 24 * 60 * 60 * 1000),
+    );
+    if let Err(error) = state
+        .db
+        .contacts()
+        .update_one(
+            doc! {
+                "workspace_id": &contact.workspace_id,
+                "account_id": &contact.account_id,
+                "wxid": &contact.wxid,
+            },
+            doc! { "$set": {
+                "cooldown_until": cooldown_until,
+                "operation_policy.explicitStopRequested": true,
+                "operation_policy.explicitStopRequestedAt": now,
+                "updated_at": now,
+            } },
+            None,
+        )
+        .await
+    {
+        // Still return stop_requested so the in-process safety barrier aborts this run. A database
+        // outage must never invert the deterministic classification into permission to send.
+        tracing::error!(%error, contact_wxid = %contact.wxid, "persist deterministic stop failed");
+    }
+
+    let analysis = doc! {
+        "outcomeStatus": OUTCOME,
+        "stopRequested": true,
+        "deterministic": true,
+        "confidence": 100,
+    };
+    let options = mongodb::options::FindOneAndUpdateOptions::builder()
+        .sort(doc! { "created_at": -1 })
+        .build();
+    if let Err(error) = state
+        .db
+        .decision_reviews()
+        .find_one_and_update(
+            doc! {
+                "workspace_id": &contact.workspace_id,
+                "account_id": &contact.account_id,
+                "contact_wxid": &contact.wxid,
+                "status": "sent",
+                "outcome_status": { "$in": [null, "pending", "analyzing"] },
+            },
+            doc! {
+                "$set": {
+                    "outcome_status": OUTCOME,
+                    "reaction_analysis": &analysis,
+                    "send_gateway_result.userReactionMessageId": inbound.message_id.clone().unwrap_or_default(),
+                    "send_gateway_result.userReactionAt": now,
+                    "send_gateway_result.userReactionAnalysis": &analysis,
+                },
+                "$unset": { "reaction_claimed_at": "", "reaction_claim_token": "" },
+            },
+            options,
+        )
+        .await
+    {
+        tracing::warn!(%error, contact_wxid = %contact.wxid, "record deterministic stop review outcome failed");
+    }
+
+    if let Err(error) = outbox::cancel_for_contact_on_user_reaction(
+        state,
+        &contact.workspace_id,
+        &contact.account_id,
+        &contact.wxid,
+    )
+    .await
+    {
+        tracing::error!(%error, contact_wxid = %contact.wxid, "cancel outbox for deterministic stop failed");
+    }
+
+    ReactionOutcome {
+        claimed: true,
+        outcome_status: Some(OUTCOME.to_string()),
+        stop_requested: true,
+    }
 }
 
 async fn record_user_reaction_inner(
@@ -1156,6 +1315,35 @@ mod a6_tests {
             sales_status, "user_replied_unclassified",
             "删失语义域无关：销售域沉默也是 unclassified"
         );
+    }
+
+    #[test]
+    fn explicit_stop_intent_accepts_only_direct_opt_outs() {
+        for text in [
+            "别再联系我",
+            "请不要再给我发消息。",
+            "退订",
+            "UNSUBSCRIBE",
+            "remove me from your list",
+        ] {
+            assert!(
+                explicit_stop_intent(text),
+                "direct opt-out must match: {text}"
+            );
+        }
+        for text in [
+            "这个产品我不需要",
+            "今天先聊到这里，谢谢",
+            "最近有点烦，先缓一缓",
+            "我没有说不要再联系我",
+            "比如客户说别再联系我时怎么办",
+            "别误会，我不是说退订",
+        ] {
+            assert!(
+                !explicit_stop_intent(text),
+                "ambiguous, quoted, or negated text must remain on the model path: {text}"
+            );
+        }
     }
 
     #[test]

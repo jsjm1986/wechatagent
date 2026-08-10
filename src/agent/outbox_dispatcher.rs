@@ -34,7 +34,8 @@ use super::outbox::{
     backoff_with_jitter_seeded, check_second_safety_gate_pure, write_outbox_event, OutboxStatus,
 };
 use super::run_envelope::{
-    SOURCE_KIND_MANUAL_SEND, SOURCE_KIND_PRINCIPAL_ESCALATION, SOURCE_KIND_SYSTEM_INCIDENT,
+    SOURCE_KIND_MANUAL_SEND, SOURCE_KIND_PRINCIPAL_CLARIFICATION, SOURCE_KIND_PRINCIPAL_ESCALATION,
+    SOURCE_KIND_SYSTEM_INCIDENT,
 };
 
 fn principal_card_source_identity(source_event_id: &str) -> Option<(ObjectId, i64)> {
@@ -466,11 +467,33 @@ async fn task_send_authorization(
         // 历史/手工 Outbox 允许没有 review；Task Outbox 的 review 在 enqueue 前已落库。
         return Ok(TaskSendAuthorization::Authorized(None));
     };
+    // The decision review is the durable batch seal for every decision-backed Outbox. Rows may
+    // be claimed while the Gateway is still creating later text segments; until the review moves
+    // from `outbox_enqueuing` to `outbox_enqueued`, no segment may cross the remote boundary.
+    //
+    // For task-backed decisions, inspect the immutable task claim *before* returning Building.
+    // A newer inbound can revoke that claim while the old review is still outbox_enqueuing; such
+    // rows are stale and must converge to canceled rather than being deferred forever.
+    let review_building = match review.status.as_str() {
+        "outbox_enqueuing" => true,
+        "outbox_enqueued" | "sent" => false,
+        other => {
+            return Ok(TaskSendAuthorization::Stale(format!(
+                "decision batch is no longer send-authorized (status={other})"
+            )))
+        }
+    };
     let binding = match (
         review.source_task_id,
         review.source_task_claim_token.as_deref(),
     ) {
-        (None, None) => return Ok(TaskSendAuthorization::Authorized(None)),
+        (None, None) => {
+            return Ok(if review_building {
+                TaskSendAuthorization::Building
+            } else {
+                TaskSendAuthorization::Authorized(None)
+            })
+        }
         (Some(task_id), Some(token)) if !token.trim().is_empty() => (task_id, token.to_string()),
         _ => {
             return Ok(TaskSendAuthorization::Stale(
@@ -526,13 +549,13 @@ async fn task_send_authorization(
             }
         }
     }
-    Ok(classify_task_send_authorization(
-        status,
-        &binding.1,
-        task_token,
-        decision_matches,
-        marker,
-    ))
+    let task_authorization =
+        classify_task_send_authorization(status, &binding.1, task_token, decision_matches, marker);
+    Ok(match task_authorization {
+        TaskSendAuthorization::Stale(reason) => TaskSendAuthorization::Stale(reason),
+        _ if review_building => TaskSendAuthorization::Building,
+        other => other,
+    })
 }
 
 /// Gateway 仍在构建同一 decision 时无损退回 pending。此路径不是发送失败，也不是
@@ -898,7 +921,9 @@ pub async fn second_safety_gate(
 ) -> AppResult<Option<String>> {
     if matches!(
         entry.source_kind.as_str(),
-        SOURCE_KIND_PRINCIPAL_ESCALATION | SOURCE_KIND_SYSTEM_INCIDENT
+        SOURCE_KIND_PRINCIPAL_ESCALATION
+            | SOURCE_KIND_PRINCIPAL_CLARIFICATION
+            | SOURCE_KIND_SYSTEM_INCIDENT
     ) {
         return Ok(None);
     }
@@ -2715,7 +2740,10 @@ pub(crate) fn check_contact_status_pure(
 ) -> Option<&'static str> {
     if matches!(
         source_kind,
-        SOURCE_KIND_MANUAL_SEND | SOURCE_KIND_PRINCIPAL_ESCALATION | SOURCE_KIND_SYSTEM_INCIDENT
+        SOURCE_KIND_MANUAL_SEND
+            | SOURCE_KIND_PRINCIPAL_ESCALATION
+            | SOURCE_KIND_PRINCIPAL_CLARIFICATION
+            | SOURCE_KIND_SYSTEM_INCIDENT
     ) {
         return None;
     }
@@ -2785,7 +2813,14 @@ pub async fn process_entry(state: &AppState, entry: &OutboxEntry) -> AppResult<(
             None,
         )
         .await?;
-    if contact.is_none() && entry.source_kind != SOURCE_KIND_SYSTEM_INCIDENT {
+    if contact.is_none()
+        && !matches!(
+            entry.source_kind.as_str(),
+            SOURCE_KIND_PRINCIPAL_ESCALATION
+                | SOURCE_KIND_PRINCIPAL_CLARIFICATION
+                | SOURCE_KIND_SYSTEM_INCIDENT
+        )
+    {
         schedule_retry_or_terminal(state, entry_id, entry, "contact not found at dispatch time")
             .await?;
         return Ok(());
@@ -2929,7 +2964,9 @@ pub async fn process_entry(state: &AppState, entry: &OutboxEntry) -> AppResult<(
     let send_fut = async {
         if matches!(
             entry.source_kind.as_str(),
-            SOURCE_KIND_PRINCIPAL_ESCALATION | SOURCE_KIND_SYSTEM_INCIDENT
+            SOURCE_KIND_PRINCIPAL_ESCALATION
+                | SOURCE_KIND_PRINCIPAL_CLARIFICATION
+                | SOURCE_KIND_SYSTEM_INCIDENT
         ) {
             let response = crate::mcp::logged_send_call_for_account(
                 state,

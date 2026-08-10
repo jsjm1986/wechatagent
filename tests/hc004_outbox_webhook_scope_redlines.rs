@@ -272,12 +272,17 @@ async fn sr024_webhook_rate_limit_is_workspace_account_scoped() {
         .await
         .expect("seed same account id in two workspaces");
 
-    let mut state = app.state.clone();
-    state.config.webhook_verify_signature = false;
-    state.config.webhook_rate_limit_capacity = 1;
-    state.config.webhook_rate_limit_window_seconds = 600;
+    let mut state_a = app.state.clone();
+    state_a.config.webhook_verify_signature = false;
+    state_a.config.webhook_rate_limit_capacity = 1;
+    state_a.config.webhook_rate_limit_window_seconds = 600;
+    // Model a second application replica: separate AppState/config instance, same Mongo authority.
+    let mut state_b = app.state.clone();
+    state_b.config.webhook_verify_signature = false;
+    state_b.config.webhook_rate_limit_capacity = 1;
+    state_b.config.webhook_rate_limit_window_seconds = 600;
 
-    let foreign_before = state
+    let foreign_before = state_a
         .db
         .raw()
         .collection::<Document>("wechat_accounts")
@@ -287,14 +292,14 @@ async fn sr024_webhook_rate_limit_is_workspace_account_scoped() {
         .expect("workspace B account exists");
 
     let _ = wechat_webhook(
-        State(state.clone()),
+        State(state_a.clone()),
         HeaderMap::new(),
         webhook_body(&app_id_a, &unique("sr024-a-first")),
     )
     .await
     .expect("workspace A first webhook is accepted");
     let limited = wechat_webhook(
-        State(state.clone()),
+        State(state_b.clone()),
         HeaderMap::new(),
         webhook_body(&app_id_a, &unique("sr024-a-second")),
     )
@@ -305,7 +310,7 @@ async fn sr024_webhook_rate_limit_is_workspace_account_scoped() {
     );
 
     let _ = wechat_webhook(
-        State(state.clone()),
+        State(state_b.clone()),
         HeaderMap::new(),
         webhook_body(&app_id_b, &unique("sr024-b-first")),
     )
@@ -313,7 +318,7 @@ async fn sr024_webhook_rate_limit_is_workspace_account_scoped() {
     .expect("workspace B first webhook must have an independent bucket");
 
     assert_eq!(
-        state
+        state_a
             .db
             .events()
             .count_documents(
@@ -330,7 +335,7 @@ async fn sr024_webhook_rate_limit_is_workspace_account_scoped() {
         "the exhausted bucket must emit one event in its resolved workspace"
     );
     assert_eq!(
-        state
+        state_a
             .db
             .events()
             .count_documents(
@@ -346,7 +351,7 @@ async fn sr024_webhook_rate_limit_is_workspace_account_scoped() {
         0,
         "workspace A exhaustion must not emit a workspace B event"
     );
-    let foreign_after = state
+    let foreign_after = state_a
         .db
         .raw()
         .collection::<Document>("wechat_accounts")

@@ -71,7 +71,10 @@ pub(super) async fn list_operation_state_policies(
     while let Some(policy) = cursor.try_next().await? {
         items.push(operation_state_policy_json(policy));
     }
-    Ok(Json(json!({ "items": items })))
+    Ok(Json(json!({
+        "items": items,
+        "actionValues": crate::agent::OPERATION_STATE_ACTION_VALUES,
+    })))
 }
 
 pub(super) async fn get_operation_state_policy(
@@ -145,6 +148,14 @@ mod tests {
         assert_eq!(value["currentVersion"], true);
         assert_eq!(value["previousVersion"], 2);
         assert_eq!(value["seededBy"], "manual");
+    }
+
+    #[test]
+    fn operation_state_action_values_match_contract_fixture() {
+        crate::routes::contract_snapshot::assert_contract_fixture(
+            "operation_state_action_values",
+            json!(crate::agent::OPERATION_STATE_ACTION_VALUES),
+        );
     }
 
     /// E5-T1：`includeAllVersions=true/false` 默认值反序列化稳定。

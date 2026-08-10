@@ -17,14 +17,15 @@
 use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
 
 use mongodb::{
     bson::{doc, DateTime},
-    options::UpdateOptions,
+    options::{TransactionOptions, UpdateOptions},
 };
 
 use super::Database;
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 
 mod helpers;
 
@@ -137,6 +138,10 @@ pub mod m054_playbook_single_default;
 pub mod m055_lesson_promotion_identity;
 /// Initialize legacy asynchronous import jobs for generation-fenced claims.
 pub mod m056_import_job_claims;
+/// Materialize acknowledgement in every state-policy version before removing the runtime bypass.
+pub mod m057_explicit_acknowledgement_action;
+/// Audit legacy text-provider active pointers before creating the unique index.
+pub mod m058_llm_provider_active_invariant;
 
 /// Seed the built-in taxonomy template into one workspace without overwriting
 /// any operator-owned row. This is used lazily when an existing/new workspace
@@ -146,6 +151,9 @@ pub(crate) async fn ensure_builtin_taxonomies_for_workspace(
     db: &Database,
     workspace_id: &str,
 ) -> AppResult<bool> {
+    const MAX_ATTEMPTS: usize = 5;
+    const MAX_COMMIT_TIME: Duration = Duration::from_secs(5);
+
     let marker_id = format!("workspace_taxonomy_template_v1:{workspace_id}");
     let markers = db.raw().collection::<mongodb::bson::Document>("migrations");
     if markers
@@ -168,39 +176,120 @@ pub(crate) async fn ensure_builtin_taxonomies_for_workspace(
         now,
     ));
 
-    let collection = db.collection_system_taxonomies();
-    let mut inserted = false;
-    for mut entry in entries {
-        entry.workspace_id = workspace_id.to_string();
-        entry.seeded_by = Some("workspace_template".to_string());
-        let filter = doc! {
-            "workspace_id": workspace_id,
-            "scope": &entry.scope,
-            "kind": &entry.kind,
-            "value.id": &entry.value.id,
-        };
-        let mut insert_doc = mongodb::bson::to_document(&entry)?;
-        insert_doc.remove("_id");
-        let result = collection
-            .update_one(
-                filter,
-                doc! { "$setOnInsert": insert_doc },
-                UpdateOptions::builder().upsert(true).build(),
+    'attempts: for attempt in 1..=MAX_ATTEMPTS {
+        let mut session = db.client().start_session(None).await?;
+        session
+            .start_transaction(
+                TransactionOptions::builder()
+                    .max_commit_time(MAX_COMMIT_TIME)
+                    .build(),
             )
             .await?;
-        inserted |= result.upserted_id.is_some();
+        let result: AppResult<Option<bool>> = async {
+            if markers
+                .find_one_with_session(doc! { "_id": &marker_id }, None, &mut session)
+                .await?
+                .is_some()
+            {
+                return Ok(None);
+            }
+
+            let collection = db.collection_system_taxonomies();
+            let mut inserted = false;
+            for template in &entries {
+                let mut entry = template.clone();
+                entry.workspace_id = workspace_id.to_string();
+                entry.seeded_by = Some("workspace_template".to_string());
+                let filter = doc! {
+                    "workspace_id": workspace_id,
+                    "scope": &entry.scope,
+                    "kind": &entry.kind,
+                    "value.id": &entry.value.id,
+                };
+                let mut insert_doc = mongodb::bson::to_document(&entry)?;
+                insert_doc.remove("_id");
+                let result = collection
+                    .update_one_with_session(
+                        filter,
+                        doc! { "$setOnInsert": insert_doc },
+                        UpdateOptions::builder().upsert(true).build(),
+                        &mut session,
+                    )
+                    .await?;
+                inserted |= result.upserted_id.is_some();
+            }
+            markers
+                .update_one_with_session(
+                    doc! { "_id": &marker_id },
+                    doc! { "$setOnInsert": { "applied_at": DateTime::now() } },
+                    UpdateOptions::builder().upsert(true).build(),
+                    &mut session,
+                )
+                .await?;
+            crate::db::config_generation::bump_generation_with_session(
+                db,
+                crate::db::config_generation::TAXONOMY_NAMESPACE,
+                workspace_id,
+                &mut session,
+            )
+            .await?;
+            Ok(Some(inserted))
+        }
+        .await;
+
+        let inserted = match result {
+            Ok(Some(inserted)) => inserted,
+            Ok(None) => {
+                let _ = session.abort_transaction().await;
+                return Ok(false);
+            }
+            Err(error) => {
+                let retryable = matches!(
+                    &error,
+                    AppError::Db(db_error)
+                        if db_error.contains_label("TransientTransactionError")
+                );
+                let _ = session.abort_transaction().await;
+                if retryable && attempt < MAX_ATTEMPTS {
+                    tokio::time::sleep(Duration::from_millis(20 * attempt as u64)).await;
+                    continue 'attempts;
+                }
+                return Err(error);
+            }
+        };
+
+        for commit_attempt in 1..=MAX_ATTEMPTS {
+            match session.commit_transaction().await {
+                Ok(()) => return Ok(inserted),
+                Err(error)
+                    if error.contains_label("UnknownTransactionCommitResult")
+                        && commit_attempt < MAX_ATTEMPTS => {}
+                Err(error) if error.contains_label("UnknownTransactionCommitResult") => {
+                    if markers
+                        .find_one(doc! { "_id": &marker_id }, None)
+                        .await?
+                        .is_some()
+                    {
+                        return Ok(inserted);
+                    }
+                    return Err(error.into());
+                }
+                Err(error)
+                    if error.contains_label("TransientTransactionError")
+                        && attempt < MAX_ATTEMPTS =>
+                {
+                    let _ = session.abort_transaction().await;
+                    tokio::time::sleep(Duration::from_millis(20 * attempt as u64)).await;
+                    continue 'attempts;
+                }
+                Err(error) => {
+                    let _ = session.abort_transaction().await;
+                    return Err(error.into());
+                }
+            }
+        }
     }
-    // Write the durable marker last. If the process stops while seeding, the
-    // next access safely retries the idempotent upserts. Once present, an
-    // operator can delete a template value without a later restart reviving it.
-    markers
-        .update_one(
-            doc! { "_id": &marker_id },
-            doc! { "$setOnInsert": { "applied_at": DateTime::now() } },
-            UpdateOptions::builder().upsert(true).build(),
-        )
-        .await?;
-    Ok(inserted)
+    unreachable!("bounded taxonomy seed transaction always returns")
 }
 
 type MigrationFuture<'a> = Pin<Box<dyn Future<Output = AppResult<()>> + Send + 'a>>;
@@ -437,6 +526,14 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration {
         id: "2026_07_056_import_job_claims",
         run: |db| Box::pin(m056_import_job_claims::run_step(db)),
+    },
+    Migration {
+        id: "2026_08_057_explicit_acknowledgement_action",
+        run: |db| Box::pin(m057_explicit_acknowledgement_action::run_step(db)),
+    },
+    Migration {
+        id: "2026_08_058_llm_provider_active_invariant",
+        run: |db| Box::pin(m058_llm_provider_active_invariant::run_step(db)),
     },
 ];
 

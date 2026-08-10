@@ -23,13 +23,18 @@ use crate::models::OperationStatePolicy;
 pub(crate) fn derive_state_policy_lists(forbids_proactive: bool) -> (Vec<String>, Vec<String>) {
     if forbids_proactive {
         (
-            vec!["silent".to_string(), "follow_up".to_string()],
+            vec![
+                "acknowledgement".to_string(),
+                "silent".to_string(),
+                "follow_up".to_string(),
+            ],
             vec!["reply".to_string()],
         )
     } else {
         (
             vec![
                 "reply".to_string(),
+                "acknowledgement".to_string(),
                 "silent".to_string(),
                 "follow_up".to_string(),
             ],
@@ -119,7 +124,14 @@ mod tests {
     #[test]
     fn derive_forbids_proactive_blocks_reply() {
         let (allowed, forbidden) = derive_state_policy_lists(true);
-        assert_eq!(allowed, vec!["silent".to_string(), "follow_up".to_string()]);
+        assert_eq!(
+            allowed,
+            vec![
+                "acknowledgement".to_string(),
+                "silent".to_string(),
+                "follow_up".to_string(),
+            ]
+        );
         assert_eq!(forbidden, vec!["reply".to_string()]);
     }
 
@@ -131,6 +143,7 @@ mod tests {
             allowed,
             vec![
                 "reply".to_string(),
+                "acknowledgement".to_string(),
                 "silent".to_string(),
                 "follow_up".to_string(),
             ]

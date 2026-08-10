@@ -150,7 +150,10 @@ pub async fn generate(
     let queue_wait_ms = admission.queue_wait().as_millis().min(i64::MAX as u128) as i64;
     let provider_started = std::time::Instant::now();
     let (llm_result, provider_model) = match &state.llm_registry {
-        Some(registry) => match registry.snapshot(workspace_id).await {
+        Some(registry) => match registry
+            .snapshot_synced(&state.db, &state.config, workspace_id)
+            .await
+        {
             Ok(snapshot) => {
                 let model = snapshot.meta.model.clone();
                 (

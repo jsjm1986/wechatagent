@@ -10,8 +10,8 @@
 //!       2. 写 `system_taxonomies`：新 canonical 新建版本；已有 current canonical
 //!          则继承其运行字段，合并候选原值/请求 aliases，并追加 current 版本。
 //!       3. 改 candidate `status="approved"`、`reviewed_at=now`。
-//!       4. `invalidate_global_taxonomy_cache`。
-//!     三步在同一 MongoDB transaction 中完成；并发 approve/reject 只有一个能从
+//!       4. 同事务推进 workspace generation，提交后失效本进程 workspace cache。
+//!     四步在同一 MongoDB transaction 中完成；并发 approve/reject 只有一个能从
 //!     pending 状态推进，失败不会留下正式字典与候选状态不一致。
 //! - `POST /api/admin/taxonomy-candidates/:id/reject`
 //!     body: `{ reason }` —— 写入 candidate.reason 并 `status="rejected"`。
@@ -409,10 +409,20 @@ async fn approve_candidate_transaction(
                 seeded_by: Some("manual".to_string()),
             })
         };
+        let taxonomy_changed = entry.is_some();
         if let Some(entry) = entry {
             taxonomies
                 .insert_one_with_session(&entry, None, &mut session)
                 .await?;
+        }
+        if taxonomy_changed {
+            crate::db::config_generation::bump_generation_with_session(
+                &state.db,
+                crate::db::config_generation::TAXONOMY_NAMESPACE,
+                workspace_id,
+                &mut session,
+            )
+            .await?;
         }
 
         let approved = candidates
@@ -473,7 +483,7 @@ async fn approve_candidate_transaction(
             }
         }
     }
-    invalidate_global_taxonomy_cache(&state.db);
+    invalidate_global_taxonomy_cache(&state.db, workspace_id);
     Ok(ApproveOutcome {
         candidate,
         merged_into_existing,

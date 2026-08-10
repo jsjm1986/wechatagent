@@ -13,8 +13,8 @@
 //! - `rollback`：以目标 row 的 `previous_version` 为索引找回上一版本，把它重新
 //!   切成唯一 current。历史版本永不删除。
 //!
-//! 任何写入 taxonomy 的路径都立即调用 [`crate::agent::taxonomy::invalidate_global_taxonomy_cache`]，
-//! 让运行中 Reply / Review Agent 在下次校验 value 时重新 build 字典。
+//! Taxonomy 指针切换与 workspace generation 在同一事务提交；提交后仅失效本进程
+//! workspace shard，其它副本在下一次校验时通过 generation 立即重建该字典。
 
 use axum::{
     extract::{Path, State},
@@ -177,6 +177,7 @@ async fn insert_new_current(
     scope: Document,
     expected_current_id: ObjectId,
     mut new_entry: Document,
+    generation_workspace: Option<&str>,
 ) -> AppResult<(ObjectId, i32)> {
     let collection = db.raw().collection::<Document>(collection_name);
     let mut session = db.client().start_session(None).await?;
@@ -229,6 +230,15 @@ async fn insert_new_current(
         let inserted_id = inserted.inserted_id.as_object_id().ok_or_else(|| {
             AppError::External("inserted ops version has no ObjectId".to_string())
         })?;
+        if let Some(workspace_id) = generation_workspace {
+            crate::db::config_generation::bump_generation_with_session(
+                db,
+                crate::db::config_generation::TAXONOMY_NAMESPACE,
+                workspace_id,
+                &mut session,
+            )
+            .await?;
+        }
         Ok((inserted_id, next_version))
     }
     .await;
@@ -248,13 +258,14 @@ async fn switch_current(
     collection_name: &str,
     scope: Document,
     target_id: ObjectId,
+    generation_workspace: Option<&str>,
 ) -> AppResult<()> {
     let collection = db.raw().collection::<Document>(collection_name);
     let mut session = db.client().start_session(None).await?;
     session
         .start_transaction(TransactionOptions::builder().build())
         .await?;
-    let result: AppResult<()> = async {
+    let result: AppResult<bool> = async {
         let mut target_filter = scope.clone();
         target_filter.insert("_id", target_id);
         let target = collection
@@ -263,7 +274,7 @@ async fn switch_current(
             .ok_or_else(|| AppError::Conflict("ops_target_changed".to_string()))?;
         let current_id = unique_current_id_with_session(&collection, &scope, &mut session).await?;
         if current_id == target_id {
-            return Ok(());
+            return Ok(false);
         }
         let now = DateTime::now();
         let mut current_filter = scope.clone();
@@ -295,12 +306,26 @@ async fn switch_current(
         if promoted.modified_count != 1 {
             return Err(AppError::Conflict("ops_target_changed".to_string()));
         }
-        Ok(())
+        Ok(true)
     }
     .await;
-    if let Err(error) = result {
-        let _ = session.abort_transaction().await;
-        return Err(ops_transaction_error(error));
+    let changed = match result {
+        Ok(changed) => changed,
+        Err(error) => {
+            let _ = session.abort_transaction().await;
+            return Err(ops_transaction_error(error));
+        }
+    };
+    if changed {
+        if let Some(workspace_id) = generation_workspace {
+            crate::db::config_generation::bump_generation_with_session(
+                db,
+                crate::db::config_generation::TAXONOMY_NAMESPACE,
+                workspace_id,
+                &mut session,
+            )
+            .await?;
+        }
     }
     commit_ops_transaction(&mut session).await
 }
@@ -359,6 +384,7 @@ async fn insert_new_current_domain_config(
         scope,
         expected_current_id,
         to_document(&new_entry)?,
+        None,
     )
     .await
 }
@@ -407,6 +433,7 @@ pub(crate) async fn append_default_operation_domain_version(
         scope,
         expected_current_id,
         to_document(&default_config)?,
+        None,
     )
     .await?;
     Ok((id, version, current.version))
@@ -805,6 +832,7 @@ pub(super) async fn rollout_operation_domain_version(
             "domain": &target.domain,
         },
         object_id,
+        None,
     )
     .await?;
     // G12：切 current 配置版本后按新 current 机器（target.state_machine）重派 policy，
@@ -871,6 +899,7 @@ pub(super) async fn rollback_operation_domain_version(
             "domain": &target.domain,
         },
         prev_id,
+        None,
     )
     .await?;
     // G12：rollback 切回历史版本 `prev` 后按其机器（prev.state_machine）重派 policy，
@@ -937,6 +966,7 @@ pub(super) async fn publish_operation_state_policy_version(
         scope,
         expected_current_id,
         to_document(&new_entry)?,
+        None,
     )
     .await?;
     Ok(Json(json!({
@@ -970,6 +1000,7 @@ pub(super) async fn rollout_operation_state_policy_version(
             "state_key": &target.state_key,
         },
         object_id,
+        None,
     )
     .await?;
     Ok(Json(json!({ "ok": true, "version": target.version })))
@@ -1020,6 +1051,7 @@ pub(super) async fn rollback_operation_state_policy_version(
             "state_key": &target.state_key,
         },
         prev_id,
+        None,
     )
     .await?;
     Ok(Json(json!({ "ok": true, "rolledBackTo": prev_version })))
@@ -1067,11 +1099,12 @@ pub async fn publish_taxonomy_version(
         scope,
         expected_current_id,
         to_document(&new_entry)?,
+        Some(&admin.current_workspace),
     )
     .await?;
     new_entry.version = next_version;
     new_entry.current_version = true;
-    invalidate_global_taxonomy_cache(&state.db);
+    invalidate_global_taxonomy_cache(&state.db, &admin.current_workspace);
     audit_taxonomy_change(&state, &admin, "publish", &new_entry).await;
     Ok(Json(json!({
         "ok": true,
@@ -1105,9 +1138,10 @@ pub async fn rollout_taxonomy_version(
             "value.id": &target.value.id,
         },
         object_id,
+        Some(&admin.current_workspace),
     )
     .await?;
-    invalidate_global_taxonomy_cache(&state.db);
+    invalidate_global_taxonomy_cache(&state.db, &admin.current_workspace);
     audit_taxonomy_change(&state, &admin, "rollout", &target).await;
     Ok(Json(json!({ "ok": true, "version": target.version })))
 }
@@ -1159,9 +1193,10 @@ pub async fn rollback_taxonomy_version(
             "value.id": &target.value.id,
         },
         prev_id,
+        Some(&admin.current_workspace),
     )
     .await?;
-    invalidate_global_taxonomy_cache(&state.db);
+    invalidate_global_taxonomy_cache(&state.db, &admin.current_workspace);
     audit_taxonomy_change(&state, &admin, "rollback", &prev).await;
     Ok(Json(json!({ "ok": true, "rolledBackTo": prev_version })))
 }
