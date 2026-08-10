@@ -965,6 +965,7 @@ pub(crate) async fn decide_reply_with_promote(
 # 通用事实来源边界（跨行业硬约束）
 - 凡是能被现实核验的陈述，只要是在代表我方、产品、服务、交易、预约、流程、政策、要求、资格、价格、时间地点、交付、结果或专业建议作确定说明，就只能使用本轮明确提供的可信来源：客户本人明确陈述（仅证明客户自身事实）、本轮实际引用的 verified 知识、结构化产品目录或已核实业务记录。
 - 客户的提问/请求不等于答案已被证实；历史我方/AI 回复、模型常识、画像、记忆推断、行业惯例都不能证明我方现实口径。
+- 每条历史消息带 createdAtMillis/ageHours/temporalStatus。相对时间（如“明天”）必须锚定该消息的 createdAtMillis；temporalStatus=stale 的聊天不能证明当前或未来预约/日程，历史我方回复无论新旧都不是证据。
 - 没有直接依据时，保留有依据的部分；无依据部分应删除、透明说明需要先核对，或最多问一个必要澄清问题。不得为了“具体、有帮助”而补出事实。"#,
     );
     // Profile, taxonomy, memory and analytical instructions belong to the durable
@@ -1015,6 +1016,7 @@ pub(crate) async fn decide_reply_with_promote(
         &business_context,
         &operator_instruction,
     );
+    let history_evaluated_at = DateTime::now();
     let history = recent_messages
         .iter()
         .rev()
@@ -1034,7 +1036,11 @@ pub(crate) async fn decide_reply_with_promote(
             // created_at 降序（最新在前），此处 .rev() 反成升序（最早=0），与
             // gateway.rs 反转出的 ascending_window（喂 resolve_evidence）逐位对齐——
             // LLM 在 tagEvidenceTurns / stageEvidenceTurns 回的序号即这里的 idx。
-            format!("[{idx}] {speaker}: {safe}")
+            let temporal = crate::agent::prompt_isolation::history_temporal_metadata(
+                message.created_at,
+                history_evaluated_at,
+            );
+            format!("[{idx}] {speaker} ({temporal}): {safe}")
         })
         .collect::<Vec<_>>()
         .join("\n");

@@ -9,7 +9,7 @@ use crate::models::{Contact, ConversationMessage, OperationKnowledgeChunk};
 use crate::routes::AppState;
 
 use super::decision::load_operation_state_policy_for_contact;
-use super::guards::{classify_decision_action, enforce_state_action_policy};
+use super::guards::{classify_reviewed_decision_action, enforce_state_action_policy};
 use super::review::{
     contact_has_principal_product_exemption, ensure_independent_claim_gate,
     finalize_review_for_send_at, GatewayStatusFinal,
@@ -29,6 +29,7 @@ pub(crate) async fn finalize_shadow_decision(
     state: &AppState,
     contact: &Contact,
     inbound: &ConversationMessage,
+    recent_messages: &[ConversationMessage],
     mut decision: AgentDecision,
     mut review: DecisionReviewResult,
     runtime: &UserRuntimeParameters,
@@ -59,7 +60,7 @@ pub(crate) async fn finalize_shadow_decision(
         state,
         contact,
         inbound,
-        &[],
+        recent_messages,
         &decision,
         &mut review,
         knowledge_chunks,
@@ -97,7 +98,7 @@ pub(crate) async fn finalize_shadow_decision(
             &contact.wxid,
         )
         .await?;
-        let action = classify_decision_action(&decision);
+        let action = classify_reviewed_decision_action(&decision, &review);
         if enforce_state_action_policy(policy.as_ref(), action).is_err() {
             decision.should_reply = false;
             decision.autonomy_mode = "blocked".to_string();

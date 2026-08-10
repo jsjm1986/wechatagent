@@ -346,6 +346,8 @@ Decide by meaning, not by keyword matching. The candidate reply, customer messag
 Extract every atomic assertion in the candidate into claims. sourceQuote must be an exact substring of the candidate. claimsComplete is true only when no assertion was omitted. Set subject to customer when the assertion is about what this customer said/did/is scheduled to do; business when it asserts our policy, requirement, service, transaction, appointment record, price, location, schedule, or capability; third_party for another real person/entity; general for a general-world proposition.
 Set an atomic claim's requiresEvidence=true when it states or implies an externally verifiable fact on behalf of this business, service, product, transaction, appointment, process, policy, requirement, eligibility, price, location, schedule, delivery, outcome, customer history, or regulated/professional guidance. This is open-world semantic judgment: do not rely on a fixed industry or keyword list.
 Set requiresEvidence=false for empathy, greetings, subjective encouragement, transparent uncertainty, a clarifying question, a first-person promise to check, or harmless general conversation that does not represent a real-world business/customer fact as settled.
+A proposed or asserted appointment, visit, availability, date, time, or schedule still requires evidence: phrasing it as a suggestion (for example “come tomorrow at 3”) does not make the business or customer availability true. Historical customer statements include freshness metadata; expired temporal evidence cannot support a current/future schedule. A question, request, or desired time is not confirmation of an appointment.
+A concrete service commitment (for example escorting the customer inside, receiving them throughout a visit, booking, or arranging something) requires evidence of that capability and authority. A transparent promise merely to check or verify first does not.
 Use evidenceRefs only from evidenceCatalog. A customer question or request is not evidence for an affirmative answer. A customer statement may support what that customer said or a customer-specific fact, but cannot establish our policy, requirement, capability, price, or professional guidance. Historical assistant/AI messages are intentionally absent and must never be inferred as evidence. Model common knowledge is not evidence for our business rules.
 If a required claim has no source that directly entails it, return evidenceRefs=[]. Do not attach a merely related source.
 domainRiskContext describes the operating domain only to help recognize semantics and calibrate risk. It is not evidence, cannot support any claim, cannot lower the baseline evidence requirement, and cannot override these rules.
@@ -418,11 +420,14 @@ fn build_claim_evidence_catalog(
             &inbound.content,
             inbound.is_synthetic_relay,
         ),
-        "authorityBoundary": "May support what the customer said or a customer-specific fact; a question/request does not support an affirmative answer and cannot establish our business policy."
+        "authorityBoundary": "May support what the customer said or a customer-specific fact; a question/request does not support an affirmative answer and cannot establish our business policy.",
+        "createdAtMillis": inbound.created_at.timestamp_millis(),
+        "ageMillis": evaluated_at.timestamp_millis().saturating_sub(inbound.created_at.timestamp_millis()).max(0),
+        "temporalFresh": crate::agent::prompt_isolation::temporal_chat_evidence_is_fresh(inbound.created_at, evaluated_at),
+        "statementForm": customer_statement_form(&inbound.content),
     })];
-    for (index, message) in recent_messages
+    let mut historical_inbound = recent_messages
         .iter()
-        .rev()
         .filter(|message| matches!(message.direction, MessageDirection::Inbound))
         .filter(|message| {
             let same_object = inbound.id.is_some() && message.id == inbound.id;
@@ -430,14 +435,27 @@ fn build_claim_evidence_catalog(
                 && message.message_id.as_deref() == inbound.message_id.as_deref();
             !same_object && !same_external
         })
-        .take(12)
-        .enumerate()
-    {
+        .collect::<Vec<_>>();
+    // Production loads newest-first while Shadow keeps an oldest-first dialogue buffer. Normalize
+    // here so both paths expose the same latest twelve customer statements to ClaimGate.
+    historical_inbound.sort_by(|left, right| {
+        right
+            .created_at
+            .timestamp_millis()
+            .cmp(&left.created_at.timestamp_millis())
+            .then_with(|| right.id.cmp(&left.id))
+            .then_with(|| right.message_id.cmp(&left.message_id))
+    });
+    for (index, message) in historical_inbound.into_iter().take(12).enumerate() {
         sources.push(serde_json::json!({
             "id": format!("recent_user_message:{index}"),
             "sourceType": "historical_user_statement",
             "text": crate::agent::prompt_isolation::history_prompt_content(&message.content),
-            "authorityBoundary": "May support what the customer previously said or a customer-specific fact; cannot establish our business policy, capability, price, or professional guidance."
+            "authorityBoundary": "May support what the customer previously said or a customer-specific fact; cannot establish our business policy, capability, price, or professional guidance.",
+            "createdAtMillis": message.created_at.timestamp_millis(),
+            "ageMillis": evaluated_at.timestamp_millis().saturating_sub(message.created_at.timestamp_millis()).max(0),
+            "temporalFresh": crate::agent::prompt_isolation::temporal_chat_evidence_is_fresh(message.created_at, evaluated_at),
+            "statementForm": customer_statement_form(&message.content),
         }));
     }
 
@@ -478,6 +496,191 @@ fn build_claim_evidence_catalog(
         }));
     }
     sources
+}
+
+fn customer_statement_form(text: &str) -> &'static str {
+    let normalized = text.trim().to_ascii_lowercase();
+    let question_or_request = normalized.contains('?')
+        || normalized.contains('？')
+        || [
+            "吗",
+            "么",
+            "能不能",
+            "能否",
+            "可以吗",
+            "可不可以",
+            "请",
+            "帮我",
+            "我想",
+            "需要吗",
+            "how about",
+            "can i",
+            "could i",
+            "would like",
+        ]
+        .iter()
+        .any(|marker| normalized.contains(marker));
+    if question_or_request {
+        "question_or_request"
+    } else {
+        "statement"
+    }
+}
+
+fn claim_is_temporally_sensitive(claim: &AtomicClaim) -> bool {
+    let scope = claim.scope.to_ascii_lowercase();
+    let text = format!("{} {}", claim.source_quote, claim.claim).to_ascii_lowercase();
+    [
+        "appointment",
+        "schedule",
+        "scheduling",
+        "availability",
+        "visit_time",
+        "calendar",
+        "预约",
+        "日程",
+        "时间安排",
+    ]
+    .iter()
+    .any(|marker| scope.contains(marker))
+        || [
+            "今天",
+            "明天",
+            "后天",
+            "今晚",
+            "上午",
+            "下午",
+            "晚上",
+            "点到",
+            "点见",
+            "到店",
+            "today",
+            "tomorrow",
+            "tonight",
+            "o'clock",
+            "appointment",
+            "scheduled",
+        ]
+        .iter()
+        .any(|marker| text.contains(marker))
+        || (text.chars().any(|ch| ch.is_ascii_digit())
+            && ["点", "时", "月", "日", ":", " am", " pm"]
+                .iter()
+                .any(|marker| text.contains(marker)))
+}
+
+fn claim_is_concrete_service_commitment(claim: &AtomicClaim) -> bool {
+    let scope = claim.scope.to_ascii_lowercase();
+    let text = format!("{} {}", claim.source_quote, claim.claim).to_ascii_lowercase();
+    let commitment_scope = [
+        "service_commitment",
+        "service_delivery",
+        "appointment_service",
+        "reception",
+        "fulfillment",
+        "接待",
+        "履约",
+        "代办",
+    ]
+    .iter()
+    .any(|marker| scope.contains(marker));
+    let concrete_commitment = [
+        "我带你进去",
+        "我来接你",
+        "我接你",
+        "全程带你",
+        "全程接待",
+        "帮你约时间",
+        "帮你预约",
+        "替你安排",
+        "给你安排",
+        "i will escort",
+        "i'll escort",
+        "i will arrange",
+        "i'll arrange",
+        "we will receive you",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker));
+    let transparent_check = [
+        "先核对",
+        "先确认",
+        "核实后",
+        "确认后",
+        "查清楚再",
+        "check first",
+        "verify first",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker));
+    (commitment_scope || concrete_commitment) && !transparent_check
+}
+
+fn temporal_evidence_ref_is_current_fact(evidence_catalog: &[Value], id: &str) -> bool {
+    let Some(source) = evidence_source(evidence_catalog, id) else {
+        return false;
+    };
+    match source.get("sourceType").and_then(Value::as_str) {
+        Some("current_user_statement" | "historical_user_statement") => {
+            source.get("temporalFresh").and_then(Value::as_bool) == Some(true)
+                && source.get("statementForm").and_then(Value::as_str) == Some("statement")
+        }
+        Some("verified_knowledge" | "active_product_catalog") => true,
+        _ => false,
+    }
+}
+
+/// The model may call a schedule a proposal or a concrete service promise harmless. The server
+/// independently upgrades those assertions and strips stale/question evidence before authorization.
+fn harden_evidence_claims(verdict: &mut IndependentClaimVerdict, evidence_catalog: &[Value]) {
+    let mut temporal_hardened = false;
+    let mut service_hardened = false;
+    for claim in &mut verdict.claims {
+        let temporal = claim_is_temporally_sensitive(claim);
+        let service = claim_is_concrete_service_commitment(claim);
+        if !temporal && !service {
+            continue;
+        }
+        temporal_hardened |= temporal;
+        service_hardened |= service;
+        claim.requires_evidence = true;
+        if service {
+            // A concrete first-person delivery promise is a business capability even if the
+            // semantic model mislabeled its subject as the customer. Customer chat cannot grant
+            // that authority; only currently verified operational knowledge can.
+            claim.subject = ClaimSubject::Business;
+            claim.evidence_refs.retain(|id| {
+                evidence_source(evidence_catalog, id)
+                    .and_then(|source| source.get("sourceType"))
+                    .and_then(Value::as_str)
+                    == Some("verified_knowledge")
+            });
+        } else if temporal {
+            claim
+                .evidence_refs
+                .retain(|id| temporal_evidence_ref_is_current_fact(evidence_catalog, id));
+        }
+    }
+    for kind in [
+        temporal_hardened.then_some("temporal_schedule"),
+        service_hardened.then_some("service_commitment"),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !verdict.claim_kinds.iter().any(|existing| existing == kind) {
+            verdict.claim_kinds.push(kind.to_string());
+        }
+    }
+    verdict.requires_evidence = verdict.claims.iter().any(|claim| claim.requires_evidence);
+    verdict.has_non_catalog_evidence_claims = verdict.claims.iter().any(|claim| {
+        claim.requires_evidence
+            && (!claim.product_claim
+                || !claim
+                    .evidence_refs
+                    .iter()
+                    .any(|id| id.starts_with("catalog:")))
+    });
 }
 
 fn evidence_source<'a>(catalog: &'a [Value], id: &str) -> Option<&'a Value> {
@@ -1077,7 +1280,8 @@ pub(crate) fn apply_independent_claim_gate(
         return false;
     };
     match outcome {
-        Ok(verdict) => {
+        Ok(mut verdict) => {
+            harden_evidence_claims(&mut verdict, &evaluation.evidence_catalog);
             let catalog_backed =
                 catalog_claims_are_backed(&verdict, active_products, &decision.reply_text);
             let catalog_failed =
@@ -1137,9 +1341,10 @@ pub(crate) async fn ensure_independent_claim_gate(
 mod independent_claim_gate_contract_tests {
     use super::{
         apply_independent_claim_gate, atomic_claim_integrity_failed, build_claim_evidence_catalog,
-        catalog_claims_are_backed, catalog_integrity_failed, hold_for_catalog_integrity_failure,
-        hold_for_claim_gate_failure, merge_independent_claim_verdict,
-        parse_independent_claim_verdict, AtomicClaim, CatalogClaim, ClaimSubject,
+        catalog_claims_are_backed, catalog_integrity_failed, claim_is_concrete_service_commitment,
+        harden_evidence_claims, hold_for_catalog_integrity_failure, hold_for_claim_gate_failure,
+        merge_independent_claim_verdict, parse_independent_claim_verdict,
+        unsupported_atomic_claims, AtomicClaim, CatalogClaim, ClaimSubject,
         IndependentClaimGateEvaluation, IndependentClaimVerdict,
     };
     use crate::agent::types::{DecisionReviewResult, HOLD_CATEGORY_BLOCKED_BY_SAFETY_GUARD};
@@ -1410,6 +1615,139 @@ mod independent_claim_gate_contract_tests {
     }
 
     #[test]
+    fn hardens_schedule_proposal_even_when_model_marks_it_non_factual() {
+        let mut verdict = IndependentClaimVerdict {
+            requires_evidence: false,
+            reason: "model treated schedule as a suggestion".to_string(),
+            claim_kinds: Vec::new(),
+            claims_complete: true,
+            claims: vec![AtomicClaim {
+                source_quote: "明天下午三点到店".to_string(),
+                claim: "建议客户明天下午三点到店".to_string(),
+                scope: "scheduling_proposal".to_string(),
+                subject: ClaimSubject::Customer,
+                product_claim: false,
+                requires_evidence: false,
+                evidence_refs: Vec::new(),
+                reason: "proposal".to_string(),
+            }],
+            has_catalog_claims: false,
+            catalog_coverage_complete: true,
+            has_non_catalog_evidence_claims: false,
+            catalog_claims: Vec::new(),
+        };
+        harden_evidence_claims(&mut verdict, &[]);
+        assert!(verdict.requires_evidence);
+        assert!(verdict.claims[0].requires_evidence);
+        assert!(verdict.claims[0].evidence_refs.is_empty());
+        assert!(verdict
+            .claim_kinds
+            .iter()
+            .any(|kind| kind == "temporal_schedule"));
+    }
+
+    #[test]
+    fn stale_or_question_customer_chat_cannot_back_current_schedule() {
+        let mut verdict = IndependentClaimVerdict {
+            requires_evidence: true,
+            reason: "appointment".to_string(),
+            claim_kinds: vec!["appointment".to_string()],
+            claims_complete: true,
+            claims: vec![AtomicClaim {
+                source_quote: "明天下午三点见".to_string(),
+                claim: "客户已预约明天下午三点".to_string(),
+                scope: "appointment".to_string(),
+                subject: ClaimSubject::Customer,
+                product_claim: false,
+                requires_evidence: true,
+                evidence_refs: vec![
+                    "recent_user_message:0".to_string(),
+                    "current_user_message".to_string(),
+                ],
+                reason: "chat context".to_string(),
+            }],
+            has_catalog_claims: false,
+            catalog_coverage_complete: true,
+            has_non_catalog_evidence_claims: true,
+            catalog_claims: Vec::new(),
+        };
+        let catalog = vec![
+            json!({
+                "id": "recent_user_message:0",
+                "sourceType": "historical_user_statement",
+                "temporalFresh": false,
+                "statementForm": "statement"
+            }),
+            json!({
+                "id": "current_user_message",
+                "sourceType": "current_user_statement",
+                "temporalFresh": true,
+                "statementForm": "question_or_request"
+            }),
+        ];
+        harden_evidence_claims(&mut verdict, &catalog);
+        assert!(verdict.claims[0].evidence_refs.is_empty());
+        assert_eq!(unsupported_atomic_claims(&verdict).len(), 1);
+    }
+
+    #[test]
+    fn concrete_reception_commitment_requires_verified_business_evidence() {
+        let mut verdict = IndependentClaimVerdict {
+            requires_evidence: false,
+            reason: "first-person promise".to_string(),
+            claim_kinds: Vec::new(),
+            claims_complete: true,
+            claims: vec![AtomicClaim {
+                source_quote: "到了我带你进去".to_string(),
+                claim: "我会接待并带客户进去".to_string(),
+                scope: "service_commitment".to_string(),
+                subject: ClaimSubject::Customer,
+                product_claim: false,
+                requires_evidence: false,
+                evidence_refs: vec![
+                    "current_user_message".to_string(),
+                    "verified_knowledge:ok".to_string(),
+                ],
+                reason: "promise".to_string(),
+            }],
+            has_catalog_claims: false,
+            catalog_coverage_complete: true,
+            has_non_catalog_evidence_claims: false,
+            catalog_claims: Vec::new(),
+        };
+        let catalog = vec![
+            json!({"id":"current_user_message","sourceType":"current_user_statement","temporalFresh":true,"statementForm":"statement"}),
+            json!({"id":"verified_knowledge:ok","sourceType":"verified_knowledge"}),
+        ];
+        harden_evidence_claims(&mut verdict, &catalog);
+        assert_eq!(verdict.claims[0].subject, ClaimSubject::Business);
+        assert_eq!(
+            verdict.claims[0].evidence_refs,
+            vec!["verified_knowledge:ok"]
+        );
+        assert!(verdict.requires_evidence);
+
+        verdict.claims[0].evidence_refs = vec!["current_user_message".to_string()];
+        harden_evidence_claims(&mut verdict, &catalog);
+        assert!(verdict.claims[0].evidence_refs.is_empty());
+    }
+
+    #[test]
+    fn transparent_check_promise_is_not_upgraded_to_service_delivery() {
+        let claim = AtomicClaim {
+            source_quote: "我先核对准确口径再回复你".to_string(),
+            claim: "回复前先核对".to_string(),
+            scope: "service_commitment".to_string(),
+            subject: ClaimSubject::Business,
+            product_claim: false,
+            requires_evidence: false,
+            evidence_refs: Vec::new(),
+            reason: "transparent process".to_string(),
+        };
+        assert!(!claim_is_concrete_service_commitment(&claim));
+    }
+
+    #[test]
     fn evidence_catalog_excludes_historical_outbound_ai_text() {
         let now = DateTime::now();
         let inbound = ConversationMessage {
@@ -1461,6 +1799,63 @@ mod independent_claim_gate_contract_tests {
                 .count(),
             1,
             "当前入站只能作为一个证据源"
+        );
+    }
+
+    #[test]
+    fn evidence_catalog_uses_latest_history_independent_of_input_order() {
+        let evaluated_at = DateTime::from_millis(1_000_000);
+        let inbound = ConversationMessage {
+            id: Some(mongodb::bson::oid::ObjectId::new()),
+            workspace_id: "workspace-a".to_string(),
+            account_id: "account-a".to_string(),
+            contact_wxid: "contact-a".to_string(),
+            message_id: Some("current".to_string()),
+            dedupe_key: None,
+            direction: MessageDirection::Inbound,
+            content: "当前消息".to_string(),
+            msg_type: Some("text".to_string()),
+            media_ref: None,
+            raw: None,
+            is_synthetic_relay: false,
+            created_at: evaluated_at,
+        };
+        let mut oldest_first = (0..15)
+            .map(|index| ConversationMessage {
+                id: Some(mongodb::bson::oid::ObjectId::new()),
+                message_id: Some(format!("history-{index:02}")),
+                content: format!("历史-{index:02}"),
+                created_at: DateTime::from_millis(index),
+                ..inbound.clone()
+            })
+            .collect::<Vec<_>>();
+        let decision = crate::agent::types::AgentDecision::default();
+        let oldest_catalog = build_claim_evidence_catalog(
+            &inbound,
+            &oldest_first,
+            &decision,
+            &[],
+            &[],
+            evaluated_at,
+        );
+        oldest_first.reverse();
+        let newest_catalog = build_claim_evidence_catalog(
+            &inbound,
+            &oldest_first,
+            &decision,
+            &[],
+            &[],
+            evaluated_at,
+        );
+        assert_eq!(oldest_catalog, newest_catalog);
+        let encoded = serde_json::to_string(&oldest_catalog).unwrap();
+        assert!(encoded.contains("历史-14"));
+        assert!(encoded.contains("历史-03"));
+        assert!(!encoded.contains("历史-02"));
+        assert_eq!(
+            oldest_catalog.len(),
+            13,
+            "current + latest twelve history rows"
         );
     }
 
@@ -2349,6 +2744,13 @@ pub async fn review_fixed_candidate_for_test(
 /// Callers may supply either newest-first (production) or oldest-first (simulation)
 /// snapshots; this function normalizes them to a stable oldest-first view.
 fn render_reviewer_recent_history(recent_messages: &[ConversationMessage]) -> String {
+    render_reviewer_recent_history_at(recent_messages, mongodb::bson::DateTime::now())
+}
+
+fn render_reviewer_recent_history_at(
+    recent_messages: &[ConversationMessage],
+    evaluated_at: mongodb::bson::DateTime,
+) -> String {
     let mut ordered = recent_messages.iter().enumerate().collect::<Vec<_>>();
     ordered.sort_by(|(left_index, left), (right_index, right)| {
         left.created_at
@@ -2379,7 +2781,11 @@ fn render_reviewer_recent_history(recent_messages: &[ConversationMessage]) -> St
                 MessageDirection::Outbound => "我方",
             };
             let safe = crate::agent::prompt_isolation::history_prompt_content(&message.content);
-            format!("[{index}] {speaker}: {safe}")
+            let temporal = crate::agent::prompt_isolation::history_temporal_metadata(
+                message.created_at,
+                evaluated_at,
+            );
+            format!("[{index}] {speaker} ({temporal}): {safe}")
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -2551,8 +2957,9 @@ fn reviewer_recent_history_section(recent_messages: &[ConversationMessage]) -> S
 mod reviewer_recent_history_tests {
     use super::{
         build_light_reviewer_user, light_memory_card_text, render_light_reviewer_history,
-        render_reviewer_recent_history, reviewer_memory_card_text, reviewer_operating_memory_text,
-        reviewer_operator_instruction_text, reviewer_recent_history_section,
+        render_reviewer_recent_history_at, reviewer_memory_card_text,
+        reviewer_operating_memory_text, reviewer_operator_instruction_text,
+        reviewer_recent_history_section,
     };
     use crate::agent::runtime::UserRuntimeParameters;
     use crate::agent::types::{AgentDecision, KnowledgeRouteResult};
@@ -2723,10 +3130,16 @@ mod reviewer_recent_history_tests {
         let mut newest_first = messages.clone();
         newest_first.reverse();
 
-        let expected =
-            "[0] 客户: 你能帮我赚钱不\n[1] 我方: 可以先说说你的方向\n[2] 客户: 你能帮我赚钱不";
-        assert_eq!(render_reviewer_recent_history(&messages), expected);
-        assert_eq!(render_reviewer_recent_history(&newest_first), expected);
+        let evaluated_at = DateTime::from_millis(1_000);
+        let expected = "[0] 客户 (createdAtMillis=10 ageHours=0 temporalStatus=fresh): 你能帮我赚钱不\n[1] 我方 (createdAtMillis=20 ageHours=0 temporalStatus=fresh): 可以先说说你的方向\n[2] 客户 (createdAtMillis=30 ageHours=0 temporalStatus=fresh): 你能帮我赚钱不";
+        assert_eq!(
+            render_reviewer_recent_history_at(&messages, evaluated_at),
+            expected
+        );
+        assert_eq!(
+            render_reviewer_recent_history_at(&newest_first, evaluated_at),
+            expected
+        );
         assert_eq!(expected.matches("你能帮我赚钱不").count(), 2);
     }
 
@@ -2739,9 +3152,16 @@ mod reviewer_recent_history_tests {
         let oldest_first = vec![first.clone(), second.clone()];
         let newest_first = vec![second, first];
 
-        let expected = "[0] 客户: 先问\n[1] 我方: 再答";
-        assert_eq!(render_reviewer_recent_history(&oldest_first), expected);
-        assert_eq!(render_reviewer_recent_history(&newest_first), expected);
+        let evaluated_at = DateTime::from_millis(1_000);
+        let expected = "[0] 客户 (createdAtMillis=10 ageHours=0 temporalStatus=fresh): 先问\n[1] 我方 (createdAtMillis=10 ageHours=0 temporalStatus=fresh): 再答";
+        assert_eq!(
+            render_reviewer_recent_history_at(&oldest_first, evaluated_at),
+            expected
+        );
+        assert_eq!(
+            render_reviewer_recent_history_at(&newest_first, evaluated_at),
+            expected
+        );
     }
 
     #[test]
