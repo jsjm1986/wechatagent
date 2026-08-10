@@ -255,6 +255,16 @@ pub fn check_state_transition(
 
 // ── Phase B / B4：operation_state_policies enforcement ────────────────────
 
+// Canonical state-policy action vocabulary. Persisted policies, migrations, API contracts and
+// the frontend must use this exact closed set.
+pub(crate) const OPERATION_STATE_ACTION_VALUES: &[&str] = &[
+    "reply",
+    "acknowledgement",
+    "silent",
+    "follow_up",
+    "cooldown",
+];
+
 /// Phase B / B4：把一个 [`AgentDecision`] 归一到一个 action 类型字符串。
 ///
 /// 当前归一规则（Phase B 范围）：
@@ -686,7 +696,11 @@ mod policy_tests {
                 "text={text}"
             );
         }
-        let legacy_no_proactive = mk_policy("cooldown", &["silent", "follow_up"], &["reply"]);
+        let legacy_no_proactive = mk_policy(
+            "cooldown",
+            &["acknowledgement", "silent", "follow_up"],
+            &["reply"],
+        );
         assert!(enforce_state_action_policy(
             Some(&legacy_no_proactive),
             classify_reviewed_decision_action(&decision, &safe_ack_review())

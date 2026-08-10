@@ -27,7 +27,7 @@ use mongodb::options::TransactionOptions;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::{collections::HashMap, sync::LazyLock};
+use std::{collections::HashMap, sync::LazyLock, time::Duration};
 
 use crate::{
     auth::AuthenticatedAdmin,
@@ -48,6 +48,125 @@ static LLM_PROVIDER_MUTATION_LOCK: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 const ACTIVE_UPDATE_APPROVAL_TTL_MS: i64 = 10 * 60 * 1000;
+const PROVIDER_COMMIT_MAX_ATTEMPTS: usize = 3;
+const PROVIDER_COMMIT_MAX_TIME: Duration = Duration::from_secs(5);
+
+fn provider_transaction_options() -> TransactionOptions {
+    TransactionOptions::builder()
+        .max_commit_time(PROVIDER_COMMIT_MAX_TIME)
+        .build()
+}
+
+/// Commit with a finite retry budget. If every response is indeterminate, read the
+/// database-authoritative active pointer to distinguish a committed activation/update from a
+/// genuinely unknown outcome. The provider row and generation live in one transaction, so an
+/// exact row match also proves the corresponding generation bump committed.
+async fn commit_text_provider_transaction(
+    session: &mut mongodb::ClientSession,
+    db: &crate::db::Database,
+    workspace_id: &str,
+    provider_id: &str,
+    committed_updated_at: DateTime,
+    expected_runtime_fingerprint: &str,
+) -> AppResult<()> {
+    for attempt in 1..=PROVIDER_COMMIT_MAX_ATTEMPTS {
+        match session.commit_transaction().await {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if error.contains_label("UnknownTransactionCommitResult")
+                    && attempt < PROVIDER_COMMIT_MAX_ATTEMPTS =>
+            {
+                tracing::warn!(attempt, %workspace_id, %provider_id, "provider commit result unknown; retrying bounded commit");
+            }
+            Err(error) if error.contains_label("UnknownTransactionCommitResult") => {
+                tracing::warn!(attempt, %error, %workspace_id, %provider_id, "provider commit result remained unknown; reading authoritative pointer");
+                let committed = db
+                    .llm_provider_configs()
+                    .find_one(
+                        doc! {
+                            "workspaceId": workspace_id,
+                            "providerId": provider_id,
+                            "isActive": true,
+                            "updatedAt": committed_updated_at,
+                        },
+                        None,
+                    )
+                    .await?
+                    .map(|provider| crate::llm::llm_provider_runtime_fingerprint(&provider))
+                    .transpose()?
+                    .as_deref()
+                    == Some(expected_runtime_fingerprint);
+                return if committed {
+                    Ok(())
+                } else {
+                    Err(AppError::Conflict(
+                        "provider_activation_commit_result_unknown".to_string(),
+                    ))
+                };
+            }
+            Err(error) => {
+                tracing::warn!(%error, %workspace_id, %provider_id, "provider transaction commit failed");
+                let _ = session.abort_transaction().await;
+                return Err(AppError::Conflict(
+                    "provider_activation_conflict".to_string(),
+                ));
+            }
+        }
+    }
+    unreachable!("finite provider commit loop always returns")
+}
+
+async fn commit_vision_provider_transaction(
+    session: &mut mongodb::ClientSession,
+    db: &crate::db::Database,
+    workspace_id: &str,
+    provider_id: &str,
+    committed_updated_at: DateTime,
+) -> AppResult<()> {
+    for attempt in 1..=PROVIDER_COMMIT_MAX_ATTEMPTS {
+        match session.commit_transaction().await {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if error.contains_label("UnknownTransactionCommitResult")
+                    && attempt < PROVIDER_COMMIT_MAX_ATTEMPTS =>
+            {
+                tracing::warn!(attempt, %workspace_id, %provider_id, "vision provider commit result unknown; retrying bounded commit");
+            }
+            Err(error) if error.contains_label("UnknownTransactionCommitResult") => {
+                tracing::warn!(attempt, %error, %workspace_id, %provider_id, "vision provider commit result remained unknown; reading authoritative assignment");
+                return if db
+                    .llm_provider_configs()
+                    .find_one(
+                        doc! {
+                            "workspaceId": workspace_id,
+                            "providerId": provider_id,
+                            "supportsVision": true,
+                            "isVisionActive": true,
+                            "updatedAt": committed_updated_at,
+                        },
+                        None,
+                    )
+                    .await?
+                    .is_some()
+                {
+                    Ok(())
+                } else {
+                    Err(AppError::Conflict(
+                        "vision_provider_commit_result_unknown".to_string(),
+                    ))
+                };
+            }
+            Err(error) => {
+                let _ = session.abort_transaction().await;
+                tracing::warn!(%error, %workspace_id, %provider_id, "vision provider reassignment commit failed");
+                return Err(AppError::Conflict(
+                    "vision_provider_assignment_conflict".to_string(),
+                ));
+            }
+        }
+    }
+    unreachable!("finite vision provider commit loop always returns")
+}
 
 #[derive(Clone)]
 struct ActiveUpdateApproval {
@@ -575,11 +694,57 @@ pub(super) async fn update_provider(
     if !unset.is_empty() {
         update_document.insert("$unset", unset);
     }
-    let update_result = state
-        .db
-        .llm_provider_configs()
-        .update_one(update_filter, update_document, None)
-        .await?;
+    let update_result = if existing.is_active {
+        let mut session = state.db.client().start_session(None).await?;
+        session
+            .start_transaction(provider_transaction_options())
+            .await?;
+        let result = state
+            .db
+            .llm_provider_configs()
+            .update_one_with_session(update_filter, update_document, None, &mut session)
+            .await;
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = session.abort_transaction().await;
+                return Err(error.into());
+            }
+        };
+        if result.matched_count == 1 {
+            if let Err(error) = crate::db::config_generation::bump_generation_with_session(
+                &state.db,
+                crate::db::config_generation::LLM_PROVIDER_NAMESPACE,
+                &workspace_id,
+                &mut session,
+            )
+            .await
+            {
+                let _ = session.abort_transaction().await;
+                return Err(error);
+            }
+            let expected_runtime_fingerprint =
+                crate::llm::llm_provider_runtime_fingerprint(&refreshed)?;
+            commit_text_provider_transaction(
+                &mut session,
+                &state.db,
+                &workspace_id,
+                &provider_id,
+                now,
+                &expected_runtime_fingerprint,
+            )
+            .await?;
+        } else {
+            let _ = session.abort_transaction().await;
+        }
+        result
+    } else {
+        state
+            .db
+            .llm_provider_configs()
+            .update_one(update_filter, update_document, None)
+            .await?
+    };
     if update_result.matched_count != 1 && existing.is_active {
         return Err(AppError::Conflict(
             "active_provider_revision_changed".to_string(),
@@ -595,10 +760,25 @@ pub(super) async fn update_provider(
             "provider {provider_id} disappeared during update"
         )));
     }
-    // DB write succeeded; replacing an existing workspace slot is in-memory
-    // and infallible because the client was constructed before the write.
+    // DB write succeeded. Active runtime edits committed their generation in the same transaction.
+    let committed_generation = if existing.is_active {
+        Some(
+            crate::db::config_generation::read_generation(
+                &state.db,
+                crate::db::config_generation::LLM_PROVIDER_NAMESPACE,
+                &workspace_id,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
     if let (Some(reg), Some((client, meta))) = (&state.llm_registry, runtime_entry) {
         reg.swap(&workspace_id, client, meta).await;
+        if let Some(generation) = committed_generation {
+            reg.mark_database_generation(&workspace_id, generation)
+                .await;
+        }
     }
     // KD-09：用 refreshed.format/base_url（实际存库值）软校验；refreshed.format 由上方 :210
     // 已验的 body.format 写入，同样合法，parse 不会失败。
@@ -670,8 +850,11 @@ pub async fn activate_provider(
 ) -> AppResult<Json<Value>> {
     let workspace_id =
         resolve_authorized_workspace(&state, &admin, params.workspace_id.clone()).await?;
+    // The local lock only reduces needless write conflicts in one process. Correctness is provided
+    // by the Mongo transaction + revision predicate below, so concurrent replicas cannot expose a
+    // zero-active or multi-active intermediate state.
     let _mutation_guard = LLM_PROVIDER_MUTATION_LOCK.lock().await;
-    let target = state
+    let expected = state
         .db
         .llm_provider_configs()
         .find_one(
@@ -680,62 +863,116 @@ pub async fn activate_provider(
         )
         .await?
         .ok_or_else(|| AppError::NotFound(format!("provider {provider_id} not found")))?;
+    // Build before changing durable state. An invalid provider can never become the active pointer.
     let runtime_entry = if state.llm_registry.is_some() {
-        Some(build_registry_entry(&state, &target)?)
+        Some(build_registry_entry(&state, &expected)?)
     } else {
         None
     };
-    let mut previous_active_ids = Vec::new();
-    let mut active_cursor = state
-        .db
-        .llm_provider_configs()
-        .find(
-            doc! { "workspaceId": &workspace_id, "isActive": true },
-            None,
-        )
+
+    let coll = state.db.llm_provider_configs();
+    let mut session = state.db.client().start_session(None).await?;
+    session
+        .start_transaction(provider_transaction_options())
         .await?;
-    while let Some(active) = active_cursor.try_next().await? {
-        previous_active_ids.push(active.provider_id);
-    }
-    let now = DateTime::now();
-    state
-        .db
-        .llm_provider_configs()
-        .update_many(
-            doc! { "workspaceId": &workspace_id, "isActive": true, "providerId": { "$ne": &provider_id } },
+    let now = DateTime::from_millis(
+        DateTime::now()
+            .timestamp_millis()
+            .max(expected.updated_at.timestamp_millis().saturating_add(1)),
+    );
+    let transaction_result: AppResult<LlmProviderConfig> = async {
+        // `updatedAt` is the provider revision/CAS. An update on another replica after our
+        // preflight invalidates this activation rather than activating bytes we did not test.
+        let mut target = coll
+            .find_one_with_session(
+                doc! {
+                    "workspaceId": &workspace_id,
+                    "providerId": &provider_id,
+                    "updatedAt": expected.updated_at,
+                },
+                None,
+                &mut session,
+            )
+            .await?
+            .ok_or_else(|| AppError::Conflict("provider_revision_changed".to_string()))?;
+        coll.update_many_with_session(
+            doc! {
+                "workspaceId": &workspace_id,
+                "isActive": true,
+                "providerId": { "$ne": &provider_id },
+            },
             doc! { "$set": { "isActive": false, "updatedAt": now } },
             None,
+            &mut session,
         )
         .await?;
-    let activate_result = state
-        .db
-        .llm_provider_configs()
-        .update_one(
-            doc! { "workspaceId": &workspace_id, "providerId": &provider_id },
-            doc! { "$set": { "isActive": true, "updatedAt": now } },
-            None,
+        let promoted = coll
+            .update_one_with_session(
+                doc! {
+                    "workspaceId": &workspace_id,
+                    "providerId": &provider_id,
+                    "updatedAt": expected.updated_at,
+                },
+                doc! { "$set": { "isActive": true, "updatedAt": now } },
+                None,
+                &mut session,
+            )
+            .await?;
+        if promoted.matched_count != 1 {
+            return Err(AppError::Conflict("provider_revision_changed".to_string()));
+        }
+        crate::db::config_generation::bump_generation_with_session(
+            &state.db,
+            crate::db::config_generation::LLM_PROVIDER_NAMESPACE,
+            &workspace_id,
+            &mut session,
         )
-        .await;
-    let activated = match activate_result {
-        Ok(result) if result.matched_count == 1 => true,
-        Ok(_) => false,
+        .await?;
+        target.is_active = true;
+        target.updated_at = now;
+        Ok(target)
+    }
+    .await;
+    let activated_target = match transaction_result {
+        Ok(target) => target,
         Err(error) => {
-            restore_active_providers(&state, &workspace_id, &previous_active_ids).await;
-            return Err(error.into());
+            let _ = session.abort_transaction().await;
+            return Err(match error {
+                AppError::Db(db_error) => {
+                    tracing::warn!(error = %db_error, %workspace_id, %provider_id, "text provider activation transaction conflicted");
+                    AppError::Conflict("provider_activation_conflict".to_string())
+                }
+                other => other,
+            });
         }
     };
-    if !activated {
-        restore_active_providers(&state, &workspace_id, &previous_active_ids).await;
-        return Err(AppError::NotFound(format!(
-            "provider {provider_id} disappeared during activation"
-        )));
-    }
-    if let (Some(reg), Some((client, meta))) = (&state.llm_registry, runtime_entry) {
+    let expected_runtime_fingerprint =
+        crate::llm::llm_provider_runtime_fingerprint(&activated_target)?;
+    commit_text_provider_transaction(
+        &mut session,
+        &state.db,
+        &workspace_id,
+        &provider_id,
+        activated_target.updated_at,
+        &expected_runtime_fingerprint,
+    )
+    .await?;
+    let committed_generation = crate::db::config_generation::read_generation(
+        &state.db,
+        crate::db::config_generation::LLM_PROVIDER_NAMESPACE,
+        &workspace_id,
+    )
+    .await?;
+
+    // Publish to this process only after the durable pointer transaction commits. Other replicas
+    // observe the generation through the DB-backed registry refresh added below.
+    if let (Some(reg), Some((client, mut meta))) = (&state.llm_registry, runtime_entry) {
+        meta.revision_ms = activated_target.updated_at.timestamp_millis();
+        meta.runtime_fingerprint = crate::llm::llm_provider_runtime_fingerprint(&activated_target)?;
         reg.swap(&workspace_id, client, meta).await;
+        reg.mark_database_generation(&workspace_id, committed_generation)
+            .await;
     }
-    let mut activated_target = target;
-    activated_target.is_active = true;
-    activated_target.updated_at = now;
     Ok(Json(
         json!({ "ok": true, "item": LlmProviderView::from_config(&activated_target, &state.config) }),
     ))
@@ -813,7 +1050,7 @@ pub(super) async fn set_vision_active(
     let coll = state.db.llm_provider_configs();
     let mut session = state.db.client().start_session(None).await?;
     session
-        .start_transaction(TransactionOptions::builder().build())
+        .start_transaction(provider_transaction_options())
         .await?;
     let transaction_result: AppResult<LlmProviderConfig> = async {
         let mut refreshed = coll
@@ -879,19 +1116,14 @@ pub(super) async fn set_vision_active(
             });
         }
     };
-    loop {
-        match session.commit_transaction().await {
-            Ok(()) => break,
-            Err(error) if error.contains_label("UnknownTransactionCommitResult") => continue,
-            Err(error) => {
-                let _ = session.abort_transaction().await;
-                tracing::warn!(error = %error, "vision provider reassignment commit failed");
-                return Err(AppError::Conflict(
-                    "vision_provider_assignment_conflict".to_string(),
-                ));
-            }
-        }
-    }
+    commit_vision_provider_transaction(
+        &mut session,
+        &state.db,
+        &workspace_id,
+        &provider_id,
+        refreshed.updated_at,
+    )
+    .await?;
     Ok(Json(
         json!({ "ok": true, "item": LlmProviderView::from_config(&refreshed, &state.config) }),
     ))
@@ -1089,29 +1321,10 @@ fn build_registry_entry(
             format: fmt,
             model: cfg.model.clone(),
             base_url: cfg.base_url.clone(),
+            revision_ms: cfg.updated_at.timestamp_millis(),
+            runtime_fingerprint: crate::llm::llm_provider_runtime_fingerprint(cfg)?,
         },
     ))
-}
-
-async fn restore_active_providers(state: &AppState, workspace_id: &str, provider_ids: &[String]) {
-    if provider_ids.is_empty() {
-        return;
-    }
-    if let Err(error) = state
-        .db
-        .llm_provider_configs()
-        .update_many(
-            doc! {
-                "workspaceId": workspace_id,
-                "providerId": { "$in": provider_ids.to_vec() },
-            },
-            doc! { "$set": { "isActive": true, "updatedAt": DateTime::now() } },
-            None,
-        )
-        .await
-    {
-        tracing::error!(%workspace_id, ?error, "failed to restore active LLM provider flags");
-    }
 }
 
 /// openai 形态 base_url 软校验（KD-09）：不以 /v1 结尾时返回 warning 文案（None=无警告）。

@@ -2087,7 +2087,9 @@ async fn current_provider_cache_identity(
 ) -> AppResult<ProviderCacheIdentity> {
     match state.llm_registry.as_ref() {
         Some(registry) => {
-            let snapshot = registry.snapshot(workspace_id).await?;
+            let snapshot = registry
+                .snapshot_synced(&state.db, &state.config, workspace_id)
+                .await?;
             Ok(ProviderCacheIdentity {
                 provider_id: snapshot.meta.provider_id,
                 model: snapshot.meta.model,

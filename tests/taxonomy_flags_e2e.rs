@@ -16,6 +16,7 @@ use mongodb::bson::{doc, DateTime};
 use reqwest::StatusCode;
 use tokio::net::TcpListener;
 use wechatagent::auth::{session::create_session, AdminUser, SESSION_COOKIE_NAME};
+use wechatagent::db::config_generation::{read_generation, TAXONOMY_NAMESPACE};
 use wechatagent::models::{TaxonomyEntry, TaxonomyValue};
 use wechatagent::routes::api_router;
 
@@ -87,7 +88,7 @@ async fn start_api(
 #[tokio::test]
 #[ignore = "requires docker (testcontainers mongo)"]
 async fn label_only_patch_preserves_runtime_fields_and_projects_them() {
-    let app = TestApp::start().await;
+    let app = TestApp::start_repl_set().await;
     let workspace_id = app.state.config.default_workspace_id.clone();
     let coll = app.state.db.collection_system_taxonomies();
 
@@ -119,6 +120,10 @@ async fn label_only_patch_preserves_runtime_fields_and_projects_them() {
     assert_eq!(projected["value"]["isTerminal"], true);
     assert_eq!(projected["value"]["isReactivationTarget"], true);
 
+    let generation_before_patch = read_generation(&app.state.db, TAXONOMY_NAMESPACE, &workspace_id)
+        .await
+        .expect("read generation before patch");
+
     let patched = client
         .patch(format!("{base_url}/admin/taxonomies/{}", oid.to_hex()))
         .header(reqwest::header::COOKIE, &cookie)
@@ -142,5 +147,68 @@ async fn label_only_patch_preserves_runtime_fields_and_projects_them() {
     assert_eq!(reloaded.value.priority_weight, Some(73));
     assert!(reloaded.value.is_terminal);
     assert!(reloaded.value.is_reactivation_target);
+    let generation_after_patch = read_generation(&app.state.db, TAXONOMY_NAMESPACE, &workspace_id)
+        .await
+        .expect("read generation after patch");
+    assert_eq!(
+        generation_after_patch,
+        generation_before_patch + 1,
+        "PATCH row and generation must commit exactly once",
+    );
+
+    let created = client
+        .post(format!("{base_url}/admin/taxonomies"))
+        .header(reqwest::header::COOKIE, &cookie)
+        .json(&serde_json::json!({
+            "scope": "global",
+            "kind": "taxonomy_atomic_crud",
+            "value": {
+                "id": "created_then_deleted",
+                "label": "Created",
+                "aliases": ["created-alias"]
+            }
+        }))
+        .send()
+        .await
+        .expect("create taxonomy");
+    assert_eq!(created.status(), StatusCode::OK);
+    let created: serde_json::Value = created.json().await.expect("decode create response");
+    let created_id = created["item"]["id"]
+        .as_str()
+        .expect("created taxonomy id")
+        .to_string();
+    let generation_after_create = read_generation(&app.state.db, TAXONOMY_NAMESPACE, &workspace_id)
+        .await
+        .expect("read generation after create");
+    assert_eq!(
+        generation_after_create,
+        generation_after_patch + 1,
+        "CREATE row and generation must commit exactly once",
+    );
+
+    let deleted = client
+        .delete(format!("{base_url}/admin/taxonomies/{created_id}"))
+        .header(reqwest::header::COOKIE, &cookie)
+        .send()
+        .await
+        .expect("delete taxonomy");
+    assert_eq!(deleted.status(), StatusCode::OK);
+    let generation_after_delete = read_generation(&app.state.db, TAXONOMY_NAMESPACE, &workspace_id)
+        .await
+        .expect("read generation after delete");
+    assert_eq!(
+        generation_after_delete,
+        generation_after_create + 1,
+        "DELETE row and generation must commit exactly once",
+    );
+    let created_oid =
+        mongodb::bson::oid::ObjectId::parse_str(&created_id).expect("created taxonomy ObjectId");
+    let deleted_row = coll
+        .find_one(doc! { "_id": created_oid }, None)
+        .await
+        .expect("load soft-deleted taxonomy")
+        .expect("soft-deleted taxonomy remains");
+    assert_eq!(deleted_row.value.status, "deprecated");
+
     server.abort();
 }

@@ -239,6 +239,75 @@ async fn seed_bound_task(
 
 #[tokio::test]
 #[ignore]
+async fn decision_batch_seal_defers_non_task_row_without_remote_send() {
+    let app = common::TestApp::start().await;
+    let mcp = start_mcp().await;
+    let state = common::rebuild_app_state_with_mcp_url(&app, mcp.uri());
+    common::ensure_test_account(&state, "default", "default").await;
+    let contact = contact("sr034-batch-seal");
+    state
+        .db
+        .contacts()
+        .insert_one(&contact, None)
+        .await
+        .expect("insert contact");
+
+    let decision_id = ObjectId::new();
+    state
+        .db
+        .decision_reviews()
+        .insert_one(
+            review(decision_id, "sr034-batch-seal-run", &contact.wxid),
+            None,
+        )
+        .await
+        .expect("insert building review");
+    let outbox_id = match enqueue(
+        &state,
+        request(
+            decision_id,
+            "sr034-batch-seal-run",
+            &contact.wxid,
+            "first-segment",
+        ),
+    )
+    .await
+    .expect("enqueue first segment")
+    {
+        EnqueueOutcome::Created { outbox_id, .. } => outbox_id,
+        other => panic!("expected Created, got {other:?}"),
+    };
+
+    let claimed = atomic_claim_pending(&state, "sr034-batch-seal-worker", 60)
+        .await
+        .expect("claim query")
+        .expect("claim first segment");
+    process_entry(&state, &claimed)
+        .await
+        .expect("building decision must defer");
+
+    let stored = state
+        .db
+        .collection_agent_send_outbox()
+        .find_one(doc! { "_id": outbox_id }, None)
+        .await
+        .expect("load outbox")
+        .expect("outbox exists");
+    assert_eq!(stored.status, OutboxStatus::Pending.as_str());
+    assert_eq!(
+        stored.attempt, 0,
+        "batch construction is not a send failure"
+    );
+    assert_eq!(
+        count_send_calls(&mcp.received_requests().await.expect("wiremock requests")),
+        0,
+        "no decision-backed segment may cross MCP before the review batch is sealed"
+    );
+    app.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore]
 async fn building_task_deferred_without_remote_send() {
     let app = common::TestApp::start().await;
     let mcp = start_mcp().await;

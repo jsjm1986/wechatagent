@@ -88,7 +88,7 @@ async fn async_main() -> anyhow::Result<()> {
     // LLM 配置：DB 优先，缺则用 .env 当种子。
     // 启动时若 `llm_provider_configs` 没有 active 记录，写一条来自 .env 的
     // openai 形态默认记录；之后每次启动都按当前 active 记录构造 LlmClient。
-    let active_provider = ensure_default_llm_provider(&db, &config).await?;
+    let active_provider = wechatagent::llm::ensure_default_llm_provider(&db, &config).await?;
     let active_providers = load_active_llm_providers(&db).await?;
     let (llm_client, active_meta) = build_runtime_llm(&active_provider, &config)?;
     let registry = Arc::new(LlmRegistry::new(
@@ -457,66 +457,6 @@ async fn ensure_example_evaluation_scenario(
     Ok(())
 }
 
-/// 启动时确保 `llm_provider_configs` 至少有一条 active 记录。
-///
-/// 行为：
-/// - 若已有 `is_active=true` 的记录，原样返回。
-/// - 否则：若任意一条记录存在，把第一条置为 active 返回；
-/// - 否则用 `.env` 的 `OPENAI_*` 写一条 openai 形态默认记录并标 active。
-async fn ensure_default_llm_provider(
-    db: &wechatagent::db::Database,
-    config: &AppConfig,
-) -> anyhow::Result<wechatagent::models::LlmProviderConfig> {
-    use mongodb::bson::{doc, DateTime};
-    if let Some(existing) = db
-        .llm_provider_configs()
-        .find_one(
-            doc! { "workspaceId": &config.default_workspace_id, "isActive": true },
-            None,
-        )
-        .await?
-    {
-        return Ok(existing);
-    }
-    if let Some(any) = db
-        .llm_provider_configs()
-        .find_one(doc! { "workspaceId": &config.default_workspace_id }, None)
-        .await?
-    {
-        db.llm_provider_configs()
-            .update_one(
-                doc! { "workspaceId": &config.default_workspace_id, "providerId": &any.provider_id },
-                doc! { "$set": { "isActive": true, "updatedAt": DateTime::now() } },
-                None,
-            )
-            .await?;
-        let mut activated = any;
-        activated.is_active = true;
-        return Ok(activated);
-    }
-    let now = DateTime::now();
-    let seed = wechatagent::models::LlmProviderConfig {
-        id: None,
-        workspace_id: config.default_workspace_id.clone(),
-        provider_id: "default".to_string(),
-        name: "默认 LLM".to_string(),
-        format: "openai".to_string(),
-        base_url: config.openai_base_url.clone(),
-        api_key: config.openai_api_key.clone(),
-        model: config.openai_model.clone(),
-        is_active: true,
-        timeout_seconds: Some(config.llm_timeout_seconds),
-        max_retries: Some(config.llm_max_retries),
-        retry_base_ms: Some(config.llm_retry_base_ms),
-        supports_vision: false,
-        is_vision_active: false,
-        created_at: now,
-        updated_at: now,
-    };
-    db.llm_provider_configs().insert_one(&seed, None).await?;
-    Ok(seed)
-}
-
 fn build_runtime_llm(
     provider: &wechatagent::models::LlmProviderConfig,
     config: &AppConfig,
@@ -538,6 +478,8 @@ fn build_runtime_llm(
         format,
         model: provider.model.clone(),
         base_url: provider.base_url.clone(),
+        revision_ms: provider.updated_at.timestamp_millis(),
+        runtime_fingerprint: wechatagent::llm::llm_provider_runtime_fingerprint(provider)?,
     };
     Ok((client, meta))
 }

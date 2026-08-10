@@ -9,8 +9,8 @@
 //! - `DELETE /api/admin/taxonomies/:id` 软删除：`value.status = "deprecated"`，
 //!   保留历史值以便对历史 run / 审核留档继续可读。
 //!
-//! 任意写操作完成后立即调用 `invalidate_global_taxonomy_cache`，让运行中
-//! Reply / Review Agent 在下次 `check_value` 时按新字典执行。
+//! 任意写操作都把字典行与 workspace generation 放在同一 Mongo 事务提交；提交后
+//! 仅失效本进程 workspace shard，其它副本在下一次读取时通过 generation 立即刷新。
 
 use axum::{
     extract::{Path, Query, State},
@@ -20,9 +20,11 @@ use axum::{
 };
 use futures::TryStreamExt;
 use mongodb::bson::{doc, to_bson, DateTime, Document};
-use mongodb::options::FindOptions;
+use mongodb::options::{FindOptions, TransactionOptions};
+use mongodb::ClientSession;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::time::Duration;
 
 use crate::{
     agent::taxonomy::invalidate_global_taxonomy_cache,
@@ -33,6 +35,59 @@ use crate::{
 
 use super::shared::*;
 use super::AppState;
+
+const TAXONOMY_COMMIT_MAX_ATTEMPTS: usize = 3;
+const TAXONOMY_COMMIT_MAX_TIME: Duration = Duration::from_secs(5);
+
+fn taxonomy_transaction_options() -> TransactionOptions {
+    TransactionOptions::builder()
+        .max_commit_time(TAXONOMY_COMMIT_MAX_TIME)
+        .build()
+}
+
+async fn commit_taxonomy_transaction(
+    session: &mut ClientSession,
+    collection: &mongodb::Collection<TaxonomyEntry>,
+    committed_filter: Document,
+) -> AppResult<()> {
+    for attempt in 1..=TAXONOMY_COMMIT_MAX_ATTEMPTS {
+        match session.commit_transaction().await {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if error.contains_label("UnknownTransactionCommitResult")
+                    && attempt < TAXONOMY_COMMIT_MAX_ATTEMPTS =>
+            {
+                tracing::warn!(
+                    attempt,
+                    "taxonomy commit result unknown; retrying bounded commit"
+                );
+            }
+            Err(error) if error.contains_label("UnknownTransactionCommitResult") => {
+                tracing::warn!(attempt, %error, "taxonomy commit result remained unknown; reading authoritative row");
+                return if collection.find_one(committed_filter, None).await?.is_some() {
+                    Ok(())
+                } else {
+                    Err(AppError::Conflict(
+                        "taxonomy_commit_result_unknown".to_string(),
+                    ))
+                };
+            }
+            Err(error) => {
+                let _ = session.abort_transaction().await;
+                if is_duplicate_key_error(&error) {
+                    return Err(AppError::Conflict(
+                        "taxonomy_identity_claim_conflict".to_string(),
+                    ));
+                }
+                tracing::warn!(%error, "taxonomy transaction commit failed");
+                return Err(AppError::Conflict(
+                    "taxonomy_transaction_conflict".to_string(),
+                ));
+            }
+        }
+    }
+    unreachable!("finite taxonomy commit loop always returns")
+}
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -171,31 +226,59 @@ pub(super) async fn create_taxonomy(
         seeded_by: Some("manual".to_string()),
     };
 
-    match state
-        .db
-        .collection_system_taxonomies()
-        .insert_one(&entry, None)
+    let collection = state.db.collection_system_taxonomies();
+    let mut session = state.db.client().start_session(None).await?;
+    session
+        .start_transaction(taxonomy_transaction_options())
+        .await?;
+    let inserted = match collection
+        .insert_one_with_session(&entry, None, &mut session)
         .await
     {
-        Ok(result) => {
-            invalidate_global_taxonomy_cache(&state.db);
-            let mut entry_with_id = entry;
-            entry_with_id.id = result.inserted_id.as_object_id();
-            Ok(Json(json!({ "item": taxonomy_entry_json(entry_with_id) })).into_response())
-        }
-        Err(error) if is_duplicate_key_error(&error) => Ok((
-            StatusCode::CONFLICT,
-            Json(json!({
-                "error": "duplicate_taxonomy",
-                "message": format!(
-                    "(scope={}, kind={}, value.id={}) 已存在",
-                    entry.scope, entry.kind, entry.value.id
+        Ok(result) => result,
+        Err(error) => {
+            let _ = session.abort_transaction().await;
+            if is_duplicate_key_error(&error) {
+                return Ok((
+                    StatusCode::CONFLICT,
+                    Json(json!({
+                        "error": "duplicate_taxonomy",
+                        "message": format!(
+                            "(scope={}, kind={}, value.id={}) 已存在",
+                            entry.scope, entry.kind, entry.value.id
+                        )
+                    })),
                 )
-            })),
-        )
-            .into_response()),
-        Err(error) => Err(error.into()),
+                    .into_response());
+            }
+            return Err(error.into());
+        }
+    };
+    if let Err(error) = crate::db::config_generation::bump_generation_with_session(
+        &state.db,
+        crate::db::config_generation::TAXONOMY_NAMESPACE,
+        &admin.current_workspace,
+        &mut session,
+    )
+    .await
+    {
+        let _ = session.abort_transaction().await;
+        return Err(error);
     }
+    let inserted_id = inserted
+        .inserted_id
+        .as_object_id()
+        .ok_or_else(|| AppError::External("inserted taxonomy entry has no ObjectId".to_string()))?;
+    commit_taxonomy_transaction(
+        &mut session,
+        &collection,
+        doc! { "_id": inserted_id, "workspace_id": &admin.current_workspace },
+    )
+    .await?;
+    invalidate_global_taxonomy_cache(&state.db, &admin.current_workspace);
+    let mut entry_with_id = entry;
+    entry_with_id.id = Some(inserted_id);
+    Ok(Json(json!({ "item": taxonomy_entry_json(entry_with_id) })).into_response())
 }
 
 pub(super) async fn patch_taxonomy(
@@ -253,10 +336,15 @@ pub(super) async fn patch_taxonomy(
     if set_doc.is_empty() {
         return Err(AppError::BadRequest("至少要传一个可更新字段".to_string()));
     }
-    set_doc.insert("updated_at", DateTime::now());
+    let updated_at = DateTime::now();
+    set_doc.insert("updated_at", updated_at);
 
-    let result = collection
-        .update_one(
+    let mut session = state.db.client().start_session(None).await?;
+    session
+        .start_transaction(taxonomy_transaction_options())
+        .await?;
+    let result = match collection
+        .update_one_with_session(
             doc! {
                 "_id": object_id,
                 "workspace_id": &admin.current_workspace,
@@ -264,19 +352,47 @@ pub(super) async fn patch_taxonomy(
             },
             doc! { "$set": set_doc },
             None,
+            &mut session,
         )
         .await
-        .map_err(|error| {
-            if is_duplicate_key_error(&error) {
+    {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = session.abort_transaction().await;
+            return Err(if is_duplicate_key_error(&error) {
                 AppError::Conflict("taxonomy_identity_claim_conflict".to_string())
             } else {
                 error.into()
-            }
-        })?;
+            });
+        }
+    };
     if result.matched_count == 0 {
+        let _ = session.abort_transaction().await;
         return Err(AppError::NotFound("taxonomy entry not found".to_string()));
     }
-    invalidate_global_taxonomy_cache(&state.db);
+    if let Err(error) = crate::db::config_generation::bump_generation_with_session(
+        &state.db,
+        crate::db::config_generation::TAXONOMY_NAMESPACE,
+        &admin.current_workspace,
+        &mut session,
+    )
+    .await
+    {
+        let _ = session.abort_transaction().await;
+        return Err(error);
+    }
+    commit_taxonomy_transaction(
+        &mut session,
+        &collection,
+        doc! {
+            "_id": object_id,
+            "workspace_id": &admin.current_workspace,
+            "current_version": true,
+            "updated_at": updated_at,
+        },
+    )
+    .await?;
+    invalidate_global_taxonomy_cache(&state.db, &admin.current_workspace);
     let entry = collection
         .find_one(
             doc! {
@@ -297,10 +413,14 @@ pub(super) async fn delete_taxonomy(
     Extension(admin): Extension<AuthenticatedAdmin>,
 ) -> AppResult<Json<Value>> {
     let object_id = parse_object_id(&id)?;
-    let result = state
-        .db
-        .collection_system_taxonomies()
-        .update_one(
+    let collection = state.db.collection_system_taxonomies();
+    let updated_at = DateTime::now();
+    let mut session = state.db.client().start_session(None).await?;
+    session
+        .start_transaction(taxonomy_transaction_options())
+        .await?;
+    let result = match collection
+        .update_one_with_session(
             doc! {
                 "_id": object_id,
                 "workspace_id": &admin.current_workspace,
@@ -309,16 +429,48 @@ pub(super) async fn delete_taxonomy(
             doc! {
                 "$set": {
                     "value.status": "deprecated",
-                    "updated_at": DateTime::now()
+                    "updated_at": updated_at,
                 }
             },
             None,
+            &mut session,
         )
-        .await?;
+        .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = session.abort_transaction().await;
+            return Err(error.into());
+        }
+    };
     if result.matched_count == 0 {
+        let _ = session.abort_transaction().await;
         return Err(AppError::NotFound("taxonomy entry not found".to_string()));
     }
-    invalidate_global_taxonomy_cache(&state.db);
+    if let Err(error) = crate::db::config_generation::bump_generation_with_session(
+        &state.db,
+        crate::db::config_generation::TAXONOMY_NAMESPACE,
+        &admin.current_workspace,
+        &mut session,
+    )
+    .await
+    {
+        let _ = session.abort_transaction().await;
+        return Err(error);
+    }
+    commit_taxonomy_transaction(
+        &mut session,
+        &collection,
+        doc! {
+            "_id": object_id,
+            "workspace_id": &admin.current_workspace,
+            "current_version": true,
+            "value.status": "deprecated",
+            "updated_at": updated_at,
+        },
+    )
+    .await?;
+    invalidate_global_taxonomy_cache(&state.db, &admin.current_workspace);
     Ok(Json(json!({ "ok": true })))
 }
 

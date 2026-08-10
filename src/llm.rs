@@ -6,6 +6,7 @@ use futures::StreamExt;
 use reqwest::header::HeaderMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::sleep;
 
@@ -1734,6 +1735,226 @@ pub struct LlmProviderMeta {
     pub format: LlmFormat,
     pub model: String,
     pub base_url: String,
+    /// Durable provider revision (`updatedAt` epoch millis), retained for diagnostics/API output.
+    pub revision_ms: i64,
+    /// Hash of every field that constructs the runtime client. This is the cache authority;
+    /// unlike a timestamp-only revision it detects same-millisecond or legacy/manual writes.
+    pub runtime_fingerprint: String,
+}
+
+pub fn llm_provider_runtime_fingerprint(
+    provider: &crate::models::LlmProviderConfig,
+) -> AppResult<String> {
+    let bytes = mongodb::bson::to_vec(&mongodb::bson::doc! {
+        "provider_id": &provider.provider_id,
+        "format": &provider.format,
+        "base_url": &provider.base_url,
+        "api_key": &provider.api_key,
+        "model": &provider.model,
+        "timeout_seconds": provider.timeout_seconds.map(|value| value.to_string()),
+        "max_retries": provider.max_retries.map(i64::from),
+        "retry_base_ms": provider.retry_base_ms.map(|value| value.to_string()),
+        "is_active": provider.is_active,
+    })?;
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
+const DEFAULT_PROVIDER_INIT_MAX_ATTEMPTS: usize = 5;
+const DEFAULT_PROVIDER_INIT_MAX_COMMIT_TIME: Duration = Duration::from_secs(5);
+
+/// Ensure the default workspace has one active provider and publish the change atomically.
+///
+/// This runs during rolling startup after the provider uniqueness indexes exist. A concurrent
+/// replica may win the election; in that case this function returns the committed authoritative
+/// row instead of creating a second active provider. Existing active configuration is read-only
+/// and does not advance the generation.
+pub async fn ensure_default_llm_provider(
+    db: &crate::db::Database,
+    config: &crate::config::AppConfig,
+) -> AppResult<crate::models::LlmProviderConfig> {
+    use mongodb::{
+        bson::{doc, DateTime},
+        options::{FindOneOptions, TransactionOptions},
+    };
+
+    let workspace_id = &config.default_workspace_id;
+    for attempt in 1..=DEFAULT_PROVIDER_INIT_MAX_ATTEMPTS {
+        if let Some(active) = db
+            .llm_provider_configs()
+            .find_one(doc! { "workspaceId": workspace_id, "isActive": true }, None)
+            .await?
+        {
+            return Ok(active);
+        }
+
+        let mut session = db.client().start_session(None).await?;
+        session
+            .start_transaction(
+                TransactionOptions::builder()
+                    .max_commit_time(DEFAULT_PROVIDER_INIT_MAX_COMMIT_TIME)
+                    .build(),
+            )
+            .await?;
+
+        let transaction_result: AppResult<Option<crate::models::LlmProviderConfig>> = async {
+            if let Some(active) = db
+                .llm_provider_configs()
+                .find_one_with_session(
+                    doc! { "workspaceId": workspace_id, "isActive": true },
+                    None,
+                    &mut session,
+                )
+                .await?
+            {
+                return Ok(Some(active));
+            }
+
+            let now = DateTime::now();
+            let provider = if let Some(mut existing) = db
+                .llm_provider_configs()
+                .find_one_with_session(
+                    doc! { "workspaceId": workspace_id },
+                    FindOneOptions::builder()
+                        .sort(doc! { "createdAt": 1_i32, "providerId": 1_i32 })
+                        .build(),
+                    &mut session,
+                )
+                .await?
+            {
+                let updated_at = DateTime::from_millis(
+                    now.timestamp_millis()
+                        .max(existing.updated_at.timestamp_millis().saturating_add(1)),
+                );
+                let promoted = db
+                    .llm_provider_configs()
+                    .update_one_with_session(
+                        doc! {
+                            "workspaceId": workspace_id,
+                            "providerId": &existing.provider_id,
+                            "isActive": { "$ne": true },
+                            "updatedAt": existing.updated_at,
+                        },
+                        doc! { "$set": { "isActive": true, "updatedAt": updated_at } },
+                        None,
+                        &mut session,
+                    )
+                    .await?;
+                if promoted.modified_count != 1 {
+                    return Err(AppError::Conflict(
+                        "default_provider_election_conflict".to_string(),
+                    ));
+                }
+                existing.is_active = true;
+                existing.updated_at = updated_at;
+                existing
+            } else {
+                let seed = crate::models::LlmProviderConfig {
+                    id: None,
+                    workspace_id: workspace_id.clone(),
+                    provider_id: "default".to_string(),
+                    name: "默认 LLM".to_string(),
+                    format: "openai".to_string(),
+                    base_url: config.openai_base_url.clone(),
+                    api_key: config.openai_api_key.clone(),
+                    model: config.openai_model.clone(),
+                    is_active: true,
+                    timeout_seconds: Some(config.llm_timeout_seconds),
+                    max_retries: Some(config.llm_max_retries),
+                    retry_base_ms: Some(config.llm_retry_base_ms),
+                    supports_vision: false,
+                    is_vision_active: false,
+                    created_at: now,
+                    updated_at: now,
+                };
+                let inserted = db
+                    .llm_provider_configs()
+                    .insert_one_with_session(&seed, None, &mut session)
+                    .await?;
+                let mut seed = seed;
+                seed.id = inserted.inserted_id.as_object_id();
+                seed
+            };
+
+            crate::db::config_generation::bump_generation_with_session(
+                db,
+                crate::db::config_generation::LLM_PROVIDER_NAMESPACE,
+                workspace_id,
+                &mut session,
+            )
+            .await?;
+            Ok(Some(provider))
+        }
+        .await;
+
+        let provider = match transaction_result {
+            Ok(Some(provider)) => provider,
+            Ok(None) => unreachable!("provider initialization always returns a row"),
+            Err(error) => {
+                let retryable = matches!(
+                    &error,
+                    AppError::Db(db_error)
+                        if db_error.contains_label("TransientTransactionError")
+                ) || matches!(&error, AppError::Conflict(code) if code == "default_provider_election_conflict");
+                let _ = session.abort_transaction().await;
+                if retryable && attempt < DEFAULT_PROVIDER_INIT_MAX_ATTEMPTS {
+                    sleep(Duration::from_millis(20 * attempt as u64)).await;
+                    continue;
+                }
+                return Err(error);
+            }
+        };
+        let expected_fingerprint = llm_provider_runtime_fingerprint(&provider)?;
+
+        for commit_attempt in 1..=DEFAULT_PROVIDER_INIT_MAX_ATTEMPTS {
+            match session.commit_transaction().await {
+                Ok(()) => return Ok(provider),
+                Err(error)
+                    if error.contains_label("UnknownTransactionCommitResult")
+                        && commit_attempt < DEFAULT_PROVIDER_INIT_MAX_ATTEMPTS => {}
+                Err(error) if error.contains_label("UnknownTransactionCommitResult") => {
+                    let authoritative = db
+                        .llm_provider_configs()
+                        .find_one(
+                            doc! {
+                                "workspaceId": workspace_id,
+                                "providerId": &provider.provider_id,
+                                "isActive": true,
+                                "updatedAt": provider.updated_at,
+                            },
+                            None,
+                        )
+                        .await?;
+                    if authoritative
+                        .as_ref()
+                        .map(llm_provider_runtime_fingerprint)
+                        .transpose()?
+                        .as_deref()
+                        == Some(expected_fingerprint.as_str())
+                    {
+                        return Ok(authoritative.expect("checked as some"));
+                    }
+                    return Err(AppError::Conflict(
+                        "default_provider_commit_result_unknown".to_string(),
+                    ));
+                }
+                Err(error)
+                    if error.contains_label("TransientTransactionError")
+                        && attempt < DEFAULT_PROVIDER_INIT_MAX_ATTEMPTS =>
+                {
+                    let _ = session.abort_transaction().await;
+                    sleep(Duration::from_millis(20 * attempt as u64)).await;
+                    break;
+                }
+                Err(error) => {
+                    let _ = session.abort_transaction().await;
+                    return Err(error.into());
+                }
+            }
+        }
+    }
+    Err(AppError::Conflict(
+        "default_provider_initialization_exhausted".to_string(),
+    ))
 }
 
 /// Workspace-scoped hot-swappable LLM client registry.
@@ -1748,7 +1969,14 @@ pub struct LlmProviderMeta {
 pub struct LlmRegistry {
     default_workspace_id: String,
     inner: tokio::sync::RwLock<HashMap<String, LlmRegistryInner>>,
+    refresh_lock: tokio::sync::Mutex<()>,
+    /// Last lightweight database generation observed for each workspace and when the complete
+    /// provider row was last verified. The TTL is the recovery path for manual writers that do
+    /// not participate in the application generation protocol.
+    database_state: tokio::sync::RwLock<HashMap<String, (i64, Instant)>>,
 }
+
+const LLM_PROVIDER_CACHE_TTL: Duration = Duration::from_secs(30);
 
 struct LlmRegistryInner {
     client: std::sync::Arc<LlmClient>,
@@ -1876,6 +2104,8 @@ impl LlmRegistry {
         Self {
             default_workspace_id,
             inner: tokio::sync::RwLock::new(entries),
+            refresh_lock: tokio::sync::Mutex::new(()),
+            database_state: tokio::sync::RwLock::new(HashMap::new()),
         }
     }
 
@@ -1885,6 +2115,116 @@ impl LlmRegistry {
             .await
             .get(workspace_id)
             .map(|entry| entry.meta.clone())
+    }
+
+    /// Pin the database-authoritative active provider for one request.
+    ///
+    /// Every request reads one tiny generation row. The complete active provider is fetched only
+    /// when that generation changes or the recovery TTL expires. Production mutations advance the
+    /// generation atomically with their runtime-visible write; manual database edits are observed
+    /// on the bounded TTL path.
+    pub async fn snapshot_synced(
+        &self,
+        db: &crate::db::Database,
+        config: &crate::config::AppConfig,
+        workspace_id: &str,
+    ) -> AppResult<LlmRegistrySnapshot> {
+        let generation = crate::db::config_generation::read_generation(
+            db,
+            crate::db::config_generation::LLM_PROVIDER_NAMESPACE,
+            workspace_id,
+        )
+        .await?;
+        let needs_refresh = self
+            .database_state
+            .read()
+            .await
+            .get(workspace_id)
+            .is_none_or(|(seen, fetched)| {
+                *seen != generation || fetched.elapsed() >= LLM_PROVIDER_CACHE_TTL
+            });
+        if needs_refresh {
+            let _refresh = self.refresh_lock.lock().await;
+            // Re-read after the coalescing lock. Another local request may already have refreshed,
+            // while another replica may have advanced the generation as this request waited.
+            let authoritative_generation = crate::db::config_generation::read_generation(
+                db,
+                crate::db::config_generation::LLM_PROVIDER_NAMESPACE,
+                workspace_id,
+            )
+            .await?;
+            let still_stale = self
+                .database_state
+                .read()
+                .await
+                .get(workspace_id)
+                .is_none_or(|(seen, fetched)| {
+                    *seen != authoritative_generation || fetched.elapsed() >= LLM_PROVIDER_CACHE_TTL
+                });
+            if still_stale {
+                let active = db
+                    .llm_provider_configs()
+                    .find_one(
+                        mongodb::bson::doc! { "workspaceId": workspace_id, "isActive": true },
+                        None,
+                    )
+                    .await?
+                    .ok_or_else(|| AppError::LlmUnavailable {
+                        kind: "workspace_provider_missing".to_string(),
+                        detail: format!(
+                            "no active LLM provider exists for workspace {workspace_id}"
+                        ),
+                        hint: "configure and activate an LLM provider for this workspace"
+                            .to_string(),
+                        retry_count: 0,
+                    })?;
+                let revision_ms = active.updated_at.timestamp_millis();
+                let runtime_fingerprint = llm_provider_runtime_fingerprint(&active)?;
+                let current_matches = self.current_meta(workspace_id).await.is_some_and(|meta| {
+                    meta.provider_id == active.provider_id
+                        && meta.runtime_fingerprint == runtime_fingerprint
+                });
+                if !current_matches {
+                    let format = LlmFormat::parse(&active.format)?;
+                    let client = LlmClient::with_format(
+                        active.base_url.clone(),
+                        active.api_key.clone(),
+                        active.model.clone(),
+                        format,
+                        active.timeout_seconds.unwrap_or(config.llm_timeout_seconds),
+                        active.max_retries.unwrap_or(config.llm_max_retries),
+                        active.retry_base_ms.unwrap_or(config.llm_retry_base_ms),
+                    )
+                    .map_err(|error| {
+                        AppError::External(format!("failed to build active LLM client: {error}"))
+                    })?;
+                    self.swap(
+                        workspace_id,
+                        client,
+                        LlmProviderMeta {
+                            provider_id: active.provider_id,
+                            format,
+                            model: active.model,
+                            base_url: active.base_url,
+                            revision_ms,
+                            runtime_fingerprint,
+                        },
+                    )
+                    .await;
+                }
+                self.mark_database_generation(workspace_id, authoritative_generation)
+                    .await;
+            }
+        }
+        self.snapshot(workspace_id).await
+    }
+
+    /// Mark a locally published provider as synchronized with the committed database generation.
+    pub async fn mark_database_generation(&self, workspace_id: &str, generation: i64) {
+        self.database_state
+            .write()
+            .await
+            .insert(workspace_id.to_string(), (generation, Instant::now()));
     }
 
     pub async fn snapshot(&self, workspace_id: &str) -> AppResult<LlmRegistrySnapshot> {
@@ -2010,6 +2350,8 @@ mod tests {
             format: LlmFormat::Openai,
             model: model.to_string(),
             base_url: "http://127.0.0.1:1".to_string(),
+            revision_ms: 0,
+            runtime_fingerprint: format!("test:{provider}:{model}"),
         }
     }
 

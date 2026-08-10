@@ -731,6 +731,23 @@ pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
             None,
         )
         .await?;
+    // Shared webhook fixed-window buckets. `_id` is the unique quota identity; TTL cleanup is
+    // eventual and never participates in authorization.
+    db.raw()
+        .collection::<Document>("webhook_rate_limit_windows")
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "expires_at": 1 })
+                .options(
+                    IndexOptions::builder()
+                        .name("webhook_rate_limit_windows_ttl".to_string())
+                        .expire_after(std::time::Duration::from_secs(0))
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
     db.contacts()
         .create_index(
             IndexModel::builder()
@@ -1971,6 +1988,24 @@ async fn ensure_llm_provider_indexes(db: &Database) -> anyhow::Result<()> {
         .create_index(
             IndexModel::builder()
                 .keys(doc! { "workspaceId": 1, "isActive": 1 })
+                .build(),
+            None,
+        )
+        .await?;
+    // Cross-replica authority: at most one text provider may be active per workspace.
+    // Activation changes this pointer in one transaction; the partial unique index also rejects
+    // any legacy/admin writer that attempts to create a second active row.
+    db.llm_provider_configs()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "workspaceId": 1 })
+                .options(
+                    IndexOptions::builder()
+                        .name("llm_provider_one_active_per_workspace".to_string())
+                        .unique(true)
+                        .partial_filter_expression(doc! { "isActive": true })
+                        .build(),
+                )
                 .build(),
             None,
         )

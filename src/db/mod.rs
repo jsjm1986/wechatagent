@@ -9,6 +9,7 @@
 //! （部分迁移会改 schema 甚至重建集合），而老逻辑把索引塞进 `connect` 会让
 //! 顺序无法控制。
 
+pub mod config_generation;
 mod indexes;
 pub mod migrations;
 

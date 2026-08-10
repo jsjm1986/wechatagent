@@ -278,7 +278,7 @@ pub(crate) async fn shadow_replay_prompt_one(
     // branches skip TTL refresh while this snapshot scope is installed.
     let live_taxonomy_cache = crate::agent::taxonomy::global_taxonomy_cache(&state.db);
     live_taxonomy_cache
-        .find_or_load_read_only(&state.db)
+        .find_or_load_read_only(&state.db, &contact.workspace_id)
         .await?;
     let taxonomy_cache = Arc::new(live_taxonomy_cache.snapshot_copy());
     let evaluation_snapshot = Arc::new(ShadowEvaluationSnapshot {
@@ -292,7 +292,9 @@ pub(crate) async fn shadow_replay_prompt_one(
     // registry keep using the injected provider already stored in AppState.
     let mut pinned_state = state.clone();
     if let Some(registry) = state.llm_registry.as_ref() {
-        let snapshot = registry.snapshot(&proposal.workspace_id).await?;
+        let snapshot = registry
+            .snapshot_synced(&state.db, &state.config, &proposal.workspace_id)
+            .await?;
         pinned_state.llm = Arc::new(snapshot);
         pinned_state.llm_registry = None;
     }

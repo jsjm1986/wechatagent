@@ -37,6 +37,9 @@ pub const SOURCE_KIND_MANUAL_SEND: &str = "manual_send";
 /// Durable internal cards sent to a configured principal. This source is not
 /// a customer reply and must not inherit customer conversation side effects.
 pub const SOURCE_KIND_PRINCIPAL_ESCALATION: &str = "principal_escalation";
+/// Durable clarification sent to a configured principal when one reply could match
+/// multiple pending escalation cards. It is an internal notification, not a customer reply.
+pub const SOURCE_KIND_PRINCIPAL_CLARIFICATION: &str = "principal_clarification";
 /// Deterministic operational alert sent to the configured Ask-Human audience.
 /// It has its own incident lifecycle and never creates a principal decision.
 pub const SOURCE_KIND_SYSTEM_INCIDENT: &str = "system_incident";
@@ -1628,6 +1631,12 @@ mod tests {
         assert_eq!(SOURCE_KIND_INBOUND_MESSAGE, "inbound_message");
         assert_eq!(SOURCE_KIND_FOLLOW_UP_TASK, "follow_up_task");
         assert_eq!(SOURCE_KIND_MANUAL_SEND, "manual_send");
+        assert_eq!(SOURCE_KIND_PRINCIPAL_ESCALATION, "principal_escalation");
+        assert_eq!(
+            SOURCE_KIND_PRINCIPAL_CLARIFICATION,
+            "principal_clarification"
+        );
+        assert_eq!(SOURCE_KIND_SYSTEM_INCIDENT, "system_incident");
     }
 
     #[test]

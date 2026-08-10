@@ -288,6 +288,9 @@ async fn pending_message_is_reconciled_to_exactly_one_durable_task() {
 #[ignore]
 async fn later_message_refreshes_single_flight_and_fences_old_outbox() {
     let app = common::TestApp::start().await;
+    let mcp = start_mcp().await;
+    let state = common::rebuild_app_state_with_mcp_url(&app, mcp.uri());
+    common::ensure_test_account(&state, "default", "default").await;
     let contact = managed_contact("sr177-fence");
     app.state
         .db
@@ -311,13 +314,13 @@ async fn later_message_refreshes_single_flight_and_fences_old_outbox() {
         DateTime::from_millis(base_ms + 1_000),
         "new",
     );
-    insert_pending_handoff(&app.state, &old).await;
-    insert_pending_handoff(&app.state, &newer).await;
+    insert_pending_handoff(&state, &old).await;
+    insert_pending_handoff(&state, &newer).await;
 
-    let durable = materialize_durable_inbound_task(&app.state, &contact, &old, 4_000)
+    let durable = materialize_durable_inbound_task(&state, &contact, &old, 4_000)
         .await
         .expect("materialize old inbound");
-    let (_task, old_claim) = claim_task_by_id(&app.state, durable.task_id, Some("default"))
+    let (_task, old_claim) = claim_task_by_id(&state, durable.task_id, Some("default"))
         .await
         .expect("claim old generation")
         .expect("old generation claimed");
@@ -329,13 +332,11 @@ async fn later_message_refreshes_single_flight_and_fences_old_outbox() {
         .insert_one(review(decision_id, "sr177-old-run", &contact.wxid), None)
         .await
         .expect("insert old decision");
-    assert!(
-        bind_task_decision_if_owned(&app.state, &old_claim, decision_id)
-            .await
-            .expect("bind old decision")
-    );
+    assert!(bind_task_decision_if_owned(&state, &old_claim, decision_id)
+        .await
+        .expect("bind old decision"));
     let outbox_id = match enqueue(
-        &app.state,
+        &state,
         EnqueueRequest {
             workspace_id: "default".to_string(),
             account_id: "default".to_string(),
@@ -357,15 +358,15 @@ async fn later_message_refreshes_single_flight_and_fences_old_outbox() {
         other => panic!("expected Created, got {other:?}"),
     };
 
-    let refreshed = materialize_durable_inbound_task(&app.state, &contact, &newer, 4_000)
+    let refreshed = materialize_durable_inbound_task(&state, &contact, &newer, 4_000)
         .await
         .expect("refresh with later inbound");
     assert_eq!(refreshed.task_id, durable.task_id);
-    assert!(!task_claim_is_current(&app.state, &old_claim)
+    assert!(!task_claim_is_current(&state, &old_claim)
         .await
         .expect("check stale claim"));
     assert!(
-        !authorize_task_outbox_if_owned(&app.state, &old_claim, decision_id)
+        !authorize_task_outbox_if_owned(&state, &old_claim, decision_id)
             .await
             .expect("old claim authorization must fail")
     );
@@ -391,11 +392,11 @@ async fn later_message_refreshes_single_flight_and_fences_old_outbox() {
         base_ms + 1_000
     );
 
-    let claimed_outbox = atomic_claim_pending(&app.state, "sr177-dispatcher", 60)
+    let claimed_outbox = atomic_claim_pending(&state, "sr177-dispatcher", 60)
         .await
         .expect("claim stale outbox")
         .expect("stale outbox available");
-    process_entry(&app.state, &claimed_outbox)
+    process_entry(&state, &claimed_outbox)
         .await
         .expect("dispatcher rejects stale generation");
     let stored_outbox = app
@@ -412,6 +413,11 @@ async fn later_message_refreshes_single_flight_and_fences_old_outbox() {
         .as_deref()
         .unwrap_or_default()
         .contains("stale_task_claim"));
+    assert_eq!(
+        count_text_send_calls(&mcp.received_requests().await.expect("wiremock requests")),
+        0,
+        "a later inbound must fence the obsolete batch before any MCP text send",
+    );
     app.cleanup().await;
 }
 

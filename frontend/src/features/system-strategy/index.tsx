@@ -13,6 +13,7 @@ import { usePromptSaveConfirm, usePromptPublishConfirm } from "../../components/
 import { ToastProvider } from "../../components/ui/Toast";
 import { VERSION_STATUS_LABELS, seededByLabel, promptLayerLabel, labelOf } from "../../lib/reviewLabels";
 import { formatTimestamp } from "../../lib/format";
+import { OPERATION_STATE_ACTION_LABELS, type OperationStateAction } from "../../contracts/operationStateAction.contract";
 import styles from "./SystemStrategy.module.css";
 
 // 系统策略频道：全局总控 Prompt（人格/任务）+ 状态机灰度 + 双层标签字典 + 跨用户教训。
@@ -39,6 +40,11 @@ type OperationStatePolicyEntry = ActiveVersionMeta & {
   recommendedPace?: string | null;
   status: string;
 };
+
+
+function stateActionLabel(value: string): string {
+  return OPERATION_STATE_ACTION_LABELS[value as OperationStateAction] ?? `未知动作（${value}）`;
+}
 
 type TaxonomyEntry = ActiveVersionMeta & {
   scope: string;
@@ -648,11 +654,11 @@ function StatePolicyAdmin({ busy }: { busy: boolean }) {
             <div className={styles.versionedListBody}>
               <div className={styles.versionedListChunk}>
                 <span>允许动作</span>
-                <p>{item.allowed.join("，") || "—"}</p>
+                <p>{item.allowed.map(stateActionLabel).join("，") || "—"}</p>
               </div>
               <div className={styles.versionedListChunk}>
                 <span>禁止动作</span>
-                <p>{item.forbidden.join("，") || "—"}</p>
+                <p>{item.forbidden.map(stateActionLabel).join("，") || "—"}</p>
               </div>
               <div className={styles.versionedListChunk}>
                 <span>建议节奏</span>

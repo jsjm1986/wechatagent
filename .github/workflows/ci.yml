@@ -48,6 +48,7 @@ on:
         type: choice
         options:
           - credential_probe
+          - delivery_protocol
           - ops
           - nightly_full
           - smoke_t4
@@ -229,6 +230,80 @@ jobs:
 
       - name: Check reproducible 47-domain audit status (SR-183)
         run: python3 scripts/check-audit-status-manifest.py
+
+  delivery-protocol:
+    name: Delivery protocol hard gate
+    runs-on: ubuntu-latest
+    needs: changes
+    if: ${{ always() && ((github.event_name == 'workflow_dispatch' && github.event.inputs.dispatch_target == 'delivery_protocol') || (github.event_name != 'workflow_dispatch' && needs.changes.outputs.backend != 'false')) }}
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /usr/local/share/boost /usr/local/share/powershell \
+            /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force || true
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry / target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Enforce Dispatcher-only MCP delivery boundary
+        run: |
+          python3 scripts/check-delivery-boundary.py --self-test
+          python3 scripts/check-delivery-boundary.py
+
+      - name: Verify redline test identities
+        shell: bash
+        run: |
+          set -euo pipefail
+          assert_one() {
+            local binary="$1"
+            local test_name="$2"
+            local count
+            count="$(cargo test --test "$binary" -- --list | grep -c "^${test_name}: test$")"
+            test "$count" -eq 1
+          }
+          assert_one reaction_stop_cancels_outbox_integration deterministic_stop_needs_no_review_or_llm_and_persists_dispatch_barrier
+          assert_one sr034_task_send_fencing decision_batch_seal_defers_non_task_row_without_remote_send
+          assert_one sr177_durable_inbound_handoff later_message_refreshes_single_flight_and_fences_old_outbox
+          assert_one principal_decision_channel principal_ambiguity_clarification_is_durable_and_never_direct_mcp
+          assert_one hc004_outbox_webhook_scope_redlines sr024_webhook_rate_limit_is_workspace_account_scoped
+          assert_one llm_provider_activate_integration activate_yields_exactly_one_active_and_is_target
+          assert_one configuration_generation_integration cross_replica_configuration_revisions_refresh_on_next_read
+          assert_one configuration_generation_integration initialization_writes_publish_generation_once_and_are_idempotent
+          assert_one configuration_generation_integration concurrent_initialization_across_replicas_commits_once
+          assert_one migration_safety_redlines m057_handles_missing_null_empty_and_concurrent_reruns
+          assert_one migration_safety_redlines m058_rejects_duplicate_active_providers_without_rewriting_rows
+          assert_one taxonomy_flags_e2e label_only_patch_preserves_runtime_fields_and_projects_them
+
+      - name: Run delivery, fencing, provider, and shared-state redlines
+        shell: bash
+        env:
+          RUSTFLAGS: ""
+          RUST_MIN_STACK: "8388608"
+          CARGO_INCREMENTAL: "0"
+          CARGO_PROFILE_TEST_DEBUG: "0"
+        run: |
+          set -euo pipefail
+          cargo test --test reaction_stop_cancels_outbox_integration deterministic_stop_needs_no_review_or_llm_and_persists_dispatch_barrier -- --ignored --exact --nocapture
+          cargo test --test sr034_task_send_fencing decision_batch_seal_defers_non_task_row_without_remote_send -- --ignored --exact --nocapture
+          cargo test --test sr177_durable_inbound_handoff later_message_refreshes_single_flight_and_fences_old_outbox -- --ignored --exact --nocapture
+          cargo test --test principal_decision_channel principal_ambiguity_clarification_is_durable_and_never_direct_mcp -- --ignored --exact --nocapture
+          cargo test --test hc004_outbox_webhook_scope_redlines sr024_webhook_rate_limit_is_workspace_account_scoped -- --ignored --exact --nocapture
+          cargo test --test llm_provider_activate_integration activate_yields_exactly_one_active_and_is_target -- --ignored --exact --nocapture
+          cargo test --test configuration_generation_integration cross_replica_configuration_revisions_refresh_on_next_read -- --ignored --exact --nocapture
+          cargo test --test configuration_generation_integration initialization_writes_publish_generation_once_and_are_idempotent -- --ignored --exact --nocapture
+          cargo test --test configuration_generation_integration concurrent_initialization_across_replicas_commits_once -- --ignored --exact --nocapture
+          cargo test --test migration_safety_redlines m057_handles_missing_null_empty_and_concurrent_reruns -- --ignored --exact --nocapture
+          cargo test --test migration_safety_redlines m058_rejects_duplicate_active_providers_without_rewriting_rows -- --ignored --exact --nocapture
+          cargo test --test taxonomy_flags_e2e label_only_patch_preserves_runtime_fields_and_projects_them -- --ignored --exact --nocapture
 
   integration:
     name: Integration tests (Docker / testcontainers)

@@ -13,6 +13,7 @@ WORKFLOW = pathlib.Path(".github/workflows/ci.yml")
 HARD_JOBS = {
     "baseline",
     "credential-probe",
+    "delivery-protocol",
     "knowledge-evidence-gate",
     "tenant-isolation-security",
     "frontend-contract",
@@ -116,6 +117,37 @@ def main() -> int:
             failures.append("skip-gate must depend on real-llm-redline")
         if "python3 scripts/check-capability-outcomes.py" not in jobs["skip-gate"]:
             failures.append("skip-gate must execute the typed capability outcome checker")
+
+    if "delivery-protocol" in jobs:
+        block = jobs["delivery-protocol"]
+        for required_test in (
+            "deterministic_stop_needs_no_review_or_llm_and_persists_dispatch_barrier",
+            "decision_batch_seal_defers_non_task_row_without_remote_send",
+            "later_message_refreshes_single_flight_and_fences_old_outbox",
+            "principal_ambiguity_clarification_is_durable_and_never_direct_mcp",
+            "sr024_webhook_rate_limit_is_workspace_account_scoped",
+            "activate_yields_exactly_one_active_and_is_target",
+            "cross_replica_configuration_revisions_refresh_on_next_read",
+            "initialization_writes_publish_generation_once_and_are_idempotent",
+            "concurrent_initialization_across_replicas_commits_once",
+            "m057_handles_missing_null_empty_and_concurrent_reruns",
+            "m058_rejects_duplicate_active_providers_without_rewriting_rows",
+            "label_only_patch_preserves_runtime_fields_and_projects_them",
+        ):
+            if block.count(required_test) < 2:
+                failures.append(
+                    f"delivery-protocol must count and execute {required_test!r}"
+                )
+        if "--ignored --exact --nocapture" not in block:
+            failures.append("delivery-protocol must execute exact ignored redlines")
+        if "python3 scripts/check-delivery-boundary.py" not in block:
+            failures.append("delivery-protocol must enforce the Dispatcher-only MCP boundary")
+        condition = property_value(block, "if") or ""
+        if "dispatch_target == 'delivery_protocol'" not in condition or "always()" not in condition:
+            failures.append("delivery-protocol must support its manual dispatch target despite skipped changes")
+        dispatch_block = text.split("workflow_dispatch:", 1)[1].split("env:", 1)[0]
+        if "- delivery_protocol" not in dispatch_block:
+            failures.append("workflow_dispatch must expose delivery_protocol")
 
     if "baseline" in jobs and "python3 scripts/check-ci-gate-policy.py" not in jobs["baseline"]:
         failures.append("baseline must execute this CI gate policy checker")

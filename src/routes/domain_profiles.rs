@@ -30,9 +30,9 @@ use mongodb::options::{FindOneOptions, FindOptions, TransactionOptions};
 use mongodb::ClientSession;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::time::Duration;
 
 use crate::{
-    agent::domain_profile::invalidate_global_domain_profile_cache,
     auth::AuthenticatedAdmin,
     db::Database,
     error::{AppError, AppResult},
@@ -43,6 +43,14 @@ use super::shared::{parse_object_id, resolve_authorized_workspace};
 use super::AppState;
 
 const DOMAIN_PROFILE_RELEASE_CONFLICT: &str = "domain_profile_release_conflict";
+const DOMAIN_PROFILE_COMMIT_MAX_ATTEMPTS: usize = 3;
+const DOMAIN_PROFILE_COMMIT_MAX_TIME: Duration = Duration::from_secs(5);
+
+fn domain_profile_transaction_options() -> TransactionOptions {
+    TransactionOptions::builder()
+        .max_commit_time(DOMAIN_PROFILE_COMMIT_MAX_TIME)
+        .build()
+}
 
 fn domain_profile_transaction_error(error: AppError) -> AppError {
     match error {
@@ -54,12 +62,40 @@ fn domain_profile_transaction_error(error: AppError) -> AppError {
     }
 }
 
-async fn commit_domain_profile_transaction(session: &mut ClientSession) -> AppResult<()> {
-    loop {
+async fn commit_domain_profile_transaction(
+    session: &mut ClientSession,
+    db: &Database,
+    committed_filter: Document,
+) -> AppResult<()> {
+    for attempt in 1..=DOMAIN_PROFILE_COMMIT_MAX_ATTEMPTS {
         match session.commit_transaction().await {
             Ok(()) => return Ok(()),
-            Err(error) if error.contains_label("UnknownTransactionCommitResult") => continue,
+            Err(error)
+                if error.contains_label("UnknownTransactionCommitResult")
+                    && attempt < DOMAIN_PROFILE_COMMIT_MAX_ATTEMPTS =>
+            {
+                tracing::warn!(
+                    attempt,
+                    "domain profile commit result unknown; retrying bounded commit"
+                );
+            }
+            Err(error) if error.contains_label("UnknownTransactionCommitResult") => {
+                tracing::warn!(attempt, %error, "domain profile commit result remained unknown; reading authoritative row");
+                return if db
+                    .domain_profiles()
+                    .find_one(committed_filter, None)
+                    .await?
+                    .is_some()
+                {
+                    Ok(())
+                } else {
+                    Err(AppError::Conflict(
+                        "domain_profile_commit_result_unknown".to_string(),
+                    ))
+                };
+            }
             Err(error) => {
+                let _ = session.abort_transaction().await;
                 tracing::warn!(error = %error, "domain profile transaction commit failed");
                 return Err(AppError::Conflict(
                     DOMAIN_PROFILE_RELEASE_CONFLICT.to_string(),
@@ -67,6 +103,7 @@ async fn commit_domain_profile_transaction(session: &mut ClientSession) -> AppRe
             }
         }
     }
+    unreachable!("finite domain profile commit loop always returns")
 }
 
 /// Validate every permanent property of an activation target before the
@@ -102,7 +139,7 @@ pub(crate) async fn append_domain_profile_draft(
     let collection = db.domain_profiles();
     let mut session = db.client().start_session(None).await?;
     session
-        .start_transaction(TransactionOptions::builder().build())
+        .start_transaction(domain_profile_transaction_options())
         .await?;
     let result: AppResult<DomainProfile> = async {
         let latest = collection
@@ -161,7 +198,23 @@ pub(crate) async fn append_domain_profile_draft(
             return Err(domain_profile_transaction_error(error));
         }
     };
-    commit_domain_profile_transaction(&mut session).await?;
+    let draft_id = draft.id.ok_or_else(|| {
+        AppError::External("inserted domain profile draft missing _id".to_string())
+    })?;
+    commit_domain_profile_transaction(
+        &mut session,
+        db,
+        doc! {
+            "_id": draft_id,
+            "workspace_id": &draft.workspace_id,
+            "profile_id": &draft.profile_id,
+            "version": draft.version,
+            "release_status": "draft",
+            "current_version": false,
+            "is_active": false,
+        },
+    )
+    .await?;
     Ok(draft)
 }
 
@@ -178,7 +231,7 @@ async fn switch_domain_profile_current(
     let collection = db.domain_profiles();
     let mut session = db.client().start_session(None).await?;
     session
-        .start_transaction(TransactionOptions::builder().build())
+        .start_transaction(domain_profile_transaction_options())
         .await?;
     let result: AppResult<DomainProfile> = async {
         let target = collection
@@ -286,7 +339,19 @@ async fn switch_domain_profile_current(
             return Err(domain_profile_transaction_error(error));
         }
     };
-    commit_domain_profile_transaction(&mut session).await?;
+    commit_domain_profile_transaction(
+        &mut session,
+        db,
+        doc! {
+            "_id": target_id,
+            "workspace_id": workspace_id,
+            "profile_id": profile_id,
+            "release_status": "published",
+            "current_version": true,
+            "updated_at": target.updated_at,
+        },
+    )
+    .await?;
     Ok(target)
 }
 
@@ -301,7 +366,7 @@ async fn switch_domain_profile_active(
     let collection = db.domain_profiles();
     let mut session = db.client().start_session(None).await?;
     session
-        .start_transaction(TransactionOptions::builder().build())
+        .start_transaction(domain_profile_transaction_options())
         .await?;
     let result: AppResult<DomainProfile> = async {
         let target = collection
@@ -381,6 +446,13 @@ async fn switch_domain_profile_active(
         let mut target = target;
         target.is_active = true;
         target.updated_at = now;
+        crate::db::config_generation::bump_generation_with_session(
+            db,
+            crate::db::config_generation::DOMAIN_PROFILE_NAMESPACE,
+            workspace_id,
+            &mut session,
+        )
+        .await?;
         Ok(target)
     }
     .await;
@@ -391,7 +463,19 @@ async fn switch_domain_profile_active(
             return Err(domain_profile_transaction_error(error));
         }
     };
-    commit_domain_profile_transaction(&mut session).await?;
+    commit_domain_profile_transaction(
+        &mut session,
+        db,
+        doc! {
+            "_id": target_id,
+            "workspace_id": workspace_id,
+            "release_status": "published",
+            "current_version": true,
+            "is_active": true,
+            "updated_at": target.updated_at,
+        },
+    )
+    .await?;
     Ok(target)
 }
 
@@ -802,7 +886,8 @@ pub async fn activate_domain_profile(
     // The runtime pointer is already committed. Invalidate before any optional
     // follow-up so the next decision observes the new profile even if a later
     // step fails and the response becomes partial.
-    invalidate_global_domain_profile_cache(&state.db);
+    crate::agent::domain_profile::global_domain_profile_cache(&state.db)
+        .invalidate_workspace(&admin.current_workspace);
 
     let now = DateTime::now();
     let mut state_machine_status = "skipped";

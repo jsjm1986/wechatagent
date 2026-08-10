@@ -17,7 +17,9 @@
 
 mod common;
 
+use axum::{body::Bytes, extract::State, http::HeaderMap};
 use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
+use wechatagent::agent::run_envelope::SOURCE_KIND_PRINCIPAL_CLARIFICATION;
 use wechatagent::models::{
     AgentPrincipalEscalation, AgentStatus, AgentTask, AskHumanPolicy, AskHumanQuietHours, Contact,
     ConversationMessage, DeciderRef, OperationKnowledgeChunk, PrincipalDecision,
@@ -26,6 +28,7 @@ use wechatagent::models::{
     PRINCIPAL_ESCALATION_STATUS_DELIVERY_FAILED, PRINCIPAL_ESCALATION_STATUS_PENDING,
     PRINCIPAL_ESCALATION_STATUS_RESOLVED, PRINCIPAL_RELAY_SENTINEL, PRINCIPAL_VERDICT_CONDITIONAL,
 };
+use wechatagent::webhooks::wechat_webhook;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -175,6 +178,84 @@ fn minimal_pending_escalation(short_code: &str, contact_wxid: &str) -> AgentPrin
         relay_terminal_at: None,
         relay_terminal_reason: None,
     }
+}
+
+/// Delivery-protocol redline: an ambiguous principal reply enters through the real webhook
+/// router, creates one idempotent durable clarification Outbox row, and performs no direct MCP
+/// send in the request handler.
+#[tokio::test]
+#[ignore = "requires MongoDB"]
+async fn principal_ambiguity_clarification_is_durable_and_never_direct_mcp() {
+    let app = common::TestApp::start().await;
+    let mcp = start_mcp_mock_success().await;
+    let mut state = common::rebuild_app_state_with_mcp_url(&app, mcp.uri());
+    state.config.webhook_verify_signature = false;
+    seed_online_default_account(&app).await;
+    app.state
+        .db
+        .operation_domain_configs()
+        .update_one(
+            doc! { "workspace_id": "default", "domain": "user_operations", "current_version": true },
+            doc! { "$set": {
+                "principal_decider": "boss_wxid",
+                "high_risk_escalation_mode": "all",
+                "updated_at": DateTime::now(),
+            }},
+            None,
+        )
+        .await
+        .expect("configure principal");
+    for (code, customer) in [("AMB1", "customer-a"), ("AMB2", "customer-b")] {
+        app.state
+            .db
+            .agent_principal_escalations()
+            .insert_one(minimal_pending_escalation(code, customer), None)
+            .await
+            .expect("insert pending escalation");
+    }
+
+    let body = Bytes::from(
+        serde_json::to_vec(&serde_json::json!({
+            "appId": "hc013-test-app",
+            "fromWxid": "boss_wxid",
+            "content": "可以",
+            "msgId": "principal-ambiguous-message"
+        }))
+        .expect("serialize webhook"),
+    );
+    for _ in 0..2 {
+        let response = wechat_webhook(State(state.clone()), HeaderMap::new(), body.clone())
+            .await
+            .expect("route ambiguous principal reply");
+        assert_eq!(response.0["routed"], "principal");
+    }
+
+    assert!(
+        mcp.received_requests()
+            .await
+            .expect("wiremock requests")
+            .is_empty(),
+        "webhook handling must not directly call MCP"
+    );
+    let rows = app
+        .state
+        .db
+        .collection_agent_send_outbox()
+        .count_documents(
+            doc! {
+                "source_kind": SOURCE_KIND_PRINCIPAL_CLARIFICATION,
+                "contact_wxid": "boss_wxid",
+                "status": "pending",
+            },
+            None,
+        )
+        .await
+        .expect("count clarification outbox");
+    assert_eq!(
+        rows, 1,
+        "replayed ambiguous replies must share one durable intent"
+    );
+    app.cleanup().await;
 }
 
 // ───────────────────── §14 DB 集成测试（#[ignore]，CI 跑） ─────────────────────

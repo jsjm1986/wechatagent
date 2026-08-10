@@ -756,7 +756,10 @@ pub async fn build_operation_knowledge_completeness(
         .acquire(crate::llm_concurrency::LlmPriority::Foreground)
         .await;
     let generated = match &state.llm_registry {
-        Some(registry) => match registry.snapshot(workspace_id).await {
+        Some(registry) => match registry
+            .snapshot_synced(&state.db, &state.config, workspace_id)
+            .await
+        {
             Ok(snapshot) => snapshot.generate_json(system, &user).await,
             Err(error) => Err(error),
         },
