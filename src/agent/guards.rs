@@ -354,24 +354,45 @@ pub(crate) fn classify_reviewed_decision_action(
                         .is_some_and(|claim| !claim.get_bool("requiresEvidence").unwrap_or(true))
                 })
             });
-    // Remove only explicit negative-boundary phrases before looking for positive scheduling or
-    // fulfillment language. This preserves “不安排时间” acknowledgements without allowing
-    // “明天不安排，后天三点见” or any concrete service promise through the narrow action.
-    let semantic_remainder = [
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum SchedulePolarity {
+        None,
+        NegativeOnly,
+        Positive,
+        Mixed,
+    }
+
+    let normalized = text.to_ascii_lowercase();
+    let negative_phrases = [
         "不安排任何时间",
+        "不安排任何预约",
         "不安排时间",
+        "不安排预约",
+        "不安排",
         "不替你安排",
         "不帮你预约",
+        "不帮你约",
         "不确认预约",
         "不会安排时间",
+        "不会安排",
+        "不用安排",
+        "无需安排",
+        "不要安排",
+        "不约了",
+        "取消安排",
+        "取消预约",
         "won't schedule",
         "will not schedule",
-    ]
-    .iter()
-    .fold(text.to_ascii_lowercase(), |value, phrase| {
-        value.replace(phrase, "")
-    });
-    let contains_temporal_or_service_language = [
+        "do not schedule",
+        "cancel the appointment",
+    ];
+    let has_negative_schedule = negative_phrases
+        .iter()
+        .any(|phrase| normalized.contains(phrase));
+    let semantic_remainder = negative_phrases
+        .iter()
+        .fold(normalized, |value, phrase| value.replace(phrase, ""));
+    let has_positive_schedule = [
         "今天",
         "明天",
         "后天",
@@ -386,6 +407,7 @@ pub(crate) fn classify_reviewed_decision_action(
         "接待",
         "带你",
         "帮你约",
+        "全程",
         "today",
         "tomorrow",
         "appointment",
@@ -395,14 +417,23 @@ pub(crate) fn classify_reviewed_decision_action(
     ]
     .iter()
     .any(|marker| semantic_remainder.contains(marker));
+    let schedule_polarity = match (has_negative_schedule, has_positive_schedule) {
+        (false, false) => SchedulePolarity::None,
+        (true, false) => SchedulePolarity::NegativeOnly,
+        (false, true) => SchedulePolarity::Positive,
+        (true, true) => SchedulePolarity::Mixed,
+    };
     if review.approved
         && !review.should_hold
-        && acknowledgement_marker
+        && (acknowledgement_marker || schedule_polarity == SchedulePolarity::NegativeOnly)
         && text.chars().count() <= 60
         && !text
             .chars()
             .any(|ch| ch.is_ascii_digit() || matches!(ch, '?' | '？'))
-        && !contains_temporal_or_service_language
+        && matches!(
+            schedule_polarity,
+            SchedulePolarity::None | SchedulePolarity::NegativeOnly
+        )
         && no_side_effects
         && manifest_is_safe
     {
@@ -641,11 +672,20 @@ mod policy_tests {
     fn reviewed_neutral_acknowledgement_has_narrow_action() {
         let mut decision = AgentDecision::default();
         decision.should_reply = true;
-        decision.reply_text = "好的，我知道了，不安排时间。".to_string();
-        assert_eq!(
-            classify_reviewed_decision_action(&decision, &safe_ack_review()),
-            "acknowledgement"
-        );
+        for text in [
+            "好的，我知道了，不安排时间。",
+            "收到，不安排。",
+            "不安排任何预约。",
+            "不约了。",
+            "取消安排。",
+        ] {
+            decision.reply_text = text.to_string();
+            assert_eq!(
+                classify_reviewed_decision_action(&decision, &safe_ack_review()),
+                "acknowledgement",
+                "text={text}"
+            );
+        }
         let legacy_no_proactive = mk_policy("cooldown", &["silent", "follow_up"], &["reply"]);
         assert!(enforce_state_action_policy(
             Some(&legacy_no_proactive),
@@ -666,6 +706,8 @@ mod policy_tests {
             "好的，我帮你安排。",
             "好的，你到了我带你进去。",
             "好的，可以吗？",
+            "收到，明天不安排，后天三点见。",
+            "收到，不安排，但我会全程接待。",
         ] {
             let mut decision = AgentDecision::default();
             decision.should_reply = true;

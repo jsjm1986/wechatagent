@@ -59,11 +59,11 @@ pub fn review_passed(review: &DecisionReviewResult, runtime: &UserRuntimeParamet
 ///
 /// 这些字段是 reply-agent 自洽逻辑链的产物，喂给 reviewer 会形成
 /// "reviewer 追认 reply-agent" 的副作用。本函数只暴露候选回复的事实面：
-/// 是否回复、回复文本、知识引用、状态/阶段、tool-loop 协议字段。
+/// 是否回复、知识引用、状态/阶段、tool-loop 协议字段。候选正文由 Reviewer 的独立
+/// `候选回复` 槽注入，不在此重复序列化。
 pub(crate) fn build_reviewer_decision_view(decision: &AgentDecision) -> String {
     serde_json::to_string(&mongodb::bson::doc! {
         "shouldReply": decision.should_reply,
-        "replyText": decision.reply_text.clone(),
         "matchedKnowledgeIds": decision.matched_knowledge_ids.clone(),
         "safeClaimsUsed": decision.safe_claims_used.clone(),
         "usedKnowledgeIds": decision.used_knowledge_ids.clone(),
@@ -1577,8 +1577,8 @@ mod reviewer_decision_view_tests {
     //!
     //! * 9 个 reasoning 字段（self_critique / why_should_reply 等）即使非空，
     //!   reviewer 视图里也不应包含其值或 key；
-    //! * 候选回复事实面（reply_text / should_reply / matched_knowledge_ids 等）
-    //!   必须保留；
+    //! * 候选正文由独立槽注入，事实面视图不得重复 reply_text；should_reply /
+    //!   matched_knowledge_ids 等控制与引用字段必须保留；
     //! * intent_analysis / next_best_action / operating_memory_update 三个
     //!   推理 Document 不进 reviewer 视图。
 
@@ -1668,11 +1668,14 @@ mod reviewer_decision_view_tests {
     #[test]
     fn reviewer_view_preserves_reply_facts() {
         let view = build_reviewer_decision_view(&decision_with_reasoning_filled());
-        // 候选回复事实面必须保留
+        // 候选正文在 Reviewer prompt 的独立槽中，此处不得重复注入。
         assert!(
-            view.contains("好的，明白您的顾虑"),
-            "应保留 replyText: {}",
-            view
+            !view.contains("好的，明白您的顾虑"),
+            "不应重复 replyText: {view}"
+        );
+        assert!(
+            !view.contains("replyText"),
+            "不应包含 replyText key: {view}"
         );
         assert!(
             view.contains("\"shouldReply\":true"),
