@@ -24,15 +24,35 @@ class BuildCleanupScriptTests(unittest.TestCase):
         )
         linked_chunk_delete = "deleteMany({document_id:{$in:_docids}})"
         legacy_chunk_delete = "deleteMany({source_name:/^biztest_/})"
-        document_delete = (
-            "db.operation_knowledge_documents.deleteMany({source_name:/^biztest_/})"
+        document_delete = "db.operation_knowledge_documents.deleteMany({_id:{$in:_docids}})"
+        frozen_chunk_delete = (
+            "db.operation_knowledge_chunks.deleteMany({_id:{$in:_chunks.map(x=>x._id)}})"
         )
 
         self.assertIn(document_query, self.script)
         self.assertIn(linked_chunk_delete, self.script)
         self.assertIn(legacy_chunk_delete, self.script)
+        self.assertIn(frozen_chunk_delete, self.script)
         self.assertIn(document_delete, self.script)
-        self.assertLess(self.script.index(linked_chunk_delete), self.script.index(document_delete))
+        self.assertLess(self.script.index(frozen_chunk_delete), self.script.index(document_delete))
+
+    def test_cleans_production_observed_derivative_shapes(self) -> None:
+        for collection in (
+            "agent_tasks",
+            "behavior_signals",
+            "knowledge_usage_logs",
+            "import_jobs",
+            "catalog_rebuild_jobs",
+            "chunk_revisions",
+            "knowledge_gap_signals",
+            "projection_observations",
+            "relationship_type_suggestions",
+            "suspected_deal_signals",
+            "mcp_call_logs",
+        ):
+            self.assertIn(f"db.{collection}", self.script)
+        self.assertIn('new RegExp("^principal-card:"', self.script)
+        self.assertIn('db.agent_events.deleteMany({"details.outbox_id":{$in:_principal_outbox_ids}})', self.script)
 
     def test_all_name_filters_require_the_biztest_prefix(self) -> None:
         self.assertNotIn("source_name:/biztest/", self.script)

@@ -20,6 +20,28 @@ import _lib
 TEST_ACCOUNT_ID = os.environ.get("BIZTEST_ACCOUNTID", "2")
 
 
+def unsafe_principal_targets(rows: object) -> list[str]:
+    """Return configured principal wxids that are outside the test namespace."""
+    if not isinstance(rows, list):
+        return ["<unreadable-principal-policy>"]
+    targets: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        policy = row.get("ask_human_policy") or row.get("askHumanPolicy") or {}
+        if not isinstance(policy, dict):
+            continue
+        chain = policy.get("deciderChain") or policy.get("decider_chain") or []
+        if isinstance(chain, list):
+            for item in chain:
+                if isinstance(item, dict) and isinstance(item.get("wxid"), str):
+                    targets.add(item["wxid"].strip())
+        legacy = policy.get("principal_decider") or policy.get("principalDecider")
+        if isinstance(legacy, str):
+            targets.add(legacy.strip())
+    return sorted(target for target in targets if target and not target.startswith(_lib.BIZ_PREFIX))
+
+
 def banner(t: str) -> None:
     print(f"\n{'='*70}\n{t}\n{'='*70}", flush=True)
 
@@ -63,24 +85,30 @@ def main() -> None:
     banner("[4/5] 测试 account")
     acc = _lib.mongo_json(
         f'db.wechat_accounts.find({{account_id:"{TEST_ACCOUNT_ID}"}},'
-        f'{{account_id:1,app_id:1,display_name:1,_id:0}}).toArray()'
+        f'{{account_id:1,app_id:1,display_name:1,online:1,webhook_secret:1,_id:0}}).toArray()'
     )
     if not acc or not isinstance(acc, list) or not acc[0].get("app_id"):
         _lib.record("step0", f"测试 account_id={TEST_ACCOUNT_ID} 不存在", str(acc)[:200], "critical", "无可用 account")
         raise SystemExit("测试 account 不存在")
-    app_id = acc[0]["app_id"]
-    print(f"account_id={TEST_ACCOUNT_ID} app_id={app_id} name={acc[0].get('display_name')}")
-    # 强制把测试账号置 online=true：outbox_dispatcher.rs:634 发送前查 account.online，
-    # 离线则 defer_account_offline（推后 next_retry_at、不增 attempt、不走 terminal，60s 一轮）
-    # → 发送永远卡在 deferred、outbox 无终态 → send_and_wait 轮询假死（域④⑥真模型重测卡 10min+
-    # 的真因，2026-06-27）。真实部署里账号连上微信即 online=true；测试账号无真实 MCP 连接，
-    # online 默认 false/缺失。这里置 true 让 dispatcher 照常发到 outbox（仍不真发微信——MCP
-    # 调用被测试 MCP_API_KEY 拦在 outbox 入队后）。纯测试环境补齐，不碰 src、不改离线 defer 逻辑。
-    _lib.mongo(
-        f'db.wechat_accounts.updateOne({{account_id:"{TEST_ACCOUNT_ID}"}},'
-        f'{{$set:{{online:true,updated_at:new Date()}}}})'
+    account = acc[0]
+    app_id = account["app_id"]
+    print(f"account_id={TEST_ACCOUNT_ID} app_id={app_id} name={account.get('display_name')}")
+    if account.get("online") is not True:
+        raise SystemExit("测试账号不在线；拒绝修改生产账号状态，请先使用隔离测试账号")
+    secret = account.get("webhook_secret")
+    if not isinstance(secret, str) or not secret.strip():
+        raise SystemExit("测试账号未配置 webhook_secret，无法按正式协议验签")
+
+    policies = _lib.mongo_json(
+        'db.operation_domain_configs.find({workspace_id:"default",current_version:true},'
+        '{ask_human_policy:1,_id:0}).toArray()'
     )
-    print(f"已置 account_id={TEST_ACCOUNT_ID} online=true（避免 outbox 离线 defer 卡死）")
+    unsafe = unsafe_principal_targets(policies)
+    if unsafe:
+        raise SystemExit(
+            "生产决策人目标未隔离，拒绝注入式业务测试；请使用随机数据库候选环境。"
+            f" unsafePrincipalCount={len(unsafe)}"
+        )
     _lib.remote_run(f"echo '{TEST_ACCOUNT_ID}|{app_id}' > /tmp/biztest_account")
 
     banner("[5/5] preflight 完成")

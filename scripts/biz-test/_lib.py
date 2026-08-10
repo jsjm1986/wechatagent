@@ -77,10 +77,12 @@ def remote_run_b64(script_text: str) -> tuple[int, str]:
 
 
 def mongo(js: str) -> str:
-    """server 上 mongosh wechatagent --quiet --eval。js 经 base64 中转避免引号/中文炸 shell。"""
+    """Run mongosh and fail closed when the remote command does not succeed."""
     b = base64.b64encode(js.encode("utf-8")).decode("ascii")
     script = f"echo {b} | base64 -d > /tmp/biztest_mongo.js && mongosh wechatagent --quiet --file /tmp/biztest_mongo.js"
-    _, out = remote_run(script)
+    return_code, out = remote_run(script)
+    if return_code != 0:
+        raise RuntimeError(f"mongosh failed with exit code {return_code}: {out[-500:]}")
     return out
 
 
@@ -137,10 +139,30 @@ def api(method: str, path: str, body: dict | None = None, *, admin: bool = False
     return {"_raw": out}
 
 
-def _mcp_key() -> str:
-    """从 server .env 读 MCP_API_KEY（不落本地文件）。"""
-    _, out = remote_run("grep -E '^MCP_API_KEY=' /opt/wechatagent/.env | head -1 | cut -d= -f2-")
-    return out.strip()
+def sign_webhook_body(secret: str, timestamp_ms: str, raw_body: bytes) -> str:
+    """Return the gewe-agent HMAC for ``<timestamp>.<raw_body>``.
+
+    Production verifies the per-account ``webhook_secret`` rather than the MCP API key.
+    Keeping this pure makes protocol drift visible in unit tests.
+    """
+    if not secret.strip():
+        raise ValueError("webhook secret is empty")
+    if not timestamp_ms.isdigit():
+        raise ValueError("webhook timestamp must be milliseconds")
+    signed = timestamp_ms.encode("ascii") + b"." + raw_body
+    return hmac.new(secret.encode("utf-8"), signed, hashlib.sha256).hexdigest()
+
+
+def _webhook_secret(app_id: str) -> str:
+    """Read the account-scoped webhook secret without writing or printing it."""
+    row = mongo_json(
+        f'db.wechat_accounts.findOne({{app_id:{json.dumps(app_id)}}},'
+        '{webhook_secret:1,_id:0})'
+    )
+    secret = row.get("webhook_secret") if isinstance(row, dict) else None
+    if not isinstance(secret, str) or not secret.strip():
+        raise RuntimeError("account webhook_secret is not configured")
+    return secret
 
 
 def api_bg(method: str, path: str, body: dict | None = None, *, admin: bool = False,
@@ -216,17 +238,23 @@ def api_bg(method: str, path: str, body: dict | None = None, *, admin: bool = Fa
 
 
 def send_webhook(app_id: str, from_wxid: str, content: str, msg_id: str) -> dict:
-    """算 HMAC-SHA256(MCP_API_KEY, raw_body) hex → X-MCP-Signature，POST /webhooks/wechat。"""
+    """Inject one strictly namespaced webhook using the production signature protocol."""
+    if not from_wxid.startswith(BIZ_PREFIX) or not msg_id.startswith(BIZ_PREFIX):
+        raise ValueError("biz-test webhooks require biztest_ sender and message ids")
     body = json.dumps(
         {"appId": app_id, "fromWxid": from_wxid, "content": content, "msgId": msg_id},
         ensure_ascii=False,
     )
-    sig = hmac.new(_mcp_key().encode("utf-8"), body.encode("utf-8"), hashlib.sha256).hexdigest()
-    b = base64.b64encode(body.encode("utf-8")).decode("ascii")
+    raw_body = body.encode("utf-8")
+    timestamp_ms = str(int(time.time() * 1000))
+    sig = sign_webhook_body(_webhook_secret(app_id), timestamp_ms, raw_body)
+    b = base64.b64encode(raw_body).decode("ascii")
     script = (
         f"echo {b} | base64 -d > /tmp/biztest_wh.json && "
         f"curl -s -X POST http://localhost:3003/webhooks/wechat "
-        f"-H 'Content-Type: application/json' -H 'X-MCP-Signature: {sig}' "
+        f"-H 'Content-Type: application/json' "
+        f"-H 'X-Webhook-Timestamp: {timestamp_ms}' "
+        f"-H 'X-Webhook-Signature: sha256={sig}' "
         f"--data-binary @/tmp/biztest_wh.json"
     )
     _, out = remote_run_b64(script)
