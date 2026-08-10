@@ -143,9 +143,14 @@ export function KnowledgeWikiView() {
               onClick={() => setMode(m.key)}
               type="button"
             >
-              <ModeIcon size={16} />
-              <span className="wikiModeBarLabel">{m.label}</span>
-              <span className="wikiModeBarCaption">{m.caption}</span>
+              <ModeIcon size={16} className="wikiModeBarIcon" />
+              {/* 标签与副标题包成一列：两者是「标题 + 说明」的关系，必须相邻。
+                  原先并列在 flex 行里、副标题靠 margin-left:auto 贴到按钮最右端，
+                  三列布局下二者相隔近 400px，视觉上断成了两个无关元素。 */}
+              <span className="wikiModeBarText">
+                <span className="wikiModeBarLabel">{m.label}</span>
+                <span className="wikiModeBarCaption">{m.caption}</span>
+              </span>
             </button>
           );
         })}

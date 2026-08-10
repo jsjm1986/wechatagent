@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback, useMemo, type FormEvent } from "react";
 import { ChevronDown, ChevronRight, Clock3, RefreshCw, Sparkles } from "lucide-react";
 import { parseApiError } from "../../lib/api";
+import { copyText } from "../../lib/clipboard";
 import { numberOr, stringOr, type TreeChunkItem } from "./shared";
 import { EmptyState } from "../../components/ui/EmptyState";
 import { wikiTypeLabel, statusLabel, integrityStatusLabel, relatedKindLabel } from "./labels";
@@ -504,12 +505,13 @@ export function KnowledgeTreeView() {
   }
 
   async function copyAnchor(anchor: Record<string, unknown>) {
-    try {
-      await navigator.clipboard.writeText(JSON.stringify(anchor, null, 2));
-      setInfo("已复制 anchor JSON 到剪贴板");
-    } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e));
-    }
+    // 走 lib/clipboard 而非裸 navigator.clipboard：后者只在安全上下文存在，
+    // 生产是纯 HTTP + IP，整个 clipboard 对象都是 undefined，此前这里必然失败
+    // 且只把一句底层报错塞进 wikiAlert。copyText 内部退化到 execCommand。
+    setError(null);
+    const ok = await copyText(JSON.stringify(anchor, null, 2));
+    if (ok) setInfo("已复制 anchor JSON 到剪贴板");
+    else setError("复制失败，请手动选中下方 JSON 复制");
   }
 
   return (

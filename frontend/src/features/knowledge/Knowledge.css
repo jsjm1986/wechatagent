@@ -1367,16 +1367,35 @@
     background: var(--fill-scheduled);
     color: var(--color-scheduled);
   }
+  /* 标签与副标题竖排成一组，紧贴图标右侧。
+     原先副标题带 margin-left:auto 被推到按钮最右端——三列布局下每个按钮约 490px 宽，
+     「工作台」与「今日待办与起草」相隔近 400px，读起来像两个无关的东西，
+     而不是「标题 + 它的说明」。 */
+  /* 标题与副标题的文本列。必须显式 flex + min-width:0：
+     1) 默认的 inline 会吞掉子元素的 display:block，两行挤回一行；
+     2) 没有 min-width:0 时 flex 子项的最小宽度是内容宽度，
+        副标题的 ellipsis 永远不触发（窄屏下会把按钮顶宽）。 */
+  .wikiModeBarText {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    margin-left: 2px;
+  }
   .wikiModeBarLabel {
+    display: block;
     font-family: var(--font-display);
     font-size: 14px;
     font-weight: 600;
-    margin-left: 4px;
+    line-height: 1.35;
   }
   .wikiModeBarCaption {
+    display: block;
     font-size: 11.5px;
+    line-height: 1.35;
     color: var(--ink-3);
-    margin-left: auto;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .wikiModeBarBtn.active .wikiModeBarCaption {
     color: var(--color-scheduled);
@@ -1537,36 +1556,67 @@
     align-items: flex-start;
     gap: 12px;
   }
+  .wikiDigestHeadText {
+    min-width: 0;
+  }
   .wikiDigestHead h3 {
     font-family: var(--font-display);
-    margin: 0 0 4px 0;
+    margin: 0 0 5px 0;
     font-size: 17px;
     color: var(--ink-1);
   }
+  /* meta 行不再整行 mono——里面混着中文（「已生成」「张待办」），
+     等宽字体下中文字距被拉开、与数字基线也对不齐。只保留常规字体，
+     字号压到 11.5px 与标题拉开层级。 */
   .wikiDigestMeta {
-    font-size: 12px;
+    display: inline-flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+    font-size: 11.5px;
+    line-height: 1.5;
     color: var(--ink-3);
-    font-family: var(--font-mono);
+  }
+  /* 分隔点用独立 span 而非文本里的 " · "：文本拼接时两侧空格会被
+     flex-wrap 折行切在点后面，出现行首孤立的「·」。 */
+  .wikiDigestMetaDot {
+    padding: 0 6px;
+    color: var(--ink-4, var(--ink-3));
   }
   .wikiDigestActions {
     display: flex;
+    align-items: center;
     gap: 8px;
+    flex-shrink: 0;
   }
   .wikiDigestActions button {
     display: inline-flex;
     align-items: center;
     gap: 6px;
-    padding: 6px 12px;
+    min-height: 0;
+    padding: 7px 13px;
     border: 1px solid var(--hairline);
-    border-radius: 6px;
+    border-radius: 8px;
     background: var(--surface-card);
     color: var(--ink-2);
     cursor: pointer;
     font-size: 12.5px;
+    font-weight: 600;
+    transition: background 0.18s, color 0.18s, border-color 0.18s;
+  }
+  .wikiDigestActions button:hover:not(:disabled) {
+    background: rgba(0, 0, 0, 0.03);
+    border-color: rgba(0, 0, 0, 0.14);
+    color: var(--ink-1);
+    box-shadow: none;
   }
   .wikiDigestActions button.primary {
     border-color: var(--color-scheduled);
     background: var(--color-scheduled);
+    color: #fff;
+  }
+  .wikiDigestActions button.primary:hover:not(:disabled) {
+    background: var(--accent-ink, #175cd3);
+    border-color: var(--accent-ink, #175cd3);
     color: #fff;
   }
   .wikiDigestActions button:disabled {
@@ -1586,38 +1636,66 @@
     grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
     gap: 12px;
   }
+  /* 卡片不再用 border-left 竖线表达 severity。
+     竖线的问题：3px 实色只压在左边框，与卡片 10px 圆角打架（左上/左下被切平），
+     四张卡并排时形成四条不等高的色带，噪声比信息量大；severity 本来已由
+     .wikiDigestBadge 的色块文字表达，竖线是同一信息的第二次编码。
+     改为整卡中性描边，severity 只由徽章承载。 */
+  /* 子元素保持默认 align-items:stretch。不可改成 flex-start：
+     .wikiDigestCardFoot 靠 justify-content:space-between 把「忽略」推到右边、
+     并用 border-top 画满卡宽的分隔线；一旦子元素收缩到内容宽度，
+     这两者都会失效（按钮贴着建议文字、分隔线只剩一小截）。 */
   .wikiDigestCard {
-    border: 1px solid var(--hairline);
-    border-radius: 10px;
-    padding: 14px;
-    background: var(--surface-card);
     display: flex;
     flex-direction: column;
-    gap: 8px;
+    gap: 7px;
+    padding: 14px 15px 12px;
+    border: 1px solid var(--hairline);
+    border-radius: 12px;
+    background: var(--surface-card);
+    transition: border-color 0.18s ease, box-shadow 0.18s ease;
   }
-  .wikiDigestCard.sev-critical {
-    border-left: 3px solid var(--color-blocked);
+  .wikiDigestCard:hover {
+    border-color: rgba(0, 0, 0, 0.14);
   }
-  .wikiDigestCard.sev-warn {
-    border-left: 3px solid var(--color-held);
-  }
-  .wikiDigestCard.sev-info {
-    border-left: 3px solid var(--color-scheduled);
+  /* 勾选是「即将批量派工」的强状态，值得整卡反馈——原先只有 13px 的复选框变蓝，
+     在四列网格里几乎看不出选中了哪张。 */
+  .wikiDigestCard.is-selected {
+    border-color: var(--color-scheduled);
+    box-shadow: 0 0 0 1px var(--color-scheduled) inset;
   }
   .wikiDigestCardHead {
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: 7px;
+    align-self: stretch;
   }
+  /* 复选框热区：裸 input 只有方块本身可点，且与徽章基线差 1-2px。 */
+  .wikiDigestPick {
+    display: inline-flex;
+    align-items: center;
+    padding: 2px;
+    margin: -2px;
+    cursor: pointer;
+  }
+  .wikiDigestPick input {
+    margin: 0;
+    cursor: pointer;
+  }
+  .wikiDigestPick input:disabled {
+    cursor: not-allowed;
+  }
+  /* 严重度徽章：胶囊 + 语义底色。去掉 mono 字体与 letter-spacing——
+     「注意/严重/提示」是中文词，等宽字体和字距只会让它显得松散错位。 */
   .wikiDigestBadge {
     display: inline-flex;
+    align-items: center;
+    flex-shrink: 0;
     padding: 2px 8px;
-    border-radius: 4px;
+    border-radius: 999px;
     font-size: 11px;
     font-weight: 600;
-    text-transform: none;
-    letter-spacing: 0.04em;
-    font-family: var(--font-mono);
+    line-height: 1.6;
   }
   .wikiDigestBadge.sev-critical {
     background: var(--fill-blocked);
@@ -1631,58 +1709,137 @@
     background: var(--fill-scheduled);
     color: var(--color-scheduled);
   }
+  /* kind 现在是中文（labels.ts 的映射键此前与后端零重叠，一直在打印
+     chunk_missing_field 这类原始 snake_case），故不再用 mono。
+     过长时截断，避免把徽章挤出行外。 */
   .wikiDigestKind {
+    flex: 1;
+    min-width: 0;
     font-size: 11.5px;
     color: var(--ink-3);
-    font-family: var(--font-mono);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .wikiDigestTitle {
     font-family: var(--font-display);
-    font-size: 14.5px;
-    font-weight: 600;
+    font-size: 15px;
+    font-weight: 650;
+    line-height: 1.4;
     margin: 0;
     color: var(--ink-1);
   }
   .wikiDigestSummary {
     margin: 0;
     font-size: 13px;
-    line-height: 1.55;
+    line-height: 1.6;
     color: var(--ink-2);
   }
+  /* 目标对象芯片：卡片指向哪条切片/话术包。两张 kind+title 相同的卡片只能靠这里
+     区分（cardId 由 target_refs 参与派生），所以它承担的是「辨识」职责，不是装饰。
+     用中性灰底而非语义色——severity 已由徽章表达，这里再上色会抢注意力。 */
+  .wikiDigestRefs {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 6px;
+  }
+  .wikiDigestRef {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 4px;
+    max-width: 100%;
+    padding: 1px 7px;
+    border-radius: 5px;
+    background: rgba(0, 0, 0, 0.04);
+    font-size: 11.5px;
+    line-height: 1.7;
+  }
+  .wikiDigestRefKind {
+    flex-shrink: 0;
+    color: var(--ink-3);
+  }
+  /* id 用等宽体：尾 6 位 hex 靠字形对齐才好逐位比对两张卡的差异。 */
+  .wikiDigestRefId {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--ink-2);
+  }
+  /* 指标条：拆成「名称 / 数值 / 阈值」三段。原先是一整串
+     「missing_fields: 2 / 阈值 0」塞进灰底框，冒号和斜杠混在等宽字体里，
+     数值读不出来。现在只有数值用 mono + ink-1 加重，名称与阈值退到 ink-3。 */
   .wikiDigestMetric {
+    display: flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: 4px 8px;
     font-size: 12px;
     color: var(--ink-3);
-    background: var(--surface-page);
-    border: 1px solid var(--hairline);
-    border-radius: 4px;
-    padding: 4px 8px;
-    font-family: var(--font-mono);
   }
+  .wikiDigestMetricName {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .wikiDigestMetricValue {
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    font-weight: 600;
+    color: var(--ink-1);
+  }
+  .wikiDigestMetricThreshold {
+    color: var(--ink-4, var(--ink-3));
+  }
+  /* 底部与正文之间用发丝线分隔，并靠 margin-top:auto 压到卡片底部——
+     同一行的卡片高度不等时（摘要长短不一），底部动作仍能对齐成一条线。 */
   .wikiDigestCardFoot {
     display: flex;
     justify-content: space-between;
     align-items: center;
-    margin-top: 4px;
+    gap: 8px;
+    margin-top: auto;
+    padding-top: 10px;
+    border-top: 1px solid var(--hairline);
   }
+  /* 建议动作本身就是「该干什么」，前面不再冠「建议：」——
+     卡片通篇都是建议，那两个字只是噪声。 */
   .wikiDigestAction {
+    min-width: 0;
     font-size: 12px;
-    color: var(--ink-3);
+    font-weight: 600;
+    color: var(--ink-2);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .wikiDigestDismiss {
+    flex-shrink: 0;
     display: inline-flex;
     align-items: center;
-    gap: 4px;
+    min-height: 0;
     background: transparent;
-    border: 1px solid var(--hairline);
-    border-radius: 4px;
-    padding: 3px 8px;
-    font-size: 11.5px;
+    border: none;
+    border-radius: 6px;
+    padding: 3px 6px;
+    font-size: 12px;
+    font-weight: 500;
     color: var(--ink-3);
     cursor: pointer;
+    transition: background 0.18s, color 0.18s;
   }
-  .wikiDigestDismiss:hover {
-    border-color: var(--hairline);
-    color: var(--ink-2);
+  .wikiDigestDismiss:hover:not(:disabled) {
+    background: rgba(0, 0, 0, 0.04);
+    border-color: transparent;
+    box-shadow: none;
+    color: var(--ink-1);
+  }
+  .wikiDigestDismiss:disabled {
+    cursor: not-allowed;
+    opacity: 0.6;
   }
   /* Today · TaskRail */
   .wikiTaskRail {
@@ -1702,39 +1859,56 @@
   }
   .wikiTaskRailForm {
     display: flex;
+    align-items: stretch;
     gap: 6px;
   }
+  /* flex-basis 用 0 而非 auto：auto 会让 input 以其 intrinsic 宽度（默认 ~20 字符，
+     约 170px）参与收缩分摊，在 200px 左栏（可用 184px）里把按钮一起压窄——
+     溢出 50px 按基准加权后按钮只剩约 50px，扣掉 padding 与图标后文字宽度不足，
+     「拉取」被迫折成两行。basis:0 让 input 独自吸收剩余空间，按钮保持自然宽度。 */
   .wikiTaskRailForm .wikiInput {
-    flex: 1 1 auto;
+    flex: 1 1 0;
     font-family: var(--font-mono);
     font-size: 12px;
     padding: 6px 8px;
     border: 1px solid var(--hairline);
-    border-radius: 4px;
+    border-radius: 6px;
     background: var(--surface-card);
     color: var(--ink-1);
     min-width: 0;
   }
   .wikiTaskRailForm .primary {
+    /* 三重保险，缺一都可能在更窄的栏宽下复现折行：
+       flex-shrink:0 不参与收缩、white-space:nowrap 不换行、min-height:0 摆脱
+       全局裸 button 基线的 38px（输入框只有 ~28px 高，两者同排会不等高）。 */
+    flex-shrink: 0;
+    white-space: nowrap;
+    min-height: 0;
     display: inline-flex;
     align-items: center;
+    justify-content: center;
     gap: 4px;
     padding: 6px 10px;
+    font-size: 12px;
+    font-weight: 600;
     background: var(--color-scheduled);
     color: #fff;
     border: 1px solid var(--color-scheduled);
-    border-radius: 4px;
+    border-radius: 6px;
     cursor: pointer;
   }
   .wikiTaskRailForm .primary:disabled {
     opacity: 0.5;
     cursor: not-allowed;
   }
+  /* 左栏空态：不套虚线框、不放图标。200px 栏宽下那些装饰会抢走
+     「这里本来该有任务」的注意力，一行说明就够。 */
   .wikiTaskRailEmpty {
-    padding: 16px;
+    margin: 0;
+    padding: 2px 2px 4px;
     color: var(--ink-3);
-    font-size: 12.5px;
-    text-align: center;
+    font-size: 12px;
+    line-height: 1.6;
   }
   .wikiTaskRailBody {
     display: flex;

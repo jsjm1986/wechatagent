@@ -33,12 +33,17 @@ function normalizeError(error: Error | LlmErrorPayload): Required<LlmErrorPayloa
       hint: error.hint || error.message || "调用 LLM 失败，请稍后再试。"
     };
   }
+  // 普通 Error(非 LlmUnavailableError)意味着失败发生在**客户端**——请求可能压根没
+  // 发出去。此前这里回落成 kind:"unknown" → 标题显示「未知错误」，把一个前端
+  // TypeError 冒充成上游模型故障（`crypto.randomUUID is not a function` 就这样被
+  // 渲染成了 LLM 错误横幅）。改用 client_error：该键早已在 LLM_KIND_LABELS 里
+  // 备好「客户端错误」文案，只是从没被 set 过。
   if (error instanceof Error) {
     return {
-      kind: "unknown",
+      kind: "client_error",
       retryCount: 0,
       detail: "",
-      hint: error.message || "调用 LLM 失败，请稍后再试。"
+      hint: error.message || "操作失败，请稍后再试。"
     };
   }
   return {
@@ -49,14 +54,29 @@ function normalizeError(error: Error | LlmErrorPayload): Required<LlmErrorPayloa
   };
 }
 
+/// 重试按钮文案。`client_error`（本地/浏览器端故障，请求根本没发出去）不能写
+/// 「AI 重试」——那会让运营以为模型又跑了一遍。此时按调用方给的动作名（默认「重试」）
+/// 陈述事实：重试的是这一次前端操作，不是一次 AI 调用。
+function retryLabel(kind: string, retrying: boolean | undefined, actionLabel?: string): string {
+  if (kind === "client_error") {
+    const verb = actionLabel ?? "重试";
+    return retrying ? `${verb}中…` : verb;
+  }
+  return retrying ? "AI 重试中…" : "AI 重试";
+}
+
 export function LlmErrorBanner({
   error,
   onRetry,
-  retrying
+  retrying,
+  retryActionLabel
 }: {
   error: Error | LlmErrorPayload;
   onRetry?: () => void;
   retrying?: boolean;
+  /// 本地故障（kind=client_error）时按钮显示的动作名，如「重新加载」。
+  /// LLM 上游故障不受影响，仍显示「AI 重试」。
+  retryActionLabel?: string;
 }) {
   const normalized = normalizeError(error);
   return (
@@ -81,7 +101,7 @@ export function LlmErrorBanner({
       {onRetry ? (
         <div className="llmErrorBanner__actions">
           <button type="button" className="primary" onClick={onRetry} disabled={retrying}>
-            {retrying ? "AI 重试中…" : "AI 重试"}
+            {retryLabel(normalized.kind, retrying, retryActionLabel)}
           </button>
         </div>
       ) : null}

@@ -5852,8 +5852,16 @@ pub struct KnowledgeDigestCard {
     pub title: String,
     /// ≤ 200 字。同上截断规则。
     pub summary: String,
-    /// `[{kind: "chunk"|"pack"|"item"|"run"|"evolution_proposal", id}]`；
-    /// 写库前做外键存在性校验，不存在的 ref 整张卡片丢弃。
+    /// `[{kind, id}]`。`kind` 取值以 prompt 给 LLM 的枚举为准：
+    /// `chunk` / `pack` / `proposal`（见 `prompts.rs` 的
+    /// `knowledge.digest.compose`）；历史上本注释还列过 `item` / `run` /
+    /// `evolution_proposal`，前端 `labels.ts` 的字典取两侧并集以免回落成原文。
+    ///
+    /// 校验强度：`parse_cards_from_llm_array` 只丢弃**缺 id / id 为空 / 非对象**
+    /// 的单条 ref（卡片本身保留），**不查库**做外键存在性校验。prompt 里那句
+    /// 「targetRefs.id 不在输入中的整张卡片丢弃」是对 LLM 的要求，不是后端强制。
+    /// 因此 ref 指向已删除对象是可能的，下游按 fail-soft 处理（如
+    /// `fix_chunk` 步骤查不到 chunk 时标记该步失败、不阻断整个任务）。
     #[serde(default)]
     pub target_refs: Vec<Document>,
     /// `fix_chunk` / `add_chunk` / `retag` / `review_evolution` / `dismiss` /

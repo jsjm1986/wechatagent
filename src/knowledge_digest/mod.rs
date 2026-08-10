@@ -752,6 +752,52 @@ fn migrated_dismissed_card_ids(
         .collect()
 }
 
+/// severity 档位：critical > warn > info；未知值排在最后。
+fn digest_severity_rank(severity: &str) -> u8 {
+    match severity {
+        "critical" => 0,
+        "warn" => 1,
+        "info" => 2,
+        _ => 3,
+    }
+}
+
+/// 卡片的 `metric.value`，取不到时为 [`f64::MIN`]（排在同级有指标的卡片之后
+/// ——没有量化依据的卡片不该抢占注意力）。
+///
+/// `value` 可能是 i64 或 f64：落库时按 JSON 数值的实际类型分别 insert
+/// （见 `parse_cards_from_llm_array` 里的 metric 解析），两种都要认。
+///
+/// NaN 与「没有指标」等价处理，同样落到 `f64::MIN`。这一步不能省：`total_cmp` 的全序
+/// 里正 NaN **大于** `f64::INFINITY`，若原样返回，一张 NaN 指标的卡片会在降序中霸占
+/// 榜首——恰好与上面那句「没有量化依据的卡片不该抢占注意力」相反。
+fn digest_metric_value(card: &KnowledgeDigestCard) -> f64 {
+    let raw = card
+        .metric
+        .as_ref()
+        .and_then(|m| m.get("value"))
+        .and_then(|v| v.as_f64().or_else(|| v.as_i64().map(|i| i as f64)));
+    match raw {
+        Some(value) if !value.is_nan() => value,
+        _ => f64::MIN,
+    }
+}
+
+/// 日报卡片排序：severity 优先，同级按 `metric.value` 降序。
+///
+/// 第二排序键此前只写在注释里、没进代码：排序闭包只比较了 severity rank。
+/// `sort_by` 是稳定排序，于是同级卡片的先后完全取决于 LLM 的输出顺序——运营看到的
+/// 「今日最该处理什么」是随机的。
+///
+/// 用 `total_cmp` 而非 `partial_cmp().unwrap()`：后者遇 NaN 返回 `None`、unwrap 当场
+/// panic，而 NaN 能从 LLM 的 f64 值一路进到这里。提成命名函数是为了让测试直接验证
+/// 生产比较器本身（而不是在测试里复制一份等价闭包）。
+fn compare_digest_cards(a: &KnowledgeDigestCard, b: &KnowledgeDigestCard) -> std::cmp::Ordering {
+    digest_severity_rank(&a.severity)
+        .cmp(&digest_severity_rank(&b.severity))
+        .then_with(|| digest_metric_value(b).total_cmp(&digest_metric_value(a)))
+}
+
 /// 从 LLM 返回的 raw JSON 数组校验/裁剪/排序成 [`KnowledgeDigestCard`]。
 /// 抽出此 helper 是为了让 smoke 测试覆盖封闭枚举 + 字段裁剪 + severity 排序，
 /// 而不需要真正起 LLM。
@@ -873,16 +919,7 @@ fn parse_cards_from_llm_array(
         }
     }
 
-    // severity 排序：critical > warn > info；同级按 metric.value desc。
-    cards.sort_by(|a, b| {
-        let rank = |s: &str| match s {
-            "critical" => 0,
-            "warn" => 1,
-            "info" => 2,
-            _ => 3,
-        };
-        rank(&a.severity).cmp(&rank(&b.severity))
-    });
+    cards.sort_by(compare_digest_cards);
 
     cards
 }
@@ -1411,6 +1448,8 @@ async fn do_generate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // 仅测试用：构造 NaN metric 需要直接写 Bson（NaN 不是合法 JSON 值）。
+    use mongodb::bson::Bson;
 
     #[test]
     fn duration_until_next_run_is_positive() {
@@ -1577,6 +1616,102 @@ mod tests {
             cards[0].summary.chars().count() <= 200,
             "summary 超长必须截断，实际 {} 字符",
             cards[0].summary.chars().count()
+        );
+    }
+
+    /// 同 severity 内必须按 `metric.value` 降序，缺指标的排最后。
+    ///
+    /// 回归点：注释一直写着「同级按 metric.value desc」，而 `sort_by` 的闭包只比较了
+    /// severity rank。`sort_by` 是稳定排序，于是同级顺序完全由 LLM 的输出顺序决定，
+    /// 运营看到的「今日最该先处理什么」是随机的。本例把最大值故意放在输入末尾——
+    /// 只有第二排序键真正参与比较，它才能冒到最前。
+    #[test]
+    fn parse_cards_sorts_same_severity_by_metric_value_desc() {
+        let card = |title: &str, metric: Value| {
+            let mut obj = json!({
+                "kind": "chunk_missing_field",
+                "title": title,
+                "summary": "同 severity，靠 metric.value 分先后",
+                "suggestedAction": "fix_chunk",
+                "severity": "warn"
+            });
+            if !metric.is_null() {
+                obj["metric"] = metric;
+            }
+            obj
+        };
+        let raw = vec![
+            card("小值", json!({"name": "missing_fields", "value": 2})),
+            card("无指标", Value::Null),
+            // i64 与 f64 混用：落库时按类型分别 insert，比较器必须两种都认。
+            card("中值", json!({"name": "hit_rate", "value": 7.5})),
+            card("大值", json!({"name": "missing_fields", "value": 42})),
+        ];
+        let cards = parse_cards_from_llm_array(raw, "acc-a", "2026-05-24");
+        let titles: Vec<&str> = cards.iter().map(|c| c.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            vec!["大值", "中值", "小值", "无指标"],
+            "同 severity 必须按 metric.value 降序，缺指标的排最后"
+        );
+    }
+
+    /// severity 仍是第一排序键：高 severity 的小指标必须压过低 severity 的大指标。
+    #[test]
+    fn parse_cards_severity_outranks_metric_value() {
+        let raw = vec![
+            json!({
+                "kind": "chunk_missing_field",
+                "title": "warn 大指标",
+                "summary": "s",
+                "suggestedAction": "fix_chunk",
+                "severity": "warn",
+                "metric": {"name": "missing_fields", "value": 999}
+            }),
+            json!({
+                "kind": "chunk_caused_block",
+                "title": "critical 小指标",
+                "summary": "s",
+                "suggestedAction": "fix_chunk",
+                "severity": "critical",
+                "metric": {"name": "block_count", "value": 1}
+            }),
+        ];
+        let cards = parse_cards_from_llm_array(raw, "acc-a", "2026-05-24");
+        assert_eq!(
+            cards[0].title, "critical 小指标",
+            "severity 必须优先于 metric.value"
+        );
+    }
+
+    /// NaN 不得让排序 panic。
+    ///
+    /// LLM 的 `value` 经 `as_f64` 落库，NaN 能一路进到比较函数；
+    /// `partial_cmp().unwrap()` 会当场 panic，故生产实现用 `total_cmp`。
+    /// 这里直接调生产比较器 `compare_digest_cards`（不复制一份闭包，否则测的是副本
+    /// 而非真实代码）：NaN 不是合法 JSON 值，无法经 `parse_cards_from_llm_array`
+    /// 的 serde 路径构造，只能从结构体入手。
+    #[test]
+    fn compare_digest_cards_survives_nan_metric_value() {
+        let card = |title: &str, value: Bson| KnowledgeDigestCard {
+            card_id: ObjectId::new(),
+            kind: "chunk_missing_field".to_string(),
+            title: title.to_string(),
+            summary: String::new(),
+            target_refs: vec![],
+            suggested_action: "fix_chunk".to_string(),
+            severity: "warn".to_string(),
+            metric: Some(doc! { "name": "x", "value": value }),
+        };
+        let mut cards = vec![
+            card("nan", Bson::Double(f64::NAN)),
+            card("normal", Bson::Int64(5)),
+        ];
+        cards.sort_by(compare_digest_cards);
+        assert_eq!(cards.len(), 2, "排序不得 panic，也不得丢卡片");
+        assert_eq!(
+            cards[0].title, "normal",
+            "NaN 按 f64::MIN 处理，必须排在有效指标之后"
         );
     }
 
