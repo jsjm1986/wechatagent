@@ -197,16 +197,23 @@ export function reportStatusLabel(v?: string | null): string {
   return REPORT_STATUS_LABELS[v] ?? v;
 }
 
-/// 今日 Digest 卡片类型
+/// 今日 Digest 卡片类型。
+///
+/// 键必须与后端 `src/prompts.rs` 的 `knowledge.digest.compose` 提示词枚举、
+/// 以及 `src/knowledge_digest/mod.rs` 的 `allowed_kinds` 白名单逐字一致——
+/// 该白名单会丢弃任何不在其中的 kind，故这里多写的键永远不会被命中。
+///
+/// 此前这张表的 8 个键（gap_coverage / stale_source / contested / …）与后端
+/// 7 个 kind **零重叠**，`digestCardKindLabel` 每次都落到 `?? v` 兜底分支，
+/// 界面上直接显示 `chunk_missing_field` 这类原始 snake_case 标识符。
 export const DIGEST_CARD_KIND_LABELS: Record<string, string> = {
-  gap_coverage: "知识缺口",
-  gap_signal: "知识缺口",
-  stale_source: "来源过期",
-  contested: "存在争议",
-  needs_review: "待确认",
-  quality_lint: "质量信号",
-  ingest_failure: "抓取失败",
-  follow_up: "跟进事项",
+  chunk_missing_field: "切片缺字段",
+  chunk_low_hit_rate: "命中率偏低",
+  chunk_caused_block: "触发拦截",
+  pack_outdated: "知识包过期",
+  evolution_pending: "进化待评估",
+  evolution_released: "进化已发布",
+  freeform: "其他",
 };
 export function digestCardKindLabel(v?: string | null): string {
   if (!v) return "—";
@@ -225,6 +232,66 @@ export const DIGEST_SUGGESTED_ACTION_LABELS: Record<string, string> = {
 export function digestSuggestedActionLabel(v?: string | null): string {
   if (!v) return "—";
   return DIGEST_SUGGESTED_ACTION_LABELS[v] ?? v;
+}
+
+/// Digest 卡片 metric.name → 中文。
+///
+/// 与本文件其它字典不同,`metric.name` **不是封闭枚举**:后端
+/// `knowledge_digest/mod.rs` 落库时只做数值类型转换(i64/f64),name 是 LLM
+/// 自由填写的字符串。所以这张表是**尽力而为**的翻译层,未知值回落原文
+/// (界面上曾直接显示 `missing_fields` 这类原始字段名)。
+///
+/// 键覆盖 prompt 里 4 路信号源的常见命名。LLM 可能吐 snake_case 或 camelCase,
+/// 故 `digestMetricNameLabel` 先归一再查表,两种形态都命中同一条中文。
+export const DIGEST_METRIC_NAME_LABELS: Record<string, string> = {
+  missing_fields: "缺失字段数",
+  missing_field_count: "缺失字段数",
+  hit_rate: "检索命中率",
+  low_hit_rate: "检索命中率",
+  miss_count: "检索落空次数",
+  block_count: "拦截次数",
+  blocked_runs: "拦截次数",
+  blocked_count: "拦截次数",
+  age_days: "滞留天数",
+  stale_days: "滞留天数",
+  draft_age_days: "草稿滞留天数",
+  proposal_count: "提案数",
+  eligible_proposals: "待评估提案数",
+  rolled_back_proposals: "已回滚提案数",
+  chunk_count: "切片数",
+  count: "计数",
+};
+
+/// camelCase / PascalCase / 空格 / 连字符 → snake_case,便于与上表比对。
+function normalizeMetricKey(raw: string): string {
+  return raw
+    .trim()
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .replace(/[\s-]+/g, "_")
+    .toLowerCase();
+}
+
+export function digestMetricNameLabel(v?: string | null): string {
+  if (!v) return "—";
+  return DIGEST_METRIC_NAME_LABELS[normalizeMetricKey(v)] ?? v;
+}
+
+/// Digest 卡片 targetRefs[].kind → 中文。
+///
+/// 注意两处口径不一致(已知问题,此表取并集以免任何一侧回落成原文):
+/// `prompts.rs` 给 LLM 的枚举是 `chunk|pack|proposal`,而 `models.rs`
+/// 的字段注释写的是 `chunk|pack|item|run|evolution_proposal`。
+export const DIGEST_TARGET_REF_KIND_LABELS: Record<string, string> = {
+  chunk: "切片",
+  pack: "话术包",
+  item: "条目",
+  run: "运行",
+  proposal: "进化提案",
+  evolution_proposal: "进化提案",
+};
+export function digestTargetRefKindLabel(v?: string | null): string {
+  if (!v) return "—";
+  return DIGEST_TARGET_REF_KIND_LABELS[v] ?? v;
 }
 
 /// 后台任务状态(knowledge_chat_tasks 封闭枚举)

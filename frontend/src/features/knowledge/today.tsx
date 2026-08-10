@@ -16,6 +16,7 @@ import {
   X,
 } from "lucide-react";
 import { parseApiError } from "../../lib/api";
+import { randomUuid } from "../../lib/uuid";
 import { createSseReconnector, type SseHandle } from "../../lib/useSseReconnect";
 import { LlmErrorBanner, focusChunk, loadChunkOptions } from "./shared";
 import { ChunkPicker } from "../../components/ui/ChunkRef";
@@ -23,7 +24,7 @@ import { useConfirm } from "../../components/ui/ConfirmDialog";
 import { useToast } from "../../components/ui/Toast";
 import { EmptyState } from "../../components/ui/EmptyState";
 import { useAccountStore } from "../../stores/accountStore";
-import { severityLabel, priorityLabel, originLabel, draftKindLabel, taskStatusLabel, reportStatusLabel, digestCardKindLabel, digestSuggestedActionLabel, chatIntentLabel } from "./labels";
+import { severityLabel, priorityLabel, originLabel, draftKindLabel, taskStatusLabel, reportStatusLabel, digestCardKindLabel, digestSuggestedActionLabel, digestMetricNameLabel, digestTargetRefKindLabel, chatIntentLabel } from "./labels";
 
 function withAccountScope(path: string, accountId: string): string {
   if (!accountId) return path;
@@ -699,6 +700,70 @@ function severityBadgeClass(sev: string): string {
   return `wikiDigestBadge sev-${sev}`;
 }
 
+/** 从后端 generatedAt 里裁出 HH:MM。
+ *
+ *  后端给的是 `2026-08-10 9:02:11.81 +00:00:00` 这类原始串，整串直插界面会
+ *  重复日期（前面已有 reportDate）、还把毫秒和 `+00:00:00` 时区后缀暴露给运营。
+ *  这里只做字符串裁剪、不 new Date()：该串不是合法 ISO8601（空格分隔 + 三段时区），
+ *  Safari 下 Date 解析会得到 Invalid Date。裁不出来就返回 null，由调用方回退显示原值，
+ *  宁可难看也不显示错误时间。 */
+export function digestGeneratedClock(raw?: string | null): string | null {
+  if (!raw) return null;
+  const m = /(\d{1,2}):(\d{2})/.exec(raw);
+  if (!m) return null;
+  return `${m[1].padStart(2, "0")}:${m[2]}`;
+}
+
+export interface DigestTargetRefChip {
+  /** 原始 kind，仅用于 React key，不上屏。 */
+  kind: string;
+  /** 完整 id，放进 title 属性供悬停查看/复制。 */
+  id: string;
+  /** 中文类型名，如「切片」。 */
+  kindLabel: string;
+  /** 尾 6 位缩写，如 `…34567`。 */
+  shortId: string;
+}
+
+/** 卡片的 targetRefs → 去重后的渲染用短标签（最多 3 条，超出的丢弃）。
+ *
+ *  **为什么必须渲染**：`cardId` 由
+ *  `(account_id, report_date, kind, target_refs, title)` 派生（后端
+ *  `knowledge_digest/mod.rs::stable_card_id`）。两张 kind/title 完全相同的卡片能
+ *  同时存在，恰恰证明它们的 `target_refs` 不同——指向不同切片。此前前端只在 TS
+ *  类型里声明 `targetRefs` 却从不上屏，运营看到两张一模一样的卡，无从判断该勾哪
+ *  张、勾了会动哪条知识。
+ *
+ *  只取 id 尾 6 位：ObjectId 是 24 位 hex，前 8 位是秒级时间戳，同一批生成的卡片
+ *  高度重复，差异集中在尾部的计数器段。尾部足以区分，又不会把卡片撑爆；完整 id
+ *  仍通过 `title` 属性可查。 */
+export function digestTargetRefLabels(
+  refs?: Array<Record<string, unknown>>,
+): DigestTargetRefChip[] {
+  if (!refs || refs.length === 0) return [];
+  const seen = new Set<string>();
+  const chips: DigestTargetRefChip[] = [];
+  for (const ref of refs) {
+    const id = typeof ref.id === "string" ? ref.id.trim() : "";
+    if (!id) continue;
+    const kind = typeof ref.kind === "string" ? ref.kind : "";
+    const dedupeKey = `${kind}:${id}`;
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+    const kindLabel = digestTargetRefKindLabel(kind);
+    chips.push({
+      kind,
+      id,
+      // kind 缺失时 digestTargetRefKindLabel 返回 "—"，那个破折号单独挂在 id 前
+      // 只是噪声，置空让 CSS 的 gap 自然收拢。
+      kindLabel: kindLabel === "—" ? "" : kindLabel,
+      shortId: id.length > 6 ? `…${id.slice(-6)}` : id,
+    });
+    if (chips.length >= 3) break;
+  }
+  return chips;
+}
+
 export function DigestCanvas() {
   const accountId = useAccountStore((state) => state.currentAccountId());
   const [report, setReport] = useState<DigestReportView | null>(null);
@@ -750,7 +815,9 @@ export function DigestCanvas() {
     setDispatchingBatch(true);
     setError(null);
     try {
-      const sessionId = crypto.randomUUID();
+      // 必须走 randomUuid()：裸 crypto.randomUUID 在非安全上下文（生产是
+      // HTTP + IP）是 undefined，此处会抛 TypeError，派工请求根本发不出去。
+      const sessionId = randomUuid();
       const r = await fetch("/api/knowledge/chat/tasks", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -856,25 +923,61 @@ export function DigestCanvas() {
   return (
     <div className="wikiDigestCanvas">
       <div className="wikiDigestHead">
-        <div>
+        <div className="wikiDigestHeadText">
           <h3>今日摘要</h3>
+          {/* 日期只出现一次：generatedAt 已裁到 HH:MM，与前面的 reportDate 互补
+              而不重复。裁不出时钟段时才回退显示原值。 */}
           <span className="wikiDigestMeta">
-            {report?.reportDate ?? "—"} · {reportStatusLabel(report?.status)} · 生成于 {report?.generatedAt ?? "—"}
+            {report?.reportDate ?? "—"}
+            <span className="wikiDigestMetaDot" aria-hidden="true">·</span>
+            {reportStatusLabel(report?.status)}
+            {report?.generatedAt ? (
+              <>
+                <span className="wikiDigestMetaDot" aria-hidden="true">·</span>
+                {digestGeneratedClock(report.generatedAt)
+                  ? `${digestGeneratedClock(report.generatedAt)} 生成`
+                  : `生成于 ${report.generatedAt}`}
+              </>
+            ) : null}
+            {visibleCards.length > 0 ? (
+              <>
+                <span className="wikiDigestMetaDot" aria-hidden="true">·</span>
+                {`${visibleCards.length} 张待办`}
+              </>
+            ) : null}
           </span>
         </div>
+        {/* 按钮层级：只有「批量派工」是主操作（蓝底）。原先它与「强制重算」都是
+            primary，两个蓝底并排互相争抢，而重算是低频的补救动作、刷新更是次要。
+            现在重算降为次级描边按钮，与刷新同级。 */}
         <div className="wikiDigestActions">
           <button type="button" onClick={() => void load()} disabled={pending}>
             <RefreshCw size={14} /> {pending ? "刷新中…" : "刷新"}
           </button>
-          <button type="button" className="primary" onClick={() => void regenerate()} disabled={regen}>
+          <button type="button" onClick={() => void regenerate()} disabled={regen}>
             <Sparkles size={14} /> {regen ? "重算中…" : "强制重算"}
           </button>
-          <button type="button" className="primary" onClick={() => void dispatchSelected()} disabled={dispatchingBatch || selected.size === 0}>
+          <button
+            type="button"
+            className="primary"
+            onClick={() => void dispatchSelected()}
+            disabled={dispatchingBatch || selected.size === 0}
+          >
             {dispatchingBatch ? "派工中…" : `批量派工（${selected.size}）`}
           </button>
         </div>
       </div>
-      {error ? <LlmErrorBanner error={error} onRetry={() => void load()} retrying={pending} /> : null}
+      {/* onRetry 绑的是 load()——重新拉取今日摘要，**不是**重发派工。所以本地故障
+          （kind=client_error，如派工前的浏览器端异常）时按钮必须写「重新加载」而非
+          「AI 重试」：后者会让运营以为派工已经又发了一遍，而实际上什么都没发出去。 */}
+      {error ? (
+        <LlmErrorBanner
+          error={error}
+          onRetry={() => void load()}
+          retrying={pending}
+          retryActionLabel="重新加载"
+        />
+      ) : null}
       {!error && report?.latestAttemptStatus && report.latestAttemptStatus !== "ok" ? (
         <div className="wikiBannerError" role="alert">
           最近重算{report.latestAttemptStatus === "running" ? "仍在进行" : "未成功"}
@@ -890,40 +993,73 @@ export function DigestCanvas() {
         />
       ) : null}
       <div className="wikiDigestGrid">
-        {visibleCards.map((card) => (
-          <article className={`wikiDigestCard sev-${card.severity}`} key={card.cardId}>
+        {visibleCards.map((card) => {
+          const refs = digestTargetRefLabels(card.targetRefs);
+          return (
+          <article
+            className={`wikiDigestCard sev-${card.severity}${selected.has(card.cardId) ? " is-selected" : ""}`}
+            key={card.cardId}
+          >
             <div className="wikiDigestCardHead">
-              <input
-                type="checkbox"
-                checked={selected.has(card.cardId)}
-                onChange={() => toggleSelect(card.cardId)}
-                disabled={card.suggestedAction === "freeform"}
-                aria-label={`选择卡片 ${card.title}`}
-              />
+              {/* 复选框包在 label 里：原先是裸 input，只有 13px 的方块可点，
+                  且与右侧徽章基线对不齐。包起来后整个「勾选区」都是热区。
+                  aria-label 必须保留在 input 上（批量派工用例按无障碍名定位它）。 */}
+              <label className="wikiDigestPick">
+                <input
+                  type="checkbox"
+                  checked={selected.has(card.cardId)}
+                  onChange={() => toggleSelect(card.cardId)}
+                  disabled={card.suggestedAction === "freeform"}
+                  aria-label={`选择卡片 ${card.title}`}
+                />
+              </label>
               <span className={severityBadgeClass(card.severity)}>{severityLabel(card.severity)}</span>
               <span className="wikiDigestKind">{digestCardKindLabel(card.kind)}</span>
             </div>
             <h4 className="wikiDigestTitle">{card.title}</h4>
             <p className="wikiDigestSummary">{card.summary}</p>
+            {/* 目标对象必须显式渲染。cardId 由 (kind, target_refs, title) 派生，
+                所以两张 kind/title 相同的卡片一定指向**不同**切片；此前 targetRefs
+                只在 TS 类型里声明、从不上屏，运营看到两张完全一样的卡，无从判断
+                该勾哪张、勾了会动哪条知识。 */}
+            {refs.length > 0 ? (
+              <div className="wikiDigestRefs">
+                {refs.map((ref) => (
+                  <span className="wikiDigestRef" key={`${ref.kind}:${ref.id}`} title={`${ref.kindLabel} ${ref.id}`}>
+                    <span className="wikiDigestRefKind">{ref.kindLabel}</span>
+                    <span className="wikiDigestRefId">{ref.shortId}</span>
+                  </span>
+                ))}
+              </div>
+            ) : null}
             {card.metric && card.metric.name ? (
               <div className="wikiDigestMetric">
-                {card.metric.name}：{card.metric.value ?? "—"}
-                {card.metric.threshold !== undefined ? ` / 阈值 ${card.metric.threshold}` : ""}
+                <span className="wikiDigestMetricName">{digestMetricNameLabel(card.metric.name)}</span>
+                <span className="wikiDigestMetricValue">{card.metric.value ?? "—"}</span>
+                {/* 阈值 0 不渲染：`threshold !== undefined` 会让「阈值 0」上屏，而
+                    「缺字段数 2 · 阈值 0」对运营零信息量——阈值 0 的语义是「只要有就算
+                    问题」，此时根本不存在需要对比的门线。同理排除 null。 */}
+                {typeof card.metric.threshold === "number" && card.metric.threshold !== 0 ? (
+                  <span className="wikiDigestMetricThreshold">阈值 {card.metric.threshold}</span>
+                ) : null}
               </div>
             ) : null}
             <div className="wikiDigestCardFoot">
-              <span className="wikiDigestAction">建议：{digestSuggestedActionLabel(card.suggestedAction)}</span>
+              <span className="wikiDigestAction">
+                {digestSuggestedActionLabel(card.suggestedAction)}
+              </span>
               <button
                 type="button"
                 className="wikiDigestDismiss"
                 onClick={() => void dismiss(card.cardId)}
                 disabled={dismissing.has(card.cardId)}
               >
-                <X size={12} /> 忽略
+                {dismissing.has(card.cardId) ? "忽略中…" : "忽略"}
               </button>
             </div>
           </article>
-        ))}
+          );
+        })}
       </div>
     </div>
   );
@@ -1293,10 +1429,12 @@ export function TaskRail() {
           ) : null}
         </div>
       ) : (
-        <EmptyState
-          title="暂无跟踪任务"
-          hint="在「AI 协作」里派发长任务后，可在此输入任务编号跟踪进度。"
-        />
+        /* 不用共享 <EmptyState/>：它是为主区设计的（28px 图标 + 虚线框 + 28px 内边距），
+           塞进 200px 的左栏只剩 ~184px 可用宽，图标和虚线框把两行提示挤成四行，
+           比「没有内容」这件事本身还显眼。这里用一行小字说明即可。 */
+        <p className="wikiTaskRailEmpty">
+          在「AI 协作」里派发长任务后，可在此跟踪进度。
+        </p>
       )}
     </aside>
   );
