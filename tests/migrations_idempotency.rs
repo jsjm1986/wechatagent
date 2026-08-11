@@ -29,13 +29,18 @@ fn destructive_probe<'a>(
 #[ignore]
 async fn run_is_idempotent_across_reruns() {
     let app = common::TestApp::start().await;
+    let migration_ids = wechatagent::db::migrations::MIGRATIONS
+        .iter()
+        .map(|migration| migration.id)
+        .collect::<Vec<_>>();
 
-    // 启动链路已执行全部迁移，每条留一行账。
+    // The collection also stores durable workspace-template initialization markers. Count only
+    // registered migration IDs when validating the migration runner's one-row-per-step ledger.
     let count = app
         .state
         .db
         .migrations()
-        .count_documents(doc! {}, None)
+        .count_documents(doc! { "_id": { "$in": &migration_ids } }, None)
         .await
         .expect("count migrations");
     assert_eq!(
@@ -52,7 +57,7 @@ async fn run_is_idempotent_across_reruns() {
         .state
         .db
         .migrations()
-        .count_documents(doc! {}, None)
+        .count_documents(doc! { "_id": { "$in": &migration_ids } }, None)
         .await
         .expect("count migrations after rerun");
     assert_eq!(

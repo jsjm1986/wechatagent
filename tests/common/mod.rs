@@ -770,6 +770,84 @@ pub async fn wait_for_outbox_processed(
     );
 }
 
+/// Run the durable analytical projection for the newest decision of one contact and wait until
+/// it reaches `completed`. Delivery tests can assert Outbox state before calling this helper;
+/// profile, taxonomy, and memory tests call it before asserting eventual projection effects.
+pub async fn complete_latest_post_decision(
+    app: &TestApp,
+    workspace_id: &str,
+    account_id: &str,
+    contact_wxid: &str,
+    projection: Value,
+) -> String {
+    use mongodb::options::FindOneOptions;
+
+    let reviews = app
+        .state
+        .db
+        .decision_reviews()
+        .clone_with_type::<Document>();
+    let review = reviews
+        .find_one(
+            doc! {
+                "workspace_id": workspace_id,
+                "account_id": account_id,
+                "contact_wxid": contact_wxid,
+                "post_decision_status": "pending",
+            },
+            FindOneOptions::builder()
+                .sort(doc! { "created_at": -1_i32, "_id": -1_i32 })
+                .build(),
+        )
+        .await
+        .expect("find pending post-decision projection")
+        .expect("pending post-decision projection exists");
+    let review_id = review
+        .get_object_id("_id")
+        .expect("post-decision review ObjectId");
+    let run_id = review
+        .get_str("run_id")
+        .expect("post-decision review run_id")
+        .to_string();
+
+    app.llm.push_response(projection);
+    let worker = tokio::spawn(wechatagent::agent::run_post_decision_worker(
+        app.state.clone(),
+    ));
+    let started = std::time::Instant::now();
+    let timeout = Duration::from_secs(20);
+    let final_status = loop {
+        let current = reviews
+            .find_one(doc! { "_id": review_id }, None)
+            .await
+            .expect("poll post-decision review")
+            .expect("post-decision review remains present");
+        let status = current
+            .get_str("post_decision_status")
+            .unwrap_or("missing")
+            .to_string();
+        if matches!(
+            status.as_str(),
+            "completed" | "failed_terminal" | "discarded"
+        ) {
+            break (status, current);
+        }
+        assert!(
+            started.elapsed() < timeout,
+            "post-decision projection timed out in status {status}: {current:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    worker.abort();
+    let _ = worker.await;
+    assert_eq!(
+        final_status.0, "completed",
+        "post-decision projection failed: {:?}",
+        final_status.1
+    );
+    run_id
+}
+
 /// 与 [`wait_for_outbox_processed`] 同语义，但按 `run_id` 字符串字段查 outbox 行。
 ///
 /// W6 / Task 7.4（R0.7 / R13.10）：happy_path_run 集成测试在调用 `handle_managed_message`

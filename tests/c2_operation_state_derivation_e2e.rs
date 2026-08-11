@@ -189,6 +189,28 @@ async fn reload_operation_state(app: &common::TestApp, contact: &Contact) -> Opt
         .operation_state
 }
 
+async fn complete_stage_projection(
+    app: &common::TestApp,
+    contact: &Contact,
+    customer_stage: &str,
+    evidence_turns: Vec<i32>,
+    explicit_intent: bool,
+) {
+    common::complete_latest_post_decision(
+        app,
+        &contact.workspace_id,
+        &contact.account_id,
+        &contact.wxid,
+        json!({
+            "customerStage": customer_stage,
+            "domainSignals": { "customer_stage": customer_stage },
+            "stageEvidenceTurns": evidence_turns,
+            "stageExplicitIntent": explicit_intent,
+        }),
+    )
+    .await;
+}
+
 /// 用例 1：**合法迁移 + synced_state 优先级**。
 ///
 /// - 旧态 `new_contact`；
@@ -239,58 +261,7 @@ async fn normal_transition_uses_customer_stage_over_operation_state() {
         3,
         "空知识库 happy path：Reply ×1 + Review ×1 + ClaimGate ×1 = 3 次 LLM 调用"
     );
-
-    // [诊断] 打印落库后的 contact 关键字段，定位 customer_stage 是否进了 domain_attributes
-    // 以及 operation_state 实际值——区分「容器丢键」vs「C2 派生块本身回落」。
-    {
-        let reloaded = app
-            .state
-            .db
-            .contacts()
-            .find_one(doc! { "_id": contact.id }, None)
-            .await
-            .expect("query")
-            .expect("contact");
-        // [诊断2] gateway 用 load_active_domain_profile 读 active profile 决定 declared_dims；
-        // 若它返回的不是 DEFAULT（不声明 customer_stage participates），retain 会剔除
-        // customer_stage。这里复刻同一读法，打印 profile_id + 声明维度，定位真因。
-        let active =
-            wechatagent::agent::load_active_domain_profile(&app.state.db, &contact.workspace_id)
-                .await
-                .expect("load active domain profile");
-        let declared: Vec<&str> = active
-            .profile_dimensions
-            .iter()
-            .filter(|d| d.participates_in_decision)
-            .map(|d| d.kind.as_str())
-            .collect();
-        eprintln!(
-            "[C2诊断] operation_state={:?} domain_attributes={:?} tags={:?}",
-            reloaded.operation_state, reloaded.domain_attributes, reloaded.manual_tags
-        );
-        // [诊断3] customer_stage 是 ValueSource::Taxonomy，gateway 写侧对它过
-        // validate_dimension_value：字典 miss → DropSilently → 移除键 + 写一条
-        // agent.dimension_dropped 审计事件。查这条事件是否存在，定位 customer_stage
-        // 是否在网关被字典校验丢弃（retain 已被诊断2 排除）。
-        let dropped_events = app
-            .state
-            .db
-            .events()
-            .count_documents(
-                doc! { "contact_wxid": &contact.wxid, "kind": "agent.dimension_dropped" },
-                None,
-            )
-            .await
-            .expect("count dimension_dropped");
-        eprintln!(
-            "[C2诊断3] agent.dimension_dropped 事件数={} declared_dims={:?}",
-            dropped_events, declared
-        );
-        eprintln!(
-            "[C2诊断2] active_profile_id={:?} transaction_facts={} declared_dims={:?}",
-            active.profile_id, active.transaction_facts_enabled, declared
-        );
-    }
+    complete_stage_projection(&app, &contact, "relationship_building", vec![], false).await;
 
     // 合法迁移写入 + customer_stage 优先：取 relationship_building 而非 need_discovery。
     assert_eq!(
@@ -361,6 +332,7 @@ async fn illegal_transition_keeps_old_state_and_audits_failsoft() {
         3,
         "Reply ×1 + Review ×1 + ClaimGate ×1 = 3 次 LLM 调用"
     );
+    complete_stage_projection(&app, &contact, "customer_success", vec![], false).await;
 
     // ① fail-soft 跳写：保留旧态 new_contact（既没被非法的 customer_success 覆盖，
     //    也没回落到 operationState=need_discovery——customer_stage present 时不回落）。
@@ -505,6 +477,7 @@ async fn illegal_stage_jump_keeps_old_stage_and_audits_failsoft() {
     handle_managed_message(&app.state, contact.clone(), &inbound)
         .await
         .expect("handle_managed_message ok（fail-soft：非法 stage 跳转不返回 Err）");
+    complete_stage_projection(&app, &contact, "customer_success", vec![], false).await;
 
     // ① domain_attributes.customer_stage 保留旧值 new_contact（未被写成 customer_success）。
     let reloaded = app
@@ -683,6 +656,7 @@ async fn weak_stage_evidence_drops_to_observation_not_domain_attrs() {
     handle_managed_message(&app.state, contact.clone(), &inbound)
         .await
         .expect("handle_managed_message ok");
+    complete_stage_projection(&app, &contact, "relationship_building", vec![0], false).await;
 
     // (a) 落一条 customer_stage 暂定层 observation。
     assert_eq!(
@@ -738,6 +712,7 @@ async fn strong_stage_evidence_writes_domain_attrs_not_observation() {
     handle_managed_message(&app.state, contact.clone(), &inbound)
         .await
         .expect("handle_managed_message ok");
+    complete_stage_projection(&app, &contact, "relationship_building", vec![0], true).await;
 
     // (a) 强证据实时写 domain_attributes.customer_stage。
     assert_eq!(

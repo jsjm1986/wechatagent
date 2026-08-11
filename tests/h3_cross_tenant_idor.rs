@@ -123,7 +123,7 @@ async fn activate_provider_blocks_cross_tenant_override() {
 #[tokio::test]
 #[ignore]
 async fn activate_provider_allows_own_workspace() {
-    let app = TestApp::start().await;
+    let app = TestApp::start_repl_set().await;
     let ws_a = "ws_a";
     let user_id = seed_admin_with_acl(&app, ws_a).await;
 

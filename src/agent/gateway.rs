@@ -4613,6 +4613,46 @@ fn run_user_operation_gateway_inner<'a>(
                 None,
             )
             .await?;
+        // `last_agent_run_at` is a delivery-rate-limit anchor, not an analytical projection.
+        // Advance it as soon as the complete text batch is durably authorized so another inbound
+        // cannot start a duplicate reply while the post-decision worker is still projecting the
+        // profile. Keep this write independent from the heavier profile/memory update below.
+        let authorized_at = DateTime::now();
+        match state
+            .db
+            .contacts()
+            .update_one(
+                doc! {
+                    "_id": contact.id,
+                    "workspace_id": &contact.workspace_id,
+                    "account_id": &contact.account_id,
+                    "wxid": &contact.wxid,
+                },
+                doc! {
+                    "$max": { "last_agent_run_at": authorized_at },
+                    "$set": { "updated_at": authorized_at },
+                },
+                None,
+            )
+            .await
+        {
+            Ok(result) if result.matched_count == 1 => {}
+            Ok(_) => tracing::error!(
+                %run_id,
+                workspace_id = %contact.workspace_id,
+                account_id = %contact.account_id,
+                contact_wxid = %contact.wxid,
+                "authorized reply did not find its contact for rate-limit anchoring"
+            ),
+            Err(error) => tracing::error!(
+                %error,
+                %run_id,
+                workspace_id = %contact.workspace_id,
+                account_id = %contact.account_id,
+                contact_wxid = %contact.wxid,
+                "authorized reply could not advance the rate-limit anchor"
+            ),
+        }
         super::post_decision::activate_projection(state, decision_review_id).await?;
         if let Err(error) = write_event_for_account(
             state,
