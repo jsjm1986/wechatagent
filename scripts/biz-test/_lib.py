@@ -462,6 +462,19 @@ def latest_decision_review(wxid: str) -> dict:
     return rows[0] if isinstance(rows, list) and rows else {}
 
 
+def manual_send_requires_outbox_poll(response: object) -> bool:
+    """Whether a management send result can still produce an async Outbox terminal.
+
+    Only durable acceptance states justify polling. Policy/review failures are already terminal
+    and intentionally create no Outbox; unknown shapes fail closed instead of wasting minutes or
+    accidentally encouraging a retry.
+    """
+    if not isinstance(response, dict):
+        return False
+    status = response.get("gatewayStatus", response.get("gateway_status"))
+    return status in {"outbox_enqueued", "skipped_duplicate"}
+
+
 def latest_outbox(wxid: str, limit: int = 5) -> list[dict]:
     """该 contact 最近 N 条 agent_send_outbox（media_asset_id/referral_card_id/content/status）。
 

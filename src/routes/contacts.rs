@@ -3022,7 +3022,9 @@ pub(super) async fn get_operation_health(
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
     let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
-    let memory = ensure_operating_memory(&state, &contact).await?;
+    // Observability GET must not create or seed memory rows. Missing memory is projected
+    // in-process with the same defaults used by the explicit write path.
+    let memory = super::shared::read_operating_memory(&state, &contact).await?;
     let latest_review = latest_decision_review(&state, &contact).await?;
     let (in_quiet_hours, next_wake_at, quiet_hours_enabled) =
         compute_quiet_hours_view(&state, &contact).await?;
