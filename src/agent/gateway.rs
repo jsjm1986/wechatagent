@@ -90,7 +90,7 @@ use super::taxonomy::{
 use super::types::{
     doc_bool, doc_i64, doc_string, non_empty_option, AgentDecision, AgentTrigger,
     ContactSendResult, DecisionReviewResult, KnowledgeRouteResult, ManualContactSend,
-    RunPlannerResult, SendGatewayResult,
+    RunPlannerResult, SendGatewayResult, HOLD_CATEGORY_HELD_BY_AI_POLICY,
 };
 
 /// 弱启发：reply 是否含"时间相关承诺"特征。仅用于 ⑥ 观测覆盖率，不进任何门、
@@ -643,6 +643,63 @@ fn review_and_evaluate_claim_gate<'a>(
     .boxed()
 }
 
+fn concise_review_detail(value: &str, max_chars: usize) -> Option<String> {
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        return None;
+    }
+    let mut detail = normalized.chars().take(max_chars).collect::<String>();
+    if normalized.chars().count() > max_chars {
+        detail.push('…');
+    }
+    Some(detail)
+}
+
+fn normalize_manual_send_review_terminal(
+    finalize_status: &mut GatewayStatusFinal,
+    review: &mut DecisionReviewResult,
+    runtime: &UserRuntimeParameters,
+) {
+    if !matches!(finalize_status, GatewayStatusFinal::Approved) || review_passed(review, runtime) {
+        return;
+    }
+
+    // The aggregate hard-gate result may be Approved while a typed soft score still fails.
+    // Manual sends have no revision loop, so exposing `approved` here would contradict the actual
+    // terminal and could make callers poll for an Outbox row that will never exist.
+    *finalize_status = GatewayStatusFinal::Held(HOLD_CATEGORY_HELD_BY_AI_POLICY.to_string());
+    review.should_hold = true;
+    review.hold_category = HOLD_CATEGORY_HELD_BY_AI_POLICY.to_string();
+    review.final_review_status = HOLD_CATEGORY_HELD_BY_AI_POLICY.to_string();
+    if review.hold_reason.trim().is_empty() {
+        review.hold_reason = if !review.approved {
+            "评审未批准候选文案，请按评审建议调整后重试".to_string()
+        } else {
+            "候选文案的结构化质量评分未达到发送阈值，请调整表达或补充可信上下文".to_string()
+        };
+    }
+}
+
+fn manual_send_block_reason(status: &str, review: &DecisionReviewResult) -> String {
+    let generic = match status {
+        "blocked_unverified_product_claim" => {
+            "知识校验未通过：文案涉及未核实的产品事实，请先核验知识或移除相关说法"
+        }
+        "blocked_by_required_field" => "发送信息不完整或格式不合法，请补齐后重试",
+        "blocked_by_budget" => "本次运行预算已耗尽，请稍后重试或缩短任务内容",
+        "blocked_by_safety_guard" => "安全边界检查未通过，请调整文案后重试",
+        "ai_waiting_for_more_context" => "上下文不足，暂不发送；请补充客户背景或发送目的",
+        "held_by_ai_policy" => "AI 策略暂缓发送，请调整文案或补充上下文后重试",
+        _ => "生产发送网关安全门拦截本次发送，请查看决策评审后调整",
+    };
+    // These are structured reviewer summaries intended for operator diagnostics. Keep them
+    // bounded and single-line; never expose prompts, chain-of-thought, or full review JSON.
+    concise_review_detail(&review.hold_reason, 160)
+        .or_else(|| concise_review_detail(&review.review_summary, 160))
+        .map(|detail| format!("{generic}。评审摘要：{detail}"))
+        .unwrap_or_else(|| generic.to_string())
+}
+
 async fn send_contact_message_gateway_inner(
     state: &AppState,
     contact: Contact,
@@ -837,14 +894,15 @@ async fn send_contact_message_gateway_inner(
         )
         .await?;
     }
-    let passed =
-        matches!(finalize_status, GatewayStatusFinal::Approved) && review_passed(&review, &runtime);
+    normalize_manual_send_review_terminal(&mut finalize_status, &mut review, &runtime);
+    let passed = matches!(finalize_status, GatewayStatusFinal::Approved);
     if !passed {
         let blocked_status = finalize_status.gateway_status_str();
+        let blocked_reason = manual_send_block_reason(&blocked_status, &review);
         let blocked_result = SendGatewayResult {
             allowed: false,
             status: blocked_status.clone(),
-            reason: "生产发送网关安全门拦截本次发送".to_string(),
+            reason: blocked_reason.clone(),
             policy_blocks: vec![blocked_status.clone()],
             run_mode: "live".to_string(),
             message_id: None,
@@ -907,7 +965,7 @@ async fn send_contact_message_gateway_inner(
             message_id: None,
             review_approved: false,
             gateway_status: blocked_status.clone(),
-            gateway_reason: "生产发送网关安全门拦截本次发送".to_string(),
+            gateway_reason: blocked_reason,
             decision_review_id: Some(review_id.to_hex()),
         });
     }
@@ -7621,6 +7679,62 @@ mod send_receipt_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn manual_send_block_reason_is_actionable_and_bounded() {
+        let review = DecisionReviewResult {
+            hold_reason: "  缺少客户对本次触达的明确上下文  ".to_string(),
+            ..Default::default()
+        };
+        let reason = manual_send_block_reason("held_by_ai_policy", &review);
+        assert!(reason.contains("调整文案或补充上下文"));
+        assert!(reason.contains("缺少客户对本次触达的明确上下文"));
+        assert!(!reason.contains("  "));
+    }
+
+    #[test]
+    fn manual_send_block_reason_maps_hard_gates_without_review_detail() {
+        let reason = manual_send_block_reason(
+            "blocked_unverified_product_claim",
+            &DecisionReviewResult::default(),
+        );
+        assert!(reason.contains("未核实的产品事实"));
+        assert!(!reason.contains("评审摘要"));
+    }
+
+    #[test]
+    fn manual_send_soft_failure_never_exposes_approved_terminal() {
+        let runtime = UserRuntimeParameters::default();
+        let mut review = DecisionReviewResult {
+            approved: false,
+            final_review_status: "approved".to_string(),
+            ..Default::default()
+        };
+        let mut status = GatewayStatusFinal::Approved;
+
+        normalize_manual_send_review_terminal(&mut status, &mut review, &runtime);
+
+        assert_eq!(
+            status,
+            GatewayStatusFinal::Held(HOLD_CATEGORY_HELD_BY_AI_POLICY.to_string())
+        );
+        assert!(review.should_hold);
+        assert_eq!(review.hold_category, HOLD_CATEGORY_HELD_BY_AI_POLICY);
+        assert_eq!(review.final_review_status, HOLD_CATEGORY_HELD_BY_AI_POLICY);
+        assert!(review.hold_reason.contains("评审未批准"));
+    }
+
+    #[test]
+    fn manual_send_hard_failure_status_is_preserved() {
+        let runtime = UserRuntimeParameters::default();
+        let mut review = DecisionReviewResult::default();
+        let mut status = GatewayStatusFinal::BlockedBySafetyGuard;
+
+        normalize_manual_send_review_terminal(&mut status, &mut review, &runtime);
+
+        assert_eq!(status, GatewayStatusFinal::BlockedBySafetyGuard);
+        assert!(!review.should_hold);
+    }
+
     use super::*;
 
     #[test]

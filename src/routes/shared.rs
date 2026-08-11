@@ -341,63 +341,32 @@ fn contact_identity_patch(contact_value: &Value) -> Document {
     patch
 }
 
-pub(super) async fn ensure_operating_memory(
-    state: &AppState,
+fn seed_operating_memory_projection(
+    memory: &mut OperatingMemory,
     contact: &Contact,
-) -> AppResult<OperatingMemory> {
-    // H13：种子记忆卡无 operation_state 时回落状态机初始态（替代写死 "new_contact"）。
-    let initial_state = agent::initial_operation_state_for_contact(state, contact).await?;
-    if let Some(mut memory) = state
-        .db
-        .operating_memories()
-        .find_one(
-            doc! {
-                "workspace_id": &contact.workspace_id,
-                "account_id": &contact.account_id,
-                "contact_wxid": &contact.wxid
-            },
-            None,
-        )
-        .await?
-    {
-        if !agent::memory_card_has_signal(&effective_route_memory_card_typed(&memory)) {
-            let seeded = agent::effective_memory_card_for_contact(&memory, contact, &initial_state);
-            if agent::memory_card_has_signal(&seeded) {
-                let updated_at = DateTime::now();
-                memory.memory_card_version = memory.memory_card_version.saturating_add(1);
-                let mut seeded_with_version = seeded;
-                seeded_with_version
-                    .extra
-                    .insert("version", memory.memory_card_version);
-                let seeded_doc =
-                    mongodb::bson::to_document(&seeded_with_version).unwrap_or_default();
-                memory.memory_card = seeded_with_version;
-                memory.memory_card_updated_at = Some(updated_at);
-                memory.updated_at = updated_at;
-                state
-                    .db
-                    .operating_memories()
-                    .update_one(
-                        doc! {
-                            "workspace_id": &contact.workspace_id,
-                            "account_id": &contact.account_id,
-                            "contact_wxid": &contact.wxid
-                        },
-                        doc! {
-                            "$set": {
-                                "memory_card": seeded_doc,
-                                "memory_card_version": memory.memory_card_version,
-                                "memory_card_updated_at": updated_at,
-                                "updated_at": updated_at
-                            }
-                        },
-                        None,
-                    )
-                    .await?;
-            }
-        }
-        return Ok(memory);
+    initial_state: &str,
+    now: DateTime,
+) -> bool {
+    if agent::memory_card_has_signal(&effective_route_memory_card_typed(memory)) {
+        return false;
     }
+    let mut seeded = agent::effective_memory_card_for_contact(memory, contact, initial_state);
+    if !agent::memory_card_has_signal(&seeded) {
+        return false;
+    }
+    memory.memory_card_version = memory.memory_card_version.saturating_add(1);
+    seeded.extra.insert("version", memory.memory_card_version);
+    memory.memory_card = seeded;
+    memory.memory_card_updated_at = Some(now);
+    memory.updated_at = now;
+    true
+}
+
+fn new_operating_memory_projection(
+    contact: &Contact,
+    initial_state: &str,
+    now: DateTime,
+) -> OperatingMemory {
     let mut memory = OperatingMemory {
         id: None,
         workspace_id: contact.workspace_id.clone(),
@@ -451,31 +420,88 @@ pub(super) async fn ensure_operating_memory(
         },
         context_pack_version: 0,
         context_pack_updated_at: None,
-        // task 6.1：`memory_card` 现在是 `MemoryCardTyped`；构造时先用空容器，
-        // 紧随其后的 `effective_memory_card_for_contact` 会把 Document 形态
-        // 的种子卡通过 `MemoryCardTyped::from_document` 灌入。
         memory_card: MemoryCardTyped::default(),
         memory_card_version: 0,
         memory_card_updated_at: None,
-        created_at: DateTime::now(),
-        updated_at: DateTime::now(),
+        created_at: now,
+        updated_at: now,
     };
-    let mut seeded_typed =
-        agent::effective_memory_card_for_contact(&memory, contact, &initial_state);
-    memory.memory_card_version = if agent::memory_card_has_signal(&seeded_typed) {
-        1
-    } else {
-        0
+    seed_operating_memory_projection(&mut memory, contact, initial_state, now);
+    memory
+}
+
+/// Read-only projection used by observability endpoints.
+///
+/// Unlike [`ensure_operating_memory`], this function never writes. Missing rows and legacy rows
+/// with an unseeded card are projected in-process with the same defaults used by the explicit
+/// write path, preserving the response contract without turning GET into a mutation.
+pub(super) async fn read_operating_memory(
+    state: &AppState,
+    contact: &Contact,
+) -> AppResult<OperatingMemory> {
+    let initial_state = agent::initial_operation_state_for_contact(state, contact).await?;
+    let filter = doc! {
+        "workspace_id": &contact.workspace_id,
+        "account_id": &contact.account_id,
+        "contact_wxid": &contact.wxid
     };
-    seeded_typed
-        .extra
-        .insert("version", memory.memory_card_version);
-    memory.memory_card = seeded_typed;
-    memory.memory_card_updated_at = if memory.memory_card_version > 0 {
-        Some(DateTime::now())
-    } else {
-        None
-    };
+    if let Some(mut memory) = state.db.operating_memories().find_one(filter, None).await? {
+        seed_operating_memory_projection(&mut memory, contact, &initial_state, DateTime::now());
+        return Ok(memory);
+    }
+    Ok(new_operating_memory_projection(
+        contact,
+        &initial_state,
+        DateTime::now(),
+    ))
+}
+
+pub(super) async fn ensure_operating_memory(
+    state: &AppState,
+    contact: &Contact,
+) -> AppResult<OperatingMemory> {
+    // H13：种子记忆卡无 operation_state 时回落状态机初始态（替代写死 "new_contact"）。
+    let initial_state = agent::initial_operation_state_for_contact(state, contact).await?;
+    if let Some(mut memory) = state
+        .db
+        .operating_memories()
+        .find_one(
+            doc! {
+                "workspace_id": &contact.workspace_id,
+                "account_id": &contact.account_id,
+                "contact_wxid": &contact.wxid
+            },
+            None,
+        )
+        .await?
+    {
+        let updated_at = DateTime::now();
+        if seed_operating_memory_projection(&mut memory, contact, &initial_state, updated_at) {
+            let seeded_doc = mongodb::bson::to_document(&memory.memory_card).unwrap_or_default();
+            state
+                .db
+                .operating_memories()
+                .update_one(
+                    doc! {
+                        "workspace_id": &contact.workspace_id,
+                        "account_id": &contact.account_id,
+                        "contact_wxid": &contact.wxid
+                    },
+                    doc! {
+                        "$set": {
+                            "memory_card": seeded_doc,
+                            "memory_card_version": memory.memory_card_version,
+                            "memory_card_updated_at": updated_at,
+                            "updated_at": updated_at
+                        }
+                    },
+                    None,
+                )
+                .await?;
+        }
+        return Ok(memory);
+    }
+    let memory = new_operating_memory_projection(contact, &initial_state, DateTime::now());
     state
         .db
         .operating_memories()
@@ -2520,7 +2546,7 @@ mod tests {
     /// 让 3 个 review-derived score 非零;键集对 Some/None 不变。
     #[test]
     fn operation_health_json_matches_contract_fixture() {
-        use super::operation_health_json;
+        use super::{new_operating_memory_projection, operation_health_json};
         use crate::models::{
             AgentDecisionReview, AgentStatus, Contact, MemoryCardTyped, OperatingMemory,
         };
@@ -2576,6 +2602,25 @@ mod tests {
             created_at: DateTime::from_millis(1_699_000_000_000),
             updated_at: DateTime::from_millis(1_700_000_100_000),
         };
+
+        // A missing row is projected entirely in memory. Keep this pure constructor aligned
+        // with the explicit ensure/write path without requiring a Mongo-backed route test.
+        let projected_missing = new_operating_memory_projection(
+            &contact,
+            "new_contact",
+            DateTime::from_millis(1_700_000_050_000),
+        );
+        assert!(projected_missing.id.is_none());
+        assert_eq!(projected_missing.workspace_id, "ws-1");
+        assert_eq!(projected_missing.account_id, "acc-1");
+        assert_eq!(projected_missing.contact_wxid, "wxid_abc");
+        assert_eq!(projected_missing.context_pack_version, 0);
+        assert_eq!(
+            projected_missing.memory_card_version,
+            i32::from(crate::agent::memory_card_has_signal(
+                &projected_missing.memory_card
+            ))
+        );
 
         let memory = OperatingMemory {
             id: Some(ObjectId::parse_str("64a1f2c3e4b5a697889c0002").unwrap()),

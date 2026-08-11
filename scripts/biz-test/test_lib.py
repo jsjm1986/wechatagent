@@ -29,6 +29,22 @@ class WebhookSigningTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "exit code 2"):
                 lib.mongo("print(1)")
 
+    def test_manual_send_polling_stops_on_policy_terminal(self) -> None:
+        self.assertFalse(
+            lib.manual_send_requires_outbox_poll(
+                {"gatewayStatus": "held_by_ai_policy", "reviewApproved": False}
+            )
+        )
+        self.assertFalse(lib.manual_send_requires_outbox_poll({"unexpected": True}))
+
+    def test_manual_send_polling_continues_only_after_durable_acceptance(self) -> None:
+        self.assertTrue(
+            lib.manual_send_requires_outbox_poll({"gatewayStatus": "outbox_enqueued"})
+        )
+        self.assertTrue(
+            lib.manual_send_requires_outbox_poll({"gateway_status": "skipped_duplicate"})
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
