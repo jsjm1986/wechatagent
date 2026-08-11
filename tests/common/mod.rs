@@ -25,8 +25,76 @@ use std::time::Duration;
 use async_trait::async_trait;
 use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
 use serde_json::Value;
-use testcontainers::ContainerAsync;
-use testcontainers_modules::mongo::Mongo;
+use testcontainers::{
+    core::{CmdWaitFor, ExecCommand, WaitFor},
+    ContainerAsync, Image,
+};
+
+#[derive(Default, Debug, Clone)]
+enum MongoInstanceKind {
+    #[default]
+    Standalone,
+    ReplSet,
+}
+
+/// Minimal Mongo image used by the shared integration fixture.
+///
+/// Keeping this local avoids coupling the entire test suite to the community modules crate while
+/// preserving its standalone and replica-set startup behavior byte-for-byte.
+#[derive(Default, Debug, Clone)]
+struct TestMongo {
+    kind: MongoInstanceKind,
+}
+
+impl TestMongo {
+    fn repl_set() -> Self {
+        Self {
+            kind: MongoInstanceKind::ReplSet,
+        }
+    }
+}
+
+impl Image for TestMongo {
+    fn name(&self) -> &str {
+        "mongo"
+    }
+
+    fn tag(&self) -> &str {
+        "5.0.6"
+    }
+
+    fn ready_conditions(&self) -> Vec<WaitFor> {
+        vec![WaitFor::message_on_stdout("Waiting for connections")]
+    }
+
+    fn cmd(&self) -> impl IntoIterator<Item = impl Into<std::borrow::Cow<'_, str>>> {
+        match self.kind {
+            MongoInstanceKind::Standalone => Vec::<String>::new(),
+            MongoInstanceKind::ReplSet => vec!["--replSet".to_string(), "rs".to_string()],
+        }
+    }
+
+    fn exec_after_start(
+        &self,
+        _: testcontainers::core::ContainerState,
+    ) -> Result<Vec<ExecCommand>, testcontainers::TestcontainersError> {
+        match self.kind {
+            MongoInstanceKind::Standalone => Ok(Vec::new()),
+            MongoInstanceKind::ReplSet => Ok(vec![ExecCommand::new(vec![
+                "mongosh".to_string(),
+                "--quiet".to_string(),
+                "--eval".to_string(),
+                "'rs.initiate()'".to_string(),
+            ])
+            .with_cmd_ready_condition(CmdWaitFor::message_on_stdout(
+                "Using a default configuration for the set",
+            ))
+            .with_container_ready_conditions(vec![WaitFor::message_on_stdout(
+                "Rebuilding PrimaryOnlyService due to stepUp",
+            )])]),
+        }
+    }
+}
 
 use wechatagent::config::AppConfig;
 use wechatagent::db::Database;
@@ -318,7 +386,7 @@ impl LlmProvider for TestLlmGenerator {
 pub struct TestApp {
     pub state: AppState,
     pub llm: Arc<TestLlmGenerator>,
-    _container: Option<ContainerAsync<Mongo>>,
+    _container: Option<ContainerAsync<TestMongo>>,
     external_mongo: bool,
 }
 
@@ -357,12 +425,15 @@ impl TestApp {
             (None, uri)
         } else {
             let container = if repl_set {
-                Mongo::repl_set()
+                TestMongo::repl_set()
                     .start()
                     .await
                     .expect("启动 mongo replica set 容器失败")
             } else {
-                Mongo::default().start().await.expect("启动 mongo 容器失败")
+                TestMongo::default()
+                    .start()
+                    .await
+                    .expect("启动 mongo 容器失败")
             };
             let host = container.get_host().await.expect("获取容器 host 失败");
             let port = container

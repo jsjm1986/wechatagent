@@ -335,7 +335,7 @@ async fn reaction_redline_stale_owner_cannot_overwrite_or_cancel_after_reclaim()
         record_user_reaction(
             &stale_state,
             &stale_contact,
-            &inbound(wxid, "inbound-stale", "不要再联系我"),
+            &inbound(wxid, "inbound-stale", "最近消息有点频繁，先缓一缓"),
         )
         .await
     });

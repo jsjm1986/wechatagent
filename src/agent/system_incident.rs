@@ -875,8 +875,11 @@ mod tests {
     async fn mongo_incident_concurrency_causality_and_notification_recovery() {
         use std::sync::{atomic::AtomicU64, Arc};
 
-        use testcontainers::runners::AsyncRunner;
-        use testcontainers_modules::mongo::Mongo;
+        use testcontainers::{
+            core::{IntoContainerPort, WaitFor},
+            runners::AsyncRunner,
+            GenericImage,
+        };
 
         let external_uri = std::env::var("TEST_MONGODB_URI")
             .ok()
@@ -884,7 +887,9 @@ mod tests {
         let (container, uri) = if let Some(uri) = external_uri {
             (None, uri)
         } else {
-            let container = Mongo::default()
+            let container = GenericImage::new("mongo", "5.0.6")
+                .with_exposed_port(27017.tcp())
+                .with_wait_for(WaitFor::message_on_stdout("Waiting for connections"))
                 .start()
                 .await
                 .expect("start Mongo test container");

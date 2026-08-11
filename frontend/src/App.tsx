@@ -8,9 +8,6 @@ import { useUiStore } from "./stores/uiStore";
 import { useProfileStore } from "./stores/profileStore";
 import { invalidateChunks } from "./features/knowledge/chunkInvalidation";
 // 频道视图已全部迁出至 features/*；App 只保留启动引导 + 全局 chunk WebSocket。
-// 保留两个 re-export 让既有测试 `import { AutonomyOutcomesTab, formatRate } from "../App"` 继续解析。
-export { AutonomyOutcomesTab } from "./features/autonomy";
-export { formatRate } from "./lib/format";
 
 // `useChunkEventStream` 在 App 顶层挂一次：连 ws://.../api/ws/chunks，把后端
 // 推下来的 ChunkEvent 转成两类 window CustomEvent：
