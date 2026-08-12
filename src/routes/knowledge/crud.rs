@@ -828,6 +828,11 @@ pub async fn update_operation_knowledge_chunk(
         Some("legacy chunk PUT".to_string()),
     )
     .await?;
+    // 响应硬编码 draft/needs_review 是**恒真投影**而非省事：本 PUT 的 patch 无条件
+    // 含 `title`（上方 :796），而 title ∈ REVIEW_SENSITIVE_PATCH_FIELDS
+    // （chunk_revisions.rs），故 `chunk_patch_requires_review(Patch, …)` 恒 true →
+    // harness `apply_server_owned_lifecycle` 恒把本次编辑压回 draft + needs_review
+    // （Human 编辑同样打回，已 verified 的 chunk 也不例外）。落库结果不可能是其它值。
     Ok(Json(json!({
         "ok": true,
         "revisionId": applied.revision_id,
