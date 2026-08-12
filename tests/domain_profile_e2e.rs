@@ -1468,20 +1468,25 @@ async fn e2e_activate_publishes_generated_state_machine() {
     );
 }
 
-/// 激活 generated_state_machine=None 的 profile（如 DEFAULT 销售域）→
-/// operation_domain_configs 不新增版本（字节等价回落 DEFAULT）。
+/// Activating a profile without an embedded machine explicitly restores the system default.
+/// This prevents a previously active custom industry's workspace-global machine from leaking
+/// into the default profile.
 #[tokio::test]
 #[ignore]
-async fn e2e_activate_without_machine_leaves_configs_unchanged() {
+async fn e2e_activate_without_machine_restores_default_machine() {
     let app = common::TestApp::start_repl_set().await;
     let db = app.state.db.clone();
     let ws = app.state.config.default_workspace_id.clone();
 
     db_seed_base_domain_config(&db, &ws).await;
-    let base_count = db_domain_config_count(&db, &ws).await;
-    let base_version = db_current_domain_config(&db, &ws).await.version;
+    let custom = doc! {
+        "states": [
+            { "key": "custom_intro", "name": "Custom", "initial": true, "allowedFrom": [] },
+        ]
+    };
+    activate_profile_with_machine(&app, &db, &ws, "custom-before-default", &custom).await;
+    let custom_version = db_current_domain_config(&db, &ws).await.version;
 
-    // profile 不带本体（generated_state_machine=None，db_create_profile 默认 None）。
     let pid = db_create_profile(&db, &ws, "no-machine", "默认", "无状态机", "manual").await;
     db.domain_profiles()
         .update_one(
@@ -1492,24 +1497,21 @@ async fn e2e_activate_without_machine_leaves_configs_unchanged() {
         .await
         .expect("set current");
 
-    let _ = wechatagent::routes::domain_profiles::activate_domain_profile(
+    let response = wechatagent::routes::domain_profiles::activate_domain_profile(
         State(app.state.clone()),
         Extension(test_admin(&ws)),
         Path(pid.to_hex()),
     )
     .await
     .expect("activate handler ok");
+    assert_eq!(response.0["steps"]["stateMachine"]["status"], "completed");
 
-    // 断言：config 表行数、current 版本号均不变（状态机表未被触碰）。
+    let current = db_current_domain_config(&db, &ws).await;
+    assert!(current.version > custom_version);
     assert_eq!(
-        db_domain_config_count(&db, &ws).await,
-        base_count,
-        "无本体 activate 不新增 config 版本（回落 DEFAULT）"
-    );
-    assert_eq!(
-        db_current_domain_config(&db, &ws).await.version,
-        base_version,
-        "current 版本号不变"
+        current.state_machine,
+        wechatagent::prompts::default_user_operation_state_machine(),
+        "machine-less profile must restore the system default machine"
     );
 }
 
