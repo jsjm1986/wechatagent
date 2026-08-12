@@ -320,6 +320,20 @@ mod list_projection_tests {
         assert_eq!(v["decision"]["authorization_window_hours"], 24.0);
     }
 
+    /// 契约快照：固定输入 → fixture 对账
+    /// （`frontend/src/contracts/escalation_list_item.fixture.json`）。防线上形状
+    /// 漂移，尤其时间字段回退成 bson 扩展 JSON 对象（白屏事故形态）。
+    #[test]
+    fn escalation_list_item_projection_matches_contract_fixture() {
+        let entry = resolved_escalation_fixture();
+        // now = created + 1h 整，ageHours 恒为 1.0，快照稳定。
+        let projected = escalation_list_item_json(&entry, 1_700_003_600_000);
+        crate::routes::contract_snapshot::assert_contract_fixture(
+            "escalation_list_item",
+            projected,
+        );
+    }
+
     #[test]
     fn list_item_keeps_null_expiry_and_pending_shape() {
         let mut entry = resolved_escalation_fixture();
