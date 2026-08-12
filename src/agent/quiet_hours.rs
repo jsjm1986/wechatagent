@@ -15,10 +15,6 @@
 
 use chrono::Utc;
 
-/// 旧版静默时段入站任务 kind，仅用于滚动升级时读取、迁移和兼容历史测试。
-/// 新写入统一使用 `webhooks::DURABLE_INBOUND_REPLY_KIND` (`inbound_reply`)。
-pub(crate) const DEFERRED_INBOUND_REPLY_KIND: &str = "deferred_inbound_reply";
-
 /// 判定 `now_hour`（0..=23）是否落在静默时段 `[start, end)` 内。
 ///
 /// 边界语义：start 含、end 不含（hour==start 静默，hour==end 已醒来）。
@@ -239,11 +235,6 @@ mod tests {
         let now = utc_ms("2026-06-09T12:00:00Z");
         let wake = next_wake_utc_ms(now, 8, -5, 0);
         assert_eq!(wake, utc_ms("2026-06-09T13:00:00Z"));
-    }
-
-    #[test]
-    fn deferred_kind_constant_stable() {
-        assert_eq!(DEFERRED_INBOUND_REPLY_KIND, "deferred_inbound_reply");
     }
 
     #[test]

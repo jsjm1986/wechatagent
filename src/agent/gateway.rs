@@ -3654,16 +3654,10 @@ fn run_user_operation_gateway_inner<'a>(
     // / write_event 落库时显式标记 context_changed。
     let context_changed_followup_hit = match &trigger {
         AgentTrigger::FollowUp(task) => {
-            // Legacy wake tasks remain readable during rolling upgrades. They reply to accumulated
-            // inbound messages and therefore must not cancel themselves on context_changed.
-            if task.kind == crate::agent::quiet_hours::DEFERRED_INBOUND_REPLY_KIND {
-                false
-            } else {
-                let last_inbound_ms =
-                    inbound_marker_for_context_check(&contact).map(|d| d.timestamp_millis());
-                let task_created_ms = task.created_at.timestamp_millis();
-                check_context_changed_followup_pure(last_inbound_ms, task_created_ms)
-            }
+            let last_inbound_ms =
+                inbound_marker_for_context_check(&contact).map(|d| d.timestamp_millis());
+            let task_created_ms = task.created_at.timestamp_millis();
+            check_context_changed_followup_pure(last_inbound_ms, task_created_ms)
         }
         _ => false,
     };
@@ -5218,9 +5212,7 @@ pub(crate) fn trigger_message(
             message_id: None,
             dedupe_key: None,
             direction: MessageDirection::Inbound,
-            // Legacy wake-task compatibility only. New quiet-hours obligations execute as a real
-            // persisted inbound trigger; ordinary follow_up tasks retain proactive wording.
-            content: follow_up_trigger_message_text(&task.kind, &task.content),
+            content: follow_up_trigger_message_text(&task.content),
             msg_type: None,
             media_ref: None,
             raw: Some(doc! {
@@ -5257,14 +5249,6 @@ pub(crate) async fn precheck_send_gateway(
     // 主动打扰，故跳过 cooldown/operation_policy/rate_limited/daily_limit；not_managed
     // 仍保留（好友已退出运营则不应继续转述）。
     let is_relay = escalation::is_principal_relay_trigger(trigger);
-    // #69 作息门控：判定这是不是"静默时段排出的延迟被动应答"（醒来任务）。
-    // 醒来任务存在的意义就是回 task 创建后累积的客户消息，因此它**豁免** context_changed
-    // （否则会被自己要回的那些消息触发自取消），但仍受 expires_at 约束。
-    let is_deferred_wake = matches!(
-        trigger,
-        AgentTrigger::FollowUp(task)
-            if task.kind == crate::agent::quiet_hours::DEFERRED_INBOUND_REPLY_KIND
-    );
     if !is_relay {
         if let Some(cooldown_until) = contact.cooldown_until {
             if cooldown_until.timestamp_millis() > DateTime::now().timestamp_millis() {
@@ -5311,13 +5295,12 @@ pub(crate) async fn precheck_send_gateway(
         // **重排**到醒来时刻（而非 cancel——避免丢承诺/催进）。
         //
         // 仅作用于 FollowUp 主动发送：
-        // - 入站（Inbound）的静默延迟在 webhook 层已是权威（命中即排 wake task、不进流水线）；
-        //   若入站仍走到这里（仅边界跨分钟的极端情形），它无 task 可重排，放行这次"刚收到就回"
-        //   反而是对的，不该静默丢弃；
-        // - relay 转述是客户期待内的被动应答（同频控豁免语义）；
-        // - 醒来任务（is_deferred_wake）恰恰在醒来时刻跑，不应被自己触发的静默门挡回。
+        // - 入站（Inbound）的静默延迟在 webhook 层已是权威（命中即把唯一的 inbound_reply
+        //   义务任务排到醒来时刻、不进流水线），醒来后该任务仍以 Inbound 语义进网关，
+        //   天然不撞这道 FollowUp 门；若入站仍走到这里（仅边界跨分钟的极端情形），
+        //   它无 task 可重排，放行这次"刚收到就回"反而是对的，不该静默丢弃；
+        // - relay 转述是客户期待内的被动应答（同频控豁免语义）。
         if matches!(trigger, AgentTrigger::FollowUp(_))
-            && !is_deferred_wake
             && crate::agent::quiet_hours::effective_quiet_hours_enabled(
                 contact,
                 &crate::agent::domain_profile::load_active_domain_profile(
@@ -5343,15 +5326,12 @@ pub(crate) async fn precheck_send_gateway(
         // expires_at 已在作息门控前判定（见上）；此处只剩 context_changed 检查。
         // 用 last_inbound_at 判定 context_changed；老数据若 last_inbound_at 还没回填
         // （migration 未跑或回填中），降级使用 last_message_at 兼容。
-        // 醒来任务豁免：它就是要回 task 创建后累积的那些入站消息（见 is_deferred_wake）。
-        if !is_deferred_wake {
-            if let Some(last_inbound) = inbound_marker_for_context_check(contact) {
-                if last_inbound.timestamp_millis() > task.created_at.timestamp_millis() {
-                    return Ok(blocked(
-                        "context_changed",
-                        "用户在跟进任务后已有新消息，取消旧跟进",
-                    ));
-                }
+        if let Some(last_inbound) = inbound_marker_for_context_check(contact) {
+            if last_inbound.timestamp_millis() > task.created_at.timestamp_millis() {
+                return Ok(blocked(
+                    "context_changed",
+                    "用户在跟进任务后已有新消息，取消旧跟进",
+                ));
             }
         }
     }
@@ -7607,16 +7587,10 @@ pub(crate) fn check_context_changed_followup_pure(
     }
 }
 
-/// #69 作息门控：根据跟进任务 kind 选择注入 Reply Agent 的"当前消息"措辞。
-///
-/// Legacy `deferred_inbound_reply` compatibility: render it as a passive response rather than
-/// proactive outreach. New quiet-hours work uses `inbound_reply` and a persisted inbound trigger.
-pub(crate) fn follow_up_trigger_message_text(kind: &str, task_content: &str) -> String {
-    if kind == crate::agent::quiet_hours::DEFERRED_INBOUND_REPLY_KIND {
-        "你在作息时段暂未回复，客户在此期间发来了消息。现在请基于完整对话历史，自然地回应客户最近的消息。".to_string()
-    } else {
-        format!("系统跟进任务到期，请重新判断是否适合主动触达。任务内容：{task_content}")
-    }
+/// 跟进任务注入 Reply Agent 的"当前消息"措辞（主动触达语境）。
+/// 静默时段的被动应答不走这里：它以持久化 inbound 触发、走 Inbound 语义进网关。
+pub(crate) fn follow_up_trigger_message_text(task_content: &str) -> String {
+    format!("系统跟进任务到期，请重新判断是否适合主动触达。任务内容：{task_content}")
 }
 
 /// Phase A / A3：taxonomy 软闸的纯逻辑——给定 active profile 的决策维度集合、LLM
@@ -8573,26 +8547,9 @@ mod tests {
     }
 
     #[test]
-    fn deferred_wake_trigger_text_is_passive_reply_framing() {
-        // #69：醒来任务用"回应客户最近消息"措辞（被动应答），不能出现"主动触达"。
-        let text = follow_up_trigger_message_text(
-            crate::agent::quiet_hours::DEFERRED_INBOUND_REPLY_KIND,
-            "作息时段累积消息",
-        );
-        assert!(
-            text.contains("回应客户"),
-            "醒来任务应是被动应答措辞: {text}"
-        );
-        assert!(
-            !text.contains("主动触达"),
-            "醒来任务不应出现主动触达措辞: {text}"
-        );
-    }
-
-    #[test]
     fn ordinary_follow_up_trigger_text_keeps_proactive_framing() {
         // 普通 follow_up 仍是"主动触达"判断，并带上任务内容。
-        let text = follow_up_trigger_message_text("follow_up", "三天前承诺的报价");
+        let text = follow_up_trigger_message_text("三天前承诺的报价");
         assert!(
             text.contains("主动触达"),
             "普通跟进应保留主动触达措辞: {text}"

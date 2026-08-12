@@ -672,10 +672,7 @@ pub async fn reconcile_workspace_reply_obligations(
         .find(
             doc! {
                 "workspace_id": workspace_id,
-                "kind": { "$in": [
-                    DURABLE_INBOUND_REPLY_KIND,
-                    agent::quiet_hours::DEFERRED_INBOUND_REPLY_KIND,
-                ] },
+                "kind": DURABLE_INBOUND_REPLY_KIND,
                 "status": { "$in": ["pending", "retry", "failed", "running", "outbox_enqueued"] },
             },
             None,
@@ -714,8 +711,6 @@ pub async fn reconcile_workspace_reply_obligations(
         };
         let run_at = policy_run_at(&runtime, &contact, state);
         let old_decision = task.get_object_id("outbox_decision_id").ok();
-        let is_legacy =
-            task.get_str("kind").ok() == Some(agent::quiet_hours::DEFERRED_INBOUND_REPLY_KIND);
 
         // Invalidate ownership first. Dispatcher authorization always joins back to this task.
         let result = tasks
@@ -724,32 +719,18 @@ pub async fn reconcile_workspace_reply_obligations(
                     "_id": task_id,
                     "status": { "$in": ["pending", "retry", "failed", "running", "outbox_enqueued"] },
                 },
-                if is_legacy {
-                    doc! {
-                        "$set": {
-                            "status": "cancelled",
-                            "gateway_status": "merged_into_reply_obligation",
-                            "updated_at": DateTime::now(),
-                        },
-                        "$unset": {
-                            "claim_token": "", "claimed_at": "", "active_task_key": "",
-                            "outbox_decision_id": "", "next_retry_at": "",
-                        },
-                    }
-                } else {
-                    doc! {
-                        "$set": {
-                            "status": "pending",
-                            "run_at": run_at,
-                            "gateway_status": "policy_reconciled",
-                            "attempt_count": 0,
-                            "updated_at": DateTime::now(),
-                        },
-                        "$unset": {
-                            "claim_token": "", "claimed_at": "", "next_retry_at": "",
-                            "outbox_decision_id": "", "error": "",
-                        },
-                    }
+                doc! {
+                    "$set": {
+                        "status": "pending",
+                        "run_at": run_at,
+                        "gateway_status": "policy_reconciled",
+                        "attempt_count": 0,
+                        "updated_at": DateTime::now(),
+                    },
+                    "$unset": {
+                        "claim_token": "", "claimed_at": "", "next_retry_at": "",
+                        "outbox_decision_id": "", "error": "",
+                    },
                 },
                 None,
             )
@@ -766,34 +747,6 @@ pub async fn reconcile_workspace_reply_obligations(
                 "quiet_hours_policy_changed",
             )
             .await?;
-        }
-
-        if is_legacy {
-            if let Some(inbound) = state
-                .db
-                .messages()
-                .find_one(
-                    doc! {
-                        "workspace_id": workspace_id,
-                        "account_id": account_id,
-                        "contact_wxid": contact_wxid,
-                        "direction": "inbound",
-                    },
-                    mongodb::options::FindOneOptions::builder()
-                        .sort(doc! { "created_at": -1, "_id": -1 })
-                        .build(),
-                )
-                .await?
-            {
-                materialize_durable_inbound_task_at(
-                    state,
-                    &contact,
-                    &inbound,
-                    run_at,
-                    "policy_reconciled",
-                )
-                .await?;
-            }
         }
     }
     Ok(changed)
@@ -1750,16 +1703,12 @@ pub async fn wechat_webhook(
     })))
 }
 
-/// #69 作息门控：静默时段入站时，确保存在一条"醒来回复"跟进任务。
+/// #69 作息门控：静默时段入站时，确保存在一条"醒来回复"义务任务。
 ///
-/// kind = [`agent::quiet_hours::DEFERRED_INBOUND_REPLY_KIND`]，与 planner 主动催进的
-/// `follow_up` 区分——precheck 据此豁免 `context_changed`（这条任务的存在意义恰恰
-/// 就是回 task 创建后累积的客户消息）。`run_at` = 下一次醒来时刻；醒来后由 task
-/// worker → handle_follow_up_task → gateway 走完整决策/审查/拆短/outbox 链路。
-///
-/// 去重：仿 planner `has_pending_follow_up` —— 同 contact 已有未终态的 wake 任务则
-/// 不再插（静默时段连发多条 → 1 task → 醒来基于累积消息回 1 次）。先查后插存在
-/// TOCTOU 窗口，但 precheck 的 rate_limited 闸在醒来时会兜住重复触达，可接受。
+/// 实际物化的是该 contact 唯一的持久 `inbound_reply` 义务（kind =
+/// [`DURABLE_INBOUND_REPLY_KIND`]，经 [`materialize_durable_inbound_task_at`]），
+/// `run_at` = 下一次醒来时刻；醒来后以 Inbound 语义进网关、基于累积消息回 1 次。
+/// 同 contact 的确定性 task `_id` 天然去重（静默时段连发多条 → 1 task）。
 ///
 /// `pub`：暴露给 tests/quiet_hours_deferral.rs 集成测试直接驱动排程链路
 /// （`Utc::now` 不可注入，集成测试只验 DB 写入 + 去重 + 埋点，时区由纯函数单测覆盖）。
