@@ -134,7 +134,109 @@ pub(crate) fn explicit_stop_intent(content: &str) -> bool {
         "dontcontactme",
         "removemefromyourlist",
     ];
-    DIRECT.iter().any(|phrase| normalized.contains(phrase))
+    if DIRECT.iter().any(|phrase| normalized.contains(phrase)) {
+        return true;
+    }
+
+    // Chinese users often omit the object after the conversation already established that the
+    // sender is pushing messages ("别再发了"). The abbreviated phrase alone is ambiguous: it can
+    // also mean "do not send this file again". Treat it as a durable opt-out only when the same
+    // message also contains an explicit conversation-ending signal.
+    const ELLIPTICAL_SEND_STOP: &[&str] = &["别再发了", "不要再发了", "别发了", "不要发了"];
+    const TERMINAL_CONTEXT: &[&str] = &[
+        "不想聊了",
+        "不想再聊",
+        "不想继续聊",
+        "到此为止",
+        "别打扰我",
+        "不要打扰我",
+        "不想收到你的消息",
+        "不想收到消息",
+    ];
+    ELLIPTICAL_SEND_STOP
+        .iter()
+        .any(|phrase| normalized.contains(phrase))
+        && TERMINAL_CONTEXT
+            .iter()
+            .any(|marker| normalized.contains(marker))
+}
+
+/// High-precision floor for an explicit purchase/payment commitment.
+///
+/// This is intentionally narrower than general interest. It does not create a deal or payment
+/// fact; it only classifies the current inbound as a reaction to the latest already-sent Review.
+/// Quoted examples, hypotheticals, negations, questions without a commitment, and non-transaction
+/// profiles remain on the model path.
+pub(crate) fn explicit_buying_intent(content: &str) -> bool {
+    let normalized = content
+        .trim()
+        .to_lowercase()
+        .chars()
+        .filter(|ch| {
+            !ch.is_whitespace()
+                && !matches!(
+                    ch,
+                    '，' | ',' | '。' | '.' | '！' | '!' | '？' | '?' | '；' | ';' | ':' | '：'
+                )
+        })
+        .collect::<String>();
+    if normalized.is_empty() || normalized.chars().count() > 120 {
+        return false;
+    }
+    if [
+        "如果",
+        "比如",
+        "例如",
+        "假设",
+        "示例",
+        "怎么回复",
+        "客户说",
+        "不买",
+        "先不买",
+        "暂时不买",
+        "不付款",
+        "先不付款",
+        "不下单",
+        "先不下单",
+        "取消订单",
+        "别下单",
+        "不要帮我下单",
+        "别帮我下单",
+        "不用帮我下单",
+        "先别帮我下单",
+        "还没决定",
+        "尚未决定",
+        "还要考虑",
+        "再考虑一下",
+        "再想想",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+    {
+        return false;
+    }
+    const COMMITMENTS: &[&str] = &[
+        "我要买",
+        "我决定买",
+        "我确认购买",
+        "就买这个",
+        "帮我下单",
+        "给我下单",
+        "直接下单",
+        "现在下单",
+        "马上下单",
+        "立即下单",
+        "现在付款",
+        "马上付款",
+        "立即付款",
+        "直接付款",
+        "我要付款",
+        "我要报名付款",
+        "现在就报名付款",
+    ];
+    COMMITMENTS
+        .iter()
+        .any(|commitment| normalized.contains(commitment))
 }
 
 async fn apply_deterministic_stop(
@@ -323,7 +425,18 @@ async fn record_user_reaction_inner(
             .await?;
     let active_polarity = active_profile.outcome_polarity.clone();
     let active_traj_dims = active_profile.trajectory_dimensions.clone();
-    let reaction_analysis = if budget_exceeded {
+    let deterministic_buying =
+        active_profile.transaction_facts_enabled && explicit_buying_intent(&inbound.content);
+    let reaction_analysis = if deterministic_buying {
+        // User-authored commitment only. This is a reaction label, never an outcome_event and
+        // never proof that payment or a transaction actually completed.
+        doc! {
+            "buyingSignal": true,
+            "deterministic": true,
+            "deterministicReason": "explicit_purchase_or_payment_commitment",
+            "confidence": 100,
+        }
+    } else if budget_exceeded {
         if let Some(b) = current_run_budget() {
             b.mark_degraded("reaction_skipped_budget_exceeded".to_string());
         }
@@ -1322,6 +1435,8 @@ mod a6_tests {
         for text in [
             "别再联系我",
             "请不要再给我发消息。",
+            "别再发了，我不想聊了，到此为止吧",
+            "不要发了，也不要打扰我",
             "退订",
             "UNSUBSCRIBE",
             "remove me from your list",
@@ -1335,6 +1450,10 @@ mod a6_tests {
             "这个产品我不需要",
             "今天先聊到这里，谢谢",
             "最近有点烦，先缓一缓",
+            "这个文件别再发了，换成 PDF",
+            "这张图不要发了，发原图",
+            "我没有说别再发了，到此为止",
+            "比如客户说别再发了、不想聊了时怎么办",
             "我没有说不要再联系我",
             "比如客户说别再联系我时怎么办",
             "别误会，我不是说退订",
@@ -1344,6 +1463,51 @@ mod a6_tests {
                 "ambiguous, quoted, or negated text must remain on the model path: {text}"
             );
         }
+    }
+
+    #[test]
+    fn explicit_buying_floor_accepts_only_unambiguous_commitments() {
+        for text in [
+            "可以现在就报名付款吗？我要买",
+            "我确认购买，帮我下单",
+            "就买这个，我现在付款",
+        ] {
+            assert!(explicit_buying_intent(text), "{text}");
+        }
+        for text in [
+            "多少钱？我先了解一下",
+            "可以报名付款吗？",
+            "如果客户说我要买，该怎么回复",
+            "我先不买，也不要帮我下单",
+            "不要帮我下单",
+            "我还没决定买，再考虑一下",
+            "我不是要付款，只是问流程",
+            "已经付款了吗",
+        ] {
+            assert!(!explicit_buying_intent(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn explicit_buying_label_uses_profile_positive_token_without_proving_a_deal() {
+        let analysis = doc! {
+            "buyingSignal": explicit_buying_intent("我要买，现在付款"),
+            "deterministic": true,
+        };
+        assert_eq!(
+            reaction_outcome_status_with_polarity(
+                &analysis,
+                &default_outcome_polarity_for_reaction()
+            ),
+            "user_replied_buying_signal"
+        );
+        assert_eq!(
+            reaction_outcome_status_with_polarity(&analysis, &companion_polarity()),
+            "user_emotion_opened_up",
+            "domain polarity still owns the positive label; caller gates this floor to transaction profiles"
+        );
+        assert!(analysis.get("dealVerified").is_none());
+        assert!(analysis.get("paymentVerified").is_none());
     }
 
     #[test]
