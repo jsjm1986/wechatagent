@@ -303,7 +303,6 @@ struct RelationalReplyContext {
 #[derive(Debug, Clone, Default)]
 struct FullReplyContext {
     recent_media_text: String,
-    referral_block: String,
 }
 
 /// Gateway-only lazy context cache. Lean runs only populate the Lean content
@@ -398,8 +397,6 @@ impl ReplyContextCache {
         &'a self,
         state: &'a AppState,
         contact: &'a Contact,
-        assist_on: bool,
-        customer_stage: Option<&'a str>,
     ) -> BoxFuture<'a, FullReplyContext> {
         async move {
             if let Some(cached) = self.full.lock().clone() {
@@ -417,38 +414,8 @@ impl ReplyContextCache {
                 .await;
                 super::send_ledger::render_recent_media_lines(&rows)
             };
-            let referral_future = async {
-                if !assist_on {
-                    return String::new();
-                }
-                let cards = load_referral_cards(state, &contact.workspace_id, &contact.account_id)
-                    .await
-                    .unwrap_or_default();
-                let candidates = super::referral::filter_referral_candidates(
-                    &cards,
-                    customer_stage,
-                    &contact.account_id,
-                );
-                let already = contact
-                    .domain_attributes
-                    .as_ref()
-                    .and_then(|d| d.get_str(crate::models::REFERRED_CARD_ID_ATTR).ok())
-                    .and_then(|cid| {
-                        cards
-                            .iter()
-                            .find(|c| c.id.map(|i| i.to_hex()).as_deref() == Some(cid))
-                            .map(|c| super::referral::AlreadyReferred {
-                                display_name: c.display_name.clone(),
-                                card_id: cid.to_string(),
-                            })
-                    });
-                super::referral::render_referral_lines(&candidates, already.as_ref())
-            };
-            let (recent_media_text, referral_block) = tokio::join!(media_future, referral_future);
-            let loaded = FullReplyContext {
-                recent_media_text,
-                referral_block,
-            };
+            let recent_media_text = media_future.await;
+            let loaded = FullReplyContext { recent_media_text };
             *self.full.lock() = Some(loaded.clone());
             loaded
         }
@@ -516,6 +483,9 @@ pub(crate) struct DecisionRunSnapshot<'a> {
     /// `None` only when the profile supplies a non-empty soul override.
     pub published_soul: Option<&'a str>,
     pub sendable_assets: &'a [crate::models::ContentAsset],
+    /// Reviewed + enabled referral cards frozen for this run. Lean receives only a rendered
+    /// overview without ids; Full receives the selectable ids.
+    pub referral_cards: &'a [crate::models::ReferralCard],
     pub reply_prompts: &'a ReplyPromptSnapshot,
     pub reply_context: &'a ReplyContextCache,
 }
@@ -737,14 +707,47 @@ pub(crate) async fn decide_reply_with_promote(
         domain_config.and_then(|c| c.assist_mode_enabled),
         assist_override,
     );
+    let referral_cards = if assist_on {
+        match run_snapshot {
+            Some(snapshot) => snapshot.referral_cards.to_vec(),
+            None => load_referral_cards(state, &contact.workspace_id, &contact.account_id)
+                .await
+                .unwrap_or_default(),
+        }
+    } else {
+        Vec::new()
+    };
+    let referral_candidates = super::referral::filter_referral_candidates(
+        &referral_cards,
+        current_customer_stage.as_deref(),
+        &contact.account_id,
+    );
+    let already_referred = contact
+        .domain_attributes
+        .as_ref()
+        .and_then(|d| d.get_str(crate::models::REFERRED_CARD_ID_ATTR).ok())
+        .and_then(|cid| {
+            referral_cards
+                .iter()
+                .find(|card| card.id.map(|id| id.to_hex()).as_deref() == Some(cid))
+                .map(|card| super::referral::AlreadyReferred {
+                    display_name: card.display_name.clone(),
+                    card_id: cid.to_string(),
+                })
+        });
+    let referral_block = if include_business {
+        super::referral::render_referral_lines(&referral_candidates, already_referred.as_ref())
+    } else {
+        String::new()
+    };
+    let referral_overview = if include_business {
+        String::new()
+    } else {
+        super::referral::render_referral_overview(&referral_candidates)
+    };
     let full_context = if include_business {
         match run_snapshot {
-            Some(snapshot) => {
-                snapshot
-                    .reply_context
-                    .full(state, contact, assist_on, current_customer_stage.as_deref())
-                    .await
-            }
+            Some(snapshot) => snapshot.reply_context.full(state, contact).await,
             None => {
                 let rows = super::send_ledger::recent_sends_for_contact(
                     state,
@@ -756,44 +759,13 @@ pub(crate) async fn decide_reply_with_promote(
                 )
                 .await;
                 let recent_media_text = super::send_ledger::render_recent_media_lines(&rows);
-                let referral_block = if assist_on {
-                    let cards =
-                        load_referral_cards(state, &contact.workspace_id, &contact.account_id)
-                            .await
-                            .unwrap_or_default();
-                    let candidates = super::referral::filter_referral_candidates(
-                        &cards,
-                        current_customer_stage.as_deref(),
-                        &contact.account_id,
-                    );
-                    let already = contact
-                        .domain_attributes
-                        .as_ref()
-                        .and_then(|d| d.get_str(crate::models::REFERRED_CARD_ID_ATTR).ok())
-                        .and_then(|cid| {
-                            cards
-                                .iter()
-                                .find(|c| c.id.map(|i| i.to_hex()).as_deref() == Some(cid))
-                                .map(|c| super::referral::AlreadyReferred {
-                                    display_name: c.display_name.clone(),
-                                    card_id: cid.to_string(),
-                                })
-                        });
-                    super::referral::render_referral_lines(&candidates, already.as_ref())
-                } else {
-                    String::new()
-                };
-                FullReplyContext {
-                    recent_media_text,
-                    referral_block,
-                }
+                FullReplyContext { recent_media_text }
             }
         }
     } else {
         FullReplyContext::default()
     };
     let recent_media_text = full_context.recent_media_text;
-    let referral_block = full_context.referral_block;
     // ④升档盲区 + 红线让位修复（2026-06-27）：原单段 assist_hint_text 只在 Lean/Relational
     // 催升档，但实测 AI 升 Full 拿到名片清单的那一刻，被两句恒注入的反向承接强红线碾压、主动
     // 拒绝引荐。这两句强红线（反向承接语义）分别是：
@@ -1326,7 +1298,9 @@ pub(crate) async fn decide_reply_with_promote(
         // referral_block=完整名片清单(仅 Full)；assist_escalation_hint=催升档(仅 Lean/Relational)；
         // assist_redline_yield=让位声明(任何档, 仅 assist_on)。assist 关账号三者皆空 → 占位空串、
         // prompt 字节等价（默认全自治账号完全不受影响）。
-        format!("{referral_block}{assist_escalation_hint}{assist_redline_yield}"),
+        format!(
+            "{referral_block}{referral_overview}{assist_escalation_hint}{assist_redline_yield}"
+        ),
         task_text,
         temporal_fact_text,
         history,

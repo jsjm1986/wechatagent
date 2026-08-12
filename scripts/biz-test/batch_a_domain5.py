@@ -2,7 +2,7 @@
 
 观测点在 mongo agent_events：kind=ptier_run_tier(details.tier_used=lean/escalated/full)、
 ptier_escalated、ptier_forced_full、ptier_clarify。details 字段名是 details(非 payload)。
-寒暄期望停 lean；复杂多诉求咨询期望升档。升档由 LLM 自评驱动,单次不稳,建议多跑。
+寒暄必须精确停 Lean；复杂多事实咨询因已命中审定知识，必须加载 Full 业务上下文。
 
 跑法：export DEPLOY_PASS=...; python scripts/biz-test/batch_a_domain5.py
 """
@@ -17,19 +17,21 @@ DOMAIN = "⑤三段式"
 WXID = "biztest_c5"
 
 
-def _ptier_events() -> list[dict]:
-    rows = _lib.mongo_json(
-        f'db.agent_events.find({{contact_wxid:"{WXID}",kind:/ptier/}},'
-        '{kind:1,details:1,_id:0}).sort({_id:-1}).limit(20).toArray()'
-    )
-    return rows if isinstance(rows, list) else []
-
 
 def main() -> None:
     account_id, app_id = _lib.biztest_account()
     _lib.ensure_managed_contact(account_id, WXID, "biztest 三段式测试客户")
     _lib.reset_contact_conversation(account_id, WXID)
     _lib.mongo(f'db.agent_events.deleteMany({{contact_wxid:"{WXID}"}})')
+    chunk_id = _lib.seed_citable_knowledge_chunk(
+        "biztest_tier_complex_course", account_id, "biztest 课程完整说明",
+        "课程包含基础编程与项目实践；师资为认证讲师；收费标准为 9800 元；开课前 7 天可申请全额退费。",
+    )
+    verified = _lib.verify_knowledge_chunk(chunk_id) if chunk_id else {}
+    _lib.expect(verified.get("ok") is True, DOMAIN, "复杂咨询知识已人工审定",
+                f"chunk={chunk_id} verify={verified}", "critical")
+    if verified.get("ok") is not True:
+        return
 
     # 寒暄 → 期望停 lean
     print(f"[{DOMAIN}] 寒暄（期望停 lean，真模型轮询）...")
@@ -44,26 +46,25 @@ def main() -> None:
         "m5b", max_wait=600,
     )
     _lib.expect(run_b is not None, DOMAIN, "复杂咨询轮 webhook 完成", f"run_b={run_b}", "high")
-    _lib.assert_llm_success(600, "user.reply.task", DOMAIN)
+    run_b_id = run_b.get("run_id", "") if isinstance(run_b, dict) else ""
+    _lib.assert_llm_success_for_run(run_b_id, "user.reply.fast.task", DOMAIN)
 
-    evts = _ptier_events()
-    kinds = [e.get("kind") for e in evts]
-    _lib.expect("ptier_run_tier" in str(kinds), DOMAIN,
-                "ptier_run_tier 事件落 mongo(三段式生效)",
-                f"kinds={kinds}", "high", "无 ptier_run_tier→三段式未生效或 PROGRESSIVE_TIER_ENABLED=false")
+    run_a_id = run_a.get("run_id", "") if isinstance(run_a, dict) else ""
+    events_a = _lib.ptier_events_for_run(WXID, run_a_id)
+    events_b = _lib.ptier_events_for_run(WXID, run_b_id)
+    tiers_a = [e.get("details", {}).get("tier_used") for e in events_a
+               if e.get("kind") == "ptier_run_tier"]
+    tiers_b = [e.get("details", {}).get("tier_used") for e in events_b
+               if e.get("kind") == "ptier_run_tier"]
+    _lib.expect(tiers_a == ["lean"], DOMAIN, "寒暄轮精确停在 Lean",
+                f"run_id={run_a_id} events={events_a}", "high",
+                "寒暄不应加载昂贵业务上下文")
+    escalated = any(t in ("escalated", "full") for t in tiers_b)
+    _lib.expect(escalated, DOMAIN, "复杂多事实咨询精确触发 Full 业务上下文",
+                f"run_id={run_b_id} events={events_b}", "high",
+                "复杂咨询停 Lean 会在未读取审定知识时作答")
 
-    # 至少一轮升档（复杂咨询应触发 escalated/forced_full，或 run_tier 的 tier_used 非 lean）
-    tiers = [str(e.get("details", {}).get("tier_used", "")) for e in evts
-             if e.get("kind") == "ptier_run_tier"]
-    escalated = (
-        any(k in ("ptier_escalated", "ptier_forced_full") for k in kinds)
-        or any(t in ("escalated", "full") for t in tiers)
-    )
-    _lib.expect(escalated, DOMAIN, "复杂咨询触发升档(escalated/full 或 ptier_escalated 事件)",
-                f"kinds={kinds} tiers={tiers}", "medium",
-                "升档由 LLM 自评驱动,单次不稳,建议多跑几轮看分布;持续不升才是真问题")
-
-    print(f"[{DOMAIN}] 完成（升档 LLM 驱动，建议跑 3 次看稳定性）")
+    print(f"[{DOMAIN}] 完成（寒暄 Lean、复杂咨询 Full 均按 run_id 取证）")
 
 
 if __name__ == "__main__":

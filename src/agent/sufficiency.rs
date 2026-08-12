@@ -47,18 +47,29 @@ pub fn decide_tier_escalation(decision: &AgentDecision) -> TierDecision {
     }
 }
 
-/// 纯谓词：本轮是否构成「确定高危、必须当场升 Full」——自评说够了（enough），但本轮确实
-/// 需要产品知识（decision_requires_knowledge）、且知识路由覆盖度为 `missing`（连弱证据都没有）。
+/// Why a Lean result must be regenerated with the Full business context.
 ///
-/// 与 [`is_coverage_optimism`] 正交：missing → 强升（本谓词，硬动作）；weak → 观测（那个谓词，
-/// 先观测后判罚）。两者各管一态，互不重叠。必须正向 `== "missing"`，绝不用 `!=`。
-pub(crate) fn should_force_full_on_missing(
+/// This chooses only the context tier, never the business action. In particular, a referral reason
+/// does not select a card and a routed chunk is authoritative here only when it came from the
+/// Knowledge Agent citation path rather than fallback navigation.
+pub(crate) fn forced_full_context_reason(
     decision: &AgentDecision,
-    knowledge_coverage: &str,
-) -> bool {
-    decision.sufficiency.as_str() == "enough"
-        && knowledge_coverage == "missing"
-        && super::guards::decision_requires_knowledge(decision)
+    has_cited_knowledge_context: bool,
+    has_explicit_referral_context: bool,
+) -> Option<&'static str> {
+    if decision.sufficiency != "enough" {
+        return None;
+    }
+    if super::guards::decision_requires_knowledge(decision) {
+        return Some("lean_declared_knowledge_required");
+    }
+    if has_cited_knowledge_context {
+        return Some("knowledge_route_cited_context");
+    }
+    if has_explicit_referral_context {
+        return Some("explicit_referral_context_requested");
+    }
+    None
 }
 
 /// 纯谓词：sufficiency 是否落在已知三态（enough / need_more_context / need_clarification）内。
@@ -72,8 +83,8 @@ pub(crate) fn is_sufficiency_recognized(decision: &AgentDecision) -> bool {
 }
 
 /// 纯谓词：本轮是否构成「需观测的自评乐观灰区」——自评说够了（enough）、本轮需产品知识、
-/// 但知识覆盖只是 `weak`（有弱证据、未硬到 missing）。missing 已由
-/// [`should_force_full_on_missing`] 强升承接，本谓词只盯不硬堵的 weak 灰区。
+/// 但知识覆盖只是 `weak`（有弱证据、未硬到 missing）。Full 上下文是否加载由
+/// [`forced_full_context_reason`] 统一裁决；本谓词只保留 weak 灰区观测。
 ///
 /// 命中只记观测 telemetry（先观测后判罚），不改档位决策。正向 `== "weak"`，绝不用 `!=`。
 pub(crate) fn is_coverage_optimism(decision: &AgentDecision, knowledge_coverage: &str) -> bool {
@@ -226,45 +237,6 @@ mod tests {
     }
 
     #[test]
-    fn force_full_hits_on_enough_missing_and_needs_knowledge() {
-        let d = decision_with_need("enough", "required");
-        assert!(should_force_full_on_missing(&d, "missing"));
-    }
-
-    #[test]
-    fn force_full_skips_weak_and_adequate_coverage() {
-        // weak 归观测、不强升；enough/not_required 覆盖足够不强升。
-        let d = decision_with_need("enough", "required");
-        assert!(!should_force_full_on_missing(&d, "weak"));
-        assert!(!should_force_full_on_missing(&d, "enough"));
-        assert!(!should_force_full_on_missing(&d, "not_required"));
-    }
-
-    #[test]
-    fn force_full_skips_when_knowledge_not_needed() {
-        // 寒暄轮 knowledge_need=not_required，即便 coverage=missing 也不强升。
-        let d = decision_with_need("enough", "not_required");
-        assert!(!should_force_full_on_missing(&d, "missing"));
-    }
-
-    #[test]
-    fn force_full_requires_positive_enough_not_negation() {
-        // _=>Enough 兜底的 unknown/空不是"自评够了"，不强升。
-        assert!(!should_force_full_on_missing(
-            &decision_with_need("unknown", "required"),
-            "missing"
-        ));
-        assert!(!should_force_full_on_missing(
-            &decision_with_need("", "required"),
-            "missing"
-        ));
-        assert!(!should_force_full_on_missing(
-            &decision_with_need("need_more_context", "required"),
-            "missing"
-        ));
-    }
-
-    #[test]
     fn sufficiency_recognized_three_states_only() {
         assert!(is_sufficiency_recognized(&make_decision("enough", "")));
         assert!(is_sufficiency_recognized(&make_decision(
@@ -277,6 +249,31 @@ mod tests {
         )));
         assert!(!is_sufficiency_recognized(&make_decision("", "")));
         assert!(!is_sufficiency_recognized(&make_decision("garbage", "")));
+    }
+
+    #[test]
+    fn full_context_reason_uses_independent_business_signals_without_forcing_actions() {
+        let required = decision_with_need("enough", "required");
+        assert_eq!(
+            forced_full_context_reason(&required, false, false),
+            Some("lean_declared_knowledge_required")
+        );
+        let routine = decision_with_need("enough", "not_required");
+        assert_eq!(
+            forced_full_context_reason(&routine, true, false),
+            Some("knowledge_route_cited_context")
+        );
+        assert_eq!(
+            forced_full_context_reason(&routine, false, true),
+            Some("explicit_referral_context_requested")
+        );
+        assert_eq!(forced_full_context_reason(&routine, false, false), None);
+        let already_escalating = decision_with_need("need_more_context", "required");
+        assert_eq!(
+            forced_full_context_reason(&already_escalating, true, true),
+            None,
+            "the ordinary escalation branch owns non-enough decisions"
+        );
     }
 
     #[test]

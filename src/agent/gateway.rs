@@ -484,6 +484,7 @@ struct GatewayBusinessInputs {
     active_products: Vec<crate::models::Product>,
     published_soul: Option<String>,
     sendable_assets: Vec<crate::models::ContentAsset>,
+    referral_cards: Vec<crate::models::ReferralCard>,
     reply_prompts: super::decision::ReplyPromptSnapshot,
 }
 
@@ -491,6 +492,7 @@ fn load_gateway_business_inputs<'a>(
     state: &'a AppState,
     contact: &'a Contact,
     active_profile: &'a crate::models::DomainProfile,
+    assist_on: bool,
 ) -> BoxFuture<'a, AppResult<GatewayBusinessInputs>> {
     async move {
         let _stage_timer = super::run_audit::stage_timer("business_preload");
@@ -520,17 +522,32 @@ fn load_gateway_business_inputs<'a>(
                 .await
                 .unwrap_or_default()
         };
+        let referral_cards_future = async {
+            if assist_on {
+                super::decision::load_referral_cards(
+                    state,
+                    &contact.workspace_id,
+                    &contact.account_id,
+                )
+                .await
+                .unwrap_or_default()
+            } else {
+                Vec::new()
+            }
+        };
         let prompt_future = load_reply_prompt_snapshot(state, contact);
-        let (products, published_soul, sendable_assets, reply_prompts) = tokio::join!(
+        let (products, published_soul, sendable_assets, referral_cards, reply_prompts) = tokio::join!(
             products_future,
             soul_future,
             sendable_assets_future,
+            referral_cards_future,
             prompt_future,
         );
         Ok(GatewayBusinessInputs {
             active_products: products,
             published_soul: published_soul?,
             sendable_assets,
+            referral_cards,
             reply_prompts: reply_prompts?,
         })
     }
@@ -2488,11 +2505,20 @@ fn run_user_operation_gateway_inner<'a>(
     // consumed by Full. Load snapshots first, then overlap optional knowledge reasoning with the
     // first Lean generation. The provider governor preserves foreground capacity, and RunBudget's
     // atomic reservation prevents the concurrent branches from exceeding the per-run call cap.
+    let assist_override = contact
+        .domain_attributes
+        .as_ref()
+        .and_then(|d| d.get_str(crate::models::ASSIST_MODE_OVERRIDE_ATTR).ok());
+    let assist_on = super::referral::assist_mode_active(
+        domain_config.as_ref().and_then(|config| config.assist_mode_enabled),
+        assist_override,
+    );
     let business_inputs =
-        load_gateway_business_inputs(state, &contact, &active_profile).await?;
+        load_gateway_business_inputs(state, &contact, &active_profile, assist_on).await?;
     let active_products = business_inputs.active_products;
     let published_soul = business_inputs.published_soul;
     let sendable_assets = business_inputs.sendable_assets;
+    let referral_cards = business_inputs.referral_cards;
     let reply_prompts = business_inputs.reply_prompts;
     let reply_context = ReplyContextCache::new();
     let reviewer_prompts = ReviewerPromptCache::new();
@@ -2535,6 +2561,7 @@ fn run_user_operation_gateway_inner<'a>(
                     active_products: &active_products,
                     published_soul: published_soul.as_deref(),
                     sendable_assets: &sendable_assets,
+                    referral_cards: &referral_cards,
                     reply_prompts: &reply_prompts,
                     reply_context: &reply_context,
                 }),
@@ -2568,6 +2595,7 @@ fn run_user_operation_gateway_inner<'a>(
                     active_products: &active_products,
                     published_soul: published_soul.as_deref(),
                     sendable_assets: &sendable_assets,
+                    referral_cards: &referral_cards,
                     reply_prompts: &reply_prompts,
                     reply_context: &reply_context,
                 }),
@@ -2640,19 +2668,36 @@ fn run_user_operation_gateway_inner<'a>(
         .ok();
     }
 
+    let has_cited_knowledge_context = !knowledge_route.selected_chunk_ids.is_empty()
+        && !knowledge_route.selected_chunks_are_fallback;
+    let current_customer_stage = contact
+        .domain_attributes
+        .as_ref()
+        .and_then(|attributes| attributes.get_str("customer_stage").ok());
+    let has_eligible_referral_candidate = assist_on
+        && !super::referral::filter_referral_candidates(
+            &referral_cards,
+            current_customer_stage,
+            &contact.account_id,
+        )
+        .is_empty();
+    let has_explicit_referral_context = has_eligible_referral_candidate
+        && super::referral::explicitly_requests_referral_context(&inbound.content);
+    let forced_full_reason = crate::agent::sufficiency::forced_full_context_reason(
+        &decision_first,
+        has_cited_knowledge_context,
+        has_explicit_referral_context,
+    );
     let mut forced_full = false;
 
     let (mut decision, mut promote_risks) = match tier_decision {
         crate::agent::sufficiency::TierDecision::Enough => {
-            if state.config.progressive_tier_enabled
-                && crate::agent::sufficiency::should_force_full_on_missing(
-                    &decision_first,
-                    &knowledge_route.knowledge_coverage,
-                )
-            {
-                // ②强升:自评 enough 但 coverage=missing 且需知识=确定高危(凭空答产品/事实),
-                // 当场升 Full 重生成。最多一次:Full 结果直接进五闸,不再触发强升(Full 已最高档)。
+            if state.config.progressive_tier_enabled && forced_full_reason.is_some() {
+                // Lean cannot consume business context. Independent knowledge/referral evidence or
+                // Lean's own knowledge declaration therefore triggers one Full regeneration. Full
+                // still owns the business decision; this branch never selects a chunk or card.
                 forced_full = true;
+                let reason = forced_full_reason.expect("checked above");
                 write_event_for_account(
                     state,
                     &contact.workspace_id,
@@ -2660,11 +2705,15 @@ fn run_user_operation_gateway_inner<'a>(
                     Some(&contact.wxid),
                     "ptier_forced_full",
                     "info",
-                    "第一程自评 enough 但 coverage=missing 且需知识，强制升 Full 重生成",
+                    "第一程停在 Lean 但存在需加载的业务上下文，强制升 Full 重生成",
                     Some(doc! {
                         "run_id": &run_id,
+                        "reason": reason,
                         "knowledge_coverage": &knowledge_route.knowledge_coverage,
                         "knowledge_need": &decision_first.knowledge_need,
+                        "has_cited_knowledge_context": has_cited_knowledge_context,
+                        "has_eligible_referral_candidate": has_eligible_referral_candidate,
+                        "has_explicit_referral_context": has_explicit_referral_context,
                     }),
                 )
                 .await
@@ -2700,6 +2749,7 @@ fn run_user_operation_gateway_inner<'a>(
                         active_products: &active_products,
                         published_soul: published_soul.as_deref(),
                         sendable_assets: &sendable_assets,
+                        referral_cards: &referral_cards,
                         reply_prompts: &reply_prompts,
                         reply_context: &reply_context,
                     }),
@@ -2793,6 +2843,7 @@ fn run_user_operation_gateway_inner<'a>(
                     active_products: &active_products,
                     published_soul: published_soul.as_deref(),
                     sendable_assets: &sendable_assets,
+                    referral_cards: &referral_cards,
                     reply_prompts: &reply_prompts,
                     reply_context: &reply_context,
                 }),
@@ -3057,6 +3108,7 @@ fn run_user_operation_gateway_inner<'a>(
                     active_products: &active_products,
                     published_soul: published_soul.as_deref(),
                     sendable_assets: &sendable_assets,
+                    referral_cards: &referral_cards,
                     reply_prompts: &reply_prompts,
                     reply_context: &reply_context,
                 }),
@@ -3330,6 +3382,7 @@ fn run_user_operation_gateway_inner<'a>(
                     active_products: &active_products,
                     published_soul: published_soul.as_deref(),
                     sendable_assets: &sendable_assets,
+                    referral_cards: &referral_cards,
                     reply_prompts: &reply_prompts,
                     reply_context: &reply_context,
                 }),
