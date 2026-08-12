@@ -2912,8 +2912,10 @@ fn run_user_operation_gateway_inner<'a>(
     // 防御兜底：单发决策路径（知识前置）不支持 tool_calling 中间轮，若 LLM 误选该相位
     // 会导致 should_reply=false（types.rs:907 强制）→ 静默 no_reply，客户提问得不到回复。
     // 这里检测到 tool_calling 时强制转 final + 清空 tool_calls + 记 degraded，避免误发空回复。
-    // 根因：user.reply.task prompt 提供了 tool_calling 形态但主链路是单发（无工具循环包裹），
-    // LLM 误选后 gateway 无处理 → 回复被吞。本防御是兜底，根治需同时收紧 prompt。
+    // 根因（历史）：旧单发 prompt `user.reply.task` 曾提供 tool_calling 形态而主链路无工具
+    // 循环包裹，LLM 误选后 gateway 无处理 → 回复被吞。prompt 侧已收紧（守护测试锁死该
+    // 形态不再出现；现行单发主路径加载的是 `user.reply.fast.task`，见 decision.rs），
+    // 本防御保留，为任何仍误吐 tool_calling 相位的模型输出兜底。
     if decision.decision_phase == "tool_calling" {
         write_event_for_account(
             state,
@@ -3906,16 +3908,19 @@ fn run_user_operation_gateway_inner<'a>(
         return Ok(());
     }
 
-    // 并发多消息去抖——主中止检查（强制落在 apply_agent_updates 之前）。
+    // 并发多消息去抖——主中止检查（强制落在任何画像 / 记忆 / outbox 落库之前）。
     //
     // 决策与审查已完成，但尚未写任何画像 / 记忆 / outbox。若此刻调度器观察到
     // 更新的入站（用户在这次生成期间又发了消息），should_abort_send() 返回 true：
     // 放弃这次已过时的生成，写一条终态 run log（gateway_status=
     // superseded_by_new_inbound），交由调度器用更全的上下文重算。
     //
-    // 关键：必须在 apply_agent_updates 之前——后者无条件把 last_agent_run_at 推到
-    // now，若先落库再放弃，重算时 precheck 会因 min_reply_interval 误判 rate_limited
-    // 吞掉聚合回复。这里直接 return 不触碰 last_agent_run_at，重算 precheck 干净。
+    // 关键：必须在本 run 推进 last_agent_run_at 的一切写点之前——outbox 授权时的
+    // `$max` 回写与发送成功后的时间戳回写都会推进它（此外 post-decision 投影 worker
+    // 的 apply_agent_updates 也会无条件推到 now，但那是本 run 落库后才会调度的异步
+    // 投影）。若先落库再放弃，重算时 precheck 会因 min_reply_interval 误判
+    // rate_limited 吞掉聚合回复。这里直接 return 不触碰 last_agent_run_at，重算
+    // precheck 干净。
     if let Some(guard) = &should_abort_send {
         if guard() {
             write_agent_run_log(
@@ -5636,10 +5641,12 @@ pub(crate) const PROACTIVE_TOUCH_SOURCE_KINDS: &[&str] = &[
 ///   `sent_at`，但 `begin_remote_send` 必定已写 `send_started_at`。
 /// * outbox 是唯一发送路径（文本 / 媒体 / 名片都经 dispatcher），故不漏数。
 ///
-/// 已知残余不精确（**比修复前小得多，故不在本次收窄**）：relay 转述与静默时段
-/// 「醒来任务」的 `source_kind` 也是 follow_up 类，语义上却是被动应答，会各占 1 次
-/// 额度。二者都不常见、且都只计 1 次（不再被分段放大）。彻底区分需要在 outbox 上
-/// 持久化更细的来源标记，属独立改动。
+/// 已知残余不精确（**比修复前小得多，故不在本次收窄**）：请示通道的安抚话术
+/// （链尾失联 / 授权过期，`escalation::enqueue_holding_reply`）以 `follow_up_task`
+/// source_kind 入队，语义上是被动安抚却会各占 1 次额度；不常见且只计 1 次。
+/// relay 转述与静默时段醒来回复则**既不占额度、也不受本闸拦截**：二者都以
+/// 合成 / durable Inbound 进网关（source_kind=`inbound_message`；闸门侧
+/// `daily_limit_applies_to` 只对 FollowUp 生效），与「被动应答豁免」契约一致。
 pub(crate) fn proactive_touch_filter(
     workspace_id: &str,
     account_id: &str,
