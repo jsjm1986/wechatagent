@@ -153,6 +153,32 @@ async fn auto_verify_handler_enforces_needs_human_audit() {
         body["needsHumanAudit"].as_i64().unwrap_or(0) >= 1,
         "过闸的 chunk 应落 needsHumanAudit,实际 body={body:?}"
     );
+    let run_id = body["runId"]
+        .as_str()
+        .expect("response exposes durable runId");
+    let response_chunk_ids = body["chunkIds"]
+        .as_array()
+        .expect("response exposes processed chunkIds");
+    assert_eq!(response_chunk_ids.len(), 3);
+    let started = app
+        .state
+        .db
+        .events()
+        .find_one(
+            doc! {
+                "kind": "knowledge_run_started",
+                "details.runId": run_id,
+                "details.chunkIds": { "$all": response_chunk_ids
+                    .iter()
+                    .filter_map(|value| value.as_str())
+                    .collect::<Vec<_>>() },
+            },
+            None,
+        )
+        .await
+        .expect("query started audit")
+        .expect("started audit exists before model work");
+    assert_eq!(started.status, "running");
 
     // ── 断言 2:落库复查(DB 层,不重拼 filter 自查——查全部 user_operations chunk) ──
     let stored = app
@@ -257,6 +283,26 @@ async fn auto_verify_counts_only_committed_revisions() {
     assert_eq!(response["processed"], json!(0));
     assert_eq!(response["failed"], json!(1));
     assert_eq!(response["needsHumanAudit"], json!(0));
+    let failed_run_id = response["runId"]
+        .as_str()
+        .expect("failed revision batch still exposes durable runId");
+    assert_eq!(response["chunkIds"], json!([]));
+    let started = app
+        .state
+        .db
+        .events()
+        .find_one(
+            doc! {
+                "kind": "knowledge_run_started",
+                "details.runId": failed_run_id,
+                "details.chunkIds": chunk_id.to_hex(),
+            },
+            None,
+        )
+        .await
+        .expect("query failed-run start audit")
+        .expect("start audit survives even when revision and usage do not commit");
+    assert_eq!(started.status, "running");
     let stored = app
         .state
         .db

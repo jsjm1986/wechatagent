@@ -725,10 +725,12 @@ pub(super) async fn post_management_message(
     let advertised_tools = advertised_tool_names(&tools);
     let context = management_context(&state, &admin.current_workspace, &payload.account_id).await?;
     let effective_dry_run = payload.dry_run.unwrap_or(session.dry_run);
+    let management_run_id = session_id.to_hex();
     let mut plan = build_management_plan(
         &state,
         &admin.current_workspace,
         &payload.account_id,
+        &management_run_id,
         &payload.content,
         &tools,
         &context,
@@ -3475,6 +3477,7 @@ pub(super) async fn build_management_plan(
     state: &AppState,
     workspace_id: &str,
     account_id: &str,
+    run_id: &str,
     instruction: &str,
     tools: &Value,
     context: &str,
@@ -3493,7 +3496,7 @@ pub(super) async fn build_management_plan(
         workspace_id,
         Some(account_id),
         None,
-        None,
+        Some(run_id),
         "management.plan",
         &system,
         &user,

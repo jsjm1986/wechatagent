@@ -312,6 +312,15 @@ pub(crate) async fn propose_chunk_repair_inner(
     let pack_payload = pack.as_ref().map(|_| Value::Null).unwrap_or(Value::Null);
 
     let id_str = chunk_object_id.to_hex();
+    record_knowledge_run_started(
+        state,
+        workspace_id,
+        &account_id,
+        run_id,
+        "knowledge.chunk.repair.propose",
+        std::slice::from_ref(&id_str),
+    )
+    .await?;
 
     let user = format!(
         r#"请为下面这条 integrityStatus = needs_review 的知识切片做 AI 自主修复（首轮）。
@@ -391,6 +400,7 @@ pub(crate) async fn propose_chunk_repair_inner(
         format!("AI 自主修复 chunk:{id_str} 第 1 轮"),
         doc! {
             "kind": "chunk_repair_session",
+            "runId": run_id,
             "chunkId": &id_str,
             "turn": 1i32,
             "confidenceHint": confidence,
@@ -427,6 +437,7 @@ pub async fn propose_chunk_repair(
     Ok(Json(json!({
         "chunkId": id,
         "sessionId": session_id,
+        "runId": run_id,
         "turn": 1,
         "promptKey": "knowledge.chunk.repair.propose",
         "interpretation": parsed.get("interpretation"),
@@ -518,6 +529,15 @@ pub(in crate::routes) async fn answer_chunk_repair(
         REPAIR_MAX_LLM_CALLS_PER_TURN,
         i32::MAX,
     ));
+    record_knowledge_run_started(
+        &state,
+        &admin.current_workspace,
+        &account_id,
+        &run_id,
+        "knowledge.chunk.repair.followup",
+        std::slice::from_ref(&id),
+    )
+    .await?;
 
     let value = agent::RUN_BUDGET
         .scope(budget.clone(), async {
@@ -579,6 +599,7 @@ pub(in crate::routes) async fn answer_chunk_repair(
         format!("AI 自主修复 chunk:{id} 第 {turn} 轮"),
         doc! {
             "kind": "chunk_repair_session",
+            "runId": &run_id,
             "chunkId": &id,
             "turn": turn as i32,
             "confidenceHint": confidence,
@@ -592,6 +613,7 @@ pub(in crate::routes) async fn answer_chunk_repair(
     Ok(Json(json!({
         "chunkId": id,
         "sessionId": session_id,
+        "runId": run_id,
         "turn": turn,
         "promptKey": "knowledge.chunk.repair.followup",
         "interpretation": parsed.get("interpretation"),

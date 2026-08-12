@@ -320,7 +320,7 @@ async fn auto_verify_operation_knowledge_chunks_inner(
     run_id: String,
     budget: Arc<agent::RunBudget>,
 ) -> AppResult<Json<Value>> {
-    let mut cursor = state
+    let cursor = state
         .db
         .operation_knowledge_chunks()
         .find(
@@ -339,6 +339,22 @@ async fn auto_verify_operation_knowledge_chunks_inner(
                 .build(),
         )
         .await?;
+    let candidates = cursor.try_collect::<Vec<_>>().await?;
+    let candidate_chunk_ids = candidates
+        .iter()
+        .filter_map(|chunk| chunk.id.map(|id| id.to_hex()))
+        .collect::<Vec<_>>();
+    if !candidate_chunk_ids.is_empty() {
+        record_knowledge_run_started(
+            &state,
+            &workspace_id,
+            &account_id,
+            &run_id,
+            "knowledge.auto_verify",
+            &candidate_chunk_ids,
+        )
+        .await?;
+    }
 
     let system = prompts::load_prompt(
         &state.db,
@@ -360,8 +376,9 @@ async fn auto_verify_operation_knowledge_chunks_inner(
     let mut llm_attempted = 0i32;
     let mut llm_failed = 0i32;
     let mut first_llm_error: Option<AppError> = None;
+    let mut processed_chunk_ids = Vec::new();
 
-    while let Some(chunk) = cursor.try_next().await? {
+    for chunk in candidates {
         let Some(chunk_id) = chunk.id else { continue };
         if budget.should_stop_optional_llm_calls() {
             if budget.is_exceeded() {
@@ -519,6 +536,7 @@ source_anchors: {}
             }
         };
         processed += 1;
+        processed_chunk_ids.push(chunk_id.to_hex());
         match final_status.as_str() {
             "verified" => verified += 1,
             "rejected" => rejected += 1,
@@ -590,6 +608,8 @@ source_anchors: {}
                     "自动校验完成：processed={processed} failed={failed} verified={verified} needs_review={needs_review} rejected={rejected} needs_human_audit={needs_human_audit}"
                 ),
                 details: Some(doc! {
+                    "runId": &run_id,
+                    "chunkIds": &processed_chunk_ids,
                     "processed": processed,
                     "failed": failed,
                     "verified": verified,
@@ -609,6 +629,8 @@ source_anchors: {}
         .await;
 
     Ok(Json(json!({
+        "runId": run_id,
+        "chunkIds": processed_chunk_ids,
         "processed": processed,
         "failed": failed,
         "verified": verified,

@@ -792,6 +792,93 @@ pub(super) fn normalize_operation_knowledge_preview_item(
     })
 }
 
+/// Extract high-confidence absolute promises from imported source text for operator review.
+///
+/// This is intentionally narrow and evidence-preserving: every note quotes one original line,
+/// does not rewrite chunk content, and never changes verification state. The LLM remains free to
+/// identify broader contextual risks; this deterministic floor prevents obvious promises from
+/// disappearing when one extraction call is incomplete.
+fn deterministic_import_risk_notes(content: &str) -> Vec<String> {
+    const MARKERS: &[&str] = &[
+        "保证学会",
+        "包教包会",
+        "全市第一",
+        "全省第一",
+        "全国第一",
+        "行业第一",
+        "全网第一",
+        "无条件退款",
+        "保证考进",
+        "保证通过",
+        "保证录取",
+        "保证见效",
+        "保证治好",
+        "百分百有效",
+        "100%有效",
+        "稳赚不赔",
+        "包治百病",
+    ];
+    const NEGATED_PREFIXES: &[&str] = &[
+        "不",
+        "不再",
+        "不能",
+        "无法",
+        "并不",
+        "不是",
+        "绝不",
+        "不提供",
+        "不支持",
+        "不承诺",
+        "未承诺",
+        "没有",
+    ];
+
+    let mut seen = std::collections::HashSet::new();
+    let mut notes = Vec::new();
+    for raw_line in content.lines() {
+        let line = raw_line
+            .trim()
+            .trim_start_matches(|ch: char| matches!(ch, '-' | '*' | '+' | '•'))
+            .trim();
+        if line.is_empty() {
+            continue;
+        }
+        let risky = MARKERS.iter().any(|marker| {
+            line.match_indices(marker).any(|(index, _)| {
+                let prefix = &line[..index];
+                !NEGATED_PREFIXES.iter().any(|negation| {
+                    prefix
+                        .trim_end_matches(|ch: char| {
+                            ch.is_whitespace()
+                                || matches!(ch, '，' | ',' | '：' | ':' | '“' | '"' | '（' | '(')
+                        })
+                        .ends_with(negation)
+                })
+            })
+        });
+        if risky {
+            let note = format!("原文含需运营核验的绝对承诺：{line}");
+            if seen.insert(note.clone()) {
+                notes.push(note);
+            }
+        }
+    }
+    notes
+}
+
+fn merge_import_risk_notes(value: &Value, content: &str) -> Vec<String> {
+    let mut notes = json_string_list(value, "riskNotes")
+        .or_else(|| json_string_list(value, "risk_notes"))
+        .unwrap_or_default();
+    let mut seen: std::collections::HashSet<String> = notes.iter().cloned().collect();
+    for note in deterministic_import_risk_notes(content) {
+        if seen.insert(note.clone()) {
+            notes.push(note);
+        }
+    }
+    notes
+}
+
 pub(super) fn normalize_operation_knowledge_preview_document(
     value: Value,
     payload: &OperationKnowledgeImportRequest,
@@ -800,6 +887,7 @@ pub(super) fn normalize_operation_knowledge_preview_document(
         .source_name
         .clone()
         .unwrap_or_else(|| "导入文本".to_string());
+    let risk_notes = merge_import_risk_notes(&value, &payload.content);
     json!({
         "accountId": payload.account_id,
         "domain": json_string(&value, "domain")
@@ -811,7 +899,7 @@ pub(super) fn normalize_operation_knowledge_preview_document(
         "summary": json_string(&value, "summary").unwrap_or_default(),
         "catalogSummary": json_string(&value, "catalogSummary").or_else(|| json_string(&value, "catalog_summary")).unwrap_or_default(),
         "routingMap": json_string_list(&value, "routingMap").or_else(|| json_string_list(&value, "routing_map")).unwrap_or_default(),
-        "riskNotes": json_string_list(&value, "riskNotes").or_else(|| json_string_list(&value, "risk_notes")).unwrap_or_default(),
+        "riskNotes": risk_notes,
         "productTags": json_string_list(&value, "productTags").or_else(|| json_string_list(&value, "product_tags")).unwrap_or_default(),
         "businessTopics": json_string_list(&value, "businessTopics").or_else(|| json_string_list(&value, "business_topics")).unwrap_or_default(),
         "rawContent": payload.content,
@@ -829,6 +917,7 @@ pub(super) fn default_operation_knowledge_preview_document(
         .source_name
         .clone()
         .unwrap_or_else(|| "导入文本".to_string());
+    let risk_notes = deterministic_import_risk_notes(&payload.content);
     json!({
         "accountId": payload.account_id,
         "domain": default_user_operations_domain(),
@@ -838,7 +927,7 @@ pub(super) fn default_operation_knowledge_preview_document(
         "summary": "",
         "catalogSummary": "",
         "routingMap": [],
-        "riskNotes": [],
+        "riskNotes": risk_notes,
         "rawContent": payload.content,
         "contentHash": stable_text_hash(&payload.content),
         "lineIndex": build_line_index(&payload.content),
@@ -1315,6 +1404,43 @@ fn truncate_for_prompt(input: &str, max_chars: usize) -> String {
 }
 
 /// 共享：写一条 AgentEvent。repair / chat / digest 多个子域复用，故留 mod.rs。
+/// Persist a durable identity before a knowledge workflow makes any LLM call.
+/// This write is intentionally fail-closed: without it, contact-less failed runs
+/// cannot be attributed or safely reconciled/cleaned after an interruption.
+async fn record_knowledge_run_started(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+    run_id: &str,
+    operation: &str,
+    chunk_ids: &[String],
+) -> AppResult<()> {
+    state
+        .db
+        .events()
+        .insert_one(
+            crate::models::AgentEvent {
+                id: None,
+                workspace_id: workspace_id.to_string(),
+                account_id: account_id.to_string(),
+                contact_wxid: None,
+                kind: "knowledge_run_started".to_string(),
+                status: "running".to_string(),
+                summary: format!("知识任务已启动：{operation}"),
+                details: Some(doc! {
+                    "runId": run_id,
+                    "operation": operation,
+                    "chunkIds": chunk_ids,
+                }),
+                created_at: DateTime::now(),
+                dedupe_key: None,
+            },
+            None,
+        )
+        .await?;
+    Ok(())
+}
+
 async fn record_repair_event(
     state: &AppState,
     workspace_id: &str,
@@ -1395,6 +1521,54 @@ fn parse_warning_to_json(w: &crate::knowledge_wiki::block_parser::ParseWarning) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn import_risk_notes_add_original_absolute_promises_and_keep_model_notes() {
+        let payload = OperationKnowledgeImportRequest {
+            account_id: Some("account-1".to_string()),
+            source_name: Some("source.md".to_string()),
+            content: "普通介绍。\n- 报名即可保证学会，学不会免费重读！\n- 全市第一。".to_string(),
+        };
+        let normalized = normalize_operation_knowledge_preview_document(
+            json!({ "riskNotes": ["模型识别：效果数据待核验"] }),
+            &payload,
+        );
+        let notes = normalized["riskNotes"].as_array().expect("risk notes");
+        assert!(notes.iter().any(|note| note == "模型识别：效果数据待核验"));
+        assert!(notes.iter().any(|note| {
+            note.as_str()
+                .is_some_and(|text| text.contains("报名即可保证学会，学不会免费重读！"))
+        }));
+        assert!(notes
+            .iter()
+            .any(|note| { note.as_str().is_some_and(|text| text.contains("全市第一")) }));
+    }
+
+    #[test]
+    fn import_risk_notes_skip_negated_disclaimers_and_deduplicate_lines() {
+        let notes = deterministic_import_risk_notes(
+            "我们不能保证学会。\n不提供无条件退款。\n包教包会。\n包教包会。",
+        );
+        assert_eq!(
+            notes.len(),
+            1,
+            "only the affirmative duplicate promise remains"
+        );
+        assert!(notes[0].contains("包教包会"));
+    }
+
+    #[test]
+    fn default_import_document_keeps_deterministic_risk_floor() {
+        let payload = OperationKnowledgeImportRequest {
+            account_id: None,
+            source_name: None,
+            content: "任何时候不满意都可无条件退款。".to_string(),
+        };
+        let document = default_operation_knowledge_preview_document(&payload);
+        assert!(document["riskNotes"]
+            .as_array()
+            .is_some_and(|notes| !notes.is_empty()));
+    }
 
     /// 红线「AI 永不自动 verify」：preview 路径即使 sourceQuote 完整命中原文锚点，
     /// integrityStatus 也只能到 needs_review，绝不能直接 verified（K5 真模型暴露）。
