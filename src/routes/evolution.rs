@@ -746,9 +746,10 @@ pub(super) async fn put_evolution_runtime_flag(
         .unwrap_or(DEFAULT_RELEASE_ADMIN);
     let now = DateTime::now();
 
-    if payload.threshold_auto_release_enabled == Some(true)
-        && !crate::evolution::auto_release::CURRENT_AUTO_RELEASE_POLICY_ENABLED
-    {
+    // HC-017（终裁 10-x 清理后）：自动发布通道已随 `evolution::auto_release` 模块
+    // 一并删除——当前产品边界是全部 proposal 由管理员显式发布，该子闸对 `true`
+    // 固定拒绝（不再引用已删除的编译期政策常量）。
+    if payload.threshold_auto_release_enabled == Some(true) {
         return Err(AppError::BadRequest(
             "automatic Evolution release is disabled by the current human-release policy"
                 .to_string(),
