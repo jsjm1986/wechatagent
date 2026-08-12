@@ -61,29 +61,33 @@ def main() -> None:
                 f"run={run}", "critical", "超时未落 run log→端点挂或 runner 死")
     if run is None:
         return
-    _lib.assert_llm_success(600, "user.reply.task", DOMAIN)
+    _lib.assert_llm_success_for_run(
+        str(run.get("run_id", "")), "user.reply.fast.task", DOMAIN
+    )
 
-    ob = _lib.latest_outbox(WXID, limit=8)
+    run_id = run.get("run_id", "") if isinstance(run, dict) else ""
+    _lib.expect(bool(run_id), DOMAIN, "本轮返回可绑定的 run_id", f"run={run}", "critical")
+    ob = _lib.outbox_for_run(WXID, run_id)
     has_asset = any(o.get("media_asset_id") for o in ob)
     _lib.expect(has_asset, DOMAIN, "素材真入 outbox(media_asset_id 非空,验证发素材链路)",
-                f"outbox={ob}", "high",
+                f"run_id={run_id} outbox={ob}", "high",
                 "要报价单但 outbox 无 media_asset_id→assets_to_send 链路未走通")
 
     # 二次门：sendable=false 诱饵不应入 outbox
     no_bait = bool(bait_id) and not any(bait_id in str(o.get("media_asset_id", "")) for o in ob)
     _lib.expect(no_bait, DOMAIN, "二次门拦 sendable=false 诱饵(不入 outbox)",
-                f"bait_id={bait_id} outbox={ob}", "high",
+                f"run_id={run_id} bait_id={bait_id} outbox={ob}", "high",
                 "sendable=false 仍入 outbox=发送二次安全门破")
 
     # C 类：Review Agent 五维评分落 agent_decision_reviews.scores（内部键 camelCase）
-    dr = _lib.latest_decision_review(WXID)
+    dr = _lib.decision_review_for_run(WXID, run_id)
     scores = dr.get("scores")
     has_scores = bool(scores) and any(
         k in str(scores) for k in ("factRisk", "humanLikeScore", "productAccuracy",
                                     "pressureRisk", "emotionalValue")
     )
     _lib.expect(has_scores, DOMAIN, "C类:Review Agent 五维评分落 agent_decision_reviews.scores",
-                f"scores={scores}", "high", "发送守门人五闸应有五维评分(factRisk 等)")
+                f"run_id={run_id} review={dr} scores={scores}", "high", "发送守门人五闸应有五维评分(factRisk 等)")
     _lib.assert_llm_success(600, "user.review.system", DOMAIN)
 
     print(f"[{DOMAIN}] 完成")

@@ -12,12 +12,46 @@ import json
 import os
 import sys
 from pathlib import Path
+from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).parent))
 import _lib
 
-# 测试 account：用户冒烟时定的 account_id=2（客服b）。
-TEST_ACCOUNT_ID = os.environ.get("BIZTEST_ACCOUNTID", "2")
+# 可通过环境显式绑定；未指定时仅接受唯一一个完整、在线且 active 的账号。
+# 禁止历史默认值静默指向另一套环境中的账号。
+TEST_ACCOUNT_ID = os.environ.get("BIZTEST_ACCOUNTID", "").strip() or None
+
+
+def select_test_account(rows: object, requested_id: Optional[str] = None) -> dict:
+    """Select one fully usable account, failing closed on absence or ambiguity."""
+    if not isinstance(rows, list):
+        raise ValueError("wechat account inventory is unreadable")
+
+    def usable(row: object) -> bool:
+        return (
+            isinstance(row, dict)
+            and isinstance(row.get("account_id"), str)
+            and bool(row["account_id"].strip())
+            and isinstance(row.get("app_id"), str)
+            and bool(row["app_id"].strip())
+            and isinstance(row.get("webhook_secret"), str)
+            and bool(row["webhook_secret"].strip())
+            and row.get("online") is True
+            and row.get("status") == "active"
+        )
+
+    candidates = [row for row in rows if usable(row)]
+    if requested_id:
+        matches = [row for row in candidates if row.get("account_id") == requested_id]
+        if len(matches) != 1:
+            raise ValueError(
+                f"explicit BIZTEST_ACCOUNTID={requested_id} does not identify exactly one usable account"
+            )
+        return matches[0]
+    if len(candidates) != 1:
+        ids = sorted(str(row.get("account_id", "<missing>")) for row in candidates)
+        raise ValueError(f"expected exactly one usable account, found {len(candidates)}: {ids}")
+    return candidates[0]
 
 
 def unsafe_principal_targets(rows: object) -> list[str]:
@@ -48,8 +82,10 @@ def banner(t: str) -> None:
 
 def main() -> None:
     banner("[1/5] server HEAD + app health")
-    print(_lib.remote_run("cd /opt/wechatagent && git rev-parse HEAD && git log --oneline -2")[1])
-    print("app:", _lib.remote_run("curl -s -o /dev/null -w '%{http_code}' http://localhost:3003/")[1])
+    print(f"release={Path(__file__).resolve().parents[2]}")
+    print("app:", _lib.remote_run(
+        f"curl -s -o /dev/null -w '%{{http_code}}' {_lib.APP_BASE_URL}/"
+    )[1])
 
     banner("[2/5] 管理员登录 → /tmp/biztest_cookie")
     admin_user = os.environ.get("ADMIN_USER", "admin")
@@ -59,7 +95,7 @@ def main() -> None:
     login = (
         f"echo {b} | base64 -d > /tmp/biztest_login.json && "
         f"curl -s -c /tmp/biztest_cookie -w ' HTTP:%{{http_code}}' -X POST "
-        f"http://localhost:3003/api/auth/login -H 'Content-Type: application/json' "
+        f"{_lib.APP_BASE_URL}/api/auth/login -H 'Content-Type: application/json' "
         f"--data-binary @/tmp/biztest_login.json"
     )
     _, out = _lib.remote_run_b64(login)
@@ -83,21 +119,32 @@ def main() -> None:
         raise SystemExit("无 active provider")
 
     banner("[4/5] 测试 account")
-    acc = _lib.mongo_json(
-        f'db.wechat_accounts.find({{account_id:"{TEST_ACCOUNT_ID}"}},'
-        f'{{account_id:1,app_id:1,display_name:1,online:1,webhook_secret:1,_id:0}}).toArray()'
+    inventory = _lib.mongo_json(
+        'db.wechat_accounts.find({},'
+        '{account_id:1,app_id:1,display_name:1,online:1,status:1,webhook_secret:1,_id:0})'
+        '.toArray()'
     )
-    if not acc or not isinstance(acc, list) or not acc[0].get("app_id"):
-        _lib.record("step0", f"测试 account_id={TEST_ACCOUNT_ID} 不存在", str(acc)[:200], "critical", "无可用 account")
-        raise SystemExit("测试 account 不存在")
-    account = acc[0]
+    try:
+        account = select_test_account(inventory, TEST_ACCOUNT_ID)
+    except ValueError as error:
+        safe_inventory = [
+            {
+                "account_id": row.get("account_id"),
+                "online": row.get("online"),
+                "status": row.get("status"),
+                "has_app_id": bool(row.get("app_id")),
+                "has_webhook_secret": bool(row.get("webhook_secret")),
+            }
+            for row in inventory
+            if isinstance(row, dict)
+        ] if isinstance(inventory, list) else "<unreadable>"
+        _lib.record("step0", "无法唯一选择可用测试 account",
+                    f"error={error} inventory={safe_inventory}", "critical",
+                    "需唯一 online+active 且具备 app_id/webhook_secret 的账号，或显式设置 BIZTEST_ACCOUNTID")
+        raise SystemExit("测试 account 不可用或不唯一") from error
+    account_id = account["account_id"]
     app_id = account["app_id"]
-    print(f"account_id={TEST_ACCOUNT_ID} app_id={app_id} name={account.get('display_name')}")
-    if account.get("online") is not True:
-        raise SystemExit("测试账号不在线；拒绝修改生产账号状态，请先使用隔离测试账号")
-    secret = account.get("webhook_secret")
-    if not isinstance(secret, str) or not secret.strip():
-        raise SystemExit("测试账号未配置 webhook_secret，无法按正式协议验签")
+    print(f"account_id={account_id} app_id={app_id} name={account.get('display_name')}")
 
     policies = _lib.mongo_json(
         'db.operation_domain_configs.find({workspace_id:"default",current_version:true},'
@@ -109,7 +156,7 @@ def main() -> None:
             "生产决策人目标未隔离，拒绝注入式业务测试；请使用随机数据库候选环境。"
             f" unsafePrincipalCount={len(unsafe)}"
         )
-    _lib.remote_run(f"echo '{TEST_ACCOUNT_ID}|{app_id}' > /tmp/biztest_account")
+    _lib.remote_run(f"echo '{account_id}|{app_id}' > /tmp/biztest_account")
 
     banner("[5/5] preflight 完成")
     print(f"真模型记录: ACTIVE={active.get('model')} VISION={vision.get('model') if vision else 'NONE'}")
