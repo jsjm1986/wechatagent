@@ -13,13 +13,37 @@ use crate::agent::escalation::{
 };
 use crate::auth::AuthenticatedAdmin;
 use crate::error::{AppError, AppResult};
-use crate::models::PrincipalDecision;
+use crate::models::{AgentPrincipalEscalation, PrincipalDecision};
 use mongodb::bson::DateTime;
 
 #[derive(Debug, Deserialize)]
 pub struct ListQuery {
     #[serde(default)]
     pub status: Option<String>,
+}
+
+/// 单条请示 → 列表项 JSON（具名以便单测）。
+///
+/// `createdAt` / `authorizationExpiresAt` 必须经 `dt_to_string` 转 RFC3339 字符串：
+/// 裸 `bson::DateTime` 会序列化成扩展 JSON 对象 `{"$date":{"$numberLong":…}}`，
+/// 前端（ResolvedEscalations.formatExpiry）把对象当 React child 渲染会整页崩溃
+/// （domain_profiles::profile_view 注释记录的白屏事故同款形态，wire 统一 RFC3339）。
+fn escalation_list_item_json(e: &AgentPrincipalEscalation, now_ms: i64) -> Value {
+    let age_hours = (now_ms - e.created_at.timestamp_millis()) as f64 / (3600.0 * 1000.0);
+    json!({
+        "shortCode": e.short_code,
+        "contactWxid": e.contact_wxid,
+        "category": e.category,
+        "reason": e.reason,
+        "questionForPrincipal": e.question_for_principal,
+        "principalWxid": e.principal_wxid,
+        "status": e.status,
+        "ageHours": age_hours,
+        "createdAt": crate::models::dt_to_string(e.created_at),
+        "decision": e.decision,
+        "authorizationExpiresAt": e.authorization_expires_at.and_then(crate::models::dt_to_string),
+        "resolvedVia": e.resolved_via,
+    })
 }
 
 /// GET /api/admin/principal-escalations?status=pending|resolved|delivery_failed
@@ -38,23 +62,7 @@ pub async fn list_principal_escalations(
     let now = DateTime::now().timestamp_millis();
     let json_items: Vec<Value> = items
         .iter()
-        .map(|e| {
-            let age_hours = (now - e.created_at.timestamp_millis()) as f64 / (3600.0 * 1000.0);
-            json!({
-                "shortCode": e.short_code,
-                "contactWxid": e.contact_wxid,
-                "category": e.category,
-                "reason": e.reason,
-                "questionForPrincipal": e.question_for_principal,
-                "principalWxid": e.principal_wxid,
-                "status": e.status,
-                "ageHours": age_hours,
-                "createdAt": e.created_at,
-                "decision": e.decision,
-                "authorizationExpiresAt": e.authorization_expires_at,
-                "resolvedVia": e.resolved_via,
-            })
-        })
+        .map(|e| escalation_list_item_json(e, now))
         .collect();
     Ok(Json(json!({ "items": json_items })))
 }
@@ -246,6 +254,84 @@ mod resolve_validation_tests {
         let decision = validate_admin_decision(value).expect("valid decision");
         assert_eq!(decision.authorization_window_hours, Some(24.0));
         assert_eq!(decision.exemption_type, "customer_only");
+    }
+}
+
+#[cfg(test)]
+mod list_projection_tests {
+    use super::*;
+
+    fn resolved_escalation_fixture() -> AgentPrincipalEscalation {
+        let created = DateTime::from_millis(1_700_000_000_000);
+        AgentPrincipalEscalation {
+            id: None,
+            workspace_id: "ws1".into(),
+            account_id: "acc1".into(),
+            contact_wxid: "wxid_cust".into(),
+            short_code: "E1A2".into(),
+            status: "resolved".into(),
+            category: "discount_request".into(),
+            reason: "客户想要折扣，超出 AI 职权".into(),
+            question_for_principal: "能否给折扣".into(),
+            principal_wxid: "wxid_boss".into(),
+            protocol: None,
+            decision: Some(PrincipalDecision {
+                verdict: "conditional".into(),
+                substance: "同意 9 折，本周内有效".into(),
+                constraints: vec!["本周内付款".into()],
+                authorization_window_hours: Some(24.0),
+                exemption_type: crate::models::EXEMPTION_TYPE_NONE.into(),
+            }),
+            authorization_expires_at: Some(DateTime::from_millis(1_700_086_400_000)),
+            is_generalizable: false,
+            knowledge_proposal_emitted: false,
+            last_holding_reply_ms: None,
+            last_pushed_at_ms: None,
+            created_at: created,
+            updated_at: created,
+            resolved_at: Some(created),
+            resolved_via: Some("admin".into()),
+            relay_state: None,
+            relay_task_id: None,
+            relay_enqueued_at: None,
+            relay_terminal_at: None,
+            relay_terminal_reason: None,
+        }
+    }
+
+    /// 裁决历史契约：时间字段必须是 RFC3339 字符串，绝不能是 bson 扩展 JSON
+    /// 对象 `{"$date":…}`——前端把对象当 React child 渲染会整页崩溃
+    /// （domain_profiles::profile_view 注释记录的白屏事故同款形态）。
+    #[test]
+    fn list_item_serializes_datetimes_as_rfc3339_strings_not_extjson_objects() {
+        let entry = resolved_escalation_fixture();
+        let v = escalation_list_item_json(&entry, 1_700_000_000_000);
+
+        let created = v["createdAt"].as_str().expect("createdAt must be a string");
+        assert!(created.starts_with("2023-11-14T22:13:20"), "{created}");
+        let expires = v["authorizationExpiresAt"]
+            .as_str()
+            .expect("authorizationExpiresAt must be a string");
+        assert!(expires.starts_with("2023-11-15T22:13:20"), "{expires}");
+
+        let raw = serde_json::to_string(&v).expect("serialize");
+        assert!(!raw.contains("$date"), "no bson extjson leakage: {raw}");
+        // decision 内层键保持 snake_case（PrincipalDecision 无 rename_all，前端按此消费）。
+        assert_eq!(v["decision"]["authorization_window_hours"], 24.0);
+    }
+
+    #[test]
+    fn list_item_keeps_null_expiry_and_pending_shape() {
+        let mut entry = resolved_escalation_fixture();
+        entry.authorization_expires_at = None;
+        entry.decision = None;
+        entry.resolved_via = None;
+        let v = escalation_list_item_json(&entry, 1_700_000_000_000);
+        assert!(v["authorizationExpiresAt"].is_null());
+        assert!(v["decision"].is_null());
+        assert!(v["resolvedVia"].is_null());
+        assert_eq!(v["shortCode"], "E1A2");
+        assert_eq!(v["ageHours"], 0.0);
     }
 }
 
