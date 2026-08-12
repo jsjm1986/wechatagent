@@ -284,8 +284,12 @@ pub fn decide_negative_reaction_block(enabled: bool, observed: Option<f64>, max_
 /// 在 `[window_start, now)` 区间扫一次 `agent_run_logs`，按 [`THRESHOLD_REASONABLE_BANDS`]
 /// 6 个 gate 的命中分类聚合命中率（命中 / 总数）。`total=0` 时返回空 map（与 None 等价）。
 ///
-/// 与 [`super::threshold::generate`] 内的口径一致：5 闸 block 类直接看
-/// `final_review_status`；rewrite 类用 `revision_applied=true` 给 human_like /
+/// 终态归因与 [`super::threshold::classify_gate_hit`] 同口径：block 类只有
+/// fact（held_by_ai_policy）与 product（blocked_unverified_product_claim）两个
+/// 有真实终态源；`blocked_by_safety_guard` 来自证据门/fail-closed 基础设施路径，
+/// **不归任何 gate**（缺陷 #16）。pressure_risk_block 是软闸无 block 终态——
+/// 窗口内恒 0 命中率没有意义，故与 planner 一样**不落 map**（decide_auto_release
+/// 收到 None 保守拒释放）。rewrite 类用 `revision_applied=true` 给 human_like /
 /// emotional_value 各 +1 命中（反映"draft 不达标曾被 rewrite"的频次）。
 async fn compute_window_gate_hit_rates(
     state: &AppState,
@@ -308,8 +312,16 @@ async fn compute_window_gate_hit_rates(
         return Ok(out);
     }
 
+    // 只为有真实统计源的 gate 建计数（缺陷 #16：pressure 软闸与 planner 一样
+    // 无源——不建条目 → map 缺失 → decide_auto_release 收 None 保守拒）。
     let mut counts: HashMap<&'static str, i64> = HashMap::new();
     for (gate, _l, _u) in THRESHOLD_REASONABLE_BANDS {
+        if matches!(
+            *gate,
+            "pressure_risk_block" | "planner_block_rate_threshold"
+        ) {
+            continue;
+        }
         counts.insert(*gate, 0);
     }
 
@@ -325,9 +337,8 @@ async fn compute_window_gate_hit_rates(
             "held_by_ai_policy" => {
                 *counts.entry("fact_risk_block").or_default() += 1;
             }
-            "blocked_by_safety_guard" => {
-                *counts.entry("pressure_risk_block").or_default() += 1;
-            }
+            // blocked_by_safety_guard：证据门/fail-closed 基础设施终态，不归任何
+            // gate（缺陷 #16，与 threshold::classify_gate_hit 同口径）。
             _ => {}
         }
         if run.revision_applied {
@@ -335,8 +346,6 @@ async fn compute_window_gate_hit_rates(
             *counts.entry("emotional_value_rewrite").or_default() += 1;
         }
     }
-    // planner_block_rate_threshold 暂不在 agent_run_logs 计数；窗口内若无样本
-    // → 留 None，decide_auto_release 会保守拒释放。
     for (gate, hit) in counts {
         out.insert(gate.to_string(), hit as f64 / total);
     }
