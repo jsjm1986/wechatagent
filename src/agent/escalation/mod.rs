@@ -553,109 +553,134 @@ pub(crate) async fn handle_principal_reply(
     }
 }
 
-/// 超时转备选：只扫描当前卡已由 Outbox 确认送达的新协议请示，并严格使用创建时冻结的
-/// policy/account 快照。改派以 escalation 单文档 CAS 开启下一 delivery generation，再由
-/// Outbox 幂等物化；这里不直接跨越 MCP 远端边界。
+/// 超时转备选：扫描新协议 pending 请示并严格使用创建时冻结的 policy/account 快照。
+/// 改派以 escalation 单文档 CAS 开启下一 delivery generation，再由 Outbox 幂等物化；
+/// 这里不直接跨越 MCP 远端边界。
+///
+/// 两个入口共用同一套超时收敛语义（[`converge_timed_out_escalation`]），仅时间基准不同：
+/// - 常规：当前卡已由 Outbox 确认送达（delivery_state=sent 且有推送时刻），
+///   以 `last_pushed_at_ms` 计龄；
+/// - 滞留：投递终失败 / 不可核验（failed_terminal / delivery_unknown），或 sent 但缺
+///   推送时刻的异常形态——没有可信推送时刻，以 `created_at` 计龄。此前这些行进不了
+///   常规扫描、会静默滞留（无改派也无安抚）。
 pub async fn scan_escalation_timeouts(state: &AppState) -> AppResult<()> {
     let now_ms = DateTime::now().timestamp_millis();
     for entry in list_timeout_eligible_escalations(state).await? {
-        let Some(protocol) = entry.protocol.as_ref() else {
-            continue;
-        };
-        let policy = resolve_ask_human_policy_snapshot(&protocol.policy);
         let Some(last_pushed_at_ms) = entry.last_pushed_at_ms else {
             continue;
         };
-        let age_hours = (now_ms - last_pushed_at_ms) as f64 / (3600.0 * 1000.0);
-        let Some(next) = next_decider_on_timeout(
-            &policy,
-            &entry.principal_wxid,
-            &entry.contact_wxid,
-            age_hours,
-        ) else {
-            let timed_out = policy
-                .timeout_hours
-                .is_some_and(|timeout| age_hours >= timeout);
-            if timed_out {
-                let min_interval_ms =
-                    (state.config.holding_reply_min_interval_hours * 3600.0 * 1000.0) as i64;
-                let should_send = entry
-                    .last_holding_reply_ms
-                    .is_none_or(|last| now_ms - last >= min_interval_ms);
-                if should_send {
-                    let holding_text = generate_holding_reply(
-                        state,
-                        &entry.workspace_id,
-                        &entry.account_id,
-                        &entry.contact_wxid,
-                        HoldingReplyScene::ChainTail,
-                        None,
-                    )
-                    .await;
-                    let window_ms = min_interval_ms.max(1);
-                    let window = now_ms.div_euclid(window_ms);
-                    match enqueue_holding_reply(
-                        state,
-                        &entry.workspace_id,
-                        &entry.account_id,
-                        &entry.contact_wxid,
-                        format!("holding-chain-tail-{}-{window}", entry.short_code),
-                        format!("principal-chain-tail:{}:{window}", entry.short_code),
-                        None,
-                        holding_text,
-                    )
-                    .await
-                    {
-                        Ok(_) => {
-                            if let Err(error) = touch_last_holding_reply_ms(
-                                state,
-                                &entry.workspace_id,
-                                &entry.short_code,
-                                now_ms,
-                            )
-                            .await
-                            {
-                                tracing::warn!(short_code = %entry.short_code, ?error, "链尾安抚已入队但更新时间失败");
-                            }
+        converge_timed_out_escalation(state, &entry, now_ms, last_pushed_at_ms).await?;
+    }
+    for entry in list_stranded_delivery_escalations(state).await? {
+        let created_at_ms = entry.created_at.timestamp_millis();
+        converge_timed_out_escalation(state, &entry, now_ms, created_at_ms).await?;
+    }
+    Ok(())
+}
+
+/// 单条 pending 请示的超时收敛：按冻结 policy 判定是否超时；超时且链上有下一位
+/// 决策人 → 骚扰门放行后改派并重推卡（刷新投递代次）；超时且已到链尾 → 给客户
+/// 发链尾安抚（按最小间隔去重）；未超时 → 不动。`age_base_ms` 是计龄基准
+/// （常规卡=推送时刻，滞留卡=创建时刻），语义由调用方保证。
+async fn converge_timed_out_escalation(
+    state: &AppState,
+    entry: &AgentPrincipalEscalation,
+    now_ms: i64,
+    age_base_ms: i64,
+) -> AppResult<()> {
+    let Some(protocol) = entry.protocol.as_ref() else {
+        return Ok(());
+    };
+    let policy = resolve_ask_human_policy_snapshot(&protocol.policy);
+    let age_hours = (now_ms - age_base_ms) as f64 / (3600.0 * 1000.0);
+    let Some(next) = next_decider_on_timeout(
+        &policy,
+        &entry.principal_wxid,
+        &entry.contact_wxid,
+        age_hours,
+    ) else {
+        let timed_out = policy
+            .timeout_hours
+            .is_some_and(|timeout| age_hours >= timeout);
+        if timed_out {
+            let min_interval_ms =
+                (state.config.holding_reply_min_interval_hours * 3600.0 * 1000.0) as i64;
+            let should_send = entry
+                .last_holding_reply_ms
+                .is_none_or(|last| now_ms - last >= min_interval_ms);
+            if should_send {
+                let holding_text = generate_holding_reply(
+                    state,
+                    &entry.workspace_id,
+                    &entry.account_id,
+                    &entry.contact_wxid,
+                    HoldingReplyScene::ChainTail,
+                    None,
+                )
+                .await;
+                let window_ms = min_interval_ms.max(1);
+                let window = now_ms.div_euclid(window_ms);
+                match enqueue_holding_reply(
+                    state,
+                    &entry.workspace_id,
+                    &entry.account_id,
+                    &entry.contact_wxid,
+                    format!("holding-chain-tail-{}-{window}", entry.short_code),
+                    format!("principal-chain-tail:{}:{window}", entry.short_code),
+                    None,
+                    holding_text,
+                )
+                .await
+                {
+                    Ok(_) => {
+                        if let Err(error) = touch_last_holding_reply_ms(
+                            state,
+                            &entry.workspace_id,
+                            &entry.short_code,
+                            now_ms,
+                        )
+                        .await
+                        {
+                            tracing::warn!(short_code = %entry.short_code, ?error, "链尾安抚已入队但更新时间失败");
                         }
-                        Err(error) => {
-                            tracing::warn!(short_code = %entry.short_code, ?error, "chain-tail holding reply enqueue failed");
-                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(short_code = %entry.short_code, ?error, "chain-tail holding reply enqueue failed");
                     }
                 }
             }
-            continue;
-        };
-        let next_wxid = next.wxid.clone();
-        let Some(next_account_id) = next
-            .account_id
-            .as_deref()
-            .filter(|account_id| !account_id.trim().is_empty())
-            .map(str::to_string)
-        else {
-            tracing::error!(short_code = %entry.short_code, next = %next_wxid, "冻结决策人缺少发送账号，拒绝改派");
-            continue;
-        };
-        let since_ms = now_ms - 24 * 3600 * 1000;
-        let today = count_pushes_today(state, &entry.workspace_id, &next_wxid, since_ms).await?;
-        let last_push = latest_push_ms(state, &entry.workspace_id, &next_wxid).await?;
-        if !push_allowed(&policy, today, last_push, now_ms) {
-            continue;
         }
-        if let Some(next_entry) = reassign_escalation(
-            state,
-            &entry.workspace_id,
-            &entry.short_code,
-            &entry.principal_wxid,
-            protocol.delivery_generation,
-            &next_wxid,
-            &next_account_id,
-        )
-        .await?
-        {
-            // 入队确认失败时保留 pending_enqueue，下一 worker tick 会按 generation 幂等补偿。
-            materialize_principal_card_delivery(state, &next_entry).await?;
-        }
+        return Ok(());
+    };
+    let next_wxid = next.wxid.clone();
+    let Some(next_account_id) = next
+        .account_id
+        .as_deref()
+        .filter(|account_id| !account_id.trim().is_empty())
+        .map(str::to_string)
+    else {
+        tracing::error!(short_code = %entry.short_code, next = %next_wxid, "冻结决策人缺少发送账号，拒绝改派");
+        return Ok(());
+    };
+    let since_ms = now_ms - 24 * 3600 * 1000;
+    let today = count_pushes_today(state, &entry.workspace_id, &next_wxid, since_ms).await?;
+    let last_push = latest_push_ms(state, &entry.workspace_id, &next_wxid).await?;
+    if !push_allowed(&policy, today, last_push, now_ms) {
+        return Ok(());
+    }
+    if let Some(next_entry) = reassign_escalation(
+        state,
+        &entry.workspace_id,
+        &entry.short_code,
+        &entry.principal_wxid,
+        protocol.delivery_generation,
+        &next_wxid,
+        &next_account_id,
+    )
+    .await?
+    {
+        // 入队确认失败时保留 pending_enqueue，下一 worker tick 会按 generation 幂等补偿。
+        materialize_principal_card_delivery(state, &next_entry).await?;
     }
     Ok(())
 }

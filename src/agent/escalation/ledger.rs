@@ -1146,6 +1146,45 @@ pub(crate) async fn list_timeout_eligible_escalations(
     Ok(cursor.try_collect().await?)
 }
 
+/// Pending new-protocol rows whose current card can no longer make progress by
+/// itself: the delivery is terminally failed or unverifiable
+/// (`failed_terminal` / `delivery_unknown`), or the row claims `sent` but has
+/// no numeric push time (anomalous shape). None of these ever gains a trusted
+/// push timestamp, so [`list_timeout_eligible_escalations`] can never surface
+/// them; the scan converges them on the `created_at` time base instead.
+/// `pending_enqueue` / `queued` rows are excluded — the delivery reconciler
+/// still owns their progress.
+pub(crate) async fn list_stranded_delivery_escalations(
+    state: &AppState,
+) -> AppResult<Vec<AgentPrincipalEscalation>> {
+    use futures::TryStreamExt;
+    let cursor = state
+        .db
+        .agent_principal_escalations()
+        .find(
+            doc! {
+                "status": PRINCIPAL_ESCALATION_STATUS_PENDING,
+                "protocol.policy.timeoutHours": { "$type": "number" },
+                "$or": [
+                    { "protocol.delivery_state": { "$in": [
+                        PRINCIPAL_CARD_DELIVERY_FAILED_TERMINAL,
+                        PRINCIPAL_CARD_DELIVERY_UNKNOWN,
+                    ] } },
+                    {
+                        "protocol.delivery_state": PRINCIPAL_CARD_DELIVERY_SENT,
+                        "last_pushed_at_ms": { "$not": { "$type": "number" } },
+                    },
+                ],
+            },
+            mongodb::options::FindOptions::builder()
+                .sort(doc! { "created_at": 1, "_id": 1 })
+                .limit(500)
+                .build(),
+        )
+        .await?;
+    Ok(cursor.try_collect().await?)
+}
+
 /// 更新链尾安抚话术发送时刻（去重用）。仅 pending 可更新。
 pub(crate) async fn touch_last_holding_reply_ms(
     state: &AppState,

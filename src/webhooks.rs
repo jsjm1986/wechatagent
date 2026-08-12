@@ -29,6 +29,7 @@ const HANDOFF_PENDING: &str = "pending";
 const HANDOFF_MATERIALIZED: &str = "materialized";
 const HANDOFF_DEFERRED: &str = "deferred"; // legacy read compatibility only
 const HANDOFF_IGNORED: &str = "ignored_not_managed";
+const HANDOFF_QUARANTINED: &str = "quarantined";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DurableInboundTask {
@@ -671,10 +672,7 @@ pub async fn reconcile_workspace_reply_obligations(
         .find(
             doc! {
                 "workspace_id": workspace_id,
-                "kind": { "$in": [
-                    DURABLE_INBOUND_REPLY_KIND,
-                    agent::quiet_hours::DEFERRED_INBOUND_REPLY_KIND,
-                ] },
+                "kind": DURABLE_INBOUND_REPLY_KIND,
                 "status": { "$in": ["pending", "retry", "failed", "running", "outbox_enqueued"] },
             },
             None,
@@ -713,8 +711,6 @@ pub async fn reconcile_workspace_reply_obligations(
         };
         let run_at = policy_run_at(&runtime, &contact, state);
         let old_decision = task.get_object_id("outbox_decision_id").ok();
-        let is_legacy =
-            task.get_str("kind").ok() == Some(agent::quiet_hours::DEFERRED_INBOUND_REPLY_KIND);
 
         // Invalidate ownership first. Dispatcher authorization always joins back to this task.
         let result = tasks
@@ -723,32 +719,18 @@ pub async fn reconcile_workspace_reply_obligations(
                     "_id": task_id,
                     "status": { "$in": ["pending", "retry", "failed", "running", "outbox_enqueued"] },
                 },
-                if is_legacy {
-                    doc! {
-                        "$set": {
-                            "status": "cancelled",
-                            "gateway_status": "merged_into_reply_obligation",
-                            "updated_at": DateTime::now(),
-                        },
-                        "$unset": {
-                            "claim_token": "", "claimed_at": "", "active_task_key": "",
-                            "outbox_decision_id": "", "next_retry_at": "",
-                        },
-                    }
-                } else {
-                    doc! {
-                        "$set": {
-                            "status": "pending",
-                            "run_at": run_at,
-                            "gateway_status": "policy_reconciled",
-                            "attempt_count": 0,
-                            "updated_at": DateTime::now(),
-                        },
-                        "$unset": {
-                            "claim_token": "", "claimed_at": "", "next_retry_at": "",
-                            "outbox_decision_id": "", "error": "",
-                        },
-                    }
+                doc! {
+                    "$set": {
+                        "status": "pending",
+                        "run_at": run_at,
+                        "gateway_status": "policy_reconciled",
+                        "attempt_count": 0,
+                        "updated_at": DateTime::now(),
+                    },
+                    "$unset": {
+                        "claim_token": "", "claimed_at": "", "next_retry_at": "",
+                        "outbox_decision_id": "", "error": "",
+                    },
                 },
                 None,
             )
@@ -765,34 +747,6 @@ pub async fn reconcile_workspace_reply_obligations(
                 "quiet_hours_policy_changed",
             )
             .await?;
-        }
-
-        if is_legacy {
-            if let Some(inbound) = state
-                .db
-                .messages()
-                .find_one(
-                    doc! {
-                        "workspace_id": workspace_id,
-                        "account_id": account_id,
-                        "contact_wxid": contact_wxid,
-                        "direction": "inbound",
-                    },
-                    mongodb::options::FindOneOptions::builder()
-                        .sort(doc! { "created_at": -1, "_id": -1 })
-                        .build(),
-                )
-                .await?
-            {
-                materialize_durable_inbound_task_at(
-                    state,
-                    &contact,
-                    &inbound,
-                    run_at,
-                    "policy_reconciled",
-                )
-                .await?;
-            }
         }
     }
     Ok(changed)
@@ -817,9 +771,18 @@ pub async fn reconcile_pending_inbound_handoffs(state: &AppState) -> AppResult<u
         .await?;
     let mut recovered = 0u64;
     while let Some(raw) = cursor.try_next().await? {
-        let inbound: ConversationMessage = mongodb::bson::from_document(raw).map_err(|error| {
-            AppError::External(format!("pending inbound handoff decode failed: {error}"))
-        })?;
+        // A single undecodable row must never abort this scan: both task-worker
+        // ticks propagate an Err from here, and a broken row sorts first forever
+        // (`created_at` ascending), so failing the whole function would stop
+        // every later pending handoff from materializing. Isolate the row out of
+        // the scan filter and keep going.
+        let inbound: ConversationMessage = match mongodb::bson::from_document(raw.clone()) {
+            Ok(inbound) => inbound,
+            Err(error) => {
+                quarantine_undecodable_inbound_handoff(state, &raw, &error.to_string()).await;
+                continue;
+            }
+        };
         let Some(message_id) = inbound.id else {
             continue;
         };
@@ -905,6 +868,94 @@ pub async fn reconcile_pending_inbound_handoffs(state: &AppState) -> AppResult<u
         recovered = recovered.saturating_add(1);
     }
     Ok(recovered)
+}
+
+/// Isolate one undecodable pending-handoff row (defect #2, poison pill). The
+/// row is stamped `handoff_status=quarantined` directly by `_id` on the raw
+/// Document path (no typed deserialization), which removes it from the
+/// `$in: [pending, deferred]` scan filter, and an admin-visible event records
+/// the decode error. Everything here is best-effort: if the quarantine write
+/// fails the row simply stays pending and is retried on the next tick.
+async fn quarantine_undecodable_inbound_handoff(
+    state: &AppState,
+    raw: &Document,
+    decode_error: &str,
+) {
+    let Some(row_id) = raw.get("_id").cloned() else {
+        tracing::warn!(
+            decode_error,
+            "undecodable inbound handoff row lacks _id; cannot quarantine"
+        );
+        return;
+    };
+    let update = state
+        .db
+        .messages()
+        .clone_with_type::<Document>()
+        .update_one(
+            doc! {
+                "_id": &row_id,
+                "handoff_status": { "$in": [HANDOFF_PENDING, HANDOFF_DEFERRED] },
+            },
+            doc! { "$set": {
+                "handoff_status": HANDOFF_QUARANTINED,
+                "handoff_updated_at": DateTime::now(),
+            } },
+            None,
+        )
+        .await;
+    let quarantined_now = match update {
+        Ok(result) => result.modified_count > 0,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                row_id = %row_id,
+                "failed to quarantine undecodable inbound handoff row"
+            );
+            return;
+        }
+    };
+    // A concurrent worker may have quarantined the same row first; only the
+    // winner records the event so it is written exactly once per row.
+    if !quarantined_now {
+        return;
+    }
+    tracing::warn!(
+        row_id = %row_id,
+        decode_error,
+        "quarantined undecodable inbound handoff row"
+    );
+    let workspace_id = raw
+        .get_str("workspace_id")
+        .map(str::to_owned)
+        .unwrap_or_else(|_| state.config.default_workspace_id.clone());
+    let account_id = raw
+        .get_str("account_id")
+        .map(str::to_owned)
+        .unwrap_or_else(|_| state.config.default_account_id.clone());
+    let contact_wxid = raw.get_str("contact_wxid").map(str::to_owned).ok();
+    let _ = state
+        .db
+        .events()
+        .insert_one(
+            crate::models::AgentEvent {
+                id: None,
+                workspace_id,
+                account_id,
+                contact_wxid,
+                kind: "inbound_handoff_quarantined".to_string(),
+                status: "warning".to_string(),
+                summary: "入站消息行无法反序列化，已隔离出交接扫描，待运维排查".to_string(),
+                details: Some(doc! {
+                    "message_id": &row_id,
+                    "decode_error": decode_error,
+                }),
+                created_at: DateTime::now(),
+                dedupe_key: None,
+            },
+            None,
+        )
+        .await;
 }
 
 /// Stable quota identity for one tenant/account/window.
@@ -1652,16 +1703,12 @@ pub async fn wechat_webhook(
     })))
 }
 
-/// #69 作息门控：静默时段入站时，确保存在一条"醒来回复"跟进任务。
+/// #69 作息门控：静默时段入站时，确保存在一条"醒来回复"义务任务。
 ///
-/// kind = [`agent::quiet_hours::DEFERRED_INBOUND_REPLY_KIND`]，与 planner 主动催进的
-/// `follow_up` 区分——precheck 据此豁免 `context_changed`（这条任务的存在意义恰恰
-/// 就是回 task 创建后累积的客户消息）。`run_at` = 下一次醒来时刻；醒来后由 task
-/// worker → handle_follow_up_task → gateway 走完整决策/审查/拆短/outbox 链路。
-///
-/// 去重：仿 planner `has_pending_follow_up` —— 同 contact 已有未终态的 wake 任务则
-/// 不再插（静默时段连发多条 → 1 task → 醒来基于累积消息回 1 次）。先查后插存在
-/// TOCTOU 窗口，但 precheck 的 rate_limited 闸在醒来时会兜住重复触达，可接受。
+/// 实际物化的是该 contact 唯一的持久 `inbound_reply` 义务（kind =
+/// [`DURABLE_INBOUND_REPLY_KIND`]，经 [`materialize_durable_inbound_task_at`]），
+/// `run_at` = 下一次醒来时刻；醒来后以 Inbound 语义进网关、基于累积消息回 1 次。
+/// 同 contact 的确定性 task `_id` 天然去重（静默时段连发多条 → 1 task）。
 ///
 /// `pub`：暴露给 tests/quiet_hours_deferral.rs 集成测试直接驱动排程链路
 /// （`Utc::now` 不可注入，集成测试只验 DB 写入 + 去重 + 埋点，时区由纯函数单测覆盖）。
