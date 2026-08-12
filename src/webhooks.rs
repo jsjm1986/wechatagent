@@ -29,6 +29,7 @@ const HANDOFF_PENDING: &str = "pending";
 const HANDOFF_MATERIALIZED: &str = "materialized";
 const HANDOFF_DEFERRED: &str = "deferred"; // legacy read compatibility only
 const HANDOFF_IGNORED: &str = "ignored_not_managed";
+const HANDOFF_QUARANTINED: &str = "quarantined";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DurableInboundTask {
@@ -817,9 +818,18 @@ pub async fn reconcile_pending_inbound_handoffs(state: &AppState) -> AppResult<u
         .await?;
     let mut recovered = 0u64;
     while let Some(raw) = cursor.try_next().await? {
-        let inbound: ConversationMessage = mongodb::bson::from_document(raw).map_err(|error| {
-            AppError::External(format!("pending inbound handoff decode failed: {error}"))
-        })?;
+        // A single undecodable row must never abort this scan: both task-worker
+        // ticks propagate an Err from here, and a broken row sorts first forever
+        // (`created_at` ascending), so failing the whole function would stop
+        // every later pending handoff from materializing. Isolate the row out of
+        // the scan filter and keep going.
+        let inbound: ConversationMessage = match mongodb::bson::from_document(raw.clone()) {
+            Ok(inbound) => inbound,
+            Err(error) => {
+                quarantine_undecodable_inbound_handoff(state, &raw, &error.to_string()).await;
+                continue;
+            }
+        };
         let Some(message_id) = inbound.id else {
             continue;
         };
@@ -905,6 +915,94 @@ pub async fn reconcile_pending_inbound_handoffs(state: &AppState) -> AppResult<u
         recovered = recovered.saturating_add(1);
     }
     Ok(recovered)
+}
+
+/// Isolate one undecodable pending-handoff row (defect #2, poison pill). The
+/// row is stamped `handoff_status=quarantined` directly by `_id` on the raw
+/// Document path (no typed deserialization), which removes it from the
+/// `$in: [pending, deferred]` scan filter, and an admin-visible event records
+/// the decode error. Everything here is best-effort: if the quarantine write
+/// fails the row simply stays pending and is retried on the next tick.
+async fn quarantine_undecodable_inbound_handoff(
+    state: &AppState,
+    raw: &Document,
+    decode_error: &str,
+) {
+    let Some(row_id) = raw.get("_id").cloned() else {
+        tracing::warn!(
+            decode_error,
+            "undecodable inbound handoff row lacks _id; cannot quarantine"
+        );
+        return;
+    };
+    let update = state
+        .db
+        .messages()
+        .clone_with_type::<Document>()
+        .update_one(
+            doc! {
+                "_id": &row_id,
+                "handoff_status": { "$in": [HANDOFF_PENDING, HANDOFF_DEFERRED] },
+            },
+            doc! { "$set": {
+                "handoff_status": HANDOFF_QUARANTINED,
+                "handoff_updated_at": DateTime::now(),
+            } },
+            None,
+        )
+        .await;
+    let quarantined_now = match update {
+        Ok(result) => result.modified_count > 0,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                row_id = %row_id,
+                "failed to quarantine undecodable inbound handoff row"
+            );
+            return;
+        }
+    };
+    // A concurrent worker may have quarantined the same row first; only the
+    // winner records the event so it is written exactly once per row.
+    if !quarantined_now {
+        return;
+    }
+    tracing::warn!(
+        row_id = %row_id,
+        decode_error,
+        "quarantined undecodable inbound handoff row"
+    );
+    let workspace_id = raw
+        .get_str("workspace_id")
+        .map(str::to_owned)
+        .unwrap_or_else(|_| state.config.default_workspace_id.clone());
+    let account_id = raw
+        .get_str("account_id")
+        .map(str::to_owned)
+        .unwrap_or_else(|_| state.config.default_account_id.clone());
+    let contact_wxid = raw.get_str("contact_wxid").map(str::to_owned).ok();
+    let _ = state
+        .db
+        .events()
+        .insert_one(
+            crate::models::AgentEvent {
+                id: None,
+                workspace_id,
+                account_id,
+                contact_wxid,
+                kind: "inbound_handoff_quarantined".to_string(),
+                status: "warning".to_string(),
+                summary: "入站消息行无法反序列化，已隔离出交接扫描，待运维排查".to_string(),
+                details: Some(doc! {
+                    "message_id": &row_id,
+                    "decode_error": decode_error,
+                }),
+                created_at: DateTime::now(),
+                dedupe_key: None,
+            },
+            None,
+        )
+        .await;
 }
 
 /// Stable quota identity for one tenant/account/window.
