@@ -1357,6 +1357,17 @@ pub(in crate::routes) fn chunk_verify_gate_reason_for(
     chunk_verify_gate_reason(has_quote, has_anchor)
 }
 
+/// 「active 但缺可引用锚点」的统一口径：integrity 报表的 `anchorsMissing` 计数
+/// （catalog.rs）与 AI Inbox 的 `anchors_missing` 修复卡（digest_inbox.rs）共用，
+/// 防止两处漂移。锚点判定用 citable 谓词（[`crate::models::chunk_has_citable_anchor`]）
+/// 而非裸 `!is_empty()`：只有畸形锚（缺 `sourceQuote` 键）的切片同样无法被引用，
+/// 属于需要重新锚定/计入降级的对象。
+pub(in crate::routes) fn chunk_is_active_missing_citable_anchor(
+    chunk: &crate::models::OperationKnowledgeChunk,
+) -> bool {
+    chunk.status == "active" && !crate::models::chunk_has_citable_anchor(&chunk.source_anchors)
+}
+
 /// `#[cfg(test)]` 的旧请求形态回归 helper：模拟调用方提交 `verified` 但缺
 /// sourceQuote/source_anchors 时的保守降级。生产 create/PUT 不调用本函数，而是在
 /// CRUD 路由无条件强制 `draft + needs_review`；只有专用 `/verify` 路由可以进入
@@ -2325,6 +2336,27 @@ mod tests {
         ];
         assert!(chunk_verify_gate_reason_for(Some("q"), &empty).is_some());
         assert!(chunk_verify_gate_reason_for(Some("q"), &all_blank).is_some());
+    }
+
+    /// B4：报表/修复卡的「缺锚」口径必须把畸形锚（缺 `sourceQuote`）视同无锚，
+    /// 且只统计 active 切片（draft/archived 不计入 D2 降级）。
+    #[test]
+    fn active_missing_citable_anchor_counts_malformed_anchor_as_missing() {
+        let mut chunk = crate::models::OperationKnowledgeChunk {
+            status: "active".to_string(),
+            source_anchors: vec![mongodb::bson::doc! { "startOffset": 0i64 }],
+            ..Default::default()
+        };
+        assert!(chunk_is_active_missing_citable_anchor(&chunk));
+
+        chunk.source_anchors = vec![mongodb::bson::doc! { "sourceQuote": "原文片段" }];
+        assert!(!chunk_is_active_missing_citable_anchor(&chunk));
+
+        chunk.source_anchors = Vec::new();
+        assert!(chunk_is_active_missing_citable_anchor(&chunk));
+
+        chunk.status = "draft".to_string();
+        assert!(!chunk_is_active_missing_citable_anchor(&chunk));
     }
 
     #[test]

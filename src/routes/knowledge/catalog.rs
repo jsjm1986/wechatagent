@@ -172,8 +172,9 @@ pub(in crate::routes) async fn get_operation_knowledge_integrity_report(
 
 /// 构建 integrity-report 主体（可被集成测直接调用，绕过 axum HTTP harness）。
 ///
-/// `anchorsMissing` = D2 降级计数：`status=="active" && source_anchors.is_empty()`
-/// （对齐 digest_inbox.rs:455）。在同一 cursor 内累加，零额外查询。
+/// `anchorsMissing` = D2 降级计数：active 且无可引用锚点（citable 口径，与
+/// digest_inbox 的 anchors_missing 修复卡共用 `chunk_is_active_missing_citable_anchor`）。
+/// 在同一 cursor 内累加，零额外查询。
 pub async fn build_operation_knowledge_integrity_report(
     state: &AppState,
     workspace_id: &str,
@@ -205,8 +206,8 @@ pub async fn build_operation_knowledge_integrity_report(
     let mut items = Vec::new();
     while let Some(chunk) = cursor.try_next().await? {
         total += 1;
-        // D2 降级口径（对齐 digest_inbox.rs:455）：active 但缺原文锚点。
-        if chunk.status == "active" && chunk.source_anchors.is_empty() {
+        // D2 降级口径（与 digest_inbox 修复卡同谓词）：active 但缺可引用锚点。
+        if super::chunk_is_active_missing_citable_anchor(&chunk) {
             anchors_missing += 1;
         }
         match chunk.integrity_status.as_deref().unwrap_or("needs_review") {

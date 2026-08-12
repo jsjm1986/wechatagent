@@ -544,7 +544,9 @@ fn review_categories_for_chunk(
         .source_quote
         .as_deref()
         .is_some_and(|quote| !quote.trim().is_empty());
-    let has_anchor = !chunk.source_anchors.is_empty();
+    // citable 口径（与 D2 verify 闸/读取侧同谓词）：只有畸形锚（缺 sourceQuote 键）
+    // 的切片同样不可引用，必须报 source_orphan 而不是 pending_verification。
+    let has_anchor = crate::models::chunk_has_citable_anchor(&chunk.source_anchors);
     if !has_quote || !has_anchor {
         categories.push("source_orphan");
     } else if chunk.integrity_status.as_deref() == Some("needs_review") {
@@ -979,6 +981,53 @@ pub(in crate::routes) async fn delete_operation_knowledge(
         "operation_knowledge_items has been removed; use operation_knowledge_chunks instead"
             .to_string(),
     ))
+}
+
+#[cfg(test)]
+mod review_category_tests {
+    use super::review_categories_for_chunk;
+    use crate::models::OperationKnowledgeChunk;
+    use std::collections::HashSet;
+
+    fn base_chunk() -> OperationKnowledgeChunk {
+        OperationKnowledgeChunk {
+            workspace_id: "ws-1".into(),
+            title: "价格政策".into(),
+            domain: "user_operations".into(),
+            status: "active".into(),
+            source_quote: Some("原文片段".into()),
+            integrity_status: Some("needs_review".into()),
+            ..Default::default()
+        }
+    }
+
+    /// B4：畸形锚（有 anchor 元素但缺非空 `sourceQuote`）不可被引用，审核队列
+    /// 必须归类 `source_orphan`（等价于没有来源），而不是 `pending_verification`
+    /// ——旧口径裸 `!is_empty()` 会把这类切片错报成「待核验」，运营看不出真因。
+    #[test]
+    fn malformed_anchor_is_source_orphan_not_pending_verification() {
+        let mut chunk = base_chunk();
+        chunk.source_anchors = vec![mongodb::bson::doc! { "startOffset": 0i64 }];
+        let categories = review_categories_for_chunk(&chunk, &HashSet::new());
+        assert!(categories.contains(&"source_orphan"), "{categories:?}");
+        assert!(
+            !categories.contains(&"pending_verification"),
+            "{categories:?}"
+        );
+    }
+
+    /// 对偶正例：可引用锚 + 原文 + needs_review → pending_verification（不过度收紧）。
+    #[test]
+    fn citable_anchor_with_quote_stays_pending_verification() {
+        let mut chunk = base_chunk();
+        chunk.source_anchors = vec![mongodb::bson::doc! { "sourceQuote": "原文片段" }];
+        let categories = review_categories_for_chunk(&chunk, &HashSet::new());
+        assert!(
+            categories.contains(&"pending_verification"),
+            "{categories:?}"
+        );
+        assert!(!categories.contains(&"source_orphan"), "{categories:?}");
+    }
 }
 
 #[cfg(test)]
