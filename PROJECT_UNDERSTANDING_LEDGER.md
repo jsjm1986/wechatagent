@@ -2,7 +2,11 @@
 
 > **用途**：AI 会话对本仓库的理解档案。所有条目都经过代码核证，按证据等级标注；后续会话应先读本文件恢复上下文，但**任何 file:line 在引用前仍须当场重验**（代码会演进）。
 >
-> **核证时间**：2026-08-12 ~ 2026-08-13（基于当时工作区：main @ a637b61；未提交改动终版快照为 **47 个文件 +3285/−1428**——早期记录的"45 个 +2986/−1394"是过程快照，工作区在会话期间仍在活跃变更）
+> **核证时间**：2026-08-12 ~ 2026-08-13（基于当时工作区：**分支 `fix/dependency-security-remediation` @ a637b61**——2026-08-13 修正：早期台账误写"main @ a637b61"，实际 main 停在 38766e2，主 workspace 全程在该修复分支上；未提交改动终版快照为 **47 个文件 +3285/−1428**）
+>
+> **方法论教训（第三条）**：环境状态（当前分支/worktree 拓扑）与代码事实同样必须亲验——`git status` 不显示分支名时必须补 `git branch` 确认，不得默认在 main。
+>
+> **S0 收口与三线工程（2026-08-13）**：47 文件已按 6+1 分组提交（S0，8 commits，禁词已修）+ 深读档案 commit + 三线 plans commit，全部落在 `fix/dependency-security-remediation` 分支（S0 后基线 d99b6e7，`cargo test --lib` 2530/0）。三线优化从 d99b6e7 分出并行执行。
 >
 > **深读工程第一轮（2026-08-13）**：全仓 19 份逐行级深读记录，见 `project-understanding/`（README 为索引含验收状态）。后端 src 约 19.3 万行、tests 182 文件、前端 5.3 万行（core+features+__tests__）、全部规格与文档逐行/逐篇读完。
 >
@@ -137,10 +141,10 @@
 | # | 缺陷/矛盾 | 亲证锚点 | 严重度 |
 |---|---|---|---|
 | 1 | ~~静默醒来任务被 daily_limit 取消→客户消息永远得不到回复（高）~~ **【22 号终裁重大修正 2026-08-13：主路径不成立，降级为 legacy 残留】**`DEFERRED_INBOUND_REPLY_KIND` 全仓**无创建点**且代码自标 legacy（`webhooks.rs:716-717` reconcile 的 `is_legacy` 判定）；现行静默唤醒物化的是 `inbound_reply`（`webhooks.rs:117` 主会话亲证）→ Inbound 语义 → daily_limit/rate_limited **天然豁免**（`5289-5296` 只拦 FollowUp）。gateway 的 deferred_wake 分支 4 处是防御历史残留行的死代码。原核证的三个锚点**行为均真但分支不可达**。残余：DB 历史 deferred 行可被 cancel（reconcile 会收敛） | 22 号终裁+主会话二次亲证 | 低（legacy 残留）。**方法论教训（第二次）：缺陷判断必须同时验证分支内行为与分支可达性（创建点）** |
-| 2 | **毒丸消息行**：pending handoff 行 decode 失败即 Err，`tick`/`tick_inbound_replies` 以 `?` 传播且坏行按 created_at 升序恒排最前——两个 worker 每轮静默中止，supervisor 熔断不触发（Err 非 panic） | `webhooks.rs:819-822` + `tasks.rs:1069,1121` | 高（低概率高影响） |
+| 2 | ~~毒丸消息行~~ **【已修复 2026-08-13 线 A commit 8d51b70】**decode 失败行按 `_id` 直更 `handoff_status=quarantined`（raw 路径+CAS 防并发）+ 审计事件，tick 继续处理后续行；quarantine best-effort 失败留 pending 下轮重试。集成测试 `poison_inbound_handoff_integration` 本地 Docker 跑绿 | 原锚点 `webhooks.rs:819-822` | 已关闭 |
 | 3 | 双脑 second reviewer **parse 失败拉闸整个 run**，与同函数注释"调用失败仅 warn 不阻塞、双脑不应成为新故障源"矛盾（LLM 调用失败确实只 warn） | `review/mod.rs:4390`（注释）vs `4409-4415`（行为） | 中（仅 REVIEWER_DUAL_ENABLED 开启时） |
 | 4 | **知识窗口错位**：router corpus=静态 priority 序 200 条，agent catalog=query 相关度重排 400 条，`cited_in_corpus` 与前者求交——verified>200 条后合法引用被静默丢弃降格 fallback，可致 R5.4 误拦 | `knowledge_router.rs:74-78,752-762` + `knowledge_agent.rs:81` | 高（随知识库规模恶化） |
-| 5 | manual_send **两道门裁决矛盾**（22 号精化：二次门 `:2799` 先于状态门 `:2830` 执行，故状态门的 manual_send 豁免是**死代码**；fail-safe 方向——宁可错杀不误发，需产品定夺语义） | `outbox_dispatcher.rs:922-928` vs `2734,2741-2748`；执行顺序 `:2799,:2830` | 低-中（fail-safe 方向的竞态） |
+| 5 | ~~manual_send 两道门裁决矛盾~~ **【已定案修复 2026-08-13 线 A commit bfc0395】**保守语义定案：manual_send 与托管发送同受"撤管即停"约束，删除不可达豁免死代码、两处注释改为如实描述 | 原锚点 dispatcher 两门 | 已关闭（语义定案） |
 | 6 | evolution 灰度旗 `updated_by` 取请求体可伪造审计身份（手边有 `Extension(admin)` 未用，违背 ReviewActor 服务端身份先例） | `evolution.rs:742-746` | 中（审计完整性） |
 | 7 | `models.rs:1802` 注释引用的迁移 `2026_05_W1_001_chunks_wiki_type_default` 不在注册表（幽灵引用，wiki_type 旧文档实际恒 None） | `models.rs:1795-1804` + migrations 注册表 | 低（注释误导） |
 | 8 | **两个空壳测试永远绿**：`revision_recheck_action_gate.rs`（零断言纯注释）、`memory_card_write_occ.rs`（仅启动容器）——revision 后动作闸复检与 memory_card OCC 两条安全不变量无可执行守护（作者注释诚实自认"骨架"） | 两文件亲读全文 | 中（覆盖幻觉） |
@@ -159,7 +163,9 @@
 
 **裁决的误报**：17 号记录初判"user.reply.task 仍在生产"——误报，见偏差表 #2 精确化表述。
 
-**重要待重验疑点 [C]**（子代理发现、主会话未逐条抽查，引用前必须重验）：hold 请示被骚扰门拦时零台账（`escalation/mod.rs:231-233`）；delivery_unknown 请示卡不进超时改派静默滞留（`ledger.rs:1136`）；run_envelope 终态写无 lifecycle CAS（`run_envelope.rs:690-693`）；prompt shadow 真实 LLM 消耗不计入 EvolutionBudget；quiet-hours runtime 加载粒度 contact/workspace 分裂；biz-test domain8 `severity="BLOCKED"` 误用致降级分支死代码；`.env.example` 缺 POST_DECISION/SILENCE_SIGNAL 两族变量；登录限流不解析 XFF（反代下全体共享一个槽）；两处 bson DateTime 扩展 JSON wire 残留；死路由 tripwire 名单缺 11 文件。
+**线 A 合并追记（2026-08-13，e2e59ba）**：缺陷 #2/#5 关闭（上表）；deferred_wake legacy 分支已物理删除（净删 103 行，缺陷 #1 残余风险归零）；delivery_unknown 请示卡滞留已修（新增 `list_stranded_delivery_escalations`，pending ∧ {failed_terminal, delivery_unknown, sent 缺推送时刻} 按 created_at 计龄进超时改派，`escalation_stranded_delivery_timeout` 3/3 绿）；两条新登记：`routes/tasks.rs:81` 残留死 kind 字符串（越界未改，待 B/C 后仲裁）、`principal_decision_channel::blocked_relay_preserves_awaiting_...` 单测在 debug 构建确定性爆栈（基线 d99b6e7 即存在，非线 A 引入，待修）。
+
+**重要待重验疑点 [C]**（子代理发现、主会话未逐条抽查，引用前必须重验）：hold 请示被骚扰门拦时零台账（`escalation/mod.rs:231-233`）；~~delivery_unknown 请示卡不进超时改派静默滞留~~（已修，见上）；run_envelope 终态写无 lifecycle CAS（`run_envelope.rs:690-693`）；prompt shadow 真实 LLM 消耗不计入 EvolutionBudget；quiet-hours runtime 加载粒度 contact/workspace 分裂；biz-test domain8 `severity="BLOCKED"` 误用致降级分支死代码；`.env.example` 缺 POST_DECISION/SILENCE_SIGNAL 两族变量；登录限流不解析 XFF（反代下全体共享一个槽）；两处 bson DateTime 扩展 JSON wire 残留；死路由 tripwire 名单缺 11 文件。
 
 ## 六、深读新增的重要机制事实（跨域级，详情见对应记录）
 
