@@ -3913,6 +3913,10 @@ pub struct GuideAuthoritativeChange {
 pub struct GuideFrozenPlan {
     pub contact_updated_at: DateTime,
     pub memory_updated_at: DateTime,
+    /// Frozen insert baseline used only when Preview observed no persisted operating-memory row.
+    /// `None` preserves the legacy/existing-row OCC contract and its candidate hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_insert: Option<Document>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub playbook_id: Option<ObjectId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

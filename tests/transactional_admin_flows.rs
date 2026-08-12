@@ -1324,6 +1324,7 @@ async fn guide_apply_rolls_back_all_writes_and_retries_once() {
     let frozen_plan = GuideFrozenPlan {
         contact_updated_at: contact.updated_at,
         memory_updated_at: memory.updated_at,
+        memory_insert: None,
         playbook_id: Some(playbook_id),
         playbook_version: Some(1),
         domain_config_id: None,
