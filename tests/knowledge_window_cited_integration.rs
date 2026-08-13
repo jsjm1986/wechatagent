@@ -31,7 +31,12 @@ const ACCOUNT: &str = "default"; // 与 TestApp 的 default_workspace_id 对齐
 
 /// 一条可被 agent 引用的 verified chunk：body / source_quote / source_anchors
 /// 三处携带同一句原文证据，满足 `quote_is_chunk_evidence` 的锚点校验。
-fn verified_chunk(workspace_id: &str, title: &str, evidence: &str, priority: i32) -> OperationKnowledgeChunk {
+fn verified_chunk(
+    workspace_id: &str,
+    title: &str,
+    evidence: &str,
+    priority: i32,
+) -> OperationKnowledgeChunk {
     OperationKnowledgeChunk {
         id: Some(ObjectId::new()),
         workspace_id: workspace_id.to_string(),
@@ -155,17 +160,16 @@ async fn agent_cited_verified_chunk_outside_window_is_not_degraded() {
         .iter()
         .filter_map(|b| b.as_document())
         .find(|d| d.get_str("id").ok() == Some(target_hex.as_str()))
-        .expect("窗外 cited chunk 的文档必须进入 selectedChunks（否则 R5.4 verified 计算拿不到它）");
+        .expect(
+            "窗外 cited chunk 的文档必须进入 selectedChunks（否则 R5.4 verified 计算拿不到它）",
+        );
     assert_eq!(
         carried.get_str("integrityStatus").ok(),
         Some("verified"),
         "携带的文档必须是 verified 原件"
     );
     assert!(
-        carried
-            .get_str("body")
-            .unwrap_or_default()
-            .contains("3999"),
+        carried.get_str("body").unwrap_or_default().contains("3999"),
         "携带的文档必须是完整正文，供 prompt 注入与背书计算"
     );
 
@@ -214,7 +218,10 @@ async fn agent_cited_chunk_inside_window_behavior_unchanged() {
         .collect();
     assert_eq!(selected, vec![target_hex.clone()], "窗内引用照常保留");
     assert_eq!(route.get_str("knowledgeCoverage").ok(), Some("enough"));
-    assert_eq!(route.get_bool("selectedChunksAreFallback").ok(), Some(false));
+    assert_eq!(
+        route.get_bool("selectedChunksAreFallback").ok(),
+        Some(false)
+    );
     let selected_docs = result.get_array("selectedChunks").expect("selectedChunks");
     assert!(
         selected_docs

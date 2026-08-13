@@ -9,7 +9,8 @@
 - escalation 集合 agent_principal_escalations:status(pending/resolved)/short_code/contact_wxid。
 - resolve 端点 POST /api/admin/principal-escalations/:short_code/resolve,
   body camelCase {verdict,substance,constraints[],authorizationWindowHours}。
-- relay prompt_key=escalation.principal.interpret。
+- admin 提交的是结构化裁决，按生产契约跳过 escalation.principal.interpret；
+  relay 仍由 user.reply.fast.task 用 AI 口吻生成。
 
 跑法：export DEPLOY_PASS=...; python scripts/biz-test/batch_a_domain6.py
 """
@@ -159,7 +160,13 @@ def main() -> None:
                         "阶段3 relay task/run/outbox 精确闭环",
                         f"evidence={relay_evidence} waited={waited}", "high",
                         "resolve 后 durable relay task 未形成精确 Gateway/Outbox 证据")
-            _lib.assert_llm_success(400, "escalation.principal.interpret", DOMAIN)
+            relay_run_id = str(
+                ((relay_evidence.get("review") or {}).get("run_id"))
+                if isinstance(relay_evidence, dict) else ""
+            )
+            _lib.assert_llm_success_for_run(
+                relay_run_id, "user.reply.fast.task", DOMAIN,
+            )
 
             # ── 阶段4：escalation → resolved ──
             esc2 = _latest_esc(WXID)

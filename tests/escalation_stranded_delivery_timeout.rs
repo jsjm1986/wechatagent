@@ -11,9 +11,9 @@ mod common;
 use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
 use wechatagent::models::{
     AgentPrincipalEscalation, AgentStatus, AskHumanPolicy, Contact, DeciderRef,
-    PrincipalEscalationProtocol, ESCALATION_CATEGORY_OUT_OF_SCOPE,
-    PRINCIPAL_CARD_DELIVERY_QUEUED, PRINCIPAL_CARD_DELIVERY_SENT,
-    PRINCIPAL_CARD_DELIVERY_UNKNOWN, PRINCIPAL_ESCALATION_STATUS_PENDING,
+    PrincipalEscalationProtocol, ESCALATION_CATEGORY_OUT_OF_SCOPE, PRINCIPAL_CARD_DELIVERY_QUEUED,
+    PRINCIPAL_CARD_DELIVERY_SENT, PRINCIPAL_CARD_DELIVERY_UNKNOWN,
+    PRINCIPAL_ESCALATION_STATUS_PENDING,
 };
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -204,8 +204,7 @@ async fn stranded_delivery_unknown_card_is_reassigned_on_timeout() {
     let state = common::rebuild_app_state_with_mcp_url(&app, mcp.uri());
     seed_customer_contact(&app).await;
 
-    let two_hours_ago =
-        DateTime::from_millis(DateTime::now().timestamp_millis() - 2 * 3600 * 1000);
+    let two_hours_ago = DateTime::from_millis(DateTime::now().timestamp_millis() - 2 * 3600 * 1000);
     app.state
         .db
         .agent_principal_escalations()
@@ -252,8 +251,7 @@ async fn stranded_sent_row_without_push_time_is_reassigned_on_timeout() {
     let state = common::rebuild_app_state_with_mcp_url(&app, mcp.uri());
     seed_customer_contact(&app).await;
 
-    let two_hours_ago =
-        DateTime::from_millis(DateTime::now().timestamp_millis() - 2 * 3600 * 1000);
+    let two_hours_ago = DateTime::from_millis(DateTime::now().timestamp_millis() - 2 * 3600 * 1000);
     app.state
         .db
         .agent_principal_escalations()
@@ -271,7 +269,11 @@ async fn stranded_sent_row_without_push_time_is_reassigned_on_timeout() {
     let converged = find_escalation(&app, "SDS1").await;
     assert_eq!(converged.principal_wxid, "backup_wxid");
     assert_eq!(
-        converged.protocol.as_ref().expect("protocol").delivery_generation,
+        converged
+            .protocol
+            .as_ref()
+            .expect("protocol")
+            .delivery_generation,
         2
     );
 }

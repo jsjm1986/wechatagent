@@ -3,7 +3,9 @@
 种 1 条 citable draft → 人工 verify → 阶段1 客户问命中召回 → 正式 patch 降级
 (needs_review) 后召回退出 → 阶段4 管理员再次 verify，召回恢复。
 
-召回命中证据在 agent_decision_reviews.used_knowledge_ids(Vec<ObjectId>),不在 agent_run_logs。
+召回命中证据在 agent_run_logs.knowledge_route.selectedChunkIds。最终
+used_knowledge_ids 只代表 Full 档可授权背书；Clarify/Relational 档会按安全设计清空，
+不能用它判断检索是否命中。
 等待用 send_and_wait 轮询 agent_run_logs(webhook 后台 runner,真模型一轮 300s+,固定 sleep 假阴)。
 
 跑法：export DEPLOY_PASS=...; python scripts/biz-test/batch_a_domain2.py
@@ -26,19 +28,18 @@ QUESTION_Q4 = "我想确认下退费的条件和流程，能再说下吗？"
 
 
 def _recall_hit(cid: str, run: dict) -> tuple[bool, str]:
-    """**本轮** decision_review(按 run_id 精确定位)的 used_knowledge_ids 是否含 cid。
-
-    不用 latest_decision_review：真模型一轮慢(300s+)+三阶段连发,查询时最新 review 常是
-    后续 no_reply 轮(used_knowledge_ids 必空)→假阴。且每轮重跑 deleteMany+insertOne 生成
-    新 ObjectId,latest 取到的历史轮 review 持有的是旧 cid→跨轮错位。按本轮 run_id 取本轮
-    review 根治这两个陷阱(systematic-debugging 2026-06-30 定性:召回链健全,测试取证方式错)。
-    """
+    """**本轮**持久化 knowledge route 的 selectedChunkIds 是否含 cid。"""
     rid = run.get("run_id", "") if isinstance(run, dict) else ""
     if not rid:
         return False, f"run 无 run_id, run={str(run)[:200]}"
-    dr = _lib.decision_review_for_run(WXID, rid)
-    used = dr.get("used_knowledge_ids", [])
-    return (cid in str(used)), f"run_id={rid} status={dr.get('status')} used_knowledge_ids={used}"
+    row = _lib.knowledge_route_for_run(WXID, rid)
+    route = row.get("knowledge_route", {}) if isinstance(row, dict) else {}
+    selected = route.get("selectedChunkIds", []) if isinstance(route, dict) else []
+    return (
+        cid in selected,
+        f"run_id={rid} status={row.get('status')} "
+        f"coverage={route.get('knowledgeCoverage')} selected_chunk_ids={selected}",
+    )
 
 
 def main() -> None:
@@ -73,7 +74,7 @@ def main() -> None:
         str(run1.get("run_id", "")), "user.reply.fast.task", DOMAIN
     )
     hit1, ev1 = _recall_hit(cid, run1)
-    _lib.expect(hit1, DOMAIN, "阶段1 改前召回命中(used_knowledge_ids 含种子 chunk)",
+    _lib.expect(hit1, DOMAIN, "阶段1 改前召回命中(knowledge_route selectedChunkIds 含种子 chunk)",
                 f"cid={cid} {ev1}", "high",
                 "verified chunk 应被召回；未命中可能是检索阈值或 stage 不匹配")
 

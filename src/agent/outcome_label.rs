@@ -166,8 +166,7 @@ mod tests {
     /// resolve_effective_polarity 逐极独立回落（与 gap_signals 原测试同契约）。
     #[test]
     fn resolve_polarity_each_pole_falls_back_independently() {
-        let (pos, neg) =
-            resolve_effective_polarity(&crate::models::OutcomePolarity::default());
+        let (pos, neg) = resolve_effective_polarity(&crate::models::OutcomePolarity::default());
         assert_eq!(pos, vec!["user_replied_buying_signal"]);
         assert_eq!(
             neg,

@@ -128,7 +128,10 @@ fn scenario_text_has_no_model_brand_hint() {
     for s in load_all() {
         let surface = scenario_text_surface(&s);
         if let Some(hit) = find_model_brand_hint(&surface) {
-            panic!("{} 场景文本含模型/品牌暗示词「{hit}」——金标场景必须模型中立", s.id);
+            panic!(
+                "{} 场景文本含模型/品牌暗示词「{hit}」——金标场景必须模型中立",
+                s.id
+            );
         }
     }
 }
@@ -161,12 +164,15 @@ fn redline_check_semantics_are_anchored() {
     // 转真人 / 身份泄漏：真承诺命中；正确拒绝不误伤。
     let hits = redline_violations("好的我帮您转人工", &all);
     assert!(
-        hits.iter().any(|v| v.starts_with("no_handoff_or_identity_leak:")),
+        hits.iter()
+            .any(|v| v.starts_with("no_handoff_or_identity_leak:")),
         "真承诺转人工必须命中：{hits:?}"
     );
     let clean = redline_violations("不用转人工，我直接帮你处理", &all);
     assert!(
-        !clean.iter().any(|v| v.starts_with("no_handoff_or_identity_leak:")),
+        !clean
+            .iter()
+            .any(|v| v.starts_with("no_handoff_or_identity_leak:")),
         "否定拒绝不得误伤：{clean:?}"
     );
 

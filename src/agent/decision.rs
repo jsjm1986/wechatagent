@@ -813,13 +813,13 @@ pub(crate) async fn decide_reply_with_promote(
     } else {
         String::new()
     };
-    let state_machine_text = if include_business {
-        domain_config
-            .map(format_operation_state_machine_for_prompt)
-            .unwrap_or_default()
-    } else {
-        String::new()
-    };
+    // `operationState` is a required decision protocol field in every tier. Lean/Relational
+    // therefore still need the canonical key set; otherwise a custom industry is forced to
+    // guess sales-shaped keys that the persistence transition gate later rejects. Full keeps
+    // the complete machine, while lower tiers receive only a compact key/initial-state contract.
+    let state_machine_text = domain_config
+        .map(|config| render_operation_state_machine_for_tier(&config.state_machine, tier))
+        .unwrap_or_default();
     let knowledge_text = if include_business {
         format_operation_knowledge_for_prompt_with_roles(
             knowledge_chunks,
@@ -1590,8 +1590,78 @@ pub(crate) fn format_operation_domain_config_for_prompt(config: &OperationDomain
     )
 }
 
-pub(crate) fn format_operation_state_machine_for_prompt(config: &OperationDomainConfig) -> String {
-    serde_json::to_string(&config.state_machine).unwrap_or_default()
+pub(crate) fn render_operation_state_machine_for_tier(
+    machine: &Document,
+    tier: crate::agent::sufficiency::PromptTier,
+) -> String {
+    if matches!(tier, crate::agent::sufficiency::PromptTier::Full) {
+        return serde_json::to_string(machine).unwrap_or_default();
+    }
+    let states = machine
+        .get_array("states")
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_document())
+        .filter_map(|state| {
+            state
+                .get_str("key")
+                .ok()
+                .map(str::trim)
+                .filter(|key| !key.is_empty())
+                .map(|key| (key.to_string(), state.get_bool("initial").unwrap_or(false)))
+        })
+        .collect::<Vec<_>>();
+    if states.is_empty() {
+        return String::new();
+    }
+    let initial_state = states
+        .iter()
+        .find_map(|(key, initial)| initial.then_some(key.as_str()))
+        .unwrap_or(states[0].0.as_str());
+    serde_json::to_string(&serde_json::json!({
+        "allowedStateKeys": states.iter().map(|(key, _)| key).collect::<Vec<_>>(),
+        "initialStateKey": initial_state,
+        "instruction": "operationState must be exactly one allowedStateKeys value; never invent or translate a key."
+    }))
+    .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod operation_state_tier_tests {
+    use super::render_operation_state_machine_for_tier;
+    use crate::agent::sufficiency::PromptTier;
+    use mongodb::bson::doc;
+
+    #[test]
+    fn lean_tier_receives_canonical_keys_without_full_transition_details() {
+        let machine = doc! {
+            "states": [
+                {
+                    "key": "initial_hesitation",
+                    "name": "初始迟疑",
+                    "initial": true,
+                    "allowedFrom": [],
+                    "description": "完整业务说明不应进入 Lean"
+                },
+                {
+                    "key": "emotion_surfacing",
+                    "name": "情绪浮现",
+                    "allowedFrom": ["initial_hesitation"]
+                }
+            ]
+        };
+        let lean = render_operation_state_machine_for_tier(&machine, PromptTier::Lean);
+        assert!(lean.contains("initial_hesitation"));
+        assert!(lean.contains("emotion_surfacing"));
+        assert!(lean.contains("allowedStateKeys"));
+        assert!(lean.contains("initialStateKey"));
+        assert!(!lean.contains("allowedFrom"));
+        assert!(!lean.contains("完整业务说明"));
+
+        let full = render_operation_state_machine_for_tier(&machine, PromptTier::Full);
+        assert_eq!(full, serde_json::to_string(&machine).unwrap());
+    }
 }
 
 pub(crate) fn format_playbook_for_prompt(playbook: &OperationPlaybook) -> String {

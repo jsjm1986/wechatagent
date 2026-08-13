@@ -262,7 +262,8 @@ async fn quality_gold_regression() {
     let acc = app.state.config.default_account_id.clone();
     raise_simulation_budget(&app, &ws).await;
     // TestApp 桩 MCP 地址原样保留：simulation 永不调 MCP，这里只是防御性桩语义。
-    let state = rebuild_app_state_with_real_llm(&app, agent_llm, app.state.config.mcp_base_url.clone());
+    let state =
+        rebuild_app_state_with_real_llm(&app, agent_llm, app.state.config.mcp_base_url.clone());
     // judge 标尺从销售 DEFAULT profile 派生（default workspace 无 active 行时的生效 profile）。
     let rubric: JudgeRubric = build_judge_rubric(&default_domain_profile(&ws));
 
@@ -270,7 +271,11 @@ async fn quality_gold_regression() {
     eprintln!(
         "[quality-gold] 场景 {} 条，judge={}，ledger={}",
         scenarios.len(),
-        if judge.is_some() { "on" } else { "skipped（未设 REAL_LLM_JUDGE=1）" },
+        if judge.is_some() {
+            "on"
+        } else {
+            "skipped（未设 REAL_LLM_JUDGE=1）"
+        },
         ledger.display()
     );
 

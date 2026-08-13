@@ -6,7 +6,9 @@
 mod common;
 
 use mongodb::bson::{doc, oid::ObjectId, to_document, DateTime, Document};
-use wechatagent::models::{AgentStatus, Contact, ConversationMessage, MessageDirection, OperationMode};
+use wechatagent::models::{
+    AgentStatus, Contact, ConversationMessage, MessageDirection, OperationMode,
+};
 use wechatagent::webhooks::{reconcile_pending_inbound_handoffs, DURABLE_INBOUND_REPLY_KIND};
 
 fn managed_contact(wxid: &str) -> Contact {

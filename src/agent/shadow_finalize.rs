@@ -65,6 +65,7 @@ pub(crate) async fn finalize_shadow_decision(
         &mut review,
         knowledge_chunks,
         &active_products,
+        &[],
         &active_profile,
         evaluated_at,
         Some(run_id),

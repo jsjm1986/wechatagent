@@ -119,7 +119,9 @@ async fn concurrent_memory_card_write_does_not_lose_race_error() {
     for (i, joined) in results.into_iter().enumerate() {
         let memory = joined
             .expect("writer task must not panic")
-            .unwrap_or_else(|e| panic!("CONC-1：并发 writer #{i} 不得返回 Err（输 OCC 必须静默让位）：{e:?}"));
+            .unwrap_or_else(|e| {
+                panic!("CONC-1：并发 writer #{i} 不得返回 Err（输 OCC 必须静默让位）：{e:?}")
+            });
         returned.push(memory);
     }
 

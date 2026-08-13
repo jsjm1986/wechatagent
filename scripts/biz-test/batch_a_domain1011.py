@@ -35,7 +35,14 @@ def _management_read(account_id: str) -> dict:
              "创建隔离 Management session", session)
     response = _lib.api_bg(
         "POST", f"/api/management-agent/sessions/{session_id}/messages",
-        {"accountId": account_id, "content": "查一下这个账号最近有哪些联系人", "dryRun": True},
+        {
+            "accountId": account_id,
+            "content": (
+                "请调用 wechatagent.search_contacts 搜索微信好友中备注或昵称包含 "
+                "biztest_read_probe 的联系人；不要只依据当前系统上下文里的最近联系人列表作答。"
+            ),
+            "dryRun": True,
+        },
         admin=True, max_wait=720, tag="mgmt_read",
     )
     _require(_lib.is_api_error(response) is None, D10,

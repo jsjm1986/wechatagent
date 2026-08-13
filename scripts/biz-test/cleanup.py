@@ -44,6 +44,10 @@ def restore_interrupted_industry_profile() -> None:
     if not isinstance(marker, dict):
         raise RuntimeError(f"unreadable industry rollback marker: {marker}")
     original_id = marker.get("original_active_id")
+    if original_id is None:
+        _lib.restore_default_domain_profile_fallback()
+        _lib.mongo(f'db.biztest_control.deleteOne({{_id:{json.dumps(RESTORE_MARKER_ID)}}})')
+        return
     if not isinstance(original_id, str) or len(original_id) != 24:
         raise RuntimeError(f"invalid industry rollback marker: {marker}")
     row = _lib.mongo_json(

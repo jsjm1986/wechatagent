@@ -15,7 +15,11 @@ use crate::common::TestApp;
 
 async fn exercise_step_verdicts(app: &TestApp) -> anyhow::Result<()> {
     let out = execute_step(&app.state, "ws_worker", "acc", "fix_chunk", &doc! {}).await?;
-    anyhow::ensure!(out.verdict == StepVerdict::Failed, "fix_chunk={:?}", out.verdict);
+    anyhow::ensure!(
+        out.verdict == StepVerdict::Failed,
+        "fix_chunk={:?}",
+        out.verdict
+    );
     let manual = execute_step(&app.state, "ws_worker", "acc", "review_evolution", &doc! {}).await?;
     anyhow::ensure!(manual.verdict == StepVerdict::NeedsManual);
     let noop = execute_step(&app.state, "ws_worker", "acc", "analyze_logs", &doc! {}).await?;

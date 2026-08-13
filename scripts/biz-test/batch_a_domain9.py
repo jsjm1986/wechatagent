@@ -7,14 +7,15 @@
   · deprecatedFacts（弃用归档，≤20）——被推翻的旧事实带 deprecationReason/supersededBy
   · coreProfile{identity,businessContext,communicationStyle,operationGoal}
   · relationshipState/preferences/doNotDo/commitments/objections/openLoops/recentEpisodeSummary
-- 候选→固化链路：decision 抽取 memory_candidates(status=pending) → consolidate 后 status=consolidated → 进 memory_card
+- 候选→固化链路：发送后 Projection 抽取 memory_candidates(status=pending) → 自动 durable
+  memory_consolidation task → status=consolidated → 进 memory_card
 - **冲突裁决的真实设计（关键）**：deprecatedFacts/discarded 针对的是**已固化在上一版 coreFacts**
   被推翻（apply_consolidator_deprecations 在 previous.core_facts 按 id 查原 fact，memory.rs:548）。
   故必须**两次固化**才能测真弃用：第一次让旧事实(8岁)进 coreFacts 得 version N，第二次改口(10岁)
   + 再固化 → 旧事实应进 deprecatedFacts(带 deprecationReason) 或被 discarded 替换，落
   memory_conflict_resolved 事件。同一轮内改口不会产生 deprecation（无"上一版 fact"可弃用）。
 
-prompt_key=user.memory_consolidator.task。触发端点 /contacts/:id/memory-consolidation/run(:id=ObjectId)。
+prompt_key=user.memory_consolidator.task。测试跟随生产自动固化任务，不与自动任务争抢手动触发唯一键。
 
 跑法：export DEPLOY_PASS=...; python scripts/biz-test/batch_a_domain9.py
 """
@@ -23,6 +24,7 @@ import re
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).parent))
 import _lib
@@ -34,16 +36,6 @@ WXID = "biztest_c9"
 def _require(condition: bool, description: str, evidence: object) -> None:
     if not _lib.expect(condition, DOMAIN, description, str(evidence), "critical"):
         raise SystemExit(f"{description}: {evidence}")
-
-
-def _contact_oid(account_id: str) -> str:
-    row = _lib.mongo_json(
-        f'db.contacts.findOne({{wxid:"{WXID}",account_id:"{account_id}"}},{{_id:1}})'
-    )
-    if not isinstance(row, dict):
-        return ""
-    oid = row.get("_id")
-    return str(oid.get("$oid", "")) if isinstance(oid, dict) else str(oid or "")
 
 
 def _memory_card(account_id: str) -> dict:
@@ -88,14 +80,107 @@ def _ages_in(texts: list[str]) -> set[str]:
     return ages
 
 
-def _consolidate(account_id: str, tag: str) -> dict:
-    contact_id = _contact_oid(account_id)
-    if not contact_id:
-        return {"_error": "no contact id"}
-    return _lib.api_bg(
-        "POST", f"/api/contacts/{contact_id}/memory-consolidation/run",
-        {}, admin=True, max_wait=300, tag=tag,
+def _wait_memory_card(account_id: str, *, after_version: int, required_age: str,
+                      max_wait: int = 300) -> dict:
+    """Wait until automatic consolidation advances and materializes one age fact."""
+    deadline = time.time() + max_wait
+    latest = {}
+    while time.time() < deadline:
+        latest = _memory_card(account_id)
+        card = latest.get("memory_card", {}) if isinstance(latest, dict) else {}
+        live = _fact_texts(card, "coreFacts") + _fact_texts(card, "recentFacts")
+        if latest.get("memory_card_version", 0) > after_version and required_age in _ages_in(live):
+            return latest
+        time.sleep(5)
+    return latest
+
+
+def _await_projection(run: dict, label: str, account_id: str) -> str:
+    """Wait for one exact projection, returning empty on a model JSON-contract miss."""
+    run_id = str(run.get("run_id", ""))
+    review = _lib.wait_projection_terminal(WXID, run_id, max_wait=300)
+    logs = _lib.projection_llm_logs(run_id)
+    if _lib.projection_model_contract_failure(review):
+        _require(
+            any(row.get("status") in {"success", "cache_hit"} for row in logs),
+            f"{label} invalid_projection 仍有精确真模型审计",
+            logs,
+        )
+        print(
+            f"[{DOMAIN}] {label} 模型投影 JSON 形态不合约，"
+            f"run_id={run_id}；将以新消息做有界重试..."
+        )
+        return ""
+    _require(
+        review.get("post_decision_status") == "completed"
+        and review.get("post_decision_memory_done") is True,
+        f"{label} post-decision Projection 完成记忆投影",
+        review,
     )
+    _require(
+        any(row.get("status") in {"success", "cache_hit"} for row in logs),
+        f"{label} 精确 user.projection.task 真调成功",
+        logs,
+    )
+    active = _lib.active_memory_consolidation_task(WXID, account_id)
+    task_id = _lib.bson_object_id(active.get("_id")) if active else ""
+    if task_id:
+        task = _lib.wait_memory_task_terminal(task_id, max_wait=300)
+        _require(
+            task.get("status") == "sent"
+            and task.get("gateway_status") in {"consolidated", "no_candidates"},
+            f"{label} 自动记忆固化任务到达终态",
+            task,
+        )
+    return run_id
+
+
+def _send_projected_turn(app_id: str, content: str, tag: str, label: str,
+                         account_id: str, *, required_age: Optional[str] = None,
+                         max_attempts: int = 3) -> str:
+    """Inject one semantic turn until its real-model projection satisfies the contract."""
+    latest: dict = {}
+    latest_candidates: list[dict] = []
+    for attempt in range(max_attempts):
+        latest = _lib.send_and_wait(
+            app_id,
+            WXID,
+            content,
+            f"{tag}_projection_{attempt + 1}",
+            max_wait=600,
+        ) or {}
+        _require(
+            bool(latest.get("run_id")),
+            f"{label} webhook 完成（投影尝试 {attempt + 1}/{max_attempts}）",
+            latest,
+        )
+        run_id = _await_projection(latest, label, account_id)
+        if not run_id:
+            continue
+        if required_age is not None:
+            latest_candidates = _lib.memory_candidates_for_runs(WXID, [run_id])
+            eligible = [
+                row for row in latest_candidates
+                if row.get("status") in {"pending", "consolidated"}
+            ]
+            candidate_ages = _ages_in(_lib.memory_candidate_texts(eligible))
+            if required_age not in candidate_ages:
+                print(
+                    f"[{DOMAIN}] {label} 合法投影未生成 {required_age} 岁可固化候选；"
+                    f"run_id={run_id}，做有界新 run 重试..."
+                )
+                continue
+        return run_id
+    _require(
+        False,
+        f"{label} 在有界重试内产生合约有效且满足事实要求的 Projection",
+        {
+            "run": latest,
+            "required_age": required_age,
+            "candidates": latest_candidates,
+        },
+    )
+    return ""
 
 
 def main() -> None:
@@ -109,34 +194,49 @@ def main() -> None:
 
     # ── 第一阶段：建立基线事实（孩子8岁）并首次固化 → 8岁进 coreFacts ──
     turns_a = [
-        "你好，我想给孩子报编程课",
-        "我孩子今年8岁，零基础",
-        "预算大概5000左右",
+        "以后跟我沟通请尽量用简短要点，我不喜欢大段文字。",
+        "请记住：我孩子今年8岁，目前零基础。",
     ]
+    run_ids_a = []
     for i, t in enumerate(turns_a):
         print(f"[{DOMAIN}] A阶段对话轮 {i+1}/{len(turns_a)}（真模型轮询）...")
-        r = _lib.send_and_wait(app_id, WXID, t, f"m9a_{i}", max_wait=600)
-        _require(isinstance(r, dict) and bool(r.get("run_id")), f"A阶段对话轮{i+1} webhook 完成", r)
+        run_ids_a.append(
+            _send_projected_turn(
+                app_id,
+                t,
+                f"m9a_{i}",
+                f"A阶段对话轮{i+1}",
+                account_id,
+                required_age="8" if i == 1 else None,
+            )
+        )
 
-    # 候选记忆链路：decision 阶段应抽取出候选（status pending/consolidated）
-    cands = _lib.mongo_json(
-        f'db.memory_candidates.find({{contact_wxid:"{WXID}"}},{{source:1,status:1,_id:0}}).toArray()'
-    )
+    # 候选记忆由发送后的独立 Projection 产生；按精确 parent run 取证，不能在主决策
+    # 送达后立即查 contact 级最新行（Projection 尚未完成时会产生竞态假阴性）。
+    cands = _lib.memory_candidates_for_runs(WXID, run_ids_a)
     has_cand = isinstance(cands, list) and len(cands) > 0
-    _require(has_cand, "decision 阶段抽取出 memory_candidates", cands)
+    _require(has_cand, "Projection 阶段抽取出精确 run 的 memory_candidates", cands)
 
-    print(f"[{DOMAIN}] 第一次固化（让8岁进 coreFacts）...")
-    res_a = _consolidate(account_id, "memcon_a")
-    print(f"  res_a={str(res_a)[:200]}")
-    _require(_lib.is_api_error(res_a) is None and bool(res_a.get("taskId")),
-             "第一次固化返回 durable taskId", res_a)
-    task_a_id = res_a["taskId"]
+    print(f"[{DOMAIN}] 等待自动固化让8岁进入事实层...")
+    card_a = _wait_memory_card(account_id, after_version=0, required_age="8")
+    _require(
+        card_a.get("memory_card_version", 0) > 0,
+        "A阶段事实触发首个 memory_card 版本",
+        card_a,
+    )
+    task_a_id = _lib.bson_object_id(card_a.get("memory_source_task_id"))
     task_a = _lib.memory_task_evidence(task_a_id)
     _require(task_a.get("status") == "sent" and task_a.get("gateway_status") == "consolidated",
-             "第一次固化 task 到达 consolidated 终态", task_a)
-    _lib.assert_llm_success(400, "user.memory_consolidator.task", DOMAIN)
+             "A阶段自动固化 task 到达 consolidated 终态", task_a)
+    generation_a = task_a.get("claim_generation")
+    commit_events_a = _lib.memory_commit_events(task_a_id, generation_a)
+    completed_a = [event for event in commit_events_a if event.get("kind") == "memory_consolidated"]
+    _require(len(completed_a) == 1, "A阶段自动固化恰有一条完成审计", commit_events_a)
+    consolidator_run_a = (completed_a[0].get("details") or {}).get("runId")
+    _lib.assert_llm_success_for_run(
+        str(consolidator_run_a or ""), "user.memory_consolidator.task", DOMAIN,
+    )
 
-    card_a = _memory_card(account_id)
     ver_a = card_a.get("memory_card_version", 0)
     core_a = _fact_texts(card_a.get("memory_card", {}), "coreFacts")
     recent_a = _fact_texts(card_a.get("memory_card", {}), "recentFacts")
@@ -157,21 +257,29 @@ def main() -> None:
 
     # ── 第二阶段：改口10岁（推翻已固化的8岁）+ 再固化 → 测真冲突裁决/弃用 ──
     print(f"[{DOMAIN}] B阶段改口10岁（推翻已固化8岁）...")
-    rb = _lib.send_and_wait(app_id, WXID, "哦我说错了，孩子其实10岁了，不是8岁", "m9b", max_wait=600)
-    _require(isinstance(rb, dict) and bool(rb.get("run_id")), "B阶段改口轮 webhook 完成", rb)
+    _send_projected_turn(
+        app_id,
+        "我刚核对过信息，认真更正：孩子今年10岁，之前说8岁是我记错了。"
+        "这不是玩笑，请按10岁更新长期记录。",
+        "m9b",
+        "B阶段改口轮",
+        account_id,
+        required_age="10",
+    )
 
-    print(f"[{DOMAIN}] 第二次固化（应触发对8岁的弃用/冲突裁决）...")
-    res_b = _consolidate(account_id, "memcon_b")
-    print(f"  res_b={str(res_b)[:200]}")
-    _require(_lib.is_api_error(res_b) is None and bool(res_b.get("taskId")),
-             "第二次固化返回 durable taskId", res_b)
-    task_b_id = res_b["taskId"]
+    print(f"[{DOMAIN}] 等待自动固化触发对8岁的弃用/冲突裁决...")
+    card_b = _wait_memory_card(account_id, after_version=ver_a, required_age="10")
+    _require(
+        card_b.get("memory_card_version", 0) > ver_a,
+        "B阶段更正触发新 memory_card 版本",
+        card_b,
+    )
+    task_b_id = _lib.bson_object_id(card_b.get("memory_source_task_id"))
     task_b = _lib.memory_task_evidence(task_b_id)
     generation = task_b.get("claim_generation")
     _require(task_b.get("status") == "sent" and task_b.get("gateway_status") == "consolidated"
-             and isinstance(generation, int), "第二次固化 task 到达精确 consolidated 终态", task_b)
+             and isinstance(generation, int), "B阶段自动固化 task 到达精确 consolidated 终态", task_b)
 
-    card_b = _memory_card(account_id)
     ver_b = card_b.get("memory_card_version", 0)
     mcb = card_b.get("memory_card", {})
     core_b = _fact_texts(mcb, "coreFacts")
@@ -198,9 +306,8 @@ def main() -> None:
     # 被混写 fact 绕过 → 假绿，2026-06-27 实证）。
     age8_live = "8" in live_ages
     age8_deprecated = "8" in deprecated_ages
-    # 生效事实层不应再有"8岁"（10岁已是 winner）。理想：旧值进 deprecatedFacts。
+    # 生效事实层不应再有"8岁"（10岁已是 winner）。
     _require(not age8_live, "冲突裁决后8岁不再生效", {"live": live_b, "ages": sorted(live_ages)})
-    _require(age8_deprecated, "旧8岁事实进入 deprecatedFacts 权威归档", deprecated_b)
 
     commit_events = _lib.memory_commit_events(task_b_id, generation)
     completed = [event for event in commit_events if event.get("kind") == "memory_consolidated"]
@@ -210,13 +317,32 @@ def main() -> None:
     run_id = complete_details.get("runId")
     _require(bool(run_id) and complete_details.get("memoryCardVersion") == ver_b,
              "完成审计绑定固化 run/version", complete_details)
+    discarded_ages = _ages_in(_lib.memory_discarded_texts(completed))
+    age8_audited_discard = "8" in discarded_ages
+    _require(
+        age8_deprecated or age8_audited_discard,
+        "旧8岁事实进入 deprecatedFacts，或由同 task 完成审计明确 discarded",
+        {
+            "deprecated": deprecated_b,
+            "completion": complete_details,
+        },
+    )
     matching_conflicts = [event for event in conflicts if
         (event.get("details") or {}).get("runId") == run_id
         and (event.get("details") or {}).get("previousVersion") == ver_a
         and (event.get("details") or {}).get("memoryCardVersion") == ver_b
         and (event.get("details") or {}).get("auditSource") in {"model_conflict", "memory_card_diff"}]
-    _require(bool(matching_conflicts),
-             "冲突事件绑定第二次 task 的 run、前后版本和审计来源", commit_events)
+    _require(
+        len(matching_conflicts) == len(conflicts) and len(matching_conflicts) <= 1,
+        "冲突事件若存在则绑定第二次 task 的 run、前后版本且不重复",
+        commit_events,
+    )
+    if age8_deprecated:
+        _require(
+            len(matching_conflicts) == 1,
+            "deprecatedFacts 分支恰有一条冲突裁决审计",
+            commit_events,
+        )
 
     # coreProfile 应有实质画像（identity/businessContext 非空）——记忆不只是 fact 列表
     profile = mcb.get("coreProfile", {}) if isinstance(mcb, dict) else {}

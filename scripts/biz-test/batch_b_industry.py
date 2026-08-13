@@ -6,6 +6,7 @@ The test records and restores the exact original active artifact. It never resol
 import json
 import sys
 from pathlib import Path
+from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).parent))
 import _lib
@@ -74,6 +75,16 @@ def _restore_original(original: dict) -> None:
     restored = _active_profile()
     _require(_lib.bson_object_id(restored.get("_id")) == original_id,
              "恢复后 active 指向原 immutable row", restored)
+
+
+def _write_restore_marker(original_id: Optional[str]) -> None:
+    _lib.mongo(
+        "db.biztest_control.replaceOne("
+        f"{{_id:{json.dumps(RESTORE_MARKER_ID)}}},"
+        f"{{_id:{json.dumps(RESTORE_MARKER_ID)},"
+        f"original_active_id:{json.dumps(original_id)},"
+        'workspace_id:"default",created_at:new Date()}, {upsert:true})'
+    )
 
 
 def run_industry(profile_id: str, name: str, description: str, opener: str,
@@ -150,15 +161,15 @@ def main() -> None:
     account_id, app_id = _lib.biztest_account()
     original = _active_profile()
     original_id = _lib.bson_object_id(original.get("_id"))
-    _require(bool(original_id), "切换行业前存在可精确恢复的 active profile", original)
-    # Persist the rollback identity before the first global pointer switch. If this process is
-    # killed before `finally`, cleanup will use the real rollout/activate APIs to recover it.
-    _lib.mongo(
-        "db.biztest_control.replaceOne("
-        f"{{_id:{json.dumps(RESTORE_MARKER_ID)}}},"
-        f"{{_id:{json.dumps(RESTORE_MARKER_ID)},original_active_id:{json.dumps(original_id)},"
-        'workspace_id:"default",created_at:new Date()}}, {upsert:true})'
+    _require(
+        not original or bool(original_id),
+        "切换行业前 active profile 身份可读，或合法回落内置 DEFAULT",
+        original,
     )
+    # Persist the rollback identity before the first global pointer switch. If this process is
+    # killed before `finally`, cleanup will recover either the exact active row or the legal
+    # zero-active-profile DEFAULT fallback.
+    _write_restore_marker(original_id)
     failure: BaseException | None = None
     try:
         for args in INDUSTRIES:
@@ -168,7 +179,15 @@ def main() -> None:
         failure = error
     finally:
         try:
-            _restore_original(original)
+            if original_id:
+                _restore_original(original)
+            else:
+                restored_default = _lib.restore_default_domain_profile_fallback()
+                _require(
+                    not _active_profile(),
+                    "精确恢复零 active profile 的内置 DEFAULT 回落",
+                    restored_default,
+                )
             _lib.mongo(
                 f'db.biztest_control.deleteOne({{_id:{json.dumps(RESTORE_MARKER_ID)}}})'
             )
