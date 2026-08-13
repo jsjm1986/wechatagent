@@ -279,3 +279,72 @@
 3. **19 号"biz-test 旧 cleanup 从未成功清理"与"management 二次 confirm 幂等已实现"**：均为推断级（原记录已标注），未亲验，不入主表。
 4. 本表行号基于 2026-08-13 含未提交改动（47 文件）的工作区；提交/继续开发后行号会漂移——**引用任何 file:line 前仍须当场重验**（CLAUDE.md 红线，本表自身同样适用）。
 5. 各源记录中"性能/风格/行为缺陷"类条目未消失，只是不属于本表范围；全局行为缺陷以 `PROJECT_UNDERSTANDING_LEDGER.md` 第五部分为准。
+
+---
+
+## 6. 终态核销表（2026-08-13 优化工程后 · 线 G 授权追加）
+
+> **性质**：本节为 2026-08-13 文档准确性收敛波（线 G / Task G4）授权追加的终态账本，§1–§5 正文一字未动。
+> **核证方式**：每条终态于线 G 会话在 `fix/dependency-security-remediation @ 3db6cf6` 基线（已含优化线 A–E + S5 全部合并）上重验——凡标"仍存"的条目，其锚点均经当场 Grep/Read 确认仍在（DIV-26 的机械拼接侧、DIV-31/32 的测试体、DIV-56 的可达性、DIV-62 的 as_document 键集四处为"§1 当日亲验 + 波次未触及对应文件"推定，未二次逐行重读）；凡标"已修/失效"的条目，均当场确认原锚点已消失或已更正。
+> **"线 F"条目说明**：CLAUDE.md / README.md 归同波并行的线 F 文件集（其任务书 F1/F2 明确逐条覆盖），本表按计划归属预记，**最终以线 F commit 为准**。
+>
+> **终态分布：已修 16（优化波次 9 + 线 F 7）／ 文档已标注 10 ／ 仍存在 43 ／ 已过时失效 2。高严重度 4 条全部收口（已修 2 + 已标注 2），无"仍存"高严重度条目。**
+
+### 6.1 已修（16 条）
+
+| # | 处置 |
+|---|---|
+| DIV-01 | 线 F（F1：CLAUDE.md 五闸表述→分数闸；本波并行，以线 F commit 为准） |
+| DIV-04 | 线 A commit bfc0395：manual_send 保守语义定案，删除不可达豁免死代码、两处注释改为如实描述 |
+| DIV-05 / DIV-06 / DIV-07 | 线 F（F1：webhook 流程图 / tool-calling 知识归属 / macOS 环境表述） |
+| DIV-16 | 线 C commit 66dd451：双脑第二路 parse 失败改回退主 review（`review/mod.rs:4627` 注释与行为已一致） |
+| DIV-21 | 线 C 清理（终裁 10-1）：`schedule_post_release_review` 死函数已删除，`post_release.rs` 头注改为如实描述事务内直插 |
+| DIV-22 | 线 C 清理（终裁 10-2）：`is_evolution_enabled_for` 死包装已删除，`runtime_flag.rs:19` 注释留档说明 |
+| DIV-25 | 线 C：`post_release.rs:53-58` 与 threshold/significance 口径统一（`blocked_by_safety_guard` 不归因任何 gate、pressure 走 revision 口径，`five_gate_mapping_tests` 钉死） |
+| DIV-29 | 线 C：两个空壳测试落实——`revision_recheck_action_gate.rs`（326 行，mock 六段编排驱动真 gateway）、`memory_card_write_occ.rs`（197 行，4 路并发 OCC 经公共 API） |
+| DIV-37 / DIV-38 / DIV-39 | 线 F（F2/F1：README 路由与迁移数、CLAUDE 基线脚本行号——F 侧另行实测现值） |
+| DIV-40 | 线 A：`gateway.rs:2945` 注释改为"旧单发 prompt `user.reply.task` **曾**提供 tool_calling 形态"（历史语态，退役 key 残留清除） |
+| DIV-41 | 线 A：去抖注释因果对象已更正（`gateway.rs:3969` 现明确 `apply_agent_updates` 是"本 run 落库后才会调度的异步"投影侧调用） |
+| DIV-59 | 注释已重写：`ledger.rs:763-765` 的 dead_code 注记现挂在 `derive_sediment_title_fallback`（真实的待接线函数）上，`derive_sediment_title` 本体在 :681 的生产调用不再与注释矛盾 |
+
+### 6.2 已过时失效（2 条 · 偏差本体消失）
+
+| # | 说明 |
+|---|---|
+| DIV-11 | `evolution::auto_release` 模块被线 C 整体物理删除（tick 无自动发布路径、`routes/evolution.rs:759-762` 拒写子闸 true）——spec R9.6 与代码现状**重新一致**，契约冲突（SR-180）关闭；evolution requirements 头部已加 2026-08-13 终态注记（线 G / G1） |
+| DIV-23 | 被指认的 `auto_release.rs:287-289` 注释随文件整体删除而不复存在 |
+
+### 6.3 文档已标注（10 条 · 历史存档不改写正文，防误导指针已就位）
+
+| # | 标注位置 |
+|---|---|
+| DIV-02 | 代码侧已收口（线 B B7：种子不再种入，`prompts.rs:2652` 守卫测试钉住；生产恒 fast.task）；autonomy requirements 头部 2026-08-13 现状注记（线 G / G1）声明九字段协议退役；`agents.html:116` 展示 key 已改 fast.task（线 G / G3）。spec 正文与 2026-07-13 slimming spec 按历史存档原则保留原文 |
+| DIV-03 | 五处 sunset notice 所在文件全部追加"2026-08-13 现状注记"（autonomy req/design、hardening req/design、evolution tasks；另 evolution req、digest req 同批加注——线 G / G1，7 文件） |
+| DIV-08 | autonomy requirements 头注声明第四 PBT 现为 `wiki_chunk_revision_pbt`（G1）；正文四处不改 |
+| DIV-09 | autonomy requirements 头注总括"正文不再作对照源、逐条偏差见本表 §2.2"（G1）；R1.4/R1.5 正文不改 |
+| DIV-10 | hardening requirements 头注②：spec 数学矛盾措辞保留作历史、实现已升级为淘汰迁移 + `coreFactEvictions` 审计（G1） |
+| DIV-12 | digest requirements 头注：基线 78 为旧值、现行 350/33 以 check-baseline.sh 为准（G1） |
+| DIV-13 | 既有标注充分：三 spec tasks.md 顶部 SR-179 权威注记 + `task-status-manifest.json` 自声明，维持 |
+| DIV-14 | 既有标注充分：同目录 `audit-status-manifest.json` 权威改判 inconclusive，维持（47 域 v2 重跑仍未发生，归属见 20b-G4） |
+| DIV-69 | hardening requirements 头注③：`human_handoff_success_rate` 属禁词前史措辞、按字面实现必被 CI lint 拦截（G1） |
+| DIV-70 | 既有标注充分：runbook 顶部 sunset notice（不再随主线更新）+ 本表 §2.3 反向索引，维持 |
+
+### 6.4 仍存在（43 条 · 全部为中/低严重度，含理由与归属）
+
+**A. 后端注释漂移 / 命名失真（26 条，低风险清理类）**——本波两线文件集均不含 src/**（历史存档原则之外的代码注释修正属代码改动，非文档波职权）。锚点均于线 G 当场复验仍在：
+DIV-17（`quiet_hours.rs:140-153` doc 描述三级链、函数体 :154-163 仍 workspace-only）、DIV-18（`escalation/mod.rs:233` "pending 台账可处置"实际未建）、DIV-19（`DocEntry` 仍零构造）、DIV-20（`knowledge_agent.rs:436` depth 计数不存在）、DIV-24（`evolution/mod.rs:225-228` "prompt 走 placeholder"已过时——prompt 影子重放已真实接线，**波次引入的新漂移面**）、DIV-26（guide readableChanges 机械拼接）、DIV-27（`admin_taxonomy_candidates.rs:191` "无 workspace_id"失实）、DIV-28（`observability.rs:1342` sweep 命中率旧口径）、DIV-42（`webhooks.rs:1586` 索引行号 55-63→813+）、DIV-43（注释行号系统性漂移——结构性长期项，治本是"注释不写行号"约定）、DIV-44（幽灵迁移引用）、DIV-45（task status 注释清单缺 `committing`）、DIV-46（provenance 注释缺 `lesson_promotion`）、DIV-47（m028 日志 id）、DIV-48（`decision.rs:1-9` 头注仍称 user.reply.task/decide_reply）、DIV-49（`supervisor.rs:3` "8 个 worker"→实 16）、DIV-50（llm.rs 层数口径）、DIV-51（memory 镜像 cap 6≠20）、DIV-52（`knowledge_router.rs:1195` fire-and-forget 注释 vs 顺序 await）、DIV-53（block_parser "行首"语义）、DIV-54（gap_signals "8 类"→12）、DIV-55（`ensure_evolution_indexes` 名不副实）、DIV-56（cohort 空 contact 注释分支不可达）、DIV-57（`evolution/mod.rs:61` skeleton 日志）、DIV-58（`proposed_raw` 命名）、DIV-60（tasks.rs:722 "第 n 次重试"文案）、DIV-63（`decision_created_ms` 名实不符）。
+**归属**：建议合并为一次 `chore(comments)` 清理波（后端 owner），DIV-24 优先（波次新引入）。
+
+**B. 测试覆盖幻觉（4 条）**：DIV-30（worker_reclaim 测试名与断言不符，HP-1 回收仍无端到端守护）、DIV-31（ingest 正向成功链零覆盖——worker 默认关）、DIV-32（delete_forbidden 未发删除请求）、DIV-71（digest_inbox 禁词防御锁旧文案副本）。**归属**：测试波 owner；DIV-30 与 28 号 §4 无守护清单同源，启用 ingest 前必须补 DIV-31。
+
+**C. 前端死代码 / 文案（5 条）**：DIV-64（wa.authed 只写不读）、DIV-65（openEventSource 死代码）、DIV-66（steward "客户 ID"实为账号 ID）、DIV-67（JudgmentBar 类型断言缺字段声明）、DIV-68（REVIEW_CATEGORY_LABELS 死代码同键不同文）。**归属**：前端 chore 波（均为一行级修正/删除）。
+
+**D. 护栏名单缺口（1 条）**：DIV-36（死路由 tripwire include 名单缺约 11 文件；另线 B 登记 `KNOWN_NON_ROUTE_HANDLERS` 的 `apply_update_chunk` 滞留条目待仲裁）。**归属**：后端 owner，与 A 组同批。
+
+**E. 本波未授权文件（4 条，中严重度居多，建议单独小 PR 尽快处置）**：
+DIV-15（`docs/DEPLOYMENT-STEPS.md:320,332` `db.agent_runs`→`agent_run_logs`——按文档排障会误判"系统没跑"，**运维文档 owner**）、DIV-33（plan 引用不存在的 findings 文件——superpowers 历史存档，接受现状或补一行勘误，档案 owner）、DIV-34（`deploy.sh` 整体过时，以 `scripts/deploy/` 为准——建议头部加弃用横幅或删除，**部署 owner**）、DIV-35（`.env.example` 缺 POST_DECISION_*/SILENCE_SIGNAL_* 两族变量——运维排障缺文档入口，**后端 owner**）。
+
+### 6.5 本节核销后的使用约定
+
+- 读 §1 主表任一条目前，先查本节终态；标"已修/失效/已标注"的条目不再构成防误导风险，标"仍存"的条目继续按 §2 反向索引对待。
+- 本节由线 G 一次性写入（2026-08-13）；后续波次关闭"仍存"条目时在对应行追加处置记录，不改写本节既有文字。
