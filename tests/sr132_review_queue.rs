@@ -69,8 +69,10 @@ fn chunk(
         integrity_status: Some(integrity_status.to_string()),
         business_topics: vec![topic.to_string()],
         source_quote: sourced.then(|| "authoritative quote".to_string()),
+        // 锚点带非空 `sourceQuote`——B3 后 source_orphan 判定走 citable 口径
+        // （`chunk_has_citable_anchor`），只有定位字段的畸形锚视同无源。
         source_anchors: sourced
-            .then(|| vec![doc! { "startLine": 1_i32 }])
+            .then(|| vec![doc! { "startLine": 1_i32, "sourceQuote": "authoritative quote" }])
             .unwrap_or_default(),
         created_at: DateTime::now(),
         updated_at: DateTime::now(),

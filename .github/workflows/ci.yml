@@ -1624,9 +1624,11 @@ jobs:
         env:
           RUSTFLAGS: ""
           RUST_MIN_STACK: "8388608"
-          # provider 由 repository variables 显式给定（或合并时按 real-llm job 字面值内联）。
-          REAL_LLM_BASE_URL: ${{ vars.REAL_LLM_BASE_URL }}
-          REAL_LLM_MODEL: ${{ vars.REAL_LLM_MODEL }}
+          # provider 按 real-llm job 同款字面值内联——HC-001 rotated-secret-provider-binding
+          # 规则（scripts/check-secrets.py）要求这些 env 逐字锁定到已轮换的授权 provider，
+          # 动态 `${{ vars.* }}` 引用会被判违规。
+          REAL_LLM_BASE_URL: https://gateway.oeezzk.cn/v1
+          REAL_LLM_MODEL: gpt-5.6-auto
           REAL_LLM_FORMAT: openai
         run: bash scripts/quality-regression.sh
 
