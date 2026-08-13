@@ -377,7 +377,9 @@ WechatAgent 自第二阶段起内置可选的"自我演化"后台 worker（`src/
 ### Shadow eval + 显著性
 
 - Shadow replay（`src/evolution/replay.rs`）只读 `agent_run_logs` 的快照，对同一 source run 在新阈值 / 新 prompt 下重判，**不**写 `agent_send_outbox`、不调 MCP、不写 `conversation_messages.outbound`。
-- 显著性门槛：`EVOLUTION_MIN_SEND_SUCCESS_DELTA`（默认 0.05）+ `EVOLUTION_MAX_5GATE_HIT_INCREASE`（默认 0.10，即新版本不得让任何闸命中率上升超过 10%）。
+- **判定主指标（2026-08-14 线 H 换血）**：`outcome_weighted_delta`——按 `source_run_id → AgentRunLog.run_id → AgentDecisionReview.outcome_status` 只读 join 取**真实用户反应**做三态分类（Hit=买入信号 / Block=负向集 / Censored=删失，真相源 `src/agent/outcome_label.rs`，`gap_signals` re-export 逐字节等价），对新旧配置各算「放行∧Hit 占比 − 放行∧Block 占比」（分母=非删失样本；"放行"仍指 `approved`/`revision_applied_approved`）后取差值。shadow replay 无法产生未来反应，标签来自源 run 的真实结局；review 缺失或删失的 replay 不进判定分母。旧的评审放行率（send_success delta）降级为 `_observed` 仅观测字段——演化器不再优化"让自己的审查者点头"这一过程指标。
+- 显著性门槛：`EVOLUTION_MIN_SEND_SUCCESS_DELTA`（默认 0.05，**env 名保持部署兼容、现承载 outcome_weighted_delta 门槛**）+ `EVOLUTION_MAX_5GATE_HIT_INCREASE`（默认 0.10，即新版本不得让任何闸命中率上升超过 10%，防"改配置让闸空转"，与结果信号正交）。
+- **样本量硬门**：非删失（Hit+Block）样本 < `EVOLUTION_MIN_REPLAYS`（env 复用，双重语义：completed replay 下限 ∧ 非删失结果样本下限）→ 候选直接 `rejected_below_threshold`（reason=`insufficient_outcome_samples`）。冷启动/低互动期演化器自然静默，是特性不是缺陷。
 - **安全回归门**（#152）：放松安全闸（`fact_risk_block` / `pressure_risk_block` / `product_accuracy_score_block`）的 threshold 候选，额外计算「安全回归率」= shadow 中"原配置被该安全闸拦下（`held_by_ai_policy` / `blocked_by_safety_guard` / `blocked_unverified_product_claim`）、新配置却放行（`approved` / `revision_applied_approved`）"的 run 占全部 completed replay 的比例。超过 `EVOLUTION_MAX_SAFETY_REGRESSION_RATE`（默认 `0.0`，零容忍）即判 `safety_gate_regression_above_threshold`、转 `rejected_below_threshold`。这条门是"放松必须用数据证明不漏风险"的硬约束，凌驾于 send_success 提升之上。
 - 三项任一不达标（含安全回归门）→ 候选直接转 `rejected_below_threshold`，不进入 `eligible_for_release`。
 - **注（2026-06-14）**：`blocked_unverified_product_claim` 作为安全回归门的被拦状态之一，其来源是 R5.4 reviewer 自报路径（强约束不变）；finalize 漏判探针（ProductEffect 分支）现已转为观测期，不再产生该 block 状态，故演化器统计窗口内该状态的样本量会下降。观测期结束后若抬回硬闸，本统计语义无需改动。

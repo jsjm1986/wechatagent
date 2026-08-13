@@ -150,7 +150,7 @@
 | 情绪价值 | `emotional_value_rewrite_below` | **6** ✅ | emotionalValue **<6 重写一次**（gates.rs:186） | 软闸 rewrite |
 | 边界隐私（无参数） | — | 固定 | ≤3 拦 / ≥4 放 / 0 豁免（gates.rs:200-201） | 固定 [04] |
 
-gate 命中方向常量：fact/pressure=GTE、human/emotional/product=LT（replay.rs:42-52）[10]。安全闸→status 权威映射（#152）：fact→held_by_ai_policy、pressure→blocked_by_safety_guard、product→blocked_unverified_product_claim（significance.rs:52-59）[10]。`SEND_SUCCESS_STATUSES=["approved","revision_applied_approved"]`（significance.rs:42，send-success 唯一口径）[10]。
+gate 命中方向常量：fact/pressure=GTE、human/emotional/product=LT（replay.rs:42-52）[10]。安全闸→status 权威映射（#152）：fact→held_by_ai_policy、pressure→blocked_by_safety_guard、product→blocked_unverified_product_claim（significance.rs:52-59）[10]。`SEND_SUCCESS_STATUSES=["approved","revision_applied_approved"]`（significance.rs，"放行"唯一口径）[10]。**线 H 换血（2026-08-14）**：threshold promote 判定主指标=`outcome_weighted_delta`（真实用户反应三态 join，分类真相源 `agent/outcome_label.rs`，删失不进分母）；`EVOLUTION_MIN_SEND_SUCCESS_DELTA` env 名不变但承载 outcome 门槛、`EVOLUTION_MIN_REPLAYS` 双语义（completed 下限 ∧ 非删失下限，不足=`insufficient_outcome_samples` 拒）；评审放行率降 `_observed` 仅观测；#152/5 闸门零变化 [10 追记]。
 
 ### 2.2 runtime 参数默认（RuntimeParametersTyped，models.rs:4877-4978 ✅ 全亲验）
 

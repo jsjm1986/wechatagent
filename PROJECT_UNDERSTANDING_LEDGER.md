@@ -156,12 +156,14 @@
 | 13 | **生产行为无测试守护清单共 19 条**（改坏不会红的区域地图，按风险排序含 deferred_wake 取消、毒丸行、知识窗口错位、HP-1 回收、GATE-1 复检、revision fallback 接线等） | 28 号 §4 | 改动前必查 |
 | 14 | ~~"被引用"功能恒 400~~ **【已修复 2026-08-13 线 B】**后端加 `serde(alias="target_id")` 双认 + 前端改发 `targetId` + 注释改正 | 线 B commit（B1） | 已关闭 |
 | 15 | ~~产品 active 过滤静默失效~~ **【已修复 2026-08-13 线 B】**同款双保险（alias + 前端 `activeOnly`），归档产品不再混入圈人下拉 | 线 B commit（B2） | 已关闭 |
-| 16 | **演化器 pressure gate 统计源失真**：`threshold.rs:69` 把 `blocked_by_safety_guard` 归因 pressure_risk_block 命中，但生产该终态来源是 R5.3.a fail-closed/业务声明拦截（`gates.rs:473,779,818`），pressure 是软闸不产此态——pressure 阈值候选建立在错误数据上、#152 反向门对该闸空转（significance/auto_release 同口径失真；post_release 侧口径已修正） | 23 号终裁+主会话双侧亲验 | 中-高（演化器可信度） |
+| 16 | **演化器 pressure gate 统计源失真**：`threshold.rs:69` 把 `blocked_by_safety_guard` 归因 pressure_risk_block 命中，但生产该终态来源是 R5.3.a fail-closed/业务声明拦截（`gates.rs:473,779,818`），pressure 是软闸不产此态——pressure 阈值候选建立在错误数据上、#152 反向门对该闸空转（significance/auto_release 同口径失真；post_release 侧口径已修正）。**线 H 补记（2026-08-14）**：判定信号换血为真实用户反应后，pressure 候选**维持停产**——真实反应结果同样无法归因到单一闸，恢复候选的前提不成立 | 23 号终裁+主会话双侧亲验 | 已关闭（线 C 停产 + 线 H 维持） |
 | 17 | ~~领导带时限裁决 → 前端崩溃~~ **【已修复 2026-08-13 线 B】**两处序列化改 RFC3339 字符串（线 B 重验发现 domain_profiles 已修方案实为 `dt_to_string`→RFC3339 而非计划所写毫秒，按"逐字对齐实际"采用；前端 formatExpiry 防御性兼容毫秒/对象/字符串三形态；附契约快照 fixture） | 线 B commit（B3） | 已关闭 |
 
 **排除的疑点**（核证后不成立）：前端 DomainProfileDraft 不回传 `generated_state_machine` 会丢 AI 状态机草稿——不成立，后端 PUT 是剥离管理键的部分 `$set` 更新，未编辑字段原值保持（`domain_profiles.rs:1149-1153,1341`）。
 
 **裁决的误报**：17 号记录初判"user.reply.task 仍在生产"——误报，见偏差表 #2 精确化表述。
+
+**第五波·线 H 演化器结局信号换血终局（2026-08-14，merge 完成）**：H1 `df59006`（三态分类器抽 `src/agent/outcome_label.rs` 单一真相源——plan 锚点 `reaction::is_negative_outcome` 已过期、实为 `DEFAULT_NEGATIVE_OUTCOMES` 常量族；gap_signals 改 `pub use` re-export 逐字节等价）；H2 `b7caec9`（significance 判定主指标换 `outcome_weighted_delta`：source_run 真实反应 join + 三态交叉矩阵，TDD 7 测试先红后绿；`insufficient_outcome_samples` 样本硬门；两 env 名保持部署兼容承载新语义；评审放行率降 `_observed`；#152/5 闸门专项测试锁定零变化——"outcome delta=+1.0 达标仍被安全回归否决"）；H3 `08f6069`（post_release 主观测换 `actual_outcome_weighted_score_delta` + 恒写三态分布，仍仅观测不回滚）。**执行插曲**：worker 隔离失效在主 workspace 干活被主会话查获（H1 提交纪律良好未裹挟用户 WIP），中断迁移到 opt-line-h worktree 后完成，迁移自查 status 精确恢复（用户 8 文件零触碰，备份比对 src 两文件逐字节一致）。验证：worktree lib 2571/0、合并后 2572/0（+1 系用户 WIP 测试）、四 PBT 41/0、`-D warnings` 绿、禁词 0、官方 evolution 隔离 lint 过、发送链文件零触碰。档案回写：10 号 §2.11 追记、30 号事实卡演化行、本表 #16 关闭注记、agent-policy.md 显著性节。
 
 **D/E 组小尾巴清理（2026-08-14，主会话直做）**：29 号 §6.4 D/E 两组 5 条全闭，"仍存"清单归零（除 A 组已由 chore 尾波关闭外无余量）。DIV-36：tripwire include 名单补 12 文件（29 号漏数 contract_snapshot.rs），抓出的 2 个 pub async fn 经仲裁均为合法 helper 进 KNOWN 名单（reconcile_campaign_dispatches / append_domain_profile_draft——后者首判降私有被编译器纠错，rg `-r` 参数污染教训入档），apply_update_chunk 死条目删除（线 B 滞留登记闭）。DIV-15/33/34/35：集合名修正、plan 勘误注记、deploy.sh 弃用横幅、.env.example 补两族 10 变量。验证：lib 2563/0（+1 系用户 WIP 自带测试，agent 改动零测试数变化）、`-D warnings` 绿、禁词 0 违规。
 

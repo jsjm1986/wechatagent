@@ -155,6 +155,8 @@ main.rs（spawn_supervised，src/main.rs:215-289）
 
 ### 2.11 `src/evolution/significance.rs`（1039 行）
 
+> **线 H 换血追记（2026-08-14，b7caec9/08f6069，本节以下为换血前快照、行号已漂移）**：threshold 判定主指标从评审放行率（send_success delta）换血为 **`outcome_weighted_delta`**——按 `source_run_id → AgentRunLog.run_id → AgentDecisionReview.outcome_status` 只读 join 真实用户反应，经共享三态分类器（真相源 `src/agent/outcome_label.rs`，H1 自 gap_signals 抽出、re-export 逐字节等价；Hit=买入信号/Block=负向集/Censored=删失）算新旧配置「放行∧Hit − 放行∧Block」占比差（分母=非删失；"放行"仍认 SEND_SUCCESS_STATUSES，故 159 行常量仍在但不再是判定正例定义）。新增样本硬门：非删失 < `EVOLUTION_MIN_REPLAYS`（env 双语义）→ `insufficient_outcome_samples` 直接拒。`min_send_success_delta` cfg 字段现承载 outcome 门槛（env 名 `EVOLUTION_MIN_SEND_SUCCESS_DELTA` 保持部署兼容）。评审放行率降为 `_observed` 仅观测。#152 安全回归门与 5 闸涨幅门语义与拦截状态集**零变化**（161-163 行相应描述仍准确）。三态分布记入 `eval_metrics`。H3：post_release 主观测指标换 `actual_outcome_weighted_score_delta` + 恒写 `before/after_outcome_distribution`（仍仅观测不自动回滚）。
+
 - **`FIVE_GATE_KEYS`** 5 个（不含 planner——不在 shadow 内观测，significance.rs:32-39）。
 - **`SEND_SUCCESS_STATUSES = ["approved", "revision_applied_approved"]`**（significance.rs:41-42）——"成功送出"语义唯一定义，design.md §4.6 同源。`success_rate` 以此为正例、None/其它为负（significance.rs:360-377）。
 - **`SAFETY_GATE_BLOCK_STATUS`**（significance.rs:44-59）：`fact_risk_block→held_by_ai_policy`、`pressure_risk_block→blocked_by_safety_guard`、`product_accuracy_score_block→blocked_unverified_product_claim`；rewrite 两闸 + planner **不是**安全闸（放松不构成"漏过风险消息"）；#152 反向门只对本表 gate 生效。`safety_block_status_for`（significance.rs:62-68）。
