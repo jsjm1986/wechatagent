@@ -236,11 +236,12 @@ proptest! {
 }
 
 // ─────────────────────────────────────────────────────────────────
-// P2 single-shot revision 上限（task 4.15）
+// P2 single-shot revision 上限（task 4.15；28 号裁决 §2.2 后补 fallback 分支）
 // ─────────────────────────────────────────────────────────────────
 //
-// `run_user_operation_gateway_inner`（src/agent/gateway.rs:706-924）的 R2 控制流
-// 里 Reply Agent / finalize / revision 的纯逻辑映射到下方 `run_revision_loop`。
+// gateway 的 R2 revision 控制流（写作时快照 `run_user_operation_gateway_inner`
+// gateway.rs:3237-3585 与 `apply_revision_fallback` gates.rs:1258-1275——行号随
+// 代码演进漂移，以符号为准）的纯逻辑映射到下方 `run_revision_loop`。
 // 模型边界与 gateway 一一对应，便于审计：
 //
 //   gateway 行为                                        本测试 model
@@ -261,11 +262,22 @@ proptest! {
 //     `second_passed = Approved && review_passed`        second_passed
 //   `if second_passed` → final_review_status =
 //      "revision_applied_approved"                       status="approved"
-//   `else { review.approved=false;
-//           review.final_review_status="revision_failed";
-//           final_decision.should_reply=false; }`        status="revision_failed",
+//   `else` → 恢复首轮 review 快照 + `apply_revision_fallback`
+//      （gateway.rs:3486-3509；LLM 错误/超时路径同函数）：
+//     └─ 首轮 trigger 纯风格（risks 全为 human_like_*/
+//        emotional_value_*，或 AllPass 且 style_diverged；
+//        无 reviewer_dual_disagree、非硬闸——
+//        `revision_fallback_is_safe_style_only`）
+//          → 恢复原稿照发：approved=true、
+//            final_review_status="revision_applied_approved"、
+//            should_reply=true                          status="approved",
+//                                                       should_reply=true
+//     └─ 其它（安全/边界/压力/双审分歧/未知）
+//          → fail-closed：
+//            final_review_status="revision_failed"、
+//            should_reply=false                         status="revision_failed",
 //                                                       should_reply=false
-//   `RevisionDecision::Skip` 同样写
+//   `RevisionDecision::Skip` 不走 fallback，直接写
 //      `final_review_status="revision_failed"`
 //      `final_decision.should_reply=false`              status="revision_failed",
 //                                                       should_reply=false
@@ -274,10 +286,15 @@ proptest! {
 //      （首轮 finalize 已写好 status）                  保留首轮 should_reply
 //
 // 性质：
-//   1. reply_calls ≤ 2 — 任意输入下都成立（Proceed 至多 +1，Skip / NotEligible 不调）；
-//   2. 当首轮 needs_revision && !should_hold && !budget_exceeded
-//      && revision_direction 非空 && (second_needs_revision || !second_approved)
-//      → 终态 should_reply == false 且 status == "revision_failed"。
+//   1. reply_calls ≤ 2 — 任意输入下都成立（Proceed 至多 +1，Skip / NotEligible 不调）。
+//      **范围声明（28 号裁决 A2）**：该上限只覆盖本模型的 revision 子流程；
+//      生产 targeted rewrite（证据修复重写）与 revision 串联时 Reply Agent
+//      全局可达 3 次，rewrite 路径不在本模型内。
+//   2. 进入 Proceed 且第二轮仍失败：
+//      2a. 首轮 trigger **非**纯风格 → should_reply == false 且 status == "revision_failed"；
+//      2b. 首轮 trigger 纯风格 → **恢复原稿照发**（should_reply == true 且
+//          status == "approved"，即 revision_applied_approved）——28 号裁决前的
+//          旧模型断言"二轮失败恒 revision_failed"与生产相反，已修正。
 
 #[derive(Debug, Clone, Copy)]
 struct ReviewSnapshot {
@@ -288,10 +305,15 @@ struct ReviewSnapshot {
     /// `review.should_hold`：是否走 hold 路径（hold 不进 R2 块）。
     should_hold: bool,
     /// 首轮 finalize 是否仍是 `Approved`；非 Approved 表示已被硬安全门拦截，
-    /// gateway 永远不会进入 R2 revision 块（gateway.rs:937 之前 fail-closed return）。
+    /// gateway 永远不会进入 R2 revision 块（首轮 finalize fail-closed return）。
     finalize_approved: bool,
     /// 是否提供了非空 `revisionDirection`（gateway.rs decide_revision R2.5）。
     revision_direction_non_empty: bool,
+    /// 首轮 revision trigger 是否为**纯风格**（`revision_fallback_is_safe_style_only`
+    /// 的模型化：soft 失败 risks 全为 human_like_*/emotional_value_*，或 AllPass 且
+    /// 唯一触发源是 style_diverged；含 pressure/boundary/硬闸/双审分歧则为 false）。
+    /// 只在进入 Proceed 且第二轮失败时被 fallback 消费。
+    fallback_safe_style_only: bool,
 }
 
 impl ReviewSnapshot {
@@ -361,10 +383,17 @@ fn run_revision_loop(
     reply_calls += 1;
     let second_passed = second.passed();
     if second_passed {
-        // R2.3：revision_applied_approved（gateway.rs:838-850）。
+        // R2.3：revision_applied_approved。
+        (reply_calls, true, "approved")
+    } else if initial.fallback_safe_style_only {
+        // 第二轮仍 fail 且首轮 trigger 纯风格 → `apply_revision_fallback` 恢复
+        // 首轮已 Approved 的原稿照发（review.approved=true、
+        // final_review_status="revision_applied_approved"、should_reply=true；
+        // gates.rs:1264-1269 亲验）。"风格改不动"不是安全事故，扣下原稿才是。
         (reply_calls, true, "approved")
     } else {
-        // R2.4：第二轮仍 fail → revision_failed（gateway.rs:851-869）。
+        // 第二轮仍 fail 且 trigger 含安全/边界/压力/双审分歧/未知 → fail-closed
+        // revision_failed（gates.rs:1270-1273）。
         (reply_calls, false, "revision_failed")
     }
 }
@@ -376,15 +405,24 @@ fn review_snapshot_strategy() -> impl Strategy<Value = ReviewSnapshot> {
         any::<bool>(),
         any::<bool>(),
         any::<bool>(),
+        any::<bool>(),
     )
         .prop_map(
-            |(approved, needs_revision, should_hold, finalize_approved, dir_non_empty)| {
+            |(
+                approved,
+                needs_revision,
+                should_hold,
+                finalize_approved,
+                dir_non_empty,
+                fallback_safe_style_only,
+            )| {
                 ReviewSnapshot {
                     approved,
                     needs_revision,
                     should_hold,
                     finalize_approved,
                     revision_direction_non_empty: dir_non_empty,
+                    fallback_safe_style_only,
                 }
             },
         )
@@ -396,14 +434,20 @@ proptest! {
         ..ProptestConfig::default()
     })]
 
-    /// **Property 2 / Task 4.15 / Validates: R2.3, R2.4, R2.8**
+    /// **Property 2 / Task 4.15 / Validates: R2.3, R2.4, R2.8 +
+    /// `apply_revision_fallback`（28 号裁决 §2.2 修正）**
     ///
     /// 任意 (首轮 review, 第二轮 review, budget_exceeded) 组合下：
-    /// 1. Reply Agent 调用次数 SHALL ≤ 2；
-    /// 2. 首轮 review 进入 R2 触发条件且第二轮仍失败时，终态 SHALL 是
-    ///    `should_reply == false` + `status == "revision_failed"`；
+    /// 1. Reply Agent 调用次数 SHALL ≤ 2（仅 revision 子流程口径——生产
+    ///    targeted rewrite 串联可达全局 3 次，见模型头部范围声明）；
+    /// 2a. 进入 R2 且第二轮仍失败、首轮 trigger **非**纯风格时，终态 SHALL 是
+    ///     `should_reply == false` + `status == "revision_failed"`（fail-closed）；
+    /// 2b. 进入 R2 且第二轮仍失败、首轮 trigger 纯风格时，SHALL 恢复原稿照发
+    ///     （`should_reply == true` + `status == "approved"`，即生产的
+    ///     revision_applied_approved 回退路径——gates.rs `apply_revision_fallback`）；
     /// 3. 进入 R2 但被 Skip 前置条件（revisionDirection 空 / 预算超额）拦截
-    ///    时，同样 SHALL 写 `revision_failed` 终态且不再调用 Reply Agent。
+    ///    时，SHALL 写 `revision_failed` 终态且不再调用 Reply Agent（Skip 分支
+    ///    不走 fallback——gateway.rs:3316-3343 亲验）。
     #[test]
     fn p2_single_shot_revision_caps_reply_calls_at_two(
         initial in review_snapshot_strategy(),
@@ -413,28 +457,29 @@ proptest! {
         let (reply_calls, should_reply, status) =
             run_revision_loop(initial, second, budget_exceeded_for_revision);
 
-        // 性质 1：Reply Agent 调用次数硬上限。
+        // 性质 1：Reply Agent 调用次数硬上限（revision 子流程口径）。
         prop_assert!(
             reply_calls <= 2,
             "reply called {} times, must be ≤ 2 (initial={:?}, second={:?}, budget_exceeded={})",
             reply_calls, initial, second, budget_exceeded_for_revision
         );
 
-        // 性质 2：进入 Proceed 且第二轮仍 fail → revision_failed。
         let entered_proceed = initial.finalize_approved
             && initial.needs_revision
             && !initial.should_hold
             && initial.revision_direction_non_empty
             && !budget_exceeded_for_revision;
         let second_failing = !second.passed();
-        if entered_proceed && second_failing {
+
+        // 性质 2a：Proceed + 第二轮 fail + 非纯风格 trigger → fail-closed。
+        if entered_proceed && second_failing && !initial.fallback_safe_style_only {
             prop_assert_eq!(
                 should_reply, false,
-                "second-pass still failing → should_reply must be false"
+                "unsafe trigger + second-pass failing → should_reply must be false"
             );
             prop_assert_eq!(
                 status, "revision_failed",
-                "second-pass still failing → status must be revision_failed"
+                "unsafe trigger + second-pass failing → status must be revision_failed"
             );
             prop_assert_eq!(
                 reply_calls, 2,
@@ -442,7 +487,25 @@ proptest! {
             );
         }
 
-        // 性质 3：Skip 分支也 SHALL 写 revision_failed 终态，且不再调用 Reply Agent。
+        // 性质 2b：Proceed + 第二轮 fail + 纯风格 trigger → 恢复原稿照发
+        // （apply_revision_fallback 白名单路径；旧模型在此断言 revision_failed，
+        // 与生产相反——28 号裁决修正）。
+        if entered_proceed && second_failing && initial.fallback_safe_style_only {
+            prop_assert_eq!(
+                should_reply, true,
+                "style-only trigger + second-pass failing → restore pre-revision draft and send"
+            );
+            prop_assert_eq!(
+                status, "approved",
+                "style-only fallback → revision_applied_approved（模型词表 approved）"
+            );
+            prop_assert_eq!(
+                reply_calls, 2,
+                "fallback path still consumed the second Reply Agent call"
+            );
+        }
+
+        // 性质 3：Skip 分支 SHALL 写 revision_failed 终态，且不再调用 Reply Agent。
         let entered_skip = initial.finalize_approved
             && initial.needs_revision
             && !initial.should_hold
