@@ -168,6 +168,36 @@ async fn manual_policy_and_complete_window_hold_through_real_router() {
         "a rejected auto-release request must not persist a flag"
     );
 
+    // 缺陷 #6：合法灰度更新且请求体自报伪造的 updatedBy —— 落库审计身份必须是
+    // 服务端会话身份（hc017-admin），不采信请求体。
+    let spoofed = client
+        .put(format!("http://{address}/api/evolution/runtime-flag"))
+        .header(reqwest::header::COOKIE, &cookie)
+        .json(&serde_json::json!({
+            "enabled": true,
+            "rolloutPercent": 25,
+            "updatedBy": "spoofed-operator"
+        }))
+        .send()
+        .await
+        .expect("request runtime flag update");
+    assert_eq!(spoofed.status(), StatusCode::OK);
+    let saved = app
+        .state
+        .db
+        .evolution_runtime_flags()
+        .find_one(doc! { "workspace_id": WORKSPACE }, None)
+        .await
+        .expect("read saved runtime flag")
+        .expect("runtime flag persisted");
+    assert_eq!(
+        saved.updated_by.as_deref(),
+        Some("hc017-admin"),
+        "updated_by 必须来自服务端会话身份，而非请求体自报值"
+    );
+    assert_eq!(saved.rollout_percent, 25);
+    assert!(saved.enabled);
+
     let response = client
         .get(format!(
             "http://{address}/api/evolution/experiments?limit=5"

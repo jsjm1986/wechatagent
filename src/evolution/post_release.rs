@@ -1,9 +1,10 @@
 //! agent-self-evolution M4 W4 Task 5.6：+24h post-release review。
 //!
-//! 每次 release 后由 `release.rs` 调 [`schedule_post_release_review`] 插一条
-//! `post_release_reviews` 文档（`scheduled_at = released_at + 24h`,
-//! `completed=false`）。`evolution::run_one_tick` 末尾调 [`run_due_reviews`]，
-//! 扫一次到期且未完成的条目，对每条：
+//! 每次 release 由 `release.rs` 在 release **事务内**直接 insert
+//! [`post_release_review_document`] 构造的 `post_release_reviews` 文档
+//! （`scheduled_at = released_at + 24h`, `completed=false`；#155 后事务化，
+//! 旧的事务外兼容入口已删除——终裁 10-1）。`evolution::run_one_tick` 末尾调
+//! [`run_due_reviews`]，扫一次到期且未完成的条目，对每条：
 //!
 //! 1. 算 `released_at - 24h ~ released_at`（BEFORE）与
 //!    `released_at ~ released_at + 24h`（AFTER）两个 24h 窗口下的 `agent_run_logs`
@@ -68,39 +69,9 @@ const FIVE_GATE_KEYS: &[(&str, &str)] = &[
     ),
 ];
 
-/// 安插一条 `post_release_reviews` 文档。`released_at` 由 `release.rs` 在自己
-/// transaction 内确定的 `now`；`scheduled_at = released_at + 24h`。
-///
-/// 注意：本函数**不参与** release transaction —— 即便 insert 失败也仅 warn，
-/// 不影响 release 本身（post-release review 是观测，不是门禁）。
-pub async fn schedule_post_release_review(
-    state: &AppState,
-    proposal_id: ObjectId,
-    workspace_id: &str,
-    account_id: &str,
-    proposal_kind: &str,
-    released_at: BsonDateTime,
-) -> Result<(), EvolutionError> {
-    let doc = post_release_review_document(
-        proposal_id,
-        workspace_id,
-        account_id,
-        proposal_kind,
-        released_at,
-    );
-    state
-        .db
-        .raw()
-        .collection::<Document>("post_release_reviews")
-        .insert_one(doc, None)
-        .await
-        .map_err(EvolutionError::from)?;
-    Ok(())
-}
-
-/// Durable +24h review intent inserted by release transactions. Keeping the
-/// document constructor here makes the transactional and compatibility paths
-/// share one schema.
+/// Durable +24h review intent inserted by release transactions
+/// (`release.rs::insert_release_observability_with_session`). The schema has a
+/// single constructor so every writer shares one shape.
 pub(crate) fn post_release_review_document(
     proposal_id: ObjectId,
     workspace_id: &str,
@@ -391,8 +362,8 @@ async fn compute_window_metrics(
 /// （DEFAULT_PROFILE 字节等价），故 DEFAULT 销售域下行为与旧
 /// `classify_outcome_label` 逐字相同；换行业时按本行业声明的极性判定。
 ///
-/// 2.5-main-4：提升为 `pub(crate)` 供 `auto_release` 的负反应强制门复用（同一口径、
-/// 同一极性源），避免两处算法 drift。
+/// 历史注：2.5-main-4 曾提升为 `pub(crate)` 供已删除的 auto-release 通道复用；
+/// 现仅本模块消费，保留 `pub(crate)` 便于未来观测面复用同一口径。
 pub(crate) async fn compute_negative_reaction_rate(
     state: &AppState,
     workspace_id: &str,
@@ -445,9 +416,6 @@ pub(crate) async fn compute_negative_reaction_rate(
 
 /// 2.5-pre-3：从 Hit / Block 计数算负反应率的纯算术核心（删失已在 caller 排除）。
 /// `Block / (Hit+Block)`；已分类反应为 0 时返回 `None`（避免 0/0 NaN 落库）。
-///
-/// 2.5-main-4：提升为 `pub(crate)`，与 [`compute_negative_reaction_rate`] 一并供
-/// `auto_release` 复用。
 pub(crate) fn negative_reaction_rate_from_counts(hits: i64, blocks: i64) -> Option<f64> {
     let classified = hits + blocks;
     if classified > 0 {

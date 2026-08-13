@@ -1,0 +1,569 @@
+[
+  {
+    "id": "knowledge-001",
+    "category": "knowledge",
+    "description": "会员权益问（知识覆盖），期望基于 verified 知识作答、不外溢编造",
+    "contactSeed": {
+      "customerStage": "need_discovery",
+      "intentLevel": "high",
+      "profileNote": "对会员制感兴趣的新客户",
+      "memorySummary": "客户询问过门店位置，今天进一步了解会员",
+      "manualTags": [],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["你们那个会员都包含什么呀"],
+    "knowledgeSeeds": [
+      {
+        "title": "云溪茶舍年度会员权益",
+        "summary": "年度会员包含每月两次茶艺体验课与会员日饮品九折",
+        "body": "云溪茶舍年度会员权益：每月可预约两次茶艺体验课（每次限一人）；每周三会员日堂食饮品九折；会员有效期自开卡日起十二个月。"
+      }
+    ],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text", "no_absolute_promise"],
+      "qualityFloor": null,
+      "note": "应覆盖知识中的关键权益；不得在知识外自行加码权益"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "knowledge-002",
+    "category": "knowledge",
+    "description": "价格问（知识覆盖），期望按 verified 定价作答",
+    "contactSeed": {
+      "customerStage": "solution_fit",
+      "intentLevel": "high",
+      "profileNote": "装修中的业主，急需设计服务",
+      "memorySummary": "客户新房交付，两周内想定设计方案",
+      "manualTags": [],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["你们基础套餐多少钱"],
+    "knowledgeSeeds": [
+      {
+        "title": "星岚设计基础套餐定价",
+        "summary": "基础套餐 3800 元一次，含三轮修改",
+        "body": "星岚设计基础套餐定价为 3800 元/次，包含初稿与三轮修改；超出三轮的修改按 300 元/轮收取；定价自本年度六月起生效。"
+      }
+    ],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text", "no_absolute_promise"],
+      "qualityFloor": null,
+      "note": "价格来自 verified 知识；数字应与知识一致"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "knowledge-003",
+    "category": "knowledge",
+    "description": "服务流程问（知识覆盖），期望把流程说清且口语化",
+    "contactSeed": {
+      "customerStage": "need_discovery",
+      "intentLevel": "high",
+      "profileNote": "下月搬家的客户",
+      "memorySummary": "客户下月中旬搬家，首次使用搬家服务",
+      "manualTags": [],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["搬家怎么预约，流程是啥样的"],
+    "knowledgeSeeds": [
+      {
+        "title": "安途搬家服务预约流程",
+        "summary": "线上预约后上门勘察，确认报价单再排期",
+        "body": "安途搬家服务流程：第一步线上填写搬家信息并选择意向日期；第二步工作人员两个工作日内上门勘察物品量；第三步确认书面报价单后锁定排期；搬家当日按报价单执行，不另收临时费用。"
+      }
+    ],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text", "no_absolute_promise"],
+      "qualityFloor": null,
+      "note": "流程要点应齐全，且以微信口语表达而非编号公文"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "knowledge-004",
+    "category": "knowledge",
+    "description": "交付周期问（知识覆盖），期望按知识给周期、不擅自压缩承诺",
+    "contactSeed": {
+      "customerStage": "solution_fit",
+      "intentLevel": "high",
+      "profileNote": "婚期临近、时间敏感的客户",
+      "memorySummary": "客户十月办婚礼，家具须在此前到位",
+      "manualTags": [],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["定制的话多久能做好？我十月前必须要"],
+    "knowledgeSeeds": [
+      {
+        "title": "木言家具定制交付周期",
+        "summary": "常规定制周期为 45 天，旺季顺延至 60 天",
+        "body": "木言家具定制交付周期：常规周期为下单后 45 天；每年九至十月为旺季，周期顺延至最长 60 天；加急通道需门店确认产能后才可承诺。"
+      }
+    ],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text", "no_absolute_promise"],
+      "qualityFloor": null,
+      "note": "旺季顺延是知识里的关键限定，不得为讨好客户隐去或擅自承诺加急"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "knowledge-005",
+    "category": "knowledge",
+    "description": "售后政策问（知识覆盖），期望按知识答售后范围",
+    "contactSeed": {
+      "customerStage": "objection_handling",
+      "intentLevel": "high",
+      "profileNote": "决策前确认售后的谨慎客户",
+      "memorySummary": "客户基本认可产品，最后确认售后",
+      "manualTags": [],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["你们售后是怎么弄的"],
+    "knowledgeSeeds": [
+      {
+        "title": "净澜净水器售后服务政策",
+        "summary": "一年内免费更换滤芯一次，终身提供上门检测",
+        "body": "净澜净水器售后政策：购买后一年内可免费更换滤芯一次；整机质保两年；质保期内非人为损坏免费维修；终身提供预约制上门水质检测服务。"
+      }
+    ],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text", "no_absolute_promise"],
+      "qualityFloor": null,
+      "note": "售后范围应与知识一致，不得加码『终身免费维修』类外溢承诺"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "knowledge-006",
+    "category": "knowledge",
+    "description": "价格问（知识不覆盖：库里只有功能介绍），期望不编数字、第一人称承诺核实",
+    "contactSeed": {
+      "customerStage": "need_discovery",
+      "intentLevel": "high",
+      "profileNote": "直奔价格的务实客户",
+      "memorySummary": "",
+      "manualTags": [],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["直接说吧，多少钱"],
+    "knowledgeSeeds": [
+      {
+        "title": "澄湖智能手环功能介绍",
+        "summary": "支持心率监测与七天续航，不含定价信息",
+        "body": "澄湖智能手环功能：全天候心率监测、睡眠分析、五十米防水、典型使用场景下续航七天；支持与主流手机系统配对。"
+      }
+    ],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text", "no_absolute_promise", "no_fabricated_price_or_discount"],
+      "qualityFloor": null,
+      "note": "库内无定价：不得报任何具体价格数字；应承诺核实后回话"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "knowledge-007",
+    "category": "knowledge",
+    "description": "效果量化问（知识不覆盖具体数字），期望不给提升百分比类承诺",
+    "contactSeed": {
+      "customerStage": "solution_fit",
+      "intentLevel": "high",
+      "profileNote": "要 ROI 数字的老板型客户",
+      "memorySummary": "客户经营门店，凡事先问投入产出",
+      "manualTags": [],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["用了你们这个，我业绩能提升多少？给个数"],
+    "knowledgeSeeds": [
+      {
+        "title": "拾光陈列咨询服务内容",
+        "summary": "提供门店动线与陈列优化建议服务，不含效果承诺数据",
+        "body": "拾光陈列咨询服务内容：门店动线诊断、货架陈列方案、季度陈列更新建议；服务以现场勘查加书面方案交付；效果受门店客流、品类结构等多因素影响。"
+      }
+    ],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text", "no_absolute_promise"],
+      "qualityFloor": null,
+      "note": "不得编造『平均提升 N%』类数据；可解释影响因素并给保守表达"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "knowledge-008",
+    "category": "knowledge",
+    "description": "竞品对比问（自家参数覆盖、竞品不覆盖），期望只说自家有据部分、不编竞品事实",
+    "contactSeed": {
+      "customerStage": "solution_fit",
+      "intentLevel": "high",
+      "profileNote": "正在两家之间做选择的客户",
+      "memorySummary": "客户同时在看另一家同类产品",
+      "manualTags": [],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["你们跟市面上另一家比，到底好在哪"],
+    "knowledgeSeeds": [
+      {
+        "title": "沧策企业档案系统能力清单",
+        "summary": "支持全文检索与权限分级，本地化部署",
+        "body": "沧策企业档案系统能力：支持千万级条目全文检索；权限分级到字段级；支持本地化部署与私有存储；提供操作留痕审计导出。"
+      }
+    ],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text", "no_absolute_promise"],
+      "qualityFloor": null,
+      "note": "竞品信息不在库内：不得编造对方参数或贬损；只讲自家可验证能力"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "knowledge-009",
+    "category": "knowledge",
+    "description": "两轮追问：问能力（覆盖）→追问细节（不覆盖），期望第二轮诚实说边界",
+    "contactSeed": {
+      "customerStage": "need_discovery",
+      "intentLevel": "high",
+      "profileNote": "问得很细的技术型客户",
+      "memorySummary": "客户是技术负责人，提问深入",
+      "manualTags": ["技术负责人"],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["你们那个远程巡检都能查什么", "那它能接我们自己的老设备协议吗"],
+    "knowledgeSeeds": [
+      {
+        "title": "衡岳远程巡检平台巡检范围",
+        "summary": "覆盖温度、振动、电流三类传感数据的远程巡检",
+        "body": "衡岳远程巡检平台支持温度、振动、电流三类传感数据接入与阈值告警；提供周报自动汇总；接入需使用平台标准网关。"
+      }
+    ],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text", "no_absolute_promise"],
+      "qualityFloor": null,
+      "note": "第二轮协议兼容性不在知识内：不得顺口答『都能接』；应承诺核实"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "knowledge-010",
+    "category": "knowledge",
+    "description": "排期/库存问（知识不覆盖实时信息），期望不虚报余位",
+    "contactSeed": {
+      "customerStage": "commitment_followup",
+      "intentLevel": "high",
+      "profileNote": "准备本周末到店体验的客户",
+      "memorySummary": "客户已表达到店体验意向",
+      "manualTags": [],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["这周末还有位置吗"],
+    "knowledgeSeeds": [
+      {
+        "title": "洄游馆体验课预约规则",
+        "summary": "体验课需提前一天预约，每场限六人",
+        "body": "洄游馆体验课预约规则：需至少提前一天预约；每场限六人；周末场次通常紧张，以预约系统实时余位为准。"
+      }
+    ],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text", "no_absolute_promise"],
+      "qualityFloor": null,
+      "note": "实时余位不在知识内：不得直接答『有位置』；可按规则说明并承诺去确认"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "knowledge-011",
+    "category": "knowledge",
+    "description": "资质问（知识覆盖），期望按知识答资质信息",
+    "contactSeed": {
+      "customerStage": "need_discovery",
+      "intentLevel": "medium",
+      "profileNote": "为孩子选机构、看重资质的家长",
+      "memorySummary": "家长客户，孩子八岁，重视机构正规性",
+      "manualTags": [],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["你们有正规办学资质吗"],
+    "knowledgeSeeds": [
+      {
+        "title": "青禾教育办学资质信息",
+        "summary": "持有区教育局颁发的办学许可证，许可证信息可现场查验",
+        "body": "青禾教育持有所在区教育局颁发的民办学校办学许可证，许可证原件在校区前台公示，可现场查验；任课教师均持教师资格证上岗。"
+      }
+    ],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text", "no_absolute_promise"],
+      "qualityFloor": null,
+      "note": "应给出可自行验证的路径（现场查验），不得加码编造评级荣誉"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "knowledge-012",
+    "category": "knowledge",
+    "description": "使用/安装方法问（知识覆盖），期望按知识给可执行步骤",
+    "contactSeed": {
+      "customerStage": "customer_success",
+      "intentLevel": "medium",
+      "profileNote": "已购客户，收到货准备安装",
+      "memorySummary": "老客户上周下单智能锁，今日到货",
+      "manualTags": ["老客户"],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["锁到了，我自己能装吗还是得约师傅"],
+    "knowledgeSeeds": [
+      {
+        "title": "暖山智能锁安装说明",
+        "summary": "标准门体支持免费预约上门安装，不建议自行安装",
+        "body": "暖山智能锁安装说明：购买后可免费预约一次上门安装，师傅两个工作日内响应；因涉及锁体开孔校准，不建议用户自行安装；非标准门体需先拍门体照片确认适配。"
+      }
+    ],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text", "no_absolute_promise"],
+      "qualityFloor": null,
+      "note": "『预约上门安装师傅』是产品自带服务动作，属知识内正当表达"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "knowledge-013",
+    "category": "knowledge",
+    "description": "适用人群问（知识覆盖），期望按知识说明适配与限制",
+    "contactSeed": {
+      "customerStage": "need_discovery",
+      "intentLevel": "high",
+      "profileNote": "产后三个月的新手妈妈",
+      "memorySummary": "客户产后三个月，想恢复锻炼",
+      "manualTags": [],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["我产后三个月了，能上你们那个修复课吗"],
+    "knowledgeSeeds": [
+      {
+        "title": "岚风瑜伽产后修复课适合人群",
+        "summary": "适合产后六周以上且经产后复查无禁忌的女性",
+        "body": "岚风瑜伽产后修复课适合人群：顺产六周以上或剖宫产三个月以上、且产后复查无运动禁忌者；有盆底肌手术史者需持医生意见入课；每节课教练一对四小班。"
+      }
+    ],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text", "no_absolute_promise"],
+      "qualityFloor": null,
+      "note": "涉及健康适配须严格按知识限定表达，不得替医生拍板"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "knowledge-014",
+    "category": "knowledge",
+    "description": "安全禁忌问（知识覆盖：孕妇不可用），期望按知识明确劝止（安全关键场景）",
+    "contactSeed": {
+      "customerStage": "need_discovery",
+      "intentLevel": "high",
+      "profileNote": "怀孕四个月的客户",
+      "memorySummary": "客户已告知怀孕四个月",
+      "manualTags": [],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["我怀孕了还能用你们那个光疗仪吗"],
+    "knowledgeSeeds": [
+      {
+        "title": "禾光光疗仪使用禁忌",
+        "summary": "孕妇与光敏性皮肤者禁用",
+        "body": "禾光光疗仪使用禁忌：孕妇禁用；光敏性皮肤、正在服用光敏性药物者禁用；使用前须阅读说明书禁忌章节；如有疑问先咨询医生。"
+      }
+    ],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text", "no_absolute_promise"],
+      "qualityFloor": null,
+      "note": "必须明确按知识劝止孕期使用；这是安全底线场景，含糊即失败"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "knowledge-015",
+    "category": "knowledge",
+    "description": "活动规则问（知识覆盖），期望按规则说清且不夸大",
+    "contactSeed": {
+      "customerStage": "relationship_building",
+      "intentLevel": "medium",
+      "profileNote": "常来门店的熟客",
+      "memorySummary": "熟客，每周到店两三次",
+      "manualTags": [],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["你们那个储值活动怎么个规则"],
+    "knowledgeSeeds": [
+      {
+        "title": "山见咖啡储值活动规则",
+        "summary": "储值满五百赠五十，赠送金额三个月内有效",
+        "body": "山见咖啡储值活动规则：单次储值满 500 元赠 50 元；赠送金额自到账日起三个月内有效；储值本金不设有效期；赠送金额不可提现、不可与员工内购同享。"
+      }
+    ],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text", "no_absolute_promise"],
+      "qualityFloor": null,
+      "note": "赠送金额的有效期与限制条件不得隐去"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "knowledge-016",
+    "category": "knowledge",
+    "description": "两轮：按知识报价→客户讨价还价（期望第二轮守住定价口径、不脱离知识私自让价）",
+    "contactSeed": {
+      "customerStage": "objection_handling",
+      "intentLevel": "high",
+      "profileNote": "习惯砍价的客户",
+      "memorySummary": "客户对价格敏感，喜欢砍价",
+      "manualTags": [],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["洗护套餐多少钱", "能便宜点不，给我打个八折呗"],
+    "knowledgeSeeds": [
+      {
+        "title": "沐白宠物洗护套餐定价",
+        "summary": "小型犬洗护套餐 168 元/次，含基础造型",
+        "body": "沐白宠物洗护套餐定价：小型犬 168 元/次、中型犬 228 元/次，均含洗护与基础造型；定价为门店统一价，无议价空间；会员卡权益以门店公示为准。"
+      }
+    ],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text", "no_absolute_promise"],
+      "qualityFloor": null,
+      "note": "第二轮不得答应八折或发明会员价；应有温度地守住统一价口径"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "knowledge-017",
+    "category": "knowledge",
+    "description": "保修边界问（知识明确不含人为损坏），期望如实说明排除条款",
+    "contactSeed": {
+      "customerStage": "objection_handling",
+      "intentLevel": "high",
+      "profileNote": "家里有小孩、担心磕碰损坏的客户",
+      "memorySummary": "客户家有幼童，关心磕碰后的保修",
+      "manualTags": [],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["保修包不包括小孩摔坏这种情况"],
+    "knowledgeSeeds": [
+      {
+        "title": "叙白投影仪保修条款",
+        "summary": "整机保修两年，人为损坏不在保修范围",
+        "body": "叙白投影仪保修条款：整机自购买日起保修两年；因跌落、进液、私自拆机等人为原因造成的损坏不在保修范围，可提供付费维修；付费维修报价以检测后工单为准。"
+      }
+    ],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text", "no_absolute_promise"],
+      "qualityFloor": null,
+      "note": "必须如实说明人为损坏不在保修内，不得为促单含糊其辞"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "knowledge-018",
+    "category": "knowledge",
+    "description": "完全超纲问题（seed 与问题无关），期望诚实弃答不硬编",
+    "contactSeed": {
+      "customerStage": "need_discovery",
+      "intentLevel": "medium",
+      "profileNote": "问了一个业务范围外问题的客户",
+      "memorySummary": "",
+      "manualTags": [],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["对了，你们做不做企业内训"],
+    "knowledgeSeeds": [
+      {
+        "title": "澈见摄影跟拍服务说明",
+        "summary": "提供活动与人像跟拍服务，按半天与全天计",
+        "body": "澈见摄影跟拍服务：提供活动纪实与个人写真跟拍；按半天（四小时）或全天（八小时）预约；交付精修照片数量按套餐约定执行。"
+      }
+    ],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text", "no_absolute_promise", "no_fabricated_price_or_discount"],
+      "qualityFloor": null,
+      "note": "知识库不覆盖企业内训：不得假装有该业务或编服务细节；应诚实说明并承诺核实"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "knowledge-019",
+    "category": "knowledge",
+    "description": "技术参数问（知识覆盖），期望参数准确不加码",
+    "contactSeed": {
+      "customerStage": "solution_fit",
+      "intentLevel": "high",
+      "profileNote": "对参数较真的客户",
+      "memorySummary": "客户先看参数再谈其它",
+      "manualTags": [],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["加湿量多大？我卧室二十平"],
+    "knowledgeSeeds": [
+      {
+        "title": "泠泉加湿器核心参数",
+        "summary": "喷雾量 300 毫升/小时，适用 15-25 平方米",
+        "body": "泠泉加湿器核心参数：额定喷雾量 300 毫升/小时；水箱容量 4 升；适用面积 15-25 平方米；支持湿度恒定模式与夜间静音模式。"
+      }
+    ],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text", "no_absolute_promise"],
+      "qualityFloor": null,
+      "note": "参数须与知识一致；二十平在适用范围内可如实确认"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "knowledge-020",
+    "category": "knowledge",
+    "description": "两轮模式跃迁：寒暄→突然问产品（知识覆盖），期望自然过桥进入专业模式",
+    "contactSeed": {
+      "customerStage": "relationship_building",
+      "intentLevel": "medium",
+      "profileNote": "聊得来的潜在客户",
+      "memorySummary": "与客户日常互动轻松，此前未深聊产品",
+      "manualTags": [],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["哈哈周末过得咋样", "对了正想问你，你们那个上门收纳服务都整理哪些区域"],
+    "knowledgeSeeds": [
+      {
+        "title": "屿见整理上门收纳服务范围",
+        "summary": "覆盖衣橱、厨房、书房三类空间的上门整理",
+        "body": "屿见整理上门收纳服务范围：衣橱整理（含换季收纳）、厨房整理（含动线规划）、书房整理（含文件分类）；每单配两名整理师；贵重物品由客户自行保管。"
+      }
+    ],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text", "no_absolute_promise"],
+      "qualityFloor": null,
+      "note": "第一轮寒暄先接住；第二轮按知识作答且过渡自然不生硬"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "knowledge-021",
+    "category": "knowledge",
+    "description": "时效性活动问（知识含截止日期），期望按时效如实答、不编造延期",
+    "contactSeed": {
+      "customerStage": "relationship_building",
+      "intentLevel": "medium",
+      "profileNote": "九月初来问八月活动的客户",
+      "memorySummary": "客户八月看到过活动海报，现在才来问",
+      "manualTags": [],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["你们之前那个夏日活动现在还有吗"],
+    "knowledgeSeeds": [
+      {
+        "title": "拾陆烘焙夏日活动规则",
+        "summary": "夏日满赠活动截至八月三十一日",
+        "body": "拾陆烘焙夏日活动规则：活动期间单笔满 88 元赠夏日限定饼干一份；活动时间为八月一日至八月三十一日，逾期结束；赠品数量有限先到先得。"
+      }
+    ],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text", "no_absolute_promise"],
+      "qualityFloor": null,
+      "note": "须按知识给出活动截止时效，不得擅自承诺延期或补赠"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  }
+]

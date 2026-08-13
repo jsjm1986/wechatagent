@@ -15,7 +15,6 @@
 //!
 //! FORBIDDEN dependencies: gateway / outbox / mcp / tasks / webhooks。
 
-pub mod auto_release;
 pub mod budget;
 pub mod cohort;
 pub mod envelope;
@@ -42,9 +41,7 @@ pub use self::envelope::{insert_experiment_envelope, update_experiment_status};
 pub use self::error::EvolutionError;
 
 pub mod runtime_flag;
-pub use self::runtime_flag::{
-    bucket_for_contact, is_evolution_enabled_for, load_runtime_flag, rollout_bucket_index,
-};
+pub use self::runtime_flag::{bucket_for_contact, load_runtime_flag, rollout_bucket_index};
 
 /// 演化器主循环。`EVOLUTION_ENABLED=false`（运维硬锁定）时立即 return；为 true 时
 /// 进常驻 tick 循环，实际是否产出由 mongo runtime flag（UI 总开关）每 tick 决定。
@@ -296,19 +293,9 @@ pub async fn run_one_tick(
             0
         });
 
-    // 9. 历史 threshold auto-release 接点。HC-017 当前政策硬闸恒关，因此立即
-    //    return 0；保留调用只为未来按类型+方向白名单启用时复用既有评估代码。
-    //    rollback 永远由 admin 手工。
-    let auto_released =
-        auto_release::auto_release_eligible_thresholds(state, workspace_id, account_id)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(
-                    ?e,
-                    "auto_release_eligible_thresholds failed; will retry next tick"
-                );
-                0
-            });
+    // （终裁 10-x 清理）：历史 threshold auto-release 接点已删除——HC-017 政策
+    // 硬闸恒关使其成为永不可达的自动发布通道；release/rollback 唯一路径是
+    // routes/evolution.rs 的管理员显式操作。
 
     write_tick_completed_event(
         state,
@@ -323,7 +310,6 @@ pub async fn run_one_tick(
         eligible_count,
         rejected_after_eval,
         post_release_completed,
-        auto_released,
     )
     .await?;
     Ok(())
@@ -380,6 +366,7 @@ async fn write_budget_exceeded_event(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn write_tick_completed_event(
     state: &AppState,
     workspace_id: &str,
@@ -393,7 +380,6 @@ async fn write_tick_completed_event(
     proposals_eligible_count: usize,
     proposals_rejected_count: usize,
     post_release_reviews_completed: usize,
-    auto_released_count: usize,
 ) -> Result<(), EvolutionError> {
     let event = crate::models::AgentEvent {
         id: None,
@@ -403,7 +389,7 @@ async fn write_tick_completed_event(
         kind: "evolution_tick_completed".to_string(),
         status: "ok".to_string(),
         summary: format!(
-            "evolution tick completed (threshold_cohort={threshold_count}, prompt_cohort={prompt_count}, threshold_proposals={threshold_proposals}, prompt_proposals={prompt_proposals}, eligible={proposals_eligible_count}, rejected={proposals_rejected_count}, post_release_reviews_completed={post_release_reviews_completed}, auto_released={auto_released_count})"
+            "evolution tick completed (threshold_cohort={threshold_count}, prompt_cohort={prompt_count}, threshold_proposals={threshold_proposals}, prompt_proposals={prompt_proposals}, eligible={proposals_eligible_count}, rejected={proposals_rejected_count}, post_release_reviews_completed={post_release_reviews_completed})"
         ),
         details: Some(doc! {
             "experiment_id": exp_id,
@@ -415,7 +401,6 @@ async fn write_tick_completed_event(
             "proposals_eligible_count": proposals_eligible_count as i32,
             "proposals_rejected_count": proposals_rejected_count as i32,
             "post_release_reviews_completed": post_release_reviews_completed as i32,
-            "auto_released_count": auto_released_count as i32,
         }),
         created_at: DateTime::now(),
         dedupe_key: None,
@@ -471,7 +456,6 @@ mod isolation_contract_tests {
     use std::path::PathBuf;
 
     const EXPECTED_MODULES: &[&str] = &[
-        "auto_release.rs",
         "budget.rs",
         "cohort.rs",
         "envelope.rs",

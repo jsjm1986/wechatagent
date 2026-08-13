@@ -41,17 +41,23 @@ pub const FIVE_GATE_KEYS: &[&str] = &[
 /// 把 final_review_status 视为"成功送出"的状态集。与 design.md §4.6 一致。
 pub const SEND_SUCCESS_STATUSES: &[&str] = &["approved", "revision_applied_approved"];
 
-/// 三个**安全闸**（block 类）与其 `final_review_status` 拦截态的映射。
+/// **安全闸**（block 类）与其 `final_review_status` 拦截态的映射。
 ///
 /// 与 [`crate::evolution::threshold::classify_gate_hit`] 同一份约定，方向反置：
 /// 给定 gate_key 找到"被该闸拦下时写入的终态字符串"。`human_like /
 /// emotional_value` 是 rewrite 类、`planner_block_rate` 属 planner 域，都**不**是
 /// 安全闸，不在此表内——放松它们不构成"漏过风险消息"。
 ///
+/// `pressure_risk_block` 同样不在此表内（缺陷 #16 修复）：pressure 在生产是
+/// **软闸**（触发 single-shot revision，不产 block 终态），此前映射的
+/// `blocked_by_safety_guard` 实际来源是证据门/fail-closed 基础设施路径
+/// （见 `threshold::classify_gate_hit` 注释）——监控一个 pressure 阈值变化
+/// 不会影响的状态等于反向门空转。`threshold::generate` 已不再对 pressure
+/// 产候选，该 gate 不会再进入 #152 判定。
+///
 /// #152 反向显著性门只对本表内的 gate 生效。
 pub const SAFETY_GATE_BLOCK_STATUS: &[(&str, &str)] = &[
     ("fact_risk_block", "held_by_ai_policy"),
-    ("pressure_risk_block", "blocked_by_safety_guard"),
     (
         "product_accuracy_score_block",
         "blocked_unverified_product_claim",
@@ -1006,7 +1012,8 @@ mod tests {
         assert!(metrics.get_str("safety_gate_block_status").is_err());
     }
 
-    /// #152：安全闸映射覆盖三个 block 类闸、且排除 rewrite / planner 闸。
+    /// #152：安全闸映射只覆盖有真实 block 终态的两闸、且排除 rewrite / planner /
+    /// pressure（缺陷 #16：pressure 是软闸不产 block 终态，反向门对它空转已消除）。
     #[test]
     fn safety_block_status_mapping_is_exhaustive_and_exclusive() {
         assert_eq!(
@@ -1014,14 +1021,11 @@ mod tests {
             Some("held_by_ai_policy")
         );
         assert_eq!(
-            safety_block_status_for(Some("pressure_risk_block")),
-            Some("blocked_by_safety_guard")
-        );
-        assert_eq!(
             safety_block_status_for(Some("product_accuracy_score_block")),
             Some("blocked_unverified_product_claim")
         );
-        // rewrite 类 / planner 域 / None 都不是安全闸。
+        // pressure 软闸（缺陷 #16）/ rewrite 类 / planner 域 / None 都不是安全闸。
+        assert_eq!(safety_block_status_for(Some("pressure_risk_block")), None);
         assert_eq!(
             safety_block_status_for(Some("human_like_score_rewrite")),
             None
