@@ -349,6 +349,10 @@ DIV-17（`quiet_hours.rs:140-153` doc 描述三级链、函数体 :154-163 仍 w
 DIV-15（`docs/DEPLOYMENT-STEPS.md:320,332` `db.agent_runs`→`agent_run_logs`——按文档排障会误判"系统没跑"，**运维文档 owner**）、DIV-33（plan 引用不存在的 findings 文件——superpowers 历史存档，接受现状或补一行勘误，档案 owner）、DIV-34（`deploy.sh` 整体过时，以 `scripts/deploy/` 为准——建议头部加弃用横幅或删除，**部署 owner**）、DIV-35（`.env.example` 缺 POST_DECISION_*/SILENCE_SIGNAL_* 两族变量——运维排障缺文档入口，**后端 owner**）。
 > **处置记录（2026-08-14 D/E 尾波，4 条全闭）**：DIV-15 两处集合名修正（查询字段 `contact_wxid`/`created_at` 经 `models.rs:3392` 亲验为 snake_case 本就正确；`docs/mcp-integration-final-delivery.md:129` 存同类 `agent_runs` 表述，历史交付存档不改）。DIV-33 plan 头部补勘误注记（F-005/F-020/F-013/F-003 编号经全 docs 检索无第二处定义，台账确未落盘、非"并入 deep-logic-audit"）。DIV-34 deploy.sh 头部弃用横幅（指向 `scripts/deploy/`，保留历史参考）。DIV-35 补齐两族 10 个变量（POST_DECISION_* 6 个 + SILENCE_* 4 个，语义与默认值逐条对照 `config.rs` 字段 doc 注释抄录，POST_DECISION 族标注"恒开无开关"）。
 
+**分组遗漏勘误（2026-08-14 全面对账时发现）**：DIV-61 与 DIV-62 属"仍存 43"成员但未被列入上述 A–E 任何组（43 = 41 列出 + 2 遗漏），导致 chore 尾波按组执行时漏处理。对账当场处置：
+> **DIV-61 已修**：`knowledge_router.rs` fallback_rank 六行注释重复两遍（原锚 :771-780 已漂移至 :826-835），删除重复段。
+> **DIV-62 仍存，影响面已精确化**：`runtime.rs` `as_document()` 的生产消费点为 `review/mod.rs:4394`（serde_json 序列化后注入 **reviewer prompt 的硬运行参数**）——wire doc 缺 `allowed_conversation_modes` / `grounding_gate_bypass_without_claim` / `distrust_self_reported_low_risk` 等新字段族意味着 reviewer 在 prompt 内看不到它们；行为红线不受影响（模式枚举校验在 `types.rs:811,960` 确定性代码、两开关由 `gates.rs` 确定性消费），实际缺口集中在**非销售域下 reviewer 对自定义模式集的感知**。修复非一行级（会改变 reviewer prompt 内容、牵动 mock 测试锚文本与 wire shape 测试），挂账 backlog 待专项处置。
+
 ### 6.5 本节核销后的使用约定
 
 - 读 §1 主表任一条目前，先查本节终态；标"已修/失效/已标注"的条目不再构成防误导风险，标"仍存"的条目继续按 §2 反向索引对待。

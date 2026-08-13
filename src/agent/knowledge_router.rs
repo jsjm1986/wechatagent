@@ -828,11 +828,6 @@ async fn route_operation_knowledge_inner(
     // 在已加载的 verified corpus 上做静态排序，取 top-N 作为弱证据回填，避免下游
     // grounding 闸直接 missing。回填时显式标 `risk_level=medium` 与 tool_trace
     // `fallback=rank`，让 Reply Agent / 审计感知"这是弱兜底而非 agent 推理结果"。
-    // fallback_rank：当 agent 在预算内未给出 cited（budget 早早耗尽 / 3 轮兜底空集
-    // / agent 显式返回 0 cited）时，按 `wiki_type_priority × dynamic_confidence`
-    // 在已加载的 verified corpus 上做静态排序，取 top-N 作为弱证据回填，避免下游
-    // grounding 闸直接 missing。回填时显式标 `risk_level=medium` 与 tool_trace
-    // `fallback=rank`，让 Reply Agent / 审计感知"这是弱兜底而非 agent 推理结果"。
     //
     // P4 探索注入（flag-gated，默认关）：当 `KNOWLEDGE_EXPLORATION_ENABLED` 开且
     // 候选池 > top-N 时，不再硬取确定性 top-N，而是按 softmax(score/温度) 在**同一
