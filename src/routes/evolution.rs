@@ -45,10 +45,6 @@ const MAX_EXPERIMENT_LIMIT: i64 = 100;
 const RELEASE_CONFIRMATION_LITERAL: &str = "RELEASE";
 const ROLLBACK_CONFIRMATION_LITERAL: &str = "ROLLBACK";
 
-/// admin 默认操作者 id；UI 没有登录态可注入时（M4 W4 简化路径）落到该常量。
-/// 真正的 SSO/admin auth 在外层 middleware 层挂——M4 不引入 evolution 专属 token。
-const DEFAULT_RELEASE_ADMIN: &str = "admin";
-
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct ListExperimentsQuery {
@@ -700,7 +696,9 @@ pub(super) struct UpdateRuntimeFlagRequest {
     enabled: bool,
     /// 灰度百分比 0..=100；超出范围由 server 钳制。
     rollout_percent: u32,
-    /// 操作者审计字段；可选（未登录态写 "admin" 默认值）。
+    /// 已废弃（缺陷 #6）：审计身份改由服务端会话（`admin.username`）落库，与
+    /// release/rollback 的 ReviewActor 先例同源。字段保留只为老客户端反序列化
+    /// 兼容——值被忽略；与会话身份不一致时留 warn 供审计发现伪造尝试。
     #[serde(default)]
     updated_by: Option<String>,
     /// 历史 workspace 自动发布子闸。None 时不改；HC-017 当前政策下 true 被拒绝。
@@ -739,11 +737,23 @@ pub(super) async fn put_evolution_runtime_flag(
     // FORBIDDEN: enqueue agent_send_outbox / mcp call
     let workspace_id = admin.current_workspace.clone();
     let rollout_percent = payload.rollout_percent.min(100);
-    let updated_by = payload
+    // 缺陷 #6：审计身份恒取服务端会话身份（认证 middleware 产物），绝不采信
+    // 请求体自报——否则灰度旗审计的 updated_by 可被任意伪造。
+    let updated_by = admin.username.as_str();
+    if let Some(claimed) = payload
         .updated_by
         .as_deref()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or(DEFAULT_RELEASE_ADMIN);
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if claimed != admin.username {
+            tracing::warn!(
+                claimed_updated_by = %claimed,
+                session_username = %admin.username,
+                "runtime-flag request body updatedBy ignored; server-side session identity is authoritative"
+            );
+        }
+    }
     let now = DateTime::now();
 
     // HC-017（终裁 10-x 清理后）：自动发布通道已随 `evolution::auto_release` 模块
