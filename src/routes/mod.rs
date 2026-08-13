@@ -971,8 +971,9 @@ pub fn api_router(state: AppState) -> Router<AppState> {
         //    reviewer_misjudge_signal / negative_example pending）只读 ────────
         .route("/admin/observability/phase-rollup", get(phase_rollup))
         .route("/admin/observability/performance", get(performance_summary))
-        // ── G-后续Ⅱ/2：worker 健康聚合（chat_tasks 状态 / gap_signals sweep 命中率 /
-        //    lessons_learned 14d pattern × review_status）一次 RTT 拉齐 ──────
+        // ── G-后续Ⅱ/2：worker 健康聚合（chat_tasks 状态 / gap_signals 历史已解决
+        //    占比 historicalResolvedShare / lessons_learned 14d pattern ×
+        //    review_status）一次 RTT 拉齐 ──────
         .route("/admin/observability/worker-health", get(worker_health))
         // ── LLM provider 配置 admin 路由：前端 UI 编辑 / 测试 / 热切换 ────
         .route(

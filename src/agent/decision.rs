@@ -1,12 +1,13 @@
-//! Reply Agent 主决策入口 (`decide_reply`)。
+//! Reply Agent 主决策入口 (`decide_reply_with_promote`)。
 //!
-//! 该模块负责构造 `user.reply.task` prompt，注入运营方法、状态机、
+//! 该模块负责构造 `user.reply.fast.task` prompt（紧凑 schema 生产主 key；
+//! 完整版 `user.reply.task` 已退役、运行时零调用），注入运营方法、状态机、
 //! 知识切片、长期记忆、最近聊天等上下文，调用 LLM 生成 [`AgentDecision`]。
 //! 同时承载 [`build_initial_operation_profile`]：根据运营 admin 录入的备注
 //! 给联系人生成初始运营画像。
 //!
 //! 所有 prompt 加载、上下文格式化、调用 LLM 都集中在这里；其它子模块
-//! 通过 `pub(crate)` 调用 `decide_reply` 复用同一份 prompt 渲染逻辑。
+//! 通过 `pub(crate)` 调用 `decide_reply_with_promote` 复用同一份 prompt 渲染逻辑。
 
 use std::sync::atomic::{AtomicBool, Ordering};
 

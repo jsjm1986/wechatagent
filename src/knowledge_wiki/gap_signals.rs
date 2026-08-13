@@ -8,7 +8,7 @@
 //! 本模块只**生成 + 消解**信号，不改 chunk；所有 chunk 编辑仍走
 //! [`crate::knowledge_wiki::chunk_revisions::apply_chunk_revision`]。
 //!
-//! 8 类 signal kind:
+//! 结构 lint 实产 9 类 signal kind:
 //! - `orphan` — chunk 既无入链也无 30d 命中，疑似死页
 //! - `broken_link` — chunk.related_chunks 指向不存在的 chunk_id
 //! - `no_outlinks` — synthesis/comparison/methodology 类 chunk 的 related_chunks 为空
@@ -17,6 +17,12 @@
 //! - `contradiction` — 同 workspace 同 normalize_title 多 chunk + body 首段 sha256 不一致
 //! - `missing_chunk` — chunk.related_chunks 指向已 archived 的 chunk（依赖被回收）
 //! - `suggestion` — `usage_stats.blocked_count_30d > 3 && integrity_status != "verified"`
+//! - `dangling_anchor` — source_quote 已无法在文档 raw_content 中定位（拿不到原文时跳过不误报）
+//!
+//! 此外，在线召回-trace 路径（`agent::knowledge_agent::classify_recall_outcome` 与
+//! 本文件 `recall_miss_from_product_block`，source=`"recall_trace"`）另产 3 类：
+//! `recall_miss` / `recall_low_yield` / `citation_format_rejected`——同落
+//! `knowledge_gap_signals` 集合，集合内 kind 共 12 类。
 //!
 //! 三个新 kind（`contradiction` / `missing_chunk` / `suggestion`）全部走纯规则路径，
 //! 不调用 LLM；source 字段维持 `"rule"`，与 stage 1 sweep 一致。

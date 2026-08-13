@@ -107,7 +107,8 @@ async fn seed_conversation_mode_taxonomy(db: &Database, now: DateTime) -> AppRes
         }
     }
     tracing::info!(
-        migration_id = "m028_seed_conversation_mode",
+        // 与 migrations/mod.rs MIGRATIONS 注册表的 id 保持一致，便于日志检索。
+        migration_id = "2026_06_Y2_001_seed_conversation_mode",
         inserted,
         skipped,
         "seeded conversation_mode taxonomy (4 values)"

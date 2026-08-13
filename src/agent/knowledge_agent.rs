@@ -3,8 +3,10 @@
 //! 设计目标：让 LLM 自己驱动 wiki chunk 探索，按 skills 那样的"按需披露"模式：
 //! - 工具集：`list_catalog`（按 query 重排后的 chunk 摘要） / `open_document`
 //!   （按文档下钻到它的原子摘要） / `open_chunk`（按需展开正文+引用） /
-//!   `follow_relations`（沿 related_chunks 跳）。round 1 额外注入**文档级目录**
-//!   （catalogSummary / routingMap 导航卡片），让 agent 先选文档再下钻原子（#619）。
+//!   `follow_relations`（沿 related_chunks 跳）。注意：#619 设想的 round 1
+//!   **文档级目录注入**（[`DocEntry`] catalogSummary / routingMap 导航卡片）
+//!   从未接线——`DocEntry` 零构造点，catalog 只有原子级 [`CatalogEntry`]（不含
+//!   documentId），`open_document` 因 agent 无从得知 documentId 而近乎不可用。
 //! - 多轮预算：≤ 4 轮 LLM 决策（文档目录+catalog → open_document → open_chunk /
 //!   follow → answer）；超出强制 answer 当前已 opened chunks。
 //! - 预算复用：所有 LLM 调用走 [`super::generate_agent_json`]，自动累计到当前
@@ -37,10 +39,11 @@ use super::generate_agent_json;
 mod cache;
 pub use cache::{cache_stats, AnswerCacheStats};
 
-/// 单轮探索的硬上限：4 轮 LLM 决策。分层召回（#619）后最坏路径多一跳——
-/// `round1 看文档目录 + catalog → open_document 下钻到原子 → open_chunk 展开正文
-/// → answer` 正好 4 轮；旧的 `list_catalog → open_chunk → follow_relations → answer`
-/// 链路同样 4 轮。第 5 轮直接强制 answer；与 [`super::RunBudget::max_llm_calls`]
+/// 单轮探索的硬上限：4 轮 LLM 决策。按 #619 分层召回设想，最坏路径
+/// `round1 文档目录 + catalog → open_document 下钻到原子 → open_chunk 展开正文
+/// → answer` 正好 4 轮（该设想中的文档目录注入未接线，见模块头注）；现行实际
+/// 链路 `list_catalog → open_chunk → follow_relations → answer` 同样 4 轮。
+/// 第 5 轮直接强制 answer；与 [`super::RunBudget::max_llm_calls`]
 /// 互不替代——budget 用尽更早跳出循环。
 pub(crate) const MAX_ROUNDS: i32 = 4;
 
@@ -126,10 +129,12 @@ pub struct CatalogEntry {
     pub related_count: i32,
 }
 
-/// 文档级导航卡片（#619 分层召回）——给 agent 在 **round 1** 当「目录/索引」读的
+/// 文档级导航卡片（#619 分层召回）——设想给 agent 在 **round 1** 当「目录/索引」读的
 /// 上层信号，密度远高于 30 条等价原子摘要。`catalogSummary` / `routingMap` 是抽取
-/// 时**专门写给 agent**的导航文本（"这份文档解决什么问题、何时该打开"），旧召回
-/// 链路从未用过它们；这里把它们暴露出来，让 agent 先按文档下钻、再展开原子。
+/// 时**专门写给 agent**的导航文本（"这份文档解决什么问题、何时该打开"）。
+///
+/// **现状：预留结构，全库零构造点**——round 1 注入从未接线，agent 目前只看到
+/// 原子级 [`CatalogEntry`]。接线时应在 round 1 组装本结构并随 catalog 下发。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DocEntry {
@@ -431,12 +436,14 @@ pub async fn answer_streaming(
 ///
 /// 上游 token 流过来的是模型**原始 JSON 文本**（如 `{"action":"answer","answer":"你好`
 /// → `世界"}`），不是裸正文。本结构体逐 char 喂入，维护一个轻量解析状态机，仅在
-/// 指针落在顶层 `answer` 字符串值内部时把解码后的字符累积进 `pending`，由 [`push`]
-/// 返回。设计取舍：
-/// - 只认顶层 `answer` 键，忽略嵌套对象里的同名键（用 `depth` 计大括号层级）。
+/// 指针落在 `answer` 字符串值内部时把解码后的字符累积返回。设计取舍：
+/// - 定位靠 [`locate_answer_value_start`] 的**朴素子串匹配**（找 `"answer"` 键 +
+///   冒号 + 起始引号，取首个命中），**不做大括号层级计数**——若 `answer` 值之前
+///   出现嵌套对象里的同名键，会提前把嵌套值当正文下发；LLM 正常输出的扁平
+///   `{"action":"answer","answer":"..."}` 形态无此问题。
 /// - 处理 JSON 字符串转义（`\"` / `\\` / `\n` / `\uXXXX` 等），保证下发的是人类
 ///   可读正文而非转义序列。
-/// - 工具轮（无 answer 字段）整段喂完后 `pending` 恒空，自然不产生 token。
+/// - 工具轮（无 answer 字段）整段喂完后累积恒空，自然不产生 token。
 #[derive(Default)]
 struct AnswerStreamer {
     /// 已扫描但尚未匹配到结构的原始字符缓冲（处理跨 chunk 的键名 / 转义切割）。

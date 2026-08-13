@@ -114,34 +114,4 @@ export const api = {
   },
 };
 
-/// 统一 SSE 订阅：封装 close/error 兜底，返回关闭函数。
-/// 替代散落的裸 EventSource（断流不收尾、error 靠旧闭包判断等坑）。
-export function openEventSource(
-  url: string,
-  handlers: {
-    onEvent?: (type: string, data: string) => void;
-    onError?: () => void;
-    events?: string[];
-  }
-): () => void {
-  if (typeof window === "undefined" || typeof window.EventSource === "undefined") {
-    return () => {};
-  }
-  const es = new EventSource(url);
-  let closed = false;
-  const close = () => {
-    if (closed) return;
-    closed = true;
-    es.close();
-  };
-  for (const evt of handlers.events ?? []) {
-    es.addEventListener(evt, (e) => handlers.onEvent?.(evt, (e as MessageEvent).data));
-  }
-  es.addEventListener("error", () => {
-    handlers.onError?.();
-    close();
-  });
-  return close;
-}
-
 export { parseApiError };

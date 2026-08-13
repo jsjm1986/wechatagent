@@ -1192,7 +1192,9 @@ pub(crate) async fn write_knowledge_usage_log(
         .await?;
     // knowledge-wiki §6.1：每次 run 把命中/拦截原子写回 chunk.usage_stats，
     // 让 catalog/persisted 的排序与 feedback worker 的 dynamic_confidence 拿到
-    // 实时计数。fire-and-forget——不阻塞 gateway 决策。
+    // 实时计数。注意这不是 fire-and-forget：循环内**顺序 await** 每次 update
+    // （N 个 chunk = N 次串行 DB 往返，仍在调用方请求路径上），`let _ =` 只吞
+    // 错误保证失败不影响主流程；本函数在决策产出后调用，不影响决策本身。
     let block_reason = if approved {
         None
     } else {

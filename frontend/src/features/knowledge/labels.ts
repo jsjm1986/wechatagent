@@ -58,19 +58,6 @@ export function severityLabel(v?: string | null): string {
   return SEVERITY_LABELS[v] ?? v;
 }
 
-/// 待评审分类
-export const REVIEW_CATEGORY_LABELS: Record<string, string> = {
-  contested: "有争议",
-  needs_review: "待确认",
-  source_orphan: "缺来源",
-  pending_verification: "待核验",
-  dependents_pending: "依赖待定",
-};
-export function reviewCategoryLabel(v?: string | null): string {
-  if (!v) return "—";
-  return REVIEW_CATEGORY_LABELS[v] ?? v;
-}
-
 /// 文档来源类型
 export const SOURCE_TYPE_LABELS: Record<string, string> = {
   manual: "手动录入",

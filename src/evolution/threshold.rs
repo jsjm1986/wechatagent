@@ -170,6 +170,9 @@ pub async fn generate(
         target_lower: f64,
         target_upper: f64,
         current_value: f64,
+        /// 名实注意：存的是 `decide_candidate` 返回的 **clamp 后**候选值（clamp
+        /// 发生时 cohort_notes.clamped_to_value 记录的就是本值），并非 clamp 前
+        /// 的原始提案；是否发生过 clamp 由旁边的 `clamped` 标记。
         proposed_raw: f64,
         clamped: bool,
         cooldown_active: bool,

@@ -1195,7 +1195,7 @@ export function TryRecallView() {
         <h3 style={{ fontSize: 20 }}>测试检索</h3>
       </header>
       <p style={{ color: "var(--muted)", fontSize: 12.5, margin: "0 0 12px" }}>
-        输入一个问题，看知识库会匹配出哪些知识条目，帮你检查知识的检索效果。客户 ID、联系人 ID 可选填。
+        输入一个问题，看知识库会匹配出哪些知识条目，帮你检查知识的检索效果。账号 ID、联系人 ID 可选填。
       </p>
       <form
         onSubmit={(e) => { e.preventDefault(); void runSearch(); }}
@@ -1203,7 +1203,7 @@ export function TryRecallView() {
       >
         <input
           type="text"
-          placeholder="客户 ID（可选，默认 default）"
+          placeholder="账号 ID（可选，默认 default）"
           value={accountId}
           onChange={(e) => setAccountId(e.target.value)}
           className="wikiInput"

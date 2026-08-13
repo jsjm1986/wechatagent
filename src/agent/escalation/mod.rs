@@ -230,7 +230,9 @@ pub(crate) async fn escalate_held_decision(
     let today = count_pushes_today(state, &contact.workspace_id, &principal_wxid, since_ms).await?;
     let last_push = latest_push_ms(state, &contact.workspace_id, &principal_wxid).await?;
     if !crate::agent::escalation::push_allowed(&policy, today, last_push, now_ms) {
-        return Ok(()); // 骚扰门关：跳过推卡（pending 台账可由 admin 在收件箱处置）
+        // 骚扰门关：直接返回，跳过推卡。注意此时 insert_pending_escalation 尚未
+        // 执行——被拦的请示**不落 pending 台账**，admin 收件箱看不到这条记录。
+        return Ok(());
     }
     // 去重：同客户同类别已有 pending → 不重复推卡骚扰领导。
     if has_pending_for_contact(

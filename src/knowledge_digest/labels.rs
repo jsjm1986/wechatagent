@@ -1,6 +1,6 @@
 //! digest 兜底文案里内嵌的 final_review_status 拦截码 → 中文。
-//! 取值来源:analyze_run_logs 扫描的 4 个状态(knowledge_digest/mod.rs:277-282)。
-//! 未知回落原值。
+//! 取值来源:`knowledge_digest/mod.rs` `analyze_run_logs` 内 `block_states`
+//! 扫描的 4 个状态(注释按约定引用函数/变量名,不写行号)。未知回落原值。
 
 pub(crate) fn block_reason_zh(reason: &str) -> String {
     match reason {

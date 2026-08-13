@@ -58,7 +58,7 @@ pub async fn run_evolutionary_worker(state: AppState) {
     let tick_seconds = state.config.evolution_tick_seconds.max(60);
     tracing::info!(
         tick_seconds,
-        "evolution worker starting (M4 W1 skeleton — empty tick by design)"
+        "evolution worker starting (full pipeline: cohort → critic → replay → significance)"
     );
     let mut ticker = interval(Duration::from_secs(tick_seconds));
     loop {
@@ -223,9 +223,12 @@ pub async fn run_one_tick(
         .map_err(EvolutionError::from)?;
 
     // 6. M4 W3：shadow replay + 显著性聚合。
-    //    pending_eval 候选驱动；budget 在 prompt critic 阶段已记录消耗，replay
-    //    现阶段 threshold 不调 LLM、prompt 走 placeholder failed，所以这里不会
-    //    再触发 BudgetExceeded。
+    //    pending_eval 候选驱动。threshold 候选纯重判不调 LLM；prompt 候选经
+    //    `replay::eval_all` → `prompt_shadow::shadow_replay_prompt_one` 跑真实
+    //    Reply+Review 影子演练（调 LLM，但消耗不回写 EvolutionBudget——budget
+    //    是 mut 借用无法跨 replay task 计量，eval_all 只做 exhausted() 静态
+    //    预检，超额的 replay 直接落 failed 文档、不向上抛）。因此下方
+    //    BudgetExceeded 分支是防御性兜底，当前 eval_all 不产生该错误。
     let pending_count = threshold_proposals
         .iter()
         .chain(prompt_proposals.iter())

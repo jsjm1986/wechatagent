@@ -1,8 +1,8 @@
 //! P1-7：长寿后台 worker 的 panic 兜底 supervisor。
 //!
-//! 背景：`main.rs` 用 `tokio::spawn` 拉起 8 个长驻 worker（task / outbox /
-//! planner / cold_contact / evolution / knowledge_digest / knowledge_task /
-//! catalog_rebuild / feedback）。这些 worker 内部都是 `loop { ... sleep ...}`，
+//! 背景：`main.rs` 用 `tokio::spawn` 拉起一组长驻 worker（受监督名单以本文件
+//! [`SUPERVISED_WORKERS`] 常量为唯一权威——注释不复制清单/数量，防止再漂移）。
+//! 这些 worker 内部都是 `loop { ... sleep ...}`，
 //! 但 future 一旦 panic（非 `Result` 路径，如越界 / unwrap None /
 //! `expect` 失败），`JoinHandle` 直接被 drop，worker 静默死亡到下次进程重启
 //! 才能恢复。生产里这往往以"为什么 follow-up 任务从昨天起再也不跑"出现。

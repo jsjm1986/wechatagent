@@ -285,8 +285,9 @@ pub trait LlmProvider: Send + Sync {
     }
 }
 
-/// 第三层「回喂 LLM 修复」的最大尝试次数（用户指定 2 次）。前两层（快路径 +
-/// `repair_loose_json` + `extract_embedded_json`）全失败才触发。
+/// 第四层「回喂 LLM 修复」的最大尝试次数（用户指定 2 次）。前三层确定性解析
+/// （快路径 / `repair_loose_json` / `extract_embedded_json`）全失败才触发——
+/// 与 `parse_or_repair` 处"三层确定性解析 + 第四层 LLM-repair"口径一致。
 const REPAIR_MAX_ATTEMPTS: u32 = 2;
 
 impl LlmClient {

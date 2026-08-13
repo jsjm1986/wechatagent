@@ -456,9 +456,9 @@ async fn e2e_only_one_active_per_workspace() {
 async fn e2e_delete_forbidden_on_active() {
     let app = common::TestApp::start().await;
     let db = app.state.db.clone();
-    let ws = &app.state.config.default_workspace_id;
+    let ws = app.state.config.default_workspace_id.clone();
 
-    let id = db_create_profile(&db, ws, "profile-x", "X", "X", "manual").await;
+    let id = db_create_profile(&db, &ws, "profile-x", "X", "X", "manual").await;
 
     db.domain_profiles()
         .update_one(
@@ -468,14 +468,48 @@ async fn e2e_delete_forbidden_on_active() {
         )
         .await
         .expect("publish");
-    db_activate_profile(&db, ws, id).await;
+    db_activate_profile(&db, &ws, id).await;
 
-    // 验证 active profile 存在（前置条件）
+    // 前置：active profile 存在。
     let p = db_get_profile(&db, id).await;
     assert_eq!(p.is_active, true, "前置：profile 激活成功");
 
-    // DB 本身不阻止删除 active 行——业务规则（禁止删 active）由 handler 层强制。
-    // 本测试验证 active 行确实存在（前置条件），业务层守卫在 handler 实现。
+    // 真删除请求（DIV-32）：直调 delete handler，active 行必须被拒。
+    let denied = wechatagent::routes::domain_profiles::delete_domain_profile(
+        State(app.state.clone()),
+        Extension(test_admin(&ws)),
+        Path(id.to_hex()),
+    )
+    .await;
+    match denied {
+        Err(AppError::BadRequest(message)) => {
+            assert!(
+                message.contains("only an unpublished domain profile draft may be deleted"),
+                "拒绝原因应指向 draft-only 规则，实际：{message}"
+            );
+        }
+        other => panic!("删除 active profile 必须被 BadRequest 拒绝，实际：{other:?}"),
+    }
+    // 被拒后行必须原封不动地存在。
+    let survived = db_get_profile(&db, id).await;
+    assert_eq!(survived.is_active, true, "active 行不得被删除");
+
+    // 区分度对照：未发布的 draft 行允许删除（证明拒绝不是无条件的）。
+    let draft_id = db_create_profile(&db, &ws, "profile-draft", "D", "D", "manual").await;
+    let deleted = wechatagent::routes::domain_profiles::delete_domain_profile(
+        State(app.state.clone()),
+        Extension(test_admin(&ws)),
+        Path(draft_id.to_hex()),
+    )
+    .await
+    .expect("draft profile delete should succeed");
+    assert_eq!(deleted.0["ok"], Value::Bool(true));
+    let gone = db
+        .domain_profiles()
+        .find_one(doc! { "_id": draft_id }, None)
+        .await
+        .expect("query deleted draft");
+    assert!(gone.is_none(), "draft 行应被物理删除");
 }
 
 // ── Part B：Real LLM 引导层生成候选 ─────────────────────────────────────────
