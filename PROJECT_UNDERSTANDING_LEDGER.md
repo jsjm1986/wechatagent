@@ -154,14 +154,16 @@
 
 | 12 | **复刻式测试实质漂移 2 处 + 幻影状态值 1 处**：`escalation_push_time_reassign` 用例 1 锁 `$set last_pushed_at_ms` 而生产为 `$unset`（`ledger.rs:1111-1114` 主会话亲证）；`autonomy_protocol_pbt` P2 模型缺 `apply_revision_fallback` 分支、断言与生产相反（`gates.rs:1258-1275`）；`dry_run_isolation` 用例 2 的 `status="completed"` 不在生产闭集（生产终态 succeeded）——三者给出假信心 | 28 号裁决 + 主会话抽证 | 中（测试可信度） |
 | 13 | **生产行为无测试守护清单共 19 条**（改坏不会红的区域地图，按风险排序含 deferred_wake 取消、毒丸行、知识窗口错位、HP-1 回收、GATE-1 复检、revision fallback 接线等） | 28 号 §4 | 改动前必查 |
-| 14 | **"被引用"功能恒 400**：前端发 `?target_id=`（`frontend/src/features/knowledge/shared.tsx:933`），后端 `ChunkReferrersQuery` camelCase 只认必填 `targetId`（`wiki_edit.rs:840-844`）→ Query 反序列化恒失败；后端注释 `:846` 参数名也写错 | 27 号发现+主会话双侧亲验 | 高（功能坏死） |
-| 15 | **产品 active 过滤静默失效**：前端发 `?active_only=true`，后端 wire 名 `activeOnly` 带 default（`products.rs:40-46`）→ 参数被忽略，campaign 圈人下拉混入归档产品 | 27 号发现+主会话双侧亲验 | 中（数据污染） |
+| 14 | ~~"被引用"功能恒 400~~ **【已修复 2026-08-13 线 B】**后端加 `serde(alias="target_id")` 双认 + 前端改发 `targetId` + 注释改正 | 线 B commit（B1） | 已关闭 |
+| 15 | ~~产品 active 过滤静默失效~~ **【已修复 2026-08-13 线 B】**同款双保险（alias + 前端 `activeOnly`），归档产品不再混入圈人下拉 | 线 B commit（B2） | 已关闭 |
 | 16 | **演化器 pressure gate 统计源失真**：`threshold.rs:69` 把 `blocked_by_safety_guard` 归因 pressure_risk_block 命中，但生产该终态来源是 R5.3.a fail-closed/业务声明拦截（`gates.rs:473,779,818`），pressure 是软闸不产此态——pressure 阈值候选建立在错误数据上、#152 反向门对该闸空转（significance/auto_release 同口径失真；post_release 侧口径已修正） | 23 号终裁+主会话双侧亲验 | 中-高（演化器可信度） |
-| 17 | **领导带时限裁决 → 前端崩溃**：`authorizationExpiresAt` 裸 bson DateTime 扩展 JSON 直出，`ResolvedEscalations.formatExpiry` 把对象交给 React 渲染——打开"已裁决历史"即白屏（与 domain_profiles 历史白屏事故同款，此两处未修） | 23 号终裁（12-3 升级） | 高（用户可感知崩溃） |
+| 17 | ~~领导带时限裁决 → 前端崩溃~~ **【已修复 2026-08-13 线 B】**两处序列化改 RFC3339 字符串（线 B 重验发现 domain_profiles 已修方案实为 `dt_to_string`→RFC3339 而非计划所写毫秒，按"逐字对齐实际"采用；前端 formatExpiry 防御性兼容毫秒/对象/字符串三形态；附契约快照 fixture） | 线 B commit（B3） | 已关闭 |
 
 **排除的疑点**（核证后不成立）：前端 DomainProfileDraft 不回传 `generated_state_machine` 会丢 AI 状态机草稿——不成立，后端 PUT 是剥离管理键的部分 `$set` 更新，未编辑字段原值保持（`domain_profiles.rs:1149-1153,1341`）。
 
 **裁决的误报**：17 号记录初判"user.reply.task 仍在生产"——误报，见偏差表 #2 精确化表述。
+
+**线 B 合并追记（2026-08-13，ce1c4d5，B5 增量另计）**：缺陷 #14/#15/#17 关闭（上表）；#9 锚点口径四处统一（收紧方向，红线 19 处零弱化）；execute_step 死路径删除（B6，两阶段提交为唯一路径，dismiss 的 account 过滤缺失随之消灭）；`user.reply.task` 种子退役落地（B7——align 语义经亲验安全：只遍历 spec 清单不枚举 DB，历史行零触碰；30 号事实卡该行需更新"种子不再种入、治理面已收缩"）。**B8 半项重要翻案**：`safe_claims/forbidden_claims/evidence_items/routing_card` 字段族在 chat/repair/catalog 链路是**活的**（prompt 仍要求输出、`catalog.rs:535` 生产查询 evidence_items）——"已删死字段"认知仅对 user-ops 主链成立，跨链路口径分叉归档为**产品决策项**（S5 打包）。新登记：`routes/mod.rs` KNOWN_NON_ROUTE_HANDLERS 的 `apply_update_chunk` 滞留条目、`website/agents.html:116` 仍展示 user.reply.task（越界未改）、DIV-40/48 的 gateway/decision 注释残留（线 A 已清 gateway 侧）。
 
 **线 A 合并追记（2026-08-13，e2e59ba）**：缺陷 #2/#5 关闭（上表）；deferred_wake legacy 分支已物理删除（净删 103 行，缺陷 #1 残余风险归零）；delivery_unknown 请示卡滞留已修（新增 `list_stranded_delivery_escalations`，pending ∧ {failed_terminal, delivery_unknown, sent 缺推送时刻} 按 created_at 计龄进超时改派，`escalation_stranded_delivery_timeout` 3/3 绿）；两条新登记：`routes/tasks.rs:81` 残留死 kind 字符串（越界未改，待 B/C 后仲裁）、`principal_decision_channel::blocked_relay_preserves_awaiting_...` 单测在 debug 构建确定性爆栈（基线 d99b6e7 即存在，非线 A 引入，待修）。
 
