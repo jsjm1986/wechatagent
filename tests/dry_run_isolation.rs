@@ -6,11 +6,22 @@
 //!   不会被 dry-run tool call 改动。
 //!
 //! 默认 `#[ignore]`，需要 Docker（testcontainers MongoDB）。
+//!
+//! **覆盖边界如实声明（28 号裁决 §2.5/§3.7 后修正）**：两个用例是"测试自插审计行
+//! 再读回"的**模型/字典形状级**守护——它们不驱动生产 management 执行链，
+//! `should_dry_run_tool`（management.rs 的 dry-run 真隔离分支）仍无行为级测试
+//! （28 号 §4#10 无守护清单在案；lib 侧 `tool_call_status_for_outcome` 单测覆盖
+//! 局部判定）。本次修正：① 原用例 2 断言的 `"completed"` 是生产闭集
+//! `ALLOWED_AGENT_COMMAND_RUN_STATUS`（models.rs）之外的幻影值——生产正常终态是
+//! `"succeeded"`；② 两用例的 status 现均经生产 `validate_agent_command_run_status`
+//! 校验后才落库，本文件再引入闭集外幻影值会当场红。
 
 mod common;
 
 use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
-use wechatagent::models::{AgentCommandRun, AgentToolCall, ManagementAgentSession};
+use wechatagent::models::{
+    validate_agent_command_run_status, AgentCommandRun, AgentToolCall, ManagementAgentSession,
+};
 
 fn make_dry_run_session() -> ManagementAgentSession {
     let now = DateTime::now();
@@ -26,6 +37,9 @@ fn make_dry_run_session() -> ManagementAgentSession {
 }
 
 fn make_command_run(session_id: ObjectId, status: &str) -> AgentCommandRun {
+    // 生产写点均过该断言（11 号 §4.2）；测试直插 typed 模型同样过一遍，
+    // 防止本文件再锁定闭集外的幻影状态值（28 号裁决 §2.5 教训）。
+    validate_agent_command_run_status(status).expect("status must be in production closed set");
     let now = DateTime::now();
     AgentCommandRun {
         id: Some(ObjectId::new()),
@@ -174,7 +188,9 @@ async fn non_dry_run_session_uses_normal_status() {
         .await
         .expect("insert session");
 
-    let command = make_command_run(session_id, "completed");
+    // 生产正常执行终态是 "succeeded"（闭集 ALLOWED_AGENT_COMMAND_RUN_STATUS；
+    // 原断言的 "completed" 是生产永不会写的幻影值，28 号裁决修正）。
+    let command = make_command_run(session_id, "succeeded");
     app.state
         .db
         .command_runs()
@@ -190,7 +206,7 @@ async fn non_dry_run_session_uses_normal_status() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(stored.status, "completed");
+    assert_eq!(stored.status, "succeeded");
 
     app.cleanup().await;
 }
