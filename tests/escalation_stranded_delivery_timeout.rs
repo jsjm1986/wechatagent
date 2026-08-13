@@ -118,6 +118,8 @@ fn two_step_policy() -> AskHumanPolicy {
         daily_push_cap: None,
         quiet_hours: None,
         timeout_hours: Some(1.0),
+        standing_order: None,
+        standing_order_after_hours: None,
     }
 }
 

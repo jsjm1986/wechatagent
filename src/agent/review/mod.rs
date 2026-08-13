@@ -1556,6 +1556,56 @@ pub(crate) fn apply_independent_claim_gate(
     }
 }
 
+/// S5-6 跳过审计标记：跳过独立 ClaimGate 的轮次在 `review.risks` 追加本标记，
+/// 保证跳过率可观测（decision_reviews.risks 检索）、误跳可排查。
+pub(crate) const CLAIM_GATE_SKIPPED_RISK_CASUAL_LOW: &str = "claim_gate_skipped_casual_low_risk";
+
+/// S5-6：寒暄低风险轮是否跳过独立 ClaimGate（省一次 LLM 调用）。七条件**全部**
+/// 满足才跳，任一不满足按现状照跑（保守方向）：
+/// ① `conversation_mode == "casual_relationship"`（寒暄关系轮）；
+/// ② `planner.risk_level == "low"`（planner 由 decision 派生，空 risk 回落 medium → 不跳）；
+/// ③ `knowledge_need == "not_required"`（精确匹配；LLM 漏填的空串不视同 not_required）；
+/// ④⑤ `used_knowledge_ids` 与 `matched_knowledge_ids` 均空（无任何知识引用）；
+/// ⑥ `assets_to_send` 空且 `namecard_to_send` 为 None（无发送物动作）；
+/// ⑦ `escalation_request` 未请求（None 或 needed=false，与 gateway trigger 判定同口径）。
+///
+/// 语义安全论证：满足条件的轮次无产品声明输入源、无知识引用、无资产/名片动作——
+/// 独立 ClaimGate 在这类轮次的历史产出恒为空声明集（requiresEvidence=false, claims=[]），
+/// 跳过消除的是纯空转调用。R5.4 硬门消费的 `claim_analysis.requiresProductKnowledge`
+/// 主源是 **Reviewer**（照跑不受影响）；ClaimGate 的 merge 只是并集增强，对空声明集
+/// 本就不改变判定。纯函数、无 IO，便于单测七条件矩阵。
+pub(crate) fn should_skip_claim_gate(
+    decision: &AgentDecision,
+    planner: &RunPlannerResult,
+) -> bool {
+    decision.conversation_mode == "casual_relationship"
+        && planner.risk_level == "low"
+        && decision.knowledge_need == "not_required"
+        && decision.used_knowledge_ids.is_empty()
+        && decision.matched_knowledge_ids.is_empty()
+        && decision.assets_to_send.is_empty()
+        && decision.namecard_to_send.is_none()
+        && decision
+            .escalation_request
+            .as_ref()
+            .is_none_or(|request| !request.needed)
+}
+
+/// S5-6：为确定性跳过构造"未评估"的 ClaimGate 评估结果。复用 `outcome: None`
+/// 的既有语义（`should_reply=false` 时 evaluate 同形）——[`apply_independent_claim_gate`]
+/// 对 None 直接返回 false（无 catalog 背书）且**不触发** `hold_for_claim_gate_failure`、
+/// 不写任何 merge 键；`candidate_reply` 锚定当前 decision 正文，保持 mismatch
+/// fail-closed 防护（rewrite/revision 后的重评契约不变）。
+pub(crate) fn skipped_claim_gate_evaluation(
+    decision: &AgentDecision,
+) -> IndependentClaimGateEvaluation {
+    IndependentClaimGateEvaluation {
+        candidate_reply: decision.reply_text.clone(),
+        evidence_catalog: Vec::new(),
+        outcome: None,
+    }
+}
+
 pub(crate) async fn ensure_independent_claim_gate(
     state: &AppState,
     contact: &Contact,
@@ -1583,6 +1633,193 @@ pub(crate) async fn ensure_independent_claim_gate(
     )
     .await;
     apply_independent_claim_gate(evaluation, decision, review, active_products)
+}
+
+#[cfg(test)]
+mod casual_claim_gate_skip_tests {
+    use super::{
+        apply_independent_claim_gate, should_skip_claim_gate, skipped_claim_gate_evaluation,
+        DecisionReviewResult, CLAIM_GATE_SKIPPED_RISK_CASUAL_LOW,
+    };
+    use crate::agent::guards::planner_from_decision;
+    use crate::agent::types::{AgentDecision, AssetSendDirective, NamecardDirective};
+    use crate::models::EscalationRequest;
+
+    /// 七条件全满足的基准寒暄轮：casual + planner low + not_required + 零知识引用
+    /// + 零资产 + 无名片 + 无请示。
+    fn casual_low_risk_decision() -> AgentDecision {
+        AgentDecision {
+            should_reply: true,
+            reply_text: "哈哈是啊，周末打算去哪儿转转？".to_string(),
+            conversation_mode: "casual_relationship".to_string(),
+            knowledge_need: "not_required".to_string(),
+            risk_level: "low".to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn skip_of(decision: &AgentDecision) -> bool {
+        let planner = planner_from_decision(decision, "test");
+        should_skip_claim_gate(decision, &planner)
+    }
+
+    #[test]
+    fn skips_when_all_seven_conditions_hold() {
+        assert!(skip_of(&casual_low_risk_decision()));
+    }
+
+    #[test]
+    fn non_casual_mode_disables_skip() {
+        let mut d = casual_low_risk_decision();
+        d.conversation_mode = "consultative".to_string();
+        assert!(!skip_of(&d));
+        d.conversation_mode = "value_exchange".to_string();
+        assert!(!skip_of(&d));
+        d.conversation_mode = "boundary_protection".to_string();
+        assert!(!skip_of(&d));
+    }
+
+    #[test]
+    fn non_low_planner_risk_disables_skip() {
+        let mut d = casual_low_risk_decision();
+        d.risk_level = "medium".to_string();
+        assert!(!skip_of(&d));
+        d.risk_level = "high".to_string();
+        assert!(!skip_of(&d));
+        // LLM 漏填 risk_level → planner_from_decision 回落 medium → 不跳（保守）。
+        d.risk_level = String::new();
+        assert!(!skip_of(&d));
+    }
+
+    #[test]
+    fn knowledge_need_other_than_not_required_disables_skip() {
+        let mut d = casual_low_risk_decision();
+        d.knowledge_need = "required".to_string();
+        assert!(!skip_of(&d));
+        d.knowledge_need = "insufficient".to_string();
+        assert!(!skip_of(&d));
+        // 漏填（空串）不得视同 not_required（保守不跳）。
+        d.knowledge_need = String::new();
+        assert!(!skip_of(&d));
+    }
+
+    #[test]
+    fn any_knowledge_reference_disables_skip() {
+        let mut d = casual_low_risk_decision();
+        d.used_knowledge_ids = vec!["64b1f77bcf86cd7994390001".to_string()];
+        assert!(!skip_of(&d));
+        let mut d = casual_low_risk_decision();
+        d.matched_knowledge_ids = vec!["64b1f77bcf86cd7994390002".to_string()];
+        assert!(!skip_of(&d));
+    }
+
+    #[test]
+    fn asset_or_namecard_directive_disables_skip() {
+        let mut d = casual_low_risk_decision();
+        d.assets_to_send = vec![AssetSendDirective {
+            asset_id: "asset1".to_string(),
+            reason: None,
+        }];
+        assert!(!skip_of(&d));
+        let mut d = casual_low_risk_decision();
+        d.namecard_to_send = Some(NamecardDirective {
+            card_id: "card1".to_string(),
+            reason: None,
+        });
+        assert!(!skip_of(&d));
+    }
+
+    #[test]
+    fn escalation_request_disables_skip_only_when_needed() {
+        let mut d = casual_low_risk_decision();
+        d.escalation_request = Some(EscalationRequest {
+            needed: true,
+            category: None,
+            reason: None,
+            question_for_principal: None,
+            self_serviceable_part: None,
+            is_generalizable: false,
+        });
+        assert!(!skip_of(&d));
+        // needed=false 的 emit 等同未请求（与 gateway trigger 判定同口径）→ 仍可跳。
+        d.escalation_request = Some(EscalationRequest {
+            needed: false,
+            category: None,
+            reason: None,
+            question_for_principal: None,
+            self_serviceable_part: None,
+            is_generalizable: false,
+        });
+        assert!(skip_of(&d));
+    }
+
+    #[test]
+    fn skipped_evaluation_applies_without_hold_or_claim_analysis_merge() {
+        // 跳过形态 = outcome:None（"未评估"既有语义）：apply 返回 false（无 catalog 背书）、
+        // 不 hold、不写任何 merge 键——R5.4 继续只消费 reviewer 的 claim_analysis 原判。
+        let decision = casual_low_risk_decision();
+        let evaluation = skipped_claim_gate_evaluation(&decision);
+        let mut review = DecisionReviewResult {
+            approved: true,
+            ..Default::default()
+        };
+        assert!(!apply_independent_claim_gate(
+            evaluation,
+            &decision,
+            &mut review,
+            &[],
+        ));
+        assert!(review.approved, "跳过不得触发 hold");
+        assert!(!review.should_hold, "hold_for_claim_gate_failure 不得被误触发");
+        assert!(
+            !review
+                .risks
+                .iter()
+                .any(|risk| risk == "independent_claim_gate_unavailable"),
+            "跳过不是失败，不得落 unavailable 风险标记"
+        );
+        for merged_key in [
+            "requiresBusinessEvidence",
+            "claimsComplete",
+            "claimManifest",
+            "unsupportedBusinessClaimCount",
+        ] {
+            assert!(
+                !review.claim_analysis.contains_key(merged_key),
+                "跳过不得伪造已评估的 merge 键 {merged_key}"
+            );
+        }
+    }
+
+    #[test]
+    fn skipped_evaluation_still_fails_closed_on_candidate_mismatch() {
+        // 防御：若跳过评估被错误地套用到另一份正文（rewrite 后未重评的误用），
+        // 既有 candidate mismatch fail-closed 仍在。
+        let decision = casual_low_risk_decision();
+        let evaluation = skipped_claim_gate_evaluation(&decision);
+        let mut other = decision.clone();
+        other.reply_text = "另一份正文".to_string();
+        let mut review = DecisionReviewResult {
+            approved: true,
+            ..Default::default()
+        };
+        assert!(!apply_independent_claim_gate(
+            evaluation,
+            &other,
+            &mut review,
+            &[],
+        ));
+        assert!(review.should_hold, "candidate mismatch 必须保持 fail-closed");
+    }
+
+    #[test]
+    fn skip_audit_risk_constant_is_stable() {
+        // 审计标记是观测契约（跳过率看板 / 误跳排查按它检索），拼写受测试锁定。
+        assert_eq!(
+            CLAIM_GATE_SKIPPED_RISK_CASUAL_LOW,
+            "claim_gate_skipped_casual_low_risk"
+        );
+    }
 }
 
 #[cfg(test)]

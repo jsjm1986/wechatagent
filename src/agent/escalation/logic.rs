@@ -424,6 +424,33 @@ pub(crate) fn sanitize_verdict(decision: PrincipalDecision) -> PrincipalDecision
     }
 }
 
+/// S5-5：链尾超时收敛时，运营预授权底线是否到期应执行。返回 `Some(口径文本)` 表示
+/// 应执行（文本已 trim）。三个前提全部满足才触发：`standing_order` 配置且非空白、
+/// `standing_order_after_hours` 配置且 > 0（routes 校验强制成对，此处防御历史脏配）、
+/// 台账年龄（now - created_at）严格超过该时限。任一不满足 → None（维持链尾安抚现状）。
+/// 纯函数、无 IO；调用方（converge_timed_out_escalation 链尾分支）已确保"链上无下一位
+/// 决策人且当前决策人已超时"。
+pub(crate) fn standing_order_due(
+    policy: &crate::agent::escalation::ResolvedAskHumanPolicy,
+    created_at_ms: i64,
+    now_ms: i64,
+) -> Option<&str> {
+    let text = policy.standing_order.as_deref()?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let after_hours = policy.standing_order_after_hours?;
+    if after_hours <= 0.0 {
+        return None;
+    }
+    let elapsed_hours = (now_ms - created_at_ms) as f64 / (3600.0 * 1000.0);
+    if elapsed_hours > after_hours {
+        Some(text)
+    } else {
+        None
+    }
+}
+
 /// 两条件同时满足才算卡死。纯函数，输入由 `build_decision_signals_text` 从 contact 取。
 pub(crate) fn is_stuck_or_undelivered(
     consecutive_unprogressed_turns: u32,
@@ -862,7 +889,61 @@ mod tests {
             daily_push_cap: None,
             quiet_hours: None,
             timeout_hours: None,
+            standing_order: None,
+            standing_order_after_hours: None,
         }
+    }
+
+    // ---- S5-5 standing_order_due（预授权底线到期判定）----
+
+    fn policy_with_standing_order(
+        text: Option<&str>,
+        after_hours: Option<f64>,
+    ) -> crate::agent::escalation::ResolvedAskHumanPolicy {
+        let mut p = policy_with(false);
+        p.standing_order = text.map(str::to_string);
+        p.standing_order_after_hours = after_hours;
+        p
+    }
+
+    const HOUR_MS: i64 = 3600 * 1000;
+
+    #[test]
+    fn standing_order_due_after_deadline_returns_trimmed_text() {
+        let p = policy_with_standing_order(Some("  最多 95 折，赠品可送。  "), Some(12.0));
+        // 台账 13h 前创建 > 12h 时限 → 触发，且文本已 trim。
+        assert_eq!(
+            standing_order_due(&p, 0, 13 * HOUR_MS),
+            Some("最多 95 折，赠品可送。")
+        );
+    }
+
+    #[test]
+    fn standing_order_not_due_at_or_before_deadline() {
+        let p = policy_with_standing_order(Some("底线口径"), Some(12.0));
+        // 恰好等于时限（不满足严格大于）→ 不触发；一半时限 → 不触发。
+        assert_eq!(standing_order_due(&p, 0, 12 * HOUR_MS), None);
+        assert_eq!(standing_order_due(&p, 0, 6 * HOUR_MS), None);
+    }
+
+    #[test]
+    fn standing_order_none_when_text_missing_or_blank() {
+        // 未配置文本 / 全空白文本 → 永不触发（维持链尾安抚现状）。
+        let missing = policy_with_standing_order(None, Some(1.0));
+        assert_eq!(standing_order_due(&missing, 0, 100 * HOUR_MS), None);
+        let blank = policy_with_standing_order(Some("   "), Some(1.0));
+        assert_eq!(standing_order_due(&blank, 0, 100 * HOUR_MS), None);
+    }
+
+    #[test]
+    fn standing_order_none_when_hours_missing_or_nonpositive() {
+        // 只配文本没配时限（历史脏配防御）→ 不触发；时限 ≤0 同理。
+        let no_hours = policy_with_standing_order(Some("底线口径"), None);
+        assert_eq!(standing_order_due(&no_hours, 0, 100 * HOUR_MS), None);
+        let zero = policy_with_standing_order(Some("底线口径"), Some(0.0));
+        assert_eq!(standing_order_due(&zero, 0, 100 * HOUR_MS), None);
+        let negative = policy_with_standing_order(Some("底线口径"), Some(-1.0));
+        assert_eq!(standing_order_due(&negative, 0, 100 * HOUR_MS), None);
     }
 
     #[test]
