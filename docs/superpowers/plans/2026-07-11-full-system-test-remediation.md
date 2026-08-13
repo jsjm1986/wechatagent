@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **勘误（2026-08-14，DIV-33）**：本文两处引用的台账 `docs/superpowers/specs/2026-07-10-full-system-test-findings.md` **从未落盘**（specs 目录 2026-07-10 前缀共 8 个文件，无此名；F-005/F-020/F-013/F-003 编号在 docs 全集也无第二处定义）。findings 原始详情已不可考，各修复项的问题描述与验收口径以本 plan 正文为准。
+
 **Goal:** 修复全量系统深度测试台账（`docs/superpowers/specs/2026-07-10-full-system-test-findings.md`）中的 P0+P1 findings：账号错配家族（F-005+F-020）、知识库概览卡顿（F-013）、任务日志内部作业泄漏（F-003）。
 
 **Architecture:** 后端 Rust(Axum) + 前端 React19/TS/Zustand。四个修复彼此正交、边界清晰：①前端三处联系人选择器传当前选中账号；②campaign 创建走前端传账号 + 后端加字段（治本，照搬 list_contacts 的"组合过滤即隔离"模式，不做多余的账号归属校验）；③completeness 端点加进程内 TTL 缓存 + 前端概览页局部骨架不阻塞整屏；④list_tasks 加 kind 白名单过滤 + 前端补 3 个 status label。
