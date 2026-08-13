@@ -343,9 +343,11 @@ DIV-17（`quiet_hours.rs:140-153` doc 描述三级链、函数体 :154-163 仍 w
 > **处置记录（2026-08-14 chore 尾波 `0551343`，5 条全闭）**：DIV-64 删 `wa.authed` 全部 5 处写入（登录态在 http-only cookie，顺修注释中不存在的 forceLogout）；DIV-65/68 死代码净删（全仓零消费亲验）；DIV-66 placeholder 与表单说明两处"客户 ID"→"账号 ID"；DIV-67 **半翻案**：`OperationHealth` 三键补声明（后端 `shared.rs` 实锤下发）成立，但 `Contact.lastConversationMode` 经亲验后端 ApiContact **当前不下发**（幽灵键）——本表"类型定义落后于后端实际下发"的描述对该键不成立，前端已补声明并如实标注幽灵状态，删除两处 `as` 断言。前端 750/750 + build 绿。
 
 **D. 护栏名单缺口（1 条）**：DIV-36（死路由 tripwire include 名单缺约 11 文件；另线 B 登记 `KNOWN_NON_ROUTE_HANDLERS` 的 `apply_update_chunk` 滞留条目待仲裁）。**归属**：后端 owner，与 A 组同批。
+> **处置记录（2026-08-14 D/E 尾波，关闭）**：include 名单补齐实际缺失的 **12** 个文件（29 号原计 11，另有 `contract_snapshot.rs` 漏数；knowledge/ 子目录 10 文件经亲验本就全覆盖）。纳入后 tripwire 抓出 2 个未挂载 `pub async fn`，逐一仲裁均为合法 helper 而非真孤儿：`reconcile_campaign_dispatches`（HC-021 派发崩溃恢复对账，tasks.rs:1131 worker 调用）与 `append_domain_profile_draft`（被 guide_profile.rs:457 跨文件复用——首判"零调用方降私有"被编译器纠错，教训：rg `-rn` 的 `-r` 是 --replace 会污染结论），二者进 KNOWN 名单带注释。`apply_update_chunk` 死条目删除（全仓亲验仅存 `_with_session` 版，线 B 滞留登记随之关闭）。12 文件全部 handler 均已挂载，无真孤儿。
 
 **E. 本波未授权文件（4 条，中严重度居多，建议单独小 PR 尽快处置）**：
 DIV-15（`docs/DEPLOYMENT-STEPS.md:320,332` `db.agent_runs`→`agent_run_logs`——按文档排障会误判"系统没跑"，**运维文档 owner**）、DIV-33（plan 引用不存在的 findings 文件——superpowers 历史存档，接受现状或补一行勘误，档案 owner）、DIV-34（`deploy.sh` 整体过时，以 `scripts/deploy/` 为准——建议头部加弃用横幅或删除，**部署 owner**）、DIV-35（`.env.example` 缺 POST_DECISION_*/SILENCE_SIGNAL_* 两族变量——运维排障缺文档入口，**后端 owner**）。
+> **处置记录（2026-08-14 D/E 尾波，4 条全闭）**：DIV-15 两处集合名修正（查询字段 `contact_wxid`/`created_at` 经 `models.rs:3392` 亲验为 snake_case 本就正确；`docs/mcp-integration-final-delivery.md:129` 存同类 `agent_runs` 表述，历史交付存档不改）。DIV-33 plan 头部补勘误注记（F-005/F-020/F-013/F-003 编号经全 docs 检索无第二处定义，台账确未落盘、非"并入 deep-logic-audit"）。DIV-34 deploy.sh 头部弃用横幅（指向 `scripts/deploy/`，保留历史参考）。DIV-35 补齐两族 10 个变量（POST_DECISION_* 6 个 + SILENCE_* 4 个，语义与默认值逐条对照 `config.rs` 字段 doc 注释抄录，POST_DECISION 族标注"恒开无开关"）。
 
 ### 6.5 本节核销后的使用约定
 
