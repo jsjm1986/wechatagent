@@ -539,6 +539,10 @@ mod isolation_contract_tests {
     fn agent_bridge_dependencies_are_closed_and_reviewed() {
         let allowed: HashSet<&str> = [
             "crate::agent::domain_profile",
+            // H2 换血：结果三态分类器单一真相源（纯函数模块，零发送链依赖）——
+            // significance / post_release 按 run_id join 真实用户反应后经它判
+            // Hit / Block / Censored。
+            "crate::agent::outcome_label",
             "crate::agent::prompt_shadow",
             "crate::agent::run_envelope",
             "crate::agent::runtime",
