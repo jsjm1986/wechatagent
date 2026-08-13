@@ -1,5 +1,7 @@
 # Frontend Design System
 
+> 2026-08-13 核对：设计原则仍现行；本次修正了"当前频道模型"两处过时清单（实际 20 个频道，权威源 `frontend/src/app/channels.ts`）。
+
 WechatAgent is a new AI operations product for enterprise users. The interface must feel premium, calm, trustworthy, and unmistakably AI-enabled without becoming decorative or complex.
 
 ## Visual Thesis
@@ -45,14 +47,11 @@ Use white sidebar navigation by default.
 - Main content renders only the active channel.
 - Sub-tabs classify content inside the active channel.
 
-Current channel model:
+Current channel model（20 个频道，定义在 `frontend/src/app/channels.ts`，分运营 / 知识 / 系统三组；下文中文清单为权威标签）：
 
 ```text
-AI Command Center
-Workbench
-User Operations
-Agent Profile
-Tasks & Logs
+AI Command Center（AI 总控）为首要 AI 原生入口
+其余频道按产品域分组，微信群运营 / 朋友圈运营为 comingSoon 占位
 ```
 
 AI Command Center should be the primary AI-native entry point. It uses a task stream and execution plan layout, not a marketing-style chat page.
@@ -67,17 +66,13 @@ execution plan / tool calls / confirmations
 
 Keep the surface white and operational. The AI expression should come from live plans, tool states, confirmations, and concise system language.
 
-The current implementation uses Chinese product labels:
+The current implementation uses Chinese product labels（2026-08-13 时点 20 个）:
 
 ```text
-AI 总控
-工作台
-用户运营
-微信群运营
-朋友圈运营
-内容资产
-系统策略
-任务日志
+运营：AI 总控 / 账号管理 / 工作台 / 用户运营 / 微信群运营 / 朋友圈运营 /
+      统一收件箱 / 请示通道配置 / 活动 / 产品与成交
+知识：内容资产 / 专属顾问 / 知识库 Wiki
+系统：系统策略 / AI 模型配置 / 任务日志 / 演化中心 / 运营成效 / 发送成效 / 自治回路监控
 ```
 
 当前开发优先级是把“用户运营”做成完整长期运营工作台：顶部是用户运营大脑配置，中间是好友池和单人画像，下面是用户运营方法和用户 Prompt。微信群运营和朋友圈运营保留一级频道，但详细工作流下一阶段再展开。
