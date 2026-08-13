@@ -327,7 +327,7 @@ R1.4/R1.5/R1.6 决策长度门：常规回复理由 ≥10 chars ≥6 汉字；cr
 | user.reply.system | system_contract | 回复运行时契约（红线锚×2） | — | **是** |
 | user.reply.policy | policy | 模式判定树+5 闸+表达红线 | — | **是** |
 | user.reply.fast.task | task_template | **生产决策主链唯一 task**：首发/targeted rewrite/revision 三站点（decision.rs:460/1321） | 8192 ✅ | **是** |
-| user.reply.task | task_template | **退役**：种子仍种入、治理仍覆盖、**运行时零消费**（[17] Q1 主会话裁决；agent/mod.rs:230-232 注释自称 "the retired full task" ✅） | — | 否 |
+| user.reply.task | task_template | **退役已落地**（2026-08-13 线 B commit 5f96159）：种子**不再种入**、prompt_guard 治理面已收缩、守护测试转靶 fast.task；DB 历史行保留不删（align 只遍历 spec 清单不枚举 DB）。运行时零消费不变 | — | 否 |
 | user.projection.system / .task | post_decision_projection | post_decision worker（无发送控制权） | — | 否 |
 | user.memory_consolidator.system / .task | memory_consolidator | memory.rs consolidator | — | 否 |
 | user.reaction.system / .task | reaction_analysis | reaction.rs | — | 否 |
@@ -539,3 +539,17 @@ auto-verify 全类型 verified 强制降级：`enforce_verified_needs_human_audi
 - worker：supervisor.rs:28-51（熔断参数+16 名单）；main.rs:213-352（16 spawn 点，2 个条件 spawn）。
 - 红线：verify.rs:83-118/479-508/674-686（人工 verify 唯一入口+auto-verify 强制降级）；outbox.rs:55-56（delivery_unknown）；webhooks.rs:2849-2883（验签 fail-closed）；check-no-human-takeover.sh:26-63（lint 词表/目录/豁免）；run_envelope.rs:152-158（禁值）。
 - 集合：db/mod.rs 63 typed accessor grep；全 src `.collection("…")` 按名统计；lessons_learned/reviewer_stats/deal_attribution_stats/structural_proposals/proactive_daily_quotas/relationship_type_suggestions/auth_security_events/webhook_rate_limit_windows/configuration_generations/post_decision_contact_leases 访问文件定位；projection_observations/IMPORT_CHECKPOINT/CONTACT_LEASE 三 const 解析；agent_generated_signals 判定为字段。
+
+---
+
+## 追记：chunk 声明字段族的跨链路口径分叉（S5-7 裁决，2026-08-13 主会话）
+
+**裁决：维持分叉、显式化记录，不动行为**（用户批复"做"后的方向选定：真正统一需产品层决定 chat 链是否也收敛 verified-only 语义，属更大工程；激进删活字段或给主链复活废字段均高风险低收益）。
+
+分叉现状（线 B B8 重验 + 25 号修正 6）：
+
+| 字段族 | user-ops 主链（decision/review/finalize） | chat/repair/catalog 链 |
+|---|---|---|
+| `safe_claims` / `forbidden_claims` / `evidence_items` / `routing_card` | **不消费**（2026-05-25 知识清理后主链改分数闸+R5.4 结构化背书） | **活跃**：chat/repair prompt 仍要求输出、`catalog.rs:535` 生产查询 `evidence_items` |
+
+使用纪律：改知识 chunk 模型或导入/修复 prompt 时，这些字段按"chat 链活字段"对待，删除前必须核 chat/repair/catalog 三处消费；主链侧永远不要为它们加消费逻辑（已被 R5.4 取代）。`models.rs` 内注释补写待 E 线合并后执行（该文件在途）。
