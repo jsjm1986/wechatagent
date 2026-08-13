@@ -891,7 +891,7 @@ async fn send_contact_message_gateway_inner(
         &active_profile,
         &active_products,
         &reviewer_prompts,
-        // 管理发送是 admin 人工指定文本，非 LLM 寒暄轮——ClaimGate 恒照跑。
+        // 管理发送是 admin 手动指定文本，非 LLM 寒暄轮——ClaimGate 恒照跑。
         false,
     )
     .await?;
@@ -3032,7 +3032,7 @@ fn run_user_operation_gateway_inner<'a>(
     } else if should_run_review(&decision, &planner, &runtime) {
         let review_mode = effective_review_mode(&planner, &decision, &runtime, false);
         // S5-6：首稿寒暄低风险轮跳过独立 ClaimGate（七条件纯函数判定）。rewrite /
-        // revision / 管理发送路径不跳——它们的触发本身即风险信号或人工指定文本。
+        // revision / 管理发送路径不跳——触发本身即风险信号或属 admin 手动指定文本。
         let skip_claim_gate = should_skip_claim_gate(&decision, &planner);
         let (mut review, claim_gate_evaluation) = review_and_evaluate_claim_gate(
             state,
