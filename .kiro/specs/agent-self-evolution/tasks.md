@@ -13,6 +13,11 @@
 > `docs/agent-policy.md` 顶部说明。后续 evolution 维度切到 `hallucination_score` /
 > `knowledge_grounding_score` 留下一轮。
 
+> **2026-08-13 现状注记**：上方 2026-05-25 注记中"运行时收敛为 3 闸 `enforce_*`（见
+> `src/agent/guards.rs`）"是中间态描述，`enforce_*` 函数已不存在，现行为分数闸体系
+> （见 `docs/agent-policy.md` 顶注）；`evolution::auto_release` 模块已物理删除、pressure gate
+> 不再产阈值候选（详见 `requirements.md` 顶部 2026-08-13 现状注记）。
+
 > **Historical Done Notice (2026-05-27; superseded by SR-179 status manifest)**：W0 → W4 + 收口曾被旧流程标为全部落地，详见 `git log --oneline | grep '^.* M4 W'`。
 > 当前生效模块：`src/evolution/{mod,budget,cohort,envelope,error,lint,post_release,prompt_critic,release,replay,runtime_flag,significance,threshold}.rs`、
 > `src/routes/evolution.rs`、`frontend/src/EvolutionCenterTab.tsx`、`scripts/check-evolution-isolation.{sh,ps1}`、

@@ -10,6 +10,22 @@
 > enforce_hallucination / enforce_run_budget`，详见 `src/agent/guards.rs`），
 > 业务可变字段全量下沉到 `Contact.domain_attributes / OperationKnowledgeChunk.domain_attributes`
 > 由 `DomainSchema` 校验。本 spec 保留作历史档案，不再作为代码实现的对照源。
+>
+> **2026-08-13 现状注记（追加，不改写正文；历史存档原则）**：上方 2026-05-25 sunset notice 中
+> "运行时收敛为 3 闸（`enforce_knowledge_grounding / enforce_hallucination / enforce_run_budget`，
+> 详见 `src/agent/guards.rs`）"的说法本身也已过时——那是一个中间态，`enforce_*` 函数现已不存在。
+> 现行为 Review **分数闸**体系：`hallucination_block_at`（wire 别名 factRiskBlockAt）≥6 硬拦、
+> `knowledge_grounding_block_below`（别名 productAccuracy）<7 硬拦、humanLike <6 / emotionalValue <6 /
+> pressureRisk ≥7 三道软闸触发 single-shot revision（二次仍不达标才落闭集阻断态），外加 R5.4
+> 三路结构化背书兜底；在线入口为 `src/agent/review/gates.rs` 的 `review_passed` /
+> `classify_dual_gate` / `finalize_review_for_send`，正确的现状叙述见 `docs/agent-policy.md` 顶注。
+> 另两处正文与现状的重要偏差：① R1 九字段协议已整体退役——生产三站点（首发 / targeted rewrite /
+> revision）统一走 `user.reply.fast.task` 紧凑契约（`src/agent/decision.rs`），`user.reply.task`
+> 自 2026-08-13 起种子亦不再种入；② R11.6 基线数字为旧值——现行合并门为 `cargo test --lib` ≥350 /
+> 四 PBT 累计 ≥33，第四个基线 PBT 是 `wiki_chunk_revision_pbt`（`string_fact_risk_guard` 已换出），
+> 以 `scripts/check-baseline.sh` 为准（2026-08-13 实测 lib 2562 / PBT 41）。
+> 本 spec 正文与现行代码的逐条已知偏差以 `project-understanding/29-doc-code-divergence-master.md`
+> （§2.2 反向索引）为权威；闭集/阈值现状速查见 `project-understanding/30-global-fact-cards.md`。
 
 ## Introduction
 

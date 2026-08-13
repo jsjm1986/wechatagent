@@ -8,6 +8,10 @@
 > `safe_claims` / `routing_card` / 5 闸阈值章节已在 knowledge-cleanup 中下线，
 > 收敛为 3 闸 `enforce_knowledge_grounding / enforce_hallucination / enforce_run_budget`
 > （详见 `src/agent/guards.rs`）。详见 `requirements.md` 顶部 sunset notice。
+>
+> **2026-08-13 现状注记**：上方 notice 所称"收敛为 3 闸 `enforce_*`（见 `src/agent/guards.rs`）"
+> 是中间态、这些函数已不存在；现行为分数闸体系（入口 `src/agent/review/gates.rs`）。详见
+> `requirements.md` 顶部 2026-08-13 现状注记与 `project-understanding/29-doc-code-divergence-master.md`。
 
 ## Overview
 

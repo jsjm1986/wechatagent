@@ -4,6 +4,11 @@
 > **形态**：三栏 — 左侧目录树（25%）/ 中间日报画布（45%）/ 右侧 chat（30%）。
 > **目标**：把"知识库 = AI agent"落到产品形态。chat 是主入口；画布是当日工作台；目录树是索引。
 
+> **2026-08-13 现状注记（追加）**：R7.1 的基线数字（`cargo test --lib` ≥78）为写作时代旧值——
+> 现行合并门为 lib ≥350 / 四 PBT 累计 ≥33，以 `scripts/check-baseline.sh` 为准。R5.4 的
+> "运营可撤销"承诺已兑现（`revoke_operator_memory` 完整链路 + 软撤销审计字段）。其余逐条偏差
+> 见 `project-understanding/29-doc-code-divergence-master.md`。
+
 本 spec 取代当前知识库频道的"三栏并排 + 编辑器跑到页面最下方"布局，并把上一轮已落地的 KnowledgeChatPanel（抽屉式对话补完）升级为常驻右侧 chat。
 
 ## R1 节奏与触发
