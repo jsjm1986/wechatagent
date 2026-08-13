@@ -230,8 +230,37 @@ pub(crate) async fn escalate_held_decision(
     let today = count_pushes_today(state, &contact.workspace_id, &principal_wxid, since_ms).await?;
     let last_push = latest_push_ms(state, &contact.workspace_id, &principal_wxid).await?;
     if !crate::agent::escalation::push_allowed(&policy, today, last_push, now_ms) {
-        // 骚扰门关：直接返回，跳过推卡。注意此时 insert_pending_escalation 尚未
-        // 执行——被拦的请示**不落 pending 台账**，admin 收件箱看不到这条记录。
+        // 骚扰门关：跳过推卡。此时 insert_pending_escalation 尚未执行——被拦的
+        // 请示不落 pending 台账；为免 admin 完全无感知，落一条 dedupe 审计事件
+        // （每客户每 UTC 日至多一条），best-effort 不阻断 hold 主链。
+        let event = crate::models::AgentEvent {
+            id: None,
+            workspace_id: contact.workspace_id.clone(),
+            account_id: contact.account_id.clone(),
+            contact_wxid: Some(contact.wxid.clone()),
+            kind: "escalation_suppressed_by_push_policy".to_string(),
+            status: "warning".to_string(),
+            summary: "hold 请示被推送保护策略拦截（今日 cap / 推送间隔 / 静默窗），未生成请示卡".to_string(),
+            details: Some(doc! {
+                "principalWxid": &principal_wxid,
+                "pushesToday": today,
+                "lastPushMs": last_push,
+                "nowMs": now_ms,
+            }),
+            created_at: mongodb::bson::DateTime::now(),
+            dedupe_key: Some(format!(
+                "escalation_suppressed:{}:{}",
+                contact.wxid,
+                now_ms / 86_400_000
+            )),
+        };
+        match state.db.events().insert_one(event, None).await {
+            Ok(_) => {}
+            Err(error) if crate::agent::escalation::is_duplicate_key_error(&error) => {}
+            Err(error) => {
+                tracing::warn!(?error, contact = %contact.wxid, "escalation suppression audit event write failed");
+            }
+        }
         return Ok(());
     }
     // 去重：同客户同类别已有 pending → 不重复推卡骚扰领导。

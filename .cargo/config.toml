@@ -1,0 +1,7 @@
+# macOS debug 构建下若干深调用链集成测试（run_envelope_integration /
+# outbox_integration / principal_decision_channel 等）在默认线程栈上溢出
+# （debug 无优化时 gateway 深 future + serde 大结构的栈帧巨大）。
+# 预留 16 MiB 线程栈（虚拟地址预留，不实际占用物理内存）；Linux CI 上该值
+# 同样安全，行为不变。
+[env]
+RUST_MIN_STACK = "16777216"
