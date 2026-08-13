@@ -15,6 +15,9 @@ pub(crate) struct ResolvedAskHumanPolicy {
     pub daily_push_cap: Option<u32>,
     pub quiet_hours: Option<AskHumanQuietHours>,
     pub timeout_hours: Option<f64>,
+    /// S5-5 运营预授权底线口径；见 [`AskHumanPolicy::standing_order`]。
+    pub standing_order: Option<String>,
+    pub standing_order_after_hours: Option<f64>,
 }
 
 /// 解析请示策略。优先 ask_human_policy；None 时回落旧字段映射（字节等价）。
@@ -30,6 +33,8 @@ pub(crate) fn resolve_ask_human_policy(config: &OperationDomainConfig) -> Resolv
             daily_push_cap: p.daily_push_cap,
             quiet_hours: p.quiet_hours.clone(),
             timeout_hours: p.timeout_hours,
+            standing_order: p.standing_order.clone(),
+            standing_order_after_hours: p.standing_order_after_hours,
         };
     }
     let all_mode = config.high_risk_escalation_mode.as_deref() == Some("all");
@@ -54,6 +59,8 @@ pub(crate) fn resolve_ask_human_policy(config: &OperationDomainConfig) -> Resolv
         daily_push_cap: None,
         quiet_hours: None,
         timeout_hours: None,
+        standing_order: None,
+        standing_order_after_hours: None,
     }
 }
 
@@ -71,6 +78,8 @@ pub(crate) fn resolve_ask_human_policy_snapshot(policy: &AskHumanPolicy) -> Reso
         daily_push_cap: policy.daily_push_cap,
         quiet_hours: policy.quiet_hours.clone(),
         timeout_hours: policy.timeout_hours,
+        standing_order: policy.standing_order.clone(),
+        standing_order_after_hours: policy.standing_order_after_hours,
     }
 }
 
@@ -105,6 +114,8 @@ pub(crate) fn freeze_ask_human_policy(
         daily_push_cap: resolved.daily_push_cap,
         quiet_hours: resolved.quiet_hours.clone(),
         timeout_hours: resolved.timeout_hours,
+        standing_order: resolved.standing_order.clone(),
+        standing_order_after_hours: resolved.standing_order_after_hours,
     }
 }
 
@@ -244,6 +255,8 @@ mod tests {
             daily_push_cap: None,
             quiet_hours: None,
             timeout_hours: None,
+            standing_order: None,
+            standing_order_after_hours: None,
         });
         assert!(
             is_decider_for_config(&cfg, "leader1"),
@@ -280,6 +293,8 @@ mod tests {
             daily_push_cap: None,
             quiet_hours: None,
             timeout_hours: None,
+            standing_order: None,
+            standing_order_after_hours: None,
         });
         assert!(
             is_decider_for_config(&cfg, "leader2"),
@@ -315,6 +330,8 @@ mod tests {
             daily_push_cap: None,
             quiet_hours: None,
             timeout_hours: None,
+            standing_order: None,
+            standing_order_after_hours: None,
         });
         assert!(
             !is_decider_for_config(&cfg, "stranger"),
@@ -373,6 +390,8 @@ mod tests {
             daily_push_cap: Some(10),
             quiet_hours: None,
             timeout_hours: Some(24.0),
+            standing_order: None,
+            standing_order_after_hours: None,
         });
         let r = resolve_ask_human_policy(&cfg);
         assert!(!r.escalate_unverified_product);
@@ -391,6 +410,8 @@ mod tests {
             daily_push_cap: daily_cap,
             quiet_hours: None,
             timeout_hours: None,
+            standing_order: None,
+            standing_order_after_hours: None,
         }
     }
 
@@ -579,6 +600,90 @@ mod tests {
             None,
             "跳过客户成员后无合法下一位须返 None（走链尾安抚），不得回退到推客户"
         );
+    }
+
+    // ── S5-5 standing order（运营预授权底线）字段透传 ──
+
+    #[test]
+    fn standing_order_fields_pass_through_all_three_resolvers() {
+        // 配置态：ask_human_policy 携带 standing order 两字段 → resolve / snapshot / freeze
+        // 三条解析路径都必须原样透传（超时扫描消费的是冻结快照，丢字段=底线永不生效）。
+        let policy = AskHumanPolicy {
+            decider_chain: vec![DeciderRef {
+                wxid: "leader1".into(),
+                display_name: None,
+                account_id: Some("acc1".into()),
+            }],
+            escalate_safety_guard: true,
+            escalate_unverified_product: true,
+            escalate_ai_policy_hold: false,
+            escalate_stuck: true,
+            dedupe_window_hours: None,
+            daily_push_cap: None,
+            quiet_hours: None,
+            timeout_hours: Some(24.0),
+            standing_order: Some("最多 95 折，赠品可送".into()),
+            standing_order_after_hours: Some(12.0),
+        };
+        let mut cfg = base_config();
+        cfg.ask_human_policy = Some(policy.clone());
+        let resolved = resolve_ask_human_policy(&cfg);
+        assert_eq!(
+            resolved.standing_order.as_deref(),
+            Some("最多 95 折，赠品可送")
+        );
+        assert_eq!(resolved.standing_order_after_hours, Some(12.0));
+        let snapshot = resolve_ask_human_policy_snapshot(&policy);
+        assert_eq!(snapshot.standing_order, resolved.standing_order);
+        assert_eq!(
+            snapshot.standing_order_after_hours,
+            resolved.standing_order_after_hours
+        );
+        let frozen = freeze_ask_human_policy(&resolved, "acc1");
+        assert_eq!(frozen.standing_order, policy.standing_order);
+        assert_eq!(
+            frozen.standing_order_after_hours,
+            policy.standing_order_after_hours
+        );
+    }
+
+    #[test]
+    fn standing_order_defaults_to_none_on_legacy_fallback() {
+        // 旧配置（无 ask_human_policy）回落路径不得凭空长出底线。
+        let cfg = base_config();
+        let resolved = resolve_ask_human_policy(&cfg);
+        assert_eq!(resolved.standing_order, None);
+        assert_eq!(resolved.standing_order_after_hours, None);
+    }
+
+    #[test]
+    fn standing_order_fields_deserialize_absent_as_none() {
+        // 向后兼容：旧文档缺两字段 → serde default None（不 panic、不误配）。
+        let legacy_json = serde_json::json!({
+            "deciderChain": [],
+            "escalateSafetyGuard": true,
+            "escalateUnverifiedProduct": true,
+            "escalateAiPolicyHold": false,
+            "escalateStuck": true,
+        });
+        let parsed: AskHumanPolicy =
+            serde_json::from_value(legacy_json).expect("legacy policy must deserialize");
+        assert_eq!(parsed.standing_order, None);
+        assert_eq!(parsed.standing_order_after_hours, None);
+        // wire 名走 camelCase（standingOrder / standingOrderAfterHours）。
+        let full_json = serde_json::json!({
+            "deciderChain": [],
+            "escalateSafetyGuard": true,
+            "escalateUnverifiedProduct": true,
+            "escalateAiPolicyHold": false,
+            "escalateStuck": true,
+            "standingOrder": "口径",
+            "standingOrderAfterHours": 6.5,
+        });
+        let parsed: AskHumanPolicy =
+            serde_json::from_value(full_json).expect("full policy must deserialize");
+        assert_eq!(parsed.standing_order.as_deref(), Some("口径"));
+        assert_eq!(parsed.standing_order_after_hours, Some(6.5));
     }
 
     #[test]

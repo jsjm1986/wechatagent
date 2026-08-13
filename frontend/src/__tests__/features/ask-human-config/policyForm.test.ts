@@ -76,3 +76,65 @@ describe("validatePolicy", () => {
     expect(validatePolicy({ ...ok, dailyPushCap: 0 } as never).length).toBeGreaterThan(0);
   });
 });
+
+// ── S5-5 预授权底线（standing order）两字段 ──
+
+describe("standing order 字段", () => {
+  it("defaultPolicy 不含底线字段（未启用态）", () => {
+    const p = defaultPolicy();
+    expect(p.standingOrder).toBeUndefined();
+    expect(p.standingOrderAfterHours).toBeUndefined();
+  });
+
+  it("extractPolicy 抽取合法 standingOrder/standingOrderAfterHours", () => {
+    const p = extractPolicy({ askHumanPolicy: {
+      deciderChain: [], escalateSafetyGuard: true, escalateUnverifiedProduct: true,
+      escalateAiPolicyHold: false, escalateStuck: true,
+      standingOrder: "最多 95 折，赠品可送", standingOrderAfterHours: 12,
+    } });
+    expect(p.standingOrder).toBe("最多 95 折，赠品可送");
+    expect(p.standingOrderAfterHours).toBe(12);
+  });
+
+  it("extractPolicy 对缺失/非法类型回落 undefined", () => {
+    const missing = extractPolicy({ askHumanPolicy: {
+      deciderChain: [], escalateSafetyGuard: true, escalateUnverifiedProduct: true,
+      escalateAiPolicyHold: false, escalateStuck: true,
+    } });
+    expect(missing.standingOrder).toBeUndefined();
+    expect(missing.standingOrderAfterHours).toBeUndefined();
+    const garbage = extractPolicy({ askHumanPolicy: {
+      deciderChain: [], escalateSafetyGuard: true, escalateUnverifiedProduct: true,
+      escalateAiPolicyHold: false, escalateStuck: true,
+      standingOrder: 42, standingOrderAfterHours: "twelve",
+    } });
+    expect(garbage.standingOrder).toBeUndefined();
+    expect(garbage.standingOrderAfterHours).toBeUndefined();
+  });
+
+  const okBase: PolicyLike = {
+    deciderChain: [], escalateSafetyGuard: true, escalateUnverifiedProduct: true,
+    escalateAiPolicyHold: false, escalateStuck: true,
+  };
+
+  it("validatePolicy：成对配置且合法 → 通过；两者全缺省 → 通过", () => {
+    expect(validatePolicy({ ...okBase, standingOrder: "底线口径", standingOrderAfterHours: 12 } as never)).toEqual([]);
+    expect(validatePolicy(okBase as never)).toEqual([]);
+  });
+
+  it("validatePolicy：只配一半 → 报错（防配了永不生效）", () => {
+    expect(validatePolicy({ ...okBase, standingOrder: "底线口径" } as never).length).toBeGreaterThan(0);
+    expect(validatePolicy({ ...okBase, standingOrderAfterHours: 12 } as never).length).toBeGreaterThan(0);
+  });
+
+  it("validatePolicy：空白口径 / 超长口径 → 报错", () => {
+    expect(validatePolicy({ ...okBase, standingOrder: "   ", standingOrderAfterHours: 12 } as never).length).toBeGreaterThan(0);
+    expect(validatePolicy({ ...okBase, standingOrder: "字".repeat(2001), standingOrderAfterHours: 12 } as never).length).toBeGreaterThan(0);
+  });
+
+  it("validatePolicy：时限 ≤0 或 >8760 → 报错", () => {
+    expect(validatePolicy({ ...okBase, standingOrder: "底线口径", standingOrderAfterHours: 0 } as never).length).toBeGreaterThan(0);
+    expect(validatePolicy({ ...okBase, standingOrder: "底线口径", standingOrderAfterHours: -1 } as never).length).toBeGreaterThan(0);
+    expect(validatePolicy({ ...okBase, standingOrder: "底线口径", standingOrderAfterHours: 8761 } as never).length).toBeGreaterThan(0);
+  });
+});

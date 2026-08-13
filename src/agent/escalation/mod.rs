@@ -37,7 +37,8 @@ use super::types::{AgentDecision, DecisionReviewResult};
 use crate::error::{AppError, AppResult};
 use crate::models::{
     AgentDecisionReview, AgentPrincipalEscalation, AgentTask, Contact, OperationDomainConfig,
-    PrincipalDecision, ESCALATION_CATEGORY_HIGH_RISK_GATED, PRINCIPAL_VERDICT_DEFERRED,
+    PrincipalDecision, ESCALATION_CATEGORY_HIGH_RISK_GATED, EXEMPTION_TYPE_NONE,
+    PRINCIPAL_VERDICT_CONDITIONAL, PRINCIPAL_VERDICT_DEFERRED,
 };
 use crate::prompts;
 use crate::routes::AppState;
@@ -603,6 +604,11 @@ async fn converge_timed_out_escalation(
             .timeout_hours
             .is_some_and(|timeout| age_hours >= timeout);
         if timed_out {
+            // S5-5：链尾无人应答且台账年龄超过运营预设时限 → 执行预授权底线
+            // （前置于安抚：底线一旦生效，客户等到的是可转述的方案而非又一条安抚）。
+            if apply_standing_order_if_due(state, entry, &policy, now_ms).await? {
+                return Ok(());
+            }
             let min_interval_ms =
                 (state.config.holding_reply_min_interval_hours * 3600.0 * 1000.0) as i64;
             let should_send = entry
@@ -683,4 +689,63 @@ async fn converge_timed_out_escalation(
         materialize_principal_card_delivery(state, &next_entry).await?;
     }
     Ok(())
+}
+
+/// S5-5 请示预授权底线：链尾无人应答超过 `standing_order_after_hours`（以台账
+/// created_at 计龄）后，把运营预写的 `standing_order` 口径当作一条与领导裁决同形的
+/// conditional 预授权执行——AI 只是执行方，裁决实质是人类提前写好的授权。
+/// 复用 [`resolve_escalation`]→[`materialize_relay_task`] 既有链路（零新发送路径），
+/// 客户随后收到的是 relay task 经网关以 AI 口吻转述的底线方案。
+///
+/// 返回 `true` = 本台账已被 resolve（或已被并发路径 resolve），调用方跳过链尾安抚；
+/// `false` = 底线未配置/时限未到，调用方维持既有安抚行为。
+///
+/// 幂等：resolve 内核 CAS 只吃 pending 台账（resolved 终态排除在扫描 filter 外），
+/// 同一台账至多应用一次；并发被领导/admin 抢先 resolve 时静默让路、不写事件。
+async fn apply_standing_order_if_due(
+    state: &AppState,
+    entry: &AgentPrincipalEscalation,
+    policy: &ResolvedAskHumanPolicy,
+    now_ms: i64,
+) -> AppResult<bool> {
+    let created_at_ms = entry.created_at.timestamp_millis();
+    let Some(text) = standing_order_due(policy, created_at_ms, now_ms) else {
+        return Ok(false);
+    };
+    let decision = PrincipalDecision {
+        verdict: PRINCIPAL_VERDICT_CONDITIONAL.to_string(),
+        substance: text.to_string(),
+        constraints: vec![],
+        // 运营常备底线不设授权过期窗；口径变更走配置编辑，只影响后续新触发。
+        authorization_window_hours: None,
+        exemption_type: EXEMPTION_TYPE_NONE.to_string(),
+    };
+    let resolved = resolve_escalation(state, entry, &decision, None, "standing_order_policy")
+        .await?;
+    if resolved.is_none() {
+        // 并发已被领导回复 / admin 裁决抢先 resolve → 幂等让路（议题已有真人裁决，
+        // 本轮既不再应用底线也不再发链尾安抚）。
+        return Ok(true);
+    }
+    let elapsed_hours = (now_ms - created_at_ms) as f64 / (3600.0 * 1000.0);
+    // fail-soft 审计：事件写失败不回滚 resolve（relay intent 已持久化）。
+    if let Err(error) = crate::agent::gateway::write_event_for_account(
+        state,
+        &entry.workspace_id,
+        &entry.account_id,
+        Some(&entry.contact_wxid),
+        "escalation_standing_order_applied",
+        "ok",
+        "链尾决策人持续未应答，按运营预授权底线口径出具转述方案",
+        Some(doc! {
+            "short_code": &entry.short_code,
+            "elapsed_hours": elapsed_hours,
+            "standing_order_after_hours": policy.standing_order_after_hours,
+        }),
+    )
+    .await
+    {
+        tracing::warn!(short_code = %entry.short_code, ?error, "standing-order 审计事件写入失败");
+    }
+    Ok(true)
 }

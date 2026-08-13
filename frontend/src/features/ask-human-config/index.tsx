@@ -2,8 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { ConfirmProvider } from "../../components/ui/ConfirmDialog";
 import { ToastProvider, useToast } from "../../components/ui/Toast";
 import { api } from "../../lib/api";
-import type { AskHumanPolicy } from "../../types";
-import { defaultPolicy, extractPolicy, validatePolicy } from "./policyForm";
+import { defaultPolicy, extractPolicy, validatePolicy, type AskHumanPolicy } from "./policyForm";
 import { DeciderChainEditor } from "./DeciderChainEditor";
 import styles from "./AskHumanConfig.module.css";
 
@@ -91,7 +90,7 @@ function AskHumanConfigView() {
   }
 
   // 可选数值字段：空字符串 → 删除该键（undefined）；有值 → number。
-  function setNumField(key: "dedupeWindowHours" | "dailyPushCap" | "timeoutHours", raw: string) {
+  function setNumField(key: "dedupeWindowHours" | "dailyPushCap" | "timeoutHours" | "standingOrderAfterHours", raw: string) {
     setDraft((d) => {
       const next = { ...d };
       if (raw.trim() === "") {
@@ -163,6 +162,41 @@ function AskHumanConfigView() {
           </button>
         )}
         <div className={styles.chainHint}>主决策人多久没响应就转交链中下一位</div>
+      </section>
+
+      <section className={styles.section}>
+        <h2 className={styles.sectionTitle}>预授权底线</h2>
+        <textarea
+          className={styles.orderTextarea}
+          placeholder="如：最多可给 95 折，赠品可送，超出请客户稍等正式确认"
+          maxLength={2000}
+          value={draft.standingOrder ?? ""}
+          onChange={(e) => setDraft((d) => {
+            const next = { ...d };
+            if (e.target.value === "") {
+              delete next.standingOrder;
+            } else {
+              next.standingOrder = e.target.value;
+            }
+            return next;
+          })}
+        />
+        <div className={styles.fieldRow}>
+          <span className={styles.fieldLabel}>生效时限</span>
+          <input
+            className={styles.numInput}
+            type="number"
+            min={0}
+            max={8760}
+            placeholder="未启用"
+            value={draft.standingOrderAfterHours ?? ""}
+            onChange={(e) => setNumField("standingOrderAfterHours", e.target.value)}
+          />
+          <span className={styles.fieldUnit}>小时（链尾无人应答持续满该时长后启用）</span>
+        </div>
+        <div className={styles.chainHint}>
+          决策人链全部超时未应答满设定时长后，AI 按这里预先写好的兜底口径答复客户；两项须同时填写。不配置＝链尾无人应答时仅周期安抚。
+        </div>
       </section>
 
       <details className={styles.advanced}>

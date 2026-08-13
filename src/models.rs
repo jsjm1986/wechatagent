@@ -1446,6 +1446,16 @@ pub struct AskHumanPolicy {
     pub quiet_hours: Option<AskHumanQuietHours>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_hours: Option<f64>,
+    /// S5-5 运营预授权底线口径（如"最多 95 折，赠品可送"）。链尾无人应答持续超过
+    /// `standing_order_after_hours` 后，超时扫描把它当作一条 conditional 预授权裁决执行
+    /// （resolved_via=standing_order_policy，复用 resolve→relay 既有链路）。
+    /// None = 未启用，维持链尾无限等待+周期安抚。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub standing_order: Option<String>,
+    /// 链尾无人应答持续多少小时后启用底线（以台账 created_at 计龄）。
+    /// 与 `standing_order` 必须成对配置（routes 校验强制），防"配了文本永不生效"的静默误配。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub standing_order_after_hours: Option<f64>,
 }
 
 /// 专属顾问名片：人类标注的真人顾问微信名片 + 触发提示。辅助模式下注入 decision prompt，

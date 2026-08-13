@@ -1,4 +1,11 @@
-import type { AskHumanPolicy, DeciderRef, AskHumanQuietHours } from "../../types";
+import type { AskHumanPolicy as AskHumanPolicyBase, DeciderRef, AskHumanQuietHours } from "../../types";
+
+// S5-5 预授权底线两字段（standingOrder / standingOrderAfterHours，对齐后端
+// AskHumanPolicy camelCase serde）。配置页本地扩展全局类型，两字段成对配置。
+export type AskHumanPolicy = AskHumanPolicyBase & {
+  standingOrder?: string;
+  standingOrderAfterHours?: number;
+};
 
 // 空链 + 保守默认开关（与后端 ResolvedAskHumanPolicy 非-all 模式回落一致）。
 export function defaultPolicy(): AskHumanPolicy {
@@ -53,6 +60,8 @@ export function extractPolicy(domainItem: unknown): AskHumanPolicy {
   const dedupe = asNumOrUndef(p.dedupeWindowHours);
   const cap = asNumOrUndef(p.dailyPushCap);
   const timeout = asNumOrUndef(p.timeoutHours);
+  const standingOrder = typeof p.standingOrder === "string" ? p.standingOrder : undefined;
+  const standingOrderAfterHours = asNumOrUndef(p.standingOrderAfterHours);
   return {
     deciderChain: chain,
     escalateSafetyGuard: asBool(p.escalateSafetyGuard, d.escalateSafetyGuard),
@@ -63,6 +72,8 @@ export function extractPolicy(domainItem: unknown): AskHumanPolicy {
     ...(cap !== undefined ? { dailyPushCap: cap } : {}),
     ...(quietHours ? { quietHours } : {}),
     ...(timeout !== undefined ? { timeoutHours: timeout } : {}),
+    ...(standingOrder !== undefined ? { standingOrder } : {}),
+    ...(standingOrderAfterHours !== undefined ? { standingOrderAfterHours } : {}),
   };
 }
 
@@ -89,5 +100,16 @@ export function validatePolicy(p: AskHumanPolicy): string[] {
   if (p.dedupeWindowHours !== undefined && p.dedupeWindowHours < 0) errs.push("去重窗口不能为负");
   if (p.timeoutHours !== undefined && p.timeoutHours < 0) errs.push("超时小时不能为负");
   if (p.dailyPushCap !== undefined && p.dailyPushCap < 1) errs.push("每日上限至少为 1");
+  // S5-5 预授权底线：两字段成对；口径非空白且 ≤2000 字符；时限 >0 且 ≤8760（与后端权威校验一致）。
+  const hasOrder = p.standingOrder !== undefined;
+  const hasHours = p.standingOrderAfterHours !== undefined;
+  if (hasOrder !== hasHours) {
+    errs.push("预授权底线口径与生效时限必须成对配置（或都留空）");
+  } else if (hasOrder && hasHours) {
+    if ((p.standingOrder ?? "").trim().length === 0) errs.push("预授权底线口径不能为空白");
+    else if ([...(p.standingOrder ?? "")].length > 2000) errs.push("预授权底线口径最长 2000 字符");
+    const h = p.standingOrderAfterHours ?? 0;
+    if (!(h > 0 && h <= 8760)) errs.push("预授权底线生效时限须大于 0 且不超过 8760 小时");
+  }
   return errs;
 }

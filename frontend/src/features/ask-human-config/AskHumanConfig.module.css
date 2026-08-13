@@ -50,6 +50,12 @@
   color: var(--ink-1); font-size: 13px;
 }
 .numInput:focus, .numInputSm:focus { outline: none; box-shadow: var(--focus-ring); }
+.orderTextarea {
+  width: 100%; max-width: 560px; min-height: 72px; resize: vertical;
+  font-size: 13px; color: var(--ink-1); padding: 8px 10px;
+  border: 1px solid var(--line-1, #d9dee5); border-radius: 6px; background: #fff;
+}
+.orderTextarea:focus { outline: none; box-shadow: var(--focus-ring); }
 .numInputSm {
   width: 64px; height: var(--control-h, 38px); padding: 0 10px;
   border: 1px solid var(--hairline); border-radius: var(--r-sm); background: var(--surface-card);
