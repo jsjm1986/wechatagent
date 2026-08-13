@@ -677,7 +677,9 @@ pub async fn update_domain_profile(
 }
 
 /// delete：禁止删除 active profile（须先 activate 另一条或回落 DEFAULT）。
-pub(super) async fn delete_domain_profile(
+/// `pub`（同 [`publish_domain_profile`] 先例）：集成测试 `tests/domain_profile_e2e.rs`
+/// 直调本 handler 守护"删 active 被拒 / 删 draft 放行"的业务规则。
+pub async fn delete_domain_profile(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
