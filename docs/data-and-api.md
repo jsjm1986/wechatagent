@@ -2,11 +2,13 @@
 
 ## Current Collections
 
-Mongo collection 数量会随迁移与功能演进变化，本文不再维护易漂移的手抄全集。当前权威来源是：
+Mongo collection 数量会随迁移与功能演进变化，本文不再维护易漂移的手抄全集。全库集合约 79 个（含按名/const 访问的非 typed 集合；集合-写入方矩阵见 `project-understanding/30-global-fact-cards.md` §8）。当前权威来源是：
 
-- `src/db/mod.rs` 的 typed collection accessors（当前 61 个）；
+- `src/db/mod.rs` 的 typed collection accessors（2026-08-13 时点 64 个，计数随演进漂移）；
 - `src/db/indexes.rs` 的索引契约；
-- `src/db/migrations/` 的历史建表、回填与收敛步骤。
+- `src/db/migrations/` 的历史建表、回填与收敛步骤（m001–m058）。
+
+金标回归场景资产（非集合，属测试数据资产）：`tests/fixtures/quality_gold/`（105 条合成场景，五类 × 21）+ `tests/quality_gold_regression.rs` 断言；一键入口 `bash scripts/quality-regression.sh`（shadow 零发送）。
 
 核心业务集合包括 `wechat_accounts`、`contacts`、`conversation_messages`、`agent_tasks`、
 `agent_events`、`mcp_call_logs`、`operation_playbooks`、`operating_memories`、
@@ -80,18 +82,20 @@ profile_attributes
 profile_updated_at
 ```
 
-标签由账号级 `operation_playbooks` 约束方法论，由 Agent 基于单个好友上下文自由生成和持续更新。业务可变字段（旧版的 `customer_stage` / `intent_level` / `objection_type` 等）下沉到 `domain_attributes: bson::Document`，由 `DomainSchema` 在落库时校验。
+标签由账号级 `operation_playbooks` 约束方法论，由 Agent 基于单个好友上下文自由生成和持续更新。业务可变字段（旧版的 `customer_stage` / `intent_level` / `objection_type` 等）下沉到 `domain_attributes: bson::Document`，由 `DomainSchema` 在落库时校验。注意 `customer_stage` / `intent_level` / `objection_type` 取值必须来自 `system_taxonomies`（双层标签红线）。
 
 运营大脑 V2 新增长期认知对象：
 
 ```text
 operating_memories: 每个 managed 好友一份，保存用户理解、关系状态、产品匹配和下一步行动。
-operation_knowledge_chunks: Agent 运行时真正按需打开的知识切片。保存 wiki_type / title / summary / body / sources / source_quote / tags / related_chunks / domain_attributes / dynamic_confidence / locked_fields。旧的销售域字段（routing_card / safe_claims / forbidden_claims / evidence_items / distortion_risks / unsupported_claims / verified_claims）已全部下沉到 domain_attributes。
+operation_knowledge_chunks: Agent 运行时真正按需打开的知识切片。保存 wiki_type / title / summary / body / sources / source_quote / tags / related_chunks / domain_attributes / dynamic_confidence / locked_fields。声明类字段族（routing_card / safe_claims / forbidden_claims / evidence_items 等）存在跨链路口径分叉（2026-08-13 S5-7 裁决：维持分叉、显式记录）——user-ops 主链自 2026-05-25 知识清理后不消费它们（已被分数闸 + R5.4 结构化背书取代）；chat/repair/catalog 链仍活跃（prompt 仍要求输出、src/routes/knowledge/catalog.rs 生产查询 evidence_items）。typed 模型已不含该字段族，它们以 DB 文档级字段留存；删改前必须核 chat/repair/catalog 三处消费，主链侧不要为它们新增消费逻辑。
 knowledge_usage_logs: Agent 运行时知识工具调用和引用审计日志，记录 selectedKnowledgeIds、selectedChunkIds、toolTrace、routeResult、回复文本和 Review 结果。
 agent_decision_reviews: 独立评审 Agent 的评分、风险、拦截和改写记录。
 ```
 
 ## Future Collections
+
+> 注（2026-08-13 核对）：本节混有**已落地**与**未来**集合——`agent_souls` / `prompt_templates` / `management_agent_sessions` / `agent_command_runs` / `agent_tool_calls` / `content_assets` / `operation_playbooks` 及"自我演化"四表均已落地；群 / 朋友圈相关仍是未来规划。存在性以 `src/db/mod.rs` 与迁移为准。
 
 微信群运营：
 
@@ -158,7 +162,8 @@ experiments:
   experiment_id (unique) / workspace_id / account_id / started_at desc
   cohort_summary { thresholdCount, promptCount }
   budget { tokensUsed, llmCalls }
-  status: running | finished | aborted
+  status: collecting | evaluating | awaiting_admin | released | aborted
+          （闭集见 src/evolution/envelope.rs；生产 tick 只走 collecting → awaiting_admin）
 
 proposals:
   experiment_id / workspace_id / account_id / proposal_kind (threshold|prompt)
