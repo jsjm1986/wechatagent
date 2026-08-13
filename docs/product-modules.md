@@ -123,7 +123,7 @@ AI Command Center
 - AI 自动生成文档目录、知识包、知识切片和证据块
 - 文档目录 `operation_knowledge_documents`
 - 运行时按需打开的知识切片 `operation_knowledge_chunks`（旧"主题知识包"`operation_knowledge_items` 已随 sales 旧库删除，相关端点恒返 400 引导改用 chunks）
-- Agent 内部工具：`knowledge.list_catalog`、`knowledge.search`、`knowledge.open_slice`（旧 `knowledge.open_evidence` 已移除）
+- Agent 内部工具：`knowledge.list_catalog`、`knowledge.search`、`knowledge.open_slice`（旧工具名 `knowledge.open_evidence` 已并入 open_slice；HTTP 路由 `/tools/open-evidence` 仅存为 open-slice 同 handler 的遗留别名）
 - 命中测试展示工具轨迹、选中切片、缺失知识和覆盖度
 - Agent 使用日志记录 routeResult、toolTrace、回复和 Review 结果
 

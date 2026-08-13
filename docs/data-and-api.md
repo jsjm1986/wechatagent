@@ -334,7 +334,7 @@ POST /api/operation-knowledge/import-apply
 GET  /api/operation-knowledge/catalog
 POST /api/operation-knowledge/tools/search
 POST /api/operation-knowledge/tools/open-slice
-POST /api/operation-knowledge/tools/open-evidence
+POST /api/operation-knowledge/tools/open-evidence   （遗留别名：与 open-slice 同一 handler）
 POST /api/operation-knowledge/test-match
 GET  /api/operation-knowledge/usage
 GET  /api/decision-reviews
