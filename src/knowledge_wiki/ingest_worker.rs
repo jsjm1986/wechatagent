@@ -357,6 +357,14 @@ async fn finalize_without_content(
     Ok(())
 }
 
+/// 拉取成功后的**收尾落库链**：claim-owned 事务内走 `ingest_chunked_text_with_session`
+/// 落 chunk（强制 draft + needs_review 红线）+ 刷 last_fetched_at / 归零
+/// failure_streak / 累加 ingest_count / 释放 claim。生产路径只经 [`run_one_round`]。
+///
+/// 集成测试覆盖形态：`outbound_fetch` 的公网-only SSRF 门（fail-closed，无测试
+/// 逃生门）使 loopback mock server 无法走通 fetch 段，故 fetch 段以拒绝路径守护
+/// （SR-109），本收尾段经 [`finalize_claimed_content_for_redline`]（真实 claim +
+/// finalize 协议）在 `tests/ingest_worker_smoke.rs` 与 sr117 中覆盖。
 async fn finalize_ingested_content(
     state: &AppState,
     src: &IngestSource,
