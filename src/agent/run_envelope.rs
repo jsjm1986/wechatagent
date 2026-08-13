@@ -10,7 +10,8 @@
 //! * [`write_run_envelope_started`]：在任何 LLM 调用之前 `insert_one` 一条
 //!   `lifecycle="started"` 的信封记录，确保即使 Reply Agent 超时 / panic /
 //!   JSON 解析失败也有可追溯条目（requirements.md R0.1 / R0.5）。
-//! * [`update_run_envelope_terminal`]：用 `update_one({run_id}, $set)` 落终态字段；
+//! * [`update_run_envelope_terminal`]：用带终态吸收 CAS 的 `update_one` 落终态
+//!   字段（filter 含合法 lifecycle 转移谓词，迟到写 fail-soft 拒绝并留审计事件）；
 //!   `matched_count == 0` 时走单次 `insert_one` 兜底 + 写
 //!   `agent_events kind="run_envelope_recovered_via_insert"`（R0.2）。
 //! * [`install_panic_hook_for_envelope`]：注册全局 `std::panic::set_hook`，把
@@ -20,7 +21,7 @@
 
 use std::sync::{Arc, Once};
 
-use mongodb::bson::{doc, DateTime, Document};
+use mongodb::bson::{doc, Bson, DateTime, Document};
 use mongodb::options::UpdateOptions;
 use serde::Serialize;
 
@@ -53,6 +54,18 @@ pub const LIFECYCLE_FAILED_AFTER_DECISION: &str = "failed_after_decision";
 pub const LIFECYCLE_ABORTED_BY_BUDGET: &str = "aborted_by_budget";
 pub const LIFECYCLE_ABORTED_BY_EXTERNAL_SIGNAL: &str = "aborted_by_external_signal";
 
+/// lifecycle 闭集全量清单（R0.3）。`assert_lifecycle_valid` 与
+/// `update_run_envelope_terminal` 的 CAS 谓词共用，保证闭集只有一份。
+pub const ALL_LIFECYCLES: &[&str] = &[
+    LIFECYCLE_STARTED,
+    LIFECYCLE_RUNNING,
+    LIFECYCLE_COMPLETED,
+    LIFECYCLE_FAILED_BEFORE_DECISION,
+    LIFECYCLE_FAILED_AFTER_DECISION,
+    LIFECYCLE_ABORTED_BY_BUDGET,
+    LIFECYCLE_ABORTED_BY_EXTERNAL_SIGNAL,
+];
+
 /// gateway_status 占位 — envelope 创建时统一为 `"pending"`，由后续阶段覆盖
 /// 为 `approved / blocked_by_required_field / ...` 等具体状态。
 const GATEWAY_STATUS_PENDING: &str = "pending";
@@ -60,6 +73,11 @@ const GATEWAY_STATUS_PENDING: &str = "pending";
 /// 把 run_id 错位 / matched_count == 0 的事件 kind 暴露为常量，便于 W1 task 2.6
 /// 的单元测试断言。
 pub const EVENT_RUN_ENVELOPE_RECOVERED_VIA_INSERT: &str = "run_envelope_recovered_via_insert";
+
+/// 终态吸收性 CAS 拒绝迟到 lifecycle 写时的审计事件 kind（R0.3/R0.10.b）。
+/// fail-soft：被拒不报错，只留本事件供追溯迟到 writer 的上游路径。
+pub const EVENT_RUN_ENVELOPE_LIFECYCLE_TRANSITION_REJECTED: &str =
+    "run_envelope_lifecycle_transition_rejected";
 
 /// R9.2：`finalReviewStatus` 允许枚举集合（含 `legacy_mode_unchecked` 灰度回退态）。
 /// 严禁 `held_for_human / human_required / waiting_for_human` 等暗示人工接管的取值。
@@ -217,16 +235,7 @@ pub fn assert_gateway_status_valid(value: &str) -> AppResult<()> {
 /// 写入时把 `lifecycle="started"` 落库；终态写入路径（gateway finalize）
 /// SHALL 显式给出一个非空 lifecycle，否则前端筛选会落入"未完成"分桶。
 pub fn assert_lifecycle_valid(value: &str) -> AppResult<()> {
-    if matches!(
-        value,
-        LIFECYCLE_STARTED
-            | LIFECYCLE_RUNNING
-            | LIFECYCLE_COMPLETED
-            | LIFECYCLE_FAILED_BEFORE_DECISION
-            | LIFECYCLE_FAILED_AFTER_DECISION
-            | LIFECYCLE_ABORTED_BY_BUDGET
-            | LIFECYCLE_ABORTED_BY_EXTERNAL_SIGNAL
-    ) {
+    if ALL_LIFECYCLES.contains(&value) {
         return Ok(());
     }
     let msg = format!(
@@ -686,14 +695,83 @@ pub async fn update_run_envelope_terminal(
         return Ok(());
     }
 
+    // R0.3 / R0.10.b：终态吸收性 CAS。写 lifecycle 时 filter 只命中"当前值可
+    // 合法转移到目标值"的行（合法 from 集合由 is_valid_lifecycle_transition
+    // 派生，含目标自身的幂等重写）；历史行（无 lifecycle 键 / 空串残行）放行。
+    // 迟到 writer 试图把终态行覆写为其它终态时整条 $set 不落（见下方 fail-soft
+    // 审计分支），不得部分污染已定格的行。
+    let mut filter = doc! { "run_id": run_id };
+    if let Some(to) = fields.lifecycle.as_deref() {
+        let mut allowed_from: Vec<&str> = ALL_LIFECYCLES
+            .iter()
+            .copied()
+            .filter(|from| is_valid_lifecycle_transition(from, to))
+            .collect();
+        allowed_from.push("");
+        filter.insert(
+            "$or",
+            vec![
+                doc! { "lifecycle": { "$in": &allowed_from } },
+                doc! { "lifecycle": { "$exists": false } },
+                doc! { "lifecycle": Bson::Null },
+            ],
+        );
+    }
+
     let update = doc! { "$set": set_doc };
     let result = db
         .agent_run_logs()
-        .update_one(doc! { "run_id": run_id }, update.clone(), None)
+        .update_one(filter, update.clone(), None)
         .await?;
 
     if result.matched_count > 0 {
         return Ok(());
+    }
+
+    // CAS miss 有两种可能：行存在但转移非法（终态吸收拒绝迟到写），或 run_id
+    // 根本不存在（走既有 insert 兜底）。补查一次区分。
+    if fields.lifecycle.is_some() {
+        let existing = db
+            .agent_run_logs()
+            .find_one(doc! { "run_id": run_id }, None)
+            .await?;
+        if let Some(row) = existing {
+            // fail-soft：迟到写被吸收，不报错；留审计事件供追溯上游 writer。
+            tracing::warn!(
+                run_id = run_id,
+                current_lifecycle = row.lifecycle.as_str(),
+                attempted_lifecycle = fields.lifecycle.as_deref().unwrap_or_default(),
+                "run_envelope terminal lifecycle transition rejected (absorbing state)"
+            );
+            let event = AgentEvent {
+                id: None,
+                workspace_id: fields
+                    .workspace_id
+                    .clone()
+                    .unwrap_or_else(|| row.workspace_id.clone()),
+                account_id: fields
+                    .account_id
+                    .clone()
+                    .unwrap_or_else(|| row.account_id.clone()),
+                contact_wxid: fields.contact_wxid.clone().or(row.contact_wxid.clone()),
+                kind: EVENT_RUN_ENVELOPE_LIFECYCLE_TRANSITION_REJECTED.to_string(),
+                status: "warning".to_string(),
+                summary: format!(
+                    "run_envelope lifecycle transition rejected for run_id={run_id}: {} -> {}",
+                    row.lifecycle,
+                    fields.lifecycle.as_deref().unwrap_or_default()
+                ),
+                details: Some(doc! {
+                    "run_id": run_id,
+                    "current_lifecycle": &row.lifecycle,
+                    "attempted_lifecycle": fields.lifecycle.as_deref().unwrap_or_default(),
+                }),
+                created_at: DateTime::now(),
+                dedupe_key: None,
+            };
+            db.events().insert_one(event, None).await?;
+            return Ok(());
+        }
     }
 
     // R0.2：兜底 insert + 事件埋点。

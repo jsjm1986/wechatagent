@@ -407,6 +407,159 @@ async fn update_one_falls_back_to_insert_with_recovery_event() {
 
 #[tokio::test]
 #[ignore]
+async fn terminal_lifecycle_is_absorbing_and_rejects_late_write() {
+    // R0.3 / R0.10.b：终态 SHALL 是吸收态。迟到的终态写（例如超时路径与正常
+    // 路径竞态，后者已落 completed）不得把行覆写为 failed_after_decision——
+    // fail-soft 吞掉整条 $set 并留 rejected 审计事件，函数不返回错误。
+    let app = common::TestApp::start().await;
+
+    let run_id = "run_envelope_absorbing_test";
+    write_run_envelope_started(
+        &app.state.db,
+        run_id,
+        &app.state.config.default_workspace_id,
+        &app.state.config.default_account_id,
+        Some("wxid_test"),
+        "evt_absorb_001",
+        SOURCE_KIND_INBOUND_MESSAGE,
+        "reply",
+    )
+    .await
+    .expect("insert started envelope");
+
+    update_run_envelope_terminal(
+        &app.state.db,
+        run_id,
+        AgentRunLogTerminalFields {
+            lifecycle: Some("completed".to_string()),
+            final_review_status: Some("approved".to_string()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("first terminal write SHALL succeed");
+
+    // 迟到 writer：试图把 completed 覆写为 failed_after_decision。
+    update_run_envelope_terminal(
+        &app.state.db,
+        run_id,
+        AgentRunLogTerminalFields {
+            lifecycle: Some("failed_after_decision".to_string()),
+            error_summary: Some("late writer".to_string()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("late write SHALL be swallowed fail-soft, not surfaced as error");
+
+    let log = app
+        .state
+        .db
+        .agent_run_logs()
+        .find_one(doc! { "run_id": run_id }, None)
+        .await
+        .expect("query agent_run_logs")
+        .expect("envelope present");
+    assert_eq!(
+        log.lifecycle, "completed",
+        "终态 SHALL 吸收：迟到写不得覆写 lifecycle"
+    );
+    assert_eq!(
+        log.error, None,
+        "被拒的迟到 $set SHALL 整条不落（不得部分污染终态行）"
+    );
+
+    // 审计事件 SHALL 记录被拒转移（kind 用字面量锁 wire 值）。
+    let event = app
+        .state
+        .db
+        .events()
+        .find_one(
+            doc! {
+                "kind": "run_envelope_lifecycle_transition_rejected",
+                "details.run_id": run_id,
+            },
+            None,
+        )
+        .await
+        .expect("query agent_events")
+        .expect("rejected-transition audit event present");
+    assert_eq!(
+        event
+            .details
+            .as_ref()
+            .and_then(|d| d.get_str("attempted_lifecycle").ok()),
+        Some("failed_after_decision")
+    );
+
+    // 同 run 不得误走 insert 兜底（行已存在）。
+    let recovered = app
+        .state
+        .db
+        .events()
+        .find_one(
+            doc! {
+                "kind": EVENT_RUN_ENVELOPE_RECOVERED_VIA_INSERT,
+                "details.run_id": run_id,
+            },
+            None,
+        )
+        .await
+        .expect("query agent_events");
+    assert!(recovered.is_none(), "存在行被拒时 SHALL NOT 走 insert 兜底");
+}
+
+#[tokio::test]
+#[ignore]
+async fn legacy_row_without_lifecycle_accepts_terminal_write() {
+    // 向后兼容：run-envelope 机制之前的历史行（无 lifecycle 键）以及兜底残行
+    // （lifecycle 空串）SHALL 继续接受终态写入——CAS 谓词不得把它们拒之门外。
+    let app = common::TestApp::start().await;
+
+    let run_id = "run_envelope_legacy_row_test";
+    app.state
+        .db
+        .raw()
+        .collection::<Document>("agent_run_logs")
+        .insert_one(
+            doc! {
+                "run_id": run_id,
+                "workspace_id": &app.state.config.default_workspace_id,
+                "account_id": &app.state.config.default_account_id,
+                "status": "pending",
+                "created_at": mongodb::bson::DateTime::now(),
+            },
+            None,
+        )
+        .await
+        .expect("insert legacy row without lifecycle key");
+
+    update_run_envelope_terminal(
+        &app.state.db,
+        run_id,
+        AgentRunLogTerminalFields {
+            lifecycle: Some("completed".to_string()),
+            final_review_status: Some("approved".to_string()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("terminal write on legacy row SHALL succeed");
+
+    let row = app
+        .state
+        .db
+        .raw()
+        .collection::<Document>("agent_run_logs")
+        .find_one(doc! { "run_id": run_id }, None)
+        .await
+        .expect("query agent_run_logs")
+        .expect("legacy row present");
+    assert_eq!(row.get_str("lifecycle").ok(), Some("completed"));
+}
+
+#[tokio::test]
+#[ignore]
 async fn panic_in_pipeline_marks_lifecycle_failed_before_decision() {
     let app = common::TestApp::start().await;
     let contact = managed_contact("wxid_envelope_panic");
