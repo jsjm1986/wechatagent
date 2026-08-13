@@ -73,8 +73,9 @@ use super::review::{
     decide_revision, derive_revision_failure, effective_review_mode, ensure_independent_claim_gate,
     evaluate_independent_claim_gate, finalize_review_for_send, local_decision_review,
     review_decision, review_passed, should_run_review, should_run_targeted_rewrite,
-    FinalizeOutcome, GatewayStatusFinal, PendingFinalizeEvent, ReviewerPromptCache,
-    RevisionDecision,
+    should_skip_claim_gate, skipped_claim_gate_evaluation, FinalizeOutcome, GatewayStatusFinal,
+    PendingFinalizeEvent, ReviewerPromptCache, RevisionDecision,
+    CLAIM_GATE_SKIPPED_RISK_CASUAL_LOW,
 };
 use super::run_envelope::{
     assert_final_review_status_valid, assert_gateway_status_valid, assert_lifecycle_valid,
@@ -614,6 +615,7 @@ fn review_and_evaluate_claim_gate<'a>(
     active_profile: &'a crate::models::DomainProfile,
     active_products: &'a [crate::models::Product],
     reviewer_prompts: &'a ReviewerPromptCache,
+    skip_claim_gate: bool,
 ) -> BoxFuture<
     'a,
     AppResult<(
@@ -622,6 +624,32 @@ fn review_and_evaluate_claim_gate<'a>(
     )>,
 > {
     async move {
+        // S5-6：寒暄低风险轮（should_skip_claim_gate 七条件全满足，由调用方判定）
+        // 跳过独立 ClaimGate 的 LLM 调用——Review 本体照跑，评估结果用"未评估"
+        // 形态（outcome=None）占位，apply 对其零 hold、零 merge。
+        if skip_claim_gate {
+            let review = review_decision(
+                state,
+                contact,
+                inbound,
+                recent_messages,
+                decision,
+                playbook,
+                domain_config,
+                runtime,
+                memory,
+                context_pack,
+                knowledge_chunks,
+                knowledge_route,
+                review_mode,
+                Some(run_id),
+                None,
+                Some(active_profile),
+                Some(reviewer_prompts),
+            )
+            .await?;
+            return Ok((review, skipped_claim_gate_evaluation(decision)));
+        }
         let (review, claim_gate) = tokio::join!(
             review_decision(
                 state,
@@ -863,6 +891,8 @@ async fn send_contact_message_gateway_inner(
         &active_profile,
         &active_products,
         &reviewer_prompts,
+        // 管理发送是 admin 人工指定文本，非 LLM 寒暄轮——ClaimGate 恒照跑。
+        false,
     )
     .await?;
     let priced_from_catalog = apply_independent_claim_gate(
@@ -3001,7 +3031,10 @@ fn run_user_operation_gateway_inner<'a>(
         local_decision_review(&decision, local_budget_ref, &runtime)
     } else if should_run_review(&decision, &planner, &runtime) {
         let review_mode = effective_review_mode(&planner, &decision, &runtime, false);
-        let (review, claim_gate_evaluation) = review_and_evaluate_claim_gate(
+        // S5-6：首稿寒暄低风险轮跳过独立 ClaimGate（七条件纯函数判定）。rewrite /
+        // revision / 管理发送路径不跳——它们的触发本身即风险信号或人工指定文本。
+        let skip_claim_gate = should_skip_claim_gate(&decision, &planner);
+        let (mut review, claim_gate_evaluation) = review_and_evaluate_claim_gate(
             state,
             &contact,
             &inbound,
@@ -3019,8 +3052,20 @@ fn run_user_operation_gateway_inner<'a>(
             &active_profile,
             &active_products,
             &reviewer_prompts,
+            skip_claim_gate,
         )
         .await?;
+        if skip_claim_gate
+            && !review
+                .risks
+                .iter()
+                .any(|risk| risk == CLAIM_GATE_SKIPPED_RISK_CASUAL_LOW)
+        {
+            // 审计标记：跳过率可观测（decision_reviews.risks）、误跳可排查。
+            review
+                .risks
+                .push(CLAIM_GATE_SKIPPED_RISK_CASUAL_LOW.to_string());
+        }
         precomputed_claim_gate = Some(claim_gate_evaluation);
         review
     } else {
@@ -3145,6 +3190,8 @@ fn run_user_operation_gateway_inner<'a>(
                 &active_profile,
                 &active_products,
                 &reviewer_prompts,
+                // rewrite 由硬闸失败触发（幻觉/grounding），改写稿必须全量重评。
+                false,
             )
             .await?;
             review = next_review;
@@ -3415,6 +3462,8 @@ fn run_user_operation_gateway_inner<'a>(
                         &active_profile,
                         &active_products,
                         &reviewer_prompts,
+                        // revision 由 finalize 后的 revision trigger 触发，二稿全量重评。
+                        false,
                     )
                     .await?;
 
