@@ -1,5 +1,7 @@
 # AI Agent System
 
+> 2026-08-13 核对：本页主体是设计意图（"建议/should"语态）；本次修正了 Prompt Pack 名称与启动种子语义两处现状断言，其余与代码一致。
+
 WechatAgent should be designed as an AI-native operations product, not a traditional admin system with a chatbot added later. The product has two different Agent categories:
 
 ```text
@@ -98,15 +100,17 @@ agent_souls
   user / management / group / moment 的稳定人格
 
 prompt_templates
-  system_contract / policy / task_template / review / methodology_generator
+  system_contract / policy / task_template / review 等（现另有 review_guard / knowledge_* /
+  escalation / post_decision_projection / memory_consolidator / reaction_analysis /
+  evaluation / methodology_generator / critic 层，全清单以 src/prompts.rs 为准）
 
 operation_playbooks
   账号级运营方法论，绑定到具体微信账号和 managed 好友
 ```
 
-默认 Prompt Pack：`wechatagent_prompt_pack_v2_2026_05`。
+当前 Prompt Pack 版本常量：`wechatagent_prompt_pack_v16_2026_06_28_...`（`src/prompts.rs` `PROMPT_PACK_VERSION`，随 spec 演进递增；"v2"仅存于 `ensure_prompt_pack_v2` 等函数名的家族称谓）。
 
-启动时如果 workspace 尚未激活 v2 pack，系统会物理删除旧 Soul、旧 PromptTemplate、旧 Playbook，并创建 v2 默认版本。人工后续修改不会在每次重启时被覆盖；如需彻底恢复系统默认，使用 `POST /api/prompt-templates/reset-system-pack`，该接口同样会先物理删除旧提示词栈再重建。
+启动种子语义（`ensure_prompt_pack_v2`）：全新空库 → bootstrap 首次种入 souls/playbook/configs/templates 四集合；非空库 → 补齐内置 Soul（append 版本，**不物理删除** Soul 历史）+ 清理上一轮归档行 + 按 spec 逐 key 内容对齐。人工后续修改不会在每次重启时被覆盖；如需彻底恢复系统默认，使用 `POST /api/prompt-templates/reset-system-pack`（显式维护动作，重建内置 pack 同时保留 Soul 不可变历史）。
 
 ## User Operations Soul
 
@@ -211,7 +215,7 @@ Command Center 是新增能力的入口，但不替代具体业务模块。复�
 
 ## Data Model Direction
 
-后续建议新增：
+后续建议新增（2026-08-13 注：除 `agent_confirmations` / `agent_prompt_versions` 外均已落地——确认流由 `agent_command_runs.status=pending_confirmation` 承载、Prompt 版本由 `prompt_templates` 多版本行承载；存在性以 `src/db/mod.rs` 为准）：
 
 ```text
 agent_souls
