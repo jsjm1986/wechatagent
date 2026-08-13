@@ -2913,6 +2913,7 @@ pub async fn process_entry(state: &AppState, entry: &OutboxEntry) -> AppResult<(
     // 防"连珠炮"——单 worker 串行 for 循环里跨客户/多段消息背靠背零间隔发出 = 机器特征。
     // 位置在 reclaim 幂等门之后（不误拦本该 post-hoc 标 sent 的条目）、发送之前。
     // 查询失败 fail-soft 放行（宁可漏限一次也不丢消息）。
+    // S5-4：间隔按本段字符数加权打字时间（长段比短句慢几拍，见 pacing.rs 常量）。
     if let Ok(Some(last_sent_ms)) =
         account_last_sent_at_ms(state, &entry.workspace_id, &entry.account_id).await
     {
@@ -2920,6 +2921,7 @@ pub async fn process_entry(state: &AppState, entry: &OutboxEntry) -> AppResult<(
             fastrand::f64(),
             state.config.account_send_min_interval_ms,
             state.config.account_send_max_interval_ms,
+            entry.content.chars().count(),
         );
         let now_ms = DateTime::now().timestamp_millis();
         if now_ms - last_sent_ms < interval_ms {
