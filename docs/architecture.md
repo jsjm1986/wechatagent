@@ -1,6 +1,6 @@
 # System Architecture
 
-> Documentation snapshot: checked against commit `d60d3d85f8e193160dca8df185de0daef004a6b6` plus the uncommitted SR-001--SR-183 closure worktree on 2026-07-24. This is not deployment verification; source code and `.env.example` are authoritative if this document drifts. Sections explicitly labelled as recommendations are not shipped topology.
+> Documentation snapshot: checked against commit `d60d3d85f8e193160dca8df185de0daef004a6b6` plus the uncommitted SR-001--SR-183 closure worktree on 2026-07-24; re-checked 2026-08-13 against opt-wave baseline `3db6cf6`（worker 数、evolution 政策、significance 口径已按当日代码修正）. This is not deployment verification; source code and `.env.example` are authoritative if this document drifts. Sections explicitly labelled as recommendations are not shipped topology.
 
 ## Current Architecture
 
@@ -64,6 +64,8 @@ src/webhooks.rs      微信消息 webhook 与 durable inbound handoff
 src/tasks.rs         fenced 跟进任务 worker
 src/evolution/       与生产发送链物理隔离的演化器
 src/knowledge_*      Knowledge Agent、日报、长任务与 Wiki worker
+tests/fixtures/quality_gold/   金标回归场景库（105 条合成场景，五类 × 21）
+tests/quality_gold_regression.rs   金标回归断言（shadow 零发送）；一键入口 scripts/quality-regression.sh
 ```
 
 ## Agent Types
@@ -110,6 +112,7 @@ POST /webhooks/wechat
 → 在 ACK 前持久化 inbound message + pending handoff marker
 → 如果 contact.agent_status != managed，标记 ignored 后停止
 → materialize/refresh 每联系人唯一 durable inbound_reply AgentTask，并立即 ACK
+  （quiet hours 内 run_at 推迟到醒来时刻；显式交易意向豁免 defer——见 docs/agent-policy.md 作息门控）
 → task worker 以 claim token + generation + lease 执行；崩溃窗口由 pending handoff reconciler 恢复
 → reload scope context → knowledge route → Reply → independent Review
 → precheck/finalize/state-action safety gates
@@ -139,7 +142,7 @@ POST /webhooks/wechat
 
 ## Evolution Worker Flow（M4 / agent-self-evolution）
 
-可选后台 tick。worker 由主进程注册，但 `EVOLUTION_ENABLED=false`（默认）时立即退出；显式设为 true 后仍需 workspace Mongo runtime flag 放行。当前代码政策 `CURRENT_AUTO_RELEASE_POLICY_ENABLED=false` 强制所有 proposal 人工发布，旧自动发布配置不能绕过。完整设计见 `docs/agent-policy.md` 自我演化章节。运行链路：
+可选后台 tick。worker 由主进程注册，但 `EVOLUTION_ENABLED=false`（默认）时立即退出；显式设为 true 后仍需 workspace Mongo runtime flag 放行。auto_release 自动放行通道已于 2026-08-13 **物理删除**（原为政策硬闸恒压制的死代码，净删约 709 行）——release 恒为 admin 手动 + 二次确认串。完整设计见 `docs/agent-policy.md` 自我演化章节。运行链路：
 
 ```text
 [evolution::tick] 每 EVOLUTION_TICK_SECONDS 触发一次
@@ -151,6 +154,8 @@ POST /webhooks/wechat
 [evolution::threshold::generate]            [evolution::prompt::generate (Critic LLM)]
   │  按 THRESHOLD_REASONABLE_BANDS 决定         │  失败 cohort + 当前模板 → diff_snippet
   │  +step / -step                              │  validate_diffs（剥禁词 / 长度门）
+  │  （pressure_risk_block 因无终态统计源
+  │   不产候选，写 skip 事件——2026-08-13）
   ↓                                              ↓
 [Proposal] status=pending_eval ──────┬──────────┘
                                      ↓
@@ -159,8 +164,9 @@ POST /webhooks/wechat
                                      │  ❌ 不调 mcp_client
                                      │  ❌ 不写 conversation_messages
                                      ↓
-[evolution::significance] EVOLUTION_MIN_SEND_SUCCESS_DELTA / *_SELF_CRITIQUE_DELTA
+[evolution::significance] EVOLUTION_MIN_SEND_SUCCESS_DELTA
                                      │ + EVOLUTION_MAX_5GATE_HIT_INCREASE
+                                     │ + 安全闸放松反向门 EVOLUTION_MAX_SAFETY_REGRESSION_RATE（默认 0.0 零容忍）
                                      ↓
                           ┌──────── significance_passed? ────────┐
                           ↓                                       ↓
@@ -388,27 +394,29 @@ POST /webhooks/wechat
 ### Worker Flow（多 worker 并行）
 
 ```text
-`spawn_supervised` 在主进程最多注册 14 条 loop（部分由 env/interval/Mongo flag 立即关闭）：
+`spawn_supervised` 在主进程注册 16 条 loop（`src/supervisor.rs` `SUPERVISED_WORKERS`；部分由 env/interval/Mongo flag 立即关闭）：
 
 1. task_worker                          follow-up/durable inbound task，走同一 gateway
-2. import_worker                        异步知识导入 job
-3. outbox_dispatcher                    durable send claim / second gate / MCP / retry
-4. media_storage_reconciler             本地内容寻址媒体启动恢复与周期一致性扫描
-5. strategic_planner                    commitment due / silent followup（默认关）
-6. cold_contact_worker                  冷联系人重激活（默认关）
-7. silence_signal_worker                沉默删失信号（默认关）
-8. evolutionary_worker                  env + Mongo 双闸（默认关；发布仍人工）
-9. knowledge_digest_worker              日报合成（默认关）
-10. knowledge_task_worker               chat plannedSteps 长任务（默认 30s）
-11. catalog_rebuild_worker              documents.catalog_summary_persisted 增量重写（默认 3s）
-12. knowledge_feedback_worker           30d usage_stats / dynamic_confidence + structural lint
+2. inbound_reply_worker                 固定 250ms 轮询恢复入站积压（durable inbound reply 义务，含毒丸行隔离），并发默认 4
+3. import_worker                        异步知识导入 job
+4. outbox_dispatcher                    durable send claim / second gate / MCP / retry
+5. post_decision_worker                 发送后投影（画像/记忆/观察回放），独立预算，contact 级租约
+6. media_storage_reconciler             本地内容寻址媒体启动恢复与周期一致性扫描
+7. strategic_planner                    commitment due / silent followup（默认关）
+8. cold_contact_worker                  冷联系人重激活（默认关）
+9. silence_signal_worker                沉默删失信号（默认关）
+10. evolutionary_worker                 env + Mongo 双闸（默认关；发布恒人工）
+11. knowledge_digest_worker             日报合成（默认关）
+12. knowledge_task_worker               chat plannedSteps 长任务（默认 30s）
+13. catalog_rebuild_worker              documents.catalog_summary_persisted 增量重写（默认 3s）
+14. knowledge_feedback_worker           30d usage_stats / dynamic_confidence + structural lint
                                         + sweep_stale_signals + lessons_learned 14d 聚合
                                         （dynamic_confidence 带最小样本门 DYNAMIC_CONFIDENCE_MIN_SAMPLES；
                                          hit/block 标签默认取真实用户反应 outcome_status，按 run_id join
                                          decision_reviews，沉默删失排除——DYNAMIC_CONFIDENCE_REAL_OUTCOME_ENABLED
                                          默认 true，置 false 退回 reviewer 自评 review_approved 旧统计）
-13. ingest_worker                       active ingest source 条件抓取（默认关）
-14. management_command_sweeper           陈旧 Management 执行租约收敛为 execution_unknown
+15. ingest_worker                       active ingest source 条件抓取（默认关）
+16. management_command_sweeper          陈旧 Management 执行租约收敛为 execution_unknown
 ```
 
 所有长寿 worker 由持久 supervisor 控制：60 秒内连续 5 次快速 panic 后进入 `open` 熔断；管理员请求恢复后，多副本仅一个副本领取 probe，稳定 60 秒才闭合，probe panic 立即重开。

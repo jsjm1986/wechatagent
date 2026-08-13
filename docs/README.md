@@ -9,8 +9,9 @@
 3. [AI Agent 系统设计](ai-agent-system.md)
 4. [Agent 策略与自动化边界](agent-policy.md)
 5. [数据与接口设计原则](data-and-api.md)
-6. [开发路线图](development-roadmap.md)
-7. [前端设计系统](frontend-design-system.md)
+6. [知识 Wiki 方法论](knowledge-wiki.md)
+7. [开发路线图](development-roadmap.md)
+8. [前端设计系统](frontend-design-system.md)
 
 ## 当前阶段
 
