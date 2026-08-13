@@ -234,6 +234,8 @@ B11（真模型方法论：env-gated/瞬时 skip/非瞬时 panic/MCP 恒桩/判�
 
 另注两处**测试本身给出假信心**（非生产缺陷但属守护失效）：escalation_push_time_reassign 用例 1 与 autonomy_protocol_pbt P2（§3#5/#8），以及 dry_run_isolation 的幻影状态值（§3#7）。
 
+> **处置追记（2026-08-14 完善波）**：#14 已关闭——`update_run_envelope_terminal` 落地终态吸收 CAS（合法 from 集由 `is_valid_lifecycle_transition` 派生、legacy 行放行、迟到写 fail-soft 落 `run_envelope_lifecycle_transition_rejected` 审计事件），`run_envelope_integration` 新增吸收性与 legacy 回归两用例守护。#15 前半（hold 骚扰门零台账）已关闭——拦截分支落 `escalation_suppressed_by_push_policy` dedupe 审计事件；后半（delivery_unknown 滞留）此前已由线 A 关闭。此前波次已关闭：#1（deferred_wake 物理删除）、#2/#3（修复+测试）、#4（DIV-30 真回收测试）、#5/#9（线 C 落实）、#7（线 A 语义定案）、#8（线 C 修复）、#12 前半（线 C）、#16（DIV-31）、#17（线 B）。仍开放：#6（revision fallback 接线集成覆盖）、#10（dry-run 生产分支驱动）、#11（IDOR 结构地图）、#12 后半（EVO-2 released_by）、#13（官方不修）、#18（Multipart 工具限制）、#19（fast 契约既成语义）。
+
 ---
 
 ## 5. 需回写修正清单
