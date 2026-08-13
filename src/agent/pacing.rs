@@ -93,7 +93,10 @@ mod tests {
         // 1000 字（base=4000 + 35000）封顶在 max_ms + 6000 = 10000。
         assert_eq!(account_send_interval_ms(1.0, 1000, 4000, 1000), 10_000);
         // 恰好触顶边界：typing 把 total 顶到 10000 整。
-        assert_eq!(account_send_interval_ms(0.0, 1000, 4000, 9000 / 35 + 1), 10_000);
+        assert_eq!(
+            account_send_interval_ms(0.0, 1000, 4000, 9000 / 35 + 1),
+            10_000
+        );
     }
 
     #[test]

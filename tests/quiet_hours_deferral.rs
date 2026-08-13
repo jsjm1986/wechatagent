@@ -383,7 +383,10 @@ async fn explicit_buying_intent_bypasses_quiet_hours_deferral_on_transaction_pro
         "defer 的 run_at 应在醒来时刻（≥30min 之后），实际 {}",
         casual_task.run_at
     );
-    assert_eq!(count_bypass_events(&app.state, W_CASUAL, casual_msg).await, 0);
+    assert_eq!(
+        count_bypass_events(&app.state, W_CASUAL, casual_msg).await,
+        0
+    );
 
     // 对照二：非交易域即便命中购买短语也不豁免（词表门以 transaction_facts_enabled 为前置）。
     let nontx_task = find_reply_obligation(&app.state, W_NONTX, &nontx_contact.wxid).await;

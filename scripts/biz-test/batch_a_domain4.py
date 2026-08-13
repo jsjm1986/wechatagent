@@ -1,7 +1,8 @@
 """域④：卡片引荐（assist 开/关双路径）。
 
 assist 关(默认)→即便高价值信号也不发卡(全自治红线兜底);
-assist 开(contacts.domain_attributes.assist_mode_override="force_on")→高价值→名片入 outbox(referral_card_id,不真发)。
+assist 开(contacts.domain_attributes.assist_mode_override="force_on")→高价值→名片入 outbox，
+并经 loopback MCP stub 到达 sent。
 
 跑法：export DEPLOY_PASS=...; python scripts/biz-test/batch_a_domain4.py
 """
@@ -77,14 +78,26 @@ def main() -> None:
     run2_id = run2.get("run_id", "") if isinstance(run2, dict) else ""
     ob2 = _lib.outbox_for_run(WXID, run2_id)
     tier2 = _lib.ptier_events_for_run(WXID, run2_id)
-    forced_full = any(e.get("kind") == "ptier_forced_full" for e in tier2)
-    _lib.expect(forced_full, DOMAIN, "明确顾问请求先加载 Full 候选上下文",
+    loaded_full = _lib.ptier_loaded_full_context(tier2)
+    _lib.expect(loaded_full, DOMAIN, "明确顾问请求在终决策前加载 Full 候选上下文",
                 f"run_id={run2_id} events={tier2}", "high",
-                "Lean 停档会导致模型永远看不到带 cardId 的已审候选")
+                "既未强升也未升档到 Full，会导致模型看不到带 cardId 的已审候选")
     has_card = any(o.get("referral_card_id") == card_id for o in ob2)
-    _lib.expect(has_card, DOMAIN, "assist开+高价值→名片入 outbox(referral_card_id,不真发)",
+    _lib.expect(has_card, DOMAIN, "assist开+高价值→测试名片进入精确 run 的 outbox",
                 f"run_id={run2_id} card_id={card_id} outbox={ob2}", "high",
                 "Full 已加载已审候选但本轮未形成对应名片 Outbox")
+    card_delivery = (
+        _lib.wait_card_outbox_terminal(WXID, run2_id, card_id)
+        if has_card else {}
+    )
+    _lib.expect(
+        card_delivery.get("status") == "sent",
+        DOMAIN,
+        "同决策文本送达后测试名片仍保有授权并经 stub 送达",
+        f"run_id={run2_id} card_id={card_id} card_delivery={card_delivery}",
+        "critical",
+        "名片被 stale_task_claim 取消表示文本结算过早清除了同决策授权绑定",
+    )
     _lib.assert_llm_success_for_run(run2_id, "user.reply.fast.task", DOMAIN)
 
     print(f"[{DOMAIN}] 完成")

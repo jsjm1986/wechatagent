@@ -1286,6 +1286,12 @@ fn prompt_specs() -> Vec<PromptSpec> {
 - needsReview 只选择复盘深度，不决定是否审核：低风险常规轮填 false；高风险、知识不足或产品声明填 true。所有可发送正文仍会经过独立 Reviewer 和 ClaimGate。
 - shouldReply=true 时 replyText 不得为空。信息不足时先给能确定的部分，必要时只问一个关键问题。
 - 产品事实只能使用已注入的 verified 知识或产品目录；没有依据就保守澄清，不得编造。
+- 客户要求特殊折扣、合同变更、退款纠纷裁决、法律承诺或定制需求等必须额外授权的事项，
+  且当前上下文没有可直接执行的有效授权时，必须输出 escalationRequest.needed=true、
+  category=out_of_scope_decision，并写清 reason、questionForPrincipal 和可自主处理的
+  selfServiceablePart。不得擅自批准或拒绝，不得编造价格底线、成本、政策或决策结论。
+  replyText 只自然承接并推进可自主处理的部分，不得暴露幕后决策来源。
+- 客户仅要求找真人、客服或负责人，不等于事项本身超职权，不得因此单独触发请示。
 - replyText 作出时间承诺时必须同步填写 lastCommitment/commitment；正式承诺和 followUp 只会在文本确认送达后生效。
 - 素材、名片和请示仅在确有需要时输出，禁止编造候选 id。
 - 不要输出 profileUpdate、tags、customerStage、intentLevel、domainSignals、profileAttributes、nextBestAction、operatingMemoryUpdate、memoryCandidates、memoryUpdate、bayesianObservations 或 agentGeneratedSignals；这些由发送后的独立投影任务处理。
@@ -1325,7 +1331,15 @@ fn prompt_specs() -> Vec<PromptSpec> {
   "nextBestAction": {},
   "objectionsDetected": [],
   "operatingMemoryUpdate": {},
-  "memoryCandidates": [],
+  "memoryCandidates": [
+    {
+      "type": "fact",
+      "content": "一条原子化、可长期使用的信息",
+      "evidence": "客户原话或有上下文的行为证据",
+      "importance": 8,
+      "confidence": 8
+    }
+  ],
   "memoryWriteScore": 0,
   "consolidationNeeded": false,
   "memoryUpdate": "",
@@ -1337,7 +1351,16 @@ fn prompt_specs() -> Vec<PromptSpec> {
 - 标签只表示长期稳定属性，临时情绪、施压、投诉、要求真人或对抗行为不得固化为标签。
 - tagEvidenceTurns/stageEvidenceTurns 使用冻结对话窗口中从 0 开始的升序编号。
 - 阶段只有客户明确表达时才设置 stageExplicitIntent=true；弱推断必须保持 false。
-- memoryCandidates 最多 6 条，必须包含用户原话或行为证据；普通寒暄不写记忆。
+- memoryCandidates 最多 6 条；每条必须包含 type/content/evidence/importance/confidence。
+  默认行业 type 只能取 fact | preference | doNotDo | commitment | objection | openLoop |
+  conflict；若后附行业指引给出覆盖枚举，则以行业指引为准。evidence 必须保留客户原话或
+  有上下文的行为证据，importance/confidence 取 1–10。
+- 写 memoryCandidates 前先判断信息是否来自客户本人，是否为认真、明确、当前有效且对未来运营
+  有持续价值的陈述。玩笑、反讽、假设、试探、转述他人或无法确认的信息不得写入长期记忆。
+- 若客户高置信地修正当前 memoryCard 中同一属性，输出 type=conflict 的候选并保留客户原话
+  证据；memoryWriteScore、importance、confidence 均设为 8–10，consolidationNeeded=true。
+- 普通寒暄或没有新增长期信息时 memoryCandidates 必须返回空数组；上面的对象只定义单项结构，
+  不是要求每轮填充。
 - bayesianObservations 最多 6 条；禁止无证据猜测。
 - 若客户明确暗示可能已下单/付款，可在 agentGeneratedSignals 输出 kind=suspected_deal 的待核实弱信号；绝不直接认定成交。
 - 仅当出现关系性质的明确新证据时，可输出 kind=relationship_type 的建议；这是待审核信号，不直接生效。
@@ -2642,6 +2665,33 @@ mod reply_task_single_shot_tests {
         );
     }
 
+    #[test]
+    fn reply_task_routes_authorization_only_decisions_to_principal_channel() {
+        let specs = prompt_specs();
+        let task = specs
+            .iter()
+            .find(|spec| spec.key == "user.reply.fast.task")
+            .expect("user.reply.fast.task prompt spec 存在");
+
+        for required in [
+            "特殊折扣",
+            "合同变更",
+            "退款纠纷",
+            "法律承诺",
+            "定制需求",
+            "category=out_of_scope_decision",
+            "questionForPrincipal",
+            "selfServiceablePart",
+            "不得擅自批准或拒绝",
+            "不得编造价格底线",
+        ] {
+            assert!(
+                task.content.contains(required),
+                "决策请示语义契约缺少 {required}"
+            );
+        }
+    }
+
     /// 退役护栏：`user.reply.task` 完整版模板已从种子包移除（生产零消费，DIV-02）。
     /// 断言它不再被种入，防止后续改动把退役 spec 复活回种子包。
     #[test]
@@ -2811,6 +2861,55 @@ mod reply_schema_evidence_tests {
             task.content.contains("bayesianObservations"),
             "projection schema 缺 bayesianObservations——贝叶斯评估旁路无 LLM 输入"
         );
+    }
+
+    #[test]
+    fn projection_schema_defines_semantic_memory_correction_contract() {
+        let specs = prompt_specs();
+        let task = specs
+            .iter()
+            .find(|spec| spec.key == "user.projection.task")
+            .expect("user.projection.task prompt spec 存在");
+
+        for field in [
+            "\"type\": \"fact\"",
+            "\"content\":",
+            "\"evidence\":",
+            "\"importance\":",
+            "\"confidence\":",
+        ] {
+            assert!(
+                task.content.contains(field),
+                "projection memory candidate schema 缺字段 {field}"
+            );
+        }
+        for semantic_guard in [
+            "玩笑",
+            "反讽",
+            "假设",
+            "转述",
+            "conflict",
+            "consolidationNeeded",
+        ] {
+            assert!(
+                task.content.contains(semantic_guard),
+                "projection memory correction 缺语义门 {semantic_guard}"
+            );
+        }
+        for candidate_type in [
+            "fact",
+            "preference",
+            "doNotDo",
+            "commitment",
+            "objection",
+            "openLoop",
+            "conflict",
+        ] {
+            assert!(
+                task.content.contains(candidate_type),
+                "projection memory candidate 缺默认合法类型 {candidate_type}"
+            );
+        }
     }
 
     /// 子计划 3 Task 3：归并 Agent 须基于宽窗口对话重判标签，输出 reconfirmedTags /

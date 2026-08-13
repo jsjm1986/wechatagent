@@ -45,7 +45,7 @@ use serde_json::Value;
 use crate::error::{AppError, AppResult};
 use crate::models::{
     Contact, ConversationMessage, DomainProfile, MessageDirection, OperatingMemory,
-    OperationDomainConfig, OperationKnowledgeChunk, OperationPlaybook, Product,
+    OperationDomainConfig, OperationKnowledgeChunk, OperationPlaybook, Product, ReferralCard,
 };
 use crate::prompts;
 use crate::routes::AppState;
@@ -333,6 +333,7 @@ async fn run_independent_claim_gate(
     decision: &AgentDecision,
     knowledge_chunks: &[OperationKnowledgeChunk],
     active_products: &[Product],
+    referral_cards: &[ReferralCard],
     active_profile: &DomainProfile,
     evaluated_at: mongodb::bson::DateTime,
     run_id: Option<&str>,
@@ -364,12 +365,14 @@ Top-level requiresEvidence must equal whether any atomic claim requires evidence
             })
         })
         .collect::<Vec<_>>();
-    let evidence_catalog = build_claim_evidence_catalog(
+    let evidence_catalog = build_claim_evidence_catalog_for_evaluation(
         inbound,
         recent_messages,
         decision,
         knowledge_chunks,
         active_products,
+        referral_cards,
+        &contact.account_id,
         evaluated_at,
     );
     let user = serde_json::to_string(&serde_json::json!({
@@ -468,7 +471,13 @@ fn claim_has_explicit_negative_polarity(claim: &AtomicClaim) -> bool {
 }
 
 fn principal_decision_authorizes_claim(source: &Value, claim: &AtomicClaim) -> bool {
-    if claim.subject != ClaimSubject::Business {
+    // A principal decision can grant or deny a customer-specific business status
+    // (for example, this customer's one-time discount). Independent semantic
+    // entailment still decides whether the source actually supports the claim.
+    if !matches!(
+        claim.subject,
+        ClaimSubject::Business | ClaimSubject::Customer
+    ) {
         return false;
     }
     match source.get("authorizationMode").and_then(Value::as_str) {
@@ -476,6 +485,29 @@ fn principal_decision_authorizes_claim(source: &Value, claim: &AtomicClaim) -> b
         Some("deny_only") => claim_has_explicit_negative_polarity(claim),
         _ => false,
     }
+}
+
+fn selected_referral_evidence_source(
+    decision: &AgentDecision,
+    referral_cards: &[ReferralCard],
+    account_id: &str,
+) -> Option<Value> {
+    let directive = decision.namecard_to_send.as_ref()?;
+    let card = referral_cards.iter().find(|card| {
+        card.id
+            .map(|id| id.to_hex() == directive.card_id)
+            .unwrap_or(false)
+            && crate::agent::referral::validate_card_sendable(card, account_id)
+    })?;
+    Some(serde_json::json!({
+        "id": format!("approved_referral_card:{}", directive.card_id),
+        "sourceType": "approved_referral_card",
+        "displayName": card.display_name,
+        "sendTriggerHint": card.send_trigger_hint,
+        "targetStages": card.target_stages,
+        "tags": card.tags,
+        "authorityBoundary": "This current enabled, admin-approved card authorizes only sending this exact advisor card and describing that controlled referral action. It does not establish contract steps, required materials, prices, schedules, outcomes, or any other service fact."
+    }))
 }
 
 fn build_claim_evidence_catalog(
@@ -601,6 +633,30 @@ fn build_claim_evidence_catalog(
             "sku": product.sku,
             "authorityBoundary": "May support only the listed product identity, exact price, currency, and SKU; not capability, outcome, delivery, or guarantee."
         }));
+    }
+    sources
+}
+
+fn build_claim_evidence_catalog_for_evaluation(
+    inbound: &ConversationMessage,
+    recent_messages: &[ConversationMessage],
+    decision: &AgentDecision,
+    knowledge_chunks: &[OperationKnowledgeChunk],
+    active_products: &[Product],
+    referral_cards: &[ReferralCard],
+    account_id: &str,
+    evaluated_at: mongodb::bson::DateTime,
+) -> Vec<Value> {
+    let mut sources = build_claim_evidence_catalog(
+        inbound,
+        recent_messages,
+        decision,
+        knowledge_chunks,
+        active_products,
+        evaluated_at,
+    );
+    if let Some(source) = selected_referral_evidence_source(decision, referral_cards, account_id) {
+        sources.push(source);
     }
     sources
 }
@@ -877,6 +933,7 @@ fn harden_evidence_claims(verdict: &mut IndependentClaimVerdict, evidence_catalo
                     Some("principal_decision") => {
                         principal_decision_authorizes_claim(source, &authorization_claim)
                     }
+                    Some("approved_referral_card") => true,
                     _ => false,
                 }
             });
@@ -937,6 +994,15 @@ fn evidence_ref_authorized(
         // A verified knowledge source may support any subject, but semantic entailment remains
         // the independent AI gate's responsibility; code verifies source identity and status.
         Some("verified_knowledge") => true,
+        // A selected card becomes evidence only after server-side id/account/review/enable checks.
+        // Its authority is narrow: the controlled referral action, never product facts.
+        Some("approved_referral_card") => {
+            !claim.product_claim
+                && matches!(
+                    claim.subject,
+                    ClaimSubject::Business | ClaimSubject::ThirdParty
+                )
+        }
         // Catalog authority is deliberately narrow and additionally covered by exact server-side
         // product/price/SKU validation below.
         Some("active_product_catalog") => {
@@ -1457,6 +1523,7 @@ pub(crate) async fn evaluate_independent_claim_gate(
     decision: &AgentDecision,
     knowledge_chunks: &[OperationKnowledgeChunk],
     active_products: &[Product],
+    referral_cards: &[ReferralCard],
     active_profile: &DomainProfile,
     evaluated_at: mongodb::bson::DateTime,
     run_id: Option<&str>,
@@ -1464,12 +1531,14 @@ pub(crate) async fn evaluate_independent_claim_gate(
     let _stage_timer = super::run_audit::stage_timer("claim_gate");
     // Invocation ownership stays in the gateway. Never trust a marker inside
     // `claim_analysis`: that document originates from the reviewed model and could forge it.
-    let evidence_catalog = build_claim_evidence_catalog(
+    let evidence_catalog = build_claim_evidence_catalog_for_evaluation(
         inbound,
         recent_messages,
         decision,
         knowledge_chunks,
         active_products,
+        referral_cards,
+        &contact.account_id,
         evaluated_at,
     );
     let outcome = if decision.should_reply {
@@ -1482,6 +1551,7 @@ pub(crate) async fn evaluate_independent_claim_gate(
                 decision,
                 knowledge_chunks,
                 active_products,
+                referral_cards,
                 active_profile,
                 evaluated_at,
                 run_id,
@@ -1574,10 +1644,7 @@ pub(crate) const CLAIM_GATE_SKIPPED_RISK_CASUAL_LOW: &str = "claim_gate_skipped_
 /// 跳过消除的是纯空转调用。R5.4 硬门消费的 `claim_analysis.requiresProductKnowledge`
 /// 主源是 **Reviewer**（照跑不受影响）；ClaimGate 的 merge 只是并集增强，对空声明集
 /// 本就不改变判定。纯函数、无 IO，便于单测七条件矩阵。
-pub(crate) fn should_skip_claim_gate(
-    decision: &AgentDecision,
-    planner: &RunPlannerResult,
-) -> bool {
+pub(crate) fn should_skip_claim_gate(decision: &AgentDecision, planner: &RunPlannerResult) -> bool {
     decision.conversation_mode == "casual_relationship"
         && planner.risk_level == "low"
         && decision.knowledge_need == "not_required"
@@ -1615,6 +1682,7 @@ pub(crate) async fn ensure_independent_claim_gate(
     review: &mut DecisionReviewResult,
     knowledge_chunks: &[OperationKnowledgeChunk],
     active_products: &[Product],
+    referral_cards: &[ReferralCard],
     active_profile: &DomainProfile,
     evaluated_at: mongodb::bson::DateTime,
     run_id: Option<&str>,
@@ -1627,6 +1695,7 @@ pub(crate) async fn ensure_independent_claim_gate(
         decision,
         knowledge_chunks,
         active_products,
+        referral_cards,
         active_profile,
         evaluated_at,
         run_id,
@@ -1770,7 +1839,10 @@ mod casual_claim_gate_skip_tests {
             &[],
         ));
         assert!(review.approved, "跳过不得触发 hold");
-        assert!(!review.should_hold, "hold_for_claim_gate_failure 不得被误触发");
+        assert!(
+            !review.should_hold,
+            "hold_for_claim_gate_failure 不得被误触发"
+        );
         assert!(
             !review
                 .risks
@@ -1809,7 +1881,10 @@ mod casual_claim_gate_skip_tests {
             &mut review,
             &[],
         ));
-        assert!(review.should_hold, "candidate mismatch 必须保持 fail-closed");
+        assert!(
+            review.should_hold,
+            "candidate mismatch 必须保持 fail-closed"
+        );
     }
 
     #[test]
@@ -1832,10 +1907,12 @@ mod independent_claim_gate_contract_tests {
         unsupported_atomic_claims, AtomicClaim, CatalogClaim, ClaimSubject,
         IndependentClaimGateEvaluation, IndependentClaimVerdict,
     };
-    use crate::agent::types::{DecisionReviewResult, HOLD_CATEGORY_BLOCKED_BY_SAFETY_GUARD};
+    use crate::agent::types::{
+        DecisionReviewResult, NamecardDirective, HOLD_CATEGORY_BLOCKED_BY_SAFETY_GUARD,
+    };
     use crate::error::AppError;
-    use crate::models::{ConversationMessage, MessageDirection, Product};
-    use mongodb::bson::{doc, DateTime, Document};
+    use crate::models::{ConversationMessage, MessageDirection, Product, ReferralCard};
+    use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
     use serde_json::json;
 
     fn product(
@@ -2380,6 +2457,90 @@ mod independent_claim_gate_contract_tests {
     }
 
     #[test]
+    fn approved_selected_referral_card_authorizes_controlled_referral_claim() {
+        let card_id = ObjectId::parse_str("64a1f2c3e4b5a697889a0011").unwrap();
+        let card = ReferralCard {
+            id: Some(card_id),
+            workspace_id: "ws".to_string(),
+            account_id: Some("acct".to_string()),
+            target_wxid: "advisor".to_string(),
+            display_name: "王老师".to_string(),
+            send_trigger_hint: "客户明确要签约时引荐".to_string(),
+            target_stages: Vec::new(),
+            tags: vec!["签约".to_string()],
+            enabled: true,
+            review_status: "approved".to_string(),
+            review_note: None,
+            created_at: DateTime::now(),
+            updated_at: DateTime::now(),
+        };
+        let mut decision = crate::agent::types::AgentDecision::default();
+        decision.namecard_to_send = Some(NamecardDirective {
+            card_id: card_id.to_hex(),
+            reason: Some("客户明确要求顾问对接".to_string()),
+        });
+        let evaluated_at = DateTime::from_millis(100_000);
+        let inbound = ConversationMessage {
+            id: None,
+            workspace_id: "ws".to_string(),
+            account_id: "acct".to_string(),
+            contact_wxid: "customer".to_string(),
+            message_id: Some("message-1".to_string()),
+            dedupe_key: None,
+            direction: MessageDirection::Inbound,
+            content: "请安排顾问对接".to_string(),
+            msg_type: Some("text".to_string()),
+            media_ref: None,
+            raw: None,
+            is_synthetic_relay: false,
+            created_at: evaluated_at,
+        };
+        let catalog = super::build_claim_evidence_catalog_for_evaluation(
+            &inbound,
+            &[],
+            &decision,
+            &[],
+            &[],
+            &[card],
+            "acct",
+            evaluated_at,
+        );
+        let source = catalog
+            .iter()
+            .find(|item| item["sourceType"] == "approved_referral_card")
+            .unwrap();
+        let evidence_id = source["id"].as_str().unwrap().to_string();
+        let mut verdict = IndependentClaimVerdict {
+            requires_evidence: true,
+            reason: "controlled referral".to_string(),
+            claim_kinds: vec!["service_commitment".to_string()],
+            claims_complete: true,
+            claims: vec![AtomicClaim {
+                source_quote: "我把王老师的名片发给你".to_string(),
+                claim: "AI 将发送已审核的王老师名片".to_string(),
+                scope: "service_commitment".to_string(),
+                subject: ClaimSubject::Business,
+                product_claim: false,
+                requires_evidence: true,
+                evidence_refs: vec![evidence_id.clone()],
+                reason: "selected referral action".to_string(),
+            }],
+            has_catalog_claims: false,
+            catalog_coverage_complete: true,
+            has_non_catalog_evidence_claims: true,
+            catalog_claims: Vec::new(),
+        };
+        harden_evidence_claims(&mut verdict, &catalog);
+        assert_eq!(verdict.claims[0].evidence_refs, vec![evidence_id.clone()]);
+        assert!(super::evidence_ref_authorized(
+            &verdict.claims[0],
+            &evidence_id,
+            &verdict,
+            &catalog,
+        ));
+    }
+
+    #[test]
     fn transparent_check_promise_is_not_upgraded_to_service_delivery() {
         let claim = AtomicClaim {
             source_quote: "我先核对准确口径再回复你".to_string(),
@@ -2423,9 +2584,16 @@ mod independent_claim_gate_contract_tests {
             evidence_refs: vec!["principal_decision".to_string()],
             reason: "principal decision".to_string(),
         };
-        let customer_claim = AtomicClaim {
+        let customer_specific_business_claim = AtomicClaim {
             subject: ClaimSubject::Customer,
-            ..business_claim("客户已确认", "customer_history")
+            ..business_claim(
+                "这次特殊情况可以给你优惠500元",
+                "customer_specific_discount",
+            )
+        };
+        let third_party_claim = AtomicClaim {
+            subject: ClaimSubject::ThirdParty,
+            ..business_claim("第三方机构已经批准", "third_party_approval")
         };
         let empty_verdict = IndependentClaimVerdict {
             requires_evidence: true,
@@ -2478,8 +2646,18 @@ mod independent_claim_gate_contract_tests {
                 negative_allowed,
                 "verdict={verdict} negative"
             );
+            assert_eq!(
+                super::evidence_ref_authorized(
+                    &customer_specific_business_claim,
+                    "principal_decision",
+                    &empty_verdict,
+                    &catalog,
+                ),
+                positive_allowed,
+                "verdict={verdict} customer-specific business decision"
+            );
             assert!(!super::evidence_ref_authorized(
-                &customer_claim,
+                &third_party_claim,
                 "principal_decision",
                 &empty_verdict,
                 &catalog,
@@ -4256,6 +4434,9 @@ mod assist_yield_tests {
         let out = append_assist_yield(base.clone(), true);
         assert!(out.starts_with(&base), "让位段追加在末尾,不改原文");
         assert!(out.contains("专属顾问"));
+        assert!(out.contains("namecardToSend"));
+        assert!(out.contains("不得仅因出现第三方姓名"));
+        assert!(out.contains("boundaryPrivacySafety"));
         assert!(out.len() > base.len());
     }
 }
@@ -4919,7 +5100,11 @@ mod second_reviewer_fallback_tests {
             "wx_test",
         );
         assert!(review.approved);
-        assert!(review.risks.is_empty(), "调用失败路径不加 risk：{:?}", review.risks);
+        assert!(
+            review.risks.is_empty(),
+            "调用失败路径不加 risk：{:?}",
+            review.risks
+        );
     }
 
     /// second 合法输出且与主脑分歧：仍触发 single-shot revision（原有增益行为不回退）。

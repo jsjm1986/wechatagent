@@ -16,8 +16,7 @@ use serde::Deserialize;
 use crate::common::redline;
 
 /// 五个场景类别（与 fixture 文件名一一对应）。
-pub const GOLD_CATEGORIES: [&str; 5] =
-    ["casual", "objection", "pressure", "knowledge", "boundary"];
+pub const GOLD_CATEGORIES: [&str; 5] = ["casual", "objection", "pressure", "knowledge", "boundary"];
 
 /// 每类场景条数下限/上限（plan C1a：五类各 20-30 条）。
 pub const CATEGORY_MIN: usize = 20;
@@ -193,9 +192,7 @@ pub fn redline_violations(reply: &str, checks: &[String]) -> Vec<String> {
                 }
             }
             "no_absolute_promise" => {
-                if let Some(hit) =
-                    redline::first_unnegated_hit(reply, &ABSOLUTE_PROMISE_MARKERS)
-                {
+                if let Some(hit) = redline::first_unnegated_hit(reply, &ABSOLUTE_PROMISE_MARKERS) {
                     out.push(format!("no_absolute_promise:{hit}"));
                 }
             }

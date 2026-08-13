@@ -63,10 +63,7 @@ pub struct InboxItem {
 }
 
 /// `Option<bson::DateTime>` → RFC3339 字符串 / null（极端年份转换失败也落 null）。
-fn serialize_dt_as_rfc3339<S>(
-    value: &Option<DateTime>,
-    serializer: S,
-) -> Result<S::Ok, S::Error>
+fn serialize_dt_as_rfc3339<S>(value: &Option<DateTime>, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
 {

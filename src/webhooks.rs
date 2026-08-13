@@ -327,7 +327,8 @@ async fn emit_quiet_hours_bypass_event(
                     .to_string(),
                 details: message_id.map(|id| doc! { "message_id": id }),
                 created_at: DateTime::now(),
-                dedupe_key: message_id.map(|id| format!("quiet_hours_buying_bypass:{}", id.to_hex())),
+                dedupe_key: message_id
+                    .map(|id| format!("quiet_hours_buying_bypass:{}", id.to_hex())),
             },
             None,
         )
@@ -512,6 +513,25 @@ async fn advance_covered_watermark(
 /// edit may already have invalidated the old claim, and a newer inbound may already have refreshed
 /// the reusable task. The frozen watermark is still advanced, but the obligation is completed only
 /// when that watermark remains the latest inbound and no manual reply owns the contact.
+fn settled_ai_reply_update(inbound_id: ObjectId, inbound_created_at: DateTime) -> Document {
+    doc! {
+        "$set": {
+            "status": "sent",
+            "gateway_status": "agent_reply_delivered",
+            "covered_through_inbound_id": inbound_id,
+            "covered_through_inbound_created_at": inbound_created_at,
+            "updated_at": DateTime::now(),
+        },
+        // Keep the immutable claim + decision binding while this task is sent. Optional
+        // media/namecard rows belonging to the same decision may be materialized after the text
+        // batch was authorized and need these fields to inherit their outbox authorization marker.
+        // A newer inbound revives this deterministic task and clears both fields before re-claiming.
+        "$unset": {
+            "claimed_at": "", "next_retry_at": "", "error": "",
+        },
+    }
+}
+
 pub(crate) async fn settle_ai_reply_obligation(
     state: &AppState,
     task_id: ObjectId,
@@ -531,19 +551,7 @@ pub(crate) async fn settle_ai_reply_obligation(
                 "latest_inbound_created_at": inbound_created_at,
                 "manual_reply_run_id": { "$exists": false },
             },
-            doc! {
-                "$set": {
-                    "status": "sent",
-                    "gateway_status": "agent_reply_delivered",
-                    "covered_through_inbound_id": inbound_id,
-                    "covered_through_inbound_created_at": inbound_created_at,
-                    "updated_at": DateTime::now(),
-                },
-                "$unset": {
-                    "claim_token": "", "claimed_at": "", "outbox_decision_id": "",
-                    "next_retry_at": "", "error": "",
-                },
-            },
+            settled_ai_reply_update(inbound_id, inbound_created_at),
             None,
         )
         .await?;
@@ -3158,7 +3166,8 @@ mod webhook_sig_tests {
 
 #[cfg(test)]
 mod reply_obligation_tests {
-    use super::manual_outbox_settlement;
+    use super::{manual_outbox_settlement, settled_ai_reply_update};
+    use mongodb::bson::{oid::ObjectId, DateTime};
 
     fn statuses(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
@@ -3191,5 +3200,27 @@ mod reply_obligation_tests {
             manual_outbox_settlement(&statuses(&["canceled", "failed_terminal"])),
             Some(false)
         );
+    }
+
+    #[test]
+    fn ai_delivery_settlement_preserves_optional_send_authorization() {
+        let update = settled_ai_reply_update(ObjectId::new(), DateTime::now());
+        let set = update.get_document("$set").unwrap();
+        let unset = update.get_document("$unset").unwrap();
+
+        assert_eq!(set.get_str("status").unwrap(), "sent");
+        assert_eq!(
+            set.get_str("gateway_status").unwrap(),
+            "agent_reply_delivered"
+        );
+        assert!(
+            !unset.contains_key("claim_token"),
+            "sent task must retain the immutable claim for late media/namecard rows"
+        );
+        assert!(
+            !unset.contains_key("outbox_decision_id"),
+            "sent task must retain the decision binding for late media/namecard rows"
+        );
+        assert!(unset.contains_key("claimed_at"));
     }
 }

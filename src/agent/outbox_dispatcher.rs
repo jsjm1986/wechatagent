@@ -3370,6 +3370,17 @@ mod tests {
             ),
             TaskSendAuthorization::Authorized(Some("task-token".to_string()))
         );
+        assert_eq!(
+            classify_task_send_authorization(
+                "sent",
+                "task-token",
+                Some("task-token"),
+                true,
+                Some("task-token")
+            ),
+            TaskSendAuthorization::Authorized(Some("task-token".to_string())),
+            "late media/namecard rows retain authorization after text delivery"
+        );
         for stale in [
             classify_task_send_authorization(
                 "outbox_enqueued",
@@ -3610,11 +3621,10 @@ mod tests {
     /// 不适用客户 agent_status 门。
     #[test]
     fn contact_status_gate_passthrough_for_principal_kinds() {
-        assert!(check_contact_status_pure(
-            SOURCE_KIND_PRINCIPAL_ESCALATION,
-            &AgentStatus::Normal
-        )
-        .is_none());
+        assert!(
+            check_contact_status_pure(SOURCE_KIND_PRINCIPAL_ESCALATION, &AgentStatus::Normal)
+                .is_none()
+        );
         assert!(check_contact_status_pure(
             SOURCE_KIND_PRINCIPAL_CLARIFICATION,
             &AgentStatus::Normal

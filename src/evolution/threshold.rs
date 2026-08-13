@@ -464,7 +464,12 @@ async fn write_gate_skipped_event(
         dedupe_key: None,
     };
     if let Err(e) = state.db.events().insert_one(event, None).await {
-        tracing::warn!(?e, gate, reason, "write evolution_threshold_gate_skipped event failed");
+        tracing::warn!(
+            ?e,
+            gate,
+            reason,
+            "write evolution_threshold_gate_skipped event failed"
+        );
     }
 }
 

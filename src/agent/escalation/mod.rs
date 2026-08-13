@@ -240,7 +240,8 @@ pub(crate) async fn escalate_held_decision(
             contact_wxid: Some(contact.wxid.clone()),
             kind: "escalation_suppressed_by_push_policy".to_string(),
             status: "warning".to_string(),
-            summary: "hold 请示被推送保护策略拦截（今日 cap / 推送间隔 / 静默窗），未生成请示卡".to_string(),
+            summary: "hold 请示被推送保护策略拦截（今日 cap / 推送间隔 / 静默窗），未生成请示卡"
+                .to_string(),
             details: Some(doc! {
                 "principalWxid": &principal_wxid,
                 "pushesToday": today,
@@ -751,8 +752,8 @@ async fn apply_standing_order_if_due(
         authorization_window_hours: None,
         exemption_type: EXEMPTION_TYPE_NONE.to_string(),
     };
-    let resolved = resolve_escalation(state, entry, &decision, None, "standing_order_policy")
-        .await?;
+    let resolved =
+        resolve_escalation(state, entry, &decision, None, "standing_order_policy").await?;
     if resolved.is_none() {
         // 并发已被领导回复 / admin 裁决抢先 resolve → 幂等让路（议题已有真人裁决，
         // 本轮既不再应用底线也不再发链尾安抚）。

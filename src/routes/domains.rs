@@ -329,8 +329,7 @@ fn validate_standing_order_config(policy: &crate::models::AskHumanPolicy) -> Res
                 .to_string(),
         ),
         (None, Some(_)) => Err(
-            "配置了预授权底线生效时限但缺少口径文本（standingOrder），两者必须成对配置"
-                .to_string(),
+            "配置了预授权底线生效时限但缺少口径文本（standingOrder），两者必须成对配置".to_string(),
         ),
         (Some(text), Some(hours)) => {
             if text.trim().is_empty() {
@@ -741,10 +740,11 @@ mod tests {
         ))
         .is_ok());
         // 边界值：1 字符 / 2000 字符 / 8760 小时均合法。
-        assert!(
-            validate_standing_order_config(&policy_with_standing_order(Some("一"), Some(8760.0)))
-                .is_ok()
-        );
+        assert!(validate_standing_order_config(&policy_with_standing_order(
+            Some("一"),
+            Some(8760.0)
+        ))
+        .is_ok());
         let max_text = "字".repeat(2000);
         assert!(validate_standing_order_config(&policy_with_standing_order(
             Some(&max_text),
@@ -767,10 +767,11 @@ mod tests {
 
     #[test]
     fn standing_order_blank_or_oversized_text_is_rejected() {
-        assert!(
-            validate_standing_order_config(&policy_with_standing_order(Some("   "), Some(12.0)))
-                .is_err()
-        );
+        assert!(validate_standing_order_config(&policy_with_standing_order(
+            Some("   "),
+            Some(12.0)
+        ))
+        .is_err());
         let oversized = "字".repeat(2001);
         assert!(validate_standing_order_config(&policy_with_standing_order(
             Some(&oversized),

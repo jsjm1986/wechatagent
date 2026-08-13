@@ -33,7 +33,8 @@ use serde_json::json;
 use wechatagent::agent::handle_managed_message;
 use wechatagent::models::{AgentStatus, Contact, ConversationMessage, MessageDirection};
 
-const REVISED_REPLY: &str = "按修正方向收敛后的第二版回复：我们先把你最关心的场景确认下来，再谈节奏。";
+const REVISED_REPLY: &str =
+    "按修正方向收敛后的第二版回复：我们先把你最关心的场景确认下来，再谈节奏。";
 
 fn make_managed_contact(wxid: &str) -> Contact {
     let now = DateTime::now();

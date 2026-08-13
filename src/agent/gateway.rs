@@ -614,6 +614,7 @@ fn review_and_evaluate_claim_gate<'a>(
     run_id: &'a str,
     active_profile: &'a crate::models::DomainProfile,
     active_products: &'a [crate::models::Product],
+    referral_cards: &'a [crate::models::ReferralCard],
     reviewer_prompts: &'a ReviewerPromptCache,
     skip_claim_gate: bool,
 ) -> BoxFuture<
@@ -678,6 +679,7 @@ fn review_and_evaluate_claim_gate<'a>(
                 decision,
                 knowledge_chunks,
                 active_products,
+                referral_cards,
                 active_profile,
                 mongodb::bson::DateTime::now(),
                 Some(run_id),
@@ -890,6 +892,7 @@ async fn send_contact_message_gateway_inner(
         &run_id,
         &active_profile,
         &active_products,
+        &[],
         &reviewer_prompts,
         // 管理发送是 admin 手动指定文本，非 LLM 寒暄轮——ClaimGate 恒照跑。
         false,
@@ -3051,6 +3054,7 @@ fn run_user_operation_gateway_inner<'a>(
             &run_id,
             &active_profile,
             &active_products,
+            &referral_cards,
             &reviewer_prompts,
             skip_claim_gate,
         )
@@ -3189,6 +3193,7 @@ fn run_user_operation_gateway_inner<'a>(
                 &run_id,
                 &active_profile,
                 &active_products,
+                &referral_cards,
                 &reviewer_prompts,
                 // rewrite 由硬闸失败触发（幻觉/grounding），改写稿必须全量重评。
                 false,
@@ -3233,6 +3238,7 @@ fn run_user_operation_gateway_inner<'a>(
                 &mut review,
                 &selected_chunks,
                 &active_products,
+                &referral_cards,
                 &active_profile,
                 mongodb::bson::DateTime::now(),
                 Some(run_id.as_str()),
@@ -3461,6 +3467,7 @@ fn run_user_operation_gateway_inner<'a>(
                         &run_id,
                         &active_profile,
                         &active_products,
+                        &referral_cards,
                         &reviewer_prompts,
                         // revision 由 finalize 后的 revision trigger 触发，二稿全量重评。
                         false,
@@ -6198,6 +6205,13 @@ async fn upsert_pending_projection_observation(
     Ok(())
 }
 
+fn projection_contact_base_set(now: DateTime) -> Document {
+    // `last_agent_run_at` is the delivery-rate-limit anchor. It is advanced when a complete
+    // outbox batch is durably authorized and again on physical delivery; post-decision profile
+    // projection must not extend that window merely because its asynchronous LLM work finished.
+    doc! { "updated_at": now }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn apply_agent_updates(
     state: &AppState,
@@ -6212,10 +6226,7 @@ pub(crate) async fn apply_agent_updates(
     projection_guard: Option<ProjectionWriteGuard>,
 ) -> AppResult<AgentUpdateOutcome> {
     let _stage_timer = super::run_audit::stage_timer("profile_updates");
-    let mut set_doc = doc! {
-        "updated_at": DateTime::now(),
-        "last_agent_run_at": DateTime::now(),
-    };
+    let mut set_doc = projection_contact_base_set(DateTime::now());
 
     if let Some(profile) = &decision.profile_update {
         set_doc.insert("agent_profile", to_document(profile)?);
@@ -7859,6 +7870,18 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn post_decision_projection_does_not_move_delivery_rate_limit_anchor() {
+        let now = DateTime::from_millis(1_700_000_000_000);
+        let set_doc = projection_contact_base_set(now);
+
+        assert_eq!(set_doc.get_datetime("updated_at").copied(), Ok(now));
+        assert!(
+            !set_doc.contains_key("last_agent_run_at"),
+            "analytical projection must not extend the delivery anti-spam window"
+        );
+    }
 
     #[test]
     fn uncovered_inbound_watermark_filter_uses_timestamp_and_object_id() {

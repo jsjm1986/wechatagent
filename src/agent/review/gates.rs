@@ -68,6 +68,8 @@ pub(crate) fn build_reviewer_decision_view(decision: &AgentDecision) -> String {
         "safeClaimsUsed": decision.safe_claims_used.clone(),
         "usedKnowledgeIds": decision.used_knowledge_ids.clone(),
         "objectionsDetected": decision.objections_detected.clone(),
+        "namecardToSend": mongodb::bson::to_bson(&decision.namecard_to_send)
+            .unwrap_or(mongodb::bson::Bson::Null),
         "customerStage": decision.customer_stage.clone().unwrap_or_default(),
         "intentLevel": decision.intent_level.clone().unwrap_or_default(),
         "operationState": decision.operation_state.clone().unwrap_or_default(),
@@ -1583,7 +1585,7 @@ mod reviewer_decision_view_tests {
     //!   推理 Document 不进 reviewer 视图。
 
     use super::build_reviewer_decision_view;
-    use crate::agent::types::AgentDecision;
+    use crate::agent::types::{AgentDecision, NamecardDirective};
     use mongodb::bson::doc;
 
     fn decision_with_reasoning_filled() -> AgentDecision {
@@ -1611,6 +1613,10 @@ mod reviewer_decision_view_tests {
             safe_claims_used: vec!["c1".to_string()],
             used_knowledge_ids: vec!["k1".to_string()],
             objections_detected: vec!["price".to_string()],
+            namecard_to_send: Some(NamecardDirective {
+                card_id: "64a1f2c3e4b5a697889a0011".to_string(),
+                reason: Some("客户明确要求顾问对接".to_string()),
+            }),
             intent_analysis: doc! { "explanation": "should not leak" },
             next_best_action: doc! { "explanation": "should not leak" },
             operating_memory_update: doc! { "explanation": "should not leak" },
@@ -1700,6 +1706,11 @@ mod reviewer_decision_view_tests {
         assert!(
             view.contains("price"),
             "应保留 objectionsDetected: {}",
+            view
+        );
+        assert!(
+            view.contains("\"namecardToSend\"") && view.contains("64a1f2c3e4b5a697889a0011"),
+            "应保留待审核的受控名片动作: {}",
             view
         );
     }

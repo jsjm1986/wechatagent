@@ -32,6 +32,15 @@ REMOTE_RUN = REPO / "scripts" / "_remote_run.py"
 BIZ_PREFIX = "biztest_"
 FINDINGS = REPO / "docs" / "superpowers" / "specs" / "2026-06-26-full-business-logic-test-findings.md"
 BLOCKED_LEDGER = REPO / "target" / "biztest_blocked.jsonl"
+ENDPOINT_GLITCH_MARKERS = (
+    "llm_tool_use_instead_of_json",
+    "llm unavailable",
+    "network_error",
+    "external_error",
+    "llm http 5",
+    "body_decode_error",
+    "timeout",
+)
 
 # server 连接 env。DEPLOY_PORT 必须 22——_remote_run.py 默认 3003 是 app 端口，不是 SSH。
 os.environ.setdefault("DEPLOY_HOST", "117.72.54.28")
@@ -216,6 +225,44 @@ def domain_profile_identity(response: dict) -> tuple[str, int | None]:
     return object_id, version
 
 
+def restore_default_domain_profile_fallback() -> dict:
+    """Restore the legal zero-active-profile runtime without touching non-test profiles.
+
+    Domain-profile activation has no public "deactivate to built-in DEFAULT" endpoint. The
+    isolated industry suite may therefore restore an original zero-row baseline only by demoting
+    the currently active ``biztest_`` row and advancing the same cache generation used by the
+    production activation transaction.
+    """
+    result = mongo_json(
+        "(() => {"
+        "const active=db.domain_profiles.findOne({workspace_id:'default',is_active:true},"
+        "{_id:1,profile_id:1,workspace_id:1});"
+        "if(active===null)return {status:'already_default',modifiedCount:0};"
+        "if(typeof active.profile_id!=='string'||!active.profile_id.startsWith('biztest_'))"
+        "throw new Error('refusing to deactivate non-biztest profile');"
+        "const now=new Date();"
+        "const demoted=db.domain_profiles.updateOne("
+        "{_id:active._id,workspace_id:'default',profile_id:/^biztest_/,is_active:true},"
+        "{$set:{is_active:false,updated_at:now}});"
+        "if(demoted.matchedCount!==1||demoted.modifiedCount!==1)"
+        "throw new Error('active biztest profile changed during default restore');"
+        "db.configuration_generations.updateOne("
+        "{_id:'domain_profile\\u0000default'},"
+        "{$set:{namespace:'domain_profile',workspace_id:'default',updated_at:now},"
+        "$inc:{generation:Long(1)},$setOnInsert:{created_at:now}},{upsert:true});"
+        "const remaining=db.domain_profiles.countDocuments({workspace_id:'default',is_active:true});"
+        "if(remaining!==0)throw new Error('default fallback restore left an active profile');"
+        "return {status:'restored_default',modifiedCount:demoted.modifiedCount};"
+        "})()"
+    )
+    if not isinstance(result, dict) or result.get("status") not in (
+        "already_default",
+        "restored_default",
+    ):
+        raise RuntimeError(f"failed to restore default domain-profile fallback: {result}")
+    return result
+
+
 def bson_object_id(value: object) -> str:
     """Normalize mongosh Extended JSON ObjectId values without accepting empty identities."""
     if isinstance(value, dict):
@@ -223,6 +270,29 @@ def bson_object_id(value: object) -> str:
     if not isinstance(value, str) or len(value) != 24:
         return ""
     return value
+
+
+def bson_int(value: object) -> int | None:
+    """Normalize mongosh BSON Long JSON while preserving signed 64-bit semantics."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    if not isinstance(value, dict):
+        return None
+    low = value.get("low")
+    high = value.get("high")
+    unsigned = value.get("unsigned", False)
+    if (
+        not isinstance(low, int)
+        or isinstance(low, bool)
+        or not isinstance(high, int)
+        or isinstance(high, bool)
+        or not isinstance(unsigned, bool)
+    ):
+        return None
+    bits = ((high & 0xFFFFFFFF) << 32) | (low & 0xFFFFFFFF)
+    if not unsigned and bits >= (1 << 63):
+        bits -= 1 << 64
+    return bits
 
 
 def sign_webhook_body(secret: str, timestamp_ms: str, raw_body: bytes) -> str:
@@ -362,28 +432,22 @@ def run_log_count(wxid: str) -> int:
 
 
 def inflight_inbound(wxid: str, window_s: int = 200) -> int:
-    """该 contact 近 window_s 秒有几条 inbound 还没对应的终态 run log（疑似 runner 在跑）。
+    """Return this contact's open run-envelope count.
 
-    barge-in 抢占（gateway.rs:2091）：runner 决策审查完成、写库前若来了更新 inbound，
-    就放弃本轮交调度器重算，落 superseded_by_new_inbound。测试若在上一轮 runner 还在
-    后台跑时就发下一条，必触发抢占→上一轮 run 被中止、断言假阴（域④路径2 实证：
-    引荐话术 run 3a352fb2 被 superseded，名片没机会入 outbox）。
-
-    粗略判据：近窗口 inbound 数 > 该 contact 终态 run log 数 → 有未消化的 inbound，
-    runner 可能在跑。返回差值（>0 = 疑似 in-flight），供 send 前等空闲。
+    ``window_s`` remains for call compatibility. Current production inserts one run envelope
+    before the first LLM call and advances it from started/running into an absorbing terminal
+    lifecycle. Counting those open states is exact and avoids treating the placeholder row as
+    proof that the run already completed.
     """
-    since = int(time.time() * 1000) - window_s * 1000
-    n_in = mongo_json(
-        f'db.conversation_messages.countDocuments({{contact_wxid:"{wxid}",'
-        f'direction:"inbound",created_at:{{$gte:new Date({since})}}}})'
+    del window_s
+    if not wxid.startswith(BIZ_PREFIX):
+        raise ValueError(f"biz-test wxid must start with {BIZ_PREFIX}")
+    open_runs = mongo_json(
+        "db.agent_run_logs.countDocuments("
+        f"{{contact_wxid:{json.dumps(wxid)},"
+        "lifecycle:{$in:['started','running']}})"
     )
-    n_run = mongo_json(
-        f'db.agent_run_logs.countDocuments({{contact_wxid:"{wxid}",'
-        f'created_at:{{$gte:new Date({since})}}}})'
-    )
-    n_in = n_in if isinstance(n_in, int) else 0
-    n_run = n_run if isinstance(n_run, int) else 0
-    return max(0, n_in - n_run)
+    return open_runs if isinstance(open_runs, int) else 0
 
 
 def wait_contact_idle(wxid: str, max_wait: int = 320, poll: int = 12) -> bool:
@@ -430,7 +494,7 @@ def reply_window_remaining_ms(wxid: str) -> int:
     fallback = _default_min_reply_interval_seconds()
     value = mongo_json(
         "(() => { const contact=db.contacts.findOne("
-        f"{{wxid:{json.dumps(wxid)}}},{{last_outbound_at:1,_id:0}});"
+        f"{{wxid:{json.dumps(wxid)}}},{{last_agent_run_at:1,_id:0}});"
         "const config=db.operation_domain_configs.findOne("
         "{workspace_id:'default',domain:'user_operations',current_version:true},"
         "{runtime_parameters:1,_id:0});"
@@ -438,7 +502,7 @@ def reply_window_remaining_ms(wxid: str) -> int:
         "?config.runtime_parameters.minReplyIntervalSeconds:null;"
         f"const interval=Number.isInteger(configured)?configured:{fallback};"
         "if(interval<0||interval>3600) throw new Error('invalid minReplyIntervalSeconds');"
-        "const last=contact&&contact.last_outbound_at;"
+        "const last=contact&&contact.last_agent_run_at;"
         "return last instanceof Date"
         "?Math.max(0,interval*1000-(Date.now()-last.getTime())):0; })()"
     )
@@ -461,17 +525,18 @@ def wait_contact_reply_window(wxid: str, max_wait: int = 120) -> bool:
 
 
 def diagnose_no_run_log(wxid: str) -> dict:
-    """run log 不落时的根因取证：一次性查清"inbound 落了但 run log 不来"属于哪种路径。
+    """Exact-run timeout diagnostics for webhook persistence, open envelopes and failures.
 
-    后端实证（webhooks.rs / agent/gateway.rs）确认 run log **没有"必落"保证**——
-    它只在 gateway _inner 各终态点显式 write_agent_run_log，任一上游 `.await?` 抛错
-    （LLM 决策调用全失败最常见）会在到达写入点前 short-circuit，run log 永不产生，
-    只在 agent_events 留一条 agent_error。故 run1=None 必须用本函数区分：
+    Current production inserts a run envelope before any LLM call and closes ordinary errors or
+    panics through the envelope guard. A timeout can still mean the inbound never reached the
+    gateway, was deferred, or remains open, so dump all neighboring evidence without guessing.
+
+    区分：
       - agent_status != managed → 根本不 spawn runner（webhooks.rs:578，永不落，设计如此）
       - inbound 未落 conversation_messages → webhook 没进站（HMAC/appId/限流/dedup）
-      - agent_events 有 agent_error → gateway 抛错（多半 LLM 端点失败，标 BLOCKED 非 bug）
-      - agent_events 有 webhook_handler_panic → 后台 runner panic（catch_unwind 兜住，不落 run log）
-      - 以上都没有但 inbound 在 → 可能 quiet-hours defer（>600s 才醒）或仍在跑/端点超时
+      - run envelope 保持 started/running → 仍在跑或 worker 卡住
+      - agent_events 有 agent_error / panic → 结合 envelope 终态判断
+      - 以上都没有但 inbound 在 → 可能 quiet-hours defer
     返回一个 dict（各维度证据），同时打印便于直接看。
     """
     js = (
@@ -500,31 +565,36 @@ def diagnose_no_run_log(wxid: str) -> dict:
     return diag
 
 
-def wait_run(wxid: str, prev_count: int = 0, *, max_wait: int = 600, poll: int = 12,
+def wait_run(wxid: str, source_event_id: str, *, max_wait: int = 600, poll: int = 12,
              diagnose_on_timeout: bool = True) -> dict | None:
-    """轮询 agent_run_logs 直到该 contact 的 run log 数 > prev_count（一轮 webhook 处理完成）。
+    """Wait for the exact webhook source's run envelope to reach an absorbing lifecycle.
 
     webhook 后台 spawn 去抖 runner，一轮含 reaction+decision+review 多次真模型调用，
     rsxermu 单次 18-113s、并发≤2，最坏一轮 300s+，故固定 sleep 必假阴，必须轮询。
-    run log 是 gateway 跑完一轮后一次性 insert 的终态记录（无 started 占位行，
-    write_agent_run_log_with_finalize），所以"出现新 run log"=该轮已处理完成。
-    返回最新一条（run_id/lifecycle/final_review_status/status/outbox_status），超时返回 None。
+    Current gateway first inserts ``lifecycle=started`` and later mutates that same row. Bind the
+    unique webhook ``msgId`` through ``source_event_id`` and exclude started/running so neither a
+    placeholder nor another contact run can satisfy the wait.
 
-    用 time.time() 墙钟计时（不能用固定 poll 累加）：每轮 run_log_count 是一次
-    SSH+mongosh 往返(~10s)，远大于 poll，固定累加会让 max_wait 失真（实测 600 跑成 957s）。
+    用 time.time() 墙钟计时（不能用固定 poll 累加）：每轮查询有远程往返开销。
 
     超时返回 None 前默认跑 diagnose_no_run_log 取证（diagnose_on_timeout），把根因
-    （非 managed / 没进站 / agent_error / panic / quiet-defer）直接 dump 出来，
+    （非 managed / 没进站 / open envelope / agent_error / quiet-defer）直接 dump 出来，
     免得每次 run1=None 都要手工上 server 查。
     """
+    if not wxid.startswith(BIZ_PREFIX) or not source_event_id.startswith(BIZ_PREFIX):
+        raise ValueError("wait_run requires biztest_ contact and source event ids")
     deadline = time.time() + max_wait
     while time.time() < deadline:
-        if run_log_count(wxid) > prev_count:
-            rows = mongo_json(
-                f'db.agent_run_logs.find({{contact_wxid:"{wxid}"}},'
-                '{run_id:1,lifecycle:1,final_review_status:1,status:1,outbox_status:1,_id:0})'
-                '.sort({created_at:-1}).limit(1).toArray()'
-            )
+        rows = mongo_json(
+            "db.agent_run_logs.find("
+            f"{{contact_wxid:{json.dumps(wxid)},"
+            f"source_event_id:{json.dumps(source_event_id)},"
+            "lifecycle:{$nin:['started','running']}},"
+            "{run_id:1,lifecycle:1,final_review_status:1,status:1,outbox_status:1,"
+            "gateway_result:1,source_event_id:1,_id:0})"
+            ".sort({created_at:-1}).limit(1).toArray()"
+        )
+        if isinstance(rows, list) and rows:
             return rows[0] if isinstance(rows, list) and rows else {}
         time.sleep(poll)
     if diagnose_on_timeout:
@@ -551,9 +621,18 @@ def endpoint_glitch_recent(wxid: str) -> dict | None:
     if not (isinstance(rows, list) and rows):
         return None
     summary = str(rows[0].get("summary", ""))
-    markers = ("llm_tool_use_instead_of_json", "llm unavailable", "external_error",
-               "LLM HTTP 5", "body_decode_error", "timeout")
-    return rows[0] if any(m in summary for m in markers) else None
+    lowered = summary.lower()
+    return rows[0] if any(marker in lowered for marker in ENDPOINT_GLITCH_MARKERS) else None
+
+
+def run_endpoint_glitch(run: dict) -> str | None:
+    """Return the exact failed run's transient provider reason, if any."""
+    if run.get("status") != "internal_error":
+        return None
+    gateway = run.get("gateway_result")
+    reason = str(gateway.get("reason", "")) if isinstance(gateway, dict) else ""
+    lowered = reason.lower()
+    return reason if any(marker in lowered for marker in ENDPOINT_GLITCH_MARKERS) else None
 
 
 def send_and_wait(app_id: str, wxid: str, content: str, tag: str, *,
@@ -578,12 +657,23 @@ def send_and_wait(app_id: str, wxid: str, content: str, tag: str, *,
             raise RuntimeError(f"contact {wxid} did not become idle before send")
         if not wait_contact_reply_window(wxid):
             raise RuntimeError(f"contact {wxid} remained inside min reply interval")
-        prev = run_log_count(wxid)
-        send_webhook(app_id, wxid, content, f"biztest_{tag}_{int(time.time()*1000)}")
+        source_event_id = f"biztest_{tag}_{int(time.time()*1000)}"
+        send_webhook(app_id, wxid, content, source_event_id)
         # 端点故障重试时不重复 dump 诊断（最后一次失败才 dump）
-        run = wait_run(wxid, prev, max_wait=max_wait, poll=poll,
+        run = wait_run(wxid, source_event_id, max_wait=max_wait, poll=poll,
                        diagnose_on_timeout=(attempt >= endpoint_retries))
         if run is not None:
+            glitch = run_endpoint_glitch(run)
+            if glitch and attempt < endpoint_retries:
+                attempt += 1
+                print(
+                    f"[send_and_wait] {wxid} 已落 transient failed run"
+                    f"(第{attempt}/{endpoint_retries}次重试)，等{retry_gap}s避限流后重发。"
+                    f"run_id={run.get('run_id')} glitch={glitch[:120]}",
+                    flush=True,
+                )
+                time.sleep(retry_gap)
+                continue
             return run
         # 没落 run log：区分端点偶发故障（可重试）vs 其它根因（不重试）
         glitch = endpoint_glitch_recent(wxid)
@@ -629,6 +719,54 @@ def decision_review_for_run(wxid: str, run_id: str) -> dict:
     return rows[0] if isinstance(rows, list) and rows else {}
 
 
+def knowledge_route_for_run(wxid: str, run_id: str) -> dict:
+    """Return the persisted knowledge route bound to one exact run."""
+    if not wxid.startswith(BIZ_PREFIX):
+        raise ValueError(f"biz-test wxid must start with {BIZ_PREFIX}")
+    if not run_id.strip():
+        return {}
+    rows = mongo_json(
+        "db.agent_run_logs.find("
+        f"{{contact_wxid:{json.dumps(wxid)},run_id:{json.dumps(run_id)}}},"
+        "{run_id:1,status:1,knowledge_route:1,_id:0})"
+        ".sort({created_at:-1}).limit(1).toArray()"
+    )
+    return rows[0] if isinstance(rows, list) and rows else {}
+
+
+def memory_candidates_for_runs(wxid: str, run_ids: list[str]) -> list[dict]:
+    """Return projected memory candidates bound to exact parent run identities."""
+    if not wxid.startswith(BIZ_PREFIX):
+        raise ValueError(f"biz-test wxid must start with {BIZ_PREFIX}")
+    selected = [run_id for run_id in run_ids if isinstance(run_id, str) and run_id.strip()]
+    if not selected:
+        return []
+    rows = mongo_json(
+        "db.memory_candidates.find("
+        f"{{contact_wxid:{json.dumps(wxid)},run_id:{{$in:{json.dumps(selected)}}}}},"
+        "{run_id:1,source:1,status:1,candidates:1,memory_write_score:1,_id:0})"
+        ".sort({created_at:1}).toArray()"
+    )
+    return rows if isinstance(rows, list) else []
+
+
+def memory_candidate_texts(rows: list[dict]) -> list[str]:
+    """Extract semantic candidate text/evidence fields without numeric scores."""
+    texts: list[str] = []
+    for row in rows:
+        candidates = row.get("candidates", []) if isinstance(row, dict) else []
+        if not isinstance(candidates, list):
+            continue
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            for key in ("content", "evidence", "text", "value"):
+                value = candidate.get(key)
+                if isinstance(value, str) and value.strip():
+                    texts.append(value.strip())
+    return texts
+
+
 def wait_review_status(wxid: str, run_id: str, statuses: set[str], *, max_wait: int = 180,
                        poll: int = 5) -> dict:
     """Wait until an exact review reaches a dispatcher-backed status such as ``sent``."""
@@ -641,6 +779,20 @@ def wait_review_status(wxid: str, run_id: str, statuses: set[str], *, max_wait: 
     return decision_review_for_run(wxid, run_id)
 
 
+def active_memory_consolidation_task(wxid: str, account_id: str) -> dict:
+    """Return the exact contact/account's current durable auto-consolidation task."""
+    if not wxid.startswith(BIZ_PREFIX):
+        raise ValueError(f"biz-test wxid must start with {BIZ_PREFIX}")
+    rows = mongo_json(
+        "db.agent_tasks.find("
+        f"{{contact_wxid:{json.dumps(wxid)},account_id:{json.dumps(account_id)},"
+        "kind:'memory_consolidation',status:{$in:['pending','running','committing','retry']}},"
+        "{status:1,gateway_status:1,claim_generation:1,prepared_commit:1,_id:1})"
+        ".sort({created_at:-1}).limit(1).toArray()"
+    )
+    return rows[0] if isinstance(rows, list) and len(rows) == 1 else {}
+
+
 def memory_task_evidence(task_id: str) -> dict:
     """Read one exact manual consolidation task and its prepared/committed run identity."""
     if not task_id.strip():
@@ -650,7 +802,24 @@ def memory_task_evidence(task_id: str) -> dict:
         f"{{_id:ObjectId({json.dumps(task_id)})}},"
         "{status:1,gateway_status:1,claim_generation:1,prepared_commit:1,_id:1}).limit(1).toArray()"
     )
-    return rows[0] if isinstance(rows, list) and len(rows) == 1 else {}
+    if not (isinstance(rows, list) and len(rows) == 1 and isinstance(rows[0], dict)):
+        return {}
+    task = rows[0]
+    generation = bson_int(task.get("claim_generation"))
+    if generation is not None:
+        task["claim_generation"] = generation
+    return task
+
+
+def wait_memory_task_terminal(task_id: str, *, max_wait: int = 300, poll: int = 5) -> dict:
+    """Wait for one exact automatic or manual consolidation task terminal."""
+    deadline = time.time() + max_wait
+    while time.time() < deadline:
+        task = memory_task_evidence(task_id)
+        if task.get("status") in {"sent", "failed", "cancelled"}:
+            return task
+        time.sleep(poll)
+    return memory_task_evidence(task_id)
 
 
 def memory_commit_events(task_id: str, claim_generation: int) -> list[dict]:
@@ -666,6 +835,24 @@ def memory_commit_events(task_id: str, claim_generation: int) -> list[dict]:
     return rows if isinstance(rows, list) else []
 
 
+def memory_discarded_texts(events: list[dict]) -> list[str]:
+    """Return explicit fact texts discarded by exact memory completion audits."""
+    texts: list[str] = []
+    for event in events:
+        if not isinstance(event, dict) or event.get("kind") != "memory_consolidated":
+            continue
+        details = event.get("details")
+        discarded = details.get("discarded", []) if isinstance(details, dict) else []
+        if not isinstance(discarded, list):
+            continue
+        texts.extend(
+            item.strip()
+            for item in discarded
+            if isinstance(item, str) and item.strip()
+        )
+    return texts
+
+
 def wait_projection_terminal(wxid: str, run_id: str, *, max_wait: int = 300,
                              poll: int = 5) -> dict:
     """Wait for the exact decision review's asynchronous post-decision projection terminal."""
@@ -677,6 +864,14 @@ def wait_projection_terminal(wxid: str, run_id: str, *, max_wait: int = 300,
             return review
         time.sleep(poll)
     return decision_review_for_run(wxid, run_id)
+
+
+def projection_model_contract_failure(review: dict) -> bool:
+    """Whether a real projection call terminally returned the wrong JSON shape."""
+    return (
+        review.get("post_decision_status") == "failed_terminal"
+        and review.get("post_decision_error_kind") == "invalid_projection"
+    )
 
 
 def relationship_suggestions_for_run(contact_id: str, run_id: str) -> list[dict]:
@@ -824,10 +1019,32 @@ def outbox_for_run(wxid: str, run_id: str) -> list[dict]:
     rows = mongo_json(
         "db.agent_send_outbox.find("
         f"{{contact_wxid:{json.dumps(wxid)},run_id:{json.dumps(run_id)}}},"
-        "{run_id:1,media_asset_id:1,referral_card_id:1,content:1,status:1,_id:0})"
+        "{run_id:1,media_asset_id:1,referral_card_id:1,content:1,status:1,"
+        "cancel_reason:1,last_error:1,attempt:1,_id:0})"
         ".sort({_id:1}).toArray()"
     )
     return rows if isinstance(rows, list) else []
+
+
+def wait_card_outbox_terminal(wxid: str, run_id: str, card_id: str, *,
+                              max_wait: int = 180, poll: int = 2) -> dict:
+    """Wait for one exact run/card outbox row to reach a closed delivery state."""
+    terminal = {"sent", "failed_terminal", "canceled", "delivery_unknown"}
+    deadline = time.time() + max_wait
+    latest: dict = {}
+    while time.time() < deadline:
+        rows = outbox_for_run(wxid, run_id)
+        latest = next(
+            (
+                row for row in rows
+                if isinstance(row, dict) and row.get("referral_card_id") == card_id
+            ),
+            {},
+        )
+        if latest.get("status") in terminal:
+            return latest
+        time.sleep(poll)
+    return latest
 
 
 def ptier_events_for_run(wxid: str, run_id: str) -> list[dict]:
@@ -843,6 +1060,31 @@ def ptier_events_for_run(wxid: str, run_id: str) -> list[dict]:
         "{kind:1,details:1,_id:0}).sort({_id:1}).toArray()"
     )
     return rows if isinstance(rows, list) else []
+
+
+def ptier_loaded_full_context(events: list[dict]) -> bool:
+    """Whether the run reached Full through either valid progressive-tier branch."""
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        if event.get("kind") == "ptier_forced_full":
+            return True
+        details = event.get("details")
+        if (
+            event.get("kind") == "ptier_escalated"
+            and isinstance(details, dict)
+            and str(details.get("target_tier", "")).lower() == "full"
+        ):
+            return True
+    return False
+
+
+def ptier_requested_clarification(events: list[dict]) -> bool:
+    """Whether the Lean decision took the valid clarification branch."""
+    return any(
+        isinstance(event, dict) and event.get("kind") == "ptier_clarify"
+        for event in events
+    )
 
 
 def llm_logs_since(seconds: int, prompt_key: str | None = None) -> list[dict]:
@@ -878,17 +1120,28 @@ def assert_llm_success(seconds: int, prompt_key: str, domain: str) -> bool:
 
 
 def assert_llm_success_for_run(run_id: str, prompt_key: str, domain: str) -> bool:
-    """Require one successful LLM ledger row bound to the exact durable run identity."""
+    """Require one successful LLM ledger row bound to the exact durable run identity.
+
+    The dispatcher can mark an outbox row sent just before the Gateway settle path flushes its
+    in-memory LLM audit batch. Poll that short durability window instead of racing the flush.
+    """
     if not run_id.strip():
         return expect(False, domain, f"{prompt_key} 有非空 run identity", "run_id is empty", "high")
-    logs = mongo_json(
-        "db.llm_call_logs.find("
-        f"{{run_id:{json.dumps(run_id)},prompt_key:{json.dumps(prompt_key)}}},"
-        "{run_id:1,prompt_key:1,status:1,final_status:1,model:1,_id:0})"
-        ".sort({_id:-1}).toArray()"
-    )
-    logs = logs if isinstance(logs, list) else []
-    ok = any(row.get("status") in ("success", "cache_hit") for row in logs)
+    logs: list[dict] = []
+    ok = False
+    for attempt in range(16):
+        rows = mongo_json(
+            "db.llm_call_logs.find("
+            f"{{run_id:{json.dumps(run_id)},prompt_key:{json.dumps(prompt_key)}}},"
+            "{run_id:1,prompt_key:1,status:1,final_status:1,model:1,_id:0})"
+            ".sort({_id:-1}).toArray()"
+        )
+        logs = rows if isinstance(rows, list) else []
+        ok = any(row.get("status") in ("success", "cache_hit") for row in logs)
+        if ok:
+            break
+        if attempt < 15:
+            time.sleep(1)
     return expect(
         ok,
         domain,
