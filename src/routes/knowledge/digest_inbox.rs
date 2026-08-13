@@ -338,6 +338,20 @@ fn inbox_pending_review_priority(chunk_type: &str) -> &'static str {
     }
 }
 
+/// Inbox 卡片硬编码文案的单一来源：构卡处与禁词防御测试
+/// （`inbox_static_strings_have_no_forbidden_words`）引用同一组常量，
+/// 文案修改自动落入禁词防御，不再出现"测试锁旧文案副本"的漂移。
+/// 新增 inbox 硬编码文案时必须在此定义并加入该测试的候选表。
+const COPY_HUMAN_AUDIT_TITLE_PREFIX: &str = "AI预审通过待复核：";
+const COPY_NEGATIVE_EXAMPLE_TITLE_PREFIX: &str = "待审反例：";
+const COPY_PENDING_REVIEW_TITLE_PREFIX: &str = "待审切片：";
+const COPY_NEGATIVE_EXAMPLE_SUMMARY: &str = "AI 从 reviewer 误判信号入队，等运营 admin 二次确认。";
+const COPY_PENDING_REVIEW_SUMMARY: &str = "AI 起草，等运营确认。";
+const COPY_QUOTE_MISSING_TITLE_PREFIX: &str = "补原文出处：";
+const COPY_QUOTE_MISSING_SUMMARY: &str = "AI 检测到该切片缺原文出处，无法通过验证。";
+const COPY_ANCHORS_MISSING_TITLE_PREFIX: &str = "修复原文锚点：";
+const COPY_ANCHORS_MISSING_SUMMARY: &str = "AI 检测到该切片原文定位锚点为空，需要重新锚定。";
+
 /// KB-08：pending_review 卡片的 title/origin。needs_human_audit = auto_verify 预审通过待人复核,
 /// 与 needs_review(未审/反例) 区分。返回 (title, origin)。
 fn pending_review_card_labels(
@@ -347,18 +361,18 @@ fn pending_review_card_labels(
 ) -> (String, String) {
     if integrity_status == "needs_human_audit" {
         return (
-            format!("AI预审通过待复核：{base_title}"),
+            format!("{COPY_HUMAN_AUDIT_TITLE_PREFIX}{base_title}"),
             "human_audit_pending".to_string(),
         );
     }
     if is_negative_example {
         return (
-            format!("待审反例：{base_title}"),
+            format!("{COPY_NEGATIVE_EXAMPLE_TITLE_PREFIX}{base_title}"),
             "negative_example_review".to_string(),
         );
     }
     (
-        format!("待审切片：{base_title}"),
+        format!("{COPY_PENDING_REVIEW_TITLE_PREFIX}{base_title}"),
         "pending_review".to_string(),
     )
 }
@@ -498,9 +512,9 @@ pub(in crate::routes) async fn knowledge_inbox(
                 title: card_title,
                 context_summary: c.summary.clone().unwrap_or_else(|| {
                     if is_negative_example {
-                        "AI 从 reviewer 误判信号入队，等运营 admin 二次确认。".into()
+                        COPY_NEGATIVE_EXAMPLE_SUMMARY.into()
                     } else {
-                        "AI 起草，等运营确认。".into()
+                        COPY_PENDING_REVIEW_SUMMARY.into()
                     }
                 }),
                 target_chunk_id: Some(chunk_id_hex.clone()),
@@ -517,8 +531,8 @@ pub(in crate::routes) async fn knowledge_inbox(
                 id: format!("chunk:{}:quote", chunk_id_hex),
                 priority: "high".into(),
                 kind: "fill_field".into(),
-                title: format!("补原文出处：{}", title),
-                context_summary: "AI 检测到该切片缺原文出处，无法通过验证。".into(),
+                title: format!("{COPY_QUOTE_MISSING_TITLE_PREFIX}{title}"),
+                context_summary: COPY_QUOTE_MISSING_SUMMARY.into(),
                 target_chunk_id: Some(chunk_id_hex.clone()),
                 target_pack_id: None,
                 suggested_actions: vec!["open_chat".into(), "open_repair".into()],
@@ -535,8 +549,8 @@ pub(in crate::routes) async fn knowledge_inbox(
                 id: format!("chunk:{}:anchor", chunk_id_hex),
                 priority: "high".into(),
                 kind: "repair_chunk".into(),
-                title: format!("修复原文锚点：{}", title),
-                context_summary: "AI 检测到该切片原文定位锚点为空，需要重新锚定。".into(),
+                title: format!("{COPY_ANCHORS_MISSING_TITLE_PREFIX}{title}"),
+                context_summary: COPY_ANCHORS_MISSING_SUMMARY.into(),
                 target_chunk_id: Some(chunk_id_hex.clone()),
                 target_pack_id: None,
                 suggested_actions: vec!["open_chat".into(), "open_repair".into()],
@@ -714,7 +728,8 @@ mod tests {
     }
 
     /// 文案防御：inbox 路径输出文案不应携带禁词。
-    /// 当前涉及到的硬编码标题前缀与 contextSummary 模板都在这里集中校验。
+    /// candidates 直接引用生产构卡常量（单一文案源，见 `COPY_*` 定义处）——
+    /// 生产文案改动自动落入本防御；新增 inbox 硬编码文案须同步加入本表。
     #[test]
     fn inbox_static_strings_have_no_forbidden_words() {
         let cn1: String = ['人', '工', '接', '管'].iter().collect();
@@ -723,12 +738,15 @@ mod tests {
         let en2: String = ['h', 'a', 'n', 'd', '-', 'o', 'f', 'f'].iter().collect();
         let forbidden = [cn1, cn2, en1, en2];
         let candidates = [
-            "待审切片：",
-            "AI 起草，等运营确认。",
-            "补原文出处：",
-            "AI 检测到该切片缺 sourceQuote，无法通过验证。",
-            "修复原文锚点：",
-            "AI 检测到该切片 sourceAnchors 为空，需要重新锚定。",
+            COPY_HUMAN_AUDIT_TITLE_PREFIX,
+            COPY_NEGATIVE_EXAMPLE_TITLE_PREFIX,
+            COPY_PENDING_REVIEW_TITLE_PREFIX,
+            COPY_NEGATIVE_EXAMPLE_SUMMARY,
+            COPY_PENDING_REVIEW_SUMMARY,
+            COPY_QUOTE_MISSING_TITLE_PREFIX,
+            COPY_QUOTE_MISSING_SUMMARY,
+            COPY_ANCHORS_MISSING_TITLE_PREFIX,
+            COPY_ANCHORS_MISSING_SUMMARY,
         ];
         for s in &candidates {
             for w in &forbidden {
