@@ -167,7 +167,7 @@ These are enforced by `guards/`, `review/`, and the gateway. Removing any of the
 
 ## Prompt + knowledge conventions
 
-Prompts are layered (Soul → System Contract → Policy → Business Context → Operator Instruction) and versioned in `prompt_templates` / `agent_souls` / `operation_playbooks`. Run logs record `promptVersions`. `prompts::ensure_prompt_pack_v2` seeds the v2 default pack at startup. The `reset-system-pack` route physically deletes and re-seeds — it is an explicit maintenance action, **not** an idempotent every-startup overwrite (would clobber operator edits).
+Prompts are layered (Soul → System Contract → Policy → Business Context → Operator Instruction) and versioned in `prompt_templates` / `agent_souls` / `operation_playbooks`. Run logs record `promptVersions`. `prompts::ensure_prompt_pack_v2` seeds the v2 default pack at startup. The `reset-system-pack` route physically deletes and re-seeds `prompt_templates` / `operation_playbooks` / `operation_domain_configs`（Soul 例外：不可变历史保留，以追加新内置版本 + 原子指针切换方式恢复，见 `prompts.rs::reset_prompt_pack_v2_as_actor`）— it is an explicit maintenance action, **not** an idempotent every-startup overwrite (would clobber operator edits).
 
 Knowledge is progressive-disclosure（catalog → search → open_slice），但注意归属：user-ops 主决策是**单发**调用、不带工具中间轮（LLM 误吐 `tool_calling` 相位会被 gateway 强制转 final 并记 degraded）；知识由 gateway 在决策**前**经 `agent/knowledge_router.rs` 预路由，多轮工具循环发生在路由内部（`knowledge_agent`）。catalog → search → open_slice 的 tool-calling 循环形态服务于管理台 chat（`agent/chat_tool_loop.rs`，永不写库、不进 outbox）。
 
