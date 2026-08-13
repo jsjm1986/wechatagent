@@ -68,9 +68,14 @@ fn seed_chunk(workspace_id: &str, idx: usize) -> OperationKnowledgeChunk {
         title: format!("待审知识切片-{idx}"),
         body: Some(format!("正文内容-{idx}:这是一条需要核验的运营知识。")),
         summary: Some(format!("摘要-{idx}")),
-        // D2/证据齐备:非空 source_quote + 非空 source_anchors。
+        // D2/证据齐备:非空 source_quote + 可引用 source_anchors。
+        // 锚点必须带非空 `sourceQuote` 键——B3 后 `chunk_evidence_flags` 走
+        // `chunk_has_citable_anchor`（citable 口径），只有定位字段的畸形锚不算证据。
         source_quote: Some(format!("原文引用-{idx}:客户提出的问题原话。")),
-        source_anchors: vec![doc! { "quote": format!("原文引用-{idx}"), "start": 0i32 }],
+        source_anchors: vec![doc! {
+            "sourceQuote": format!("原文引用-{idx}:客户提出的问题原话。"),
+            "start": 0i32,
+        }],
         integrity_status: Some("needs_review".to_string()),
         confidence_score: Some(50),
         status: "active".to_string(),
