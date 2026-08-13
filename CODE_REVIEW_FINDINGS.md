@@ -4,6 +4,18 @@
 > 方法：源码阅读 + `rg` 双向引用追踪 + 现有测试反证检查。`cargo check --all-targets` 在 `-Dwarnings` 下干净通过。
 > 复核补充：当前工作区已运行 `cargo test --lib`，结果为 **2,351 passed / 0 failed**，4 组 PBT 为 **41 passed / 0 failed**；前端 Vitest 为 **125 files / 616 tests passed**，production build 通过；Rust `-D warnings` 全目标检查、Evolution 隔离与治理门均通过。CI 定义的 Knowledge evidence 5 条及 Tenant isolation 3 条 Docker/testcontainers hard gate 已在本机真实执行并全部通过。
 > 全量 ignored soft suite 在首次全目标链接期间使 `target/` 膨胀至约 34 GiB、磁盘逼近写满，已主动中止并用 `cargo clean` 恢复；因此不能记为全量 integration 通过。真实 LLM/MCP/微信链路、GitHub Actions 和生产迁移演练仍未执行，本台账不等同于部署验收。
+>
+> **2026-08-13 处置追记（优化工程四波后核对）**：本台账既有条目状态经四波（线 A–E + S5）复核
+> 无回退。两条相关新事实：①「已验证正确的关键红线」表中"自动发布不可绕过"一行引用的
+> `auto_release.rs:40,44,57` 已失效——`evolution::auto_release` 模块于优化线 C **整体物理删除**，
+> 该红线从"编译期 const false 压制"升级为"机制不存在"（管理 API 仍拒写 workspace 子闸 true，
+> `src/routes/evolution.rs`）；② 演化器 pressure gate 统计源失真（本台账未单列，见
+> `PROJECT_UNDERSTANDING_LEDGER.md` 第五部分缺陷 #16）已终裁修复：`blocked_by_safety_guard`
+> 终态不归因任何 gate，pressure 阈值候选停产（`src/evolution/threshold.rs`）。
+> 仍开放项如实保留、四波未动：`AUTH-02`、`WK-02`、`S3-18`、`S3-32`；设计选择类
+> `S2-07` / `S2-10` / `S3-08` / `S3-11` / `S3-16` / `S3-17` / `S3-26`–`S3-29` 未动；**HC-001 生产
+> 凭证轮换 8 项硬门依旧是最高优先运维待办**。基线现状（2026-08-13 S5 终态）：lib 2562 / 四 PBT 41 /
+> 前端 750。
 
 ## 当前结论
 
