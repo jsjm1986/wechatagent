@@ -1650,6 +1650,24 @@ pub struct KnowledgeRouteResult {
     /// 按「非回填」处理，与本改动前的行为一致。
     #[serde(default)]
     pub selected_chunks_are_fallback: bool,
+    /// B5（知识窗口错位修复）：agent 引用并经 DB 直查复核的**窗外** chunk 完整文档。
+    ///
+    /// 为什么需要携带：运行时静态窗口（`load_operation_knowledge`）只装 top-200
+    /// （priority/updated_at 倒排），而 knowledge_agent 的 `open_chunk` 按 `_id`
+    /// 直查、不受窗口限制——agent 完全可能合法引用第 201 名的 verified chunk。
+    /// 此前 router 把 cited 与窗口求交，窗外引用被当成"不在 corpus"降格成
+    /// fallback 弱回填；修复后由本字段携带窗外文档，
+    /// `select_operation_knowledge_chunks` 在窗内查不到该 id 时从这里补齐，使
+    /// prompt 注入与 `compute_verified_chunks`（R5.4 产品背书）拿到同一批文档。
+    /// 装入前已按与窗口逐字同口径的过滤（workspace + domain + status=active +
+    /// integrity_status=verified + account 归属）复核，verified-only 语义只增真。
+    ///
+    /// `#[serde(skip)]`：纯运行时载体，不进任何序列化面（`to_document` →
+    /// knowledge_usage_logs.route_result / run_envelope.knowledge_route /
+    /// simulation 报告 / AgentDecision.knowledge_route），持久化形状零变化；
+    /// 反序列化时恒为默认空 Vec（R11 安全）。
+    #[serde(skip)]
+    pub cited_verified_chunks: Vec<OperationKnowledgeChunk>,
 }
 
 /// 自学习采集管道 S4：单条被选 chunk 的召回倾向快照。
