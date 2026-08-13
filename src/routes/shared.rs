@@ -1054,6 +1054,12 @@ fn current_user_operations_domain_filter(workspace_id: &str) -> Document {
     }
 }
 
+/// 组装 guide preview 的 LLM prompt。
+///
+/// 注意：prompt 要求 LLM 输出的 `readableChanges`（业务话术）在 preview 响应侧
+/// **被丢弃**——`guides.rs` 的 preview handler 用 `frozen_plan.authoritative_changes`
+/// 的 `"{target} / {label}"` 机器拼接回填该字段（冻结计划才是权威变更源），前端
+/// 显示的不是这里 LLM 产出的文案。保留该字段要求是为稳定 LLM 输出 schema。
 pub(super) fn build_guide_preview_prompt(
     instruction: &str,
     mode: &str,

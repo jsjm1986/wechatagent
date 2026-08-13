@@ -718,8 +718,10 @@ async fn process_claimed_task(
                         Some(&task_contact_wxid),
                         "follow_up_retry_scheduled",
                         "retry",
+                        // attempt_count 经 claim 的 ReturnDocument::After 已含本次执行，
+                        // 语义是"已执行 n 次"而非"第 n 次重试"，文案按此表述。
                         &format!(
-                            "跟进任务失败，已安排第 {attempt_count}/{max_attempts} 次重试：{error}"
+                            "跟进任务第 {attempt_count}/{max_attempts} 次执行失败，已安排重试：{error}"
                         ),
                         None,
                     )

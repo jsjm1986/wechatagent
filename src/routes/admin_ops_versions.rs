@@ -1232,12 +1232,14 @@ where
 /// system_taxonomies 版本改动（publish / rollout / rollback）成功后写一条审计事件，
 /// 记录**是谁**改了哪条全局/账号 scope 字典项。
 ///
-/// 背景（Stage4 孤儿 #4）：`TaxonomyEntry` 无 `workspace_id`、只有 `scope`（`"global"`
-/// 或 account_id），三个版本 handler 历史上不接 `AuthenticatedAdmin`——全局字典任一
-/// admin 皆可改且改动无迹可查。本系统无 RBAC 角色模型（`AuthenticatedAdmin` 仅
-/// user_id/username/current_workspace），"谁有权改全局字典" 红线/文档均无定义，故
-/// **不加拦截门**（保持策略型孤儿的现状语义），只补最小可观测：把改动主体与目标
-/// scope 落一条 `taxonomy_version_changed` 事件，让全局字典变更 who/what 可追溯。
+/// 背景（Stage4 孤儿 #4）：`TaxonomyEntry` 以 `scope`（`"global"` 或 account_id）
+/// 区分全局/账号级字典（模型自 m032 起**另有** `workspace_id` 租户边界字段，但
+/// scope 才是"谁可改"的粒度），三个版本 handler 历史上不接 `AuthenticatedAdmin`——
+/// 全局字典任一 admin 皆可改且改动无迹可查。本系统无 RBAC 角色模型
+/// （`AuthenticatedAdmin` 仅 user_id/username/current_workspace），"谁有权改全局
+/// 字典" 红线/文档均无定义，故**不加拦截门**（保持策略型孤儿的现状语义），只补
+/// 最小可观测：把改动主体与目标 scope 落一条 `taxonomy_version_changed` 事件，
+/// 让全局字典变更 who/what 可追溯。
 ///
 /// **fail-soft**：审计写失败绝不影响已成功的字典改动（best-effort，忽略错误）——
 /// 与 gateway 送达后审计降级、prompt publish 观测事件同红线（可观测不得反噬业务）。

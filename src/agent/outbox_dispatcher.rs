@@ -968,6 +968,9 @@ pub async fn second_safety_gate(
     let is_managed = contact
         .as_ref()
         .map_or(false, |c| c.agent_status == AgentStatus::Managed);
+    // 名实注意：变量名沿用纯函数形参 `decision_created_ms`，但实际取的是
+    // **outbox entry** 的 created_at（decision 产出 → enqueue 通常毫秒级，作
+    // decision 创建时刻的近似）；user-stop 判定在极窄窗口下以 entry 时刻为准。
     let decision_created_ms = entry.created_at.timestamp_millis();
     Ok(check_second_safety_gate_pure(
         now.timestamp_millis(),

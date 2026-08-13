@@ -2602,6 +2602,15 @@ async fn ensure_suspected_deal_signals_indexes(db: &Database) -> anyhow::Result<
 /// agent-self-evolution W0 (Task 1.2)：5 张新 collection + prompt_templates
 /// 多版本辅助索引。
 ///
+/// **命名警示（函数名窄于实际覆盖）**：本函数以 evolution 起步，此后大量后续
+/// 子系统的索引就近追加于此——函数体还包含 knowledge_daily_reports /
+/// knowledge_chat_tasks / knowledge_operator_memory / chunk_revisions /
+/// knowledge_gap_signals / domain_schemas / domain_profiles /
+/// catalog_rebuild_jobs / operation_knowledge_chunks / admin_users /
+/// admin_sessions / ingest_sources / reviewer_stats / deal_attribution_stats /
+/// lessons_learned / agent_principal_escalations 等非 evolution 集合。按函数名
+/// 找索引会漏掉一大半，真实覆盖以函数体为准。下方逐条说明仅覆盖 evolution 部分：
+///
 /// - `experiments`：`(workspace_id, account_id, started_at desc)` 列表查询；
 ///   `(experiment_id)` 唯一保证 envelope 不重复 insert；另有
 ///   `(workspace_id, account_id, experiment_id)` 支撑租户内关联查询（Requirements 1.3）。

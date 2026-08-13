@@ -573,10 +573,13 @@ pub fn compact_memory_card_with_dimensions(
     }
 
     // H17：typed 骨架数组在 extra 里的历史镜像 cap 保持写死（coreFacts 6 /
-    // recentFacts 10 / deprecatedFacts 6——与 typed 三数组固定 cap 6/10/20 的 wire
-    // 兼容形态，不属业务维度）。业务记忆维度（preferences/doNotDo/... 八槽）的 cap
-    // 改由 memory_dimensions 驱动：DEFAULT 维度逐字复刻原 cap 表，故字节等价；情感
-    // profile 声明的额外槽（情绪史/纪念日）也在此被各自 cap 截断（防无界增长）。
+    // recentFacts 10 / deprecatedFacts 6）。注意镜像 cap 是历史 wire 兼容的独立
+    // 写死值，与 typed 三数组的 cap（core 6 / recent 10 / deprecated **20**，见
+    // 上方 truncate 调用）在 deprecated 一侧并不相等——镜像只保留 6 条副本，
+    // 不与 typed 对齐；不属业务维度。业务记忆维度（preferences/doNotDo/... 八槽）
+    // 的 cap 改由 memory_dimensions 驱动：DEFAULT 维度逐字复刻原 cap 表，故字节
+    // 等价；情感 profile 声明的额外槽（情绪史/纪念日）也在此被各自 cap 截断
+    // （防无界增长）。
     limit_extra_array(&mut compact.extra, "coreFacts", 6);
     limit_extra_array(&mut compact.extra, "recentFacts", 10);
     limit_extra_array(&mut compact.extra, "deprecatedFacts", 6);

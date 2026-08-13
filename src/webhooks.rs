@@ -1582,8 +1582,9 @@ pub async fn wechat_webhook(
 
     // P0-19：dedupe 原子化。原 check-then-insert 存在 TOCTOU 竞态，两个并发
     // webhook 的 find_one 都可能返回 None，导致同一条入站消息被双写。改为
-    // 直接 insert_one + 捕获 11000 duplicate key 错误（依赖
-    // db/indexes.rs:55-63 的 partial unique index `workspace_id+account_id+dedupe_key`），
+    // 直接 insert_one + 捕获 11000 duplicate key 错误（依赖 `db/indexes.rs`
+    // `ensure_all` 为 conversation_messages 建的 partial unique index
+    // `workspace_id+account_id+dedupe_key`；注释按约定引用函数名不写行号），
     // 让 MongoDB 在写入时原子去重。
     let raw = to_document(&payload).ok();
     // F1：解析入站消息类型 + 媒体引用，不再写死 None。

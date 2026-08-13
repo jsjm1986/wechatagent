@@ -137,20 +137,15 @@ pub(crate) fn bypass_deferral_for_explicit_buying_intent(
     active_profile.transaction_facts_enabled && super::reaction::explicit_buying_intent(content)
 }
 
-/// universal-domain-adaptation H19 / G04：解析某 contact 的**有效作息门控开关**。
+/// 解析某 contact 的**有效作息门控开关**——现行语义是 **workspace 开关唯一权威**：
+/// 直接返回 `workspace_enabled`（即 `runtime.quiet_hours_enabled`），contact /
+/// profile 两级的 `quiet_hours.enabled_override` 已**不再**参与调度判定。
 ///
-/// 经 [`resolve_operation_mode`](crate::planner::resolve_operation_mode) 三级链
-/// （contact override → profile.per_relationship → profile 默认范式）取
-/// `quiet_hours.enabled_override`，缺省回落全局 `global_enabled`（即
-/// `runtime.quiet_hours_enabled`）。与其余 6 个 OperationMode 驱动力解析路径一致——
-/// 此前只读 `contact.operation_mode_override`、绕过 resolve，导致 profile/per_relationship
-/// 级的 `quiet_hours.enabled_override` 是运行时死字段（G04）。纯函数、不查 DB
-/// （profile 由调用方传入已加载值）。
-///
-/// DEFAULT 字节等价：contact override=None + profile 默认范式 `enabled_override=None`
-/// → resolve 回落 `OperationMode::default()`（`enabled_override=None`）→ `.unwrap_or`
-/// 返回 `global_enabled`，与改造前逐字一致；情感陪伴 profile/contact 设 `Some(false)`
-/// → 夜间不被静默门压制。
+/// 历史脉络：universal-domain-adaptation H19 / G04 曾把本函数接上
+/// [`resolve_operation_mode`](crate::planner::resolve_operation_mode) 三级链
+/// （contact override → profile.per_relationship → profile 默认范式），后收敛回
+/// workspace-only。保留 `_contact` / `_profile` 入参只为调用面签名稳定与滚动升级
+/// 兼容（老数据里的 override 字段仍可读，但不改变行为）。纯函数、不查 DB。
 pub(crate) fn effective_quiet_hours_enabled(
     _contact: &crate::models::Contact,
     _profile: &crate::models::DomainProfile,

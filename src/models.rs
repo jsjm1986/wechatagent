@@ -910,8 +910,11 @@ pub struct AgentTask {
 /// 在 `$set: { status: ... }` 之前必须经过 [`assert_agent_task_status_valid`]
 /// 校验，避免把闭集外脏值写进 DB。
 ///
-/// 历史值清单（来自审计 D1 C-2/3/4）：
+/// 历史值清单（来自审计 D1 C-2/3/4，后补 `committing`）：
 /// - `pending / running / retry / failed / cancelled`：reclaim / claim / 重试 / 终态
+/// - `committing`：两阶段任务提交的中间态（`prepare_task_commit_if_owned` 已把
+///   prepared_commit 持久化、待 finalize；campaign fanout / enrollment 也用它
+///   先占位、finalize 后才释放为 pending 进入 worker 认领集）
 /// - `sent`：outcome_aggregation / memory_consolidation 完成态
 /// - `completed`：保留为 R10 reset 一致 alias
 /// - `outbox_enqueued`：gateway 把决策交付给 outbox 后写回的 task 终态
@@ -951,6 +954,7 @@ mod agent_task_status_tests {
         for s in [
             "pending",
             "running",
+            "committing",
             "retry",
             "failed",
             "cancelled",
@@ -1809,7 +1813,8 @@ pub struct OperationKnowledgeChunk {
 
     // ── knowledge-wiki 方法论字段（前向兼容；旧文档读出来全 None） ──
     /// 9 类 wiki_type 之一（source/entity/concept/comparison/synthesis/methodology/finding/query/thesis）。
-    /// 旧文档读出 None；migration `2026_05_W1_001_chunks_wiki_type_default` 把所有缺字段 chunk 默认填 "entity"。
+    /// 旧文档读出 None；无回填迁移（历史注释曾引用的 wiki_type 默认值迁移从未注册），
+    /// 缺字段 chunk 靠读取侧兜底为 "entity"（如 knowledge_agent 的 `wiki_type.unwrap_or("entity")`）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wiki_type: Option<String>,
     /// 业务字段 JSON 容器：销售域 `customer_stage / objection_type / pressure_level`，
@@ -2000,8 +2005,12 @@ impl Default for OperationKnowledgeChunk {
 
 /// chunk 的写入来源标注。
 ///
-/// `source` ∈ {ai, human, rule, imported}；`llm_model_alias` 用 provider_id 别名
-/// （由用户在 LLM Provider Configs 自填），**不允许出现具体模型名/品牌名**。
+/// `source` 生产写入值 ∈ {ai, human, rule, imported, principal_authorized,
+/// lesson_promotion}：前五个经 `chunk_revisions::ProvenanceSource` 枚举写入；
+/// `lesson_promotion` 由 lessons_learned 晋升链直构（`routes/lessons_learned.rs`
+/// 的 `LESSON_PROMOTION_SOURCE`，并有 `uniq_kchunks_lesson_promotion_source`
+/// 唯一索引锁身份）。`llm_model_alias` 用 provider_id 别名（由用户在 LLM
+/// Provider Configs 自填），**不允许出现具体模型名/品牌名**。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChunkProvenance {
     pub source: String,
@@ -2060,7 +2069,8 @@ pub struct ChunkRevision {
     pub before_snapshot: Option<Document>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after_snapshot: Option<Document>,
-    /// 写入来源 ∈ {ai, human, rule, imported}。
+    /// 写入来源，闭集见 `chunk_revisions::ProvenanceSource`
+    /// （ai / human / rule / imported / principal_authorized）。
     pub source: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,

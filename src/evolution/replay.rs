@@ -122,9 +122,10 @@ pub async fn eval_all(
             _ => continue,
         };
         for src in source_runs {
-            // budget 静态预检（threshold 不计 LLM；prompt 现阶段直接 failed
-            // 不启动 LLM——所以 W3 的 budget 主要在 W2 的 prompt_critic 阶段消耗。
-            // 这里仍调 exhausted 占位以保持后续接入完整 LLM 时一处控制。
+            // budget 静态预检：threshold 重放不调 LLM；prompt 重放在 task 内
+            // 调真实 LLM（shadow_replay_prompt_one），但 EvolutionBudget 是 mut
+            // 借用、无法跨 task 计量，影子消耗不回写本预算——exhausted() 预检
+            // 是唯一控制点，超额时后续 replay 直接写 failed 不启动。
             if budget.exhausted() {
                 let _ =
                     insert_replay_failed(state, &proposal, pid, src, "evolution_budget_exceeded")
