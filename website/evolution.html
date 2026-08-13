@@ -198,10 +198,10 @@
       </div>
       <div class="pipe-step is-admin reveal reveal-d2">
         <div class="ps-no">09</div>
-        <h5 data-lang-zh>阈值自动放量</h5><h5 data-lang-en>Threshold auto-release</h5>
-        <p data-lang-zh>仅阈值候选、且双重开关开启时，对仍未回正的信号闭环放量。提示词永远要人确认。默认关闭。</p>
-        <p data-lang-en>Only for threshold candidates, only when a double switch is on, closing the loop for signals that haven't self-corrected. Prompts always need a human. Off by default.</p>
-        <span class="ps-fn">auto_release_eligible_thresholds</span>
+        <h5 data-lang-zh>发布永远人工</h5><h5 data-lang-en>Release stays human</h5>
+        <p data-lang-zh>历史上曾存在被政策硬闸恒压制的阈值自动放量通道，2026-08 已整体从代码删除。阈值与提示词候选一律由管理员显式确认后发布，回滚同样永远手动。</p>
+        <p data-lang-en>A policy-suppressed threshold auto-release channel once existed; it was fully removed from the codebase in 2026-08. Threshold and prompt candidates alike ship only after explicit admin confirmation; rollback stays manual too.</p>
+        <span class="ps-fn">release_threshold · admin only</span>
       </div>
     </div>
   </div>
@@ -263,7 +263,7 @@
       <div class="band-row"><span class="br-key">pressure_risk_block</span><span class="br-base">≥ 7.0</span><span class="br-band">0.05 – 0.15</span></div>
       <div class="band-row"><span class="br-key">product_accuracy_score_block</span><span class="br-base">&lt; 7.0</span><span class="br-band">0.05 – 0.15</span></div>
       <div class="band-row"><span class="br-key">human_like_score_rewrite</span><span class="br-base">&lt; 6.0</span><span class="br-band">0.08 – 0.18</span></div>
-      <div class="band-row"><span class="br-key">emotional_value_rewrite</span><span class="br-base">&lt; 5.0</span><span class="br-band">0.08 – 0.18</span></div>
+      <div class="band-row"><span class="br-key">emotional_value_rewrite</span><span class="br-base">&lt; 6.0</span><span class="br-band">0.08 – 0.18</span></div>
       <div class="band-row"><span class="br-key">planner_block_rate_threshold</span><span class="br-base">0.60</span><span class="br-band">0.10 – 0.30</span></div>
     </div>
   </div>
@@ -289,11 +289,11 @@
           <span>no gateway</span><span>no outbox</span><span>no MCP</span><span>no outbound</span><span>no run_log</span>
         </div>
       </div>
-      <div class="shadow-card wip reveal reveal-d1">
-        <span class="sc-tag" data-lang-zh>分阶段建设中 · 提示词候选</span><span class="sc-tag" data-lang-en>Staged · prompt candidates</span>
-        <h4 data-lang-zh>提示词候选：完整 LLM 重放分期落地</h4><h4 data-lang-en>Prompt: full LLM replay is staged</h4>
-        <p data-lang-zh>诚实地说：提示词候选的完整影子重放（用新提示词在历史对话上真实重跑 LLM）尚在分期建设中，当前阶段记为 <code>prompt_replay_not_implemented_w3</code>。这意味着提示词改动当前必须走管理员人工确认这条更保守的路径——而不会被自动放量。我们选择把现状写清楚，而不是夸大能力。</p>
-        <p data-lang-en>To be honest: full shadow replay for prompt candidates (actually re-running the LLM with the new prompt over real history) is still being built in stages, currently recorded as <code>prompt_replay_not_implemented_w3</code>. This means prompt edits today must take the more conservative admin-confirmation path — they are never auto-released. We state the status plainly rather than overstate the capability.</p>
+      <div class="shadow-card live reveal reveal-d1">
+        <span class="sc-tag" data-lang-zh>已实装 · 提示词候选</span><span class="sc-tag" data-lang-en>Live · prompt candidates</span>
+        <h4 data-lang-zh>提示词候选：真实重跑决策 + 评审</h4><h4 data-lang-en>Prompt: really re-runs decide + review</h4>
+        <p data-lang-zh>提示词候选的影子重放已经落地（2026-08 前该能力尚在分期建设、页面曾如实标注）：用新提示词在历史样本上真实重跑「决策 + 独立评审」演练，逐条对比新旧结果。与阈值候选一样零副作用——不调网关、不入发件箱、不调 MCP。评估归评估：提示词永远不会被自动发布，必须由管理员确认。</p>
+        <p data-lang-en>Shadow replay for prompt candidates is now live (before 2026-08 it was staged, and this page said so): the new prompt genuinely re-runs the decide + independent-review drill over historical samples, comparing old and new outcomes case by case. Zero side effects, same as thresholds — no gateway, no outbox, no MCP. Evaluation stays evaluation: prompts are never auto-released and always need admin confirmation.</p>
         <div class="sc-zero">
           <span data-lang-zh>提示词永远要人确认</span><span data-lang-en>prompts always need a human</span>
         </div>
@@ -406,13 +406,13 @@
       </div>
       <div class="rel-card auto reveal reveal-d1">
         <span class="rc-ico"><svg viewBox="0 0 24 24" fill="none"><path d="M4 12a8 8 0 018-8 8 8 0 017 4m1 4a8 8 0 01-8 8 8 8 0 01-7-4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M19 4v4h-4M5 20v-4h4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
-        <span class="rc-flag" data-lang-zh>默认关闭 · 仅阈值</span><span class="rc-flag" data-lang-en>off by default · threshold only</span>
-        <h4 data-lang-zh>自动放量</h4><h4 data-lang-en>Auto-release</h4>
-        <p data-lang-zh>仅阈值候选可走闭环自动放量，且需要环境总开关与工作区子开关「双闸」同时开启（默认都关）。还要满足：回看窗口里信号仍未自然回正、且窗口内的负反应率未超过上限。提示词永远不自动放量。</p>
-        <p data-lang-en>Only threshold candidates can auto-release, and only when both an env switch and a per-workspace switch are on (both off by default). The signal must still be off-band in the look-back window, and the window's negative-reaction rate must stay under the cap. Prompts never auto-release.</p>
+        <span class="rc-flag" data-lang-zh>已整体移除 · 永远人工</span><span class="rc-flag" data-lang-en>removed · always human</span>
+        <h4 data-lang-zh>自动放量：已移除</h4><h4 data-lang-en>Auto-release: removed</h4>
+        <p data-lang-zh>阈值自动放量通道曾以「环境总开关 + 工作区子开关」双闸默认关的形态存在，且被代码级政策硬闸恒压制、从未放行；2026-08 起该机制整体从代码中删除——不再存在任何自动发布路径，管理接口也拒绝开启该开关。阈值与提示词一样，永远只走管理员确认发布。</p>
+        <p data-lang-en>The threshold auto-release channel once sat behind a double switch (env + per-workspace, both off by default) and a code-level policy gate that never let it fire; as of 2026-08 the mechanism is deleted outright — no auto-release path exists, and the admin API refuses to enable the flag. Thresholds, like prompts, ship only via explicit admin release.</p>
         <div class="rc-meta">
-          <div class="rc-line"><code>336h</code><span data-lang-zh>回看窗口（14 天）</span><span data-lang-en>look-back (14 days)</span></div>
-          <div class="rc-line"><code>cap = 1 / tick</code><span data-lang-zh>单 tick 至多放量 1 条</span><span data-lang-en>at most 1 per tick</span></div>
+          <div class="rc-line"><code>removed</code><span data-lang-zh>机制已从代码删除（2026-08）</span><span data-lang-en>mechanism deleted (2026-08)</span></div>
+          <div class="rc-line"><code>admin only</code><span data-lang-zh>发布与回滚均需管理员确认</span><span data-lang-en>release &amp; rollback need an admin</span></div>
         </div>
       </div>
       <div class="rel-card rollback reveal reveal-d2">
@@ -558,7 +558,7 @@
     </div>
     <div class="footer-bottom">
       <span>© 2026 WeAgent · <span data-lang-zh>私域自主运营</span><span data-lang-en>Autonomous private-domain operations</span></span>
-      <span data-lang-zh>构建于 2026-06-28 · 由 Claude Code 根据项目代码生成 · by opus-4.8 · 11 万行 Rust 代码 · 比例 100%</span><span data-lang-en>Built 2026-06-28 · generated by Claude Code from the project codebase · by opus-4.8 · 110k+ lines of Rust · 100% generated</span>
+      <span data-lang-zh>构建于 2026-06-28 · 基于项目真实代码生成 · 19 万行 Rust 代码 · 数字复核于 2026-08-13</span><span data-lang-en>Built 2026-06-28 · generated from the project codebase · 190k+ lines of Rust · figures re-verified 2026-08-13</span>
       <span data-lang-zh>Rust · Axum · MongoDB · React · MCP</span>
       <span data-lang-en>Built with Rust · Axum · MongoDB · React · MCP</span>
     </div>
