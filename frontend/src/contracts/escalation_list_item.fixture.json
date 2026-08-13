@@ -1,0 +1,22 @@
+{
+  "ageHours": 1.0,
+  "authorizationExpiresAt": "2023-11-15T22:13:20Z",
+  "category": "discount_request",
+  "contactWxid": "wxid_cust",
+  "createdAt": "2023-11-14T22:13:20Z",
+  "decision": {
+    "authorization_window_hours": 24.0,
+    "constraints": [
+      "本周内付款"
+    ],
+    "exemption_type": "none",
+    "substance": "同意 9 折，本周内有效",
+    "verdict": "conditional"
+  },
+  "principalWxid": "wxid_boss",
+  "questionForPrincipal": "能否给折扣",
+  "reason": "客户想要折扣，超出 AI 职权",
+  "resolvedVia": "admin",
+  "shortCode": "E1A2",
+  "status": "resolved"
+}

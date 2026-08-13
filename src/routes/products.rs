@@ -41,7 +41,9 @@ const ALLOWED_STATUS: &[&str] = &["active", "archived"];
 #[serde(rename_all = "camelCase")]
 pub(super) struct ListQuery {
     /// 仅返 active 产品（供报价/前端可售列表）；默认 false（admin 看全量含归档）。
-    #[serde(default)]
+    /// 主名 `activeOnly`（camelCase 契约）；`active_only` 为历史别名（早期前端
+    /// 发 snake_case 被静默忽略导致过滤失效，alias 兼容存量书签/脚本）。
+    #[serde(default, alias = "active_only")]
     active_only: bool,
 }
 
@@ -339,6 +341,29 @@ fn is_duplicate_key(err: &mongodb::error::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn list_query_accepts_camel_case_and_snake_case_active_only() {
+        use axum::extract::Query;
+        use axum::http::Uri;
+
+        let camel: Query<ListQuery> =
+            Query::try_from_uri(&"/products?activeOnly=true".parse::<Uri>().expect("uri"))
+                .expect("camelCase activeOnly accepted");
+        assert!(camel.active_only, "activeOnly=true must enable the filter");
+
+        // 历史别名：早期前端发 snake_case，被 serde 静默忽略导致归档产品漏进
+        // campaign 圈人下拉（缺陷 #15）。alias 保证两种写法都真正过滤。
+        let snake: Query<ListQuery> =
+            Query::try_from_uri(&"/products?active_only=true".parse::<Uri>().expect("uri"))
+                .expect("snake_case active_only accepted");
+        assert!(snake.active_only, "active_only=true must enable the filter");
+
+        let absent: Query<ListQuery> =
+            Query::try_from_uri(&"/products".parse::<Uri>().expect("uri"))
+                .expect("no param accepted");
+        assert!(!absent.active_only, "default stays false (admin sees all)");
+    }
 
     #[test]
     fn validate_product_money_rejects_negative_and_bad_currency() {

@@ -840,10 +840,13 @@ pub(in crate::routes) async fn unrelate_operation_knowledge_chunk(
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChunkReferrersQuery {
+    /// 主名 `targetId`（camelCase 契约）；`target_id` 作为历史别名保留，
+    /// 兼容早期前端/书签的 snake_case 写法（曾导致该接口恒 400）。
+    #[serde(alias = "target_id")]
     pub target_id: String,
 }
 
-/// `GET /operation-knowledge/chunks/referrers?target_id=...`
+/// `GET /operation-knowledge/chunks/referrers?targetId=...`
 /// 扫 `related_chunks.chunk_id == target_id`，返回反向引用列表。
 /// 不物化反向 link（避免双向写入一致性问题），每次查询走 query path。
 pub async fn list_chunk_referrers(
@@ -1081,5 +1084,27 @@ mod contract_tests {
             "kind": "supports"
         }))
         .is_err());
+    }
+
+    #[test]
+    fn chunk_referrers_query_accepts_camel_case_and_snake_case_target_id() {
+        use axum::extract::Query;
+        use axum::http::Uri;
+
+        let camel: Query<ChunkReferrersQuery> = Query::try_from_uri(
+            &"/operation-knowledge/chunks/referrers?targetId=abc"
+                .parse::<Uri>()
+                .expect("uri"),
+        )
+        .expect("camelCase targetId accepted");
+        assert_eq!(camel.target_id, "abc");
+
+        let snake: Query<ChunkReferrersQuery> = Query::try_from_uri(
+            &"/operation-knowledge/chunks/referrers?target_id=abc"
+                .parse::<Uri>()
+                .expect("uri"),
+        )
+        .expect("snake_case target_id accepted as legacy alias");
+        assert_eq!(snake.target_id, "abc");
     }
 }

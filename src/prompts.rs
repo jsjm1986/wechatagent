@@ -77,17 +77,10 @@ pub const DEFAULT_REPLY_SYSTEM_REDLINE_ANCHORS: &[&str] = &[
     "不要编造价格、承诺、成交、案例、身份、产品能力或已经发生的事实。",
 ];
 
-pub const DEFAULT_REPLY_TASK_REDLINE_ANCHORS: &[&str] = &[
-    "\"decisionPhase\": \"final\",",
-    "\"riskLevel\": \"low | medium | high\",",
-    "\"knowledgeNeed\": \"not_required | required | insufficient\",",
-    "\"autonomyMode\": \"auto | assisted | blocked\",",
-    "\"shouldReply\": true,",
-];
-
-/// Compact reply contract anchors. These are intentionally separate from the legacy full-task
-/// anchors so prompt management can evolve the fast schema without reintroducing projection
-/// fields, while preserving send authorization and safety-critical side effects.
+/// Compact reply contract anchors for the production single-shot reply prompt.
+/// （历史注：曾另有 `user.reply.task` 完整版模板及其独立锚集
+/// `DEFAULT_REPLY_TASK_REDLINE_ANCHORS`——该模板生产零消费，已随退役清理从种子包
+/// 与治理面移除；已存在的 DB 行保留不删，align 只对齐 spec 清单内的 key。）
 pub const DEFAULT_REPLY_FAST_TASK_REDLINE_ANCHORS: &[&str] = &[
     "\"decisionPhase\": \"final\",",
     "\"shouldReply\": true,",
@@ -1297,210 +1290,6 @@ fn prompt_specs() -> Vec<PromptSpec> {
 - 素材、名片和请示仅在确有需要时输出，禁止编造候选 id。
 - 不要输出 profileUpdate、tags、customerStage、intentLevel、domainSignals、profileAttributes、nextBestAction、operatingMemoryUpdate、memoryCandidates、memoryUpdate、bayesianObservations 或 agentGeneratedSignals；这些由发送后的独立投影任务处理。
 - 只输出 JSON，不要注释、markdown 或额外说明。"#,
-        },
-        PromptSpec {
-            key: "user.reply.task",
-            agent_kind: "user",
-            layer: "task_template",
-            title: "用户运营回复任务模板",
-            description: "生成回复决策、画像更新、运营记忆和跟进任务。",
-            status: "active",
-            content: r#"请基于以下上下文生成运营决策 JSON。本契约由系统校验层 (`RawAgentDecision::validate_and_promote`) 强制：缺字段、枚举非法、互斥违规、关键变化轮长度不足都会被自动拦截，无法发送。请把所有字段都填好。
-
-## 决策形态（本轮只输出一次完整决策，没有中间轮）
-本模板是**单发**决策：需要的知识检索已由系统在本轮之前完成并注入下方上下文，你不需要、也不能再请求任何工具或分多轮。请直接输出下面 final 形态的完整决策 JSON（`decisionPhase` 恒为 `"final"`）。
-`needsReview` 只选择复盘深度，不决定是否审核：低风险常规轮填 false；高风险、知识不足或产品声明填 true。所有可发送正文仍会经过独立 Reviewer 和 ClaimGate。
-
-### final 形态契约（下面所有字段都必填，缺一即全局阻断）
-{
-  "decisionPhase": "final",
-
-  // ── 自治协议必填枚举（R3.1 / R3.2 / R3.3） ──
-  "riskLevel": "low | medium | high",
-  "knowledgeNeed": "not_required | required | insufficient",
-  "runMode": "fast_chat | memory_candidate | knowledge_grounded | high_risk",
-  "autonomyMode": "auto | assisted | blocked",
-  "needsReview": false,
-  "consolidationNeeded": false,
-
-  // ── 对话模式（v3 必填，严格枚举） ──
-  // 必须按 user.reply.policy 中的优先级树自上而下判定，命中即停。
-  "conversationMode": "casual_relationship | value_exchange | consultative | boundary_protection",
-  "conversationModeReason": "为什么本轮选这个模式（一句话即可，须可追溯到 policy 优先级条款）",
-
-  // ── 自治协议必填思考链（R1.3，每个非空） ──
-  "userUnderstanding":   "我对用户当前真实诉求 / 状态的理解。低风险常规轮可写 'unchanged' 短形式或简短陈述；关键变化轮 ≥ 20 unicode 字符且不得为 'unchanged'。",
-  "relationshipRead":    "我对当前关系温度 / 信任 / 边界的读取。规则同上。",
-  "operationGoal":       "本次轮次我要服务的运营目标。规则同上。",
-  "knowledgeNeedReason": "我为什么判 knowledgeNeed 是这个值。低风险轮 ≥ 6 unicode 字符。",
-  "memoryUpdateReason":  "我为什么写 / 不写长期记忆。规则同 userUnderstanding。",
-  "selfCritique":        "我对本次决策的自我质疑（哪里可能错、哪里可能太过 / 太少）。低风险轮 ≥ 6 unicode 字符；关键变化轮 ≥ 20 unicode 字符。",
-  "riskSelfCheck":       "我对 factRisk / pressureRisk / 产品声明 / 边界的自检。规则同 userUnderstanding。",
-
-  // ── 回复理由（R1.4 互斥必填） ──
-  // shouldReply=true 时必须填 whyShouldReply（≥ 10 unicode 字符且 ≥ 6 汉字；关键变化轮 ≥ 30 unicode 字符且 ≥ 12 汉字）。
-  // shouldReply=false 时必须填 whySkipReply，规则同上。另一个字段允许写空字符串。
-  "shouldReply": true,
-  "whyShouldReply": "我为什么本轮要回复（足量解释为什么这一刻回复是更合适的运营动作）",
-  "whySkipReply": "",
-
-  // ── 回复正文 + 业务字段 ──
-  "replyText": "要发送给客户的微信文本，口吻自然，不要暴露系统或 AI；先给价值，少提问；如果用户要求清单/步骤/框架，要直接给出精简内容",
-  "operationState": "当前运营状态 key，必须来自状态机",
-  "operationStateReason": "为什么处于这个状态或为什么迁移",
-  "operationStateConfidence": 8,
-  "nextBestAction": {
-    "type": "reply",
-    "score": 7,
-    "reason": "本次动作的运营原因",
-    "relationshipGain": 2,
-    "userValue": 2,
-    "conversionProgress": 1,
-    "productFit": 1,
-    "timing": 1,
-    "disturbanceCost": 0,
-    "pressureRisk": 1,
-    "factRisk": 0
-  },
-  "profileUpdate": {
-    "summary": "更新后的一句话客户画像",
-    "interests": ["兴趣"],
-    "communicationStyle": "沟通风格",
-    "operationGoal": "运营目标"
-  },
-  "tags": ["自由标签"],
-  "customerStage": "自由生成的客户阶段",
-  "intentLevel": "自由生成的意向等级",
-  // ── 维度中文显示名（仅在你为上面 customerStage / intentLevel 等维度填了"字典里可能没有的自造新值"时才填） ──
-  "dimensionDisplayNames": {
-    "customer_stage": "为你上面填的 customerStage 值配一个 4-8 字简洁中文名（如 焦虑观望）；若该值是常见标准阶段、或你没把握，就不要填这一项",
-    "intent_level": "同理，为你上面填的 intentLevel 自造新值配简洁中文名；标准值或没把握就不填"
-  },
-  // ── 标签 / 阶段的对话证据（每个判断都要能指回对话里的依据） ──
-  // 「窗口序号」= 下方「最近聊天」列表里每条消息行首方括号内的编号（从 0 起、最早的消息为 0、依次递增）。
-  "tagEvidenceTurns": [0],         // 支撑上面 tags 的证据消息窗口序号数组；没有对话依据支撑的标签就不要输出。
-  "stageEvidenceTurns": [0],       // 支撑 customerStage 判定的证据消息窗口序号数组。
-  "stageExplicitIntent": false,    // customerStage 是否基于客户自己明确表达的（true）；若只是你结合上下文的推断则填 false。
-  // ── 深层评估维度（可选，旁路观测；仅供评估，不影响你本轮的回复决策） ──
-  "bayesianObservations": [
-    { "dimension": "维度名（你自己命名，如 价格敏感度/决策果断度）", "value": "判断值", "confidence": 0.0, "evidenceTurns": [0] }
-  ],                               // 可选：你对该客户的深层评估维度（最多 6 个，开放维度）。confidence=你的把握度 0.0~1.0；evidenceTurns=支撑该判断的对话窗口序号。没有可观察维度时给空数组。
-  // ── 信息充分性自评（渐进式三档；判断"本轮拿到的上下文够不够支撑这条回复"） ──
-  // 本轮 prompt 可能只注入了精简上下文（寒暄/闲聊够用）。如果你发现要答好客户这条消息其实还缺东西，就如实说，系统会按需补料后让你重答；不要在信息不足时硬编答案。
-  "sufficiency": "enough",         // enough=信息已足够，直接定稿；need_more_context=缺我方内部上下文（需要更懂这个人或需要产品/知识资料）；need_clarification=客户没说清，需要先问清楚
-  "missingTier": "none",           // 仅当 sufficiency=need_more_context 时有意义：relational=缺这个客户的关系/画像/历史；full=缺产品目录/知识切片/方法论。其它情况填 none
-  "clarificationIntent": "",       // 仅当 sufficiency=need_clarification 时填：一句话说明要向客户澄清什么；其它情况留空
-  // 【need_clarification 硬约束】当 sufficiency=need_clarification 时，replyText 只能是面向客户的
-  // 澄清问句本身，不得给任何推测性答案/硬答（信息不足时硬答＝幻觉风险）。把不确定的点直接问清楚。
-  "lastCommitment": "最近承诺或待确认事项",
-  "commitment": {
-    "text": "最近承诺或待确认事项（与 lastCommitment 同义，二选一即可）",
-    "dueAt": "该承诺的到期时间，RFC3339 格式如 2026-06-12T09:00:00+08:00；无明确时间则留空"
-  },
-  "followUpPolicy": "下一步跟进策略",
-  "profileAttributes": {
-    "budget": "如未知则留空",
-    "decisionRole": "如未知则留空"
-  },
-  "operatingMemoryUpdate": {
-    "userUnderstanding": {
-      "facts": [],
-      "signals": [],
-      "hypotheses": [],
-      "unknowns": [],
-      "changes": []
-    },
-    "relationshipState": {},
-    "productFit": {
-      "painPoints": [],
-      "interestedProducts": [],
-      "fitReasons": [],
-      "objections": [],
-      "notFitReasons": [],
-      "safeClaimsUsed": []
-    },
-    "nextAction": {
-      "currentState": "",
-      "nextBestAction": "",
-      "reason": "",
-      "timing": "",
-      "avoid": ""
-    }
-  },
-  "memoryCandidates": [
-    {
-      "type": "fact | preference | doNotDo | commitment | objection | openLoop | conflict",
-      "content": "候选记忆内容",
-      "evidence": "来自用户哪句话或哪个行为",
-      "importance": 0,
-      "confidence": 0
-    }
-  ],
-  "memoryWriteScore": 0,
-  "matchedKnowledgeIds": [],
-  "safeClaimsUsed": [],
-  "objectionsDetected": [],
-  "usedKnowledgeIds": [],
-  "memoryUpdate": "需要写入长期记忆的摘要",
-  "followUp": {
-    "needed": false,
-    "runAt": "需要跟进时填 RFC3339 时间，如 2026-06-12T09:00:00+08:00；needed=false 时留空",
-    "content": ""
-  },
-
-  // ── 素材文件发送（assetsToSend，可选；没有契合素材就整个字段省略或留空数组） ──
-  // 当上下文「可发送素材」清单里有契合当前客户阶段与问题的文件时，可在此选择发给客户。
-  // 每项 = { "assetId": "清单里列出的 id", "reason": "为什么这一刻发这份素材" }。
-  "assetsToSend": [
-    { "assetId": "只能填上方「可发送素材」清单里出现的 id，禁止编造", "reason": "选这份素材的运营理由" }
-  ],
-
-  // ── 专属顾问名片引荐（namecardToSend，可选；没有契合的顾问就整个字段省略） ──
-  // 仅当上下文出现「可引荐的专属顾问」候选清单时（=本账号已开启辅助模式）才可能用到。
-  // 当客户明确契合某顾问的触发提示（如要签约/要到店参观/需要深入对接）时，可选一位引荐。
-  "namecardToSend": { "cardId": "只能填上方「可引荐的专属顾问」清单里出现的 cardId，禁止编造", "reason": "为什么这一刻把这位顾问引荐给客户" },
-
-  // ── 决策墙请示（escalationRequest，条件必填） ──
-  // escalationRequest：判定按**事项实质**——一旦你判断本轮触及超出自身职权的「决策墙」（合同变更 / 特殊折扣 / 退款纠纷 / 法律承诺 / 定制需求等超出标准政策权限的事项，或风险被闸门拦下、需领导授权才能答的件），该字段就**不是可选、而是必填**：必须输出 needed=true 并填对应 category。只有本轮**确实没有**触及任何决策墙时，才省略该字段或填 needed=false。
-  // 判定看事项实质，不是客户嘴上"要换人对接"——客户嘴上要换人但事项你能处理，就继续自己处理，不要 escalate。
-  // 重要：即使你输出 escalationRequest，这一轮的 reply 仍要正常写——把"安抚占位话术 + selfServiceablePart 里你能自主答的部分"自然地融进 reply 一起发给客户（reply 会照常经发送链路送达，请示是后台动作，客户不会冷场）。绝不要把 reply 留空。
-  // 【自洽自检·必做】如果你在 replyText 里向客户表达了"这事我需要向上反馈 / 向领导确认一下 / 帮你申请看看 / 我确认之后再答复你"这类意思，就说明你已判定本轮触及了决策墙——此时**省略 escalationRequest 就是自相矛盾**：口头向客户承诺了请示，但结构化字段缺失会让这件事永远到不了幕后决策源、承诺落空。所以二选一：要么你自己有职权直接答（reply 里就别说要请示），要么你说了要请示就**必须** emit escalationRequest(needed=true)。这条对所有 category 生效。
-  // 三类（category 取其一）：
-  //   out_of_scope_decision：合同变更/特殊折扣/退款纠纷/法律承诺/定制需求等超出标准政策权限。
-  //   high_risk_gated：触及未验证产品声明、或风险被闸门拦下、需领导授权才能答的件。
-  //   stuck_or_undelivered：同一议题已多轮未推进且客户有负面情绪。
-  // 字段：{ "needed": true, "category": "...", "reason": "给领导看的卡点", "questionForPrincipal": "向领导提的问题", "selfServiceablePart": "客户这条消息里你能自主答的部分(若有，应已融进 reply)", "isGeneralizable": true/false(这条决策是否能泛化成通用知识) }
-
-  // 【转述模式】如果客户最新消息以 __PRINCIPAL_RELAY__ 开头，这不是客户发的话，而是"领导已就之前一条请示给出裁决"的内部转述任务。载荷字段：verdict（approved/rejected/conditional/deferred/delegated_back）、substance（领导给的实质结论，是你转述的唯一事实源）、constraints（附带条件）。此时你要：
-  //   1) 绝不把 __PRINCIPAL_RELAY__、verdict=、substance= 等任何内部字段或方括号文字发给客户；
-  //   2) 用你自己的口吻、结合该客户当前语境，自然地把结论转述出去；
-  //   3) 按 verdict 决定基调：
-  //      approved/conditional → 正面推进 substance，有 constraints 就说清条件（如"申请下来了可以给你8折，麻烦本周内付款哈"）；
-  //      rejected → 保关系优先，先给 substance 里的替代方案，没有就用标准口径婉拒，别生硬；
-  //      delegated_back → 领导把决定交回你，在标准权限内自己给客户一个答复（substance 可能为空）；
-  //      其它/异常 → 不替领导承诺超权事项，按标准口径稳住客户。
-  //   4) escalationRequest 这一轮通常省略（除非转述里又冒出新的越权点）。
-}
-
-要求：
-- 如果产品知识区为空或知识路由显示 missing/weak，涉及产品事实时只做关系维护、澄清需求或说明需要进一步确认。
-- memoryCandidates 只写会影响未来运营的高价值信息，必须有用户原话或行为作为 evidence；普通寒暄不要写入。
-- memoryWriteScore 0-10，6 以上才代表需要异步整理长期记忆。
-- 【承诺必填】凡你在 replyText 里向客户做了任何与时间相关的承诺或待办（如"明天发您资料""下周给您答复""稍后整理好发您"），必须同时填写 lastCommitment（描述该承诺）以及可选的结构化 commitment.dueAt（到期时间，RFC3339）；否则系统无法在到期时提醒你跟进，承诺会落空、关系受损。没有任何时间承诺时才留空。
-- riskLevel/knowledgeNeed/runMode/autonomyMode 必须严格使用上面列出的枚举值（小写，下划线）。
-- consolidationNeeded=true 或 riskLevel=high 或 knowledgeNeed in [required, insufficient] 视为关键变化轮，R1.3 七字段每个 ≥ 20 unicode 字符且不得使用 'unchanged'；whyShouldReply/whySkipReply 命中那一个 ≥ 30 unicode 字符 + ≥ 12 汉字。
-- riskLevel=low + knowledgeNeed=not_required + consolidationNeeded=false 视为低风险常规轮，R1.3 七字段允许 'unchanged' 短形式，但 knowledgeNeedReason / selfCritique 仍需 ≥ 6 unicode 字符。
-- 【素材文件发送】上下文若给出「可发送素材」清单，你可按需选择文件发给客户，写进 assetsToSend（[{assetId, reason}]）。规则：
-  - 没有契合当前客户阶段与问题的素材，就不发（assetsToSend 留空数组或省略），不要为发而发。
-  - 选了「表达:file_primary（文件为主）」的素材：replyText 只做一句简短引导（如"给您发份报价单"），不要把文件内容用文字再复述一遍。
-  - 选了「表达:file_support（文件佐证）」的素材：replyText 正常回答，文件作为佐证补充。
-  - 只能选清单里列出的 assetId，禁止编造；清单外的 id 会被系统丢弃。
-- 【专属顾问引荐】上下文若给出「可引荐的专属顾问」清单，你可按需把某位顾问引荐给客户，写进 namecardToSend（{cardId, reason}）。规则：
-  - 只在客户真正契合某顾问的触发提示时引荐（如明确要签约/要到店参观/需要深入技术对接），没有契合的就不引荐（namecardToSend 省略），不要为引荐而引荐。
-  - 引荐时 replyText 先用你自己的口吻做一句自然铺垫（如"我给您引荐一位专属顾问，专门一对一跟进您这边的情况，会更贴合"），名片会随后自动附上——不要在 replyText 里粘任何联系方式或二维码。铺垫话术里不要出现"负责人/上级/能拍板的人/转接/对接给谁"这类把客户推给更高权威的措辞（那会踩边界红线）；定位是"为您增配一位更专属的顾问"，不是"把你交给我之上的人"。
-  - 只能选清单里列出的 cardId，禁止编造；清单外的 id 会被系统丢弃。
-  - 看到「已引荐」信号时：客户已引荐过，你退为辅助答疑，正常回答客户问题即可，不再主动推进成交、不重复引荐（除非客户出现与上次完全不同的新需求场景）。
-上下文由系统在本模板后注入。你必须只输出上述 JSON。"#,
         },
         PromptSpec {
             key: "user.projection.system",
@@ -2767,7 +2556,10 @@ mod reply_redline_anchor_tests {
         let specs = prompt_specs();
         for (key, anchors) in [
             ("user.reply.system", DEFAULT_REPLY_SYSTEM_REDLINE_ANCHORS),
-            ("user.reply.task", DEFAULT_REPLY_TASK_REDLINE_ANCHORS),
+            (
+                "user.reply.fast.task",
+                DEFAULT_REPLY_FAST_TASK_REDLINE_ANCHORS,
+            ),
         ] {
             let prompt = specs
                 .iter()
@@ -2821,31 +2613,44 @@ mod prompt_pack_probe_tests {
 mod reply_task_single_shot_tests {
     use super::*;
 
-    /// tool_calling 静默 no_reply 根治护栏：`user.reply.task` 是**单发**决策 prompt
-    /// （主链路无 tool-loop 包裹，用户运营 tool_loop 已 sunset，`decision.tool_calls`
-    /// 永不执行；知识检索由 knowledge_router 独立前置完成）。若 prompt 仍提供
-    /// tool_calling 决策形态，LLM 可能误选该相位 → `build_tool_calling_decision`
-    /// 强制 `reply_text=""` / `should_reply=false`（types.rs）→ 客户提问被静默吞。
-    /// 网关兜底闸（gateway.rs `decision_phase_tool_calling_in_single_shot`）只能记
-    /// degraded、无法恢复从未生成的回复文本——它保留 `should_reply=false`——故**根治
-    /// = prompt 不再提供该形态**，且一次覆盖首发 / rewrite / revision 三个共用本 prompt
-    /// 的决策站点。本护栏锁死：user.reply.task 决策 JSON 只有 final 形态，绝不含
-    /// tool_calling。
+    /// tool_calling 静默 no_reply 根治护栏：`user.reply.fast.task` 是生产**单发**
+    /// 决策 prompt（主链路无 tool-loop 包裹，用户运营 tool_loop 已 sunset，
+    /// `decision.tool_calls` 永不执行；知识检索由 knowledge_router 独立前置完成）。
+    /// 若 prompt 提供 tool_calling 决策形态，LLM 可能误选该相位 →
+    /// `build_tool_calling_decision` 强制 `reply_text=""` / `should_reply=false`
+    /// （types.rs）→ 客户提问被静默吞。网关兜底闸（gateway.rs
+    /// `decision_phase_tool_calling_in_single_shot`）只能记 degraded、无法恢复从未
+    /// 生成的回复文本——故**根治 = prompt 不提供该形态**，一次覆盖首发 / rewrite /
+    /// revision 三个共用本 prompt 的决策站点。本护栏锁死：单发决策 JSON 只有
+    /// final 形态，绝不含 tool_calling。
+    /// （护栏原对象是退役的完整版 `user.reply.task`，随其移出种子包转靶到生产 key。）
     #[test]
     fn reply_task_prompt_offers_only_final_phase() {
         let specs = prompt_specs();
         let task = specs
             .iter()
-            .find(|s| s.key == "user.reply.task")
-            .expect("user.reply.task prompt spec 存在");
+            .find(|s| s.key == "user.reply.fast.task")
+            .expect("user.reply.fast.task prompt spec 存在");
         assert!(
             !task.content.contains("tool_calling"),
-            "user.reply.task 单发 prompt 不得再提供 tool_calling 决策形态（会诱发静默 no_reply）"
+            "user.reply.fast.task 单发 prompt 不得提供 tool_calling 决策形态（会诱发静默 no_reply）"
         );
         // final 形态契约仍在（决策 JSON 主体没被误删）
         assert!(
             task.content.contains("\"decisionPhase\": \"final\""),
-            "user.reply.task 应保留 final 形态契约"
+            "user.reply.fast.task 应保留 final 形态契约"
+        );
+    }
+
+    /// 退役护栏：`user.reply.task` 完整版模板已从种子包移除（生产零消费，DIV-02）。
+    /// 断言它不再被种入，防止后续改动把退役 spec 复活回种子包。
+    #[test]
+    fn retired_full_reply_task_stays_out_of_seed_pack() {
+        assert!(
+            prompt_specs()
+                .iter()
+                .all(|spec| spec.key != "user.reply.task"),
+            "user.reply.task 已退役（种子包不再包含），不要把它加回 prompt_specs"
         );
     }
 
@@ -2910,13 +2715,15 @@ mod reply_task_single_shot_tests {
         }
     }
 
+    /// 批次1 瘦身护栏（转靶生产 key）：4 个死字段（全库无任何 guard/阈值/发送逻辑
+    /// 消费）不得回流进生产单发 prompt 的契约，白占 token。
     #[test]
     fn reply_task_prompt_drops_dead_fields() {
         let specs = prompt_specs();
         let task = specs
             .iter()
-            .find(|s| s.key == "user.reply.task")
-            .expect("user.reply.task prompt spec 存在");
+            .find(|s| s.key == "user.reply.fast.task")
+            .expect("user.reply.fast.task prompt spec 存在");
         for dead in [
             "intentAnalysis",
             "productFitScore",
@@ -2925,17 +2732,8 @@ mod reply_task_single_shot_tests {
         ] {
             assert!(
                 !task.content.contains(dead),
-                "reply.task 模板不应再声明死字段 {dead}(无消费点,白占 token)"
+                "fast reply 模板不应声明死字段 {dead}(无消费点,白占 token)"
             );
-        }
-        for keep in [
-            "memoryWriteScore",
-            "matchedKnowledgeIds",
-            "safeClaimsUsed",
-            "objectionsDetected",
-            "usedKnowledgeIds",
-        ] {
-            assert!(task.content.contains(keep), "存活字段 {keep} 被误删");
         }
     }
 }
@@ -2983,33 +2781,35 @@ mod mode_gate_policy_anchor_tests {
 mod reply_schema_evidence_tests {
     use super::*;
 
-    /// 子计划2 Task5：reply 决策 schema（`user.reply.task` 的 final 形态契约）必须
-    /// 要求 LLM 额外输出标签/阶段的证据窗口序位 + 阶段是否基于客户明确表达。
-    /// 这三个 wire key 是 `RawAgentDecision`（camelCase）反序列化的字段名，下游
-    /// Task1-4（resolve_evidence / tag_observation / customer_stage 强弱门控）的输入。
-    /// 缺任一即整条证据链断成死代码——故断真 prompt pack 文本，防 schema 漂移。
+    /// 子计划2 Task5：标签/阶段证据 schema 必须要求 LLM 输出证据窗口序位 + 阶段
+    /// 是否基于客户明确表达。这些 wire key 是投影解析（camelCase）反序列化的字段
+    /// 名，下游 Task1-4（resolve_evidence / tag_observation / customer_stage 强弱
+    /// 门控）的输入。缺任一即整条证据链断成死代码——故断真 prompt pack 文本，防
+    /// schema 漂移。
+    /// （原对象是退役的完整版 `user.reply.task`；分层后画像/标签证据字段由发送后
+    /// 投影 prompt `user.projection.task` 承载，测试随之转靶。）
     #[test]
     fn reply_schema_requests_evidence_turns() {
         let specs = prompt_specs();
         let task = specs
             .iter()
-            .find(|s| s.key == "user.reply.task")
-            .expect("user.reply.task prompt spec 存在");
+            .find(|s| s.key == "user.projection.task")
+            .expect("user.projection.task prompt spec 存在");
         assert!(
             task.content.contains("tagEvidenceTurns"),
-            "reply schema 缺 tagEvidenceTurns——标签证据链无 LLM 输入"
+            "projection schema 缺 tagEvidenceTurns——标签证据链无 LLM 输入"
         );
         assert!(
             task.content.contains("stageEvidenceTurns"),
-            "reply schema 缺 stageEvidenceTurns——customer_stage 证据链无 LLM 输入"
+            "projection schema 缺 stageEvidenceTurns——customer_stage 证据链无 LLM 输入"
         );
         assert!(
             task.content.contains("stageExplicitIntent"),
-            "reply schema 缺 stageExplicitIntent——强弱证据门控无 LLM 输入"
+            "projection schema 缺 stageExplicitIntent——强弱证据门控无 LLM 输入"
         );
         assert!(
             task.content.contains("bayesianObservations"),
-            "reply schema 缺 bayesianObservations——贝叶斯评估旁路无 LLM 输入"
+            "projection schema 缺 bayesianObservations——贝叶斯评估旁路无 LLM 输入"
         );
     }
 

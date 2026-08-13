@@ -1198,7 +1198,15 @@ impl StepVerdict {
     }
 }
 
-/// 执行单个 step；不同 action 走不同 fail-soft 路径，但都不写 verified、不发送 outbox。
+/// 执行单个**非 mutating** step；不同 action 走不同 fail-soft 路径，但都不写
+/// verified、不发送 outbox。
+///
+/// mutating action（add_chunk / retag / dismiss）由 `run_claimed_task` 的
+/// `is_mutating` 分派进 `prepare_mutating_step` → `persist_step_intent` →
+/// `commit_mutating_step_once` 两阶段提交（intent 持久化 + 事务 + claim 栅栏），
+/// **不会**进入本函数；传入这三个 action 会落到 unsupported 分支报错。不要在
+/// 这里重加直接实现——历史上的重复实现曾漂移（dismiss 缺 account 过滤，可误伤
+/// 同 workspace 其它账号日报的卡片），已于退役清理中删除。
 pub async fn execute_step(
     state: &AppState,
     workspace_id: &str,
@@ -1273,208 +1281,6 @@ pub async fn execute_step(
                 }),
             }
         }
-        "add_chunk" => {
-            let summary = step.get_str("summary").unwrap_or("").trim().to_string();
-            if summary.is_empty() {
-                return Ok(StepOutcome {
-                    verdict: StepVerdict::Failed,
-                    chunk_id: None,
-                    message: "缺 summary 上下文，未起草新条目".to_string(),
-                    details: None,
-                });
-            }
-            let system = crate::prompts::load_prompt(
-                &state.db,
-                workspace_id,
-                "knowledge.chat.draft_chunk",
-            )
-            .await
-            .unwrap_or_else(|_| {
-                "你是知识库对话 Agent，起草新切片草稿。只输出 JSON: {patch, missingFields, followupQuestions, naturalReply}.".to_string()
-            });
-            let user = format!(
-                r#"请基于下面的运营待办摘要起草一条新知识切片草稿。
-
-待办摘要：
-{summary}
-
-起草要求：
-- patch 必须含非空的 title、summary、body 三者。
-- body（正文）承载可验证事实，绝不能留空。
-- 信息不足以填某字段时，把字段名写进 missingFields，不要编造内容。
-
-只输出 JSON 起草一条新切片草稿。"#
-            );
-            let run_id = format!(
-                "knowledge-task-add-{}",
-                step.get_str("stepId").unwrap_or("")
-            );
-            match crate::agent::generate_agent_json(
-                state,
-                workspace_id,
-                Some(_account_id),
-                None,
-                Some(&run_id),
-                "knowledge.chat.draft_chunk",
-                &system,
-                &user,
-            )
-            .await
-            {
-                Ok(value) => {
-                    let patch = value
-                        .get("patch")
-                        .and_then(|p| mongodb::bson::to_document(p).ok())
-                        .unwrap_or_default();
-                    if patch.is_empty() {
-                        return Ok(StepOutcome {
-                            verdict: StepVerdict::Failed,
-                            chunk_id: None,
-                            message: "AI 未产出可落库的草稿字段".to_string(),
-                            details: None,
-                        });
-                    }
-                    // apply_create_chunk 强制 status=draft + integrity_status=needs_review。
-                    // account_id 传 None → 落 workspace 共享域（与 chat 新建一致）。
-                    // operator_statement=summary 作为溯源陈述驱动 sourceQuote 锚定。
-                    match crate::routes::knowledge::apply_create_chunk(
-                        state,
-                        workspace_id,
-                        None,
-                        "knowledge-task",
-                        &patch,
-                        None,
-                        &summary,
-                    )
-                    .await
-                    {
-                        Ok(res) => {
-                            let new_id = res
-                                .get("createdChunkId")
-                                .and_then(|v| v.as_str())
-                                .filter(|s| !s.trim().is_empty())
-                                .map(|s| s.to_string());
-                            let (verdict, message) = if let Some(id) = new_id.as_deref() {
-                                (
-                                    StepVerdict::Committed,
-                                    format!("已起草新知识切片草稿：{id}，请运营在编辑器审核"),
-                                )
-                            } else {
-                                (
-                                    StepVerdict::Failed,
-                                    "起草落库返回成功但缺 createdChunkId，无法确认草稿产物"
-                                        .to_string(),
-                                )
-                            };
-                            Ok(StepOutcome {
-                                verdict,
-                                chunk_id: new_id,
-                                message,
-                                details: None,
-                            })
-                        }
-                        Err(err) => Ok(StepOutcome {
-                            verdict: StepVerdict::Failed,
-                            chunk_id: None,
-                            message: format!("起草落库失败（{err}，fail-soft）"),
-                            details: None,
-                        }),
-                    }
-                }
-                Err(err) => Ok(StepOutcome {
-                    verdict: StepVerdict::Failed,
-                    chunk_id: None,
-                    message: format!("起草生成失败（{err}，fail-soft）"),
-                    details: None,
-                }),
-            }
-        }
-        "retag" => {
-            let Some(cid) = step.get_str("targetChunkId").ok().map(|s| s.to_string()) else {
-                return Ok(StepOutcome {
-                    verdict: StepVerdict::Failed,
-                    chunk_id: None,
-                    message: "缺 targetChunkId，未重抽标签".to_string(),
-                    details: None,
-                });
-            };
-            let Ok(object_id) = ObjectId::parse_str(&cid) else {
-                return Ok(StepOutcome {
-                    verdict: StepVerdict::Failed,
-                    chunk_id: Some(cid.clone()),
-                    message: format!("targetChunkId={cid} 非法，未重抽标签"),
-                    details: None,
-                });
-            };
-            let chunk = state
-                .db
-                .operation_knowledge_chunks()
-                .find_one(
-                    doc! {
-                        "_id": object_id,
-                        "workspace_id": workspace_id,
-                        "domain": "user_operations",
-                        "$or": [
-                            { "account_id": null },
-                            { "account_id": _account_id },
-                        ],
-                    },
-                    None,
-                )
-                .await?;
-            let Some(chunk) = chunk else {
-                return Ok(StepOutcome {
-                    verdict: StepVerdict::Failed,
-                    chunk_id: Some(cid.clone()),
-                    message: format!("chunk {cid} 不存在，未重抽标签"),
-                    details: None,
-                });
-            };
-            let body = chunk.body.clone().unwrap_or_default();
-            match crate::routes::knowledge::extract_knowledge_tags_inner(
-                state,
-                workspace_id,
-                Some(_account_id),
-                &chunk.title,
-                &body,
-            )
-            .await
-            {
-                Ok((product_tags, business_topics)) => {
-                    let patch = doc! {
-                        "productTags": product_tags.clone(),
-                        "businessTopics": business_topics.clone(),
-                    };
-                    // apply_update_chunk 强制 status=draft + integrity_status=needs_review。
-                    // operator_statement 传空（retag 不改 sourceQuote，不触发重锚定）。
-                    crate::routes::knowledge::apply_update_chunk(
-                        state,
-                        workspace_id,
-                        _account_id,
-                        &cid,
-                        &patch,
-                        "",
-                    )
-                    .await?;
-                    Ok(StepOutcome {
-                        verdict: StepVerdict::Committed,
-                        chunk_id: Some(cid.clone()),
-                        message: format!(
-                            "已为 chunk {cid} 重抽标签（产品 {} / 主题 {}），落为待确认草稿",
-                            product_tags.len(),
-                            business_topics.len()
-                        ),
-                        details: None,
-                    })
-                }
-                Err(err) => Ok(StepOutcome {
-                    verdict: StepVerdict::NeedsManual,
-                    chunk_id: Some(cid.clone()),
-                    message: format!("chunk {cid} 重抽标签失败（{err}，fail-soft）"),
-                    details: None,
-                }),
-            }
-        }
         "review_evolution" => Ok(StepOutcome {
             verdict: StepVerdict::NeedsManual,
             chunk_id: None,
@@ -1527,58 +1333,6 @@ pub async fn execute_step(
                 message: format!("已汇总近 24h 拦截/暂缓事件 {} 条（详见 turn 详情）", total),
                 details: Some(doc! { "analyzeLogsTotal": total, "byKind": top }),
             })
-        }
-        "dismiss" => {
-            let card_id_hex = step.get_str("cardId").unwrap_or("").to_string();
-            if let Ok(card_oid) = ObjectId::parse_str(&card_id_hex) {
-                let report_date = step
-                    .get_str("reportDate")
-                    .ok()
-                    .map(|s| s.to_string())
-                    .unwrap_or_default();
-                let mut filter = doc! {
-                    "workspace_id": workspace_id,
-                    "cards.cardId": card_oid,
-                };
-                if !report_date.is_empty() {
-                    filter.insert("report_date", &report_date);
-                }
-                let update = state
-                    .db
-                    .knowledge_daily_reports()
-                    .update_one(
-                        filter,
-                        doc! { "$addToSet": { "dismissed_card_ids": card_oid } },
-                        None,
-                    )
-                    .await?;
-                let (verdict, message) = if update.matched_count == 0 {
-                    (
-                        StepVerdict::Failed,
-                        format!("卡片 {card_id_hex} 不属于当前 workspace/report，未忽略"),
-                    )
-                } else if update.modified_count == 0 {
-                    (
-                        StepVerdict::Noop,
-                        format!("卡片 {card_id_hex} 已处于忽略状态"),
-                    )
-                } else {
-                    (StepVerdict::Committed, format!("已忽略卡片 {card_id_hex}"))
-                };
-                Ok(StepOutcome {
-                    verdict,
-                    chunk_id: None,
-                    message,
-                    details: None,
-                })
-            } else {
-                Ok(StepOutcome {
-                    verdict: StepVerdict::Failed,
-                    chunk_id: None,
-                    message: "缺有效 cardId，未忽略卡片".to_string(),
-                    details: None,
-                })
-            }
         }
         other => Err(anyhow::anyhow!("unsupported action: {other}")),
     }

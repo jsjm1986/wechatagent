@@ -477,7 +477,6 @@ pub(in crate::routes) async fn knowledge_inbox(
         };
         let quote = c.source_quote.clone().unwrap_or_default();
         let has_quote = !quote.trim().is_empty();
-        let has_anchor = !c.source_anchors.is_empty();
         let integrity = c.integrity_status.clone().unwrap_or_default();
         let updated_ms = c.updated_at.timestamp_millis();
 
@@ -528,8 +527,10 @@ pub(in crate::routes) async fn knowledge_inbox(
             });
         }
 
-        // 3) anchors_missing：active 且无 source_anchors（即便有 quote 也算）。
-        if c.status == "active" && !has_anchor {
+        // 3) anchors_missing：active 且无可引用锚点（即便有 quote 也算；citable
+        //    口径与 integrity 报表共用 super::chunk_is_active_missing_citable_anchor，
+        //    只有畸形锚的切片同样进修复卡）。
+        if super::chunk_is_active_missing_citable_anchor(c) {
             items.push(InboxCardView {
                 id: format!("chunk:{}:anchor", chunk_id_hex),
                 priority: "high".into(),

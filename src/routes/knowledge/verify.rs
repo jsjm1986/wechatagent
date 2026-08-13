@@ -389,13 +389,7 @@ async fn auto_verify_operation_knowledge_chunks_inner(
             degraded = true;
             break;
         }
-        let has_source_quote = chunk
-            .source_quote
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .is_some();
-        let has_source_anchor = !chunk.source_anchors.is_empty();
+        let (has_source_quote, has_source_anchor) = chunk_evidence_flags(&chunk);
         let user = format!(
             r#"请对下面这条知识切片做自动校验。
 切片 ID: {}
@@ -642,6 +636,24 @@ source_anchors: {}
     })))
 }
 
+/// auto-verify 判定链的证据旗标：`(has_source_quote, has_citable_anchor)`。
+///
+/// 锚点侧用 [`crate::models::chunk_has_citable_anchor`]（citable 口径），与 D2
+/// verify 闸（`chunk_verify_gate_reason_for`）和读取侧 `quote_is_chunk_evidence`
+/// 同一谓词——裸 `!source_anchors.is_empty()` 会把只有畸形锚（缺 `sourceQuote`
+/// 键）的切片误判为「有锚」，让永远无法被引用的切片通过预审分诊。
+/// 具名抽出是为了让口径可被单测锚死（判定函数只收 bool，算错在闸上不可见）。
+fn chunk_evidence_flags(chunk: &crate::models::OperationKnowledgeChunk) -> (bool, bool) {
+    let has_source_quote = chunk
+        .source_quote
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some();
+    let has_citable_anchor = crate::models::chunk_has_citable_anchor(&chunk.source_anchors);
+    (has_source_quote, has_citable_anchor)
+}
+
 /// 波 D2：knowledge auto-verify 的"最终状态"判定（先于 admin 后台抽样）。
 ///
 /// 性质：
@@ -688,6 +700,24 @@ pub fn enforce_verified_needs_human_audit(final_status: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// B4：畸形锚（有元素但缺非空 `sourceQuote`）在 auto-verify 判定链上必须
+    /// 视同「无锚」——否则不可引用的切片会被预审分诊放行到 needs_human_audit。
+    #[test]
+    fn evidence_flags_treat_malformed_anchor_as_missing() {
+        let mut chunk = crate::models::OperationKnowledgeChunk {
+            source_quote: Some("原文片段".into()),
+            source_anchors: vec![mongodb::bson::doc! { "startOffset": 0i64 }],
+            ..Default::default()
+        };
+        assert_eq!(chunk_evidence_flags(&chunk), (true, false));
+
+        chunk.source_anchors = vec![mongodb::bson::doc! { "sourceQuote": "原文片段" }];
+        assert_eq!(chunk_evidence_flags(&chunk), (true, true));
+
+        chunk.source_quote = Some("   ".into());
+        assert_eq!(chunk_evidence_flags(&chunk), (false, true));
+    }
 
     #[test]
     fn auto_verify_all_llm_failures_preserve_structured_error() {

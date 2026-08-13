@@ -21,7 +21,9 @@ use wechatagent::models::{KnowledgeChatTask, KnowledgeChatTurn};
 
 #[test]
 fn planned_step_action_enum_is_closed_set() {
-    // 与 src/knowledge_task/mod.rs:execute_step 的 match arms 对齐；任何 worker 端
+    // 与 src/knowledge_task/mod.rs 的 worker 分派对齐：mutating（add_chunk/retag/
+    // dismiss）走 run_claimed_task 的两阶段提交（prepare/commit），非 mutating
+    // （fix_chunk/review_evolution/analyze_logs）走 execute_step。任何 worker 端
     // 新增 action 必须同步加入这里，否则 worker 会走 unsupported 分支 fail-soft。
     let allowed_actions = [
         "fix_chunk",
