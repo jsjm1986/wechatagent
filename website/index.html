@@ -169,7 +169,7 @@
         <span class="hc-no">04</span>
         <div class="hc-body">
           <div class="hc-t" data-lang-zh>自进化</div><div class="hc-t" data-lang-en>Self-evolving</div>
-          <div class="hc-d" data-lang-zh>越用越懂客户，改动留审批闸</div><div class="hc-d" data-lang-en>Learns customers; changes stay gated</div>
+          <div class="hc-d" data-lang-zh>越用越懂客户；默认关闭、改动留审批闸</div><div class="hc-d" data-lang-en>Learns customers; off by default, changes stay gated</div>
         </div>
       </div>
     </div>
@@ -287,7 +287,7 @@
         <div class="pq-ico"><svg viewBox="0 0 24 24" fill="none"><path d="M3 17l5-5 4 3 5-7" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/><path d="M17 8h4v4" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" opacity=".4"/></svg></div>
         <div class="pq-pain" data-lang-zh>成交之后就再没下文</div><div class="pq-pain" data-lang-en>Silence after the deal closes</div>
         <div class="pq-sep" data-lang-zh>解</div><div class="pq-sep" data-lang-en>FIX</div>
-        <div class="pq-fix" data-lang-zh>冷客户 AI 主动重激活</div><div class="pq-fix" data-lang-en>AI reactivates cold customers</div>
+        <div class="pq-fix" data-lang-zh>冷客户 AI 主动重激活（需显式启用）</div><div class="pq-fix" data-lang-en>AI reactivates cold customers (opt-in)</div>
       </div>
       <div class="pq-card reveal reveal-d4">
         <div class="pq-ico"><svg viewBox="0 0 24 24" fill="none"><path d="M16 17l5-5-5-5M21 12H9" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/><path d="M12 3H5a2 2 0 00-2 2v14a2 2 0 002 2h7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
@@ -368,14 +368,14 @@
       <div class="card card-hover reveal">
         <div class="icon-badge"><svg viewBox="0 0 24 24" fill="none"><path d="M12 2v20M2 12h20" stroke="currentColor" stroke-width="1.4" opacity=".3"/><path d="M5 15c3-1 5-4 7-8 2 4 4 7 7 8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
         <h3 class="h-sub" data-lang-zh>自我演化中心</h3><h3 class="h-sub" data-lang-en>Self-Evolution Center</h3>
-        <p class="muted" data-lang-zh>后台 worker 在影子环境重放历史决策，微调阈值与提示词；显著性达标才可发布，一键回滚。主链路零副作用。</p>
-        <p class="muted" data-lang-en>A worker replays past decisions in shadow mode to tune thresholds and prompts; release only on significance, rollback in one click. Zero side effects on the live path.</p>
+        <p class="muted" data-lang-zh>后台 worker 在影子环境重放历史决策，微调阈值与提示词；显著性达标才可发布，一键回滚。主链路零副作用。演化全链默认关闭，需显式启用。</p>
+        <p class="muted" data-lang-en>A worker replays past decisions in shadow mode to tune thresholds and prompts; release only on significance, rollback in one click. Zero side effects on the live path. The whole evolution chain is off by default — explicit opt-in.</p>
       </div>
       <div class="card card-hover reveal reveal-d1">
         <div class="icon-badge"><svg viewBox="0 0 24 24" fill="none"><path d="M4 6h16M4 12h16M4 18h10" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg></div>
         <h3 class="h-sub" data-lang-zh>统一收件箱</h3><h3 class="h-sub" data-lang-en>Unified Inbox</h3>
-        <p class="muted" data-lang-zh>8 类待办汇于一处：请示裁决、知识核验、标签候选、关系建议、画像发布、进化发布、经验晋升、知识缺口。</p>
-        <p class="muted" data-lang-en>8 review streams in one place: escalations, knowledge verification, tag candidates, relationship hints, profile publish, evolution release, lesson promotion, knowledge gaps.</p>
+        <p class="muted" data-lang-zh>9 类待办汇于一处：请示裁决、知识核验、标签候选、关系建议、画像发布、进化发布、经验晋升、知识缺口、疑似成交。</p>
+        <p class="muted" data-lang-en>9 review streams in one place: escalations, knowledge verification, tag candidates, relationship hints, profile publish, evolution release, lesson promotion, knowledge gaps, suspected deals.</p>
       </div>
       <div class="card card-hover reveal reveal-d2">
         <div class="icon-badge"><svg viewBox="0 0 24 24" fill="none"><path d="M3 17l6-6 4 4 8-8M21 7v5M21 7h-5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
@@ -385,7 +385,7 @@
       </div>
     </div>
     <div class="center-cta reveal">
-      <a href="product.html" class="btn btn-outline"><span data-lang-zh>展开全部 18 个管理频道</span><span data-lang-en>See all 18 channels</span>
+      <a href="product.html" class="btn btn-outline"><span data-lang-zh>展开全部 20 个管理频道</span><span data-lang-en>See all 20 channels</span>
         <svg viewBox="0 0 24 24" fill="none"><path d="M5 12h14M13 6l6 6-6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></a>
     </div>
   </div>
@@ -568,9 +568,9 @@
           <div class="rt-lbl" data-lang-en><b>Unit baseline</b>: every merge must pass ≥350 with 0 failures, plus property-based invariants — numbers never regress.</div>
         </div>
         <div class="rt-stat reveal reveal-d2">
-          <div class="rt-big" data-lang-zh>CI 双门</div><div class="rt-big" data-lang-en>Dual CI gate</div>
-          <div class="rt-lbl" data-lang-zh>基线门 + 红线静态扫描门。任何违背全自治定位的措辞、任何安全闸放松，都会让 CI 直接失败。</div>
-          <div class="rt-lbl" data-lang-en>Baseline gate + a red-line static scan. Any wording against full autonomy, or a loosened safety gate, fails CI outright.</div>
+          <div class="rt-big" data-lang-zh>9 道 CI 硬门</div><div class="rt-big" data-lang-en>9 hard CI gates</div>
+          <div class="rt-lbl" data-lang-zh>测试基线、红线词静态扫描、演化器隔离，加上送达协议、租户隔离、知识证据等硬门。任何违背全自治定位的措辞、任何安全闸放松，都会让 CI 直接失败。</div>
+          <div class="rt-lbl" data-lang-en>Test baseline, red-line static scan and evolver isolation, plus delivery-protocol, tenant-isolation, knowledge-evidence and other hard gates. Any wording against full autonomy, or a loosened safety gate, fails CI outright.</div>
         </div>
       </div>
     </div>
@@ -675,7 +675,7 @@
     </div>
     <div class="footer-bottom">
       <span>© 2026 WeAgent · <span data-lang-zh>私域自主运营</span><span data-lang-en>Autonomous private-domain operations</span></span>
-      <span data-lang-zh>构建于 2026-06-28 · 由 Claude Code 根据项目代码生成 · by opus-4.8 · 11 万行 Rust 代码 · 比例 100%</span><span data-lang-en>Built 2026-06-28 · generated by Claude Code from the project codebase · by opus-4.8 · 110k+ lines of Rust · 100% generated</span>
+      <span data-lang-zh>构建于 2026-06-28 · 基于项目真实代码生成 · 19 万行 Rust 代码 · 数字复核于 2026-08-13</span><span data-lang-en>Built 2026-06-28 · generated from the project codebase · 190k+ lines of Rust · figures re-verified 2026-08-13</span>
       <span data-lang-zh>Rust · Axum · MongoDB · React · MCP</span>
       <span data-lang-en>Built with Rust · Axum · MongoDB · React · MCP</span>
     </div>

@@ -1,6 +1,6 @@
 """WechatAgent 全量业务测试公共库。所有域脚本 import 它。
 
-连 server 117 经 scripts/_remote_run.py(paramiko)，在 server 上 curl localhost:3003 + mongosh wechatagent。
+支持远程 SSH 或服务器本机运行；API 端口与 Mongo 数据库由严格校验的 BIZTEST_APP_PORT/BIZTEST_DATABASE 绑定。
 凭据从 env 读(DEPLOY_PASS)/server .env 读(MCP_API_KEY)，绝不写进文件。
 
 观测纪律：业务行为断言查 mongo；journalctl/llm_call_logs 只抓 LLM 真调铁证。
@@ -12,6 +12,8 @@ import hashlib
 import hmac
 import json
 import os
+import re
+import shlex
 import subprocess
 import sys
 import time
@@ -29,6 +31,7 @@ REPO = Path(__file__).resolve().parents[2]
 REMOTE_RUN = REPO / "scripts" / "_remote_run.py"
 BIZ_PREFIX = "biztest_"
 FINDINGS = REPO / "docs" / "superpowers" / "specs" / "2026-06-26-full-business-logic-test-findings.md"
+BLOCKED_LEDGER = REPO / "target" / "biztest_blocked.jsonl"
 
 # server 连接 env。DEPLOY_PORT 必须 22——_remote_run.py 默认 3003 是 app 端口，不是 SSH。
 os.environ.setdefault("DEPLOY_HOST", "117.72.54.28")
@@ -38,6 +41,29 @@ os.environ.setdefault("DEPLOY_USER", "root")
 
 
 LOCAL_MODE = os.environ.get("BIZTEST_LOCAL") == "1"
+
+
+def _validated_app_port(raw: str) -> int:
+    try:
+        port = int(raw)
+    except ValueError as error:
+        raise ValueError("BIZTEST_APP_PORT must be an integer") from error
+    if not 1024 <= port <= 65535:
+        raise ValueError("BIZTEST_APP_PORT must be between 1024 and 65535")
+    return port
+
+
+def _validated_database(raw: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", raw):
+        raise ValueError("BIZTEST_DATABASE contains unsafe characters")
+    if raw in {"admin", "config", "local"}:
+        raise ValueError("BIZTEST_DATABASE cannot be a Mongo system database")
+    return raw
+
+
+BIZTEST_APP_PORT = _validated_app_port(os.environ.get("BIZTEST_APP_PORT", "3003"))
+BIZTEST_DATABASE = _validated_database(os.environ.get("BIZTEST_DATABASE", "wechatagent"))
+APP_BASE_URL = f"http://127.0.0.1:{BIZTEST_APP_PORT}"
 
 
 def remote_run(cmd: str) -> tuple[int, str]:
@@ -79,7 +105,8 @@ def remote_run_b64(script_text: str) -> tuple[int, str]:
 def mongo(js: str) -> str:
     """Run mongosh and fail closed when the remote command does not succeed."""
     b = base64.b64encode(js.encode("utf-8")).decode("ascii")
-    script = f"echo {b} | base64 -d > /tmp/biztest_mongo.js && mongosh wechatagent --quiet --file /tmp/biztest_mongo.js"
+    script = (f"echo {b} | base64 -d > /tmp/biztest_mongo.js && "
+              f"mongosh {shlex.quote(BIZTEST_DATABASE)} --quiet --file /tmp/biztest_mongo.js")
     return_code, out = remote_run(script)
     if return_code != 0:
         raise RuntimeError(f"mongosh failed with exit code {return_code}: {out[-500:]}")
@@ -95,7 +122,8 @@ def mongo_json(js: str) -> Any:
     if not out:
         return None
     # mongosh --quiet 仍可能带连接/弃用提示行，逐行尝试解析，取最后一个成功的。
-    parsed: Any = None
+    missing = object()
+    parsed: Any = missing
     for line in out.splitlines():
         line = line.strip()
         if not line:
@@ -104,15 +132,15 @@ def mongo_json(js: str) -> Any:
             parsed = json.loads(line)
         except Exception:
             continue
-    if parsed is None:
+    if parsed is missing:
         return {"_raw": out}
     return parsed
 
 
 def api(method: str, path: str, body: dict | None = None, *, admin: bool = False, timeout: int = 180) -> dict:
-    """server 上 curl localhost:3003 打 API。body dict→JSON(base64 中转)。admin 带 cookie。"""
+    """Call the explicitly bound biz-test API. body dict→JSON(base64 中转)."""
     base = [
-        "curl", "-s", "-X", method, f"http://localhost:3003{path}",
+        "curl", "-s", "-X", method, f"{APP_BASE_URL}{path}",
         "-H", "'Content-Type: application/json'", "--max-time", str(timeout),
     ]
     if admin:
@@ -137,6 +165,64 @@ def api(method: str, path: str, body: dict | None = None, *, admin: bool = False
         except Exception:
             continue
     return {"_raw": out}
+
+
+def campaign_dispatch_body(spec: dict) -> dict:
+    """Extract the complete frozen Campaign identity returned by create/preview."""
+    spec_hash = spec.get("specHash") if isinstance(spec, dict) else None
+    spec_version = spec.get("specVersion") if isinstance(spec, dict) else None
+    if not isinstance(spec_hash, str) or not spec_hash.strip():
+        raise ValueError("campaign response is missing specHash")
+    if not isinstance(spec_version, int) or isinstance(spec_version, bool) or spec_version < 1:
+        raise ValueError("campaign response is missing a positive specVersion")
+    return {"specHash": spec_hash, "specVersion": spec_version}
+
+
+def management_command_binding(command: dict, account_id: str) -> dict:
+    """Bind confirm/reject to the selected account and server-issued frozen plan hash."""
+    plan_hash = command.get("planHash") if isinstance(command, dict) else None
+    if not account_id.strip():
+        raise ValueError("management command account_id is empty")
+    if not isinstance(plan_hash, str) or not plan_hash.strip():
+        raise ValueError("management command response is missing planHash")
+    return {"accountId": account_id, "planHash": plan_hash}
+
+
+def guide_apply_binding(preview: dict, *, confirm_global_impact: bool | None = None) -> dict:
+    """Bind Guide Apply to the exact server-issued preview identity and frozen candidate."""
+    item = preview.get("item") if isinstance(preview, dict) else None
+    item = item if isinstance(item, dict) else preview
+    required = {
+        "previewId": item.get("id") if isinstance(item, dict) else None,
+        "expectedAccountId": item.get("accountId") if isinstance(item, dict) else None,
+        "expectedContactId": item.get("contactId") if isinstance(item, dict) else None,
+        "candidateHash": item.get("candidateHash") if isinstance(item, dict) else None,
+    }
+    if not all(isinstance(value, str) and value.strip() for value in required.values()):
+        raise ValueError("guide preview response is missing frozen apply identity")
+    requires = bool(item.get("requiresStrongConfirmation"))
+    required["confirmGlobalImpact"] = requires if confirm_global_impact is None else bool(confirm_global_impact)
+    return required
+
+
+def domain_profile_identity(response: dict) -> tuple[str, int | None]:
+    """Return the exact immutable profile row id/version from generate or publish responses."""
+    object_id = response.get("id") if isinstance(response, dict) else None
+    version = response.get("version") if isinstance(response, dict) else None
+    if not isinstance(object_id, str) or not object_id.strip():
+        raise ValueError("domain profile response is missing id")
+    if version is not None and (not isinstance(version, int) or isinstance(version, bool)):
+        raise ValueError("domain profile response has invalid version")
+    return object_id, version
+
+
+def bson_object_id(value: object) -> str:
+    """Normalize mongosh Extended JSON ObjectId values without accepting empty identities."""
+    if isinstance(value, dict):
+        value = value.get("$oid")
+    if not isinstance(value, str) or len(value) != 24:
+        return ""
+    return value
 
 
 def sign_webhook_body(secret: str, timestamp_ms: str, raw_body: bytes) -> str:
@@ -185,7 +271,7 @@ def api_bg(method: str, path: str, body: dict | None = None, *, admin: bool = Fa
 
     curl = [
         "curl", "-s", "--max-time", str(max_wait), "-X", method,
-        f"http://localhost:3003{path}", "-H", "'Content-Type: application/json'",
+        f"{APP_BASE_URL}{path}", "-H", "'Content-Type: application/json'",
     ]
     if admin:
         curl += ["-b", "/tmp/biztest_cookie"]
@@ -251,7 +337,7 @@ def send_webhook(app_id: str, from_wxid: str, content: str, msg_id: str) -> dict
     b = base64.b64encode(raw_body).decode("ascii")
     script = (
         f"echo {b} | base64 -d > /tmp/biztest_wh.json && "
-        f"curl -s -X POST http://localhost:3003/webhooks/wechat "
+        f"curl -s -X POST {APP_BASE_URL}/webhooks/wechat "
         f"-H 'Content-Type: application/json' "
         f"-H 'X-Webhook-Timestamp: {timestamp_ms}' "
         f"-H 'X-Webhook-Signature: sha256={sig}' "
@@ -311,6 +397,67 @@ def wait_contact_idle(wxid: str, max_wait: int = 320, poll: int = 12) -> bool:
             return True
         time.sleep(poll)
     return False
+
+
+def _default_min_reply_interval_seconds() -> int:
+    """Read the deployment fallback without exposing unrelated environment values."""
+    raw = os.environ.get("AGENT_MIN_REPLY_INTERVAL_SECONDS")
+    if raw is None and not LOCAL_MODE:
+        command = (
+            'workdir=$(systemctl show wechatagent -p WorkingDirectory --value) && '
+            'set -a && . "$workdir/.env" && set +a && '
+            'printf "%s" "${AGENT_MIN_REPLY_INTERVAL_SECONDS:-20}"'
+        )
+        code, output = remote_run(command)
+        if code != 0:
+            raise RuntimeError("cannot read deployment min reply interval")
+        raw = output.strip().splitlines()[-1] if output.strip() else ""
+    if raw is None:
+        raw = "20"
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as error:
+        raise RuntimeError("invalid AGENT_MIN_REPLY_INTERVAL_SECONDS") from error
+    if value < 0 or value > 3600:
+        raise RuntimeError("AGENT_MIN_REPLY_INTERVAL_SECONDS is outside safe bounds")
+    return value
+
+
+def reply_window_remaining_ms(wxid: str) -> int:
+    """Return the exact production precheck window remaining for one test contact."""
+    if not wxid.startswith(BIZ_PREFIX):
+        raise ValueError(f"biz-test wxid must start with {BIZ_PREFIX}")
+    fallback = _default_min_reply_interval_seconds()
+    value = mongo_json(
+        "(() => { const contact=db.contacts.findOne("
+        f"{{wxid:{json.dumps(wxid)}}},{{last_outbound_at:1,_id:0}});"
+        "const config=db.operation_domain_configs.findOne("
+        "{workspace_id:'default',domain:'user_operations',current_version:true},"
+        "{runtime_parameters:1,_id:0});"
+        "const configured=config&&config.runtime_parameters"
+        "?config.runtime_parameters.minReplyIntervalSeconds:null;"
+        f"const interval=Number.isInteger(configured)?configured:{fallback};"
+        "if(interval<0||interval>3600) throw new Error('invalid minReplyIntervalSeconds');"
+        "const last=contact&&contact.last_outbound_at;"
+        "return last instanceof Date"
+        "?Math.max(0,interval*1000-(Date.now()-last.getTime())):0; })()"
+    )
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise RuntimeError(f"unreadable reply window for {wxid}: {value}")
+    return value
+
+
+def wait_contact_reply_window(wxid: str, max_wait: int = 120) -> bool:
+    """Wait out the configured production anti-spam interval; never clear its state."""
+    deadline = time.time() + max_wait
+    while True:
+        remaining_ms = reply_window_remaining_ms(wxid)
+        if remaining_ms <= 0:
+            return True
+        now = time.time()
+        if now >= deadline or now + remaining_ms / 1000.0 + 1 > deadline:
+            return False
+        time.sleep(min(remaining_ms / 1000.0 + 1, 5.0))
 
 
 def diagnose_no_run_log(wxid: str) -> dict:
@@ -427,7 +574,10 @@ def send_and_wait(app_id: str, wxid: str, content: str, tag: str, *,
     while True:
         # 发前等 contact 空闲：上一轮 runner 还在跑时发会触发 barge-in 抢占
         # （gateway.rs:2091 superseded_by_new_inbound），让上一轮 run 被中止断言假阴。
-        wait_contact_idle(wxid)
+        if not wait_contact_idle(wxid):
+            raise RuntimeError(f"contact {wxid} did not become idle before send")
+        if not wait_contact_reply_window(wxid):
+            raise RuntimeError(f"contact {wxid} remained inside min reply interval")
         prev = run_log_count(wxid)
         send_webhook(app_id, wxid, content, f"biztest_{tag}_{int(time.time()*1000)}")
         # 端点故障重试时不重复 dump 诊断（最后一次失败才 dump）
@@ -462,6 +612,182 @@ def latest_decision_review(wxid: str) -> dict:
     return rows[0] if isinstance(rows, list) and rows else {}
 
 
+def decision_review_for_run(wxid: str, run_id: str) -> dict:
+    """Return the review bound to one exact run, never a later contact-level row."""
+    if not wxid.startswith(BIZ_PREFIX):
+        raise ValueError(f"biz-test wxid must start with {BIZ_PREFIX}")
+    if not run_id.strip():
+        return {}
+    rows = mongo_json(
+        "db.agent_decision_reviews.find("
+        f"{{contact_wxid:{json.dumps(wxid)},run_id:{json.dumps(run_id)}}},"
+        "{run_id:1,used_knowledge_ids:1,scores:1,status:1,outcome_status:1,reaction_analysis:1,"
+        "approved:1,send_gateway_result:1,operation_state:1,post_decision_status:1,"
+        "post_decision_error_kind:1,post_decision_profile_done:1,"
+        "post_decision_memory_done:1,_id:1}).sort({_id:-1}).limit(1).toArray()"
+    )
+    return rows[0] if isinstance(rows, list) and rows else {}
+
+
+def wait_review_status(wxid: str, run_id: str, statuses: set[str], *, max_wait: int = 180,
+                       poll: int = 5) -> dict:
+    """Wait until an exact review reaches a dispatcher-backed status such as ``sent``."""
+    deadline = time.time() + max_wait
+    while time.time() < deadline:
+        review = decision_review_for_run(wxid, run_id)
+        if review.get("status") in statuses:
+            return review
+        time.sleep(poll)
+    return decision_review_for_run(wxid, run_id)
+
+
+def memory_task_evidence(task_id: str) -> dict:
+    """Read one exact manual consolidation task and its prepared/committed run identity."""
+    if not task_id.strip():
+        return {}
+    rows = mongo_json(
+        "db.agent_tasks.find("
+        f"{{_id:ObjectId({json.dumps(task_id)})}},"
+        "{status:1,gateway_status:1,claim_generation:1,prepared_commit:1,_id:1}).limit(1).toArray()"
+    )
+    return rows[0] if isinstance(rows, list) and len(rows) == 1 else {}
+
+
+def memory_commit_events(task_id: str, claim_generation: int) -> list[dict]:
+    """Return only durable events owned by one exact memory commit attempt."""
+    if not task_id.strip() or not isinstance(claim_generation, int):
+        return []
+    prefix = f"memory_commit:{task_id}:{claim_generation}:"
+    rows = mongo_json(
+        "db.agent_events.find("
+        f"{{dedupe_key:{{$regex:{json.dumps('^' + prefix)}}}}},"
+        "{kind:1,status:1,details:1,dedupe_key:1,_id:0}).sort({dedupe_key:1}).toArray()"
+    )
+    return rows if isinstance(rows, list) else []
+
+
+def wait_projection_terminal(wxid: str, run_id: str, *, max_wait: int = 300,
+                             poll: int = 5) -> dict:
+    """Wait for the exact decision review's asynchronous post-decision projection terminal."""
+    terminal = {"completed", "failed_terminal", "discarded"}
+    deadline = time.time() + max_wait
+    while time.time() < deadline:
+        review = decision_review_for_run(wxid, run_id)
+        if review.get("post_decision_status") in terminal:
+            return review
+        time.sleep(poll)
+    return decision_review_for_run(wxid, run_id)
+
+
+def relationship_suggestions_for_run(contact_id: str, run_id: str) -> list[dict]:
+    """Resolve suggestions through the strict projection-observation ledger identity."""
+    if not contact_id or not run_id.strip():
+        return []
+    rows = mongo_json(
+        "(() => { const obs=db.projection_observations.find("
+        f"{{entity_type:'relationship_type_suggestion',run_id:{json.dumps(run_id)}}},"
+        "{entity_id:1,_id:0}).toArray();"
+        "const ids=obs.map(x=>{try{return ObjectId(x.entity_id)}catch(e){return null}})"
+        ".filter(Boolean); return db.relationship_type_suggestions.find("
+        f"{{_id:{{$in:ids}},contact_id:{json.dumps(contact_id)}}},"
+        "{suggested_value:1,status:1,confidence:1,source_run_ids:1,_id:1}).toArray(); })()"
+    )
+    return rows if isinstance(rows, list) else []
+
+
+def projection_llm_logs(run_id: str) -> list[dict]:
+    """Return only the child LLM call used by one exact post-decision projection."""
+    if not run_id.strip():
+        return []
+    rows = mongo_json(
+        "db.llm_call_logs.find("
+        f"{{run_id:{json.dumps(run_id + ':projection')},prompt_key:'user.projection.task'}},"
+        "{run_id:1,prompt_key:1,status:1,final_status:1,_id:0}).toArray()"
+    )
+    return rows if isinstance(rows, list) else []
+
+
+def seed_citable_knowledge_chunk(source_name: str, account_id: str, title: str, body: str) -> str:
+    """Insert a reviewable, citable biz-test fixture using the current chunk BSON contract.
+
+    The row deliberately starts as ``draft + needs_review``. Callers must use
+    :func:`verify_knowledge_chunk` to enter the production catalog; this helper cannot create a
+    verified row and therefore cannot bypass the human verification lifecycle.
+    """
+    if not source_name.startswith(BIZ_PREFIX):
+        raise ValueError(f"source_name must start with {BIZ_PREFIX}")
+    values = {
+        "source_name": source_name,
+        "workspace_id": "default",
+        "account_id": account_id,
+        "domain": "user_operations",
+        "knowledge_type": "product_fact",
+        "title": title,
+        "summary": body,
+        "body": body,
+        "source_quote": body,
+        "integrity_status": "needs_review",
+        "status": "draft",
+        "priority": 100,
+        "wiki_type": "entity",
+        "chunk_type": "product_fact",
+    }
+    literal = json.dumps(values, ensure_ascii=False)
+    quote = json.dumps(body, ensure_ascii=False)
+    mongo(f'db.operation_knowledge_chunks.deleteMany({{source_name:{json.dumps(source_name)}}})')
+    row = mongo_json(
+        "(() => { const value=" + literal + ";"
+        "value.source_anchors=[{sourceQuote:" + quote + ",sourceName:value.source_name}];"
+        "value.created_at=new Date();value.updated_at=value.created_at;"
+        "return db.operation_knowledge_chunks.insertOne(value).insertedId; })()"
+    )
+    if isinstance(row, dict):
+        return str(row.get("$oid", ""))
+    return str(row or "")
+
+
+def get_knowledge_chunk(chunk_id: str) -> dict:
+    """Read one chunk through the authenticated production API contract."""
+    response = api("GET", f"/api/operation-knowledge/chunks/{chunk_id}", admin=True)
+    item = response.get("item") if isinstance(response, dict) else None
+    return item if isinstance(item, dict) else {}
+
+
+def verify_knowledge_chunk(chunk_id: str) -> dict:
+    """Human-verify one chunk using the server-issued optimistic concurrency token."""
+    item = get_knowledge_chunk(chunk_id)
+    expected = item.get("updatedAt")
+    if not isinstance(expected, str) or not expected.strip():
+        return {"_error": "missing_updatedAt", "item": item}
+    return api(
+        "POST",
+        f"/api/operation-knowledge/chunks/{chunk_id}/verify",
+        {"expectedUpdatedAt": expected, "verifiedClaims": []},
+        admin=True,
+    )
+
+
+def patch_knowledge_chunk(chunk_id: str, patch: dict) -> dict:
+    """Apply an editable content patch through the revision/lifecycle endpoint."""
+    return api(
+        "POST",
+        f"/api/operation-knowledge/chunks/{chunk_id}/patch",
+        {"patch": patch, "reason": "biz-test lifecycle verification"},
+        admin=True,
+    )
+
+
+def active_outbox_count(wxid: str) -> int:
+    """Count queued deliveries that could still reach a biz-test contact."""
+    if not wxid.startswith(BIZ_PREFIX):
+        raise ValueError(f"biz-test wxid must start with {BIZ_PREFIX}")
+    value = mongo_json(
+        "db.agent_send_outbox.countDocuments("
+        f"{{contact_wxid:{json.dumps(wxid)},status:{{$in:[\"pending\",\"in_flight\"]}}}})"
+    )
+    return int(value) if isinstance(value, (int, float)) else -1
+
+
 def manual_send_requires_outbox_poll(response: object) -> bool:
     """Whether a management send result can still produce an async Outbox terminal.
 
@@ -489,6 +815,36 @@ def latest_outbox(wxid: str, limit: int = 5) -> list[dict]:
     return rows if isinstance(rows, list) else []
 
 
+def outbox_for_run(wxid: str, run_id: str) -> list[dict]:
+    """Return Outbox rows for one exact biz-test run, never contact-level history."""
+    if not wxid.startswith(BIZ_PREFIX):
+        raise ValueError(f"biz-test wxid must start with {BIZ_PREFIX}")
+    if not run_id.strip():
+        return []
+    rows = mongo_json(
+        "db.agent_send_outbox.find("
+        f"{{contact_wxid:{json.dumps(wxid)},run_id:{json.dumps(run_id)}}},"
+        "{run_id:1,media_asset_id:1,referral_card_id:1,content:1,status:1,_id:0})"
+        ".sort({_id:1}).toArray()"
+    )
+    return rows if isinstance(rows, list) else []
+
+
+def ptier_events_for_run(wxid: str, run_id: str) -> list[dict]:
+    """Return progressive-tier events whose durable details.run_id matches this run."""
+    if not wxid.startswith(BIZ_PREFIX):
+        raise ValueError(f"biz-test wxid must start with {BIZ_PREFIX}")
+    if not run_id.strip():
+        return []
+    rows = mongo_json(
+        "db.agent_events.find("
+        f"{{contact_wxid:{json.dumps(wxid)},kind:/^ptier_/,"
+        f"\"details.run_id\":{json.dumps(run_id)}}},"
+        "{kind:1,details:1,_id:0}).sort({_id:1}).toArray()"
+    )
+    return rows if isinstance(rows, list) else []
+
+
 def llm_logs_since(seconds: int, prompt_key: str | None = None) -> list[dict]:
     """查 llm_call_logs 最近 N 秒记录（mongo），用于真调铁证断言。
 
@@ -508,25 +864,57 @@ def llm_logs_since(seconds: int, prompt_key: str | None = None) -> list[dict]:
 
 
 def assert_llm_success(seconds: int, prompt_key: str, domain: str) -> bool:
-    """真调铁证：最近 N 秒该 prompt_key 有 success/cache_hit 记录，否则 record 一条 high。
-
-    cache_hit 也算通过：命中 LRU prompt 缓存证明该 prompt 链路曾真调成功（相同输入），
-    只是本次未重打模型。failed/json_error 才是真异常。
-    """
+    """Require durable evidence that the exact prompt path reached a successful model result."""
     logs = llm_logs_since(seconds, prompt_key)
     ok = any(l.get("status") in ("success", "cache_hit") for l in logs)
-    if not ok:
-        record(
-            domain,
-            f"{prompt_key} 无 success/cache_hit 的 llm_call_logs",
-            f"logs={logs}",
-            "high",
-            "LLM 未真调或失败(json_error/failed)→该域断言可能假绿，排查端点",
-        )
-    return ok
+    return expect(
+        ok,
+        domain,
+        f"{prompt_key} 有 success/cache_hit 的 llm_call_logs",
+        f"logs={logs}",
+        "high",
+        "LLM 未真调或失败(json_error/failed)，该域没有可接受的真实模型证据",
+    )
+
+
+def assert_llm_success_for_run(run_id: str, prompt_key: str, domain: str) -> bool:
+    """Require one successful LLM ledger row bound to the exact durable run identity."""
+    if not run_id.strip():
+        return expect(False, domain, f"{prompt_key} 有非空 run identity", "run_id is empty", "high")
+    logs = mongo_json(
+        "db.llm_call_logs.find("
+        f"{{run_id:{json.dumps(run_id)},prompt_key:{json.dumps(prompt_key)}}},"
+        "{run_id:1,prompt_key:1,status:1,final_status:1,model:1,_id:0})"
+        ".sort({_id:-1}).toArray()"
+    )
+    logs = logs if isinstance(logs, list) else []
+    ok = any(row.get("status") in ("success", "cache_hit") for row in logs)
+    return expect(
+        ok,
+        domain,
+        f"{prompt_key} exact run 有 success/cache_hit 的 llm_call_logs",
+        f"run_id={run_id} logs={logs}",
+        "high",
+        "该业务 run 没有成功模型证据，不能用同 prompt 的并发历史调用代替",
+    )
 
 
 _INIT = False
+
+
+def record_blocked(domain: str, capability: str, evidence: str, requirement: str) -> None:
+    """Persist an environment/capability block separately from business assertion failures."""
+    BLOCKED_LEDGER.parent.mkdir(parents=True, exist_ok=True)
+    row = {
+        "domain": domain,
+        "capability": capability,
+        "evidence": evidence[:500],
+        "requirement": requirement[:500],
+        "recordedAtMs": int(time.time() * 1000),
+    }
+    with BLOCKED_LEDGER.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+    print(f"[BLOCKED] {domain}: {capability}", flush=True)
 
 
 def record(domain: str, phenomenon: str, evidence: str, severity: str, root_cause: str) -> None:
@@ -548,13 +936,24 @@ def record(domain: str, phenomenon: str, evidence: str, severity: str, root_caus
     print(f"[FINDING/{severity}] {domain}: {phenomenon}", flush=True)
 
 
+class BizTestAssertionError(AssertionError):
+    """A non-observational acceptance assertion failed."""
+
+
 def expect(cond: bool, domain: str, desc: str, evidence: str, severity: str = "high", root: str = "") -> bool:
-    """断言：真→打 PASS；假→record finding。返回 cond 供链式判断。"""
+    """Record every assertion and fail the process for every non-``low`` failure.
+
+    ``low`` is the sole observational level. Critical/high/medium and explicit BLOCKED findings
+    are authoritative suite failures; allowing those scripts to return zero made earlier matrices
+    false-green even when their own evidence contradicted acceptance.
+    """
     if cond:
         print(f"[PASS] {domain}: {desc}", flush=True)
-    else:
-        record(domain, f"断言失败: {desc}", evidence, severity, root or "断言不成立，见证据")
-    return cond
+        return True
+    record(domain, f"断言失败: {desc}", evidence, severity, root or "断言不成立，见证据")
+    if severity.strip().lower() != "low":
+        raise BizTestAssertionError(f"[{severity}] {domain}: {desc}; evidence={evidence[:500]}")
+    return False
 
 
 def is_api_error(resp: Any) -> str | None:
@@ -626,6 +1025,8 @@ def reset_contact_conversation(account_id: str, wxid: str) -> None:
     问题"等历史→后续轮回"先核对再答"/no_reply 而不再引用知识直接答（实证 c2 阶段4 召回恢复
     假阴根因）。不碰 operating_memories（长期记忆/memory_card，各域如⑨自行 deleteMany 管理）。
     """
+    if not wxid.startswith(BIZ_PREFIX):
+        raise ValueError(f"biz-test wxid must start with {BIZ_PREFIX}")
     for c, field in [
         ("conversation_messages", "contact_wxid"),
         ("agent_run_logs", "contact_wxid"),
@@ -634,9 +1035,14 @@ def reset_contact_conversation(account_id: str, wxid: str) -> None:
         ("agent_decision_reviews", "contact_wxid"),
     ]:
         mongo(f'db.{c}.deleteMany({{{field}:"{wxid}",account_id:"{account_id}"}})')
-    # 重置滚动短期记忆（独立字段，非上面任何集合）：清空 memory_summary + last_outbound_style，
-    # 让每轮触发不带历史承诺包袱。不动 manual_tags/human_profile_note（运营权威，非对话残留）。
+    # 测试重跑还必须撤销上一轮由确定性 stop 写入的持久屏障，否则新 webhook 会在
+    # precheck 阶段直接命中 cooldown，永远测不到当前入站的 stop 汇合路径。这里只允许
+    # biztest_ contact，并只清 stop 自己拥有的字段；其它运营策略保持不动。
     mongo(
-        f'db.contacts.updateOne({{wxid:"{wxid}",account_id:"{account_id}"}},'
-        '{$set:{memory_summary:null,last_outbound_style:null}})'
+        'db.contacts.updateOne('
+        f'{{wxid:{json.dumps(wxid)},account_id:{json.dumps(account_id)}}},'
+        '{$set:{memory_summary:null,last_outbound_style:null},'
+        '$unset:{cooldown_until:"",'
+        '"operation_policy.explicitStopRequested":"",'
+        '"operation_policy.explicitStopRequestedAt":""}})'
     )

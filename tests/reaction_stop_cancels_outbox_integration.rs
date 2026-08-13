@@ -271,7 +271,7 @@ async fn deterministic_stop_needs_no_review_or_llm_and_persists_dispatch_barrier
         message_id: Some("inbound_deterministic_stop".to_string()),
         dedupe_key: None,
         direction: MessageDirection::Inbound,
-        content: "请不要再联系我，停止给我发消息。".to_string(),
+        content: "别再发了，我不想聊了，到此为止吧".to_string(),
         msg_type: None,
         media_ref: None,
         raw: None,

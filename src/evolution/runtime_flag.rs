@@ -10,11 +10,15 @@
 //! contact 在 rollout_percent 单调上升时永远是"先进先稳"——一个 contact
 //! 一旦在 5% 桶里命中，rollout 抬到 20% 时它仍然在桶内，避免来回切换。
 //!
-//! `EVOLUTION_ENABLED=false` env-var 仍然作为最外层熔断：env 关停时
-//! `is_evolution_enabled_for` 直接返回 false，不再读 mongo 文档；env 开启
-//! 时才进一步读 mongo flag 决定 contact 是否落在灰度桶里。这样 env 可以
-//! 作为生产紧急 kill switch（不需要 mongo 写权限），mongo flag 是日常
-//! 灰度调度面板。
+//! `EVOLUTION_ENABLED=false` env-var 仍然作为最外层熔断：worker 主循环在
+//! env 关停时进函数即 return，根本不读 mongo 文档；env 开启时每 tick 由
+//! [`load_runtime_flag`] + [`bucket_for_contact`]（cohort 过滤消费）决定
+//! contact 是否落在灰度桶里。这样 env 可以作为生产紧急 kill switch（不需要
+//! mongo 写权限），mongo flag 是日常灰度调度面板。
+//!
+//! 终裁 10-2 清理：历史的 `is_evolution_enabled_for` 综合判定包装（设想的
+//! worker / webhook / shadow 三路调用方）从未接线，唯一真实消费是 cohort
+//! 过滤经 [`bucket_for_contact`]，已删除。
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -65,39 +69,6 @@ pub fn bucket_for_contact(flag: &EvolutionRuntimeFlag, contact_id: &str) -> bool
         return false;
     }
     rollout_bucket_index(contact_id) < flag.rollout_percent_clamped()
-}
-
-/// 综合判定：env `EVOLUTION_ENABLED` + mongo `evolution_runtime_flags` 双闸。
-///
-/// 顺序：
-///   1. `state.config.evolution_enabled = false` → 直接 false（env kill switch）；
-///   2. mongo 文档不存在 → false（默认保守，不灰度）；
-///   3. `flag.enabled = false` → false；
-///   4. `rollout_bucket_index(contact_id) < flag.rollout_percent_clamped()` → true。
-///
-/// 任何一步抛错（mongo 不可用等）都按 false 返回 + warn 日志，避免演化器在
-/// 数据库抖动时把自己升级成"全量启用"。
-pub async fn is_evolution_enabled_for(
-    state: &AppState,
-    workspace_id: &str,
-    contact_id: &str,
-) -> bool {
-    if !state.config.evolution_enabled {
-        return false;
-    }
-    match load_runtime_flag(state, workspace_id).await {
-        Ok(Some(flag)) => bucket_for_contact(&flag, contact_id),
-        Ok(None) => false,
-        Err(err) => {
-            tracing::warn!(
-                workspace_id,
-                contact_id,
-                ?err,
-                "evolution runtime flag lookup failed; default to disabled"
-            );
-            false
-        }
-    }
 }
 
 #[cfg(test)]

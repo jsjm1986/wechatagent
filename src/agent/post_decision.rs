@@ -107,6 +107,7 @@ fn compact_messages(messages: &[ConversationMessage]) -> Vec<Document> {
         .iter()
         .map(|message| {
             doc! {
+                "id": message.id.map(Bson::ObjectId).unwrap_or(Bson::Null),
                 "messageId": message.message_id.clone().map(Bson::from).unwrap_or(Bson::Null),
                 "direction": match message.direction { MessageDirection::Inbound => "inbound", MessageDirection::Outbound => "outbound" },
                 "content": truncate_chars(&message.content, MAX_MESSAGE_CHARS),
@@ -1005,7 +1006,10 @@ async fn process_claimed(state: &AppState, review: Document) -> AppResult<()> {
     let window = window_docs
         .into_iter()
         .map(|row| ConversationMessage {
-            id: None,
+            id: row
+                .get_object_id("id")
+                .or_else(|_| row.get_object_id("_id"))
+                .ok(),
             workspace_id: workspace_id.to_string(),
             account_id: account_id.to_string(),
             contact_wxid: contact_wxid.to_string(),
@@ -1380,6 +1384,33 @@ mod tests {
     #[test]
     fn compact_text_truncates_on_unicode_boundaries() {
         assert_eq!(truncate_chars("甲乙丙", 2), "甲乙");
+    }
+
+    #[test]
+    fn compact_messages_preserves_evidence_object_id() {
+        let id = ObjectId::new();
+        let messages = vec![ConversationMessage {
+            id: Some(id),
+            workspace_id: "ws".to_string(),
+            account_id: "account".to_string(),
+            contact_wxid: "wxid".to_string(),
+            message_id: Some("business-message-id".to_string()),
+            dedupe_key: None,
+            direction: MessageDirection::Inbound,
+            content: "明确推进".to_string(),
+            msg_type: None,
+            media_ref: None,
+            raw: None,
+            is_synthetic_relay: false,
+            created_at: DateTime::now(),
+        }];
+
+        let compacted = compact_messages(&messages);
+        assert_eq!(compacted[0].get_object_id("id").ok(), Some(id));
+        assert_eq!(
+            compacted[0].get_str("messageId").ok(),
+            Some("business-message-id")
+        );
     }
 
     #[test]

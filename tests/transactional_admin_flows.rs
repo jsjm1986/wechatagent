@@ -390,6 +390,31 @@ async fn hc015_gateway_writes_one_candidate_and_one_bayesian_point_per_run() {
         .await
         .expect("run HC-015 gateway");
     assert_eq!(app.llm.calls(), 3);
+    let projected_run_id = common::complete_latest_post_decision(
+        &app,
+        &workspace_id,
+        &account_id,
+        &wxid,
+        serde_json::json!({
+            "customerStage": &raw_stage,
+            "domainSignals": { "customer_stage": &raw_stage },
+            "bayesianObservations": [
+                {
+                    "dimension": "预算敏感度",
+                    "value": "高",
+                    "confidence": 0.4,
+                    "evidenceTurns": [0]
+                },
+                {
+                    "dimension": "预算敏感度",
+                    "value": "高",
+                    "confidence": 0.9,
+                    "evidenceTurns": [0]
+                }
+            ]
+        }),
+    )
+    .await;
 
     let candidate = app
         .state
@@ -451,9 +476,10 @@ async fn hc015_gateway_writes_one_candidate_and_one_bayesian_point_per_run() {
         .expect("HC-015 run exists");
     assert_eq!(
         signal.history[0].source_run_id.as_deref(),
-        Some(run.run_id.as_str()),
+        Some(projected_run_id.as_str()),
         "Bayesian point must carry the producing run id"
     );
+    assert_eq!(run.run_id, projected_run_id);
 
     app.cleanup().await;
 }
@@ -1298,6 +1324,7 @@ async fn guide_apply_rolls_back_all_writes_and_retries_once() {
     let frozen_plan = GuideFrozenPlan {
         contact_updated_at: contact.updated_at,
         memory_updated_at: memory.updated_at,
+        memory_insert: None,
         playbook_id: Some(playbook_id),
         playbook_version: Some(1),
         domain_config_id: None,

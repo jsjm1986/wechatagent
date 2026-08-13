@@ -43,6 +43,7 @@ mod knowledge_tools;
 mod media_send;
 mod memory;
 pub(crate) mod multimodal;
+pub(crate) mod outcome_label;
 pub(crate) mod outbox;
 pub(crate) mod outbox_dispatcher;
 pub(crate) mod pacing;

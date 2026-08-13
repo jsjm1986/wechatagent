@@ -1,4 +1,9 @@
 #!/bin/bash
+# ⚠️ 已弃用（2026-08-14 标注）：本脚本是 2026-07-07 的冻结快照（固定旧分支、
+# 8080 直连、交互式合并 main），与现行产线不符——candidate_smoke.py 已把
+# 3003/8080 列为保留端口拒用，现行健康检查走 127.0.0.1:3003。
+# 现行部署工具链见 scripts/deploy/。本文件仅作历史参考，勿直接执行。
+#
 # WechatAgent 快速部署脚本
 # 分支: fix/dispatcher-send-timeout-alignment (15 commits)
 # 日期: 2026-07-07

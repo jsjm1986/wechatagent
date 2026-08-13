@@ -34,7 +34,7 @@ use super::outbox::{
     backoff_with_jitter_seeded, check_second_safety_gate_pure, write_outbox_event, OutboxStatus,
 };
 use super::run_envelope::{
-    SOURCE_KIND_MANUAL_SEND, SOURCE_KIND_PRINCIPAL_CLARIFICATION, SOURCE_KIND_PRINCIPAL_ESCALATION,
+    SOURCE_KIND_PRINCIPAL_CLARIFICATION, SOURCE_KIND_PRINCIPAL_ESCALATION,
     SOURCE_KIND_SYSTEM_INCIDENT,
 };
 
@@ -910,8 +910,12 @@ async fn settle_late_cancel_as_delivery_unknown(
     Ok(true)
 }
 
-/// **二次安全门**（R13.4）：发送前再次检查 contact cooldown / user stop /
-/// 陈旧度（30min）。任一命中 → 返回 `Some(reason)`。
+/// **二次安全门**（R13.4）：发送前再次检查 managed / contact cooldown /
+/// user stop / 陈旧度（30min）。任一命中 → 返回 `Some(reason)`。
+///
+/// 豁免仅限收件人不是客户的三类（领导请示/澄清卡、系统事件通知）；
+/// `manual_send` 与普通托管发送同受本门约束（撤管即停，admin 确认不豁免
+/// 撤管竞态——与 [`check_contact_status_pure`] 的语义定案一致）。
 //
 // NOTE: 暴露为 `pub` 仅供 `tests/outbox_integration.rs`（W4 / Task 5.8 / R13.10）
 // 直接驱动，不应在生产代码中绕过 `process_entry` 单独调用。
@@ -964,6 +968,9 @@ pub async fn second_safety_gate(
     let is_managed = contact
         .as_ref()
         .map_or(false, |c| c.agent_status == AgentStatus::Managed);
+    // 名实注意：变量名沿用纯函数形参 `decision_created_ms`，但实际取的是
+    // **outbox entry** 的 created_at（decision 产出 → enqueue 通常毫秒级，作
+    // decision 创建时刻的近似）；user-stop 判定在极窄窗口下以 entry 时刻为准。
     let decision_created_ms = entry.created_at.timestamp_millis();
     Ok(check_second_safety_gate_pure(
         now.timestamp_millis(),
@@ -2731,7 +2738,13 @@ async fn settle_ambiguous_send(
 ///
 /// 入队后到 dispatcher 抢占之间 contact 可能被运营改成 `normal`（撤管）或
 /// `paused`，此时 in-flight MCP 不应继续把消息送出去（违反"撤管即停"语义）。
-/// `manual_send`（admin UI 主动发）不受此门约束——admin 已显式确认发送意图。
+///
+/// 语义定案（保守方向）：`manual_send`（admin UI 主动发）与普通托管发送**同受**
+/// 撤管即停约束——admin 确认的是"发这条消息"，不豁免其后发生的撤管竞态；撤管时
+/// 宁可取消已确认的发送。上游 [`second_safety_gate`] 本就对 manual_send 判
+/// `not_managed_at_send`，本门作为其后第二次 fresh 读的复核点保持同一判定，
+/// 两读之间的状态翻转也收敛到 cancel。
+/// 仅豁免收件人不是客户的三类：领导请示/澄清卡与系统事件通知。
 ///
 /// 返回 `Some(reason)` 表示应当 cancel；`None` 表示放行。
 pub(crate) fn check_contact_status_pure(
@@ -2740,8 +2753,7 @@ pub(crate) fn check_contact_status_pure(
 ) -> Option<&'static str> {
     if matches!(
         source_kind,
-        SOURCE_KIND_MANUAL_SEND
-            | SOURCE_KIND_PRINCIPAL_ESCALATION
+        SOURCE_KIND_PRINCIPAL_ESCALATION
             | SOURCE_KIND_PRINCIPAL_CLARIFICATION
             | SOURCE_KIND_SYSTEM_INCIDENT
     ) {
@@ -2904,6 +2916,7 @@ pub async fn process_entry(state: &AppState, entry: &OutboxEntry) -> AppResult<(
     // 防"连珠炮"——单 worker 串行 for 循环里跨客户/多段消息背靠背零间隔发出 = 机器特征。
     // 位置在 reclaim 幂等门之后（不误拦本该 post-hoc 标 sent 的条目）、发送之前。
     // 查询失败 fail-soft 放行（宁可漏限一次也不丢消息）。
+    // S5-4：间隔按本段字符数加权打字时间（长段比短句慢几拍，见 pacing.rs 常量）。
     if let Ok(Some(last_sent_ms)) =
         account_last_sent_at_ms(state, &entry.workspace_id, &entry.account_id).await
     {
@@ -2911,6 +2924,7 @@ pub async fn process_entry(state: &AppState, entry: &OutboxEntry) -> AppResult<(
             fastrand::f64(),
             state.config.account_send_min_interval_ms,
             state.config.account_send_max_interval_ms,
+            entry.content.chars().count(),
         );
         let now_ms = DateTime::now().timestamp_millis();
         if now_ms - last_sent_ms < interval_ms {
@@ -3286,6 +3300,7 @@ async fn tick(state: &AppState, worker: &str, lease_seconds: i32) -> AppResult<(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::run_envelope::SOURCE_KIND_MANUAL_SEND;
 
     #[tokio::test]
     async fn outbox_notify_wakes_production_wait_without_poll_delay() {
@@ -3571,17 +3586,40 @@ mod tests {
         assert_eq!(reason, Some("contact_status_changed_unmanaged"));
     }
 
-    /// P1-6：admin 主动 manual_send 不受 agent_status 门约束——admin
-    /// 已显式确认发送意图（同 admin 直接联系语义）。
+    /// 保守语义定案：manual_send 与普通托管发送同受"撤管即停"约束。撤管竞态下
+    /// 宁可取消 admin 已确认的发送，也不把消息发给已退出托管的 contact（二次安全门
+    /// 同判 not_managed_at_send，本门是其后的第二读复核）。
     #[test]
-    fn contact_status_gate_passthrough_for_manual_send() {
-        assert!(
-            check_contact_status_pure(SOURCE_KIND_MANUAL_SEND, &AgentStatus::Normal).is_none(),
-            "manual_send 不受 agent_status 门约束"
+    fn contact_status_gate_cancels_manual_send_when_unmanaged() {
+        assert_eq!(
+            check_contact_status_pure(SOURCE_KIND_MANUAL_SEND, &AgentStatus::Normal),
+            Some("contact_status_changed_unmanaged"),
+            "manual_send 不豁免撤管竞态"
         );
+    }
+
+    /// managed contact 的 manual_send 照常放行（约束只在撤管后生效）。
+    #[test]
+    fn contact_status_gate_allows_manual_send_when_managed() {
         assert!(
             check_contact_status_pure(SOURCE_KIND_MANUAL_SEND, &AgentStatus::Managed).is_none()
         );
+    }
+
+    /// 领导请示/澄清卡与系统事件通知的收件人是幕后决策人而非客户，
+    /// 不适用客户 agent_status 门。
+    #[test]
+    fn contact_status_gate_passthrough_for_principal_kinds() {
+        assert!(check_contact_status_pure(
+            SOURCE_KIND_PRINCIPAL_ESCALATION,
+            &AgentStatus::Normal
+        )
+        .is_none());
+        assert!(check_contact_status_pure(
+            SOURCE_KIND_PRINCIPAL_CLARIFICATION,
+            &AgentStatus::Normal
+        )
+        .is_none());
     }
 
     #[test]

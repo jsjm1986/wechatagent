@@ -5,6 +5,10 @@
 //! 消息回复——最像真人（睡觉时不回、醒来看完所有消息再答）。主动发送（planner
 //! 催进 / 承诺跟进）若在静默时段到点，则**重排**到醒来时刻而非取消（避免丢承诺）。
 //!
+//! 唯一豁免（S5-3）：交易域 profile 下的**显式购买/付款承诺**入站即时应答、不等醒来
+//! （半夜要下单的客户等 10 小时 = 直接丢单），见
+//! [`bypass_deferral_for_explicit_buying_intent`]。
+//!
 //! 时区：用**运营参数固定偏移** `quiet_hours_tz_offset_hours`（小时，如中国 +8），
 //! 不依赖部署宿主时区（`chrono::Local` 取的是进程时区，容器多默认 UTC，会让
 //! "22:00 静默"实际在 UTC 22:00 触发、偏 8 小时）。判定全部用 epoch 毫秒 + 偏移的
@@ -14,10 +18,6 @@
 //! 取真实时钟的薄包装（[`is_quiet_now`] / [`next_wake_at`]）用 `Utc::now()`。
 
 use chrono::Utc;
-
-/// 旧版静默时段入站任务 kind，仅用于滚动升级时读取、迁移和兼容历史测试。
-/// 新写入统一使用 `webhooks::DURABLE_INBOUND_REPLY_KIND` (`inbound_reply`)。
-pub(crate) const DEFERRED_INBOUND_REPLY_KIND: &str = "deferred_inbound_reply";
 
 /// 判定 `now_hour`（0..=23）是否落在静默时段 `[start, end)` 内。
 ///
@@ -115,20 +115,37 @@ pub(crate) fn next_wake_at(
     ))
 }
 
-/// universal-domain-adaptation H19 / G04：解析某 contact 的**有效作息门控开关**。
+/// S5-3：静默时段 defer 的**显式交易意图豁免**判定（确定性、零 LLM 成本）。
 ///
-/// 经 [`resolve_operation_mode`](crate::planner::resolve_operation_mode) 三级链
-/// （contact override → profile.per_relationship → profile 默认范式）取
-/// `quiet_hours.enabled_override`，缺省回落全局 `global_enabled`（即
-/// `runtime.quiet_hours_enabled`）。与其余 6 个 OperationMode 驱动力解析路径一致——
-/// 此前只读 `contact.operation_mode_override`、绕过 resolve，导致 profile/per_relationship
-/// 级的 `quiet_hours.enabled_override` 是运行时死字段（G04）。纯函数、不查 DB
-/// （profile 由调用方传入已加载值）。
+/// 与 reaction 确定性购买下限（`reaction.rs` 的 `deterministic_buying`）**同一词表、
+/// 同一语义门**：交易域 profile（`transaction_facts_enabled=true`）+ 显式购买/付款
+/// 承诺短语（[`super::reaction::explicit_buying_intent`]：≤120 字、反例 marker 过滤）。
+/// 两个条件缺一不可——非交易域（情感陪伴等）即便命中购买短语也不豁免，杜绝
+/// admin 误配下交易语义渗入非交易对话。
 ///
-/// DEFAULT 字节等价：contact override=None + profile 默认范式 `enabled_override=None`
-/// → resolve 回落 `OperationMode::default()`（`enabled_override=None`）→ `.unwrap_or`
-/// 返回 `global_enabled`，与改造前逐字一致；情感陪伴 profile/contact 设 `Some(false)`
-/// → 夜间不被静默门压制。
+/// 设计边界：v1 刻意只做交易词表豁免，**不做"高意向阶段"判定**——阶段集合是
+/// 行业可配的（`system_taxonomies` / DomainProfile），硬编码销售阶段违反通用化；
+/// 后续若需要按阶段豁免，应走 DomainProfile 配置声明，而不是在这里加分支。
+///
+/// 放在 quiet_hours 模块（而非 webhooks）：`reaction` 是 `agent` 的私有子模块，
+/// 词表函数 `pub(crate)` 但模块路径对 crate 根不可见；本模块是 `pub(crate) mod`，
+/// 由同 parent 内转发即可让 webhooks 消费，无须放宽 `reaction` 模块本身的可见性。
+pub(crate) fn bypass_deferral_for_explicit_buying_intent(
+    active_profile: &crate::models::DomainProfile,
+    content: &str,
+) -> bool {
+    active_profile.transaction_facts_enabled && super::reaction::explicit_buying_intent(content)
+}
+
+/// 解析某 contact 的**有效作息门控开关**——现行语义是 **workspace 开关唯一权威**：
+/// 直接返回 `workspace_enabled`（即 `runtime.quiet_hours_enabled`），contact /
+/// profile 两级的 `quiet_hours.enabled_override` 已**不再**参与调度判定。
+///
+/// 历史脉络：universal-domain-adaptation H19 / G04 曾把本函数接上
+/// [`resolve_operation_mode`](crate::planner::resolve_operation_mode) 三级链
+/// （contact override → profile.per_relationship → profile 默认范式），后收敛回
+/// workspace-only。保留 `_contact` / `_profile` 入参只为调用面签名稳定与滚动升级
+/// 兼容（老数据里的 override 字段仍可读，但不改变行为）。纯函数、不查 DB。
 pub(crate) fn effective_quiet_hours_enabled(
     _contact: &crate::models::Contact,
     _profile: &crate::models::DomainProfile,
@@ -242,11 +259,6 @@ mod tests {
     }
 
     #[test]
-    fn deferred_kind_constant_stable() {
-        assert_eq!(DEFERRED_INBOUND_REPLY_KIND, "deferred_inbound_reply");
-    }
-
-    #[test]
     fn jitter_is_deterministic_per_seed() {
         let now = 1_700_000_000_000;
         let a = next_wake_utc_ms(now, 8, 8, jitter_ms_for_seed("wxid_alice", 900));
@@ -337,5 +349,40 @@ mod tests {
 
         assert!(effective_quiet_hours_enabled(&contact, &profile, true));
         assert!(!effective_quiet_hours_enabled(&contact, &profile, false));
+    }
+
+    // ── S5-3：静默 defer 的显式交易意图豁免门 ──────────────────────────
+
+    /// 交易域（DEFAULT 销售 profile，transaction_facts_enabled=true）+ 显式购买/
+    /// 付款承诺 → 豁免为真；寒暄、反例 marker（"如果"假设句）不豁免。
+    #[test]
+    fn buying_intent_bypass_hits_only_explicit_commitment_on_transaction_profile() {
+        let tx = crate::agent::domain_profile::default_domain_profile("ws-quiet-tx");
+        assert!(bypass_deferral_for_explicit_buying_intent(
+            &tx,
+            "我要买，现在付款"
+        ));
+        assert!(!bypass_deferral_for_explicit_buying_intent(
+            &tx,
+            "今天好累呀，晚点再聊"
+        ));
+        // 与 reaction 确定性购买下限同一词表同一语义：假设/反例 marker 一样被过滤。
+        assert!(!bypass_deferral_for_explicit_buying_intent(
+            &tx,
+            "如果我要买，现在付款有优惠吗"
+        ));
+        assert!(!bypass_deferral_for_explicit_buying_intent(&tx, "先不买了"));
+    }
+
+    /// 非交易域（情感陪伴 example，transaction_facts_enabled=false）：同一购买短语
+    /// 也不豁免——profile 门与词表门缺一不可。
+    #[test]
+    fn buying_intent_bypass_requires_transaction_profile() {
+        let nontx =
+            crate::agent::domain_profile::example_emotional_companion_profile("ws-quiet-nontx");
+        assert!(!bypass_deferral_for_explicit_buying_intent(
+            &nontx,
+            "我要买，现在付款"
+        ));
     }
 }

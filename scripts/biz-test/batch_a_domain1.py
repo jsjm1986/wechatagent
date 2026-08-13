@@ -1,7 +1,7 @@
 """域①：文章进知识库的分析整理能力。
 
 import-preview 真调 LLM(knowledge.import.preview)析出 document/items/chunks，
-验 forbiddenClaims 识别营销夸大、sourceQuote 忠于原文、落库全 needs_review(红线)。
+验 document.riskNotes 留痕绝对承诺、sourceQuote 忠于原文、落库全 needs_review(红线)。
 
 跑法：export DEPLOY_PASS=...; python scripts/biz-test/batch_a_domain1.py
 """
@@ -42,16 +42,17 @@ def main() -> None:
     _lib.expect(has_quote, DOMAIN, "chunk 含 sourceQuote(忠于原文)",
                 f"keys={list(chunks[0].keys())}", "high")
 
-    # forbiddenClaims 真识别营销夸大（文章含"保证学会/包教包会/全市第一/无条件退款"）
-    all_forbidden = [f for c in chunks for f in (c.get("forbiddenClaims") or [])]
-    doc_forbidden = []
-    items = preview.get("items", [])
-    for it in items:
-        doc_forbidden += it.get("forbiddenClaims") or []
-    total_forbidden = all_forbidden + doc_forbidden
-    _lib.expect(len(total_forbidden) > 0, DOMAIN, "识别出营销夸大(forbiddenClaims 非空)",
-                f"forbidden={total_forbidden}", "high",
-                "文章含'保证学会/包教包会/全市第一'等夸大,应进 forbiddenClaims")
+    # 现行契约已删除 chunk/item.forbiddenClaims；绝对承诺统一留痕在 document.riskNotes。
+    # 服务端有原文行级确定性下限，模型可补充更广的上下文风险，但不能漏掉显式保证/最高级宣传。
+    document = preview.get("document", {}) if isinstance(preview, dict) else {}
+    risk_notes = document.get("riskNotes", []) if isinstance(document, dict) else []
+    risk_blob = "\n".join(str(note) for note in risk_notes)
+    expected_markers = ("保证学会", "包教包会", "全市第一", "无条件退款", "保证考进")
+    captured = [marker for marker in expected_markers if marker in risk_blob]
+    _lib.expect(len(captured) >= 3, DOMAIN,
+                "document.riskNotes 留痕多条原文绝对承诺",
+                f"captured={captured} riskNotes={risk_notes}", "high",
+                "显式保证/最高级宣传未进入现行 riskNotes 审计契约")
 
     # import-apply 落库 → 验红线：全 needs_review
     print(f"[{DOMAIN}] import-apply 落库...")
@@ -73,17 +74,31 @@ def main() -> None:
     time.sleep(2)
     # chunk 无 source_name 字段（在 document 层）；按 apply 返回的 documentId 关联查询。
     # document_id 是 ObjectId 类型，字符串查询命中 0，必须 ObjectId() 包裹。
+    if not isinstance(doc_id, str) or len(doc_id) != 24:
+        _lib.expect(False, DOMAIN, "import-apply 返回合法 documentId",
+                    f"applied={applied}", "critical", "无法回读持久化导入结果")
+        return
     rows = _lib.mongo_json(
         f'db.operation_knowledge_chunks.find({{document_id:ObjectId("{doc_id}")}},'
         '{integrity_status:1,status:1,_id:0}).toArray()'
     )
     rows = rows if isinstance(rows, list) else []
+    stored_doc = _lib.mongo_json(
+        f'db.operation_knowledge_documents.findOne({{_id:ObjectId("{doc_id}")}},'
+        '{risk_notes:1,_id:0})'
+    )
+    stored_risks = stored_doc.get("risk_notes", []) if isinstance(stored_doc, dict) else []
+    stored_blob = "\n".join(str(note) for note in stored_risks)
+    _lib.expect(all(marker in stored_blob for marker in captured), DOMAIN,
+                "riskNotes 随 Document 持久化且未在 Apply 丢失",
+                f"captured={captured} stored={stored_risks}", "critical",
+                "预览风险提示未持久化，运营审核界面无法追溯")
     all_review = bool(rows) and all(r.get("integrity_status") == "needs_review" for r in rows)
     _lib.expect(all_review, DOMAIN, "落库全 needs_review(AI 永不自动 verify 红线)",
                 f"doc_id={doc_id} chunkIds={len(chunk_ids)} rows={rows}", "critical",
                 "若有 verified=红线破")
 
-    print(f"[{DOMAIN}] 完成。落库 {len(rows)} chunks, forbiddenClaims {len(total_forbidden)} 条")
+    print(f"[{DOMAIN}] 完成。落库 {len(rows)} chunks, riskNotes {len(stored_risks)} 条")
 
 
 if __name__ == "__main__":

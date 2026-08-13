@@ -69,9 +69,9 @@ export function JudgmentBar({
   onRiskClick,
   onEscalationClick,
 }: JudgmentBarProps) {
-  // 人格态：lastConversationMode 经字典翻译；OperationHealth 类型无此字段，Contact 亦为可选
-  // 拓展键，故用与 legacy.tsx:2179 一致的断言读取。无值不渲染此 chip。
-  const lastMode = (contact as { lastConversationMode?: string | null }).lastConversationMode || null;
+  // 人格态：lastConversationMode 经字典翻译。设计预留键（后端当前不下发，
+  // 见 types 里 Contact.lastConversationMode 注释），无值不渲染此 chip。
+  const lastMode = contact.lastConversationMode || null;
   const modeLabel = lastMode ? labelFor(taxonomies, "conversation_mode", lastMode).text : null;
 
   // 最近轮：finalReviewStatus 精确 10 态映射（取代旧 approved?通过:拦截 二元）。
@@ -87,11 +87,10 @@ export function JudgmentBar({
   // 风险灯：健康度存在 danger 项即亮红，点击切观测段。
   const hasRisk = (health?.items || []).some((item) => item.tone === "danger");
 
-  // 作息灯：作息字段是 Task 1 新增的 operation-health 只读顶层键，OperationHealth 类型未声明，
-  // 故断言读取；inQuietHours 非 true（undefined/false）不渲染此 chip（优雅降级）。
-  const quiet = health as (OperationHealth & { inQuietHours?: boolean; nextWakeAt?: string | null }) | null;
-  const inQuietHours = quiet?.inQuietHours === true;
-  const wakeTime = formatWakeTime(quiet?.nextWakeAt);
+  // 作息灯：Task 1 的 operation-health 只读顶层键（OperationHealth 已声明）；
+  // inQuietHours 非 true（undefined/false）不渲染此 chip（优雅降级）。
+  const inQuietHours = health?.inQuietHours === true;
+  const wakeTime = formatWakeTime(health?.nextWakeAt);
 
   // 请示灯：正数可点击；null 显示不可用，不能和真实 0 混淆。
   const escalationLabel = escalationCountLabel(escalationCount);

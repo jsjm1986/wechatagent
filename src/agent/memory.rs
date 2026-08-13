@@ -573,10 +573,13 @@ pub fn compact_memory_card_with_dimensions(
     }
 
     // H17：typed 骨架数组在 extra 里的历史镜像 cap 保持写死（coreFacts 6 /
-    // recentFacts 10 / deprecatedFacts 6——与 typed 三数组固定 cap 6/10/20 的 wire
-    // 兼容形态，不属业务维度）。业务记忆维度（preferences/doNotDo/... 八槽）的 cap
-    // 改由 memory_dimensions 驱动：DEFAULT 维度逐字复刻原 cap 表，故字节等价；情感
-    // profile 声明的额外槽（情绪史/纪念日）也在此被各自 cap 截断（防无界增长）。
+    // recentFacts 10 / deprecatedFacts 6）。注意镜像 cap 是历史 wire 兼容的独立
+    // 写死值，与 typed 三数组的 cap（core 6 / recent 10 / deprecated **20**，见
+    // 上方 truncate 调用）在 deprecated 一侧并不相等——镜像只保留 6 条副本，
+    // 不与 typed 对齐；不属业务维度。业务记忆维度（preferences/doNotDo/... 八槽）
+    // 的 cap 改由 memory_dimensions 驱动：DEFAULT 维度逐字复刻原 cap 表，故字节
+    // 等价；情感 profile 声明的额外槽（情绪史/纪念日）也在此被各自 cap 截断
+    // （防无界增长）。
     limit_extra_array(&mut compact.extra, "coreFacts", 6);
     limit_extra_array(&mut compact.extra, "recentFacts", 10);
     limit_extra_array(&mut compact.extra, "deprecatedFacts", 6);
@@ -831,6 +834,86 @@ pub(crate) fn deprecate_same_dimension_conflicts(
 ///
 /// 返回追加的 `warnings: Vec<String>`，由调用方写入
 /// `agent_run_logs.memory_consolidator_warnings`。
+/// Build durable, run-scoped audit details from the committed memory-card transition.
+/// Model-authored conflict descriptions are retained as context, while newly deprecated facts
+/// are derived from the authoritative before/after cards so deterministic same-dimension
+/// arbitration is observable even when the model omitted `conflicts`.
+pub(crate) fn memory_conflict_audit_events(
+    previous: &MemoryCardTyped,
+    current: &MemoryCardTyped,
+    model_conflicts: &[Document],
+    run_id: &str,
+    previous_version: i32,
+    memory_card_version: i32,
+) -> Vec<Document> {
+    use std::collections::HashSet;
+
+    fn fact_identity(fact: &MemoryFactRepr) -> String {
+        match fact {
+            MemoryFactRepr::Structured(value) if !value.id.trim().is_empty() => {
+                format!("id:{}", value.id)
+            }
+            _ => format!("text:{}", fact.as_text()),
+        }
+    }
+
+    let prior: HashSet<String> = previous
+        .deprecated_facts
+        .iter()
+        .map(fact_identity)
+        .collect();
+    let mut events = Vec::new();
+    for conflict in model_conflicts {
+        let mut details = conflict.clone();
+        details.insert("auditSource", "model_conflict");
+        details.insert("runId", run_id);
+        details.insert("previousVersion", previous_version);
+        details.insert("memoryCardVersion", memory_card_version);
+        events.push(details);
+    }
+    for fact in &current.deprecated_facts {
+        if prior.contains(&fact_identity(fact)) {
+            continue;
+        }
+        let mut details = doc! {
+            "auditSource": "memory_card_diff",
+            "runId": run_id,
+            "previousVersion": previous_version,
+            "memoryCardVersion": memory_card_version,
+            "deprecatedFactText": fact.as_text(),
+        };
+        if let MemoryFactRepr::Structured(value) = fact {
+            details.insert("deprecatedFactId", value.id.clone());
+            details.insert(
+                "dimension",
+                value
+                    .dimension
+                    .clone()
+                    .map(Bson::String)
+                    .unwrap_or(Bson::Null),
+            );
+            details.insert(
+                "deprecationReason",
+                value
+                    .deprecation_reason
+                    .clone()
+                    .map(Bson::String)
+                    .unwrap_or(Bson::Null),
+            );
+            details.insert(
+                "supersededBy",
+                value
+                    .extra
+                    .get("supersededBy")
+                    .cloned()
+                    .unwrap_or(Bson::Null),
+            );
+        }
+        events.push(details);
+    }
+    events
+}
+
 pub(crate) fn apply_consolidator_deprecations(
     card: &mut MemoryCardTyped,
     previous: Option<&MemoryCardTyped>,
@@ -1850,7 +1933,7 @@ async fn consolidate_contact_memory_inner(
     }
     // 先把所有审计副作用转成纯数据。生产 worker 必须在 Task 的 committing CAS
     // 获胜后才允许写这些投影；否则 admin cancel 与这里会形成跨集合 TOCTOU。
-    let mut conflict_events = Vec::new();
+    let mut model_conflicts = Vec::new();
     if let Some(conflicts) = value.get("conflicts").and_then(|v| v.as_array()) {
         for conflict in conflicts {
             let winner = conflict
@@ -1860,7 +1943,7 @@ async fn consolidate_contact_memory_inner(
             if winner.is_empty() || winner == "none" {
                 continue;
             }
-            conflict_events.push(doc! {
+            model_conflicts.push(doc! {
                 "a_id": conflict.get("aId").and_then(|v| v.as_str()).unwrap_or(""),
                 "b_id": conflict.get("bId").and_then(|v| v.as_str()).unwrap_or(""),
                 "winner": winner,
@@ -1871,6 +1954,14 @@ async fn consolidate_contact_memory_inner(
         }
     }
     let next_version = next_memory_card_version(&memory);
+    let conflict_events = memory_conflict_audit_events(
+        &previous_card,
+        &compact,
+        &model_conflicts,
+        &run_id,
+        memory.memory_card_version,
+        next_version,
+    );
     compact.extra.insert("version", next_version);
     compact.extra.insert("source", "memory_consolidator_agent");
     let compact_doc = to_document(&compact).unwrap_or_default();
@@ -3504,10 +3595,12 @@ mod r7_deprecation_tests {
     //! 4. 改写场景：新 fact text 与上一版 X 不同但 id 相同 → 视为改写直接覆盖、
     //!    不进 deprecatedFacts。
 
-    use super::apply_consolidator_deprecations;
-    use super::deprecate_same_dimension_conflicts;
+    use super::{
+        apply_consolidator_deprecations, deprecate_same_dimension_conflicts,
+        memory_conflict_audit_events,
+    };
     use crate::models::{MemoryCardTyped, MemoryFact, MemoryFactRepr};
-    use mongodb::bson::DateTime;
+    use mongodb::bson::{doc, DateTime};
     use serde_json::json;
 
     fn fact(id: &str, text: &str) -> MemoryFact {
@@ -3710,6 +3803,44 @@ mod r7_deprecation_tests {
         let dep: Vec<&str> = card.deprecated_facts.iter().map(|f| f.as_text()).collect();
         assert!(dep.iter().any(|t| t.contains("8")), "旧值进 deprecated");
         assert!(!warnings.is_empty(), "裁决应记 warning 供审计");
+    }
+
+    #[test]
+    fn conflict_audit_is_bound_to_committed_run_and_versions() {
+        let previous = MemoryCardTyped::default();
+        let mut deprecated = fact("old-age", "孩子8岁");
+        deprecated.dimension = Some("child_age".into());
+        deprecated.deprecation_reason = Some("superseded by newer fact".into());
+        deprecated.extra.insert("supersededBy", "new-age");
+        let current = MemoryCardTyped {
+            deprecated_facts: vec![MemoryFactRepr::Structured(deprecated)],
+            ..Default::default()
+        };
+        let events = memory_conflict_audit_events(
+            &previous,
+            &current,
+            &[doc! { "winner": "new-age" }],
+            "run-42",
+            7,
+            8,
+        );
+        assert_eq!(
+            events.len(),
+            2,
+            "model context and authoritative diff are both retained"
+        );
+        for event in &events {
+            assert_eq!(event.get_str("runId").unwrap(), "run-42");
+            assert_eq!(event.get_i32("previousVersion").unwrap(), 7);
+            assert_eq!(event.get_i32("memoryCardVersion").unwrap(), 8);
+        }
+        let durable = events
+            .iter()
+            .find(|event| event.get_str("auditSource").ok() == Some("memory_card_diff"))
+            .unwrap();
+        assert_eq!(durable.get_str("deprecatedFactId").unwrap(), "old-age");
+        assert_eq!(durable.get_str("supersededBy").unwrap(), "new-age");
+        assert_eq!(durable.get_str("dimension").unwrap(), "child_age");
     }
 
     #[test]

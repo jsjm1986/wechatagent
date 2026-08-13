@@ -7,16 +7,15 @@ import "./components/ui/reset.css";
 import "./styles.css";
 
 // P0-F：全局 fetch 401 拦截器。后端 session middleware 拒登录后会返 401；
-// 前端这里 monkey-patch 一次 fetch，所有 /api 调用 401 都走 forceLogout，
-// 把页面拉回 LoginScreen。开关用 sessionStorage（重启 tab 也能复现）。
-const SESSION_KEY = "wa.authed";
+// 前端这里 monkey-patch 一次 fetch，所有 /api 调用 401 都派发 wa-auth-expired
+// 事件，AuthGate 监听后清登录态、把页面拉回 LoginScreen。登录判定唯一依据
+// /api/auth/me（session cookie 为 http-only，本地不镜像登录态）。
 const originalFetch = window.fetch.bind(window);
 window.fetch = async (input, init) => {
   const res = await originalFetch(input, init);
   if (res.status === 401) {
     const url = typeof input === "string" ? input : (input as Request).url;
     if (url.startsWith("/api/") && !url.startsWith("/api/auth/login")) {
-      sessionStorage.removeItem(SESSION_KEY);
       window.dispatchEvent(new CustomEvent("wa-auth-expired"));
     }
   }
@@ -59,7 +58,6 @@ function LoginScreen({ onLoggedIn }: { onLoggedIn: (me: MeResponse) => void }) {
         return;
       }
       const me = (await meRes.json()) as MeResponse;
-      sessionStorage.setItem(SESSION_KEY, "1");
       onLoggedIn(me);
     } catch (e) {
       setErr(`网络错误：${(e as Error).message}`);
@@ -126,10 +124,8 @@ function AuthGate() {
         if (cancelled) return;
         if (r.ok) {
           const body = (await r.json()) as MeResponse;
-          sessionStorage.setItem(SESSION_KEY, "1");
           setMe(body);
         } else {
-          sessionStorage.removeItem(SESSION_KEY);
           setMe(null);
         }
       } finally {
@@ -155,7 +151,6 @@ function AuthGate() {
     } catch {
       // 网络错失败也清本地状态。
     }
-    sessionStorage.removeItem(SESSION_KEY);
     setMe(null);
   }
 

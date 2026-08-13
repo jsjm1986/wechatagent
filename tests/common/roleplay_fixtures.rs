@@ -56,13 +56,21 @@ where
     F: FnOnce(&mut DomainProfile),
 {
     let mut profile = default_domain_profile(workspace_id);
+    mutate(&mut profile);
+    // The mutation may replace the whole profile with an authoritative industry template. Pin
+    // fixture identity/release fields afterwards so semantic fields cannot drift while the row
+    // remains a valid unique active artifact for this test workspace.
     profile.id = Some(ObjectId::new());
+    profile.workspace_id = workspace_id.to_string();
     profile.profile_id = profile_id.to_string();
+    profile.version = 1;
+    profile.previous_version = None;
+    profile.release_status = "published".to_string();
     profile.is_active = true;
     profile.current_version = true;
     profile.seeded_by = Some("roleplay_fixture".to_string());
-    profile.updated_at = DateTime::now();
-    mutate(&mut profile);
+    profile.created_at = DateTime::now();
+    profile.updated_at = profile.created_at;
 
     // 单活：降级同 workspace 其它 active 行。
     app.state
@@ -108,15 +116,16 @@ pub async fn seed_emotional_companion_profile_in_workspace(
     // 第 78 点：价值字段从 lib 侧单一真相源 example_emotional_companion_profile 取，
     // 避免 fixture 与 lib 单测两份情感陪伴契约漂移。seed helper 只负责单活/插入/缓存失效。
     let template = wechatagent::agent::example_emotional_companion_profile(workspace_id);
-    seed_active_domain_profile(app, workspace_id, "emotional_companion_minimal", move |p| {
-        p.display_name = template.display_name;
-        p.description = template.description;
-        p.conversation_modes = template.conversation_modes;
-        p.grounding_gate_bypass_without_claim = template.grounding_gate_bypass_without_claim;
-        p.distrust_self_reported_low_risk = template.distrust_self_reported_low_risk;
-        p.operation_mode = template.operation_mode;
-        p.prompt_fragment = template.prompt_fragment;
-    })
+    seed_active_domain_profile(
+        app,
+        workspace_id,
+        "emotional_companion_minimal",
+        move |profile| {
+            // Copy the complete authoritative template. Selecting a few fields here previously left
+            // transaction_facts_enabled=true and other sales defaults active in "emotional" tests.
+            *profile = template;
+        },
+    )
     .await
 }
 

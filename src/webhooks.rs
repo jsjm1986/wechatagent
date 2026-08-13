@@ -29,6 +29,7 @@ const HANDOFF_PENDING: &str = "pending";
 const HANDOFF_MATERIALIZED: &str = "materialized";
 const HANDOFF_DEFERRED: &str = "deferred"; // legacy read compatibility only
 const HANDOFF_IGNORED: &str = "ignored_not_managed";
+const HANDOFF_QUARANTINED: &str = "quarantined";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DurableInboundTask {
@@ -242,6 +243,103 @@ pub(crate) fn policy_run_at(
         )
     } else {
         DateTime::now()
+    }
+}
+
+/// 一条 managed 入站进入唯一被动回复义务的排程结果。
+enum InboundScheduleOutcome {
+    /// 静默时段：义务已排到醒来时刻（`gateway_status=quiet_hours_waiting`）。
+    QuietDeferred,
+    /// 正常去抖链路（非静默时段，或命中 S5-3 显式交易意图豁免）：返回义务 task
+    /// 供 webhook 主路径即时安排后台唤醒；恢复路径可忽略（task worker 会接手）。
+    Debounced(DurableInboundTask),
+}
+
+/// #69 作息门控 + S5-3 豁免：把一条 managed 入站排进该 contact 唯一的
+/// `inbound_reply` 义务。webhook 主路径与 [`reconcile_pending_inbound_handoffs`]
+/// 崩溃恢复路径共用本判定，杜绝两处分支漂移。
+///
+/// 静默时段默认 defer 到醒来时刻；唯一豁免（S5-3）：交易域 profile 下的显式
+/// 购买/付款承诺（[`agent::quiet_hours::bypass_deferral_for_explicit_buying_intent`]，
+/// 与 reaction 确定性购买下限同词表同语义门）→ 走正常去抖链路（与非静默时段
+/// 行为一致），并 best-effort 写一条 `quiet_hours_bypassed_buying_intent` 事件。
+async fn schedule_managed_inbound_obligation(
+    state: &AppState,
+    contact: &Contact,
+    inbound: &ConversationMessage,
+    runtime: &crate::agent::UserRuntimeParameters,
+    active_profile: &crate::models::DomainProfile,
+) -> AppResult<InboundScheduleOutcome> {
+    let quiet = runtime.quiet_hours_enabled
+        && agent::quiet_hours::is_quiet_now(
+            runtime.quiet_hours_start,
+            runtime.quiet_hours_end,
+            runtime.quiet_hours_tz_offset_hours,
+        );
+    let buying_intent_bypass = quiet
+        && agent::quiet_hours::bypass_deferral_for_explicit_buying_intent(
+            active_profile,
+            &inbound.content,
+        );
+    if buying_intent_bypass {
+        emit_quiet_hours_bypass_event(state, contact, inbound.id).await;
+    }
+    if quiet && !buying_intent_bypass {
+        let run_at = agent::quiet_hours::next_wake_at(
+            runtime.quiet_hours_end,
+            runtime.quiet_hours_tz_offset_hours,
+            &contact.wxid,
+            state.config.wake_jitter_max_seconds,
+        );
+        materialize_durable_inbound_task_at(state, contact, inbound, run_at, "quiet_hours_waiting")
+            .await?;
+        Ok(InboundScheduleOutcome::QuietDeferred)
+    } else {
+        let window_ms = crate::agent::domain_profile::resolve_debounce_window_ms(
+            active_profile,
+            state.config.message_debounce_window_ms,
+        );
+        let task = materialize_durable_inbound_task(state, contact, inbound, window_ms).await?;
+        Ok(InboundScheduleOutcome::Debounced(task))
+    }
+}
+
+/// S5-3 豁免命中的可观测埋点（best-effort：写失败只 warn，绝不阻断应答链路）。
+/// `dedupe_key` 用 message `_id` 锚定——webhook 主路径与恢复路径并发处理同一条
+/// 入站时，partial unique index 保证事件至多一条。
+async fn emit_quiet_hours_bypass_event(
+    state: &AppState,
+    contact: &Contact,
+    message_id: Option<ObjectId>,
+) {
+    let result = state
+        .db
+        .events()
+        .insert_one(
+            crate::models::AgentEvent {
+                id: None,
+                workspace_id: contact.workspace_id.clone(),
+                account_id: contact.account_id.clone(),
+                contact_wxid: Some(contact.wxid.clone()),
+                kind: "quiet_hours_bypassed_buying_intent".to_string(),
+                status: "bypassed".to_string(),
+                summary: "静默时段收到显式购买/付款承诺，AI 按交易域策略即时应答（不等待醒来时刻）"
+                    .to_string(),
+                details: message_id.map(|id| doc! { "message_id": id }),
+                created_at: DateTime::now(),
+                dedupe_key: message_id.map(|id| format!("quiet_hours_buying_bypass:{}", id.to_hex())),
+            },
+            None,
+        )
+        .await;
+    if let Err(error) = result {
+        if !is_duplicate_key_error(&error) {
+            tracing::warn!(
+                contact_wxid = %contact.wxid,
+                ?error,
+                "记录 quiet_hours_bypassed_buying_intent 事件失败（观测旁路，不影响应答）"
+            );
+        }
     }
 }
 
@@ -671,10 +769,7 @@ pub async fn reconcile_workspace_reply_obligations(
         .find(
             doc! {
                 "workspace_id": workspace_id,
-                "kind": { "$in": [
-                    DURABLE_INBOUND_REPLY_KIND,
-                    agent::quiet_hours::DEFERRED_INBOUND_REPLY_KIND,
-                ] },
+                "kind": DURABLE_INBOUND_REPLY_KIND,
                 "status": { "$in": ["pending", "retry", "failed", "running", "outbox_enqueued"] },
             },
             None,
@@ -713,8 +808,6 @@ pub async fn reconcile_workspace_reply_obligations(
         };
         let run_at = policy_run_at(&runtime, &contact, state);
         let old_decision = task.get_object_id("outbox_decision_id").ok();
-        let is_legacy =
-            task.get_str("kind").ok() == Some(agent::quiet_hours::DEFERRED_INBOUND_REPLY_KIND);
 
         // Invalidate ownership first. Dispatcher authorization always joins back to this task.
         let result = tasks
@@ -723,32 +816,18 @@ pub async fn reconcile_workspace_reply_obligations(
                     "_id": task_id,
                     "status": { "$in": ["pending", "retry", "failed", "running", "outbox_enqueued"] },
                 },
-                if is_legacy {
-                    doc! {
-                        "$set": {
-                            "status": "cancelled",
-                            "gateway_status": "merged_into_reply_obligation",
-                            "updated_at": DateTime::now(),
-                        },
-                        "$unset": {
-                            "claim_token": "", "claimed_at": "", "active_task_key": "",
-                            "outbox_decision_id": "", "next_retry_at": "",
-                        },
-                    }
-                } else {
-                    doc! {
-                        "$set": {
-                            "status": "pending",
-                            "run_at": run_at,
-                            "gateway_status": "policy_reconciled",
-                            "attempt_count": 0,
-                            "updated_at": DateTime::now(),
-                        },
-                        "$unset": {
-                            "claim_token": "", "claimed_at": "", "next_retry_at": "",
-                            "outbox_decision_id": "", "error": "",
-                        },
-                    }
+                doc! {
+                    "$set": {
+                        "status": "pending",
+                        "run_at": run_at,
+                        "gateway_status": "policy_reconciled",
+                        "attempt_count": 0,
+                        "updated_at": DateTime::now(),
+                    },
+                    "$unset": {
+                        "claim_token": "", "claimed_at": "", "next_retry_at": "",
+                        "outbox_decision_id": "", "error": "",
+                    },
                 },
                 None,
             )
@@ -765,34 +844,6 @@ pub async fn reconcile_workspace_reply_obligations(
                 "quiet_hours_policy_changed",
             )
             .await?;
-        }
-
-        if is_legacy {
-            if let Some(inbound) = state
-                .db
-                .messages()
-                .find_one(
-                    doc! {
-                        "workspace_id": workspace_id,
-                        "account_id": account_id,
-                        "contact_wxid": contact_wxid,
-                        "direction": "inbound",
-                    },
-                    mongodb::options::FindOneOptions::builder()
-                        .sort(doc! { "created_at": -1, "_id": -1 })
-                        .build(),
-                )
-                .await?
-            {
-                materialize_durable_inbound_task_at(
-                    state,
-                    &contact,
-                    &inbound,
-                    run_at,
-                    "policy_reconciled",
-                )
-                .await?;
-            }
         }
     }
     Ok(changed)
@@ -817,9 +868,18 @@ pub async fn reconcile_pending_inbound_handoffs(state: &AppState) -> AppResult<u
         .await?;
     let mut recovered = 0u64;
     while let Some(raw) = cursor.try_next().await? {
-        let inbound: ConversationMessage = mongodb::bson::from_document(raw).map_err(|error| {
-            AppError::External(format!("pending inbound handoff decode failed: {error}"))
-        })?;
+        // A single undecodable row must never abort this scan: both task-worker
+        // ticks propagate an Err from here, and a broken row sorts first forever
+        // (`created_at` ascending), so failing the whole function would stop
+        // every later pending handoff from materializing. Isolate the row out of
+        // the scan filter and keep going.
+        let inbound: ConversationMessage = match mongodb::bson::from_document(raw.clone()) {
+            Ok(inbound) => inbound,
+            Err(error) => {
+                quarantine_undecodable_inbound_handoff(state, &raw, &error.to_string()).await;
+                continue;
+            }
+        };
         let Some(message_id) = inbound.id else {
             continue;
         };
@@ -874,37 +934,100 @@ pub async fn reconcile_pending_inbound_handoffs(state: &AppState) -> AppResult<u
         let active_profile =
             agent::domain_profile::load_active_domain_profile(&state.db, &contact.workspace_id)
                 .await?;
-        let quiet = runtime.quiet_hours_enabled
-            && agent::quiet_hours::is_quiet_now(
-                runtime.quiet_hours_start,
-                runtime.quiet_hours_end,
-                runtime.quiet_hours_tz_offset_hours,
-            );
-        if quiet {
-            let run_at = agent::quiet_hours::next_wake_at(
-                runtime.quiet_hours_end,
-                runtime.quiet_hours_tz_offset_hours,
-                &contact.wxid,
-                state.config.wake_jitter_max_seconds,
-            );
-            materialize_durable_inbound_task_at(
-                state,
-                &contact,
-                &inbound,
-                run_at,
-                "quiet_hours_waiting",
-            )
+        // 恢复路径无须即时唤醒：task worker 会按 run_at 接手，Debounced 结果可忽略。
+        schedule_managed_inbound_obligation(state, &contact, &inbound, &runtime, &active_profile)
             .await?;
-        } else {
-            let window_ms = crate::agent::domain_profile::resolve_debounce_window_ms(
-                &active_profile,
-                state.config.message_debounce_window_ms,
-            );
-            materialize_durable_inbound_task(state, &contact, &inbound, window_ms).await?;
-        }
         recovered = recovered.saturating_add(1);
     }
     Ok(recovered)
+}
+
+/// Isolate one undecodable pending-handoff row (defect #2, poison pill). The
+/// row is stamped `handoff_status=quarantined` directly by `_id` on the raw
+/// Document path (no typed deserialization), which removes it from the
+/// `$in: [pending, deferred]` scan filter, and an admin-visible event records
+/// the decode error. Everything here is best-effort: if the quarantine write
+/// fails the row simply stays pending and is retried on the next tick.
+async fn quarantine_undecodable_inbound_handoff(
+    state: &AppState,
+    raw: &Document,
+    decode_error: &str,
+) {
+    let Some(row_id) = raw.get("_id").cloned() else {
+        tracing::warn!(
+            decode_error,
+            "undecodable inbound handoff row lacks _id; cannot quarantine"
+        );
+        return;
+    };
+    let update = state
+        .db
+        .messages()
+        .clone_with_type::<Document>()
+        .update_one(
+            doc! {
+                "_id": &row_id,
+                "handoff_status": { "$in": [HANDOFF_PENDING, HANDOFF_DEFERRED] },
+            },
+            doc! { "$set": {
+                "handoff_status": HANDOFF_QUARANTINED,
+                "handoff_updated_at": DateTime::now(),
+            } },
+            None,
+        )
+        .await;
+    let quarantined_now = match update {
+        Ok(result) => result.modified_count > 0,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                row_id = %row_id,
+                "failed to quarantine undecodable inbound handoff row"
+            );
+            return;
+        }
+    };
+    // A concurrent worker may have quarantined the same row first; only the
+    // winner records the event so it is written exactly once per row.
+    if !quarantined_now {
+        return;
+    }
+    tracing::warn!(
+        row_id = %row_id,
+        decode_error,
+        "quarantined undecodable inbound handoff row"
+    );
+    let workspace_id = raw
+        .get_str("workspace_id")
+        .map(str::to_owned)
+        .unwrap_or_else(|_| state.config.default_workspace_id.clone());
+    let account_id = raw
+        .get_str("account_id")
+        .map(str::to_owned)
+        .unwrap_or_else(|_| state.config.default_account_id.clone());
+    let contact_wxid = raw.get_str("contact_wxid").map(str::to_owned).ok();
+    let _ = state
+        .db
+        .events()
+        .insert_one(
+            crate::models::AgentEvent {
+                id: None,
+                workspace_id,
+                account_id,
+                contact_wxid,
+                kind: "inbound_handoff_quarantined".to_string(),
+                status: "warning".to_string(),
+                summary: "入站消息行无法反序列化，已隔离出交接扫描，待运维排查".to_string(),
+                details: Some(doc! {
+                    "message_id": &row_id,
+                    "decode_error": decode_error,
+                }),
+                created_at: DateTime::now(),
+                dedupe_key: None,
+            },
+            None,
+        )
+        .await;
 }
 
 /// Stable quota identity for one tenant/account/window.
@@ -1459,8 +1582,9 @@ pub async fn wechat_webhook(
 
     // P0-19：dedupe 原子化。原 check-then-insert 存在 TOCTOU 竞态，两个并发
     // webhook 的 find_one 都可能返回 None，导致同一条入站消息被双写。改为
-    // 直接 insert_one + 捕获 11000 duplicate key 错误（依赖
-    // db/indexes.rs:55-63 的 partial unique index `workspace_id+account_id+dedupe_key`），
+    // 直接 insert_one + 捕获 11000 duplicate key 错误（依赖 `db/indexes.rs`
+    // `ensure_all` 为 conversation_messages 建的 partial unique index
+    // `workspace_id+account_id+dedupe_key`；注释按约定引用函数名不写行号），
     // 让 MongoDB 在写入时原子去重。
     let raw = to_document(&payload).ok();
     // F1：解析入站消息类型 + 媒体引用，不再写死 None。
@@ -1589,6 +1713,8 @@ pub async fn wechat_webhook(
         // Schedule the contact's single inbound_reply obligation at the wake time. The inbound is persisted above,
         // 醒来时 gateway 的 load_recent_messages 会天然聚合这段时间的全部消息一次性回。
         // 开关/时段来自运营域配置（RuntimeParametersTyped，前端可改），默认启用。
+        // 静默/豁免判定收敛在 schedule_managed_inbound_obligation（与崩溃恢复路径共用），
+        // S5-3：交易域的显式购买/付款承诺不 defer、走正常去抖即时应答。
         let domain_config = agent::load_user_operation_domain_config_for_contact(
             &state,
             &workspace_id,
@@ -1599,46 +1725,31 @@ pub async fn wechat_webhook(
             crate::agent::UserRuntimeParameters::from_config(domain_config.as_ref(), &state);
         let active_profile =
             agent::domain_profile::load_active_domain_profile(&state.db, &workspace_id).await?;
-        let quiet = runtime.quiet_hours_enabled
-            && agent::quiet_hours::is_quiet_now(
-                runtime.quiet_hours_start,
-                runtime.quiet_hours_end,
-                runtime.quiet_hours_tz_offset_hours,
-            );
-        if quiet {
-            let run_at = agent::quiet_hours::next_wake_at(
-                runtime.quiet_hours_end,
-                runtime.quiet_hours_tz_offset_hours,
-                &contact.wxid,
-                state.config.wake_jitter_max_seconds,
-            );
-            materialize_durable_inbound_task_at(
-                &state,
-                &contact,
-                &inbound,
-                run_at,
-                "quiet_hours_waiting",
-            )
-            .await?;
-            deferred = true;
-        } else {
-            let window_ms = crate::agent::domain_profile::resolve_debounce_window_ms(
-                &active_profile,
-                state.config.message_debounce_window_ms,
-            );
-            let durable_task =
-                materialize_durable_inbound_task(&state, &contact, &inbound, window_ms).await?;
-            let task_id = durable_task.task_id;
-            let run_at_ms = durable_task.run_at_ms;
-            let bg_state = state.clone();
-            tokio::spawn(async move {
-                let now_ms = DateTime::now().timestamp_millis();
-                let wait_ms = run_at_ms.saturating_sub(now_ms).max(0) as u64;
-                tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
-                if let Err(error) = crate::tasks::run_due_task_by_id(&bg_state, task_id).await {
-                    tracing::error!(%task_id, %error, "durable inbound immediate wake failed; periodic worker will retry");
-                }
-            });
+        match schedule_managed_inbound_obligation(
+            &state,
+            &contact,
+            &inbound,
+            &runtime,
+            &active_profile,
+        )
+        .await?
+        {
+            InboundScheduleOutcome::QuietDeferred => {
+                deferred = true;
+            }
+            InboundScheduleOutcome::Debounced(durable_task) => {
+                let task_id = durable_task.task_id;
+                let run_at_ms = durable_task.run_at_ms;
+                let bg_state = state.clone();
+                tokio::spawn(async move {
+                    let now_ms = DateTime::now().timestamp_millis();
+                    let wait_ms = run_at_ms.saturating_sub(now_ms).max(0) as u64;
+                    tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+                    if let Err(error) = crate::tasks::run_due_task_by_id(&bg_state, task_id).await {
+                        tracing::error!(%task_id, %error, "durable inbound immediate wake failed; periodic worker will retry");
+                    }
+                });
+            }
         }
     } else if let Some(message_oid) = inbound.id {
         mark_inbound_handoff(&state, message_oid, HANDOFF_IGNORED).await?;
@@ -1652,16 +1763,12 @@ pub async fn wechat_webhook(
     })))
 }
 
-/// #69 作息门控：静默时段入站时，确保存在一条"醒来回复"跟进任务。
+/// #69 作息门控：静默时段入站时，确保存在一条"醒来回复"义务任务。
 ///
-/// kind = [`agent::quiet_hours::DEFERRED_INBOUND_REPLY_KIND`]，与 planner 主动催进的
-/// `follow_up` 区分——precheck 据此豁免 `context_changed`（这条任务的存在意义恰恰
-/// 就是回 task 创建后累积的客户消息）。`run_at` = 下一次醒来时刻；醒来后由 task
-/// worker → handle_follow_up_task → gateway 走完整决策/审查/拆短/outbox 链路。
-///
-/// 去重：仿 planner `has_pending_follow_up` —— 同 contact 已有未终态的 wake 任务则
-/// 不再插（静默时段连发多条 → 1 task → 醒来基于累积消息回 1 次）。先查后插存在
-/// TOCTOU 窗口，但 precheck 的 rate_limited 闸在醒来时会兜住重复触达，可接受。
+/// 实际物化的是该 contact 唯一的持久 `inbound_reply` 义务（kind =
+/// [`DURABLE_INBOUND_REPLY_KIND`]，经 [`materialize_durable_inbound_task_at`]），
+/// `run_at` = 下一次醒来时刻；醒来后以 Inbound 语义进网关、基于累积消息回 1 次。
+/// 同 contact 的确定性 task `_id` 天然去重（静默时段连发多条 → 1 task）。
 ///
 /// `pub`：暴露给 tests/quiet_hours_deferral.rs 集成测试直接驱动排程链路
 /// （`Utc::now` 不可注入，集成测试只验 DB 写入 + 去重 + 埋点，时区由纯函数单测覆盖）。

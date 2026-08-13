@@ -1,11 +1,12 @@
 //! 2026_07_030：回填 outcome_events 数组元素缺失的 verification/event_kind 默认值。
 //!
-//! 背景(KC-05)：`OutcomeEvent.verification`(models.rs:451 default→staff_confirmed) 与
-//! `event_kind`(models.rs:464 default→deal) 的 `#[serde(default)]` 只作用于反序列化、
+//! 背景(KC-05)：`models.rs` 中 `OutcomeEvent.verification`(default→staff_confirmed)
+//! 与 `event_kind`(default→deal) 的 `#[serde(default)]` 只作用于反序列化、
 //! Mongo 查询不补。§4.5(2026-06-15)字段上线前登记的老成交事件 BSON 里没这两键，
 //! campaign 圈人粗筛 `$elemMatch` 精确匹配(campaigns.rs)对缺字段落空 → product 定向
 //! 活动静默漏老客户。防线 A(查询侧 $exists/$ne 对齐)已即时止血；本迁移治本清历史，
 //! 彻底消除 serde 默认与 Mongo 查询的长期口径分裂。
+//! (注释按约定引用类型/字段名,不写行号——行号随代码漂移。)
 //!
 //! **不加 APP_ENV=production 守卫**：本回填写的就是 serde 读时本已假设的默认值
 //! (staff_confirmed/deal)，语义保持、非破坏、幂等——与 m018/m022/m025 同类(它们均无
@@ -13,10 +14,10 @@
 //! "过早回填致误黑"特定危害)，均与本迁移性质不同。误加守卫会致 117 生产静默 SKIP、
 //! 防线 B 名存实亡。
 //!
-//! **存储键**：Contact **无** `#[serde(rename_all)]`(models.rs:148)→ 顶层字段存 snake_case
-//! `outcome_events`(见 db/indexes.rs:38-40 索引键 + 防线A campaigns.rs 亦用 snake_case)。
+//! **存储键**：`Contact` 结构体**无** `#[serde(rename_all)]` → 顶层字段存 snake_case
+//! `outcome_events`(db/indexes.rs 的索引键 + 防线A campaigns.rs 亦用 snake_case)。
 //! 内层 OutcomeEvent 带 `rename_all="camelCase"` → `event_kind`→`eventKind`、`verification` 不变。
-//! **兼容 legacy alias**：Contact.outcome_events serde alias="deal_events"(models.rs:248)，
+//! **兼容 legacy alias**：`Contact.outcome_events` 带 serde alias="deal_events"，
 //! 故极老文档数组键可能是 `deal_events`；两个键各回填一次。
 //!
 //! 合并策略：`$map` 遍历数组，每元素 `$mergeObjects([默认值底, $$ev])` —— 默认值在底、
@@ -48,8 +49,8 @@ pub(super) fn backfill_array(field: &str) -> Document {
 ///
 /// 必须逐字段 `{field:$exists}`,**不能**共享一个 `$or:[两键任一存在]`——否则对
 /// `deal_events` 那轮,凡是有 `outcome_events` 的文档也会被命中,而 `backfill_array` 的
-/// `$ifNull($field,[])` 会给它们**凭空新增 `deal_events:[]`**。Contact.outcome_events 带
-/// `#[serde(alias="deal_events")]`(models.rs:248),两键同现 → serde `duplicate_field` 反序列化
+/// `$ifNull($field,[])` 会给它们**凭空新增 `deal_events:[]`**。`Contact.outcome_events` 带
+/// `#[serde(alias="deal_events")]`,两键同现 → serde `duplicate_field` 反序列化
 /// 报错,`Collection<Contact>` 类型化读取(webhook reload/圈人/outbox 热路径)全崩。故按字段隔离。
 pub(super) fn backfill_filter(field: &str) -> Document {
     doc! { field: { "$exists": true } }

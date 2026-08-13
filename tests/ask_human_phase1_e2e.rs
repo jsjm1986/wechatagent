@@ -129,6 +129,8 @@ async fn seed_pending_escalation(
             daily_push_cap: None,
             quiet_hours: None,
             timeout_hours: None,
+            standing_order: None,
+            standing_order_after_hours: None,
         });
     let principal_account_id = frozen_policy
         .decider_chain
@@ -1046,6 +1048,8 @@ async fn operation_domain_json_includes_ask_human_policy() {
         daily_push_cap: Some(3),
         quiet_hours: None,
         timeout_hours: Some(24.0),
+        standing_order: None,
+        standing_order_after_hours: None,
     };
     let policy_bson = mongodb::bson::to_bson(&policy).unwrap();
     app.state

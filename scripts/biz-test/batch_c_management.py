@@ -12,9 +12,9 @@ delete_knowledge_chunk/reset_system_pack) + verify 类 + dispatch_campaign 恒�
 - reject → command.status=canceled，未执行(目标资源不变)
 - 再发 → confirm → 真执行(status=succeeded/failed，非暂存)
 - confirm/reject 乐观锁：二次 confirm 返 already_processed_or_not_found
-注：管理 Agent 是否规划出危险工具是 LLM 自主行为；若本轮未规划出 irreversible 工具(未触发
-  pending_confirmation)，查 plan 记录 LLM 实际规划了什么(low/medium 观察)，不硬失败。
-  指令指向 biztest 假 chunk id → 即便 confirm 执行也是 matched=0 no-op(不动真实数据)。
+验收要求两轮都必须规划出目标 irreversible 工具并进入 pending_confirmation；未覆盖即非零失败，
+不能把模型未规划目标工具解释成确认门已通过。指令指向 biztest 假 chunk id，因此 confirm 即便
+执行 delete 也只会 matched=0，不触碰真实业务数据。
 
 跑法：export DEPLOY_PASS=... ADMIN_USER=admin ADMIN_PASS=admin; python scripts/biz-test/batch_c_management.py
 依赖：先跑 step0_preflight.py。
@@ -28,7 +28,7 @@ import _lib
 
 DOMAIN = "管理Agent危险动作确认"
 # biztest 假 chunk id(24位hex)——即便 confirm 执行 delete 也是 matched=0 no-op，不动真数据。
-FAKE_CHUNK = "0000000000000000biztest1"[:24].ljust(24, "0")
+FAKE_CHUNK = "000000000000000000000001"
 
 
 def _new_session(account_id: str) -> str | None:
@@ -55,6 +55,11 @@ def _plan_tools(resp: dict) -> list:
 
 def main() -> None:
     account_id, _app_id = _lib.biztest_account()
+    fake_exists = _lib.mongo_json(
+        f'db.operation_knowledge_chunks.countDocuments({{_id:ObjectId("{FAKE_CHUNK}")}})'
+    )
+    if fake_exists != 0:
+        raise SystemExit(f"biz-test fake chunk id unexpectedly exists: {FAKE_CHUNK}")
 
     # 危险指令：删除一个(假)知识切片 → 期望 LLM 规划 delete_knowledge_chunk(irreversible)。
     danger_instruction = (
@@ -72,12 +77,13 @@ def main() -> None:
         _lib.record(DOMAIN, "post message 端点失败(BLOCKED)", f"resp={str(r1)[:160]}", "high",
                     f"端点故障 {err},标 BLOCKED 不假绿")
         raise SystemExit(f"post 失败: {err}")
-    _lib.assert_llm_success(720, "management.plan", DOMAIN)
+    _lib.assert_llm_success_for_run(sid, "management.plan", DOMAIN)
 
     cmd1 = r1.get("command") or {}
     status1 = cmd1.get("status")
     tools1 = _plan_tools(r1)
     cmd1_id = cmd1.get("id")
+    binding1 = _lib.management_command_binding(cmd1, account_id)
     print(f"[{DOMAIN}] command.status={status1} planned_tools={tools1} id={cmd1_id}")
 
     irreversible_planned = any(
@@ -100,7 +106,21 @@ def main() -> None:
                     "暂存却落了 tool_call=确认闸形同虚设,危险动作绕过确认")
 
         # 铁证 2：reject → canceled，未执行。
-        rej = _lib.api("POST", f"/api/management-agent/commands/{cmd1_id}/reject", {},
+        bad_binding = dict(binding1)
+        bad_binding["planHash"] = "0" * 64
+        rejected_tamper = _lib.api(
+            "POST", f"/api/management-agent/commands/{cmd1_id}/confirm", bad_binding,
+            admin=True, timeout=60,
+        )
+        _lib.expect(_lib.is_api_error(rejected_tamper) is not None, DOMAIN,
+                    "篡改 planHash 的 confirm 被拒", f"resp={rejected_tamper}", "critical")
+        tc_after_tamper = _lib.mongo_json(
+            f'db.agent_tool_calls.countDocuments({{command_run_id:ObjectId("{cmd1_id}")}})'
+        )
+        _lib.expect(tc_after_tamper == 0, DOMAIN, "错误哈希确认产生零工具副作用",
+                    f"tool_call_count={tc_after_tamper}", "critical")
+
+        rej = _lib.api("POST", f"/api/management-agent/commands/{cmd1_id}/reject", binding1,
                        admin=True, timeout=60)
         print(f"[{DOMAIN}] reject resp={str(rej)[:120]}")
         _lib.expect(isinstance(rej, dict) and rej.get("status") == "canceled", DOMAIN,
@@ -112,25 +132,33 @@ def main() -> None:
         _lib.expect(isinstance(st, list) and st and st[0] == "canceled", DOMAIN,
                     "reject 后 agent_command_runs.status=canceled(DB真改)", f"status={st}", "high")
         # 铁证 3：二次 reject/confirm 乐观锁 → already_processed_or_not_found。
-        again = _lib.api("POST", f"/api/management-agent/commands/{cmd1_id}/confirm", {},
+        again = _lib.api("POST", f"/api/management-agent/commands/{cmd1_id}/confirm", binding1,
                          admin=True, timeout=60)
-        _lib.expect(isinstance(again, dict) and again.get("status") == "already_processed_or_not_found",
-                    DOMAIN, "已 reject 的命令再 confirm → 乐观锁拒(already_processed)",
+        _lib.expect(isinstance(again, dict) and again.get("status") == "canceled",
+                    DOMAIN, "已 reject 的命令再 confirm → 幂等返回 canceled",
                     f"resp={str(again)[:120]}", "high",
                     "乐观锁失效=已取消命令仍可被确认执行")
 
         # ── 第二轮：再发危险指令 → confirm → 真执行(假 chunk → matched=0 no-op)──
-        print(f"[{DOMAIN}] 第二轮:再发危险指令验 confirm 真执行...")
-        r2 = _post(sid, account_id, danger_instruction)
+        print(f"[{DOMAIN}] 第二轮:新 session 再发危险指令验 confirm 真执行...")
+        sid2 = _new_session(account_id)
+        _lib.expect(bool(sid2), DOMAIN, "第二轮创建独立 management session 返回 id",
+                    f"sid2={sid2}", "critical")
+        r2 = _post(sid2, account_id, danger_instruction)
+        err2 = _lib.is_api_error(r2)
+        _lib.expect(err2 is None, DOMAIN, "第二轮危险指令端点成功",
+                    f"response={r2}", "high")
+        _lib.assert_llm_success_for_run(sid2, "management.plan", DOMAIN)
         cmd2 = r2.get("command") or {} if isinstance(r2, dict) else {}
         if cmd2.get("status") == "pending_confirmation":
             cmd2_id = cmd2.get("id")
-            conf = _lib.api("POST", f"/api/management-agent/commands/{cmd2_id}/confirm", {},
+            binding2 = _lib.management_command_binding(cmd2, account_id)
+            conf = _lib.api("POST", f"/api/management-agent/commands/{cmd2_id}/confirm", binding2,
                             admin=True, timeout=120)
             print(f"[{DOMAIN}] confirm resp={str(conf)[:160]}")
             conf_status = conf.get("status") if isinstance(conf, dict) else None
-            _lib.expect(conf_status in ("succeeded", "failed"), DOMAIN,
-                        "confirm 后真执行(status=succeeded/failed,非暂存)",
+            _lib.expect(conf_status in ("succeeded", "failed", "execution_unknown"), DOMAIN,
+                        "confirm 后进入保守执行终态(非暂存)",
                         f"status={conf_status} resp={str(conf)[:140]}", "high",
                         "confirm 应触发真执行;假 chunk 删除 matched=0 但流程须走完")
             # 验 agent_command_runs 不再是 pending_confirmation。
@@ -141,15 +169,17 @@ def main() -> None:
                         DOMAIN, "confirm 后 command 脱离 pending_confirmation",
                         f"status={st2}", "high")
         else:
-            _lib.record(DOMAIN, "第二轮 LLM 未再规划危险工具(confirm 路径未覆盖)",
-                        f"status={cmd2.get('status')} tools={_plan_tools(r2)}", "low",
-                        "LLM 自主行为,本轮未规划危险动作,可复跑")
+            _lib.expect(
+                False, DOMAIN, "第二轮危险指令必须覆盖 confirm 执行路径",
+                f"status={cmd2.get('status')} tools={_plan_tools(r2)} response={r2}", "high",
+                "权威矩阵未形成第二个 pending_confirmation，不能把 confirm 路径记为已验",
+            )
     else:
         # 区分两种情形:
         # (a) LLM 规划了 irreversible 工具却没走 pending_confirmation = 确认闸真失效。
         #     plan_requires_confirmation 对 irreversible 是纯代码硬保证,这种组合是确定性回归,
         #     必须 critical 硬失败(expect),不能降级成观察吞掉。
-        # (b) LLM 根本没规划出危险工具(理解成别的/拒绝危险操作)= LLM 自主行为,low 观察可复跑。
+        # (b) LLM 未规划目标危险工具 = 本轮没有覆盖确认门，验收必须失败而非观察性放过。
         if irreversible_planned:
             _lib.expect(False, DOMAIN,
                         f"规划了 irreversible 工具却未走 pending_confirmation(确认闸失效!status={status1})",
@@ -157,11 +187,12 @@ def main() -> None:
                         "irreversible 工具必须走确认闸(plan_requires_confirmation 硬保证);"
                         "规划了却直接执行/未暂存=安全红线破,确认闸回归")
         else:
-            _lib.record(DOMAIN,
-                        f"LLM 未规划危险工具(confirm 路径未覆盖,status={status1})",
-                        f"planned_tools={tools1} irreversible_in_plan=False", "low",
-                        "LLM 自主未规划删除工具(理解成别的/拒绝危险操作),可复跑")
-        print(f"[{DOMAIN}] LLM 未触发确认闸,已记录实际规划 tools={tools1}")
+            _lib.expect(
+                False, DOMAIN, "危险删除指令必须规划出受确认门保护的工具",
+                f"status={status1} planned_tools={tools1} response={r1}", "high",
+                "权威矩阵没有覆盖危险工具计划，不能据此验收确认门",
+            )
+        print(f"[{DOMAIN}] 危险确认路径未覆盖 tools={tools1}")
 
     print(f"[{DOMAIN}] 完成。")
 

@@ -317,7 +317,7 @@ mongo
    db.conversation_messages.find({direction: "inbound"}).sort({created_at:-1}).limit(1)
    
    // 检查 Agent run 记录
-   db.agent_runs.find().sort({created_at:-1}).limit(1)
+   db.agent_run_logs.find().sort({created_at:-1}).limit(1)
    
    // 检查 MCP 调用日志
    db.mcp_logs.find({tool_name: "message_send_text"}).sort({created_at:-1}).limit(1)
@@ -329,7 +329,7 @@ mongo
 2. 检查 Agent run 是否成功（不被 `blocked_by_budget` 拦截）
 3. 查看 MongoDB：
    ```javascript
-   db.agent_runs.find({contact_wxid: "<新联系人wxid>"}).sort({created_at:-1}).limit(1)
+   db.agent_run_logs.find({contact_wxid: "<新联系人wxid>"}).sort({created_at:-1}).limit(1)
    
    // 预期：
    // - gateway_status 不是 "blocked_by_budget"

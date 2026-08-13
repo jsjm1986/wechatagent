@@ -409,9 +409,18 @@ async fn freeze_guide_plan(
         });
     }
 
+    let memory_insert = if memory.id.is_none() {
+        let mut baseline = mongodb::bson::to_document(memory)?;
+        baseline.remove("_id");
+        Some(baseline)
+    } else {
+        None
+    };
+
     Ok(GuideFrozenPlan {
         contact_updated_at: contact.updated_at,
         memory_updated_at: memory.updated_at,
+        memory_insert,
         playbook_id,
         playbook_version,
         domain_config_id,
@@ -501,7 +510,9 @@ pub(super) async fn preview_user_operation_guide(
             "contact does not belong to account".to_string(),
         ));
     }
-    let memory = ensure_operating_memory(&state, &contact).await?;
+    // Preview is a capability proposal and must not create business state. Missing memory is
+    // projected in-process and frozen for insertion only if the operator later confirms Apply.
+    let memory = read_operating_memory(&state, &contact).await?;
     let latest_review = latest_decision_review(&state, &contact).await?;
     let playbook = agent::load_operation_playbook_for_contact(&state, &contact).await?;
     let (in_quiet_hours, next_wake_at, quiet_hours_enabled) =
@@ -886,11 +897,10 @@ async fn apply_claimed_user_operation_guide_v3(
             return Err(AppError::Conflict("guide_contact_changed".to_string()));
         }
 
-        let memory_filter = doc! {
+        let memory_identity = doc! {
             "workspace_id": &preview.workspace_id,
             "account_id": &preview.account_id,
             "contact_wxid": &preview.contact_wxid,
-            "updated_at": plan.memory_updated_at,
         };
         let mut memory_set = if plan.memory_set.is_empty() {
             Document::new()
@@ -902,18 +912,38 @@ async fn apply_claimed_user_operation_guide_v3(
             )
         };
         memory_set.insert(GUIDE_APPLY_GUARD_FIELD, preview_id.to_hex());
-        let memory_result = state
-            .db
-            .operating_memories()
-            .update_one_with_session(
-                memory_filter,
-                doc! { "$set": memory_set },
-                None,
-                &mut session,
-            )
-            .await?;
-        if memory_result.matched_count != 1 {
-            return Err(AppError::Conflict("guide_memory_changed".to_string()));
+        if let Some(frozen_insert) = plan.memory_insert.as_ref() {
+            let memories = state.db.operating_memories().clone_with_type::<Document>();
+            if memories
+                .find_one_with_session(memory_identity.clone(), None, &mut session)
+                .await?
+                .is_some()
+            {
+                return Err(AppError::Conflict("guide_memory_changed".to_string()));
+            }
+            let mut inserted = frozen_insert.clone();
+            for (key, value) in memory_set {
+                inserted.insert(key, value);
+            }
+            memories
+                .insert_one_with_session(inserted, None, &mut session)
+                .await?;
+        } else {
+            let mut memory_filter = memory_identity;
+            memory_filter.insert("updated_at", plan.memory_updated_at);
+            let memory_result = state
+                .db
+                .operating_memories()
+                .update_one_with_session(
+                    memory_filter,
+                    doc! { "$set": memory_set },
+                    None,
+                    &mut session,
+                )
+                .await?;
+            if memory_result.matched_count != 1 {
+                return Err(AppError::Conflict("guide_memory_changed".to_string()));
+            }
         }
 
         match (plan.playbook_id, plan.playbook_version) {
@@ -1087,6 +1117,7 @@ mod tests {
         GuideFrozenPlan {
             contact_updated_at: DateTime::from_millis(1_700_000_000_000),
             memory_updated_at: DateTime::from_millis(1_700_000_000_001),
+            memory_insert: None,
             playbook_id: None,
             playbook_version: None,
             domain_config_id: None,

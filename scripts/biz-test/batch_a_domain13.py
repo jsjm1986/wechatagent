@@ -1,23 +1,11 @@
-"""域⑬：知识库自治 LLM 群（auto_verify 红线 / completeness clamp / repair 忠实 / vision）。
+"""域⑬：知识自治（auto-verify 红线、completeness clamp、repair 提案、Vision 能力）。
 
-实测确认的真实形态：
-- auto-verify：POST /operation-knowledge/auto-verify，body camelCase
-  {accountId,confidenceThreshold,humanAuditSampleRate,limit}；响应
-  {processed,verified,needsReview,rejected,needsHumanAudit}。红线(verify.rs:392):
-  product_fact 类**一律强制 needsHumanAudit**,不被 LLM 自评放行成 verified。
-  prompt_key=knowledge.auto_verify(走 generate_agent_json,写 log)。
-- completeness：GET/POST /operation-knowledge/completeness?accountId=。**直调 state.llm.generate_json
-  (catalog.rs:711),绕过 generate_agent_json→不写 llm_call_logs,故不能 assert_llm_success**。
-  verified==0 时走 fallback 早退不调 LLM。clamp 红线:有 needs_review 草稿绝不宣称 fully_supported。
-  响应 {totalChunks,verifiedChunks,needsReviewChunks,answeringMode,gaps}。
-- repair：POST /operation-knowledge/chunks/:id/repair(无 body)；响应
-  {patch,missingFields,followupQuestions,sessionId}；prompt_key=knowledge.chunk.repair.propose。
-- vision：需 active vision provider,无则标 BLOCKED 不假绿。
-
-跑法：export DEPLOY_PASS=...; python scripts/biz-test/batch_a_domain13.py
+每个核心断言创建自己的当前契约 fixture，并以精确 chunk id / revision / usage ledger 取证；
+不依赖前序域残留。Vision 是可选环境能力，未配置或未提供图片 fixture 时写独立 BLOCKED
+台账，不计作核心业务 PASS。
 """
+import json
 import sys
-import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -26,109 +14,129 @@ import _lib
 DOMAIN = "⑬知识自治"
 
 
-def main() -> None:
-    account_id, _app_id = _lib.biztest_account()
+def _require(condition: bool, description: str, evidence: object, severity: str = "critical") -> None:
+    _lib.expect(condition, DOMAIN, description, str(evidence), severity)
 
-    # ── auto-verify：批量校验（复用域①/域②落的 biztest needs_review chunks）──
-    print(f"[{DOMAIN}] auto-verify 批量校验（真模型，后台轮询）...")
+
+def main() -> None:
+    account_id, _ = _lib.biztest_account()
+
+    # 独立、最新的 citable draft；limit=1 令本轮只能处理这一行。
+    auto_id = _lib.seed_citable_knowledge_chunk(
+        "biztest_auto_verify_redline", account_id, "biztest 自动预审价格",
+        "企业版年费 9800 元，含 10 个坐席。",
+    )
+    _require(bool(auto_id), "创建 auto-verify 独立 fixture", auto_id)
     av = _lib.api_bg(
         "POST", "/api/operation-knowledge/auto-verify",
         {"accountId": account_id, "confidenceThreshold": 7,
-         "humanAuditSampleRate": 0.1, "limit": 20},
-        admin=True, max_wait=600, tag="autoverify",
+         "humanAuditSampleRate": 0.0, "limit": 1},
+        admin=True, max_wait=600, tag="autoverify_exact",
     )
-    print(f"  av={str(av)[:300]}")
-    processed = av.get("processed") if isinstance(av, dict) else None
-    _lib.expect(processed is not None, DOMAIN, "auto-verify 真跑返回统计(processed)",
-                f"av={str(av)[:300]}", "high", "auto-verify 无 processed→端点错或无 chunk 可校")
-    if processed is not None and processed > 0:
-        _lib.assert_llm_success(600, "knowledge.auto_verify", DOMAIN)
+    auto_run_id = av.get("runId") if isinstance(av, dict) else None
+    _require(_lib.is_api_error(av) is None and av.get("processed") == 1
+             and av.get("failed") == 0
+             and isinstance(auto_run_id, str) and bool(auto_run_id)
+             and av.get("chunkIds") == [auto_id],
+             "auto-verify 精确处理一条且返回冻结 run/chunk 身份", av)
+    auto_item = _lib.get_knowledge_chunk(auto_id)
+    usage = _lib.mongo_json(
+        'db.knowledge_usage_logs.findOne('
+        f'{{"route_result.kind":"knowledge_auto_verify",'
+        f'"route_result.chunkId":{json.dumps(auto_id)}}},'
+        '{route_result:1,knowledge_ids:1,run_id:1,_id:0},{sort:{created_at:-1}})'
+    )
+    revisions = _lib.mongo_json(
+        'db.chunk_revisions.find('
+        f'{{chunk_id:{json.dumps(auto_id)},op:"verify",source:"rule",'
+        'reason:/^auto_verify:/},'
+        '{revision_id:1,source:1,op:1,patch:1,_id:0})'
+        '.sort({created_at:-1}).limit(1).toArray()'
+    )
+    revision = revisions[0] if isinstance(revisions, list) and revisions else None
+    route = usage.get("route_result", {}) if isinstance(usage, dict) else {}
+    final_status = route.get("finalStatus") if isinstance(route, dict) else None
+    exact_audit = (
+        isinstance(revision, dict) and bool(revision.get("revision_id"))
+        and isinstance(route, dict)
+        and route.get("chunkId") == auto_id
+        and route.get("revisionId") == revision.get("revision_id")
+        and usage.get("run_id") == auto_run_id
+        and final_status == auto_item.get("integrityStatus")
+    )
+    _require(exact_audit, "auto-verify usage 与 rule revision 精确绑定目标 chunk",
+             {"item": auto_item, "usage": usage, "revision": revision})
+    _require(final_status != "verified" and auto_item.get("integrityStatus") != "verified",
+             "AI 自动预审绝不把知识放行为 verified",
+             {"response": av, "item": auto_item, "usage": usage})
+    _lib.assert_llm_success_for_run(auto_run_id, "knowledge.auto_verify", DOMAIN)
 
-    # 红线：种一条 product_fact 类切片，验 auto-verify 不把它放行成 verified（强制 needsHumanAudit）
-    _lib.mongo('db.operation_knowledge_chunks.deleteMany({source_name:"biztest_product_fact"})')
-    _lib.mongo(
-        'db.operation_knowledge_chunks.insertOne({'
-        'source_name:"biztest_product_fact",title:"biztest 价格",'
-        'workspace_id:"default",domain:"user_operations",priority:0,'
-        'content:"企业版年费 9800 元，含 10 个坐席。",'
-        'source_quote:"企业版年费 9800 元，含 10 个坐席。",'
-        'source_anchors:["企业版年费 9800 元"],'
-        'knowledge_type:"product_fact",integrity_status:"needs_review",status:"draft",'
-        f'account_id:"{account_id}",created_at:new Date(),updated_at:new Date()'
-        '}})'
+    # Repair 使用另一条 draft，避免被上面的 auto-verify 改写；proposal 不得改 chunk。
+    repair_id = _lib.seed_citable_knowledge_chunk(
+        "biztest_repair_fixture", account_id, "biztest 待补全交付说明",
+        "交付支持远程实施，具体周期尚待运营补充。",
     )
-    av2 = _lib.api_bg(
-        "POST", "/api/operation-knowledge/auto-verify",
-        {"accountId": account_id, "confidenceThreshold": 7,
-         "humanAuditSampleRate": 0.0, "limit": 20},
-        admin=True, max_wait=600, tag="autoverify2",
-    )
-    pf = _lib.mongo_json(
-        'db.operation_knowledge_chunks.findOne({source_name:"biztest_product_fact"},'
-        '{integrity_status:1,_id:0})'
-    )
-    pf_status = pf.get("integrity_status") if isinstance(pf, dict) else None
-    _lib.expect(pf_status != "verified", DOMAIN,
-                "红线:product_fact 类 auto-verify 不自评放行成 verified(强制人工把关)",
-                f"product_fact integrity_status={pf_status} av2={str(av2)[:200]}", "critical",
-                "product_fact 被 LLM 自评直接 verified=AI永不自动verify红线破")
+    _require(bool(repair_id), "创建 repair 独立 fixture", repair_id)
+    before = _lib.get_knowledge_chunk(repair_id)
 
-    # ── completeness：clamp（有 needs_review 草稿不宣称 fully_supported）──
-    # 注意：completeness 直调 llm.generate_json 不写 log，不能 assert_llm_success。
-    print(f"[{DOMAIN}] completeness 审计...")
+    # 有 needs_review fixture 时 completeness 必须看到草稿且不得宣称 fully supported。
     comp = _lib.api_bg(
         "POST", "/api/operation-knowledge/completeness?accountId=" + account_id,
         None, admin=True, max_wait=400, tag="completeness",
     )
-    mode = str(comp.get("answeringMode", "")) if isinstance(comp, dict) else ""
-    nr = comp.get("needsReviewChunks", 0) if isinstance(comp, dict) else 0
-    print(f"  answeringMode={mode} needsReviewChunks={nr}")
-    if isinstance(nr, int) and nr > 0:
-        _lib.expect(mode != "fully_supported", DOMAIN,
-                    "completeness clamp:有 needs_review 草稿绝不宣称 fully_supported",
-                    f"mode={mode} needsReview={nr}", "high",
-                    "有草稿仍判 fully_supported=认知状态闸 clamp 失效")
-    else:
-        _lib.expect(isinstance(comp, dict) and "answeringMode" in comp, DOMAIN,
-                    "completeness 返回 answeringMode(无草稿则 clamp 不触发,仅验链路通)",
-                    f"comp={str(comp)[:200]}", "low")
+    comp_item = comp.get("item") if isinstance(comp, dict) else None
+    comp_item = comp_item if isinstance(comp_item, dict) else comp
+    _require(_lib.is_api_error(comp) is None
+             and isinstance(comp_item, dict)
+             and isinstance(comp_item.get("needsReviewChunks"), int)
+             and comp_item.get("needsReviewChunks") > 0,
+             "completeness 识别 needs_review fixture", comp, "high")
+    _require(comp_item.get("answeringMode") != "fully_supported",
+             "有 needs_review 草稿时 answeringMode 不得 fully_supported", comp, "high")
 
-    # ── repair：对一条 needs_review chunk 跑修复，验产 patch ──
-    print(f"[{DOMAIN}] chunk repair...")
-    ch = _lib.mongo_json(
-        'db.operation_knowledge_chunks.findOne('
-        '{source_name:/biztest/,integrity_status:"needs_review"},{_id:1})'
+    rp = _lib.api_bg(
+        "POST", f"/api/operation-knowledge/chunks/{repair_id}/repair",
+        None, admin=True, max_wait=600, tag="repair_exact",
     )
-    if isinstance(ch, dict) and ch.get("_id"):
-        oid = ch["_id"]
-        chid = str(oid.get("$oid", "")) if isinstance(oid, dict) else str(oid)
-        rp = _lib.api_bg(
-            "POST", f"/api/operation-knowledge/chunks/{chid}/repair",
-            None, admin=True, max_wait=600, tag="repair",
-        )
-        has_patch = isinstance(rp, dict) and ("patch" in rp or "missingFields" in rp)
-        _lib.expect(has_patch, DOMAIN, "repair 真产 patch/missingFields",
-                    f"rp={str(rp)[:300]}", "medium", "repair 无 patch→修复链路未产出")
-        if has_patch:
-            _lib.assert_llm_success(600, "knowledge.chunk.repair.propose", DOMAIN)
-    else:
-        _lib.record(DOMAIN, "无 biztest needs_review chunk 可跑 repair(先跑域①②)",
-                    "findOne 返回空", "low", "依赖前序域落库,非bug")
+    after = _lib.get_knowledge_chunk(repair_id)
+    proposal_ok = (
+        _lib.is_api_error(rp) is None
+        and rp.get("chunkId") == repair_id
+        and isinstance(rp.get("sessionId"), str) and bool(rp.get("sessionId"))
+        and isinstance(rp.get("runId"), str)
+        and rp.get("runId", "").startswith(f"repair-chunk-{repair_id}-")
+        and rp.get("promptKey") == "knowledge.chunk.repair.propose"
+        and isinstance(rp.get("patch"), dict)
+        and isinstance(rp.get("missingFields"), list)
+    )
+    _require(proposal_ok, "repair 返回绑定目标 chunk/run 的结构化提案", rp, "high")
+    repair_usage = _lib.mongo_json(
+        'db.knowledge_usage_logs.findOne('
+        f'{{run_id:{json.dumps(rp.get("runId"))},"route_result.targetId":{json.dumps(repair_id)}}},'
+        '{run_id:1,route_result:1,knowledge_ids:1,_id:0})'
+    )
+    _require(isinstance(repair_usage, dict) and repair_usage.get("run_id") == rp.get("runId"),
+             "repair usage ledger 精确绑定目标 chunk/run", repair_usage, "high")
+    immutable_fields = ("status", "integrityStatus", "body", "summary", "updatedAt")
+    unchanged = all(before.get(key) == after.get(key) for key in immutable_fields)
+    _require(unchanged, "repair propose 只生成提案、不修改 chunk", {"before": before, "after": after})
+    _lib.assert_llm_success_for_run(
+        rp.get("runId", ""), "knowledge.chunk.repair.propose", DOMAIN
+    )
 
-    # ── vision：需 active vision provider，否则 BLOCKED 不假绿 ──
-    provs = _lib.api("GET", "/api/admin/llm-providers", admin=True)
-    items = provs.get("items", provs) if isinstance(provs, dict) else provs
+    # Vision 是独立可选能力。本矩阵没有上传真实图片，必须显式 BLOCKED 而不是假装通过。
+    providers = _lib.api("GET", "/api/admin/llm-providers", admin=True)
+    items = providers.get("items", providers) if isinstance(providers, dict) else providers
     items = items if isinstance(items, list) else []
-    has_vision = any(p.get("isVisionActive") or p.get("supportsVision")
-                     or p.get("visionActive") for p in items)
-    if not has_vision:
-        _lib.record(DOMAIN, "vision 多模态子项 BLOCKED(无 active vision provider)",
-                    "GET /llm-providers 无 vision active", "low",
-                    "需配 llama-3.2-90b-vision 等后单独测,非bug(rsxermu claude 不一定开 vision)")
+    active_vision = next((item for item in items if item.get("isVisionActive")), None)
+    if active_vision is None:
+        _lib.record_blocked(DOMAIN, "vision_import", "no active vision provider",
+                            "configure one active supportsVision provider and rerun image import")
     else:
-        print(f"  vision provider 在,vision import 子项需图片 base64,本版留人工补")
+        _lib.record_blocked(DOMAIN, "vision_import", f"provider={active_vision.get('id')}",
+                            "supply an isolated biztest image fixture and assert import lineage")
 
-    print(f"[{DOMAIN}] 完成")
+    print(f"[{DOMAIN}] 核心完成：auto-verify/complete/repair 已精确取证；Vision 见 BLOCKED 台账")
 
 
 if __name__ == "__main__":

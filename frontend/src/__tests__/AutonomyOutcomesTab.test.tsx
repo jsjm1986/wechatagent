@@ -14,7 +14,8 @@
 import { render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { AutonomyOutcomesTab, formatRate } from "../App";
+import { AutonomyOutcomesTab } from "../features/autonomy";
+import { formatRate } from "../lib/format";
 
 type PlannerSection = {
   silent: { tick: number; scanned: number; emitted: number; tickDetailEmitted: number; capped: number; backoff: number };

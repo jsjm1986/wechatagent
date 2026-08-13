@@ -26,10 +26,31 @@ interface ResolvedItem {
   createdAt?: string | null;
 }
 
-function formatExpiry(value: string | null | undefined): string {
+// 后端契约是 RFC3339 字符串（principal_escalations::escalation_list_item_json 经
+// dt_to_string 统一）；这里防御性兼容毫秒数与历史 bson 扩展 JSON 对象
+// {$date:{$numberLong:"…"}} / {$date:"…"}（旧部署/缓存残留曾把对象原样交给
+// React 渲染导致整页崩溃）。任何形态都绝不把非字符串值直接返回。
+function expiryToDate(value: unknown): Date | null {
+  if (typeof value === "number" && Number.isFinite(value)) return new Date(value);
+  if (typeof value === "string") {
+    const t = new Date(value);
+    return Number.isNaN(t.getTime()) ? null : t;
+  }
+  if (typeof value === "object" && value !== null && "$date" in value) {
+    const inner = (value as { $date: unknown }).$date;
+    if (typeof inner === "string" || typeof inner === "number") return expiryToDate(inner);
+    if (typeof inner === "object" && inner !== null && "$numberLong" in inner) {
+      const ms = Number((inner as { $numberLong: unknown }).$numberLong);
+      return Number.isFinite(ms) ? new Date(ms) : null;
+    }
+  }
+  return null;
+}
+
+export function formatExpiry(value: unknown): string {
   if (!value) return "本次转述不设期限";
-  const t = new Date(value);
-  if (Number.isNaN(t.getTime())) return value;
+  const t = expiryToDate(value);
+  if (!t) return typeof value === "string" ? value : "时间格式无法识别";
   // 本地化到分钟即可，秒级精度对回顾历史无意义。
   return t.toLocaleString("zh-CN", {
     year: "numeric",

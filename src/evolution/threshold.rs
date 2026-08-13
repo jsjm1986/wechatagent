@@ -42,6 +42,12 @@ const MAX_THRESHOLD_PROPOSALS_PER_TICK: usize = 4;
 /// 单独定（10%~30%——planner 自我反馈环本身就是为了在这个范围内振荡）。
 pub const THRESHOLD_REASONABLE_BANDS: &[(&str, f64, f64)] = &[
     ("fact_risk_block", 0.05, 0.15),
+    // pressure_risk_block 保留目标区间但**当前不产候选**（缺陷 #16）：pressure 在
+    // 生产是软闸（触发 single-shot revision，终态痕迹是 revision_applied /
+    // revision_failed），不产生任何专属 block 终态；此前把 `blocked_by_safety_guard`
+    // 当作它的命中统计源是错误归因。在接入真实软闸命中观测源（如 run log 记录
+    // 具体触发的 rewrite/pressure 闸）之前，`generate` 对该 gate 跳过候选生成
+    // （与 planner_block_rate_threshold 同一"缺样本 ≠ 0 命中"纪律）。
     ("pressure_risk_block", 0.05, 0.15),
     ("human_like_score_rewrite", 0.08, 0.18),
     ("emotional_value_rewrite", 0.08, 0.18),
@@ -66,7 +72,14 @@ fn classify_gate_hit(final_review_status: &str) -> Option<&'static str> {
     match final_review_status {
         "blocked_unverified_product_claim" => Some("product_accuracy_score_block"),
         "held_by_ai_policy" => Some("fact_risk_block"),
-        "blocked_by_safety_guard" => Some("pressure_risk_block"),
+        // `blocked_by_safety_guard` 不归任何 gate（缺陷 #16 修复，保守口径）：
+        // 该终态的生产来源是非产品业务事实证据门与 fail-closed 基础设施路径
+        // （gates.rs:779 证据发送前失效、:818 unsupported 非产品业务事实、
+        // GatewayStatusFinal::BlockedBySafetyGuard 的 R5.3.a 注释 :469-474，
+        // 以及 review/mod.rs 的 ClaimGate/schema 失败 hold 族）——没有一条由
+        // pressure 或 product 分数阈值驱动（pressure 是软闸走 revision，不产
+        // block 终态；产品阈值门的终态是 blocked_unverified_product_claim）。
+        // 归入任何 gate 都会让该 gate 的命中率混入"调阈值不会改变"的事件。
         // human_like / emotional_value 是 rewrite 类，rewrite 后通常 final 走
         // revision_applied_approved；这里通过 revision_applied 字段补判（在 generate 内）。
         _ => None,
@@ -88,9 +101,14 @@ pub async fn generate(
         return Ok(Vec::new());
     }
     // 1. 把 cohort 内每条 run 拉出来，按 gate 累加命中数。
+    //    只统计**有真实终态/字段信号源**的 gate：pressure_risk_block（软闸，无
+    //    block 终态）与 planner_block_rate_threshold（无 run log 同源样本）都不在
+    //    此表内——它们在下方 band 循环里经 `hit_counts.get(gate)` miss 被跳过。
     let mut total_runs = 0_u64;
-    let mut hit_counts: HashMap<&'static str, f64> =
-        review_gate_keys().iter().map(|gate| (*gate, 0.0)).collect();
+    let mut hit_counts: HashMap<&'static str, f64> = gates_with_terminal_stat_source()
+        .iter()
+        .map(|gate| (*gate, 0.0))
+        .collect();
     let mut cursor = state
         .db
         .agent_run_logs()
@@ -127,6 +145,18 @@ pub async fn generate(
     }
     let total_runs_f = total_runs as f64;
 
+    // 缺陷 #16：pressure gate 因无终态统计源被跳过——留 tick 级审计事件说明
+    // 原因（best-effort：事件写失败只 warn，不影响其余 gate 的候选生成）。
+    write_gate_skipped_event(
+        state,
+        experiment_id,
+        workspace_id,
+        account_id,
+        "pressure_risk_block",
+        "no_terminal_signal_source",
+    )
+    .await;
+
     // 2. 算每 gate 的命中率与候选方向。
     let cooldown_skipped = load_gate_cooldowns(state, workspace_id, account_id).await?;
     // #155(P1)：候选的 current_value 必须基于当前生效 override，而非硬编码占位。
@@ -140,6 +170,9 @@ pub async fn generate(
         target_lower: f64,
         target_upper: f64,
         current_value: f64,
+        /// 名实注意：存的是 `decide_candidate` 返回的 **clamp 后**候选值（clamp
+        /// 发生时 cohort_notes.clamped_to_value 记录的就是本值），并非 clamp 前
+        /// 的原始提案；是否发生过 clamp 由旁边的 `clamped` 标记。
         proposed_raw: f64,
         clamped: bool,
         cooldown_active: bool,
@@ -148,8 +181,9 @@ pub async fn generate(
     }
     let mut candidates: Vec<Candidate> = Vec::new();
     for (gate, lower, upper) in THRESHOLD_REASONABLE_BANDS {
-        // Planner block rate 没有 agent_run_logs 同源样本。缺样本不是 0 命中，
-        // 因此在接入真实观测源前不生成 planner 候选。
+        // 无统计源的 gate 直接跳过：planner block rate 没有 agent_run_logs 同源
+        // 样本；pressure_risk_block 是软闸、无 block 终态（缺陷 #16）。缺样本不是
+        // 0 命中，因此在接入真实观测源前不对它们生成候选。
         let Some(hits) = hit_counts.get(gate).copied() else {
             continue;
         };
@@ -389,14 +423,49 @@ pub fn decide_candidate(
     Some((proposed_clamped, clamped))
 }
 
-fn review_gate_keys() -> &'static [&'static str] {
+/// 有真实统计源的 review gate：终态映射（[`classify_gate_hit`]）覆盖 fact /
+/// product 两个 block 闸；`revision_applied` 字段分摊覆盖两个 rewrite 闸。
+/// pressure_risk_block **不在**此列（软闸无 block 终态，缺陷 #16）；
+/// planner_block_rate_threshold 亦无 run log 同源样本。
+fn gates_with_terminal_stat_source() -> &'static [&'static str] {
     &[
         "fact_risk_block",
-        "pressure_risk_block",
         "human_like_score_rewrite",
         "emotional_value_rewrite",
         "product_accuracy_score_block",
     ]
+}
+
+/// 缺陷 #16 审计事件：某 gate 因无统计源被跳过候选生成。best-effort——写失败
+/// 只 warn，绝不阻断其余 gate 的候选生成（与 mod.rs tick 事件族同款直写
+/// `agent_events`，不触发送链）。
+async fn write_gate_skipped_event(
+    state: &AppState,
+    experiment_id: &str,
+    workspace_id: &str,
+    account_id: &str,
+    gate: &str,
+    reason: &str,
+) {
+    let event = crate::models::AgentEvent {
+        id: None,
+        workspace_id: workspace_id.to_string(),
+        account_id: account_id.to_string(),
+        contact_wxid: None,
+        kind: "evolution_threshold_gate_skipped".to_string(),
+        status: "info".to_string(),
+        summary: format!("threshold gate {gate} skipped: {reason}"),
+        details: Some(doc! {
+            "experiment_id": experiment_id,
+            "gate_key": gate,
+            "reason": reason,
+        }),
+        created_at: DateTime::now(),
+        dedupe_key: None,
+    };
+    if let Err(e) = state.db.events().insert_one(event, None).await {
+        tracing::warn!(?e, gate, reason, "write evolution_threshold_gate_skipped event failed");
+    }
 }
 
 fn gate_hits_below_threshold(gate: &str) -> bool {
@@ -420,12 +489,39 @@ mod tests {
             classify_gate_hit("held_by_ai_policy"),
             Some("fact_risk_block")
         );
-        assert_eq!(
-            classify_gate_hit("blocked_by_safety_guard"),
-            Some("pressure_risk_block")
-        );
+        // 缺陷 #16：blocked_by_safety_guard 来自证据门/fail-closed 基础设施路径
+        // （gates.rs:779,818 + R5.3.a），与 pressure 分数阈值无因果——不归任何 gate。
+        assert_eq!(classify_gate_hit("blocked_by_safety_guard"), None);
         assert_eq!(classify_gate_hit("approved"), None);
         assert_eq!(classify_gate_hit("revision_applied_approved"), None);
+    }
+
+    /// 缺陷 #16：pressure_risk_block 无终态统计源 → 不进 hit_counts 初始集，
+    /// band 循环对它 `continue`，永不生成候选（与 planner 同一纪律）；band 表
+    /// 仍保留其目标区间（接入真实观测源后恢复生成）。
+    #[test]
+    fn pressure_gate_is_excluded_from_stat_sources_but_kept_in_bands() {
+        assert!(
+            !gates_with_terminal_stat_source().contains(&"pressure_risk_block"),
+            "pressure 软闸无 block 终态，不得进统计源集合"
+        );
+        assert!(
+            !gates_with_terminal_stat_source().contains(&"planner_block_rate_threshold"),
+            "planner 无 run log 同源样本，不得进统计源集合"
+        );
+        assert!(
+            THRESHOLD_REASONABLE_BANDS
+                .iter()
+                .any(|(g, _, _)| *g == "pressure_risk_block"),
+            "band 表保留 pressure 目标区间（文档化观测口径）"
+        );
+        // 统计源集合内的 gate 必须都有 band（防单侧漂移）。
+        for gate in gates_with_terminal_stat_source() {
+            assert!(
+                THRESHOLD_REASONABLE_BANDS.iter().any(|(g, _, _)| g == gate),
+                "统计源 gate {gate} 缺 band"
+            );
+        }
     }
 
     #[test]

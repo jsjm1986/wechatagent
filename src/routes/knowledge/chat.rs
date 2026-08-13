@@ -7,6 +7,7 @@ use axum::{
 use futures::TryStreamExt;
 use mongodb::{
     bson::{doc, oid::ObjectId, Bson, DateTime, Document},
+    options::FindOneOptions,
     ClientSession,
 };
 use serde::{Deserialize, Serialize};
@@ -598,22 +599,74 @@ pub async fn chat_apply(
         &admin.user_id,
     )
     .await?;
-    const MAX_TRANSACTION_ATTEMPTS: usize = 3;
+    const MAX_TRANSACTION_ATTEMPTS: usize = 6;
     for attempt in 0..MAX_TRANSACTION_ATTEMPTS {
         match chat_apply_once(&state, &admin, &account_id, &trimmed).await {
             Ok(receipt) => return Ok(Json(receipt)),
-            Err(error)
-                if attempt + 1 < MAX_TRANSACTION_ATTEMPTS
-                    && is_transient_chat_apply_error(&error) =>
-            {
-                continue;
+            Err(error) if is_transient_chat_apply_error(&error) => {
+                // A concurrent caller may own the transaction that will publish the stable
+                // receipt. Do not spin through every retry before that transaction can commit,
+                // and never leak a Mongo WriteConflict through this idempotent API boundary.
+                tokio::time::sleep(chat_apply_retry_delay(attempt)).await;
+                if let Some(receipt) = load_committed_chat_apply_receipt(
+                    &state,
+                    &admin.current_workspace,
+                    &account_id,
+                    &trimmed,
+                )
+                .await?
+                {
+                    return Ok(Json(receipt));
+                }
+                if attempt + 1 == MAX_TRANSACTION_ATTEMPTS {
+                    return Err(AppError::Conflict(
+                        "chat_apply_transaction_conflict".to_string(),
+                    ));
+                }
             }
             Err(error) => return Err(error),
         }
     }
-    Err(AppError::Conflict(
-        "chat_apply_transaction_conflict".to_string(),
-    ))
+    unreachable!("bounded chat apply retry loop always returns")
+}
+
+fn chat_apply_retry_delay(attempt: usize) -> std::time::Duration {
+    // 20 + 40 + 80 + 160 + 320 + 640 ms keeps the endpoint bounded while giving the winning
+    // transaction enough time to commit its receipt on loaded replica sets.
+    std::time::Duration::from_millis(20_u64.saturating_mul(1_u64 << attempt.min(5)))
+}
+
+async fn load_committed_chat_apply_receipt(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+    session_id: &str,
+) -> AppResult<Option<Value>> {
+    let latest_draft = state
+        .db
+        .knowledge_chat_turns()
+        .find_one(
+            doc! {
+                "workspace_id": workspace_id,
+                "account_id": account_id,
+                "session_id": session_id,
+                "role": "assistant",
+                "patch": { "$ne": null },
+            },
+            FindOneOptions::builder()
+                .sort(doc! { "turn_index": -1_i32, "_id": -1_i32 })
+                .build(),
+        )
+        .await?;
+    let Some(turn) = latest_draft else {
+        return Ok(None);
+    };
+    if turn.status != "applied" {
+        return Ok(None);
+    }
+    turn.apply_result
+        .map(|receipt| Some(Bson::Document(receipt).into()))
+        .ok_or_else(|| AppError::Conflict("chat_apply_receipt_missing".to_string()))
 }
 
 fn is_transient_chat_apply_error(error: &AppError) -> bool {
@@ -2699,7 +2752,7 @@ pub(crate) async fn apply_create_chunk_with_session(
     payload.integrity_status = Some("needs_review".to_string());
 
     // chat 新建的知识没有父文档，溯源 = 运营在会话里的口头陈述本身。锚定规则与
-    // apply_update_chunk 共用 resolve_quote_anchors（见其文档）。
+    // apply_update_chunk_with_session 共用 resolve_quote_anchors（见其文档）。
     let resolution = resolve_quote_anchors(operator_statement, payload.source_quote.as_deref());
     payload.source_anchors = resolution.anchors;
     if let Some(quote) = resolution.quote {
@@ -2754,38 +2807,9 @@ pub(crate) async fn apply_create_chunk_with_session(
     }))
 }
 
-pub(crate) async fn apply_update_chunk(
-    state: &AppState,
-    workspace_id: &str,
-    account_id: &str,
-    chunk_id: &str,
-    patch: &Document,
-    operator_statement: &str,
-) -> AppResult<Value> {
-    let mut session = state.db.client().start_session(None).await?;
-    session.start_transaction(None).await?;
-    let result = apply_update_chunk_with_session(
-        state,
-        workspace_id,
-        account_id,
-        chunk_id,
-        patch,
-        operator_statement,
-        None,
-        &mut session,
-    )
-    .await;
-    let value = match result {
-        Ok(value) => value,
-        Err(error) => {
-            let _ = session.abort_transaction().await;
-            return Err(error);
-        }
-    };
-    crate::knowledge_wiki::chunk_revisions::commit_chunk_transaction(&mut session).await?;
-    Ok(value)
-}
-
+// 注：曾有 non-session 包装 `apply_update_chunk`（自建事务再委托本函数），唯一
+// 调用方是 knowledge_task execute_step 已退役的 retag 直接路径；包装随之删除，
+// 更新一律走本 _with_session 内核（chat_apply 与 worker 两阶段 commit 均自持 session）。
 pub(crate) async fn apply_update_chunk_with_session(
     state: &AppState,
     workspace_id: &str,

@@ -82,8 +82,9 @@ const SNAKE_CASE_COLLECTIONS: &[&str] = &[
 /// 用 camelCase `workspaceId` 的集合——对应 model struct 头带
 /// `#[serde(rename_all="camelCase")]`,故 `workspace_id` 序列化成 `workspaceId`
 /// (见 tests::KNOWN_CAMEL_TENANT_COLLECTIONS 审计基准)。
-/// 注意:`admin_users` 不在此表——AdminUser 用 `workspaces:Vec<String>` 而非单值
-/// workspaceId(auth/mod.rs:28-39),不符合单值回填契约。
+/// 注意:`admin_users` 不在此表——AdminUser（`auth/mod.rs`）用
+/// `workspaces:Vec<String>` 而非单值 workspaceId,不符合单值回填契约。
+/// （注释按约定引用类型/字段名,不写行号——行号随代码漂移。）
 const CAMEL_CASE_COLLECTIONS: &[&str] = &["llm_provider_configs", "campaigns", "campaign_sends"];
 
 pub async fn run_step(db: &Database) -> AppResult<()> {
@@ -197,7 +198,7 @@ mod tests {
 
     /// 审计定稿:真实携带**单值 camelCase `workspaceId`** 字段的集合。
     /// 判据=对应 struct 头带 `#[serde(rename_all="camelCase")]`(spec §2):
-    /// LlmProviderConfig(models.rs:4732)/ Campaign(552)/ CampaignSend(596)。
+    /// `models.rs` 的 LlmProviderConfig / Campaign / CampaignSend 三个类型。
     const KNOWN_CAMEL_TENANT_COLLECTIONS: &[&str] =
         &["llm_provider_configs", "campaigns", "campaign_sends"];
 

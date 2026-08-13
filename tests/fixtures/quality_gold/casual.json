@@ -1,0 +1,443 @@
+[
+  {
+    "id": "casual-001",
+    "category": "casual",
+    "description": "初次添加后的首句问候，期望自然承接并做一个轻量推进，不夹推销",
+    "contactSeed": {
+      "customerStage": "new_contact",
+      "intentLevel": "low",
+      "profileNote": "线下活动扫码添加的新好友，暂无更多背景",
+      "memorySummary": "",
+      "manualTags": [],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["你好"],
+    "knowledgeSeeds": [],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text"],
+      "qualityFloor": null,
+      "note": "寒暄必回；首轮不应出现产品推销话术"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "casual-002",
+    "category": "casual",
+    "description": "单独一句『在吗』，期望直接承接而不是反问式客服腔",
+    "contactSeed": {
+      "customerStage": "relationship_building",
+      "intentLevel": "medium",
+      "profileNote": "做社区团购的个体店主，此前聊过两次进货节奏",
+      "memorySummary": "客户经营社区小店，关心进货成本，上次聊到月底盘货",
+      "manualTags": ["个体店主"],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["在吗"],
+    "knowledgeSeeds": [],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text"],
+      "qualityFloor": null,
+      "note": "应表现出『我在』的即时感并顺势承接，不应只回一句『在的，请问有什么可以帮您』式模板"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "casual-003",
+    "category": "casual",
+    "description": "最小回应『嗯』作为首条消息（边界：几乎零信息量，仍须温和承接）",
+    "contactSeed": {
+      "customerStage": "relationship_building",
+      "intentLevel": "low",
+      "profileNote": "话很少的客户，之前多为单字回复",
+      "memorySummary": "客户偏内向，回复短，不喜欢被连环追问",
+      "manualTags": [],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["嗯"],
+    "knowledgeSeeds": [],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text"],
+      "qualityFloor": null,
+      "note": "不应连环追问；一句轻承接即可"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "casual-004",
+    "category": "casual",
+    "description": "清晨问候『早』，期望有温度的口语回应",
+    "contactSeed": {
+      "customerStage": "relationship_building",
+      "intentLevel": "medium",
+      "profileNote": "习惯早起晨跑的客户，之前聊过早餐习惯",
+      "memorySummary": "客户有晨跑习惯，作息规律",
+      "manualTags": [],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["早"],
+    "knowledgeSeeds": [],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text"],
+      "qualityFloor": null,
+      "note": "结合画像的自然问候优于万能模板"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "casual-005",
+    "category": "casual",
+    "description": "深夜『晚安』收尾，期望简短收束、不追问不推进",
+    "contactSeed": {
+      "customerStage": "need_discovery",
+      "intentLevel": "medium",
+      "profileNote": "白天聊过需求，晚上主动道晚安",
+      "memorySummary": "白天聊过一次需求梳理，客户说改天细聊",
+      "manualTags": [],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["晚安啦"],
+    "knowledgeSeeds": [],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text"],
+      "qualityFloor": null,
+      "note": "收尾轮不应借机推进业务话题"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "casual-006",
+    "category": "casual",
+    "description": "节日问候，期望自然回礼并带一点只属于对方的具体感",
+    "contactSeed": {
+      "customerStage": "customer_success",
+      "intentLevel": "medium",
+      "profileNote": "老客户，去年下过单，家里有两个孩子",
+      "memorySummary": "已成交老客户，孩子一个上小学一个幼儿园，节假日常带娃出游",
+      "manualTags": ["老客户"],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["新年快乐哈"],
+    "knowledgeSeeds": [],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text"],
+      "qualityFloor": null,
+      "note": "对老客户的节日回礼应带记忆感，不应像群发"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "casual-007",
+    "category": "casual",
+    "description": "天气闲聊开场，期望顺着话题接住而非硬拉回业务",
+    "contactSeed": {
+      "customerStage": "relationship_building",
+      "intentLevel": "low",
+      "profileNote": "户外工作者，常在下午发消息",
+      "memorySummary": "客户做工程监理，经常在工地",
+      "manualTags": [],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["今天可真热，晒得不行"],
+    "knowledgeSeeds": [],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text"],
+      "qualityFloor": null,
+      "note": "应结合『在工地』的画像共情，不应转推销"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "casual-008",
+    "category": "casual",
+    "description": "简单致谢，期望自然收下并保持关系温度",
+    "contactSeed": {
+      "customerStage": "need_discovery",
+      "intentLevel": "medium",
+      "profileNote": "昨天帮客户整理过一份对比思路",
+      "memorySummary": "昨天给客户梳理过选型思路，客户说要拿去和同事讨论",
+      "manualTags": [],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["好的谢谢你，帮大忙了"],
+    "knowledgeSeeds": [],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text"],
+      "qualityFloor": null,
+      "note": "不应借致谢立刻催进度"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "casual-009",
+    "category": "casual",
+    "description": "三轮寒暄延续：问候→说忙→问周末上班，期望多轮不重复寒暄、承接连贯",
+    "contactSeed": {
+      "customerStage": "relationship_building",
+      "intentLevel": "medium",
+      "profileNote": "开烘焙工作室的客户，周末生意最忙",
+      "memorySummary": "客户经营烘焙工作室，周末订单多，平时下午相对空闲",
+      "manualTags": ["烘焙工作室"],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["你好呀", "最近忙得脚不沾地", "对了你们周末上班吗"],
+    "knowledgeSeeds": [],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text"],
+      "qualityFloor": null,
+      "note": "第二三轮不得再次开场式问候；最后一问应正面作答"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "casual-010",
+    "category": "casual",
+    "description": "成交后的老客户随口问好，期望熟人感承接",
+    "contactSeed": {
+      "customerStage": "customer_success",
+      "intentLevel": "low",
+      "profileNote": "半年前成交的老客户，服务体验良好",
+      "memorySummary": "老客户，半年前成交，之后偶尔寒暄，对服务满意",
+      "manualTags": ["老客户"],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["好久没联系啦，最近咋样"],
+    "knowledgeSeeds": [],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text"],
+      "qualityFloor": null,
+      "note": "熟人口吻，不应像第一次见面，也不应立刻推新品"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "casual-011",
+    "category": "casual",
+    "description": "纯语气词『哈哈哈哈』，期望接住气氛而不尬聊",
+    "contactSeed": {
+      "customerStage": "relationship_building",
+      "intentLevel": "low",
+      "profileNote": "性格开朗爱开玩笑的客户",
+      "memorySummary": "客户说话轻松爱调侃，上一轮聊到他把闹钟按掉迟到的事",
+      "manualTags": [],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["哈哈哈哈"],
+    "knowledgeSeeds": [],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text"],
+      "qualityFloor": null,
+      "note": "允许轻松幽默；不应回客服腔"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "casual-012",
+    "category": "casual",
+    "description": "客户自嘲拖延，期望共情不说教、给个轻量台阶",
+    "contactSeed": {
+      "customerStage": "need_discovery",
+      "intentLevel": "medium",
+      "profileNote": "之前说要整理需求清单但一直没动手",
+      "memorySummary": "客户上月说要整理需求清单发过来，至今未发",
+      "manualTags": [],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["我这拖延症又犯了，之前说要弄的清单一直没动"],
+    "knowledgeSeeds": [],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text"],
+      "qualityFloor": null,
+      "note": "不应说教『要自律』；可给最小可执行的下一步"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "casual-013",
+    "category": "casual",
+    "description": "客户发错消息道歉，期望轻松化解不借题发挥",
+    "contactSeed": {
+      "customerStage": "relationship_building",
+      "intentLevel": "low",
+      "profileNote": "",
+      "memorySummary": "",
+      "manualTags": [],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["刚那条消息发错人了，不好意思哈"],
+    "knowledgeSeeds": [],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text"],
+      "qualityFloor": null,
+      "note": "一句轻松承接即可，不应趁机推进业务"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "casual-014",
+    "category": "casual",
+    "description": "沉默多日后客户主动回归，期望不翻旧账、不指责失联",
+    "contactSeed": {
+      "customerStage": "relationship_building",
+      "intentLevel": "medium",
+      "profileNote": "两周前聊过一半突然没了回音",
+      "memorySummary": "两周前聊到一半客户中断回复，此前对话氛围正常",
+      "manualTags": [],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["前阵子实在太忙了，才看到你消息"],
+    "knowledgeSeeds": [],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text"],
+      "qualityFloor": null,
+      "note": "应体谅并自然衔接上次话题，不应质问为何不回"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "casual-015",
+    "category": "casual",
+    "description": "客户反问近况『你最近咋样』，期望以人设口吻自然应答且不暴露系统身份",
+    "contactSeed": {
+      "customerStage": "relationship_building",
+      "intentLevel": "low",
+      "profileNote": "关系较熟的客户，聊天像朋友",
+      "memorySummary": "和客户互动频繁，彼此说话随意",
+      "manualTags": [],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["你最近咋样，忙不忙"],
+    "knowledgeSeeds": [],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text"],
+      "qualityFloor": null,
+      "note": "以第一人称自然应答；不得自曝 AI 身份，也不得编造具体私人经历细节堆砌"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "casual-016",
+    "category": "casual",
+    "description": "生活化寒暄『吃了吗』，期望口语承接",
+    "contactSeed": {
+      "customerStage": "relationship_building",
+      "intentLevel": "low",
+      "profileNote": "年纪稍长的客户，说话家常",
+      "memorySummary": "客户五十多岁，喜欢家常式寒暄",
+      "manualTags": [],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["吃了吗"],
+    "knowledgeSeeds": [],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text"],
+      "qualityFloor": null,
+      "note": "家常承接即可"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "casual-017",
+    "category": "casual",
+    "description": "客户分享生活事件（孩子入园），期望承接情绪价值",
+    "contactSeed": {
+      "customerStage": "customer_success",
+      "intentLevel": "low",
+      "profileNote": "老客户，孩子今年三岁",
+      "memorySummary": "老客户，之前聊过孩子快上幼儿园",
+      "manualTags": ["老客户"],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["娃今天第一天上幼儿园，老母亲有点感慨"],
+    "knowledgeSeeds": [],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text"],
+      "qualityFloor": null,
+      "note": "承接具体的感慨（第一天入园），不应空泛共情或转业务"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "casual-018",
+    "category": "casual",
+    "description": "三轮碎片消息：对了→我想起来个事→算了下次再说（边界：话头收回，不应穷追）",
+    "contactSeed": {
+      "customerStage": "need_discovery",
+      "intentLevel": "medium",
+      "profileNote": "说话跳跃的客户",
+      "memorySummary": "客户思维发散，经常话说一半",
+      "manualTags": [],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["对了", "我想起来个事", "算了，下次见面再说吧"],
+    "knowledgeSeeds": [],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text"],
+      "qualityFloor": null,
+      "note": "最后一轮应尊重收回，不应追问『什么事呀说嘛』式穷追"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "casual-019",
+    "category": "casual",
+    "description": "客户对此前话题给出含糊反馈『还行吧』，期望不过度解读、轻量跟进",
+    "contactSeed": {
+      "customerStage": "need_discovery",
+      "intentLevel": "medium",
+      "profileNote": "上周发过一份公开的行业清单给客户",
+      "memorySummary": "上周分享过一份行业趋势清单，客户当时没细看",
+      "manualTags": [],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["上次你发的那个，我看了下，还行吧"],
+    "knowledgeSeeds": [],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text"],
+      "qualityFloor": null,
+      "note": "『还行吧』是弱信号；不应把它解读成高意向而加压推进"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "casual-020",
+    "category": "casual",
+    "description": "半开放试探『最近有啥新东西不』（边界：可自然升价值分享，但无知识背书不得展开产品细节）",
+    "contactSeed": {
+      "customerStage": "relationship_building",
+      "intentLevel": "medium",
+      "profileNote": "对行业动态感兴趣的客户",
+      "memorySummary": "客户喜欢了解新趋势，之前对行业动态类内容有回应",
+      "manualTags": [],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["最近有啥新东西不"],
+    "knowledgeSeeds": [],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text", "no_absolute_promise", "no_fabricated_price_or_discount"],
+      "qualityFloor": null,
+      "note": "知识库为空：不得编造新品/活动细节，可自然承接并了解对方关注点"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "casual-021",
+    "category": "casual",
+    "description": "凌晨『睡不着』（边界：寒暄外壳下的情绪暗示，期望被接住而非被解决）",
+    "contactSeed": {
+      "customerStage": "relationship_building",
+      "intentLevel": "low",
+      "profileNote": "独自在外地工作的客户",
+      "memorySummary": "客户独居外地，最近提过工作压力大",
+      "manualTags": [],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["睡不着"],
+    "knowledgeSeeds": [],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text"],
+      "qualityFloor": null,
+      "note": "先承接情绪、给空间；不应给一堆助眠建议清单，更不应转业务"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  }
+]

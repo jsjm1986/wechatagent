@@ -1,15 +1,21 @@
 //! agent-self-evolution M4 W4 Task 5.6：+24h post-release review。
 //!
-//! 每次 release 后由 `release.rs` 调 [`schedule_post_release_review`] 插一条
-//! `post_release_reviews` 文档（`scheduled_at = released_at + 24h`,
-//! `completed=false`）。`evolution::run_one_tick` 末尾调 [`run_due_reviews`]，
-//! 扫一次到期且未完成的条目，对每条：
+//! 每次 release 由 `release.rs` 在 release **事务内**直接 insert
+//! [`post_release_review_document`] 构造的 `post_release_reviews` 文档
+//! （`scheduled_at = released_at + 24h`, `completed=false`；#155 后事务化，
+//! 旧的事务外兼容入口已删除——终裁 10-1）。`evolution::run_one_tick` 末尾调
+//! [`run_due_reviews`]，扫一次到期且未完成的条目，对每条：
 //!
 //! 1. 算 `released_at - 24h ~ released_at`（BEFORE）与
 //!    `released_at ~ released_at + 24h`（AFTER）两个 24h 窗口下的 `agent_run_logs`
 //!    切片；
-//! 2. 写 `actual_send_success_rate_delta`（approved-like / total 差值）与
-//!    `actual_5gate_hit_delta`（每个 5gate block-rate 的差值）；
+//! 2. 写对比指标（H3 起与 significance H2 判定同口径——真实用户反应结果为主）：
+//!    - `actual_outcome_weighted_score_delta`（主观测指标：(Hit−Block)/非删失 的
+//!      前/后窗口差，三态分类与 H2 同一支共享分类器）；
+//!    - `before/after_outcome_distribution`（三态分布，含删失计数）；
+//!    - `actual_negative_reaction_rate_delta`（保留，2.5-pre-3）；
+//!    - `actual_send_success_rate_delta`（保留，过程指标观测）与
+//!      `actual_5gate_hit_delta`（每个 5gate block-rate 的差值）；
 //! 3. 把 `completed=true / completed_at=now`，并写一条
 //!    `agent_events kind="evolution_post_release_review"`。
 //!
@@ -68,39 +74,9 @@ const FIVE_GATE_KEYS: &[(&str, &str)] = &[
     ),
 ];
 
-/// 安插一条 `post_release_reviews` 文档。`released_at` 由 `release.rs` 在自己
-/// transaction 内确定的 `now`；`scheduled_at = released_at + 24h`。
-///
-/// 注意：本函数**不参与** release transaction —— 即便 insert 失败也仅 warn，
-/// 不影响 release 本身（post-release review 是观测，不是门禁）。
-pub async fn schedule_post_release_review(
-    state: &AppState,
-    proposal_id: ObjectId,
-    workspace_id: &str,
-    account_id: &str,
-    proposal_kind: &str,
-    released_at: BsonDateTime,
-) -> Result<(), EvolutionError> {
-    let doc = post_release_review_document(
-        proposal_id,
-        workspace_id,
-        account_id,
-        proposal_kind,
-        released_at,
-    );
-    state
-        .db
-        .raw()
-        .collection::<Document>("post_release_reviews")
-        .insert_one(doc, None)
-        .await
-        .map_err(EvolutionError::from)?;
-    Ok(())
-}
-
-/// Durable +24h review intent inserted by release transactions. Keeping the
-/// document constructor here makes the transactional and compatibility paths
-/// share one schema.
+/// Durable +24h review intent inserted by release transactions
+/// (`release.rs::insert_release_observability_with_session`). The schema has a
+/// single constructor so every writer shares one shape.
 pub(crate) fn post_release_review_document(
     proposal_id: ObjectId,
     workspace_id: &str,
@@ -120,6 +96,10 @@ pub(crate) fn post_release_review_document(
         "completed": false,
         "actual_send_success_rate_delta": null,
         "actual_5gate_hit_delta": doc! {},
+        // H3：+24h 主观测指标（与 significance H2 同口径）与三态分布占位。
+        "actual_outcome_weighted_score_delta": null,
+        "before_outcome_distribution": doc! {},
+        "after_outcome_distribution": doc! {},
         "completed_at": null,
     }
 }
@@ -211,6 +191,16 @@ async fn process_one_review(state: &AppState, review: &Document) -> Result<(), E
         .zip(before.negative_reaction_rate)
         .map(|(a, b)| a - b);
 
+    // H3 主观测指标：结果加权分（(Hit−Block)/非删失）的前/后窗口 delta——与
+    // significance H2 判定同口径。任一窗口全删失（None）→ delta 缺省不写。
+    // 观测性质不变：仍不自动回滚（Requirements 9.7），回滚必须经 admin。
+    let delta_outcome_weighted = after
+        .outcome_weighted_score
+        .zip(before.outcome_weighted_score)
+        .map(|(a, b)| a - b);
+    let before_distribution = outcome_distribution_doc(&before.outcome_counts);
+    let after_distribution = outcome_distribution_doc(&after.outcome_counts);
+
     let mut delta_5gate = Document::new();
     for (gate_key, _status) in FIVE_GATE_KEYS {
         let a = after.five_gate_hit_rate.get(*gate_key).copied();
@@ -234,6 +224,11 @@ async fn process_one_review(state: &AppState, review: &Document) -> Result<(), E
                     "actual_send_success_rate_delta": delta_send_success,
                     "actual_5gate_hit_delta": delta_5gate.clone(),
                     "actual_negative_reaction_rate_delta": delta_negative_reaction,
+                    // H3：主观测指标 + 三态分布（Document 加法字段，读方走 raw
+                    // Document / typed struct 未列字段被 serde 忽略——向后兼容）。
+                    "actual_outcome_weighted_score_delta": delta_outcome_weighted,
+                    "before_outcome_distribution": before_distribution.clone(),
+                    "after_outcome_distribution": after_distribution.clone(),
                 }
             },
             None,
@@ -249,9 +244,16 @@ async fn process_one_review(state: &AppState, review: &Document) -> Result<(), E
         "before_total_runs": before.total_runs as i64,
         "after_total_runs": after.total_runs as i64,
         "actual_5gate_hit_delta": delta_5gate,
+        // H3：三态分布恒写（含全删失窗口——admin 能看到"没有结果证据"本身）。
+        "before_outcome_distribution": before_distribution,
+        "after_outcome_distribution": after_distribution,
     };
     if let Some(d) = delta_send_success {
         details.insert("actual_send_success_rate_delta", d);
+    }
+    // H3 主观测指标（与 significance H2 同口径）；任一窗口全删失 → 缺省不写。
+    if let Some(d) = delta_outcome_weighted {
+        details.insert("actual_outcome_weighted_score_delta", d);
     }
     // 2.5-pre-3：负反应率观测（仅写 details，不参与判决）。窗口内无已分类客户反应
     // （全删失/无反应）时 before/after 为 None → delta 缺省不写，admin 面板天然空缺。
@@ -299,13 +301,17 @@ struct WindowMetrics {
     send_success_rate: Option<f64>,
     /// gate_key → block-rate（命中 / total）。
     five_gate_hit_rate: HashMap<String, f64>,
-    /// universal-domain-adaptation 2.5-pre-3：业务结果兜底观测指标。
-    /// `negative_reaction_rate = Σ(label==Block) / max(1, Σ(label∈{Hit,Block}))`，
-    /// 客户负反应占已分类反应的比例。数据源 = 窗口内 `agent_decision_reviews.outcome_status`
-    /// 经 [`crate::knowledge_wiki::gap_signals::classify_outcome_label`] 三态判定
-    /// （沉默/pending/未分类 = Censored，删失排除，不进分子也不进分母）。
+    /// H3：窗口内客户反应三态分布（Hit / Block / Censored）——+24h 主观测指标
+    /// `outcome_weighted_score` 与保留的 `negative_reaction_rate` 都从它派生，
+    /// 与 significance H2 判定同口径（同一支共享分类器、同删失语义）。
+    outcome_counts: WindowOutcomeCounts,
+    /// universal-domain-adaptation 2.5-pre-3：业务结果兜底观测指标（保留）。
+    /// `negative_reaction_rate = Σ(Block) / (Σ(Hit)+Σ(Block))`，删失不进分母；
     /// 窗口内无已分类反应时为 `None`（避免 0/0 NaN 落库）。
     negative_reaction_rate: Option<f64>,
+    /// H3 主观测指标：`(Hit − Block) / (Hit + Block)`，与 significance H2 的
+    /// outcome_weighted 口径同族；无已分类反应时 `None`。
+    outcome_weighted_score: Option<f64>,
 }
 
 async fn compute_window_metrics(
@@ -364,43 +370,54 @@ async fn compute_window_metrics(
         }
     }
 
+    let outcome_counts =
+        compute_window_outcome_counts(state, workspace_id, account_id, start, end).await?;
     let negative_reaction_rate =
-        compute_negative_reaction_rate(state, workspace_id, account_id, start, end).await?;
+        negative_reaction_rate_from_counts(outcome_counts.hits, outcome_counts.blocks);
+    let outcome_weighted_score =
+        outcome_weighted_score_from_counts(outcome_counts.hits, outcome_counts.blocks);
 
     Ok(WindowMetrics {
         total_runs,
         send_success_rate,
         five_gate_hit_rate,
+        outcome_counts,
         negative_reaction_rate,
+        outcome_weighted_score,
     })
 }
 
-/// 2.5-pre-3：窗口内客户负反应率（业务结果兜底观测指标）。
+/// H3：单个窗口内客户反应的三态分布计数（与 significance H2 判定同一支
+/// 共享分类器 [`crate::agent::outcome_label`] 判定）。
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct WindowOutcomeCounts {
+    pub hits: i64,
+    pub blocks: i64,
+    /// 删失（沉默 / pending / 未分类 / `outcome_status` 缺失）。只用于分布观测，
+    /// 不进任何比率分母。
+    pub censored: i64,
+}
+
+/// 2.5-pre-3 / H3：窗口内客户反应三态分布（业务结果兜底观测指标的数据底座）。
 ///
 /// 按 `(workspace_id, account_id, created_at∈[start,end))` 在 `agent_decision_reviews`
-/// 上按 `outcome_status` group-count，再用回路① 同一支
-/// [`crate::knowledge_wiki::gap_signals::classify_outcome_label`] 三态判定把每个
-/// status 归 Hit / Block / Censored。`negative_reaction_rate = Σ(Block) /
-/// (Σ(Hit)+Σ(Block))`；删失（沉默/pending/未分类）不进分子也不进分母。已分类反应
-/// 为 0 时返回 `None`（避免 0/0 NaN 落库）。
+/// 上按 `outcome_status` group-count，再用与 significance H2 判定同一支共享分类器
+/// [`crate::agent::outcome_label::classify_outcome_label_with_polarity`] 把每个
+/// status 归 Hit / Block / Censored。`outcome_status` 缺失/null 也计入 Censored
+/// （H3 起不再被 $match 滤掉——三态分布要完整）。
 ///
 /// **G07 修复**：本函数加载 active profile 的 `outcome_polarity`，经
-/// [`crate::knowledge_wiki::gap_signals::resolve_effective_polarity`] 解析后传入
-/// 参数化分类器 `classify_outcome_label_with_polarity`——与回路①
-/// （`refresh_usage_stats`）同源同极性。空极性逐极回落内置销售 const
-/// （DEFAULT_PROFILE 字节等价），故 DEFAULT 销售域下行为与旧
-/// `classify_outcome_label` 逐字相同；换行业时按本行业声明的极性判定。
-///
-/// 2.5-main-4：提升为 `pub(crate)` 供 `auto_release` 的负反应强制门复用（同一口径、
-/// 同一极性源），避免两处算法 drift。
-pub(crate) async fn compute_negative_reaction_rate(
+/// [`crate::agent::outcome_label::resolve_effective_polarity`] 解析后传入参数化
+/// 分类器——与回路①（`refresh_usage_stats`）及 significance H2 同源同极性。
+/// 空极性逐极回落内置销售 const（DEFAULT_PROFILE 字节等价）。
+pub(crate) async fn compute_window_outcome_counts(
     state: &AppState,
     workspace_id: &str,
     account_id: &str,
     start: BsonDateTime,
     end: BsonDateTime,
-) -> Result<Option<f64>, EvolutionError> {
-    use crate::knowledge_wiki::gap_signals::{
+) -> Result<WindowOutcomeCounts, EvolutionError> {
+    use crate::agent::outcome_label::{
         classify_outcome_label_with_polarity, resolve_effective_polarity, OutcomeLabel,
     };
     use futures::TryStreamExt;
@@ -410,7 +427,6 @@ pub(crate) async fn compute_negative_reaction_rate(
             "workspace_id": workspace_id,
             "account_id": account_id,
             "created_at": { "$gte": start, "$lt": end },
-            "outcome_status": { "$exists": true, "$ne": null },
         }},
         doc! { "$group": { "_id": "$outcome_status", "n": { "$sum": 1i64 } } },
     ];
@@ -428,32 +444,49 @@ pub(crate) async fn compute_negative_reaction_rate(
         })?;
     let (positive, negative) = resolve_effective_polarity(&profile.outcome_polarity);
 
-    let mut hits: i64 = 0;
-    let mut blocks: i64 = 0;
+    let mut counts = WindowOutcomeCounts::default();
     while let Some(row) = cursor.try_next().await.map_err(EvolutionError::from)? {
         let n = row.get_i64("n").unwrap_or(0);
         let status = row.get_str("_id").ok();
         match classify_outcome_label_with_polarity(status, &positive, &negative) {
-            OutcomeLabel::Hit => hits += n,
-            OutcomeLabel::Block => blocks += n,
-            OutcomeLabel::Censored => {}
+            OutcomeLabel::Hit => counts.hits += n,
+            OutcomeLabel::Block => counts.blocks += n,
+            OutcomeLabel::Censored => counts.censored += n,
         }
     }
 
-    Ok(negative_reaction_rate_from_counts(hits, blocks))
+    Ok(counts)
 }
 
 /// 2.5-pre-3：从 Hit / Block 计数算负反应率的纯算术核心（删失已在 caller 排除）。
 /// `Block / (Hit+Block)`；已分类反应为 0 时返回 `None`（避免 0/0 NaN 落库）。
-///
-/// 2.5-main-4：提升为 `pub(crate)`，与 [`compute_negative_reaction_rate`] 一并供
-/// `auto_release` 复用。
 pub(crate) fn negative_reaction_rate_from_counts(hits: i64, blocks: i64) -> Option<f64> {
     let classified = hits + blocks;
     if classified > 0 {
         Some(blocks as f64 / classified as f64)
     } else {
         None
+    }
+}
+
+/// H3：结果加权分的纯算术核心——`(Hit − Block) / (Hit + Block)`，与 significance
+/// H2 的 outcome_weighted 口径同族（生产窗口内消息均已实际发出，"放行"恒真，
+/// 故分子无需再乘放行判定）。已分类反应为 0 时返回 `None`（避免 0/0 NaN 落库）。
+pub(crate) fn outcome_weighted_score_from_counts(hits: i64, blocks: i64) -> Option<f64> {
+    let classified = hits + blocks;
+    if classified > 0 {
+        Some((hits - blocks) as f64 / classified as f64)
+    } else {
+        None
+    }
+}
+
+/// H3：三态分布的落库形态（`post_release_reviews` 与 agent_events details 共用）。
+fn outcome_distribution_doc(counts: &WindowOutcomeCounts) -> Document {
+    doc! {
+        "hit": counts.hits,
+        "block": counts.blocks,
+        "censored": counts.censored,
     }
 }
 
@@ -544,6 +577,24 @@ mod tests {
         assert_eq!(negative_reaction_rate_from_counts(1, 3), Some(0.75));
         // 全 hit → 0.0（非 None）。
         assert_eq!(negative_reaction_rate_from_counts(4, 0), Some(0.0));
+    }
+
+    /// H3：+24h 主观测指标与 significance H2 判定同族——
+    /// outcome_weighted_score = (Hit − Block) / 非删失。删失不进分母。
+    #[test]
+    fn outcome_weighted_score_matches_significance_family_semantics() {
+        // 3 hit / 1 block → (3-1)/4 = 0.5。
+        assert_eq!(outcome_weighted_score_from_counts(3, 1), Some(0.5));
+        // 全 block → -1.0（最坏）；全 hit → 1.0（最好）。
+        assert_eq!(outcome_weighted_score_from_counts(0, 4), Some(-1.0));
+        assert_eq!(outcome_weighted_score_from_counts(4, 0), Some(1.0));
+    }
+
+    /// H3：窗口内无已分类反应（全删失）→ None，避免 0/0 NaN 落库——
+    /// 与 negative_reaction_rate 的删失语义一致。
+    #[test]
+    fn outcome_weighted_score_is_none_when_all_censored() {
+        assert_eq!(outcome_weighted_score_from_counts(0, 0), None);
     }
 
     #[test]

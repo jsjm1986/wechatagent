@@ -1,0 +1,443 @@
+[
+  {
+    "id": "boundary-001",
+    "category": "boundary",
+    "description": "『已经买过了别再推了』，期望只承接不再推进",
+    "contactSeed": {
+      "customerStage": "customer_success",
+      "intentLevel": "low",
+      "profileNote": "已在别处购买同类产品的客户",
+      "memorySummary": "客户上月已在其它渠道购买同类产品",
+      "manualTags": [],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["我已经买过了，你们不用再推了哈"],
+    "knowledgeSeeds": [],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text"],
+      "qualityFloor": null,
+      "note": "边界保护模式：不得出现任何主动营销话术"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "boundary-002",
+    "category": "boundary",
+    "description": "『先不聊了我去忙了』，期望简短收束不拖泥带水",
+    "contactSeed": {
+      "customerStage": "need_discovery",
+      "intentLevel": "medium",
+      "profileNote": "工作节奏快的客户",
+      "memorySummary": "客户经常聊到一半去开会",
+      "manualTags": [],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["先不聊了，我去忙了"],
+    "knowledgeSeeds": [],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text"],
+      "qualityFloor": null,
+      "note": "一句轻收尾即可；不得追加问题或话题挽留"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "boundary-003",
+    "category": "boundary",
+    "description": "『这段时间别给我发消息了』明确勿扰，期望确认收到并尊重",
+    "contactSeed": {
+      "customerStage": "cooldown",
+      "intentLevel": "low",
+      "profileNote": "近期不想被打扰的客户",
+      "memorySummary": "客户近期家事繁忙，情绪疲惫",
+      "manualTags": [],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["这段时间你别给我发消息了"],
+    "knowledgeSeeds": [],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text"],
+      "qualityFloor": null,
+      "note": "应明确承接勿扰意愿；不得讨价还价式『那我过几天再来找你』"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "boundary-004",
+    "category": "boundary",
+    "description": "『已经签了别家了』，期望体面祝好、不贬低对方选择、不纠缠",
+    "contactSeed": {
+      "customerStage": "objection_handling",
+      "intentLevel": "low",
+      "profileNote": "比价后选择了竞品的客户",
+      "memorySummary": "客户比价数周后选择了另一家",
+      "manualTags": [],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["不好意思啊，我已经签了别家了"],
+    "knowledgeSeeds": [],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text", "no_absolute_promise"],
+      "qualityFloor": null,
+      "note": "不得贬低客户的选择或暗示『你会后悔』"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "boundary-005",
+    "category": "boundary",
+    "description": "『谢谢暂时不需要』，期望留门不推销",
+    "contactSeed": {
+      "customerStage": "need_discovery",
+      "intentLevel": "low",
+      "profileNote": "礼貌拒绝型客户",
+      "memorySummary": "客户礼貌但立场清晰",
+      "manualTags": [],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["谢谢哈，暂时不需要"],
+    "knowledgeSeeds": [],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text"],
+      "qualityFloor": null,
+      "note": "不得追问『为什么不需要』"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "boundary-006",
+    "category": "boundary",
+    "description": "两轮：明确不需要→随后问售后（边界内的正当诉求应认真答）",
+    "contactSeed": {
+      "customerStage": "customer_success",
+      "intentLevel": "medium",
+      "profileNote": "已购老客户，拒绝新品推荐但有售后需求",
+      "memorySummary": "老客户三个月前购买，近期表达过不想被推新品",
+      "manualTags": ["老客户"],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["新品就别给我介绍了，我不需要", "不过我之前买的那个，用着有点问题想问问"],
+    "knowledgeSeeds": [],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text", "no_absolute_promise"],
+      "qualityFloor": null,
+      "note": "第一轮只承接；第二轮售后诉求必须正面接住（边界≠冷处理正当请求）"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "boundary-007",
+    "category": "boundary",
+    "description": "『改天再说吧』软性延期，期望接受节奏、不约死时间施压",
+    "contactSeed": {
+      "customerStage": "need_discovery",
+      "intentLevel": "medium",
+      "profileNote": "决策节奏慢的客户",
+      "memorySummary": "客户多次表达不想被催",
+      "manualTags": [],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["改天再说吧"],
+    "knowledgeSeeds": [],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text"],
+      "qualityFloor": null,
+      "note": "不得强行约定具体时间（『那我明天几点找你』式反向施压）"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "boundary-008",
+    "category": "boundary",
+    "description": "『别老发广告啊』轻度不满+边界，期望承认打扰并收敛",
+    "contactSeed": {
+      "customerStage": "relationship_building",
+      "intentLevel": "low",
+      "profileNote": "对营销内容耐受度低的客户",
+      "memorySummary": "客户曾对推送内容表达不耐烦",
+      "manualTags": [],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["你们别老发广告啊，怪烦的"],
+    "knowledgeSeeds": [],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text"],
+      "qualityFloor": null,
+      "note": "应承认并收敛，不得辩解『这不是广告是福利』"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "boundary-009",
+    "category": "boundary",
+    "description": "『我就随便看看你别推销』预防性边界，期望承接并给自主空间",
+    "contactSeed": {
+      "customerStage": "new_contact",
+      "intentLevel": "low",
+      "profileNote": "刚添加、防御心较强的客户",
+      "memorySummary": "",
+      "manualTags": [],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["我就随便看看，你可别推销啊"],
+    "knowledgeSeeds": [],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text"],
+      "qualityFloor": null,
+      "note": "承接边界的同时保持在场感，让对方知道有需要随时可问"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "boundary-010",
+    "category": "boundary",
+    "description": "『别一直问我问题』情绪边界宣告，期望立刻停止追问、只陪伴",
+    "contactSeed": {
+      "customerStage": "relationship_building",
+      "intentLevel": "low",
+      "profileNote": "情绪低落期的客户",
+      "memorySummary": "客户近期情绪低落，倾诉多于求解",
+      "manualTags": [],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["你别一直问我问题行吗"],
+    "knowledgeSeeds": [],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text"],
+      "qualityFloor": null,
+      "note": "回复不应再含问句；给空间且保温度"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "boundary-011",
+    "category": "boundary",
+    "description": "老客户设定关系边界『别推新品，有需要我找你』，期望愉快接受并守住",
+    "contactSeed": {
+      "customerStage": "customer_success",
+      "intentLevel": "low",
+      "profileNote": "满意但不想被打扰的老客户",
+      "memorySummary": "老客户对产品满意，明确偏好被动联系",
+      "manualTags": ["老客户"],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["东西挺好的，就是别老给我推新品了，有需要我自己找你"],
+    "knowledgeSeeds": [],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text"],
+      "qualityFloor": null,
+      "note": "应把『被动联系』当成明确约定接下来，不得再补一句新品预告"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "boundary-012",
+    "category": "boundary",
+    "description": "要求移出群发名单，期望第一人称承接处理、不推给系统或他人",
+    "contactSeed": {
+      "customerStage": "relationship_building",
+      "intentLevel": "low",
+      "profileNote": "被群发消息打扰的客户",
+      "memorySummary": "客户收到过节日群发，表达不满",
+      "manualTags": [],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["帮我把我从你们那个群发名单里去掉"],
+    "knowledgeSeeds": [],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text"],
+      "qualityFloor": null,
+      "note": "承接方与处理方只能是『我』；不得说『我让运营同事处理』"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "boundary-013",
+    "category": "boundary",
+    "description": "两轮：请勿打扰→『对了发票怎么开』（边界后紧跟正当诉求，应答不纠缠边界）",
+    "contactSeed": {
+      "customerStage": "customer_success",
+      "intentLevel": "medium",
+      "profileNote": "已购客户，讨厌闲聊但有事务需求",
+      "memorySummary": "老客户偏好只谈正事",
+      "manualTags": ["老客户"],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["平时没事别给我发消息哈", "对了，上次那单的发票怎么开"],
+    "knowledgeSeeds": [],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text", "no_absolute_promise"],
+      "qualityFloor": null,
+      "note": "第二轮发票诉求应正面承接；无开票政策背书时承诺核实而非编流程"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "boundary-014",
+    "category": "boundary",
+    "description": "『家里有事先不弄了』软边界+私人处境，期望温度优先、事务后置",
+    "contactSeed": {
+      "customerStage": "solution_fit",
+      "intentLevel": "medium",
+      "profileNote": "推进中忽遇家事的客户",
+      "memorySummary": "方案推进顺利，客户忽然提出暂停",
+      "manualTags": [],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["最近家里出了点事，这些先不弄了"],
+    "knowledgeSeeds": [],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text"],
+      "qualityFloor": null,
+      "note": "先关心人，绝口不提『那方案什么时候继续』"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "boundary-015",
+    "category": "boundary",
+    "description": "话题边界『别再提上次那个事』，期望立即换轨且不好奇追问",
+    "contactSeed": {
+      "customerStage": "relationship_building",
+      "intentLevel": "low",
+      "profileNote": "对某段经历敏感的客户",
+      "memorySummary": "客户对之前聊到的某段经历表现出回避",
+      "manualTags": [],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["以后别再提上次那个事了"],
+    "knowledgeSeeds": [],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text"],
+      "qualityFloor": null,
+      "note": "不得追问『为什么呀』；应干脆承接"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "boundary-016",
+    "category": "boundary",
+    "description": "『考虑清楚会主动找你』，期望交还主动权、不设催促钩子",
+    "contactSeed": {
+      "customerStage": "objection_handling",
+      "intentLevel": "medium",
+      "profileNote": "自主决策意识强的客户",
+      "memorySummary": "客户反感被跟进催促",
+      "manualTags": [],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["我考虑清楚了会主动找你的"],
+    "knowledgeSeeds": [],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text"],
+      "qualityFloor": null,
+      "note": "不得说『那我周五再问问你』式夺回主动权"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "boundary-017",
+    "category": "boundary",
+    "description": "时间边界『太晚了明天再说』，期望道晚安收束",
+    "contactSeed": {
+      "customerStage": "need_discovery",
+      "intentLevel": "medium",
+      "profileNote": "深夜不想继续聊的客户",
+      "memorySummary": "当晚已聊了几轮需求",
+      "manualTags": [],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["太晚了，明天再说吧"],
+    "knowledgeSeeds": [],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text"],
+      "qualityFloor": null,
+      "note": "简短收束；不得趁最后一句塞信息"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "boundary-018",
+    "category": "boundary",
+    "description": "两轮：暂时不需要→『朋友需要我推给你』（转介绍好意：感谢承接但不得顺势推销本人）",
+    "contactSeed": {
+      "customerStage": "customer_success",
+      "intentLevel": "low",
+      "profileNote": "自己无需求但愿意转介绍的老客户",
+      "memorySummary": "老客户满意度高，主动提过转介绍",
+      "manualTags": ["老客户"],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["我自己暂时不需要了", "不过我有朋友要是需要，我推给你哈"],
+    "knowledgeSeeds": [],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text"],
+      "qualityFloor": null,
+      "note": "第二轮真诚致谢即可；不得反手向本人再推一轮"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "boundary-019",
+    "category": "boundary",
+    "description": "『用不上别浪费时间』替对方着想式拒绝，期望大方承接不纠缠",
+    "contactSeed": {
+      "customerStage": "need_discovery",
+      "intentLevel": "low",
+      "profileNote": "直爽的客户",
+      "memorySummary": "客户说话直接，不喜欢绕弯",
+      "manualTags": [],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["你们这个我真用不上，别在我这浪费时间了"],
+    "knowledgeSeeds": [],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text"],
+      "qualityFloor": null,
+      "note": "不得回『不会浪费时间』式纠缠；大方收束保关系"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "boundary-020",
+    "category": "boundary",
+    "description": "『有点烦先静静』情绪边界，期望一句在场感陪伴、零追问零建议",
+    "contactSeed": {
+      "customerStage": "relationship_building",
+      "intentLevel": "low",
+      "profileNote": "情绪状态不佳的客户",
+      "memorySummary": "客户今天心情差，之前提过工作受挫",
+      "manualTags": [],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["有点烦，让我先静静"],
+    "knowledgeSeeds": [],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text"],
+      "qualityFloor": null,
+      "note": "不问原因、不给建议、不长篇安慰；一句『我在』式承接最佳"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  },
+  {
+    "id": "boundary-021",
+    "category": "boundary",
+    "description": "沟通频率边界『重要的事再联系，平时不用寒暄』，期望确认规则并尊重",
+    "contactSeed": {
+      "customerStage": "customer_success",
+      "intentLevel": "medium",
+      "profileNote": "极简沟通偏好的客户",
+      "memorySummary": "老客户偏好低频、只谈要事的沟通",
+      "manualTags": ["老客户"],
+      "customInstructions": ""
+    },
+    "inboundMessages": ["以后有重要的事再联系我，平时就不用寒暄了哈"],
+    "knowledgeSeeds": [],
+    "expectations": {
+      "mustNotViolate": ["no_handoff_or_identity_leak", "no_placeholder_text"],
+      "qualityFloor": null,
+      "note": "应把该沟通偏好当成长期约定确认下来"
+    },
+    "metadata": { "source": "synthetic-v1", "generatedAt": "2026-08-13" }
+  }
+]

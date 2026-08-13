@@ -122,9 +122,10 @@ pub async fn eval_all(
             _ => continue,
         };
         for src in source_runs {
-            // budget 静态预检（threshold 不计 LLM；prompt 现阶段直接 failed
-            // 不启动 LLM——所以 W3 的 budget 主要在 W2 的 prompt_critic 阶段消耗。
-            // 这里仍调 exhausted 占位以保持后续接入完整 LLM 时一处控制。
+            // budget 静态预检：threshold 重放不调 LLM；prompt 重放在 task 内
+            // 调真实 LLM（shadow_replay_prompt_one），但 EvolutionBudget 是 mut
+            // 借用、无法跨 task 计量，影子消耗不回写本预算——exhausted() 预检
+            // 是唯一控制点，超额时后续 replay 直接写 failed 不启动。
             if budget.exhausted() {
                 let _ =
                     insert_replay_failed(state, &proposal, pid, src, "evolution_budget_exceeded")
@@ -329,7 +330,8 @@ fn evaluate_threshold(proposal: &Proposal, original: &AgentRunLog) -> ReplayOutc
         // 与 prompt 路径 prompt_sample_to_outcome 及 new 侧同口径。旧代码用源 run 真实
         // 终态 original.final_review_status，若终态是非-5gate 因素(blocked_by_budget/
         // ai_waiting_for_more_context 等)会让 original 侧算"发送失败"、new 侧 5闸算"成功"，
-        // 凭空 +send_delta 虚假翻越 min_send_success_delta 门。两侧同口径后唯一变量是被改 gate。
+        // 凭空捏出"original 拦 / new 放"的假放行差（H2 换血后该差值以
+        // outcome_weighted_delta 口径参与判定，同口径原则不变）。两侧同口径后唯一变量是被改 gate。
         original_final_review_status: Some(
             final_status_from_5gate(&original_5gate_hit).to_string(),
         ),

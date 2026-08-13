@@ -111,8 +111,10 @@ pub async fn select_cohorts_filtered(
     }
 
     // 同 contact 去重，每个 contact 最多保留 cap 条（保留最近的——上层 cursor
-    // 已按 created_at 倒序）。空 contact_wxid 视为"无 contact"分组下的一个
-    // 自然 contact 组（实际不会大量出现）。
+    // 已按 created_at 倒序）。注意：空 contact_wxid 的 run 在上方
+    // `contact_in_runtime_cohort`（要求 `!contact.is_empty()`）处已被过滤，
+    // 进不到本去重——`dedup_per_contact` 对空 key 的"自然分组"行为仅在单测
+    // 直调时可达，生产路径不出现。
     let threshold = dedup_per_contact(&threshold_pool, cap_per_contact);
     let prompt_pool: Vec<(ObjectId, String, String)> = threshold_pool
         .iter()

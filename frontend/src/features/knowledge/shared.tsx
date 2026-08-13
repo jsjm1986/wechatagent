@@ -930,7 +930,7 @@ function ChunkReferrersList({ chunkId }: { chunkId: string }) {
   useEffect(() => {
     if (!open || items !== null) return;
     setLoading(true);
-    fetch(`/api/operation-knowledge/chunks/referrers?target_id=${encodeURIComponent(chunkId)}`)
+    fetch(`/api/operation-knowledge/chunks/referrers?targetId=${encodeURIComponent(chunkId)}`)
       .then(async (r) => {
         if (!r.ok) throw await parseApiError(r);
         return r.json() as Promise<{ items: ReferrerEntry[] }>;

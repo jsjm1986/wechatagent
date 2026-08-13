@@ -294,6 +294,7 @@ pub async fn put_ask_human_policy(
             return Err(AppError::BadRequest("quiet_hours 小时须 0-23".into()));
         }
     }
+    validate_standing_order_config(&policy).map_err(AppError::BadRequest)?;
     let policy_bson = mongodb::bson::to_bson(&policy)?;
     let res = state
         .db
@@ -312,6 +313,38 @@ pub async fn put_ask_human_policy(
         return Err(AppError::NotFound("operation domain 当前版本不存在".into()));
     }
     Ok(Json(json!({ "ok": true })))
+}
+
+/// S5-5 预授权底线配置校验：两字段必须成对给出或成对缺省（只配一半 → 400，防
+/// "配了口径文本但永不生效 / 配了时限却无口径可执行"的静默误配）；口径文本非空白
+/// 且 ≤ 2000 字符；生效时限 > 0 且 ≤ 8760 小时（一年）。纯函数，便于单测。
+fn validate_standing_order_config(policy: &crate::models::AskHumanPolicy) -> Result<(), String> {
+    match (
+        policy.standing_order.as_deref(),
+        policy.standing_order_after_hours,
+    ) {
+        (None, None) => Ok(()),
+        (Some(_), None) => Err(
+            "配置了预授权底线口径但缺少生效时限（standingOrderAfterHours），两者必须成对配置"
+                .to_string(),
+        ),
+        (None, Some(_)) => Err(
+            "配置了预授权底线生效时限但缺少口径文本（standingOrder），两者必须成对配置"
+                .to_string(),
+        ),
+        (Some(text), Some(hours)) => {
+            if text.trim().is_empty() {
+                return Err("预授权底线口径不能为空白".to_string());
+            }
+            if text.chars().count() > 2000 {
+                return Err("预授权底线口径最长 2000 字符".to_string());
+            }
+            if !(hours > 0.0 && hours <= 8760.0) {
+                return Err("预授权底线生效时限须大于 0 且不超过 8760 小时".to_string());
+            }
+            Ok(())
+        }
+    }
 }
 
 pub(super) async fn reset_operation_domain(
@@ -674,6 +707,92 @@ mod tests {
         );
     }
 
+    // ── S5-5 validate_standing_order_config（预授权底线成对/边界校验）──
+
+    fn policy_with_standing_order(
+        text: Option<&str>,
+        hours: Option<f64>,
+    ) -> crate::models::AskHumanPolicy {
+        crate::models::AskHumanPolicy {
+            decider_chain: vec![],
+            escalate_safety_guard: true,
+            escalate_unverified_product: true,
+            escalate_ai_policy_hold: false,
+            escalate_stuck: true,
+            dedupe_window_hours: None,
+            daily_push_cap: None,
+            quiet_hours: None,
+            timeout_hours: None,
+            standing_order: text.map(str::to_string),
+            standing_order_after_hours: hours,
+        }
+    }
+
+    #[test]
+    fn standing_order_both_absent_is_valid() {
+        assert!(validate_standing_order_config(&policy_with_standing_order(None, None)).is_ok());
+    }
+
+    #[test]
+    fn standing_order_both_present_valid_passes() {
+        assert!(validate_standing_order_config(&policy_with_standing_order(
+            Some("最多 95 折，赠品可送"),
+            Some(12.0),
+        ))
+        .is_ok());
+        // 边界值：1 字符 / 2000 字符 / 8760 小时均合法。
+        assert!(
+            validate_standing_order_config(&policy_with_standing_order(Some("一"), Some(8760.0)))
+                .is_ok()
+        );
+        let max_text = "字".repeat(2000);
+        assert!(validate_standing_order_config(&policy_with_standing_order(
+            Some(&max_text),
+            Some(0.5),
+        ))
+        .is_ok());
+    }
+
+    #[test]
+    fn standing_order_half_configured_is_rejected() {
+        // 只配文本 → 拒（防"配了永不生效"）；只配时限 → 拒（无口径可执行）。
+        assert!(
+            validate_standing_order_config(&policy_with_standing_order(Some("口径"), None))
+                .is_err()
+        );
+        assert!(
+            validate_standing_order_config(&policy_with_standing_order(None, Some(12.0))).is_err()
+        );
+    }
+
+    #[test]
+    fn standing_order_blank_or_oversized_text_is_rejected() {
+        assert!(
+            validate_standing_order_config(&policy_with_standing_order(Some("   "), Some(12.0)))
+                .is_err()
+        );
+        let oversized = "字".repeat(2001);
+        assert!(validate_standing_order_config(&policy_with_standing_order(
+            Some(&oversized),
+            Some(12.0),
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn standing_order_hours_out_of_range_is_rejected() {
+        for bad in [0.0, -1.0, 8760.1, f64::NAN] {
+            assert!(
+                validate_standing_order_config(&policy_with_standing_order(
+                    Some("口径"),
+                    Some(bad)
+                ))
+                .is_err(),
+                "hours={bad} 必须被拒绝"
+            );
+        }
+    }
+
     /// 契约快照:operation_domain_json。OperationDomainConfig 22 字段全量构造。
     /// methodology 等 5 个是 String(非 Document);runtime_parameters/state_machine 是
     /// Document(纯标量 doc! 避泄漏);ask_human_policy 给 Some(完整 AskHumanPolicy);
@@ -721,6 +840,8 @@ mod tests {
                     tz_offset_hours: 8,
                 }),
                 timeout_hours: Some(24.0),
+                standing_order: None,
+                standing_order_after_hours: None,
             }),
             assist_mode_enabled: Some(false),
         };

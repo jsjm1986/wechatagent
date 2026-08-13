@@ -6,10 +6,18 @@
 //! 失败短路：
 //! - completed_replay_count < min_replays → reject `insufficient_completed_replays`
 //! - fail_rate (failed / total) > max_fail_rate → reject `replay_fail_rate_above_threshold`
+//! - 非删失结果样本（Hit+Block）< min_replays → reject `insufficient_outcome_samples`
 //!
-//! 阈值候选（threshold）：
-//! - send_success_rate_delta = new_rate - original_rate
-//! - 通过条件：delta ≥ min_send_success_delta；同时 5 闸任一项 new_hit_rate - original_hit_rate ≤ max_5gate_hit_increase
+//! 阈值候选（threshold，H2 换血——判定标签 = 真实用户反应结果）：
+//! - 每条 completed replay 按 `source_run_id → AgentRunLog.run_id →
+//!   AgentDecisionReview.outcome_status` join 出源 run 的三态标签
+//!   （Hit / Block / Censored，共享分类器 [`crate::agent::outcome_label`]）；
+//!   Censored / review 缺失 = 删失，不进判定分母。
+//! - outcome_weighted_delta = 新配置（「放行∧Hit」−「放行∧Block」）/非删失数
+//!   − 旧配置同口径；"放行" = final_review_status ∈ [`SEND_SUCCESS_STATUSES`]。
+//! - 通过条件：outcome_weighted_delta ≥ min_outcome_weighted_delta；同时 5 闸
+//!   任一项 new_hit_rate - original_hit_rate ≤ max_5gate_hit_increase；#152 安全
+//!   反向门（语义不变）叠加其上。评审放行率降为 `_observed` 仅观测证据。
 //!
 //! Prompt 候选（prompt）：**不自动放行/拒绝**。阶段二改造——prompt 改动靠真模型
 //! shadow 对照产出证据供管理员 release 把关。`completed ≥ 1` → `eligible_for_release`
@@ -24,8 +32,11 @@
 //!
 //! 任意 NaN 进入 → 直接 reject `nan_in_metrics`（防御）。
 
-use mongodb::bson::{doc, Bson, Document};
+use std::collections::HashMap;
 
+use mongodb::bson::{doc, oid::ObjectId, Bson, Document};
+
+use crate::agent::outcome_label::OutcomeLabel;
 use crate::config::AppConfig;
 use crate::models::ShadowReplay;
 
@@ -41,17 +52,23 @@ pub const FIVE_GATE_KEYS: &[&str] = &[
 /// 把 final_review_status 视为"成功送出"的状态集。与 design.md §4.6 一致。
 pub const SEND_SUCCESS_STATUSES: &[&str] = &["approved", "revision_applied_approved"];
 
-/// 三个**安全闸**（block 类）与其 `final_review_status` 拦截态的映射。
+/// **安全闸**（block 类）与其 `final_review_status` 拦截态的映射。
 ///
 /// 与 [`crate::evolution::threshold::classify_gate_hit`] 同一份约定，方向反置：
 /// 给定 gate_key 找到"被该闸拦下时写入的终态字符串"。`human_like /
 /// emotional_value` 是 rewrite 类、`planner_block_rate` 属 planner 域，都**不**是
 /// 安全闸，不在此表内——放松它们不构成"漏过风险消息"。
 ///
+/// `pressure_risk_block` 同样不在此表内（缺陷 #16 修复）：pressure 在生产是
+/// **软闸**（触发 single-shot revision，不产 block 终态），此前映射的
+/// `blocked_by_safety_guard` 实际来源是证据门/fail-closed 基础设施路径
+/// （见 `threshold::classify_gate_hit` 注释）——监控一个 pressure 阈值变化
+/// 不会影响的状态等于反向门空转。`threshold::generate` 已不再对 pressure
+/// 产候选，该 gate 不会再进入 #152 判定。
+///
 /// #152 反向显著性门只对本表内的 gate 生效。
 pub const SAFETY_GATE_BLOCK_STATUS: &[(&str, &str)] = &[
     ("fact_risk_block", "held_by_ai_policy"),
-    ("pressure_risk_block", "blocked_by_safety_guard"),
     (
         "product_accuracy_score_block",
         "blocked_unverified_product_claim",
@@ -70,12 +87,19 @@ pub fn safety_block_status_for(gate_key: Option<&str>) -> Option<&'static str> {
 /// 显著性配置（无 IO 版本）。从 [`AppConfig`] 摘取。
 #[derive(Debug, Clone)]
 pub struct SignificanceCfg {
+    /// 双重语义（同一 env `EVOLUTION_MIN_REPLAYS`）：completed replay 的最低条数
+    /// （early reject），**且**（H2 换血后）非删失结果样本（Hit+Block）的最低条数
+    /// （`insufficient_outcome_samples` 硬门）。
     pub min_replays: usize,
-    pub min_send_success_delta: f64,
+    /// H2 换血：结果加权放行差（outcome_weighted_delta）的 promote 门槛。
+    /// env 名沿用 `EVOLUTION_MIN_SEND_SUCCESS_DELTA`（部署兼容，见 `from_config`），
+    /// 但语义已从"评审放行率提升"换血为"「放行∧Hit」占比 −「放行∧Block」占比的
+    /// 新旧配置差值"——衡量的是真实用户反应结果，不再是过程指标。
+    pub min_outcome_weighted_delta: f64,
     pub max_5gate_hit_increase: f64,
     pub max_fail_rate: f64,
     /// #152：安全闸放松回归率上限。shadow 中"原本被该安全闸拦下、新配置却
-    /// 放行"的占比超过此值即 reject，哪怕 send_success / self_critique 都达标。
+    /// 放行"的占比超过此值即 reject，哪怕 outcome delta / self_critique 都达标。
     /// 默认 0.0 —— 零容忍：任一条风险消息从 blocked 翻成 sent 即否决放松提案。
     pub max_safety_regression_rate: f64,
 }
@@ -84,7 +108,10 @@ impl SignificanceCfg {
     pub fn from_config(cfg: &AppConfig) -> Self {
         Self {
             min_replays: cfg.evolution_min_replays,
-            min_send_success_delta: cfg.evolution_min_send_success_delta,
+            // env 名 `EVOLUTION_MIN_SEND_SUCCESS_DELTA` 保持不变（部署兼容）；
+            // H2 换血后它承载的是 outcome_weighted_delta（结果加权放行差）门槛，
+            // 不再是 send_success_rate_delta（评审放行率差）。
+            min_outcome_weighted_delta: cfg.evolution_min_send_success_delta,
             max_5gate_hit_increase: cfg.evolution_max_5gate_hit_increase,
             max_fail_rate: cfg.evolution_replay_max_fail_rate,
             max_safety_regression_rate: cfg.evolution_max_safety_regression_rate,
@@ -127,19 +154,26 @@ fn grade_safety_regression(
     (passed, rate, count)
 }
 
-/// 阈值候选显著性测试。
+/// 阈值候选显著性测试（H2 换血：判定标签 = 真实用户反应结果，不再是评审放行率）。
+///
+/// `outcome_by_source_run`：`source_run_id` → 源 run 真实用户反应的三态标签
+/// （由 [`aggregate_and_grade`] 按 run_id join `AgentDecisionReview.outcome_status`
+/// 经共享分类器判定后传入；**map 缺键 = review 缺失 = 删失**）。replay 无法产生
+/// 未来的用户反应，故新旧配置共用源 run 的同一真实结果，差异体现在"该配置是否
+/// 会放行这条消息"与"该消息的真实结果"的交叉矩阵上。
 ///
 /// 通过条件（必须全部成立）：
-/// - completed ≥ min_replays
-/// - failed / total ≤ max_fail_rate
-/// - send_success_rate_delta ≥ min_send_success_delta
-/// - 5 闸任一项 new_hit_rate - original_hit_rate ≤ max_5gate_hit_increase
+/// - completed ≥ min_replays；failed / total ≤ max_fail_rate（early reject，语义不变）
+/// - 非删失结果样本（Hit+Block）≥ min_replays，否则 `insufficient_outcome_samples`
+/// - outcome_weighted_delta ≥ min_outcome_weighted_delta
+/// - 5 闸任一项 new_hit_rate - original_hit_rate ≤ max_5gate_hit_increase（不变）
 /// - #152：若 `gate_key` 是安全闸（[`SAFETY_GATE_BLOCK_STATUS`]），安全回归率
-///   ≤ `max_safety_regression_rate`（默认 0.0）。非安全闸该门恒过。
+///   ≤ `max_safety_regression_rate`（默认 0.0）。非安全闸该门恒过。（不变）
 pub fn grade_threshold(
     replays: &[ShadowReplay],
     cfg: &SignificanceCfg,
     gate_key: Option<&str>,
+    outcome_by_source_run: &HashMap<ObjectId, OutcomeLabel>,
 ) -> (bool, Document) {
     if let Some(reason) = early_reject(replays, cfg) {
         return reason;
@@ -147,13 +181,72 @@ pub fn grade_threshold(
     let completed: Vec<&ShadowReplay> =
         replays.iter().filter(|r| r.status == "completed").collect();
 
+    // ── H2 交叉矩阵统计 ───────────────────────────────────────────────
+    // 对每条 completed replay 取源 run 的真实结果标签；Censored / map 缺键
+    // （review 缺失）都是删失，不进判定分母。非删失样本上分别数新旧配置的
+    // 「放行∧Hit」/「放行∧Block」（放行 = final_review_status ∈ SEND_SUCCESS_STATUSES）。
+    let mut hit_count = 0_i64;
+    let mut block_count = 0_i64;
+    let mut censored_count = 0_i64;
+    let mut original_released_hit = 0_i64;
+    let mut original_released_block = 0_i64;
+    let mut new_released_hit = 0_i64;
+    let mut new_released_block = 0_i64;
+    for r in &completed {
+        let label = outcome_by_source_run
+            .get(&r.source_run_id)
+            .copied()
+            .unwrap_or(OutcomeLabel::Censored);
+        let original_released = is_send_success(r.original_final_review_status.as_deref());
+        let new_released = is_send_success(r.new_final_review_status.as_deref());
+        match label {
+            OutcomeLabel::Hit => {
+                hit_count += 1;
+                original_released_hit += i64::from(original_released);
+                new_released_hit += i64::from(new_released);
+            }
+            OutcomeLabel::Block => {
+                block_count += 1;
+                original_released_block += i64::from(original_released);
+                new_released_block += i64::from(new_released);
+            }
+            OutcomeLabel::Censored => censored_count += 1,
+        }
+    }
+    let non_censored = hit_count + block_count;
+
+    // 样本量硬门：非删失结果样本不足 → 直接 reject。冷启动/低互动期（客户
+    // 反应稀疏）演化器自然静默——这是特性不是缺陷：没有足够真实结果证据
+    // 就不该 promote 任何配置变更。`non_censored == 0` 一并拦住（也防除零）。
+    if non_censored < cfg.min_replays as i64 || non_censored == 0 {
+        return (
+            false,
+            doc! {
+                "kind": "threshold",
+                "reason": "insufficient_outcome_samples",
+                "completed_replay_count": completed.len() as i64,
+                "failed_replay_count": (replays.len() - completed.len()) as i64,
+                "outcome_hit_count": hit_count,
+                "outcome_block_count": block_count,
+                "outcome_censored_count": censored_count,
+                "non_censored_outcome_count": non_censored,
+                "min_outcome_samples_required": cfg.min_replays as i64,
+            },
+        );
+    }
+
+    // 结果加权放行分：（放行∧Hit − 放行∧Block）/ 非删失样本数。
+    // 新旧配置同分母（同一批源 run 的同一批真实结果），delta 只反映
+    // "配置变更让放行决策与真实结果的对齐度变了多少"。
+    let denom = non_censored as f64;
+    let original_score = (original_released_hit - original_released_block) as f64 / denom;
+    let new_score = (new_released_hit - new_released_block) as f64 / denom;
+    let outcome_delta = new_score - original_score;
+
+    // 旧过程指标（评审放行率）降为仅观测证据（_observed 后缀），供管理员
+    // 对照——它不再参与判定。
     let original_send = success_rate(&completed, |r| r.original_final_review_status.as_deref());
     let new_send = success_rate(&completed, |r| r.new_final_review_status.as_deref());
-    let send_delta = new_send - original_send;
-
-    if send_delta.is_nan() {
-        return (false, doc! { "reason": "nan_in_metrics" });
-    }
 
     let gate_deltas = compute_5gate_deltas(&completed);
     if let Some(reason) = nan_in_gate_deltas(&gate_deltas) {
@@ -165,23 +258,33 @@ pub fn grade_threshold(
         .fold(f64::NEG_INFINITY, f64::max);
 
     // #152 反向显著性门：放松安全闸时，原本被拦下的风险消息不得翻成已发送。
+    // 拦截状态集合与语义不变，叠加在新结果指标之上。
     let safety_block_status = safety_block_status_for(gate_key);
     let (safety_passed, safety_rate, safety_count) =
         grade_safety_regression(&completed, safety_block_status, cfg);
 
-    let send_passed = send_delta >= cfg.min_send_success_delta;
+    let outcome_passed = outcome_delta >= cfg.min_outcome_weighted_delta;
     let gate_passed = max_increase <= cfg.max_5gate_hit_increase;
-    let passed = send_passed && gate_passed && safety_passed;
+    let passed = outcome_passed && gate_passed && safety_passed;
 
     let mut metrics = doc! {
         "kind": "threshold",
         "completed_replay_count": completed.len() as i64,
         "failed_replay_count": (replays.len() - completed.len()) as i64,
-        "original_send_success_rate": original_send,
-        "new_send_success_rate": new_send,
-        "send_success_rate_delta": send_delta,
+        // H2 换血：三态分布 + 结果加权放行差（判定主指标）。
+        "outcome_hit_count": hit_count,
+        "outcome_block_count": block_count,
+        "outcome_censored_count": censored_count,
+        "non_censored_outcome_count": non_censored,
+        "original_outcome_weighted_score": original_score,
+        "new_outcome_weighted_score": new_score,
+        "outcome_weighted_delta": outcome_delta,
+        "outcome_delta_passed": outcome_passed,
+        // 旧过程指标仅观测（不判定）。
+        "original_send_success_rate_observed": original_send,
+        "new_send_success_rate_observed": new_send,
+        "send_success_rate_delta_observed": new_send - original_send,
         "max_5gate_hit_increase_observed": max_increase,
-        "send_success_delta_passed": send_passed,
         "gate_increase_passed": gate_passed,
         "safety_regression_passed": safety_passed,
         "safety_regression_rate": safety_rate,
@@ -196,17 +299,33 @@ pub fn grade_threshold(
     }
     metrics.insert("five_gate_hit_delta_per_gate", gate_doc);
     if !passed {
-        // 优先暴露安全回归（最危险），其次 send，最后 gate。
+        // 优先暴露安全回归（最危险），其次 outcome，最后 gate。
         let reason = if !safety_passed {
             "safety_gate_regression_above_threshold"
-        } else if !send_passed {
-            "send_success_delta_below_threshold"
+        } else if !outcome_passed {
+            "outcome_weighted_delta_below_threshold"
         } else {
             "gate_hit_increase_above_threshold"
         };
         metrics.insert("reason", reason);
     }
     (passed, metrics)
+}
+
+/// "放行"判定：final_review_status ∈ [`SEND_SUCCESS_STATUSES`]。
+fn is_send_success(status: Option<&str>) -> bool {
+    status
+        .map(|s| SEND_SUCCESS_STATUSES.contains(&s))
+        .unwrap_or(false)
+}
+
+/// 三态标签的 eval_metrics 字符串形态（per-sample 证据 / 观测计数用）。
+fn outcome_label_str(label: OutcomeLabel) -> &'static str {
+    match label {
+        OutcomeLabel::Hit => "hit",
+        OutcomeLabel::Block => "block",
+        OutcomeLabel::Censored => "censored",
+    }
 }
 
 /// Prompt 候选显著性测试。
@@ -226,7 +345,11 @@ pub fn grade_threshold(
 /// - per-sample 新旧 5 闸命中 / selfCritique addressed / final 状态（`per_sample_evidence`）；
 /// - 聚合观测：self_critique addressed 新旧率与 delta、5 闸涨幅、token_cost_delta；
 ///   这些字段**仅供管理员参考**，不再是放行闸（带 `_observed` 后缀强调）。
-pub fn grade_prompt(replays: &[ShadowReplay], cfg: &SignificanceCfg) -> (bool, Document) {
+pub fn grade_prompt(
+    replays: &[ShadowReplay],
+    cfg: &SignificanceCfg,
+    outcome_by_source_run: &HashMap<ObjectId, OutcomeLabel>,
+) -> (bool, Document) {
     let _ = cfg; // prompt 路径不再消费数值阈值；保留入参签名一致性。
     let total = replays.len();
     let completed: Vec<&ShadowReplay> =
@@ -267,12 +390,35 @@ pub fn grade_prompt(replays: &[ShadowReplay], cfg: &SignificanceCfg) -> (bool, D
         .map(|(_, d)| *d)
         .fold(f64::NEG_INFINITY, f64::max);
 
+    // ── H2：源 run 真实结果三态分布（仅观测证据，不 gating）─────────────
+    // prompt 候选仍由管理员看证据 release；三态分布告诉管理员这批对照样本
+    // 的真实用户反应构成（map 缺键 = review 缺失 = 删失）。
+    let mut hit_count = 0_i64;
+    let mut block_count = 0_i64;
+    let mut censored_count = 0_i64;
+    for r in &completed {
+        match outcome_by_source_run
+            .get(&r.source_run_id)
+            .copied()
+            .unwrap_or(OutcomeLabel::Censored)
+        {
+            OutcomeLabel::Hit => hit_count += 1,
+            OutcomeLabel::Block => block_count += 1,
+            OutcomeLabel::Censored => censored_count += 1,
+        }
+    }
+
     // ── per-sample 新旧对照证据 ───────────────────────────────────────
     let per_sample: Vec<Bson> = completed
         .iter()
         .map(|r| {
+            let label = outcome_by_source_run
+                .get(&r.source_run_id)
+                .copied()
+                .unwrap_or(OutcomeLabel::Censored);
             Bson::Document(doc! {
                 "source_run_id": r.source_run_id,
+                "source_outcome_label": outcome_label_str(label),
                 "original_final_review_status": opt_str_bson(r.original_final_review_status.as_deref()),
                 "new_final_review_status": opt_str_bson(r.new_final_review_status.as_deref()),
                 "original_self_critique_addressed": opt_bool_bson(r.original_self_critique_for_metric()),
@@ -295,6 +441,10 @@ pub fn grade_prompt(replays: &[ShadowReplay], cfg: &SignificanceCfg) -> (bool, D
         "self_critique_addressed_delta_observed": critique_delta,
         "max_5gate_hit_increase_observed": max_increase,
         "token_cost_delta_mean_observed": token_delta,
+        // H2：三态分布观测证据（threshold 侧是判定输入，prompt 侧仅供管理员参考）。
+        "outcome_hit_count_observed": hit_count,
+        "outcome_block_count_observed": block_count,
+        "outcome_censored_count_observed": censored_count,
     };
     let mut gate_doc = Document::new();
     for (gate, delta) in gate_deltas {
@@ -490,6 +640,17 @@ pub async fn aggregate_and_grade(
 
     let cfg = SignificanceCfg::from_config(&state.config);
 
+    // H2 换血：真实用户反应三态分类的极性来自 active DomainProfile（与
+    // post_release / 回路① `refresh_usage_stats` 同源同极性；空极性逐极回落
+    // 内置销售常量，DEFAULT 域字节等价）。
+    let profile = crate::agent::domain_profile::load_active_domain_profile(&state.db, workspace_id)
+        .await
+        .map_err(|error| {
+            super::error::EvolutionError::Internal(format!("load active domain profile: {error}"))
+        })?;
+    let (positive, negative) =
+        crate::agent::outcome_label::resolve_effective_polarity(&profile.outcome_polarity);
+
     // 1. 加载本 experiment 下所有 proposals。
     let mut proposals: Vec<crate::models::Proposal> = state
         .db
@@ -542,10 +703,27 @@ pub async fn aggregate_and_grade(
         let completed = replays.iter().filter(|r| r.status == "completed").count();
         let failed = total - completed;
 
+        // 2.5 H2 换血：按 source_run_id → run_id → decision_review.outcome_status
+        // join 出每条 completed replay 的真实用户反应三态标签（map 缺键 = 删失）。
+        let outcome_by_source_run = load_outcome_labels_by_source_run(
+            state,
+            workspace_id,
+            account_id,
+            &replays,
+            &positive,
+            &negative,
+        )
+        .await?;
+
         // 3. 按 kind 调对应 grader。
         let (passed, metrics) = match proposal.proposal_kind.as_str() {
-            "threshold" => grade_threshold(&replays, &cfg, proposal.gate_key.as_deref()),
-            "prompt" => grade_prompt(&replays, &cfg),
+            "threshold" => grade_threshold(
+                &replays,
+                &cfg,
+                proposal.gate_key.as_deref(),
+                &outcome_by_source_run,
+            ),
+            "prompt" => grade_prompt(&replays, &cfg, &outcome_by_source_run),
             other => (
                 false,
                 doc! {
@@ -603,6 +781,111 @@ pub async fn aggregate_and_grade(
     Ok((eligible_count, rejected_count))
 }
 
+/// H2 换血：把一批 shadow replays 的 `source_run_id` join 到源 run 的真实用户
+/// 反应三态标签。链路：`source_run_id`（= `agent_run_logs._id`）→ `AgentRunLog.run_id`
+/// （uuid 字符串）→ `agent_decision_reviews.run_id` → `outcome_status` → 共享分类器
+/// [`crate::agent::outcome_label::classify_outcome_label_with_polarity`]。
+///
+/// - **map 缺键 = 删失**：源 run 无 review（如 run 被拦未发送，reaction 永不 claim）
+///   或 run log 已被 retention 清理 → 该 replay 不进结果判定分母。
+/// - 同 run_id 多条 review（索引非 unique，不假设一 run 一 review）→ 按 `created_at`
+///   升序遍历、后写覆盖，取最新一条的 outcome_status。
+/// - 只读 join（agent_run_logs / decision_reviews 均只 find），不触发送链——与本
+///   模块"决定性、无 IO 纯函数 + IO 只在聚合层"的分层一致。
+async fn load_outcome_labels_by_source_run(
+    state: &crate::routes::AppState,
+    workspace_id: &str,
+    account_id: &str,
+    replays: &[ShadowReplay],
+    positive: &[String],
+    negative: &[String],
+) -> Result<HashMap<ObjectId, OutcomeLabel>, super::error::EvolutionError> {
+    use futures::TryStreamExt;
+    use mongodb::options::FindOptions;
+
+    let source_oids: Vec<ObjectId> = replays
+        .iter()
+        .filter(|r| r.status == "completed")
+        .map(|r| r.source_run_id)
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    if source_oids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    // 1. agent_run_logs：ObjectId → run_id 字符串。
+    let runs: Vec<crate::models::AgentRunLog> = state
+        .db
+        .agent_run_logs()
+        .find(
+            doc! {
+                "_id": { "$in": &source_oids },
+                "workspace_id": workspace_id,
+                "account_id": account_id,
+            },
+            None,
+        )
+        .await
+        .map_err(super::error::EvolutionError::from)?
+        .try_collect()
+        .await
+        .map_err(super::error::EvolutionError::from)?;
+    let mut oids_by_run_id: HashMap<String, Vec<ObjectId>> = HashMap::new();
+    for run in &runs {
+        if run.run_id.is_empty() {
+            continue;
+        }
+        if let Some(id) = run.id {
+            oids_by_run_id
+                .entry(run.run_id.clone())
+                .or_default()
+                .push(id);
+        }
+    }
+    if oids_by_run_id.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    // 2. decision_reviews：run_id → outcome_status（run_id 单字段索引已建，
+    //    见 db/indexes.rs H11-linkage 注释；filter 仍带 workspace/account 收口）。
+    let run_ids: Vec<&String> = oids_by_run_id.keys().collect();
+    let reviews: Vec<crate::models::AgentDecisionReview> = state
+        .db
+        .decision_reviews()
+        .find(
+            doc! {
+                "workspace_id": workspace_id,
+                "account_id": account_id,
+                "run_id": { "$in": run_ids },
+            },
+            FindOptions::builder()
+                .sort(doc! { "created_at": 1 })
+                .build(),
+        )
+        .await
+        .map_err(super::error::EvolutionError::from)?
+        .try_collect()
+        .await
+        .map_err(super::error::EvolutionError::from)?;
+
+    let mut out: HashMap<ObjectId, OutcomeLabel> = HashMap::new();
+    for review in reviews {
+        let Some(rid) = review.run_id else { continue };
+        let label = crate::agent::outcome_label::classify_outcome_label_with_polarity(
+            review.outcome_status.as_deref(),
+            positive,
+            negative,
+        );
+        if let Some(oids) = oids_by_run_id.get(&rid) {
+            for oid in oids {
+                out.insert(*oid, label);
+            }
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -611,11 +894,33 @@ mod tests {
     fn cfg() -> SignificanceCfg {
         SignificanceCfg {
             min_replays: 30,
-            min_send_success_delta: 0.05,
+            min_outcome_weighted_delta: 0.05,
             max_5gate_hit_increase: 0.10,
             max_fail_rate: 0.30,
             max_safety_regression_rate: 0.0,
         }
+    }
+
+    /// 按下标把三态标签 zip 到 replays 的 source_run_id 上（None = 不入 map，
+    /// 模拟 review 缺失 = 删失）。
+    fn outcome_map(
+        replays: &[ShadowReplay],
+        labels: &[Option<OutcomeLabel>],
+    ) -> HashMap<ObjectId, OutcomeLabel> {
+        assert_eq!(replays.len(), labels.len(), "labels 必须与 replays 等长");
+        replays
+            .iter()
+            .zip(labels.iter())
+            .filter_map(|(r, l)| l.map(|l| (r.source_run_id, l)))
+            .collect()
+    }
+
+    /// 全体 replays 统一标签的 outcome map。
+    fn uniform_outcomes(
+        replays: &[ShadowReplay],
+        label: OutcomeLabel,
+    ) -> HashMap<ObjectId, OutcomeLabel> {
+        replays.iter().map(|r| (r.source_run_id, label)).collect()
     }
 
     fn rep(
@@ -659,30 +964,182 @@ mod tests {
         }
     }
 
-    /// 4.7 case 1：30 条 replay，原 0.6 / 新 0.7 → threshold passed=true
+    /// H2 交叉矩阵 pass：40 条非删失（30 Hit + 10 Block）。
+    /// original 放行 18 条 Hit + 全部 10 条 Block → score=(18-10)/40=0.2；
+    /// new 放行全部 30 条 Hit + 全部 10 条 Block → score=(30-10)/40=0.5；
+    /// outcome_weighted_delta=+0.3 ≥ 0.05 → passed，且三态分布被记进 metrics。
     #[test]
-    fn threshold_pass_when_send_success_delta_above_min() {
+    fn threshold_pass_on_positive_outcome_weighted_delta_cross_matrix() {
         let mut replays = Vec::new();
-        // 30 条：原成功 18 条（0.6），新成功 21 条（0.7）。
+        let mut labels = Vec::new();
         for i in 0..30 {
             let original = if i < 18 {
                 Some("approved")
             } else {
-                Some("blocked_by_safety_guard")
+                Some("held_by_ai_policy")
             };
-            let new = if i < 21 {
-                Some("approved")
-            } else {
-                Some("blocked_by_safety_guard")
-            };
-            replays.push(rep("completed", original, new, no_gate(), None, None));
+            replays.push(rep(
+                "completed",
+                original,
+                Some("approved"),
+                no_gate(),
+                None,
+                None,
+            ));
+            labels.push(Some(OutcomeLabel::Hit));
         }
-        let (passed, metrics) = grade_threshold(&replays, &cfg(), None);
+        for _ in 0..10 {
+            replays.push(rep(
+                "completed",
+                Some("approved"),
+                Some("approved"),
+                no_gate(),
+                None,
+                None,
+            ));
+            labels.push(Some(OutcomeLabel::Block));
+        }
+        let outcomes = outcome_map(&replays, &labels);
+        let (passed, metrics) = grade_threshold(&replays, &cfg(), None, &outcomes);
         assert!(
             passed,
-            "expected passed for +0.10 send_success delta, got metrics={metrics:?}"
+            "expected passed for +0.3 outcome_weighted_delta, got metrics={metrics:?}"
         );
         assert_eq!(metrics.get_str("kind").unwrap(), "threshold");
+        // 三态分布进评估摘要（eval_metrics 是 Document，加法字段天然向后兼容）。
+        assert_eq!(metrics.get_i64("outcome_hit_count").unwrap(), 30);
+        assert_eq!(metrics.get_i64("outcome_block_count").unwrap(), 10);
+        assert_eq!(metrics.get_i64("outcome_censored_count").unwrap(), 0);
+        assert_eq!(metrics.get_i64("non_censored_outcome_count").unwrap(), 40);
+        let delta = metrics.get_f64("outcome_weighted_delta").unwrap();
+        assert!((delta - 0.3).abs() < 1e-9, "got {delta}");
+    }
+
+    /// H2 交叉矩阵 reject：新配置把负反应 run 放了出去。20 条 Hit 两侧都放行，
+    /// 10 条 Block 原侧拦住（held）、新侧放行 → original=(20-0)/30≈0.667、
+    /// new=(20-10)/30≈0.333，delta≈-0.333 → reject（评审放行率视角下新配置
+    /// "放行更多"反而是加分项——正是被换血掉的过程指标幻觉）。
+    #[test]
+    fn threshold_reject_when_new_config_releases_negative_outcome_runs() {
+        let mut replays = Vec::new();
+        let mut labels = Vec::new();
+        for _ in 0..20 {
+            replays.push(rep(
+                "completed",
+                Some("approved"),
+                Some("approved"),
+                no_gate(),
+                None,
+                None,
+            ));
+            labels.push(Some(OutcomeLabel::Hit));
+        }
+        for _ in 0..10 {
+            replays.push(rep(
+                "completed",
+                Some("held_by_ai_policy"),
+                Some("approved"),
+                no_gate(),
+                None,
+                None,
+            ));
+            labels.push(Some(OutcomeLabel::Block));
+        }
+        let outcomes = outcome_map(&replays, &labels);
+        let (passed, metrics) = grade_threshold(&replays, &cfg(), None, &outcomes);
+        assert!(!passed);
+        assert_eq!(
+            metrics.get_str("reason").unwrap(),
+            "outcome_weighted_delta_below_threshold"
+        );
+        assert!(metrics.get_f64("outcome_weighted_delta").unwrap() < 0.0);
+    }
+
+    /// H2 删失语义：Censored / review 缺失（map 缺键）都不进判定分母。
+    /// 30 条 Hit（original 放行 3、new 放行 5）→ delta=2/30≈0.0667 ≥ 0.05 pass；
+    /// 若 30 条删失被误入分母 → 2/60≈0.033 < 0.05 会 fail——本测试锁分母口径。
+    #[test]
+    fn censored_replays_excluded_from_outcome_denominator() {
+        let mut replays = Vec::new();
+        let mut labels = Vec::new();
+        for i in 0..30 {
+            let original = if i < 3 {
+                Some("approved")
+            } else {
+                Some("held_by_ai_policy")
+            };
+            let new = if i < 5 {
+                Some("approved")
+            } else {
+                Some("held_by_ai_policy")
+            };
+            replays.push(rep("completed", original, new, no_gate(), None, None));
+            labels.push(Some(OutcomeLabel::Hit));
+        }
+        // 30 条删失：15 条显式 Censored + 15 条 map 缺键（review 缺失），两者等价。
+        for i in 0..30 {
+            replays.push(rep(
+                "completed",
+                Some("approved"),
+                Some("approved"),
+                no_gate(),
+                None,
+                None,
+            ));
+            labels.push(if i < 15 {
+                Some(OutcomeLabel::Censored)
+            } else {
+                None
+            });
+        }
+        let outcomes = outcome_map(&replays, &labels);
+        let (passed, metrics) = grade_threshold(&replays, &cfg(), None, &outcomes);
+        assert!(passed, "删失不得稀释分母，got metrics={metrics:?}");
+        assert_eq!(metrics.get_i64("outcome_hit_count").unwrap(), 30);
+        assert_eq!(metrics.get_i64("outcome_censored_count").unwrap(), 30);
+        assert_eq!(metrics.get_i64("non_censored_outcome_count").unwrap(), 30);
+    }
+
+    /// H2 样本量硬门：completed=40 ≥ min_replays 过 early gate，但非删失只有
+    /// 29 < 30 → 哪怕 delta 极佳也 reject `insufficient_outcome_samples`
+    /// （冷启动/低互动期演化器自然静默——特性不是缺陷）。
+    #[test]
+    fn insufficient_outcome_samples_rejects_even_with_good_delta() {
+        let mut replays = Vec::new();
+        let mut labels = Vec::new();
+        // 29 条 Hit：original 全拦、new 全放 → delta 若被判会是 +1.0。
+        for _ in 0..29 {
+            replays.push(rep(
+                "completed",
+                Some("held_by_ai_policy"),
+                Some("approved"),
+                no_gate(),
+                None,
+                None,
+            ));
+            labels.push(Some(OutcomeLabel::Hit));
+        }
+        // 11 条删失补足 completed=40。
+        for _ in 0..11 {
+            replays.push(rep(
+                "completed",
+                Some("approved"),
+                Some("approved"),
+                no_gate(),
+                None,
+                None,
+            ));
+            labels.push(None);
+        }
+        let outcomes = outcome_map(&replays, &labels);
+        let (passed, metrics) = grade_threshold(&replays, &cfg(), None, &outcomes);
+        assert!(!passed);
+        assert_eq!(
+            metrics.get_str("reason").unwrap(),
+            "insufficient_outcome_samples"
+        );
+        assert_eq!(metrics.get_i64("non_censored_outcome_count").unwrap(), 29);
+        assert_eq!(metrics.get_i64("min_outcome_samples_required").unwrap(), 30);
     }
 
     /// 4.7 case 2：replay 失败率 > 30% → reject
@@ -703,7 +1160,9 @@ mod tests {
         for _ in 0..14 {
             replays.push(rep("failed", None, None, no_gate(), None, None));
         }
-        let (passed, metrics) = grade_threshold(&replays, &cfg(), None);
+        // early reject 先于 outcome 判定 → outcome map 传满 Hit 也照拒。
+        let outcomes = uniform_outcomes(&replays, OutcomeLabel::Hit);
+        let (passed, metrics) = grade_threshold(&replays, &cfg(), None, &outcomes);
         assert!(!passed);
         assert_eq!(
             metrics.get_str("reason").unwrap(),
@@ -731,7 +1190,8 @@ mod tests {
                 Some(1000),
             ));
         }
-        let (passed, metrics) = grade_prompt(&replays, &cfg());
+        let outcomes = uniform_outcomes(&replays, OutcomeLabel::Hit);
+        let (passed, metrics) = grade_prompt(&replays, &cfg(), &outcomes);
         // 证据就绪 → eligible（不再因 5 闸涨幅自动拒）。
         assert!(passed);
         assert_eq!(metrics.get_str("kind").unwrap(), "prompt");
@@ -812,7 +1272,8 @@ mod tests {
                 None,
             ));
         }
-        let (passed, metrics) = grade_threshold(&replays, &cfg(), None);
+        let outcomes = uniform_outcomes(&replays, OutcomeLabel::Hit);
+        let (passed, metrics) = grade_threshold(&replays, &cfg(), None, &outcomes);
         assert!(!passed);
         assert_eq!(
             metrics.get_str("reason").unwrap(),
@@ -824,14 +1285,17 @@ mod tests {
     /// PBT/防御: prompt grade 在 replay vec empty 时永远 reject（无可对照证据）
     #[test]
     fn prompt_reject_when_replays_empty() {
-        let (passed, metrics) = grade_prompt(&[], &cfg());
+        let (passed, metrics) = grade_prompt(&[], &cfg(), &HashMap::new());
         assert!(!passed);
         assert_eq!(metrics.get_str("reason").unwrap(), "no_completed_replays");
     }
 
-    /// 阈值候选 send_success_rate 计算路径：仅 approved / revision_applied_approved 计为成功
+    /// H2 放行口径：交叉矩阵里"放行"仍只认 [`SEND_SUCCESS_STATUSES`]——
+    /// `revision_applied_approved` 算放行、`held_by_ai_policy` 不算。
+    /// 30 条全 Hit：original 全放行（score=1.0），new 只放行 24 条
+    /// `revision_applied_approved`（score=0.8）→ delta=-0.2 → reject。
     #[test]
-    fn success_rate_only_counts_send_statuses() {
+    fn released_only_counts_send_success_statuses_in_cross_matrix() {
         let mut replays = Vec::new();
         for i in 0..30 {
             let new = if i < 24 {
@@ -848,12 +1312,13 @@ mod tests {
                 None,
             ));
         }
-        let (passed, metrics) = grade_threshold(&replays, &cfg(), None);
-        // 原 30/30=1.0，新 24/30=0.8，delta=-0.2，应 reject
+        let outcomes = uniform_outcomes(&replays, OutcomeLabel::Hit);
+        let (passed, metrics) = grade_threshold(&replays, &cfg(), None, &outcomes);
+        // 原 (30-0)/30=1.0，新 (24-0)/30=0.8，delta=-0.2，应 reject。
         assert!(!passed);
         assert_eq!(
             metrics.get_str("reason").unwrap(),
-            "send_success_delta_below_threshold"
+            "outcome_weighted_delta_below_threshold"
         );
     }
 
@@ -876,8 +1341,9 @@ mod tests {
                 None,
             ));
         }
-        // 同时 send_success 持平（delta=0）— 必失败 send 这一项；用 +delta 的样本另测
-        let (passed, _) = grade_threshold(&replays, &cfg(), None);
+        // 同时 outcome 持平（delta=0）— 必失败 outcome 这一项；用 +delta 的样本另测
+        let outcomes = uniform_outcomes(&replays, OutcomeLabel::Hit);
+        let (passed, _) = grade_threshold(&replays, &cfg(), None, &outcomes);
         assert!(!passed); // delta=0 < 0.05
     }
 
@@ -898,7 +1364,8 @@ mod tests {
                 Some(1200),
             ));
         }
-        let (passed, metrics) = grade_prompt(&replays, &cfg());
+        let outcomes = uniform_outcomes(&replays, OutcomeLabel::Hit);
+        let (passed, metrics) = grade_prompt(&replays, &cfg(), &outcomes);
         assert!(passed);
         // 观测证据：新侧 addressed rate=0.7、delta=+0.7（原侧 None→0.0）。
         let new_rate = metrics.get_f64("new_self_critique_addressed_rate").unwrap();
@@ -918,23 +1385,14 @@ mod tests {
         assert_eq!(nan_in_gate_deltas(&bad), Some("nan_in_metrics"));
     }
 
-    /// #152：放松 fact_risk_block 安全闸——shadow 里有一条原本 held_by_ai_policy
-    /// 被拦下的 run，新阈值放行成 approved。即便 send_success +delta 达标，
-    /// 默认零容忍（max_safety_regression_rate=0.0）也必须 reject。
+    /// #152：放松 fact_risk_block 安全闸——30 条原 held_by_ai_policy 被拦、
+    /// 新阈值全放行且源 run 全是 Hit → outcome_weighted_delta=+1.0 完全达标，
+    /// 但默认零容忍（max_safety_regression_rate=0.0）下 blocked→sent 翻转必须
+    /// reject，且 reason 优先暴露安全回归——锁 #152 叠加在新指标之上的优先级。
     #[test]
-    fn safety_gate_loosening_rejected_when_blocked_run_flips_to_sent() {
+    fn safety_gate_loosening_rejected_even_when_outcome_delta_passes() {
         let mut replays = Vec::new();
-        // 1 条危险翻转：原 held_by_ai_policy → 新 approved。
-        replays.push(rep(
-            "completed",
-            Some("held_by_ai_policy"),
-            Some("approved"),
-            no_gate(),
-            None,
-            None,
-        ));
-        // 29 条普通成功 run（让 send_success delta 为正、过 min_replays）。
-        for _ in 0..29 {
+        for _ in 0..30 {
             replays.push(rep(
                 "completed",
                 Some("held_by_ai_policy"),
@@ -944,13 +1402,17 @@ mod tests {
                 None,
             ));
         }
-        let (passed, metrics) = grade_threshold(&replays, &cfg(), Some("fact_risk_block"));
+        let outcomes = uniform_outcomes(&replays, OutcomeLabel::Hit);
+        let (passed, metrics) =
+            grade_threshold(&replays, &cfg(), Some("fact_risk_block"), &outcomes);
         assert!(!passed, "放走风险消息必须 reject，metrics={metrics:?}");
         assert_eq!(
             metrics.get_str("reason").unwrap(),
             "safety_gate_regression_above_threshold"
         );
         assert!(metrics.get_f64("safety_regression_rate").unwrap() > 0.0);
+        // outcome 门本身是达标的（delta=+1.0）——被否决的是安全回归，不是结果信号。
+        assert!(metrics.get_bool("outcome_delta_passed").unwrap());
     }
 
     /// #152：收紧 fact_risk_block（原 approved → 新 held_by_ai_policy）不算回归——
@@ -959,7 +1421,7 @@ mod tests {
     fn safety_gate_tightening_not_counted_as_regression() {
         let mut replays = Vec::new();
         // 30 条原 approved → 新 approved（无任何 blocked→sent 翻转），
-        // 且 send_success 持平。回归门应过（rate=0）。
+        // 且 outcome 持平。回归门应过（rate=0）。
         for _ in 0..30 {
             replays.push(rep(
                 "completed",
@@ -970,7 +1432,9 @@ mod tests {
                 None,
             ));
         }
-        let (_passed, metrics) = grade_threshold(&replays, &cfg(), Some("fact_risk_block"));
+        let outcomes = uniform_outcomes(&replays, OutcomeLabel::Hit);
+        let (_passed, metrics) =
+            grade_threshold(&replays, &cfg(), Some("fact_risk_block"), &outcomes);
         assert_eq!(metrics.get_f64("safety_regression_rate").unwrap(), 0.0);
         assert!(metrics.get_bool("safety_regression_passed").unwrap());
     }
@@ -998,15 +1462,75 @@ mod tests {
                 None,
             ));
         }
-        let (_passed, metrics) =
-            grade_threshold(&replays, &cfg(), Some("human_like_score_rewrite"));
+        let outcomes = uniform_outcomes(&replays, OutcomeLabel::Hit);
+        let (_passed, metrics) = grade_threshold(
+            &replays,
+            &cfg(),
+            Some("human_like_score_rewrite"),
+            &outcomes,
+        );
         // 非安全闸：回归门恒过（rate=0、count=0），不应出现 safety reason。
         assert!(metrics.get_bool("safety_regression_passed").unwrap());
         assert_eq!(metrics.get_i64("safety_regression_count").unwrap(), 0);
         assert!(metrics.get_str("safety_gate_block_status").is_err());
     }
 
-    /// #152：安全闸映射覆盖三个 block 类闸、且排除 rewrite / planner 闸。
+    /// H2 prompt 路径：三态分布作为**观测证据**记进 metrics（不 gating），
+    /// per-sample 证据每条带 `source_outcome_label`（缺 review = censored）。
+    #[test]
+    fn prompt_records_outcome_distribution_as_observed_evidence() {
+        let replays = vec![
+            rep(
+                "completed",
+                Some("approved"),
+                Some("approved"),
+                no_gate(),
+                Some(true),
+                Some(100),
+            ),
+            rep(
+                "completed",
+                Some("approved"),
+                Some("approved"),
+                no_gate(),
+                Some(true),
+                Some(100),
+            ),
+            rep(
+                "completed",
+                Some("approved"),
+                Some("approved"),
+                no_gate(),
+                Some(true),
+                Some(100),
+            ),
+        ];
+        let labels = [Some(OutcomeLabel::Hit), Some(OutcomeLabel::Block), None];
+        let outcomes = outcome_map(&replays, &labels);
+        let (passed, metrics) = grade_prompt(&replays, &cfg(), &outcomes);
+        // completed≥1 → 仍 eligible：三态分布是证据不是闸。
+        assert!(passed);
+        assert_eq!(metrics.get_i64("outcome_hit_count_observed").unwrap(), 1);
+        assert_eq!(metrics.get_i64("outcome_block_count_observed").unwrap(), 1);
+        assert_eq!(
+            metrics.get_i64("outcome_censored_count_observed").unwrap(),
+            1
+        );
+        let samples = metrics.get_array("per_sample_evidence").unwrap();
+        let sample_labels: Vec<&str> = samples
+            .iter()
+            .map(|s| {
+                s.as_document()
+                    .unwrap()
+                    .get_str("source_outcome_label")
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(sample_labels, vec!["hit", "block", "censored"]);
+    }
+
+    /// #152：安全闸映射只覆盖有真实 block 终态的两闸、且排除 rewrite / planner /
+    /// pressure（缺陷 #16：pressure 是软闸不产 block 终态，反向门对它空转已消除）。
     #[test]
     fn safety_block_status_mapping_is_exhaustive_and_exclusive() {
         assert_eq!(
@@ -1014,14 +1538,11 @@ mod tests {
             Some("held_by_ai_policy")
         );
         assert_eq!(
-            safety_block_status_for(Some("pressure_risk_block")),
-            Some("blocked_by_safety_guard")
-        );
-        assert_eq!(
             safety_block_status_for(Some("product_accuracy_score_block")),
             Some("blocked_unverified_product_claim")
         );
-        // rewrite 类 / planner 域 / None 都不是安全闸。
+        // pressure 软闸（缺陷 #16）/ rewrite 类 / planner 域 / None 都不是安全闸。
+        assert_eq!(safety_block_status_for(Some("pressure_risk_block")), None);
         assert_eq!(
             safety_block_status_for(Some("human_like_score_rewrite")),
             None

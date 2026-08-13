@@ -245,9 +245,16 @@ async fn typed_runtime_writes_and_guide_apply_are_enforced_end_to_end_inner() {
         .insert_one(&contact, None)
         .await
         .expect("seed SR-094 contact");
-    wechatagent::agent::load_or_create_operating_memory(&app.state, &contact)
-        .await
-        .expect("seed SR-094 memory");
+    assert_eq!(
+        app.state
+            .db
+            .operating_memories()
+            .count_documents(doc! { "contact_wxid": &contact.wxid }, None)
+            .await
+            .expect("count memory before Guide preview"),
+        0,
+        "fixture must exercise the missing-memory Preview path"
+    );
 
     let api = start_api(&app, &workspace_id).await;
     let client = reqwest::Client::new();
@@ -393,6 +400,16 @@ async fn typed_runtime_writes_and_guide_apply_are_enforced_end_to_end_inner() {
         .await
         .expect("valid Guide preview");
     assert_eq!(preview.status(), StatusCode::OK);
+    assert_eq!(
+        app.state
+            .db
+            .operating_memories()
+            .count_documents(doc! { "contact_wxid": &contact.wxid }, None)
+            .await
+            .expect("count memory after Guide preview"),
+        0,
+        "Guide Preview must not create operating memory"
+    );
     let preview_body: Value = preview.json().await.expect("Guide preview JSON");
     let preview_item = &preview_body["item"];
     assert_eq!(preview_item["impactScope"], "workspace_user_operations");
@@ -468,6 +485,16 @@ async fn typed_runtime_writes_and_guide_apply_are_enforced_end_to_end_inner() {
     assert_eq!(receipt["item"]["committed"], true);
     assert_eq!(receipt["item"]["impactScope"], "workspace_user_operations");
     assert_eq!(receipt["item"]["candidateHash"], candidate_hash);
+    assert_eq!(
+        app.state
+            .db
+            .operating_memories()
+            .count_documents(doc! { "contact_wxid": &contact.wxid }, None)
+            .await
+            .expect("count memory after Guide apply"),
+        1,
+        "confirmed Apply creates the frozen missing-memory baseline exactly once"
+    );
     let applied_domain = current_domain(&app, &workspace_id).await;
     assert_eq!(
         runtime_integer(&applied_domain.runtime_parameters, "maxDailyTouches"),

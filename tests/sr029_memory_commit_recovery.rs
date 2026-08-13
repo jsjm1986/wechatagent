@@ -291,6 +291,10 @@ fn prepared_task(
                 "b_id": "b",
                 "winner": "a",
                 "resolution": "newer evidence",
+                "auditSource": "model_conflict",
+                "runId": format!("run-{generation}"),
+                "previousVersion": 0,
+                "memoryCardVersion": 1,
             }],
             "summary": "prepared summary",
             "discarded": [],
@@ -416,7 +420,13 @@ async fn seed_recovery_case(
                     "kind": "memory_conflict_resolved",
                     "status": "info",
                     "summary": "consolidator 解决了一组事实冲突",
-                    "details": { "winner": "a" },
+                    "details": {
+                        "winner": "a",
+                        "auditSource": "model_conflict",
+                        "runId": format!("run-{generation}"),
+                        "previousVersion": 0,
+                        "memoryCardVersion": 1,
+                    },
                     "created_at": now,
                     "dedupe_key": format!(
                         "memory_commit:{}:{}:conflict:0",
@@ -533,6 +543,29 @@ async fn prepared_commit_replays_all_partial_windows_exactly_once() {
             1,
             "case={case}"
         );
+        let conflict = raw
+            .collection::<Document>("agent_events")
+            .find_one(
+                doc! {
+                    "workspace_id": &ws,
+                    "dedupe_key": format!(
+                        "memory_commit:{}:{}:conflict:0",
+                        task_id.to_hex(), generation
+                    ),
+                },
+                None,
+            )
+            .await
+            .expect("read conflict event")
+            .expect("conflict event exists");
+        let details = conflict.get_document("details").expect("conflict details");
+        assert_eq!(
+            details.get_str("runId").unwrap(),
+            format!("run-{generation}")
+        );
+        assert_eq!(details.get_i32("previousVersion").unwrap(), 0);
+        assert_eq!(details.get_i32("memoryCardVersion").unwrap(), 1);
+        assert_eq!(details.get_str("auditSource").unwrap(), "model_conflict");
         assert_eq!(
             raw.collection::<Document>("agent_events")
                 .count_documents(

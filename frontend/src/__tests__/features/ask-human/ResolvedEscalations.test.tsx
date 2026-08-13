@@ -10,7 +10,7 @@ vi.mock("../../../lib/api", async () => {
 });
 
 import { api } from "../../../lib/api";
-import { ResolvedEscalations } from "../../../features/ask-human/ResolvedEscalations";
+import { ResolvedEscalations, formatExpiry } from "../../../features/ask-human/ResolvedEscalations";
 import AskHumanFeature from "../../../features/ask-human/index";
 import { useInboxStore } from "../../../stores/inboxStore";
 
@@ -70,6 +70,65 @@ describe("ResolvedEscalations 已裁决历史", () => {
     get.mockResolvedValue({ items: [] });
     render(<ResolvedEscalations />);
     await screen.findByText(/暂无已裁决记录/);
+  });
+
+  it("历史 bson 扩展 JSON 对象 {$date:{$numberLong}} 不崩溃且能解析出时间", async () => {
+    get.mockResolvedValue({
+      items: [
+        {
+          shortCode: "E3",
+          decision: { verdict: "approved", substance: "旧数据裁决" },
+          // 旧部署/缓存残留的 wire 形态（后端已统一 RFC3339，此为防御回归）。
+          authorizationExpiresAt: { $date: { $numberLong: "1767225600000" } },
+          resolvedVia: "admin",
+        },
+      ],
+    });
+
+    render(<ResolvedEscalations />);
+    await screen.findByText("E3");
+    // 1767225600000 ms = 2026-01-01T00:00:00Z → 本地化渲染必含 2026 年份。
+    expect(screen.getByText(/2026/)).toBeTruthy();
+  });
+
+  it("毫秒数形态的到期时间也能渲染", async () => {
+    get.mockResolvedValue({
+      items: [
+        {
+          shortCode: "E4",
+          decision: { verdict: "conditional", substance: "毫秒形态" },
+          authorizationExpiresAt: 1767225600000,
+          resolvedVia: "admin",
+        },
+      ],
+    });
+
+    render(<ResolvedEscalations />);
+    await screen.findByText("E4");
+    expect(screen.getByText(/2026/)).toBeTruthy();
+  });
+});
+
+describe("formatExpiry 防御性时间解析", () => {
+  it("RFC3339 字符串（后端契约主形态）解析为本地化时间", () => {
+    expect(formatExpiry("2026-01-01T00:00:00Z")).toMatch(/2026/);
+  });
+
+  it("毫秒数与历史 bson 扩展 JSON 对象均能解析", () => {
+    expect(formatExpiry(1767225600000)).toMatch(/2026/);
+    expect(formatExpiry({ $date: { $numberLong: "1767225600000" } })).toMatch(/2026/);
+    expect(formatExpiry({ $date: "2026-01-01T00:00:00Z" })).toMatch(/2026/);
+  });
+
+  it("空值显示不设期限；无法识别的值绝不原样返回对象", () => {
+    expect(formatExpiry(null)).toBe("本次转述不设期限");
+    expect(formatExpiry(undefined)).toBe("本次转述不设期限");
+    expect(formatExpiry("")).toBe("本次转述不设期限");
+    // 无法解析的字符串保持旧行为（原样展示字符串是安全的）。
+    expect(formatExpiry("не время")).toBe("не время");
+    // 任意对象必须落安全文案（React child 只能是字符串）。
+    expect(formatExpiry({ foo: 1 })).toBe("时间格式无法识别");
+    expect(formatExpiry({ $date: { $numberLong: "abc" } })).toBe("时间格式无法识别");
   });
 });
 

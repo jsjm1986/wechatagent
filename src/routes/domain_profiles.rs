@@ -677,7 +677,9 @@ pub async fn update_domain_profile(
 }
 
 /// delete：禁止删除 active profile（须先 activate 另一条或回落 DEFAULT）。
-pub(super) async fn delete_domain_profile(
+/// `pub`（同 [`publish_domain_profile`] 先例）：集成测试 `tests/domain_profile_e2e.rs`
+/// 直调本 handler 守护"删 active 被拒 / 删 draft 放行"的业务规则。
+pub async fn delete_domain_profile(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
@@ -890,18 +892,23 @@ pub async fn activate_domain_profile(
         .invalidate_workspace(&admin.current_workspace);
 
     let now = DateTime::now();
-    let mut state_machine_status = "skipped";
+    let state_machine_status;
     let mut state_policies_status = "skipped";
     let mut state_policies_report = json!(null);
     let mut contacts_status = "skipped";
     let mut contacts_matched = 0_u64;
     let mut contacts_modified = 0_u64;
     let mut errors: Vec<Value> = Vec::new();
-    // universal/H13：若该 profile 携带 AI 生成的状态机本体，activate 时把它 publish 成
-    // `operation_domain_configs` 在 `(workspace, user_operations)` 下的新 current 版本——
-    // 运行时引擎照旧按 `(workspace, domain, current_version=true)` 读表，零改动即拿到行业
-    // 状态机。`None`（如 DEFAULT 销售域）→ 不动状态机表 → 运行时字节等价回落 DEFAULT。
-    if let Some(machine) = target.generated_state_machine.as_ref() {
+    // Resolve one effective machine for every activation. A profile without an embedded
+    // machine means "use the system default", not "keep whichever industry's workspace-global
+    // machine happened to be active before". Publishing the explicit default is a no-op when the
+    // workspace already uses it, and safely restores it after switching back from a custom domain.
+    let effective_machine = target
+        .generated_state_machine
+        .clone()
+        .unwrap_or_else(crate::prompts::default_user_operation_state_machine);
+    let machine = &effective_machine;
+    {
         match super::admin_ops_versions::publish_state_machine_version(
             &state.db,
             &target.workspace_id,

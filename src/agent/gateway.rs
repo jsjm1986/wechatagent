@@ -73,8 +73,9 @@ use super::review::{
     decide_revision, derive_revision_failure, effective_review_mode, ensure_independent_claim_gate,
     evaluate_independent_claim_gate, finalize_review_for_send, local_decision_review,
     review_decision, review_passed, should_run_review, should_run_targeted_rewrite,
-    FinalizeOutcome, GatewayStatusFinal, PendingFinalizeEvent, ReviewerPromptCache,
-    RevisionDecision,
+    should_skip_claim_gate, skipped_claim_gate_evaluation, FinalizeOutcome, GatewayStatusFinal,
+    PendingFinalizeEvent, ReviewerPromptCache, RevisionDecision,
+    CLAIM_GATE_SKIPPED_RISK_CASUAL_LOW,
 };
 use super::run_envelope::{
     assert_final_review_status_valid, assert_gateway_status_valid, assert_lifecycle_valid,
@@ -484,6 +485,7 @@ struct GatewayBusinessInputs {
     active_products: Vec<crate::models::Product>,
     published_soul: Option<String>,
     sendable_assets: Vec<crate::models::ContentAsset>,
+    referral_cards: Vec<crate::models::ReferralCard>,
     reply_prompts: super::decision::ReplyPromptSnapshot,
 }
 
@@ -491,6 +493,7 @@ fn load_gateway_business_inputs<'a>(
     state: &'a AppState,
     contact: &'a Contact,
     active_profile: &'a crate::models::DomainProfile,
+    assist_on: bool,
 ) -> BoxFuture<'a, AppResult<GatewayBusinessInputs>> {
     async move {
         let _stage_timer = super::run_audit::stage_timer("business_preload");
@@ -520,17 +523,32 @@ fn load_gateway_business_inputs<'a>(
                 .await
                 .unwrap_or_default()
         };
+        let referral_cards_future = async {
+            if assist_on {
+                super::decision::load_referral_cards(
+                    state,
+                    &contact.workspace_id,
+                    &contact.account_id,
+                )
+                .await
+                .unwrap_or_default()
+            } else {
+                Vec::new()
+            }
+        };
         let prompt_future = load_reply_prompt_snapshot(state, contact);
-        let (products, published_soul, sendable_assets, reply_prompts) = tokio::join!(
+        let (products, published_soul, sendable_assets, referral_cards, reply_prompts) = tokio::join!(
             products_future,
             soul_future,
             sendable_assets_future,
+            referral_cards_future,
             prompt_future,
         );
         Ok(GatewayBusinessInputs {
             active_products: products,
             published_soul: published_soul?,
             sendable_assets,
+            referral_cards,
             reply_prompts: reply_prompts?,
         })
     }
@@ -597,6 +615,7 @@ fn review_and_evaluate_claim_gate<'a>(
     active_profile: &'a crate::models::DomainProfile,
     active_products: &'a [crate::models::Product],
     reviewer_prompts: &'a ReviewerPromptCache,
+    skip_claim_gate: bool,
 ) -> BoxFuture<
     'a,
     AppResult<(
@@ -605,6 +624,32 @@ fn review_and_evaluate_claim_gate<'a>(
     )>,
 > {
     async move {
+        // S5-6：寒暄低风险轮（should_skip_claim_gate 七条件全满足，由调用方判定）
+        // 跳过独立 ClaimGate 的 LLM 调用——Review 本体照跑，评估结果用"未评估"
+        // 形态（outcome=None）占位，apply 对其零 hold、零 merge。
+        if skip_claim_gate {
+            let review = review_decision(
+                state,
+                contact,
+                inbound,
+                recent_messages,
+                decision,
+                playbook,
+                domain_config,
+                runtime,
+                memory,
+                context_pack,
+                knowledge_chunks,
+                knowledge_route,
+                review_mode,
+                Some(run_id),
+                None,
+                Some(active_profile),
+                Some(reviewer_prompts),
+            )
+            .await?;
+            return Ok((review, skipped_claim_gate_evaluation(decision)));
+        }
         let (review, claim_gate) = tokio::join!(
             review_decision(
                 state,
@@ -846,6 +891,8 @@ async fn send_contact_message_gateway_inner(
         &active_profile,
         &active_products,
         &reviewer_prompts,
+        // 管理发送是 admin 手动指定文本，非 LLM 寒暄轮——ClaimGate 恒照跑。
+        false,
     )
     .await?;
     let priced_from_catalog = apply_independent_claim_gate(
@@ -2488,11 +2535,20 @@ fn run_user_operation_gateway_inner<'a>(
     // consumed by Full. Load snapshots first, then overlap optional knowledge reasoning with the
     // first Lean generation. The provider governor preserves foreground capacity, and RunBudget's
     // atomic reservation prevents the concurrent branches from exceeding the per-run call cap.
+    let assist_override = contact
+        .domain_attributes
+        .as_ref()
+        .and_then(|d| d.get_str(crate::models::ASSIST_MODE_OVERRIDE_ATTR).ok());
+    let assist_on = super::referral::assist_mode_active(
+        domain_config.as_ref().and_then(|config| config.assist_mode_enabled),
+        assist_override,
+    );
     let business_inputs =
-        load_gateway_business_inputs(state, &contact, &active_profile).await?;
+        load_gateway_business_inputs(state, &contact, &active_profile, assist_on).await?;
     let active_products = business_inputs.active_products;
     let published_soul = business_inputs.published_soul;
     let sendable_assets = business_inputs.sendable_assets;
+    let referral_cards = business_inputs.referral_cards;
     let reply_prompts = business_inputs.reply_prompts;
     let reply_context = ReplyContextCache::new();
     let reviewer_prompts = ReviewerPromptCache::new();
@@ -2535,6 +2591,7 @@ fn run_user_operation_gateway_inner<'a>(
                     active_products: &active_products,
                     published_soul: published_soul.as_deref(),
                     sendable_assets: &sendable_assets,
+                    referral_cards: &referral_cards,
                     reply_prompts: &reply_prompts,
                     reply_context: &reply_context,
                 }),
@@ -2568,6 +2625,7 @@ fn run_user_operation_gateway_inner<'a>(
                     active_products: &active_products,
                     published_soul: published_soul.as_deref(),
                     sendable_assets: &sendable_assets,
+                    referral_cards: &referral_cards,
                     reply_prompts: &reply_prompts,
                     reply_context: &reply_context,
                 }),
@@ -2640,19 +2698,36 @@ fn run_user_operation_gateway_inner<'a>(
         .ok();
     }
 
+    let has_cited_knowledge_context = !knowledge_route.selected_chunk_ids.is_empty()
+        && !knowledge_route.selected_chunks_are_fallback;
+    let current_customer_stage = contact
+        .domain_attributes
+        .as_ref()
+        .and_then(|attributes| attributes.get_str("customer_stage").ok());
+    let has_eligible_referral_candidate = assist_on
+        && !super::referral::filter_referral_candidates(
+            &referral_cards,
+            current_customer_stage,
+            &contact.account_id,
+        )
+        .is_empty();
+    let has_explicit_referral_context = has_eligible_referral_candidate
+        && super::referral::explicitly_requests_referral_context(&inbound.content);
+    let forced_full_reason = crate::agent::sufficiency::forced_full_context_reason(
+        &decision_first,
+        has_cited_knowledge_context,
+        has_explicit_referral_context,
+    );
     let mut forced_full = false;
 
     let (mut decision, mut promote_risks) = match tier_decision {
         crate::agent::sufficiency::TierDecision::Enough => {
-            if state.config.progressive_tier_enabled
-                && crate::agent::sufficiency::should_force_full_on_missing(
-                    &decision_first,
-                    &knowledge_route.knowledge_coverage,
-                )
-            {
-                // ②强升:自评 enough 但 coverage=missing 且需知识=确定高危(凭空答产品/事实),
-                // 当场升 Full 重生成。最多一次:Full 结果直接进五闸,不再触发强升(Full 已最高档)。
+            if state.config.progressive_tier_enabled && forced_full_reason.is_some() {
+                // Lean cannot consume business context. Independent knowledge/referral evidence or
+                // Lean's own knowledge declaration therefore triggers one Full regeneration. Full
+                // still owns the business decision; this branch never selects a chunk or card.
                 forced_full = true;
+                let reason = forced_full_reason.expect("checked above");
                 write_event_for_account(
                     state,
                     &contact.workspace_id,
@@ -2660,11 +2735,15 @@ fn run_user_operation_gateway_inner<'a>(
                     Some(&contact.wxid),
                     "ptier_forced_full",
                     "info",
-                    "第一程自评 enough 但 coverage=missing 且需知识，强制升 Full 重生成",
+                    "第一程停在 Lean 但存在需加载的业务上下文，强制升 Full 重生成",
                     Some(doc! {
                         "run_id": &run_id,
+                        "reason": reason,
                         "knowledge_coverage": &knowledge_route.knowledge_coverage,
                         "knowledge_need": &decision_first.knowledge_need,
+                        "has_cited_knowledge_context": has_cited_knowledge_context,
+                        "has_eligible_referral_candidate": has_eligible_referral_candidate,
+                        "has_explicit_referral_context": has_explicit_referral_context,
                     }),
                 )
                 .await
@@ -2700,6 +2779,7 @@ fn run_user_operation_gateway_inner<'a>(
                         active_products: &active_products,
                         published_soul: published_soul.as_deref(),
                         sendable_assets: &sendable_assets,
+                        referral_cards: &referral_cards,
                         reply_prompts: &reply_prompts,
                         reply_context: &reply_context,
                     }),
@@ -2793,6 +2873,7 @@ fn run_user_operation_gateway_inner<'a>(
                     active_products: &active_products,
                     published_soul: published_soul.as_deref(),
                     sendable_assets: &sendable_assets,
+                    referral_cards: &referral_cards,
                     reply_prompts: &reply_prompts,
                     reply_context: &reply_context,
                 }),
@@ -2861,8 +2942,10 @@ fn run_user_operation_gateway_inner<'a>(
     // 防御兜底：单发决策路径（知识前置）不支持 tool_calling 中间轮，若 LLM 误选该相位
     // 会导致 should_reply=false（types.rs:907 强制）→ 静默 no_reply，客户提问得不到回复。
     // 这里检测到 tool_calling 时强制转 final + 清空 tool_calls + 记 degraded，避免误发空回复。
-    // 根因：user.reply.task prompt 提供了 tool_calling 形态但主链路是单发（无工具循环包裹），
-    // LLM 误选后 gateway 无处理 → 回复被吞。本防御是兜底，根治需同时收紧 prompt。
+    // 根因（历史）：旧单发 prompt `user.reply.task` 曾提供 tool_calling 形态而主链路无工具
+    // 循环包裹，LLM 误选后 gateway 无处理 → 回复被吞。prompt 侧已收紧（守护测试锁死该
+    // 形态不再出现；现行单发主路径加载的是 `user.reply.fast.task`，见 decision.rs），
+    // 本防御保留，为任何仍误吐 tool_calling 相位的模型输出兜底。
     if decision.decision_phase == "tool_calling" {
         write_event_for_account(
             state,
@@ -2948,7 +3031,10 @@ fn run_user_operation_gateway_inner<'a>(
         local_decision_review(&decision, local_budget_ref, &runtime)
     } else if should_run_review(&decision, &planner, &runtime) {
         let review_mode = effective_review_mode(&planner, &decision, &runtime, false);
-        let (review, claim_gate_evaluation) = review_and_evaluate_claim_gate(
+        // S5-6：首稿寒暄低风险轮跳过独立 ClaimGate（七条件纯函数判定）。rewrite /
+        // revision / 管理发送路径不跳——触发本身即风险信号或属 admin 手动指定文本。
+        let skip_claim_gate = should_skip_claim_gate(&decision, &planner);
+        let (mut review, claim_gate_evaluation) = review_and_evaluate_claim_gate(
             state,
             &contact,
             &inbound,
@@ -2966,8 +3052,20 @@ fn run_user_operation_gateway_inner<'a>(
             &active_profile,
             &active_products,
             &reviewer_prompts,
+            skip_claim_gate,
         )
         .await?;
+        if skip_claim_gate
+            && !review
+                .risks
+                .iter()
+                .any(|risk| risk == CLAIM_GATE_SKIPPED_RISK_CASUAL_LOW)
+        {
+            // 审计标记：跳过率可观测（decision_reviews.risks）、误跳可排查。
+            review
+                .risks
+                .push(CLAIM_GATE_SKIPPED_RISK_CASUAL_LOW.to_string());
+        }
         precomputed_claim_gate = Some(claim_gate_evaluation);
         review
     } else {
@@ -3057,6 +3155,7 @@ fn run_user_operation_gateway_inner<'a>(
                     active_products: &active_products,
                     published_soul: published_soul.as_deref(),
                     sendable_assets: &sendable_assets,
+                    referral_cards: &referral_cards,
                     reply_prompts: &reply_prompts,
                     reply_context: &reply_context,
                 }),
@@ -3091,6 +3190,8 @@ fn run_user_operation_gateway_inner<'a>(
                 &active_profile,
                 &active_products,
                 &reviewer_prompts,
+                // rewrite 由硬闸失败触发（幻觉/grounding），改写稿必须全量重评。
+                false,
             )
             .await?;
             review = next_review;
@@ -3330,6 +3431,7 @@ fn run_user_operation_gateway_inner<'a>(
                     active_products: &active_products,
                     published_soul: published_soul.as_deref(),
                     sendable_assets: &sendable_assets,
+                    referral_cards: &referral_cards,
                     reply_prompts: &reply_prompts,
                     reply_context: &reply_context,
                 }),
@@ -3360,6 +3462,8 @@ fn run_user_operation_gateway_inner<'a>(
                         &active_profile,
                         &active_products,
                         &reviewer_prompts,
+                        // revision 由 finalize 后的 revision trigger 触发，二稿全量重评。
+                        false,
                     )
                     .await?;
 
@@ -3601,16 +3705,10 @@ fn run_user_operation_gateway_inner<'a>(
     // / write_event 落库时显式标记 context_changed。
     let context_changed_followup_hit = match &trigger {
         AgentTrigger::FollowUp(task) => {
-            // Legacy wake tasks remain readable during rolling upgrades. They reply to accumulated
-            // inbound messages and therefore must not cancel themselves on context_changed.
-            if task.kind == crate::agent::quiet_hours::DEFERRED_INBOUND_REPLY_KIND {
-                false
-            } else {
-                let last_inbound_ms =
-                    inbound_marker_for_context_check(&contact).map(|d| d.timestamp_millis());
-                let task_created_ms = task.created_at.timestamp_millis();
-                check_context_changed_followup_pure(last_inbound_ms, task_created_ms)
-            }
+            let last_inbound_ms =
+                inbound_marker_for_context_check(&contact).map(|d| d.timestamp_millis());
+            let task_created_ms = task.created_at.timestamp_millis();
+            check_context_changed_followup_pure(last_inbound_ms, task_created_ms)
         }
         _ => false,
     };
@@ -3859,16 +3957,19 @@ fn run_user_operation_gateway_inner<'a>(
         return Ok(());
     }
 
-    // 并发多消息去抖——主中止检查（强制落在 apply_agent_updates 之前）。
+    // 并发多消息去抖——主中止检查（强制落在任何画像 / 记忆 / outbox 落库之前）。
     //
     // 决策与审查已完成，但尚未写任何画像 / 记忆 / outbox。若此刻调度器观察到
     // 更新的入站（用户在这次生成期间又发了消息），should_abort_send() 返回 true：
     // 放弃这次已过时的生成，写一条终态 run log（gateway_status=
     // superseded_by_new_inbound），交由调度器用更全的上下文重算。
     //
-    // 关键：必须在 apply_agent_updates 之前——后者无条件把 last_agent_run_at 推到
-    // now，若先落库再放弃，重算时 precheck 会因 min_reply_interval 误判 rate_limited
-    // 吞掉聚合回复。这里直接 return 不触碰 last_agent_run_at，重算 precheck 干净。
+    // 关键：必须在本 run 推进 last_agent_run_at 的一切写点之前——outbox 授权时的
+    // `$max` 回写与发送成功后的时间戳回写都会推进它（此外 post-decision 投影 worker
+    // 的 apply_agent_updates 也会无条件推到 now，但那是本 run 落库后才会调度的异步
+    // 投影）。若先落库再放弃，重算时 precheck 会因 min_reply_interval 误判
+    // rate_limited 吞掉聚合回复。这里直接 return 不触碰 last_agent_run_at，重算
+    // precheck 干净。
     if let Some(guard) = &should_abort_send {
         if guard() {
             write_agent_run_log(
@@ -4613,6 +4714,46 @@ fn run_user_operation_gateway_inner<'a>(
                 None,
             )
             .await?;
+        // `last_agent_run_at` is a delivery-rate-limit anchor, not an analytical projection.
+        // Advance it as soon as the complete text batch is durably authorized so another inbound
+        // cannot start a duplicate reply while the post-decision worker is still projecting the
+        // profile. Keep this write independent from the heavier profile/memory update below.
+        let authorized_at = DateTime::now();
+        match state
+            .db
+            .contacts()
+            .update_one(
+                doc! {
+                    "_id": contact.id,
+                    "workspace_id": &contact.workspace_id,
+                    "account_id": &contact.account_id,
+                    "wxid": &contact.wxid,
+                },
+                doc! {
+                    "$max": { "last_agent_run_at": authorized_at },
+                    "$set": { "updated_at": authorized_at },
+                },
+                None,
+            )
+            .await
+        {
+            Ok(result) if result.matched_count == 1 => {}
+            Ok(_) => tracing::error!(
+                %run_id,
+                workspace_id = %contact.workspace_id,
+                account_id = %contact.account_id,
+                contact_wxid = %contact.wxid,
+                "authorized reply did not find its contact for rate-limit anchoring"
+            ),
+            Err(error) => tracing::error!(
+                %error,
+                %run_id,
+                workspace_id = %contact.workspace_id,
+                account_id = %contact.account_id,
+                contact_wxid = %contact.wxid,
+                "authorized reply could not advance the rate-limit anchor"
+            ),
+        }
         super::post_decision::activate_projection(state, decision_review_id).await?;
         if let Err(error) = write_event_for_account(
             state,
@@ -5125,9 +5266,7 @@ pub(crate) fn trigger_message(
             message_id: None,
             dedupe_key: None,
             direction: MessageDirection::Inbound,
-            // Legacy wake-task compatibility only. New quiet-hours obligations execute as a real
-            // persisted inbound trigger; ordinary follow_up tasks retain proactive wording.
-            content: follow_up_trigger_message_text(&task.kind, &task.content),
+            content: follow_up_trigger_message_text(&task.content),
             msg_type: None,
             media_ref: None,
             raw: Some(doc! {
@@ -5164,14 +5303,6 @@ pub(crate) async fn precheck_send_gateway(
     // 主动打扰，故跳过 cooldown/operation_policy/rate_limited/daily_limit；not_managed
     // 仍保留（好友已退出运营则不应继续转述）。
     let is_relay = escalation::is_principal_relay_trigger(trigger);
-    // #69 作息门控：判定这是不是"静默时段排出的延迟被动应答"（醒来任务）。
-    // 醒来任务存在的意义就是回 task 创建后累积的客户消息，因此它**豁免** context_changed
-    // （否则会被自己要回的那些消息触发自取消），但仍受 expires_at 约束。
-    let is_deferred_wake = matches!(
-        trigger,
-        AgentTrigger::FollowUp(task)
-            if task.kind == crate::agent::quiet_hours::DEFERRED_INBOUND_REPLY_KIND
-    );
     if !is_relay {
         if let Some(cooldown_until) = contact.cooldown_until {
             if cooldown_until.timestamp_millis() > DateTime::now().timestamp_millis() {
@@ -5218,13 +5349,12 @@ pub(crate) async fn precheck_send_gateway(
         // **重排**到醒来时刻（而非 cancel——避免丢承诺/催进）。
         //
         // 仅作用于 FollowUp 主动发送：
-        // - 入站（Inbound）的静默延迟在 webhook 层已是权威（命中即排 wake task、不进流水线）；
-        //   若入站仍走到这里（仅边界跨分钟的极端情形），它无 task 可重排，放行这次"刚收到就回"
-        //   反而是对的，不该静默丢弃；
-        // - relay 转述是客户期待内的被动应答（同频控豁免语义）；
-        // - 醒来任务（is_deferred_wake）恰恰在醒来时刻跑，不应被自己触发的静默门挡回。
+        // - 入站（Inbound）的静默延迟在 webhook 层已是权威（命中即把唯一的 inbound_reply
+        //   义务任务排到醒来时刻、不进流水线），醒来后该任务仍以 Inbound 语义进网关，
+        //   天然不撞这道 FollowUp 门；若入站仍走到这里（仅边界跨分钟的极端情形），
+        //   它无 task 可重排，放行这次"刚收到就回"反而是对的，不该静默丢弃；
+        // - relay 转述是客户期待内的被动应答（同频控豁免语义）。
         if matches!(trigger, AgentTrigger::FollowUp(_))
-            && !is_deferred_wake
             && crate::agent::quiet_hours::effective_quiet_hours_enabled(
                 contact,
                 &crate::agent::domain_profile::load_active_domain_profile(
@@ -5250,15 +5380,12 @@ pub(crate) async fn precheck_send_gateway(
         // expires_at 已在作息门控前判定（见上）；此处只剩 context_changed 检查。
         // 用 last_inbound_at 判定 context_changed；老数据若 last_inbound_at 还没回填
         // （migration 未跑或回填中），降级使用 last_message_at 兼容。
-        // 醒来任务豁免：它就是要回 task 创建后累积的那些入站消息（见 is_deferred_wake）。
-        if !is_deferred_wake {
-            if let Some(last_inbound) = inbound_marker_for_context_check(contact) {
-                if last_inbound.timestamp_millis() > task.created_at.timestamp_millis() {
-                    return Ok(blocked(
-                        "context_changed",
-                        "用户在跟进任务后已有新消息，取消旧跟进",
-                    ));
-                }
+        if let Some(last_inbound) = inbound_marker_for_context_check(contact) {
+            if last_inbound.timestamp_millis() > task.created_at.timestamp_millis() {
+                return Ok(blocked(
+                    "context_changed",
+                    "用户在跟进任务后已有新消息，取消旧跟进",
+                ));
             }
         }
     }
@@ -5563,10 +5690,12 @@ pub(crate) const PROACTIVE_TOUCH_SOURCE_KINDS: &[&str] = &[
 ///   `sent_at`，但 `begin_remote_send` 必定已写 `send_started_at`。
 /// * outbox 是唯一发送路径（文本 / 媒体 / 名片都经 dispatcher），故不漏数。
 ///
-/// 已知残余不精确（**比修复前小得多，故不在本次收窄**）：relay 转述与静默时段
-/// 「醒来任务」的 `source_kind` 也是 follow_up 类，语义上却是被动应答，会各占 1 次
-/// 额度。二者都不常见、且都只计 1 次（不再被分段放大）。彻底区分需要在 outbox 上
-/// 持久化更细的来源标记，属独立改动。
+/// 已知残余不精确（**比修复前小得多，故不在本次收窄**）：请示通道的安抚话术
+/// （链尾失联 / 授权过期，`escalation::enqueue_holding_reply`）以 `follow_up_task`
+/// source_kind 入队，语义上是被动安抚却会各占 1 次额度；不常见且只计 1 次。
+/// relay 转述与静默时段醒来回复则**既不占额度、也不受本闸拦截**：二者都以
+/// 合成 / durable Inbound 进网关（source_kind=`inbound_message`；闸门侧
+/// `daily_limit_applies_to` 只对 FollowUp 生效），与「被动应答豁免」契约一致。
 pub(crate) fn proactive_touch_filter(
     workspace_id: &str,
     account_id: &str,
@@ -7514,16 +7643,10 @@ pub(crate) fn check_context_changed_followup_pure(
     }
 }
 
-/// #69 作息门控：根据跟进任务 kind 选择注入 Reply Agent 的"当前消息"措辞。
-///
-/// Legacy `deferred_inbound_reply` compatibility: render it as a passive response rather than
-/// proactive outreach. New quiet-hours work uses `inbound_reply` and a persisted inbound trigger.
-pub(crate) fn follow_up_trigger_message_text(kind: &str, task_content: &str) -> String {
-    if kind == crate::agent::quiet_hours::DEFERRED_INBOUND_REPLY_KIND {
-        "你在作息时段暂未回复，客户在此期间发来了消息。现在请基于完整对话历史，自然地回应客户最近的消息。".to_string()
-    } else {
-        format!("系统跟进任务到期，请重新判断是否适合主动触达。任务内容：{task_content}")
-    }
+/// 跟进任务注入 Reply Agent 的"当前消息"措辞（主动触达语境）。
+/// 静默时段的被动应答不走这里：它以持久化 inbound 触发、走 Inbound 语义进网关。
+pub(crate) fn follow_up_trigger_message_text(task_content: &str) -> String {
+    format!("系统跟进任务到期，请重新判断是否适合主动触达。任务内容：{task_content}")
 }
 
 /// Phase A / A3：taxonomy 软闸的纯逻辑——给定 active profile 的决策维度集合、LLM
@@ -8480,26 +8603,9 @@ mod tests {
     }
 
     #[test]
-    fn deferred_wake_trigger_text_is_passive_reply_framing() {
-        // #69：醒来任务用"回应客户最近消息"措辞（被动应答），不能出现"主动触达"。
-        let text = follow_up_trigger_message_text(
-            crate::agent::quiet_hours::DEFERRED_INBOUND_REPLY_KIND,
-            "作息时段累积消息",
-        );
-        assert!(
-            text.contains("回应客户"),
-            "醒来任务应是被动应答措辞: {text}"
-        );
-        assert!(
-            !text.contains("主动触达"),
-            "醒来任务不应出现主动触达措辞: {text}"
-        );
-    }
-
-    #[test]
     fn ordinary_follow_up_trigger_text_keeps_proactive_framing() {
         // 普通 follow_up 仍是"主动触达"判断，并带上任务内容。
-        let text = follow_up_trigger_message_text("follow_up", "三天前承诺的报价");
+        let text = follow_up_trigger_message_text("三天前承诺的报价");
         assert!(
             text.contains("主动触达"),
             "普通跟进应保留主动触达措辞: {text}"

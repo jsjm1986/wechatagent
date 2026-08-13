@@ -971,8 +971,9 @@ pub fn api_router(state: AppState) -> Router<AppState> {
         //    reviewer_misjudge_signal / negative_example pending）只读 ────────
         .route("/admin/observability/phase-rollup", get(phase_rollup))
         .route("/admin/observability/performance", get(performance_summary))
-        // ── G-后续Ⅱ/2：worker 健康聚合（chat_tasks 状态 / gap_signals sweep 命中率 /
-        //    lessons_learned 14d pattern × review_status）一次 RTT 拉齐 ──────
+        // ── G-后续Ⅱ/2：worker 健康聚合（chat_tasks 状态 / gap_signals 历史已解决
+        //    占比 historicalResolvedShare / lessons_learned 14d pattern ×
+        //    review_status）一次 RTT 拉齐 ──────
         .route("/admin/observability/worker-health", get(worker_health))
         // ── LLM provider 配置 admin 路由：前端 UI 编辑 / 测试 / 热切换 ────
         .route(
@@ -1089,17 +1090,22 @@ mod tests {
             include_str!("admin_taxonomy_candidates.rs"),
             include_str!("admin_relationship_suggestions.rs"),
             include_str!("admin_suspected_deals.rs"),
+            include_str!("ask_human_inbox.rs"),
             include_str!("assets.rs"),
             include_str!("auth.rs"),
             include_str!("behavior_signal_metrics.rs"),
+            include_str!("campaigns.rs"),
             include_str!("chunk_locks.rs"),
             include_str!("contacts.rs"),
+            include_str!("contract_snapshot.rs"),
             include_str!("conversations.rs"),
+            include_str!("domain_profiles.rs"),
             include_str!("domain_schemas.rs"),
             include_str!("domains.rs"),
             include_str!("evaluations.rs"),
             include_str!("events.rs"),
             include_str!("evolution.rs"),
+            include_str!("guide_profile.rs"),
             include_str!("guides.rs"),
             include_str!("health.rs"),
             include_str!("knowledge/mod.rs"),
@@ -1115,17 +1121,24 @@ mod tests {
             include_str!("lessons_learned.rs"),
             include_str!("llm_providers.rs"),
             include_str!("management.rs"),
+            include_str!("management_prompt_edit.rs"),
+            include_str!("media_assets.rs"),
             include_str!("observability.rs"),
+            include_str!("operation_view.rs"),
             include_str!("outcome_metrics.rs"),
             include_str!("outcomes_autonomy.rs"),
             include_str!("playbooks.rs"),
+            include_str!("principal_escalations.rs"),
             include_str!("products.rs"),
             include_str!("prompt_templates.rs"),
+            include_str!("referral_cards.rs"),
             include_str!("reviews.rs"),
+            include_str!("send_ledger.rs"),
             include_str!("shared.rs"),
             include_str!("simulations.rs"),
             include_str!("souls.rs"),
             include_str!("tasks.rs"),
+            include_str!("worker_controls.rs"),
         ];
 
         // 已知不是 axum handler 的 `pub async fn`：integration helper / WS handler。
@@ -1189,11 +1202,9 @@ mod tests {
             // knowledge/import.rs：标签抽取核心业务逻辑，被 extract_operation_knowledge_tags
             // handler 与 knowledge_task worker（retag action）复用、不直接绑 HTTP。
             "extract_knowledge_tags_inner",
-            // knowledge/chat.rs：chunk 更新落库内核（强制 draft+needs_review），被 chat_apply
-            // 与 knowledge_task worker（retag action）复用、不直接绑 HTTP。
-            "apply_update_chunk",
             // Transaction-aware worker cores. Their callers own the MongoDB
             // session and compose these writes with durable task state.
+            // （非 session 版 apply_update_chunk 已被 with_session 版取代并删除。）
             "ingest_chunked_text_with_session",
             "apply_create_chunk_with_session",
             "apply_update_chunk_with_session",
@@ -1208,6 +1219,13 @@ mod tests {
             // prepared commit 对账入口由 tasks.rs::reconcile_prepared_task_commits 调用。
             "handle_initial_profile_task_with_claim",
             "reconcile_initial_profile_commit",
+            // campaigns.rs：HC-021 campaign 派发崩溃恢复对账（快照冻结与确定性任务
+            // 物化两个 durable 步骤之间的进程崩溃续跑），被 tasks.rs worker 周期调用、
+            // 不直接绑 HTTP。
+            "reconcile_campaign_dispatches",
+            // domain_profiles.rs：profile 草稿版本追加落库 helper，被同文件 handlers
+            // 与 guide_profile.rs（AI 生成画像落草稿）跨文件复用，不直接绑 HTTP。
+            "append_domain_profile_draft",
         ];
 
         let mut handlers: Vec<&str> = Vec::new();

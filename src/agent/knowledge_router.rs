@@ -749,17 +749,72 @@ async fn route_operation_knowledge_inner(
 
     // 保留 KnowledgeRouteResult 既有字段语义；selected_chunk_ids 直接用 agent
     // cited，evidence_excerpts 取 source_quotes，tool_trace 透传。
-    let cited_in_corpus: Vec<String> = answer
-        .cited_chunk_ids
-        .iter()
-        .filter(|id| {
-            knowledge.chunks.iter().any(|item| {
-                item.id.map(|object_id| object_id.to_hex()).as_deref() == Some(id.as_str())
-            })
-        })
-        .take(8)
-        .cloned()
-        .collect();
+    //
+    // B5：cited 复核从「与静态 top-200 窗口求交」改为「按 id 批量 DB 直查」。
+    // 窗口只是注入用的快照，不是 verified 全集的边界：knowledge_agent 的
+    // open_chunk 按 `_id` 直查、可合法打开窗外 verified chunk，旧交集会把这类
+    // 合法引用降格成 fallback 弱回填。直查过滤与 `load_operation_knowledge` 的
+    // chunk 窗口过滤逐字同口径（workspace + domain + status=active +
+    // integrity_status=verified + account $or），故复核结果只可能比旧交集多认
+    // 「真 verified」、绝不放进窗口口径外的东西（verified-only 只增真、不增假）。
+    // id 数量有界：cite ⊆ opened 由 `filter_answer_against_opened_chunks` 保证，
+    // opened 受 MAX_ROUNDS × open 批量上限约束。
+    let cited_object_ids: Vec<mongodb::bson::oid::ObjectId> = {
+        let mut seen = std::collections::HashSet::new();
+        answer
+            .cited_chunk_ids
+            .iter()
+            .filter(|id| seen.insert(id.as_str()))
+            .filter_map(|id| mongodb::bson::oid::ObjectId::parse_str(id).ok())
+            .collect()
+    };
+    let mut cited_verified_by_id: std::collections::HashMap<String, OperationKnowledgeChunk> =
+        std::collections::HashMap::new();
+    if !cited_object_ids.is_empty() {
+        let mut cursor = state
+            .db
+            .operation_knowledge_chunks()
+            .find(
+                doc! {
+                    "workspace_id": &contact.workspace_id,
+                    "domain": "user_operations",
+                    "status": "active",
+                    "integrity_status": "verified",
+                    "$or": [
+                        { "account_id": null },
+                        { "account_id": &contact.account_id }
+                    ],
+                    "_id": { "$in": cited_object_ids }
+                },
+                None,
+            )
+            .await?;
+        while let Some(chunk) = cursor.try_next().await? {
+            if let Some(hex) = chunk.id.map(|oid| oid.to_hex()) {
+                cited_verified_by_id.insert(hex, chunk);
+            }
+        }
+    }
+    // 保序 + 上限 8（沿用旧交集路径的 take(8) 语义）。窗内命中不装文档
+    // （`select_operation_knowledge_chunks` 先查窗口原件），仅窗外文档进
+    // `cited_verified_chunks` 由 route 运行时携带给下游投影。
+    let mut cited_in_corpus: Vec<String> = Vec::new();
+    let mut cited_verified_chunks: Vec<OperationKnowledgeChunk> = Vec::new();
+    for id in &answer.cited_chunk_ids {
+        if cited_in_corpus.len() == 8 {
+            break;
+        }
+        let Some(chunk) = cited_verified_by_id.remove(id.as_str()) else {
+            continue;
+        };
+        let in_window = knowledge.chunks.iter().any(|item| {
+            item.id.map(|object_id| object_id.to_hex()).as_deref() == Some(id.as_str())
+        });
+        if !in_window {
+            cited_verified_chunks.push(chunk);
+        }
+        cited_in_corpus.push(id.clone());
+    }
     let evidence_excerpts: Vec<String> = answer
         .source_quotes
         .iter()
@@ -896,12 +951,17 @@ async fn route_operation_knowledge_inner(
         // S4：召回倾向占位。rank = 选中顺序，score = wiki_type_priority ×
         // dynamic_confidence，pool_size = 已加载候选 chunk 数。
         // P4：探索抽样时 selection_prob 记录每个被选 chunk 的 softmax 概率（propensity）。
+        // B5 注：池仍取窗口快照——窗外 cited chunk 按既有「未在 corpus 中找到的 id
+        // 跳过（不杜撰快照）」语义无 ranking 行；S4 目前只采集不消费，可接受。
         selected_chunk_rankings: build_chunk_rankings(
             &selected_chunk_ids,
             &knowledge.chunks,
             "tool_loop",
             fallback_probs.as_ref(),
         ),
+        // B5：窗外 cited verified 文档的运行时载体（serde(skip)，不进落库投影）。
+        // fallback 分支下恒为空（cited 复核为空才会走 fallback）。
+        cited_verified_chunks,
     };
     Ok(route)
 }
@@ -1048,6 +1108,10 @@ pub(crate) fn route_used_knowledge_ids(route: &KnowledgeRouteResult) -> Vec<Stri
         .collect()
 }
 
+/// 把 `selected_chunk_ids` 折成可注入 prompt / 可参与 R5.4 verified 计算的完整
+/// 文档投影。B5：窗内 id 取窗口原件；窗外 id（agent 合法引用、经 DB 直查复核）
+/// 从 `route.cited_verified_chunks` 运行时载体补齐——两边都查不到的 id 照旧跳过。
+/// 顺序按 `selected_chunk_ids` 保持。
 pub(crate) fn select_operation_knowledge_chunks(
     chunks: &[OperationKnowledgeChunk],
     route: &KnowledgeRouteResult,
@@ -1056,9 +1120,12 @@ pub(crate) fn select_operation_knowledge_chunks(
         .selected_chunk_ids
         .iter()
         .filter_map(|id| {
-            chunks.iter().find(|item| {
-                item.id.map(|object_id| object_id.to_hex()).as_deref() == Some(id.as_str())
-            })
+            chunks
+                .iter()
+                .chain(route.cited_verified_chunks.iter())
+                .find(|item| {
+                    item.id.map(|object_id| object_id.to_hex()).as_deref() == Some(id.as_str())
+                })
         })
         .cloned()
         .collect::<Vec<_>>()
@@ -1125,7 +1192,9 @@ pub(crate) async fn write_knowledge_usage_log(
         .await?;
     // knowledge-wiki §6.1：每次 run 把命中/拦截原子写回 chunk.usage_stats，
     // 让 catalog/persisted 的排序与 feedback worker 的 dynamic_confidence 拿到
-    // 实时计数。fire-and-forget——不阻塞 gateway 决策。
+    // 实时计数。注意这不是 fire-and-forget：循环内**顺序 await** 每次 update
+    // （N 个 chunk = N 次串行 DB 往返，仍在调用方请求路径上），`let _ =` 只吞
+    // 错误保证失败不影响主流程；本函数在决策产出后调用，不影响决策本身。
     let block_reason = if approved {
         None
     } else {
@@ -1736,5 +1805,87 @@ mod tests {
             route_used_knowledge_ids(&legacy),
             vec!["c_legacy".to_string()]
         );
+    }
+}
+
+/// B5 知识窗口错位修复的纯函数面测试（DB 直查复核路径由
+/// `tests/knowledge_window_cited_integration.rs` 端到端覆盖）。
+#[cfg(test)]
+mod cited_window_carry_tests {
+    use super::select_operation_knowledge_chunks;
+    use crate::agent::types::KnowledgeRouteResult;
+    use crate::models::OperationKnowledgeChunk;
+    use mongodb::bson::oid::ObjectId;
+
+    fn chunk_with_id(oid: ObjectId, title: &str) -> OperationKnowledgeChunk {
+        OperationKnowledgeChunk {
+            id: Some(oid),
+            title: title.to_string(),
+            body: Some(format!("正文：{title}")),
+            integrity_status: Some("verified".to_string()),
+            status: "active".to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// 窗外文档由 `route.cited_verified_chunks` 携带时，select 必须补齐——
+    /// 这是 gateway 传给 prompt 注入与 `compute_verified_chunks`（R5.4）的
+    /// 同一投影，缺了它窗外合法引用就在下游"消失"。窗内 id 仍从窗口取
+    /// （顺序按 selected_chunk_ids 保持）。
+    #[test]
+    fn select_merges_carried_out_of_window_docs() {
+        let in_window_oid = ObjectId::new();
+        let out_of_window_oid = ObjectId::new();
+        let window = vec![chunk_with_id(in_window_oid, "窗内")];
+        let route = KnowledgeRouteResult {
+            selected_chunk_ids: vec![in_window_oid.to_hex(), out_of_window_oid.to_hex()],
+            cited_verified_chunks: vec![chunk_with_id(out_of_window_oid, "窗外")],
+            ..Default::default()
+        };
+        let selected = select_operation_knowledge_chunks(&window, &route);
+        let titles: Vec<&str> = selected.iter().map(|c| c.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            vec!["窗内", "窗外"],
+            "窗外携带文档必须按 selected_chunk_ids 顺序补入下游投影；got {titles:?}"
+        );
+    }
+
+    /// 窗内命中优先于携带文档：同一 id 两边都有时取窗口原件（与修复前字节等价），
+    /// 携带载体只做窗外兜底、不覆盖窗口。
+    #[test]
+    fn select_prefers_window_doc_over_carried_copy() {
+        let oid = ObjectId::new();
+        let window = vec![chunk_with_id(oid, "窗口原件")];
+        let route = KnowledgeRouteResult {
+            selected_chunk_ids: vec![oid.to_hex()],
+            cited_verified_chunks: vec![chunk_with_id(oid, "携带副本")],
+            ..Default::default()
+        };
+        let selected = select_operation_knowledge_chunks(&window, &route);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].title, "窗口原件");
+    }
+
+    /// 持久化面守卫：`cited_verified_chunks` 是 `#[serde(skip)]` 运行时载体，
+    /// 绝不能进 `to_document` 投影（knowledge_usage_logs.route_result /
+    /// run_envelope.knowledge_route / simulation 报告共用此投影）；
+    /// 历史 route 文档缺该字段时反序列化恒为空 Vec（R11 安全）。
+    #[test]
+    fn cited_verified_chunks_never_enter_persistence_projection() {
+        let route = KnowledgeRouteResult {
+            selected_chunk_ids: vec![ObjectId::new().to_hex()],
+            cited_verified_chunks: vec![chunk_with_id(ObjectId::new(), "窗外")],
+            ..Default::default()
+        };
+        let doc = mongodb::bson::to_document(&route).expect("route 可序列化");
+        assert!(
+            !doc.contains_key("citedVerifiedChunks"),
+            "运行时载体不得进入持久化投影；keys: {:?}",
+            doc.keys().collect::<Vec<_>>()
+        );
+        let legacy: KnowledgeRouteResult =
+            serde_json::from_str(r#"{"selectedChunkIds":["c1"]}"#).expect("legacy route");
+        assert!(legacy.cited_verified_chunks.is_empty());
     }
 }

@@ -12,7 +12,7 @@ export function ProductMultiSelect({ value, onChange }: { value: string[]; onCha
     let alive = true;
     void (async () => {
       try {
-        const r = await api.get<{ items: ProductOption[] }>("/api/products?active_only=true");
+        const r = await api.get<{ items: ProductOption[] }>("/api/products?activeOnly=true");
         if (alive) setOpts(r.items);
       } catch {
         if (alive) setFailed(true);

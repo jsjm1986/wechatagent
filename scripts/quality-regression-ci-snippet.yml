@@ -1,0 +1,83 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# 金标质量回归环 nightly job 片段（优化线 C · C1c 产出）。
+#
+# ⚠️ 本文件不是独立 workflow——ci.yml 不在线 C 所有权矩阵内，按计划本片段由
+#    主会话人工合并进 .github/workflows/ci.yml 的 jobs: 段。合并说明：
+#
+# 1. 挂链位置：`needs: real-llm-redline`——追加在 rsxermu 串行链
+#    （real-llm → recall → ops → quality → adversarial → redline）末端，
+#    与 skip-gate 并行（skip-gate 不打 LLM API，无并发冲突）。
+# 2. `continue-on-error: true` 起步（v1 软门：红线违规会让本 job 红，但对合并
+#    无否决权；ledger 累积 ≥3 次运行且方差可接受后由主会话决策收紧）。
+# 3. env 里的 REAL_LLM_BASE_URL / REAL_LLM_MODEL 用 repository variables 引用
+#    （本片段有意不内置任何模型名——金标环代码/脚本模型中立）；合并时也可按
+#    ci.yml 既有 real-llm job 的字面值内联，保持与 nightly 能力套件同一 provider。
+# 4. judge 默认关（REAL_LLM_JUDGE 不设）：首批 nightly 先积累红线信号与执行
+#    时长基线；开 judge 时补 REAL_LLM_JUDGE=1 + REAL_LLM_JUDGE_* 三件套
+#    （须与被测 agent 异族，参照 tests/common/dynamic.rs R5.0.1 纪律）。
+# ═══════════════════════════════════════════════════════════════════════════
+
+  quality-gold:
+    name: Quality gold regression (金标回归环 / shadow 零发送)
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.dispatch_target == 'nightly_full') }}
+    # 串行链末端（守 rsxermu 并发上限，见 real-llm-recall 注释）；软门起步。
+    needs: real-llm-redline
+    continue-on-error: true
+    timeout-minutes: 120
+    env:
+      REAL_LLM_API_KEY: ${{ secrets.RSXERMU_KEY }}
+    steps:
+      - name: Require REAL_LLM_API_KEY (缺 key 真 fail，不假绿)
+        if: ${{ env.REAL_LLM_API_KEY == '' }}
+        run: |
+          echo "::error::REAL_LLM_API_KEY 未配置（secrets.RSXERMU_KEY 为空）。金标回归环必须有 key 才能真跑——缺 key 直接 fail，不静默跳过假绿。"
+          exit 1
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 同 integration/real-llm job：清预装 SDK 腾 ~30GB，防 target + mongo 镜像撑爆磁盘。
+      - name: Free disk space
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /usr/local/share/boost /usr/local/share/powershell \
+            /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force || true
+          df -h
+
+      - name: Install Rust toolchain
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry / target
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        uses: Swatinem/rust-cache@v2
+
+      # rust-cache 可能带回旧 ledger；清空防陈旧运行被当成本次证据。
+      - name: Reset quality gold ledger
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        run: rm -rf target/quality_gold && mkdir -p target/quality_gold
+
+      # 一键入口自带 env fail-fast 与汇总输出。RUSTFLAGS 置空同 real-llm job 理由
+      # （测试目标陈年 warning 不阻断真实跑测）。
+      - name: Run quality gold regression (scripts/quality-regression.sh)
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        env:
+          RUSTFLAGS: ""
+          RUST_MIN_STACK: "8388608"
+          # provider 由 repository variables 显式给定（或合并时按 real-llm job 字面值内联）。
+          REAL_LLM_BASE_URL: ${{ vars.REAL_LLM_BASE_URL }}
+          REAL_LLM_MODEL: ${{ vars.REAL_LLM_MODEL }}
+          REAL_LLM_FORMAT: openai
+        run: bash scripts/quality-regression.sh
+
+      # ledger 是软门升级决策的原始证据（≥3 次运行方差评估），恒上传。
+      - name: Upload quality gold ledger
+        if: ${{ always() && env.REAL_LLM_API_KEY != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: quality-gold-ledger
+          path: target/quality_gold/
+          if-no-files-found: ignore
+          retention-days: 30

@@ -184,6 +184,7 @@ const LONG_IMPORT_PROMPT_TEMPLATE: &str = r#"请把下面文本拆分为渐进�
 - 穷尽覆盖的对象不止量化事实：原文里每一个**离散信息单元**都要落地，不要因为它没有数字就漏掉。离散信息单元包括但不限于——决议/结论、动作项/待办及其**责任人与截止日期**、分项条款、流程步骤、各方观点、适用与不适用条件。例如会议纪要类文档，每一条决议、每一项待办（连同谁负责、何时完成）都必须各自落入 body，绝不能只总结成一句"会上讨论了若干事项"。判断标准：原文每一个可独立成立、能被单独追溯核对的陈述，都应在抽取结果里找得到对应内容。
 - 只忠于原文：body、summary 只能包含原文已陈述的内容，**禁止补充原文没有的描述、范围、功能、优惠条件或推断**。拿不准是否在原文里，就不写。
 - 案例、报价、效果数据必须完整落入对应 chunk 的 body；没有证据不要编造成案例。
+- 原文出现“保证/包会/第一/无条件退款/百分百有效/稳赚不赔”等绝对承诺、效果保证或无法直接证实的最高级宣传时，必须把对应原文风险逐条写入 document.riskNotes，供运营核验；不得因它同时存在于 chunk.body 就省略风险提示。
 - productTags / businessTopics 用于运行时把用户消息匹配到对应 chunk。
 - document 级 productTags / businessTopics 可以是其下所有 chunks 的去重并集，也可由 LLM 自行抽取。
 
@@ -2803,6 +2804,11 @@ mod tests {
         assert!(
             LONG_IMPORT_PROMPT_TEMPLATE.contains("不要编造成案例"),
             "须保留不编造案例护栏"
+        );
+        assert!(
+            LONG_IMPORT_PROMPT_TEMPLATE.contains("document.riskNotes")
+                && LONG_IMPORT_PROMPT_TEMPLATE.contains("绝对承诺"),
+            "须明确要求把绝对承诺写入现行 document.riskNotes 契约"
         );
         // 占位符仍在，运行时 .replace() 依赖
         assert!(LONG_IMPORT_PROMPT_TEMPLATE.contains("{SOURCE_NAME}"));

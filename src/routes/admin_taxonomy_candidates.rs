@@ -188,7 +188,8 @@ pub(super) async fn reject_taxonomy_candidate(
 }
 
 /// 候选 scope 是否允许指定 account 审批（管理 Agent 工具侧 scope 隔离）。
-/// TaxonomyCandidate/TaxonomyEntry 无 workspace_id 字段，隔离边界是 `scope`：
+/// TaxonomyCandidate/TaxonomyEntry **均带 `workspace_id`**（m032 已回填，相关
+/// filter 恒带租户边界）；本函数只管 workspace 之内的**账号级** `scope` 隔离：
 /// `"global"` 全局候选任何账号可审；否则 scope 必须等于发起者 account_id
 /// （账号级候选只能本账号审）。纯函数便于单测覆盖三种放行/拒绝路径。
 pub(in crate::routes) fn taxonomy_scope_allows(candidate_scope: &str, account_id: &str) -> bool {

@@ -31,6 +31,38 @@ class PrincipalSafetyTests(unittest.TestCase):
     def test_unreadable_policy_fails_closed(self) -> None:
         self.assertTrue(preflight.unsafe_principal_targets({"unexpected": True}))
 
+    def test_auto_selects_the_only_fully_usable_account(self) -> None:
+        rows = [
+            {"account_id": "offline", "app_id": "app-1", "webhook_secret": "s",
+             "online": False, "status": "active"},
+            {"account_id": "102", "app_id": "app-2", "webhook_secret": "s",
+             "online": True, "status": "active"},
+        ]
+        self.assertEqual(preflight.select_test_account(rows)["account_id"], "102")
+
+    def test_auto_selection_rejects_ambiguity(self) -> None:
+        rows = [
+            {"account_id": account_id, "app_id": f"app-{account_id}",
+             "webhook_secret": "s", "online": True, "status": "active"}
+            for account_id in ("101", "102")
+        ]
+        with self.assertRaisesRegex(ValueError, "exactly one usable account"):
+            preflight.select_test_account(rows)
+
+    def test_explicit_account_must_be_fully_usable(self) -> None:
+        rows = [{"account_id": "102", "app_id": "app-2", "webhook_secret": "",
+                 "online": True, "status": "active"}]
+        with self.assertRaisesRegex(ValueError, "BIZTEST_ACCOUNTID=102"):
+            preflight.select_test_account(rows, "102")
+
+    def test_explicit_account_selects_exact_identity(self) -> None:
+        rows = [
+            {"account_id": account_id, "app_id": f"app-{account_id}",
+             "webhook_secret": "s", "online": True, "status": "active"}
+            for account_id in ("101", "102")
+        ]
+        self.assertEqual(preflight.select_test_account(rows, "102")["account_id"], "102")
+
 
 if __name__ == "__main__":
     unittest.main()

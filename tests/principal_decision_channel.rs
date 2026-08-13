@@ -154,6 +154,8 @@ fn minimal_pending_escalation(short_code: &str, contact_wxid: &str) -> AgentPrin
                 daily_push_cap: None,
                 quiet_hours: None,
                 timeout_hours: None,
+                standing_order: None,
+                standing_order_after_hours: None,
             },
             principal_account_id: "default".to_string(),
             delivery_generation: 1,
@@ -679,6 +681,8 @@ async fn t_timeout_reassign_pushes_and_touches_updated_at() {
             daily_push_cap: None,
             quiet_hours: None,
             timeout_hours: Some(1.0),
+            standing_order: None,
+            standing_order_after_hours: None,
         },
     )
     .await;
@@ -768,6 +772,8 @@ async fn t_timeout_reassign_terminal_delivery_failure_releases_pending() {
             daily_push_cap: None,
             quiet_hours: None,
             timeout_hours: Some(1.0),
+            standing_order: None,
+            standing_order_after_hours: None,
         },
     )
     .await;
@@ -885,6 +891,8 @@ async fn t_timeout_reassign_blocked_by_quiet_hours_skips_push() {
                 tz_offset_hours: 0,
             }),
             timeout_hours: Some(1.0),
+            standing_order: None,
+            standing_order_after_hours: None,
         },
     )
     .await;
@@ -941,6 +949,8 @@ async fn t_timeout_reassign_cap_one_not_self_blocked() {
             daily_push_cap: Some(1),
             quiet_hours: None,
             timeout_hours: Some(1.0),
+            standing_order: None,
+            standing_order_after_hours: None,
         },
     )
     .await;
@@ -994,6 +1004,8 @@ async fn t_timeout_reassign_concurrent_scans_enqueue_one_generation() {
             daily_push_cap: None,
             quiet_hours: None,
             timeout_hours: Some(1.0),
+            standing_order: None,
+            standing_order_after_hours: None,
         },
     )
     .await;
@@ -1131,6 +1143,8 @@ async fn t_timeout_chain_tail_sends_holding_reply_once_within_interval() {
             daily_push_cap: None,
             quiet_hours: None,
             timeout_hours: Some(1.0),
+            standing_order: None,
+            standing_order_after_hours: None,
         },
     )
     .await;

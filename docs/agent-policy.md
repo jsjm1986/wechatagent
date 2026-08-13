@@ -66,7 +66,8 @@ Agent 必须遵守：
 
 行为：
 
-- 静默时段**入站**消息不立即回，排一条 `deferred_inbound_reply` 跟进任务（`run_at` = 下一次醒来时刻），并写一条 `quiet_hours_deferred_inbound` 观测事件供后台审计；连发去重（同 contact 仅 1 条 wake 任务），醒来后基于累积消息走完整决策/审查链路回 1 次。
+- 静默时段**入站**消息不立即回，物化一条 durable `inbound_reply` 任务并把 `run_at` 推迟到下一次醒来时刻（`webhooks.rs::schedule_managed_inbound_obligation`；历史专用任务类型 `deferred_inbound_reply` 及其分支已于 2026-08-13 物理删除）；连发去重（同 contact 仅 1 条 wake 任务），醒来后基于累积消息走完整决策/审查链路回 1 次。
+- **显式交易意向豁免（2026-08-13 S5-3）**：静默时段内客户消息命中显式购买/付款承诺（与 reaction 确定性购买判定同词表、同 domain profile 门控，`quiet_hours.rs::bypass_deferral_for_explicit_buying_intent`）时**不 defer**、立即走正常应答链路，并写 `quiet_hours_bypassed_buying_intent` 观测事件（按消息 `_id` 去重）。
 - 静默时段到点的**主动发送**（planner 催进 / 承诺跟进）**重排**到醒来时刻而非取消，避免丢承诺。
 
 ## Operating Brain V2
@@ -99,11 +100,16 @@ RunBudget 超限                        终止本 run，写入闭集终态，不
 > `product_accuracy_block_below` 实际承载 **knowledge_grounding** 阈值（由
 > `knowledge_grounding_block_below` 映射）。阅读 `review.rs` 时按此别名对齐。
 
-`HumanLikeScore` / `EmotionalValue` / `PressureRisk` 作为 Review 评分软闸（见
-`review::route_dual_gate`）：低于 / 高于阈值时触发一次 `single-shot revision`；二次仍未通过
-则写闭集阻断终态，不进入 Outbox。
+`HumanLikeScore` / `EmotionalValue` / `PressureRisk` / `BoundaryPrivacySafety`（≤3 触发、0=未评分豁免）作为 Review 评分软闸（见
+`review::classify_dual_gate` / `route_dual_gate`）：越过阈值时触发一次 `single-shot revision`；二次仍未通过
+则写闭集阻断终态（`revision_failed`），不进入 Outbox。
 
-当前实现使用统一发送网关。任何自动发送，包括私聊自动回复和 follow-up 定时任务，都必须重新加载上下文，检查 managed、冷却期、最小间隔和任务是否过期，再进入独立 Review Agent。候选回复先生成，再评审；评审未通过时改写一次；二次仍未通过则写入 `blocked_review`，不调用微信发送工具。
+> **统计口径注意（2026-08-13 终裁）**：`pressure_risk` 是软闸，生产**不产生** `blocked_by_safety_guard`
+> 之类的 block 终态——该终态的实际来源是产品声明 fail-closed / relay 守卫路径。任何把
+> `blocked_by_safety_guard` 归因为 pressure 闸命中的统计都是失真口径；演化器已按此终裁停止为
+> pressure 闸生成阈值候选（见下"自我演化"节）。
+
+当前实现使用统一发送网关。任何自动发送，包括私聊自动回复和 follow-up 定时任务，都必须重新加载上下文，检查 managed、冷却期、最小间隔和任务是否过期，再进入独立 Review Agent。候选回复先生成，再评审；评审未通过时改写一次；二次仍未通过则写入闭集阻断终态（如 `review_blocked` / `revision_failed`），不调用微信发送工具。寒暄低风险首稿在七条件全部满足时跳过独立 Claim Gate（`review::should_skip_claim_gate`，审计标记 `claim_gate_skipped_casual_low_risk` 落 risks；仅主程首稿分流，rewrite / revision / 管理发送恒照跑）。
 
 **每日触达上限（`max_daily_touches`）仅约束 AI 主动触达（follow-up 定时任务）**；客户主动发消息的被动回复（Inbound）属"客户期待内的被动应答"，不受此上限限制（与 quiet_hours 门同为 FollowUp-only 语义）。被动回复的防刷屏由最小回复间隔（`min_reply_interval`）与账号级软上限承担。
 
@@ -149,6 +155,14 @@ RunBudget 超限                        终止本 run，写入闭集终态，不
 
 - 先发一句 AI 口吻的自然铺垫话术（融进 `replyText`），再附名片（设计 D5），对话始终是 AI 在说。
 - 名片经现有 outbox 幂等通道（幂等键含 `referral_card_id`）发送，dispatcher 分流调 MCP `message_send_namecard`，复用既有出站链路。
+
+## Ask-Human 决策请示（principal escalation）
+
+AI 遇到超出自身职权/能力的事项（折扣权限、承诺、敏感业务边界）时向**幕后决策源（领导）**请示，拿回结论后用自己的口吻向客户转述——客户永远只面对 AI。三类触发 category：`out_of_scope_decision / high_risk_gated / stuck_or_undelivered`。决策人链、去重窗口、每日推送 cap、请示卡静默时段（与客户触达 quiet hours 是两套）、超时时限等策略在创建时冻结，在途流程不被配置变化改写。
+
+- 超时行为：任务 tick 内周期扫描（`scan_escalation_timeouts`）；有下一位决策人则改派重推卡，链尾默认周期安抚、不自动关单；投递失败/结果未知的滞留请示卡同样按台账建立时刻计龄进入超时改派（2026-08-13 修复）。
+- **预授权底线（standing order，2026-08-13 S5-5）**：运营可在 AskHumanPolicy 预写 `standing_order` 口径与 `standing_order_after_hours` 时限（双字段成对校验强制，防"配了文本永不生效"的静默误配）。链尾无人应答超过时限后，预写口径被当作一条与领导裁决同形的 conditional 决议，复用既有 resolve→relay 通道由 AI 转述（`resolved_via="standing_order_policy"`）——本质是**执行人类预授权，不是 AI 代决**；未配置时行为不变（链尾只安抚）。
+- 裁决 relay 经出站守卫：禁止向客户泄漏内部载荷字段、禁止引入 substance 之外的数字；领导口述时限时写 `authorization_expires_at`。
 
 ## Group Operations Policy
 
@@ -347,6 +361,8 @@ WechatAgent 自第二阶段起内置可选的"自我演化"后台 worker（`src/
 - 命中率 > 上限 → 候选 `proposed_value = current + step`（阈值收紧）。
 - 命中率 < 下限 → 候选 `proposed_value = current - step`（阈值放松）。
 - 落在 band 内 → 不产候选。
+- **pressure 闸候选不再生成（2026-08-13 终裁）**：历史实现把 `blocked_by_safety_guard` 终态归因为 `pressure_risk_block` 命中，但生产中 pressure 是软闸、不产生该终态（终态实际来自业务声明 fail-closed 路径）——统计源失真，该闸的阈值候选建立在错误数据上。现已停止为 `pressure_risk_block` 生成候选（写 skip 事件留痕），#152 反向门对该闸的空转随之消除。
+- **auto_release 通道已物理删除（2026-08-13）**：曾存在的 `auto_release_eligible_thresholds` 自动放行机制（被政策硬闸恒压制的刻意死代码）已整体移除（净删约 709 行）；release 恒为 admin 手动 + 二次确认串。
 - **安全闸放松约束**（#152）：`fact_risk_block` / `pressure_risk_block` / `product_accuracy_score_block` 三个 block 类闸是安全闸。放松它们的候选必须额外过一道反向显著性门（见下「Shadow eval + 显著性」），否则即使 send_success 提升达标也被判 `rejected_below_threshold`。`human_like_score_rewrite` / `emotional_value_rewrite`（rewrite 类）不受此约束——放松它们不会漏过风险消息。
 - Release 写一条 `threshold_overrides`（`rolled_back_at=null` 且 `released_at` 最新者生效）；run 入口 `resolve_thresholds` 单次读取，正在跑的 run 不受影响。
 - Rollback 立即把 `threshold_overrides.rolled_back_at` 置为 now，下一次 run 入口的 `resolve_thresholds` 读回 baseline（来自 contact runtime / `AppConfig`）。
@@ -361,7 +377,9 @@ WechatAgent 自第二阶段起内置可选的"自我演化"后台 worker（`src/
 ### Shadow eval + 显著性
 
 - Shadow replay（`src/evolution/replay.rs`）只读 `agent_run_logs` 的快照，对同一 source run 在新阈值 / 新 prompt 下重判，**不**写 `agent_send_outbox`、不调 MCP、不写 `conversation_messages.outbound`。
-- 显著性门槛：`EVOLUTION_MIN_SEND_SUCCESS_DELTA`（默认 0.05）+ `EVOLUTION_MAX_5GATE_HIT_INCREASE`（默认 0.10，即新版本不得让任何闸命中率上升超过 10%）。
+- **判定主指标（2026-08-14 线 H 换血）**：`outcome_weighted_delta`——按 `source_run_id → AgentRunLog.run_id → AgentDecisionReview.outcome_status` 只读 join 取**真实用户反应**做三态分类（Hit=买入信号 / Block=负向集 / Censored=删失，真相源 `src/agent/outcome_label.rs`，`gap_signals` re-export 逐字节等价），对新旧配置各算「放行∧Hit 占比 − 放行∧Block 占比」（分母=非删失样本；"放行"仍指 `approved`/`revision_applied_approved`）后取差值。shadow replay 无法产生未来反应，标签来自源 run 的真实结局；review 缺失或删失的 replay 不进判定分母。旧的评审放行率（send_success delta）降级为 `_observed` 仅观测字段——演化器不再优化"让自己的审查者点头"这一过程指标。
+- 显著性门槛：`EVOLUTION_MIN_SEND_SUCCESS_DELTA`（默认 0.05，**env 名保持部署兼容、现承载 outcome_weighted_delta 门槛**）+ `EVOLUTION_MAX_5GATE_HIT_INCREASE`（默认 0.10，即新版本不得让任何闸命中率上升超过 10%，防"改配置让闸空转"，与结果信号正交）。
+- **样本量硬门**：非删失（Hit+Block）样本 < `EVOLUTION_MIN_REPLAYS`（env 复用，双重语义：completed replay 下限 ∧ 非删失结果样本下限）→ 候选直接 `rejected_below_threshold`（reason=`insufficient_outcome_samples`）。冷启动/低互动期演化器自然静默，是特性不是缺陷。
 - **安全回归门**（#152）：放松安全闸（`fact_risk_block` / `pressure_risk_block` / `product_accuracy_score_block`）的 threshold 候选，额外计算「安全回归率」= shadow 中"原配置被该安全闸拦下（`held_by_ai_policy` / `blocked_by_safety_guard` / `blocked_unverified_product_claim`）、新配置却放行（`approved` / `revision_applied_approved`）"的 run 占全部 completed replay 的比例。超过 `EVOLUTION_MAX_SAFETY_REGRESSION_RATE`（默认 `0.0`，零容忍）即判 `safety_gate_regression_above_threshold`、转 `rejected_below_threshold`。这条门是"放松必须用数据证明不漏风险"的硬约束，凌驾于 send_success 提升之上。
 - 三项任一不达标（含安全回归门）→ 候选直接转 `rejected_below_threshold`，不进入 `eligible_for_release`。
 - **注（2026-06-14）**：`blocked_unverified_product_claim` 作为安全回归门的被拦状态之一，其来源是 R5.4 reviewer 自报路径（强约束不变）；finalize 漏判探针（ProductEffect 分支）现已转为观测期，不再产生该 block 状态，故演化器统计窗口内该状态的样本量会下降。观测期结束后若抬回硬闸，本统计语义无需改动。
@@ -693,7 +711,7 @@ stage 2（LLM 批裁决：contradiction / suggestion / 残留信号是否仍适�
 > 本节记录各阶段当时的交付，不是当前运行时契约。后续已将 Prompt 与 ops 配置收敛为
 > 唯一 current 指针，并移除旧 `enforce_*` 函数；现行行为以上文和源码为准。
 
-本轮演进按计划 `Phase 0 → A → B → C → D → E` 分阶段交付，每阶段守住 R11.6 基线门（`cargo test --lib ≥ 350` / 4 PBT 累计 ≥ 33，PBT 集合：`state_transition_pbt / memory_card_invariants / wiki_chunk_revision_pbt / llm_retry_jitter`，与 `scripts/check-baseline.{sh:25,ps1:17}` 实际门槛同步）+ R11 `coreFacts: Vec<String>` 兼容 + AI-autonomous 字面量禁词。
+本轮演进按计划 `Phase 0 → A → B → C → D → E` 分阶段交付，每阶段守住 R11.6 基线门（`cargo test --lib ≥ 350` / 4 PBT 累计 ≥ 33，PBT 集合：`state_transition_pbt / memory_card_invariants / wiki_chunk_revision_pbt / llm_retry_jitter`，与 `scripts/check-baseline.{sh,ps1}` 的 `LIB_BASELINE`/`PBT_BASELINE` 实际门槛同步）+ R11 `coreFacts: Vec<String>` 兼容 + AI-autonomous 字面量禁词。
 
 ### Phase 0：紧急修复
 

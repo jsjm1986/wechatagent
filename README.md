@@ -2,7 +2,7 @@
 
 WechatAgent 是一个面向微信私域关系运营的 AI Agent 平台。后端使用 Rust/Axum，MongoDB 保存业务事实、队列和审计数据，React 管理端负责配置与运营，通过 MCP Server 接入微信能力，并由 workspace 级 LLM Provider 完成决策、知识检索、独立评审和后台管理。
 
-> 文档同步基线：`e9ba277`（2026-08-04）。本地确定性核验为 `cargo test --lib` **2,359 passed / 0 failed**、4 组 PBT **41 passed / 0 failed**、前端 Vitest **125 files / 616 tests passed**、前端 production build 通过；CI 定义的 Knowledge evidence 5 条与 Tenant isolation 3 条 Docker/testcontainers hard gate 已在本机真实执行并全部通过。全量 ignored soft suite 因首次链接使 `target/` 膨胀并触及本机磁盘安全线而主动中止；真实 LLM、真实 MCP、GitHub Actions 和生产数据迁移仍需在对应环境单独验收。
+> 文档同步基线：`3db6cf6`（2026-08-13，优化波次 S0 + 三线 + S5 两线合并后）。该基线的确定性核验为 `cargo test --lib` **2,562 passed / 0 failed**、4 组 PBT **41 passed / 0 failed**、前端 Vitest **750 tests passed**、禁词与 CI 政策 lint 全绿。上一轮全量验收（`e9ba277`，2026-08-04）另含：CI 定义的 Knowledge evidence 5 条与 Tenant isolation 3 条 Docker/testcontainers hard gate 已在本机真实执行并全部通过；全量 ignored soft suite 因首次链接使 `target/` 膨胀并触及本机磁盘安全线而主动中止。真实 LLM、真实 MCP、GitHub Actions 和生产数据迁移仍需在对应环境单独验收。
 
 当前可用闭环聚焦**微信好友私聊运营**：联系人默认处于 `normal`，只有管理员显式加入 `managed` 后，Agent 才会自动消费入站消息、维护画像与长期记忆、生成跟进任务并发送回复。微信群运营和朋友圈运营目前只是前端频道占位，不参与自动运营。
 
@@ -10,13 +10,13 @@ WechatAgent 是一个面向微信私域关系运营的 AI Agent 平台。后端�
 
 | 领域 | 当前实现 |
 | --- | --- |
-| 用户运营 | 联系人同步与导入、纳管、画像、标签证据、运营状态、长期记忆、Playbook、静默时段与主动跟进 |
-| 决策与发送 | Reply Agent、独立 Claim Gate/Review、单次修订、durable Outbox、投递前二次安全检查、MCP 发送 |
+| 用户运营 | 联系人同步与导入、纳管、画像、标签证据、运营状态、长期记忆、Playbook、静默时段与主动跟进（显式交易意向可豁免静默延迟） |
+| 决策与发送 | Reply Agent、独立 Claim Gate/Review（寒暄低风险首稿可按七条件跳过 Claim Gate 并留审计标记）、单次修订、durable Outbox、投递前二次安全检查、长度加权发送节奏、MCP 发送 |
 | 知识 Wiki | 文本/文档/PDF/图片导入、切片、修订、审核、渐进式工具检索、问答、缺口和使用反馈 |
 | AI 总控 | Management Agent 将自然语言命令转换为冻结计划；工具白名单、风险分级、确认门和 durable intent 可审计 |
-| 业务运营 | 产品与成交、冻结受众的 Campaign、素材、专属顾问名片、Ask-Human 决策通道、发送成效 |
+| 业务运营 | 产品与成交、冻结受众的 Campaign、素材、专属顾问名片、Ask-Human 决策通道（含预授权底线 standing order）、发送成效 |
 | 配置治理 | Prompt、Soul、Domain Profile、Domain Schema、Taxonomy、状态机和策略的版本化发布与回滚 |
-| 自治评估 | 运行审计、业务结果、Shadow replay、阈值候选和可选 Evolution worker；生产发布仍受管理员控制 |
+| 自治评估 | 运行审计、业务结果、Shadow replay、阈值候选和可选 Evolution worker（生产发布仍受管理员控制）；105 条合成场景金标回归环（`scripts/quality-regression.sh`，shadow 零发送） |
 | 多租户 | 主要业务数据按 `workspace_id + account_id` 隔离；每个微信账号可维护独立 MCP 配置 |
 
 ## 设计原则与边界
@@ -44,7 +44,7 @@ MongoDB replica set                                      |
   +--> durable Outbox --> safety recheck --> MCP Server --> WeChat
 ```
 
-单个进程托管 `/api`、`/webhooks/wechat`、`frontend/dist` 和后台 worker。Windows 启动入口会创建具有 32 MB 栈的专用线程和 Tokio runtime，以覆盖迁移、Prompt seed 和缓存预热等深调用。
+单个进程托管 `/api`、`/webhooks/wechat`、`frontend/dist` 和后台 worker。启动入口在所有平台统一创建具有 32 MB 栈的专用线程和 Tokio runtime（规避 Windows 默认小栈下迁移、Prompt seed、缓存预热等启动期深调用的栈溢出）。
 
 ### 启动顺序
 
@@ -66,6 +66,8 @@ MongoDB replica set                                      |
 | Worker | 默认 | 职责与关闭方式 |
 | --- | --- | --- |
 | `task_worker` | 开启 | claim `agent_tasks`，执行私聊和 follow-up；间隔见 `TASK_WORKER_INTERVAL_SECONDS` |
+| `inbound_reply_worker` | 开启 | 固定 250ms 轮询恢复入站积压（durable inbound reply 义务，含毒丸行隔离），并发度 `INBOUND_REPLY_WORKER_CONCURRENCY`（默认 4） |
+| `post_decision_worker` | 开启 | 发送后投影（画像/记忆/观察回放），独立 token/call 预算，contact 级租约 |
 | `import_worker` | 开启 | 异步导入、heartbeat、孤儿回收；成功分段写 48 小时 checkpoint，reclaim 只补缺失段，终态 CAS 成功后清理 checkpoint |
 | `outbox_dispatcher` | 开启 | 租约认领、授权复核、MCP 投递、重试和终态收敛 |
 | `media_storage_reconciler` | 开启 | 启动时及每小时修复媒体提交窗口、清理 orphan、故障资产 fail-close |
@@ -86,8 +88,8 @@ MongoDB replica set                                      |
 
 ```text
 Webhook 验签、时间窗和账号限流
-  -> 持久化 inbound message
-  -> managed 联系人物化 durable task
+  -> 持久化 inbound message（无法解码的毒丸行按 _id 隔离为 quarantined 并审计，不阻塞后续行）
+  -> managed 联系人物化 durable task（静默时段 defer 到唤醒点；显式交易意向可豁免 defer）
   -> claim token + generation
   -> Gateway 加载消息、画像、记忆、策略和 verified knowledge
   -> Reply Agent
@@ -100,7 +102,7 @@ Webhook 验签、时间窗和账号限流
   -> 消息、task、run、decision、发送台账和审计事件收敛
 ```
 
-Review 的硬闸覆盖幻觉、知识 grounding、未验证产品声明等事实风险；human-like、压力风险、情绪价值、边界与隐私等软闸可要求一次改写。Reviewer 只读取生成结果和事实面，不接收 Reply Agent 的自我推理字段。开启双 Reviewer 时，第二 provider 配置不完整会导致启动失败。
+Review 的硬闸覆盖幻觉、知识 grounding、未验证产品声明等事实风险；human-like、压力风险、情绪价值、边界与隐私等软闸可要求一次改写。Reviewer 只读取生成结果和事实面，不接收 Reply Agent 的自我推理字段。开启双 Reviewer 时，第二 provider 配置不完整会导致启动失败。寒暄低风险首稿在七条件全部满足时跳过独立 Claim Gate（审计标记 `claim_gate_skipped_casual_low_risk`；rewrite/revision 与管理发送恒照跑）。发送间隔按文本长度加权：`base + 字符数 × 35ms`，封顶 `max + 6s`；间隔配置为 0/0（闸关）时恒为 0。
 
 Agent run 生命周期为：
 
@@ -130,7 +132,7 @@ specHash + specVersion + audience + intent + dispatchGeneration
 
 ### Ask-Human
 
-当 Agent 遇到折扣、承诺、敏感业务边界等决策墙时，会创建 principal escalation。决策人链、静默时段、每日 cap、去重窗口、超时转下一位等策略在创建时冻结，避免在途流程被配置变化改写。请示卡、裁决 relay 和 holding reply 都走 durable task/Outbox；决策人不可达时系统按策略延期或收口，不会悄悄放行高风险动作。
+当 Agent 遇到折扣、承诺、敏感业务边界等决策墙时，会创建 principal escalation。决策人链、静默时段、每日 cap、去重窗口、超时转下一位等策略在创建时冻结，避免在途流程被配置变化改写。请示卡、裁决 relay 和 holding reply 都走 durable task/Outbox；决策人不可达时系统按策略延期或收口，不会悄悄放行高风险动作。运营可预写**预授权底线（standing order）**：链尾无人应答超过设定时限后，预写口径被当作与领导裁决同形的决议走既有 resolve→relay 通道由 AI 转述（本质是执行人类预授权而非 AI 代决；`standing_order` 与时限双字段成对校验防静默误配）；未配置时链尾只周期安抚、不自动放行。
 
 ### Knowledge Wiki
 
@@ -170,7 +172,7 @@ Management Agent 先生成带 hash 的冻结计划，再从白名单工具目录
 
 ## 数据架构
 
-项目使用约 70 个 MongoDB collection。常用集合按领域分组如下：
+项目使用约 79 个 MongoDB collection（集合-写入方矩阵见 `project-understanding/30-global-fact-cards.md` §8）。常用集合按领域分组如下：
 
 | 领域 | 核心集合 |
 | --- | --- |
@@ -182,7 +184,7 @@ Management Agent 先生成带 hash 的冻结计划，再从白名单工具目录
 | 管理与演化 | `management_agent_sessions`, `agent_command_runs`, `agent_tool_calls`, `experiments`, `proposals`, `shadow_replays`, `threshold_overrides` |
 | 鉴权 | `admin_users`, `admin_sessions`, `auth_security_events` |
 
-启动时会按编号执行 `src/db/migrations/` 中的 56 个有序迁移，然后创建索引。部分生产数据清理或回填迁移受 `APP_ENV=production` 和 `APPROVED_MIGRATIONS` 保护；执行前应备份并核对迁移源码。
+启动时会按编号执行 `src/db/migrations/` 中的 58 个有序迁移（m001–m058），然后创建索引。部分生产数据清理或回填迁移受 `APP_ENV=production` 和 `APPROVED_MIGRATIONS` 保护；执行前应备份并核对迁移源码。
 
 > 完整功能和生产部署要求 MongoDB **replica set**。知识修订、版本发布、Evolution、Guide、Taxonomy、Provider 等路径使用多文档事务；standalone MongoDB 可能允许应用启动和简单浏览，但事务功能会在运行时失败。
 
@@ -223,7 +225,7 @@ POST {APP_BASE_URL}/webhooks/wechat
 src/main.rs             启动、静态托管和 worker 注册
 src/agent/              Gateway、Review、Memory、Outbox、发送与升级链
 src/auth/               Argon2、Mongo session、ACL、限流和可选 RS256 JWT
-src/db/                 typed collection、56 个迁移和索引
+src/db/                 typed collection、58 个迁移和索引
 src/evolution/          与生产发送副作用隔离的演化器
 src/knowledge_wiki/     Wiki、catalog、修订、反馈与自动导入
 src/knowledge_task/     可恢复的知识长任务
@@ -323,7 +325,7 @@ cargo run --release
 
 ## API 与管理端
 
-后端当前定义 231 条路由，完整事实源是 `src/routes/mod.rs`。主要域如下：
+后端当前定义 235 条路由（计数会随开发漂移，完整事实源是 `src/routes/mod.rs`）。主要域如下：
 
 ```text
 /api/auth                    登录、登出、workspace、session 和 JWT
@@ -377,6 +379,14 @@ Windows PowerShell：
 ```
 
 基线要求 `cargo test --lib` 至少 350 项通过、`RUSTFLAGS="-D warnings" cargo check --tests` 通过，并要求 `state_transition_pbt`、`memory_card_invariants`、`wiki_chunk_revision_pbt` 和 `llm_retry_jitter` 累计至少 33 项通过且无失败。
+
+金标回归环（105 条合成场景 shadow 回归，零真实发送，需真实 LLM key）：
+
+```bash
+bash scripts/quality-regression.sh
+```
+
+场景库在 `tests/fixtures/quality_gold/`（五类 × 21），断言逻辑在 `tests/quality_gold_regression.rs`（红线硬门 + judge 软门）；CI nightly `quality-gold` job 以软门运行，缺 key 时真实失败而非假绿。
 
 多数 `#[ignore]` 集成测试需要 testcontainers MongoDB，也可通过 `TEST_MONGODB_URI` 使用预置测试实例。CI 另有知识证据、租户隔离、secret、manifest 和 literal lint 等阻断门；完整 ignored suite 当前属于 `continue-on-error` 诊断 job。真实模型、动态能力和红线测试主要由 nightly workflow 执行，不能用单次本地单元测试替代。
 

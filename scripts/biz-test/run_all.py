@@ -5,12 +5,14 @@ docs/superpowers/specs/2026-06-26-full-business-logic-test-findings.md。
 
 跑法：export DEPLOY_PASS=... ADMIN_USER=... ADMIN_PASS=...; python scripts/biz-test/run_all.py
 """
+import json
 import subprocess
 import sys
 import time
 from pathlib import Path
 
 HERE = Path(__file__).parent
+BLOCKED_LEDGER = HERE.parents[1] / "target" / "biztest_blocked.jsonl"
 
 # 批 A：销售域基线（DEFAULT profile，不切全局 active）
 BATCH_A = [
@@ -24,6 +26,16 @@ BATCH_A = [
     "batch_a_domain9",      # ⑨长期记忆固化
     "batch_a_domain1011",   # ⑩管理agent编排+⑪提示词编辑红线
     "batch_a_domain13",     # ⑬知识库自治LLM群
+]
+
+# API/transaction acceptance domains. These must be part of the authoritative suite; keeping
+# them as standalone scripts only would allow Guide/Campaign/Management regressions to go green.
+BATCH_C = [
+    "batch_c_campaign",
+    "batch_c_management",
+    "batch_c_guide",
+    "batch_c_digital_twin",
+    "batch_c_evaluation",
 ]
 
 
@@ -52,6 +64,11 @@ def execute_suite(run_fn=run) -> int:
                     rc = run_fn(module)
                     if rc != 0 and overall == 0:
                         overall = rc
+                for module in BATCH_C:
+                    rc = run_fn(module)
+                    if rc != 0 and overall == 0:
+                        overall = rc
+                # Industry profiles switch the workspace-global runtime and therefore run last.
                 rc = run_fn("batch_b_industry")
                 if rc != 0 and overall == 0:
                     overall = rc
@@ -62,11 +79,30 @@ def execute_suite(run_fn=run) -> int:
     return overall
 
 
+def blocked_summary(path: Path = BLOCKED_LEDGER) -> dict:
+    rows = []
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                value = {"capability": "unreadable_blocked_record", "evidence": line[:200]}
+            rows.append(value)
+    return {"count": len(rows), "items": rows}
+
+
 def main() -> None:
+    BLOCKED_LEDGER.parent.mkdir(parents=True, exist_ok=True)
+    BLOCKED_LEDGER.unlink(missing_ok=True)
     rc = execute_suite()
+    blocked = blocked_summary()
+    status = "failed" if rc else ("passed_with_blocked" if blocked["count"] else "passed")
     print("\n全量完成。问题清单见 "
           "docs/superpowers/specs/2026-06-26-full-business-logic-test-findings.md")
-    print("逐条复核证据、按 severity 排序、标注红线预期 vs 真 bug 后再下结论。")
+    print(json.dumps({"status": status, "exitCode": rc, "blocked": blocked},
+                     ensure_ascii=False))
     raise SystemExit(rc)
 
 

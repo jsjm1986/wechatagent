@@ -14,7 +14,7 @@ use crate::evolution::lint::passes_forbidden_words;
 use crate::prompts::{
     normalize_prompt_content, DEFAULT_MODE_GATE_POLICY, DEFAULT_REPLY_FAST_TASK_REDLINE_ANCHORS,
     DEFAULT_REPLY_REDLINE_ANCHORS, DEFAULT_REPLY_SYSTEM_REDLINE_ANCHORS,
-    DEFAULT_REPLY_TASK_REDLINE_ANCHORS, DEFAULT_REVIEWER_FEWSHOT, PROMPT_EVOLUTION_FORBIDDEN_KEYS,
+    DEFAULT_REVIEWER_FEWSHOT, PROMPT_EVOLUTION_FORBIDDEN_KEYS,
 };
 use crate::routes::AppState;
 use serde_json::Value;
@@ -39,7 +39,8 @@ pub fn required_anchors(template_key: &str) -> Vec<&'static str> {
             v
         }
         "user.reply.system" => DEFAULT_REPLY_SYSTEM_REDLINE_ANCHORS.to_vec(),
-        "user.reply.task" => DEFAULT_REPLY_TASK_REDLINE_ANCHORS.to_vec(),
+        // 注：退役的完整版 `user.reply.task` 已随种子包移除退出治理面（生产零消费；
+        // 遗留 DB 行按普通话术 key 走禁用词闸）。
         "user.reply.fast.task" => DEFAULT_REPLY_FAST_TASK_REDLINE_ANCHORS.to_vec(),
         "user.review.system" => vec![DEFAULT_REVIEWER_FEWSHOT],
         _ => Vec::new(),
@@ -61,7 +62,6 @@ pub fn prompt_edit_tier(template_key: &str) -> PromptEditTier {
             "user.reply.policy"
                 | "user.reply.system"
                 | "user.review.system"
-                | "user.reply.task"
                 | "user.reply.fast.task"
         )
     {
@@ -248,12 +248,14 @@ mod tests {
             PromptEditTier::ConstrainedEditable
         );
         assert_eq!(
-            prompt_edit_tier("user.reply.task"),
-            PromptEditTier::ConstrainedEditable
-        );
-        assert_eq!(
             prompt_edit_tier("user.reply.fast.task"),
             PromptEditTier::ConstrainedEditable
+        );
+        // 退役收缩：完整版 user.reply.task 已移出种子包与治理面，遗留 DB 行按
+        // 普通话术 key 处理（仍过禁用词闸，不再要求红线锚）。
+        assert_eq!(
+            prompt_edit_tier("user.reply.task"),
+            PromptEditTier::FreelyEditable
         );
         // 禁止改：evolution critic（PROMPT_EVOLUTION_FORBIDDEN_KEYS）
         assert_eq!(
@@ -377,7 +379,6 @@ mod tests {
     #[test]
     fn reply_system_and_task_require_runtime_contract_anchors() {
         assert!(validate_prompt_edit("user.reply.system", "普通内容").is_err());
-        assert!(validate_prompt_edit("user.reply.task", "普通内容").is_err());
         assert!(validate_prompt_edit("user.reply.fast.task", "普通内容").is_err());
 
         let fast = crate::prompts::prompt_specs_for_test()

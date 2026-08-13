@@ -33,6 +33,20 @@ class RunAllSafetyTests(unittest.TestCase):
         self.assertEqual(calls[-1], "cleanup")
         self.assertIn("batch_b_industry", calls)
 
+
+    def test_blocked_summary_is_machine_readable(self) -> None:
+        import json
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "blocked.jsonl"
+            path.write_text(
+                json.dumps({"domain": "d", "capability": "vision"}) + "\n",
+                encoding="utf-8",
+            )
+            summary = run_all.blocked_summary(path)
+        self.assertEqual(summary["count"], 1)
+        self.assertEqual(summary["items"][0]["capability"], "vision")
+
     def test_final_cleanup_failure_is_returned(self) -> None:
         calls: list[str] = []
 

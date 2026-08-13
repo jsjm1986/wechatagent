@@ -22,6 +22,9 @@ pub struct InboxItem {
     pub title: String,
     pub summary: String,
     pub severity: String,
+    /// wire 上是 RFC3339 字符串或 null（inboxApi.ts 声明 string|null）；裸
+    /// bson::DateTime 直接 serde 会输出扩展 JSON 对象 `{"$date":…}` 污染契约。
+    #[serde(serialize_with = "serialize_dt_as_rfc3339")]
     pub created_at: Option<DateTime>,
     pub age_hours: f64,
     pub action_kind: String, // "inline" | "rich"
@@ -57,6 +60,20 @@ pub struct InboxItem {
     // 仅 knowledge_review 来源填充,其余来源恒 None。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub integrity_status: Option<String>,
+}
+
+/// `Option<bson::DateTime>` → RFC3339 字符串 / null（极端年份转换失败也落 null）。
+fn serialize_dt_as_rfc3339<S>(
+    value: &Option<DateTime>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match value.and_then(crate::models::dt_to_string) {
+        Some(text) => serializer.serialize_some(&text),
+        None => serializer.serialize_none(),
+    }
 }
 
 fn age_hours_of(created: Option<DateTime>, now_ms: i64) -> f64 {
@@ -1005,6 +1022,28 @@ mod tests {
         assert_eq!(v["principalWxid"], "wxid_boss");
         assert_eq!(v["category"], "discount_request");
         assert_eq!(v["accountId"], "acc1");
+    }
+
+    /// 收件箱契约：createdAt 必须是 RFC3339 字符串（inboxApi.ts 声明 string|null），
+    /// 绝不能是 bson 扩展 JSON 对象 `{"$date":…}`（同 principal_escalations 列表的
+    /// 前端崩溃形态；此处虽暂无 UI 消费，契约必须先修正）。
+    #[test]
+    fn inbox_item_created_at_serializes_as_rfc3339_string_not_extjson_object() {
+        let mut esc = test_escalation_fixture();
+        esc.created_at = DateTime::from_millis(1_700_000_000_000);
+        let item = escalation_to_inbox_item(&esc, 1_700_000_000_000);
+        let v = serde_json::to_value(&item).unwrap();
+        let created = v["createdAt"].as_str().expect("createdAt must be a string");
+        assert!(created.starts_with("2023-11-14T22:13:20"), "{created}");
+        assert!(!serde_json::to_string(&v).unwrap().contains("$date"));
+
+        // None → null（沿用可选字段语义，不省略键：createdAt 无 skip_serializing_if）。
+        let none_item = InboxItem {
+            created_at: None,
+            ..escalation_to_inbox_item(&esc, 0)
+        };
+        let v = serde_json::to_value(&none_item).unwrap();
+        assert!(v["createdAt"].is_null());
     }
 
     fn test_gap_fixture() -> crate::models::KnowledgeGapSignal {

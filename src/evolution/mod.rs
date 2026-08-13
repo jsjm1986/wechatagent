@@ -15,7 +15,6 @@
 //!
 //! FORBIDDEN dependencies: gateway / outbox / mcp / tasks / webhooks。
 
-pub mod auto_release;
 pub mod budget;
 pub mod cohort;
 pub mod envelope;
@@ -42,9 +41,7 @@ pub use self::envelope::{insert_experiment_envelope, update_experiment_status};
 pub use self::error::EvolutionError;
 
 pub mod runtime_flag;
-pub use self::runtime_flag::{
-    bucket_for_contact, is_evolution_enabled_for, load_runtime_flag, rollout_bucket_index,
-};
+pub use self::runtime_flag::{bucket_for_contact, load_runtime_flag, rollout_bucket_index};
 
 /// 演化器主循环。`EVOLUTION_ENABLED=false`（运维硬锁定）时立即 return；为 true 时
 /// 进常驻 tick 循环，实际是否产出由 mongo runtime flag（UI 总开关）每 tick 决定。
@@ -61,7 +58,7 @@ pub async fn run_evolutionary_worker(state: AppState) {
     let tick_seconds = state.config.evolution_tick_seconds.max(60);
     tracing::info!(
         tick_seconds,
-        "evolution worker starting (M4 W1 skeleton — empty tick by design)"
+        "evolution worker starting (full pipeline: cohort → critic → replay → significance)"
     );
     let mut ticker = interval(Duration::from_secs(tick_seconds));
     loop {
@@ -226,9 +223,12 @@ pub async fn run_one_tick(
         .map_err(EvolutionError::from)?;
 
     // 6. M4 W3：shadow replay + 显著性聚合。
-    //    pending_eval 候选驱动；budget 在 prompt critic 阶段已记录消耗，replay
-    //    现阶段 threshold 不调 LLM、prompt 走 placeholder failed，所以这里不会
-    //    再触发 BudgetExceeded。
+    //    pending_eval 候选驱动。threshold 候选纯重判不调 LLM；prompt 候选经
+    //    `replay::eval_all` → `prompt_shadow::shadow_replay_prompt_one` 跑真实
+    //    Reply+Review 影子演练（调 LLM，但消耗不回写 EvolutionBudget——budget
+    //    是 mut 借用无法跨 replay task 计量，eval_all 只做 exhausted() 静态
+    //    预检，超额的 replay 直接落 failed 文档、不向上抛）。因此下方
+    //    BudgetExceeded 分支是防御性兜底，当前 eval_all 不产生该错误。
     let pending_count = threshold_proposals
         .iter()
         .chain(prompt_proposals.iter())
@@ -296,19 +296,9 @@ pub async fn run_one_tick(
             0
         });
 
-    // 9. 历史 threshold auto-release 接点。HC-017 当前政策硬闸恒关，因此立即
-    //    return 0；保留调用只为未来按类型+方向白名单启用时复用既有评估代码。
-    //    rollback 永远由 admin 手工。
-    let auto_released =
-        auto_release::auto_release_eligible_thresholds(state, workspace_id, account_id)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(
-                    ?e,
-                    "auto_release_eligible_thresholds failed; will retry next tick"
-                );
-                0
-            });
+    // （终裁 10-x 清理）：历史 threshold auto-release 接点已删除——HC-017 政策
+    // 硬闸恒关使其成为永不可达的自动发布通道；release/rollback 唯一路径是
+    // routes/evolution.rs 的管理员显式操作。
 
     write_tick_completed_event(
         state,
@@ -323,7 +313,6 @@ pub async fn run_one_tick(
         eligible_count,
         rejected_after_eval,
         post_release_completed,
-        auto_released,
     )
     .await?;
     Ok(())
@@ -380,6 +369,7 @@ async fn write_budget_exceeded_event(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn write_tick_completed_event(
     state: &AppState,
     workspace_id: &str,
@@ -393,7 +383,6 @@ async fn write_tick_completed_event(
     proposals_eligible_count: usize,
     proposals_rejected_count: usize,
     post_release_reviews_completed: usize,
-    auto_released_count: usize,
 ) -> Result<(), EvolutionError> {
     let event = crate::models::AgentEvent {
         id: None,
@@ -403,7 +392,7 @@ async fn write_tick_completed_event(
         kind: "evolution_tick_completed".to_string(),
         status: "ok".to_string(),
         summary: format!(
-            "evolution tick completed (threshold_cohort={threshold_count}, prompt_cohort={prompt_count}, threshold_proposals={threshold_proposals}, prompt_proposals={prompt_proposals}, eligible={proposals_eligible_count}, rejected={proposals_rejected_count}, post_release_reviews_completed={post_release_reviews_completed}, auto_released={auto_released_count})"
+            "evolution tick completed (threshold_cohort={threshold_count}, prompt_cohort={prompt_count}, threshold_proposals={threshold_proposals}, prompt_proposals={prompt_proposals}, eligible={proposals_eligible_count}, rejected={proposals_rejected_count}, post_release_reviews_completed={post_release_reviews_completed})"
         ),
         details: Some(doc! {
             "experiment_id": exp_id,
@@ -415,7 +404,6 @@ async fn write_tick_completed_event(
             "proposals_eligible_count": proposals_eligible_count as i32,
             "proposals_rejected_count": proposals_rejected_count as i32,
             "post_release_reviews_completed": post_release_reviews_completed as i32,
-            "auto_released_count": auto_released_count as i32,
         }),
         created_at: DateTime::now(),
         dedupe_key: None,
@@ -471,7 +459,6 @@ mod isolation_contract_tests {
     use std::path::PathBuf;
 
     const EXPECTED_MODULES: &[&str] = &[
-        "auto_release.rs",
         "budget.rs",
         "cohort.rs",
         "envelope.rs",
@@ -552,6 +539,10 @@ mod isolation_contract_tests {
     fn agent_bridge_dependencies_are_closed_and_reviewed() {
         let allowed: HashSet<&str> = [
             "crate::agent::domain_profile",
+            // H2 换血：结果三态分类器单一真相源（纯函数模块，零发送链依赖）——
+            // significance / post_release 按 run_id join 真实用户反应后经它判
+            // Hit / Block / Censored。
+            "crate::agent::outcome_label",
             "crate::agent::prompt_shadow",
             "crate::agent::run_envelope",
             "crate::agent::runtime",

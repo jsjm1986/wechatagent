@@ -1,5 +1,7 @@
 # 运营知识库 wiki-style 方法论（knowledge-wiki）
 
+> 2026-08-13 核对：修正 catalog 重建节奏与声明字段族现状两处；其余与代码一致。
+
 本文是知识库子系统的"方法论 + 决策表 + lifecycle"参考。日常运维 / 写新 chunk / 设计行业 schema 时先翻这里。设计动机与当时的 LLW 借鉴清单见 [`docs/agent-policy.md` §运营知识库 wiki-style 方法论](agent-policy.md#运营知识库-wiki-style-方法论knowledge-wiki)；后端字段 / 路由 / 索引 / 集合定义见 [`docs/data-and-api.md` §knowledge-wiki](data-and-api.md#knowledge-wiki-子系统phase-a-g)。
 
 ## 1. 为什么不是销售话术 RAG
@@ -136,7 +138,9 @@ block，沉默/pending 作为删失不进分母；显式关闭 `DYNAMIC_CONFIDEN
 
 ## 9. 行业可配 schema（domain_schemas）
 
-> **2026-05-25 收敛**：`Contact` 和 `OperationKnowledgeChunk` 主表的销售域专属字段（旧版的 `customer_stage / intent_level / objection_type / routing_card / safe_claims / forbidden_claims / evidence_items ...`）已全量下沉到各自的 `domain_attributes: bson::Document` 子文档，由 active `DomainSchema` 在落库时校验。换行业 = 切 schema，不动 chunk / contact 主表代码。
+> **2026-05-25 收敛**：`Contact` 和 `OperationKnowledgeChunk` 主表的销售域专属字段（旧版的 `customer_stage / intent_level / objection_type` 等）已下沉到各自的 `domain_attributes: bson::Document` 子文档，由 active `DomainSchema` 在落库时校验。换行业 = 切 schema，不动 chunk / contact 主表代码。
+>
+> **声明字段族补注（2026-08-13 S5-7 裁决）**：`routing_card / safe_claims / forbidden_claims / evidence_items` 并非简单"下沉"——typed 模型已不含它们，user-ops 主链不消费（被分数闸 + R5.4 取代），但 chat/repair/catalog 链仍活跃（prompt 仍要求输出、`src/routes/knowledge/catalog.rs` 生产查询文档级 `evidence_items` 字段）。跨链路口径分叉被显式保留；删改前必须核 chat/repair/catalog 三处消费。
 
 `domain_schemas` 让产品在不同行业用同一份 chunk 主表，`active=true` 一条 / workspace。chunk 与 contact 写入时按 active schema 校验各自的 `domain_attributes`：
 
@@ -162,7 +166,7 @@ block，沉默/pending 作为删失不进分母；显式关闭 `DYNAMIC_CONFIDEN
 | `GET /operation-knowledge/catalog/persisted` | `documents.catalog_summary_persisted` 落库快照 + `dynamic_confidence` 排序 | O(N 文档读) | 生产路径默认；前端列表 / 召回 router 拉 catalog |
 | `GET /operation-knowledge/catalog` (live) | 实时聚合 N × M chunk | O(N × M) | ops debug / 对账 / 新建 chunk 后立刻看效果 |
 
-写 chunk 后 < 3 s 内 catalog/persisted 反映新数据（`apply_chunk_revision` 写完即 enqueue `catalog_rebuild_jobs`，worker 200 ms 一轮消费）。catalog rebuild 失败 3 次 → `job.status=failed` + 写 `last_error`；feedback worker 周期捞 failed 重试一次。
+写 chunk 后约一个 worker tick 内 catalog/persisted 反映新数据（`apply_chunk_revision` 写完即 enqueue `catalog_rebuild_jobs`，worker 默认每 3 s 一轮消费——`CATALOG_REBUILD_WORKER_INTERVAL_SECONDS=3`，0 = 停）。catalog rebuild 失败 3 次 → `job.status=failed` + 写 `last_error`；feedback worker 周期捞 failed 重试一次。
 
 ## 11. 删除级联
 

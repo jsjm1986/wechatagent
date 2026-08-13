@@ -350,9 +350,9 @@ impl Database {
     }
 
     /// Phase C / C3：`evolution_runtime_flags` 集合 typed accessor。
-    /// 运行时演化器开关 + 灰度比例（0..=100）。`evolution::is_evolution_enabled_for`
-    /// 读这条文档计算 `hash(contact_id) % 100 < rollout_percent`。同一 workspace
-    /// 单条文档；不存在时按"关停态"处理。
+    /// 运行时演化器开关 + 灰度比例（0..=100）。由 `evolution::runtime_flag` 读取，
+    /// 灰度分桶在 cohort 过滤侧生效（`hash(contact_id) % 100 < rollout_percent`）。
+    /// 同一 workspace 单条文档；不存在时按"关停态"处理。
     pub fn evolution_runtime_flags(&self) -> Collection<crate::models::EvolutionRuntimeFlag> {
         self.db.collection("evolution_runtime_flags")
     }

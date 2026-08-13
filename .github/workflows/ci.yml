@@ -1574,3 +1574,68 @@ jobs:
         env:
           REAL_LLM_LEDGER: target/real_llm_ledger
         run: python3 scripts/check-capability-outcomes.py
+
+  quality-gold:
+    name: Quality gold regression (金标回归环 / shadow 零发送)
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.dispatch_target == 'nightly_full') }}
+    # 串行链末端（守 rsxermu 并发上限，见 real-llm-recall 注释）；软门起步。
+    needs: real-llm-redline
+    continue-on-error: true
+    timeout-minutes: 120
+    env:
+      REAL_LLM_API_KEY: ${{ secrets.RSXERMU_KEY }}
+    steps:
+      - name: Require REAL_LLM_API_KEY (缺 key 真 fail，不假绿)
+        if: ${{ env.REAL_LLM_API_KEY == '' }}
+        run: |
+          echo "::error::REAL_LLM_API_KEY 未配置（secrets.RSXERMU_KEY 为空）。金标回归环必须有 key 才能真跑——缺 key 直接 fail，不静默跳过假绿。"
+          exit 1
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 同 integration/real-llm job：清预装 SDK 腾 ~30GB，防 target + mongo 镜像撑爆磁盘。
+      - name: Free disk space
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /usr/local/share/boost /usr/local/share/powershell \
+            /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force || true
+          df -h
+
+      - name: Install Rust toolchain
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry / target
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        uses: Swatinem/rust-cache@v2
+
+      # rust-cache 可能带回旧 ledger；清空防陈旧运行被当成本次证据。
+      - name: Reset quality gold ledger
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        run: rm -rf target/quality_gold && mkdir -p target/quality_gold
+
+      # 一键入口自带 env fail-fast 与汇总输出。RUSTFLAGS 置空同 real-llm job 理由
+      # （测试目标陈年 warning 不阻断真实跑测）。
+      - name: Run quality gold regression (scripts/quality-regression.sh)
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        env:
+          RUSTFLAGS: ""
+          RUST_MIN_STACK: "8388608"
+          # provider 由 repository variables 显式给定（或合并时按 real-llm job 字面值内联）。
+          REAL_LLM_BASE_URL: ${{ vars.REAL_LLM_BASE_URL }}
+          REAL_LLM_MODEL: ${{ vars.REAL_LLM_MODEL }}
+          REAL_LLM_FORMAT: openai
+        run: bash scripts/quality-regression.sh
+
+      # ledger 是软门升级决策的原始证据（≥3 次运行方差评估），恒上传。
+      - name: Upload quality gold ledger
+        if: ${{ always() && env.REAL_LLM_API_KEY != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: quality-gold-ledger
+          path: target/quality_gold/
+          if-no-files-found: ignore
+          retention-days: 30

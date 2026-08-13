@@ -26,3 +26,4 @@ __pycache__/
 /scripts/e2e/
 /kb_backup_local/
 website.zip
+/.worktrees/

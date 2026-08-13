@@ -57,27 +57,32 @@ scripts/check-baseline.ps1             # Windows / PowerShell
 scripts/check-baseline.sh              # Linux / CI
 ```
 
-Configuration is via `.env` (copy from `.env.example`). Required at startup: `MCP_API_KEY`, `OPENAI_API_KEY`. All other vars have defaults in `src/config.rs` (LLM retry/timeout, task worker interval, webhook rate limit, claim timeouts, etc.). The shell here is bash on Windows — use Unix paths and forward slashes; the project root contains non-ASCII characters (`工作项目`), so prefer absolute paths via the tooling rather than `cd`.
+Configuration is via `.env` (copy from `.env.example`). Required at startup: `MCP_API_KEY`, `OPENAI_API_KEY`. All other vars have defaults in `src/config.rs` (LLM retry/timeout, task worker interval, webhook rate limit, claim timeouts, etc.). 开发环境以会话运行时信息为准（2026-08-13 时点为 macOS + zsh），不要假设 Windows；项目根目录含非 ASCII 字符（`开发项目`），优先用工具的绝对路径而非 `cd`。
 
 ## Test baseline (do not regress)
 
 `scripts/check-baseline.{sh,ps1}` is the merge gate, defined in `.kiro/specs/agent-autonomy-loop/requirements.md` R11.6. It enforces:
 
-- `cargo test --lib`: **≥ 350 passed, 0 failed** (knowledge-cleanup 后基线，与 `scripts/check-baseline.{sh:25,ps1:17}` `LIB_BASELINE=350` 同步)
-- Cumulative across these four PBT files: **≥ 33 passed, 0 failed**
+- `cargo test --lib`: **≥ 350 passed, 0 failed**（门槛值，与 `scripts/check-baseline.{sh,ps1}` 中的 `LIB_BASELINE=350` 同步——脚本行号会漂移，以变量名为准）。当前实际通过数约 **2562**（2026-08-13 优化波次后），远高于门槛；新工作只加不减。
+- Cumulative across these four PBT files: **≥ 33 passed, 0 failed**（当前实际约 41）
   - `state_transition_pbt`, `memory_card_invariants`, `wiki_chunk_revision_pbt`, `llm_retry_jitter`
 
 Either threshold failing or any failure → `exit 1`. New work should add tests, not lower these numbers. The `coreFacts` field must keep deserializing the legacy `Vec<String>` form for backward compat (R11).
 
-A second merge gate is `scripts/check-no-human-takeover.{sh,ps1}` — a CI lint that scans `git diff` newly-added lines under `src/agent/`, `src/routes/`, `src/evolution/`, `frontend/src/` for forbidden words (`human[_ -]?takeover|takeover|hand[ -]?off|人工接管|人工介入|人工托管|接管|人工`). Tests directories are excluded. The lint enforces the AI-autonomous positioning at the literal string level — pick AI-internal status names and labels (e.g. "AI 策略主动暂缓 / 安全门拦截 / AI 等待更多上下文"), never "人工接管 / takeover / hand-off".
+A second merge gate is `scripts/check-no-human-takeover.{sh,ps1}` — a CI lint that scans `git diff` newly-added lines under `src/agent/`, `src/routes/`, `src/evolution/`, `frontend/src/` for forbidden words (`human[_ -]?takeover|takeover|hand[_ -]?off|人工接管|人工介入|人工托管|接管|人工`). Tests directories are excluded. The lint enforces the AI-autonomous positioning at the literal string level — pick AI-internal status names and labels (e.g. "AI 策略主动暂缓 / 安全门拦截 / AI 等待更多上下文"), never "人工接管 / takeover / hand-off".
 
 Most integration tests under `tests/` are `#[ignore]` by default and require Docker (testcontainers MongoDB). `cargo test` will compile them but skip ignored tests; run explicitly via `cargo test --test <name> -- --ignored` when Docker is available.
 
 **Local vs CI split (disk-space discipline).** The dev disk is small and compiling the 100+ integration test binaries (`pdf-extract` / `feed-rs` / `scraper` / `jsonwebtoken` pull a large `target/`) plus pulling the `mongo` image routinely fills it (`os error 112` / `no space left on device`). So locally run only the cheap, small-footprint suites: `cargo test --lib` and individual PBT files (`cargo test --test <name>`). Leave the full `--ignored` integration suite to GitHub CI — `.github/workflows/ci.yml`'s `integration` job frees ~30GB of pre-installed SDKs before building, which a local machine can't. Every push to `main` / PR runs both the baseline gate and integration job, so committed work is always exercised on CI. When the local disk does fill, delete `target/debug/incremental` first (regenerated automatically, several GB, no dependency rebuild) before any heavier cleanup.
 
+## Project-understanding 档案与金标回归（事实性导航）
+
+- `project-understanding/` 存有 2026-08-13 全仓深读档案：`29-doc-code-divergence-master.md`（71 条"文档声称 X、代码实际 Y"偏差权威底单，含按误导源文件的反向索引）、`30-global-fact-cards.md`（闭集/阈值/幂等键/worker/prompt key 单一速查）、`28-crosscheck-tests-vs-prod.md`（无测试守护清单）及 19 份逐行深读记录；根目录 `PROJECT_UNDERSTANDING_LEDGER.md` 为总台账（含各优化波次追记，是新事实的权威）。台账内"改动前使用顺序"节给出查阅顺序：30 号速查 → 29 号反向索引 → 28 号 §4 → 对应深读记录 → 终裁记录 → 任何 file:line 动手前当场重验。
+- 金标回归环：`bash scripts/quality-regression.sh` 一键对 105 条合成场景（`tests/fixtures/quality_gold/`，五类 × 21）做 shadow 回归（`tests/quality_gold_regression.rs`，零真实发送；红线硬门 + judge 软门）；CI nightly `quality-gold` job 以软门运行。
+
 ## Architecture (big picture)
 
-Single Rust process: hosts the admin SPA, exposes the JSON API under `/api`, receives WeChat callbacks at `POST /webhooks/wechat`, and runs the follow-up task worker in a background `tokio::spawn`.
+Single Rust process: hosts the admin SPA, exposes the JSON API under `/api`, receives WeChat callbacks at `POST /webhooks/wechat`, and runs **16 个 supervised 后台 worker**（名单见 `src/supervisor.rs` `SUPERVISED_WORKERS`：task worker、inbound reply worker、outbox dispatcher、post-decision 投影等；其中 6 个由默认关闭的 env flag 控制——strategic_planner / cold_contact / silence_signal / evolutionary / knowledge_digest / ingest）.
 
 ```
 React Admin (frontend/, served from frontend/dist)
@@ -87,12 +92,14 @@ Rust Axum (src/main.rs → src/lib.rs)
   │   └── chunk_locks.rs  WebSocket soft-lock + broadcast bus for collaborative chunk editing (P1-4)
   ├── webhooks.rs    POST /webhooks/wechat — parses payload, persists inbound, gates Agent
   ├── tasks.rs       follow-up task worker loop (interval = TASK_WORKER_INTERVAL_SECONDS)
+  ├── supervisor.rs  16 个后台 worker 的熔断监督（SUPERVISED_WORKERS；panic 退避 + 熔断 open/half_open）
   ├── agent/         user-ops Agent (decision → review → send) — see below
+  ├── evolution/     自演化子系统（EVOLUTION_ENABLED 默认 false；与发送链物理隔离，release 恒人工）
   ├── auth/          session cookie + Argon2; auth/jwt.rs = RS256 Bearer issue/verify (P1-7, gated by JWT_ENABLED)
   ├── knowledge_wiki/ knowledge subsystem; ingest_worker.rs = auto-ingest RSS/HTML loop (P1-6, gated by INGEST_WORKER_ENABLED)
   ├── prompts.rs     prompt pack v2 + ensure_prompt_pack_v2 (seeded at startup)
   ├── llm.rs         OpenAI-compatible client w/ retry/jitter, usage tracking, token-level streaming SSE (P1-3)
-  ├── mcp.rs         MCP JSON-RPC client (account/contact/message_send_text)
+  ├── mcp.rs         MCP JSON-RPC 通用工具客户端（发送类工具调用只允许出现在 outbox dispatcher——CI delivery-protocol job 锁定）
   ├── db/            Mongo connect + ensure_indexes + migrations
   └── models.rs      All BSON-serde structs (very large; one file by convention)
 ```
@@ -108,10 +115,10 @@ Phase G P1 additions (multi-tenant workspace, graph community layout, token-leve
 | `types` | internal contracts: `AgentDecision`, `DecisionReviewResult`, `KnowledgeRouteResult`, `AgentTrigger` |
 | `runtime` | `UserRuntimeParameters` strongly-typed run params |
 | `budget` | `RunBudget` task-local LLM token/call counter (MP-5) |
-| `guards` | state-machine transitions, string-level fact-risk, knowledge-grounding checks |
+| `guards` | state-machine transition legality + state-action policy（字符串级 fact-risk / knowledge 守卫已于 2026-05-25 删除，见 `guards.rs` 头注；评分闸在 `review/gates.rs`） |
 | `memory` | long-term memoryCard consolidation (MP-8) |
 | `reaction` | user-reaction analysis with claim lock (HP-3) |
-| `knowledge_router` | catalog → search → open_slice tool-calling planner (MP-9) |
+| `knowledge_router` | gateway 决策前的知识预路由（多轮 catalog → search → open_slice 循环在路由内部执行，MP-9） |
 | `decision` | Reply Agent main decision + initial profile generation |
 | `review` | Independent Review Agent + revision flow (MP-10) |
 | `gateway` | unified send gateway, `run_user_operation_gateway`, `handle_managed_message`, `handle_follow_up_task` |
@@ -119,6 +126,8 @@ Phase G P1 additions (multi-tenant workspace, graph community layout, token-leve
 | `simulation` | shadow-mode `simulate_user_dialogue` |
 | `taxonomy` | dual-layer tagging (`system_taxonomies` + `taxonomy_candidates`) |
 | `run_envelope` | single-run envelope/log shape |
+
+表为节选，完整子模块清单以 `src/agent/mod.rs` 为准——另有 `outbox_dispatcher`（发送状态机+二次安全门）、`escalation/`（幕后请示通道）、`quiet_hours`、`pacing`（长度加权发送间隔）、`post_decision`（发送后投影）、`knowledge_agent`、`chat_tool_loop` 等。
 
 Every send (webhook auto-reply AND follow-up tasks) flows through the **same gateway**: reload context → check `managed`/cooldown/min-interval/daily cap/expiry → Reply Agent → independent Review → optionally one revision → outbox → MCP `message_send_text`. Bypassing the gateway is a bug.
 
@@ -131,11 +140,14 @@ POST /webhooks/wechat
   → parse appId / fromWxid / content / msgId
   → resolve account + contact, write inbound to conversation_messages
   → if contact.agent_status != "managed": stop here (only persist, don't reply)
-  → run_user_operation_gateway(...)  // decision + review + send
+  → materialize durable `inbound_reply` task（静默时段 defer 到 next_wake_at；显式交易意向可豁免
+    defer——quiet_hours.rs `bypass_deferral_for_explicit_buying_intent`）
+  → task worker 认领任务（非静默时 webhook 另 spawn 低延迟唤醒）
+      → run_user_operation_gateway(...)  // decision + review + send
   → write events / outcome metrics / decision review / run log
 ```
 
-Only contacts with `agent_status = "managed"` get auto-replies. `normal` contacts are persisted only.
+注意：webhook handler 本身**不同步执行 Agent**——它只落库并物化 durable 任务，决策执行在 task worker 层（崩溃后任务可恢复）。Only contacts with `agent_status = "managed"` get auto-replies. `normal` contacts are persisted only.
 
 ### MongoDB layer (`src/db/`)
 
@@ -145,8 +157,8 @@ Only contacts with `agent_status = "managed"` get auto-replies. `normal` contact
 
 These are enforced by `guards/`, `review/`, and the gateway. Removing any of them is almost certainly wrong — re-read `docs/agent-policy.md` and `.kiro/specs/agent-autonomy-loop/requirements.md` first.
 
-- Auto-send is gated by methodology thresholds — current rules: `FactRisk ≥ 6` block, `PressureRisk ≥ 7` block, `HumanLikeScore < 6` rewrite once, `EmotionalValue < 6` rewrite once, `ProductAccuracyScore < 7` block product-claim sends.
-- Product claims must be backed by **verified knowledge** in `operation_knowledge_chunks`; otherwise `blocked_unverified_product_claim`.
+- Auto-send is gated by the Review **评分闸体系**（2026-05-25 起替代字符串守卫；判定在 `src/agent/review/gates.rs`，阈值默认在 `RuntimeParametersTyped` 且 runtime 可覆盖）：`hallucinationScore`（wire alias `factRisk`）**≥ 6 硬拦**、`knowledgeGroundingScore`（alias `productAccuracy`）**< 7 硬拦**（情感域可条件旁路，DEFAULT 恒判）；`pressureRisk ≥ 7`、`humanLike < 6`、`emotionalValue < 6`、`boundaryPrivacySafety ≤ 3` 为**软闸**，合并触发一次 single-shot revision（pressure 是软闸、生产不产 block 终态）。wire 别名映射见 `src/agent/runtime.rs`：`fact_risk_block_at` 实际承载 hallucination 阈值、`product_accuracy_block_below` 实际承载 knowledge_grounding 阈值——按字面名调参会调错。
+- Product claims 走 R5.4 **三路背书取或**：verified knowledge（`operation_knowledge_chunks`）∪ 产品目录结构化定价（priced_from_catalog）∪ 领导授权豁免（principal_product_exempted）；三者皆空才 `blocked_unverified_product_claim`。
 - `operation_state` is **derived from the normalized `customer_stage`** at the gateway write site (C2 — same canonical id space, m006), so the two fields never drift; it falls back to the decision's own `operation_state` only when no `customer_stage` is present. The synced value goes through `check_state_transition` against the state-machine dictionary (`operation_domain_configs`). This is **fail-soft**: an illegal transition does NOT block the reply (already sent) — it skips the `operation_state` write (keeps the old state) and emits an `agent.operation_state_transition_rejected` audit event. Agents do not invent new state keys. The engine reads `initial` / `allowFromAny` / `allowedFrom` flags from the state machine, so it is industry-agnostic (DEFAULT sales profile marks only `new_contact` as `initial`).
 - **Dual-layer tagging**: `customer_stage` / `intent_level` / `objection_type` must come from `system_taxonomies`. Free-form ideas go to `agent_generated_signals` and `taxonomy_candidates` for admin review; unreviewed candidates **must not** block runs.
 - Each run has a token/call budget (`RunBudget`). Exceeding it returns `AppError::BudgetExceeded` and the gateway falls back (e.g. `local_decision_review`, skip rewrite). Don't surface this as a 5xx to webhook callers.
@@ -155,13 +167,13 @@ These are enforced by `guards/`, `review/`, and the gateway. Removing any of the
 
 ## Prompt + knowledge conventions
 
-Prompts are layered (Soul → System Contract → Policy → Business Context → Operator Instruction) and versioned in `prompt_templates` / `agent_souls` / `operation_playbooks`. Run logs record `promptVersions`. `prompts::ensure_prompt_pack_v2` seeds the v2 default pack at startup. The `reset-system-pack` route physically deletes and re-seeds — it is an explicit maintenance action, **not** an idempotent every-startup overwrite (would clobber operator edits).
+Prompts are layered (Soul → System Contract → Policy → Business Context → Operator Instruction) and versioned in `prompt_templates` / `agent_souls` / `operation_playbooks`. Run logs record `promptVersions`. `prompts::ensure_prompt_pack_v2` seeds the v2 default pack at startup. The `reset-system-pack` route physically deletes and re-seeds `prompt_templates` / `operation_playbooks` / `operation_domain_configs`（Soul 例外：不可变历史保留，以追加新内置版本 + 原子指针切换方式恢复，见 `prompts.rs::reset_prompt_pack_v2_as_actor`）— it is an explicit maintenance action, **not** an idempotent every-startup overwrite (would clobber operator edits).
 
-Knowledge is progressive-disclosure: catalog → list_chunks → open_slice via tool-calling, not a single "stuff everything in the prompt" call. The router lives in `agent/knowledge_router.rs`.
+Knowledge is progressive-disclosure（catalog → search → open_slice），但注意归属：user-ops 主决策是**单发**调用、不带工具中间轮（LLM 误吐 `tool_calling` 相位会被 gateway 强制转 final 并记 degraded）；知识由 gateway 在决策**前**经 `agent/knowledge_router.rs` 预路由，多轮工具循环发生在路由内部（`knowledge_agent`）。catalog → search → open_slice 的 tool-calling 循环形态服务于管理台 chat（`agent/chat_tool_loop.rs`，永不写库、不进 outbox）。
 
 ## Specs and roadmap
 
-- Active specs: `.kiro/specs/agent-autonomy-loop/` (current wave) and `.kiro/specs/user-ops-agent-hardening/`. Each has `requirements.md`, `design.md`, `tasks.md`. Read the requirements before changing behavior the spec covers.
+- `.kiro/specs/` 三大 spec（agent-autonomy-loop / user-ops-agent-hardening / agent-self-evolution）**均已 sunset**（各文件头部有 notice；notice 自身"3 闸 enforce_*"的描述是中间态，现行闸门以 `src/agent/review/gates.rs` 分数闸为准）。任务完成状态的唯一权威是 `.kiro/specs/task-status-manifest.json`——历史 markdown `[x]` 勾选不可信。读任何 spec 前先对照 `project-understanding/29-doc-code-divergence-master.md` 的反向索引防误导。
 - Product/architecture docs live in `docs/`; `docs/README.md` lists the reading order. New top-level product modules update `docs/product-modules.md` first; new automation behaviors update `docs/agent-policy.md` first; new backend capabilities update `docs/architecture.md` and `docs/data-and-api.md` first.
 
 ## Frontend notes

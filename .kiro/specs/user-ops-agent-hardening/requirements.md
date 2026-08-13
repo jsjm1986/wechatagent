@@ -8,6 +8,19 @@
 > 已在 knowledge-cleanup 中下线。运行时收敛为 3 闸（`enforce_knowledge_grounding /
 > enforce_hallucination / enforce_run_budget`，见 `src/agent/guards.rs`），
 > 销售域字段下沉到 `domain_attributes` + `DomainSchema`。本 spec 保留作历史档案。
+>
+> **2026-08-13 现状注记（追加，不改写正文；历史存档原则）**：① 上方 notice 中"收敛为 3 闸
+> `enforce_*`（见 `src/agent/guards.rs`）"是中间态描述，`enforce_*` 函数已不存在；现行为分数闸
+> 体系（hallucination ≥6 / knowledge_grounding <7 两硬拦 + humanLike / emotionalValue / pressureRisk
+> 三软闸 single-shot revision），入口 `src/agent/review/gates.rs`，现状叙述以 `docs/agent-policy.md`
+> 顶注为准。② R8 的双不变量（coreFacts cap=6 与 R8.7"未 discarded 的初始集合最终 ⊇ S"）在
+> |S|>6 时数学上不可同时满足——spec 措辞保留作历史；实现已升级为"容量淘汰迁入 recentFacts +
+> `extra.coreFactEvictions` 有界审计"（不再静默丢弃，SR-182 处置）。③ R19.2 的指标名
+> `human_handoff_success_rate` 属"全自治"定位收紧之前的历史措辞，按字面实现会被
+> `scripts/check-no-human-takeover.sh` CI lint 拦截，新实现须改用 AI-internal 命名。④ 任务真实
+> 交付状态以 `../task-status-manifest.json` 为唯一权威（见 tasks.md 顶注）。正文逐条偏差见
+> `project-understanding/29-doc-code-divergence-master.md`（§2.2 反向索引），闭集/阈值速查见
+> `project-understanding/30-global-fact-cards.md`。
 
 ## Introduction
 

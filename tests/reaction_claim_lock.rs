@@ -335,7 +335,7 @@ async fn reaction_redline_stale_owner_cannot_overwrite_or_cancel_after_reclaim()
         record_user_reaction(
             &stale_state,
             &stale_contact,
-            &inbound(wxid, "inbound-stale", "不要再联系我"),
+            &inbound(wxid, "inbound-stale", "最近消息有点频繁，先缓一缓"),
         )
         .await
     });
@@ -441,6 +441,170 @@ async fn reaction_redline_stale_owner_cannot_overwrite_or_cancel_after_reclaim()
         "stale stop result must not cancel pending delivery intents"
     );
     assert_eq!(provider.calls(), 2);
+
+    app.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn explicit_buying_floor_is_claim_scoped_transaction_only_and_zero_llm() {
+    let app = common::TestApp::start().await;
+
+    // Transaction profile + exact sent predecessor: classify without model variance, but through
+    // the production claim/CAS path and without creating any deal/payment fact.
+    let (buyer, buyer_review_id) =
+        seed_contact_and_review(&app.state, "reaction_explicit_buyer").await;
+    record_user_reaction(
+        &app.state,
+        &buyer,
+        &inbound(
+            "reaction_explicit_buyer",
+            "inbound-explicit-buy",
+            "可以现在就报名付款吗？我要买",
+        ),
+    )
+    .await
+    .expect("deterministic buying reaction");
+    assert_eq!(
+        app.llm.calls(),
+        0,
+        "explicit buying floor must not call the LLM"
+    );
+    let buyer_review = app
+        .state
+        .db
+        .decision_reviews()
+        .find_one(doc! { "_id": buyer_review_id }, None)
+        .await
+        .expect("read buyer review")
+        .expect("buyer review exists");
+    assert_eq!(
+        buyer_review.outcome_status.as_deref(),
+        Some("user_replied_buying_signal")
+    );
+    assert_eq!(buyer_review.reaction_claim_generation, 1);
+    assert_eq!(
+        buyer_review.reaction_analysis.get_bool("deterministic"),
+        Ok(true)
+    );
+    assert!(buyer_review.reaction_analysis.get("dealVerified").is_none());
+    assert!(buyer_review
+        .reaction_analysis
+        .get("paymentVerified")
+        .is_none());
+
+    // No sent predecessor means there is nothing to classify. The phrase alone must not create a
+    // review, trajectory, deal, or model call.
+    let no_predecessor = managed_contact("reaction_buy_without_predecessor");
+    app.state
+        .db
+        .contacts()
+        .insert_one(&no_predecessor, None)
+        .await
+        .expect("insert no-predecessor contact");
+    record_user_reaction(
+        &app.state,
+        &no_predecessor,
+        &inbound(
+            "reaction_buy_without_predecessor",
+            "inbound-buy-no-review",
+            "我要买，现在付款",
+        ),
+    )
+    .await
+    .expect("no predecessor is a no-op");
+    assert_eq!(app.llm.calls(), 0);
+    assert_eq!(
+        app.state
+            .db
+            .decision_reviews()
+            .count_documents(
+                doc! { "contact_wxid": "reaction_buy_without_predecessor" },
+                None,
+            )
+            .await
+            .expect("count no-predecessor reviews"),
+        0
+    );
+    let no_predecessor_after = app
+        .state
+        .db
+        .contacts()
+        .find_one(doc! { "_id": no_predecessor.id }, None)
+        .await
+        .expect("read no-predecessor contact")
+        .expect("no-predecessor contact exists");
+    assert!(no_predecessor_after.intent_trajectory.is_empty());
+
+    // Negated language stays on the model path instead of being hard-coded as a buying signal.
+    let (negated, negated_review_id) =
+        seed_contact_and_review(&app.state, "reaction_negated_buyer").await;
+    app.llm
+        .push_response(json!({ "outcomeStatus": "user_replied_continue_exploring" }));
+    record_user_reaction(
+        &app.state,
+        &negated,
+        &inbound(
+            "reaction_negated_buyer",
+            "inbound-negated-buy",
+            "我先不买，也不要帮我下单",
+        ),
+    )
+    .await
+    .expect("negated buying reaction uses model");
+    assert_eq!(app.llm.calls(), 1);
+    let negated_review = app
+        .state
+        .db
+        .decision_reviews()
+        .find_one(doc! { "_id": negated_review_id }, None)
+        .await
+        .expect("read negated review")
+        .expect("negated review exists");
+    assert_eq!(
+        negated_review.outcome_status.as_deref(),
+        Some("user_replied_continue_exploring")
+    );
+    assert_ne!(
+        negated_review.reaction_analysis.get_bool("deterministic"),
+        Ok(true)
+    );
+
+    // The complete emotional template disables transaction facts. The same literal words must
+    // remain domain-modelled and consume the queued LLM response rather than the sales floor.
+    common::roleplay_fixtures::seed_emotional_companion_profile_in_workspace(&app, "default").await;
+    let (companion, companion_review_id) =
+        seed_contact_and_review(&app.state, "reaction_companion_buy_words").await;
+    app.llm
+        .push_response(json!({ "outcomeStatus": "user_emotion_opened_up" }));
+    record_user_reaction(
+        &app.state,
+        &companion,
+        &inbound(
+            "reaction_companion_buy_words",
+            "inbound-companion-buy-words",
+            "我要买，现在付款",
+        ),
+    )
+    .await
+    .expect("non-transaction profile uses model semantics");
+    assert_eq!(app.llm.calls(), 2);
+    let companion_review = app
+        .state
+        .db
+        .decision_reviews()
+        .find_one(doc! { "_id": companion_review_id }, None)
+        .await
+        .expect("read companion review")
+        .expect("companion review exists");
+    assert_eq!(
+        companion_review.outcome_status.as_deref(),
+        Some("user_emotion_opened_up")
+    );
+    assert_ne!(
+        companion_review.reaction_analysis.get_bool("deterministic"),
+        Ok(true)
+    );
 
     app.cleanup().await;
 }

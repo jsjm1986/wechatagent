@@ -1339,7 +1339,9 @@ async fn aggregate_gap_signals(
         .db
         .raw()
         .collection::<Document>("knowledge_gap_signals");
-    // status 分布：pending = sweep 还没消化的；auto_resolved/applied/dismissed 之比是 sweep 命中率。
+    // status 分布：pending = sweep 还没消化的。注意 resolved 占比是**保留历史中
+    // 已解决状态的占比**（historicalResolvedShare），不是单轮 sweep 命中率——
+    // 集合无 run/cohort 标识，无法反推"上一轮处理了多少"（见下方输出处注释）。
     let pipeline_status = vec![
         doc! { "$match": { "workspace_id": workspace, "created_at": { "$lte": as_of } } },
         doc! { "$group": { "_id": "$status", "count": { "$sum": 1 } } },

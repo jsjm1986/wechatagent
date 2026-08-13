@@ -133,6 +133,12 @@ export type Contact = {
   lastMessageAt?: string;
   /** 最近一条入站消息原文截断（待启用档展示，后端 list_contacts 填充）。 */
   lastInboundPreview?: string | null;
+  /**
+   * cockpit 人格态 chip 的设计预留键（2026-07-01 驾驶舱 redesign spec 声明的
+   * 数据源）：后端 ApiContact 投影当前并不下发此字段，运行时恒缺省——消费方
+   * （JudgmentBar/PlannerView）无值不渲染。后端接线后此键自动点亮。
+   */
+  lastConversationMode?: string | null;
   updatedAt: string;
 };
 
@@ -505,6 +511,11 @@ export type OperationHealthItem = {
 export type OperationHealth = {
   scores: Record<string, number>;
   items: OperationHealthItem[];
+  /** 作息灯只读三键：后端 operation_health 聚合顶层下发（与
+   * contracts/operationHealth.contract.ts 的 CANONICAL_KEYS 对齐）。 */
+  inQuietHours?: boolean;
+  nextWakeAt?: string | null;
+  quietHoursEnabled?: boolean;
 };
 
 export type UserOperationGuidePreview = {

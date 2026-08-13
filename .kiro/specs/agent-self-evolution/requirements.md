@@ -1,6 +1,24 @@
 # Requirements Document
 
 > 中文标题：用户运营 Agent 自我演化（agent-self-evolution）— 需求文档
+>
+> **2026-08-13 现状注记（追加，不改写正文；历史存档原则）**：
+> ① **R9.6 终态处置（SR-180 契约冲突关闭）**：历史上代码曾引入受政策硬闸
+> （`CURRENT_AUTO_RELEASE_POLICY_ENABLED=false`）恒压制的阈值自动放量通道
+> （`evolution::auto_release`），与 R9.6"本期不引入自动发布开关"构成 spec-代码契约冲突（SR-180）。
+> 2026-08-13 优化线 C 已将该模块**物理删除**：tick 不再有任何自动发布路径，管理 API 拒写
+> workspace 子闸 true（`src/routes/evolution.rs`），config 中残留字段仅作休眠兼容。R9.6 与代码
+> 现状重新一致——release 仍为 admin 手动 + `RELEASE` 确认串，rollback 永远手动（R9.7 不变）。
+> ② **pressure gate 阈值候选停产**：`pressure_risk_block` 在现行分数闸体系中是软闸（触发
+> single-shot revision）、不产生 block 终态，缺乏终态统计源；演化器自 2026-08-13 起不再为该
+> gate 生成阈值候选（`src/evolution/threshold.rs`），band 目标区间保留仅作文档化观测口径，
+> `blocked_by_safety_guard` 终态不归因任何 gate。
+> ③ 5 个 gate_key 仍是 `threshold_overrides` 的稳定持久化标识符（与运行时解耦）；运行时已是
+> 分数闸体系（两硬拦 + 三软闸，见 `docs/agent-policy.md` 顶注）。R8.6 基线数字（lib ≥313 /
+> PBT ≥37）为旧值，现行合并门以 `scripts/check-baseline.sh` 为准（lib ≥350 / 四 PBT ≥33；
+> 2026-08-13 实测 lib 2562 / PBT 41）。正文逐条偏差见
+> `project-understanding/29-doc-code-divergence-master.md`，闭集/阈值速查见
+> `project-understanding/30-global-fact-cards.md`。
 
 ## Introduction
 

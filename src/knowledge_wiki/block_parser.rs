@@ -18,9 +18,10 @@
 //!
 //! 解析后产出 `Vec<ParsedChunkBlock>` + `ParseWarnings`：
 //!
-//! - **fence-aware**：以"行首 `---CHUNK: <id>---`"为开始锚，"行首 `---END CHUNK---`"为结束锚；
-//!   行内出现这两个 token 但不在行首 → 当作普通正文（防 LLM 在 body 里写到 `---END CHUNK---`
-//!   而被误识别为终止）；
+//! - **fence-aware**：以"行首（**去左侧空白后**）`---CHUNK: <id>---`"为开始锚，
+//!   "行首（同上）`---END CHUNK---`"为结束锚——判定是 `trim_start` 后整行匹配，
+//!   因此**左侧缩进**的 fence 同样生效；token 出现在行中部（前面有非空白字符）
+//!   → 当作普通正文（防 LLM 在 body 里写到 `---END CHUNK---` 而被误识别为终止）；
 //! - **unsafe-id 拒收**：`id` 含 `/` `\` `..` `<` `>` `|` `?` `*` 或控制字符 →
 //!   该 block 整体丢弃 + 写一条 unsafe-id warning（防 path traversal / XSS）；
 //! - **流截断容错**：最后一个 `---CHUNK: ...---` 没有匹配的 `---END CHUNK---` →

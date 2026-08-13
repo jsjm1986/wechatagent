@@ -1,22 +1,5 @@
-"""阶段2 guide 引导层域：自然语言指令 → preview(不落业务库) → apply(真映射 DB)。
-
-引导层让运营用自然语言（"把这个客户标记为高意向，多关注"）调 LLM 生成一份
-**可确认的配置修改预览**(suggestedChanges)，先落 user_operation_guide_previews 表
-(status=pending)**不碰业务库**；运营确认后 apply 才把 suggestedChanges 真映射到
-contact/memory/playbook/domain(guides.rs:158-161 四个 apply_*_changes)。
-
-本脚本铁证：
-- preview 调用后：user_operation_guide_previews 表 +1 条 pending；**contact 业务字段不变**
-  (红线：preview 是只读预览，绝不直接改业务库)
-- apply 调用后：preview.status→applied；suggestedChanges 里声明的字段真写进 contact
-  (updated_at 被刷新 + 至少一个映射字段落库)
-- apply 已 applied 的 preview 再 apply → 400(guides.rs:140 "not pending")
-注：suggestedChanges 由 LLM 生成，无法预知改哪个字段；故断言"preview 不落业务库"(确定)
-  + "apply 后 contact.updated_at 变化"(确定，只要 suggestedChanges 非空)，不臆测具体字段值。
-
-跑法：export DEPLOY_PASS=... ADMIN_USER=admin ADMIN_PASS=admin; python scripts/biz-test/batch_c_guide.py
-依赖：先跑 step0_preflight.py。
-"""
+"""Guide v3 acceptance: read-only Preview, frozen Apply, and idempotent receipt replay."""
+import json
 import sys
 import time
 from pathlib import Path
@@ -24,178 +7,116 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 import _lib
 
-DOMAIN = "guide引导层"
+DOMAIN = "guide引导层v3"
 WXID = "biztest_guide"
 
 
-def _contact_snapshot(account_id: str) -> dict:
-    """取 contact 的业务字段快照（preview 前后比对，证 preview 不落库）。"""
-    rows = _lib.mongo_json(
-        f'db.contacts.find({{wxid:"{WXID}",account_id:"{account_id}"}},'
-        '{human_profile_note:1,follow_up_policy:1,operation_state:1,updated_at:1,'
-        '"domain_attributes.customer_stage":1,_id:1}).toArray()'
+def _contact(account_id: str) -> dict:
+    row = _lib.mongo_json(
+        "db.contacts.findOne("
+        f"{{wxid:{json.dumps(WXID)},account_id:{json.dumps(account_id)}}},"
+        "{human_profile_note:1,follow_up_policy:1,operation_state:1,domain_attributes:1,"
+        "updated_at:1,_id:1})"
     )
-    return rows[0] if isinstance(rows, list) and rows else {}
+    return row if isinstance(row, dict) else {}
+
+
+def _memory_count(account_id: str) -> int:
+    value = _lib.mongo_json(
+        "db.operating_memories.countDocuments("
+        f"{{contact_wxid:{json.dumps(WXID)},account_id:{json.dumps(account_id)}}})"
+    )
+    return int(value) if isinstance(value, (int, float)) else -1
+
+
+def _require(condition: bool, description: str, evidence: object) -> None:
+    if not _lib.expect(condition, DOMAIN, description, str(evidence), "critical"):
+        raise SystemExit(f"{description}: {evidence}")
 
 
 def main() -> None:
-    account_id, _app_id = _lib.biztest_account()
+    account_id, _ = _lib.biztest_account()
     _lib.ensure_managed_contact(account_id, WXID, "引导测试客户")
     _lib.reset_contact_conversation(account_id, WXID)
-    # 清掉旧 preview，干净起点。
-    _lib.mongo(f'db.user_operation_guide_previews.deleteMany({{contact_wxid:"{WXID}"}})')
-
-    snap = _contact_snapshot(account_id)
-    contact_id = snap.get("_id", {}).get("$oid") if isinstance(snap.get("_id"), dict) else str(snap.get("_id", ""))
-    if not contact_id:
-        _lib.record(DOMAIN, "contact 未建", f"wxid={WXID}", "critical", "ensure_managed_contact 失败")
-        raise SystemExit("contact 未建")
-    print(f"[{DOMAIN}] contact_id={contact_id} 起始快照={snap}")
-
-    prev_count = _lib.mongo_json(
-        f'db.user_operation_guide_previews.countDocuments({{contact_wxid:"{WXID}"}})'
-    )
-    prev_count = prev_count if isinstance(prev_count, int) else 0
-
-    # ── preview：自然语言指令 → LLM 生成 suggestedChanges（真调 LLM，用 api_bg）──
-    instruction = "这个客户是高意向用户，请把他标记成重点跟进，并补充一句画像备注说明他关注价格。"
-    print(f"[{DOMAIN}] /guide/preview 真跑(LLM 生成配置预览)...")
-    t0 = time.time()
-    preview_resp = _lib.api_bg(
-        "POST", "/api/user-operations/guide/preview",
-        {"accountId": account_id, "contactId": contact_id, "instruction": instruction},
-        admin=True, max_wait=720, tag="guide_preview",
-    )
-    print(f"  耗时 {time.time()-t0:.1f}s resp={str(preview_resp)[:300]}")
-
-    err = _lib.is_api_error(preview_resp)
-    if err:
-        _lib.record(DOMAIN, "preview 端点失败(BLOCKED 非业务 bug)", f"resp={str(preview_resp)[:200]}",
-                    "high", f"端点故障 {err}，标 BLOCKED 不假绿")
-        raise SystemExit(f"preview 端点失败: {err}")
-
-    _lib.assert_llm_success(720, "user.guide.preview", DOMAIN)
-
-    preview_id = (preview_resp.get("item") or {}).get("id") or (preview_resp.get("item") or {}).get("_id")
-    _lib.expect(bool(preview_id), DOMAIN, "preview 返回 previewId",
-                f"resp={str(preview_resp)[:200]}", "critical")
-
-    # 铁证 1：preview 落 user_operation_guide_previews 表(+1, status=pending)。
-    after_count = _lib.mongo_json(
-        f'db.user_operation_guide_previews.countDocuments({{contact_wxid:"{WXID}"}})'
-    )
-    after_count = after_count if isinstance(after_count, int) else 0
-    _lib.expect(after_count == prev_count + 1, DOMAIN, "preview 落 1 条 guide_preview 记录",
-                f"prev={prev_count} after={after_count}", "high")
-
-    # 铁证 2：preview **不碰业务库** —— contact 业务字段与起始快照一致。
-    snap_after_preview = _contact_snapshot(account_id)
-    # updated_at 比对（preview 不该刷新 contact.updated_at）。
-    def _field(s, k):
-        return s.get(k)
-    same = (
-        _field(snap, "human_profile_note") == _field(snap_after_preview, "human_profile_note")
-        and _field(snap, "follow_up_policy") == _field(snap_after_preview, "follow_up_policy")
-        and _field(snap, "operation_state") == _field(snap_after_preview, "operation_state")
-        and _field(snap, "domain_attributes") == _field(snap_after_preview, "domain_attributes")
-    )
-    _lib.expect(same, DOMAIN, "preview 不直接改业务库(contact 字段不变=红线)",
-                f"before={snap} after={snap_after_preview}", "critical",
-                "preview 是只读预览,若改 contact 说明 preview 误落业务库")
-
-    # 查 suggestedChanges 是否非空（决定 apply 是否会改 contact）。
-    sc = _lib.mongo_json(
-        f'db.user_operation_guide_previews.find({{contact_wxid:"{WXID}"}})'
-        '.sort({_id:-1}).limit(1).toArray().map(p=>({status:p.status,'
-        'keys:Object.keys(p.suggested_changes||{})}))'
-    )
-    sc0 = sc[0] if isinstance(sc, list) and sc else {}
-    print(f"[{DOMAIN}] suggestedChanges keys={sc0.get('keys')} status={sc0.get('status')}")
-    has_changes = bool(sc0.get("keys"))
-
-    # ── apply：把 suggestedChanges 真映射到 DB ──
-    print(f"[{DOMAIN}] /guide/apply previewId={preview_id}...")
-    apply_resp = _lib.api("POST", "/api/user-operations/guide/apply",
-                          {"previewId": str(preview_id)}, admin=True, timeout=120)
-    print(f"  apply resp={str(apply_resp)[:250]}")
-    aerr = _lib.is_api_error(apply_resp)
-    if aerr:
-        # 修复后:apply 不应再因 LLM 越界 operationState 整体 400(部分应用)。
-        # 若仍 400 且是状态机/字典相关 → 修复回归,记 critical。其余 api_error → BLOCKED(端点/MCP)。
-        if "operation_state" in str(apply_resp) or "状态机" in str(apply_resp) or "dimension" in str(apply_resp):
-            _lib.record(DOMAIN, "apply 仍因枚举越界整体失败(部分应用修复回归)",
-                        f"resp={str(apply_resp)[:200]}", "critical",
-                        "修复目标=越界字段跳过+合法字段落库;若 apply 仍 400 说明 shared.rs "
-                        "apply_contact_changes 的 skip 改动未生效或被回退")
-            raise SystemExit(f"apply 部分应用回归: {aerr}")
-        _lib.record(DOMAIN, "apply 端点失败(BLOCKED)", f"resp={str(apply_resp)[:200]}", "high",
-                    "非枚举越界类错误,疑端点/MCP,标 BLOCKED 等恢复复跑")
-        raise SystemExit(f"apply 失败: {aerr}")
-
-    # apply 成功(200):验 skippedFields 回流 + 合法字段落库。
-    item = apply_resp.get("item", {}) if isinstance(apply_resp, dict) else {}
-    skipped = item.get("skippedFields", [])
-    applied = item.get("appliedFields", [])
-    print(f"  appliedFields={applied} skippedFields={skipped}")
-    # 部分应用红线的真正证据:当有字段被跳过(越界)时,合法字段必须仍然落库——
-    # 即"单个越界字段不得连坐丢弃全部合法字段"。skipped 非空恰是本次修复要治的 bug 场景
-    # (旧代码此时整请求 400、合法字段全丢),故只要 skipped 非空就强断言"至少一个合法字段幸存"。
-    skipped_names = {s.get("field") for s in skipped if isinstance(s, dict)}
-    if skipped:
-        # 合法字段幸存 = updated_at 被刷新(有字段落库)或 appliedFields 非空。二者任一即证未连坐。
-        snap_partial = _contact_snapshot(account_id)
-        ua_pre = _field(snap_after_preview, "updated_at")
-        ua_post = _field(snap_partial, "updated_at")
-        survived = bool(applied) or (has_changes and ua_pre != ua_post)
-        _lib.expect(survived, DOMAIN,
-                    "有字段被跳过时合法字段仍落库(部分应用红线:越界字段不连坐)",
-                    f"skipped={skipped} applied={applied} updated_at {ua_pre}->{ua_post}", "critical",
-                    "旧 bug=单越界字段致整请求 400 合法字段全丢;修复后须越界跳过、合法字段照落")
-    # skippedFields 里的字段名必须是已知枚举键之一(不臆造),且确实来自本次 suggestedChanges。
-    sc_keys = set(sc0.get("keys", []))
-    for name in skipped_names:
-        _lib.expect(name in sc_keys, DOMAIN, "skippedFields 字段来自本次 suggestedChanges(不臆造)",
-                    f"skipped_field={name} suggested_keys={sc_keys}", "high",
-                    "回流的越界字段名必须是运营实际提交的键,否则回流数据失真")
-
-    # apply 成功路径:铁证 3+4(preview.status=applied + updated_at 刷新)。
-    # 修复后 apply 越界不再整体 400,此路径恒到达。
-    status_after = _lib.mongo_json(
-        f'db.user_operation_guide_previews.find({{contact_wxid:"{WXID}"}})'
-        '.sort({_id:-1}).limit(1).toArray().map(p=>p.status)'
-    )
-    st = status_after[0] if isinstance(status_after, list) and status_after else None
-    _lib.expect(st == "applied", DOMAIN, "apply 后 preview.status=applied",
-                f"status={st}", "high")
-    if has_changes:
-        snap_after_apply = _contact_snapshot(account_id)
-        ua_before = _field(snap_after_preview, "updated_at")
-        ua_after = _field(snap_after_apply, "updated_at")
-        _lib.expect(ua_before != ua_after, DOMAIN,
-                    "apply 真映射到 contact(updated_at 刷新=suggestedChanges 落库)",
-                    f"updated_at before={ua_before} after={ua_after} changes_keys={sc0.get('keys')}",
-                    "high", "apply 是配置生效点,suggestedChanges 非空却没改 contact=映射断裂")
-    else:
-        _lib.record(DOMAIN, "LLM 未生成 suggestedChanges(无可映射变更)",
-                    f"keys={sc0.get('keys')}", "low",
-                    "LLM 自主未产出变更建议,可复跑;非红线破")
-
-    # 铁证 5：非 pending 的 preview 再 apply → 400(guides.rs:140 "not pending")。
-    # 不依赖第一轮 LLM 是否越界:直接把第一轮 preview 强制标 applied(确定性构造非-pending 态),
-    # 再 apply 验幂等保护。这样无论上面走了拒绝还是成功路径,本铁证都测的是真正的 not-pending 闸。
+    # Exact test-root cleanup only. Starting without memory exercises Preview's read-only projection.
     _lib.mongo(
-        f'db.user_operation_guide_previews.updateOne({{_id:ObjectId("{preview_id}")}},'
-        '{$set:{status:"applied"}})'
+        f'db.user_operation_guide_previews.deleteMany({{contact_wxid:{json.dumps(WXID)},'
+        f'account_id:{json.dumps(account_id)}}});'
+        f'db.operating_memories.deleteMany({{contact_wxid:{json.dumps(WXID)},'
+        f'account_id:{json.dumps(account_id)}}})'
     )
-    reapply = _lib.api("POST", "/api/user-operations/guide/apply",
-                       {"previewId": str(preview_id)}, admin=True, timeout=60)
-    reapply_err = _lib.is_api_error(reapply)
-    _lib.expect(reapply_err is not None and "api_error" in (reapply_err or ""),
-                DOMAIN, "非 pending 的 preview 再 apply 被拒(not pending 幂等保护)",
-                f"reapply={str(reapply)[:150]} err={reapply_err}", "high",
-                "preview 非幂等保护缺失=重复 apply 会重复改库")
+    before = _contact(account_id)
+    contact_id = _lib.bson_object_id(before.get("_id"))
+    _require(bool(contact_id), "测试联系人存在", before)
+    _require(_memory_count(account_id) == 0, "Preview 前无记忆行", _memory_count(account_id))
 
-    print(f"[{DOMAIN}] 完成。preview不落业务库✓ 状态机闸/映射✓ not-pending保护✓")
+    response = _lib.api_bg(
+        "POST", "/api/user-operations/guide/preview",
+        {
+            "accountId": account_id,
+            "contactId": contact_id,
+            "instruction": "仅针对当前客户：标记为重点跟进，并备注他明确关注价格。",
+            "mode": "smart",
+        },
+        admin=True, max_wait=720, tag="guide_preview_v3",
+    )
+    error = _lib.is_api_error(response)
+    if error:
+        raise SystemExit(f"Guide Preview BLOCKED: {error}")
+    _lib.assert_llm_success(720, "user.guide.preview", DOMAIN)
+    item = response.get("item") if isinstance(response, dict) else None
+    _require(isinstance(item, dict), "Preview 返回冻结候选", response)
+    binding = _lib.guide_apply_binding(response)
+    _require(binding["expectedAccountId"] == account_id, "Apply 绑定测试账号", binding)
+    _require(binding["expectedContactId"] == contact_id, "Apply 绑定测试联系人", binding)
+
+    stored = _lib.mongo_json(
+        "db.user_operation_guide_previews.findOne("
+        f"{{_id:ObjectId({json.dumps(binding['previewId'])})}},"
+        "{status:1,candidate_hash:1,apply_protocol_version:1,_id:0})"
+    )
+    _require(
+        isinstance(stored, dict) and stored.get("status") == "pending"
+        and stored.get("candidate_hash") == binding["candidateHash"],
+        "Preview 以 pending + candidateHash 精确落库", stored,
+    )
+    _require(_contact(account_id) == before, "Preview 不修改 contact", {"before": before, "after": _contact(account_id)})
+    _require(_memory_count(account_id) == 0, "Preview 不创建 operating_memory", _memory_count(account_id))
+
+    tampered = dict(binding)
+    tampered["candidateHash"] = "0" * 64
+    rejected = _lib.api("POST", "/api/user-operations/guide/apply", tampered, admin=True)
+    _require(_lib.is_api_error(rejected) is not None, "篡改 candidateHash 被拒", rejected)
+    _require(_contact(account_id) == before and _memory_count(account_id) == 0,
+             "错误哈希产生零业务副作用", {"contact": _contact(account_id), "memory": _memory_count(account_id)})
+
+    applied = _lib.api("POST", "/api/user-operations/guide/apply", binding, admin=True, timeout=180)
+    error = _lib.is_api_error(applied)
+    if error:
+        raise SystemExit(f"Guide Apply failed: {error} response={applied}")
+    receipt = applied.get("item") if isinstance(applied, dict) else None
+    _require(
+        isinstance(receipt, dict) and receipt.get("committed") is True
+        and receipt.get("previewId") == binding["previewId"]
+        and receipt.get("candidateHash") == binding["candidateHash"],
+        "Apply 返回与冻结候选绑定的提交回执", receipt,
+    )
+    _require(bool(receipt.get("appliedFields")), "明确指令至少应用一个合法字段", receipt)
+    _require(_memory_count(account_id) == 1, "确认后恰好创建冻结记忆基线", _memory_count(account_id))
+    status = _lib.mongo_json(
+        f'db.user_operation_guide_previews.findOne({{_id:ObjectId({json.dumps(binding["previewId"])})}}).status'
+    )
+    _require(status == "applied", "提交后 Preview 进入 applied", status)
+
+    replay = _lib.api("POST", "/api/user-operations/guide/apply", binding, admin=True)
+    replay_receipt = replay.get("item") if isinstance(replay, dict) else None
+    _require(replay_receipt == receipt, "重复 Apply 幂等返回同一持久化回执", {"first": receipt, "replay": replay_receipt})
+    events = _lib.mongo_json(
+        "db.agent_events.countDocuments("
+        f"{{kind:'user_operation_guide_applied','details.previewId':{json.dumps(binding['previewId'])}}})"
+    )
+    _require(events == 1, "幂等重放不重复写审计事件", events)
+    print(f"[{DOMAIN}] 完成：Preview零业务写入✓ 冻结绑定✓ Apply提交✓ 幂等回执✓")
 
 
 if __name__ == "__main__":

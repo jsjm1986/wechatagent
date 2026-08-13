@@ -48,6 +48,17 @@ async fn p0_seed_active_profile_round_trips() {
         !profile.operation_mode.funnel.enabled,
         "情感陪伴应关闭漏斗推进"
     );
+    assert!(
+        !profile.transaction_facts_enabled,
+        "完整行业模板必须关闭交易事实，不能静默继承销售默认"
+    );
+    assert!(
+        profile
+            .memory_dimensions
+            .iter()
+            .any(|dimension| { dimension.key == "anniversaries" && dimension.date_dimension }),
+        "完整行业模板的日期记忆维度必须持久化，不能只复制少数字段"
+    );
 }
 
 /// 退出条件 2 补充：默认 workspace 仍回落 DEFAULT（隔离性——seed 不污染别的 ws）。
