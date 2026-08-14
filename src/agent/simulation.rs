@@ -30,7 +30,9 @@ use super::knowledge_router::{
 use super::memory::{
     effective_memory_card_for_contact, load_operating_memory_read_only, next_memory_card_version,
 };
-use super::review::{effective_review_mode, local_decision_review, review_decision};
+use super::review::{
+    effective_review_mode, local_decision_review, review_decision, ReviewInvocationKind,
+};
 use super::runtime::UserRuntimeParameters;
 use super::shadow_finalize::finalize_shadow_decision;
 use super::sufficiency::PromptTier;
@@ -236,6 +238,7 @@ async fn simulate_user_dialogue_inner(
                 None,
                 None,
                 None,
+                ReviewInvocationKind::Conversation,
             )
             .await?
         };

@@ -74,7 +74,7 @@ use super::review::{
     evaluate_independent_claim_gate, finalize_review_for_send, local_decision_review,
     review_decision, review_passed, should_run_review, should_run_targeted_rewrite,
     should_skip_claim_gate, skipped_claim_gate_evaluation, FinalizeOutcome, GatewayStatusFinal,
-    PendingFinalizeEvent, ReviewerPromptCache, RevisionDecision,
+    PendingFinalizeEvent, ReviewInvocationKind, ReviewerPromptCache, RevisionDecision,
     CLAIM_GATE_SKIPPED_RISK_CASUAL_LOW,
 };
 use super::run_envelope::{
@@ -616,6 +616,7 @@ fn review_and_evaluate_claim_gate<'a>(
     active_products: &'a [crate::models::Product],
     referral_cards: &'a [crate::models::ReferralCard],
     reviewer_prompts: &'a ReviewerPromptCache,
+    invocation_kind: ReviewInvocationKind,
     skip_claim_gate: bool,
 ) -> BoxFuture<
     'a,
@@ -647,6 +648,7 @@ fn review_and_evaluate_claim_gate<'a>(
                 None,
                 Some(active_profile),
                 Some(reviewer_prompts),
+                invocation_kind,
             )
             .await?;
             return Ok((review, skipped_claim_gate_evaluation(decision)));
@@ -670,6 +672,7 @@ fn review_and_evaluate_claim_gate<'a>(
                 None,
                 Some(active_profile),
                 Some(reviewer_prompts),
+                invocation_kind,
             ),
             evaluate_independent_claim_gate(
                 state,
@@ -683,6 +686,7 @@ fn review_and_evaluate_claim_gate<'a>(
                 active_profile,
                 mongodb::bson::DateTime::now(),
                 Some(run_id),
+                invocation_kind,
             ),
         );
         Ok((review?, claim_gate))
@@ -894,6 +898,7 @@ async fn send_contact_message_gateway_inner(
         &active_products,
         &[],
         &reviewer_prompts,
+        ReviewInvocationKind::ManualOutreach,
         // 管理发送是 admin 手动指定文本，非 LLM 寒暄轮——ClaimGate 恒照跑。
         false,
     )
@@ -3056,6 +3061,7 @@ fn run_user_operation_gateway_inner<'a>(
             &active_products,
             &referral_cards,
             &reviewer_prompts,
+            ReviewInvocationKind::Conversation,
             skip_claim_gate,
         )
         .await?;
@@ -3195,6 +3201,7 @@ fn run_user_operation_gateway_inner<'a>(
                 &active_products,
                 &referral_cards,
                 &reviewer_prompts,
+                ReviewInvocationKind::Conversation,
                 // rewrite 由硬闸失败触发（幻觉/grounding），改写稿必须全量重评。
                 false,
             )
@@ -3469,6 +3476,7 @@ fn run_user_operation_gateway_inner<'a>(
                         &active_products,
                         &referral_cards,
                         &reviewer_prompts,
+                        ReviewInvocationKind::Conversation,
                         // revision 由 finalize 后的 revision trigger 触发，二稿全量重评。
                         false,
                     )

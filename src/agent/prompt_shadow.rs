@@ -47,7 +47,7 @@ use super::knowledge_router::{
 use super::memory::{
     effective_memory_card_for_contact, load_operating_memory_read_only, next_memory_card_version,
 };
-use super::review::{effective_review_mode, review_decision};
+use super::review::{effective_review_mode, review_decision, ReviewInvocationKind};
 use super::run_envelope::SOURCE_KIND_INBOUND_MESSAGE;
 use super::runtime::{resolve_thresholds, UserRuntimeParameters};
 use super::shadow_finalize::finalize_shadow_decision;
@@ -647,6 +647,7 @@ async fn run_prompt_shadow_branch(
         Some(prompt_override),
         None,
         None,
+        ReviewInvocationKind::Conversation,
     )
     .await?;
     if !prompt_override.was_applied() {
