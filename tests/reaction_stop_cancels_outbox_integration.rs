@@ -192,7 +192,13 @@ async fn record_user_reaction_stop_cancels_pending_outbox() {
     // mock LLM：analyze_user_reaction 调 generate_agent_json 恰一次（reaction.rs:335），
     // 返回 stopRequested=true → reaction_outcome_status_with_polarity 映射为
     // user_replied_stop_requested（reaction.rs:369）→ outcome_signals_stop 命中。
-    app.llm.push_response(json!({ "stopRequested": true }));
+    app.llm.push_response(json!({
+        "stopRequested": true,
+        "speechAct": "statement",
+        "assertionStatus": "asserted",
+        "subject": "customer",
+        "confidence": 0.95
+    }));
 
     // 构造一条入站消息（用户明确表达停止），真调 record_user_reaction 驱动完整串联。
     let inbound = ConversationMessage {
@@ -242,13 +248,35 @@ async fn record_user_reaction_stop_cancels_pending_outbox() {
             entry.cancel_reason
         );
     }
+
+    let stored_contact = app
+        .state
+        .db
+        .contacts()
+        .find_one(doc! { "_id": contact.id }, None)
+        .await
+        .expect("load contact after stop")
+        .expect("contact exists after stop");
+    assert!(
+        stored_contact
+            .cooldown_until
+            .is_some_and(|until| until.timestamp_millis() > DateTime::now().timestamp_millis()),
+        "high-confidence AI stop must persist a durable cooldown"
+    );
+    assert_eq!(
+        stored_contact
+            .operation_policy
+            .get_bool("explicitStopRequested")
+            .ok(),
+        Some(true)
+    );
 }
 
 #[tokio::test]
 #[ignore]
-async fn deterministic_stop_needs_no_review_or_llm_and_persists_dispatch_barrier() {
+async fn stop_text_without_sent_predecessor_does_not_claim_reaction() {
     let app = common::TestApp::start().await;
-    let contact = make_contact("user_deterministic_stop");
+    let contact = make_contact("user_stop_without_sent");
     app.state
         .db
         .contacts()
@@ -259,8 +287,8 @@ async fn deterministic_stop_needs_no_review_or_llm_and_persists_dispatch_barrier
     let outbox_id = enqueue_pending(
         &app.state,
         &contact,
-        "evt_deterministic_stop",
-        "这条消息绝不能越过远端边界",
+        "evt_stop_without_sent",
+        "这条消息不能在没有有效决策的情况下越过远端边界",
     )
     .await;
     let inbound = ConversationMessage {
@@ -268,7 +296,7 @@ async fn deterministic_stop_needs_no_review_or_llm_and_persists_dispatch_barrier
         workspace_id: contact.workspace_id.clone(),
         account_id: contact.account_id.clone(),
         contact_wxid: contact.wxid.clone(),
-        message_id: Some("inbound_deterministic_stop".to_string()),
+        message_id: Some("inbound_stop_without_sent".to_string()),
         dedupe_key: None,
         direction: MessageDirection::Inbound,
         content: "别再发了，我不想聊了，到此为止吧".to_string(),
@@ -281,11 +309,11 @@ async fn deterministic_stop_needs_no_review_or_llm_and_persists_dispatch_barrier
 
     record_user_reaction(&app.state, &contact, &inbound)
         .await
-        .expect("deterministic stop should succeed without a prior review");
+        .expect("reaction without a sent predecessor should be a no-op");
     assert_eq!(
         app.llm.calls(),
         0,
-        "explicit stop must never depend on LLM availability"
+        "without a sent predecessor there is no reaction claim or model call"
     );
 
     let stored_contact = app
@@ -296,19 +324,11 @@ async fn deterministic_stop_needs_no_review_or_llm_and_persists_dispatch_barrier
         .await
         .expect("load contact")
         .expect("contact exists");
-    assert!(
-        stored_contact
-            .cooldown_until
-            .is_some_and(|until| until.timestamp_millis() > DateTime::now().timestamp_millis()),
-        "explicit stop must persist a restart-safe cooldown"
-    );
-    assert_eq!(
-        stored_contact
-            .operation_policy
-            .get_bool("explicitStopRequested")
-            .ok(),
-        Some(true)
-    );
+    assert!(stored_contact.cooldown_until.is_none());
+    assert!(stored_contact
+        .operation_policy
+        .get("explicitStopRequested")
+        .is_none());
 
     let entry = app
         .state
@@ -318,9 +338,6 @@ async fn deterministic_stop_needs_no_review_or_llm_and_persists_dispatch_barrier
         .await
         .expect("load outbox")
         .expect("outbox exists");
-    assert_eq!(entry.status, "canceled");
-    assert_eq!(
-        entry.cancel_reason.as_deref(),
-        Some("user_reaction_stop_requested")
-    );
+    assert_eq!(entry.status, "pending");
+    assert!(entry.cancel_reason.is_none());
 }

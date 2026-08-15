@@ -280,10 +280,6 @@ fn build_profile_generation_prompt(
   "businessFormulas": [
     {{"key": "公式key(camelCase)", "expression": "客户视角的可读展开式", "displayName": "中文名"}}
   ],
-  "commitmentMarkers": {{
-    "productEffect": ["这类话一说出来客户就会失去信任（绝对化效果承诺）"],
-    "toneOnly": ["这类话只有语气上的分量，没有实质承诺"]
-  }},
   "coverageDimensions": [
     {{"key": "covKey", "displayName": "中文名", "required": false}}
   ],
@@ -307,7 +303,7 @@ fn build_profile_generation_prompt(
 
 **重要提醒：**
 - profile_id 是唯一标识，固定为「{profile_id}」，不要改动。
-- 如果某个**公式/承诺词/覆盖维度**在你的行业里没有对应的，不要硬凑——给空数组或空串就好。
+- 如果某个**公式/覆盖维度**在你的行业里没有对应的，不要硬凑——给空数组或空串就好。
 - promptFragment 要写得像一段真实思考，不是产品说明书。
 - **字段类型严格**：`promptFragment`、`description` 必须是**单个纯文本字符串**（哪怕内容很长、包含多段思考，也要写在一个字符串里，用换行分隔），**不要写成 `{{...}}` 对象或数组**。
 - `profileDimensions` **必须**给出至少 3 个维度（这是配置的核心，不能为空数组）；每个维度的 `kind` 和 `displayName` 都必须是非空字符串。
@@ -502,7 +498,6 @@ mod tests {
         assert_eq!(to_snake_case("displayName"), "display_name");
         assert_eq!(to_snake_case("profileDimensions"), "profile_dimensions");
         assert_eq!(to_snake_case("profileId"), "profile_id");
-        assert_eq!(to_snake_case("commitmentMarkers"), "commitment_markers");
         assert_eq!(to_snake_case("coverageDimensions"), "coverage_dimensions");
         assert_eq!(to_snake_case("businessFormulas"), "business_formulas");
     }

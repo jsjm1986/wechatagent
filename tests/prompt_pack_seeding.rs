@@ -3,8 +3,7 @@
 //! 性质：
 //! - `ensure_prompt_pack_v2` 在已经种过 v2 的 workspace 上**不会**删除运营人员
 //!   手工创建的 active / draft 模板（哪怕 prompt_key 不在 spec 中）。
-//! - 同一 workspace 上若 spec 里新增了 key（比如波 D 之前缺失的
-//!   `user.review.product_claim_markers` / `knowledge.auto_verify`），
+//! - 同一 workspace 上若 spec 里新增了 key（例如语义 reaction 合同或知识校验合同），
 //!   `align_prompt_specs` 会在该 key 缺失时（`None => true` 分支）把它们补齐，
 //!   而不会因为"版本号已匹配"整体跳过。
 //!
@@ -107,8 +106,8 @@ async fn ensure_prompt_pack_seeds_all_spec_keys() {
     let app = common::TestApp::start().await;
     let workspace = app.state.config.default_workspace_id.clone();
 
-    // 跑了一遍 prompt pack v2 后，spec 里的两个新 key 都应已落地。
-    for key in ["user.review.product_claim_markers", "knowledge.auto_verify"] {
+    // 跑了一遍 prompt pack v2 后，当前语义 reaction / 知识校验合同都应已落地。
+    for key in ["user.reaction.task", "knowledge.auto_verify"] {
         let template = app
             .state
             .db

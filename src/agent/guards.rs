@@ -8,9 +8,7 @@
 
 use mongodb::bson::Document;
 
-use crate::models::{
-    CommitmentMarkers, OperationDomainConfig, OperationKnowledgeChunk, OperationStatePolicy,
-};
+use crate::models::{OperationDomainConfig, OperationKnowledgeChunk, OperationStatePolicy};
 
 use super::types::{doc_bool, AgentDecision, DecisionReviewResult, RunPlannerResult};
 
@@ -297,12 +295,11 @@ pub fn classify_decision_action(decision: &AgentDecision) -> &'static str {
     "silent"
 }
 
-/// Classify a narrowly bounded acknowledgement after Reviewer + ClaimGate have completed.
-///
-/// This is intentionally stricter than text keyword matching: the body must be short, have no
-/// question/number, carry no durable side effect, and ClaimGate must report a complete manifest
-/// with no evidence-requiring assertion. It lets a user receive “好的，我知道了，不安排时间”
-/// even in a no-proactive-contact state without turning arbitrary replies into a policy bypass.
+/// Classify an acknowledgement only when the model's semantic contract says so and the normal
+/// review/claim gates prove that the outbound has no factual assertion or durable side effect.
+/// Natural-language text is deliberately not inspected here: the Reply Agent owns the semantic
+/// interpretation, while this function only validates the structured contract and execution
+/// safety conditions.
 pub(crate) fn classify_reviewed_decision_action(
     decision: &AgentDecision,
     review: &DecisionReviewResult,
@@ -310,23 +307,15 @@ pub(crate) fn classify_reviewed_decision_action(
     if !decision.should_reply {
         return classify_decision_action(decision);
     }
-    let text = decision.reply_text.trim();
-    let acknowledgement_marker = [
-        "好的",
-        "好，",
-        "好。",
-        "收到",
-        "明白",
-        "知道了",
-        "了解",
-        "没问题",
-        "ok",
-        "okay",
-        "got it",
-        "understood",
-    ]
-    .iter()
-    .any(|marker| text.to_ascii_lowercase().contains(marker));
+    let response_disposition = decision
+        .intent_analysis
+        .get_document("semanticAssessment")
+        .ok()
+        .and_then(|assessment| assessment.get_str("responseDisposition").ok())
+        .or_else(|| decision.intent_analysis.get_str("responseDisposition").ok());
+    if response_disposition != Some("acknowledgement") {
+        return "reply";
+    }
     let no_side_effects = decision
         .follow_up
         .as_ref()
@@ -361,92 +350,10 @@ pub(crate) fn classify_reviewed_decision_action(
                 claims.iter().all(|claim| {
                     claim
                         .as_document()
-                        .is_some_and(|claim| !claim.get_bool("requiresEvidence").unwrap_or(true))
+                        .is_some_and(|claim| claim.get_str("evidenceNeed") == Ok("not_needed"))
                 })
             });
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum SchedulePolarity {
-        None,
-        NegativeOnly,
-        Positive,
-        Mixed,
-    }
-
-    let normalized = text.to_ascii_lowercase();
-    let negative_phrases = [
-        "不安排任何时间",
-        "不安排任何预约",
-        "不安排时间",
-        "不安排预约",
-        "不安排",
-        "不替你安排",
-        "不帮你预约",
-        "不帮你约",
-        "不确认预约",
-        "不会安排时间",
-        "不会安排",
-        "不用安排",
-        "无需安排",
-        "不要安排",
-        "不约了",
-        "取消安排",
-        "取消预约",
-        "won't schedule",
-        "will not schedule",
-        "do not schedule",
-        "cancel the appointment",
-    ];
-    let has_negative_schedule = negative_phrases
-        .iter()
-        .any(|phrase| normalized.contains(phrase));
-    let semantic_remainder = negative_phrases
-        .iter()
-        .fold(normalized, |value, phrase| value.replace(phrase, ""));
-    let has_positive_schedule = [
-        "今天",
-        "明天",
-        "后天",
-        "上午",
-        "下午",
-        "晚上",
-        "点到",
-        "点见",
-        "到店",
-        "预约",
-        "安排",
-        "接待",
-        "带你",
-        "帮你约",
-        "全程",
-        "today",
-        "tomorrow",
-        "appointment",
-        "schedule",
-        "arrange",
-        "escort",
-    ]
-    .iter()
-    .any(|marker| semantic_remainder.contains(marker));
-    let schedule_polarity = match (has_negative_schedule, has_positive_schedule) {
-        (false, false) => SchedulePolarity::None,
-        (true, false) => SchedulePolarity::NegativeOnly,
-        (false, true) => SchedulePolarity::Positive,
-        (true, true) => SchedulePolarity::Mixed,
-    };
-    if review.approved
-        && !review.should_hold
-        && (acknowledgement_marker || schedule_polarity == SchedulePolarity::NegativeOnly)
-        && text.chars().count() <= 60
-        && !text
-            .chars()
-            .any(|ch| ch.is_ascii_digit() || matches!(ch, '?' | '？'))
-        && matches!(
-            schedule_polarity,
-            SchedulePolarity::None | SchedulePolarity::NegativeOnly
-        )
-        && no_side_effects
-        && manifest_is_safe
-    {
+    if review.approved && !review.should_hold && no_side_effects && manifest_is_safe {
         "acknowledgement"
     } else {
         "reply"
@@ -570,66 +477,6 @@ pub(crate) fn compute_verified_chunks<'a>(
     out
 }
 
-/// 承诺词类型（grounding 漏判兜底硬闸用）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CommitmentClass {
-    /// 效果/数据类断言（成功率/见效/回款/百分比）——漏判+无 verified 时硬闸拦截。
-    ProductEffect,
-    /// 语气类承诺（保证/一定能/绝对）——最易误杀情感承诺，仅观测不拦。
-    ToneOnly,
-    /// 无承诺词。
-    None,
-}
-
-/// universal-domain-adaptation H4：DEFAULT 销售域绝对化承诺词表 fallback const。
-///
-/// `commitment_claim_class` 在 active profile 的 `commitment_markers` 为空时回落到这两组
-/// （向后兼容 + 防御老库/异常 profile）。**单一真相源**：`default_domain_profile` 的
-/// `commitment_markers` seed 逐字复刻这两组，由 `default_profile_commitment_markers_match_guards_const`
-/// 跨模块等价测试锁死（防 seed 与 fallback 漂移）。提到模块级 `pub(crate)` 即为供该测试引用。
-pub(crate) const PRODUCT_EFFECT_MARKERS: [&str; 5] = ["成功率", "见效", "回款", "百分之", "百分百"];
-/// 见 [`PRODUCT_EFFECT_MARKERS`]：纯语气类绝对化承诺 fallback const。
-pub(crate) const TONE_ONLY_MARKERS: [&str; 3] = ["保证", "一定能", "绝对"];
-
-/// 把候选回复按承诺词类型分类。ProductEffect 优先（同时命中两类时取更危险者）。
-/// 词表与 `prompts.rs` 既有 `user.review.product_claim_markers` 模板同源，切分两类
-/// 以控制误杀：效果/数据类几乎只出现在可验证产品断言；语气类大量出现在情感/口语承诺。
-///
-/// universal-domain-adaptation H4：词表从写死 const 改为读 `markers`（来自 active
-/// DomainProfile.commitment_markers）。`markers` 两组皆空时回落内置销售域 const
-/// （[`PRODUCT_EFFECT_MARKERS`] / [`TONE_ONLY_MARKERS`]）——防御老库/异常 profile，且
-/// DEFAULT_PROFILE 的词表逐字复刻 const（等价护栏锁死），故 DEFAULT 下行为字节等价。
-/// 换行业=另一份 profile 声明本行业的绝对化承诺词。
-pub(crate) fn commitment_claim_class(
-    reply_text: &str,
-    markers: &CommitmentMarkers,
-) -> CommitmentClass {
-    let text = reply_text.trim();
-    if text.is_empty() {
-        return CommitmentClass::None;
-    }
-    // 空 profile 词表回落内置 const（向后兼容 + 防御）。
-    let fallback_product: Vec<&str> = PRODUCT_EFFECT_MARKERS.to_vec();
-    let fallback_tone: Vec<&str> = TONE_ONLY_MARKERS.to_vec();
-    let product_effect: Vec<&str> = if markers.product_effect.is_empty() {
-        fallback_product
-    } else {
-        markers.product_effect.iter().map(String::as_str).collect()
-    };
-    let tone_only: Vec<&str> = if markers.tone_only.is_empty() {
-        fallback_tone
-    } else {
-        markers.tone_only.iter().map(String::as_str).collect()
-    };
-    if product_effect.iter().any(|m| text.contains(m)) {
-        return CommitmentClass::ProductEffect;
-    }
-    if tone_only.iter().any(|m| text.contains(m)) {
-        return CommitmentClass::ToneOnly;
-    }
-    CommitmentClass::None
-}
-
 #[cfg(test)]
 mod policy_tests {
     //! Phase B / B4：`classify_decision_action` + `enforce_state_action_policy` 单测。
@@ -663,6 +510,14 @@ mod policy_tests {
         d
     }
 
+    fn set_response_disposition(decision: &mut AgentDecision, disposition: &str) {
+        decision.intent_analysis = mongodb::bson::doc! {
+            "semanticAssessment": {
+                "responseDisposition": disposition,
+            },
+        };
+    }
+
     fn safe_ack_review() -> DecisionReviewResult {
         DecisionReviewResult {
             approved: true,
@@ -671,7 +526,7 @@ mod policy_tests {
                 "claimsComplete": true,
                 "claimManifest": [{
                     "sourceQuote": "好的，我知道了",
-                    "requiresEvidence": false,
+                    "evidenceNeed": "not_needed",
                 }],
             },
             ..Default::default()
@@ -679,59 +534,95 @@ mod policy_tests {
     }
 
     #[test]
-    fn reviewed_neutral_acknowledgement_has_narrow_action() {
+    fn reviewed_semantic_acknowledgement_uses_contract_not_reply_words() {
         let mut decision = AgentDecision::default();
         decision.should_reply = true;
+        set_response_disposition(&mut decision, "acknowledgement");
+
+        // These bodies intentionally do not share a fixed acknowledgement vocabulary. The
+        // action must stay the same because the Reply Agent's structured semantic contract is
+        // the authority; adding another natural-language phrase must never require a server edit.
         for text in [
-            "好的，我知道了，不安排时间。",
-            "收到，不安排。",
-            "不安排任何预约。",
-            "不约了。",
-            "取消安排。",
+            "我把你的意思记下了，先到这里。",
+            "收到你的说明，今天就聊到这儿。",
+            "Acknowledged; we can leave it here for now.",
+            "云朵在窗边，先这样。",
+            "这条消息我已经看到了。",
+            "第2条我看到了，可以先停在这里。",
         ] {
             decision.reply_text = text.to_string();
             assert_eq!(
                 classify_reviewed_decision_action(&decision, &safe_ack_review()),
                 "acknowledgement",
-                "text={text}"
+                "semantic acknowledgement must not depend on text markers: {text}"
             );
         }
-        let legacy_no_proactive = mk_policy(
+    }
+
+    #[test]
+    fn cooldown_allows_safe_acknowledgement_but_blocks_semantic_reply() {
+        let cooldown = mk_policy(
             "cooldown",
             &["acknowledgement", "silent", "follow_up"],
             &["reply"],
         );
-        assert!(enforce_state_action_policy(
-            Some(&legacy_no_proactive),
-            classify_reviewed_decision_action(&decision, &safe_ack_review())
-        )
-        .is_ok());
+
+        let mut acknowledgement = AgentDecision::default();
+        acknowledgement.should_reply = true;
+        acknowledgement.reply_text = "我把你的意思记下了，先到这里。".to_string();
+        set_response_disposition(&mut acknowledgement, "acknowledgement");
+        let ack_action = classify_reviewed_decision_action(&acknowledgement, &safe_ack_review());
+        assert_eq!(ack_action, "acknowledgement");
+        assert!(enforce_state_action_policy(Some(&cooldown), ack_action).is_ok());
+
+        let mut ordinary_reply = acknowledgement.clone();
+        ordinary_reply.reply_text = "我来具体说明下一步怎么做。".to_string();
+        set_response_disposition(&mut ordinary_reply, "reply");
+        let reply_action = classify_reviewed_decision_action(&ordinary_reply, &safe_ack_review());
+        assert_eq!(reply_action, "reply");
+        assert!(enforce_state_action_policy(Some(&cooldown), reply_action).is_err());
     }
 
     #[test]
-    fn acknowledgement_never_bypasses_explicit_forbidden_or_business_content() {
+    fn acknowledgement_never_bypasses_explicit_forbidden_or_semantic_reply() {
         let explicitly_forbidden = mk_policy("guarded", &[], &["acknowledgement"]);
         assert!(
             enforce_state_action_policy(Some(&explicitly_forbidden), "acknowledgement").is_err()
         );
 
-        for text in [
-            "好的，明天下午三点见。",
-            "好的，我帮你安排。",
-            "好的，你到了我带你进去。",
-            "好的，可以吗？",
-            "收到，明天不安排，后天三点见。",
-            "收到，不安排，但我会全程接待。",
-        ] {
-            let mut decision = AgentDecision::default();
-            decision.should_reply = true;
-            decision.reply_text = text.to_string();
-            assert_eq!(
-                classify_reviewed_decision_action(&decision, &safe_ack_review()),
-                "reply",
-                "text={text}"
-            );
-        }
+        let mut decision = AgentDecision::default();
+        decision.should_reply = true;
+        decision.reply_text = "好的，明天下午三点见。".to_string();
+        set_response_disposition(&mut decision, "reply");
+        assert_eq!(
+            classify_reviewed_decision_action(&decision, &safe_ack_review()),
+            "reply"
+        );
+
+        decision.reply_text = "任意文本都可以由 AI 语义判为确认".to_string();
+        set_response_disposition(&mut decision, "acknowledgement");
+        let mut evidence_review = safe_ack_review();
+        evidence_review.claim_analysis = mongodb::bson::doc! {
+            "independentClaimGate": true,
+            "claimsComplete": true,
+            "claimManifest": [{
+                "sourceQuote": "任意文本都可以由 AI 语义判为确认",
+                "evidenceNeed": "required",
+            }],
+        };
+        assert_eq!(
+            classify_reviewed_decision_action(&decision, &evidence_review),
+            "reply"
+        );
+
+        // A familiar-looking body is still an ordinary reply when the model says its disposition
+        // is reply. The server must not infer acknowledgement from the wording.
+        decision.reply_text = "收到。".to_string();
+        set_response_disposition(&mut decision, "reply");
+        assert_eq!(
+            classify_reviewed_decision_action(&decision, &safe_ack_review()),
+            "reply"
+        );
     }
 
     #[test]
@@ -739,6 +630,7 @@ mod policy_tests {
         let mut decision = AgentDecision::default();
         decision.should_reply = true;
         decision.reply_text = "收到。".to_string();
+        set_response_disposition(&mut decision, "acknowledgement");
         assert_eq!(
             classify_reviewed_decision_action(
                 &decision,
@@ -873,99 +765,6 @@ mod policy_tests {
                 "proposal={proposed}"
             );
         }
-    }
-
-    #[test]
-    fn commitment_class_product_effect_on_data_words() {
-        let m = crate::agent::domain_profile::default_domain_profile("ws").commitment_markers;
-        assert_eq!(
-            commitment_claim_class("我们的成功率高达95%", &m),
-            CommitmentClass::ProductEffect
-        );
-        assert_eq!(
-            commitment_claim_class("三天就见效", &m),
-            CommitmentClass::ProductEffect
-        );
-        assert_eq!(
-            commitment_claim_class("保证按时回款", &m),
-            CommitmentClass::ProductEffect
-        );
-    }
-
-    #[test]
-    fn commitment_class_tone_only_on_soft_words() {
-        let m = crate::agent::domain_profile::default_domain_profile("ws").commitment_markers;
-        assert_eq!(
-            commitment_claim_class("我保证认真对待您的问题", &m),
-            CommitmentClass::ToneOnly
-        );
-        assert_eq!(
-            commitment_claim_class("这事绝对不怪你", &m),
-            CommitmentClass::ToneOnly
-        );
-        assert_eq!(
-            commitment_claim_class("这个方案一定能帮到你", &m),
-            CommitmentClass::ToneOnly
-        );
-    }
-
-    #[test]
-    fn commitment_class_product_effect_wins_when_both_present() {
-        // 同时含语气词「一定能」和效果词「成功率」→ 取更危险的 ProductEffect
-        let m = crate::agent::domain_profile::default_domain_profile("ws").commitment_markers;
-        assert_eq!(
-            commitment_claim_class("一定能把成功率做上去", &m),
-            CommitmentClass::ProductEffect
-        );
-    }
-
-    #[test]
-    fn commitment_class_none_on_plain_reply() {
-        let m = crate::agent::domain_profile::default_domain_profile("ws").commitment_markers;
-        assert_eq!(
-            commitment_claim_class("好的，我先了解下你的具体情况", &m),
-            CommitmentClass::None
-        );
-    }
-
-    #[test]
-    fn commitment_class_empty_markers_falls_back_to_const() {
-        // H4：profile 词表两组皆空 → 回落内置销售域 const（向后兼容/防御）。
-        let empty = CommitmentMarkers::default();
-        assert_eq!(
-            commitment_claim_class("我们的成功率高达95%", &empty),
-            CommitmentClass::ProductEffect
-        );
-        assert_eq!(
-            commitment_claim_class("我保证认真对待", &empty),
-            CommitmentClass::ToneOnly
-        );
-        assert_eq!(
-            commitment_claim_class("好的，我先了解下", &empty),
-            CommitmentClass::None
-        );
-    }
-
-    #[test]
-    fn commitment_class_custom_industry_markers_honored() {
-        // H4：换行业=另一份词表。医疗域「根治率/包好」效果词、「一定治好」语气词。
-        let medical = CommitmentMarkers {
-            product_effect: vec!["根治率".to_string(), "包好".to_string()],
-            tone_only: vec!["一定治好".to_string()],
-        };
-        assert_eq!(
-            commitment_claim_class("我们根治率很高", &medical),
-            CommitmentClass::ProductEffect
-        );
-        assert_eq!(
-            commitment_claim_class("这病一定治好", &medical),
-            CommitmentClass::ToneOnly
-        );
-        // 销售域 const 词在医疗 profile 下不再命中（词表已替换，非叠加）。
-        assert_eq!(
-            commitment_claim_class("三天就见效", &medical),
-            CommitmentClass::None
-        );
     }
 }
 

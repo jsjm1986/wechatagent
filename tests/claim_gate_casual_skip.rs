@@ -1,12 +1,8 @@
-//! S5-6 寒暄低风险轮跳过独立 ClaimGate：conversation_mode=casual_relationship ∧
-//! planner 低风险 ∧ knowledge_need=not_required ∧ 零知识引用 ∧ 零发送物 ∧ 无请示的
-//! 轮次，Review 本体照跑、只跳过语义声明抽取器（每轮省一次 LLM 调用），并在
-//! review.risks 落 `claim_gate_skipped_casual_low_risk` 审计标记；任一条件不满足
-//! （对照：risk=medium）时 ClaimGate 照跑、不落标记。
+//! 可发送正文必须经过独立 ClaimGate，包括寒暄低风险轮。
 //!
-//! 断言手法：mock LLM 队列不排 ClaimGate 响应——若误未跳过，ClaimGate 调用会因
-//! 无匹配 schema 响应而失败并 fail-closed 成 blocked_by_safety_guard，"终态
-//! approved + LLM 调用数恰好 2" 即同时证明零调用与链路完好。
+//! 回归重点不是匹配某句寒暄，而是锁定两个链路不变量：
+//! 1. 普通低风险正文也执行 Reply + Reviewer + ClaimGate；
+//! 2. Reply Agent 即使把事实性正文自报为 `claims=[] / low risk`，也不能绕过独立核验。
 //!
 //! 默认 #[ignore]，需 Docker（testcontainers MongoDB）。
 
@@ -110,6 +106,27 @@ fn casual_reply_decision_json(reply_text: &str, risk_level: &str) -> serde_json:
         "operationState": "need_discovery",
         "shouldReply": true,
         "replyText": reply_text,
+        "whyShouldReply": "客户主动分享周末近况，顺着生活话题自然回应并保持轻松交流。",
+        "whySkipReply": "",
+        "intentAnalysis": {
+            "semanticAssessment": {
+                "intent": "维持轻松的日常互动",
+                "speechAct": "question",
+                "subject": "customer",
+                "assertionStatus": "interrogative",
+                "knowledgeNeed": "not_required",
+                "responseDisposition": "reply",
+                "semanticRisk": {
+                    "content": "low",
+                    "pressure": "low",
+                    "boundary": "low",
+                    "privacy": "low",
+                    "confidence": 0.98
+                },
+                "claims": [],
+                "reason": "完整语境表明这是生活寒暄和轻量提问，不代表任何业务事实。"
+            }
+        },
         "usedKnowledgeIds": [],
         "matchedKnowledgeIds": [],
         "conversationMode": "casual_relationship",
@@ -148,11 +165,64 @@ fn review_pass_json() -> serde_json::Value {
     })
 }
 
-/// 寒暄 + 低风险 + 零知识引用：独立 ClaimGate 零调用（队列不排 ClaimGate 响应仍
-/// 终态 approved），LLM 只调 Reply + Review 两次，review.risks 落跳过审计标记。
+/// A model may still populate the legacy boolean incorrectly while providing the newer semantic
+/// contract correctly. The server must reconcile that contradiction from the typed AI field,
+/// without inspecting the candidate text or maintaining a phrase allowlist.
+fn contradictory_legacy_claim_gate_json() -> serde_json::Value {
+    json!({
+        // Legacy aggregate mirrors are deliberately wrong. The parser must ignore them and derive
+        // the gate only from claims[].evidenceNeed.
+        "requiresEvidence": true,
+        "claimKinds": ["conversational_performative"],
+        "claimsComplete": true,
+        "semanticAssessment": {
+            "speechAct": "model_specific_acknowledgement",
+            "subject": "none",
+            "assertionStatus": "performative_completed_by_reply",
+            "knowledgeNeed": "not_required",
+            "responseDisposition": "acknowledgement",
+            "contentRisk": "low",
+            "confidence": 0.96,
+            "reason": "当前会话中的确认行为，不是外部业务事实。"
+        },
+        "responseDisposition": "model_specific_reply_mode",
+        "claims": [{
+            "sourceQuote": "收到",
+            "claim": "确认已收到当前消息",
+            "scope": "conversation_acknowledgement",
+            "subject": "general",
+            "speechAct": "acknowledgement",
+            "assertionStatus": "performative_completed_by_reply",
+            "evidenceNeed": "not_needed",
+            "negativePolarity": false,
+            "confidence": 0.96,
+            "productClaim": false,
+            // Deliberately inconsistent legacy field: evidenceNeed is the semantic authority.
+            "requiresEvidence": true,
+            "evidenceRefs": [],
+            "reason": "会话确认由回复本身完成，不代表外部现实状态。"
+        }],
+        "hasCatalogClaims": false,
+        "catalogCoverageComplete": true,
+        "hasNonCatalogEvidenceClaims": true,
+        "catalogClaims": [],
+        "reason": "没有需要外部证据的现实业务断言。"
+    })
+}
+
+fn missing_semantic_authority_claim_gate_json() -> serde_json::Value {
+    let mut value = contradictory_legacy_claim_gate_json();
+    value["claims"][0]
+        .as_object_mut()
+        .expect("claim object")
+        .remove("evidenceNeed");
+    value
+}
+
+/// 低风险寒暄仍要执行独立 ClaimGate，不能为了省一次调用削弱双模型独立性。
 #[tokio::test]
 #[ignore = "requires MongoDB"]
-async fn casual_low_risk_turn_skips_claim_gate_llm_call() {
+async fn casual_low_risk_turn_still_runs_claim_gate() {
     let app = common::TestApp::start().await;
     let contact = make_managed_contact("user_casual_skip");
     app.state
@@ -169,13 +239,13 @@ async fn casual_low_risk_turn_skips_claim_gate_llm_call() {
         .await
         .expect("insert inbound message");
 
-    // 只排 Reply + Review 两条响应；ClaimGate 若被误调用会因无匹配 schema 响应
-    // 失败并 fail-closed（blocked_by_safety_guard），下方 approved 断言即会失败。
     app.llm.push_response(casual_reply_decision_json(
         "哈哈爬山好啊！这个天气正合适，我周末就宅着追了个剧～你们去的哪座山？",
         "low",
     ));
     app.llm.push_response(review_pass_json());
+    app.llm
+        .push_response(common::independent_claim_gate_pass_json());
 
     let before_calls = app.llm.calls();
     handle_managed_message(&app.state, contact.clone(), &inbound)
@@ -184,8 +254,8 @@ async fn casual_low_risk_turn_skips_claim_gate_llm_call() {
     let after_calls = app.llm.calls();
     assert_eq!(
         after_calls - before_calls,
-        2,
-        "寒暄低风险轮应只调 Reply + Review 两次 LLM（ClaimGate 被跳过）"
+        3,
+        "任何可发送正文都应执行 Reply + Review + ClaimGate 三次 LLM 调用"
     );
 
     let log = app
@@ -204,7 +274,7 @@ async fn casual_low_risk_turn_skips_claim_gate_llm_call() {
         .expect("agent_run_logs row exists");
     assert_eq!(
         log.final_review_status, "approved",
-        "跳过 ClaimGate 的寒暄轮终态必须 approved（不得误触发 hold_for_claim_gate_failure），实际 {:?}",
+        "独立 ClaimGate 通过后寒暄轮终态应 approved，实际 {:?}",
         log.final_review_status
     );
 
@@ -217,11 +287,11 @@ async fn casual_low_risk_turn_skips_claim_gate_llm_call() {
         .expect("query decision_reviews")
         .expect("decision review row exists");
     assert!(
-        review
+        !review
             .risks
             .iter()
             .any(|risk| risk == "claim_gate_skipped_casual_low_risk"),
-        "跳过必须落审计标记 claim_gate_skipped_casual_low_risk，实际 risks={:?}",
+        "发送链路不得再出现 ClaimGate 跳过标记，实际 risks={:?}",
         review.risks
     );
 
@@ -236,20 +306,162 @@ async fn casual_low_risk_turn_skips_claim_gate_llm_call() {
     assert_eq!(outbox.contact_wxid, contact.wxid);
 }
 
-/// 对照：同为寒暄文本但 riskLevel=medium（跳过条件不满足）→ ClaimGate 照跑
-/// （消费第三条 mock 响应），不落跳过标记。
+/// The semantic contract must repair a contradictory legacy boolean instead of turning a
+/// conversational performative into an unsupported-business safety hold.
 #[tokio::test]
 #[ignore = "requires MongoDB"]
-async fn casual_medium_risk_turn_still_runs_claim_gate() {
+async fn semantic_claim_contract_overrides_contradictory_legacy_evidence_flag() {
     let app = common::TestApp::start().await;
-    let contact = make_managed_contact("user_casual_medium");
+    let contact = make_managed_contact("user_semantic_contract_repair");
     app.state
         .db
         .contacts()
         .insert_one(&contact, None)
         .await
         .expect("insert managed contact");
-    let inbound = make_inbound(&contact, "msg_casual_002", "哈哈周末去爬山啦，你呢？");
+    let inbound = make_inbound(&contact, "msg_semantic_contract_001", "收到");
+    app.state
+        .db
+        .messages()
+        .insert_one(&inbound, None)
+        .await
+        .expect("insert inbound message");
+
+    app.llm
+        .push_response(casual_reply_decision_json("收到", "low"));
+    app.llm.push_response(review_pass_json());
+    app.llm
+        .push_response(contradictory_legacy_claim_gate_json());
+
+    handle_managed_message(&app.state, contact.clone(), &inbound)
+        .await
+        .expect("handle_managed_message ok");
+
+    let log = app
+        .state
+        .db
+        .agent_run_logs()
+        .find_one(
+            doc! {
+                "workspace_id": &contact.workspace_id,
+                "contact_wxid": &contact.wxid,
+            },
+            None,
+        )
+        .await
+        .expect("query agent_run_logs")
+        .expect("agent_run_logs row exists");
+    assert_eq!(
+        log.final_review_status, "approved",
+        "semantic evidenceNeed=not_needed must prevent a false safety hold"
+    );
+
+    let claim_analysis = log
+        .review
+        .get_document("claimAnalysis")
+        .expect("run log persists merged claim analysis");
+    assert_eq!(
+        claim_analysis
+            .get_bool("requiresBusinessEvidence")
+            .unwrap_or(true),
+        false
+    );
+    assert_eq!(
+        claim_analysis
+            .get_i64("unsupportedBusinessClaimCount")
+            .unwrap_or(-1),
+        0
+    );
+
+    app.state
+        .db
+        .collection_agent_send_outbox()
+        .find_one(doc! { "run_id": &log.run_id }, None)
+        .await
+        .expect("query outbox by run_id")
+        .expect("semantically safe acknowledgement must be enqueued");
+}
+
+/// Missing semantic authority is a malformed AI contract, not permission to trust a legacy
+/// boolean. The gate gets one bounded semantic re-evaluation and then applies the corrected result.
+#[tokio::test]
+#[ignore = "requires MongoDB"]
+async fn missing_evidence_need_retries_once_without_text_fallback() {
+    let app = common::TestApp::start().await;
+    let contact = make_managed_contact("user_semantic_contract_retry");
+    app.state
+        .db
+        .contacts()
+        .insert_one(&contact, None)
+        .await
+        .expect("insert managed contact");
+    let inbound = make_inbound(&contact, "msg_semantic_contract_retry_001", "明白");
+    app.state
+        .db
+        .messages()
+        .insert_one(&inbound, None)
+        .await
+        .expect("insert inbound message");
+
+    app.llm
+        .push_response(casual_reply_decision_json("收到", "low"));
+    app.llm.push_response(review_pass_json());
+    app.llm
+        .push_response(missing_semantic_authority_claim_gate_json());
+    app.llm
+        .push_response(contradictory_legacy_claim_gate_json());
+
+    let before_calls = app.llm.calls();
+    handle_managed_message(&app.state, contact.clone(), &inbound)
+        .await
+        .expect("handle_managed_message ok");
+    assert_eq!(
+        app.llm.calls() - before_calls,
+        4,
+        "Reply + Reviewer + invalid ClaimGate + one semantic contract retry"
+    );
+
+    let log = app
+        .state
+        .db
+        .agent_run_logs()
+        .find_one(
+            doc! { "run_id": { "$exists": true }, "contact_wxid": &contact.wxid },
+            None,
+        )
+        .await
+        .expect("query agent_run_logs")
+        .expect("agent_run_logs row exists");
+    assert_eq!(log.final_review_status, "approved");
+    let claim_analysis = log
+        .review
+        .get_document("claimAnalysis")
+        .expect("run log persists merged claim analysis");
+    assert_eq!(claim_analysis.get_i32("semanticContractVersion"), Ok(2));
+    assert_eq!(
+        claim_analysis.get_bool("requiresBusinessEvidence"),
+        Ok(false)
+    );
+}
+
+/// Reply Agent 与 Reviewer 可能同时漏判。即便 Reply Agent 把事实性正文伪装成
+/// casual + low + claims=[]，缺失独立 ClaimGate 结果也必须 fail-closed，原正文不能获批。
+#[tokio::test]
+#[ignore = "requires MongoDB"]
+async fn self_reported_empty_claims_cannot_bypass_independent_gate() {
+    let app = common::TestApp::start().await;
+    let contact = make_managed_contact("user_false_low_risk_claims");
+    app.state
+        .db
+        .contacts()
+        .insert_one(&contact, None)
+        .await
+        .expect("insert managed contact");
+    let inbound = make_inbound(
+        &contact,
+        "msg_false_low_001",
+        "那我明天下午直接过去可以吗？",
+    );
     app.state
         .db
         .messages()
@@ -258,22 +470,21 @@ async fn casual_medium_risk_turn_still_runs_claim_gate() {
         .expect("insert inbound message");
 
     app.llm.push_response(casual_reply_decision_json(
-        "哈哈爬山好啊！这个天气正合适，我周末就宅着追了个剧～你们去的哪座山？",
-        "medium",
+        "可以，我们门店明天下午三点一定有空位，你直接过来就行。",
+        "low",
     ));
     app.llm.push_response(review_pass_json());
-    app.llm
-        .push_response(common::independent_claim_gate_pass_json());
+    // 故意不排 ClaimGate 响应。独立闸必须真实调用并因上游结果缺失而 fail-closed；
+    // 若代码错误地相信 Reply Agent 自报的 claims=[]，本轮只会调用两次并错误获批。
 
     let before_calls = app.llm.calls();
     handle_managed_message(&app.state, contact.clone(), &inbound)
         .await
         .expect("handle_managed_message ok");
     let after_calls = app.llm.calls();
-    assert_eq!(
-        after_calls - before_calls,
-        3,
-        "risk=medium 的寒暄轮 ClaimGate 必须照跑：Reply + Review + ClaimGate = 3 次"
+    assert!(
+        after_calls - before_calls >= 3,
+        "自报低风险不能跳过独立 ClaimGate；失败后的客户保障回复允许产生额外调用"
     );
 
     let log = app
@@ -290,7 +501,10 @@ async fn casual_medium_risk_turn_still_runs_claim_gate() {
         .await
         .expect("query agent_run_logs")
         .expect("agent_run_logs row exists");
-    assert_eq!(log.final_review_status, "approved");
+    assert_eq!(
+        log.final_review_status, "blocked_by_safety_guard",
+        "独立 ClaimGate 无有效结果时必须 fail-closed"
+    );
 
     let review = app
         .state
@@ -301,11 +515,11 @@ async fn casual_medium_risk_turn_still_runs_claim_gate() {
         .expect("query decision_reviews")
         .expect("decision review row exists");
     assert!(
-        !review
+        review
             .risks
             .iter()
-            .any(|risk| risk == "claim_gate_skipped_casual_low_risk"),
-        "未跳过的轮次不得落跳过标记，实际 risks={:?}",
+            .any(|risk| risk == "independent_claim_gate_unavailable"),
+        "ClaimGate 失败必须留下可审计风险，实际 risks={:?}",
         review.risks
     );
 }

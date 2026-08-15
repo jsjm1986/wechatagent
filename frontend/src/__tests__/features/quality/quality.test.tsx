@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import QualityFeature, { OutcomeMetricsTab } from "../../../features/quality";
 
 // quality（运营成效中心）频道一体化迁移后的视觉/集成测试（追加，不改既有套件）。
-// 验证：(1) 自包含 QualityFeature 渲染面板小标题 + 四个 Tab；
+// 验证：(1) 自包含 QualityFeature 渲染面板小标题 + 三个真实质量 Tab；
 //       (2) outcome Tab 经 accountStore 选中账号驱动取数，null 指标渲染为 "—"。
 
 vi.mock("../../../stores/accountStore", () => ({
@@ -43,7 +43,7 @@ describe("QualityFeature — 一体化频道（新视觉壳）", () => {
     globalThis.fetch = realFetch;
   });
 
-  it("渲染面板小标题与四个 Tab", () => {
+  it("渲染面板小标题与三个真实质量 Tab", () => {
     installFetch([]);
     render(<QualityFeature />);
 
@@ -51,7 +51,7 @@ describe("QualityFeature — 一体化频道（新视觉壳）", () => {
     expect(screen.getByText("长期指标")).toBeInTheDocument();
     expect(screen.getByText("知识自动校验")).toBeInTheDocument();
     expect(screen.getByText("公式遵守度")).toBeInTheDocument();
-    expect(screen.getByText("产品声明标记词")).toBeInTheDocument();
+    expect(screen.queryByText("产品声明标记词")).not.toBeInTheDocument();
   });
 
   it("outcome Tab：null 指标渲染为 '—'，数值正常显示", async () => {

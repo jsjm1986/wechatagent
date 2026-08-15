@@ -383,7 +383,6 @@ export const useStrategyStore = create<StrategyState & StrategyActions>((set, ge
         prompt_fragment: profile.prompt_fragment,
         conversation_modes: profile.conversation_modes,
         business_formulas: profile.business_formulas,
-        commitment_markers: profile.commitment_markers,
         coverage_dimensions: profile.coverage_dimensions,
         threshold_overrides: profile.threshold_overrides ?? undefined,
         methodology_generator_preamble: profile.methodology_generator_preamble ?? undefined,

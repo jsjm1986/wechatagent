@@ -606,12 +606,14 @@ pub(crate) fn backoff_with_jitter_seeded(attempt: i32, jitter01: f64) -> i64 {
     base + delta
 }
 
-/// 判断 reaction outcome 是否表示用户要求停止 / cooldown（R13.4）。
+/// 判断结构化 reaction outcome 是否表示用户要求停止 / 退订 / cooldown（R13.4）。
 pub(crate) fn outcome_signals_stop(outcome: &str) -> bool {
     if outcome.is_empty() {
         return false;
     }
-    outcome.contains("stop_requested") || outcome.contains("cooldown_requested")
+    outcome.contains("stop_requested")
+        || outcome.contains("cooldown_requested")
+        || outcome == "user_replied_unsubscribed"
 }
 
 /// 一个 outbox status 是否属于"用户反应取消通道可以推进的集合"（R13.6）。
@@ -1427,6 +1429,7 @@ mod tests {
         assert!(outcome_signals_stop("user_replied_stop_requested"));
         assert!(outcome_signals_stop("user_stop_requested"));
         assert!(outcome_signals_stop("contact_cooldown_requested"));
+        assert!(outcome_signals_stop("user_replied_unsubscribed"));
         assert!(!outcome_signals_stop("user_replied_buying_signal"));
         assert!(!outcome_signals_stop("user_replied_unclassified"));
         assert!(!outcome_signals_stop(""));

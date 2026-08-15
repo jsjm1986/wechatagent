@@ -3,13 +3,10 @@ import { Workflow } from "lucide-react";
 import { api } from "../../lib/api";
 import { formatRate, formatNumber } from "../../lib/format";
 import { useAccountStore } from "../../stores/accountStore";
-import { ConfirmProvider, useConfirm } from "../../components/ui/ConfirmDialog";
-import { promptDiffBody } from "../../components/prompt/usePromptSaveConfirm";
 import { EvaluationScenariosPanel } from "./EvaluationScenariosPanel";
-import { VERSION_STATUS_LABELS, labelOf } from "../../lib/reviewLabels";
 import styles from "./Quality.module.css";
 
-// 运营成效中心频道：长期指标 / 知识自动校验 / 公式遵守度评测 / 产品声明兜底标记词。
+// 运营成效中心频道：长期指标 / 知识自动校验 / 公式遵守度评测。
 // 大页头（eyebrow/title/subtitle）由 Shell 依据 channels.ts 渲染，组件仅保留面板级小标题 + Tab 条。
 
 type OutcomeMetric = {
@@ -66,15 +63,7 @@ type AutoVerifyResult = {
   budget?: Record<string, unknown>;
 };
 
-type PromptTemplateLite = {
-  id: string;
-  promptKey: string;
-  status: string;
-  version: number;
-  content: string;
-};
-
-type QualityTab = "outcome" | "autoVerify" | "formula" | "markers";
+type QualityTab = "outcome" | "autoVerify" | "formula";
 
 export function OutcomeMetricsTab({ accountId }: { accountId?: string }) {
   const [horizon, setHorizon] = useState<"7d" | "30d">("7d");
@@ -372,214 +361,10 @@ export function FormulaAdherenceTab({ accountId }: { accountId?: string }) {
   );
 }
 
-export function ProductClaimMarkersTab() {
-  // 路径B 二次确认弹框需 <ConfirmProvider> 祖先；quality 频道未挂全局 Provider，
-  // 本 Tab 自包含补挂（独立内联 save()，与 strategyStore 无关）。
-  return (
-    <ConfirmProvider>
-      <ProductClaimMarkersTabInner />
-    </ConfirmProvider>
-  );
-}
-
-function ProductClaimMarkersTabInner() {
-  const confirm = useConfirm();
-  const [template, setTemplate] = useState<PromptTemplateLite | null>(null);
-  const [draft, setDraft] = useState<string>("");
-  const [parseError, setParseError] = useState<string>("");
-  const [saving, setSaving] = useState(false);
-  const [err, setErr] = useState<string>("");
-  const [statusMsg, setStatusMsg] = useState<string>("");
-
-  async function load() {
-    setErr("");
-    setStatusMsg("");
-    try {
-      const data = await api.get<{ items: PromptTemplateLite[] }>("/api/prompt-templates");
-      const found = (data.items || []).find(
-        (item) => item.promptKey === "user.review.product_claim_markers" && item.status === "active"
-      );
-      if (!found) {
-        setErr("未找到 active 的 user.review.product_claim_markers 模板，可能需要重置 prompt pack。");
-        return;
-      }
-      setTemplate(found);
-      setDraft(found.content);
-    } catch (e) {
-      setErr(e instanceof Error ? e.message : String(e));
-    }
-  }
-
-  useEffect(() => {
-    void load();
-  }, []);
-
-  function validateJson(text: string): string {
-    try {
-      const parsed = JSON.parse(text);
-      if (!parsed || typeof parsed !== "object") return "JSON 顶层必须是对象";
-      if (!Array.isArray(parsed.markers)) return "缺 markers 数组";
-      if (!Array.isArray(parsed.whitelistPhrases)) return "缺 whitelistPhrases 数组";
-      if (typeof parsed.whitelistWindowChars !== "number") return "whitelistWindowChars 必须是数字";
-      for (const m of parsed.markers) {
-        if (!m || typeof m !== "object") return "markers 中含非对象项";
-        if (typeof m.kind !== "string") return "marker.kind 必须是字符串";
-        if (typeof m.label !== "string") return "marker.label 必须是字符串";
-      }
-      return "";
-    } catch (e) {
-      return e instanceof Error ? e.message : String(e);
-    }
-  }
-
-  function onChangeDraft(value: string) {
-    setDraft(value);
-    setParseError(validateJson(value));
-  }
-
-  async function save(force?: boolean) {
-    if (!template) return;
-    const validation = validateJson(draft);
-    if (validation) {
-      setParseError(validation);
-      return;
-    }
-    setSaving(true);
-    setErr("");
-    setStatusMsg("");
-    try {
-      const resp = await api.put<{ status?: string; reason?: string; diff?: string }>(
-        `/api/prompt-templates/${template.id}`,
-        {
-          promptKey: template.promptKey,
-          agentKind: "user",
-          layer: "review_guard",
-          title: "产品事实风险兜底标记",
-          description: "Rust 字符串兜底 guard 使用的可编辑标记词和白名单。",
-          content: draft,
-          status: "active",
-          // force=true：管理者已逐字核对，覆盖 LLM 红线语义审查。
-          ...(force ? { force: true } : {}),
-        }
-      );
-      // 真 bug 修复：needs_human_confirm 是 200，不能静默当成功发布。
-      if (resp && resp.status === "needs_human_confirm") {
-        setSaving(false);
-        const ok = await confirm({
-          title: "改动需逐字核对后确认",
-          body: promptDiffBody(resp.reason ?? "", resp.diff ?? ""),
-          tone: "danger",
-          confirmText: "已核对，强制保存",
-          requireText: "已核对",
-        });
-        if (ok) await save(true);
-        return;
-      }
-      // publish 独立三态流：publish 可能在 update 通过后仍被 publish 自己的 LLM 闸拦。
-      // 用独立 try/catch + 内联 {force:true} 重发（不再重走 save(true)，避免 double-PUT/死循环）。
-      const doPublish = async (publishForce?: boolean): Promise<void> => {
-        try {
-          const pubResp = await api.post<{ status?: string; reason?: string; diff?: string }>(
-            `/api/prompt-templates/${template.id}/publish`,
-            publishForce ? { force: true } : {}
-          );
-          if (pubResp && pubResp.status === "needs_human_confirm") {
-            setSaving(false);
-            const ok = await confirm({
-              title: "发布前需逐字核对后确认",
-              body: promptDiffBody(pubResp.reason ?? "", pubResp.diff ?? ""),
-              tone: "danger",
-              confirmText: "已核对，强制发布",
-              requireText: "已核对",
-            });
-            // 带 force 重发 publish（不再重走 update）。
-            if (ok) await doPublish(true);
-            return;
-          }
-          setStatusMsg("已保存。注：该兜底守卫当前未启用，改动暂不影响评审行为。");
-          await load();
-        } catch (e) {
-          const message = e instanceof Error ? e.message : String(e);
-          // publish 阶段的红线 reject：内联带 force 重发 publish，不走外层 save(true)（避免 double-PUT）。
-          if (message.includes("红线语义审查拒绝")) {
-            setSaving(false);
-            const ok = await confirm({
-              title: "触碰自治边界红线，已被语义审查拦截",
-              body: promptDiffBody(message, ""),
-              tone: "danger",
-              confirmText: "已核对无误，强制发布",
-              requireText: "已核对",
-            });
-            if (ok) await doPublish(true);
-            return;
-          }
-          setErr(message);
-        }
-      };
-      // publish 的 force 与 update 的 force 独立：publish 始终先以无 force 跑自己的红线闸，
-      // force 只由 publish 自身的 confirm 产生（不继承 update 的 force）。
-      await doPublish();
-    } catch (e) {
-      const message = e instanceof Error ? e.message : String(e);
-      // Reject：4xx「红线语义审查拒绝」→ 弹框显拒绝理由 + 强制保存入口。
-      if (message.includes("红线语义审查拒绝")) {
-        setSaving(false);
-        const ok = await confirm({
-          title: "触碰自治边界红线，已被语义审查拦截",
-          body: promptDiffBody(message, ""),
-          tone: "danger",
-          confirmText: "已核对无误，强制保存",
-          requireText: "已核对",
-        });
-        if (ok) await save(true);
-        return;
-      }
-      setErr(message);
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  return (
-    <div className={styles.tabPanel}>
-      <p className={styles.desc}>
-        产品事实风险兜底的标记词与白名单短语（预留配置，当前未启用）。当前线上对产品声明的把关由
-        「已验证知识背书」机制负责——AI 只能基于已核验的知识条目做产品 / 价格 / 政策声明，否则拦截。
-        本配置为将来重新启用字符串级兜底守卫时预留，编辑后不会改变当前评审行为。
-      </p>
-      {err && <div className={styles.error}>{err}</div>}
-      {statusMsg && <div className={styles.success}>{statusMsg}</div>}
-      {template && (
-        <>
-          <small className={styles.metaLine}>
-            模板版本 v{template.version} · 状态：{labelOf(VERSION_STATUS_LABELS, template.status)}
-          </small>
-          <textarea
-            className={styles.textarea}
-            value={draft}
-            onChange={(e) => onChangeDraft(e.target.value)}
-            spellCheck={false}
-          />
-          {parseError && <div className={styles.error}>JSON 校验：{parseError}</div>}
-          <div className={styles.actions}>
-            <button className={styles.btnPrimary} onClick={() => void save()} disabled={saving || !!parseError}>
-              {saving ? "发布中" : "保存并发布"}
-            </button>
-            <button className={styles.btnGhost} onClick={() => void load()} disabled={saving}>
-              丢弃改动
-            </button>
-          </div>
-        </>
-      )}
-    </div>
-  );
-}
-
 const TABS: { id: QualityTab; label: string }[] = [
   { id: "outcome", label: "长期指标" },
   { id: "autoVerify", label: "知识自动校验" },
   { id: "formula", label: "公式遵守度" },
-  { id: "markers", label: "产品声明标记词" },
 ];
 
 export default function QualityFeature() {
@@ -616,7 +401,6 @@ export default function QualityFeature() {
         {tab === "outcome" && <OutcomeMetricsTab accountId={accountId} />}
         {tab === "autoVerify" && <AutoVerifyTab accountId={accountId} />}
         {tab === "formula" && <FormulaAdherenceTab accountId={accountId} />}
-        {tab === "markers" && <ProductClaimMarkersTab />}
       </section>
     </div>
   );

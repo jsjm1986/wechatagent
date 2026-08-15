@@ -1488,46 +1488,6 @@ function ProfileEditor({
       </details>
 
       <details className={styles.advanced}>
-        <summary>承诺标记词</summary>
-        <div className={styles.formGrid}>
-          <label className={styles.field}>
-            <span>绝对化效果承诺词（逗号分隔）</span>
-            <textarea
-              className={styles.textarea}
-              value={(draft.commitment_markers?.product_effect ?? []).join(", ")}
-              onChange={(e) =>
-                update({
-                  commitment_markers: {
-                    ...(draft.commitment_markers ?? { product_effect: [], tone_only: [] }),
-                    product_effect: e.target.value.split(",").map((s) => s.trim()).filter(Boolean),
-                  },
-                })
-              }
-              placeholder="保证 100%, 绝对有效, 一定能看到效果"
-              rows={2}
-            />
-          </label>
-          <label className={styles.field}>
-            <span>语气类夸大词（逗号分隔）</span>
-            <textarea
-              className={styles.textarea}
-              value={(draft.commitment_markers?.tone_only ?? []).join(", ")}
-              onChange={(e) =>
-                update({
-                  commitment_markers: {
-                    ...(draft.commitment_markers ?? { product_effect: [], tone_only: [] }),
-                    tone_only: e.target.value.split(",").map((s) => s.trim()).filter(Boolean),
-                  },
-                })
-              }
-              placeholder="太棒了, 绝对值, 超级划算"
-              rows={2}
-            />
-          </label>
-        </div>
-      </details>
-
-      <details className={styles.advanced}>
         <summary>方法论生成器引导语（可选）</summary>
         <label className={styles.field}>
           <span>方法论生成器引导语</span>

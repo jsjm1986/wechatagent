@@ -40,18 +40,14 @@ fn holding_safety_verdict_allows(verdict: &HoldingSafetyVerdict) -> bool {
         && !verdict.promises_outcome
 }
 
-/// 拟发给客户的过渡文案是否安全可发：非空 + 无「全自治定位禁词」+
-/// （授权类场景）不含授权 substance 之外的数字事实。任一不满足即不安全，调用方回落硬编码。
+/// 拟发给客户的过渡文案是否安全可发：非空 + （授权类场景）不含授权 substance
+/// 之外的数字事实。自然语言风险由下方独立 AI 语义审查负责。
 pub(crate) fn holding_reply_text_is_safe(
     text: &str,
     scene: HoldingReplyScene,
     authorized_substance: Option<&str>,
 ) -> bool {
     if text.trim().is_empty() {
-        return false;
-    }
-    // 运行期全自治定位禁词守卫（复用 evolution lint 同款词表）。
-    if !crate::evolution::lint::passes_forbidden_words(text) {
         return false;
     }
     // All holding scenes use the same objective quantity boundary. `None` means the authorized
@@ -100,9 +96,7 @@ async fn review_holding_reply(
 }
 
 /// 过渡/占位回复的场景化 prompt（system 段）。约束 AI 口吻、短句、不复述内部字段。
-/// 注意：本字符串**刻意不含任何禁词字面量**（否则会被 CI 的全自治定位文本 lint
-/// 扫 src/agent/ 新增行时自噬），改用「你是唯一对接人」这类正面表述框定；
-/// 运行期禁词判断完全交给 holding_reply_text_is_safe → passes_forbidden_words 兜底。
+/// 该字符串只负责指示独立模型按语义审查，不承担业务事实授权。
 fn holding_reply_system_prompt(scene: HoldingReplyScene) -> &'static str {
     match scene {
         HoldingReplyScene::GateHold =>
@@ -128,7 +122,7 @@ fn holding_reply_system_prompt(scene: HoldingReplyScene) -> &'static str {
 
 /// 生成一条给客户的过渡/占位回复。
 /// 独立预算旁路：用新 RunBudget scope 包住 LLM 调用，主 run 预算耗尽也能生成一次。
-/// 任一失败/超时/耗尽/禁词命中/数字越界 → 回落 scene 对应硬编码文案。
+/// 任一失败/超时/耗尽/语义审查不通过/数字越界 → 回落 scene 对应硬编码文案。
 /// **保证返回非空、经守卫的文案**（客户永不被晾死）。
 pub(crate) async fn generate_holding_reply(
     state: &AppState,
@@ -214,12 +208,9 @@ mod tests {
     }
 
     #[test]
-    fn forbidden_word_is_unsafe() {
-        // 含全自治定位禁词 → 不安全。用 concat! 在「人」「工」间断开拼接，
-        // 使本源码行不出现连续禁词字面量（避 CI 全自治定位文本 lint 自噬），
-        // 运行期拼回的完整串仍被 passes_forbidden_words 命中。
-        assert!(!holding_reply_text_is_safe(
-            concat!("稍等，我帮您转人", "工处理"),
+    fn natural_language_is_not_scanned_by_objective_guard() {
+        assert!(holding_reply_text_is_safe(
+            "这段自然语言由 AI 语义审查，不由服务端词表裁决",
             HoldingReplyScene::GateHold,
             None
         ));

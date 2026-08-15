@@ -1,16 +1,12 @@
 //! 提示词自然语言编辑的三层分级 + 双闸校验（spec §4.4）。
 //! 红线靠机制不靠 LLM 自觉：任何经自然语言写回 prompt_templates 的内容，
-//! 落库前强制过两道闸（禁用词 + 锚完整性），命中即拒、fail-closed。
+//! 落库前强制过结构闸（模板层级 + 锚完整性），命中即拒、fail-closed。
 //!
 //! 本模块从 routes/management_prompt_edit.rs 下沉到中立顶层模块，供人工编辑路径
 //! 与 evolution release 路径共用（两条写 prompt 的路径同享三道红线闸）。
 //!
-//! 注意：本文件位于 src/ 顶层，CI lint 会扫新增行的禁用词字面量
-//! （含测试 mod，因为只排除 */tests/* 路径而非同文件 #[cfg(test)]）。所以
-//! 非测试代码绝不内联任何禁用词 / 红线正文（只 import 锚常量，锚常量定义在
-//! prompts.rs 不在扫描区）；测试构造禁用词时用字符拼接绕过字面量。
+//! 注意：红线正文只从 prompts.rs 的锚常量加载，避免编辑器路径复制一份策略文本。
 
-use crate::evolution::lint::passes_forbidden_words;
 use crate::prompts::{
     normalize_prompt_content, DEFAULT_MODE_GATE_POLICY, DEFAULT_REPLY_FAST_TASK_REDLINE_ANCHORS,
     DEFAULT_REPLY_REDLINE_ANCHORS, DEFAULT_REPLY_SYSTEM_REDLINE_ANCHORS, DEFAULT_REVIEWER_FEWSHOT,
@@ -40,7 +36,7 @@ pub fn required_anchors(template_key: &str) -> Vec<&'static str> {
         }
         "user.reply.system" => DEFAULT_REPLY_SYSTEM_REDLINE_ANCHORS.to_vec(),
         // 注：退役的完整版 `user.reply.task` 已随种子包移除退出治理面（生产零消费；
-        // 遗留 DB 行按普通话术 key 走禁用词闸）。
+        // 遗留 DB 行按普通话术 key 处理。
         "user.reply.fast.task" => DEFAULT_REPLY_FAST_TASK_REDLINE_ANCHORS.to_vec(),
         "user.review.system" => vec![DEFAULT_REVIEWER_FEWSHOT],
         _ => Vec::new(),
@@ -67,7 +63,7 @@ pub fn prompt_edit_tier(template_key: &str) -> PromptEditTier {
     {
         return PromptEditTier::ConstrainedEditable;
     }
-    // 其余业务话术 key，可自由改（仍过禁用词闸）
+    // 其余业务话术 key，可自由改（发布时仍会走 AI 语义审查）
     PromptEditTier::FreelyEditable
 }
 
@@ -81,11 +77,7 @@ pub fn validate_prompt_edit(template_key: &str, new_content: &str) -> Result<(),
         }
         PromptEditTier::FreelyEditable | PromptEditTier::ConstrainedEditable => {}
     }
-    // 闸 1：禁用词闸，自由改与强约束层都过
-    if !passes_forbidden_words(new_content) {
-        return Err("写回内容命中禁用词表，已拒绝".to_string());
-    }
-    // 闸 2：锚完整性闸——强约束层的全部锚段（业务锚 + 红线锚）必须逐字仍在。
+    // 结构闸：强约束层的全部锚段（业务锚 + 红线锚）必须逐字仍在。
     // CRLF 归一：锚常量是 Windows 工作树的 r#"..."# 多行串，git autocrlf 跨构建
     // LF↔CRLF 互转；管理者提交的 new_content 换行风格也不受控。裸 contains 会因
     // 换行字节不同失配、误拒合法编辑 → 两边都过 normalize_prompt_content 再比
@@ -102,9 +94,8 @@ pub fn validate_prompt_edit(template_key: &str, new_content: &str) -> Result<(),
 }
 
 // ── Task 6.6 第三闸：LLM 红线语义审查（三态降级人确认）──
-// 字面双闸（validate_prompt_edit）只挡禁词字面量与锚段被删；挡不住「保留锚段、
-// 无字面禁词、却插入变相真人转介/承诺转交/削弱 grounding」的语义绕过。第三闸用
-// LLM 对 diff 增量做语义判定，靠语义不靠词表（守 agent-first）。
+// 结构闸只保护模板层级与不可删除锚段；变相真人转介、承诺转交、削弱 grounding 等
+// 风险由第三闸的 LLM 对 diff 增量做语义判定，服务端不再用自然语言词表裁决。
 // 三态：Pass 放行 / Reject(理由) 拒绝 / NeedsHumanConfirm 降级人确认
 // （LLM 重试退避后仍不可用——不 fail-closed 死路、不 fail-open 放水）。
 
@@ -137,7 +128,7 @@ pub fn compose_appended_content(current: &str, snippet: &str) -> String {
     format!("{}\n\n{}", current.trim_end(), snippet)
 }
 
-/// 第三闸：LLM 语义审查 diff 增量。先过字面双闸（调用方保证），本函数只做语义层。
+/// 第三闸：LLM 语义审查 diff 增量。结构闸由调用方保证，本函数只做语义层。
 /// 复用 generate_agent_json（项目唯一 LLM JSON 入口，自带重试/退避/RunBudget）。
 pub async fn review_prompt_edit(
     state: &AppState,
@@ -226,12 +217,6 @@ mod tests {
         DEFAULT_MODE_GATE_POLICY, DEFAULT_REPLY_REDLINE_ANCHORS, DEFAULT_REVIEWER_FEWSHOT,
     };
 
-    /// 用字符拼接构造禁用词，绕过源码字面量（本文件在 lint 扫描区，
-    /// 连续的禁用词字面量会被禁词 CI lint 扫到导致误判）。
-    fn forbidden_phrase() -> String {
-        ["人", "工", "接", "管"].concat()
-    }
-
     #[test]
     fn tier_classifies_three_layers() {
         // 强约束：含红线 / 锚的业务模板
@@ -252,7 +237,7 @@ mod tests {
             PromptEditTier::ConstrainedEditable
         );
         // 退役收缩：完整版 user.reply.task 已移出种子包与治理面，遗留 DB 行按
-        // 普通话术 key 处理（仍过禁用词闸，不再要求红线锚）。
+        // 普通话术 key 处理，不要求红线锚。
         assert_eq!(
             prompt_edit_tier("user.reply.task"),
             PromptEditTier::FreelyEditable
@@ -270,13 +255,12 @@ mod tests {
     }
 
     #[test]
-    fn dual_gate_rejects_forbidden_words() {
-        // 禁用词闸：写回含禁用词被拒（fail-closed）
-        let bad = format!(
-            "{DEFAULT_MODE_GATE_POLICY}\n遇到难题就{}",
-            forbidden_phrase()
+    fn structure_gate_does_not_scan_natural_language() {
+        let text = format!(
+            "{DEFAULT_MODE_GATE_POLICY}\n{}\n包含任意自然语言内容，由 AI 语义审查决定",
+            DEFAULT_REPLY_REDLINE_ANCHORS.join("\n")
         );
-        assert!(validate_prompt_edit("user.reply.policy", &bad).is_err());
+        assert!(validate_prompt_edit("user.reply.policy", &text).is_ok());
     }
 
     #[test]
@@ -300,7 +284,7 @@ mod tests {
 
     #[test]
     fn dual_gate_allows_valid_constrained_edit() {
-        // 保留全部锚（业务锚 + 红线锚）+ 无禁用词 + 追加业务措辞 → 放行
+        // 保留全部锚（业务锚 + 红线锚）+ 追加业务措辞 → 放行；自然语言风险交给 AI 闸。
         let redlines: String = DEFAULT_REPLY_REDLINE_ANCHORS.join("\n");
         let ok = format!("{DEFAULT_MODE_GATE_POLICY}\n{redlines}\n\n补充：本行业语气更稳重。");
         assert!(validate_prompt_edit("user.reply.policy", &ok).is_ok());
@@ -314,11 +298,13 @@ mod tests {
     }
 
     #[test]
-    fn freely_editable_only_checks_forbidden_words() {
-        // 可自由改层：仍过禁用词闸，但不要求锚段
+    fn freely_editable_skips_natural_language_word_gate() {
         assert!(validate_prompt_edit("knowledge.chat.draft_chunk", "随便写业务话术").is_ok());
-        let bad = format!("必要时{}", forbidden_phrase());
-        assert!(validate_prompt_edit("knowledge.chat.draft_chunk", &bad).is_err());
+        assert!(validate_prompt_edit(
+            "knowledge.chat.draft_chunk",
+            "任何自然语言内容都不由服务端词表裁决"
+        )
+        .is_ok());
     }
 
     #[test]

@@ -2,6 +2,7 @@ use mongodb::bson::{doc, to_document, DateTime};
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::time::{Duration, Instant};
 
 use crate::{
     error::{AppError, AppResult},
@@ -24,6 +25,13 @@ use crate::{
 /// 转述）也以本值为唯一阻塞上界。
 pub(crate) const MCP_CLIENT_TIMEOUT_SECONDS: u64 = 60;
 
+/// A cached Streamable-HTTP session is revalidated after this much idle time.
+///
+/// The server may expire/evict a session without restarting the process.  A
+/// read-only MCP request can safely refresh that session before a non-idempotent
+/// send crosses the remote boundary.
+const MCP_SESSION_REVALIDATION_INTERVAL: Duration = Duration::from_secs(30);
+
 /// 客户消息发送的边界结果。`SafeToRetry` 表示请求可证明没有进入不可逆投递；
 /// `DeliveryUncertain` 表示发送请求可能已被远端接收，但本地没有可信回执。
 #[derive(Debug, thiserror::Error)]
@@ -32,6 +40,12 @@ pub(crate) enum McpSendError {
     SafeToRetry(String),
     #[error("delivery uncertain: {0}")]
     DeliveryUncertain(String),
+}
+
+#[derive(Clone)]
+struct CachedSession {
+    id: Option<String>,
+    validated_at: Instant,
 }
 
 #[derive(Clone)]
@@ -45,7 +59,11 @@ pub struct McpClient {
     /// `gewe-multi-tenant` 即此类，失效返 HTTP 404 `Unknown MCP session` → 丢缓存重连一次）；
     /// `None` = server 无状态（initialize 未回 session 头，如无状态 mock）→ 后续请求不带 session 头。
     /// MCP 规范里 `mcp-session-id` 是可选的，两类 server 都要兼容。
-    sessions: std::sync::Arc<dashmap::DashMap<String, Option<String>>>,
+    /// Cached session plus the monotonic time of its last successful request.
+    /// Keeping both values in one map makes stale-session invalidation atomic:
+    /// a concurrent refresh cannot have its timestamp removed with the old
+    /// session.
+    sessions: std::sync::Arc<dashmap::DashMap<String, CachedSession>>,
     /// roster 后台刷新的 per-account in-flight 去重标记(键=account_id)。
     /// spawn_roster_refresh 抢锁:键已存在→放弃本次spawn(全局同一账号同时只有一个
     /// 后台拉取任务),消除"前端8s force轮询叠加spawn→并发打爆MCP SSE并发上限→大body
@@ -81,11 +99,56 @@ impl McpClient {
     async fn ensure_session(&self, base_url: &str, api_key: &str) -> AppResult<Option<String>> {
         let cache_key = Self::session_cache_key(base_url, api_key);
         if let Some(existing) = self.sessions.get(&cache_key) {
-            return Ok(existing.clone());
+            return Ok(existing.id.clone());
         }
         let session_id = self.initialize_session(base_url, api_key).await?;
-        self.sessions.insert(cache_key, session_id.clone());
+        self.sessions.insert(
+            cache_key,
+            CachedSession {
+                id: session_id.clone(),
+                validated_at: Instant::now(),
+            },
+        );
         Ok(session_id)
+    }
+
+    fn session_needs_validation(&self, base_url: &str, api_key: &str) -> bool {
+        let cache_key = Self::session_cache_key(base_url, api_key);
+        self.sessions
+            .get(&cache_key)
+            .map(|cached| cached.validated_at.elapsed() >= MCP_SESSION_REVALIDATION_INTERVAL)
+            .unwrap_or(true)
+    }
+
+    fn mark_session_validated(
+        &self,
+        base_url: &str,
+        api_key: &str,
+        expected_session: Option<&str>,
+    ) {
+        if let Some(mut cached) = self
+            .sessions
+            .get_mut(&Self::session_cache_key(base_url, api_key))
+        {
+            if cached.id.as_deref() == expected_session {
+                cached.validated_at = Instant::now();
+            }
+        }
+    }
+
+    /// Remove a cached session only when it is still the session that failed.
+    /// A concurrent request may already have installed a fresh session; an
+    /// unconditional remove would otherwise delete the replacement.
+    fn invalidate_session_if_matches(
+        &self,
+        base_url: &str,
+        api_key: &str,
+        expected_session: Option<&str>,
+    ) {
+        let cache_key = Self::session_cache_key(base_url, api_key);
+        self.sessions.remove_if(&cache_key, |_, cached| {
+            cached.id.as_deref() == expected_session
+        });
     }
 
     /// 跑 MCP `initialize` 握手，返回 server 下发的 `mcp-session-id`（有状态 server）
@@ -154,8 +217,7 @@ impl McpClient {
             let body = response.text().await?;
             // 会话失效：丢缓存重握手一次（server 重启常见），仍失败则如实报错。
             if status.as_u16() == 404 && !reinitialized {
-                self.sessions
-                    .remove(&Self::session_cache_key(base_url, api_key));
+                self.invalidate_session_if_matches(base_url, api_key, session_id.as_deref());
                 reinitialized = true;
                 continue;
             }
@@ -165,8 +227,46 @@ impl McpClient {
                     format!("MCP HTTP {status}: {}", truncate_for_error(&body)),
                 ));
             }
-            return parse_mcp_response_body(&body);
+            let parsed = parse_mcp_response_body(&body)?;
+            self.mark_session_validated(base_url, api_key, session_id.as_deref());
+            return Ok(parsed);
         }
+    }
+
+    /// Validate an idle session using a read-only request.  If the server has
+    /// evicted the cached session, `post_rpc` clears it and safely re-handshakes
+    /// before this method returns.  No customer message has crossed the remote
+    /// send boundary yet, so all failures remain safe to retry.
+    async fn validate_session_before_send(
+        &self,
+        base_url: &str,
+        api_key: &str,
+        account_alias: Option<&str>,
+    ) -> Result<(), McpSendError> {
+        if !self.session_needs_validation(base_url, api_key) {
+            return Ok(());
+        }
+
+        let mut params = json!({});
+        if let (Some(alias), Some(obj)) = (account_alias, params.as_object_mut()) {
+            obj.insert("account_alias".to_string(), json!(alias));
+        }
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": uuid::Uuid::new_v4().to_string(),
+            "method": "tools/list",
+            "params": params
+        });
+        let body = self
+            .post_rpc(base_url, api_key, &request)
+            .await
+            .map_err(|err| McpSendError::SafeToRetry(err.to_string()))?;
+        if let Some(error) = body.get("error") {
+            return Err(McpSendError::SafeToRetry(format!(
+                "MCP session validation failed: {error}"
+            )));
+        }
+        Ok(())
     }
 
     pub async fn call_tool_with_key<A: Serialize>(
@@ -245,6 +345,10 @@ impl McpClient {
             "params": { "name": tool_name, "arguments": arguments }
         });
 
+        // Revalidate an idle session before the irreversible send boundary.
+        self.validate_session_before_send(base_url, api_key, account_alias)
+            .await?;
+
         // initialize 尚未提交客户消息，因此这里的任何失败都可安全重试。
         let session_id = self
             .ensure_session(base_url, api_key)
@@ -272,6 +376,12 @@ impl McpClient {
             .text()
             .await
             .map_err(|err| McpSendError::DeliveryUncertain(err.to_string()))?;
+        if status.as_u16() == 404 {
+            // Do not replay this send: the request crossed the network
+            // boundary.  Invalidate the stale cache so the next independent
+            // send can establish a fresh session instead of failing again.
+            self.invalidate_session_if_matches(base_url, api_key, session_id.as_deref());
+        }
         if !status.is_success() {
             return Err(McpSendError::DeliveryUncertain(format!(
                 "MCP HTTP {status}: {}",
@@ -280,6 +390,7 @@ impl McpClient {
         }
         let body = parse_mcp_response_body(&body)
             .map_err(|err| McpSendError::DeliveryUncertain(err.to_string()))?;
+        self.mark_session_validated(base_url, api_key, session_id.as_deref());
         if let Some(error) = body.get("error") {
             return Err(McpSendError::SafeToRetry(format!(
                 "MCP tool {tool_name} failed: {error}"
@@ -1149,7 +1260,14 @@ pub fn spawn_roster_refresh(state: AppState, workspace_id: String, account_id: S
 
 #[cfg(test)]
 mod sse_parse_tests {
-    use super::{parse_mcp_response_body, McpClient};
+    use super::{parse_mcp_response_body, McpClient, MCP_SESSION_REVALIDATION_INTERVAL};
+    use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
+    use wiremock::{
+        matchers::{method, path},
+        Mock, MockServer, Request, Respond, ResponseTemplate,
+    };
 
     #[test]
     fn parses_sse_single_data_line() {
@@ -1197,6 +1315,137 @@ mod sse_parse_tests {
         assert_eq!(
             McpClient::session_cache_key("http://h1:3001/", "keyA"),
             McpClient::session_cache_key("http://h1:3001", "keyA")
+        );
+    }
+
+    #[test]
+    fn stale_invalidation_does_not_remove_replacement_session() {
+        let client =
+            McpClient::new("http://mcp.test".to_string(), "test-key".to_string()).expect("client");
+        let cache_key = McpClient::session_cache_key("http://mcp.test", "test-key");
+        client.sessions.insert(
+            cache_key.clone(),
+            super::CachedSession {
+                id: Some("fresh-session".to_string()),
+                validated_at: Instant::now(),
+            },
+        );
+
+        client.invalidate_session_if_matches("http://mcp.test", "test-key", Some("stale-session"));
+
+        assert_eq!(
+            client
+                .sessions
+                .get(&cache_key)
+                .and_then(|cached| cached.id.clone()),
+            Some("fresh-session".to_string())
+        );
+    }
+
+    struct StaleSessionRefreshResponder {
+        calls: AtomicUsize,
+    }
+
+    impl Respond for StaleSessionRefreshResponder {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let body: serde_json::Value =
+                serde_json::from_slice(&request.body).expect("valid JSON-RPC request");
+            let method_name = body
+                .get("method")
+                .and_then(serde_json::Value::as_str)
+                .expect("method in JSON-RPC request");
+
+            match call {
+                // The cached session is deliberately stale.  This request is
+                // read-only, so the client may safely re-handshake.
+                0 => {
+                    assert_eq!(method_name, "tools/list");
+                    ResponseTemplate::new(404).set_body_json(json!({
+                        "error": "Unknown MCP session"
+                    }))
+                }
+                1 => {
+                    assert_eq!(method_name, "initialize");
+                    ResponseTemplate::new(200)
+                        .insert_header("mcp-session-id", "fresh-session")
+                        .set_body_json(json!({
+                            "jsonrpc": "2.0",
+                            "id": body.get("id").cloned().unwrap_or_else(|| json!(1)),
+                            "result": { "protocolVersion": "2024-11-05", "capabilities": {} }
+                        }))
+                }
+                2 => {
+                    assert_eq!(method_name, "tools/list");
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "jsonrpc": "2.0",
+                        "id": body.get("id").cloned().unwrap_or_else(|| json!(1)),
+                        "result": { "tools": [] }
+                    }))
+                }
+                3 => {
+                    assert_eq!(method_name, "tools/call");
+                    assert_eq!(
+                        request
+                            .headers
+                            .get("mcp-session-id")
+                            .and_then(|value| value.to_str().ok()),
+                        Some("fresh-session")
+                    );
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "jsonrpc": "2.0",
+                        "id": body.get("id").cloned().unwrap_or_else(|| json!(1)),
+                        "result": { "structuredContent": { "ok": true, "newMsgId": "msg-1" } }
+                    }))
+                }
+                _ => panic!("unexpected MCP request #{call}: {body}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn send_revalidates_stale_session_before_remote_boundary() {
+        let server = MockServer::start().await;
+        let responder = StaleSessionRefreshResponder {
+            calls: AtomicUsize::new(0),
+        };
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .respond_with(responder)
+            .mount(&server)
+            .await;
+
+        let client = McpClient::new(server.uri(), "test-key".to_string()).expect("client");
+        let cache_key = McpClient::session_cache_key(&server.uri(), "test-key");
+        client.sessions.insert(
+            cache_key.clone(),
+            super::CachedSession {
+                id: Some("stale-session".to_string()),
+                validated_at: Instant::now()
+                    - MCP_SESSION_REVALIDATION_INTERVAL
+                    - std::time::Duration::from_secs(1),
+            },
+        );
+
+        let result = client
+            .call_send_tool_with_key(
+                &server.uri(),
+                "test-key",
+                "message_send_text",
+                json!({ "recipient": "wxid_test", "content": "hello" }),
+                None,
+            )
+            .await
+            .expect("send should use refreshed session");
+
+        assert_eq!(result.pointer("/ok"), Some(&json!(true)));
+        assert_eq!(
+            client
+                .sessions
+                .get(&McpClient::session_cache_key(&server.uri(), "test-key"))
+                .is_some(),
+            true,
+            "successful validation/send should keep a fresh timestamp"
         );
     }
 }

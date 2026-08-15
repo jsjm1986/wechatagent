@@ -98,43 +98,6 @@ pub(crate) fn render_referral_overview(candidates: &[&ReferralCard]) -> String {
     out
 }
 
-/// Narrow deterministic signal for a customer explicitly asking for the configured advisor path.
-///
-/// This does not decide to send a card. It only allows Gateway to load the reviewed Full candidate
-/// list. Negated and quoted/example-like mentions stay out, so ordinary discussion of the feature
-/// does not cause a business-tier escalation.
-pub(crate) fn explicitly_requests_referral_context(content: &str) -> bool {
-    let normalized: String = content
-        .chars()
-        .filter(|ch| {
-            !ch.is_whitespace() && !matches!(ch, '，' | ',' | '。' | '！' | '!' | '？' | '?')
-        })
-        .collect();
-    if normalized.is_empty()
-        || ["如果", "比如", "例如", "假设", "示例", "文案", "怎么回复"]
-            .iter()
-            .any(|marker| normalized.contains(marker))
-    {
-        return false;
-    }
-    const REQUESTS: &[&str] = &[
-        "安排顾问",
-        "推荐顾问",
-        "引荐顾问",
-        "顾问对接",
-        "联系顾问",
-        "专属顾问",
-        "一对一顾问",
-    ];
-    const NEGATIONS: &[&str] = &["不用", "不要", "不需要", "无需", "先别", "暂不", "别再"];
-    REQUESTS.iter().any(|request| {
-        normalized.match_indices(request).any(|(index, _)| {
-            let prefix = &normalized[..index];
-            !NEGATIONS.iter().any(|negation| prefix.ends_with(negation))
-        })
-    })
-}
-
 pub(crate) fn render_referral_lines(
     candidates: &[&ReferralCard],
     already: Option<&AlreadyReferred>,
@@ -434,26 +397,6 @@ mod tests {
         assert!(!overview.contains("64a1f2c3e4b5a697889a0011"));
         assert!(!overview.contains("wxid_boss"));
         assert_eq!(render_referral_overview(&[]), "");
-    }
-
-    #[test]
-    fn explicit_referral_request_is_narrow_and_rejects_negated_or_quoted_mentions() {
-        for text in [
-            "我想尽快签约，能安排顾问对接吗？",
-            "可以推荐一位专属顾问吗",
-            "我需要一对一顾问聊下细节",
-        ] {
-            assert!(explicitly_requests_referral_context(text), "{text}");
-        }
-        for text in [
-            "不用安排顾问，我先自己看看",
-            "暂不需要顾问对接",
-            "如果客户问能安排顾问吗，该怎么回复",
-            "你们的顾问制度是怎么设计的",
-            "我想了解课程内容和价格",
-        ] {
-            assert!(!explicitly_requests_referral_context(text), "{text}");
-        }
     }
 
     #[test]

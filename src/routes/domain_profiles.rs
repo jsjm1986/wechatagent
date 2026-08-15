@@ -1076,17 +1076,16 @@ pub async fn activate_domain_profile(
 }
 
 /// 「危险开关」字段集：直接左右 AI 能否瞎编产品 / 自学习方向 / 人格本体 / 风控阈值 /
-/// 交易事实注入 / 评审取向 / 模式-闸说明的 13 个字段。publish 对所有字段都不改变运行时；
+/// 交易事实注入 / 评审取向 / 模式-闸说明的 12 个字段。publish 对所有字段都不改变运行时；
 /// 此列表用于响应中标出相对当前 active 的高风险差异，帮助管理员在显式 activate 前重点审阅。
 /// `reviewer_orientation`（评审重点取向 / 转化平衡 / few-shot 打分锚）与
 /// `mode_gate_policy_override`（模式与 5 闸说明散文）直接改写喂给 Review/Reply Agent 的
 /// 取向 prompt，G31 起一并纳入风险提示。黑名单外字段仍不列入风险提示，但也必须经过
 /// 独立 activate 才进入运行时。
-const RISKY_FIELD_NAMES: [&str; 13] = [
+const RISKY_FIELD_NAMES: [&str; 12] = [
     "soul_override",
     "methodology_override",
     "conversation_mode_policy",
-    "commitment_markers",
     "conversation_modes",
     "operation_mode",
     "grounding_gate_bypass_without_claim",
@@ -1098,9 +1097,10 @@ const RISKY_FIELD_NAMES: [&str; 13] = [
     "mode_gate_policy_override",
 ];
 
-/// 比对两份 profile 的 13 个危险字段，返回**发生变化**的字段名列表（顺序与
+/// 比对两份 profile 的 12 个危险字段，返回**发生变化**的字段名列表（顺序与
 /// [`RISKY_FIELD_NAMES`] 一致）。整体相等比较（逐字段 `!=`，偏保守：宁可多一次确认也
-/// 不漏判）。`commitment_markers` / `operation_mode` / `outcome_polarity` /
+/// 不漏判）。历史 `commitment_markers` 不在审计清单内：它既不再写入，也不参与运行时语义判定；
+/// `operation_mode` / `outcome_polarity` /
 /// `threshold_overrides` / `reviewer_orientation` 依赖各自类型的 `PartialEq`（见 `models.rs`）。
 ///
 /// 纯函数、无 IO，供 `publish_domain_profile` 生成审阅提示 + 单测共用。空 Vec = 无危险变更。
@@ -1115,35 +1115,32 @@ pub fn risky_fields_changed(old: &DomainProfile, new: &DomainProfile) -> Vec<&'s
     if old.conversation_mode_policy != new.conversation_mode_policy {
         changed.push(RISKY_FIELD_NAMES[2]);
     }
-    if old.commitment_markers != new.commitment_markers {
+    if old.conversation_modes != new.conversation_modes {
         changed.push(RISKY_FIELD_NAMES[3]);
     }
-    if old.conversation_modes != new.conversation_modes {
+    if old.operation_mode != new.operation_mode {
         changed.push(RISKY_FIELD_NAMES[4]);
     }
-    if old.operation_mode != new.operation_mode {
+    if old.grounding_gate_bypass_without_claim != new.grounding_gate_bypass_without_claim {
         changed.push(RISKY_FIELD_NAMES[5]);
     }
-    if old.grounding_gate_bypass_without_claim != new.grounding_gate_bypass_without_claim {
+    if old.distrust_self_reported_low_risk != new.distrust_self_reported_low_risk {
         changed.push(RISKY_FIELD_NAMES[6]);
     }
-    if old.distrust_self_reported_low_risk != new.distrust_self_reported_low_risk {
+    if old.outcome_polarity != new.outcome_polarity {
         changed.push(RISKY_FIELD_NAMES[7]);
     }
-    if old.outcome_polarity != new.outcome_polarity {
+    if old.threshold_overrides != new.threshold_overrides {
         changed.push(RISKY_FIELD_NAMES[8]);
     }
-    if old.threshold_overrides != new.threshold_overrides {
+    if old.transaction_facts_enabled != new.transaction_facts_enabled {
         changed.push(RISKY_FIELD_NAMES[9]);
     }
-    if old.transaction_facts_enabled != new.transaction_facts_enabled {
+    if old.reviewer_orientation != new.reviewer_orientation {
         changed.push(RISKY_FIELD_NAMES[10]);
     }
-    if old.reviewer_orientation != new.reviewer_orientation {
-        changed.push(RISKY_FIELD_NAMES[11]);
-    }
     if old.mode_gate_policy_override != new.mode_gate_policy_override {
-        changed.push(RISKY_FIELD_NAMES[12]);
+        changed.push(RISKY_FIELD_NAMES[11]);
     }
     changed
 }
@@ -1169,9 +1166,13 @@ fn strip_backend_managed_keys(body: &Document) -> Document {
         "created_at",
         "updated_at",
     ];
+    // Deprecated semantic word-list field. It remains deserializable for old rows, but new
+    // writes must discard it so the legacy classifier cannot be resurrected through the API.
+    const RETIRED_CONTENT_KEYS: &[&str] = &["commitment_markers"];
     let mut set_doc = Document::new();
     for (k, v) in body.iter() {
-        if BACKEND_MANAGED_KEYS.contains(&k.as_str()) {
+        if BACKEND_MANAGED_KEYS.contains(&k.as_str()) || RETIRED_CONTENT_KEYS.contains(&k.as_str())
+        {
             continue;
         }
         set_doc.insert(k.clone(), v.clone());
@@ -1302,6 +1303,10 @@ mod tests {
         let body = doc! {
             "display_name": "情感陪伴",
             "grounding_gate_bypass_without_claim": true,
+            "commitment_markers": {
+                "product_effect": ["不要再写入"],
+                "tone_only": ["不要再写入"]
+            },
             // 以下后端管理键必须被剥离,不可经 PUT 篡改：
             "is_active": true,
             "version": 99_i32,
@@ -1332,6 +1337,7 @@ mod tests {
             "id",
             "workspace_id",
             "profile_id",
+            "commitment_markers",
         ] {
             assert!(set_doc.get(k).is_none(), "后端管理键 {k} 必须被剥离");
         }
@@ -1510,19 +1516,15 @@ mod tests {
     }
 
     #[test]
-    fn risky_fields_changed_commitment_markers_uses_partial_eq() {
-        // 钉死 CommitmentMarkers 的 PartialEq derive 生效：改其内 Vec 即被检出。
+    fn risky_fields_changed_ignores_retired_commitment_markers() {
+        // 旧词表字段不再是运行时策略，也不应触发激活前风险提示。
         let base = default_domain_profile("ws");
         let mut edited = base.clone();
         edited
             .commitment_markers
             .product_effect
             .push("根治率".to_string());
-        assert_eq!(
-            risky_fields_changed(&base, &edited),
-            vec!["commitment_markers"],
-            "CommitmentMarkers 内层 Vec 变更经 PartialEq 检出"
-        );
+        assert!(risky_fields_changed(&base, &edited).is_empty());
     }
 
     #[test]

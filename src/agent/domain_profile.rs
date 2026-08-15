@@ -18,7 +18,7 @@
 //! 等价于当前写死在源码里的销售域行为**：
 //!
 //! - 画像维度 = `customer_stage` / `intent_level`（对齐 `decision_taxonomy::TAGGED_FIELDS`）；
-//! - 承诺词表 = `guards::commitment_claim_class` 的 5 + 3 词（逐字复刻）；
+//! - `commitment_markers` 仅作为历史配置字段保留，不参与语义、风险或发送判定；
 //! - completeness 维度 = `catalog.rs` 的五维 coverage（逐字复刻）。
 //!
 //! 这保证 Phase 1 把消费点切到 profile 后，DEFAULT_PROFILE 下的所有现有 PBT /
@@ -734,10 +734,9 @@ pub fn answering_mode_labels(profile: Option<&AnsweringModeProfile>) -> (String,
 
 /// 构造内置 DEFAULT_PROFILE。内容逐字等价当前源码写死的销售域行为。
 ///
-/// 注意：这里复刻的常量与以下源码点**必须保持同步**，Phase 1 切换消费点后由
+/// 注意：这里复刻的结构化默认值与以下源码点**必须保持同步**，Phase 1 切换消费点后由
 /// 等价性测试锁死：
 /// - `src/agent/decision_taxonomy.rs::TAGGED_FIELDS`（customer_stage / intent_level）
-/// - `src/agent/guards.rs::commitment_claim_class`（product_effect / tone_only 词表）
 /// - `src/routes/knowledge/catalog.rs`（五维 coverage）
 pub fn default_domain_profile(workspace_id: &str) -> DomainProfile {
     let now = mongodb::bson::DateTime::now();
@@ -770,21 +769,8 @@ pub fn default_domain_profile(workspace_id: &str) -> DomainProfile {
         // H9（第 20 点）：DEFAULT 对话模式判定规则 = None → 保留 policy 写死的销售判定段
         // （逐字等价、销售域零变化）。换行业声明本字段即整段替换判定规则。
         conversation_mode_policy: None,
-        commitment_markers: CommitmentMarkers {
-            // 逐字复刻 guards.rs::commitment_claim_class
-            product_effect: vec![
-                "成功率".to_string(),
-                "见效".to_string(),
-                "回款".to_string(),
-                "百分之".to_string(),
-                "百分百".to_string(),
-            ],
-            tone_only: vec![
-                "保证".to_string(),
-                "一定能".to_string(),
-                "绝对".to_string(),
-            ],
-        },
+        // 历史配置字段保留以兼容已存储 profile；运行时不读取它做关键词判定。
+        commitment_markers: CommitmentMarkers::default(),
         coverage_dimensions: vec![
             // 逐字复刻 catalog.rs 五维 + 命中锚点散文（H5-b：anchor_hint 注入审计 prompt）。
             CoverageDimension { key: "capability".to_string(), display_name: "能力".to_string(), required: false, review_topic_aliases: vec!["功能".to_string(), "产品能力".to_string(), "服务能力".to_string()], anchor_hint: Some("有 verified 切片陈述产品/服务\"能做什么\"的具体能力或功能事实。".to_string()), initial_signal: Some("verified".to_string()) },
@@ -1420,26 +1406,6 @@ mod tests {
     }
 
     #[test]
-    fn default_profile_commitment_markers_match_guards_verbatim() {
-        // 跨模块等价护栏（修复 G）：DEFAULT seed 必须逐字等于 guards 的 fallback const
-        // 单一真相源——直接引用 guards::{PRODUCT_EFFECT_MARKERS, TONE_ONLY_MARKERS}，
-        // 而非各自抄一份字面量。此前本测试只断言 seed==内联字面量、从不引用 guards const，
-        // 故 guards const 若被改，seed 与 fallback 漂移也照样绿（与 outcome_polarity 的
-        // 引用式同源相比缺一层保护）。现升级为真交叉引用，锁死两侧任一漂移。
-        let p = default_domain_profile("ws-1");
-        assert_eq!(
-            p.commitment_markers.product_effect,
-            crate::agent::guards::PRODUCT_EFFECT_MARKERS.to_vec(),
-            "DEFAULT seed product_effect 必须与 guards::PRODUCT_EFFECT_MARKERS 逐字一致"
-        );
-        assert_eq!(
-            p.commitment_markers.tone_only,
-            crate::agent::guards::TONE_ONLY_MARKERS.to_vec(),
-            "DEFAULT seed tone_only 必须与 guards::TONE_ONLY_MARKERS 逐字一致"
-        );
-    }
-
-    #[test]
     fn default_profile_coverage_matches_catalog_five_dims() {
         let p = default_domain_profile("ws-1");
         let keys: Vec<&str> = p
@@ -1687,10 +1653,13 @@ mod tests {
     fn default_profile_bson_round_trip() {
         let p = default_domain_profile("ws-1");
         let doc = mongodb::bson::to_document(&p).expect("serialize");
+        assert!(!doc.contains_key("commitment_markers"));
         let parsed: DomainProfile = mongodb::bson::from_document(doc).expect("deserialize");
         assert_eq!(parsed.profile_id, p.profile_id);
         assert_eq!(parsed.profile_dimensions.len(), 2);
-        assert_eq!(parsed.commitment_markers.product_effect.len(), 5);
+        // 旧承诺词配置字段只读兼容，新的 BSON 不应再写出该字段。
+        assert!(parsed.commitment_markers.product_effect.is_empty());
+        assert!(parsed.commitment_markers.tone_only.is_empty());
         // H11：outcome_polarity 经 BSON 往返不丢（camelCase positive/negative）。
         assert_eq!(
             parsed.outcome_polarity.positive,

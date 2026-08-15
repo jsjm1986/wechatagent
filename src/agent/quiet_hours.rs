@@ -5,9 +5,8 @@
 //! 消息回复——最像真人（睡觉时不回、醒来看完所有消息再答）。主动发送（planner
 //! 催进 / 承诺跟进）若在静默时段到点，则**重排**到醒来时刻而非取消（避免丢承诺）。
 //!
-//! 唯一豁免（S5-3）：交易域 profile 下的**显式购买/付款承诺**入站即时应答、不等醒来
-//! （半夜要下单的客户等 10 小时 = 直接丢单），见
-//! [`bypass_deferral_for_explicit_buying_intent`]。
+//! 所有入站都遵守该时段策略；业务意图和交易意图由唤醒后的 AI 语义链路判断，
+//! 不在排程入口通过关键词绕过静默时段。
 //!
 //! 时区：用**运营参数固定偏移** `quiet_hours_tz_offset_hours`（小时，如中国 +8），
 //! 不依赖部署宿主时区（`chrono::Local` 取的是进程时区，容器多默认 UTC，会让
@@ -113,28 +112,6 @@ pub(crate) fn next_wake_at(
         tz_offset_hours,
         jitter,
     ))
-}
-
-/// S5-3：静默时段 defer 的**显式交易意图豁免**判定（确定性、零 LLM 成本）。
-///
-/// 与 reaction 确定性购买下限（`reaction.rs` 的 `deterministic_buying`）**同一词表、
-/// 同一语义门**：交易域 profile（`transaction_facts_enabled=true`）+ 显式购买/付款
-/// 承诺短语（[`super::reaction::explicit_buying_intent`]：≤120 字、反例 marker 过滤）。
-/// 两个条件缺一不可——非交易域（情感陪伴等）即便命中购买短语也不豁免，杜绝
-/// admin 误配下交易语义渗入非交易对话。
-///
-/// 设计边界：v1 刻意只做交易词表豁免，**不做"高意向阶段"判定**——阶段集合是
-/// 行业可配的（`system_taxonomies` / DomainProfile），硬编码销售阶段违反通用化；
-/// 后续若需要按阶段豁免，应走 DomainProfile 配置声明，而不是在这里加分支。
-///
-/// 放在 quiet_hours 模块（而非 webhooks）：`reaction` 是 `agent` 的私有子模块，
-/// 词表函数 `pub(crate)` 但模块路径对 crate 根不可见；本模块是 `pub(crate) mod`，
-/// 由同 parent 内转发即可让 webhooks 消费，无须放宽 `reaction` 模块本身的可见性。
-pub(crate) fn bypass_deferral_for_explicit_buying_intent(
-    active_profile: &crate::models::DomainProfile,
-    content: &str,
-) -> bool {
-    active_profile.transaction_facts_enabled && super::reaction::explicit_buying_intent(content)
 }
 
 /// 解析某 contact 的**有效作息门控开关**——现行语义是 **workspace 开关唯一权威**：
@@ -349,40 +326,5 @@ mod tests {
 
         assert!(effective_quiet_hours_enabled(&contact, &profile, true));
         assert!(!effective_quiet_hours_enabled(&contact, &profile, false));
-    }
-
-    // ── S5-3：静默 defer 的显式交易意图豁免门 ──────────────────────────
-
-    /// 交易域（DEFAULT 销售 profile，transaction_facts_enabled=true）+ 显式购买/
-    /// 付款承诺 → 豁免为真；寒暄、反例 marker（"如果"假设句）不豁免。
-    #[test]
-    fn buying_intent_bypass_hits_only_explicit_commitment_on_transaction_profile() {
-        let tx = crate::agent::domain_profile::default_domain_profile("ws-quiet-tx");
-        assert!(bypass_deferral_for_explicit_buying_intent(
-            &tx,
-            "我要买，现在付款"
-        ));
-        assert!(!bypass_deferral_for_explicit_buying_intent(
-            &tx,
-            "今天好累呀，晚点再聊"
-        ));
-        // 与 reaction 确定性购买下限同一词表同一语义：假设/反例 marker 一样被过滤。
-        assert!(!bypass_deferral_for_explicit_buying_intent(
-            &tx,
-            "如果我要买，现在付款有优惠吗"
-        ));
-        assert!(!bypass_deferral_for_explicit_buying_intent(&tx, "先不买了"));
-    }
-
-    /// 非交易域（情感陪伴 example，transaction_facts_enabled=false）：同一购买短语
-    /// 也不豁免——profile 门与词表门缺一不可。
-    #[test]
-    fn buying_intent_bypass_requires_transaction_profile() {
-        let nontx =
-            crate::agent::domain_profile::example_emotional_companion_profile("ws-quiet-nontx");
-        assert!(!bypass_deferral_for_explicit_buying_intent(
-            &nontx,
-            "我要买，现在付款"
-        ));
     }
 }

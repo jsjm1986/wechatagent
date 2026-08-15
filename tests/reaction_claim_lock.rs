@@ -164,9 +164,21 @@ impl BlockingReactionProvider {
         let value = match call {
             0 => {
                 self.release_first.notified().await;
-                json!({ "stopRequested": true })
+                json!({
+                    "stopRequested": true,
+                    "speechAct": "statement",
+                    "assertionStatus": "asserted",
+                    "subject": "customer",
+                    "confidence": 0.95
+                })
             }
-            1 => json!({ "buyingSignal": true }),
+            1 => json!({
+                "buyingSignal": true,
+                "speechAct": "request",
+                "assertionStatus": "requested",
+                "subject": "business",
+                "confidence": 0.95
+            }),
             other => {
                 return Err(AppError::External(format!(
                     "unexpected reaction LLM call index {other}"
@@ -447,13 +459,20 @@ async fn reaction_redline_stale_owner_cannot_overwrite_or_cancel_after_reclaim()
 
 #[tokio::test]
 #[ignore]
-async fn explicit_buying_floor_is_claim_scoped_transaction_only_and_zero_llm() {
+async fn structured_buying_signal_is_claim_scoped_and_model_driven() {
     let app = common::TestApp::start().await;
 
-    // Transaction profile + exact sent predecessor: classify without model variance, but through
-    // the production claim/CAS path and without creating any deal/payment fact.
+    // A current AI reaction verdict drives the outcome through the production claim/CAS path;
+    // no text keyword or deterministic buying floor is consulted.
     let (buyer, buyer_review_id) =
         seed_contact_and_review(&app.state, "reaction_explicit_buyer").await;
+    app.llm.push_response(json!({
+        "buyingSignal": true,
+        "speechAct": "request",
+        "assertionStatus": "requested",
+        "subject": "business",
+        "confidence": 0.95
+    }));
     record_user_reaction(
         &app.state,
         &buyer,
@@ -464,11 +483,11 @@ async fn explicit_buying_floor_is_claim_scoped_transaction_only_and_zero_llm() {
         ),
     )
     .await
-    .expect("deterministic buying reaction");
+    .expect("structured buying reaction");
     assert_eq!(
         app.llm.calls(),
-        0,
-        "explicit buying floor must not call the LLM"
+        1,
+        "buying outcome must come from the AI reaction verdict"
     );
     let buyer_review = app
         .state
@@ -483,10 +502,10 @@ async fn explicit_buying_floor_is_claim_scoped_transaction_only_and_zero_llm() {
         Some("user_replied_buying_signal")
     );
     assert_eq!(buyer_review.reaction_claim_generation, 1);
-    assert_eq!(
-        buyer_review.reaction_analysis.get_bool("deterministic"),
-        Ok(true)
-    );
+    assert!(buyer_review
+        .reaction_analysis
+        .get("deterministic")
+        .is_none());
     assert!(buyer_review.reaction_analysis.get("dealVerified").is_none());
     assert!(buyer_review
         .reaction_analysis
@@ -494,7 +513,7 @@ async fn explicit_buying_floor_is_claim_scoped_transaction_only_and_zero_llm() {
         .is_none());
 
     // No sent predecessor means there is nothing to classify. The phrase alone must not create a
-    // review, trajectory, deal, or model call.
+    // review, trajectory, deal, or additional model call.
     let no_predecessor = managed_contact("reaction_buy_without_predecessor");
     app.state
         .db
@@ -513,7 +532,7 @@ async fn explicit_buying_floor_is_claim_scoped_transaction_only_and_zero_llm() {
     )
     .await
     .expect("no predecessor is a no-op");
-    assert_eq!(app.llm.calls(), 0);
+    assert_eq!(app.llm.calls(), 1);
     assert_eq!(
         app.state
             .db
@@ -539,8 +558,13 @@ async fn explicit_buying_floor_is_claim_scoped_transaction_only_and_zero_llm() {
     // Negated language stays on the model path instead of being hard-coded as a buying signal.
     let (negated, negated_review_id) =
         seed_contact_and_review(&app.state, "reaction_negated_buyer").await;
-    app.llm
-        .push_response(json!({ "outcomeStatus": "user_replied_continue_exploring" }));
+    app.llm.push_response(json!({
+        "outcomeStatus": "user_replied_continue_exploring",
+        "speechAct": "negated",
+        "assertionStatus": "negated",
+        "subject": "customer",
+        "confidence": 0.95
+    }));
     record_user_reaction(
         &app.state,
         &negated,
@@ -552,7 +576,7 @@ async fn explicit_buying_floor_is_claim_scoped_transaction_only_and_zero_llm() {
     )
     .await
     .expect("negated buying reaction uses model");
-    assert_eq!(app.llm.calls(), 1);
+    assert_eq!(app.llm.calls(), 2);
     let negated_review = app
         .state
         .db
@@ -575,8 +599,13 @@ async fn explicit_buying_floor_is_claim_scoped_transaction_only_and_zero_llm() {
     common::roleplay_fixtures::seed_emotional_companion_profile_in_workspace(&app, "default").await;
     let (companion, companion_review_id) =
         seed_contact_and_review(&app.state, "reaction_companion_buy_words").await;
-    app.llm
-        .push_response(json!({ "outcomeStatus": "user_emotion_opened_up" }));
+    app.llm.push_response(json!({
+        "outcomeStatus": "user_emotion_opened_up",
+        "speechAct": "statement",
+        "assertionStatus": "asserted",
+        "subject": "customer",
+        "confidence": 0.95
+    }));
     record_user_reaction(
         &app.state,
         &companion,
@@ -588,7 +617,7 @@ async fn explicit_buying_floor_is_claim_scoped_transaction_only_and_zero_llm() {
     )
     .await
     .expect("non-transaction profile uses model semantics");
-    assert_eq!(app.llm.calls(), 2);
+    assert_eq!(app.llm.calls(), 3);
     let companion_review = app
         .state
         .db

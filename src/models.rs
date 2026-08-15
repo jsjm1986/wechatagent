@@ -2298,8 +2298,11 @@ pub struct DomainProfile {
     /// 本字段只换"用什么规则选模式"，不放宽"反人工接管"硬规则。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation_mode_policy: Option<String>,
-    /// 本行业绝对化承诺词表（替代 `guards.rs` 写死的中文销售词）。
-    #[serde(default)]
+    /// 历史兼容字段。仅用于读取旧 profile，永不写回 API / BSON，也不参与运行时判断。
+    ///
+    /// 新的承诺、事实和风险判断必须来自 AI 的结构化语义结果；保留反序列化能力只是
+    /// 为了让旧数据库记录能够平滑加载，不把历史配置误当成当前策略。
+    #[serde(default, skip_serializing)]
     pub commitment_markers: CommitmentMarkers,
     /// completeness 审计维度（替代 `catalog.rs` 写死的五维 coverage）。
     #[serde(default)]
@@ -3013,13 +3016,14 @@ mod profile_dimension_validation_tests {
     }
 }
 
-/// 绝对化承诺词表，按 `commitment_claim_class` 分两类（替代 `guards.rs` 写死词表）。
+/// 历史兼容字段。运行时的承诺、事实和风险判断由 AI 的结构化语义结果负责，
+/// 不再读取这些词表做字符串匹配。
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct CommitmentMarkers {
-    /// 产品效果类（如销售域「成功率/见效/回款」，医疗域「根治率」，教培域「保过」）。
+    /// 保留旧 profile 数据的产品效果分类，不参与运行时判定。
     #[serde(default)]
     pub product_effect: Vec<String>,
-    /// 纯语气类（如「保证/一定能/绝对」）。
+    /// 保留旧 profile 数据的语气分类，不参与运行时判定。
     #[serde(default)]
     pub tone_only: Vec<String>,
 }

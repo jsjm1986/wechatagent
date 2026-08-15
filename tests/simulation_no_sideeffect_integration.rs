@@ -174,6 +174,144 @@ fn known_usage() -> ChatUsage {
     }
 }
 
+fn revision_reply_json(reply_text: &str) -> serde_json::Value {
+    json!({
+        "decisionPhase": "final",
+        "userUnderstanding": "客户在轻量交流中希望继续了解当前话题，回复只做自然承接。",
+        "relationshipRead": "关系正常推进，当前不需要引入产品事实或交易承诺。",
+        "operationGoal": "保持自然交流并只问一个必要问题。",
+        "knowledgeNeedReason": "本轮不涉及产品能力或业务事实，无需知识库。",
+        "memoryUpdateReason": "本轮没有需要持久化的新事实。",
+        "selfCritique": "避免模板化和连续追问，保持口语自然。",
+        "whyShouldReply": "客户主动发来消息，及时承接有助于保持对话。",
+        "whySkipReply": "",
+        "riskSelfCheck": "回复不包含未经核实的现实业务声明。",
+        "riskLevel": "medium",
+        "knowledgeNeed": "not_required",
+        "runMode": "fast_chat",
+        "autonomyMode": "auto",
+        "needsReview": true,
+        "consolidationNeeded": false,
+        "operationState": "new_contact",
+        "shouldReply": true,
+        "replyText": reply_text,
+        "usedKnowledgeIds": [],
+        "matchedKnowledgeIds": [],
+        "conversationMode": "consultative",
+        "conversationModeReason": "本轮按自然承接模式回复，不主动引入业务话题。"
+    })
+}
+
+fn revision_review_json(needs_revision: bool) -> serde_json::Value {
+    json!({
+        "approved": true,
+        "scores": {
+            "humanLike": if needs_revision { 5 } else { 9 },
+            "emotionalValue": 8,
+            "productAccuracy": 9,
+            "boundaryPrivacySafety": 9,
+            "pressureRisk": 1,
+            "factRisk": 0
+        },
+        "claimAnalysis": {
+            "hasProductClaim": false,
+            "requiresProductKnowledge": false,
+            "knowledgeSupported": true,
+            "reason": "回复不包含产品能力或现实业务事实。"
+        },
+        "risks": [],
+        "rewriteInstruction": "",
+        "reviewSummary": "语义安全，检查口语自然度。",
+        "needsRevision": needs_revision,
+        "revisionDirection": if needs_revision { "减少模板化表达，改成更自然的微信口吻。" } else { "" },
+        "shouldHold": false,
+        "holdReason": "",
+        "holdCategory": "",
+        "selfCritiqueAddressed": !needs_revision
+    })
+}
+
+fn semantic_reply_json(
+    reply_text: &str,
+    speech_act: &str,
+    subject: &str,
+    assertion_status: &str,
+    response_disposition: &str,
+    conversation_mode: &str,
+) -> serde_json::Value {
+    json!({
+        "decisionPhase": "final",
+        "userUnderstanding": "根据完整上下文识别本轮言语行为，不按单个词或固定短语升级风险。",
+        "relationshipRead": "当前关系正常，本轮只承接客户明确表达，不额外推进或制造压力。",
+        "operationGoal": "准确回应当前 speech act，并避免把提问、否定、假设或引用改写成事实。",
+        "knowledgeNeedReason": "候选回复不代表产品能力、价格、预约或业务政策已经成立。",
+        "memoryUpdateReason": "本轮没有形成需要持久化的稳定客户事实。",
+        "selfCritique": "保持自然微信口吻，只处理当前语义，不从词面做过度推断。",
+        "whyShouldReply": "客户主动表达了当前意图，简短承接能保持上下文连贯并尊重其边界。",
+        "whySkipReply": "",
+        "riskSelfCheck": "候选只完成会话行为或提出澄清，不把现实业务事实表述为已确认。",
+        "riskLevel": "low",
+        "knowledgeNeed": "not_required",
+        "runMode": "fast_chat",
+        "autonomyMode": "auto",
+        "needsReview": false,
+        "consolidationNeeded": false,
+        "operationState": "new_contact",
+        "shouldReply": true,
+        "replyText": reply_text,
+        "intentAnalysis": {
+            "semanticAssessment": {
+                "intent": "承接客户当前言语行为",
+                "speechAct": speech_act,
+                "subject": subject,
+                "assertionStatus": assertion_status,
+                "knowledgeNeed": "not_required",
+                "responseDisposition": response_disposition,
+                "semanticRisk": {
+                    "content": "low",
+                    "pressure": "low",
+                    "boundary": "low",
+                    "privacy": "low",
+                    "confidence": 0.96
+                },
+                "claims": [],
+                "reason": "完整语境表明候选没有把外部业务事实表述为已经确定。"
+            }
+        },
+        "usedKnowledgeIds": [],
+        "matchedKnowledgeIds": [],
+        "conversationMode": conversation_mode,
+        "conversationModeReason": "模式由当前完整语境决定，不按自然语言关键词切换。"
+    })
+}
+
+fn semantic_claim_gate_pass_json(
+    speech_act: &str,
+    subject: &str,
+    assertion_status: &str,
+    response_disposition: &str,
+) -> serde_json::Value {
+    json!({
+        "claimKinds": [],
+        "claimsComplete": true,
+        "semanticAssessment": {
+            "speechAct": speech_act,
+            "subject": subject,
+            "assertionStatus": assertion_status,
+            "knowledgeNeed": "not_required",
+            "responseDisposition": response_disposition,
+            "contentRisk": "low",
+            "confidence": 0.97,
+            "reason": "候选只完成当前会话行为，没有确认外部业务事实。"
+        },
+        "responseDisposition": response_disposition,
+        "claims": [],
+        "catalogCoverageComplete": true,
+        "catalogClaims": [],
+        "reason": "No externally verifiable business claim is asserted."
+    })
+}
+
 /// 红线：完整 Shadow 链结束后，成本日志之外的数据库逐文档不变。
 #[tokio::test]
 #[ignore]
@@ -260,6 +398,252 @@ async fn simulation_has_no_business_side_effects() {
     assert!(logs
         .iter()
         .all(|log| log.get_str("run_mode") == Ok("shadow")));
+
+    app.cleanup().await;
+}
+
+/// Shadow 必须执行与生产相同的 single-shot revision：首稿只因人味软闸触发改写，
+/// 二稿重新走 Reviewer + ClaimGate，最终只能报告 would_send，并标记
+/// `revision_applied_approved`，不能把首稿的 `revision_required` 暴露给评测层。
+#[tokio::test]
+#[ignore]
+async fn simulation_runs_single_shot_revision_and_rechecks_candidate() {
+    let app = TestApp::start().await;
+    let ws = app.state.config.default_workspace_id.clone();
+    let acc = app.state.config.default_account_id.clone();
+    let contact = managed_contact(&ws, &acc, "wx_sim_revision");
+
+    app.llm
+        .push_response(revision_reply_json("这是一版偏模板的回复。"));
+    app.llm.push_response(revision_review_json(true));
+    app.llm
+        .push_response(common::independent_claim_gate_pass_json());
+    app.llm
+        .push_response(revision_reply_json("收到，我先顺着你刚才的重点聊。"));
+    app.llm.push_response(revision_review_json(false));
+    app.llm
+        .push_response(common::independent_claim_gate_pass_json());
+
+    let turns = simulate_user_dialogue(&app.state, contact, vec!["你好".to_string()])
+        .await
+        .expect("shadow revision simulation must complete");
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0].status, "would_send");
+    assert_eq!(
+        turns[0]
+            .review
+            .get_str("finalReviewStatus")
+            .unwrap_or_default(),
+        "revision_applied_approved"
+    );
+    assert_eq!(
+        app.llm.calls(),
+        6,
+        "首稿和二稿各应完整执行 Reply + Review + ClaimGate"
+    );
+
+    app.cleanup().await;
+}
+
+/// Unsupported open-world business facts must take the targeted rewrite path before finalize;
+/// Shadow must then re-run Reviewer + ClaimGate on the rewritten candidate instead of reporting
+/// a false hard safety block for a repairable draft.
+#[tokio::test]
+#[ignore]
+async fn simulation_rewrites_unsupported_business_claim_before_finalize() {
+    let app = TestApp::start().await;
+    let ws = app.state.config.default_workspace_id.clone();
+    let acc = app.state.config.default_account_id.clone();
+    let contact = managed_contact(&ws, &acc, "wx_sim_targeted_rewrite");
+    let unsupported = "明天下午三点一定能安排";
+
+    app.llm
+        .push_response(revision_reply_json(&format!("放心，我们{}。", unsupported)));
+    app.llm.push_response(revision_review_json(false));
+    app.llm
+        .push_response(common::independent_claim_gate_unsupported_business_json(
+            unsupported,
+        ));
+    app.llm.push_response(revision_reply_json(
+        "具体时间还要先核对清楚，我不先替你保证。",
+    ));
+    app.llm.push_response(revision_review_json(false));
+    app.llm
+        .push_response(common::independent_claim_gate_pass_json());
+
+    let turns = simulate_user_dialogue(&app.state, contact, vec!["明天下午能安排吗？".to_string()])
+        .await
+        .expect("targeted rewrite simulation must complete");
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0].status, "would_send");
+    assert_eq!(
+        app.llm.calls(),
+        6,
+        "定向改写后必须重新执行 Reply + Review + ClaimGate"
+    );
+    assert!(!turns[0].reply_text.contains(unsupported));
+    assert_eq!(
+        turns[0]
+            .review
+            .get_i64("unsupportedNonProductBusinessClaimCount")
+            .unwrap_or(0),
+        0
+    );
+
+    app.cleanup().await;
+}
+
+/// 多轮语义碰撞矩阵：自然语言里即使出现报价、保证、明天、翻倍、预约等词，服务端也
+/// 不得恢复关键词硬门。每个可发送候选都必须保留 Reply Agent 结构化语义，并完整执行
+/// Reviewer + 独立 ClaimGate；Shadow 仍不得写任何业务集合。
+#[tokio::test]
+#[ignore]
+async fn simulation_semantic_matrix_runs_full_independent_chain_without_keyword_gates() {
+    struct Case {
+        inbound: &'static str,
+        reply: &'static str,
+        speech_act: &'static str,
+        subject: &'static str,
+        assertion_status: &'static str,
+        response_disposition: &'static str,
+        conversation_mode: &'static str,
+    }
+
+    let cases = [
+        Case {
+            inbound: "嗨，刚好想到你，就来打声招呼。",
+            reply: "嗨，收到你的招呼。最近怎么样？",
+            speech_act: "greeting",
+            subject: "none",
+            assertion_status: "not_applicable",
+            response_disposition: "reply",
+            conversation_mode: "casual_relationship",
+        },
+        Case {
+            inbound: "这个话题先暂停，我忙完再决定要不要继续。",
+            reply: "好，这个话题先停在这里。",
+            speech_act: "statement",
+            subject: "none",
+            assertion_status: "not_applicable",
+            response_disposition: "acknowledgement",
+            conversation_mode: "boundary_protection",
+        },
+        Case {
+            inbound: "你刚才说‘需要先核对’，依据来自哪里？",
+            reply: "你问得对。你想核对的是哪一条结论？",
+            speech_act: "question",
+            subject: "customer",
+            assertion_status: "interrogative",
+            response_disposition: "clarify",
+            conversation_mode: "value_exchange",
+        },
+        Case {
+            inbound: "我想先梳理业务，不急着买，第一步该看什么？",
+            reply: "可以先从目标和约束拆开看。你现在更想先理清哪一块？",
+            speech_act: "question",
+            subject: "customer",
+            assertion_status: "interrogative",
+            response_disposition: "clarify",
+            conversation_mode: "value_exchange",
+        },
+        Case {
+            inbound: "我不是说预约成功了，也没有要求你保证明天有位置。",
+            reply: "明白，我们不把它当成预约确认，也不先做任何保证。",
+            speech_act: "negated",
+            subject: "business",
+            assertion_status: "negated",
+            response_disposition: "acknowledgement",
+            conversation_mode: "boundary_protection",
+        },
+        Case {
+            inbound: "假如报价减半、效果翻倍，这种前提下会怎么取舍？",
+            reply: "这种前提先别当成事实，最好分别看预算约束和效果依据。你想先拆哪一边？",
+            speech_act: "uncertain",
+            subject: "general",
+            assertion_status: "uncertain",
+            response_disposition: "clarify",
+            conversation_mode: "value_exchange",
+        },
+        Case {
+            inbound: "有人原话是‘这个项目一定能翻倍’，我只是转述，不代表我认同。",
+            reply: "单凭这句转述不能判断真假，得看它原本的条件和依据。",
+            speech_act: "quoted",
+            subject: "general",
+            assertion_status: "quoted",
+            response_disposition: "reply",
+            conversation_mode: "value_exchange",
+        },
+    ];
+
+    let app = TestApp::start().await;
+    let ws = app.state.config.default_workspace_id.clone();
+    let acc = app.state.config.default_account_id.clone();
+    let contact = managed_contact(&ws, &acc, "wx_semantic_matrix");
+    let before = business_snapshot(&app).await;
+
+    for case in &cases {
+        app.llm.push_response(semantic_reply_json(
+            case.reply,
+            case.speech_act,
+            case.subject,
+            case.assertion_status,
+            case.response_disposition,
+            case.conversation_mode,
+        ));
+        app.llm.push_response(review_pass_json());
+        app.llm.push_response(semantic_claim_gate_pass_json(
+            case.speech_act,
+            case.subject,
+            case.assertion_status,
+            case.response_disposition,
+        ));
+    }
+
+    let turns = simulate_user_dialogue(
+        &app.state,
+        contact,
+        cases.iter().map(|case| case.inbound.to_string()).collect(),
+    )
+    .await
+    .expect("semantic matrix simulation must complete");
+
+    assert_eq!(turns.len(), cases.len());
+    assert_eq!(
+        app.llm.calls(),
+        cases.len() * 3,
+        "每个可发送候选都必须执行 Reply + Reviewer + ClaimGate"
+    );
+    for (turn, case) in turns.iter().zip(&cases) {
+        assert_eq!(turn.status, "would_send", "inbound={}", case.inbound);
+        let assessment = turn
+            .decision
+            .get_document("intentAnalysis")
+            .and_then(|intent| intent.get_document("semanticAssessment"))
+            .expect("valid semantic assessment must survive promotion");
+        assert_eq!(assessment.get_str("speechAct"), Ok(case.speech_act));
+        assert_eq!(
+            assessment.get_str("assertionStatus"),
+            Ok(case.assertion_status)
+        );
+        assert_eq!(
+            assessment.get_str("responseDisposition"),
+            Ok(case.response_disposition)
+        );
+        assert_eq!(
+            turn.review
+                .get_document("claimAnalysis")
+                .and_then(|analysis| analysis.get_bool("claimsComplete")),
+            Ok(true)
+        );
+        assert!(!turn.review.get_array("risks").is_ok_and(|risks| {
+            risks
+                .iter()
+                .any(|risk| risk.as_str() == Some("claim_gate_skipped_casual_low_risk"))
+        }));
+    }
+
+    let after = business_snapshot(&app).await;
+    assert_eq!(before, after, "多轮 Shadow 语义矩阵不得产生业务副作用");
 
     app.cleanup().await;
 }

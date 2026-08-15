@@ -189,8 +189,8 @@ pub use runtime::{resolve_thresholds, ResolvedThresholds};
 pub use dimension_registry::normalize_target_stages;
 pub use types::{DecisionReviewResult, RawAgentDecision, ReviewScores};
 
-// agent-autonomy-loop W3 / Task 4.14：P4 PBT 已随销售域守卫一起删除（2026-05-25
-// 知识库清理），ProductClaimMarkers / default_product_claim_markers 不再公开。
+// agent-autonomy-loop W3 / Task 4.14：销售域字符串守卫已移除；产品事实由 AI
+// 结构化声明与 Claim Gate 的证据校验负责。
 
 // agent-autonomy-loop W3 / Task 4.11：让 PBT 通过 `wechatagent::agent::taxonomy`
 // 直接访问 cache 构造 helper 与命中分支枚举。

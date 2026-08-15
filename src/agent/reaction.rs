@@ -49,14 +49,6 @@ pub(crate) async fn record_user_reaction_with_outcome(
     contact: &Contact,
     inbound: &ConversationMessage,
 ) -> AppResult<ReactionOutcome> {
-    // Explicit opt-out is a deterministic safety signal, not a model-quality question. Apply it
-    // before loading prompts/config or claiming a review so a missing prior review, exhausted LLM
-    // budget, provider outage, or malformed model response can never turn an unambiguous stop into
-    // `unclassified` and allow the current reply to continue.
-    if explicit_stop_intent(&inbound.content) {
-        return Ok(apply_deterministic_stop(state, contact, inbound).await);
-    }
-
     // 波 A1：在最外层为 reaction 路径起一个 RunBudget。即便 stuck 重置阶段
     // 不调用 LLM，只要后续 analyze_user_reaction 命中就能记账并支持降级。
     let domain_config =
@@ -76,259 +68,6 @@ pub(crate) async fn record_user_reaction_with_outcome(
             record_user_reaction_inner(state, contact, inbound, run_id),
         )
         .await
-}
-
-/// High-precision, domain-independent opt-out recognizer. This intentionally accepts only direct
-/// imperatives about contact/messages or standard unsubscribe tokens. Objections, purchase
-/// rejection, polite conversation endings, and quoted/negated examples remain for the LLM path.
-pub(crate) fn explicit_stop_intent(content: &str) -> bool {
-    let normalized = content
-        .trim()
-        .to_lowercase()
-        .chars()
-        .filter(|ch| {
-            !ch.is_whitespace()
-                && !matches!(
-                    ch,
-                    '，' | ',' | '。' | '.' | '！' | '!' | '？' | '?' | '；' | ';' | ':' | '：'
-                )
-        })
-        .collect::<String>();
-    if normalized.is_empty() || normalized.chars().count() > 96 {
-        return false;
-    }
-    // Do not classify someone discussing or negating an opt-out phrase as an actual instruction.
-    if [
-        "没有说",
-        "没说",
-        "不是说",
-        "并不是",
-        "并非",
-        "别误会",
-        "举例",
-        "比如",
-    ]
-    .iter()
-    .any(|marker| normalized.contains(marker))
-    {
-        return false;
-    }
-    const DIRECT: &[&str] = &[
-        "别再联系我",
-        "不要再联系我",
-        "别联系我了",
-        "不要联系我了",
-        "停止联系我",
-        "别再给我发消息",
-        "不要再给我发消息",
-        "停止给我发消息",
-        "别再发消息",
-        "不要再发消息",
-        "停止发送消息",
-        "取消订阅",
-        "退订",
-        "unsubscribe",
-        "stopmessagingme",
-        "donotcontactme",
-        "don'tcontactme",
-        "dontcontactme",
-        "removemefromyourlist",
-    ];
-    if DIRECT.iter().any(|phrase| normalized.contains(phrase)) {
-        return true;
-    }
-
-    // Chinese users often omit the object after the conversation already established that the
-    // sender is pushing messages ("别再发了"). The abbreviated phrase alone is ambiguous: it can
-    // also mean "do not send this file again". Treat it as a durable opt-out only when the same
-    // message also contains an explicit conversation-ending signal.
-    const ELLIPTICAL_SEND_STOP: &[&str] = &["别再发了", "不要再发了", "别发了", "不要发了"];
-    const TERMINAL_CONTEXT: &[&str] = &[
-        "不想聊了",
-        "不想再聊",
-        "不想继续聊",
-        "到此为止",
-        "别打扰我",
-        "不要打扰我",
-        "不想收到你的消息",
-        "不想收到消息",
-    ];
-    ELLIPTICAL_SEND_STOP
-        .iter()
-        .any(|phrase| normalized.contains(phrase))
-        && TERMINAL_CONTEXT
-            .iter()
-            .any(|marker| normalized.contains(marker))
-}
-
-/// High-precision floor for an explicit purchase/payment commitment.
-///
-/// This is intentionally narrower than general interest. It does not create a deal or payment
-/// fact; it only classifies the current inbound as a reaction to the latest already-sent Review.
-/// Quoted examples, hypotheticals, negations, questions without a commitment, and non-transaction
-/// profiles remain on the model path.
-pub(crate) fn explicit_buying_intent(content: &str) -> bool {
-    let normalized = content
-        .trim()
-        .to_lowercase()
-        .chars()
-        .filter(|ch| {
-            !ch.is_whitespace()
-                && !matches!(
-                    ch,
-                    '，' | ',' | '。' | '.' | '！' | '!' | '？' | '?' | '；' | ';' | ':' | '：'
-                )
-        })
-        .collect::<String>();
-    if normalized.is_empty() || normalized.chars().count() > 120 {
-        return false;
-    }
-    if [
-        "如果",
-        "比如",
-        "例如",
-        "假设",
-        "示例",
-        "怎么回复",
-        "客户说",
-        "不买",
-        "先不买",
-        "暂时不买",
-        "不付款",
-        "先不付款",
-        "不下单",
-        "先不下单",
-        "取消订单",
-        "别下单",
-        "不要帮我下单",
-        "别帮我下单",
-        "不用帮我下单",
-        "先别帮我下单",
-        "还没决定",
-        "尚未决定",
-        "还要考虑",
-        "再考虑一下",
-        "再想想",
-    ]
-    .iter()
-    .any(|marker| normalized.contains(marker))
-    {
-        return false;
-    }
-    const COMMITMENTS: &[&str] = &[
-        "我要买",
-        "我决定买",
-        "我确认购买",
-        "就买这个",
-        "帮我下单",
-        "给我下单",
-        "直接下单",
-        "现在下单",
-        "马上下单",
-        "立即下单",
-        "现在付款",
-        "马上付款",
-        "立即付款",
-        "直接付款",
-        "我要付款",
-        "我要报名付款",
-        "现在就报名付款",
-    ];
-    COMMITMENTS
-        .iter()
-        .any(|commitment| normalized.contains(commitment))
-}
-
-async fn apply_deterministic_stop(
-    state: &AppState,
-    contact: &Contact,
-    inbound: &ConversationMessage,
-) -> ReactionOutcome {
-    const OUTCOME: &str = "user_replied_stop_requested";
-    let now = DateTime::now();
-    // A long-lived persisted cooldown is reversible by an administrator but survives process
-    // restarts and is consumed by Gateway, Planner, and the dispatch-time safety gate.
-    let cooldown_until = DateTime::from_millis(
-        now.timestamp_millis()
-            .saturating_add(100_i64 * 365 * 24 * 60 * 60 * 1000),
-    );
-    if let Err(error) = state
-        .db
-        .contacts()
-        .update_one(
-            doc! {
-                "workspace_id": &contact.workspace_id,
-                "account_id": &contact.account_id,
-                "wxid": &contact.wxid,
-            },
-            doc! { "$set": {
-                "cooldown_until": cooldown_until,
-                "operation_policy.explicitStopRequested": true,
-                "operation_policy.explicitStopRequestedAt": now,
-                "updated_at": now,
-            } },
-            None,
-        )
-        .await
-    {
-        // Still return stop_requested so the in-process safety barrier aborts this run. A database
-        // outage must never invert the deterministic classification into permission to send.
-        tracing::error!(%error, contact_wxid = %contact.wxid, "persist deterministic stop failed");
-    }
-
-    let analysis = doc! {
-        "outcomeStatus": OUTCOME,
-        "stopRequested": true,
-        "deterministic": true,
-        "confidence": 100,
-    };
-    let options = mongodb::options::FindOneAndUpdateOptions::builder()
-        .sort(doc! { "created_at": -1 })
-        .build();
-    if let Err(error) = state
-        .db
-        .decision_reviews()
-        .find_one_and_update(
-            doc! {
-                "workspace_id": &contact.workspace_id,
-                "account_id": &contact.account_id,
-                "contact_wxid": &contact.wxid,
-                "status": "sent",
-                "outcome_status": { "$in": [null, "pending", "analyzing"] },
-            },
-            doc! {
-                "$set": {
-                    "outcome_status": OUTCOME,
-                    "reaction_analysis": &analysis,
-                    "send_gateway_result.userReactionMessageId": inbound.message_id.clone().unwrap_or_default(),
-                    "send_gateway_result.userReactionAt": now,
-                    "send_gateway_result.userReactionAnalysis": &analysis,
-                },
-                "$unset": { "reaction_claimed_at": "", "reaction_claim_token": "" },
-            },
-            options,
-        )
-        .await
-    {
-        tracing::warn!(%error, contact_wxid = %contact.wxid, "record deterministic stop review outcome failed");
-    }
-
-    if let Err(error) = outbox::cancel_for_contact_on_user_reaction(
-        state,
-        &contact.workspace_id,
-        &contact.account_id,
-        &contact.wxid,
-    )
-    .await
-    {
-        tracing::error!(%error, contact_wxid = %contact.wxid, "cancel outbox for deterministic stop failed");
-    }
-
-    ReactionOutcome {
-        claimed: true,
-        outcome_status: Some(OUTCOME.to_string()),
-        stop_requested: true,
-    }
 }
 
 async fn record_user_reaction_inner(
@@ -425,18 +164,7 @@ async fn record_user_reaction_inner(
             .await?;
     let active_polarity = active_profile.outcome_polarity.clone();
     let active_traj_dims = active_profile.trajectory_dimensions.clone();
-    let deterministic_buying =
-        active_profile.transaction_facts_enabled && explicit_buying_intent(&inbound.content);
-    let reaction_analysis = if deterministic_buying {
-        // User-authored commitment only. This is a reaction label, never an outcome_event and
-        // never proof that payment or a transaction actually completed.
-        doc! {
-            "buyingSignal": true,
-            "deterministic": true,
-            "deterministicReason": "explicit_purchase_or_payment_commitment",
-            "confidence": 100,
-        }
-    } else if budget_exceeded {
+    let reaction_analysis = if budget_exceeded {
         if let Some(b) = current_run_budget() {
             b.mark_degraded("reaction_skipped_budget_exceeded".to_string());
         }
@@ -460,8 +188,13 @@ async fn record_user_reaction_inner(
             doc! { "outcomeStatus": "user_replied_unclassified", "confidence": 0 }
         })
     };
+    // The model owns the interpretation, but a low-confidence interpretation must not create
+    // durable stop/cooldown, outbox cancellation, or transaction-learning side effects. Collapse
+    // such output to the censored/unclassified state before any downstream consumer sees it.
+    let reaction_analysis = apply_reaction_confidence_floor(reaction_analysis);
     let outcome = reaction_outcome_status_with_polarity(&reaction_analysis, &active_polarity);
     let outcome_for_outbox = outcome.clone();
+    let stop_requested = reaction_requests_stop(&reaction_analysis, &outcome_for_outbox);
     let reaction_analysis_for_trajectory = reaction_analysis.clone();
     // Phase C / C1: 用 reviewer 当时的 approved 标志 + 用户实际反应 outcome 计算 misjudge 信号。
     // approved=true 但用户负反应 → approved_but_user_negative（reviewer 放过了实际不该发的内容）。
@@ -514,6 +247,19 @@ async fn record_user_reaction_inner(
         return Ok(ReactionOutcome::default());
     }
 
+    // A high-confidence AI stop decision is a durable contact boundary, not only an in-process
+    // cancellation signal. Persist it after the reaction claim is committed so a reclaimed or
+    // stale worker cannot create a cooldown on behalf of a review it no longer owns.
+    if stop_requested {
+        if let Err(error) = persist_reaction_stop_cooldown(state, contact).await {
+            tracing::error!(
+                %error,
+                contact_wxid = %contact.wxid,
+                "persist AI reaction stop cooldown failed"
+            );
+        }
+    }
+
     // Phase D / D1：把 reaction outcome 追加到 contact.intent_trajectory（滑窗 50）。
     // mongo `$push + $slice: -50` 一步完成 append + 上限裁剪；并发追加（同一 contact
     // 同时收两条入站消息）天然安全 —— 都会落进数组、超出 50 的旧条目被裁掉。
@@ -564,7 +310,7 @@ async fn record_user_reaction_inner(
     // 名下还在 pending / in_flight 的 outbox entry 一并取消，避免 dispatcher
     // 在用户已经表态"别再发了"之后继续推进过期决策。Best-effort：取消失败
     // 仅记录 warning，不影响 reaction 记录主路径成功落地。
-    if outbox::outcome_signals_stop(&outcome_for_outbox) {
+    if stop_requested {
         match outbox::cancel_for_contact_on_user_reaction(
             state,
             &contact.workspace_id,
@@ -597,7 +343,7 @@ async fn record_user_reaction_inner(
     Ok(ReactionOutcome {
         claimed: true,
         outcome_status: Some(outcome_for_outbox.clone()),
-        stop_requested: outbox::outcome_signals_stop(&outcome_for_outbox),
+        stop_requested,
     })
 }
 
@@ -663,6 +409,77 @@ async fn analyze_user_reaction(
     to_document(&value).map_err(AppError::from)
 }
 
+const REACTION_CONFIDENCE_FLOOR: f64 = 0.7;
+const REACTION_STOP_COOLDOWN_MS: i64 = 100_i64 * 365 * 24 * 60 * 60 * 1000;
+
+fn reaction_confidence(analysis: &Document) -> f64 {
+    let raw = match analysis.get("confidence") {
+        Some(mongodb::bson::Bson::Double(value)) => *value,
+        Some(mongodb::bson::Bson::Int32(value)) => *value as f64,
+        Some(mongodb::bson::Bson::Int64(value)) => *value as f64,
+        _ => 0.0,
+    };
+    // Older prompts occasionally emitted a percentage-like 0..100 integer. Accept that shape
+    // only as a compatibility conversion; missing/invalid values remain low confidence.
+    let normalized = if raw > 1.0 && raw <= 100.0 {
+        raw / 100.0
+    } else {
+        raw
+    };
+    normalized.clamp(0.0, 1.0)
+}
+
+fn apply_reaction_confidence_floor(mut analysis: Document) -> Document {
+    let confidence = reaction_confidence(&analysis);
+    if confidence >= REACTION_CONFIDENCE_FLOOR {
+        return analysis;
+    }
+    analysis.insert("outcomeStatus", "user_replied_unclassified");
+    analysis.insert("stopRequested", false);
+    analysis.insert("buyingSignal", false);
+    analysis.insert("objection", false);
+    analysis.insert("continueExploring", false);
+    analysis.insert("lowConfidence", true);
+    analysis
+}
+
+fn reaction_requests_stop(analysis: &Document, outcome: &str) -> bool {
+    doc_bool(analysis, "stopRequested")
+        || doc_bool(analysis, "stop_requested")
+        || outbox::outcome_signals_stop(outcome)
+        // `user_replied_unsubscribed` is a closed semantic outcome, not a natural-language scan.
+        || outcome == "user_replied_unsubscribed"
+}
+
+async fn persist_reaction_stop_cooldown(state: &AppState, contact: &Contact) -> AppResult<()> {
+    let now = DateTime::now();
+    let cooldown_until = DateTime::from_millis(
+        now.timestamp_millis()
+            .saturating_add(REACTION_STOP_COOLDOWN_MS),
+    );
+    state
+        .db
+        .contacts()
+        .update_one(
+            doc! {
+                "workspace_id": &contact.workspace_id,
+                "account_id": &contact.account_id,
+                "wxid": &contact.wxid,
+            },
+            doc! {
+                "$set": {
+                    "cooldown_until": cooldown_until,
+                    "operation_policy.explicitStopRequested": true,
+                    "operation_policy.explicitStopRequestedAt": now,
+                    "updated_at": now,
+                }
+            },
+            None,
+        )
+        .await?;
+    Ok(())
+}
+
 /// 从 reaction 分析 Document 推断 outcome_status 字符串。
 ///
 /// **2.5-main-3（正极配置化）**：`buyingSignal` flag 分支的正极 token 从写死字面量
@@ -685,8 +502,9 @@ pub(crate) fn reaction_outcome_status_with_polarity(
         return status;
     }
     if doc_bool(analysis, "stopRequested") || doc_bool(analysis, "stop_requested") {
-        "user_replied_stop_requested".to_string()
-    } else if doc_bool(analysis, "buyingSignal") || doc_bool(analysis, "buying_signal") {
+        return "user_replied_stop_requested".to_string();
+    }
+    if doc_bool(analysis, "buyingSignal") || doc_bool(analysis, "buying_signal") {
         // 正极 token 走 profile（空集回落 DEFAULT 字面量，字节等价）。
         polarity
             .positive
@@ -1431,83 +1249,50 @@ mod a6_tests {
     }
 
     #[test]
-    fn explicit_stop_intent_accepts_only_direct_opt_outs() {
-        for text in [
-            "别再联系我",
-            "请不要再给我发消息。",
-            "别再发了，我不想聊了，到此为止吧",
-            "不要发了，也不要打扰我",
-            "退订",
-            "UNSUBSCRIBE",
-            "remove me from your list",
-        ] {
-            assert!(
-                explicit_stop_intent(text),
-                "direct opt-out must match: {text}"
-            );
-        }
-        for text in [
-            "这个产品我不需要",
-            "今天先聊到这里，谢谢",
-            "最近有点烦，先缓一缓",
-            "这个文件别再发了，换成 PDF",
-            "这张图不要发了，发原图",
-            "我没有说别再发了，到此为止",
-            "比如客户说别再发了、不想聊了时怎么办",
-            "我没有说不要再联系我",
-            "比如客户说别再联系我时怎么办",
-            "别误会，我不是说退订",
-        ] {
-            assert!(
-                !explicit_stop_intent(text),
-                "ambiguous, quoted, or negated text must remain on the model path: {text}"
-            );
-        }
-    }
-
-    #[test]
-    fn explicit_buying_floor_accepts_only_unambiguous_commitments() {
-        for text in [
-            "可以现在就报名付款吗？我要买",
-            "我确认购买，帮我下单",
-            "就买这个，我现在付款",
-        ] {
-            assert!(explicit_buying_intent(text), "{text}");
-        }
-        for text in [
-            "多少钱？我先了解一下",
-            "可以报名付款吗？",
-            "如果客户说我要买，该怎么回复",
-            "我先不买，也不要帮我下单",
-            "不要帮我下单",
-            "我还没决定买，再考虑一下",
-            "我不是要付款，只是问流程",
-            "已经付款了吗",
-        ] {
-            assert!(!explicit_buying_intent(text), "{text}");
-        }
-    }
-
-    #[test]
-    fn explicit_buying_label_uses_profile_positive_token_without_proving_a_deal() {
-        let analysis = doc! {
-            "buyingSignal": explicit_buying_intent("我要买，现在付款"),
-            "deterministic": true,
-        };
+    fn low_confidence_reaction_is_censored_before_side_effects() {
+        let analysis = apply_reaction_confidence_floor(doc! {
+            "outcomeStatus": "user_replied_stop_requested",
+            "stopRequested": true,
+            "buyingSignal": true,
+            "confidence": 0.4,
+        });
         assert_eq!(
-            reaction_outcome_status_with_polarity(
-                &analysis,
-                &default_outcome_polarity_for_reaction()
-            ),
+            reaction_outcome_status(&analysis),
+            "user_replied_unclassified"
+        );
+        assert!(!doc_bool(&analysis, "stopRequested"));
+        assert!(!doc_bool(&analysis, "buyingSignal"));
+    }
+
+    #[test]
+    fn high_confidence_reaction_uses_structured_ai_result() {
+        let stop = apply_reaction_confidence_floor(doc! {
+            "stopRequested": true,
+            "speechAct": "statement",
+            "assertionStatus": "asserted",
+            "confidence": 0.91,
+        });
+        assert_eq!(
+            reaction_outcome_status(&stop),
+            "user_replied_stop_requested"
+        );
+        let conflicting = doc! {
+            "outcomeStatus": "user_replied_continue_exploring",
+            "stopRequested": true,
+            "confidence": 0.91,
+        };
+        assert!(reaction_requests_stop(
+            &conflicting,
+            "user_replied_continue_exploring"
+        ));
+        let buying = apply_reaction_confidence_floor(doc! {
+            "buyingSignal": true,
+            "confidence": 0.85,
+        });
+        assert_eq!(
+            reaction_outcome_status(&buying),
             "user_replied_buying_signal"
         );
-        assert_eq!(
-            reaction_outcome_status_with_polarity(&analysis, &companion_polarity()),
-            "user_emotion_opened_up",
-            "domain polarity still owns the positive label; caller gates this floor to transaction profiles"
-        );
-        assert!(analysis.get("dealVerified").is_none());
-        assert!(analysis.get("paymentVerified").is_none());
     }
 
     #[test]

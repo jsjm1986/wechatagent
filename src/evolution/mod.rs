@@ -19,7 +19,6 @@ pub mod budget;
 pub mod cohort;
 pub mod envelope;
 pub mod error;
-pub mod lint;
 pub mod post_release;
 pub mod prompt_critic;
 pub mod release;
@@ -463,7 +462,6 @@ mod isolation_contract_tests {
         "cohort.rs",
         "envelope.rs",
         "error.rs",
-        "lint.rs",
         "mod.rs",
         "post_release.rs",
         "prompt_critic.rs",

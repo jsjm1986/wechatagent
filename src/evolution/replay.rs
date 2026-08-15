@@ -20,8 +20,7 @@
 //! - **不**写 `conversation_messages` 出站文档；
 //! - **不**写 `agent_run_logs`（避免污染 outcomes）。
 //!
-//! `evolution::lint::passes_forbidden_words` 在 critic 路径已守过，本模块不再
-//! 二次扫描；本模块自身的代码 / 字符串都在 CI lint 静态扫描范围内。
+//! 本模块不对候选自然语言做二次词表扫描；发布阶段由 AI 语义审查决定。
 //!
 //! 并行：使用 `tokio::sync::Semaphore::new(evolution_replay_concurrency)` 限并发。
 //! 预算超额时仍未启动的 replay 写 `failed` + `failure_reason="evolution_budget_exceeded"`。

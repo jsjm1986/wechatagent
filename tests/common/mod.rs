@@ -222,7 +222,8 @@ impl TestLlmGenerator {
         }
         let response_kind = |result: &LlmJsonResult| {
             let value = &result.value;
-            if value.get("requiresEvidence").is_some()
+            if value.get("semanticAssessment").is_some()
+                && value.get("responseDisposition").is_some()
                 && value.get("claims").is_some()
                 && value.get("catalogClaims").is_some()
             {
@@ -241,11 +242,9 @@ impl TestLlmGenerator {
             ResponseKind::ClaimGate
         } else if system.contains("运营知识库的 wiki 研究员") {
             ResponseKind::Knowledge
-        } else if system.contains("请独立审核候选回复")
-            || system.contains("独立审核")
+        } else if system.contains("请独立审核")
+            || system.contains("请评审候选回复")
             || system.contains("独立运营质量评审 Agent")
-            || system.contains("reviewer")
-            || system.contains("Reviewer")
         {
             ResponseKind::Reviewer
         } else if system.contains("shouldReply") && system.contains("conversationMode") {
@@ -292,13 +291,21 @@ impl TestLlmGenerator {
 /// 排入完整 schema，避免旧的 Reply→Review 两段 fixture 被第三次调用错位消费。
 pub fn independent_claim_gate_pass_json() -> Value {
     serde_json::json!({
-        "requiresEvidence": false,
         "claimKinds": [],
         "claimsComplete": true,
+        "semanticAssessment": {
+            "speechAct": "uncertain",
+            "subject": "none",
+            "assertionStatus": "not_applicable",
+            "knowledgeNeed": "not_required",
+            "responseDisposition": "reply",
+            "contentRisk": "low",
+            "confidence": 0.96,
+            "reason": "The candidate contains no settled external business assertion."
+        },
+        "responseDisposition": "reply",
         "claims": [],
-        "hasCatalogClaims": false,
         "catalogCoverageComplete": true,
-        "hasNonCatalogEvidenceClaims": false,
         "catalogClaims": [],
         "reason": "The candidate contains no independently verifiable business claim."
     })
@@ -307,22 +314,34 @@ pub fn independent_claim_gate_pass_json() -> Value {
 /// Independent ClaimGate verdict for an unsupported, non-product real-world business fact.
 pub fn independent_claim_gate_unsupported_business_json(source_quote: &str) -> Value {
     serde_json::json!({
-        "requiresEvidence": true,
         "claimKinds": ["open_world_business_fact"],
         "claimsComplete": true,
+        "semanticAssessment": {
+            "speechAct": "statement",
+            "subject": "business",
+            "assertionStatus": "asserted",
+            "knowledgeNeed": "required",
+            "responseDisposition": "reply",
+            "contentRisk": "medium",
+            "confidence": 0.97,
+            "reason": "The candidate asserts an externally verifiable business fact."
+        },
+        "responseDisposition": "reply",
         "claims": [{
             "sourceQuote": source_quote,
             "claim": "The business asserts a real-world requirement without a trusted source.",
             "scope": "open_world_business_fact",
             "subject": "business",
+            "speechAct": "statement",
+            "assertionStatus": "asserted",
+            "evidenceNeed": "required",
+            "negativePolarity": false,
+            "confidence": 0.97,
             "productClaim": false,
-            "requiresEvidence": true,
             "evidenceRefs": [],
             "reason": "No server-catalogued source directly supports this assertion."
         }],
-        "hasCatalogClaims": false,
         "catalogCoverageComplete": true,
-        "hasNonCatalogEvidenceClaims": true,
         "catalogClaims": [],
         "reason": "The candidate contains an unsupported non-product business fact."
     })
@@ -333,22 +352,34 @@ pub fn independent_claim_gate_unsupported_business_json(source_quote: &str) -> V
 /// chunk; it must not be used to bypass evidence checks in generic gateway-flow tests.
 pub fn independent_claim_gate_verified_knowledge_json(chunk_id: &str, source_quote: &str) -> Value {
     serde_json::json!({
-        "requiresEvidence": true,
         "claimKinds": ["product_capability"],
         "claimsComplete": true,
+        "semanticAssessment": {
+            "speechAct": "statement",
+            "subject": "business",
+            "assertionStatus": "asserted",
+            "knowledgeNeed": "required",
+            "responseDisposition": "reply",
+            "contentRisk": "medium",
+            "confidence": 0.98,
+            "reason": "The candidate asserts a product capability backed by verified knowledge."
+        },
+        "responseDisposition": "reply",
         "claims": [{
             "sourceQuote": source_quote,
             "claim": "The candidate asserts a verified product capability.",
             "scope": "product_capability",
             "subject": "business",
+            "speechAct": "statement",
+            "assertionStatus": "asserted",
+            "evidenceNeed": "required",
+            "negativePolarity": false,
+            "confidence": 0.98,
             "productClaim": true,
-            "requiresEvidence": true,
             "evidenceRefs": [format!("verified_knowledge:{chunk_id}")],
             "reason": "Directly supported by the cited verified knowledge."
         }],
-        "hasCatalogClaims": false,
         "catalogCoverageComplete": true,
-        "hasNonCatalogEvidenceClaims": true,
         "catalogClaims": [],
         "reason": "The candidate asserts a product capability backed by cited verified knowledge."
     })

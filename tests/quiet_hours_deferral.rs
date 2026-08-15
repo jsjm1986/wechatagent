@@ -158,7 +158,7 @@ async fn quiet_hours_reuses_single_reply_obligation() {
     );
 }
 
-// ── S5-3：静默时段显式交易意图豁免 ─────────────────────────────────────────
+// ── 语义判断与作息排程解耦 ────────────────────────────────────────────────
 
 /// 构造一份"此刻必然处于静默时段"的 runtime_parameters：tz 偏移取 0，
 /// 静默窗口 = [当前 UTC 小时, +2h)。BSON 类型与
@@ -181,7 +181,7 @@ fn quiet_domain_config(workspace_id: &str) -> OperationDomainConfig {
         id: None,
         workspace_id: workspace_id.to_string(),
         domain: "user_operations".to_string(),
-        name: "quiet-hours bypass 测试域".to_string(),
+        name: "quiet-hours semantic scheduling test domain".to_string(),
         goal: "-".to_string(),
         methodology: "-".to_string(),
         workflow: "-".to_string(),
@@ -217,7 +217,7 @@ async fn insert_pending_inbound(
         workspace_id: contact.workspace_id.clone(),
         account_id: contact.account_id.clone(),
         contact_wxid: contact.wxid.clone(),
-        message_id: Some(format!("quiet-bypass-{id}")),
+        message_id: Some(format!("quiet-semantic-{id}")),
         dedupe_key: None,
         direction: MessageDirection::Inbound,
         content: content.to_string(),
@@ -252,7 +252,7 @@ async fn seed_non_transaction_active_profile(
         .clone_with_type::<Document>()
         .insert_one(
             doc! {
-                "profile_id": "quiet_bypass_nontx_v1",
+                "profile_id": "quiet_semantic_nontx_v1",
                 "workspace_id": workspace_id,
                 "display_name": "非交易测试域",
                 "transaction_facts_enabled": false,
@@ -284,36 +284,14 @@ async fn find_reply_obligation(
         .expect("reply obligation should exist")
 }
 
-async fn count_bypass_events(
-    state: &wechatagent::routes::AppState,
-    workspace_id: &str,
-    message_id: ObjectId,
-) -> u64 {
-    state
-        .db
-        .events()
-        .count_documents(
-            doc! {
-                "workspace_id": workspace_id,
-                "kind": "quiet_hours_bypassed_buying_intent",
-                "details.message_id": message_id,
-            },
-            None,
-        )
-        .await
-        .expect("count bypass events")
-}
-
-/// S5-3：静默时段的显式购买/交易承诺不再等醒来。交易域 profile（默认销售域）下，
-/// 确定性词表命中 → 走正常去抖链路（gateway_status=debouncing、run_at≈now）并写
-/// `quiet_hours_bypassed_buying_intent` 事件；对照组一（同交易域、寒暄消息）与
-/// 对照组二（非交易域、同购买短语）仍旧 defer 到醒来时刻、不写事件。
+/// 作息排程不读取消息词面：无论是购买表达、寒暄、假设还是非交易域消息，
+/// 静默时段都统一排到醒来；醒来后再交给 AI 语义链路判断如何回应。
 #[tokio::test]
 #[ignore]
-async fn explicit_buying_intent_bypasses_quiet_hours_deferral_on_transaction_profile() {
-    const W_BUY: &str = "ws_quiet_bypass_buy";
-    const W_CASUAL: &str = "ws_quiet_bypass_casual";
-    const W_NONTX: &str = "ws_quiet_bypass_nontx";
+async fn all_inbound_messages_defer_during_quiet_hours() {
+    const W_BUY: &str = "ws_quiet_semantic_buy";
+    const W_CASUAL: &str = "ws_quiet_semantic_casual";
+    const W_NONTX: &str = "ws_quiet_semantic_nontx";
 
     let app = common::TestApp::start().await;
     let now_ms = DateTime::now().timestamp_millis();
@@ -329,9 +307,9 @@ async fn explicit_buying_intent_bypasses_quiet_hours_deferral_on_transaction_pro
     // W_BUY / W_CASUAL 不种 profile → 回落 DEFAULT 销售域（transaction_facts_enabled=true）。
     seed_non_transaction_active_profile(&app.state, W_NONTX).await;
 
-    let buy_contact = managed_contact_in(W_BUY, "user_quiet_bypass_buy");
-    let casual_contact = managed_contact_in(W_CASUAL, "user_quiet_bypass_casual");
-    let nontx_contact = managed_contact_in(W_NONTX, "user_quiet_bypass_nontx");
+    let buy_contact = managed_contact_in(W_BUY, "user_quiet_semantic_buy");
+    let casual_contact = managed_contact_in(W_CASUAL, "user_quiet_semantic_casual");
+    let nontx_contact = managed_contact_in(W_NONTX, "user_quiet_semantic_nontx");
     for contact in [&buy_contact, &casual_contact, &nontx_contact] {
         app.state
             .db
@@ -341,10 +319,9 @@ async fn explicit_buying_intent_bypasses_quiet_hours_deferral_on_transaction_pro
             .expect("insert managed contact");
     }
 
-    let buy_msg = insert_pending_inbound(&app.state, &buy_contact, "我要买，现在付款").await;
-    let casual_msg =
-        insert_pending_inbound(&app.state, &casual_contact, "今天好累呀，晚点再聊").await;
-    let nontx_msg = insert_pending_inbound(&app.state, &nontx_contact, "我要买，现在付款").await;
+    insert_pending_inbound(&app.state, &buy_contact, "我要买，现在付款").await;
+    insert_pending_inbound(&app.state, &casual_contact, "今天好累呀，晚点再聊").await;
+    insert_pending_inbound(&app.state, &nontx_contact, "如果我要买，现在付款有优惠吗").await;
 
     assert_eq!(
         reconcile_pending_inbound_handoffs(&app.state)
@@ -353,50 +330,33 @@ async fn explicit_buying_intent_bypasses_quiet_hours_deferral_on_transaction_pro
         3
     );
 
-    // 交易域 + 显式购买承诺：豁免静默 defer，走正常去抖链路（run_at ≈ 入站 + 去抖窗口）。
-    let buy_task = find_reply_obligation(&app.state, W_BUY, &buy_contact.wxid).await;
+    for (workspace_id, wxid) in [
+        (W_BUY, &buy_contact.wxid),
+        (W_CASUAL, &casual_contact.wxid),
+        (W_NONTX, &nontx_contact.wxid),
+    ] {
+        let task = find_reply_obligation(&app.state, workspace_id, wxid).await;
+        assert_eq!(
+            task.gateway_status.as_deref(),
+            Some("quiet_hours_waiting"),
+            "消息词面不应改变静默排程: {task:?}"
+        );
+        assert!(
+            task.run_at.timestamp_millis() >= now_ms + 30 * 60_000,
+            "静默任务应排到醒来时刻，实际 {}",
+            task.run_at
+        );
+    }
     assert_eq!(
-        buy_task.gateway_status.as_deref(),
-        Some("debouncing"),
-        "显式交易意图应走正常去抖而非 quiet_hours_waiting: {buy_task:?}"
+        app.state
+            .db
+            .events()
+            .count_documents(doc! { "kind": "quiet_hours_bypassed_buying_intent" }, None)
+            .await
+            .expect("count removed keyword bypass events"),
+        0,
+        "不应再产生基于购买关键词的作息豁免事件"
     );
-    assert!(
-        buy_task.run_at.timestamp_millis() <= now_ms + 60_000,
-        "豁免后的 run_at 应近在眼前（去抖窗口内），实际 {}",
-        buy_task.run_at
-    );
-    assert_eq!(
-        count_bypass_events(&app.state, W_BUY, buy_msg).await,
-        1,
-        "豁免应写一条 quiet_hours_bypassed_buying_intent 事件（含 message_id）"
-    );
-
-    // 对照一：同交易域的寒暄消息仍 defer 到醒来（wake ≥ 1h 之后）。
-    let casual_task = find_reply_obligation(&app.state, W_CASUAL, &casual_contact.wxid).await;
-    assert_eq!(
-        casual_task.gateway_status.as_deref(),
-        Some("quiet_hours_waiting"),
-        "寒暄消息在静默时段应继续 defer: {casual_task:?}"
-    );
-    assert!(
-        casual_task.run_at.timestamp_millis() >= now_ms + 30 * 60_000,
-        "defer 的 run_at 应在醒来时刻（≥30min 之后），实际 {}",
-        casual_task.run_at
-    );
-    assert_eq!(
-        count_bypass_events(&app.state, W_CASUAL, casual_msg).await,
-        0
-    );
-
-    // 对照二：非交易域即便命中购买短语也不豁免（词表门以 transaction_facts_enabled 为前置）。
-    let nontx_task = find_reply_obligation(&app.state, W_NONTX, &nontx_contact.wxid).await;
-    assert_eq!(
-        nontx_task.gateway_status.as_deref(),
-        Some("quiet_hours_waiting"),
-        "非交易域的购买短语不应豁免静默 defer: {nontx_task:?}"
-    );
-    assert!(nontx_task.run_at.timestamp_millis() >= now_ms + 30 * 60_000);
-    assert_eq!(count_bypass_events(&app.state, W_NONTX, nontx_msg).await, 0);
 
     app.cleanup().await;
 }

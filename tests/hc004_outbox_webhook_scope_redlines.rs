@@ -682,7 +682,13 @@ async fn sr027_reaction_stop_cancels_only_same_workspace_account_outbox() {
         .await
         .expect("count foreign events before");
 
-    app.llm.push_response(json!({ "stopRequested": true }));
+    app.llm.push_response(json!({
+        "stopRequested": true,
+        "speechAct": "statement",
+        "assertionStatus": "asserted",
+        "subject": "customer",
+        "confidence": 0.95
+    }));
     let reaction = inbound(&workspace_local, &account_id, &contact_wxid);
     record_user_reaction(&app.state, &local_contact, &reaction)
         .await

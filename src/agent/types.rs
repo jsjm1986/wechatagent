@@ -276,7 +276,7 @@ pub struct AgentDecision {
     //   - consultative       ：顾问/销售模式，明确处理产品/价格/方案/异议
     //   - boundary_protection：边界保护，客户已表达不需要 / 仅服务老客户
     //
-    // gateway 在 keyword fastpath 命中时会强制覆盖为 consultative。
+    // 模式由 Reply Agent 根据完整语境输出；服务端只校验协议枚举，不扫描消息关键词。
     #[serde(default = "default_conversation_mode")]
     pub conversation_mode: String,
     #[serde(default)]
@@ -723,6 +723,41 @@ const CONVERSATION_MODE_VALUES: &[&str] = &[
     "consultative",
     "boundary_protection",
 ];
+pub(crate) const SEMANTIC_SPEECH_ACT_VALUES: &[&str] = &[
+    "greeting",
+    "question",
+    "request",
+    "statement",
+    "wish",
+    "hypothetical",
+    "quoted",
+    "negated",
+    "empathy",
+    "uncertain",
+];
+pub(crate) const SEMANTIC_SUBJECT_VALUES: &[&str] =
+    &["customer", "business", "third_party", "general", "none"];
+pub(crate) const SEMANTIC_ASSERTION_STATUS_VALUES: &[&str] = &[
+    "asserted",
+    "interrogative",
+    "requested",
+    "hypothetical",
+    "quoted",
+    "negated",
+    "uncertain",
+    "not_applicable",
+];
+pub(crate) const SEMANTIC_KNOWLEDGE_NEED_VALUES: &[&str] =
+    &["not_required", "required", "uncertain"];
+pub(crate) const SEMANTIC_RESPONSE_DISPOSITION_VALUES: &[&str] = &[
+    "reply",
+    "acknowledgement",
+    "clarify",
+    "defer",
+    "silent",
+    "cooldown",
+];
+pub(crate) const SEMANTIC_RISK_VALUES: &[&str] = &["low", "medium", "high"];
 const ALLOWED_TOOL_NAMES: &[&str] = &[
     "knowledge.list_catalog",
     "knowledge.search",
@@ -885,6 +920,7 @@ impl RawAgentDecision {
         decision.reply_text = reply_text;
         decision.risk_self_check = risk_self_check;
         clear_deferred_fields(&mut decision);
+        sanitize_semantic_assessment(&mut decision, &mut risks);
         (decision, risks)
     }
 
@@ -1123,6 +1159,7 @@ impl RawAgentDecision {
 
         // 把既有 carry-through 字段从 raw 拷过去（避免 promote 把它们丢失）。
         carry_through_fields(self, &mut decision);
+        sanitize_semantic_assessment(&mut decision, &mut risks);
 
         (decision, risks)
     }
@@ -1141,7 +1178,8 @@ fn clear_deferred_fields(decision: &mut AgentDecision) {
     decision.dimension_display_names.clear();
     decision.follow_up_policy = None;
     decision.profile_attributes.clear();
-    decision.intent_analysis.clear();
+    // `intent_analysis` carries the Reply Agent's semantic contract.  It is part of the
+    // send-time review input, not a deferred projection field, so keep it across promotion.
     decision.next_best_action.clear();
     decision.cooldown_until = None;
     decision.product_fit_score = None;
@@ -1159,6 +1197,122 @@ fn clear_deferred_fields(decision: &mut AgentDecision) {
     decision.knowledge_need_reason.clear();
     decision.memory_update_reason.clear();
     decision.self_critique.clear();
+}
+
+/// Validate the Reply Agent's optional semantic contract without classifying natural-language
+/// content.  The contract is advisory input for the independent reviewers: malformed self-report
+/// is removed and audited, while the candidate still proceeds through the full Reviewer and Claim
+/// Gate path.  Missing contracts remain compatible with older prompt packs and are handled by
+/// those independent gates rather than becoming a hard protocol block.
+fn sanitize_semantic_assessment(decision: &mut AgentDecision, risks: &mut Vec<String>) {
+    let Some(assessment) = decision
+        .intent_analysis
+        .get_document("semanticAssessment")
+        .ok()
+        .cloned()
+    else {
+        return;
+    };
+
+    let invalid = validate_semantic_assessment_shape(
+        &assessment,
+        &decision.reply_text,
+        decision.should_reply,
+        &decision.knowledge_need,
+    )
+    .err();
+    if let Some(field) = invalid {
+        decision.intent_analysis.remove("semanticAssessment");
+        risks.push(format!("semantic_contract_invalid:{field}"));
+    }
+}
+
+fn validate_semantic_assessment_shape(
+    assessment: &Document,
+    _reply_text: &str,
+    should_reply: bool,
+    top_level_knowledge_need: &str,
+) -> Result<(), &'static str> {
+    fn required_text<'a>(
+        document: &'a Document,
+        key: &'static str,
+    ) -> Result<&'a str, &'static str> {
+        document
+            .get_str(key)
+            .ok()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or(key)
+    }
+    fn enum_value(
+        document: &Document,
+        key: &'static str,
+        allowed: &[&str],
+    ) -> Result<(), &'static str> {
+        let value = required_text(document, key)?;
+        if allowed.iter().any(|candidate| *candidate == value) {
+            Ok(())
+        } else {
+            Err(key)
+        }
+    }
+
+    required_text(assessment, "intent")?;
+    required_text(assessment, "reason")?;
+    enum_value(assessment, "speechAct", SEMANTIC_SPEECH_ACT_VALUES)?;
+    enum_value(assessment, "subject", SEMANTIC_SUBJECT_VALUES)?;
+    enum_value(
+        assessment,
+        "assertionStatus",
+        SEMANTIC_ASSERTION_STATUS_VALUES,
+    )?;
+    let semantic_knowledge_need = required_text(assessment, "knowledgeNeed")?;
+    if !SEMANTIC_KNOWLEDGE_NEED_VALUES.contains(&semantic_knowledge_need) {
+        return Err("knowledgeNeed");
+    }
+    let response_disposition = required_text(assessment, "responseDisposition")?;
+    if !SEMANTIC_RESPONSE_DISPOSITION_VALUES.contains(&response_disposition) {
+        return Err("responseDisposition");
+    }
+    if should_reply == matches!(response_disposition, "silent" | "cooldown") {
+        return Err("responseDispositionConsistency");
+    }
+    let knowledge_consistent = match (top_level_knowledge_need, semantic_knowledge_need) {
+        ("not_required", "not_required")
+        | ("required", "required")
+        | ("insufficient", "uncertain" | "required") => true,
+        // Legacy/custom prompts may omit or conservatively widen the top-level route.  Do not
+        // reject a semantically valid assessment solely because the route is more conservative.
+        ("required", "uncertain") | ("insufficient", "not_required") => true,
+        _ => false,
+    };
+    if !knowledge_consistent {
+        return Err("knowledgeNeedConsistency");
+    }
+
+    let risk = assessment
+        .get_document("semanticRisk")
+        .map_err(|_| "semanticRisk")?;
+    for key in ["content", "pressure", "boundary", "privacy"] {
+        enum_value(risk, key, SEMANTIC_RISK_VALUES)?;
+    }
+    let confidence = risk
+        .get_f64("confidence")
+        .map_err(|_| "semanticRisk.confidence")?;
+    if !confidence.is_finite() || !(0.0..=1.0).contains(&confidence) {
+        return Err("semanticRisk.confidence");
+    }
+
+    let claims = assessment.get_array("claims").map_err(|_| "claims")?;
+    for claim in claims {
+        let claim = claim.as_document().ok_or("claims[]")?;
+        required_text(claim, "text")?;
+        required_text(claim, "reason")?;
+        claim
+            .get_bool("requiresEvidence")
+            .map_err(|_| "claims[].requiresEvidence")?;
+    }
+    Ok(())
 }
 
 /// 检查"该回复 / 不回复理由"长度与汉字数量是否达标（R1.4 / R1.6）。
@@ -2059,6 +2213,27 @@ mod validate_and_promote_tests {
             why_skip_reply: None,
             should_reply: Some(true),
             reply_text: Some("好的，谢谢你的问候。".to_string()),
+            conversation_mode: Some("casual_relationship".to_string()),
+            conversation_mode_reason: Some("当前是普通问候，按轻量关系模式回应。".to_string()),
+            intent_analysis: Some(mongodb::bson::doc! {
+                "semanticAssessment": {
+                    "intent": "回应客户的轻量问候",
+                    "speechAct": "greeting",
+                    "subject": "customer",
+                    "assertionStatus": "not_applicable",
+                    "knowledgeNeed": "not_required",
+                    "responseDisposition": "reply",
+                    "semanticRisk": {
+                        "content": "low",
+                        "pressure": "low",
+                        "boundary": "low",
+                        "privacy": "low",
+                        "confidence": 0.98,
+                    },
+                    "claims": [],
+                    "reason": "普通会话寒暄，不代表任何现实业务事实。",
+                }
+            }),
             ..RawAgentDecision::default()
         }
     }
@@ -2532,6 +2707,77 @@ mod validate_and_promote_tests {
         assert!(decision.agent_generated_signals.is_empty());
         assert_eq!(decision.assets_to_send.len(), 1);
         assert_eq!(decision.last_commitment.as_deref(), Some("明天给答复"));
+    }
+
+    #[test]
+    fn compact_reply_validation_keeps_valid_semantic_contract() {
+        let raw = make_valid_low_routine_raw();
+        let (decision, risks) = raw.validate_reply_critical(&runtime_default(true));
+
+        assert!(risks.is_empty(), "unexpected risks: {risks:?}");
+        assert!(decision
+            .intent_analysis
+            .get_document("semanticAssessment")
+            .is_ok());
+    }
+
+    #[test]
+    fn compact_reply_validation_drops_invalid_semantic_enum_without_hard_block_tag() {
+        let mut raw = make_valid_low_routine_raw();
+        raw.intent_analysis
+            .as_mut()
+            .expect("intent analysis")
+            .get_document_mut("semanticAssessment")
+            .expect("semantic assessment")
+            .insert("speechAct", "price_magic_word");
+
+        let (decision, risks) = raw.validate_reply_critical(&runtime_default(true));
+
+        assert!(decision
+            .intent_analysis
+            .get_document("semanticAssessment")
+            .is_err());
+        assert_eq!(
+            risks,
+            vec!["semantic_contract_invalid:speechAct".to_string()]
+        );
+        assert!(!risks.iter().any(|risk| {
+            risk.starts_with("missing_required_field:") || risk.starts_with("invalid_enum_value:")
+        }));
+    }
+
+    #[test]
+    fn compact_reply_validation_rejects_silent_disposition_for_sendable_body() {
+        let mut raw = make_valid_low_routine_raw();
+        raw.intent_analysis
+            .as_mut()
+            .expect("intent analysis")
+            .get_document_mut("semanticAssessment")
+            .expect("semantic assessment")
+            .insert("responseDisposition", "silent");
+
+        let (decision, risks) = raw.validate_reply_critical(&runtime_default(true));
+
+        assert!(decision
+            .intent_analysis
+            .get_document("semanticAssessment")
+            .is_err());
+        assert!(risks
+            .iter()
+            .any(|risk| risk == "semantic_contract_invalid:responseDispositionConsistency"));
+    }
+
+    #[test]
+    fn compact_reply_validation_allows_legacy_missing_semantic_contract() {
+        let mut raw = make_valid_low_routine_raw();
+        raw.intent_analysis = None;
+
+        let (_decision, risks) = raw.validate_reply_critical(&runtime_default(true));
+
+        assert!(
+            risks.is_empty(),
+            "旧 Prompt 缺少辅助语义合同应退回独立双闸，而不是结构性硬拦: {risks:?}"
+        );
     }
 
     #[test]

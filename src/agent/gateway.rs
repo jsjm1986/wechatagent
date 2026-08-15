@@ -73,9 +73,8 @@ use super::review::{
     decide_revision, derive_revision_failure, effective_review_mode, ensure_independent_claim_gate,
     evaluate_independent_claim_gate, finalize_review_for_send, local_decision_review,
     review_decision, review_passed, should_run_review, should_run_targeted_rewrite,
-    should_skip_claim_gate, skipped_claim_gate_evaluation, FinalizeOutcome, GatewayStatusFinal,
-    PendingFinalizeEvent, ReviewInvocationKind, ReviewerPromptCache, RevisionDecision,
-    CLAIM_GATE_SKIPPED_RISK_CASUAL_LOW,
+    FinalizeOutcome, GatewayStatusFinal, PendingFinalizeEvent, ReviewInvocationKind,
+    ReviewerPromptCache, RevisionDecision,
 };
 use super::run_envelope::{
     assert_final_review_status_valid, assert_gateway_status_valid, assert_lifecycle_valid,
@@ -93,23 +92,6 @@ use super::types::{
     ContactSendResult, DecisionReviewResult, KnowledgeRouteResult, ManualContactSend,
     RunPlannerResult, SendGatewayResult, HOLD_CATEGORY_HELD_BY_AI_POLICY,
 };
-
-/// 弱启发：reply 是否含"时间相关承诺"特征。仅用于 ⑥ 观测覆盖率，不进任何门、
-/// 不改变发送判定。非红线护栏（"是否做了承诺"是语义判断，交 LLM + prompt）。
-/// 明确接受可能误报/漏报——这正是它只观测不拦的原因。
-fn reply_has_time_commitment_feature(reply: &str) -> bool {
-    const MARKERS: [&str; 8] = [
-        "明天",
-        "后天",
-        "下周",
-        "下个月",
-        "稍后",
-        "晚点",
-        "回头",
-        "马上",
-    ];
-    MARKERS.iter().any(|m| reply.contains(m))
-}
 
 fn existing_outbox_covers_decision(
     existing_decision_id: Option<ObjectId>,
@@ -617,7 +599,6 @@ fn review_and_evaluate_claim_gate<'a>(
     referral_cards: &'a [crate::models::ReferralCard],
     reviewer_prompts: &'a ReviewerPromptCache,
     invocation_kind: ReviewInvocationKind,
-    skip_claim_gate: bool,
 ) -> BoxFuture<
     'a,
     AppResult<(
@@ -626,33 +607,6 @@ fn review_and_evaluate_claim_gate<'a>(
     )>,
 > {
     async move {
-        // S5-6：寒暄低风险轮（should_skip_claim_gate 七条件全满足，由调用方判定）
-        // 跳过独立 ClaimGate 的 LLM 调用——Review 本体照跑，评估结果用"未评估"
-        // 形态（outcome=None）占位，apply 对其零 hold、零 merge。
-        if skip_claim_gate {
-            let review = review_decision(
-                state,
-                contact,
-                inbound,
-                recent_messages,
-                decision,
-                playbook,
-                domain_config,
-                runtime,
-                memory,
-                context_pack,
-                knowledge_chunks,
-                knowledge_route,
-                review_mode,
-                Some(run_id),
-                None,
-                Some(active_profile),
-                Some(reviewer_prompts),
-                invocation_kind,
-            )
-            .await?;
-            return Ok((review, skipped_claim_gate_evaluation(decision)));
-        }
         let (review, claim_gate) = tokio::join!(
             review_decision(
                 state,
@@ -899,8 +853,6 @@ async fn send_contact_message_gateway_inner(
         &[],
         &reviewer_prompts,
         ReviewInvocationKind::ManualOutreach,
-        // 管理发送是 admin 手动指定文本，非 LLM 寒暄轮——ClaimGate 恒照跑。
-        false,
     )
     .await?;
     let priced_from_catalog = apply_independent_claim_gate(
@@ -925,8 +877,6 @@ async fn send_contact_message_gateway_inner(
         &selected_chunks,
         // 管理发送 decision 直接构造、非 LLM raw output，无 protocol promote_risks。
         Vec::new(),
-        synthetic_inbound.content.as_str(),
-        &active_profile.commitment_markers,
         priced_from_catalog,
         principal_product_exempted,
     );
@@ -2719,8 +2669,9 @@ fn run_user_operation_gateway_inner<'a>(
             &contact.account_id,
         )
         .is_empty();
-    let has_explicit_referral_context = has_eligible_referral_candidate
-        && super::referral::explicitly_requests_referral_context(&inbound.content);
+    // Candidate availability is a typed server fact. Whether the customer actually wants a
+    // referral remains an AI decision; do not pre-classify the inbound text with a phrase list.
+    let has_explicit_referral_context = has_eligible_referral_candidate;
     let forced_full_reason = crate::agent::sufficiency::forced_full_context_reason(
         &decision_first,
         has_cited_knowledge_context,
@@ -3039,10 +2990,7 @@ fn run_user_operation_gateway_inner<'a>(
         local_decision_review(&decision, local_budget_ref, &runtime)
     } else if should_run_review(&decision, &planner, &runtime) {
         let review_mode = effective_review_mode(&planner, &decision, &runtime, false);
-        // S5-6：首稿寒暄低风险轮跳过独立 ClaimGate（七条件纯函数判定）。rewrite /
-        // revision / 管理发送路径不跳——触发本身即风险信号或属 admin 手动指定文本。
-        let skip_claim_gate = should_skip_claim_gate(&decision, &planner);
-        let (mut review, claim_gate_evaluation) = review_and_evaluate_claim_gate(
+        let (review, claim_gate_evaluation) = review_and_evaluate_claim_gate(
             state,
             &contact,
             &inbound,
@@ -3062,20 +3010,8 @@ fn run_user_operation_gateway_inner<'a>(
             &referral_cards,
             &reviewer_prompts,
             ReviewInvocationKind::Conversation,
-            skip_claim_gate,
         )
         .await?;
-        if skip_claim_gate
-            && !review
-                .risks
-                .iter()
-                .any(|risk| risk == CLAIM_GATE_SKIPPED_RISK_CASUAL_LOW)
-        {
-            // 审计标记：跳过率可观测（decision_reviews.risks）、误跳可排查。
-            review
-                .risks
-                .push(CLAIM_GATE_SKIPPED_RISK_CASUAL_LOW.to_string());
-        }
         precomputed_claim_gate = Some(claim_gate_evaluation);
         review
     } else {
@@ -3202,8 +3138,6 @@ fn run_user_operation_gateway_inner<'a>(
                 &referral_cards,
                 &reviewer_prompts,
                 ReviewInvocationKind::Conversation,
-                // rewrite 由硬闸失败触发（幻觉/grounding），改写稿必须全量重评。
-                false,
             )
             .await?;
             review = next_review;
@@ -3260,8 +3194,6 @@ fn run_user_operation_gateway_inner<'a>(
         &contact,
         &selected_chunks,
         promote_risks.clone(),
-        inbound.content.as_str(),
-        &active_profile.commitment_markers,
         priced_from_catalog,
         principal_product_exempted,
     );
@@ -3477,8 +3409,6 @@ fn run_user_operation_gateway_inner<'a>(
                         &referral_cards,
                         &reviewer_prompts,
                         ReviewInvocationKind::Conversation,
-                        // revision 由 finalize 后的 revision trigger 触发，二稿全量重评。
-                        false,
                     )
                     .await?;
 
@@ -3505,8 +3435,6 @@ fn run_user_operation_gateway_inner<'a>(
                         &contact,
                         &selected_chunks,
                         promote_risks.clone(),
-                        inbound.content.as_str(),
-                        &active_profile.commitment_markers,
                         second_priced_from_catalog,
                         second_principal_product_exempted,
                     );
@@ -3756,6 +3684,11 @@ fn run_user_operation_gateway_inner<'a>(
                 "finalize_review_blocked",
             )
         };
+        // `precheck` only describes the cheap gateway snapshot taken before Review/Claim Gate.
+        // Once finalize has produced a terminal block, persist that terminal outcome instead of
+        // reusing the earlier `allowed=true` snapshot; otherwise the run log contradicts
+        // `finalReviewStatus` and makes an actually blocked reply look sendable to operators.
+        let terminal_gateway = blocked(&blocked_status, cancel_reason);
         write_decision_review(
             state,
             &contact,
@@ -3765,7 +3698,7 @@ fn run_user_operation_gateway_inner<'a>(
             playbook.as_ref(),
             domain_config.as_ref(),
             &runtime,
-            &precheck,
+            &terminal_gateway,
             &context_pack,
             &blocked_status,
             &knowledge_route,
@@ -3798,7 +3731,7 @@ fn run_user_operation_gateway_inner<'a>(
         &knowledge_route,
         to_document(&final_decision).unwrap_or_default(),
         to_document(&review).unwrap_or_default(),
-        to_document(&precheck).unwrap_or_default(),
+        to_document(&terminal_gateway).unwrap_or_default(),
         None,
         FinalizeRunLogFields {
             final_review_status: review.final_review_status.clone(),
@@ -6500,25 +6433,8 @@ pub(crate) async fn apply_agent_updates(
     // `awaiting_principal_decision` is derived only after a durable escalation
     // and its Outbox intent exist. Writing it from the LLM request here could
     // leave a false waiting state when policy routing or enqueue later fails.
-    // 承诺是“客户已经收到的外部事实”，必须由 dispatcher 在真实送达后提交。
-    // 此处仅保留缺字段观测，不写 commitments。
-    if non_empty_option(&decision.last_commitment).is_none()
-        && reply_has_time_commitment_feature(&decision.reply_text)
-    {
-        // ⑥观测：reply 像做了时间承诺但 LLM 没填 commitment 字段 → 无 follow-up。
-        // 仅观测 prompt 强化是否生效，不阻断、不改写、不进任何门。
-        let _ = write_agent_update_event(
-            state,
-            contact,
-            projection_guard,
-            "commitment_field_missing",
-            "agent.commitment_field_missing",
-            "observed",
-            "回复疑似含时间承诺但未填 commitment 字段（观测，未拦截）",
-            None,
-        )
-        .await;
-    }
+    // Whether a candidate contains a commitment is a model-owned semantic field;
+    // this projection path never scans the reply text for commitment words.
     if let Some(value) = non_empty_option(&decision.follow_up_policy) {
         set_doc.insert("follow_up_policy", value);
     }
@@ -8363,21 +8279,6 @@ mod tests {
         // 截断保留前 N 个(顺序稳定)。
         assert_eq!(observed[0].dimension, "维度0");
         assert_eq!(observed[MAX_BAYESIAN_SLOTS - 1].dimension, "维度5");
-    }
-
-    // ⑥ 承诺兑现观测：reply 时间承诺特征检测（弱启发，仅观测覆盖率）。
-    #[test]
-    fn reply_has_time_commitment_feature_detects_relative_dates() {
-        assert!(reply_has_time_commitment_feature("我明天发您资料"));
-        assert!(reply_has_time_commitment_feature("下周给您答复"));
-        assert!(reply_has_time_commitment_feature("稍后整理好发您"));
-        assert!(reply_has_time_commitment_feature("我马上处理"));
-    }
-    #[test]
-    fn reply_has_time_commitment_feature_negative() {
-        assert!(!reply_has_time_commitment_feature("好的，我了解了"));
-        assert!(!reply_has_time_commitment_feature(""));
-        assert!(!reply_has_time_commitment_feature("这个产品确实不错"));
     }
 
     // 终审 Important#1：媒体发送门与文本同源。

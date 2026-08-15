@@ -18,8 +18,7 @@
 //! 历史决策：本模块刻意 **不** 拼装最终 prompt，只输出"被包裹后的字符串"，
 //! 让 callee 自己决定放在哪段（system 段头 / user 段尾 / few-shot 内）。
 
-use crate::models::{ConversationMessage, MessageDirection};
-use serde::Serialize;
+use crate::models::ConversationMessage;
 
 const USER_OPEN: &str = "<<<USER_TURN>>>";
 const USER_CLOSE: &str = "<<<END_USER_TURN>>>";
@@ -78,45 +77,6 @@ pub fn budget_history_contents(
     rendered
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ActiveTemporalFact {
-    pub evidence_ref: String,
-    pub text: String,
-    pub created_at_millis: i64,
-}
-
-/// Server-derived schedule authority shared by Reply, Reviewer, and ClaimGate.
-/// Conversation history remains available for continuity, but only `active_temporal_facts`
-/// may authorize a concrete customer schedule assertion.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TemporalFactView {
-    pub active_temporal_facts: Vec<ActiveTemporalFact>,
-    pub expired_temporal_facts_present: bool,
-    pub latest_customer_schedule_position: String,
-    pub current_message_schedule_relevant: bool,
-    pub may_assert_concrete_schedule: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SchedulePosition {
-    Denied,
-    Confirmed,
-    GenericInquiry,
-    ConcreteProposal,
-}
-
-impl SchedulePosition {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Denied => "denied",
-            Self::Confirmed => "confirmed",
-            Self::GenericInquiry | Self::ConcreteProposal => "question_or_request",
-        }
-    }
-}
-
 pub fn temporal_chat_evidence_is_fresh(
     created_at: mongodb::bson::DateTime,
     evaluated_at: mongodb::bson::DateTime,
@@ -126,147 +86,6 @@ pub fn temporal_chat_evidence_is_fresh(
         .saturating_sub(created_at.timestamp_millis())
         .max(0)
         <= TEMPORAL_CHAT_EVIDENCE_MAX_AGE_MS
-}
-
-pub fn customer_statement_form(text: &str) -> &'static str {
-    let normalized = text.trim().to_ascii_lowercase();
-    let question_or_request = normalized.contains('?')
-        || normalized.contains('？')
-        || [
-            "吗",
-            "么",
-            "能不能",
-            "能否",
-            "可以吗",
-            "可不可以",
-            "怎么样",
-            "行不行",
-            "请",
-            "帮我",
-            "我想",
-            "需要吗",
-            "how about",
-            "can i",
-            "could i",
-            "would like",
-        ]
-        .iter()
-        .any(|marker| normalized.contains(marker));
-    if question_or_request {
-        "question_or_request"
-    } else {
-        "statement"
-    }
-}
-
-fn schedule_position(text: &str) -> Option<SchedulePosition> {
-    let normalized = text.trim().to_ascii_lowercase();
-    let denied = [
-        "没有预约",
-        "没预约",
-        "不要安排",
-        "别安排",
-        "不用安排",
-        "无需安排",
-        "不安排",
-        "不约了",
-        "取消安排",
-        "取消预约",
-        "不去了",
-        "不去店",
-        "no appointment",
-        "do not schedule",
-        "don't schedule",
-        "cancel the appointment",
-    ]
-    .iter()
-    .any(|marker| normalized.contains(marker));
-    if denied {
-        return Some(SchedulePosition::Denied);
-    }
-
-    let explicit_schedule = [
-        "预约",
-        "约了",
-        "约好",
-        "安排",
-        "到店",
-        "去店",
-        "见面",
-        "几点",
-        "什么时候",
-        "约的时间",
-        "约定时间",
-        "appointment",
-        "schedule",
-        "meet",
-    ]
-    .iter()
-    .any(|marker| normalized.contains(marker));
-    let concrete_time = [
-        "今天",
-        "明天",
-        "后天",
-        "今晚",
-        "周一",
-        "周二",
-        "周三",
-        "周四",
-        "周五",
-        "周六",
-        "周日",
-        "星期一",
-        "星期二",
-        "星期三",
-        "星期四",
-        "星期五",
-        "星期六",
-        "星期日",
-        "上午",
-        "下午",
-        "晚上",
-        "today",
-        "tomorrow",
-        "tonight",
-        "monday",
-        "tuesday",
-        "wednesday",
-        "thursday",
-        "friday",
-        "saturday",
-        "sunday",
-        "一点",
-        "两点",
-        "二点",
-        "三点",
-        "四点",
-        "五点",
-        "六点",
-        "七点",
-        "八点",
-        "九点",
-        "十点",
-        "十一点",
-        "十二点",
-    ]
-    .iter()
-    .any(|marker| normalized.contains(marker))
-        || (normalized.chars().any(|ch| ch.is_ascii_digit())
-            && ["点", "时", "月", "日", ":", " am", " pm"]
-                .iter()
-                .any(|marker| normalized.contains(marker)));
-    if !explicit_schedule && !concrete_time {
-        return None;
-    }
-
-    if customer_statement_form(&normalized) == "question_or_request" {
-        return Some(if concrete_time {
-            SchedulePosition::ConcreteProposal
-        } else {
-            SchedulePosition::GenericInquiry
-        });
-    }
-    Some(SchedulePosition::Confirmed)
 }
 
 pub fn message_matches_inbound(
@@ -286,134 +105,12 @@ pub fn message_matches_inbound(
     same_object || same_external || same_unidentified
 }
 
-/// Build a stable temporal authority view. A later denial or concrete unconfirmed proposal
-/// supersedes older confirmations. A generic schedule inquiry may use the latest fresh customer
-/// confirmation, while an unrelated current message cannot cause an old schedule to resurface.
-pub fn build_temporal_fact_view(
-    inbound: &ConversationMessage,
-    recent_messages: &[ConversationMessage],
-    evaluated_at: mongodb::bson::DateTime,
-) -> TemporalFactView {
-    let current_position = if inbound.is_synthetic_relay {
-        None
-    } else {
-        schedule_position(&inbound.content)
-    };
-    let mut historical = recent_messages
-        .iter()
-        .filter(|message| matches!(message.direction, MessageDirection::Inbound))
-        .filter(|message| !message_matches_inbound(message, inbound))
-        .collect::<Vec<_>>();
-    historical.sort_by(|left, right| {
-        right
-            .created_at
-            .timestamp_millis()
-            .cmp(&left.created_at.timestamp_millis())
-            .then_with(|| right.id.cmp(&left.id))
-            .then_with(|| right.message_id.cmp(&left.message_id))
-    });
-
-    let mut candidates = Vec::with_capacity(historical.len() + 1);
-    if !inbound.is_synthetic_relay {
-        candidates.push((
-            "current_user_message".to_string(),
-            inbound,
-            current_position,
-        ));
-    }
-    candidates.extend(
-        historical
-            .into_iter()
-            .take(12)
-            .enumerate()
-            .map(|(index, message)| {
-                (
-                    format!("recent_user_message:{index}"),
-                    message,
-                    schedule_position(&message.content),
-                )
-            }),
-    );
-    candidates.sort_by(|left, right| {
-        right
-            .1
-            .created_at
-            .timestamp_millis()
-            .cmp(&left.1.created_at.timestamp_millis())
-            .then_with(|| {
-                let left_current = left.0 == "current_user_message";
-                let right_current = right.0 == "current_user_message";
-                right_current.cmp(&left_current)
-            })
-            .then_with(|| right.1.id.cmp(&left.1.id))
-            .then_with(|| right.0.cmp(&left.0))
-    });
-
-    let latest_position = candidates.iter().find_map(|(_, _, position)| *position);
-    let mut expired_temporal_facts_present = false;
-    let mut active = None;
-    for (evidence_ref, message, position) in &candidates {
-        let Some(position) = position else { continue };
-        match position {
-            SchedulePosition::Denied | SchedulePosition::ConcreteProposal => break,
-            SchedulePosition::GenericInquiry => continue,
-            SchedulePosition::Confirmed => {
-                if temporal_chat_evidence_is_fresh(message.created_at, evaluated_at) {
-                    let text = if evidence_ref == "current_user_message" {
-                        "[见下方最新消息]".to_string()
-                    } else {
-                        let safe = history_prompt_content(&message.content);
-                        let mut bounded = budget_history_contents(
-                            &[safe],
-                            HISTORY_MESSAGE_MAX_CHARS,
-                            HISTORY_MESSAGE_MAX_CHARS,
-                            false,
-                        );
-                        bounded.pop().flatten().unwrap_or_default()
-                    };
-                    active = Some(ActiveTemporalFact {
-                        evidence_ref: evidence_ref.clone(),
-                        text,
-                        created_at_millis: message.created_at.timestamp_millis(),
-                    });
-                } else {
-                    expired_temporal_facts_present = true;
-                }
-                break;
-            }
-        }
-    }
-    expired_temporal_facts_present |= candidates.iter().any(|(_, message, position)| {
-        matches!(position, Some(SchedulePosition::Confirmed))
-            && !temporal_chat_evidence_is_fresh(message.created_at, evaluated_at)
-    });
-
-    let current_message_schedule_relevant = current_position.is_some();
-    let may_assert_concrete_schedule = active.is_some()
-        && matches!(
-            current_position,
-            Some(SchedulePosition::Confirmed | SchedulePosition::GenericInquiry)
-        );
-    TemporalFactView {
-        active_temporal_facts: if may_assert_concrete_schedule {
-            active.into_iter().collect()
-        } else {
-            Vec::new()
-        },
-        expired_temporal_facts_present,
-        latest_customer_schedule_position: latest_position
-            .map(SchedulePosition::label)
-            .unwrap_or("none")
-            .to_string(),
-        current_message_schedule_relevant,
-        may_assert_concrete_schedule,
-    }
-}
-
-pub fn render_temporal_fact_view(view: &TemporalFactView) -> String {
-    serde_json::to_string(view).unwrap_or_else(|_| {
-        r#"{"activeTemporalFacts":[],"expiredTemporalFactsPresent":false,"latestCustomerSchedulePosition":"none","currentMessageScheduleRelevant":false,"mayAssertConcreteSchedule":false}"#.to_string()
-    })
+/// Render objective time metadata for the prompt. The server deliberately does not classify the
+/// language into appointments, confirmations, cancellations, greetings, purchases, or any other
+/// semantic category. The model receives the original conversation plus message age/freshness and
+/// makes the contextual judgment itself.
+pub fn render_temporal_context_notice() -> &'static str {
+    "时间相关语义由模型根据完整对话判断；服务端只提供每条消息的 createdAtMillis、ageHours 与 temporalStatus。新鲜度是客观元数据，不等于预约、确认、取消或我方业务事实。客户消息只能说明客户自身表达，不能单独证明我方的政策、能力、预约记录、价格、交付或结果；历史我方/AI 回复也不是证据。"
 }
 
 /// Compact metadata prepended to every historical prompt line. It gives Reply and Reviewer the
@@ -498,25 +195,6 @@ fn strip_known_tags(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mongodb::bson::{DateTime, Document};
-
-    fn message(at_ms: i64, direction: MessageDirection, content: &str) -> ConversationMessage {
-        ConversationMessage {
-            id: None,
-            workspace_id: "workspace-a".to_string(),
-            account_id: "account-a".to_string(),
-            contact_wxid: "contact-a".to_string(),
-            message_id: Some(format!("message-{at_ms}-{content}")),
-            dedupe_key: None,
-            direction,
-            content: content.to_string(),
-            msg_type: None,
-            media_ref: None,
-            raw: Some(Document::new()),
-            is_synthetic_relay: false,
-            created_at: DateTime::from_millis(at_ms),
-        }
-    }
 
     #[test]
     fn empty_input_still_wraps() {
@@ -646,105 +324,11 @@ mod tests {
     }
 
     #[test]
-    fn current_confirmation_is_the_only_authorized_schedule_fact() {
-        let now = DateTime::from_millis(100_000);
-        let inbound = message(100_000, MessageDirection::Inbound, "明天下午三点可以");
-        let view = build_temporal_fact_view(&inbound, &[inbound.clone()], now);
-        assert!(view.may_assert_concrete_schedule);
-        assert_eq!(view.latest_customer_schedule_position, "confirmed");
-        assert_eq!(view.active_temporal_facts.len(), 1);
-        assert_eq!(
-            view.active_temporal_facts[0].evidence_ref,
-            "current_user_message"
-        );
-        assert_eq!(view.active_temporal_facts[0].text, "[见下方最新消息]");
-    }
-
-    #[test]
-    fn current_message_wins_ties_with_historical_schedule_positions() {
-        let now = DateTime::from_millis(100_000);
-        let inbound = message(100_000, MessageDirection::Inbound, "没有预约，不要安排");
-        let historical = message(100_000, MessageDirection::Inbound, "明天下午三点可以");
-        let view = build_temporal_fact_view(&inbound, &[historical], now);
-        assert_eq!(view.latest_customer_schedule_position, "denied");
-        assert!(!view.may_assert_concrete_schedule);
-        assert!(view.active_temporal_facts.is_empty());
-    }
-
-    #[test]
-    fn latest_denial_or_concrete_proposal_supersedes_old_confirmation() {
-        let now = DateTime::from_millis(100_000);
-        let confirmed = message(90_000, MessageDirection::Inbound, "明天下午三点可以");
-        for text in ["没有预约，不要安排", "后天下午四点可以吗？"] {
-            let inbound = message(100_000, MessageDirection::Inbound, text);
-            let view = build_temporal_fact_view(&inbound, &[confirmed.clone()], now);
-            assert!(!view.may_assert_concrete_schedule, "text={text}");
-            assert!(view.active_temporal_facts.is_empty(), "text={text}");
-        }
-    }
-
-    #[test]
-    fn vague_lack_of_time_is_not_a_schedule_confirmation() {
-        let now = DateTime::from_millis(100_000);
-        let old_confirmation = message(90_000, MessageDirection::Inbound, "明天下午三点可以");
-        let inbound = message(100_000, MessageDirection::Inbound, "最近有点没时间");
-        let view = build_temporal_fact_view(&inbound, &[old_confirmation], now);
-        assert!(!view.current_message_schedule_relevant);
-        assert!(!view.may_assert_concrete_schedule);
-        assert!(view.active_temporal_facts.is_empty());
-    }
-
-    #[test]
-    fn natural_language_concrete_time_question_is_a_proposal_not_confirmation() {
-        let now = DateTime::from_millis(100_000);
-        for text in ["周三下午三点怎么样", "明天下午三点行不行"] {
-            let inbound = message(100_000, MessageDirection::Inbound, text);
-            let view = build_temporal_fact_view(&inbound, &[], now);
-            assert_eq!(
-                view.latest_customer_schedule_position, "question_or_request",
-                "text={text}"
-            );
-            assert!(!view.may_assert_concrete_schedule, "text={text}");
-            assert!(view.active_temporal_facts.is_empty(), "text={text}");
-        }
-    }
-
-    #[test]
-    fn generic_inquiry_can_use_fresh_confirmation_but_unrelated_turn_cannot() {
-        let now = DateTime::from_millis(100_000);
-        let confirmed = message(90_000, MessageDirection::Inbound, "明天下午三点可以");
-        let inquiry = message(100_000, MessageDirection::Inbound, "我们约的时间是几点？");
-        let inquiry_view = build_temporal_fact_view(&inquiry, &[confirmed.clone()], now);
-        assert!(inquiry_view.may_assert_concrete_schedule);
-        assert_eq!(
-            inquiry_view.active_temporal_facts[0].evidence_ref,
-            "recent_user_message:0"
-        );
-
-        let unrelated = message(100_000, MessageDirection::Inbound, "最近有点忙");
-        let unrelated_view = build_temporal_fact_view(&unrelated, &[confirmed], now);
-        assert!(!unrelated_view.may_assert_concrete_schedule);
-        assert!(unrelated_view.active_temporal_facts.is_empty());
-    }
-
-    #[test]
-    fn stale_confirmation_and_historical_assistant_text_never_authorize_schedule() {
-        let now = DateTime::from_millis(TEMPORAL_CHAT_EVIDENCE_MAX_AGE_MS + 100_000);
-        let stale = message(1, MessageDirection::Inbound, "明天下午三点可以");
-        let assistant = message(
-            now.timestamp_millis() - 1,
-            MessageDirection::Outbound,
-            "已经帮你预约明天下午三点",
-        );
-        let inbound = message(
-            now.timestamp_millis(),
-            MessageDirection::Inbound,
-            "我们约的时间是几点？",
-        );
-        let view = build_temporal_fact_view(&inbound, &[stale, assistant], now);
-        assert!(!view.may_assert_concrete_schedule);
-        assert!(view.active_temporal_facts.is_empty());
-        assert!(view.expired_temporal_facts_present);
+    fn temporal_context_notice_declares_model_owned_semantics() {
+        let notice = render_temporal_context_notice();
+        assert!(notice.contains("模型根据完整对话判断"));
+        assert!(notice.contains("createdAtMillis"));
+        assert!(notice.contains("不等于预约"));
     }
 
     #[test]

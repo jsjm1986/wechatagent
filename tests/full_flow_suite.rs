@@ -576,6 +576,16 @@ async fn full_flow_a1c_persistent_unsupported_business_fact_is_blocked() {
 
     let log = fetch_run_log(&app, &contact).await;
     assert_eq!(log.final_review_status, "blocked_by_safety_guard");
+    assert_eq!(
+        log.gateway_result.get_bool("allowed").ok(),
+        Some(false),
+        "终态被安全门拦截时 gatewayResult.allowed 必须与 finalReviewStatus 一致"
+    );
+    assert_eq!(
+        log.gateway_result.get_str("status").ok(),
+        Some("blocked_by_safety_guard"),
+        "终态被安全门拦截时不得继续记录早期 precheck=allowed"
+    );
     // 客户回应保障会补一条中性占位；原始无依据业务回复绝不能进入 outbox。
     assert_eq!(outbox_count_for(&app, &contact).await, 1);
     let placeholder = app
@@ -1231,7 +1241,7 @@ async fn pending_delivery_is_not_learned_as_user_reaction() {
         .expect("insert second inbound");
     app.llm.push_response(json!({
         "outcomeStatus": "user_replied_positive",
-        "confidence": 8,
+        "confidence": 0.8,
         "summary": "客户表示会继续查看"
     }));
     let calls_before = app.llm.calls();

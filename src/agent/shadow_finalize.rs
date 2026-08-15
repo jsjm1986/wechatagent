@@ -11,8 +11,9 @@ use crate::routes::AppState;
 use super::decision::load_operation_state_policy_for_contact;
 use super::guards::{classify_reviewed_decision_action, enforce_state_action_policy};
 use super::review::{
-    contact_has_principal_product_exemption, ensure_independent_claim_gate,
-    finalize_review_for_send_at, GatewayStatusFinal,
+    apply_independent_claim_gate, contact_has_principal_product_exemption,
+    ensure_independent_claim_gate, finalize_review_for_send_at, GatewayStatusFinal,
+    IndependentClaimGateEvaluation,
 };
 use super::runtime::UserRuntimeParameters;
 use super::types::{AgentDecision, DecisionReviewResult};
@@ -30,12 +31,48 @@ pub(crate) async fn finalize_shadow_decision(
     contact: &Contact,
     inbound: &ConversationMessage,
     recent_messages: &[ConversationMessage],
+    decision: AgentDecision,
+    review: DecisionReviewResult,
+    runtime: &UserRuntimeParameters,
+    knowledge_chunks: &[OperationKnowledgeChunk],
+    promote_risks: Vec<String>,
+    run_id: &str,
+) -> AppResult<ShadowFinalizeResult> {
+    finalize_shadow_decision_with_claim_gate(
+        state,
+        contact,
+        inbound,
+        recent_messages,
+        decision,
+        review,
+        runtime,
+        knowledge_chunks,
+        promote_risks,
+        run_id,
+        None,
+    )
+    .await
+}
+
+/// Shadow finalization with an optional precomputed Claim Gate result.
+///
+/// Production evaluates Claim Gate before targeted rewrite selection and then re-evaluates the
+/// rewritten candidate. Shadow needs the same ordering to report the real terminal status, but it
+/// must not call the gate twice for the same candidate. Callers may therefore pass the exact
+/// evaluation for `decision`; `None` preserves the legacy wrapper behavior used by prompt shadow.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn finalize_shadow_decision_with_claim_gate(
+    state: &AppState,
+    contact: &Contact,
+    inbound: &ConversationMessage,
+    recent_messages: &[ConversationMessage],
     mut decision: AgentDecision,
     mut review: DecisionReviewResult,
     runtime: &UserRuntimeParameters,
     knowledge_chunks: &[OperationKnowledgeChunk],
     promote_risks: Vec<String>,
     run_id: &str,
+    claim_gate_evaluation: Option<IndependentClaimGateEvaluation>,
 ) -> AppResult<ShadowFinalizeResult> {
     let shadow_snapshot = super::budget::current_shadow_evaluation_snapshot();
     let (active_profile, active_products, evaluated_at) = match shadow_snapshot {
@@ -56,21 +93,28 @@ pub(crate) async fn finalize_shadow_decision(
             (profile, products, mongodb::bson::DateTime::now())
         }
     };
-    let priced_from_catalog = ensure_independent_claim_gate(
-        state,
-        contact,
-        inbound,
-        recent_messages,
-        &decision,
-        &mut review,
-        knowledge_chunks,
-        &active_products,
-        &[],
-        &active_profile,
-        evaluated_at,
-        Some(run_id),
-    )
-    .await;
+    let priced_from_catalog = match claim_gate_evaluation {
+        Some(evaluation) => {
+            apply_independent_claim_gate(evaluation, &decision, &mut review, &active_products)
+        }
+        None => {
+            ensure_independent_claim_gate(
+                state,
+                contact,
+                inbound,
+                recent_messages,
+                &decision,
+                &mut review,
+                knowledge_chunks,
+                &active_products,
+                &[],
+                &active_profile,
+                evaluated_at,
+                Some(run_id),
+            )
+            .await
+        }
+    };
     let principal_product_exempted = contact_has_principal_product_exemption(contact);
     let outcome = finalize_review_for_send_at(
         review,
@@ -79,8 +123,6 @@ pub(crate) async fn finalize_shadow_decision(
         contact,
         knowledge_chunks,
         promote_risks,
-        inbound.content.as_str(),
-        &active_profile.commitment_markers,
         priced_from_catalog,
         principal_product_exempted,
         evaluated_at,

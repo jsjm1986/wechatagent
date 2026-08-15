@@ -636,11 +636,6 @@ export type BusinessFormula = {
   eval_score_key?: string | null;
 };
 
-export type CommitmentMarkers = {
-  product_effect: string[];
-  tone_only: string[];
-};
-
 export type CoverageDimension = {
   key: string;
   display_name: string;
@@ -748,7 +743,6 @@ export type DomainProfile = {
   prompt_fragment: string;
   conversation_modes: string[];
   business_formulas: BusinessFormula[];
-  commitment_markers: CommitmentMarkers;
   coverage_dimensions: CoverageDimension[];
   threshold_overrides?: ProfileThresholds | null;
   // universal-domain-adaptation 增量字段（H12/H14/H16/H17/H11/H8 等）。
@@ -791,7 +785,6 @@ export type DomainProfileDraft = {
   prompt_fragment?: string;
   conversation_modes?: string[];
   business_formulas?: BusinessFormula[];
-  commitment_markers?: CommitmentMarkers;
   coverage_dimensions?: CoverageDimension[];
   threshold_overrides?: ProfileThresholds;
   methodology_generator_preamble?: string;

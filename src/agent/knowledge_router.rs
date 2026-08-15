@@ -605,7 +605,10 @@ fn knowledge_prefilter_requires_agent(
         return true;
     }
     let current = current_message.trim();
-    if current.is_empty() || current.chars().count() > 12 || !looks_context_dependent(current) {
+    // Short follow-ups can depend on the immediately preceding turn. Do not classify them with a
+    // natural-language marker list; the Knowledge Agent decides relevance after this cheap shape
+    // check and the full citation path still authorizes every factual claim.
+    if current.is_empty() || current.chars().count() > 12 {
         return false;
     }
 
@@ -622,13 +625,6 @@ fn knowledge_prefilter_requires_agent(
         .map(|message| message.content.trim())
         .find(|content| !content.is_empty() && *content != current)
         .is_some_and(|previous| knowledge_has_local_relevance(previous, chunks, now))
-}
-
-fn looks_context_dependent(message: &str) -> bool {
-    message.ends_with(['?', '？', '呢', '吗'])
-        || ["多少", "多久", "怎么", "这个", "那个", "它", "具体"]
-            .iter()
-            .any(|marker| message.contains(marker))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1333,10 +1329,10 @@ mod local_relevance_prefilter_tests {
     }
 
     #[test]
-    fn unrelated_short_social_turn_does_not_inherit_old_product_topic() {
+    fn short_turn_rechecks_immediate_context_without_phrase_classification() {
         let chunks = vec![chunk("年度会员价格", "年度会员售价与续费政策")];
         let recent = vec![message(10, "我想了解年度会员"), message(20, "晚安")];
-        assert!(!knowledge_prefilter_requires_agent(
+        assert!(knowledge_prefilter_requires_agent(
             "晚安",
             &recent,
             &chunks,

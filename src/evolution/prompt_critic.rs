@@ -14,8 +14,6 @@
 //! 失败 / 安全 drop 策略（design.md §3.2 / §9.3）：
 //! - schema 反序列化失败 / 字段超长 → 整批 drop，写入一条占位 proposal
 //!   `status="rejected_below_threshold" failure_reason="critic_schema_invalid"`。
-//! - snippet / summary 命中 [`super::lint::passes_forbidden_words`] → 整批 drop，
-//!   `failure_reason="forbidden_literal"`。
 //! - templateKey ∈ [`crate::prompts::PROMPT_EVOLUTION_FORBIDDEN_KEYS`] → 整批
 //!   drop，`failure_reason="self_referential_critic_prompt"`。
 //! - EvolutionBudget 耗尽 → 不进 LLM 调用，返回空 vec；调用方据此跳过。
@@ -37,7 +35,6 @@ use crate::routes::AppState;
 use super::budget::EvolutionBudget;
 use super::cohort::Cohorts;
 use super::error::EvolutionError;
-use super::lint::passes_forbidden_words;
 use super::revision::prompt_revision;
 
 /// 单次 tick 允许产出的 prompt proposal 数。design.md §3.2 锁定为 4。
@@ -274,7 +271,7 @@ pub async fn generate(
         return Ok(Vec::new());
     }
 
-    // 7. 字段长度 / 禁词 / 自指三道闸；任一命中整批 drop。
+    // 7. 字段长度 / 自指 / 目标 key 三道结构闸；自然语言风险交给发布阶段 AI 语义审查。
     if let Some(reason) = validate_diffs(&parsed.diffs) {
         return Ok(vec![mk_drop_proposal(
             experiment_id,
@@ -465,9 +462,6 @@ fn validate_diffs(diffs: &[CriticDiff]) -> Option<&'static str> {
         {
             return Some("critic_schema_invalid");
         }
-        if !passes_forbidden_words(&diff.snippet) || !passes_forbidden_words(&diff.summary) {
-            return Some("forbidden_literal");
-        }
         if PROMPT_EVOLUTION_FORBIDDEN_KEYS.contains(&diff.template_key.as_str()) {
             return Some("self_referential_critic_prompt");
         }
@@ -632,21 +626,6 @@ mod tests {
         assert_eq!(validate_diffs(&diffs), Some("critic_schema_invalid"));
     }
 
-    /// snippet 命中 CI 禁词（含被禁的中文角色）→ 整批 drop（`forbidden_literal`）。
-    /// 测试串使用 unicode 转义构造，避开 CI 禁词扫描脚本对本测试源文件
-    /// 的字面量命中。
-    #[test]
-    fn validate_diffs_rejects_forbidden_literal_in_snippet() {
-        // 通过 unicode 转义构造一个会被禁词扫描命中的串，避免本测试源文件
-        // 自身被 lint 命中。代码点参见 lint 模块的禁词常量。
-        let forbidden = format!(
-            "遇到投诉时，建议切换到{}{}{}{}以稳住客户",
-            '\u{4eba}', '\u{5de5}', '\u{63a5}', '\u{7ba1}',
-        );
-        let diffs = vec![mk_diff("user.reply.policy", "policy", "ok", &forbidden)];
-        assert_eq!(validate_diffs(&diffs), Some("forbidden_literal"));
-    }
-
     /// templateKey == evolution_critic_v1 → 整批 drop（`self_referential_critic_prompt`）。
     #[test]
     fn validate_diffs_rejects_self_reference() {
@@ -674,27 +653,33 @@ mod tests {
         assert_eq!(validate_diffs(&diffs), None);
     }
 
-    /// 多条合法 diff 中只要任一条命中禁词，整批 drop（lint 是全或无）。
+    /// 多条结构合法 diff 不因自然语言内容被服务端词表裁决。
     #[test]
-    fn validate_diffs_drops_whole_batch_if_one_violates() {
-        // 通过 unicode 转义构造禁词，避开 lint 字面量扫描。
-        let forbidden = format!(
-            "请{}{}{}{}处理",
-            '\u{4eba}', '\u{5de5}', '\u{4ecb}', '\u{5165}',
-        );
+    fn validate_diffs_accepts_natural_language_without_word_gate() {
         let diffs = vec![
             mk_diff("user.reply.policy", "policy", "ok", "正常 snippet"),
-            mk_diff("user.reply.policy", "soul", "ok", &forbidden),
+            mk_diff(
+                "user.reply.policy",
+                "soul",
+                "自然语言摘要",
+                "自然语言内容由 AI 语义审查",
+            ),
         ];
-        assert_eq!(validate_diffs(&diffs), Some("forbidden_literal"));
+        assert_eq!(validate_diffs(&diffs), None);
     }
 
     /// drop proposal 的 schema 字段：kind=prompt，status=rejected_below_threshold。
     #[test]
     fn drop_proposal_uses_prompt_kind_and_rejected_status() {
-        let p = mk_drop_proposal("exp_x", "ws", "acct", "forbidden_literal", DateTime::now());
+        let p = mk_drop_proposal(
+            "exp_x",
+            "ws",
+            "acct",
+            "critic_schema_invalid",
+            DateTime::now(),
+        );
         assert_eq!(p.proposal_kind, "prompt");
         assert_eq!(p.status, "rejected_below_threshold");
-        assert_eq!(p.failure_reason.as_deref(), Some("forbidden_literal"));
+        assert_eq!(p.failure_reason.as_deref(), Some("critic_schema_invalid"));
     }
 }

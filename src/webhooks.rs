@@ -250,19 +250,17 @@ pub(crate) fn policy_run_at(
 enum InboundScheduleOutcome {
     /// 静默时段：义务已排到醒来时刻（`gateway_status=quiet_hours_waiting`）。
     QuietDeferred,
-    /// 正常去抖链路（非静默时段，或命中 S5-3 显式交易意图豁免）：返回义务 task
-    /// 供 webhook 主路径即时安排后台唤醒；恢复路径可忽略（task worker 会接手）。
+    /// 正常去抖链路：返回义务 task 供 webhook 主路径即时安排后台唤醒；
+    /// 恢复路径可忽略（task worker 会接手）。
     Debounced(DurableInboundTask),
 }
 
-/// #69 作息门控 + S5-3 豁免：把一条 managed 入站排进该 contact 唯一的
+/// #69 作息门控：把一条 managed 入站排进该 contact 唯一的
 /// `inbound_reply` 义务。webhook 主路径与 [`reconcile_pending_inbound_handoffs`]
 /// 崩溃恢复路径共用本判定，杜绝两处分支漂移。
 ///
-/// 静默时段默认 defer 到醒来时刻；唯一豁免（S5-3）：交易域 profile 下的显式
-/// 购买/付款承诺（[`agent::quiet_hours::bypass_deferral_for_explicit_buying_intent`]，
-/// 与 reaction 确定性购买下限同词表同语义门）→ 走正常去抖链路（与非静默时段
-/// 行为一致），并 best-effort 写一条 `quiet_hours_bypassed_buying_intent` 事件。
+/// 静默时段统一 defer 到醒来时刻；是否需要知识、澄清、交易动作或停止触达，
+/// 由唤醒后的 AI 语义链路决定。
 async fn schedule_managed_inbound_obligation(
     state: &AppState,
     contact: &Contact,
@@ -276,15 +274,7 @@ async fn schedule_managed_inbound_obligation(
             runtime.quiet_hours_end,
             runtime.quiet_hours_tz_offset_hours,
         );
-    let buying_intent_bypass = quiet
-        && agent::quiet_hours::bypass_deferral_for_explicit_buying_intent(
-            active_profile,
-            &inbound.content,
-        );
-    if buying_intent_bypass {
-        emit_quiet_hours_bypass_event(state, contact, inbound.id).await;
-    }
-    if quiet && !buying_intent_bypass {
+    if quiet {
         let run_at = agent::quiet_hours::next_wake_at(
             runtime.quiet_hours_end,
             runtime.quiet_hours_tz_offset_hours,
@@ -301,46 +291,6 @@ async fn schedule_managed_inbound_obligation(
         );
         let task = materialize_durable_inbound_task(state, contact, inbound, window_ms).await?;
         Ok(InboundScheduleOutcome::Debounced(task))
-    }
-}
-
-/// S5-3 豁免命中的可观测埋点（best-effort：写失败只 warn，绝不阻断应答链路）。
-/// `dedupe_key` 用 message `_id` 锚定——webhook 主路径与恢复路径并发处理同一条
-/// 入站时，partial unique index 保证事件至多一条。
-async fn emit_quiet_hours_bypass_event(
-    state: &AppState,
-    contact: &Contact,
-    message_id: Option<ObjectId>,
-) {
-    let result = state
-        .db
-        .events()
-        .insert_one(
-            crate::models::AgentEvent {
-                id: None,
-                workspace_id: contact.workspace_id.clone(),
-                account_id: contact.account_id.clone(),
-                contact_wxid: Some(contact.wxid.clone()),
-                kind: "quiet_hours_bypassed_buying_intent".to_string(),
-                status: "bypassed".to_string(),
-                summary: "静默时段收到显式购买/付款承诺，AI 按交易域策略即时应答（不等待醒来时刻）"
-                    .to_string(),
-                details: message_id.map(|id| doc! { "message_id": id }),
-                created_at: DateTime::now(),
-                dedupe_key: message_id
-                    .map(|id| format!("quiet_hours_buying_bypass:{}", id.to_hex())),
-            },
-            None,
-        )
-        .await;
-    if let Err(error) = result {
-        if !is_duplicate_key_error(&error) {
-            tracing::warn!(
-                contact_wxid = %contact.wxid,
-                ?error,
-                "记录 quiet_hours_bypassed_buying_intent 事件失败（观测旁路，不影响应答）"
-            );
-        }
     }
 }
 

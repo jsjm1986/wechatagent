@@ -51,20 +51,6 @@
       "order": 3
     }
   ],
-  "commitment_markers": {
-    "product_effect": [
-      "成功率",
-      "见效",
-      "回款",
-      "百分之",
-      "百分百"
-    ],
-    "tone_only": [
-      "保证",
-      "一定能",
-      "绝对"
-    ]
-  },
   "conversation_modes": [
     "casual_relationship",
     "value_exchange",

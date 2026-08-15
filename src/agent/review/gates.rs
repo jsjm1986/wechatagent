@@ -62,6 +62,11 @@ pub fn review_passed(review: &DecisionReviewResult, runtime: &UserRuntimeParamet
 /// 是否回复、知识引用、状态/阶段、tool-loop 协议字段。候选正文由 Reviewer 的独立
 /// `候选回复` 槽注入，不在此重复序列化。
 pub(crate) fn build_reviewer_decision_view(decision: &AgentDecision) -> String {
+    let semantic_assessment = decision
+        .intent_analysis
+        .get_document("semanticAssessment")
+        .cloned()
+        .unwrap_or_default();
     serde_json::to_string(&mongodb::bson::doc! {
         "shouldReply": decision.should_reply,
         "matchedKnowledgeIds": decision.matched_knowledge_ids.clone(),
@@ -78,6 +83,7 @@ pub(crate) fn build_reviewer_decision_view(decision: &AgentDecision) -> String {
         "runMode": decision.run_mode.clone(),
         "riskLevel": decision.risk_level.clone(),
         "knowledgeNeed": decision.knowledge_need.clone(),
+        "semanticAssessment": semantic_assessment,
     })
     .unwrap_or_default()
 }
@@ -280,9 +286,9 @@ pub(crate) fn route_dual_gate(
 
 /// item ②：从候选回复正文提取廉价客观特征，供软闸改写指令使用。
 ///
-/// 不做任何判罚、**也不替改写 Agent 预判方向**——只把「问句数 / 字数 / 共情词
-/// 命中数」这三个真模型自己难以准确自测的客观量算出来，拼成一句中文提示追加到
-/// revision_direction，让单次改写有客观抓手。空回复返回空串（不追加）。
+/// 不做任何判罚、**也不替改写 Agent 预判方向**——只把问句数和字数这两个
+/// 不依赖自然语言词表的客观量拼成一句提示。语气、共情和业务语义全部交给改写 Agent。
+/// 空回复返回空串（不追加）。
 ///
 /// **问句一项刻意只报数、不下"该加该减"的结论**：是否调整问句高度依赖用户当前
 /// 语境（用户说"别一直问"时该减，用户在等推进时可加），这是语义判断，归改写
@@ -296,23 +302,10 @@ fn reply_objective_features(reply_text: &str) -> String {
     }
     let questions = text.matches(['?', '？']).count();
     let chars = text.chars().count();
-    const EMPATHY_WORDS: [&str; 10] = [
-        "理解",
-        "明白",
-        "辛苦",
-        "不容易",
-        "感受",
-        "确实",
-        "懂",
-        "体会",
-        "替你",
-        "为你",
-    ];
-    let empathy: usize = EMPATHY_WORDS.iter().map(|w| text.matches(w).count()).sum();
     format!(
-        "【本次回复客观特征】问句 {questions} 个、{chars} 字、共情词约 {empathy} 处——\
-         改写时请结合用户当前语境判断问句的增减（用户若表达不想被追问，应改用陈述句\
-         承接、不再提问）；篇幅过长可精简到口语节奏；共情词偏少可先承接对方处境再给信息。"
+        "【本次回复客观特征】问句 {questions} 个、{chars} 字——\
+         改写时请结合完整对话判断是否需要调整问句、承接方式和篇幅；不要用固定词表\
+         代替语义判断。"
     )
 }
 
@@ -577,8 +570,6 @@ pub fn contact_has_principal_product_exemption(contact: &crate::models::Contact)
 /// * `_contact`：当前 contact，本期保留参数位（同上，task 3.4 / R8 使用）。
 /// * `knowledge_chunks`：当前 run 已加载的知识切片，用于 R5.4
 ///   verified_chunks 计算与 R5.7 safe_claims 反向门。
-/// * `markers`：`enforce_string_fact_risk_guard` 的产品声明标记词集合，用于
-///   R5.3.a fail-closed 推断。
 /// * `promote_risks`：来自 [`crate::agent::types::RawAgentDecision::validate_and_promote`]
 ///   的协议违规标签（如 `missing_required_field:* / invalid_enum_value:* /
 ///   invalid_type:* / decision_phase_invalid:* /
@@ -595,8 +586,6 @@ pub fn finalize_review_for_send(
     _contact: &crate::models::Contact,
     knowledge_chunks: &[crate::models::OperationKnowledgeChunk],
     promote_risks: Vec<String>,
-    _inbound_text: &str,
-    commitment_markers: &crate::models::CommitmentMarkers,
     priced_from_catalog: bool,
     principal_product_exempted: bool,
 ) -> FinalizeOutcome {
@@ -608,8 +597,6 @@ pub fn finalize_review_for_send(
         _contact,
         knowledge_chunks,
         promote_risks,
-        _inbound_text,
-        commitment_markers,
         priced_from_catalog,
         principal_product_exempted,
         mongodb::bson::DateTime::now(),
@@ -627,8 +614,6 @@ pub(crate) fn finalize_review_for_send_at(
     _contact: &crate::models::Contact,
     knowledge_chunks: &[crate::models::OperationKnowledgeChunk],
     promote_risks: Vec<String>,
-    _inbound_text: &str,
-    commitment_markers: &crate::models::CommitmentMarkers,
     priced_from_catalog: bool,
     principal_product_exempted: bool,
     evaluated_at: mongodb::bson::DateTime,
@@ -746,7 +731,7 @@ pub(crate) fn finalize_review_for_send_at(
         .flatten()
         .filter_map(|value| value.as_document())
         .filter(|claim| {
-            claim.get_bool("requiresEvidence").unwrap_or(false)
+            claim.get_str("evidenceNeed") == Ok("required")
                 && !claim.get_bool("productClaim").unwrap_or(false)
         })
         .flat_map(|claim| {
@@ -879,73 +864,6 @@ pub(crate) fn finalize_review_for_send_at(
                 status: GatewayStatusFinal::BlockedUnverifiedProductClaim,
                 pending_events,
             };
-        }
-    }
-
-    // ── item ①「先观测后判罚」：grounding 漏判探针（非拦截） ──
-    //
-    // R5.4 硬闸只在 reviewer 自报 requiresProductKnowledge=true 时触发。若
-    // reviewer 漏判（未自报），含「保证三个月回款」这类绝对化产品承诺、又无
-    // verified chunk 背书的回复会直接放行——这是质量红线上的真实缺口。
-    //
-    // 本探针**不改变任何发送判定**（不动 review.approved / final_review_status /
-    // 返回 status），只在「reviewer 未自报 ∧ 回复含硬承诺 ∧ 无 verified 背书」
-    // 三者同现时落一条 telemetry，量化 reviewer 到底多久漏判一次。位置在 R5.4
-    // 硬闸之后——若 reviewer 已自报、上方已 block/return，本探针不会执行，故不
-    // 与真阳性重复计数。有统计意义的漏判率证据后，再决定是否抬成硬闸（用户决策：
-    // 先观测，避免重新引入 2026-05-25 刻意删除的脆弱 string-marker 判罚）。
-    if !crate::agent::guards::claim_requires_product_knowledge(&review.claim_analysis) {
-        let class =
-            crate::agent::guards::commitment_claim_class(&decision.reply_text, commitment_markers);
-        if class != crate::agent::guards::CommitmentClass::None {
-            let verified = crate::agent::guards::compute_verified_chunks(
-                &decision.used_knowledge_ids,
-                knowledge_chunks,
-                evaluated_at,
-            );
-            if verified.is_empty() {
-                match class {
-                    crate::agent::guards::CommitmentClass::ProductEffect => {
-                        // ProductEffect is only a telemetry hint. Semantic claim decisions belong
-                        // to the AI reviewer; keyword matching must never become the business
-                        // judge. A separate typed AI claim gate supplies the fail-closed verdict.
-                        let mut details = Document::new();
-                        details.insert(
-                            "reply_excerpt",
-                            decision.reply_text.chars().take(80).collect::<String>(),
-                        );
-                        details.insert("used_knowledge_ids", decision.used_knowledge_ids.clone());
-                        details.insert("knowledge_chunk_total", knowledge_chunks.len() as i64);
-                        pending_events.push(PendingFinalizeEvent {
-                            kind: "grounding_probe_reviewer_missed".to_string(),
-                            status: "observe".to_string(),
-                            summary:
-                                "观测：回复含效果/数据类承诺且无 verified 背书，但 reviewer 未标 requiresProductKnowledge"
-                                    .to_string(),
-                            details,
-                        });
-                    }
-                    crate::agent::guards::CommitmentClass::ToneOnly => {
-                        // 语气类：维持现状，仅观测不拦（避免误杀情感承诺）。
-                        let mut details = Document::new();
-                        details.insert(
-                            "reply_excerpt",
-                            decision.reply_text.chars().take(80).collect::<String>(),
-                        );
-                        details.insert("used_knowledge_ids", decision.used_knowledge_ids.clone());
-                        details.insert("knowledge_chunk_total", knowledge_chunks.len() as i64);
-                        pending_events.push(PendingFinalizeEvent {
-                            kind: "grounding_probe_reviewer_missed".to_string(),
-                            status: "observe".to_string(),
-                            summary:
-                                "观测：回复含语气类承诺且无 verified 背书，但 reviewer 未标 requiresProductKnowledge"
-                                    .to_string(),
-                            details,
-                        });
-                    }
-                    crate::agent::guards::CommitmentClass::None => {}
-                }
-            }
         }
     }
 
@@ -1581,7 +1499,7 @@ mod reviewer_decision_view_tests {
     //!   reviewer 视图里也不应包含其值或 key；
     //! * 候选正文由独立槽注入，事实面视图不得重复 reply_text；should_reply /
     //!   matched_knowledge_ids 等控制与引用字段必须保留；
-    //! * intent_analysis / next_best_action / operating_memory_update 三个
+    //! * 只有 intent_analysis.semanticAssessment 语义合同进入 reviewer 视图；其余
     //!   推理 Document 不进 reviewer 视图。
 
     use super::build_reviewer_decision_view;
@@ -1617,7 +1535,13 @@ mod reviewer_decision_view_tests {
                 card_id: "64a1f2c3e4b5a697889a0011".to_string(),
                 reason: Some("客户明确要求顾问对接".to_string()),
             }),
-            intent_analysis: doc! { "explanation": "should not leak" },
+            intent_analysis: doc! {
+                "semanticAssessment": {
+                    "responseDisposition": "reply",
+                    "speechAct": "statement",
+                },
+                "explanation": "should not leak",
+            },
             next_best_action: doc! { "explanation": "should not leak" },
             operating_memory_update: doc! { "explanation": "should not leak" },
             ..Default::default()
@@ -1657,7 +1581,6 @@ mod reviewer_decision_view_tests {
             "whyShouldReply",
             "whySkipReply",
             "riskSelfCheck",
-            "intentAnalysis",
             "nextBestAction",
             "operatingMemoryUpdate",
         ];
@@ -1706,6 +1629,16 @@ mod reviewer_decision_view_tests {
         assert!(
             view.contains("price"),
             "应保留 objectionsDetected: {}",
+            view
+        );
+        assert!(
+            view.contains("semanticAssessment") && view.contains("responseDisposition"),
+            "应保留 Reply Agent 的语义合同: {}",
+            view
+        );
+        assert!(
+            !view.contains("\"explanation\":\"should not leak\""),
+            "不应注入 semanticAssessment 之外的 intentAnalysis 推理: {}",
             view
         );
         assert!(
@@ -1966,10 +1899,10 @@ mod dual_gate_classification_tests {
         let out = reply_objective_features("好的，我来想想看");
         // 报了客观量。
         assert!(out.contains("问句"));
-        assert!(out.contains("共情词"));
-        // 把问句增减判断交还给改写 Agent，并显式点出"用户拒绝追问→改陈述句"。
-        assert!(out.contains("结合用户当前语境判断"));
-        assert!(out.contains("不想被追问"));
+        assert!(out.contains("字"));
+        // 把语气与问句增减判断交还给改写 Agent，不再由服务端词表代判。
+        assert!(out.contains("结合完整对话判断"));
+        assert!(out.contains("不要用固定词表"));
         // 不再无条件鼓励加问句（旧的反向引导根因）。
         assert!(!out.contains("问句过少可加 1 个自然反问"));
     }
@@ -2146,8 +2079,6 @@ mod dual_gate_classification_tests {
             &contact,
             &[],
             Vec::new(),
-            "用户最新消息",
-            &crate::models::CommitmentMarkers::default(),
             false,
             false,
         );
@@ -2182,8 +2113,6 @@ mod dual_gate_classification_tests {
             &contact,
             &[],
             Vec::new(),
-            "用户最新消息",
-            &crate::models::CommitmentMarkers::default(),
             false,
             false,
         );
@@ -2226,8 +2155,6 @@ mod dual_gate_classification_tests {
             &contact,
             &[],
             Vec::new(),
-            "收到，谢谢",
-            &crate::models::CommitmentMarkers::default(),
             false,
             false,
         );
@@ -2271,8 +2198,6 @@ mod dual_gate_classification_tests {
             &contact,
             &[],
             Vec::new(),
-            "用户最新消息",
-            &crate::models::CommitmentMarkers::default(),
             false,
             false,
         );
@@ -2306,8 +2231,6 @@ mod dual_gate_classification_tests {
             &contact,
             &[],
             Vec::new(),
-            "用户最新消息",
-            &crate::models::CommitmentMarkers::default(),
             false,
             false,
         );
@@ -2340,8 +2263,6 @@ mod dual_gate_classification_tests {
             &contact,
             &[],
             Vec::new(),
-            "用户最新消息",
-            &crate::models::CommitmentMarkers::default(),
             false,
             false,
         );
@@ -2415,7 +2336,7 @@ mod dual_gate_classification_tests {
                 "claim": "到店必须携带身份证",
                 "scope": "visit_requirement",
                 "productClaim": false,
-                "requiresEvidence": true,
+                "evidenceNeed": "required",
                 "evidenceRefs": Vec::<String>::new(),
                 "supported": false,
             }],
@@ -2430,8 +2351,6 @@ mod dual_gate_classification_tests {
             &contact,
             &[],
             Vec::new(),
-            "到店要带什么",
-            &crate::models::CommitmentMarkers::default(),
             false,
             false,
         );
@@ -2461,7 +2380,7 @@ mod dual_gate_classification_tests {
                 "claim": "客户已约明天下午三点",
                 "scope": "appointment",
                 "productClaim": false,
-                "requiresEvidence": true,
+                "evidenceNeed": "required",
                 "evidenceRefs": ["current_user_message"],
                 "supported": true,
             }],
@@ -2476,8 +2395,6 @@ mod dual_gate_classification_tests {
             &contact,
             &[],
             Vec::new(),
-            "明天下午三点可以",
-            &crate::models::CommitmentMarkers::default(),
             false,
             false,
         );
@@ -2502,7 +2419,7 @@ mod dual_gate_classification_tests {
                 "scope": "accessibility",
                 "subject": "business",
                 "productClaim": false,
-                "requiresEvidence": true,
+                "evidenceNeed": "required",
                 "evidenceRefs": [format!("verified_knowledge:{chunk_id}")],
                 "supported": true,
             }],
@@ -2518,8 +2435,6 @@ mod dual_gate_classification_tests {
             &contact,
             std::slice::from_ref(&chunk),
             Vec::new(),
-            "请问有无障碍通道吗",
-            &crate::models::CommitmentMarkers::default(),
             false,
             false,
             evaluated_at,
@@ -2552,8 +2467,6 @@ mod dual_gate_classification_tests {
             &contact,
             std::slice::from_ref(&chunk),
             Vec::new(),
-            "我们的产品一定能帮您",
-            &crate::models::CommitmentMarkers::default(),
             false,
             false,
         );
@@ -2592,8 +2505,6 @@ mod dual_gate_classification_tests {
             &contact,
             &[],
             Vec::new(),
-            "这款年度会员是 199 元",
-            &crate::models::CommitmentMarkers::default(),
             true,  // priced_from_catalog：报价 product_id 命中 active 产品目录
             false, // principal_product_exempted：无领导授权豁免
         );
@@ -2652,8 +2563,6 @@ mod dual_gate_classification_tests {
             &contact,
             &[],
             Vec::new(),
-            "这款年度会员是 199 元",
-            &crate::models::CommitmentMarkers::default(),
             false, // priced_from_catalog：无目录报价背书
             true,  // principal_product_exempted：领导已针对该客户授权
         );
@@ -2682,8 +2591,6 @@ mod dual_gate_classification_tests {
             &contact,
             std::slice::from_ref(&chunk),
             Vec::new(),
-            "用户最新消息",
-            &crate::models::CommitmentMarkers::default(),
             false,
             false,
         );
@@ -2706,8 +2613,6 @@ mod dual_gate_classification_tests {
             &contact,
             &[],
             Vec::new(),
-            "今天天气不错",
-            &crate::models::CommitmentMarkers::default(),
             false,
             false,
         );
@@ -2715,18 +2620,15 @@ mod dual_gate_classification_tests {
         assert!(outcome.review.approved);
     }
 
-    // ── item ①「先观测」：grounding 漏判探针（非拦截）单测 ──
-
+    // 发送边界不再扫描正文关键词。是否需要证据完全由 AI 的结构化 claimAnalysis
+    // 决定，服务端只执行证据 ID、目录和时效校验。
     #[test]
-    fn finalize_emits_grounding_probe_on_reviewer_missed_commitment() {
-        // reviewer 未自报 requiresProductKnowledge，但回复含「一定能」硬承诺、
-        // 且无 verified chunk → 落 grounding_probe_reviewer_missed 观测事件，
-        // 但**不改变任何发送判定**（仍 Approved、approved=true、should_reply=true）。
+    fn finalize_does_not_scan_reply_text_for_business_markers() {
         let runtime = UserRuntimeParameters::default();
         let mut review = full_pass_review();
         review.claim_analysis = mongodb::bson::doc! { "requiresProductKnowledge": false };
         let mut decision = shouldreply_decision();
-        decision.reply_text = "这个方案一定能帮您解决问题".to_string();
+        decision.reply_text = "这句话包含任意业务词，但模型明确判为无证据声明".to_string();
         let contact = finalize_contact();
         let outcome = finalize_review_for_send(
             review,
@@ -2735,175 +2637,15 @@ mod dual_gate_classification_tests {
             &contact,
             &[],
             Vec::new(),
-            "你们能解决我的问题吗",
-            &crate::models::CommitmentMarkers::default(),
             false,
             false,
         );
-        // 零拦截：判定不变。
         assert_eq!(outcome.status, GatewayStatusFinal::Approved);
-        assert!(outcome.review.approved);
         assert!(decision.should_reply);
-        // 但落了观测事件。
-        assert!(outcome
-            .pending_events
-            .iter()
-            .any(|e| e.kind == "grounding_probe_reviewer_missed" && e.status == "observe"));
-    }
-
-    #[test]
-    fn finalize_no_grounding_probe_when_reviewer_already_flagged() {
-        // reviewer 已自报 requiresProductKnowledge=true → 走原 R5.4 硬闸 block，
-        // 观测探针不执行（不与真阳性重复计数）。
-        let runtime = UserRuntimeParameters::default();
-        let mut review = full_pass_review();
-        review.claim_analysis = mongodb::bson::doc! { "requiresProductKnowledge": true };
-        let mut decision = shouldreply_decision();
-        decision.reply_text = "这个方案一定能帮您解决问题".to_string();
-        let contact = finalize_contact();
-        let outcome = finalize_review_for_send(
-            review,
-            &mut decision,
-            &runtime,
-            &contact,
-            &[],
-            Vec::new(),
-            "你们能解决我的问题吗",
-            &crate::models::CommitmentMarkers::default(),
-            false,
-            false,
-        );
-        // R5.4 硬闸生效。
-        assert_eq!(
-            outcome.status,
-            GatewayStatusFinal::BlockedUnverifiedProductClaim
-        );
-        // 观测探针未执行：无 grounding_probe_reviewer_missed 事件，避免重复计数。
         assert!(!outcome
             .pending_events
             .iter()
             .any(|e| e.kind == "grounding_probe_reviewer_missed"));
-    }
-
-    #[test]
-    fn finalize_no_grounding_probe_when_reply_has_no_commitment() {
-        // reviewer 未自报 + 回复不含承诺词 → 探针不触发。
-        let runtime = UserRuntimeParameters::default();
-        let mut review = full_pass_review();
-        review.claim_analysis = mongodb::bson::doc! { "requiresProductKnowledge": false };
-        let mut decision = shouldreply_decision();
-        decision.reply_text = "好的，我先了解下你的具体情况".to_string();
-        let contact = finalize_contact();
-        let outcome = finalize_review_for_send(
-            review,
-            &mut decision,
-            &runtime,
-            &contact,
-            &[],
-            Vec::new(),
-            "你们能解决我的问题吗",
-            &crate::models::CommitmentMarkers::default(),
-            false,
-            false,
-        );
-        assert_eq!(outcome.status, GatewayStatusFinal::Approved);
-        assert!(!outcome
-            .pending_events
-            .iter()
-            .any(|e| e.kind == "grounding_probe_reviewer_missed"));
-    }
-
-    // ── A2：grounding 漏判兜底硬闸（词类型切分）单测 ──
-
-    #[test]
-    fn finalize_only_observes_on_product_effect_claim_when_reviewer_missed() {
-        // Keyword telemetry must not replace the AI semantic claim decision.
-        let runtime = UserRuntimeParameters::default();
-        let mut review = full_pass_review();
-        review.claim_analysis = mongodb::bson::doc! { "requiresProductKnowledge": false };
-        let mut decision = shouldreply_decision();
-        decision.reply_text = "放心，我们保证按时回款".to_string();
-        let contact = finalize_contact();
-        let outcome = finalize_review_for_send(
-            review,
-            &mut decision,
-            &runtime,
-            &contact,
-            &[],
-            Vec::new(),
-            "你们能保证回款吗",
-            &crate::models::CommitmentMarkers::default(),
-            false,
-            false,
-        );
-        assert_eq!(outcome.status, GatewayStatusFinal::Approved);
-        assert!(outcome.review.approved);
-        assert!(decision.should_reply);
-        assert!(outcome
-            .pending_events
-            .iter()
-            .any(|e| e.kind == "grounding_probe_reviewer_missed" && e.status == "observe"));
-    }
-
-    #[test]
-    fn finalize_only_observes_on_tone_only_claim_when_reviewer_missed() {
-        // reviewer 漏判 + 回复仅含语气词「保证」(无效果词) + 无 verified → 不拦，仅观测。
-        let runtime = UserRuntimeParameters::default();
-        let mut review = full_pass_review();
-        review.claim_analysis = mongodb::bson::doc! { "requiresProductKnowledge": false };
-        let mut decision = shouldreply_decision();
-        decision.reply_text = "我保证会认真对待你的问题".to_string();
-        let contact = finalize_contact();
-        let outcome = finalize_review_for_send(
-            review,
-            &mut decision,
-            &runtime,
-            &contact,
-            &[],
-            Vec::new(),
-            "你会上心吗",
-            &crate::models::CommitmentMarkers::default(),
-            false,
-            false,
-        );
-        assert_eq!(outcome.status, GatewayStatusFinal::Approved);
-        assert!(outcome.review.approved);
-        assert!(decision.should_reply);
-        assert!(outcome
-            .pending_events
-            .iter()
-            .any(|e| e.kind == "grounding_probe_reviewer_missed" && e.status == "observe"));
-        assert!(!outcome
-            .pending_events
-            .iter()
-            .any(|e| e.kind == "product_claim_blocked_by_probe_fallback"));
-    }
-
-    #[test]
-    fn finalize_probe_fallback_skipped_when_verified_present() {
-        // reviewer 漏判 + 回复含效果词「成功率」+ 有 verified 交集 → 不误伤,放行。
-        let runtime = UserRuntimeParameters::default();
-        let mut review = full_pass_review();
-        review.claim_analysis = mongodb::bson::doc! { "requiresProductKnowledge": false };
-        let mut decision = shouldreply_decision();
-        decision.reply_text = "我们的成功率确实不错".to_string();
-        let chunk = mk_chunk("verified");
-        decision.used_knowledge_ids = vec![chunk.id.unwrap().to_hex()];
-        let contact = finalize_contact();
-        let outcome = finalize_review_for_send(
-            review,
-            &mut decision,
-            &runtime,
-            &contact,
-            std::slice::from_ref(&chunk),
-            Vec::new(),
-            "成功率怎么样",
-            &crate::models::CommitmentMarkers::default(),
-            false,
-            false,
-        );
-        assert_eq!(outcome.status, GatewayStatusFinal::Approved);
-        assert!(decision.should_reply);
     }
 
     // ── R1.5 insufficient_detail 降级为 single-shot revision（t15 跌单弧根因修复）──
@@ -2932,8 +2674,6 @@ mod dual_gate_classification_tests {
             &contact,
             &[],
             promote_risks,
-            "用户最新消息",
-            &crate::models::CommitmentMarkers::default(),
             false,
             false,
         );
@@ -2982,8 +2722,6 @@ mod dual_gate_classification_tests {
             &contact,
             &[],
             promote_risks,
-            "用户最新消息",
-            &crate::models::CommitmentMarkers::default(),
             false,
             false,
         );
@@ -3016,8 +2754,6 @@ mod dual_gate_classification_tests {
             &contact,
             &[],
             promote_risks,
-            "用户最新消息",
-            &crate::models::CommitmentMarkers::default(),
             false,
             false,
         );
@@ -3047,8 +2783,6 @@ mod dual_gate_classification_tests {
             &contact,
             &[],
             promote_risks,
-            "用户最新消息",
-            &crate::models::CommitmentMarkers::default(),
             false,
             false,
         );
@@ -3094,8 +2828,6 @@ mod dual_gate_classification_tests {
             &contact,
             std::slice::from_ref(&chunk),
             Vec::new(),
-            "我们的产品一定能帮您解决",
-            &crate::models::CommitmentMarkers::default(),
             false,
             false,
         );
@@ -3123,8 +2855,6 @@ mod dual_gate_classification_tests {
             &contact,
             &[],
             Vec::new(),
-            "用户最新消息",
-            &crate::models::CommitmentMarkers::default(),
             false,
             false,
         );
