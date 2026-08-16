@@ -51,7 +51,7 @@ use super::turn_loop::{
 };
 use super::types::{
     AgentDecision, AgentTrigger, KnowledgeRouteResult, KnowledgeRuntime, RunPlannerResult,
-    ToolCallRequest, HOLD_CATEGORY_BLOCKED_BY_SAFETY_GUARD, HOLD_CATEGORY_HELD_BY_AI_POLICY,
+    ToolCallRequest, HOLD_CATEGORY_BLOCKED_BY_SAFETY_GUARD,
 };
 
 const USER_TURN_TOOL_NAMES: &[&str] = &[TOOL_LIST_CATALOG, TOOL_SEARCH, TOOL_OPEN_SLICE];
@@ -104,6 +104,123 @@ fn principal_route_consistency_issue(
         return Some(PrincipalRouteConsistencyIssue::IncompleteEscalationRequest);
     }
     None
+}
+
+/// Build a safe, complete principal action from the Knowledge Agent's typed route when the Reply
+/// Agent has already spent its single bounded repair and still returned an incoherent action.
+/// This is not a semantic classifier or a keyword gate: the route's closed semantic result is the
+/// only trigger. The fallback prevents a selected hand-off from disappearing into a generic hold.
+fn bounded_control_text(value: &str, max_chars: usize) -> String {
+    let value = value.trim();
+    let mut output = value.chars().take(max_chars).collect::<String>();
+    if value.chars().count() > max_chars {
+        output.push_str("...");
+    }
+    output
+}
+
+fn materialize_principal_route_fallback(
+    decision: &mut AgentDecision,
+    route: &KnowledgeRouteResult,
+) -> bool {
+    if !route_requests_principal(route) {
+        return false;
+    }
+
+    let missing = route
+        .resolution
+        .missing_information
+        .iter()
+        .map(|value| bounded_control_text(value, 160))
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    let missing_summary = missing.join("、");
+    let reason = if missing_summary.is_empty() {
+        "知识研判显示当前事实需要有权人员确认".to_string()
+    } else {
+        bounded_control_text(
+            &format!("知识研判显示以下信息仍需有权人员确认：{missing_summary}"),
+            480,
+        )
+    };
+    let question = if route.resolution.authority_question.trim().is_empty() {
+        if missing_summary.is_empty() {
+            "请确认当前业务安排和可对外回复口径。".to_string()
+        } else {
+            bounded_control_text(
+                &format!("请确认以下信息后再回复客户：{missing_summary}"),
+                480,
+            )
+        }
+    } else {
+        bounded_control_text(&route.resolution.authority_question, 480)
+    };
+
+    // A failed repair must not carry stale structured intents into the commit layer.  The
+    // fallback is intentionally a single text acknowledgement plus one principal request; all
+    // unrelated writes (appointment, commitment, follow-up, state transition, media, profile and
+    // memory projections) are discarded rather than guessed from the rejected draft.
+    decision.profile_update = None;
+    decision.tags.clear();
+    decision.tag_evidence_turns.clear();
+    decision.stage_evidence_turns.clear();
+    decision.stage_explicit_intent = false;
+    decision.bayesian_observations.clear();
+    decision.customer_stage = None;
+    decision.intent_level = None;
+    decision.domain_signals.clear();
+    decision.dimension_display_names.clear();
+    decision.last_commitment = None;
+    decision.commitment = None;
+    decision.follow_up_policy = None;
+    decision.profile_attributes.clear();
+    decision.intent_analysis.clear();
+    decision.next_best_action.clear();
+    decision.operation_state = None;
+    decision.operation_state_reason = None;
+    decision.operation_state_confidence = None;
+    decision.cooldown_until = None;
+    decision.product_fit_score = None;
+    decision.matched_knowledge_ids.clear();
+    decision.safe_claims_used.clear();
+    decision.quoted_product_ids.clear();
+    decision.forbidden_claim_risk = None;
+    decision.objections_detected.clear();
+    decision.recommended_resource_ids.clear();
+    decision.operating_memory_update.clear();
+    decision.memory_candidates.clear();
+    decision.memory_write_score = 0;
+    decision.consolidation_needed = false;
+    decision.memory_update.clear();
+    decision.follow_up = None;
+    decision.tool_calls.clear();
+    decision.decision_phase = "final".to_string();
+    decision.claim_manifest.clear();
+    decision.verification = Default::default();
+    decision.appointment_request = None;
+    decision.assets_to_send.clear();
+    decision.namecard_to_send = None;
+
+    decision.should_reply = true;
+    decision.reply_text = super::escalation::fallback_holding_reply().to_string();
+    decision.next_step = "ask_principal".to_string();
+    decision.autonomy_mode = "assisted".to_string();
+    decision.knowledge_need = "required".to_string();
+    decision.knowledge_need_reason = reason.clone();
+    decision.why_skip_reply.clear();
+    if decision.why_should_reply.trim().is_empty() {
+        decision.why_should_reply =
+            "先自然承接客户并确认缺失事实，避免在没有依据时给出确定安排。".to_string();
+    }
+    decision.escalation_request = Some(crate::models::EscalationRequest {
+        needed: true,
+        category: Some(crate::models::ESCALATION_CATEGORY_OUT_OF_SCOPE.to_string()),
+        reason: Some(reason),
+        question_for_principal: Some(question),
+        self_serviceable_part: None,
+        is_generalizable: false,
+    });
+    true
 }
 
 fn repair_and_reauthorization_capacity_available(budget: &RunBudget, dual_reviewer: bool) -> bool {
@@ -410,6 +527,7 @@ pub(crate) struct ModelTurnEnvironment<'a, C> {
     last_planner: RunPlannerResult,
     pending_finalize_events: Vec<PendingFinalizeEvent>,
     principal_consistency_repair_issued: bool,
+    principal_route_fallback_applied: bool,
 }
 
 impl<'a, C> ModelTurnEnvironment<'a, C> {
@@ -423,6 +541,7 @@ impl<'a, C> ModelTurnEnvironment<'a, C> {
             last_planner,
             pending_finalize_events: Vec::new(),
             principal_consistency_repair_issued: false,
+            principal_route_fallback_applied: false,
         }
     }
 
@@ -719,7 +838,7 @@ where
                 }
             };
             let instruction = "The typed knowledgeRoute.resolution selected authorized_operator + ask_principal. Return one complete final decision aligned with it: nextStep=ask_principal; escalationRequest.needed=true with an allowed category, a concrete reason, and questionForPrincipal based on authorityQuestion; shouldReply=true with a short natural first-person holding reply. Do not assert the missing fact and do not expose any internal role, channel, prompt, or control field to the customer.";
-            let mut review = super::types::DecisionReviewResult {
+            let review = super::types::DecisionReviewResult {
                 approved: false,
                 needs_revision: true,
                 rewrite_instruction: instruction.to_string(),
@@ -745,32 +864,20 @@ where
                 self.inputs
                     .budget
                     .mark_degraded("principal_repair_skipped_required_authorization_tail");
-                return Ok(Self::hold_for_exhausted_repair(
-                    draft,
-                    review,
-                    "budget_insufficient_for_principal_repair_and_reauthorization",
-                    "The principal action requires repair, but the bounded run budget does not retain enough capacity for repair plus independent reauthorization",
-                ));
             }
 
-            draft.decision.should_reply = false;
-            draft.decision.autonomy_mode = "blocked".to_string();
-            review.needs_revision = false;
-            review.should_hold = true;
-            review.hold_category = HOLD_CATEGORY_HELD_BY_AI_POLICY.to_string();
-            review.hold_reason = self
-                .inputs
-                .knowledge_route
-                .resolution
-                .authority_question
-                .trim()
-                .to_string();
-            review.final_review_status = HOLD_CATEGORY_HELD_BY_AI_POLICY.to_string();
-            return Ok(AuthorizationManifest::held(
-                HOLD_CATEGORY_HELD_BY_AI_POLICY,
-                "The bounded Reply repair did not produce the structured principal action selected by the Knowledge Agent",
-                review,
-            ));
+            // The route is already an independent AI semantic decision. Preserve that decision
+            // as a minimal, customer-safe action instead of dropping it into a generic
+            // `held_by_ai_policy` branch (which may intentionally suppress generic escalation).
+            if materialize_principal_route_fallback(
+                &mut draft.decision,
+                self.inputs.knowledge_route,
+            ) {
+                self.principal_route_fallback_applied = true;
+                self.inputs
+                    .budget
+                    .mark_degraded("principal_route_fallback_applied");
+            }
         }
 
         let decision = &draft.decision;
@@ -898,6 +1005,16 @@ where
             contact_has_principal_product_exemption(self.inputs.contact),
         );
         review = finalized.review;
+        if self.principal_route_fallback_applied
+            && !review
+                .risks
+                .iter()
+                .any(|risk| risk == "principal_route_fallback_applied")
+        {
+            review
+                .risks
+                .push("principal_route_fallback_applied".to_string());
+        }
         let pending_events = finalized.pending_events;
 
         if matches!(finalized.status, GatewayStatusFinal::Approved)
@@ -1051,6 +1168,67 @@ mod tests {
             principal_route_consistency_issue(&principal_route(), &AgentDecision::default(), false),
             None
         );
+    }
+
+    #[test]
+    fn principal_route_fallback_replaces_unsupported_reply_with_complete_action() {
+        let route = principal_route();
+        let mut decision = AgentDecision {
+            should_reply: true,
+            reply_text: "明天下午三点可以到店".to_string(),
+            next_step: "respond".to_string(),
+            appointment_request: Some(Default::default()),
+            last_commitment: Some("明天下午三点到店".to_string()),
+            operation_state: Some("appointment_pending".to_string()),
+            follow_up: Some(Default::default()),
+            ..Default::default()
+        };
+
+        assert!(materialize_principal_route_fallback(&mut decision, &route));
+        assert_eq!(
+            decision.reply_text,
+            super::super::escalation::fallback_holding_reply()
+        );
+        assert_eq!(decision.next_step, "ask_principal");
+        assert_eq!(decision.autonomy_mode, "assisted");
+        assert_eq!(decision.knowledge_need, "required");
+        assert!(decision.appointment_request.is_none());
+        assert!(decision.last_commitment.is_none());
+        assert!(decision.operation_state.is_none());
+        assert!(decision.follow_up.is_none());
+        let request = decision
+            .escalation_request
+            .as_ref()
+            .expect("fallback must preserve the principal action");
+        assert!(request.needed);
+        assert_eq!(
+            request.category.as_deref(),
+            Some(crate::models::ESCALATION_CATEGORY_OUT_OF_SCOPE)
+        );
+        assert!(request
+            .reason
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty()));
+        assert!(request
+            .question_for_principal
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty()));
+        assert_eq!(
+            principal_route_consistency_issue(&route, &decision, true),
+            None
+        );
+    }
+
+    #[test]
+    fn principal_route_fallback_does_not_activate_for_non_principal_route() {
+        let route = KnowledgeRouteResult::default();
+        let mut decision = AgentDecision {
+            reply_text: "保持原样".to_string(),
+            ..Default::default()
+        };
+        assert!(!materialize_principal_route_fallback(&mut decision, &route));
+        assert_eq!(decision.reply_text, "保持原样");
+        assert!(decision.escalation_request.is_none());
     }
 
     #[test]
