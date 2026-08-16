@@ -29,8 +29,9 @@ use super::memory::{
     default_memory_card, effective_memory_card_for_contact, load_or_create_operating_memory,
 };
 use super::types::{
-    non_empty_option, AgentDecision, DecisionReviewResult, KnowledgeRouteResult, KnowledgeRuntime,
-    RunPlannerResult, SelectedChunkRanking,
+    non_empty_option, AgentDecision, DecisionReviewResult, KnowledgeAnswerability,
+    KnowledgeNextStep, KnowledgeRequiredAuthority, KnowledgeResolution, KnowledgeRouteResult,
+    KnowledgeRuntime, RunPlannerResult, SelectedChunkRanking,
 };
 
 pub(crate) async fn load_operation_knowledge(
@@ -667,6 +668,12 @@ async fn route_operation_knowledge_inner(
             risk_level: "low".to_string(),
             knowledge_coverage: "not_required".to_string(),
             reason: "当前消息与 verified 知识语料无本地相关信号，跳过可选多轮知识推理".to_string(),
+            resolution: KnowledgeResolution {
+                answerability: KnowledgeAnswerability::NotRequired,
+                required_authority: KnowledgeRequiredAuthority::None,
+                recommended_next_step: KnowledgeNextStep::Respond,
+                ..Default::default()
+            },
             tool_trace: vec![doc! {
                 "tool": "knowledge.skip",
                 "reason": "zero_local_relevance",
@@ -923,6 +930,7 @@ async fn route_operation_knowledge_inner(
             false,
         )
     };
+    let resolution = answer.resolution.clone();
     let route = KnowledgeRouteResult {
         needed_categories: Vec::new(),
         selected_knowledge_ids: Vec::new(),
@@ -932,8 +940,9 @@ async fn route_operation_knowledge_inner(
         risk_level,
         requires_evidence: !evidence_excerpts.is_empty(),
         knowledge_coverage,
-        missing_knowledge: Vec::new(),
+        missing_knowledge: resolution.missing_information.clone(),
         reason: answer.answer.clone(),
+        resolution,
         tool_trace,
         evidence_excerpts,
         // B2：本批 selected_chunk_ids 是否只是导航候选（fallback 静态回填）。
@@ -1066,12 +1075,46 @@ pub(crate) fn empty_knowledge_route(planner: &RunPlannerResult) -> KnowledgeRout
         risk_level: planner.risk_level.clone(),
         knowledge_coverage: "not_required".to_string(),
         reason: format!("Reply Agent 判断本轮无需打开知识库：{}", planner.reason),
+        resolution: KnowledgeResolution {
+            answerability: KnowledgeAnswerability::NotRequired,
+            required_authority: KnowledgeRequiredAuthority::None,
+            recommended_next_step: KnowledgeNextStep::Respond,
+            ..Default::default()
+        },
         tool_trace: vec![doc! {
             "tool": "knowledge.skip",
             "reason": planner.reason.clone()
         }],
         ..Default::default()
     }
+}
+
+/// Whether the Knowledge Agent's typed research result requires the business-aware prompt tier.
+///
+/// This is capability routing, not a semantic classifier: every value below was selected by the
+/// Knowledge Agent. The runtime does not inspect the customer's natural-language message.
+pub(crate) fn route_requires_full_context(route: &KnowledgeRouteResult) -> bool {
+    matches!(
+        route.resolution.answerability,
+        KnowledgeAnswerability::PartiallySupported | KnowledgeAnswerability::Unsupported
+    ) || matches!(
+        route.resolution.recommended_next_step,
+        KnowledgeNextStep::ClarifyCustomer
+            | KnowledgeNextStep::AskPrincipal
+            | KnowledgeNextStep::Defer
+    )
+}
+
+/// Whether the Knowledge Agent coherently selected the configured principal capability.
+///
+/// Requiring all three typed dimensions prevents one malformed enum from becoming an action. The
+/// actual channel configuration and final customer-facing decision are checked separately.
+pub(crate) fn route_requests_principal(route: &KnowledgeRouteResult) -> bool {
+    matches!(
+        route.resolution.answerability,
+        KnowledgeAnswerability::PartiallySupported | KnowledgeAnswerability::Unsupported
+    ) && route.resolution.required_authority == KnowledgeRequiredAuthority::AuthorizedOperator
+        && route.resolution.recommended_next_step == KnowledgeNextStep::AskPrincipal
 }
 
 /// 把 route 的选中集折成 `decision.used_knowledge_ids`——即**可用于产品事实背书**
@@ -1783,6 +1826,41 @@ mod tests {
         assert!(used.contains(&"k1".to_string()));
     }
 
+    #[test]
+    fn typed_resolution_routes_context_without_inspecting_customer_text() {
+        let route = KnowledgeRouteResult {
+            resolution: KnowledgeResolution {
+                answerability: KnowledgeAnswerability::Unsupported,
+                required_authority: KnowledgeRequiredAuthority::AuthorizedOperator,
+                recommended_next_step: KnowledgeNextStep::AskPrincipal,
+                missing_information: vec!["current operating state".to_string()],
+                authority_question: "What is the current operating state?".to_string(),
+            },
+            ..Default::default()
+        };
+
+        assert!(route_requires_full_context(&route));
+        assert!(route_requests_principal(&route));
+    }
+
+    #[test]
+    fn principal_route_requires_a_coherent_typed_triple() {
+        let mut route = KnowledgeRouteResult {
+            resolution: KnowledgeResolution {
+                answerability: KnowledgeAnswerability::Unsupported,
+                required_authority: KnowledgeRequiredAuthority::ExternalSystem,
+                recommended_next_step: KnowledgeNextStep::AskPrincipal,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(!route_requests_principal(&route));
+
+        route.resolution.required_authority = KnowledgeRequiredAuthority::AuthorizedOperator;
+        route.resolution.answerability = KnowledgeAnswerability::Supported;
+        assert!(!route_requests_principal(&route));
+    }
+
     /// 缺字段的历史 route 文档（R11 反序列化安全）按「非回填」处理，行为与本改动前一致。
     #[test]
     fn legacy_route_without_fallback_flag_defaults_to_authorizing() {
@@ -1795,6 +1873,11 @@ mod tests {
         assert_eq!(
             route_used_knowledge_ids(&legacy),
             vec!["c_legacy".to_string()]
+        );
+        assert_eq!(
+            legacy.resolution.answerability,
+            KnowledgeAnswerability::Unknown,
+            "historical route documents must remain deserializable without inventing semantics"
         );
     }
 }

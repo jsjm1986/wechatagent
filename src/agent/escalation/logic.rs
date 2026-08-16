@@ -285,9 +285,9 @@ fn consecutive_unprogressed_turns(trajectory: &[crate::models::IntentTrajectoryE
     count
 }
 
-/// 组装注入 decision prompt 的"请示通道信号"段（纯函数，无 IO）。三信号：
-/// ①等待领导决策中（domain_attributes 布尔标记）②多轮卡死（意图轨迹连续未推进+末轮负面）
-/// ③高风险升级模式（workspace 配置）。三信号全缺返回空串（decision.rs 据此决定是否拼接）。
+/// 组装注入 decision prompt 的"请示通道信号"段（纯函数，无 IO）。信号包括已配置的
+/// ask_principal 能力、等待中的既有裁决、多轮卡死、高风险升级模式和已引荐态。
+/// 全部缺失时返回空串（decision.rs 据此决定是否拼接）。
 ///
 /// **2.5-main-3**：`negative_outcomes` = 本行业有效负极集（来自 active
 /// DomainProfile.outcome_polarity，由调用方 decision.rs 经 `effective_negative_outcomes`
@@ -299,6 +299,17 @@ pub(crate) fn build_decision_signals_text(
     negative_outcomes: &[impl AsRef<str>],
 ) -> String {
     let mut lines: Vec<String> = Vec::new();
+
+    // 能力存在性是服务端配置事实，不是对客户消息的语义判断。是否需要调用该能力仍由
+    // Knowledge / Reply Agent 根据完整语境自主决定。
+    let principal_channel_available = domain_config
+        .map(crate::agent::escalation::resolve_ask_human_policy)
+        .is_some_and(|policy| !policy.decider_chain.is_empty());
+    if principal_channel_available {
+        lines.push(
+            "- 本工作区已配置内部 ask_principal 能力：仅当你按完整语境判断某项现实事实或决定确需有权人员核准时，才输出结构化 escalationRequest；对客户始终由你第一人称承接和后续同步，不暴露内部角色、通道或控制字段。".to_string(),
+        );
+    }
 
     // ① 等待领导决策中：该客户有一条 pending 请示，正在等领导回话。
     let awaiting = contact
@@ -894,6 +905,33 @@ mod tests {
         }
     }
 
+    fn domain_config_with_principal() -> crate::models::OperationDomainConfig {
+        crate::models::OperationDomainConfig {
+            id: None,
+            workspace_id: "ws1".to_string(),
+            domain: "user_operations".to_string(),
+            name: "test".to_string(),
+            goal: String::new(),
+            methodology: String::new(),
+            workflow: String::new(),
+            tool_policy: String::new(),
+            automation_policy: String::new(),
+            review_policy: String::new(),
+            runtime_parameters: mongodb::bson::Document::new(),
+            state_machine: mongodb::bson::Document::new(),
+            status: "active".to_string(),
+            updated_at: mongodb::bson::DateTime::now(),
+            version: 1,
+            current_version: true,
+            previous_version: None,
+            seeded_by: None,
+            principal_decider: Some("principal_wxid".to_string()),
+            high_risk_escalation_mode: None,
+            ask_human_policy: None,
+            assist_mode_enabled: None,
+        }
+    }
+
     // ---- S5-5 standing_order_due（预授权底线到期判定）----
 
     fn policy_with_standing_order(
@@ -988,6 +1026,20 @@ mod tests {
             crate::agent::reaction::DEFAULT_NEGATIVE_OUTCOMES
         )
         .is_empty());
+    }
+
+    #[test]
+    fn signals_expose_configured_principal_capability_without_classifying_text() {
+        let contact = make_contact("cust1");
+        let config = domain_config_with_principal();
+        let text = build_decision_signals_text(
+            &contact,
+            Some(&config),
+            crate::agent::reaction::DEFAULT_NEGATIVE_OUTCOMES,
+        );
+
+        assert!(text.contains("ask_principal"));
+        assert!(text.contains("escalationRequest"));
     }
 
     #[test]

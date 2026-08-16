@@ -31,7 +31,7 @@ use futures::TryStreamExt;
 use mongodb::bson::{doc, oid::ObjectId, DateTime};
 use serde_json::json;
 use wechatagent::agent::knowledge_agent::{
-    answer, AnswerRequest, AnswerResult, CatalogFilter, SourceQuoteCitation,
+    answer, AnswerRequest, AnswerResult, CatalogFilter, KnowledgeResolution, SourceQuoteCitation,
 };
 use wechatagent::auth::AuthenticatedAdmin;
 use wechatagent::llm::{LlmClient, LlmFormat};
@@ -690,6 +690,7 @@ fn reach_superset_of_adopt() {
     // follow_relations openedBodies=["c"]。
     let result = AnswerResult {
         answer: "测试答案".to_string(),
+        resolution: KnowledgeResolution::default(),
         cited_chunk_ids: vec!["a".to_string()],
         source_quotes: Vec::<SourceQuoteCitation>::new(),
         tool_trace: vec![

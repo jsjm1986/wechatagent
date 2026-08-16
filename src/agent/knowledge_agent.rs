@@ -35,6 +35,9 @@ use crate::routes::AppState;
 
 use super::budget::{current_run_budget, current_run_mode};
 use super::generate_agent_json;
+pub use super::types::{
+    KnowledgeAnswerability, KnowledgeNextStep, KnowledgeRequiredAuthority, KnowledgeResolution,
+};
 
 mod cache;
 pub use cache::{cache_stats, AnswerCacheStats};
@@ -191,6 +194,7 @@ pub struct SourceQuoteCitation {
 #[serde(rename_all = "camelCase")]
 pub struct AnswerResult {
     pub answer: String,
+    pub resolution: KnowledgeResolution,
     pub cited_chunk_ids: Vec<String>,
     pub source_quotes: Vec<SourceQuoteCitation>,
     pub tool_trace: Vec<Document>,
@@ -258,6 +262,8 @@ enum AgentAction {
         source_quotes: Vec<RawSourceQuote>,
         #[serde(default)]
         answer: String,
+        #[serde(default)]
+        resolution: KnowledgeResolution,
     },
 }
 
@@ -277,7 +283,7 @@ const SYSTEM_PROMPT: &str = "你是运营知识库的 wiki 研究员。\n\
 你不能凭空回答；任何回答都必须来自被你 open 过的 chunk。\n\
 你只输出严格 JSON。每轮只能输出 5 个 action 之一：list_catalog / open_document / open_chunk / follow_relations / answer。\n\
 最多 4 轮工具调用。最后一轮必须 answer。\n\
-你的 answer 是给系统内部回复 Agent 的**知识研判**，不是发给客户的话术，也不是可执行的对客行动脚本。本系统定位是 AI 全程自治：客户始终只与 AI 对话。若被检索的知识内容描述了机构内部的流程分工（例如某类事项需按正式政策核对、由内部相应岗位确认），你可以如实转述该知识所界定的**事实边界**（如「此项以正式政策/当期正式口径为准」），但绝不把这类内部流程改写成对客户的行动建议话术。凡超出当前已 open 知识能确定的事项，统一研判为「需按正式口径核对后确认」，由内部回复 Agent 决定如何向客户表达。";
+你的 answer 是给系统内部回复 Agent 的**知识研判**，不是发给客户的话术，也不是可执行的对客行动脚本。本系统定位是 AI 全程自治：客户始终只与 AI 对话。若被检索的知识内容描述了机构内部的流程分工（例如某类事项需按正式政策核对、由内部相应岗位确认），你可以如实转述该知识所界定的**事实边界**，但绝不把内部角色或流程写成对客户的话术。凡超出当前已 open 知识能确定的事项，必须在 resolution 中按语义标明可回答性、缺失信息、所需权威和下一步；禁止按客户文本中的单词、短语或词表判断。";
 
 /// 知识库 agent 主循环。
 ///
@@ -702,6 +708,7 @@ async fn answer_inner(
     if catalog.is_empty() {
         return Ok(AnswerResult {
             answer: "知识库无相关内容。".to_string(),
+            resolution: KnowledgeResolution::default(),
             cited_chunk_ids: Vec::new(),
             source_quotes: Vec::new(),
             tool_trace,
@@ -758,6 +765,7 @@ async fn answer_inner(
     // rounds_used，避免前端误以为"用了 max_rounds 才放弃"。
     let mut last_completed_round: i32 = 0;
     let mut cancelled = false;
+    let scoped_run_id = current_run_budget().map(|budget| budget.run_id.clone());
     for round in 1..=max_rounds {
         if is_cancelled(cancel) {
             push_trace(
@@ -816,7 +824,7 @@ async fn answer_inner(
                 &req.workspace_id,
                 req.account_id.as_deref(),
                 None,
-                None,
+                scoped_run_id.as_deref(),
                 "knowledge.agent",
                 SYSTEM_PROMPT,
                 &user_prompt,
@@ -833,7 +841,7 @@ async fn answer_inner(
                 &req.workspace_id,
                 req.account_id.as_deref(),
                 None,
-                None,
+                scoped_run_id.as_deref(),
                 "knowledge.agent",
                 SYSTEM_PROMPT,
                 &user_prompt,
@@ -1002,6 +1010,7 @@ async fn answer_inner(
                 cited_chunk_ids,
                 source_quotes,
                 answer,
+                resolution,
             } => {
                 // 服务端不信任「声称回答却无正文」的终态：LLM 偶尔 emit 一个结构合法
                 // 但 answer 为空白的 Answer action 提前收尾，会让调用方拿到空答案。
@@ -1043,6 +1052,7 @@ async fn answer_inner(
                 );
                 let result = AnswerResult {
                     answer,
+                    resolution,
                     cited_chunk_ids: cited,
                     source_quotes: quotes,
                     tool_trace,
@@ -1093,6 +1103,7 @@ async fn answer_inner(
     };
     Ok(AnswerResult {
         answer: answer_text,
+        resolution: KnowledgeResolution::default(),
         cited_chunk_ids,
         source_quotes: Vec::new(),
         tool_trace,
@@ -1752,7 +1763,7 @@ fn build_prompt(
 {{"action":"open_document","documentId":"..."}}
 {{"action":"open_chunk","ids":["chunk_id_1","chunk_id_2"]}}
 {{"action":"follow_relations","chunkId":"...","depth":1}}
-{{"action":"answer","citedChunkIds":["..."],"sourceQuotes":[{{"chunkId":"...","quote":"...","sourceAnchorIndex":0}}],"answer":"..."}}
+{{"action":"answer","citedChunkIds":["..."],"sourceQuotes":[{{"chunkId":"...","quote":"...","sourceAnchorIndex":0}}],"answer":"...","resolution":{{"answerability":"supported | partially_supported | unsupported | not_required","requiredAuthority":"none | customer | authorized_operator | licensed_professional | external_system","recommendedNextStep":"respond | clarify_customer | ask_principal | defer","missingInformation":["..."],"authorityQuestion":"..."}}}}
 
 规则：
 - 召回漏斗：catalog 已按与本次 query 的相关度排过序，越靠前越相关。看到与 query 相关的候选，**默认动作就是 open_chunk 展开它的正文**再核对作答。
@@ -1761,6 +1772,10 @@ fn build_prompt(
 - 只有当 catalog 里确实没有任何与 query 相关的候选时，才回答"知识库无相关内容"并 cited 留空；**在尚未 open 任何相关候选正文之前，禁止下此结论**。
 - **诚实弃答原则**：判定一条候选能否支撑作答，标准是它是否【直接覆盖本 query 所问的对象与口径】，而非主题词面相近。若 open 后只有【主题相邻、口径不同、或仅部分相关，不能直接回答本 query】的内容，必须诚实说明"知识库仅有近似/相关知识，无法据此确切作答"，并 cited 留空或仅 cite 真正能支撑的部分；**绝不把近似知识当确切事实硬答，绝不编造或外推未在正文中明确给出的数字/比例/条件/期限/范围**。宁可承认不知道，也不臆造。
 - **弃答须可推进（actionable）**：凡是诚实弃答（cited 留空或仅部分支撑、明确告知"无法确切作答"）时，answer 末尾**必须再补一句具体、可执行的追问**——点明还缺哪一类信息、请对方补充什么口径/细节，或提示这块知识可由运营补全，让弃答成为可被补全、可推进对话的下一步；**禁止只平铺一句"不知道/暂无"就收尾**。追问只围绕澄清与补全展开，绝不借机编造任何不在正文中的事实、数字或承诺。
+- 每个 answer 都必须输出完整 resolution。resolution 是内部语义结论，不是客户话术；不得把内部角色、控制字段或推理过程写进 answer。
+- answerability=supported 仅限已 open 且实际引用的 verified 证据直接覆盖本 query 全部所问；只覆盖一部分用 partially_supported；没有直接证据用 unsupported。不要把"主题相关"当作 supported。
+- requiredAuthority / recommendedNextStep 必须按缺口实质选择，禁止按客户文本中的词或短语匹配：缺客户自身信息用 customer + clarify_customer；缺机构当前安排、当期政策、实时可用性或其它须由有权运营人员确认的内部事实，用 authorized_operator + ask_principal；须执业判断用 licensed_professional；须查询实时外部记录用 external_system。已有充分证据则用 none + respond。
+- recommendedNextStep=ask_principal 时 authorityQuestion 必须是一句具体、可直接交给有权人员回答的问题；其它 nextStep 可留空。missingInformation 只列当前证据真正缺少的事实，不写泛化套话。
 - citedChunkIds 必须是上面"已 open 的 chunks"中的 chunkId 子集；不能凭空创造。
 - follow_relations 会把最相关的关联条目【正文】直接载入上面"已 open 的 chunks"，可当轮直接 cite，无需再 open_chunk。
 - 每个 cited 必须配 sourceQuote；如某 chunk 没有可引用原文，可省略 sourceQuote 但仍可 cite。
@@ -2092,17 +2107,12 @@ async fn current_provider_cache_identity(
     state: &AppState,
     workspace_id: &str,
 ) -> AppResult<ProviderCacheIdentity> {
-    match state.llm_registry.as_ref() {
-        Some(registry) => {
-            let snapshot = registry
-                .snapshot_synced(&state.db, &state.config, workspace_id)
-                .await?;
-            Ok(ProviderCacheIdentity {
-                provider_id: snapshot.meta.provider_id,
-                model: snapshot.meta.model,
-                generation: snapshot.generation,
-            })
-        }
+    match super::resolve_llm_registry_snapshot(state, workspace_id).await? {
+        Some(snapshot) => Ok(ProviderCacheIdentity {
+            provider_id: snapshot.meta.provider_id,
+            model: snapshot.meta.model,
+            generation: snapshot.generation,
+        }),
         None => Ok(ProviderCacheIdentity {
             provider_id: "injected".to_string(),
             model: state.config.openai_model.clone(),
@@ -2789,6 +2799,7 @@ mod tests {
         }
         AnswerResult {
             answer: String::new(),
+            resolution: KnowledgeResolution::default(),
             cited_chunk_ids: cited.iter().map(|s| s.to_string()).collect(),
             source_quotes: Vec::new(),
             tool_trace: trace,
@@ -2977,7 +2988,7 @@ mod tests {
     #[test]
     fn parse_answer_action_with_camel_alias() {
         let raw: serde_json::Value = serde_json::from_str(
-            r#"{"action":"answer","citedChunkIds":["c1"],"sourceQuotes":[{"chunkId":"c1","quote":"q","sourceAnchorIndex":0}],"answer":"hello"}"#,
+            r#"{"action":"answer","citedChunkIds":["c1"],"sourceQuotes":[{"chunkId":"c1","quote":"q","sourceAnchorIndex":0}],"answer":"hello","resolution":{"answerability":"unsupported","requiredAuthority":"authorized_operator","recommendedNextStep":"ask_principal","missingInformation":["current state"],"authorityQuestion":"What is the current state?"}}"#,
         )
         .unwrap();
         let action: AgentAction = serde_json::from_value(raw).unwrap();
@@ -2986,10 +2997,19 @@ mod tests {
                 cited_chunk_ids,
                 source_quotes,
                 answer,
+                resolution,
             } => {
                 assert_eq!(cited_chunk_ids, vec!["c1".to_string()]);
                 assert_eq!(source_quotes.len(), 1);
                 assert_eq!(answer, "hello");
+                assert_eq!(
+                    resolution.recommended_next_step,
+                    crate::agent::types::KnowledgeNextStep::AskPrincipal
+                );
+                assert_eq!(
+                    resolution.required_authority,
+                    crate::agent::types::KnowledgeRequiredAuthority::AuthorizedOperator
+                );
             }
             _ => panic!("expected answer"),
         }

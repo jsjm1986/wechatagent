@@ -33,7 +33,7 @@ use super::guards::{
     action_policy_state_key, decision_operation_state_candidate, enforce_reviewed_decision_actions,
     normalize_decision_runtime, normalize_decision_state, planner_from_decision,
 };
-use super::knowledge_router::route_used_knowledge_ids;
+use super::knowledge_router::{route_requests_principal, route_used_knowledge_ids};
 use super::knowledge_tools::{
     dispatch_chat_tool_call, ToolDispatchState, TOOL_LIST_CATALOG, TOOL_OPEN_SLICE, TOOL_SEARCH,
 };
@@ -51,10 +51,68 @@ use super::turn_loop::{
 };
 use super::types::{
     AgentDecision, AgentTrigger, KnowledgeRouteResult, KnowledgeRuntime, RunPlannerResult,
-    ToolCallRequest, HOLD_CATEGORY_BLOCKED_BY_SAFETY_GUARD,
+    ToolCallRequest, HOLD_CATEGORY_BLOCKED_BY_SAFETY_GUARD, HOLD_CATEGORY_HELD_BY_AI_POLICY,
 };
 
 const USER_TURN_TOOL_NAMES: &[&str] = &[TOOL_LIST_CATALOG, TOOL_SEARCH, TOOL_OPEN_SLICE];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrincipalRouteConsistencyIssue {
+    MissingCustomerReply,
+    MissingEscalationRequest,
+    IncompleteEscalationRequest,
+}
+
+/// Validate the structural hand-off between two independent AI decisions. The Knowledge Agent
+/// owns whether principal authority is needed; this function checks only that the Reply Agent
+/// represented that result as a complete, customer-safe action when the capability exists.
+fn principal_route_consistency_issue(
+    route: &KnowledgeRouteResult,
+    decision: &AgentDecision,
+    principal_channel_available: bool,
+) -> Option<PrincipalRouteConsistencyIssue> {
+    if !principal_channel_available || !route_requests_principal(route) {
+        return None;
+    }
+    if !decision.should_reply || decision.reply_text.trim().is_empty() {
+        return Some(PrincipalRouteConsistencyIssue::MissingCustomerReply);
+    }
+    let Some(request) = decision
+        .escalation_request
+        .as_ref()
+        .filter(|request| request.needed)
+    else {
+        return Some(PrincipalRouteConsistencyIssue::MissingEscalationRequest);
+    };
+    let valid_category = request
+        .category
+        .as_deref()
+        .is_some_and(|category| crate::models::ALLOWED_ESCALATION_CATEGORY.contains(&category));
+    if !valid_category
+        || request
+            .reason
+            .as_deref()
+            .map(str::trim)
+            .is_none_or(str::is_empty)
+        || request
+            .question_for_principal
+            .as_deref()
+            .map(str::trim)
+            .is_none_or(str::is_empty)
+        || decision.next_step != "ask_principal"
+    {
+        return Some(PrincipalRouteConsistencyIssue::IncompleteEscalationRequest);
+    }
+    None
+}
+
+fn repair_and_reauthorization_capacity_available(budget: &RunBudget, dual_reviewer: bool) -> bool {
+    // Reviewer + ClaimGate, the optional second Reviewer, and one completion sentinel. The
+    // surrounding budget contract treats reaching the exact cap as exhausted.
+    let authorization_tail = 3 + i32::from(dual_reviewer);
+    !budget.is_llm_or_token_exhausted()
+        && budget.available_llm_calls_before_tail(authorization_tail) > 0
+}
 
 pub(crate) struct TurnModelAssets {
     pub active_products: Vec<Product>,
@@ -351,6 +409,7 @@ pub(crate) struct ModelTurnEnvironment<'a, C> {
     opened_chunk_ids: HashSet<String>,
     last_planner: RunPlannerResult,
     pending_finalize_events: Vec<PendingFinalizeEvent>,
+    principal_consistency_repair_issued: bool,
 }
 
 impl<'a, C> ModelTurnEnvironment<'a, C> {
@@ -363,6 +422,7 @@ impl<'a, C> ModelTurnEnvironment<'a, C> {
             opened_chunk_ids: HashSet::new(),
             last_planner,
             pending_finalize_events: Vec::new(),
+            principal_consistency_repair_issued: false,
         }
     }
 
@@ -444,6 +504,8 @@ impl<'a, C> ModelTurnEnvironment<'a, C> {
         draft.decision.autonomy_mode = "blocked".to_string();
         review.approved = false;
         review.needs_revision = false;
+        review.should_hold = true;
+        review.hold_category = HOLD_CATEGORY_BLOCKED_BY_SAFETY_GUARD.to_string();
         review.final_review_status = "blocked_by_budget".to_string();
         if !review.risks.iter().any(|existing| existing == risk) {
             review.risks.push(risk.to_string());
@@ -604,7 +666,7 @@ where
             validate_appointment_request(draft.decision.appointment_request.as_ref())
         {
             let risk = format!("appointment_request_invalid:{}", issue.code());
-            let mut review = super::types::DecisionReviewResult {
+            let review = super::types::DecisionReviewResult {
                 approved: false,
                 rewrite_instruction: issue.repair_instruction().to_string(),
                 review_summary: format!(
@@ -614,22 +676,99 @@ where
                 risks: vec![risk],
                 ..Default::default()
             };
-            if self.inputs.budget.is_llm_or_token_exhausted() {
-                review.should_hold = true;
-                review.hold_category = HOLD_CATEGORY_BLOCKED_BY_SAFETY_GUARD.to_string();
-                review.final_review_status = "blocked_by_budget".to_string();
-                review
-                    .risks
-                    .push("budget_exceeded_no_action_repair".to_string());
-                return Ok(AuthorizationManifest::held(
-                    "blocked_by_budget",
-                    "Appointment action is invalid and the bounded repair budget is exhausted",
+            if !repair_and_reauthorization_capacity_available(
+                &self.inputs.budget,
+                self.inputs.state.second_reviewer_llm.is_some(),
+            ) {
+                self.inputs
+                    .budget
+                    .mark_degraded("appointment_repair_skipped_required_authorization_tail");
+                return Ok(Self::hold_for_exhausted_repair(
+                    draft,
                     review,
+                    "budget_insufficient_for_action_repair_and_reauthorization",
+                    "The appointment action requires repair, but the bounded run budget does not retain enough capacity for repair plus independent reauthorization",
                 ));
             }
             return Ok(AuthorizationManifest::repairable(
                 "repair_required",
                 issue.repair_instruction(),
+                review,
+            ));
+        }
+
+        let principal_channel_available = self
+            .inputs
+            .domain_config
+            .map(super::escalation::resolve_ask_human_policy)
+            .is_some_and(|policy| !policy.decider_chain.is_empty());
+        if let Some(issue) = principal_route_consistency_issue(
+            self.inputs.knowledge_route,
+            &draft.decision,
+            principal_channel_available,
+        ) {
+            let issue_code = match issue {
+                PrincipalRouteConsistencyIssue::MissingCustomerReply => {
+                    "principal_route_missing_customer_reply"
+                }
+                PrincipalRouteConsistencyIssue::MissingEscalationRequest => {
+                    "principal_route_missing_escalation_request"
+                }
+                PrincipalRouteConsistencyIssue::IncompleteEscalationRequest => {
+                    "principal_route_incomplete_escalation_request"
+                }
+            };
+            let instruction = "The typed knowledgeRoute.resolution selected authorized_operator + ask_principal. Return one complete final decision aligned with it: nextStep=ask_principal; escalationRequest.needed=true with an allowed category, a concrete reason, and questionForPrincipal based on authorityQuestion; shouldReply=true with a short natural first-person holding reply. Do not assert the missing fact and do not expose any internal role, channel, prompt, or control field to the customer.";
+            let mut review = super::types::DecisionReviewResult {
+                approved: false,
+                needs_revision: true,
+                rewrite_instruction: instruction.to_string(),
+                review_summary:
+                    "Reply action did not represent the Knowledge Agent's typed authority request"
+                        .to_string(),
+                risks: vec![issue_code.to_string()],
+                ..Default::default()
+            };
+            let repair_capacity_available = repair_and_reauthorization_capacity_available(
+                &self.inputs.budget,
+                self.inputs.state.second_reviewer_llm.is_some(),
+            );
+            if !self.principal_consistency_repair_issued {
+                if repair_capacity_available {
+                    self.principal_consistency_repair_issued = true;
+                    return Ok(AuthorizationManifest::repairable(
+                        "repair_required",
+                        instruction,
+                        review,
+                    ));
+                }
+                self.inputs
+                    .budget
+                    .mark_degraded("principal_repair_skipped_required_authorization_tail");
+                return Ok(Self::hold_for_exhausted_repair(
+                    draft,
+                    review,
+                    "budget_insufficient_for_principal_repair_and_reauthorization",
+                    "The principal action requires repair, but the bounded run budget does not retain enough capacity for repair plus independent reauthorization",
+                ));
+            }
+
+            draft.decision.should_reply = false;
+            draft.decision.autonomy_mode = "blocked".to_string();
+            review.needs_revision = false;
+            review.should_hold = true;
+            review.hold_category = HOLD_CATEGORY_HELD_BY_AI_POLICY.to_string();
+            review.hold_reason = self
+                .inputs
+                .knowledge_route
+                .resolution
+                .authority_question
+                .trim()
+                .to_string();
+            review.final_review_status = HOLD_CATEGORY_HELD_BY_AI_POLICY.to_string();
+            return Ok(AuthorizationManifest::held(
+                HOLD_CATEGORY_HELD_BY_AI_POLICY,
+                "The bounded Reply repair did not produce the structured principal action selected by the Knowledge Agent",
                 review,
             ));
         }
@@ -727,12 +866,18 @@ where
         };
 
         if should_run_targeted_rewrite(decision, &review, self.inputs.runtime) {
-            if self.inputs.budget.is_llm_or_token_exhausted() {
+            if !repair_and_reauthorization_capacity_available(
+                &self.inputs.budget,
+                self.inputs.state.second_reviewer_llm.is_some(),
+            ) {
+                self.inputs
+                    .budget
+                    .mark_degraded("action_repair_skipped_required_authorization_tail");
                 return Ok(Self::hold_for_exhausted_repair(
                     draft,
                     review,
-                    "budget_exceeded_before_action_repair",
-                    "The candidate requires another authorization repair, but the bounded run budget is exhausted",
+                    "budget_insufficient_for_action_repair_and_reauthorization",
+                    "The candidate requires another repair, but the bounded run budget does not retain enough capacity for repair plus independent reauthorization",
                 ));
             }
             return Ok(AuthorizationManifest::repairable(
@@ -759,12 +904,18 @@ where
             && review.needs_revision
             && !review.should_hold
         {
-            if self.inputs.budget.is_llm_or_token_exhausted() {
+            if !repair_and_reauthorization_capacity_available(
+                &self.inputs.budget,
+                self.inputs.state.second_reviewer_llm.is_some(),
+            ) {
+                self.inputs
+                    .budget
+                    .mark_degraded("quality_revision_skipped_required_authorization_tail");
                 return Ok(Self::hold_for_exhausted_repair(
                     draft,
                     review,
-                    "budget_exceeded_before_revision",
-                    "The approved candidate requires a quality revision, but the bounded run budget is exhausted",
+                    "budget_insufficient_for_revision_and_reauthorization",
+                    "The candidate requires a quality revision, but the bounded run budget does not retain enough capacity for revision plus independent reauthorization",
                 ));
             }
             return Ok(AuthorizationManifest::repairable(
@@ -824,6 +975,20 @@ where
 mod tests {
     use super::*;
 
+    fn principal_route() -> KnowledgeRouteResult {
+        KnowledgeRouteResult {
+            resolution: super::super::types::KnowledgeResolution {
+                answerability: super::super::types::KnowledgeAnswerability::Unsupported,
+                required_authority:
+                    super::super::types::KnowledgeRequiredAuthority::AuthorizedOperator,
+                recommended_next_step: super::super::types::KnowledgeNextStep::AskPrincipal,
+                missing_information: vec!["current state".to_string()],
+                authority_question: "What is the current state?".to_string(),
+            },
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn user_turn_tool_surface_is_read_only_and_bounded() {
         assert_eq!(USER_TURN_TOOL_NAMES.len(), 3);
@@ -846,6 +1011,69 @@ mod tests {
         assert_eq!(
             ModelTurnEnvironment::<SandboxCommitter>::repair_instruction(&review),
             "remove unsupported schedule"
+        );
+    }
+
+    #[test]
+    fn typed_principal_route_requires_customer_reply_and_complete_action() {
+        let route = principal_route();
+        let mut decision = AgentDecision::default();
+        assert_eq!(
+            principal_route_consistency_issue(&route, &decision, true),
+            Some(PrincipalRouteConsistencyIssue::MissingCustomerReply)
+        );
+
+        decision.should_reply = true;
+        decision.reply_text = "I will verify this and follow up.".to_string();
+        assert_eq!(
+            principal_route_consistency_issue(&route, &decision, true),
+            Some(PrincipalRouteConsistencyIssue::MissingEscalationRequest)
+        );
+
+        decision.next_step = "ask_principal".to_string();
+        decision.escalation_request = Some(crate::models::EscalationRequest {
+            needed: true,
+            category: Some(crate::models::ESCALATION_CATEGORY_OUT_OF_SCOPE.to_string()),
+            reason: Some("Current authority is required".to_string()),
+            question_for_principal: Some("What is the current state?".to_string()),
+            self_serviceable_part: None,
+            is_generalizable: false,
+        });
+        assert_eq!(
+            principal_route_consistency_issue(&route, &decision, true),
+            None
+        );
+    }
+
+    #[test]
+    fn typed_principal_route_is_inert_without_configured_capability() {
+        assert_eq!(
+            principal_route_consistency_issue(&principal_route(), &AgentDecision::default(), false),
+            None
+        );
+    }
+
+    #[test]
+    fn repair_preserves_authorization_tail_and_completion_sentinel() {
+        let budget = RunBudget::new("repair", 100_000, 5, 0);
+        assert!(repair_and_reauthorization_capacity_available(
+            &budget, false
+        ));
+
+        budget.try_reserve_llm_call().unwrap();
+        budget.try_reserve_llm_call().unwrap();
+        assert!(
+            !repair_and_reauthorization_capacity_available(&budget, false),
+            "two calls used leaves exactly Reviewer + ClaimGate + sentinel, so repair must stop"
+        );
+
+        budget.grant_additional_llm_calls(1);
+        assert!(repair_and_reauthorization_capacity_available(
+            &budget, false
+        ));
+        assert!(
+            !repair_and_reauthorization_capacity_available(&budget, true),
+            "dual review needs one additional authorization-tail call"
         );
     }
 }

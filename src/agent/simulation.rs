@@ -106,17 +106,22 @@ pub(crate) async fn simulate_user_dialogue_with_budget(
         )
         .with_run_mode("shadow"),
     );
-    let turns = RUN_BUDGET
+    let llm_registry_snapshot =
+        super::resolve_llm_registry_snapshot(state, &contact.workspace_id).await?;
+    let turns = super::RUN_LLM_REGISTRY_SNAPSHOT
         .scope(
-            budget.clone(),
-            simulate_user_dialogue_inner(
-                state,
-                contact,
-                messages,
-                domain_config,
-                runtime,
-                run_id,
+            llm_registry_snapshot,
+            RUN_BUDGET.scope(
                 budget.clone(),
+                simulate_user_dialogue_inner(
+                    state,
+                    contact,
+                    messages,
+                    domain_config,
+                    runtime,
+                    run_id,
+                    budget.clone(),
+                ),
             ),
         )
         .await;

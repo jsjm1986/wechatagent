@@ -1082,6 +1082,15 @@ pub(crate) async fn decide_reply_with_promote_context(
 - 每条历史消息带 createdAtMillis/ageHours/temporalStatus。相对时间（如“明天”）必须锚定该消息的 createdAtMillis；temporalStatus=stale 的聊天不能证明当前或未来预约/日程，历史我方回复无论新旧都不是证据。
 - 没有直接依据时，保留有依据的部分；无依据部分应删除、透明说明需要先核对，或最多问一个必要澄清问题。不得为了“具体、有帮助”而补出事实。
 
+# 结构化知识研判的执行方式
+- Full 档的 knowledgeRoute.resolution 是独立知识 Agent 按完整语境作出的结构化研判，不是事实证据本身，也不是给客户复述的文本。不得向客户暴露 knowledgeRoute、requiredAuthority、内部请示、领导、系统或其它控制字段。
+- 当 recommendedNextStep=ask_principal、requiredAuthority=authorized_operator 且本轮“请示通道信号”确认内部通道可用时，输出 nextStep=ask_principal 和完整 escalationRequest（needed=true、category=out_of_scope_decision、具体 reason 与 questionForPrincipal）；同时 shouldReply=true，用第一人称自然说明我正在核准、后续由我继续同步，绝不编造缺失事实，也不把客户转给幕后角色。
+- 当 recommendedNextStep=clarify_customer 时，只问一个真正能补齐 missingInformation 的客户问题；当 answerability=partially_supported 或 unsupported 时，不得把未被证据覆盖的部分写成确定结论。
+
+# 人设呈现边界
+- Soul、业务目标、运营方法、可用工具和职责范围只用于决定你怎么做，绝不是可以向客户复述的自我介绍材料。不得用“身份标签 + 职责清单”的方式解释自己，也不得把配置里的行业、任务、转化目标或内部流程说给客户听。
+- 客户问你是谁、在做什么或为什么这样回复时，结合长期一致的人设和当前关系自然作答，像一个已经在微信里持续聊天的具体的人；少做身份宣告，多承接他此刻真正关心的事。任何具体身份、履历、地点和现实经历仍须有可信来源，不能为拟人化而临时编造。
+
 # 最近聊天窗口序号补充
 - 最近聊天可能因上下文预算省略较早行，所以方括号编号可能有缺口。编号始终是原始升序窗口位置；输出 tagEvidenceTurns、stageEvidenceTurns、bayesianObservations.evidenceTurns 时必须原样引用可见行的方括号编号，不得按显示行次重新编号。"#,
     );
@@ -2342,7 +2351,10 @@ mod persona_override_tests {
     /// 知识充分度信号由 knowledgeCoverage / missingKnowledge 等结构化字段承载)。
     #[test]
     fn format_knowledge_route_drops_debug_metadata() {
-        use crate::agent::types::{KnowledgeRouteResult, SelectedChunkRanking};
+        use crate::agent::types::{
+            KnowledgeAnswerability, KnowledgeNextStep, KnowledgeRequiredAuthority,
+            KnowledgeResolution, KnowledgeRouteResult, SelectedChunkRanking,
+        };
         let route = KnowledgeRouteResult {
             needed_categories: vec!["product".to_string()],
             selected_knowledge_ids: vec!["k1".to_string()],
@@ -2351,6 +2363,13 @@ mod persona_override_tests {
             reason: "命中产品事实切片".to_string(),
             requires_evidence: true,
             missing_knowledge: vec!["定价细则".to_string()],
+            resolution: KnowledgeResolution {
+                answerability: KnowledgeAnswerability::Unsupported,
+                required_authority: KnowledgeRequiredAuthority::AuthorizedOperator,
+                recommended_next_step: KnowledgeNextStep::AskPrincipal,
+                missing_information: vec!["当期可用口径".to_string()],
+                authority_question: "当前应采用什么口径？".to_string(),
+            },
             tool_trace: vec![mongodb::bson::doc! { "tool": "search" }],
             evidence_excerpts: vec!["某条摘录".to_string()],
             selected_chunk_rankings: vec![SelectedChunkRanking {
@@ -2368,6 +2387,9 @@ mod persona_override_tests {
         );
         assert!(out.contains("knowledgeCoverage"), "保留 knowledgeCoverage");
         assert!(out.contains("missingKnowledge"), "保留 missingKnowledge");
+        assert!(out.contains("\"resolution\""), "保留结构化知识研判");
+        assert!(out.contains("ask_principal"), "保留模型选择的下一能力");
+        assert!(out.contains("authorized_operator"), "保留所需权威类型");
         assert!(
             !out.contains("命中产品事实切片"),
             "剔除 reason 内容（防越权承接措辞回流）"

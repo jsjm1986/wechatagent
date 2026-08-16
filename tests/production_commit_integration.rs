@@ -12,7 +12,10 @@ use wechatagent::agent::{
     enqueue, handle_follow_up_task_with_claim, handle_managed_message, EnqueueOutcome,
     EnqueueRequest,
 };
-use wechatagent::models::{AgentStatus, AgentTask, Contact, ConversationMessage, MessageDirection};
+use wechatagent::models::{
+    AgentStatus, AgentTask, AskHumanPolicy, Contact, ConversationMessage, DeciderRef,
+    MessageDirection,
+};
 use wechatagent::tasks::TaskClaim;
 
 fn managed_contact(wxid: &str) -> Contact {
@@ -369,15 +372,175 @@ async fn appointment_side_effect_is_enforced_independently_from_allowed_reply() 
             .expect("count appointments"),
         0
     );
+    let outbox = app
+        .state
+        .db
+        .collection_agent_send_outbox()
+        .find(doc! { "run_id": &run.run_id }, None)
+        .await
+        .expect("query outbox")
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("collect outbox");
     assert_eq!(
-        app.state
-            .db
-            .collection_agent_send_outbox()
-            .count_documents(doc! { "run_id": &run.run_id }, None)
-            .await
-            .expect("count outbox"),
-        0
+        outbox.len(),
+        1,
+        "held inbound turns receive one neutral ack"
     );
+    assert!(outbox[0].source_event_id.ends_with("#ack-placeholder"));
+    assert!(outbox[0].decision_id.is_none());
+}
+
+#[tokio::test]
+#[ignore = "requires replica-set MongoDB"]
+async fn explicit_principal_request_is_materialized_even_when_reply_is_held() {
+    let app = common::TestApp::start_repl_set().await;
+    let contact = managed_contact("production_commit_explicit_principal_hold");
+    let inbound = inbound(&contact, "production-commit-explicit-principal-hold-001");
+    insert_contact_and_inbound(&app, &contact, &inbound).await;
+
+    // This is an explicit model-selected handoff, not the generic high-risk fallback. Keep the
+    // generic ai-policy escalation switch off so the test proves the structured request is not
+    // silently discarded when a later deterministic policy holds the reply.
+    let policy = AskHumanPolicy {
+        decider_chain: vec![DeciderRef {
+            wxid: "principal_for_explicit_hold".to_string(),
+            display_name: Some("值班负责人".to_string()),
+            account_id: Some("default".to_string()),
+        }],
+        escalate_safety_guard: true,
+        escalate_unverified_product: true,
+        escalate_ai_policy_hold: false,
+        escalate_stuck: true,
+        dedupe_window_hours: None,
+        daily_push_cap: None,
+        quiet_hours: None,
+        timeout_hours: None,
+        standing_order: None,
+        standing_order_after_hours: None,
+    };
+    let policy_bson = mongodb::bson::to_bson(&policy).expect("serialize ask-human policy");
+    app.state
+        .db
+        .operation_domain_configs()
+        .update_one(
+            doc! {
+                "workspace_id": &contact.workspace_id,
+                "domain": "user_operations",
+                "current_version": true,
+            },
+            doc! { "$set": { "ask_human_policy": policy_bson } },
+            None,
+        )
+        .await
+        .expect("configure ask-human policy");
+
+    let state_policy_update = app
+        .state
+        .db
+        .operation_state_policies()
+        .update_one(
+            doc! {
+                "workspace_id": &contact.workspace_id,
+                "domain": "user_operations",
+                "state_key": "need_discovery",
+                "current_version": true,
+            },
+            doc! {
+                "$set": {
+                    "allowed": ["silent"],
+                    "forbidden": ["reply"],
+                    "status": "active",
+                },
+            },
+            None,
+        )
+        .await
+        .expect("hold replies through operation-state policy");
+    assert_eq!(state_policy_update.matched_count, 1);
+
+    let mut decision = reply_json("我先核对一下当前安排，再把结果同步给你。", false, false);
+    decision["nextStep"] = json!("ask_principal");
+    decision["escalationRequest"] = json!({
+        "needed": true,
+        "category": "out_of_scope_decision",
+        "reason": "当前安排需要有权人员确认",
+        "questionForPrincipal": "是否按这条安排继续跟进？",
+        "selfServiceablePart": "我先把你的需求记录下来",
+        "isGeneralizable": false
+    });
+    queue_authorized_turn(&app, decision);
+
+    handle_managed_message(&app.state, contact.clone(), &inbound)
+        .await
+        .expect("held turn should settle without transport error");
+
+    let run = app
+        .state
+        .db
+        .agent_run_logs()
+        .find_one(doc! { "contact_wxid": &contact.wxid }, None)
+        .await
+        .expect("query run")
+        .expect("run exists");
+    assert_eq!(run.status, "held_by_ai_policy");
+
+    let escalation = app
+        .state
+        .db
+        .agent_principal_escalations()
+        .find_one(
+            doc! {
+                "workspace_id": &contact.workspace_id,
+                "account_id": &contact.account_id,
+                "contact_wxid": &contact.wxid,
+                "category": "out_of_scope_decision",
+                "status": "pending",
+            },
+            None,
+        )
+        .await
+        .expect("query explicit escalation")
+        .expect("explicit model request must create a pending principal card");
+    assert_eq!(escalation.reason, "当前安排需要有权人员确认");
+    assert_eq!(
+        escalation.question_for_principal,
+        "是否按这条安排继续跟进？"
+    );
+
+    let customer_outbox = app
+        .state
+        .db
+        .collection_agent_send_outbox()
+        .find(doc! { "run_id": &run.run_id }, None)
+        .await
+        .expect("query customer outbox")
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("collect customer outbox");
+    assert_eq!(customer_outbox.len(), 1);
+    assert!(customer_outbox[0]
+        .source_event_id
+        .ends_with("#ack-placeholder"));
+
+    let principal_outbox = app
+        .state
+        .db
+        .collection_agent_send_outbox()
+        .find(
+            doc! {
+                "account_id": "default",
+                "contact_wxid": "principal_for_explicit_hold",
+                "source_kind": "principal_escalation",
+            },
+            None,
+        )
+        .await
+        .expect("query principal outbox")
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("collect principal outbox");
+    assert_eq!(principal_outbox.len(), 1);
 }
 
 #[tokio::test]
@@ -434,15 +597,23 @@ async fn exhausted_authorization_budget_fails_closed_for_appointment_only_action
             .expect("count appointments"),
         0
     );
+    let outbox = app
+        .state
+        .db
+        .collection_agent_send_outbox()
+        .find(doc! { "run_id": &run.run_id }, None)
+        .await
+        .expect("query outbox")
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("collect outbox");
     assert_eq!(
-        app.state
-            .db
-            .collection_agent_send_outbox()
-            .count_documents(doc! { "run_id": &run.run_id }, None)
-            .await
-            .expect("count outbox"),
-        0
+        outbox.len(),
+        1,
+        "budget-held inbound turns receive one neutral ack"
     );
+    assert!(outbox[0].source_event_id.ends_with("#ack-placeholder"));
+    assert!(outbox[0].decision_id.is_none());
 }
 
 #[tokio::test]

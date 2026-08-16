@@ -56,6 +56,7 @@ pub(crate) fn forced_full_context_reason(
     decision: &AgentDecision,
     has_cited_knowledge_context: bool,
     has_explicit_referral_context: bool,
+    has_structured_knowledge_directive: bool,
 ) -> Option<&'static str> {
     if decision.sufficiency != "enough" {
         return None;
@@ -65,6 +66,9 @@ pub(crate) fn forced_full_context_reason(
     }
     if has_cited_knowledge_context {
         return Some("knowledge_route_cited_context");
+    }
+    if has_structured_knowledge_directive {
+        return Some("knowledge_route_structured_directive");
     }
     if has_explicit_referral_context {
         return Some("explicit_referral_context_requested");
@@ -257,22 +261,29 @@ mod tests {
     fn full_context_reason_uses_independent_business_signals_without_forcing_actions() {
         let required = decision_with_need("enough", "required");
         assert_eq!(
-            forced_full_context_reason(&required, false, false),
+            forced_full_context_reason(&required, false, false, false),
             Some("lean_declared_knowledge_required")
         );
         let routine = decision_with_need("enough", "not_required");
         assert_eq!(
-            forced_full_context_reason(&routine, true, false),
+            forced_full_context_reason(&routine, true, false, false),
             Some("knowledge_route_cited_context")
         );
         assert_eq!(
-            forced_full_context_reason(&routine, false, true),
+            forced_full_context_reason(&routine, false, true, false),
             Some("explicit_referral_context_requested")
         );
-        assert_eq!(forced_full_context_reason(&routine, false, false), None);
+        assert_eq!(
+            forced_full_context_reason(&routine, false, false, true),
+            Some("knowledge_route_structured_directive")
+        );
+        assert_eq!(
+            forced_full_context_reason(&routine, false, false, false),
+            None
+        );
         let already_escalating = decision_with_need("need_more_context", "required");
         assert_eq!(
-            forced_full_context_reason(&already_escalating, true, true),
+            forced_full_context_reason(&already_escalating, true, true, true),
             None,
             "the ordinary escalation branch owns non-enough decisions"
         );

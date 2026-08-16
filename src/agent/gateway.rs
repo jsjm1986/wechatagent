@@ -370,22 +370,29 @@ pub async fn send_contact_message_gateway(
         crate::agent::runtime::resolve_thresholds(state, &contact)
             .await?
             .apply_to_runtime(&mut runtime);
+        let llm_registry_snapshot = {
+            let _stage_timer = super::run_audit::stage_timer("llm_provider_snapshot");
+            super::resolve_llm_registry_snapshot(state, &contact.workspace_id).await?
+        };
         let budget = Arc::new(RunBudget::new(
             run_id.clone(),
             runtime.run_token_budget,
             runtime.run_max_llm_calls,
             runtime.knowledge_max_tool_calls,
         ));
-        RUN_BUDGET
+        super::RUN_LLM_REGISTRY_SNAPSHOT
             .scope(
-                budget,
-                send_contact_message_gateway_inner(
-                    state,
-                    contact,
-                    request,
-                    run_id.clone(),
-                    domain_config,
-                    runtime,
+                llm_registry_snapshot,
+                RUN_BUDGET.scope(
+                    budget,
+                    send_contact_message_gateway_inner(
+                        state,
+                        contact,
+                        request,
+                        run_id.clone(),
+                        domain_config,
+                        runtime,
+                    ),
                 ),
             )
             .await
@@ -1841,6 +1848,10 @@ async fn run_user_operation_gateway_with_parallel_reaction(
         crate::agent::runtime::resolve_thresholds(state, &contact)
             .await?
             .apply_to_runtime(&mut runtime);
+        let llm_registry_snapshot = {
+            let _stage_timer = super::run_audit::stage_timer("llm_provider_snapshot");
+            super::resolve_llm_registry_snapshot(state, &contact.workspace_id).await?
+        };
 
         // MP-5 / Task 15：为本次 run 构建 budget，并通过 task_local 注入。
         let budget = Arc::new(RunBudget::new(
@@ -1849,20 +1860,23 @@ async fn run_user_operation_gateway_with_parallel_reaction(
             runtime.run_max_llm_calls,
             runtime.knowledge_max_tool_calls,
         ));
-        RUN_BUDGET
+        super::RUN_LLM_REGISTRY_SNAPSHOT
             .scope(
-                budget,
-                run_user_operation_gateway_inner(
-                    state,
-                    contact,
-                    trigger,
-                    task_context,
-                    run_id.clone(),
-                    inbound,
-                    domain_config,
-                    runtime,
-                    should_abort_send,
-                    parallel_reaction.clone(),
+                llm_registry_snapshot,
+                RUN_BUDGET.scope(
+                    budget,
+                    run_user_operation_gateway_inner(
+                        state,
+                        contact,
+                        trigger,
+                        task_context,
+                        run_id.clone(),
+                        inbound,
+                        domain_config,
+                        runtime,
+                        should_abort_send,
+                        parallel_reaction.clone(),
+                    ),
                 ),
             )
             .await
@@ -2082,6 +2096,30 @@ pub(crate) async fn trigger_principal_escalation(
     };
     escalation::materialize_principal_card_delivery(state, &entry).await?;
     Ok(())
+}
+
+/// Return an explicit model-selected principal handoff only when the request is
+/// structurally complete. This is deliberately a schema check, not a semantic
+/// keyword gate: the Knowledge/Reply agents decide *whether* human authority is
+/// needed; deterministic code only prevents an empty or unknown request from
+/// becoming an unusable card.
+fn explicit_principal_escalation_request(
+    decision: &crate::agent::types::AgentDecision,
+) -> Option<&crate::models::EscalationRequest> {
+    decision.escalation_request.as_ref().filter(|request| {
+        request.needed
+            && request.category.as_deref().is_some_and(|category| {
+                crate::models::ALLOWED_ESCALATION_CATEGORY.contains(&category)
+            })
+            && request
+                .reason
+                .as_deref()
+                .is_some_and(|reason| !reason.trim().is_empty())
+            && request
+                .question_for_principal
+                .as_deref()
+                .is_some_and(|question| !question.trim().is_empty())
+    })
 }
 
 /// relay：把领导裁决用 AI 口吻转述给客户，走现有网关。转述完清等待态、按需发知识提案。
@@ -2634,7 +2672,16 @@ async fn persist_production_post_commit(
     }
 
     if authorization.disposition != "authorized" {
-        if let Err(error) = escalation::escalate_held_decision(
+        // A coherent structured request is the model's semantic authority decision. It must
+        // survive a later review/claim hold; otherwise `escalate_ai_policy_hold=false` silently
+        // discards an explicit ask-human result and the customer is left with only an ack. The
+        // trigger still applies account binding, push limits, dedupe and category policy. Only
+        // incomplete/no-request holds fall back to the generic deterministic risk policy.
+        if let Some(request) = explicit_principal_escalation_request(decision) {
+            if let Err(error) = trigger_principal_escalation(state, contact, request).await {
+                tracing::warn!(%error, %run_id, "explicit principal escalation failed after held commit");
+            }
+        } else if let Err(error) = escalation::escalate_held_decision(
             state,
             contact,
             review,
@@ -3085,10 +3132,13 @@ fn run_user_operation_gateway_inner<'a>(
     // Candidate availability is a typed server fact. Whether the customer actually wants a
     // referral remains an AI decision; do not pre-classify the inbound text with a phrase list.
     let has_explicit_referral_context = has_eligible_referral_candidate;
+    let has_structured_knowledge_directive =
+        crate::agent::knowledge_router::route_requires_full_context(&knowledge_route);
     let forced_full_reason = crate::agent::sufficiency::forced_full_context_reason(
         &decision_first,
         has_cited_knowledge_context,
         has_explicit_referral_context,
+        has_structured_knowledge_directive,
     );
     let mut forced_full = false;
 
@@ -3116,6 +3166,7 @@ fn run_user_operation_gateway_inner<'a>(
                         "has_cited_knowledge_context": has_cited_knowledge_context,
                         "has_eligible_referral_candidate": has_eligible_referral_candidate,
                         "has_explicit_referral_context": has_explicit_referral_context,
+                        "has_structured_knowledge_directive": has_structured_knowledge_directive,
                     }),
                 )
                 .await
@@ -3431,6 +3482,13 @@ fn run_user_operation_gateway_inner<'a>(
         .committer()
         .persist_post_commit_work(&turn_outcome.commit_receipt)
         .await;
+    let post_commit_status = turn_outcome
+        .commit_receipt
+        .details
+        .get_str("gateway_status")
+        .unwrap_or("held_by_ai_policy")
+        .to_string();
+    let post_commit_requires_ack = turn_outcome.authorization.disposition != "authorized";
     persist_production_post_commit(
         state,
         &contact,
@@ -3450,10 +3508,41 @@ fn run_user_operation_gateway_inner<'a>(
         &turn_outcome,
     )
     .await;
+    if post_commit_requires_ack
+        && !commit_receipt_has_partial_outbox_conflict(&turn_outcome.commit_receipt)
+    {
+        // The unified Harness can settle a turn as held after the early precheck has already
+        // passed (for example, bounded authorization repair exhaustion). Reuse the existing
+        // side-budgeted, semantically reviewed holding path so an inbound customer is not left
+        // without any response. The source-event suffix keeps this idempotent across retries.
+        ensure_customer_acknowledged(
+            state,
+            &contact,
+            &run_id,
+            trigger.kind(),
+            &envelope_source_event_id,
+            &post_commit_status,
+            task_context.as_ref(),
+            &should_abort_send,
+        )
+        .await;
+    }
     return Ok(());
 
     }
     .boxed()
+}
+
+/// A held commit may discover that an earlier attempt already created part of the same
+/// response batch.  The atomic committer records those duplicate ids in the receipt and holds
+/// rather than adding another segment.  Do not append a neutral acknowledgement after that
+/// point: it would interleave a second, unrelated message with the partial batch and defeat the
+/// outbox conflict guard.  This is a receipt-level structural signal, not a text/status heuristic.
+fn commit_receipt_has_partial_outbox_conflict(receipt: &super::turn_loop::CommitReceipt) -> bool {
+    receipt
+        .details
+        .get_array("duplicate_outbox_ids")
+        .is_ok_and(|ids| !ids.is_empty())
 }
 
 /// 客户发送回执的三态分类。
@@ -6375,6 +6464,52 @@ mod tests {
             decision_id,
             "sent"
         ));
+    }
+
+    #[test]
+    fn partial_outbox_receipt_suppresses_a_second_ack_placeholder() {
+        let mut receipt = crate::agent::turn_loop::CommitReceipt::default();
+        assert!(!commit_receipt_has_partial_outbox_conflict(&receipt));
+        receipt.details.insert(
+            "duplicate_outbox_ids",
+            vec![Bson::ObjectId(ObjectId::new())],
+        );
+        assert!(commit_receipt_has_partial_outbox_conflict(&receipt));
+    }
+
+    #[test]
+    fn explicit_principal_request_survives_a_later_held_terminal() {
+        let mut decision = AgentDecision::default();
+        decision.escalation_request = Some(crate::models::EscalationRequest {
+            needed: true,
+            category: Some(crate::models::ESCALATION_CATEGORY_OUT_OF_SCOPE.to_string()),
+            reason: Some("当前安排需要有权人员确认".to_string()),
+            question_for_principal: Some("是否按此安排继续跟进？".to_string()),
+            self_serviceable_part: None,
+            is_generalizable: false,
+        });
+
+        let request = explicit_principal_escalation_request(&decision)
+            .expect("完整的结构化请示不应因后续 held 被丢弃");
+        assert_eq!(
+            request.category.as_deref(),
+            Some(crate::models::ESCALATION_CATEGORY_OUT_OF_SCOPE)
+        );
+    }
+
+    #[test]
+    fn incomplete_principal_request_uses_generic_hold_policy() {
+        let mut decision = AgentDecision::default();
+        decision.escalation_request = Some(crate::models::EscalationRequest {
+            needed: true,
+            category: Some("unknown_category".to_string()),
+            reason: Some("需要确认".to_string()),
+            question_for_principal: None,
+            self_serviceable_part: None,
+            is_generalizable: false,
+        });
+
+        assert!(explicit_principal_escalation_request(&decision).is_none());
     }
 
     // 客户回应保障守卫判定纯函数（黑名单语义）：

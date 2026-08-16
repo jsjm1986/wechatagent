@@ -1346,6 +1346,11 @@ fn normalize_harness_control(decision: &mut AgentDecision, risks: &mut Vec<Strin
         decision.next_step = normalized.to_string();
     }
 
+    if escalation_needed && decision.next_step != "ask_principal" {
+        risks.push("next_step_inconsistent:escalation_request".to_string());
+        decision.next_step = "ask_principal".to_string();
+    }
+
     if decision.decision_phase == RAW_TOOL_CALLING
         && !matches!(decision.next_step.as_str(), "retrieve" | "verify")
     {
@@ -1951,6 +1956,83 @@ pub(crate) fn is_forbidden_hold_category(value: &str) -> bool {
     HOLD_CATEGORY_FORBIDDEN_VALUES.contains(&value.trim())
 }
 
+/// Knowledge Agent's semantic assessment of whether the opened evidence can answer the turn.
+///
+/// The runtime consumes this closed protocol only for capability routing. It never infers the
+/// value from customer text, phrases, or a keyword list.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum KnowledgeAnswerability {
+    Supported,
+    PartiallySupported,
+    Unsupported,
+    NotRequired,
+    #[serde(other)]
+    Unknown,
+}
+
+impl Default for KnowledgeAnswerability {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
+/// The authority class the Knowledge Agent says is needed to close an evidence gap.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum KnowledgeRequiredAuthority {
+    None,
+    Customer,
+    AuthorizedOperator,
+    LicensedProfessional,
+    ExternalSystem,
+    #[serde(other)]
+    Unknown,
+}
+
+impl Default for KnowledgeRequiredAuthority {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
+/// Model-selected next capability after knowledge research.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum KnowledgeNextStep {
+    Respond,
+    ClarifyCustomer,
+    AskPrincipal,
+    Defer,
+    #[serde(other)]
+    Unknown,
+}
+
+impl Default for KnowledgeNextStep {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
+/// Typed semantic hand-off from the Knowledge Agent to the shared turn Harness.
+///
+/// `authority_question` is internal control data for the configured principal channel. The Reply
+/// Agent must render its own customer-facing language and must not expose this structure.
+#[derive(Debug, Serialize, Deserialize, Default, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct KnowledgeResolution {
+    #[serde(default)]
+    pub answerability: KnowledgeAnswerability,
+    #[serde(default)]
+    pub required_authority: KnowledgeRequiredAuthority,
+    #[serde(default)]
+    pub recommended_next_step: KnowledgeNextStep,
+    #[serde(default, deserialize_with = "string_or_vec")]
+    pub missing_information: Vec<String>,
+    #[serde(default)]
+    pub authority_question: String,
+}
+
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct KnowledgeRouteResult {
@@ -1974,6 +2056,10 @@ pub struct KnowledgeRouteResult {
     pub missing_knowledge: Vec<String>,
     #[serde(default)]
     pub reason: String,
+    /// AI-owned semantic research result. Deterministic code may route capabilities from these
+    /// enums, but never derives them by scanning natural-language customer content.
+    #[serde(default)]
+    pub resolution: KnowledgeResolution,
     #[serde(default, deserialize_with = "document_vec")]
     pub tool_trace: Vec<Document>,
     #[serde(default, deserialize_with = "string_or_vec")]
@@ -2529,6 +2615,27 @@ mod validate_and_promote_tests {
         assert!(!risks
             .iter()
             .any(|risk| risk.contains("next_step") || risk.contains("nextStep")));
+    }
+
+    #[test]
+    fn escalation_request_normalizes_control_step_to_ask_principal() {
+        let mut raw = make_valid_low_routine_raw();
+        raw.next_step = Some("respond".to_string());
+        raw.escalation_request = Some(crate::models::EscalationRequest {
+            needed: true,
+            category: Some(crate::models::ESCALATION_CATEGORY_OUT_OF_SCOPE.to_string()),
+            reason: Some("需要当前授权口径".to_string()),
+            question_for_principal: Some("当前应按什么口径处理？".to_string()),
+            self_serviceable_part: None,
+            is_generalizable: false,
+        });
+
+        let (decision, risks) = raw.validate_reply_critical(&runtime_default(true));
+
+        assert_eq!(decision.next_step, "ask_principal");
+        assert!(risks
+            .iter()
+            .any(|risk| risk == "next_step_inconsistent:escalation_request"));
     }
 
     #[test]

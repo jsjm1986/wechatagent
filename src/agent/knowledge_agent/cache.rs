@@ -203,6 +203,7 @@ mod tests {
     fn mk_result(answer: &str) -> AnswerResult {
         AnswerResult {
             answer: answer.to_string(),
+            resolution: crate::agent::types::KnowledgeResolution::default(),
             cited_chunk_ids: Vec::new(),
             source_quotes: Vec::new(),
             tool_trace: Vec::new(),

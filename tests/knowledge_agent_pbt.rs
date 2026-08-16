@@ -28,7 +28,8 @@ use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
 use proptest::prelude::*;
 use wechatagent::agent::knowledge_agent::{
     classify_recall_outcome, filter_answer_against_opened, merge_catalog_pure, rank_key,
-    split_prefetch, truncate_chars, wiki_type_priority, AnswerResult, CatalogEntry, RawSourceQuote,
+    split_prefetch, truncate_chars, wiki_type_priority, AnswerResult, CatalogEntry,
+    KnowledgeResolution, RawSourceQuote,
 };
 use wechatagent::knowledge_wiki::structural_proposals::{
     StructuralKind, StructuralProposal, STATUS_PENDING_REVIEW,
@@ -466,6 +467,7 @@ fn mk_answer_result(
     }
     AnswerResult {
         answer: String::new(),
+        resolution: KnowledgeResolution::default(),
         cited_chunk_ids: cited,
         source_quotes: Vec::new(),
         tool_trace: trace,

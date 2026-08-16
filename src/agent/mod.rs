@@ -233,10 +233,41 @@ static LLM_EXACT_CACHE: LazyLock<PlMutex<LruCache<String, Value>>> = LazyLock::n
     ))
 });
 
+tokio::task_local! {
+    /// Immutable provider generation selected once for a complete Gateway or Simulation run.
+    /// Calls outside those scopes retain the historical per-call synchronization behavior.
+    pub(crate) static RUN_LLM_REGISTRY_SNAPSHOT: Option<crate::llm::LlmRegistrySnapshot>;
+}
+
+/// Resolve the active workspace provider, reusing the run-pinned generation when present.
+///
+/// Keeping this helper shared is important for cache correctness: the Knowledge Agent cache
+/// identity and every upstream call in one run must observe the same provider generation.
+pub(crate) async fn resolve_llm_registry_snapshot(
+    state: &AppState,
+    workspace_id: &str,
+) -> AppResult<Option<crate::llm::LlmRegistrySnapshot>> {
+    if let Ok(snapshot) = RUN_LLM_REGISTRY_SNAPSHOT.try_with(|snapshot| snapshot.clone()) {
+        return Ok(snapshot);
+    }
+    match &state.llm_registry {
+        Some(registry) => Ok(Some(
+            registry
+                .snapshot_synced(&state.db, &state.config, workspace_id)
+                .await?,
+        )),
+        None => Ok(None),
+    }
+}
+
 // Conservative first limits based on successful production distributions. Fast Reply has a
 // smaller schema than the retired full task, while Reviewer and ClaimGate limits remain above
 // every historical successful response observed before rollout.
 const FAST_REPLY_MAX_OUTPUT_TOKENS: u32 = 8192;
+// The Knowledge Agent previously used the same effective 8k provider default without an explicit
+// bound. Supplying that unchanged ceiling opts DeepSeek into strict JSON mode and disables hidden
+// reasoning, which production traces showed could consume thousands of non-customer-facing tokens.
+const KNOWLEDGE_AGENT_MAX_OUTPUT_TOKENS: u32 = 8192;
 pub(crate) const LIGHT_REVIEWER_MAX_OUTPUT_TOKENS: u32 = 3072;
 pub(crate) const REVIEWER_MAX_OUTPUT_TOKENS: u32 = 8192;
 const CLAIM_GATE_MAX_OUTPUT_TOKENS: u32 = 3072;
@@ -245,6 +276,7 @@ const PERSONA_WORLD_STATE_MAX_OUTPUT_TOKENS: u32 = 768;
 fn critical_path_output_token_limit(prompt_key: &str) -> Option<u32> {
     match prompt_key {
         "user.reply.fast.task" => Some(FAST_REPLY_MAX_OUTPUT_TOKENS),
+        "knowledge.agent" => Some(KNOWLEDGE_AGENT_MAX_OUTPUT_TOKENS),
         "user.review.light.system" => Some(LIGHT_REVIEWER_MAX_OUTPUT_TOKENS),
         "user.review.system" => Some(REVIEWER_MAX_OUTPUT_TOKENS),
         "user.review.claim_gate" => Some(CLAIM_GATE_MAX_OUTPUT_TOKENS),
@@ -274,14 +306,7 @@ pub(crate) async fn generate_agent_json(
     // identity and a cache miss must use the same client snapshot; otherwise a
     // hot swap between lookup and call could store a new provider's response
     // under the old provider generation (or vice versa).
-    let registry_snapshot = match &state.llm_registry {
-        Some(registry) => Some(
-            registry
-                .snapshot_synced(&state.db, &state.config, workspace_id)
-                .await?,
-        ),
-        None => None,
-    };
+    let registry_snapshot = resolve_llm_registry_snapshot(state, workspace_id).await?;
     let (provider_id, provider_model, provider_generation) = registry_snapshot
         .as_ref()
         .map(|snapshot| {
@@ -482,14 +507,7 @@ pub(crate) async fn generate_agent_json_streaming(
     token_tx: tokio::sync::mpsc::UnboundedSender<String>,
 ) -> AppResult<Value> {
     let started_at = DateTime::now();
-    let registry_snapshot = match &state.llm_registry {
-        Some(registry) => Some(
-            registry
-                .snapshot_synced(&state.db, &state.config, workspace_id)
-                .await?,
-        ),
-        None => None,
-    };
+    let registry_snapshot = resolve_llm_registry_snapshot(state, workspace_id).await?;
     let (provider_id, provider_model) = registry_snapshot
         .as_ref()
         .map(|snapshot| {
@@ -925,6 +943,10 @@ mod tests {
         assert_eq!(
             super::critical_path_output_token_limit("user.reply.fast.task"),
             Some(super::FAST_REPLY_MAX_OUTPUT_TOKENS)
+        );
+        assert_eq!(
+            super::critical_path_output_token_limit("knowledge.agent"),
+            Some(super::KNOWLEDGE_AGENT_MAX_OUTPUT_TOKENS)
         );
         assert_eq!(
             super::critical_path_output_token_limit("user.review.light.system"),
