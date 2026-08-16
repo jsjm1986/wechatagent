@@ -27,6 +27,32 @@ function kindLabel(kind: string): string {
 // 禁语是安全红线，后端恒注入、无视 minInjectTier，故行内不显档位而显「恒注入」。
 const FORBIDDEN_TIER_BADGE = "恒注入";
 
+const INSERTION_LEVEL_OPTIONS = [
+  { value: "subtle", label: "轻度" },
+  { value: "contextual", label: "情境" },
+  { value: "direct", label: "直接" }
+] as const;
+
+type InsertionLevel = typeof INSERTION_LEVEL_OPTIONS[number]["value"];
+
+function toggleInsertionLevel(
+  levels: InsertionLevel[],
+  level: InsertionLevel
+): InsertionLevel[] {
+  if (levels.includes(level)) {
+    return levels.length === 1 ? levels : levels.filter((item) => item !== level);
+  }
+  return [...levels, level];
+}
+
+function insertionLevelLabel(levels?: InsertionLevel[]): string {
+  const selected = levels?.length ? levels : INSERTION_LEVEL_OPTIONS.map((option) => option.value);
+  return INSERTION_LEVEL_OPTIONS
+    .filter((option) => selected.includes(option.value))
+    .map((option) => option.label)
+    .join(" / ");
+}
+
 // 最低注入档 → 中文标签；缺失/未知按完整档（与后端 None=full 语义一致）。
 function tierLabel(tier?: string): string {
   switch (tier) {
@@ -67,6 +93,9 @@ const EMPTY_ASSET_DRAFT = {
   body: "",
   usageScene: "",
   minInjectTier: "full",
+  enabled: true,
+  allowedInsertionLevels: ["subtle", "contextual", "direct"] as InsertionLevel[],
+  usageGuidance: ""
 };
 
 export default function ContentAssetsFeature() {
@@ -270,12 +299,17 @@ function ContentAssetsWorkbench({ currentAccountId }: { currentAccountId: string
                   value={scopedDraft.kind}
                   onChange={(event) => {
                     const kind = event.target.value;
-                    // 切到禁用表达时注入档字段被隐藏（后端恒注入、无视 minInjectTier），
-                    // 同步把 draft 值归位默认档，避免残留上次所选档位落库（死字段、不整洁）。
                     setAssetDraft(
                       currentAccountId,
                       kind === "forbidden_expression"
-                        ? { ...scopedDraft, kind, minInjectTier: "full" }
+                        ? {
+                            ...scopedDraft,
+                            kind,
+                            minInjectTier: "full",
+                            enabled: false,
+                            allowedInsertionLevels: ["subtle", "contextual", "direct"],
+                            usageGuidance: ""
+                          }
                         : { ...scopedDraft, kind }
                     );
                   }}
@@ -310,19 +344,57 @@ function ContentAssetsWorkbench({ currentAccountId }: { currentAccountId: string
                 />
               </label>
               {scopedDraft.kind !== "forbidden_expression" && (
-                <label className={styles.field}>
-                  <span className={styles.fieldLabel}>最低注入档</span>
-                  <select
-                    className={styles.select}
-                    value={scopedDraft.minInjectTier}
-                    onChange={(event) => setAssetDraft(currentAccountId, { ...scopedDraft, minInjectTier: event.target.value })}
-                  >
-                    <option value="lean">精简档（任何对话都注入，最常生效）</option>
-                    <option value="relational">关系档（进入关系经营时注入）</option>
-                    <option value="full">完整档（仅深入业务时注入）</option>
-                  </select>
-                  <span className={styles.hint}>核心禁语/口吻选精简档时刻生效；重型话术/长 FAQ 选完整档。</span>
-                </label>
+                <>
+                  <label className={styles.field}>
+                    <span className={styles.fieldLabel}>最低注入档</span>
+                    <select
+                      className={styles.select}
+                      value={scopedDraft.minInjectTier}
+                      onChange={(event) => setAssetDraft(currentAccountId, { ...scopedDraft, minInjectTier: event.target.value })}
+                    >
+                      <option value="lean">精简档（任何对话都注入，最常生效）</option>
+                      <option value="relational">关系档（进入关系经营时注入）</option>
+                      <option value="full">完整档（仅深入业务时注入）</option>
+                    </select>
+                  </label>
+                  <label className={styles.checkboxField}>
+                    <input
+                      type="checkbox"
+                      checked={scopedDraft.enabled}
+                      onChange={(event) => setAssetDraft(currentAccountId, { ...scopedDraft, enabled: event.target.checked })}
+                    />
+                    <span>启用文本资产</span>
+                  </label>
+                  <fieldset className={styles.levelFieldset}>
+                    <legend className={styles.fieldLabel}>允许植入强度</legend>
+                    <div className={styles.levelOptions}>
+                      {INSERTION_LEVEL_OPTIONS.map((option) => (
+                        <label className={styles.checkboxField} key={option.value}>
+                          <input
+                            type="checkbox"
+                            checked={scopedDraft.allowedInsertionLevels.includes(option.value)}
+                            onChange={() => setAssetDraft(currentAccountId, {
+                              ...scopedDraft,
+                              allowedInsertionLevels: toggleInsertionLevel(
+                                scopedDraft.allowedInsertionLevels as InsertionLevel[],
+                                option.value
+                              )
+                            })}
+                          />
+                          <span>{option.label}</span>
+                        </label>
+                      ))}
+                    </div>
+                  </fieldset>
+                  <label className={styles.field}>
+                    <span className={styles.fieldLabel}>使用指引</span>
+                    <textarea
+                      className={styles.textareaCompact}
+                      value={scopedDraft.usageGuidance}
+                      onChange={(event) => setAssetDraft(currentAccountId, { ...scopedDraft, usageGuidance: event.target.value })}
+                    />
+                  </label>
+                </>
               )}
               <button className={styles.submit} type="submit" disabled={busy || !scopedDraft.title.trim()}>
                 保存资产
@@ -450,12 +522,26 @@ function TextAssetRow({
   const [editBody, setEditBody] = useState(asset.body ?? "");
   const [editUsageScene, setEditUsageScene] = useState(asset.usageScene ?? "");
   const [editTier, setEditTier] = useState(asset.minInjectTier ?? "full");
+  const [editEnabled, setEditEnabled] = useState(asset.enabled === true);
+  const [editInsertionLevels, setEditInsertionLevels] = useState<InsertionLevel[]>(
+    asset.allowedInsertionLevels?.length
+      ? asset.allowedInsertionLevels
+      : ["subtle", "contextual", "direct"]
+  );
+  const [editUsageGuidance, setEditUsageGuidance] = useState(asset.usageGuidance ?? "");
 
   const openEdit = () => {
     setEditTitle(asset.title);
     setEditBody(asset.body ?? "");
     setEditUsageScene(asset.usageScene ?? "");
     setEditTier(asset.minInjectTier ?? "full");
+    setEditEnabled(asset.enabled === true);
+    setEditInsertionLevels(
+      asset.allowedInsertionLevels?.length
+        ? asset.allowedInsertionLevels
+        : ["subtle", "contextual", "direct"]
+    );
+    setEditUsageGuidance(asset.usageGuidance ?? "");
     setEditing(true);
   };
 
@@ -464,7 +550,10 @@ function TextAssetRow({
       title: editTitle.trim(),
       body: editBody,
       usageScene: editUsageScene,
-      minInjectTier: editTier
+      minInjectTier: editTier,
+      enabled: editEnabled,
+      allowedInsertionLevels: editInsertionLevels,
+      usageGuidance: editUsageGuidance
     });
     setEditing(false);
   };
@@ -487,6 +576,14 @@ function TextAssetRow({
           <span className={styles.kind}>
             {asset.kind === "forbidden_expression" ? FORBIDDEN_TIER_BADGE : tierLabel(asset.minInjectTier)}
           </span>
+          {asset.kind !== "forbidden_expression" && (
+            <>
+              <span className={styles.kind}>{asset.enabled === true ? "已启用" : "已停用"}</span>
+              <span className={styles.kind}>
+                {insertionLevelLabel(asset.allowedInsertionLevels)}
+              </span>
+            </>
+          )}
         </span>
       </div>
       <p className={styles.body}>{asset.body || asset.usageScene || "暂无内容"}</p>
@@ -538,18 +635,53 @@ function TextAssetRow({
             />
           </label>
           {asset.kind !== "forbidden_expression" && (
-            <label className={styles.field}>
-              <span className={styles.fieldLabel}>最低注入档</span>
-              <select
-                className={styles.select}
-                value={editTier}
-                onChange={(event) => setEditTier(event.target.value)}
-              >
-                <option value="lean">精简档（任何对话都注入，最常生效）</option>
-                <option value="relational">关系档（进入关系经营时注入）</option>
-                <option value="full">完整档（仅深入业务时注入）</option>
-              </select>
-            </label>
+            <>
+              <label className={styles.field}>
+                <span className={styles.fieldLabel}>最低注入档</span>
+                <select
+                  className={styles.select}
+                  value={editTier}
+                  onChange={(event) => setEditTier(event.target.value)}
+                >
+                  <option value="lean">精简档（任何对话都注入，最常生效）</option>
+                  <option value="relational">关系档（进入关系经营时注入）</option>
+                  <option value="full">完整档（仅深入业务时注入）</option>
+                </select>
+              </label>
+              <label className={styles.checkboxField}>
+                <input
+                  type="checkbox"
+                  checked={editEnabled}
+                  onChange={(event) => setEditEnabled(event.target.checked)}
+                />
+                <span>启用文本资产</span>
+              </label>
+              <fieldset className={styles.levelFieldset}>
+                <legend className={styles.fieldLabel}>允许植入强度</legend>
+                <div className={styles.levelOptions}>
+                  {INSERTION_LEVEL_OPTIONS.map((option) => (
+                    <label className={styles.checkboxField} key={option.value}>
+                      <input
+                        type="checkbox"
+                        checked={editInsertionLevels.includes(option.value)}
+                        onChange={() => setEditInsertionLevels((levels) =>
+                          toggleInsertionLevel(levels, option.value)
+                        )}
+                      />
+                      <span>{option.label}</span>
+                    </label>
+                  ))}
+                </div>
+              </fieldset>
+              <label className={styles.field}>
+                <span className={styles.fieldLabel}>使用指引</span>
+                <textarea
+                  className={styles.textareaCompact}
+                  value={editUsageGuidance}
+                  onChange={(event) => setEditUsageGuidance(event.target.value)}
+                />
+              </label>
+            </>
           )}
           <button
             className={styles.reviewBtn}

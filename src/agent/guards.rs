@@ -131,6 +131,19 @@ pub(crate) fn action_policy_state_key(
         .map(ToString::to_string)
 }
 
+/// Resolve the single send-authorized operation-state candidate. Projection-only fields such as
+/// `customer_stage` are deliberately excluded: the send-critical protocol clears them before the
+/// first commit, and a post-delivery analytical model must never create an operational side effect.
+/// Centralizing this boundary prevents policy authorization from depending on deferred projection
+/// output.
+pub(crate) fn decision_operation_state_candidate(decision: &AgentDecision) -> Option<&str> {
+    decision
+        .operation_state
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
 pub(crate) fn operation_states(domain_config: Option<&OperationDomainConfig>) -> Vec<Document> {
     domain_config
         .and_then(|config| config.state_machine.get_array("states").ok())
@@ -261,6 +274,7 @@ pub(crate) const OPERATION_STATE_ACTION_VALUES: &[&str] = &[
     "silent",
     "follow_up",
     "cooldown",
+    "appointment_request",
 ];
 
 /// Phase B / B4：把一个 [`AgentDecision`] 归一到一个 action 类型字符串。
@@ -291,6 +305,13 @@ pub fn classify_decision_action(decision: &AgentDecision) -> &'static str {
         .unwrap_or(false)
     {
         return "cooldown";
+    }
+    if decision
+        .appointment_request
+        .as_ref()
+        .is_some_and(|request| request.requested)
+    {
+        return "appointment_request";
     }
     "silent"
 }
@@ -332,6 +353,10 @@ pub(crate) fn classify_reviewed_decision_action(
         && decision.assets_to_send.is_empty()
         && decision.namecard_to_send.is_none()
         && decision
+            .appointment_request
+            .as_ref()
+            .is_none_or(|request| !request.requested)
+        && decision
             .escalation_request
             .as_ref()
             .is_none_or(|request| !request.needed);
@@ -358,6 +383,64 @@ pub(crate) fn classify_reviewed_decision_action(
     } else {
         "reply"
     }
+}
+
+/// Return every state-machine action represented by a reviewed decision.
+///
+/// A decision can contain more than one durable effect (for example a reply and an appointment
+/// request).  The legacy `classify_reviewed_decision_action` API intentionally returns the
+/// primary communication action for callers that only need a label; enforcement paths must use
+/// this complete projection so a side effect cannot hide behind an otherwise safe reply.
+pub(crate) fn reviewed_decision_actions(
+    decision: &AgentDecision,
+    review: &DecisionReviewResult,
+) -> Vec<&'static str> {
+    let mut actions = Vec::with_capacity(4);
+    let mut push_unique = |action| {
+        if !actions.contains(&action) {
+            actions.push(action);
+        }
+    };
+    push_unique(classify_reviewed_decision_action(decision, review));
+    // These fields are independent durable effects. Project them individually so a safe reply
+    // cannot hide a forbidden follow-up, cooldown, or appointment request.
+    if decision
+        .follow_up
+        .as_ref()
+        .is_some_and(|follow_up| follow_up.needed)
+    {
+        push_unique("follow_up");
+    }
+    if decision
+        .cooldown_until
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        push_unique("cooldown");
+    }
+    if decision
+        .appointment_request
+        .as_ref()
+        .is_some_and(|request| request.requested)
+    {
+        push_unique("appointment_request");
+    }
+    actions
+}
+
+/// Enforce every action represented by a reviewed decision against one operation-state policy.
+/// The first deterministic failure is returned so existing audit/status plumbing remains stable.
+pub(crate) fn enforce_reviewed_decision_actions(
+    policy: Option<&OperationStatePolicy>,
+    decision: &AgentDecision,
+    review: &DecisionReviewResult,
+) -> Result<(), (&'static str, String)> {
+    for action in reviewed_decision_actions(decision, review) {
+        if let Err(reason) = enforce_state_action_policy(policy, action) {
+            return Err((action, reason));
+        }
+    }
+    Ok(())
 }
 
 /// Phase B / B4：用 `operation_state_policies` 行校验候选 action 是否被允许。
@@ -481,7 +564,7 @@ pub(crate) fn compute_verified_chunks<'a>(
 mod policy_tests {
     //! Phase B / B4：`classify_decision_action` + `enforce_state_action_policy` 单测。
     use super::*;
-    use crate::agent::types::FollowUpDecision;
+    use crate::agent::types::{AppointmentRequestDecision, FollowUpDecision};
     use crate::models::OperationStatePolicy;
     use mongodb::bson::DateTime;
 
@@ -516,6 +599,14 @@ mod policy_tests {
                 "responseDisposition": disposition,
             },
         };
+    }
+
+    fn appointment_request() -> AppointmentRequestDecision {
+        AppointmentRequestDecision {
+            requested: true,
+            request_text: "客户希望预约到院面诊".to_string(),
+            ..AppointmentRequestDecision::default()
+        }
     }
 
     fn safe_ack_review() -> DecisionReviewResult {
@@ -649,6 +740,14 @@ mod policy_tests {
             classify_reviewed_decision_action(&decision, &safe_ack_review()),
             "reply"
         );
+
+        decision.follow_up = None;
+        decision.appointment_request = Some(appointment_request());
+        assert_eq!(
+            classify_reviewed_decision_action(&decision, &safe_ack_review()),
+            "reply",
+            "a durable appointment write cannot be classified as a side-effect-free acknowledgement"
+        );
     }
 
     #[test]
@@ -662,6 +761,55 @@ mod policy_tests {
     fn classify_silent_when_no_signals() {
         let d = AgentDecision::default();
         assert_eq!(classify_decision_action(&d), "silent");
+    }
+
+    #[test]
+    fn classify_appointment_only_as_appointment_request() {
+        let mut decision = AgentDecision::default();
+        decision.appointment_request = Some(appointment_request());
+        assert_eq!(classify_decision_action(&decision), "appointment_request");
+        assert_eq!(
+            reviewed_decision_actions(&decision, &DecisionReviewResult::default()),
+            vec!["appointment_request"]
+        );
+    }
+
+    #[test]
+    fn reviewed_actions_include_reply_and_appointment_side_effect() {
+        let mut decision = mk_decision_reply();
+        decision.appointment_request = Some(appointment_request());
+        assert_eq!(
+            reviewed_decision_actions(&decision, &safe_ack_review()),
+            vec!["reply", "appointment_request"]
+        );
+
+        let policy = mk_policy("guarded", &["reply"], &[]);
+        let (action, error) =
+            enforce_reviewed_decision_actions(Some(&policy), &decision, &safe_ack_review())
+                .expect_err("appointment action must be checked independently");
+        assert_eq!(action, "appointment_request");
+        assert!(error.contains("action=appointment_request"));
+    }
+
+    #[test]
+    fn reviewed_actions_project_all_independent_durable_effects() {
+        let mut decision = mk_decision_reply();
+        decision.follow_up = Some(FollowUpDecision {
+            needed: true,
+            ..Default::default()
+        });
+        decision.cooldown_until = Some("2030-01-01T00:00:00Z".to_string());
+        decision.appointment_request = Some(appointment_request());
+        assert_eq!(
+            reviewed_decision_actions(&decision, &safe_ack_review()),
+            vec!["reply", "follow_up", "cooldown", "appointment_request"]
+        );
+
+        let policy = mk_policy("guarded", &["reply", "follow_up"], &[]);
+        let (action, _) =
+            enforce_reviewed_decision_actions(Some(&policy), &decision, &safe_ack_review())
+                .expect_err("cooldown and appointment must not hide behind reply");
+        assert_eq!(action, "cooldown");
     }
 
     #[test]
@@ -765,6 +913,22 @@ mod policy_tests {
                 "proposal={proposed}"
             );
         }
+    }
+
+    #[test]
+    fn decision_state_candidate_uses_only_send_authorized_operation_state() {
+        let mut decision = mk_decision_reply();
+        decision.operation_state = Some("need_discovery".to_string());
+        decision
+            .domain_signals
+            .insert("customer_stage", "relationship_building");
+        assert_eq!(
+            decision_operation_state_candidate(&decision),
+            Some("need_discovery")
+        );
+
+        decision.operation_state = None;
+        assert_eq!(decision_operation_state_candidate(&decision), None);
     }
 }
 

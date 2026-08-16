@@ -80,6 +80,12 @@ fn structured(id: &str, text: &str, due_at: Option<DateTime>) -> CommitmentRepr 
         text: text.to_string(),
         due_at,
         created_at: DateTime::now(),
+        status: "active".to_string(),
+        fulfilled_at: None,
+        cancelled_at: None,
+        superseded_by: None,
+        source_id: None,
+        related_entity_id: None,
         extra: Document::new(),
     })
 }

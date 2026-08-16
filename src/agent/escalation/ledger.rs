@@ -4,8 +4,8 @@
 use super::logic::{is_duplicate_key_error, is_pending_dedupe_conflict, short_code_from_seed};
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    AgentPrincipalEscalation, AgentTask, AskHumanPolicy, OperationDomainConfig,
-    OperationKnowledgeChunk, PrincipalDecision, PrincipalEscalationProtocol,
+    AgentPrincipalEscalation, AgentTask, AskHumanPolicy, AuthorityObservation,
+    OperationDomainConfig, OperationKnowledgeChunk, PrincipalDecision, PrincipalEscalationProtocol,
     ALLOWED_ESCALATION_CATEGORY, PRINCIPAL_CARD_DELIVERY_FAILED_TERMINAL,
     PRINCIPAL_CARD_DELIVERY_PENDING_ENQUEUE, PRINCIPAL_CARD_DELIVERY_QUEUED,
     PRINCIPAL_CARD_DELIVERY_SENT, PRINCIPAL_CARD_DELIVERY_UNKNOWN,
@@ -650,18 +650,74 @@ pub(crate) async fn resolve_escalation(
             );
         }
     }
-    let updated = state
-        .db
-        .agent_principal_escalations()
-        .find_one_and_update(
-            filter,
-            doc! { "$set": set },
-            mongodb::options::FindOneAndUpdateOptions::builder()
-                .return_document(mongodb::options::ReturnDocument::After)
-                .build(),
-        )
+    // The resolved ledger row and the authority observation are one authority-bearing state
+    // transition. If either write fails, neither is committed; the relay reconciler can safely
+    // retry the still-pending escalation instead of exposing a decision without provenance.
+    let mut session = state.db.client().start_session(None).await?;
+    session
+        .start_transaction(TransactionOptions::builder().build())
         .await?;
+    let transaction_result: AppResult<Option<AgentPrincipalEscalation>> = async {
+        let updated = state
+            .db
+            .agent_principal_escalations()
+            .find_one_and_update_with_session(
+                filter,
+                doc! { "$set": set },
+                mongodb::options::FindOneAndUpdateOptions::builder()
+                    .return_document(mongodb::options::ReturnDocument::After)
+                    .build(),
+                &mut session,
+            )
+            .await?;
+        if let Some(resolved) = updated.as_ref() {
+            crate::agent::authority::record_authority_observation_with_session(
+                &state.db,
+                &mut session,
+                AuthorityObservation {
+                    id: Some(ObjectId::new()),
+                    workspace_id: resolved.workspace_id.clone(),
+                    account_id: resolved.account_id.clone(),
+                    contact_wxid: resolved.contact_wxid.clone(),
+                    source_type: "principal_decision".to_string(),
+                    source_id: escalation_id.to_hex(),
+                    subject: "business".to_string(),
+                    content: format!(
+                        "verdict={}; substance={}; constraints={}",
+                        decision.verdict,
+                        decision.substance,
+                        if decision.constraints.is_empty() {
+                            "none".to_string()
+                        } else {
+                            decision.constraints.join("; ")
+                        }
+                    ),
+                    authority_boundary: "Authorizes only the exact principal decision substance and listed constraints for this escalation; it does not become general knowledge or authorize unrelated prices, schedules, outcomes, or services.".to_string(),
+                    valid_from: Some(now),
+                    valid_until: authorization_expires_at,
+                    status: "active".to_string(),
+                    superseded_by: None,
+                    source_run_id: None,
+                    created_at: now,
+                    updated_at: now,
+                },
+            )
+            .await?;
+        }
+        Ok(updated)
+    }
+    .await;
+    let updated = match transaction_result {
+        Ok(updated) => updated,
+        Err(error) => {
+            let _ = session.abort_transaction().await;
+            return Err(error);
+        }
+    };
+    crate::knowledge_wiki::chunk_revisions::commit_chunk_transaction(&mut session).await?;
     if let Some(resolved) = updated.as_ref() {
+        // Task materialization is deliberately after the authority transaction. A crash here
+        // leaves relay_state=pending, which the existing reconciler can materialize idempotently.
         materialize_relay_task(state, resolved).await?;
     }
     Ok(updated)

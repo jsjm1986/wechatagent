@@ -174,6 +174,44 @@ fn known_usage() -> ChatUsage {
     }
 }
 
+fn empty_projection_json() -> serde_json::Value {
+    json!({
+        "profileUpdate": null,
+        "tags": [],
+        "tagEvidenceTurns": [],
+        "stageEvidenceTurns": [],
+        "stageExplicitIntent": false,
+        "bayesianObservations": [],
+        "customerStage": null,
+        "intentLevel": null,
+        "domainSignals": {},
+        "dimensionDisplayNames": {},
+        "followUpPolicy": null,
+        "profileAttributes": {},
+        "nextBestAction": {},
+        "objectionsDetected": [],
+        "operatingMemoryUpdate": {},
+        "memoryCandidates": [],
+        "memoryWriteScore": 0,
+        "consolidationNeeded": false,
+        "memoryUpdate": "",
+        "agentGeneratedSignals": []
+    })
+}
+
+fn fact_projection_json(content: &str, evidence: &str) -> serde_json::Value {
+    let mut projection = empty_projection_json();
+    projection["memoryCandidates"] = json!([{
+        "type": "fact",
+        "content": content,
+        "evidence": evidence,
+        "importance": 8,
+        "confidence": 9
+    }]);
+    projection["memoryWriteScore"] = json!(8);
+    projection
+}
+
 fn revision_reply_json(reply_text: &str) -> serde_json::Value {
     json!({
         "decisionPhase": "final",
@@ -352,6 +390,8 @@ async fn simulation_has_no_business_side_effects() {
         .push_response_with_usage(review_pass_json(), known_usage());
     app.llm
         .push_response_with_usage(common::independent_claim_gate_pass_json(), known_usage());
+    app.llm
+        .push_response_with_usage(empty_projection_json(), known_usage());
 
     let turns = simulate_user_dialogue(&app.state, contact, vec!["你好".to_string()])
         .await
@@ -394,7 +434,11 @@ async fn simulation_has_no_business_side_effects() {
         .try_collect()
         .await
         .expect("collect shadow llm logs");
-    assert_eq!(logs.len(), 3, "Reply、Review、ClaimGate 应各留一条成本日志");
+    assert_eq!(
+        logs.len(),
+        4,
+        "Reply、Review、ClaimGate、Projection 应各留一条成本日志"
+    );
     assert!(logs
         .iter()
         .all(|log| log.get_str("run_mode") == Ok("shadow")));
@@ -418,6 +462,7 @@ async fn simulation_runs_single_shot_revision_and_rechecks_candidate() {
     app.llm.push_response(revision_review_json(true));
     app.llm
         .push_response(common::independent_claim_gate_pass_json());
+    app.llm.push_response(empty_projection_json());
     app.llm
         .push_response(revision_reply_json("收到，我先顺着你刚才的重点聊。"));
     app.llm.push_response(revision_review_json(false));
@@ -438,8 +483,8 @@ async fn simulation_runs_single_shot_revision_and_rechecks_candidate() {
     );
     assert_eq!(
         app.llm.calls(),
-        6,
-        "首稿和二稿各应完整执行 Reply + Review + ClaimGate"
+        7,
+        "首稿和二稿各应完整执行 Reply + Review + ClaimGate，最终再执行 Projection"
     );
 
     app.cleanup().await;
@@ -470,6 +515,7 @@ async fn simulation_rewrites_unsupported_business_claim_before_finalize() {
     app.llm.push_response(revision_review_json(false));
     app.llm
         .push_response(common::independent_claim_gate_pass_json());
+    app.llm.push_response(empty_projection_json());
 
     let turns = simulate_user_dialogue(&app.state, contact, vec!["明天下午能安排吗？".to_string()])
         .await
@@ -478,8 +524,8 @@ async fn simulation_rewrites_unsupported_business_claim_before_finalize() {
     assert_eq!(turns[0].status, "would_send");
     assert_eq!(
         app.llm.calls(),
-        6,
-        "定向改写后必须重新执行 Reply + Review + ClaimGate"
+        7,
+        "定向改写后必须重新执行 Reply + Review + ClaimGate，最终再执行 Projection"
     );
     assert!(!turns[0].reply_text.contains(unsupported));
     assert_eq!(
@@ -597,6 +643,7 @@ async fn simulation_semantic_matrix_runs_full_independent_chain_without_keyword_
             case.assertion_status,
             case.response_disposition,
         ));
+        app.llm.push_response(empty_projection_json());
     }
 
     let turns = simulate_user_dialogue(
@@ -610,8 +657,8 @@ async fn simulation_semantic_matrix_runs_full_independent_chain_without_keyword_
     assert_eq!(turns.len(), cases.len());
     assert_eq!(
         app.llm.calls(),
-        cases.len() * 3,
-        "每个可发送候选都必须执行 Reply + Reviewer + ClaimGate"
+        cases.len() * 4,
+        "每个可发送候选都必须执行 Reply + Reviewer + ClaimGate + Projection"
     );
     for (turn, case) in turns.iter().zip(&cases) {
         assert_eq!(turn.status, "would_send", "inbound={}", case.inbound);
@@ -644,6 +691,72 @@ async fn simulation_semantic_matrix_runs_full_independent_chain_without_keyword_
 
     let after = business_snapshot(&app).await;
     assert_eq!(before, after, "多轮 Shadow 语义矩阵不得产生业务副作用");
+
+    app.cleanup().await;
+}
+
+/// Projection is part of the simulated loop rather than a detached display artifact. A fact
+/// extracted after one authorized turn must be present in the next turn's context pack, while the
+/// durable business collections remain unchanged.
+#[tokio::test]
+#[ignore]
+async fn simulation_carries_authorized_projection_into_the_next_turn() {
+    let app = TestApp::start().await;
+    let ws = app.state.config.default_workspace_id.clone();
+    let acc = app.state.config.default_account_id.clone();
+    let contact = managed_contact(&ws, &acc, "wx_sim_projection_loop");
+    let before = business_snapshot(&app).await;
+    let remembered = "客户明确表示平时只有周末方便沟通";
+
+    for (index, reply) in ["明白，我记下了。", "好，那我们按你的节奏来。"]
+        .into_iter()
+        .enumerate()
+    {
+        app.llm.push_response(semantic_reply_json(
+            reply,
+            "statement",
+            "customer",
+            "asserted",
+            "acknowledgement",
+            "casual_relationship",
+        ));
+        app.llm.push_response(review_pass_json());
+        app.llm.push_response(semantic_claim_gate_pass_json(
+            "statement",
+            "customer",
+            "asserted",
+            "acknowledgement",
+        ));
+        app.llm.push_response(if index == 0 {
+            fact_projection_json(remembered, "我平时只有周末方便聊")
+        } else {
+            empty_projection_json()
+        });
+    }
+
+    let turns = simulate_user_dialogue(
+        &app.state,
+        contact,
+        vec![
+            "我平时只有周末方便聊".to_string(),
+            "那就先这样，周末再说".to_string(),
+        ],
+    )
+    .await
+    .expect("multi-turn projection simulation must complete");
+
+    assert_eq!(turns.len(), 2);
+    assert_eq!(turns[0].memory_preview.get_str("status"), Ok("applied"));
+    assert!(turns[1]
+        .context_pack
+        .get_array("recentFacts")
+        .is_ok_and(|facts| facts.iter().any(|fact| fact.as_str() == Some(remembered))));
+    assert_eq!(app.llm.calls(), 8);
+    assert_eq!(
+        before,
+        business_snapshot(&app).await,
+        "in-memory projection must not persist business state"
+    );
 
     app.cleanup().await;
 }

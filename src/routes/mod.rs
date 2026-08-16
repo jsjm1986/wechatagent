@@ -30,6 +30,7 @@ mod admin_taxonomies;
 mod admin_taxonomy_candidates;
 // pub（非 pub(crate)）：ask_human_phase1_e2e.rs 集成测试需从 tests/ crate 直调
 // ask_human_inbox / ask_human_summary handler 真函数，仿 domain_profiles 已有先例。
+pub mod appointments;
 pub mod ask_human_inbox;
 // pub（非默认私有）：structured_organization_integration.rs 集成测试需从 tests/
 // crate 直调 list_content_assets handler 真函数（缺口 8 tags 检索 + workspace 隔离），
@@ -165,6 +166,10 @@ use admin_suspected_deals::{approve_suspected_deal, list_suspected_deals, reject
 use admin_taxonomies::{create_taxonomy, delete_taxonomy, list_taxonomies, patch_taxonomy};
 use admin_taxonomy_candidates::{
     approve_taxonomy_candidate, list_taxonomy_candidates, reject_taxonomy_candidate,
+};
+use appointments::{
+    create_appointment, get_appointment, list_appointments, transition_appointment,
+    update_appointment,
 };
 use ask_human_inbox::{ask_human_inbox, ask_human_summary};
 use assets::{create_content_asset, list_content_assets};
@@ -394,6 +399,15 @@ pub fn api_router(state: AppState) -> Router<AppState> {
             post(run_contact_memory_consolidation),
         )
         .route("/contacts/:id/operation-health", get(get_operation_health))
+        .route(
+            "/appointments",
+            get(list_appointments).post(create_appointment),
+        )
+        .route(
+            "/appointments/:id",
+            get(get_appointment).patch(update_appointment),
+        )
+        .route("/appointments/:id/transition", post(transition_appointment))
         .route(
             "/user-operations/guide/preview",
             post(preview_user_operation_guide),
@@ -1091,6 +1105,7 @@ mod tests {
             include_str!("admin_relationship_suggestions.rs"),
             include_str!("admin_suspected_deals.rs"),
             include_str!("ask_human_inbox.rs"),
+            include_str!("appointments.rs"),
             include_str!("assets.rs"),
             include_str!("auth.rs"),
             include_str!("behavior_signal_metrics.rs"),

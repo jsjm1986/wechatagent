@@ -74,6 +74,20 @@
 }
 .input { height: 40px; }
 .textarea { min-height: 120px; resize: vertical; line-height: 1.55; }
+.textareaCompact {
+  font: inherit;
+  font-size: 13px;
+  width: 100%;
+  min-height: 76px;
+  resize: vertical;
+  line-height: 1.55;
+  color: var(--ink-1);
+  border-radius: var(--r-sm);
+  border: 1px solid var(--hairline);
+  background: var(--surface-card);
+  padding: 10px 12px;
+  outline: none;
+}
 .select { height: 40px; cursor: pointer; }
 .input:focus,
 .textarea:focus,
@@ -112,6 +126,8 @@
 .checkboxField { display: flex; align-items: center; gap: 8px; }
 .checkboxField input { width: 16px; height: 16px; }
 .checkboxField span { font-size: 12.5px; color: var(--ink-2); }
+.levelFieldset { margin: 0; padding: 0; border: 0; min-width: 0; }
+.levelOptions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 7px; }
 
 /* 文件选择行 */
 .fileInput { font-size: 12.5px; color: var(--ink-2); }

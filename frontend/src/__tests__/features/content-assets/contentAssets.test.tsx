@@ -40,7 +40,10 @@ describe("ContentAssetsFeature", () => {
         title: "",
         body: "",
         usageScene: "",
-        minInjectTier: "full"
+        minInjectTier: "full",
+        enabled: true,
+        allowedInsertionLevels: ["subtle", "contextual", "direct"],
+        usageGuidance: ""
       },
       assetDraftAccountId: "test123",
       setAssetDraft: vi.fn(),
@@ -136,7 +139,16 @@ describe("ContentAssetsFeature", () => {
     expect(editAssetMeta).toHaveBeenCalledTimes(1);
     const fields = vi.mocked(editAssetMeta).mock.calls[0][1] as Record<string, unknown>;
     expect(fields).toHaveProperty("minInjectTier", "lean");
+    expect(fields).toHaveProperty("enabled", false);
+    expect(fields).toHaveProperty("allowedInsertionLevels");
     expect(fields).toHaveProperty("title", "测试FAQ资产");
+  });
+
+  it("exposes text governance controls without applying them to forbidden assets", () => {
+    render(<ContentAssetsFeature />);
+    expect(screen.getAllByText("允许植入强度").length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText("使用指引").length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText("已停用").length).toBeGreaterThanOrEqual(1);
   });
 
   // B：删除按钮经 window.confirm 确认后调用 deleteAsset

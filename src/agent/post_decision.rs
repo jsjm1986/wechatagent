@@ -16,6 +16,13 @@ use crate::error::{AppError, AppResult};
 use crate::models::{ConversationMessage, MessageDirection, OperationDomainConfig};
 use crate::routes::AppState;
 
+use super::decision::{
+    load_operation_state_policy_for_contact, load_user_operation_domain_config_for_contact,
+};
+use super::guards::{
+    action_policy_state_key, check_state_transition, enforce_state_action_policy,
+    initial_operation_state_key,
+};
 use super::runtime::UserRuntimeParameters;
 use super::types::{AgentDecision, DecisionReviewResult, DeferredProjectionDecision};
 
@@ -318,6 +325,94 @@ fn projection_user_payload(
     ))
 }
 
+/// Generate the same deferred projection used by the durable worker without creating or
+/// updating a review row. Simulation uses this entry point to carry analytical state between
+/// turns while keeping every production collection untouched.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn generate_projection_read_only(
+    state: &AppState,
+    decision: &AgentDecision,
+    memory: &crate::models::OperatingMemory,
+    context_pack: &Document,
+    domain_config: Option<&OperationDomainConfig>,
+    active_profile: &crate::models::DomainProfile,
+    active_products: &[crate::models::Product],
+    ascending_window: &[ConversationMessage],
+    contact: &crate::models::Contact,
+    run_id: &str,
+) -> AppResult<DeferredProjectionDecision> {
+    let payload = doc! {
+        "authorized_decision": compact_authorized_decision(decision),
+        "memory_snapshot": compact_memory_snapshot(memory)?,
+        "context_pack": context_pack.clone(),
+        "domain_config": domain_config.map(to_bson).transpose()?.unwrap_or(Bson::Null),
+        "active_profile": to_bson(active_profile)?,
+        "active_products": to_bson(&active_products.iter().take(MAX_SNAPSHOT_PRODUCTS).cloned().collect::<Vec<_>>())?,
+        "contact_snapshot": compact_contact_snapshot(contact)?,
+        "product_snapshot": to_bson(&compact_products(active_products)?)?,
+        "ascending_window": to_bson(&compact_messages(ascending_window))?,
+        "locale": contact.locale.clone().map(Bson::from).unwrap_or(Bson::Null),
+        "run_id": run_id,
+    };
+    ensure_snapshot_size(state, &payload)?;
+
+    let locale = contact.locale.as_deref();
+    let (system, task) = tokio::join!(
+        crate::prompts::load_prompt_for_contact(
+            &state.db,
+            &contact.workspace_id,
+            "user.projection.system",
+            &contact.wxid,
+            locale,
+        ),
+        crate::prompts::load_prompt_for_contact(
+            &state.db,
+            &contact.workspace_id,
+            "user.projection.task",
+            &contact.wxid,
+            locale,
+        ),
+    );
+    let (system, _) = system?;
+    let (task, _) = task?;
+    let guidance = super::entitlements::render_relationship_type_suggestion_guidance();
+    let fixed_chars = system
+        .chars()
+        .count()
+        .saturating_add(task.chars().count())
+        .saturating_add(guidance.chars().count())
+        .saturating_add(32);
+    let input_budget = state
+        .config
+        .post_decision_prompt_max_chars
+        .saturating_sub(fixed_chars);
+    if input_budget < 512 {
+        return Err(payload_error(
+            "projection prompt too large",
+            format!(
+                "fixed prompts consume {fixed_chars} chars of {}",
+                state.config.post_decision_prompt_max_chars
+            ),
+        ));
+    }
+    let (projection_input, _) = projection_user_payload(&payload, input_budget)?;
+    let user = format!("{task}{guidance}\n\n冻结输入：\n{projection_input}");
+    let child_run_id = format!("{run_id}:projection");
+    let raw = super::generate_agent_json(
+        state,
+        &contact.workspace_id,
+        Some(&contact.account_id),
+        Some(&contact.wxid),
+        Some(&child_run_id),
+        "user.projection.task",
+        &system,
+        &user,
+    )
+    .await?;
+    DeferredProjectionDecision::from_value(raw)
+        .map_err(|error| payload_error("validate projection result", error))
+}
+
 async fn load_or_freeze_projection_prompts(
     state: &AppState,
     review_id: ObjectId,
@@ -529,6 +624,48 @@ async fn guard_projection_taxonomy(
     decision: &mut AgentDecision,
     run_id: &str,
 ) -> AppResult<()> {
+    guard_projection_taxonomy_inner(
+        state,
+        contact,
+        domain_config,
+        active_profile,
+        decision,
+        Some(run_id),
+    )
+    .await
+}
+
+/// Apply the projection taxonomy contract without emitting taxonomy candidates. Simulation uses
+/// the normalized decision only as an in-memory preview, so candidate writes would violate its
+/// no-side-effect boundary.
+pub(crate) async fn normalize_projection_read_only(
+    state: &AppState,
+    contact: &crate::models::Contact,
+    domain_config: Option<&OperationDomainConfig>,
+    active_profile: &crate::models::DomainProfile,
+    projection: DeferredProjectionDecision,
+) -> AppResult<AgentDecision> {
+    let mut decision = projection.into_agent_decision();
+    guard_projection_taxonomy_inner(
+        state,
+        contact,
+        domain_config,
+        active_profile,
+        &mut decision,
+        None,
+    )
+    .await?;
+    Ok(decision)
+}
+
+async fn guard_projection_taxonomy_inner(
+    state: &AppState,
+    contact: &crate::models::Contact,
+    domain_config: Option<&OperationDomainConfig>,
+    active_profile: &crate::models::DomainProfile,
+    decision: &mut AgentDecision,
+    persist_candidate_run_id: Option<&str>,
+) -> AppResult<()> {
     let cache = super::taxonomy::global_taxonomy_cache(&state.db);
     cache.find_or_load(&state.db, &contact.workspace_id).await?;
     let dimension_kinds = super::domain_profile::decision_dimension_kinds(active_profile);
@@ -561,21 +698,23 @@ async fn guard_projection_taxonomy(
         .collect::<Vec<_>>();
     let mut review = DecisionReviewResult::default();
     super::gateway::apply_taxonomy_guard_outcome(decision, &mut review, &outcome);
-    for (kind, raw, display_name) in candidates {
-        if let Err(error) = super::taxonomy::upsert_candidate_once_per_run(
-            &state.db,
-            &contact.workspace_id,
-            &contact.account_id,
-            &kind,
-            &raw,
-            Some("post-decision projection"),
-            50,
-            display_name.as_deref(),
-            run_id,
-        )
-        .await
-        {
-            tracing::warn!(%error, kind, raw, "projection taxonomy candidate upsert failed");
+    if let Some(run_id) = persist_candidate_run_id {
+        for (kind, raw, display_name) in candidates {
+            if let Err(error) = super::taxonomy::upsert_candidate_once_per_run(
+                &state.db,
+                &contact.workspace_id,
+                &contact.account_id,
+                &kind,
+                &raw,
+                Some("post-decision projection"),
+                50,
+                display_name.as_deref(),
+                run_id,
+            )
+            .await
+            {
+                tracing::warn!(%error, kind, raw, "projection taxonomy candidate upsert failed");
+            }
         }
     }
     super::domain_signals::normalize_domain_signals(decision);
@@ -600,20 +739,512 @@ pub(crate) async fn activate_projection(state: &AppState, review_id: ObjectId) -
     Ok(())
 }
 
-pub(crate) async fn discard_projection(state: &AppState, review_id: ObjectId, reason: &str) {
-    let _ = state
+/// Apply the operational controls frozen by the atomic production commit.
+///
+/// The post-decision model is intentionally allowed to write analytical profile fields only.  A
+/// state transition or cooldown is a customer-side side effect, so it is read from the immutable
+/// review contract, revalidated against the current domain/policy versions, and then committed
+/// with a contact-state CAS.  The review marker makes retries idempotent; the underlying writes
+/// are also safe to repeat after a process crash between the write and marker update.
+pub(crate) async fn apply_authorized_projection_controls(
+    state: &AppState,
+    review_id: ObjectId,
+) -> AppResult<()> {
+    let review = state
+        .db
+        .decision_reviews()
+        .clone_with_type::<Document>()
+        .find_one(doc! { "_id": review_id }, None)
+        .await?
+        .ok_or_else(|| {
+            AppError::Conflict(format!(
+                "decision review {review_id} disappeared before control finalization"
+            ))
+        })?;
+    let controls = match review.get_document("authorized_projection_controls") {
+        Ok(value) => value,
+        Err(_) => return Ok(()),
+    };
+    if !controls.get_bool("authorized").unwrap_or(false) {
+        return Ok(());
+    }
+    if review
+        .get_str("authorized_projection_controls_status")
+        .ok()
+        .is_some_and(|status| !status.trim().is_empty())
+    {
+        return Ok(());
+    }
+
+    let workspace_id = review
+        .get_str("workspace_id")
+        .map_err(|error| payload_error("authorized controls workspace_id", error))?;
+    let account_id = review
+        .get_str("account_id")
+        .map_err(|error| payload_error("authorized controls account_id", error))?;
+    let contact_wxid = review
+        .get_str("contact_wxid")
+        .map_err(|error| payload_error("authorized controls contact_wxid", error))?;
+    let contact = state
+        .db
+        .contacts()
+        .find_one(
+            doc! {
+                "workspace_id": workspace_id,
+                "account_id": account_id,
+                "wxid": contact_wxid,
+            },
+            None,
+        )
+        .await?
+        .ok_or_else(|| AppError::Conflict("contact_missing_before_authorized_controls".into()))?;
+
+    let current_domain_config =
+        load_user_operation_domain_config_for_contact(state, workspace_id, contact_wxid).await?;
+    let expected_domain_version = controls.get_i32("domain_version").ok();
+    let domain_version_matches = match (expected_domain_version, current_domain_config.as_ref()) {
+        (Some(expected), Some(current)) => current.version == expected,
+        (Some(_), None) | (None, Some(_)) => false,
+        (None, None) => true,
+    };
+    if !domain_version_matches {
+        return suppress_authorized_projection_controls(
+            state,
+            &review,
+            "operation domain version changed before control finalization",
+            doc! {
+                "expected_domain_version": expected_domain_version.map(Bson::Int32).unwrap_or(Bson::Null),
+                "current_domain_version": current_domain_config.as_ref().map(|config| Bson::Int32(config.version)).unwrap_or(Bson::Null),
+            },
+        )
+        .await;
+    }
+
+    let expected_policy_state = control_string(controls, "policy_state");
+    let expected_source_state = control_string(controls, "source_operation_state");
+    let current_effective_state = action_policy_state_key(
+        current_domain_config.as_ref(),
+        contact.operation_state.as_deref(),
+        None,
+    )
+    .unwrap_or_else(|| initial_operation_state_key(current_domain_config.as_ref()));
+    if expected_source_state.as_deref() != Some(current_effective_state.as_str()) {
+        return suppress_authorized_projection_controls(
+            state,
+            &review,
+            "contact operation state changed before control finalization",
+            doc! {
+                "expected_source_state": expected_source_state.map(Bson::String).unwrap_or(Bson::Null),
+                "current_source_state": current_effective_state,
+                "target_policy_state": expected_policy_state.clone().map(Bson::String).unwrap_or(Bson::Null),
+            },
+        )
+        .await;
+    }
+
+    let current_policy = if let Some(policy_state) = expected_policy_state.as_deref() {
+        load_operation_state_policy_for_contact(state, workspace_id, policy_state, contact_wxid)
+            .await?
+    } else {
+        None
+    };
+    let expected_policy_version = controls.get_i32("policy_version").ok();
+    let policy_version_matches = match (expected_policy_version, current_policy.as_ref()) {
+        (Some(expected), Some(current)) => {
+            current.status == "active" && current.version == expected
+        }
+        (Some(_), None) | (None, Some(_)) => false,
+        (None, None) => true,
+    };
+    if !policy_version_matches {
+        return suppress_authorized_projection_controls(
+            state,
+            &review,
+            "operation state policy changed before control finalization",
+            doc! {
+                "expected_policy_version": expected_policy_version.map(Bson::Int32).unwrap_or(Bson::Null),
+                "current_policy_version": current_policy.as_ref().map(|policy| Bson::Int32(policy.version)).unwrap_or(Bson::Null),
+                "policy_state": expected_policy_state.map(Bson::String).unwrap_or(Bson::Null),
+            },
+        )
+        .await;
+    }
+
+    let actions = control_actions(controls);
+    for action in &actions {
+        if let Err(reason) = enforce_state_action_policy(current_policy.as_ref(), action) {
+            return suppress_authorized_projection_controls(
+                state,
+                &review,
+                &reason,
+                doc! {
+                    "action": action,
+                    "actions": actions.clone(),
+                    "policy_state": expected_policy_state.clone().map(Bson::String).unwrap_or(Bson::Null),
+                },
+            )
+            .await;
+        }
+    }
+
+    let operation_state = control_string(controls, "operation_state");
+    let operation_state_source = control_string(controls, "operation_state_source");
+    let mut result_status = "applied";
+    let mut result_details = Document::new();
+    // An invalid candidate is intentionally represented by a null executable target. Preserve
+    // the rejected proposal as an audit event, but never feed it into the contact CAS below.
+    if let Some((prior, attempted, reason)) = rejected_operation_state_candidate(
+        &review,
+        controls,
+        current_domain_config.as_ref(),
+        &contact,
+    ) {
+        result_status = "applied_with_state_rejection";
+        result_details.insert("state_transition_reason", reason.clone());
+        emit_authorized_controls_event(
+            state,
+            &review,
+            "agent.operation_state_transition_rejected",
+            "rejected",
+            &format!("operation_state 拒绝迁移 {prior} → {attempted}：{reason}"),
+            doc! {
+                "prior_state": prior,
+                "attempted_state": attempted,
+                "reason": reason,
+            },
+        )
+        .await;
+    }
+    // Keep the raw contact value (including an absent/null value) as the fencing token for every
+    // side effect below. A state transition may advance this token; a lost CAS must fence the
+    // dependent cooldown rather than letting it land on whatever state happens to be current.
+    let mut expected_contact_operation_state = contact.operation_state.clone();
+    let mut state_control_fenced = false;
+
+    if let Some(next_state) = operation_state.as_deref() {
+        if let Some(reason) = check_state_transition(
+            current_domain_config.as_ref(),
+            contact.operation_state.as_deref(),
+            next_state,
+        ) {
+            result_status = "applied_with_state_rejection";
+            result_details.insert("state_transition_reason", reason.clone());
+            emit_authorized_controls_event(
+                state,
+                &review,
+                "agent.operation_state_transition_rejected",
+                "rejected",
+                &format!(
+                    "operation_state 拒绝迁移 {} → {}：{}",
+                    contact.operation_state.as_deref().unwrap_or("<empty>"),
+                    next_state,
+                    reason
+                ),
+                doc! {
+                    "prior_state": contact.operation_state.clone().unwrap_or_default(),
+                    "attempted_state": next_state,
+                    "reason": reason,
+                },
+            )
+            .await;
+        } else if contact.operation_state.as_deref() != Some(next_state) {
+            let filter = scoped_control_contact_state_filter(
+                &review,
+                &contact,
+                contact.operation_state.as_deref(),
+            );
+            let mut set_fields = doc! {
+                "operation_state": next_state,
+                "operation_state_updated_at": DateTime::now(),
+                "updated_at": DateTime::now(),
+            };
+            if let Some(reason) = control_string(controls, "operation_state_reason") {
+                set_fields.insert("operation_state_reason", reason);
+            }
+            if let Ok(confidence) = controls.get_i32("operation_state_confidence") {
+                set_fields.insert("operation_state_confidence", confidence);
+            }
+            if operation_state_source.as_deref() == Some("customer_stage") {
+                set_fields.insert("domain_attributes.customer_stage", next_state);
+                set_fields.insert("domain_attributes_updated_at", DateTime::now());
+            }
+            let write = state
+                .db
+                .contacts()
+                .update_one(filter, doc! { "$set": set_fields }, None)
+                .await?;
+            if write.matched_count != 1 {
+                let current = state
+                    .db
+                    .contacts()
+                    .find_one(scoped_control_contact_filter(&review, &contact), None)
+                    .await?
+                    .ok_or_else(|| {
+                        AppError::Conflict("contact_missing_after_authorized_state_cas".into())
+                    })?;
+                if current.operation_state.as_deref() != Some(next_state) {
+                    state_control_fenced = true;
+                    result_status = "fenced_conflict";
+                    result_details.insert("attempted_state", next_state);
+                    emit_authorized_controls_event(
+                        state,
+                        &review,
+                        "agent.authorized_projection_controls_fenced",
+                        "fenced",
+                        "authorized operation-state control lost its contact CAS",
+                        doc! {
+                            "attempted_state": next_state,
+                            "current_state": current.operation_state.clone().map(Bson::String).unwrap_or(Bson::Null),
+                        },
+                    )
+                    .await;
+                } else {
+                    // Another worker completed the same idempotent transition. Continue only
+                    // with a new fencing token for the state that was actually observed.
+                    expected_contact_operation_state = current.operation_state.clone();
+                }
+            } else {
+                expected_contact_operation_state = Some(next_state.to_string());
+                emit_authorized_controls_event(
+                    state,
+                    &review,
+                    "agent.operation_state_transitioned",
+                    "transitioned",
+                    &format!("operation_state {} → {}", contact.operation_state.as_deref().unwrap_or("<empty>"), next_state),
+                    doc! {
+                        "prior_state": contact.operation_state.clone().unwrap_or_default(),
+                        "next_state": next_state,
+                        "reason": control_string(controls, "operation_state_reason").unwrap_or_default(),
+                        "confidence": controls.get_i32("operation_state_confidence").unwrap_or(0),
+                    },
+                )
+                .await;
+            }
+        }
+    }
+
+    let has_cooldown_action = actions.iter().any(|action| action == "cooldown");
+    if has_cooldown_action && !state_control_fenced {
+        if let Ok(cooldown_until) = controls.get_datetime("cooldown_until") {
+            let result = state
+                .db
+                .contacts()
+                .update_one(
+                    scoped_control_contact_state_filter(
+                        &review,
+                        &contact,
+                        expected_contact_operation_state.as_deref(),
+                    ),
+                    doc! {
+                        "$max": { "cooldown_until": *cooldown_until },
+                        "$set": { "updated_at": DateTime::now() },
+                    },
+                    None,
+                )
+                .await?;
+            if result.matched_count != 1 {
+                result_status = "fenced_conflict";
+                result_details.insert("cooldown_update", "contact_cas_missed");
+            }
+        }
+    } else if has_cooldown_action && state_control_fenced {
+        result_details.insert("cooldown_update", "state_transition_fenced");
+    }
+
+    mark_authorized_projection_controls(state, review_id, result_status, result_details).await
+}
+
+fn control_string(document: &Document, key: &str) -> Option<String> {
+    document
+        .get_str(key)
+        .ok()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn control_actions(document: &Document) -> Vec<String> {
+    document
+        .get_array("actions")
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Bson::as_str)
+        .map(ToString::to_string)
+        .filter(|value| !value.trim().is_empty())
+        .collect()
+}
+
+/// Recover an invalid model-proposed operation state for audit purposes without turning it into
+/// an executable projection control.  The production commit deliberately stores a null target
+/// when the proposal is unknown or not reachable from the contact's source state; the raw review
+/// field remains useful as immutable evidence of what was rejected.  This helper is only called
+/// after the domain and policy/version fences have passed, so the reason is evaluated against the
+/// same state machine that authorized the rest of the decision.
+fn rejected_operation_state_candidate_for_source(
+    review: &Document,
+    controls: &Document,
+    domain_config: Option<&OperationDomainConfig>,
+    stored_state: Option<&str>,
+) -> Option<(String, String, String)> {
+    if control_string(controls, "operation_state").is_some() {
+        return None;
+    }
+    let attempted = control_string(review, "operation_state")?;
+    let prior = action_policy_state_key(domain_config, stored_state, None)
+        .unwrap_or_else(|| initial_operation_state_key(domain_config));
+    if attempted == prior {
+        return None;
+    }
+    let reason = check_state_transition(domain_config, stored_state, &attempted)?;
+    Some((prior, attempted, reason))
+}
+
+fn rejected_operation_state_candidate(
+    review: &Document,
+    controls: &Document,
+    domain_config: Option<&OperationDomainConfig>,
+    contact: &crate::models::Contact,
+) -> Option<(String, String, String)> {
+    rejected_operation_state_candidate_for_source(
+        review,
+        controls,
+        domain_config,
+        contact.operation_state.as_deref(),
+    )
+}
+
+fn scoped_control_contact_filter(review: &Document, contact: &crate::models::Contact) -> Document {
+    let mut filter = doc! {
+        "workspace_id": review.get_str("workspace_id").unwrap_or(&contact.workspace_id),
+        "account_id": review.get_str("account_id").unwrap_or(&contact.account_id),
+        "wxid": review.get_str("contact_wxid").unwrap_or(&contact.wxid),
+    };
+    if let Some(id) = contact.id {
+        filter.insert("_id", id);
+    }
+    filter
+}
+
+/// Add the raw operation-state fencing predicate used by all customer-side control writes.
+/// `None` deliberately matches both legacy documents with a missing field and documents that
+/// explicitly store BSON null, preserving the same compatibility semantics as the old CAS.
+fn scoped_control_contact_state_filter(
+    review: &Document,
+    contact: &crate::models::Contact,
+    expected_state: Option<&str>,
+) -> Document {
+    let mut filter = scoped_control_contact_filter(review, contact);
+    match expected_state {
+        Some(state) => {
+            filter.insert("operation_state", state);
+        }
+        None => {
+            filter.insert(
+                "$or",
+                vec![
+                    doc! { "operation_state": Bson::Null },
+                    doc! { "operation_state": { "$exists": false } },
+                ],
+            );
+        }
+    }
+    filter
+}
+
+async fn suppress_authorized_projection_controls(
+    state: &AppState,
+    review: &Document,
+    reason: &str,
+    details: Document,
+) -> AppResult<()> {
+    let review_id = review
+        .get_object_id("_id")
+        .map_err(|error| payload_error("authorized controls review_id", error))?;
+    mark_authorized_projection_controls(
+        state,
+        review_id,
+        "suppressed_policy_changed",
+        details.clone(),
+    )
+    .await?;
+    emit_authorized_controls_event(
+        state,
+        review,
+        "agent.authorized_projection_controls_suppressed",
+        "suppressed",
+        reason,
+        details,
+    )
+    .await;
+    Ok(())
+}
+
+async fn mark_authorized_projection_controls(
+    state: &AppState,
+    review_id: ObjectId,
+    status: &str,
+    details: Document,
+) -> AppResult<()> {
+    let mut set_fields = doc! {
+        "authorized_projection_controls_status": status,
+        "authorized_projection_controls_applied_at": DateTime::now(),
+    };
+    if !details.is_empty() {
+        set_fields.insert("authorized_projection_controls_details", details);
+    }
+    state
         .db
         .decision_reviews()
         .clone_with_type::<Document>()
         .update_one(
-            doc! { "_id": review_id, "post_decision_status": "prepared" },
             doc! {
-                "$set": { "post_decision_status": "discarded", "post_decision_error": reason },
-                "$unset": { "post_decision_payload": "" },
+                "_id": review_id,
+                "$or": [
+                    { "authorized_projection_controls_status": { "$exists": false } },
+                    { "authorized_projection_controls_status": Bson::Null },
+                ],
             },
+            doc! { "$set": set_fields },
             None,
         )
-        .await;
+        .await?;
+    Ok(())
+}
+
+async fn emit_authorized_controls_event(
+    state: &AppState,
+    review: &Document,
+    kind: &str,
+    status: &str,
+    summary: &str,
+    details: Document,
+) {
+    let Ok(review_id) = review.get_object_id("_id") else {
+        return;
+    };
+    let workspace_id = review.get_str("workspace_id").unwrap_or_default();
+    let account_id = review.get_str("account_id").unwrap_or_default();
+    let contact_wxid = review.get_str("contact_wxid").ok();
+    let dedupe_key = format!(
+        "authorized_projection_controls:{}:{kind}",
+        review_id.to_hex()
+    );
+    if let Err(error) = super::gateway::write_event_for_account_with_dedupe(
+        state,
+        workspace_id,
+        account_id,
+        contact_wxid,
+        kind,
+        status,
+        summary,
+        Some(details),
+        Some(dedupe_key),
+    )
+    .await
+    {
+        tracing::warn!(%error, %review_id, "authorized projection controls audit event failed");
+    }
 }
 
 fn runnable_filter(now: DateTime) -> Document {
@@ -989,6 +1620,14 @@ async fn process_claimed(state: &AppState, review: Document) -> AppResult<()> {
         ).await?;
         return Ok(());
     };
+
+    // A no-reply decision has no transport delivery callback.  The gateway makes a best-effort
+    // attempt immediately after the atomic commit, and this durable worker is the retry path for
+    // an outage or process crash at that boundary.  The control function is guarded by the review
+    // marker and contact CAS, so replaying it cannot create an additional side effect.
+    if review.get_str("status").ok() == Some("no_reply") {
+        apply_authorized_projection_controls(state, review_id).await?;
+    }
 
     let context_pack = payload
         .get_document("context_pack")
@@ -1426,10 +2065,53 @@ mod tests {
     }
 
     #[test]
+    fn runnable_filter_keeps_no_reply_on_the_durable_projection_lane() {
+        let filter = runnable_filter(DateTime::now());
+        let statuses = filter
+            .get_document("status")
+            .expect("status filter is present")
+            .get_array("$in")
+            .expect("status filter is an allow-list");
+        assert!(statuses
+            .iter()
+            .any(|status| status.as_str() == Some("no_reply")));
+    }
+
+    #[test]
     fn permanent_error_classification_is_bounded() {
         let invalid = payload_error("validate projection result", "forbidden field");
         assert!(permanent_projection_error(&invalid));
         let transient = AppError::External("temporary processing failure".to_string());
         assert!(!permanent_projection_error(&transient));
+    }
+
+    #[test]
+    fn rejected_state_evidence_is_audit_only_when_target_is_null() {
+        let domain = crate::prompts::default_domain_configs("ws")
+            .into_iter()
+            .find(|config| config.domain == "user_operations")
+            .expect("default user operation domain");
+        let review = doc! { "operation_state": "customer_success" };
+        let controls = doc! { "operation_state": Bson::Null };
+
+        let rejected = rejected_operation_state_candidate_for_source(
+            &review,
+            &controls,
+            Some(&domain),
+            Some("new_contact"),
+        )
+        .expect("unreachable target should remain auditable");
+        assert_eq!(rejected.0, "new_contact");
+        assert_eq!(rejected.1, "customer_success");
+        assert!(rejected.2.contains("state_transition_invalid"));
+
+        let applied_controls = doc! { "operation_state": "need_discovery" };
+        assert!(rejected_operation_state_candidate_for_source(
+            &review,
+            &applied_controls,
+            Some(&domain),
+            Some("new_contact"),
+        )
+        .is_none());
     }
 }

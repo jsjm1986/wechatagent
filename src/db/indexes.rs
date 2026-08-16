@@ -572,6 +572,66 @@ pub(crate) fn chunk_revision_timeline_index() -> IndexModel {
         .build()
 }
 
+fn authority_observation_identity_index() -> IndexModel {
+    IndexModel::builder()
+        .keys(doc! {
+            "workspace_id": 1,
+            "account_id": 1,
+            "contact_wxid": 1,
+            "source_type": 1,
+            "source_id": 1,
+            "subject": 1,
+        })
+        .options(
+            IndexOptions::builder()
+                .name("uniq_authority_observation_source".to_string())
+                .unique(true)
+                .build(),
+        )
+        .build()
+}
+
+fn appointment_idempotency_index() -> IndexModel {
+    IndexModel::builder()
+        .keys(doc! {
+            "workspace_id": 1,
+            "account_id": 1,
+            "idempotency_key": 1,
+        })
+        .options(
+            IndexOptions::builder()
+                .name("uniq_appointment_idempotency".to_string())
+                .unique(true)
+                .build(),
+        )
+        .build()
+}
+
+fn persona_world_state_current_index() -> IndexModel {
+    IndexModel::builder()
+        .keys(doc! { "workspace_id": 1, "account_id": 1 })
+        .options(
+            IndexOptions::builder()
+                .name("uniq_persona_world_state_current".to_string())
+                .unique(true)
+                .partial_filter_expression(doc! { "current": true })
+                .build(),
+        )
+        .build()
+}
+
+fn turn_snapshot_identity_index() -> IndexModel {
+    IndexModel::builder()
+        .keys(doc! { "run_id": 1, "turn_id": 1 })
+        .options(
+            IndexOptions::builder()
+                .name("uniq_agent_turn_snapshot_run_turn".to_string())
+                .unique(true)
+                .build(),
+        )
+        .build()
+}
+
 fn index_option_semantics(options: Option<&IndexOptions>) -> anyhow::Result<Document> {
     let mut semantics = mongodb::bson::to_document(&options.cloned().unwrap_or_default())?;
     // MongoDB returns the server-selected index version, and historical
@@ -1447,6 +1507,7 @@ pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
     ensure_relationship_type_suggestions_indexes(db).await?;
     ensure_suspected_deal_signals_indexes(db).await?;
     ensure_projection_observation_indexes(db).await?;
+    ensure_turn_runtime_indexes(db).await?;
     // ── agent-self-evolution W0 (Task 1.2) ──
     ensure_evolution_indexes(db).await?;
     // LLM 服务商配置：(workspace_id, provider_id) 唯一；is_active 部分索引便于
@@ -2555,6 +2616,94 @@ async fn ensure_projection_observation_indexes(db: &Database) -> anyhow::Result<
                     IndexOptions::builder()
                         .name("uniq_projection_observation_entity_run".to_string())
                         .unique(true)
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
+    Ok(())
+}
+
+async fn ensure_turn_runtime_indexes(db: &Database) -> anyhow::Result<()> {
+    db.authority_observations()
+        .create_index(authority_observation_identity_index(), None)
+        .await?;
+    db.authority_observations()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! {
+                    "workspace_id": 1,
+                    "account_id": 1,
+                    "contact_wxid": 1,
+                    "status": 1,
+                    "created_at": -1,
+                })
+                .options(
+                    IndexOptions::builder()
+                        .name("authority_observation_contact_timeline".to_string())
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
+
+    db.appointments()
+        .create_index(appointment_idempotency_index(), None)
+        .await?;
+    db.appointments()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! {
+                    "workspace_id": 1,
+                    "account_id": 1,
+                    "contact_wxid": 1,
+                    "status": 1,
+                    "updated_at": -1,
+                })
+                .options(
+                    IndexOptions::builder()
+                        .name("appointment_contact_lifecycle".to_string())
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
+
+    db.persona_world_states()
+        .create_index(persona_world_state_current_index(), None)
+        .await?;
+    db.persona_world_states()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! {
+                    "workspace_id": 1,
+                    "account_id": 1,
+                    "effective_from": -1,
+                })
+                .options(
+                    IndexOptions::builder()
+                        .name("persona_world_state_timeline".to_string())
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
+
+    db.agent_turn_snapshots()
+        .create_index(turn_snapshot_identity_index(), None)
+        .await?;
+    db.agent_turn_snapshots()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "expires_at": 1 })
+                .options(
+                    IndexOptions::builder()
+                        .name("agent_turn_snapshot_ttl".to_string())
+                        .expire_after(std::time::Duration::from_secs(0))
                         .build(),
                 )
                 .build(),

@@ -22,16 +22,17 @@ use mongodb::{options::ClientOptions, Client, Collection, Database as MongoDatab
 
 use crate::models::{
     AgentCommandRun, AgentDecisionReview, AgentEvent, AgentOutcomeMetric, AgentPrincipalEscalation,
-    AgentRunLog, AgentSendLedger, AgentSoul, AgentTask, AgentToolCall, BehaviorSignal,
-    BehaviorSignalMetric, Campaign, CampaignSend, CatalogRebuildJob, ChunkRevision, Contact,
-    ContentAsset, ConversationMessage, DomainProfile, DomainSchema, EvaluationScenario, Experiment,
-    ImportJob, IngestSource, KnowledgeChatTask, KnowledgeChatTurn, KnowledgeDailyReport,
-    KnowledgeGapSignal, KnowledgeOperatorMemory, KnowledgeUsageLog, LlmCallLog, LlmProviderConfig,
+    AgentRunLog, AgentSendLedger, AgentSoul, AgentTask, AgentToolCall, AgentTurnSnapshot,
+    Appointment, AuthorityObservation, BehaviorSignal, BehaviorSignalMetric, Campaign,
+    CampaignSend, CatalogRebuildJob, ChunkRevision, Contact, ContentAsset, ConversationMessage,
+    DomainProfile, DomainSchema, EvaluationScenario, Experiment, ImportJob, IngestSource,
+    KnowledgeChatTask, KnowledgeChatTurn, KnowledgeDailyReport, KnowledgeGapSignal,
+    KnowledgeOperatorMemory, KnowledgeUsageLog, LlmCallLog, LlmProviderConfig,
     ManagementAgentMessage, ManagementAgentSession, McpCallLog, MemoryCandidate, MigrationRecord,
     OperatingMemory, OperationDomainConfig, OperationKnowledgeChunk, OperationKnowledgeDocument,
-    OperationPlaybook, OutboxEntry, PostReleaseReview, Product, PromptTemplate, Proposal,
-    ReferralCard, RelationshipTypeSuggestion, ShadowReplay, SuspectedDealSignal, SystemIncident,
-    TaxonomyCandidate, TaxonomyEntry, ThresholdOverride, ThresholdOverrideAudit,
+    OperationPlaybook, OutboxEntry, PersonaWorldState, PostReleaseReview, Product, PromptTemplate,
+    Proposal, ReferralCard, RelationshipTypeSuggestion, ShadowReplay, SuspectedDealSignal,
+    SystemIncident, TaxonomyCandidate, TaxonomyEntry, ThresholdOverride, ThresholdOverrideAudit,
     UserOperationGuidePreview, WechatAccount,
 };
 
@@ -146,6 +147,22 @@ impl Database {
 
     pub fn content_assets(&self) -> Collection<ContentAsset> {
         self.db.collection("content_assets")
+    }
+
+    pub fn authority_observations(&self) -> Collection<AuthorityObservation> {
+        self.db.collection("authority_observations")
+    }
+
+    pub fn appointments(&self) -> Collection<Appointment> {
+        self.db.collection("appointments")
+    }
+
+    pub fn persona_world_states(&self) -> Collection<PersonaWorldState> {
+        self.db.collection("persona_world_states")
+    }
+
+    pub fn agent_turn_snapshots(&self) -> Collection<AgentTurnSnapshot> {
+        self.db.collection("agent_turn_snapshots")
     }
 
     pub fn agent_souls(&self) -> Collection<AgentSoul> {

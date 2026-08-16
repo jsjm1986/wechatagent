@@ -50,6 +50,15 @@ pub(super) struct ContentAssetRequest {
     tags: Vec<String>,
     usage_scene: Option<String>,
     min_inject_tier: Option<String>,
+    #[serde(default = "default_asset_enabled")]
+    enabled: bool,
+    #[serde(default)]
+    allowed_insertion_levels: Vec<String>,
+    usage_guidance: Option<String>,
+}
+
+fn default_asset_enabled() -> bool {
+    true
 }
 
 pub async fn list_content_assets(
@@ -115,6 +124,9 @@ pub async fn list_content_assets(
             "sendable": asset.sendable,
             "reviewNote": asset.review_note,
             "minInjectTier": asset.min_inject_tier,
+            "enabled": asset.enabled.unwrap_or(false),
+            "allowedInsertionLevels": asset.allowed_insertion_levels.unwrap_or_default(),
+            "usageGuidance": asset.usage_guidance,
             "updatedAt": crate::models::dt_to_string(asset.updated_at)
         }));
     }
@@ -131,6 +143,12 @@ pub(super) async fn create_content_asset(
             "kind and title are required".to_string(),
         ));
     }
+    let text_governed = payload.kind != "media"
+        && payload.kind != "forbidden_expression"
+        && payload
+            .body
+            .as_deref()
+            .is_some_and(|body| !body.trim().is_empty());
     let asset = ContentAsset {
         id: None,
         workspace_id: admin.current_workspace.clone(),
@@ -153,11 +171,19 @@ pub(super) async fn create_content_asset(
         target_stages: None,
         expression_pref: None,
         requires_principal_approval: None,
-        review_status: None,
+        review_status: Some("approved".to_string()),
         review_note: None,
         min_inject_tier: Some(normalize_min_inject_tier(
             payload.min_inject_tier.as_deref(),
         )),
+        enabled: Some(text_governed && payload.enabled),
+        allowed_insertion_levels: text_governed
+            .then(|| normalize_insertion_levels(payload.allowed_insertion_levels)),
+        usage_guidance: text_governed
+            .then_some(payload.usage_guidance)
+            .flatten()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
         created_at: DateTime::now(),
         updated_at: DateTime::now(),
     };
@@ -167,9 +193,32 @@ pub(super) async fn create_content_asset(
     ))
 }
 
+pub(crate) fn normalize_insertion_levels(levels: Vec<String>) -> Vec<String> {
+    let mut normalized = levels
+        .into_iter()
+        .filter_map(|level| match level.trim() {
+            "subtle" => Some("subtle".to_string()),
+            "contextual" => Some("contextual".to_string()),
+            "direct" => Some("direct".to_string()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    normalized.sort();
+    normalized.dedup();
+    if normalized.is_empty() {
+        vec![
+            "subtle".to_string(),
+            "contextual".to_string(),
+            "direct".to_string(),
+        ]
+    } else {
+        normalized
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::normalize_min_inject_tier;
+    use super::{normalize_insertion_levels, normalize_min_inject_tier};
 
     #[test]
     fn normalize_keeps_valid_lowercases_defaults_full() {
@@ -179,5 +228,26 @@ mod tests {
         assert_eq!(normalize_min_inject_tier(None), "full");
         assert_eq!(normalize_min_inject_tier(Some("garbage")), "full");
         assert_eq!(normalize_min_inject_tier(Some("")), "full");
+    }
+
+    #[test]
+    fn insertion_levels_are_closed_deduplicated_and_default_to_all() {
+        assert_eq!(
+            normalize_insertion_levels(vec![
+                "direct".to_string(),
+                "unknown".to_string(),
+                "subtle".to_string(),
+                "direct".to_string(),
+            ]),
+            vec!["direct".to_string(), "subtle".to_string()]
+        );
+        assert_eq!(
+            normalize_insertion_levels(Vec::new()),
+            vec![
+                "subtle".to_string(),
+                "contextual".to_string(),
+                "direct".to_string(),
+            ]
+        );
     }
 }

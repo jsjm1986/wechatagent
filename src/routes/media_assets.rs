@@ -274,6 +274,9 @@ pub(super) async fn upload_media_asset(
         review_status: Some("draft".into()),
         review_note: None,
         min_inject_tier: None,
+        enabled: None,
+        allowed_insertion_levels: None,
+        usage_guidance: None,
         created_at: DateTime::now(),
         updated_at: DateTime::now(),
     };
@@ -399,6 +402,9 @@ pub struct UpdateMetaRequest {
     target_stages: Option<Vec<String>>,
     requires_principal_approval: Option<bool>,
     min_inject_tier: Option<String>,
+    enabled: Option<bool>,
+    allowed_insertion_levels: Option<Vec<String>>,
+    usage_guidance: Option<String>,
 }
 
 /// PUT /content-assets/:id —— 改元数据（JSON，部分更新）。
@@ -460,6 +466,28 @@ pub async fn update_content_asset_meta(
             "min_inject_tier",
             crate::routes::assets::normalize_min_inject_tier(Some(&v)),
         );
+    }
+    let text_governed = asset.kind != "media" && asset.kind != "forbidden_expression";
+    if !text_governed
+        && (payload.enabled.is_some()
+            || payload.allowed_insertion_levels.is_some()
+            || payload.usage_guidance.is_some())
+    {
+        return Err(AppError::BadRequest(
+            "text governance fields are unavailable for this asset kind".into(),
+        ));
+    }
+    if let Some(v) = payload.enabled {
+        set.insert("enabled", v);
+    }
+    if let Some(levels) = payload.allowed_insertion_levels {
+        set.insert(
+            "allowed_insertion_levels",
+            crate::routes::assets::normalize_insertion_levels(levels),
+        );
+    }
+    if let Some(guidance) = payload.usage_guidance {
+        set.insert("usage_guidance", guidance.trim().to_string());
     }
     set.insert("updated_at", DateTime::now());
 

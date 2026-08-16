@@ -24,7 +24,7 @@ use sha2::{Digest, Sha256};
 use crate::error::AppResult;
 use crate::evolution::revision::{content_sha256, parse_prompt_revision};
 use crate::models::{
-    AgentTask, Contact, ConversationMessage, OperatingMemory, OperationDomainConfig,
+    AgentTask, Contact, ConversationMessage, DomainProfile, OperatingMemory, OperationDomainConfig,
     OperationKnowledgeChunk, OperationPlaybook, Proposal,
 };
 use crate::routes::AppState;
@@ -32,27 +32,25 @@ use crate::routes::AppState;
 use super::budget::{RunBudget, RUN_BUDGET};
 use super::budget::{ShadowEvaluationSnapshot, SHADOW_EVALUATION_SNAPSHOT};
 use super::decision::{
-    decide_reply_with_promote, load_operation_playbook_for_contact,
-    load_user_operation_domain_config_for_contact, PromptOverride,
+    load_operation_playbook_for_contact, load_user_operation_domain_config_for_contact,
+    PromptOverride,
 };
 use super::gateway::{load_context_messages, load_pending_tasks};
-use super::guards::{
-    initial_operation_state_key, normalize_decision_runtime, normalize_decision_state,
-    planner_from_decision,
-};
+use super::guards::initial_operation_state_key;
 use super::knowledge_router::{
-    load_operation_knowledge, route_operation_knowledge_read_only, route_used_knowledge_ids,
+    load_operation_knowledge, route_operation_knowledge_read_only,
     select_operation_knowledge_chunks,
 };
-use super::memory::{
-    effective_memory_card_for_contact, load_operating_memory_read_only, next_memory_card_version,
+use super::memory::{effective_memory_card_for_contact, load_operating_memory_read_only};
+use super::model_turn::{
+    load_turn_model_assets, ModelTurnEnvironment, ModelTurnInputs, SandboxCommitter,
+    TurnModelAssets,
 };
-use super::review::{effective_review_mode, review_decision, ReviewInvocationKind};
+use super::review::ReviewInvocationKind;
 use super::run_envelope::SOURCE_KIND_INBOUND_MESSAGE;
 use super::runtime::{resolve_thresholds, UserRuntimeParameters};
-use super::shadow_finalize::finalize_shadow_decision;
-use super::sufficiency::PromptTier;
-use super::types::{KnowledgeRouteResult, RunPlannerResult};
+use super::turn_loop::{run_turn, TurnKernelInput};
+use super::types::{KnowledgeRouteResult, KnowledgeRuntime, RunPlannerResult};
 
 /// 单条源样本的新旧对照结果。Task 13（replay.rs）负责把它映射进 `ShadowReplay`
 /// 落库——本结构只承载两侧 scores / status / self_critique，不直接写库。
@@ -66,7 +64,8 @@ pub(crate) struct PromptShadowSample {
     pub original_scores: Option<Document>,
     /// 用「原 prompt + 追加片段」跑出的 review.scores。
     pub new_scores: Option<Document>,
-    /// Production-equivalent terminal status after claim/finalize/state-policy gates.
+    /// Authorization-equivalent terminal status after claim, final review, send-gateway, and
+    /// operation-state policy gates. The shadow branch still performs no production side effects.
     pub original_final_review_status: Option<String>,
     pub new_final_review_status: Option<String>,
     pub new_review_risks: Vec<String>,
@@ -346,12 +345,16 @@ fn prompt_shadow_source_message_filter(
 struct PreparedPromptShadow {
     playbook: Option<OperationPlaybook>,
     memory: OperatingMemory,
+    knowledge: KnowledgeRuntime,
     pending_tasks: Vec<AgentTask>,
     recent: Vec<ConversationMessage>,
     context_pack: Document,
     initial_planner: RunPlannerResult,
     knowledge_route: KnowledgeRouteResult,
     selected_chunks: Vec<OperationKnowledgeChunk>,
+    active_profile: DomainProfile,
+    model_assets: TurnModelAssets,
+    effective_soul: String,
 }
 
 struct PromptBranchEvidence {
@@ -525,6 +528,26 @@ async fn prepare_prompt_shadow(
     let memory = load_operating_memory_read_only(state, contact).await?;
     let operation_knowledge = load_operation_knowledge(state, contact).await?;
     let pending_tasks = load_pending_tasks(state, contact).await?;
+    let active_profile =
+        super::domain_profile::load_active_domain_profile(&state.db, &contact.workspace_id).await?;
+    let assist_override = contact.domain_attributes.as_ref().and_then(|attributes| {
+        attributes
+            .get_str(crate::models::ASSIST_MODE_OVERRIDE_ATTR)
+            .ok()
+    });
+    let assist_on = super::referral::assist_mode_active(
+        domain_config.and_then(|config| config.assist_mode_enabled),
+        assist_override,
+    );
+    let model_assets = load_turn_model_assets(state, contact, &active_profile, assist_on).await?;
+    let effective_soul = active_profile
+        .soul_override
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or(model_assets.published_soul.as_deref())
+        .unwrap_or_default()
+        .to_string();
     let mut history = load_context_messages(state, contact, runtime).await?;
     history.reverse();
     let mut recent = history
@@ -568,12 +591,16 @@ async fn prepare_prompt_shadow(
     Ok(Some(PreparedPromptShadow {
         playbook,
         memory,
+        knowledge: operation_knowledge,
         pending_tasks,
         recent,
         context_pack,
         initial_planner,
         knowledge_route,
         selected_chunks,
+        active_profile,
+        model_assets,
+        effective_soul,
     }))
 }
 
@@ -592,85 +619,93 @@ async fn run_prompt_shadow_branch(
     if budget.is_llm_or_token_exhausted() {
         return Ok(Err(PromptBranchFailure::BudgetExceeded));
     }
-    let (mut decision, promote_risks) = decide_reply_with_promote(
+    let turn_id = format!("{run_id}:prompt-shadow");
+    let authority = super::authority::compile(super::authority::AuthorityCompileInput {
         state,
+        run_id,
+        turn_id: &turn_id,
         contact,
         inbound,
-        &prepared.recent,
-        &prepared.pending_tasks,
-        prepared.playbook.as_ref(),
-        domain_config,
-        runtime,
-        &prepared.memory,
-        &prepared.context_pack,
-        &prepared.selected_chunks,
-        &prepared.knowledge_route,
-        None,
-        Some(run_id),
-        Some(prompt_override),
-        PromptTier::Full,
-        None,
-    )
+        recent_messages: &prepared.recent,
+        memory: &prepared.memory,
+        active_products: &prepared.model_assets.active_products,
+        referral_cards: &prepared.model_assets.referral_cards,
+        effective_soul: &prepared.effective_soul,
+        projected_appointments: &[],
+        projected_world_state: None,
+        invocation: super::authority::AuthorityInvocation::Conversation,
+        evaluated_at: mongodb::bson::DateTime::now(),
+    })
     .await?;
-    normalize_decision_state(&mut decision, domain_config);
-    normalize_decision_runtime(&mut decision, &prepared.initial_planner);
-    let mut planner = planner_from_decision(&decision, "prompt shadow frozen comparison");
-    if !prepared.knowledge_route.selected_chunk_ids.is_empty()
-        || !prepared.knowledge_route.selected_knowledge_ids.is_empty()
-    {
-        planner.knowledge_required = true;
-        if planner.review_mode.trim().is_empty() {
-            planner.review_mode = "full".to_string();
-        }
-    }
-    normalize_decision_runtime(&mut decision, &planner);
-    decision.context_pack_version = Some(next_memory_card_version(&prepared.memory));
-    decision.used_knowledge_ids = route_used_knowledge_ids(&prepared.knowledge_route);
-    if budget.is_llm_or_token_exhausted() {
-        return Ok(Err(PromptBranchFailure::BudgetExceeded));
-    }
-    let review = review_decision(
-        state,
-        contact,
-        inbound,
-        &prepared.recent,
-        &decision,
-        prepared.playbook.as_ref(),
-        domain_config,
-        runtime,
-        &prepared.memory,
-        &prepared.context_pack,
+    authority.append_verified_knowledge(
         &prepared.selected_chunks,
-        &prepared.knowledge_route,
-        effective_review_mode(&planner, &decision, runtime, false),
-        Some(run_id),
-        Some(prompt_override),
-        None,
-        None,
-        ReviewInvocationKind::Conversation,
+        &super::knowledge_router::route_used_knowledge_ids(&prepared.knowledge_route),
+        mongodb::bson::DateTime::now(),
+    )?;
+    let mut environment = ModelTurnEnvironment::new(
+        ModelTurnInputs {
+            state,
+            contact,
+            inbound,
+            recent_messages: &prepared.recent,
+            pending_tasks: &prepared.pending_tasks,
+            playbook: prepared.playbook.as_ref(),
+            domain_config,
+            runtime,
+            memory: &prepared.memory,
+            context_pack: &prepared.context_pack,
+            knowledge: &prepared.knowledge,
+            selected_chunks: &prepared.selected_chunks,
+            knowledge_route: &prepared.knowledge_route,
+            initial_planner: &prepared.initial_planner,
+            active_profile: &prepared.active_profile,
+            active_products: &prepared.model_assets.active_products,
+            published_soul: prepared.model_assets.published_soul.as_deref(),
+            sendable_assets: &prepared.model_assets.sendable_assets,
+            referral_cards: &prepared.model_assets.referral_cards,
+            reply_prompts: &prepared.model_assets.reply_prompts,
+            reply_context: &prepared.model_assets.reply_context,
+            reviewer_prompts: None,
+            authority: &authority,
+            budget: budget.clone(),
+            run_id,
+            prompt_override: Some(prompt_override),
+            invocation_kind: ReviewInvocationKind::Conversation,
+            first_generation: None,
+            persist_runtime_snapshot: false,
+        },
+        SandboxCommitter::with_policy(
+            "prompt_shadow",
+            state,
+            contact,
+            domain_config,
+            runtime,
+            inbound,
+        ),
+    );
+    let outcome = run_turn(
+        &TurnKernelInput {
+            run_id,
+            turn_id: &turn_id,
+            authority_bundle_hash: authority.bundle_hash(),
+        },
+        &mut environment,
     )
     .await?;
     if !prompt_override.was_applied() {
         return Ok(Err(PromptBranchFailure::TargetNotApplied));
     }
-    let finalized = finalize_shadow_decision(
-        state,
-        contact,
-        inbound,
-        &prepared.recent,
-        decision,
-        review,
-        runtime,
-        &prepared.selected_chunks,
-        promote_risks,
-        run_id,
-    )
-    .await?;
+    if budget.is_llm_or_token_exhausted()
+        && outcome.authorization.final_status == "blocked_by_budget"
+    {
+        return Ok(Err(PromptBranchFailure::BudgetExceeded));
+    }
+    let review = outcome.authorization.review;
     Ok(Ok(PromptBranchEvidence {
-        scores: to_document(&finalized.review.scores).ok(),
-        final_status: finalized.final_status,
-        review_risks: finalized.review.risks.clone(),
-        self_critique_addressed: Some(finalized.review.self_critique_addressed),
+        scores: to_document(&review.scores).ok(),
+        final_status: outcome.authorization.final_status,
+        review_risks: review.risks.clone(),
+        self_critique_addressed: Some(review.self_critique_addressed),
     }))
 }
 

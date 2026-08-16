@@ -5,6 +5,7 @@ export const OPERATION_STATE_ACTION_VALUES = [
   "silent",
   "follow_up",
   "cooldown",
+  "appointment_request",
 ] as const;
 
 export type OperationStateAction = (typeof OPERATION_STATE_ACTION_VALUES)[number];
@@ -15,4 +16,5 @@ export const OPERATION_STATE_ACTION_LABELS: Record<OperationStateAction, string>
   silent: "静默",
   follow_up: "后续跟进",
   cooldown: "进入冷却",
+  appointment_request: "记录预约请求",
 };

@@ -142,6 +142,11 @@ pub mod m056_import_job_claims;
 pub mod m057_explicit_acknowledgement_action;
 /// Audit legacy text-provider active pointers before creating the unique index.
 pub mod m058_llm_provider_active_invariant;
+mod m059_authority_observations;
+mod m060_appointment_commitment_lifecycle;
+mod m061_persona_world_state;
+/// Materialize the appointment-request action in legacy state-policy allowlists.
+pub mod m062_explicit_appointment_request_action;
 
 /// Seed the built-in taxonomy template into one workspace without overwriting
 /// any operator-owned row. This is used lazily when an existing/new workspace
@@ -534,6 +539,22 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration {
         id: "2026_08_058_llm_provider_active_invariant",
         run: |db| Box::pin(m058_llm_provider_active_invariant::run_step(db)),
+    },
+    Migration {
+        id: "2026_08_059_authority_observations",
+        run: |db| Box::pin(m059_authority_observations::run_step(db)),
+    },
+    Migration {
+        id: "2026_08_060_appointment_commitment_lifecycle",
+        run: |db| Box::pin(m060_appointment_commitment_lifecycle::run_step(db)),
+    },
+    Migration {
+        id: "2026_08_061_persona_world_state",
+        run: |db| Box::pin(m061_persona_world_state::run_step(db)),
+    },
+    Migration {
+        id: "2026_08_062_explicit_appointment_request_action",
+        run: |db| Box::pin(m062_explicit_appointment_request_action::run_step(db)),
     },
 ];
 

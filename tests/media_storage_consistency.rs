@@ -45,6 +45,9 @@ fn media_asset(id: ObjectId, workspace_id: &str, file_path: String, sha: String)
         review_status: Some("approved".to_string()),
         review_note: None,
         min_inject_tier: None,
+        enabled: Some(true),
+        allowed_insertion_levels: None,
+        usage_guidance: None,
         created_at: now,
         updated_at: now,
     }

@@ -201,7 +201,7 @@ impl TestLlmGenerator {
         self.call_count.load(Ordering::SeqCst)
     }
 
-    fn pop_or_error(&self, system: &str) -> AppResult<LlmJsonResult> {
+    fn pop_or_error(&self, system: &str, user: &str) -> AppResult<LlmJsonResult> {
         self.call_count.fetch_add(1, Ordering::SeqCst);
         let mut queue = self.responses.lock().expect("test llm queue");
         if queue.is_empty() {
@@ -218,28 +218,49 @@ impl TestLlmGenerator {
             Reply,
             Reviewer,
             ClaimGate,
+            PersonaWorldState,
+            Projection,
+            Judge,
             Other,
         }
         let response_kind = |result: &LlmJsonResult| {
             let value = &result.value;
-            if value.get("semanticAssessment").is_some()
-                && value.get("responseDisposition").is_some()
+            if value.get("claimsComplete").is_some()
                 && value.get("claims").is_some()
+                && value.get("catalogCoverageComplete").is_some()
                 && value.get("catalogClaims").is_some()
             {
                 ResponseKind::ClaimGate
+            } else if value.get("stateText").is_some()
+                && value.get("availability").is_some()
+                && value.get("mood").is_some()
+            {
+                ResponseKind::PersonaWorldState
             } else if value.get("decisionPhase").is_some() {
                 ResponseKind::Reply
             } else if value.get("approved").is_some() && value.get("scores").is_some() {
                 ResponseKind::Reviewer
             } else if value.get("action").is_some() {
                 ResponseKind::Knowledge
+            } else if value.get("profileUpdate").is_some()
+                && value.get("memoryCandidates").is_some()
+                && value.get("agentGeneratedSignals").is_some()
+            {
+                ResponseKind::Projection
+            } else if value.get("verdict").is_some()
+                && value.get("issues").is_some()
+                && value.get("summary").is_some()
+                && value.get("recommendation").is_some()
+            {
+                ResponseKind::Judge
             } else {
                 ResponseKind::Other
             }
         };
         let request_kind = if system.contains("independent semantic claim reviewer") {
             ResponseKind::ClaimGate
+        } else if system.contains("account-wide social world state") {
+            ResponseKind::PersonaWorldState
         } else if system.contains("运营知识库的 wiki 研究员") {
             ResponseKind::Knowledge
         } else if system.contains("请独立审核")
@@ -252,6 +273,15 @@ impl TestLlmGenerator {
             // (for example knowledge.chat.intent) must stay FIFO; treating every unknown system
             // as Reply skips their intent payload whenever a later decisionPhase response exists.
             ResponseKind::Reply
+        } else if user.contains("\"profileUpdate\"")
+            && user.contains("\"memoryCandidates\"")
+            && user.contains("\"agentGeneratedSignals\"")
+        {
+            ResponseKind::Projection
+        } else if user.contains("\"verdict\": \"pass | fail | inconclusive\"")
+            && user.contains("\"recommendation\"")
+        {
+            ResponseKind::Judge
         } else {
             ResponseKind::Other
         };
@@ -273,6 +303,9 @@ impl TestLlmGenerator {
                     ResponseKind::Reply => "reply",
                     ResponseKind::Reviewer => "reviewer",
                     ResponseKind::ClaimGate => "claim_gate",
+                    ResponseKind::PersonaWorldState => "persona_world_state",
+                    ResponseKind::Projection => "projection",
+                    ResponseKind::Judge => "judge",
                     ResponseKind::Other => "other",
                 })
                 .collect::<Vec<_>>();
@@ -387,16 +420,12 @@ pub fn independent_claim_gate_verified_knowledge_json(chunk_id: &str, source_quo
 
 #[async_trait]
 impl LlmProvider for TestLlmGenerator {
-    async fn generate_json(&self, system: &str, _user: &str) -> AppResult<Value> {
-        Ok(self.pop_or_error(system)?.value)
+    async fn generate_json(&self, system: &str, user: &str) -> AppResult<Value> {
+        Ok(self.pop_or_error(system, user)?.value)
     }
 
-    async fn generate_json_with_usage(
-        &self,
-        system: &str,
-        _user: &str,
-    ) -> AppResult<LlmJsonResult> {
-        self.pop_or_error(system)
+    async fn generate_json_with_usage(&self, system: &str, user: &str) -> AppResult<LlmJsonResult> {
+        self.pop_or_error(system, user)
     }
 
     /// 模拟一个 supports_vision 的 provider：忽略图片字节，从同一队列取下一条
@@ -405,11 +434,11 @@ impl LlmProvider for TestLlmGenerator {
     async fn generate_json_with_image(
         &self,
         system: &str,
-        _user: &str,
+        user: &str,
         _image_base64: &str,
         _mime: &str,
     ) -> AppResult<Value> {
-        Ok(self.pop_or_error(system)?.value)
+        Ok(self.pop_or_error(system, user)?.value)
     }
 }
 

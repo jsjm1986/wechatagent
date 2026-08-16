@@ -23,13 +23,22 @@
 use std::{sync::LazyLock, time::Duration};
 
 use futures::TryStreamExt;
-use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
+use mongodb::bson::{doc, oid::ObjectId, Bson, DateTime, Document};
 use mongodb::options::{FindOneAndUpdateOptions, FindOptions, ReturnDocument, UpdateOptions};
 
-use crate::error::AppResult;
-use crate::models::{AgentStatus, AgentTask, OutboxEntry};
+use crate::error::{AppError, AppResult};
+use crate::models::{
+    AgentStatus, AgentTask, OperationDomainConfig, OperationStatePolicy, OutboxEntry,
+};
 use crate::routes::AppState;
 
+use super::decision::{
+    load_operation_state_policy_for_contact, load_user_operation_domain_config_for_contact,
+};
+use super::guards::{
+    action_policy_state_key, decision_operation_state_candidate, enforce_state_action_policy,
+    initial_operation_state_key,
+};
 use super::outbox::{
     backoff_with_jitter_seeded, check_second_safety_gate_pure, write_outbox_event, OutboxStatus,
 };
@@ -37,6 +46,7 @@ use super::run_envelope::{
     SOURCE_KIND_PRINCIPAL_CLARIFICATION, SOURCE_KIND_PRINCIPAL_ESCALATION,
     SOURCE_KIND_SYSTEM_INCIDENT,
 };
+use super::turn_loop::AUTHORIZATION_FENCE_VERSION;
 
 fn principal_card_source_identity(source_event_id: &str) -> Option<(ObjectId, i64)> {
     let mut parts = source_event_id.split(':');
@@ -707,6 +717,223 @@ fn remote_send_start_filter(
     filter
 }
 
+fn read_fence_i32(controls: &Document, key: &str) -> Result<Option<i32>, String> {
+    let value = controls
+        .get(key)
+        .ok_or_else(|| format!("authorization_fence_missing:{key}"))?;
+    match value {
+        Bson::Null => Ok(None),
+        Bson::Int32(value) => Ok(Some(*value)),
+        Bson::Int64(value) => i32::try_from(*value)
+            .map(Some)
+            .map_err(|_| format!("authorization_fence_invalid:{key}")),
+        _ => Err(format!("authorization_fence_invalid:{key}")),
+    }
+}
+
+fn read_fence_string<'a>(controls: &'a Document, key: &str) -> Result<Option<&'a str>, String> {
+    let value = controls
+        .get(key)
+        .ok_or_else(|| format!("authorization_fence_missing:{key}"))?;
+    match value {
+        Bson::Null => Ok(None),
+        Bson::String(value) if !value.trim().is_empty() => Ok(Some(value.trim())),
+        Bson::String(_) => Err(format!("authorization_fence_invalid:{key}")),
+        _ => Err(format!("authorization_fence_invalid:{key}")),
+    }
+}
+
+/// Return the effective operation state represented by a contact at an authorization boundary.
+///
+/// Rows written before the operation-state migration may omit the field entirely.  All writers
+/// resolve that representation to the active machine's initial state, so the final send fence
+/// must compare the same semantic value rather than the raw BSON shape (`null`).
+fn effective_source_operation_state(
+    domain_config: Option<&OperationDomainConfig>,
+    stored_state: Option<&str>,
+) -> String {
+    action_policy_state_key(domain_config, stored_state, None)
+        .unwrap_or_else(|| initial_operation_state_key(domain_config))
+}
+
+/// Pure final check for the structured authorization fence frozen by the atomic production
+/// commit. This deliberately consumes only typed state/version data; no reply text or semantic
+/// marker is inspected here.
+fn decision_send_fence_reason(
+    controls: &Document,
+    current_domain_version: Option<i32>,
+    current_source_state: Option<&str>,
+    current_policy: Option<&OperationStatePolicy>,
+    projection_status: Option<&str>,
+) -> Option<String> {
+    let fence_version = controls.get_i32("authorization_fence_version").ok();
+    if fence_version != Some(AUTHORIZATION_FENCE_VERSION) {
+        return Some("authorization_fence_unsupported_version".to_string());
+    }
+    if controls.get_bool("authorized").ok() != Some(true) {
+        return Some("decision_not_authorized_at_send".to_string());
+    }
+
+    let expected_domain_version = match read_fence_i32(controls, "domain_version") {
+        Ok(value) => value,
+        Err(reason) => return Some(reason),
+    };
+    if expected_domain_version != current_domain_version {
+        return Some(format!(
+            "operation_domain_changed_before_send:expected={expected_domain_version:?}:current={current_domain_version:?}"
+        ));
+    }
+
+    let expected_source_state = match read_fence_string(controls, "source_operation_state") {
+        Ok(value) => value,
+        Err(reason) => return Some(reason),
+    };
+    let expected_target_state = match read_fence_string(controls, "operation_state") {
+        Ok(value) => value,
+        Err(reason) => return Some(reason),
+    };
+    let source_state_matches = expected_source_state == current_source_state;
+    let authorized_target_state_matches = projection_status == Some("applied")
+        && expected_target_state.is_some()
+        && expected_target_state == current_source_state;
+    if !source_state_matches && !authorized_target_state_matches {
+        return Some(format!(
+            "operation_state_changed_before_send:expected={expected_source_state:?}:current={current_source_state:?}:projection_status={projection_status:?}"
+        ));
+    }
+
+    let expected_policy_state = match read_fence_string(controls, "policy_state") {
+        Ok(value) => value,
+        Err(reason) => return Some(reason),
+    };
+    let current_policy_state = current_policy.map(|policy| policy.state_key.as_str());
+    if expected_policy_state != current_policy_state {
+        return Some(format!(
+            "operation_policy_state_changed_before_send:expected={expected_policy_state:?}:current={current_policy_state:?}"
+        ));
+    }
+
+    let expected_policy_version = match read_fence_i32(controls, "policy_version") {
+        Ok(value) => value,
+        Err(reason) => return Some(reason),
+    };
+    let current_policy_version = current_policy.map(|policy| policy.version);
+    if expected_policy_version != current_policy_version {
+        return Some(format!(
+            "operation_state_policy_changed_before_send:expected={expected_policy_version:?}:current={current_policy_version:?}"
+        ));
+    }
+    if current_policy.is_some_and(|policy| policy.status != "active") {
+        return Some("inactive_operation_state_policy_before_send".to_string());
+    }
+
+    let actions = match controls.get("actions") {
+        Some(Bson::Array(actions)) if !actions.is_empty() => actions,
+        Some(Bson::Array(_)) => return Some("authorization_fence_missing_actions".to_string()),
+        Some(_) => return Some("authorization_fence_invalid:actions".to_string()),
+        None => return Some("authorization_fence_missing:actions".to_string()),
+    };
+    for value in actions {
+        let Some(action) = value
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return Some("authorization_fence_invalid:actions".to_string());
+        };
+        if let Err(reason) = enforce_state_action_policy(current_policy, action) {
+            return Some(format!("{reason}:before_send"));
+        }
+    }
+    None
+}
+
+/// Re-read the structured authorization fence immediately before the irreversible remote-send
+/// CAS. Reviews created before the fence schema existed remain compatible; every current atomic
+/// commit carries the marker and is checked fail-closed.
+async fn decision_send_authorization_gate(
+    state: &AppState,
+    entry: &OutboxEntry,
+) -> AppResult<Option<String>> {
+    let Some(decision_id) = entry.decision_id else {
+        return Ok(None);
+    };
+    let review = state
+        .db
+        .decision_reviews()
+        .clone_with_type::<Document>()
+        .find_one(doc! { "_id": decision_id }, None)
+        .await?;
+    let Some(review) = review else {
+        return Ok(Some("decision_review_missing_before_send".to_string()));
+    };
+    let Some(controls) = review.get_document("authorized_projection_controls").ok() else {
+        // Historical/manual rows predate the unified production commit and have no structured
+        // fence. They retain the legacy dispatcher checks until explicitly migrated.
+        return Ok(None);
+    };
+    if !controls.contains_key("authorization_fence_version") {
+        return Ok(None);
+    }
+
+    let contact = state
+        .db
+        .contacts()
+        .find_one(
+            doc! {
+                "workspace_id": &entry.workspace_id,
+                "account_id": &entry.account_id,
+                "wxid": &entry.contact_wxid,
+            },
+            None,
+        )
+        .await?;
+    let Some(contact) = contact else {
+        return Ok(Some(
+            "contact_missing_before_send_authorization".to_string(),
+        ));
+    };
+
+    let current_domain_config = load_user_operation_domain_config_for_contact(
+        state,
+        &entry.workspace_id,
+        &entry.contact_wxid,
+    )
+    .await?;
+    let policy_state = controls
+        .get_str("policy_state")
+        .ok()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let current_policy = if let Some(policy_state) = policy_state {
+        load_operation_state_policy_for_contact(
+            state,
+            &entry.workspace_id,
+            policy_state,
+            &entry.contact_wxid,
+        )
+        .await?
+    } else {
+        None
+    };
+    // Contacts created before the operation-state migration may have a missing/null field. The
+    // authorization compiler resolves that representation to the active machine's initial state;
+    // use the same effective value at the final send fence instead of comparing raw storage
+    // shape. This keeps legacy contacts compatible without weakening the state/version fence.
+    let current_source_state = effective_source_operation_state(
+        current_domain_config.as_ref(),
+        contact.operation_state.as_deref(),
+    );
+
+    Ok(decision_send_fence_reason(
+        controls,
+        current_domain_config.as_ref().map(|config| config.version),
+        Some(current_source_state.as_str()),
+        current_policy.as_ref(),
+        review.get_str("authorized_projection_controls_status").ok(),
+    ))
+}
+
 async fn begin_remote_send(
     state: &AppState,
     entry_id: ObjectId,
@@ -718,6 +945,10 @@ async fn begin_remote_send(
     else {
         return Ok(false);
     };
+    if let Some(reason) = decision_send_authorization_gate(state, entry).await? {
+        cancel_entry(state, entry_id, entry, &reason).await?;
+        return Ok(false);
+    }
     // SR-034 最后不可逆边界只依赖当前 Outbox 单文档：该 marker 只能在持有
     // 同一 Task claim token 的 owner 成功提交 task 授权后写入。
     let filter = remote_send_start_filter(
@@ -1292,11 +1523,7 @@ async fn clear_delivery_finalize_markers(state: &AppState, decision_id: ObjectId
 /// 当一条纯文本 entry 已确认送达后，检查同一 decision 的全部文本分段是否均已送达。
 /// review 上的短 lease 保证同一时刻只有一个提交者；outbox 上的 pending marker 让
 /// dispatcher 能在进程崩溃后重跑。所有附属写入均幂等，review 仅在它们完成后置 sent。
-async fn finalize_delivered_text_decision(
-    state: &AppState,
-    entry: &OutboxEntry,
-    contact: &crate::models::Contact,
-) {
+async fn finalize_delivered_text_decision(state: &AppState, entry: &OutboxEntry) {
     if entry.media_asset_id.is_some() || entry.referral_card_id.is_some() {
         return;
     }
@@ -1468,106 +1695,92 @@ async fn finalize_delivered_text_decision(
     // 发送已成事实。附属写入失败时保留 finalizing + outbox marker，由后续 tick 重试；
     // 绝不把 outbox 改回 pending，因而不会触发重复发送。
     let side_effect_result: AppResult<()> = async {
+        activate_pending_commitments(state, entry, &coverage_snapshot).await?;
+        // State/cooldown controls are frozen in the atomic review and become effective only after
+        // the complete text batch is confirmed delivered. The analytical projection worker is
+        // explicitly forbidden from applying these fields, so this is the single production
+        // delivery boundary for reply decisions.
+        super::post_decision::apply_authorized_projection_controls(state, decision_id).await?;
         if let Some(decision) = decision.as_ref() {
-            if let Some(value) = decision
-                .last_commitment
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            {
-                let mut commitment =
-                    crate::models::CommitmentEntry::from_plain_text(value.to_string());
-                if let Some(structured) = &decision.commitment {
-                    if structured.text.trim() == value {
-                        commitment.due_at = super::types::parse_rfc3339_to_bson(&structured.due_at);
-                    }
-                }
-                state
-                    .db
-                    .contacts()
-                    .update_one(
-                        doc! { "_id": contact.id, "commitments.text": { "$ne": value } },
-                        super::gateway::build_commitment_push_update(&commitment),
-                        None,
-                    )
-                    .await?;
-            }
-
             if let Some(follow_up) = decision
                 .follow_up
                 .as_ref()
                 .filter(|follow_up| follow_up.needed && !follow_up.content.trim().is_empty())
             {
-                if let Some(run_at) = super::types::parse_follow_up_run_at(&follow_up.run_at) {
-                    let defaults = crate::models::RuntimeParametersTyped::default();
-                    let max_pending = review
-                        .runtime_parameters_snapshot
-                        .get_i64("maxPendingFollowUps")
-                        .unwrap_or(defaults.max_pending_follow_ups);
-                    let expires_hours = review
-                        .runtime_parameters_snapshot
-                        .get_i64("followUpExpiresHours")
-                        .unwrap_or(defaults.follow_up_expires_hours);
-                    let pending_count = state
-                        .db
-                        .tasks()
-                        .count_documents(
-                            doc! {
-                                "workspace_id": &entry.workspace_id,
-                                "account_id": &entry.account_id,
-                                "contact_wxid": &entry.contact_wxid,
-                                "kind": "follow_up",
-                                "status": "pending",
-                            },
-                            None,
-                        )
-                        .await?;
-                    if pending_count < max_pending.max(0) as u64 {
-                        let expires_at = DateTime::from_millis(
-                            run_at.timestamp_millis() + expires_hours.max(0) * 60 * 60 * 1000,
-                        );
-                        let now = DateTime::now();
-                        let task = AgentTask {
-                            id: None,
-                            workspace_id: entry.workspace_id.clone(),
-                            account_id: entry.account_id.clone(),
-                            contact_wxid: entry.contact_wxid.clone(),
-                            kind: "follow_up".to_string(),
-                            run_at,
-                            expires_at: Some(expires_at),
-                            content: follow_up.content.clone(),
-                            status: "pending".to_string(),
-                            source_decision_id: Some(decision_id),
-                            review_required: true,
-                            attempt_count: 0,
-                            max_attempts: 3,
-                            next_retry_at: None,
-                            gateway_status: Some("scheduled_after_delivery".to_string()),
-                            cancel_reason: None,
-                            error: None,
-                            claimed_at: None,
-                            claim_recovery_count: 0,
-                            created_at: now,
-                            updated_at: now,
-                        };
-                        let task_doc = mongodb::bson::to_document(&task)?;
-                        state
+                let follow_up_allowed =
+                    follow_up_action_allowed(state, &entry, &review, decision).await?;
+                if follow_up_allowed {
+                    if let Some(run_at) = super::types::parse_follow_up_run_at(&follow_up.run_at) {
+                        let defaults = crate::models::RuntimeParametersTyped::default();
+                        let max_pending = review
+                            .runtime_parameters_snapshot
+                            .get_i64("maxPendingFollowUps")
+                            .unwrap_or(defaults.max_pending_follow_ups);
+                        let expires_hours = review
+                            .runtime_parameters_snapshot
+                            .get_i64("followUpExpiresHours")
+                            .unwrap_or(defaults.follow_up_expires_hours);
+                        let pending_count = state
                             .db
                             .tasks()
-                            .update_one(
-                                doc! { "_id": decision_id },
-                                doc! { "$setOnInsert": task_doc },
-                                UpdateOptions::builder().upsert(true).build(),
+                            .count_documents(
+                                doc! {
+                                    "workspace_id": &entry.workspace_id,
+                                    "account_id": &entry.account_id,
+                                    "contact_wxid": &entry.contact_wxid,
+                                    "kind": "follow_up",
+                                    "status": "pending",
+                                },
+                                None,
                             )
                             .await?;
+                        if pending_count < max_pending.max(0) as u64 {
+                            let expires_at = DateTime::from_millis(
+                                run_at.timestamp_millis() + expires_hours.max(0) * 60 * 60 * 1000,
+                            );
+                            let now = DateTime::now();
+                            let task = AgentTask {
+                                id: None,
+                                workspace_id: entry.workspace_id.clone(),
+                                account_id: entry.account_id.clone(),
+                                contact_wxid: entry.contact_wxid.clone(),
+                                kind: "follow_up".to_string(),
+                                run_at,
+                                expires_at: Some(expires_at),
+                                content: follow_up.content.clone(),
+                                status: "pending".to_string(),
+                                source_decision_id: Some(decision_id),
+                                review_required: true,
+                                attempt_count: 0,
+                                max_attempts: 3,
+                                next_retry_at: None,
+                                gateway_status: Some("scheduled_after_delivery".to_string()),
+                                cancel_reason: None,
+                                error: None,
+                                claimed_at: None,
+                                claim_recovery_count: 0,
+                                created_at: now,
+                                updated_at: now,
+                            };
+                            let task_doc = mongodb::bson::to_document(&task)?;
+                            state
+                                .db
+                                .tasks()
+                                .update_one(
+                                    doc! { "_id": decision_id },
+                                    doc! { "$setOnInsert": task_doc },
+                                    UpdateOptions::builder().upsert(true).build(),
+                                )
+                                .await?;
+                        }
+                    } else {
+                        tracing::warn!(
+                            decision_id = %decision_id,
+                            run_id = %entry.run_id,
+                            raw_run_at = %follow_up.run_at,
+                            "skipping follow-up with missing or invalid run_at"
+                        );
                     }
-                } else {
-                    tracing::warn!(
-                        decision_id = %decision_id,
-                        run_id = %entry.run_id,
-                        raw_run_at = %follow_up.run_at,
-                        "skipping follow-up with missing or invalid run_at"
-                    );
                 }
             }
         }
@@ -1739,6 +1952,170 @@ async fn finalize_delivered_text_decision(
     }
 }
 
+/// Promote commitments only after the complete text batch is sent. The update predicate makes the
+/// transition idempotent: a retry sees `active` and leaves it untouched, while a missing row is
+/// surfaced as a reconciliation error instead of silently authorizing a phantom commitment.
+async fn activate_pending_commitments(
+    state: &AppState,
+    entry: &OutboxEntry,
+    review: &Document,
+) -> AppResult<()> {
+    let ids = review
+        .get_array("pending_commitment_ids")
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str().map(str::trim))
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    if ids.is_empty() {
+        return Ok(());
+    }
+
+    for id in ids {
+        let scope = doc! {
+            "workspace_id": &entry.workspace_id,
+            "account_id": &entry.account_id,
+            "wxid": &entry.contact_wxid,
+        };
+        let mut filter = scope.clone();
+        filter.insert(
+            "commitments",
+            doc! { "$elemMatch": { "id": &id, "status": "pending_delivery" } },
+        );
+        let result = state
+            .db
+            .contacts()
+            .update_one(
+                filter,
+                doc! {
+                    "$set": {
+                        "commitments.$.status": "active",
+                        "updated_at": DateTime::now(),
+                    }
+                },
+                None,
+            )
+            .await?;
+        if result.matched_count == 1 {
+            continue;
+        }
+
+        let mut exists_filter = scope;
+        exists_filter.insert("commitments.id", &id);
+        let exists = state.db.contacts().find_one(exists_filter, None).await?;
+        if exists.is_none() {
+            return Err(AppError::Conflict(format!(
+                "pending commitment {id} disappeared before delivery finalization"
+            )));
+        }
+        // Already active (for example, a crash after promotion but before review cleanup) is an
+        // idempotent success. Other terminal states are left untouched and remain auditable.
+    }
+    Ok(())
+}
+
+/// Revalidate a deferred follow-up against the contact's current operation-state policy. The
+/// original turn authorizes the decision, but the task is materialized only after delivery; a
+/// state/policy publish in that interval must be able to suppress this independent side effect.
+async fn follow_up_action_allowed(
+    state: &AppState,
+    entry: &OutboxEntry,
+    review: &crate::models::AgentDecisionReview,
+    decision: &super::types::AgentDecision,
+) -> AppResult<bool> {
+    let contact = state
+        .db
+        .contacts()
+        .find_one(
+            doc! {
+                "workspace_id": &entry.workspace_id,
+                "account_id": &entry.account_id,
+                "wxid": &entry.contact_wxid,
+            },
+            None,
+        )
+        .await?
+        .ok_or_else(|| {
+            AppError::Conflict("contact_missing_before_follow_up_finalize".to_string())
+        })?;
+    let frozen_domain_config =
+        mongodb::bson::from_document::<crate::models::OperationDomainConfig>(
+            review.domain_config_snapshot.clone(),
+        )
+        .ok();
+    let current_domain_config = super::decision::load_user_operation_domain_config_for_contact(
+        state,
+        &contact.workspace_id,
+        &contact.wxid,
+    )
+    .await?;
+    if review.domain_config_snapshot.contains_key("version") {
+        let expected_version = review.domain_config_snapshot.get_i32("version").ok();
+        let current_version = current_domain_config.as_ref().map(|config| config.version);
+        if expected_version != current_version {
+            let _ = state
+                .db
+                .decision_reviews()
+                .clone_with_type::<Document>()
+                .update_one(
+                    doc! { "_id": review.id, "status": "delivery_finalizing" },
+                    doc! { "$set": {
+                        "follow_up_policy_blocked": true,
+                        "follow_up_policy_block_reason": "operation_domain_changed_before_follow_up",
+                        "follow_up_policy_block_expected_domain_version": expected_version.map(Bson::Int32).unwrap_or(Bson::Null),
+                        "follow_up_policy_block_current_domain_version": current_version.map(Bson::Int32).unwrap_or(Bson::Null),
+                    } },
+                    None,
+                )
+                .await;
+            return Ok(false);
+        }
+    }
+    let domain_config = current_domain_config
+        .as_ref()
+        .or(frozen_domain_config.as_ref());
+    let operation_state = action_policy_state_key(
+        domain_config,
+        contact.operation_state.as_deref(),
+        decision_operation_state_candidate(decision),
+    )
+    .unwrap_or_else(|| initial_operation_state_key(domain_config));
+    let policy = load_operation_state_policy_for_contact(
+        state,
+        &contact.workspace_id,
+        &operation_state,
+        &contact.wxid,
+    )
+    .await?;
+    if let Err(reason) = enforce_state_action_policy(policy.as_ref(), "follow_up") {
+        tracing::warn!(
+            decision_id = ?review.id,
+            run_id = %entry.run_id,
+            operation_state = %operation_state,
+            %reason,
+            "deferred follow-up suppressed by current operation-state policy"
+        );
+        let _ = state
+            .db
+            .decision_reviews()
+            .clone_with_type::<Document>()
+            .update_one(
+                doc! { "_id": review.id, "status": "delivery_finalizing" },
+                doc! { "$set": {
+                    "follow_up_policy_blocked": true,
+                    "follow_up_policy_block_reason": reason,
+                    "follow_up_policy_block_state": operation_state,
+                } },
+                None,
+            )
+            .await;
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 /// 恢复“outbox 已 sent，但 review/承诺/follow-up 尚未完成”的窗口。
 async fn reconcile_delivered_decision_finalizations(state: &AppState) -> AppResult<()> {
     let mut cursor = state
@@ -1787,8 +2164,8 @@ async fn reconcile_delivered_decision_finalizations(state: &AppState) -> AppResu
                 None,
             )
             .await?;
-        if let Some(contact) = contact {
-            finalize_delivered_text_decision(state, &entry, &contact).await;
+        if contact.is_some() {
+            finalize_delivered_text_decision(state, &entry).await;
         } else {
             clear_delivery_finalize_markers(state, decision_id).await;
         }
@@ -2686,7 +3063,7 @@ async fn commit_verified_delivery(
     .await;
     refresh_run_log_outbox_status(state, &entry.run_id).await;
     if let Some(contact) = contact {
-        finalize_delivered_text_decision(state, entry, contact).await;
+        finalize_delivered_text_decision(state, entry).await;
         super::send_ledger::record_send_for_entry(state, entry, contact, delivered_at).await;
     }
     Ok(true)
@@ -3065,7 +3442,7 @@ pub async fn process_entry(state: &AppState, entry: &OutboxEntry) -> AppResult<(
             .await;
             refresh_run_log_outbox_status(state, &entry.run_id).await;
             if let Some(contact) = contact.as_ref() {
-                finalize_delivered_text_decision(state, entry, contact).await;
+                finalize_delivered_text_decision(state, entry).await;
 
                 // 主动发送台账：素材/名片条目记一条（纯文本不记）。fail-soft，不影响已成发送。
                 super::send_ledger::record_send_for_entry(state, entry, contact, delivered_at)
@@ -3438,6 +3815,146 @@ mod tests {
                 ],
             }
         );
+    }
+
+    fn authorization_fence_controls(actions: &[&str]) -> Document {
+        doc! {
+            "authorization_fence_version": AUTHORIZATION_FENCE_VERSION,
+            "authorized": true,
+            "domain_version": 7_i32,
+            "source_operation_state": "new_contact",
+            "operation_state": "need_discovery",
+            "policy_state": "need_discovery",
+            "policy_version": 3_i32,
+            "actions": actions.iter().map(|action| Bson::String((*action).to_string())).collect::<Vec<_>>(),
+        }
+    }
+
+    fn authorization_fence_policy() -> OperationStatePolicy {
+        OperationStatePolicy {
+            id: None,
+            workspace_id: "ws".to_string(),
+            domain: "user_operations".to_string(),
+            state_key: "need_discovery".to_string(),
+            allowed: vec![
+                "reply".to_string(),
+                "follow_up".to_string(),
+                "cooldown".to_string(),
+            ],
+            forbidden: Vec::new(),
+            recommended_pace: None,
+            status: "active".to_string(),
+            updated_at: DateTime::from_millis(1),
+            version: 3,
+            current_version: true,
+            previous_version: None,
+            seeded_by: None,
+        }
+    }
+
+    #[test]
+    fn legacy_missing_operation_state_resolves_to_initial_state_at_send_fence() {
+        assert_eq!(effective_source_operation_state(None, None), "new_contact");
+        assert_eq!(
+            effective_source_operation_state(None, Some("")),
+            "new_contact"
+        );
+    }
+
+    #[test]
+    fn decision_send_fence_allows_matching_structured_state_and_all_actions() {
+        let controls = authorization_fence_controls(&["reply", "follow_up", "cooldown"]);
+        let policy = authorization_fence_policy();
+        assert_eq!(
+            decision_send_fence_reason(
+                &controls,
+                Some(7),
+                Some("new_contact"),
+                Some(&policy),
+                None,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn decision_send_fence_rejects_domain_or_source_state_drift() {
+        let controls = authorization_fence_controls(&["reply"]);
+        let policy = authorization_fence_policy();
+        let domain_reason = decision_send_fence_reason(
+            &controls,
+            Some(8),
+            Some("new_contact"),
+            Some(&policy),
+            None,
+        )
+        .expect("domain version drift must block");
+        assert!(domain_reason.starts_with("operation_domain_changed_before_send"));
+
+        let state_reason = decision_send_fence_reason(
+            &controls,
+            Some(7),
+            Some("need_discovery"),
+            Some(&policy),
+            None,
+        )
+        .expect("source state drift must block");
+        assert!(state_reason.starts_with("operation_state_changed_before_send"));
+    }
+
+    #[test]
+    fn decision_send_fence_rejects_policy_version_and_independent_action_blocks() {
+        let controls = authorization_fence_controls(&["reply"]);
+        let mut policy = authorization_fence_policy();
+        policy.version = 4;
+        let version_reason = decision_send_fence_reason(
+            &controls,
+            Some(7),
+            Some("new_contact"),
+            Some(&policy),
+            None,
+        )
+        .expect("policy version drift must block");
+        assert!(version_reason.starts_with("operation_state_policy_changed_before_send"));
+
+        let controls = authorization_fence_controls(&["reply", "follow_up"]);
+        let mut policy = authorization_fence_policy();
+        policy.forbidden.push("follow_up".to_string());
+        let action_reason = decision_send_fence_reason(
+            &controls,
+            Some(7),
+            Some("new_contact"),
+            Some(&policy),
+            None,
+        )
+        .expect("a forbidden secondary action must block the batch");
+        assert!(action_reason.contains("state_action_forbidden"));
+    }
+
+    #[test]
+    fn decision_send_fence_allows_only_the_review_applied_target_state() {
+        let mut controls = authorization_fence_controls(&["reply"]);
+        controls.insert("operation_state", "need_discovery");
+        let policy = authorization_fence_policy();
+        assert_eq!(
+            decision_send_fence_reason(
+                &controls,
+                Some(7),
+                Some("need_discovery"),
+                Some(&policy),
+                Some("applied"),
+            ),
+            None,
+            "media/namecard rows may follow a successfully applied state transition"
+        );
+        assert!(decision_send_fence_reason(
+            &controls,
+            Some(7),
+            Some("need_discovery"),
+            Some(&policy),
+            Some("fenced_conflict"),
+        )
+        .is_some());
     }
 
     #[test]

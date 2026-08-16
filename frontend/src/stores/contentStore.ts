@@ -10,6 +10,9 @@ export type AssetDraft = {
   body: string;
   usageScene: string;
   minInjectTier: string;
+  enabled: boolean;
+  allowedInsertionLevels: Array<"subtle" | "contextual" | "direct">;
+  usageGuidance: string;
 };
 
 const EMPTY_DRAFT: AssetDraft = {
@@ -18,6 +21,9 @@ const EMPTY_DRAFT: AssetDraft = {
   body: "",
   usageScene: "",
   minInjectTier: "full",
+  enabled: true,
+  allowedInsertionLevels: ["subtle", "contextual", "direct"],
+  usageGuidance: "",
 };
 
 type AssetScopePayload =
@@ -167,6 +173,9 @@ export const useContentStore = create<ContentState & ContentActions>((set, get) 
           body: frozenDraft.body || undefined,
           usageScene: frozenDraft.usageScene || undefined,
           minInjectTier: frozenDraft.minInjectTier,
+          enabled: frozenDraft.enabled,
+          allowedInsertionLevels: frozenDraft.allowedInsertionLevels,
+          usageGuidance: frozenDraft.usageGuidance || undefined,
         });
         if (currentAccountId() !== accountId) return;
         set({

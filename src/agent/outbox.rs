@@ -203,24 +203,20 @@ pub(crate) fn run_sequence_for(
         .unwrap_or(0)
 }
 
-// ── 主入口 ──────────────────────────────────────────────────────────────
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedOutboxEntry {
+    pub entry: OutboxEntry,
+    pub used_synthetic_key: bool,
+}
 
-/// 把决策结果入队到 `agent_send_outbox`（design.md §3.2 R13.2）。
-///
-/// 行为：
-/// * 计算 `content_hash = sha256(content)` + `idempotency_key`；
-/// * 空 `source_event_id` 走 `synthetic:run_id:contact_wxid:content_hash` 兜底，
-///   同时写 `outbox_synthetic_idempotency_key` warning 事件；
-/// * `insert_one` 成功 → 返回 [`EnqueueOutcome::Created`] + 写 `outbox_created` 事件；
-/// * `DuplicateKey` → 返回 [`EnqueueOutcome::IdempotentSkip`] + 写
-///   `outbox_idempotent_skip` warning 事件；
-/// * 其它 db 错误 → 透传 [`OutboxError::Db`]。
-///
-/// 关键不变量：**永远不发送两次**。即使上层在 retry 路径上再次调用 enqueue，
-/// 由唯一索引兜底；本函数只关心"入队成功 vs 已存在 vs 真错"。
-pub async fn enqueue(state: &AppState, req: EnqueueRequest) -> Result<EnqueueOutcome, OutboxError> {
-    let _stage_timer = super::run_audit::stage_timer("outbox_enqueue");
-    // ── 入参校验 ────────────────────────────────────────────────────
+/// Validate and freeze one Outbox row without touching MongoDB. Atomic committers build the
+/// complete batch through this function before opening a transaction, so invalid media/namecard
+/// directives cannot leave a partially persisted customer reply.
+pub(crate) fn prepare_outbox_entry(
+    req: &EnqueueRequest,
+    now: DateTime,
+    outbox_id: ObjectId,
+) -> Result<PreparedOutboxEntry, OutboxError> {
     if req.workspace_id.trim().is_empty() {
         return Err(OutboxError::Invalid("workspace_id is empty".to_string()));
     }
@@ -238,28 +234,15 @@ pub async fn enqueue(state: &AppState, req: EnqueueRequest) -> Result<EnqueueOut
     if req.run_id.trim().is_empty() {
         return Err(OutboxError::Invalid("run_id is empty".to_string()));
     }
+    if req.media_asset_id.is_some() && req.referral_card_id.is_some() {
+        return Err(OutboxError::Invalid(
+            "media_asset_id and referral_card_id are mutually exclusive".to_string(),
+        ));
+    }
 
-    let now = DateTime::now();
     let content_hash = sha256_hex(req.content.as_bytes());
-
-    // ── source_event_id 兜底 ────────────────────────────────────────
-    //
-    // 空 source_event_id（典型场景：跟进任务 follow-up，没有入站消息触发）
-    // SHALL 走 synthetic 前缀，让 idempotency_key 仍能唯一约束"同一 run +
-    // 同一 contact + 同一 content 不重复发送"。
-    //
-    // P1-4：manual_send 路径每次点击都会拿到全新 run_id，若仍把 run_id 拌进
-    // synthetic key，admin 双击发送同一内容时 idempotency_key 不冲突，会真发
-    // 两次。manual_send 视语义是"内容级幂等"——同 contact + 同 content 在
-    // 24h 内只发一次（足以避免双击 + 不挡明天的合理重发）。其他 source_kind
-    // 仍用 run_id 兜底，保持既有契约。
     let day_bucket = now.timestamp_millis() / (24 * 60 * 60 * 1000);
-    // media-asset Task 8（硬伤③ 方案甲）：媒体条目（media_asset_id 有值）**一律**走
-    // synthetic_media 形态，忽略 source_event_id 分支。否则 webhook 入站触发时
-    // source_event_id 非空 → 走 `{source_event_id}:{contact}:{content_hash}` 分支，
-    // 媒体 content 为空 → content_hash=sha256("") 对所有素材相同 → 同一入站发两个
-    // 不同文件会撞键、第二个被误去重漏发。media_routes_synthetic 把该判定抽成纯函数。
-    let (legacy_idempotency_key, used_synthetic) = if media_routes_synthetic(
+    let (legacy_idempotency_key, used_synthetic_key) = if media_routes_synthetic(
         &req.media_asset_id,
         &req.referral_card_id,
         &req.source_event_id,
@@ -284,6 +267,83 @@ pub async fn enqueue(state: &AppState, req: EnqueueRequest) -> Result<EnqueueOut
     };
     let idempotency_key =
         scoped_outbox_idempotency_key(&req.workspace_id, &req.account_id, &legacy_idempotency_key);
+    let max_attempts = if req.max_attempts <= 0 {
+        3
+    } else {
+        req.max_attempts.min(10)
+    };
+
+    Ok(PreparedOutboxEntry {
+        used_synthetic_key,
+        entry: OutboxEntry {
+            id: Some(outbox_id),
+            workspace_id: req.workspace_id.clone(),
+            account_id: req.account_id.clone(),
+            contact_wxid: req.contact_wxid.clone(),
+            run_id: req.run_id.clone(),
+            decision_id: req.decision_id,
+            source_event_id: req.source_event_id.clone(),
+            source_kind: req.source_kind.clone(),
+            content: req.content.clone(),
+            content_hash,
+            idempotency_key,
+            delivery_priority: delivery_priority_for(
+                &req.source_kind,
+                req.media_asset_id.as_deref(),
+                req.referral_card_id.as_deref(),
+            ),
+            run_sequence: run_sequence_for(
+                &req.source_event_id,
+                req.media_asset_id.as_deref(),
+                req.referral_card_id.as_deref(),
+            ),
+            media_asset_id: req.media_asset_id.clone(),
+            referral_card_id: req.referral_card_id.clone(),
+            attempt: 0,
+            max_attempts,
+            status: OutboxStatus::Pending.as_str().to_string(),
+            cancel_reason: None,
+            last_error: None,
+            next_retry_at: None,
+            worker_id: None,
+            locked_until: None,
+            claim_token: None,
+            claim_generation: 0,
+            cancel_requested: false,
+            cancel_requested_at: None,
+            send_started_at: None,
+            task_send_authorization_token: None,
+            reclaimed_in_flight: false,
+            reclaim_count: 0,
+            created_at: now,
+            updated_at: now,
+            sent_at: None,
+        },
+    })
+}
+
+// ── 主入口 ──────────────────────────────────────────────────────────────
+
+/// 把决策结果入队到 `agent_send_outbox`（design.md §3.2 R13.2）。
+///
+/// 行为：
+/// * 计算 `content_hash = sha256(content)` + `idempotency_key`；
+/// * 空 `source_event_id` 走 `synthetic:run_id:contact_wxid:content_hash` 兜底，
+///   同时写 `outbox_synthetic_idempotency_key` warning 事件；
+/// * `insert_one` 成功 → 返回 [`EnqueueOutcome::Created`] + 写 `outbox_created` 事件；
+/// * `DuplicateKey` → 返回 [`EnqueueOutcome::IdempotentSkip`] + 写
+///   `outbox_idempotent_skip` warning 事件；
+/// * 其它 db 错误 → 透传 [`OutboxError::Db`]。
+///
+/// 关键不变量：**永远不发送两次**。即使上层在 retry 路径上再次调用 enqueue，
+/// 由唯一索引兜底；本函数只关心"入队成功 vs 已存在 vs 真错"。
+pub async fn enqueue(state: &AppState, req: EnqueueRequest) -> Result<EnqueueOutcome, OutboxError> {
+    let _stage_timer = super::run_audit::stage_timer("outbox_enqueue");
+    let now = DateTime::now();
+    let prepared = prepare_outbox_entry(&req, now, ObjectId::new())?;
+    let used_synthetic = prepared.used_synthetic_key;
+    let entry = prepared.entry;
+    let idempotency_key = entry.idempotency_key.clone();
 
     if used_synthetic {
         // 警告事件：synthetic 路径不算错误，但运维需要监控其频率（高频 = 跟进
@@ -307,57 +367,6 @@ pub async fn enqueue(state: &AppState, req: EnqueueRequest) -> Result<EnqueueOut
         )
         .await;
     }
-
-    let max_attempts = if req.max_attempts <= 0 {
-        3
-    } else {
-        req.max_attempts.min(10)
-    };
-
-    let entry = OutboxEntry {
-        id: None,
-        workspace_id: req.workspace_id.clone(),
-        account_id: req.account_id.clone(),
-        contact_wxid: req.contact_wxid.clone(),
-        run_id: req.run_id.clone(),
-        decision_id: req.decision_id,
-        source_event_id: req.source_event_id.clone(),
-        source_kind: req.source_kind.clone(),
-        content: req.content.clone(),
-        content_hash: content_hash.clone(),
-        idempotency_key: idempotency_key.clone(),
-        delivery_priority: delivery_priority_for(
-            &req.source_kind,
-            req.media_asset_id.as_deref(),
-            req.referral_card_id.as_deref(),
-        ),
-        run_sequence: run_sequence_for(
-            &req.source_event_id,
-            req.media_asset_id.as_deref(),
-            req.referral_card_id.as_deref(),
-        ),
-        media_asset_id: req.media_asset_id.clone(),
-        referral_card_id: req.referral_card_id.clone(),
-        attempt: 0,
-        max_attempts,
-        status: OutboxStatus::Pending.as_str().to_string(),
-        cancel_reason: None,
-        last_error: None,
-        next_retry_at: None,
-        worker_id: None,
-        locked_until: None,
-        claim_token: None,
-        claim_generation: 0,
-        cancel_requested: false,
-        cancel_requested_at: None,
-        send_started_at: None,
-        task_send_authorization_token: None,
-        reclaimed_in_flight: false,
-        reclaim_count: 0,
-        created_at: now,
-        updated_at: now,
-        sent_at: None,
-    };
 
     // ── 写入 + DuplicateKey 容错 ────────────────────────────────────
     let collection = state.db.collection_agent_send_outbox();

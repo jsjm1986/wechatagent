@@ -5,6 +5,7 @@ mod common;
 use mongodb::bson::{doc, oid::ObjectId, Bson, Document};
 use wechatagent::db::migrations::{
     m057_explicit_acknowledgement_action as m057, m058_llm_provider_active_invariant as m058,
+    m062_explicit_appointment_request_action as m062,
 };
 
 #[tokio::test]
@@ -66,6 +67,68 @@ async fn m057_handles_missing_null_empty_and_concurrent_reruns() {
                 .any(|value| value.as_str() == Some("acknowledgement")));
         }
     }
+    app.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires MongoDB"]
+async fn m062_materializes_appointment_action_without_overriding_forbidden() {
+    let app = common::TestApp::start().await;
+    let policies = app
+        .state
+        .db
+        .raw()
+        .collection::<Document>("operation_state_policies");
+    let ids = [ObjectId::new(), ObjectId::new()];
+    policies
+        .insert_many(
+            [
+                doc! {
+                    "_id": ids[0], "workspace_id": "m062", "domain": "d",
+                    "state_key": "legacy", "allowed": ["reply"], "forbidden": [],
+                    "version": 1, "current_version": true, "status": "active",
+                },
+                doc! {
+                    "_id": ids[1], "workspace_id": "m062", "domain": "d",
+                    "state_key": "forbidden", "allowed": [],
+                    "forbidden": ["appointment_request"],
+                    "version": 1, "current_version": true, "status": "active",
+                },
+            ],
+            None,
+        )
+        .await
+        .expect("seed legacy appointment policies");
+
+    let (left, right) = tokio::join!(m062::run_step(&app.state.db), m062::run_step(&app.state.db));
+    left.expect("first concurrent migration");
+    right.expect("second concurrent migration");
+    m062::run_step(&app.state.db)
+        .await
+        .expect("idempotent migration rerun");
+
+    let migrated = policies
+        .find_one(doc! { "_id": ids[0] }, None)
+        .await
+        .expect("read migrated row")
+        .expect("migrated row exists");
+    assert!(migrated
+        .get_array("allowed")
+        .expect("allowed array")
+        .iter()
+        .any(|value| value.as_str() == Some("appointment_request")));
+
+    let forbidden = policies
+        .find_one(doc! { "_id": ids[1] }, None)
+        .await
+        .expect("read forbidden row")
+        .expect("forbidden row exists");
+    assert!(!forbidden
+        .get_array("allowed")
+        .expect("allowed array")
+        .iter()
+        .any(|value| value.as_str() == Some("appointment_request")));
+
     app.cleanup().await;
 }
 

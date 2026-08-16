@@ -246,6 +246,9 @@ export type ContentAsset = {
   mediaId?: string;
   usageScene?: string;
   minInjectTier?: string;
+  enabled?: boolean;
+  allowedInsertionLevels?: Array<"subtle" | "contextual" | "direct">;
+  usageGuidance?: string;
   // 销售素材文件字段
   mediaType?: "image" | "file" | "video";
   fileName?: string;

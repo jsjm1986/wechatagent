@@ -10,5 +10,6 @@ describe("契约: 状态策略动作闭集", () => {
     expect(OPERATION_STATE_ACTION_VALUES).toEqual(fixture);
     expect(Object.keys(OPERATION_STATE_ACTION_LABELS).sort()).toEqual([...fixture].sort());
     expect(OPERATION_STATE_ACTION_VALUES).toContain("acknowledgement");
+    expect(OPERATION_STATE_ACTION_VALUES).toContain("appointment_request");
   });
 });

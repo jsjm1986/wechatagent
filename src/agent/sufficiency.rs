@@ -100,6 +100,7 @@ pub(crate) fn is_coverage_optimism(decision: &AgentDecision, knowledge_coverage:
 /// Clarify(Lean) / Escalate(Relational) 都 `include_business=false`,没读切片;若记路由 id,
 /// grounding 硬闸 `compute_verified_chunks` 取 `used ∩ verified` 非空即放行,会架空
 /// `blocked_unverified_product_claim` 红线(gates.rs:660)。正向条件,绝不改成无条件赋值。
+#[cfg(test)]
 pub(crate) fn should_record_used_knowledge_ids(forced_full: bool, escalated_to_full: bool) -> bool {
     forced_full || escalated_to_full
 }
@@ -107,6 +108,7 @@ pub(crate) fn should_record_used_knowledge_ids(forced_full: bool, escalated_to_f
 /// KB-01：本决策最终应记录的 used_knowledge_ids。
 /// Full 档(读了切片)记路由命中 id;非 Full 档(没读切片)一律清空——含 LLM 经
 /// carry_through 透传的自报值,不给 grounding 硬闸 `compute_verified_chunks` 留架空口。
+#[cfg(test)]
 pub(crate) fn resolve_used_knowledge_ids(
     forced_full: bool,
     escalated_to_full: bool,

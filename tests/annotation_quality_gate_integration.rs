@@ -91,6 +91,9 @@ fn make_draft_asset(workspace_id: &str, title: &str) -> ContentAsset {
         review_status: Some("draft".to_string()),
         review_note: None,
         min_inject_tier: None,
+        enabled: Some(true),
+        allowed_insertion_levels: None,
+        usage_guidance: None,
         created_at: now,
         updated_at: now,
     }

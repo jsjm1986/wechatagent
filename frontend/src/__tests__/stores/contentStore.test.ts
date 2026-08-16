@@ -63,6 +63,9 @@ describe("contentStore account and entity scope", () => {
         body: "",
         usageScene: "",
         minInjectTier: "full",
+        enabled: true,
+        allowedInsertionLevels: ["subtle", "contextual", "direct"],
+        usageGuidance: "",
       },
       assetDraftAccountId: "",
     });

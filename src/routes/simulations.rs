@@ -15,6 +15,15 @@ use super::shared::*;
 use super::AppState;
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UserOperationJudgeOutput {
+    verdict: String,
+    issues: Vec<String>,
+    summary: String,
+    recommendation: String,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct UserDialogueSimulationRequest {
     account_id: String,
@@ -104,7 +113,8 @@ pub(super) async fn run_user_operation_evaluation(
             messages.into_iter().map(ToString::to_string).collect(),
         )
         .await?;
-        let evaluation = judge_user_operation_scenario(scenario, expected, &turns);
+        let evaluation =
+            judge_user_operation_scenario(&state, &contact, scenario, expected, &turns).await;
         let passed = evaluation
             .get("passed")
             .and_then(|value| value.as_bool())
@@ -125,13 +135,18 @@ pub(super) async fn run_user_operation_evaluation(
                 .unwrap_or(false)
         })
         .count();
+    let inconclusive_count = items
+        .iter()
+        .filter(|item| item["evaluation"]["verdict"] == "inconclusive")
+        .count();
     Ok(Json(json!({
         "runMode": "shadow_evaluation",
         "scenarioProfile": if profile.transaction_facts_enabled { "transactional" } else { "relationship" },
         "summary": {
             "total": items.len(),
             "passed": passed_count,
-            "failed": items.len().saturating_sub(passed_count)
+            "failed": items.len().saturating_sub(passed_count + inconclusive_count),
+            "inconclusive": inconclusive_count,
         },
         "items": items
     })))
@@ -189,67 +204,174 @@ fn evaluation_scenarios(
     ]
 }
 
-pub(super) fn judge_user_operation_scenario(
+pub(super) async fn judge_user_operation_scenario(
+    state: &AppState,
+    contact: &crate::models::Contact,
     scenario: &str,
     expected: &str,
     turns: &[agent::UserOperationSimulationTurn],
 ) -> Value {
     let Some(last_turn) = turns.last() else {
-        return json!({
-            "passed": false,
-            "scores": {},
-            "issues": ["场景没有生成任何 turn"],
-            "summary": "评测失败：没有输出",
-            "recommendation": "检查 simulation 输入和联系人状态"
-        });
+        return judge_evaluation(
+            "inconclusive",
+            scenario,
+            expected,
+            None,
+            vec!["场景没有生成任何 turn".to_string()],
+            "评测无法完成：没有可评估输出".to_string(),
+            "检查 simulation 输入和联系人状态".to_string(),
+        );
     };
-    // S1.3 (Phase 0)：simulation 不再硬编码 5 闸阈值，改成"读 prod 路径的
-    // enforce_decision_guards / review_passed 终态"。`simulate_user_dialogue`
-    // 已经走 gateway → review，所以 review.scores / final_review_status /
-    // gateway_status 与 prod 同源。本函数只把 review 终态翻译成 evaluation 视图。
-    let scores = last_turn.review.get_document("scores").ok();
-    let human_like = doc_i32_opt(scores, "humanLike");
-    let emotional_value = doc_i32_opt(scores, "emotionalValue");
-    let hallucination = doc_i32_opt(scores, "hallucinationScore");
-    let knowledge_grounding = doc_i32_opt(scores, "knowledgeGroundingScore");
-    let pressure_risk = doc_i32_opt(scores, "pressureRisk");
-    let mut issues: Vec<String> = Vec::new();
-    // 硬闸判定复用生产同源信号:simulation.rs:207-216 已用生产 review_passed
-    // 把每轮终态算进 turn.status(would_send/review_blocked/gateway_blocked/no_reply)。
-    // 不再自算 hallucination/grounding 硬阈值——旧 50/60 阈值是 0-100 档,与 reviewer
-    // 的 0-10 档错配(幻觉闸恒不触发=死闸、grounding 闸恒误判 failed);旧 finalReviewStatus
-    // 匹配块读的字段 DecisionReviewResult 序列化根本不产生,恒为空=死门。
-    match last_turn.status.as_str() {
-        "would_send" | "no_reply" => {}
-        "review_blocked" => issues.push("Review 闸拦截：候选回复未通过独立 Review".to_string()),
-        "gateway_blocked" => issues.push("发送网关拦截，需要检查频控或纳管状态".to_string()),
-        "blocked_by_safety_guard" => {
-            issues.push("安全门拦截：候选回复含未获支持的现实声明".to_string())
-        }
-        "blocked_unverified_product_claim" => {
-            issues.push("产品声明拦截：候选回复缺少可核实知识依据".to_string())
-        }
-        "held_by_ai_policy" => issues.push("AI 策略暂缓：候选动作未获发送授权".to_string()),
-        status => issues.push(format!("生产终态未获发送授权：{status}")),
+
+    if !matches!(last_turn.status.as_str(), "would_send" | "no_reply") {
+        return judge_evaluation(
+            "fail",
+            scenario,
+            expected,
+            Some(last_turn),
+            vec![format!("生产终态未获发送授权：{}", last_turn.status)],
+            "场景未进入可发送或主动沉默终态".to_string(),
+            "先检查 turns 中的授权清单、Review 和 Gateway 结果".to_string(),
+        );
     }
-    // scores 仍读取并透传给前端展示(humanLike/hallucination 等),但不参与拦截判定。
-    let passed = matches!(last_turn.status.as_str(), "would_send" | "no_reply");
+
+    let system = match crate::prompts::load_prompt_for_contact(
+        &state.db,
+        &contact.workspace_id,
+        "eval.user_operation_judge.system",
+        &contact.wxid,
+        contact.locale.as_deref(),
+    )
+    .await
+    {
+        Ok((prompt, _)) => prompt,
+        Err(error) => {
+            return inconclusive_judge_evaluation(
+                scenario,
+                expected,
+                last_turn,
+                format!("加载评测提示词失败：{error}"),
+            )
+        }
+    };
+    let snapshot = json!({
+        "scenario": scenario,
+        "expectedBehavior": expected,
+        "terminalStatus": last_turn.status,
+        "turns": turns,
+    });
+    let user = format!(
+        "请基于冻结的 shadow simulation 判断是否满足场景目标。主动沉默 no_reply 既不能自动通过，也不能自动失败，必须结合用户意图和完整对话判断。\n\n输出且只输出以下严格 JSON，字段不得缺失：\n{{\n  \"verdict\": \"pass | fail | inconclusive\",\n  \"issues\": [],\n  \"summary\": \"\",\n  \"recommendation\": \"\"\n}}\n\n冻结输入：\n{}",
+        serde_json::to_string(&snapshot).unwrap_or_default()
+    );
+    let judge_run_id = format!("shadow-evaluation:{}:{}", scenario, uuid::Uuid::new_v4());
+    let raw = match agent::generate_agent_json(
+        state,
+        &contact.workspace_id,
+        Some(&contact.account_id),
+        Some(&contact.wxid),
+        Some(&judge_run_id),
+        "eval.user_operation_judge.system",
+        &system,
+        &user,
+    )
+    .await
+    {
+        Ok(raw) => raw,
+        Err(error) => {
+            return inconclusive_judge_evaluation(
+                scenario,
+                expected,
+                last_turn,
+                format!("Judge 调用失败：{error}"),
+            )
+        }
+    };
+    match parse_judge_output(raw) {
+        Ok(output) => judge_evaluation(
+            &output.verdict,
+            scenario,
+            expected,
+            Some(last_turn),
+            output.issues,
+            output.summary,
+            output.recommendation,
+        ),
+        Err(reason) => inconclusive_judge_evaluation(
+            scenario,
+            expected,
+            last_turn,
+            format!("Judge 输出无效：{reason}"),
+        ),
+    }
+}
+
+fn parse_judge_output(raw: Value) -> Result<UserOperationJudgeOutput, String> {
+    let mut output: UserOperationJudgeOutput =
+        serde_json::from_value(raw).map_err(|error| error.to_string())?;
+    output.verdict = output.verdict.trim().to_string();
+    if !matches!(output.verdict.as_str(), "pass" | "fail" | "inconclusive") {
+        return Err(format!("invalid verdict: {}", output.verdict));
+    }
+    output.summary = output.summary.trim().to_string();
+    output.recommendation = output.recommendation.trim().to_string();
+    if output.summary.is_empty() || output.recommendation.is_empty() {
+        return Err("summary and recommendation must be non-empty".to_string());
+    }
+    output.issues = output
+        .issues
+        .into_iter()
+        .map(|issue| issue.trim().to_string())
+        .filter(|issue| !issue.is_empty())
+        .take(20)
+        .collect();
+    Ok(output)
+}
+
+fn inconclusive_judge_evaluation(
+    scenario: &str,
+    expected: &str,
+    last_turn: &agent::UserOperationSimulationTurn,
+    issue: String,
+) -> Value {
+    judge_evaluation(
+        "inconclusive",
+        scenario,
+        expected,
+        Some(last_turn),
+        vec![issue],
+        "评测无法得出可靠结论".to_string(),
+        "检查 Judge 可用性和输出契约后重新评测".to_string(),
+    )
+}
+
+fn judge_evaluation(
+    verdict: &str,
+    scenario: &str,
+    expected: &str,
+    last_turn: Option<&agent::UserOperationSimulationTurn>,
+    issues: Vec<String>,
+    summary: String,
+    recommendation: String,
+) -> Value {
+    let scores = last_turn.and_then(|turn| turn.review.get_document("scores").ok());
     json!({
-        "passed": passed,
+        "verdict": verdict,
+        "passed": verdict == "pass",
         "runMode": "shadow",
         "scores": {
-            "humanLike": human_like,
-            "emotionalValue": emotional_value,
-            "hallucinationScore": hallucination,
-            "knowledgeGroundingScore": knowledge_grounding,
-            "pressureRisk": pressure_risk,
+            "humanLike": doc_i32_opt(scores, "humanLike"),
+            "emotionalValue": doc_i32_opt(scores, "emotionalValue"),
+            "hallucinationScore": doc_i32_opt(scores, "hallucinationScore"),
+            "knowledgeGroundingScore": doc_i32_opt(scores, "knowledgeGroundingScore"),
+            "pressureRisk": doc_i32_opt(scores, "pressureRisk"),
         },
-        "finalReviewStatus": last_turn.status.clone(),
+        "finalReviewStatus": last_turn.map(|turn| turn.status.as_str()).unwrap_or("missing"),
         "issues": issues,
-        "summary": if passed { "场景通过 prod 同源 review 终态" } else { "场景存在需要优化的风险项" },
+        "summary": summary,
         "scenario": scenario,
         "expected": expected,
-        "recommendation": if passed { "保持当前策略，继续做长对话回归" } else { "查看 turns 中的 reply、review 和 memoryCard 后优化提示词或知识库" }
+        "recommendation": recommendation,
     })
 }
 
@@ -281,68 +403,78 @@ mod judge_tests {
             gateway_result: Document::new(),
             knowledge_route: Document::new(),
             context_pack: Document::new(),
+            commit_receipt: Document::new(),
             memory_preview: Document::new(),
             state_transition: Document::new(),
         }
     }
 
     #[test]
-    fn would_send_turn_judged_passed() {
-        let turns = vec![would_send_turn()];
-        let v = judge_user_operation_scenario("询价", "正常报价", &turns);
-        // 生产 review_passed 已让该 turn=would_send,judge 不应再判 failed
-        assert_eq!(
-            v["passed"],
-            serde_json::Value::Bool(true),
-            "would_send(生产已通过)必须 judged passed;旧 grounding<60 死规则会误判 failed: issues={}",
-            v["issues"]
-        );
-    }
-
-    #[test]
-    fn review_blocked_turn_judged_failed() {
-        let mut turns = vec![would_send_turn()];
-        // status=review_blocked 表示生产 review_passed 拦了它(simulation.rs:209)
-        turns[0].status = "review_blocked".into();
-        let v = judge_user_operation_scenario("询价", "正常报价", &turns);
-        assert_eq!(
-            v["passed"],
-            serde_json::Value::Bool(false),
-            "review_blocked(生产已拦)必须 judged failed"
-        );
-    }
-
-    #[test]
-    fn every_non_send_terminal_is_failed_instead_of_false_green() {
-        for status in [
-            "blocked_by_safety_guard",
-            "blocked_unverified_product_claim",
-            "held_by_ai_policy",
-            "revision_required",
-            "blocked_by_budget",
-            "internal_error",
-        ] {
-            let mut turns = vec![would_send_turn()];
-            turns[0].status = status.to_string();
-            let result = judge_user_operation_scenario("regression", "must send safely", &turns);
-            assert_eq!(
-                result["passed"],
-                serde_json::Value::Bool(false),
-                "status={status}"
+    fn judge_contract_supports_pass_fail_and_inconclusive_for_no_reply() {
+        let mut turn = would_send_turn();
+        turn.status = "no_reply".to_string();
+        for (verdict, passed) in [("pass", true), ("fail", false), ("inconclusive", false)] {
+            let output = parse_judge_output(json!({
+                "verdict": verdict,
+                "issues": if verdict == "pass" { Vec::<String>::new() } else { vec!["reason".to_string()] },
+                "summary": "semantic judgment",
+                "recommendation": "keep testing"
+            }))
+            .unwrap();
+            let result = judge_evaluation(
+                &output.verdict,
+                "silence",
+                "safe silence",
+                Some(&turn),
+                output.issues,
+                output.summary,
+                output.recommendation,
             );
-            assert!(result["issues"]
-                .as_array()
-                .is_some_and(|issues| !issues.is_empty()));
+            assert_eq!(result["passed"], serde_json::Value::Bool(passed));
+            assert_eq!(result["verdict"], verdict);
         }
     }
 
     #[test]
-    fn no_reply_is_an_explicit_passing_terminal() {
-        let mut turns = vec![would_send_turn()];
-        turns[0].status = "no_reply".to_string();
-        let result = judge_user_operation_scenario("silence", "safe silence", &turns);
-        assert_eq!(result["passed"], serde_json::Value::Bool(true));
-        assert_eq!(result["issues"].as_array().map(Vec::len), Some(0));
+    fn malformed_or_unknown_judge_output_is_not_a_pass() {
+        assert!(parse_judge_output(json!({
+            "verdict": "pass",
+            "issues": [],
+            "summary": "missing recommendation"
+        }))
+        .is_err());
+        assert!(parse_judge_output(json!({
+            "verdict": "maybe",
+            "issues": [],
+            "summary": "uncertain",
+            "recommendation": "retry"
+        }))
+        .is_err());
+        assert!(parse_judge_output(json!({
+            "verdict": "pass",
+            "issues": [],
+            "summary": "ok",
+            "recommendation": "continue",
+            "passed": true
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn deterministic_non_send_terminal_is_failed() {
+        let mut turn = would_send_turn();
+        turn.status = "blocked_by_safety_guard".to_string();
+        let result = judge_evaluation(
+            "fail",
+            "regression",
+            "must be authorized",
+            Some(&turn),
+            vec![format!("生产终态未获发送授权：{}", turn.status)],
+            "not authorized".to_string(),
+            "inspect authorization".to_string(),
+        );
+        assert_eq!(result["passed"], false);
+        assert_eq!(result["verdict"], "fail");
     }
 
     #[test]

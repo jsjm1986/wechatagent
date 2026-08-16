@@ -3,5 +3,6 @@
   "acknowledgement",
   "silent",
   "follow_up",
-  "cooldown"
+  "cooldown",
+  "appointment_request"
 ]

@@ -140,10 +140,12 @@ impl RunAuditBuffer {
         self.path.lock().tier = Some(tier.to_string());
     }
 
+    #[cfg(test)]
     pub(crate) fn mark_rewrite(&self) {
         self.path.lock().rewrite = true;
     }
 
+    #[cfg(test)]
     pub(crate) fn mark_revision(&self) {
         self.path.lock().revision = true;
     }
@@ -357,14 +359,6 @@ fn with_current_audit(action: impl FnOnce(&RunAuditBuffer)) {
 
 pub(crate) fn mark_tier(tier: &str) {
     with_current_audit(|audit| audit.set_tier(tier));
-}
-
-pub(crate) fn mark_rewrite() {
-    with_current_audit(RunAuditBuffer::mark_rewrite);
-}
-
-pub(crate) fn mark_revision() {
-    with_current_audit(RunAuditBuffer::mark_revision);
 }
 
 pub(crate) fn mark_no_reply() {

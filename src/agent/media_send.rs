@@ -493,6 +493,9 @@ mod tests {
             review_status: review.map(|s| s.to_string()),
             review_note: None,
             min_inject_tier: None,
+            enabled: None,
+            allowed_insertion_levels: None,
+            usage_guidance: None,
             created_at: DateTime::now(),
             updated_at: DateTime::now(),
         }

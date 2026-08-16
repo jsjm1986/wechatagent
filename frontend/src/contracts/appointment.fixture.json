@@ -1,0 +1,20 @@
+{
+  "accountId": "account-contract",
+  "confirmationSourceId": "admin-contract",
+  "confirmationSourceType": "admin",
+  "confirmedEnd": "2026-08-22T03:30:00Z",
+  "confirmedStart": "2026-08-22T02:30:00Z",
+  "contactWxid": "wxid-contract",
+  "createdAt": "2026-08-15T01:00:00Z",
+  "id": "64b64c76f1f0a3a72c2f9a10",
+  "idempotencyKey": "appointment-request:v1:turn-contract",
+  "location": "院区一层咨询室",
+  "requestText": "客户希望周六上午到院面诊",
+  "requestedEnd": "2026-08-22T03:00:00Z",
+  "requestedStart": "2026-08-22T02:00:00Z",
+  "sourceTurnId": "turn-contract",
+  "status": "confirmed",
+  "updatedAt": "2026-08-15T01:30:00Z",
+  "version": 3,
+  "workspaceId": "workspace-contract"
+}

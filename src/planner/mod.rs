@@ -676,7 +676,9 @@ pub(crate) fn pick_commitment_emit_target(
         let CommitmentRepr::Structured(entry) = repr else {
             continue;
         };
-        if entry.id.is_empty() {
+        // Only a delivered, active commitment is an autonomous follow-up authority. Pending or
+        // terminal lifecycle rows remain auditable but must not trigger customer contact.
+        if entry.status != "active" || entry.id.is_empty() {
             continue;
         }
         // due_at 缺失时用 created_at + fallback 窗口合成（仅当 fallback 启用）。
@@ -2580,6 +2582,12 @@ mod tests {
             text: text.to_string(),
             due_at,
             created_at: DateTime::from_millis(0),
+            status: "active".to_string(),
+            fulfilled_at: None,
+            cancelled_at: None,
+            superseded_by: None,
+            source_id: None,
+            related_entity_id: None,
             extra: Document::new(),
         })
     }
@@ -2822,6 +2830,12 @@ mod tests {
             text: "无 due 的承诺".to_string(),
             due_at: None,
             created_at: DateTime::from_millis(created_ms),
+            status: "active".to_string(),
+            fulfilled_at: None,
+            cancelled_at: None,
+            superseded_by: None,
+            source_id: None,
+            related_entity_id: None,
             extra: Document::new(),
         })
     }
@@ -2873,6 +2887,29 @@ mod tests {
         let now = dt(10_000_000);
         let contact = Contact {
             commitments: vec![entry("", "无 id", Some(dt(now.timestamp_millis() - 1_000)))],
+            ..template()
+        };
+        assert!(pick_commitment_emit_target(&contact, now, 8, 0).is_none());
+    }
+
+    #[test]
+    fn commitment_skips_pending_delivery_status() {
+        let now = dt(10_000_000);
+        let pending = CommitmentRepr::Structured(CommitmentEntry {
+            id: "pending".to_string(),
+            text: "尚未确认送达".to_string(),
+            due_at: Some(dt(now.timestamp_millis() - 1_000)),
+            created_at: dt(0),
+            status: "pending_delivery".to_string(),
+            fulfilled_at: None,
+            cancelled_at: None,
+            superseded_by: None,
+            source_id: None,
+            related_entity_id: None,
+            extra: Document::new(),
+        });
+        let contact = Contact {
+            commitments: vec![pending],
             ..template()
         };
         assert!(pick_commitment_emit_target(&contact, now, 8, 0).is_none());

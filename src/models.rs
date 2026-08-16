@@ -1305,8 +1305,144 @@ pub struct ContentAsset {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_inject_tier: Option<String>,
 
+    /// Runtime governance for text assets. Only explicitly enabled, approved rows may enter the
+    /// authority snapshot or Reply prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Conversational insertion levels the Agent may choose semantically. Values are
+    /// `subtle/contextual/direct`; this is guidance, never a deterministic message classifier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_insertion_levels: Option<Vec<String>>,
+    /// Operator-authored natural-language guidance describing when and how this asset is useful.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_guidance: Option<String>,
+
     pub created_at: DateTime,
     pub updated_at: DateTime,
+}
+
+/// Append-only observation that may participate in a future turn's authority snapshot.
+///
+/// `content` records what the source established. `authority_boundary` records what it may not be
+/// stretched to establish. Outbound AI text is deliberately not an allowed source type.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthorityObservation {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub workspace_id: String,
+    pub account_id: String,
+    pub contact_wxid: String,
+    pub source_type: String,
+    pub source_id: String,
+    pub subject: String,
+    pub content: String,
+    pub authority_boundary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_from: Option<DateTime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_until: Option<DateTime>,
+    /// `active/superseded/revoked/expired/legacy_unverified`.
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<ObjectId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_run_id: Option<String>,
+    pub created_at: DateTime,
+    pub updated_at: DateTime,
+}
+
+pub const APPOINTMENT_STATUSES: &[&str] = &[
+    "requested",
+    "pending_confirmation",
+    "confirmed",
+    "reschedule_requested",
+    "cancelled",
+    "completed",
+    "no_show",
+    "expired",
+];
+
+/// Customer visit lifecycle. The Agent may create a request, but confirmation requires an
+/// administrator/principal/tool receipt recorded in `confirmation_source_*`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Appointment {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub workspace_id: String,
+    pub account_id: String,
+    pub contact_wxid: String,
+    /// Stable caller-provided identity for retry-safe request creation.
+    pub idempotency_key: String,
+    pub status: String,
+    pub request_text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_start: Option<DateTime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_end: Option<DateTime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmed_start: Option<DateTime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmed_end: Option<DateTime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmation_source_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmation_source_id: Option<String>,
+    pub source_turn_id: String,
+    pub version: i64,
+    pub created_at: DateTime,
+    pub updated_at: DateTime,
+}
+
+/// One account-wide current social world state. It prevents each contact from receiving an
+/// independently invented daily life while still allowing natural conversational texture.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersonaWorldState {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub workspace_id: String,
+    pub account_id: String,
+    pub current: bool,
+    pub state_text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub availability: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mood: Option<String>,
+    pub effective_from: DateTime,
+    pub effective_until: DateTime,
+    pub version: i64,
+    pub generated_by: String,
+    pub created_at: DateTime,
+    pub updated_at: DateTime,
+}
+
+/// Bounded, replayable authority snapshot for one turn. Full hidden prompts and chain-of-thought
+/// are never stored here; sources and trace entries contain only model-visible evidence and
+/// structured decisions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentTurnSnapshot {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub run_id: String,
+    pub turn_id: String,
+    pub workspace_id: String,
+    pub account_id: String,
+    pub contact_wxid: String,
+    pub authority_version: i32,
+    pub bundle_hash: String,
+    #[serde(default)]
+    pub sources: Vec<Document>,
+    #[serde(default)]
+    pub evidence_ledger: Vec<Document>,
+    #[serde(default)]
+    pub loop_trace: Vec<Document>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization_manifest: Option<Document>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_receipt: Option<Document>,
+    pub created_at: DateTime,
+    pub expires_at: DateTime,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -5161,6 +5297,25 @@ mod typed {
         /// 触发本条 fact 的 run_id。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub source_run_id: Option<String>,
+        /// Authority classification for this fact. New durable facts must carry a non-empty value;
+        /// migrated rows use `legacy_unverified` and cannot authorize current business state.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub authority: Option<String>,
+        /// Origin category such as `customer_inbound`, `admin`, `principal_decision`, or `tool`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub source_type: Option<String>,
+        /// Subject described by the fact. Kept open (`customer`, `business`, etc.) for semantic use.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub subject: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub valid_from: Option<DateTime>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub valid_until: Option<DateTime>,
+        /// `active/legacy_unverified/superseded/revoked/expired`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub status: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub superseded_by: Option<String>,
         /// 创建时间。
         #[serde(default = "default_epoch_dt")]
         pub created_at: DateTime,
@@ -5191,6 +5346,13 @@ mod typed {
                 dimension: None,
                 source_message_ids: Vec::new(),
                 source_run_id: None,
+                authority: None,
+                source_type: None,
+                subject: None,
+                valid_from: None,
+                valid_until: None,
+                status: None,
+                superseded_by: None,
                 created_at: DateTime::from_millis(0),
                 updated_at: DateTime::from_millis(0),
                 extra: Document::new(),
@@ -5215,6 +5377,13 @@ mod typed {
                 dimension: None,
                 source_message_ids: Vec::new(),
                 source_run_id: None,
+                authority: Some("legacy_unverified".to_string()),
+                source_type: Some("legacy".to_string()),
+                subject: None,
+                valid_from: Some(now),
+                valid_until: None,
+                status: Some("legacy_unverified".to_string()),
+                superseded_by: None,
                 created_at: now,
                 updated_at: now,
                 extra: Document::new(),
@@ -5438,8 +5607,25 @@ mod typed {
         pub due_at: Option<DateTime>,
         #[serde(default = "default_epoch_dt")]
         pub created_at: DateTime,
+        /// `pending_delivery/active/fulfilled/cancelled/superseded/expired`.
+        #[serde(default = "default_commitment_status")]
+        pub status: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub fulfilled_at: Option<DateTime>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub cancelled_at: Option<DateTime>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub superseded_by: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub source_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub related_entity_id: Option<ObjectId>,
         #[serde(flatten, default)]
         pub extra: Document,
+    }
+
+    fn default_commitment_status() -> String {
+        "active".to_string()
     }
 
     impl CommitmentEntry {
@@ -5450,6 +5636,12 @@ mod typed {
                 text,
                 due_at: None,
                 created_at: DateTime::now(),
+                status: default_commitment_status(),
+                fulfilled_at: None,
+                cancelled_at: None,
+                superseded_by: None,
+                source_id: None,
+                related_entity_id: None,
                 extra: Document::new(),
             }
         }
@@ -6398,6 +6590,13 @@ mod typed_tests {
             dimension: None,
             source_message_ids: vec![ObjectId::new(), ObjectId::new()],
             source_run_id: Some("run-abc".to_string()),
+            authority: Some("Customer statement only".to_string()),
+            source_type: Some("customer_inbound".to_string()),
+            subject: Some("customer".to_string()),
+            valid_from: Some(DateTime::from_millis(1_700_000_000_000)),
+            valid_until: None,
+            status: Some("active".to_string()),
+            superseded_by: None,
             created_at: DateTime::from_millis(1_700_000_000_000),
             updated_at: DateTime::from_millis(1_700_000_010_000),
             extra: Document::new(),
@@ -7670,6 +7869,9 @@ mod content_asset_compat_tests {
             review_status: Some("approved".into()),
             review_note: None,
             min_inject_tier: None,
+            enabled: Some(true),
+            allowed_insertion_levels: Some(vec!["contextual".into()]),
+            usage_guidance: Some("仅在客户明确询问报价资料时使用".into()),
             created_at: DateTime::now(),
             updated_at: DateTime::now(),
         };

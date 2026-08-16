@@ -1,7 +1,7 @@
 //! 2026_05_W4_001：为每个 user_operations 状态机里的 state_key 写一行默认 policy。
 //!
-//! 默认策略遵循"宽允许 / 窄禁止"原则：所有 state 默认允许 `["reply","silent","follow_up"]`
-//! 三动作；只有 `cooldown` state 强制 `forbidden=["reply"]`（冷却期不主动回复）。
+//! 默认策略遵循"宽允许 / 窄禁止"原则：所有 state 默认允许回复、确认、静默、跟进和
+//! 客户预约请求记录；只有 `forbidsProactive` state 强制 `forbidden=["reply"]`。
 //! 已存在的 (workspace_id, domain, state_key) 行被跳过，保留运营人员的手工调整。
 
 use futures::TryStreamExt;
@@ -17,9 +17,8 @@ use crate::models::OperationStatePolicy;
 /// [`crate::routes::admin_ops_versions::publish_state_machine_version`]（profile activate
 /// 联动 publish 行业状态机时重派生）。两处共用一份逻辑，杜绝「m013 与 publish 路径漂移」。
 ///
-/// 返回向量的**顺序与内容**与改造前 m013 内联逻辑逐字等价（DEFAULT 字节等价红线）：
-/// - `true`  → allowed `["silent","follow_up"]`、forbidden `["reply"]`
-/// - `false` → allowed `["reply","silent","follow_up"]`、forbidden `[]`
+/// - `true`  → 禁普通主动回复，但允许无事实确认、静默、跟进和记录客户预约请求；
+/// - `false` → 允许完整动作集合。
 pub(crate) fn derive_state_policy_lists(forbids_proactive: bool) -> (Vec<String>, Vec<String>) {
     if forbids_proactive {
         (
@@ -27,6 +26,7 @@ pub(crate) fn derive_state_policy_lists(forbids_proactive: bool) -> (Vec<String>
                 "acknowledgement".to_string(),
                 "silent".to_string(),
                 "follow_up".to_string(),
+                "appointment_request".to_string(),
             ],
             vec!["reply".to_string()],
         )
@@ -37,6 +37,7 @@ pub(crate) fn derive_state_policy_lists(forbids_proactive: bool) -> (Vec<String>
                 "acknowledgement".to_string(),
                 "silent".to_string(),
                 "follow_up".to_string(),
+                "appointment_request".to_string(),
             ],
             Vec::new(),
         )
@@ -119,8 +120,8 @@ pub(super) async fn run_step(db: &Database) -> AppResult<()> {
 mod tests {
     use super::derive_state_policy_lists;
 
-    /// `forbidsProactive=true`：禁主动回复——allowed=["silent","follow_up"]、forbidden=["reply"]。
-    /// 顺序与内容锁死（DEFAULT 字节等价红线：与改造前 m013 内联逻辑逐字一致）。
+    /// `forbidsProactive=true` blocks ordinary replies but still permits recording a customer
+    /// appointment request because that write is reactive and independently authorized.
     #[test]
     fn derive_forbids_proactive_blocks_reply() {
         let (allowed, forbidden) = derive_state_policy_lists(true);
@@ -130,6 +131,7 @@ mod tests {
                 "acknowledgement".to_string(),
                 "silent".to_string(),
                 "follow_up".to_string(),
+                "appointment_request".to_string(),
             ]
         );
         assert_eq!(forbidden, vec!["reply".to_string()]);
@@ -146,6 +148,7 @@ mod tests {
                 "acknowledgement".to_string(),
                 "silent".to_string(),
                 "follow_up".to_string(),
+                "appointment_request".to_string(),
             ]
         );
         assert!(forbidden.is_empty());

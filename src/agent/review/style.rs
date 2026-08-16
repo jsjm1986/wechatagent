@@ -65,6 +65,7 @@ pub(crate) fn extract_outbound_style_fingerprint(content: &str) -> String {
 /// 机械风格比较的唯一允许结果。刻意没有 `Revise` / `Block` 变体：结构指纹
 /// 只能产生质量观测，不能改变已经通过 Reviewer / ClaimGate 的发送授权。
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) enum StyleContinuityObservation {
     NoSignal,
     AuditOnly { previous: String, current: String },
@@ -74,6 +75,7 @@ pub(crate) enum StyleContinuityObservation {
 ///
 /// 风格指纹有 6 段 `key:value`。不同段数或至少 3 个轴变化时记为漂移；该信号
 /// 只能用于审计。长度、问号和句末符号高度依赖当前语义，不能单独触发改写。
+#[cfg(test)]
 pub(crate) fn observe_style_continuity(
     previous: &str,
     current: &str,

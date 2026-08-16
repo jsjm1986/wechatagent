@@ -26,9 +26,9 @@ use serde_json::json;
 
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    AgentProfile, AgentTask, ConfirmedTag, Contact, ConversationMessage, Evidence, MemoryCandidate,
-    MemoryCardTyped, MemoryFact, MemoryFactRepr, OperatingMemory, PersonalityFacet,
-    PersonalityProfile, PersonalitySnapshot,
+    AgentProfile, AgentTask, CommitmentRepr, ConfirmedTag, Contact, ConversationMessage, Evidence,
+    MemoryCandidate, MemoryCardTyped, MemoryFact, MemoryFactRepr, OperatingMemory,
+    PersonalityFacet, PersonalityProfile, PersonalitySnapshot,
 };
 use crate::prompts;
 use crate::routes::AppState;
@@ -237,10 +237,20 @@ pub(crate) fn memory_card_from_contact(
     let mut preferences = Vec::new();
     push_unique_text(&mut preferences, Some(&communication_style));
     let mut commitments = Vec::new();
-    push_unique_text(
-        &mut commitments,
-        contact.commitments.last().map(|c| c.text()),
-    );
+    let latest_active_commitment = contact
+        .commitments
+        .iter()
+        .rev()
+        .find(|commitment| match commitment {
+            // Legacy plain entries have no lifecycle field; migrations preserve them as the
+            // pre-existing active commitment representation.
+            CommitmentRepr::Plain(text) => !text.trim().is_empty(),
+            CommitmentRepr::Structured(entry) => {
+                entry.status == "active" && !entry.text.trim().is_empty()
+            }
+        })
+        .map(|commitment| commitment.text());
+    push_unique_text(&mut commitments, latest_active_commitment);
     let mut open_loops = Vec::new();
     push_unique_text(&mut open_loops, contact.follow_up_policy.as_deref());
 
@@ -306,6 +316,29 @@ fn push_seed_fact(items: &mut Vec<MemoryFactRepr>, value: Option<&str>, source: 
         return;
     }
     let mut fact = crate::models::MemoryFact::from_plain_text(text.to_string());
+    let (authority, subject) = match source {
+        "operator_manual" => (
+            "Authorizes only this exact operator-authored customer record; it does not establish a business capability, price, schedule, or outcome.",
+            "customer",
+        ),
+        "confirmed_tag" => (
+            "Authorizes only this exact customer-side tag as recorded by the operator; it does not establish a business capability, price, schedule, or outcome.",
+            "customer",
+        ),
+        _ => (
+            "Authorizes only the exact recorded customer-side fact and its declared provenance.",
+            "customer",
+        ),
+    };
+    let now = DateTime::now();
+    fact.authority = Some(authority.to_string());
+    fact.source_type = Some(source.to_string());
+    fact.subject = Some(subject.to_string());
+    fact.evidence = Some(text.to_string());
+    fact.valid_from = Some(now);
+    fact.status = Some("active".to_string());
+    fact.created_at = now;
+    fact.updated_at = now;
     fact.extra.insert("source", source);
     items.push(MemoryFactRepr::Structured(fact));
 }
@@ -2930,7 +2963,7 @@ pub(crate) fn evidence_capped_importance(evidence: &str, importance: i32) -> i32
     }
 }
 
-fn validated_memory_candidate(candidate: Document) -> Option<Document> {
+pub(crate) fn validated_memory_candidate(candidate: Document) -> Option<Document> {
     let candidate_type = doc_string(&candidate, "type")?;
     let content = doc_string(&candidate, "content")?;
     let evidence = doc_string(&candidate, "evidence")?;
@@ -3616,6 +3649,13 @@ mod r7_deprecation_tests {
             dimension: None,
             source_message_ids: vec![],
             source_run_id: None,
+            authority: None,
+            source_type: None,
+            subject: None,
+            valid_from: None,
+            valid_until: None,
+            status: None,
+            superseded_by: None,
             created_at: DateTime::from_millis(0),
             updated_at: DateTime::from_millis(0),
             extra: Default::default(),
@@ -4341,6 +4381,49 @@ mod r7_deprecation_tests {
             core_texts.iter().any(|t| *t == "家长"),
             "manual_tags 应留 core_facts"
         );
+        let fact = card
+            .core_facts
+            .iter()
+            .find_map(|item| match item {
+                MemoryFactRepr::Structured(fact) if fact.text == "VIP 客户" => Some(fact),
+                _ => None,
+            })
+            .expect("operator fact should be structured");
+        assert_eq!(fact.status.as_deref(), Some("active"));
+        assert_eq!(fact.source_type.as_deref(), Some("operator_manual"));
+        assert_eq!(fact.subject.as_deref(), Some("customer"));
+        assert!(fact
+            .authority
+            .as_deref()
+            .is_some_and(|value| value.contains("operator-authored")));
+    }
+
+    #[test]
+    fn memory_card_excludes_pending_commitments_from_prompt_seed() {
+        use super::memory_card_from_contact;
+        use crate::models::{CommitmentEntry, CommitmentRepr};
+
+        let mut active = CommitmentEntry::from_plain_text("已确认的回访承诺".to_string());
+        active.status = "active".to_string();
+        let mut pending = CommitmentEntry::from_plain_text("尚未确认送达的承诺".to_string());
+        pending.status = "pending_delivery".to_string();
+        let contact = Contact {
+            commitments: vec![
+                CommitmentRepr::Structured(active),
+                CommitmentRepr::Structured(pending),
+            ],
+            ..seed_contact()
+        };
+
+        let card = memory_card_from_contact(&contact, &seed_memory(), "new_contact");
+        let values = card
+            .extra
+            .get_array("commitments")
+            .expect("commitment prompt slot")
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(values, vec!["已确认的回访承诺"]);
     }
 
     #[test]

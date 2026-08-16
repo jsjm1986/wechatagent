@@ -16,11 +16,13 @@
 
 #![allow(dead_code)]
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use mongodb::bson::{doc, Document};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use super::budget::RunBudget;
 use super::knowledge_tools::{
@@ -132,8 +134,8 @@ async fn chat_reply_with_tools_loop_with_timeout<'a>(
     let mut failure_streak: i32 = 0;
     let mut tool_calls_dispatched: i32 = 0;
     let mut last_decision: Option<AgentDecision> = None;
-    let mut last_promote_risks: Vec<String> = Vec::new();
     let mut loop_count: i32 = 0;
+    let mut observed_progress = HashSet::new();
 
     while loop_count < max_loops {
         if tokio::time::Instant::now() >= deadline {
@@ -158,13 +160,14 @@ async fn chat_reply_with_tools_loop_with_timeout<'a>(
                 }
             };
         loop_count += 1;
-        last_promote_risks = promote_risks;
+        risks.extend(promote_risks);
 
         match decision.decision_phase.as_str() {
             "tool_calling" => {
                 if !decision.reply_text.trim().is_empty() || decision.should_reply {
                     risks.push("chat_tool_calling_phase_with_reply_text".to_string());
                 }
+                let context_start = accumulated_results.len();
                 let dispatch_outcome = dispatch_chat_turn(
                     &decision.tool_calls,
                     runtime,
@@ -190,6 +193,13 @@ async fn chat_reply_with_tools_loop_with_timeout<'a>(
                         risks,
                         tool_trace,
                     });
+                }
+                let progress_hash =
+                    tool_progress_hash(&decision.tool_calls, &accumulated_results[context_start..]);
+                if !observed_progress.insert(progress_hash) {
+                    risks.push("chat_tool_loop_no_progress".to_string());
+                    last_decision = Some(decision);
+                    break;
                 }
                 if dispatch_outcome.force_stop {
                     last_decision = Some(decision);
@@ -243,7 +253,8 @@ async fn chat_reply_with_tools_loop_with_timeout<'a>(
     }
 
     let elapsed_ms = loop_started.elapsed().as_millis() as i64;
-    risks.extend(last_promote_risks);
+    risks.sort();
+    risks.dedup();
     Ok(ChatToolLoopOutcome {
         decision,
         risks,
@@ -251,6 +262,16 @@ async fn chat_reply_with_tools_loop_with_timeout<'a>(
         tool_calls_dispatched,
         elapsed_ms,
     })
+}
+
+fn tool_progress_hash(tool_calls: &[ToolCallRequest], result_segment: &str) -> String {
+    let payload = serde_json::json!({
+        "toolCalls": tool_calls,
+        "resultSegment": result_segment,
+    });
+    hex::encode(Sha256::digest(
+        serde_json::to_vec(&payload).unwrap_or_default(),
+    ))
 }
 
 struct DispatchTurnOutcome {
@@ -593,7 +614,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn four_tool_calling_rounds_are_normalized_to_final() {
+    async fn repeated_tool_round_without_new_result_terminates_early() {
         let db = crate::db::Database::connect("mongodb://127.0.0.1:1/test", "wechatagent_test")
             .await
             .expect("lazy connect should not fail on URI parse");
@@ -619,13 +640,13 @@ mod tests {
         .await
         .expect("loop exhaustion should return a normalized outcome");
 
-        assert_eq!(call_count.load(Ordering::SeqCst), CHAT_TOOL_LOOP_MAX_LOOPS);
+        assert_eq!(call_count.load(Ordering::SeqCst), 2);
         assert_eq!(outcome.decision.decision_phase, "final");
         assert!(outcome.decision.tool_calls.is_empty());
         assert!(outcome
             .risks
             .iter()
-            .any(|risk| risk == "chat_tool_loop_exhausted"));
+            .any(|risk| risk == "chat_tool_loop_no_progress"));
     }
 
     #[tokio::test]

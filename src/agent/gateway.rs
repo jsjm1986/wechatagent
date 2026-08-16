@@ -49,9 +49,9 @@ use super::decision::{
 };
 use super::escalation;
 use super::guards::{
-    action_policy_state_key, check_state_transition, classify_reviewed_decision_action,
-    enforce_state_action_policy, initial_operation_state_key, normalize_decision_runtime,
-    normalize_decision_state, operation_states, planner_from_decision,
+    action_policy_state_key, check_state_transition, decision_operation_state_candidate,
+    enforce_reviewed_decision_actions, initial_operation_state_key, normalize_decision_runtime,
+    normalize_decision_state, planner_from_decision,
 };
 use super::knowledge_router::{
     empty_knowledge_route, load_operation_knowledge, maybe_emit_unverified_warning,
@@ -69,12 +69,10 @@ use super::outbox::{
     enqueue as outbox_enqueue, EnqueueOutcome, EnqueueRequest, OutboxStatus as OutboxSendStatus,
 };
 use super::review::{
-    apply_independent_claim_gate, apply_revision_fallback, contact_has_principal_product_exemption,
-    decide_revision, derive_revision_failure, effective_review_mode, ensure_independent_claim_gate,
-    evaluate_independent_claim_gate, finalize_review_for_send, local_decision_review,
-    review_decision, review_passed, should_run_review, should_run_targeted_rewrite,
-    FinalizeOutcome, GatewayStatusFinal, PendingFinalizeEvent, ReviewInvocationKind,
-    ReviewerPromptCache, RevisionDecision,
+    apply_independent_claim_gate, contact_has_principal_product_exemption,
+    evaluate_independent_claim_gate_with_authority, finalize_review_for_send, review_decision,
+    review_passed, FinalizeOutcome, GatewayStatusFinal, PendingFinalizeEvent, ReviewInvocationKind,
+    ReviewerPromptCache,
 };
 use super::run_envelope::{
     assert_final_review_status_valid, assert_gateway_status_valid, assert_lifecycle_valid,
@@ -83,10 +81,7 @@ use super::run_envelope::{
     SOURCE_KIND_FOLLOW_UP_TASK, SOURCE_KIND_INBOUND_MESSAGE, SOURCE_KIND_MANUAL_SEND,
 };
 use super::runtime::UserRuntimeParameters;
-use super::taxonomy::{
-    check_value as taxonomy_check_value, global_taxonomy_cache,
-    upsert_candidate as taxonomy_upsert_candidate, TaxonomyMatch,
-};
+use super::taxonomy::{check_value as taxonomy_check_value, TaxonomyMatch};
 use super::types::{
     doc_bool, doc_i64, doc_string, non_empty_option, AgentDecision, AgentTrigger,
     ContactSendResult, DecisionReviewResult, KnowledgeRouteResult, ManualContactSend,
@@ -110,6 +105,7 @@ fn existing_outbox_covers_decision(
 /// 条（丢最旧，与原 `drain(0..drop)` 语义一致）。去重仍在应用层快照判定（并发
 /// 下可能写重复——接受：planner pick_commitment_emit_target 单选 +
 /// commitment_recently_emitted 按 id 幂等，重复项最多占槽不重复 emit）。
+#[cfg(test)]
 pub(crate) fn build_commitment_push_update(
     entry: &crate::models::CommitmentEntry,
 ) -> mongodb::bson::Document {
@@ -599,6 +595,7 @@ fn review_and_evaluate_claim_gate<'a>(
     referral_cards: &'a [crate::models::ReferralCard],
     reviewer_prompts: &'a ReviewerPromptCache,
     invocation_kind: ReviewInvocationKind,
+    authority: &'a super::authority::AuthoritySnapshot,
 ) -> BoxFuture<
     'a,
     AppResult<(
@@ -628,7 +625,7 @@ fn review_and_evaluate_claim_gate<'a>(
                 Some(reviewer_prompts),
                 invocation_kind,
             ),
-            evaluate_independent_claim_gate(
+            evaluate_independent_claim_gate_with_authority(
                 state,
                 contact,
                 inbound,
@@ -641,6 +638,7 @@ fn review_and_evaluate_claim_gate<'a>(
                 mongodb::bson::DateTime::now(),
                 Some(run_id),
                 invocation_kind,
+                Some(authority),
             ),
         );
         Ok((review?, claim_gate))
@@ -813,6 +811,38 @@ async fn send_contact_message_gateway_inner(
     let knowledge_route = knowledge_route?;
     let selected_chunks =
         select_operation_knowledge_chunks(&operation_knowledge.chunks, &knowledge_route);
+    let manual_soul = match active_profile
+        .soul_override
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => value.to_string(),
+        None => super::decision::load_published_soul(state, &contact.workspace_id, "user").await?,
+    };
+    let authority = super::authority::compile(super::authority::AuthorityCompileInput {
+        state,
+        run_id: &run_id,
+        turn_id: &source_event_id,
+        contact: &contact,
+        inbound: &synthetic_inbound,
+        recent_messages: &context_messages,
+        memory: &memory,
+        active_products: &active_products,
+        referral_cards: &[],
+        effective_soul: &manual_soul,
+        projected_appointments: &[],
+        projected_world_state: None,
+        invocation: super::authority::AuthorityInvocation::ManualOutreach,
+        evaluated_at: DateTime::now(),
+    })
+    .await?;
+    authority.append_verified_knowledge(
+        &selected_chunks,
+        &route_used_knowledge_ids(&knowledge_route),
+        DateTime::now(),
+    )?;
+    authority.persist_initial(&state.db).await?;
     let mut decision = AgentDecision {
         should_reply: true,
         reply_text: content.clone(),
@@ -853,6 +883,7 @@ async fn send_contact_message_gateway_inner(
         &[],
         &reviewer_prompts,
         ReviewInvocationKind::ManualOutreach,
+        &authority,
     )
     .await?;
     let priced_from_catalog = apply_independent_claim_gate(
@@ -1374,48 +1405,90 @@ async fn maybe_handle_non_text_transition(
                 "task-backed non-text transition requires an owned claim".to_string(),
             )
         })?;
+        let transition_decision = AgentDecision {
+            should_reply: true,
+            reply_text: reply.clone(),
+            ..AgentDecision::default()
+        };
+        let transition_review = DecisionReviewResult {
+            approved: true,
+            review_summary: "非文本入站过渡话术（确定性系统回复）".to_string(),
+            ..DecisionReviewResult::default()
+        };
+        let transition_domain_config = load_user_operation_domain_config_for_contact(
+            state,
+            &contact.workspace_id,
+            &contact.wxid,
+        )
+        .await?;
+        let source_operation_state = action_policy_state_key(
+            transition_domain_config.as_ref(),
+            contact.operation_state.as_deref(),
+            None,
+        )
+        .unwrap_or_else(|| initial_operation_state_key(transition_domain_config.as_ref()));
+        let transition_policy = load_operation_state_policy_for_contact(
+            state,
+            &contact.workspace_id,
+            &source_operation_state,
+            &contact.wxid,
+        )
+        .await?;
+        let controls = super::turn_loop::authorization_projection_controls(
+            true,
+            &transition_decision,
+            &transition_review,
+            Some(&source_operation_state),
+            None,
+            Some(&source_operation_state),
+            transition_policy.as_ref().map(|value| value.version),
+            transition_domain_config.as_ref().map(|value| value.version),
+        );
+        let mut transition_review_doc = to_document(&AgentDecisionReview {
+            id: None,
+            workspace_id: contact.workspace_id.clone(),
+            account_id: contact.account_id.clone(),
+            contact_wxid: Some(contact.wxid.clone()),
+            run_id: Some(run_id.to_string()),
+            inbound_message_id: inbound.message_id.clone(),
+            reply_text: Some(reply.clone()),
+            approved: true,
+            scores: Document::new(),
+            formula_breakdown: Document::new(),
+            risks: Vec::new(),
+            rewrite_instruction: None,
+            review_summary: Some("非文本入站过渡话术（确定性系统回复）".to_string()),
+            playbook_id: None,
+            playbook_version: None,
+            used_knowledge_ids: Vec::new(),
+            prompt_versions: Document::new(),
+            operation_state: contact.operation_state.clone(),
+            next_best_action: Document::new(),
+            context_pack_snapshot: doc! { "msgType": &msg_type },
+            domain_config_snapshot: transition_domain_config
+                .as_ref()
+                .and_then(|config| to_document(config).ok())
+                .unwrap_or_default(),
+            runtime_parameters_snapshot: Document::new(),
+            send_gateway_result: doc! { "allowed": true, "status": "outbox_enqueuing" },
+            outcome_status: Some("pending".to_string()),
+            reaction_analysis: Document::new(),
+            reaction_claimed_at: None,
+            reaction_claim_token: None,
+            reaction_claim_generation: 0,
+            source_task_id: None,
+            source_task_claim_token: None,
+            reviewer_misjudge_signal: None,
+            expected_text_segments: 1,
+            status: "outbox_enqueuing".to_string(),
+            created_at: DateTime::now(),
+        })?;
+        transition_review_doc.insert("authorized_projection_controls", controls);
         let decision_id = state
             .db
             .decision_reviews()
-            .insert_one(
-                AgentDecisionReview {
-                    id: None,
-                    workspace_id: contact.workspace_id.clone(),
-                    account_id: contact.account_id.clone(),
-                    contact_wxid: Some(contact.wxid.clone()),
-                    run_id: Some(run_id.to_string()),
-                    inbound_message_id: inbound.message_id.clone(),
-                    reply_text: Some(reply.clone()),
-                    approved: true,
-                    scores: Document::new(),
-                    formula_breakdown: Document::new(),
-                    risks: Vec::new(),
-                    rewrite_instruction: None,
-                    review_summary: Some("非文本入站过渡话术（确定性系统回复）".to_string()),
-                    playbook_id: None,
-                    playbook_version: None,
-                    used_knowledge_ids: Vec::new(),
-                    prompt_versions: Document::new(),
-                    operation_state: contact.operation_state.clone(),
-                    next_best_action: Document::new(),
-                    context_pack_snapshot: doc! { "msgType": &msg_type },
-                    domain_config_snapshot: Document::new(),
-                    runtime_parameters_snapshot: Document::new(),
-                    send_gateway_result: doc! { "allowed": true, "status": "outbox_enqueuing" },
-                    outcome_status: Some("pending".to_string()),
-                    reaction_analysis: Document::new(),
-                    reaction_claimed_at: None,
-                    reaction_claim_token: None,
-                    reaction_claim_generation: 0,
-                    source_task_id: None,
-                    source_task_claim_token: None,
-                    reviewer_misjudge_signal: None,
-                    expected_text_segments: 1,
-                    status: "outbox_enqueuing".to_string(),
-                    created_at: DateTime::now(),
-                },
-                None,
-            )
+            .clone_with_type::<Document>()
+            .insert_one(transition_review_doc, None)
             .await?
             .inserted_id
             .as_object_id()
@@ -2136,11 +2209,13 @@ pub(crate) async fn relay_principal_decision_to_customer(
 /// media-asset Task 8：素材发送相对文本回复的定序。当前两种 expression_pref
 /// （file_primary / file_support）都先发一句文字引导、文件随后（先文字后文件）；
 /// 抽成纯函数留扩展点——若后续想让 file_primary 改成先发文件，只改这一处。
+#[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum SendOrder {
     TextThenMedia,
 }
 
+#[cfg(test)]
 pub(crate) fn media_send_order(_expression_pref: &str) -> SendOrder {
     SendOrder::TextThenMedia
 }
@@ -2151,6 +2226,7 @@ pub(crate) fn media_send_order(_expression_pref: &str) -> SendOrder {
 /// ①should_reply=false/文本空时只发孤立文件（违背"文件配引导话术"设计）；
 /// ②relay 守卫置 false 时媒体仍照发。设计文档 §6.2 规定 file_primary 也总有
 /// 简短引导文本，故复用要求非空文本的 outbox_eligible 是正确的、不会过严。
+#[cfg(test)]
 pub(crate) fn media_send_allowed(outbox_eligible: bool, has_assets: bool) -> bool {
     outbox_eligible && has_assets
 }
@@ -2158,6 +2234,7 @@ pub(crate) fn media_send_allowed(outbox_eligible: bool, has_assets: bool) -> boo
 /// media-asset 终审 Important#1：并发去抖中止应覆盖文本与媒体两条轨道——只要本
 /// run 会发任何东西（文本或媒体）就该被"已被更新入站取代"的去抖拦截，否则一个
 /// superseded 的 run 仍会发出孤立文件（媒体去抖失效）。
+#[cfg(test)]
 pub(crate) fn should_run_send(outbox_eligible: bool, media_pending: bool) -> bool {
     outbox_eligible || media_pending
 }
@@ -2189,7 +2266,7 @@ async fn apply_state_action_gate(
     let operation_state = action_policy_state_key(
         domain_config,
         contact.operation_state.as_deref(),
-        final_decision.operation_state.as_deref(),
+        decision_operation_state_candidate(final_decision),
     );
     let operation_state = match operation_state {
         Some(value) => value,
@@ -2202,8 +2279,10 @@ async fn apply_state_action_gate(
         &contact.wxid,
     )
     .await?;
-    let action = classify_reviewed_decision_action(final_decision, review);
-    if let Err(reason) = enforce_state_action_policy(policy_opt.as_ref(), action) {
+    let actions = super::guards::reviewed_decision_actions(final_decision, review);
+    if let Err((action, reason)) =
+        enforce_reviewed_decision_actions(policy_opt.as_ref(), final_decision, review)
+    {
         review.approved = false;
         review.final_review_status = "held_by_ai_policy".to_string();
         final_decision.should_reply = false;
@@ -2226,6 +2305,7 @@ async fn apply_state_action_gate(
             &reason,
             Some(doc! {
                 "run_id": run_id,
+                "actions": actions.clone(),
                 "action": action,
                 "operation_state": &operation_state,
                 "reason": reason.clone(),
@@ -2326,6 +2406,7 @@ async fn ensure_customer_acknowledged(
 /// 幂等锚，同消息重放须命中同 key 去重）原样用；空时回落 run_id，保证多段 key 仍
 /// 按 run 隔离（否则 "#seg{idx}" 非空会走非 synthetic 分支丢掉 run_id，跨 run 雷同
 /// 分段撞键被误去重、静默丢消息）。
+#[cfg(test)]
 fn segment_idempotency_base<'a>(source_event_id: &'a str, run_id: &'a str) -> &'a str {
     if source_event_id.is_empty() {
         run_id
@@ -2342,8 +2423,275 @@ fn segment_idempotency_base<'a>(source_event_id: &'a str, run_id: &'a str) -> &'
 /// 假 ⟺ 本 run 不会 enqueue 任何东西。用它统一决定 task 终态：`should_reply=true` 但
 /// `reply_text` 为空这种退化决策此前既不置 `outbox_enqueued`（因文本空）、也不 cancel
 /// （因 should_reply 真）→ task 卡在 `running` 被 reclaim 反复重试、3 次后强制 failed。
+#[cfg(test)]
 fn text_send_eligible(should_reply: bool, reply_text: &str) -> bool {
     should_reply && !reply_text.trim().is_empty()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn persist_production_post_commit(
+    state: &AppState,
+    contact: &Contact,
+    inbound: &ConversationMessage,
+    trigger_kind: &str,
+    run_id: &str,
+    playbook: Option<&OperationPlaybook>,
+    domain_config: Option<&OperationDomainConfig>,
+    runtime: &UserRuntimeParameters,
+    memory: &crate::models::OperatingMemory,
+    context_pack: &Document,
+    active_profile: &crate::models::DomainProfile,
+    active_products: &[crate::models::Product],
+    sendable_assets: &[crate::models::ContentAsset],
+    recent_messages: &[ConversationMessage],
+    knowledge_route: &KnowledgeRouteResult,
+    outcome: &super::turn_loop::TurnOutcome,
+) {
+    let decision = &outcome.draft.decision;
+    let authorization = &outcome.authorization;
+    let review = &authorization.review;
+    let receipt = &outcome.commit_receipt;
+    let gateway_status = receipt
+        .details
+        .get_str("gateway_status")
+        .unwrap_or("held_by_ai_policy");
+    let review_id = receipt
+        .details
+        .get_str("decision_review_id")
+        .ok()
+        .and_then(|value| ObjectId::parse_str(value).ok());
+
+    if gateway_status == "no_reply" {
+        super::run_audit::mark_no_reply();
+        if let Some(review_id) = review_id {
+            // No-reply has no delivery callback. Apply the frozen operational controls now so a
+            // projection outage cannot silently drop an authorized cooldown/state transition.
+            if let Err(error) =
+                super::post_decision::apply_authorized_projection_controls(state, review_id).await
+            {
+                tracing::warn!(%error, %run_id, %review_id, "no-reply authorized controls finalization failed");
+            }
+        }
+    }
+
+    if receipt
+        .details
+        .get_bool("projection_eligible")
+        .unwrap_or(false)
+    {
+        if let Some(review_id) = review_id {
+            let projection_contact = if let Some(contact_id) = contact.id {
+                match state
+                    .db
+                    .contacts()
+                    .find_one(
+                        doc! {
+                            "_id": contact_id,
+                            "workspace_id": &contact.workspace_id,
+                            "account_id": &contact.account_id,
+                            "wxid": &contact.wxid,
+                        },
+                        None,
+                    )
+                    .await
+                {
+                    Ok(Some(current)) => current,
+                    Ok(None) => contact.clone(),
+                    Err(error) => {
+                        tracing::warn!(%error, %run_id, "post-commit contact refresh failed");
+                        contact.clone()
+                    }
+                }
+            } else {
+                contact.clone()
+            };
+            let ascending_window = recent_messages.iter().rev().cloned().collect::<Vec<_>>();
+            match super::post_decision::persist_projection_snapshot(
+                state,
+                review_id,
+                decision,
+                memory,
+                context_pack,
+                domain_config,
+                active_profile,
+                active_products,
+                &ascending_window,
+                &projection_contact,
+                run_id,
+            )
+            .await
+            {
+                Ok(()) => {
+                    if let Err(error) =
+                        super::post_decision::activate_projection(state, review_id).await
+                    {
+                        tracing::warn!(%error, %run_id, %review_id, "post-commit projection activation failed");
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, %run_id, %review_id, "post-commit projection snapshot failed");
+                    super::post_decision::mark_preparation_failed(
+                        state,
+                        review_id,
+                        &error.to_string(),
+                    )
+                    .await;
+                }
+            }
+        } else {
+            tracing::error!(%run_id, "atomic commit receipt omitted decision review id");
+        }
+    }
+
+    if let Err(error) = write_knowledge_usage_log(
+        state,
+        contact,
+        decision,
+        review,
+        knowledge_route,
+        review_passed(review, runtime),
+        run_id,
+    )
+    .await
+    {
+        tracing::warn!(%error, %run_id, "post-commit knowledge usage telemetry failed");
+    }
+
+    let (event_kind, event_level, event_summary) = match gateway_status {
+        "outbox_enqueued" => (
+            "outbox_enqueued",
+            "success",
+            "回复批次已在原子事务中建立并授权",
+        ),
+        "no_reply" => (
+            "agent_reply_prepared",
+            "no_reply",
+            "Agent 本轮自主判断无需回复",
+        ),
+        "skipped_duplicate" => (
+            "outbox_skipped_duplicate",
+            "skipped_duplicate",
+            "已有完整的幂等 Outbox 批次覆盖本轮",
+        ),
+        "stale_task_claim" => (
+            "task_claim_fenced",
+            "stale_task_claim",
+            "任务所有权在提交前已变更，本轮未发送",
+        ),
+        "gateway_blocked" | "quiet_hours_deferred" => (
+            "gateway_blocked",
+            gateway_status,
+            "最终发送权限检查未授权本轮发送",
+        ),
+        _ => (
+            "blocked_review",
+            gateway_status,
+            "Agent Harness 未授权本轮客户侧副作用",
+        ),
+    };
+    let mut event_details = build_decision_event_details(decision, playbook, review);
+    event_details.insert("run_id", run_id);
+    event_details.insert("trigger_kind", trigger_kind);
+    event_details.insert("commit_receipt", receipt.to_document());
+    if let Err(error) = write_event_for_account(
+        state,
+        &contact.workspace_id,
+        &contact.account_id,
+        Some(&contact.wxid),
+        event_kind,
+        event_level,
+        event_summary,
+        Some(event_details),
+    )
+    .await
+    {
+        tracing::warn!(%error, %run_id, "post-commit audit event failed");
+    }
+
+    if receipt
+        .details
+        .get_bool("appointment_created")
+        .unwrap_or(false)
+    {
+        if let Some(appointment_id) = receipt.appointment_id.as_deref() {
+            if let Err(error) = write_event_for_account(
+                state,
+                &contact.workspace_id,
+                &contact.account_id,
+                Some(&contact.wxid),
+                "appointment_requested",
+                "requested",
+                "客户预约请求已记录，等待有权人员确认",
+                Some(doc! { "run_id": run_id, "appointment_id": appointment_id }),
+            )
+            .await
+            {
+                tracing::warn!(%error, %run_id, "appointment request audit failed");
+            }
+        } else {
+            tracing::error!(%run_id, "appointment commit receipt omitted created appointment id");
+        }
+    }
+
+    if authorization.disposition != "authorized" {
+        if let Err(error) = escalation::escalate_held_decision(
+            state,
+            contact,
+            review,
+            decision,
+            domain_config,
+            gateway_status,
+        )
+        .await
+        {
+            tracing::warn!(%error, %run_id, "held decision escalation failed after commit");
+        }
+        if gateway_status == "blocked_unverified_product_claim" {
+            let candidate = crate::knowledge_wiki::gap_signals::GapSignalCandidate::recall_miss_from_product_block(
+                inbound.content.clone(),
+            );
+            if let Err(error) = crate::knowledge_wiki::gap_signals::persist_recall_signal(
+                &state.db,
+                &contact.workspace_id,
+                candidate,
+            )
+            .await
+            {
+                tracing::warn!(%error, %run_id, "product-claim gap signal persistence failed");
+            }
+        }
+    } else if let Some(request) = decision
+        .escalation_request
+        .as_ref()
+        .filter(|request| request.needed)
+    {
+        if let Err(error) = trigger_principal_escalation(state, contact, request).await {
+            tracing::warn!(%error, %run_id, "principal escalation failed after commit");
+        }
+    }
+
+    if let Ok(asset_ids) = receipt.details.get_array("principal_media_ids") {
+        for asset_id in asset_ids.iter().filter_map(Bson::as_str) {
+            let title = ObjectId::parse_str(asset_id)
+                .ok()
+                .and_then(|id| sendable_assets.iter().find(|asset| asset.id == Some(id)))
+                .map(|asset| asset.title.as_str())
+                .unwrap_or(asset_id);
+            let request = crate::models::EscalationRequest {
+                needed: true,
+                category: Some(crate::models::ESCALATION_CATEGORY_OUT_OF_SCOPE.to_string()),
+                reason: Some(format!("素材《{title}》标记为需领导核准后才能发送给客户")),
+                question_for_principal: Some(format!("是否同意把素材《{title}》发给该客户？")),
+                self_serviceable_part: None,
+                is_generalizable: false,
+            };
+            if let Err(error) = trigger_principal_escalation(state, contact, &request).await {
+                tracing::warn!(%error, %run_id, %asset_id, "principal media escalation failed");
+            }
+        }
+    }
+
+    super::outbox_dispatcher::refresh_run_log_outbox_status(state, run_id).await;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2510,6 +2858,57 @@ fn run_user_operation_gateway_inner<'a>(
     let reply_prompts = business_inputs.reply_prompts;
     let reply_context = ReplyContextCache::new();
     let reviewer_prompts = ReviewerPromptCache::new();
+    let effective_soul = active_profile
+        .soul_override
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or(published_soul.as_deref())
+        .unwrap_or_default();
+    let turn_id = if envelope_source_event_id.trim().is_empty() {
+        run_id.as_str()
+    } else {
+        envelope_source_event_id.as_str()
+    };
+    let persona_world_state = match super::persona_world_state::ensure_effective_world_state(
+        state,
+        &contact.workspace_id,
+        &contact.account_id,
+        effective_soul,
+        runtime.quiet_hours_tz_offset_hours,
+        Some(&run_id),
+    )
+    .await
+    {
+        Ok(world_state) => world_state,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                workspace_id = %contact.workspace_id,
+                account_id = %contact.account_id,
+                "persona world-state generation failed soft"
+            );
+            None
+        }
+    };
+    let authority = super::authority::compile(super::authority::AuthorityCompileInput {
+        state,
+        run_id: &run_id,
+        turn_id,
+        contact: &contact,
+        inbound: &inbound,
+        recent_messages: &recent_messages,
+        memory: &memory,
+        active_products: &active_products,
+        referral_cards: &referral_cards,
+        effective_soul,
+        projected_appointments: &[],
+        projected_world_state: persona_world_state.as_ref(),
+        invocation: super::authority::AuthorityInvocation::Conversation,
+        evaluated_at: DateTime::now(),
+    })
+    .await?;
+    authority.persist_initial(&state.db).await?;
 
     let route_future = route_gateway_knowledge(
         state,
@@ -2552,6 +2951,7 @@ fn run_user_operation_gateway_inner<'a>(
                     referral_cards: &referral_cards,
                     reply_prompts: &reply_prompts,
                     reply_context: &reply_context,
+                    authority: &authority,
                 }),
             );
             let (route, first) = tokio::try_join!(route_future, lean_future)?;
@@ -2561,6 +2961,11 @@ fn run_user_operation_gateway_inner<'a>(
             // prompt bytes consume the selected knowledge and route metadata.
             let route = route_future.await?;
             let chunks = select_operation_knowledge_chunks(&operation_knowledge.chunks, &route);
+            authority.append_verified_knowledge(
+                &chunks,
+                &route_used_knowledge_ids(&route),
+                DateTime::now(),
+            )?;
             let first = decide_reply_with_promote(
                 state,
                 &contact,
@@ -2586,6 +2991,7 @@ fn run_user_operation_gateway_inner<'a>(
                     referral_cards: &referral_cards,
                     reply_prompts: &reply_prompts,
                     reply_context: &reply_context,
+                    authority: &authority,
                 }),
             )
             .await?;
@@ -2593,6 +2999,13 @@ fn run_user_operation_gateway_inner<'a>(
         };
     let selected_chunks =
         select_operation_knowledge_chunks(&operation_knowledge.chunks, &knowledge_route);
+    if state.config.progressive_tier_enabled {
+        authority.append_verified_knowledge(
+            &selected_chunks,
+            &route_used_knowledge_ids(&knowledge_route),
+            DateTime::now(),
+        )?;
+    }
     mark_run_envelope_running(
         &state.db,
         &run_id,
@@ -2679,7 +3092,7 @@ fn run_user_operation_gateway_inner<'a>(
     );
     let mut forced_full = false;
 
-    let (mut decision, mut promote_risks) = match tier_decision {
+    let (mut decision, promote_risks) = match tier_decision {
         crate::agent::sufficiency::TierDecision::Enough => {
             if state.config.progressive_tier_enabled && forced_full_reason.is_some() {
                 // Lean cannot consume business context. Independent knowledge/referral evidence or
@@ -2741,6 +3154,7 @@ fn run_user_operation_gateway_inner<'a>(
                         referral_cards: &referral_cards,
                         reply_prompts: &reply_prompts,
                         reply_context: &reply_context,
+                        authority: &authority,
                     }),
                 )
                 .await?
@@ -2833,9 +3247,10 @@ fn run_user_operation_gateway_inner<'a>(
                     published_soul: published_soul.as_deref(),
                     sendable_assets: &sendable_assets,
                     referral_cards: &referral_cards,
-                    reply_prompts: &reply_prompts,
-                    reply_context: &reply_context,
-                }),
+                        reply_prompts: &reply_prompts,
+                        reply_context: &reply_context,
+                        authority: &authority,
+                    }),
             )
             .await?
         }
@@ -2898,2120 +3313,145 @@ fn run_user_operation_gateway_inner<'a>(
     .await
     .ok();
 
-    // 防御兜底：单发决策路径（知识前置）不支持 tool_calling 中间轮，若 LLM 误选该相位
-    // 会导致 should_reply=false（types.rs:907 强制）→ 静默 no_reply，客户提问得不到回复。
-    // 这里检测到 tool_calling 时强制转 final + 清空 tool_calls + 记 degraded，避免误发空回复。
-    // 根因（历史）：旧单发 prompt `user.reply.task` 曾提供 tool_calling 形态而主链路无工具
-    // 循环包裹，LLM 误选后 gateway 无处理 → 回复被吞。prompt 侧已收紧（守护测试锁死该
-    // 形态不再出现；现行单发主路径加载的是 `user.reply.fast.task`，见 decision.rs），
-    // 本防御保留，为任何仍误吐 tool_calling 相位的模型输出兜底。
-    if decision.decision_phase == "tool_calling" {
-        write_event_for_account(
-            state,
-            &contact.workspace_id,
-            &contact.account_id,
-            Some(&contact.wxid),
-            "decision_phase_tool_calling_in_single_shot",
-            "degraded",
-            "单发决策路径收到 tool_calling 相位（不支持），强制转 final 避免静默 no_reply",
-            Some(doc! {
-                "run_id": &run_id,
-                "tool_calls_count": decision.tool_calls.len() as i64,
-            }),
-        )
-        .await
-        .ok();
-        decision.decision_phase = "final".to_string();
-        decision.tool_calls.clear();
-        // should_reply 保持原值（LLM 在 tool_calling 时默认 false，转 final 后若有 reply_text
-        // 则应该发，但 build_tool_calling_decision 已强制清空 reply_text，此时保持 false 安全）。
-    }
-
     normalize_decision_state(&mut decision, domain_config.as_ref());
     normalize_decision_runtime(&mut decision, &initial_planner);
-    let mut planner = planner_from_decision(&decision, "Reply Agent 单轮决策（知识路由前置）");
+    let mut initial_turn_planner =
+        planner_from_decision(&decision, "Reply Agent 首轮决策（共享 Harness）");
     if !knowledge_route.selected_chunk_ids.is_empty()
         || !knowledge_route.selected_knowledge_ids.is_empty()
     {
-        planner.knowledge_required = true;
-        if planner.review_mode.trim().is_empty() {
-            planner.review_mode = "full".to_string();
+        initial_turn_planner.knowledge_required = true;
+        if initial_turn_planner.review_mode.trim().is_empty() {
+            initial_turn_planner.review_mode = "full".to_string();
         }
     }
-    apply_confidence_override(&mut planner, &decision, &runtime);
-    normalize_decision_runtime(&mut decision, &planner);
+    apply_confidence_override(&mut initial_turn_planner, &decision, &runtime);
+    normalize_decision_runtime(&mut decision, &initial_turn_planner);
     decision.context_pack_version = Some(next_memory_card_version(&memory));
-    // ⑤口径修正(KB-01):Full 档记路由命中 id;非 Full 档(Lean/Clarify/Relational 不读切片)
-    // 一律清空 used_knowledge_ids——含 LLM 经 carry_through 透传的自报 id,否则自报一个真实
-    // verified ObjectId 即可令 grounding 硬闸 used∩verified 非空、架空 blocked_unverified_product_claim。
-    decision.used_knowledge_ids = crate::agent::sufficiency::resolve_used_knowledge_ids(
-        forced_full,
-        escalated_to_full,
-        route_used_knowledge_ids(&knowledge_route),
-    );
-    let _ = &mut promote_risks;
-    // MP-5 / Task 15：进入 review 前预算超额则降级到 local。
-    // agent-autonomy-loop W2 / Task 3.1：`local_decision_review` 改为接受
-    // `&RunBudget`，在三分支前先抢一次 task-local 引用，None 时构造一个
-    // 即时态空预算（is_exceeded() == false），以保持 unit 测试 / 非
-    // RUN_BUDGET.scope 入口的兼容性。
-    let run_budget = current_run_budget();
-    let budget_exceeded_for_review = run_budget
-        .as_ref()
-        .map(|b| b.is_llm_or_token_exhausted())
-        .unwrap_or(false);
-    let local_budget_fallback;
-    let local_budget_ref: &RunBudget = match run_budget.as_ref() {
-        Some(b) => b.as_ref(),
-        None => {
-            local_budget_fallback = RunBudget::new(run_id.clone(), i64::MAX, i32::MAX, i32::MAX);
-            &local_budget_fallback
-        }
-    };
-    // 首稿 Reviewer 与独立 ClaimGate 输入相同且判定相互独立，正常路径并行执行可把
-    // 墙钟从二者之和降为较慢者耗时。两道闸的输入、失败策略和 finalize 汇总均不变；
-    // 若 Reviewer 要求重写，下面会丢弃首稿 ClaimGate，并对改写后的最终正文重新执行。
-    let mut precomputed_claim_gate = None;
-    let mut review = if budget_exceeded_for_review {
-        if let Some(b) = run_budget.as_ref() {
-            b.mark_degraded("review_skipped_budget_exceeded".to_string());
-        }
-        write_event_for_account(
-            state,
-            &contact.workspace_id,
-            &contact.account_id,
-            Some(&contact.wxid),
-            "run_budget_exceeded",
-            "degraded",
-            "预算超额：跳过 LLM review，使用 local_decision_review",
-            Some(doc! { "stage": "review", "run_id": &run_id }),
-        )
-        .await?;
-        local_decision_review(&decision, local_budget_ref, &runtime)
-    } else if should_run_review(&decision, &planner, &runtime) {
-        let review_mode = effective_review_mode(&planner, &decision, &runtime, false);
-        let (review, claim_gate_evaluation) = review_and_evaluate_claim_gate(
-            state,
-            &contact,
-            &inbound,
-            &recent_messages,
-            &decision,
-            playbook.as_ref(),
-            domain_config.as_ref(),
-            &runtime,
-            &memory,
-            &context_pack,
-            &selected_chunks,
-            &knowledge_route,
-            review_mode,
-            &run_id,
-            &active_profile,
-            &active_products,
-            &referral_cards,
-            &reviewer_prompts,
-            ReviewInvocationKind::Conversation,
-        )
-        .await?;
-        precomputed_claim_gate = Some(claim_gate_evaluation);
-        review
+    let first_generation_used_full_context =
+        !state.config.progressive_tier_enabled || forced_full || escalated_to_full;
+    decision.used_knowledge_ids = if first_generation_used_full_context {
+        route_used_knowledge_ids(&knowledge_route)
     } else {
-        local_decision_review(&decision, local_budget_ref, &runtime)
+        Vec::new()
     };
-    let mut final_decision = decision;
-    // Merge the independent manifest before the one-shot rewrite decision. This lets an
-    // unsupported open-world business fact take the existing targeted rewrite path instead of
-    // waiting until finalize, where the only safe option would be to block the entire reply.
-    let mut precomputed_catalog_backed = precomputed_claim_gate.take().map(|evaluation| {
-        apply_independent_claim_gate(
-            evaluation,
-            &final_decision,
-            &mut review,
-            &active_products,
-        )
+
+    let turn_budget = current_run_budget().unwrap_or_else(|| {
+        Arc::new(RunBudget::new(
+            run_id.clone(),
+            runtime.run_token_budget,
+            runtime.run_max_llm_calls,
+            runtime.knowledge_max_tool_calls,
+        ))
     });
-
-    if should_run_targeted_rewrite(&final_decision, &review, &runtime) {
-        // Phase B / B1：`needs_revision=true` 表示 [`route_dual_gate`] 已经
-        // 把当前 review 标为软闸-only 失败，应走 finalize 之后的 single-shot
-        // revision 通道（decide_revision Proceed），而不是这里的 rewrite 路径
-        // （rewrite_instruction 为空、且会再调一次 review 形成双重 LLM 调用）。
-        // 让本分支只接住 hallucination / grounding 硬闸（reviewer 自己也会
-        // 在硬闸失败时写非空 rewrite_instruction）。
-        // MP-5 / Task 15：rewrite 之前再检查预算；超额时跳过 rewrite，直接走拦截路径。
-        if let Some(budget) = current_run_budget() {
-            let stage_bundle = 4 + i32::from(state.second_reviewer_llm.is_some());
-            budget.grant_additional_llm_calls(stage_bundle);
-        }
-        let budget_exceeded_for_rewrite = current_run_budget()
-            .map(|b| b.is_llm_or_token_exhausted())
-            .unwrap_or(false);
-        if budget_exceeded_for_rewrite {
-            if let Some(b) = current_run_budget() {
-                b.mark_degraded("rewrite_skipped_budget_exceeded".to_string());
-            }
-            write_event_for_account(
+    let mut turn_environment = super::model_turn::ModelTurnEnvironment::new(
+        super::model_turn::ModelTurnInputs {
+            state,
+            contact: &contact,
+            inbound: &inbound,
+            recent_messages: &recent_messages,
+            pending_tasks: &pending_tasks,
+            playbook: playbook.as_ref(),
+            domain_config: domain_config.as_ref(),
+            runtime: &runtime,
+            memory: &memory,
+            context_pack: &context_pack,
+            knowledge: &operation_knowledge,
+            selected_chunks: &selected_chunks,
+            knowledge_route: &knowledge_route,
+            initial_planner: &initial_turn_planner,
+            active_profile: &active_profile,
+            active_products: &active_products,
+            published_soul: published_soul.as_deref(),
+            sendable_assets: &sendable_assets,
+            referral_cards: &referral_cards,
+            reply_prompts: &reply_prompts,
+            reply_context: &reply_context,
+            reviewer_prompts: Some(&reviewer_prompts),
+            authority: &authority,
+            budget: turn_budget,
+            run_id: &run_id,
+            prompt_override: None,
+            invocation_kind: ReviewInvocationKind::Conversation,
+            first_generation: Some((decision, promote_risks)),
+            persist_runtime_snapshot: true,
+        },
+        super::production_commit::ProductionCommitter::new(
+            super::production_commit::ProductionCommitInputs {
                 state,
-                &contact.workspace_id,
-                &contact.account_id,
-                Some(&contact.wxid),
-                "run_budget_exceeded",
-                "degraded",
-                "预算超额：跳过 rewrite，本次按现有 review 结果决定是否拦截",
-                Some(doc! { "stage": "rewrite", "run_id": &run_id }),
-            )
-            .await?;
-        } else {
-            super::run_audit::mark_rewrite();
-            write_decision_review(
-                state,
-                &contact,
-                &inbound,
-                &final_decision,
-                &review,
-                playbook.as_ref(),
-                domain_config.as_ref(),
-                &runtime,
-                &precheck,
-                &context_pack,
-                "rewrite_requested",
-                &knowledge_route,
-                &run_id,
-                &planner,
-            )
-            .await?;
-            let (rewritten, rewrite_promote_risks) = decide_reply_with_promote(
-                state,
-                &contact,
-                &inbound,
-                &recent_messages,
-                &pending_tasks,
-                playbook.as_ref(),
-                domain_config.as_ref(),
-                &runtime,
-                &memory,
-                &context_pack,
-                &selected_chunks,
-                &knowledge_route,
-                Some(&review.rewrite_instruction),
-                Some(&run_id),
-                None,
-                crate::agent::sufficiency::PromptTier::Full,
-                Some(DecisionRunSnapshot {
-                    active_profile: &active_profile,
-                    active_products: &active_products,
-                    published_soul: published_soul.as_deref(),
-                    sendable_assets: &sendable_assets,
-                    referral_cards: &referral_cards,
-                    reply_prompts: &reply_prompts,
-                    reply_context: &reply_context,
-                }),
-            )
-            .await?;
-            let prior_namecard = final_decision.namecard_to_send.clone();
-            final_decision = rewritten;
-            promote_risks = rewrite_promote_risks;
-            // 名片引荐是业务决策，不应因 tone-polish 改写而丢失：改写若未重新输出引荐则沿用改写前意图
-            if final_decision.namecard_to_send.is_none() {
-                final_decision.namecard_to_send = prior_namecard;
-            }
-            normalize_decision_state(&mut final_decision, domain_config.as_ref());
-            normalize_decision_runtime(&mut final_decision, &planner);
-            final_decision.context_pack_version = Some(next_memory_card_version(&memory));
-            final_decision.used_knowledge_ids = route_used_knowledge_ids(&knowledge_route);
-            let (next_review, claim_gate_evaluation) = review_and_evaluate_claim_gate(
-                state,
-                &contact,
-                &inbound,
-                &recent_messages,
-                &final_decision,
-                playbook.as_ref(),
-                domain_config.as_ref(),
-                &runtime,
-                &memory,
-                &context_pack,
-                &selected_chunks,
-                &knowledge_route,
-                "full",
-                &run_id,
-                &active_profile,
-                &active_products,
-                &referral_cards,
-                &reviewer_prompts,
-                ReviewInvocationKind::Conversation,
-            )
-            .await?;
-            review = next_review;
-            precomputed_claim_gate = Some(claim_gate_evaluation);
-            precomputed_catalog_backed = None;
-        }
-    }
-
-    // ── agent-autonomy-loop W2 / Task 3.4：finalize_review_for_send 接入 ──
-    //
-    // 三分支（budget_exceeded / should_run_review / 默认）的 review 结果在此
-    // 统一汇总到 finalize_review_for_send。任一硬安全门触发 SHALL 强制
-    // `final_decision.should_reply=false` 且 `final_decision.autonomy_mode="blocked"`，
-    // 并产出待写 `agent_events`（由 [`persist_finalize_pending_events`] 持久化）。
-    // 任何上游 `approved=true` SHALL NOT 绕过本调用（详见 design.md §4.5 / N3）。
-    // 客观购买事实增强 G2（spec §5.4）：R5.4 priced_from_catalog 并联背书。
-    // 加载本 workspace active 产品（IDOR：只取本 workspace）；独立 ClaimGate 从最终
-    // 正文逐 clause 提取目录事实并给出精确 sourceQuote，服务端再逐字段及反向覆盖核验。
-    // Reply 自报 quoted_product_ids 不参与授权。产品表空 → 恒假。
-    // G4 #5 收口：报价背书是交易事实的一种消费，统一受 transaction_facts_enabled 闸。
-    // 非交易域（情感陪伴）即便误配产品表也不启用目录背书（方向更严格、安全）。
-    // active_products 已与知识路由并行加载，本 run 后续复用同一目录快照。
-    // R5.4 第三条并联背书：该客户是否有生效的 A 类领导授权产品豁免。
-    let principal_product_exempted = contact_has_principal_product_exemption(&contact);
-    let priced_from_catalog = match precomputed_claim_gate.take() {
-        Some(evaluation) => {
-            apply_independent_claim_gate(evaluation, &final_decision, &mut review, &active_products)
-        }
-        None if precomputed_catalog_backed.is_some() => {
-            precomputed_catalog_backed.unwrap_or(false)
-        }
-        None => {
-            ensure_independent_claim_gate(
-                state,
-                &contact,
-                &inbound,
-                &recent_messages,
-                &final_decision,
-                &mut review,
-                &selected_chunks,
-                &active_products,
-                &referral_cards,
-                &active_profile,
-                mongodb::bson::DateTime::now(),
-                Some(run_id.as_str()),
-            )
-            .await
-        }
-    };
-    let outcome = finalize_review_for_send(
-        review,
-        &mut final_decision,
-        &runtime,
-        &contact,
-        &selected_chunks,
-        promote_risks.clone(),
-        priced_from_catalog,
-        principal_product_exempted,
+                contact: &contact,
+                inbound: &inbound,
+                trigger: match &trigger {
+                    AgentTrigger::Inbound(message) => AgentTrigger::Inbound(message),
+                    AgentTrigger::FollowUp(task) => AgentTrigger::FollowUp(task),
+                },
+                task_context: task_context.as_ref(),
+                playbook: playbook.as_ref(),
+                domain_config: domain_config.as_ref(),
+                runtime: &runtime,
+                context_pack: &context_pack,
+                knowledge_route: &knowledge_route,
+                active_profile: &active_profile,
+                sendable_assets: &sendable_assets,
+                referral_cards: &referral_cards,
+                source_event_id: &envelope_source_event_id,
+                source_kind: &envelope_source_kind,
+                context_refreshed: should_refresh_context,
+                should_abort_send: should_abort_send.clone(),
+                authority: &authority,
+            },
+        ),
     );
-    let FinalizeOutcome {
-        review: finalized_review,
-        status: mut finalize_status,
-        pending_events,
-    } = outcome;
-    let mut review = finalized_review;
-    persist_finalize_pending_events(state, &contact, &pending_events).await?;
-
-    // ── Phase B / B4：operation_state_policies 终态再扣一道 ──
-    //
-    // finalize 走 Approved 之后再按当前 operation_state 校验"该状态允许 / 禁止
-    // agent 做哪类动作"。命中 forbidden 或 allowlist 收敛模式不含本次 action，
-    // 强制把 finalize_status 改成 `held_by_ai_policy`、`should_reply=false`，
-    // 落到下面统一的 `!Approved` 拦截分支去写审计 / 取消任务 / 写 run log。
-    //
-    // 老库无 `operation_state_policies` 行 → `enforce_state_action_policy(None, _)`
-    // fallthrough（向前兼容）；该入口不会绕过 outbox / idempotency。
-    if matches!(finalize_status, GatewayStatusFinal::Approved) {
-        apply_state_action_gate(
-            state,
-            &contact,
-            domain_config.as_ref(),
-            &mut final_decision,
-            &mut review,
-            &mut finalize_status,
-            &run_id,
-        )
-        .await?;
-
-    }
-
-    // ── R2 single-shot revision 控制流 ──
-    //
-    // 触发条件（design.md §4.5 / R2.3 / R2.4 / R2.8 / R2.9）：
-    //   * `outcome.status == Approved`（finalize 未触发任何硬安全门，且
-    //     `review.approved && final_decision.should_reply` 已在 finalize 内确认）；
-    //   * `outcome.review.needs_revision == true`；
-    //   * `outcome.review.should_hold == false`（hold 路径不 revise）；
-    //   * `outcome.review.revision_direction.trim()` 非空；
-    //   * 当前 RunBudget 未超额；
-    //   * 单 run 内 `revision_attempted == false`（最多 1 次重试）。
-    //
-    // 二次 Reply Agent 调用走 30s timeout 控制；超时 / LLM 错误 → revision_failed。
-    // 二次 review 仍 fail（`review_passed=false` 或 finalize 触发硬门）→
-    // gateway_status="revision_failed" + should_reply=false。
-    let mut revision_applied = false;
-    let mut revision_reason = String::new();
-    let mut pre_revision_summary: Option<String> = None;
-    let mut post_revision_summary: Option<String> = None;
-    if matches!(finalize_status, GatewayStatusFinal::Approved)
-        && review.needs_revision
-        && !review.should_hold
-        && !review.revision_direction.trim().is_empty()
-    {
-        if let Some(budget) = current_run_budget() {
-            let stage_bundle = 4 + i32::from(state.second_reviewer_llm.is_some());
-            budget.grant_additional_llm_calls(stage_bundle);
-        }
-    }
-    let budget_exceeded_for_revision = current_run_budget()
-        .map(|b| b.is_llm_or_token_exhausted())
-        .unwrap_or(false);
-
-    // Phase D / D2：首轮完整 Reviewer / ClaimGate 已通过后，仅观测结构风格漂移。
-    // 长度、问号和句末符号高度依赖本轮语义（例如上一轮提问、本轮道晚安会天然
-    // 同时变化 3 个轴），不能把机械差异提升为安全修订闸门。生成前已经注入弱风格
-    // 参考；这里仅写审计，不修改 review.needs_revision / risks / revision_direction。
-    // Reviewer 自己识别的人味、情绪、压力、隐私、事实等问题仍走原 single-shot
-    // revision + 二次 ClaimGate/Reviewer，安全语义不变。
-    if matches!(finalize_status, GatewayStatusFinal::Approved)
-        && !review.needs_revision
-        && !review.should_hold
-        && final_decision.should_reply
-    {
-        let prev_style = contact.last_outbound_style.clone().unwrap_or_default();
-        if !prev_style.trim().is_empty() {
-            let new_style =
-                super::review::extract_outbound_style_fingerprint(&final_decision.reply_text);
-            if let super::review::StyleContinuityObservation::AuditOnly {
-                previous,
-                current,
-            } = super::review::observe_style_continuity(&prev_style, &new_style)
-            {
-                write_event_for_account(
-                    state,
-                    &contact.workspace_id,
-                    &contact.account_id,
-                    Some(&contact.wxid),
-                    "style_consistency_observed",
-                    "info",
-                    &format!(
-                        "style_diverged_observed_only: prev={} new={}",
-                        previous, current
-                    ),
-                    Some(doc! {
-                        "run_id": &run_id,
-                        "prev_style": previous,
-                        "new_style": current,
-                        "action": "audit_only",
-                    }),
-                )
-                .await?;
-            }
-        }
-    }
-
-    let revision_decision =
-        decide_revision(&finalize_status, &review, budget_exceeded_for_revision);
-    match revision_decision {
-        RevisionDecision::NotEligible => { /* 不进 R2 块 */ }
-        RevisionDecision::Skip { reason, event } => {
-            // R2.5 / R2.8：revisionDirection 空 / 预算超额 → 写事件 + 失败终态。
-            review.approved = false;
-            review.revision_applied = false;
-            review.final_review_status = "revision_failed".to_string();
-            final_decision.should_reply = false;
-            let (reason_str, status) = derive_revision_failure(reason);
-            finalize_status = status;
-            revision_reason = reason_str;
-            let summary = match event {
-                "revision_skipped_invalid_direction" => {
-                    "Review Agent 要求 revision 但 revisionDirection 为空，跳过本次 revision"
-                }
-                "revision_skipped_budget_exceeded" => "预算超额：跳过 single-shot revision",
-                _ => "single-shot revision 跳过：未知原因",
-            };
-            write_event_for_account(
-                state,
-                &contact.workspace_id,
-                &contact.account_id,
-                Some(&contact.wxid),
-                event,
-                "blocked",
-                summary,
-                Some(doc! { "run_id": &run_id }),
-            )
-            .await?;
-        }
-        RevisionDecision::Proceed => {
-            super::run_audit::mark_revision();
-            let revision_direction = review.revision_direction.trim().to_string();
-            // 改写失败/超时回退用：此刻 final_decision 仍是改写前那份已 Approved 的原稿。
-            // decide_revision 只在首轮 finalize=Approved 时才返回 Proceed（gates.rs:981），
-            // 但 Approved 仍可能带 pressure / boundary-privacy / dual-reviewer 等安全类
-            // revision trigger；这些 trigger 的改写失败必须 fail closed。保留首轮 review
-            // 快照，让 fallback policy 只对白名单纯风格 trigger 恢复原稿。
-            let pre_revision_decision = final_decision.clone();
-            let pre_revision_review = review.clone();
-            // R2.3 / R2.10：触发 1 次 revision，把 revisionDirection 透传
-            // 给 Reply Agent，30s 超时控制。
-            pre_revision_summary = Some(format!(
-                "approved={} reply_text_len={} risks={:?} revisionDirection={}",
-                review.approved,
-                final_decision.reply_text.chars().count(),
-                review.risks,
-                revision_direction
-            ));
-            let revision_future = decide_reply_with_promote(
-                state,
-                &contact,
-                &inbound,
-                &recent_messages,
-                &pending_tasks,
-                playbook.as_ref(),
-                domain_config.as_ref(),
-                &runtime,
-                &memory,
-                &context_pack,
-                &selected_chunks,
-                &knowledge_route,
-                Some(&revision_direction),
-                Some(&run_id),
-                None,
-                crate::agent::sufficiency::PromptTier::Full,
-                Some(DecisionRunSnapshot {
-                    active_profile: &active_profile,
-                    active_products: &active_products,
-                    published_soul: published_soul.as_deref(),
-                    sendable_assets: &sendable_assets,
-                    referral_cards: &referral_cards,
-                    reply_prompts: &reply_prompts,
-                    reply_context: &reply_context,
-                }),
-            );
-            match tokio::time::timeout(std::time::Duration::from_secs(30), revision_future).await {
-                Ok(Ok((mut revised_decision, revised_promote_risks))) => {
-                    normalize_decision_state(&mut revised_decision, domain_config.as_ref());
-                    normalize_decision_runtime(&mut revised_decision, &planner);
-                    revised_decision.context_pack_version = Some(next_memory_card_version(&memory));
-                    revised_decision.used_knowledge_ids =
-                        route_used_knowledge_ids(&knowledge_route);
-
-                    let (mut second_review, second_claim_gate) = review_and_evaluate_claim_gate(
-                        state,
-                        &contact,
-                        &inbound,
-                        &recent_messages,
-                        &revised_decision,
-                        playbook.as_ref(),
-                        domain_config.as_ref(),
-                        &runtime,
-                        &memory,
-                        &context_pack,
-                        &selected_chunks,
-                        &knowledge_route,
-                        "full",
-                        &run_id,
-                        &active_profile,
-                        &active_products,
-                        &referral_cards,
-                        &reviewer_prompts,
-                        ReviewInvocationKind::Conversation,
-                    )
-                    .await?;
-
-                    let prior_namecard = final_decision.namecard_to_send.clone();
-                    final_decision = revised_decision;
-                    promote_risks = revised_promote_risks;
-                    // 名片引荐是业务决策，不应因 revision 改写而丢失：改写若未重新输出引荐则沿用改写前意图
-                    if final_decision.namecard_to_send.is_none() {
-                        final_decision.namecard_to_send = prior_namecard;
-                    }
-                    let second_priced_from_catalog = apply_independent_claim_gate(
-                        second_claim_gate,
-                        &final_decision,
-                        &mut second_review,
-                        &active_products,
-                    );
-                    // R5.4 第三条并联背书：contact 未变，豁免记录同 contact，重算取同值。
-                    let second_principal_product_exempted =
-                        contact_has_principal_product_exemption(&contact);
-                    let second_outcome = finalize_review_for_send(
-                        second_review,
-                        &mut final_decision,
-                        &runtime,
-                        &contact,
-                        &selected_chunks,
-                        promote_risks.clone(),
-                        second_priced_from_catalog,
-                        second_principal_product_exempted,
-                    );
-                    let FinalizeOutcome {
-                        review: second_finalized_review,
-                        status: second_finalize_status,
-                        pending_events: second_pending_events,
-                    } = second_outcome;
-                    review = second_finalized_review;
-                    persist_finalize_pending_events(state, &contact, &second_pending_events)
-                        .await?;
-
-                    let second_passed =
-                        matches!(second_finalize_status, GatewayStatusFinal::Approved)
-                            && review_passed(&review, &runtime);
-
-                    if second_passed {
-                        // R2.3：revision_applied_approved
-                        revision_applied = true;
-                        review.revision_applied = true;
-                        review.final_review_status = "revision_applied_approved".to_string();
-                        revision_reason = "revision_applied_approved".to_string();
-                        finalize_status = GatewayStatusFinal::Approved;
-                        post_revision_summary = Some(format!(
-                            "approved=true reply_text_len={} risks={:?}",
-                            final_decision.reply_text.chars().count(),
-                            review.risks
-                        ));
-                        // GATE-1:revision 整条替换 final_decision,operation_state 可能迁入
-                        // 禁止 reply 的态。初次动作闸只校验了改写前的 decision,这里对改写后的
-                        // final_decision 复检一次,命中 forbidden 时把外层 finalize_status 置
-                        // Held —— 下游统一拦截分支据此 fail-closed,不 enqueue outbox。
-                        apply_state_action_gate(
-                            state,
-                            &contact,
-                            domain_config.as_ref(),
-                            &mut final_decision,
-                            &mut review,
-                            &mut finalize_status,
-                            &run_id,
-                        )
-                        .await?;
-                    } else {
-                        // 第二轮未过：按首轮 trigger 分类。纯风格可恢复原稿；安全/边界/
-                        // 压力/双审分歧一律 hold，不允许把已知风险原稿重新标成可发送。
-                        review = pre_revision_review.clone();
-                        revision_applied = false;
-                        let (reason, restored) = apply_revision_fallback(
-                            &mut review,
-                            &runtime,
-                            &mut finalize_status,
-                            "revision_post_review_failed",
-                        );
-                        revision_reason = reason;
-                        if restored {
-                            final_decision = pre_revision_decision.clone();
-                            final_decision.should_reply = true;
-                        } else {
-                            final_decision.should_reply = false;
-                        }
-                        post_revision_summary = Some(format!(
-                        "revision_post_review_failed restored_pre_revision={} reply_text_len={}",
-                        restored,
-                        final_decision.reply_text.chars().count(),
-                    ));
-                    }
-                }
-                Ok(Err(err)) => {
-                    review = pre_revision_review.clone();
-                    revision_applied = false;
-                    let (reason, restored) = apply_revision_fallback(
-                        &mut review,
-                        &runtime,
-                        &mut finalize_status,
-                        &format!("revision_llm_error:{}", err),
-                    );
-                    revision_reason = reason;
-                    if restored {
-                        final_decision = pre_revision_decision.clone();
-                        final_decision.should_reply = true;
-                    } else {
-                        final_decision.should_reply = false;
-                    }
-                    write_event_for_account(
-                        state,
-                        &contact.workspace_id,
-                        &contact.account_id,
-                        Some(&contact.wxid),
-                        "revision_llm_failure",
-                        if restored { "info" } else { "blocked" },
-                        if restored {
-                            "Reply Agent revision 调用失败：纯风格改写回退到原稿"
-                        } else {
-                            "Reply Agent revision 调用失败：安全类改写 fail closed"
-                        },
-                        Some(doc! {
-                            "run_id": &run_id,
-                            "error": err.to_string(),
-                            "restored_pre_revision": restored,
-                        }),
-                    )
-                    .await?;
-                }
-                Err(_) => {
-                    review = pre_revision_review.clone();
-                    revision_applied = false;
-                    let (reason, restored) = apply_revision_fallback(
-                        &mut review,
-                        &runtime,
-                        &mut finalize_status,
-                        "revision_llm_timeout_30s",
-                    );
-                    revision_reason = reason;
-                    if restored {
-                        final_decision = pre_revision_decision.clone();
-                        final_decision.should_reply = true;
-                    } else {
-                        final_decision.should_reply = false;
-                    }
-                    write_event_for_account(
-                        state,
-                        &contact.workspace_id,
-                        &contact.account_id,
-                        Some(&contact.wxid),
-                        "revision_llm_failure",
-                        if restored { "info" } else { "blocked" },
-                        if restored {
-                            "Reply Agent revision 调用超时（30s）：纯风格改写回退到原稿"
-                        } else {
-                            "Reply Agent revision 调用超时（30s）：安全类改写 fail closed"
-                        },
-                        Some(doc! {
-                            "run_id": &run_id,
-                            "latency_ms": 30000_i64,
-                            "restored_pre_revision": restored,
-                        }),
-                    )
-                    .await?;
-                }
-            }
-        }
-    }
-    let _ = promote_risks; // 后续如需进一步审计可再消费
-
-    // ── Phase A / A3：最终稿 taxonomy 软闸 ──
-    //
-    // 必须放在所有 rewrite/revision 结束之后，只对真正可发送的最终稿执行一次：否则
-    // revision 可引入一个未审核维度并绕过首稿检查，或同一 run 重复累计 candidate。
-    // CandidateNew 仍进入候选审核队列且不阻塞回复，但从画像字段及同源 FSM 提案中隔离。
-    if matches!(finalize_status, GatewayStatusFinal::Approved) {
-        let cache = global_taxonomy_cache(&state.db);
-        cache.find_or_load(&state.db, &contact.workspace_id).await?;
-        let dimension_kinds =
-            crate::agent::domain_profile::decision_dimension_kinds(&active_profile);
-        let fsm_customer_stage_keys = operation_states(domain_config.as_ref())
-            .into_iter()
-            .filter_map(|state| state.get_str("key").ok().map(ToString::to_string))
-            .collect::<Vec<_>>();
-        let outcome = compute_taxonomy_guard_outcome(
-            &final_decision,
-            &dimension_kinds,
-            &fsm_customer_stage_keys,
-            &contact.workspace_id,
-            &contact.account_id,
-            &cache,
-        );
-        let candidate_display_names = outcome
-            .candidate_writes
-            .iter()
-            .map(|(kind, raw)| {
-                (
-                    kind.clone(),
-                    raw.clone(),
-                    pick_dimension_display_name(&final_decision.dimension_display_names, kind)
-                        .map(ToString::to_string),
-                )
-            })
-            .collect::<Vec<_>>();
-        apply_taxonomy_guard_outcome(&mut final_decision, &mut review, &outcome);
-        for (kind, raw, display_name) in candidate_display_names {
-            if let Err(error) = taxonomy_upsert_candidate(
-                &state.db,
-                &contact.workspace_id,
-                &contact.account_id,
-                &kind,
-                &raw,
-                Some("user-ops final decision path"),
-                50,
-                display_name.as_deref(),
-            )
-            .await
-            {
-                tracing::warn!(?error, kind, raw, "taxonomy upsert_candidate failed");
-            }
-        }
-    }
-
-    // 同步把 finalize 阶段计算好的 final_review_status / revision_applied 字段
-    // 写回 review struct，便于审计 / 落库（write_decision_review / write_agent_run_log
-    // 都 serialize 这个 review）。
-    if review.final_review_status.is_empty() {
-        // 兜底：finalize 路径已设置 final_review_status；若空则用 finalize_status 兜底。
-        review.final_review_status = finalize_status.final_review_status_str();
-    }
-
-    // ISSUE-001 (R12)：FollowUp 路径下，review 阶段（~3s）期间用户可能中途
-    // 发新 inbound。原逻辑在此处 review-held 短路返回，导致 cancel_task 的 reason
-    // 始终是 "finalize_review_blocked"，掩盖了"用户中途插话"这一真实信号。
-    // 这里先用 last_inbound_at vs task.created_at 重算 context_changed，命中则
-    // 把 finalize_status 改写为 BlockedSafetyGuard + reason 改写，让 cancel_task
-    // / write_event 落库时显式标记 context_changed。
-    let context_changed_followup_hit = match &trigger {
-        AgentTrigger::FollowUp(task) => {
-            let last_inbound_ms =
-                inbound_marker_for_context_check(&contact).map(|d| d.timestamp_millis());
-            let task_created_ms = task.created_at.timestamp_millis();
-            check_context_changed_followup_pure(last_inbound_ms, task_created_ms)
-        }
-        _ => false,
-    };
-    let context_changed_followup_reason: Option<&'static str> = if context_changed_followup_hit {
-        Some("用户在跟进任务后已有新消息（review 阶段被覆盖），取消旧跟进")
-    } else {
-        None
-    };
-
-    // finalize 终态决定是否拦截发送：approved 路径继续走原有 send 逻辑；
-    // 其它终态（held / blocked_*）一律 fail-closed（不发送、记录审计）。
-    if !matches!(finalize_status, GatewayStatusFinal::Approved) {
-        let (blocked_status, cancel_reason) = if let Some(reason) = context_changed_followup_reason
-        {
-            // ISSUE-001 (R12)：context_changed 抢先覆盖 gateway_status；
-            // final_review_status 保持 finalize 计算值（10 项枚举内合法），
-            // 但通过 review.risks 追加 "follow_up_context_changed" 标签，
-            // 让审计 / observability 能看到这一 race 真实信号。
-            if !review
-                .risks
-                .iter()
-                .any(|r| r == "follow_up_context_changed")
-            {
-                review.risks.push("follow_up_context_changed".to_string());
-            }
-            ("context_changed".to_string(), reason)
-        } else {
-            (
-                finalize_status.gateway_status_str(),
-                "finalize_review_blocked",
-            )
-        };
-        // `precheck` only describes the cheap gateway snapshot taken before Review/Claim Gate.
-        // Once finalize has produced a terminal block, persist that terminal outcome instead of
-        // reusing the earlier `allowed=true` snapshot; otherwise the run log contradicts
-        // `finalReviewStatus` and makes an actually blocked reply look sendable to operators.
-        let terminal_gateway = blocked(&blocked_status, cancel_reason);
-        write_decision_review(
-            state,
-            &contact,
-            &inbound,
-            &final_decision,
-            &review,
-            playbook.as_ref(),
-            domain_config.as_ref(),
-            &runtime,
-            &terminal_gateway,
-            &context_pack,
-            &blocked_status,
-            &knowledge_route,
-            &run_id,
-            &planner,
-        )
-        .await?;
-        if let Some(task_context) = task_context.as_ref() {
-            cancel_task(state, task_context, &blocked_status, cancel_reason).await?;
-        }
-        write_event_for_account(
-            state,
-            &contact.workspace_id,
-            &contact.account_id,
-            Some(&contact.wxid),
-            "blocked_review",
-            &blocked_status,
-            cancel_reason,
-            Some(review_event_details(&review)),
-        )
-        .await?;
-        write_agent_run_log_with_finalize(
-        state,
-        &contact,
-        &run_id,
-        trigger.kind(),
-        &blocked_status,
-        &planner,
-        doc! { "refreshed": should_refresh_context, "version": context_pack.get_i32("version").unwrap_or_default() },
-        &knowledge_route,
-        to_document(&final_decision).unwrap_or_default(),
-        to_document(&review).unwrap_or_default(),
-        to_document(&terminal_gateway).unwrap_or_default(),
-        None,
-        FinalizeRunLogFields {
-            final_review_status: review.final_review_status.clone(),
-            autonomy_mode: final_decision.autonomy_mode.clone(),
-            conversation_mode: final_decision.conversation_mode.clone(),
-            conversation_mode_reason: final_decision.conversation_mode_reason.clone(),
-            revision_applied,
-            revision_reason: revision_reason.clone(),
-            pre_revision_summary: pre_revision_summary.clone(),
-            post_revision_summary: post_revision_summary.clone(),
-            self_critique: non_empty_option(&Some(final_decision.self_critique.clone())),
-            source_event_id: envelope_source_event_id.clone(),
-            source_kind: envelope_source_kind.clone(),
+    let turn_outcome = super::turn_loop::run_turn(
+        &super::turn_loop::TurnKernelInput {
+            run_id: &run_id,
+            turn_id,
+            authority_bundle_hash: authority.bundle_hash(),
         },
+        &mut turn_environment,
     )
     .await?;
-        // hold→升级请示：被风险闸门拦下的高风险件，按 workspace 升级模式请示领导（只推卡+落台账+写
-        // awaiting）。客户安抚占位不在这里——由下方 ensure_customer_acknowledged 守卫统一负责（方案 B 解耦）。
-        // 错误只记 warn、不阻断 run、不改终态（与 approved 末尾 trigger_principal_escalation 同纪律）。
-        // context_changed 不是决策墙，should_escalate_held 对其返回 false，不会误升级。
-        if let Err(e) = escalation::escalate_held_decision(
-            state,
-            &contact,
-            &review,
-            &final_decision,
-            domain_config.as_ref(),
-            &blocked_status,
-        )
-        .await
-        {
-            tracing::warn!(error = %e, contact = %contact.wxid, "hold→升级请示失败（不阻断 run）");
-        }
-
-        // ⑨ 产品宣称被拦 → 写 recall_miss 知识缺口信号（收件箱可见，缺口可被闭环修复）。
-        //
-        // R5.4 硬闸只发了瞬时 `product_claim_blocked` 事件（details 仅 used_knowledge_ids），
-        // 运营无法据此知道「缺什么、补什么」。这里把客户当前问句（inbound.content）落成一条
-        // recall_miss 缺口信号——统一收件箱已展示 source=gap_signal，运营据 search_queries
-        // 里的客户问句对话式补录 / verify 相关知识。
-        //
-        // fail-soft：gap_signal 写失败只记 warn、不阻断 run（回复路径已决，与上方
-        // escalate_held / `agent.dimension_dropped` 的 let _ 同纪律）。落点选在此 async
-        // 上游而非 finalize_review_for_send 内——后者是纯同步 finalize 逻辑、不持有 db。
-        if matches!(
-            finalize_status,
-            GatewayStatusFinal::BlockedUnverifiedProductClaim
-        ) {
-            let candidate =
-            crate::knowledge_wiki::gap_signals::GapSignalCandidate::recall_miss_from_product_block(
-                inbound.content.clone(),
-            );
-            if let Err(e) = crate::knowledge_wiki::gap_signals::persist_recall_signal(
-                &state.db,
-                &contact.workspace_id,
-                candidate,
-            )
-            .await
-            {
-                tracing::warn!(
-                    error = %e,
-                    contact = %contact.wxid,
-                    "产品宣称被拦写 recall_miss 缺口信号失败（不阻断 run）"
-                );
-            }
-        }
-        ensure_customer_acknowledged(
-            state,
-            &contact,
-            &run_id,
-            trigger.kind(),
-            &envelope_source_event_id,
-            &blocked_status,
-            task_context.as_ref(),
-            &should_abort_send,
-        )
-        .await;
-        return Ok(());
-    }
-
-    let final_precheck = precheck_send_gateway(state, &contact, &trigger, &runtime).await?;
-    if final_decision.should_reply && !final_precheck.allowed {
-        if let Some(task_context) = task_context.as_ref() {
-            // #69：与第一道 precheck 一致——静默时段命中重排到醒来，其余 block 取消。
-            // 第二道在 LLM 决策之后命中（罕见：仅当静默边界恰好落在决策耗时内），
-            // 重排即丢弃这次决策、醒来按完整上下文重跑，语义正确。
-            if final_precheck.status == "quiet_hours_deferred" {
-                let wake_at = crate::agent::quiet_hours::next_wake_at(
-                    runtime.quiet_hours_end,
-                    runtime.quiet_hours_tz_offset_hours,
-                    &contact.wxid,
-                    state.config.wake_jitter_max_seconds,
-                );
-                reschedule_task(state, task_context, wake_at, &final_precheck.reason).await?;
-            } else {
-                cancel_task(
-                    state,
-                    task_context,
-                    &final_precheck.status,
-                    &final_precheck.reason,
-                )
-                .await?;
-            }
-        }
-        write_decision_review(
-            state,
-            &contact,
-            &inbound,
-            &final_decision,
-            &review,
-            playbook.as_ref(),
-            domain_config.as_ref(),
-            &runtime,
-            &final_precheck,
-            &context_pack,
-            "gateway_blocked",
-            &knowledge_route,
-            &run_id,
-            &planner,
-        )
-        .await?;
-        write_event_for_account(
-            state,
-            &contact.workspace_id,
-            &contact.account_id,
-            Some(&contact.wxid),
-            "gateway_blocked",
-            &final_precheck.status,
-            &final_precheck.reason,
-            Some(to_document(&final_precheck).unwrap_or_default()),
-        )
-        .await?;
-        write_agent_run_log_with_finalize(
-        state,
-        &contact,
-        &run_id,
-        trigger.kind(),
-        "gateway_blocked",
-        &planner,
-        doc! { "refreshed": should_refresh_context, "version": context_pack.get_i32("version").unwrap_or_default() },
-        &knowledge_route,
-        to_document(&final_decision).unwrap_or_default(),
-        to_document(&review).unwrap_or_default(),
-        to_document(&final_precheck).unwrap_or_default(),
-        None,
-        FinalizeRunLogFields {
-            final_review_status: review.final_review_status.clone(),
-            autonomy_mode: final_decision.autonomy_mode.clone(),
-            conversation_mode: final_decision.conversation_mode.clone(),
-            conversation_mode_reason: final_decision.conversation_mode_reason.clone(),
-            revision_applied,
-            revision_reason: revision_reason.clone(),
-            pre_revision_summary: pre_revision_summary.clone(),
-            post_revision_summary: post_revision_summary.clone(),
-            self_critique: non_empty_option(&Some(final_decision.self_critique.clone())),
-            source_event_id: envelope_source_event_id.clone(),
-            source_kind: envelope_source_kind.clone(),
-        },
-    )
-    .await?;
-        ensure_customer_acknowledged(
-            state,
-            &contact,
-            &run_id,
-            trigger.kind(),
-            &envelope_source_event_id,
-            &final_precheck.status,
-            task_context.as_ref(),
-            &should_abort_send,
-        )
-        .await;
-        return Ok(());
-    }
-
-    // 并发多消息去抖——主中止检查（强制落在任何画像 / 记忆 / outbox 落库之前）。
-    //
-    // 决策与审查已完成，但尚未写任何画像 / 记忆 / outbox。若此刻调度器观察到
-    // 更新的入站（用户在这次生成期间又发了消息），should_abort_send() 返回 true：
-    // 放弃这次已过时的生成，写一条终态 run log（gateway_status=
-    // superseded_by_new_inbound），交由调度器用更全的上下文重算。
-    //
-    // 关键：必须在本 run 推进 last_agent_run_at 的一切写点之前——outbox 授权时的
-    // `$max` 回写与发送成功后的时间戳回写都会推进它（此外 post-decision 投影 worker
-    // 的 apply_agent_updates 也会无条件推到 now，但那是本 run 落库后才会调度的异步
-    // 投影）。若先落库再放弃，重算时 precheck 会因 min_reply_interval 误判
-    // rate_limited 吞掉聚合回复。这里直接 return 不触碰 last_agent_run_at，重算
-    // precheck 干净。
-    if let Some(guard) = &should_abort_send {
-        if guard() {
-            write_agent_run_log(
-            state,
-            &contact,
-            &run_id,
-            trigger.kind(),
-            "superseded_by_new_inbound",
-            &planner,
-            doc! { "refreshed": should_refresh_context, "version": context_pack.get_i32("version").unwrap_or_default() },
-            &knowledge_route,
-            to_document(&final_decision).unwrap_or_default(),
-            to_document(&review).unwrap_or_default(),
-            to_document(&final_precheck).unwrap_or_default(),
-            None,
-            &envelope_source_event_id,
-            &envelope_source_kind,
-        )
-        .await?;
-            return Ok(());
-        }
-    }
-
-    // The 100ms monitor is an early-abort optimization, not the ownership
-    // authority. Re-read the exact task lease immediately before the first
-    // profile/memory mutation so a newer inbound cannot slip through the
-    // monitor scheduling window and let an obsolete generation write state.
-    if let Some(claim) = task_context
-        .as_ref()
-        .and_then(|context| context.claim.as_ref())
-    {
-        if !crate::tasks::task_claim_is_current(state, claim).await? {
-            write_agent_run_log(
-            state,
-            &contact,
-            &run_id,
-            trigger.kind(),
-            "stale_task_claim",
-            &planner,
-            doc! { "refreshed": should_refresh_context, "version": context_pack.get_i32("version").unwrap_or_default() },
-            &knowledge_route,
-            to_document(&final_decision).unwrap_or_default(),
-            to_document(&review).unwrap_or_default(),
-            to_document(&final_precheck).unwrap_or_default(),
-            None,
-            &envelope_source_event_id,
-            &envelope_source_kind,
-        )
-        .await?;
-            return Ok(());
-        }
-    }
-
-    // 子计划2 Task3/Task4：tag_observation 证据锚定 + customer_stage 强弱门控均需按
-    // created_at 升序（最早在前，0-based）的对话窗口——与 prompt 呈现给 LLM 的顺序一致。
-    // `recent_messages` 来自 load_recent_messages，按 {created_at:-1} 降序（最新在前），
-    // 故此处反转成升序后共享给 apply_agent_updates（Task4）与 apply_operating_memory_update
-    // （Task3），只构造一次。
-    let ascending_window: Vec<ConversationMessage> =
-        recent_messages.iter().rev().cloned().collect();
-    if !final_decision.should_reply {
-        super::run_audit::mark_no_reply();
-    }
-    let decision_review_id = write_decision_review(
-        state,
-        &contact,
-        &inbound,
-        &final_decision,
-        &review,
-        playbook.as_ref(),
-        domain_config.as_ref(),
-        &runtime,
-        &final_precheck,
-        &context_pack,
-        if final_decision.should_reply {
-            "outbox_enqueuing"
-        } else {
-            "no_reply"
-        },
-        &knowledge_route,
-        &run_id,
-        &planner,
-    )
-    .await?;
-    // SR-034：在创建任何 Outbox 前，把 decision 绑定到本次 task claim。生产路径
-    // 必须以不可复用 token CAS；若 lease 已被 reclaim/新 owner 取得所有权，本 worker 到此
-    // 立即停止，绝不进入 Outbox。旧直接调用入口仅保留按 task_id 的兼容关联。
-    if let Some(task_context) = task_context.as_ref() {
-        let bound = if let Some(claim) = task_context.claim.as_ref() {
-            crate::tasks::bind_task_decision_if_owned(state, claim, decision_review_id).await?
-        } else {
-            state
-                .db
-                .tasks()
-                .update_one(
-                    task_context.write_filter(),
-                    doc! { "$set": {
-                        "outbox_decision_id": decision_review_id,
-                        "updated_at": DateTime::now(),
-                    } },
-                    None,
-                )
-                .await?
-                .matched_count
-                == 1
-        };
-        if !bound {
-            state
-                .db
-                .decision_reviews()
-                .update_one(
-                    doc! { "_id": decision_review_id },
-                    doc! { "$set": { "status": "stale_task_claim" } },
-                    None,
-                )
-                .await?;
-            write_event_for_account(
-                state,
-                &contact.workspace_id,
-                &contact.account_id,
-                Some(&contact.wxid),
-                "task_claim_fenced",
-                "stale_task_claim",
-                "任务 lease 已由新 owner 取得所有权，本轮在 Outbox 前终止",
-                Some(doc! { "run_id": &run_id, "decision_id": decision_review_id }),
-            )
-            .await?;
-            super::post_decision::discard_projection(state, decision_review_id, "stale_task_claim").await;
-            return Ok(());
-        }
-    }
-    if let Err(error) = super::post_decision::persist_projection_snapshot(
-        state,
-        decision_review_id,
-        &final_decision,
-        &memory,
-        &context_pack,
-        domain_config.as_ref(),
-        &active_profile,
-        &active_products,
-        &ascending_window,
-        &contact,
-        &run_id,
-    )
-    .await
-    {
-        tracing::warn!(
-            %error,
-            review_id = %decision_review_id,
-            run_id,
-            "post-decision snapshot preparation failed; customer delivery continues"
-        );
-        super::post_decision::mark_preparation_failed(
-            state,
-            decision_review_id,
-            &error.to_string(),
-        )
-        .await;
-    }
-    // Usage telemetry is not a send-authorization fact. Keep it visible but fail-soft so an
-    // observability outage cannot suppress a reply that already passed all safety barriers.
-    if let Err(error) = write_knowledge_usage_log(
-        state,
-        &contact,
-        &final_decision,
-        &review,
-        &knowledge_route,
-        review_passed(&review, &runtime),
-        &run_id,
-    )
-    .await
-    {
-        tracing::warn!(%error, %run_id, "knowledge usage telemetry failed before outbox");
-    }
-    if !text_send_eligible(final_decision.should_reply, &final_decision.reply_text) {
-        if let Some(task_context) = task_context.as_ref() {
-            // should_reply=false → 无需触达；should_reply=true 但 reply_text 为空 → 退化
-            // 决策无内容可发（媒体/名片也因 outbox_eligible 要求非空文本而不会发）。两者都
-            // 须落终态，否则 task 卡在 running 被 reclaim 反复重试、3 次后强制 failed。
-            let reason = if final_decision.should_reply {
-                "Agent 想回复但生成的正文为空，无内容可发送"
-            } else {
-                "Agent 判断无需触达"
-            };
-            cancel_task(state, task_context, "no_reply", reason).await?;
-        }
-        if final_decision.should_reply {
-            super::post_decision::discard_projection(
-                state,
-                decision_review_id,
-                "empty_reply_text",
-            )
-            .await;
-        } else {
-            super::post_decision::activate_projection(state, decision_review_id).await?;
-        }
-    }
-    let details = build_decision_event_details(&final_decision, playbook.as_ref(), &review);
-    // This event precedes durable enqueue. Describe only the fact that is true now; the
-    // `outbox_enqueued` event is emitted after the batch seal below. Audit writes are fail-soft.
-    if let Err(error) = write_event_for_account(
-        state,
-        &contact.workspace_id,
-        &contact.account_id,
-        Some(&contact.wxid),
-        "agent_reply_prepared",
-        "prepared",
-        if final_decision.should_reply {
-            "Agent 已生成并审查回复，准备建立 outbox"
-        } else {
-            "Agent 判断无需回复"
-        },
-        Some(details),
-    )
-    .await
-    {
-        tracing::warn!(%error, %run_id, "prepared reply audit event failed");
-    }
-    if let Err(error) = write_agent_run_log_with_finalize(
-    state,
-    &contact,
-    &run_id,
-    trigger.kind(),
-    if final_decision.should_reply { "outbox_enqueuing" } else { "no_reply" },
-    &planner,
-    doc! { "refreshed": should_refresh_context, "version": context_pack.get_i32("version").unwrap_or_default() },
-    &knowledge_route,
-    to_document(&final_decision).unwrap_or_default(),
-    to_document(&review).unwrap_or_default(),
-    to_document(&final_precheck).unwrap_or_default(),
-    None,
-    FinalizeRunLogFields {
-        final_review_status: review.final_review_status.clone(),
-        autonomy_mode: final_decision.autonomy_mode.clone(),
-        conversation_mode: final_decision.conversation_mode.clone(),
-        conversation_mode_reason: final_decision.conversation_mode_reason.clone(),
-        revision_applied,
-        revision_reason: revision_reason.clone(),
-        pre_revision_summary: pre_revision_summary.clone(),
-        post_revision_summary: post_revision_summary.clone(),
-        self_critique: non_empty_option(&Some(final_decision.self_critique.clone())),
-        source_event_id: envelope_source_event_id.clone(),
-        source_kind: envelope_source_kind.clone(),
-    },
-)
-.await
-    {
-        tracing::warn!(%error, %run_id, "pre-enqueue run telemetry failed");
-    }
-
-    // W4 / Task 5.5：决策落地 = outbox 写入。仅在 finalReviewStatus ∈
-    // {approved, revision_applied_approved} 且 should_reply=true 时入队；
-    // 真正发送由 dispatcher worker 异步抢占（atomic claim + lease）后通过
-    // `send_outbound_message` 调 MCP（spec R13 / requirements §F）。
-    let final_status = review.final_review_status.as_str();
-    let mut outbox_eligible = final_decision.should_reply
-        && !final_decision.reply_text.trim().is_empty()
-        && (final_status == "approved" || final_status == "revision_applied_approved");
-    let mut delivery_block_status: Option<&str> = None;
-    // relay 出站红线守卫（代码级兜底）：relay 转述绝不透传内部载荷
-    // （__PRINCIPAL_RELAY__/verdict=/substance=/constraints=）。命中即 fail-closed：
-    // 不入队该文本（宁可客户这轮收不到，也绝不把内部载荷标记发给客户），记 event + warn
-    // 供运维定位。非 relay run 不受影响。
-    //
-    // 注：转述是否忠于领导授权（不编造授权外折扣/数字）由生成侧 prompt（substance 是
-    // 唯一事实源）+ 独立 Review Agent（已同时看到授权 substance 与拟发转述）做语义级把关，
-    // 不再用字符级数字白名单 backstop——后者威胁模型错误（既漏中文数字、又误杀无害的
-    // 时间/序数/等价折扣数字，其 fail-closed 曾致 KD-03 裁决黑洞），已删除（KD-01/03）。
-    if outbox_eligible && escalation::is_principal_relay_trigger(&trigger) {
-        let leaks_payload =
-            escalation::relay_output_leaks_internal_payload(&final_decision.reply_text);
-        if leaks_payload {
-            outbox_eligible = false;
-            delivery_block_status = Some("blocked_by_safety_guard");
-            tracing::warn!(
-                %run_id,
-                contact_wxid = %contact.wxid,
-                "relay 转述拟发文本疑似泄漏内部载荷，已拦截不发（fail-closed）"
-            );
-            write_event_for_account(
-                state,
-                &contact.workspace_id,
-                &contact.account_id,
-                Some(&contact.wxid),
-                "blocked_review",
-                "blocked_by_safety_guard",
-                "relay 转述输出含内部载荷标记，安全门拦截不发送",
-                None,
-            )
-            .await?;
-        }
-    }
-    // 并发多消息去抖——兜底中止检查（outbox 入队之前）。主检查在 apply 之前已挡掉
-    // 绝大多数；这里再查一次，接住 apply / memory / decision-review 写入期间到达的
-    // 更新入站，避免发出一条已过时的回复。此前的画像 / 记忆写入已落库（幂等、
-    // last-write-wins），重算会再覆盖一遍，不丢正确性；唯一保证是"不入队过时回复"。
-    // 终审 Important#1：去抖须同时覆盖文本与媒体——只要本 run 会发任何东西就该被
-    // 取代保护。media_pending 用 final_status 终态门判断（与文本无媒体时字节等价：
-    // has_assets=false 时 media_pending=false，条件退化为纯 outbox_eligible）。
-    // 名片引荐同理纳入：本 run 若会发名片，superseded 时也要一并中止（缺口③同源）。
-    let media_pending = (final_status == "approved" || final_status == "revision_applied_approved")
-        && (!final_decision.assets_to_send.is_empty() || final_decision.namecard_to_send.is_some());
-    if should_run_send(outbox_eligible, media_pending) {
-        // B-01（已知产品取舍，暂不修）：此兜底 guard 到下方多段 enqueue 循环之间仍有极窄
-        // 尾窗（每段一次 outbox_enqueue DB 往返，约 10-100ms）——新入站若恰落在此窗口内，
-        // 本轮过时回复会全部 enqueue，同时 runner 检测 generation 变化重算再 enqueue 一批，
-        // 两批 segment 幂等 key 不同不互相去重 → 客户可能收两次回复。彻底消除需"入队后按
-        // run_id/generation 撤销上一 gen 的 pending outbox"补偿（EnqueueRequest 已带 run_id），
-        // 但该方案触碰 outbox 幂等核心 + runner 重算交互（并发正确性改动，风险最高），且此窗口
-        // 极窄、生产自然触发概率低，故列为已知产品取舍待专项，不在本轮低危加固批消除。详见台账 B-01。
-        if let Some(guard) = &should_abort_send {
-            if guard() {
-                tracing::info!(
-                    %run_id,
-                    contact_wxid = %contact.wxid,
-                    "outbox enqueue skipped: superseded by newer inbound"
-                );
-                state
-                    .db
-                    .decision_reviews()
-                    .update_one(
-                        doc! { "_id": decision_review_id, "status": "outbox_enqueuing" },
-                        doc! { "$set": { "status": "superseded_by_new_inbound" } },
-                        None,
-                    )
-                    .await?;
-                state
-                .db
-                .agent_run_logs()
-                .update_one(
-                    doc! { "run_id": &run_id, "status": "outbox_enqueuing" },
-                    doc! { "$set": {
-                        "status": "superseded_by_new_inbound",
-                        "lifecycle": crate::agent::run_envelope::LIFECYCLE_ABORTED_BY_EXTERNAL_SIGNAL,
-                        "abort_reason": "superseded_by_new_inbound",
-                        "updated_at": DateTime::now(),
-                    } },
-                    None,
-                )
-                .await?;
-                if let Some(task_context) = task_context.as_ref() {
-                    cancel_task(
-                        state,
-                        task_context,
-                        "superseded_by_new_inbound",
-                        "入队前被更新的客户消息取代",
-                    )
-                    .await?;
-                }
-                super::post_decision::discard_projection(
-                    state,
-                    decision_review_id,
-                    "superseded_by_new_inbound",
-                )
-                .await;
-                return Ok(());
-            }
-        }
-    }
-    let mut text_outbox_enqueued = false;
-    let mut cross_decision_duplicates: Vec<(usize, ObjectId, String)> = Vec::new();
-    if outbox_eligible {
-        let source_event_id = match &trigger {
-            AgentTrigger::Inbound(msg) => msg.message_id.clone().unwrap_or_default(),
-            AgentTrigger::FollowUp(task) => task.id.map(|id| id.to_hex()).unwrap_or_default(),
-        };
-        // #68：把整条回复拆成多条短消息,逐条 enqueue。每条把 segment 序号拼进
-        // source_event_id(`{src}#seg{idx}`),保证 N 条幂等 key 天然不碰撞——否则
-        // 两段内容雷同(如都是"好的")时 content_hash 相同会被当幂等 skip 吞掉、丢消息。
-        let segments = split_reply_into_segments(
-            &final_decision.reply_text,
-            state.config.agent_reply_max_segment_chars,
-            state.config.agent_reply_max_segments,
-        );
-        let total = segments.len();
-        // 多段消息：单段 enqueue 失败时**不立即中断**——否则前面已入队的段会发出、
-        // 后续段永远不发，客户收到半截回复（webhook 路径无重算补发）。每段幂等 key
-        // 独立（`#seg{idx}`），故继续尝试剩余段、最大化发完能发的；循环后若有任何段
-        // 失败再整体返 Err 让上层可观测。
-        let mut enqueue_errors: Vec<(usize, AppError)> = Vec::new();
-        for (idx, segment) in segments.into_iter().enumerate() {
-            let seg_source_event_id = if total > 1 {
-                format!(
-                    "{}#seg{idx}",
-                    segment_idempotency_base(&source_event_id, &run_id)
-                )
-            } else {
-                source_event_id.clone()
-            };
-            let enqueue_req = EnqueueRequest {
-                workspace_id: contact.workspace_id.clone(),
-                account_id: contact.account_id.clone(),
-                contact_wxid: contact.wxid.clone(),
-                run_id: run_id.clone(),
-                decision_id: Some(decision_review_id),
-                source_event_id: seg_source_event_id,
-                source_kind: trigger.kind().to_string(),
-                content: segment,
-                media_asset_id: None,
-                referral_card_id: None,
-                max_attempts: 3,
-            };
-            match outbox_enqueue(state, enqueue_req).await {
-                Ok(EnqueueOutcome::Created { outbox_id, .. }) => {
-                    text_outbox_enqueued = true;
-                    tracing::info!(
-                        %run_id,
-                        %outbox_id,
-                        contact_wxid = %contact.wxid,
-                        segment_index = idx,
-                        segment_total = total,
-                        "outbox enqueued"
-                    );
-                }
-                Ok(EnqueueOutcome::IdempotentSkip {
-                    idempotency_key,
-                    existing_outbox_id,
-                    existing_decision_id,
-                    existing_status,
-                    ..
-                }) => {
-                    let adopted = if let (Some(old_decision_id), Some(claim)) = (
-                        existing_decision_id,
-                        task_context
-                            .as_ref()
-                            .and_then(|context| context.claim.as_ref()),
-                    ) {
-                        crate::tasks::adopt_recoverable_durable_outbox_if_owned(
-                            state,
-                            claim,
-                            decision_review_id,
-                            &run_id,
-                            existing_outbox_id,
-                            old_decision_id,
-                        )
-                        .await?
-                    } else {
-                        false
-                    };
-                    if adopted
-                        || existing_outbox_covers_decision(
-                            existing_decision_id,
-                            decision_review_id,
-                            &existing_status,
-                        )
-                    {
-                        text_outbox_enqueued = true;
-                    } else {
-                        cross_decision_duplicates.push((idx, existing_outbox_id, existing_status));
-                    }
-                    tracing::info!(
-                        %run_id,
-                        %idempotency_key,
-                        contact_wxid = %contact.wxid,
-                        segment_index = idx,
-                        %existing_outbox_id,
-                        "outbox enqueue idempotent skip"
-                    );
-                }
-                Err(err) => {
-                    tracing::error!(?err, %run_id, segment_index = idx, "outbox enqueue failed");
-                    enqueue_errors.push((idx, err.into()));
-                }
-            }
-        }
-        if enqueue_errors.is_empty()
-            && !cross_decision_duplicates.is_empty()
-            && cross_decision_duplicates.len() == total
-            && !text_outbox_enqueued
-        {
-            let duplicate_outbox_ids: Vec<ObjectId> = cross_decision_duplicates
-                .iter()
-                .map(|(_, outbox_id, _)| *outbox_id)
-                .collect();
-            state
-                .db
-                .decision_reviews()
-                .update_one(
-                    doc! { "_id": decision_review_id, "status": "outbox_enqueuing" },
-                    doc! { "$set": {
-                        "status": "skipped_duplicate",
-                        "duplicate_outbox_ids": duplicate_outbox_ids.clone(),
-                    } },
-                    None,
-                )
-                .await?;
-            state
-                .db
-                .agent_run_logs()
-                .update_one(
-                    doc! { "run_id": &run_id, "status": "outbox_enqueuing" },
-                    doc! { "$set": {
-                        "status": "skipped_duplicate",
-                        "lifecycle": crate::agent::run_envelope::LIFECYCLE_COMPLETED,
-                        "updated_at": DateTime::now(),
-                    } },
-                    None,
-                )
-                .await?;
-            if let Some(task_context) = task_context.as_ref() {
-                cancel_task(
-                    state,
-                    task_context,
-                    "skipped_duplicate",
-                    "相同回复已由既有 outbox 覆盖，本轮不重复发送",
-                )
-                .await?;
-            }
-            write_event_for_account(
-                state,
-                &contact.workspace_id,
-                &contact.account_id,
-                Some(&contact.wxid),
-                "outbox_skipped_duplicate",
-                "skipped_duplicate",
-                "全部文本分段均命中既有 outbox，本轮未重复入队",
-                Some(doc! {
-                    "run_id": &run_id,
-                    "duplicate_outbox_ids": duplicate_outbox_ids,
-                }),
-            )
-            .await
-            .ok();
-            super::post_decision::discard_projection(
-                state,
-                decision_review_id,
-                "skipped_duplicate",
-            )
-            .await;
-            return Ok(());
-        }
-        if !enqueue_errors.is_empty() || !cross_decision_duplicates.is_empty() {
-            let partial_outbox_status = if text_outbox_enqueued {
-                "pending"
-            } else {
-                "canceled"
-            };
-            let failed_indices: Vec<i64> =
-                enqueue_errors.iter().map(|(idx, _)| *idx as i64).collect();
-            let duplicate_indices: Vec<i64> = cross_decision_duplicates
-                .iter()
-                .map(|(idx, _, _)| *idx as i64)
-                .collect();
-            write_event_for_account(
-                state,
-                &contact.workspace_id,
-                &contact.account_id,
-                Some(&contact.wxid),
-                "outbox_enqueue_partial_failure",
-                "error",
-                "多段回复部分段入队失败——已入队段照常发出，失败段缺失，需管理员核对",
-                Some(doc! {
-                    "run_id": &run_id,
-                    "segment_total": total as i64,
-                    "failed_segment_indices": failed_indices,
-                    "duplicate_segment_indices": duplicate_indices,
-                }),
-            )
-            .await
-            .ok();
-            state
-                .db
-                .decision_reviews()
-                .update_one(
-                    doc! { "_id": decision_review_id, "status": "outbox_enqueuing" },
-                    doc! { "$set": { "status": "outbox_enqueue_partial_failure" } },
-                    None,
-                )
-                .await?;
-            state
-                .db
-                .agent_run_logs()
-                .update_one(
-                    doc! { "run_id": &run_id },
-                    doc! { "$set": {
-                        "status": "outbox_enqueue_partial_failure",
-                        "lifecycle": crate::agent::run_envelope::LIFECYCLE_FAILED_AFTER_DECISION,
-                        "outbox_status": partial_outbox_status,
-                        "updated_at": DateTime::now(),
-                    } },
-                    None,
-                )
-                .await?;
-            if let Some(task_context) = task_context.as_ref() {
-                cancel_task(
-                    state,
-                    task_context,
-                    "outbox_enqueue_partial_failure",
-                    "多段回复部分入队失败",
-                )
-                .await?;
-            }
-            super::post_decision::discard_projection(
-                state,
-                decision_review_id,
-                "outbox_enqueue_partial_failure",
-            )
-            .await;
-            super::outbox_dispatcher::refresh_run_log_outbox_status(state, &run_id).await;
-            if let Some((_, err)) = enqueue_errors.into_iter().next() {
-                return Err(err);
-            }
-            return Ok(());
-        }
-    }
-    if let Some(task_context) = task_context.as_ref() {
-        if text_send_eligible(final_decision.should_reply, &final_decision.reply_text)
-            && !text_outbox_enqueued
-        {
-            cancel_task(
-                state,
-                task_context,
-                "blocked_by_safety_guard",
-                "发送安全门拦截，未创建 outbox",
-            )
-            .await?;
-        }
-    }
-    if final_decision.should_reply && !text_outbox_enqueued {
-        let blocked_status = delivery_block_status.unwrap_or("blocked_by_safety_guard");
-        state
-            .db
-            .decision_reviews()
-            .update_one(
-                doc! { "_id": decision_review_id, "status": "outbox_enqueuing" },
-                doc! { "$set": { "status": blocked_status } },
-                None,
-            )
-            .await?;
-        state
-            .db
-            .agent_run_logs()
-            .update_one(
-                doc! { "run_id": &run_id },
-                doc! { "$set": {
-                    "status": blocked_status,
-                    "lifecycle": crate::agent::run_envelope::LIFECYCLE_FAILED_AFTER_DECISION,
-                    "outbox_status": "canceled",
-                    "updated_at": DateTime::now(),
-                } },
-                None,
-            )
-            .await?;
-        super::post_decision::discard_projection(
-            state,
-            decision_review_id,
-            delivery_block_status.unwrap_or("blocked_by_safety_guard"),
-        )
-        .await;
-    }
-    // 全部文本分段完成 enqueue 后立即提交 task 授权。可选素材/名片不再阻塞客户文本。Dispatcher 在此之前
-    // 即使抢到首段，也只会识别为 Building 并无损 defer；同 token CAS 成功后才允许 MCP。
-    if text_outbox_enqueued {
-        let task_authorized = if let Some(task_context) = task_context.as_ref() {
-            if let Some(claim) = task_context.claim.as_ref() {
-                crate::tasks::authorize_task_outbox_if_owned(state, claim, decision_review_id)
-                    .await?
-            } else {
-                crate::models::assert_agent_task_status_valid("outbox_enqueued");
-                state
-                    .db
-                    .tasks()
-                    .update_one(
-                        task_context.write_filter(),
-                        doc! { "$set": {
-                            "status": "outbox_enqueued",
-                            "gateway_status": "outbox_enqueued",
-                            "outbox_decision_id": decision_review_id,
-                            "updated_at": DateTime::now(),
-                        } },
-                        None,
-                    )
-                    .await?
-                    .matched_count
-                    == 1
-            }
-        } else {
-            true
-        };
-        if !task_authorized {
-            state
-                .db
-                .decision_reviews()
-                .update_one(
-                    doc! { "_id": decision_review_id, "status": "outbox_enqueuing" },
-                    doc! { "$set": { "status": "stale_task_claim" } },
-                    None,
-                )
-                .await?;
-            state
-            .db
-            .agent_run_logs()
-            .update_one(
-                doc! { "run_id": &run_id, "status": "outbox_enqueuing" },
-                doc! { "$set": {
-                    "status": "stale_task_claim",
-                    "lifecycle": crate::agent::run_envelope::LIFECYCLE_ABORTED_BY_EXTERNAL_SIGNAL,
-                    "abort_reason": "stale_task_claim",
-                    "updated_at": DateTime::now(),
-                } },
-                None,
-            )
-            .await?;
-            write_event_for_account(
-                state,
-                &contact.workspace_id,
-                &contact.account_id,
-                Some(&contact.wxid),
-                "task_claim_fenced",
-                "stale_task_claim",
-                "文本 Outbox 已构建但任务授权 CAS 失败，Dispatcher 将取消旧 owner 条目",
-                Some(doc! { "run_id": &run_id, "decision_id": decision_review_id }),
-            )
-            .await?;
-            super::post_decision::discard_projection(
-                state,
-                decision_review_id,
-                "stale_task_claim",
-            )
-            .await;
-            super::outbox_dispatcher::refresh_run_log_outbox_status(state, &run_id).await;
-            return Ok(());
-        }
-        state
-            .db
-            .decision_reviews()
-            .update_one(
-                doc! { "_id": decision_review_id, "status": "outbox_enqueuing" },
-                doc! { "$set": { "status": "outbox_enqueued" } },
-                None,
-            )
-            .await?;
-        state
-            .db
-            .agent_run_logs()
-            .update_one(
-                doc! { "run_id": &run_id, "status": "outbox_enqueuing" },
-                doc! { "$set": {
-                    "status": "outbox_enqueued",
-                    "lifecycle": crate::agent::run_envelope::LIFECYCLE_COMPLETED,
-                } },
-                None,
-            )
-            .await?;
-        // `last_agent_run_at` is a delivery-rate-limit anchor, not an analytical projection.
-        // Advance it as soon as the complete text batch is durably authorized so another inbound
-        // cannot start a duplicate reply while the post-decision worker is still projecting the
-        // profile. Keep this write independent from the heavier profile/memory update below.
-        let authorized_at = DateTime::now();
-        match state
-            .db
-            .contacts()
-            .update_one(
-                doc! {
-                    "_id": contact.id,
-                    "workspace_id": &contact.workspace_id,
-                    "account_id": &contact.account_id,
-                    "wxid": &contact.wxid,
-                },
-                doc! {
-                    "$max": { "last_agent_run_at": authorized_at },
-                    "$set": { "updated_at": authorized_at },
-                },
-                None,
-            )
-            .await
-        {
-            Ok(result) if result.matched_count == 1 => {}
-            Ok(_) => tracing::error!(
-                %run_id,
-                workspace_id = %contact.workspace_id,
-                account_id = %contact.account_id,
-                contact_wxid = %contact.wxid,
-                "authorized reply did not find its contact for rate-limit anchoring"
-            ),
-            Err(error) => tracing::error!(
-                %error,
-                %run_id,
-                workspace_id = %contact.workspace_id,
-                account_id = %contact.account_id,
-                contact_wxid = %contact.wxid,
-                "authorized reply could not advance the rate-limit anchor"
-            ),
-        }
-        super::post_decision::activate_projection(state, decision_review_id).await?;
+    for event in turn_environment.pending_finalize_events() {
         if let Err(error) = write_event_for_account(
             state,
             &contact.workspace_id,
             &contact.account_id,
             Some(&contact.wxid),
-            "outbox_enqueued",
-            "success",
-            "回复批次已完整建立并获得发送授权",
-            Some(doc! { "run_id": &run_id, "decision_id": decision_review_id }),
+            &event.kind,
+            &event.status,
+            &event.summary,
+            Some(event.details.clone()),
         )
         .await
         {
-            tracing::warn!(%error, %run_id, "outbox authorization audit event failed");
+            tracing::warn!(%error, %run_id, "post-commit finalize audit event failed");
         }
     }
-    // media-asset Task 8：素材文件发送。文本回复已在上方先入 outbox（先文字后文件），
-    // 这里把 final_decision.assets_to_send 逐个转成独立媒体 outbox 条目。
-    // 终审 Important#1：媒体门改为复用 outbox_eligible（含 should_reply + reply 非空
-    // + final_status 终态 + relay 泄漏 fail-closed），与文本发送门同源。后果：当 reply_text
-    // 为空但有素材时会被挡掉——这是**期望行为**（设计要求文件必须配引导话术，不发孤立文件）。
-    // 每条仍做 approved+sendable+合法 media_type 二次准入校验（防 AI 幻觉出未审素材），
-    // 非法 assetId 跳过 + 审计；requires_principal_approval=true 的不直接发，走现有
-    // escalation 请示通道（拿回结论后由领导决策路径决定是否发）。
-    if media_send_allowed(outbox_eligible, !final_decision.assets_to_send.is_empty()) {
-        let media_source_event_id = match &trigger {
-            AgentTrigger::Inbound(msg) => msg.message_id.clone().unwrap_or_default(),
-            AgentTrigger::FollowUp(task) => task.id.map(|id| id.to_hex()).unwrap_or_default(),
-        };
-        for directive in &final_decision.assets_to_send {
-            // 准入二次校验：必须是合法 ObjectId + approved + sendable + 合法 media_type。
-            let oid = match ObjectId::parse_str(&directive.asset_id) {
-                Ok(o) => o,
-                Err(_) => {
-                    write_event_for_account(
-                        state,
-                        &contact.workspace_id,
-                        &contact.account_id,
-                        Some(&contact.wxid),
-                        "media_asset_id_invalid",
-                        "warning",
-                        "AI 选材给出非法 assetId（非 ObjectId），已跳过不发",
-                        Some(doc! { "run_id": &run_id, "asset_id": &directive.asset_id }),
-                    )
-                    .await
-                    .ok();
-                    continue;
-                }
-            };
-            // 修复2（纵深防御）：按 _id + workspace_id 双条件查，杜绝跨租户 IDOR。
-            // 修复3（一致性）：DB 瞬时故障降级为"记审计 + 跳过该素材（continue）"，与同块
-            // 的 media_outbox_enqueue_failed 对齐；不再用 `?` 传播——否则会跳过函数末尾的
-            // escalation_request 推送（文本早已入 outbox）。
-            let asset = match state
-                .db
-                .content_assets()
-                .find_one(
-                    doc! { "_id": oid, "workspace_id": &contact.workspace_id },
-                    None,
-                )
-                .await
-            {
-                Ok(a) => a,
-                Err(err) => {
-                    tracing::error!(?err, %run_id, asset_id = %directive.asset_id, "media asset 查询失败（降级跳过该素材，不阻断 run）");
-                    write_event_for_account(
-                        state,
-                        &contact.workspace_id,
-                        &contact.account_id,
-                        Some(&contact.wxid),
-                        "media_asset_lookup_failed",
-                        "error",
-                        "素材查询失败（文本已照常发出，素材缺失需管理员核对）",
-                        Some(doc! { "run_id": &run_id, "asset_id": &directive.asset_id }),
-                    )
-                    .await
-                    .ok();
-                    continue;
-                }
-            };
-            let asset = match asset {
-                Some(a) if super::media_send::validate_asset_sendable(&a) => a,
-                _ => {
-                    write_event_for_account(
-                        state,
-                        &contact.workspace_id,
-                        &contact.account_id,
-                        Some(&contact.wxid),
-                        "media_asset_rejected",
-                        "warning",
-                        "AI 选材指向不存在/未审/不可发素材，已跳过不发（防幻觉）",
-                        Some(doc! { "run_id": &run_id, "asset_id": &directive.asset_id }),
-                    )
-                    .await
-                    .ok();
-                    continue;
-                }
-            };
-            // requires_principal_approval=true 的素材不直接发：走现有 escalation 请示通道，
-            // 由领导拿回结论后的决策路径决定是否发。此处仅入请示 + 审计，不入 outbox。
-            if asset.requires_principal_approval == Some(true) {
-                let escalation_req = crate::models::EscalationRequest {
-                    needed: true,
-                    category: Some(crate::models::ESCALATION_CATEGORY_OUT_OF_SCOPE.to_string()),
-                    reason: Some(format!(
-                        "素材《{}》标记为需领导核准后才能发送给客户",
-                        asset.title
-                    )),
-                    question_for_principal: Some(format!(
-                        "是否同意把素材《{}》发给该客户？",
-                        asset.title
-                    )),
-                    self_serviceable_part: None,
-                    is_generalizable: false,
-                };
-                if let Err(err) =
-                    trigger_principal_escalation(state, &contact, &escalation_req).await
-                {
-                    tracing::warn!(
-                        contact_wxid = %contact.wxid,
-                        asset_id = %directive.asset_id,
-                        error = %err,
-                        "媒体素材请示推送失败（降级不阻断 run）"
-                    );
-                }
-                write_event_for_account(
-                    state,
-                    &contact.workspace_id,
-                    &contact.account_id,
-                    Some(&contact.wxid),
-                    "media_asset_escalated",
-                    "info",
-                    "素材需领导核准，已入请示通道（未直接发）",
-                    Some(doc! { "run_id": &run_id, "asset_id": &directive.asset_id }),
-                )
-                .await
-                .ok();
-                continue;
-            }
-            // 定序：当前所有 expression_pref 都「先文字后文件」（媒体追加在文本之后）。
-            let _ = media_send_order(asset.expression_pref.as_deref().unwrap_or("file_support"));
-            let enqueue_req = EnqueueRequest {
-                workspace_id: contact.workspace_id.clone(),
-                account_id: contact.account_id.clone(),
-                contact_wxid: contact.wxid.clone(),
-                run_id: run_id.clone(),
-                decision_id: Some(decision_review_id),
-                source_event_id: media_source_event_id.clone(),
-                source_kind: trigger.kind().to_string(),
-                content: String::new(), // 媒体条目允许空 content
-                media_asset_id: Some(directive.asset_id.clone()),
-                referral_card_id: None,
-                max_attempts: 3,
-            };
-            match outbox_enqueue(state, enqueue_req).await {
-                Ok(EnqueueOutcome::Created { outbox_id, .. }) => {
-                    tracing::info!(
-                        %run_id,
-                        %outbox_id,
-                        contact_wxid = %contact.wxid,
-                        asset_id = %directive.asset_id,
-                        "media outbox enqueued"
-                    );
-                }
-                Ok(EnqueueOutcome::IdempotentSkip {
-                    idempotency_key, ..
-                }) => {
-                    tracing::info!(
-                        %run_id,
-                        %idempotency_key,
-                        asset_id = %directive.asset_id,
-                        "media outbox enqueue idempotent skip"
-                    );
-                }
-                Err(err) => {
-                    tracing::error!(?err, %run_id, asset_id = %directive.asset_id, "media outbox enqueue failed");
-                    write_event_for_account(
-                        state,
-                        &contact.workspace_id,
-                        &contact.account_id,
-                        Some(&contact.wxid),
-                        "media_outbox_enqueue_failed",
-                        "error",
-                        "素材入 outbox 失败（文本已照常发出，素材缺失需管理员核对）",
-                        Some(doc! { "run_id": &run_id, "asset_id": &directive.asset_id }),
-                    )
-                    .await
-                    .ok();
-                }
-            }
-        }
-    }
-    // 名片引荐：辅助模式开启 + AI 输出 namecard_to_send + 准入校验通过 → 入队名片 outbox 条目。
-    // 追加在素材/文本之后 = 先发铺垫话术、后发名片（D5）。错误不阻断已入队的文本。
-    // 名片是主动引荐，不走素材的 requires_principal_approval→escalation 分支（D9 已解耦：
-    // 被推真人 = 台前专属顾问，≠ 幕后 principal_decider）。
-    // 发送门与素材/文本同源（media_send_allowed → outbox_eligible）：含 should_reply +
-    // reply_text 非空 + 终态 + relay 泄漏 fail-closed。杜绝 ①should_reply=false/reply 空时
-    // 发孤立名片（无铺垫话术）②relay 泄漏守卫置 outbox_eligible=false 时仍发名片。
-    if media_send_allowed(outbox_eligible, final_decision.namecard_to_send.is_some()) {
-        if let Some(directive) = final_decision.namecard_to_send.as_ref() {
-            let assist_override = contact
-                .domain_attributes
-                .as_ref()
-                .and_then(|d| d.get_str(crate::models::ASSIST_MODE_OVERRIDE_ATTR).ok());
-            let assist_on = super::referral::assist_mode_active(
-                domain_config.as_ref().and_then(|c| c.assist_mode_enabled),
-                assist_override,
-            );
-            if assist_on {
-                // 准入二次校验：card 必须真实存在 + enabled + approved（防 AI 幻觉 card_id）。
-                // 查询带 workspace_id scope（防 AI 幻觉跨租户 ObjectId 命中他 workspace 的名片，
-                // 与素材 send_outbound_media 的 IDOR 防御对齐）。
-                let card = match ObjectId::parse_str(&directive.card_id) {
-                    Ok(oid) => state
-                        .db
-                        .referral_cards()
-                        .find_one(
-                            doc! { "_id": oid, "workspace_id": &contact.workspace_id },
-                            None,
-                        )
-                        .await
-                        .ok()
-                        .flatten(),
-                    Err(_) => None,
-                };
-                match card {
-                    Some(c) if super::referral::validate_card_sendable(&c, &contact.account_id) => {
-                        let namecard_source_event_id = match &trigger {
-                            AgentTrigger::Inbound(msg) => {
-                                msg.message_id.clone().unwrap_or_default()
-                            }
-                            AgentTrigger::FollowUp(task) => {
-                                task.id.map(|id| id.to_hex()).unwrap_or_default()
-                            }
-                        };
-                        let enqueue_req = EnqueueRequest {
-                            workspace_id: contact.workspace_id.clone(),
-                            account_id: contact.account_id.clone(),
-                            contact_wxid: contact.wxid.clone(),
-                            run_id: run_id.clone(),
-                            decision_id: Some(decision_review_id),
-                            source_event_id: format!("{}#namecard", namecard_source_event_id),
-                            source_kind: trigger.kind().to_string(),
-                            content: String::new(),
-                            media_asset_id: None,
-                            referral_card_id: Some(directive.card_id.clone()),
-                            max_attempts: 3,
-                        };
-                        match outbox_enqueue(state, enqueue_req).await {
-                            Ok(EnqueueOutcome::Created { outbox_id, .. }) => {
-                                tracing::info!(%run_id, %outbox_id, contact_wxid = %contact.wxid, card_id = %directive.card_id, "namecard outbox enqueued");
-                            }
-                            Ok(EnqueueOutcome::IdempotentSkip {
-                                idempotency_key, ..
-                            }) => {
-                                tracing::info!(%run_id, %idempotency_key, card_id = %directive.card_id, "namecard outbox enqueue idempotent skip");
-                            }
-                            Err(err) => {
-                                tracing::error!(?err, %run_id, card_id = %directive.card_id, "namecard outbox enqueue failed");
-                                write_event_for_account(
-                                    state,
-                                    &contact.workspace_id,
-                                    &contact.account_id,
-                                    Some(&contact.wxid),
-                                    "namecard_outbox_enqueue_failed",
-                                    "error",
-                                    "名片入 outbox 失败（文本已照常发出，名片缺失需管理员核对）",
-                                    Some(doc! { "run_id": &run_id, "card_id": &directive.card_id }),
-                                )
-                                .await
-                                .ok();
-                            }
-                        }
-                    }
-                    _ => {
-                        write_event_for_account(
-                            state,
-                            &contact.workspace_id,
-                            &contact.account_id,
-                            Some(&contact.wxid),
-                            "referral_card_rejected",
-                            "warning",
-                            "AI 选的名片不存在/未审/已停用，已跳过引荐（防幻觉）",
-                            Some(doc! { "run_id": &run_id, "card_id": &directive.card_id }),
-                        )
-                        .await
-                        .ok();
-                    }
-                }
-            }
-        }
-    }
-    super::outbox_dispatcher::refresh_run_log_outbox_status(state, &run_id).await;
-    // 决策请示触发（统一占位模型）：占位 reply 已入 outbox 正常发给客户，
-    // 这里只做不面向客户的副作用——推请示卡给领导 + 落台账 pending。
-    // 失败不回滚已发占位、不让 run 失败：仅 warn 降级。
-    if let Some(req) = final_decision.escalation_request.as_ref() {
-        if req.needed {
-            if let Err(err) = trigger_principal_escalation(state, &contact, req).await {
-                tracing::warn!(
-                    workspace_id = %contact.workspace_id,
-                    contact_wxid = %contact.wxid,
-                    error = %err,
-                    "principal escalation 推卡/落台账失败（占位已正常发出，降级不阻断 run）"
-                );
-            }
-        }
-    }
-    Ok(())
+    turn_environment
+        .committer()
+        .persist_post_commit_work(&turn_outcome.commit_receipt)
+        .await;
+    persist_production_post_commit(
+        state,
+        &contact,
+        &inbound,
+        trigger.kind(),
+        &run_id,
+        playbook.as_ref(),
+        domain_config.as_ref(),
+        &runtime,
+        &memory,
+        &context_pack,
+        &active_profile,
+        &active_products,
+        &sendable_assets,
+        &recent_messages,
+        &knowledge_route,
+        &turn_outcome,
+    )
+    .await;
+    return Ok(());
+
     }
     .boxed()
 }
@@ -6438,60 +4878,67 @@ pub(crate) async fn apply_agent_updates(
     if let Some(value) = non_empty_option(&decision.follow_up_policy) {
         set_doc.insert("follow_up_policy", value);
     }
-    // C2：operation_state 与 customer_stage 强制同步——二者取值同属一套 canonical id
-    // 空间（m006 一一对应），历史上各写各、会漂移。这里令 operation_state 派生自
-    // **归一后的** customer_stage（signals_decision.domain_signals，已过 taxonomy
-    // canonical 改写），保两字段一致、消除双轨漂移。customer_stage 缺失时（决策只给
-    // state 不给 stage，如部分 mock / 纯状态推进）回落 decision.operation_state，
-    // 行为与改造前一致。
-    // rejected = check_state_transition 判非法时记 (旧 state, 拟写 state, reason)，
-    // DB 写库后据此补一条审计事件（fail-soft，见下方写入分支）。
-    // applied = 实际写入的 operation_state（被拒/缺失时为 None）；下方 transitioned
-    // 事件据**实际写入值**而非 decision.operation_state 判迁移，保事件与库一致（C2
-    // 单一真值：金标里 customer_stage 缺失 → applied==decision.operation_state，逐字等价）。
+    // Operational state and cooldown are authorized controls, not analytical projection fields.
+    // A post-delivery projection carries a deliberately reduced decision and must never be able
+    // to create a new operational side effect. The production finalizer applies the frozen
+    // controls from the atomic review row after the delivery lifecycle is satisfied.
     let mut rejected_state_transition: Option<(String, String, String)> = None;
     let mut applied_operation_state: Option<String> = None;
-    let synced_state = signals_decision
-        .domain_signals
-        .get_str("customer_stage")
-        .ok()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToString::to_string)
-        .or_else(|| non_empty_option(&decision.operation_state));
-    if let Some(value) = synced_state {
-        // C2-2：接回 check_state_transition 校验闸（H13-2 已把引擎 initial/allowFromAny
-        // 泛化为状态机标志驱动）。fail-soft：非法迁移**不阻断 reply**（reply 已在本函数
-        // 之前下发，本函数只做画像/状态落库），仅 (a) 拒绝本次 operation_state 写入、保留
-        // 旧 state；(b) 写一条审计事件。domain_config=None（simulation/老调用）时
-        // check_state_transition 返回 None → fail-open 照常写，行为与改造前一致。
-        match check_state_transition(domain_config, contact.operation_state.as_deref(), &value) {
-            None => {
-                applied_operation_state = Some(value.clone());
-                set_doc.insert("operation_state", value);
-                set_doc.insert("operation_state_updated_at", DateTime::now());
-            }
-            Some(reason) => {
-                rejected_state_transition = Some((
-                    contact.operation_state.clone().unwrap_or_default(),
-                    value,
-                    reason,
-                ));
+    if projection_guard.is_none() {
+        // C2：operation_state 与 customer_stage 强制同步——二者取值同属一套 canonical id
+        // 空间（m006 一一对应），历史上各写各、会漂移。这里令 operation_state 派生自
+        // **归一后的** customer_stage（signals_decision.domain_signals，已过 taxonomy
+        // canonical 改写），保两字段一致、消除双轨漂移。customer_stage 缺失时（决策只给
+        // state 不给 stage，如部分 mock / 纯状态推进）回落 decision.operation_state，
+        // 行为与改造前一致。
+        // rejected = check_state_transition 判非法时记 (旧 state, 拟写 state, reason)，
+        // DB 写库后据此补一条审计事件（fail-soft，见下方写入分支）。
+        // applied = 实际写入的 operation_state（被拒/缺失时为 None）；下方 transitioned
+        // 事件据**实际写入值**而非 decision.operation_state 判迁移，保事件与库一致（C2
+        // 单一真值：金标里 customer_stage 缺失 → applied==decision.operation_state，逐字等价）。
+        let synced_state = signals_decision
+            .domain_signals
+            .get_str("customer_stage")
+            .ok()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
+            .or_else(|| non_empty_option(&decision.operation_state));
+        if let Some(value) = synced_state {
+            // C2-2：接回 check_state_transition 校验闸（H13-2 已把引擎 initial/allowFromAny
+            // 泛化为状态机标志驱动）。fail-soft：非法迁移**不阻断 reply**（reply 已在本函数
+            // 之前下发，本函数只做画像/状态落库），仅 (a) 拒绝本次 operation_state 写入、保留
+            // 旧 state；(b) 写一条审计事件。domain_config=None（simulation/老调用）时
+            // check_state_transition 返回 None → fail-open 照常写，行为与改造前一致。
+            match check_state_transition(domain_config, contact.operation_state.as_deref(), &value)
+            {
+                None => {
+                    applied_operation_state = Some(value.clone());
+                    set_doc.insert("operation_state", value);
+                    set_doc.insert("operation_state_updated_at", DateTime::now());
+                }
+                Some(reason) => {
+                    rejected_state_transition = Some((
+                        contact.operation_state.clone().unwrap_or_default(),
+                        value,
+                        reason,
+                    ));
+                }
             }
         }
-    }
-    if let Some(value) = non_empty_option(&decision.operation_state_reason) {
-        set_doc.insert("operation_state_reason", value);
-    }
-    if let Some(value) = decision.operation_state_confidence {
-        set_doc.insert("operation_state_confidence", value);
-    }
-    if let Some(value) = decision
-        .cooldown_until
-        .as_deref()
-        .and_then(|value| DateTime::parse_rfc3339_str(value).ok())
-    {
-        set_doc.insert("cooldown_until", value);
+        if let Some(value) = non_empty_option(&decision.operation_state_reason) {
+            set_doc.insert("operation_state_reason", value);
+        }
+        if let Some(value) = decision.operation_state_confidence {
+            set_doc.insert("operation_state_confidence", value);
+        }
+        if let Some(value) = decision
+            .cooldown_until
+            .as_deref()
+            .and_then(|value| DateTime::parse_rfc3339_str(value).ok())
+        {
+            set_doc.insert("cooldown_until", value);
+        }
     }
     if !decision.profile_attributes.is_empty() {
         set_doc.insert("profile_attributes", decision.profile_attributes.clone());
@@ -6820,47 +5267,49 @@ pub(crate) async fn apply_agent_updates(
     // （保留旧 state、reply 已照常下发），并**不**发 transitioned 事件——二者互斥，
     // 避免对一次被拒迁移既报"已迁移"又报"被拒"。domain_config=None 时不会进 rejected
     // 分支（fail-open），detect_state_transition 行为与改造前逐字一致。
-    if let Some((prior, attempted, reason)) = &rejected_state_transition {
-        // fail-soft：纯审计写失败不阻断主流程（回复稍后异步入队），与 dimension_dropped 同风格。
-        let _ = write_agent_update_event(
-            state,
-            contact,
-            projection_guard,
-            "operation_state_transition_rejected",
-            "agent.operation_state_transition_rejected",
-            "rejected",
-            &format!("operation_state 拒绝迁移 {prior} → {attempted}：{reason}"),
-            Some(doc! {
-                "prior_state": prior,
-                "attempted_state": attempted,
-                "reason": reason,
-            }),
-        )
-        .await;
-    } else if let Some((prior, next)) = detect_state_transition(
-        contact.operation_state.as_deref(),
-        applied_operation_state.as_deref(),
-    ) {
-        // fail-soft：纯审计写失败不阻断主流程（回复稍后异步入队），与 dimension_dropped 同风格。
-        let _ = write_agent_update_event(
-            state,
-            contact,
-            projection_guard,
-            "operation_state_transitioned",
-            "agent.operation_state_transitioned",
-            "transitioned",
-            &format!("operation_state {prior} → {next}"),
-            Some(doc! {
-                "prior_state": &prior,
-                "next_state": &next,
-                "reason": decision
-                    .operation_state_reason
-                    .clone()
-                    .unwrap_or_default(),
-                "confidence": decision.operation_state_confidence.unwrap_or(0),
-            }),
-        )
-        .await;
+    if projection_guard.is_none() {
+        if let Some((prior, attempted, reason)) = &rejected_state_transition {
+            // fail-soft：纯审计写失败不阻断主流程（回复稍后异步入队），与 dimension_dropped 同风格。
+            let _ = write_agent_update_event(
+                state,
+                contact,
+                projection_guard,
+                "operation_state_transition_rejected",
+                "agent.operation_state_transition_rejected",
+                "rejected",
+                &format!("operation_state 拒绝迁移 {prior} → {attempted}：{reason}"),
+                Some(doc! {
+                    "prior_state": prior,
+                    "attempted_state": attempted,
+                    "reason": reason,
+                }),
+            )
+            .await;
+        } else if let Some((prior, next)) = detect_state_transition(
+            contact.operation_state.as_deref(),
+            applied_operation_state.as_deref(),
+        ) {
+            // fail-soft：纯审计写失败不阻断主流程（回复稍后异步入队），与 dimension_dropped 同风格。
+            let _ = write_agent_update_event(
+                state,
+                contact,
+                projection_guard,
+                "operation_state_transitioned",
+                "agent.operation_state_transitioned",
+                "transitioned",
+                &format!("operation_state {prior} → {next}"),
+                Some(doc! {
+                    "prior_state": &prior,
+                    "next_state": &next,
+                    "reason": decision
+                        .operation_state_reason
+                        .clone()
+                        .unwrap_or_default(),
+                    "confidence": decision.operation_state_confidence.unwrap_or(0),
+                }),
+            )
+            .await;
+        }
     }
 
     // follow_up 同样只在 dispatcher 确认本 decision 的全部文本段送达后创建。
@@ -7003,6 +5452,56 @@ pub(crate) fn simulation_gateway_document(gateway: &SendGatewayResult) -> Docume
     doc
 }
 
+/// Resolve the structured authorization fence for the administrative/deterministic review
+/// writers.  These paths do not run the model turn kernel, but they still need the same
+/// state/policy/version contract before an outbox row may cross the remote-send boundary.
+async fn build_review_authorization_controls(
+    state: &AppState,
+    contact: &Contact,
+    decision: &AgentDecision,
+    review: &DecisionReviewResult,
+    domain_config: Option<&OperationDomainConfig>,
+    runtime: &UserRuntimeParameters,
+    status: &str,
+) -> AppResult<Document> {
+    let authorized = status == "outbox_enqueuing" && review_passed(review, runtime);
+    if !authorized {
+        return Ok(super::turn_loop::authorization_projection_controls(
+            false, decision, review, None, None, None, None, None,
+        ));
+    }
+
+    let source_operation_state =
+        action_policy_state_key(domain_config, contact.operation_state.as_deref(), None)
+            .unwrap_or_else(|| initial_operation_state_key(domain_config));
+    let policy_state = action_policy_state_key(
+        domain_config,
+        contact.operation_state.as_deref(),
+        decision_operation_state_candidate(decision),
+    )
+    .unwrap_or_else(|| source_operation_state.clone());
+    let target_operation_state = decision_operation_state_candidate(decision)
+        .filter(|candidate| policy_state == *candidate)
+        .map(ToString::to_string);
+    let policy = load_operation_state_policy_for_contact(
+        state,
+        &contact.workspace_id,
+        &policy_state,
+        &contact.wxid,
+    )
+    .await?;
+    Ok(super::turn_loop::authorization_projection_controls(
+        true,
+        decision,
+        review,
+        Some(&source_operation_state),
+        target_operation_state.as_deref(),
+        Some(&policy_state),
+        policy.as_ref().map(|value| value.version),
+        domain_config.map(|value| value.version),
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn write_decision_review(
     state: &AppState,
@@ -7044,75 +5543,89 @@ pub(crate) async fn write_decision_review(
             prompt_versions.insert(key, value);
         }
     }
+    let authorized_projection_controls = build_review_authorization_controls(
+        state,
+        contact,
+        decision,
+        review,
+        domain_config,
+        runtime,
+        status,
+    )
+    .await?;
+    let review_row = AgentDecisionReview {
+        id: None,
+        workspace_id: contact.workspace_id.clone(),
+        account_id: contact.account_id.clone(),
+        contact_wxid: Some(contact.wxid.clone()),
+        run_id: Some(run_id.to_string()),
+        inbound_message_id: inbound.message_id.clone(),
+        reply_text: if decision.reply_text.trim().is_empty() {
+            None
+        } else {
+            Some(decision.reply_text.clone())
+        },
+        approved: review_passed(review, runtime),
+        scores: to_document(&review.scores).unwrap_or_default(),
+        formula_breakdown: review.formula_breakdown.clone(),
+        risks: review.risks.clone(),
+        rewrite_instruction: non_empty_option(&Some(review.rewrite_instruction.clone())),
+        review_summary: non_empty_option(&Some(review.review_summary.clone())),
+        playbook_id: playbook.and_then(|item| item.id),
+        playbook_version: playbook.map(|item| item.version),
+        used_knowledge_ids: decision
+            .used_knowledge_ids
+            .iter()
+            .filter_map(|id| ObjectId::parse_str(id).ok())
+            .collect(),
+        prompt_versions,
+        operation_state: decision.operation_state.clone(),
+        next_best_action: decision.next_best_action.clone(),
+        context_pack_snapshot: {
+            let mut snapshot = context_pack.clone();
+            snapshot.insert(
+                "knowledgeRoute",
+                to_document(knowledge_route).unwrap_or_default(),
+            );
+            snapshot.insert("runPlanner", to_document(planner).unwrap_or_default());
+            snapshot
+        },
+        domain_config_snapshot: domain_config
+            .and_then(|config| to_document(config).ok())
+            .unwrap_or_default(),
+        runtime_parameters_snapshot: runtime.as_document(),
+        send_gateway_result: to_document(gateway_result).unwrap_or_default(),
+        outcome_status: Some("pending".to_string()),
+        reaction_analysis: Document::new(),
+        reaction_claimed_at: None,
+        reaction_claim_token: None,
+        reaction_claim_generation: 0,
+        source_task_id: None,
+        source_task_claim_token: None,
+        reviewer_misjudge_signal: None,
+        expected_text_segments: if status == "outbox_enqueuing" {
+            split_reply_into_segments(
+                &decision.reply_text,
+                state.config.agent_reply_max_segment_chars,
+                state.config.agent_reply_max_segments,
+            )
+            .len() as i32
+        } else {
+            0
+        },
+        status: status.to_string(),
+        created_at: DateTime::now(),
+    };
+    let mut review_document = to_document(&review_row)?;
+    review_document.insert(
+        "authorized_projection_controls",
+        authorized_projection_controls,
+    );
     let result = state
         .db
         .decision_reviews()
-        .insert_one(
-            AgentDecisionReview {
-                id: None,
-                workspace_id: contact.workspace_id.clone(),
-                account_id: contact.account_id.clone(),
-                contact_wxid: Some(contact.wxid.clone()),
-                run_id: Some(run_id.to_string()),
-                inbound_message_id: inbound.message_id.clone(),
-                reply_text: if decision.reply_text.trim().is_empty() {
-                    None
-                } else {
-                    Some(decision.reply_text.clone())
-                },
-                approved: review_passed(review, runtime),
-                scores: to_document(&review.scores).unwrap_or_default(),
-                formula_breakdown: review.formula_breakdown.clone(),
-                risks: review.risks.clone(),
-                rewrite_instruction: non_empty_option(&Some(review.rewrite_instruction.clone())),
-                review_summary: non_empty_option(&Some(review.review_summary.clone())),
-                playbook_id: playbook.and_then(|item| item.id),
-                playbook_version: playbook.map(|item| item.version),
-                used_knowledge_ids: decision
-                    .used_knowledge_ids
-                    .iter()
-                    .filter_map(|id| ObjectId::parse_str(id).ok())
-                    .collect(),
-                prompt_versions,
-                operation_state: decision.operation_state.clone(),
-                next_best_action: decision.next_best_action.clone(),
-                context_pack_snapshot: {
-                    let mut snapshot = context_pack.clone();
-                    snapshot.insert(
-                        "knowledgeRoute",
-                        to_document(knowledge_route).unwrap_or_default(),
-                    );
-                    snapshot.insert("runPlanner", to_document(planner).unwrap_or_default());
-                    snapshot
-                },
-                domain_config_snapshot: domain_config
-                    .and_then(|config| to_document(config).ok())
-                    .unwrap_or_default(),
-                runtime_parameters_snapshot: runtime.as_document(),
-                send_gateway_result: to_document(gateway_result).unwrap_or_default(),
-                outcome_status: Some("pending".to_string()),
-                reaction_analysis: Document::new(),
-                reaction_claimed_at: None,
-                reaction_claim_token: None,
-                reaction_claim_generation: 0,
-                source_task_id: None,
-                source_task_claim_token: None,
-                reviewer_misjudge_signal: None,
-                expected_text_segments: if status == "outbox_enqueuing" {
-                    split_reply_into_segments(
-                        &decision.reply_text,
-                        state.config.agent_reply_max_segment_chars,
-                        state.config.agent_reply_max_segments,
-                    )
-                    .len() as i32
-                } else {
-                    0
-                },
-                status: status.to_string(),
-                created_at: DateTime::now(),
-            },
-            None,
-        )
+        .clone_with_type::<Document>()
+        .insert_one(review_document, None)
         .await?;
     result
         .inserted_id
@@ -7568,6 +6081,7 @@ pub(crate) async fn write_event_for_account_with_dedupe(
 ///
 /// 这是抢先在 review-held 短路前覆盖的判定逻辑，用于让 cancel_task /
 /// write_event 落库时显式标记 context_changed 而非 finalize_review_blocked。
+#[cfg(test)]
 pub(crate) fn check_context_changed_followup_pure(
     last_inbound_ms: Option<i64>,
     task_created_ms: i64,

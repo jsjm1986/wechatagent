@@ -4,15 +4,12 @@
 //! ## 背景：补的是哪三段逻辑
 //! `tests/c2_state_transition_cross_domain.rs` 已用纯函数确定性覆盖
 //! `check_state_transition` 的判定正确性，但**显式放弃**了 gateway 端到端：派生写入点的
-//! 三段关键逻辑（synced_state 取值优先级 / fail-soft 非法迁移跳写 / 审计事件）此前
+//! 三段关键逻辑（送达生命周期 / fail-soft 非法迁移跳写 / 审计事件）此前
 //! **无任何 E2E 断言**。本文件用 **mock-LLM**（不是真模型）驱动 `handle_managed_message`
 //! 全链，确定性覆盖：
 //!
-//! 1. **synced_state 取值优先级**（:2742-2750）：operation_state 优先派生自
-//!    `domain_signals.customer_stage`，仅在 customer_stage 缺失时回落
-//!    `decision.operation_state`。`normal_transition_*` 用例同时给 customerStage 与
-//!    一个**不同的** operationState，断言最终落库值取的是 customerStage 派生值——证明
-//!    优先级而非简单二选一。
+//! 1. **送达生命周期边界**：operation_state 只从发送关键决策冻结，并由 dispatcher 在完整
+//!    文本送达后应用；后置投影的 customer_stage 不得覆盖它。
 //! 2. **fail-soft 非法迁移跳写**（:2756-2766）：`check_state_transition` 判非法时
 //!    **不写** operation_state（保留旧值），记 rejected。`illegal_transition_*` 用例断言
 //!    operation_state 保留旧值、未被非法值覆盖。
@@ -21,7 +18,7 @@
 //!    （fail-soft，gateway 走 approved + outbox 入队，不是 blocked）。
 //!
 //! ## 为什么用 mock-LLM 而不是真模型
-//! 三段逻辑都是**确定性**的：给定 contact 旧态 + decision 的 customer_stage，状态机
+//! 三段逻辑都是**确定性**的：给定 contact 旧态 + 发送关键 decision 的 operation_state，状态机
 //! （DEFAULT 销售 profile，由 `ensure_prompt_pack_v2` 种入 active）唯一决定合法/非法。
 //! 用 mock-LLM 压固定决策 JSON 即可稳定复现，比真模型 E2E 更可靠、不 flaky——正是
 //! `c2_state_transition_cross_domain.rs`「命门用确定性测」哲学向全链路的延伸。
@@ -29,6 +26,8 @@
 //! 默认 `#[ignore]`，需要 Docker（testcontainers MongoDB），由 CI integration job 跑。
 
 mod common;
+
+use std::time::Duration;
 
 use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
 use serde_json::json;
@@ -113,9 +112,8 @@ fn make_inbound(contact: &Contact, message_id: &str, content: &str) -> Conversat
 /// Reply Agent 决策 JSON：参数化 `customer_stage` 与 `operation_state` 两个字段，
 /// 其余字段全部填充满足 `validate_and_promote`（R1.3/R1.4/R1.6）的合法值。
 ///
-/// 关键：`customerStage`（typed）经 `normalize_domain_signals` 镜像进 `domain_signals`
-/// 容器，是 C2 synced_state 的**优先**来源；`operationState` 是缺失时的回落来源。两者
-/// 取不同值即可在断言里区分优先级。risk_level=medium + knowledge_need=not_required +
+/// 关键：`operationState` 是发送关键授权来源；`customerStage` 只进入后置画像投影。两者
+/// 取不同值即可验证投影不会越权。risk_level=medium + knowledge_need=not_required +
 /// consolidation=false → 非「关键变化轮」也非「低风险常规轮」，仅需 R1.3 字段非空。
 fn reply_decision_json(customer_stage: &str, operation_state: &str) -> serde_json::Value {
     json!({
@@ -211,18 +209,96 @@ async fn complete_stage_projection(
     .await;
 }
 
-/// 用例 1：**合法迁移 + synced_state 优先级**。
+/// Simulate the durable transport receipt, then let the real dispatcher recovery path finalize
+/// the decision. Operational controls are intentionally inactive before this boundary.
+async fn finalize_latest_text_delivery(app: &common::TestApp, contact: &Contact) {
+    let outbox = app.state.db.collection_agent_send_outbox();
+    let entry = outbox
+        .find_one(
+            doc! {
+                "workspace_id": &contact.workspace_id,
+                "account_id": &contact.account_id,
+                "contact_wxid": &contact.wxid,
+                "decision_id": { "$ne": null },
+                "media_asset_id": null,
+                "referral_card_id": null,
+            },
+            None,
+        )
+        .await
+        .expect("query text outbox")
+        .expect("text outbox exists");
+    let decision_id = entry.decision_id.expect("text outbox decision_id");
+    let now = DateTime::now();
+    outbox
+        .update_many(
+            doc! {
+                "workspace_id": &contact.workspace_id,
+                "account_id": &contact.account_id,
+                "contact_wxid": &contact.wxid,
+                "decision_id": decision_id,
+                "media_asset_id": null,
+                "referral_card_id": null,
+            },
+            doc! {
+                "$set": {
+                    "status": "sent",
+                    "sent_at": now,
+                    "updated_at": now,
+                    "delivery_finalize_pending": true,
+                },
+                "$unset": { "worker_id": "", "locked_until": "" },
+            },
+            None,
+        )
+        .await
+        .expect("mark complete text batch delivered");
+
+    let state = app.state.clone();
+    let dispatcher = tokio::spawn(async move {
+        wechatagent::agent::run_outbox_dispatcher(state)
+            .await
+            .expect("dispatcher loop should remain live");
+    });
+    let reviews = app
+        .state
+        .db
+        .decision_reviews()
+        .clone_with_type::<Document>();
+    let started = std::time::Instant::now();
+    loop {
+        let review = reviews
+            .find_one(doc! { "_id": decision_id }, None)
+            .await
+            .expect("poll finalized review")
+            .expect("review remains present");
+        if review.get_str("status") == Ok("sent")
+            && review
+                .get_str("authorized_projection_controls_status")
+                .is_ok_and(|status| !status.is_empty())
+        {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "dispatcher did not finalize delivered decision: {review:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    dispatcher.abort();
+    let _ = dispatcher.await;
+}
+
+/// 用例 1：**送达后应用发送关键 operation_state，投影 stage 不得越权**。
 ///
 /// - 旧态 `new_contact`；
-/// - 决策 `customerStage = "relationship_building"`（legal：relationship_building.allowedFrom
-///   含 new_contact）；
-/// - 决策 `operationState = "need_discovery"`（同样 legal，但**不应**被用——customer_stage 优先）；
-/// - 断言：最终 operation_state == `relationship_building`（取 customerStage 派生值，
-///   不是 need_discovery）→ 同时覆盖「合法迁移写入」与「synced_state 优先级」两段。
+/// - 发送关键决策 `operationState = "need_discovery"`；
+/// - 后置投影尝试提供 `customer_stage = "relationship_building"`；
+/// - 断言：最终 operation_state == `need_discovery`，且投影不能把它改成 stage 值。
 #[tokio::test]
 #[ignore]
-async fn normal_transition_uses_customer_stage_over_operation_state() {
-    let app = common::TestApp::start().await;
+async fn delivery_applies_explicit_operation_state_not_projection_stage() {
+    let app = common::TestApp::start_repl_set().await;
     let contact = make_managed_contact("user_c2_legal", "new_contact");
     app.state
         .db
@@ -242,8 +318,7 @@ async fn normal_transition_uses_customer_stage_over_operation_state() {
         .await
         .expect("insert inbound");
 
-    // 知识库为空 → route_operation_knowledge 早返回（0 次 LLM）。
-    // LLM 调用序列：#1 Reply Agent；#2 Review Agent；#3 独立 ClaimGate。
+    // 测试只关心持久化契约，不依赖并发 LLM 调用的具体次数。
     app.llm.push_response(reply_decision_json(
         "relationship_building",
         "need_discovery",
@@ -252,22 +327,17 @@ async fn normal_transition_uses_customer_stage_over_operation_state() {
     app.llm
         .push_response(common::independent_claim_gate_pass_json());
 
-    let before = app.llm.calls();
     handle_managed_message(&app.state, contact.clone(), &inbound)
         .await
         .expect("handle_managed_message ok");
-    assert_eq!(
-        app.llm.calls() - before,
-        3,
-        "空知识库 happy path：Reply ×1 + Review ×1 + ClaimGate ×1 = 3 次 LLM 调用"
-    );
+    finalize_latest_text_delivery(&app, &contact).await;
     complete_stage_projection(&app, &contact, "relationship_building", vec![], false).await;
 
-    // 合法迁移写入 + customer_stage 优先：取 relationship_building 而非 need_discovery。
+    // 合法迁移只采用发送关键 operationState；后置 customer_stage 不能覆盖它。
     assert_eq!(
         reload_operation_state(&app, &contact).await.as_deref(),
-        Some("relationship_building"),
-        "operation_state 应派生自 customerStage（优先级高于 operationState=need_discovery）"
+        Some("need_discovery"),
+        "operation_state 应在文本送达后应用发送关键决策，不能由投影 stage 覆盖"
     );
 
     // 合法迁移写一条 transitioned 事件，且**不**写 rejected 事件（互斥）。
@@ -290,17 +360,15 @@ async fn normal_transition_uses_customer_stage_over_operation_state() {
 /// 用例 2：**fail-soft 非法迁移跳写 + 审计事件 + reply 照常下发**。
 ///
 /// - 旧态 `new_contact`；
-/// - 决策 `customerStage = "customer_success"`（**非法**：customer_success.allowedFrom =
-///   ["commitment_followup", "customer_success"]，不含 new_contact，且非 allowFromAny/initial）；
-/// - 决策 `operationState = "need_discovery"`（legal，但 customer_stage 已 present → 不回落，
-///   被拒后**不**改用它）；
-/// - 断言：① operation_state 保留旧值 new_contact（未被 customer_success 覆盖、也未变 need_discovery）；
+/// - 发送关键决策 `operationState = "customer_success"`（**非法**：该状态不能从 new_contact 迁入）；
+/// - 后置投影也提供相同 stage，但它不是授权来源；
+/// - 断言：① operation_state 保留旧值 new_contact；
 ///   ② 落一条 `agent.operation_state_transition_rejected` 审计事件（details 字段正确）；
 ///   ③ reply 仍 approved + outbox 入队（fail-soft 不阻断）。
 #[tokio::test]
 #[ignore]
 async fn illegal_transition_keeps_old_state_and_audits_failsoft() {
-    let app = common::TestApp::start().await;
+    let app = common::TestApp::start_repl_set().await;
     let contact = make_managed_contact("user_c2_illegal", "new_contact");
     app.state
         .db
@@ -316,26 +384,20 @@ async fn illegal_transition_keeps_old_state_and_audits_failsoft() {
         .await
         .expect("insert inbound");
 
-    // 同样 3 次 LLM 调用；customerStage 取一个从 new_contact 非法的终态 customer_success。
+    // 显式发送关键状态取一个从 new_contact 非法的终态 customer_success。
     app.llm
-        .push_response(reply_decision_json("customer_success", "need_discovery"));
+        .push_response(reply_decision_json("customer_success", "customer_success"));
     app.llm.push_response(review_pass_json());
     app.llm
         .push_response(common::independent_claim_gate_pass_json());
 
-    let before = app.llm.calls();
     handle_managed_message(&app.state, contact.clone(), &inbound)
         .await
         .expect("handle_managed_message ok（fail-soft：非法迁移不返回 Err）");
-    assert_eq!(
-        app.llm.calls() - before,
-        3,
-        "Reply ×1 + Review ×1 + ClaimGate ×1 = 3 次 LLM 调用"
-    );
+    finalize_latest_text_delivery(&app, &contact).await;
     complete_stage_projection(&app, &contact, "customer_success", vec![], false).await;
 
-    // ① fail-soft 跳写：保留旧态 new_contact（既没被非法的 customer_success 覆盖，
-    //    也没回落到 operationState=need_discovery——customer_stage present 时不回落）。
+    // ① fail-soft 跳写：保留旧态 new_contact。
     assert_eq!(
         reload_operation_state(&app, &contact).await.as_deref(),
         Some("new_contact"),
@@ -449,7 +511,7 @@ fn make_managed_contact_with_stage(
 #[tokio::test]
 #[ignore]
 async fn illegal_stage_jump_keeps_old_stage_and_audits_failsoft() {
-    let app = common::TestApp::start().await;
+    let app = common::TestApp::start_repl_set().await;
     let contact =
         make_managed_contact_with_stage("user_c1_stage_illegal", "new_contact", "new_contact");
     app.state
@@ -623,7 +685,7 @@ async fn count_stage_observations(app: &common::TestApp, contact: &Contact) -> u
 #[tokio::test]
 #[ignore]
 async fn weak_stage_evidence_drops_to_observation_not_domain_attrs() {
-    let app = common::TestApp::start().await;
+    let app = common::TestApp::start_repl_set().await;
     let mut contact = make_managed_contact("user_d7_weak", "new_contact");
     // stage 状态机的 prev_stage 读 domain_attributes.customer_stage（非 operation_state）。
     // 预置为 new_contact，使 → relationship_building 合法迁移（否则 from=None→非 initial 态被拒）。
@@ -677,7 +739,7 @@ async fn weak_stage_evidence_drops_to_observation_not_domain_attrs() {
 #[tokio::test]
 #[ignore]
 async fn strong_stage_evidence_writes_domain_attrs_not_observation() {
-    let app = common::TestApp::start().await;
+    let app = common::TestApp::start_repl_set().await;
     let mut contact = make_managed_contact("user_d7_strong", "new_contact");
     // 同弱证据用例：预置 domain_attributes.customer_stage=new_contact 使 → relationship_building 合法。
     contact.domain_attributes = Some(doc! { "customer_stage": "new_contact" });
@@ -741,7 +803,7 @@ async fn strong_stage_evidence_writes_domain_attrs_not_observation() {
 #[tokio::test]
 #[ignore]
 async fn audit_write_failure_does_not_drop_reply_failsoft() {
-    let app = common::TestApp::start().await;
+    let app = common::TestApp::start_repl_set().await;
 
     // 装 validator：拒绝 kind == agent.operation_state_transition_rejected 的插入。
     // create_collection 若集合已存在会报错，用 let _ 忽略；随后 collMod 装校验器。

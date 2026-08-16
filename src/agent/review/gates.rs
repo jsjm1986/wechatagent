@@ -485,14 +485,6 @@ impl GatewayStatusFinal {
             GatewayStatusFinal::Held(category) => category.clone(),
         }
     }
-
-    /// 映射到 `agent_run_logs.final_review_status` 落库字面量（与 R9.2 严格枚举对齐）。
-    pub(crate) fn final_review_status_str(&self) -> String {
-        // gateway_status 与 finalReviewStatus 在所有 finalize 终态下一一对应；
-        // R2 revision 应用后 task 3.4 会把 `Approved` 改写为
-        // `revision_applied_approved`，本函数不参与该改写。
-        self.gateway_status_str()
-    }
 }
 
 /// finalize 阶段产生但尚未写库的 `agent_events` 条目。
@@ -1043,6 +1035,7 @@ fn extend_risks_unique<I: IntoIterator<Item = String>>(risks: &mut Vec<String>, 
 ///   终态由 [`derive_revision_failure`] 决定；
 /// * `Proceed`：调用 Reply Agent 第二次。
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) enum RevisionDecision {
     /// 不触发 revision（finalize 已 hold/blocked，或 review 未要求 revision）。
     NotEligible,
@@ -1080,6 +1073,7 @@ pub(crate) enum RevisionDecision {
 ///   revision_direction`；
 /// * `budget_exceeded`：调用方根据 `RunBudget::is_llm_or_token_exhausted()` 计算的快照
 ///   （task-local，不在纯函数内读取）。
+#[cfg(test)]
 pub(crate) fn decide_revision(
     finalize_status: &GatewayStatusFinal,
     review: &DecisionReviewResult,
@@ -1118,30 +1112,6 @@ pub(crate) fn decide_revision(
 /// agent-autonomy-loop W2 / Task 3.7（R2.4 / R2.11）：把 revision 失败原因
 /// 映射到 `(revision_reason, GatewayStatusFinal)`。
 ///
-/// 所有 revision 失败路径最终 finalReviewStatus 都 SHALL 是 `"revision_failed"`，
-/// gateway_status 都 SHALL 是 `Held(held_by_ai_policy)`（与 design.md §4.5
-/// 状态映射表一致）；本函数主要确保 gateway.rs 的 4 个 revision 失败分支
-/// （invalid_direction / budget_exceeded / llm_error / llm_timeout /
-/// post_review_failed）使用同一套终态字面量，避免散落字面量造成漂移。
-///
-/// 参数 `reason` 接受以下字面量（gateway.rs 中按分支选择）：
-/// * `"revisionDirection_empty"` → R2.5 跳过；
-/// * `"budget_exceeded_before_revision"` → R2.8 跳过；
-/// * `"revision_llm_timeout_30s"` → R2.11 超时；
-/// * `"revision_post_review_failed"` → R2.4 第二轮 review 仍 fail；
-/// * 任何 `revision_llm_error:*` 前缀 → R2.11 LLM 业务错误；
-/// * 其它字符串 → 视为未知失败原因，仍走 `revision_failed` 终态（fail-closed）。
-///
-/// 返回 `(revision_reason, status)`：调用方 SHALL 把 `revision_reason` 落
-/// `agent_run_logs.revision_reason`，把 `status` 作为 finalize_status 写回
-/// gateway 主路径。
-pub(crate) fn derive_revision_failure(reason: &str) -> (String, GatewayStatusFinal) {
-    // 所有 revision 失败终态统一为 Held(held_by_ai_policy)；finalReviewStatus
-    // 由调用方在 review.final_review_status 中显式写 "revision_failed"。
-    let status = GatewayStatusFinal::Held(HOLD_CATEGORY_HELD_BY_AI_POLICY.to_string());
-    (reason.to_string(), status)
-}
-
 /// Decide fallback from the Reviewer's structured scores, not from reply keywords.
 ///
 /// The AI owns semantic review. Code only enforces its typed safety result: hard-gate,
@@ -1149,6 +1119,7 @@ pub(crate) fn derive_revision_failure(reason: &str) -> (String, GatewayStatusFin
 /// be restored only when the structured classification is safe except for human-like or
 /// emotional-value style quality, or when the mechanical style-divergence detector was the
 /// sole trigger.
+#[cfg(test)]
 pub(crate) fn revision_fallback_is_safe_style_only(
     review: &DecisionReviewResult,
     runtime: &UserRuntimeParameters,
@@ -1175,6 +1146,7 @@ pub(crate) fn revision_fallback_is_safe_style_only(
 
 /// Apply the revision failure policy and return whether the pre-revision draft may be restored.
 /// Unsafe or unknown revision triggers fail closed with `revision_failed`.
+#[cfg(test)]
 pub(crate) fn apply_revision_fallback(
     review: &mut DecisionReviewResult,
     runtime: &UserRuntimeParameters,

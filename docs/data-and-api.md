@@ -6,7 +6,7 @@ Mongo collection 数量会随迁移与功能演进变化，本文不再维护易
 
 - `src/db/mod.rs` 的 typed collection accessors（2026-08-13 时点 64 个，计数随演进漂移）；
 - `src/db/indexes.rs` 的索引契约；
-- `src/db/migrations/` 的历史建表、回填与收敛步骤（m001–m058）。
+- `src/db/migrations/` 的历史建表、回填与收敛步骤（m001–m062）。
 
 金标回归场景资产（非集合，属测试数据资产）：`tests/fixtures/quality_gold/`（105 条合成场景，五类 × 21）+ `tests/quality_gold_regression.rs` 断言；一键入口 `bash scripts/quality-regression.sh`（shadow 零发送）。
 

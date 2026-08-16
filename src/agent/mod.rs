@@ -23,6 +23,8 @@
 //! 访问 [`budget`] 模块的 task-local，而被几乎所有子模块共用，放在 mod.rs
 //! 既能避免循环依赖，也能让 LLM 调用计费/缓存/日志的所有逻辑位于一处。
 
+pub(crate) mod appointment_request;
+pub(crate) mod authority;
 pub(crate) mod bayesian_slots;
 mod budget;
 mod chat_tool_loop;
@@ -42,12 +44,15 @@ mod knowledge_router;
 mod knowledge_tools;
 mod media_send;
 mod memory;
+pub(crate) mod model_turn;
 pub(crate) mod multimodal;
 pub(crate) mod outbox;
 pub(crate) mod outbox_dispatcher;
 pub(crate) mod outcome_label;
 pub(crate) mod pacing;
+pub(crate) mod persona_world_state;
 pub(crate) mod post_decision;
+pub(crate) mod production_commit;
 pub(crate) mod projection_observations;
 pub(crate) mod prompt_isolation;
 pub(crate) mod prompt_shadow;
@@ -59,12 +64,12 @@ mod run_audit;
 pub mod run_envelope;
 pub(crate) mod runtime;
 pub(crate) mod send_ledger;
-mod shadow_finalize;
 mod simulation;
 pub mod sufficiency;
 pub(crate) mod system_incident;
 pub(crate) mod tag_evidence;
 pub(crate) mod taxonomy;
+pub(crate) mod turn_loop;
 pub(crate) mod types;
 
 use std::{num::NonZeroUsize, sync::LazyLock};
@@ -235,6 +240,7 @@ const FAST_REPLY_MAX_OUTPUT_TOKENS: u32 = 8192;
 pub(crate) const LIGHT_REVIEWER_MAX_OUTPUT_TOKENS: u32 = 3072;
 pub(crate) const REVIEWER_MAX_OUTPUT_TOKENS: u32 = 8192;
 const CLAIM_GATE_MAX_OUTPUT_TOKENS: u32 = 3072;
+const PERSONA_WORLD_STATE_MAX_OUTPUT_TOKENS: u32 = 768;
 
 fn critical_path_output_token_limit(prompt_key: &str) -> Option<u32> {
     match prompt_key {
@@ -242,6 +248,7 @@ fn critical_path_output_token_limit(prompt_key: &str) -> Option<u32> {
         "user.review.light.system" => Some(LIGHT_REVIEWER_MAX_OUTPUT_TOKENS),
         "user.review.system" => Some(REVIEWER_MAX_OUTPUT_TOKENS),
         "user.review.claim_gate" => Some(CLAIM_GATE_MAX_OUTPUT_TOKENS),
+        "user.persona_world_state.system" => Some(PERSONA_WORLD_STATE_MAX_OUTPUT_TOKENS),
         _ => None,
     }
 }
@@ -930,6 +937,10 @@ mod tests {
         assert_eq!(
             super::critical_path_output_token_limit("user.review.claim_gate"),
             Some(super::CLAIM_GATE_MAX_OUTPUT_TOKENS)
+        );
+        assert_eq!(
+            super::critical_path_output_token_limit("user.persona_world_state.system"),
+            Some(super::PERSONA_WORLD_STATE_MAX_OUTPUT_TOKENS)
         );
         for key in [
             "user.reply.task",

@@ -89,6 +89,9 @@ fn media_asset(
         review_status: Some("approved".into()),
         review_note: None,
         min_inject_tier: None,
+        enabled: Some(true),
+        allowed_insertion_levels: None,
+        usage_guidance: None,
         created_at: now,
         updated_at: now,
     }

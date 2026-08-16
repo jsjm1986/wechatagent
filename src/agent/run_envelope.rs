@@ -1902,16 +1902,15 @@ mod protocol_skeleton_tests {
         assert!(!is_valid_lifecycle_transition("", LIFECYCLE_STARTED));
     }
 
-    // ── 4. decision_phase=tool_calling + 9 字段全空 → 不触发协议违规 ───
+    // ── 4. decision_phase=tool_calling 只校验工具计划，不校验 final 字段 ───
 
     #[test]
-    fn tool_calling_phase_skips_protocol_validation_with_all_empty_fields() {
+    fn tool_calling_phase_requires_an_executable_tool_plan() {
         // R1.10 / R4.1.b：tool_calling 中间轮 SHALL 跳过 R1.3/R1.4/R1.5/R1.6/R3
-        // 全部校验。即使 R1.3 7 字段、R3.1/R3.2/R3.3 必填字段全部为空，
-        // risks 仍应为空（toolCalls 为空时也不报）。
+        // 的 final 字段校验，但必须携带至少一个合法只读工具调用，否则 harness 无法推进。
         let raw = RawAgentDecision {
             decision_phase: Some("tool_calling".to_string()),
-            // 故意 9 字段 + R3 必填字段全部留空
+            // 故意把 final 字段和 toolCalls 都留空。
             ..RawAgentDecision::default()
         };
         let runtime = runtime_default();
@@ -1919,10 +1918,16 @@ mod protocol_skeleton_tests {
 
         assert_eq!(decision.decision_phase, "tool_calling");
         assert!(
-            risks.is_empty(),
-            "tool_calling 中间轮即使 9 字段全空也不应触发协议违规, risks={:?}",
+            risks
+                .iter()
+                .any(|risk| risk == "missing_required_field:tool_calls"),
+            "无工具计划的 tool_calling 必须被结构校验捕获, risks={:?}",
             risks
         );
+        assert!(!risks.iter().any(|risk| {
+            risk.starts_with("missing_required_field:")
+                && risk != "missing_required_field:tool_calls"
+        }));
     }
 
     #[test]

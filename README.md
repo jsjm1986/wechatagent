@@ -184,7 +184,7 @@ Management Agent 先生成带 hash 的冻结计划，再从白名单工具目录
 | 管理与演化 | `management_agent_sessions`, `agent_command_runs`, `agent_tool_calls`, `experiments`, `proposals`, `shadow_replays`, `threshold_overrides` |
 | 鉴权 | `admin_users`, `admin_sessions`, `auth_security_events` |
 
-启动时会按编号执行 `src/db/migrations/` 中的 58 个有序迁移（m001–m058），然后创建索引。部分生产数据清理或回填迁移受 `APP_ENV=production` 和 `APPROVED_MIGRATIONS` 保护；执行前应备份并核对迁移源码。
+启动时会按编号执行 `src/db/migrations/` 中的 62 个有序迁移（m001–m062），然后创建索引。部分生产数据清理或回填迁移受 `APP_ENV=production` 和 `APPROVED_MIGRATIONS` 保护；执行前应备份并核对迁移源码。
 
 > 完整功能和生产部署要求 MongoDB **replica set**。知识修订、版本发布、Evolution、Guide、Taxonomy、Provider 等路径使用多文档事务；standalone MongoDB 可能允许应用启动和简单浏览，但事务功能会在运行时失败。
 
@@ -225,7 +225,7 @@ POST {APP_BASE_URL}/webhooks/wechat
 src/main.rs             启动、静态托管和 worker 注册
 src/agent/              Gateway、Review、Memory、Outbox、发送与升级链
 src/auth/               Argon2、Mongo session、ACL、限流和可选 RS256 JWT
-src/db/                 typed collection、58 个迁移和索引
+src/db/                 typed collection、62 个迁移和索引
 src/evolution/          与生产发送副作用隔离的演化器
 src/knowledge_wiki/     Wiki、catalog、修订、反馈与自动导入
 src/knowledge_task/     可恢复的知识长任务

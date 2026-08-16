@@ -82,7 +82,7 @@ pub const DEFAULT_REPLY_SYSTEM_REDLINE_ANCHORS: &[&str] = &[
 /// `DEFAULT_REPLY_TASK_REDLINE_ANCHORS`——该模板生产零消费，已随退役清理从种子包
 /// 与治理面移除；已存在的 DB 行保留不删，align 只对齐 spec 清单内的 key。）
 pub const DEFAULT_REPLY_FAST_TASK_REDLINE_ANCHORS: &[&str] = &[
-    "\"decisionPhase\": \"final\",",
+    "\"decisionPhase\": \"tool_calling | final\",",
     "\"shouldReply\": true,",
     "\"replyText\": \"要发送给客户的微信文本\"",
     "产品事实只能使用已注入的 verified 知识或产品目录",
@@ -1164,6 +1164,24 @@ fn prompt_specs() -> Vec<PromptSpec> {
 - 下一步策略必须低压、自然、像真人微信。"#,
         },
         PromptSpec {
+            key: "user.persona_world_state.system",
+            agent_kind: "user",
+            layer: "system_contract",
+            title: "用户运营 Persona 世界状态",
+            description: "生成账户级、时间窗内一致的日常情境，避免按联系人分别编造生活。",
+            status: "active",
+            content: r#"You generate one account-wide social world state for a WeChat operator persona. Output strict JSON only.
+
+Use only publishedSoul and trustedTimeContext from the input. Never infer from, refer to, or invent any customer, conversation, appointment, transaction, case, or customer-specific relationship. Decide the natural social texture semantically; do not use keyword matching or a phrase list.
+
+Create one coherent, harmless context that can remain consistent for the complete supplied time window. It may include ordinary low-stakes activity, conversational pace, and mood when compatible with the Soul. Do not invent identity credentials, family or relationship events, health conditions, emergencies, travel claims, precise physical location, financial/legal facts, business capabilities, service availability, customer cases, or operational commitments. Keep details modest enough that the Reply Agent can use them naturally in casual conversation without turning them into a sales claim or a promise.
+
+availability describes conversational pace only. It must not promise guaranteed response time, appointment availability, staffing, service capacity, or any real-world action. mood should be brief and internally consistent. stateText must stand alone and must not address a customer.
+
+Return exactly this shape, with null when an optional field is unnecessary:
+{"stateText":"coherent account-wide context for this time window","availability":"conversational pace only or null","mood":"brief mood or null"}"#,
+        },
+        PromptSpec {
             key: "user.reply.system",
             agent_kind: "user",
             layer: "system_contract",
@@ -1273,7 +1291,8 @@ fn prompt_specs() -> Vec<PromptSpec> {
 
 只输出严格 JSON：
 {
-  "decisionPhase": "final",
+  "decisionPhase": "tool_calling | final",
+  "nextStep": "respond | stay_silent | retrieve | verify | clarify | ask_principal",
   "riskLevel": "low | medium | high",
   "knowledgeNeed": "not_required | required | insufficient",
   "runMode": "fast_chat | memory_candidate | knowledge_grounded | high_risk",
@@ -1308,6 +1327,10 @@ fn prompt_specs() -> Vec<PromptSpec> {
   "usedKnowledgeIds": [],
   "matchedKnowledgeIds": [],
   "safeClaimsUsed": [],
+  "claimManifest": [{ "claimId": "c1", "text": "候选回复里的原子现实断言", "subject": "customer | business | third_party | general", "requiresEvidence": false, "proposedSourceIds": [], "reason": "为什么需要或不需要来源" }],
+  "verification": { "needed": false, "reason": "是否还需只读核验以及原因" },
+  "toolCalls": [{ "tool": "knowledge.list_catalog | knowledge.search | knowledge.open_slice", "arguments": {} }],
+  "appointmentRequest": { "requested": false, "requestText": "客户希望面诊的原始意图摘要", "preferredStart": "RFC3339 或空串", "preferredEnd": "RFC3339 或空串", "locationPreference": "客户表达的地点偏好或空串", "reason": "为什么本轮形成预约请求" },
   "lastCommitment": "仅记录 replyText 本轮新作出的时间承诺，没有则省略",
   "commitment": { "text": "承诺内容", "dueAt": "RFC3339 时间或空串" },
   "followUp": { "needed": false, "runAt": "RFC3339 时间或空串", "content": "送达后才可建立的跟进内容" },
@@ -1318,6 +1341,10 @@ fn prompt_specs() -> Vec<PromptSpec> {
 
 硬规则：
 - 所有枚举必须使用列出的值；operationState 必须来自注入的状态机。
+- 你自主选择 nextStep。需要更多事实时输出 decisionPhase=tool_calling、nextStep=retrieve 或 verify，并给出一个或多个只读 toolCalls；该中间轮 shouldReply=false、replyText 为空。拿到工具结果后重新判断，最多只查真正需要的内容。信息已经够时直接 final，不要为了展示能力而调用工具。
+- final 轮不得再输出 toolCalls，nextStep 只能是 respond、stay_silent、clarify 或 ask_principal。clarify 仍是一条面向客户的自然回复；ask_principal 需同时给 escalationRequest，且不得向客户暴露幕后来源。
+- claimManifest 是你的草稿自检清单，不是发送授权。独立 ClaimGate 会从最终 replyText 重新提取并逐条核验；不得把自报 proposedSourceIds 当成已经获批。
+- appointmentRequest 只表示客户提出了面诊/到店请求，绝不表示预约已经确认。只有后台、决策人或外部预约工具的可信回执才能把请求转为 confirmed；在此之前 replyText 只能描述为待确认或正在核对。
 - needsReview 只选择复盘深度，不决定是否审核：低风险常规轮填 false；高风险、知识不足或产品声明填 true。所有可发送正文仍会经过独立 Reviewer 和 ClaimGate。
 - `intentAnalysis.semanticAssessment` 是本轮语义裁决，必须和 `replyText` 一致；不要让服务端通过关键词替你改写它。代码只验证字段结构、枚举、候选原文引用和服务端证据权限。
 - shouldReply=true 时 replyText 不得为空。信息不足时先给能确定的部分，必要时只问一个关键问题。
@@ -1638,7 +1665,16 @@ EmotionalValue 打分按这一轮用户的状态分两把尺子，避免逼出�
 你不负责聊天，只负责评价一次 shadow simulation 是否满足生产级长期运营要求。
 只输出严格 JSON，不输出 markdown。
 评分必须关注：是否提供具体价值、是否遵守 doNotDo、是否编造事实、是否正确处理状态迁移、是否写入有效记忆、是否像真人微信。
-如果知识库不足导致无法回答产品事实，允许保守说明，但不允许编造。"#,
+如果知识库不足导致无法回答产品事实，允许保守说明，但不允许编造。
+主动沉默 no_reply 不是自动通过项，也不是自动失败项；必须根据场景目标、用户最后表达和完整对话判断沉默是否合适。
+输出必须严格包含且只包含：
+{
+  "verdict": "pass | fail | inconclusive",
+  "issues": [],
+  "summary": "结论与主要依据",
+  "recommendation": "下一步建议"
+}
+无法可靠判断、输入不足或输出契约不确定时 verdict 必须为 inconclusive。"#,
         },
         PromptSpec {
             key: "management.plan.system",
@@ -2651,35 +2687,28 @@ mod prompt_pack_probe_tests {
 }
 
 #[cfg(test)]
-mod reply_task_single_shot_tests {
+mod reply_task_harness_tests {
     use super::*;
 
-    /// tool_calling 静默 no_reply 根治护栏：`user.reply.fast.task` 是生产**单发**
-    /// 决策 prompt（主链路无 tool-loop 包裹，用户运营 tool_loop 已 sunset，
-    /// `decision.tool_calls` 永不执行；知识检索由 knowledge_router 独立前置完成）。
-    /// 若 prompt 提供 tool_calling 决策形态，LLM 可能误选该相位 →
-    /// `build_tool_calling_decision` 强制 `reply_text=""` / `should_reply=false`
-    /// （types.rs）→ 客户提问被静默吞。网关兜底闸（gateway.rs
-    /// `decision_phase_tool_calling_in_single_shot`）只能记 degraded、无法恢复从未
-    /// 生成的回复文本——故**根治 = prompt 不提供该形态**，一次覆盖首发 / rewrite /
-    /// revision 三个共用本 prompt 的决策站点。本护栏锁死：单发决策 JSON 只有
-    /// final 形态，绝不含 tool_calling。
-    /// （护栏原对象是退役的完整版 `user.reply.task`，随其移出种子包转靶到生产 key。）
+    /// Harness 契约护栏：生产 Reply 可自主选择只读工具中间轮或最终轮，且必须明确
+    /// 下一步。工具中间轮不能成为发送授权，最终正文仍由独立 Reviewer/ClaimGate 审核。
     #[test]
-    fn reply_task_prompt_offers_only_final_phase() {
+    fn reply_task_prompt_exposes_bounded_harness_protocol() {
         let specs = prompt_specs();
         let task = specs
             .iter()
             .find(|s| s.key == "user.reply.fast.task")
             .expect("user.reply.fast.task prompt spec 存在");
         assert!(
-            !task.content.contains("tool_calling"),
-            "user.reply.fast.task 单发 prompt 不得提供 tool_calling 决策形态（会诱发静默 no_reply）"
+            task.content
+                .contains("\"decisionPhase\": \"tool_calling | final\""),
+            "Reply prompt 必须暴露工具中间轮与最终轮"
         );
-        // final 形态契约仍在（决策 JSON 主体没被误删）
         assert!(
-            task.content.contains("\"decisionPhase\": \"final\""),
-            "user.reply.fast.task 应保留 final 形态契约"
+            task.content.contains("\"nextStep\"")
+                && task.content.contains("\"toolCalls\"")
+                && task.content.contains("独立 ClaimGate"),
+            "Reply prompt 必须同时声明路由字段、工具计划和独立授权边界"
         );
     }
 

@@ -118,6 +118,68 @@ fn default_conversation_mode() -> String {
     "casual_relationship".to_string()
 }
 
+/// Model-owned control step for the next harness iteration. The protocol is closed so the
+/// runtime can route capabilities, while the semantic choice of step remains entirely with AI.
+fn infer_next_step(decision_phase: &str, should_reply: bool, escalation_needed: bool) -> String {
+    if decision_phase == "tool_calling" {
+        "retrieve".to_string()
+    } else if escalation_needed {
+        "ask_principal".to_string()
+    } else if should_reply {
+        "respond".to_string()
+    } else {
+        "stay_silent".to_string()
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DraftClaim {
+    /// Stable model-local identifier used only to correlate a draft across repair iterations.
+    #[serde(default)]
+    pub claim_id: String,
+    /// Atomic meaning asserted by the candidate. This is advisory; independent ClaimGate owns
+    /// send authorization and re-extracts claims from the final reply.
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub subject: String,
+    #[serde(default)]
+    pub requires_evidence: bool,
+    #[serde(default, deserialize_with = "string_or_vec")]
+    pub proposed_source_ids: Vec<String>,
+    #[serde(default)]
+    pub reason: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct VerificationDecision {
+    #[serde(default)]
+    pub needed: bool,
+    #[serde(default)]
+    pub reason: String,
+}
+
+/// Typed visit request emitted by the Reply Agent. This represents a customer request only;
+/// confirmation is a separate lifecycle transition requiring trusted external provenance.
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AppointmentRequestDecision {
+    #[serde(default)]
+    pub requested: bool,
+    #[serde(default)]
+    pub request_text: String,
+    #[serde(default)]
+    pub preferred_start: String,
+    #[serde(default)]
+    pub preferred_end: String,
+    #[serde(default)]
+    pub location_preference: String,
+    #[serde(default)]
+    pub reason: String,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentDecision {
@@ -263,6 +325,19 @@ pub struct AgentDecision {
     pub tool_calls: Vec<ToolCallRequest>,
     #[serde(default)]
     pub agent_generated_signals: Vec<AgentSignal>,
+
+    /// Model-selected harness action. Missing legacy values are inferred from the structural
+    /// phase, escalation request, and shouldReply flag; code never infers it from message words.
+    #[serde(default)]
+    pub next_step: String,
+    /// Draft-side claim inventory for self-critique and repair. It is never an authorization
+    /// source; the independent ClaimGate produces the authoritative manifest.
+    #[serde(default)]
+    pub claim_manifest: Vec<DraftClaim>,
+    #[serde(default)]
+    pub verification: VerificationDecision,
+    #[serde(default)]
+    pub appointment_request: Option<AppointmentRequestDecision>,
 
     // ── conversation_mode：四模式人格切换（R-prompt-v3） ──
     //
@@ -412,6 +487,10 @@ impl Default for AgentDecision {
             decision_phase: default_decision_phase(),
             tool_calls: Vec::new(),
             agent_generated_signals: Vec::new(),
+            next_step: String::new(),
+            claim_manifest: Vec::new(),
+            verification: VerificationDecision::default(),
+            appointment_request: None,
             // conversation_mode：默认寒暄模式（最保守）
             conversation_mode: default_conversation_mode(),
             conversation_mode_reason: None,
@@ -471,6 +550,12 @@ pub struct RawAgentDecision {
 
     // ── R8 自由信号 ──
     pub agent_generated_signals: Option<Vec<AgentSignal>>,
+
+    // ── Harness control and typed side-effect intents ──
+    pub next_step: Option<String>,
+    pub claim_manifest: Option<Vec<DraftClaim>>,
+    pub verification: Option<VerificationDecision>,
+    pub appointment_request: Option<AppointmentRequestDecision>,
 
     // ── R-prompt-v3 conversation_mode：四模式人格切换 ──
     pub conversation_mode: Option<String>,
@@ -600,6 +685,12 @@ impl DeferredProjectionDecision {
             "commitment",
             "followUp",
             "toolCalls",
+            "operationState",
+            "operationStateReason",
+            "operationStateConfidence",
+            "cooldownUntil",
+            "nextStep",
+            "appointmentRequest",
         ];
         let object = value
             .as_object()
@@ -717,6 +808,15 @@ const RUN_MODE_VALUES: &[&str] = &[
     "high_risk",
 ];
 const AUTONOMY_MODE_VALUES: &[&str] = &["auto", "assisted", "blocked"];
+const NEXT_STEP_VALUES: &[&str] = &[
+    "respond",
+    "stay_silent",
+    "retrieve",
+    "verify",
+    "repair",
+    "clarify",
+    "ask_principal",
+];
 const CONVERSATION_MODE_VALUES: &[&str] = &[
     "casual_relationship",
     "value_exchange",
@@ -837,12 +937,30 @@ impl RawAgentDecision {
     ) -> (AgentDecision, Vec<String>) {
         let mut risks = Vec::new();
         let phase = match self.decision_phase.as_deref().map(str::trim) {
+            Some(RAW_TOOL_CALLING) => RAW_TOOL_CALLING.to_string(),
             Some(RAW_FINAL) | None | Some("") => RAW_FINAL.to_string(),
             Some(other) => {
                 risks.push(format!("decision_phase_invalid:{other}"));
                 RAW_FINAL.to_string()
             }
         };
+        if phase == RAW_TOOL_CALLING {
+            let tool_calls = self.tool_calls.clone().unwrap_or_default();
+            if tool_calls.is_empty() {
+                risks.push("missing_required_field:tool_calls".to_string());
+            }
+            for call in &tool_calls {
+                let trimmed = call.tool.trim();
+                if trimmed.is_empty()
+                    || !ALLOWED_TOOL_NAMES.iter().any(|allowed| *allowed == trimmed)
+                {
+                    risks.push(format!("invalid_tool_call:{}", call.tool));
+                }
+            }
+            let mut decision = build_tool_calling_decision(self, phase);
+            normalize_harness_control(&mut decision, &mut risks);
+            return (decision, risks);
+        }
         let allowed_modes: Vec<&str> = if runtime.allowed_conversation_modes.is_empty() {
             CONVERSATION_MODE_VALUES.to_vec()
         } else {
@@ -920,6 +1038,7 @@ impl RawAgentDecision {
         decision.reply_text = reply_text;
         decision.risk_self_check = risk_self_check;
         clear_deferred_fields(&mut decision);
+        normalize_harness_control(&mut decision, &mut risks);
         sanitize_semantic_assessment(&mut decision, &mut risks);
         (decision, risks)
     }
@@ -953,13 +1072,18 @@ impl RawAgentDecision {
         // ── tool_calling 中间轮（R1.10 / R4.1）：仅做 toolCalls schema 检查 ──
         if phase == RAW_TOOL_CALLING {
             let tool_calls = self.tool_calls.clone().unwrap_or_default();
+            if tool_calls.is_empty() {
+                risks.push("missing_required_field:tool_calls".to_string());
+            }
             for call in &tool_calls {
                 let trimmed = call.tool.trim();
                 if trimmed.is_empty() || !ALLOWED_TOOL_NAMES.iter().any(|a| *a == trimmed) {
                     risks.push(format!("invalid_tool_call:{}", call.tool));
                 }
             }
-            return (build_tool_calling_decision(self, phase), risks);
+            let mut decision = build_tool_calling_decision(self, phase);
+            normalize_harness_control(&mut decision, &mut risks);
+            return (decision, risks);
         }
 
         // ── final 轮：执行完整校验 ──
@@ -1159,6 +1283,7 @@ impl RawAgentDecision {
 
         // 把既有 carry-through 字段从 raw 拷过去（避免 promote 把它们丢失）。
         carry_through_fields(self, &mut decision);
+        normalize_harness_control(&mut decision, &mut risks);
         sanitize_semantic_assessment(&mut decision, &mut risks);
 
         (decision, risks)
@@ -1197,6 +1322,68 @@ fn clear_deferred_fields(decision: &mut AgentDecision) {
     decision.knowledge_need_reason.clear();
     decision.memory_update_reason.clear();
     decision.self_critique.clear();
+}
+
+fn normalize_harness_control(decision: &mut AgentDecision, risks: &mut Vec<String>) {
+    let escalation_needed = decision
+        .escalation_request
+        .as_ref()
+        .is_some_and(|request| request.needed);
+    let inferred = || {
+        infer_next_step(
+            &decision.decision_phase,
+            decision.should_reply,
+            escalation_needed,
+        )
+    };
+    let normalized = decision.next_step.trim();
+    if normalized.is_empty() {
+        decision.next_step = inferred();
+    } else if !NEXT_STEP_VALUES.contains(&normalized) {
+        risks.push(format!("invalid_enum_value:next_step:{normalized}"));
+        decision.next_step = inferred();
+    } else {
+        decision.next_step = normalized.to_string();
+    }
+
+    if decision.decision_phase == RAW_TOOL_CALLING
+        && !matches!(decision.next_step.as_str(), "retrieve" | "verify")
+    {
+        risks.push("next_step_inconsistent:tool_calling".to_string());
+        decision.next_step = if decision.verification.needed {
+            "verify".to_string()
+        } else {
+            "retrieve".to_string()
+        };
+    }
+    if decision.decision_phase == RAW_FINAL
+        && matches!(
+            decision.next_step.as_str(),
+            "retrieve" | "verify" | "repair"
+        )
+    {
+        risks.push("next_step_inconsistent:final".to_string());
+        decision.next_step = inferred();
+    }
+
+    decision.claim_manifest.retain(|claim| {
+        let valid = !claim.claim_id.trim().is_empty() && !claim.text.trim().is_empty();
+        if !valid {
+            risks.push("draft_claim_manifest_entry_invalid".to_string());
+        }
+        valid
+    });
+    if decision.verification.needed && decision.verification.reason.trim().is_empty() {
+        risks.push("verification_reason_missing".to_string());
+    }
+    if let Some(request) = decision.appointment_request.as_ref() {
+        if !request.requested {
+            decision.appointment_request = None;
+        } else if request.request_text.trim().is_empty() {
+            risks.push("appointment_request_text_missing".to_string());
+            decision.appointment_request = None;
+        }
+    }
 }
 
 /// Validate the Reply Agent's optional semantic contract without classifying natural-language
@@ -1389,6 +1576,18 @@ fn build_minimal_decision(raw: RawAgentDecision) -> AgentDecision {
 /// 把既有非 9 自治协议字段（profile / tags / memory / signals 等）从 Raw 透传到
 /// `AgentDecision`，避免 promote 把它们丢失。
 fn carry_through_fields(raw: RawAgentDecision, decision: &mut AgentDecision) {
+    if let Some(v) = raw.next_step {
+        decision.next_step = v;
+    }
+    if let Some(v) = raw.claim_manifest {
+        decision.claim_manifest = v;
+    }
+    if let Some(v) = raw.verification {
+        decision.verification = v;
+    }
+    if raw.appointment_request.is_some() {
+        decision.appointment_request = raw.appointment_request;
+    }
     if let Some(v) = raw.used_knowledge_ids {
         decision.used_knowledge_ids = v;
     }
@@ -1993,6 +2192,7 @@ pub struct UserOperationSimulationTurn {
     pub gateway_result: Document,
     pub knowledge_route: Document,
     pub context_pack: Document,
+    pub commit_receipt: Document,
     pub memory_preview: Document,
     pub state_transition: Document,
 }
@@ -2318,6 +2518,85 @@ mod validate_and_promote_tests {
             "应追加 invalid_tool_call risk，实际 risks={:?}",
             risks
         );
+    }
+
+    #[test]
+    fn legacy_final_without_next_step_is_inferred_structurally() {
+        let raw = make_valid_low_routine_raw();
+        let (decision, risks) = raw.validate_reply_critical(&runtime_default(true));
+
+        assert_eq!(decision.next_step, "respond");
+        assert!(!risks
+            .iter()
+            .any(|risk| risk.contains("next_step") || risk.contains("nextStep")));
+    }
+
+    #[test]
+    fn compact_reply_validation_accepts_valid_tool_calling_phase() {
+        let raw = RawAgentDecision {
+            decision_phase: Some("tool_calling".to_string()),
+            next_step: Some("verify".to_string()),
+            verification: Some(VerificationDecision {
+                needed: true,
+                reason: "需要核对当前已审核知识切片".to_string(),
+            }),
+            tool_calls: Some(vec![ToolCallRequest {
+                tool: "knowledge.search".to_string(),
+                arguments: mongodb::bson::doc! { "query": "用户当前问题" },
+            }]),
+            ..RawAgentDecision::default()
+        };
+
+        let (decision, risks) = raw.validate_reply_critical(&runtime_default(true));
+
+        assert_eq!(decision.decision_phase, "tool_calling");
+        assert_eq!(decision.next_step, "verify");
+        assert_eq!(decision.tool_calls.len(), 1);
+        assert!(!decision.should_reply);
+        assert!(decision.reply_text.is_empty());
+        assert!(risks.is_empty(), "unexpected tool phase risks: {risks:?}");
+    }
+
+    #[test]
+    fn appointment_request_never_materializes_without_request_text() {
+        let mut raw = make_valid_low_routine_raw();
+        raw.appointment_request = Some(AppointmentRequestDecision {
+            requested: true,
+            request_text: "   ".to_string(),
+            preferred_start: "2026-08-20T10:00:00+08:00".to_string(),
+            ..AppointmentRequestDecision::default()
+        });
+
+        let (decision, risks) = raw.validate_reply_critical(&runtime_default(true));
+
+        assert!(decision.appointment_request.is_none());
+        assert!(risks
+            .iter()
+            .any(|risk| risk == "appointment_request_text_missing"));
+    }
+
+    #[test]
+    fn draft_claim_manifest_is_preserved_only_as_advisory_metadata() {
+        let mut raw = make_valid_low_routine_raw();
+        raw.claim_manifest = Some(vec![DraftClaim {
+            claim_id: "draft-1".to_string(),
+            text: "候选回复中的待核验断言".to_string(),
+            subject: "business".to_string(),
+            requires_evidence: true,
+            proposed_source_ids: vec!["model-invented-source".to_string()],
+            reason: "草稿自检".to_string(),
+        }]);
+
+        let (decision, risks) = raw.validate_reply_critical(&runtime_default(true));
+
+        assert!(risks.is_empty(), "unexpected risks: {risks:?}");
+        assert_eq!(decision.claim_manifest.len(), 1);
+        assert_eq!(
+            decision.claim_manifest[0].proposed_source_ids,
+            vec!["model-invented-source"]
+        );
+        assert!(decision.used_knowledge_ids.is_empty());
+        assert!(decision.safe_claims_used.is_empty());
     }
 
     #[test]
@@ -2782,12 +3061,18 @@ mod validate_and_promote_tests {
 
     #[test]
     fn deferred_projection_schema_rejects_send_control_fields() {
-        let error = DeferredProjectionDecision::from_value(serde_json::json!({
-            "tags": [],
-            "replyText": "must never be accepted"
-        }))
-        .expect_err("projection schema must deny reply fields");
-        assert!(error.contains("forbidden send-control field"));
+        for field in [
+            "replyText",
+            "operationState",
+            "cooldownUntil",
+            "appointmentRequest",
+        ] {
+            let mut value = serde_json::json!({ "tags": [] });
+            value[field] = serde_json::json!("must never be accepted");
+            let error = DeferredProjectionDecision::from_value(value)
+                .expect_err("projection schema must deny send-control fields");
+            assert!(error.contains("forbidden send-control field"));
+        }
     }
 
     #[test]
