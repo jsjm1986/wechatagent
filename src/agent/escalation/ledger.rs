@@ -15,16 +15,458 @@ use crate::models::{
 };
 use crate::routes::AppState;
 use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
-use mongodb::options::{TransactionOptions, UpdateOptions};
+use mongodb::options::{
+    FindOneAndUpdateOptions, ReturnDocument, TransactionOptions, UpdateOptions,
+};
 
-/// 插入一条 pending 台账。短码碰撞（短码唯一索引报错）时换种子重试至多 5 次。
-///
-/// 返回 `Ok(Some(entry))` = 成功插入；`Ok(None)` = 同客户同类别已有 pending
-/// （并发漏过 `has_pending_for_contact` 预检，被 pending 去重唯一索引兜住），
-/// 调用方据此跳过后续推卡（与 `has_pending_for_contact` 命中早返回同效）。
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn insert_pending_escalation(
+fn build_pending_escalation_entry(
+    id: Option<ObjectId>,
+    workspace_id: &str,
+    account_id: &str,
+    contact_wxid: &str,
+    short_code: String,
+    category: &str,
+    reason: &str,
+    question_for_principal: &str,
+    principal_wxid: &str,
+    is_generalizable: bool,
+    domain_config: &OperationDomainConfig,
+    policy: AskHumanPolicy,
+    principal_account_id: &str,
+    delivery_content: String,
+    now: DateTime,
+) -> AgentPrincipalEscalation {
+    AgentPrincipalEscalation {
+        id,
+        workspace_id: workspace_id.to_string(),
+        account_id: account_id.to_string(),
+        contact_wxid: contact_wxid.to_string(),
+        short_code,
+        status: PRINCIPAL_ESCALATION_STATUS_PENDING.to_string(),
+        category: category.to_string(),
+        reason: reason.to_string(),
+        question_for_principal: question_for_principal.to_string(),
+        principal_wxid: principal_wxid.to_string(),
+        protocol: Some(PrincipalEscalationProtocol {
+            domain: domain_config.domain.clone(),
+            policy_version: domain_config.version,
+            policy,
+            principal_account_id: principal_account_id.to_string(),
+            delivery_generation: 1,
+            delivery_state: PRINCIPAL_CARD_DELIVERY_PENDING_ENQUEUE.to_string(),
+            delivery_content,
+            delivery_outbox_id: None,
+            failure_cleanup_completed_at: None,
+        }),
+        decision: None,
+        authorization_expires_at: None,
+        is_generalizable,
+        knowledge_proposal_emitted: false,
+        last_holding_reply_ms: None,
+        // Only a confirmed Outbox delivery may set this timestamp.
+        last_pushed_at_ms: None,
+        created_at: now,
+        updated_at: now,
+        resolved_at: None,
+        resolved_via: None,
+        relay_state: None,
+        relay_task_id: None,
+        relay_enqueued_at: None,
+        relay_terminal_at: None,
+        relay_terminal_reason: None,
+    }
+}
+
+const PRINCIPAL_INTENT_CLAIM_TIMEOUT_MS: i64 = 120_000;
+const PRINCIPAL_INTENT_RECONCILE_LIMIT: usize = 100;
+
+#[derive(Debug)]
+enum PrincipalIntentOutcome {
+    Materialized(ObjectId),
+    Deduplicated(ObjectId),
+    Deferred(String),
+    Invalid(String),
+}
+
+#[derive(Debug)]
+enum DeterministicEscalationInsert {
+    Entry(AgentPrincipalEscalation),
+    Deduplicated(ObjectId),
+}
+
+/// Materialize one review-scoped ask-human intent immediately after commit.
+/// Periodic reconciliation uses the same claim/fencing path, so this is only a
+/// latency optimization and never the sole execution opportunity.
+pub(crate) async fn materialize_principal_escalation_intent(
     state: &AppState,
+    review_id: ObjectId,
+) -> AppResult<bool> {
+    let Some(review) = claim_principal_escalation_intent(state, Some(review_id)).await? else {
+        return Ok(false);
+    };
+    settle_claimed_principal_intent(state, review).await?;
+    Ok(true)
+}
+
+/// Recover pending/retry ask-human intents written atomically with decision
+/// reviews. Each claim is fenced; multiple workers may call this concurrently.
+pub(crate) async fn reconcile_principal_escalation_intents_once(
+    state: &AppState,
+) -> AppResult<u64> {
+    let mut settled = 0_u64;
+    for _ in 0..PRINCIPAL_INTENT_RECONCILE_LIMIT {
+        let Some(review) = claim_principal_escalation_intent(state, None).await? else {
+            break;
+        };
+        match settle_claimed_principal_intent(state, review).await {
+            Ok(()) => settled += 1,
+            Err(error) => {
+                tracing::warn!(%error, "principal escalation intent reconciliation failed");
+            }
+        }
+    }
+    Ok(settled)
+}
+
+async fn claim_principal_escalation_intent(
+    state: &AppState,
+    review_id: Option<ObjectId>,
+) -> AppResult<Option<Document>> {
+    let now = DateTime::now();
+    let stale_before =
+        DateTime::from_millis(now.timestamp_millis() - PRINCIPAL_INTENT_CLAIM_TIMEOUT_MS);
+    let mut filter = doc! {
+        "$or": [
+            {
+                "principal_escalation_intent.status": { "$in": [
+                    super::PRINCIPAL_INTENT_STATUS_PENDING,
+                    super::PRINCIPAL_INTENT_STATUS_RETRY,
+                ] },
+                "$or": [
+                    { "principal_escalation_intent.next_retry_at": { "$lte": now } },
+                    { "principal_escalation_intent.next_retry_at": { "$exists": false } },
+                ],
+            },
+            {
+                "principal_escalation_intent.status": super::PRINCIPAL_INTENT_STATUS_PROCESSING,
+                "principal_escalation_intent.claimed_at": { "$lt": stale_before },
+            },
+        ],
+    };
+    if let Some(review_id) = review_id {
+        filter.insert("_id", review_id);
+    }
+    let claim_token = uuid::Uuid::new_v4().to_string();
+    Ok(state
+        .db
+        .decision_reviews()
+        .clone_with_type::<Document>()
+        .find_one_and_update(
+            filter,
+            doc! {
+                "$set": {
+                    "principal_escalation_intent.status": super::PRINCIPAL_INTENT_STATUS_PROCESSING,
+                    "principal_escalation_intent.claim_token": &claim_token,
+                    "principal_escalation_intent.claimed_at": now,
+                    "principal_escalation_intent.updated_at": now,
+                },
+                "$inc": {
+                    "principal_escalation_intent.attempts": 1i64,
+                    "principal_escalation_intent.claim_generation": 1i64,
+                },
+            },
+            FindOneAndUpdateOptions::builder()
+                .sort(doc! { "principal_escalation_intent.next_retry_at": 1, "created_at": 1 })
+                .return_document(ReturnDocument::After)
+                .build(),
+        )
+        .await?)
+}
+
+async fn settle_claimed_principal_intent(state: &AppState, review: Document) -> AppResult<()> {
+    let review_id = review.get_object_id("_id").map_err(|error| {
+        AppError::External(format!("principal intent review id missing: {error}"))
+    })?;
+    let intent = review
+        .get_document("principal_escalation_intent")
+        .map_err(|error| {
+            AppError::External(format!("principal intent payload missing: {error}"))
+        })?;
+    let claim_token = intent
+        .get_str("claim_token")
+        .map_err(|error| {
+            AppError::External(format!("principal intent claim token missing: {error}"))
+        })?
+        .to_string();
+    let attempts = intent
+        .get_i64("attempts")
+        .or_else(|_| intent.get_i32("attempts").map(i64::from))
+        .unwrap_or(1);
+
+    match process_claimed_principal_intent(state, &review).await {
+        Ok(PrincipalIntentOutcome::Materialized(escalation_id)) => {
+            finish_principal_intent(
+                state,
+                review_id,
+                &claim_token,
+                super::PRINCIPAL_INTENT_STATUS_MATERIALIZED,
+                Some(escalation_id),
+                None,
+            )
+            .await?;
+            Ok(())
+        }
+        Ok(PrincipalIntentOutcome::Deduplicated(escalation_id)) => {
+            finish_principal_intent(
+                state,
+                review_id,
+                &claim_token,
+                super::PRINCIPAL_INTENT_STATUS_DEDUPLICATED,
+                Some(escalation_id),
+                None,
+            )
+            .await?;
+            Ok(())
+        }
+        Ok(PrincipalIntentOutcome::Deferred(reason)) => {
+            retry_principal_intent(state, review_id, &claim_token, attempts, &reason).await?;
+            Ok(())
+        }
+        Ok(PrincipalIntentOutcome::Invalid(reason)) => {
+            finish_principal_intent(
+                state,
+                review_id,
+                &claim_token,
+                super::PRINCIPAL_INTENT_STATUS_INVALID,
+                None,
+                Some(&reason),
+            )
+            .await?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = retry_principal_intent(
+                state,
+                review_id,
+                &claim_token,
+                attempts,
+                &error.to_string(),
+            )
+            .await;
+            Err(error)
+        }
+    }
+}
+
+async fn process_claimed_principal_intent(
+    state: &AppState,
+    review: &Document,
+) -> AppResult<PrincipalIntentOutcome> {
+    let review_id = review.get_object_id("_id").map_err(|error| {
+        AppError::External(format!("principal intent review id missing: {error}"))
+    })?;
+    let workspace_id = review.get_str("workspace_id").map_err(|error| {
+        AppError::External(format!("principal intent workspace missing: {error}"))
+    })?;
+    let account_id = review.get_str("account_id").map_err(|error| {
+        AppError::External(format!("principal intent account missing: {error}"))
+    })?;
+    let contact_wxid = review.get_str("contact_wxid").map_err(|error| {
+        AppError::External(format!("principal intent contact missing: {error}"))
+    })?;
+    let intent = review
+        .get_document("principal_escalation_intent")
+        .map_err(|error| {
+            AppError::External(format!("principal intent payload missing: {error}"))
+        })?;
+    let request_doc = intent
+        .get_document("request")
+        .map_err(|error| AppError::External(format!("principal intent request missing: {error}")))?
+        .clone();
+    let request: crate::models::EscalationRequest = mongodb::bson::from_document(request_doc)
+        .map_err(|error| {
+            AppError::External(format!("principal intent request invalid: {error}"))
+        })?;
+    let Some(category) = request.category.as_deref() else {
+        return Ok(PrincipalIntentOutcome::Invalid(
+            "principal intent category missing".to_string(),
+        ));
+    };
+    let Some(reason) = request
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(PrincipalIntentOutcome::Invalid(
+            "principal intent reason missing".to_string(),
+        ));
+    };
+    let Some(question) = request
+        .question_for_principal
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(PrincipalIntentOutcome::Invalid(
+            "principal intent question missing".to_string(),
+        ));
+    };
+    if !request.needed || !ALLOWED_ESCALATION_CATEGORY.contains(&category) {
+        return Ok(PrincipalIntentOutcome::Invalid(
+            "principal intent request is outside the transport schema".to_string(),
+        ));
+    }
+
+    if let Some(existing) = state
+        .db
+        .agent_principal_escalations()
+        .find_one(doc! { "_id": review_id }, None)
+        .await?
+    {
+        if existing.workspace_id != workspace_id
+            || existing.account_id != account_id
+            || existing.contact_wxid != contact_wxid
+            || existing.category != category
+        {
+            return Ok(PrincipalIntentOutcome::Invalid(
+                "deterministic escalation identity conflicts with another scope".to_string(),
+            ));
+        }
+        if existing.status == PRINCIPAL_ESCALATION_STATUS_PENDING {
+            materialize_principal_card_delivery(state, &existing).await?;
+        }
+        return Ok(PrincipalIntentOutcome::Materialized(review_id));
+    }
+
+    if let Some(existing) = state
+        .db
+        .agent_principal_escalations()
+        .find_one(
+            doc! {
+                "_id": { "$ne": review_id },
+                "workspace_id": workspace_id,
+                "account_id": account_id,
+                "contact_wxid": contact_wxid,
+                "category": category,
+                "status": PRINCIPAL_ESCALATION_STATUS_PENDING,
+            },
+            None,
+        )
+        .await?
+    {
+        if let Some(existing_id) = existing.id {
+            return Ok(PrincipalIntentOutcome::Deduplicated(existing_id));
+        }
+    }
+
+    let Some(contact) = state
+        .db
+        .contacts()
+        .find_one(
+            doc! {
+                "workspace_id": workspace_id,
+                "account_id": account_id,
+                "wxid": contact_wxid,
+            },
+            None,
+        )
+        .await?
+    else {
+        return Ok(PrincipalIntentOutcome::Deferred(
+            "customer contact is not available yet".to_string(),
+        ));
+    };
+    let Some(domain_config) = crate::agent::load_user_operation_domain_config_for_contact(
+        state,
+        workspace_id,
+        contact_wxid,
+    )
+    .await?
+    else {
+        return Ok(PrincipalIntentOutcome::Deferred(
+            "ask-human configuration is not available yet".to_string(),
+        ));
+    };
+    let policy = super::resolve_ask_human_policy(&domain_config);
+    if super::stuck_suppressed(category, &policy) {
+        return Ok(PrincipalIntentOutcome::Deferred(
+            "this escalation category is disabled by current policy".to_string(),
+        ));
+    }
+    let frozen_policy = super::freeze_ask_human_policy(&policy, account_id);
+    let Some(decider) = frozen_policy.decider_chain.first() else {
+        return Ok(PrincipalIntentOutcome::Deferred(
+            "ask-human decider chain is not configured yet".to_string(),
+        ));
+    };
+    let principal_wxid = decider.wxid.trim().to_string();
+    let Some(principal_account_id) = decider
+        .account_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+    else {
+        return Ok(PrincipalIntentOutcome::Deferred(
+            "ask-human decider account is not configured yet".to_string(),
+        ));
+    };
+    if principal_wxid.is_empty() || principal_wxid == contact_wxid {
+        return Ok(PrincipalIntentOutcome::Deferred(
+            "ask-human decider identity is invalid".to_string(),
+        ));
+    }
+    let now_ms = DateTime::now().timestamp_millis();
+    let since_ms = now_ms - 24 * 3600 * 1000;
+    let today = super::count_pushes_today(state, workspace_id, &principal_wxid, since_ms).await?;
+    let last_push = super::latest_push_ms(state, workspace_id, &principal_wxid).await?;
+    if !super::push_allowed(&policy, today, last_push, now_ms) {
+        return Ok(PrincipalIntentOutcome::Deferred(
+            "principal push policy is temporarily blocking delivery".to_string(),
+        ));
+    }
+    let customer_label = contact
+        .remark
+        .clone()
+        .or(contact.nickname.clone())
+        .or(contact.alias.clone())
+        .unwrap_or_else(|| contact.wxid.clone());
+    match insert_pending_escalation_with_id(
+        state,
+        review_id,
+        workspace_id,
+        account_id,
+        contact_wxid,
+        category,
+        reason,
+        question,
+        &principal_wxid,
+        request.is_generalizable,
+        &domain_config,
+        frozen_policy,
+        &principal_account_id,
+        &customer_label,
+    )
+    .await?
+    {
+        DeterministicEscalationInsert::Entry(entry) => {
+            if entry.status == PRINCIPAL_ESCALATION_STATUS_PENDING {
+                materialize_principal_card_delivery(state, &entry).await?;
+            }
+            Ok(PrincipalIntentOutcome::Materialized(review_id))
+        }
+        DeterministicEscalationInsert::Deduplicated(existing_id) => {
+            Ok(PrincipalIntentOutcome::Deduplicated(existing_id))
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn insert_pending_escalation_with_id(
+    state: &AppState,
+    escalation_id: ObjectId,
     workspace_id: &str,
     account_id: &str,
     contact_wxid: &str,
@@ -37,15 +479,21 @@ pub(crate) async fn insert_pending_escalation(
     policy: AskHumanPolicy,
     principal_account_id: &str,
     customer_label: &str,
-) -> AppResult<Option<AgentPrincipalEscalation>> {
-    debug_assert!(
-        ALLOWED_ESCALATION_CATEGORY.contains(&category),
-        "category 必须在闭集内"
-    );
+) -> AppResult<DeterministicEscalationInsert> {
     let now = DateTime::now();
     for attempt in 0..5u32 {
-        let seed =
-            (now.timestamp_millis() as u64).wrapping_add(attempt as u64 * 2_654_435_761) as u32;
+        let seed = (now.timestamp_millis() as u64)
+            .wrapping_add(attempt as u64 * 2_654_435_761)
+            .wrapping_add(u64::from_be_bytes([
+                0,
+                0,
+                0,
+                0,
+                escalation_id.bytes()[0],
+                escalation_id.bytes()[1],
+                escalation_id.bytes()[2],
+                escalation_id.bytes()[3],
+            ])) as u32;
         let short_code = short_code_from_seed(seed);
         let delivery_content = super::logic::render_principal_card(
             &short_code,
@@ -53,72 +501,176 @@ pub(crate) async fn insert_pending_escalation(
             reason,
             question_for_principal,
         );
-        let entry = AgentPrincipalEscalation {
-            id: None,
-            workspace_id: workspace_id.to_string(),
-            account_id: account_id.to_string(),
-            contact_wxid: contact_wxid.to_string(),
-            short_code: short_code.clone(),
-            status: PRINCIPAL_ESCALATION_STATUS_PENDING.to_string(),
-            category: category.to_string(),
-            reason: reason.to_string(),
-            question_for_principal: question_for_principal.to_string(),
-            principal_wxid: principal_wxid.to_string(),
-            protocol: Some(PrincipalEscalationProtocol {
-                domain: domain_config.domain.clone(),
-                policy_version: domain_config.version,
-                policy: policy.clone(),
-                principal_account_id: principal_account_id.to_string(),
-                delivery_generation: 1,
-                delivery_state: PRINCIPAL_CARD_DELIVERY_PENDING_ENQUEUE.to_string(),
-                delivery_content,
-                delivery_outbox_id: None,
-                failure_cleanup_completed_at: None,
-            }),
-            decision: None,
-            authorization_expires_at: None,
+        let entry = build_pending_escalation_entry(
+            Some(escalation_id),
+            workspace_id,
+            account_id,
+            contact_wxid,
+            short_code,
+            category,
+            reason,
+            question_for_principal,
+            principal_wxid,
             is_generalizable,
-            knowledge_proposal_emitted: false,
-            last_holding_reply_ms: None,
-            // Only a confirmed Outbox delivery may set this timestamp.
-            last_pushed_at_ms: None,
-            created_at: now,
-            updated_at: now,
-            resolved_at: None,
-            resolved_via: None,
-            relay_state: None,
-            relay_task_id: None,
-            relay_enqueued_at: None,
-            relay_terminal_at: None,
-            relay_terminal_reason: None,
-        };
+            domain_config,
+            policy.clone(),
+            principal_account_id,
+            delivery_content,
+            now,
+        );
         match state
             .db
             .agent_principal_escalations()
             .insert_one(&entry, None)
             .await
         {
-            Ok(res) => {
-                let mut saved = entry;
-                saved.id = res.inserted_id.as_object_id();
-                return Ok(Some(saved));
-            }
-            Err(e) => {
-                // pending 去重唯一索引冲突：并发已插入同客户同类别 pending → 静默"已存在"。
-                if is_pending_dedupe_conflict(&e) {
-                    return Ok(None);
+            Ok(_) => return Ok(DeterministicEscalationInsert::Entry(entry)),
+            Err(error) => {
+                if let Some(existing) = state
+                    .db
+                    .agent_principal_escalations()
+                    .find_one(doc! { "_id": escalation_id }, None)
+                    .await?
+                {
+                    return Ok(DeterministicEscalationInsert::Entry(existing));
                 }
-                // 短码唯一索引冲突：换种子重试。
-                if is_duplicate_key_error(&e) {
+                if is_pending_dedupe_conflict(&error) {
+                    if let Some(existing) = state
+                        .db
+                        .agent_principal_escalations()
+                        .find_one(
+                            doc! {
+                                "workspace_id": workspace_id,
+                                "account_id": account_id,
+                                "contact_wxid": contact_wxid,
+                                "category": category,
+                                "status": PRINCIPAL_ESCALATION_STATUS_PENDING,
+                            },
+                            None,
+                        )
+                        .await?
+                    {
+                        if let Some(existing_id) = existing.id {
+                            return Ok(DeterministicEscalationInsert::Deduplicated(existing_id));
+                        }
+                    }
+                }
+                if is_duplicate_key_error(&error) {
                     continue;
                 }
-                return Err(e.into());
+                return Err(error.into());
             }
         }
     }
     Err(AppError::External(
-        "短码生成连续碰撞，插入请示台账失败".into(),
+        "deterministic escalation short-code allocation exhausted".to_string(),
     ))
+}
+
+async fn finish_principal_intent(
+    state: &AppState,
+    review_id: ObjectId,
+    claim_token: &str,
+    status: &str,
+    escalation_id: Option<ObjectId>,
+    error: Option<&str>,
+) -> AppResult<()> {
+    let now = DateTime::now();
+    let mut set = doc! {
+        "principal_escalation_intent.status": status,
+        "principal_escalation_intent.updated_at": now,
+        "principal_escalation_intent.completed_at": now,
+    };
+    if let Some(escalation_id) = escalation_id {
+        set.insert("principal_escalation_intent.escalation_id", escalation_id);
+    }
+    if let Some(error) = error {
+        set.insert(
+            "principal_escalation_intent.last_error",
+            error.chars().take(1024).collect::<String>(),
+        );
+    }
+    let mut unset = doc! {
+        "principal_escalation_intent.claim_token": "",
+        "principal_escalation_intent.claimed_at": "",
+        "principal_escalation_intent.next_retry_at": "",
+    };
+    if error.is_none() {
+        unset.insert("principal_escalation_intent.last_error", "");
+    }
+    let result = state
+        .db
+        .decision_reviews()
+        .clone_with_type::<Document>()
+        .update_one(
+            doc! {
+                "_id": review_id,
+                "principal_escalation_intent.status": super::PRINCIPAL_INTENT_STATUS_PROCESSING,
+                "principal_escalation_intent.claim_token": claim_token,
+            },
+            doc! {
+                "$set": set,
+                "$unset": unset,
+            },
+            None,
+        )
+        .await?;
+    if result.matched_count != 1 {
+        tracing::info!(
+            %review_id,
+            %claim_token,
+            terminal_status = status,
+            "discarded stale principal escalation intent result after claim ownership changed"
+        );
+    }
+    Ok(())
+}
+
+async fn retry_principal_intent(
+    state: &AppState,
+    review_id: ObjectId,
+    claim_token: &str,
+    attempts: i64,
+    reason: &str,
+) -> AppResult<()> {
+    let exponent = attempts.saturating_sub(1).clamp(0, 6) as u32;
+    let delay_seconds = (60_i64.saturating_mul(1_i64 << exponent)).min(3600);
+    let now = DateTime::now();
+    let next_retry_at =
+        DateTime::from_millis(now.timestamp_millis() + delay_seconds.saturating_mul(1000));
+    let result = state
+        .db
+        .decision_reviews()
+        .clone_with_type::<Document>()
+        .update_one(
+            doc! {
+                "_id": review_id,
+                "principal_escalation_intent.status": super::PRINCIPAL_INTENT_STATUS_PROCESSING,
+                "principal_escalation_intent.claim_token": claim_token,
+            },
+            doc! {
+                "$set": {
+                    "principal_escalation_intent.status": super::PRINCIPAL_INTENT_STATUS_RETRY,
+                    "principal_escalation_intent.next_retry_at": next_retry_at,
+                    "principal_escalation_intent.last_error": reason.chars().take(1024).collect::<String>(),
+                    "principal_escalation_intent.updated_at": now,
+                },
+                "$unset": {
+                    "principal_escalation_intent.claim_token": "",
+                    "principal_escalation_intent.claimed_at": "",
+                },
+            },
+            None,
+        )
+        .await?;
+    if result.matched_count != 1 {
+        tracing::info!(
+            %review_id,
+            %claim_token,
+            "discarded stale principal escalation intent retry after claim ownership changed"
+        );
+    }
+    Ok(())
 }
 
 /// Materialize one frozen principal-card intent into the existing durable Outbox.
@@ -579,31 +1131,6 @@ pub(crate) async fn list_pending_for_principal(
         )
         .await?;
     Ok(cursor.try_collect().await?)
-}
-
-/// 该客户是否已有同类别的 pending 请示（去重用：避免等待期重复推卡骚扰领导）。
-pub(crate) async fn has_pending_for_contact(
-    state: &AppState,
-    workspace_id: &str,
-    account_id: &str,
-    contact_wxid: &str,
-    category: &str,
-) -> AppResult<bool> {
-    let count = state
-        .db
-        .agent_principal_escalations()
-        .count_documents(
-            doc! {
-                "workspace_id": workspace_id,
-                "account_id": account_id,
-                "contact_wxid": contact_wxid,
-                "category": category,
-                "status": PRINCIPAL_ESCALATION_STATUS_PENDING,
-            },
-            None,
-        )
-        .await?;
-    Ok(count > 0)
 }
 
 /// 把一条 pending 台账标 resolved，写入真人裁决 + 授权过期时间。

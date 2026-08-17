@@ -21,7 +21,7 @@
 
 use std::sync::{Arc, Once};
 
-use mongodb::bson::{doc, Bson, DateTime, Document};
+use mongodb::bson::{doc, to_document, Bson, DateTime, Document};
 use mongodb::options::UpdateOptions;
 use serde::Serialize;
 
@@ -399,6 +399,7 @@ pub async fn write_run_envelope_started(
     source_event_id: &str,
     source_kind: &str,
     trigger_kind: &str,
+    task_claim: Option<&crate::tasks::TaskClaim>,
 ) -> AppResult<()> {
     let envelope = AgentRunLog {
         id: None,
@@ -439,7 +440,16 @@ pub async fn write_run_envelope_started(
         created_at: DateTime::now(),
     };
 
-    db.agent_run_logs().insert_one(envelope, None).await?;
+    let mut envelope = to_document(&envelope)?;
+    if let Some(claim) = task_claim {
+        envelope.insert("source_task_id", claim.task_id);
+        envelope.insert("source_task_claim_token", claim.claim_token.clone());
+        envelope.insert("source_task_claim_generation", claim.claim_generation);
+    }
+    db.agent_run_logs()
+        .clone_with_type::<Document>()
+        .insert_one(envelope, None)
+        .await?;
     Ok(())
 }
 
@@ -654,6 +664,113 @@ pub async fn fail_run_envelope_if_open(
         }
     }
     Ok(false)
+}
+
+/// Close every open run owned by one exact task claim. The task id alone is not
+/// sufficient: a reclaimed task may already have a newer owner whose run must
+/// remain open.
+pub async fn abort_run_envelopes_for_task_claim(
+    db: &Database,
+    task_id: mongodb::bson::oid::ObjectId,
+    claim_token: &str,
+    claim_generation: i64,
+    reason: &str,
+) -> AppResult<u64> {
+    let reason: String = reason.chars().take(1024).collect();
+    let result = db
+        .agent_run_logs()
+        .clone_with_type::<Document>()
+        .update_many(
+            doc! {
+                "source_task_id": task_id,
+                "source_task_claim_token": claim_token,
+                "source_task_claim_generation": claim_generation,
+                "lifecycle": { "$in": [LIFECYCLE_STARTED, LIFECYCLE_RUNNING] },
+            },
+            doc! { "$set": {
+                "status": "stale_task_claim",
+                "gateway_result": {
+                    "gatewayStatus": "stale_task_claim",
+                    "reason": &reason,
+                },
+                "error_summary": &reason,
+                "abort_reason": "stale_task_claim",
+                "lifecycle": LIFECYCLE_ABORTED_BY_EXTERNAL_SIGNAL,
+            } },
+            None,
+        )
+        .await?;
+    Ok(result.modified_count)
+}
+
+/// Recover the narrow crash window between reclaiming a stale task and closing
+/// its run envelope. Only envelopes carrying the full task-claim identity are
+/// considered; a current owner with the same task id remains untouched.
+pub async fn reconcile_stale_task_run_envelopes(
+    db: &Database,
+    stale_before: DateTime,
+) -> AppResult<u64> {
+    use futures::TryStreamExt;
+
+    let mut cursor = db
+        .agent_run_logs()
+        .clone_with_type::<Document>()
+        .find(
+            doc! {
+                "lifecycle": { "$in": [LIFECYCLE_STARTED, LIFECYCLE_RUNNING] },
+                "source_task_id": { "$exists": true },
+                "source_task_claim_token": { "$type": "string", "$ne": "" },
+                "source_task_claim_generation": { "$exists": true },
+                "created_at": { "$lt": stale_before },
+            },
+            mongodb::options::FindOptions::builder().limit(100).build(),
+        )
+        .await?;
+    let mut closed = 0_u64;
+    while let Some(envelope) = cursor.try_next().await? {
+        let Ok(task_id) = envelope.get_object_id("source_task_id") else {
+            continue;
+        };
+        let Ok(claim_token) = envelope.get_str("source_task_claim_token") else {
+            continue;
+        };
+        let claim_generation = envelope
+            .get_i64("source_task_claim_generation")
+            .or_else(|_| {
+                envelope
+                    .get_i32("source_task_claim_generation")
+                    .map(i64::from)
+            });
+        let Ok(claim_generation) = claim_generation else {
+            continue;
+        };
+        let task = db
+            .tasks()
+            .clone_with_type::<Document>()
+            .find_one(doc! { "_id": task_id }, None)
+            .await?;
+        let claim_is_current = task.as_ref().is_some_and(|task| {
+            task.get_str("status").ok() == Some("running")
+                && task.get_str("claim_token").ok() == Some(claim_token)
+                && task
+                    .get_i64("claim_generation")
+                    .or_else(|_| task.get_i32("claim_generation").map(i64::from))
+                    .ok()
+                    == Some(claim_generation)
+        });
+        if claim_is_current {
+            continue;
+        }
+        closed += abort_run_envelopes_for_task_claim(
+            db,
+            task_id,
+            claim_token,
+            claim_generation,
+            "task claim is no longer current",
+        )
+        .await?;
+    }
+    Ok(closed)
 }
 
 /// R0.2：把终态字段写入 `agent_run_logs.{run_id}`；matched_count == 0 时走

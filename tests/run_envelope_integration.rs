@@ -325,6 +325,7 @@ async fn same_run_id_second_insert_triggers_duplicate_key_error() {
         "evt_dup_001",
         SOURCE_KIND_INBOUND_MESSAGE,
         "reply",
+        None,
     )
     .await
     .expect("first insert SHALL succeed");
@@ -339,6 +340,7 @@ async fn same_run_id_second_insert_triggers_duplicate_key_error() {
         "evt_dup_002",
         SOURCE_KIND_INBOUND_MESSAGE,
         "reply",
+        None,
     )
     .await;
 
@@ -423,6 +425,7 @@ async fn terminal_lifecycle_is_absorbing_and_rejects_late_write() {
         "evt_absorb_001",
         SOURCE_KIND_INBOUND_MESSAGE,
         "reply",
+        None,
     )
     .await
     .expect("insert started envelope");

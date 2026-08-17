@@ -4458,6 +4458,15 @@ pub struct ApiCommitment {
     pub text: String,
     pub due_at: Option<String>,
     pub created_at: Option<String>,
+    pub status: String,
+    pub fulfilled_at: Option<String>,
+    pub cancelled_at: Option<String>,
+    pub superseded_at: Option<String>,
+    pub expired_at: Option<String>,
+    pub superseded_by: Option<String>,
+    pub lifecycle_updated_at: Option<String>,
+    pub lifecycle_reason: Option<String>,
+    pub lifecycle_source_id: Option<String>,
 }
 
 impl From<&CommitmentRepr> for ApiCommitment {
@@ -4468,6 +4477,15 @@ impl From<&CommitmentRepr> for ApiCommitment {
                 text: text.clone(),
                 due_at: None,
                 created_at: None,
+                status: "legacy_unverified".to_string(),
+                fulfilled_at: None,
+                cancelled_at: None,
+                superseded_at: None,
+                expired_at: None,
+                superseded_by: None,
+                lifecycle_updated_at: None,
+                lifecycle_reason: None,
+                lifecycle_source_id: None,
             },
             CommitmentRepr::Structured(entry) => Self {
                 id: entry.id.clone(),
@@ -4475,6 +4493,15 @@ impl From<&CommitmentRepr> for ApiCommitment {
                 due_at: dt_to_string(entry.due_at.unwrap_or(DateTime::from_millis(0)))
                     .filter(|_| entry.due_at.is_some()),
                 created_at: dt_to_string(entry.created_at),
+                status: entry.status.clone(),
+                fulfilled_at: entry.fulfilled_at.and_then(dt_to_string),
+                cancelled_at: entry.cancelled_at.and_then(dt_to_string),
+                superseded_at: entry.superseded_at.and_then(dt_to_string),
+                expired_at: entry.expired_at.and_then(dt_to_string),
+                superseded_by: entry.superseded_by.clone(),
+                lifecycle_updated_at: entry.lifecycle_updated_at.and_then(dt_to_string),
+                lifecycle_reason: entry.lifecycle_reason.clone(),
+                lifecycle_source_id: entry.lifecycle_source_id.clone(),
             },
         }
     }
@@ -5615,7 +5642,17 @@ mod typed {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub cancelled_at: Option<DateTime>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub superseded_at: Option<DateTime>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub expired_at: Option<DateTime>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         pub superseded_by: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub lifecycle_updated_at: Option<DateTime>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub lifecycle_reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub lifecycle_source_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub source_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -5639,7 +5676,12 @@ mod typed {
                 status: default_commitment_status(),
                 fulfilled_at: None,
                 cancelled_at: None,
+                superseded_at: None,
+                expired_at: None,
                 superseded_by: None,
+                lifecycle_updated_at: None,
+                lifecycle_reason: None,
+                lifecycle_source_id: None,
                 source_id: None,
                 related_entity_id: None,
                 extra: Document::new(),

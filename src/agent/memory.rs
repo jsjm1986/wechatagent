@@ -242,9 +242,9 @@ pub(crate) fn memory_card_from_contact(
         .iter()
         .rev()
         .find(|commitment| match commitment {
-            // Legacy plain entries have no lifecycle field; migrations preserve them as the
-            // pre-existing active commitment representation.
-            CommitmentRepr::Plain(text) => !text.trim().is_empty(),
+            // Legacy plain entries lack delivery and lifecycle proof. Keep them in storage for
+            // audit/migration compatibility, but never project them as current obligations.
+            CommitmentRepr::Plain(_) => false,
             CommitmentRepr::Structured(entry) => {
                 entry.status == "active" && !entry.text.trim().is_empty()
             }

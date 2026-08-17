@@ -236,6 +236,11 @@ pub struct AgentDecision {
     pub last_commitment: Option<String>,
     /// PR-D：结构化承诺（带可选 dueAt）。promote 时从 RawAgentDecision.commitment 透传。
     pub commitment: Option<CommitmentDecision>,
+    /// Model-selected lifecycle transitions for already-active commitments. The runtime only
+    /// validates referenced ids/statuses and applies authorized transitions; it never infers an
+    /// action from customer words.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commitment_updates: Vec<CommitmentLifecycleDecision>,
     pub follow_up_policy: Option<String>,
     #[serde(default)]
     pub profile_attributes: Document,
@@ -447,6 +452,7 @@ impl Default for AgentDecision {
             dimension_display_names: Document::new(),
             last_commitment: None,
             commitment: None,
+            commitment_updates: Vec::new(),
             follow_up_policy: None,
             profile_attributes: Document::new(),
             intent_analysis: Document::new(),
@@ -602,6 +608,8 @@ pub struct RawAgentDecision {
     pub last_commitment: Option<String>,
     /// PR-D：结构化承诺（带可选 dueAt）。缺失时回落 last_commitment。
     pub commitment: Option<CommitmentDecision>,
+    #[serde(default)]
+    pub commitment_updates: Option<Vec<CommitmentLifecycleDecision>>,
     pub follow_up_policy: Option<String>,
     pub profile_attributes: Option<Document>,
     pub intent_analysis: Option<Document>,
@@ -683,6 +691,7 @@ impl DeferredProjectionDecision {
             "escalationRequest",
             "lastCommitment",
             "commitment",
+            "commitmentUpdates",
             "followUp",
             "toolCalls",
             "operationState",
@@ -816,6 +825,7 @@ const NEXT_STEP_VALUES: &[&str] = &[
     "repair",
     "clarify",
     "ask_principal",
+    "defer",
 ];
 const CONVERSATION_MODE_VALUES: &[&str] = &[
     "casual_relationship",
@@ -1381,6 +1391,30 @@ fn normalize_harness_control(decision: &mut AgentDecision, risks: &mut Vec<Strin
     if decision.verification.needed && decision.verification.reason.trim().is_empty() {
         risks.push("verification_reason_missing".to_string());
     }
+    if decision.commitment_updates.len() > 8 {
+        risks.push("commitment_updates_over_limit".to_string());
+    }
+    let mut commitment_ids = Vec::with_capacity(decision.commitment_updates.len());
+    for update in &mut decision.commitment_updates {
+        update.commitment_id = update.commitment_id.trim().to_string();
+        update.reason = update.reason.trim().to_string();
+        if update.commitment_id.is_empty() {
+            risks.push("commitment_update_id_missing".to_string());
+        }
+        if update.reason.is_empty() {
+            risks.push("commitment_update_reason_missing".to_string());
+        } else if update.reason.chars().count() > 500 {
+            risks.push("commitment_update_reason_too_long".to_string());
+        }
+        if update.action == CommitmentLifecycleAction::Unknown {
+            risks.push("commitment_update_action_invalid".to_string());
+        }
+        if commitment_ids.contains(&update.commitment_id) {
+            risks.push("commitment_update_duplicate_id".to_string());
+        } else {
+            commitment_ids.push(update.commitment_id.clone());
+        }
+    }
     if let Some(request) = decision.appointment_request.as_ref() {
         if !request.requested {
             decision.appointment_request = None;
@@ -1668,6 +1702,9 @@ fn carry_through_fields(raw: RawAgentDecision, decision: &mut AgentDecision) {
             decision.commitment = Some(c);
         }
     }
+    if let Some(v) = raw.commitment_updates {
+        decision.commitment_updates = v;
+    }
     if raw.follow_up_policy.is_some() {
         decision.follow_up_policy = raw.follow_up_policy;
     }
@@ -1773,6 +1810,38 @@ pub struct CommitmentDecision {
     /// created_at 兜底接住（见 [`super::super::planner`] commitment fallback）。
     #[serde(default)]
     pub due_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CommitmentLifecycleAction {
+    Fulfilled,
+    Cancelled,
+    Superseded,
+    Expired,
+    #[serde(other)]
+    Unknown,
+}
+
+impl Default for CommitmentLifecycleAction {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
+/// A typed lifecycle decision about one existing active commitment.
+///
+/// `reason` is audit/reviewer context, not a customer-facing sentence. A `superseded` action is
+/// linked by the runtime to the new commitment created by the same authorized reply.
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitmentLifecycleDecision {
+    #[serde(default)]
+    pub commitment_id: String,
+    #[serde(default)]
+    pub action: CommitmentLifecycleAction,
+    #[serde(default)]
+    pub reason: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
@@ -2636,6 +2705,19 @@ mod validate_and_promote_tests {
         assert!(risks
             .iter()
             .any(|risk| risk == "next_step_inconsistent:escalation_request"));
+    }
+
+    #[test]
+    fn final_defer_step_is_preserved_as_a_closed_harness_action() {
+        let mut raw = make_valid_low_routine_raw();
+        raw.next_step = Some("defer".to_string());
+
+        let (decision, risks) = raw.validate_reply_critical(&runtime_default(true));
+
+        assert_eq!(decision.next_step, "defer");
+        assert!(!risks
+            .iter()
+            .any(|risk| risk.contains("next_step") || risk.contains("nextStep")));
     }
 
     #[test]

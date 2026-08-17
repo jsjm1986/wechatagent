@@ -356,6 +356,7 @@ pub async fn send_contact_message_gateway(
         &source_event_id,
         SOURCE_KIND_MANUAL_SEND,
         SOURCE_KIND_MANUAL_SEND,
+        None,
     )
     .await?;
 
@@ -1822,6 +1823,9 @@ async fn run_user_operation_gateway_with_parallel_reaction(
     let run_id = uuid::Uuid::new_v4().to_string();
     let (source_event_id, source_kind) = trigger_envelope_source(&trigger);
     let trigger_kind = trigger.kind().to_string();
+    let task_claim = task_context
+        .as_ref()
+        .and_then(|context| context.claim.as_ref());
     write_run_envelope_started(
         &state.db,
         &run_id,
@@ -1831,6 +1835,7 @@ async fn run_user_operation_gateway_with_parallel_reaction(
         &source_event_id,
         source_kind,
         &trigger_kind,
+        task_claim,
     )
     .await?;
 
@@ -1997,129 +2002,6 @@ fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
     } else {
         "non-string panic payload".to_string()
     }
-}
-
-/// decision Agent emit 了 escalation_request 时，在 approved 发送路径末尾调用。
-/// 占位 reply 已由网关经 outbox 正常发给客户——本函数只做不面向客户的两件事：
-/// 推请示卡给领导 wxid + 落 pending 台账。调用方对本函数错误只记 warn、不阻断 run。
-pub(crate) async fn trigger_principal_escalation(
-    state: &AppState,
-    contact: &Contact,
-    req: &crate::models::EscalationRequest,
-) -> AppResult<()> {
-    if !req.needed {
-        return Ok(());
-    }
-    let Some(cfg) = super::decision::load_user_operation_domain_config_for_contact(
-        state,
-        &contact.workspace_id,
-        &contact.wxid,
-    )
-    .await?
-    else {
-        return Ok(()); // 无 config = 请示通道未配置
-    };
-    let policy = escalation::resolve_ask_human_policy(&cfg);
-    let frozen_policy = escalation::freeze_ask_human_policy(&policy, &contact.account_id);
-    let Some(decider) = frozen_policy.decider_chain.first() else {
-        return Ok(()); // 决策人链空 = 本 workspace 未启用请示通道
-    };
-    let principal_wxid = decider.wxid.clone();
-    let principal_account_id = decider
-        .account_id
-        .as_deref()
-        .ok_or_else(|| AppError::BadRequest("决策人缺少发送账号".into()))?
-        .to_string();
-    if principal_wxid == contact.wxid {
-        return Err(AppError::BadRequest(
-            "决策人配置等于客户 wxid，拒绝触发请示".into(),
-        ));
-    }
-    // 骚扰门：daily_push_cap / quiet_hours（None 配置全放行，字节等价）。
-    let now_ms = mongodb::bson::DateTime::now().timestamp_millis();
-    let since_ms = now_ms - 24 * 3600 * 1000;
-    let today =
-        escalation::count_pushes_today(state, &contact.workspace_id, &principal_wxid, since_ms)
-            .await?;
-    let last_push =
-        escalation::latest_push_ms(state, &contact.workspace_id, &principal_wxid).await?;
-    if !escalation::push_allowed(&policy, today, last_push, now_ms) {
-        return Ok(()); // 骚扰门关：跳过推卡
-    }
-    let category = req
-        .category
-        .clone()
-        .unwrap_or_else(|| crate::models::ESCALATION_CATEGORY_OUT_OF_SCOPE.to_string());
-    // escalate_stuck=false → 本 workspace 关闭"卡死"类请示（默认 true 字节等价）。
-    if escalation::stuck_suppressed(&category, &policy) {
-        return Ok(());
-    }
-    // 去重：同客户同类别已有 pending → 不重复推卡。
-    if escalation::has_pending_for_contact(
-        state,
-        &contact.workspace_id,
-        &contact.account_id,
-        &contact.wxid,
-        &category,
-    )
-    .await?
-    {
-        return Ok(());
-    }
-    let reason = req.reason.clone().unwrap_or_default();
-    let question = req.question_for_principal.clone().unwrap_or_default();
-    let customer_label = contact
-        .remark
-        .clone()
-        .or_else(|| contact.nickname.clone())
-        .or_else(|| contact.alias.clone())
-        .unwrap_or_else(|| contact.wxid.clone());
-    let Some(entry) = escalation::insert_pending_escalation(
-        state,
-        &contact.workspace_id,
-        &contact.account_id,
-        &contact.wxid,
-        &category,
-        &reason,
-        &question,
-        &principal_wxid,
-        req.is_generalizable,
-        &cfg,
-        frozen_policy,
-        &principal_account_id,
-        &customer_label,
-    )
-    .await?
-    else {
-        // 并发已插入同客户同类别 pending（pending 去重索引兜住）→ 不重复推卡。
-        return Ok(());
-    };
-    escalation::materialize_principal_card_delivery(state, &entry).await?;
-    Ok(())
-}
-
-/// Return an explicit model-selected principal handoff only when the request is
-/// structurally complete. This is deliberately a schema check, not a semantic
-/// keyword gate: the Knowledge/Reply agents decide *whether* human authority is
-/// needed; deterministic code only prevents an empty or unknown request from
-/// becoming an unusable card.
-fn explicit_principal_escalation_request(
-    decision: &crate::agent::types::AgentDecision,
-) -> Option<&crate::models::EscalationRequest> {
-    decision.escalation_request.as_ref().filter(|request| {
-        request.needed
-            && request.category.as_deref().is_some_and(|category| {
-                crate::models::ALLOWED_ESCALATION_CATEGORY.contains(&category)
-            })
-            && request
-                .reason
-                .as_deref()
-                .is_some_and(|reason| !reason.trim().is_empty())
-            && request
-                .question_for_principal
-                .as_deref()
-                .is_some_and(|question| !question.trim().is_empty())
-    })
 }
 
 /// relay：把领导裁决用 AI 口吻转述给客户，走现有网关。转述完清等待态、按需发知识提案。
@@ -2480,7 +2362,6 @@ async fn persist_production_post_commit(
     context_pack: &Document,
     active_profile: &crate::models::DomainProfile,
     active_products: &[crate::models::Product],
-    sendable_assets: &[crate::models::ContentAsset],
     recent_messages: &[ConversationMessage],
     knowledge_route: &KnowledgeRouteResult,
     outcome: &super::turn_loop::TurnOutcome,
@@ -2671,70 +2552,29 @@ async fn persist_production_post_commit(
         }
     }
 
-    if authorization.disposition != "authorized" {
-        // A coherent structured request is the model's semantic authority decision. It must
-        // survive a later review/claim hold; otherwise `escalate_ai_policy_hold=false` silently
-        // discards an explicit ask-human result and the customer is left with only an ack. The
-        // trigger still applies account binding, push limits, dedupe and category policy. Only
-        // incomplete/no-request holds fall back to the generic deterministic risk policy.
-        if let Some(request) = explicit_principal_escalation_request(decision) {
-            if let Err(error) = trigger_principal_escalation(state, contact, request).await {
-                tracing::warn!(%error, %run_id, "explicit principal escalation failed after held commit");
-            }
-        } else if let Err(error) = escalation::escalate_held_decision(
-            state,
-            contact,
-            review,
-            decision,
-            domain_config,
-            gateway_status,
-        )
-        .await
+    if let Some(review_id) = review_id {
+        if let Err(error) =
+            escalation::materialize_principal_escalation_intent(state, review_id).await
         {
-            tracing::warn!(%error, %run_id, "held decision escalation failed after commit");
-        }
-        if gateway_status == "blocked_unverified_product_claim" {
-            let candidate = crate::knowledge_wiki::gap_signals::GapSignalCandidate::recall_miss_from_product_block(
-                inbound.content.clone(),
-            );
-            if let Err(error) = crate::knowledge_wiki::gap_signals::persist_recall_signal(
-                &state.db,
-                &contact.workspace_id,
-                candidate,
-            )
-            .await
-            {
-                tracing::warn!(%error, %run_id, "product-claim gap signal persistence failed");
-            }
-        }
-    } else if let Some(request) = decision
-        .escalation_request
-        .as_ref()
-        .filter(|request| request.needed)
-    {
-        if let Err(error) = trigger_principal_escalation(state, contact, request).await {
-            tracing::warn!(%error, %run_id, "principal escalation failed after commit");
+            tracing::warn!(%error, %run_id, %review_id, "durable principal escalation intent wake failed");
         }
     }
 
-    if let Ok(asset_ids) = receipt.details.get_array("principal_media_ids") {
-        for asset_id in asset_ids.iter().filter_map(Bson::as_str) {
-            let title = ObjectId::parse_str(asset_id)
-                .ok()
-                .and_then(|id| sendable_assets.iter().find(|asset| asset.id == Some(id)))
-                .map(|asset| asset.title.as_str())
-                .unwrap_or(asset_id);
-            let request = crate::models::EscalationRequest {
-                needed: true,
-                category: Some(crate::models::ESCALATION_CATEGORY_OUT_OF_SCOPE.to_string()),
-                reason: Some(format!("素材《{title}》标记为需领导核准后才能发送给客户")),
-                question_for_principal: Some(format!("是否同意把素材《{title}》发给该客户？")),
-                self_serviceable_part: None,
-                is_generalizable: false,
-            };
-            if let Err(error) = trigger_principal_escalation(state, contact, &request).await {
-                tracing::warn!(%error, %run_id, %asset_id, "principal media escalation failed");
-            }
+    if authorization.disposition != "authorized"
+        && gateway_status == "blocked_unverified_product_claim"
+    {
+        let candidate =
+            crate::knowledge_wiki::gap_signals::GapSignalCandidate::recall_miss_from_product_block(
+                inbound.content.clone(),
+            );
+        if let Err(error) = crate::knowledge_wiki::gap_signals::persist_recall_signal(
+            &state.db,
+            &contact.workspace_id,
+            candidate,
+        )
+        .await
+        {
+            tracing::warn!(%error, %run_id, "product-claim gap signal persistence failed");
         }
     }
 
@@ -2969,40 +2809,106 @@ fn run_user_operation_gateway_inner<'a>(
         &run_id,
     );
 
+    let mut first_generation_full = false;
     let (knowledge_route, decision_first, promote_risks_first) =
         if state.config.progressive_tier_enabled {
-            let lean_route = empty_knowledge_route(&initial_planner);
-            let lean_chunks: Vec<crate::models::OperationKnowledgeChunk> = Vec::new();
-            let lean_future = decide_reply_with_promote(
-                state,
-                &contact,
-                &inbound,
-                &recent_messages,
-                &pending_tasks,
-                playbook.as_ref(),
-                domain_config.as_ref(),
-                &runtime,
-                &memory,
-                &context_pack,
-                &lean_chunks,
-                &lean_route,
-                None,
-                Some(&run_id),
-                None,
-                crate::agent::sufficiency::PromptTier::Lean,
-                Some(DecisionRunSnapshot {
-                    active_profile: &active_profile,
-                    active_products: &active_products,
-                    published_soul: published_soul.as_deref(),
-                    sendable_assets: &sendable_assets,
-                    referral_cards: &referral_cards,
-                    reply_prompts: &reply_prompts,
-                    reply_context: &reply_context,
-                    authority: &authority,
-                }),
-            );
-            let (route, first) = tokio::try_join!(route_future, lean_future)?;
-            (route, first.0, first.1)
+            // Resolve the typed Knowledge hand-off before choosing the first Reply tier. A
+            // Lean result cannot be used when the Knowledge Agent has already selected a
+            // business-context hand-off or supplied real verified citations; running Lean in
+            // parallel would spend a call whose output is necessarily discarded.
+            let route = route_future.await?;
+            let route_chunks = select_operation_knowledge_chunks(&operation_knowledge.chunks, &route);
+            authority.append_verified_knowledge(
+                &route_chunks,
+                &route_used_knowledge_ids(&route),
+                DateTime::now(),
+            )?;
+            let route_needs_full = crate::agent::knowledge_router::route_requires_full_context(&route)
+                || !route_used_knowledge_ids(&route).is_empty();
+            if route_needs_full {
+                first_generation_full = true;
+                write_event_for_account(
+                    state,
+                    &contact.workspace_id,
+                    &contact.account_id,
+                    Some(&contact.wxid),
+                    "ptier_lean_skipped",
+                    "info",
+                    "知识路由已语义判断需要完整业务上下文，跳过无效 Lean 首程",
+                    Some(doc! {
+                        "run_id": &run_id,
+                        "knowledge_coverage": &route.knowledge_coverage,
+                        "selected_chunk_count": route.selected_chunk_ids.len() as i32,
+                        "selected_knowledge_count": route.selected_knowledge_ids.len() as i32,
+                        "resolution": to_document(&route.resolution).unwrap_or_default(),
+                    }),
+                )
+                .await
+                .ok();
+                let first = decide_reply_with_promote(
+                    state,
+                    &contact,
+                    &inbound,
+                    &recent_messages,
+                    &pending_tasks,
+                    playbook.as_ref(),
+                    domain_config.as_ref(),
+                    &runtime,
+                    &memory,
+                    &context_pack,
+                    &route_chunks,
+                    &route,
+                    None,
+                    Some(&run_id),
+                    None,
+                    crate::agent::sufficiency::PromptTier::Full,
+                    Some(DecisionRunSnapshot {
+                        active_profile: &active_profile,
+                        active_products: &active_products,
+                        published_soul: published_soul.as_deref(),
+                        sendable_assets: &sendable_assets,
+                        referral_cards: &referral_cards,
+                        reply_prompts: &reply_prompts,
+                        reply_context: &reply_context,
+                        authority: &authority,
+                    }),
+                )
+                .await?;
+                (route, first.0, first.1)
+            } else {
+                let lean_route = empty_knowledge_route(&initial_planner);
+                let lean_chunks: Vec<crate::models::OperationKnowledgeChunk> = Vec::new();
+                let first = decide_reply_with_promote(
+                    state,
+                    &contact,
+                    &inbound,
+                    &recent_messages,
+                    &pending_tasks,
+                    playbook.as_ref(),
+                    domain_config.as_ref(),
+                    &runtime,
+                    &memory,
+                    &context_pack,
+                    &lean_chunks,
+                    &lean_route,
+                    None,
+                    Some(&run_id),
+                    None,
+                    crate::agent::sufficiency::PromptTier::Lean,
+                    Some(DecisionRunSnapshot {
+                        active_profile: &active_profile,
+                        active_products: &active_products,
+                        published_soul: published_soul.as_deref(),
+                        sendable_assets: &sendable_assets,
+                        referral_cards: &referral_cards,
+                        reply_prompts: &reply_prompts,
+                        reply_context: &reply_context,
+                        authority: &authority,
+                    }),
+                )
+                .await?;
+                (route, first.0, first.1)
+            }
         } else {
             // Kill switch retains the established Knowledge -> Full serial ordering because Full
             // prompt bytes consume the selected knowledge and route metadata.
@@ -3046,13 +2952,8 @@ fn run_user_operation_gateway_inner<'a>(
         };
     let selected_chunks =
         select_operation_knowledge_chunks(&operation_knowledge.chunks, &knowledge_route);
-    if state.config.progressive_tier_enabled {
-        authority.append_verified_knowledge(
-            &selected_chunks,
-            &route_used_knowledge_ids(&knowledge_route),
-            DateTime::now(),
-        )?;
-    }
+    // In progressive mode the route-selected evidence was appended before the first tier was
+    // chosen; the non-progressive branch appended it while constructing its Full generation.
     mark_run_envelope_running(
         &state.db,
         &run_id,
@@ -3082,7 +2983,20 @@ fn run_user_operation_gateway_inner<'a>(
     }
 
     // 充分性自评判定：决定直接进闸 / 升档第二程 / 澄清。
-    let tier_decision = crate::agent::sufficiency::decide_tier_escalation(&decision_first);
+    let tier_decision = if first_generation_full {
+        // A typed Knowledge hand-off already selected Full for the first Reply pass. Do not
+        // spend another Full generation merely because the Full output itself reports that more
+        // context would be useful; review/claim gates still decide whether the resulting action
+        // is authorized.
+        match crate::agent::sufficiency::decide_tier_escalation(&decision_first) {
+            crate::agent::sufficiency::TierDecision::Escalate(_) => {
+                crate::agent::sufficiency::TierDecision::Enough
+            }
+            other => other,
+        }
+    } else {
+        crate::agent::sufficiency::decide_tier_escalation(&decision_first)
+    };
 
     // 块B：预求值升档标志(供 match 后 run tier 元信息与 used_knowledge_ids 口径判断,
     // 避免 tier_decision 被 match 消费后作用域问题)。
@@ -3144,7 +3058,10 @@ fn run_user_operation_gateway_inner<'a>(
 
     let (mut decision, promote_risks) = match tier_decision {
         crate::agent::sufficiency::TierDecision::Enough => {
-            if state.config.progressive_tier_enabled && forced_full_reason.is_some() {
+            if state.config.progressive_tier_enabled
+                && !first_generation_full
+                && forced_full_reason.is_some()
+            {
                 // Lean cannot consume business context. Independent knowledge/referral evidence or
                 // Lean's own knowledge declaration therefore triggers one Full regeneration. Full
                 // still owns the business decision; this branch never selects a chunk or card.
@@ -3337,7 +3254,7 @@ fn run_user_operation_gateway_inner<'a>(
         }
     };
     // run tier 元信息(不碰 models.rs,走事件;tier_used: forced_full→full / escalated→escalated / 否则 lean)。
-    let tier_used = if forced_full {
+    let tier_used = if forced_full || first_generation_full {
         "full"
     } else if escalated {
         "escalated"
@@ -3379,8 +3296,10 @@ fn run_user_operation_gateway_inner<'a>(
     apply_confidence_override(&mut initial_turn_planner, &decision, &runtime);
     normalize_decision_runtime(&mut decision, &initial_turn_planner);
     decision.context_pack_version = Some(next_memory_card_version(&memory));
-    let first_generation_used_full_context =
-        !state.config.progressive_tier_enabled || forced_full || escalated_to_full;
+    let first_generation_used_full_context = !state.config.progressive_tier_enabled
+        || forced_full
+        || first_generation_full
+        || escalated_to_full;
     decision.used_knowledge_ids = if first_generation_used_full_context {
         route_used_knowledge_ids(&knowledge_route)
     } else {
@@ -3502,7 +3421,6 @@ fn run_user_operation_gateway_inner<'a>(
         &context_pack,
         &active_profile,
         &active_products,
-        &sendable_assets,
         &recent_messages,
         &knowledge_route,
         &turn_outcome,
@@ -6489,7 +6407,7 @@ mod tests {
             is_generalizable: false,
         });
 
-        let request = explicit_principal_escalation_request(&decision)
+        let request = escalation::explicit_principal_escalation_request(&decision)
             .expect("完整的结构化请示不应因后续 held 被丢弃");
         assert_eq!(
             request.category.as_deref(),
@@ -6509,7 +6427,7 @@ mod tests {
             is_generalizable: false,
         });
 
-        assert!(explicit_principal_escalation_request(&decision).is_none());
+        assert!(escalation::explicit_principal_escalation_request(&decision).is_none());
     }
 
     // 客户回应保障守卫判定纯函数（黑名单语义）：

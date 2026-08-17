@@ -466,7 +466,6 @@ pub(crate) async fn route_operation_knowledge(
         knowledge,
         run_id,
         false,
-        inbound.is_synthetic_relay,
         KnowledgeRoutePurpose::GeneratedReply,
     )
     .await
@@ -495,7 +494,6 @@ pub(crate) async fn route_operation_knowledge_for_existing_candidate(
         knowledge,
         run_id,
         false,
-        true,
         KnowledgeRoutePurpose::ExistingCandidate,
     )
     .await
@@ -523,7 +521,6 @@ pub(crate) async fn route_operation_knowledge_preview(
         knowledge,
         run_id,
         false,
-        true,
         KnowledgeRoutePurpose::PreviewOnly,
     )
     .await
@@ -549,7 +546,6 @@ pub(crate) async fn route_operation_knowledge_read_only(
         knowledge,
         run_id,
         true,
-        false,
         KnowledgeRoutePurpose::GeneratedReply,
     )
     .await
@@ -577,57 +573,6 @@ impl KnowledgeRoutePurpose {
     }
 }
 
-/// Cheap conservative prefilter for optional Knowledge Agent work. A positive result
-/// only means "possibly relevant" and still requires the full Agent citation path. A zero
-/// result may skip optional reasoning, but never creates evidence or authorizes a claim.
-fn knowledge_has_local_relevance(
-    message: &str,
-    chunks: &[OperationKnowledgeChunk],
-    now: DateTime,
-) -> bool {
-    let query = message.trim();
-    !query.is_empty()
-        && chunks.iter().any(|chunk| {
-            super::knowledge_agent::rank_key(query, chunk, now).effective_relevance_micros > 0
-        })
-}
-
-/// Preserve semantic retrieval for short context-dependent follow-ups such as
-/// “多少钱？” or “那它呢”. Only the immediately preceding distinct message is
-/// consulted, so an old product discussion cannot keep unrelated social turns on
-/// the expensive path indefinitely.
-fn knowledge_prefilter_requires_agent(
-    current_message: &str,
-    recent_messages: &[ConversationMessage],
-    chunks: &[OperationKnowledgeChunk],
-    now: DateTime,
-) -> bool {
-    if knowledge_has_local_relevance(current_message, chunks, now) {
-        return true;
-    }
-    let current = current_message.trim();
-    // Short follow-ups can depend on the immediately preceding turn. Do not classify them with a
-    // natural-language marker list; the Knowledge Agent decides relevance after this cheap shape
-    // check and the full citation path still authorizes every factual claim.
-    if current.is_empty() || current.chars().count() > 12 {
-        return false;
-    }
-
-    let mut ordered = recent_messages.iter().collect::<Vec<_>>();
-    ordered.sort_by(|left, right| {
-        right
-            .created_at
-            .timestamp_millis()
-            .cmp(&left.created_at.timestamp_millis())
-            .then_with(|| right.id.cmp(&left.id))
-    });
-    ordered
-        .into_iter()
-        .map(|message| message.content.trim())
-        .find(|content| !content.is_empty() && *content != current)
-        .is_some_and(|previous| knowledge_has_local_relevance(previous, chunks, now))
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn route_operation_knowledge_inner(
     state: &AppState,
@@ -639,7 +584,6 @@ async fn route_operation_knowledge_inner(
     knowledge: &KnowledgeRuntime,
     run_id: Option<&str>,
     read_only: bool,
-    force_agent: bool,
     purpose: KnowledgeRoutePurpose,
 ) -> AppResult<KnowledgeRouteResult> {
     if knowledge.documents.is_empty() && knowledge.chunks.is_empty() {
@@ -655,37 +599,11 @@ async fn route_operation_knowledge_inner(
         &inbound.content,
         inbound.is_synthetic_relay,
     );
-    if !force_agent
-        && !knowledge.chunks.is_empty()
-        && !knowledge_prefilter_requires_agent(
-            &current_message,
-            recent_messages,
-            &knowledge.chunks,
-            DateTime::now(),
-        )
-    {
-        return Ok(KnowledgeRouteResult {
-            risk_level: "low".to_string(),
-            knowledge_coverage: "not_required".to_string(),
-            reason: "当前消息与 verified 知识语料无本地相关信号，跳过可选多轮知识推理".to_string(),
-            resolution: KnowledgeResolution {
-                answerability: KnowledgeAnswerability::NotRequired,
-                required_authority: KnowledgeRequiredAuthority::None,
-                recommended_next_step: KnowledgeNextStep::Respond,
-                ..Default::default()
-            },
-            tool_trace: vec![doc! {
-                "tool": "knowledge.skip",
-                "reason": "zero_local_relevance",
-            }],
-            ..Default::default()
-        });
-    }
-
     // ── Agent-first 渐进式披露 ──────────────────────────────────────────
     // 把"运营消息上下文"折成 query 喂给 knowledge_agent，让它自己 list_catalog
-    // → open_chunk → follow_relations → answer。本路径完全不再做硬关键词匹配；
-    // 所有命中都来自 LLM 决策，运行时只读、不写 chunk。
+    // → open_chunk → follow_relations → answer。运行时不再以本地相关性或词表
+    // 预判是否需要知识；是否相关、是否需要证据以及下一步动作全部由 Knowledge
+    // Agent 依据完整上下文语义判断，运行时只负责预算、权限和证据约束。
     let history_block = recent_messages
         .iter()
         .rev()
@@ -1105,16 +1023,47 @@ pub(crate) fn route_requires_full_context(route: &KnowledgeRouteResult) -> bool 
     )
 }
 
-/// Whether the Knowledge Agent coherently selected the configured principal capability.
+/// A coherent, closed semantic hand-off selected by the Knowledge Agent.
 ///
-/// Requiring all three typed dimensions prevents one malformed enum from becoming an action. The
-/// actual channel configuration and final customer-facing decision are checked separately.
-pub(crate) fn route_requests_principal(route: &KnowledgeRouteResult) -> bool {
-    matches!(
+/// The runtime may validate that the Reply Agent materialized one of these actions, but it never
+/// derives a hand-off from customer text. Unknown or internally inconsistent enum combinations
+/// deliberately produce no hand-off and remain subject to the ordinary independent review path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KnowledgeHandoffKind {
+    ClarifyCustomer,
+    AskPrincipal,
+    DeferLicensedProfessional,
+    DeferExternalSystem,
+}
+
+pub(crate) fn coherent_knowledge_handoff(
+    route: &KnowledgeRouteResult,
+) -> Option<KnowledgeHandoffKind> {
+    if !matches!(
         route.resolution.answerability,
         KnowledgeAnswerability::PartiallySupported | KnowledgeAnswerability::Unsupported
-    ) && route.resolution.required_authority == KnowledgeRequiredAuthority::AuthorizedOperator
-        && route.resolution.recommended_next_step == KnowledgeNextStep::AskPrincipal
+    ) {
+        return None;
+    }
+
+    match (
+        route.resolution.required_authority,
+        route.resolution.recommended_next_step,
+    ) {
+        (KnowledgeRequiredAuthority::Customer, KnowledgeNextStep::ClarifyCustomer) => {
+            Some(KnowledgeHandoffKind::ClarifyCustomer)
+        }
+        (KnowledgeRequiredAuthority::AuthorizedOperator, KnowledgeNextStep::AskPrincipal) => {
+            Some(KnowledgeHandoffKind::AskPrincipal)
+        }
+        (KnowledgeRequiredAuthority::LicensedProfessional, KnowledgeNextStep::Defer) => {
+            Some(KnowledgeHandoffKind::DeferLicensedProfessional)
+        }
+        (KnowledgeRequiredAuthority::ExternalSystem, KnowledgeNextStep::Defer) => {
+            Some(KnowledgeHandoffKind::DeferExternalSystem)
+        }
+        _ => None,
+    }
 }
 
 /// 把 route 的选中集折成 `decision.used_knowledge_ids`——即**可用于产品事实背书**
@@ -1252,22 +1201,8 @@ pub(crate) async fn write_knowledge_usage_log(
 }
 
 #[cfg(test)]
-mod local_relevance_prefilter_tests {
-    use super::{
-        knowledge_has_local_relevance, knowledge_prefilter_requires_agent, KnowledgeRoutePurpose,
-    };
-    use crate::models::{ConversationMessage, MessageDirection, OperationKnowledgeChunk};
-    use mongodb::bson::{DateTime, Document};
-
-    fn chunk(title: &str, body: &str) -> OperationKnowledgeChunk {
-        OperationKnowledgeChunk {
-            title: title.to_string(),
-            body: Some(body.to_string()),
-            integrity_status: Some("verified".to_string()),
-            status: "active".to_string(),
-            ..Default::default()
-        }
-    }
+mod route_budget_tests {
+    use super::KnowledgeRoutePurpose;
 
     #[test]
     fn route_purpose_reserves_only_its_actual_downstream_stages() {
@@ -1309,78 +1244,6 @@ mod local_relevance_prefilter_tests {
             ),
             5
         );
-    }
-
-    #[test]
-    fn unrelated_social_message_skips_optional_reasoning() {
-        let chunks = vec![chunk("年度会员价格", "年度会员售价与续费政策")];
-        assert!(!knowledge_has_local_relevance(
-            "今晚早点休息，晚安",
-            &chunks,
-            DateTime::now(),
-        ));
-    }
-
-    #[test]
-    fn product_question_keeps_semantic_reasoning() {
-        let chunks = vec![chunk("年度会员价格", "年度会员售价与续费政策")];
-        assert!(knowledge_has_local_relevance(
-            "年度会员续费多少钱？",
-            &chunks,
-            DateTime::now(),
-        ));
-    }
-
-    #[test]
-    fn empty_message_never_fabricates_relevance() {
-        let chunks = vec![chunk("年度会员价格", "年度会员售价与续费政策")];
-        assert!(!knowledge_has_local_relevance(
-            "  ",
-            &chunks,
-            DateTime::now()
-        ));
-    }
-
-    fn message(at: i64, content: &str) -> ConversationMessage {
-        ConversationMessage {
-            id: None,
-            workspace_id: "ws".to_string(),
-            account_id: "acc".to_string(),
-            contact_wxid: "wxid".to_string(),
-            message_id: Some(format!("m-{at}")),
-            dedupe_key: None,
-            direction: MessageDirection::Inbound,
-            content: content.to_string(),
-            msg_type: None,
-            media_ref: None,
-            raw: Some(Document::new()),
-            is_synthetic_relay: false,
-            created_at: DateTime::from_millis(at),
-        }
-    }
-
-    #[test]
-    fn short_price_followup_uses_immediate_relevant_context() {
-        let chunks = vec![chunk("年度会员价格", "年度会员售价与续费政策")];
-        let recent = vec![message(10, "我想了解年度会员"), message(20, "多少钱？")];
-        assert!(knowledge_prefilter_requires_agent(
-            "多少钱？",
-            &recent,
-            &chunks,
-            DateTime::now(),
-        ));
-    }
-
-    #[test]
-    fn short_turn_rechecks_immediate_context_without_phrase_classification() {
-        let chunks = vec![chunk("年度会员价格", "年度会员售价与续费政策")];
-        let recent = vec![message(10, "我想了解年度会员"), message(20, "晚安")];
-        assert!(knowledge_prefilter_requires_agent(
-            "晚安",
-            &recent,
-            &chunks,
-            DateTime::now(),
-        ));
     }
 }
 
@@ -1840,7 +1703,44 @@ mod tests {
         };
 
         assert!(route_requires_full_context(&route));
-        assert!(route_requests_principal(&route));
+        assert_eq!(
+            coherent_knowledge_handoff(&route),
+            Some(KnowledgeHandoffKind::AskPrincipal)
+        );
+        assert_eq!(
+            coherent_knowledge_handoff(&route),
+            Some(KnowledgeHandoffKind::AskPrincipal)
+        );
+    }
+
+    #[test]
+    fn typed_resolution_distinguishes_customer_and_defer_handoffs() {
+        let mut route = KnowledgeRouteResult {
+            resolution: KnowledgeResolution {
+                answerability: KnowledgeAnswerability::Unsupported,
+                required_authority: KnowledgeRequiredAuthority::Customer,
+                recommended_next_step: KnowledgeNextStep::ClarifyCustomer,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            coherent_knowledge_handoff(&route),
+            Some(KnowledgeHandoffKind::ClarifyCustomer)
+        );
+
+        route.resolution.required_authority = KnowledgeRequiredAuthority::LicensedProfessional;
+        route.resolution.recommended_next_step = KnowledgeNextStep::Defer;
+        assert_eq!(
+            coherent_knowledge_handoff(&route),
+            Some(KnowledgeHandoffKind::DeferLicensedProfessional)
+        );
+
+        route.resolution.required_authority = KnowledgeRequiredAuthority::ExternalSystem;
+        assert_eq!(
+            coherent_knowledge_handoff(&route),
+            Some(KnowledgeHandoffKind::DeferExternalSystem)
+        );
     }
 
     #[test]
@@ -1854,11 +1754,25 @@ mod tests {
             },
             ..Default::default()
         };
-        assert!(!route_requests_principal(&route));
+        assert_eq!(coherent_knowledge_handoff(&route), None);
+        assert_ne!(
+            coherent_knowledge_handoff(&route),
+            Some(KnowledgeHandoffKind::AskPrincipal)
+        );
 
         route.resolution.required_authority = KnowledgeRequiredAuthority::AuthorizedOperator;
         route.resolution.answerability = KnowledgeAnswerability::Supported;
-        assert!(!route_requests_principal(&route));
+        assert_eq!(coherent_knowledge_handoff(&route), None);
+        assert_ne!(
+            coherent_knowledge_handoff(&route),
+            Some(KnowledgeHandoffKind::AskPrincipal)
+        );
+
+        assert_eq!(
+            coherent_knowledge_handoff(&KnowledgeRouteResult::default()),
+            None,
+            "empty or legacy routes must not invent a semantic hand-off"
+        );
     }
 
     /// 缺字段的历史 route 文档（R11 反序列化安全）按「非回填」处理，行为与本改动前一致。

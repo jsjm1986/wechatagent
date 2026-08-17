@@ -28,6 +28,7 @@ pub(crate) mod authority;
 pub(crate) mod bayesian_slots;
 mod budget;
 mod chat_tool_loop;
+pub(crate) mod commitment_lifecycle;
 pub(crate) mod consolidation_window;
 mod decision;
 mod decision_taxonomy;

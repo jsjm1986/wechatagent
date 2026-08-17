@@ -159,6 +159,15 @@ export type ContactCommitment = {
   text: string;
   dueAt?: string | null;
   createdAt?: string | null;
+  status: "pending_delivery" | "active" | "fulfilled" | "cancelled" | "superseded" | "expired" | "legacy_unverified";
+  fulfilledAt?: string | null;
+  cancelledAt?: string | null;
+  supersededAt?: string | null;
+  expiredAt?: string | null;
+  supersededBy?: string | null;
+  lifecycleUpdatedAt?: string | null;
+  lifecycleReason?: string | null;
+  lifecycleSourceId?: string | null;
 };
 
 export type Message = {

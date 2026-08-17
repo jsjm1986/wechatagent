@@ -21,7 +21,11 @@ mod common;
 use std::time::Duration;
 
 use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
+use wechatagent::agent::run_envelope::{
+    write_run_envelope_started, LIFECYCLE_ABORTED_BY_EXTERNAL_SIGNAL, SOURCE_KIND_FOLLOW_UP_TASK,
+};
 use wechatagent::models::AgentTask;
+use wechatagent::tasks::TaskClaim;
 use wechatagent::webhooks::DURABLE_INBOUND_REPLY_KIND;
 
 /// 构造一个 running 任务文档（含 claim_token / claim_generation lease 字段——
@@ -100,6 +104,26 @@ async fn stale_running_task_is_recovered_to_retry() {
     // task_claim_timeout_seconds = 5（来自 TestApp 配置）；claimed_at 设为 1 小时前必定超时。
     let one_hour_ago_ms = DateTime::now().timestamp_millis() - 60 * 60 * 1000;
     let (task_id, raw) = running_task_doc(one_hour_ago_ms, 0);
+    let claim_token = raw.get_str("claim_token").expect("claim token").to_string();
+    let claim = TaskClaim {
+        task_id,
+        claim_token,
+        claim_generation: 1,
+    };
+    let run_id = format!("stale-task-run-{}", task_id.to_hex());
+    write_run_envelope_started(
+        &app.state.db,
+        &run_id,
+        "default",
+        "default",
+        Some("user_stale"),
+        &task_id.to_hex(),
+        SOURCE_KIND_FOLLOW_UP_TASK,
+        "follow_up",
+        Some(&claim),
+    )
+    .await
+    .expect("insert task-bound run envelope");
     insert_raw_task(&app, raw).await;
 
     // 驱动真实 worker：首次 tick 立即执行（reclaim 在 due 扫描之前）。
@@ -118,6 +142,24 @@ async fn stale_running_task_is_recovered_to_retry() {
     assert!(recovered.get("claimed_at").is_none(), "claimed_at unset");
     assert!(recovered.get("claim_token").is_none(), "claim_token unset");
     assert!(recovered.get_datetime("next_retry_at").is_ok());
+
+    let run = app
+        .state
+        .db
+        .agent_run_logs()
+        .clone_with_type::<Document>()
+        .find_one(doc! { "run_id": &run_id }, None)
+        .await
+        .expect("query run envelope")
+        .expect("run envelope present");
+    assert_eq!(
+        run.get_str("lifecycle").unwrap_or_default(),
+        LIFECYCLE_ABORTED_BY_EXTERNAL_SIGNAL
+    );
+    assert_eq!(
+        run.get_str("status").unwrap_or_default(),
+        "stale_task_claim"
+    );
 
     // 回收事件已落审计流。
     let event = app
@@ -161,6 +203,84 @@ async fn fresh_running_task_with_recent_claim_is_skipped() {
     assert_eq!(fresh.get_str("status").unwrap_or_default(), "running");
     assert_eq!(fresh.get_i32("claim_recovery_count").unwrap_or(-1), 0);
     assert!(fresh.get("claimed_at").is_some(), "lease intact");
+}
+
+#[tokio::test]
+#[ignore]
+async fn stale_envelope_reconciliation_keeps_the_current_claim_open() {
+    let app = common::TestApp::start().await;
+    let now_ms = DateTime::now().timestamp_millis();
+    let (task_id, raw) = running_task_doc(now_ms, 0);
+    let current_token = raw
+        .get_str("claim_token")
+        .expect("current token")
+        .to_string();
+    insert_raw_task(&app, raw).await;
+
+    let old_claim = TaskClaim {
+        task_id,
+        claim_token: "old-owner".to_string(),
+        claim_generation: 0,
+    };
+    let current_claim = TaskClaim {
+        task_id,
+        claim_token: current_token,
+        claim_generation: 1,
+    };
+    for (run_id, claim) in [
+        ("stale-owner-envelope", &old_claim),
+        ("current-owner-envelope", &current_claim),
+    ] {
+        write_run_envelope_started(
+            &app.state.db,
+            run_id,
+            "default",
+            "default",
+            Some("user_stale"),
+            &task_id.to_hex(),
+            SOURCE_KIND_FOLLOW_UP_TASK,
+            "follow_up",
+            Some(claim),
+        )
+        .await
+        .expect("insert task envelope");
+        app.state
+            .db
+            .agent_run_logs()
+            .clone_with_type::<Document>()
+            .update_one(
+                doc! { "run_id": run_id },
+                doc! { "$set": { "created_at": DateTime::from_millis(now_ms - 60_000) } },
+                None,
+            )
+            .await
+            .expect("age run envelope");
+    }
+
+    let closed = wechatagent::agent::run_envelope::reconcile_stale_task_run_envelopes(
+        &app.state.db,
+        DateTime::from_millis(now_ms - 5_000),
+    )
+    .await
+    .expect("reconcile stale envelopes");
+    assert_eq!(closed, 1);
+
+    let runs = app.state.db.agent_run_logs().clone_with_type::<Document>();
+    let old = runs
+        .find_one(doc! { "run_id": "stale-owner-envelope" }, None)
+        .await
+        .expect("query old envelope")
+        .expect("old envelope present");
+    let current = runs
+        .find_one(doc! { "run_id": "current-owner-envelope" }, None)
+        .await
+        .expect("query current envelope")
+        .expect("current envelope present");
+    assert_eq!(
+        old.get_str("lifecycle").unwrap_or_default(),
+        LIFECYCLE_ABORTED_BY_EXTERNAL_SIGNAL
+    );
+    assert_eq!(current.get_str("lifecycle").unwrap_or_default(), "started");
 }
 
 #[tokio::test]

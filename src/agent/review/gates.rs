@@ -83,6 +83,8 @@ pub(crate) fn build_reviewer_decision_view(decision: &AgentDecision) -> String {
         "runMode": decision.run_mode.clone(),
         "riskLevel": decision.risk_level.clone(),
         "knowledgeNeed": decision.knowledge_need.clone(),
+        "commitmentUpdates": mongodb::bson::to_bson(&decision.commitment_updates)
+            .unwrap_or(mongodb::bson::Bson::Array(Vec::new())),
         "semanticAssessment": semantic_assessment,
     })
     .unwrap_or_default()

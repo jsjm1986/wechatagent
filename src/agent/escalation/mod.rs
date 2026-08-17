@@ -26,6 +26,10 @@ pub async fn reconcile_pending_relay_intents(state: &AppState) -> AppResult<u64>
     ledger::reconcile_pending_relay_intents_once(state).await
 }
 
+pub async fn reconcile_principal_escalation_intents(state: &AppState) -> AppResult<u64> {
+    ledger::reconcile_principal_escalation_intents_once(state).await
+}
+
 pub async fn reconcile_principal_card_deliveries(state: &AppState) -> AppResult<u64> {
     ledger::reconcile_principal_card_deliveries_once(state).await
 }
@@ -34,7 +38,7 @@ use super::generate_agent_json;
 use super::outbox::{enqueue as outbox_enqueue, EnqueueOutcome, EnqueueRequest};
 use super::run_envelope::{SOURCE_KIND_FOLLOW_UP_TASK, SOURCE_KIND_PRINCIPAL_CLARIFICATION};
 use super::types::{AgentDecision, DecisionReviewResult};
-use crate::error::{AppError, AppResult};
+use crate::error::AppResult;
 use crate::models::{
     AgentDecisionReview, AgentPrincipalEscalation, AgentTask, Contact, OperationDomainConfig,
     PrincipalDecision, ESCALATION_CATEGORY_HIGH_RISK_GATED, EXEMPTION_TYPE_NONE,
@@ -42,7 +46,146 @@ use crate::models::{
 };
 use crate::prompts;
 use crate::routes::AppState;
-use mongodb::bson::{doc, DateTime};
+use mongodb::bson::{doc, to_document, DateTime, Document};
+
+pub(crate) const PRINCIPAL_INTENT_STATUS_PENDING: &str = "pending";
+pub(crate) const PRINCIPAL_INTENT_STATUS_PROCESSING: &str = "processing";
+pub(crate) const PRINCIPAL_INTENT_STATUS_RETRY: &str = "retry";
+pub(crate) const PRINCIPAL_INTENT_STATUS_MATERIALIZED: &str = "materialized";
+pub(crate) const PRINCIPAL_INTENT_STATUS_DEDUPLICATED: &str = "deduplicated";
+pub(crate) const PRINCIPAL_INTENT_STATUS_INVALID: &str = "invalid";
+
+/// Return the model-selected principal handoff only when its transport schema is
+/// complete. This validates structure, not customer wording or semantic intent.
+pub(crate) fn explicit_principal_escalation_request(
+    decision: &AgentDecision,
+) -> Option<&crate::models::EscalationRequest> {
+    decision.escalation_request.as_ref().filter(|request| {
+        request.needed
+            && request.category.as_deref().is_some_and(|category| {
+                crate::models::ALLOWED_ESCALATION_CATEGORY.contains(&category)
+            })
+            && request
+                .reason
+                .as_deref()
+                .is_some_and(|reason| !reason.trim().is_empty())
+            && request
+                .question_for_principal
+                .as_deref()
+                .is_some_and(|question| !question.trim().is_empty())
+    })
+}
+
+/// Freeze one durable ask-human intent into the decision review written by the
+/// production transaction. AI owns whether an explicit request is needed;
+/// deterministic code only supplies the configured held-decision fallback and
+/// merges approval-required media into the same recoverable request.
+pub(crate) fn build_principal_escalation_intent(
+    decision: &AgentDecision,
+    review: &DecisionReviewResult,
+    domain_config: Option<&OperationDomainConfig>,
+    authorization_disposition: &str,
+    blocked_status: &str,
+    principal_media_titles: &[String],
+    now: DateTime,
+) -> Option<Document> {
+    let media_is_relevant =
+        authorization_disposition == "authorized" && !principal_media_titles.is_empty();
+    let (mut request, mut source) =
+        if let Some(explicit) = explicit_principal_escalation_request(decision) {
+            (explicit.clone(), "explicit_model_request".to_string())
+        } else if authorization_disposition != "authorized"
+            && domain_config.is_some_and(|config| {
+                let policy = resolve_ask_human_policy(config);
+                should_escalate_held(blocked_status, &policy)
+            })
+        {
+            let reason = if !review.hold_reason.trim().is_empty() {
+                review.hold_reason.trim().to_string()
+            } else if !review.review_summary.trim().is_empty() {
+                review.review_summary.trim().to_string()
+            } else {
+                "当前回复涉及需要有权人员确认的业务边界".to_string()
+            };
+            (
+                crate::models::EscalationRequest {
+                    needed: true,
+                    category: Some(ESCALATION_CATEGORY_HIGH_RISK_GATED.to_string()),
+                    reason: Some(reason),
+                    question_for_principal: Some(format!(
+                        "请确认这次应采用的客户回复口径。当前暂停原因：{}。",
+                        labels::blocked_status_zh(blocked_status)
+                    )),
+                    self_serviceable_part: None,
+                    is_generalizable: false,
+                },
+                "held_decision_fallback".to_string(),
+            )
+        } else if media_is_relevant {
+            (
+                media_approval_request(principal_media_titles),
+                "principal_media_approval".to_string(),
+            )
+        } else {
+            return None;
+        };
+
+    if media_is_relevant && source != "principal_media_approval" {
+        append_media_approval(&mut request, principal_media_titles);
+        source.push_str("_with_media");
+    }
+
+    let request = to_document(&request).ok()?;
+    Some(doc! {
+        "protocol_version": 1i32,
+        "status": PRINCIPAL_INTENT_STATUS_PENDING,
+        "source": source,
+        "request": request,
+        "attempts": 0i64,
+        "claim_generation": 0i64,
+        "next_retry_at": now,
+        "created_at": now,
+        "updated_at": now,
+    })
+}
+
+fn media_approval_request(titles: &[String]) -> crate::models::EscalationRequest {
+    let names = media_title_summary(titles);
+    crate::models::EscalationRequest {
+        needed: true,
+        category: Some(crate::models::ESCALATION_CATEGORY_OUT_OF_SCOPE.to_string()),
+        reason: Some(format!("本轮拟发送的素材需要负责人核准：{names}")),
+        question_for_principal: Some(format!("是否同意向该客户发送这些素材：{names}？")),
+        self_serviceable_part: None,
+        is_generalizable: false,
+    }
+}
+
+fn append_media_approval(request: &mut crate::models::EscalationRequest, titles: &[String]) {
+    let names = media_title_summary(titles);
+    let media_reason = format!("本轮另有需核准素材：{names}");
+    let media_question = format!("同时请确认是否可以发送这些素材：{names}？");
+    request.reason = Some(match request.reason.as_deref().map(str::trim) {
+        Some(reason) if !reason.is_empty() => format!("{reason}；{media_reason}"),
+        _ => media_reason,
+    });
+    request.question_for_principal = Some(
+        match request.question_for_principal.as_deref().map(str::trim) {
+            Some(question) if !question.is_empty() => format!("{question} {media_question}"),
+            _ => media_question,
+        },
+    );
+}
+
+fn media_title_summary(titles: &[String]) -> String {
+    titles
+        .iter()
+        .map(|title| title.trim())
+        .filter(|title| !title.is_empty())
+        .take(8)
+        .collect::<Vec<_>>()
+        .join("、")
+}
 
 async fn enqueue_holding_reply(
     state: &AppState,
@@ -184,136 +327,6 @@ async fn enqueue_expired_relay_holding_reply(
         .await?;
     let _ = task;
     Ok(true)
-}
-
-/// hold→升级请示：被风险闸门拦下的高风险件，按 workspace 升级模式请示领导。
-///
-/// 与 `trigger_principal_escalation` 的区别：后者用于 approved 路径（占位已由 outbox 发出）；
-/// 本函数用于 hold 路径，只推领导卡 + 落 pending 台账 + 写 awaiting 标记，**不向客户发任何消息**。
-/// 客户侧的安抚占位由网关守卫 `ensure_customer_acknowledged` 统一负责（解耦"安抚客户"与
-/// "请示领导"：前者对任何 Inbound 零回复无条件补，后者受领导骚扰门 / 去重约束）。
-///
-/// 调用方对本函数错误只记 warn、不阻断 run、不改终态。
-pub(crate) async fn escalate_held_decision(
-    state: &AppState,
-    contact: &Contact,
-    review: &DecisionReviewResult,
-    final_decision: &AgentDecision,
-    domain_config: Option<&OperationDomainConfig>,
-    blocked_status: &str,
-) -> AppResult<()> {
-    let Some(domain_config) = domain_config else {
-        return Ok(());
-    };
-    let policy = crate::agent::escalation::resolve_ask_human_policy(domain_config);
-    if !should_escalate_held(blocked_status, &policy) {
-        return Ok(());
-    }
-    let frozen_policy = freeze_ask_human_policy(&policy, &contact.account_id);
-    let Some(decider) = frozen_policy.decider_chain.first() else {
-        return Ok(()); // 决策人链空 = 本 workspace 未启用请示通道
-    };
-    let principal_wxid = decider.wxid.clone();
-    let principal_account_id = decider
-        .account_id
-        .as_deref()
-        .ok_or_else(|| AppError::BadRequest("决策人缺少发送账号".into()))?
-        .to_string();
-    if principal_wxid == contact.wxid {
-        return Err(AppError::BadRequest(
-            "决策人配置等于客户 wxid，拒绝触发请示".into(),
-        ));
-    }
-    // 骚扰门：daily_push_cap / quiet_hours（None 配置全放行，字节等价）。
-    let now_ms = mongodb::bson::DateTime::now().timestamp_millis();
-    let since_ms = now_ms - 24 * 3600 * 1000;
-    let today = count_pushes_today(state, &contact.workspace_id, &principal_wxid, since_ms).await?;
-    let last_push = latest_push_ms(state, &contact.workspace_id, &principal_wxid).await?;
-    if !crate::agent::escalation::push_allowed(&policy, today, last_push, now_ms) {
-        // 骚扰门关：跳过推卡。此时 insert_pending_escalation 尚未执行——被拦的
-        // 请示不落 pending 台账；为免 admin 完全无感知，落一条 dedupe 审计事件
-        // （每客户每 UTC 日至多一条），best-effort 不阻断 hold 主链。
-        let event = crate::models::AgentEvent {
-            id: None,
-            workspace_id: contact.workspace_id.clone(),
-            account_id: contact.account_id.clone(),
-            contact_wxid: Some(contact.wxid.clone()),
-            kind: "escalation_suppressed_by_push_policy".to_string(),
-            status: "warning".to_string(),
-            summary: "hold 请示被推送保护策略拦截（今日 cap / 推送间隔 / 静默窗），未生成请示卡"
-                .to_string(),
-            details: Some(doc! {
-                "principalWxid": &principal_wxid,
-                "pushesToday": today,
-                "lastPushMs": last_push,
-                "nowMs": now_ms,
-            }),
-            created_at: mongodb::bson::DateTime::now(),
-            dedupe_key: Some(format!(
-                "escalation_suppressed:{}:{}",
-                contact.wxid,
-                now_ms / 86_400_000
-            )),
-        };
-        match state.db.events().insert_one(event, None).await {
-            Ok(_) => {}
-            Err(error) if crate::agent::escalation::is_duplicate_key_error(&error) => {}
-            Err(error) => {
-                tracing::warn!(?error, contact = %contact.wxid, "escalation suppression audit event write failed");
-            }
-        }
-        return Ok(());
-    }
-    // 去重：同客户同类别已有 pending → 不重复推卡骚扰领导。
-    if has_pending_for_contact(
-        state,
-        &contact.workspace_id,
-        &contact.account_id,
-        &contact.wxid,
-        ESCALATION_CATEGORY_HIGH_RISK_GATED,
-    )
-    .await?
-    {
-        return Ok(());
-    }
-    let reason = if !review.hold_reason.trim().is_empty() {
-        review.hold_reason.clone()
-    } else {
-        review.review_summary.clone()
-    };
-    let question = format!(
-        "该客户议题触发高风险闸门（{}），AI 暂不自行答复。拟答风险等级：{}。请领导定夺该如何回复。",
-        labels::blocked_status_zh(blocked_status),
-        labels::risk_level_zh(&final_decision.risk_level),
-    );
-    let customer_label = contact
-        .remark
-        .clone()
-        .or_else(|| contact.nickname.clone())
-        .or_else(|| contact.alias.clone())
-        .unwrap_or_else(|| contact.wxid.clone());
-    let Some(entry) = insert_pending_escalation(
-        state,
-        &contact.workspace_id,
-        &contact.account_id,
-        &contact.wxid,
-        ESCALATION_CATEGORY_HIGH_RISK_GATED,
-        &reason,
-        &question,
-        &principal_wxid,
-        false,
-        domain_config,
-        frozen_policy,
-        &principal_account_id,
-        &customer_label,
-    )
-    .await?
-    else {
-        // 并发已插入同客户同类别 pending（pending 去重索引兜住）→ 不重复推卡。
-        return Ok(());
-    };
-    materialize_principal_card_delivery(state, &entry).await?;
-    Ok(())
 }
 
 /// 处理 principal_decision_relay task：领导已裁决，把决策用 AI 口吻转述给客户。

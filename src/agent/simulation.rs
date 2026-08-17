@@ -20,6 +20,7 @@ use crate::routes::AppState;
 
 use super::appointment_request::validate_appointment_request;
 use super::budget::{RunBudget, RunBudgetSnapshot, RUN_BUDGET};
+use super::commitment_lifecycle::apply_commitment_updates_to_projection;
 use super::decision::{
     load_operation_playbook_for_contact, load_user_operation_domain_config_for_contact,
 };
@@ -231,6 +232,7 @@ impl SimulationProjection {
             }
         }
 
+        let mut replacement_commitment_id = None;
         if would_send {
             if let Some(text) = decision
                 .last_commitment
@@ -244,16 +246,17 @@ impl SimulationProjection {
                 if !already_present {
                     let mut commitment = CommitmentEntry::from_plain_text(text.to_string());
                     commitment.created_at = now;
-                    // The production commit writes this marker before transport delivery and
-                    // promotes it only after every text segment is confirmed sent. Keep the
-                    // simulation projection honest about that lifecycle boundary.
-                    commitment.status = "pending_delivery".to_string();
+                    // `would_send` represents the completed delivery boundary in a shadow turn.
+                    // Production briefly persists pending_delivery before transport confirms all
+                    // segments, then promotes the same row to active in its delivery finalizer.
+                    commitment.status = "active".to_string();
                     commitment.source_id = Some(turn_id.to_string());
                     if let Some(structured) = decision.commitment.as_ref() {
                         if structured.text.trim() == text {
                             commitment.due_at = parse_projection_datetime(&structured.due_at);
                         }
                     }
+                    replacement_commitment_id = Some(commitment.id.clone());
                     self.contact
                         .commitments
                         .push(CommitmentRepr::Structured(commitment));
@@ -261,9 +264,30 @@ impl SimulationProjection {
                         let remove = self.contact.commitments.len() - 8;
                         self.contact.commitments.drain(0..remove);
                     }
+                } else {
+                    replacement_commitment_id =
+                        self.contact
+                            .commitments
+                            .iter()
+                            .find_map(|commitment| match commitment {
+                                CommitmentRepr::Structured(entry)
+                                    if entry.source_id.as_deref() == Some(turn_id) =>
+                                {
+                                    Some(entry.id.clone())
+                                }
+                                _ => None,
+                            });
                 }
             }
         }
+        apply_commitment_updates_to_projection(
+            &mut self.contact.commitments,
+            &decision.commitment_updates,
+            replacement_commitment_id.as_deref(),
+            turn_id,
+            now,
+        )
+        .map_err(AppError::External)?;
         self.contact.updated_at = now;
         Ok(())
     }

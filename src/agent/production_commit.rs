@@ -25,6 +25,7 @@ use crate::tasks::TaskRunContext;
 use super::appointment_request::validate_appointment_request;
 use super::authority::AuthoritySnapshot;
 use super::budget::current_run_budget;
+use super::commitment_lifecycle::build_commitment_transition_mutations;
 use super::decision::{
     initial_operation_state_for_contact, load_operation_state_policy_for_contact,
 };
@@ -527,7 +528,11 @@ impl<'a> ProductionCommitter<'a> {
         let mut appointment_will_commit = plan.authorization.disposition == "authorized"
             && !duplicate_batch
             && prepared.appointment.is_some();
-        if !selected_outbox.is_empty() || appointment_will_commit {
+        let mut lifecycle_will_commit = plan.authorization.disposition == "authorized"
+            && !duplicate_batch
+            && selected_outbox.is_empty()
+            && !plan.draft.decision.commitment_updates.is_empty();
+        if !selected_outbox.is_empty() || appointment_will_commit || lifecycle_will_commit {
             let mut contact_filter = doc! {
                 "workspace_id": &self.inputs.contact.workspace_id,
                 "account_id": &self.inputs.contact.account_id,
@@ -586,6 +591,7 @@ impl<'a> ProductionCommitter<'a> {
                 selected_outbox.clear();
                 duplicate_batch = false;
                 appointment_will_commit = false;
+                lifecycle_will_commit = false;
                 terminal_status = self::terminal_status(plan, false, false);
                 gateway = gateway_result(&terminal_status, plan);
                 transaction_state_action_hold = Some(doc! {
@@ -611,6 +617,7 @@ impl<'a> ProductionCommitter<'a> {
                 selected_outbox.clear();
                 duplicate_batch = false;
                 appointment_will_commit = false;
+                lifecycle_will_commit = false;
                 terminal_status = self::terminal_status(plan, false, false);
                 gateway = gateway_result(&terminal_status, plan);
             } else if plan.authorization.disposition == "authorized" {
@@ -672,6 +679,7 @@ impl<'a> ProductionCommitter<'a> {
                         selected_outbox.clear();
                         duplicate_batch = false;
                         appointment_will_commit = false;
+                        lifecycle_will_commit = false;
                         terminal_status = self::terminal_status(plan, false, false);
                         gateway = gateway_result(&terminal_status, plan);
                         let actions = super::guards::reviewed_decision_actions(
@@ -782,6 +790,8 @@ impl<'a> ProductionCommitter<'a> {
         }
 
         let mut commitment_ids = Vec::new();
+        let mut lifecycle_transition_ids = Vec::new();
+        let mut lifecycle_stale_ids = Vec::new();
         if !selected_outbox.is_empty() {
             let mut update = doc! {
                 "$max": { "last_agent_run_at": now },
@@ -862,6 +872,55 @@ impl<'a> ProductionCommitter<'a> {
             mutation_count += 1;
         }
 
+        if lifecycle_will_commit {
+            let mutations = build_commitment_transition_mutations(
+                &self.inputs.contact.workspace_id,
+                &self.inputs.contact.account_id,
+                &self.inputs.contact.wxid,
+                &plan.draft.decision.commitment_updates,
+                None,
+                &prepared.decision_id.to_hex(),
+                now,
+            )
+            .map_err(AppError::External)?;
+            for mut mutation in mutations {
+                if let Some(id) = self.inputs.contact.id {
+                    mutation.filter.insert("_id", id);
+                }
+                let result = self
+                    .inputs
+                    .state
+                    .db
+                    .contacts()
+                    .update_one_with_session(mutation.filter, mutation.pipeline, None, session)
+                    .await?;
+                if result.matched_count == 1 {
+                    lifecycle_transition_ids.push(mutation.commitment_id);
+                    mutation_count += 1;
+                } else {
+                    // Another authorized turn may have terminalized the same active row first.
+                    // The stale transition remains auditable but must not invalidate this run.
+                    lifecycle_stale_ids.push(mutation.commitment_id);
+                }
+            }
+            self.inputs
+                .state
+                .db
+                .decision_reviews()
+                .clone_with_type::<Document>()
+                .update_one_with_session(
+                    doc! { "_id": prepared.decision_id },
+                    doc! { "$set": {
+                        "commitment_lifecycle_applied_at": now,
+                        "commitment_lifecycle_transition_ids": &lifecycle_transition_ids,
+                        "commitment_lifecycle_stale_ids": &lifecycle_stale_ids,
+                    } },
+                    None,
+                    session,
+                )
+                .await?;
+        }
+
         let mut outbox_ids = Vec::new();
         for entry in &selected_outbox {
             self.inputs
@@ -905,7 +964,10 @@ impl<'a> ProductionCommitter<'a> {
             .into());
         }
 
-        let receipt_status = if !selected_outbox.is_empty() || appointment_created {
+        let receipt_status = if !selected_outbox.is_empty()
+            || appointment_created
+            || !lifecycle_transition_ids.is_empty()
+        {
             "committed"
         } else if terminal_status == "no_reply" || duplicate_batch {
             "no_op"
@@ -931,6 +993,8 @@ impl<'a> ProductionCommitter<'a> {
                     .or_else(|| prepared.post_commit.state_action_hold.clone()),
                 "gateway_block": prepared.post_commit.gateway_block.clone(),
                 "appointment_created": appointment_created,
+                "commitment_lifecycle_transition_ids": lifecycle_transition_ids,
+                "commitment_lifecycle_stale_ids": lifecycle_stale_ids,
                 "projection_eligible": terminal_status == "outbox_enqueued" || terminal_status == "no_reply",
             },
         };
@@ -1390,6 +1454,8 @@ fn build_decision_review_document(
     let source_claim = inputs
         .task_context
         .and_then(|context| context.claim.as_ref());
+    let action_only_lifecycle_review =
+        !plan.draft.decision.should_reply && !plan.draft.decision.commitment_updates.is_empty();
     let review_row = AgentDecisionReview {
         id: Some(prepared.decision_id),
         workspace_id: inputs.contact.workspace_id.clone(),
@@ -1398,7 +1464,11 @@ fn build_decision_review_document(
         run_id: Some(plan.run_id.clone()),
         inbound_message_id: inputs.inbound.message_id.clone(),
         reply_text: non_empty(&plan.draft.decision.reply_text),
-        approved: review_passed(review, inputs.runtime),
+        approved: if action_only_lifecycle_review {
+            review.approved && !review.should_hold
+        } else {
+            review_passed(review, inputs.runtime)
+        },
         scores: to_document(&review.scores).unwrap_or_default(),
         formula_breakdown: review.formula_breakdown.clone(),
         risks: review.risks.clone(),
@@ -1447,6 +1517,29 @@ fn build_decision_review_document(
             vec![Bson::String(commitment.id.clone())],
         );
     }
+    if !plan.draft.decision.commitment_updates.is_empty() {
+        document.insert(
+            "commitment_lifecycle_updates",
+            mongodb::bson::to_bson(&plan.draft.decision.commitment_updates)?,
+        );
+        document.insert(
+            "commitment_lifecycle_source_id",
+            prepared.decision_id.to_hex(),
+        );
+        let timing = if status == "outbox_enqueued" {
+            "after_delivery"
+        } else if status == "no_reply" && plan.authorization.disposition == "authorized" {
+            "in_transaction"
+        } else {
+            "not_applied"
+        };
+        document.insert("commitment_lifecycle_timing", timing);
+        if commitment_persisted {
+            if let Some(commitment) = prepared.commitment.as_ref() {
+                document.insert("commitment_lifecycle_replacement_id", commitment.id.clone());
+            }
+        }
+    }
     // Projection is asynchronous and intentionally receives an analytical-only contract.  Freeze
     // the already-authorized operational controls in the same review row so a later model pass
     // cannot invent, remove, or reinterpret a state/cooldown side effect.
@@ -1468,6 +1561,33 @@ fn build_decision_review_document(
         {
             document.insert("covers_through_inbound_created_at", *created_at);
         }
+    }
+    let principal_media_titles = prepared
+        .principal_media
+        .iter()
+        .map(|asset_id| {
+            ObjectId::parse_str(asset_id)
+                .ok()
+                .and_then(|id| {
+                    inputs
+                        .sendable_assets
+                        .iter()
+                        .find(|asset| asset.id == Some(id))
+                })
+                .map(|asset| asset.title.clone())
+                .unwrap_or_else(|| asset_id.clone())
+        })
+        .collect::<Vec<_>>();
+    if let Some(intent) = super::escalation::build_principal_escalation_intent(
+        &plan.draft.decision,
+        review,
+        inputs.domain_config,
+        &plan.authorization.disposition,
+        status,
+        &principal_media_titles,
+        now,
+    ) {
+        document.insert("principal_escalation_intent", intent);
     }
     Ok(document)
 }

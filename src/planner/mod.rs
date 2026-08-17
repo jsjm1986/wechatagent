@@ -2585,7 +2585,12 @@ mod tests {
             status: "active".to_string(),
             fulfilled_at: None,
             cancelled_at: None,
+            superseded_at: None,
+            expired_at: None,
             superseded_by: None,
+            lifecycle_updated_at: None,
+            lifecycle_reason: None,
+            lifecycle_source_id: None,
             source_id: None,
             related_entity_id: None,
             extra: Document::new(),
@@ -2833,7 +2838,12 @@ mod tests {
             status: "active".to_string(),
             fulfilled_at: None,
             cancelled_at: None,
+            superseded_at: None,
+            expired_at: None,
             superseded_by: None,
+            lifecycle_updated_at: None,
+            lifecycle_reason: None,
+            lifecycle_source_id: None,
             source_id: None,
             related_entity_id: None,
             extra: Document::new(),
@@ -2903,7 +2913,12 @@ mod tests {
             status: "pending_delivery".to_string(),
             fulfilled_at: None,
             cancelled_at: None,
+            superseded_at: None,
+            expired_at: None,
             superseded_by: None,
+            lifecycle_updated_at: None,
+            lifecycle_reason: None,
+            lifecycle_source_id: None,
             source_id: None,
             related_entity_id: None,
             extra: Document::new(),
@@ -2913,6 +2928,30 @@ mod tests {
             ..template()
         };
         assert!(pick_commitment_emit_target(&contact, now, 8, 0).is_none());
+    }
+
+    #[test]
+    fn commitment_skips_every_terminal_lifecycle_status() {
+        let now = dt(10_000_000);
+        for status in ["fulfilled", "cancelled", "superseded", "expired"] {
+            let mut terminal = match entry(
+                &format!("terminal-{status}"),
+                "已终结承诺",
+                Some(dt(now.timestamp_millis() - 1_000)),
+            ) {
+                CommitmentRepr::Structured(entry) => entry,
+                CommitmentRepr::Plain(_) => unreachable!(),
+            };
+            terminal.status = status.to_string();
+            let contact = Contact {
+                commitments: vec![CommitmentRepr::Structured(terminal)],
+                ..template()
+            };
+            assert!(
+                pick_commitment_emit_target(&contact, now, 8, 0).is_none(),
+                "terminal status {status} must never emit"
+            );
+        }
     }
 
     /// commitment filter 只筛 commitments 非空。

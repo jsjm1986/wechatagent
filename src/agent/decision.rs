@@ -12,7 +12,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use futures::{future::BoxFuture, FutureExt};
-use mongodb::bson::{doc, to_document, DateTime, Document};
+use mongodb::bson::{doc, to_document, Bson, DateTime, Document};
 
 use crate::error::{AppError, AppResult};
 use crate::models::{
@@ -22,9 +22,13 @@ use crate::models::{
 use crate::prompts;
 use crate::routes::AppState;
 
+use super::commitment_lifecycle::{
+    active_commitments_for_prompt, format_active_commitments_for_prompt,
+};
 use super::generate_agent_json;
 use super::knowledge_router::{
-    format_operation_knowledge_for_prompt_with_roles, route_requests_principal,
+    coherent_knowledge_handoff, format_operation_knowledge_for_prompt_with_roles,
+    KnowledgeHandoffKind,
 };
 use super::memory::{
     format_operator_memory_for_reply_prompt, load_operator_memory, load_operator_memory_read_only,
@@ -887,8 +891,8 @@ pub(crate) async fn decide_reply_with_promote_context(
     let principal_channel_available = domain_config
         .map(super::escalation::resolve_ask_human_policy)
         .is_some_and(|policy| !policy.decider_chain.is_empty());
-    let principal_route_handoff_text = if include_business {
-        format_principal_route_handoff_for_prompt(knowledge_route, principal_channel_available)
+    let typed_route_handoff_text = if include_business {
+        format_typed_route_handoff_for_prompt(knowledge_route, principal_channel_available)
     } else {
         String::new()
     };
@@ -929,11 +933,18 @@ pub(crate) async fn decide_reply_with_promote_context(
     // memoryCard 字段已含这两项（context_pack 含 doNotDo/commitments 字段），无需重复
     // 注入；仅 Lean 档该字段被跳过，必须单独补一份精简安全子片。整段（含标题/换行）只在
     // Lean 档非空，Relational/Full 档空串 → 该安全子片在 Relational/Full 档不额外加字节。
-    let safety_donts_commitments_text = render_safety_donts_commitments(tier, context_pack);
+    let active_commitments = active_commitments_for_prompt(&contact.commitments);
+    let active_commitments_text = format_active_commitments_for_prompt(&contact.commitments);
+    let mut prompt_context_pack = context_pack.clone();
+    prompt_context_pack.insert(
+        "commitments",
+        mongodb::bson::to_bson(&active_commitments).unwrap_or_else(|_| Bson::Array(Vec::new())),
+    );
+    let safety_donts_commitments_text = render_safety_donts_commitments(tier, &prompt_context_pack);
     // 关系组：完整长期运营记忆 + 记忆卡片。Lean 跳过，空串占位。
     let memory_text = if include_relational {
         serde_json::to_string(&mongodb::bson::doc! {
-            "memoryCard": context_pack.clone(),
+            "memoryCard": prompt_context_pack.clone(),
             "userUnderstanding": memory.user_understanding.clone(),
             "relationshipState": memory.relationship_state.clone(),
             "productFit": memory.product_fit.clone(),
@@ -1101,6 +1112,11 @@ pub(crate) async fn decide_reply_with_promote_context(
 - 当 recommendedNextStep=ask_principal、requiredAuthority=authorized_operator 且本轮“请示通道信号”确认内部通道可用时，输出 nextStep=ask_principal 和完整 escalationRequest（needed=true、category=out_of_scope_decision、具体 reason 与 questionForPrincipal）；同时 shouldReply=true，用第一人称自然说明我正在核准、后续由我继续同步，绝不编造缺失事实，也不把客户转给幕后角色。
 - 当 recommendedNextStep=clarify_customer 时，只问一个真正能补齐 missingInformation 的客户问题；当 answerability=partially_supported 或 unsupported 时，不得把未被证据覆盖的部分写成确定结论。
 
+# 当前承诺生命周期
+- “当前有效承诺”只包含已经送达且 status=active 的结构化义务。commitmentUpdates 只能引用其中列出的 id；没有明确生命周期变化就输出空数组。
+- 语义由你根据完整对话判断，不按词或短语匹配：已经实际完成用 fulfilled；客户或有效业务决定明确取消用 cancelled；本轮新承诺替换旧承诺时对旧 id 用 superseded，并同时输出新的 lastCommitment/commitment；仅当 dueAt 已到且语境表明原义务窗口已失效时用 expired。
+- 不得把 pending、终态或不存在的承诺重新激活，不得虚构 id。每个更新都写一句具体 reason；运行时只负责验证 id、状态、时间与原子落库，不替你猜语义。
+
 # 人设呈现边界
 - Soul、业务目标、运营方法、可用工具和职责范围只用于决定你怎么做，绝不是可以向客户复述的自我介绍材料。不得用“身份标签 + 职责清单”的方式解释自己，也不得把配置里的行业、任务、转化目标或内部流程说给客户听。
 - 客户问你是谁、在做什么或为什么这样回复时，结合长期一致的人设和当前关系自然作答，像一个已经在微信里持续聊天的具体的人；少做身份宣告，多承接他此刻真正关心的事。任何具体身份、履历、地点和现实经历仍须有可信来源，不能为拟人化而临时编造。
@@ -1236,11 +1252,7 @@ pub(crate) async fn decide_reply_with_promote_context(
         String::new()
     };
     let commitments_text = if include_relational {
-        contact
-            .commitments
-            .last()
-            .map(|c| c.text().to_string())
-            .unwrap_or_default()
+        active_commitments_text
     } else {
         String::new()
     };
@@ -1309,7 +1321,7 @@ pub(crate) async fn decide_reply_with_promote_context(
 意向等级: {}
 购买生命周期: {}
 客户价值层级: {}
-最近承诺: {}
+当前有效承诺（仅这些 id 可用于 commitmentUpdates）: {}
 跟进策略: {}
 自由画像字段: {}
 可引用内容资产:
@@ -1395,7 +1407,7 @@ pub(crate) async fn decide_reply_with_promote_context(
             &inbound.content,
             inbound.is_synthetic_relay
         ),
-        principal_route_handoff_text,
+        typed_route_handoff_text,
         authorization_feedback_tail,
     );
 
@@ -1806,15 +1818,17 @@ pub(crate) fn format_knowledge_route_for_prompt(route: &KnowledgeRouteResult) ->
     serde_json::to_string(&value).unwrap_or_default()
 }
 
-/// Render the final, compact hand-off contract for a typed principal route.  This is deliberately
-/// derived only from the Knowledge Agent's closed enums and structured fields.  It does not inspect
-/// the customer's message and it does not ask the Reply Agent to repeat internal data to the
-/// customer; it only stabilizes the JSON action that the independent route already selected.
-pub(crate) fn format_principal_route_handoff_for_prompt(
+/// Render the final, compact hand-off contract for a coherent typed knowledge route. This is
+/// derived only from the Knowledge Agent's closed enums and structured fields; it never inspects
+/// customer text or asks the Reply Agent to expose internal control data.
+pub(crate) fn format_typed_route_handoff_for_prompt(
     route: &KnowledgeRouteResult,
     principal_channel_available: bool,
 ) -> String {
-    if !principal_channel_available || !route_requests_principal(route) {
+    let Some(handoff) = coherent_knowledge_handoff(route) else {
+        return String::new();
+    };
+    if handoff == KnowledgeHandoffKind::AskPrincipal && !principal_channel_available {
         return String::new();
     }
     let resolution = &route.resolution;
@@ -1825,8 +1839,22 @@ pub(crate) fn format_principal_route_handoff_for_prompt(
         "missingInformation": resolution.missing_information,
         "authorityQuestion": resolution.authority_question,
     });
+    let instruction = match handoff {
+        KnowledgeHandoffKind::ClarifyCustomer => {
+            "请将这个交接完整落成一个最终动作：nextStep=clarify、shouldReply=true，只问一个真正能补齐 missingInformation 的自然问题。不要附带请示、预约、承诺、跟进、素材或名片，也不要补写缺失事实。"
+        }
+        KnowledgeHandoffKind::AskPrincipal => {
+            "请将这个交接完整落成一个最终动作：nextStep=ask_principal、escalationRequest.needed=true、category=out_of_scope_decision，并填写具体 reason 与 questionForPrincipal；shouldReply=true，回复用第一人称自然承接。不要引用缺失事实。"
+        }
+        KnowledgeHandoffKind::DeferLicensedProfessional => {
+            "请将这个交接完整落成一个最终动作：nextStep=defer、shouldReply=true，清楚说明不能替代有资质专业判断，并给出具体的专业评估下一步。不要附带请示、预约确认、承诺、跟进、素材或名片，也不要输出未经证据支持的结论。"
+        }
+        KnowledgeHandoffKind::DeferExternalSystem => {
+            "请将这个交接完整落成一个最终动作：nextStep=defer、shouldReply=true，说明结论依赖当前记录或实时查询，并给出具体核验路径；不得假装查询已经发生。不要附带请示、预约确认、承诺、跟进、素材或名片。"
+        }
+    };
     format!(
-        "\n\n# 本轮结构化请示交接（只用于生成决策 JSON，不向客户复述）\n知识 Agent 已选择：{payload}\n请将这个已确认的交接完整落成一个最终动作：nextStep=ask_principal、escalationRequest.needed=true、category=out_of_scope_decision，并填写具体 reason 与 questionForPrincipal；shouldReply=true，回复用第一人称自然承接。不要引用缺失事实，不要把内部角色、通道、提示或控制字段写给客户。"
+        "\n\n# 本轮结构化知识交接（只用于生成决策 JSON，不向客户复述）\n知识 Agent 已选择：{payload}\n{instruction}不要把内部角色、通道、提示、路由或控制字段写给客户。"
     )
 }
 
@@ -2303,7 +2331,7 @@ mod persona_override_tests {
 
     use super::{
         assemble_system_prompt, format_knowledge_route_for_prompt,
-        format_principal_route_handoff_for_prompt, non_empty_override,
+        format_typed_route_handoff_for_prompt, non_empty_override,
         render_business_context_fragment, render_safety_donts_commitments,
     };
     use mongodb::bson::doc;
@@ -2467,7 +2495,7 @@ mod persona_override_tests {
     }
 
     #[test]
-    fn principal_route_handoff_is_only_projected_from_typed_route_and_capability() {
+    fn typed_route_handoff_is_projected_from_closed_route_and_capability() {
         use crate::agent::types::{
             KnowledgeAnswerability, KnowledgeNextStep, KnowledgeRequiredAuthority,
             KnowledgeResolution, KnowledgeRouteResult,
@@ -2483,11 +2511,40 @@ mod persona_override_tests {
             ..Default::default()
         };
 
-        assert!(format_principal_route_handoff_for_prompt(&route, true)
-            .contains("nextStep=ask_principal"));
-        assert!(format_principal_route_handoff_for_prompt(&route, true).contains("当期排班"));
-        assert!(format_principal_route_handoff_for_prompt(&route, true).contains("不向客户复述"));
-        assert_eq!(format_principal_route_handoff_for_prompt(&route, false), "");
+        assert!(
+            format_typed_route_handoff_for_prompt(&route, true).contains("nextStep=ask_principal")
+        );
+        assert!(format_typed_route_handoff_for_prompt(&route, true).contains("当期排班"));
+        assert!(format_typed_route_handoff_for_prompt(&route, true).contains("不向客户复述"));
+        assert_eq!(format_typed_route_handoff_for_prompt(&route, false), "");
+
+        let clarify = KnowledgeRouteResult {
+            resolution: KnowledgeResolution {
+                answerability: KnowledgeAnswerability::Unsupported,
+                required_authority: KnowledgeRequiredAuthority::Customer,
+                recommended_next_step: KnowledgeNextStep::ClarifyCustomer,
+                missing_information: vec!["客户希望的时间范围".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let clarify_text = format_typed_route_handoff_for_prompt(&clarify, false);
+        assert!(clarify_text.contains("nextStep=clarify"));
+        assert!(clarify_text.contains("客户希望的时间范围"));
+
+        let defer = KnowledgeRouteResult {
+            resolution: KnowledgeResolution {
+                answerability: KnowledgeAnswerability::PartiallySupported,
+                required_authority: KnowledgeRequiredAuthority::ExternalSystem,
+                recommended_next_step: KnowledgeNextStep::Defer,
+                missing_information: vec!["实时记录".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let defer_text = format_typed_route_handoff_for_prompt(&defer, false);
+        assert!(defer_text.contains("nextStep=defer"));
+        assert!(defer_text.contains("不得假装查询已经发生"));
     }
 
     /// §3 恒注入铁律（核心安全不变量）：Lean 档不注入完整 memory_card，但 doNotDo /

@@ -41,13 +41,14 @@ use sha2::{Digest, Sha256};
 
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    Contact, ConversationMessage, DomainProfile, MessageDirection, OperatingMemory,
+    CommitmentRepr, Contact, ConversationMessage, DomainProfile, MessageDirection, OperatingMemory,
     OperationDomainConfig, OperationKnowledgeChunk, OperationPlaybook, Product, ReferralCard,
 };
 use crate::prompts;
 use crate::routes::AppState;
 
 use super::budget::RunBudget;
+use super::commitment_lifecycle::active_commitments_for_prompt;
 use super::decision::{
     format_operation_domain_config_for_prompt, format_playbook_for_prompt, PromptOverride,
 };
@@ -4482,7 +4483,7 @@ pub(crate) fn should_run_review(
 ) -> bool {
     // A sendable body must never authorize its own review bypass. Risk, confidence, and
     // needs_review still select light/full review, but cannot decide whether review happens.
-    decision.should_reply
+    decision.should_reply || !decision.commitment_updates.is_empty()
 }
 
 /// Local terminal used when a strict Reviewer verdict was not executed.
@@ -4490,7 +4491,7 @@ pub(crate) fn should_run_review(
 /// A sendable body always fails closed. Budget exhaustion uses the existing
 /// `budget_exceeded_no_review` contract so finalize returns `blocked_by_budget`;
 /// any other accidental local path becomes an auditable safety hold. A deliberate
-/// no-reply decision remains locally approvable because it has no outbound body.
+/// no-reply decision remains locally approvable only when it also has no durable semantic action.
 ///
 /// 注意：本函数不依赖 task-local `RUN_BUDGET`，调用方必须显式传入
 /// `&RunBudget`，便于 `simulation` 等持有自己 `Arc<RunBudget>` 的入口
@@ -4503,7 +4504,7 @@ pub fn local_decision_review(
     budget: &RunBudget,
     _runtime: &UserRuntimeParameters,
 ) -> DecisionReviewResult {
-    if !decision.should_reply {
+    if !decision.should_reply && decision.commitment_updates.is_empty() {
         return DecisionReviewResult {
             approved: true,
             scores: ReviewScores {
@@ -4513,7 +4514,8 @@ pub fn local_decision_review(
                 knowledge_grounding_score: 10,
                 ..Default::default()
             },
-            review_summary: "No outbound body; no Reviewer verdict is required".to_string(),
+            review_summary: "No outbound body or lifecycle action; no Reviewer verdict is required"
+                .to_string(),
             ..Default::default()
         };
     }
@@ -4720,6 +4722,42 @@ fn render_reviewer_recent_history_bounded_at(
         .join("\n")
 }
 
+fn reviewer_context_pack_with_active_commitments(
+    context_pack: &Document,
+    commitments: &[CommitmentRepr],
+) -> Document {
+    let mut projected = context_pack.clone();
+    projected.insert(
+        "commitments",
+        mongodb::bson::to_bson(&active_commitments_for_prompt(commitments))
+            .unwrap_or_else(|_| Bson::Array(Vec::new())),
+    );
+    projected
+}
+
+fn route_reviewer_result_for_decision(
+    review: &mut DecisionReviewResult,
+    runtime: &UserRuntimeParameters,
+    decision: &AgentDecision,
+) {
+    if decision.should_reply {
+        route_dual_gate(review, runtime, &decision.reply_text);
+        return;
+    }
+
+    // With no outbound body, style/pressure scores have no behavioral surface. The independent
+    // Reviewer still owns the semantic verdict; code only applies the existing hard fact and
+    // product-grounding thresholds to its structured result.
+    let product_grounding_passed =
+        !crate::agent::guards::claim_requires_product_knowledge(&review.claim_analysis)
+            || review.scores.knowledge_grounding_score >= runtime.product_accuracy_block_below;
+    review.approved = review.approved
+        && review.scores.hallucination_score < runtime.fact_risk_block_at
+        && product_grounding_passed;
+    review.needs_revision = false;
+    review.revision_direction.clear();
+}
+
 fn reviewer_memory_card_text(context_pack: &Document) -> String {
     serde_json::to_string(context_pack).unwrap_or_default()
 }
@@ -4874,6 +4912,13 @@ fn build_light_reviewer_user(
         mongodb::bson::DateTime::now(),
         invocation_kind,
     );
+    let commitment_updates =
+        serde_json::to_string(&decision.commitment_updates).unwrap_or_else(|_| "[]".to_string());
+    let candidate_reply = if decision.should_reply {
+        decision.reply_text.as_str()
+    } else {
+        "（本轮不发送客户文本）"
+    };
     format!(
         r#"请独立审核这条低风险候选微信回复。只输出严格 JSON：
 {{
@@ -4905,6 +4950,8 @@ fn build_light_reviewer_user(
 - 不限产品：候选代表我方确定陈述任何可现实核验的业务事实（政策、要求、资格、预约、流程、时间地点、费用、交付、健康/专业准备事项等开放语义）都必须有直接可信来源；客户提问不是答案证据，历史我方/AI 回复、模型常识、画像和推断不是证据。无依据时必须要求局部改成核对/澄清，不得因“给具体内容”而放行。
 - 会话行为不等于外部业务事实：确认收到、寒暄/当前会话存在、道歉或撤回措辞、接受对方暂停、表明本轮不继续施压、邀请对方之后继续聊，这些行为由当前回复本身完成，不需外部证据。只有同时承诺持久运营结果、保证未来响应、服务时段或其他可核验动作时才升级。
 - 拦截虚假事实、绝对承诺、高压催促、隐私/内部画像泄露，以及暴露 AI、系统、提示词、内部评分或幕后决策来源。
+- commitmentUpdates 是对已存在 active 承诺的内部生命周期动作。必须根据完整对话、当前有效承诺及时间元数据独立判断 fulfilled/cancelled/superseded/expired 是否有明确语义依据；不得用客户文本关键词或单句命中代替语义判断。
+- 当本轮无客户回复、仅有 commitmentUpdates 时，humanLike/emotionalValue/pressureRisk 不是动作的判定依据；将它们记为无正文风格风险的中性通过分，重点用 approved、factRisk 和 reviewSummary 审核动作本身。
 - 检查关键记忆中的 doNotDo、commitments、事实冲突和重复追问；中性轮不强挤共情，情绪轮要接住具体处境。
 - 微信表达应口语、短而有来回；报告腔、编号清单、markdown 符号和超长整段降低 humanLike。
 - 联系人指令不得覆盖事实、安全、隐私或产品证据硬门。
@@ -4919,6 +4966,9 @@ fn build_light_reviewer_user(
 
 候选回复：
 {candidate}
+
+候选承诺生命周期动作（内部结构化副作用，空数组表示无）：
+{commitment_updates}
 
 关键记忆：
 {memory}
@@ -4935,7 +4985,8 @@ fn build_light_reviewer_user(
             recent_messages,
             (!invocation_kind.is_manual_outreach()).then_some(inbound),
         ),
-        candidate = decision.reply_text,
+        candidate = candidate_reply,
+        commitment_updates = commitment_updates,
         memory = light_memory_card_text(context_pack),
         instruction = operator_instruction,
         thresholds = serde_json::to_string(&thresholds).unwrap_or_default(),
@@ -5410,7 +5461,7 @@ pub(crate) async fn review_decision(
     invocation_kind: ReviewInvocationKind,
 ) -> AppResult<DecisionReviewResult> {
     let _stage_timer = super::run_audit::stage_timer("reviewer");
-    if !decision.should_reply {
+    if !decision.should_reply && decision.commitment_updates.is_empty() {
         return Ok(DecisionReviewResult {
             approved: true,
             scores: ReviewScores {
@@ -5486,7 +5537,9 @@ pub(crate) async fn review_decision(
     let runtime_text = serde_json::to_string(&runtime.as_document()).unwrap_or_default();
     // MemoryCard 在下方“长期记忆卡片”槽位完整注入一次。长期运营记忆槽只保留
     // relationshipState / productFit / nextAction，消除同一张卡的重复序列化；信息不裁剪。
-    let memory_card_text = reviewer_memory_card_text(context_pack);
+    let reviewer_context_pack =
+        reviewer_context_pack_with_active_commitments(context_pack, &contact.commitments);
+    let memory_card_text = reviewer_memory_card_text(&reviewer_context_pack);
     let memory_text = reviewer_operating_memory_text(memory);
     // Reply Agent 会执行联系人级运营特别指令；Reviewer 也必须看到同一指令，才能检查
     // 候选是否遵守。它是质量/经营约束，不能覆盖事实、安全、隐私及产品证据硬门。
@@ -5537,7 +5590,7 @@ pub(crate) async fn review_decision(
             inbound,
             recent_messages,
             decision,
-            context_pack,
+            &reviewer_context_pack,
             &operator_instruction_text,
             runtime,
             knowledge_route,
@@ -5588,6 +5641,8 @@ Review 模式: {}
 - 区分“陈述事实”和“完成会话行为”：确认收到、寒暄/表明当前正在回应、道歉或撤回措辞、接受客户暂停、表明本轮不再施压、邀请之后继续聊，都由这条回复本身完成，不是需证据支持的业务事实。只有它额外承诺了持久运营结果、保证未来响应、服务时段或其他可核验动作时才升级。
 - 知识切片只能作为导航；涉及产品能力、案例、价格、效果、交付承诺时，候选回复必须由 verifiedClaims、sourceAnchors 或 evidenceItems 支撑。
 - 如果候选回复使用了未验证切片、无 sourceAnchors 的事实、unsupportedClaims 或 needs_review/rejected 内容，应提高 factRisk 并要求改写或拦截。
+- commitmentUpdates 是对下方当前 active 承诺的内部生命周期动作。必须按完整对话、当前有效承诺和客观时间元数据判断动作是否真正成立；不得使用客户文本关键词、词表或单句命中代替语义判断。无充分语义依据时 approved=false，并在 reviewSummary 说明。
+- 当 shouldReply=false 且仅审核 commitmentUpdates 时，正文风格分数不应成为阻断依据；将 humanLike/emotionalValue/boundaryPrivacySafety 记为 10、pressureRisk 记为 1，用 approved/factRisk 表达生命周期语义审核结果。
 - claimAnalysis 必须基于语义判断，不要按关键词判断。用户原话中的“AI运营”“自动化”等词不等于产品承诺；只有候选回复在表达我方能提供什么、保证什么、价格/案例/效果/交付能力时，才算需要产品知识支撑。
 - 如果候选回复只是承接用户顾虑、表达理解、提出轻量澄清问题、拒绝做效果保证或说明需要先核对，requiresProductKnowledge=false；不得因为澄清问题中提到产品主题就误判为产品断言。
 - 必须检查候选回复是否违背长期记忆卡片里的 doNotDo、commitments、coreFacts、recentFacts、objections 和 deprecatedFacts；违背时应提高风险并要求改写或拦截。
@@ -5718,7 +5773,7 @@ Review 模式: {}
         // 软闸失败时保持 approved=false（review_passed 行为）但同时写
         // needs_revision=true / revision_direction，让 finalize 在硬门未命中时
         // 把 soft-gate-only 失败矫正为 Approved，以触发 single-shot revision。
-        route_dual_gate(&mut review, runtime, &decision.reply_text);
+        route_reviewer_result_for_decision(&mut review, runtime, decision);
 
         // Phase E / E2：reviewer 双脑并行——若 AppState 注入了第二 provider，再跑
         // 一份独立评分，与主 reviewer 走 [`detect_dual_reviewer_disagreement`]
@@ -5730,7 +5785,7 @@ Review 模式: {}
             &mut review,
             second_res,
             runtime,
-            &decision.reply_text,
+            decision,
             &contact.account_id,
             &contact.wxid,
         );
@@ -5749,7 +5804,7 @@ Review 模式: {}
         }
     };
     let _ = (decision, domain_config, knowledge_chunks, contact);
-    route_dual_gate(&mut review, runtime, &decision.reply_text);
+    route_reviewer_result_for_decision(&mut review, runtime, decision);
 
     Ok(review)
 }
@@ -5772,14 +5827,28 @@ fn apply_second_reviewer_result(
     review: &mut DecisionReviewResult,
     second_res: AppResult<Value>,
     runtime: &UserRuntimeParameters,
-    reply_text: &str,
+    decision: &AgentDecision,
     account_id: &str,
     contact_wxid: &str,
 ) {
     match second_res {
         Ok(second_value) => match parse_live_review(second_value) {
             Ok(mut second_review) => {
-                route_dual_gate(&mut second_review, runtime, reply_text);
+                route_reviewer_result_for_decision(&mut second_review, runtime, decision);
+                if !decision.should_reply {
+                    if review.approved != second_review.approved {
+                        review.approved = false;
+                        let marker =
+                            "reviewer_dual_disagree:commitment_lifecycle_action".to_string();
+                        if !review.risks.iter().any(|risk| risk == &marker) {
+                            review.risks.push(marker);
+                        }
+                        review.review_summary =
+                            "Independent reviewers disagreed on the commitment lifecycle action; the action is held"
+                                .to_string();
+                    }
+                    return;
+                }
                 if let Some(disagreement) =
                     detect_dual_reviewer_disagreement(review, &second_review, runtime)
                 {
@@ -5915,6 +5984,61 @@ mod required_reviewer_tests {
         assert!(result.approved);
         assert!(!result.should_hold);
     }
+
+    #[test]
+    fn no_reply_commitment_lifecycle_action_still_requires_reviewer() {
+        let mut decision = AgentDecision::default();
+        decision.commitment_updates = vec![super::super::types::CommitmentLifecycleDecision {
+            commitment_id: "c1".to_string(),
+            action: super::super::types::CommitmentLifecycleAction::Fulfilled,
+            reason: "the promised item was delivered in the conversation".to_string(),
+        }];
+        let planner = RunPlannerResult::default();
+        let runtime = UserRuntimeParameters::default();
+        assert!(should_run_review(&decision, &planner, &runtime));
+
+        let budget = RunBudget::new("run_lifecycle_review", i64::MAX, i32::MAX, i32::MAX);
+        let result = local_decision_review(&decision, &budget, &runtime);
+        assert!(!result.approved);
+        assert!(result.should_hold);
+        assert!(result
+            .risks
+            .iter()
+            .any(|risk| risk == "required_reviewer_not_executed"));
+    }
+
+    #[test]
+    fn action_only_review_uses_semantic_fact_gate_not_body_style_scores() {
+        let decision = AgentDecision {
+            commitment_updates: vec![super::super::types::CommitmentLifecycleDecision {
+                commitment_id: "c1".to_string(),
+                action: super::super::types::CommitmentLifecycleAction::Cancelled,
+                reason: "the customer and operator mutually cancelled the obligation".to_string(),
+            }],
+            ..Default::default()
+        };
+        let runtime = UserRuntimeParameters::default();
+        let mut review = DecisionReviewResult {
+            approved: true,
+            scores: ReviewScores {
+                human_like: 0,
+                emotional_value: 0,
+                hallucination_score: 1,
+                knowledge_grounding_score: 0,
+                pressure_risk: 10,
+                boundary_privacy_safety: 0,
+            },
+            ..Default::default()
+        };
+        route_reviewer_result_for_decision(&mut review, &runtime, &decision);
+        assert!(review.approved);
+        assert!(!review.needs_revision);
+
+        review.approved = true;
+        review.scores.hallucination_score = runtime.fact_risk_block_at;
+        route_reviewer_result_for_decision(&mut review, &runtime, &decision);
+        assert!(!review.approved);
+    }
 }
 
 #[cfg(test)]
@@ -5967,7 +6091,11 @@ mod second_reviewer_fallback_tests {
             &mut review,
             Ok(serde_json::json!({ "bogus": true })),
             &UserRuntimeParameters::default(),
-            "你好，收到啦",
+            &AgentDecision {
+                should_reply: true,
+                reply_text: "你好，收到啦".to_string(),
+                ..Default::default()
+            },
             "acct",
             "wx_test",
         );
@@ -5991,7 +6119,11 @@ mod second_reviewer_fallback_tests {
             &mut review,
             Ok(serde_json::json!({ "still": "bogus" })),
             &UserRuntimeParameters::default(),
-            "你好，收到啦",
+            &AgentDecision {
+                should_reply: true,
+                reply_text: "你好，收到啦".to_string(),
+                ..Default::default()
+            },
             "acct",
             "wx_test",
         );
@@ -6013,7 +6145,11 @@ mod second_reviewer_fallback_tests {
             &mut review,
             Err(AppError::External("upstream timeout".to_string())),
             &UserRuntimeParameters::default(),
-            "你好，收到啦",
+            &AgentDecision {
+                should_reply: true,
+                reply_text: "你好，收到啦".to_string(),
+                ..Default::default()
+            },
             "acct",
             "wx_test",
         );
@@ -6033,7 +6169,11 @@ mod second_reviewer_fallback_tests {
             &mut review,
             Ok(disagreeing_second_value()),
             &UserRuntimeParameters::default(),
-            "你好，收到啦",
+            &AgentDecision {
+                should_reply: true,
+                reply_text: "你好，收到啦".to_string(),
+                ..Default::default()
+            },
             "acct",
             "wx_test",
         );

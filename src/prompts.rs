@@ -1292,7 +1292,7 @@ Return exactly this shape, with null when an optional field is unnecessary:
 只输出严格 JSON：
 {
   "decisionPhase": "tool_calling | final",
-  "nextStep": "respond | stay_silent | retrieve | verify | clarify | ask_principal",
+  "nextStep": "respond | stay_silent | retrieve | verify | clarify | ask_principal | defer",
   "riskLevel": "low | medium | high",
   "knowledgeNeed": "not_required | required | insufficient",
   "runMode": "fast_chat | memory_candidate | knowledge_grounded | high_risk",
@@ -1333,6 +1333,7 @@ Return exactly this shape, with null when an optional field is unnecessary:
   "appointmentRequest": { "requested": false, "requestText": "客户希望面诊的原始意图摘要", "preferredStart": "RFC3339 或空串", "preferredEnd": "RFC3339 或空串", "locationPreference": "客户表达的地点偏好或空串", "reason": "为什么本轮形成预约请求" },
   "lastCommitment": "仅记录 replyText 本轮新作出的时间承诺，没有则省略",
   "commitment": { "text": "承诺内容", "dueAt": "RFC3339 时间或空串" },
+  "commitmentUpdates": [{ "commitmentId": "只能引用当前有效承诺中的 id", "action": "fulfilled | cancelled | superseded | expired", "reason": "基于完整语境的一句话依据" }],
   "followUp": { "needed": false, "runAt": "RFC3339 时间或空串", "content": "送达后才可建立的跟进内容" },
   "assetsToSend": [{ "assetId": "只能使用候选清单中的 id", "reason": "发送理由" }],
   "namecardToSend": { "cardId": "只能使用候选清单中的 id", "reason": "引荐理由" },
@@ -1342,7 +1343,7 @@ Return exactly this shape, with null when an optional field is unnecessary:
 硬规则：
 - 所有枚举必须使用列出的值；operationState 必须来自注入的状态机。
 - 你自主选择 nextStep。需要更多事实时输出 decisionPhase=tool_calling、nextStep=retrieve 或 verify，并给出一个或多个只读 toolCalls；该中间轮 shouldReply=false、replyText 为空。拿到工具结果后重新判断，最多只查真正需要的内容。信息已经够时直接 final，不要为了展示能力而调用工具。
-- final 轮不得再输出 toolCalls，nextStep 只能是 respond、stay_silent、clarify 或 ask_principal。clarify 仍是一条面向客户的自然回复；ask_principal 需同时给 escalationRequest，且不得向客户暴露幕后来源。
+- final 轮不得再输出 toolCalls，nextStep 只能是 respond、stay_silent、clarify、ask_principal 或 defer。clarify 仍是一条面向客户的自然追问；ask_principal 需同时给 escalationRequest；defer 表示现在回复事实边界与下一核验路径，不表示静默、不创建定时任务。任何类型都不得向客户暴露幕后来源或控制字段。
 - claimManifest 是你的草稿自检清单，不是发送授权。独立 ClaimGate 会从最终 replyText 重新提取并逐条核验；不得把自报 proposedSourceIds 当成已经获批。
 - appointmentRequest 只表示客户提出了面诊/到店请求，绝不表示预约已经确认。只有后台、决策人或外部预约工具的可信回执才能把请求转为 confirmed；在此之前 replyText 只能描述为待确认或正在核对。
 - needsReview 只选择复盘深度，不决定是否审核：低风险常规轮填 false；高风险、知识不足或产品声明填 true。所有可发送正文仍会经过独立 Reviewer 和 ClaimGate。
@@ -1356,6 +1357,7 @@ Return exactly this shape, with null when an optional field is unnecessary:
   replyText 只自然承接并推进可自主处理的部分，不得暴露幕后决策来源。
 - 客户仅要求找真人、客服或负责人，不等于事项本身超职权，不得因此单独触发请示。
 - replyText 作出时间承诺时必须同步填写 lastCommitment/commitment；正式承诺和 followUp 只会在文本确认送达后生效。
+- `当前有效承诺` 是已经送达且尚未终结的结构化义务。只有完整语境足以支持时才输出 commitmentUpdates：已实际完成用 fulfilled；客户或有效业务决定明确取消用 cancelled；本轮新承诺替换旧承诺时对旧 id 用 superseded，并同时填写新的 lastCommitment/commitment；仅当 dueAt 已到且语境表明该义务窗口已失效时用 expired。不得按客户消息中的单词或短语匹配，不得编造 id；没有明确变化就输出空数组。
 - 素材、名片和请示仅在确有需要时输出，禁止编造候选 id。
 - 不要输出 profileUpdate、tags、customerStage、intentLevel、domainSignals、profileAttributes、nextBestAction、operatingMemoryUpdate、memoryCandidates、memoryUpdate、bayesianObservations 或 agentGeneratedSignals；这些由发送后的独立投影任务处理。
 - 只输出 JSON，不要注释、markdown 或额外说明。"#,

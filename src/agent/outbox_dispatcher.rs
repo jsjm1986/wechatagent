@@ -32,6 +32,7 @@ use crate::models::{
 };
 use crate::routes::AppState;
 
+use super::commitment_lifecycle::build_commitment_transition_mutations;
 use super::decision::{
     load_operation_state_policy_for_contact, load_user_operation_domain_config_for_contact,
 };
@@ -1696,6 +1697,8 @@ async fn finalize_delivered_text_decision(state: &AppState, entry: &OutboxEntry)
     // 绝不把 outbox 改回 pending，因而不会触发重复发送。
     let side_effect_result: AppResult<()> = async {
         activate_pending_commitments(state, entry, &coverage_snapshot).await?;
+        apply_delivered_commitment_lifecycle_updates(state, entry, decision_id, &coverage_snapshot)
+            .await?;
         // State/cooldown controls are frozen in the atomic review and become effective only after
         // the complete text batch is confirmed delivered. The analytical projection worker is
         // explicitly forbidden from applying these fields, so this is the single production
@@ -2013,6 +2016,117 @@ async fn activate_pending_commitments(
         // Already active (for example, a crash after promotion but before review cleanup) is an
         // idempotent success. Other terminal states are left untouched and remain auditable.
     }
+    Ok(())
+}
+
+/// Apply the frozen lifecycle actions only after every text segment is confirmed delivered.
+/// Stale or concurrently terminalized targets are recorded and skipped so an irreversible remote
+/// delivery can always converge to a terminal review status.
+async fn apply_delivered_commitment_lifecycle_updates(
+    state: &AppState,
+    entry: &OutboxEntry,
+    decision_id: ObjectId,
+    review: &Document,
+) -> AppResult<()> {
+    let updates = match review.get_array("commitment_lifecycle_updates") {
+        Ok(values) => {
+            match mongodb::bson::from_bson::<Vec<super::types::CommitmentLifecycleDecision>>(
+                Bson::Array(values.clone()),
+            ) {
+                Ok(updates) => updates,
+                Err(error) => {
+                    tracing::warn!(?error, %decision_id, "invalid frozen commitment lifecycle payload");
+                    let _ = state
+                        .db
+                        .decision_reviews()
+                        .clone_with_type::<Document>()
+                        .update_one(
+                            doc! { "_id": decision_id },
+                            doc! { "$set": {
+                                "commitment_lifecycle_apply_error": "invalid_frozen_payload",
+                                "commitment_lifecycle_applied_at": DateTime::now(),
+                            } },
+                            None,
+                        )
+                        .await;
+                    return Ok(());
+                }
+            }
+        }
+        Err(_) => return Ok(()),
+    };
+    if updates.is_empty() {
+        return Ok(());
+    }
+
+    let replacement_id = review
+        .get_str("commitment_lifecycle_replacement_id")
+        .ok()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let mutations = match build_commitment_transition_mutations(
+        &entry.workspace_id,
+        &entry.account_id,
+        &entry.contact_wxid,
+        &updates,
+        replacement_id,
+        &decision_id.to_hex(),
+        DateTime::now(),
+    ) {
+        Ok(mutations) => mutations,
+        Err(error) => {
+            tracing::warn!(%error, %decision_id, "invalid commitment lifecycle mutation after delivery");
+            let _ = state
+                .db
+                .decision_reviews()
+                .clone_with_type::<Document>()
+                .update_one(
+                    doc! { "_id": decision_id },
+                    doc! { "$set": {
+                        "commitment_lifecycle_apply_error": error,
+                        "commitment_lifecycle_applied_at": DateTime::now(),
+                    } },
+                    None,
+                )
+                .await;
+            return Ok(());
+        }
+    };
+
+    let mut transition_ids = Vec::new();
+    let mut stale = Vec::new();
+    for mutation in mutations {
+        let result = state
+            .db
+            .contacts()
+            .update_one(mutation.filter, mutation.pipeline, None)
+            .await?;
+        if result.matched_count == 1 {
+            transition_ids.push(mutation.commitment_id);
+        } else {
+            stale.push(doc! {
+                "commitmentId": mutation.commitment_id,
+                "requestedStatus": mutation.target_status,
+            });
+        }
+    }
+
+    state
+        .db
+        .decision_reviews()
+        .clone_with_type::<Document>()
+        .update_one(
+            doc! { "_id": decision_id, "status": "delivery_finalizing" },
+            doc! { "$set": {
+                "commitment_lifecycle_applied_at": DateTime::now(),
+                "commitment_lifecycle_transition_ids": transition_ids,
+                "commitment_lifecycle_stale_transitions": stale,
+            }, "$unset": {
+                "commitment_lifecycle_apply_error": "",
+            } },
+            None,
+        )
+        .await?;
     Ok(())
 }
 

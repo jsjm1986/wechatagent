@@ -22,6 +22,7 @@ use crate::routes::AppState;
 use super::appointment_request::validate_appointment_request;
 use super::authority::AuthoritySnapshot;
 use super::budget::RunBudget;
+use super::commitment_lifecycle::validate_commitment_updates;
 use super::decision::{
     decide_reply_with_promote_context, initial_operation_state_for_contact,
     load_operation_state_policy_for_contact, load_published_soul, load_referral_cards,
@@ -33,7 +34,9 @@ use super::guards::{
     action_policy_state_key, decision_operation_state_candidate, enforce_reviewed_decision_actions,
     normalize_decision_runtime, normalize_decision_state, planner_from_decision,
 };
-use super::knowledge_router::{route_requests_principal, route_used_knowledge_ids};
+use super::knowledge_router::{
+    coherent_knowledge_handoff, route_used_knowledge_ids, KnowledgeHandoffKind,
+};
 use super::knowledge_tools::{
     dispatch_chat_tool_call, ToolDispatchState, TOOL_LIST_CATALOG, TOOL_OPEN_SLICE, TOOL_SEARCH,
 };
@@ -57,32 +60,104 @@ use super::types::{
 const USER_TURN_TOOL_NAMES: &[&str] = &[TOOL_LIST_CATALOG, TOOL_SEARCH, TOOL_OPEN_SLICE];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PrincipalRouteConsistencyIssue {
+enum TypedRouteConsistencyIssueKind {
     MissingCustomerReply,
+    IncorrectNextStep,
+    UnexpectedEscalationRequest,
+    ConflictingDeliverySideEffects,
     MissingEscalationRequest,
     IncompleteEscalationRequest,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TypedRouteConsistencyIssue {
+    handoff: KnowledgeHandoffKind,
+    kind: TypedRouteConsistencyIssueKind,
+}
+
+fn has_conflicting_delivery_side_effects(decision: &AgentDecision) -> bool {
+    decision
+        .appointment_request
+        .as_ref()
+        .is_some_and(|request| request.requested)
+        || decision.commitment.is_some()
+        || decision
+            .last_commitment
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        || decision
+            .follow_up
+            .as_ref()
+            .is_some_and(|follow_up| follow_up.needed)
+        || decision
+            .cooldown_until
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        || !decision.assets_to_send.is_empty()
+        || decision.namecard_to_send.is_some()
+        || !decision.commitment_updates.is_empty()
+}
+
 /// Validate the structural hand-off between two independent AI decisions. The Knowledge Agent
-/// owns whether principal authority is needed; this function checks only that the Reply Agent
-/// represented that result as a complete, customer-safe action when the capability exists.
-fn principal_route_consistency_issue(
+/// owns the semantic route; this function checks only that the Reply Agent represented the
+/// already-selected route as one complete customer-facing action. No customer text is inspected.
+fn typed_route_consistency_issue(
     route: &KnowledgeRouteResult,
     decision: &AgentDecision,
     principal_channel_available: bool,
-) -> Option<PrincipalRouteConsistencyIssue> {
-    if !principal_channel_available || !route_requests_principal(route) {
+) -> Option<TypedRouteConsistencyIssue> {
+    let handoff = coherent_knowledge_handoff(route)?;
+    if handoff == KnowledgeHandoffKind::AskPrincipal && !principal_channel_available {
         return None;
     }
     if !decision.should_reply || decision.reply_text.trim().is_empty() {
-        return Some(PrincipalRouteConsistencyIssue::MissingCustomerReply);
+        return Some(TypedRouteConsistencyIssue {
+            handoff,
+            kind: TypedRouteConsistencyIssueKind::MissingCustomerReply,
+        });
     }
+
+    if handoff != KnowledgeHandoffKind::AskPrincipal {
+        let expected_next_step = match handoff {
+            KnowledgeHandoffKind::ClarifyCustomer => "clarify",
+            KnowledgeHandoffKind::DeferLicensedProfessional
+            | KnowledgeHandoffKind::DeferExternalSystem => "defer",
+            KnowledgeHandoffKind::AskPrincipal => unreachable!(),
+        };
+        if decision.next_step != expected_next_step {
+            return Some(TypedRouteConsistencyIssue {
+                handoff,
+                kind: TypedRouteConsistencyIssueKind::IncorrectNextStep,
+            });
+        }
+        if decision
+            .escalation_request
+            .as_ref()
+            .is_some_and(|request| request.needed)
+        {
+            return Some(TypedRouteConsistencyIssue {
+                handoff,
+                kind: TypedRouteConsistencyIssueKind::UnexpectedEscalationRequest,
+            });
+        }
+        if has_conflicting_delivery_side_effects(decision) {
+            return Some(TypedRouteConsistencyIssue {
+                handoff,
+                kind: TypedRouteConsistencyIssueKind::ConflictingDeliverySideEffects,
+            });
+        }
+        return None;
+    }
+
     let Some(request) = decision
         .escalation_request
         .as_ref()
         .filter(|request| request.needed)
     else {
-        return Some(PrincipalRouteConsistencyIssue::MissingEscalationRequest);
+        return Some(TypedRouteConsistencyIssue {
+            handoff,
+            kind: TypedRouteConsistencyIssueKind::MissingEscalationRequest,
+        });
     };
     let valid_category = request
         .category
@@ -101,15 +176,62 @@ fn principal_route_consistency_issue(
             .is_none_or(str::is_empty)
         || decision.next_step != "ask_principal"
     {
-        return Some(PrincipalRouteConsistencyIssue::IncompleteEscalationRequest);
+        return Some(TypedRouteConsistencyIssue {
+            handoff,
+            kind: TypedRouteConsistencyIssueKind::IncompleteEscalationRequest,
+        });
     }
     None
 }
 
-/// Build a safe, complete principal action from the Knowledge Agent's typed route when the Reply
-/// Agent has already spent its single bounded repair and still returned an incoherent action.
-/// This is not a semantic classifier or a keyword gate: the route's closed semantic result is the
-/// only trigger. The fallback prevents a selected hand-off from disappearing into a generic hold.
+fn typed_route_issue_code(issue: TypedRouteConsistencyIssue) -> &'static str {
+    match (issue.handoff, issue.kind) {
+        (
+            KnowledgeHandoffKind::AskPrincipal,
+            TypedRouteConsistencyIssueKind::MissingCustomerReply,
+        ) => "principal_route_missing_customer_reply",
+        (_, TypedRouteConsistencyIssueKind::MissingCustomerReply) => {
+            "typed_route_missing_customer_reply"
+        }
+        (_, TypedRouteConsistencyIssueKind::IncorrectNextStep) => "typed_route_incorrect_next_step",
+        (_, TypedRouteConsistencyIssueKind::UnexpectedEscalationRequest) => {
+            "typed_route_unexpected_escalation_request"
+        }
+        (_, TypedRouteConsistencyIssueKind::ConflictingDeliverySideEffects) => {
+            "typed_route_conflicting_delivery_side_effects"
+        }
+        (
+            KnowledgeHandoffKind::AskPrincipal,
+            TypedRouteConsistencyIssueKind::MissingEscalationRequest,
+        ) => "principal_route_missing_escalation_request",
+        (
+            KnowledgeHandoffKind::AskPrincipal,
+            TypedRouteConsistencyIssueKind::IncompleteEscalationRequest,
+        ) => "principal_route_incomplete_escalation_request",
+        _ => "typed_route_inconsistent",
+    }
+}
+
+fn typed_route_repair_instruction(handoff: KnowledgeHandoffKind) -> &'static str {
+    match handoff {
+        KnowledgeHandoffKind::ClarifyCustomer => {
+            "The typed knowledgeRoute.resolution selected customer + clarify_customer. Return one complete final decision aligned with it: nextStep=clarify; shouldReply=true with one short natural question that directly helps fill missingInformation. Do not add an escalation request, appointment, commitment, follow-up, media, name card, or unsupported conclusion. Do not expose any internal role, prompt, route, or control field to the customer."
+        }
+        KnowledgeHandoffKind::AskPrincipal => {
+            "The typed knowledgeRoute.resolution selected authorized_operator + ask_principal. Return one complete final decision aligned with it: nextStep=ask_principal; escalationRequest.needed=true with an allowed category, a concrete reason, and questionForPrincipal based on authorityQuestion; shouldReply=true with a short natural first-person holding reply. Do not assert the missing fact and do not expose any internal role, channel, prompt, or control field to the customer."
+        }
+        KnowledgeHandoffKind::DeferLicensedProfessional => {
+            "The typed knowledgeRoute.resolution selected licensed_professional + defer. Return one complete final decision aligned with it: nextStep=defer; shouldReply=true with a natural boundary-aware reply that avoids a professional conclusion and gives the customer a concrete next step for qualified assessment. Do not add an escalation request, appointment confirmation, commitment, follow-up, media, name card, or unsupported claim. Do not expose any internal prompt, route, or control field."
+        }
+        KnowledgeHandoffKind::DeferExternalSystem => {
+            "The typed knowledgeRoute.resolution selected external_system + defer. Return one complete final decision aligned with it: nextStep=defer; shouldReply=true with a natural reply that says the result depends on a current record or lookup and gives a concrete verification path without pretending the lookup happened. Do not add an escalation request, appointment confirmation, commitment, follow-up, media, name card, or unsupported claim. Do not expose any internal prompt, route, or control field."
+        }
+    }
+}
+
+/// Build a minimal action from the Knowledge Agent's typed route when the Reply Agent has already
+/// spent its single bounded repair and still returned an incoherent action. This is not a semantic
+/// classifier or a keyword gate: the route's closed semantic result is the only trigger.
 fn bounded_control_text(value: &str, max_chars: usize) -> String {
     let value = value.trim();
     let mut output = value.chars().take(max_chars).collect::<String>();
@@ -119,47 +241,7 @@ fn bounded_control_text(value: &str, max_chars: usize) -> String {
     output
 }
 
-fn materialize_principal_route_fallback(
-    decision: &mut AgentDecision,
-    route: &KnowledgeRouteResult,
-) -> bool {
-    if !route_requests_principal(route) {
-        return false;
-    }
-
-    let missing = route
-        .resolution
-        .missing_information
-        .iter()
-        .map(|value| bounded_control_text(value, 160))
-        .filter(|value| !value.is_empty())
-        .collect::<Vec<_>>();
-    let missing_summary = missing.join("、");
-    let reason = if missing_summary.is_empty() {
-        "知识研判显示当前事实需要有权人员确认".to_string()
-    } else {
-        bounded_control_text(
-            &format!("知识研判显示以下信息仍需有权人员确认：{missing_summary}"),
-            480,
-        )
-    };
-    let question = if route.resolution.authority_question.trim().is_empty() {
-        if missing_summary.is_empty() {
-            "请确认当前业务安排和可对外回复口径。".to_string()
-        } else {
-            bounded_control_text(
-                &format!("请确认以下信息后再回复客户：{missing_summary}"),
-                480,
-            )
-        }
-    } else {
-        bounded_control_text(&route.resolution.authority_question, 480)
-    };
-
-    // A failed repair must not carry stale structured intents into the commit layer.  The
-    // fallback is intentionally a single text acknowledgement plus one principal request; all
-    // unrelated writes (appointment, commitment, follow-up, state transition, media, profile and
-    // memory projections) are discarded rather than guessed from the rejected draft.
+fn clear_typed_route_fallback_side_effects(decision: &mut AgentDecision) {
     decision.profile_update = None;
     decision.tags.clear();
     decision.tag_evidence_turns.clear();
@@ -172,6 +254,7 @@ fn materialize_principal_route_fallback(
     decision.dimension_display_names.clear();
     decision.last_commitment = None;
     decision.commitment = None;
+    decision.commitment_updates.clear();
     decision.follow_up_policy = None;
     decision.profile_attributes.clear();
     decision.intent_analysis.clear();
@@ -200,26 +283,145 @@ fn materialize_principal_route_fallback(
     decision.appointment_request = None;
     decision.assets_to_send.clear();
     decision.namecard_to_send = None;
+    decision.escalation_request = None;
+    decision.agent_generated_signals.clear();
+}
+
+fn route_missing_summary(route: &KnowledgeRouteResult) -> String {
+    route
+        .resolution
+        .missing_information
+        .iter()
+        .map(|value| bounded_control_text(value, 160))
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join("、")
+}
+
+fn materialize_typed_route_fallback(
+    decision: &mut AgentDecision,
+    route: &KnowledgeRouteResult,
+    principal_channel_available: bool,
+) -> bool {
+    let Some(handoff) = coherent_knowledge_handoff(route) else {
+        return false;
+    };
+    if handoff == KnowledgeHandoffKind::AskPrincipal && !principal_channel_available {
+        return false;
+    }
+
+    let missing_summary = route_missing_summary(route);
+    let reason = if missing_summary.is_empty() {
+        "知识研判显示当前信息不足以形成可靠结论".to_string()
+    } else {
+        bounded_control_text(
+            &format!("知识研判显示以下信息仍待补齐：{missing_summary}"),
+            480,
+        )
+    };
+
+    // A failed repair must not carry stale structured intents into the commit layer. The
+    // fallback is one minimal customer-facing action; unrelated writes are discarded rather than
+    // guessed from the rejected draft.
+    clear_typed_route_fallback_side_effects(decision);
 
     decision.should_reply = true;
-    decision.reply_text = super::escalation::fallback_holding_reply().to_string();
-    decision.next_step = "ask_principal".to_string();
-    decision.autonomy_mode = "assisted".to_string();
-    decision.knowledge_need = "required".to_string();
     decision.knowledge_need_reason = reason.clone();
     decision.why_skip_reply.clear();
-    if decision.why_should_reply.trim().is_empty() {
-        decision.why_should_reply =
-            "先自然承接客户并确认缺失事实，避免在没有依据时给出确定安排。".to_string();
+    decision.risk_self_check =
+        "只表达当前证据边界和下一步，不补写未经核实的事实或承诺。".to_string();
+
+    match handoff {
+        KnowledgeHandoffKind::ClarifyCustomer => {
+            decision.reply_text = if missing_summary.is_empty() {
+                "我先确认一个关键信息：你具体想了解的是哪一部分？".to_string()
+            } else {
+                bounded_control_text(
+                    &format!("我先确认一个关键信息：{missing_summary}。方便补充一下吗？"),
+                    360,
+                )
+            };
+            decision.next_step = "clarify".to_string();
+            decision.autonomy_mode = "auto".to_string();
+            decision.knowledge_need = "insufficient".to_string();
+            decision.why_should_reply =
+                "先向客户补齐结构化研判指出的关键信息，再继续给出可靠答复。".to_string();
+            decision.sufficiency = "need_clarification".to_string();
+            decision.missing_tier = "none".to_string();
+            decision.clarification_intent = if missing_summary.is_empty() {
+                "确认客户当前真正想了解的具体问题".to_string()
+            } else {
+                missing_summary
+            };
+        }
+        KnowledgeHandoffKind::AskPrincipal => {
+            let question = if route.resolution.authority_question.trim().is_empty() {
+                if missing_summary.is_empty() {
+                    "请确认当前业务安排和可对外回复口径。".to_string()
+                } else {
+                    bounded_control_text(
+                        &format!("请确认以下信息后再回复客户：{missing_summary}"),
+                        480,
+                    )
+                }
+            } else {
+                bounded_control_text(&route.resolution.authority_question, 480)
+            };
+            decision.reply_text = super::escalation::fallback_holding_reply().to_string();
+            decision.next_step = "ask_principal".to_string();
+            decision.autonomy_mode = "assisted".to_string();
+            decision.knowledge_need = "required".to_string();
+            decision.why_should_reply =
+                "先自然承接客户并确认缺失事实，避免在没有依据时给出确定安排。".to_string();
+            decision.sufficiency = "need_more_context".to_string();
+            decision.missing_tier = "none".to_string();
+            decision.clarification_intent.clear();
+            decision.escalation_request = Some(crate::models::EscalationRequest {
+                needed: true,
+                category: Some(crate::models::ESCALATION_CATEGORY_OUT_OF_SCOPE.to_string()),
+                reason: Some(reason),
+                question_for_principal: Some(question),
+                self_serviceable_part: None,
+                is_generalizable: false,
+            });
+        }
+        KnowledgeHandoffKind::DeferLicensedProfessional => {
+            decision.reply_text = if missing_summary.is_empty() {
+                "这部分需要由具备相应资质的专业人员结合实际情况判断，我先不替你下结论。请以专业评估结果为准。".to_string()
+            } else {
+                bounded_control_text(
+                    &format!("这部分还需要结合{missing_summary}，由具备相应资质的专业人员判断。我先不替你下结论，请以专业评估结果为准。"),
+                    420,
+                )
+            };
+            decision.next_step = "defer".to_string();
+            decision.autonomy_mode = "assisted".to_string();
+            decision.knowledge_need = "insufficient".to_string();
+            decision.why_should_reply =
+                "明确说明专业判断边界，并给出不会误导客户的下一步。".to_string();
+            decision.sufficiency = "enough".to_string();
+            decision.missing_tier = "none".to_string();
+            decision.clarification_intent.clear();
+        }
+        KnowledgeHandoffKind::DeferExternalSystem => {
+            decision.reply_text = if missing_summary.is_empty() {
+                "这件事需要以当前查询记录为准，我现在不能凭现有信息确认，先不乱给结论。请通过对应查询渠道核实后，把结果发我，我再继续帮你看。".to_string()
+            } else {
+                bounded_control_text(
+                    &format!("这件事需要以当前查询记录为准，目前还缺{missing_summary}，我先不凭现有信息下结论。请通过对应查询渠道核实后，把结果发我，我再继续帮你看。"),
+                    460,
+                )
+            };
+            decision.next_step = "defer".to_string();
+            decision.autonomy_mode = "assisted".to_string();
+            decision.knowledge_need = "insufficient".to_string();
+            decision.why_should_reply =
+                "明确说明实时记录缺口，并给出不会伪造查询结果的下一步。".to_string();
+            decision.sufficiency = "enough".to_string();
+            decision.missing_tier = "none".to_string();
+            decision.clarification_intent.clear();
+        }
     }
-    decision.escalation_request = Some(crate::models::EscalationRequest {
-        needed: true,
-        category: Some(crate::models::ESCALATION_CATEGORY_OUT_OF_SCOPE.to_string()),
-        reason: Some(reason),
-        question_for_principal: Some(question),
-        self_serviceable_part: None,
-        is_generalizable: false,
-    });
     true
 }
 
@@ -526,8 +728,10 @@ pub(crate) struct ModelTurnEnvironment<'a, C> {
     opened_chunk_ids: HashSet<String>,
     last_planner: RunPlannerResult,
     pending_finalize_events: Vec<PendingFinalizeEvent>,
-    principal_consistency_repair_issued: bool,
-    principal_route_fallback_applied: bool,
+    commitment_update_repair_issued: bool,
+    dropped_commitment_update_risk: Option<String>,
+    typed_route_repair_issued: bool,
+    typed_route_fallback_applied: bool,
 }
 
 impl<'a, C> ModelTurnEnvironment<'a, C> {
@@ -540,8 +744,10 @@ impl<'a, C> ModelTurnEnvironment<'a, C> {
             opened_chunk_ids: HashSet::new(),
             last_planner,
             pending_finalize_events: Vec::new(),
-            principal_consistency_repair_issued: false,
-            principal_route_fallback_applied: false,
+            commitment_update_repair_issued: false,
+            dropped_commitment_update_risk: None,
+            typed_route_repair_issued: false,
+            typed_route_fallback_applied: false,
         }
     }
 
@@ -781,6 +987,7 @@ where
 
     async fn authorize(&mut self, draft: &mut DraftEnvelope) -> AppResult<AuthorizationManifest> {
         self.pending_finalize_events.clear();
+        self.dropped_commitment_update_risk = None;
         if let Err(issue) =
             validate_appointment_request(draft.decision.appointment_request.as_ref())
         {
@@ -816,34 +1023,82 @@ where
             ));
         }
 
+        let creates_replacement_commitment = draft.decision.should_reply
+            && !draft.decision.reply_text.trim().is_empty()
+            && (draft
+                .decision
+                .commitment
+                .as_ref()
+                .is_some_and(|commitment| !commitment.text.trim().is_empty())
+                || draft
+                    .decision
+                    .last_commitment
+                    .as_deref()
+                    .is_some_and(|commitment| !commitment.trim().is_empty()));
+        if let Some(issue) = validate_commitment_updates(
+            &self.inputs.contact.commitments,
+            &draft.decision.commitment_updates,
+            creates_replacement_commitment,
+            DateTime::now(),
+        ) {
+            let risk = issue.code().to_string();
+            let instruction = issue.repair_instruction();
+            let review = super::types::DecisionReviewResult {
+                approved: false,
+                needs_revision: true,
+                rewrite_instruction: instruction.to_string(),
+                review_summary: format!(
+                    "Structured commitment lifecycle update failed validation: {}",
+                    issue.code()
+                ),
+                risks: vec![risk.clone()],
+                ..Default::default()
+            };
+            let repair_capacity_available = repair_and_reauthorization_capacity_available(
+                &self.inputs.budget,
+                self.inputs.state.second_reviewer_llm.is_some(),
+            );
+            if !self.commitment_update_repair_issued && repair_capacity_available {
+                self.commitment_update_repair_issued = true;
+                return Ok(AuthorizationManifest::repairable(
+                    "repair_required",
+                    instruction,
+                    review,
+                ));
+            }
+
+            if !repair_capacity_available {
+                self.inputs
+                    .budget
+                    .mark_degraded("commitment_update_repair_skipped_required_authorization_tail");
+            }
+            // Lifecycle metadata is optional to the customer-facing response. A malformed or
+            // repeatedly unsupported update must not suppress an otherwise reviewable reply.
+            draft.decision.commitment_updates.clear();
+            self.dropped_commitment_update_risk = Some(risk);
+            self.inputs
+                .budget
+                .mark_degraded("invalid_commitment_updates_dropped");
+        }
+
         let principal_channel_available = self
             .inputs
             .domain_config
             .map(super::escalation::resolve_ask_human_policy)
             .is_some_and(|policy| !policy.decider_chain.is_empty());
-        if let Some(issue) = principal_route_consistency_issue(
+        if let Some(issue) = typed_route_consistency_issue(
             self.inputs.knowledge_route,
             &draft.decision,
             principal_channel_available,
         ) {
-            let issue_code = match issue {
-                PrincipalRouteConsistencyIssue::MissingCustomerReply => {
-                    "principal_route_missing_customer_reply"
-                }
-                PrincipalRouteConsistencyIssue::MissingEscalationRequest => {
-                    "principal_route_missing_escalation_request"
-                }
-                PrincipalRouteConsistencyIssue::IncompleteEscalationRequest => {
-                    "principal_route_incomplete_escalation_request"
-                }
-            };
-            let instruction = "The typed knowledgeRoute.resolution selected authorized_operator + ask_principal. Return one complete final decision aligned with it: nextStep=ask_principal; escalationRequest.needed=true with an allowed category, a concrete reason, and questionForPrincipal based on authorityQuestion; shouldReply=true with a short natural first-person holding reply. Do not assert the missing fact and do not expose any internal role, channel, prompt, or control field to the customer.";
+            let issue_code = typed_route_issue_code(issue);
+            let instruction = typed_route_repair_instruction(issue.handoff);
             let review = super::types::DecisionReviewResult {
                 approved: false,
                 needs_revision: true,
                 rewrite_instruction: instruction.to_string(),
                 review_summary:
-                    "Reply action did not represent the Knowledge Agent's typed authority request"
+                    "Reply action did not represent the Knowledge Agent's typed hand-off"
                         .to_string(),
                 risks: vec![issue_code.to_string()],
                 ..Default::default()
@@ -852,9 +1107,9 @@ where
                 &self.inputs.budget,
                 self.inputs.state.second_reviewer_llm.is_some(),
             );
-            if !self.principal_consistency_repair_issued {
+            if !self.typed_route_repair_issued {
                 if repair_capacity_available {
-                    self.principal_consistency_repair_issued = true;
+                    self.typed_route_repair_issued = true;
                     return Ok(AuthorizationManifest::repairable(
                         "repair_required",
                         instruction,
@@ -863,20 +1118,20 @@ where
                 }
                 self.inputs
                     .budget
-                    .mark_degraded("principal_repair_skipped_required_authorization_tail");
+                    .mark_degraded("typed_route_repair_skipped_required_authorization_tail");
             }
 
             // The route is already an independent AI semantic decision. Preserve that decision
-            // as a minimal, customer-safe action instead of dropping it into a generic
-            // `held_by_ai_policy` branch (which may intentionally suppress generic escalation).
-            if materialize_principal_route_fallback(
+            // as one minimal, customer-safe action instead of replacing it with a generic hold.
+            if materialize_typed_route_fallback(
                 &mut draft.decision,
                 self.inputs.knowledge_route,
+                principal_channel_available,
             ) {
-                self.principal_route_fallback_applied = true;
+                self.typed_route_fallback_applied = true;
                 self.inputs
                     .budget
-                    .mark_degraded("principal_route_fallback_applied");
+                    .mark_degraded("typed_route_fallback_applied");
             }
         }
 
@@ -885,7 +1140,9 @@ where
             .appointment_request
             .as_ref()
             .is_some_and(|request| request.requested);
-        let requires_semantic_authorization = decision.should_reply || has_appointment_action;
+        let has_commitment_lifecycle_action = !decision.commitment_updates.is_empty();
+        let requires_semantic_authorization =
+            decision.should_reply || has_appointment_action || has_commitment_lifecycle_action;
         let authorization_chunks = self.authorization_chunks();
         let (mut review, priced_from_catalog) = if !requires_semantic_authorization {
             (
@@ -903,9 +1160,10 @@ where
                 &self.inputs.budget,
                 self.inputs.runtime,
             );
-            if has_appointment_action && !decision.should_reply {
+            if (has_appointment_action || has_commitment_lifecycle_action) && !decision.should_reply
+            {
                 review.review_summary =
-                    "Required appointment action authorization was unavailable because the run budget was exhausted"
+                    "Required structured action authorization was unavailable because the run budget was exhausted"
                         .to_string();
                 review
                     .risks
@@ -928,41 +1186,42 @@ where
                 self.inputs.invocation_kind,
                 Some(self.inputs.authority),
             );
-            let (mut review, claim_gate) = if decision.should_reply {
-                let review_mode = effective_review_mode(
-                    &self.last_planner,
-                    decision,
-                    self.inputs.runtime,
-                    draft.repair_attempt > 0,
-                );
-                let review_future = review_decision(
-                    self.inputs.state,
-                    self.inputs.contact,
-                    self.inputs.inbound,
-                    self.inputs.recent_messages,
-                    decision,
-                    self.inputs.playbook,
-                    self.inputs.domain_config,
-                    self.inputs.runtime,
-                    self.inputs.memory,
-                    self.inputs.context_pack,
-                    &authorization_chunks,
-                    self.inputs.knowledge_route,
-                    review_mode,
-                    Some(self.inputs.run_id),
-                    self.inputs.prompt_override,
-                    Some(self.inputs.active_profile),
-                    self.inputs.reviewer_prompts,
-                    self.inputs.invocation_kind,
-                );
-                let (review, claim_gate) = tokio::join!(review_future, claim_gate_future);
-                (review?, claim_gate)
-            } else {
-                (
-                    local_decision_review(decision, &self.inputs.budget, self.inputs.runtime),
-                    claim_gate_future.await,
-                )
-            };
+            let (mut review, claim_gate) =
+                if decision.should_reply || has_commitment_lifecycle_action {
+                    let review_mode = effective_review_mode(
+                        &self.last_planner,
+                        decision,
+                        self.inputs.runtime,
+                        draft.repair_attempt > 0,
+                    );
+                    let review_future = review_decision(
+                        self.inputs.state,
+                        self.inputs.contact,
+                        self.inputs.inbound,
+                        self.inputs.recent_messages,
+                        decision,
+                        self.inputs.playbook,
+                        self.inputs.domain_config,
+                        self.inputs.runtime,
+                        self.inputs.memory,
+                        self.inputs.context_pack,
+                        &authorization_chunks,
+                        self.inputs.knowledge_route,
+                        review_mode,
+                        Some(self.inputs.run_id),
+                        self.inputs.prompt_override,
+                        Some(self.inputs.active_profile),
+                        self.inputs.reviewer_prompts,
+                        self.inputs.invocation_kind,
+                    );
+                    let (review, claim_gate) = tokio::join!(review_future, claim_gate_future);
+                    (review?, claim_gate)
+                } else {
+                    (
+                        local_decision_review(decision, &self.inputs.budget, self.inputs.runtime),
+                        claim_gate_future.await,
+                    )
+                };
             let priced_from_catalog = apply_independent_claim_gate(
                 claim_gate,
                 decision,
@@ -971,6 +1230,12 @@ where
             );
             (review, priced_from_catalog)
         };
+
+        if let Some(risk) = self.dropped_commitment_update_risk.as_ref() {
+            if !review.risks.iter().any(|existing| existing == risk) {
+                review.risks.push(risk.clone());
+            }
+        }
 
         if should_run_targeted_rewrite(decision, &review, self.inputs.runtime) {
             if !repair_and_reauthorization_capacity_available(
@@ -1005,15 +1270,15 @@ where
             contact_has_principal_product_exemption(self.inputs.contact),
         );
         review = finalized.review;
-        if self.principal_route_fallback_applied
+        if self.typed_route_fallback_applied
             && !review
                 .risks
                 .iter()
-                .any(|risk| risk == "principal_route_fallback_applied")
+                .any(|risk| risk == "typed_route_fallback_applied")
         {
             review
                 .risks
-                .push("principal_route_fallback_applied".to_string());
+                .push("typed_route_fallback_applied".to_string());
         }
         let pending_events = finalized.pending_events;
 
@@ -1106,6 +1371,37 @@ mod tests {
         }
     }
 
+    fn clarify_route(missing_information: Vec<&str>) -> KnowledgeRouteResult {
+        KnowledgeRouteResult {
+            resolution: super::super::types::KnowledgeResolution {
+                answerability: super::super::types::KnowledgeAnswerability::Unsupported,
+                required_authority: super::super::types::KnowledgeRequiredAuthority::Customer,
+                recommended_next_step: super::super::types::KnowledgeNextStep::ClarifyCustomer,
+                missing_information: missing_information
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn defer_route(
+        authority: super::super::types::KnowledgeRequiredAuthority,
+    ) -> KnowledgeRouteResult {
+        KnowledgeRouteResult {
+            resolution: super::super::types::KnowledgeResolution {
+                answerability: super::super::types::KnowledgeAnswerability::PartiallySupported,
+                required_authority: authority,
+                recommended_next_step: super::super::types::KnowledgeNextStep::Defer,
+                missing_information: vec!["current verified record".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn user_turn_tool_surface_is_read_only_and_bounded() {
         assert_eq!(USER_TURN_TOOL_NAMES.len(), 3);
@@ -1136,15 +1432,21 @@ mod tests {
         let route = principal_route();
         let mut decision = AgentDecision::default();
         assert_eq!(
-            principal_route_consistency_issue(&route, &decision, true),
-            Some(PrincipalRouteConsistencyIssue::MissingCustomerReply)
+            typed_route_consistency_issue(&route, &decision, true),
+            Some(TypedRouteConsistencyIssue {
+                handoff: KnowledgeHandoffKind::AskPrincipal,
+                kind: TypedRouteConsistencyIssueKind::MissingCustomerReply,
+            })
         );
 
         decision.should_reply = true;
         decision.reply_text = "I will verify this and follow up.".to_string();
         assert_eq!(
-            principal_route_consistency_issue(&route, &decision, true),
-            Some(PrincipalRouteConsistencyIssue::MissingEscalationRequest)
+            typed_route_consistency_issue(&route, &decision, true),
+            Some(TypedRouteConsistencyIssue {
+                handoff: KnowledgeHandoffKind::AskPrincipal,
+                kind: TypedRouteConsistencyIssueKind::MissingEscalationRequest,
+            })
         );
 
         decision.next_step = "ask_principal".to_string();
@@ -1156,16 +1458,13 @@ mod tests {
             self_serviceable_part: None,
             is_generalizable: false,
         });
-        assert_eq!(
-            principal_route_consistency_issue(&route, &decision, true),
-            None
-        );
+        assert_eq!(typed_route_consistency_issue(&route, &decision, true), None);
     }
 
     #[test]
     fn typed_principal_route_is_inert_without_configured_capability() {
         assert_eq!(
-            principal_route_consistency_issue(&principal_route(), &AgentDecision::default(), false),
+            typed_route_consistency_issue(&principal_route(), &AgentDecision::default(), false),
             None
         );
     }
@@ -1184,7 +1483,11 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(materialize_principal_route_fallback(&mut decision, &route));
+        assert!(materialize_typed_route_fallback(
+            &mut decision,
+            &route,
+            true
+        ));
         assert_eq!(
             decision.reply_text,
             super::super::escalation::fallback_holding_reply()
@@ -1213,10 +1516,7 @@ mod tests {
             .question_for_principal
             .as_deref()
             .is_some_and(|value| !value.trim().is_empty()));
-        assert_eq!(
-            principal_route_consistency_issue(&route, &decision, true),
-            None
-        );
+        assert_eq!(typed_route_consistency_issue(&route, &decision, true), None);
     }
 
     #[test]
@@ -1226,9 +1526,146 @@ mod tests {
             reply_text: "保持原样".to_string(),
             ..Default::default()
         };
-        assert!(!materialize_principal_route_fallback(&mut decision, &route));
+        assert!(!materialize_typed_route_fallback(
+            &mut decision,
+            &route,
+            true
+        ));
         assert_eq!(decision.reply_text, "保持原样");
         assert!(decision.escalation_request.is_none());
+    }
+
+    #[test]
+    fn typed_clarify_route_requires_a_pure_customer_question() {
+        let route = clarify_route(vec!["preferred date", "location"]);
+        let mut decision = AgentDecision {
+            should_reply: true,
+            reply_text: "Which date works for you?".to_string(),
+            next_step: "respond".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            typed_route_consistency_issue(&route, &decision, true),
+            Some(TypedRouteConsistencyIssue {
+                handoff: KnowledgeHandoffKind::ClarifyCustomer,
+                kind: TypedRouteConsistencyIssueKind::IncorrectNextStep,
+            })
+        );
+
+        decision.next_step = "clarify".to_string();
+        decision.commitment = Some(Default::default());
+        assert_eq!(
+            typed_route_consistency_issue(&route, &decision, true),
+            Some(TypedRouteConsistencyIssue {
+                handoff: KnowledgeHandoffKind::ClarifyCustomer,
+                kind: TypedRouteConsistencyIssueKind::ConflictingDeliverySideEffects,
+            })
+        );
+
+        decision.commitment = None;
+        assert_eq!(typed_route_consistency_issue(&route, &decision, true), None);
+    }
+
+    #[test]
+    fn clarify_fallback_uses_structured_missing_information_and_clears_actions() {
+        let route = clarify_route(vec!["你更方便的日期", "希望到访的地点"]);
+        let mut decision = AgentDecision {
+            should_reply: true,
+            reply_text: "明天下午已经安排好了".to_string(),
+            next_step: "respond".to_string(),
+            appointment_request: Some(Default::default()),
+            last_commitment: Some("明天下午确认".to_string()),
+            assets_to_send: vec![Default::default()],
+            ..Default::default()
+        };
+
+        assert!(materialize_typed_route_fallback(
+            &mut decision,
+            &route,
+            true
+        ));
+        assert_eq!(decision.next_step, "clarify");
+        assert!(decision.reply_text.contains("你更方便的日期"));
+        assert!(decision.reply_text.contains("希望到访的地点"));
+        assert!(decision.appointment_request.is_none());
+        assert!(decision.last_commitment.is_none());
+        assert!(decision.assets_to_send.is_empty());
+        assert!(decision.escalation_request.is_none());
+        assert_eq!(typed_route_consistency_issue(&route, &decision, true), None);
+    }
+
+    #[test]
+    fn clarify_fallback_handles_empty_missing_information_without_message_matching() {
+        let route = clarify_route(Vec::new());
+        let mut decision = AgentDecision::default();
+
+        assert!(materialize_typed_route_fallback(
+            &mut decision,
+            &route,
+            true
+        ));
+        assert_eq!(decision.next_step, "clarify");
+        assert!(decision.reply_text.contains("具体想了解"));
+        assert_eq!(typed_route_consistency_issue(&route, &decision, true), None);
+    }
+
+    #[test]
+    fn licensed_and_external_defer_routes_require_explicit_defer_action() {
+        for (authority, expected_handoff) in [
+            (
+                super::super::types::KnowledgeRequiredAuthority::LicensedProfessional,
+                KnowledgeHandoffKind::DeferLicensedProfessional,
+            ),
+            (
+                super::super::types::KnowledgeRequiredAuthority::ExternalSystem,
+                KnowledgeHandoffKind::DeferExternalSystem,
+            ),
+        ] {
+            let route = defer_route(authority);
+            let mut decision = AgentDecision {
+                should_reply: true,
+                reply_text: "I cannot confirm this yet.".to_string(),
+                next_step: "respond".to_string(),
+                ..Default::default()
+            };
+            assert_eq!(
+                typed_route_consistency_issue(&route, &decision, true),
+                Some(TypedRouteConsistencyIssue {
+                    handoff: expected_handoff,
+                    kind: TypedRouteConsistencyIssueKind::IncorrectNextStep,
+                })
+            );
+
+            assert!(materialize_typed_route_fallback(
+                &mut decision,
+                &route,
+                true
+            ));
+            assert_eq!(decision.next_step, "defer");
+            assert!(decision.escalation_request.is_none());
+            assert_eq!(typed_route_consistency_issue(&route, &decision, true), None);
+        }
+    }
+
+    #[test]
+    fn malformed_typed_route_is_not_materialized() {
+        let route = KnowledgeRouteResult {
+            resolution: super::super::types::KnowledgeResolution {
+                answerability: super::super::types::KnowledgeAnswerability::Unsupported,
+                required_authority: super::super::types::KnowledgeRequiredAuthority::ExternalSystem,
+                recommended_next_step: super::super::types::KnowledgeNextStep::AskPrincipal,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut decision = AgentDecision::default();
+
+        assert_eq!(typed_route_consistency_issue(&route, &decision, true), None);
+        assert!(!materialize_typed_route_fallback(
+            &mut decision,
+            &route,
+            true
+        ));
     }
 
     #[test]

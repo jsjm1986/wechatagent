@@ -896,6 +896,21 @@ async fn reclaim_stale_running_tasks(state: &AppState) -> anyhow::Result<usize> 
                 )
                 .await?;
             if res.modified_count == 1 {
+                if let (Some(token), Some(generation)) = (claim_token.as_deref(), claim_generation)
+                {
+                    if let Err(error) =
+                        crate::agent::run_envelope::abort_run_envelopes_for_task_claim(
+                            &state.db,
+                            task_id,
+                            token,
+                            generation,
+                            "task claim recovery was exhausted",
+                        )
+                        .await
+                    {
+                        tracing::error!(%task_id, %error, "failed to close exhausted task run envelope");
+                    }
+                }
                 let _ = agent::write_event_for_account(
                     state,
                     &task.workspace_id,
@@ -953,6 +968,19 @@ async fn reclaim_stale_running_tasks(state: &AppState) -> anyhow::Result<usize> 
             .await?;
         if res.modified_count == 1 {
             recovered += 1;
+            if let (Some(token), Some(generation)) = (claim_token.as_deref(), claim_generation) {
+                if let Err(error) = crate::agent::run_envelope::abort_run_envelopes_for_task_claim(
+                    &state.db,
+                    task_id,
+                    token,
+                    generation,
+                    "stale task claim was reclaimed for retry",
+                )
+                .await
+                {
+                    tracing::error!(%task_id, %error, "failed to close reclaimed task run envelope");
+                }
+            }
             let _ = agent::write_event_for_account(
                 state,
                 &task.workspace_id,
@@ -1124,6 +1152,9 @@ async fn tick(state: &AppState) -> anyhow::Result<()> {
     // SR-054: a resolution persists a durable relay intent before task
     // materialization. Recover any crash/interruption before claiming work.
     let _ = crate::agent::escalation::reconcile_pending_relay_intents(state).await?;
+    // Ask-human intent is committed with the decision review. Configuration or
+    // push-policy delays keep it retryable instead of dropping the request.
+    let _ = crate::agent::escalation::reconcile_principal_escalation_intents(state).await?;
     let _ = crate::agent::escalation::reconcile_principal_card_deliveries(state).await?;
     let _ = crate::agent::system_incident::reconcile_notifications(state).await?;
     // HC-021: the first dispatch freezes one audience snapshot before materializing
@@ -1131,6 +1162,19 @@ async fn tick(state: &AppState) -> anyhow::Result<()> {
     let _ = crate::routes::campaigns::reconcile_campaign_dispatches(state).await?;
     // HP-1：先回收 stale running，再 claim 新任务。
     let _ = reclaim_stale_running_tasks(state).await?;
+    // A process may have crashed after the task CAS but before the paired run-envelope
+    // close. The full task-claim identity makes this repair safe across newer owners.
+    let run_stale_timeout_ms = i64::try_from(state.config.task_claim_timeout_seconds.max(1))
+        .unwrap_or(i64::MAX / 1000)
+        .saturating_mul(1000);
+    let run_stale_before = DateTime::from_millis(
+        DateTime::now()
+            .timestamp_millis()
+            .saturating_sub(run_stale_timeout_ms),
+    );
+    let _ =
+        crate::agent::run_envelope::reconcile_stale_task_run_envelopes(&state.db, run_stale_before)
+            .await?;
     // A candidate may arrive while its single-flight memory task is crossing running -> failed.
     // The scheduler leaves rerun_requested on that row; revive it before scanning runnable work.
     let _ = revive_failed_memory_tasks_with_rerun(state).await?;

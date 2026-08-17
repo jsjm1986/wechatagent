@@ -1264,6 +1264,24 @@ pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
             None,
         )
         .await?;
+    db.decision_reviews()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! {
+                    "principal_escalation_intent.status": 1,
+                    "principal_escalation_intent.next_retry_at": 1,
+                    "principal_escalation_intent.claimed_at": 1,
+                    "created_at": 1,
+                })
+                .options(
+                    IndexOptions::builder()
+                        .name("idx_decision_review_principal_intent_due".to_string())
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
     db.agent_run_logs()
         .create_index(
             IndexModel::builder()
@@ -1277,6 +1295,24 @@ pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
             IndexModel::builder()
                 .keys(doc! { "run_id": 1 })
                 .options(IndexOptions::builder().unique(true).build())
+                .build(),
+            None,
+        )
+        .await?;
+    db.agent_run_logs()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! {
+                    "source_task_id": 1,
+                    "source_task_claim_token": 1,
+                    "source_task_claim_generation": 1,
+                    "lifecycle": 1,
+                })
+                .options(
+                    IndexOptions::builder()
+                        .name("idx_run_log_source_task_claim_lifecycle".to_string())
+                        .build(),
+                )
                 .build(),
             None,
         )

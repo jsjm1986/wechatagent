@@ -1878,7 +1878,9 @@ export function PlannerViewSection({ contact }: { contact: Contact | null }) {
   const stageResult = stagnationValue
     ? labelFor(taxonomies, stagnationDimension, stagnationValue)
     : null;
-  const commitments = (contact.commitments ?? []).slice(0, 5);
+  const commitments = (contact.commitments ?? [])
+    .filter((commitment) => commitment.status === "active")
+    .slice(0, 5);
   const hasStage = !!stagnationValue || !!stagnationUpdatedAt;
   const hasCommitments = commitments.length > 0;
   const lastMode = (contact as { lastConversationMode?: string | null }).lastConversationMode || null;
@@ -2088,4 +2090,3 @@ function formatStageTimestamp(iso: string): string {
   const pad = (n: number) => n.toString().padStart(2, "0");
   return `${dt.getFullYear()}-${pad(dt.getMonth() + 1)}-${pad(dt.getDate())} ${pad(dt.getHours())}:${pad(dt.getMinutes())}`;
 }
-

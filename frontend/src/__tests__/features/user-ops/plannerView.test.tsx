@@ -96,6 +96,21 @@ describe("PlannerViewSection 多维度看板(A4)", () => {
     expect(row.textContent).not.toContain("2026-06-26");
   });
 
+  it("主动跟进视角只展示 active 承诺", () => {
+    const contact = {
+      ...baseContact,
+      commitments: [
+        { id: "active", text: "继续跟进", status: "active" },
+        { id: "fulfilled", text: "已完成", status: "fulfilled" },
+        { id: "cancelled", text: "已取消", status: "cancelled" },
+      ],
+    } as Contact;
+    render(<PlannerViewSection contact={contact} />);
+    expect(screen.getByText("继续跟进")).toBeInTheDocument();
+    expect(screen.queryByText("已完成")).not.toBeInTheDocument();
+    expect(screen.queryByText("已取消")).not.toBeInTheDocument();
+  });
+
   it("自定义停滞维度显示同源值和时间", () => {
     setStore(
       [{ kind: "relationship_closeness", displayName: "关系亲密度", participatesInDecision: true }],
