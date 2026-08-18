@@ -17,7 +17,9 @@ use futures::TryStreamExt;
 use mongodb::bson::{doc, DateTime, Document};
 use serde_json::json;
 
-use wechatagent::agent::simulate_user_dialogue;
+use wechatagent::agent::{
+    simulate_user_dialogue, simulate_user_dialogue_with_mode, SimulationProjectionMode,
+};
 use wechatagent::llm::ChatUsage;
 use wechatagent::models::{AgentStatus, Contact};
 
@@ -442,6 +444,104 @@ async fn simulation_has_no_business_side_effects() {
     assert!(logs
         .iter()
         .all(|log| log.get_str("run_mode") == Ok("shadow")));
+
+    app.cleanup().await;
+}
+
+/// The default HTTP-oriented mode must exercise the complete response and
+/// authorization path without spending an additional LLM call on analytical
+/// projection. Authorized state still advances only inside the isolated
+/// in-memory projection.
+#[tokio::test]
+#[ignore]
+async fn response_only_skips_projection_llm_and_preserves_zero_side_effects() {
+    let app = TestApp::start().await;
+    let ws = app.state.config.default_workspace_id.clone();
+    let acc = app.state.config.default_account_id.clone();
+    let contact = managed_contact(&ws, &acc, "wx_sim_response_only");
+    let before = business_snapshot(&app).await;
+
+    app.llm.push_response(reply_decision_json());
+    app.llm.push_response(review_pass_json());
+    app.llm
+        .push_response(common::independent_claim_gate_pass_json());
+
+    let turns = simulate_user_dialogue_with_mode(
+        &app.state,
+        contact,
+        vec!["你好".to_string()],
+        SimulationProjectionMode::ResponseOnly,
+    )
+    .await
+    .expect("response-only shadow simulation must complete");
+
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0].status, "would_send");
+    assert_eq!(turns[0].memory_preview.get_str("status"), Ok("deferred"));
+    assert_eq!(
+        turns[0].performance.get_str("projectionStatus"),
+        Ok("deferred")
+    );
+    assert_eq!(
+        turns[0].performance.get_str("projectionMode"),
+        Ok("response_only")
+    );
+    assert_eq!(
+        app.llm.calls(),
+        3,
+        "response_only must call Reply + Reviewer + ClaimGate only"
+    );
+    assert_eq!(
+        before,
+        business_snapshot(&app).await,
+        "response_only shadow must not persist business state"
+    );
+
+    app.cleanup().await;
+}
+
+/// Analytical projection is diagnostic follow-up work. A malformed or failed
+/// projection must remain visible in diagnostics without replacing an already
+/// authorized reply terminal status.
+#[tokio::test]
+#[ignore]
+async fn projection_failure_cannot_change_authorized_reply_status() {
+    let app = TestApp::start().await;
+    let ws = app.state.config.default_workspace_id.clone();
+    let acc = app.state.config.default_account_id.clone();
+    let contact = managed_contact(&ws, &acc, "wx_sim_projection_failure");
+    let before = business_snapshot(&app).await;
+
+    app.llm.push_response(reply_decision_json());
+    app.llm.push_response(review_pass_json());
+    app.llm
+        .push_response(common::independent_claim_gate_pass_json());
+    app.llm
+        .push_response(json!({ "replyText": "projection must not control delivery" }));
+
+    let turns = simulate_user_dialogue_with_mode(
+        &app.state,
+        contact,
+        vec!["你好".to_string()],
+        SimulationProjectionMode::MemoryLoop,
+    )
+    .await
+    .expect("projection failure must degrade without failing the reply turn");
+
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0].status, "would_send");
+    assert!(turns[0].should_reply);
+    assert_eq!(turns[0].memory_preview.get_str("status"), Ok("failed"));
+    assert_eq!(
+        turns[0].performance.get_str("projectionStatus"),
+        Ok("failed")
+    );
+    assert_eq!(app.llm.calls(), 4);
+    assert_eq!(
+        before,
+        business_snapshot(&app).await,
+        "failed memory projection must not persist business state"
+    );
 
     app.cleanup().await;
 }

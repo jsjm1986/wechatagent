@@ -212,6 +212,105 @@ describe("userOpsStore.loadMessages", () => {
   });
 });
 
+describe("userOpsStore.runDialogueSimulation", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    useUserOpsStore.setState({
+      simulationInput: "你好\n我想先了解一下",
+      simulationTurns: [],
+      simulationRunMetrics: null,
+      simulationRequestGeneration: 0,
+      simulationBusy: false,
+    });
+  });
+
+  it("requests response_only and stores run diagnostics", async () => {
+    const selected = contact("contact-a", "A");
+    bindContact(selected);
+    const turn = {
+      turn: 1,
+      inboundText: "你好",
+      shouldReply: true,
+      replyText: "你好呀",
+      status: "would_send",
+      decision: {},
+      review: {},
+      gatewayResult: {},
+      knowledgeRoute: {},
+      memoryPreview: { status: "deferred" },
+      stateTransition: {},
+      performance: { totalMs: 120, projectionStatus: "deferred" },
+    };
+    const metrics = {
+      projectionMode: "response_only",
+      projectionDeferred: true,
+      totalMs: 125,
+      llmCallsUsed: 3,
+    };
+    (api.post as any).mockResolvedValueOnce({
+      items: [turn],
+      runMode: "shadow",
+      applied: false,
+      metrics,
+    });
+
+    await useUserOpsStore.getState().runDialogueSimulation();
+
+    expect(api.post).toHaveBeenCalledWith(
+      "/api/user-operations/simulations/dialogue",
+      {
+        accountId: "A",
+        contactId: "contact-a",
+        messages: ["你好", "我想先了解一下"],
+        projectionMode: "response_only",
+      },
+    );
+    expect(useUserOpsStore.getState().simulationTurns).toEqual([turn]);
+    expect(useUserOpsStore.getState().simulationRunMetrics).toEqual(metrics);
+    expect(useUserOpsStore.getState().simulationBusy).toBe(false);
+  });
+
+  it("drops a late result after the selected contact changes", async () => {
+    const responseA = deferred<any>();
+    const responseB = deferred<any>();
+    (api.post as any).mockImplementation((_url: string, body: { accountId: string }) =>
+      body.accountId === "A" ? responseA.promise : responseB.promise
+    );
+
+    const contactA = contact("contact-a", "A");
+    const contactB = contact("contact-b", "B");
+    useAccountStore.setState({
+      accounts: [account("A"), account("B")],
+      selectedAccountId: "A",
+    });
+    useContactStore.setState({ contacts: [contactA], selected: contactA, dataAccountId: "A" });
+    useUserOpsStore.getState().hydrateSelected(contactA);
+    useUserOpsStore.getState().setSimulationInput("A 的问题");
+    const runA = useUserOpsStore.getState().runDialogueSimulation();
+
+    useAccountStore.setState({ selectedAccountId: "B" });
+    useContactStore.setState({ contacts: [contactB], selected: contactB, dataAccountId: "B" });
+    useUserOpsStore.getState().hydrateSelected(contactB);
+    useUserOpsStore.getState().setSimulationInput("B 的问题");
+    const runB = useUserOpsStore.getState().runDialogueSimulation();
+
+    responseB.resolve({
+      items: [{ turn: 1, inboundText: "B 的问题", status: "would_send" }],
+      metrics: { projectionMode: "response_only", totalMs: 80 },
+    });
+    await runB;
+    responseA.resolve({
+      items: [{ turn: 1, inboundText: "A 的问题", status: "would_send" }],
+      metrics: { projectionMode: "memory_loop", totalMs: 999 },
+    });
+    await runA;
+
+    expect(useUserOpsStore.getState().simulationTurns[0]?.inboundText).toBe("B 的问题");
+    expect(useUserOpsStore.getState().simulationRunMetrics?.totalMs).toBe(80);
+    expect(useUserOpsStore.getState().simulationBusy).toBe(false);
+  });
+});
+
 describe("userOpsStore stale contact actions", () => {
   beforeEach(() => {
     vi.clearAllMocks();

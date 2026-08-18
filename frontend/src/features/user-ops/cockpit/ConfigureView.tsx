@@ -62,6 +62,7 @@ export function ConfigureView(props: CockpitPanelProps) {
     simulationBusy,
     simulationInput,
     simulationTurns,
+    simulationRunMetrics,
     onAnalyzeProfile,
     onApplyGuidePreview,
     onDisableAgent,
@@ -466,7 +467,7 @@ export function ConfigureView(props: CockpitPanelProps) {
                 {simulationBusy ? "验证中" : "开始验证"}
               </button>
             </div>
-            <SimulationResult turns={simulationTurns} />
+            <SimulationResult turns={simulationTurns} metrics={simulationRunMetrics} />
           </section>
         </>
       )}

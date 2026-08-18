@@ -17,7 +17,8 @@ import type {
   TraditionalOpsTab,
   OperationDomainConfig,
   OperationDomainDraft,
-  DomainKey
+  DomainKey,
+  SimulationRunMetrics
 } from "../types";
 import { api } from "../lib/api";
 import { useInboxStore } from "./inboxStore";
@@ -60,6 +61,8 @@ interface UserOpsState {
   guidePreviewGeneration: number;
   simulationInput: string;
   simulationTurns: SimulationTurn[];
+  simulationRunMetrics: SimulationRunMetrics | null;
+  simulationRequestGeneration: number;
   selectedPlaybookId: string;
 
   // 数据
@@ -351,6 +354,8 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
   guidePreviewGeneration: 0,
   simulationInput: "我最近在看 AI 运营，想了解你们能做到什么程度。\n我们现在几百个客户，销售经常跟丢，但我不想做机器人群发。\n如果客户三天没回，你们会一直追吗？",
   simulationTurns: [],
+  simulationRunMetrics: null,
+  simulationRequestGeneration: 0,
   selectedPlaybookId: "",
 
   playbooks: [],
@@ -412,6 +417,10 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
     referredCardId: undefined,
     profileEditDraft: {},
     selectedPlaybookId: "",
+    simulationTurns: [],
+    simulationRunMetrics: null,
+    simulationRequestGeneration: state.simulationRequestGeneration + 1,
+    simulationBusy: false,
     guidePreview: null,
     guidePreviewGeneration: state.guidePreviewGeneration + 1,
     guideBusy: false,
@@ -454,6 +463,10 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
         followUpPolicy: contact.followUpPolicy || "",
       },
       selectedPlaybookId: contact.playbookId || "",
+      simulationTurns: [],
+      simulationRunMetrics: null,
+      simulationRequestGeneration: state.simulationRequestGeneration + 1,
+      simulationBusy: false,
       guidePreview: null,
       guidePreviewGeneration: state.guidePreviewGeneration + 1,
       guideBusy: false,
@@ -1029,7 +1042,14 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
 
     if (!selected || !currentAccountId) return;
 
-    set({ simulationBusy: true });
+    const requestGeneration = get().simulationRequestGeneration + 1;
+    const requestContactId = selected.id;
+    set({
+      simulationBusy: true,
+      simulationTurns: [],
+      simulationRunMetrics: null,
+      simulationRequestGeneration: requestGeneration,
+    });
     useUiStore.getState().setError("");
 
     try {
@@ -1038,20 +1058,40 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
         .map((line) => line.trim())
         .filter((line) => line.length > 0);
 
-      const data = await api.post<{ items: SimulationTurn[]; runMode: string; applied: boolean }>(
+      const data = await api.post<{
+        items: SimulationTurn[];
+        runMode: string;
+        applied: boolean;
+        projectionMode?: string;
+        projectionDeferred?: boolean;
+        metrics?: SimulationRunMetrics;
+      }>(
         "/api/user-operations/simulations/dialogue",
         {
           accountId: currentAccountId,
           contactId: selected.id,
-          messages
+          messages,
+          projectionMode: "response_only"
         }
       );
 
-      set({ simulationTurns: data.items || [] });
+      const currentContact = useContactStore.getState().selected;
+      if (
+        get().simulationRequestGeneration === requestGeneration &&
+        useAccountStore.getState().currentAccountId() === currentAccountId &&
+        currentContact?.id === requestContactId &&
+        currentContact.accountId === currentAccountId
+      ) {
+        set({ simulationTurns: data.items || [], simulationRunMetrics: data.metrics || null });
+      }
     } catch (error) {
-      useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
+      if (get().simulationRequestGeneration === requestGeneration) {
+        useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
+      }
     } finally {
-      set({ simulationBusy: false });
+      if (get().simulationRequestGeneration === requestGeneration) {
+        set({ simulationBusy: false });
+      }
     }
   },
 

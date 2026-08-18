@@ -130,6 +130,43 @@ describe("ConfigureView 4-tab", () => {
     expect(screen.getByText("Agent 已确认和待整理的信息")).toBeInTheDocument();
   });
 
+  it("影子验证展示运行级与单轮性能诊断", () => {
+    renderView({
+      simulationRunMetrics: {
+        projectionMode: "response_only",
+        projectionDeferred: true,
+        totalMs: 245,
+        llmCallsUsed: 3,
+      },
+      simulationTurns: [{
+        turn: 1,
+        inboundText: "你好",
+        shouldReply: true,
+        replyText: "你好呀",
+        status: "would_send",
+        decision: {},
+        review: { scores: {} },
+        gatewayResult: { allowed: true },
+        knowledgeRoute: { selectedChunkIds: [] },
+        memoryPreview: { status: "deferred" },
+        stateTransition: {},
+        performance: {
+          totalMs: 240,
+          replyAndAuthorizationMs: 180,
+          projectionMs: 0,
+          projectionStatus: "deferred",
+        },
+      }],
+    });
+
+    fireEvent.click(screen.getByRole("tab", { name: "工具" }));
+    expect(screen.getByText("模式：仅回复链路")).toBeInTheDocument();
+    expect(screen.getByText("总耗时：245 ms")).toBeInTheDocument();
+    expect(screen.getByText("LLM：3 次")).toBeInTheDocument();
+    expect(screen.getByText("本轮：240 ms")).toBeInTheDocument();
+    expect(screen.getByText("投影：deferred / 0 ms")).toBeInTheDocument();
+  });
+
   it("managed contact has an explicit action to persist the selected operating style", () => {
     const onSaveRelationshipType = vi.fn();
     renderView({

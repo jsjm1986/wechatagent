@@ -88,6 +88,7 @@ function UserOpsFeatureInner() {
     guidePreview,
     simulationInput,
     simulationTurns,
+    simulationRunMetrics,
     selectedPlaybookId,
     playbooks,
     playbookDraft,
@@ -355,6 +356,7 @@ function UserOpsFeatureInner() {
               simulationBusy={simulationBusy}
               simulationInput={simulationInput}
               simulationTurns={simulationTurns}
+              simulationRunMetrics={simulationRunMetrics}
               onAnalyzeProfile={analyzeProfile}
               onApplyGuidePreview={onApplyGuide}
               onDisableAgent={async () => { await disableAgent(); void loadContactCounts(effectiveAccountId); }}

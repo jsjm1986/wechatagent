@@ -2375,6 +2375,9 @@ pub struct UserOperationSimulationTurn {
     pub commit_receipt: Document,
     pub memory_preview: Document,
     pub state_transition: Document,
+    /// Per-turn shadow timings. These are diagnostic only and never authorize a side effect.
+    #[serde(default)]
+    pub performance: Document,
 }
 
 #[derive(Debug, Clone, Default)]

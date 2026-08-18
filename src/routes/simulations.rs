@@ -32,6 +32,8 @@ pub(super) struct UserDialogueSimulationRequest {
     messages: Vec<String>,
     #[serde(default)]
     apply_memory: bool,
+    #[serde(default)]
+    projection_mode: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -49,11 +51,11 @@ pub(super) async fn simulate_user_operation_dialogue(
     Json(payload): Json<UserDialogueSimulationRequest>,
 ) -> AppResult<Json<Value>> {
     validate_account(&state, &admin.current_workspace, &payload.account_id).await?;
-    if payload.apply_memory {
-        return Err(AppError::BadRequest(
-            "shadow simulation cannot apply memory yet".to_string(),
-        ));
-    }
+    let projection_mode = agent::SimulationProjectionMode::from_request(
+        payload.projection_mode.as_deref(),
+        payload.apply_memory,
+    )
+    .map_err(AppError::BadRequest)?;
     let messages = payload
         .messages
         .into_iter()
@@ -70,10 +72,21 @@ pub(super) async fn simulate_user_operation_dialogue(
             "contact does not belong to account".to_string(),
         ));
     }
-    let turns = agent::simulate_user_dialogue(&state, contact, messages).await?;
+    let outcome = agent::simulate_user_dialogue_with_budget_and_mode(
+        &state,
+        contact,
+        messages,
+        projection_mode,
+    )
+    .await?;
+    let metrics = outcome.metrics;
+    let turns = outcome.turns?;
     Ok(Json(json!({
         "runMode": "shadow",
         "applied": false,
+        "projectionMode": projection_mode.as_str(),
+        "projectionDeferred": projection_mode == agent::SimulationProjectionMode::ResponseOnly,
+        "metrics": metrics,
         "items": turns
     })))
 }
@@ -385,6 +398,36 @@ mod judge_tests {
     use super::*;
     use crate::agent::UserOperationSimulationTurn;
 
+    #[test]
+    fn dialogue_request_supports_explicit_and_legacy_projection_modes() {
+        let explicit: UserDialogueSimulationRequest = serde_json::from_value(json!({
+            "accountId": "account-1",
+            "contactId": "contact-1",
+            "messages": ["你好"],
+            "projectionMode": "response_only"
+        }))
+        .expect("explicit projectionMode request must deserialize");
+        assert_eq!(explicit.projection_mode.as_deref(), Some("response_only"));
+        assert!(!explicit.apply_memory);
+
+        let legacy: UserDialogueSimulationRequest = serde_json::from_value(json!({
+            "accountId": "account-1",
+            "contactId": "contact-1",
+            "messages": ["你好"],
+            "applyMemory": true
+        }))
+        .expect("legacy applyMemory request must deserialize");
+        assert!(legacy.apply_memory);
+        assert_eq!(
+            agent::SimulationProjectionMode::from_request(
+                legacy.projection_mode.as_deref(),
+                legacy.apply_memory,
+            )
+            .unwrap(),
+            agent::SimulationProjectionMode::MemoryLoop
+        );
+    }
+
     // 构造一个"生产已判通过"的 turn:status=would_send(simulation.rs:211 仅在
     // decision.should_reply && review_passed 时取此值),scores 健康(0-10 档)。
     fn would_send_turn() -> UserOperationSimulationTurn {
@@ -406,6 +449,7 @@ mod judge_tests {
             commit_receipt: Document::new(),
             memory_preview: Document::new(),
             state_transition: Document::new(),
+            performance: Document::new(),
         }
     }
 

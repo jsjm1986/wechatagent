@@ -41,6 +41,7 @@ import type {
   OperationHealth,
   UserOperationGuidePreview,
   SimulationTurn,
+  SimulationRunMetrics,
   OperationDomainConfig,
   OperationDomainDraft,
   SendHistoryItem
@@ -340,17 +341,32 @@ export function MemoryFactRow({ fact }: { fact: MemoryFactView }) {
 }
 
 
-export function SimulationResult({ turns }: { turns: SimulationTurn[] }) {
+export function SimulationResult({
+  turns,
+  metrics
+}: {
+  turns: SimulationTurn[];
+  metrics?: SimulationRunMetrics | null;
+}) {
   const taxonomies = useProfileStore((s) => s.taxonomies);
   if (!turns.length) return <EmptyInline text="还没有验证结果。输入多轮用户消息后开始验证。" />;
   return (
     <div className="simulationResult">
+      {metrics && (
+        <div className="simMetrics simulationRunMetrics">
+          <span>模式：{metrics.projectionMode === "memory_loop" ? "回复 + 记忆循环" : "仅回复链路"}</span>
+          <span>总耗时：{typeof metrics.totalMs === "number" ? `${metrics.totalMs} ms` : "-"}</span>
+          <span>LLM：{typeof metrics.llmCallsUsed === "number" ? metrics.llmCallsUsed : "-"} 次</span>
+          <span>投影：{metrics.projectionDeferred ? "已延后" : "已执行"}</span>
+        </div>
+      )}
       {turns.map((turn) => {
         const reviewScores = (turn.review?.scores || {}) as Record<string, number>;
         const gatewayAllowed = Boolean(turn.gatewayResult?.allowed);
         const selectedChunks = Array.isArray(turn.knowledgeRoute?.selectedChunkIds)
           ? (turn.knowledgeRoute.selectedChunkIds as string[]).length
           : 0;
+        const performance = turn.performance || {};
         return (
           <article key={turn.turn} className="simulationTurn">
             <header>
@@ -373,6 +389,9 @@ export function SimulationResult({ turns }: { turns: SimulationTurn[] }) {
               <span>知识匹配：{reviewScores.knowledgeGroundingScore ?? "-"}</span>
               <span>真人感：{reviewScores.humanLike ?? "-"}</span>
               <span>知识切片：{selectedChunks}</span>
+              <span>本轮：{typeof performance.totalMs === "number" ? `${performance.totalMs} ms` : "-"}</span>
+              <span>回复链路：{typeof performance.replyAndAuthorizationMs === "number" ? `${performance.replyAndAuthorizationMs} ms` : "-"}</span>
+              <span>投影：{performance.projectionStatus || "-"}{typeof performance.projectionMs === "number" ? ` / ${performance.projectionMs} ms` : ""}</span>
               <span>状态：{turn.stateTransition?.from ? labelFor(taxonomies, "customer_stage", String(turn.stateTransition.from)).text : "-"} → {turn.stateTransition?.to ? labelFor(taxonomies, "customer_stage", String(turn.stateTransition.to)).text : "-"}</span>
             </div>
             {Array.isArray(turn.review?.risks) && turn.review.risks.length > 0 && (

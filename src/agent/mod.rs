@@ -149,8 +149,12 @@ pub use reaction::{cap_intent_trajectory, record_user_reaction};
 pub use send_ledger::{
     recent_sends_for_contact, record_send as record_send_ledger, scan_send_ledger_outcomes,
 };
-pub use simulation::simulate_user_dialogue;
-pub(crate) use simulation::simulate_user_dialogue_with_budget;
+pub use simulation::{
+    simulate_user_dialogue, simulate_user_dialogue_with_mode, SimulationProjectionMode,
+};
+pub(crate) use simulation::{
+    simulate_user_dialogue_with_budget, simulate_user_dialogue_with_budget_and_mode,
+};
 pub use types::{
     AgentDecision, ContactSendResult, FollowUpDecision, GeneratedOperationProfile,
     KnowledgeRouteResult, ManualContactSend, RunPlannerResult, UserOperationSimulationTurn,

@@ -6,7 +6,7 @@
 //! 知识路由、状态迁移都被打包成 [`UserOperationSimulationTurn`]，给前端
 //! 展示完整轨迹。
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use mongodb::bson::{doc, oid::ObjectId, to_document, Bson, DateTime, Document};
 use mongodb::options::FindOneOptions;
@@ -45,6 +45,41 @@ use super::types::{AgentDecision, AgentTrigger, RunPlannerResult, UserOperationS
 /// module is called directly by an internal evaluation or test.
 const MAX_SIMULATION_MESSAGES: usize = 12;
 
+/// Selects whether a shadow run exercises only the response/authorization
+/// path or also runs the analytical post-decision memory projection loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SimulationProjectionMode {
+    ResponseOnly,
+    MemoryLoop,
+}
+
+impl SimulationProjectionMode {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::ResponseOnly => "response_only",
+            Self::MemoryLoop => "memory_loop",
+        }
+    }
+
+    /// Parse the HTTP value. `applyMemory=true` remains a compatibility alias
+    /// for `memory_loop`; an omitted value defaults to `response_only`.
+    pub(crate) fn from_request(value: Option<&str>, apply_memory: bool) -> Result<Self, String> {
+        if apply_memory {
+            return Ok(Self::MemoryLoop);
+        }
+        let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Ok(Self::ResponseOnly);
+        };
+        match value {
+            "response_only" | "responseOnly" | "response-only" => Ok(Self::ResponseOnly),
+            "memory_loop" | "memoryLoop" | "memory-loop" => Ok(Self::MemoryLoop),
+            other => Err(format!(
+                "unknown projectionMode '{other}', expected response_only or memory_loop"
+            )),
+        }
+    }
+}
+
 /// `run_max_llm_calls` is the per-conversation-turn ceiling used by the live
 /// gateway. A shadow request may contain several turns, and every sendable
 /// candidate now runs Reply + Reviewer + independent Claim Gate. Scale only
@@ -65,7 +100,28 @@ pub async fn simulate_user_dialogue(
     contact: Contact,
     messages: Vec<String>,
 ) -> AppResult<Vec<UserOperationSimulationTurn>> {
-    simulate_user_dialogue_with_budget(state, contact, messages)
+    simulate_user_dialogue_with_mode(
+        state,
+        contact,
+        messages,
+        SimulationProjectionMode::MemoryLoop,
+    )
+    .await
+}
+
+/// Run an isolated Shadow dialogue with an explicit projection policy.
+///
+/// Both modes execute the production reply, review, claim and authorization
+/// path. `ResponseOnly` defers analytical memory projection, while
+/// `MemoryLoop` also carries projected memory into later turns. Neither mode
+/// persists business state or sends a message.
+pub async fn simulate_user_dialogue_with_mode(
+    state: &AppState,
+    contact: Contact,
+    messages: Vec<String>,
+    projection_mode: SimulationProjectionMode,
+) -> AppResult<Vec<UserOperationSimulationTurn>> {
+    simulate_user_dialogue_with_budget_and_mode(state, contact, messages, projection_mode)
         .await?
         .turns
 }
@@ -78,6 +134,7 @@ pub async fn simulate_user_dialogue(
 pub(crate) struct SimulationRunOutcome {
     pub(crate) turns: AppResult<Vec<UserOperationSimulationTurn>>,
     pub(crate) budget: RunBudgetSnapshot,
+    pub(crate) metrics: Document,
 }
 
 pub(crate) async fn simulate_user_dialogue_with_budget(
@@ -85,6 +142,22 @@ pub(crate) async fn simulate_user_dialogue_with_budget(
     contact: Contact,
     messages: Vec<String>,
 ) -> AppResult<SimulationRunOutcome> {
+    simulate_user_dialogue_with_budget_and_mode(
+        state,
+        contact,
+        messages,
+        SimulationProjectionMode::MemoryLoop,
+    )
+    .await
+}
+
+pub(crate) async fn simulate_user_dialogue_with_budget_and_mode(
+    state: &AppState,
+    contact: Contact,
+    messages: Vec<String>,
+    projection_mode: SimulationProjectionMode,
+) -> AppResult<SimulationRunOutcome> {
+    let started_at = Instant::now();
     let domain_config =
         load_user_operation_domain_config_for_contact(state, &contact.workspace_id, &contact.wxid)
             .await?;
@@ -122,17 +195,86 @@ pub(crate) async fn simulate_user_dialogue_with_budget(
                     runtime,
                     run_id,
                     budget.clone(),
+                    projection_mode,
                 ),
             ),
         )
         .await;
     let budget = budget.snapshot();
-    Ok(SimulationRunOutcome { turns, budget })
+    let metrics = simulation_run_metrics(projection_mode, started_at.elapsed(), &turns, &budget);
+    Ok(SimulationRunOutcome {
+        turns,
+        budget,
+        metrics,
+    })
+}
+
+fn simulation_run_metrics(
+    projection_mode: SimulationProjectionMode,
+    elapsed: std::time::Duration,
+    turns: &AppResult<Vec<UserOperationSimulationTurn>>,
+    budget: &RunBudgetSnapshot,
+) -> Document {
+    let mut turn_count = 0_i64;
+    let mut projection_deferred = 0_i64;
+    let mut projection_failed = 0_i64;
+    let mut stage_totals = doc! {
+        "totalMs": 0_i64,
+        "knowledgeRouteMs": 0_i64,
+        "replyAndAuthorizationMs": 0_i64,
+        "projectionMs": 0_i64,
+    };
+    if let Ok(turns) = turns {
+        turn_count = turns.len() as i64;
+        for turn in turns {
+            for key in [
+                "totalMs",
+                "knowledgeRouteMs",
+                "replyAndAuthorizationMs",
+                "projectionMs",
+            ] {
+                let value = turn
+                    .performance
+                    .get_i64(key)
+                    .or_else(|_| turn.performance.get_i32(key).map(i64::from))
+                    .unwrap_or_default();
+                let current = stage_totals.get_i64(key).unwrap_or_default();
+                stage_totals.insert(key, current.saturating_add(value));
+            }
+            match turn
+                .performance
+                .get_str("projectionStatus")
+                .unwrap_or_default()
+            {
+                "deferred" => projection_deferred += 1,
+                "failed" => projection_failed += 1,
+                _ => {}
+            }
+        }
+    }
+    doc! {
+        "projectionMode": projection_mode.as_str(),
+        "projectionDeferred": projection_mode == SimulationProjectionMode::ResponseOnly,
+        "totalMs": elapsed.as_millis().min(i64::MAX as u128) as i64,
+        "turnCount": turn_count,
+        "projectionDeferredTurns": projection_deferred,
+        "projectionFailedTurns": projection_failed,
+        "stageTotals": stage_totals,
+        "llmCallsUsed": budget.llm_calls_used,
+        "tokensUsed": budget.tokens_used,
+        "unknownUsageCalls": budget.unknown_usage_calls,
+        "toolCallsUsed": budget.tool_calls_used,
+        "degradedReasons": budget.degraded_reasons.clone(),
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::simulation_llm_call_budget;
+    use mongodb::bson::{doc, Document};
+
+    use super::{simulation_llm_call_budget, simulation_run_metrics, SimulationProjectionMode};
+    use crate::agent::budget::RunBudget;
+    use crate::agent::types::UserOperationSimulationTurn;
 
     #[test]
     fn shadow_llm_budget_scales_with_bounded_turn_count() {
@@ -147,6 +289,66 @@ mod tests {
     fn shadow_llm_budget_handles_invalid_or_large_base_limits() {
         assert_eq!(simulation_llm_call_budget(-1, 4), 0);
         assert_eq!(simulation_llm_call_budget(i32::MAX, 12), i32::MAX);
+    }
+
+    #[test]
+    fn projection_mode_defaults_to_response_only_and_honors_legacy_alias() {
+        assert_eq!(
+            SimulationProjectionMode::from_request(None, false).unwrap(),
+            SimulationProjectionMode::ResponseOnly
+        );
+        assert_eq!(
+            SimulationProjectionMode::from_request(Some("memoryLoop"), false).unwrap(),
+            SimulationProjectionMode::MemoryLoop
+        );
+        assert_eq!(
+            SimulationProjectionMode::from_request(Some("response_only"), true).unwrap(),
+            SimulationProjectionMode::MemoryLoop
+        );
+        assert!(SimulationProjectionMode::from_request(Some("unsafe"), false).is_err());
+    }
+
+    #[test]
+    fn response_only_metrics_mark_projection_as_deferred() {
+        let budget = RunBudget::new("test", 100, 10, 10).snapshot();
+        let turn = UserOperationSimulationTurn {
+            turn: 1,
+            inbound_text: "hi".to_string(),
+            should_reply: true,
+            reply_text: "hello".to_string(),
+            status: "would_send".to_string(),
+            decision: Document::new(),
+            review: Document::new(),
+            gateway_result: Document::new(),
+            knowledge_route: Document::new(),
+            context_pack: Document::new(),
+            commit_receipt: Document::new(),
+            memory_preview: Document::new(),
+            state_transition: Document::new(),
+            performance: doc! {
+                "totalMs": 12_i64,
+                "knowledgeRouteMs": 2_i64,
+                "replyAndAuthorizationMs": 8_i64,
+                "projectionMs": 0_i64,
+                "projectionStatus": "deferred",
+            },
+        };
+        let metrics = simulation_run_metrics(
+            SimulationProjectionMode::ResponseOnly,
+            std::time::Duration::from_millis(20),
+            &Ok(vec![turn]),
+            &budget,
+        );
+        assert!(metrics.get_bool("projectionDeferred").unwrap());
+        assert_eq!(metrics.get_i64("projectionDeferredTurns").unwrap(), 1);
+        assert_eq!(
+            metrics
+                .get_document("stageTotals")
+                .unwrap()
+                .get_i64("projectionMs")
+                .unwrap(),
+            0
+        );
     }
 }
 
@@ -565,6 +767,7 @@ async fn simulate_user_dialogue_inner(
     runtime: UserRuntimeParameters,
     run_id: String,
     budget: Arc<RunBudget>,
+    projection_mode: SimulationProjectionMode,
 ) -> AppResult<Vec<UserOperationSimulationTurn>> {
     let playbook = load_operation_playbook_for_contact(state, &contact).await?;
     let memory = load_operating_memory_read_only(state, &contact).await?;
@@ -620,6 +823,7 @@ async fn simulate_user_dialogue_inner(
     let mut turns = Vec::new();
 
     for (index, text) in messages.into_iter().enumerate() {
+        let turn_started_at = Instant::now();
         let turn_contact = projection.contact.clone();
         let turn_memory = projection.memory.clone();
         let inbound = ConversationMessage {
@@ -662,6 +866,7 @@ async fn simulate_user_dialogue_inner(
             ..Default::default()
         };
         // ── WB5：simulation 与生产 gateway 对齐——永远先跑知识路由 ───────────
+        let knowledge_route_started_at = Instant::now();
         let knowledge_route = if budget.is_exceeded() {
             budget.mark_degraded("simulation_knowledge_route_skipped_budget_exceeded");
             let mut route = empty_knowledge_route(&initial_planner);
@@ -680,12 +885,17 @@ async fn simulate_user_dialogue_inner(
             )
             .await?
         };
+        let knowledge_route_ms = knowledge_route_started_at
+            .elapsed()
+            .as_millis()
+            .min(i64::MAX as u128) as i64;
         let selected_chunks =
             select_operation_knowledge_chunks(&operation_knowledge.chunks, &knowledge_route);
         let turn_id = inbound
             .message_id
             .clone()
             .unwrap_or_else(|| format!("shadow-turn-{}", index + 1));
+        let reply_started_at = Instant::now();
         let authority = super::authority::compile(super::authority::AuthorityCompileInput {
             state,
             run_id: &run_id,
@@ -771,19 +981,18 @@ async fn simulate_user_dialogue_inner(
         let final_status = outcome.authorization.final_status.clone();
         let mut decision = outcome.draft.decision;
         let review = outcome.authorization.review;
+        let reply_and_authorization_ms =
+            reply_started_at.elapsed().as_millis().min(i64::MAX as u128) as i64;
         if !authorized {
             decision.should_reply = false;
             decision.autonomy_mode = "blocked".to_string();
         }
-        let status = if !gateway.allowed {
-            "gateway_blocked".to_string()
-        } else if authorized && decision.should_reply {
-            "would_send".to_string()
-        } else if authorized {
-            "no_reply".to_string()
-        } else {
-            final_status
-        };
+        let status = canonical_simulation_status(
+            gateway.allowed,
+            authorized,
+            decision.should_reply,
+            final_status,
+        );
         let would_send = status == "would_send";
         let current_state = turn_contact
             .operation_state
@@ -793,6 +1002,8 @@ async fn simulate_user_dialogue_inner(
         let mut projection_window = history.clone();
         projection_window.push(inbound.clone());
         let mut memory_preview = doc! { "status": "not_authorized" };
+        let projection_started_at = Instant::now();
+        let mut projection_status = "not_authorized";
         if gateway.allowed && authorized {
             let applied_at = DateTime::now();
             projection.apply_authorized_decision(
@@ -802,65 +1013,83 @@ async fn simulate_user_dialogue_inner(
                 would_send,
                 applied_at,
             )?;
-            match super::post_decision::generate_projection_read_only(
-                state,
-                &decision,
-                &projection.memory,
-                &context_pack,
-                domain_config.as_ref(),
-                &active_profile,
-                &model_assets.active_products,
-                &projection_window,
-                &projection.contact,
-                &run_id,
-            )
-            .await
-            {
-                Ok(deferred) => match super::post_decision::normalize_projection_read_only(
+            if projection_mode == SimulationProjectionMode::MemoryLoop {
+                match super::post_decision::generate_projection_read_only(
                     state,
-                    &projection.contact,
+                    &decision,
+                    &projection.memory,
+                    &context_pack,
                     domain_config.as_ref(),
                     &active_profile,
-                    deferred,
+                    &model_assets.active_products,
+                    &projection_window,
+                    &projection.contact,
+                    &run_id,
                 )
                 .await
                 {
-                    Ok(projected_decision) => {
-                        projection.apply_deferred_projection(
-                            &projected_decision,
-                            domain_config.as_ref(),
-                            &active_profile,
-                            &projection_window,
-                            DateTime::now(),
-                        );
-                        memory_preview = doc! {
-                            "status": "applied",
-                            "operatingMemoryUpdate": projected_decision.operating_memory_update,
-                            "memoryCandidates": projected_decision.memory_candidates,
-                            "memoryWriteScore": projected_decision.memory_write_score,
-                            "memoryUpdate": projected_decision.memory_update,
-                            "memoryCard": to_document(&projection.memory.memory_card).unwrap_or_default(),
-                        };
-                    }
+                    Ok(deferred) => match super::post_decision::normalize_projection_read_only(
+                        state,
+                        &projection.contact,
+                        domain_config.as_ref(),
+                        &active_profile,
+                        deferred,
+                    )
+                    .await
+                    {
+                        Ok(projected_decision) => {
+                            projection.apply_deferred_projection(
+                                &projected_decision,
+                                domain_config.as_ref(),
+                                &active_profile,
+                                &projection_window,
+                                DateTime::now(),
+                            );
+                            projection_status = "applied";
+                            memory_preview = doc! {
+                                "status": "applied",
+                                "operatingMemoryUpdate": projected_decision.operating_memory_update,
+                                "memoryCandidates": projected_decision.memory_candidates,
+                                "memoryWriteScore": projected_decision.memory_write_score,
+                                "memoryUpdate": projected_decision.memory_update,
+                                "memoryCard": to_document(&projection.memory.memory_card).unwrap_or_default(),
+                            };
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, %run_id, %turn_id, "simulation projection normalization failed");
+                            projection_status = "failed";
+                            memory_preview = doc! {
+                                "status": "failed",
+                                "reason": "projection_normalization_failed",
+                            };
+                        }
+                    },
                     Err(error) => {
-                        tracing::warn!(%error, %run_id, %turn_id, "simulation projection normalization failed");
+                        tracing::warn!(%error, %run_id, %turn_id, "simulation deferred projection failed");
+                        projection_status = "failed";
                         memory_preview = doc! {
                             "status": "failed",
-                            "reason": "projection_normalization_failed",
+                            "reason": "projection_generation_failed",
                         };
                     }
-                },
-                Err(error) => {
-                    tracing::warn!(%error, %run_id, %turn_id, "simulation deferred projection failed");
-                    memory_preview = doc! {
-                        "status": "failed",
-                        "reason": "projection_generation_failed",
-                    };
                 }
+            } else {
+                projection_status = "deferred";
+                memory_preview = doc! {
+                    "status": "deferred",
+                    "reason": "response_only_mode",
+                    "projectionMode": projection_mode.as_str(),
+                };
             }
         } else if !gateway.allowed {
+            projection_status = "gateway_blocked";
             memory_preview = doc! { "status": "gateway_blocked" };
         }
+        let projection_ms = projection_started_at
+            .elapsed()
+            .as_millis()
+            .min(i64::MAX as u128) as i64;
+        let total_ms = turn_started_at.elapsed().as_millis().min(i64::MAX as u128) as i64;
         let next_state = projection
             .contact
             .operation_state
@@ -885,6 +1114,14 @@ async fn simulate_user_dialogue_inner(
                 "reason": decision.operation_state_reason.clone().unwrap_or_default(),
                 "accepted": projection.contact.operation_state != turn_contact.operation_state,
             },
+            performance: doc! {
+                "totalMs": total_ms,
+                "knowledgeRouteMs": knowledge_route_ms,
+                "replyAndAuthorizationMs": reply_and_authorization_ms,
+                "projectionMs": projection_ms,
+                "projectionStatus": projection_status,
+                "projectionMode": projection_mode.as_str(),
+            },
         });
         history.push(inbound);
         if would_send {
@@ -906,4 +1143,24 @@ async fn simulate_user_dialogue_inner(
         }
     }
     Ok(turns)
+}
+
+/// Keep the externally visible shadow terminal state independent from the
+/// optional analytical projection. A projection failure must never turn an
+/// otherwise authorized reply into a reply failure.
+fn canonical_simulation_status(
+    gateway_allowed: bool,
+    authorized: bool,
+    should_reply: bool,
+    final_status: String,
+) -> String {
+    if !gateway_allowed {
+        "gateway_blocked".to_string()
+    } else if authorized && should_reply {
+        "would_send".to_string()
+    } else if authorized {
+        "no_reply".to_string()
+    } else {
+        final_status
+    }
 }

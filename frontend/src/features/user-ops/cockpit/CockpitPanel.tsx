@@ -15,7 +15,8 @@ import type {
   OperationPlaybook,
   UserOperationGuidePreview,
   Message,
-  SimulationTurn
+  SimulationTurn,
+  SimulationRunMetrics
 } from "../../../types";
 import { useProfileStore } from "../../../stores/profileStore";
 import { principalEscalationCount, useInboxStore } from "../../../stores/inboxStore";
@@ -59,6 +60,7 @@ export type CockpitPanelProps = {
   simulationBusy: boolean;
   simulationInput: string;
   simulationTurns: SimulationTurn[];
+  simulationRunMetrics?: SimulationRunMetrics | null;
   onAnalyzeProfile: () => void;
   onApplyGuidePreview: (confirmGlobalImpact?: boolean) => void;
   onDisableAgent: () => void;

@@ -591,6 +591,31 @@ export type SimulationTurn = {
   contextPack?: Record<string, unknown>;
   memoryPreview: Record<string, unknown>;
   stateTransition: Record<string, unknown>;
+  performance?: {
+    totalMs?: number;
+    knowledgeRouteMs?: number;
+    replyAndAuthorizationMs?: number;
+    projectionMs?: number;
+    projectionStatus?: string;
+    projectionMode?: string;
+    [key: string]: unknown;
+  };
+};
+
+export type SimulationRunMetrics = {
+  projectionMode?: string;
+  projectionDeferred?: boolean;
+  totalMs?: number;
+  turnCount?: number;
+  projectionDeferredTurns?: number;
+  projectionFailedTurns?: number;
+  llmCallsUsed?: number;
+  tokensUsed?: number;
+  unknownUsageCalls?: number;
+  toolCallsUsed?: number;
+  stageTotals?: Record<string, unknown>;
+  degradedReasons?: string[];
+  [key: string]: unknown;
 };
 
 export type DomainKey = "user_operations" | "group_operations" | "moment_operations";
