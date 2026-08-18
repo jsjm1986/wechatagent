@@ -975,10 +975,7 @@ fn has_protocol_violation(risks: &[String]) -> bool {
 /// 不给，正是 t15 跌单弧暴露的"闸门系统性过度拦截/全程哑火"真 bug。它改由
 /// [`is_insufficient_detail_tag`] 识别、走 single-shot revision 通道（与软闸失败同路）。
 fn is_protocol_violation_tag(risk: &str) -> bool {
-    risk.starts_with("missing_required_field:")
-        || risk.starts_with("invalid_enum_value:")
-        || risk.starts_with("invalid_type:")
-        || risk.starts_with("decision_phase_invalid:")
+    crate::agent::types::is_reply_protocol_violation(risk)
 }
 
 /// 单个 risk 标签是否属于"关键轮推理字段偏短"语义（spec R1.5 长度违规）。

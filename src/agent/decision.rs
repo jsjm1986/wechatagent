@@ -891,11 +891,13 @@ pub(crate) async fn decide_reply_with_promote_context(
     let principal_channel_available = domain_config
         .map(super::escalation::resolve_ask_human_policy)
         .is_some_and(|policy| !policy.decider_chain.is_empty());
-    let typed_route_handoff_text = if include_business {
-        format_typed_route_handoff_for_prompt(knowledge_route, principal_channel_available)
-    } else {
-        String::new()
-    };
+    // A customer clarification is a lightweight typed hand-off: it does not need the Full
+    // business snapshot, but Lean must still see the Knowledge Agent's closed decision so it can
+    // ask exactly one useful question instead of inventing a reply.  Ask-principal/defer routes
+    // are also safe to render here; their generation tier is selected separately by the route
+    // capability function above.
+    let typed_route_handoff_text =
+        format_typed_route_handoff_for_prompt(knowledge_route, principal_channel_available);
     // agent-autonomy-loop W5 / Task 6.5：注入最近 K=5 条 deprecated_facts，
     // 让 Reply Agent 知道哪些事实已过期，避免再次引用。仅传 id / text /
     // deprecation_reason / deprecated_at，按 deprecated_at 降序。
@@ -1429,7 +1431,20 @@ pub(crate) async fn decide_reply_with_promote_context(
     // invalid_type:* / decision_phase_invalid:* /
     // insufficient_detail_in_critical_turn:*`）。risks 由调用方在
     // `finalize_review_for_send` 阶段消费。
-    let raw: RawAgentDecision = serde_json::from_value(value).map_err(AppError::from)?;
+    let raw: RawAgentDecision = match serde_json::from_value(value) {
+        Ok(raw) => raw,
+        Err(error) => {
+            tracing::warn!(%error, "reply decision wire contract could not be deserialized");
+            let decision = AgentDecision {
+                decision_phase: "final".to_string(),
+                next_step: "repair".to_string(),
+                should_reply: false,
+                autonomy_mode: "blocked".to_string(),
+                ..Default::default()
+            };
+            return Ok((decision, vec!["invalid_type:reply_decision".to_string()]));
+        }
+    };
     // universal-domain-adaptation H9：active_profile 已在函数顶部加载。`runtime` 由
     // from_config 给的内置默认四模式；这里用 profile.conversation_modes 覆盖（非空时），
     // 让 validate_and_promote 按本行业声明的模式集合做严格枚举校验。DEFAULT 销售域
@@ -1841,7 +1856,7 @@ pub(crate) fn format_typed_route_handoff_for_prompt(
     });
     let instruction = match handoff {
         KnowledgeHandoffKind::ClarifyCustomer => {
-            "请将这个交接完整落成一个最终动作：nextStep=clarify、shouldReply=true，只问一个真正能补齐 missingInformation 的自然问题。不要附带请示、预约、承诺、跟进、素材或名片，也不要补写缺失事实。"
+            "请将这个交接完整落成一个最终动作：nextStep=clarify、sufficiency=need_clarification、shouldReply=true，并在 clarificationIntent 写清要补齐的缺口；客户可见回复只问一个真正能补齐 missingInformation 的自然问题。不要附带请示、预约、承诺、跟进、素材或名片，也不要补写缺失事实。"
         }
         KnowledgeHandoffKind::AskPrincipal => {
             "请将这个交接完整落成一个最终动作：nextStep=ask_principal、escalationRequest.needed=true、category=out_of_scope_decision，并填写具体 reason 与 questionForPrincipal；shouldReply=true，回复用第一人称自然承接。不要引用缺失事实。"
@@ -2530,6 +2545,7 @@ mod persona_override_tests {
         };
         let clarify_text = format_typed_route_handoff_for_prompt(&clarify, false);
         assert!(clarify_text.contains("nextStep=clarify"));
+        assert!(clarify_text.contains("sufficiency=need_clarification"));
         assert!(clarify_text.contains("客户希望的时间范围"));
 
         let defer = KnowledgeRouteResult {

@@ -56,7 +56,8 @@ use super::guards::{
 use super::knowledge_router::{
     empty_knowledge_route, load_operation_knowledge, maybe_emit_unverified_warning,
     route_operation_knowledge, route_operation_knowledge_for_existing_candidate,
-    route_used_knowledge_ids, select_operation_knowledge_chunks, write_knowledge_usage_log,
+    route_requires_full_generation, route_requires_knowledge_review, route_used_knowledge_ids,
+    select_operation_knowledge_chunks, write_knowledge_usage_log,
 };
 use super::memory::{
     contact_memory_consolidation_due, effective_memory_card, effective_memory_card_for_contact,
@@ -2757,27 +2758,6 @@ fn run_user_operation_gateway_inner<'a>(
     } else {
         envelope_source_event_id.as_str()
     };
-    let persona_world_state = match super::persona_world_state::ensure_effective_world_state(
-        state,
-        &contact.workspace_id,
-        &contact.account_id,
-        effective_soul,
-        runtime.quiet_hours_tz_offset_hours,
-        Some(&run_id),
-    )
-    .await
-    {
-        Ok(world_state) => world_state,
-        Err(error) => {
-            tracing::warn!(
-                %error,
-                workspace_id = %contact.workspace_id,
-                account_id = %contact.account_id,
-                "persona world-state generation failed soft"
-            );
-            None
-        }
-    };
     let authority = super::authority::compile(super::authority::AuthorityCompileInput {
         state,
         run_id: &run_id,
@@ -2790,23 +2770,36 @@ fn run_user_operation_gateway_inner<'a>(
         referral_cards: &referral_cards,
         effective_soul,
         projected_appointments: &[],
-        projected_world_state: persona_world_state.as_ref(),
+        // Authority reads any already-effective durable state. Missing optional social texture
+        // must never synchronously generate on the customer-response critical path.
+        projected_world_state: None,
         invocation: super::authority::AuthorityInvocation::Conversation,
         evaluated_at: DateTime::now(),
     })
     .await?;
     authority.persist_initial(&state.db).await?;
 
-    let route_future = route_gateway_knowledge(
-        state,
-        &contact,
-        &inbound,
-        &recent_messages,
-        &memory,
-        &context_pack,
-        &operation_knowledge,
-        &initial_planner,
-        &run_id,
+    let turn_timeouts = super::turn_loop::TurnLoopTimeouts::from_seconds(
+        state.config.agent_turn_phase_timeout_seconds,
+        state.config.agent_turn_repair_timeout_seconds,
+        state.config.agent_turn_authorization_timeout_seconds,
+        state.config.agent_turn_total_timeout_seconds,
+    );
+    let turn_total_deadline = turn_timeouts.total_deadline_from_now();
+    let route_future = turn_timeouts.run_initial_phase(
+        "knowledge_route",
+        turn_total_deadline,
+        route_gateway_knowledge(
+            state,
+            &contact,
+            &inbound,
+            &recent_messages,
+            &memory,
+            &context_pack,
+            &operation_knowledge,
+            &initial_planner,
+            &run_id,
+        ),
     );
 
     let mut first_generation_full = false;
@@ -2823,8 +2816,7 @@ fn run_user_operation_gateway_inner<'a>(
                 &route_used_knowledge_ids(&route),
                 DateTime::now(),
             )?;
-            let route_needs_full = crate::agent::knowledge_router::route_requires_full_context(&route)
-                || !route_used_knowledge_ids(&route).is_empty();
+            let route_needs_full = route_requires_full_generation(&route);
             if route_needs_full {
                 first_generation_full = true;
                 write_event_for_account(
@@ -2845,68 +2837,78 @@ fn run_user_operation_gateway_inner<'a>(
                 )
                 .await
                 .ok();
-                let first = decide_reply_with_promote(
-                    state,
-                    &contact,
-                    &inbound,
-                    &recent_messages,
-                    &pending_tasks,
-                    playbook.as_ref(),
-                    domain_config.as_ref(),
-                    &runtime,
-                    &memory,
-                    &context_pack,
-                    &route_chunks,
-                    &route,
-                    None,
-                    Some(&run_id),
-                    None,
-                    crate::agent::sufficiency::PromptTier::Full,
-                    Some(DecisionRunSnapshot {
-                        active_profile: &active_profile,
-                        active_products: &active_products,
-                        published_soul: published_soul.as_deref(),
-                        sendable_assets: &sendable_assets,
-                        referral_cards: &referral_cards,
-                        reply_prompts: &reply_prompts,
-                        reply_context: &reply_context,
-                        authority: &authority,
-                    }),
-                )
-                .await?;
+                let first = turn_timeouts
+                    .run_initial_phase(
+                        "initial_reply",
+                        turn_total_deadline,
+                        decide_reply_with_promote(
+                            state,
+                            &contact,
+                            &inbound,
+                            &recent_messages,
+                            &pending_tasks,
+                            playbook.as_ref(),
+                            domain_config.as_ref(),
+                            &runtime,
+                            &memory,
+                            &context_pack,
+                            &route_chunks,
+                            &route,
+                            None,
+                            Some(&run_id),
+                            None,
+                            crate::agent::sufficiency::PromptTier::Full,
+                            Some(DecisionRunSnapshot {
+                                active_profile: &active_profile,
+                                active_products: &active_products,
+                                published_soul: published_soul.as_deref(),
+                                sendable_assets: &sendable_assets,
+                                referral_cards: &referral_cards,
+                                reply_prompts: &reply_prompts,
+                                reply_context: &reply_context,
+                                authority: &authority,
+                            }),
+                        ),
+                    )
+                    .await?;
                 (route, first.0, first.1)
             } else {
                 let lean_route = empty_knowledge_route(&initial_planner);
                 let lean_chunks: Vec<crate::models::OperationKnowledgeChunk> = Vec::new();
-                let first = decide_reply_with_promote(
-                    state,
-                    &contact,
-                    &inbound,
-                    &recent_messages,
-                    &pending_tasks,
-                    playbook.as_ref(),
-                    domain_config.as_ref(),
-                    &runtime,
-                    &memory,
-                    &context_pack,
-                    &lean_chunks,
-                    &lean_route,
-                    None,
-                    Some(&run_id),
-                    None,
-                    crate::agent::sufficiency::PromptTier::Lean,
-                    Some(DecisionRunSnapshot {
-                        active_profile: &active_profile,
-                        active_products: &active_products,
-                        published_soul: published_soul.as_deref(),
-                        sendable_assets: &sendable_assets,
-                        referral_cards: &referral_cards,
-                        reply_prompts: &reply_prompts,
-                        reply_context: &reply_context,
-                        authority: &authority,
-                    }),
-                )
-                .await?;
+                let first = turn_timeouts
+                    .run_initial_phase(
+                        "initial_reply",
+                        turn_total_deadline,
+                        decide_reply_with_promote(
+                            state,
+                            &contact,
+                            &inbound,
+                            &recent_messages,
+                            &pending_tasks,
+                            playbook.as_ref(),
+                            domain_config.as_ref(),
+                            &runtime,
+                            &memory,
+                            &context_pack,
+                            &lean_chunks,
+                            &lean_route,
+                            None,
+                            Some(&run_id),
+                            None,
+                            crate::agent::sufficiency::PromptTier::Lean,
+                            Some(DecisionRunSnapshot {
+                                active_profile: &active_profile,
+                                active_products: &active_products,
+                                published_soul: published_soul.as_deref(),
+                                sendable_assets: &sendable_assets,
+                                referral_cards: &referral_cards,
+                                reply_prompts: &reply_prompts,
+                                reply_context: &reply_context,
+                                authority: &authority,
+                            }),
+                        ),
+                    )
+                    .await?;
                 (route, first.0, first.1)
             }
         } else {
@@ -2919,35 +2921,40 @@ fn run_user_operation_gateway_inner<'a>(
                 &route_used_knowledge_ids(&route),
                 DateTime::now(),
             )?;
-            let first = decide_reply_with_promote(
-                state,
-                &contact,
-                &inbound,
-                &recent_messages,
-                &pending_tasks,
-                playbook.as_ref(),
-                domain_config.as_ref(),
-                &runtime,
-                &memory,
-                &context_pack,
-                &chunks,
-                &route,
-                None,
-                Some(&run_id),
-                None,
-                crate::agent::sufficiency::PromptTier::Full,
-                Some(DecisionRunSnapshot {
-                    active_profile: &active_profile,
-                    active_products: &active_products,
-                    published_soul: published_soul.as_deref(),
-                    sendable_assets: &sendable_assets,
-                    referral_cards: &referral_cards,
-                    reply_prompts: &reply_prompts,
-                    reply_context: &reply_context,
-                    authority: &authority,
-                }),
-            )
-            .await?;
+            let first = turn_timeouts
+                .run_initial_phase(
+                    "initial_reply",
+                    turn_total_deadline,
+                    decide_reply_with_promote(
+                        state,
+                        &contact,
+                        &inbound,
+                        &recent_messages,
+                        &pending_tasks,
+                        playbook.as_ref(),
+                        domain_config.as_ref(),
+                        &runtime,
+                        &memory,
+                        &context_pack,
+                        &chunks,
+                        &route,
+                        None,
+                        Some(&run_id),
+                        None,
+                        crate::agent::sufficiency::PromptTier::Full,
+                        Some(DecisionRunSnapshot {
+                            active_profile: &active_profile,
+                            active_products: &active_products,
+                            published_soul: published_soul.as_deref(),
+                            sendable_assets: &sendable_assets,
+                            referral_cards: &referral_cards,
+                            reply_prompts: &reply_prompts,
+                            reply_context: &reply_context,
+                            authority: &authority,
+                        }),
+                    ),
+                )
+                .await?;
             (route, first.0, first.1)
         };
     let selected_chunks =
@@ -3047,7 +3054,7 @@ fn run_user_operation_gateway_inner<'a>(
     // referral remains an AI decision; do not pre-classify the inbound text with a phrase list.
     let has_explicit_referral_context = has_eligible_referral_candidate;
     let has_structured_knowledge_directive =
-        crate::agent::knowledge_router::route_requires_full_context(&knowledge_route);
+        crate::agent::knowledge_router::route_requires_full_generation(&knowledge_route);
     let forced_full_reason = crate::agent::sufficiency::forced_full_context_reason(
         &decision_first,
         has_cited_knowledge_context,
@@ -3089,7 +3096,7 @@ fn run_user_operation_gateway_inner<'a>(
                 .await
                 .ok();
                 // B-1:升 Full 前放宽本 run 的 token gating 上限,让「Lean 探测 + Full 程
-                // + review + 一次 rewrite」不撑爆 base run_token_budget(150000)而被
+                // + review + 一次 rewrite」不撑爆 base run_token_budget(300000)而被
                 // blocked_by_budget 拦回复。tokens_used 仍如实累计,只放宽判定上限。
                 if let Some(b) = current_run_budget() {
                     b.grant_escalated_ceiling(runtime.run_token_budget_escalated);
@@ -3097,35 +3104,40 @@ fn run_user_operation_gateway_inner<'a>(
                     // Reviewer + ClaimGate (and optional dual Reviewer).
                     b.grant_additional_llm_calls(1);
                 }
-                decide_reply_with_promote(
-                    state,
-                    &contact,
-                    &inbound,
-                    &recent_messages,
-                    &pending_tasks,
-                    playbook.as_ref(),
-                    domain_config.as_ref(),
-                    &runtime,
-                    &memory,
-                    &context_pack,
-                    &selected_chunks,
-                    &knowledge_route,
-                    None,
-                    Some(&run_id),
-                    None,
-                    crate::agent::sufficiency::PromptTier::Full,
-                    Some(DecisionRunSnapshot {
-                        active_profile: &active_profile,
-                        active_products: &active_products,
-                        published_soul: published_soul.as_deref(),
-                        sendable_assets: &sendable_assets,
-                        referral_cards: &referral_cards,
-                        reply_prompts: &reply_prompts,
-                        reply_context: &reply_context,
-                        authority: &authority,
-                    }),
-                )
-                .await?
+                turn_timeouts
+                    .run_initial_phase(
+                        "progressive_reply",
+                        turn_total_deadline,
+                        decide_reply_with_promote(
+                            state,
+                            &contact,
+                            &inbound,
+                            &recent_messages,
+                            &pending_tasks,
+                            playbook.as_ref(),
+                            domain_config.as_ref(),
+                            &runtime,
+                            &memory,
+                            &context_pack,
+                            &selected_chunks,
+                            &knowledge_route,
+                            None,
+                            Some(&run_id),
+                            None,
+                            crate::agent::sufficiency::PromptTier::Full,
+                            Some(DecisionRunSnapshot {
+                                active_profile: &active_profile,
+                                active_products: &active_products,
+                                published_soul: published_soul.as_deref(),
+                                sendable_assets: &sendable_assets,
+                                referral_cards: &referral_cards,
+                                reply_prompts: &reply_prompts,
+                                reply_context: &reply_context,
+                                authority: &authority,
+                            }),
+                        ),
+                    )
+                    .await?
             } else {
                 // ①观测(weak 灰区):未强升时查收窄后的 is_coverage_optimism,只记不拦。
                 if crate::agent::sufficiency::is_coverage_optimism(
@@ -3192,35 +3204,40 @@ fn run_user_operation_gateway_inner<'a>(
             if let Some(b) = current_run_budget() {
                 b.grant_escalated_ceiling(runtime.run_token_budget_escalated);
             }
-            decide_reply_with_promote(
-                state,
-                &contact,
-                &inbound,
-                &recent_messages,
-                &pending_tasks,
-                playbook.as_ref(),
-                domain_config.as_ref(),
-                &runtime,
-                &memory,
-                &context_pack,
-                &selected_chunks,
-                &knowledge_route,
-                None,
-                Some(&run_id),
-                None,
-                target_tier,
-                Some(DecisionRunSnapshot {
-                    active_profile: &active_profile,
-                    active_products: &active_products,
-                    published_soul: published_soul.as_deref(),
-                    sendable_assets: &sendable_assets,
-                    referral_cards: &referral_cards,
-                        reply_prompts: &reply_prompts,
-                        reply_context: &reply_context,
-                        authority: &authority,
-                    }),
-            )
-            .await?
+            turn_timeouts
+                .run_initial_phase(
+                    "progressive_reply",
+                    turn_total_deadline,
+                    decide_reply_with_promote(
+                        state,
+                        &contact,
+                        &inbound,
+                        &recent_messages,
+                        &pending_tasks,
+                        playbook.as_ref(),
+                        domain_config.as_ref(),
+                        &runtime,
+                        &memory,
+                        &context_pack,
+                        &selected_chunks,
+                        &knowledge_route,
+                        None,
+                        Some(&run_id),
+                        None,
+                        target_tier,
+                        Some(DecisionRunSnapshot {
+                            active_profile: &active_profile,
+                            active_products: &active_products,
+                            published_soul: published_soul.as_deref(),
+                            sendable_assets: &sendable_assets,
+                            referral_cards: &referral_cards,
+                            reply_prompts: &reply_prompts,
+                            reply_context: &reply_context,
+                            authority: &authority,
+                        }),
+                    ),
+                )
+                .await?
         }
         crate::agent::sufficiency::TierDecision::Clarify => {
             // C：信息不足需澄清。第一程已生成澄清向回复，直接用它进后续 review/finalize。
@@ -3285,9 +3302,7 @@ fn run_user_operation_gateway_inner<'a>(
     normalize_decision_runtime(&mut decision, &initial_planner);
     let mut initial_turn_planner =
         planner_from_decision(&decision, "Reply Agent 首轮决策（共享 Harness）");
-    if !knowledge_route.selected_chunk_ids.is_empty()
-        || !knowledge_route.selected_knowledge_ids.is_empty()
-    {
+    if route_requires_knowledge_review(&knowledge_route) {
         initial_turn_planner.knowledge_required = true;
         if initial_turn_planner.review_mode.trim().is_empty() {
             initial_turn_planner.review_mode = "full".to_string();
@@ -3372,13 +3387,15 @@ fn run_user_operation_gateway_inner<'a>(
             },
         ),
     );
-    let turn_outcome = super::turn_loop::run_turn(
+    let turn_outcome = super::turn_loop::run_turn_with_deadline(
         &super::turn_loop::TurnKernelInput {
             run_id: &run_id,
             turn_id,
             authority_bundle_hash: authority.bundle_hash(),
         },
         &mut turn_environment,
+        turn_timeouts,
+        turn_total_deadline,
     )
     .await?;
     for event in turn_environment.pending_finalize_events() {
@@ -3445,6 +3462,13 @@ fn run_user_operation_gateway_inner<'a>(
         )
         .await;
     }
+    super::persona_world_state::schedule_world_state_refresh(
+        state,
+        &contact.workspace_id,
+        &contact.account_id,
+        effective_soul,
+        runtime.quiet_hours_tz_offset_hours,
+    );
     return Ok(());
 
     }
@@ -6433,13 +6457,20 @@ mod tests {
     // 客户回应保障守卫判定纯函数（黑名单语义）：
     // 只要 Inbound 且 status 不在豁免清单内就补占位（覆盖真正的晾死：held/blocked/precheck）。
     #[test]
-    fn ack_placeholder_inbound_held_and_blocked_terminals_get_ack() {
+    fn ack_placeholder_inbound_holds_get_ack() {
         for status in [
             "held_by_ai_policy",
             "blocked_by_required_field",
             "blocked_by_budget",
             "blocked_by_safety_guard",
             "blocked_unverified_product_claim",
+            "held_invalid_tool_plan",
+            "held_no_progress",
+            "held_invalid_repair",
+            "held_repair_exhausted",
+            "held_invalid_authorization",
+            "held_iteration_exhausted",
+            "held_invalid_authorized_draft",
             "daily_limit", // 仅 FollowUp 会命中；此用例验证 should_send_ack_placeholder 对该状态串的黑名单判定，与门是否触发无关
             "policy_cooldown", // 运营策略冷却：仍 ack
         ] {

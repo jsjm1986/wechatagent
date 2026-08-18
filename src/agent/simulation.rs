@@ -37,7 +37,7 @@ use super::model_turn::{
 };
 use super::review::ReviewInvocationKind;
 use super::runtime::UserRuntimeParameters;
-use super::turn_loop::{run_turn, TurnKernelInput};
+use super::turn_loop::{run_turn_with_timeouts, TurnKernelInput, TurnLoopTimeouts};
 use super::types::{AgentDecision, AgentTrigger, RunPlannerResult, UserOperationSimulationTurn};
 
 /// The HTTP simulation route accepts at most twelve inbound messages per run.
@@ -750,13 +750,19 @@ async fn simulate_user_dialogue_inner(
                 &inbound,
             ),
         );
-        let outcome = run_turn(
+        let outcome = run_turn_with_timeouts(
             &TurnKernelInput {
                 run_id: &run_id,
                 turn_id: &turn_id,
                 authority_bundle_hash: authority.bundle_hash(),
             },
             &mut environment,
+            TurnLoopTimeouts::from_seconds(
+                state.config.agent_turn_phase_timeout_seconds,
+                state.config.agent_turn_repair_timeout_seconds,
+                state.config.agent_turn_authorization_timeout_seconds,
+                state.config.agent_turn_total_timeout_seconds,
+            ),
         )
         .await?;
         drop(environment);

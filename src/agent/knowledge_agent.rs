@@ -279,11 +279,41 @@ pub struct RawSourceQuote {
 }
 
 const SYSTEM_PROMPT: &str = "你是运营知识库的 wiki 研究员。\n\
-你必须按 skills 的渐进式披露模式工作：先读文档目录（每份文档的 catalogSummary / routingMap 是给你导航的索引），判断哪份文档相关后 open_document 下钻到它的原子摘要，再选择性地 open_chunk 展开完整正文，最后给出带引用的 answer。\n\
+系统会直接提供按本次查询排序的原子知识 catalog。你必须按渐进式披露模式工作：先判断 catalog 中哪些原子相关，相关时优先 open_chunk 展开完整正文；只有已经掌握 documentId、确实需要查看同一文档下其它原子摘要时才使用 open_document；最后给出带引用的 answer。\n\
 你不能凭空回答；任何回答都必须来自被你 open 过的 chunk。\n\
 你只输出严格 JSON。每轮只能输出 5 个 action 之一：list_catalog / open_document / open_chunk / follow_relations / answer。\n\
 最多 4 轮工具调用。最后一轮必须 answer。\n\
 你的 answer 是给系统内部回复 Agent 的**知识研判**，不是发给客户的话术，也不是可执行的对客行动脚本。本系统定位是 AI 全程自治：客户始终只与 AI 对话。若被检索的知识内容描述了机构内部的流程分工（例如某类事项需按正式政策核对、由内部相应岗位确认），你可以如实转述该知识所界定的**事实边界**，但绝不把内部角色或流程写成对客户的话术。凡超出当前已 open 知识能确定的事项，必须在 resolution 中按语义标明可回答性、缺失信息、所需权威和下一步；禁止按客户文本中的单词、短语或词表判断。";
+
+/// Stable user-message prefix for every round of one Knowledge loop.
+///
+/// Keep all invariant schema and policy before query/catalog/round state. Providers that cache a
+/// common prompt prefix can then reuse this block across requests and also reuse the much longer
+/// `protocol + query + catalog` prefix between round 1 and round 2 of the same research loop.
+const ACTION_PROTOCOL: &str = r#"知识库研究协议（稳定规则）：
+下一步只输出以下 5 种 action 之一的严格 JSON：
+{"action":"list_catalog","filter":{"wikiTypes":["..."],"businessTopics":["..."]}}
+{"action":"open_document","documentId":"..."}
+{"action":"open_chunk","ids":["chunk_id_1","chunk_id_2"]}
+{"action":"follow_relations","chunkId":"...","depth":1}
+{"action":"answer","citedChunkIds":["..."],"sourceQuotes":[{"chunkId":"...","quote":"...","sourceAnchorIndex":0}],"answer":"...","resolution":{"answerability":"supported | partially_supported | unsupported | not_required","requiredAuthority":"none | customer | authorized_operator | licensed_professional | external_system","recommendedNextStep":"respond | clarify_customer | ask_principal | defer","missingInformation":["..."],"authorityQuestion":"..."}}
+
+- 召回漏斗：catalog 已按与本次 query 的相关度排过序，越靠前越相关。看到与 query 相关的候选，默认动作就是 open_chunk 展开它的正文再核对作答。
+- catalog 只给摘要且会被截断，回答任何细节问题（具体数字、比例、条件、期限等）前必须先 open_chunk 读正文，绝不能仅凭摘要臆测或直接说没有。
+- open_document 仅在你已掌握某条目的 documentId、想一次性查看同文档下其它原子摘要时才用；没有 documentId 时无需 open_document，直接 open_chunk 即可。
+- 只有当 catalog 里确实没有任何与 query 相关的候选时，才回答“知识库无相关内容”并让 cited 留空；在尚未 open 任何相关候选正文之前，禁止下此结论。
+- 诚实弃答原则：判定一条候选能否支撑作答，标准是它是否直接覆盖本 query 所问的对象与口径，而非主题词面相近。若 open 后只有主题相邻、口径不同、或仅部分相关，必须说明知识库仅有近似或部分知识，无法据此确切作答，并让 cited 留空或仅 cite 真正能支撑的部分。绝不把近似知识当确切事实硬答，绝不编造或外推正文未明确给出的数字、比例、条件、期限或范围。
+- 弃答须可推进：凡诚实弃答时，answer 末尾必须补一句具体、可执行的追问，点明缺少哪类信息、需要补充什么口径或细节，或提示运营补全该知识。禁止只说“不知道”或“暂无”。
+- 每个 answer 都必须输出完整 resolution。resolution 是内部语义结论，不是客户话术；不得把内部角色、控制字段或推理过程写进 answer。
+- answerability=supported 仅限已 open 且实际引用的 verified 证据直接覆盖本 query 全部所问；只覆盖一部分用 partially_supported；没有直接证据用 unsupported。无需业务知识即可处理的社交或关系性消息用 not_required + none + respond，且 cited 留空。
+- requiredAuthority / recommendedNextStep 必须按缺口实质选择，禁止按客户文本中的词或短语匹配：缺客户自身信息用 customer + clarify_customer；缺机构当前安排、当期政策、实时可用性或其它须由有权运营人员确认的内部事实，用 authorized_operator + ask_principal；须执业判断用 licensed_professional + defer；须查询实时外部记录用 external_system + defer。已有充分证据或无需知识则用 none + respond。
+- recommendedNextStep=ask_principal 时 authorityQuestion 必须是一句具体、可直接交给有权人员回答的问题；其它 nextStep 可留空。missingInformation 只列当前证据真正缺少的事实，不写泛化套话。
+- citedChunkIds 必须是“已 open 的 chunks”中的 chunkId 子集，不能凭空创造。
+- follow_relations 会把最相关的关联条目正文直接载入“已 open 的 chunks”，可当轮直接 cite，无需再 open_chunk。
+- 每个 cited 必须配 sourceQuote；如某 chunk 没有可引用原文，可省略 sourceQuote 但仍可 cite。
+- 候选 catalog 中所有 chunk 都已 integrity_status=verified；遇到 verified=false 是异常，不要 cite。
+- 关系角色（relationRole）：已 open 的 chunk 若带 relationRole="contradiction"，表示它是经 contradicts 关系拉入的、与来源 chunk 相矛盾的说法，仅供对比辨别用，绝不可作为支撑材料 cite。遇到矛盾，应据其余正向 chunk 作答，必要时说明该点存在不同说法、需要核实，但不要把矛盾说法当确切事实引用。
+- 不要复述 catalog 中的整段 summary；用自然语言总结答复。"#;
 
 /// 知识库 agent 主循环。
 ///
@@ -755,6 +785,14 @@ async fn answer_inner(
             out.tool_trace = tool_trace;
             return Ok(out);
         }
+        push_trace(
+            &mut tool_trace,
+            tx,
+            doc! {
+                "tool": "cache_miss",
+                "maxRounds": max_rounds,
+            },
+        );
         Some(key)
     } else {
         None
@@ -1747,47 +1785,20 @@ fn build_prompt(
         ""
     };
     format!(
-        r#"用户查询：
+        r#"{ACTION_PROTOCOL}
+
+用户查询：
 {query}
+
+候选 catalog（仅摘要，不含正文）：
+{catalog_json}
 
 当前轮次：{round}/{max_rounds}{force_answer_hint}
 
 已 open 的 chunks（含正文）：
 {opened_json}
 
-候选 catalog（仅摘要，不含正文）：
-{catalog_json}
-
-下一步只输出以下 5 种 action 之一的严格 JSON：
-{{"action":"list_catalog","filter":{{"wikiTypes":["..."],"businessTopics":["..."]}}}}
-{{"action":"open_document","documentId":"..."}}
-{{"action":"open_chunk","ids":["chunk_id_1","chunk_id_2"]}}
-{{"action":"follow_relations","chunkId":"...","depth":1}}
-{{"action":"answer","citedChunkIds":["..."],"sourceQuotes":[{{"chunkId":"...","quote":"...","sourceAnchorIndex":0}}],"answer":"...","resolution":{{"answerability":"supported | partially_supported | unsupported | not_required","requiredAuthority":"none | customer | authorized_operator | licensed_professional | external_system","recommendedNextStep":"respond | clarify_customer | ask_principal | defer","missingInformation":["..."],"authorityQuestion":"..."}}}}
-
-规则：
-- 召回漏斗：catalog 已按与本次 query 的相关度排过序，越靠前越相关。看到与 query 相关的候选，**默认动作就是 open_chunk 展开它的正文**再核对作答。
-- catalog 只给【摘要】且会被截断，回答任何细节问题（具体数字/比例/条件/期限等）前**必须先 open_chunk 读正文**，绝不能仅凭摘要臆测或直接说没有。
-- open_document 仅在你已掌握某条目的 documentId、想一次性查看同文档下其它原子摘要时才用；没有 documentId 时无需 open_document，直接 open_chunk 即可。
-- 只有当 catalog 里确实没有任何与 query 相关的候选时，才回答"知识库无相关内容"并 cited 留空；**在尚未 open 任何相关候选正文之前，禁止下此结论**。
-- **诚实弃答原则**：判定一条候选能否支撑作答，标准是它是否【直接覆盖本 query 所问的对象与口径】，而非主题词面相近。若 open 后只有【主题相邻、口径不同、或仅部分相关，不能直接回答本 query】的内容，必须诚实说明"知识库仅有近似/相关知识，无法据此确切作答"，并 cited 留空或仅 cite 真正能支撑的部分；**绝不把近似知识当确切事实硬答，绝不编造或外推未在正文中明确给出的数字/比例/条件/期限/范围**。宁可承认不知道，也不臆造。
-- **弃答须可推进（actionable）**：凡是诚实弃答（cited 留空或仅部分支撑、明确告知"无法确切作答"）时，answer 末尾**必须再补一句具体、可执行的追问**——点明还缺哪一类信息、请对方补充什么口径/细节，或提示这块知识可由运营补全，让弃答成为可被补全、可推进对话的下一步；**禁止只平铺一句"不知道/暂无"就收尾**。追问只围绕澄清与补全展开，绝不借机编造任何不在正文中的事实、数字或承诺。
-- 每个 answer 都必须输出完整 resolution。resolution 是内部语义结论，不是客户话术；不得把内部角色、控制字段或推理过程写进 answer。
-- answerability=supported 仅限已 open 且实际引用的 verified 证据直接覆盖本 query 全部所问；只覆盖一部分用 partially_supported；没有直接证据用 unsupported。不要把"主题相关"当作 supported。
-- requiredAuthority / recommendedNextStep 必须按缺口实质选择，禁止按客户文本中的词或短语匹配：缺客户自身信息用 customer + clarify_customer；缺机构当前安排、当期政策、实时可用性或其它须由有权运营人员确认的内部事实，用 authorized_operator + ask_principal；须执业判断用 licensed_professional；须查询实时外部记录用 external_system。已有充分证据则用 none + respond。
-- recommendedNextStep=ask_principal 时 authorityQuestion 必须是一句具体、可直接交给有权人员回答的问题；其它 nextStep 可留空。missingInformation 只列当前证据真正缺少的事实，不写泛化套话。
-- citedChunkIds 必须是上面"已 open 的 chunks"中的 chunkId 子集；不能凭空创造。
-- follow_relations 会把最相关的关联条目【正文】直接载入上面"已 open 的 chunks"，可当轮直接 cite，无需再 open_chunk。
-- 每个 cited 必须配 sourceQuote；如某 chunk 没有可引用原文，可省略 sourceQuote 但仍可 cite。
-- 候选 catalog 中所有 chunk 都已 integrity_status=verified；遇到 verified=false 是异常，不要 cite。
-- **关系角色（relationRole）**：已 open 的 chunk 若带 `relationRole="contradiction"`，表示它是经 `contradicts` 关系拉入的【与来源 chunk 相矛盾的说法】，**仅供你对比辨别用，绝不可作为支撑材料 cite**；遇到矛盾，应据其余正向（无 relationRole 标记的）chunk 作答，必要时点明"就该点存在不同说法、建议运营核实"，但不要把矛盾说法当确切事实引用。
-- 不要复述 catalog 中的整段 summary；用自然语言总结答复。"#,
-        query = query,
-        round = round,
-        max_rounds = max_rounds,
-        force_answer_hint = force_answer_hint,
-        opened_json = opened_json,
-        catalog_json = catalog_json,
+现在只输出本轮 action 的严格 JSON。"#,
     )
 }
 
@@ -2599,6 +2610,60 @@ mod tests {
             !prompt.contains("\"relationRole\": \"contradiction\""),
             "普通 chunk 不应带 contradiction 标记"
         );
+    }
+
+    #[test]
+    fn build_prompt_keeps_protocol_query_and_catalog_before_round_state() {
+        let catalog = vec![CatalogEntry {
+            chunk_id: "catalog-1".to_string(),
+            wiki_type: "methodology".to_string(),
+            chunk_type: "product_fact".to_string(),
+            title: "目录条目".to_string(),
+            summary: "摘要".to_string(),
+            business_topics: vec!["topic".to_string()],
+            verified: true,
+            has_source_quote: true,
+            dynamic_confidence: 0.9,
+            related_count: 0,
+        }];
+        let opened = ChunkFull {
+            chunk_id: "catalog-1".to_string(),
+            wiki_type: "methodology".to_string(),
+            chunk_type: "product_fact".to_string(),
+            title: "目录条目".to_string(),
+            summary: "摘要".to_string(),
+            body: "完整正文".to_string(),
+            source_quote: None,
+            source_anchors: Vec::new(),
+            related_chunks: Vec::new(),
+            verified: true,
+            business_topics: vec!["topic".to_string()],
+            relation_role: None,
+        };
+
+        let first = build_prompt("同一查询", &[], &catalog, 1, 4);
+        let second = build_prompt("同一查询", &[opened], &catalog, 2, 4);
+        assert!(first.starts_with(ACTION_PROTOCOL));
+
+        let first_round = first.find("当前轮次：").expect("round marker");
+        let second_round = second.find("当前轮次：").expect("round marker");
+        assert_eq!(
+            &first[..first_round],
+            &second[..second_round],
+            "round-specific state must come after the reusable protocol + query + catalog prefix"
+        );
+        let query_header = first.find("\n用户查询：").unwrap();
+        let catalog_header = first.find("\n候选 catalog（仅摘要，不含正文）：").unwrap();
+        assert!(query_header < catalog_header);
+        assert!(catalog_header < first_round);
+        assert!(first_round < first.find("\n已 open 的 chunks（含正文）：").unwrap());
+    }
+
+    #[test]
+    fn system_prompt_matches_the_atomic_catalog_runtime() {
+        assert!(SYSTEM_PROMPT.contains("原子知识 catalog"));
+        assert!(SYSTEM_PROMPT.contains("优先 open_chunk"));
+        assert!(!SYSTEM_PROMPT.contains("先读文档目录"));
     }
 
     #[test]

@@ -147,6 +147,8 @@ mod m060_appointment_commitment_lifecycle;
 mod m061_persona_world_state;
 /// Materialize the appointment-request action in legacy state-policy allowlists.
 pub mod m062_explicit_appointment_request_action;
+/// Upgrade only untouched system-seeded user-operation budget tuples.
+pub mod m063_user_operation_runtime_budget_defaults;
 
 /// Seed the built-in taxonomy template into one workspace without overwriting
 /// any operator-owned row. This is used lazily when an existing/new workspace
@@ -555,6 +557,10 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration {
         id: "2026_08_062_explicit_appointment_request_action",
         run: |db| Box::pin(m062_explicit_appointment_request_action::run_step(db)),
+    },
+    Migration {
+        id: "2026_08_063_user_operation_runtime_budget_defaults",
+        run: |db| Box::pin(m063_user_operation_runtime_budget_defaults::run_step(db)),
     },
 ];
 

@@ -341,7 +341,10 @@ pub(crate) fn classify_reviewed_decision_action(
         .follow_up
         .as_ref()
         .is_none_or(|follow_up| !follow_up.needed)
-        && decision.commitment.is_none()
+        && decision
+            .commitment
+            .as_ref()
+            .is_none_or(|commitment| commitment.text.trim().is_empty())
         && decision
             .last_commitment
             .as_deref()
@@ -350,8 +353,14 @@ pub(crate) fn classify_reviewed_decision_action(
             .cooldown_until
             .as_deref()
             .is_none_or(|value| value.trim().is_empty())
-        && decision.assets_to_send.is_empty()
-        && decision.namecard_to_send.is_none()
+        && decision
+            .assets_to_send
+            .iter()
+            .all(|directive| directive.asset_id.trim().is_empty())
+        && decision
+            .namecard_to_send
+            .as_ref()
+            .is_none_or(|directive| directive.card_id.trim().is_empty())
         && decision
             .appointment_request
             .as_ref()
@@ -747,6 +756,36 @@ mod policy_tests {
             classify_reviewed_decision_action(&decision, &safe_ack_review()),
             "reply",
             "a durable appointment write cannot be classified as a side-effect-free acknowledgement"
+        );
+    }
+
+    #[test]
+    fn acknowledgement_ignores_empty_optional_action_shells_but_not_real_actions() {
+        let make_decision = |namecard_to_send| {
+            let mut decision = AgentDecision {
+                should_reply: true,
+                reply_text: "acknowledged".to_string(),
+                commitment: Some(Default::default()),
+                assets_to_send: vec![Default::default()],
+                namecard_to_send,
+                ..Default::default()
+            };
+            set_response_disposition(&mut decision, "acknowledgement");
+            decision
+        };
+        let decision = make_decision(Some(Default::default()));
+        assert_eq!(
+            classify_reviewed_decision_action(&decision, &safe_ack_review()),
+            "acknowledgement"
+        );
+
+        let decision = make_decision(Some(crate::agent::types::NamecardDirective {
+            card_id: "card-1".to_string(),
+            ..Default::default()
+        }));
+        assert_eq!(
+            classify_reviewed_decision_action(&decision, &safe_ack_review()),
+            "reply"
         );
     }
 

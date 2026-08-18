@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use futures::StreamExt;
 use reqwest::header::HeaderMap;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc::UnboundedSender;
@@ -150,39 +150,265 @@ struct AnthropicUsage {
     input_tokens: i64,
     #[serde(default)]
     output_tokens: i64,
+    #[serde(default)]
+    cache_creation_input_tokens: Option<i64>,
+    #[serde(default)]
+    cache_read_input_tokens: Option<i64>,
+    #[serde(default)]
+    cache_creation: Option<AnthropicCacheCreation>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct AnthropicCacheCreation {
+    #[serde(default)]
+    ephemeral_5m_input_tokens: Option<i64>,
+    #[serde(default)]
+    ephemeral_1h_input_tokens: Option<i64>,
 }
 
 impl From<AnthropicUsage> for ChatUsage {
     fn from(usage: AnthropicUsage) -> Self {
+        let cache_telemetry_reported = usage.cache_read_input_tokens.is_some()
+            || usage.cache_creation_input_tokens.is_some()
+            || usage.cache_creation.is_some();
+        let cache_read = usage.cache_read_input_tokens.unwrap_or(0).max(0);
+        let nested_cache_creation = usage
+            .cache_creation
+            .map(|detail| {
+                detail
+                    .ephemeral_5m_input_tokens
+                    .unwrap_or(0)
+                    .max(0)
+                    .saturating_add(detail.ephemeral_1h_input_tokens.unwrap_or(0).max(0))
+            })
+            .unwrap_or(0);
+        let cache_creation = usage
+            .cache_creation_input_tokens
+            .unwrap_or(0)
+            .max(0)
+            .max(nested_cache_creation);
+        let uncached_input = usage.input_tokens.max(0);
+        let prompt_tokens = uncached_input
+            .saturating_add(cache_read)
+            .saturating_add(cache_creation);
         Self {
-            prompt_tokens: usage.input_tokens,
-            completion_tokens: usage.output_tokens,
-            total_tokens: usage.input_tokens.saturating_add(usage.output_tokens),
+            prompt_tokens,
+            completion_tokens: usage.output_tokens.max(0),
+            total_tokens: prompt_tokens.saturating_add(usage.output_tokens.max(0)),
+            prompt_cache_hit_tokens: cache_read,
+            prompt_cache_miss_tokens: if cache_telemetry_reported {
+                uncached_input.saturating_add(cache_creation)
+            } else {
+                0
+            },
             usage_known: true,
-            ..Default::default()
         }
     }
 }
 
-#[derive(Debug, Deserialize, Default, Clone)]
+#[derive(Debug, Deserialize, Default)]
+struct CacheTokenDetails {
+    #[serde(default)]
+    cached_tokens: Option<i64>,
+    #[serde(default)]
+    cache_read: Option<i64>,
+    #[serde(default)]
+    cache_read_tokens: Option<i64>,
+    #[serde(default)]
+    cache_read_input_tokens: Option<i64>,
+    #[serde(default)]
+    cache_creation: Option<i64>,
+    #[serde(default)]
+    cache_creation_tokens: Option<i64>,
+    #[serde(default)]
+    cache_creation_input_tokens: Option<i64>,
+    #[serde(default)]
+    cache_write: Option<i64>,
+    #[serde(default)]
+    cache_write_tokens: Option<i64>,
+}
+
+impl CacheTokenDetails {
+    fn read_tokens(&self) -> i64 {
+        self.cached_tokens
+            .unwrap_or(0)
+            .max(self.cache_read.unwrap_or(0))
+            .max(self.cache_read_tokens.unwrap_or(0))
+            .max(self.cache_read_input_tokens.unwrap_or(0))
+            .max(0)
+    }
+
+    fn created_tokens(&self) -> i64 {
+        self.cache_creation
+            .unwrap_or(0)
+            .max(self.cache_creation_tokens.unwrap_or(0))
+            .max(self.cache_creation_input_tokens.unwrap_or(0))
+            .max(self.cache_write.unwrap_or(0))
+            .max(self.cache_write_tokens.unwrap_or(0))
+            .max(0)
+    }
+
+    fn telemetry_reported(&self) -> bool {
+        self.cached_tokens.is_some()
+            || self.cache_read.is_some()
+            || self.cache_read_tokens.is_some()
+            || self.cache_read_input_tokens.is_some()
+            || self.cache_creation.is_some()
+            || self.cache_creation_tokens.is_some()
+            || self.cache_creation_input_tokens.is_some()
+            || self.cache_write.is_some()
+            || self.cache_write_tokens.is_some()
+    }
+}
+
+/// Wire-level usage shape used by OpenAI-compatible chat and Responses relays.
+///
+/// Providers disagree on whether cache counters live at the top level or under
+/// `prompt_tokens_details` / `input_tokens_details`. Keep that compatibility logic at the
+/// protocol boundary so downstream accounting sees one stable `ChatUsage` shape.
+#[derive(Debug, Deserialize, Default)]
+struct ChatUsageWire {
+    #[serde(default)]
+    prompt_tokens: i64,
+    #[serde(default)]
+    input_tokens: i64,
+    #[serde(default)]
+    completion_tokens: i64,
+    #[serde(default)]
+    output_tokens: i64,
+    #[serde(default)]
+    total_tokens: i64,
+    #[serde(default)]
+    prompt_cache_hit_tokens: Option<i64>,
+    #[serde(default)]
+    prompt_cache_miss_tokens: Option<i64>,
+    #[serde(default)]
+    cached_tokens: Option<i64>,
+    #[serde(default)]
+    cache_read: Option<i64>,
+    #[serde(default)]
+    cache_read_tokens: Option<i64>,
+    #[serde(default)]
+    cache_read_input_tokens: Option<i64>,
+    #[serde(default)]
+    cache_creation: Option<i64>,
+    #[serde(default)]
+    cache_creation_tokens: Option<i64>,
+    #[serde(default)]
+    cache_creation_input_tokens: Option<i64>,
+    #[serde(default)]
+    cache_write: Option<i64>,
+    #[serde(default)]
+    cache_write_tokens: Option<i64>,
+    #[serde(default)]
+    prompt_tokens_details: Option<CacheTokenDetails>,
+    #[serde(default)]
+    input_tokens_details: Option<CacheTokenDetails>,
+}
+
+impl From<ChatUsageWire> for ChatUsage {
+    fn from(wire: ChatUsageWire) -> Self {
+        let details = [&wire.prompt_tokens_details, &wire.input_tokens_details];
+        let nested_hit = details
+            .iter()
+            .filter_map(|detail| detail.as_ref())
+            .map(CacheTokenDetails::read_tokens)
+            .max()
+            .unwrap_or(0);
+        let nested_creation = details
+            .iter()
+            .filter_map(|detail| detail.as_ref())
+            .map(CacheTokenDetails::created_tokens)
+            .max()
+            .unwrap_or(0);
+        let cache_hit = wire
+            .prompt_cache_hit_tokens
+            .unwrap_or(0)
+            .max(wire.cached_tokens.unwrap_or(0))
+            .max(wire.cache_read.unwrap_or(0))
+            .max(wire.cache_read_tokens.unwrap_or(0))
+            .max(wire.cache_read_input_tokens.unwrap_or(0))
+            .max(nested_hit)
+            .max(0);
+        let explicit_cache_miss = wire.prompt_cache_miss_tokens.unwrap_or(0).max(0);
+        let cache_creation = wire
+            .cache_creation
+            .unwrap_or(0)
+            .max(wire.cache_creation_tokens.unwrap_or(0))
+            .max(wire.cache_creation_input_tokens.unwrap_or(0))
+            .max(wire.cache_write.unwrap_or(0))
+            .max(wire.cache_write_tokens.unwrap_or(0))
+            .max(nested_creation)
+            .max(0);
+        let cache_telemetry_reported = wire.prompt_cache_hit_tokens.is_some()
+            || wire.prompt_cache_miss_tokens.is_some()
+            || wire.cached_tokens.is_some()
+            || wire.cache_read.is_some()
+            || wire.cache_read_tokens.is_some()
+            || wire.cache_read_input_tokens.is_some()
+            || wire.cache_creation.is_some()
+            || wire.cache_creation_tokens.is_some()
+            || wire.cache_creation_input_tokens.is_some()
+            || wire.cache_write.is_some()
+            || wire.cache_write_tokens.is_some()
+            || details
+                .iter()
+                .filter_map(|detail| detail.as_ref())
+                .any(CacheTokenDetails::telemetry_reported);
+        let prompt_tokens = wire
+            .prompt_tokens
+            .max(wire.input_tokens)
+            .max(cache_hit.saturating_add(explicit_cache_miss))
+            .max(cache_hit.saturating_add(cache_creation))
+            .max(0);
+        let completion_tokens = wire.completion_tokens.max(wire.output_tokens).max(0);
+        let total_tokens = wire
+            .total_tokens
+            .max(prompt_tokens.saturating_add(completion_tokens))
+            .max(0);
+        let bounded_cache_hit = cache_hit.min(prompt_tokens);
+        let cache_miss = if cache_telemetry_reported {
+            prompt_tokens.saturating_sub(bounded_cache_hit)
+        } else {
+            0
+        };
+        Self {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            prompt_cache_hit_tokens: bounded_cache_hit,
+            prompt_cache_miss_tokens: cache_miss,
+            usage_known: false,
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone)]
 pub struct ChatUsage {
-    #[serde(default)]
     pub prompt_tokens: i64,
-    #[serde(default)]
     pub completion_tokens: i64,
-    #[serde(default)]
     pub total_tokens: i64,
-    #[serde(default)]
+    /// Prompt tokens served from a provider cache. When cache telemetry is reported, hit and miss
+    /// form a complete partition of `prompt_tokens`.
     pub prompt_cache_hit_tokens: i64,
-    #[serde(default)]
+    /// Prompt tokens not served from a provider cache. This is not limited to newly written cache
+    /// entries; it includes every uncached input token reported for the request.
     pub prompt_cache_miss_tokens: i64,
     /// Whether the upstream response actually contained a usage object.
     ///
     /// A missing usage object is not the same as a measured zero. Some relay
     /// providers omit usage entirely; keeping that distinction prevents cost
     /// and run-budget telemetry from presenting an unknown value as zero.
-    #[serde(default)]
     pub usage_known: bool,
+}
+
+impl<'de> Deserialize<'de> for ChatUsage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        ChatUsageWire::deserialize(deserializer).map(Into::into)
+    }
 }
 
 impl ChatUsage {
@@ -2495,6 +2721,121 @@ mod tests {
             .map(ChatUsage::from)
             .unwrap_or_default()
             .is_known());
+    }
+
+    #[test]
+    fn openai_nested_prompt_cache_usage_is_normalized() {
+        let usage: ChatUsage = serde_json::from_str(
+            r#"{
+                "prompt_tokens": 100,
+                "completion_tokens": 20,
+                "total_tokens": 120,
+                "prompt_tokens_details": {"cached_tokens": 70}
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(usage.prompt_tokens, 100);
+        assert_eq!(usage.completion_tokens, 20);
+        assert_eq!(usage.total_tokens, 120);
+        assert_eq!(usage.prompt_cache_hit_tokens, 70);
+        assert_eq!(usage.prompt_cache_miss_tokens, 30);
+        assert!(
+            !usage.usage_known,
+            "wire parsing stays unknown until response is reported"
+        );
+        assert!(usage.reported().is_known());
+    }
+
+    #[test]
+    fn deepseek_direct_cache_partitions_are_preserved() {
+        let usage: ChatUsage = serde_json::from_str(
+            r#"{
+                "prompt_tokens": 100,
+                "completion_tokens": 20,
+                "total_tokens": 120,
+                "prompt_cache_hit_tokens": 70,
+                "prompt_cache_miss_tokens": 30
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(usage.prompt_tokens, 100);
+        assert_eq!(usage.total_tokens, 120);
+        assert_eq!(usage.prompt_cache_hit_tokens, 70);
+        assert_eq!(usage.prompt_cache_miss_tokens, 30);
+    }
+
+    #[test]
+    fn responses_style_cache_read_and_creation_fields_are_supported_without_double_counting() {
+        let usage: ChatUsage = serde_json::from_str(
+            r#"{
+                "input_tokens": 200,
+                "output_tokens": 10,
+                "input_tokens_details": {"cache_read": 80, "cache_creation": 35},
+                "cache_read_input_tokens": 80,
+                "cache_creation_input_tokens": 35
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(usage.prompt_cache_hit_tokens, 80);
+        assert_eq!(
+            usage.prompt_cache_miss_tokens, 120,
+            "miss telemetry is the uncached prompt partition, not only newly written cache tokens"
+        );
+        assert_eq!(
+            usage.total_tokens, 210,
+            "missing total is derived once from prompt + completion"
+        );
+    }
+
+    #[test]
+    fn reported_zero_cache_hit_still_records_the_uncached_prompt_partition() {
+        let usage: ChatUsage = serde_json::from_str(
+            r#"{
+                "prompt_tokens": 100,
+                "completion_tokens": 5,
+                "prompt_tokens_details": {"cached_tokens": 0}
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(usage.prompt_cache_hit_tokens, 0);
+        assert_eq!(usage.prompt_cache_miss_tokens, 100);
+    }
+
+    #[test]
+    fn anthropic_cache_read_and_creation_tokens_form_complete_prompt_partitions() {
+        let reported: AnthropicMessageResponse = serde_json::from_str(
+            r#"{
+                "content":[{"type":"text","text":"{}"}],
+                "usage":{
+                    "input_tokens":100,
+                    "output_tokens":10,
+                    "cache_read_input_tokens":40,
+                    "cache_creation_input_tokens":60
+                }
+            }"#,
+        )
+        .unwrap();
+        let usage = reported.usage.map(ChatUsage::from).unwrap();
+        assert_eq!(usage.prompt_tokens, 200);
+        assert_eq!(usage.total_tokens, 210);
+        assert_eq!(usage.prompt_cache_hit_tokens, 40);
+        assert_eq!(usage.prompt_cache_miss_tokens, 160);
+        assert!(usage.is_known());
+    }
+
+    #[test]
+    fn anthropic_usage_without_cache_fields_does_not_invent_cache_support() {
+        let reported: AnthropicMessageResponse = serde_json::from_str(
+            r#"{
+                "content":[{"type":"text","text":"{}"}],
+                "usage":{"input_tokens":100,"output_tokens":10}
+            }"#,
+        )
+        .unwrap();
+        let usage = reported.usage.map(ChatUsage::from).unwrap();
+        assert_eq!(usage.prompt_tokens, 100);
+        assert_eq!(usage.prompt_cache_hit_tokens, 0);
+        assert_eq!(usage.prompt_cache_miss_tokens, 0);
     }
 
     #[test]

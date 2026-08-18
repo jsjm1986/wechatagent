@@ -9,7 +9,7 @@ use mongodb::{
 use crate::{
     db::Database,
     error::{AppError, AppResult},
-    models::{OperationDomainConfig, OperationPlaybook, PromptTemplate},
+    models::{OperationDomainConfig, OperationPlaybook, PromptTemplate, RuntimeParametersTyped},
     soul_versions::{self, NewSoulVersion},
 };
 
@@ -642,6 +642,7 @@ pub fn default_playbook(workspace_id: &str, account_id: &str) -> OperationPlaybo
 }
 
 pub fn default_domain_configs(workspace_id: &str) -> Vec<OperationDomainConfig> {
+    let runtime_defaults = RuntimeParametersTyped::default();
     vec![
         OperationDomainConfig {
             id: None,
@@ -667,9 +668,10 @@ pub fn default_domain_configs(workspace_id: &str) -> Vec<OperationDomainConfig> 
                 "emotionalValueRewriteBelow": 6,
                 "productAccuracyBlockBelow": 7,
                 "operationStateConfidenceFullReviewBelow": 4,
-                "runTokenBudget": 30000,
-                "runMaxLlmCalls": 6,
-                "simulationTokenBudget": 60000
+                "runTokenBudget": runtime_defaults.run_token_budget,
+                "runTokenBudgetEscalated": runtime_defaults.run_token_budget_escalated,
+                "runMaxLlmCalls": runtime_defaults.run_max_llm_calls,
+                "simulationTokenBudget": runtime_defaults.simulation_token_budget
             },
             state_machine: default_user_operation_state_machine(),
             status: "active".to_string(),
@@ -748,6 +750,42 @@ pub fn default_domain_configs(workspace_id: &str) -> Vec<OperationDomainConfig> 
             assist_mode_enabled: None,
         },
     ]
+}
+
+#[cfg(test)]
+mod runtime_budget_seed_tests {
+    use super::*;
+
+    #[test]
+    fn user_operation_seed_uses_typed_runtime_budget_defaults() {
+        let config = default_domain_configs("runtime-default-test")
+            .into_iter()
+            .find(|config| config.domain == "user_operations")
+            .expect("user operations seed");
+        let typed = RuntimeParametersTyped::default();
+        assert_eq!(
+            config.runtime_parameters.get_i64("runTokenBudget").ok(),
+            Some(typed.run_token_budget)
+        );
+        assert_eq!(
+            config
+                .runtime_parameters
+                .get_i64("runTokenBudgetEscalated")
+                .ok(),
+            Some(typed.run_token_budget_escalated)
+        );
+        assert_eq!(
+            config.runtime_parameters.get_i32("runMaxLlmCalls").ok(),
+            Some(typed.run_max_llm_calls)
+        );
+        assert_eq!(
+            config
+                .runtime_parameters
+                .get_i64("simulationTokenBudget")
+                .ok(),
+            Some(typed.simulation_token_budget)
+        );
+    }
 }
 
 pub fn default_user_operation_state_machine() -> Document {

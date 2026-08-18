@@ -151,10 +151,9 @@ fn scenario_contact(ws: &str, acc: &str, scenario: &GoldScenario) -> Contact {
     }
 }
 
-/// 抬高默认 user_operations 域配置的 run 级 LLM 容量：多轮场景（≤3 轮 × 每轮
-/// 知识路由/Reply/Review/ClaimGate）会超过默认 runMaxLlmCalls=6，导致 Review 被
-/// 预算降级为 `local_decision_review` 全 hold——那是预算语义不是对话质量。取值仍在
-/// 运营写侧 schema 允许范围内（runMaxLlmCalls ≤ 20、simulationTokenBudget ≤ 2000000）。
+/// 为批量模拟抬高独立 LLM 容量：多轮场景会按消息数扩展单轮链路调用，不能让评测
+/// 因模拟预算先耗尽而被误判为对话质量问题。取值仍在运营写侧 schema 允许范围内
+/// （runMaxLlmCalls ≤ 20、simulationTokenBudget ≤ 2000000）。
 async fn raise_simulation_budget(app: &TestApp, ws: &str) {
     app.state
         .db

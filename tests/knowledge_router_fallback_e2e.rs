@@ -7,12 +7,14 @@
 //! `knowledge_coverage=weak`、`tool_trace.fallback_rank=agent_returned_zero_cited`，
 //! 让 grounding 闸不至于 missing、Reply Agent / 审计感知"这是弱兜底"。
 //!
-//! 三个场景：
+//! 四个场景：
 //! 1. **agent 给 0 cited → fallback 触发**：8 条 chunk 全 verified，agent 回 answer
 //!    且 cited=[]，路由必须取 top-5（按 wiki_type_priority 倒排）。
-//! 2. **agent 给的 cited 不在 corpus → fallback 触发**：agent 输出一条不存在的
+//! 2. **agent 明确 not_required → 不 fallback**：即使 corpus 非空，也必须保留 AI 的
+//!    结构化无需知识结论，不给寒暄附着无关导航 chunk。
+//! 3. **agent 给的 cited 不在 corpus → fallback 触发**：agent 输出一条不存在的
 //!    chunk_id（OOB），filter_in_corpus 后为空，必须走 fallback。
-//! 3. **corpus 真的空 → 维持 missing**：0 个 verified chunk，整个路径 short-circuit
+//! 4. **corpus 真的空 → 维持 missing**：0 个 verified chunk，整个路径 short-circuit
 //!    在 `route_operation_knowledge` 头部 `documents.is_empty() && chunks.is_empty()`，
 //!    返回 `coverage=missing`、不进入 LLM。
 //!
@@ -186,7 +188,72 @@ async fn router_falls_back_to_top_n_when_agent_cites_nothing() {
     assert_eq!(trace.get_i32("selected").ok(), Some(5));
 }
 
-/// 场景 2：agent 给的 cited 全部不在 corpus（OOB chunk_id）→ filter 后为空 →
+/// 场景 2：Knowledge Agent 明确判定本轮不需要业务知识时，不得再用静态排序覆盖该
+/// AI 语义结论。这个测试故意保留非空 corpus，防止“因为库恰好为空所以没 fallback”的
+/// 假阳性。
+#[tokio::test]
+#[ignore]
+async fn router_preserves_not_required_without_navigation_fallback() {
+    let app = TestApp::start().await;
+    let workspace = ws(&app);
+    insert(
+        &app,
+        &[verified_chunk(
+            &workspace,
+            "眼袋项目知识",
+            "methodology",
+            0.9,
+        )],
+    )
+    .await;
+
+    app.llm.push_response(json!({
+        "action": "answer",
+        "answer": "本轮是普通社交承接，不需要知识依据。",
+        "citedChunkIds": [],
+        "sourceQuotes": [],
+        "resolution": {
+            "answerability": "not_required",
+            "requiredAuthority": "none",
+            "recommendedNextStep": "respond",
+            "missingInformation": [],
+            "authorityQuestion": ""
+        }
+    }));
+
+    let result = test_knowledge_route_for_contact(
+        &app.state,
+        None,
+        &app.state.config.default_workspace_id,
+        ACCOUNT,
+        "晚上好",
+    )
+    .await
+    .expect("route");
+    let route = result.get_document("route").expect("route doc");
+
+    assert_eq!(
+        route.get_str("knowledgeCoverage").ok(),
+        Some("not_required")
+    );
+    assert_eq!(route.get_str("riskLevel").ok(), Some("low"));
+    assert!(route
+        .get_array("selectedChunkIds")
+        .expect("selectedChunkIds")
+        .is_empty());
+    assert!(result
+        .get_array("selectedChunks")
+        .expect("selectedChunks")
+        .is_empty());
+    assert!(!route
+        .get_array("toolTrace")
+        .expect("toolTrace")
+        .iter()
+        .filter_map(|value| value.as_document())
+        .any(|event| event.get_str("tool").ok() == Some("fallback_rank")));
+}
+
+/// 场景 3：agent 给的 cited 全部不在 corpus（OOB chunk_id）→ filter 后为空 →
 /// fallback 触发（与场景 1 路径一致，但起因不同）。守住"agent 不能凭空创造 cited
 /// 来绕过 fallback"。
 #[tokio::test]
@@ -248,7 +315,7 @@ async fn router_falls_back_when_agent_cites_chunks_outside_corpus() {
     assert!(has_fallback, "toolTrace 必须含 fallback_rank");
 }
 
-/// 场景 3：corpus 真的为空（0 verified chunk）→ short-circuit `coverage=missing`，
+/// 场景 4：corpus 真的为空（0 verified chunk）→ short-circuit `coverage=missing`，
 /// 不进入 LLM 也不进 fallback。守住"空知识库不要假装有兜底"。
 #[tokio::test]
 #[ignore]

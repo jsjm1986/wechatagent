@@ -4,6 +4,10 @@
 //! optional-call budgeting, CAS/upsert convergence, and the guarantee that customer context never
 //! enters the generator input.
 
+use std::sync::LazyLock;
+use std::time::Duration;
+
+use dashmap::{mapref::entry::Entry, DashMap};
 use mongodb::{
     bson::{doc, oid::ObjectId, Bson, DateTime},
     options::{FindOneAndUpdateOptions, ReturnDocument},
@@ -25,6 +29,10 @@ const REQUIRED_LLM_TAIL: i32 = 3;
 const MAX_STATE_TEXT_CHARS: usize = 600;
 const MAX_AVAILABILITY_CHARS: usize = 160;
 const MAX_MOOD_CHARS: usize = 80;
+const BACKGROUND_REFRESH_DELAY: Duration = Duration::from_secs(1);
+
+type RefreshKey = (String, String, i64);
+static REFRESH_IN_FLIGHT: LazyLock<DashMap<RefreshKey, ()>> = LazyLock::new(DashMap::new);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WorldStateWindow {
@@ -39,6 +47,94 @@ struct GeneratedWorldState {
     state_text: String,
     availability: Option<String>,
     mood: Option<String>,
+}
+
+struct RefreshGuard(RefreshKey);
+
+impl Drop for RefreshGuard {
+    fn drop(&mut self) {
+        REFRESH_IN_FLIGHT.remove(&self.0);
+    }
+}
+
+fn refresh_key(
+    workspace_id: &str,
+    account_id: &str,
+    timezone_offset_hours: i32,
+    now: DateTime,
+) -> RefreshKey {
+    let window = world_state_window(now, timezone_offset_hours);
+    (
+        workspace_id.to_string(),
+        account_id.to_string(),
+        window.effective_from.timestamp_millis(),
+    )
+}
+
+fn claim_refresh_slot(key: RefreshKey) -> bool {
+    match REFRESH_IN_FLIGHT.entry(key) {
+        Entry::Occupied(_) => false,
+        Entry::Vacant(entry) => {
+            entry.insert(());
+            true
+        }
+    }
+}
+
+/// Schedule optional account-level social texture after the customer turn has settled.
+///
+/// The spawned task does not inherit the current run budget, run id, or customer message. A
+/// process-local slot coalesces concurrent contacts on the same account and six-hour window.
+pub(crate) fn schedule_world_state_refresh(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+    effective_soul: &str,
+    timezone_offset_hours: i32,
+) -> bool {
+    let effective_soul = effective_soul.trim();
+    if effective_soul.is_empty() {
+        return false;
+    }
+
+    let key = refresh_key(
+        workspace_id,
+        account_id,
+        timezone_offset_hours,
+        DateTime::now(),
+    );
+    if !claim_refresh_slot(key.clone()) {
+        return false;
+    }
+
+    let state = state.clone();
+    let workspace_id = workspace_id.to_string();
+    let account_id = account_id.to_string();
+    let effective_soul = effective_soul.to_string();
+    tokio::spawn(async move {
+        let _guard = RefreshGuard(key);
+        // Let the foreground turn release its provider permit and return to the caller before
+        // optional account maintenance competes for capacity.
+        tokio::time::sleep(BACKGROUND_REFRESH_DELAY).await;
+        if let Err(error) = ensure_effective_world_state(
+            &state,
+            &workspace_id,
+            &account_id,
+            &effective_soul,
+            timezone_offset_hours,
+            None,
+        )
+        .await
+        {
+            tracing::warn!(
+                %error,
+                %workspace_id,
+                %account_id,
+                "persona world-state background refresh failed soft"
+            );
+        }
+    });
+    true
 }
 
 pub(crate) async fn ensure_effective_world_state(
@@ -369,5 +465,16 @@ mod tests {
             "mood": null
         }))
         .is_err());
+    }
+
+    #[test]
+    fn refresh_slots_coalesce_same_account_window() {
+        let now = DateTime::parse_rfc3339_str("2026-08-18T03:30:00Z").unwrap();
+        let key = refresh_key("workspace-slot-test", "account-slot-test", 8, now);
+        assert!(claim_refresh_slot(key.clone()));
+        assert!(!claim_refresh_slot(key.clone()));
+        REFRESH_IN_FLIGHT.remove(&key);
+        assert!(claim_refresh_slot(key.clone()));
+        REFRESH_IN_FLIGHT.remove(&key);
     }
 }

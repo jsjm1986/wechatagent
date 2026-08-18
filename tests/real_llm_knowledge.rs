@@ -212,6 +212,7 @@ async fn seed_chunk(
         summary: Some(summary.to_string()),
         body: Some(body.to_string()),
         source_quote: Some(body.to_string()),
+        source_anchors: vec![doc! { "sourceQuote": body }],
         integrity_status: Some(integrity_status.to_string()),
         confidence_score: Some(88),
         status: status.to_string(),
@@ -369,6 +370,28 @@ async fn k1_real_open_chunk_reaches_body_detail() {
         trace_opened_id(&result, &id_k1),
         "真模型必须 open_chunk 展开 K1 正文（赔付数字只在 body），tool_trace={:?}",
         result.tool_trace
+    );
+    assert!(
+        result.cited_chunk_ids.contains(&id_k1),
+        "K1 答案必须引用实际承载赔付条款的目标 chunk，cited={:?}",
+        result.cited_chunk_ids
+    );
+    let normalized_answer = result
+        .answer
+        .replace('％', "%")
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>();
+    let mentions_30 = normalized_answer.contains("30%")
+        || normalized_answer.contains("百分之30")
+        || normalized_answer.contains("百分之三十");
+    let mentions_50 = normalized_answer.contains("50%")
+        || normalized_answer.contains("百分之50")
+        || normalized_answer.contains("百分之五十");
+    assert!(
+        mentions_30 && mentions_50,
+        "K1 答案必须完整表达两档赔付比例 30% 和 50%，实际={:?}",
+        result.answer
     );
 }
 

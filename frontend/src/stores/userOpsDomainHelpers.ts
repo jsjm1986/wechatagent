@@ -16,14 +16,16 @@ export const QUIET_HOURS_COMPATIBILITY_DEFAULTS: QuietHoursSettingsValue = {
   tzOffsetHours: 8
 };
 
-// USER_RUNTIME_PARAMETER_FIELDS 常量定义
-const USER_RUNTIME_PARAMETER_FIELDS: Array<{
+export type UserRuntimeParameterField = {
   key: string;
   label: string;
   detail: string;
   kind: "number" | "boolean";
   defaultValue: number | boolean;
-}> = [
+};
+
+// 传统编辑器与 store 共用同一份字段顺序和兼容默认，避免保存旧配置时回写陈旧预算。
+export const USER_RUNTIME_PARAMETER_FIELDS: UserRuntimeParameterField[] = [
   { key: "recentMessageLimit", label: "上下文消息数", detail: "每次决策读取的最近消息数量", kind: "number", defaultValue: 12 },
   { key: "minReplyIntervalSeconds", label: "最小回复间隔", detail: "避免短时间连续自动回复，单位秒", kind: "number", defaultValue: 20 },
   { key: "maxDailyTouches", label: "每日触达上限", detail: "单个好友每天最多主动触达次数", kind: "number", defaultValue: 3 },
@@ -35,9 +37,10 @@ const USER_RUNTIME_PARAMETER_FIELDS: Array<{
   { key: "humanLikeRewriteBelow", label: "真人感重写线", detail: "低于该分值时要求重写", kind: "number", defaultValue: 6 },
   { key: "emotionalValueRewriteBelow", label: "情绪价值重写线", detail: "低于该分值时要求重写", kind: "number", defaultValue: 6 },
   { key: "operationStateConfidenceFullReviewBelow", label: "状态置信 Review 线", detail: "低于该分值强制完整 Review", kind: "number", defaultValue: 4 },
-  { key: "runTokenBudget", label: "单次 Token 预算", detail: "单次用户运营运行的最大 token", kind: "number", defaultValue: 30000 },
-  { key: "runMaxLlmCalls", label: "单次模型调用上限", detail: "单次用户运营最多 LLM 调用次数", kind: "number", defaultValue: 6 },
-  { key: "simulationTokenBudget", label: "模拟评测预算", detail: "单次模拟/评测可用 token", kind: "number", defaultValue: 60000 },
+  { key: "runTokenBudget", label: "单次 Token 预算", detail: "单次用户运营运行的最大 token", kind: "number", defaultValue: 300000 },
+  { key: "runTokenBudgetEscalated", label: "升档 Token 预算", detail: "复杂轮次升档后的最大 token", kind: "number", defaultValue: 600000 },
+  { key: "runMaxLlmCalls", label: "单次模型调用上限", detail: "单次用户运营最多 LLM 调用次数", kind: "number", defaultValue: 10 },
+  { key: "simulationTokenBudget", label: "模拟评测预算", detail: "单次模拟/评测可用 token", kind: "number", defaultValue: 300000 },
   { key: "reactionTokenBudget", label: "反应分析预算", detail: "用户回应分析单次最多 token", kind: "number", defaultValue: 8000 },
   { key: "reactionMaxLlmCalls", label: "反应分析调用上限", detail: "用户回应分析最多 LLM 调用次数", kind: "number", defaultValue: 2 },
   { key: "quietHoursEnabled", label: "作息门控", detail: "开启后客户在休息时段来的消息不立即回，等醒来时段一次性回复；主动跟进也顺延到醒来", kind: "boolean", defaultValue: true },

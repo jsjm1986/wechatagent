@@ -168,6 +168,41 @@ impl LlmProvider for FailoverProvider {
             .unwrap_or_else(|| AppError::External("failover: 无可用 LLM 客户端".to_string())))
     }
 
+    async fn generate_json_with_usage_limit(
+        &self,
+        system: &str,
+        user: &str,
+        max_output_tokens: u32,
+    ) -> AppResult<LlmJsonResult> {
+        let mut last_err: Option<AppError> = None;
+        for (i, client) in self.clients.iter().enumerate() {
+            match client
+                .generate_json_with_usage_limit(system, user, max_output_tokens)
+                .await
+            {
+                Ok(r) => {
+                    if i > 0 {
+                        eprintln!(
+                            "[failover] 主模型 {} 不可用，已切到备胎[{i}] {} 兜底成功",
+                            self.primary_label, r.model
+                        );
+                    }
+                    return Ok(r);
+                }
+                Err(e) if is_failover_worthy(&e) => {
+                    eprintln!(
+                        "[failover] {} 第{i}个候选不可用，尝试下一个备胎: {e}",
+                        self.primary_label
+                    );
+                    last_err = Some(e);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last_err
+            .unwrap_or_else(|| AppError::External("failover: 无可用 LLM 客户端".to_string())))
+    }
+
     // vision 裁判（Q3）经本包装调多模态：必须把图请求也沿候选链 failover，否则会落到
     // trait 默认实现（返回 vision_not_supported）——这正是首版 Q3 vision 裁判全判失败的根因。
     async fn generate_json_with_image(

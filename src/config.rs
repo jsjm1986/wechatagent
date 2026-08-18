@@ -44,6 +44,21 @@ pub struct AppConfig {
     pub llm_timeout_seconds: u64,
     pub llm_max_retries: u32,
     pub llm_retry_base_ms: u64,
+    /// Shared Harness timeout for one generate/tool/authorize phase. Each phase receives a fresh
+    /// budget; the total timeout below still bounds the complete loop. Default 75 seconds leaves
+    /// room above the default provider timeout without allowing an unbounded call.
+    pub agent_turn_phase_timeout_seconds: u64,
+    /// A bounded repair regenerates a complete decision after authorization feedback. It gets its
+    /// own longer budget so a malformed first response does not fail merely because the repair is
+    /// a second full model generation.
+    pub agent_turn_repair_timeout_seconds: u64,
+    /// Authorization can contain Reviewer and ClaimGate in parallel, and ClaimGate may perform one
+    /// bounded contract re-evaluation. It therefore has a separate budget instead of inheriting a
+    /// single-call phase limit.
+    pub agent_turn_authorization_timeout_seconds: u64,
+    /// Absolute wall-clock cap for one Harness turn after it enters the shared loop. Default 240
+    /// seconds covers a slow authorization plus one bounded repair and re-authorization.
+    pub agent_turn_total_timeout_seconds: u64,
     /// Process-local shared-provider concurrency cap. Every public Agent LLM
     /// entry point acquires this governor before crossing the HTTP boundary.
     pub llm_max_concurrency: usize,
@@ -415,6 +430,22 @@ impl std::fmt::Debug for AppConfig {
             .field("openai_base_url", &self.openai_base_url)
             .field("openai_api_key", &mask_secret(&self.openai_api_key))
             .field("openai_model", &self.openai_model)
+            .field(
+                "agent_turn_phase_timeout_seconds",
+                &self.agent_turn_phase_timeout_seconds,
+            )
+            .field(
+                "agent_turn_repair_timeout_seconds",
+                &self.agent_turn_repair_timeout_seconds,
+            )
+            .field(
+                "agent_turn_authorization_timeout_seconds",
+                &self.agent_turn_authorization_timeout_seconds,
+            )
+            .field(
+                "agent_turn_total_timeout_seconds",
+                &self.agent_turn_total_timeout_seconds,
+            )
             .field("default_workspace_id", &self.default_workspace_id)
             .field("default_account_id", &self.default_account_id)
             .field(
@@ -499,6 +530,21 @@ impl AppConfig {
             llm_timeout_seconds: env_or("LLM_TIMEOUT_SECONDS", "45").parse()?,
             llm_max_retries: env_or("LLM_MAX_RETRIES", "5").parse()?,
             llm_retry_base_ms: env_or("LLM_RETRY_BASE_MS", "1500").parse()?,
+            agent_turn_phase_timeout_seconds: env_or("AGENT_TURN_PHASE_TIMEOUT_SECONDS", "75")
+                .parse::<u64>()?
+                .clamp(10, 300),
+            agent_turn_repair_timeout_seconds: env_or("AGENT_TURN_REPAIR_TIMEOUT_SECONDS", "150")
+                .parse::<u64>()?
+                .clamp(10, 600),
+            agent_turn_authorization_timeout_seconds: env_or(
+                "AGENT_TURN_AUTHORIZATION_TIMEOUT_SECONDS",
+                "150",
+            )
+            .parse::<u64>()?
+            .clamp(10, 600),
+            agent_turn_total_timeout_seconds: env_or("AGENT_TURN_TOTAL_TIMEOUT_SECONDS", "240")
+                .parse::<u64>()?
+                .clamp(30, 900),
             llm_max_concurrency: env_or("LLM_MAX_CONCURRENCY", "4")
                 .parse::<usize>()?
                 .clamp(1, 64),

@@ -50,6 +50,7 @@ import { GATEWAY_STATUS_LABELS, NEXT_BEST_ACTION_TYPE_LABELS, VERSION_STATUS_LAB
 import { useProfileStore, labelFor } from "../../stores/profileStore";
 import type { TaxonomyMap } from "../../stores/profileStore";
 import { useUserOpsStore } from "../../stores/userOpsStore";
+import { USER_RUNTIME_PARAMETER_FIELDS } from "../../stores/userOpsDomainHelpers";
 import { useAccountStore } from "../../stores/accountStore";
 import { overdueHours, formatRelativeTime } from "./poolHelpers";
 import TagTrustPanel from "./TagTrustPanel";
@@ -135,35 +136,6 @@ export const MEMORY_DRAFT_FIELD_GROUPS: Array<{
       { key: "reason", label: "判断依据", multiline: true }
     ]
   }
-];
-
-const USER_RUNTIME_PARAMETER_FIELDS: Array<{
-  key: string;
-  label: string;
-  detail: string;
-  kind: "number" | "boolean";
-  defaultValue: number | boolean;
-}> = [
-  { key: "recentMessageLimit", label: "上下文消息数", detail: "每次决策读取的最近消息数量", kind: "number", defaultValue: 12 },
-  { key: "minReplyIntervalSeconds", label: "最小回复间隔", detail: "避免短时间连续自动回复，单位秒", kind: "number", defaultValue: 20 },
-  { key: "maxDailyTouches", label: "每日触达上限", detail: "单个好友每天最多主动触达次数", kind: "number", defaultValue: 3 },
-  { key: "maxPendingFollowUps", label: "待跟进上限", detail: "同一好友最多保留的未执行跟进任务", kind: "number", defaultValue: 3 },
-  { key: "followUpExpiresHours", label: "跟进过期时间", detail: "超过时间未执行则自动失效，单位小时", kind: "number", defaultValue: 48 },
-  { key: "cooldownAfterNoReplyHours", label: "未回复冷却", detail: "用户无回应后的默认冷却时间，单位小时", kind: "number", defaultValue: 24 },
-  { key: "hallucinationBlockAt", label: "幻觉风险拦截线", detail: "幻觉风险达到该分值则禁止发送", kind: "number", defaultValue: 6 },
-  { key: "knowledgeGroundingBlockBelow", label: "知识落地拦截线", detail: "低于该分值则禁止发送涉及产品/价格/政策的内容", kind: "number", defaultValue: 7 },
-  { key: "humanLikeRewriteBelow", label: "真人感重写线", detail: "低于该分值时要求重写", kind: "number", defaultValue: 6 },
-  { key: "emotionalValueRewriteBelow", label: "情绪价值重写线", detail: "低于该分值时要求重写", kind: "number", defaultValue: 6 },
-  { key: "operationStateConfidenceFullReviewBelow", label: "状态置信复盘线", detail: "低于该分值强制完整复盘", kind: "number", defaultValue: 4 },
-  { key: "runTokenBudget", label: "单次 Token 预算", detail: "单次用户运营运行的最大 token", kind: "number", defaultValue: 30000 },
-  { key: "runMaxLlmCalls", label: "单次模型调用上限", detail: "单次用户运营最多 LLM 调用次数", kind: "number", defaultValue: 6 },
-  { key: "simulationTokenBudget", label: "模拟评测预算", detail: "单次模拟/评测可用 token", kind: "number", defaultValue: 60000 },
-  { key: "reactionTokenBudget", label: "反应分析预算", detail: "用户回应分析单次最多 token", kind: "number", defaultValue: 8000 },
-  { key: "reactionMaxLlmCalls", label: "反应分析调用上限", detail: "用户回应分析最多 LLM 调用次数", kind: "number", defaultValue: 2 },
-  { key: "quietHoursEnabled", label: "作息门控", detail: "开启后客户在休息时段来的消息不立即回，等醒来时段一次性回复；主动跟进也顺延到醒来", kind: "boolean", defaultValue: true },
-  { key: "quietHoursStart", label: "休息起点(时)", detail: "进入静默的整点小时，运营方本地时区，0-23，含。默认 22", kind: "number", defaultValue: 22 },
-  { key: "quietHoursEnd", label: "醒来时间(时)", detail: "结束静默/醒来回复的整点小时，0-23，不含。默认 8；起点>终点表示跨午夜", kind: "number", defaultValue: 8 },
-  { key: "quietHoursTzOffsetHours", label: "作息时区偏移", detail: "运营方所在时区相对 UTC 的小时偏移，中国填 8。不依赖服务器时区，跨机房部署也稳定", kind: "number", defaultValue: 8 }
 ];
 
 const MODE_COPY: Record<UserOpsMode, { title: string; desc: string }> = {

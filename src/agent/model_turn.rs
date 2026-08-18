@@ -35,16 +35,17 @@ use super::guards::{
     normalize_decision_runtime, normalize_decision_state, planner_from_decision,
 };
 use super::knowledge_router::{
-    coherent_knowledge_handoff, route_used_knowledge_ids, KnowledgeHandoffKind,
+    coherent_knowledge_handoff, route_requires_knowledge_review, route_used_knowledge_ids,
+    KnowledgeHandoffKind,
 };
 use super::knowledge_tools::{
     dispatch_chat_tool_call, ToolDispatchState, TOOL_LIST_CATALOG, TOOL_OPEN_SLICE, TOOL_SEARCH,
 };
 use super::review::{
     apply_independent_claim_gate, contact_has_principal_product_exemption, effective_review_mode,
-    evaluate_independent_claim_gate_with_authority, finalize_review_for_send,
-    local_decision_review, review_decision, should_run_targeted_rewrite, GatewayStatusFinal,
-    PendingFinalizeEvent, ReviewInvocationKind, ReviewerPromptCache,
+    embedded_light_claim_gate_evaluation, evaluate_independent_claim_gate_with_authority,
+    finalize_review_for_send, local_decision_review, review_decision, should_run_targeted_rewrite,
+    GatewayStatusFinal, PendingFinalizeEvent, ReviewInvocationKind, ReviewerPromptCache,
 };
 use super::runtime::UserRuntimeParameters;
 use super::sufficiency::PromptTier;
@@ -53,8 +54,8 @@ use super::turn_loop::{
     ToolDispatchBatch, TurnEnvironment, TurnGenerateRequest,
 };
 use super::types::{
-    AgentDecision, AgentTrigger, KnowledgeRouteResult, KnowledgeRuntime, RunPlannerResult,
-    ToolCallRequest, HOLD_CATEGORY_BLOCKED_BY_SAFETY_GUARD,
+    reply_protocol_violations, AgentDecision, AgentTrigger, KnowledgeRouteResult, KnowledgeRuntime,
+    RunPlannerResult, ToolCallRequest, HOLD_CATEGORY_BLOCKED_BY_SAFETY_GUARD,
 };
 
 const USER_TURN_TOOL_NAMES: &[&str] = &[TOOL_LIST_CATALOG, TOOL_SEARCH, TOOL_OPEN_SLICE];
@@ -80,7 +81,10 @@ fn has_conflicting_delivery_side_effects(decision: &AgentDecision) -> bool {
         .appointment_request
         .as_ref()
         .is_some_and(|request| request.requested)
-        || decision.commitment.is_some()
+        || decision
+            .commitment
+            .as_ref()
+            .is_some_and(|commitment| !commitment.text.trim().is_empty())
         || decision
             .last_commitment
             .as_deref()
@@ -93,8 +97,14 @@ fn has_conflicting_delivery_side_effects(decision: &AgentDecision) -> bool {
             .cooldown_until
             .as_deref()
             .is_some_and(|value| !value.trim().is_empty())
-        || !decision.assets_to_send.is_empty()
-        || decision.namecard_to_send.is_some()
+        || decision
+            .assets_to_send
+            .iter()
+            .any(|directive| !directive.asset_id.trim().is_empty())
+        || decision
+            .namecard_to_send
+            .as_ref()
+            .is_some_and(|directive| !directive.card_id.trim().is_empty())
         || !decision.commitment_updates.is_empty()
 }
 
@@ -728,10 +738,44 @@ pub(crate) struct ModelTurnEnvironment<'a, C> {
     opened_chunk_ids: HashSet<String>,
     last_planner: RunPlannerResult,
     pending_finalize_events: Vec<PendingFinalizeEvent>,
+    protocol_repair_issued: bool,
     commitment_update_repair_issued: bool,
     dropped_commitment_update_risk: Option<String>,
     typed_route_repair_issued: bool,
     typed_route_fallback_applied: bool,
+}
+
+fn requires_full_knowledge_review(
+    route: &KnowledgeRouteResult,
+    opened_chunk_ids: &HashSet<String>,
+) -> bool {
+    route_requires_knowledge_review(route) || !opened_chunk_ids.is_empty()
+}
+
+fn embedded_light_claim_gate_eligible(
+    review_mode: &str,
+    decision: &AgentDecision,
+    route: &KnowledgeRouteResult,
+    opened_chunk_ids: &HashSet<String>,
+    invocation_kind: ReviewInvocationKind,
+    inbound_is_synthetic_relay: bool,
+) -> bool {
+    review_mode == "light"
+        && invocation_kind == ReviewInvocationKind::Conversation
+        && !inbound_is_synthetic_relay
+        && decision.should_reply
+        && decision.risk_level == "low"
+        && decision.knowledge_need == "not_required"
+        && decision.autonomy_mode == "auto"
+        && decision.next_step == "respond"
+        && decision.used_knowledge_ids.is_empty()
+        && !requires_full_knowledge_review(route, opened_chunk_ids)
+        && !has_conflicting_delivery_side_effects(decision)
+        && !decision.verification.needed
+        && !decision
+            .escalation_request
+            .as_ref()
+            .is_some_and(|request| request.needed)
 }
 
 impl<'a, C> ModelTurnEnvironment<'a, C> {
@@ -744,6 +788,7 @@ impl<'a, C> ModelTurnEnvironment<'a, C> {
             opened_chunk_ids: HashSet::new(),
             last_planner,
             pending_finalize_events: Vec::new(),
+            protocol_repair_issued: false,
             commitment_update_repair_issued: false,
             dropped_commitment_update_risk: None,
             typed_route_repair_issued: false,
@@ -767,14 +812,7 @@ impl<'a, C> ModelTurnEnvironment<'a, C> {
         normalize_decision_state(&mut decision, self.inputs.domain_config);
         normalize_decision_runtime(&mut decision, self.inputs.initial_planner);
         let mut planner = planner_from_decision(&decision, "shared Agent Harness turn");
-        if !self.inputs.knowledge_route.selected_chunk_ids.is_empty()
-            || !self
-                .inputs
-                .knowledge_route
-                .selected_knowledge_ids
-                .is_empty()
-            || !self.opened_chunk_ids.is_empty()
-        {
+        if requires_full_knowledge_review(self.inputs.knowledge_route, &self.opened_chunk_ids) {
             planner.knowledge_required = true;
             if planner.review_mode.trim().is_empty() {
                 planner.review_mode = "full".to_string();
@@ -839,6 +877,33 @@ impl<'a, C> ModelTurnEnvironment<'a, C> {
             review.review_summary = reason.to_string();
         }
         AuthorizationManifest::held("blocked_by_budget", reason, review)
+    }
+
+    fn protocol_repair_instruction(violations: &[String]) -> String {
+        let violations = serde_json::to_string(violations).unwrap_or_else(|_| "[]".to_string());
+        format!(
+            "The previous Reply decision did not satisfy the structured final contract. Protocol violations: {violations}. Re-evaluate the conversation and return one complete decisionPhase=final JSON object. Include every required send-critical field with the correct JSON type and allowed enum value, including riskLevel, knowledgeNeed, runMode, autonomyMode, conversationMode, operationState, needsReview, shouldReply, riskSelfCheck, and the matching replyText/whyShouldReply or whySkipReply branch. Preserve only actions supported by the authority bundle. Do not explain the protocol to the customer and do not place internal field names in replyText."
+        )
+    }
+
+    fn hold_for_protocol_failure(
+        draft: &mut DraftEnvelope,
+        violations: Vec<String>,
+        reason: &str,
+    ) -> AuthorizationManifest {
+        draft.decision.should_reply = false;
+        draft.decision.autonomy_mode = "blocked".to_string();
+        let review = super::types::DecisionReviewResult {
+            approved: false,
+            should_hold: true,
+            hold_reason: reason.to_string(),
+            hold_category: HOLD_CATEGORY_BLOCKED_BY_SAFETY_GUARD.to_string(),
+            final_review_status: "blocked_by_required_field".to_string(),
+            review_summary: reason.to_string(),
+            risks: violations,
+            ..Default::default()
+        };
+        AuthorizationManifest::held("blocked_by_required_field", reason, review)
     }
 
     fn authorization_chunks(&self) -> Vec<OperationKnowledgeChunk> {
@@ -988,6 +1053,43 @@ where
     async fn authorize(&mut self, draft: &mut DraftEnvelope) -> AppResult<AuthorizationManifest> {
         self.pending_finalize_events.clear();
         self.dropped_commitment_update_risk = None;
+        let protocol_violations = reply_protocol_violations(&draft.promote_risks);
+        if !protocol_violations.is_empty() {
+            let instruction = Self::protocol_repair_instruction(&protocol_violations);
+            let repair_capacity_available = repair_and_reauthorization_capacity_available(
+                &self.inputs.budget,
+                self.inputs.state.second_reviewer_llm.is_some(),
+            );
+            if !self.protocol_repair_issued && repair_capacity_available {
+                self.protocol_repair_issued = true;
+                let review = super::types::DecisionReviewResult {
+                    approved: false,
+                    needs_revision: true,
+                    rewrite_instruction: instruction.clone(),
+                    review_summary:
+                        "Reply decision failed the structured protocol and requires one bounded regeneration"
+                            .to_string(),
+                    risks: protocol_violations,
+                    ..Default::default()
+                };
+                return Ok(AuthorizationManifest::repairable(
+                    "repair_required",
+                    instruction,
+                    review,
+                ));
+            }
+
+            if !repair_capacity_available {
+                self.inputs
+                    .budget
+                    .mark_degraded("reply_protocol_repair_skipped_required_authorization_tail");
+            }
+            return Ok(Self::hold_for_protocol_failure(
+                draft,
+                protocol_violations,
+                "Reply decision remained structurally invalid after the bounded repair opportunity",
+            ));
+        }
         if let Err(issue) =
             validate_appointment_request(draft.decision.appointment_request.as_ref())
         {
@@ -1171,28 +1273,21 @@ where
             }
             (review, false)
         } else {
-            let claim_gate_future = evaluate_independent_claim_gate_with_authority(
-                self.inputs.state,
-                self.inputs.contact,
-                self.inputs.inbound,
-                self.inputs.recent_messages,
-                decision,
-                &authorization_chunks,
-                self.inputs.active_products,
-                self.inputs.referral_cards,
-                self.inputs.active_profile,
-                DateTime::now(),
-                Some(self.inputs.run_id),
-                self.inputs.invocation_kind,
-                Some(self.inputs.authority),
-            );
-            let (mut review, claim_gate) =
+            let (mut review, claim_gate, embedded_light_gate) =
                 if decision.should_reply || has_commitment_lifecycle_action {
                     let review_mode = effective_review_mode(
                         &self.last_planner,
                         decision,
                         self.inputs.runtime,
                         draft.repair_attempt > 0,
+                    );
+                    let can_try_embedded = embedded_light_claim_gate_eligible(
+                        review_mode,
+                        decision,
+                        self.inputs.knowledge_route,
+                        &self.opened_chunk_ids,
+                        self.inputs.invocation_kind,
+                        self.inputs.inbound.is_synthetic_relay,
                     );
                     let review_future = review_decision(
                         self.inputs.state,
@@ -1214,12 +1309,73 @@ where
                         self.inputs.reviewer_prompts,
                         self.inputs.invocation_kind,
                     );
-                    let (review, claim_gate) = tokio::join!(review_future, claim_gate_future);
-                    (review?, claim_gate)
+                    if can_try_embedded {
+                        let review = review_future.await?;
+                        if let Some(claim_gate) = embedded_light_claim_gate_evaluation(
+                            &review,
+                            decision,
+                            self.inputs.authority.evidence_catalog(),
+                        ) {
+                            (review, claim_gate, true)
+                        } else {
+                            let claim_gate = evaluate_independent_claim_gate_with_authority(
+                                self.inputs.state,
+                                self.inputs.contact,
+                                self.inputs.inbound,
+                                self.inputs.recent_messages,
+                                decision,
+                                &authorization_chunks,
+                                self.inputs.active_products,
+                                self.inputs.referral_cards,
+                                self.inputs.active_profile,
+                                DateTime::now(),
+                                Some(self.inputs.run_id),
+                                self.inputs.invocation_kind,
+                                Some(self.inputs.authority),
+                            )
+                            .await;
+                            (review, claim_gate, false)
+                        }
+                    } else {
+                        let claim_gate_future = evaluate_independent_claim_gate_with_authority(
+                            self.inputs.state,
+                            self.inputs.contact,
+                            self.inputs.inbound,
+                            self.inputs.recent_messages,
+                            decision,
+                            &authorization_chunks,
+                            self.inputs.active_products,
+                            self.inputs.referral_cards,
+                            self.inputs.active_profile,
+                            DateTime::now(),
+                            Some(self.inputs.run_id),
+                            self.inputs.invocation_kind,
+                            Some(self.inputs.authority),
+                        );
+                        let (review, claim_gate) = tokio::join!(review_future, claim_gate_future);
+                        (review?, claim_gate, false)
+                    }
                 } else {
+                    let claim_gate = evaluate_independent_claim_gate_with_authority(
+                        self.inputs.state,
+                        self.inputs.contact,
+                        self.inputs.inbound,
+                        self.inputs.recent_messages,
+                        decision,
+                        &authorization_chunks,
+                        self.inputs.active_products,
+                        self.inputs.referral_cards,
+                        self.inputs.active_profile,
+                        DateTime::now(),
+                        Some(self.inputs.run_id),
+                        self.inputs.invocation_kind,
+                        Some(self.inputs.authority),
+                    )
+                    .await;
                     (
                         local_decision_review(decision, &self.inputs.budget, self.inputs.runtime),
-                        claim_gate_future.await,
+                        claim_gate,
+                        false,
                     )
                 };
             let priced_from_catalog = apply_independent_claim_gate(
@@ -1227,6 +1383,14 @@ where
                 decision,
                 &mut review,
                 self.inputs.active_products,
+            );
+            review.claim_analysis.insert(
+                "claimGateMode",
+                if embedded_light_gate {
+                    "embedded_light"
+                } else {
+                    "independent"
+                },
             );
             (review, priced_from_catalog)
         };
@@ -1356,6 +1520,93 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn embedded_candidate() -> AgentDecision {
+        AgentDecision {
+            decision_phase: "final".to_string(),
+            next_step: "respond".to_string(),
+            should_reply: true,
+            reply_text: "在的，刚看到。".to_string(),
+            risk_level: "low".to_string(),
+            knowledge_need: "not_required".to_string(),
+            autonomy_mode: "auto".to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn embedded_light_gate_eligibility_is_structural_and_conservative() {
+        let route = KnowledgeRouteResult::default();
+        let opened = HashSet::new();
+        let mut decision = embedded_candidate();
+        assert!(embedded_light_claim_gate_eligible(
+            "light",
+            &decision,
+            &route,
+            &opened,
+            ReviewInvocationKind::Conversation,
+            false,
+        ));
+
+        decision.verification.needed = true;
+        assert!(!embedded_light_claim_gate_eligible(
+            "light",
+            &decision,
+            &route,
+            &opened,
+            ReviewInvocationKind::Conversation,
+            false,
+        ));
+        decision.verification.needed = false;
+        decision.escalation_request = Some(crate::models::EscalationRequest {
+            needed: true,
+            category: None,
+            reason: None,
+            question_for_principal: None,
+            self_serviceable_part: None,
+            is_generalizable: false,
+        });
+        assert!(!embedded_light_claim_gate_eligible(
+            "light",
+            &decision,
+            &route,
+            &opened,
+            ReviewInvocationKind::Conversation,
+            false,
+        ));
+    }
+
+    #[test]
+    fn empty_optional_action_shells_are_structural_noops() {
+        let mut decision = embedded_candidate();
+        decision.commitment = Some(Default::default());
+        decision.assets_to_send = vec![Default::default()];
+        decision.namecard_to_send = Some(Default::default());
+        assert!(
+            !has_conflicting_delivery_side_effects(&decision),
+            "empty optional objects must not force an independent ClaimGate"
+        );
+
+        decision.namecard_to_send = Some(super::super::types::NamecardDirective {
+            card_id: "card-1".to_string(),
+            ..Default::default()
+        });
+        assert!(has_conflicting_delivery_side_effects(&decision));
+
+        decision.namecard_to_send = None;
+        decision.assets_to_send = vec![super::super::types::AssetSendDirective {
+            asset_id: "asset-1".to_string(),
+            ..Default::default()
+        }];
+        assert!(has_conflicting_delivery_side_effects(&decision));
+
+        decision.assets_to_send.clear();
+        decision.commitment = Some(super::super::types::CommitmentDecision {
+            text: "follow up with the customer".to_string(),
+            ..Default::default()
+        });
+        assert!(has_conflicting_delivery_side_effects(&decision));
+    }
 
     fn principal_route() -> KnowledgeRouteResult {
         KnowledgeRouteResult {
@@ -1553,7 +1804,10 @@ mod tests {
         );
 
         decision.next_step = "clarify".to_string();
-        decision.commitment = Some(Default::default());
+        decision.commitment = Some(super::super::types::CommitmentDecision {
+            text: "follow up after checking the schedule".to_string(),
+            ..Default::default()
+        });
         assert_eq!(
             typed_route_consistency_issue(&route, &decision, true),
             Some(TypedRouteConsistencyIssue {
@@ -1666,6 +1920,19 @@ mod tests {
             &route,
             true
         ));
+    }
+
+    #[test]
+    fn harness_opened_verified_chunk_forces_full_review_without_a_preselected_route() {
+        let route = KnowledgeRouteResult::default();
+        let mut opened = HashSet::new();
+        assert!(!requires_full_knowledge_review(&route, &opened));
+
+        opened.insert("verified-chunk-id".to_string());
+        assert!(
+            requires_full_knowledge_review(&route, &opened),
+            "a chunk opened by the Harness must not bypass the full Reviewer merely because the initial route was empty"
+        );
     }
 
     #[test]

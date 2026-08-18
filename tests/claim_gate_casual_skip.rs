@@ -1,8 +1,9 @@
-//! 可发送正文必须经过独立 ClaimGate，包括寒暄低风险轮。
+//! 低风险正文可由独立 Light Reviewer 同轮给出完整原子 claim 判断；其它正文仍必须经过
+//! 专用 ClaimGate。
 //!
 //! 回归重点不是匹配某句寒暄，而是锁定两个链路不变量：
-//! 1. 普通低风险正文也执行 Reply + Reviewer + ClaimGate；
-//! 2. Reply Agent 即使把事实性正文自报为 `claims=[] / low risk`，也不能绕过独立核验。
+//! 1. 完整且确认无 evidence claim 的 Light Reviewer 结果可省去专用 ClaimGate；
+//! 2. 合同缺失、业务事实或 Reply 自报 `claims=[] / low risk` 都不能绕过独立核验。
 //!
 //! 默认 #[ignore]，需 Docker（testcontainers MongoDB）。
 
@@ -165,6 +166,38 @@ fn review_pass_json() -> serde_json::Value {
     })
 }
 
+fn review_pass_with_embedded_atomic_json(
+    source_quote: &str,
+    evidence_need: &str,
+    product_claim: bool,
+) -> serde_json::Value {
+    let mut value = review_pass_json();
+    value["claimAnalysis"]["atomicClaimGate"] = json!({
+        "claimKinds": ["complete_candidate_unit"],
+        "claimsComplete": true,
+        "claims": [{
+            "sourceQuote": source_quote,
+            "claim": "独立审核候选回复的完整原子语义",
+            "scope": "open_semantic_scope",
+            "subject": if evidence_need == "required" { "business" } else { "general" },
+            "actionKind": null,
+            "evidenceNeed": evidence_need,
+            "negativePolarity": false,
+            "productClaim": product_claim,
+            "evidenceRefs": [],
+            "reason": if evidence_need == "required" {
+                "候选代表机构确认了可现实核验的业务事实。"
+            } else {
+                "候选只完成当前会话中的轻量互动，不结算外部业务事实。"
+            }
+        }],
+        "catalogCoverageComplete": true,
+        "catalogClaims": [],
+        "reason": "已完整检查候选回复的原子语义。"
+    });
+    value
+}
+
 /// A model may still populate the legacy boolean incorrectly while providing the newer semantic
 /// contract correctly. The server must reconcile that contradiction from the typed AI field,
 /// without inspecting the candidate text or maintaining a phrase allowlist.
@@ -219,10 +252,11 @@ fn missing_semantic_authority_claim_gate_json() -> serde_json::Value {
     value
 }
 
-/// 低风险寒暄仍要执行独立 ClaimGate，不能为了省一次调用削弱双模型独立性。
+/// 低风险寒暄由独立 Light Reviewer 同轮完成原子 claim 判断，无需再串一个专用
+/// ClaimGate；Reply 自报不参与该判定。
 #[tokio::test]
 #[ignore = "requires MongoDB"]
-async fn casual_low_risk_turn_still_runs_claim_gate() {
+async fn casual_low_risk_turn_uses_embedded_light_claim_gate() {
     let app = common::TestApp::start().await;
     let contact = make_managed_contact("user_casual_skip");
     app.state
@@ -239,13 +273,14 @@ async fn casual_low_risk_turn_still_runs_claim_gate() {
         .await
         .expect("insert inbound message");
 
-    app.llm.push_response(casual_reply_decision_json(
-        "哈哈爬山好啊！这个天气正合适，我周末就宅着追了个剧～你们去的哪座山？",
-        "low",
-    ));
-    app.llm.push_response(review_pass_json());
+    let reply = "哈哈爬山好啊！这个天气正合适，我周末就宅着追了个剧～你们去的哪座山？";
     app.llm
-        .push_response(common::independent_claim_gate_pass_json());
+        .push_response(casual_reply_decision_json(reply, "low"));
+    app.llm.push_response(review_pass_with_embedded_atomic_json(
+        reply,
+        "not_needed",
+        false,
+    ));
 
     let before_calls = app.llm.calls();
     handle_managed_message(&app.state, contact.clone(), &inbound)
@@ -254,8 +289,8 @@ async fn casual_low_risk_turn_still_runs_claim_gate() {
     let after_calls = app.llm.calls();
     assert_eq!(
         after_calls - before_calls,
-        3,
-        "任何可发送正文都应执行 Reply + Review + ClaimGate 三次 LLM 调用"
+        2,
+        "安全 Lean 正文应只执行 Reply + 独立 Light Reviewer 两次 LLM 调用"
     );
 
     let log = app
@@ -274,25 +309,17 @@ async fn casual_low_risk_turn_still_runs_claim_gate() {
         .expect("agent_run_logs row exists");
     assert_eq!(
         log.final_review_status, "approved",
-        "独立 ClaimGate 通过后寒暄轮终态应 approved，实际 {:?}",
+        "嵌入式原子判断通过后寒暄轮终态应 approved，实际 {:?}",
         log.final_review_status
     );
 
-    let review = app
-        .state
-        .db
-        .decision_reviews()
-        .find_one(doc! { "run_id": &log.run_id }, None)
-        .await
-        .expect("query decision_reviews")
-        .expect("decision review row exists");
-    assert!(
-        !review
-            .risks
-            .iter()
-            .any(|risk| risk == "claim_gate_skipped_casual_low_risk"),
-        "发送链路不得再出现 ClaimGate 跳过标记，实际 risks={:?}",
-        review.risks
+    let claim_analysis = log
+        .review
+        .get_document("claimAnalysis")
+        .expect("run log persists merged claim analysis");
+    assert_eq!(
+        claim_analysis.get_str("claimGateMode").unwrap_or_default(),
+        "embedded_light"
     );
 
     let outbox = app
@@ -329,7 +356,11 @@ async fn semantic_claim_contract_overrides_contradictory_legacy_evidence_flag() 
 
     app.llm
         .push_response(casual_reply_decision_json("收到", "low"));
-    app.llm.push_response(review_pass_json());
+    app.llm.push_response(review_pass_with_embedded_atomic_json(
+        "可以，我们门店明天下午三点一定有空位，你直接过来就行。",
+        "required",
+        false,
+    ));
     app.llm
         .push_response(contradictory_legacy_claim_gate_json());
 

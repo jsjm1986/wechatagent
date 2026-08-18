@@ -15,11 +15,15 @@ use sha2::{Digest, Sha256};
 use crate::error::{AppError, AppResult};
 
 use super::guards::reviewed_decision_actions;
-use super::types::{AgentDecision, DecisionReviewResult, ToolCallRequest};
+use super::types::{
+    is_reply_protocol_violation, AgentDecision, DecisionReviewResult, ToolCallRequest,
+};
 
 pub(crate) const TURN_LOOP_MAX_ITERATIONS: usize = 4;
 pub(crate) const TURN_LOOP_MAX_REPAIRS: usize = 2;
-pub(crate) const TURN_LOOP_DEADLINE: Duration = Duration::from_secs(30);
+pub(crate) const TURN_LOOP_PHASE_TIMEOUT: Duration = Duration::from_secs(75);
+pub(crate) const TURN_LOOP_AUTHORIZATION_TIMEOUT: Duration = Duration::from_secs(150);
+pub(crate) const TURN_LOOP_TOTAL_TIMEOUT: Duration = Duration::from_secs(240);
 const TURN_LOOP_CONTEXT_MAX_CHARS: usize = 12_000;
 
 /// Version for the structured authorization fence stored beside every current production
@@ -331,6 +335,7 @@ pub(crate) trait TurnEnvironment: Send {
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn run_turn<E: TurnEnvironment>(
     input: &TurnKernelInput<'_>,
     environment: &mut E,
@@ -339,10 +344,106 @@ pub(crate) async fn run_turn<E: TurnEnvironment>(
 }
 
 #[derive(Debug, Clone, Copy)]
+pub(crate) struct TurnLoopTimeouts {
+    phase_timeout: Duration,
+    repair_timeout: Duration,
+    authorization_timeout: Duration,
+    total_timeout: Duration,
+}
+
+impl TurnLoopTimeouts {
+    pub(crate) fn from_seconds(
+        phase_timeout_seconds: u64,
+        repair_timeout_seconds: u64,
+        authorization_timeout_seconds: u64,
+        total_timeout_seconds: u64,
+    ) -> Self {
+        let phase_timeout_seconds = phase_timeout_seconds.max(1);
+        let repair_timeout_seconds = repair_timeout_seconds.max(1);
+        let authorization_timeout_seconds = authorization_timeout_seconds.max(1);
+        Self {
+            phase_timeout: Duration::from_secs(phase_timeout_seconds),
+            repair_timeout: Duration::from_secs(repair_timeout_seconds),
+            authorization_timeout: Duration::from_secs(authorization_timeout_seconds),
+            total_timeout: Duration::from_secs(
+                total_timeout_seconds.max(
+                    phase_timeout_seconds
+                        .max(repair_timeout_seconds)
+                        .max(authorization_timeout_seconds),
+                ),
+            ),
+        }
+    }
+
+    pub(crate) fn total_deadline_from_now(&self) -> tokio::time::Instant {
+        tokio::time::Instant::now() + self.total_timeout
+    }
+
+    pub(crate) async fn run_initial_phase<T>(
+        &self,
+        phase: &'static str,
+        total_deadline: tokio::time::Instant,
+        future: impl std::future::Future<Output = AppResult<T>>,
+    ) -> AppResult<T> {
+        timeout_at(
+            phase,
+            phase_deadline(total_deadline, self.phase_timeout),
+            future,
+        )
+        .await
+    }
+}
+
+impl Default for TurnLoopTimeouts {
+    fn default() -> Self {
+        Self {
+            phase_timeout: TURN_LOOP_PHASE_TIMEOUT,
+            repair_timeout: TURN_LOOP_AUTHORIZATION_TIMEOUT,
+            authorization_timeout: TURN_LOOP_AUTHORIZATION_TIMEOUT,
+            total_timeout: TURN_LOOP_TOTAL_TIMEOUT,
+        }
+    }
+}
+
+pub(crate) async fn run_turn_with_timeouts<E: TurnEnvironment>(
+    input: &TurnKernelInput<'_>,
+    environment: &mut E,
+    timeouts: TurnLoopTimeouts,
+) -> AppResult<TurnOutcome> {
+    let total_deadline = timeouts.total_deadline_from_now();
+    run_turn_with_deadline(input, environment, timeouts, total_deadline).await
+}
+
+pub(crate) async fn run_turn_with_deadline<E: TurnEnvironment>(
+    input: &TurnKernelInput<'_>,
+    environment: &mut E,
+    timeouts: TurnLoopTimeouts,
+    total_deadline: tokio::time::Instant,
+) -> AppResult<TurnOutcome> {
+    run_turn_with_config_at(
+        input,
+        environment,
+        TurnLoopConfig {
+            max_iterations: TURN_LOOP_MAX_ITERATIONS,
+            max_repairs: TURN_LOOP_MAX_REPAIRS,
+            phase_timeout: timeouts.phase_timeout,
+            repair_timeout: timeouts.repair_timeout,
+            authorization_timeout: timeouts.authorization_timeout,
+            total_timeout: timeouts.total_timeout,
+        },
+        Some(total_deadline),
+    )
+    .await
+}
+
+#[derive(Debug, Clone, Copy)]
 struct TurnLoopConfig {
     max_iterations: usize,
     max_repairs: usize,
-    deadline: Duration,
+    phase_timeout: Duration,
+    repair_timeout: Duration,
+    authorization_timeout: Duration,
+    total_timeout: Duration,
 }
 
 impl Default for TurnLoopConfig {
@@ -350,7 +451,10 @@ impl Default for TurnLoopConfig {
         Self {
             max_iterations: TURN_LOOP_MAX_ITERATIONS,
             max_repairs: TURN_LOOP_MAX_REPAIRS,
-            deadline: TURN_LOOP_DEADLINE,
+            phase_timeout: TURN_LOOP_PHASE_TIMEOUT,
+            repair_timeout: TURN_LOOP_AUTHORIZATION_TIMEOUT,
+            authorization_timeout: TURN_LOOP_AUTHORIZATION_TIMEOUT,
+            total_timeout: TURN_LOOP_TOTAL_TIMEOUT,
         }
     }
 }
@@ -361,12 +465,25 @@ pub(crate) struct TurnKernelInput<'a> {
     pub authority_bundle_hash: &'a str,
 }
 
+#[cfg(test)]
 async fn run_turn_with_config<E: TurnEnvironment>(
     input: &TurnKernelInput<'_>,
     environment: &mut E,
     config: TurnLoopConfig,
 ) -> AppResult<TurnOutcome> {
-    let deadline = tokio::time::Instant::now() + config.deadline;
+    run_turn_with_config_at(input, environment, config, None).await
+}
+
+async fn run_turn_with_config_at<E: TurnEnvironment>(
+    input: &TurnKernelInput<'_>,
+    environment: &mut E,
+    config: TurnLoopConfig,
+    inherited_total_deadline: Option<tokio::time::Instant>,
+) -> AppResult<TurnOutcome> {
+    let configured_deadline = tokio::time::Instant::now() + config.total_timeout;
+    let total_deadline = inherited_total_deadline
+        .map(|deadline| deadline.min(configured_deadline))
+        .unwrap_or(configured_deadline);
     let mut tool_context = String::new();
     let mut authorization_feedback = String::new();
     let mut repairs = 0usize;
@@ -377,8 +494,19 @@ async fn run_turn_with_config<E: TurnEnvironment>(
     let mut last_draft: Option<DraftEnvelope> = None;
 
     for iteration in 0..config.max_iterations {
+        let generation_timeout = if repairs > 0 {
+            config.repair_timeout
+        } else {
+            config.phase_timeout
+        };
+        let generate_deadline = phase_deadline(total_deadline, generation_timeout);
         let generated = timeout_at(
-            deadline,
+            if repairs > 0 {
+                "repair_generate"
+            } else {
+                "generate"
+            },
+            generate_deadline,
             environment.generate(TurnGenerateRequest {
                 iteration,
                 repair_attempt: repairs,
@@ -420,13 +548,15 @@ async fn run_turn_with_config<E: TurnEnvironment>(
                     trace,
                     iteration + 1,
                     repairs,
-                    deadline,
+                    total_deadline,
                 )
                 .await;
             }
+            let dispatch_deadline = phase_deadline(total_deadline, config.phase_timeout);
             let batch = timeout_at(
-                deadline,
-                environment.dispatch_tools(&draft.decision.tool_calls, deadline),
+                "tool_dispatch",
+                dispatch_deadline,
+                environment.dispatch_tools(&draft.decision.tool_calls, dispatch_deadline.at),
             )
             .await?;
             append_bounded_context(
@@ -461,7 +591,7 @@ async fn run_turn_with_config<E: TurnEnvironment>(
                     trace,
                     iteration + 1,
                     repairs,
-                    deadline,
+                    total_deadline,
                 )
                 .await;
             }
@@ -471,7 +601,11 @@ async fn run_turn_with_config<E: TurnEnvironment>(
         }
 
         let progress_identity = stable_progress_hash(&draft_hash, &evidence_fingerprint);
-        if !seen_progress.insert(progress_identity) {
+        let has_protocol_violation = draft
+            .promote_risks
+            .iter()
+            .any(|risk| is_reply_protocol_violation(risk));
+        if !has_protocol_violation && !seen_progress.insert(progress_identity) {
             let authorization = AuthorizationManifest::held(
                 "held_no_progress",
                 "turn loop produced the same structured draft without new verified evidence",
@@ -485,12 +619,27 @@ async fn run_turn_with_config<E: TurnEnvironment>(
                 trace,
                 iteration + 1,
                 repairs,
-                deadline,
+                total_deadline,
             )
             .await;
         }
+        if has_protocol_violation {
+            trace.push(doc! {
+                "iteration": iteration as i64,
+                "phase": "protocol_authorization",
+                "violation_count": draft.promote_risks.iter()
+                    .filter(|risk| is_reply_protocol_violation(risk))
+                    .count() as i64,
+            });
+        }
 
-        let authorization = timeout_at(deadline, environment.authorize(&mut draft)).await?;
+        let authorization_deadline = phase_deadline(total_deadline, config.authorization_timeout);
+        let authorization = timeout_at(
+            "authorization",
+            authorization_deadline,
+            environment.authorize(&mut draft),
+        )
+        .await?;
         let finalized_draft_hash = stable_draft_hash(&draft.decision);
         if finalized_draft_hash != draft.draft_hash {
             trace.push(doc! {
@@ -519,7 +668,7 @@ async fn run_turn_with_config<E: TurnEnvironment>(
                     trace,
                     iteration + 1,
                     repairs,
-                    deadline,
+                    total_deadline,
                 )
                 .await;
             }
@@ -538,7 +687,7 @@ async fn run_turn_with_config<E: TurnEnvironment>(
                         trace,
                         iteration + 1,
                         repairs,
-                        deadline,
+                        total_deadline,
                     )
                     .await;
                 }
@@ -560,7 +709,7 @@ async fn run_turn_with_config<E: TurnEnvironment>(
                     trace,
                     iteration + 1,
                     repairs,
-                    deadline,
+                    total_deadline,
                 )
                 .await;
             }
@@ -578,7 +727,7 @@ async fn run_turn_with_config<E: TurnEnvironment>(
                     trace,
                     iteration + 1,
                     repairs,
-                    deadline,
+                    total_deadline,
                 )
                 .await;
             }
@@ -601,7 +750,7 @@ async fn run_turn_with_config<E: TurnEnvironment>(
         trace,
         config.max_iterations,
         repairs,
-        deadline,
+        total_deadline,
     )
     .await
 }
@@ -662,12 +811,36 @@ async fn commit_outcome<E: TurnEnvironment>(
 }
 
 async fn timeout_at<T>(
-    deadline: tokio::time::Instant,
+    phase: &'static str,
+    deadline: TurnDeadline,
     future: impl std::future::Future<Output = AppResult<T>>,
 ) -> AppResult<T> {
-    tokio::time::timeout_at(deadline, future)
+    tokio::time::timeout_at(deadline.at, future)
         .await
-        .map_err(|_| AppError::External("turn_loop_timeout".to_string()))?
+        .map_err(|_| {
+            AppError::External(format!("turn_loop_timeout:{phase}:{}", deadline.limit_kind))
+        })?
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TurnDeadline {
+    at: tokio::time::Instant,
+    limit_kind: &'static str,
+}
+
+fn phase_deadline(total_deadline: tokio::time::Instant, phase_timeout: Duration) -> TurnDeadline {
+    let phase_deadline = tokio::time::Instant::now() + phase_timeout;
+    if phase_deadline < total_deadline {
+        TurnDeadline {
+            at: phase_deadline,
+            limit_kind: "phase_budget",
+        }
+    } else {
+        TurnDeadline {
+            at: total_deadline,
+            limit_kind: "total_budget",
+        }
+    }
 }
 
 fn stable_draft_hash(decision: &AgentDecision) -> String {
@@ -869,6 +1042,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repeated_protocol_invalid_draft_reaches_authorizer_terminal_status() {
+        struct ProtocolEnvironment {
+            generated: usize,
+            authorized: usize,
+        }
+
+        #[async_trait]
+        impl TurnEnvironment for ProtocolEnvironment {
+            async fn generate(
+                &mut self,
+                _request: TurnGenerateRequest,
+            ) -> AppResult<(AgentDecision, Vec<String>)> {
+                self.generated += 1;
+                Ok((
+                    AgentDecision {
+                        decision_phase: "final".to_string(),
+                        next_step: "repair".to_string(),
+                        should_reply: false,
+                        ..AgentDecision::default()
+                    },
+                    vec!["missing_required_field:should_reply".to_string()],
+                ))
+            }
+
+            async fn dispatch_tools(
+                &mut self,
+                _calls: &[ToolCallRequest],
+                _deadline: tokio::time::Instant,
+            ) -> AppResult<ToolDispatchBatch> {
+                unreachable!()
+            }
+
+            async fn authorize(
+                &mut self,
+                _draft: &mut DraftEnvelope,
+            ) -> AppResult<AuthorizationManifest> {
+                self.authorized += 1;
+                if self.authorized == 1 {
+                    Ok(AuthorizationManifest::repairable(
+                        "repair_required",
+                        "return the complete final contract",
+                        DecisionReviewResult::default(),
+                    ))
+                } else {
+                    Ok(AuthorizationManifest::held(
+                        "blocked_by_required_field",
+                        "protocol repair failed",
+                        DecisionReviewResult::default(),
+                    ))
+                }
+            }
+
+            async fn commit(&mut self, plan: CommitPlan) -> AppResult<CommitResult> {
+                Ok(CommitResult {
+                    receipt: CommitReceipt {
+                        status: "held".to_string(),
+                        environment: "test".to_string(),
+                        committed_at: DateTime::now(),
+                        ..CommitReceipt::default()
+                    },
+                    plan,
+                })
+            }
+        }
+
+        let mut env = ProtocolEnvironment {
+            generated: 0,
+            authorized: 0,
+        };
+        let outcome = run_turn(&input(), &mut env).await.unwrap();
+
+        assert_eq!(
+            outcome.authorization.final_status,
+            "blocked_by_required_field"
+        );
+        assert_eq!(env.generated, 2);
+        assert_eq!(env.authorized, 2);
+    }
+
+    #[tokio::test]
     async fn draft_claim_self_report_cannot_override_authorizer() {
         let mut decision = final_decision("unsupported candidate");
         decision
@@ -900,7 +1153,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deadline_covers_environment_calls() {
+    async fn phase_timeout_covers_environment_calls() {
         struct SlowEnvironment;
         #[async_trait]
         impl TurnEnvironment for SlowEnvironment {
@@ -935,12 +1188,217 @@ mod tests {
             TurnLoopConfig {
                 max_iterations: 4,
                 max_repairs: 2,
-                deadline: Duration::from_millis(10),
+                phase_timeout: Duration::from_millis(10),
+                repair_timeout: Duration::from_millis(10),
+                authorization_timeout: Duration::from_millis(10),
+                total_timeout: Duration::from_millis(100),
             },
         )
         .await
-        .expect_err("slow environment call must hit the absolute deadline");
-        assert!(error.to_string().contains("turn_loop_timeout"));
+        .expect_err("slow environment call must hit its phase timeout");
+        assert!(error
+            .to_string()
+            .contains("turn_loop_timeout:generate:phase_budget"));
+    }
+
+    #[tokio::test]
+    async fn initial_gateway_phases_share_phase_and_total_deadlines() {
+        let phase_limited = TurnLoopTimeouts {
+            phase_timeout: Duration::from_millis(10),
+            repair_timeout: Duration::from_millis(100),
+            authorization_timeout: Duration::from_millis(100),
+            total_timeout: Duration::from_millis(100),
+        };
+        let phase_error = phase_limited
+            .run_initial_phase(
+                "knowledge_route",
+                phase_limited.total_deadline_from_now(),
+                async {
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    Ok(())
+                },
+            )
+            .await
+            .expect_err("knowledge routing must retain its own phase cap");
+        assert!(phase_error
+            .to_string()
+            .contains("turn_loop_timeout:knowledge_route:phase_budget"));
+
+        let total_limited = TurnLoopTimeouts {
+            phase_timeout: Duration::from_millis(100),
+            ..phase_limited
+        };
+        let total_error = total_limited
+            .run_initial_phase(
+                "initial_reply",
+                tokio::time::Instant::now() + Duration::from_millis(10),
+                async {
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    Ok(())
+                },
+            )
+            .await
+            .expect_err("the shared total deadline must cap initial reply generation");
+        assert!(total_error
+            .to_string()
+            .contains("turn_loop_timeout:initial_reply:total_budget"));
+    }
+
+    #[tokio::test]
+    async fn harness_entry_does_not_reset_an_inherited_total_deadline() {
+        struct DelayedGenerateEnvironment {
+            committed: usize,
+        }
+
+        #[async_trait]
+        impl TurnEnvironment for DelayedGenerateEnvironment {
+            async fn generate(
+                &mut self,
+                _request: TurnGenerateRequest,
+            ) -> AppResult<(AgentDecision, Vec<String>)> {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Ok((final_decision("must not complete"), Vec::new()))
+            }
+
+            async fn dispatch_tools(
+                &mut self,
+                _calls: &[ToolCallRequest],
+                _deadline: tokio::time::Instant,
+            ) -> AppResult<ToolDispatchBatch> {
+                unreachable!()
+            }
+
+            async fn authorize(
+                &mut self,
+                _draft: &mut DraftEnvelope,
+            ) -> AppResult<AuthorizationManifest> {
+                unreachable!()
+            }
+
+            async fn commit(&mut self, _plan: CommitPlan) -> AppResult<CommitResult> {
+                self.committed += 1;
+                unreachable!()
+            }
+        }
+
+        let timeouts = TurnLoopTimeouts {
+            phase_timeout: Duration::from_millis(100),
+            repair_timeout: Duration::from_millis(100),
+            authorization_timeout: Duration::from_millis(100),
+            total_timeout: Duration::from_millis(100),
+        };
+        let total_deadline = tokio::time::Instant::now() + Duration::from_millis(35);
+        timeouts
+            .run_initial_phase("knowledge_route", total_deadline, async {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let mut env = DelayedGenerateEnvironment { committed: 0 };
+        let error = run_turn_with_deadline(&input(), &mut env, timeouts, total_deadline)
+            .await
+            .expect_err("elapsed pre-Harness work must consume the shared total budget");
+        assert!(error
+            .to_string()
+            .contains("turn_loop_timeout:generate:total_budget"));
+        assert_eq!(env.committed, 0);
+    }
+
+    #[tokio::test]
+    async fn phase_budget_refreshes_while_total_deadline_remains_absolute() {
+        struct TwoSlowPhases;
+
+        #[async_trait]
+        impl TurnEnvironment for TwoSlowPhases {
+            async fn generate(
+                &mut self,
+                _request: TurnGenerateRequest,
+            ) -> AppResult<(AgentDecision, Vec<String>)> {
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                Ok((final_decision("ready"), Vec::new()))
+            }
+
+            async fn dispatch_tools(
+                &mut self,
+                _calls: &[ToolCallRequest],
+                _deadline: tokio::time::Instant,
+            ) -> AppResult<ToolDispatchBatch> {
+                unreachable!()
+            }
+
+            async fn authorize(
+                &mut self,
+                _draft: &mut DraftEnvelope,
+            ) -> AppResult<AuthorizationManifest> {
+                tokio::time::sleep(Duration::from_millis(80)).await;
+                Ok(AuthorizationManifest::authorized(
+                    "approved",
+                    DecisionReviewResult::default(),
+                ))
+            }
+
+            async fn commit(&mut self, plan: CommitPlan) -> AppResult<CommitResult> {
+                Ok(CommitResult {
+                    plan,
+                    receipt: CommitReceipt::default(),
+                })
+            }
+        }
+
+        let outcome = run_turn_with_config(
+            &input(),
+            &mut TwoSlowPhases,
+            TurnLoopConfig {
+                max_iterations: 2,
+                max_repairs: 1,
+                phase_timeout: Duration::from_millis(60),
+                repair_timeout: Duration::from_millis(100),
+                authorization_timeout: Duration::from_millis(100),
+                total_timeout: Duration::from_millis(250),
+            },
+        )
+        .await
+        .expect("generation must not consume the authorization phase budget");
+        assert_eq!(outcome.authorization.disposition, "authorized");
+
+        let authorization_error = run_turn_with_config(
+            &input(),
+            &mut TwoSlowPhases,
+            TurnLoopConfig {
+                max_iterations: 2,
+                max_repairs: 1,
+                phase_timeout: Duration::from_millis(60),
+                repair_timeout: Duration::from_millis(60),
+                authorization_timeout: Duration::from_millis(20),
+                total_timeout: Duration::from_millis(250),
+            },
+        )
+        .await
+        .expect_err("authorization must use its own phase budget");
+        assert!(authorization_error
+            .to_string()
+            .contains("turn_loop_timeout:authorization:phase_budget"));
+
+        let error = run_turn_with_config(
+            &input(),
+            &mut TwoSlowPhases,
+            TurnLoopConfig {
+                max_iterations: 2,
+                max_repairs: 1,
+                phase_timeout: Duration::from_millis(200),
+                repair_timeout: Duration::from_millis(200),
+                authorization_timeout: Duration::from_millis(200),
+                total_timeout: Duration::from_millis(100),
+            },
+        )
+        .await
+        .expect_err("the absolute turn deadline must still cap multiple phases");
+        assert!(error
+            .to_string()
+            .contains("turn_loop_timeout:authorization:total_budget"));
     }
 
     #[tokio::test]
@@ -1154,7 +1612,10 @@ mod tests {
             TurnLoopConfig {
                 max_iterations: 2,
                 max_repairs: 1,
-                deadline: Duration::from_millis(10),
+                phase_timeout: Duration::from_millis(10),
+                repair_timeout: Duration::from_millis(10),
+                authorization_timeout: Duration::from_millis(10),
+                total_timeout: Duration::from_millis(10),
             },
         )
         .await

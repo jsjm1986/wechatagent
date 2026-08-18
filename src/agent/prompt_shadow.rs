@@ -49,7 +49,7 @@ use super::model_turn::{
 use super::review::ReviewInvocationKind;
 use super::run_envelope::SOURCE_KIND_INBOUND_MESSAGE;
 use super::runtime::{resolve_thresholds, UserRuntimeParameters};
-use super::turn_loop::{run_turn, TurnKernelInput};
+use super::turn_loop::{run_turn_with_timeouts, TurnKernelInput, TurnLoopTimeouts};
 use super::types::{KnowledgeRouteResult, KnowledgeRuntime, RunPlannerResult};
 
 /// 单条源样本的新旧对照结果。Task 13（replay.rs）负责把它映射进 `ShadowReplay`
@@ -683,13 +683,19 @@ async fn run_prompt_shadow_branch(
             inbound,
         ),
     );
-    let outcome = run_turn(
+    let outcome = run_turn_with_timeouts(
         &TurnKernelInput {
             run_id,
             turn_id: &turn_id,
             authority_bundle_hash: authority.bundle_hash(),
         },
         &mut environment,
+        TurnLoopTimeouts::from_seconds(
+            state.config.agent_turn_phase_timeout_seconds,
+            state.config.agent_turn_repair_timeout_seconds,
+            state.config.agent_turn_authorization_timeout_seconds,
+            state.config.agent_turn_total_timeout_seconds,
+        ),
     )
     .await?;
     if !prompt_override.was_applied() {

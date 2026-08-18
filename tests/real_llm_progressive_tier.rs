@@ -142,6 +142,41 @@ impl LlmProvider for FailoverProvider {
         Err(last_err
             .unwrap_or_else(|| AppError::External("failover: 无可用 LLM 客户端".to_string())))
     }
+
+    async fn generate_json_with_usage_limit(
+        &self,
+        system: &str,
+        user: &str,
+        max_output_tokens: u32,
+    ) -> AppResult<LlmJsonResult> {
+        let mut last_err: Option<AppError> = None;
+        for (i, client) in self.clients.iter().enumerate() {
+            match client
+                .generate_json_with_usage_limit(system, user, max_output_tokens)
+                .await
+            {
+                Ok(r) => {
+                    if i > 0 {
+                        eprintln!(
+                            "[failover] 主模型 {} 不可用，已切到备胎[{i}] {} 兜底成功",
+                            self.primary_label, r.model
+                        );
+                    }
+                    return Ok(r);
+                }
+                Err(e) if is_failover_worthy(&e) => {
+                    eprintln!(
+                        "[failover] {} 第{i}个候选不可用，尝试下一个备胎: {e}",
+                        self.primary_label
+                    );
+                    last_err = Some(e);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last_err
+            .unwrap_or_else(|| AppError::External("failover: 无可用 LLM 客户端".to_string())))
+    }
 }
 
 /// FAILOVER key 是否已配。
@@ -428,6 +463,72 @@ async fn p1_greeting_stays_lean_no_escalation() {
     unwrap_or_skip_transient!(
         handle_managed_message(&state, contact.clone(), &inbound).await,
         "寒暄轮链路必须 Ok"
+    );
+
+    let log = state
+        .db
+        .agent_run_logs()
+        .find_one(
+            doc! {
+                "workspace_id": &contact.workspace_id,
+                "account_id": &contact.account_id,
+                "contact_wxid": &contact.wxid,
+                "source_event_id": &inbound.message_id,
+            },
+            None,
+        )
+        .await
+        .expect("query greeting run log")
+        .expect("寒暄轮必须落 agent_run_log");
+    assert_ne!(
+        log.final_review_status, "blocked_by_required_field",
+        "合法寒暄不得因 Reply JSON 协议字段缺失被拦截"
+    );
+    assert!(
+        matches!(
+            log.final_review_status.as_str(),
+            "approved" | "revision_applied_approved"
+        ),
+        "寒暄轮必须真正通过审查，不能只以链路 Ok 或非回复终态假绿，实际={:?}",
+        log.final_review_status
+    );
+    let claim_analysis = log
+        .review
+        .get_document("claimAnalysis")
+        .expect("寒暄轮必须持久化结构化 claim contract");
+    assert_eq!(
+        claim_analysis.get_str("claimGateMode").unwrap_or_default(),
+        "embedded_light",
+        "严格低风险、无有效副作用的寒暄应复用 Light Reviewer 的原子合同，不能再串行调用独立 ClaimGate"
+    );
+
+    let outbox = state
+        .db
+        .collection_agent_send_outbox()
+        .find_one(
+            doc! {
+                "workspace_id": &contact.workspace_id,
+                "account_id": &contact.account_id,
+                "contact_wxid": &contact.wxid,
+                "source_event_id": &inbound.message_id,
+                "decision_id": { "$type": "objectId" },
+            },
+            None,
+        )
+        .await
+        .expect("query greeting outbox")
+        .expect("获批寒暄轮必须产生 decision-backed 正常 outbox");
+    assert!(
+        outbox.decision_id.is_some(),
+        "正常回复 outbox 必须绑定 decision"
+    );
+    assert!(
+        !outbox.source_event_id.ends_with("#ack-placeholder"),
+        "寒暄轮不得用 ack placeholder 冒充正常回复"
+    );
+    assert!(
+        !outbox.content.trim().is_empty(),
+        "正常回复 outbox 内容不得为空"
     );
 
     // 硬断言：寒暄轮不该升档。

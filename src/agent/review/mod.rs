@@ -1523,6 +1523,42 @@ pub(crate) struct IndependentClaimGateEvaluation {
     outcome: Option<AppResult<IndependentClaimVerdict>>,
 }
 
+/// Reuse an independent Light Reviewer verdict only when its embedded atomic contract proves that
+/// the complete candidate contains no evidence-bearing or catalog claim.
+///
+/// Missing/malformed fields and any evidence-bearing unit return `None`; callers then run the
+/// dedicated ClaimGate. The Reply Agent's own claim metadata is never consulted.
+pub(crate) fn embedded_light_claim_gate_evaluation(
+    review: &DecisionReviewResult,
+    decision: &AgentDecision,
+    evidence_catalog: Vec<Value>,
+) -> Option<IndependentClaimGateEvaluation> {
+    let contract = review
+        .claim_analysis
+        .get_document("atomicClaimGate")
+        .ok()?
+        .clone();
+    let value = serde_json::to_value(contract).ok()?;
+    let verdict = parse_independent_claim_verdict(value).ok()?;
+    let safe_without_dedicated_gate = verdict.claims_complete
+        && !verdict.requires_evidence
+        && !verdict.has_catalog_claims
+        && verdict.catalog_coverage_complete
+        && !verdict.has_non_catalog_evidence_claims
+        && verdict.catalog_claims.is_empty()
+        && verdict.claims.iter().all(|claim| {
+            claim.action_kind.is_none()
+                && !claim.requires_evidence
+                && !claim.product_claim
+                && claim.evidence_refs.is_empty()
+        });
+    safe_without_dedicated_gate.then(|| IndependentClaimGateEvaluation {
+        candidate_fingerprint: authorization_candidate_fingerprint(decision),
+        evidence_catalog,
+        outcome: Some(Ok(verdict)),
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn evaluate_independent_claim_gate_with_authority(
     state: &AppState,
@@ -1675,11 +1711,11 @@ mod independent_claim_gate_contract_tests {
     use super::{
         apply_independent_claim_gate, atomic_claim_integrity_failed, build_claim_evidence_catalog,
         build_independent_claim_gate_user_payload, catalog_claims_are_backed,
-        catalog_integrity_failed, harden_evidence_claims, hold_for_catalog_integrity_failure,
-        hold_for_claim_gate_failure, merge_independent_claim_verdict,
-        parse_independent_claim_verdict, unsupported_atomic_claims, AtomicClaim, CatalogClaim,
-        ClaimSubject, IndependentClaimGateEvaluation, IndependentClaimVerdict,
-        ReviewInvocationKind,
+        catalog_integrity_failed, embedded_light_claim_gate_evaluation, harden_evidence_claims,
+        hold_for_catalog_integrity_failure, hold_for_claim_gate_failure,
+        merge_independent_claim_verdict, parse_independent_claim_verdict,
+        unsupported_atomic_claims, AtomicClaim, CatalogClaim, ClaimSubject,
+        IndependentClaimGateEvaluation, IndependentClaimVerdict, ReviewInvocationKind,
     };
     use crate::agent::types::{
         AppointmentRequestDecision, DecisionReviewResult, NamecardDirective,
@@ -1923,6 +1959,83 @@ mod independent_claim_gate_contract_tests {
             payload["candidateActionIntents"][0]["requestText"],
             "客户希望周四上午到院面诊"
         );
+    }
+
+    #[test]
+    fn embedded_light_claim_contract_is_reused_only_when_every_unit_needs_no_evidence() {
+        let reply = "在的，刚看到你的消息。";
+        let decision = crate::agent::types::AgentDecision {
+            should_reply: true,
+            reply_text: reply.to_string(),
+            ..Default::default()
+        };
+        let mut review = DecisionReviewResult {
+            approved: true,
+            claim_analysis: doc! { "requiresProductKnowledge": false },
+            ..Default::default()
+        };
+        review.claim_analysis.insert(
+            "atomicClaimGate",
+            mongodb::bson::to_bson(&json!({
+                "claimKinds": ["conversation_presence"],
+                "claimsComplete": true,
+                "claims": [{
+                    "sourceQuote": reply,
+                    "claim": "在当前会话中回应客户",
+                    "scope": "current_conversation",
+                    "subject": "general",
+                    "actionKind": null,
+                    "evidenceNeed": "not_needed",
+                    "negativePolarity": false,
+                    "productClaim": false,
+                    "evidenceRefs": [],
+                    "reason": "由本条回复本身完成，不承诺外部现实状态"
+                }],
+                "catalogCoverageComplete": true,
+                "catalogClaims": [],
+                "reason": "完整覆盖候选"
+            }))
+            .unwrap(),
+        );
+
+        let evaluation = embedded_light_claim_gate_evaluation(&review, &decision, Vec::new())
+            .expect("complete no-evidence verdict should be reusable");
+        assert!(!apply_independent_claim_gate(
+            evaluation,
+            &decision,
+            &mut review,
+            &[],
+        ));
+        assert!(!review.should_hold);
+        assert_eq!(
+            review.claim_analysis.get_bool("requiresBusinessEvidence"),
+            Ok(false)
+        );
+
+        review.claim_analysis.insert(
+            "atomicClaimGate",
+            mongodb::bson::to_bson(&json!({
+                "claimKinds": ["business_schedule"],
+                "claimsComplete": true,
+                "claims": [{
+                    "sourceQuote": reply,
+                    "claim": "机构确认现实安排",
+                    "scope": "business_schedule",
+                    "subject": "business",
+                    "actionKind": null,
+                    "evidenceNeed": "required",
+                    "negativePolarity": false,
+                    "productClaim": false,
+                    "evidenceRefs": [],
+                    "reason": "属于现实业务事实"
+                }],
+                "catalogCoverageComplete": true,
+                "catalogClaims": [],
+                "reason": "需要专用证据核验"
+            }))
+            .unwrap(),
+        );
+        assert!(embedded_light_claim_gate_evaluation(&review, &decision, Vec::new()).is_none());
     }
 
     #[test]
@@ -4936,7 +5049,26 @@ fn build_light_reviewer_user(
     "hasProductClaim": false,
     "requiresProductKnowledge": false,
     "knowledgeSupported": true,
-    "reason": "一句话说明"
+    "reason": "一句话说明",
+    "atomicClaimGate": {{
+      "claimKinds": [],
+      "claimsComplete": true,
+      "claims": [{{
+        "sourceQuote": "候选回复中的完整最小原文片段",
+        "claim": "独立表达该片段的完整语义",
+        "scope": "开放语义范围",
+        "subject": "customer | business | third_party | general",
+        "actionKind": null,
+        "evidenceNeed": "required | not_needed",
+        "negativePolarity": false,
+        "productClaim": false,
+        "evidenceRefs": [],
+        "reason": "为什么该原子语义需要或不需要现实证据"
+      }}],
+      "catalogCoverageComplete": true,
+      "catalogClaims": [],
+      "reason": "对候选全部原子语义的总体判断"
+    }}
   }},
   "risks": [],
   "rewriteInstruction": "",
@@ -4946,6 +5078,12 @@ fn build_light_reviewer_user(
 审核规则：
 - 六项 scores 都必须给 0-10 整数；风险越高越危险，其余分数越高越好。
 - 候选只要表达产品能力、价格、案例、效果、交付或承诺，requiresProductKnowledge 必须为 true；无可靠证据时提高 factRisk、降低 productAccuracy。
+- atomicClaimGate 必须独立于 Reply Agent 的自我分析，按候选正文完整语义逐个提取不可再拆的原子单元；不得相信候选决策里的 claims、riskLevel 或 knowledgeNeed 自报值。
+- claimsComplete=true 只在没有遗漏任何有实际语义的正文单元时使用。每条 sourceQuote 必须是候选回复中的逐字、非空、完整最小片段；寒暄也可以抽取为 not_needed，纯粹没有可独立表达单元时 claims 才可为空。
+- evidenceNeed=required：候选代表我方确定陈述任何可现实核验的客户、业务、服务、产品、交易、预约、流程、政策、要求、资格、价格、地点、时间、交付、效果或专业事实。evidenceNeed=not_needed：寒暄、共情、主观鼓励、透明不确定、澄清问题，以及由本条回复本身完成且不承诺持久结果的会话行为。
+- productClaim 仅在该原子单元肯定表达产品能力、效果、价格、案例或交付事实时为 true；产品主题只出现在提问、拒绝保证、透明核对中时为 false。
+- atomicClaimGate 的 evidenceRefs 在轻审阶段固定输出空数组；只要任一原子 evidenceNeed=required 或 productClaim=true，系统会自动交给独立 ClaimGate 做完整证据核验，不得为了省调用把它改成 not_needed。
+- atomicClaimGate 的 actionKind 在轻审正文审查中固定为 null，catalogClaims 固定为空数组，catalogCoverageComplete=true。不要输出 requiresEvidence、hasCatalogClaims 等冗余汇总布尔值。
 - 只有候选正面断言产品能力、效果、价格、案例或交付事实时才算产品声明。在澄清问题、透明表达不确定、拒绝做保证或承诺先核对时提到产品主题，不得仅因主题本身就置 requiresProductKnowledge=true。
 - 不限产品：候选代表我方确定陈述任何可现实核验的业务事实（政策、要求、资格、预约、流程、时间地点、费用、交付、健康/专业准备事项等开放语义）都必须有直接可信来源；客户提问不是答案证据，历史我方/AI 回复、模型常识、画像和推断不是证据。无依据时必须要求局部改成核对/澄清，不得因“给具体内容”而放行。
 - 会话行为不等于外部业务事实：确认收到、寒暄/当前会话存在、道歉或撤回措辞、接受对方暂停、表明本轮不继续施压、邀请对方之后继续聊，这些行为由当前回复本身完成，不需外部证据。只有同时承诺持久运营结果、保证未来响应、服务时段或其他可核验动作时才升级。

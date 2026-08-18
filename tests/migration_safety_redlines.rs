@@ -6,6 +6,7 @@ use mongodb::bson::{doc, oid::ObjectId, Bson, Document};
 use wechatagent::db::migrations::{
     m057_explicit_acknowledgement_action as m057, m058_llm_provider_active_invariant as m058,
     m062_explicit_appointment_request_action as m062,
+    m063_user_operation_runtime_budget_defaults as m063,
 };
 
 #[tokio::test]
@@ -128,6 +129,115 @@ async fn m062_materializes_appointment_action_without_overriding_forbidden() {
         .expect("allowed array")
         .iter()
         .any(|value| value.as_str() == Some("appointment_request")));
+
+    app.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires MongoDB"]
+async fn m063_upgrades_only_the_untouched_system_budget_tuple() {
+    let app = common::TestApp::start().await;
+    let configs = app
+        .state
+        .db
+        .raw()
+        .collection::<Document>("operation_domain_configs");
+    let ids = [
+        ObjectId::new(),
+        ObjectId::new(),
+        ObjectId::new(),
+        ObjectId::new(),
+    ];
+    configs
+        .insert_many(
+            [
+                doc! {
+                    "_id": ids[0], "workspace_id": "m063-system", "domain": "user_operations",
+                    "current_version": true, "seeded_by": "system",
+                    "runtime_parameters": {
+                        "runTokenBudget": 30_000_i64,
+                        "runMaxLlmCalls": 6_i32,
+                        "simulationTokenBudget": 60_000_i64,
+                    },
+                },
+                doc! {
+                    "_id": ids[1], "workspace_id": "m063-manual", "domain": "user_operations",
+                    "current_version": true, "seeded_by": "manual",
+                    "runtime_parameters": {
+                        "runTokenBudget": 30_000_i64,
+                        "runMaxLlmCalls": 6_i32,
+                        "simulationTokenBudget": 60_000_i64,
+                    },
+                },
+                doc! {
+                    "_id": ids[2], "workspace_id": "m063-custom", "domain": "user_operations",
+                    "current_version": true, "seeded_by": "system",
+                    "runtime_parameters": {
+                        "runTokenBudget": 120_000_i64,
+                        "runMaxLlmCalls": 6_i32,
+                        "simulationTokenBudget": 60_000_i64,
+                    },
+                },
+                doc! {
+                    "_id": ids[3], "workspace_id": "m063-escalated", "domain": "user_operations",
+                    "current_version": true, "seeded_by": "system",
+                    "runtime_parameters": {
+                        "runTokenBudget": 30_000_i64,
+                        "runTokenBudgetEscalated": 100_000_i64,
+                        "runMaxLlmCalls": 6_i32,
+                        "simulationTokenBudget": 60_000_i64,
+                    },
+                },
+            ],
+            None,
+        )
+        .await
+        .expect("seed runtime budget fixtures");
+
+    let (left, right) = tokio::join!(m063::run_step(&app.state.db), m063::run_step(&app.state.db));
+    left.expect("first concurrent migration");
+    right.expect("second concurrent migration");
+    m063::run_step(&app.state.db)
+        .await
+        .expect("idempotent migration rerun");
+
+    let migrated = configs
+        .find_one(doc! { "_id": ids[0] }, None)
+        .await
+        .expect("read migrated config")
+        .expect("migrated config exists");
+    let migrated_runtime = migrated
+        .get_document("runtime_parameters")
+        .expect("migrated runtime parameters");
+    assert_eq!(
+        migrated_runtime.get_i64("runTokenBudget").ok(),
+        Some(300_000)
+    );
+    assert_eq!(
+        migrated_runtime.get_i64("runTokenBudgetEscalated").ok(),
+        Some(600_000)
+    );
+    assert_eq!(migrated_runtime.get_i32("runMaxLlmCalls").ok(), Some(10));
+    assert_eq!(
+        migrated_runtime.get_i64("simulationTokenBudget").ok(),
+        Some(300_000)
+    );
+
+    for id in &ids[1..] {
+        let preserved = configs
+            .find_one(doc! { "_id": id }, None)
+            .await
+            .expect("read preserved config")
+            .expect("preserved config exists");
+        let runtime = preserved
+            .get_document("runtime_parameters")
+            .expect("preserved runtime parameters");
+        assert_ne!(
+            runtime.get_i64("runTokenBudgetEscalated").ok(),
+            Some(600_000),
+            "operator-owned or customized rows must not be migrated"
+        );
+    }
 
     app.cleanup().await;
 }

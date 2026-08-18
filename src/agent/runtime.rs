@@ -244,14 +244,15 @@ pub(crate) fn validate_and_normalize_user_runtime_parameters(
         }
     }
 
+    let defaults = crate::models::RuntimeParametersTyped::default();
     let run_budget = normalized
         .get("runTokenBudget")
         .and_then(integer_value)
-        .unwrap_or(150_000);
+        .unwrap_or(defaults.run_token_budget);
     let escalated_budget = normalized
         .get("runTokenBudgetEscalated")
         .and_then(integer_value)
-        .unwrap_or(500_000);
+        .unwrap_or(defaults.run_token_budget_escalated);
     if escalated_budget < run_budget {
         return Err(
             "runtime parameter runTokenBudgetEscalated must be >= runTokenBudget".to_string(),
@@ -291,7 +292,7 @@ pub struct UserRuntimeParameters {
     pub operation_state_confidence_full_review_below: i32,
     /// MP-5 / Task 15：单 run 累计 token 上限。超额触发降级（跳过 review/rewrite/二次 router 等）。
     pub run_token_budget: i64,
-    /// B-1 修复:progressive-tier 升档 run 的 token gating 上限(默认 100000)。
+    /// B-1 修复:progressive-tier 升档 run 的 token gating 上限。
     /// gateway 升档分支经 RunBudget::grant_escalated_ceiling 授予本 run。
     pub run_token_budget_escalated: i64,
     /// MP-5 / Task 15：单 run 最多 LLM 调用次数。
@@ -943,9 +944,9 @@ mod tests {
             product_accuracy_block_below: 7,
             distrust_self_reported_low_risk: false,
             operation_state_confidence_full_review_below: 4,
-            run_token_budget: 150000,
-            run_token_budget_escalated: 500000,
-            run_max_llm_calls: 6,
+            run_token_budget: 300000,
+            run_token_budget_escalated: 600000,
+            run_max_llm_calls: 10,
             simulation_token_budget: 300000,
             reaction_token_budget: 8000,
             reaction_max_llm_calls: 2,

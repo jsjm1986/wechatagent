@@ -874,6 +874,25 @@ const ALLOWED_TOOL_NAMES: &[&str] = &[
     "knowledge.open_slice",
 ];
 
+/// Whether a promoted Reply decision risk means the model failed the structured wire contract.
+///
+/// These tags describe protocol shape, not customer semantics. Keeping the classifier here gives
+/// the Harness and final send gate one shared definition and avoids status/text heuristics.
+pub(crate) fn is_reply_protocol_violation(risk: &str) -> bool {
+    risk.starts_with("missing_required_field:")
+        || risk.starts_with("invalid_enum_value:")
+        || risk.starts_with("invalid_type:")
+        || risk.starts_with("decision_phase_invalid:")
+}
+
+pub(crate) fn reply_protocol_violations(risks: &[String]) -> Vec<String> {
+    risks
+        .iter()
+        .filter(|risk| is_reply_protocol_violation(risk))
+        .cloned()
+        .collect()
+}
+
 /// 计 Unicode 字符数（按 char 计，与 R1 / R3 中需求文本一致）。
 fn count_unicode_chars(s: &str) -> usize {
     s.chars().count()
@@ -1762,14 +1781,20 @@ fn carry_through_fields(raw: RawAgentDecision, decision: &mut AgentDecision) {
     if raw.escalation_request.is_some() {
         decision.escalation_request = raw.escalation_request;
     }
-    // media-asset Task 8（硬伤① carry-through）：LLM 选的素材若不在此透传，promote
-    // 后 assets_to_send 永远为空、素材被静默丢弃。只在 Some 时覆盖，None 保持默认空。
+    // media-asset Task 8（硬伤① carry-through）：只保留带有效结构化 id 的动作。部分
+    // provider 会为可选对象输出空壳 `{}`；它表达的是 no-op，不能升级成真实发送副作用。
     if let Some(v) = raw.assets_to_send {
-        decision.assets_to_send = v;
+        decision.assets_to_send = v
+            .into_iter()
+            .filter(|directive| !directive.asset_id.trim().is_empty())
+            .collect();
     }
     // 名片引荐 carry-through：LLM 选的名片若不在此透传，promote 后 namecard_to_send
-    // 永远为 None、名片被静默丢弃。只在 Some 时覆盖，None 保持默认 None。
-    if let Some(v) = raw.namecard_to_send {
+    // 永远为 None、名片被静默丢弃。空 cardId 是 no-op，不构成可执行引荐。
+    if let Some(v) = raw
+        .namecard_to_send
+        .filter(|directive| !directive.card_id.trim().is_empty())
+    {
         decision.namecard_to_send = Some(v);
     }
     // 渐进式三档 + 充分性自评（2026-06-23）：LLM 输出的自评字段若不在此透传，
@@ -2518,9 +2543,9 @@ mod validate_and_promote_tests {
             emotional_value_rewrite_below: 6,
             product_accuracy_block_below: 7,
             operation_state_confidence_full_review_below: 4,
-            run_token_budget: 150000,
-            run_token_budget_escalated: 500000,
-            run_max_llm_calls: 6,
+            run_token_budget: 300000,
+            run_token_budget_escalated: 600000,
+            run_max_llm_calls: 10,
             simulation_token_budget: 300000,
             reaction_token_budget: 8000,
             reaction_max_llm_calls: 2,
@@ -3128,6 +3153,21 @@ mod validate_and_promote_tests {
         assert_eq!(decision.assets_to_send[0].asset_id, "a1");
     }
 
+    #[test]
+    fn raw_decision_discards_empty_asset_directives_as_noops() {
+        let mut raw = make_valid_low_routine_raw();
+        raw.assets_to_send = Some(vec![
+            AssetSendDirective::default(),
+            AssetSendDirective {
+                asset_id: "  ".to_string(),
+                reason: Some("empty provider placeholder".to_string()),
+            },
+        ]);
+        let runtime = runtime_default(true);
+        let (decision, _risks) = raw.validate_and_promote(&runtime);
+        assert!(decision.assets_to_send.is_empty());
+    }
+
     /// LLM 没给 assetsToSend（None）时，promote 后保持默认空——不误造素材。
     #[test]
     fn raw_decision_without_assets_promotes_empty() {
@@ -3331,6 +3371,18 @@ mod namecard_directive_tests {
             .namecard_to_send
             .expect("namecard must carry through");
         assert_eq!(card.card_id, "c1");
+    }
+
+    #[test]
+    fn raw_decision_discards_empty_namecard_directive_as_noop() {
+        let mut raw = make_valid_low_routine_raw();
+        raw.namecard_to_send = Some(NamecardDirective {
+            card_id: "  ".to_string(),
+            reason: Some("empty provider placeholder".to_string()),
+        });
+        let runtime = runtime_default(true);
+        let (decision, _risks) = raw.validate_and_promote(&runtime);
+        assert!(decision.namecard_to_send.is_none());
     }
 }
 
