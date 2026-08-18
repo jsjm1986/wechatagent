@@ -632,6 +632,7 @@ fn review_and_evaluate_claim_gate<'a>(
                 None,
                 Some(active_profile),
                 Some(reviewer_prompts),
+                true,
                 invocation_kind,
             ),
             evaluate_independent_claim_gate_with_authority(

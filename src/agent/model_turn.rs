@@ -343,14 +343,11 @@ fn materialize_typed_route_fallback(
 
     match handoff {
         KnowledgeHandoffKind::ClarifyCustomer => {
-            decision.reply_text = if missing_summary.is_empty() {
-                "我先确认一个关键信息：你具体想了解的是哪一部分？".to_string()
-            } else {
-                bounded_control_text(
-                    &format!("我先确认一个关键信息：{missing_summary}。方便补充一下吗？"),
-                    360,
-                )
-            };
+            // `missingInformation` is an internal semantic artifact, not customer copy. If the
+            // Reply Agent still cannot render the typed hand-off after its bounded repair, keep
+            // the fallback neutral instead of exposing an internal checklist verbatim.
+            decision.reply_text =
+                "我想先把你的情况弄准一点：你现在最希望我先帮你确认哪一件事？".to_string();
             decision.next_step = "clarify".to_string();
             decision.autonomy_mode = "auto".to_string();
             decision.knowledge_need = "insufficient".to_string();
@@ -396,14 +393,7 @@ fn materialize_typed_route_fallback(
             });
         }
         KnowledgeHandoffKind::DeferLicensedProfessional => {
-            decision.reply_text = if missing_summary.is_empty() {
-                "这部分需要由具备相应资质的专业人员结合实际情况判断，我先不替你下结论。请以专业评估结果为准。".to_string()
-            } else {
-                bounded_control_text(
-                    &format!("这部分还需要结合{missing_summary}，由具备相应资质的专业人员判断。我先不替你下结论，请以专业评估结果为准。"),
-                    420,
-                )
-            };
+            decision.reply_text = "只凭现在这些信息，我不能替你判断当前的具体情况。最稳妥的是让具备相应资质的专业人员结合实际情况评估；你愿意的话，我可以先帮你把需要重点说明的情况理一下。".to_string();
             decision.next_step = "defer".to_string();
             decision.autonomy_mode = "assisted".to_string();
             decision.knowledge_need = "insufficient".to_string();
@@ -414,14 +404,7 @@ fn materialize_typed_route_fallback(
             decision.clarification_intent.clear();
         }
         KnowledgeHandoffKind::DeferExternalSystem => {
-            decision.reply_text = if missing_summary.is_empty() {
-                "这件事需要以当前查询记录为准，我现在不能凭现有信息确认，先不乱给结论。请通过对应查询渠道核实后，把结果发我，我再继续帮你看。".to_string()
-            } else {
-                bounded_control_text(
-                    &format!("这件事需要以当前查询记录为准，目前还缺{missing_summary}，我先不凭现有信息下结论。请通过对应查询渠道核实后，把结果发我，我再继续帮你看。"),
-                    460,
-                )
-            };
+            decision.reply_text = "这件事要以当前记录或实时查询结果为准，我现在不能凭现有信息替你确认。你把最新查询结果发我，我再接着帮你看。".to_string();
             decision.next_step = "defer".to_string();
             decision.autonomy_mode = "assisted".to_string();
             decision.knowledge_need = "insufficient".to_string();
@@ -435,12 +418,60 @@ fn materialize_typed_route_fallback(
     true
 }
 
-fn repair_and_reauthorization_capacity_available(budget: &RunBudget, dual_reviewer: bool) -> bool {
-    // Reviewer + ClaimGate, the optional second Reviewer, and one completion sentinel. The
-    // surrounding budget contract treats reaching the exact cap as exhausted.
-    let authorization_tail = 3 + i32::from(dual_reviewer);
+const REPAIR_GENERATION_CALLS: i32 = 1;
+const REQUIRED_REAUTHORIZATION_CALLS: i32 = 2;
+
+fn ensure_repair_and_reauthorization_capacity(budget: &RunBudget) -> bool {
+    let snapshot = budget.snapshot();
+    let token_ceiling = snapshot
+        .token_budget
+        .saturating_add(snapshot.escalation_bonus);
+    if snapshot.tokens_used >= token_ceiling {
+        return false;
+    }
+
+    // A repair candidate must be generated and then independently authorized by the primary
+    // Reviewer plus ClaimGate. The optional second Reviewer is intentionally not repeated for a
+    // repaired candidate: it already contributed epistemic diversity on the original candidate
+    // and is not part of the mandatory send fence.
+    let required_calls = REPAIR_GENERATION_CALLS + REQUIRED_REAUTHORIZATION_CALLS;
+    let available_calls = budget.available_llm_calls_before_tail(0);
+    if available_calls < required_calls {
+        budget.grant_additional_llm_calls(required_calls - available_calls);
+    }
+
     !budget.is_llm_or_token_exhausted()
-        && budget.available_llm_calls_before_tail(authorization_tail) > 0
+        && budget.available_llm_calls_before_tail(REQUIRED_REAUTHORIZATION_CALLS) > 0
+}
+
+fn align_principal_claim_repair(
+    route: &KnowledgeRouteResult,
+    principal_channel_available: bool,
+    review: &mut super::types::DecisionReviewResult,
+) {
+    if !principal_channel_available
+        || coherent_knowledge_handoff(route) != Some(KnowledgeHandoffKind::AskPrincipal)
+        || review.should_hold
+        || review
+            .claim_analysis
+            .get_i64("unsupportedBusinessClaimCount")
+            .unwrap_or(0)
+            <= 0
+    {
+        return;
+    }
+
+    let claim_gate_detail = review.rewrite_instruction.trim().to_string();
+    review.approved = false;
+    review.needs_revision = false;
+    review.rewrite_instruction = format!(
+        "The Knowledge Agent selected ask_principal and the independent ClaimGate found an unsupported real-world assertion in the customer reply. Preserve the complete escalationRequest and a short first-person holding reply, but remove every attempted answer to the unresolved fact, including softened guesses or likely-sounding conclusions. Do not expose the principal, internal route, or authorization process.{}",
+        if claim_gate_detail.is_empty() {
+            String::new()
+        } else {
+            format!(" ClaimGate detail: {claim_gate_detail}")
+        }
+    );
 }
 
 pub(crate) struct TurnModelAssets {
@@ -1056,10 +1087,8 @@ where
         let protocol_violations = reply_protocol_violations(&draft.promote_risks);
         if !protocol_violations.is_empty() {
             let instruction = Self::protocol_repair_instruction(&protocol_violations);
-            let repair_capacity_available = repair_and_reauthorization_capacity_available(
-                &self.inputs.budget,
-                self.inputs.state.second_reviewer_llm.is_some(),
-            );
+            let repair_capacity_available =
+                ensure_repair_and_reauthorization_capacity(&self.inputs.budget);
             if !self.protocol_repair_issued && repair_capacity_available {
                 self.protocol_repair_issued = true;
                 let review = super::types::DecisionReviewResult {
@@ -1104,10 +1133,7 @@ where
                 risks: vec![risk],
                 ..Default::default()
             };
-            if !repair_and_reauthorization_capacity_available(
-                &self.inputs.budget,
-                self.inputs.state.second_reviewer_llm.is_some(),
-            ) {
+            if !ensure_repair_and_reauthorization_capacity(&self.inputs.budget) {
                 self.inputs
                     .budget
                     .mark_degraded("appointment_repair_skipped_required_authorization_tail");
@@ -1156,10 +1182,8 @@ where
                 risks: vec![risk.clone()],
                 ..Default::default()
             };
-            let repair_capacity_available = repair_and_reauthorization_capacity_available(
-                &self.inputs.budget,
-                self.inputs.state.second_reviewer_llm.is_some(),
-            );
+            let repair_capacity_available =
+                ensure_repair_and_reauthorization_capacity(&self.inputs.budget);
             if !self.commitment_update_repair_issued && repair_capacity_available {
                 self.commitment_update_repair_issued = true;
                 return Ok(AuthorizationManifest::repairable(
@@ -1205,10 +1229,8 @@ where
                 risks: vec![issue_code.to_string()],
                 ..Default::default()
             };
-            let repair_capacity_available = repair_and_reauthorization_capacity_available(
-                &self.inputs.budget,
-                self.inputs.state.second_reviewer_llm.is_some(),
-            );
+            let repair_capacity_available =
+                ensure_repair_and_reauthorization_capacity(&self.inputs.budget);
             if !self.typed_route_repair_issued {
                 if repair_capacity_available {
                     self.typed_route_repair_issued = true;
@@ -1307,6 +1329,7 @@ where
                         self.inputs.prompt_override,
                         Some(self.inputs.active_profile),
                         self.inputs.reviewer_prompts,
+                        draft.repair_attempt == 0,
                         self.inputs.invocation_kind,
                     );
                     if can_try_embedded {
@@ -1384,6 +1407,11 @@ where
                 &mut review,
                 self.inputs.active_products,
             );
+            align_principal_claim_repair(
+                self.inputs.knowledge_route,
+                principal_channel_available,
+                &mut review,
+            );
             review.claim_analysis.insert(
                 "claimGateMode",
                 if embedded_light_gate {
@@ -1402,10 +1430,7 @@ where
         }
 
         if should_run_targeted_rewrite(decision, &review, self.inputs.runtime) {
-            if !repair_and_reauthorization_capacity_available(
-                &self.inputs.budget,
-                self.inputs.state.second_reviewer_llm.is_some(),
-            ) {
+            if !ensure_repair_and_reauthorization_capacity(&self.inputs.budget) {
                 self.inputs
                     .budget
                     .mark_degraded("action_repair_skipped_required_authorization_tail");
@@ -1450,10 +1475,7 @@ where
             && review.needs_revision
             && !review.should_hold
         {
-            if !repair_and_reauthorization_capacity_available(
-                &self.inputs.budget,
-                self.inputs.state.second_reviewer_llm.is_some(),
-            ) {
+            if !ensure_repair_and_reauthorization_capacity(&self.inputs.budget) {
                 self.inputs
                     .budget
                     .mark_degraded("quality_revision_skipped_required_authorization_tail");
@@ -1743,6 +1765,7 @@ mod tests {
             decision.reply_text,
             super::super::escalation::fallback_holding_reply()
         );
+        assert!(!decision.reply_text.contains("current state"));
         assert_eq!(decision.next_step, "ask_principal");
         assert_eq!(decision.autonomy_mode, "assisted");
         assert_eq!(decision.knowledge_need, "required");
@@ -1839,8 +1862,12 @@ mod tests {
             true
         ));
         assert_eq!(decision.next_step, "clarify");
-        assert!(decision.reply_text.contains("你更方便的日期"));
-        assert!(decision.reply_text.contains("希望到访的地点"));
+        assert!(!decision.reply_text.contains("你更方便的日期"));
+        assert!(!decision.reply_text.contains("希望到访的地点"));
+        assert_eq!(
+            decision.clarification_intent,
+            "你更方便的日期、希望到访的地点"
+        );
         assert!(decision.appointment_request.is_none());
         assert!(decision.last_commitment.is_none());
         assert!(decision.assets_to_send.is_empty());
@@ -1859,7 +1886,7 @@ mod tests {
             true
         ));
         assert_eq!(decision.next_step, "clarify");
-        assert!(decision.reply_text.contains("具体想了解"));
+        assert!(decision.reply_text.contains("最希望我先帮你确认"));
         assert_eq!(typed_route_consistency_issue(&route, &decision, true), None);
     }
 
@@ -1896,6 +1923,7 @@ mod tests {
                 true
             ));
             assert_eq!(decision.next_step, "defer");
+            assert!(!decision.reply_text.contains("current verified record"));
             assert!(decision.escalation_request.is_none());
             assert_eq!(typed_route_consistency_issue(&route, &decision, true), None);
         }
@@ -1936,26 +1964,49 @@ mod tests {
     }
 
     #[test]
-    fn repair_preserves_authorization_tail_and_completion_sentinel() {
+    fn repair_grants_only_the_missing_generation_and_required_authorization_capacity() {
         let budget = RunBudget::new("repair", 100_000, 5, 0);
-        assert!(repair_and_reauthorization_capacity_available(
-            &budget, false
-        ));
-
         budget.try_reserve_llm_call().unwrap();
         budget.try_reserve_llm_call().unwrap();
-        assert!(
-            !repair_and_reauthorization_capacity_available(&budget, false),
-            "two calls used leaves exactly Reviewer + ClaimGate + sentinel, so repair must stop"
-        );
+        budget.try_reserve_llm_call().unwrap();
 
-        budget.grant_additional_llm_calls(1);
-        assert!(repair_and_reauthorization_capacity_available(
-            &budget, false
-        ));
+        assert!(ensure_repair_and_reauthorization_capacity(&budget));
+        assert_eq!(budget.snapshot().llm_call_bonus, 1);
+
+        budget.try_reserve_llm_call().unwrap(); // repaired generation
+        budget.try_reserve_llm_call().unwrap(); // primary Reviewer
+        budget.try_reserve_llm_call().unwrap(); // ClaimGate
+        assert_eq!(budget.snapshot().llm_calls_used, 6);
+        assert!(budget.try_reserve_llm_call().is_err());
+    }
+
+    #[test]
+    fn repair_does_not_expand_an_exhausted_token_ceiling() {
+        let budget = RunBudget::new("repair", 100, 5, 0);
+        budget.record_call(100);
+
         assert!(
-            !repair_and_reauthorization_capacity_available(&budget, true),
-            "dual review needs one additional authorization-tail call"
+            !ensure_repair_and_reauthorization_capacity(&budget),
+            "a bounded repair may add call slots, never token authority"
         );
+        assert_eq!(budget.snapshot().llm_call_bonus, 0);
+    }
+
+    #[test]
+    fn ask_principal_claim_repair_is_driven_by_the_structured_claim_gate_result() {
+        let mut review = super::super::types::DecisionReviewResult {
+            approved: false,
+            rewrite_instruction: "remove unsupported schedule claim".to_string(),
+            claim_analysis: doc! { "unsupportedBusinessClaimCount": 1_i64 },
+            ..Default::default()
+        };
+
+        align_principal_claim_repair(&principal_route(), true, &mut review);
+
+        assert!(review.rewrite_instruction.contains("ask_principal"));
+        assert!(review
+            .rewrite_instruction
+            .contains("remove unsupported schedule claim"));
+        assert!(!review.needs_revision);
     }
 }

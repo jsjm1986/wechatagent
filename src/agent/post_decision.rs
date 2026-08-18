@@ -32,6 +32,8 @@ const MAX_BACKOFF_MS: i64 = 5 * 60_000;
 const MAX_SNAPSHOT_MESSAGES: usize = 20;
 const MAX_SNAPSHOT_PRODUCTS: usize = 100;
 const MAX_MESSAGE_CHARS: usize = 4_000;
+const MAX_MODEL_PROJECTION_INPUT_CHARS: usize = 28_000;
+const MAX_MODEL_MESSAGE_CHARS: usize = 1_500;
 const CONTACT_LEASE_COLLECTION: &str = "post_decision_contact_leases";
 const SCRUB_POLL_SECONDS: u64 = 60 * 60;
 
@@ -245,75 +247,206 @@ fn serialize_projection_input(input: &Document) -> AppResult<String> {
     serde_json::to_string(input).map_err(|error| payload_error("encode projection input", error))
 }
 
+fn truncated_bson_string(source: &Document, key: &str, max_chars: usize) -> Bson {
+    source
+        .get_str(key)
+        .ok()
+        .map(|value| Bson::String(truncate_chars(value, max_chars)))
+        .unwrap_or(Bson::Null)
+}
+
+fn copy_projection_field(source: &Document, target: &mut Document, key: &str) {
+    if let Some(value) = source.get(key) {
+        target.insert(key, value.clone());
+    }
+}
+
+fn compact_projection_profile(value: Option<&Bson>) -> Bson {
+    let Some(Bson::Document(source)) = value else {
+        return Bson::Null;
+    };
+    let mut profile = doc! {
+        "displayName": truncated_bson_string(source, "display_name", 320),
+        "description": truncated_bson_string(source, "description", 1_200),
+        "promptFragment": truncated_bson_string(source, "prompt_fragment", 3_000),
+    };
+    for key in [
+        "profile_dimensions",
+        "memory_dimensions",
+        "trajectory_dimensions",
+    ] {
+        copy_projection_field(source, &mut profile, key);
+    }
+    Bson::Document(profile)
+}
+
+fn compact_projection_domain(value: Option<&Bson>) -> Bson {
+    let Some(Bson::Document(source)) = value else {
+        return Bson::Null;
+    };
+    let mut domain = doc! {
+        "domain": truncated_bson_string(source, "domain", 240),
+        "name": truncated_bson_string(source, "name", 240),
+        "goal": truncated_bson_string(source, "goal", 1_200),
+    };
+    copy_projection_field(source, &mut domain, "state_machine");
+    Bson::Document(domain)
+}
+
+fn compact_projection_contact(value: Option<&Bson>) -> Bson {
+    let Some(Bson::Document(source)) = value else {
+        return Bson::Null;
+    };
+    let mut contact = doc! {
+        "nickname": source.get("nickname").cloned().unwrap_or(Bson::Null),
+        "remark": source.get("remark").cloned().unwrap_or(Bson::Null),
+        "humanProfileNote": truncated_bson_string(source, "humanProfileNote", 1_200),
+        "memorySummary": truncated_bson_string(source, "memorySummary", 1_200),
+        "operationState": source.get("operationState").cloned().unwrap_or(Bson::Null),
+        "locale": source.get("locale").cloned().unwrap_or(Bson::Null),
+    };
+    for key in [
+        "manualTags",
+        "confirmedTags",
+        "domainAttributes",
+        "profileAttributes",
+        "commitments",
+        "intentTrajectory",
+    ] {
+        copy_projection_field(source, &mut contact, key);
+    }
+    Bson::Document(contact)
+}
+
+fn compact_projection_memory(value: Option<&Bson>) -> Bson {
+    let Some(Bson::Document(source)) = value else {
+        return Bson::Null;
+    };
+    let mut memory = Document::new();
+    for key in [
+        "userUnderstanding",
+        "relationshipState",
+        "productFit",
+        "nextAction",
+        "memoryCard",
+        "memoryCardVersion",
+    ] {
+        copy_projection_field(source, &mut memory, key);
+    }
+    Bson::Document(memory)
+}
+
+fn compact_projection_messages(value: Option<&Bson>) -> Bson {
+    let Some(Bson::Array(rows)) = value else {
+        return Bson::Null;
+    };
+    Bson::Array(
+        rows.iter()
+            .enumerate()
+            .map(|(index, row)| {
+                let Some(source) = row.as_document() else {
+                    return row.clone();
+                };
+                let mut message = doc! {
+                    "turnIndex": i32::try_from(index).unwrap_or(i32::MAX),
+                    "content": truncated_bson_string(source, "content", MAX_MODEL_MESSAGE_CHARS),
+                };
+                for key in ["id", "messageId", "direction", "msgType", "createdAt"] {
+                    copy_projection_field(source, &mut message, key);
+                }
+                Bson::Document(message)
+            })
+            .collect(),
+    )
+}
+
+fn mark_truncated(truncated: &mut Vec<String>, section: &str) {
+    if !truncated.iter().any(|value| value == section) {
+        truncated.push(section.to_string());
+    }
+}
+
+fn trim_projection_message_content(input: &mut Document, keep_chars: usize, omit_old: bool) {
+    let Some(Bson::Array(rows)) = input.get_mut("ascendingConversationWindow") else {
+        return;
+    };
+    let recent_start = rows.len().saturating_sub(6);
+    for (index, row) in rows.iter_mut().enumerate() {
+        let Some(message) = row.as_document_mut() else {
+            continue;
+        };
+        if omit_old && index < recent_start {
+            message.insert("content", "");
+            message.insert("contentOmitted", true);
+            continue;
+        }
+        if let Ok(content) = message.get_str("content") {
+            message.insert("content", truncate_chars(content, keep_chars));
+        }
+    }
+}
+
+fn projection_model_input_budget(configured_max_chars: usize, fixed_chars: usize) -> usize {
+    configured_max_chars
+        .saturating_sub(fixed_chars)
+        .min(MAX_MODEL_PROJECTION_INPUT_CHARS)
+}
+
 /// Build a valid JSON input within the model-facing character budget. Low-priority sections are
 /// removed first; recent conversation and the send-authorized decision are retained longest.
+/// The durable payload remains complete for deterministic normalization and persistence. This
+/// function only creates the smaller model view.
 fn projection_user_payload(
     payload: &Document,
     max_chars: usize,
 ) -> AppResult<(String, Vec<String>)> {
     let mut input = doc! {
         "authorizedDecision": payload.get("authorized_decision").or_else(|| payload.get("decision")).cloned().unwrap_or(Bson::Null),
-        "ascendingConversationWindow": payload.get("ascending_window").cloned().unwrap_or(Bson::Null),
-        "contactSnapshot": payload.get("contact_snapshot").cloned().unwrap_or(Bson::Null),
-        "operatingMemory": payload.get("memory_snapshot").or_else(|| payload.get("memory")).cloned().unwrap_or(Bson::Null),
-        "activeProfile": payload.get("active_profile").cloned().unwrap_or(Bson::Null),
-        "activeProducts": payload.get("product_snapshot").or_else(|| payload.get("active_products")).cloned().unwrap_or(Bson::Null),
-        "domainConfig": payload.get("domain_config").cloned().unwrap_or(Bson::Null),
-        "contextPack": payload.get("context_pack").cloned().unwrap_or(Bson::Null),
+        "ascendingConversationWindow": compact_projection_messages(payload.get("ascending_window")),
+        "contactSnapshot": compact_projection_contact(payload.get("contact_snapshot")),
+        "operatingMemory": compact_projection_memory(payload.get("memory_snapshot").or_else(|| payload.get("memory"))),
+        "activeProfile": compact_projection_profile(payload.get("active_profile")),
+        "domainConfig": compact_projection_domain(payload.get("domain_config")),
     };
     let mut truncated = Vec::new();
+    if payload.contains_key("context_pack") {
+        mark_truncated(&mut truncated, "contextPack");
+    }
+    if payload.contains_key("product_snapshot") || payload.contains_key("active_products") {
+        mark_truncated(&mut truncated, "activeProducts");
+    }
     let mut encoded = serialize_projection_input(&input)?;
     if encoded.chars().count() <= max_chars {
         return Ok((encoded, truncated));
     }
 
-    // Additional context is lowest priority and can be reconstructed from later runs.
-    for key in [
-        "contextPack",
-        "domainConfig",
-        "activeProducts",
-        "activeProfile",
-        "operatingMemory",
-    ] {
+    for key in ["domainConfig", "activeProfile"] {
         input.insert(key, Bson::Null);
-        truncated.push(key.to_string());
+        mark_truncated(&mut truncated, key);
         encoded = serialize_projection_input(&input)?;
         if encoded.chars().count() <= max_chars {
             return Ok((encoded, truncated));
         }
     }
 
-    // Preserve the most recent turns while reducing an unusually large conversation snapshot.
-    loop {
-        let removed = match input.get_mut("ascendingConversationWindow") {
-            Some(Bson::Array(rows)) if rows.len() > 1 && encoded.chars().count() > max_chars => {
-                let remove = (rows.len() / 2).max(1);
-                rows.drain(0..remove);
-                true
-            }
-            _ => false,
-        };
-        if !removed {
-            break;
-        }
-        if !truncated
-            .iter()
-            .any(|value| value == "ascendingConversationWindow")
-        {
-            truncated.push("ascendingConversationWindow".to_string());
-        }
+    // Keep every array position stable so evidence-turn indices still refer to the complete
+    // frozen window used by deterministic projection application.
+    for (keep_chars, omit_old) in [(600, false), (240, true), (80, true)] {
+        trim_projection_message_content(&mut input, keep_chars, omit_old);
+        mark_truncated(&mut truncated, "ascendingConversationWindow");
         encoded = serialize_projection_input(&input)?;
-    }
-    if encoded.chars().count() <= max_chars {
-        return Ok((encoded, truncated));
+        if encoded.chars().count() <= max_chars {
+            return Ok((encoded, truncated));
+        }
     }
 
-    // Contact state is useful but never more authoritative than the frozen authorized decision.
-    input.insert("contactSnapshot", Bson::Null);
-    truncated.push("contactSnapshot".to_string());
-    encoded = serialize_projection_input(&input)?;
-    if encoded.chars().count() <= max_chars {
-        return Ok((encoded, truncated));
+    for key in ["contactSnapshot", "operatingMemory"] {
+        input.insert(key, Bson::Null);
+        mark_truncated(&mut truncated, key);
+        encoded = serialize_projection_input(&input)?;
+        if encoded.chars().count() <= max_chars {
+            return Ok((encoded, truncated));
+        }
     }
 
     Err(payload_error(
@@ -382,10 +515,8 @@ pub(crate) async fn generate_projection_read_only(
         .saturating_add(task.chars().count())
         .saturating_add(guidance.chars().count())
         .saturating_add(32);
-    let input_budget = state
-        .config
-        .post_decision_prompt_max_chars
-        .saturating_sub(fixed_chars);
+    let input_budget =
+        projection_model_input_budget(state.config.post_decision_prompt_max_chars, fixed_chars);
     if input_budget < 512 {
         return Err(payload_error(
             "projection prompt too large",
@@ -523,10 +654,8 @@ async fn load_or_generate_projection(
             .saturating_add(task.chars().count())
             .saturating_add(guidance.chars().count())
             .saturating_add(32);
-        let input_budget = state
-            .config
-            .post_decision_prompt_max_chars
-            .saturating_sub(fixed_chars);
+        let input_budget =
+            projection_model_input_budget(state.config.post_decision_prompt_max_chars, fixed_chars);
         if input_budget < 512 {
             return Err(payload_error(
                 "projection prompt too large",
@@ -2018,6 +2147,97 @@ mod tests {
         assert!(truncated.contains(&"contextPack".to_string()));
         assert!(encoded.contains("authorizedDecision"));
         assert!(encoded.contains("recent"));
+    }
+
+    #[test]
+    fn projection_model_view_omits_full_control_objects_but_keeps_domain_guidance() {
+        let payload = doc! {
+            "authorized_decision": { "replyText": "我先接着帮你看" },
+            "ascending_window": [{ "direction": "inbound", "content": "术后第三天有点肿" }],
+            "contact_snapshot": { "nickname": "小雨", "operationState": "aftercare" },
+            "memory_snapshot": { "memoryCard": { "coreFacts": [] }, "memoryCardVersion": 2 },
+            "active_profile": {
+                "display_name": "医美咨询",
+                "description": "用于理解画像维度",
+                "prompt_fragment": "按医疗咨询领域理解",
+                "profile_dimensions": [{ "key": "recovery_stage" }],
+                "memory_dimensions": [{ "key": "care_preference" }],
+                "soul_override": "INTERNAL_SOUL_MUST_NOT_REACH_PROJECTION_MODEL",
+                "methodology_override": "INTERNAL_METHOD_MUST_NOT_REACH_PROJECTION_MODEL",
+            },
+            "domain_config": {
+                "domain": "medical_aesthetics",
+                "name": "眼袋咨询",
+                "goal": "提取有证据的新信息",
+                "state_machine": { "states": ["aftercare"] },
+                "review_policy": "INTERNAL_REVIEW_POLICY_MUST_NOT_REACH_PROJECTION_MODEL",
+                "runtime_parameters": { "secret": "INTERNAL_RUNTIME" },
+            },
+            "active_products": [{ "summary": "PRODUCT_PAYLOAD_MUST_NOT_REACH_PROJECTION_MODEL" }],
+            "context_pack": { "secret": "CONTEXT_PACK_MUST_NOT_REACH_PROJECTION_MODEL" },
+        };
+
+        let (encoded, truncated) =
+            projection_user_payload(&payload, MAX_MODEL_PROJECTION_INPUT_CHARS).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+
+        assert_eq!(
+            value["activeProfile"]["profile_dimensions"][0]["key"],
+            "recovery_stage"
+        );
+        assert_eq!(
+            value["domainConfig"]["state_machine"]["states"][0],
+            "aftercare"
+        );
+        for forbidden in [
+            "INTERNAL_SOUL_MUST_NOT_REACH_PROJECTION_MODEL",
+            "INTERNAL_METHOD_MUST_NOT_REACH_PROJECTION_MODEL",
+            "INTERNAL_REVIEW_POLICY_MUST_NOT_REACH_PROJECTION_MODEL",
+            "INTERNAL_RUNTIME",
+            "PRODUCT_PAYLOAD_MUST_NOT_REACH_PROJECTION_MODEL",
+            "CONTEXT_PACK_MUST_NOT_REACH_PROJECTION_MODEL",
+        ] {
+            assert!(!encoded.contains(forbidden));
+        }
+        assert!(truncated.contains(&"activeProducts".to_string()));
+        assert!(truncated.contains(&"contextPack".to_string()));
+    }
+
+    #[test]
+    fn projection_message_trimming_preserves_original_evidence_indices() {
+        let messages = (0..20)
+            .map(|index| {
+                Bson::Document(doc! {
+                    "direction": if index % 2 == 0 { "inbound" } else { "outbound" },
+                    "content": format!("turn-{index}-{}", "x".repeat(1_000)),
+                })
+            })
+            .collect::<Vec<_>>();
+        let payload = doc! {
+            "authorized_decision": { "replyText": "ok" },
+            "ascending_window": messages,
+        };
+
+        let (encoded, truncated) = projection_user_payload(&payload, 4_000).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        let rows = value["ascendingConversationWindow"]
+            .as_array()
+            .expect("conversation remains an array");
+
+        assert_eq!(rows.len(), 20);
+        for (index, row) in rows.iter().enumerate() {
+            assert_eq!(row["turnIndex"].as_i64(), Some(index as i64));
+        }
+        assert!(truncated.contains(&"ascendingConversationWindow".to_string()));
+    }
+
+    #[test]
+    fn projection_model_input_budget_is_bounded_below_the_durable_snapshot_limit() {
+        assert_eq!(
+            projection_model_input_budget(80_000, 5_000),
+            MAX_MODEL_PROJECTION_INPUT_CHARS
+        );
+        assert_eq!(projection_model_input_budget(20_000, 5_000), 15_000);
     }
 
     #[test]

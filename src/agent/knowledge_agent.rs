@@ -307,6 +307,7 @@ const ACTION_PROTOCOL: &str = r#"知识库研究协议（稳定规则）：
 - 每个 answer 都必须输出完整 resolution。resolution 是内部语义结论，不是客户话术；不得把内部角色、控制字段或推理过程写进 answer。
 - answerability=supported 仅限已 open 且实际引用的 verified 证据直接覆盖本 query 全部所问；只覆盖一部分用 partially_supported；没有直接证据用 unsupported。无需业务知识即可处理的社交或关系性消息用 not_required + none + respond，且 cited 留空。
 - requiredAuthority / recommendedNextStep 必须按缺口实质选择，禁止按客户文本中的词或短语匹配：缺客户自身信息用 customer + clarify_customer；缺机构当前安排、当期政策、实时可用性或其它须由有权运营人员确认的内部事实，用 authorized_operator + ask_principal；须执业判断用 licensed_professional + defer；须查询实时外部记录用 external_system + defer。已有充分证据或无需知识则用 none + respond。
+- 健康、医疗或其它受专业资质约束的语境中，必须区分“一般教育信息”和“对当前个体状态的判断”。知识条目说明某种现象通常如何，不等于能据此认定这位客户当前情况属于该现象、风险低或无需处理。若仍缺个体的程度、变化、伴随情况等实质信息，先用 customer + clarify_customer 只补最关键的一项；若结论本身需要专业评估，则用 licensed_professional + defer。按完整语义判断，不建立症状词表。
 - recommendedNextStep=ask_principal 时 authorityQuestion 必须是一句具体、可直接交给有权人员回答的问题；其它 nextStep 可留空。missingInformation 只列当前证据真正缺少的事实，不写泛化套话。
 - citedChunkIds 必须是“已 open 的 chunks”中的 chunkId 子集，不能凭空创造。
 - follow_relations 会把最相关的关联条目正文直接载入“已 open 的 chunks”，可当轮直接 cite，无需再 open_chunk。

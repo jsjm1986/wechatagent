@@ -500,6 +500,7 @@ Set an atomic claim's evidenceNeed=required when it states or implies an externa
 Set evidenceNeed=not_needed for empathy, greetings, subjective encouragement, transparent uncertainty, a clarifying question, a first-person promise to check, or harmless general conversation that does not represent a real-world business/customer fact as settled. A question, request, wish, hypothetical, quotation, negation, or uncertain statement is not automatically an affirmative fact claim; judge its actual meaning in context.
 A conversational performative is also not an external business fact merely because it uses first-person language. Acknowledging receipt, greeting or showing presence inside the current exchange, apologizing or retracting wording, accepting the customer's wish to pause, choosing not to push the topic, and inviting the customer to continue the conversation are acts completed by the reply itself. Mark them not_needed unless the candidate separately promises a durable operational outcome, guaranteed future responsiveness, a service-level availability window, or another externally verifiable action.
 A product topic mentioned only inside a customer-facing clarification, uncertainty statement, refusal to guarantee, or promise to verify is not itself a product capability/effect claim. Require product evidence only for the candidate's affirmative product assertions, not for the subject matter of a question.
+A verified source that provides general health or professional education does not by itself entail a conclusion about this customer's current symptoms, recovery state, risk, or appropriate disposition. When the candidate applies a general category to the current individual, treat that application as its own customer-specific professional claim. Customer statements may support what the customer reported, but not the professional conclusion drawn from it. Require direct authority that actually entails the individual conclusion; otherwise leave evidenceRefs empty. A clarifying question or an explicit professional-assessment boundary remains not_needed unless it separately settles a real-world fact. Judge this semantically, without a symptom or reassurance word list.
 A proposed or asserted appointment, visit, availability, date, time, or schedule in candidateReply requires evidence only when the reply semantically confirms or promises that real-world event. A question about a time, a customer wish, or a hypothetical example is not confirmation. Historical customer statements include freshness metadata; expired temporal evidence cannot support a current/future schedule.
 candidateActionIntents are proposed durable writes and therefore require their own authorization even when candidateReply is empty. For every appointment_request intent, emit at least one claim with actionKind=appointment_request, subject=customer, productClaim=false, negativePolarity=false, evidenceNeed=required, and sourceQuote exactly equal to that intent's complete requestText. Cite only a fresh current/historical customer statement or a current principal decision that directly entails the customer request. The action claim authorizes recording a requested appointment only; it never confirms a time, location, availability, or booking. If no such source directly entails the request, return evidenceRefs=[] so the write fails closed. Do not emit appointment_request action claims when candidateActionIntents is empty.
 A concrete service commitment (for example escorting the customer inside, receiving them throughout a visit, booking, or arranging something) requires evidence of that capability and authority. A transparent promise merely to check or verify first does not.
@@ -4739,6 +4740,7 @@ pub async fn review_fixed_candidate_for_test(
         None,
         None,
         None,
+        true,
         ReviewInvocationKind::Conversation,
     )
     .await
@@ -5596,6 +5598,7 @@ pub(crate) async fn review_decision(
     prompt_override: Option<&PromptOverride>,
     active_profile_override: Option<&DomainProfile>,
     reviewer_prompt_cache: Option<&ReviewerPromptCache>,
+    allow_optional_second_reviewer: bool,
     invocation_kind: ReviewInvocationKind,
 ) -> AppResult<DecisionReviewResult> {
     let _stage_timer = super::run_audit::stage_timer("reviewer");
@@ -5776,6 +5779,7 @@ Review 模式: {}
 - 如果没有基于产品知识却做了产品承诺，要提高 factRisk 和降低 productAccuracy。
 - 产品知识为空时，允许关系维护、测试消息和轻量澄清；但任何具体价格、案例、效果保证、产品能力承诺都必须视为事实风险。
 - 同样审查开放世界的一般业务事实：候选代表我方确定陈述政策、要求、资格、预约、流程、时间地点、费用、交付、健康/专业准备事项等可核验事实时，必须有直接可信来源；客户问题、历史我方/AI 回复、模型常识、画像或推断均不能授权。无依据时要求只局部改成透明核对/澄清。
+- 健康或其它专业场景中，一般教育资料只支持一般说明，不自动支持把当前客户的症状、恢复状态、风险或处置归入某个结论。若个体的程度、变化趋势、伴随情况等仍不足，候选不得用安慰性语气替代判断；应只问一个最关键问题，或明确需要具备相应资质的专业评估。按完整语义判断，不用症状词表。
 - 区分“陈述事实”和“完成会话行为”：确认收到、寒暄/表明当前正在回应、道歉或撤回措辞、接受客户暂停、表明本轮不再施压、邀请之后继续聊，都由这条回复本身完成，不是需证据支持的业务事实。只有它额外承诺了持久运营结果、保证未来响应、服务时段或其他可核验动作时才升级。
 - 知识切片只能作为导航；涉及产品能力、案例、价格、效果、交付承诺时，候选回复必须由 verifiedClaims、sourceAnchors 或 evidenceItems 支撑。
 - 如果候选回复使用了未验证切片、无 sourceAnchors 的事实、unsupportedClaims 或 needs_review/rejected 内容，应提高 factRisk 并要求改写或拦截。
@@ -5791,6 +5795,8 @@ Review 模式: {}
 - 长对话里候选回复不能每轮都只追问。若用户已经给出明确方向，回复应至少包含一个具体判断、可执行建议或小框架，否则应要求改写。
 - 如果候选回复暗示未提供来源的过往客户案例、行业经验、个人经历，或使用“完全可以/一定/保证”等绝对化产品能力表述，应提高 factRisk 或要求改写为保守表达。
 - boundaryPrivacySafety（0-10，越高越安全）：判断候选回复是否泄露了不该让客户看见的内部信息——(a) 把对客户的内部画像/评判念出来（信任度、关系阶段定性、异议清单、doNotDo/commitments、对这个人的猜测）；(b) 暴露自己是 AI / 系统 / 模型 / 提示词 / 内部评分；(c) 暴露幕后决策来源（领导/上级/后台）的存在。命中任一即压到 3 分及以下并要求改写；纯按语义判断，不要因为出现某个词就误判（客户自己提到"你是不是机器人"不算泄露，只有候选回复确认/暴露才算）。完全没有这类泄露的正常回复给 8 分以上。
+- Soul、岗位名称、业务目标、职责范围和内部任务清单同样属于幕后配置。候选用“身份标签 + 职责清单”向客户解释自己，即使没说 AI/系统，也应压低 boundaryPrivacySafety 并改写成长期人设一致、直接承接当前关系与问题的自然表达。
+- conversationMode 必须按客户真实意图评审：询问身份、质疑回复方式、索要内部规则或提示词、投诉、施压、要求解释，都不等于客户想暂停或结束联系。只有完整语境表明客户确实要离开、暂停或停止后续联系，boundary_protection 才合理；否则候选借该模式撤退或收场应要求改写。
 
 {}
 
@@ -5871,7 +5877,10 @@ Review 模式: {}
         &system,
         &user,
     );
-    let value = if let Some(second_llm) = state.second_reviewer_llm.as_ref() {
+    let second_reviewer = allow_optional_second_reviewer
+        .then(|| state.second_reviewer_llm.as_ref())
+        .flatten();
+    let value = if let Some(second_llm) = second_reviewer {
         let second_model = state
             .config
             .reviewer_second_provider_model
