@@ -25,7 +25,7 @@ mod style;
 // review.rs 顶层可见性 re-export。
 pub(crate) use gates::{
     apply_dual_reviewer_disagreement, build_reviewer_decision_view,
-    detect_dual_reviewer_disagreement, route_dual_gate,
+    detect_dual_reviewer_disagreement, reviewer_escalation_protocol, route_dual_gate,
 };
 pub use gates::{
     contact_has_principal_product_exemption, finalize_review_for_send, review_passed,
@@ -5029,6 +5029,8 @@ fn build_light_reviewer_user(
     );
     let commitment_updates =
         serde_json::to_string(&decision.commitment_updates).unwrap_or_else(|_| "[]".to_string());
+    let escalation_protocol = serde_json::to_string(&reviewer_escalation_protocol(decision))
+        .unwrap_or_else(|_| "{}".to_string());
     let candidate_reply = if decision.should_reply {
         decision.reply_text.as_str()
     } else {
@@ -5110,6 +5112,9 @@ fn build_light_reviewer_user(
 候选承诺生命周期动作（内部结构化副作用，空数组表示无）：
 {commitment_updates}
 
+候选请示协议事实（只用于独立核对，不代表结论已获授权）：
+{escalation_protocol}
+
 关键记忆：
 {memory}
 
@@ -5127,6 +5132,7 @@ fn build_light_reviewer_user(
         ),
         candidate = candidate_reply,
         commitment_updates = commitment_updates,
+        escalation_protocol = escalation_protocol,
         memory = light_memory_card_text(context_pack),
         instruction = operator_instruction,
         thresholds = serde_json::to_string(&thresholds).unwrap_or_default(),
@@ -5268,6 +5274,15 @@ mod reviewer_recent_history_tests {
             should_reply: true,
             reply_text: "你先慢慢看，有想法随时找我。".to_string(),
             used_knowledge_ids: vec!["verified-1".to_string()],
+            next_step: "ask_principal".to_string(),
+            escalation_request: Some(crate::models::EscalationRequest {
+                needed: true,
+                category: Some("out_of_scope_decision".to_string()),
+                reason: Some("内部理由不应进入轻审".to_string()),
+                question_for_principal: Some("内部问题不应进入轻审".to_string()),
+                self_serviceable_part: Some("内部判断不应进入轻审".to_string()),
+                is_generalizable: false,
+            }),
             ..Default::default()
         };
         let card = mongodb::bson::doc! {
@@ -5305,6 +5320,12 @@ mod reviewer_recent_history_tests {
         assert!(user.contains("不要连续追问"));
         assert!(user.contains("避免主动推销"));
         assert!(user.contains("verified-1"));
+        assert!(user.contains("\"nextStep\":\"ask_principal\""));
+        assert!(user.contains("\"needed\":true"));
+        assert!(user.contains("\"category\":\"out_of_scope_decision\""));
+        assert!(!user.contains("内部理由不应进入轻审"));
+        assert!(!user.contains("内部问题不应进入轻审"));
+        assert!(!user.contains("内部判断不应进入轻审"));
         assert!(!user.contains("不应进入 light 投影"));
         assert!(!user.contains("运营方法:"));
         assert!(!user.contains("用户运营域策略:"));

@@ -83,11 +83,26 @@ pub(crate) fn build_reviewer_decision_view(decision: &AgentDecision) -> String {
         "runMode": decision.run_mode.clone(),
         "riskLevel": decision.risk_level.clone(),
         "knowledgeNeed": decision.knowledge_need.clone(),
+        "escalationProtocol": reviewer_escalation_protocol(decision),
         "commitmentUpdates": mongodb::bson::to_bson(&decision.commitment_updates)
             .unwrap_or(mongodb::bson::Bson::Array(Vec::new())),
         "semanticAssessment": semantic_assessment,
     })
     .unwrap_or_default()
+}
+
+/// Reviewer 必须看见候选是否正在请示，才能独立判断正文是否“先给方向、再请示”。
+/// 只暴露协议事实，不回流 reason、questionForPrincipal 或 selfServiceablePart 等
+/// Reply Agent 自我解释，保持评审的独立性。
+pub(crate) fn reviewer_escalation_protocol(decision: &AgentDecision) -> Document {
+    let request = decision.escalation_request.as_ref();
+    mongodb::bson::doc! {
+        "nextStep": decision.next_step.clone(),
+        "needed": request.map(|item| item.needed).unwrap_or(false),
+        "category": request
+            .and_then(|item| item.category.clone())
+            .unwrap_or_default(),
+    }
 }
 
 /// Phase B / B1：双闸分类结果。
@@ -1475,6 +1490,7 @@ mod reviewer_decision_view_tests {
 
     use super::build_reviewer_decision_view;
     use crate::agent::types::{AgentDecision, NamecardDirective};
+    use crate::models::EscalationRequest;
     use mongodb::bson::doc;
 
     fn decision_with_reasoning_filled() -> AgentDecision {
@@ -1506,6 +1522,15 @@ mod reviewer_decision_view_tests {
                 card_id: "64a1f2c3e4b5a697889a0011".to_string(),
                 reason: Some("客户明确要求顾问对接".to_string()),
             }),
+            next_step: "ask_principal".to_string(),
+            escalation_request: Some(EscalationRequest {
+                needed: true,
+                category: Some("out_of_scope_decision".to_string()),
+                reason: Some("不应回流的请示理由".to_string()),
+                question_for_principal: Some("不应回流的请示问题".to_string()),
+                self_serviceable_part: Some("不应回流的自主回答判断".to_string()),
+                is_generalizable: false,
+            }),
             intent_analysis: doc! {
                 "semanticAssessment": {
                     "responseDisposition": "reply",
@@ -1532,6 +1557,9 @@ mod reviewer_decision_view_tests {
             "用户提出了具体顾虑，需要回应",
             "无产品承诺，无销售压力",
             "should not leak",
+            "不应回流的请示理由",
+            "不应回流的请示问题",
+            "不应回流的自主回答判断",
         ];
         for needle in leaked_values {
             assert!(
@@ -1617,6 +1645,15 @@ mod reviewer_decision_view_tests {
             "应保留待审核的受控名片动作: {}",
             view
         );
+        assert!(
+            view.contains("\"nextStep\":\"ask_principal\"")
+                && view.contains("\"needed\":true")
+                && view.contains("\"category\":\"out_of_scope_decision\""),
+            "应保留请示协议事实: {}",
+            view
+        );
+        assert!(!view.contains("questionForPrincipal"));
+        assert!(!view.contains("selfServiceablePart"));
     }
 
     #[test]
