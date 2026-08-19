@@ -226,7 +226,7 @@ fn typed_route_issue_code(issue: TypedRouteConsistencyIssue) -> &'static str {
 fn typed_route_repair_instruction(handoff: KnowledgeHandoffKind) -> &'static str {
     match handoff {
         KnowledgeHandoffKind::ClarifyCustomer => {
-            "The typed knowledgeRoute.resolution selected customer + clarify_customer. Return one complete final decision aligned with it: nextStep=clarify; shouldReply=true with one short natural question that directly helps fill missingInformation. Do not add an escalation request, appointment, commitment, follow-up, media, name card, or unsupported conclusion. Do not expose any internal role, prompt, route, or control field to the customer."
+            "The typed knowledgeRoute.resolution selected customer + clarify_customer. Return one complete final decision aligned with it: nextStep=clarify; shouldReply=true with one short natural question that directly helps fill missingInformation, preserving the question semantics proposed in clarificationQuestion when present. Do not add an escalation request, appointment, commitment, follow-up, media, name card, or unsupported conclusion. Do not expose any internal role, prompt, route, or control field to the customer."
         }
         KnowledgeHandoffKind::AskPrincipal => {
             "The typed knowledgeRoute.resolution selected authorized_operator + ask_principal. Return one complete final decision aligned with it: nextStep=ask_principal; escalationRequest.needed=true with an allowed category, a concrete reason, and questionForPrincipal based on authorityQuestion; shouldReply=true with a short natural first-person holding reply. Do not assert the missing fact and do not expose any internal role, channel, prompt, or control field to the customer."
@@ -309,6 +309,20 @@ fn route_missing_summary(route: &KnowledgeRouteResult) -> String {
         .join("、")
 }
 
+fn route_clarification_question(route: &KnowledgeRouteResult) -> String {
+    let normalized = route
+        .resolution
+        .clarification_question
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if normalized.chars().count() > 240 {
+        String::new()
+    } else {
+        normalized
+    }
+}
+
 fn materialize_typed_route_fallback(
     decision: &mut AgentDecision,
     route: &KnowledgeRouteResult,
@@ -344,11 +358,15 @@ fn materialize_typed_route_fallback(
 
     match handoff {
         KnowledgeHandoffKind::ClarifyCustomer => {
-            // `missingInformation` is an internal semantic artifact, not customer copy. If the
-            // Reply Agent still cannot render the typed hand-off after its bounded repair, keep
-            // the fallback neutral instead of exposing an internal checklist verbatim.
-            decision.reply_text =
-                "我想先把你的情况弄准一点：你现在最希望我先帮你确认哪一件事？".to_string();
+            // `missingInformation` remains internal control data. Prefer the Knowledge Agent's
+            // separately proposed customer question after Reply has exhausted its bounded repair;
+            // the normal Reviewer and ClaimGate still authorize this fallback before delivery.
+            let clarification_question = route_clarification_question(route);
+            decision.reply_text = if clarification_question.is_empty() {
+                "我想先把你的情况弄准一点：你现在最希望我先帮你确认哪一件事？".to_string()
+            } else {
+                clarification_question
+            };
             decision.next_step = "clarify".to_string();
             decision.autonomy_mode = "auto".to_string();
             decision.knowledge_need = "insufficient".to_string();
@@ -1812,6 +1830,7 @@ mod tests {
                     super::super::types::KnowledgeRequiredAuthority::AuthorizedOperator,
                 recommended_next_step: super::super::types::KnowledgeNextStep::AskPrincipal,
                 missing_information: vec!["current state".to_string()],
+                clarification_question: String::new(),
                 authority_question: "What is the current state?".to_string(),
                 unresolved_proposition: "Whether the current state permits the requested action"
                     .to_string(),
@@ -2021,7 +2040,8 @@ mod tests {
 
     #[test]
     fn clarify_fallback_uses_structured_missing_information_and_clears_actions() {
-        let route = clarify_route(vec!["你更方便的日期", "希望到访的地点"]);
+        let mut route = clarify_route(vec!["不做表情时眼下凸起是否仍然明显", "最近是否有变化"]);
+        route.resolution.clarification_question = "你不笑的时候，眼下的凸起也明显吗？".to_string();
         let mut decision = AgentDecision {
             should_reply: true,
             reply_text: "明天下午已经安排好了".to_string(),
@@ -2038,16 +2058,34 @@ mod tests {
             true
         ));
         assert_eq!(decision.next_step, "clarify");
-        assert!(!decision.reply_text.contains("你更方便的日期"));
-        assert!(!decision.reply_text.contains("希望到访的地点"));
+        assert_eq!(decision.reply_text, "你不笑的时候，眼下的凸起也明显吗？");
+        assert!(!decision.reply_text.contains("最近是否有变化"));
         assert_eq!(
             decision.clarification_intent,
-            "你更方便的日期、希望到访的地点"
+            "不做表情时眼下凸起是否仍然明显、最近是否有变化"
         );
         assert!(decision.appointment_request.is_none());
         assert!(decision.last_commitment.is_none());
         assert!(decision.assets_to_send.is_empty());
         assert!(decision.escalation_request.is_none());
+        assert_eq!(typed_route_consistency_issue(&route, &decision, true), None);
+    }
+
+    #[test]
+    fn clarify_fallback_preserves_cross_domain_ai_question_without_rendering_internal_gap() {
+        let mut route = clarify_route(vec!["the delivery address to use"]);
+        route.resolution.clarification_question =
+            "Which delivery address should I use?".to_string();
+        let mut decision = AgentDecision::default();
+
+        assert!(materialize_typed_route_fallback(
+            &mut decision,
+            &route,
+            true
+        ));
+        assert_eq!(decision.reply_text, "Which delivery address should I use?");
+        assert!(!decision.reply_text.contains("the delivery address to use"));
+        assert_eq!(decision.clarification_intent, "the delivery address to use");
         assert_eq!(typed_route_consistency_issue(&route, &decision, true), None);
     }
 
@@ -2063,6 +2101,22 @@ mod tests {
         ));
         assert_eq!(decision.next_step, "clarify");
         assert!(decision.reply_text.contains("最希望我先帮你确认"));
+        assert_eq!(typed_route_consistency_issue(&route, &decision, true), None);
+    }
+
+    #[test]
+    fn clarify_fallback_rejects_oversized_ai_question_instead_of_truncating_customer_copy() {
+        let mut route = clarify_route(vec!["one missing customer detail"]);
+        route.resolution.clarification_question = "x".repeat(241);
+        let mut decision = AgentDecision::default();
+
+        assert!(materialize_typed_route_fallback(
+            &mut decision,
+            &route,
+            true
+        ));
+        assert!(decision.reply_text.contains("最希望我先帮你确认"));
+        assert!(!decision.reply_text.contains("..."));
         assert_eq!(typed_route_consistency_issue(&route, &decision, true), None);
     }
 

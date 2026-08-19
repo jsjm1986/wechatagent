@@ -1747,7 +1747,8 @@ pub(crate) fn embedded_light_claim_gate_evaluation(
                 && !claim.requires_evidence
                 && !claim.product_claim
                 && claim.evidence_refs.is_empty()
-        });
+        })
+        && !atomic_claim_integrity_failed_for_decision(&verdict, decision, &evidence_catalog);
     safe_without_dedicated_gate.then(|| IndependentClaimGateEvaluation {
         candidate_fingerprint: authorization_candidate_fingerprint(decision),
         evidence_catalog,
@@ -2096,6 +2097,7 @@ mod independent_claim_gate_contract_tests {
                 required_authority: KnowledgeRequiredAuthority::AuthorizedOperator,
                 recommended_next_step: KnowledgeNextStep::AskPrincipal,
                 missing_information: vec!["current authorized decision".to_string()],
+                clarification_question: String::new(),
                 authority_question: authority_question.to_string(),
                 unresolved_proposition: unresolved_proposition.to_string(),
             },
@@ -2534,6 +2536,54 @@ mod independent_claim_gate_contract_tests {
         );
         assert!(
             embedded_light_claim_gate_evaluation(&review, &decision, &route, Vec::new()).is_none()
+        );
+    }
+
+    #[test]
+    fn embedded_light_claim_contract_falls_back_when_source_quote_changes_punctuation() {
+        let decision = crate::agent::types::AgentDecision {
+            should_reply: true,
+            reply_text: "你好，吴界。我是小星，有什么想了解的随时说。".to_string(),
+            ..Default::default()
+        };
+        let mut review = DecisionReviewResult {
+            approved: true,
+            claim_analysis: doc! { "requiresProductKnowledge": false },
+            ..Default::default()
+        };
+        review.claim_analysis.insert(
+            "atomicClaimGate",
+            mongodb::bson::to_bson(&json!({
+                "claimKinds": ["self_introduction"],
+                "claimsComplete": true,
+                "claims": [{
+                    "sourceQuote": "我是小星。",
+                    "claim": "以小星的长期人物身份进行当前会话",
+                    "scope": "current_conversation",
+                    "subject": "general",
+                    "actionKind": null,
+                    "evidenceNeed": "not_needed",
+                    "negativePolarity": false,
+                    "productClaim": false,
+                    "evidenceRefs": [],
+                    "reason": "会话内人物表达"
+                }],
+                "catalogCoverageComplete": true,
+                "catalogClaims": [],
+                "reason": "完整覆盖候选"
+            }))
+            .unwrap(),
+        );
+
+        assert!(
+            embedded_light_claim_gate_evaluation(
+                &review,
+                &decision,
+                &KnowledgeRouteResult::default(),
+                Vec::new(),
+            )
+            .is_none(),
+            "a malformed embedded quote must use the dedicated ClaimGate instead of failing the send path"
         );
     }
 
@@ -5568,6 +5618,21 @@ fn light_reviewer_trigger_section(
     }
 }
 
+const REVIEWER_REWRITE_LOCALITY_GUIDANCE: &str = r#"
+
+# Reviewer 修订边界
+只有候选确有缺陷时才给 rewriteInstruction。修订必须只处理有缺陷的片段，并保持客户最新消息的 speech act、当前主题和自然社交带宽；不得把历史任务、旧承诺、旧请示或旧业务主题加入一个原本不延续它们的当前回合，也不得新增客户最新消息未提出的事实、承诺、动作或业务话题。无关的自我介绍或职责披露应局部删除，不得用历史工作内容替换。以上按完整语义判断，不使用客户关键词、词表或固定句式。
+"#;
+
+fn render_reviewer_current_turn_guidance(operation_state_continuity: &str) -> String {
+    format!(
+        "{}{}{}",
+        render_current_turn_precedence_guidance(),
+        REVIEWER_REWRITE_LOCALITY_GUIDANCE,
+        operation_state_continuity
+    )
+}
+
 fn build_light_reviewer_user(
     contact_salutations: &[String],
     inbound: &ConversationMessage,
@@ -5612,11 +5677,7 @@ fn build_light_reviewer_user(
     let current_turn_guidance = if invocation_kind.is_manual_outreach() {
         String::new()
     } else {
-        format!(
-            "{}{}",
-            render_current_turn_precedence_guidance(),
-            operation_state_continuity
-        )
+        render_reviewer_current_turn_guidance(operation_state_continuity)
     };
     let candidate_reply = if decision.should_reply {
         decision.reply_text.as_str()
@@ -5801,10 +5862,11 @@ fn reviewer_recent_history_section(
 mod reviewer_recent_history_tests {
     use super::{
         build_light_reviewer_user, full_reviewer_trigger_section, light_memory_card_text,
-        render_light_reviewer_history, render_reviewer_recent_history_at,
-        render_reviewer_recent_history_bounded_at, reviewer_authority_boundary_text,
-        reviewer_memory_card_text, reviewer_operating_memory_text,
-        reviewer_operator_instruction_text, reviewer_recent_history_section, ReviewInvocationKind,
+        render_light_reviewer_history, render_reviewer_current_turn_guidance,
+        render_reviewer_recent_history_at, render_reviewer_recent_history_bounded_at,
+        reviewer_authority_boundary_text, reviewer_memory_card_text,
+        reviewer_operating_memory_text, reviewer_operator_instruction_text,
+        reviewer_recent_history_section, ReviewInvocationKind,
     };
     use crate::agent::runtime::UserRuntimeParameters;
     use crate::agent::types::{
@@ -5995,6 +6057,19 @@ mod reviewer_recent_history_tests {
         assert!(!user.contains("不应进入 light 投影"));
         assert!(!user.contains("运营方法:"));
         assert!(!user.contains("用户运营域策略:"));
+        assert!(user.contains("修订必须只处理有缺陷的片段"));
+        assert!(user.contains("不得用历史工作内容替换"));
+    }
+
+    #[test]
+    fn reviewer_rewrite_guidance_preserves_latest_speech_act_without_phrase_matching() {
+        let guidance = render_reviewer_current_turn_guidance("\nstate continuity");
+        assert!(guidance.contains("客户最新消息的 speech act"));
+        assert!(guidance.contains("不得把历史任务、旧承诺、旧请示或旧业务主题加入"));
+        assert!(guidance.contains("不得新增客户最新消息未提出的事实、承诺、动作或业务话题"));
+        assert!(guidance.contains("不使用客户关键词、词表或固定句式"));
+        assert!(guidance.ends_with("state continuity"));
+        assert!(!guidance.contains("你好/在吗"));
     }
 
     #[test]
@@ -6444,11 +6519,7 @@ pub(crate) async fn review_decision(
         let current_turn_guidance = if invocation_kind.is_manual_outreach() {
             String::new()
         } else {
-            format!(
-                "{}{}",
-                render_current_turn_precedence_guidance(),
-                operation_state_continuity
-            )
+            render_reviewer_current_turn_guidance(&operation_state_continuity)
         };
         format!(
             r#"请评审候选回复。

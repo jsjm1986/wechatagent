@@ -2161,6 +2161,12 @@ pub struct KnowledgeResolution {
     pub recommended_next_step: KnowledgeNextStep,
     #[serde(default, deserialize_with = "string_or_vec")]
     pub missing_information: Vec<String>,
+    /// One concise customer-facing question proposed by the Knowledge Agent when the typed route
+    /// is `customer + clarify_customer`. It remains internal until Reply/Review authorization and
+    /// is empty for other routes. This avoids rendering internal `missing_information` fragments
+    /// as customer copy when the bounded Reply repair cannot produce a coherent action.
+    #[serde(default)]
+    pub clarification_question: String,
     #[serde(default)]
     pub authority_question: String,
     /// One concise real-world proposition that is still unresolved when the available evidence

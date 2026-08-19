@@ -1972,6 +1972,7 @@ mod tests {
                 required_authority: KnowledgeRequiredAuthority::AuthorizedOperator,
                 recommended_next_step: KnowledgeNextStep::AskPrincipal,
                 missing_information: vec!["current operating state".to_string()],
+                clarification_question: String::new(),
                 authority_question: "What is the current operating state?".to_string(),
                 unresolved_proposition: "What is the current operating state?".to_string(),
             },

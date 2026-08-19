@@ -2027,12 +2027,13 @@ pub(crate) fn format_typed_route_handoff_for_prompt(
         "requiredAuthority": resolution.required_authority,
         "recommendedNextStep": resolution.recommended_next_step,
         "missingInformation": resolution.missing_information,
+        "clarificationQuestion": resolution.clarification_question,
         "authorityQuestion": resolution.authority_question,
         "unresolvedProposition": resolution.unresolved_proposition,
     });
     let instruction = match handoff {
         KnowledgeHandoffKind::ClarifyCustomer => {
-            "请将这个交接完整落成一个最终动作：nextStep=clarify、sufficiency=need_clarification、shouldReply=true，并在 clarificationIntent 写清要补齐的缺口；客户可见回复只问一个真正能补齐 missingInformation 的自然问题。不要附带请示、预约、承诺、跟进、素材或名片，也不要补写缺失事实。"
+            "请将这个交接完整落成一个最终动作：nextStep=clarify、sufficiency=need_clarification、shouldReply=true，并在 clarificationIntent 写清要补齐的缺口；客户可见回复只问一个真正能补齐 missingInformation 的自然问题，优先自然采用 clarificationQuestion 所表达的问题语义。不要附带请示、预约、承诺、跟进、素材或名片，也不要补写缺失事实。"
         }
         KnowledgeHandoffKind::AskPrincipal => {
             "请将这个交接完整落成一个最终动作：nextStep=ask_principal、escalationRequest.needed=true、category=out_of_scope_decision，并填写具体 reason 与 questionForPrincipal；shouldReply=true，回复用第一人称自然承接。`unresolvedProposition` 仍未关闭，任何由局部事实拼出的肯定、否定或概率方向都不得先说给客户。不要引用缺失事实。"
@@ -2637,6 +2638,7 @@ mod persona_override_tests {
                 required_authority: KnowledgeRequiredAuthority::AuthorizedOperator,
                 recommended_next_step: KnowledgeNextStep::AskPrincipal,
                 missing_information: vec!["当期可用口径".to_string()],
+                clarification_question: String::new(),
                 authority_question: "当前应采用什么口径？".to_string(),
                 unresolved_proposition: "当前应采用哪一条对外口径".to_string(),
             },
@@ -2698,6 +2700,7 @@ mod persona_override_tests {
                 required_authority: KnowledgeRequiredAuthority::AuthorizedOperator,
                 recommended_next_step: KnowledgeNextStep::AskPrincipal,
                 missing_information: vec!["当期排班".to_string()],
+                clarification_question: String::new(),
                 authority_question: "请确认当期排班和可预约时间".to_string(),
                 unresolved_proposition: "这位客户明天下午是否确有可预约面诊名额".to_string(),
             },
@@ -2719,6 +2722,7 @@ mod persona_override_tests {
                 required_authority: KnowledgeRequiredAuthority::Customer,
                 recommended_next_step: KnowledgeNextStep::ClarifyCustomer,
                 missing_information: vec!["客户希望的时间范围".to_string()],
+                clarification_question: "你大概希望安排在哪个时间段？".to_string(),
                 ..Default::default()
             },
             ..Default::default()
@@ -2727,6 +2731,8 @@ mod persona_override_tests {
         assert!(clarify_text.contains("nextStep=clarify"));
         assert!(clarify_text.contains("sufficiency=need_clarification"));
         assert!(clarify_text.contains("客户希望的时间范围"));
+        assert!(clarify_text.contains("你大概希望安排在哪个时间段？"));
+        assert!(clarify_text.contains("优先自然采用 clarificationQuestion"));
 
         let defer = KnowledgeRouteResult {
             resolution: KnowledgeResolution {
