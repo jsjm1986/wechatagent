@@ -541,7 +541,7 @@ pub struct RawAgentDecision {
     pub why_skip_reply: Option<String>,
     pub risk_self_check: Option<String>,
 
-    // ── 业务必填字段（R3.1 / R3.2 / R3.3） ──
+    // ── 业务协议字段（R3.1 / R3.2 / R3.3；operation_state 为可选变更提案） ──
     pub risk_level: Option<String>,     // low | medium | high
     pub knowledge_need: Option<String>, // not_required | required | insufficient
     pub run_mode: Option<String>, // fast_chat | memory_candidate | knowledge_grounded | high_risk
@@ -1029,8 +1029,11 @@ impl RawAgentDecision {
             &allowed_modes,
             &mut risks,
         );
-        let operation_state =
-            check_required_string(self.operation_state.clone(), "operation_state", &mut risks);
+        let operation_state = self
+            .operation_state
+            .clone()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
         let needs_review = check_required_bool(self.needs_review, "needs_review", &mut risks);
         let should_reply = check_required_bool(self.should_reply, "should_reply", &mut risks);
         let risk_self_check =
@@ -1061,7 +1064,11 @@ impl RawAgentDecision {
         } else {
             conversation_mode
         };
-        decision.operation_state = (!operation_state.is_empty()).then_some(operation_state);
+        decision.operation_state = operation_state;
+        if decision.operation_state.is_none() {
+            decision.operation_state_reason = None;
+            decision.operation_state_confidence = None;
+        }
         decision.needs_review = needs_review;
         decision.should_reply = should_reply;
         decision.reply_text = reply_text;
@@ -1167,8 +1174,11 @@ impl RawAgentDecision {
             "consolidation_needed",
             &mut risks,
         );
-        let operation_state =
-            check_required_string(self.operation_state.clone(), "operation_state", &mut risks);
+        let operation_state = self
+            .operation_state
+            .clone()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
 
         // R1.3 7 字段始终必填（trim 后非空）
         let user_understanding = check_required_string(
@@ -1279,11 +1289,7 @@ impl RawAgentDecision {
             autonomy_mode,
             needs_review,
             consolidation_needed,
-            operation_state: if operation_state.is_empty() {
-                None
-            } else {
-                Some(operation_state)
-            },
+            operation_state,
             decision_phase: phase,
             user_understanding,
             relationship_read,
@@ -1312,6 +1318,10 @@ impl RawAgentDecision {
 
         // 把既有 carry-through 字段从 raw 拷过去（避免 promote 把它们丢失）。
         carry_through_fields(self, &mut decision);
+        if decision.operation_state.is_none() {
+            decision.operation_state_reason = None;
+            decision.operation_state_confidence = None;
+        }
         normalize_harness_control(&mut decision, &mut risks);
         sanitize_semantic_assessment(&mut decision, &mut risks);
 
@@ -1628,6 +1638,15 @@ fn build_minimal_decision(raw: RawAgentDecision) -> AgentDecision {
         ..AgentDecision::default()
     };
     carry_through_fields(raw, &mut decision);
+    decision.operation_state = decision
+        .operation_state
+        .take()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if decision.operation_state.is_none() {
+        decision.operation_state_reason = None;
+        decision.operation_state_confidence = None;
+    }
     decision
 }
 
@@ -1896,6 +1915,23 @@ pub struct ReviewScores {
     pub boundary_privacy_safety: i32,
 }
 
+/// Independent Reviewer verdict for a Reply Agent lifecycle-state proposal.
+///
+/// The Reply Agent may omit `operationState` to preserve the durable state.  When it proposes a
+/// change, the Reviewer judges whether the current turn or another trusted current event actually
+/// supports that lifecycle transition.  The runtime only enforces this typed verdict; it does not
+/// classify customer text or maintain a phrase list.
+#[derive(Debug, Serialize, Deserialize, Default, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OperationStateAssessment {
+    #[serde(default)]
+    pub proposal_present: bool,
+    #[serde(default)]
+    pub supported: bool,
+    #[serde(default)]
+    pub reason: String,
+}
+
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct DecisionReviewResult {
@@ -1913,6 +1949,8 @@ pub struct DecisionReviewResult {
     pub rewrite_instruction: String,
     #[serde(default)]
     pub review_summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_state_assessment: Option<OperationStateAssessment>,
 
     // ─────────────────────────────────────────────────────────────────
     // agent-autonomy-loop W2 / Task 3.3：R2 / R9 自治回路扩字段。
@@ -2624,6 +2662,65 @@ mod validate_and_promote_tests {
             }),
             ..RawAgentDecision::default()
         }
+    }
+
+    #[test]
+    fn omitted_operation_state_preserves_durable_state_without_protocol_violation() {
+        for compact in [true, false] {
+            let mut raw = make_valid_low_routine_raw();
+            raw.operation_state = None;
+            raw.operation_state_reason = Some("不应脱离提案单独保留".to_string());
+            raw.operation_state_confidence = Some(9);
+            let (decision, risks) = if compact {
+                raw.validate_reply_critical(&runtime_default(true))
+            } else {
+                raw.validate_and_promote(&runtime_default(true))
+            };
+
+            assert!(
+                !risks
+                    .iter()
+                    .any(|risk| risk == "missing_required_field:operation_state"),
+                "operationState omission must mean preserve, risks={risks:?}"
+            );
+            assert!(decision.operation_state.is_none());
+            assert!(decision.operation_state_reason.is_none());
+            assert!(decision.operation_state_confidence.is_none());
+        }
+    }
+
+    #[test]
+    fn legacy_protocol_path_also_clears_orphaned_state_metadata() {
+        let mut raw = make_valid_low_routine_raw();
+        raw.operation_state = Some("   ".to_string());
+        raw.operation_state_reason = Some("孤立理由".to_string());
+        raw.operation_state_confidence = Some(9);
+        let mut runtime = runtime_default(true);
+        runtime.autonomy_protocol_enabled = false;
+
+        let (decision, risks) = raw.validate_and_promote(&runtime);
+
+        assert!(risks.is_empty());
+        assert!(decision.operation_state.is_none());
+        assert!(decision.operation_state_reason.is_none());
+        assert!(decision.operation_state_confidence.is_none());
+    }
+
+    #[test]
+    fn non_empty_operation_state_remains_a_typed_transition_proposal() {
+        let mut raw = make_valid_low_routine_raw();
+        raw.operation_state = Some("  appointment_request  ".to_string());
+        raw.operation_state_reason = Some("客户本轮明确提出预约请求".to_string());
+        raw.operation_state_confidence = Some(9);
+
+        let (decision, risks) = raw.validate_reply_critical(&runtime_default(true));
+
+        assert!(risks.is_empty(), "unexpected risks: {risks:?}");
+        assert_eq!(
+            decision.operation_state.as_deref(),
+            Some("appointment_request")
+        );
+        assert_eq!(decision.operation_state_confidence, Some(9));
     }
 
     #[test]

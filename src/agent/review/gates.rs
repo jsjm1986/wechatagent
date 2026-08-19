@@ -77,7 +77,11 @@ pub(crate) fn build_reviewer_decision_view(decision: &AgentDecision) -> String {
             .unwrap_or(mongodb::bson::Bson::Null),
         "customerStage": decision.customer_stage.clone().unwrap_or_default(),
         "intentLevel": decision.intent_level.clone().unwrap_or_default(),
-        "operationState": decision.operation_state.clone().unwrap_or_default(),
+        "operationState": decision
+            .operation_state
+            .clone()
+            .map(mongodb::bson::Bson::String)
+            .unwrap_or(mongodb::bson::Bson::Null),
         "decisionPhase": decision.decision_phase.clone(),
         "autonomyMode": decision.autonomy_mode.clone(),
         "runMode": decision.run_mode.clone(),

@@ -32,6 +32,74 @@ pub(crate) fn normalize_decision_state(
     }
 }
 
+/// Collapse a proposal that merely repeats the contact's durable state into the same no-op shape
+/// as an omitted proposal. This avoids refreshing state timestamps and keeps Reviewer attention on
+/// genuine lifecycle changes. The comparison uses typed state keys after normalization; it never
+/// inspects customer text.
+pub(crate) fn suppress_same_state_proposal(
+    decision: &mut AgentDecision,
+    current_state: Option<&str>,
+) -> bool {
+    let current_state = current_state
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let proposed_state = decision
+        .operation_state
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if current_state.is_none() || current_state != proposed_state {
+        return false;
+    }
+    decision.operation_state = None;
+    decision.operation_state_reason = None;
+    decision.operation_state_confidence = None;
+    true
+}
+
+#[cfg(test)]
+mod state_proposal_normalization_tests {
+    use super::suppress_same_state_proposal;
+    use crate::agent::types::AgentDecision;
+
+    #[test]
+    fn repeated_durable_state_becomes_an_omitted_proposal() {
+        let mut decision = AgentDecision {
+            operation_state: Some("appointment_confirmation".to_string()),
+            operation_state_reason: Some("模型重复当前态".to_string()),
+            operation_state_confidence: Some(8),
+            ..AgentDecision::default()
+        };
+
+        assert!(suppress_same_state_proposal(
+            &mut decision,
+            Some("appointment_confirmation")
+        ));
+        assert!(decision.operation_state.is_none());
+        assert!(decision.operation_state_reason.is_none());
+        assert!(decision.operation_state_confidence.is_none());
+    }
+
+    #[test]
+    fn genuinely_different_state_remains_for_semantic_review() {
+        let mut decision = AgentDecision {
+            operation_state: Some("appointment_request".to_string()),
+            operation_state_reason: Some("本轮出现新的生命周期证据".to_string()),
+            operation_state_confidence: Some(9),
+            ..AgentDecision::default()
+        };
+
+        assert!(!suppress_same_state_proposal(
+            &mut decision,
+            Some("need_discovery")
+        ));
+        assert_eq!(
+            decision.operation_state.as_deref(),
+            Some("appointment_request")
+        );
+    }
+}
+
 // W1 / R3.6 / N1：本函数不再填默认；缺失字段由 validate_and_promote 校验。
 //
 // 这里保留的是 `memory_write_score` 与 planner.memory_change_importance 的非

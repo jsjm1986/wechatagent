@@ -2073,7 +2073,8 @@ mod protocol_skeleton_tests {
     #[test]
     fn final_phase_with_all_empty_fields_triggers_full_validation() {
         // R1.10 / R1.3 / R3.1 / R3.2 / R3.3：final 轮空字段应触发完整校验。
-        // 最少应包含 R1.3 的 7 个字段缺失 + R3 必填的 6 个枚举/bool/state 字段缺失。
+        // 最少应包含 R1.3 的 7 个字段缺失 + R3 必填枚举/bool 字段缺失；
+        // operationState 是可选生命周期变更提案，省略表示保持持久态。
         let raw = RawAgentDecision {
             decision_phase: Some("final".to_string()),
             ..RawAgentDecision::default()
@@ -2107,7 +2108,6 @@ mod protocol_skeleton_tests {
             "autonomy_mode",
             "needs_review",
             "consolidation_needed",
-            "operation_state",
         ];
         for field in r3_fields {
             assert!(
@@ -2117,6 +2117,10 @@ mod protocol_skeleton_tests {
                 risks
             );
         }
+        assert!(
+            !risks.contains(&"missing_required_field:operation_state".to_string()),
+            "operationState omission must preserve durable state instead of becoming a protocol violation: {risks:?}"
+        );
     }
 
     // ── 6. risk_level="critical" 触发 invalid_enum_value ───────────────

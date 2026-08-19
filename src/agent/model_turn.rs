@@ -33,6 +33,7 @@ use super::gateway::precheck_send_gateway;
 use super::guards::{
     action_policy_state_key, decision_operation_state_candidate, enforce_reviewed_decision_actions,
     normalize_decision_runtime, normalize_decision_state, planner_from_decision,
+    suppress_same_state_proposal,
 };
 use super::knowledge_router::{
     coherent_knowledge_handoff, route_requires_knowledge_review, route_used_knowledge_ids,
@@ -474,6 +475,72 @@ fn align_principal_claim_repair(
     );
 }
 
+fn enforce_operation_state_assessment(
+    decision: &mut AgentDecision,
+    review: &mut super::types::DecisionReviewResult,
+    current_state: Option<&str>,
+) {
+    let Some(proposed_state) =
+        decision_operation_state_candidate(decision).map(ToString::to_string)
+    else {
+        return;
+    };
+    let assessment = review.operation_state_assessment.as_ref();
+    let supported = assessment.is_some_and(|item| item.proposal_present && item.supported);
+    if supported {
+        let reviewer_reason = assessment
+            .map(|item| item.reason.trim().to_string())
+            .filter(|reason| !reason.is_empty())
+            .unwrap_or_default();
+        if decision
+            .operation_state_reason
+            .as_deref()
+            .map(str::trim)
+            .filter(|reason| !reason.is_empty())
+            .is_none()
+            && !reviewer_reason.is_empty()
+        {
+            decision.operation_state_reason = Some(reviewer_reason.clone());
+        }
+        review.formula_breakdown.insert(
+            "operationStateProposalDisposition",
+            doc! {
+                "status": "accepted",
+                "currentState": current_state.unwrap_or_default(),
+                "proposedState": &proposed_state,
+                "reason": &reviewer_reason,
+            },
+        );
+        return;
+    }
+
+    let risk = match assessment {
+        None => "operation_state_proposal_dropped_missing_assessment",
+        Some(item) if !item.proposal_present => {
+            "operation_state_proposal_dropped_assessment_mismatch"
+        }
+        Some(_) => "operation_state_proposal_dropped_unsupported",
+    };
+    if !review.risks.iter().any(|item| item == risk) {
+        review.risks.push(risk.to_string());
+    }
+    review.formula_breakdown.insert(
+        "operationStateProposalDisposition",
+        doc! {
+            "status": "dropped",
+            "currentState": current_state.unwrap_or_default(),
+            "proposedState": &proposed_state,
+            "reason": assessment
+                .map(|item| item.reason.clone())
+                .filter(|reason| !reason.trim().is_empty())
+                .unwrap_or_else(|| "Independent Reviewer did not provide affirmative semantic support for the lifecycle change".to_string()),
+        },
+    );
+    decision.operation_state = None;
+    decision.operation_state_reason = None;
+    decision.operation_state_confidence = None;
+}
+
 pub(crate) struct TurnModelAssets {
     pub active_products: Vec<Product>,
     pub published_soul: Option<String>,
@@ -841,6 +908,10 @@ impl<'a, C> ModelTurnEnvironment<'a, C> {
         full_context: bool,
     ) -> AgentDecision {
         normalize_decision_state(&mut decision, self.inputs.domain_config);
+        suppress_same_state_proposal(
+            &mut decision,
+            self.inputs.contact.operation_state.as_deref(),
+        );
         normalize_decision_runtime(&mut decision, self.inputs.initial_planner);
         let mut planner = planner_from_decision(&decision, "shared Agent Harness turn");
         if requires_full_knowledge_review(self.inputs.knowledge_route, &self.opened_chunk_ids) {
@@ -913,7 +984,7 @@ impl<'a, C> ModelTurnEnvironment<'a, C> {
     fn protocol_repair_instruction(violations: &[String]) -> String {
         let violations = serde_json::to_string(violations).unwrap_or_else(|_| "[]".to_string());
         format!(
-            "The previous Reply decision did not satisfy the structured final contract. Protocol violations: {violations}. Re-evaluate the conversation and return one complete decisionPhase=final JSON object. Include every required send-critical field with the correct JSON type and allowed enum value, including riskLevel, knowledgeNeed, runMode, autonomyMode, conversationMode, operationState, needsReview, shouldReply, riskSelfCheck, and the matching replyText/whyShouldReply or whySkipReply branch. Preserve only actions supported by the authority bundle. Do not explain the protocol to the customer and do not place internal field names in replyText."
+            "The previous Reply decision did not satisfy the structured final contract. Protocol violations: {violations}. Re-evaluate the conversation and return one complete decisionPhase=final JSON object. Include every required send-critical field with the correct JSON type and allowed enum value, including riskLevel, knowledgeNeed, runMode, autonomyMode, conversationMode, needsReview, shouldReply, riskSelfCheck, and the matching replyText/whyShouldReply or whySkipReply branch. operationState is optional: omit it or use null to preserve the current durable state, and propose a different state only when the complete current turn directly supports a lifecycle change. Preserve only actions supported by the authority bundle. Do not explain the protocol to the customer and do not place internal field names in replyText."
         )
     }
 
@@ -1265,8 +1336,11 @@ where
             .as_ref()
             .is_some_and(|request| request.requested);
         let has_commitment_lifecycle_action = !decision.commitment_updates.is_empty();
-        let requires_semantic_authorization =
-            decision.should_reply || has_appointment_action || has_commitment_lifecycle_action;
+        let has_operation_state_proposal = decision_operation_state_candidate(decision).is_some();
+        let requires_semantic_authorization = decision.should_reply
+            || has_appointment_action
+            || has_commitment_lifecycle_action
+            || has_operation_state_proposal;
         let authorization_chunks = self.authorization_chunks();
         let (mut review, priced_from_catalog) = if !requires_semantic_authorization {
             (
@@ -1284,7 +1358,10 @@ where
                 &self.inputs.budget,
                 self.inputs.runtime,
             );
-            if (has_appointment_action || has_commitment_lifecycle_action) && !decision.should_reply
+            if (has_appointment_action
+                || has_commitment_lifecycle_action
+                || has_operation_state_proposal)
+                && !decision.should_reply
             {
                 review.review_summary =
                     "Required structured action authorization was unavailable because the run budget was exhausted"
@@ -1295,74 +1372,56 @@ where
             }
             (review, false)
         } else {
-            let (mut review, claim_gate, embedded_light_gate) =
-                if decision.should_reply || has_commitment_lifecycle_action {
-                    let review_mode = effective_review_mode(
-                        &self.last_planner,
-                        decision,
-                        self.inputs.runtime,
-                        draft.repair_attempt > 0,
-                    );
-                    let can_try_embedded = embedded_light_claim_gate_eligible(
-                        review_mode,
+            let (mut review, claim_gate, embedded_light_gate) = if decision.should_reply
+                || has_commitment_lifecycle_action
+                || has_operation_state_proposal
+            {
+                let review_mode = effective_review_mode(
+                    &self.last_planner,
+                    decision,
+                    self.inputs.runtime,
+                    draft.repair_attempt > 0,
+                );
+                let can_try_embedded = embedded_light_claim_gate_eligible(
+                    review_mode,
+                    decision,
+                    self.inputs.knowledge_route,
+                    &self.opened_chunk_ids,
+                    self.inputs.invocation_kind,
+                    self.inputs.inbound.is_synthetic_relay,
+                );
+                let review_future = review_decision(
+                    self.inputs.state,
+                    self.inputs.contact,
+                    self.inputs.inbound,
+                    self.inputs.recent_messages,
+                    decision,
+                    self.inputs.playbook,
+                    self.inputs.domain_config,
+                    self.inputs.runtime,
+                    self.inputs.memory,
+                    self.inputs.context_pack,
+                    &authorization_chunks,
+                    self.inputs.knowledge_route,
+                    review_mode,
+                    Some(self.inputs.run_id),
+                    self.inputs.prompt_override,
+                    Some(self.inputs.active_profile),
+                    self.inputs.reviewer_prompts,
+                    draft.repair_attempt == 0,
+                    self.inputs.invocation_kind,
+                );
+                if can_try_embedded {
+                    let review = review_future.await?;
+                    if let Some(claim_gate) = embedded_light_claim_gate_evaluation(
+                        &review,
                         decision,
                         self.inputs.knowledge_route,
-                        &self.opened_chunk_ids,
-                        self.inputs.invocation_kind,
-                        self.inputs.inbound.is_synthetic_relay,
-                    );
-                    let review_future = review_decision(
-                        self.inputs.state,
-                        self.inputs.contact,
-                        self.inputs.inbound,
-                        self.inputs.recent_messages,
-                        decision,
-                        self.inputs.playbook,
-                        self.inputs.domain_config,
-                        self.inputs.runtime,
-                        self.inputs.memory,
-                        self.inputs.context_pack,
-                        &authorization_chunks,
-                        self.inputs.knowledge_route,
-                        review_mode,
-                        Some(self.inputs.run_id),
-                        self.inputs.prompt_override,
-                        Some(self.inputs.active_profile),
-                        self.inputs.reviewer_prompts,
-                        draft.repair_attempt == 0,
-                        self.inputs.invocation_kind,
-                    );
-                    if can_try_embedded {
-                        let review = review_future.await?;
-                        if let Some(claim_gate) = embedded_light_claim_gate_evaluation(
-                            &review,
-                            decision,
-                            self.inputs.knowledge_route,
-                            self.inputs.authority.evidence_catalog(),
-                        ) {
-                            (review, claim_gate, true)
-                        } else {
-                            let claim_gate = evaluate_independent_claim_gate_with_authority(
-                                self.inputs.state,
-                                self.inputs.contact,
-                                self.inputs.inbound,
-                                self.inputs.recent_messages,
-                                decision,
-                                Some(self.inputs.knowledge_route),
-                                &authorization_chunks,
-                                self.inputs.active_products,
-                                self.inputs.referral_cards,
-                                self.inputs.active_profile,
-                                DateTime::now(),
-                                Some(self.inputs.run_id),
-                                self.inputs.invocation_kind,
-                                Some(self.inputs.authority),
-                            )
-                            .await;
-                            (review, claim_gate, false)
-                        }
+                        self.inputs.authority.evidence_catalog(),
+                    ) {
+                        (review, claim_gate, true)
                     } else {
-                        let claim_gate_future = evaluate_independent_claim_gate_with_authority(
+                        let claim_gate = evaluate_independent_claim_gate_with_authority(
                             self.inputs.state,
                             self.inputs.contact,
                             self.inputs.inbound,
@@ -1377,12 +1436,12 @@ where
                             Some(self.inputs.run_id),
                             self.inputs.invocation_kind,
                             Some(self.inputs.authority),
-                        );
-                        let (review, claim_gate) = tokio::join!(review_future, claim_gate_future);
-                        (review?, claim_gate, false)
+                        )
+                        .await;
+                        (review, claim_gate, false)
                     }
                 } else {
-                    let claim_gate = evaluate_independent_claim_gate_with_authority(
+                    let claim_gate_future = evaluate_independent_claim_gate_with_authority(
                         self.inputs.state,
                         self.inputs.contact,
                         self.inputs.inbound,
@@ -1397,14 +1456,34 @@ where
                         Some(self.inputs.run_id),
                         self.inputs.invocation_kind,
                         Some(self.inputs.authority),
-                    )
-                    .await;
-                    (
-                        local_decision_review(decision, &self.inputs.budget, self.inputs.runtime),
-                        claim_gate,
-                        false,
-                    )
-                };
+                    );
+                    let (review, claim_gate) = tokio::join!(review_future, claim_gate_future);
+                    (review?, claim_gate, false)
+                }
+            } else {
+                let claim_gate = evaluate_independent_claim_gate_with_authority(
+                    self.inputs.state,
+                    self.inputs.contact,
+                    self.inputs.inbound,
+                    self.inputs.recent_messages,
+                    decision,
+                    Some(self.inputs.knowledge_route),
+                    &authorization_chunks,
+                    self.inputs.active_products,
+                    self.inputs.referral_cards,
+                    self.inputs.active_profile,
+                    DateTime::now(),
+                    Some(self.inputs.run_id),
+                    self.inputs.invocation_kind,
+                    Some(self.inputs.authority),
+                )
+                .await;
+                (
+                    local_decision_review(decision, &self.inputs.budget, self.inputs.runtime),
+                    claim_gate,
+                    false,
+                )
+            };
             let priced_from_catalog = apply_independent_claim_gate(
                 claim_gate,
                 decision,
@@ -1426,6 +1505,13 @@ where
             );
             (review, priced_from_catalog)
         };
+
+        enforce_operation_state_assessment(
+            &mut draft.decision,
+            &mut review,
+            self.inputs.contact.operation_state.as_deref(),
+        );
+        let decision = &draft.decision;
 
         if let Some(risk) = self.dropped_commitment_update_risk.as_ref() {
             if !review.risks.iter().any(|existing| existing == risk) {
@@ -1600,6 +1686,90 @@ mod tests {
             ReviewInvocationKind::Conversation,
             false,
         ));
+    }
+
+    #[test]
+    fn unsupported_state_proposal_is_dropped_without_rejecting_the_reply() {
+        let mut decision = embedded_candidate();
+        decision.operation_state = Some("appointment_request".to_string());
+        decision.operation_state_reason = Some("模型提出了阶段变化".to_string());
+        decision.operation_state_confidence = Some(8);
+        let original_reply = decision.reply_text.clone();
+        let mut review = super::super::types::DecisionReviewResult {
+            approved: true,
+            operation_state_assessment: Some(super::super::types::OperationStateAssessment {
+                proposal_present: true,
+                supported: false,
+                reason: "当前轮没有直接支持持久阶段变化的语义依据".to_string(),
+            }),
+            ..Default::default()
+        };
+
+        enforce_operation_state_assessment(&mut decision, &mut review, Some("need_discovery"));
+
+        assert!(decision.operation_state.is_none());
+        assert!(decision.operation_state_reason.is_none());
+        assert!(decision.operation_state_confidence.is_none());
+        assert_eq!(decision.reply_text, original_reply);
+        assert!(review.approved);
+        assert!(review
+            .risks
+            .iter()
+            .any(|risk| risk == "operation_state_proposal_dropped_unsupported"));
+    }
+
+    #[test]
+    fn supported_state_proposal_survives_independent_semantic_review() {
+        let mut decision = embedded_candidate();
+        decision.operation_state = Some("appointment_request".to_string());
+        let mut review = super::super::types::DecisionReviewResult {
+            approved: true,
+            operation_state_assessment: Some(super::super::types::OperationStateAssessment {
+                proposal_present: true,
+                supported: true,
+                reason: "当前轮的完整语义直接形成了新的持久业务阶段".to_string(),
+            }),
+            ..Default::default()
+        };
+
+        enforce_operation_state_assessment(&mut decision, &mut review, Some("need_discovery"));
+
+        assert_eq!(
+            decision.operation_state.as_deref(),
+            Some("appointment_request")
+        );
+        assert_eq!(
+            decision.operation_state_reason.as_deref(),
+            Some("当前轮的完整语义直接形成了新的持久业务阶段")
+        );
+        assert!(review.risks.is_empty());
+        assert_eq!(
+            review
+                .formula_breakdown
+                .get_document("operationStateProposalDisposition")
+                .and_then(|value| value.get_str("status"))
+                .unwrap(),
+            "accepted"
+        );
+    }
+
+    #[test]
+    fn changed_state_without_typed_reviewer_assessment_fails_soft_to_preserve() {
+        let mut decision = embedded_candidate();
+        decision.operation_state = Some("appointment_request".to_string());
+        let mut review = super::super::types::DecisionReviewResult {
+            approved: true,
+            ..Default::default()
+        };
+
+        enforce_operation_state_assessment(&mut decision, &mut review, Some("need_discovery"));
+
+        assert!(decision.operation_state.is_none());
+        assert!(review.approved);
+        assert!(review
+            .risks
+            .iter()
+            .any(|risk| { risk == "operation_state_proposal_dropped_missing_assessment" }));
     }
 
     #[test]

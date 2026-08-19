@@ -864,13 +864,14 @@ pub(crate) async fn decide_reply_with_promote_context(
     } else {
         String::new()
     };
-    // `operationState` is a required decision protocol field in every tier. Lean/Relational
-    // therefore still need the canonical key set; otherwise a custom industry is forced to
-    // guess sales-shaped keys that the persistence transition gate later rejects. Full keeps
-    // the complete machine, while lower tiers receive only a compact key/initial-state contract.
-    let state_machine_text = domain_config
-        .map(|config| render_operation_state_machine_for_tier(&config.state_machine, tier))
-        .unwrap_or_default();
+    // `operationState` is an optional lifecycle-transition proposal. Every tier receives the
+    // contact's current/effective state and the canonical state keys so Lean/Relational can
+    // preserve continuity without guessing. Full additionally receives the complete machine.
+    let state_machine_text = render_operation_state_context_for_tier(
+        domain_config.map(|config| &config.state_machine),
+        contact.operation_state.as_deref(),
+        tier,
+    );
     let knowledge_text = if include_business {
         format_operation_knowledge_for_prompt_with_roles(
             knowledge_chunks,
@@ -1127,6 +1128,11 @@ pub(crate) async fn decide_reply_with_promote_context(
 - Soul、业务目标、运营方法、可用工具和职责范围只用于决定你怎么做，绝不是可以向客户复述的自我介绍材料。不得用“身份标签 + 职责清单”的方式解释自己，也不得把配置里的行业、任务、转化目标或内部流程说给客户听。
 - 客户问你是谁、在做什么或为什么这样回复时，结合长期一致的人设和当前关系自然作答，像一个已经在微信里持续聊天的具体的人；少做身份宣告，多承接他此刻真正关心的事。任何具体身份、履历、地点和现实经历仍须有可信来源，不能为拟人化而临时编造。
 
+# 生命周期状态提案协议
+- operationState 不是每轮必填的分类标签，而是可选的持久生命周期变更提案。没有直接语义依据时省略或输出 null，表示保持 currentDurableState；不要为填字段而重复当前态。
+- conversationMode 只描述本轮互动方式，不会自动改变 operationState。只有客户最新消息的完整语义或本轮可信事件直接支持持久阶段变化时，才输出状态机中的新 key，并同步给出 operationStateReason 与 operationStateConfidence。
+- 不得用客户词语、短语、寒暄形式、单个字段或固定分类表推导迁移；历史状态、旧任务、画像和运营目标只提供背景，不能单独证明本轮发生变化。
+
 # 最近聊天窗口序号补充
 - 最近聊天可能因上下文预算省略较早行，所以方括号编号可能有缺口。编号始终是原始升序窗口位置；输出 tagEvidenceTurns、stageEvidenceTurns、bayesianObservations.evidenceTurns 时必须原样引用可见行的方括号编号，不得按显示行次重新编号。"#,
     );
@@ -1205,7 +1211,14 @@ pub(crate) async fn decide_reply_with_promote_context(
     // when an old playbook, operation state, or commitment otherwise looks like a current task.
     // The contract is semantic and open-ended: it must never become a customer-text keyword
     // classifier or a second hard-coded greeting path.
-    let current_turn_guidance = render_current_turn_precedence_guidance();
+    let current_turn_guidance = format!(
+        "{}{}",
+        render_current_turn_precedence_guidance(),
+        render_operation_state_continuity_contract(
+            contact.operation_state.as_deref(),
+            domain_config.map(|config| &config.state_machine),
+        )
+    );
     // 关系组：user prompt 里的画像字段（agent_profile / memory_summary / tags /
     // domain_attributes 各阶段字段）。Lean 跳过、空串占位；Relational+Full 与改造前等价。
     let agent_profile_text = if include_relational {
@@ -1287,7 +1300,7 @@ pub(crate) async fn decide_reply_with_promote_context(
 用户运营域策略:
 {}
 
-运营状态机:
+运营状态上下文:
 {}
 
 长期运营记忆:
@@ -1746,14 +1759,68 @@ pub(crate) fn render_operation_state_machine_for_tier(
     serde_json::to_string(&serde_json::json!({
         "allowedStateKeys": states.iter().map(|(key, _)| key).collect::<Vec<_>>(),
         "initialStateKey": initial_state,
-        "instruction": "operationState must be exactly one allowedStateKeys value; never invent or translate a key."
+        "instruction": "operationState is optional. Omit or use null to preserve the current durable state. When proposing a lifecycle change, use exactly one allowedStateKeys value; never invent or translate a key."
     }))
     .unwrap_or_default()
 }
 
+pub(crate) fn render_operation_state_context_for_tier(
+    machine: Option<&Document>,
+    current_durable_state: Option<&str>,
+    tier: crate::agent::sufficiency::PromptTier,
+) -> String {
+    let current_durable_state = current_durable_state
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let initial_state = super::guards::initial_operation_state_key_in_machine(machine);
+    let effective_current_state = current_durable_state.unwrap_or(&initial_state);
+    let state_machine = machine
+        .map(|machine| render_operation_state_machine_for_tier(machine, tier))
+        .filter(|rendered| !rendered.is_empty())
+        .and_then(|rendered| serde_json::from_str::<serde_json::Value>(&rendered).ok())
+        .unwrap_or(serde_json::Value::Null);
+
+    serde_json::json!({
+        "currentDurableState": current_durable_state,
+        "effectiveCurrentState": effective_current_state,
+        "stateMachine": state_machine,
+        "transitionProposalContract": {
+            "field": "operationState",
+            "optional": true,
+            "omitOrNullMeans": "preserve_current_durable_state",
+            "sameStateMayBeOmitted": true,
+            "conversationModeChangesLifecycle": false,
+            "evidenceRule": "Propose a changed state only when the complete current turn or another trusted current event directly supports a durable lifecycle change. Historical state, an old task, or a transient conversation mode is not sufficient by itself."
+        }
+    })
+    .to_string()
+}
+
+pub(crate) fn render_operation_state_continuity_contract(
+    current_durable_state: Option<&str>,
+    machine: Option<&Document>,
+) -> String {
+    let current_durable_state = current_durable_state
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let initial_state = super::guards::initial_operation_state_key_in_machine(machine);
+    let effective_current_state = current_durable_state.unwrap_or(&initial_state);
+    let durable_display = current_durable_state.unwrap_or("null（尚未持久化，使用有效初始态）");
+    format!(
+        r#"
+
+# 运营状态连续性（紧邻最新消息的最终约束）
+- currentDurableState={durable_display}；effectiveCurrentState={effective_current_state}。
+- operationState 是可选的“生命周期变更提案”，不是每轮都要重新分类的答案。没有直接语义依据时省略或输出 null，系统会保持当前持久态；重复输出当前态没有额外价值。
+- conversationMode 只描述本轮互动方式，是瞬时轴，不会自动改变持久生命周期。寒暄、在场确认、情绪承接、身份问答、暂停或结束当前话题，都不能仅凭互动模式推导状态迁移。
+- 只有客户最新消息的完整语义或本轮可信事件直接支持持久阶段发生变化时，才提议一个状态机中的新 key，并给出对应 reason/confidence。历史状态、旧任务、画像、预约记录或运营目标本身都不是本轮迁移证据。
+"#
+    )
+}
+
 #[cfg(test)]
 mod operation_state_tier_tests {
-    use super::render_operation_state_machine_for_tier;
+    use super::{render_operation_state_context_for_tier, render_operation_state_machine_for_tier};
     use crate::agent::sufficiency::PromptTier;
     use mongodb::bson::doc;
 
@@ -1785,6 +1852,65 @@ mod operation_state_tier_tests {
 
         let full = render_operation_state_machine_for_tier(&machine, PromptTier::Full);
         assert_eq!(full, serde_json::to_string(&machine).unwrap());
+    }
+
+    #[test]
+    fn every_tier_receives_current_state_and_optional_transition_contract() {
+        let machine = doc! {
+            "states": [
+                { "key": "first_contact", "initial": true, "allowedFrom": [] },
+                { "key": "need_discovery", "allowedFrom": ["first_contact"] },
+                { "key": "appointment_confirmation", "allowedFrom": ["need_discovery"] },
+            ]
+        };
+
+        for tier in [PromptTier::Lean, PromptTier::Relational, PromptTier::Full] {
+            let rendered = render_operation_state_context_for_tier(
+                Some(&machine),
+                Some("appointment_confirmation"),
+                tier,
+            );
+            let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+            assert_eq!(
+                value["currentDurableState"],
+                serde_json::json!("appointment_confirmation")
+            );
+            assert_eq!(
+                value["effectiveCurrentState"],
+                serde_json::json!("appointment_confirmation")
+            );
+            assert_eq!(
+                value["transitionProposalContract"]["optional"],
+                serde_json::json!(true)
+            );
+            assert_eq!(
+                value["transitionProposalContract"]["conversationModeChangesLifecycle"],
+                serde_json::json!(false)
+            );
+        }
+    }
+
+    #[test]
+    fn absent_durable_state_uses_domain_initial_state_without_forcing_a_proposal() {
+        let machine = doc! {
+            "states": [
+                { "key": "initial_hesitation", "initial": true },
+                { "key": "emotion_surfacing" },
+            ]
+        };
+        let rendered =
+            render_operation_state_context_for_tier(Some(&machine), None, PromptTier::Lean);
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+
+        assert!(value["currentDurableState"].is_null());
+        assert_eq!(
+            value["effectiveCurrentState"],
+            serde_json::json!("initial_hesitation")
+        );
+        assert_eq!(
+            value["transitionProposalContract"]["omitOrNullMeans"],
+            serde_json::json!("preserve_current_durable_state")
+        );
     }
 }
 
@@ -1832,6 +1958,7 @@ pub(crate) fn render_current_turn_precedence_guidance() -> &'static str {
 - 先识别当前会话行为，再决定 conversationMode、shouldReply、nextStep、commitmentUpdates 和 escalationRequest。简短社交开场、在场确认、暂停或结束表达，优先完成对应的会话行为；自然短回和留出空间本身可以是完整答案，不强制自我介绍、业务导航、额外提问、素材、面诊或请示。
 - 如果当前消息与历史状态冲突，以客户最新的明确表达为准；语义不够确定时保守承接，或只问一个真正必要的澄清问题，不猜测、不重启旧流程，也不把旧承诺当成客户本轮意图。
 - 人物连续性来自已确认的人设、记忆和可信事实。允许自然口吻和有限的当前状态表达，但不要因寒暄临时创造新的生活经历、地点、身份或互相冲突的背景。
+- 人设一致是内部行为约束，不等于每轮都要把人设说出来。客户没有询问身份或关系定位时，自我介绍、岗位名称、职责清单和主动业务导航属于无关扩展；客户直接询问时，才用长期一致的人物口吻做最小、自然的回答，然后承接其真正关心的问题。
 "#
 }
 
@@ -1848,6 +1975,8 @@ mod current_turn_precedence_tests {
         assert!(guidance.contains("不按关键词、短语、日期、词表"));
         assert!(guidance.contains("不强制自我介绍、业务导航"));
         assert!(guidance.contains("人物连续性"));
+        assert!(guidance.contains("人设一致是内部行为约束"));
+        assert!(guidance.contains("客户直接询问时"));
         assert!(!guidance.contains("你好/hi/在吗"));
     }
 }
