@@ -1337,6 +1337,7 @@ where
                         if let Some(claim_gate) = embedded_light_claim_gate_evaluation(
                             &review,
                             decision,
+                            self.inputs.knowledge_route,
                             self.inputs.authority.evidence_catalog(),
                         ) {
                             (review, claim_gate, true)
@@ -1347,6 +1348,7 @@ where
                                 self.inputs.inbound,
                                 self.inputs.recent_messages,
                                 decision,
+                                Some(self.inputs.knowledge_route),
                                 &authorization_chunks,
                                 self.inputs.active_products,
                                 self.inputs.referral_cards,
@@ -1366,6 +1368,7 @@ where
                             self.inputs.inbound,
                             self.inputs.recent_messages,
                             decision,
+                            Some(self.inputs.knowledge_route),
                             &authorization_chunks,
                             self.inputs.active_products,
                             self.inputs.referral_cards,
@@ -1385,6 +1388,7 @@ where
                         self.inputs.inbound,
                         self.inputs.recent_messages,
                         decision,
+                        Some(self.inputs.knowledge_route),
                         &authorization_chunks,
                         self.inputs.active_products,
                         self.inputs.referral_cards,
@@ -1639,6 +1643,8 @@ mod tests {
                 recommended_next_step: super::super::types::KnowledgeNextStep::AskPrincipal,
                 missing_information: vec!["current state".to_string()],
                 authority_question: "What is the current state?".to_string(),
+                unresolved_proposition: "Whether the current state permits the requested action"
+                    .to_string(),
             },
             ..Default::default()
         }

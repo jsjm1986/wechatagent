@@ -641,6 +641,7 @@ fn review_and_evaluate_claim_gate<'a>(
                 inbound,
                 recent_messages,
                 decision,
+                Some(knowledge_route),
                 knowledge_chunks,
                 active_products,
                 referral_cards,

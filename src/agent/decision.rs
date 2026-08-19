@@ -1111,7 +1111,7 @@ pub(crate) async fn decide_reply_with_promote_context(
 
 # 结构化知识研判的执行方式
 - Full 档的 knowledgeRoute.resolution 是独立知识 Agent 按完整语境作出的结构化研判，不是事实证据本身，也不是给客户复述的文本。不得向客户暴露 knowledgeRoute、requiredAuthority、内部请示、领导、系统或其它控制字段。
-- 当 recommendedNextStep=ask_principal、requiredAuthority=authorized_operator 且本轮“请示通道信号”确认内部通道可用时，输出 nextStep=ask_principal 和完整 escalationRequest（needed=true、category=out_of_scope_decision、具体 reason 与 questionForPrincipal）；同时 shouldReply=true，用第一人称自然说明我正在核准、后续由我继续同步。缺失事实此刻仍是未知：不得先给一个猜测、倾向性答案或“看起来大概如此”的结论再说去确认，也不得把客户转给幕后角色。
+- 当 recommendedNextStep=ask_principal、requiredAuthority=authorized_operator 且本轮“请示通道信号”确认内部通道可用时，输出 nextStep=ask_principal 和完整 escalationRequest（needed=true、category=out_of_scope_decision、具体 reason 与 questionForPrincipal）；同时 shouldReply=true，用第一人称自然说明我正在核准、后续由我继续同步。`unresolvedProposition` 是仍未关闭的完整现实命题：不得先给一个猜测、倾向性答案或“看起来大概如此”的结论再说去确认，也不得把客户转给幕后角色。即使命题中的局部事实各自有来源，只要组合后让客户能推出该命题的肯定、否定或概率方向，也必须保留边界。
 - 当 recommendedNextStep=clarify_customer 时，只问一个真正能补齐 missingInformation 的客户问题；当 answerability=partially_supported 或 unsupported 时，不得把未被证据覆盖的部分写成确定结论。
 
 # 健康与专业判断边界
@@ -1857,13 +1857,14 @@ pub(crate) fn format_typed_route_handoff_for_prompt(
         "recommendedNextStep": resolution.recommended_next_step,
         "missingInformation": resolution.missing_information,
         "authorityQuestion": resolution.authority_question,
+        "unresolvedProposition": resolution.unresolved_proposition,
     });
     let instruction = match handoff {
         KnowledgeHandoffKind::ClarifyCustomer => {
             "请将这个交接完整落成一个最终动作：nextStep=clarify、sufficiency=need_clarification、shouldReply=true，并在 clarificationIntent 写清要补齐的缺口；客户可见回复只问一个真正能补齐 missingInformation 的自然问题。不要附带请示、预约、承诺、跟进、素材或名片，也不要补写缺失事实。"
         }
         KnowledgeHandoffKind::AskPrincipal => {
-            "请将这个交接完整落成一个最终动作：nextStep=ask_principal、escalationRequest.needed=true、category=out_of_scope_decision，并填写具体 reason 与 questionForPrincipal；shouldReply=true，回复用第一人称自然承接。不要引用缺失事实。"
+            "请将这个交接完整落成一个最终动作：nextStep=ask_principal、escalationRequest.needed=true、category=out_of_scope_decision，并填写具体 reason 与 questionForPrincipal；shouldReply=true，回复用第一人称自然承接。`unresolvedProposition` 仍未关闭，任何由局部事实拼出的肯定、否定或概率方向都不得先说给客户。不要引用缺失事实。"
         }
         KnowledgeHandoffKind::DeferLicensedProfessional => {
             "请将这个交接完整落成一个最终动作：nextStep=defer、shouldReply=true，清楚说明不能替代有资质专业判断，并给出具体的专业评估下一步。不要附带请示、预约确认、承诺、跟进、素材或名片，也不要输出未经证据支持的结论。"
@@ -2466,6 +2467,7 @@ mod persona_override_tests {
                 recommended_next_step: KnowledgeNextStep::AskPrincipal,
                 missing_information: vec!["当期可用口径".to_string()],
                 authority_question: "当前应采用什么口径？".to_string(),
+                unresolved_proposition: "当前应采用哪一条对外口径".to_string(),
             },
             tool_trace: vec![mongodb::bson::doc! { "tool": "search" }],
             evidence_excerpts: vec!["某条摘录".to_string()],
@@ -2526,6 +2528,7 @@ mod persona_override_tests {
                 recommended_next_step: KnowledgeNextStep::AskPrincipal,
                 missing_information: vec!["当期排班".to_string()],
                 authority_question: "请确认当期排班和可预约时间".to_string(),
+                unresolved_proposition: "这位客户明天下午是否确有可预约面诊名额".to_string(),
             },
             ..Default::default()
         };
@@ -2534,6 +2537,8 @@ mod persona_override_tests {
             format_typed_route_handoff_for_prompt(&route, true).contains("nextStep=ask_principal")
         );
         assert!(format_typed_route_handoff_for_prompt(&route, true).contains("当期排班"));
+        assert!(format_typed_route_handoff_for_prompt(&route, true)
+            .contains("这位客户明天下午是否确有可预约面诊名额"));
         assert!(format_typed_route_handoff_for_prompt(&route, true).contains("不向客户复述"));
         assert_eq!(format_typed_route_handoff_for_prompt(&route, false), "");
 

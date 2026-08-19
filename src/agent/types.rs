@@ -2125,6 +2125,11 @@ pub struct KnowledgeResolution {
     pub missing_information: Vec<String>,
     #[serde(default)]
     pub authority_question: String,
+    /// One concise real-world proposition that is still unresolved when the available evidence
+    /// cannot close the customer's question. This is semantic control data for downstream agents,
+    /// never customer-facing copy. It remains empty for supported or not-required turns.
+    #[serde(default)]
+    pub unresolved_proposition: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]

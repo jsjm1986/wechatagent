@@ -1118,6 +1118,14 @@ pub(crate) fn route_requires_knowledge_review(route: &KnowledgeRouteResult) -> b
                 | KnowledgeNextStep::AskPrincipal
                 | KnowledgeNextStep::Defer
         )
+        || route_has_unresolved_proposition(route)
+}
+
+/// Explicit semantic boundary emitted by the Knowledge Agent. This is a typed hand-off signal,
+/// not a classifier over customer text. Any non-empty proposition must stay visible to every
+/// authorization stage, even if the selected next step is a professional or external deferral.
+pub(crate) fn route_has_unresolved_proposition(route: &KnowledgeRouteResult) -> bool {
+    !route.resolution.unresolved_proposition.trim().is_empty()
 }
 
 /// A coherent, closed semantic hand-off selected by the Knowledge Agent.
@@ -1965,6 +1973,7 @@ mod tests {
                 recommended_next_step: KnowledgeNextStep::AskPrincipal,
                 missing_information: vec!["current operating state".to_string()],
                 authority_question: "What is the current operating state?".to_string(),
+                unresolved_proposition: "What is the current operating state?".to_string(),
             },
             ..Default::default()
         };

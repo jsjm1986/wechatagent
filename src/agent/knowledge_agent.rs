@@ -296,7 +296,7 @@ const ACTION_PROTOCOL: &str = r#"知识库研究协议（稳定规则）：
 {"action":"open_document","documentId":"..."}
 {"action":"open_chunk","ids":["chunk_id_1","chunk_id_2"]}
 {"action":"follow_relations","chunkId":"...","depth":1}
-{"action":"answer","citedChunkIds":["..."],"sourceQuotes":[{"chunkId":"...","quote":"...","sourceAnchorIndex":0}],"answer":"...","resolution":{"answerability":"supported | partially_supported | unsupported | not_required","requiredAuthority":"none | customer | authorized_operator | licensed_professional | external_system","recommendedNextStep":"respond | clarify_customer | ask_principal | defer","missingInformation":["..."],"authorityQuestion":"..."}}
+{"action":"answer","citedChunkIds":["..."],"sourceQuotes":[{"chunkId":"...","quote":"...","sourceAnchorIndex":0}],"answer":"...","resolution":{"answerability":"supported | partially_supported | unsupported | not_required","requiredAuthority":"none | customer | authorized_operator | licensed_professional | external_system","recommendedNextStep":"respond | clarify_customer | ask_principal | defer","missingInformation":["..."],"authorityQuestion":"...","unresolvedProposition":"..."}}
 
 - 召回漏斗：catalog 已按与本次 query 的相关度排过序，越靠前越相关。看到与 query 相关的候选，默认动作就是 open_chunk 展开它的正文再核对作答。
 - catalog 只给摘要且会被截断，回答任何细节问题（具体数字、比例、条件、期限等）前必须先 open_chunk 读正文，绝不能仅凭摘要臆测或直接说没有。
@@ -305,10 +305,11 @@ const ACTION_PROTOCOL: &str = r#"知识库研究协议（稳定规则）：
 - 诚实弃答原则：判定一条候选能否支撑作答，标准是它是否直接覆盖本 query 所问的对象与口径，而非主题词面相近。若 open 后只有主题相邻、口径不同、或仅部分相关，必须说明知识库仅有近似或部分知识，无法据此确切作答，并让 cited 留空或仅 cite 真正能支撑的部分。绝不把近似知识当确切事实硬答，绝不编造或外推正文未明确给出的数字、比例、条件、期限或范围。
 - 弃答须可推进：凡诚实弃答时，answer 末尾必须补一句具体、可执行的追问，点明缺少哪类信息、需要补充什么口径或细节，或提示运营补全该知识。禁止只说“不知道”或“暂无”。
 - 每个 answer 都必须输出完整 resolution。resolution 是内部语义结论，不是客户话术；不得把内部角色、控制字段或推理过程写进 answer。
+- `unresolvedProposition` 是一个简洁、完整、可判断真假的现实命题，专门描述当前证据仍未关闭且会实质影响本轮答复的那一部分。它必须由完整 query、已 open 证据和 resolution 共同语义判断生成，明确当前对象与所问范围，不能从关键词、词表、金额、行业类别或固定句式推导；任何业务主题都使用同一判断方法。若 answerability=partially_supported/unsupported 且仍有一个待核准事实，必须填写；若 answerability=supported 或 not_required，通常留空。它是给 Reply/Reviewer/ClaimGate 的边界，不是客户可见文案。
 - answerability=supported 仅限已 open 且实际引用的 verified 证据直接覆盖本 query 全部所问；只覆盖一部分用 partially_supported；没有直接证据用 unsupported。无需业务知识即可处理的社交或关系性消息用 not_required + none + respond，且 cited 留空。
 - requiredAuthority / recommendedNextStep 必须按缺口实质选择，禁止按客户文本中的词或短语匹配：缺客户自身信息用 customer + clarify_customer；缺机构当前安排、当期政策、实时可用性或其它须由有权运营人员确认的内部事实，用 authorized_operator + ask_principal；须执业判断用 licensed_professional + defer；须查询实时外部记录用 external_system + defer。已有充分证据或无需知识则用 none + respond。
 - 健康、医疗或其它受专业资质约束的语境中，必须区分“一般教育信息”和“对当前个体状态的判断”。知识条目说明某种现象通常如何，不等于能据此认定这位客户当前情况属于该现象、风险低或无需处理。若仍缺个体的程度、变化、伴随情况等实质信息，先用 customer + clarify_customer 只补最关键的一项；若结论本身需要专业评估，则用 licensed_professional + defer。按完整语义判断，不建立症状词表。
-- recommendedNextStep=ask_principal 时 authorityQuestion 必须是一句具体、可直接交给有权人员回答的问题；其它 nextStep 可留空。missingInformation 只列当前证据真正缺少的事实，不写泛化套话。
+- recommendedNextStep=ask_principal 时 authorityQuestion 必须是一句具体、可直接交给有权人员回答的问题；其它 nextStep 可留空。missingInformation 只列当前证据真正缺少的事实，不写泛化套话。`unresolvedProposition` 与 authorityQuestion 指向同一个尚未关闭的命题，但前者要写成完整可判定的现实命题，不能只写“当前状态”。
 - citedChunkIds 必须是“已 open 的 chunks”中的 chunkId 子集，不能凭空创造。
 - follow_relations 会把最相关的关联条目正文直接载入“已 open 的 chunks”，可当轮直接 cite，无需再 open_chunk。
 - 每个 cited 必须配 sourceQuote；如某 chunk 没有可引用原文，可省略 sourceQuote 但仍可 cite。
@@ -3054,7 +3055,7 @@ mod tests {
     #[test]
     fn parse_answer_action_with_camel_alias() {
         let raw: serde_json::Value = serde_json::from_str(
-            r#"{"action":"answer","citedChunkIds":["c1"],"sourceQuotes":[{"chunkId":"c1","quote":"q","sourceAnchorIndex":0}],"answer":"hello","resolution":{"answerability":"unsupported","requiredAuthority":"authorized_operator","recommendedNextStep":"ask_principal","missingInformation":["current state"],"authorityQuestion":"What is the current state?"}}"#,
+            r#"{"action":"answer","citedChunkIds":["c1"],"sourceQuotes":[{"chunkId":"c1","quote":"q","sourceAnchorIndex":0}],"answer":"hello","resolution":{"answerability":"unsupported","requiredAuthority":"authorized_operator","recommendedNextStep":"ask_principal","missingInformation":["current state"],"authorityQuestion":"What is the current state?","unresolvedProposition":"Whether the requested action is currently authorized"}}"#,
         )
         .unwrap();
         let action: AgentAction = serde_json::from_value(raw).unwrap();
@@ -3075,6 +3076,10 @@ mod tests {
                 assert_eq!(
                     resolution.required_authority,
                     crate::agent::types::KnowledgeRequiredAuthority::AuthorizedOperator
+                );
+                assert_eq!(
+                    resolution.unresolved_proposition,
+                    "Whether the requested action is currently authorized"
                 );
             }
             _ => panic!("expected answer"),
